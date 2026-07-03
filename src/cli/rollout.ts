@@ -16,8 +16,11 @@
  *   3. Refresh `switchroom-web` + `switchroom-hostd` (separate compose
  *      projects that do NOT self-heal on a pin bump) via `webd/hostd
  *      install --tag`, then refresh `switchroom-hindsight` (a standalone
- *      `docker run` on the mutable `:latest` tag — also not compose, also
- *      no self-heal) via `memory setup --recreate` (pull + recreate).
+ *      `docker run` — also not compose, also no self-heal) via `memory
+ *      setup --recreate --tag <target>` (pull the pinned `:vX.Y.Z` +
+ *      recreate). A failed recreate is FATAL — it already stopped/removed
+ *      the old container, so leaving the roll "ok" would report success on
+ *      a fleet whose memory backend is down.
  *   4. Final sweep — print a per-agent version table.
  *
  * Footguns this closes (each a real past incident, see CLAUDE.md / memory):
@@ -27,10 +30,11 @@
  *     self-heal on the first `agent restart` (#2170) — no separate step.
  *   - web + hostd are separate compose projects, stale every release —
  *     step 3.
- *   - hindsight is a standalone `docker run` on the mutable `:latest` tag
- *     (not a compose service), so a roll never re-pulls it and it drifts
- *     stale — observed stuck on claude 2.1.197 while the fleet moved to
- *     2.1.199. The `:latest` re-pull + recreate in step 3 closes it.
+ *   - hindsight is a standalone `docker run` (not a compose service), so a
+ *     roll never re-pulls it and it drifts stale — observed stuck on claude
+ *     2.1.197 while the fleet moved to 2.1.199. Step 3 re-pulls + recreates
+ *     it on the PINNED `:vX.Y.Z` (the roll target), not floating `:latest`,
+ *     so hindsight lands on the same version as the rest of the fleet.
  *   - the `:latest` pull-race / wrong-version-served — the per-agent
  *     `--version` assert in step 2.
  *
@@ -62,7 +66,7 @@ export type RolloutStep =
   | { kind: "sweep" };
 
 export interface RolloutPlanOpts {
-  /** Skip the web + hostd refresh (step 3). */
+  /** Skip the web + hostd + hindsight refresh (step 3). */
   skipWeb?: boolean;
   /**
    * When set (i.e. the operator passed `--pin`), persist `release.pin` to
@@ -204,7 +208,7 @@ export function formatRolloutPlan(
         lines.push(`  ${n}. hostd install --tag ${target} (separate compose project)`);
         break;
       case "refresh-hindsight":
-        lines.push(`  ${n}. refresh hindsight — pull :latest + recreate (standalone docker run, not compose)`);
+        lines.push(`  ${n}. refresh hindsight — pull ${target} + recreate (standalone docker run, not compose)`);
         break;
       case "sweep":
         lines.push(`  ${n}. sweep — print per-agent version table`);
@@ -342,6 +346,13 @@ export interface RolloutDeps {
    * can omit it.
    */
   persistPin?(pin: string): void;
+  /**
+   * Probe whether the standalone `switchroom-hindsight` container exists on
+   * this host (the `refresh-hindsight` step no-ops cleanly when it doesn't).
+   * Defaults (in production) to {@link isHindsightContainerExists}; tests
+   * inject it so the executor's hindsight branch runs without docker.
+   */
+  hindsightExists?(): boolean;
 }
 
 export interface RolloutResult {
@@ -655,13 +666,39 @@ export function executeRollout(
         // memory.config.url never drifts under the fleet. No-op cleanly when
         // hindsight isn't installed on this host (guard below also returns
         // false when docker is unavailable).
-        if (!isHindsightContainerExists()) {
+        const hindsightExists = deps.hindsightExists ?? isHindsightContainerExists;
+        if (!hindsightExists()) {
           deps.log(`ROLL_STEP refresh-hindsight — no hindsight container on this host; skipping`);
           break;
         }
-        deps.log(`ROLL_STEP refresh-hindsight — memory setup --recreate (pull :latest + recreate)`);
-        const r = deps.run(["memory", "setup", "--recreate"]);
-        if (r.status !== 0) warnings.push(`hindsight refresh failed (non-fatal); agents already rolled`);
+        // Thread the pinned rollout target through as `--tag <target>` so the
+        // recreate pulls `…switchroom-hindsight:v<target>` — the SAME pinned
+        // image the rest of the fleet moved to — NOT floating `:latest`
+        // (which drifts hindsight off the roll's version; #2752 fix 1).
+        deps.log(
+          `ROLL_STEP refresh-hindsight — memory setup --recreate --tag ${target} (pull ${target} + recreate)`,
+        );
+        const r = deps.run(["memory", "setup", "--recreate", "--tag", target]);
+        if (r.status !== 0) {
+          // FATAL, not a soft warning (#2752 fix 2): `memory setup --recreate`
+          // already did `docker stop && docker rm` before the failing
+          // `startHindsight`, so a failed recreate leaves the fleet with NO
+          // memory backend. Folding that into the generic non-fatal web/hostd
+          // warning while returning ok:true reported success on a fleet whose
+          // memory is DOWN. Stop the roll (same stop-on-failure semantics as a
+          // failed agent restart) and name the manual recovery.
+          deps.log(
+            `  ✗ hindsight recreate FAILED — the memory backend is DOWN (the ` +
+              `recreate stopped + removed the old container before the failed ` +
+              `start). Run \`switchroom memory setup\` to bring it back. — STOPPING`,
+          );
+          return {
+            ok: false,
+            rolled,
+            failedStep: "refresh-hindsight",
+            warnings,
+          };
+        }
         break;
       }
       case "sweep": {
@@ -728,7 +765,7 @@ export function registerRolloutCommand(program: Command): void {
       "--agents <list>",
       "Comma-separated subset of agents to roll (default: all configured).",
     )
-    .option("--skip-web", "Skip the web + hostd refresh step.")
+    .option("--skip-web", "Skip the web + hostd + hindsight refresh step.")
     .option(
       "--allow-downgrade",
       "Permit rolling to an older semver tag (operator-approved rollback path). " +
@@ -1016,7 +1053,7 @@ export function registerRollbackCommand(program: Command): void {
       "--agents <list>",
       "Comma-separated subset of agents to roll back (default: all configured).",
     )
-    .option("--skip-web", "Skip the web + hostd refresh step.")
+    .option("--skip-web", "Skip the web + hostd + hindsight refresh step.")
     .option("--dry-run", "Print the plan and exit without changing anything.")
     .action(async (opts: { to?: string; agents?: string; skipWeb?: boolean; dryRun?: boolean }) => {
       // Delegate entirely to the rollout action with --allow-downgrade.

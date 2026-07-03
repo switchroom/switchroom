@@ -117,6 +117,13 @@ describe("formatRolloutPlan", () => {
 function harness(opts: {
   versions: Record<string, string | null>;
   runStatus?: (args: string[]) => number;
+  /**
+   * Inject the standalone-hindsight-container probe so the refresh-hindsight
+   * branch runs without docker. Defaults to false (no container → the step
+   * no-ops), matching a CI host with no hindsight — which is why the
+   * pre-existing web/hostd tests never trip the hindsight run.
+   */
+  hindsightExists?: boolean;
 }): {
   deps: RolloutDeps;
   runs: string[][];
@@ -137,6 +144,7 @@ function harness(opts: {
     log: (line) => logs.push(line),
     emitPhase: (p) => phases.push(p),
     persistPin: (pin) => persisted.push(pin),
+    hindsightExists: () => opts.hindsightExists ?? false,
   };
   return { deps, runs, logs, persisted, phases };
 }
@@ -248,6 +256,63 @@ describe("executeRollout", () => {
     // target carries the v-prefix; in-container version does not.
     const r = executeRollout(steps, "v0.15.18", deps);
     expect(r.ok).toBe(true);
+  });
+});
+
+// ── #2752 refresh-hindsight — pinned tag + fatal recreate ─────────────────
+
+describe("executeRollout — refresh-hindsight (#2752)", () => {
+  const TARGET = "v0.15.18";
+
+  it("no-ops cleanly when no hindsight container exists (never runs memory setup)", () => {
+    const steps = planRollout(["clerk"]);
+    const { deps, runs } = harness({
+      versions: { clerk: "0.15.18" },
+      hindsightExists: false,
+    });
+    const r = executeRollout(steps, TARGET, deps);
+    expect(r.ok).toBe(true);
+    expect(runs.some((a) => a[0] === "memory")).toBe(false);
+  });
+
+  it("Fix 1: passes --tag <target> so the recreate pulls the PINNED image, not :latest", () => {
+    const steps = planRollout(["clerk"]);
+    const { deps, runs } = harness({
+      versions: { clerk: "0.15.18" },
+      hindsightExists: true,
+    });
+    const r = executeRollout(steps, TARGET, deps);
+    expect(r.ok).toBe(true);
+    expect(runs).toContainEqual(["memory", "setup", "--recreate", "--tag", TARGET]);
+  });
+
+  it("Fix 2: a recreate FAILURE is FATAL — flips ok:false and stops the roll", () => {
+    const steps = planRollout(["clerk"]);
+    const { deps } = harness({
+      versions: { clerk: "0.15.18" },
+      hindsightExists: true,
+      // Only the hindsight recreate fails; agent restart + apply succeed.
+      runStatus: (args) => (args[0] === "memory" ? 1 : 0),
+    });
+    const r = executeRollout(steps, TARGET, deps);
+    expect(r.ok).toBe(false);
+    expect(r.failedStep).toBe("refresh-hindsight");
+    // NOT folded into the generic non-fatal web/hostd warning string.
+    expect(r.warnings.some((w) => /hindsight refresh failed \(non-fatal\)/.test(w))).toBe(false);
+    // The agent was already rolled before the fatal memory-backend failure.
+    expect(r.rolled).toEqual(["clerk"]);
+  });
+
+  it("a web/hostd failure stays non-fatal even while hindsight recreate succeeds", () => {
+    const steps = planRollout(["clerk"]);
+    const { deps } = harness({
+      versions: { clerk: "0.15.18" },
+      hindsightExists: true,
+      runStatus: (args) => (args[0] === "webd" || args[0] === "hostd" ? 1 : 0),
+    });
+    const r = executeRollout(steps, TARGET, deps);
+    expect(r.ok).toBe(true);
+    expect(r.warnings.length).toBe(2); // web + hostd only; hindsight succeeded
   });
 });
 

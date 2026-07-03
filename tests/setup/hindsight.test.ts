@@ -228,6 +228,28 @@ describe("hindsight broker-fed mode (#1245)", () => {
     expect(args).not.toContain("ghcr.io/vectorize-io/hindsight:latest");
   });
 
+  // #2752 fix 1 — a version-pinned rollout threads its target through as
+  // imageTag so the standalone recreate pulls + runs the SAME pinned image
+  // (`:vX.Y.Z`) the rest of the fleet moved to, not floating `:latest`.
+  it("runs the PINNED :vX.Y.Z image when an imageTag is provided", () => {
+    startHindsight({ apiPort: 8888, uiPort: 9999 }, undefined, "v0.15.18");
+    const args = findRunArgs();
+    expect(args).toContain("ghcr.io/switchroom/switchroom-hindsight:v0.15.18");
+    expect(args).not.toContain(HINDSIGHT_IMAGE); // NOT floating :latest
+  });
+
+  it("normalizes a bare (v-less) tag to the :vX.Y.Z form the workflow publishes", () => {
+    startHindsight({ apiPort: 8888, uiPort: 9999 }, undefined, "0.15.18");
+    const args = findRunArgs();
+    expect(args).toContain("ghcr.io/switchroom/switchroom-hindsight:v0.15.18");
+  });
+
+  it("falls back to floating :latest when no imageTag is given (standalone memory setup)", () => {
+    startHindsight({ apiPort: 8888, uiPort: 9999 });
+    const args = findRunArgs();
+    expect(args).toContain(HINDSIGHT_IMAGE);
+  });
+
   // Regression — without uid/gid on the tmpfs, the mount lands root-owned
   // and the entrypoint shim's `chmod 0700 /run/claude-creds` (running as
   // the image's pinned USER hindsight, UID 11000) fails EACCES → boot
