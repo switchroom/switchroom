@@ -487,18 +487,32 @@ function turnsToMessages(turns: Turn[]): object[] {
   return messages;
 }
 
-/** Claude models available via the switchroom subscription. */
-const SWITCHROOM_MODELS = [
-  "claude-sonnet-5",
-  "claude-opus-4-8",
-  "claude-haiku-4-5-20251001",
-  "claude-fable-5",
-];
+/** Claude models available via the switchroom subscription.
+ *
+ * These are the family ALIASES the claude CLI resolves itself, not pinned
+ * concrete ids. Pinned ids rot: `claude-fable-5` was retired server-side and
+ * 4xx'd the fleet on 2026-06-13 (see telegram-plugin/gateway/model-command.ts
+ * MODEL_ALIASES), while the `fable` alias keeps resolving to the current
+ * flagship. The picker's selection is injected as `/model <value>` (see the
+ * config.set handler), so aliases are the durable selector.
+ */
+export const SWITCHROOM_MODELS = ["fable", "opus", "sonnet", "haiku"];
+
+/** Report the model for an agent session. There is no live per-session model
+ * source in the adapter (a `/model` switch happens inside the claude session
+ * and is not observable here), so the most honest answer is the agent's
+ * configured model from switchroom.yaml (per-agent `model:` over
+ * `defaults.model`), falling back to the `sonnet` family alias (the CLI's
+ * default tier) when nothing is configured. */
+export function configuredModel(config: SwitchroomConfig, agentName?: string): string {
+  const agentModel = agentName ? config.agents?.[agentName]?.model : undefined;
+  return agentModel ?? config.defaults?.model ?? "sonnet";
+}
 
 /** Build a ModelOptionsResponse for the Hermes Desktop model picker. */
-function switchroomModelOptions() {
+function switchroomModelOptions(config: SwitchroomConfig, agentName?: string) {
   return {
-    model: "claude-sonnet-5",
+    model: configuredModel(config, agentName),
     provider: "switchroom",
     providers: [
       {
@@ -673,7 +687,9 @@ export async function handleHermesRest(
     return {
       status: 200,
       body: {
-        model: "claude-sonnet-5",
+        // No session context on this endpoint — report the fleet-default
+        // configured model rather than a hardcoded constant.
+        model: configuredModel(config),
         provider: "switchroom",
         capabilities: {},
       },
@@ -771,7 +787,7 @@ export async function handleHermesRest(
 
   // GET /api/model/options — model picker list (ModelOptionsResponse)
   if (method === "GET" && pathname.startsWith("/api/model/options")) {
-    return { status: 200, body: switchroomModelOptions() };
+    return { status: 200, body: switchroomModelOptions(config) };
   }
 
   // POST /api/model/set — model selection (accept silently; agent model is set per-session via config.set RPC)
@@ -1110,12 +1126,16 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
     }
 
     case "model.options": {
-      sendResponse(ctx, rpcOk(id, switchroomModelOptions()));
+      const sessionId = String(params.session_id ?? ctx.activeSessionId ?? "");
+      const agentName = sessionId ? parseHermesSessionId(sessionId).agentName : undefined;
+      sendResponse(ctx, rpcOk(id, switchroomModelOptions(config, agentName)));
       break;
     }
 
     case "model.info": {
-      sendResponse(ctx, rpcOk(id, { model: "claude-sonnet-5", provider: "switchroom" }));
+      const sessionId = String(params.session_id ?? ctx.activeSessionId ?? "");
+      const agentName = sessionId ? parseHermesSessionId(sessionId).agentName : undefined;
+      sendResponse(ctx, rpcOk(id, { model: configuredModel(config, agentName), provider: "switchroom" }));
       break;
     }
 
