@@ -158,7 +158,7 @@ describe("tool-label-pretool.mjs", () => {
     const cases: Array<[string, Record<string, unknown>, string]> = [
       ["Edit", { file_path: "/x/foo.ts" }, "Editing foo.ts"],
       ["Write", { file_path: "/x/bar.md" }, "Writing bar.md"],
-      ["NotebookEdit", { notebook_path: "/x/n.ipynb" }, "Editing notebook n.ipynb"],
+      ["NotebookEdit", { notebook_path: "/x/n.ipynb" }, "Editing n.ipynb"],
     ];
     for (const [tool, input, expected] of cases) {
       const r = run(
@@ -193,13 +193,13 @@ describe("tool-label-pretool.mjs", () => {
       stateDir,
     );
     const g2 = r2.sidecarLines.find((l) => l.tool_use_id === "g2");
-    expect(g2?.label).toBe("Searching . for TODO");
+    expect(g2?.label).toBe("Searching for TODO");
   });
 
   it("Glob / WebFetch / WebSearch", () => {
     const cases: Array<[string, Record<string, unknown>, string]> = [
       ["Glob", { pattern: "**/*.ts" }, "Finding files matching **/*.ts"],
-      ["WebFetch", { url: "https://example.com/path?x=1" }, "Fetching example.com/path"],
+      ["WebFetch", { url: "https://example.com/path?x=1" }, "Reading example.com"],
       ["WebSearch", { query: "claude code hooks" }, "Searching the web for claude code hooks"],
     ];
     for (const [tool, input, expected] of cases) {
@@ -237,7 +237,7 @@ describe("tool-label-pretool.mjs", () => {
       ["mcp__switchroom-telegram__get_recent_messages", {}, "Reading chat history"],
       ["mcp__hindsight__recall", { query: "x" }, "Searching memory"],
       ["mcp__hindsight__reflect", { query: "x" }, "Searching memory"],
-      ["mcp__hindsight__retain", { content: "x" }, "Saving memory"],
+      ["mcp__hindsight__retain", { content: "x" }, "Saving to memory"],
     ];
     for (const [tool, input, expected] of cases) {
       const r = run(
