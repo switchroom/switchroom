@@ -286,6 +286,9 @@ export default defineConfig({
       "**/telegram-plugin/tests/reaction-trigger-flow.test.ts",
       // reaction-dispatch tests (#2291) use bun:test — run via test:bun.
       "**/telegram-plugin/tests/reaction-dispatch.test.ts",
+      // status-query-telemetry.test.ts uses bun:test (truthful-telemetry PR) —
+      // excluded here, run via test:bun.
+      "**/telegram-plugin/tests/status-query-telemetry.test.ts",
     ],
     coverage: {
       provider: "v8",
