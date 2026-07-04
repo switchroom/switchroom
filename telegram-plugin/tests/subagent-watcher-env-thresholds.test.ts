@@ -26,9 +26,17 @@ function subAgentUserMsg(promptText: string) {
 function makeHarness(opts: {
   agentId?: string
   configStallThresholdMs?: number
+  configSilentSynthStallThresholdMs?: number
   configSilentStallTerminalMs?: number
+  initialContent?: string
 } = {}) {
-  const { agentId = 'env-thresh-agent', configStallThresholdMs, configSilentStallTerminalMs } = opts
+  const {
+    agentId = 'env-thresh-agent',
+    configStallThresholdMs,
+    configSilentSynthStallThresholdMs,
+    configSilentStallTerminalMs,
+    initialContent,
+  } = opts
 
   let currentTime = 1000
   const stallCalls: Array<{ idleMs: number }> = []
@@ -43,7 +51,7 @@ function makeHarness(opts: {
   const subagentsDir = `${sessionDir}/subagents`
   const jsonlPath = `${subagentsDir}/agent-${agentId}.jsonl`
   const fileContents = new Map<string, Buffer>()
-  fileContents.set(jsonlPath, Buffer.from(buildJSONL(subAgentUserMsg('bg task')), 'utf-8'))
+  fileContents.set(jsonlPath, Buffer.from(initialContent ?? buildJSONL(subAgentUserMsg('bg task')), 'utf-8'))
 
   let lastOpenedPath: string | null = null
   const mockFs = {
@@ -81,7 +89,7 @@ function makeHarness(opts: {
   const watcher = startSubagentWatcher({
     agentDir,
     stallThresholdMs: configStallThresholdMs,
-    silentSynthesisStallThresholdMs: configStallThresholdMs,
+    silentSynthesisStallThresholdMs: configSilentSynthStallThresholdMs ?? configStallThresholdMs,
     silentStallTerminalMs: configSilentStallTerminalMs,
     rescanMs: 500,
     onStall: (_id, idleMs) => stallCalls.push({ idleMs }),
@@ -209,6 +217,41 @@ describe('subagent-watcher env-var threshold overrides', () => {
     h.advance(2_000)
     h.advance(60_000)
     expect(h.stallTerminalCalls).toHaveLength(0)
+  })
+
+  it('a Bash-in-flight worker skips the tight stall threshold but still releases the terminal gate', () => {
+    // End-to-end of the long-runner suppression under compressed env-tuned
+    // windows: a worker mid-`Bash` (a) is NOT flagged at the tight active-loop
+    // threshold, (b) IS eventually flagged at the widened silent-synthesis
+    // window, and (c) the pass-2 terminal synthesis STILL fires the fixed
+    // window after that — the load-bearing completion-gate release is intact.
+    const h = makeHarness({
+      agentId: 'env-thresh-bash',
+      configStallThresholdMs: 1000, // tight active-loop threshold
+      configSilentSynthStallThresholdMs: 10_000, // widened long-runner window
+      configSilentStallTerminalMs: 5000, // compressed terminal window
+      initialContent: buildJSONL(
+        subAgentUserMsg('bg task'),
+        { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tool-B', name: 'Bash', input: { command: 'npm test' } }] } },
+      ),
+    })
+    h.advance(500) // register + tail → toolCount=1, lastTool=Bash
+    h.unmarkHistorical()
+
+    // 5s idle — well past the 1s active-loop threshold, but a Bash worker uses
+    // the 10s silent-synthesis window, so NO false stall.
+    h.advance(5_000)
+    expect(h.stallCalls).toHaveLength(0)
+
+    // Cross the 10s window → the stall IS flagged (pass-2 becomes reachable).
+    h.advance(6_000)
+    expect(h.stallCalls).toHaveLength(1)
+    expect(h.stallTerminalCalls).toHaveLength(0)
+
+    // 5s post-stall → terminal synthesis releases the deferred-completion gate.
+    h.advance(6_000)
+    expect(h.stallTerminalCalls).toHaveLength(1)
+    expect(h.finishCalls).toHaveLength(1)
   })
 
   it('zero env value falls through to default (zero is not "fire immediately")', () => {

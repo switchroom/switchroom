@@ -801,6 +801,87 @@ describe('createWorkerActivityFeed — heartbeat', () => {
     await feed.update('w1', 'chat', view({ elapsedMs: 2000, latestSummary: 'go' })).catch(() => {})
     expect(bot.edits.length).toBe(editsBefore)
   })
+
+  // ─── Prose-silent worker: first paint driven by the heartbeat ──────────────
+  // The user-visible bug: a background worker that dives straight into quiet
+  // work (a long `Bash` / `npm test`) fires ONE `sub_agent_tool_use` tick when
+  // the command starts, then no more JSONL lines for the whole run. If that one
+  // tick lands before `firstPaintMin` the paint is held — and pre-fix the
+  // heartbeat skipped `messageId == null` handles, so nothing ever re-drove the
+  // paint and the worker showed NOTHING for its entire run. The heartbeat now
+  // performs the first paint once the held handle is past `firstPaintMin`.
+  it('(vi) paints a prose-silent worker whose only tick arrived before firstPaintMin, via a later heartbeat', async () => {
+    const bot = makeFakeBot()
+    let clock = 0
+    const feed = createWorkerActivityFeed({
+      bot,
+      now: () => clock,
+      firstPaintMinMs: 8000,
+      heartbeatTickMs: 6000,
+      minEditIntervalMs: 2500,
+      setInterval: () => 1,
+      clearInterval: () => {},
+    })
+    const drain = () => new Promise((r) => setTimeout(r, 0))
+
+    // A single tool tick at 2s (the Bash invocation) — before firstPaintMin,
+    // so the paint is held. This is the ONLY update the worker ever sends.
+    clock = 2000
+    await feed.update('w1', 'chat', view({ elapsedMs: 2000, toolCount: 1, latestSummary: '' }))
+    expect(bot.sent).toHaveLength(0)
+    expect(feed.messageIdOf('w1')).toBeNull()
+
+    // A heartbeat still before firstPaintMin holds — trivial workers stay silent.
+    clock = 6000
+    feed.heartbeatTick()
+    await drain()
+    expect(bot.sent).toHaveLength(0)
+    expect(feed.messageIdOf('w1')).toBeNull()
+
+    // A heartbeat PAST firstPaintMin performs the first paint — the worker
+    // becomes visible even though it never emitted prose or a second tick.
+    clock = 12_000
+    feed.heartbeatTick()
+    await drain()
+    expect(bot.sent).toHaveLength(1)
+    expect(feed.messageIdOf('w1')).toBe(1000)
+    expect(bot.sent[0].text).toContain('🛠 **Worker**')
+
+    // And it keeps updating: a later heartbeat edits the message with a
+    // climbing `· Ns` suffix so the still-alive worker visibly advances.
+    clock = 20_000
+    feed.heartbeatTick()
+    await drain()
+    expect(bot.edits.length).toBeGreaterThanOrEqual(1)
+    // No narrative step (prose-silent) → the advance shows in the header's
+    // climbing master elapsed rather than a `· Ns` step suffix.
+    expect(bot.edits[bot.edits.length - 1].text).toMatch(/_\d+s · 1 tool_/)
+  })
+
+  it('(vii) still holds a trivial sub-firstPaintMin worker silent (heartbeat never force-paints early)', async () => {
+    const bot = makeFakeBot()
+    let clock = 0
+    const feed = createWorkerActivityFeed({
+      bot,
+      now: () => clock,
+      firstPaintMinMs: 8000,
+      heartbeatTickMs: 6000,
+      setInterval: () => 1,
+      clearInterval: () => {},
+    })
+    const drain = () => new Promise((r) => setTimeout(r, 0))
+    // Worker ticks once at 1s then finishes at 3s (handback covers it). No
+    // heartbeat before firstPaintMin may paint it.
+    clock = 1000
+    await feed.update('w1', 'chat', view({ elapsedMs: 1000, toolCount: 1, latestSummary: '' }))
+    clock = 3000
+    feed.heartbeatTick()
+    await drain()
+    expect(bot.sent).toHaveLength(0)
+    await feed.finish('w1', view({ state: 'done', toolCount: 1 }))
+    // finish with no posted message → no recap edit (handback covers the result).
+    expect(bot.edits).toHaveLength(0)
+  })
 })
 
 // ─── Extreme-edge: single oversized narrative line (no-truncate ON) ──────────
