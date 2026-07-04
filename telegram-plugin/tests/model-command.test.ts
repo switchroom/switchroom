@@ -226,6 +226,26 @@ describe("handleModelCommand — set", () => {
     expect(reply.text).not.toContain("earlier prose that must not leak");
   });
 
+  it("does NOT relay scrollback prose that merely contains 'switched'/'set model' as ordinary words", async () => {
+    // No line begins with claude's real confirmation phrasing — these are just
+    // English sentences that happen to use the words. None must be relayed.
+    const prose = [
+      "I switched the deploy to blue-green as we discussed.",
+      "Then I set model behaviour aside and moved on to the tests.",
+      "The team kept model changes out of this release entirely.",
+    ].join("\n");
+    const { deps } = makeDeps({ inject: async () => okResult(prose) });
+    const reply = await handleModelCommand({ kind: "set", model: "fable" }, deps);
+    // The anchored regex rejects all three lines, so nothing leaks and there is
+    // no <pre> block. A clean session confirmation is sent instead.
+    expect(reply.text).not.toContain("<pre>");
+    expect(reply.text).not.toContain("switched the deploy");
+    expect(reply.text).not.toContain("set model behaviour");
+    expect(reply.text).not.toContain("kept model changes");
+    expect(reply.text).toContain("switched (session)");
+    expect(reply.html).toBe(true);
+  });
+
   it("re-gates the model arg at the seam (caller bypassing the parser)", async () => {
     const { deps, calls } = makeDeps();
     const reply = await handleModelCommand({ kind: "set", model: "a b; reboot" }, deps);

@@ -840,9 +840,21 @@ export function modelSwitchConfirmationLine(output: string): string | null {
   const line = output
     .split('\n')
     .map((l) => l.trim())
-    .find((l) => /set model|switched|kept model/i.test(l))
+    .find((l) => MODEL_SWITCH_CONFIRMATION_PREFIX.test(l))
   return line && line.length > 0 ? line : null
 }
+
+/**
+ * claude's real model-switch confirmation always begins the line (optionally
+ * behind a status glyph like `⏺` + whitespace) with one of these exact
+ * phrasings. Anchoring to the line start keeps ordinary scrollback prose that
+ * merely *contains* words like "switched" or "set model" (e.g. "I switched the
+ * deploy to blue-green") from false-positiving as a confirmation worth
+ * relaying. Shared by `modelSwitchConfirmationLine` (does this line qualify?)
+ * and `sessionModelFromConfirmation` (pull the name out).
+ */
+const MODEL_SWITCH_CONFIRMATION_PREFIX =
+  /^\s*[⏺●•>-]?\s*(?:Set model to|Switched to|Kept model as)\b/i
 
 /**
  * Pull the model NAME out of claude's session-switch confirmation so it can
