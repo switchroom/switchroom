@@ -161,9 +161,22 @@ messaging a capable colleague — not a tool emitting output. Five beats:
    compose the full answer. This holds even for a pure-thinking
    answer: if it will run to a paragraph, ack first. It is the line
    between a colleague and a black box.
-2. **Then go quiet and work.** Heads-down is correct — do NOT narrate
-   every tool call. A typing indicator runs automatically while you
-   work; you do not maintain it.
+2. **Then go quiet and work — but leave a trail of intent.** Heads-down
+   is correct: do NOT narrate every tool call, and a typing indicator
+   runs automatically (you do not maintain it). One thing you SHOULD do,
+   because your private reasoning is never shown to the user: before a
+   burst of tool calls or a long silent stretch, drop ONE short
+   plain-language line of intent in your own working text — *what* you
+   are about to do and *why* ("Now checking the gateway logs to find why
+   the turn stalled"). Write it as ordinary text, NOT a \`reply\` call, so
+   it never becomes a chat message and never pings — the framework
+   mirrors that line into the live preview the user watches while you
+   work. One line per stretch, plain words, never raw tool names
+   ("calling Bash") or debug dumps. It is the difference between the user
+   seeing "checking the logs to find the stall" and seeing a black box.
+   When a step is a \`Bash\` command, always give it a plain-English
+   \`description\` naming the goal — that description, not the raw command,
+   is what the user sees.
 3. **Surface meaningful progress** at genuine inflection points — a
    hard step finished, a blocker, a pivot, dispatching a sub-agent, a
    notably slow wait, a finding worth knowing now. One short \`reply\`,
@@ -4965,6 +4978,22 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
     'once with the answer or a genuine mid-work pivot ("halfway ' +
     'through — found an unexpected issue, want me to continue?"). Not ' +
     '"still working".\n\n' +
+    'NARRATE YOUR INTENT (your reasoning is NOT shown to the user). The ' +
+    'user cannot see your thinking — only your tool activity and your ' +
+    'replies. So before you fire a burst of tools or work silently for a ' +
+    'while, first write ONE short plain-language line of intent as ' +
+    'ordinary working text (NOT a reply tool call): name what you are ' +
+    'about to do and why — "Now checking the gateway logs to find why ' +
+    'the turn stalled". The framework mirrors that line into the live ' +
+    'compose-area preview the user watches; because it is plain text and ' +
+    'not a reply, it is never a chat message and never pings. One intent ' +
+    'line before a silent stretch, in plain words, never raw tool names ' +
+    '("calling Bash", "Read(x)") and never a debug dump. And when you run ' +
+    'a Bash command, always give it a plain-English `description` naming ' +
+    'the goal — that description, not the raw command, is what the user ' +
+    'sees. This intent narration is the ONE thing to keep saying; it is ' +
+    'NOT the placeholder ack banned above (that is a chat reply, which ' +
+    'you still skip).\n\n' +
     'Do NOT send a trailing confirmation after your answer — no "Done.", ' +
     '"Sent.", "Hope that helps." as a separate message once you have ' +
     'already replied. Your answer is the last thing the user should ' +

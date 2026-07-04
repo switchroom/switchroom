@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync, readlinkSync, lstatSync, readdirSync, cpSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { scaffoldAgent, reconcileAgent, installHindsightPlugin, installSwitchroomSkills } from "../src/agents/scaffold.js";
+import { scaffoldAgent, reconcileAgent, installHindsightPlugin, installSwitchroomSkills, renderFleetInvariants } from "../src/agents/scaffold.js";
 import { renderTemplate, renderProfileClaudeTemplate } from "../src/agents/profiles.js";
 import { cronScriptFilename, cronUnitName } from "../src/agents/cron-unit-name.js";
 import type { AgentConfig, SwitchroomConfig, TelegramConfig } from "../src/config/schema.js";
@@ -2635,6 +2635,67 @@ describe("scaffoldAgent with global defaults cascade", () => {
     expect(cmd).toMatch(/Skip the hollow openers/);
     expect(cmd).toMatch(/Genuine acknowledgement is fine/);
     expect(cmd).toMatch(/plain punctuation/);
+  });
+
+  it("turn-pacing directive carries the intent-narration carrier (thinking-redacted visibility)", () => {
+    // Option 2 of the thinking-visibility work: with extended-thinking
+    // text server-redacted for the current flagship models, the model's
+    // own plain-language intent narration is the ONLY compliant carrier
+    // for "what am I doing / why". The directive must instruct the model
+    // to drop a one-line intent (as ordinary working text, NOT a reply)
+    // before a silent tool stretch — and to distinguish it from the
+    // banned placeholder ack. It must stay inside the job's bad-list:
+    // no per-tool-call narration, no raw tool names, no debug dumps.
+    const agentConfig = makeAgentConfig({});
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "narration-agent": agentConfig },
+    } as SwitchroomConfig;
+    const result = scaffoldAgent(
+      "narration-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+      switchroomConfig,
+    );
+    const settings = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+    const cmd = (settings.hooks.UserPromptSubmit as Array<{
+      hooks: Array<{ command: string }>;
+    }>)
+      .flatMap((g) => g.hooks)
+      .find((h) => h.command.includes("turn-pacing"))!.command;
+    // The intent-narration carrier is present.
+    expect(cmd).toMatch(/NARRATE YOUR INTENT/);
+    expect(cmd).toMatch(/reasoning is NOT shown/);
+    // It is transcript text mirrored to the preview, NOT a reply.
+    expect(cmd).toMatch(/ordinary working text \(NOT a reply/);
+    expect(cmd).toMatch(/live[\s\S]{0,40}preview/);
+    // It respects the bad-list: no raw tool names, no debug dumps.
+    expect(cmd).toMatch(/never raw tool names/);
+    expect(cmd).toMatch(/never a debug dump/);
+    // Bash gets a plain-English description (the draft-mirror carrier).
+    expect(cmd).toMatch(/plain-English `description`/);
+    // It is explicitly distinguished from the banned placeholder ack.
+    expect(cmd).toMatch(/NOT the placeholder ack/);
+  });
+
+  it("TELEGRAM_GUIDANCE beat 2 carries the intent-narration trail", () => {
+    // The static fleet-invariant block (shipped to every agent via
+    // ~/.switchroom/fleet/switchroom-invariants.md, not just the per-turn
+    // hook) must also teach the intent-narration carrier, so agents that
+    // read the static block still get it. Beat 2 is where "go quiet and
+    // work" lives — the narration trail rides alongside it.
+    const invariants = renderFleetInvariants();
+    expect(invariants).toMatch(/leave a trail of intent/);
+    expect(invariants).toMatch(/private reasoning is never shown/);
+    expect(invariants).toMatch(/NOT a `reply` call/);
+    expect(invariants).toMatch(/plain-English\s+`description`/);
+    // Bad-list guardrails travel with it (no per-tool spam / raw names).
+    expect(invariants).toMatch(/never raw tool names/);
+    expect(invariants).toMatch(/debug dumps/);
   });
 
   it("turn-pacing directive carries the decision-first turn-end shape (#2707)", () => {
