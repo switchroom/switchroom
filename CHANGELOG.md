@@ -13,7 +13,98 @@ read-only ledger reader (`src/web/fleet-health-read.ts`) and the top-level
 that will run the detection crons). Feature is inert until an owner is
 assigned.
 
-## unreleased — Fleet Health live detection pipeline (model-free sensor, priority ledger, GH-issue lifecycle)
+## v0.16.46 — Voice pipeline: eager pre-synthesis + deterministic TTS normalization; intent-narration pacing; formatting, handback & model-picker fixes
+
+Voice-out gets faster and cleaner, thinking-visibility gets a reliable
+carrier, and a batch of Telegram/web/model fixes land alongside two
+CHANGELOG sections that shipped without a version header (folded in below).
+
+### Voice
+
+- **Eager pre-synthesis + attach-on-tap Listen + 7-day rolling cleanup**
+  (#2766/#2763): whenever a reply becomes Listen-eligible the gateway kicks
+  an async background kokoro synth off the reply critical path, writes the
+  audio under `TELEGRAM_STATE_DIR/voice-cache/<token>.ogg`, and tapping 🔊
+  Listen attaches the pre-made file instantly instead of waiting on the GPU.
+  New `telegram-plugin/voice-presynth.ts` (bounded FIFO `PreSynthQueue`,
+  `sweepVoiceCacheDir` with 7-day TTL + 500MB oldest-first budget, atomic
+  writer, kill switch `SWITCHROOM_DISABLE_EAGER_VOICE=1`). On-demand entry
+  TTL raised 1h → 7 days; local engine only (the openai cloud path never
+  eager-synthesizes); missing/expired entries fall back to lazy synth.
+- **Deterministic L1 TTS normalization before `/tts`** (#2762/#2760 Phase 1):
+  new pure `telegram-plugin/tts-normalize.ts` (markdown strip, spoken URLs,
+  emoji, currency, percentages, ordinals, times, ISO dates, phone digit runs,
+  units, symbol expansion) applied in the voice-out path right before the
+  `/tts` body is built, mirroring `text-voice-scrub.ts` (inline-code
+  park/restore, kill switch). Wired at both body-build sites
+  (`synthesizeVoiceOut` kokoro+openai, and the on-demand Listen tap). Shipped
+  default-on; `SWITCHROOM_DISABLE_TTS_NORMALIZE` wins as the kill switch.
+
+### Pacing / thinking-visibility
+
+- **Intent-narration as the reliable thinking-visibility carrier** (#2761):
+  flagship models server-redact interstitial thinking text, so the model's
+  own plain-language intent narration is the only compliant "what am I doing"
+  carrier during a silent tool burst. Strengthens the pacing prompt
+  (`TELEGRAM_GUIDANCE` beat 2 + the per-turn `<turn-pacing>` directive) so a
+  one-line plain intent reliably precedes tool bursts, and always give Bash a
+  plain-English description as the visible label — without per-tool-call
+  message spam or raw tool names. Contract pinned in `scaffold.test.ts` + a
+  new `jtbd-narration-intent-dm` UAT scenario.
+
+### Telegram / formatting / model
+
+- **Fleet-wide consistent outbound formatting** (#2755): deterministic
+  typography at the gateway, identical on reply / edit_message / stream_reply.
+  `addParagraphSpacers` inserts the U+00A0 spacer line at every block
+  transition (keeping list/table/quote interiors tight); new
+  `normalizePunctuation` (em/en dashes → comma or hyphen, unicode bullets →
+  `- `) and `stripExcessBold` (over-bold tripwire). Floor "Formatting for
+  Telegram" card + its `reference/telegram-formatting-guide.md` mirror
+  rewritten to one concise shared spec.
+- **Sub-agent handback survives Claude Code split-line writes** (#2758):
+  Claude Code 2.1.199 now splits one logical assistant message across
+  multiple JSONL lines sharing a `message.id`, stamping terminal
+  `stop_reason: end_turn` on every split line (including the leading
+  thinking-only line). `projectSubagentLine` now treats `end_turn` as
+  terminal only on a line carrying the answer surface (non-empty text or a
+  real non-Agent/Task tool_use), so background/sub-agent work keeps surfacing
+  in the thread. Legacy single-line shape degrades identically.
+- **Hermes model picker uses family aliases; `model.info` reads config**
+  (#2759, part of #2757 gap 3): the picker injected pinned concrete ids
+  (incl. the retired `claude-fable-5` that 4xx'd the fleet); switch
+  `SWITCHROOM_MODELS` to the CLI-resolved family aliases
+  (fable/opus/sonnet/haiku). `model.info` (RPC + `GET /api/model/info`) now
+  reports the agent's configured model from `switchroom.yaml` instead of a
+  hardcoded `claude-sonnet-5`.
+- **sonnet-5 pins, vault reason alias, async always-allow save, idempotent
+  scaffold** (#2756): bump every live `claude-sonnet-4-6` default to
+  `claude-sonnet-5`; `vault_request_access` accepts `why` as a `reason`
+  alias (reason wins when both present); always-allow save acks the tap
+  immediately then persists in a 12-min background continuation with the real
+  outcome edited back; `writeFileSyncIfChanged` + `dirContentEquals` skip
+  byte-identical scaffold rewrites.
+
+### CI / docs / tests
+
+- **Live Telegram UAT made on-demand only** (#2765): `UAT_GATE_ENABLED` repo
+  var flipped false (operator decision 2026-07-04) so PRs/merges stop burning
+  subscription quota on a live Opus turn; the sentinel treats var-off as pass,
+  and `workflow_dispatch` bypasses the var + path filter so a manual
+  `gh workflow run ci-uat.yml` always executes.
+- **CLAUDE.md refresh** (#2764): rewrite the root CLAUDE.md against the
+  current tree (1099 → ~360 lines), every claim re-verified — required-check
+  count 10 → 11, corrected npm scripts, current `src/` layout, developer-
+  ownership test-failure stance, uat-gate SLA + flake guidance, PR-hygiene
+  and root-context uid-0 editing pitfalls.
+- **tool-label-pretool root test aligned with #2758 label rewrite** (#2769):
+  update the 4 stale vitest expectations to the shipped hook label strings,
+  clearing vitest-shard (3) red on main.
+- **Drop dead `src/watchdog` test globs from `test:bun`** (#2768, fixes
+  #2767): `src/watchdog/` was removed but `test:bun` still listed its two
+  test files; removing the dead globs keeps the test surface honest.
+
+### Fleet Health live detection pipeline (model-free sensor, priority ledger, GH-issue lifecycle)
 
 The machinery that populates the ledger the admin page reads (RFC
 `reference/rfcs/fleet-health.md`; serves `fleet-stays-healthy`). A new
@@ -42,7 +133,7 @@ Documents the two owner-agent crons (nightly sensor, weekly deep-dive) and the
 mapping/scoring in the RFC + a new `docs/fleet-health.md`. Per-agent cron config
 and per-agent ledger state are never committed.
 
-## unreleased — Voice PR-B2: local GPU STT sidecar (gateway consuming side + token injection)
+### Voice PR-B2: local GPU STT sidecar (gateway consuming side + token injection)
 
 Wires the gateway's voice-in path to the local `voice-sidecar` GPU
 speech-to-text service when the host's PR-B1 voice verdict is `engine: local`.
