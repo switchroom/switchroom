@@ -329,12 +329,13 @@ describe("planRollout — hostd context (#2487)", () => {
     const kinds = steps.map((s) =>
       s.kind === "restart-agent" ? `r:${s.agent}` : s.kind,
     );
-    // apply → canary (test-harness) → persist-pin → rest → sweep.
+    // apply → canary (test-harness) → persist-pin → rest → refresh-hindsight → sweep.
     expect(kinds).toEqual([
       "apply",
       "r:test-harness",
       "persist-pin",
       "r:clerk",
+      "refresh-hindsight",
       "sweep",
     ]);
     // persist-pin comes strictly AFTER the canary restart.
@@ -350,6 +351,20 @@ describe("planRollout — hostd context (#2487)", () => {
     }).map((s) => s.kind);
     expect(kinds).not.toContain("refresh-web");
     expect(kinds).not.toContain("refresh-hostd");
+  });
+
+  it("RECREATES the hindsight singleton (standalone docker run — hostd can recreate it)", () => {
+    const steps = planRollout(["clerk", "marko"], {
+      pinToPersist: TARGET,
+      hostdContext: true,
+    });
+    const kinds = steps.map((s) => s.kind);
+    // hindsight is a standalone `docker run` hostd owns via the docker
+    // socket — it must be rolled so the memory backend isn't left a version
+    // behind (unlike refresh-web/refresh-hostd, separate compose projects).
+    expect(kinds).toContain("refresh-hindsight");
+    // ...and it lands immediately before the final sweep.
+    expect(kinds.indexOf("refresh-hindsight")).toBe(kinds.indexOf("sweep") - 1);
   });
 
   it("host-shell path is unchanged — persist FIRST, web/hostd present", () => {

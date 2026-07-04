@@ -162,6 +162,12 @@ export function planRollout(
       // the persist intent consistent.
       steps.push({ kind: "persist-pin", pin: opts.pinToPersist });
     }
+    // Recreate the hindsight singleton so a hostd/agent-driven roll doesn't
+    // leave the memory backend a version behind (refresh-web/refresh-hostd
+    // stay host-side — separate compose projects; hindsight is a standalone
+    // `docker run` hostd can recreate via the docker socket). The executor's
+    // refresh-hindsight case self-guards via hindsightExists().
+    steps.push({ kind: "refresh-hindsight" });
     steps.push({ kind: "sweep" });
     return steps;
   }
