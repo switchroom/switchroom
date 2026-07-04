@@ -17,11 +17,10 @@
  * last line of defence at the actual /tts body build. Rules where both
  * passes apply are no-ops the second time.
  *
- * Gating (issue: "off by default until proven"):
- *   - ENABLED only when `SWITCHROOM_TTS_NORMALIZE=1` (or `true`).
- *   - Additionally, `SWITCHROOM_DISABLE_TTS_NORMALIZE=1` is a kill switch
- *     that wins even when the enable flag is set — same shape as
- *     `SWITCHROOM_DISABLE_VOICE_SCRUB`; rollback is one env var.
+ * Gating: ON BY DEFAULT (operator decision 2026-07-04 — Phase 1 ships
+ * default-on). The only gate is the kill switch:
+ * `SWITCHROOM_DISABLE_TTS_NORMALIZE=1` returns the input byte-identical —
+ * same shape as `SWITCHROOM_DISABLE_VOICE_SCRUB`; rollback is one env var.
  *
  * Rules (en locale, deterministic, conservative — when unsure, pass
  * text through unchanged):
@@ -42,12 +41,10 @@
 const NULL = '\x00'
 const INLINE_PH = `${NULL}TN_INLINE`
 
-/** Enabled = opt-in flag set AND kill switch not set. */
+/** On by default; the kill switch is the only gate. */
 export function ttsNormalizeEnabled(): boolean {
   const kill = process.env.SWITCHROOM_DISABLE_TTS_NORMALIZE
-  if (kill === '1' || kill === 'true') return false
-  const on = process.env.SWITCHROOM_TTS_NORMALIZE
-  return on === '1' || on === 'true'
+  return !(kill === '1' || kill === 'true')
 }
 
 // ---------------------------------------------------------------------------
@@ -262,25 +259,31 @@ export function normalizeForTts(text: string): string {
   })
 
   // -- Phone-like digit runs → digit-by-digit. Fires ONLY on clearly
-  //    phone-shaped tokens (optional +country, groups of digits with
-  //    spaces/hyphens, 7+ digits total) so ordinary numbers are untouched.
+  //    phone-shaped tokens: a leading + (international), or a leading 0
+  //    (national) with separator-delimited 2-4-digit grouping; 7-15
+  //    digits total. Ordinary space-separated numbers ("1024 2048 4096")
+  //    and short groupings without a phone prefix ("12 34 56 78") stay
+  //    untouched.
   s = s.replace(/(?<![\w.])(\+?\d[\d\- ]{6,}\d)(?![\w.])/g, (m: string) => {
-    const digits = m.replace(/[^\d+]/g, '')
-    const digitCount = digits.replace(/\D/g, '').length
-    if (digitCount < 7 || digitCount > 15) return m
-    // A plain large integer (no separators, no +) is more likely a count
-    // than a phone number — leave it for the cardinal pass / as digits.
-    if (!/[+\- ]/.test(m)) return m
+    const digits = m.replace(/\D/g, '')
+    if (digits.length < 7 || digits.length > 15) return m
+    const groups = m.replace(/^\+/, '').split(/[- ]+/)
+    const phoneShaped =
+      m.startsWith('+') ||
+      (m.startsWith('0') &&
+        groups.length >= 2 &&
+        groups.every((g) => /^\d{2,4}$/.test(g)))
+    if (!phoneShaped) return m
     const words: string[] = []
-    for (const ch of digits) {
-      if (ch === '+') words.push('plus')
-      else words.push(ONES[Number(ch)]!)
-    }
+    if (m.startsWith('+')) words.push('plus')
+    for (const ch of digits) words.push(ONES[Number(ch)]!)
     return words.join(' ')
   })
 
-  // -- Times HH:MM (24h) → spoken.
-  s = s.replace(/\b([01]?\d|2[0-3]):([0-5]\d)\b/g, (_m, hh: string, mm: string) => {
+  // -- Times HH:MM (24h) → spoken. The (?!:?\d) guard skips HH:MM:SS
+  //    entirely — a half-spoken time with a dangling ":46" reads worse
+  //    than leaving the digits as-is.
+  s = s.replace(/\b([01]?\d|2[0-3]):([0-5]\d)(?!:?\d)/g, (_m, hh: string, mm: string) => {
     const h = Number(hh)
     const min = Number(mm)
     const hw = belowThousand(h)
@@ -289,18 +292,26 @@ export function normalizeForTts(text: string): string {
     return `${hw} ${belowThousand(min)}`
   })
 
-  // -- Currency: $5 → "five dollars"; $5.20 → "five dollars twenty".
-  s = s.replace(/\$(\d{1,9})(?:\.(\d{2}))?\b/g, (m, dollars: string, cents?: string) => {
-    const dw = numberToWords(Number(dollars))
-    if (!dw) return m
-    const noun = Number(dollars) === 1 && !cents ? 'dollar' : 'dollars'
-    if (cents && cents !== '00') {
-      const cw = numberToWords(Number(cents))
-      if (!cw) return m
-      return `${dw} ${noun} ${cw}`
-    }
-    return `${dw} ${noun}`
-  })
+  // -- Currency: $5 → "five dollars"; $5.20 → "five dollars twenty";
+  //    $1,000 → "one thousand dollars" (thousands separators consumed).
+  //    The trailing lookahead bails on odd-cents ("$5.203") and partial
+  //    thousands ("$1,00") — the whole token is left unchanged rather
+  //    than half-read.
+  s = s.replace(
+    /\$(\d{1,3}(?:,\d{3})+|\d{1,9})(?:\.(\d{2}))?(?![\d,]|\.\d)/g,
+    (m, dollarsRaw: string, cents?: string) => {
+      const dollars = Number(dollarsRaw.replace(/,/g, ''))
+      const dw = numberToWords(dollars)
+      if (!dw) return m
+      const noun = dollars === 1 && !cents ? 'dollar' : 'dollars'
+      if (cents && cents !== '00') {
+        const cw = numberToWords(Number(cents))
+        if (!cw) return m
+        return `${dw} ${noun} ${cw}`
+      }
+      return `${dw} ${noun}`
+    },
+  )
 
   // -- Percentages: 12% → "twelve percent"; 3.5% keeps digits + "percent".
   s = s.replace(/\b(\d{1,9})%/g, (m, n: string) => {

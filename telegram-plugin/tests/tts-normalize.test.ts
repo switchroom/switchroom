@@ -5,43 +5,36 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { normalizeForTts, ttsNormalizeEnabled } from '../tts-normalize.js'
 
-const FLAG = 'SWITCHROOM_TTS_NORMALIZE'
 const KILL = 'SWITCHROOM_DISABLE_TTS_NORMALIZE'
 
-let savedFlag: string | undefined
 let savedKill: string | undefined
 
 beforeEach(() => {
-  savedFlag = process.env[FLAG]
   savedKill = process.env[KILL]
-  process.env[FLAG] = '1'
   delete process.env[KILL]
 })
 
 afterEach(() => {
-  if (savedFlag === undefined) delete process.env[FLAG]
-  else process.env[FLAG] = savedFlag
   if (savedKill === undefined) delete process.env[KILL]
   else process.env[KILL] = savedKill
 })
 
 describe('gating', () => {
-  test('pass-through when flag is off (default)', () => {
-    delete process.env[FLAG]
-    const input = '**bold** $5.20 https://github.com/x 🚀'
-    expect(normalizeForTts(input)).toBe(input)
-    expect(ttsNormalizeEnabled()).toBe(false)
-  })
-
-  test('kill switch wins even when the flag is on', () => {
-    process.env[KILL] = '1'
-    const input = '**bold** and $5.20'
-    expect(normalizeForTts(input)).toBe(input)
-    expect(ttsNormalizeEnabled()).toBe(false)
-  })
-
-  test('enabled when flag=1 and no kill switch', () => {
+  test('ON by default — normalizes with no env vars set', () => {
     expect(ttsNormalizeEnabled()).toBe(true)
+    expect(normalizeForTts('**bold** $5.20')).toBe('bold five dollars twenty')
+  })
+
+  test('kill switch → byte-identical pass-through', () => {
+    process.env[KILL] = '1'
+    const input = '**bold** and $5.20 🚀 https://github.com/x'
+    expect(normalizeForTts(input)).toBe(input)
+    expect(ttsNormalizeEnabled()).toBe(false)
+  })
+
+  test('kill switch accepts "true"', () => {
+    process.env[KILL] = 'true'
+    expect(ttsNormalizeEnabled()).toBe(false)
   })
 
   test('empty input stays empty', () => {
@@ -86,6 +79,14 @@ describe('markdown', () => {
     expect(normalizeForTts('run `deploy_5km_run` now')).toBe(
       'run deploy_5km_run now',
     )
+  })
+
+  test('unterminated fence swallows to end-of-input (deliberate)', () => {
+    // An opening ``` with no close drops everything after it — reading
+    // half a code block aloud is worse than omitting it. Pinned as the
+    // intended trade-off.
+    const out = normalizeForTts('before\n```ts\nconst secret = 1\nmore code')
+    expect(out).toBe('before code block omitted.')
   })
 
   test('tables summarized as table omitted', () => {
@@ -133,6 +134,42 @@ describe('numbers', () => {
     expect(normalizeForTts('call 0412 345 678 now')).toBe(
       'call zero four one two three four five six seven eight now',
     )
+  })
+
+  test('international +-prefixed number read as digits', () => {
+    expect(normalizeForTts('call +61 412 345 678')).toBe(
+      'call plus six one four one two three four five six seven eight',
+    )
+  })
+
+  test('ordinary space-separated numbers stay untouched', () => {
+    expect(normalizeForTts('scores were 1024 2048 4096 today')).toBe(
+      'scores were 1024 2048 4096 today',
+    )
+  })
+
+  test('short digit groups without phone prefix stay untouched', () => {
+    // The unit pass may expand a trailing unit, but the digit groups
+    // themselves must never be read digit-by-digit.
+    const out = normalizeForTts('12 34 56 78 items')
+    expect(out).toBe('12 34 56 78 items')
+  })
+
+  test('currency with thousands separator: $1,000 → one thousand dollars', () => {
+    expect(normalizeForTts('paid $1,000 up front')).toBe(
+      'paid one thousand dollars up front',
+    )
+    expect(normalizeForTts('$12,345.67 total')).toBe(
+      'twelve thousand three hundred forty-five dollars sixty-seven total',
+    )
+  })
+
+  test('odd cents ($5.203) left unchanged rather than half-read', () => {
+    expect(normalizeForTts('value $5.203 today')).toBe('value $5.203 today')
+  })
+
+  test('HH:MM:SS left unchanged (no dangling seconds)', () => {
+    expect(normalizeForTts('at 12:34:56 sharp')).toBe('at 12:34:56 sharp')
   })
 
   test('units expand: 5km, 10GB, 500ms', () => {

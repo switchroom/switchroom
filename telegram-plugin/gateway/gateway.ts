@@ -8747,8 +8747,7 @@ async function synthesizeVoiceOut(plan: {
   try {
     // #2760 Phase 1: deterministic L1 TTS normalization, applied at the
     // single choke point where every engine's request body is built.
-    // No-op unless SWITCHROOM_TTS_NORMALIZE=1 (kill switch:
-    // SWITCHROOM_DISABLE_TTS_NORMALIZE).
+    // On by default; kill switch: SWITCHROOM_DISABLE_TTS_NORMALIZE=1.
     const ttsText = normalizeForTts(plan.ttsText)
     if (plan.engine === 'kokoro') {
       const token = await materializeSidecarToken()
