@@ -54,6 +54,52 @@ describe('vault_request_access — tap-to-unlock-and-approve UX', () => {
     expect(approveBlock).not.toMatch(/ask the agent to re-issue the request card/)
   })
 
+  it('passphrase prompt goes out as a NEW rich message, not an in-place edit', () => {
+    // fails when: the cache-miss branch reverts to overloading the
+    // ORIGINAL card as the prompt via editMessageText. An in-place
+    // edit fires no notification and stays stapled to the card's old
+    // position, so a busy topic buries it and the operator never sees
+    // the passphrase ask (the reported v0.16.45 admin-key miss). The
+    // prompt must be a fresh `sendRichMessage` below.
+    const approveBlock =
+      gatewaySrc.split('if (action === \'approve\')')[1]?.split('await ctx.answerCallbackQuery({ text: \'Unknown action\'')[0] ?? ''
+    // A distinct passphrase-prompt send exists (verb-tagged).
+    expect(approveBlock).toMatch(/sendRichMessage\(pending\.chat_id, richMessage\(promptText\)/)
+    expect(approveBlock).toMatch(/vault_request_access\.passphrase_prompt/)
+  })
+
+  it('passphrase prompt renders via richMessage — no raw literal-markdown edit', () => {
+    // ROOT CAUSE of the reported bug: the old admin-only and
+    // joining-batch branches passed RAW markdown strings (with literal
+    // `**`/`_`) straight to editMessageText (parse_mode=none), so the
+    // bold/italic rendered as literal characters, and the "locked"
+    // branch concatenated a string with a richMessage() object
+    // (→ "[object Object]"). Every branch must now flow through the
+    // richMessage() GFM render path.
+    const approveBlock =
+      gatewaySrc.split('if (action === \'approve\')')[1]?.split('await ctx.answerCallbackQuery({ text: \'Unknown action\'')[0] ?? ''
+    // The prompt text is assembled once and wrapped in richMessage.
+    expect(approveBlock).toMatch(/const promptText =/)
+    // Regression guard: the old raw-string admin-only edit copy is gone.
+    expect(approveBlock).not.toMatch(/requires your vault passphrase to grant/)
+    // Regression guard: no string-concatenated richMessage() object
+    // (the "[object Object]" bug) remains.
+    expect(approveBlock).not.toMatch(/\+\s*\n\s*richMessage\(/)
+  })
+
+  it('passphrase prompt is attention-grabbing and does NOT suppress notifications', () => {
+    // fails when: the prompt loses its strong header or someone adds
+    // disable_notification to it. The whole point of the fix is that
+    // the operator gets PINGED — a silent prompt is the bug.
+    const approveBlock =
+      gatewaySrc.split('if (action === \'approve\')')[1]?.split('await ctx.answerCallbackQuery({ text: \'Unknown action\'')[0] ?? ''
+    expect(approveBlock).toMatch(/ACTION NEEDED: passphrase required/)
+    // The send options for the prompt must not carry disable_notification.
+    const promptSend =
+      approveBlock.split('const promptText =')[1]?.split('return')[0] ?? ''
+    expect(promptSend).not.toMatch(/disable_notification/)
+  })
+
   it('passphrase intercept deletes the chat message and resumes mint', () => {
     // fails when: the new pending-op handler stops calling
     // deleteSensitiveMessage on the passphrase message OR stops
