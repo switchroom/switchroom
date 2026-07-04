@@ -184,13 +184,46 @@ describe("handleModelCommand — show / help never inject (picker-wedge guard)",
 });
 
 describe("handleModelCommand — set", () => {
-  it("injects exactly `/model <name>` once and relays output + persistence note", async () => {
+  it("injects exactly `/model <name>` once and relays a genuine confirmation + persistence note", async () => {
     const { deps, calls } = makeDeps();
     const reply = await handleModelCommand({ kind: "set", model: "opus" }, deps);
     expect(calls).toEqual([{ agent: "klanker", command: "/model opus" }]);
     expect(reply.text).toContain("<pre>⏺ Set model to sonnet</pre>");
     expect(reply.text).toContain("Session-only");
     expect(reply.html).toBe(true);
+  });
+
+  it("SILENT switch: suppresses raw pane scrollback instead of dumping it as a code block", async () => {
+    // claude switches models silently, so the pane capture below the command
+    // echo is just the agent's previous prose answer. It must NOT be relayed.
+    const scrollback = [
+      "Here's the summary you asked for earlier:",
+      "- point one about the deploy",
+      "- point two about the rollback plan",
+    ].join("\n");
+    const { deps } = makeDeps({ inject: async () => okResult(scrollback) });
+    const reply = await handleModelCommand({ kind: "set", model: "fable" }, deps);
+    // The leak: none of the scrollback prose reaches the reply, and there is
+    // no <pre> code block echoing the capture.
+    expect(reply.text).not.toContain("summary you asked for");
+    expect(reply.text).not.toContain("rollback plan");
+    expect(reply.text).not.toContain("<pre>");
+    // A clean, session-scoped confirmation is sent instead.
+    expect(reply.text).toContain("/model fable");
+    expect(reply.text).toContain("switched (session)");
+    expect(reply.text).toContain("Session-only");
+    expect(reply.html).toBe(true);
+  });
+
+  it("relays only the confirmation line when the capture also carries scrollback", async () => {
+    const mixed = [
+      "Some earlier prose that must not leak",
+      "⏺ Set model to Fable 5 for this session",
+    ].join("\n");
+    const { deps } = makeDeps({ inject: async () => okResult(mixed) });
+    const reply = await handleModelCommand({ kind: "set", model: "fable" }, deps);
+    expect(reply.text).toContain("<pre>⏺ Set model to Fable 5 for this session</pre>");
+    expect(reply.text).not.toContain("earlier prose that must not leak");
   });
 
   it("re-gates the model arg at the seam (caller bypassing the parser)", async () => {

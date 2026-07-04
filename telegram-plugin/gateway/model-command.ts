@@ -227,11 +227,30 @@ export async function handleModelCommand(
   }
 
   if (result.outcome === 'ok') {
+    // claude's `/model <name>` switches the session SILENTLY — it does not
+    // print a confirmation line. So `result.output` on this path is almost
+    // always just whatever pane scrollback sat below the command echo (the
+    // agent's previous prose answer). `isTuiChromeLine` strips borders/glyphs
+    // but NOT ordinary prose, so blindly `preBlock`-ing `result.output` here
+    // dumped that unrelated scrollback back to the user as a code block
+    // (screenshot-confirmed on klanker, v0.16.47). Only relay output when it
+    // actually looks like a model-switch acknowledgement; otherwise suppress
+    // it and send a clean confirmation.
+    const confirmation = modelSwitchConfirmationLine(result.output)
+    if (confirmation) {
+      return {
+        text: [
+          `${verbHtml}`,
+          deps.preBlock(confirmation),
+          ...(result.truncated ? ['_truncated_'] : []),
+          PERSIST_NOTE,
+        ].join('\n'),
+        html: true,
+      }
+    }
     return {
       text: [
-        `${verbHtml}`,
-        deps.preBlock(result.output),
-        ...(result.truncated ? ['_truncated_'] : []),
+        `${verbHtml} — switched (session).`,
         PERSIST_NOTE,
       ].join('\n'),
       html: true,
@@ -806,6 +825,23 @@ export function isSrToClaudeTransition(
   nextModel: string,
 ): boolean {
   return !!prevModel?.startsWith('sr-') && !nextModel.startsWith('sr-')
+}
+
+/**
+ * Return the single line of a pane capture that actually reads as claude's
+ * model-switch acknowledgement ("Set model to X…", "Switched to X", or
+ * "Kept model as X"), or null when no such line is present. Used by the
+ * direct `/model <name>` path to decide whether `result.output` carries a
+ * genuine confirmation worth relaying, versus mere scrollback that must NOT
+ * be echoed back to chat. Mirrors the line-scan already used by the picker
+ * alias/sr-* callback paths.
+ */
+export function modelSwitchConfirmationLine(output: string): string | null {
+  const line = output
+    .split('\n')
+    .map((l) => l.trim())
+    .find((l) => /set model|switched|kept model/i.test(l))
+  return line && line.length > 0 ? line : null
 }
 
 /**
