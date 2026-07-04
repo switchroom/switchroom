@@ -433,6 +433,13 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
   function heartbeatTick(): void {
     const now = nowFn()
     for (const h of handles.values()) {
+      // Orphan-paint guard: `finish()` deletes the handle in a `.finally` that
+      // may not have drained if a tick fires in the same synchronous stretch.
+      // Skip any handle no longer in the map so the first-paint branch below
+      // can never send a fresh `running` message on an already-finished worker
+      // (which would orphan a card that never finalizes). Restores the
+      // structural safety the pre-first-paint `messageId == null` skip gave.
+      if (!handles.has(h.agentId)) continue
       if (h.lastView == null) continue
       if (h.lastView.state !== 'running') continue
       if (now < h.cooldownUntil) continue

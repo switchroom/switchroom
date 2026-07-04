@@ -882,6 +882,39 @@ describe('createWorkerActivityFeed — heartbeat', () => {
     // finish with no posted message → no recap edit (handback covers the result).
     expect(bot.edits).toHaveLength(0)
   })
+
+  it('(viii) a finished, still-unpainted worker is NOT orphan-painted by a later heartbeat', async () => {
+    // Regression guard: the heartbeat first-paint branch must never send a
+    // fresh `running` message on an already-finished handle. finish() deletes
+    // the handle; a subsequent heartbeat (even one past firstPaintMin) must
+    // skip it — otherwise a permanently orphaned card that never finalizes.
+    const bot = makeFakeBot()
+    let clock = 0
+    const feed = createWorkerActivityFeed({
+      bot,
+      now: () => clock,
+      firstPaintMinMs: 8000,
+      heartbeatTickMs: 6000,
+      setInterval: () => 1,
+      clearInterval: () => {},
+    })
+    const drain = () => new Promise((r) => setTimeout(r, 0))
+    // One held tick before firstPaintMin — no paint yet.
+    clock = 2000
+    await feed.update('w1', 'chat', view({ elapsedMs: 2000, toolCount: 1, latestSummary: '' }))
+    expect(bot.sent).toHaveLength(0)
+    expect(feed.messageIdOf('w1')).toBeNull()
+    // Worker finishes while still unpainted (finish drops the handle).
+    await feed.finish('w1', view({ state: 'done', toolCount: 1 }))
+    expect(feed.messageIdOf('w1')).toBeNull()
+    // A heartbeat well past firstPaintMin must NOT paint a new message.
+    clock = 20_000
+    feed.heartbeatTick()
+    await drain()
+    expect(bot.sent).toHaveLength(0)
+    expect(bot.edits).toHaveLength(0)
+    expect(feed.messageIdOf('w1')).toBeNull()
+  })
 })
 
 // ─── Extreme-edge: single oversized narrative line (no-truncate ON) ──────────
