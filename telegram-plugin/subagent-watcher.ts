@@ -48,7 +48,7 @@ import { sanitiseToolArg } from './fleet-state.js'
 import { clipNarrative, describeToolUse } from './tool-activity-summary.js'
 import { REPLY_TOOLS, isDraftOfReply } from './narrative-dedup.js'
 import { truncate } from './card-format.js'
-import { bumpSubagentActivity, recordSubagentStall, recordSubagentResume, recordSubagentEnd, reapStuckRunningRows, countRunningBackgroundSubagents } from './registry/subagents-schema.js'
+import { bumpSubagentActivity, recordSubagentStall, recordSubagentResume, recordSubagentEnd, reapStuckRunningRows, countRunningBackgroundSubagents, recordNestedSubagentDispatch } from './registry/subagents-schema.js'
 import { touchTurnActiveMarker } from './gateway/turn-active-marker.js'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -183,6 +183,16 @@ export interface WorkerEntry {
    * `turn.lastReplyText`.
    */
   lastReplyText?: string
+  /**
+   * Wall-clock ms of the most recent RETRY of `backfillJsonlAgentId` from the
+   * liveness path (readSubTail's "row not in DB yet" branch). The one-shot
+   * backfill at registration loses the race for a NESTED worker: its row is
+   * written by recordNestedSubagentDispatch only when the watcher reads the
+   * PARENT worker's dispatch line, which can land after the child's own
+   * registration. Retrying (throttled) closes the "liveness skip … Phase 2
+   * Pre hook pending" window that froze nested cards on "starting…".
+   */
+  lastBackfillAttemptAt?: number
 }
 
 export interface SubagentWatcherConfig {
@@ -537,6 +547,13 @@ const DEFAULT_REAPER_INTERVAL_MS = 15 * 60_000     // 15 minutes
  */
 const TERMINAL_CLEANUP_GRACE_MS = 30_000
 
+/**
+ * Throttle for the liveness-path retry of `backfillJsonlAgentId` (see
+ * WorkerEntry.lastBackfillAttemptAt). Cheap (one meta.json read + two
+ * indexed lookups) but no reason to run it on every 1s poll tick.
+ */
+const BACKFILL_RETRY_INTERVAL_MS = 3000
+
 // ─── JSONL tail per sub-agent ─────────────────────────────────────────────
 
 interface SubTail {
@@ -674,21 +691,52 @@ export function backfillJsonlAgentId(
   // throws out of the watcher poll loop.
   try {
     const linkedRow = db
-      .prepare('SELECT started_at, parent_turn_key FROM subagents WHERE id = ?')
-      .get(candidateId) as { started_at: number; parent_turn_key: string | null } | null
+      .prepare('SELECT started_at, parent_turn_key, parent_agent_id FROM subagents WHERE id = ?')
+      .get(candidateId) as { started_at: number; parent_turn_key: string | null; parent_agent_id?: string | null } | null
     if (linkedRow != null && linkedRow.parent_turn_key == null) {
-      const turn = db
-        .prepare(
-          `SELECT turn_key FROM turns
-           WHERE started_at <= ? AND (ended_at IS NULL OR ended_at >= ?)
-           ORDER BY started_at DESC LIMIT 1`,
-        )
-        .get(linkedRow.started_at, linkedRow.started_at) as { turn_key: string } | null
-      if (turn?.turn_key != null) {
+      // Nested-parent inheritance FIRST: a depth-2+ worker's dispatching
+      // context is another sub-agent, not a gateway turn — its origin is its
+      // ancestor chain's turn key (stamped on the depth-1 row while the main
+      // turn was still active). The time-window match below can never be
+      // right for it (the turn had typically ended before the nested dispatch
+      // happened, and overlapping windows mis-attribute).
+      let resolvedKey: string | null = null
+      if (linkedRow.parent_agent_id != null && linkedRow.parent_agent_id.length > 0) {
+        const seen = new Set<string>([agentId])
+        let cursor: string | null = linkedRow.parent_agent_id
+        for (let hop = 0; hop < 5 && cursor != null && !seen.has(cursor); hop++) {
+          seen.add(cursor)
+          const parentRow = db
+            .prepare('SELECT parent_turn_key, parent_agent_id FROM subagents WHERE jsonl_agent_id = ? LIMIT 1')
+            .get(cursor) as { parent_turn_key: string | null; parent_agent_id?: string | null } | null
+          if (parentRow == null) break
+          if (parentRow.parent_turn_key != null && parentRow.parent_turn_key.length > 0) {
+            resolvedKey = parentRow.parent_turn_key
+            break
+          }
+          cursor = parentRow.parent_agent_id ?? null
+        }
+        if (resolvedKey != null) {
+          log?.(`subagent-watcher: backfill parent_turn_key ${candidateId} → ${resolvedKey} (inherited via nested-parent chain)`)
+        }
+      }
+      if (resolvedKey == null) {
+        const turn = db
+          .prepare(
+            `SELECT turn_key FROM turns
+             WHERE started_at <= ? AND (ended_at IS NULL OR ended_at >= ?)
+             ORDER BY started_at DESC LIMIT 1`,
+          )
+          .get(linkedRow.started_at, linkedRow.started_at) as { turn_key: string } | null
+        if (turn?.turn_key != null) {
+          resolvedKey = turn.turn_key
+          log?.(`subagent-watcher: backfill parent_turn_key ${candidateId} → ${resolvedKey}`)
+        }
+      }
+      if (resolvedKey != null) {
         db
           .prepare('UPDATE subagents SET parent_turn_key = ? WHERE id = ?')
-          .run(turn.turn_key, candidateId)
-        log?.(`subagent-watcher: backfill parent_turn_key ${candidateId} → ${turn.turn_key}`)
+          .run(resolvedKey, candidateId)
       }
     }
   } catch (err) {
@@ -783,6 +831,22 @@ export function readSubTail(
           .get(entry.agentId) as { id: string; background: number } | null
         if (existing == null) {
           log?.(`subagent-watcher: liveness skip ${entry.agentId} — row not in DB yet (Phase 2 Pre hook pending)`)
+          // Retry the jsonl link (throttled). Registration's one-shot backfill
+          // loses the race for a NESTED worker whose row is only written when
+          // the watcher reads the PARENT's dispatch line — without this retry
+          // the row never links, the worker is misclassified foreground, and
+          // its card freezes on "starting…" forever (the depth-2+ freeze).
+          if (
+            entry.lastBackfillAttemptAt == null ||
+            now - entry.lastBackfillAttemptAt >= BACKFILL_RETRY_INTERVAL_MS
+          ) {
+            entry.lastBackfillAttemptAt = now
+            try {
+              backfillJsonlAgentId(db, entry.filePath, entry.agentId, log)
+            } catch (bfErr) {
+              log?.(`subagent-watcher: backfill retry error ${entry.agentId}: ${(bfErr as Error).message}`)
+            }
+          }
         } else {
           bumpSubagentActivity(db, { id: existing.id, ts: now })
           isForeground = existing.background === 0
@@ -977,6 +1041,36 @@ export function readSubTail(
               } catch (cbErr) {
                 log?.(`subagent-watcher: onProgress (tool) callback error ${entry.agentId}: ${(cbErr as Error).message}`)
               }
+            }
+          }
+        } else if (ev.kind === 'sub_agent_nested_spawn') {
+          // Nested (depth-2+) dispatch keying: this worker just dispatched a
+          // sub-agent of its own. The PreToolUse hook can't attribute it (the
+          // main turn's turn-active.json marker is long gone for a background
+          // worker, and under concurrent nested dispatch the hook's write can
+          // be lost entirely) — but WE are reading the authoritative dispatch
+          // line right now. Record/repair the child's registry row: ensure it
+          // exists (keyed on the dispatch tool_use_id, which the child's
+          // meta.json `toolUseId` links against), stamp `parent_agent_id` =
+          // this worker's jsonl stem, and inherit `parent_turn_key`
+          // transitively so origin-chat routing works at any depth. Rendering
+          // is unchanged (design §5.5 "no recursion in rendering") — this is
+          // registry keying only. Fire-and-forget: a DB hiccup must never
+          // break the tail loop.
+          if (db != null && ev.toolUseId != null && ev.toolUseId.length > 0) {
+            try {
+              const nestedInput = (ev.input ?? {}) as Record<string, unknown>
+              recordNestedSubagentDispatch(db, {
+                toolUseId: ev.toolUseId,
+                parentJsonlAgentId: entry.agentId,
+                agentType: typeof nestedInput.subagent_type === 'string' ? nestedInput.subagent_type : null,
+                description: typeof nestedInput.description === 'string' ? nestedInput.description : null,
+                background: nestedInput.run_in_background === true,
+                now,
+              })
+              log?.(`subagent-watcher: nested dispatch recorded parent=${entry.agentId} toolUseId=${ev.toolUseId}`)
+            } catch (dbErr) {
+              log?.(`subagent-watcher: nested dispatch record error ${entry.agentId}: ${(dbErr as Error).message}`)
             }
           }
         } else if (ev.kind === 'sub_agent_text') {
@@ -1292,6 +1386,23 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
             log?.(`subagent-watcher: backfill error for ${agentId}: ${(err as Error).message}`)
           }
         }
+        // Historical/onProgress gate-ordering fix: the initial read above ran
+        // while `entry.historical` was still TRUE, so every onProgress cue it
+        // would have fired was suppressed by the `!entry.historical` guard —
+        // and the tail cursor is now at EOF, so for a quiet worker no later
+        // tick ever re-fires them. The card painted as a bare stub and froze
+        // on "starting…" forever. Re-read from the start now that the entry
+        // is live: the replayed events rebuild toolCount/lastTool/narrative
+        // AND fire onProgress so the worker's card reaches real activity.
+        entry.toolCount = 0
+        entry.lastTool = null
+        entry.pendingNarrative = null
+        tail.cursor = 0
+        tail.pendingPartial = ''
+        tail.hasEmittedStart = false
+        readSubTail(entry, tail, n, (desc) => {
+          log?.(`subagent-watcher: description updated for ${agentId}: ${desc}`)
+        }, fs, log, db, parentStateDir, config.onUnstall, undefined, config.onProgress)
       }
     }
 

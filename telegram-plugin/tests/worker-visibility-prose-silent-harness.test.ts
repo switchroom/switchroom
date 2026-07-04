@@ -179,12 +179,15 @@ function makeHarness() {
     },
     // Mirror the gateway's onProgress → workerActivityFeed.update wiring for a
     // background worker (worker-feed owns the progress beat).
-    onProgress: ({ agentId: id, description, latestSummary, elapsedMs, lastTool, toolCount }) => {
+    onProgress: ({ agentId: id, description, latestSummary, elapsedMs, lastTool, toolCount, progressLine }) => {
       const view: WorkerActivityView = {
         description,
         lastTool,
         toolCount,
-        latestSummary,
+        // Mirror the gateway's step-line precedence: the friendly tool label
+        // on tool ticks, else the narrative (the unified-cards fix — a
+        // tools-only worker must grow real steps, not freeze on "starting…").
+        latestSummary: progressLine != null && progressLine.length > 0 ? progressLine : latestSummary,
         elapsedMs,
         state: 'running',
       }

@@ -16,6 +16,7 @@ function makeSub(over: Partial<Subagent>): Subagent {
     status: 'running',
     result_summary: null,
     jsonl_agent_id: 'a37ad7639ae61476c',
+    parent_agent_id: null,
     ...over,
   }
 }
@@ -136,5 +137,29 @@ describe('resolveWorkerFeedDispatch — randomized property sweep', () => {
       // 5. Pure + deterministic: identical inputs yield a deep-equal result.
       expect(resolveWorkerFeedDispatch(sub, watcher), ctx).toEqual(out)
     }
+  })
+})
+
+describe('resolveWorkerFeedDispatch — nested/row-presence signals (unified progress cards)', () => {
+  it('hasRow=false for a missing registry row (never silently foreground-nest it)', () => {
+    const out = resolveWorkerFeedDispatch(null, 'sub-agent')
+    expect(out.hasRow).toBe(false)
+    expect(out.isNested).toBe(false)
+  })
+
+  it('hasRow=true for any present row', () => {
+    expect(resolveWorkerFeedDispatch(makeSub({}), 'sub-agent').hasRow).toBe(true)
+  })
+
+  it('isNested=true when parent_agent_id is set (depth-2+ dispatch)', () => {
+    const sub = makeSub({ parent_agent_id: 'ac15e1e3528f421d6', background: false })
+    const out = resolveWorkerFeedDispatch(sub, 'sub-agent')
+    expect(out.isNested).toBe(true)
+    // Its own background flag stays honest — the caller ORs isNested in.
+    expect(out.isBackground).toBe(false)
+  })
+
+  it('isNested=false for a main-session dispatch (parent_agent_id null)', () => {
+    expect(resolveWorkerFeedDispatch(makeSub({ parent_agent_id: null }), 's').isNested).toBe(false)
   })
 })

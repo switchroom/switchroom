@@ -622,7 +622,7 @@ import {
   buildResumeWatchdogReportInbound,
   selectResumeBuilder,
 } from './resume-inbound-builder.js'
-import { applySubagentsSchema, getSubagentByJsonlId } from '../registry/subagents-schema.js'
+import { applySubagentsSchema, getSubagentByJsonlId, resolveSubagentOriginTurnKey } from '../registry/subagents-schema.js'
 import { resolveWorkerFeedDispatch, type WorkerFeedDispatch } from './worker-feed-dispatch.js'
 import {
   resolveSubagentStatusSurface,
@@ -1408,9 +1408,15 @@ function resolveSubagentOriginChat(
 ): { chatId: string; threadId?: number } | null {
   if (turnsDb == null) return null
   try {
-    const sub = getSubagentByJsonlId(turnsDb, agentId)
-    if (sub?.parent_turn_key == null) return null
-    const turn = getTurnByKey(turnsDb, sub.parent_turn_key)
+    // Transitive walk: a NESTED (depth-2+) worker's own parent_turn_key is
+    // NULL by construction (its dispatching context is another sub-agent,
+    // not a gateway turn) — resolveSubagentOriginTurnKey follows the
+    // parent_agent_id chain to the ancestor row that WAS stamped at
+    // main-turn dispatch time, so nested cards + handbacks route to the
+    // originating chat/topic instead of falling back to the owner DM.
+    const originKey = resolveSubagentOriginTurnKey(turnsDb, agentId)
+    if (originKey == null) return null
+    const turn = getTurnByKey(turnsDb, originKey)
     if (turn == null || turn.chat_id.length === 0) return null
     const threadNum =
       turn.thread_id != null && turn.thread_id.length > 0
@@ -25482,6 +25488,27 @@ void (async () => {
                   } catch { /* best-effort */ }
                 }
                 const isBackground = dispatch.isBackground
+                // NESTED (depth-2+) worker terminal: its live status surfaced
+                // via the worker feed (see onProgress), so finalize that card
+                // cleanly — never leave it frozen mid-"→ step". But NO user
+                // handback: its result returns to its DISPATCHING WORKER as
+                // the Task tool result (the depth-1 worker folds it into its
+                // own handback); injecting a second gateway handback would
+                // double-report the same work.
+                if (dispatch.isNested) {
+                  if (workerFeedEnabled) {
+                    void workerActivityFeed?.finish(agentId, {
+                      description: dispatch.feedDescription,
+                      lastTool: null,
+                      toolCount,
+                      latestSummary: resultText,
+                      elapsedMs: durationMs,
+                      state: outcome === 'failed' ? 'failed' : 'done',
+                    })
+                    reconcileWorkerPin(agentId, null, false)
+                  }
+                  return
+                }
                 if (!isBackground) {
                   // Model A — a foreground sub-agent finished. Collapse its
                   // nested child block from the parent's activity draft; the
@@ -25681,7 +25708,18 @@ void (async () => {
                     dispatch = resolveWorkerFeedDispatch(getSubagentByJsonlId(turnsDb, agentId), description)
                   } catch { /* best-effort */ }
                 }
-                const isBackground = dispatch.isBackground
+                // A NESTED (depth-2+) worker surfaces via the worker feed
+                // regardless of its own background flag: its "parent" is a
+                // worker, not the gateway's live turn, so nesting it into
+                // `currentTurn` would attribute it to an unrelated turn.
+                const isBackground = dispatch.isBackground || dispatch.isNested
+                // The live step line for THIS tick: the friendly tool label on
+                // tool ticks, else the narrative. Previously the worker feed
+                // was fed ONLY `latestSummary` (prose), so a tools-only worker
+                // — the common case — had a card that heartbeat-edited but
+                // never grew past "starting…" (the frozen-card symptom). The
+                // foreground nest path below already used this precedence.
+                const stepLine = (progressLine != null && progressLine.length > 0) ? progressLine : latestSummary
                 if (!isBackground) {
                   // Model A — a foreground sub-agent runs inside the parent's
                   // turn, so its live narrative nests under the parent's
@@ -25697,7 +25735,14 @@ void (async () => {
                   // the worker feed (owner-DM fallback), not into the void.
                   const surface = resolveSubagentStatusSurface({
                     isBackground: false,
-                    liveTurnPresent: currentTurn != null,
+                    // A ROW-LESS worker must not nest into the live turn: with
+                    // no registry row we cannot know it belongs to this turn
+                    // (it is most often a nested dispatch whose row hasn't
+                    // linked yet), and polluting the parent's card misroutes
+                    // it. Route it via the orphan worker-feed path instead —
+                    // once the row links (watcher retry, ≤ a poll tick) the
+                    // classification self-corrects.
+                    liveTurnPresent: currentTurn != null && dispatch.hasRow,
                     workerFeedEnabled,
                     orphanStatusEnabled,
                   })
@@ -25711,7 +25756,7 @@ void (async () => {
                         description: dispatch.feedDescription,
                         lastTool,
                         toolCount,
-                        latestSummary,
+                        latestSummary: stepLine,
                         elapsedMs,
                         state: 'running',
                       },
@@ -25752,9 +25797,12 @@ void (async () => {
                     narrative = []
                     turn.foregroundSubAgents.set(agentId, narrative)
                   }
-                  // Dedup against the immediately-preceding line — the watcher
-                  // re-emits the same narrative across ticks while a tool runs.
-                  if (narrative[narrative.length - 1] !== child) {
+                  // Dedup within the whole rolling window (mirrors the worker
+                  // feed's accumulateNarrative): the watcher re-emits the same
+                  // narrative across ticks, and a preamble + its tool label can
+                  // repeat non-adjacently (A,B,A) — both must collapse to one
+                  // ordered step.
+                  if (!narrative.includes(child)) {
                     narrative.push(child)
                     if (narrative.length > FOREGROUND_SUBAGENT_ACCUM_MAX) {
                       narrative.splice(0, narrative.length - FOREGROUND_SUBAGENT_ACCUM_MAX)
@@ -25846,7 +25894,10 @@ void (async () => {
                       description: dispatch.feedDescription,
                       lastTool,
                       toolCount,
-                      latestSummary,
+                      // The tick's step line (tool label on tool ticks, prose
+                      // on text ticks) — NOT bare latestSummary, which starved
+                      // tools-only workers of steps (frozen "starting…").
+                      latestSummary: stepLine,
                       elapsedMs,
                       state: 'running',
                     },
