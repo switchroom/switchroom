@@ -24,6 +24,7 @@ import type { FleetHealthLedger } from "../web/fleet-health-read.js";
 import { fleetHealthLedgerPath } from "../web/fleet-health-read.js";
 import { scanAgent, type Finding, type AgentScanResult } from "./detect.js";
 import { buildLedger } from "./ledger.js";
+import { isTestAgent } from "./test-agents.js";
 
 /**
  * Resolve the `.switchroom` base dir, matching the read-side
@@ -49,6 +50,10 @@ export interface ScanResult {
   perAgent: AgentScanResult[];
   agentsScanned: number;
   agentsSkipped: string[];
+  /** Test/synthetic agents (e.g. `test-harness`) deliberately excluded from
+   *  the production drift ledger — their findings never enter frequency/reach.
+   *  See `isTestAgent` for the rule. */
+  agentsExcluded: string[];
 }
 
 /** List agent slugs under `<base>/agents` (directories only). */
@@ -78,9 +83,20 @@ export function runScan(opts: ScanOptions = {}): ScanResult {
   const findings: Finding[] = [];
   const perAgent: AgentScanResult[] = [];
   const skipped: string[] = [];
+  const excluded: string[] = [];
   let scanned = 0;
 
   for (const agent of agents) {
+    // Test/synthetic agents (test-harness et al.) deliberately exercise the
+    // failure paths this scanner watches (represent/obligation escalation,
+    // killed turns, silent no-ops) on every UAT run. Counting them as
+    // production drift inflates frequency/reach and buries the real signal, so
+    // they are excluded from the ledger entirely.
+    if (isTestAgent(agent)) {
+      excluded.push(agent);
+      log(`fleet-health: excluding test/synthetic agent ${agent} from drift counts`);
+      continue;
+    }
     const turnsPath = resolve(base, "agents", agent, "turns.jsonl");
     const gwPath = resolve(base, "logs", agent, "gateway-supervisor.log");
     let turnsText = "";
@@ -125,7 +141,13 @@ export function runScan(opts: ScanOptions = {}): ScanResult {
     prior,
   });
 
-  return { ledger, perAgent, agentsScanned: scanned, agentsSkipped: skipped };
+  return {
+    ledger,
+    perAgent,
+    agentsScanned: scanned,
+    agentsSkipped: skipped,
+    agentsExcluded: excluded,
+  };
 }
 
 /** Read the existing ledger (for GH-number carry-forward + count-drop), or

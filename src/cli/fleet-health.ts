@@ -72,6 +72,9 @@ export function registerFleetHealthCommand(program: Command): void {
           `fleet-health: scanned ${result.agentsScanned} agents` +
             (result.agentsSkipped.length
               ? `, skipped ${result.agentsSkipped.length} (${result.agentsSkipped.join(", ")})`
+              : "") +
+            (result.agentsExcluded.length
+              ? `, excluded ${result.agentsExcluded.length} test agent(s) (${result.agentsExcluded.join(", ")})`
               : ""),
         );
 
