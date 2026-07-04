@@ -580,16 +580,25 @@ export function executeRollout(
           return { ok: false, rolled, failedStep: "apply", warnings };
         }
         if (execOpts.hostdContext) {
-          // TRADEOFF (surfaced, not hidden): --compose-only skipped the
-          // per-agent template refresh. If this release changed the
-          // start.sh / .mcp.json / settings.json templates, agents keep
-          // their stale wrappers until a host-side privileged apply runs.
+          // SURFACED (not hidden): --compose-only skipped the host-side
+          // per-agent scaffold loop (hostd is unprivileged and cannot write
+          // per-agent state dirs). This is NOT left stale: the per-agent
+          // restart-reconcile that follows for every agent in this roll
+          // refreshes each agent's own templates (start.sh / .mcp.json /
+          // settings.json) from inside its own container on restart. So a
+          // version roll picks up template changes automatically — no
+          // agent-run apply, and no manual host apply, is required here.
+          // A host-side `sudo switchroom apply` is only for STRUCTURAL
+          // changes (new-agent scaffolding / compose regeneration), not for
+          // per-agent template refresh on a roll.
           warnings.push(
             `apply ran --compose-only (hostd is unprivileged and cannot ` +
               `write per-agent state dirs). Compose + compose-level env/` +
-              `healthcheck are up to date, but per-agent template changes ` +
-              `(start.sh / .mcp.json / settings.json) are NOT applied — run ` +
-              `a host-side \`sudo switchroom apply\` if this release changed them.`,
+              `healthcheck are up to date; per-agent template changes ` +
+              `(start.sh / .mcp.json / settings.json) are refreshed ` +
+              `automatically by each agent's restart-reconcile in this roll. ` +
+              `A host-side \`sudo switchroom apply\` is only needed for ` +
+              `structural changes (new agents / compose regeneration).`,
           );
         }
         break;

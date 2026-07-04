@@ -925,10 +925,70 @@ export function detectComposeV2(): string | null {
 }
 
 /**
+ * The directed error thrown when `switchroom apply`'s full per-agent
+ * scaffold is attempted from *inside* an agent container. This is a dead
+ * end by construction — not a bug to work around:
+ *
+ *   - HOME resolves to the container state dir (`/state/agent/home/
+ *     .switchroom`), which has no vault, so the vault-missing preflight
+ *     trips; and
+ *   - the agent container ships no `docker compose` v2 plugin, so even
+ *     with HOME pointed at the host home the compose-v2 preflight trips.
+ *
+ * A version roll does NOT need an agent to run a full apply: the
+ * hostd-driven rollout already runs apply as `--compose-only` (skipping
+ * the per-agent scaffold loop deliberately, #902) and each agent refreshes
+ * its own per-agent templates from inside its own container on
+ * restart-reconcile. So the roll completes without any full apply. This
+ * message redirects the caller to that path instead of chasing the bare
+ * "vault missing" / "docker compose v2 not found" errors.
+ */
+export const IN_AGENT_CONTAINER_APPLY_MSG =
+  "`switchroom apply`'s full per-agent scaffold cannot run from inside an " +
+  "agent container — this is a host/hostd operation by construction " +
+  "(no vault at the container HOME, and no `docker compose` v2 plugin " +
+  "here).\n" +
+  "To roll the fleet to a new version, drive the hostd rollout " +
+  "(`mcp__hostd__rollout`): it runs a `--compose-only` apply plus a " +
+  "per-agent restart-reconcile, and each agent refreshes its own templates " +
+  "on restart — the roll completes without any agent running a full apply.\n" +
+  "A full host-side `sudo switchroom apply` is only needed for structural " +
+  "changes (compose regeneration / new-agent scaffolding), and is run by " +
+  "the operator on the host, never from inside an agent.";
+
+/**
+ * Detect that we're executing inside a switchroom agent container, where a
+ * full `switchroom apply` is a structural dead end (see
+ * IN_AGENT_CONTAINER_APPLY_MSG). Two independent signals, either is enough:
+ *
+ *   1. The agent-container env markers (`SWITCHROOM_AGENT_NAME` /
+ *      `SWITCHROOM_AGENT_ROOT`), set by the agent wrapper; or
+ *   2. the structural fingerprint — no vault at the resolved HOME AND no
+ *      `docker compose` v2 — which is exactly the shape an agent container
+ *      presents even if the env markers are somehow absent.
+ */
+export function isInAgentContainer(
+  vaultPresent: boolean,
+  composeV2Present: boolean,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (env.SWITCHROOM_AGENT_NAME || env.SWITCHROOM_AGENT_ROOT) {
+    return true;
+  }
+  return !vaultPresent && !composeV2Present;
+}
+
+/**
  * Run the preflight gate. Fail fast (throws) when the config requires
  * vault-resolved secrets but ~/.switchroom/vault.enc is missing, or
  * when `docker compose` v2 is unavailable. Both conditions would have
  * surfaced as cryptic mid-apply / mid-up failures otherwise.
+ *
+ * When those conditions are actually the fingerprint of an agent
+ * container (see isInAgentContainer), throw the DIRECTED
+ * IN_AGENT_CONTAINER_APPLY_MSG instead of the bare vault/compose error, so
+ * an agent chasing a full apply is pointed at the hostd rollout path
+ * rather than a dead end. The genuine host case is unchanged.
  */
 export function runApplyPreflight(
   config: SwitchroomConfig,
@@ -937,14 +997,26 @@ export function runApplyPreflight(
   const vaultPath = resolvePath(
     config.vault?.path ?? "~/.switchroom/vault.enc",
   );
-  if (hasVaultRefs(config) && !existsSync(vaultPath)) {
+  const detect = opts.detectComposeV2 ?? detectComposeV2;
+  const vaultMissing = hasVaultRefs(config) && !existsSync(vaultPath);
+  const composeErr = detect();
+
+  // If this is an agent container, redirect to the hostd rollout path
+  // BEFORE emitting the bare vault/compose errors that mislead the agent
+  // into thinking apply is a step it can complete here.
+  if (
+    (vaultMissing || composeErr) &&
+    isInAgentContainer(!vaultMissing, composeErr === null)
+  ) {
+    throw new Error(IN_AGENT_CONTAINER_APPLY_MSG);
+  }
+
+  if (vaultMissing) {
     throw new Error(
       `Config references vault keys (vault:<name>) but ${vaultPath} is missing. ` +
       `Run \`switchroom setup\` first to initialise the vault.`,
     );
   }
-  const detect = opts.detectComposeV2 ?? detectComposeV2;
-  const composeErr = detect();
   if (composeErr) {
     throw new Error(composeErr);
   }
