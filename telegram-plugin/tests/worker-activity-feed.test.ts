@@ -667,6 +667,55 @@ describe('createWorkerActivityFeed — heartbeat', () => {
     expect(edit1!.text).toContain(`· ${Math.floor((26_000 - dispatchAt) / 1000)}s`)
   })
 
+  it('(i-b) heartbeat repaint keeps the header master elapsed >= the step timer (same clock anchor)', async () => {
+    // Ken-observed defect: the heartbeat computed a LIVE `· Ns` step suffix
+    // from dispatchAtMs but re-rendered the header from the STALE
+    // lastView.elapsedMs (frozen at the last watcher event), so the current
+    // step's timer could read MORE than the card's master elapsed. Both must
+    // derive from the same anchor at render time.
+    const bot = makeFakeBot()
+    let clock = 10_000
+    const feed = createWorkerActivityFeed({
+      bot,
+      now: () => clock,
+      minEditIntervalMs: 2500,
+      heartbeatTickMs: 6000,
+      setInterval: () => 1,
+      clearInterval: () => {},
+    })
+    // First paint: view says elapsed 9s → dispatchAt = 19_000 - 9_000 = 10_000.
+    clock = 19_000
+    await feed.update('w1', 'chat', view({ elapsedMs: 9000, latestSummary: 'pulling data' }))
+    expect(bot.sent).toHaveLength(1)
+
+    // No watcher events for a long stretch; the heartbeat repaints at 80s.
+    clock = 80_000 // live elapsed = 70_000 ms = 1m10s
+    feed.heartbeatTick()
+    // Drain the handle's promise chain.
+    await new Promise((r) => setTimeout(r, 0))
+
+    const edit = bot.edits[bot.edits.length - 1]
+    expect(edit).toBeDefined()
+    // Header line 2 (`_{elapsed} · {n} tools_`) must show the LIVE master
+    // elapsed — not the stale 9s from the last view.
+    const headerMatch = /_(\d+(?:m\d+)?s) · \d+ tools?_/.exec(edit.text)
+    expect(headerMatch, `no header elapsed in: ${edit.text}`).not.toBeNull()
+    // Step suffix (`· Ns**`) on the in-progress line.
+    const stepMatch = /· (\d+(?:m\d+)?s)\*\*/.exec(edit.text)
+    expect(stepMatch, `no step suffix in: ${edit.text}`).not.toBeNull()
+
+    const toMs = (s: string): number => {
+      const m = /^(?:(\d+)m)?(\d+)s$/.exec(s)!
+      return (m[1] ? Number(m[1]) * 60_000 : 0) + Number(m[2]) * 1000
+    }
+    const headerMs = toMs(headerMatch![1])
+    const stepMs = toMs(stepMatch![1])
+    // Outcome: both timers advance together off one anchor — the header is
+    // live (not frozen at 9s) and the step never exceeds the master.
+    expect(headerMs).toBeGreaterThanOrEqual(stepMs)
+    expect(headerMs).toBe(70_000) // 1m10s — refreshed to the live value
+  })
+
   it('(ii) respects a 429 cooldown — no edit while cooldownUntil is in the future', async () => {
     const bot = makeFakeBot()
     let clock = 10_000
