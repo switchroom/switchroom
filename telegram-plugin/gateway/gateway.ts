@@ -20160,20 +20160,61 @@ async function handleVaultRequestAccessCallback(ctx: Context, data: string): Pro
       // cards open at once.
       const joiningBatch = items.length > 1
       await ctx.answerCallbackQuery({ text: joiningBatch ? `🔐 Queued — one passphrase covers ${items.length} cards` : '🔐 Send your passphrase…' }).catch(() => {})
+
+      // Strip the buttons on the ORIGINAL card and mark it "waiting" so it
+      // can't be re-tapped, but do NOT overload it as the passphrase prompt.
+      // An in-place edit fires no notification and stays pinned to the card's
+      // old position in the chat, so a busy topic buries it and the operator
+      // never sees the passphrase ask — the exact admin-key miss this fixes
+      // (v0.16.45: the prompt scrolled off, the passphrase never arrived, the
+      // grant was never minted). The prompt goes out as a fresh message below.
       await ctx.api
         .editMessageText(
           pending.chat_id,
           pending.card_message_id,
-          joiningBatch
-            ? `🔐 **Queued behind an earlier card.** Type your passphrase as your next message — it covers **${items.length}** pending approvals in this chat (one entry mints all grants, no re-type per card).`
-            : isAdminOnly
-            ? `🔒 **Admin-only credential.** \`${pending.key}\` requires your vault passphrase to grant — reply with it as your next message and we'll mint the grant for **${escapeHtmlForTg(pending.agent)}**, then delete the passphrase message.\n\n` +
-              `_The passphrase is what proves it's you: an agent can never mint this key on its own._`
-            : `🔐 **Vault is locked.** Reply with your passphrase as your next message — we'll unlock, mint the grant for **${escapeHtmlForTg(pending.agent)}**, and delete the passphrase message in one step.\n\n` +
-              richMessage(`_Mint authority stays operator-only: the broker only accepts the grant when the passphrase matches._`),
+          richMessage(`🔐 _Approved — waiting for your vault passphrase. See the prompt below._`),
           { reply_markup: { inline_keyboard: [] } },
         )
         .catch(() => {})
+
+      // The passphrase prompt as a NEW rich message. Three fixes vs. the old
+      // in-place edit, all of which the reported bug needed:
+      //   1. Real bold/italic — rendered through the sanctioned `richMessage`
+      //      GFM path (`sendRichMessage`), never a raw string. The old admin
+      //      and joining-batch branches passed raw markdown to editMessageText
+      //      (parse_mode=none), so `**`/`_` rendered as literal characters;
+      //      the "locked" branch even concatenated a string with a
+      //      `richMessage()` object (→ `[object Object]`). All three are gone.
+      //   2. It lands at the BOTTOM of the chat, not stapled to an old card
+      //      that later messages bury.
+      //   3. It fires a notification — `disable_notification` is deliberately
+      //      NOT set — so the operator is actually pinged to act.
+      // Attention-grabbing header, short lines, key in code formatting.
+      const promptText = joiningBatch
+        ? `**⚠️🔐 ACTION NEEDED: passphrase required**\n\n` +
+          `Type your vault passphrase as your **next message**.\n` +
+          `One entry covers **${items.length}** pending approvals in this chat, no re-type per card.\n\n` +
+          `_We delete the passphrase message the moment we read it._`
+        : isAdminOnly
+        ? `**⚠️🔐 ACTION NEEDED: passphrase required**\n\n` +
+          `\`${pending.key}\` is an **admin-only credential**.\n` +
+          `Type your vault passphrase as your **next message** to mint the grant for **${escapeHtmlForTg(pending.agent)}**.\n\n` +
+          `_The passphrase is what proves it's you. An agent can never mint this key on its own. We delete the passphrase message the moment we read it._`
+        : `**⚠️🔐 ACTION NEEDED: passphrase required**\n\n` +
+          `Your vault is locked.\n` +
+          `Reply with your passphrase as your **next message** to unlock and mint the grant for **${escapeHtmlForTg(pending.agent)}**.\n\n` +
+          `_Mint authority stays operator-only: the broker only accepts the grant when the passphrase matches. We delete the passphrase message the moment we read it._`
+
+      // #1075: deleted-topic safe — fall back to the main chat. Wrapped
+      // through robustApiCall for flood-wait retries, mirroring the card send.
+      await retryWithThreadFallback<{ message_id: number }>(
+        robustApiCall,
+        (tid) =>
+          lockedBot.api.sendRichMessage(pending.chat_id, richMessage(promptText), {
+            ...(tid != null && Number.isFinite(tid) ? { message_thread_id: tid } : {}),
+          }),
+        { threadId: pending.threadId, chat_id: pending.chat_id, verb: 'vault_request_access.passphrase_prompt' },
+      ).catch(() => {})
       return
     }
 
