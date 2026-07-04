@@ -7,7 +7,7 @@
  * tempdir, and mirrors the gateway's onProgress/onFinish routing
  * (resolveWorkerFeedDispatch + resolveSubagentOriginTurnKey).
  *
- * Scenario (the live incident, ad36b37e…): a depth-1 BACKGROUND worker —
+ * Scenario (the live incident shape): a depth-1 BACKGROUND worker —
  * attributed to its originating turn at dispatch — spawns a nested worker
  * AFTER the main turn has ended. The PreToolUse hook cannot attribute the
  * nested dispatch (turn-active.json is gone) and may lose the row entirely.
@@ -45,7 +45,7 @@ import {
 import { resolveWorkerFeedDispatch } from '../gateway/worker-feed-dispatch.js'
 
 const OWNER_DM = 'owner-dm-fallback'
-const ORIGIN_CHAT = '8248703757'
+const ORIGIN_CHAT = '-1001234567890'
 const ORIGIN_TURN_KEY = `${ORIGIN_CHAT}:_:1783202199395`
 
 function jline(o: object): string {
