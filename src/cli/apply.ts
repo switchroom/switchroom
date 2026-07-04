@@ -312,15 +312,21 @@ export async function provisionLiteLLMKeys(
 
     const alreadyProvisioned: string[] = [];
     const unprovisionedNew: string[] = [];
+    const brokerUnreachable: string[] = [];
     for (const { name } of optedIn) {
       const vaultKey = `litellm/${name}/api-key`;
       const existing = await getViaBrokerStructured(vaultKey);
       if (existing.kind === "ok") {
         alreadyProvisioned.push(name);
+      } else if (existing.kind === "unreachable") {
+        // #2781: broker unreachable is an environment limitation (hostd's
+        // container has no broker socket by construction) — we can't
+        // provision OR confirm, so degrade to a warning rather than fail
+        // apply. The agent keeps its previous routing env either way.
+        brokerUnreachable.push(name);
       } else {
-        // kind === "not_found" (genuinely new) or "unreachable" (can't confirm
-        // it's provisioned) — either way, this agent is not known-good and must
-        // be surfaced, not silently skipped.
+        // kind === "not_found" (genuinely new) or "denied" — this agent is
+        // not known-good and must be surfaced, not silently skipped.
         unprovisionedNew.push(name);
       }
     }
@@ -333,6 +339,16 @@ export async function provisionLiteLLMKeys(
         chalk.gray(
           `  ~ litellm: ${alreadyProvisioned.length} agent(s) already provisioned ` +
           `(${alreadyProvisioned.join(", ")}) — unaffected by missing passphrase.\n`,
+        ),
+      );
+    }
+
+    if (brokerUnreachable.length > 0) {
+      ctx.writeErr(
+        chalk.yellow(
+          `  ! litellm: vault-broker unreachable — could not verify/provision ` +
+          `${brokerUnreachable.length} agent(s) (${brokerUnreachable.join(", ")}); ` +
+          `they keep their previous routing env.\n`,
         ),
       );
     }
@@ -438,13 +454,20 @@ export async function provisionLiteLLMKeys(
         continue;
       }
       if (existing.kind === "unreachable") {
-        failures.push({
-          agent: name,
-          message: `litellm: vault-broker unreachable (${existing.msg ?? "no detail"}); cannot provision key.`,
-        });
+        // #2781: an unreachable broker is an ENVIRONMENT limitation, not a
+        // provisioning error — hostd's in-container `switchroom apply` has no
+        // broker socket mounted BY CONSTRUCTION, so treating this as a
+        // scaffold failure made every hostd reconcile exit 1 (12/12 "failed")
+        // and rolled back every config_propose_edit. Degrade to a WARNING,
+        // mirroring the "Hindsight unreachable — skipping bank creation"
+        // path: the agent keeps whatever routing env its previous provision
+        // gave it, and apply exits 0 if nothing else failed. Genuine
+        // provisioning errors (bad ref / write denial with the broker
+        // reachable) below still land in `failures`.
         ctx.writeErr(
-          chalk.red(
-            `  x litellm/${name}: vault-broker unreachable — agent will not get routing env.\n`,
+          chalk.yellow(
+            `  ! litellm/${name}: vault-broker unreachable (${existing.msg ?? "no detail"}) — ` +
+            `skipping key provisioning; agent keeps its previous routing env.\n`,
           ),
         );
         continue;
@@ -1616,6 +1639,22 @@ export function formatScaffoldFailureResolution(
     `ERROR: Scaffolded ${scaffolded}/${agentsTotal} agents. ${fail} failed.`,
   );
   lines.push("");
+  // #2781: the 0700/privilege-escalation guidance below is only the right
+  // diagnosis when at least one failure actually IS a permission failure.
+  // Printing it for, e.g., litellm/vault failures misdirected operators at
+  // sudo when the problem was elsewhere. Non-permission failures get a
+  // generic pointer at the per-agent error lines instead.
+  const hasPermissionFailure = failures.some((f) =>
+    /EACCES|EPERM|permission denied/i.test(f.message),
+  );
+  if (!hasPermissionFailure) {
+    lines.push(
+      `${fail} agent(s) failed to scaffold — see the per-agent error lines above`,
+    );
+    lines.push("for the specific cause(s).");
+    lines.push("");
+    return lines.join("\n");
+  }
   lines.push(
     "Per-agent state dirs are mode 0700 owned by per-agent UIDs (the v0.7+",
   );

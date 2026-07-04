@@ -235,8 +235,9 @@ describe("provisionLiteLLMKeys — real broker e2e (blocker-1 seam)", () => {
   // peer, so `getViaBrokerStructured` returns `denied` for ANY key regardless
   // of presence (peer-identity ACL, not a key lookup) — same limitation the
   // file-header note calls out for operator-mode reads. The null-passphrase
-  // branch deliberately treats a non-`ok` probe (not_found / denied /
-  // unreachable) as "not known-good → surface it", which is the conservative,
+  // branch deliberately treats a not_found / denied probe as "not known-good
+  // → surface it" (an `unreachable` probe degrades to a WARNING since #2781 —
+  // hostd's container has no broker socket by construction), the conservative,
   // LOUD behavior the fix requires. The unit-level split (ok → quiet,
   // else → surfaced) is asserted where the broker read is stubbable; here we
   // pin the load-bearing half: a genuinely-new agent is surfaced, not skipped

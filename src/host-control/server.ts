@@ -2086,15 +2086,19 @@ export class HostdServer {
         recRes2.exit_code === 0
           ? "rolled back successfully"
           : `rolled back but recovery reconcile also failed (exit ${recRes2.exit_code})`;
+      // #2781: carry the failed reconcile's output into the audit row —
+      // pre-fix the rolled-back path discarded stdout/stderr entirely,
+      // so "reconcile exit 1" gave the operator nothing to diagnose with.
       await approval.finalize({
         outcome: "reconcile_failed_rolled_back",
-        detail: recoveryNote,
+        detail: `${recoveryNote}; reconcile stderr: ${tail(recRes.stderr, 512) || "(empty)"}`,
       });
       return this.reconcileFailedRolledBack(
         `reconcile exit ${recRes.exit_code}; ${recoveryNote}`,
         req,
         caller,
         started,
+        { primary: recRes, recovery: recRes2 },
       );
     } finally {
       release();
@@ -2114,6 +2118,15 @@ export class HostdServer {
     req: Extract<HostdRequest, { op: "config_propose_edit" }>,
     caller: SocketIdentity,
     started: number,
+    // #2781: captured output of the failed reconcile (and the recovery
+    // reconcile, when one ran). Pre-fix this path DISCARDED the child's
+    // stdout/stderr while the success path returned stdout_tail/stderr_tail
+    // — so a rolled-back edit surfaced only "reconcile exit 1" with zero
+    // diagnostics. Mirror the success path's tail fields here.
+    output?: {
+      primary: { stdout: string; stderr: string };
+      recovery?: { stdout: string; stderr: string; exit_code: number };
+    },
   ): HostdResponse {
     const legacy = `E_RECONCILE_FAILED_ROLLED_BACK: ${detail}`;
     const built = err(
@@ -2128,7 +2141,20 @@ export class HostdServer {
       .caller(caller.kind === "agent" ? "agent" : "operator")
       .agentName(caller.kind === "agent" ? caller.name : undefined)
       .build(req.request_id, Date.now() - started);
-    return { ...built, error: legacy };
+    const resp: HostdResponse = { ...built, error: legacy };
+    if (output) {
+      const recoveryStdout =
+        output.recovery && output.recovery.exit_code !== 0
+          ? `\n--- recovery reconcile stdout ---\n${output.recovery.stdout}`
+          : "";
+      const recoveryStderr =
+        output.recovery && output.recovery.exit_code !== 0
+          ? `\n--- recovery reconcile stderr ---\n${output.recovery.stderr}`
+          : "";
+      resp.stdout_tail = tail(output.primary.stdout + recoveryStdout);
+      resp.stderr_tail = tail(output.primary.stderr + recoveryStderr);
+    }
+    return resp;
   }
 
   /** Serializes concurrent config_propose_edit apply phases. */
