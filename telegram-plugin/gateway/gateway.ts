@@ -67,6 +67,7 @@ import {
  *  slightly brisker than neutral (Ken's chosen default). */
 const VOICE_OUT_DEFAULT_SPEED = 1.1
 import { normalizeForSpeech } from '../voice-normalize-text.js'
+import { normalizeForTts } from '../tts-normalize.js'
 import { synthesizeViaOpenAi } from '../voice-synthesize.js'
 import {
   createTelegraphAccount,
@@ -8744,12 +8745,17 @@ async function synthesizeVoiceOut(plan: {
   ttsText: string
 }): Promise<Uint8Array | null> {
   try {
+    // #2760 Phase 1: deterministic L1 TTS normalization, applied at the
+    // single choke point where every engine's request body is built.
+    // No-op unless SWITCHROOM_TTS_NORMALIZE=1 (kill switch:
+    // SWITCHROOM_DISABLE_TTS_NORMALIZE).
+    const ttsText = normalizeForTts(plan.ttsText)
     if (plan.engine === 'kokoro') {
       const token = await materializeSidecarToken()
       if (!token) return null // materializeSidecarToken already logged why.
       const result = await synthesizeViaSidecar({
         token,
-        text: plan.ttsText,
+        text: ttsText,
         voice: plan.voice,
         speed: plan.speed,
       })
@@ -8773,7 +8779,7 @@ async function synthesizeVoiceOut(plan: {
     if (!apiKey) return null // materializeVoiceKey already logged why.
     const result = await synthesizeViaOpenAi({
       apiKey,
-      text: plan.ttsText,
+      text: ttsText,
       voice: plan.voice,
     })
     if (!result.ok) {
@@ -22518,7 +22524,11 @@ bot.on('callback_query:data', async ctx => {
     }
     const result = await synthesizeViaSidecar({
       token: sidecarToken,
-      text: entry.text,
+      // #2760 Phase 1: same deterministic normalization as the immediate
+      // voice-out path — the Listen lazy path builds its own /tts body from
+      // the persisted cache, so it must normalize independently (cache
+      // entries may predate the flag flip).
+      text: normalizeForTts(entry.text),
       voice: entry.voice,
       speed: entry.speed,
     })
