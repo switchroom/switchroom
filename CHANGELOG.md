@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.16.47 — Admin-key passphrase prompt made unmissable
+
+A single focused Telegram fix on top of v0.16.46.
+
+### Telegram
+
+- **Admin-key passphrase prompt: rich render + notification ping** (#2771):
+  when an operator tapped Approve on a vault-grant card for an admin-only key
+  (e.g. `npm_token_*`), the follow-up passphrase request was written by
+  editing the original card in place with a raw markdown string. That failed
+  two ways: the raw string went out `parse_mode=none` so `**bold**`/`_italic_`
+  rendered as literal characters (the "locked" branch was worse, concatenating
+  a string with a `richMessage()` object → `[object Object]`), and an in-place
+  edit fires no notification and stays stapled to the card's old position, so
+  a busy topic buried it — the operator missed the prompt entirely (observed
+  on v0.16.45) and the grant was never minted. Fix: the original card is now
+  edited only to strip its buttons and show a short "waiting" status; the
+  passphrase prompt goes out as a NEW rich message through the sanctioned
+  `richMessage()`/`sendRichMessage()` path — real bold, a strong "ACTION
+  NEEDED: passphrase required" header, short lines, the key in code
+  formatting. It lands at the bottom of the chat and fires a notification.
+  Applies to all three branches (admin-only, locked vault, batched cards).
+  Security semantics unchanged: the passphrase message is still deleted on
+  receipt, never logged, and the agent still can never self-mint.
+
 ## v0.16.42 — Fleet Health: operator-facing fleet issue tracker + admin page
 
 Ships the first slice of Fleet Health (RFC `reference/rfcs/fleet-health.md`,
