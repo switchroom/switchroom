@@ -26,8 +26,14 @@ import { dirname } from 'path'
 export const VOICE_ONDEMAND_CALLBACK_PREFIX = 'voice:'
 
 /** Cache entry TTL. A button tapped after this degrades to an "expired" toast
- *  rather than pinning reply text in memory forever. */
-export const VOICE_ONDEMAND_TTL_MS = 60 * 60 * 1000 // 1h
+ *  rather than pinning reply text in memory forever.
+ *
+ *  7 days since #2763 (was 1h): eager pre-synthesis keeps the spoken file on
+ *  disk for 7 days, and the acceptance bar is "tapping Listen on any message
+ *  <7 days old plays instantly" — which needs the ENTRY alive that long too
+ *  (the lazy fallback also reads it). Memory stays bounded by
+ *  VOICE_ONDEMAND_MAX_ENTRIES; the entry is a few hundred bytes of text. */
+export const VOICE_ONDEMAND_TTL_MS = 7 * 24 * 60 * 60 * 1000 // 7 days
 
 /** Bounded cache size; oldest entries are evicted past this. */
 export const VOICE_ONDEMAND_MAX_ENTRIES = 500
@@ -39,6 +45,13 @@ export type VoiceOnDemandPayload = {
   voice?: string
   /** Resolved + clamped playback speed. */
   speed: number
+  /** Absolute path of the eagerly pre-synthesized audio file (#2763), set by
+   *  the pre-synth queue after a successful background synth. Absent on
+   *  pre-feature entries, on kill-switched gateways, and until the job runs. */
+  filePath?: string
+  /** Epoch ms the entry was stored (put time) — recorded alongside filePath
+   *  per #2763 so the sweep/introspection can reason about entry age. */
+  createdAt?: number
 }
 
 type StoredEntry = VoiceOnDemandPayload & { expiresAt: number }
@@ -101,7 +114,11 @@ export class VoiceOnDemandCache {
   put(token: string, payload: VoiceOnDemandPayload): void {
     // Re-insert to move an existing key to the newest (most-recent) position.
     this.store.delete(token)
-    this.store.set(token, { ...payload, expiresAt: this.now() + this.ttlMs })
+    this.store.set(token, {
+      createdAt: this.now(),
+      ...payload,
+      expiresAt: this.now() + this.ttlMs,
+    })
     while (this.store.size > this.maxEntries) {
       const oldest = this.store.keys().next().value
       if (oldest === undefined) break
@@ -119,8 +136,37 @@ export class VoiceOnDemandCache {
       this.flush()
       return null
     }
-    const { text, voice, speed } = entry
-    return voice === undefined ? { text, speed } : { text, voice, speed }
+    const { text, voice, speed, filePath } = entry
+    // createdAt stays internal (persisted for sweep/introspection) so the
+    // returned shape only grows when a pre-synth file actually exists —
+    // pre-#2763 callers and tests see the exact old payload.
+    return {
+      text,
+      speed,
+      ...(voice !== undefined ? { voice } : {}),
+      ...(filePath !== undefined ? { filePath } : {}),
+    }
+  }
+
+  /** Record the pre-synthesized audio file path on an existing entry (#2763).
+   *  No-op if the entry has expired or been evicted meanwhile (the file will
+   *  simply age out via the sweep). Does NOT bump LRU position or TTL — the
+   *  entry's lifetime is anchored at put time. */
+  setFilePath(token: string, filePath: string): void {
+    const entry = this.store.get(token)
+    if (entry == null || entry.expiresAt <= this.now()) return
+    entry.filePath = filePath
+    this.flush()
+  }
+
+  /** Drop entries whose pre-synth files the sweep deleted (#2763). Unknown
+   *  tokens are ignored (file may belong to an already-evicted entry). */
+  prune(tokens: Iterable<string>): void {
+    let changed = false
+    for (const token of tokens) {
+      if (this.store.delete(token)) changed = true
+    }
+    if (changed) this.flush()
   }
 
   /** Current entry count (test/introspection aid). */

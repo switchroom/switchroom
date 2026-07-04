@@ -162,6 +162,8 @@ export default defineConfig({
       "**/telegram-plugin/tests/sandbox-hint-posttool.test.ts",
       // tts-normalize.test.ts (#2760 Phase 1) imports bun:test — run via test:bun.
       "**/telegram-plugin/tests/tts-normalize.test.ts",
+      // voice-presynth.test.ts (#2763) imports bun:test — run via test:bun.
+      "**/telegram-plugin/tests/voice-presynth.test.ts",
       // fleet-fallback-gate.test.ts uses bun:test — run via test:bun.
       "**/telegram-plugin/tests/fleet-fallback-gate.test.ts",
       "**/telegram-plugin/tests/ipc-server-client.test.ts",
