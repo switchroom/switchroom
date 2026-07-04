@@ -636,7 +636,14 @@ export async function reconcileAndRestartAgent(
   if (allChanges.length > 0) {
     const kinds = allChanges.map((p) => classifyChangeKind(p));
     const allCron = kinds.every((k) => k === "cron");
-    if (allCron) {
+    // The cron-only hot path skips the container recreate — but --force and a
+    // one-shot release override (`--pin <target>` on the hostd rollout path)
+    // are explicit demands to recreate on the TARGET image. If we take the hot
+    // path there, an agent with only cron-tagged drift (e.g.
+    // `.claude-cron/.mcp.json`) stays on the OLD image and the roll's
+    // version-assert stalls. Force/pin must always win over classification.
+    // Fixes #2779.
+    if (allCron && !opts.force && !opts.releaseOverride) {
       const r = deps.applyCronChangesHot(name, allChanges);
       log(
         chalk.cyan(
