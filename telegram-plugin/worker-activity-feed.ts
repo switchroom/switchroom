@@ -405,13 +405,27 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
   }
 
   /**
-   * Heartbeat — option (a), suffix-only, NEVER opens a new message. For each
-   * handle with a posted message, enqueue a re-render through the existing
-   * chain → doUpdate path (never editMessageText directly). Skips:
-   *   - handles with no posted message (messageId == null),
+   * Heartbeat — keeps a running worker's message alive AND performs the
+   * FIRST paint for a prose-silent worker whose only tick arrived before
+   * `firstPaintMin`.
+   *
+   * Why the first-paint branch exists: a background worker that dives
+   * straight into quiet work (e.g. a long `Bash` / `npm test`) emits a
+   * single `sub_agent_tool_use` event when the command is invoked, then no
+   * further JSONL lines for the whole run. That one tick drives `update`
+   * once — but if it lands before `firstPaintMin` the paint is held, and
+   * with no subsequent tick nothing ever re-drives it, so the worker shows
+   * NOTHING for its entire run (the "I can't see the worker" gap). The
+   * heartbeat closes it: once such a handle is past `firstPaintMin`, drive a
+   * paint here through the same chain → doUpdate path. After first paint the
+   * suffix-only maintenance branch keeps it advancing.
+   *
+   * For handles that already have a posted message, this is the original
+   * option-(a), suffix-only re-render (never editMessageText directly). Skips:
    *   - handles inside a 429 cooldown,
-   *   - handles edited within minEditInterval (no stampede),
-   *   - non-running handles (terminal/deleted).
+   *   - handles with no `lastView` (no update ever arrived) or non-running,
+   *   - for the maintenance branch: handles edited within minEditInterval
+   *     (no stampede) or whose current step isn't yet stale.
    * The `· Ns` liveSuffix is applied ONLY when the worker's current step is
    * stale (now - lastEditAt >= heartbeatTickMs) so a normally-ticking worker is
    * untouched and its body stays byte-stable for the dedup.
@@ -419,14 +433,37 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
   function heartbeatTick(): void {
     const now = nowFn()
     for (const h of handles.values()) {
-      if (h.messageId == null) continue
+      // Orphan-paint guard: `finish()` deletes the handle in a `.finally` that
+      // may not have drained if a tick fires in the same synchronous stretch.
+      // Skip any handle no longer in the map so the first-paint branch below
+      // can never send a fresh `running` message on an already-finished worker
+      // (which would orphan a card that never finalizes). Restores the
+      // structural safety the pre-first-paint `messageId == null` skip gave.
+      if (!handles.has(h.agentId)) continue
       if (h.lastView == null) continue
       if (h.lastView.state !== 'running') continue
       if (now < h.cooldownUntil) continue
+
+      const liveElapsed = h.dispatchAtMs != null ? now - h.dispatchAtMs : h.lastView.elapsedMs
+
+      // First-paint path: a prose-silent worker's single early tick was held
+      // (elapsed < firstPaintMin) and no further tick re-drove it. Once it is
+      // past firstPaintMin, drive the paint. doUpdate's send branch re-checks
+      // firstPaintMin against the refreshed elapsed, so this is exact.
+      if (h.messageId == null) {
+        if (liveElapsed < firstPaintMin) continue
+        const view = { ...h.lastView, elapsedMs: Math.max(h.lastView.elapsedMs, liveElapsed) }
+        h.chain = h.chain
+          .then(() => doUpdate(h, view))
+          .catch((err) => {
+            log(`worker-feed: heartbeat first-paint chain error ${h.agentId}: ${(err as Error).message}`)
+          })
+        continue
+      }
+
       if (now - h.lastEditAt < minEditInterval) continue
       const stale = now - h.lastEditAt >= heartbeatTickMs
       if (!stale) continue
-      const liveElapsed = h.dispatchAtMs != null ? now - h.dispatchAtMs : h.lastView.elapsedMs
       const liveSuffix = ' · ' + formatFeedElapsed(liveElapsed)
       // Re-render THROUGH the chain + doUpdate path — never editMessageText directly.
       //

@@ -450,6 +450,28 @@ const DEFAULT_SILENT_SYNTHESIS_STALL_THRESHOLD_MS = 300_000
 const DEFAULT_SILENT_STALL_TERMINAL_MS = 300_000
 
 /**
+ * Tools that legitimately run for minutes with ZERO intervening JSONL
+ * writes: the worker emits ONE `sub_agent_tool_use` line when the command
+ * starts, then nothing until it returns. `Bash` (a build, `npm test`, a long
+ * curl, a git clone) is the canonical case. A worker whose last observed tool
+ * is one of these is NOT stalled just because the JSONL went quiet — the
+ * 60s active-loop threshold misfires on exactly this population, producing the
+ * false "stall detected (idle 60s)" the operator hit while a background worker
+ * was mid-`Bash`. Pass-1 stall detection widens the idle threshold for these
+ * to the same silent-synthesis window used for not-yet-started workers, so a
+ * long command is given room before it counts as stalled. The pass-2 terminal
+ * synthesis is unchanged — it still releases the deferred-completion gate the
+ * fixed window after a stall IS eventually flagged.
+ */
+const LONG_RUNNING_TOOLS: ReadonlySet<string> = new Set(['Bash'])
+
+/** True when the tool named legitimately runs quiet for minutes (see
+ *  LONG_RUNNING_TOOLS). Null/undefined tool name → false. */
+function isLongRunningTool(name: string | null | undefined): boolean {
+  return name != null && LONG_RUNNING_TOOLS.has(name)
+}
+
+/**
  * Freshness window for the boot-scan "in-flight at boot → promote to
  * live" path. A worker file still in `running` state at boot is only
  * promoted (un-suppressed) if its last write (file mtime) is within this
@@ -1446,9 +1468,18 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       // tool_use. Once tools have started, switch to the tighter loop
       // threshold — frequent JSONL writes mean 60s of silence is a
       // strong signal the sub-agent is genuinely stuck.
-      const threshold = entry.toolCount === 0
-        ? silentSynthesisStallThresholdMs
-        : stallThresholdMs
+      // A worker that hasn't fired any tools yet is mid-silent-synthesis; a
+      // worker whose LAST tool is a known long-runner (e.g. `Bash`) is mid-
+      // command — both legitimately go quiet in the JSONL for minutes, so both
+      // use the wider silent-synthesis window instead of the tight 60s active-
+      // loop threshold. Without the long-runner arm a background worker running
+      // a long `Bash`/`npm test` was falsely flagged "stall detected (idle
+      // 60s)" while genuinely alive. Pass-2 terminal synthesis (below) is
+      // unaffected: it still fires the fixed window after a stall IS flagged.
+      const threshold =
+        entry.toolCount === 0 || isLongRunningTool(entry.lastTool?.name)
+          ? silentSynthesisStallThresholdMs
+          : stallThresholdMs
       if (idleMs >= threshold) {
         entry.stallNotified = true
         entry.stalledAt = n

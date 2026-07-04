@@ -311,6 +311,76 @@ describe('subagent-watcher onStall callback (Option C, issue #393)', () => {
     expect(stallCalls).toHaveLength(1)
   })
 
+  // Bash-in-flight suppression: a worker whose LAST observed tool is a known
+  // long-runner (`Bash` — a build, `npm test`, a long curl) legitimately goes
+  // quiet in the JSONL for minutes while the command runs. Pre-fix the tight
+  // 60s active-loop threshold misfired on exactly this population, producing
+  // the false "stall detected (idle 60s)" the operator hit while a background
+  // worker was mid-Bash. The watcher now widens the threshold for such workers
+  // to the silent-synthesis window.
+  it('does NOT trip stall at 60s when the last tool is Bash (long-runner suppression)', () => {
+    const agentId = 'stall-bash-01'
+    const { stallCalls, advance, watcher } = makeStallHarness({
+      agentId,
+      stallThresholdMs: 60_000,
+      silentSynthesisStallThresholdMs: 300_000, // 5min
+      rescanMs: 500,
+      initialContent: buildJSONL(
+        subAgentUserMsg('background task'),
+        { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tool-B', name: 'Bash', input: { command: 'npm test' } }] } },
+      ),
+    })
+    advance(500) // register + tail read → toolCount=1, lastTool=Bash
+    const entry = watcher.getRegistry().get(agentId)
+    if (entry) entry.historical = false
+    expect(entry?.lastTool?.name).toBe('Bash')
+    advance(120_000) // 2min idle — far past 60s but under the silent-synth window
+    expect(stallCalls).toHaveLength(0) // NOT falsely stalled mid-Bash
+  })
+
+  it('DOES trip stall for a Bash worker once past the silent-synthesis window (pass-2 gate still reachable)', () => {
+    const agentId = 'stall-bash-02'
+    const { stallCalls, advance, watcher } = makeStallHarness({
+      agentId,
+      stallThresholdMs: 60_000,
+      silentSynthesisStallThresholdMs: 300_000, // 5min
+      rescanMs: 500,
+      initialContent: buildJSONL(
+        subAgentUserMsg('background task'),
+        { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tool-B', name: 'Bash', input: { command: 'sleep 999' } }] } },
+      ),
+    })
+    advance(500)
+    const entry = watcher.getRegistry().get(agentId)
+    if (entry) entry.historical = false
+    advance(120_000) // under the window — no stall yet
+    expect(stallCalls).toHaveLength(0)
+    advance(200_000) // total ~5min20s — past the silent-synth window → stall fires
+    expect(stallCalls).toHaveLength(1)
+    expect(stallCalls[0].agentId).toBe(agentId)
+  })
+
+  it('a non-long-runner last tool (Read) still trips at the tight 60s threshold', () => {
+    // Guard the suppression is scoped to long-runners only — a Read that goes
+    // quiet for 60s is genuinely stalled and must still flag.
+    const agentId = 'stall-read-01'
+    const { stallCalls, advance, watcher } = makeStallHarness({
+      agentId,
+      stallThresholdMs: 60_000,
+      silentSynthesisStallThresholdMs: 600_000, // way out — proves the 60s path is taken
+      rescanMs: 500,
+      initialContent: buildJSONL(
+        subAgentUserMsg('background task'),
+        { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tool-R', name: 'Read', input: { path: '/x' } }] } },
+      ),
+    })
+    advance(500)
+    const entry = watcher.getRegistry().get(agentId)
+    if (entry) entry.historical = false
+    advance(65_000) // 65s quiet after a Read → genuinely stalled
+    expect(stallCalls).toHaveLength(1)
+  })
+
   // Test 10: onStall is NOT called for sub-agents already done/failed
   it('does not call onStall for sub-agents in done/failed state', () => {
     const agentId = 'stall-test-10-done'
