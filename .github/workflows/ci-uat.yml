@@ -118,7 +118,12 @@ jobs:
     # path filter used to enforce). NOT the required context — the always-on
     # `uat-gate` sentinel below is.
     needs: changes
-    if: vars.UAT_GATE_ENABLED == 'true' && needs.changes.outputs.relevant == 'true'
+    # workflow_dispatch bypasses BOTH gates: a manual run is the operator
+    # explicitly asking for the UAT (2026-07-04: UAT_GATE_ENABLED flipped to
+    # false — per-commit live UAT burns subscription quota; on-demand only).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (vars.UAT_GATE_ENABLED == 'true' && needs.changes.outputs.relevant == 'true')
     runs-on: [self-hosted, uat-host]
     timeout-minutes: 18
     env:
@@ -199,9 +204,10 @@ jobs:
     # Thorough probabilistic pool — too slow to gate, so schedule/dispatch-ONLY
     # and non-required. (Each fuzz scenario is a real ~10-30s round-trip; the
     # full pool exceeds a 35-min job budget on the single runner.)
+    # Dispatch-only like uat-gate-run above: manual dispatch = operator opt-in,
+    # regardless of the UAT_GATE_ENABLED var (off since 2026-07-04).
     if: >-
-      vars.UAT_GATE_ENABLED == 'true' &&
-      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+      github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, uat-host]
     timeout-minutes: 50
     env:
