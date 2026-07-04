@@ -62,6 +62,13 @@ import {
   buildListenKeyboard,
   mayInjectListenButton,
 } from '../voice-ondemand.js'
+import {
+  PreSynthQueue,
+  sweepVoiceCacheDir,
+  writeVoiceCacheFile,
+  eagerVoiceEnabled,
+  VOICE_SWEEP_INTERVAL_MS,
+} from '../voice-presynth.js'
 
 /** Fleet default TTS speed when voice_out is enabled but speed is unset —
  *  slightly brisker than neutral (Ken's chosen default). */
@@ -8635,6 +8642,71 @@ const voiceOnDemandCache = new VoiceOnDemandCache({
   persistPath: join(STATE_DIR, 'voice-ondemand.json'),
 })
 
+// ─── Eager voice pre-synthesis (#2763) ─────────────────────────────────────
+// Whenever a reply becomes Listen-eligible (a voiceOnDemandCache entry is
+// persisted alongside the Listen button), ALSO synthesize the audio in the
+// background via the LOCAL sidecar and park it on disk, so the 🔊 Listen tap
+// attaches the pre-made file instantly instead of waiting on the GPU. Local
+// engine only (kokoro — zero token/dollar cost); the openai cloud engine
+// never pre-synthesizes. Strictly off the reply critical path: jobs drain
+// through a bounded FIFO (concurrency 1, drop-oldest past the cap) and every
+// failure is swallowed — the tap just falls back to the lazy synth path.
+// Kill switch: SWITCHROOM_DISABLE_EAGER_VOICE=1 (the sweep still runs so old
+// files age out).
+const VOICE_CACHE_DIR = join(STATE_DIR, 'voice-cache')
+
+const voicePreSynthQueue = new PreSynthQueue({
+  runJob: async (job) => {
+    const sidecarToken = await materializeSidecarToken()
+    if (!sidecarToken) return // sidecar unavailable — lazy path will retry on tap
+    const result = await synthesizeViaSidecar({
+      token: sidecarToken,
+      // Same deterministic normalization the lazy Listen path applies —
+      // job.text is normalizeForSpeech(reply); normalizeForTts is the #2760
+      // L1 pass on top.
+      text: normalizeForTts(job.text),
+      voice: job.voice,
+      speed: job.speed,
+    })
+    if (!result.ok) {
+      process.stderr.write(
+        `telegram gateway: voice-presynth: sidecar synthesis failed token=${job.token} reason=${result.reason}\n`,
+      )
+      return
+    }
+    const filePath = writeVoiceCacheFile(VOICE_CACHE_DIR, job.token, result.audio)
+    voiceOnDemandCache.setFilePath(job.token, filePath)
+    process.stderr.write(
+      `telegram gateway: voice-presynth: cached ${result.audio.length} bytes at ${filePath} ` +
+        `(${result.durationMs}ms, backlog=${voicePreSynthQueue.size})\n`,
+    )
+  },
+})
+
+/** Rolling 7-day TTL + 500MB size-budget sweep over VOICE_CACHE_DIR. Runs at
+ *  boot and hourly; ALWAYS runs (even under the eager-voice kill switch) so
+ *  previously written files age out. Crash-safe: missing dir/files tolerated. */
+function sweepVoiceCache(): void {
+  try {
+    const result = sweepVoiceCacheDir({ dir: VOICE_CACHE_DIR })
+    if (result.deletedTokens.length > 0) {
+      voiceOnDemandCache.prune(result.deletedTokens)
+      process.stderr.write(
+        `telegram gateway: voice-presynth: sweep removed ${result.deletedTokens.length} file(s), ` +
+          `${result.remainingBytes} bytes remain\n`,
+      )
+    }
+  } catch (err) {
+    // Defence in depth — sweepVoiceCacheDir is already per-file crash-safe.
+    process.stderr.write(`telegram gateway: voice-presynth: sweep failed: ${String(err)}\n`)
+  }
+}
+
+if (!STATIC) {
+  sweepVoiceCache() // boot sweep — covers a died timer / long downtime
+  setInterval(sweepVoiceCache, VOICE_SWEEP_INTERVAL_MS).unref()
+}
+
 type VoiceOutAccess = NonNullable<Access['voice_out']>
 
 /**
@@ -9280,6 +9352,22 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
       // replayed. The gate above guarantees this is the ONLY button on the
       // message, so keeping it is safe (no agent buttons to protect).
       replyMarkup = buildListenKeyboard(token)
+      // #2763 eager pre-synthesis: kick a background synth of the same
+      // payload so the Listen tap attaches the pre-made file instantly.
+      // Local-engine only (useOnDemandButton already gates engine==='kokoro'
+      // — the cloud engine never eager-synthesizes). enqueue() is a
+      // synchronous array push; the drain is deferred + async and never
+      // awaited here, so the text sends below are never delayed and a synth
+      // failure can never affect message delivery (the tap just falls back
+      // to the lazy path).
+      if (eagerVoiceEnabled()) {
+        voicePreSynthQueue.enqueue({
+          token,
+          text: voiceOutPlan.ttsChunks[0]!,
+          ...(voiceOutPlan.voice != null ? { voice: voiceOutPlan.voice } : {}),
+          speed: voiceOutPlan.speed,
+        })
+      }
     }
   }
 
@@ -22500,7 +22588,6 @@ bot.on('callback_query:data', async ctx => {
         .catch(() => {})
       return
     }
-    await ctx.answerCallbackQuery({ text: '🔊 Synthesizing…' }).catch(() => {})
     const cbChatId = String(ctx.chat?.id ?? ctx.from.id)
     const cbMessageId = ctx.callbackQuery?.message?.message_id
     const cbThreadId = (() => {
@@ -22511,35 +22598,57 @@ bot.on('callback_query:data', async ctx => {
       }
       return undefined
     })()
-    // Local sidecar (kokoro) synthesis — same helper the immediate voice-out
-    // path uses. On-demand is a local-engine feature; the cache is only
-    // populated when resolveVoiceOutPlan gated the local verdict.
-    const sidecarToken = await materializeSidecarToken()
-    if (!sidecarToken) {
-      await ctx
-        .answerCallbackQuery({ text: 'Voice sidecar unavailable — try again later.' })
-        .catch(() => {})
-      return
+    // #2763 attach-on-tap: prefer the eagerly pre-synthesized file (written
+    // by the pre-synth queue at reply time). If it's on disk, attach it
+    // immediately — no GPU wait. Missing/unreadable file (expired + swept,
+    // crash, pre-feature entry, kill-switched gateway) falls back
+    // transparently to the lazy synth path below.
+    let audio: Uint8Array | null = null
+    if (entry.filePath != null) {
+      try {
+        audio = readFileSync(entry.filePath)
+      } catch {
+        audio = null // swept/missing — lazy fallback
+      }
     }
-    const result = await synthesizeViaSidecar({
-      token: sidecarToken,
-      // #2760 Phase 1: same deterministic normalization as the immediate
-      // voice-out path — the Listen lazy path builds its own /tts body from
-      // the persisted cache, so it must normalize independently (cache
-      // entries may predate the flag flip).
-      text: normalizeForTts(entry.text),
-      voice: entry.voice,
-      speed: entry.speed,
-    })
-    if (!result.ok) {
-      process.stderr.write(
-        `telegram gateway: voice-out on-demand: synthesis failed reason=${result.reason}\n`,
-      )
-      await ctx
-        .answerCallbackQuery({ text: `Voice failed: ${result.reason}` })
-        .catch(() => {})
-      return
+    if (audio != null) {
+      await ctx.answerCallbackQuery({ text: '🔊' }).catch(() => {})
+    } else {
+      await ctx.answerCallbackQuery({ text: '🔊 Synthesizing…' }).catch(() => {})
+      // Local sidecar (kokoro) synthesis — same helper the immediate voice-out
+      // path uses. On-demand is a local-engine feature; the cache is only
+      // populated when resolveVoiceOutPlan gated the local verdict.
+      const sidecarToken = await materializeSidecarToken()
+      if (!sidecarToken) {
+        await ctx
+          .answerCallbackQuery({ text: 'Voice sidecar unavailable — try again later.' })
+          .catch(() => {})
+        return
+      }
+      const result = await synthesizeViaSidecar({
+        token: sidecarToken,
+        // #2760 Phase 1: same deterministic normalization as the immediate
+        // voice-out path — the Listen lazy path builds its own /tts body from
+        // the persisted cache, so it must normalize independently (cache
+        // entries may predate the flag flip).
+        text: normalizeForTts(entry.text),
+        voice: entry.voice,
+        speed: entry.speed,
+      })
+      if (!result.ok) {
+        process.stderr.write(
+          `telegram gateway: voice-out on-demand: synthesis failed reason=${result.reason}\n`,
+        )
+        await ctx
+          .answerCallbackQuery({ text: `Voice failed: ${result.reason}` })
+          .catch(() => {})
+        return
+      }
+      audio = result.audio
     }
+    // Rebind as const so the closure below narrows to non-null (TS doesn't
+    // narrow a captured `let` inside an arrow function).
+    const audioOut: Uint8Array = audio
     try {
       // Native voice note (NOT a document), quote-replying the button's
       // message.
@@ -22548,7 +22657,7 @@ bot.on('callback_query:data', async ctx => {
           bot.api.sendVoice(
             cbChatId,
             // allow-raw-bot-api: single native voice-note send for an on-demand Listen tap.
-            new InputFile(Buffer.from(result.audio)),
+            new InputFile(Buffer.from(audioOut)),
             {
               ...(cbMessageId != null ? { reply_parameters: { message_id: cbMessageId } } : {}),
               ...(cbThreadId != null ? { message_thread_id: cbThreadId } : {}),
