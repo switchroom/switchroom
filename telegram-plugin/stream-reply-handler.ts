@@ -216,25 +216,24 @@ export interface StreamReplyDeps {
     sameAsLast: boolean
   }) => void
   /**
-   * Optional: progress-card driver completion hook. Wired by the gateway
-   * to `progressDriver.forceCompleteTurn(...)`. Invoked after a
-   * `stream_reply(done=true)` on the default (unnamed) lane finalizes,
-   * so the final-answer delivery acts as an authoritative turn-complete
-   * signal equal to session-tail `turn_end`. Skipped when args.lane is
-   * 'progress' (that's the driver's own emit — calling this would cause
-   * re-entry). Safe to leave unset for callers that don't use the driver.
+   * Optional: turn-complete hook. Historically wired by the gateway to
+   * `progressDriver.forceCompleteTurn(...)` so a `stream_reply(done=true)` on
+   * the default (unnamed) lane acted as an authoritative turn-complete signal
+   * equal to session-tail `turn_end`. The pinned progress card was retired
+   * (#1122/#1126) and `progressDriver` is permanently null, so the gateway now
+   * passes a no-op wrapper for this dep — the hook is inert until a future
+   * consumer re-attaches it. Skipped when args.lane is 'progress'. Safe to
+   * leave unset.
    */
   forceCompleteTurn?: (chatId: string, threadId: number | undefined) => void
   /**
-   * Optional: progress-card driver delivery counter hook. Wired by the
-   * gateway to `progressDriver.recordOutboundDelivered(...)`. Called
-   * BEFORE `forceCompleteTurn` so the driver's per-turn outbound counter
-   * is non-zero when the terminal render fires. Without this ordering
-   * guarantee, `forceCompleteTurn` flushes the card while
-   * `outboundDeliveredCount === 0` → ⚠️ false positive (issue #310).
-   * Only called on the default (unnamed) lane when `done=true` and the
-   * stream produced a non-null messageId. Safe to leave unset for callers
-   * that don't use the driver.
+   * Optional: outbound-delivery counter hook. Historically wired to
+   * `progressDriver.recordOutboundDelivered(...)`, called BEFORE
+   * `forceCompleteTurn` so the driver's per-turn outbound counter was non-zero
+   * when the terminal render fired (issue #310). With the progress card retired
+   * (#1122/#1126, null driver) the gateway passes a no-op wrapper — inert until
+   * re-attached. Only called on the default (unnamed) lane when `done=true` and
+   * the stream produced a non-null messageId. Safe to leave unset.
    */
   recordOutboundDelivered?: (chatId: string, threadId: number | undefined) => void
   /** Whether to persist outbound history. */

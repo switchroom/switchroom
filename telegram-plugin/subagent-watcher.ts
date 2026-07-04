@@ -293,37 +293,47 @@ export interface SubagentWatcherConfig {
   /**
    * Option C: callback fired when a stall is detected for a running sub-agent.
    * Called with the sub-agent's agentId, idle ms, and description string.
-   * Wired to `progressDriver.onSubAgentStall` in gateway.ts so the progress
-   * card re-renders with a visible ⚠️ stall indicator even when the bridge
-   * has disconnected. The `stallNotified` flag prevents duplicate calls for
-   * the same sub-agent across subsequent poll ticks.
+   * The `stallNotified` flag prevents duplicate calls for the same sub-agent
+   * across subsequent poll ticks.
+   *
+   * NOTE: this used to be wired in gateway.ts to `progressDriver.onSubAgentStall`
+   * so the pinned progress card could render a ⚠️ stall badge. That card was
+   * retired (#1122/#1126) and the gateway wiring was removed (the dead no-op
+   * falsely implied a stall renders a visual badge). The callback is retained
+   * as an unwired hook — PR 2 will re-wire it to repaint the live `🛠 Worker`
+   * activity feed on stall. Currently no gateway consumer is attached.
    */
   onStall?: (agentId: string, idleMs: number, description: string) => void
   /**
    * Symmetric to `onStall`: fires when a previously-stalled sub-agent's
    * JSONL grows again (text emission, tool use, turn_end — anything that
-   * moves last_activity_at). Wired to `progressDriver.onSubAgentUnstall`
-   * in gateway.ts so the pinned card clears the ⚠ Stalled badge as soon
-   * as activity resumes, instead of waiting on the next render tick.
+   * moves last_activity_at).
    *
    * Each stall→resume cycle fires exactly once: the watcher resets
    * `entry.stallNotified` on resume, so a sub-agent that stalls again
    * later in the same lifetime is detected (and reported) again.
+   *
+   * NOTE: formerly wired to `progressDriver.onSubAgentUnstall` (retired card,
+   * #1122/#1126) — the gateway wiring was removed with `onStall`. Retained as
+   * an unwired hook for PR 2's live-feed repaint.
    */
   onUnstall?: (agentId: string, description: string) => void
   /**
    * RFC §Bug 6: fires when the watcher synthesises a terminal transition
    * for a stalled sub-agent (no explicit `sub_agent_turn_end` line in
    * the JSONL after `silentStallTerminalMs` past the stall notification).
-   * Wired in gateway.ts to push a synthetic
-   * `{kind:'sub_agent_turn_end', agentId}` event into the progress
-   * driver so the pinned card can release its deferred-completion gate
-   * for the background dispatch.
    *
    * Idempotent: each sub-agent triggers this at most once per lifetime
-   * (guarded by `entry.stallTerminalSynthesised`). Fires *before* the
-   * existing `onFinish` callback so the driver-side state mutation
-   * lands first; the audit-log surface then sees a consistent fleet.
+   * (guarded by `entry.stallTerminalSynthesised`).
+   *
+   * NOTE: formerly wired in gateway.ts to push a synthetic
+   * `{kind:'sub_agent_turn_end', agentId}` into the progress driver so the
+   * pinned card could release its deferred-completion gate. The card is retired
+   * (#1122/#1126) and that dead wiring was removed. The completion path does
+   * NOT depend on this callback: the silent-stall synthesis loop in
+   * `checkStalls()` writes the terminal registry-DB row itself
+   * (`recordSubagentEnd`) and fires `maybySendStateTransition` → `onFinish`
+   * (the handback) regardless. Retained as an unwired hook.
    */
   onStallTerminal?: (agentId: string, description: string) => void
   /**

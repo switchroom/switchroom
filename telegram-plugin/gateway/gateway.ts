@@ -629,7 +629,12 @@ import {
   isOrphanSubagentStatusEnabled,
 } from './subagent-status-surface.js'
 import { formatIdleFooter } from '../idle-footer.js'
-import { resolveCallingSubagent } from './resolve-calling-subagent.js'
+import {
+  deriveStatusQueryTelemetry,
+  formatStatusQueryLine,
+  formatStatusQueryUxFailureLine,
+  type StatusQuerySurfaces,
+} from '../status-query-telemetry.js'
 
 // ─── Stderr logging ───────────────────────────────────────────────────────
 // Install the line-stamper FIRST so it wraps closest to the original
@@ -7328,11 +7333,10 @@ const ipcServer: IpcServer = createIpcServer({
     // compaction occupancy read (see maybeProactiveCompact).
     if (msg.activeFile) lastSessionActiveFile = msg.activeFile
     const ev = msg.event as unknown as SessionEvent
-    // Pass the envelope's chatId so non-enqueue events can route to the
-    // correct card even when the driver's currentChatId is stale.
-    const chatHint = msg.chatId || null
-    const threadHint = msg.threadId != null ? String(msg.threadId) : undefined
-    progressDriver?.ingest(ev, chatHint, threadHint)
+    // #1122/#1126: session events used to be ingested into the pinned progress
+    // card here (`progressDriver.ingest`). The card is retired and the driver
+    // is permanently null, so that call was a dead no-op — removed. Session
+    // events still drive the live surfaces via `handleSessionEvent`.
     handleSessionEvent(ev)
     // Problem B: keep the deferred-interrupt boundary tracker in lockstep with
     // the session stream (tool_use opens, tool_result/turn_end close). If a `!`
@@ -10592,44 +10596,14 @@ async function executeProgressUpdate(args: Record<string, unknown>): Promise<unk
     progressUpdateTurnCount.set(key, currentCount + 1)
   }
 
-  // Issue #305 Option A — try the card-injection path first.
-  // If the call originates from a sub-agent and the parent has an active
-  // pinned card, narrative lands as the sub-agent's row body. Falls through
-  // to the message-send path on miss (parent-agent calls, no active card,
-  // race with watcher backfill, etc).
-  const agentIdHint = (typeof args.agent_id === 'string' && args.agent_id) || null
-  const toolUseIdHint = (typeof args.tool_use_id === 'string' && args.tool_use_id) || null
-  const subAgent = resolveCallingSubagent({
-    db: turnsDb,
-    chatId: chat_id,
-    threadId,
-    agentIdHint,
-    toolUseIdHint,
-  })
-  if (subAgent != null && progressDriver != null) {
-    const cardText = text.length > 200 ? text.slice(0, 199) + '…' : text
-    const result = progressDriver.recordSubAgentNarrative({
-      chatId: chat_id,
-      threadId: threadId != null ? String(threadId) : undefined,
-      agentId: subAgent.agentId,
-      text: cardText,
-    })
-    if (result.ok) {
-      progressUpdateLastSent.set(key, now)
-      try {
-        signalTracker.noteSignal(key, Date.now())
-      } catch { /* best-effort signal */ }
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({ ok: true, mode: 'card', agent_id: subAgent.agentId }),
-          },
-        ],
-      }
-    }
-    // Otherwise fall through to message-send below.
-  }
+  // Issue #305 Option A — the card-injection path (route a sub-agent's
+  // `progress_update` narrative into its row on the parent's pinned card)
+  // was retired with the progress card in #1122/#1126: `progressDriver` is
+  // permanently null, so `recordSubAgentNarrative` could never fire and the
+  // whole `resolveCallingSubagent` → card-inject block was a dead no-op that
+  // always fell through here. Removed. Sub-agent progress now surfaces via
+  // the `🛠 Worker` activity feed + the model's own in-voice handback, and a
+  // `progress_update` call always takes the plain message-send path below.
 
   // Send plain message (no quote-reply). Single rich-markdown path (#2669):
   // `parseMode:'text'` config opts into a literal plain send; everything
@@ -11798,7 +11772,11 @@ function resetOrphanedReplyTimeout(): void {
     currentSessionChatId: turn.sessionChatId,
     capturedTextCount: turn.capturedText.length,
     replyCalled: turn.replyCalled,
-    progressCardActive: progressDriver != null,
+    // #1122/#1126: the pinned card is retired and `progressDriver` is
+    // permanently null, so this suppression signal is always false. Kept as a
+    // literal (the shouldArm* predicate still accepts the flag) rather than
+    // reading the dead driver.
+    progressCardActive: false,
   })) {
     turn.orphanedReplyTimeoutId = setTimeout(() => {
       // The timer fires asynchronously; re-read currentTurn so we
@@ -11812,7 +11790,8 @@ function resetOrphanedReplyTimeout(): void {
         currentSessionChatId: t.sessionChatId,
         capturedTextCount: t.capturedText.length,
         replyCalled: t.replyCalled,
-        progressCardActive: progressDriver != null,
+        // #1122/#1126: retired card / null driver — always false (see above).
+        progressCardActive: false,
       })) {
         // Feed-survival guard: re-arm the fuse while the turn is
         // legitimately working — an in-flight tool, a detached background
@@ -13969,12 +13948,13 @@ function handleSessionEvent(ev: SessionEvent): void {
       }
       // #550: symmetric cleanup with the writeTurnActiveMarker call at
       // the enqueue arm (line ~2810). Pre-fix, removal was single-pathed
-      // through progressDriver.onTurnComplete, which silently no-ops
-      // when forceCompleteTurn finds no active card — leaking the
-      // marker across restarts and triggering watchdog false-positive
-      // restarts. The onTurnComplete callback is retained as defence-
-      // in-depth (both paths are idempotent — unlinkSync swallows
-      // ENOENT).
+      // through the (now-retired, #1122/#1126) progressDriver.onTurnComplete
+      // callback, which silently no-op'd when forceCompleteTurn found no
+      // active card — leaking the marker across restarts and triggering
+      // watchdog false-positive restarts. That driver callback no longer
+      // exists (progressDriver is permanently null); this explicit
+      // removeTurnActiveMarker is now the sole cleanup path (idempotent —
+      // unlinkSync swallows ENOENT).
       removeTurnActiveMarker(STATE_DIR)
       // #1067: null the atom in one assignment, replacing the seven
       // field clears the pre-refactor version did. Any late-arriving
@@ -14651,36 +14631,56 @@ async function handleInbound(
   }
 
   // Issue #109: when the user has to ask "status?" mid-turn, the live progress
-  // surface (pinned card + status reactions) has failed its job. Log the
-  // event with a snapshot of the card state so we can count + analyze
-  // frequency. We don't intercept the message — it still flows through to
-  // the agent, since the agent may have a useful answer the card hasn't
-  // surfaced yet.
+  // surface (status reactions + the edit-in-place `🛠 Worker` feed) may have
+  // failed its job. Log the event with a snapshot of what is ACTUALLY in
+  // flight so we can count + analyze frequency. We don't intercept the
+  // message — it still flows through to the agent, since the agent may have a
+  // useful answer the surfaces haven't communicated yet.
   //
-  // Log shape (grep anchor: "ux-failure: status-query"):
-  //   ux-failure: status-query agent=<n> chat_id=<n> thread=<n|none>
-  //                            card_stage=<stage> card_turn_age_s=<int>
-  //                            card_items=<n> card_subagents=<n>
+  // Truthful telemetry (was a lying diagnostic): the pinned progress card was
+  // retired in #1122/#1126 and `progressDriver` is now permanently null, so
+  // the old `progressDriver.peek(...)` snapshot ALWAYS reported idle/zero
+  // regardless of live work — actively misleading debugging. We now read the
+  // LIVE surfaces instead: the running-background-worker DB count
+  // (`countRunningWorkers`), the `🛠 Worker` activity-feed size, the
+  // cross-turn pending-async-dispatch flag (`pending-work-progress.ts`), and
+  // whether a turn is active (`activeTurnStartedAt`). A live background worker
+  // ⇒ non-idle. A `ux-failure` is emitted ONLY when all of those are genuinely
+  // zero AND no turn is active — i.e. the user asked "status?" and there really
+  // was nothing in flight for the surfaces to have shown.
   //
-  // `card_turn_age_s` is always a non-negative integer; `-1` is the
-  // sentinel for "no active turn / driver idle" so structured-log parsers
-  // (Loki, Datadog, awk) can treat the field as numeric without
-  // string-comparison branches.
+  // Log shape (grep anchor: "status-query"):
+  //   status-query agent=<n> chat_id=<n> thread=<n|none> stage=<stage>
+  //                turn_age_s=<int> running_workers=<n> worker_feed=<n>
+  //                pending_async=<0|1>
+  // When idle, a second line carries the grep anchor "ux-failure: status-query".
+  //
+  // `turn_age_s` is always a non-negative integer; `-1` is the sentinel for
+  // "no active turn" so structured-log parsers (Loki, Datadog, awk) can treat
+  // the field as numeric without string-comparison branches.
   if (STATUS_QUERY_RE.test(text)) {
     try {
-      const threadKey = messageThreadId != null ? String(messageThreadId) : undefined
-      const cardState = progressDriver?.peek(chat_id, threadKey)
-      const turnAgeS = cardState?.turnStartedAt
-        ? Math.max(0, Math.floor((Date.now() - cardState.turnStartedAt) / 1000))
-        : -1
-      const stage = cardState?.stage ?? 'idle'
-      const itemCount = cardState?.items.length ?? 0
-      const subAgentCount = cardState?.subAgents.size ?? 0
+      const thread = messageThreadId != null ? String(messageThreadId) : 'none'
+      const key = statusKey(chat_id, messageThreadId)
+      const turnStartedAt = activeTurnStartedAt.get(key)
+      const turnActive = turnStartedAt != null
+      const surfaces: StatusQuerySurfaces = {
+        turnActive,
+        turnAgeS: turnActive
+          ? Math.max(0, Math.floor((Date.now() - turnStartedAt) / 1000))
+          : -1,
+        runningWorkers: countRunningWorkers(),
+        workerFeedSize: workerActivityFeed?.size ?? 0,
+        pendingAsync: pendingProgress.hasPendingAsyncDispatch(key) ? 1 : 0,
+      }
+      const telemetry = deriveStatusQueryTelemetry(surfaces)
       const agentName = process.env.SWITCHROOM_AGENT_NAME ?? '-'
       process.stderr.write(
-        `telegram gateway: ux-failure: status-query agent=${agentName} chat_id=${chat_id} thread=${threadKey ?? 'none'} ` +
-        `card_stage=${stage} card_turn_age_s=${turnAgeS} card_items=${itemCount} card_subagents=${subAgentCount}\n`,
+        formatStatusQueryLine(agentName, String(chat_id), thread, surfaces, telemetry),
       )
+      if (telemetry.idle) {
+        process.stderr.write(formatStatusQueryUxFailureLine(agentName, String(chat_id), thread))
+      }
     } catch (err) {
       process.stderr.write(`telegram gateway: status-query telemetry failed: ${(err as Error).message}\n`)
     }
@@ -24679,10 +24679,22 @@ process.on('SIGINT', () => void shutdown('SIGINT'))
 // pacing + the silence-poke safety net. The module-level helper vars
 // (`unpinProgressCardForChat`, `getPinnedProgressCardMessageId`,
 // `completeProgressCardTurn`, `flushProgressCardsForShutdown`,
-// `progressDriver`) stay declared and `null`, so the dozens of
+// `progressDriver`) stay declared and `null`, so the remaining
 // optional-chained call sites scattered through this file remain
-// valid TypeScript and no-op at runtime. Those dead sites are
-// scheduled for a follow-up cleanup PR.
+// valid TypeScript and no-op at runtime.
+//
+// Cleanup pass (truthful-telemetry PR): the actively-misleading dead sites
+// have been purged — the `status-query` telemetry now reads the live surfaces
+// instead of the null-driver `peek()`; the sub-agent `onStall`/`onUnstall`/
+// `onStallTerminal` gateway wirings (which falsely implied a stall renders a
+// visual badge) are removed; the dead sub-agent card-injection block in
+// `progress_update` is gone; and `progressCardActive` reads the literal false
+// instead of `progressDriver != null`. The remaining `progressDriver?.X` /
+// `unpinProgressCardForChat?.(...)` / `completeProgressCardTurn?.(...)` sites
+// are interface-bound no-ops (deps handed to stream-reply-handler /
+// disconnect-flush, or constant-folding guards inside the turn-flush backstop
+// hot path); removing them means changing those modules' public shapes and is
+// deferred so this PR stays scoped to truthful telemetry + comment fixes.
 
 
 // ─── Startup ──────────────────────────────────────────────────────────────
@@ -25402,55 +25414,21 @@ void (async () => {
               // the model's own beat-4 handback reply; the watcher's
               // role here is registry liveness + the `onFinish` cue.
               log: (msg) => process.stderr.write(`telegram gateway: ${msg}\n`),
-              // Option C (#393): route stall detections into the progress-card
-              // driver so the pinned card re-renders with a ⚠️ indicator even
-              // when the bridge has disconnected and events have stopped flowing.
-              onStall: (agentId, idleMs, description) => {
-                progressDriver?.onSubAgentStall(agentId, idleMs, description)
-              },
-              // Symmetric to onStall: clear the ⚠ Stalled badge as soon
-              // as the watcher sees JSONL activity return, instead of
-              // waiting on the next render tick to recompute idle ms.
-              onUnstall: (agentId, description) => {
-                progressDriver?.onSubAgentUnstall?.(agentId, description)
-              },
-              // RFC §Bug 6: background `Agent` dispatches in some
-              // Claude Code versions don't write a terminal
-              // `system + turn_duration` line to the sub-agent JSONL.
-              // The watcher detects the silent-stall window and
-              // synthesises terminal here; we mirror it into the
-              // progress driver as a real `sub_agent_turn_end`
-              // SessionEvent so the deferred-completion gate
-              // releases and the pinned card flips from 🌀 to ✅.
+              // #1122/#1126 cleanup: the `onStall` / `onUnstall` /
+              // `onStallTerminal` callbacks used to route into
+              // `progressDriver.onSubAgentStall` / `onSubAgentUnstall` /
+              // `ingest(sub_agent_turn_end)` so the pinned card could render a
+              // ⚠️ badge and release its deferred-completion gate. That card
+              // was deleted and `progressDriver` is permanently null, so those
+              // wirings were dead no-ops that falsely implied a stall renders a
+              // visual badge (it doesn't). They are removed here.
               //
-              // Find the parent turnKey + chatId by peeking the
-              // driver's fleet (same idiom onFinish uses just below).
-              onStallTerminal: (agentId) => {
-                try {
-                  const fleets = progressDriver?.peekAllFleets() ?? []
-                  for (const f of fleets) {
-                    if (f.fleet.has(agentId)) {
-                      progressDriver?.ingest(
-                        { kind: 'sub_agent_turn_end', agentId },
-                        f.chatId ?? null,
-                        undefined,
-                      )
-                      return
-                    }
-                  }
-                  // No fleet entry — the driver-side state was lost
-                  // (cs.dispose ran or peek timing missed). Drop a
-                  // log line and fall through to onFinish's audit
-                  // surface; the card may already be cleaned up.
-                  process.stderr.write(
-                    `telegram gateway: subagent-watcher: onStallTerminal ${agentId} — no fleet entry to retarget; synthetic sub_agent_turn_end skipped\n`,
-                  )
-                } catch (err) {
-                  process.stderr.write(
-                    `telegram gateway: subagent-watcher: onStallTerminal ${agentId} ingest error: ${(err as Error).message}\n`,
-                  )
-                }
-              },
+              // The load-bearing completion path is NOT here: subagent-watcher's
+              // silent-stall terminal synthesis writes the terminal registry-DB
+              // row itself (`recordSubagentEnd`) and fires `maybySendStateTransition`
+              // → `onFinish` (the handback) independently of `onStallTerminal`.
+              // Re-painting a live background worker on stall/unstall is PR 2's
+              // job (via the `🛠 Worker` activity feed, not a retired card).
               // conversational-pacing beat 4 — the handback. A foreground
               // sub-agent hands its result straight back as the Task tool
               // result, inside the parent's own turn; the model sees it
