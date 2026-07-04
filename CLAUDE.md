@@ -125,7 +125,7 @@ obligation:
 
 ## Lint gates
 
-`npm run lint` = `tsc --noEmit` plus these guard scripts (each has an
+`npm run lint` = `tsc --noEmit` plus these guard scripts (most have an
 `npm run lint:<name>` alias; see `package.json`):
 `check-plugin-references`, `check-bot-api-wrapping`,
 `check-bun-test-imports`, `check-no-pii-secrets`,
@@ -142,6 +142,7 @@ Traps that bite repeatedly:
   `check-bot-api-wrapping` while tsc stays green. Run it locally and widen
   ranges in the same PR. New Telegram API calls go through
   `retryApiCall`/`robustApiCall`, not raw.
+
 ### Secrets in tests
 
 GitHub Push Protection blocks token-shaped literals even in fixtures. Build
@@ -182,7 +183,10 @@ vitest via `bun run --cwd telegram-plugin test:uat <name>`
 (`vitest.uat.config.ts`). Scenarios: `telegram-plugin/uat/scenarios/`,
 named `jtbd-<job>-{dm,channel}` / `fuzz-*`.
 
-- **`uat-gate` is a REQUIRED check** (`ci-uat.yml`). The heavy `uat-gate-run`
+- **`uat-gate` is a sentinel job, NOT ruleset-required** (`ci-uat.yml`; as
+  of 2026-07 it is absent from Ruleset 16470166's 11 required checks, so
+  `--auto --squash` WILL merge past a red `uat-gate` — check it yourself
+  before enabling auto-merge on plugin/agent-path PRs). The heavy `uat-gate-run`
   fires on the self-hosted `uat-host` runner when plugin/agent paths change
   and `UAT_GATE_ENABLED` is set; it runs three live scenarios:
   `jtbd-fast-trivial-dm` (real DM round-trip, **hard reply-latency SLA of
@@ -192,8 +196,8 @@ named `jtbd-<job>-{dm,channel}` / `fuzz-*`.
   was legitimately path-skipped.
 - **Known-flaky under quota/API turbulence.** If your diff doesn't touch the
   reply-latency or delivery path and `uat-gate` reds, re-run the workflow
-  rather than trying to merge past it (you can't — bypass is locked).
-- `uat-fuzz` is `workflow_dispatch`-only and non-required (each fuzz scenario
+  and get it green before merging — never ship past a red gate.
+- `uat-fuzz` is `workflow_dispatch` + scheduled runs, non-required (each fuzz scenario
   burns real subscription quota).
 - **Don't attempt full headless UAT locally** — it needs the live
   test-harness agent, a real MTProto driver session, and vault creds. Scope
@@ -294,7 +298,7 @@ DB, audit log, scaffolds). A test that writes there corrupts a running fleet
 - If you can't point to a vault test's tmpdir, assume it hits production and
   stop.
 
-## Release (condensed — full landmine detail in git history + memories)
+## Release (condensed — full landmine detail in git history)
 
 - **Version source of truth is the git tag**, resolved by
   `scripts/build.mjs:resolveVersion()`. The committed `package.json`
@@ -304,7 +308,9 @@ DB, audit log, scaffolds). A test that writes there corrupts a running fleet
 - `npm pack` names the tarball from the stale version — bump `package.json`
   **uncommitted** at pack time; verify `dist/cli/switchroom.js` is in the
   tarball before `npm publish --ignore-scripts`. Never pipe the build through
-  `tail` (masks a failed exit).
+  `tail` (masks a failed exit). Release builds need a **real
+  `node_modules`**, not a worktree symlink — a symlinked `node_modules` made
+  `bun build` silently emit an empty `dist/cli/` (broke v0.12.6→7).
 - Create the GitHub Release (`gh release create`) — historically silently
   dropped. The naive `awk '/^## vX/,/^## v/'` CHANGELOG range collapses to
   one line; use a start-flag awk instead.
@@ -321,7 +327,9 @@ DB, audit log, scaffolds). A test that writes there corrupts a running fleet
 ## Secrets & safety rails
 
 Dev-host vault is broker-auto-unlocked: `switchroom vault get <key>` needs no
-passphrase. Never mirror the vault to plaintext; never commit tokens. Never
+passphrase. On-disk layout + the 5-state layout migration
+(`src/vault/migrate-layout.ts`) are documented in `docs/vault.md` § Layout.
+Never mirror the vault to plaintext; never commit tokens. Never
 bypass hooks (`--no-verify`) or force-push `main`. Don't touch `vendor/`,
 `~/.switchroom/vault/`, or private dirs without reason.
 
