@@ -563,3 +563,40 @@ describe('agent-dir resolution (RFC §Bug 2)', () => {
     }
   })
 })
+
+// ---------------------------------------------------------------------------
+// Concurrent nested dispatch — row-creation reliability (unified cards)
+// ---------------------------------------------------------------------------
+
+describe('pretool — concurrent dispatch reliability', () => {
+  it('N hook processes writing the same registry.db concurrently all land their rows', async () => {
+    // The live-incident failure mode: several sub-agents dispatch at once
+    // (a depth-1 worker fanning out nested workers), the hook processes
+    // contend on registry.db, and a loser's INSERT vanished with
+    // SQLITE_BUSY → 0 rows → the worker's card froze on "starting…".
+    // The busy_timeout arming + this pin keep that from regressing.
+    const N = 8
+    const { spawn } = require('child_process') as typeof import('child_process')
+    const runs = Array.from({ length: N }, (_, i) => new Promise<number>((resolve) => {
+      const child = spawn(process.execPath, [PRETOOL_SCRIPT], {
+        env: { ...process.env, SWITCHROOM_AGENT_DIR: agentDir },
+        stdio: ['pipe', 'ignore', 'inherit'],
+      })
+      child.on('close', (code: number | null) => resolve(code ?? -1))
+      child.stdin!.end(JSON.stringify({
+        session_id: 'sess-conc',
+        tool_name: 'Task',
+        tool_use_id: `toolu_conc_${i}`,
+        tool_input: { description: `concurrent worker ${i}`, run_in_background: true },
+      }))
+    }))
+    const codes = await Promise.all(runs)
+    expect(codes.every((c) => c === 0)).toBe(true)
+
+    const db = openDb()
+    const rows = db.prepare(
+      "SELECT id FROM subagents WHERE id LIKE 'toolu_conc_%' ORDER BY id",
+    ).all() as Array<{ id: string }>
+    expect(rows.length).toBe(N)
+  }, 30_000)
+})

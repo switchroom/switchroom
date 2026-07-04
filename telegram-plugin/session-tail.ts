@@ -124,7 +124,19 @@ export type SessionEvent =
   | { kind: 'sub_agent_text'; agentId: string; text: string; blockIndex: number; lastInMessage: boolean }
   | { kind: 'sub_agent_tool_result'; agentId: string; toolUseId: string; isError?: boolean; errorText?: string }
   | { kind: 'sub_agent_turn_end'; agentId: string }
-  | { kind: 'sub_agent_nested_spawn'; agentId: string }
+  | {
+      kind: 'sub_agent_nested_spawn'
+      agentId: string
+      /** tool_use id of the nested Agent/Task dispatch — the `subagents`
+       *  registry PK the child's meta.json `toolUseId` links against. Lets
+       *  the watcher record/repair the nested worker's registry row
+       *  (recordNestedSubagentDispatch — the depth-2+ keying fix). */
+      toolUseId?: string | null
+      /** The dispatch tool_input (description / subagent_type /
+       *  run_in_background) — registry metadata only, never rendered
+       *  (design §5.5's "no recursion in rendering" rule is unchanged). */
+      input?: Record<string, unknown>
+    }
   /**
    * Emitted when a sub-agent JSONL has >= CAP_TOOL_USE_THRESHOLD tool_use
    * records but no terminal record (no `type:result`, `subtype:end`, or
@@ -480,7 +492,12 @@ export function projectSubagentLine(
         // that would surface the sub-sub-agent's description and break
         // the "no recursion in rendering" rule.
         if (name === 'Agent' || name === 'Task') {
-          events.push({ kind: 'sub_agent_nested_spawn', agentId })
+          events.push({
+            kind: 'sub_agent_nested_spawn',
+            agentId,
+            toolUseId: (c.id as string | undefined) ?? null,
+            input: (c.input as Record<string, unknown> | undefined) ?? undefined,
+          })
         } else {
           events.push({
             kind: 'sub_agent_tool_use',

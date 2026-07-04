@@ -311,9 +311,15 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
   function accumulateNarrative(h: WorkerHandle, view: WorkerActivityView): void {
     const line = view.latestSummary.trim()
     if (line.length === 0) return
-    // Dedup against the immediately-preceding line — the watcher re-emits the
-    // same narrative across ticks while a tool runs; we only grow on change.
-    if (h.narrative[h.narrative.length - 1] === line) return
+    // Dedup within the whole rolling window, not just the immediately-
+    // preceding line. The watcher re-emits the same narrative across ticks
+    // while a tool runs (adjacent repeats), AND one logical step can surface
+    // twice non-adjacently — e.g. a "Look for X" preamble followed later by
+    // the Task tool whose describeToolUse label is the same "Look for X"
+    // description, interleaved with another step (the A,B,A duplication the
+    // operator observed on live cards). A legitimate later re-visit of the
+    // same step re-appears once the earlier copy scrolls out of the window.
+    if (h.narrative.includes(line)) return
     h.narrative.push(line)
     // Rolling window — keep only the last STATUS_ROLLING_LINES in memory. The
     // render shows exactly those lines (clipped per-line by the unified pipeline);
