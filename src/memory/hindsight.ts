@@ -654,12 +654,23 @@ export async function createBank(
     }
     // ECONNREFUSED / fetch failed → daemon not running. Normalize to
     // "Unreachable" so the CLI can surface a specific operator message.
+    // Also catch the undici connect-layer failure ("Unable to connect. Is
+    // the computer able to access the url?" / UND_ERR_CONNECT), which none
+    // of the substrings above match — it was falling through to the scary
+    // "⚠ Failed to create Hindsight bank" branch on every restart instead
+    // of the calm "unreachable — agent still usable" path.
     const msg = String(err);
+    const causeCode = (err as { cause?: { code?: string } })?.cause?.code;
     if (
       msg.includes("ECONNREFUSED") ||
       msg.includes("fetch failed") ||
       msg.includes("Failed to fetch") ||
-      msg.includes("ENOTFOUND")
+      msg.includes("ENOTFOUND") ||
+      msg.includes("Unable to connect") ||
+      msg.includes("UND_ERR_CONNECT") ||
+      causeCode === "UND_ERR_CONNECT" ||
+      causeCode === "ECONNREFUSED" ||
+      causeCode === "ENOTFOUND"
     ) {
       return { ok: false, reason: "Unreachable" };
     }
