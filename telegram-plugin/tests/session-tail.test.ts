@@ -577,6 +577,97 @@ describe('projectSubagentLine', () => {
     ])
   })
 
+  // ── Upstream-shape regression (Claude Code ≥2.1.x split-message writes) ──
+  // One logical assistant message is now persisted as MULTIPLE JSONL lines
+  // sharing one message.id, one content-block per line, and the terminal
+  // stop_reason (end_turn) is stamped on EVERY split line — including the
+  // leading [thinking] line that precedes the [text: final answer] line.
+  // Regression: firing the sub-agent terminal on the thinking-only line marks
+  // the sub-agent done and hands back stale/empty text BEFORE the real handback
+  // [text] line is projected. These pin the fix: the terminal must ride the
+  // content-bearing line, not the thinking-only split preamble.
+  it('does NOT emit sub_agent_turn_end on a thinking-only end_turn split line', () => {
+    // The FIRST line of a split terminal message: thinking only, but carries
+    // stop_reason end_turn (observed verbatim in 2.1.199 transcripts).
+    const st = { hasEmittedStart: true }
+    const events = projectSubagentLine(
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          id: 'msg_split',
+          stop_reason: 'end_turn',
+          content: [{ type: 'thinking', thinking: 'deciding how to summarise', signature: 'sig' }],
+        },
+      }),
+      'X',
+      st,
+    )
+    // Thinking is a projection no-op for sub-agents; crucially, NO premature
+    // terminal — the handback text has not been seen yet.
+    expect(events.some((e) => e.kind === 'sub_agent_turn_end')).toBe(false)
+  })
+
+  it('emits the handback text THEN one turn_end across a split end_turn message', () => {
+    // The full split terminal message, as two consecutive JSONL lines sharing
+    // message.id — the shape that dropped background sub-agent handbacks.
+    const st = { hasEmittedStart: true }
+    const thinkingLine = JSON.stringify({
+      type: 'assistant',
+      message: {
+        id: 'msg_split2',
+        stop_reason: 'end_turn',
+        content: [{ type: 'thinking', thinking: '...', signature: 'sig' }],
+      },
+    })
+    const textLine = JSON.stringify({
+      type: 'assistant',
+      message: {
+        id: 'msg_split2',
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'Handback: the fix is in session-tail.' }],
+      },
+    })
+    const all = [
+      ...projectSubagentLine(thinkingLine, 'X', st),
+      ...projectSubagentLine(textLine, 'X', st),
+    ]
+    // The handback text must be emitted, and exactly one turn_end, and the
+    // text must come BEFORE the turn_end so the watcher captures the real
+    // result before it marks the entry done.
+    const textEvents = all.filter((e) => e.kind === 'sub_agent_text')
+    const endEvents = all.filter((e) => e.kind === 'sub_agent_turn_end')
+    expect(textEvents.length).toBe(1)
+    expect((textEvents[0] as { text: string }).text).toBe('Handback: the fix is in session-tail.')
+    expect(endEvents.length).toBe(1)
+    const textIdx = all.findIndex((e) => e.kind === 'sub_agent_text')
+    const endIdx = all.findIndex((e) => e.kind === 'sub_agent_turn_end')
+    expect(textIdx).toBeLessThan(endIdx)
+  })
+
+  it('still fires terminal on the legacy single-line [thinking, text](end_turn) shape', () => {
+    // Graceful degradation: the OLD one-line-all-blocks shape has a text block
+    // on the same line, so the terminal fires exactly as before.
+    const st = { hasEmittedStart: true }
+    const events = projectSubagentLine(
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          stop_reason: 'end_turn',
+          content: [
+            { type: 'thinking', thinking: '...', signature: 'sig' },
+            { type: 'text', text: 'Legacy handback.' },
+          ],
+        },
+      }),
+      'X',
+      st,
+    )
+    const textIdx = events.findIndex((e) => e.kind === 'sub_agent_text')
+    const endIdx = events.findIndex((e) => e.kind === 'sub_agent_turn_end')
+    expect(textIdx).toBeGreaterThanOrEqual(0)
+    expect(endIdx).toBeGreaterThan(textIdx)
+  })
+
   it('does NOT emit sub_agent_turn_end for a tool-using assistant message (stop_reason tool_use)', () => {
     // A mid-run assistant message that calls a tool has stop_reason 'tool_use'
     // and keeps going — it must not be mistaken for completion.

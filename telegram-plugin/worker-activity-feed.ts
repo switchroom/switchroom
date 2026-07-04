@@ -429,7 +429,15 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       const liveElapsed = h.dispatchAtMs != null ? now - h.dispatchAtMs : h.lastView.elapsedMs
       const liveSuffix = ' · ' + formatFeedElapsed(liveElapsed)
       // Re-render THROUGH the chain + doUpdate path — never editMessageText directly.
-      const view = h.lastView
+      //
+      // CLOCK-ANCHOR PARITY: refresh the view's elapsedMs to the SAME
+      // `liveElapsed` the step suffix shows. The header renders
+      // `view.elapsedMs`; passing the stale lastView froze the header at the
+      // last watcher event while the `· Ns` suffix kept ticking, so the
+      // current step's timer could read MORE than the card's master elapsed
+      // (Ken-observed defect). Both numbers now derive from one anchor
+      // (dispatchAtMs) at one `now`, so header elapsed >= step suffix always.
+      const view = { ...h.lastView, elapsedMs: Math.max(h.lastView.elapsedMs, liveElapsed) }
       h.chain = h.chain
         .then(() => doUpdate(h, view, liveSuffix))
         .catch((err) => {
