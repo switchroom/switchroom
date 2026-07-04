@@ -10,7 +10,7 @@ This skill is the reference for running `switchroom` CLI commands against existi
 
 **Four commands to know:**
 - `switchroom update` — full operator path: pulls images + applies config + recreates containers + runs doctor (since v0.7.8 / #918). What you want 95% of the time.
-- `switchroom apply` — config-only reconcile: refresh per-agent scaffolds and (re)write `~/.switchroom/compose/docker-compose.yml` without touching running containers. Use when you want to inspect the generated compose before bringing the fleet up yourself.
+- `switchroom apply` — **host/operator-only**, for structural changes: refresh per-agent scaffolds and (re)write `~/.switchroom/compose/docker-compose.yml`. Its full per-agent scaffold **cannot run from inside an agent container** (no vault at the container HOME, no `docker compose` v2 plugin) — that's correct by construction, not a bug. Version rolls do NOT need it: drive the **hostd rollout** (`mcp__hostd__rollout`), which runs a `--compose-only` apply plus a per-agent restart-reconcile that refreshes each agent's templates automatically. Reserve a host-side `sudo switchroom apply` for compose regeneration / new-agent scaffolding.
 - `switchroom restart [agent]` — bounces a stuck or wedged agent
 - `switchroom version` — shows what's running (versions + health summary)
 
@@ -59,7 +59,7 @@ switchroom update --rebuild      # source-checkout users: also git pull + npm bu
 
 `switchroom update` is the operator path. The CLI self-elevates via sudo internally for the per-agent scaffold dirs that need root — no need for `sudo HOME=… PATH=…` incantations.
 
-If you only need the config-reconcile half without restarting agents, `switchroom apply` writes `~/.switchroom/compose/docker-compose.yml` and refreshes per-agent scaffolds without touching running containers. The operator runs the docker bring-up themselves.
+If you only need the config-reconcile half without restarting agents, `switchroom apply` (run **on the host by the operator**) writes `~/.switchroom/compose/docker-compose.yml` and refreshes per-agent scaffolds without touching running containers. The operator runs the docker bring-up themselves. Note this full apply cannot run from inside an agent container by construction — to roll the fleet to a new version from an agent, use the hostd rollout (`mcp__hostd__rollout`) instead of a full apply.
 
 From inside an agent's Telegram DM, the same flow is available as `/upgradestatus` (read-only) and `/update apply` (admin-gated).
 

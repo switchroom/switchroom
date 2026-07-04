@@ -2,7 +2,12 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runApply, runApplyPreflight } from "./apply.js";
+import {
+  runApply,
+  runApplyPreflight,
+  isInAgentContainer,
+  IN_AGENT_CONTAINER_APPLY_MSG,
+} from "./apply.js";
 import * as scaffoldModule from "../agents/scaffold.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 
@@ -155,6 +160,73 @@ describe("runApply", () => {
       const all = sink.join("");
       expect(all).toMatch(/could not chown/);
       expect(all).toMatch(/continuing/i);
+    });
+  });
+
+  describe("in-agent-container preflight redirect", () => {
+    // Snapshot + restore the agent-container env markers so these cases
+    // are deterministic regardless of whether the suite itself happens to
+    // run inside an agent container.
+    let _origName: string | undefined;
+    let _origRoot: string | undefined;
+    beforeEach(() => {
+      _origName = process.env.SWITCHROOM_AGENT_NAME;
+      _origRoot = process.env.SWITCHROOM_AGENT_ROOT;
+      delete process.env.SWITCHROOM_AGENT_NAME;
+      delete process.env.SWITCHROOM_AGENT_ROOT;
+    });
+    afterEach(() => {
+      if (_origName !== undefined) process.env.SWITCHROOM_AGENT_NAME = _origName;
+      else delete process.env.SWITCHROOM_AGENT_NAME;
+      if (_origRoot !== undefined) process.env.SWITCHROOM_AGENT_ROOT = _origRoot;
+      else delete process.env.SWITCHROOM_AGENT_ROOT;
+    });
+
+    it("isInAgentContainer detects the env marker regardless of structural signals", () => {
+      expect(
+        isInAgentContainer(true, true, { SWITCHROOM_AGENT_NAME: "klanker" }),
+      ).toBe(true);
+      expect(
+        isInAgentContainer(true, true, { SWITCHROOM_AGENT_ROOT: "true" }),
+      ).toBe(true);
+    });
+
+    it("isInAgentContainer detects the structural fingerprint (no vault + no compose v2)", () => {
+      expect(isInAgentContainer(false, false, {})).toBe(true);
+      // A genuine host missing only ONE of the two is NOT the fingerprint.
+      expect(isInAgentContainer(false, true, {})).toBe(false);
+      expect(isInAgentContainer(true, false, {})).toBe(false);
+    });
+
+    it("preflight throws the DIRECTED hostd-rollout message when the env marker is set", () => {
+      process.env.SWITCHROOM_AGENT_NAME = "klanker";
+      const fakeVault = join(tmpdir(), `nonexistent-vault-${Date.now()}.enc`);
+      const cfg = {
+        ...makeStubConfig("/tmp/agents"),
+        vault: { path: fakeVault },
+        telegram: { bot_token: "vault:telegram_bot_token" },
+      } as unknown as SwitchroomConfig;
+      // Compose "present" (skip) so only the vault-missing condition trips —
+      // the env marker still routes to the directed message.
+      expect(() => runApplyPreflight(cfg, SKIP_COMPOSE_PREFLIGHT)).toThrow(
+        /mcp__hostd__rollout/,
+      );
+      expect(() => runApplyPreflight(cfg, SKIP_COMPOSE_PREFLIGHT)).toThrow(
+        IN_AGENT_CONTAINER_APPLY_MSG,
+      );
+    });
+
+    it("preflight throws the DIRECTED message on the structural fingerprint (no vault + no compose v2)", () => {
+      const fakeVault = join(tmpdir(), `nonexistent-vault-${Date.now()}.enc`);
+      const cfg = {
+        ...makeStubConfig("/tmp/agents"),
+        vault: { path: fakeVault },
+        telegram: { bot_token: "vault:telegram_bot_token" },
+      } as unknown as SwitchroomConfig;
+      // No env markers (cleared above); force compose v2 "missing".
+      expect(() =>
+        runApplyPreflight(cfg, { detectComposeV2: () => "compose v2 missing" }),
+      ).toThrow(/mcp__hostd__rollout/);
     });
   });
 
