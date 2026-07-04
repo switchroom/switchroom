@@ -76,6 +76,16 @@ function safeBasename(p) {
   }
 }
 
+/** Hostname only, `www.` stripped — the WebFetch label form ("Reading example.com"). */
+function urlHost(u) {
+  if (!u || typeof u !== 'string') return ''
+  try {
+    return new URL(u).hostname.replace(/^www\./, '')
+  } catch {
+    return u
+  }
+}
+
 function urlHostPath(u) {
   if (!u || typeof u !== 'string') return ''
   try {
@@ -115,26 +125,53 @@ export function computeLabel(toolName, input) {
   }
 
   // Built-in rule table.
+  //
+  // THE single status vocabulary. This function is the ONE composer for the
+  // per-tool activity wording on EVERY surface: the real-time sidecar drives
+  // the live feed from here, and the gateway/watcher flush paths delegate via
+  // `describeToolUse` (tool-activity-summary.ts). Do NOT fork a second
+  // wording table — status-vocabulary-unification.test.ts pins the
+  // delegation, so drift fails CI.
   switch (toolName) {
-    case 'Read':
-      return `Reading ${clip(safeBasename(i.file_path))}`.trim()
-    case 'Edit':
-      return `Editing ${clip(safeBasename(i.file_path))}`.trim()
-    case 'Write':
-      return `Writing ${clip(safeBasename(i.file_path))}`.trim()
-    case 'Grep': {
-      const path = i.path ? clip(asText(i.path), 40) : '.'
-      const pat = clip(asText(i.pattern), 40)
-      return `Searching ${path} for ${pat}`
+    case 'Read': {
+      const f = clip(safeBasename(i.file_path))
+      return f ? `Reading ${f}` : 'Reading a file'
     }
-    case 'Glob':
-      return `Finding files matching ${clip(asText(i.pattern), 60)}`
-    case 'WebFetch':
-      return `Fetching ${clip(urlHostPath(i.url), 60)}`
-    case 'WebSearch':
-      return `Searching the web for ${clip(asText(i.query), 60)}`
-    case 'NotebookEdit':
-      return `Editing notebook ${clip(safeBasename(i.notebook_path))}`
+    case 'Edit':
+    case 'MultiEdit': {
+      const f = clip(safeBasename(i.file_path))
+      return f ? `Editing ${f}` : 'Editing a file'
+    }
+    case 'Write': {
+      const f = clip(safeBasename(i.file_path))
+      return f ? `Writing ${f}` : 'Writing a file'
+    }
+    case 'Grep': {
+      const pat = clip(asText(i.pattern), 40)
+      if (!pat) return 'Searching files'
+      const path = i.path ? clip(asText(i.path), 40) : ''
+      return path ? `Searching ${path} for ${pat}` : `Searching for ${pat}`
+    }
+    case 'Glob': {
+      const pat = clip(asText(i.pattern), 60)
+      return pat ? `Finding files matching ${pat}` : 'Searching files'
+    }
+    case 'WebFetch': {
+      const h = clip(urlHost(i.url), 60)
+      return h ? `Reading ${h}` : 'Reading a web page'
+    }
+    case 'WebSearch': {
+      const q = clip(asText(i.query), 60)
+      return q ? `Searching the web for ${q}` : 'Searching the web'
+    }
+    case 'NotebookEdit': {
+      const f = clip(safeBasename(i.notebook_path))
+      return f ? `Editing ${f}` : 'Editing a notebook'
+    }
+    case 'TaskCreate':
+    case 'TaskUpdate':
+    case 'TaskList':
+      return 'Updating the plan'
     case 'BashOutput':
       return 'Reading background output'
     case 'KillBash':
@@ -183,7 +220,8 @@ export function computeLabel(toolName, input) {
       case 'mcp__hindsight__reflect':
         return 'Searching memory'
       case 'mcp__hindsight__retain':
-        return 'Saving memory'
+      case 'mcp__hindsight__update_memory':
+        return 'Saving to memory'
       // Explicit suppressions — return null so we don't emit a sidecar line.
       case 'mcp__hindsight__sync_retain':
         return null
