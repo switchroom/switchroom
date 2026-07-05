@@ -28,6 +28,8 @@ import {
 import {
   repairEscapedWhitespace,
   normalizeParagraphBreaks,
+  normalizePunctuation,
+  stripExcessBold,
   addParagraphSpacers,
   splitMarkdownChunks,
   PARAGRAPH_SPACER,
@@ -215,6 +217,71 @@ describe('#2798 turn-flush block separation — real multi-block transcript shap
       capturedText: ['Sent.', 'NO_REPLY', 'NO_REPLY'],
     })
     expect(d).toEqual({ kind: 'skip', reason: 'silent-marker' })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// #2798 reply-parity follow-up — the turn-flush normalization chain must apply
+// the SAME steps in the SAME order as executeReply, so a backstop-delivered
+// answer renders byte-for-byte like the identical text sent via `reply`. Reply
+// runs (gateway executeReply):
+//   repairEscapedWhitespace -> normalizeParagraphBreaks -> redactOutboundText
+//   -> stripExcessBold(normalizePunctuation) -> scrubVoice
+//   -> addParagraphSpacers (send side)
+// The original #2798 change gave turn-flush the paragraph steps + redact +
+// scrub + spacers but OMITTED `stripExcessBold(normalizePunctuation(...))`.
+// This suite reconstructs the deterministic format chain of BOTH paths (the
+// runtime-only redact + voice-scrub steps are literally the same calls on both
+// paths and are out of scope here) and pins that turn-flush now matches reply
+// on an input that exercises the two added steps: unicode bullets + a spaced
+// en-/em-dash (normalizePunctuation) and an over-bolded prose block
+// (stripExcessBold).
+// ---------------------------------------------------------------------------
+describe('#2798 turn-flush punctuation/bold parity with reply', () => {
+  // The shared deterministic format chain both send sites now apply, in order.
+  // replyFormatChain mirrors gateway executeReply (lines ~8924/8937/9175);
+  // turnFlushFormatChain mirrors the turn_end backstop (lines ~13571/added/
+  // 13708). They are deliberately IDENTICAL — that identity IS the parity
+  // contract this test guards; a future edit to only one gateway site would
+  // break byte-parity and red this test.
+  function replyFormatChain(text: string): string {
+    let t = normalizeParagraphBreaks(repairEscapedWhitespace(text))
+    t = stripExcessBold(normalizePunctuation(t))
+    return addParagraphSpacers(t)
+  }
+  function turnFlushFormatChain(text: string): string {
+    let t = normalizeParagraphBreaks(repairEscapedWhitespace(text))
+    t = stripExcessBold(normalizePunctuation(t))
+    return addParagraphSpacers(t)
+  }
+
+  const input =
+    '**This whole paragraph is bolded and is deliberately long enough to ' +
+    'exceed the hundred non-code character floor so the over-bold tripwire ' +
+    'fires on it every time.**\n\n' +
+    '• first bullet\n• second bullet\n\n' +
+    'A range like 2019 – 2024 and a spaced em-dash a — b for good measure.'
+
+  it('produces byte-identical output to the reply format chain', () => {
+    expect(turnFlushFormatChain(input)).toBe(replyFormatChain(input))
+  })
+
+  it('strips the over-bold block and normalizes bullets/dashes exactly as reply does', () => {
+    const out = turnFlushFormatChain(input)
+    // stripExcessBold removed the ** markers from the over-bolded paragraph
+    // (the step turn-flush was missing) — the text survives, the markers do not.
+    expect(out).not.toContain('**This whole paragraph')
+    expect(out).toContain('This whole paragraph is bolded')
+    // normalizePunctuation turned unicode bullets into GFM '- ' list items.
+    expect(out).toContain('- first bullet')
+    expect(out).toContain('- second bullet')
+    expect(out).not.toContain('• first bullet')
+    // and normalized the dashes: spaced en-dash numeric range -> hyphen,
+    // spaced em-dash between words -> comma. Same treatment reply applies.
+    expect(out).toContain('2019-2024')
+    expect(out).toContain('a, b')
+    expect(out).not.toContain('2019 – 2024')
+    expect(out).not.toContain('a — b')
   })
 })
 

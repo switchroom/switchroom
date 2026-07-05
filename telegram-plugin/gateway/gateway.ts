@@ -13588,6 +13588,15 @@ function handleSessionEvent(ev: SessionEvent): void {
         // the preview, and recordOutbound.
         capturedText = redactOutboundText(capturedText, 'turn_flush')
 
+        // #2798 reply-parity — normalize dashes/bullets and trip the over-bold
+        // guard deterministically, on code-masked text. This is the SAME chain
+        // the reply path applies (`stripExcessBold(normalizePunctuation(text))`)
+        // in the SAME order: after redact, before scrubVoice. Without it the
+        // turn-flush backstop rendered punctuation/bold differently from an
+        // identical reply. Kept inline to mirror reply exactly — a shared helper
+        // is a deliberate future refactor, not this change.
+        capturedText = stripExcessBold(normalizePunctuation(capturedText))
+
         // Voice scrub (PR #1683 follow-up). Turn-flush is the path
         // that fires when the model emits raw transcript text WITHOUT
         // calling reply / stream_reply. That captured text bypasses
