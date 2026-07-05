@@ -349,9 +349,15 @@ export const TOOLS = [
       "persisted only AFTER the canary confirms (a failed canary never " +
       "strands a bad pin). `pin` MUST be a tagged semver (vX.Y.Z) — sha " +
       "pins are rejected because the version assert needs a semver to " +
-      "compare against. The hostd/web self-refresh is DEFERRED on this path " +
-      "(an agent-invoked rollout cannot recreate its own hostd container " +
-      "without killing itself); run that host-side. By default downgrade pins " +
+      "compare against. When the target pin is NEWER than hostd's own CLI " +
+      "(every freshly tagged release), hostd SELF-BUMPS first (#2645): its " +
+      "container restarts on the target image (~30-60s blip on this MCP " +
+      "socket), then the roll resumes AUTOMATICALLY under the SAME " +
+      "request_id — do NOT re-issue the rollout during the blip; poll " +
+      "get_status with the returned request_id once the socket is back. " +
+      "The web refresh stays DEFERRED on this path; the terminal warnings " +
+      "name exactly what is still on the prior version (web, host operator " +
+      "CLI) and the host-side commands to finish. By default downgrade pins " +
       "are rejected — pass `allow_downgrade: true` for the operator-approved " +
       "rollback path to a known-good earlier tag; all other safety rails " +
       "(canary order, version-assert, stop-on-mismatch) apply unchanged. " +

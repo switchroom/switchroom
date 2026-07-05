@@ -55,6 +55,10 @@ function phaseLine(s: RolloutRenderState): string {
       return "persisting pin";
     case "hostd-web-deferred":
       return "hostd/web refresh deferred (run host-side)";
+    case "self-bump":
+      return "hostd refreshing itself to the target (brief control blip)…";
+    case "self-bump-done":
+      return "hostd refreshed — resuming the roll";
     default:
       return "starting";
   }

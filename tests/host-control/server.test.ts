@@ -5,12 +5,18 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, writeFileSync, chmodSync, rmSync, mkdirSync, statSync, appendFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, chmodSync, rmSync, mkdirSync, statSync, appendFileSync, readFileSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { HostdServer } from "../../src/host-control/server.js";
 import { hostdRequest } from "../../src/host-control/client.js";
+import {
+  parsePendingRolloutMarker,
+  encodePendingRolloutMarker,
+  SELF_BUMP_MARKER_FILENAME,
+  type PendingRolloutMarker,
+} from "../../src/host-control/self-bump.js";
 
 let tmp: string;
 let server: HostdServer;
@@ -2527,5 +2533,468 @@ describe("hostd server — rollout narrator feed (#2726 Part 2)", () => {
     expect(poll.result).toBe("completed");
 
     rmSync(execTmp, { recursive: true, force: true });
+  });
+});
+
+// ── #2645 — hostd self-bump on stale-CLI rollout ─────────────────────────────
+describe("hostd self-bump (#2645)", () => {
+  const composeSeed = [
+    "services:",
+    "  hostd:",
+    "    image: ghcr.io/switchroom/switchroom-hostd:v0.16.0",
+    "    volumes:",
+    "      - /var/run/docker.sock:/var/run/docker.sock",
+    "",
+  ].join("\n");
+
+  const hostdDir = () => join(tmp, ".switchroom", "hostd");
+  const composePath = () => join(hostdDir(), "docker-compose.yml");
+  const markerPath = () => join(hostdDir(), SELF_BUMP_MARKER_FILENAME);
+
+  /** Recording docker stub: appends argv to `rec`; behavior per-verb via
+   *  the baked-in exit codes. */
+  function writeDockerStub(opts: {
+    rec: string;
+    manifestExit?: number;
+    runExit?: number;
+    waitCode?: number;
+  }): string {
+    const p = join(tmp, `docker-stub-${createHash("sha1").update(opts.rec).digest("hex").slice(0, 8)}.sh`);
+    writeFileSync(
+      p,
+      `#!/bin/sh\n` +
+        `echo "docker: $@" >> "${opts.rec}"\n` +
+        `case "$1" in\n` +
+        `  manifest) exit ${opts.manifestExit ?? 0} ;;\n` +
+        `  rm) exit 0 ;;\n` +
+        `  run) echo cid; exit ${opts.runExit ?? 0} ;;\n` +
+        `  wait) echo ${opts.waitCode ?? 0}; exit 0 ;;\n` +
+        `esac\n` +
+        `exit 0\n`,
+    );
+    chmodSync(p, 0o755);
+    return p;
+  }
+
+  afterEach(() => {
+    // Test 1 deliberately leaves a marker (prod deletes it at resume);
+    // scrub it so the NEXT test's beforeEach server.start() can't resume
+    // a stale roll against the default stub. Same for compose + baks.
+    rmSync(markerPath(), { force: true });
+    rmSync(composePath(), { force: true });
+    for (const f of readdirSync(hostdDir())) {
+      if (f.startsWith("docker-compose.yml.bak-selfbump-")) {
+        rmSync(join(hostdDir(), f), { force: true });
+      }
+    }
+  });
+
+  it("a pin newer than hostd's CLI begins a self-bump: tag-bump + marker + detached helper, answers started", async () => {
+    writeFileSync(composePath(), composeSeed);
+    const dockerRec = join(tmp, "selfbump-docker-1.txt");
+    const cliRec = join(tmp, "selfbump-cli-1.txt");
+    const cliStub = join(tmp, "selfbump-cli-stub-1.sh");
+    writeFileSync(cliStub, `#!/bin/sh\necho "argv: $@" >> "${cliRec}"\nexit 0\n`);
+    chmodSync(cliStub, 0o755);
+
+    await server.stop();
+    server = new HostdServer({
+      homeDir: tmp,
+      agentUids: { klanker: 10001, bob: 10002 },
+      config: { agents: { klanker: { admin: true }, bob: {} } },
+      switchroomBin: cliStub,
+      dockerBin: writeDockerStub({ rec: dockerRec }),
+      auditLogPath: join(tmp, "audit-selfbump-1.log"),
+      allowNonLinux: true,
+      selfVersion: "0.16.0",
+      hostHomeDir: "/host/op",
+    });
+    await server.start();
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+
+    const resp = await hostdRequest(
+      { socketPath: sock },
+      {
+        v: 1,
+        op: "rollout",
+        request_id: "ro-sb-1",
+        args: { pin: "v0.16.5", agents: ["test-harness", "klanker"], skip_web: true },
+      },
+    );
+    expect(resp.result).toBe("started");
+    const payload = JSON.parse(resp.payload!);
+    expect(payload.phase).toBe("self-bump");
+    expect(payload.note).toContain("resumes");
+    expect(payload.note).toContain("do NOT re-issue");
+
+    // Compose tag-bumped in place, backup written.
+    expect(readFileSync(composePath(), "utf8")).toContain(
+      "image: ghcr.io/switchroom/switchroom-hostd:v0.16.5",
+    );
+    expect(
+      readdirSync(hostdDir()).some((f) =>
+        f.startsWith("docker-compose.yml.bak-selfbump-"),
+      ),
+    ).toBe(true);
+
+    // Marker carries everything the new hostd needs to resume.
+    const marker = parsePendingRolloutMarker(readFileSync(markerPath(), "utf8"));
+    expect(marker).toMatchObject({
+      request_id: "ro-sb-1",
+      pin: "v0.16.5",
+      agents: ["test-harness", "klanker"],
+      skip_web: true,
+      caller: { kind: "agent", name: "klanker" },
+      prior_hostd_version: "0.16.0",
+    });
+
+    // Helper spawned detached with host-path mounts; target image
+    // existence probed first.
+    const dockerCalls = readFileSync(dockerRec, "utf8");
+    expect(dockerCalls).toContain(
+      "manifest inspect ghcr.io/switchroom/switchroom-hostd:v0.16.5",
+    );
+    expect(dockerCalls).toContain("run -d --rm --name switchroom-hostd-selfbump");
+    expect(dockerCalls).toContain(
+      "-v /host/op/.switchroom/hostd:/host/op/.switchroom/hostd",
+    );
+    // The helper runs from the OLD (guaranteed-local) image so `run -d`
+    // returns fast; the target is only fetched by its `compose pull`.
+    const runLine = dockerCalls
+      .split("\n")
+      .find((l) => l.includes("run -d --rm"))!;
+    expect(runLine).toContain(
+      "/bin/sh ghcr.io/switchroom/switchroom-hostd:v0.16.0 -c",
+    );
+    // The rollout CLI child was NOT spawned — the roll resumes post-recreate.
+    expect(existsSync(cliRec)).toBe(false);
+
+    // Durable self-bump phase row under the SAME request_id.
+    const rows = readFileSync(join(tmp, "audit-selfbump-1.log"), "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    expect(
+      rows.some(
+        (r) =>
+          r.op === "rollout" && r.phase === "self-bump" && r.request_id === "ro-sb-1",
+      ),
+    ).toBe(true);
+
+    // Fleet-mutation lock held through the blip: a second roll is denied.
+    const second = await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "rollout", request_id: "ro-sb-1b", args: { pin: "v0.16.5" } },
+    );
+    expect(second.result).toBe("denied");
+    expect(second.error).toContain("fleet-mutation lock");
+  });
+
+  it("refuses cleanly (nothing changed) when the target image is not pullable yet", async () => {
+    writeFileSync(composePath(), composeSeed);
+    const dockerRec = join(tmp, "selfbump-docker-2.txt");
+    await server.stop();
+    server = new HostdServer({
+      homeDir: tmp,
+      agentUids: { klanker: 10001 },
+      config: { agents: { klanker: { admin: true } } },
+      switchroomBin: stubBin,
+      dockerBin: writeDockerStub({ rec: dockerRec, manifestExit: 1 }),
+      auditLogPath: join(tmp, "audit-selfbump-2.log"),
+      allowNonLinux: true,
+      selfVersion: "0.16.0",
+      hostHomeDir: "/host/op",
+    });
+    await server.start();
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+
+    const resp = await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "rollout", request_id: "ro-sb-2", args: { pin: "v0.16.5" } },
+    );
+    expect(resp.result).toBe("denied");
+    expect(resp.error).toContain("not pullable");
+    // Nothing changed: compose still on the old tag, no marker.
+    expect(readFileSync(composePath(), "utf8")).toContain("v0.16.0");
+    expect(existsSync(markerPath())).toBe(false);
+  });
+
+  it("rolls the bump back when the helper container fails to spawn", async () => {
+    writeFileSync(composePath(), composeSeed);
+    const dockerRec = join(tmp, "selfbump-docker-3.txt");
+    await server.stop();
+    server = new HostdServer({
+      homeDir: tmp,
+      agentUids: { klanker: 10001 },
+      config: { agents: { klanker: { admin: true } } },
+      switchroomBin: stubBin,
+      dockerBin: writeDockerStub({ rec: dockerRec, runExit: 1 }),
+      auditLogPath: join(tmp, "audit-selfbump-3.log"),
+      allowNonLinux: true,
+      selfVersion: "0.16.0",
+      hostHomeDir: "/host/op",
+    });
+    await server.start();
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+
+    const resp = await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "rollout", request_id: "ro-sb-3", args: { pin: "v0.16.5" } },
+    );
+    expect(resp.result).toBe("error");
+    expect(resp.error).toContain("self-bump helper");
+    // Rolled back: compose restored, marker removed.
+    expect(readFileSync(composePath(), "utf8")).toContain("v0.16.0");
+    expect(existsSync(markerPath())).toBe(false);
+    // Terminal error row landed for the request.
+    const rows = readFileSync(join(tmp, "audit-selfbump-3.log"), "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    const terminal = rows.find(
+      (r) => r.request_id === "ro-sb-3" && r.phase === "terminal",
+    );
+    expect(terminal).toBeDefined();
+    expect(terminal!.result).toBe("error");
+    // Lock released — a follow-up roll isn't lock-denied.
+    const retry = await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "rollout", request_id: "ro-sb-3b", args: { pin: "v0.16.5" } },
+    );
+    expect(retry.error ?? "").not.toContain("fleet-mutation lock");
+  });
+
+  it("watcher rolls the bump back when the HELPER (pull/up) fails after spawning", async () => {
+    // The helper spawns fine but its pull/compose script fails — the
+    // container exits nonzero (the script PROPAGATES the failure; a
+    // trailing bare echo would mask it as 0), `docker wait` reports it,
+    // and the still-alive old hostd restores the compose, deletes the
+    // marker, releases the lock and writes a loud terminal row instead of
+    // leaving the caller polling a perpetual `started`.
+    writeFileSync(composePath(), composeSeed);
+    const dockerRec = join(tmp, "selfbump-docker-3w.txt");
+    await server.stop();
+    server = new HostdServer({
+      homeDir: tmp,
+      agentUids: { klanker: 10001 },
+      config: { agents: { klanker: { admin: true } } },
+      switchroomBin: stubBin,
+      dockerBin: writeDockerStub({ rec: dockerRec, waitCode: 1 }),
+      auditLogPath: join(tmp, "audit-selfbump-3w.log"),
+      allowNonLinux: true,
+      selfVersion: "0.16.0",
+      hostHomeDir: "/host/op",
+    });
+    await server.start();
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+
+    const resp = await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "rollout", request_id: "ro-sb-3w", args: { pin: "v0.16.5" } },
+    );
+    // The spawn itself succeeded, so the caller still gets `started`…
+    expect(resp.result).toBe("started");
+    await new Promise((r) => setTimeout(r, 400));
+
+    // …but the watcher then observed the failure and rolled everything back.
+    expect(readFileSync(composePath(), "utf8")).toContain("v0.16.0");
+    expect(readFileSync(composePath(), "utf8")).not.toContain("v0.16.5");
+    expect(existsSync(markerPath())).toBe(false);
+    const rows = readFileSync(join(tmp, "audit-selfbump-3w.log"), "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    const terminal = rows.find(
+      (r) => r.request_id === "ro-sb-3w" && r.phase === "terminal",
+    );
+    expect(terminal).toBeDefined();
+    expect(terminal!.result).toBe("error");
+    expect(String(terminal!.error)).toContain("helper failed");
+    // Lock released — a follow-up roll isn't lock-denied.
+    const retry = await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "rollout", request_id: "ro-sb-3wb", args: { pin: "v0.16.5" } },
+    );
+    expect(retry.error ?? "").not.toContain("fleet-mutation lock");
+  });
+
+  it("boot resume relaunches the roll under the SAME request_id and deletes the marker", async () => {
+    const cliRec = join(tmp, "selfbump-cli-4.txt");
+    const cliStub = join(tmp, "selfbump-cli-stub-4.sh");
+    writeFileSync(
+      cliStub,
+      `#!/bin/sh\n` +
+        `echo "argv: $@" >> "${cliRec}"\n` +
+        `echo "ctx: $SWITCHROOM_HOSTD_CONTEXT" >> "${cliRec}"\n` +
+        `echo 'SWITCHROOM_ROLLOUT_RESULT:{"ok":true,"rolled":["test-harness","klanker"],"warnings":[]}'\n` +
+        `exit 0\n`,
+    );
+    chmodSync(cliStub, 0o755);
+    const marker: PendingRolloutMarker = {
+      v: 1,
+      request_id: "ro-sb-resume",
+      pin: "v0.16.5",
+      agents: ["test-harness", "klanker"],
+      skip_web: true,
+      caller: { kind: "agent", name: "klanker" },
+      created_at: new Date().toISOString(),
+      prior_hostd_version: "0.16.0",
+    };
+    writeFileSync(markerPath(), encodePendingRolloutMarker(marker));
+
+    await server.stop();
+    server = new HostdServer({
+      homeDir: tmp,
+      agentUids: { klanker: 10001 },
+      config: { agents: { klanker: { admin: true } } },
+      switchroomBin: cliStub,
+      auditLogPath: join(tmp, "audit-selfbump-4.log"),
+      allowNonLinux: true,
+      selfVersion: "0.16.5", // now ON the target — resume proceeds
+      hostHomeDir: "/host/op",
+    });
+    await server.start();
+    await new Promise((r) => setTimeout(r, 400));
+
+    // Marker consumed; roll relaunched with the marker's exact args.
+    expect(existsSync(markerPath())).toBe(false);
+    const rec = readFileSync(cliRec, "utf8");
+    expect(rec).toContain(
+      "argv: rollout --pin v0.16.5 --agents test-harness,klanker --skip-web",
+    );
+    expect(rec).toContain("ctx: 1");
+
+    const rows = readFileSync(join(tmp, "audit-selfbump-4.log"), "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    expect(
+      rows.some(
+        (r) =>
+          r.op === "rollout" &&
+          r.phase === "self-bump-done" &&
+          r.request_id === "ro-sb-resume",
+      ),
+    ).toBe(true);
+    const terminal = rows.find(
+      (r) => r.request_id === "ro-sb-resume" && r.phase === "terminal",
+    );
+    expect(terminal).toBeDefined();
+    expect(terminal!.result).toBe("completed");
+    expect(terminal!.rolled).toEqual(["test-harness", "klanker"]);
+    // Caller identity survived the recreate (drives get_status gating + DM push).
+    expect(terminal!.caller).toEqual({ kind: "agent", name: "klanker" });
+  });
+
+  it("boot resume with a STALE marker terminal-errors without spawning", async () => {
+    const cliRec = join(tmp, "selfbump-cli-5.txt");
+    const cliStub = join(tmp, "selfbump-cli-stub-5.sh");
+    writeFileSync(cliStub, `#!/bin/sh\necho "argv: $@" >> "${cliRec}"\nexit 0\n`);
+    chmodSync(cliStub, 0o755);
+    const marker: PendingRolloutMarker = {
+      v: 1,
+      request_id: "ro-sb-stale",
+      pin: "v0.16.5",
+      caller: { kind: "agent", name: "klanker" },
+      created_at: new Date(Date.now() - 20 * 60 * 1000).toISOString(),
+      prior_hostd_version: "0.16.0",
+    };
+    writeFileSync(markerPath(), encodePendingRolloutMarker(marker));
+
+    await server.stop();
+    server = new HostdServer({
+      homeDir: tmp,
+      agentUids: { klanker: 10001 },
+      config: { agents: { klanker: { admin: true } } },
+      switchroomBin: cliStub,
+      auditLogPath: join(tmp, "audit-selfbump-5.log"),
+      allowNonLinux: true,
+      selfVersion: "0.16.5",
+      hostHomeDir: "/host/op",
+    });
+    await server.start();
+    await new Promise((r) => setTimeout(r, 200));
+
+    expect(existsSync(markerPath())).toBe(false);
+    expect(existsSync(cliRec)).toBe(false); // no roll spawned
+    const rows = readFileSync(join(tmp, "audit-selfbump-5.log"), "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    const terminal = rows.find(
+      (r) => r.request_id === "ro-sb-stale" && r.phase === "terminal",
+    );
+    expect(terminal).toBeDefined();
+    expect(terminal!.result).toBe("error");
+    expect(terminal!.failed_step).toBe("self-bump");
+  });
+
+  it("boot resume terminal-errors when hostd is STILL older than the pin (helper failed)", async () => {
+    const cliRec = join(tmp, "selfbump-cli-6.txt");
+    const cliStub = join(tmp, "selfbump-cli-stub-6.sh");
+    writeFileSync(cliStub, `#!/bin/sh\necho "argv: $@" >> "${cliRec}"\nexit 0\n`);
+    chmodSync(cliStub, 0o755);
+    const marker: PendingRolloutMarker = {
+      v: 1,
+      request_id: "ro-sb-stillstale",
+      pin: "v0.16.5",
+      caller: { kind: "agent", name: "klanker" },
+      created_at: new Date().toISOString(),
+      prior_hostd_version: "0.16.0",
+    };
+    writeFileSync(markerPath(), encodePendingRolloutMarker(marker));
+
+    await server.stop();
+    server = new HostdServer({
+      homeDir: tmp,
+      agentUids: { klanker: 10001 },
+      config: { agents: { klanker: { admin: true } } },
+      switchroomBin: cliStub,
+      auditLogPath: join(tmp, "audit-selfbump-6.log"),
+      allowNonLinux: true,
+      selfVersion: "0.16.0", // STILL stale — bump never landed
+      hostHomeDir: "/host/op",
+    });
+    await server.start();
+    await new Promise((r) => setTimeout(r, 200));
+
+    expect(existsSync(markerPath())).toBe(false);
+    expect(existsSync(cliRec)).toBe(false);
+    const rows = readFileSync(join(tmp, "audit-selfbump-6.log"), "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    const terminal = rows.find(
+      (r) => r.request_id === "ro-sb-stillstale" && r.phase === "terminal",
+    );
+    expect(terminal).toBeDefined();
+    expect(terminal!.result).toBe("error");
+    expect(String(terminal!.error)).toContain("hostd install");
+  });
+
+  it("a malformed marker is dropped without resuming (and without crashing boot)", async () => {
+    const cliRec = join(tmp, "selfbump-cli-7.txt");
+    const cliStub = join(tmp, "selfbump-cli-stub-7.sh");
+    writeFileSync(cliStub, `#!/bin/sh\necho "argv: $@" >> "${cliRec}"\nexit 0\n`);
+    chmodSync(cliStub, 0o755);
+    writeFileSync(markerPath(), "{not json");
+
+    await server.stop();
+    server = new HostdServer({
+      homeDir: tmp,
+      agentUids: { klanker: 10001 },
+      config: { agents: { klanker: { admin: true } } },
+      switchroomBin: cliStub,
+      auditLogPath: join(tmp, "audit-selfbump-7.log"),
+      allowNonLinux: true,
+      selfVersion: "0.16.5",
+      hostHomeDir: "/host/op",
+    });
+    await server.start();
+    await new Promise((r) => setTimeout(r, 200));
+
+    expect(existsSync(markerPath())).toBe(false);
+    expect(existsSync(cliRec)).toBe(false);
+    expect(server.getBoundPaths().length).toBe(1); // boot completed normally
   });
 });
