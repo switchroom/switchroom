@@ -40,6 +40,12 @@ DEFAULTS = {
     "recallContextTurns": 1,
     "recallMaxQueryChars": 800,
     "recallRoles": ["user", "assistant"],
+    # Upstream 962140eef — optional recall tag filters passed through to the
+    # recall API, plus per-additional-bank overrides keyed by bank ID.
+    "recallTags": [],
+    "recallTagsMatch": "any",
+    "recallTagGroups": None,
+    "recallAdditionalBankFilters": {},
     "recallPromptPreamble": (
         "Relevant memories from past conversations (prioritize recent when "
         "conflicting). Only use memories that are directly useful to continue "
@@ -63,6 +69,12 @@ DEFAULTS = {
     "daemonIdleTimeout": 0,
     "embedVersion": "latest",
     "embedPackagePath": None,
+    # Upstream 55ef70679 — optional global HTTP request timeout override
+    # (seconds). None = keep each call's own default. NOTE: switchroom's
+    # recall.py deliberately does NOT wire this override into its client —
+    # recall carries its own 8s hook-budget timeout (see recall.py). This
+    # mainly benefits retain's 15s timeout on slow/loaded servers.
+    "requestTimeoutSeconds": None,
     # Bank
     "bankId": None,
     "bankIdPrefix": "",
@@ -109,8 +121,16 @@ ENV_OVERRIDES = {
     "HINDSIGHT_RECALL_SKIP_TRIVIAL": ("recallSkipTrivial", bool),
     "HINDSIGHT_RECALL_MAX_QUERY_CHARS": ("recallMaxQueryChars", int),
     "HINDSIGHT_RECALL_CONTEXT_TURNS": ("recallContextTurns", int),
+    # Upstream 962140eef — recall tag filters. The tags env var accepts JSON
+    # or a comma-separated list; the others must be JSON.
+    "HINDSIGHT_RECALL_TAGS": ("recallTags", list),
+    "HINDSIGHT_RECALL_TAGS_MATCH": ("recallTagsMatch", str),
+    "HINDSIGHT_RECALL_TAG_GROUPS": ("recallTagGroups", dict),
+    "HINDSIGHT_RECALL_ADDITIONAL_BANK_FILTERS": ("recallAdditionalBankFilters", dict),
     "HINDSIGHT_API_PORT": ("apiPort", int),
     "HINDSIGHT_DAEMON_IDLE_TIMEOUT": ("daemonIdleTimeout", int),
+    # Upstream 55ef70679 — global request timeout override.
+    "HINDSIGHT_REQUEST_TIMEOUT_SECONDS": ("requestTimeoutSeconds", int),
     "HINDSIGHT_EMBED_VERSION": ("embedVersion", str),
     "HINDSIGHT_EMBED_PACKAGE_PATH": ("embedPackagePath", str),
     "HINDSIGHT_DYNAMIC_BANK_ID": ("dynamicBankId", bool),
@@ -131,8 +151,22 @@ def _cast_env(value: str, typ):
         if typ is float:
             return float(value)
         if typ is list:
+            # JSON list first (upstream 962140eef), else fall through to the
+            # comma-separated fallback in the except branch below.
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, list):
+                    return parsed
+            except ValueError:
+                pass
             # Comma-separated → list of trimmed, non-empty strings.
             return [t.strip() for t in value.split(",") if t.strip()]
+        if typ is dict:
+            # JSON only (dict or list accepted — tag_groups may be a list).
+            parsed = json.loads(value)
+            if isinstance(parsed, (dict, list)):
+                return parsed
+            return None
         return value
     except (ValueError, AttributeError):
         return None
