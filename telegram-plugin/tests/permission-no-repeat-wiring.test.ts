@@ -58,7 +58,7 @@ describe('no-repeat-on-timeout wiring', () => {
   })
 
   it('onPermissionRequest short-circuits a recent-timeout duplicate before posting a card', () => {
-    const fn = slice(GATEWAY, 'onPermissionRequest(', 4000)
+    const fn = slice(GATEWAY, 'onPermissionRequest(', 6000)
     const dupIdx = fn.indexOf('isRecentTimeoutDuplicate(')
     const cardIdx = fn.indexOf('pendingPermissions.set(requestId')
     expect(dupIdx).toBeGreaterThan(-1)

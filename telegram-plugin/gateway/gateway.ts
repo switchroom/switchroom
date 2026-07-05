@@ -116,7 +116,14 @@ import {
   type PermissionCardRef,
 } from './permission-timeout.js'
 import { renderVaultRequestAccessCard } from './vault-request-access-card.js'
-import { createPermissionCardStore } from './permission-card-store.js'
+import { createPermissionCardStore, type PersistedPermCard } from './permission-card-store.js'
+import {
+  isPermissionRearmEnabled,
+  permissionRearmGraceMs,
+  classifyPermissionRequest,
+  computeBootSweepStripTargets,
+  distinctRequestIds,
+} from './permission-rearm.js'
 import { pickRecoveredPermissionOrigin } from './permission-card-origin.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
 import { appendActivityLabel, clipNarrative, renderActivityFeedWithNested, formatStepSuffix, type SessionActivityHeader } from '../tool-activity-summary.js'
@@ -7294,6 +7301,81 @@ function dispatchPermissionVerdict(ev: PermissionEvent): void {
   }
 }
 
+/**
+ * #2861 re-arm: a `permission_request` re-sent by the bridge after a gateway
+ * restart, for a request_id that's NO LONGER in `pendingPermissions` but is
+ * still in the persisted card store. Restore the in-memory pending entry with
+ * the ORIGINAL `startedAt` (so the existing TTL clock keeps running from the
+ * original ask — an already-expired re-arm drops straight into the TTL
+ * auto-deny sweep, which correctly unwedges claude) and re-attach the inline
+ * keyboard on the EXISTING message(s) via editMessageText — never a new card.
+ *
+ * NEVER answers the card: only the question is restored (no-self-escalation).
+ */
+function rearmPermissionFromStore(
+  msg: PermissionRequestForward,
+  persisted: PersistedPermCard[],
+): void {
+  const { requestId, toolName, description, inputPreview } = msg
+  // Original clock: take the earliest persisted startedAt (all entries for one
+  // request share it, but be defensive).
+  const startedAt = persisted.reduce(
+    (min, c) => (c.startedAt < min ? c.startedAt : min),
+    persisted[0].startedAt,
+  )
+  const cardText = persisted[0].cardText
+  const cards = persisted.map(c => ({ chatId: c.chatId, messageId: c.messageId }))
+  pendingPermissions.set(requestId, {
+    tool_name: toolName,
+    description,
+    input_preview: inputPreview,
+    startedAt,
+    card_text: cardText,
+    cards,
+  })
+  process.stderr.write(
+    `telegram gateway: re-arming permission card(s) for request=${requestId} ` +
+    `tool=${toolName} (${cards.length} card(s), original startedAt preserved)\n`,
+  )
+  // Re-attach the keyboard on each surviving card message. Message-id-targeted
+  // edit — no thread needed, so THREAD_NOT_FOUND is not in the blast radius.
+  const showAlways = resolveScopedAllowChoices(toolName, inputPreview) != null
+  const keyboard = buildPermissionActionRow(requestId, showAlways)
+  for (const c of cards) {
+    void swallowingApiCall(
+      // allow-raw-bot-api: routed through swallowingApiCall (retry policy); message-id-targeted edit (no thread to lose). Re-attaches the Allow/Deny keyboard on the persisted card after a gateway restart.
+      () => bot.api.editMessageText(c.chatId, c.messageId, richMessage(cardText), { reply_markup: keyboard }),
+      { chat_id: c.chatId, verb: 'permission_request.rearm' },
+    )
+  }
+}
+
+/**
+ * Strip a single stale permission card: drop its keyboard and show the
+ * "gateway restarted" notice. Shared by the boot-sweep (immediate legacy path
+ * and the #2861 grace-period path). Best-effort — a deleted/inaccessible card
+ * is swallowed, never fatal.
+ */
+async function stripStalePermissionCard(card: PersistedPermCard): Promise<void> {
+  const toolLabel = card.toolName ?? 'unknown tool'
+  const notice = `🔒 **${toolLabel}**\n\n⚠️ *Gateway restarted — this request is no longer active. Ask your agent to try again if needed.*`
+  try {
+    // allow-raw-bot-api: targeted by message_id; no thread needed; fire-and-forget boot sweep
+    await bot.api.editMessageText(
+      card.chatId,
+      card.messageId,
+      richMessage(notice),
+      { reply_markup: { inline_keyboard: [] } },
+    )
+  } catch (err) {
+    // Card may already be deleted, edited, or in an inaccessible chat — benign
+    process.stderr.write(
+      `telegram gateway: boot-sweep: stale-card strip failed ` +
+      `${card.chatId}:${card.messageId}: ${(err as Error).message}\n`,
+    )
+  }
+}
+
 const ipcServer: IpcServer = createIpcServer({
   socketPath: SOCKET_PATH,
 
@@ -7663,6 +7745,38 @@ const ipcServer: IpcServer = createIpcServer({
 
   onPermissionRequest(_client: IpcClient, msg: PermissionRequestForward) {
     const { requestId, toolName, description, inputPreview } = msg
+    // #2861 idempotent re-send handling. The bridge re-sends every outstanding
+    // permission_request on each IPC (re)connect, so the same request_id can
+    // arrive more than once. Disposition:
+    //   duplicate → already live in pendingPermissions; ignore (no 2nd card).
+    //   rearm     → gone from memory (gateway restarted) but the persisted card
+    //               store still has it; restore + re-attach keyboard in place.
+    //   fresh     → new ask; fall through to the normal card-posting path.
+    // Either re-claim marks the id so the grace-period boot-sweep won't strip
+    // it. Kill switch SWITCHROOM_PERMISSION_REARM=0 skips this entirely (legacy
+    // behavior: a re-send would post a duplicate card, as before this fix).
+    if (isPermissionRearmEnabled()) {
+      const persisted = pendingPermissions.has(requestId)
+        ? []
+        : permCardStore.loadAll().filter(e => e.requestId === requestId)
+      const disposition = classifyPermissionRequest({
+        hasPending: pendingPermissions.has(requestId),
+        persistedCount: persisted.length,
+      })
+      if (disposition === 'duplicate') {
+        process.stderr.write(
+          `telegram gateway: permission_request duplicate re-send ignored ` +
+          `request=${requestId} (already pending)\n`,
+        )
+        return
+      }
+      if (disposition === 'rearm') {
+        // Re-arm restores the pending entry; the grace-period boot-sweep
+        // preserves anything live in pendingPermissions, so it won't strip it.
+        rearmPermissionFromStore(msg, persisted)
+        return
+      }
+    }
     // "⏱ 30 min" short-circuit: if the operator tapped a live scoped grant
     // covering this exact request, auto-allow without posting a card. CRITICAL:
     // dispatch WITHOUT a `rule` so the bridge does NOT cache it untimed
@@ -24973,39 +25087,68 @@ void (async () => {
         // tracks the live turn from there.
         try { removeTurnActiveMarker(STATE_DIR) } catch { /* best-effort */ }
 
-        // Strip stale permission cards from prior gateway session. Any entry
-        // still in the store was never resolved (gateway died before the
-        // operator tapped or the reaper ran). The operator might have seen
-        // those cards and tapped them — if so, they got STALE_TAP_NOTICE
-        // ("already resolved") which is misleading. Edit the messages to
-        // remove the keyboard and show a clear "restarted" notice instead.
-        void (async () => {
-          const stale = permCardStore.loadAll()
-          if (stale.length === 0) return
-          process.stderr.write(
-            `telegram gateway: boot-sweep: stripping ${stale.length} stale permission card(s) from prior gateway session\n`,
-          )
-          for (const card of stale) {
-            const toolLabel = card.toolName ?? 'unknown tool'
-            const notice = `🔒 **${toolLabel}**\n\n⚠️ *Gateway restarted — this request is no longer active. Ask your agent to try again if needed.*`
-            try {
-              // allow-raw-bot-api: targeted by message_id; no thread needed; fire-and-forget boot sweep
-              await bot.api.editMessageText(
-                card.chatId,
-                card.messageId,
-                richMessage(notice),
-                { reply_markup: { inline_keyboard: [] } },
-              )
-            } catch (err) {
-              // Card may already be deleted, edited, or in an inaccessible chat — benign
-              process.stderr.write(
-                `telegram gateway: boot-sweep: stale-card strip failed ` +
-                `${card.chatId}:${card.messageId}: ${(err as Error).message}\n`,
-              )
-            }
+        // Boot-sweep for permission cards from a prior gateway session. Any
+        // entry still in the store was never resolved (gateway died before the
+        // operator tapped or the reaper ran).
+        //
+        // #2861: DON'T strip immediately. A still-live claude session's bridge
+        // re-sends its outstanding permission_requests on IPC reconnect within
+        // a few seconds — re-arming the persisted card instead of losing the
+        // suspended turn. So we wait a grace window (~90 s) and only strip
+        // entries that were NOT re-claimed by a bridge re-send in the meantime.
+        // A genuinely dead session (container recreate → new bridge, empty
+        // ledger) never re-sends, so those still get the "restarted" notice.
+        //
+        // Kill switch SWITCHROOM_PERMISSION_REARM=0 reverts to the legacy
+        // immediate strip-everything sweep.
+        if (!isPermissionRearmEnabled()) {
+          void (async () => {
+            const stale = permCardStore.loadAll()
+            if (stale.length === 0) return
+            process.stderr.write(
+              `telegram gateway: boot-sweep: stripping ${stale.length} stale permission card(s) from prior gateway session\n`,
+            )
+            for (const card of stale) await stripStalePermissionCard(card)
+            permCardStore.clear()
+          })()
+        } else {
+          const bootStale = permCardStore.loadAll()
+          if (bootStale.length > 0) {
+            const graceMs = permissionRearmGraceMs()
+            process.stderr.write(
+              `telegram gateway: boot-sweep: ${bootStale.length} pending permission card(s) from prior ` +
+              `session; deferring strip ${graceMs}ms to allow bridge re-arm (#2861)\n`,
+            )
+            setTimeout(() => {
+              void (async () => {
+                // Reload — some entries may have been resolved (tap/TTL) during
+                // the grace window, which removes them from the store.
+                const remaining = permCardStore.loadAll()
+                // Preserve anything currently LIVE in pendingPermissions: that
+                // covers both re-armed cards (a bridge re-send restored them)
+                // AND fresh cards born during the grace window (a new approval
+                // posted after boot). Only cards with no live pending entry —
+                // a genuinely dead session that never reconnected — are stripped.
+                const liveRequestIds = new Set(pendingPermissions.keys())
+                const toStrip = computeBootSweepStripTargets(remaining, liveRequestIds)
+                if (toStrip.length === 0) {
+                  process.stderr.write(
+                    `telegram gateway: boot-sweep: all pending permission cards re-armed or still live — nothing to strip\n`,
+                  )
+                  return
+                }
+                process.stderr.write(
+                  `telegram gateway: boot-sweep: stripping ${toStrip.length} dead-session permission card(s) ` +
+                  `after ${graceMs}ms grace (of ${remaining.length} still persisted, ${liveRequestIds.size} live)\n`,
+                )
+                for (const card of toStrip) await stripStalePermissionCard(card)
+                // Remove ONLY the stripped request_ids — re-armed entries stay
+                // persisted so a subsequent restart re-arms them again.
+                for (const id of distinctRequestIds(toStrip)) permCardStore.remove(id)
+              })()
+            }, graceMs).unref?.()
           }
-          permCardStore.clear()
-        })()
+        }
 
         // Boot-time pin sweep
         try {

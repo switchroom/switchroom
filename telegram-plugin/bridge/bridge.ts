@@ -30,6 +30,7 @@ import { createIpcClient, type IpcClientHandle } from './ipc-client.js'
 import { buildEffectiveToolSchemas, LINEAR_ENV } from './tool-filter.js'
 import type { InboundMessage, PermissionEvent, StatusEvent } from '../gateway/ipc-protocol.js'
 import { matchesAllowRule } from '../permission-rule.js'
+import { createOutstandingPermissionLedger } from './permission-ledger.js'
 
 installPluginLogger()
 
@@ -582,6 +583,40 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 // added by either is honoured by all.
 const sessionAllowRules = new Set<string>()
 
+// #2861: outstanding permission-request ledger. Every permission_request from
+// claude is recorded here and re-sent on each IPC (re)connect, so a request
+// that arrives while the gateway is down (or that the gateway lost across a
+// restart) is redelivered instead of dropped. Deleted in onPermission when a
+// verdict is delivered. Kill switch: SWITCHROOM_PERMISSION_REARM=0 reverts to
+// the legacy drop-when-disconnected behavior.
+const outstandingPermissions = createOutstandingPermissionLedger()
+const permissionRearmEnabled = process.env.SWITCHROOM_PERMISSION_REARM !== '0'
+
+/**
+ * Re-send every outstanding permission_request to the gateway. Called on each
+ * IPC (re)connect via the ipc-client onConnect hook. The gateway dedupes /
+ * re-arms them idempotently (gateway/permission-rearm.ts), so re-sending on
+ * every reconnect is safe. Never answers a card — re-transmits the question.
+ */
+function flushOutstandingPermissionRequests(): void {
+  if (!permissionRearmEnabled) return
+  if (!ipc || !ipc.isConnected()) return
+  const pending = outstandingPermissions.all()
+  if (pending.length === 0) return
+  process.stderr.write(
+    `telegram bridge: re-sending ${pending.length} outstanding permission request(s) on gateway (re)connect\n`,
+  )
+  for (const p of pending) {
+    ipc.sendPermissionRequest({
+      type: 'permission_request',
+      requestId: p.request_id,
+      toolName: p.tool_name,
+      description: p.description,
+      inputPreview: p.input_preview,
+    })
+  }
+}
+
 mcp.setNotificationHandler(
   z.object({
     method: z.literal('notifications/claude/channel/permission_request'),
@@ -615,8 +650,29 @@ mcp.setNotificationHandler(
         return
       }
     }
+    // #2861: record the request in the outstanding ledger BEFORE the connect
+    // check so it survives a disconnected gateway and is re-sent on reconnect.
+    // It's deleted in onPermission when the verdict is delivered.
+    if (permissionRearmEnabled) {
+      outstandingPermissions.add({
+        request_id: params.request_id,
+        tool_name: params.tool_name,
+        description: params.description,
+        input_preview: params.input_preview,
+      })
+    }
     if (!ipc || !ipc.isConnected()) {
-      process.stderr.write('telegram bridge: permission_request received but not connected to gateway\n')
+      // BUFFER, don't drop (#2861 R2). The request is in the ledger; the
+      // onConnect flush re-sends it once the gateway is reachable. Falls back
+      // to the legacy drop only when re-arm is killed.
+      if (permissionRearmEnabled) {
+        process.stderr.write(
+          `telegram bridge: permission_request buffered (gateway offline), will re-send on reconnect ` +
+          `request_id=${params.request_id}\n`,
+        )
+      } else {
+        process.stderr.write('telegram bridge: permission_request received but not connected to gateway\n')
+      }
       return
     }
     ipc.sendPermissionRequest({
@@ -658,6 +714,9 @@ function onPermission(msg: PermissionEvent): void {
   if (msg.rule) {
     sessionAllowRules.add(msg.rule)
   }
+  // #2861: verdict delivered → drop the request from the outstanding ledger so
+  // a later reconnect doesn't re-send an already-resolved approval.
+  outstandingPermissions.delete(msg.requestId)
   mcp.notification({
     method: 'notifications/claude/channel/permission',
     params: {
@@ -836,6 +895,8 @@ async function main(): Promise<void> {
     onInbound,
     onPermission,
     onStatus,
+    // #2861: re-send outstanding permission requests on every (re)connect.
+    onConnect: flushOutstandingPermissionRequests,
     log: (msg) => process.stderr.write(`telegram bridge: ipc: ${msg}\n`),
     // #2307 Tier-1: the cron-session bridge shares the agent's STATE_DIR
     // (access.json / history / gateway.sock) but writes its liveness file to a
