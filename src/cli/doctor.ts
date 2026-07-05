@@ -987,7 +987,7 @@ export function checkHindsightConsumer(
       name: "hindsight consumer",
       status: "warn",
       detail:
-        `auth.consumers[hindsight] -> ${entry.account} (uid ${entry.uid ?? 0}); ` +
+        `auth.consumers[hindsight] -> ${entry.account ?? "(follows active)"} (uid ${entry.uid ?? 0}); ` +
         `couldn't query auth-broker container (not running / docker unavailable)`,
       fix:
         "Check `auth-broker: service health` row above; if the broker is " +
@@ -1000,7 +1000,7 @@ export function checkHindsightConsumer(
       name: "hindsight consumer",
       status: "warn",
       detail:
-        `auth.consumers[hindsight] -> ${entry.account} (uid ${entry.uid ?? 0}); ` +
+        `auth.consumers[hindsight] -> ${entry.account ?? "(follows active)"} (uid ${entry.uid ?? 0}); ` +
         `auth-broker is running but socket not bound at /run/switchroom/auth-broker/${entry.name}/sock`,
       fix:
         "Run `switchroom apply` to refresh compose and rebind per-consumer sockets.",
@@ -1010,7 +1010,7 @@ export function checkHindsightConsumer(
   return {
     name: "hindsight consumer",
     status: "ok",
-    detail: `auth.consumers[hindsight] -> ${entry.account} (uid ${entry.uid ?? 0})`,
+    detail: `auth.consumers[hindsight] -> ${entry.account ?? "(follows active)"} (uid ${entry.uid ?? 0})`,
   };
 }
 

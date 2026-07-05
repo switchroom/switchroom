@@ -744,14 +744,16 @@ export function generateHindsightComposeSnippet(): string {
  * same `name` is already present, leaves it untouched.
  *
  * @param configPath  absolute path to switchroom.yaml
- * @param account     account label to pin the consumer to (typically
- *                    `auth.active` at setup time)
+ * @param account     optional account label to PIN the consumer to. Omit
+ *                    (the default since the consumer-unpin change) to
+ *                    register the consumer follow-active: it rides the
+ *                    fleet `auth.active` with the same failover agents get.
  * @param uid         UID to chown the consumer socket to;
  *                    defaults to HINDSIGHT_DEFAULT_UID
  */
 export async function ensureHindsightConsumer(
   configPath: string,
-  account: string,
+  account?: string,
   uid: number = HINDSIGHT_DEFAULT_UID,
 ): Promise<{ added: boolean; reason: string }> {
   const fs = await import("node:fs");
@@ -797,7 +799,7 @@ export async function ensureHindsightConsumer(
 
   const entry = new YAMLMap();
   entry.set("name", HINDSIGHT_CONSUMER_NAME);
-  entry.set("account", account);
+  if (account !== undefined) entry.set("account", account);
   entry.set("uid", uid);
   consumersNode.add(entry);
 

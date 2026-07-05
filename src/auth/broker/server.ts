@@ -1117,7 +1117,12 @@ export class AuthBroker {
     if (identity.kind === "operator") return auth.active ?? null;
     if (identity.kind === "consumer") {
       const c = (auth.consumers ?? []).find((x) => x.name === identity.name);
-      return c?.account ?? null;
+      if (!c) return null;
+      // Unpinned consumer (no `account:` in yaml) rides the fleet active —
+      // same resolution as an override-less agent, so swaps/failover apply
+      // identically. Attribution follows: its mark-exhausted hits the
+      // active, exactly like an agent's.
+      return c.account ?? auth.active ?? null;
     }
     // agent
     const agent = (this.config.agents ?? {})[identity.name];
@@ -1452,7 +1457,10 @@ export class AuthBroker {
     });
     const consumers = (auth.consumers ?? []).map((c) => ({
       name: c.name,
-      account: c.account,
+      // Unpinned consumers report the account they are bound to right now
+      // (the fleet active) so dashboards stay truthful; the wire shape
+      // stays a plain string either way.
+      account: c.account ?? auth.active ?? "",
       last_seen_at: this.consumerLastSeen[c.name] ?? null,
     }));
     // Identity-specific overage signal: is the account THIS caller is bound to
@@ -1707,6 +1715,9 @@ export class AuthBroker {
       process.stdout.write(
         `auth-broker: fleet-quota-probe shows ACTIVE ${label} exhausted — proactive failover\n`,
       );
+      // Audit parity with the consumer sensor: a proactive mark leaves a
+      // durable audit record, not just a stdout line (#2845 review nit).
+      this.audit({ op: "mark-exhausted", identity: { kind: "operator" }, account: label, accountKind: "claude", ok: true });
       await this.markExhaustedAndRoll(label, decision.until ?? undefined, { kind: "operator" });
     }
   }
@@ -1724,8 +1735,15 @@ export class AuthBroker {
    * consumer over on a transient probe error). Never throws into the timer.
    */
   async consumerQuotaProbeTick(): Promise<void> {
+    // PINNED accounts only: an unpinned consumer rides the fleet active,
+    // which the fleet-wide probe (fleetQuotaProbeTick) already covers —
+    // including the proactive roll when it walls.
     const accounts = Array.from(
-      new Set((this.config.auth?.consumers ?? []).map((c) => c.account)),
+      new Set(
+        (this.config.auth?.consumers ?? [])
+          .map((c) => c.account)
+          .filter((a): a is string => typeof a === "string" && a.length > 0),
+      ),
     );
     for (const label of accounts) {
       const creds = readAccountCredentials(label, this.home);
@@ -1945,7 +1963,13 @@ export class AuthBroker {
    */
   private exhaustionLiveCorroborated(account: string): boolean {
     const snapshot = this.lastQuotaCache[account];
-    if (!snapshot || !snapshotFresh(snapshot, this.now())) return false;
+    // Tighter freshness ceiling than the serving path's 24h default
+    // (#2845 review nit): a durable promote must be backed by a snapshot
+    // younger than one 5h refill period, else a stale walled reading
+    // (fleet probing disabled / degraded) could promote off an account
+    // whose window already refilled. With default probing (minutes-old
+    // snapshots) this never binds.
+    if (!snapshot || !snapshotFresh(snapshot, this.now(), MARK_EXHAUSTED_DEFAULT_MS)) return false;
     if (!snapshotWalled(snapshot)) return false;
     return !overageLiftsWall(snapshot, this.isOverageAllowed(account));
   }
@@ -2845,11 +2869,14 @@ export class AuthBroker {
       //       just had its creds refreshed; push the fresh creds immediately.
       // In both cases we write the current serving account (post failover), never
       // the raw pinned one, preserving the attribution invariant.
-      const isPinned = consumer.account === label;
+      // An unpinned consumer's "bound" account is the fleet active.
+      const bound = consumer.account ?? this.config.auth?.active;
+      const isPinned = bound === label;
       const effective = this.servingAccountForConsumer(consumer.name);
       const isEffective = effective === label;
       if (!isPinned && !isEffective) continue;
-      const toMirror = effective ?? consumer.account;
+      const toMirror = effective ?? bound;
+      if (toMirror == null) continue;
       if (this.mirrorAccountToConsumer(toMirror, consumer)) {
         fanned.push(consumer.name);
       }
@@ -2881,7 +2908,8 @@ export class AuthBroker {
   private servingAccountForConsumer(name: string): string | null {
     const c = (this.config.auth?.consumers ?? []).find((x) => x.name === name);
     if (!c) return null;
-    return this.accountWithFailover(c.account);
+    // Unpinned consumer follows the fleet active (agent parity).
+    return this.accountWithFailover(c.account ?? this.config.auth?.active);
   }
 
   /**

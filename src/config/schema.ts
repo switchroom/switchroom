@@ -3354,10 +3354,14 @@ export const SwitchroomConfigSchema = z.object({
             account: z
               .string()
               .min(1)
+              .optional()
               .describe(
-                "Pinned account label for this consumer. `get-credentials` returns " +
-                "this account's credentials; `mark-exhausted` from this consumer " +
-                "only affects this account.",
+                "Optional pinned account label for this consumer. When set, " +
+                "`get-credentials` serves this account (with automatic failover " +
+                "while it is quota-exhausted) and `mark-exhausted` from this " +
+                "consumer attributes to it — use a pin for quota isolation. " +
+                "When omitted, the consumer follows the fleet `auth.active` " +
+                "exactly like an agent: same account swaps, same failover.",
               ),
             uid: z
               .number()
