@@ -2439,6 +2439,9 @@ export function installHindsightPlugin(
  *
  * Currently overrides:
  *   - `retainEveryNTurns`: 10 → 1 (capture every turn, not every 10th)
+ *   - `retainMode`: full-session → chunked (Phase 6b: window, not whole
+ *     transcript, re-consolidated per fire; paired with the vendor
+ *     retain.py divergence)
  *   - `recallMaxMemories`: 12 → 8 (tighter prompt, less model noise)
  *   - `recallMinOverlap`: 0.0 → 0.10 (drop weak Jaccard-overlap matches)
  *
@@ -2485,6 +2488,40 @@ function renderHindsightSettingsOverrides(
   // Override: every turn retains (no throttle). See the rationale in
   // installHindsightPlugin() above.
   settings.retainEveryNTurns = 1;
+  // Phase 6b (RFC reference/rfcs/hindsight-synthesis-layers.md): switch from
+  // the vendor default retainMode="full-session" to "chunked" while keeping
+  // retainEveryNTurns=1. This is the crux of Phase 6b option A — keep the
+  // every-turn crash durability that retainEveryNTurns=1 buys (a ≤2-turn
+  // session still retains its token before a restart; the jtbd-memory-
+  // survives-restart UAT), but STOP re-consolidating the whole accumulated
+  // transcript on every Stop fire. Under full-session × every-turn, each fire
+  // re-sent the entire growing transcript to Hindsight's consolidation engine
+  // — the ~1M-tokens/day/agent invisible spend. In chunked mode retain.py
+  // slices only the recent window (retainOverlapTurns + retainEveryNTurns
+  // turns) per fire.
+  //
+  // This override is INERT without the paired vendor patch: upstream retain.py
+  // gated chunked window-slicing on `retainEveryNTurns > 1`, so chunked at
+  // n=1 silently fell back to full-session. The switchroom divergence in
+  // vendor/hindsight-memory/scripts/retain.py (select_retain_window) decouples
+  // the window slice from that throttle, which is what makes chunked+every-turn
+  // actually take effect. See that file's header comment + the CHANGELOG entry.
+  //
+  // Durability holds because the window always extends to the END of the
+  // transcript, so the turn that just completed (whose Stop hook is firing)
+  // is always inside the window, and every turn fires at n=1 — so each turn's
+  // content is retained on its own fire. No fact can fall outside every window.
+  //
+  // No operator override surface yet: switchroom.yaml exposes memory.recall.*
+  // (see AgentMemorySchema in src/config/schema.ts) but no memory.retain.mode
+  // key, so this is the scaffold default for every agent. If a retain-mode
+  // cascade is added later, wire it here (mirroring the recall knobs) and let
+  // the env/config value win over this default.
+  settings.retainMode = "chunked";
+  // retainOverlapTurns stays at the vendor default (2) → window = 3 recent
+  // turns at retainEveryNTurns=1. That's a comfortable safety margin for the
+  // restart guarantee (the firing turn plus the two before it), so no explicit
+  // override is warranted.
   // v0.13.22 smart defaults: at our recallBudget=low the vendor's 12
   // memories is generous; 8 keeps prompt noise down without hurting
   // the substantive recall@N (top-8 carries the same dominant facts

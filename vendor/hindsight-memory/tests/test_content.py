@@ -116,6 +116,64 @@ class TestSliceLastTurnsByUserBoundary:
     def test_non_list_returns_empty(self):
         assert slice_last_turns_by_user_boundary(None, 1) == []
 
+    # --- switchroom divergence: tool_result user-messages are NOT turns ---
+
+    @staticmethod
+    def _tool_result(tuid: str, text: str) -> dict:
+        # Claude Code emits tool results as role="user" with a content list of
+        # tool_result blocks (the shape read_transcript produces).
+        return {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": tuid, "content": text}],
+        }
+
+    def test_tool_result_messages_are_not_turn_boundaries(self):
+        # One human turn + 3 tool rounds. Requesting 1 turn must anchor to the
+        # human message, NOT the newest tool_result — otherwise a tool-heavy
+        # turn drops the human's text from the window (silent memory loss).
+        msgs = [
+            {"role": "user", "content": "human fact"},
+            {"role": "assistant", "content": "a"},
+            self._tool_result("t1", "r1"),
+            {"role": "assistant", "content": "a"},
+            self._tool_result("t2", "r2"),
+            {"role": "assistant", "content": "a"},
+            self._tool_result("t3", "r3"),
+            {"role": "assistant", "content": "a"},
+        ]
+        result = slice_last_turns_by_user_boundary(msgs, 1)
+        assert result[0]["content"] == "human fact"
+        assert result == msgs  # only 1 human turn, so the whole thing is kept
+
+    def test_counts_human_turns_only_across_tool_heavy_turns(self):
+        # 2 human turns, each followed by a tool round. Requesting 1 human turn
+        # slices to the SECOND human message, not into the first turn's tools.
+        msgs = [
+            {"role": "user", "content": "human one"},
+            {"role": "assistant", "content": "a"},
+            self._tool_result("t1", "r1"),
+            {"role": "user", "content": "human two"},
+            {"role": "assistant", "content": "a"},
+            self._tool_result("t2", "r2"),
+        ]
+        result = slice_last_turns_by_user_boundary(msgs, 1)
+        assert result[0]["content"] == "human two"
+
+    def test_mixed_text_and_tool_result_block_is_a_boundary(self):
+        # A user message with BOTH text and a tool_result block still counts as
+        # a human turn (conservative — only pure tool_result messages are skipped).
+        msgs = [
+            {"role": "user", "content": "older"},
+            {"role": "assistant", "content": "a"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "human with attached result"},
+                {"type": "tool_result", "tool_use_id": "t1", "content": "r1"},
+            ]},
+            {"role": "assistant", "content": "a"},
+        ]
+        result = slice_last_turns_by_user_boundary(msgs, 1)
+        assert result[0]["content"][0]["text"] == "human with attached result"
+
 
 # ---------------------------------------------------------------------------
 # compose_recall_query
