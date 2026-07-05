@@ -62,7 +62,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 1
     outputs:
-      relevant: ${{ steps.filter.outputs.relevant }}
+      relevant: ${{ steps.filter.outputs.core }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -70,33 +70,11 @@ jobs:
         id: filter
         uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d  # v4.0.1
         with:
-          filters: |
-            relevant:
-              - 'src/**'
-              - 'tests/**'
-              - 'telegram-plugin/**/*.ts'
-              - 'scripts/build.mjs'
-              - 'vitest.config.ts'
-              - 'tsconfig.json'
-              - 'package.json'
-              - 'bun.lock'
-              - 'telegram-plugin/package.json'
-              - 'telegram-plugin/bun.lock'
-              - '.github/actions/setup-switchroom/**'
-              - '.github/workflows/ci-tests-core.yml'
-              # sec WS9-F1 (#1402): security-load-bearing non-src paths.
-              # profiles/ renders every agent's start.sh + the WS8
-              # tool-safety hooks; bin/*-hook.sh + skills/ are baked into
-              # the agent image; docker/ + workflows are the supply-chain
-              # root. Without these a profiles/bin/skills/docker/.github-
-              # only PR skipped→passed this required gate with no tests.
-              # The scaffold/profile-render tests live under src/+tests/
-              # which this `vitest` sentinel runs.
-              - 'profiles/**'
-              - 'bin/**'
-              - 'skills/**'
-              - 'docker/**'
-              - '.github/workflows/**'
+          # Shared external filters file — the sec WS9-F1 (#1402)
+          # security-load-bearing path list is defined ONCE there and
+          # anchored into each workflow's filter key. See the header of
+          # .github/path-filters.yml for the rationale.
+          filters: .github/path-filters.yml
 
   # ─── Build dist/ once, share with all shards ──────────────────────
   build-dist:
