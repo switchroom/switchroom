@@ -17177,7 +17177,14 @@ function buildModelDeps(restartCtx?: ModelDepsRestartContext): ModelMenuDeps & M
   return {
     discover: (a) => discoverModels(a),
     discoverSrModels: async () => {
-      const base = process.env.ANTHROPIC_BASE_URL
+      // /model/info lives on the ROOT proxy (model-mapped surface), NOT the
+      // Anthropic pass-through that ANTHROPIC_BASE_URL now points at
+      // (<root>/anthropic). Prefer SWITCHROOM_LITELLM_BASE (the root emitted
+      // by compose.ts); fall back to stripping a trailing /anthropic off
+      // ANTHROPIC_BASE_URL so an agent booted from a pre-passthrough compose
+      // (base_url == root) still resolves correctly.
+      const base = process.env.SWITCHROOM_LITELLM_BASE
+        ?? process.env.ANTHROPIC_BASE_URL?.replace(/\/anthropic\/?$/, '')
       const headers = process.env.ANTHROPIC_CUSTOM_HEADERS
       if (!base || !headers) return []
       const keyMatch = headers.match(/x-litellm-api-key:\s*Bearer\s*(\S+)/)

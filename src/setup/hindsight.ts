@@ -510,8 +510,12 @@ export function startHindsight(
       // recognizes; the CP service has no equivalent env var override.
       "-e", `HINDSIGHT_API_PORT=${apiPort}`,
       // LiteLLM routing: inherited by the claude_agent_sdk subprocess so
-      // consolidation/reflect calls hit the proxy for spend tracking.
-      "-e", `ANTHROPIC_BASE_URL=${litellm.baseUrl}`,
+      // consolidation/reflect calls hit the proxy for spend tracking. Point
+      // at the Anthropic pass-through (<root>/anthropic), not the model-mapped
+      // route — the latter re-chunks the SSE stream and stalls long Claude
+      // responses mid-flight (the 2026-07-05 stall). hindsight only makes
+      // Claude calls, so it has no /model/info discovery to keep on the root.
+      "-e", `ANTHROPIC_BASE_URL=${litellm.baseUrl.replace(/\/+$/, "")}/anthropic`,
       "-e", `ANTHROPIC_CUSTOM_HEADERS=x-litellm-api-key: Bearer ${litellm.apiKey}\nx-litellm-customer-id: hindsight\nx-litellm-tags: service:hindsight`,
     );
   }

@@ -2184,17 +2184,31 @@ function emitAgentService(
   // ANTHROPIC_BASE_URL without a key makes every claude call hit the proxy
   // unauthenticated — a silently-broken agent. So a failed/absent provision
   // ⇒ no routing env ⇒ the agent keeps the normal broker-OAuth Anthropic
-  // path (degraded-but-working) rather than a dead proxy path. When both
-  // gates pass: ANTHROPIC_BASE_URL → proxy, ANTHROPIC_SMALL_FAST_MODEL pins
-  // the fast lane, SWITCHROOM_LITELLM=1 tells start.sh to fetch the key from
-  // the vault and export it as the x-litellm-api-key Bearer (the SECRET is
-  // NEVER emitted here — only the marker). Set BEFORE the userEnv merge so
-  // these system-managed keys are authoritative (the merge only fills env[k]
-  // when undefined). base_url is required for the marker to be useful; only
-  // emit the trio when it resolved.
+  // path (degraded-but-working) rather than a dead proxy path.
+  //
+  // ANTHROPIC_BASE_URL points the `claude` CLI at LiteLLM's **Anthropic
+  // pass-through** endpoint (`<root>/anthropic`), NOT the model-mapped
+  // `/v1/messages` route. The pass-through raw-forwards the request and
+  // streams the upstream SSE bytes natively; the model-mapped route
+  // translate→ChatCompletion→re-emit→re-chunks the stream, which stalls
+  // long opus responses mid-flight ("API Error: Response stalled
+  // mid-stream" — the 2026-07-05 marko incident). claude appends
+  // `/v1/messages`, so `<root>/anthropic` → `<root>/anthropic/v1/messages`,
+  // exactly the pass-through path. OAuth still rides in Authorization
+  // (forwarded upstream unchanged); the virtual key rides in the
+  // x-litellm-api-key header start.sh exports — that split is what keeps
+  // this subscription-native. SWITCHROOM_LITELLM_BASE keeps the ROOT proxy
+  // URL for the two consumers that need the model-mapped/admin surface, NOT
+  // the pass-through: start.sh's `/health/liveliness` probe and the
+  // gateway's `/model/info` non-Claude (sr-*) model discovery. Set BEFORE
+  // the userEnv merge so these system-managed keys are authoritative (the
+  // merge only fills env[k] when undefined). base_url is required for the
+  // markers to be useful; only emit the set when it resolved.
   if (a.litellm.enabled && a.litellm.keyConfirmed && a.litellm.baseUrl) {
+    const root = a.litellm.baseUrl.replace(/\/+$/, "");
     env.SWITCHROOM_LITELLM = "1";
-    env.ANTHROPIC_BASE_URL = a.litellm.baseUrl;
+    env.SWITCHROOM_LITELLM_BASE = root;
+    env.ANTHROPIC_BASE_URL = `${root}/anthropic`;
     env.ANTHROPIC_SMALL_FAST_MODEL = a.litellm.smallFastModel;
   }
   // SWITCHROOM_VOICE_ENGINE: the host's voice-transcription verdict
