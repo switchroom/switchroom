@@ -353,6 +353,69 @@ export const AgentMemorySchema = z
       .string()
       .optional()
       .describe("Instructions for the fact extraction LLM during retain. Cascade: override."),
+    mental_models: z
+      .array(
+        z.object({
+          name: z
+            .string()
+            .min(1)
+            .describe(
+              "Stable model name (identity key for idempotent ensure). Two " +
+              "declarations with the same name in one agent are rejected."
+            ),
+          source_query: z
+            .string()
+            .min(1)
+            .describe(
+              "The reflection query the model answers, semantically " +
+              "refreshed from the bank's content."
+            ),
+          refresh_after_consolidation: z
+            .boolean()
+            .optional()
+            .describe(
+              "Refresh this model after each consolidation. Defaults OFF — " +
+              "refresh adds bounded background model-spend + timeout risk " +
+              "(RFC Phase 5), so it is opt-in per model."
+            ),
+          max_tokens: z
+            .number()
+            .int()
+            .positive()
+            .optional()
+            .describe("Cap on the synthesized model's token size."),
+        })
+      )
+      .superRefine((models, ctx) => {
+        const seen = new Set<string>();
+        for (let i = 0; i < models.length; i++) {
+          const key = models[i].name;
+          if (seen.has(key)) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: [i, "name"],
+              message:
+                `duplicate mental_models name "${key}" — model names must be ` +
+                `unique within an agent (they are the idempotent-ensure key)`,
+            });
+          }
+          seen.add(key);
+        }
+      })
+      .optional()
+      .describe(
+        "Operator-declared, per-specialist Hindsight mental models (RFC " +
+        "Phase 5). Named, opt-in curated reflections this agent's bank should " +
+        "carry — e.g. a coach's 'training-plan-state' or a lawyer's " +
+        "'open-matters'. Ensured idempotently at scaffold/reconcile: NOTHING " +
+        "is created unless declared here (zero declarations = zero models, " +
+        "matching post-#2447 behaviour), and no fixed identity model is " +
+        "reintroduced — 'who the user is' stays owned by dedicated profile " +
+        "banks (users.*.profile_bank), never a per-agent model. Per-agent " +
+        "ONLY: intentionally not accepted at the defaults/profile tier, so a " +
+        "model can never be fleet-seeded — each specialist opts in on its own " +
+        "(the invariant-clean inverse of the retired blind auto-seeding)."
+      ),
     observations_mission: z
       .string()
       .optional()

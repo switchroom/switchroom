@@ -629,7 +629,7 @@ import { shouldEmitNotionMcp } from "../config/notion-workspace-acl.js";
 import { reconcileAgentDefaultSkills } from "./reconcile-default-skills.js";
 import { applyTelegramProgressGuidance } from "./sub-agent-telegram-prompt.js";
 import type { McpServerConfig } from "../memory/hindsight.js";
-import { createBank, updateBankMissions, DEFAULT_RETAIN_MISSION, resolveBankMissionExtras, isHindsightEnabled } from "../memory/hindsight.js";
+import { createBank, updateBankMissions, ensureDeclaredMentalModels, DEFAULT_RETAIN_MISSION, resolveBankMissionExtras, isHindsightEnabled } from "../memory/hindsight.js";
 import { loadTopicState } from "../telegram/state.js";
 import { resolveDualPath } from "../config/paths.js";
 import { resolvePath } from "../config/loader.js";
@@ -4421,6 +4421,28 @@ export function scaffoldAgent(
         .catch((err) => {
           console.warn(`  ${chalk.yellow("⚠")} Bank mission update error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
         });
+
+      // Ensure operator-DECLARED per-specialist mental models (Phase 5). Only
+      // models named in memory.mental_models are created — no blind seeding
+      // (that is the #2447 regression this avoids). Best-effort; never blocks.
+      ensureDeclaredMentalModels(
+        apiUrl,
+        hindsightBankId,
+        agentConfig.memory?.mental_models,
+        { timeoutMs: 5000 },
+      )
+        .then((outcomes) => {
+          for (const o of outcomes) {
+            if (o.ok) {
+              console.log(`  ${chalk.green("✓")} Mental model "${o.name}" ready for ${formatAgentBankLabel(name, hindsightBankId)}`);
+            } else {
+              console.warn(`  ${chalk.yellow("⚠")} Failed to ensure mental model "${o.name}" for ${formatAgentBankLabel(name, hindsightBankId)}: ${o.reason}`);
+            }
+          }
+        })
+        .catch((err) => {
+          console.warn(`  ${chalk.yellow("⚠")} Mental model ensure error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
+        });
     });
   }
 
@@ -6439,6 +6461,29 @@ export function reconcileAgent(
             console.warn(`  ${chalk.yellow("⚠")} Bank mission update error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
           });
       }
+
+      // Ensure operator-DECLARED per-specialist mental models (Phase 5) on
+      // reconcile too — declared models are the desired steady state, so a
+      // newly-added declaration lands on the next apply/restart. Only named
+      // models are created; nothing is auto-seeded. Best-effort; never blocks.
+      ensureDeclaredMentalModels(
+        apiUrl,
+        hindsightBankId,
+        agentConfig.memory?.mental_models,
+        { timeoutMs: 5000 },
+      )
+        .then((outcomes) => {
+          for (const o of outcomes) {
+            if (o.ok) {
+              console.log(`  ${chalk.green("✓")} Mental model "${o.name}" ready for ${formatAgentBankLabel(name, hindsightBankId)}`);
+            } else {
+              console.warn(`  ${chalk.yellow("⚠")} Failed to ensure mental model "${o.name}" for ${formatAgentBankLabel(name, hindsightBankId)}: ${o.reason}`);
+            }
+          }
+        })
+        .catch((err) => {
+          console.warn(`  ${chalk.yellow("⚠")} Mental model ensure error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
+        });
     });
   }
 

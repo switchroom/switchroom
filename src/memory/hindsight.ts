@@ -438,23 +438,66 @@ export async function probeHindsight(
 }
 
 /**
- * Ensure the user-profile Mental Model exists for a bank.
+ * A single operator-declared mental model for a bank.
  *
- * Creates the Mental Model if it doesn't exist, idempotent on subsequent calls.
- * The MM is pre-computed via reflection and answers "what do we know about the user?"
+ * These are the Phase-5 "curated per-specialist" models: named, opt-in,
+ * operator-authored in `switchroom.yaml` (`memory.mental_models`). Unlike the
+ * retired auto-seeded "user-profile" model (#2447), NOTHING is created unless
+ * the operator explicitly declares it — so zero declarations means zero models,
+ * exactly matching post-#2447 behaviour. This deliberately does NOT reintroduce
+ * a fixed identity model: "who the user is" stays owned by the dedicated profile
+ * banks (`users.*.profile_bank`), never a per-agent mental model.
+ */
+export interface MentalModelSpec {
+  /** Stable model name (the identity key for idempotent ensure). */
+  name: string;
+  /** The reflection query the model answers, refreshed from bank content. */
+  sourceQuery: string;
+  /**
+   * When true, Hindsight refreshes the model after each consolidation. Defaults
+   * OFF (undefined) — refresh adds bounded background model-spend + timeout risk
+   * (see RFC Phase 5), so it is opt-in per model.
+   */
+  refreshAfterConsolidation?: boolean;
+  /** Optional cap on the synthesized model's token size. */
+  maxTokens?: number;
+}
+
+/**
+ * Ensure a single, operator-declared Mental Model exists for a bank.
+ *
+ * Idempotent: creates the model if no model with `spec.name` exists, otherwise
+ * a no-op success. Matches existence by exact item NAME (a substring check
+ * false-positives across sibling models — see the history in the list step).
  *
  * @param apiUrl Hindsight MCP endpoint (e.g. "http://127.0.0.1:18888/mcp/")
  * @param bankId The bank ID to create the MM in
- * @param opts Optional fetch implementation and timeout
+ * @param spec   The declared model (name + source_query + optional knobs)
+ * @param opts   Optional fetch implementation and timeout
  * @returns {ok: true} on success, {ok: false, reason} on error
  */
-export async function ensureUserProfileMentalModel(
+export async function ensureMentalModel(
   apiUrl: string,
   bankId: string,
+  spec: MentalModelSpec,
   opts?: { fetchImpl?: typeof fetch; timeoutMs?: number }
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
   const fetchImpl = opts?.fetchImpl ?? fetch;
   const timeoutMs = opts?.timeoutMs ?? 5000;
+
+  // Only send optional args when set — keeps the create payload minimal and
+  // schema-clean (props verified against tests/fixtures/hindsight-tools-list).
+  const createArguments: Record<string, unknown> = {
+    name: spec.name,
+    source_query: spec.sourceQuery,
+  };
+  if (spec.refreshAfterConsolidation !== undefined) {
+    createArguments.trigger_refresh_after_consolidation =
+      spec.refreshAfterConsolidation;
+  }
+  if (spec.maxTokens !== undefined) {
+    createArguments.max_tokens = spec.maxTokens;
+  }
 
   try {
     const controller = new AbortController();
@@ -539,7 +582,7 @@ export async function ensureUserProfileMentalModel(
         if (models && typeof models === "string") {
           const parsed = JSON.parse(models) as { items?: Array<{ name?: string }> };
           const items = Array.isArray(parsed?.items) ? parsed.items : [];
-          if (items.some((m) => m?.name === "user-profile")) {
+          if (items.some((m) => m?.name === spec.name)) {
             return { ok: true }; // Already exists (by exact name)
           }
         }
@@ -566,25 +609,18 @@ export async function ensureUserProfileMentalModel(
         method: "tools/call",
         params: {
           name: "create_mental_model",
-          arguments: {
-            name: "user-profile",
-            // The server's create_mental_model argument is `source_query`, not
-            // `query` (an upstream rename). Passing `query` returns HTTP 200
-            // with isError:true "Missing required argument: source_query" — and
-            // because the old code only checked `createResponse.ok` (HTTP
-            // status), it reported {ok:true} while creating NOTHING. That broke
-            // the user-profile mental model fleet-wide (the "knows you" feature):
-            // banks had zero mental models despite "ready". Fixed: correct arg +
-            // the isError check below.
-            source_query:
-              "What are the key facts, preferences, context, and communication style about the user I talk to? Summarize what matters for making the agent feel like it knows them.",
-            // NOTE: do NOT send `types` — create_mental_model's schema does not
-            // accept it (props: name, source_query, mental_model_id, tags,
-            // max_tokens, trigger_refresh_after_consolidation, bank_id), so the
-            // server SILENTLY DROPS it (isError stays false). The mental model
-            // draws across fact types from its source_query regardless. Adding a
-            // schema-unknown arg back here reds memory.hindsight-contract.fixture.
-          },
+          // The server's create_mental_model argument is `source_query`, not
+          // `query` (an upstream rename). Passing `query` returns HTTP 200 with
+          // isError:true "Missing required argument: source_query" — and if a
+          // caller only checked `createResponse.ok` (HTTP status), it would
+          // report {ok:true} while creating NOTHING (the isError check below
+          // guards that). Optional knobs (trigger_refresh_after_consolidation,
+          // max_tokens) are added by the caller in `createArguments` only when
+          // set. Do NOT add `types` — it is not in create_mental_model's schema
+          // (props: name, source_query, mental_model_id, tags, max_tokens,
+          // trigger_refresh_after_consolidation, bank_id); the server silently
+          // drops it and it reds memory.hindsight-contract.fixture.
+          arguments: createArguments,
         },
       }),
       signal: controller.signal,
@@ -620,6 +656,111 @@ export async function ensureUserProfileMentalModel(
     }
     return { ok: false, reason: String(err) };
   }
+}
+
+/**
+ * The source_query for the (retired-from-auto-wiring) user-profile model.
+ * Kept as a named constant so the dormant dashboard "Build profile" path and
+ * its tests share one definition. NOT auto-created by scaffold/reconcile any
+ * more (#2447) — dedicated profile banks own user identity.
+ */
+export const USER_PROFILE_SOURCE_QUERY =
+  "What are the key facts, preferences, context, and communication style about the user I talk to? Summarize what matters for making the agent feel like it knows them.";
+
+/**
+ * Ensure the user-profile Mental Model exists for a bank.
+ *
+ * DORMANT auto-wiring: scaffold/reconcile no longer call this (#2447 retired
+ * per-agent user-profile models in favour of dedicated profile banks). Kept for
+ * the operator-triggered dashboard "Build profile" path. Thin wrapper over the
+ * generalized {@link ensureMentalModel}.
+ */
+export async function ensureUserProfileMentalModel(
+  apiUrl: string,
+  bankId: string,
+  opts?: { fetchImpl?: typeof fetch; timeoutMs?: number }
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  return ensureMentalModel(
+    apiUrl,
+    bankId,
+    { name: "user-profile", sourceQuery: USER_PROFILE_SOURCE_QUERY },
+    opts
+  );
+}
+
+/**
+ * The raw shape of a `memory.mental_models[]` entry as it lands from
+ * switchroom.yaml (snake_case, post-cascade). Mapped to {@link MentalModelSpec}
+ * by {@link ensureDeclaredMentalModels}.
+ */
+export interface DeclaredMentalModelConfig {
+  name: string;
+  source_query: string;
+  refresh_after_consolidation?: boolean;
+  max_tokens?: number;
+}
+
+/**
+ * The result of ensuring one declared model, for legible scaffold/reconcile
+ * logging.
+ */
+export interface EnsureMentalModelOutcome {
+  name: string;
+  ok: boolean;
+  reason?: string;
+}
+
+/**
+ * Ensure every operator-DECLARED mental model exists for a bank (Phase 5).
+ *
+ * This is the invariant-clean replacement for the retired auto-seeding (#2447):
+ * it creates ONLY the models the operator named in `memory.mental_models`, so
+ * an agent with no declarations gets no models (identical to post-#2447
+ * behaviour). No fixed "user-profile" identity model is implied — that domain
+ * stays with the dedicated profile banks. Each model is ensured idempotently
+ * (create-if-absent by exact name); best-effort and never throws, so a slow or
+ * down Hindsight never blocks scaffold/reconcile.
+ *
+ * @param apiUrl  Hindsight MCP endpoint
+ * @param bankId  The agent's bank id
+ * @param models  The declared models (may be undefined / empty → no-op)
+ * @param opts    Optional fetch impl + per-model timeout
+ * @returns per-model outcomes (empty array when nothing was declared)
+ */
+export async function ensureDeclaredMentalModels(
+  apiUrl: string,
+  bankId: string,
+  models: DeclaredMentalModelConfig[] | undefined,
+  opts?: { fetchImpl?: typeof fetch; timeoutMs?: number }
+): Promise<EnsureMentalModelOutcome[]> {
+  if (!models || models.length === 0) return [];
+
+  const outcomes: EnsureMentalModelOutcome[] = [];
+  const seen = new Set<string>();
+  for (const m of models) {
+    // Defensive de-dupe (schema also rejects dupes) so one bad config can't
+    // double-create; first declaration wins.
+    if (seen.has(m.name)) continue;
+    seen.add(m.name);
+
+    const spec: MentalModelSpec = {
+      name: m.name,
+      sourceQuery: m.source_query,
+      refreshAfterConsolidation: m.refresh_after_consolidation,
+      maxTokens: m.max_tokens,
+    };
+    try {
+      const result = await ensureMentalModel(apiUrl, bankId, spec, opts);
+      outcomes.push(
+        result.ok
+          ? { name: m.name, ok: true }
+          : { name: m.name, ok: false, reason: result.reason }
+      );
+    } catch (err) {
+      outcomes.push({ name: m.name, ok: false, reason: String(err) });
+    }
+  }
+  return outcomes;
 }
 
 /**
