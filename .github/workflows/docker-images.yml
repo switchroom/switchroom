@@ -54,7 +54,54 @@ env:
   IMAGE_NAMESPACE: ${{ github.repository_owner }}
 
 jobs:
+  # ─── Path-change filter (sentinel pattern, see ci-lint.yml) ───────
+  # PRs that don't touch image inputs skip the whole build matrix —
+  # previously EVERY PR paid ~9 image builds. Filters live in
+  # .github/path-filters.yml (keys: images / hindsight / voice).
+  #
+  # Gating policy:
+  #   - build-base / build-dependents: PRs gated on `images`; every
+  #     non-PR event (main push, tag, dispatch) always builds — we
+  #     don't gamble on the release path.
+  #   - build-hindsight / build-voice: also path-gated on MAIN PUSHES
+  #     (`hindsight` / `voice` keys) — they extend upstream bases, not
+  #     switchroom-base, and rarely change; an unchanged context was a
+  #     ~100% cache-hit no-op push anyway (promote-to-dev already
+  #     tolerates the missing :sha-<short> tag). Tags + dispatch still
+  #     always build them.
+  #
+  # This job itself skips on tag pushes / workflow_dispatch (dorny has
+  # no diff base there); downstream `if:`s use `!cancelled()` so a
+  # skipped `changes` doesn't auto-skip the builds on those events.
+  #
+  # NOTE (required checks): Ruleset 16470166 must require the
+  # `images-ok` sentinel below INSTEAD of build-base/build-hindsight/
+  # build-dependents ×6 — a path-skipped required matrix context would
+  # hard-block irrelevant PRs (#1343 lesson).
+  changes:
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    outputs:
+      images: ${{ steps.filter.outputs.images }}
+      hindsight: ${{ steps.filter.outputs.hindsight }}
+      voice: ${{ steps.filter.outputs.voice }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - name: Filter changed paths
+        id: filter
+        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d  # v4.0.1
+        with:
+          filters: .github/path-filters.yml
+
   build-base:
+    needs: changes
+    # Non-PR events (main push / tag / dispatch): always build.
+    # PRs: only when image inputs changed. `!cancelled()` because
+    # `changes` is skipped on tag/dispatch and a skipped need would
+    # otherwise auto-skip this job.
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.images == 'true') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -163,7 +210,12 @@ jobs:
             CACHE_BUST=${{ github.run_attempt }}
 
   build-dependents:
-    needs: build-base
+    needs: [changes, build-base]
+    # Same gate as build-base, plus an explicit success check on the
+    # base build — `!cancelled()` alone would let dependents run past
+    # a FAILED base (unlike the default all-needs-succeeded semantics
+    # it replaces).
+    if: ${{ !cancelled() && needs.build-base.result == 'success' && (github.event_name != 'pull_request' || needs.changes.outputs.images == 'true') }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -266,6 +318,14 @@ jobs:
     # base job and runs in parallel. See docker/Dockerfile.hindsight
     # for why we extend instead of running upstream as-is (claude-code
     # provider + claude-agent-sdk + UID pin).
+    #
+    # Path-gated on PRs AND main pushes (see `changes` header): the
+    # hindsight context rarely changes, and an unchanged-context main
+    # push was already a pure cache-hit no-op (nothing pushed, no
+    # :sha-<short> tag — promote-to-dev's absence-skip handles it).
+    # Tags + workflow_dispatch always build.
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') || needs.changes.outputs.hindsight == 'true') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -335,6 +395,12 @@ jobs:
     # hosts are amd64. Building an arm64 leg would emit an image that can't
     # actually run GPU STT, so we don't (this is the one fleet image that
     # is single-arch by design — every other image is amd64+arm64).
+    #
+    # Path-gated on PRs AND main pushes like build-hindsight (see the
+    # `changes` header): the CUDA layers make voice the heaviest build
+    # and its context almost never changes. Tags + dispatch always build.
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') || needs.changes.outputs.voice == 'true') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -448,8 +514,19 @@ jobs:
     # a missing `:sha-<short>` at promote time provably means
     # "build succeeded but context unchanged → buildx cache hit, nothing
     # pushed", never "build failed".
+    # Since the hindsight/voice builds became path-gated on main pushes
+    # too, their `needs` result can legitimately be `skipped` here — a
+    # skip means "context unchanged this commit, nothing pushed", which
+    # the retag step below already treats as a benign absence (existing
+    # :dev retained). So this `if:` requires smoke-test SUCCESS but only
+    # non-failure (success or skipped) from hindsight/voice.
     needs: [smoke-test, build-hindsight, build-voice]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: >-
+      !cancelled() &&
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      needs.smoke-test.result == 'success' &&
+      needs.build-hindsight.result != 'failure' && needs.build-hindsight.result != 'cancelled' &&
+      needs.build-voice.result != 'failure' && needs.build-voice.result != 'cancelled'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -504,3 +581,43 @@ jobs:
             printf '%s\n' "$out"
             exit 1
           fi
+
+  # ─── Sentinel ─────────────────────────────────────────────────────
+  # Branch-protection-required context (see ci-lint.yml header for the
+  # pattern). ALWAYS runs and aggregates the path-gated build jobs:
+  # pass when every build succeeded OR was legitimately path-skipped;
+  # fail when any build failed/cancelled, or when the `changes` filter
+  # job itself broke on an event where it gates (can't trust a skip
+  # produced by broken infra). Ruleset 16470166 should require
+  # `images-ok` INSTEAD of build-base / build-hindsight /
+  # build-dependents ×6.
+  images-ok:
+    needs: [changes, build-base, build-dependents, build-hindsight, build-voice]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Verdict
+        run: |
+          c='${{ needs.changes.result }}'
+          # `changes` is intentionally skipped on tag pushes /
+          # workflow_dispatch (no diff base) — skipped is fine; only a
+          # failure/cancel is infra breakage.
+          if [ "$c" = "failure" ] || [ "$c" = "cancelled" ]; then
+            echo "::error::changes=$c — path-filter infra failed; can't trust skip"
+            exit 1
+          fi
+          fail=0
+          for pair in \
+            "build-base=${{ needs.build-base.result }}" \
+            "build-dependents=${{ needs.build-dependents.result }}" \
+            "build-hindsight=${{ needs.build-hindsight.result }}" \
+            "build-voice=${{ needs.build-voice.result }}"; do
+            job="${pair%%=*}"; r="${pair#*=}"
+            if [ "$r" = "failure" ] || [ "$r" = "cancelled" ]; then
+              echo "::error::${job}=${r} — real build failure, blocking"
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] || exit 1
+          echo "changes=$c → pass (builds green or path-skipped)"
