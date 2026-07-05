@@ -191,6 +191,103 @@ export const DEFAULT_RETAIN_MISSION =
   "conversations. Skip one-off chatter and temporary task noise.";
 
 /**
+ * Hindsight bank disposition traits (1-5 each). Mirrors the engine's flat
+ * `disposition_skepticism` / `disposition_literalism` / `disposition_empathy`
+ * config fields (confirmed against the live `/v1/bank-template-schema`:
+ * integers 1-5, engine default 3 when null). switchroom models them as one
+ * nested object for ergonomic YAML and flattens at the API boundary.
+ */
+export interface BankDisposition {
+  skepticism?: number;
+  literalism?: number;
+  empathy?: number;
+}
+
+/**
+ * Extra bank-mission fields threaded through the config cascade (Phase 2 of
+ * `reference/rfcs/hindsight-synthesis-layers.md` — "a persona without its own
+ * memory is cosplay"; banks should be *specialized*, not merely isolated).
+ *
+ * `reflect_mission` and `observations_mission` are string config fields;
+ * `disposition` flattens to the three `disposition_*` integer fields.
+ */
+export interface BankMissionExtras {
+  reflect_mission?: string;
+  observations_mission?: string;
+  disposition?: BankDisposition;
+}
+
+/**
+ * Code-level memory defaults keyed by built-in **filesystem** profile
+ * (`agents.<name>.extends`). These differentiate the specialists so the
+ * feature works on a fresh `switchroom setup` with zero YAML (defaults
+ * principle) — a coach leans empathy-high, an analyst/EA leans skeptical and
+ * literal. Operator config (already cascaded) overrides these per-key.
+ *
+ * Only `disposition` + `observations_mission` are defaulted here; the
+ * persona statement (`reflect_mission` / `bank_mission`) stays operator-driven
+ * so there is no code-vs-yaml persona conflict. Profiles not listed inherit
+ * the engine default (all traits 3, no observations mission).
+ */
+export const PROFILE_MEMORY_DEFAULTS: Record<string, BankMissionExtras> = {
+  "health-coach": {
+    disposition: { skepticism: 2, literalism: 2, empathy: 5 },
+    observations_mission:
+      "Synthesise the person's wellbeing patterns, motivations, and emotional " +
+      "context — how habits, setbacks, and encouragement connect over time.",
+  },
+  "executive-assistant": {
+    disposition: { skepticism: 4, literalism: 4, empathy: 3 },
+  },
+  coding: {
+    disposition: { skepticism: 4, literalism: 5, empathy: 2 },
+  },
+};
+
+/**
+ * Merge two dispositions per-key (override wins on each trait, inherits the
+ * rest). Returns undefined when neither side sets anything.
+ */
+function mergeDisposition(
+  base: BankDisposition | undefined,
+  over: BankDisposition | undefined,
+): BankDisposition | undefined {
+  if (!base && !over) return undefined;
+  const merged: BankDisposition = { ...(base ?? {}), ...(over ?? {}) };
+  return Object.keys(merged).length > 0 ? merged : undefined;
+}
+
+/**
+ * Resolve the effective {@link BankMissionExtras} for an agent by layering
+ * the resolved memory config over the built-in profile defaults
+ * ({@link PROFILE_MEMORY_DEFAULTS}). Config wins; disposition merges per-key.
+ *
+ * Used by BOTH the scaffold and reconcile bank-update paths in
+ * `src/agents/scaffold.ts`, so existing banks pick up profile/config changes
+ * on `switchroom apply` — not only freshly scaffolded ones.
+ */
+export function resolveBankMissionExtras(
+  memory:
+    | { reflect_mission?: string; observations_mission?: string; disposition?: BankDisposition }
+    | undefined,
+  profileName: string,
+): BankMissionExtras {
+  const pd = PROFILE_MEMORY_DEFAULTS[profileName] ?? {};
+  const out: BankMissionExtras = {};
+
+  const reflect = memory?.reflect_mission ?? pd.reflect_mission;
+  if (reflect != null) out.reflect_mission = reflect;
+
+  const observations = memory?.observations_mission ?? pd.observations_mission;
+  if (observations != null) out.observations_mission = observations;
+
+  const disposition = mergeDisposition(pd.disposition, memory?.disposition);
+  if (disposition) out.disposition = disposition;
+
+  return out;
+}
+
+/**
  * Parse a Hindsight MCP response body.
  *
  * Hindsight's MCP server returns text/event-stream responses of the form:
@@ -693,7 +790,13 @@ export async function createBank(
 export async function updateBankMissions(
   apiUrl: string,
   bankId: string,
-  missions: { bank_mission?: string; retain_mission?: string },
+  missions: {
+    bank_mission?: string;
+    retain_mission?: string;
+    reflect_mission?: string;
+    observations_mission?: string;
+    disposition?: BankDisposition;
+  },
   opts?: { fetchImpl?: typeof fetch; timeoutMs?: number }
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
   const fetchImpl = opts?.fetchImpl ?? fetch;
@@ -761,13 +864,34 @@ export async function updateBankMissions(
           // NOT a top-level `retain_mission` — that is a CONFIG field and must
           // go through `config_updates` (verified live: the server SILENTLY
           // DROPPED a top-level retain_mission, so the retain-steering half of
-          // every mission update was a live no-op). Route it correctly.
+          // every mission update was a live no-op). Every other steering field
+          // is a config field too and routes the same way.
+          //
+          // The engine stores the top-level `mission` as `config.reflect_mission`
+          // (verified live: switchroom's bank_mission lands there). So
+          // `reflect_mission` and `bank_mission` target the SAME field — when
+          // the explicit `reflect_mission` is set we route it through
+          // config_updates and drop the top-level `mission` so the two can't
+          // race; a bare `bank_mission` keeps the legacy top-level route.
           arguments: {
             bank_id: bankId,
-            ...(missions.bank_mission != null ? { mission: missions.bank_mission } : {}),
-            ...(missions.retain_mission != null
-              ? { config_updates: { retain_mission: missions.retain_mission } }
+            ...(missions.reflect_mission == null && missions.bank_mission != null
+              ? { mission: missions.bank_mission }
               : {}),
+            ...(() => {
+              const configUpdates: Record<string, unknown> = {};
+              if (missions.retain_mission != null)
+                configUpdates.retain_mission = missions.retain_mission;
+              if (missions.reflect_mission != null)
+                configUpdates.reflect_mission = missions.reflect_mission;
+              if (missions.observations_mission != null)
+                configUpdates.observations_mission = missions.observations_mission;
+              const d = missions.disposition;
+              if (d?.skepticism != null) configUpdates.disposition_skepticism = d.skepticism;
+              if (d?.literalism != null) configUpdates.disposition_literalism = d.literalism;
+              if (d?.empathy != null) configUpdates.disposition_empathy = d.empathy;
+              return Object.keys(configUpdates).length > 0 ? { config_updates: configUpdates } : {};
+            })(),
           },
         },
       }),

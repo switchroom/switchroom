@@ -394,6 +394,18 @@ export function mergeAgentConfig(
       if (v === undefined) continue;
       if (k === "recall" && base.recall && typeof v === "object" && v !== null && !Array.isArray(v)) {
         combined[k] = { ...base.recall, ...(v as Record<string, unknown>) };
+      } else if (
+        k === "disposition" &&
+        (base as { disposition?: unknown }).disposition &&
+        typeof v === "object" && v !== null && !Array.isArray(v)
+      ) {
+        // Same one-level-deep merge as `recall`: an agent may override a
+        // single trait (e.g. empathy) and inherit the profile's other two
+        // traits, rather than replacing the whole disposition object.
+        combined[k] = {
+          ...((base as { disposition?: Record<string, unknown> }).disposition),
+          ...(v as Record<string, unknown>),
+        };
       } else {
         combined[k] = v;
       }

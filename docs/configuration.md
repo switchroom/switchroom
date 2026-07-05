@@ -181,6 +181,35 @@ agents:
 
 > **Note:** this generates the *memory* wiring only. Who may **drive** an agent (`access.allowFrom`) is still paired at agent creation as today — generating access from `users:` is a future phase.
 
+### Specializing a bank — missions & disposition
+
+A persona without its own memory is cosplay: banks should be *specialized*, not merely isolated. Four `memory.*` fields steer how a bank extracts, recalls, and synthesizes — a coach should read its notes differently than a lawyer.
+
+| Field | Type | Cascade | Steers |
+| --- | --- | --- | --- |
+| `reflect_mission` | string | override | The bank's "who am I / what matters" framing applied during recall/reflect. Engine-accurate name for what `bank_mission` sets. |
+| `bank_mission` | string | override | **Alias** for `reflect_mission` (retained for back-compat — switchroom's `bank_mission` lands in the engine's `reflect_mission`). If both are set, `reflect_mission` wins. |
+| `retain_mission` | string | override | What the fact-extraction LLM keeps during auto-retain. Defaults to a curated mission on fresh agents. |
+| `observations_mission` | string | override | What the observation-consolidation LLM synthesizes from raw facts (the higher-order "what patterns matter" lens). |
+| `disposition` | object | **per-key merge** | Personality traits (`skepticism` / `literalism` / `empathy`, each `1`–`5`, engine default `3`) shaping recall/reflect/observation framing. |
+
+```yaml
+agents:
+  gymbro:
+    extends: health-coach
+    memory:
+      observations_mission: "Track motivation, adherence, and how setbacks connect to encouragement."
+      disposition:
+        empathy: 5        # overrides just this trait; skepticism/literalism
+                          # inherit the health-coach profile default (2/2)
+```
+
+`disposition` deep-merges one level (like `recall`): overriding a single trait leaves the profile's other traits in place. The other three fields override wholesale.
+
+**Zero-config defaults.** Built-in profiles ship differentiated dispositions so a fresh `switchroom setup` needs no YAML — `health-coach` leans empathy-high (`2/2/5`), `executive-assistant` leans precise (`4/4/3`), `coding` leans skeptical + literal (`4/5/2`). Operator config overrides these per-key.
+
+All four apply at **both** scaffold (fresh agents) and reconcile (`switchroom apply` updates existing banks) — except the `retain_mission` *default*, which is seeded only at scaffold so a customized retain mission is never clobbered.
+
 ### Demoting individual memories from auto-recall
 
 If one specific memory keeps surfacing in the recall block and isn't useful (over-broad world fact, stale context, etc.), tag it with `[demote-from-recall]` — or `demote-from-recall` / `no-recall`, all three work. The memory stays in the bank, `mcp__hindsight__reflect` and manual recall can still find it, but auto-recall skips it.
