@@ -435,3 +435,146 @@ describe('inbound-spool — robustness', () => {
     ])
   })
 })
+
+describe('inbound-spool — #2789 C: multi-message drop notice reports the real count', () => {
+  it('passes the true per-chat dropped count to the coalesced notice', () => {
+    const fs = fakeFs()
+    let t = 0
+    const s = createInboundSpool({
+      path: PATH,
+      fs,
+      now: () => t,
+      escalateAfterMs: 100,
+      escalateNoticeCooldownMs: 10_000,
+    })
+    // Four undeliverable synthetics in ONE chat — the historical bug
+    // coalesced these into a notice that read as a SINGLE drop.
+    s.put('marko', msg({ messageId: 0, ts: 1, meta: { source: 'cron' } }))
+    s.put('marko', msg({ messageId: 0, ts: 2, meta: { source: 'cron' } }))
+    s.put('marko', msg({ messageId: 0, ts: 3, meta: { source: 'cron' } }))
+    s.put('marko', msg({ messageId: 0, ts: 4, meta: { source: 'cron' } }))
+    t = 1000 // all older than the 100ms bound
+    const posted: number[] = []
+    const seen: number[] = []
+    const dropped = s.sweepEscalations((_e, { postNotice, droppedCount }) => {
+      seen.push(droppedCount)
+      if (postNotice) posted.push(droppedCount)
+    })
+    expect(dropped).toBe(4) // all four retracted
+    // Every callback for this chat sees the true sweep count (4), and the
+    // ONE posted notice reports 4 — not 1.
+    expect(seen).toEqual([4, 4, 4, 4])
+    expect(posted).toEqual([4])
+  })
+
+  it('reports per-chat counts independently in a mixed sweep', () => {
+    const fs = fakeFs()
+    let t = 0
+    const s = createInboundSpool({
+      path: PATH,
+      fs,
+      now: () => t,
+      escalateAfterMs: 100,
+      escalateNoticeCooldownMs: 10_000,
+    })
+    // 3 in chat A, 1 in chat B.
+    s.put('m', msg({ chatId: 'A', messageId: 0, ts: 1, meta: { source: 'cron' } }))
+    s.put('m', msg({ chatId: 'A', messageId: 0, ts: 2, meta: { source: 'cron' } }))
+    s.put('m', msg({ chatId: 'A', messageId: 0, ts: 3, meta: { source: 'cron' } }))
+    s.put('m', msg({ chatId: 'B', messageId: 0, ts: 4, meta: { source: 'cron' } }))
+    t = 1000
+    const posted = new Map<string, number>()
+    s.sweepEscalations((e, { postNotice, droppedCount }) => {
+      if (postNotice) posted.set(String(e.msg.chatId), droppedCount)
+    })
+    expect(posted.get('A')).toBe(3)
+    expect(posted.get('B')).toBe(1)
+  })
+
+  it('a single drop still reports a count of 1', () => {
+    const fs = fakeFs()
+    let t = 0
+    const s = createInboundSpool({ path: PATH, fs, now: () => t, escalateAfterMs: 100 })
+    s.put('m', msg({ messageId: 0, ts: 1, meta: { source: 'cron' } }))
+    t = 1000
+    const counts: number[] = []
+    s.sweepEscalations((_e, { droppedCount }) => counts.push(droppedCount))
+    expect(counts).toEqual([1])
+  })
+})
+
+describe('inbound-spool — #2789 B: spool write failure surfaces a health signal', () => {
+  // An fs whose appendFileSync can be toggled to fail, modelling a full /
+  // unwritable persistent volume. The append swallows the error (delivery
+  // must not break) but the degradation must be SURFACED, not silent.
+  function toggleableFs(): InboundSpoolFsSeam & { fail: boolean } {
+    const files = new Map<string, string>()
+    const seam = {
+      fail: false,
+      appendFileSync(p: string, d: string) {
+        if (seam.fail) throw new Error('ENOSPC: no space left on device')
+        files.set(p, (files.get(p) ?? '') + d)
+      },
+      readFileSync: (p: string) => files.get(p) ?? '',
+      writeFileSync: (p: string, d: string) => files.set(p, d),
+      renameSync: (from: string, to: string) => {
+        files.set(to, files.get(from) ?? '')
+        files.delete(from)
+      },
+      existsSync: (p: string) => files.has(p),
+      statSizeSync: (p: string) => Buffer.byteLength(files.get(p) ?? ''),
+    }
+    return seam
+  }
+
+  it('raises a latched onDegraded signal when an append fails, and isDegraded() reflects it', () => {
+    const fs = toggleableFs()
+    const events: { degraded: boolean; consecutiveFailures: number }[] = []
+    const s = createInboundSpool({
+      path: PATH,
+      fs,
+      log: () => {},
+      onDegraded: (info) => events.push({ degraded: info.degraded, consecutiveFailures: info.consecutiveFailures }),
+    })
+    expect(s.isDegraded()).toBe(false)
+    fs.fail = true
+    // put() must NOT throw — live delivery keeps working, durability degrades.
+    expect(() => s.put('a', msg({ messageId: 1, ts: 1 }))).not.toThrow()
+    expect(s.isDegraded()).toBe(true)
+    expect(s.appendFailureCount()).toBe(1)
+    // Latched: exactly one transition event on entering degraded.
+    expect(events).toEqual([{ degraded: true, consecutiveFailures: 1 }])
+  })
+
+  it('does not re-fire the degraded signal on every failing append (latched)', () => {
+    const fs = toggleableFs()
+    const events: boolean[] = []
+    const s = createInboundSpool({
+      path: PATH, fs, log: () => {},
+      onDegraded: (info) => events.push(info.degraded),
+    })
+    fs.fail = true
+    s.put('a', msg({ messageId: 1, ts: 1 }))
+    s.put('a', msg({ messageId: 2, ts: 2 }))
+    s.put('a', msg({ messageId: 3, ts: 3 }))
+    expect(s.appendFailureCount()).toBe(3)
+    expect(events).toEqual([true]) // one transition, not three
+  })
+
+  it('surfaces recovery when appends succeed again (health signal un-latches)', () => {
+    const fs = toggleableFs()
+    const events: boolean[] = []
+    const s = createInboundSpool({
+      path: PATH, fs, log: () => {},
+      onDegraded: (info) => events.push(info.degraded),
+    })
+    fs.fail = true
+    s.put('a', msg({ messageId: 1, ts: 1 }))
+    expect(s.isDegraded()).toBe(true)
+    fs.fail = false
+    s.put('a', msg({ messageId: 2, ts: 2 }))
+    expect(s.isDegraded()).toBe(false)
+    expect(s.appendFailureCount()).toBe(0)
+    expect(events).toEqual([true, false]) // degraded → recovered
+  })
+})
