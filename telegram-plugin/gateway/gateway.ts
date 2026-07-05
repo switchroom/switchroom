@@ -13557,6 +13557,18 @@ function handleSessionEvent(ev: SessionEvent): void {
 
       if (flushDecision.kind === 'flush') {
         let capturedText = flushDecision.text
+        // #2798 — turn-flush delivers the model's terminal prose when it
+        // skipped reply/stream_reply, but historically bypassed the reply
+        // path's markdown normalization entirely. Mirror executeReply's front
+        // of pipeline here so the backstop renders identically: repair LLM
+        // JSON-escape bungles (literal `\n`), then promote lone prose paragraph
+        // breaks into GFM hard breaks so the Bot API 10.1 rich path doesn't
+        // collapse them (lists/tables/code left untouched). Runs BEFORE the
+        // redact/scrub below, exactly as reply orders it (repair → normalize →
+        // redact → scrub), so masking sees the repaired text. The matching
+        // addParagraphSpacers pass runs on the send side just before
+        // splitMarkdownChunks (see below).
+        capturedText = normalizeParagraphBreaks(repairEscapedWhitespace(capturedText))
         // Component 3 — origin-thread backstop. `chatId`/`threadId` are
         // captured from the turn atom (turn.sessionChatId/sessionThreadId)
         // at the top of this turn_end handler, NOT from the live
@@ -13687,7 +13699,14 @@ function handleSessionEvent(ev: SessionEvent): void {
             link_preview_options: { is_disabled: true },
           }
           const limit = RICH_MESSAGE_MAX_CHARS
-          const htmlChunks = splitMarkdownChunks(capturedText, limit)
+          // #2798 / #2692 — inject visible blank-line spacers into prose `\n\n`
+          // gaps before splitting, exactly as executeReply does. The rich GFM
+          // renderer collapses a bare `\n\n` gap TIGHT, so without this the
+          // paragraph boundaries from the '\n\n' block join (turn-flush-safety
+          // .ts) would still render jammed together. Mirrors reply's
+          // `addParagraphSpacers(text)` on the non-literal path.
+          const renderedText = addParagraphSpacers(capturedText)
+          const htmlChunks = splitMarkdownChunks(renderedText, limit)
           const sentIds: number[] = []
           try {
             // #654 deterministic double-message fix. If the progress

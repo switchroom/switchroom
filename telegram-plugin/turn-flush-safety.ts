@@ -190,7 +190,22 @@ export function decideTurnFlush(input: FlushDecisionInput): FlushDecision {
   if (input.replyCalled) return { kind: 'skip', reason: 'reply-called' }
 
   if (input.chatId == null) return { kind: 'skip', reason: 'no-inbound-chat' }
-  const joined = input.capturedText.join('\n').trim()
+  // #2798 — join whole authored assistant text blocks with a PARAGRAPH break,
+  // not a single newline. Each `capturedText` element is one complete
+  // `content[i].text` block (session-tail.ts `projectAssistantTextBlocks`), so
+  // the boundary between two elements is a paragraph boundary. Joining with a
+  // lone `\n` collapses adjacent blocks into one run — on the Bot API 10.1
+  // rich-markdown path (#2669) a single newline is a soft break, so the blocks
+  // render as an undifferentiated wall-of-text. `\n\n` is the GFM paragraph
+  // separator; the gateway send path then wedges visible spacers into those
+  // gaps via addParagraphSpacers (mirroring the reply path, #2692) so the
+  // paragraphs render with real separation.
+  //
+  // The silent-marker guards below are unaffected by this change:
+  // isSilentFlushMarker length-guards the whole joined string; the composite /
+  // trailing-marker guards split on '\n' and filter empty lines, so the extra
+  // blank line an '\n\n' join introduces is discarded before matching.
+  const joined = input.capturedText.join('\n\n').trim()
   if (joined.length === 0) return { kind: 'skip', reason: 'empty-text' }
   if (isSilentFlushMarker(joined)) return { kind: 'skip', reason: 'silent-marker' }
   // Composite silent noise — e.g. "Sent.\nNO_REPLY\nNO_REPLY" accumulated

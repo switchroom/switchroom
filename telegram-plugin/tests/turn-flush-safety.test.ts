@@ -21,6 +21,18 @@ import {
   endsWithSilentMarker,
   isTurnFlushSafetyEnabled,
 } from '../turn-flush-safety.js'
+// Rich-message send-path primitives (Bot API 10.1, #2669/#2692). The #2798
+// regression suite below reconstructs the exact gateway turn-flush render
+// pipeline from these so it pins end-to-end behaviour, not just the pure
+// decision function.
+import {
+  repairEscapedWhitespace,
+  normalizeParagraphBreaks,
+  addParagraphSpacers,
+  splitMarkdownChunks,
+  PARAGRAPH_SPACER,
+  RICH_MESSAGE_MAX_CHARS,
+} from '../format.js'
 
 describe('isCompositeSilentNoise — Stop-hook re-prompt leak backstop', () => {
   it('suppresses the observed leak "Sent.\\nNO_REPLY\\nNO_REPLY"', () => {
@@ -109,6 +121,103 @@ describe('decideTurnFlush — prose+trailing-sentinel is suppressed, not leaked 
   })
 })
 
+// ---------------------------------------------------------------------------
+// #2798 — turn-flush must render multiple WHOLE assistant text blocks with
+// paragraph separation, not a collapsed wall-of-text. This suite reconstructs
+// the real gateway turn-flush render pipeline (post-#2669 rich-markdown path):
+//   decideTurnFlush -> join('\n\n')
+//   -> repairEscapedWhitespace -> normalizeParagraphBreaks
+//   -> addParagraphSpacers -> splitMarkdownChunks -> sendRichMessage
+// so it pins the end-to-end fix, not just the pure decision. The corpus is a
+// REAL captured-transcript shape (three separate content[i].text blocks, one
+// stored UNTRIMMED with a trailing '\n' exactly as session-tail.ts pushes
+// them), NOT a hand-authored ['para A','para B'] that would pass by
+// construction regardless of the join separator.
+// ---------------------------------------------------------------------------
+describe('#2798 turn-flush block separation — real multi-block transcript shape', () => {
+  const realBlocks = [
+    "I've finished reviewing the three files you flagged.",
+    // Untrimmed: a real assistant text block keeps its trailing newline
+    // (session-tail.ts drops only empty/whitespace-only blocks). This is the
+    // "join('\\n\\n') on a block already ending in '\\n' stacks 3 newlines"
+    // case the design note calls out.
+    'The `auth` handler looks correct. The token-refresh path has a race, ' +
+      'though: two concurrent requests can both trigger a refresh and the ' +
+      'second clobbers the first.\n',
+    'Want me to open a PR with the mutex fix, or would you rather patch it ' +
+      'inline first?',
+  ]
+
+  // Mirror the gateway turn-flush send pipeline exactly.
+  function renderLikeTurnFlush(blocks: string[]): string {
+    const d = decideTurnFlush({ chatId: '12345', replyCalled: false, capturedText: blocks })
+    expect(d.kind).toBe('flush')
+    const joined = (d as { kind: 'flush'; text: string }).text
+    const normalized = normalizeParagraphBreaks(repairEscapedWhitespace(joined))
+    return addParagraphSpacers(normalized)
+  }
+
+  it('separates whole blocks with a visible paragraph gap, not a wall-of-text', () => {
+    const out = renderLikeTurnFlush(realBlocks)
+    // Every block's content survives.
+    expect(out).toContain("I've finished reviewing")
+    expect(out).toContain('The `auth` handler looks correct')
+    expect(out).toContain('Want me to open a PR')
+    // The wall-of-text failure mode glues two blocks one '\n' apart. Assert the
+    // boundary carries a real paragraph break with the injected visible spacer
+    // line (#2692 rich-path spacer), and NOT a single-newline join.
+    expect(out).toContain(`\n\n${PARAGRAPH_SPACER}\n\n`)
+    expect(out).not.toContain('flagged.\nThe `auth`')
+    // A spacer sits specifically between block 1 and block 2.
+    const b1 = out.indexOf('flagged.')
+    const b2 = out.indexOf('The `auth` handler')
+    expect(out.slice(b1, b2)).toContain(PARAGRAPH_SPACER)
+  })
+
+  it('collapses the untrimmed-trailing-newline stack — no 3+ newline run reaches the wire', () => {
+    const out = renderLikeTurnFlush(realBlocks)
+    // Block 2's trailing '\n' + the '\n\n' join = 3 newlines; normalize
+    // collapses 3+ runs to '\n\n' and addParagraphSpacers wedges exactly one
+    // spacer, so no doubled/stacked blank run survives.
+    expect(out).not.toMatch(/\n{3,}/)
+    // One spacer per block transition: 3 blocks → 2 gaps → 2 spacers.
+    const spacerCount = out.split(PARAGRAPH_SPACER).length - 1
+    expect(spacerCount).toBe(2)
+  })
+
+  it('the whole separated answer stays in one rich chunk here (well under 32768)', () => {
+    const out = renderLikeTurnFlush(realBlocks)
+    const chunks = splitMarkdownChunks(out, RICH_MESSAGE_MAX_CHARS)
+    expect(chunks.length).toBe(1)
+    expect(chunks[0]).toContain(PARAGRAPH_SPACER)
+  })
+
+  it('still SUPPRESSES a real transcript that deliberately terminates with a bare NO_REPLY (#2053 guard intact)', () => {
+    // Same real prose shape, but the model closed with NO_REPLY as its final
+    // block (intentional silence). The '\n\n' join must NOT defeat the
+    // trailing-marker guard.
+    const d = decideTurnFlush({
+      chatId: '12345',
+      replyCalled: false,
+      capturedText: [
+        'Reviewed the overnight digest. Nothing needs your attention: all ' +
+          'three checks are green and the backup completed at 04:12.',
+        'NO_REPLY',
+      ],
+    })
+    expect(d).toEqual({ kind: 'skip', reason: 'silent-marker' })
+  })
+
+  it('still SUPPRESSES the composite silent-noise blob under the new join', () => {
+    const d = decideTurnFlush({
+      chatId: '12345',
+      replyCalled: false,
+      capturedText: ['Sent.', 'NO_REPLY', 'NO_REPLY'],
+    })
+    expect(d).toEqual({ kind: 'skip', reason: 'silent-marker' })
+  })
+})
+
 describe('decideTurnFlush', () => {
   it('(a) does NOT flush when the reply tool was called', () => {
     const decision = decideTurnFlush({
@@ -125,9 +234,12 @@ describe('decideTurnFlush', () => {
       replyCalled: false,
       capturedText: ['here is the answer', 'more detail'],
     })
+    // #2798 — whole authored text blocks are joined with a PARAGRAPH break
+    // ('\n\n'), not a lone '\n', so adjacent blocks don't collapse into a
+    // single run on the rich-markdown path.
     expect(decision).toEqual({
       kind: 'flush',
-      text: 'here is the answer\nmore detail',
+      text: 'here is the answer\n\nmore detail',
     })
   })
 
