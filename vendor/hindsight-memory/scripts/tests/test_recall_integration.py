@@ -55,13 +55,35 @@ class _FakeClient:
         self._memories = memories if memories is not None else []
         self._recall_exc = recall_exc
         self._list_exc = list_exc
+        # One entry per recall() call — lets tests assert the tag-filter
+        # kwargs (upstream 962140eef) that main() passed per bank.
+        self.recall_calls = []
 
     def list_directives(self, bank_id, active_only=True, timeout=2):
         if self._list_exc is not None:
             raise self._list_exc
         return {"items": list(self._directives)}
 
-    def recall(self, bank_id, query, max_tokens=1024, budget="mid", types=None, timeout=10):
+    def recall(
+        self,
+        bank_id,
+        query,
+        max_tokens=1024,
+        budget="mid",
+        types=None,
+        tags=None,
+        tags_match=None,
+        tag_groups=None,
+        timeout=10,
+    ):
+        self.recall_calls.append(
+            {
+                "bank_id": bank_id,
+                "tags": tags,
+                "tags_match": tags_match,
+                "tag_groups": tag_groups,
+            }
+        )
         if self._recall_exc is not None:
             raise self._recall_exc
         return {"results": list(self._memories)}
@@ -615,6 +637,68 @@ class OverlapGateIntegrationTests(unittest.TestCase):
         # No memories survived; with no directives either, we expect no
         # additionalContext at all.
         self.assertIsNone(ctx)
+
+
+class RecallTagFilterIntegrationTests(unittest.TestCase):
+    """Upstream 962140eef port — tag filters flow through main() to each
+    per-bank recall call, composed with our additional-banks routing."""
+
+    def test_global_tags_passed_to_primary_bank(self):
+        client = _FakeClient(memories=[_memory("a fact")])
+        _run_main_with(
+            client,
+            config_extra={
+                "recallTags": ["memory_type:rule"],
+                "recallTagsMatch": "any_strict",
+            },
+        )
+        self.assertEqual(client.recall_calls[0]["tags"], ["memory_type:rule"])
+        self.assertEqual(client.recall_calls[0]["tags_match"], "any_strict")
+
+    def test_no_tags_match_sent_without_tags_or_groups(self):
+        client = _FakeClient(memories=[_memory("a fact")])
+        _run_main_with(client, config_extra={"recallTagsMatch": "all"})
+        self.assertIsNone(client.recall_calls[0]["tags"])
+        self.assertIsNone(client.recall_calls[0]["tags_match"])
+        self.assertIsNone(client.recall_calls[0]["tag_groups"])
+
+    def test_per_bank_filter_overrides_global_for_additional_bank(self):
+        client = _FakeClient(memories=[_memory("a fact")])
+        _run_main_with(
+            client,
+            config_extra={
+                "recallAdditionalBanks": ["shared-bank"],
+                "recallTags": ["tech_stack:supabase"],
+                "recallTagsMatch": "any",
+                "recallAdditionalBankFilters": {
+                    "shared-bank": {
+                        "recallTags": ["memory_type:rule"],
+                        "recallTagsMatch": "all_strict",
+                    }
+                },
+            },
+        )
+        primary, extra = client.recall_calls[0], client.recall_calls[1]
+        self.assertEqual(primary["bank_id"], "test-bank")
+        self.assertEqual(primary["tags"], ["tech_stack:supabase"])
+        self.assertEqual(primary["tags_match"], "any")
+        self.assertEqual(extra["bank_id"], "shared-bank")
+        self.assertEqual(extra["tags"], ["memory_type:rule"])
+        self.assertEqual(extra["tags_match"], "all_strict")
+
+    def test_additional_bank_without_override_inherits_global(self):
+        client = _FakeClient(memories=[_memory("a fact")])
+        _run_main_with(
+            client,
+            config_extra={
+                "recallAdditionalBanks": ["shared-bank"],
+                "recallTags": ["memory_type:rule"],
+            },
+        )
+        extra = client.recall_calls[1]
+        self.assertEqual(extra["tags"], ["memory_type:rule"])
+        # Global tags_match defaults are only sent when filters are active.
+        self.assertEqual(extra["tags_match"], None)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### Ported from upstream (vectorize-io/hindsight, `hindsight-integrations/claude-code/`)
+
+- `c5a61db2b` — raise `_check_health` default timeout 2s→10s in
+  `scripts/lib/daemon.py` to stop the busy-daemon restart/kill loop
+  (applied clean; codex-integration hunk not applicable).
+- `3d6c2ba8b` — label "Current time" as UTC in the recall context block
+  (`lib/content.py:format_current_time`), so client LLMs in non-UTC
+  timezones don't misread the timestamp as local time.
+- `962140eef` — recall tag filters: `recallTags`, `recallTagsMatch`,
+  `recallTagGroups`, plus per-additional-bank overrides via
+  `recallAdditionalBankFilters`. Hand-ported into the switchroom recall.py
+  rewrite: filters compose with sender-bank routing (per-bank overrides
+  apply to sender banks too) and are part of the recall cache key
+  (`_tag_filter_sig`) so a filter change can't serve stale cached results.
+- `55ef70679` — optional `requestTimeoutSeconds` /
+  `HINDSIGHT_REQUEST_TIMEOUT_SECONDS` global request-timeout override in
+  `HindsightClient` (adapted to our `_request`). Wired into retain.py only;
+  recall.py deliberately keeps its own 8s hook-budget timeout. Upstream's
+  mcp_server.py hunks skipped (not vendored).
+
 ### Added
 
 - `{user_id}` template variable for `retainTags` and `retainMetadata`, resolved

@@ -156,7 +156,14 @@ def run_retain(hook_input: dict, force: bool = False) -> dict:
 
     api_token = config.get("hindsightApiToken")
     try:
-        client = HindsightClient(api_url, api_token)
+        # Upstream 55ef70679 — honor the optional requestTimeoutSeconds
+        # override (retain runs outside the recall hook budget, so a longer
+        # timeout is safe here; recall.py deliberately omits this).
+        client = HindsightClient(
+            api_url,
+            api_token,
+            request_timeout_override=config.get("requestTimeoutSeconds"),
+        )
     except ValueError as e:
         print(f"[Hindsight] Invalid API URL: {e}", file=sys.stderr)
         return {"status": "failed", "error": e, "payload": None}

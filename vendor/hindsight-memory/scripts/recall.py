@@ -229,6 +229,33 @@ def _resolve_sender_bank(
     return additional_banks
 
 
+def _tag_filter_sig(
+    recall_tags,
+    tags_match,
+    tag_groups,
+    additional_bank_filters,
+) -> str:
+    """Stable fingerprint of the recall tag-filter configuration
+    (upstream 962140eef) for cache keying. Tag filters change what the
+    recall API returns for an identical query, so they MUST be part of
+    the cache key — otherwise a config change (or per-bank filter edit)
+    within the TTL window would serve stale, differently-filtered
+    results. Empty/default filters collapse to "" so pre-existing cache
+    behaviour (and keys) are unchanged when the feature is unused."""
+    if not (recall_tags or tag_groups or additional_bank_filters):
+        return ""
+    try:
+        return json.dumps(
+            [recall_tags, tags_match, tag_groups, additional_bank_filters],
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        # Unserializable config — fall back to repr; stable within a
+        # process and still distinguishes filtered from unfiltered.
+        return repr([recall_tags, tags_match, tag_groups, additional_bank_filters])
+
+
 def _cache_key(
     session_id: str,
     prompt: str,
@@ -236,6 +263,7 @@ def _cache_key(
     extra_banks: list,
     active_thread_id: str | None = None,
     active_sender: str | None = None,
+    tag_filter_sig: str = "",
 ) -> str:
     """Stable hash for cache keying. Session_id is included so a new
     session always misses, regardless of the TTL setting. Extra banks
@@ -259,6 +287,9 @@ def _cache_key(
         ",".join(sorted(extra_banks or [])),
         active_thread_id or "",
         active_sender or "",
+        # Upstream 962140eef port: tag filters shape the result set, so
+        # they are part of the key (see _tag_filter_sig). "" when unused.
+        tag_filter_sig or "",
     ]
     payload = "\x1f".join(parts)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -703,11 +734,32 @@ def main():
         additional_banks,
     )
 
+    # Upstream 962140eef — optional recall tag filters. Resolved BEFORE the
+    # cache check so the tag-filter fingerprint is part of the cache key
+    # (filters change the result set for an identical query). Per-bank
+    # overrides in recallAdditionalBankFilters apply to any additional bank —
+    # including sender banks appended by _resolve_sender_bank above.
+    recall_tags = config.get("recallTags") or None
+    tag_groups = config.get("recallTagGroups") or None
+    tags_match = config.get("recallTagsMatch") if recall_tags or tag_groups else None
+    additional_bank_filters = config.get("recallAdditionalBankFilters") or {}
+    if not isinstance(additional_bank_filters, dict):
+        additional_bank_filters = {}
+    tag_filter_sig = _tag_filter_sig(recall_tags, tags_match, tag_groups, additional_bank_filters)
+
     # Switchroom #424 phase 4.1 — cache check BEFORE any HTTP traffic.
     # Whole-session-scoped, opt-in via HINDSIGHT_RECALL_CACHE_TTL_SECS.
     cache_ttl = _cache_ttl_secs()
     cache_key = (
-        _cache_key(session_id, prompt, bank_id, additional_banks, active_thread_id, active_sender)
+        _cache_key(
+            session_id,
+            prompt,
+            bank_id,
+            additional_banks,
+            active_thread_id,
+            active_sender,
+            tag_filter_sig,
+        )
         if cache_ttl > 0
         else ""
     )
@@ -787,6 +839,11 @@ def main():
             max_tokens=config.get("recallMaxTokens", 1024),
             budget=config.get("recallBudget", "mid"),
             types=config.get("recallTypes"),
+            # Upstream 962140eef — optional tag filters (resolved above the
+            # cache check; part of the cache key).
+            tags=recall_tags,
+            tags_match=tags_match,
+            tag_groups=tag_groups,
             # 8s in-script timeout leaves 4s headroom inside the 12s
             # UserPromptSubmit hook ceiling (see hooks.json:20) for cache
             # write + block formatting. Tightened from 10s in switchroom
@@ -809,6 +866,19 @@ def main():
     # cache key reflects every bank queried; reuse that local instead of
     # re-reading config.
     for extra_bank_id in additional_banks:
+        # Upstream 962140eef — per-bank tag-filter overrides; fall back to
+        # the global filters when the bank has no entry. Applies uniformly
+        # to config-listed banks and sender banks appended by
+        # _resolve_sender_bank (both flow through `additional_banks`).
+        extra_filter = additional_bank_filters.get(extra_bank_id, {})
+        if not isinstance(extra_filter, dict):
+            extra_filter = {}
+        extra_tags = extra_filter.get("recallTags", recall_tags) or None
+        extra_tag_groups = extra_filter.get("recallTagGroups", tag_groups) or None
+        extra_tags_match = extra_filter.get(
+            "recallTagsMatch",
+            tags_match if extra_tags or extra_tag_groups else None,
+        )
         try:
             extra_response = client.recall(
                 bank_id=extra_bank_id,
@@ -816,6 +886,9 @@ def main():
                 max_tokens=config.get("recallMaxTokens", 1024),
                 budget=config.get("recallBudget", "mid"),
                 types=config.get("recallTypes"),
+                tags=extra_tags,
+                tags_match=extra_tags_match,
+                tag_groups=extra_tag_groups,
                 # 8s in-script timeout leaves 4s headroom inside the 12s
                 # UserPromptSubmit hook ceiling (see hooks.json:20) for cache
                 # write + block formatting. Tightened from 10s in switchroom
