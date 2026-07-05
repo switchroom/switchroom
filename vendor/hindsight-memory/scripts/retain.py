@@ -74,6 +74,7 @@ def select_retain_window(
     retain_every_n: int,
     overlap_turns: int,
     all_messages: list,
+    force: bool = False,
 ) -> tuple:
     """Decide which messages to retain and whether to send as a full window.
 
@@ -93,23 +94,32 @@ def select_retain_window(
     to retain once a fire happens. A chunked window of
     ``max(retain_every_n, 1) + overlap_turns`` turns is correct for any
     ``retain_every_n >= 1``. With ``retain_every_n=1, overlap=2`` the window
-    is the 3 most-recent turns.
+    is the 3 most-recent HUMAN turns (tool_result messages don't count as
+    turns — see slice_last_turns_by_user_boundary).
+
+    ``force=True`` (SessionEnd final retain) widens chunked mode to a
+    full-session sweep — belt-and-braces so a graceful shutdown always flushes
+    the whole session even if per-turn windowing had an edge. This costs a
+    full sweep only ONCE per session (at end), not per turn.
 
     Durability invariant (jtbd-memory-survives-restart UAT): the window
     always extends to the END of the transcript (``slice_last_turns_by_user_boundary``
     returns ``messages[start:]``), so the turn that just completed — the one
     whose Stop hook is firing — is ALWAYS included. Every turn fires (no
     throttle at n=1), so every turn's content is retained on its own fire.
-    No fact can fall outside every window.
+    Boundaries are counted on human messages only, so a tool-heavy turn can't
+    push the human's fact outside the window. No fact can fall outside every
+    window.
     """
-    if retain_mode == "chunked":
+    if retain_mode == "chunked" and not force:
         # Sliding window: N turns + configured overlap. max(retain_every_n, 1)
         # keeps the window valid at n=1 (the decoupling); for n>1 this equals
         # the previous `retain_every_n + overlap_turns` (behaviour unchanged).
         window_turns = max(retain_every_n, 1) + overlap_turns
         messages_to_retain = slice_last_turns_by_user_boundary(all_messages, window_turns)
         return messages_to_retain, True
-    # Full session mode: retain all messages, always as a full window.
+    # Full session: vendor full-session mode, OR a forced (SessionEnd) chunked
+    # sweep. Retain all messages, always as a full window.
     return list(all_messages), True
 
 
@@ -168,13 +178,18 @@ def run_retain(hook_input: dict, force: bool = False) -> dict:
     # (Phase 6b: chunked window-slicing now works at retainEveryNTurns=1).
     overlap_turns = config.get("retainOverlapTurns", 0)
     messages_to_retain, retain_full_window = select_retain_window(
-        retain_mode, retain_every_n, overlap_turns, all_messages
+        retain_mode, retain_every_n, overlap_turns, all_messages, force=force
     )
-    if retain_mode == "chunked":
+    if retain_mode == "chunked" and not force:
         window_turns = max(retain_every_n, 1) + overlap_turns
         debug_log(
             config,
-            f"Chunked retain firing (window: {window_turns} turns, {len(messages_to_retain)} messages)",
+            f"Chunked retain firing (window: {window_turns} human turns, {len(messages_to_retain)} messages)",
+        )
+    elif retain_mode == "chunked" and force:
+        debug_log(
+            config,
+            f"Chunked retain, forced full-session sweep (SessionEnd): {len(all_messages)} messages",
         )
     else:
         debug_log(config, f"Full session retain: {len(all_messages)} messages")

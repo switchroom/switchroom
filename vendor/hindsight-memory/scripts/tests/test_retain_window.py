@@ -147,5 +147,115 @@ class SelectRetainWindowNoRegression(unittest.TestCase):
         self.assertIsNot(result, messages)
 
 
+def _human_msg(text: str) -> dict:
+    return {"role": "user", "content": text}
+
+
+def _tool_result_msg(tool_use_id: str, text: str) -> dict:
+    # Claude Code emits tool results as role="user" with a content list of
+    # tool_result blocks — exactly the shape read_transcript() produces.
+    return {
+        "role": "user",
+        "content": [{"type": "tool_result", "tool_use_id": tool_use_id, "content": text}],
+    }
+
+
+def _assistant_msg(text: str) -> dict:
+    return {"role": "assistant", "content": text}
+
+
+def _contains_text(messages: list, needle: str) -> bool:
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, str) and needle in c:
+            return True
+    return False
+
+
+class SelectRetainWindowToolHeavyTurn(unittest.TestCase):
+    """Finding 1 regression: tool_result messages are role="user" but are NOT
+    human turns. A tool-heavy turn must not push the human's fact out of the
+    window. These FAIL before the content.py boundary fix and pass after.
+    """
+
+    def test_tool_heavy_single_turn_keeps_human_fact_in_window(self):
+        # One logical human turn: the fact, then 3 sequential tool rounds.
+        # OLD boundary semantics count the 3 tool_result "user" messages as
+        # 3 turns and slice them off — dropping the human fact. NEW semantics
+        # count only the 1 human turn, so the whole (1 human-turn) transcript
+        # is retained and the fact survives.
+        fact = "my deploy token is DURABILITY_TOKEN_XYZ"
+        messages = [
+            _human_msg(fact),
+            _assistant_msg("let me look that up"),
+            _tool_result_msg("t1", "file a"),
+            _assistant_msg("checking more"),
+            _tool_result_msg("t2", "file b"),
+            _assistant_msg("one more"),
+            _tool_result_msg("t3", "file c"),
+            _assistant_msg("here is your answer"),
+        ]
+        result, _ = select_retain_window(
+            "chunked", retain_every_n=1, overlap_turns=2, all_messages=messages
+        )
+        self.assertTrue(
+            _contains_text(result, "DURABILITY_TOKEN_XYZ"),
+            "human fact fell outside the retain window on a tool-heavy turn "
+            "(silent memory loss). Window was: "
+            + repr([m.get("content") for m in result]),
+        )
+
+    def test_tool_heavy_current_turn_among_prior_human_turns(self):
+        # Two prior human turns, then a tool-heavy current turn whose human
+        # message carries the fact. window=3 human turns must include the
+        # current turn's human message regardless of tool volume.
+        fact = "the current fact is CURRENT_FACT_42"
+        messages = [
+            _human_msg("older turn 0"),
+            _assistant_msg("a0"),
+            _human_msg("older turn 1"),
+            _assistant_msg("a1"),
+            _human_msg(fact),
+            _assistant_msg("looking"),
+            _tool_result_msg("t1", "r1"),
+            _assistant_msg("more"),
+            _tool_result_msg("t2", "r2"),
+            _assistant_msg("more"),
+            _tool_result_msg("t3", "r3"),
+            _assistant_msg("done"),
+        ]
+        result, _ = select_retain_window(
+            "chunked", retain_every_n=1, overlap_turns=2, all_messages=messages
+        )
+        self.assertTrue(_contains_text(result, "CURRENT_FACT_42"))
+        # And the window is anchored to 3 HUMAN turns — so the oldest human
+        # message ("older turn 0") is the window start.
+        self.assertTrue(_contains_text(result, "older turn 0"))
+
+
+class SelectRetainWindowForce(unittest.TestCase):
+    """Finding 2: SessionEnd force=True widens chunked mode to full-session."""
+
+    def test_force_retains_full_session_in_chunked_mode(self):
+        messages = _transcript(10)  # turns 0..9
+        result, full_window = select_retain_window(
+            "chunked", retain_every_n=1, overlap_turns=2,
+            all_messages=messages, force=True,
+        )
+        # Forced sweep at SessionEnd retains everything, not just the window.
+        self.assertEqual(_user_turn_indices(result), list(range(10)))
+        self.assertEqual(len(result), len(messages))
+        self.assertTrue(full_window)
+
+    def test_no_force_still_windows_in_chunked_mode(self):
+        # Guard: the force widening must not leak into normal per-turn fires.
+        messages = _transcript(10)
+        result, _ = select_retain_window(
+            "chunked", retain_every_n=1, overlap_turns=2,
+            all_messages=messages, force=False,
+        )
+        self.assertEqual(_user_turn_indices(result), [7, 8, 9])  # last 3 turns
+
+
 if __name__ == "__main__":
     unittest.main()
