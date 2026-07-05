@@ -393,6 +393,22 @@ export const AgentMemorySchema = z
         "Cascade: per-key merge (an agent overrides individual traits and " +
         "inherits the rest, matching `recall`)."
       ),
+    directive_capture_nudge: z
+      .boolean()
+      .optional()
+      .describe(
+        "Deterministic directive-capture nudge (issue #2848 Stage B). When " +
+        "on (switchroom default true — Stage A measured a ~55% miss rate on " +
+        "durable corrections), the auto-recall hook regex-detects correction " +
+        "/ standing-rule-shaped inbound (\"always/never …\", \"from now on …\", " +
+        "\"stop doing …\", a stated preference, \"that's wrong, it's …\") and " +
+        "appends a terse advisory to the turn's context telling the model to " +
+        "persist the rule with mcp__hindsight__create_directive if it IS " +
+        "durable. Detection is pure regex — the model does the judgment " +
+        "in-session and calls create_directive itself (no model callsite, no " +
+        "silent hook-side write). Set false to disable per-agent. " +
+        "Cascade: override (per-agent wins over default)."
+      ),
     recall: z
       .object({
         max_memories: z
@@ -2135,6 +2151,10 @@ const profileFields = {
       // agents) hindsight-native by default, with per-agent `file: true` opt-in.
       file: z.boolean().optional(),
       isolation: z.enum(["default", "strict"]).optional(),
+      // Mirror of AgentMemorySchema.directive_capture_nudge — accepted at the
+      // defaults/profile tier too, so `defaults.memory.directive_capture_nudge:
+      // false` can disable the #2848 nudge fleet-wide (per-agent `true` opt-in).
+      directive_capture_nudge: z.boolean().optional(),
       recall: z
         .object({
           max_memories: z.number().int().min(0).optional(),
