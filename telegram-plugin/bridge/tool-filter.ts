@@ -30,13 +30,12 @@ export interface NamedTool {
 }
 
 /**
- * Hot tools pinned loaded — must never defer. The reply path
- * (reply/stream_reply) plus the frequently-used early-turn ops. Everything
- * NOT in this set defers under tool-search.
+ * Hot tools pinned loaded — must never defer. The reply path plus the
+ * frequently-used early-turn ops. Everything NOT in this set defers under
+ * tool-search.
  */
 export const ALWAYS_LOAD_TOOLS: ReadonlySet<string> = new Set([
   'reply',
-  'stream_reply',
   'get_recent_messages',
   'react',
   'edit_message',

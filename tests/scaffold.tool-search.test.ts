@@ -12,7 +12,7 @@
  *        used only occasionally — no first-turn benefit from pinning.
  *      - switchroom-telegram (P4): NO LONGER pinned server-wide
  *        (`alwaysLoad: false`); the bridge pins only the hot tools (reply /
- *        stream_reply / get_recent_messages / react / …) per-tool via
+ *        get_recent_messages / react / …) per-tool via
  *        `_meta["anthropic/alwaysLoad"]`, so the ~14 cold tools defer.
  */
 import { describe, it, expect, afterEach } from "vitest";
@@ -101,7 +101,6 @@ describe("tool-search wiring (source guards)", () => {
     expect(filterSrc).toMatch(/ALWAYS_LOAD_TOOLS/);
     expect(filterSrc).toMatch(/anthropic\/alwaysLoad/);
     expect(filterSrc).toMatch(/'reply'/);
-    expect(filterSrc).toMatch(/'stream_reply'/);
     // and the bridge actually applies it to the tools/list response.
     const bridgeSrc = readFileSync(
       resolve(__dirname, "..", "telegram-plugin", "bridge", "bridge.ts"),

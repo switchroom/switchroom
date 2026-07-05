@@ -213,7 +213,7 @@ value back into chat.
 
 ### Formatting — make it scannable
 
-\`reply\` and \`stream_reply\` render rich Markdown (Bot API 10.1) for you, so
+\`reply\` renders rich Markdown (Bot API 10.1) for you, so
 \`**bold**\` becomes bold and backtick-wrapped text becomes monospace. Your full
 formatting floor card — the toolkit and when to reach for each — is injected
 into your system prompt every session; this is the conversational summary.
@@ -266,7 +266,7 @@ phone. Optimise it for a thumb scroll, not a terminal dump:
   wins.
 
 Every turn that answers a user message ends with a user-visible
-\`reply\` (or \`stream_reply\` done=true) — Telegram is all the user
+\`reply\` — Telegram is all the user
 sees; your terminal output never reaches them.`;
 
 /**
@@ -421,8 +421,8 @@ right answer at all. Structure exists for the reader, not the writer: a two-item
 bullet list is worse than a sentence, a heading on a three-line reply is noise. When
 in doubt, shorter and plainer wins.
 
-Every turn that answers a user message ends with a user-visible \`reply\` (or
-\`stream_reply\` done=true) — Telegram is all the user sees; your terminal output
+Every turn that answers a user message ends with a user-visible \`reply\`
+— Telegram is all the user sees; your terminal output
 never reaches them.`;
 
 /**
@@ -935,7 +935,6 @@ export function setupPlugins(agentDir: string, useSwitchroomPlugin = false): voi
 const SWITCHROOM_TELEGRAM_MCP_TOOLS = [
   "mcp__switchroom-telegram",
   "mcp__switchroom-telegram__reply",
-  "mcp__switchroom-telegram__stream_reply",
   "mcp__switchroom-telegram__react",
   "mcp__switchroom-telegram__edit_message",
   "mcp__switchroom-telegram__send_typing",
@@ -1802,7 +1801,7 @@ function buildHumanizerEnvVars(
  * baseline 79,056 tok under `auto`, unchanged even by the per-tool diet).
  * `true` forces deferral of every tool NOT pinned via
  * `_meta["anthropic/alwaysLoad"]` — switchroom pins the load-bearing hot path
- * (reply / stream_reply / etc. in the telegram bridge; hindsight + agent-config
+ * (reply / etc. in the telegram bridge; hindsight + agent-config
  * server-wide), so the reply path stays loaded while the heavy business-MCP +
  * cold-tool surface defers. Canary (test-harness, 2026-06-18): baseline
  * 79,056 → 47,064 tok (~40%) with the reply UAT still passing.
@@ -3675,7 +3674,7 @@ export function scaffoldAgent(
         },
         // Tool-search right-sizing (P4-B): the server is NO LONGER pinned
         // wholesale. The bridge pins the load-bearing hot tools (reply /
-        // stream_reply / get_recent_messages / react / edit_message /
+        // get_recent_messages / react / edit_message /
         // send_typing / download_attachment) individually via the native
         // per-tool `_meta["anthropic/alwaysLoad"]` annotation, so they
         // never defer (no orphaned-reply round-trip), while the ~14 cold
@@ -4636,7 +4635,7 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
           ],
         },
         {
-          // #2053 defense-in-depth: drop a reply/stream_reply call whose
+          // #2053 defense-in-depth: drop a reply call whose
           // payload is only the silent sentinel (NO_REPLY/HEARTBEAT_OK),
           // so the sentinel can never reach chat regardless of any
           // nag-loop behaviour. No matcher — the hook self-filters by
@@ -5033,7 +5032,7 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
     'request. A wall of text the user has to re-read to find the one fact ' +
     'that matters is the failure this exists to prevent.\n\n' +
     'CRITICAL: "answer" means a call to the reply tool ' +
-    '(mcp__switchroom-telegram__reply, or stream_reply with done=true). ' +
+    '(mcp__switchroom-telegram__reply). ' +
     'Your terminal/transcript text is NEVER delivered to Telegram — the ' +
     'user sees only what you send through the reply tool. After a long ' +
     'tool sequence (scheduling, multi-step research, sub-agent handback), ' +
@@ -6028,7 +6027,7 @@ export function reconcileAgent(
         },
         // Tool-search right-sizing (P4-B): the server is NO LONGER pinned
         // wholesale. The bridge pins the load-bearing hot tools (reply /
-        // stream_reply / get_recent_messages / react / edit_message /
+        // get_recent_messages / react / edit_message /
         // send_typing / download_attachment) individually via the native
         // per-tool `_meta["anthropic/alwaysLoad"]` annotation, so they
         // never defer (no orphaned-reply round-trip), while the ~14 cold

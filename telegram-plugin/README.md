@@ -9,10 +9,12 @@ and substantially extended for long-running, multi-agent deployments.
 The upstream plugin handles the basic send/receive wire protocol. This fork
 adds the ergonomics and reliability that an always-on agent fleet needs:
 
-- **Streaming replies** — `stream_reply` edits a single message in place as
-  work progresses (~1/sec throttle), so users see live progress instead of
-  silent gaps followed by a wall-of-text. Optional `lane` parameter lets each
-  lane (e.g. `thinking` vs default `answer`) get its own message per chat+thread.
+- **Live progress card** — an event-driven progress card (Plan → Run → Done
+  with live tool bullets, elapsed time, and status emoji) edits a single
+  message in place as work progresses, so users see live progress instead of
+  silent gaps followed by a wall-of-text. This is rendered by the plugin for
+  free while the turn is in-flight — the model just sends the final answer once
+  via `reply`.
 - **Status reactions** — emoji lifecycle (👀 queued → 🤔 thinking → 👨‍💻 tool
   use → 🔥 streaming → 👍 done) on the user's own message gives "I'm working"
   feedback for free, plus stall watchdogs (🥱 30s idle, 😨 90s).
@@ -36,7 +38,7 @@ adds the ergonomics and reliability that an always-on agent fleet needs:
 - **Switchroom slash-commands** — `/agents`, `/restart`, `/logs`, `/memory`,
   `/grant`, `/dangerous`, `/permissions`, `/reconcile` etc., handled by the
   plugin without consuming Claude Code tokens.
-- **12 MCP tools** — `reply`, `stream_reply`, `react`, `edit_message`,
+- **11 MCP tools** — `reply`, `react`, `edit_message`,
   `delete_message`, `forward_message`, `pin_message`, `send_typing`,
   `download_attachment`, `get_recent_messages`, `send_checklist`,
   `update_checklist` (the latter two ship native Telegram checklists,
@@ -196,40 +198,27 @@ When an inbound message is received, the plugin immediately reacts with an emoji
 
 Set to an empty string `""` to disable. Only Telegram's fixed emoji whitelist is accepted (👍 👎 ❤ 🔥 👀 🎉 etc). A typing indicator is also sent automatically.
 
-### `stream_reply` tool (preferred for multi-step work)
+### Progress while working
 
-Sends or updates a streaming reply that edits one message in-place rather
-than sending many. Call repeatedly during long tasks with full snapshots of
-the current message; the plugin throttles edits to ~1/sec to respect
-Telegram's rate limit. Set `done=true` on the final call to lock the
-message.
-
-| Parameter | Required | Description |
-|-----------|----------|-------------|
-| `chat_id` | yes | Target chat ID |
-| `text` | yes | Full text snapshot (NOT a delta — pass the complete current content each call) |
-| `done` | no | `true` on final call. After `done=true` the stream is locked and further calls are no-ops. Default `false`. |
-| `format` | no | `"html"` (default), `"markdownv2"`, or `"text"` |
-| `lane` | no | Optional lane name. Each lane gets its own Telegram message per chat+thread. Use `lane: "thinking"` to surface reasoning progress alongside the main answer stream. Omit for the default answer lane. |
-| `message_thread_id` | no | Forum topic thread ID (auto-applied from the last inbound message if not specified) |
-
-Hard-stops at 4096 chars (Telegram message limit). On edit-404 (the message
-we're editing was deleted), the plugin sends a fresh message and continues
-the stream against the new id. A short `idleMs` pre-send debounce coalesces
-back-to-back snapshots before the first wire send, avoiding a redundant
-edit when several updates arrive in the same tick.
+For long tasks the model does **not** need to narrate progress or drive a
+streaming message itself. The plugin renders an event-driven progress card
+(Plan → Run → Done with live tool bullets, elapsed time, and status emoji)
+for free while the turn is in-flight. Send the final answer once, with
+`reply` — it chunks anything over Telegram's 4096-char limit. (The retired
+`stream_reply` tool was a redundant, worse alias of `reply`; the internal
+progress-card streaming that drove it is preserved and is what renders the
+live card.)
 
 ### Manual streaming progress via `edit_message`
 
-If you need finer control than `stream_reply` offers, you can drive the
-edit loop yourself:
+If you want to drive an in-place edit loop yourself:
 
 1. Send an initial "thinking..." message with `reply` — note the returned `message_id`
 2. Call `edit_message` with updated text as work progresses (edits are silent — no push notification)
 3. Call `send_typing` between steps to keep the typing indicator alive (it expires after ~5s)
 4. When done, send a **new** `reply` so the user's device pings with a push notification
 
-In most cases `stream_reply` is simpler and is the recommended path.
+In most cases the automatic progress card is simpler and is the recommended path.
 
 ### `send_typing` tool
 

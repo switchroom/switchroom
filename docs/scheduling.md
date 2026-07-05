@@ -192,7 +192,7 @@ time, but config-load validation should reject it before then.
 
 ## How cron tasks deliver to Telegram
 
-Because cron fires arrive as ordinary inbound turns in the running session, the agent's normal reply path runs — `mcp__switchroom-telegram__reply` (or `stream_reply`) writes to the chat the same way it does for a user-typed message. Markdown→HTML conversion, smart chunking, and sanitization are identical. If the agent decides the prompt has nothing meaningful to say, no reply is sent — a silent run is correct behaviour, not an error.
+Because cron fires arrive as ordinary inbound turns in the running session, the agent's normal reply path runs — `mcp__switchroom-telegram__reply` writes to the chat the same way it does for a user-typed message. Markdown→HTML conversion, smart chunking, and sanitization are identical. If the agent decides the prompt has nothing meaningful to say, no reply is sent — a silent run is correct behaviour, not an error.
 
 This replaces the pre-v0.8 flow (singleton `switchroom-cron` container running `docker exec agent-<name> claude -p ...`), which created a fresh isolated process per fire with no awareness of the running session.
 

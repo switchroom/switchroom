@@ -8,10 +8,10 @@ import { readFileSync } from 'node:fs'
  * echoed a secret it read from a file/env/not-yet-vaulted value would send
  * the raw bytes to Telegram, log a preview to stderr, and store them in
  * history. This pins that `redactOutboundText()` runs at the ENTRY of each
- * agent-free-text tool (reply / stream_reply / edit_message), before the
+ * agent-free-text tool (reply / edit_message), before the
  * stderr preview, the dedup key, the send, and the history record.
  *
- * Why structural: executeReply/executeStreamReply/executeEditMessage are
+ * Why structural: executeReply/executeEditMessage are
  * not exported (same constraint as gateway-secret-detect.test.ts). The
  * masking itself — that `redact()` covers the Sanctum shape and every
  * provider token — is exercised behaviorally in secret-detect-sanctum.test.ts
@@ -41,15 +41,6 @@ describe('gateway outbound secret-scrub — structural wiring', () => {
     expect(start).toBeGreaterThan(0)
     expect(redactIdx).toBeGreaterThan(start)
     expect(previewIdx).toBeGreaterThan(redactIdx) // mask BEFORE the preview is logged
-  })
-
-  it('stream_reply: scrubs at entry, before the voice scrub + dedup', () => {
-    const start = src.indexOf('async function executeStreamReply(')
-    const redactIdx = src.indexOf(`redactOutboundText(args.text as string, 'stream_reply')`, start)
-    const scrubIdx = src.indexOf(`site: 'stream_reply'`, start)
-    expect(start).toBeGreaterThan(0)
-    expect(redactIdx).toBeGreaterThan(start)
-    expect(scrubIdx).toBeGreaterThan(redactIdx)
   })
 
   it('edit_message: scrubs at entry, before the voice scrub + send', () => {

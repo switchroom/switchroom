@@ -126,22 +126,16 @@ describe('buffer-gate release decoupled from final-answer classification', () =>
     expect(releaseIdx).toBeGreaterThan(gateBlockClose)
   })
 
-  it('executeStreamReply calls releaseTurnBufferGate before its final return', () => {
-    const post =
-      gatewaySrc.split('async function executeStreamReply')[1]
-        ?.split('\nasync function ')[0] ?? ''
-    expect(post).toMatch(/releaseTurnBufferGate\(statusKey\(/)
-  })
-
-  it('the helper is invoked from executeReply / executeStreamReply only — not from new mid-turn paths', () => {
+  it('the helper is invoked from executeReply only — not from new mid-turn paths', () => {
     // Sanity: nothing else should call releaseTurnBufferGate. The
     // helper is narrow on purpose. If future code adds new
     // callsites that aren't reply-finalize, the steer-vs-queue
     // semantics could drift.
     const callMatches = gatewaySrc.match(/releaseTurnBufferGate\(/g) ?? []
-    // Definition + 2 callsites (executeReply, executeStreamReply) = 3.
+    // Definition + 1 callsite (executeReply) = 2. (The retired
+    // stream_reply tool's callsite was removed with executeStreamReply.)
     // If this count grows the test catches it; reviewer must justify
     // any new callsite.
-    expect(callMatches.length).toBe(3)
+    expect(callMatches.length).toBe(2)
   })
 })

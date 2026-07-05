@@ -2,12 +2,11 @@
 
 Switchroom ships an enhanced `switchroom-telegram` MCP plugin that replaces the official marketplace plugin. It is the default — no configuration needed.
 
-## 10 MCP tools
+## 9 MCP tools
 
 | Tool | What it does |
 |------|-------------|
-| `reply` | Send text, photos, or documents. Supports threading, topic routing, file attachments. |
-| `stream_reply` | Edit a single message in place as work progresses (~1/sec throttle). Use for long tasks to avoid chat spam. |
+| `reply` | Send text, photos, or documents — the single final-answer tool. Chunks anything over Telegram's 4096-char limit. Supports threading, topic routing, file attachments. |
 | `react` | Add emoji reactions to messages (Telegram whitelist: 👍 👎 ❤️ 🔥 👀 🎉 etc). |
 | `edit_message` | Update a previously sent message. Edits are silent (no push notification). |
 | `delete_message` | Remove a bot-sent message (48h Telegram API limit). |
@@ -37,19 +36,13 @@ A local SQLite database (`telegram/history.db`) records every message. After a C
 
 History survives process restarts and session resets.
 
-## stream_reply pattern
+## Progress while working
 
-For tasks taking more than ~5 seconds:
-
-```
-1. stream_reply(chat_id, "Reading the file...", done=false)  ← creates message
-2. stream_reply(chat_id, "Reading the file...\nParsing...", done=false)  ← edits in place
-3. stream_reply(chat_id, "Done! Here's the result: ...", done=true)  ← locks
-```
-
-Pass the **full current text** on each call (not a delta). The plugin throttles to ~1/sec.
-
-After `done=true`, send a separate `reply` if you want a push notification to the user's device (edits are silent).
+For long tasks you do not need to narrate progress by editing a message. The
+plugin renders an event-driven progress card (Plan → Run → Done with live tool
+bullets, elapsed time, and status emoji) for free while the turn is in-flight.
+Send the final answer once, with `reply` — it chunks anything over Telegram's
+4096-char limit. For an explicit mid-turn check-in use `progress_update`.
 
 ## Formatting
 

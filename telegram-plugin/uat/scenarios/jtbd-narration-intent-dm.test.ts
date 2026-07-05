@@ -100,7 +100,7 @@ describe("uat-jtbd: narration intent before a silent tool stretch", () => {
     const toolCount = events.filter((e) => e.kind === "tool_use").length;
     expect(toolCount).toBeGreaterThan(1);
     const replyToolFired = events.some(
-      (e) => e.kind === "tool_use" && /^(reply|stream_reply)$/.test(e.toolName),
+      (e) => e.kind === "tool_use" && /^reply$/.test(e.toolName),
     );
     expect(replyToolFired).toBe(false);
   });

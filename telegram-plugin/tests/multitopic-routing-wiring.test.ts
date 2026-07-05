@@ -50,15 +50,9 @@ describe('component 3 — turn-origin reply routing', () => {
     expect(fn).toMatch(/resolveAnswerThread\w*\(/)
   })
 
-  it('executeStreamReply resolves the answer thread via the origin turn too', () => {
-    const fn = gatewaySrc.split('async function executeStreamReply')[1]?.split('\nasync function ')[0] ?? ''
-    expect(fn).toMatch(/findTurnByOriginId\(args\.origin_turn_id/)
-    expect(fn).toMatch(/resolveAnswerThread\w*\(/)
-  })
-
-  it('the reply + stream_reply tool schemas expose origin_turn_id to the model', () => {
+  it('the reply tool schema exposes origin_turn_id to the model', () => {
     const occurrences = bridgeSrc.match(/origin_turn_id: \{ type: 'string'/g) ?? []
-    expect(occurrences.length).toBe(2) // reply + stream_reply
+    expect(occurrences.length).toBe(1) // reply
   })
 
   it('recentTurnsById is a BOUNDED registry (cannot grow unbounded)', () => {
@@ -78,8 +72,8 @@ describe('framework-owned origin recovery (determinism residual, 2026-06-05)', (
     expect(fn).toMatch(/recentTurnIdBySourceMessageId\.delete\(evicted\.sourceMessageId\)/)
   })
 
-  it('both reply paths recover origin from the quoted message_id when the model omits the echo', () => {
-    for (const name of ['executeReply', 'executeStreamReply']) {
+  it('the reply path recovers origin from the quoted message_id when the model omits the echo', () => {
+    for (const name of ['executeReply']) {
       const fn = gatewaySrc.split(new RegExp(`async function ${name}`))[1]?.split('\nasync function ')[0] ?? ''
       // Echo first (authoritative), quoted message_id as the framework fallback.
       expect(fn).toMatch(/const echoedTurn = findTurnByOriginId\(args\.origin_turn_id/)
@@ -144,7 +138,7 @@ describe('component 5 — queued-status UX (delete-on-answer)', () => {
 
   it('Hook C reaps the placeholder on the answer (executeReply / stream)', () => {
     const reapCalls = gatewaySrc.match(/reapQueuedStatus\(/g) ?? []
-    // definition + executeReply + executeStreamReply + purge cleanup (2 branches)
+    // definition + executeReply + purge cleanup (2 branches)
     expect(reapCalls.length).toBeGreaterThanOrEqual(4)
   })
 

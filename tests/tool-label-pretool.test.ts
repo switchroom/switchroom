@@ -228,7 +228,7 @@ describe("tool-label-pretool.mjs", () => {
   });
 
   it("MCP allowlist (telegram + hindsight)", () => {
-    // NOTE (#2516): the switchroom-telegram SURFACE tools (reply, stream_reply,
+    // NOTE (#2516): the switchroom-telegram SURFACE tools (reply,
     // react, edit_message) are now suppressed key-agnostically — they ARE the
     // conversation, so they don't get an activity-feed label. They're asserted
     // in the "genuinely-suppressed tools" test below. Only the read-only /
@@ -282,12 +282,11 @@ describe("tool-label-pretool.mjs", () => {
     // MCP servers (perplexity, webkite, …) now get a generic label so research
     // turns surface in the live activity feed. Only the surface/control tools
     // below stay silent.
-    // NOTE (#2516): the switchroom-telegram surface tools (reply / stream_reply /
+    // NOTE (#2516): the switchroom-telegram surface tools (reply /
     // react / edit_message) are the conversation itself and are suppressed
     // key-agnostically — they emit no sidecar label.
     const cases: Array<[string, Record<string, unknown>]> = [
       ["mcp__switchroom-telegram__reply", { text: "hi" }],
-      ["mcp__switchroom-telegram__stream_reply", { text: "hi" }],
       ["mcp__switchroom-telegram__react", { emoji: "👍" }],
       ["mcp__switchroom-telegram__edit_message", { text: "hi" }],
       ["mcp__switchroom-telegram__send_typing", {}],

@@ -263,20 +263,21 @@ describe('claimOrDowngradePing — PR-4c over-ping decision moves into the faça
     expect(blockCode).not.toMatch(/\bawait\b/)
   })
 
-  it('claimOrDowngradePing appears EXACTLY ONCE in the gateway, inside the executeReply window (stream path untouched)', () => {
-    // The over-ping net exists ONLY in executeReply. executeStreamReply has no
-    // decideOverPing / firstPingAt / wasOverPingSuppressed and never calls
-    // claimOrDowngradePing — PR-4c does not touch the stream path.
+  it('claimOrDowngradePing appears EXACTLY ONCE in the gateway, inside the executeReply window', () => {
+    // The over-ping net exists ONLY in executeReply. The retired stream_reply
+    // tool (executeStreamReply) had no decideOverPing / firstPingAt /
+    // wasOverPingSuppressed and never called claimOrDowngradePing.
     const calls = [...gatewaySrc.matchAll(/\.claimOrDowngradePing\(/g)]
     expect(calls).toHaveLength(1)
     const callIdx = gatewaySrc.indexOf('.claimOrDowngradePing(')
     const execReplyIdx = gatewaySrc.indexOf('async function executeReply(')
-    const execStreamIdx = gatewaySrc.indexOf('async function executeStreamReply(')
+    // Upper bound: the next top-level function after executeReply.
+    const nextFnIdx = gatewaySrc.indexOf('\nasync function ', execReplyIdx + 1)
     expect(execReplyIdx).toBeGreaterThan(-1)
-    expect(execStreamIdx).toBeGreaterThan(execReplyIdx)
-    // The single call is inside executeReply (before executeStreamReply starts).
+    expect(nextFnIdx).toBeGreaterThan(execReplyIdx)
+    // The single call is inside executeReply.
     expect(callIdx).toBeGreaterThan(execReplyIdx)
-    expect(callIdx).toBeLessThan(execStreamIdx)
+    expect(callIdx).toBeLessThan(nextFnIdx)
   })
 })
 
@@ -370,19 +371,12 @@ describe('the 7 drain sites route through the façade with producers preserved v
   })
 })
 
-describe('the 2 lever-2 finalize blocks route through the façade', () => {
+describe('the lever-2 finalize block routes through the façade', () => {
   it('executeReply finalize routes via markSubstantiveFinalDelivered + finalizeCard (latch + clear preserved)', () => {
     const after = gatewaySrc.split('async function executeReply(')[1] ?? ''
-    const body = after.split('async function executeStreamReply(')[0] ?? after
+    const body = after.split('\nasync function ')[0]?.split('\nfunction ')[0] ?? after
     expect(body).toMatch(/markSubstantiveFinalDelivered\(\(\) => \{\s*\n\s*finalizeTurn\.finalAnswerEverDelivered = true/)
     expect(body).toMatch(/finalizeCard\(\(\) => \{\s*\n\s*clearActivitySummary\(finalizeTurn\)/)
-  })
-
-  it('executeStreamReply finalize routes via markSubstantiveFinalDelivered + finalizeCard (latch + clear preserved)', () => {
-    const after = gatewaySrc.split('async function executeStreamReply(')[1] ?? ''
-    const body = after.split('\nasync function ')[0]?.split('\nfunction ')[0] ?? after
-    expect(body).toMatch(/markSubstantiveFinalDelivered\(\(\) => \{\s*\n\s*turn\.finalAnswerEverDelivered = true/)
-    expect(body).toMatch(/finalizeCard\(\(\) => \{\s*\n\s*clearActivitySummary\(turn\)/)
   })
 })
 

@@ -801,7 +801,6 @@ describe("scaffoldAgent", () => {
     const expectedTools = [
       "mcp__switchroom-telegram", // bare server name
       "mcp__switchroom-telegram__reply",
-      "mcp__switchroom-telegram__stream_reply",
       "mcp__switchroom-telegram__react",
       "mcp__switchroom-telegram__edit_message",
       "mcp__switchroom-telegram__send_typing",
