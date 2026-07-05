@@ -37,14 +37,22 @@ DEFAULTS = {
     # scores, so this is the switchroom-side quality filter — see #475.
     "recallMinOverlap": 0.0,
     "recallTypes": ["world", "experience"],
-    # Switchroom #2848 Stage B — deterministic directive-capture nudge.
+    # Switchroom #2848 Stage B/C — deterministic directive capture.
     # When on (switchroom default; pinned true in the copied plugin
-    # settings.json by applyHindsightSettingsOverrides), recall.py regex-
-    # detects correction / standing-rule-shaped inbound and appends a terse
-    # advisory to the UserPromptSubmit additionalContext telling the model
-    # to persist the rule with create_directive if it IS durable. Pure
-    # detection — no model callsite. Operators opt out per-agent via
-    # memory.directive_capture_nudge=false → HINDSIGHT_DIRECTIVE_CAPTURE_NUDGE.
+    # settings.json by applyHindsightSettingsOverrides), TWO deterministic
+    # hooks share this knob:
+    #   * Stage B (recall.py, UserPromptSubmit): regex-detects correction /
+    #     standing-rule-shaped inbound and appends a terse advisory to the
+    #     turn's additionalContext telling the model to persist the rule with
+    #     create_directive if it IS durable.
+    #   * Stage C (directive_verify.py, Stop): after the turn, re-checks the
+    #     human turn against a HIGH-PRECISION durable-rule regex and, if the
+    #     model recorded no create_directive call, blocks the stop ONCE to
+    #     re-prompt capture (closes the "model ignored the nudge" gap).
+    # Both are pure detection — no model callsite, no silent hook-side write;
+    # the model authors the directive in-session (chat-legible). Operators opt
+    # out per-agent via memory.directive_capture_nudge=false →
+    # HINDSIGHT_DIRECTIVE_CAPTURE_NUDGE (disables BOTH hooks).
     "directiveCaptureNudge": True,
     "recallContextTurns": 1,
     "recallMaxQueryChars": 800,
