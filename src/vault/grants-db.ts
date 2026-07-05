@@ -23,18 +23,79 @@ export const DEFAULT_GRANTS_DB_PATH = path.join(
 );
 
 /**
- * Open (or create) the grants database at the given path.
- *
- * - Creates parent directory if needed.
- * - Sets file mode 0600 after creation.
- * - Runs schema migration.
- *
- * @param dbPath Absolute path (defaults to ~/.switchroom/vault-grants.db).
+ * WAL sidecar suffixes that must be quarantined alongside the main DB file.
+ * A stale/corrupt -wal or -shm can re-corrupt a freshly recreated DB, so they
+ * move aside together.
  */
-export function openGrantsDb(dbPath = DEFAULT_GRANTS_DB_PATH): Database {
-  const dir = path.dirname(dbPath);
-  fs.mkdirSync(dir, { recursive: true });
+const WAL_SIDECAR_SUFFIXES = ["-wal", "-shm"];
 
+/**
+ * Decide whether an error thrown while opening/migrating the grants DB
+ * indicates genuine on-disk corruption (as opposed to a transient/operational
+ * failure such as EACCES, ENOSPC, or a bug in our own migration SQL).
+ *
+ * We are deliberately conservative: only SQLite's corruption / not-a-database
+ * error classes trigger the destructive quarantine-and-recreate path. Anything
+ * else is re-thrown so we never silently wipe legitimate grants on, e.g., a
+ * permissions problem.
+ */
+export function isGrantsDbCorruption(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+
+  // bun:sqlite surfaces SQLite result codes on `.code` (e.g. "SQLITE_CORRUPT",
+  // "SQLITE_NOTADB") and a human-readable message. Match on both so we are
+  // robust across Bun versions that populate one but not the other.
+  const code = String(
+    (err as { code?: unknown }).code ?? "",
+  ).toUpperCase();
+  if (
+    code === "SQLITE_CORRUPT" ||
+    code === "SQLITE_NOTADB" ||
+    code.startsWith("SQLITE_CORRUPT_")
+  ) {
+    return true;
+  }
+
+  const message = String(
+    (err as { message?: unknown }).message ?? "",
+  ).toLowerCase();
+  return (
+    message.includes("database disk image is malformed") ||
+    message.includes("file is not a database") ||
+    message.includes("file is encrypted or is not a database")
+  );
+}
+
+/**
+ * Move a corrupt grants DB (and any WAL sidecars) aside to a timestamped
+ * `.corrupt-<ISO>` copy for forensics, then return the quarantine path of the
+ * main file. Never deletes — availability wins over the corrupt bytes, but the
+ * bytes are preserved so the outage can be investigated.
+ */
+function quarantineGrantsDb(dbPath: string): string {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const quarantinePath = `${dbPath}.corrupt-${stamp}`;
+  fs.renameSync(dbPath, quarantinePath);
+
+  for (const suffix of WAL_SIDECAR_SUFFIXES) {
+    const sidecar = `${dbPath}${suffix}`;
+    if (fs.existsSync(sidecar)) {
+      try {
+        fs.renameSync(sidecar, `${quarantinePath}${suffix}`);
+      } catch {
+        // A leftover sidecar is non-fatal for recreation; best-effort move.
+      }
+    }
+  }
+
+  return quarantinePath;
+}
+
+/**
+ * Open the grants DB, set perms, enable pragmas, and run the idempotent schema
+ * migrations. Throws on any failure (caller decides whether to quarantine).
+ */
+function openAndMigrate(dbPath: string): Database {
   const db = new Database(dbPath, { create: true });
 
   // Set mode 0600 (user-only). chmodSync on the path — Database opens the
@@ -61,4 +122,44 @@ export function openGrantsDb(dbPath = DEFAULT_GRANTS_DB_PATH): Database {
   migrateApprovalSchema(db);
 
   return db;
+}
+
+/**
+ * Open (or create) the grants database at the given path.
+ *
+ * - Creates parent directory if needed.
+ * - Sets file mode 0600 after creation.
+ * - Runs schema migration.
+ *
+ * Durability: a corrupt/truncated grants DB is a regenerable file (grants are
+ * re-derivable via the approval flow), so rather than crash-looping the broker
+ * — which takes down secret access across the whole fleet — a genuinely
+ * corrupt DB is quarantined to a timestamped `.corrupt-<ISO>` copy and a fresh
+ * empty DB is recreated in its place. Only SQLite corruption error classes
+ * trigger this; operational errors (EACCES, ENOSPC, …) are re-thrown so we
+ * never wipe legitimate grants for a transient problem.
+ *
+ * @param dbPath Absolute path (defaults to ~/.switchroom/vault-grants.db).
+ */
+export function openGrantsDb(dbPath = DEFAULT_GRANTS_DB_PATH): Database {
+  const dir = path.dirname(dbPath);
+  fs.mkdirSync(dir, { recursive: true });
+
+  try {
+    return openAndMigrate(dbPath);
+  } catch (err) {
+    if (!isGrantsDbCorruption(err)) throw err;
+
+    const quarantinePath = quarantineGrantsDb(dbPath);
+    console.error(
+      `[vault-broker] grants DB at ${dbPath} is corrupt (${
+        (err as { message?: string }).message ?? err
+      }); quarantined to ${quarantinePath} and recreating an empty grants DB. ` +
+        "Existing grants must be re-approved via the vault approval flow.",
+    );
+
+    // Recreate from scratch. If this second attempt also fails it is not a
+    // corruption problem we can recover from — let it throw.
+    return openAndMigrate(dbPath);
+  }
 }
