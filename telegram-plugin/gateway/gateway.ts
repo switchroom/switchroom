@@ -8317,11 +8317,45 @@ const ipcServer: IpcServer = createIpcServer({
     // frequent cron, or a crashed cron session) falls back to the MAIN agent
     // bridge so the fire lands now; it routes cheap again once the session is
     // up. See deliverInjectWithFallback.
+    // #2793 part B — durable cron boot-replay. A fire the scheduler is
+    // REPLAYING across a restart carries `meta.replay_fire_ms`; route it
+    // through the durable inbound spool so accept and consume are ledgered
+    // separately (mirrors the real-inbound path). The scheduler's own
+    // scheduler.jsonl records the fire at socket-accept, which stops
+    // findMissedFires from re-firing it — but a socket accept is NOT proof
+    // the session consumed it. Spooling here means: if the session isn't up
+    // (accepted-but-not-consumed), the entry stays un-acked and the spool's
+    // boot-replay re-delivers it on the next gateway boot (closes the
+    // silent-loss window); and the stable `spoolId` (keyed on the replayed
+    // fire) dedups a re-replay so it lands at most once (closes the
+    // double-fire window). Live cron ticks never set replay_fire_ms, so they
+    // keep the fire-and-forget path unchanged. STATIC mode has no spool —
+    // fall through to the legacy path.
+    const isDurableReplay =
+      inboundSpool != null &&
+      typeof msg.inbound.meta?.replay_fire_ms === 'string' &&
+      msg.inbound.meta.replay_fire_ms.length > 0
+    if (isDurableReplay && inboundSpool != null) {
+      // Durable ACCEPT: put before delivery so a crash between accept and
+      // consume leaves the entry recoverable (boot-replay re-delivers).
+      // Idempotent by stable spoolId — a re-replay of the same missed fire
+      // is a no-op while the prior entry is still un-acked.
+      inboundSpool.put(msg.agentName, msg.inbound as unknown as InboundMessage)
+    }
     const { target, delivered, fellBackToMain } = deliverInjectWithFallback(
       msg.agentName,
       msg.inbound.meta,
       (t) => ipcServer.sendToAgent(t, msg.inbound),
     )
+    if (isDurableReplay && inboundSpool != null && delivered) {
+      // Durable CONSUME: the fire reached a live bridge, so tombstone the
+      // spool entry (same "delivered to a live registered bridge" ack
+      // semantics the inbound spool uses — see its v1 scope note). On a
+      // miss we leave it un-acked: the pendingInboundBuffer.push below
+      // buffers it for the reconnect drain, and the durable spool copy is
+      // re-delivered on the next boot if this process dies first.
+      inboundSpool.ack(msg.inbound as unknown as InboundMessage)
+    }
     if (fellBackToMain) {
       process.stderr.write(
         `telegram gateway: cron fire fell back to main session (no cron bridge) agent=${msg.agentName} prompt_key=${promptKey}\n`,

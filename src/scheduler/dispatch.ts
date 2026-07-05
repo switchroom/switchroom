@@ -236,6 +236,17 @@ export interface InboundDispatchOptions {
   session?: "cron" | "main";
   /** Tier-1 cron-session model; emitted as `meta.model` for the cron bridge. */
   model?: string;
+  /**
+   * Boot-replay marker (#2793 part B). Set to the minute-aligned epoch ms
+   * of the missed fire being replayed. Emitted as `meta.replay_fire_ms` so
+   * the gateway routes this inject through the durable inbound spool (accept
+   * and consume ledgered separately) instead of the fire-and-forget socket
+   * path, and so `spoolId` derives a STABLE dedup key from the replayed fire
+   * — a re-replay of the same missed fire across a gateway restart collapses
+   * to one delivery. Unset for live cron ticks, which keep the fire-and-forget
+   * path and their per-fire identity.
+   */
+  replayFireMs?: number;
 }
 
 export interface InboundDispatchResult {
@@ -286,6 +297,10 @@ export function dispatchAsInbound(
       // absent → 'main'). meta is Record<string,string> on the wire.
       ...(options.session === "cron" ? { session: "cron" } : {}),
       ...(options.session === "cron" && options.model ? { model: options.model } : {}),
+      // Boot-replay durability marker (#2793 part B) — see InboundDispatchOptions.
+      ...(options.replayFireMs !== undefined
+        ? { replay_fire_ms: String(options.replayFireMs) }
+        : {}),
     },
   };
   const delivered = dispatcher.sendToAgent(entry.agent, message);

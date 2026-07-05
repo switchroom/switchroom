@@ -777,9 +777,15 @@ export async function main(): Promise<void> {
             continue;
           }
           const threadId = resolveEntryThreadId(m.entry, channel);
+          // #2793 part B: stamp the minute-aligned fire this replay is for so
+          // the gateway routes it through the durable inbound spool (accept vs
+          // consume ledgered separately) and `spoolId` derives a stable dedup
+          // key. Closes the boot-replay silent-loss window (accepted but never
+          // consumed → the spool re-delivers on the next gateway boot) and the
+          // double-fire window (re-replay collapses on the stable id).
           const result = dispatchAsInbound(
             m.entry,
-            { chatId: channel.chatId, threadId },
+            { chatId: channel.chatId, threadId, replayFireMs: m.expectedFireMs },
             dispatcher,
           );
           sink.recordFire({
