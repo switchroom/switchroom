@@ -62,9 +62,16 @@ permissions:
   contents: read
   packages: write
 
+# workflow_dispatch runs get their own concurrency group (keyed by
+# run id) so a busy merge train on main can't cancel a manually
+# requested full build — dispatch is the recovery lever for exactly
+# the case where push runs keep superseding each other before a
+# path-gated image (e.g. hindsight) gets rebuilt (#1336, and observed
+# live on 2026-07-05: three successive merges cancelled both the push
+# run carrying a hindsight pin bump and the recovery dispatch).
 concurrency:
-  group: docker-images-${{ github.ref }}
-  cancel-in-progress: true
+  group: docker-images-${{ github.event_name == 'workflow_dispatch' && format('dispatch-{0}', github.run_id) || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 env:
   REGISTRY: ghcr.io
