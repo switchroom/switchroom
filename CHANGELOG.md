@@ -1947,8 +1947,7 @@ deferred to the next tick instead of shipping unverified numbers. The
 decision FSM is proven by total enumeration (144 cells + a terminal-state
 invariant). Kill-switches: `SWITCHROOM_QUOTA_WATCH_FLEET_DEDUP=0`,
 `SWITCHROOM_QUOTA_WATCH_MAX_STALE_MS=0`,
-`SWITCHROOM_QUOTA_WATCH_LATE_RECOVERY_MS=0`,
-`SWITCHROOM_QUOTA_WATCH_SEND_ON_PROBE_FAIL=1`.
+`SWITCHROOM_QUOTA_WATCH_LATE_RECOVERY_MS=0`.
 
 ### PR B — fallback failure notice + honest quota columns (#2255)
 

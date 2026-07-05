@@ -97,9 +97,10 @@ export function emptyAccountState(): QuotaWatchAccountState {
  *   SWITCHROOM_QUOTA_WATCH_FLEET_DEDUP       "0" disables the broker claim
  *                                            (every agent sends, pre-incident
  *                                            behaviour)
- *   SWITCHROOM_QUOTA_WATCH_SEND_ON_PROBE_FAIL "1" restores sending from
- *                                            cached data when the pre-send
- *                                            validation probe fails
+ *
+ * When the pre-send validation probe fails, the alert is unconditionally
+ * suppressed (a quota notification must never carry numbers we could not
+ * verify live); the transition re-evaluates on the next poll tick.
  */
 export interface QuotaWatchTuning {
   /** Cached snapshots older than this are treated as unknown (no opinion). 0 = off. */
@@ -108,8 +109,6 @@ export interface QuotaWatchTuning {
   lateRecoveryMs: number;
   /** Route sends through the broker's claim-notification dedup. */
   fleetDedup: boolean;
-  /** Legacy: send from cached data when the validation probe fails. */
-  sendOnProbeFail: boolean;
 }
 
 export const DEFAULT_QUOTA_WATCH_MAX_STALE_MS = 60 * 60_000;
@@ -133,7 +132,6 @@ export function resolveQuotaWatchTuning(
     maxStaleMs: num(env.SWITCHROOM_QUOTA_WATCH_MAX_STALE_MS, DEFAULT_QUOTA_WATCH_MAX_STALE_MS),
     lateRecoveryMs: num(env.SWITCHROOM_QUOTA_WATCH_LATE_RECOVERY_MS, DEFAULT_QUOTA_WATCH_LATE_RECOVERY_MS),
     fleetDedup: env.SWITCHROOM_QUOTA_WATCH_FLEET_DEDUP !== "0",
-    sendOnProbeFail: env.SWITCHROOM_QUOTA_WATCH_SEND_ON_PROBE_FAIL === "1",
   };
 }
 

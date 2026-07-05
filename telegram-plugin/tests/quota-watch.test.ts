@@ -696,12 +696,11 @@ import {
 } from "../quota-watch.js";
 
 describe("resolveQuotaWatchTuning", () => {
-  it("defaults: stale gate 60min, late-recovery 6h, dedup on, probe-fail send off", () => {
+  it("defaults: stale gate 60min, late-recovery 6h, dedup on", () => {
     const t = resolveQuotaWatchTuning({});
     expect(t.maxStaleMs).toBe(DEFAULT_QUOTA_WATCH_MAX_STALE_MS);
     expect(t.lateRecoveryMs).toBe(DEFAULT_QUOTA_WATCH_LATE_RECOVERY_MS);
     expect(t.fleetDedup).toBe(true);
-    expect(t.sendOnProbeFail).toBe(false);
   });
 
   it("each knob is individually kill-switchable", () => {
@@ -709,12 +708,10 @@ describe("resolveQuotaWatchTuning", () => {
       SWITCHROOM_QUOTA_WATCH_MAX_STALE_MS: "0",
       SWITCHROOM_QUOTA_WATCH_LATE_RECOVERY_MS: "0",
       SWITCHROOM_QUOTA_WATCH_FLEET_DEDUP: "0",
-      SWITCHROOM_QUOTA_WATCH_SEND_ON_PROBE_FAIL: "1",
     });
     expect(t.maxStaleMs).toBe(0);
     expect(t.lateRecoveryMs).toBe(0);
     expect(t.fleetDedup).toBe(false);
-    expect(t.sendOnProbeFail).toBe(true);
   });
 
   it("garbage numeric values fall back to defaults", () => {
