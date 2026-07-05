@@ -1,0 +1,110 @@
+# Shared dorny/paths-filter definitions (external filters file).
+#
+# Consumed via `filters: .github/path-filters.yml` by:
+#   - ci-lint.yml          → key `lint`
+#   - ci-tests-core.yml    → key `core`
+#   - ci-tests-plugin.yml  → key `plugin`
+#   - docker-images.yml    → keys `images`, `hindsight`, `voice`
+#
+# Why this file exists: the sec WS9-F1 (#1402) security-load-bearing
+# path list was copy-pasted across ci-lint / ci-tests-core /
+# ci-tests-plugin and had already started to be a drift hazard — a
+# path added to one workflow's copy but not the others silently
+# re-opens the skip→pass hole WS9-F1 closed. YAML anchors in a single
+# shared file keep the list defined once. dorny/paths-filter flattens
+# nested arrays, so `- *ws9f1-security` inside a filter list works.
+#
+# WS9-F1 rationale (see ci-tests-core.yml pre-#-this-PR history):
+# profiles/ renders every agent's start.sh + the WS8 tool-safety
+# hooks; bin/*-hook.sh + skills/ are baked into the agent image;
+# docker/ + workflows are the supply-chain root. Without these a
+# profiles/bin/skills/docker/.github-only PR skipped→passed required
+# gates with no tests.
+
+ws9f1-security: &ws9f1-security
+  - 'profiles/**'
+  - 'bin/**'
+  - 'skills/**'
+  - 'docker/**'
+  - '.github/workflows/**'
+  # This file gates what runs — a change to it must itself run everything.
+  - '.github/path-filters.yml'
+
+lint:
+  - '**/*.ts'
+  - '**/*.tsx'
+  - 'tsconfig.json'
+  - 'package.json'
+  - 'bun.lock'
+  - 'telegram-plugin/package.json'
+  - 'telegram-plugin/bun.lock'
+  - 'scripts/check-*.mjs'
+  - 'scripts/check-bot-api-wrapping.sh'
+  - '.github/actions/setup-switchroom/**'
+  - '.github/workflows/ci-lint.yml'
+  - *ws9f1-security
+
+core:
+  - 'src/**'
+  - 'tests/**'
+  - 'telegram-plugin/**/*.ts'
+  - 'scripts/build.mjs'
+  - 'vitest.config.ts'
+  - 'tsconfig.json'
+  - 'package.json'
+  - 'bun.lock'
+  - 'telegram-plugin/package.json'
+  - 'telegram-plugin/bun.lock'
+  - '.github/actions/setup-switchroom/**'
+  - '.github/workflows/ci-tests-core.yml'
+  - *ws9f1-security
+
+plugin:
+  - 'telegram-plugin/**'
+  - 'package.json'
+  - 'bun.lock'
+  - 'telegram-plugin/package.json'
+  - 'telegram-plugin/bun.lock'
+  - '.github/actions/setup-switchroom/**'
+  - '.github/workflows/ci-tests-plugin.yml'
+  - *ws9f1-security
+
+# docker-images.yml PR gate. Mirrors docker-e2e.yml's image-input list
+# (the src/** subtrees whose bundles are baked into images) plus the
+# image build inputs themselves. Keep in sync with docker-e2e.yml's
+# cache key + filter when image inputs change.
+images:
+  - 'docker/**'
+  - 'src/vault/**'
+  - 'src/cli/apply.ts'
+  - 'src/agents/compose.ts'
+  - 'src/agent-scheduler/**'
+  - 'src/auth/broker/**'
+  - 'src/host-control/**'
+  - 'telegram-plugin/**'
+  - 'bin/**'
+  - 'profiles/**'
+  - 'vendor/hindsight-memory/**'
+  - 'package.json'
+  - 'bun.lock'
+  - 'scripts/build.mjs'
+  - '.github/workflows/docker-images.yml'
+  - '.github/path-filters.yml'
+
+# hindsight extends upstream vectorize-io/hindsight (not switchroom-base)
+# and rarely changes — path-gated even on main pushes.
+hindsight:
+  - 'docker/Dockerfile.hindsight'
+  - 'docker/hindsight-*'
+  - 'vendor/hindsight-memory/**'
+  - '.github/workflows/docker-images.yml'
+  - '.github/path-filters.yml'
+
+# voice FROMs nvidia/cuda (not switchroom-base), bakes no dist — the
+# CUDA layers make it the heaviest build, and it almost never changes.
+# Path-gated even on main pushes.
+voice:
+  - 'docker/Dockerfile.voice'
+  - 'docker/voice-sidecar/**'
+  - '.github/workflows/docker-images.yml'
+  - '.github/path-filters.yml'
