@@ -26,11 +26,13 @@
  *       - `fresh` — a brand-new ask; post a card as usual.
  *
  *  3. The boot-sweep becomes a grace-period strip. At boot, instead of
- *     stripping persisted cards immediately, wait ~90 s: a live claude
- *     session's bridge re-sends its outstanding requests within that window
- *     (re-claiming them). Only entries NOT re-claimed by the deadline — a
- *     genuinely dead session (container recreate → new bridge, empty ledger,
- *     never re-sends) — get today's "Gateway restarted" strip.
+ *     stripping persisted cards immediately, wait ~90 s, then strip only the
+ *     cards whose request_id is NOT currently live in `pendingPermissions`.
+ *     A live entry means either a bridge re-send re-armed the card, OR a fresh
+ *     approval was posted during the window — both are legitimately-pending
+ *     asks. Only a genuinely dead session's card (container recreate → new
+ *     bridge, empty ledger, never re-sends → no live entry) gets today's
+ *     "Gateway restarted" strip.
  *
  * NEVER auto-allows anything: re-arm restores only the QUESTION, never a
  * verdict (no-self-escalation invariant). No model callsite is involved —
@@ -85,15 +87,24 @@ export function classifyPermissionRequest(opts: {
 
 /**
  * Which persisted cards should the boot-sweep strip at the grace deadline?
- * Everything that was NOT re-claimed by a bridge re-send in the meantime.
- * A re-claimed request_id belongs to a still-live session whose card has
- * already been re-armed — stripping it would kill a legitimately pending ask.
+ * Everything whose request_id is NOT currently live.
+ *
+ * `liveRequestIds` is the set of request_ids present in `pendingPermissions`
+ * at the deadline — which covers BOTH:
+ *   - re-armed cards (a bridge re-send restored the pending entry), and
+ *   - fresh cards born during the grace window (a new approval posted after
+ *     boot sets a pending entry the normal way).
+ * Both are legitimately-pending asks a claude session is still suspended on;
+ * stripping either would re-wedge the turn. Only a genuinely dead session's
+ * card — persisted but with no live pending entry (the bridge never
+ * reconnected to re-arm it) — is stripped. Keying on liveness rather than a
+ * "was re-claimed" flag is what makes fresh-during-grace cards safe.
  */
 export function computeBootSweepStripTargets(
   stale: readonly PersistedPermCard[],
-  reclaimed: ReadonlySet<string>,
+  liveRequestIds: ReadonlySet<string>,
 ): PersistedPermCard[] {
-  return stale.filter(card => !reclaimed.has(card.requestId))
+  return stale.filter(card => !liveRequestIds.has(card.requestId))
 }
 
 /** Distinct request_ids in a persisted-card list (for per-request store removal). */

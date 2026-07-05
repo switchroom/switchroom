@@ -4566,11 +4566,6 @@ const STATUS_QUERY_RE = /^\s*status\??\s*$/i
 // ─── Permission handling ──────────────────────────────────────────────────
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string; startedAt: number; card_text: string; cards: { chatId: string; messageId: number; threadId?: number | null }[] }>()
-// #2861: request_ids re-claimed by a bridge re-send since boot — either
-// deduped (already live) or re-armed from the persisted card store. The
-// grace-period boot-sweep consults this set: a re-claimed id belongs to a
-// live session and MUST NOT be stripped. Populated in onPermissionRequest.
-const rearmReclaimedRequestIds = new Set<string>()
 // PERMISSION_TTL_MS / ttlForTool / the timed-out card builder now live in
 // ./permission-timeout.ts (pure + unit-testable). hostd gated verbs get a
 // 30-min window; everything else keeps the 10-min default.
@@ -7769,7 +7764,6 @@ const ipcServer: IpcServer = createIpcServer({
         persistedCount: persisted.length,
       })
       if (disposition === 'duplicate') {
-        rearmReclaimedRequestIds.add(requestId)
         process.stderr.write(
           `telegram gateway: permission_request duplicate re-send ignored ` +
           `request=${requestId} (already pending)\n`,
@@ -7777,7 +7771,8 @@ const ipcServer: IpcServer = createIpcServer({
         return
       }
       if (disposition === 'rearm') {
-        rearmReclaimedRequestIds.add(requestId)
+        // Re-arm restores the pending entry; the grace-period boot-sweep
+        // preserves anything live in pendingPermissions, so it won't strip it.
         rearmPermissionFromStore(msg, persisted)
         return
       }
@@ -25129,16 +25124,22 @@ void (async () => {
                 // Reload — some entries may have been resolved (tap/TTL) during
                 // the grace window, which removes them from the store.
                 const remaining = permCardStore.loadAll()
-                const toStrip = computeBootSweepStripTargets(remaining, rearmReclaimedRequestIds)
+                // Preserve anything currently LIVE in pendingPermissions: that
+                // covers both re-armed cards (a bridge re-send restored them)
+                // AND fresh cards born during the grace window (a new approval
+                // posted after boot). Only cards with no live pending entry —
+                // a genuinely dead session that never reconnected — are stripped.
+                const liveRequestIds = new Set(pendingPermissions.keys())
+                const toStrip = computeBootSweepStripTargets(remaining, liveRequestIds)
                 if (toStrip.length === 0) {
                   process.stderr.write(
-                    `telegram gateway: boot-sweep: all pending permission cards re-claimed by bridge re-arm — nothing to strip\n`,
+                    `telegram gateway: boot-sweep: all pending permission cards re-armed or still live — nothing to strip\n`,
                   )
                   return
                 }
                 process.stderr.write(
-                  `telegram gateway: boot-sweep: stripping ${toStrip.length} un-re-claimed permission card(s) ` +
-                  `after ${graceMs}ms grace (of ${remaining.length} still persisted)\n`,
+                  `telegram gateway: boot-sweep: stripping ${toStrip.length} dead-session permission card(s) ` +
+                  `after ${graceMs}ms grace (of ${remaining.length} still persisted, ${liveRequestIds.size} live)\n`,
                 )
                 for (const card of toStrip) await stripStalePermissionCard(card)
                 // Remove ONLY the stripped request_ids — re-armed entries stay

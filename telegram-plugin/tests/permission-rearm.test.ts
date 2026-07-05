@@ -52,26 +52,37 @@ describe('classifyPermissionRequest', () => {
 })
 
 describe('computeBootSweepStripTargets', () => {
-  it('strips only entries NOT re-claimed by a bridge re-send', () => {
+  it('strips only entries whose request_id is NOT currently live', () => {
     const stale = [card('aaaaa', 10), card('bbbbb', 11), card('ccccc', 12)]
-    const reclaimed = new Set(['bbbbb'])
-    const targets = computeBootSweepStripTargets(stale, reclaimed)
+    const live = new Set(['bbbbb']) // bbbbb re-armed / still pending
+    const targets = computeBootSweepStripTargets(stale, live)
     expect(targets.map(t => t.requestId)).toEqual(['aaaaa', 'ccccc'])
   })
 
-  it('a re-claimed entry survives the deadline (empty strip)', () => {
+  it('a re-armed (live) entry survives the deadline (empty strip)', () => {
     const stale = [card('aaaaa', 10)]
-    const reclaimed = new Set(['aaaaa'])
-    expect(computeBootSweepStripTargets(stale, reclaimed)).toEqual([])
+    const live = new Set(['aaaaa'])
+    expect(computeBootSweepStripTargets(stale, live)).toEqual([])
   })
 
-  it('an un-re-claimed entry is stripped at the deadline', () => {
+  it('a dead-session entry (no live pending) is stripped at the deadline', () => {
     const stale = [card('aaaaa', 10)]
-    const reclaimed = new Set<string>()
-    expect(computeBootSweepStripTargets(stale, reclaimed).map(t => t.requestId)).toEqual(['aaaaa'])
+    const live = new Set<string>()
+    expect(computeBootSweepStripTargets(stale, live).map(t => t.requestId)).toEqual(['aaaaa'])
   })
 
-  it('keeps ALL fan-out messages for an un-re-claimed request', () => {
+  it('a FRESH card born during the grace window (live but not in the boot set) survives', () => {
+    // Regression for the reviewer-caught blocker: a new approval posted after
+    // boot writes its own persisted row, so it appears in `remaining` at the
+    // deadline. It's live in pendingPermissions, so it must NOT be stripped —
+    // otherwise a legitimately-suspended turn gets re-wedged.
+    const remaining = [card('dead0', 10), card('fresh', 20)]
+    const live = new Set(['fresh']) // 'fresh' posted during grace, still pending
+    const targets = computeBootSweepStripTargets(remaining, live)
+    expect(targets.map(t => t.requestId)).toEqual(['dead0'])
+  })
+
+  it('keeps ALL fan-out messages for a dead-session request', () => {
     // Same request_id, two operator surfaces → two persisted rows.
     const stale = [card('aaaaa', 10), card('aaaaa', 20)]
     const targets = computeBootSweepStripTargets(stale, new Set())

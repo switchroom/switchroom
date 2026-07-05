@@ -96,10 +96,6 @@ describe('gateway re-arm wiring', () => {
     expect(GATEWAY).toMatch(/computeBootSweepStripTargets/)
   })
 
-  it('tracks re-claimed request_ids for the grace-period sweep', () => {
-    expect(GATEWAY).toMatch(/const rearmReclaimedRequestIds = new Set<string>\(\)/)
-  })
-
   it('onPermissionRequest dedupes / re-arms before posting a card', () => {
     const fn = slice(GATEWAY, 'onPermissionRequest(_client: IpcClient, msg: PermissionRequestForward)', 5200)
     expect(fn).toMatch(/isPermissionRearmEnabled\(\)/)
@@ -108,7 +104,6 @@ describe('gateway re-arm wiring', () => {
     expect(fn).toMatch(/disposition === 'duplicate'/)
     expect(fn).toMatch(/disposition === 'rearm'/)
     expect(fn).toMatch(/rearmPermissionFromStore\(/)
-    expect(fn).toMatch(/rearmReclaimedRequestIds\.add\(requestId\)/)
     // The dedup/re-arm block must sit before the card-post (formatPermissionCardBody).
     const rearmIdx = fn.indexOf('classifyPermissionRequest')
     const postIdx = fn.indexOf('formatPermissionCardBody')
@@ -143,18 +138,21 @@ describe('gateway re-arm wiring', () => {
 
 describe('gateway boot-sweep grace period', () => {
   it('defers the strip when re-arm is enabled, keeps immediate strip as the kill-switch path', () => {
-    const sweep = slice(GATEWAY, 'Boot-sweep for permission cards from a prior gateway session', 3400)
+    const sweep = slice(GATEWAY, 'Boot-sweep for permission cards from a prior gateway session', 4200)
     expect(sweep).toMatch(/if \(!isPermissionRearmEnabled\(\)\)/)
     // legacy immediate path still strips everything + clears the store
     expect(sweep).toMatch(/permCardStore\.clear\(\)/)
-    // grace path: setTimeout + grace-ms knob + reclaimed filter
+    // grace path: setTimeout + grace-ms knob + live-pending filter
     expect(sweep).toMatch(/setTimeout\(/)
     expect(sweep).toMatch(/permissionRearmGraceMs\(\)/)
-    expect(sweep).toMatch(/computeBootSweepStripTargets\(remaining, rearmReclaimedRequestIds\)/)
+    // Preserve anything currently live in pendingPermissions — covers both
+    // re-armed AND fresh-during-grace cards (reviewer-caught blocker fix).
+    expect(sweep).toMatch(/new Set\(pendingPermissions\.keys\(\)\)/)
+    expect(sweep).toMatch(/computeBootSweepStripTargets\(remaining, liveRequestIds\)/)
   })
 
   it('the grace path removes only stripped request_ids, not the whole store', () => {
-    const sweep = slice(GATEWAY, 'Boot-sweep for permission cards from a prior gateway session', 3400)
+    const sweep = slice(GATEWAY, 'Boot-sweep for permission cards from a prior gateway session', 4200)
     // Per-request removal (preserves re-armed live entries) inside the deferred block.
     expect(sweep).toMatch(/distinctRequestIds\(toStrip\)/)
     expect(sweep).toMatch(/permCardStore\.remove\(id\)/)
