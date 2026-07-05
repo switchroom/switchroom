@@ -36,6 +36,10 @@ import { execFileSync, type ExecFileSyncOptions } from "node:child_process";
 import { readFileSync, readlinkSync, fstatSync } from "node:fs";
 import type { Socket } from "node:net";
 import { getPeerCred } from "./peercred-ffi.js";
+import {
+  parseSocketIdentity,
+  type SocketIdentity as BrokerSocketIdentity,
+} from "../../broker-common/peercred-path.js";
 
 /**
  * Socket-path-as-identity (Phase 2a).
@@ -99,9 +103,7 @@ const RESERVED_AGENT_NAMES = new Set(["operator", "hostd"]);
  *                                 mode 0600 + chown to operator UID
  *                                 enforced by the broker at bind time.
  */
-export type SocketIdentity =
-  | { kind: "agent"; name: string }
-  | { kind: "operator" };
+export type SocketIdentity = BrokerSocketIdentity;
 
 /**
  * Path to identity. Returns null when the path matches no canonical shape.
@@ -114,22 +116,23 @@ export type SocketIdentity =
  * One operator shape:
  *   (c) /run/switchroom/broker/operator/sock         (RESERVED — not an agent)
  *
- * "operator" cannot be an agent name (see RESERVED_AGENT_NAMES); a flat
- * file at /run/switchroom/broker/operator.sock is also rejected to keep
- * the reservation airtight regardless of bind shape.
+ * "operator" cannot be an agent name (see RESERVED_AGENT_NAMES); it resolves
+ * to `{kind:"operator"}` from EITHER the subdir or the flat bind shape
+ * (`operator` is matched before the reserved-name gate in the shared
+ * primitive), so the reservation holds regardless of bind shape.
+ *
+ * #2795: the parse+operator+reserved gate is the shared broker-plane
+ * primitive (`src/broker-common/peercred-path.ts`); this call site supplies
+ * only the vault-specific patterns + reserved set. Semantics are identical
+ * to the pre-#2795 inline implementation.
  */
 export function socketPathToIdentity(
   socketPath: string,
 ): SocketIdentity | null {
-  if (typeof socketPath !== "string" || socketPath.length === 0) return null;
-  const m =
-    socketPath.match(SOCKET_PATH_AGENT_RE) ??
-    socketPath.match(SOCKET_PATH_AGENT_SUBDIR_RE);
-  if (!m) return null;
-  const name = m[1];
-  if (name === "operator") return { kind: "operator" };
-  if (RESERVED_AGENT_NAMES.has(name)) return null;
-  return { kind: "agent", name };
+  return parseSocketIdentity(socketPath, {
+    patterns: [SOCKET_PATH_AGENT_RE, SOCKET_PATH_AGENT_SUBDIR_RE],
+    reservedNames: RESERVED_AGENT_NAMES,
+  });
 }
 
 /**
