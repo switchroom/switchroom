@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.17.6 — Durable fleet failover: persisted active, proactive roll, unpinned consumers
+
+### PR A — Honest ↻ Refresh on /auth and /usage cards (#2843)
+
+The cards' ↻ Refresh button served up-to-45s-cached quota while stamping
+"Live · refreshed 0s ago". It now passes `forceLive` (an explicit tap is
+the user asking for live-now data, still throttled to one per 5s per
+message), stamps "⚠ cached Nm ago" whenever any account was served from
+cache, and keeps demo-mode email masking across refresh (switch-button
+labels are masked too). The served/capturedAt zip logic is extracted as
+`zipProbeResults` with unit tests so the footer logic can't drift.
+
+### PR B — Durable fleet failover (#2845)
+
+Root cause of the 2026-07-05 walled-fleet incident: account swaps lived
+only in broker memory, so every broker/agent recreate reloaded the stale
+yaml `auth.active` and re-poisoned the fleet with a quota-walled account;
+an idle fleet never proactively recovered at all.
+
+- **Persisted active override** (`state/auth-broker/active-override.json`)
+  — written on every `set-active` and every corroborated roll; applied at
+  boot + SIGHUP. A hand-edited yaml `auth.active` wins and drops the
+  override (operator intent is never overridden by stale automation).
+- **Auto-promote on roll** — `mark-exhausted` with a successful roll
+  promotes the target to nominal `auth.active` (persisted). Gated on a
+  fresh (≤5h) live snapshot proving the wall, so a bogus mark keeps the
+  old self-reverting window semantics. Note: after a corroborated wall
+  the fleet *stays* on the promoted account when the old one refills —
+  no auto-revert to the previous primary.
+- **Proactive fleet failover** — the broker's periodic per-account probe
+  now rolls the fleet the moment the ACTIVE account's fresh probe shows
+  exhaustion (boot + interval; kill switch
+  `SWITCHROOM_DISABLE_FLEET_QUOTA_PROBE=1`). No failed agent turn needed.
+
+### PR C — Optional consumer pin: unpinned consumers follow the fleet active (#2852)
+
+`auth.consumers[].account` is now optional. An unpinned consumer (the new
+`switchroom setup` default for hindsight) rides `auth.active` exactly like
+an agent: same swaps, same failover, mark-exhausted attributes to the
+active. Pinned consumers keep the existing quota-isolation semantics.
+Config note: a pin-less consumer entry requires this broker version —
+unpin yaml only after the fleet is on v0.17.6. Also folds in #2845 review
+hardening: proactive marks write durable audit records, and the durable-
+promote corroboration ceiling tightens from 24h to one 5h refill period.
+
 ## v0.17.5 — Fix approval card race + start.sh claude command warning
 
 ### PR A — Hold inbound delivery gate while approval card is outstanding (#2840)
