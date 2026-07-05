@@ -1,5 +1,138 @@
 # Changelog
 
+## v0.17.7 — Approvals survive restarts + specialized, chat-legible memory
+
+### PR A — Re-arm approval cards across restarts + bridge request ledger (#2861/#2867)
+
+Pending tool-permission approvals lived only in the gateway's in-memory
+`pendingPermissions` map and died two ways, both closed here. A gateway
+restart used to strip the persisted card ("Gateway restarted…") while the
+claude session stayed suspended inside the MCP permission call — no verdict
+was ever dispatched and the turn wedged (marko's gateway booted ~14× on
+fleet-roll day, killing every pending card each time). And the bridge dropped
+permission requests whenever the gateway IPC was down, so no card ever posted
+and claude hung indefinitely. The existing `permission-card-store.ts`
+persistence is now used to **re-arm** the question after a restart (restoring
+`pendingPermissions` with the original `startedAt` and re-attaching the
+keyboard on the existing message — never a fresh card), and the bridge keeps
+an outstanding-request ledger keyed by `request_id`, buffering disconnected
+requests and re-sending them on every reconnect. Re-arm restores only the
+question, never a verdict (no-self-escalation); kill switch
+`SWITCHROOM_PERMISSION_REARM=0`.
+
+### PR B — Re-offer missed approvals when the operator returns after TTL (#2862/#2866)
+
+When an approval card TTL-expires with the operator away, the gateway
+auto-denies (timeout-is-not-denial) — but nothing re-offered the approval when
+the operator came back, so cron-fired gated work was silently dropped (marko's
+brevo nurture-drip batches died this way two days running). At TTL auto-deny
+the miss is now appended to a persisted digest in `STATE_DIR`
+(`missed-approvals-store.ts`); on the first operator-activity event after ≥1
+miss accumulates, the gateway posts **one** compact digest card per origin
+surface. **Retry** synthesizes an inbound asking the agent to re-attempt the
+action (the same synthesized-inbound path cron uses — it re-raises a fresh
+approval card, never a synthesized verdict); **Dismiss** clears the record.
+Kill switch `SWITCHROOM_MISSED_APPROVAL_REOFFER=0`.
+
+### PR C — Persist scoped grants across restarts (#2863/#2865)
+
+The gateway's 30-min scoped-approval windows (`scopedGrants`) were in-memory
+only, so any bounce — fleet roll, config apply, failover probe — wiped every
+window and an action the operator had allowed minutes ago re-carded
+immediately, reading as "my approval didn't stick." They now persist to a tiny
+`STATE_DIR/scoped-grants.json` (same pattern as the card store). Entries carry
+the absolute wall-clock `expiresAt` captured at the original tap, so a restart
+can never *extend* a window (grant at T, reload at T+29min → ~1 min left); the
+reloaded grant runs the identical fail-closed gate. Kill switch
+`SWITCHROOM_SCOPED_GRANT_PERSIST=0`.
+
+### PR D — Route cron boot-replays through the durable inbound spool (#2793 part B / #2860)
+
+Cron boot-replay was ledgered at socket-accept in the scheduler, not at
+consumption, opening two windows: a replay accepted but never consumed (bridge
+not up yet) was recorded delivered and dropped (silent-loss), and the
+accept-time ledger couldn't distinguish "consumed" from "accepted" so a
+re-replay across a restart could re-run it (double-fire). A boot-replay now
+carries `meta.replay_fire_ms` and routes through the durable inbound spool —
+`put` on accept, `ack` only on confirmed delivery — with a stable `spoolId`
+keyed on `(chatId, schedule_index, replay_fire_ms)`. Re-replays dedup to one
+entry (closes double-fire) and un-acked entries re-deliver on the next boot
+(closes silent-loss): at-least-once with dedup. (Part A, at-most-once resume,
+shipped earlier in #2808.)
+
+### PR E — Sparse, chat-legible memory surface (hindsight Phase 4 / #2858)
+
+Surfaces ONE terse line in the originating chat/topic when the interactive
+session *materially* changes what it remembers: `📌 remembered: "<directive>"`
+on `create_directive`, `✂️ forgot: …` on an invalidate / demote-from-recall.
+Deterministic tool-call observation — no model call, no polling, no `claude
+-p`. It's sparse and material-only: **no line on ordinary recall, no line on
+routine consolidation**, avoiding the "regurgitating old facts unprompted"
+anti-pattern. New reusable `memory-legibility.ts` module (whose
+`detectMemoryLegibilityEvent` primitive PR F imports rather than re-deriving);
+kill switch `SWITCHROOM_MEMORY_LEGIBILITY=0` (default ON). Serves
+`remember-across-sessions`.
+
+### PR F — Deterministic directive-capture nudge (#2848 Stage B / #2864)
+
+Stage A measured a **~55% miss rate** on durable corrections — capture was a
+per-agent lottery (clerk held 0 directives across 449 messages). The vendored
+recall hook (UserPromptSubmit) now regex-detects correction / standing-rule-
+shaped inbound and appends a terse advisory to the turn's `additionalContext`
+telling the model to persist the rule with `create_directive` **if** it's
+durable — the model still does the judgment in-session and calls the tool
+itself (no silent hook-side write, no new model callsite). A negative guard
+scrubs pleasantry shapes ("always happy to help") before matching. Config knob
+`memory.directive_capture_nudge` (default ON). Serves
+`remember-across-sessions`.
+
+### PR G — Thread reflect/observations mission + disposition through the cascade (#2855)
+
+Phase 2 of the hindsight synthesis-layers RFC — banks should be *specialized*,
+not merely isolated. Wires the remaining bank-steering levers through the
+config cascade: `reflect_mission` and `observations_mission` (string,
+override) and `disposition {skepticism, literalism, empathy}` (1–5 each,
+per-key merge). Verified against the live engine: `disposition` is three flat
+1–5 integer fields (modeled as one nested object in YAML, flattened at the API
+boundary), and switchroom's existing `bank_mission` **is** the engine's
+`reflect_mission` (kept as a documented alias). Built-in profiles ship
+differentiated defaults (`health-coach` empathy-high 2/2/5,
+`executive-assistant` 4/4/3, `coding` 4/5/2) so a fresh setup needs zero
+config. Operator-config-driven only — no agent self-modification of its own
+bank missions.
+
+### PR H — Pin the refresh-hindsight recreate to the release target (#2851/#2856)
+
+`switchroom update`'s `refresh-hindsight` step recreated the hindsight
+singleton via `memory setup --recreate` with no `--tag`, so it always pulled
+floating `:latest` even on a version-pinned fleet — the hole that left the
+v0.17.5 roll's `switchroom-hindsight` on `:latest`. The target is now resolved
+lazily (`--pin`, else the persisted `release.pin`) and threaded as `--tag
+<version>`. Only a concrete `vX.Y.Z` is pinnable; a `sha-` pin, a floating
+`--channel`, or no pin still floats to `:latest` (the standalone default,
+unchanged).
+
+### PR I — `switchroom apply --dry-run` (#2829)
+
+Adds a real `--dry-run` to `switchroom apply`: it runs the full
+compose-regeneration + validation pipeline **in memory** and reports what a
+real apply would do — profile resolution per agent, vault provisioning gaps
+(broker reachability, new-key provisioning), and would-be compose changes
+(image-tag deltas) — **without** writing the compose file, persisting
+anything, or touching a container. Exits non-zero when a real apply would
+fail. Closes the gap behind the v0.17.0 rollout incident, where
+`rollout --dry-run` only printed the step plan and never exercised the
+config-regeneration that actually failed (`apply --dry-run` errored with
+`unknown option`).
+
+### PR J — Docs: fix ProductOS link + conform reference/ to current templates (#2868)
+
+Fixes the 404ing `../../ProductOS/` relative link in `reference/README.md`,
+and brings `reference/` into conformance with the current ProductOS templates
+after the front-door revamp: adds the missing `## Related` section to the 9 job
+specs that lacked it (all 23 now carry the full terse subset) and fixes two
+RFCs using path-style `serves:` values to the bare-slug scheme.
+
 ## v0.17.6 — Durable fleet failover: persisted active, proactive roll, unpinned consumers
 
 ### PR A — Honest ↻ Refresh on /auth and /usage cards (#2843)
