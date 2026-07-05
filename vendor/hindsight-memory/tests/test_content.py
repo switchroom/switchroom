@@ -217,6 +217,53 @@ class TestComposeRecallQuery:
         assert "user msg" in result
         assert "assistant msg" not in result
 
+    # --- switchroom divergence: the recall context slice counts HUMAN turns,
+    # not tool_result pseudo-turns (follow-up to #2830, closing the reviewer nit
+    # that the retain path had a test but the recall path — the OTHER caller of
+    # slice_last_turns_by_user_boundary — did not).
+
+    def test_tool_heavy_prior_turn_keeps_human_text_in_recall_context(self):
+        # A prior human turn stating a fact, then 3 sequential tool rounds
+        # (Claude Code emits tool results as role="user"). recall_context_turns=2
+        # asks for the latest turn + one prior HUMAN turn. If the tool_result
+        # messages were counted as boundaries the human fact would be sliced
+        # out; the guard skips them so the fact lands in "Prior context:".
+        messages = [
+            {"role": "user", "content": "my prod database is called ORCHID_PRIMARY"},
+            {"role": "assistant", "content": "let me look that up"},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "TOOLPAYLOAD_1"}]},
+            {"role": "assistant", "content": "checking more"},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t2", "content": "TOOLPAYLOAD_2"}]},
+            {"role": "assistant", "content": "one more"},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t3", "content": "TOOLPAYLOAD_3"}]},
+            {"role": "assistant", "content": "here is your schema"},
+        ]
+        result = compose_recall_query("what port does it listen on", messages, recall_context_turns=2)
+        assert "Prior context:" in result
+        assert "ORCHID_PRIMARY" in result  # human turn survived the tool-heavy turn
+        assert "TOOLPAYLOAD" not in result  # tool_result payload is not human context
+
+    def test_recall_context_anchors_to_human_turns_across_tool_volume(self):
+        # Two prior human turns, each followed by tool rounds. Asking for 3
+        # context turns (latest + 2 prior HUMAN) must reach past all the
+        # tool_result messages to the oldest human turn — tool volume must not
+        # consume the turn budget.
+        messages = [
+            {"role": "user", "content": "the deploy key is FALCON_9_KEY"},
+            {"role": "assistant", "content": "looking"},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "out a"}]},
+            {"role": "assistant", "content": "more"},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t2", "content": "out b"}]},
+            {"role": "user", "content": "and remind me of the region too"},
+            {"role": "assistant", "content": "checking region"},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t3", "content": "out c"}]},
+            {"role": "assistant", "content": "region is ap-southeast-2"},
+        ]
+        result = compose_recall_query("put those together for me", messages, recall_context_turns=3)
+        assert "Prior context:" in result
+        assert "FALCON_9_KEY" in result
+        assert "and remind me of the region too" in result
+
 
 # ---------------------------------------------------------------------------
 # truncate_recall_query
