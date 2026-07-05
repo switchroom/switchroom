@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.17.3 — LiteLLM Anthropic pass-through
+
+### Claude routes via the /anthropic pass-through, not the model-mapped path (#2835)
+
+Routing Claude (opus) through LiteLLM's model-mapped `/v1/messages` route
+re-chunks the upstream SSE stream, which stalled long responses mid-flight
+("API Error: Response stalled mid-stream" after minutes — the 2026-07-05
+marko incident). Claude now points at LiteLLM's **Anthropic pass-through**
+(`<root>/anthropic/v1/messages`), which raw-forwards and streams native SSE
+bytes — same shape as direct OAuth, no re-chunk.
+
+- `compose.ts` emits `ANTHROPIC_BASE_URL=<root>/anthropic` for the claude
+  CLI, plus a new `SWITCHROOM_LITELLM_BASE=<root>` for the two consumers
+  that need the root proxy surface, not the pass-through: start.sh's
+  `/health/liveliness` boot probe and the gateway's `/model/info`
+  non-Claude (`sr-*`) model discovery.
+- `start.sh` (outer + inner) + `cron-session.sh` health probes and the
+  gateway's `discoverSrModels` now target the root; hindsight's
+  claude_agent_sdk subprocess also routes via the pass-through.
+- OAuth still rides in `Authorization` (forwarded upstream unchanged); the
+  virtual key rides in `x-litellm-api-key` — the split that keeps this
+  subscription-native. Non-Claude models stay on the model-mapped root path
+  via the virtual key.
+- Pairs with a LiteLLM proxy bump to v1.91.0 ("disable proxy buffering on
+  streaming SSE responses") on the operator's deployment.
+
 ## v0.17.2 — hostd self-service rolls
 
 ### PR A — hostd self-bump on stale-CLI rollout (#2833)
