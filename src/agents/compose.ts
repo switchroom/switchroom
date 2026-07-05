@@ -2530,8 +2530,13 @@ function emitAgentService(
     );
   }
   // Operator-authored shared webkite config (e.g. defaults.format,
-  // proxy rotation file). Optional — agents work fine without it,
-  // using webkite's built-in defaults.
+  // proxy rotation file). Optional OVERRIDE — the fleet already ships a
+  // baked-in default render config (#2805): Dockerfile.agent bakes
+  // docker/webkite/config.toml to /opt/switchroom/webkite/config.toml and
+  // start.sh.hbs seeds it to ~/.config/webkite/config.toml (copy-if-absent).
+  // When this operator file exists it is bind-mounted RO onto the SAME
+  // target, so the file is present at boot and start.sh's copy-if-absent
+  // skips — i.e. the operator override wins over the baked default.
   if (existsSync(`${probeHome}/.switchroom/webkite/config.toml`)) {
     lines.push(
       `      - ${homePrefix}/.switchroom/webkite/config.toml:/state/agent/home/.config/webkite/config.toml:ro`,

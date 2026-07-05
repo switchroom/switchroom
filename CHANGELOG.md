@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.16.50 — Fleet-wide webkite render config
+
+### Web extraction
+
+- **Baked-in webkite render config so JS-heavy sites render** (#2805): the
+  fleet ships cloakbrowser (stealth Chromium) baked into the agent image, but
+  carried no webkite render config, so webkite's auto-heuristic classified
+  JS-gated SPA/booking pages (e.g. `palacecinemas.com.au` session times) as
+  `thin_article` with `has_renderers: false` and returned only the static
+  shell. A default `config.toml` is now baked to `/opt/switchroom/webkite/`
+  in `Dockerfile.agent` and re-synced to `~/.config/webkite/config.toml` at
+  boot by `start.sh` whenever the two differ (NOT copy-if-absent: `$HOME` is a
+  host-persistent bind mount, so a write-once seed would let a stale home copy
+  shadow every future image update; refresh-from-image keeps the fleet
+  current). An operator-authored `~/.switchroom/webkite/config.toml` override
+  is bind-mounted RO onto the same target and still wins (detected and left
+  untouched). It enables render, keeps the baked-in local cloakbrowser as the
+  auto-spawned primary backend with Cloudflare/Firecrawl as cloud fallback
+  (`profile = "local-first"`), and force-renders known JS-gated domains via
+  `[[render.routes]]`. Every
+  key was verified against the shipped `webkite` binary's own schema. NOTE: a
+  per-route post-render wait/interaction hook is not expressible in webkite
+  0.4.0's `RouteConfig` (only `domains`/`providers`/`mode`/`exclusive`); the
+  wait-for-selector path remains a per-call `webkite_read` argument.
+
 ## v0.16.47 — Admin-key passphrase prompt made unmissable
 
 A single focused Telegram fix on top of v0.16.46.

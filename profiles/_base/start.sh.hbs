@@ -828,6 +828,36 @@ if command -v switchroom >/dev/null 2>&1; then
   unset sr_wk_pair sr_wk_env sr_wk_key sr_wk_val
 fi
 
+# Fleet-wide webkite render config (#2805). Seed the image-baked default
+# (/opt/switchroom/webkite/config.toml) into the XDG location webkite reads
+# ($HOME/.config/webkite/config.toml) so JS-heavy SPA/booking pages render
+# via the baked-in cloakbrowser instead of returning a static shell.
+#
+# REFRESH-from-image, not copy-if-absent. $HOME (/state/agent/home) is a
+# host-PERSISTENT bind mount (see src/agents/compose.ts), so a copy-if-absent
+# seed would write once and then the stale home copy would shadow every future
+# image-shipped config update forever — the config would be un-updatable
+# fleet-wide after first boot. Instead re-sync the target from the baked
+# default whenever they differ, so an image bump always propagates.
+#
+# Operator override still wins: an operator-authored
+# ~/.switchroom/webkite/config.toml is bind-mounted RO onto this exact target
+# (compose.ts). We detect that mount and leave it untouched; even absent the
+# mountpoint check, a cp onto the RO mount fails harmlessly and the override
+# is preserved.
+if [ -f /opt/switchroom/webkite/config.toml ]; then
+  sr_wk_target="$HOME/.config/webkite/config.toml"
+  if mountpoint -q "$sr_wk_target" 2>/dev/null; then
+    : # operator override bind-mounted RO — never clobber it
+  elif ! cmp -s /opt/switchroom/webkite/config.toml "$sr_wk_target" 2>/dev/null; then
+    mkdir -p "$HOME/.config/webkite" 2>/dev/null || true
+    cp /opt/switchroom/webkite/config.toml "$sr_wk_target" 2>/dev/null \
+      && echo "webkite: synced fleet render config to \$HOME/.config/webkite/config.toml" >&2 \
+      || echo "webkite: could not sync render config (non-fatal)" >&2
+  fi
+  unset sr_wk_target
+fi
+
 # LiteLLM routing (opt-in, #litellm). When SWITCHROOM_LITELLM is set (compose
 # env, gated on litellm.enabled && keyConfirmed), route the unmodified `claude`
 # CLI through the operator's LiteLLM proxy at ANTHROPIC_BASE_URL: fetch the
