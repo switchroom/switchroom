@@ -13,7 +13,7 @@
  */
 
 import { maskUsername } from "./demo-mask.js";
-import { escapeMarkdown } from "./card-format.js";
+import { escapeMarkdown, stackCardLines } from "./card-format.js";
 
 export type AuthSummary = {
   authenticated: boolean;
@@ -148,7 +148,7 @@ export function formatAgentLine(meta: AgentMetadata): string {
  */
 export function startText(agentName: string, dmDisabled: boolean): string {
   if (dmDisabled) return "This bot isn't accepting new connections.";
-  return [
+  return stackCardLines([
     `**Switchroom** — Telegram on your Claude Pro or Max subscription.`,
     ``,
     `This bot is the **${escapeHtml(agentName)}** agent. Pair first, then send messages here and they reach the agent; replies and reactions come back.`,
@@ -158,7 +158,7 @@ export function startText(agentName: string, dmDisabled: boolean): string {
     `2. In Claude Code: \`/telegram:access pair <code>\``,
     ``,
     `After pairing, try \`/status\` or \`/commands\`.`,
-  ].join("\n");
+  ]);
 }
 
 /**
@@ -166,7 +166,7 @@ export function startText(agentName: string, dmDisabled: boolean): string {
  * Deliberately short because Telegram truncates /help popovers.
  */
 export function helpText(agentName: string): string {
-  return [
+  return stackCardLines([
     `**Switchroom** — your Pro/Max subscription, wired to Telegram.`,
     ``,
     `This bot is the **${escapeHtml(agentName)}** agent. Text and photos route through to it; replies, reactions and progress cards come back.`,
@@ -177,7 +177,7 @@ export function helpText(agentName: string): string {
     `\`/status\` — agent, model, auth`,
     `\`/vault audit <agent>\` — admin: review agent's vault access + one-tap [🔓 Allow] on recent denials`,
     `\`/commands\` — full command list`,
-  ].join("\n");
+  ]);
 }
 
 /**
@@ -246,14 +246,18 @@ export function statusPairedText(params: {
     if (audit.memoryBank) lines.push(`**Memory** ${escapeHtml(audit.memoryBank)}`);
   }
 
-  return lines.join("\n");
+  return stackCardLines(lines);
 }
 
 /**
  * `/status` when the sender isn't paired yet but has a pending code.
  */
 export function statusPendingText(code: string): string {
-  return `Pending pairing — run in Claude Code:\n\n\`/telegram:access pair ${code}\``;
+  return stackCardLines([
+    `Pending pairing — run in Claude Code:`,
+    ``,
+    `\`/telegram:access pair ${code}\``,
+  ]);
 }
 
 /**
@@ -365,7 +369,7 @@ export const TELEGRAM_BASE_COMMANDS = TELEGRAM_MENU_COMMANDS.slice(0, 3);
 export const TELEGRAM_SWITCHROOM_COMMANDS = TELEGRAM_MENU_COMMANDS.slice(3);
 
 export function switchroomHelpText(agentName: string): string {
-  return [
+  return stackCardLines([
     `**Switchroom bot** — commands for the **${escapeHtml(agentName)}** agent.`,
     ``,
     `**Session & approvals**`,
@@ -415,7 +419,7 @@ export function switchroomHelpText(agentName: string): string {
     `\`/commands\` — this help`,
     ``,
     `_Tip: \`/update\` shows the plan; \`/update apply\` executes it; \`/restart\` bounces a stuck agent; \`/version\` checks what's running._`,
-  ].join("\n");
+  ]);
 }
 
 /**
