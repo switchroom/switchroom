@@ -3,7 +3,7 @@ artifact: Hindsight primitive fit — use the synthesis layers the memory job de
 serves: remember-across-sessions
 advances-outcome: standing-team
 relates: jobs/run-a-fleet-of-specialists.md, jobs/feel-like-a-colleague.md
-status: partially shipped (rev. 2026-07-05); phases 1 + 6a live, 6b + 2/3/5 open — status record + remaining work
+status: partially shipped (rev. 2026-07-05); phases 1 + 6a + 6b live, 2/3/5 open — status record + remaining work
 ---
 
 # Hindsight synthesis layers — what we run vs. what the job asks for
@@ -23,7 +23,9 @@ what it believes and why").
 
 **This document has since become a status record.** Phase 1 shipped
 (observations are now recalled), Phase 6a shipped (recall is gated on
-trivial turns), and per-speaker / shared-bank recall landed as an adjacent
+trivial turns), Phase 6b shipped (retain is now a chunked window instead of
+re-consolidating the whole transcript every turn — #2830, rolled fleet-wide
+in v0.17.5), and per-speaker / shared-bank recall landed as an adjacent
 feature. Several premises the original proposal rested on have also *moved*:
 per-agent user-profile mental models were retired (#2447), so the "one
 auto-seeded model everywhere" gap the RFC described no longer exists. The
@@ -45,7 +47,7 @@ it argues for using capability we already pay for, within the lines.
 | 4. Chat-legible memory (sparse) | **NOT-STARTED** | only a transient `📚 recalling memories` spinner exists (#303); no store/correct legibility line |
 | 5. Curated mental models per specialist | **NOT-STARTED** as automation | and arguably *regressed* — user-profile auto-seeding was removed in #2447 |
 | 6a. Gate recall on trivial turns | **SHIPPED** | `recallSkipTrivial=true` + `_is_trivial_stateless()` guard |
-| 6b. Right-size retain cadence | **NOT-STARTED** | premise still holds; blocked by a load-bearing vendor constraint (see below) |
+| 6b. Right-size retain cadence | **SHIPPED** (#2830/#2831) | chunked windowed retain at `retainEveryNTurns=1` — vendor `retain.py` patched (`select_retain_window()`) to decouple window-slicing from the `>1` throttle; savings not yet measured (#2847) |
 
 ## Evidence (original snapshot 2026-06-18, with 2026-07-05 corrections)
 
@@ -165,12 +167,16 @@ against switchroom's lines. Status of each, updated for 2026-07-05:
 
 1. **Silent background consolidation vs
    [`chat-is-the-single-source-of-truth`](../invariants.md) + `on-leash`.**
-   *Still open.* The engine runs LLM consolidation/observation/graph-building
-   the operator never triggered and never sees. Phase 6b (right-sizing the
-   retain cadence) is the lever here and has not shipped, so this remains the
-   largest invisible subscription draw. Bounded and inspectable in output,
-   but still background model-spend the operator didn't initiate (also
-   brushes
+   *Mitigated by #2830; magnitude pending measurement.* The engine still runs
+   LLM consolidation/observation/graph-building the operator never triggered
+   and never sees, so the *legibility* tension persists (Phase 4 is the lever
+   for that). But the *magnitude* — previously the largest invisible
+   subscription draw, driven by `full-session` re-consolidation on every turn
+   — is now addressed in code: Phase 6b (#2830) switched retain to a chunked
+   window, so a fire consolidates only the recent window rather than the whole
+   growing transcript. The realized savings are **not yet measured** (#2847).
+   Whatever remains is still background model-spend the operator didn't
+   initiate (also brushes
    [`crons-use-the-model-only-when-it-earns-it`](../jobs/crons-use-the-model-only-when-it-earns-it.md)).
 2. **Invisible recall injection vs "honest, legible recall."** *Still open.*
    The `<hindsight_memories>` block is hidden `additionalContext`. Phase 4
@@ -310,42 +316,48 @@ invariant.
   job's continuity criteria), which is why it targets only the clearly
   stateless class.
 
-- **6b — Right-size retain cadence. — NOT-STARTED; premise holds, blocked by
-  a load-bearing vendor constraint.** `retainEveryNTurns=1` (scaffold
-  override; vendor default is 10) means every turn triggers background
-  consolidation (sonnet) — confirmed live as the single largest *invisible*
-  subscription draw (on the order of ~1M consolidation tokens/day/agent,
-  ~100% of an agent's LLM spend) and the engine room of tension (1). The
-  original RFC implied you can simply raise N or switch retain modes to cut
-  this. **That is not true in the vendor code as written.** Three facts,
-  stated plainly:
-  1. **The cost premise is confirmed live.** Switchroom runs `full-session`
-     retain mode (`retain.py:108`), so each fire re-consolidates the whole
-     accumulated transcript and per-fire cost grows with session length — the
-     savings curve from firing less often is real but non-linear.
-  2. **"Chunked windowing WITH every-turn firing" is impossible without a
-     vendor patch.** In `vendor/hindsight-memory/scripts/retain.py:121`, the
-     chunked slice path is gated on **both** `retain_mode == "chunked"`
-     **and** `retain_every_n > 1`. With the current `retainEveryNTurns=1` it
-     falls through to full-session regardless of `retainMode`. Decoupling the
-     window-slice from the throttle requires editing the vendor code; you
-     cannot get chunked-window economics while still firing every turn from
-     config alone.
-  3. **The every-turn setting is a deliberate correctness guarantee, not an
-     oversight.** The `jtbd-memory-survives-restart-dm` UAT breaks if
-     short-session (≤2-turn) retain stops firing — it originally *failed*
-     under the vendor's `retainEveryNTurns:10` throttle, which is precisely
-     why scaffold set it to 1 (`scaffold.ts` ~L2441/L2487). The one other way
-     a short session flushes is the SessionEnd `force=True` retain
-     (`retain.py:113`), which bypasses the throttle. So the restart guarantee
-     depends on **either** every-turn firing **or** the SessionEnd
-     force-flush; any cadence change must preserve one of those paths or the
-     UAT regresses.
-  Net: 6b is the biggest token lever but it is not a config flip. It needs a
-  vendor patch to decouple chunk-slicing from the throttle *and* a design that
-  keeps the short-session restart guarantee (force-flush on SessionEnd, or a
-  lower floor that still fires on short DMs). A measured tradeoff, gated on
-  proving no memory-loss regression.
+- **6b — Right-size retain cadence. — SHIPPED (#2830/#2831); rolled
+  fleet-wide in v0.17.5.** `retainEveryNTurns=1` (scaffold override; vendor
+  default is 10) means every turn triggers background consolidation (sonnet).
+  Under the previous `full-session` retain mode this was confirmed live as the
+  single largest *invisible* subscription draw (on the order of ~1M
+  consolidation tokens/day/agent, ~100% of an agent's LLM spend) and the
+  engine room of tension (1). The original RFC noted you could not simply
+  raise N or flip retain modes to cut this — a vendor patch was required. That
+  patch is exactly what #2830 landed. Three facts, stated plainly:
+  1. **The cost premise was confirmed live** before the fix. Switchroom ran
+     `full-session` retain mode, so each fire re-consolidated the whole
+     accumulated transcript and per-fire cost grew with session length — the
+     savings curve from windowing is real but non-linear.
+  2. **"Chunked windowing WITH every-turn firing" required a vendor patch —
+     now applied.** Upstream `retain.py` gated the chunked slice path on
+     **both** `retain_mode == "chunked"` **and** `retain_every_n > 1`, so at
+     `retainEveryNTurns=1` it fell through to full-session regardless of
+     `retainMode`. #2830 extracted `select_retain_window()`
+     (`vendor/hindsight-memory/scripts/retain.py:72`) to decouple the
+     window-slice from the `>1` throttle — a chunked window of
+     `max(retain_every_n, 1) + overlap_turns` is well-defined at
+     `retain_every_n >= 1`, so chunked+every-turn now works. The
+     switchroom-divergence is documented at the patch site (candidate to
+     upstream to vectorize-io/hindsight); `scaffold.ts:2520` sets
+     `retainMode="chunked"` and `tests/scaffold.recall-observations.test.ts`
+     pins it, with a vendor unittest at
+     `vendor/hindsight-memory/scripts/tests/test_retain_window.py`.
+  3. **The short-session restart guarantee is preserved.** The
+     `jtbd-memory-survives-restart-dm` UAT breaks if short-session (≤2-turn)
+     retain stops firing — which is why scaffold keeps `retainEveryNTurns=1`.
+     Windowing does not weaken this: the chunked window always extends to the
+     end of the transcript, so the firing turn is always inside the window,
+     and every turn fires at n=1. A pre-merge adversarial review caught the
+     one way this could have silently lost memory — the window must count
+     **human turns only** (tool_result messages are not turns; counting them
+     could push the human's fact outside the window). `select_retain_window()`
+     slices by human-turn boundary accordingly. The SessionEnd `force=True`
+     retain still exists as the belt-and-suspenders flush.
+  Net: 6b was the biggest token lever and it has shipped — a decoupling vendor
+  patch plus the chunked scaffold override, with the short-session restart
+  guarantee kept intact. The realized savings are **not yet measured**; that
+  verification is tracked in #2847.
 
 ## Speed & token budget
 
@@ -362,12 +374,18 @@ Two latency/token surfaces matter, and they pull in opposite directions:
   `mid` ~5s, which adds an LLM rerank pass; switchroom does not.)
 - **Background (invisible).** Every retain triggers consolidation (sonnet, on
   the subscription) the operator never sees; `retainEveryNTurns=1` makes that
-  per-turn. This is the largest *uncounted* subscription draw. Live, it is
-  essentially **100% of an agent's model spend** (order ~1M consolidation
-  tokens/day/agent), and the engine room of invariant tension (1). It is
-  *unchanged* since 2026-06-18 because Phase 6b has not shipped (see the
-  vendor constraint above). Mental-model refreshes (when refresh-enabled)
-  would add to it, but auto-seeding was retired so none are wired today.
+  per-turn. This was the largest *uncounted* subscription draw — under
+  `full-session` retain it was essentially **100% of an agent's model spend**
+  (order ~1M consolidation tokens/day/agent), and the engine room of invariant
+  tension (1). **Phase 6b (#2830, live in v0.17.5) addresses it in code:**
+  chunked windowed retain re-consolidates only the recent window per fire
+  instead of the whole growing transcript, so per-fire consolidation input
+  should be roughly flat over session length rather than growing linearly. The
+  realized savings are **not yet measured** — that verification (per-agent
+  consolidation spend via LiteLLM, flat-per-fire evidence) is tracked in
+  #2847, and this section will carry the numbers once available.
+  Mental-model refreshes (when refresh-enabled) would add to it, but
+  auto-seeding was retired so none are wired today.
 
 Per-phase scorecard against the three axes (status-annotated):
 
@@ -379,15 +397,17 @@ Per-phase scorecard against the three axes (status-annotated):
 | 4. Chat-legible (sparse) | NOT-STARTED | legible **iff** sparse | negligible | minor output tokens |
 | 5. Curated mental models | NOT-STARTED | + faster *reflect* | neutral on hot path | background refresh spend; timeout risk |
 | 6a. Gate recall on trivial turns | SHIPPED | trivial turns feel instant | **win** — skips ~1–2s arm | **win** — drops ~1024 tok on trivial turns |
-| 6b. Right-size retain cadence | NOT-STARTED | unchanged | unchanged | **win when unblocked** — needs vendor patch + restart-guarantee preserved |
+| 6b. Right-size retain cadence | SHIPPED (#2830) | unchanged | unchanged | **win — shipped**; chunked window, flat-per-fire; savings unmeasured (#2847) |
 
-Net read: **Phases 1 and 6a have shipped** and moved recall from the job's
-*bad* column toward its *good* column at near-zero (1) or negative (6a) cost.
-**Phase 2** is partially in (bank/retain missions). **Phase 3** exists as
-guidance but not as a guaranteed path. **Phase 4** is untouched. **Phase 5**
-changed shape entirely (profile knowledge moved to dedicated banks). **Phase
-6b** remains the biggest token lever and the hardest — a vendor patch, not a
-config flip.
+Net read: **Phases 1, 6a, and 6b have shipped.** 1 and 6a moved recall from
+the job's *bad* column toward its *good* column at near-zero (1) or negative
+(6a) cost; 6b (#2830) took on the biggest token lever — the every-turn
+`full-session` reconsolidation draw — with a vendor patch that decouples
+chunked window-slicing from the throttle (the config flip alone was never
+enough), and its realized savings are pending measurement (#2847). **Phase 2**
+is partially in (bank/retain missions). **Phase 3** exists as guidance but not
+as a guaranteed path. **Phase 4** is untouched. **Phase 5** changed shape
+entirely (profile knowledge moved to dedicated banks).
 
 ## Verdict check (the four-part rule)
 
