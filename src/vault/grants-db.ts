@@ -42,17 +42,22 @@ const WAL_SIDECAR_SUFFIXES = ["-wal", "-shm"];
 export function isGrantsDbCorruption(err: unknown): boolean {
   if (!err || typeof err !== "object") return false;
 
-  // bun:sqlite surfaces SQLite result codes on `.code` (e.g. "SQLITE_CORRUPT",
-  // "SQLITE_NOTADB") and a human-readable message. Match on both so we are
-  // robust across Bun versions that populate one but not the other.
+  // bun:sqlite surfaces SQLite result codes on `.code` (e.g. "SQLITE_CORRUPT")
+  // and a human-readable message. Match on both so we are robust across Bun
+  // versions that populate one but not the other.
+  //
+  // Deliberately EXCLUDED: SQLITE_NOTADB / "file is not a database" / "file is
+  // encrypted or is not a database". Those codes are raised when SQLite cannot
+  // read the file *as a database* — most commonly because of a wrong or missing
+  // encryption key (a RECOVERABLE key-availability condition), not because the
+  // on-disk bytes are structurally damaged. Treating NOTADB as corruption would
+  // let a transient key problem trigger the destructive quarantine-and-recreate
+  // path and wipe every legitimate grant. We only quarantine on signals that
+  // genuinely mean the on-disk image itself is damaged.
   const code = String(
     (err as { code?: unknown }).code ?? "",
   ).toUpperCase();
-  if (
-    code === "SQLITE_CORRUPT" ||
-    code === "SQLITE_NOTADB" ||
-    code.startsWith("SQLITE_CORRUPT_")
-  ) {
+  if (code === "SQLITE_CORRUPT" || code.startsWith("SQLITE_CORRUPT_")) {
     return true;
   }
 
@@ -61,8 +66,7 @@ export function isGrantsDbCorruption(err: unknown): boolean {
   ).toLowerCase();
   return (
     message.includes("database disk image is malformed") ||
-    message.includes("file is not a database") ||
-    message.includes("file is encrypted or is not a database")
+    message.includes("database is corrupt")
   );
 }
 
@@ -98,28 +102,41 @@ function quarantineGrantsDb(dbPath: string): string {
 function openAndMigrate(dbPath: string): Database {
   const db = new Database(dbPath, { create: true });
 
-  // Set mode 0600 (user-only). chmodSync on the path — Database opens the
-  // file before we can set mode, so we set it after open. The window is tiny
-  // on a private ~/.switchroom directory.
+  // If any post-open step throws (pragma / migration), the Database handle is
+  // already open and holds a file descriptor. Close it before propagating so
+  // the corruption/quarantine path (or any re-throw) doesn't leak an fd and,
+  // critically, doesn't keep a lock on a file we're about to rename aside.
   try {
-    fs.chmodSync(dbPath, 0o600);
-  } catch {
-    // Non-fatal: may already have correct perms, or on a FS that ignores modes
+    // Set mode 0600 (user-only). chmodSync on the path — Database opens the
+    // file before we can set mode, so we set it after open. The window is tiny
+    // on a private ~/.switchroom directory.
+    try {
+      fs.chmodSync(dbPath, 0o600);
+    } catch {
+      // Non-fatal: may already have correct perms, or on a FS that ignores modes
+    }
+
+    // Enable WAL mode for better concurrency
+    db.run("PRAGMA journal_mode=WAL");
+    // Without a busy_timeout, bun:sqlite defaults to 0ms and a contending
+    // writer fails IMMEDIATELY with SQLITE_BUSY — a grant write can be
+    // silently dropped. Wait-and-retry instead of dropping.
+    db.run("PRAGMA busy_timeout=5000");
+    db.run("PRAGMA foreign_keys=ON");
+
+    // Idempotent schema migration — vault grants (existing) + approval kernel
+    // (RFC B §5). Both live in vault-grants.db; the kernel reuses this DB
+    // handle rather than standing up a parallel file.
+    migrateGrantsSchema(db);
+    migrateApprovalSchema(db);
+  } catch (err) {
+    try {
+      db.close();
+    } catch {
+      // Best-effort close; the original error is what matters.
+    }
+    throw err;
   }
-
-  // Enable WAL mode for better concurrency
-  db.run("PRAGMA journal_mode=WAL");
-  // Without a busy_timeout, bun:sqlite defaults to 0ms and a contending
-  // writer fails IMMEDIATELY with SQLITE_BUSY — a grant write can be
-  // silently dropped. Wait-and-retry instead of dropping.
-  db.run("PRAGMA busy_timeout=5000");
-  db.run("PRAGMA foreign_keys=ON");
-
-  // Idempotent schema migration — vault grants (existing) + approval kernel
-  // (RFC B §5). Both live in vault-grants.db; the kernel reuses this DB
-  // handle rather than standing up a parallel file.
-  migrateGrantsSchema(db);
-  migrateApprovalSchema(db);
 
   return db;
 }
@@ -140,14 +157,24 @@ function openAndMigrate(dbPath: string): Database {
  * never wipe legitimate grants for a transient problem.
  *
  * @param dbPath Absolute path (defaults to ~/.switchroom/vault-grants.db).
+ * @param opener Injection seam for tests — how a DB is opened+migrated at a
+ *   path. Defaults to the canonical `openAndMigrate`. Tests use this to force a
+ *   corruption vs. non-corruption throw without depending on SQLite internals.
  */
-export function openGrantsDb(dbPath = DEFAULT_GRANTS_DB_PATH): Database {
+export function openGrantsDb(
+  dbPath = DEFAULT_GRANTS_DB_PATH,
+  opener: (p: string) => Database = openAndMigrate,
+): Database {
   const dir = path.dirname(dbPath);
   fs.mkdirSync(dir, { recursive: true });
 
   try {
-    return openAndMigrate(dbPath);
+    return opener(dbPath);
   } catch (err) {
+    // Non-corruption failures (EACCES, ENOSPC, a bug in our migration SQL, a
+    // recoverable key-availability/NOTADB condition) must propagate WITHOUT
+    // touching the on-disk file — we never quarantine or wipe legitimate grants
+    // for a transient/operational problem.
     if (!isGrantsDbCorruption(err)) throw err;
 
     const quarantinePath = quarantineGrantsDb(dbPath);
@@ -160,6 +187,6 @@ export function openGrantsDb(dbPath = DEFAULT_GRANTS_DB_PATH): Database {
 
     // Recreate from scratch. If this second attempt also fails it is not a
     // corruption problem we can recover from — let it throw.
-    return openAndMigrate(dbPath);
+    return opener(dbPath);
   }
 }
