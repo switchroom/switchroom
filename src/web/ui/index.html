@@ -2392,8 +2392,20 @@
         return;
       }
 
+      // Worst-first posture strip + sort — not-active (down) or auth-failed
+      // agents are the ones that need attention; surface them first.
+      const needsAttention = (a) => a.active !== 'active' || a.auth.authenticated === false;
+      const attnAgents = agents.filter(needsAttention);
+      const cleanAgents = agents.filter(a => !needsAttention(a));
+      const posture = `
+        <div class="ac-posture" style="grid-column:1/-1;margin:0 0 0.4rem;justify-content:flex-start">
+          <span class="ac-stat attn"><span class="n">${attnAgents.length}</span><span class="l">need attention</span></span>
+          <span class="ac-stat clean"><span class="n">${cleanAgents.length}</span><span class="l">running clean</span></span>
+        </div>`;
+      const sortedAgents = attnAgents.concat(cleanAgents);
+
       container.className = 'agents-grid';
-      container.innerHTML = agents.map(a => `
+      container.innerHTML = posture + sortedAgents.map(a => `
         <div class="agent-card" data-agent="${escapeHtml(a.name)}">
           <div class="card-header" onclick="toggleLogs('${escapeHtml(a.name)}')">
             <div class="status-dot ${statusClass(a)}" title="${escapeHtml(a.active)} · bridge heartbeat (not a claude-liveness signal)"></div>
@@ -2731,15 +2743,36 @@
       const updating = h.stale
         ? `<span style="color:var(--text-dim);font-size:.7rem;margin-left:.4rem">(updating…)</span>`
         : '';
+
+      // Worst-first posture strip — same "attention vs clean" pattern as
+      // Fleet Health / Accounts. hostd counts as attention when the audit
+      // log is missing/erroring OR any recent verb actually failed (not
+      // the benign in-flight "started" state).
+      const hostdHasFailure = !!(hd.recent && hd.recent.some(e =>
+        e.result === 'error' || (e.exit_code != null && e.exit_code !== 0)));
+      const services = [
+        { key: 'broker', ok: !!b.reachable, name: 'auth-broker', dotOk: b.reachable,
+          html: `<div class="agent-card"><div class="card-header" style="cursor:default">${dot(b.reachable)}<span class="agent-name">auth-broker</span></div><div style="padding:0 1.25rem 1rem">${brokerBody}</div></div>` },
+        { key: 'hindsight', ok: hs.running !== false, name: 'hindsight', dotOk: hs.running,
+          html: `<div class="agent-card"><div class="card-header" style="cursor:default">${dot(hs.running)}<span class="agent-name">hindsight</span></div><div style="padding:0 1.25rem 1rem">${hindsightBody}</div></div>` },
+      ];
+      const attnCount = services.filter(s => !s.ok).length + (hd.auditLogPresent && !hostdHasFailure ? 0 : 1);
+      const cleanCount = services.length + 1 - attnCount;
+      const posture = `
+        <div class="ac-posture" style="margin:0 0 0.6rem;justify-content:flex-start">
+          <span class="ac-stat attn"><span class="n">${attnCount}</span><span class="l">need attention</span></span>
+          <span class="ac-stat clean"><span class="n">${cleanCount}</span><span class="l">clean</span></span>
+        </div>`;
+      // Sort the service cards worst-first (down services surface before
+      // healthy ones) — the hostd card stays pinned below since it's a
+      // wider table, not part of the two-up grid.
+      const servicesSorted = services.slice().sort((a, b2) => (a.ok === b2.ok) ? 0 : a.ok ? 1 : -1);
+
       container.innerHTML = `
         ${updating ? `<div style="margin-bottom:.4rem">System health ${updating}</div>` : ''}
+        ${posture}
         <div class="agents-grid">
-          <div class="agent-card"><div class="card-header" style="cursor:default">
-            ${dot(b.reachable)}<span class="agent-name">auth-broker</span></div>
-            <div style="padding:0 1.25rem 1rem">${brokerBody}</div></div>
-          <div class="agent-card"><div class="card-header" style="cursor:default">
-            ${dot(hs.running)}<span class="agent-name">hindsight</span></div>
-            <div style="padding:0 1.25rem 1rem">${hindsightBody}</div></div>
+          ${servicesSorted.map(s => s.html).join('')}
         </div>
         <div class="agent-card" style="margin-top:1rem"><div class="card-header" style="cursor:default">
           ${dot(hd.auditLogPresent)}<span class="agent-name">hostd — recent privileged verbs</span></div>
@@ -2848,6 +2881,25 @@
       const linear = data.linear || { configured: false, agents: [] };
       const agentNames = data.agentNames || [];
 
+      // Worst-first: a config-only account (no live broker slot — never
+      // actually connected) is the real "needs attention" signal here. A
+      // brokerKnown account past its (short-lived) access-token expiry is
+      // NOT broken — it auto-refreshes on next use via the refresh token —
+      // so it must NOT be sorted/flagged as an attention item (matches the
+      // "don't alarm on auto-refresh" fix in renderOAuthAccountCard above).
+      const isConnBroken = (a) => a.brokerKnown === false;
+      const worstFirst = (list) => list.slice().sort((a, b) => (isConnBroken(a) === isConnBroken(b)) ? 0 : isConnBroken(a) ? -1 : 1);
+      const googleSorted = worstFirst(google);
+      const microsoftSorted = worstFirst(microsoft);
+      const oauthAttn = google.filter(isConnBroken).length + microsoft.filter(isConnBroken).length;
+      const oauthClean = (google.length + microsoft.length) - oauthAttn;
+      const posture = (google.length + microsoft.length) > 0
+        ? `<div class="ac-posture" style="margin:0 0 1rem;justify-content:flex-start">
+             <span class="ac-stat attn"><span class="n">${oauthAttn}</span><span class="l">need attention</span></span>
+             <span class="ac-stat clean"><span class="n">${oauthClean}</span><span class="l">connected</span></span>
+           </div>`
+        : '';
+
       // When a provider's fetch FAILED (not genuinely empty), its empty-state
       // must say "couldn't load", never "none configured" — otherwise a
       // transient blip reads as "you have no accounts".
@@ -2856,10 +2908,10 @@
         data.googleFailed
           ? "Couldn't load Google accounts — the data source was unreachable (retrying)."
           : 'No Google accounts. Add one under <code>google_accounts:</code> and run <code>switchroom auth google account add</code>.',
-        google.map(a => renderOAuthAccountCard(a, { showType: false, provider: 'google', agentNames })).join(''),
+        googleSorted.map(a => renderOAuthAccountCard(a, { showType: false, provider: 'google', agentNames })).join(''),
       );
 
-      const msCards = microsoft.map(a => renderOAuthAccountCard(a, { showType: true, provider: 'microsoft', agentNames })).join('');
+      const msCards = microsoftSorted.map(a => renderOAuthAccountCard(a, { showType: true, provider: 'microsoft', agentNames })).join('');
       const msEmpty = data.microsoftFailed
         ? "Couldn't load Microsoft accounts — the data source was unreachable (retrying)."
         : 'No Microsoft accounts yet — click <b>Connect a Microsoft account</b> above (or <code>/connect microsoft</code> from Telegram).';
@@ -2957,7 +3009,7 @@
         ? renderProblem(problemFor('connections-unreachable', {}))
         : '';
 
-      container.innerHTML = unreachableBanner + degradedBanner + googleSection + microsoftSection + notionSection + linearSection;
+      container.innerHTML = unreachableBanner + degradedBanner + posture + googleSection + microsoftSection + notionSection + linearSection;
     }
 
     function renderSchedule(data) {
@@ -3050,7 +3102,27 @@
           </div>`;
       };
 
-      const cards = Object.keys(byAgent).sort().map(agent => {
+      // Worst-first: an agent whose most recent fire for ANY of its crons
+      // failed (non-zero exit) needs attention before agents whose fires
+      // are all clean (or unfired). Posture strip mirrors the Fleet
+      // Health / Accounts "need attention vs clean" pattern.
+      const agentHasFailure = (agent) => {
+        const agentFires = recent[agent] || [];
+        return byAgent[agent].some(e => {
+          const latest = agentFires.filter(f => f.promptKey === e.promptKey).slice(-1)[0];
+          return latest && latest.exitCode !== 0;
+        });
+      };
+      const agentNamesSorted = Object.keys(byAgent).sort();
+      const attnAgentNames = agentNamesSorted.filter(agentHasFailure);
+      const cleanAgentNames = agentNamesSorted.filter(a => !agentHasFailure(a));
+      const posture = `
+        <div class="ac-posture" style="margin:0 0 0.8rem;justify-content:flex-start">
+          <span class="ac-stat attn"><span class="n">${attnAgentNames.length}</span><span class="l">need attention</span></span>
+          <span class="ac-stat clean"><span class="n">${cleanAgentNames.length}</span><span class="l">clean</span></span>
+        </div>`;
+
+      const cards = attnAgentNames.concat(cleanAgentNames).map(agent => {
         const agentFires = recent[agent] || [];
         const list = byAgent[agent].map(e => renderCron(e, agentFires)).join('');
         return `
@@ -3062,7 +3134,7 @@
           <div style="padding:.5rem 1.25rem 1rem">${list}</div>
         </div>`;
       }).join('');
-      container.innerHTML = degradedBanner + truncatedNote + cards;
+      container.innerHTML = degradedBanner + truncatedNote + posture + cards;
     }
 
     function renderApprovals(data, grants) {
