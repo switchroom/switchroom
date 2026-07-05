@@ -170,6 +170,27 @@ describe("scaffold: start.sh resume mode behaviours", () => {
     const forceFreshBlock = startSh.slice(forceFreshIdx);
     expect(forceFreshBlock).toContain('CONTINUE_FLAG=""');
   });
+
+  it("rebuilds a stale handoff briefing and consumes the sidecars (#2790)", () => {
+    // A clean shutdown leaves a non-empty .handoff.md; a later hard crash never
+    // refreshes it. The boot gate must therefore rebuild when the newest session
+    // JSONL is newer than .handoff.md — not merely when .handoff.md is empty —
+    // and must consume the sidecars after injection so they can't be re-served.
+    const result = scaffoldAgent(
+      "stale-handoff-test",
+      makeAgentConfig(),
+      tmpDir,
+      telegramConfig,
+    );
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+    // Staleness guard: compare JSONL mtime against .handoff.md mtime, not just -s.
+    expect(startSh).toContain("_HANDOFF_STALE=1");
+    expect(startSh).toMatch(/_JSONL_MOD.*-gt.*_HANDOFF_MOD|"\$_JSONL_MOD" -gt "\$_HANDOFF_MOD"/);
+    // The old empty-only gate must be gone.
+    expect(startSh).not.toContain('if [ ! -s "$HANDOFF_FILE" ]; then\n  _LATEST_JSONL=');
+    // Sidecars are consumed after injection so a later crash can't re-serve them.
+    expect(startSh).toContain('rm -f "$HANDOFF_BRIEFING_FILE" "$HANDOFF_FILE"');
+  });
 });
 
 // ── Briefing assembler script ───────────────────────────────────────────────────
