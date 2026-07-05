@@ -345,6 +345,92 @@ export function normalizeParagraphBreaks(text: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Card line-break hardener — for DETERMINISTIC command/card bodies
+// ---------------------------------------------------------------------------
+
+/**
+ * Harden the lone `\n` line breaks of a DETERMINISTIC card body into GFM hard
+ * breaks (`  \n`, two trailing spaces) so every field lands on its own line
+ * under Telegram's Bot API 10.1 rich-message (GFM) renderer.
+ *
+ * Why this exists (the run-on-blob bug): the rich path (#2669) renders a lone
+ * `\n` between two non-blank lines as a *soft* break — the two lines collapse
+ * onto the same visual line with a space between them. Agent PROSE is repaired
+ * on the reply path by `normalizeParagraphBreaks`, but the ~98 slash-command
+ * card replies dispatched through `switchroomReply(…, { html: true })` are sent
+ * as RAW markdown with no normalization. Their builders stack short labelled
+ * fields (`**5h window** …`, `**Model** …`, `Auth: ✓ Max …`) joined by a single
+ * `\n`, so the whole card renders as one run-on blob.
+ *
+ * A deterministic card is NOT free prose — every newline its builder emits is
+ * an INTENDED line break. So this hardener promotes UNCONDITIONALLY (no
+ * sentence-terminal-punctuation gate, unlike `normalizeParagraphBreaks`) with
+ * one exception: a line that participates in a genuine GFM block construct
+ * (list / table / blockquote / heading / fenced code) keeps its single `\n` so
+ * its native stacking / contiguity survives — a monospace table inside a ```
+ * fence is never touched (it is code-masked AND the fence lines are excluded).
+ * Real `\n\n` paragraph gaps (a builder's block separators) are preserved.
+ *
+ * This is the string-level sibling of `stackCardLines` (card-format.ts), which
+ * does the same promotion from a pre-split `string[]` of guaranteed
+ * single-line, non-block entries. Use `hardenCardBreaks` where the card body is
+ * already an assembled string (e.g. the `switchroomReply` chokepoint) and may
+ * legitimately contain GFM block constructs.
+ *
+ * Runs on code-masked text and is idempotent — a break already hardened to
+ * `  \n` re-hardens to the same `  \n`.
+ */
+export function hardenCardBreaks(text: string): string {
+  if (!text.includes('\n')) return text
+
+  const nonce = Math.random().toString(36).slice(2)
+  const { masked, restore, placeholder } = maskCodeRegions(text, nonce)
+
+  // Collapse 3+ newline runs to a single clean `\n\n` gap (mirrors
+  // normalizeParagraphBreaks step 1) so a stray extra blank line never becomes
+  // an oversized gap. A genuine one-blank-line `\n\n` block gap is preserved.
+  const out = masked.replace(/\n{3,}/g, '\n\n')
+
+  // A line participating in a GFM block construct whose single-`\n` contiguity
+  // must survive (its interior must NOT get a hard break).
+  const isBlockConstructLine = (line: string): boolean =>
+    isListItemLine(line) ||
+    isTableRowLine(line) ||
+    isTableDelimiterLine(line) ||
+    isBlockquoteLine(line) ||
+    isHeadingLine(line) ||
+    isFenceOpenLine(line, placeholder)
+
+  const lines = out.split('\n')
+  const pieces: string[] = []
+  for (let i = 0; i < lines.length; i++) {
+    let line = lines[i]
+    const isLast = i === lines.length - 1
+    const next = isLast ? '' : lines[i + 1]
+    // Promote only between two non-blank content lines where NEITHER is a GFM
+    // block-construct line (so lists / tables / quotes / headings / fences keep
+    // their native single-`\n` stacking). A blank current/next line is a `\n\n`
+    // paragraph gap — never promote across it.
+    const promote =
+      !isLast &&
+      line.trim() !== '' &&
+      next.trim() !== '' &&
+      !isBlockConstructLine(line) &&
+      !isBlockConstructLine(next)
+    if (promote) {
+      // Strip trailing whitespace so a re-run emits exactly one `  \n` (never
+      // accumulate spaces). Include `\r` for CRLF sources.
+      line = line.replace(/[ \t\r]+$/, '')
+    }
+    pieces.push(line)
+    if (isLast) break
+    pieces.push(promote ? '  \n' : '\n')
+  }
+
+  return restore(pieces.join(''))
+}
+
+// ---------------------------------------------------------------------------
 // Paragraph spacers — restore a VISIBLE blank line between prose paragraphs
 // ---------------------------------------------------------------------------
 

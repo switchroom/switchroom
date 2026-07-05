@@ -16,10 +16,59 @@ import {
   normalizePunctuation,
   stripExcessBold,
   splitMarkdownChunks,
+  hardenCardBreaks,
   PARAGRAPH_SPACER,
 } from '../format.js'
 
 const SP = PARAGRAPH_SPACER // U+00A0
+
+describe('hardenCardBreaks — deterministic card line-break hardener', () => {
+  test('promotes lone field breaks to GFM hard breaks (the blob fix)', () => {
+    const out = hardenCardBreaks('Agent: assistant\nAuth: Max\nStatus: running')
+    expect(out).toBe('Agent: assistant  \nAuth: Max  \nStatus: running')
+  })
+
+  test('preserves `\\n\\n` block gaps (not promoted)', () => {
+    const out = hardenCardBreaks('**Header**\nfield one\n\n**Next**\nfield two')
+    expect(out).toBe('**Header**  \nfield one\n\n**Next**  \nfield two')
+  })
+
+  test('leaves GFM list items on their native single `\\n`', () => {
+    const out = hardenCardBreaks('- one\n- two\n- three')
+    expect(out).toBe('- one\n- two\n- three')
+  })
+
+  test('leaves GFM table rows untouched', () => {
+    const src = '| a | b |\n| - | - |\n| 1 | 2 |'
+    expect(hardenCardBreaks(src)).toBe(src)
+  })
+
+  test('never touches a fenced code block interior', () => {
+    const src = '**Accounts**\n```\nalice  ok\nbob    ok\n```\n**Agents**'
+    // The fenced monospace table keeps its single `\n`s; the header lines that
+    // face the fence are not hard-broken (fence line is a block construct).
+    expect(hardenCardBreaks(src)).toBe(src)
+  })
+
+  test('does not hard-break across a heading or blockquote', () => {
+    expect(hardenCardBreaks('# Title\nbody')).toBe('# Title\nbody')
+    expect(hardenCardBreaks('> quote\nbody')).toBe('> quote\nbody')
+  })
+
+  test('collapses 3+ newline runs to a single `\\n\\n` gap', () => {
+    expect(hardenCardBreaks('a\n\n\n\nb')).toBe('a\n\nb')
+  })
+
+  test('is idempotent', () => {
+    const src = 'Agent: x\nAuth: y\n\n**H**\n🟢 Broker running\n🟢 Kernel up'
+    const once = hardenCardBreaks(src)
+    expect(hardenCardBreaks(once)).toBe(once)
+  })
+
+  test('no-op for single-line text', () => {
+    expect(hardenCardBreaks('just one line')).toBe('just one line')
+  })
+})
 
 describe('addParagraphSpacers — uniform block spacing', () => {
   test('still spaces prose→prose (existing behaviour)', () => {

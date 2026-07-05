@@ -233,7 +233,7 @@ const REPLY_TO_TEXT_MAX = 200
 const SILENT_END_FALLBACK_TEXT =
   '⚠️ The agent finished working but didn’t send a reply — your last ' +
   'message may not have been answered. Please try asking again.'
-import { splitMarkdownChunks, hardSliceToCap, repairEscapedWhitespace, normalizeParagraphBreaks, addParagraphSpacers, normalizePunctuation, stripExcessBold, escapeMarkdown, RICH_MESSAGE_MAX_CHARS } from '../format.js'
+import { splitMarkdownChunks, hardSliceToCap, repairEscapedWhitespace, normalizeParagraphBreaks, addParagraphSpacers, normalizePunctuation, stripExcessBold, escapeMarkdown, hardenCardBreaks, RICH_MESSAGE_MAX_CHARS } from '../format.js'
 import { richMessage } from '../rich-send.js'
 import { scrubVoice } from '../text-voice-scrub.js'
 import {
@@ -10812,7 +10812,10 @@ function renderVaultRequestSaveCard(req: PendingVaultRequestSave, agentSlug: str
   }
   lines.push('')
   lines.push(`_Tap Save to write to the host vault, Rename to change the key name, or Discard to drop it. The value is held in this chat's gateway memory until you decide._`)
-  return lines.join('\n')
+  // hardenCardBreaks: labelled field lines (key: / why:) would soft-collapse
+  // into one blob under the GFM rich renderer; this card is sent direct via
+  // richMessage, bypassing the switchroomReply chokepoint.
+  return hardenCardBreaks(lines.join('\n'))
 }
 
 /**
@@ -11313,7 +11316,11 @@ async function executeVaultRequestAccess(args: Record<string, unknown>): Promise
   pendingVaultRequestAccesses.set(stageId, pending)
   sweepPendingVaultRequestAccesses()
 
-  const text = renderVaultRequestAccessCard(pending)
+  // hardenCardBreaks: the access-request card stacks labelled fields
+  // (key: / scope: / why:) with single `\n`, which soft-collapse into one
+  // blob under the GFM rich renderer — sent direct here, bypassing the
+  // switchroomReply chokepoint.
+  const text = hardenCardBreaks(renderVaultRequestAccessCard(pending))
   const threadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
   // Remember the agent's working topic so the grant-outcome inbound resumes in it.
   if (threadId != null) pending.threadId = threadId
@@ -15717,8 +15724,17 @@ async function switchroomReply(
   }
   // #2669: `options.html` now means "render `text` as GFM markdown via the
   // rich-message path" (legacy field name kept). Plain otherwise.
+  //
+  // Every deterministic slash-command card ships through this html branch as
+  // RAW markdown (no reply-path normalization). Under the Bot API 10.1 GFM
+  // renderer a lone `\n` is a SOFT break, so a card whose builder stacks
+  // labelled fields with single `\n` (e.g. `/usage`, `/model`, `/auth`)
+  // renders as one run-on blob. `hardenCardBreaks` promotes those lone
+  // field breaks to GFM hard breaks (`  \n`) while leaving lists / tables /
+  // fenced code / blockquotes / headings on their native single `\n` — the
+  // same treatment the direct-send cards get from `stackCardLines`.
   if (options.html) {
-    await ctx.replyWithRichMessage(richMessage(text), replyOpts)
+    await ctx.replyWithRichMessage(richMessage(hardenCardBreaks(text)), replyOpts)
   } else {
     await ctx.reply(text, replyOpts)
   }
