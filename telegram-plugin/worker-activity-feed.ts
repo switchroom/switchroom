@@ -38,7 +38,7 @@ import {
   truncate,
 } from './card-format.js'
 import { STATUS_ROLLING_LINES } from './status-no-truncate.js'
-import { renderStatusCard, formatFeedElapsed } from './tool-activity-summary.js'
+import { renderStatusCard, formatStepSuffix } from './tool-activity-summary.js'
 
 /** Worker-activity feed is ON by default; an operator opts out with
  *  SWITCHROOM_WORKER_ACTIVITY_FEED=0. */
@@ -226,6 +226,13 @@ interface WorkerHandle {
    * `· Ns` suffix climbs even when no fresh view arrives.
    */
   dispatchAtMs: number | null
+  /**
+   * Wall-clock ms the CURRENT step started — stamped whenever a NEW narrative
+   * line lands (the `→` line changes). The heartbeat's step suffix shows the
+   * step's OWN elapsed from this anchor (not the worker total, which the
+   * header already carries), and only once past STEP_TIMER_MIN_MS.
+   */
+  stepStartedAtMs: number | null
 }
 
 const COOLDOWN_JITTER_MS = 500
@@ -321,6 +328,9 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
     // same step re-appears once the earlier copy scrolls out of the window.
     if (h.narrative.includes(line)) return
     h.narrative.push(line)
+    // The `→` current-step line just CHANGED — reset the per-step timer so the
+    // heartbeat's `· Ns` suffix measures THIS step, not the whole worker run.
+    h.stepStartedAtMs = nowFn()
     // Rolling window — keep only the last STATUS_ROLLING_LINES in memory. The
     // render shows exactly those lines (clipped per-line by the unified pipeline);
     // fitCardToBudget is the wire-limit backstop.
@@ -470,11 +480,17 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       if (now - h.lastEditAt < minEditInterval) continue
       const stale = now - h.lastEditAt >= heartbeatTickMs
       if (!stale) continue
-      const liveSuffix = ' · ' + formatFeedElapsed(liveElapsed)
+      // Per-step suffix: the CURRENT step's own elapsed (since the `→` line
+      // last changed), never the worker total — the header already shows the
+      // total, and repeating it on the step line was the Ken-observed dupe.
+      // Under STEP_TIMER_MIN_MS formatStepSuffix returns '' (no timer yet);
+      // the header elapsed still climbs via the refreshed view below.
+      const stepElapsed = h.stepStartedAtMs != null ? now - h.stepStartedAtMs : liveElapsed
+      const liveSuffix = formatStepSuffix(stepElapsed)
       // Re-render THROUGH the chain + doUpdate path — never editMessageText directly.
       //
-      // CLOCK-ANCHOR PARITY: refresh the view's elapsedMs to the SAME
-      // `liveElapsed` the step suffix shows. The header renders
+      // CLOCK-ANCHOR PARITY: refresh the view's elapsedMs to the same `now`
+      // anchor the step suffix uses. The header renders
       // `view.elapsedMs`; passing the stale lastView froze the header at the
       // last watcher event while the `· Ns` suffix kept ticking, so the
       // current step's timer could read MORE than the card's master elapsed
@@ -521,6 +537,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
           chain: Promise.resolve(),
           lastView: null,
           dispatchAtMs: null,
+          stepStartedAtMs: null,
         }
         handles.set(agentId, h)
       }

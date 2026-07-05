@@ -114,7 +114,7 @@ import { renderVaultRequestAccessCard } from './vault-request-access-card.js'
 import { createPermissionCardStore } from './permission-card-store.js'
 import { pickRecoveredPermissionOrigin } from './permission-card-origin.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
-import { appendActivityLabel, clipNarrative, renderActivityFeedWithNested, type SessionActivityHeader } from '../tool-activity-summary.js'
+import { appendActivityLabel, clipNarrative, renderActivityFeedWithNested, formatStepSuffix, type SessionActivityHeader } from '../tool-activity-summary.js'
 import { REPLY_TOOLS, isDraftOfReply } from '../narrative-dedup.js'
 import { toolLabel } from '../tool-labels.js'
 import { createTypingWrapper } from '../typing-wrap.js'
@@ -1945,13 +1945,8 @@ const POST_ANSWER_LIVENESS_STALE_MS = parsePostAnswerLivenessMs(
   process.env.SWITCHROOM_POST_ANSWER_LIVENESS_STALE_MS,
 ) || 30_000
 
-/** Compact mm/ss-ish elapsed for the live feed suffix: "18s", "1m05s". */
-function formatFeedElapsed(ms: number): string {
-  const s = Math.floor(ms / 1000)
-  if (s < 60) return `${s}s`
-  const m = Math.floor(s / 60)
-  return `${m}m${(s % 60).toString().padStart(2, '0')}s`
-}
+// Live-feed step suffixes render via `formatStepSuffix` (tool-activity-summary):
+// the CURRENT step's own elapsed, shown only past STEP_TIMER_MIN_MS (10 s).
 
 /**
  * Authoritative "is a turn in flight?" for every gate that previously
@@ -12177,7 +12172,10 @@ function openLivenessFeedIfDue(turn: CurrentTurn): void {
   const livenessHeader: SessionActivityHeader = {
     label: 'Agent', elapsedMs: age, toolCount: turn.labeledToolCount, state: 'running',
   }
-  const rendered = renderActivityFeedWithNested(lines, [], false, ` · ${formatFeedElapsed(age)}`, undefined, livenessHeader)
+  // Liveness card is a single "step" whose start is the turn start, so `age`
+  // IS the step's own elapsed. formatStepSuffix keeps the `→` line timer-free
+  // until the step has run ≥ STEP_TIMER_MIN_MS (header total still shows).
+  const rendered = renderActivityFeedWithNested(lines, [], false, formatStepSuffix(age), undefined, livenessHeader)
   if (rendered == null) return
   turn.activityPendingRender = rendered
   const ea = emissionAuthorityFor(turn)
@@ -12297,8 +12295,10 @@ function feedHeartbeatTick(): void {
       label: 'Agent', elapsedMs: age, toolCount: turn.labeledToolCount, state: 'running',
     }
     const lines = turn.mirrorLines.length > 0 ? turn.mirrorLines : ['Working in background…']
+    // `subagentAt` is the worker's last ADVANCE — the current step's start —
+    // so this suffix is already per-step. formatStepSuffix adds the 10 s gate.
     const elapsed = Date.now() - subagentAt
-    const rendered = renderActivityFeedWithNested(lines, [], false, ` · ${formatFeedElapsed(elapsed)}`, undefined, livenessHeader)
+    const rendered = renderActivityFeedWithNested(lines, [], false, formatStepSuffix(elapsed), undefined, livenessHeader)
     if (rendered == null) return
     turn.activityPendingRender = rendered
     const ea = emissionAuthorityFor(turn)
@@ -12339,7 +12339,10 @@ function feedHeartbeatTick(): void {
   if (turn.lastToolLabelAt == null) return // feed not driven by a labelled step
   const elapsed = Date.now() - turn.lastToolLabelAt
   if (elapsed < FEED_HEARTBEAT_MIN_STALE_MS) return // step is fresh; feed advancing normally
-  const rendered = composeTurnActivity(turn, false, ` · ${formatFeedElapsed(elapsed)}`)
+  // `lastToolLabelAt` resets on every new tool label, so `elapsed` is the
+  // CURRENT step's own run time. formatStepSuffix holds the timer back until
+  // the step passes STEP_TIMER_MIN_MS (10 s) — header total is unaffected.
+  const rendered = composeTurnActivity(turn, false, formatStepSuffix(elapsed))
   if (rendered == null) return
   turn.activityPendingRender = rendered
   const ea = emissionAuthorityFor(turn)
