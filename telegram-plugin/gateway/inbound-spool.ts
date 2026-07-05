@@ -94,6 +94,28 @@ export function spoolId(msg: InboundMessage): string {
   ) {
     return `s:resume:${msg.meta.resume_turn_key}`
   }
+  // Cron BOOT-REPLAY (#2793 part B): a scheduled fire that the boot
+  // replay re-injects because it was missed across a restart. Keyed on
+  // the minute-aligned fire it is replaying (`replay_fire_ms`) plus the
+  // schedule index, NOT the fresh synthetic `messageId` (=ts, minted per
+  // replay attempt) — so a re-replay of the SAME missed fire across a
+  // subsequent gateway restart collapses to ONE live spool entry instead
+  // of stacking a fresh one each boot. This is what makes routing cron
+  // replays through the durable spool at-least-once WITH dedup, mirroring
+  // the resume/handback stable-id idiom above. Live (non-replay) cron
+  // ticks never set `replay_fire_ms`, so they are unaffected and keep
+  // their per-fire identity.
+  if (
+    msg.meta?.source === 'cron' &&
+    typeof msg.meta?.replay_fire_ms === 'string' &&
+    msg.meta.replay_fire_ms.length > 0
+  ) {
+    const idx =
+      typeof msg.meta?.schedule_index === 'string' && msg.meta.schedule_index.length > 0
+        ? msg.meta.schedule_index
+        : '-'
+    return `s:cron-replay:${msg.chatId}:${idx}:${msg.meta.replay_fire_ms}`
+  }
   if (typeof msg.messageId === 'number' && msg.messageId > 0) {
     return `m:${msg.chatId}:${msg.messageId}`
   }

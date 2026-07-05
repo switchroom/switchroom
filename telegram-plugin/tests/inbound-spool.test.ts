@@ -99,6 +99,48 @@ describe('spoolId — stable dedup key', () => {
     )
     expect(a).not.toBe(b)
   })
+  // #2793 part B: a cron BOOT-REPLAY carries meta.replay_fire_ms (the
+  // minute-aligned fire being replayed). spoolId() keys on it + the
+  // schedule index so a re-replay of the SAME missed fire across a gateway
+  // restart — which mints a fresh synthetic messageId=ts each boot —
+  // collapses to one live entry instead of stacking a fresh one each boot.
+  it('cron boot-replay → s:cron-replay:chat:idx:fireMs, stable across ts/messageId', () => {
+    const a = spoolId(
+      msg({
+        messageId: 1700_000_000_000,
+        ts: 1700_000_000_000,
+        meta: { source: 'cron', schedule_index: '3', replay_fire_ms: '1699999980000' },
+      }),
+    )
+    const b = spoolId(
+      msg({
+        messageId: 1700_000_999_999,
+        ts: 1700_000_999_999,
+        meta: { source: 'cron', schedule_index: '3', replay_fire_ms: '1699999980000' },
+      }),
+    )
+    expect(a).toBe('s:cron-replay:c1:3:1699999980000')
+    expect(b).toBe(a) // stable across the fresh per-boot messageId/ts
+  })
+  it('cron boot-replays for distinct missed fires stay distinct', () => {
+    const a = spoolId(
+      msg({ messageId: 0, meta: { source: 'cron', schedule_index: '3', replay_fire_ms: '100' } }),
+    )
+    const b = spoolId(
+      msg({ messageId: 0, meta: { source: 'cron', schedule_index: '3', replay_fire_ms: '200' } }),
+    )
+    const c = spoolId(
+      msg({ messageId: 0, meta: { source: 'cron', schedule_index: '4', replay_fire_ms: '100' } }),
+    )
+    expect(a).not.toBe(b) // different fire minute
+    expect(a).not.toBe(c) // different schedule index
+  })
+  it('a LIVE cron tick (no replay_fire_ms) keeps its per-fire identity', () => {
+    // Live ticks are not routed through the spool, but assert the id path
+    // is unchanged so live fires never collapse into a replay bucket.
+    const live = spoolId(msg({ messageId: 0, meta: { source: 'cron' }, ts: 500 }))
+    expect(live).toBe('s:c1:cron:500')
+  })
   it('subagent_handback without jsonl id falls back to legacy id (back-compat)', () => {
     const a = spoolId(
       msg({ messageId: 555, meta: { source: 'subagent_handback' }, ts: 100 }),
@@ -576,5 +618,68 @@ describe('inbound-spool — #2789 B: spool write failure surfaces a health signa
     expect(s.isDegraded()).toBe(false)
     expect(s.appendFailureCount()).toBe(0)
     expect(events).toEqual([true, false]) // degraded → recovered
+  })
+})
+
+// #2793 part B — cron boot-replay accept-vs-consume durability. A missed
+// scheduled fire re-injected at boot is routed through this spool by the
+// gateway's onInjectInbound handler (put on accept, ack on confirmed
+// delivery). These tests pin the two windows the ledger closes.
+describe('#2793 — cron boot-replay accept vs consume', () => {
+  function replayMsg(fireMs: number, boot: number): InboundMessage {
+    // A fresh synthetic messageId/ts is minted every replay attempt; the
+    // stable identity is (schedule_index, replay_fire_ms).
+    return msg({
+      messageId: boot,
+      ts: boot,
+      user: 'cron',
+      userId: 0,
+      meta: { source: 'cron', schedule_index: '3', replay_fire_ms: String(fireMs) },
+    })
+  }
+
+  it('accepted-but-NOT-consumed replay survives a restart and re-fires', () => {
+    const fs = fakeFs()
+    // Boot 1: the gateway accepts the replay (put) but the session never
+    // came up, so it is never delivered → never acked.
+    createInboundSpool({ path: PATH, fs, log: () => {} }).put('a', replayMsg(1000, 111))
+    // Boot 2: a fresh gateway rehydrates from the durable log. The un-acked
+    // replay is STILL live, so the boot-replay path re-delivers it — the
+    // silent-loss window (accepted, never consumed) is closed.
+    const s2 = createInboundSpool({ path: PATH, fs, log: () => {} })
+    const live = s2.liveEntries()
+    expect(live).toHaveLength(1)
+    expect(live[0]!.msg.meta?.replay_fire_ms).toBe('1000')
+  })
+
+  it('a CONSUMED replay (acked on delivery) does NOT re-fire on restart', () => {
+    const fs = fakeFs()
+    const s1 = createInboundSpool({ path: PATH, fs, log: () => {} })
+    const m = replayMsg(1000, 111)
+    s1.put('a', m)
+    s1.ack(m) // gateway delivered it to a live bridge → tombstone
+    // A fresh gateway sees the tombstone and does not re-deliver — the
+    // double-fire window is closed for a consumed replay.
+    const s2 = createInboundSpool({ path: PATH, fs, log: () => {} })
+    expect(s2.liveEntries()).toHaveLength(0)
+  })
+
+  it('a re-replay of the SAME missed fire dedups (at-least-once with dedup)', () => {
+    const fs = fakeFs()
+    const s = createInboundSpool({ path: PATH, fs, log: () => {} })
+    // First accept.
+    expect(s.put('a', replayMsg(1000, 111))).toBe(true)
+    // The scheduler re-replays the same missed fire on a later boot (fresh
+    // messageId/ts) while the first is still un-acked → collapses to one.
+    expect(s.put('a', replayMsg(1000, 222))).toBe(false)
+    expect(s.liveCount()).toBe(1)
+  })
+
+  it('distinct missed fires are each retained (no cross-fire collapse)', () => {
+    const fs = fakeFs()
+    const s = createInboundSpool({ path: PATH, fs, log: () => {} })
+    expect(s.put('a', replayMsg(1000, 111))).toBe(true)
+    expect(s.put('a', replayMsg(2000, 222))).toBe(true)
+    expect(s.liveCount()).toBe(2)
   })
 })
