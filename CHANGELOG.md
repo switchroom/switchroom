@@ -1,5 +1,95 @@
 # Changelog
 
+## v0.17.8 — Hindsight synthesis layers complete: specialized banks + curated mental models
+
+Closes out the Hindsight synthesis-layers RFC
+(`reference/rfcs/hindsight-synthesis-layers.md`) — Phases 2 through 5 — so
+memory banks are *specialized*, corrections *stick*, and per-specialist mental
+models can be curated without ever crossing the no-silent-self-write line.
+
+### PR A — Close out bank specialization (hindsight Phase 2 / #2871)
+
+Phase 2's core mission/disposition threading (`reflect_mission`,
+`observations_mission`, per-bank `disposition`) already landed via #2855
+(shipped in v0.17.7). This resolves the phase's one remaining open item — the
+dormant #2816 recall tag-filter port — by **documenting it as intentionally
+dormant** rather than wiring a speculative per-bank tag taxonomy the RFC
+doesn't specify. `scaffold.ts` gains a decision comment + `TODO(#2816)`
+spelling out exactly how to wire it later (the `HINDSIGHT_RECALL_TAGS` env
+escape hatch stays available to advanced operators), and a new regression test
+locks the scaffold to the vendor no-op defaults so no agent's recall is
+silently tag-scoped. RFC Phase 2 marked SHIPPED; no runtime behavior change.
+
+### PR B — Deterministic correction capture that sticks (hindsight Phase 3 / #2873)
+
+Extends the Stage-B directive-capture *nudge* (#2864) with a **Stage-C
+Stop-hook post-turn verifier** (`vendor/hindsight-memory/scripts/directive_verify.py`).
+Stage B was purely advisory — when the model silently ignored the nudge a
+durable correction was lost the same way it was pre-Stage-B (Stage A measured a
+~55% miss rate). The verifier isolates the human turn, tests it against a
+**narrow, high-precision** durable-rule regex (a strict subset of Stage B's
+detector, AND-gated on `looks_like_standing_rule`), and — if a durable rule was
+stated but **no** `create_directive` fired — blocks the stop **once** to
+re-prompt capture. Invariant-clean, identical to Stage B: pure-regex detection
+(no model callsite), no silent hook-side write (the model still authors the
+directive verbatim, visible in chat), at-most-once per turn with an explicit
+one-off escape. Reuses the `memory.directive_capture_nudge` knob (disabling the
+nudge disables the verifier). **Also fixes a retain double-fire**: the block
+re-fires the Stop event, so `retain.py` now early-returns under
+`stop_hook_active=true` to avoid POSTing a duplicate transcript document and
+double-incrementing the retain cadence counter.
+
+### PR C — Consolidation-driven remembered/updated surface (hindsight Phase 4 / #2872)
+
+Adds the poll-free **UPDATE** side of the Phase 4 chat-legible memory surface,
+the background counterpart to the foreground store/forget path shipped in
+#2858 (v0.17.7). When the consolidation engine distils a new durable
+observation (or supersedes a stale one) it emits a `consolidation.completed`
+webhook and the gateway surfaces ONE terse line
+(`🧠 updated what I know about "…"` / `🧠 revised …`). New pure
+`consolidation-legibility.ts` module (materiality filter + per-agent rate
+limiter: 10-min interval, 1-h identical-line dedup); `recordWebhookEvent`
+routes the verified event to a **send-free** sink, still audited to
+`webhook-events.jsonl`, **never** injected as a model turn. No model call, no
+polling, no `claude -p`. **Plumbed but dormant** — gated OFF by default
+(`SWITCHROOM_CONSOLIDATION_LEGIBILITY`, opt-in), and the pinned hindsight
+image (v0.8.4) does **not** yet emit `consolidation.completed`, so the consumer
+stays inert until that upstream event ships. The payload parser tolerates
+several plausible field aliases; whoever lands the hindsight-side emitter
+should pin the exact schema.
+
+### PR D — Operator-declared per-agent mental models (hindsight Phase 5 / #2874)
+
+Lands the **operator-curated declarative** half of Phase 5, plus the design
+note (`reference/rfcs/hindsight-phase5-mental-model-curation.md`). Adds
+`memory.mental_models[]` (`{ name, source_query, refresh_after_consolidation?,
+max_tokens? }`), accepted at the **per-agent tier only**, consumed by a
+generalized `ensureMentalModel` / `ensureDeclaredMentalModels` on scaffold +
+reconcile. Avoids every harm that #2447 removed by construction: **no blind
+seeding** (zero declarations = byte-for-byte post-#2447 behavior, no default
+model), **no identity collision** (profile banks still own "who the user is";
+these answer *domain* questions), **no self-escalation** (declarations are
+operator-edited in `switchroom.yaml`), and **no fleet-wide over-seeding** (never
+accepted at `defaults`/profile tier). Refresh is opt-in, off by default.
+
+### PR E — Agent-proposes / human-approves mental models (hindsight Phase 5 / #2875)
+
+Adds the **second half** of the Phase 5 shape on top of PR D: the agent
+**proposes** a mental model, the human **approves in chat**, and on approval it
+becomes a first-class declared model in `agents.<self>.memory.mental_models[]`
+— consumed by the exact `ensureDeclaredMentalModels` path from PR D. New
+`mental_model_propose` gateway MCP tool mirrors the `vault_request_access`
+shape: renders a `[✅ Approve] [🚫 Deny]` card, ends the turn, resumes via a
+synthetic inbound. On approve, the gateway builds a unified diff **appending**
+the model and submits it through hostd's `config_propose_edit` apply+reconcile
+machinery (hostd stays the sole config writer); the #1977 single-tap
+correlation avoids a second card since the operator already approved on the
+proposal card. Guardrails: propose-only/self-approve impossible (operator-only
+tap + hostd gate), duplicate-name rejected before any card, per-agent ≤5
+cards/hour, a narrow self-scope gate letting a non-admin agent append **only**
+to its own `memory.mental_models[]`. Nothing is created before the human taps;
+live-session-only (no 3am cards into an empty topic).
+
 ## v0.17.7 — Approvals survive restarts + specialized, chat-legible memory
 
 ### PR A — Re-arm approval cards across restarts + bridge request ledger (#2861/#2867)
