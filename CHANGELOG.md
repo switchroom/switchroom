@@ -1,5 +1,30 @@
 # Changelog
 
+## unreleased — hostd self-bump: one-call agent-driven fleet rolls
+
+- **hostd self-bumps on a stale-CLI rollout instead of refusing** (#2645):
+  hostd's CLI is baked into its image, so it is older than EVERY freshly
+  tagged release — which made every agent-invoked `rollout` to a new version
+  fail `preflight-stale-cli`, with a host-shell-only remedy (`switchroom
+  hostd install --tag …`). The root agent could never roll a release by
+  itself; agents worked around it by hand-editing hostd's compose file. Now,
+  when the pin is newer than hostd's own CLI, hostd: verifies the target
+  image is pullable (`docker manifest inspect` — refuses cleanly when the
+  docker-images workflow hasn't finished), tag-bumps its own compose in
+  place (backup kept), writes a resume marker, and hands its own recreate to
+  a detached sibling helper container (`docker run -d --rm`, docker.sock +
+  hostd dir only — a sibling survives the recreate that would SIGKILL any
+  in-container driver, brick scenario #1/#2458). The NEW hostd finds the
+  marker at boot and relaunches the roll under the SAME request_id, so the
+  audit hash-chain, in-chat narration and `get_status` all continue
+  seamlessly. Marker is single-shot (deleted before validation), staleness-
+  capped at 15 min, and shape-validated; a failed helper is caught by a
+  `docker wait` watcher that rolls the compose bump back and writes a loud
+  terminal row. New `self-bump` / `self-bump-done` narration phases. The
+  rollout terminal warnings now name exactly what stays on the prior version
+  (web dashboard, host operator CLI) with the host-side finish commands
+  (#2645 item 3).
+
 ## v0.16.50 — Fleet-wide webkite render config
 
 ### Web extraction

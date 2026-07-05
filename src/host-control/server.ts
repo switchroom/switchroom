@@ -38,6 +38,8 @@ import {
   writeSync,
   fsyncSync,
   closeSync,
+  copyFileSync,
+  unlinkSync,
 } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { createHash, randomUUID, randomBytes } from "node:crypto";
@@ -62,6 +64,19 @@ import {
   isVersionAssertable,
   type RolloutPhase,
 } from "../cli/rollout.js";
+import { SWITCHROOM_VERSION } from "../cli/resolve-version.js";
+import {
+  needsSelfBump,
+  bumpHostdComposeImageTag,
+  encodePendingRolloutMarker,
+  parsePendingRolloutMarker,
+  isMarkerFresh,
+  selfBumpHelperArgs,
+  SELF_BUMP_MARKER_FILENAME,
+  SELF_BUMP_HELPER_CONTAINER,
+  SELF_BUMP_LOG_FILENAME,
+  type PendingRolloutMarker,
+} from "./self-bump.js";
 import { parseUpdateResultLine } from "../cli/update.js";
 import { parseAuditLine, latestRolloutRowForRequest } from "./audit-reader.js";
 import {
@@ -170,6 +185,20 @@ export interface ServerOptions {
    * transport as the approval card). Fire-and-forget; never blocks/fails the
    * roll. Unset → no terminal ping (durable audit row is still written). */
   rolloutRelay?: RolloutRelay;
+  /**
+   * The daemon's own CLI version, compared against a rollout pin to
+   * decide whether hostd must self-bump before driving the roll (#2645).
+   * Default: the build-stamped SWITCHROOM_VERSION. Test seam.
+   */
+  selfVersion?: string;
+  /**
+   * The operator home as the HOST sees it — used as the bind-source
+   * prefix for the self-bump helper container's mounts (a `/host-home/…`
+   * container path is meaningless to dockerd). Default:
+   * `SWITCHROOM_HOST_HOME` env (set in the hostd compose), falling back
+   * to `homeDir` for the host-direct daemon. Test seam.
+   */
+  hostHomeDir?: string;
   /** Test seam: override the random hex id generator. */
   generateApprovalId?: () => string;
   /** Test seam: override the `switchroom apply` subprocess invocation. */
@@ -572,6 +601,17 @@ export class HostdServer {
     // a root-owned 0700 dir, so no agent could ever reach the daemon.
     await chmod(hostdDir, 0o755).catch(() => undefined);
 
+    // #2645 — self-bump boot resume. MUST run before the sockets bind
+    // (so no incoming request can race the fleet-mutation lock the resume
+    // takes) and before the orphan sweep below (a resumable roll isn't an
+    // orphan — its terminal row is still coming). Best-effort: a resume
+    // failure logs + terminal-rows but never blocks boot.
+    await this.resumePendingSelfBumpRollout().catch((e) => {
+      process.stderr.write(
+        `hostd: self-bump resume failed (non-fatal): ${(e as Error).message}\n`,
+      );
+    });
+
     const agentNames = Object.keys(this.opts.agentUids).sort();
     if (agentNames.length === 0) {
       // No admin agents declared yet. Phase 1 no-op exit — the
@@ -924,7 +964,7 @@ export class HostdServer {
           resp = this.handleApply(req, caller, started);
           break;
         case "rollout":
-          resp = this.handleRollout(req, caller, started);
+          resp = await this.handleRollout(req, caller, started);
           break;
         case "agent_start":
           resp = await this.handleAgentStart(req, started);
@@ -1451,23 +1491,67 @@ export class HostdServer {
    * Returns `started`; default wire timeout (no long override) — same
    * async fire-and-forget pattern as update_apply.
    */
-  private handleRollout(
+  private async handleRollout(
     req: Extract<HostdRequest, { op: "rollout" }>,
     caller: SocketIdentity,
     started: number,
-  ): HostdResponse {
+  ): Promise<HostdResponse> {
     const denied = this.checkFleetMutationLock(req.op, req.request_id, started);
     if (denied) return denied;
+
+    // #2645 item 1 — hostd self-bump. hostd's CLI is baked into its image,
+    // so it is older than EVERY freshly tagged release; without this branch
+    // the roll is refused by the CLI-side `preflight-stale-cli` guard and
+    // the only remedy is a host-shell `hostd install`, defeating the
+    // agent-driven roll entirely. Instead: tag-bump hostd's own compose,
+    // hand off to a detached sibling helper that recreates this container
+    // on the target image, and let the NEW hostd resume this very request
+    // from the marker at boot (see resumePendingSelfBumpRollout).
+    if (
+      needsSelfBump(this.opts.selfVersion ?? SWITCHROOM_VERSION, req.args.pin)
+    ) {
+      return this.beginSelfBump(req, caller, started);
+    }
 
     const assetDenied = this.applyAssetPreflight(req.request_id, started);
     if (assetDenied) return assetDenied;
 
-    const args = ["rollout", "--pin", req.args.pin];
-    if (req.args.agents && req.args.agents.length > 0) {
-      args.push("--agents", req.args.agents.join(","));
+    const entry = this.launchRollout(req.args, req.request_id, caller, started);
+    return {
+      v: 1,
+      request_id: entry.request_id,
+      result: "started",
+      exit_code: null,
+      duration_ms: Date.now() - started,
+    };
+  }
+
+  /**
+   * Shared tail of the rollout launch: build the child argv, capture
+   * prior-pin + install context, record the status entry, take the
+   * fleet-mutation lock and spawn the child. Used by the direct
+   * `handleRollout` path and by the post-self-bump boot resume — the two
+   * MUST stay behaviorally identical so a resumed roll is
+   * indistinguishable from a direct one downstream (audit, narration,
+   * get_status).
+   */
+  private launchRollout(
+    args: {
+      pin: string;
+      agents?: string[];
+      skip_web?: boolean;
+      allow_downgrade?: boolean;
+    },
+    request_id: string,
+    caller: SocketIdentity,
+    started: number,
+  ): StatusEntry {
+    const argv = ["rollout", "--pin", args.pin];
+    if (args.agents && args.agents.length > 0) {
+      argv.push("--agents", args.agents.join(","));
     }
-    if (req.args.skip_web) args.push("--skip-web");
-    if (req.args.allow_downgrade) args.push("--allow-downgrade");
+    if (args.skip_web) argv.push("--skip-web");
+    if (args.allow_downgrade) argv.push("--allow-downgrade");
 
     const installCtx = readCachedInstallType(
       this.opts.bindRoot ?? this.opts.homeDir,
@@ -1492,6 +1576,143 @@ export class HostdServer {
     }
 
     const entry: StatusEntry = {
+      request_id,
+      caller,
+      op: "rollout",
+      result: "started",
+      exit_code: null,
+      started_at: started,
+      finished_at: null,
+      stdout_tail: "",
+      stderr_tail: "",
+      pin: args.pin,
+      install_context: {
+        install_type: installCtx.install_type,
+        detected_at: installCtx.detected_at,
+      },
+      ...(priorPin ? { prior_pin: priorPin } : {}),
+    };
+    this.recordStatus(entry);
+    this.fleetMutationInFlight = {
+      op: "rollout",
+      request_id,
+      started_at: started,
+    };
+    this.spawnRollout(argv, entry);
+    return entry;
+  }
+
+  /** Daemon-view path of the hostd dir (compose file, marker, sockets). */
+  private hostdDirPath(): string {
+    return join(this.opts.homeDir, ".switchroom", "hostd");
+  }
+
+  /** HOST-view path of the hostd dir — what dockerd resolves bind sources
+   *  against. Inside the dockerized daemon `homeDir` is `/host-home`,
+   *  which is meaningless to dockerd; SWITCHROOM_HOST_HOME (baked into the
+   *  hostd compose env) carries the real host home. */
+  private hostdDirHostPath(): string {
+    const hostHome =
+      this.opts.hostHomeDir ??
+      process.env.SWITCHROOM_HOST_HOME?.trim() ??
+      this.opts.homeDir;
+    return join(hostHome, ".switchroom", "hostd");
+  }
+
+  /**
+   * #2645 item 1 — begin a hostd self-bump: tag-bump hostd's own compose
+   * to the roll's target, write the resume marker, and hand the recreate
+   * to a DETACHED SIBLING helper container. Answers `started`; the roll
+   * itself is relaunched by the NEW hostd's boot resume under the same
+   * request_id. Everything before the helper spawn is reversible; a
+   * failed spawn restores the compose + marker so nothing changed.
+   */
+  private async beginSelfBump(
+    req: Extract<HostdRequest, { op: "rollout" }>,
+    caller: SocketIdentity,
+    started: number,
+  ): Promise<HostdResponse> {
+    const ownVersion = this.opts.selfVersion ?? SWITCHROOM_VERSION;
+    const composePath = join(this.hostdDirPath(), "docker-compose.yml");
+    if (!existsSync(composePath)) {
+      return deniedResponse(
+        req.request_id,
+        `rollout: hostd's CLI (v${ownVersion}) is older than the target ` +
+          `${req.args.pin} and needs a self-bump first, but its compose file ` +
+          `is missing at ${composePath}. Run \`switchroom hostd install ` +
+          `--tag ${req.args.pin}\` on the host, then re-run the roll. ` +
+          `Nothing was changed.`,
+        Date.now() - started,
+      );
+    }
+    const before = readFileSync(composePath, "utf8");
+    const bumped = bumpHostdComposeImageTag(before, req.args.pin);
+    if (!bumped) {
+      return deniedResponse(
+        req.request_id,
+        `rollout: hostd needs a self-bump to ${req.args.pin} but no ` +
+          `switchroom-hostd image line was found in ${composePath} ` +
+          `(hand-edited compose?). Run \`switchroom hostd install --tag ` +
+          `${req.args.pin}\` on the host, then re-run the roll. Nothing ` +
+          `was changed.`,
+        Date.now() - started,
+      );
+    }
+
+    // Verify the target image is actually published BEFORE committing to
+    // anything — a roll fired minutes after a tag push can beat the
+    // docker-images workflow. Manifest inspect is a fast metadata round-trip
+    // (no layer download); a failure refuses cleanly with nothing changed.
+    const probe = await this.runDocker([
+      "manifest",
+      "inspect",
+      bumped.newImageRef,
+    ]);
+    if (probe.exit_code !== 0) {
+      return deniedResponse(
+        req.request_id,
+        `rollout: hostd needs a self-bump to ${req.args.pin} but the target ` +
+          `image ${bumped.newImageRef} is not pullable yet (docker manifest ` +
+          `inspect failed: ${tail(probe.stderr).trim() || "unknown error"}). ` +
+          `The docker-images workflow may still be building — retry in a ` +
+          `few minutes. Nothing was changed.`,
+        Date.now() - started,
+      );
+    }
+
+    // A stuck helper from a previous attempt holds the fixed name; remove
+    // it so the fresh spawn can't fail on a name conflict. Per-name rm -f
+    // of a container we own by construction (labeled switchroom.hostd-selfbump).
+    await this.runDocker(["rm", "-f", SELF_BUMP_HELPER_CONTAINER]).catch(
+      () => undefined,
+    );
+
+    const ts = new Date().toISOString().replace(/[:.]/g, "-");
+    const bakPath = `${composePath}.bak-selfbump-${ts}`;
+    const markerPath = join(this.hostdDirPath(), SELF_BUMP_MARKER_FILENAME);
+    const marker: PendingRolloutMarker = {
+      v: 1,
+      request_id: req.request_id,
+      pin: req.args.pin,
+      ...(req.args.agents && req.args.agents.length > 0
+        ? { agents: req.args.agents }
+        : {}),
+      ...(req.args.skip_web ? { skip_web: true } : {}),
+      ...(req.args.allow_downgrade ? { allow_downgrade: true } : {}),
+      caller:
+        caller.kind === "agent"
+          ? { kind: "agent", name: caller.name }
+          : { kind: "operator" },
+      created_at: new Date().toISOString(),
+      prior_hostd_version: ownVersion,
+    };
+    copyFileSync(composePath, bakPath);
+    writeFileSync(composePath, bumped.yaml, "utf8");
+    writeFileSync(markerPath, encodePendingRolloutMarker(marker), {
+      mode: 0o600,
+    });
+
+    const entry: StatusEntry = {
       request_id: req.request_id,
       caller,
       op: req.op,
@@ -1502,11 +1723,6 @@ export class HostdServer {
       stdout_tail: "",
       stderr_tail: "",
       pin: req.args.pin,
-      install_context: {
-        install_type: installCtx.install_type,
-        detected_at: installCtx.detected_at,
-      },
-      ...(priorPin ? { prior_pin: priorPin } : {}),
     };
     this.recordStatus(entry);
     this.fleetMutationInFlight = {
@@ -1514,14 +1730,197 @@ export class HostdServer {
       request_id: req.request_id,
       started_at: started,
     };
-    this.spawnRollout(args, entry);
+    // Durable phase row + narration: the operator sees "hostd refreshing
+    // itself" instead of a silent gap while the container recreates.
+    this.onRolloutPhase(entry, { phase: "self-bump", target: req.args.pin });
+
+    const rollbackBump = (): void => {
+      try {
+        copyFileSync(bakPath, composePath);
+        unlinkSync(markerPath);
+      } catch (e) {
+        process.stderr.write(
+          `hostd: self-bump rollback failed (compose/marker may need manual ` +
+            `restore from ${bakPath}): ${(e as Error).message}\n`,
+        );
+      }
+    };
+
+    const helper = await this.runDocker(
+      selfBumpHelperArgs({
+        hostdDirHostPath: this.hostdDirHostPath(),
+        image: bumped.newImageRef,
+      }),
+    ).catch((e) => ({
+      exit_code: -1,
+      stdout: "",
+      stderr: (e as Error).message,
+    }));
+    if (helper.exit_code !== 0) {
+      rollbackBump();
+      entry.result = "error";
+      entry.finished_at = Date.now();
+      entry.error = `self-bump helper spawn failed: ${tail(helper.stderr).trim()}`;
+      this.fleetMutationInFlight = null;
+      void this.writeTerminalAudit(entry);
+      return {
+        v: 1,
+        request_id: req.request_id,
+        result: "error",
+        exit_code: null,
+        duration_ms: Date.now() - started,
+        error:
+          `rollout: could not spawn the hostd self-bump helper container ` +
+          `(${tail(helper.stderr).trim() || "unknown error"}). The compose ` +
+          `bump was rolled back — nothing is changed. Fallback: ` +
+          `\`switchroom hostd install --tag ${req.args.pin}\` on the host, ` +
+          `then re-run the roll.`,
+      };
+    }
+
+    // Watch the helper from the OLD hostd. On success the helper recreates
+    // this very container, so the watcher usually dies before firing — by
+    // design. It only ever resolves meaningfully on FAILURE (pull error,
+    // compose error): we are still alive, the marker would otherwise sit
+    // until the staleness cutoff, and the caller would poll a perpetual
+    // `started`. Fail loudly instead: restore, clear, terminal row.
+    void this.runDocker(["wait", SELF_BUMP_HELPER_CONTAINER])
+      .then((w) => {
+        const code = Number.parseInt(w.stdout.trim(), 10);
+        if (w.exit_code === 0 && code === 0) return; // recreate imminent
+        rollbackBump();
+        entry.result = "error";
+        entry.finished_at = Date.now();
+        entry.error =
+          `self-bump helper failed (container exit ${Number.isFinite(code) ? code : "unknown"}). ` +
+          `See ${join(this.hostdDirHostPath(), SELF_BUMP_LOG_FILENAME)} on the host. ` +
+          `Compose bump rolled back. Fallback: \`switchroom hostd install ` +
+          `--tag ${req.args.pin}\` host-side, then re-run the roll.`;
+        if (
+          this.fleetMutationInFlight &&
+          this.fleetMutationInFlight.request_id === entry.request_id
+        ) {
+          this.fleetMutationInFlight = null;
+        }
+        void this.writeTerminalAudit(entry);
+        this.pushRolloutTerminal(entry);
+      })
+      .catch(() => undefined);
+
     return {
       v: 1,
       request_id: req.request_id,
       result: "started",
       exit_code: null,
       duration_ms: Date.now() - started,
+      payload: JSON.stringify({
+        phase: "self-bump",
+        pin: req.args.pin,
+        rolled: [],
+        note:
+          `hostd's CLI (v${ownVersion}) is older than ${req.args.pin}, so ` +
+          `hostd is refreshing itself first: its container restarts on the ` +
+          `target image (~30-60s blip on this socket), then the roll resumes ` +
+          `AUTOMATICALLY under this same request_id. Poll get_status with ` +
+          `this request_id after the blip; do NOT re-issue the rollout.`,
+      }),
     };
+  }
+
+  /**
+   * Boot-side of the self-bump (#2645): if the previous hostd process
+   * left a pending-rollout marker, relaunch that roll now — same
+   * request_id, so the audit chain, narration surface and get_status
+   * continue seamlessly. Single-shot: the marker is deleted before any
+   * validation so a crash-looping resume can't re-fire the roll forever.
+   * Runs BEFORE the sockets bind (no request can race the lock) and
+   * BEFORE the orphan sweep (a resumable roll isn't an orphan).
+   */
+  private async resumePendingSelfBumpRollout(): Promise<void> {
+    const markerPath = join(this.hostdDirPath(), SELF_BUMP_MARKER_FILENAME);
+    if (!existsSync(markerPath)) return;
+    let raw: string;
+    try {
+      raw = readFileSync(markerPath, "utf8");
+    } finally {
+      try {
+        unlinkSync(markerPath);
+      } catch {
+        // Unreadable AND undeletable — nothing safe to do; the orphan
+        // sweep will surface the stranded roll.
+      }
+    }
+    const marker = parsePendingRolloutMarker(raw!);
+    if (!marker) {
+      process.stderr.write(
+        `hostd: pending-rollout marker at ${markerPath} was malformed — ` +
+          `dropped without resuming. The originating roll will surface via ` +
+          `the orphan sweep.\n`,
+      );
+      return;
+    }
+    const caller: SocketIdentity =
+      marker.caller.kind === "agent"
+        ? { kind: "agent", name: marker.caller.name }
+        : { kind: "operator" };
+    const failResume = async (why: string): Promise<void> => {
+      const entry: StatusEntry = {
+        request_id: marker.request_id,
+        caller,
+        op: "rollout",
+        result: "error",
+        exit_code: null,
+        started_at: Date.parse(marker.created_at) || Date.now(),
+        finished_at: Date.now(),
+        stdout_tail: "",
+        stderr_tail: "",
+        pin: marker.pin,
+        failed_step: "self-bump",
+        error: why,
+      };
+      this.recordStatus(entry);
+      process.stderr.write(`hostd: self-bump resume failed: ${why}\n`);
+      await this.writeTerminalAudit(entry);
+      this.pushRolloutTerminal(entry);
+    };
+
+    const ownVersion = this.opts.selfVersion ?? SWITCHROOM_VERSION;
+    if (!isMarkerFresh(marker, Date.now())) {
+      await failResume(
+        `pending-rollout marker for ${marker.pin} (request_id ` +
+          `${marker.request_id}) was older than the resume cutoff — the ` +
+          `self-bump helper likely stalled. hostd is now on v${ownVersion}. ` +
+          `Re-issue the rollout to try again.`,
+      );
+      return;
+    }
+    if (needsSelfBump(ownVersion, marker.pin)) {
+      await failResume(
+        `hostd is still on v${ownVersion} after the self-bump to ` +
+          `${marker.pin} (helper failed? see ` +
+          `${join(this.hostdDirHostPath(), SELF_BUMP_LOG_FILENAME)}). ` +
+          `Fallback: \`switchroom hostd install --tag ${marker.pin}\` ` +
+          `host-side, then re-issue the rollout.`,
+      );
+      return;
+    }
+
+    process.stderr.write(
+      `hostd: resuming rollout ${marker.request_id} → ${marker.pin} after ` +
+        `self-bump (v${marker.prior_hostd_version} → v${ownVersion})\n`,
+    );
+    const entry = this.launchRollout(
+      {
+        pin: marker.pin,
+        ...(marker.agents ? { agents: marker.agents } : {}),
+        ...(marker.skip_web ? { skip_web: true } : {}),
+        ...(marker.allow_downgrade ? { allow_downgrade: true } : {}),
+      },
+      marker.request_id,
+      caller,
+      Date.now(),
+    );
+    this.onRolloutPhase(entry, { phase: "self-bump-done", target: marker.pin });
   }
 
   /** Synchronous: `switchroom agent start <name>` — fast (~1-2s for
