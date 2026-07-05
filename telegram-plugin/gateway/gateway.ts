@@ -383,6 +383,7 @@ import {
 import { loadObligations, persistObligations } from './obligation-store.js'
 import {
   loadStatusPins,
+  mutateStatusPinRow,
   pinnedMessageIsOurs,
   reconcileAndPersistStatusPin,
   runStatusPinBootCleanup,
@@ -5659,22 +5660,37 @@ const statusPinStoreFs = {
 }
 const statusPinPersistEnabled = !STATIC && PIN_STATUS_WHILE_WORKING
 
-// The full live claim set as persisted rows (confirmed pins), from the Maps.
-function snapshotStatusPins(): PersistedStatusPin[] {
-  const snapshot: PersistedStatusPin[] = []
-  for (const [pinKey, state] of statusPinState) {
-    const chatId = statusPinChatIds.get(pinKey)
-    if (chatId == null) continue
-    snapshot.push({ pinKey, chatId, messageId: state.messageId })
-  }
-  return snapshot
-}
+// Slot-banner pin persistence (#421 crash-recovery). The slot banner is pinned
+// in the owner chat when the agent is on a non-default OAuth slot. Rather than a
+// parallel store + second boot hook, its pin is persisted in the SAME
+// status-pins.json store under a distinct `banner:` pinKey, so the ONE existing
+// runStatusPinBootCleanup unpins an orphaned banner on boot for free. Every
+// write to the shared store is a per-key read-modify-write under the store's
+// per-path lock (mutateStatusPinRow / reconcileAndPersistStatusPin), so the two
+// pin kinds (map-backed status pins + this banner row) can never clobber each
+// other's rows — the "other" rows always come from the authoritative on-disk
+// file, never from a possibly-stale in-memory snapshot.
+const BANNER_PIN_KEY = 'banner:owner'
+// Banner persistence rides the same "store is usable" gate as status pins minus
+// the worker-pin feature flag: the banner is an independent feature, so it must
+// persist/recover whenever there's a real state volume (STATIC = no volume/dry
+// run → no-op). The boot-cleanup gate below is widened to cover this.
+const bannerPinPersistEnabled = !STATIC
 
-// The live claim set EXCLUDING one key — used by reconcileAndPersistStatusPin so
-// it can rewrite the whole set atomically while it flips that one key's record
-// between pending / confirmed / absent.
-function snapshotStatusPinsExcept(exceptKey: string): PersistedStatusPin[] {
-  return snapshotStatusPins().filter((p) => p.pinKey !== exceptKey)
+// Persist (or drop) the slot-banner's pin row into the shared store. Routes
+// through mutateStatusPinRow: a read-modify-write for ONLY the banner:owner key,
+// serialised on the store's per-path lock, so the live fg:/wk: status-pin rows
+// on disk are carried through unchanged and never clobbered. Best-effort +
+// gated: no-op when the store isn't usable (STATIC). Fire-and-forget — the
+// mutation never rejects (persist is fail-open, load is fail-open).
+function persistBannerRow(row: PersistedStatusPin | null): void {
+  if (!bannerPinPersistEnabled) return
+  void mutateStatusPinRow(
+    STATUS_PIN_STORE_PATH,
+    statusPinStoreFs,
+    BANNER_PIN_KEY,
+    row,
+  )
 }
 
 // The Bot API surface the pin driver needs. `lockedBot` is defined later; wrap
@@ -5707,7 +5723,11 @@ function statusPinApi(): PinBotApi {
  * positives.
  */
 async function statusPinBootCleanup(): Promise<void> {
-  if (!statusPinPersistEnabled) return
+  // Runs when EITHER pin kind could have written the shared store: the
+  // map-backed status pins (statusPinPersistEnabled) or the slot banner
+  // (bannerPinPersistEnabled). A single cleanup drains ALL orphaned rows —
+  // status pins AND banner alike — since they share status-pins.json.
+  if (!statusPinPersistEnabled && !bannerPinPersistEnabled) return
   const api = statusPinApi()
   const { cleared, total } = await runStatusPinBootCleanup({
     path: STATUS_PIN_STORE_PATH,
@@ -5818,7 +5838,6 @@ async function reconcileStatusPinInner(
     pinKey,
     chatId,
     op,
-    snapshotOthers: () => snapshotStatusPinsExcept(pinKey),
     applyPin: runReconcile,
   })
   if (next == null) {
@@ -18365,6 +18384,17 @@ async function refreshPinnedBanner(reason: string): Promise<void> {
       prevState: pinnedBannerState,
       onError: (phase, err) => {
         process.stderr.write(`telegram gateway: banner ${phase} failed (${reason}): ${err}\n`)
+      },
+      // Durable pin persistence into the SHARED status-pin store (distinct
+      // `banner:` pinKey). persist-BEFORE-pin ordering: pending() lands before
+      // the pinChatMessage call so a crash in that window is recoverable by the
+      // one runStatusPinBootCleanup on next boot. Best-effort / gated no-op.
+      persist: {
+        pending: (chatId, messageId) =>
+          persistBannerRow({ pinKey: BANNER_PIN_KEY, chatId, messageId, pending: true }),
+        confirm: (chatId, messageId) =>
+          persistBannerRow({ pinKey: BANNER_PIN_KEY, chatId, messageId }),
+        clear: () => persistBannerRow(null),
       },
     })
   } catch (err) {

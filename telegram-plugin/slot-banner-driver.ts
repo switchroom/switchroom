@@ -72,6 +72,23 @@ export interface RefreshBannerArgs {
   /** Optional API-failure observer. Phase identifies which Bot API
    *  call failed so the caller can log meaningfully. Default: silent. */
   onError?: (phase: 'pin' | 'edit' | 'unpin', err: unknown) => void;
+  /** Optional durable-persistence hooks so an orphaned banner pin is
+   *  recoverable across a gateway crash. The gateway wires these to the
+   *  shared status-pin store (a distinct `banner:` pinKey), mirroring the
+   *  status-pin store's persist-BEFORE-pin ordering. All hooks are
+   *  best-effort — the driver guards each call so a throwing hook can never
+   *  break banner pinning (persistence is cosmetic-recovery, never load-bearing
+   *  for the live pin). Omit entirely to disable persistence (unit tests). */
+  persist?: {
+    /** Record a PENDING pin: the banner message was sent but the pin API call
+     *  has not yet confirmed. Called AFTER sendMessage, BEFORE pinChatMessage,
+     *  so a crash in that window leaves a recoverable record on disk. */
+    pending?: (chatId: string, messageId: number) => void;
+    /** Rewrite the record as confirmed once the pin lands. */
+    confirm?: (chatId: string, messageId: number) => void;
+    /** Drop the persisted record (banner unpinned, cleared, or pin failed). */
+    clear?: () => void;
+  };
 }
 
 /**
@@ -95,6 +112,17 @@ export async function refreshBanner(
     args.defaultSlot,
   );
 
+  // Persistence hooks are cosmetic-recovery; a throwing hook must never break
+  // live banner pinning. Guard every call.
+  const safePersist = (fn: (() => void) | undefined) => {
+    if (!fn) return;
+    try {
+      fn();
+    } catch {
+      /* best-effort — persistence failures degrade to in-memory-only */
+    }
+  };
+
   if (action.kind === 'noop') return args.prevState;
 
   if (action.kind === 'unpin') {
@@ -105,7 +133,10 @@ export async function refreshBanner(
     }
     // Even if unpin failed, drop our claim — the message may have been
     // unpinned out-of-band (operator did it manually) and re-pinning
-    // would be more confusing than surfacing it again later.
+    // would be more confusing than surfacing it again later. Drop the
+    // persisted record too (unpin-then-clear mirrors the status-pin store:
+    // a crash between unpin and clear just re-unpins next boot, idempotent).
+    safePersist(args.persist?.clear);
     return null;
   }
 
@@ -122,15 +153,24 @@ export async function refreshBanner(
       args.onError?.('pin', err);
       return args.prevState;
     }
+    // Persist INTENT (pending) BEFORE the pin API call: a crash between the pin
+    // landing and its confirm rewrite leaves a pending record that boot cleanup
+    // unpins next boot — closing the persist-after-pin leak.
+    safePersist(() => args.persist?.pending?.(String(args.ownerChatId), sent.message_id));
     try {
       await args.bot.api.pinChatMessage(args.ownerChatId, sent.message_id, {
         disable_notification: true,
       });
     } catch (err) {
       args.onError?.('pin', err);
-      // sendMessage succeeded but pin failed — don't claim the message.
+      // sendMessage succeeded but pin failed — don't claim the message, and
+      // drop the pending record so we don't leave a phantom claim for a pin
+      // that never landed.
+      safePersist(args.persist?.clear);
       return args.prevState;
     }
+    // Pin confirmed — rewrite the record without the pending flag.
+    safePersist(() => args.persist?.confirm?.(String(args.ownerChatId), sent.message_id));
     return { messageId: sent.message_id, slot: action.slot };
   }
 

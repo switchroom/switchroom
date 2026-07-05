@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   loadStatusPins,
+  mutateStatusPinRow,
   persistStatusPins,
   pinnedMessageIsOurs,
   reconcileAndPersistStatusPin,
@@ -259,6 +260,193 @@ describe("runStatusPinBootCleanup", () => {
 });
 
 /**
+ * Concurrency race (multiple writers of status-pins.json). The store has two
+ * concurrent writers: `reconcileAndPersistStatusPin` (fg:/wk: rows) and
+ * `mutateStatusPinRow` (the banner:owner row). The race: a `pending` row is
+ * written to disk BEFORE the applyPin network call; if a SECOND writer runs
+ * DURING that await window and rebuilds the file, it can drop the in-flight
+ * pending/confirmed row. The per-path lock + read-modify-write must close it —
+ * BOTH rows survive.
+ */
+describe("status-pin-store — concurrent-writer race", () => {
+  it("a banner persist DURING the applyPin await window does NOT drop the status pin's pending row", async () => {
+    const { fs } = memFs();
+
+    // applyPin is a promise we control: it resolves only when we let it, so we
+    // can fire a concurrent writer squarely inside the await window.
+    let releaseApplyPin!: () => void;
+    const applyPinGate = new Promise<void>((r) => {
+      releaseApplyPin = r;
+    });
+    // Snapshot what's on disk at the moment the pin API is invoked (proves the
+    // pending row was written before the network call).
+    let onDiskAtPin: PersistedStatusPin[] = [];
+
+    const reconcile = reconcileAndPersistStatusPin({
+      path: PATH,
+      fs,
+      pinKey: "fg:c:3",
+      chatId: "-100123",
+      op: { kind: "pin", messageId: 715 },
+      applyPin: async () => {
+        onDiskAtPin = loadStatusPins(PATH, fs);
+        await applyPinGate; // in-flight: hold the pin open
+        return { messageId: 715 };
+      },
+      log: () => {},
+    });
+
+    // Let the reconcile reach its applyPin await (pending row now on disk).
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(onDiskAtPin).toEqual([
+      { pinKey: "fg:c:3", chatId: "-100123", messageId: 715, pending: true },
+    ]);
+
+    // Fire the banner persist DURING the await window. Under the per-path lock
+    // it must serialise AFTER the reconcile completes — its read-modify-write
+    // then sees the confirmed fg: row and preserves it.
+    const bannerPersist = mutateStatusPinRow(
+      PATH,
+      fs,
+      "banner:owner",
+      { pinKey: "banner:owner", chatId: "-100999", messageId: 42 },
+      () => {},
+    );
+
+    // Now release the pin so the reconcile confirms.
+    releaseApplyPin();
+    await reconcile;
+    await bannerPersist;
+
+    // BOTH rows survive: the status pin was NOT dropped by the concurrent
+    // banner write (the pre-fix bug), and the banner row is present.
+    const loaded = loadStatusPins(PATH, fs);
+    expect(loaded).toContainEqual({
+      pinKey: "fg:c:3",
+      chatId: "-100123",
+      messageId: 715,
+    });
+    expect(loaded).toContainEqual({
+      pinKey: "banner:owner",
+      chatId: "-100999",
+      messageId: 42,
+    });
+    expect(loaded).toHaveLength(2);
+  });
+
+  it("two concurrent key reconciles both survive (no lost pending row)", async () => {
+    const { fs } = memFs();
+
+    let releaseA!: () => void;
+    const gateA = new Promise<void>((r) => {
+      releaseA = r;
+    });
+
+    const reconcileA = reconcileAndPersistStatusPin({
+      path: PATH,
+      fs,
+      pinKey: "fg:c:3",
+      chatId: "-100123",
+      op: { kind: "pin", messageId: 715 },
+      applyPin: async () => {
+        await gateA;
+        return { messageId: 715 };
+      },
+      log: () => {},
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Second key's reconcile fires while A's pin is in-flight. Serialised by the
+    // lock, it runs after A confirms — its read-modify-write preserves A's row.
+    const reconcileB = reconcileAndPersistStatusPin({
+      path: PATH,
+      fs,
+      pinKey: "wk:agent-x",
+      chatId: "-100999",
+      op: { kind: "pin", messageId: 42 },
+      applyPin: async () => ({ messageId: 42 }),
+      log: () => {},
+    });
+
+    releaseA();
+    await reconcileA;
+    await reconcileB;
+
+    const loaded = loadStatusPins(PATH, fs);
+    expect(loaded).toContainEqual({
+      pinKey: "fg:c:3",
+      chatId: "-100123",
+      messageId: 715,
+    });
+    expect(loaded).toContainEqual({
+      pinKey: "wk:agent-x",
+      chatId: "-100999",
+      messageId: 42,
+    });
+    expect(loaded).toHaveLength(2);
+  });
+
+  // This is the case the LOCK (not just per-key RMW) is required for: two
+  // overlapping ops on the SAME pinKey. Different-key writers survive with or
+  // without serialisation (RMW alone preserves them), so the two tests above
+  // pass even against a no-op lock. Here a `clear` races a `pin` on one key:
+  // without the lock the clear runs inside the pin's await window, removes the
+  // pending row, and the pin's later confirm RESURRECTS a pin that was meant to
+  // be cleared. With the FIFO lock the clear waits until the pin fully confirms,
+  // then removes it — final state is correctly empty. Asserting absence is what
+  // distinguishes the real lock from a no-op one.
+  it("a clear racing a pin on the SAME key does not resurrect the cleared pin", async () => {
+    const { fs } = memFs();
+
+    let releasePin!: () => void;
+    const pinGate = new Promise<void>((r) => {
+      releasePin = r;
+    });
+
+    // Pin op acquires the lock first and holds it across its applyPin await.
+    const pin = reconcileAndPersistStatusPin({
+      path: PATH,
+      fs,
+      pinKey: "fg:c:3",
+      chatId: "-100123",
+      op: { kind: "pin", messageId: 715 },
+      applyPin: async () => {
+        await pinGate;
+        return { messageId: 715 };
+      },
+      log: () => {},
+    });
+    // Reach the applyPin await — pending row now on disk, lock held.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Clear the SAME key while the pin is in-flight. FIFO-serialised behind the
+    // pin, it must run only AFTER the pin confirms, leaving the key removed.
+    const clear = reconcileAndPersistStatusPin({
+      path: PATH,
+      fs,
+      pinKey: "fg:c:3",
+      chatId: "-100123",
+      op: { kind: "clear" },
+      applyPin: async () => null,
+      log: () => {},
+    });
+
+    releasePin();
+    await pin;
+    await clear;
+
+    // The later-submitted clear wins: the key is gone, NOT resurrected by the
+    // pin's confirm write (which would happen under a no-op lock).
+    const loaded = loadStatusPins(PATH, fs);
+    expect(loaded.find((r) => r.pinKey === "fg:c:3")).toBeUndefined();
+    expect(loaded).toHaveLength(0);
+  });
+});
+
+/**
  * Envelope versioning — a v1 snapshot (no `pending` field) must still load
  * fail-open as a confirmed pin, and v2 must round-trip the `pending` flag.
  */
@@ -322,7 +510,6 @@ describe("reconcileAndPersistStatusPin — persist-before-pin ordering", () => {
       pinKey: "fg:c:3",
       chatId: "-100123",
       op: { kind: "pin", messageId: 715 },
-      snapshotOthers: () => [],
       applyPin: async () => {
         order.push("pin-api");
         onDiskAtPin = loadStatusPins(PATH, fs);
@@ -354,7 +541,6 @@ describe("reconcileAndPersistStatusPin — persist-before-pin ordering", () => {
         pinKey: "fg:c:3",
         chatId: "-100123",
         op: { kind: "pin", messageId: 715 },
-        snapshotOthers: () => [],
         applyPin: async () => {
           pinnedInTelegram = 715; // the pin landed in Telegram
           throw new Error("SIGKILL — process died before confirm rewrite");
@@ -395,7 +581,6 @@ describe("reconcileAndPersistStatusPin — persist-before-pin ordering", () => {
       pinKey: "fg:c:3",
       chatId: "-100123",
       op: { kind: "pin", messageId: 715 },
-      snapshotOthers: () => [],
       // reconcilePin returns null (prevState) when the pin API throws.
       applyPin: async () => null,
       log: () => {},
@@ -412,18 +597,49 @@ describe("reconcileAndPersistStatusPin — persist-before-pin ordering", () => {
       chatId: "-100999",
       messageId: 42,
     };
+    // Others now come from the on-disk file (read-modify-write), not a caller
+    // snapshot — seed the other key's row on disk first.
+    persistStatusPins(PATH, fs, [other]);
     await reconcileAndPersistStatusPin({
       path: PATH,
       fs,
       pinKey: "fg:c:3",
       chatId: "-100123",
       op: { kind: "pin", messageId: 715 },
-      snapshotOthers: () => [other],
       applyPin: async () => ({ messageId: 715 }),
       log: () => {},
     });
     const loaded = loadStatusPins(PATH, fs);
     expect(loaded).toContainEqual(other);
+    expect(loaded).toContainEqual({
+      pinKey: "fg:c:3",
+      chatId: "-100123",
+      messageId: 715,
+    });
+  });
+
+  it("uses on-disk OTHER rows (not a memory snapshot) — an on-disk key is preserved", async () => {
+    // The banner (or another key's) row can exist ON DISK without the reconcile
+    // caller knowing about it. Read-modify-write must carry it through.
+    const { fs } = memFs();
+    persistStatusPins(PATH, fs, [
+      { pinKey: "banner:owner", chatId: "-100999", messageId: 42 },
+    ]);
+    await reconcileAndPersistStatusPin({
+      path: PATH,
+      fs,
+      pinKey: "fg:c:3",
+      chatId: "-100123",
+      op: { kind: "pin", messageId: 715 },
+      applyPin: async () => ({ messageId: 715 }),
+      log: () => {},
+    });
+    const loaded = loadStatusPins(PATH, fs);
+    expect(loaded).toContainEqual({
+      pinKey: "banner:owner",
+      chatId: "-100999",
+      messageId: 42,
+    });
     expect(loaded).toContainEqual({
       pinKey: "fg:c:3",
       chatId: "-100123",
@@ -440,7 +656,6 @@ describe("reconcileAndPersistStatusPin — persist-before-pin ordering", () => {
       pinKey: "fg:c:3",
       chatId: "-100123",
       op: { kind: "clear" },
-      snapshotOthers: () => [],
       applyPin: async () => null,
       log: () => {},
     });
