@@ -540,6 +540,23 @@ function emitImageOrBuild(
 }
 
 /**
+ * Emit a `logging:` block capping the Docker json-file log driver.
+ *
+ * `restart: always` services run for weeks; without a cap the json-file
+ * sink (distinct from the in-container `service.log`, cf. #739) grows
+ * unbounded and fills the host disk. A full disk then breaks every write
+ * path fleet-wide — the failure ancestor behind many durability bugs.
+ * 10 MB × 3 files bounds each container to ~30 MB of stdout/stderr.
+ */
+function emitLogging(lines: string[]): void {
+  lines.push(`    logging:`);
+  lines.push(`      driver: json-file`);
+  lines.push(`      options:`);
+  lines.push(`        max-size: "10m"`);
+  lines.push(`        max-file: "3"`);
+}
+
+/**
  * Emit the `voice-sidecar` singleton service (PR-B2) — a local GPU
  * speech-to-text server (faster-whisper) the gateway POSTs voice bytes to
  * when the host's voice verdict is `local`. Caller gates emission on the
@@ -576,6 +593,7 @@ function emitVoiceSidecarService(
   lines.push(`      switchroom.role: "voice-sidecar"`);
   lines.push(`      switchroom.fleet: "${containerNamePrefix}"`);
   lines.push(`    restart: always`);
+  emitLogging(lines);
   // GPU passthrough — requires the nvidia-container-toolkit on the host
   // (the PR-B1 `containerToolkit` probe; a `local` verdict implies it).
   lines.push(`    deploy:`);
@@ -1286,6 +1304,7 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   lines.push(`      switchroom.role: "broker"`);
   lines.push(`      switchroom.fleet: "${containerNamePrefix}"`);
   lines.push(`    restart: always`);
+  emitLogging(lines);
   // Liveness probe — bind-presence. The broker creates per-agent
   // socket directories at startup and binds `<dir>/sock` for each
   // configured agent. If at least one bind has happened, the daemon
@@ -1516,6 +1535,7 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   lines.push(`      switchroom.role: "kernel"`);
   lines.push(`      switchroom.fleet: "${containerNamePrefix}"`);
   lines.push(`    restart: always`);
+  emitLogging(lines);
   // Mirror the broker's bind-presence healthcheck — same failure-mode
   // surface (kernel binds per-agent sockets at
   // /run/switchroom/kernel/<agent>/sock; silently exits or hangs the
@@ -1608,6 +1628,7 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   lines.push(`      switchroom.role: "auth-broker"`);
   lines.push(`      switchroom.fleet: "${containerNamePrefix}"`);
   lines.push(`    restart: always`);
+  emitLogging(lines);
   // Bind-presence healthcheck — same probe pattern as vault-broker /
   // approval-kernel (PR #898). Empty-fleet trade-off applies: a
   // switchroom install with zero agents and zero consumers reports
@@ -1859,6 +1880,7 @@ function emitAgentService(
     lines.push(`    network_mode: host`);
   }
   lines.push(`    restart: always`);
+  emitLogging(lines);
   lines.push(`    init: false`);
   // PTY allocation — claude's interactive mode requires a TTY at stdin
   // (the alt-screen UI, autoaccept-poll keystrokes, and the `--print`

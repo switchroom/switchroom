@@ -1,7 +1,7 @@
 import { randomBytes, scryptSync, createCipheriv, createDecipheriv } from "node:crypto";
 import {
   readFileSync,
-  writeFileSync,
+  writeSync,
   existsSync,
   renameSync,
   mkdirSync,
@@ -84,8 +84,25 @@ function atomicWriteFileSync(path: string, data: string, mode: number): void {
   const dir = dirname(resolve(effectivePath));
   const tmp = resolve(dir, `.${basename(effectivePath)}.${process.pid}.${Date.now()}.tmp`);
   try {
-    writeFileSync(tmp, data, { encoding: "utf8", mode });
+    // Write + fsync the tmp file's contents to stable storage BEFORE the
+    // rename. Without the fsync, a host crash can leave the renamed file
+    // present-but-empty (the dirent is durable but the data blocks aren't) —
+    // a torn/zeroed vault survives the crash. Mirrors backup.ts's pattern.
+    const fd = openSync(tmp, "wx", mode);
+    try {
+      writeSync(fd, data);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
     renameSync(tmp, effectivePath);
+    // Durability: fsync the parent dir so the rename's dirent update is
+    // persisted — otherwise POSIX permits a post-rename crash to lose it.
+    // Best-effort: some filesystems refuse fsync on directories.
+    try {
+      const dirFd = openSync(dir, "r");
+      try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+    } catch {}
   } catch (err) {
     try { if (existsSync(tmp)) unlinkSync(tmp); } catch {}
     throw err;

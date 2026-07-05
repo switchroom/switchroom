@@ -48,6 +48,10 @@ export function openGrantsDb(dbPath = DEFAULT_GRANTS_DB_PATH): Database {
 
   // Enable WAL mode for better concurrency
   db.run("PRAGMA journal_mode=WAL");
+  // Without a busy_timeout, bun:sqlite defaults to 0ms and a contending
+  // writer fails IMMEDIATELY with SQLITE_BUSY — a grant write can be
+  // silently dropped. Wait-and-retry instead of dropping.
+  db.run("PRAGMA busy_timeout=5000");
   db.run("PRAGMA foreign_keys=ON");
 
   // Idempotent schema migration — vault grants (existing) + approval kernel

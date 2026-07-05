@@ -140,6 +140,11 @@ export function initHistory(stateDir: string, retentionDays = 30): void {
   // and survives crashes more cleanly than rollback journal.
   db.exec('PRAGMA journal_mode = WAL')
   db.exec('PRAGMA synchronous = NORMAL')
+  // Without a busy_timeout, bun:sqlite defaults to 0ms and a contending
+  // writer fails IMMEDIATELY with SQLITE_BUSY. History rows feed owed-reply
+  // logic (a dropped write can lose an owed reply), so wait-and-retry rather
+  // than drop. Mirrors the registry DB's pattern (turns-schema.ts).
+  db.exec('PRAGMA busy_timeout = 5000')
   db.exec(`
     CREATE TABLE IF NOT EXISTS messages (
       chat_id        TEXT    NOT NULL,
