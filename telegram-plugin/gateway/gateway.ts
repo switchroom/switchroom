@@ -12599,6 +12599,13 @@ function handleSessionEvent(ev: SessionEvent): void {
             deliveryQueue,
             chatKey(ev.chatId, ev.threadId != null ? Number(ev.threadId) : null),
             ev.messageId,
+            // #2786 — pass the raw enqueue envelope so the ack survives the
+            // composer merging/reordering inbound wrappers (the single
+            // re-parsed `ev.messageId` can then belong to a sibling, not our
+            // tracked message). The tolerant match scans all ids in this
+            // content; a synthetic-source turn still lacks the user id, so the
+            // cross-source false-ack guard holds.
+            ev.rawContent,
           )
         }
         // PR3b-cutover: feed the authoritative turn-start to the delivery

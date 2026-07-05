@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import {
   ackDelivery,
   createDeliveryQueue,
+  extractEnqueueMessageIds,
   forgetDelivery,
   isTrackableResumeSynthetic,
   shouldTrackDelivery,
@@ -148,6 +149,63 @@ describe('ackDelivery — message-id-matched (cross-source false-ack guard)', ()
     trackDelivery(q, 'chat:_', { text: 'x' }, 0) // no messageId
     expect(ackDelivery(q, 'chat:_', '5001')).toBe(true)
     expect(q.pending.size).toBe(0)
+  })
+})
+
+// Regression for #2786 — the enqueue-ack mismatch that re-delivers a RUNNING
+// turn (a duplicate turn / double-actioned user message). Delivery-confirm
+// re-parses the `<channel message_id="…">` envelope back out of the transcript
+// to match the ack. When the composer merges/reorders inbound envelopes, the
+// single re-parsed id can belong to a sibling, so strict equality mis-concludes
+// "never delivered" and the sweep re-delivers a turn already running. Passing
+// the raw enqueue content lets the ack tolerate that by scanning every id.
+describe('ackDelivery — composer-tolerant match (#2786 duplicate-turn guard)', () => {
+  const envelope = (id: string, text: string) =>
+    `<channel source="telegram" chat_id="555" message_id="${id}" user="ken">${text}</channel>`
+
+  it('reproduces the bug: strict re-parsed id mismatch would NOT ack (pre-fix)', () => {
+    const q = fresh()
+    trackDelivery(q, 'chat:_', { text: 'run the deploy' }, 0, '5002')
+    // Composer merged an earlier sibling first, so parseChannelMeta re-parsed
+    // the FIRST id (5001), not our tracked 5002. Without the content, no ack →
+    // the sweep would re-deliver the already-running turn (the duplicate).
+    expect(ackDelivery(q, 'chat:_', '5001')).toBe(false)
+    expect(sweep(q, 15_000, TIMEOUT)).toHaveLength(1) // would double-action
+  })
+
+  it('acks when the tracked id appears anywhere in the merged enqueue content', () => {
+    const q = fresh()
+    trackDelivery(q, 'chat:_', { text: 'run the deploy' }, 0, '5002')
+    const merged = `${envelope('5001', 'hi')}\n${envelope('5002', 'run the deploy')}`
+    // First-parsed id is the sibling's 5001, but our 5002 is present in content.
+    expect(ackDelivery(q, 'chat:_', '5001', merged)).toBe(true)
+    expect(q.pending.size).toBe(0)
+    expect(sweep(q, 15_000, TIMEOUT)).toHaveLength(0) // no duplicate turn
+  })
+
+  it('acks on a reformatted single envelope where content still carries the id', () => {
+    const q = fresh()
+    trackDelivery(q, 'chat:_', { text: 'x' }, 0, '5002')
+    // Re-parse yielded null (wrapper reformatted) but the id survives in content.
+    expect(ackDelivery(q, 'chat:_', null, envelope('5002', 'x'))).toBe(true)
+    expect(q.pending.size).toBe(0)
+  })
+
+  it('preserves the cross-source false-ack guard: a synthetic turn whose content lacks our id does NOT ack', () => {
+    const q = fresh()
+    trackDelivery(q, 'chat:_', { text: 'real user msg' }, 0, '5002')
+    // A cron/resume turn under the same key — its envelope carries a fabricated
+    // id, never the user's 5002. Even with content scanning, it must not ack.
+    const cron = envelope('1716123456789', 'scheduled digest')
+    expect(ackDelivery(q, 'chat:_', '1716123456789', cron)).toBe(false)
+    expect(q.pending.size).toBe(1)
+    expect(sweep(q, 15_000, TIMEOUT)).toHaveLength(1) // user msg re-delivered, not dropped
+  })
+
+  it('extractEnqueueMessageIds pulls every id from a merged envelope', () => {
+    const merged = `${envelope('5001', 'a')}\n${envelope('5002', 'b')}`
+    expect(extractEnqueueMessageIds(merged)).toEqual(['5001', '5002'])
+    expect(extractEnqueueMessageIds('no envelope here')).toEqual([])
   })
 })
 
