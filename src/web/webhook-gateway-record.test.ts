@@ -392,4 +392,111 @@ describe('recordWebhookEvent', () => {
     const result = recordWebhookEvent(baseRecord(), deps)
     expect(result.status).toBe('error')
   })
+
+  // ── Consolidation-legibility (hindsight Phase 4) ────────────────────────
+  const consolidationConfig: RecordDeps['loadConfig'] = () =>
+    ({
+      telegram: { forum_chat_id: '-100123' },
+      agents: { reggie: { topic_id: 42, channels: { telegram: {} } } },
+    }) as unknown as ReturnType<NonNullable<RecordDeps['loadConfig']>>
+
+  function consolidationRec(
+    payload: Record<string, unknown> = { stored: 1, subject: 'x' },
+  ): WebhookGatewayRecord {
+    return baseRecord({
+      source: 'hindsight',
+      event_type: 'consolidation.completed',
+      rendered_text: 'consolidation done',
+      delivery_id: undefined,
+      payload,
+    })
+  }
+
+  it('delegates a consolidation.completed event to onConsolidation with the resolved target', () => {
+    const { resolveAgentDir, root } = makeTmpResolveAgentDir()
+    const seen: Array<{ rec: WebhookGatewayRecord; target: { chatId: string; threadId?: number } }> =
+      []
+    const injected: unknown[] = []
+    const deps: RecordDeps = {
+      resolveAgentDir,
+      dedupStore: makeDedupStore(),
+      log: () => {},
+      loadConfig: consolidationConfig,
+      inject: () => {
+        injected.push(true)
+        return true
+      },
+      onConsolidation: (rec, target) => seen.push({ rec, target }),
+    }
+
+    const result = recordWebhookEvent(consolidationRec(), deps)
+
+    expect(result.status).toBe('ok')
+    // Never injected as a model turn — it is a discrete status line.
+    expect(injected).toHaveLength(0)
+    expect(result.dispatched).toBeUndefined()
+    expect(seen).toHaveLength(1)
+    expect(seen[0].target).toEqual({ chatId: '-100123', threadId: 42 })
+    expect(seen[0].rec.payload).toEqual({ stored: 1, subject: 'x' })
+
+    // Still recorded to the audit log regardless of surfacing.
+    const logPath = join(root, 'reggie', 'telegram', 'webhook-events.jsonl')
+    const lines = readFileSync(logPath, 'utf-8').split('\n').filter(Boolean)
+    expect(lines).toHaveLength(1)
+    expect(JSON.parse(lines[0]).event_type).toBe('consolidation.completed')
+  })
+
+  it('skips onConsolidation (but still records) when there is no chat target', () => {
+    const { resolveAgentDir, root } = makeTmpResolveAgentDir()
+    const seen: unknown[] = []
+    const deps: RecordDeps = {
+      resolveAgentDir,
+      dedupStore: makeDedupStore(),
+      log: () => {},
+      loadConfig: () =>
+        ({ agents: { reggie: { channels: { telegram: {} } } } }) as unknown as ReturnType<
+          NonNullable<RecordDeps['loadConfig']>
+        >,
+      onConsolidation: () => seen.push(true),
+    }
+
+    const result = recordWebhookEvent(consolidationRec(), deps)
+    expect(result.status).toBe('ok')
+    expect(seen).toHaveLength(0)
+    const logPath = join(root, 'reggie', 'telegram', 'webhook-events.jsonl')
+    expect(readFileSync(logPath, 'utf-8').split('\n').filter(Boolean)).toHaveLength(1)
+  })
+
+  it('records the consolidation event even when onConsolidation throws', () => {
+    const { resolveAgentDir, root } = makeTmpResolveAgentDir()
+    const deps: RecordDeps = {
+      resolveAgentDir,
+      dedupStore: makeDedupStore(),
+      log: () => {},
+      loadConfig: consolidationConfig,
+      onConsolidation: () => {
+        throw new Error('surface boom')
+      },
+    }
+
+    const result = recordWebhookEvent(consolidationRec(), deps)
+    expect(result.status).toBe('ok')
+    const logPath = join(root, 'reggie', 'telegram', 'webhook-events.jsonl')
+    expect(readFileSync(logPath, 'utf-8').split('\n').filter(Boolean)).toHaveLength(1)
+  })
+
+  it('is a no-op sink when onConsolidation is not provided (event still recorded)', () => {
+    const { resolveAgentDir, root } = makeTmpResolveAgentDir()
+    const deps: RecordDeps = {
+      resolveAgentDir,
+      dedupStore: makeDedupStore(),
+      log: () => {},
+      loadConfig: consolidationConfig,
+    }
+
+    const result = recordWebhookEvent(consolidationRec(), deps)
+    expect(result.status).toBe('ok')
+    const logPath = join(root, 'reggie', 'telegram', 'webhook-events.jsonl')
+    expect(readFileSync(logPath, 'utf-8').split('\n').filter(Boolean)).toHaveLength(1)
+  })
 })

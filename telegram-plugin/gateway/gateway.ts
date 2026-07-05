@@ -98,6 +98,14 @@ import {
   isMemoryLegibilityEnabled,
   renderMemoryLegibilityLine,
 } from '../memory-legibility.js'
+import {
+  ConsolidationRateLimiter,
+  consolidationSignature,
+  detectConsolidationEvent,
+  isConsolidationLegibilityEnabled,
+  renderConsolidationLine,
+} from '../consolidation-legibility.js'
+import type { WebhookGatewayRecord } from '../../src/web/webhook-gateway-record.js'
 import { reconcilePin, type PinBotApi } from '../status-pin-driver.js'
 import type { PinState, DesiredPin } from '../status-pin.js'
 import { decidePinAction } from '../status-pin.js'
@@ -6412,6 +6420,19 @@ const SILENCE_LIVENESS_PRODUCTION = process.env.SWITCHROOM_SILENCE_LIVENESS_PROD
 // on ordinary recall or routine consolidation. Default ON;
 // SWITCHROOM_MEMORY_LEGIBILITY=0 disables it.
 const MEMORY_LEGIBILITY_ENABLED = isMemoryLegibilityEnabled(process.env.SWITCHROOM_MEMORY_LEGIBILITY)
+// Consolidation-driven legibility (#2849 follow-up, hindsight Phase 4). The
+// "updated what I know about Y" side, driven by the background
+// `consolidation.completed` webhook rather than a foreground tool call.
+// OPT-IN (default OFF), unlike MEMORY_LEGIBILITY_ENABLED above: this path is
+// fed by an unbounded background engine + a webhook the pinned hindsight image
+// does not yet emit, so the RFC keeps it "sparse … clearly gated".
+const CONSOLIDATION_LEGIBILITY_ENABLED = isConsolidationLegibilityEnabled(
+  process.env.SWITCHROOM_CONSOLIDATION_LEGIBILITY,
+)
+// One long-lived limiter across all consolidation events — collapses a burst
+// of material consolidations to at most one line per interval, and suppresses
+// an identical "updated about X" line inside the dedup window.
+const consolidationRateLimiter = new ConsolidationRateLimiter()
 
 /**
  * Feed-survival predicate — the single source of truth for "is this turn
@@ -8891,6 +8912,7 @@ const ipcServer: IpcServer = createIpcServer({
           {
             inject: webhookInject,
             log: (s) => process.stderr.write(`telegram gateway: ${s}`),
+            onConsolidation: surfaceConsolidationLegibility,
           },
         ),
     })
@@ -12640,6 +12662,65 @@ function surfaceMemoryLegibility(
   ).catch((err) => {
     process.stderr.write(
       `telegram gateway: memory-legibility send failed: ${
+        err instanceof Error ? err.message : String(err)
+      }\n`,
+    )
+  })
+}
+
+/**
+ * #2849 hindsight Phase 4 (follow-up) — consolidation-driven legibility.
+ *
+ * The gateway-side sink for a verified `hindsight` / `consolidation.completed`
+ * webhook. `recordWebhookEvent` has already logged the event for audit and
+ * resolved the agent's channel target; this decides whether it is MATERIAL
+ * (a genuine store/correct — else nothing), rate-limits it hard, and — only
+ * if it clears both gates — sends ONE terse "🧠 updated what I know about Y"
+ * real message with notifications suppressed. Never injects a model turn.
+ * OPT-IN via SWITCHROOM_CONSOLIDATION_LEGIBILITY.
+ */
+function surfaceConsolidationLegibility(
+  rec: WebhookGatewayRecord,
+  target: { chatId: string; threadId?: number },
+): void {
+  if (!CONSOLIDATION_LEGIBILITY_ENABLED) return
+  const event = detectConsolidationEvent(rec.payload)
+  if (event == null) return // routine no-op consolidation — surface nothing
+  const agent = rec.agent
+  // Rate-limiter clock MUST be wall-clock (Date.now()), never rec.ts: rec.ts
+  // can be derived from the (attacker-influenceable) webhook payload, and a
+  // spoofed far-past / far-future timestamp would poison the per-agent
+  // min-interval gate — either permanently opening it (stale ts always older
+  // than the window) or jamming it shut. The limiter only cares about "how
+  // long since the last surface on THIS gateway", which is a local wall-clock
+  // question.
+  if (!consolidationRateLimiter.allow(agent, consolidationSignature(event), Date.now())) {
+    process.stderr.write(
+      `telegram gateway: consolidation-legibility ${event.kind} rate-limited ` +
+        `agent=${agent} topic='${event.topic}'\n`,
+    )
+    return
+  }
+  const chatId = target.chatId
+  const threadId = target.threadId
+  const line = renderConsolidationLine(event)
+  process.stderr.write(
+    `telegram gateway: consolidation-legibility ${event.kind} chat=${chatId} ` +
+      `thread=${threadId ?? '-'} agent=${agent}\n`,
+  )
+  void retryWithThreadFallback(
+    robustApiCall,
+    (tid) =>
+      bot.api.sendMessage(chatId, line, {
+        parse_mode: 'HTML',
+        // Status surface, not the user's answer — never ping the device.
+        disable_notification: true,
+        ...(tid != null ? { message_thread_id: tid } : {}),
+      }),
+    { threadId, chat_id: chatId, verb: 'consolidation-legibility.sendMessage' },
+  ).catch((err) => {
+    process.stderr.write(
+      `telegram gateway: consolidation-legibility send failed: ${
         err instanceof Error ? err.message : String(err)
       }\n`,
     )

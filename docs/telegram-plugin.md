@@ -81,6 +81,23 @@ Detection is a deterministic tool-call observation (no model call, no polling). 
 
 The surface is **on by default** (kill-switch: `SWITCHROOM_MEMORY_LEGIBILITY=0`). To disable it per-agent, set `SWITCHROOM_MEMORY_LEGIBILITY=0` in the agent's gateway environment.
 
+#### Consolidation-driven "updated what I know" (opt-in)
+
+The store/forget lines above are driven by the **foreground** session's own tool calls. The **background** consolidation engine — which distils new durable observations and supersedes stale ones between turns — is invisible to that path. When hindsight emits a `consolidation.completed` webhook, the gateway can surface a terse companion line for a *genuine* store/correct:
+
+```
+🧠 updated what I know about "your deploy preferences"
+🧠 revised what I know about "the old runbook"
+```
+
+This is **off by default** and opt-in per agent: set `SWITCHROOM_CONSOLIDATION_LEGIBILITY=1` in the gateway environment. It is gated more tightly than the tool-observation path because it is fed by an unbounded background engine:
+
+- **Material-only** — a line surfaces *only* when a consolidation actually stored or corrected a durable memory; the overwhelmingly common no-op consolidation surfaces nothing.
+- **Rate-limited** — at most one line per agent per 10 minutes, and an identical "updated about X" line is suppressed for an hour, so a burst of material consolidations collapses to a single line.
+- **Never a wake** — the webhook is recorded for audit and surfaced as a discrete status message (notifications suppressed); it never injects a model turn.
+
+The webhook flows through the existing peercred-gated ingest socket (`webhook_via_gateway`); the pinned hindsight image does not yet emit `consolidation.completed`, so this consumer is dormant until that upstream event exists — which is why it ships off by default.
+
 ### Message history
 
 A local SQLite database records every inbound and outbound message. After a Claude Code restart, the agent can call `get_recent_messages` to recover context instead of asking "what were we doing?". History survives process restarts and session resets.
@@ -216,3 +233,4 @@ The switchroom fork reads additional env vars from `start.sh`:
 | `SWITCHROOM_CONFIG` | Auto-set by scaffold | Path to switchroom.yaml for config resolution |
 | `SWITCHROOM_WORKER_ACTIVITY_FEED` | Gateway env (kill-switch) | On by default; `0` disables the background worker-activity feed. See "Background worker activity feed" above |
 | `SWITCHROOM_MEMORY_LEGIBILITY` | Gateway env (kill-switch) | On by default; `0` disables the sparse "📌 remembered / ✂️ forgot" memory surface. See "Chat-legible memory" above |
+| `SWITCHROOM_CONSOLIDATION_LEGIBILITY` | Gateway env (opt-in) | Off by default; `1`/`true`/`on`/`yes` enables the rate-limited "🧠 updated what I know about Y" line driven by the `consolidation.completed` webhook. See "Consolidation-driven" above |
