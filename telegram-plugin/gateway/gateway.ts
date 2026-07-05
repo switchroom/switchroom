@@ -12687,7 +12687,14 @@ function surfaceConsolidationLegibility(
   const event = detectConsolidationEvent(rec.payload)
   if (event == null) return // routine no-op consolidation — surface nothing
   const agent = rec.agent
-  if (!consolidationRateLimiter.allow(agent, consolidationSignature(event), rec.ts || Date.now())) {
+  // Rate-limiter clock MUST be wall-clock (Date.now()), never rec.ts: rec.ts
+  // can be derived from the (attacker-influenceable) webhook payload, and a
+  // spoofed far-past / far-future timestamp would poison the per-agent
+  // min-interval gate — either permanently opening it (stale ts always older
+  // than the window) or jamming it shut. The limiter only cares about "how
+  // long since the last surface on THIS gateway", which is a local wall-clock
+  // question.
+  if (!consolidationRateLimiter.allow(agent, consolidationSignature(event), Date.now())) {
     process.stderr.write(
       `telegram gateway: consolidation-legibility ${event.kind} rate-limited ` +
         `agent=${agent} topic='${event.topic}'\n`,

@@ -175,6 +175,39 @@ describe('ConsolidationRateLimiter — sparse / non-spammy', () => {
     expect(rl.allow('klanker', 'updated:a', 700_000)).toBe(false) // dedup window
     expect(rl.allow('klanker', 'updated:b', 700_000)).toBe(true) // new topic past interval
   })
+
+  // Regression: the gateway caller (surfaceConsolidationLegibility) MUST pass
+  // Date.now() as the clock, never a payload-derived rec.ts. This test proves
+  // WHY: a spoofed/stale timestamp from the webhook payload poisons the
+  // per-agent min-interval gate. A far-FUTURE payload ts leaves the stored
+  // last-surface time in the future, so a genuine later wall-clock surface
+  // reads as "in the past" and the gate stays jammed shut; a far-PAST ts makes
+  // every subsequent surface look older than the window and the gate never
+  // engages (spam). Feeding wall-clock avoids both.
+  it('a payload-derived far-future timestamp would jam the interval gate shut', () => {
+    const rl = new ConsolidationRateLimiter({ minIntervalMs: 600_000, dedupWindowMs: 0 })
+    const wallNow = 1_000_000
+    const spoofedFuture = wallNow + 10 * 365 * 24 * 3_600_000 // ~10y ahead
+    // First surface stamped with the attacker's future ts.
+    expect(rl.allow('klanker', 'updated:a', spoofedFuture)).toBe(true)
+    // A genuine later surface (real wall-clock) is now "before" the stored
+    // last time → interval never elapses → legitimate surface suppressed.
+    expect(rl.allow('klanker', 'updated:b', wallNow + 700_000)).toBe(false)
+  })
+
+  it('a payload-derived timestamp lets a spoofer defeat the interval gate (spam)', () => {
+    // Two events arrive ~1ms apart in REALITY, but each carries a payload ts
+    // inflated to appear far apart. Keyed on payload ts, the gate sees them as
+    // past the interval and lets BOTH through — spam.
+    const rl = new ConsolidationRateLimiter({ minIntervalMs: 600_000, dedupWindowMs: 0 })
+    expect(rl.allow('klanker', 'updated:a', 0)).toBe(true)
+    expect(rl.allow('klanker', 'updated:b', 700_000)).toBe(true) // spoofed far-apart ts → not blocked
+    // Wall-clock (what the fix passes) blocks the same two events 1ms apart.
+    const rl2 = new ConsolidationRateLimiter({ minIntervalMs: 600_000, dedupWindowMs: 0 })
+    const wallNow = 1_000_000_000
+    expect(rl2.allow('klanker', 'updated:a', wallNow)).toBe(true)
+    expect(rl2.allow('klanker', 'updated:b', wallNow + 1)).toBe(false)
+  })
 })
 
 describe('consolidationSignature — stable dedup key', () => {
