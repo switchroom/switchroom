@@ -37,14 +37,14 @@ describe("shouldSuppressRepresent — #2472 duplicate-represent guard", () => {
   });
 
   it("does NOT suppress the FIRST represent — genuine plain-text-no-reply still represents once", () => {
-    // First represent: lastRepresentedAt is undefined. Even though an assistant
-    // message (the original plain-text answer) exists in history, the single
-    // re-ask must still fire — the agent never called the reply tool.
-    const o = obligation({ lastRepresentedAt: undefined });
+    // First represent: lastRepresentedAt is undefined, no reply tool call was
+    // ever recorded (the genuine plain-text-no-reply case → no outbound row, so
+    // the predicate reports false). The single re-ask must still fire.
+    const o = obligation({ openedAt: 0, lastRepresentedAt: undefined });
     const suppress = shouldSuppressRepresent(o, {
       historyEnabled: true,
-      // history WOULD report an outbound exists, but the first represent ignores it
-      hasOutboundDeliveredSince: () => true,
+      // No outbound row exists for a plain-text answer → predicate is false.
+      hasOutboundDeliveredSince: () => false,
     });
     expect(suppress).toBe(false); // represent fires exactly once
   });
@@ -66,6 +66,42 @@ describe("shouldSuppressRepresent — #2472 duplicate-represent guard", () => {
     const suppress = shouldSuppressRepresent(o, {
       historyEnabled: true,
       hasOutboundDeliveredSince: replyDeliveredAt(500),
+    });
+    expect(suppress).toBe(false);
+  });
+
+  it("#2788 Gap B — SUPPRESSES the FIRST represent when a genuine reply was delivered since openedAt", () => {
+    // The narrow false "you never answered" window: a real reply landed at
+    // t=1500 after the obligation was raised at t=1000, but its routing didn't
+    // resolve back to the origin so the ledger's close path missed it. The FIRST
+    // represent must now dedup against outbound history (cutoff = openedAt) and
+    // suppress, instead of emitting a false "you never answered".
+    const o = obligation({ openedAt: 1000, lastRepresentedAt: undefined });
+    const suppress = shouldSuppressRepresent(o, {
+      historyEnabled: true,
+      hasOutboundDeliveredSince: replyDeliveredAt(1500),
+    });
+    expect(suppress).toBe(true); // first represent deduped → no false "you never answered"
+  });
+
+  it("#2788 Gap B — first represent still fires when the only reply PREDATES openedAt", () => {
+    // A reply at t=500 answered an EARLIER turn, before this obligation was
+    // raised at t=1000. It is not evidence THIS obligation was answered → the
+    // first represent must still fire.
+    const o = obligation({ openedAt: 1000, lastRepresentedAt: undefined });
+    const suppress = shouldSuppressRepresent(o, {
+      historyEnabled: true,
+      hasOutboundDeliveredSince: replyDeliveredAt(500),
+    });
+    expect(suppress).toBe(false);
+  });
+
+  it("#2788 Gap B — first represent falls back to firing when openedAt is unknown", () => {
+    // Without an openedAt cutoff we cannot dedup safely — never suppress on doubt.
+    const o = obligation({ openedAt: undefined, lastRepresentedAt: undefined });
+    const suppress = shouldSuppressRepresent(o, {
+      historyEnabled: true,
+      hasOutboundDeliveredSince: () => true,
     });
     expect(suppress).toBe(false);
   });

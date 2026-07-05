@@ -394,6 +394,7 @@ import {
 } from './status-pin-store.js'
 import { driveEscalation } from './escalation-drive.js'
 import { shouldSuppressRepresent } from './represent-guard.js'
+import { shouldDeferEscalationForBridge } from './escalation-bridge-gate.js'
 import { createInboundSpool } from './inbound-spool.js'
 import { purgeStaleTurnsForChat } from './turn-state-purge.js'
 import { decideInboundDelivery } from './inbound-delivery-gate.js'
@@ -7017,6 +7018,22 @@ function obligationSweep(): void {
   // normal close path) — close silently instead of alarming the user with a
   // false "I may have missed this". This is Fix 4: escalate only on knowledge,
   // not doubt. Fall back to false (safe: never suppresses) if history unavailable.
+  //
+  // #2788 Gap A — bridge-flap gate. The escalate branch DIRECT-SENDS (via
+  // bot.api.sendMessage below), bypassing the bridge. So while the bridge is
+  // down the represent branch is naturally stranded (bridge → buffer) but this
+  // branch would still fire a false "I may have missed this", even though the
+  // real reply is merely queued behind a transient outage. Defer: if the bridge
+  // is not alive, leave the obligation OPEN and re-drive on a later sweep once
+  // it recovers. Obligations survive bridge death (durable ledger, re-evaluated
+  // every sweep), so this deferral adds NO unbounded liveness dependency — the
+  // whole gateway already rests on the bridge eventually reconnecting.
+  if (shouldDeferEscalationForBridge({ bridgeAlive: ipcServer.getClient(agent)?.isAlive() === true })) {
+    process.stderr.write(
+      `telegram gateway: obligation escalation deferred — bridge down (nudge waits for reconnect) origin=${o.originTurnId}\n`,
+    )
+    return
+  }
   if (HISTORY_ENABLED && hasOutboundDeliveredSince(o.chatId, o.openedAt, o.threadId)) {
     process.stderr.write(
       `telegram gateway: obligation closed silently — outbound delivered since open origin=${o.originTurnId}\n`,
