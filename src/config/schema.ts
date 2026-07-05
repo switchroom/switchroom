@@ -366,9 +366,13 @@ export const AgentMemorySchema = z
           source_query: z
             .string()
             .min(1)
+            .max(2000)
             .describe(
               "The reflection query the model answers, semantically " +
-              "refreshed from the bank's content."
+              "refreshed from the bank's content. Capped at 2000 chars — a " +
+              "standing reflection query, not a document; the ceiling also " +
+              "bounds what an agent-proposed model can smuggle past the " +
+              "operator approval card."
             ),
           refresh_after_consolidation: z
             .boolean()
@@ -382,8 +386,13 @@ export const AgentMemorySchema = z
             .number()
             .int()
             .positive()
+            .max(8192)
             .optional()
-            .describe("Cap on the synthesized model's token size."),
+            .describe(
+              "Cap on the synthesized model's token size. Upper-bounded at " +
+              "8192 — a mental model is a standing summary, not a corpus; the " +
+              "ceiling also caps what an agent-proposed model can request."
+            ),
         })
       )
       .superRefine((models, ctx) => {

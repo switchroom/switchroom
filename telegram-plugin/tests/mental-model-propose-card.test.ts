@@ -14,6 +14,7 @@ describe("renderMentalModelProposeCard", () => {
       source_query: "What is the athlete's current plan?",
       reason: "I keep re-deriving the plan state every session",
       refresh_after_consolidation: true,
+      max_tokens: 1024,
     });
     expect(card).toContain("proposes a mental model");
     expect(card).toContain("coach");
@@ -22,6 +23,8 @@ describe("renderMentalModelProposeCard", () => {
     expect(card).toContain("What is the athlete's current plan?");
     expect(card).toContain("I keep re-deriving the plan state every session");
     expect(card).toContain("refresh after consolidation: `on`");
+    // max_tokens is surfaced so the operator approves exactly what's applied.
+    expect(card).toContain("max tokens: `1024`");
     // The card explains the approve/deny semantics so the operator can decide.
     expect(card).toContain("Approve");
     expect(card).toContain("Deny");
@@ -36,6 +39,9 @@ describe("renderMentalModelProposeCard", () => {
     });
     expect(card).toContain("why: _not provided_");
     expect(card).toContain("refresh after consolidation: `off`");
+    // No max_tokens on the proposal → the applied model inherits the default;
+    // render that explicitly rather than hiding the field.
+    expect(card).toContain("max tokens: `default`");
   });
 
   it("defuses a backtick in the model name so it can't break out of the code span", () => {

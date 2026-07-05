@@ -71,4 +71,36 @@ describe("AgentMemorySchema.mental_models", () => {
       }).success,
     ).toBe(false);
   });
+
+  it("rejects a max_tokens above the 8192 ceiling", () => {
+    expect(
+      AgentMemorySchema.safeParse({
+        collection: "b",
+        mental_models: [{ name: "x", source_query: "q?", max_tokens: 8193 }],
+      }).success,
+    ).toBe(false);
+    // At the ceiling is fine.
+    expect(
+      AgentMemorySchema.safeParse({
+        collection: "b",
+        mental_models: [{ name: "x", source_query: "q?", max_tokens: 8192 }],
+      }).success,
+    ).toBe(true);
+  });
+
+  it("rejects a source_query above the 2000-char ceiling", () => {
+    expect(
+      AgentMemorySchema.safeParse({
+        collection: "b",
+        mental_models: [{ name: "x", source_query: "q".repeat(2001) }],
+      }).success,
+    ).toBe(false);
+    // At the ceiling is fine.
+    expect(
+      AgentMemorySchema.safeParse({
+        collection: "b",
+        mental_models: [{ name: "x", source_query: "q".repeat(2000) }],
+      }).success,
+    ).toBe(true);
+  });
 });

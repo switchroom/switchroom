@@ -685,16 +685,36 @@ export function assertSelfScopedMentalModelEdit(
     return { ok: false, detail: `self-scope: config did not parse (${(e as Error).message})` };
   }
 
-  // 1. Additive-only on the caller's own declared models (by name). Dropping a
-  //    previously-declared model is not a "propose a model" tap, so keep the
-  //    contract tight and reject it.
-  const beforeNames = readCallerMentalModelNames(before, caller);
-  const afterNames = readCallerMentalModelNames(after, caller);
-  for (const name of beforeNames) {
-    if (!afterNames.includes(name)) {
+  // 1. Additive-only on the caller's own declared models, BY NAME AND CONTENT.
+  //    Every model declared before must still be declared after AND be
+  //    byte-for-byte identical (same source_query / max_tokens /
+  //    refresh_after_consolidation). Only brand-NEW names may appear. This is
+  //    the load-bearing guard: step 2 strips the whole mental_models array
+  //    before comparing, so an in-place REWRITE that keeps all the names (e.g.
+  //    silently repointing an existing model's source_query, or bumping its
+  //    max_tokens) is invisible there — it must be caught here, or a "propose"
+  //    tap could smuggle an edit to an already-approved model.
+  const beforeModels = readCallerMentalModels(before, caller);
+  const afterByName = new Map<string, unknown>();
+  for (const m of readCallerMentalModels(after, caller)) {
+    const n = m && typeof m === "object" ? (m as { name?: unknown }).name : undefined;
+    if (typeof n === "string" && !afterByName.has(n)) afterByName.set(n, m);
+  }
+  for (const m of beforeModels) {
+    const n = m && typeof m === "object" ? (m as { name?: unknown }).name : undefined;
+    if (typeof n !== "string") continue; // malformed pre-existing entry — step 2's structural check is the backstop
+    if (!afterByName.has(n)) {
       return {
         ok: false,
-        detail: `self-scope: edit removes existing mental model "${name}" from agents.${caller}.memory.mental_models`,
+        detail: `self-scope: edit removes existing mental model "${n}" from agents.${caller}.memory.mental_models`,
+      };
+    }
+    if (!isDeepStrictEqual(m, afterByName.get(n))) {
+      return {
+        ok: false,
+        detail:
+          `self-scope: edit rewrites existing mental model "${n}" ` +
+          `(append-only: an existing declared model is immutable — only NEW models may be added)`,
       };
     }
   }
@@ -703,6 +723,8 @@ export function assertSelfScopedMentalModelEdit(
   //    both sides (identically) and require deep structural equality of the
   //    remainder. Collapsing an emptied `memory` object handles the case where
   //    the edit CREATES `memory:`/`mental_models:` that didn't exist before.
+  //    (This proves nothing OUTSIDE the array moved; step 1 above proves the
+  //    array only GREW — existing entries unchanged.)
   const beforeStripped = stripCallerMentalModels(before, caller);
   const afterStripped = stripCallerMentalModels(after, caller);
   if (!isDeepStrictEqual(beforeStripped, afterStripped)) {
@@ -725,12 +747,6 @@ function readCallerMentalModels(cfg: Record<string, unknown>, caller: string): u
   if (!memory || typeof memory !== "object") return [];
   const models = (memory as Record<string, unknown>).mental_models;
   return Array.isArray(models) ? models : [];
-}
-
-function readCallerMentalModelNames(cfg: Record<string, unknown>, caller: string): string[] {
-  return readCallerMentalModels(cfg, caller)
-    .map((m) => (m && typeof m === "object" ? (m as { name?: unknown }).name : undefined))
-    .filter((n): n is string => typeof n === "string");
 }
 
 function stripCallerMentalModels(

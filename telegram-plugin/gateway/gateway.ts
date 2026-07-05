@@ -4787,14 +4787,24 @@ function sweepStaleAlwaysAllowCorrelations(now = Date.now()): void {
 // approved on the proposal card). Forge-resistance: the auto-resolve match is
 // an EXACT byte-match of the inbound diff against the diff the gateway itself
 // synthesized and queued — an agent-forged edit finds no entry and falls
-// through to a real operator card. Single-shot + 30s TTL sweep.
+// through to a real operator card. Single-shot + a dedicated TTL sweep.
+//
+// TTL: this correlation must outlive the WHOLE config-edit approval budget,
+// NOT the 30s "always allow" window. The mental-model resolve dispatches
+// `config_propose_edit` to hostd with a 720s timeout (see the 720_000 dispatch
+// budgets below); hostd's approval callback can legitimately arrive any time
+// within that window if the operator taps slowly. Reusing the 30s
+// ALWAYS_ALLOW_CORRELATION_TTL_MS would sweep the correlation out from under a
+// slow-but-valid tap, dropping the auto-approve and surfacing a SECOND card
+// for an edit the operator already approved. Size it to the hostd budget.
+const MENTAL_MODEL_CORRELATION_TTL_MS = 720_000
 const pendingMentalModelCorrelations = new Map<string, { agentName: string; unifiedDiff: string; createdAt: number }>()
 function mentalModelCorrelationKey(agentName: string, unifiedDiff: string): string {
   return `${agentName}::${createHash('sha256').update(unifiedDiff).digest('hex')}`
 }
 function sweepStaleMentalModelCorrelations(now = Date.now()): void {
   for (const [key, entry] of pendingMentalModelCorrelations) {
-    if (now - entry.createdAt > ALWAYS_ALLOW_CORRELATION_TTL_MS) {
+    if (now - entry.createdAt > MENTAL_MODEL_CORRELATION_TTL_MS) {
       pendingMentalModelCorrelations.delete(key)
     }
   }

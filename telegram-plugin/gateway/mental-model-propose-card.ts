@@ -28,6 +28,7 @@ export interface MentalModelProposeCardInput {
   source_query: string;
   reason?: string;
   refresh_after_consolidation?: boolean;
+  max_tokens?: number;
 }
 
 export function renderMentalModelProposeCard(
@@ -41,6 +42,12 @@ export function renderMentalModelProposeCard(
   lines.push(`source query: _${escapeHtmlForTg(req.source_query)}_`);
   const refreshLabel = req.refresh_after_consolidation ? "on" : "off";
   lines.push(`refresh after consolidation: \`${codeSpanSafe(refreshLabel)}\``);
+  // Always show max_tokens so the operator approves EXACTLY what's applied.
+  // When the proposal omits it, the declared model inherits the bank default —
+  // render that explicitly rather than hiding the field.
+  const maxTokensLabel =
+    typeof req.max_tokens === "number" ? String(req.max_tokens) : "default";
+  lines.push(`max tokens: \`${codeSpanSafe(maxTokensLabel)}\``);
   // Always render the why-line, even when omitted — a missing rationale is
   // then visibly an agent-side failure, not a card-template choice (mirrors
   // the vault card's #1790 behaviour).
