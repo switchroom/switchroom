@@ -79,6 +79,7 @@ export default defineConfig({
       "**/node_modules/**",
       "**/dist/**",
       "**/src/vault/grants.test.ts",
+      "**/src/vault/grants-db.test.ts",
       // Approval-kernel suites use bun:sqlite — run via test:bun.
       "**/src/vault/approvals/kernel.test.ts",
       "**/src/vault/approvals/approval-origin.test.ts",
