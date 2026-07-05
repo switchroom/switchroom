@@ -101,8 +101,8 @@ if [ -n "$SWITCHROOM_LITELLM" ] && command -v switchroom >/dev/null 2>&1; then
   if [ -z "$sr_ll_key" ]; then
     echo "litellm: no virtual key for cron '{{name}}' — falling back to direct OAuth (no tracking/guardrail)" >&2
   elif command -v curl >/dev/null 2>&1 && [ -n "$ANTHROPIC_BASE_URL" ] \
-       && ! curl -fsS -m 5 -o /dev/null "${ANTHROPIC_BASE_URL%/}/health/liveliness" 2>/dev/null; then
-    echo "litellm: proxy unreachable at $ANTHROPIC_BASE_URL — falling back to direct OAuth (no tracking/guardrail this session)" >&2
+       && ! curl -fsS -m 5 -o /dev/null "${SWITCHROOM_LITELLM_BASE:-${ANTHROPIC_BASE_URL%/anthropic}}/health/liveliness" 2>/dev/null; then
+    echo "litellm: proxy unreachable at ${SWITCHROOM_LITELLM_BASE:-$ANTHROPIC_BASE_URL} — falling back to direct OAuth (no tracking/guardrail this session)" >&2
   else
     sr_ll_ok="1"
   fi
@@ -114,7 +114,7 @@ x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:
   else
     # Fail-open: drop every routing var so the claude CLI talks to Anthropic
     # directly on its OAuth credential (subscription path), unproxied.
-    unset ANTHROPIC_BASE_URL ANTHROPIC_SMALL_FAST_MODEL SWITCHROOM_LITELLM
+    unset ANTHROPIC_BASE_URL ANTHROPIC_SMALL_FAST_MODEL SWITCHROOM_LITELLM SWITCHROOM_LITELLM_BASE
   fi
   unset sr_ll_key sr_ll_ok
 fi

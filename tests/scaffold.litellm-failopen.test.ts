@@ -63,8 +63,14 @@ describe("scaffoldAgent: LiteLLM fail-open boot contract (#litellm)", () => {
     expect(startSh).toContain('if [ -n "$SWITCHROOM_LITELLM" ]');
 
     // Boot reachability probe against the proxy's unauthenticated liveness
-    // endpoint (so a key-less probe still works).
-    expect(startSh).toContain("/health/liveliness");
+    // endpoint (so a key-less probe still works). It MUST target the ROOT
+    // proxy (SWITCHROOM_LITELLM_BASE), not ANTHROPIC_BASE_URL — the latter now
+    // points at the /anthropic pass-through, and /anthropic/health/liveliness
+    // 404s, which would make the probe fail and silently fail-open the whole
+    // fleet to direct OAuth. Regression guard for the passthrough migration.
+    expect(startSh).toContain(
+      "${SWITCHROOM_LITELLM_BASE:-${ANTHROPIC_BASE_URL%/anthropic}}/health/liveliness",
+    );
 
     // FAIL-OPEN: on missing key OR unreachable proxy, strip ALL routing env so
     // claude talks to Anthropic directly on its OAuth credential.
