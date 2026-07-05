@@ -84,3 +84,29 @@ describe('no-repeat-on-timeout wiring', () => {
     expect(GATEWAY).toMatch(/permissionTimeoutSignatures\.delete\(sig\)/)
   })
 })
+
+describe('inbound gate holds while approval card is outstanding (#2841)', () => {
+  // turnInFlightForGate() must return true when pendingPermissions is non-empty,
+  // even after releaseTurnBufferGate has cleared claudeBusyKeys/machine on the
+  // first interim reply. Without this, a new inbound delivered in that window
+  // displaces the approval context and orphans the pending MCP call.
+  it('turnInFlightForGate includes pendingPermissions.size > 0 on the legacy path', () => {
+    // span 1500: the function has a ~800-char comment block before the code lines.
+    const fn = slice(GATEWAY, 'function turnInFlightForGate()', 1500)
+    // Both paths (legacy claudeBusyKeys + machine-authoritative) must include the check.
+    expect(fn).toMatch(/claudeBusyKeys\.size\s*>\s*0\s*\|\|\s*hasPendingApproval/)
+  })
+
+  it('turnInFlightForGate includes pendingPermissions.size > 0 on the machine path', () => {
+    const fn = slice(GATEWAY, 'function turnInFlightForGate()', 1600)
+    // probeGateParity(...) || hasPendingApproval — the inner arg contains its own
+    // parens (isMachineInTurn()), so match the two tokens independently.
+    expect(fn).toContain('probeGateParity(')
+    expect(fn).toMatch(/probeGateParity[\s\S]+?\|\|\s*hasPendingApproval/)
+  })
+
+  it('hasPendingApproval reads pendingPermissions.size', () => {
+    const fn = slice(GATEWAY, 'function turnInFlightForGate()', 1500)
+    expect(fn).toMatch(/pendingPermissions\.size\s*>\s*0/)
+  })
+})

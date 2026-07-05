@@ -303,6 +303,12 @@ for _stray_claude in \
   "$HOME/.local/bin/claude" \
   "$HOME/bin/claude"; do
   if [ -e "$_stray_claude" ] || [ -L "$_stray_claude" ]; then
+    # Skip our own canonical symlink re-seated at end of this block — it points
+    # back to the image binary and is not a shadow install. Any other file or
+    # symlink at this path (e.g. npm self-install, manual copy) is pruned.
+    if [ -L "$_stray_claude" ] && [ "$(readlink "$_stray_claude" 2>/dev/null)" = "/usr/local/bin/claude" ]; then
+      continue
+    fi
     echo "start.sh: pruning user-local claude shadow at $_stray_claude (image binary is authoritative)" >&2
     rm -f "$_stray_claude"
   fi
