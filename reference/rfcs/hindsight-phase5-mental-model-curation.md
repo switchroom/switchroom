@@ -96,13 +96,44 @@ recreating something the operator wanted gone.)
   match, the no-blind-seeding guard (undefined/empty → zero fetches), and
   the schema surface incl. duplicate/empty/invalid rejection.
 
+## Second slice shipped (stacked PR — agent-proposes → human-approves)
+
+The other half of the invariant-clean shape, stacked on this branch. An
+agent surfaces a candidate model and the operator taps Approve; on approval
+it becomes a first-class DECLARED model consumed by the exact ensure/reconcile
+path above. Nothing bespoke — the approved proposal is just a new declaration.
+
+- **Tool:** `mental_model_propose(chat_id, name, source_query, reason?,
+  refresh_after_consolidation?, max_tokens?)` — a gateway MCP tool that
+  mirrors the `vault_request_access` SHAPE (agent PROPOSES; the operator taps;
+  the agent can never self-approve; the turn ends and resumes via a synthetic
+  inbound). It renders a `[✅ Approve] [🚫 Deny]` card.
+- **Approve → persist:** the gateway builds a unified diff APPENDING the model
+  to `agents.<self>.memory.mental_models[]` and submits it through hostd's
+  `config_propose_edit` apply+reconcile machinery (hostd is the sole config
+  writer — the leash). A single-tap correlation (the same #1977 mechanism the
+  "🔁 Always allow" flow uses) makes hostd auto-approve the edit WITHOUT a
+  second card, since the operator already approved on the proposal card. The
+  apply triggers reconcile, which runs `ensureDeclaredMentalModels` — so the
+  model is ENSURED by the same path the declarative slice uses. On apply the
+  agent is woken with `<channel source="mental_model_proposal_applied">`.
+- **Deny → nothing:** no config read, no diff, no edit, no ensure; the agent
+  is woken with `mental_model_proposal_denied`.
+- **Guardrails:** propose-only (self-approve impossible — operator-only tap +
+  the hostd approval gate); duplicate-name rejection against the agent's
+  already-declared models (before a card is even posted); a per-agent
+  rate-limit (≤5 cards/hour) plus hostd's own `config_edit_rate_per_hour`;
+  nothing is created before the human taps Approve. The non-admin self-scope
+  gate is widened by one narrow rule — a non-admin agent may append to its OWN
+  `memory.mental_models[]` (in addition to its own `tools.allow`), so a forged
+  proposal diff touching any other field/agent is still rejected.
+
 ## Deliberately out of scope (follow-ups)
 
-- **Agent-proposes → operator-confirms in chat.** The other half of the
-  RFC's invariant-clean shape: an agent surfaces "I'd pin a model for X —
-  approve?" and the operator taps. Higher value, more surface (an
-  approval-card flow), so it is a separate increment on top of this
-  declarative base.
+- **Proposals from a scheduled reflection (cron), not just a live session.**
+  This slice fires the proposal from a live turn (the agent has a `chat_id`).
+  Whether a background reflection cron should be allowed to surface proposals
+  is an open product decision (see below).
 - **Autonomous creation.** Explicitly never (RFC non-goal + tension 3).
 - **Chat-legible "model refreshed" line.** Belongs with Phase 4's sparse
   legibility work, not here.
@@ -117,3 +148,14 @@ fleet-wide default re-creates the "seeded whether earned or not" shape
 that #2447 removed. If the fleet later shows a genuinely universal model
 worth defaulting, revisit with the agent-proposes-→-confirms flow rather
 than a silent default. Flagged for the operator, not decided.
+
+**Should a background reflection (cron) be allowed to PROPOSE, or only a
+live session?** The second slice deliberately fires `mental_model_propose`
+from a live turn (the agent has a `chat_id` and the operator is present to
+tap). A scheduled reflection could ALSO notice a model worth pinning — but
+firing an approval card into an empty topic at 3am is the vault flow's
+"don't spam an empty topic" anti-pattern, and a non-interactive fire can't
+end-turn-and-resume the same way. Options: (a) live-only (today); (b) let a
+cron STAGE a proposal that is surfaced on the next interactive turn; (c) let
+a cron post a card that simply waits for the operator whenever they next
+look. Left to the operator — (a) is the safe default shipped.

@@ -419,6 +419,24 @@ const TOOL_SCHEMAS = [
     },
   },
   {
+    name: 'mental_model_propose',
+    description:
+      "Propose a Hindsight MENTAL MODEL for the operator to approve (agent-proposes → human-approves, hindsight Phase 5). Use this when — over real work — you notice a recurring, domain-specific question worth maintaining a standing, semantically-refreshed answer to from YOUR bank (e.g. a coach's `training-plan-state`, a lawyer's `open-matters`). You may PROPOSE but can NEVER self-approve: this renders a Telegram [Approve]/[Deny] card to the operator. On Approve the model is DECLARED — appended to your `memory.mental_models[]` in switchroom.yaml via the operator-approved config-edit path — and ensured in your bank (it then refreshes from your bank content). On Deny nothing is written. This is NOT for identity/'who is the user' (dedicated profile banks own that) and NOT a substitute for `retain` (store a fact) or `create_mental_model` where you already have direct Hindsight tools — it is the leashed, human-gated way to add a DURABLE declared model to your config. After firing this tool, END YOUR TURN cleanly — a fresh inbound arrives (`<channel source=\"mental_model_proposal_applied\">` / `mental_model_proposal_denied`) once the operator decides. Do NOT propose a model whose name is already declared (it is rejected), and do NOT spam (one card per proposal; the operator sees every one).",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        chat_id: { type: 'string', description: 'Chat to render the approval card in (use the chat_id of the user message that triggered the workflow).' },
+        name: { type: 'string', description: 'Stable model name — the idempotent-ensure identity key (lowercase kebab/snake, e.g. `training-plan-state`). Must be UNIQUE among your already-declared models or the proposal is rejected.' },
+        source_query: { type: 'string', description: 'The reflection query the model answers, semantically refreshed from your bank content (e.g. "What is the athlete\'s current training plan, recent sessions, and open adjustments?"). Frame it as a DOMAIN question, never an identity question.' },
+        reason: { type: 'string', description: 'REQUIRED in practice — one-line rationale rendered on the card (e.g. "I keep re-deriving the plan state every session; a standing model would save the lookup"). Omitting it renders "why: not provided" and the operator will usually Deny.' },
+        refresh_after_consolidation: { type: 'boolean', description: 'Refresh this model after each consolidation. Defaults OFF — refresh adds bounded background model-spend + timeout risk (RFC Phase 5). Only set true when the model genuinely needs to track fast-moving state.' },
+        max_tokens: { type: 'number', description: 'Optional cap on the synthesized model\'s token size.' },
+        message_thread_id: { type: 'string', description: 'Forum topic thread ID. Auto-applied from the last inbound message if not specified.' },
+      },
+      required: ['chat_id', 'name', 'source_query'],
+    },
+  },
+  {
     name: 'linear_agent_activity',
     description:
       'Emit a structured Linear AgentActivity against an agent session (#2298). Use this ONLY inside a turn that was woken by a Linear agent session (the inbound carries meta.source="linear" and meta.agent_session_id) — pass that agent_session_id back here. Linear renders activities as status chips + a timeline on the issue, so the human sees acknowledge → work → result. Emit a `thought` within ~10s of being woken so the session does not look dead, then `message`(s) as you make progress, and finally exactly one terminal `complete` (work done) or `error` (you could not proceed). body is required for thought/message/error and optional for complete. Resolves the agent\'s Linear app token from the vault; on VAULT-BROKER-DENIED it returns an error instructing you to vault_request_access for `linear/<agent>/token`.',

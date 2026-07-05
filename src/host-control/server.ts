@@ -82,6 +82,7 @@ import { parseAuditLine, latestRolloutRowForRequest } from "./audit-reader.js";
 import {
   validateConfigEdit,
   assertSelfScopedAllowEdit,
+  assertSelfScopedMentalModelEdit,
 } from "./config-edit-validator.js";
 import { classifyBlastRadius } from "./config-blast-radius.js";
 import type { ApprovalGateway } from "./approval-gateway.js";
@@ -2158,9 +2159,16 @@ export class HostdServer {
     }
     // ── Self-scope gate (non-admin callers) ─────────────────────────
     // checkGate admits non-admin agents to this verb; this is the
-    // enforced boundary. A non-admin agent may only widen its OWN
-    // `agents.<caller>.tools.allow` — the "🔁 Always allow" persistence
-    // path. Operators and admin agents skip the check (full trust).
+    // enforced boundary. A non-admin agent may only:
+    //   (a) widen its OWN `agents.<caller>.tools.allow` — the "🔁 Always
+    //       allow" persistence path; OR
+    //   (b) append to its OWN `agents.<caller>.memory.mental_models[]` —
+    //       the agent-proposes → human-approves mental-model curation path
+    //       (hindsight Phase 5). The operator tap on the proposal card is the
+    //       human gate; this check proves the edit can ONLY grow the caller's
+    //       own declared-model list (a forged proposal diff smuggling in any
+    //       other field is rejected here).
+    // Operators and admin agents skip the check (full trust).
     if (caller.kind === "agent" && this.opts.config.agents[caller.name]?.admin !== true) {
       let beforeContent: string;
       try {
@@ -2168,23 +2176,38 @@ export class HostdServer {
       } catch {
         beforeContent = "";
       }
-      const scope = assertSelfScopedAllowEdit(
+      const allowScope = assertSelfScopedAllowEdit(
         beforeContent,
         verdict.postApplyContent,
         caller.name,
       );
-      if (!scope.ok) {
-        return err("E_NOT_SELF_SCOPED", scope.detail)
-          .why(
-            "non-admin agents may only add rules to their own " +
-              "agents.<self>.tools.allow via config_propose_edit",
-          )
-          .fixBadInput("unified_diff")
-          .op("config_propose_edit")
-          .caller("agent")
-          .agentName(caller.name)
-          .asDenied()
-          .build(req.request_id, Date.now() - started);
+      // A non-admin edit is admitted if it is EITHER a self-scoped tools.allow
+      // widen (the "🔁 Always allow" path) OR a self-scoped append to the
+      // caller's own memory.mental_models[] (the agent-proposes → human-
+      // approves curation path). Only when BOTH fail is the edit rejected. We
+      // surface the tools.allow detail (the historical, most-common failure
+      // mode) and document the mental-models path in `.why()`.
+      if (!allowScope.ok) {
+        const mentalModelScope = assertSelfScopedMentalModelEdit(
+          beforeContent,
+          verdict.postApplyContent,
+          caller.name,
+        );
+        if (!mentalModelScope.ok) {
+          return err("E_NOT_SELF_SCOPED", allowScope.detail)
+            .why(
+              "non-admin agents may only add rules to their own " +
+                "agents.<self>.tools.allow OR append their own " +
+                "agents.<self>.memory.mental_models via config_propose_edit " +
+                `(mental-model check: ${mentalModelScope.detail})`,
+            )
+            .fixBadInput("unified_diff")
+            .op("config_propose_edit")
+            .caller("agent")
+            .agentName(caller.name)
+            .asDenied()
+            .build(req.request_id, Date.now() - started);
+        }
       }
     }
     // ── Approval card ───────────────────────────────────────────────
