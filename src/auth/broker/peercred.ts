@@ -19,22 +19,35 @@
  * on peer UID, because UIDs collide and the bind-path is what we control.
  */
 
+import { matchSocketName } from "../../broker-common/peercred-path.js";
+
 /** Listener-bind regex. Accepts `<name>/sock` shape only — flat `<name>.sock` is rejected. */
 const AUTH_BROKER_SOCKET_PATH_RE =
   /^\/run\/switchroom\/auth-broker\/([a-zA-Z0-9][a-zA-Z0-9_-]*)\/sock$/;
 
+/** Max slug length — defence in depth beyond the regex slug shape. */
+const AUTH_BROKER_MAX_NAME_LEN = 63;
+
 /** Reserved socket-path names that cannot be used as agent or consumer names. */
 export const RESERVED_NAMES = new Set(["operator"]);
 
-/** Bind-path → name. Returns null when the path matches no canonical shape. */
+/**
+ * Bind-path → name (raw, including the reserved `operator` name — the
+ * kind split happens in `classify` against the loaded config). Returns null
+ * when the path matches no canonical shape or the name exceeds the length
+ * guard.
+ *
+ * #2795: the match+length-guard is the shared broker-plane primitive
+ * (`src/broker-common/peercred-path.ts` `matchSocketName`); this call site
+ * supplies only the auth-broker pattern + length cap. Semantics are
+ * identical to the pre-#2795 inline implementation.
+ */
 export function socketPathToName(socketPath: string): string | null {
-  const m = AUTH_BROKER_SOCKET_PATH_RE.exec(socketPath);
-  if (!m) return null;
-  const name = m[1];
-  // Validate name length and that it's a legal slug — defence in depth
-  // against a path slipping past the regex check.
-  if (name.length === 0 || name.length > 63) return null;
-  return name;
+  return matchSocketName(
+    socketPath,
+    [AUTH_BROKER_SOCKET_PATH_RE],
+    AUTH_BROKER_MAX_NAME_LEN,
+  );
 }
 
 /**
