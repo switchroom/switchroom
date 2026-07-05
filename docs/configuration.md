@@ -245,6 +245,32 @@ Use this to answer "is 12 the right cap?" — if `CAP` fires on most turns, the 
 
 The log is bounded to the last ~5000 events per agent.
 
+### Making corrections stick — `memory.directive_capture_nudge`
+
+Hindsight **directives** are the primitive that makes a standing rule survive a restart: user-authored, verbatim, and re-injected into every turn. But whether a correction actually *becomes* a directive was, historically, guidance-only — the model is told to call `create_directive` when you give it a durable rule, and inconsistently does. An audit (issue #2848) measured a **~55% miss rate** on clear-cut durable corrections: the same broadcast correction was captured by one agent and silently dropped by two others.
+
+`memory.directive_capture_nudge` (default **on**) closes that gap. On every inbound the auto-recall hook runs a **deterministic regex** over the message; when it looks correction- or standing-rule-shaped — `always`/`never`, `from now on`, `stop doing …`, a stated preference, `call me …`, `that's wrong, it's …` — it appends a terse advisory to the turn's context reminding the model that *if* this is a durable rule (not a one-off), it should persist it with `create_directive` before answering.
+
+Two things it deliberately does **not** do (both are hard invariants):
+
+- **No extra model call.** Detection is pure regex; the *judgment* — is this actually a standing rule? — happens inside the interactive `claude` session, on the operator's subscription. There is no classifier callsite.
+- **No silent write.** The hook only nudges. The model decides and calls `create_directive` itself, visible in chat — the hook never writes a directive you didn't see.
+
+Detection is intentionally inclusive (the nudge is cheap and advisory, so a false positive just costs a few tokens and is ignored), with a guard against the obvious pleasantry shapes (`always happy to help`, `never mind`).
+
+```yaml
+defaults:
+  memory:
+    directive_capture_nudge: false   # disable fleet-wide (not recommended — Stage A proved a real gap)
+
+agents:
+  clerk:
+    memory:
+      directive_capture_nudge: true  # per-agent opt back in
+```
+
+**Cascade: override** (per-agent wins over profile/defaults). Omit the field to inherit the on-by-default. Operationally the knob threads the same way as the other recall tuning: the switchroom default is pinned in the plugin's `settings.json`, and `start.sh` exports `HINDSIGHT_DIRECTIVE_CAPTURE_NUDGE` only when you override it (the env value wins at plugin load). Serves the `remember-across-sessions` job.
+
 ### Server-side caps on the Hindsight container
 
 `switchroom memory --start` launches the bundled Hindsight container with `HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE=1000` already set. The same default is baked into the `--compose` snippet output.

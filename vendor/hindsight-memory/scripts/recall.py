@@ -597,6 +597,126 @@ def _is_trivial_stateless(ack_form, stripped):
     return False
 
 
+# Switchroom #2848 Stage B — deterministic directive-capture nudge.
+#
+# Stage A audit (issue #2848) measured a ~55% miss rate on durable
+# corrections: the model is instructed (guidance-only, in
+# profiles/default/CLAUDE.md.hbs) to persist standing rules with
+# mcp__hindsight__create_directive, but does so inconsistently — capture
+# is a per-agent lottery (the same broadcast correction was captured by
+# one agent and silently dropped by two others). This adds DETERMINISTIC
+# detection of correction / standing-rule-shaped inbound (pure regex — NO
+# model callsite; the claude-native invariant forbids a classifier call)
+# and appends a terse advisory nudge to the UserPromptSubmit
+# additionalContext. The MODEL makes the judgment IN-SESSION and calls
+# create_directive itself (visible in chat); the hook NEVER writes a
+# directive on its own — a silent hook-side write would break
+# chat-legibility and edge the no-self-escalation invariant.
+#
+# On by default (Stage A proved a real gap → defaults principle);
+# operators opt out per-agent via memory.directive_capture_nudge=false in
+# switchroom.yaml, which start.sh exports as
+# HINDSIGHT_DIRECTIVE_CAPTURE_NUDGE=false (recall.py falls back to the
+# settings.json default, which switchroom pins on).
+#
+# Detection is intentionally inclusive (the nudge is cheap + advisory, so
+# a modest false-positive rate is acceptable — the model just ignores it
+# on a one-off), but a negative guard scrubs the obvious pleasantry
+# shapes ("always happy to help", "never mind") BEFORE the positive
+# match, so those don't fire on a bare "always"/"never".
+_DIRECTIVE_NUDGE_NEGATIVE_RE = re.compile(
+    r"""(?ix)
+    (?:
+        never \s* mind
+      | nevermind
+      | always \s+ (?: happy | glad | welcome | here \s+ to \s+ help | open \s+ to )
+      | never \s+ (?: fails? | hurts? | too \s+ late | a \s+ dull )
+      | as \s+ always
+      | thanks? \s+ as \s+ always
+      | forever \s+ grateful
+    )
+    """
+)
+
+_DIRECTIVE_NUDGE_RE = re.compile(
+    r"""(?ix)
+    (?:
+      # --- explicit standing-rule framings ---
+        \b from \s+ now \s+ on \b
+      | \b going \s+ forward \b
+      | \b in \s+ (?: the \s+ )? future \b
+      | \b (?: as \s+ a \s+ )? general \s+ (?: rule | behaviou?r | policy | principle | agent \s+ behaviou?r ) \b
+      | \b as \s+ a \s+ rule \b
+      | \b i \s+ want \s+ you \s+ to \b
+      | \b you \s+ should \s+ (?: always | never ) \b
+      # --- always / never (pleasantries pre-scrubbed by the negative guard) ---
+      | \b always \b
+      | \b never \b
+      | \b no \s+ longer \b
+      | \b anymore \b
+      # --- prohibitions / behavioural corrections ---
+      | \b stop \s+ (?: doing | saying | using | calling | adding | making | being | sending | putting ) \b
+      | \b (?: do \s* n['’]? t | don['’]? t | do \s+ not ) \s+ (?: ever \s+ )?
+            (?: make | guess | assume | use | say | add | send | call | include | do | put | write | reply | respond | mention ) \b
+      | \b (?: do \s* n['’]? t | don['’]? t | do \s+ not ) \b [^.?!]{0,40} \b again \b
+      | \b (?: should \s* n['’]? t | shouldn['’]? t | should \s+ not ) \b
+      # --- preferences / identity ---
+      | \b (?: i | we ) \s+ (?: prefer | always \s+ want | never \s+ want ) \b
+      | \b i['’]? d \s+ prefer \b
+      | \b call \s+ me \b
+      # --- memory / reinforcement ---
+      | \b remember \s+ (?: to | that | this | always | never ) \b
+      | \b make \s+ sure \s+ (?: you | to | that | not | it ) \b
+      # --- explicit wrongness + restatement ---
+      | \b that['’]? s \s+ (?: wrong | not \s+ right | incorrect | not \s+ what ) \b
+      | \b (?: no ,? \s+ )? it['’]? s \s+ (?: actually | not ) \b
+      | \b (?: that['’]? s | it['’]? s ) \s+ (?: dead | deprecated | retired | closed ) \b
+      | \b we \s+ (?: now \s+ )? (?: use \s+ only | only \s+ use | no \s+ longer \s+ use ) \b
+    )
+    """
+)
+
+# Terse, advisory. The model decides IN-SESSION whether this is a durable
+# rule and, if so, calls create_directive itself (chat-legible). Kept
+# short so it costs a handful of tokens on a false positive.
+_DIRECTIVE_CAPTURE_NUDGE = (
+    "<directive_capture_check>\n"
+    "The latest user message is correction- or standing-rule-shaped "
+    '(e.g. "always/never …", "from now on …", "stop doing …", a stated '
+    'preference, or "that’s wrong, it’s …"). If it states a DURABLE rule '
+    "for how you should behave going forward — not a one-off request for "
+    "this task — persist it NOW with mcp__hindsight__create_directive "
+    "(verbatim, in the user’s own words) BEFORE you answer, so the "
+    "correction survives future sessions. If it’s only a one-off "
+    "instruction, ignore this note and just answer.\n"
+    "</directive_capture_check>"
+)
+
+
+def looks_like_standing_rule(text) -> bool:
+    """Deterministic (regex-only) test for correction / standing-rule shape.
+
+    Pleasantry shapes ("always happy to help", "never mind") are scrubbed
+    BEFORE the positive match so they can't trip the bare always/never
+    signals. Returns False on empty / non-string input. No model call —
+    the model does the actual judgment in-session (issue #2848).
+    """
+    if not isinstance(text, str) or not text.strip():
+        return False
+    scrubbed = _DIRECTIVE_NUDGE_NEGATIVE_RE.sub(" ", text)
+    return bool(_DIRECTIVE_NUDGE_RE.search(scrubbed))
+
+
+def _combine_context(base, nudge) -> str:
+    """Join the recall/directives context with the directive-capture nudge,
+    skipping empties. Either may be None/empty. The nudge is kept OUT of the
+    cached / last-recall context (it's transient per-inbound) and appended
+    only at emit time, so a cache hit re-derives it from the current prompt
+    rather than replaying a stale one."""
+    parts = [p for p in (base, nudge) if p]
+    return "\n\n".join(parts)
+
+
 def main():
     config = load_config()
 
@@ -664,6 +784,22 @@ def main():
     if config.get("recallSkipTrivial", True) and _is_trivial_stateless(_ack_form, _stripped):
         debug_log(config, f"Prompt is trivial/stateless ({_ack_form!r}), skipping recall")
         return
+
+    # Switchroom #2848 Stage B — directive-capture nudge. Deterministic
+    # (regex) detection of correction / standing-rule-shaped inbound; when
+    # it fires we append a terse advisory to the additionalContext telling
+    # the model to persist the rule with create_directive if it IS durable.
+    # Computed on `_stripped` (the channel-envelope-stripped text) so the
+    # `<channel …>` wrapper never trips detection. Runs AFTER the ack/
+    # trivial-skip gates (those return early and genuinely need no nudge)
+    # and leaves the recall/directive path below untouched — it only adds
+    # to whatever additionalContext that path emits. On by default;
+    # HINDSIGHT_DIRECTIVE_CAPTURE_NUDGE=false (or memory.directive_capture_nudge:
+    # false) turns it off. No model callsite (claude-native invariant).
+    nudge_block = None
+    if config.get("directiveCaptureNudge", True) and looks_like_standing_rule(_stripped):
+        nudge_block = _DIRECTIVE_CAPTURE_NUDGE
+        debug_log(config, "Directive-capture nudge: inbound looks like a standing rule")
 
     session_id = hook_input.get("session_id") or ""
 
@@ -771,7 +907,10 @@ def main():
             cached_context = None
         if cached_context is not None:
             debug_log(config, f"Recall cache HIT (key={cache_key[:12]}…) — skipping API call")
-            _emit_cached_context(cached_context)
+            # #2848 — append the nudge to the cached context at emit time
+            # (the cache stores nudge-free context; the nudge is re-derived
+            # from the current prompt, so a hit can't replay a stale one).
+            _emit_cached_context(_combine_context(cached_context, nudge_block))
             _write_recall_log({
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "session_id": (session_id or "")[:32],
@@ -790,6 +929,7 @@ def main():
                 "active_thread_id": active_thread_id,
                 "active_topic_alias": active_topic_alias,
                 "topic_filter_mode": _topic_filter_mode(),
+                "directive_nudge": bool(nudge_block),
             })
             return
         debug_log(config, f"Recall cache MISS (key={cache_key[:12]}…)")
@@ -1025,8 +1165,12 @@ def main():
         update_placeholder(placeholder_chat_id, "💭 thinking")
 
     # If neither block has content, there's nothing to inject — exit
-    # silently to avoid emitting an empty hookSpecificOutput.
+    # silently to avoid emitting an empty hookSpecificOutput. #2848: unless
+    # the directive-capture nudge fired, in which case emit the nudge alone
+    # (a correction with no memories/directives still needs the reminder).
     if not directives_block and not memories_block:
+        if nudge_block:
+            _emit_cached_context(nudge_block)
         return
 
     # Compose final context. Directives block goes ABOVE memories so the
@@ -1092,13 +1236,16 @@ def main():
         "source_topics": source_topic_summary,
         "topic_filter_mode": topic_filter_mode,
         "topic_dropped": topic_dropped,
+        "directive_nudge": bool(nudge_block),
     })
 
-    # Output JSON for Claude Code hook system
+    # Output JSON for Claude Code hook system. #2848: append the
+    # directive-capture nudge (if it fired) at emit time — it's kept out of
+    # the cached / last-recall context above so it can't go stale.
     output = {
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
-            "additionalContext": context_message,
+            "additionalContext": _combine_context(context_message, nudge_block),
         }
     }
     json.dump(output, sys.stdout)

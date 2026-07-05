@@ -37,6 +37,15 @@ DEFAULTS = {
     # scores, so this is the switchroom-side quality filter — see #475.
     "recallMinOverlap": 0.0,
     "recallTypes": ["world", "experience"],
+    # Switchroom #2848 Stage B — deterministic directive-capture nudge.
+    # When on (switchroom default; pinned true in the copied plugin
+    # settings.json by applyHindsightSettingsOverrides), recall.py regex-
+    # detects correction / standing-rule-shaped inbound and appends a terse
+    # advisory to the UserPromptSubmit additionalContext telling the model
+    # to persist the rule with create_directive if it IS durable. Pure
+    # detection — no model callsite. Operators opt out per-agent via
+    # memory.directive_capture_nudge=false → HINDSIGHT_DIRECTIVE_CAPTURE_NUDGE.
+    "directiveCaptureNudge": True,
     "recallContextTurns": 1,
     "recallMaxQueryChars": 800,
     "recallRoles": ["user", "assistant"],
@@ -119,6 +128,11 @@ ENV_OVERRIDES = {
     # from agents.<name>.memory.recall.skip_trivial only on override; the
     # switchroom default is on (recall.py falls back to True).
     "HINDSIGHT_RECALL_SKIP_TRIVIAL": ("recallSkipTrivial", bool),
+    # Switchroom #2848 Stage B: directive-capture nudge on/off. Set by
+    # start.sh from agents.<name>.memory.directive_capture_nudge only when
+    # the operator overrode it; the switchroom default is on (settings.json
+    # pins true; recall.py falls back to True).
+    "HINDSIGHT_DIRECTIVE_CAPTURE_NUDGE": ("directiveCaptureNudge", bool),
     "HINDSIGHT_RECALL_MAX_QUERY_CHARS": ("recallMaxQueryChars", int),
     "HINDSIGHT_RECALL_CONTEXT_TURNS": ("recallContextTurns", int),
     # Upstream 962140eef — recall tag filters. The tags env var accepts JSON

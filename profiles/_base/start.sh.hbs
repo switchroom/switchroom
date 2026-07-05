@@ -433,6 +433,14 @@ export HINDSIGHT_RECALL_TYPES="{{hindsightRecallTypes}}"
 {{#if hindsightRecallSkipTrivial}}
 export HINDSIGHT_RECALL_SKIP_TRIVIAL={{hindsightRecallSkipTrivial}}
 {{/if}}
+# #2848 Stage B — directive-capture nudge (memory.directive_capture_nudge
+# cascade). On by default (plugin settings.json): recall.py regex-detects
+# correction / standing-rule-shaped inbound and nudges the model to persist
+# it with create_directive if durable. Export only when the operator overrode
+# it; set false to disable the nudge for this agent.
+{{#if hindsightDirectiveCaptureNudge}}
+export HINDSIGHT_DIRECTIVE_CAPTURE_NUDGE={{hindsightDirectiveCaptureNudge}}
+{{/if}}
 # PR6 — supergroup-mode topic tagging. JSON map of {alias: thread_id}
 # parsed by retain.py + recall.py to (a) stamp chat_id/thread_id/topic_alias
 # into retained memory metadata and (b) emit a "Current topic: …" preamble

@@ -2556,6 +2556,15 @@ function renderHindsightSettingsOverrides(
   // opt OUT via memory.recall.skip_trivial=false in switchroom.yaml
   // (exported as HINDSIGHT_RECALL_SKIP_TRIVIAL only when overridden).
   settings.recallSkipTrivial = true;
+  // #2848 Stage B: deterministic directive-capture nudge ON by default.
+  // Stage A audit found a ~55% miss rate on durable corrections (guidance-
+  // only capture is a per-agent lottery), so recall.py regex-detects
+  // correction-shaped inbound and nudges the model to persist it with
+  // create_directive — the model does the judgment in-session (no model
+  // callsite). Operators opt OUT per-agent via memory.directive_capture_nudge
+  // =false (exported as HINDSIGHT_DIRECTIVE_CAPTURE_NUDGE only when overridden;
+  // the env value wins over this settings.json default).
+  settings.directiveCaptureNudge = true;
   // Static shared-bank recall (RFC reference/rfcs/per-speaker-memory-routing.md,
   // ship-B): recall these extra banks on every turn, merged into the agent's
   // own bank results. Sourced from memory.recall.additional_banks (cascaded);
@@ -2626,6 +2635,9 @@ interface BuildWorkspaceContextArgs {
   // each undefined unless the operator overrode the switchroom default.
   hindsightRecallTypes?: string;
   hindsightRecallSkipTrivial?: string;
+  // #2848 Stage B — directive-capture nudge opt-out. Stringified bool,
+  // undefined unless the operator overrode the switchroom default (on).
+  hindsightDirectiveCaptureNudge?: string;
   // PR6 — supergroup-mode topic tagging. JSON map of {alias: thread_id}
   // injected as HINDSIGHT_TOPIC_ALIASES_JSON so retain.py can resolve
   // numeric thread_ids to human alias names in memory metadata.
@@ -2666,6 +2678,7 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightRecallMinOverlap,
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
+    hindsightDirectiveCaptureNudge,
     hindsightTopicAliasesJson,
     hindsightSenderBanksJson,
     hindsightTopicFilterMode,
@@ -2745,6 +2758,7 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightRecallMinOverlap,
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
+    hindsightDirectiveCaptureNudge,
     // PR6 — only emit the env-export blocks when we actually have a
     // value, so `{{#if hindsightTopicAliasesJsonQ}}` and friends are
     // false-y for fleet-shared / DM agents (the dominant case).
@@ -3358,6 +3372,15 @@ export function scaffoldAgent(
     agentConfig.memory?.recall?.skip_trivial === undefined
       ? undefined
       : String(agentConfig.memory.recall.skip_trivial);
+  // #2848 Stage B — directive-capture nudge cascade. undefined unless the
+  // operator overrode the switchroom default (on). Exported only when set
+  // (see start.sh.hbs), so an unset value leaves the on-by-default
+  // settings.json override in force. Top-level memory.* knob (not under
+  // memory.recall) — it gates a correction-detection nudge, not recall tuning.
+  const hindsightDirectiveCaptureNudge =
+    agentConfig.memory?.directive_capture_nudge === undefined
+      ? undefined
+      : String(agentConfig.memory.directive_capture_nudge);
 
   // PR6 — supergroup-mode topic tagging. Build the {alias: thread_id}
   // JSON for retain.py + recall.py to resolve numeric thread_ids to
@@ -3415,6 +3438,7 @@ export function scaffoldAgent(
     hindsightRecallMinOverlap,
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
+    hindsightDirectiveCaptureNudge,
     hindsightTopicAliasesJson,
     hindsightSenderBanksJson,
     hindsightTopicFilterMode,
@@ -5447,6 +5471,15 @@ export function reconcileAgent(
     agentConfig.memory?.recall?.skip_trivial === undefined
       ? undefined
       : String(agentConfig.memory.recall.skip_trivial);
+  // #2848 Stage B — directive-capture nudge cascade. undefined unless the
+  // operator overrode the switchroom default (on). Exported only when set
+  // (see start.sh.hbs), so an unset value leaves the on-by-default
+  // settings.json override in force. Top-level memory.* knob (not under
+  // memory.recall) — it gates a correction-detection nudge, not recall tuning.
+  const hindsightDirectiveCaptureNudge =
+    agentConfig.memory?.directive_capture_nudge === undefined
+      ? undefined
+      : String(agentConfig.memory.directive_capture_nudge);
   // PR6 — mirror scaffoldAgent's computation. Both paths feed
   // buildWorkspaceContext, so the template sees identical shape.
   const topicAliases = agentConfig.channels?.telegram?.topic_aliases;
@@ -5528,6 +5561,7 @@ export function reconcileAgent(
       hindsightRecallMinOverlap,
       hindsightRecallTypes,
       hindsightRecallSkipTrivial,
+      hindsightDirectiveCaptureNudge,
       // PR6 — supergroup-mode topic tagging env vars. Same gate as
       // buildWorkspaceContext: only emit the shell-quoted JSON when
       // we actually have a topic_aliases map.
@@ -6231,6 +6265,7 @@ export function reconcileAgent(
       hindsightRecallMinOverlap,
       hindsightRecallTypes,
       hindsightRecallSkipTrivial,
+      hindsightDirectiveCaptureNudge,
       hindsightTopicAliasesJson,
       hindsightSenderBanksJson,
       hindsightTopicFilterMode,
