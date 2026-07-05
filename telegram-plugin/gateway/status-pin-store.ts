@@ -223,6 +223,79 @@ export type StatusPinPersistOp =
   | { kind: 'clear' }
 
 /**
+ * Per-PATH async serial lock. status-pins.json has multiple concurrent writers
+ * (the fg:/wk: status-pin reconciles AND the banner:owner row), each of which
+ * is a read-modify-write against the shared file. Without serialisation two
+ * writers can interleave their load→persist and clobber each other's rows.
+ *
+ * `withStoreLock(path, fn)` chains `fn` after the current tail promise for that
+ * path and returns fn's result. The stored tail NEVER rejects (a failing op
+ * can't wedge the chain), and `fn` runs regardless of whether the prior op
+ * resolved or rejected.
+ */
+const storeLockTails = new Map<string, Promise<unknown>>()
+
+export function withStoreLock<T>(
+  path: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const prev = storeLockTails.get(path) ?? Promise.resolve()
+  // Run fn after prev settles either way (fn ignores the settled value).
+  const run = prev.then(fn, fn)
+  // Keep a non-rejecting tail so one failed op can't poison every later one.
+  storeLockTails.set(
+    path,
+    run.then(
+      () => undefined,
+      () => undefined,
+    ),
+  )
+  return run
+}
+
+/**
+ * READ-MODIFY-WRITE for exactly ONE pinKey's row, against the authoritative
+ * on-disk file. Loads the current snapshot from disk, drops any row for
+ * `pinKey`, appends `row` (unless null = removal), and persists atomically.
+ *
+ * Crucially the OTHER rows come from disk, never from an in-memory map that may
+ * lag disk — so a writer can never drop another key's pending/confirmed row.
+ * NOT locked itself; callers run it inside `withStoreLock`.
+ */
+function applyStatusPinRow(
+  path: string,
+  fs: StatusPinStoreFsSeam,
+  pinKey: string,
+  row: PersistedStatusPin | null,
+  log: (line: string) => void,
+): void {
+  const current = loadStatusPins(path, fs)
+  const others = current.filter((p) => p.pinKey !== pinKey)
+  const next = row == null ? others : [...others, row]
+  persistStatusPins(path, fs, next, log)
+}
+
+/**
+ * Public single-key mutation, serialised through the per-path lock. Upserts (or
+ * removes, when `row` is null) ONLY `pinKey`'s row, preserving every other row
+ * as it currently is ON DISK. This is the write path for pin kinds that don't
+ * need the pending→confirm dance (e.g. the banner:owner row); the status-pin
+ * reconcile uses `reconcileAndPersistStatusPin`, which holds the same lock
+ * across its whole pending→pin→confirm sequence.
+ */
+export function mutateStatusPinRow(
+  path: string,
+  fs: StatusPinStoreFsSeam,
+  pinKey: string,
+  row: PersistedStatusPin | null,
+  log: (line: string) => void = (l) => process.stderr.write(l),
+): Promise<void> {
+  return withStoreLock(path, async () => {
+    applyStatusPinRow(path, fs, pinKey, row, log)
+  })
+}
+
+/**
  * Persist-ordering wrapper closing the persist-AFTER-pin leak window.
  *
  * THE BUG this fixes: previously the gateway pinned the Telegram message FIRST,
@@ -237,21 +310,26 @@ export type StatusPinPersistOp =
  * pending record on disk, and boot cleanup unpins pending records too (see
  * runStatusPinBootCleanup), so the orphan is recovered next boot.
  *
- * `snapshotOthers` returns the OTHER live claims (every key except `pinKey`) so
- * the whole set is rewritten atomically each step — mirrors how the gateway
- * snapshots its Map. `applyPin` performs the real Telegram pin/unpin (the
- * gateway binds `reconcilePin`) and returns the next in-memory state so the
- * caller can update its Map. Never throws — persistence is best-effort/fail-open
- * and pin errors are already swallowed by `applyPin` (reconcilePin).
+ * CONCURRENCY: the ENTIRE op (pending write → await applyPin → confirm/clear
+ * write) runs under the per-path `withStoreLock`, so no other writer can
+ * interleave during the applyPin await window. Each disk write is a
+ * read-modify-write (`applyStatusPinRow`) keyed on THIS pinKey against the
+ * on-disk file — the other keys' rows (including a banner row, or another
+ * concurrent key's pending row) come from disk and are always preserved. This
+ * closes the race where a snapshot rebuilt from the (lagging) in-memory map
+ * dropped an in-flight key's row.
+ *
+ * `applyPin` performs the real Telegram pin/unpin (the gateway binds
+ * `reconcilePin`) and returns the next in-memory state so the caller can update
+ * its Map. Never throws — persistence is best-effort/fail-open and pin errors
+ * are already swallowed by `applyPin` (reconcilePin).
  */
-export async function reconcileAndPersistStatusPin(args: {
+export function reconcileAndPersistStatusPin(args: {
   path: string
   fs: StatusPinStoreFsSeam
   pinKey: string
   chatId: string
   op: StatusPinPersistOp
-  /** Live claims for every OTHER key (rewritten alongside on each step). */
-  snapshotOthers: () => PersistedStatusPin[]
   /** Execute the real pin/unpin; returns the confirmed message id (pin) or
    *  null (cleared). Must never throw — API errors are swallowed inside. */
   applyPin: () => Promise<{ messageId: number } | null>
@@ -260,43 +338,44 @@ export async function reconcileAndPersistStatusPin(args: {
   const { path, fs, pinKey, chatId, op } = args
   const log = args.log ?? ((l: string) => process.stderr.write(l))
 
-  if (op.kind === 'pin') {
-    // Persist INTENT first, marked pending — BEFORE the pin API call. If we
-    // crash after the pin lands but before the confirm rewrite, this pending
-    // record is what boot cleanup uses to unpin the orphan.
-    persistStatusPins(
-      path,
-      fs,
-      [
-        ...args.snapshotOthers(),
+  // Hold the per-path lock across the WHOLE op so no other writer (a banner
+  // persist, or another key's reconcile) can rebuild/overwrite the file during
+  // the applyPin await window and drop this key's pending/confirmed row.
+  return withStoreLock(path, async () => {
+    if (op.kind === 'pin') {
+      // Persist INTENT first, marked pending — BEFORE the pin API call. If we
+      // crash after the pin lands but before the confirm rewrite, this pending
+      // record is what boot cleanup uses to unpin the orphan.
+      applyStatusPinRow(
+        path,
+        fs,
+        pinKey,
         { pinKey, chatId, messageId: op.messageId, pending: true },
-      ],
-      log,
-    )
-    const next = await args.applyPin()
-    if (next == null) {
-      // Pin failed (claim NOT taken by reconcilePin). Clear the pending record
-      // so we don't leave a phantom claim for a pin that never landed.
-      persistStatusPins(path, fs, args.snapshotOthers(), log)
-      return null
-    }
-    // Pin confirmed — rewrite the record without the pending flag.
-    persistStatusPins(
-      path,
-      fs,
-      [
-        ...args.snapshotOthers(),
+        log,
+      )
+      const next = await args.applyPin()
+      if (next == null) {
+        // Pin failed (claim NOT taken by reconcilePin). Clear the pending
+        // record so we don't leave a phantom claim for a pin that never landed.
+        applyStatusPinRow(path, fs, pinKey, null, log)
+        return null
+      }
+      // Pin confirmed — rewrite the record without the pending flag.
+      applyStatusPinRow(
+        path,
+        fs,
+        pinKey,
         { pinKey, chatId, messageId: next.messageId },
-      ],
-      log,
-    )
-    return next
-  }
+        log,
+      )
+      return next
+    }
 
-  // clear: unpin (best-effort) THEN drop the record. Ordering is safe here —
-  // if we crash after the unpin but before the rewrite, the stale record just
-  // gets unpinned again next boot (idempotent), never a lingering pin.
-  const next = await args.applyPin()
-  persistStatusPins(path, fs, args.snapshotOthers(), log)
-  return next
+    // clear: unpin (best-effort) THEN drop the record. Ordering is safe here —
+    // if we crash after the unpin but before the rewrite, the stale record just
+    // gets unpinned again next boot (idempotent), never a lingering pin.
+    const next = await args.applyPin()
+    applyStatusPinRow(path, fs, pinKey, null, log)
+    return next
+  })
 }

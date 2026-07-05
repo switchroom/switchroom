@@ -28,7 +28,6 @@ import {
   persistStatusPins,
   reconcileAndPersistStatusPin,
   runStatusPinBootCleanup,
-  type PersistedStatusPin,
   type StatusPinStoreFsSeam,
 } from "../gateway/status-pin-store.js";
 import { reconcilePin } from "../status-pin-driver.js";
@@ -81,17 +80,6 @@ function makeGateway(fs: StatusPinStoreFsSeam, tg: ReturnType<typeof fakeTelegra
   const statusPinState = new Map<string, PinState>();
   const statusPinChatIds = new Map<string, string>();
 
-  const snapshotExcept = (exceptKey: string): PersistedStatusPin[] => {
-    const out: PersistedStatusPin[] = [];
-    for (const [pinKey, st] of statusPinState) {
-      if (pinKey === exceptKey) continue;
-      const chatId = statusPinChatIds.get(pinKey);
-      if (chatId == null) continue;
-      out.push({ pinKey, chatId, messageId: st.messageId });
-    }
-    return out;
-  };
-
   async function reconcileStatusPin(pinKey: string, chatId: string, desired: DesiredPin) {
     const prev = statusPinState.get(pinKey) ?? null;
     const action = decidePinAction(prev, desired);
@@ -105,7 +93,6 @@ function makeGateway(fs: StatusPinStoreFsSeam, tg: ReturnType<typeof fakeTelegra
       pinKey,
       chatId,
       op,
-      snapshotOthers: () => snapshotExcept(pinKey),
       applyPin: () =>
         reconcilePin({ api: tg.api, chatId, prevState: prev, desired }),
       log: () => {},
@@ -173,7 +160,6 @@ describe("status-pin boot recovery (gateway wiring)", () => {
         pinKey: "fg:c:3",
         chatId: "-100123",
         op: { kind: "pin", messageId: 715 },
-        snapshotOthers: () => [],
         applyPin: async () => {
           await tg.api.pinChatMessage("-100123", 715); // pin lands in Telegram
           throw new Error("SIGKILL before confirm rewrite");
