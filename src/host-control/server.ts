@@ -2469,10 +2469,20 @@ export class HostdServer {
           started,
         );
       }
-      // Reconcile.
+      // Reconcile — scoped to the requesting agent when possible.
+      // `switchroom apply --only <name>` scaffolds only that agent (8s
+      // vs 2+ min for the full fleet), which keeps the round-trip well
+      // within the gateway's 60s dispatch timeout. Falls back to a
+      // full apply when the caller is the operator socket (rare) or
+      // `runReconcile` is injected by tests.
       const runner =
         this.opts.runReconcile ??
-        (async () => this.runSwitchroom(["apply"]));
+        (async () =>
+          this.runSwitchroom(
+            caller.kind === "agent"
+              ? ["apply", "--only", callerName, "--non-interactive"]
+              : ["apply", "--non-interactive"],
+          ));
       const recRes = await runner({ requestId: approvalId });
       if (recRes.exit_code === 0) {
         // Tell the operator which agents must restart for this edit to go
