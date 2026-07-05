@@ -54,6 +54,7 @@ import {
   clampMarkExpiry,
   overageLiftsWall,
   snapshotFresh,
+  snapshotWalled,
   WALL_PCT,
 } from "./account-eligibility.js";
 import type { AuthConfig, AuthConsumer, SwitchroomConfig } from "../../config/schema.js";
@@ -155,6 +156,32 @@ interface QuotaEntry {
 }
 interface QuotaState {
   [label: string]: QuotaEntry;
+}
+
+/**
+ * Persisted fleet-active override (`active-override.json`). Written on every
+ * successful `set-active` AND on every `mark-exhausted` roll (auto-promote),
+ * so an account swap survives a broker restart/recreate.
+ *
+ * Why: `set-active` historically mutated only in-memory config —
+ * "persisting back to YAML is the CLI's job" (RFC §4.6). Every non-CLI
+ * swap (Telegram /auth use, the switch buttons, auto-fallback) therefore
+ * silently reverted to the stale yaml `auth.active` on the next broker
+ * recreate — repeatedly re-poisoning the fleet with a quota-walled account
+ * during the 2026-07-05 incident (each recreate re-mirrored the walled
+ * account; agents had to crash into the wall again to re-roll).
+ *
+ * Precedence at boot: the override wins over yaml ONLY while yaml's
+ * `auth.active` still reads the same value it had when the override was
+ * written (`yaml_active_at_write`). A hand-edited yaml is newer operator
+ * intent — it wins and the override file is deleted.
+ */
+interface ActiveOverride {
+  active: string;
+  /** yaml `auth.active` at the moment this override was written (null =
+   *  yaml had no active set). */
+  yaml_active_at_write: string | null;
+  updated_at: number;
 }
 
 /**
@@ -409,6 +436,15 @@ export class AuthBroker {
    *  first heads-up. */
   private capChownWarned = false;
 
+  /**
+   * The `auth.active` value as read from switchroom.yaml (constructor
+   * config / last SIGHUP reload), BEFORE any persisted-override or swap is
+   * applied. Recorded into `active-override.json` at write time so boot
+   * can tell "yaml unchanged since the swap → override wins" apart from
+   * "operator hand-edited yaml since → yaml wins". See applyActiveOverride.
+   */
+  private yamlActive: string | undefined;
+
   private closed = false;
 
   constructor(
@@ -416,6 +452,7 @@ export class AuthBroker {
     private readonly opts: AuthBrokerOptions = {},
   ) {
     this.config = config;
+    this.yamlActive = config.auth?.active;
     this.home = opts.home;
     this.now = opts.now ?? nowMs;
     this.operatorUid = opts.operatorUid;
@@ -618,6 +655,11 @@ export class AuthBroker {
     this.assertConfigConsistent(config);
     const prev = this.config;
     this.config = config;
+    // Re-apply the persisted active override against the fresh yaml read —
+    // without this a SIGHUP would silently revert a persisted swap to the
+    // stale yaml `auth.active` (same class as the boot-revert this fixes).
+    this.yamlActive = config.auth?.active;
+    this.applyActiveOverride();
 
     const wanted = new Set<string>();
     for (const name of Object.keys(config.agents ?? {})) {
@@ -1629,6 +1671,20 @@ export class AuthBroker {
    * Each probe is a 1-token Haiku call (fetchQuota) — negligible spend. Caches
    * the snapshot for `list-state`; a failed probe is a no-op (keeps the prior
    * snapshot). Never throws into the timer. Public for tests.
+   *
+   * Proactive fleet failover (2026-07-05 incident): when the fresh probe of
+   * the ACTIVE account indicates exhaustion (same overage-aware test the
+   * consumer sensor uses), mark it and roll the fleet immediately — without
+   * waiting for an agent to crash into the wall mid-turn. The reactive
+   * 429/TUI-wall path stays as the fast trigger; this closes the idle-fleet
+   * gap (a wall crossed overnight previously sat unhandled until the next
+   * live turn failed) AND the recreate-revert gap (this runs at boot, so a
+   * recreated broker whose stale yaml points at a walled account self-heals
+   * on the first tick instead of re-poisoning the fleet). Self-quiescing:
+   * a successful roll auto-promotes the target to `auth.active`, so the
+   * next tick probes a healthy active and no-ops. During a true all-blocked
+   * window the roll re-runs each tick and succeeds on the first tick after
+   * any fallback's window refills.
    */
   async fleetQuotaProbeTick(): Promise<void> {
     for (const label of listAccounts(this.home)) {
@@ -1643,6 +1699,15 @@ export class AuthBroker {
         continue;
       }
       this.cacheQuotaSnapshot(label, result);
+      // Re-read active each iteration: a promote earlier in this loop moves it.
+      const active = this.config.auth?.active;
+      if (label !== active) continue;
+      const decision = quotaIndicatesExhaustion(result, this.isOverageAllowed(label));
+      if (!decision.exhausted) continue;
+      process.stdout.write(
+        `auth-broker: fleet-quota-probe shows ACTIVE ${label} exhausted — proactive failover\n`,
+      );
+      await this.markExhaustedAndRoll(label, decision.until ?? undefined, { kind: "operator" });
     }
   }
 
@@ -1740,15 +1805,19 @@ export class AuthBroker {
       socket.write(encodeError(id, "ACCOUNT_NOT_FOUND", `account '${account}' not found`));
       return;
     }
-    // Mutate in-memory config; persisting back to YAML is the CLI's job
-    // (CLI calls set-active via the operator socket *after* writing YAML —
-    // see RFC §4.6). The broker accepts the in-memory swap so subsequent
-    // get-credentials calls reflect it immediately.
+    // Mutate in-memory config AND persist the swap to the broker's own
+    // state file. Yaml stays the CLI's job (RFC §4.6: CLI writes YAML then
+    // calls set-active), but non-CLI callers (Telegram /auth use, the
+    // switch buttons) have no yaml writer — pre-fix their swap silently
+    // reverted to the stale yaml `auth.active` on the next broker
+    // recreate (2026-07-05 incident). The override survives restarts and
+    // yields to a newer hand-edited yaml (see applyActiveOverride).
     const cfg: SwitchroomConfig = {
       ...this.config,
       auth: { ...(this.config.auth ?? {}), active: account },
     };
     this.config = cfg;
+    this.persistActiveOverride(account);
     const fanned = this.fanoutToAffectedAgents(account);
     // Push updated creds to any consumer mirror whose effective account is now
     // `account` (e.g. a consumer whose failover just resolved to this account
@@ -1770,6 +1839,24 @@ export class AuthBroker {
       socket.write(encodeError(id, "ACCOUNT_NOT_FOUND", "no active account configured"));
       return;
     }
+    const { rolled, rolledTo } = await this.markExhaustedAndRoll(account, until, identity);
+    this.audit({ op: "mark-exhausted", identity, account, accountKind: "claude", ok: true });
+    socket.write(encodeSuccess(id, { account, rolled, rolledTo }));
+  }
+
+  /**
+   * Mark `account` exhausted, roll the fleet off it, and — when the walled
+   * account was the fleet active — promote the roll target to nominal
+   * `auth.active` (persisted). Shared core of the `mark-exhausted` op (the
+   * reactive 429/TUI-wall path via auto-fallback) and the proactive
+   * fleet-probe path (`fleetQuotaProbeTick`), so the two triggers cannot
+   * diverge in roll/promote semantics.
+   */
+  private async markExhaustedAndRoll(
+    account: string,
+    until: number | undefined,
+    identity: Identity,
+  ): Promise<{ rolled: string[]; rolledTo: string | null }> {
     const now = this.now();
     // Clamp the misfire-prone case: a mark longer than the 5h default (the +7d
     // weekly fallback that landed on the healthy primary on 2026-06-10) is only
@@ -1808,8 +1895,59 @@ export class AuthBroker {
     // auto-fallback) report an accurate "switched to <X>" without a follow-up
     // admin set-active. `null` when every fallback_order entry is genuinely
     // exhausted (honest all-blocked).
-    this.audit({ op: "mark-exhausted", identity, account, accountKind: "claude", ok: true });
-    socket.write(encodeSuccess(id, { account, rolled, rolledTo }));
+    //
+    // Auto-promote (2026-07-05 incident): when the roll found a target AND
+    // the walled account was the fleet active, promote the target to
+    // nominal `auth.active` and persist it. Pre-fix the nominal active
+    // stayed pointed at the walled account for the whole exhaustion
+    // window; every restart/recreate-time mirror path that reads nominal
+    // active (agent recreate scaffolds, boot fanout) re-poisoned the fleet
+    // with walled creds, and each agent had to crash into the wall again
+    // before the serving-path failover re-covered it. Promoting makes the
+    // failover the fleet's real, durable state. Stale-wall storms from
+    // other gateways are guarded upstream: runFleetAutoFallback live-probes
+    // the (now healthy) active and skips before ever calling this op.
+    //
+    // Corroboration gate: a promote is a DURABLE act with no auto-revert,
+    // so it requires a FRESH live snapshot proving the account is genuinely
+    // walled (same discipline clampMarkExpiry applies to long marks, and
+    // the #2478 probe-blind guard applies to the fleet alert). Without it,
+    // a bogus/misfired mark (the 2026-06-10 incident shape) would durably
+    // swap the fleet off a healthy account; ungated marks still get the
+    // temporary window-failover semantics, which self-heal on the next
+    // healthy probe.
+    if (
+      rolledTo &&
+      this.config.auth?.active === account &&
+      this.exhaustionLiveCorroborated(account)
+    ) {
+      this.config = {
+        ...this.config,
+        auth: { ...(this.config.auth ?? {}), active: rolledTo },
+      };
+      this.persistActiveOverride(rolledTo);
+      this.fanoutAllConsumers();
+      this.audit({ op: "auto-promote-active", identity, account: rolledTo, accountKind: "claude", ok: true });
+      process.stdout.write(
+        `auth-broker: auto-promoted auth.active ${account} → ${rolledTo} ` +
+          `(${account} exhausted until ${new Date(exhaustedUntil).toISOString()}) — persisted\n`,
+      );
+    }
+    return { rolled, rolledTo };
+  }
+
+  /**
+   * Is `account`'s exhaustion backed by live evidence — a FRESH cached
+   * snapshot that reads walled (and not overage-lifted)? Gates the durable
+   * auto-promote in `markExhaustedAndRoll`; mirrors the corroboration the
+   * quota-watch fleet alert requires (#2478) and the freshness discipline
+   * of `clampMarkExpiry`.
+   */
+  private exhaustionLiveCorroborated(account: string): boolean {
+    const snapshot = this.lastQuotaCache[account];
+    if (!snapshot || !snapshotFresh(snapshot, this.now())) return false;
+    if (!snapshotWalled(snapshot)) return false;
+    return !overageLiftsWall(snapshot, this.isOverageAllowed(account));
   }
 
   /**
@@ -2982,6 +3120,58 @@ export class AuthBroker {
     // #2495 Change 1 — reload the durable utilization cache so a restart
     // serves last-known (age-stamped) quota, not a blank card.
     this.lastQuotaCache = this.readJson<LastQuotaCache>("last-quota.json") ?? {};
+    this.applyActiveOverride();
+  }
+
+  /**
+   * Apply the persisted fleet-active override (see `ActiveOverride`).
+   * Called on boot (loadStateFromDisk) and after every SIGHUP reload.
+   *
+   * Rules:
+   *   - no file / malformed → nothing.
+   *   - yaml `auth.active` changed since the override was written →
+   *     operator hand-edit is newer intent: drop the override (delete file).
+   *   - override account no longer exists on disk → ignore (keep yaml).
+   *   - otherwise → the override IS the fleet active.
+   */
+  private applyActiveOverride(): void {
+    const ov = this.readJson<ActiveOverride>("active-override.json");
+    if (!ov || typeof ov.active !== "string" || ov.active.length === 0) return;
+    const yamlActive = this.yamlActive ?? null;
+    if ((ov.yaml_active_at_write ?? null) !== yamlActive) {
+      process.stdout.write(
+        `auth-broker: active-override dropped — yaml auth.active changed since the swap ` +
+          `(${ov.yaml_active_at_write ?? "unset"} → ${yamlActive ?? "unset"}); yaml wins\n`,
+      );
+      try { unlinkSync(join(this.stateDir, "active-override.json")); } catch { /* best-effort */ }
+      return;
+    }
+    if (!accountExists(ov.active, this.home)) {
+      process.stdout.write(
+        `auth-broker: active-override ignored — account '${ov.active}' not found on disk\n`,
+      );
+      return;
+    }
+    if (ov.active === this.config.auth?.active) return;
+    this.config = {
+      ...this.config,
+      auth: { ...(this.config.auth ?? {}), active: ov.active },
+    };
+    process.stdout.write(
+      `auth-broker: active-override applied — auth.active ${yamlActive ?? "unset"} → ${ov.active} ` +
+        `(persisted swap survives restarts)\n`,
+    );
+  }
+
+  /** Persist the current fleet-active swap so it survives a broker
+   *  restart/recreate. See `ActiveOverride` for the precedence contract. */
+  private persistActiveOverride(active: string): void {
+    const entry: ActiveOverride = {
+      active,
+      yaml_active_at_write: this.yamlActive ?? null,
+      updated_at: this.now(),
+    };
+    atomicWriteJsonSync(join(this.stateDir, "active-override.json"), entry, 0o600);
   }
 
   private readJson<T>(name: string): T | null {
