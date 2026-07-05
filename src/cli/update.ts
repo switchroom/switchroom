@@ -119,6 +119,11 @@ interface UpdateOptions {
   /** Test seam — override `memory.backend === "hindsight"` detection for
    *  the `refresh-hindsight` step instead of reading from switchroom.yaml. */
   memoryBackendHindsight?: boolean;
+  /** Test seam — override the resolved hindsight image pin tag threaded
+   *  into `memory setup --recreate --tag <tag>` instead of resolving it
+   *  from `--pin` / the persisted `release.pin`. An empty string forces
+   *  the floating `:latest` path (no `--tag`). */
+  hindsightPinTag?: string;
   /** One-shot release-channel override (mirrors `apply --channel`). */
   channel?: "dev" | "rc" | "latest";
   /** One-shot release-pin override (mirrors `apply --pin`). Mutually
@@ -325,6 +330,45 @@ export function parseUpdateResultLine(stdout: string): {
   } catch {
     return null;
   }
+}
+
+/**
+ * Resolve the hindsight image tag to pin the `refresh-hindsight` recreate
+ * to (#2851), mirroring how `switchroom rollout` threads `--tag <target>`.
+ *
+ * `memory setup` never reads the durable `release.pin` (unlike compose /
+ * `webd|hostd install`, whose tags resolve from it), so without an explicit
+ * `--tag` the recreate pulls floating `:latest` and the memory singleton
+ * silently drifts a version behind the pinned fleet — the v0.17.5 roll left
+ * hindsight on `:latest` this way.
+ *
+ * Resolution order: an explicit `hindsightPinTag` override (test seam; empty
+ * string forces the floating path) → nothing when a floating `--channel`
+ * override is in play → this run's `--pin` → the already-persisted
+ * `release.pin`. Only a concrete `vX.Y.Z` is returned, because the release
+ * workflow publishes the hindsight image per version as `:vX.Y.Z`; a
+ * `sha-…` pin (or no pin / unreadable config) yields `undefined` → floating
+ * `:latest`, the standalone default. Resolved lazily at run() time so
+ * build-time step inspection stays free of config I/O.
+ */
+export function resolveHindsightPinTag(opts: UpdateOptions): string | undefined {
+  if (typeof opts.hindsightPinTag === "string") {
+    return opts.hindsightPinTag || undefined;
+  }
+  // A floating channel override has no fixed version — leave hindsight
+  // floating too.
+  if (opts.channel) return undefined;
+  let candidate = opts.pin;
+  if (!candidate) {
+    try {
+      candidate = loadConfig().release?.pin ?? undefined;
+    } catch {
+      // Best-effort: fall back to floating :latest rather than fail the
+      // whole update if config can't be loaded.
+      candidate = undefined;
+    }
+  }
+  return candidate && /^v\d+\.\d+\.\d+$/.test(candidate) ? candidate : undefined;
 }
 
 /**
@@ -550,19 +594,30 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
     },
   });
 
-  // refresh-hindsight: pull the latest hindsight image and recreate the
+  // refresh-hindsight: pull the hindsight image and recreate the
   // container. Same isolation gap as refresh-hostd/refresh-web — the
   // hindsight singleton runs as its own standalone `docker run` container
   // (managed by `memory setup`, NOT in the agent fleet's compose project),
-  // and it uses a floating `:latest` tag that `pull-images` / `--pin`
-  // never touch. So before this step existed, `switchroom update` left
-  // hindsight on whatever stale `:latest` it last started with — even
-  // after the durability fixes (#2412 stable worker_id, #2416 backups /
-  // healthcheck / self-maintenance) were already baked into `:latest`,
-  // the running container kept serving the pre-fix image until an operator
-  // separately ran `memory setup --stop` + `memory setup`. This step folds
-  // that recreate into the update (reusing the container's current port so
-  // memory.config.url never changes under the fleet).
+  // so `pull-images` never touches it. Before this step existed,
+  // `switchroom update` left hindsight on whatever stale image it last
+  // started with — even after the durability fixes (#2412 stable
+  // worker_id, #2416 backups / healthcheck / self-maintenance) were baked
+  // into the image, the running container kept serving the pre-fix bits
+  // until an operator separately ran `memory setup --stop` + `memory
+  // setup`. This step folds that recreate into the update (reusing the
+  // container's current port so memory.config.url never changes under the
+  // fleet).
+  //
+  // Pin the recreate to the fleet's target version (#2851). Unlike
+  // refresh-web/refresh-hostd — whose tags resolve from the durable
+  // `release.pin` via compose / `webd|hostd install` — `memory setup`
+  // never reads `release.pin`, so without an explicit `--tag` it recreates
+  // on floating `:latest` and the memory singleton silently drifts a
+  // version behind the pinned fleet (v0.17.5 roll left hindsight on
+  // `:latest`). Mirror `switchroom rollout`, which threads `--tag
+  // <target>`. The target is resolved lazily inside run() (see
+  // {@link resolveHindsightPinTag}) so build-time step inspection stays
+  // free of config I/O.
   //
   // Skipped when the memory backend isn't hindsight OR --skip-images is set.
   let memoryBackendHindsight: boolean;
@@ -580,14 +635,17 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
   steps.push({
     name: "refresh-hindsight",
     description:
-      "switchroom memory setup --recreate — pull latest hindsight image + recreate the memory singleton (standalone container, reusing its current port)",
+      "switchroom memory setup --recreate — pull the hindsight image (pinned to the release target when set, else :latest) + recreate the memory singleton (reusing its current port)",
     skipReason: !memoryBackendHindsight
       ? "memory.backend is not hindsight — no hindsight singleton to refresh"
       : opts.skipImages
         ? "--skip-images flag set"
         : undefined,
     run: () => {
-      const r = runner(process.execPath, [scriptPath, "memory", "setup", "--recreate"]);
+      const pinTag = resolveHindsightPinTag(opts);
+      const setupArgs = ["memory", "setup", "--recreate"];
+      if (pinTag) setupArgs.push("--tag", pinTag);
+      const r = runner(process.execPath, [scriptPath, ...setupArgs]);
       if (r.status !== 0) throw new Error("switchroom memory setup --recreate failed");
     },
   });
