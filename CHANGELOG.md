@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.17.5 — Fix approval card race + start.sh claude command warning
+
+### PR A — Hold inbound delivery gate while approval card is outstanding (#2840)
+
+After the first interim reply, `releaseTurnBufferGate` cleared `claudeBusyKeys`
+even when claude was still blocked on an outstanding approval card. A new
+inbound arriving in that window saw `turnInFlightAtReceipt=false`, delivered
+directly, and displaced the approval context — orphaning the pending MCP call
+(observed: Brevo post approval tapped, but email send never executed).
+
+`turnInFlightForGate()` now returns `true` while `pendingPermissions` is
+non-empty, keeping the gate closed from card-post through the operator tap or
+10-minute auto-deny TTL.
+
+### PR B — Structural regression tests + prune loop guard (#2841)
+
+- Structural pins in `permission-no-repeat-wiring.test.ts` asserting both code
+  paths of `turnInFlightForGate()` include `pendingPermissions.size > 0`. Future
+  refactors that drop the guard will fail CI.
+- `start.sh` prune loop skips the canonical `$HOME/.local/bin/claude` symlink
+  (via `readlink` guard) to avoid spurious "pruning shadow" log on subsequent
+  boots.
+
+### PR C — Fix stale comment in start.sh re-seat block (#2842)
+
+Corrects a one-sentence comment that said the prune loop "removes" the symlink
+on the next boot — after the #2841 guard it now skips (preserves) it.
+
+Also re-seats `$HOME/.local/bin/claude → /usr/local/bin/claude` at boot,
+silencing the claude v2.1.x+ "claude command missing or broken" startup warning.
+
 ## v0.17.4 — Fix "Always allow" not sticking
 
 `config_propose_edit` in hostd now passes `--only <agent>` to `switchroom apply`,
