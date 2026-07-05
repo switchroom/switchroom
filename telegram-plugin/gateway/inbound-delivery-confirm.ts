@@ -85,10 +85,18 @@ export function trackDelivery<M>(
  * already running (#2786). Scanning ALL ids in the raw content makes the ack
  * tolerant of that reorder/merge: the tracked id is present iff its envelope
  * was delivered, regardless of parse order.
+ *
+ * The regex is LEFT-ANCHORED on an attribute boundary (start-of-string or a
+ * whitespace/quote before the name) so it matches ONLY the real `message_id`
+ * attribute — never a same-suffix sibling like `target_message_id`,
+ * `reply_to_message_id`, `original_message_id`, or `card_message_id`. This is
+ * what makes the tolerant-path match safe on a never-drop code path: a
+ * substring collision on some other `*_message_id` attribute cannot false-ack
+ * (and thus silently drop) a real user message still waiting to land.
  */
 export function extractEnqueueMessageIds(content: string): string[] {
   const ids: string[] = []
-  const re = /message_id="([^"]+)"/g
+  const re = /(?:^|[\s"'])message_id="([^"]+)"/g
   let m: RegExpExecArray | null
   while ((m = re.exec(content)) != null) ids.push(m[1]!)
   return ids
