@@ -132,8 +132,18 @@ export function repairEscapedWhitespace(text: string): string {
 interface MaskedCode {
   masked: string
   restore: (s: string) => string
-  /** The placeholder prefix injected for each masked region (fence or span). */
+  /**
+   * The placeholder prefix injected for FENCED-BLOCK masks only. A masked
+   * fenced block occupies a whole line, so `isFenceOpenLine` / `isMarkerLine`
+   * treat a line that STARTS with this prefix as a block construct. INLINE
+   * code spans get a DISTINCT prefix (see maskCodeRegions) that deliberately
+   * does NOT start with this one — so a line that merely opens with an inline
+   * span (e.g. `\`key\` = \`value\``) reads as ordinary prose and still gets
+   * its line break hardened.
+   */
   placeholder: string
+  /** Remove EVERY mask (fenced + inline) — used to measure visible length. */
+  stripPlaceholders: (s: string) => string
 }
 
 /**
@@ -144,31 +154,40 @@ interface MaskedCode {
  * Fenced blocks are extracted FIRST and only when CLOSED (matching ```), so an
  * unclosed fence is left intact rather than misparsed by the inline pass. Inline
  * spans use `[^\`\n]+` — the same definition the chunker treats as code.
+ *
+ * Fenced and inline masks carry DISTINCT prefixes (`\x00RMF…` vs `\x00RMI…`).
+ * This matters because the fenced prefix is what the block-structure predicates
+ * (`isFenceOpenLine`, `isMarkerLine`) use to recognise a standalone masked code
+ * block. Sharing one prefix (the pre-fix bug) made a line that merely STARTS
+ * with an inline code span look like a fenced block, so its lone `\n` was never
+ * hardened and the card collapsed into one run-on line (real victim:
+ * `/vault get` rendering `\`key\` = \`value\``).
  */
 function maskCodeRegions(text: string, nonce: string): MaskedCode {
-  const CODE_MASK_PH = `\x00RM${nonce}_`
+  const FENCE_MASK_PH = `\x00RMF${nonce}_`
+  const INLINE_MASK_PH = `\x00RMI${nonce}_`
   const codeMasks: string[] = []
 
   const masked = text
     .replace(/```[\s\S]*?```/g, (m) => {
       const idx = codeMasks.length
       codeMasks.push(m)
-      return `${CODE_MASK_PH}${idx}\x00`
+      return `${FENCE_MASK_PH}${idx}\x00`
     })
     .replace(/`[^`\n]+`/g, (m) => {
       const idx = codeMasks.length
       codeMasks.push(m)
-      return `${CODE_MASK_PH}${idx}\x00`
+      return `${INLINE_MASK_PH}${idx}\x00`
     })
 
-  const restoreRe = new RegExp(
-    `${CODE_MASK_PH.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\d+)\x00`,
-    'g',
-  )
+  // Restore / strip match EITHER prefix, keyed on the shared index space.
+  const escNonce = nonce.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const anyMaskRe = new RegExp(`\x00RM[FI]${escNonce}_(\\d+)\x00`, 'g')
   const restore = (s: string): string =>
-    s.replace(restoreRe, (_m, idx) => codeMasks[Number(idx)] ?? _m)
+    s.replace(anyMaskRe, (_m, idx) => codeMasks[Number(idx)] ?? _m)
+  const stripPlaceholders = (s: string): string => s.replace(anyMaskRe, '')
 
-  return { masked, restore, placeholder: CODE_MASK_PH }
+  return { masked, restore, placeholder: FENCE_MASK_PH, stripPlaceholders }
 }
 
 // ---------------------------------------------------------------------------
@@ -709,14 +728,11 @@ export function stripExcessBold(text: string): string {
   if (!text.includes('**')) return text
 
   const nonce = Math.random().toString(36).slice(2)
-  const { masked, restore, placeholder } = maskCodeRegions(text, nonce)
+  const { masked, restore, placeholder, stripPlaceholders } = maskCodeRegions(text, nonce)
 
-  // Non-code character budget: masked text with the placeholders removed.
-  const placeholderRe = new RegExp(
-    `${placeholder.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\d+\x00`,
-    'g',
-  )
-  const visible = masked.replace(placeholderRe, '')
+  // Non-code character budget: masked text with BOTH fenced + inline masks
+  // removed (stripPlaceholders handles the two distinct prefixes).
+  const visible = stripPlaceholders(masked)
   if (visible.length < 100) return restore(masked)
 
   let boldChars = 0

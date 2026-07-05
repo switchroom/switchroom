@@ -11316,11 +11316,9 @@ async function executeVaultRequestAccess(args: Record<string, unknown>): Promise
   pendingVaultRequestAccesses.set(stageId, pending)
   sweepPendingVaultRequestAccesses()
 
-  // hardenCardBreaks: the access-request card stacks labelled fields
-  // (key: / scope: / why:) with single `\n`, which soft-collapse into one
-  // blob under the GFM rich renderer — sent direct here, bypassing the
-  // switchroomReply chokepoint.
-  const text = hardenCardBreaks(renderVaultRequestAccessCard(pending))
+  // renderVaultRequestAccessCard self-hardens its field line breaks (this card
+  // is sent direct, bypassing the switchroomReply chokepoint).
+  const text = renderVaultRequestAccessCard(pending)
   const threadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
   // Remember the agent's working topic so the grant-outcome inbound resumes in it.
   if (threadId != null) pending.threadId = threadId

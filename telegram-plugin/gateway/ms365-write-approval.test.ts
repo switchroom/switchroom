@@ -105,6 +105,19 @@ describe("buildMs365CardText", () => {
     expect(text).toContain("bob@example.com");
   });
 
+  it("hard-breaks its field lines so GFM doesn't collapse them into a blob", () => {
+    // The Agent:/Tool:/Item:/Account: field lines must carry GFM hard breaks
+    // (`  \n`), not bare `\n` soft breaks. Assert every adjacent pair of
+    // non-blank content lines is separated by a hard break or a `\n\n` gap.
+    const text = buildMs365CardText(base);
+    expect(text).toContain("  \n");
+    const nl = text.split("\n");
+    for (let i = 0; i < nl.length - 1; i++) {
+      if (nl[i].trim() === "" || nl[i + 1].trim() === "") continue; // block gap
+      expect(nl[i].endsWith("  ")).toBe(true);
+    }
+  });
+
   it("omits ID line for new files", () => {
     const text = buildMs365CardText({ ...base, itemId: "(new)" });
     expect(text).not.toMatch(/^ID:/m);

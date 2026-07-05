@@ -68,6 +68,36 @@ describe('hardenCardBreaks — deterministic card line-break hardener', () => {
   test('no-op for single-line text', () => {
     expect(hardenCardBreaks('just one line')).toBe('just one line')
   })
+
+  // Regression (reviewer nit): a field line that STARTS with an inline code
+  // span used to be misclassified as a masked fenced-block open (fenced +
+  // inline masks shared one placeholder prefix), so its lone `\n` was never
+  // hardened and the card collapsed. Real victim: `/vault get` rendering
+  // `` `key` = `value` `` on one line.
+  test('hardens a line that STARTS with an inline code span', () => {
+    const out = hardenCardBreaks('`key` = `value`\n`k2` = `v2`')
+    expect(out).toBe('`key` = `value`  \n`k2` = `v2`')
+  })
+
+  test('/vault get shape (`key` =\\n`value`) hard-breaks onto two lines', () => {
+    const out = hardenCardBreaks('`sk-key` =\n`hunter2`')
+    expect(out).toBe('`sk-key` =  \n`hunter2`')
+  })
+
+  test('inline-span-leading fix does NOT disturb a real fenced block', () => {
+    // A genuine ``` fence between two inline-span-leading field lines: the
+    // field lines harden, the fence interior stays byte-for-byte intact.
+    const src = '`a` = 1\n```\nx = 1\ny = 2\n```\n`b` = 2'
+    const out = hardenCardBreaks(src)
+    expect(out).toContain('```\nx = 1\ny = 2\n```') // fence interior untouched
+    expect(out).not.toContain('x = 1  \n') // no hard break injected inside fence
+  })
+
+  test('mid-line inline spans still harden (unchanged behaviour)', () => {
+    expect(hardenCardBreaks('Model: `opus`\nAuth: `Max`')).toBe(
+      'Model: `opus`  \nAuth: `Max`',
+    )
+  })
 })
 
 describe('addParagraphSpacers — uniform block spacing', () => {

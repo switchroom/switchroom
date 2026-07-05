@@ -91,4 +91,21 @@ describe('renderVaultRequestAccessCard', () => {
     })
     expect(text).toContain('why: _not provided_')
   })
+
+  it('hard-breaks its field lines so GFM does not collapse the card into a blob', () => {
+    const text = renderVaultRequestAccessCard({
+      agent: 'overlord',
+      key: 'openai/OPENAI_API_KEY',
+      scope: 'read',
+      reason: 'call the completions endpoint',
+      ttl_seconds: 7 * 86400,
+    })
+    // The key: / scope: / why: field lines carry GFM hard breaks (`  \n`).
+    expect(text).toContain('  \n')
+    const nl = text.split('\n')
+    for (let i = 0; i < nl.length - 1; i++) {
+      if (nl[i].trim() === '' || nl[i + 1].trim() === '') continue // `\n\n` block gap
+      expect(nl[i].endsWith('  ')).toBe(true)
+    }
+  })
 })
