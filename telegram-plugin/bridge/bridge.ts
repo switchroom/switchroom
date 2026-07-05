@@ -75,7 +75,7 @@ const mcp = new Server(
     instructions: [
       'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. A single message may carry SEVERAL attachments (a forwarded album or a text+multi-image burst): when attachment_count is set (>1), also handle the numbered siblings — image_path_2, image_path_3, … (Read each) and attachment_file_id_2, attachment_file_id_3, … (download_attachment each). Process every one, not just the first. Reply with the reply tool — pass chat_id back. The reply and stream_reply tools quote-reply to the latest inbound user message by default, so you do NOT need to pass reply_to for normal responses. Pass reply_to (a message_id) only when quoting a specific earlier message, or pass quote:false to send a bare (non-quoted) message.',
+      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. A single message may carry SEVERAL attachments (a forwarded album or a text+multi-image burst): when attachment_count is set (>1), also handle the numbered siblings — image_path_2, image_path_3, … (Read each) and attachment_file_id_2, attachment_file_id_3, … (download_attachment each). Process every one, not just the first. Reply with the reply tool — pass chat_id back. The reply tool quote-replies to the latest inbound user message by default, so you do NOT need to pass reply_to for normal responses. Pass reply_to (a message_id) only when quoting a specific earlier message, or pass quote:false to send a bare (non-quoted) message.',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, edit_message for interim progress updates, and delete_message when you need to truly remove a message (prefer edit_message if you just want to change text — delete is for retraction). Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings. Use send_typing to show a typing indicator during long operations. Use pin_message to pin important outputs. Use forward_message to quote/resurface earlier messages.',
       '',
@@ -125,46 +125,6 @@ const TOOL_SCHEMAS = [
                 callback_data: { type: 'string', description: 'Opaque tag delivered back to the agent on tap. Max 58 chars (gateway prepends an `agent:` prefix to the 64-byte Telegram limit). Mutually exclusive with url.' },
                 ack_text: { type: 'string', description: 'Toast text shown to the user the instant they tap this button (#710). Default "✓ received". Max ~200 chars (Telegram answerCallbackQuery limit). Has no effect on URL buttons.' },
                 single_use: { type: 'boolean', description: 'When true (default) tapping any single_use button on the message removes the entire keyboard so the user can\'t double-fire. Set false on buttons that should stay tappable (e.g. a "Refresh" button). If ANY button on the message has single_use:false the keyboard is preserved on tap.' },
-              },
-              required: ['text'],
-            },
-          },
-        },
-      },
-      required: ['chat_id', 'text'],
-    },
-  },
-  {
-    name: 'stream_reply',
-    description:
-      'Post the final answer for this turn. The plugin renders an event-driven progress card (Plan → Run → Done with live tool bullets, elapsed time, and status emoji) for free while the turn is in-flight, so you do not need to narrate intermediate progress. Call `stream_reply` exactly once per turn with done=true and the complete answer text. Hard cap is 32768 chars (the rich-message wire limit) — longer text is dropped by a defensive guard, so use `reply` for anything that long (it chunks). Calling with done=false is an error in this environment (the progress card already owns the mid-turn surface). inline_keyboard adds tappable buttons under the final message — see `reply` for shape and constraints.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        chat_id: { type: 'string' },
-        text: { type: 'string', description: 'Full text snapshot. NOT a delta — pass the complete current content each call.' },
-        done: { type: 'boolean', description: 'Must be true. Posts this text as the final answer for the turn and locks the message.' },
-        message_thread_id: { type: 'string', description: 'Forum topic thread ID. Auto-applied from the last inbound message if not specified.' },
-        origin_turn_id: { type: 'string', description: 'In a forum supergroup, pass back the origin_turn_id attribute from the <channel> message you are answering. It pins the reply to that message\'s topic even if another topic\'s turn started meanwhile. Omit in DMs / single-topic chats.' },
-        format: { type: 'string', enum: ['html', 'markdownv2', 'text'], description: "Rendering mode. 'html' (default) converts markdown to Telegram HTML." },
-        reply_to: { type: 'string', description: 'Message ID to quote-reply to. Overrides the default (latest inbound).' },
-        quote: { type: 'boolean', description: 'Opt out of the default quote-reply behavior. Default: true. Ignored when reply_to is explicitly set.' },
-        protect_content: { type: 'boolean', description: 'When true, Telegram prevents the message from being forwarded or saved.' },
-        quote_text: { type: 'string', description: 'Surgical quote: specific text to highlight from the reply_to message. Requires reply_to.' },
-        disable_notification: { type: 'boolean', description: 'When true, the INITIAL message send is silent (no device ping). Has no effect on subsequent edits — Telegram never pings on editMessageText. Default false. Use for mid-turn stream starts you do not want to ping; omit on the final answer.' },
-        inline_keyboard: {
-          type: 'array',
-          description: '2D array of tappable buttons under the final message. Same shape and constraints as `reply.inline_keyboard` — each button has `text` and EXACTLY ONE of `url` or `callback_data`, plus optional `ack_text` (custom tap-toast; default "✓ received") and `single_use` (default true; set false to keep the keyboard tappable after a tap). Tap on a callback_data button is delivered to this agent as an inbound channel event with meta.button_callback_data set.',
-          items: {
-            type: 'array',
-            items: {
-              type: 'object',
-              properties: {
-                text: { type: 'string' },
-                url: { type: 'string' },
-                callback_data: { type: 'string' },
-                ack_text: { type: 'string', description: 'Toast text shown on tap. Default "✓ received".' },
-                single_use: { type: 'boolean', description: 'Default true. Set false to keep the keyboard tappable after this button is tapped.' },
               },
               required: ['text'],
             },

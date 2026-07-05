@@ -8,12 +8,11 @@ The official Telegram plugin provides basic message send/receive. Switchroom's f
 
 ## What the switchroom fork adds
 
-### Message tools (12 MCP tools)
+### Message tools (11 MCP tools)
 
 | Tool | What it does |
 |------|-------------|
-| `reply` | Send text, photos, or documents. Supports threading, topic routing, multi-file attachments, inline keyboard URL buttons, `protect_content`, `quote_text`, and an optional `accent` status header (`in-progress`/`done`/`issue`). |
-| `stream_reply` | Edit a single message in place as work progresses (~1/sec throttle). Same `accent` and inline-keyboard support as `reply`. Optional `lane` parameter splits parallel streams (e.g. `thinking` vs default answer) per chat+thread. |
+| `reply` | Send the final answer — text, photos, or documents; the single final-answer tool. Chunks anything over Telegram's 4096-char limit. Supports threading, topic routing, multi-file attachments, inline keyboard URL buttons, `protect_content`, `quote_text`, and an optional `accent` status header (`in-progress`/`done`/`issue`). |
 | `react` | Add emoji reactions to messages (Telegram whitelist: 👍 👎 ❤️ 🔥 👀 🎉 etc). |
 | `edit_message` | Update a previously sent message. |
 | `delete_message` | Remove a bot-sent message (48h Telegram limit). |
@@ -27,11 +26,11 @@ The official Telegram plugin provides basic message send/receive. Switchroom's f
 
 ### Status accent headers
 
-Both `reply` and `stream_reply` accept an optional `accent: 'in-progress' | 'done' | 'issue'` parameter that prepends a status indicator line (`🔵 In progress…`, `✅ Done`, `⚠️ Issue`) above the message body. Use it for status communication on long-running work and completion announcements; omit it for routine conversational replies. (#328)
+`reply` accepts an optional `accent: 'in-progress' | 'done' | 'issue'` parameter that prepends a status indicator line (`🔵 In progress…`, `✅ Done`, `⚠️ Issue`) above the message body. Use it for status communication on long-running work and completion announcements; omit it for routine conversational replies. (#328)
 
 ### Inline keyboard URL buttons
 
-`reply` and `stream_reply` accept an `inline_keyboard` parameter — an array of rows, each row an array of `{ text, url }` buttons — for tap-to-open links rendered as Telegram inline buttons (#271).
+`reply` accepts an `inline_keyboard` parameter — an array of rows, each row an array of `{ text, url }` buttons — for tap-to-open links rendered as Telegram inline buttons (#271).
 
 ### Emoji status reactions
 
@@ -181,10 +180,9 @@ agents:
         stream_mode: pty   # opt out of the checklist card
 ```
 
-Progress-card messages are sent on a dedicated `lane: "progress"` via
-`stream_reply` so they don't collide with the answer message. The final
-answer still lands separately via the model's `reply` / `stream_reply`
-call.
+Progress-card messages are sent on a dedicated `lane: "progress"` via the
+internal stream-reply handler so they don't collide with the answer message.
+The final answer still lands separately via the model's `reply` call.
 
 ## Configuration
 

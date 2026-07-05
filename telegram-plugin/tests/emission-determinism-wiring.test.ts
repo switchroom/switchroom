@@ -52,8 +52,8 @@ describe('sticky finalAnswerEverDelivered latch (lever 1 precondition / R0)', ()
     // The latch is set true only at the points that set finalAnswerDelivered=true,
     // and only when the reply was substantive — so an ack never latches it.
     const setTrue = [...gatewaySrc.matchAll(/finalAnswerEverDelivered\s*=\s*true/g)]
-    // executeReply, executeStreamReply, silent-anchor merge, + the two lever-2
-    // finalize blocks (which are themselves substantive-gated).
+    // executeReply, silent-anchor merge, + the lever-2 finalize block
+    // (which is itself substantive-gated).
     expect(setTrue.length).toBeGreaterThanOrEqual(3)
     // Each `finalAnswerEverDelivered = true` must sit in a substantive context:
     // either guarded by `if (turn.finalAnswerSubstantive)` or inside an
@@ -125,14 +125,9 @@ describe('drain producers — narrative may not OPEN, liveness + tool may', () =
 })
 
 describe('lever 2 — finalize the card BEFORE a substantive reply send', () => {
-  /** executeReply body up to executeStreamReply. */
+  /** executeReply body up to the next top-level function. */
   function executeReplySrc(): string {
     const after = gatewaySrc.split('async function executeReply(')[1] ?? ''
-    return after.split('async function executeStreamReply(')[0] ?? after
-  }
-  /** executeStreamReply body up to the next top-level function. */
-  function executeStreamReplySrc(): string {
-    const after = gatewaySrc.split('async function executeStreamReply(')[1] ?? ''
     return after.split('\nasync function ')[0]?.split('\nfunction ')[0] ?? after
   }
 
@@ -148,27 +143,11 @@ describe('lever 2 — finalize the card BEFORE a substantive reply send', () => 
     expect(window).toMatch(/isSubstantiveFinalReply/)
   })
 
-  it('executeStreamReply finalizes before handleStreamReply, gated on substantive', () => {
-    const src = executeStreamReplySrc()
-    const clearIdx = src.indexOf('clearActivitySummary(')
-    const sendIdx = src.indexOf('const result = await handleStreamReply(')
-    expect(clearIdx).toBeGreaterThan(-1)
-    expect(sendIdx).toBeGreaterThan(-1)
-    expect(clearIdx).toBeLessThan(sendIdx)
-    // Window extended to 600 chars to account for the finalAnswerDeliveredAt stamp
-    // added inside the markSubstantiveFinalDelivered callback (Fix 2 / #2587).
-    const window = src.slice(Math.max(0, clearIdx - 600), clearIdx)
-    expect(window).toMatch(/isSubstantiveFinalReply/)
-  })
-
   it('acks do NOT finalize early — no unconditional clearActivitySummary before the reply send', () => {
-    // Both lever-2 finalize sites sit inside an isSubstantiveFinalReply guard.
+    // The lever-2 finalize site sits inside an isSubstantiveFinalReply guard.
     // An ack (non-substantive) falls through and never finalizes early, so the
     // reopen path keeps owning the card (the #2141 ack-then-work feed).
-    const replySrc = (() => {
-      const after = gatewaySrc.split('async function executeReply(')[1] ?? ''
-      return after.split('async function executeStreamReply(')[0] ?? after
-    })()
+    const replySrc = executeReplySrc()
     // The pre-loop clearActivitySummary must be the substantive-gated one.
     const preLoop = replySrc.split('for (let i = 0; i < chunks.length')[0] ?? ''
     const clears = [...preLoop.matchAll(/clearActivitySummary\(/g)]

@@ -191,4 +191,4 @@ Before writing the test, ask:
 - `telegram-plugin/tests/fake-bot-api.test.ts` — meta-test of the fake;
   read first when adding new fake-bot capabilities
 - `telegram-plugin/tests/streaming-e2e.test.ts` — worked example of a
-  larger end-to-end test (PTY → stream_reply → done)
+  larger end-to-end test (PTY → internal stream-reply handler → done)

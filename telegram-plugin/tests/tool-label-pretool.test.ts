@@ -41,18 +41,15 @@ describe('computeLabel — never-null built-in fallthrough', () => {
 })
 
 describe('computeLabel — surface-tool suppression is key-agnostic', () => {
-  it('returns null for telegram reply/stream_reply under any registration key', () => {
+  it('returns null for telegram reply under any registration key', () => {
     // Standard switchroom-telegram key.
     expect(computeLabel('mcp__switchroom-telegram__reply', {})).toBeNull()
-    expect(computeLabel('mcp__switchroom-telegram__stream_reply', {})).toBeNull()
 
     // Legacy clerk-telegram key — same plugin, different registration name.
     expect(computeLabel('mcp__clerk-telegram__reply', {})).toBeNull()
-    expect(computeLabel('mcp__clerk-telegram__stream_reply', {})).toBeNull()
 
     // Hypothetical custom fork.
     expect(computeLabel('mcp__my-custom-telegram__reply', {})).toBeNull()
-    expect(computeLabel('mcp__my-custom-telegram__stream_reply', {})).toBeNull()
   })
 
   it('returns null for telegram react under any registration key', () => {
