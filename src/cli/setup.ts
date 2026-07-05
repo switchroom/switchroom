@@ -983,22 +983,17 @@ async function stepMemoryBackend(
   } catch { /* vault unreachable; skip the courtesy note */ }
 
   // Register the hindsight consumer in switchroom.yaml so the auth-broker
-  // binds a per-consumer UDS for it on next `switchroom apply`.
-  const activeAccount = config.auth?.active;
-  if (!activeAccount) {
-    console.log(
-      chalk.yellow(
-        `  No auth.active account set — skipping consumer registration. ` +
-          `Run \`switchroom auth use <label>\` and re-run setup.`,
-      ),
-    );
-  } else {
+  // binds a per-consumer UDS for it on next `switchroom apply`. Registered
+  // UNPINNED (no `account:`): the consumer follows the fleet `auth.active`
+  // with the same failover agents get. Operators who want quota isolation
+  // can add an explicit `account:` pin afterwards.
+  {
     try {
-      const result = await ensureHindsightConsumer(switchroomConfigPath, activeAccount);
+      const result = await ensureHindsightConsumer(switchroomConfigPath);
       if (result.added) {
         console.log(
           chalk.green(
-            `  ${STEP_DONE} Registered auth.consumers[${HINDSIGHT_CONSUMER_NAME}] = ${activeAccount}`,
+            `  ${STEP_DONE} Registered auth.consumers[${HINDSIGHT_CONSUMER_NAME}] (follows the fleet active account)`,
           ),
         );
       } else {
