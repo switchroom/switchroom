@@ -117,16 +117,28 @@ PYEOF
 # container didn't match, the entrypoint would EACCES on the
 # socket connect.
 #
-# `usermod -u` rewrites every file under the user's HOME and any
-# explicitly-listed dir we know they own, but the upstream image
-# scatters python venvs across /app and /opt — find any file owned
-# by the old UID and chown it to the new one (idempotent: re-runs
-# of the same build with the same target UID are no-ops).
+# `usermod -u` rewrites every file under the user's HOME; the find
+# below catches everything else the hindsight user owns (idempotent:
+# re-runs of the same build with the same target UID are no-ops).
+#
+# SCOPED, not `find / -xdev` (perf, #2807 follow-up): hindsight-owned
+# files live ONLY under /app and /home/hindsight — verified against
+# upstream docker/standalone/Dockerfile (vectorize-io/hindsight
+# v0.8.2), which does `chown -R hindsight:hindsight /app` and
+# `useradd -m` + `mkdir /home/hindsight/.pg0`; nothing hindsight-owned
+# is created elsewhere. The old whole-filesystem sweep also chowned
+# every UNRELATED file that merely shared the numeric old UID (upstream
+# useradd assigns 1000, which collides with base-image users like
+# `node`), and each chown copy-ups the file into this layer — that
+# roughly doubled the exported image and dominated the CI push time.
+# ASSUMPTION: if a future upstream bump starts placing hindsight-owned
+# files outside /app + /home/hindsight, this list must be extended —
+# symptom would be runtime EACCES under the new path.
 RUN OLD_UID=$(id -u hindsight) && NEW_UID=11000 \
  && if [ "$OLD_UID" != "$NEW_UID" ]; then \
       usermod -u "$NEW_UID" hindsight \
    && groupmod -g "$NEW_UID" hindsight 2>/dev/null || true \
-   && find / -xdev -uid "$OLD_UID" ! -path '/proc/*' -exec chown -h "$NEW_UID":"$NEW_UID" {} + ; \
+   && find /app /home/hindsight -xdev -uid "$OLD_UID" -exec chown -h "$NEW_UID":"$NEW_UID" {} + ; \
     fi \
  && id hindsight >&2
 
