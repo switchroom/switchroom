@@ -202,15 +202,21 @@ jobs:
       fail-fast: false
       matrix:
         image:
-          - { name: base,        file: docker/Dockerfile.base,        dist: true,  base-arg: false }
-          - { name: agent,       file: docker/Dockerfile.agent,       dist: true,  base-arg: true }
-          - { name: broker,      file: docker/Dockerfile.broker,      dist: true,  base-arg: true }
-          - { name: kernel,      file: docker/Dockerfile.kernel,      dist: true,  base-arg: true }
-          - { name: hostd,       file: docker/Dockerfile.hostd,       dist: true,  base-arg: true }
-          - { name: auth-broker, file: docker/Dockerfile.auth-broker, dist: true,  base-arg: true }
-          - { name: web,         file: docker/Dockerfile.web,         dist: true,  base-arg: true }
-          - { name: hindsight,   file: docker/Dockerfile.hindsight,   dist: false, base-arg: false }
-          - { name: voice,       file: docker/Dockerfile.voice,       dist: false, base-arg: false }
+          # `cache` names each image's registry buildcache tag: since
+          # docker-images.yml split base/dependents into per-arch
+          # native-runner builds, their caches are per-arch
+          # (:buildcache-<arch>); this amd64-only job reads the amd64
+          # one. hindsight/voice stayed single-job and keep the plain
+          # :buildcache tag.
+          - { name: base,        file: docker/Dockerfile.base,        dist: true,  base-arg: false, cache: buildcache-amd64 }
+          - { name: agent,       file: docker/Dockerfile.agent,       dist: true,  base-arg: true,  cache: buildcache-amd64 }
+          - { name: broker,      file: docker/Dockerfile.broker,      dist: true,  base-arg: true,  cache: buildcache-amd64 }
+          - { name: kernel,      file: docker/Dockerfile.kernel,      dist: true,  base-arg: true,  cache: buildcache-amd64 }
+          - { name: hostd,       file: docker/Dockerfile.hostd,       dist: true,  base-arg: true,  cache: buildcache-amd64 }
+          - { name: auth-broker, file: docker/Dockerfile.auth-broker, dist: true,  base-arg: true,  cache: buildcache-amd64 }
+          - { name: web,         file: docker/Dockerfile.web,         dist: true,  base-arg: true,  cache: buildcache-amd64 }
+          - { name: hindsight,   file: docker/Dockerfile.hindsight,   dist: false, base-arg: false, cache: buildcache }
+          - { name: voice,       file: docker/Dockerfile.voice,       dist: false, base-arg: false, cache: buildcache }
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -253,5 +259,8 @@ jobs:
           push: false
           build-args: ${{ matrix.image.base-arg && format('BASE_IMAGE={0}/{1}/switchroom-base:latest', env.REGISTRY, env.IMAGE_NAMESPACE) || '' }}
           # Read-only registry cache (never cache-to — #1965 pattern,
-          # and this job must not pollute the release cache).
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/switchroom-${{ matrix.image.name }}:buildcache
+          # and this job must not pollute the release cache). Second
+          # line is the legacy pre-per-arch-split tag as a fallback.
+          cache-from: |
+            type=registry,ref=ghcr.io/${{ github.repository_owner }}/switchroom-${{ matrix.image.name }}:${{ matrix.image.cache }}
+            type=registry,ref=ghcr.io/${{ github.repository_owner }}/switchroom-${{ matrix.image.name }}:buildcache

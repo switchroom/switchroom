@@ -152,11 +152,12 @@ fake tokens by runtime concatenation (`"sk-ant-" + "fake"`); pattern:
 ## CI
 
 GitHub Actions is primary and gating. `main` is protected by repository
-Ruleset `16470166` with **11 required checks**: `lint`, `bun-test`, `vitest`,
-`build-base`, `build-hindsight`, and `build-dependents` ×6 (agent, broker,
-kernel, auth-broker, hostd, web). Edits to the required list are Ruleset
-edits (`gh api repos/switchroom/switchroom/rulesets/16470166`), not classic
-branch protection.
+Ruleset `16470166` with **4 required checks**: `lint`, `bun-test`, `vitest`,
+`images-ok` (the docker-images sentinel — the individual build jobs are NOT
+required, so matrix/job renames there don't touch branch protection; keep
+`images-ok`'s `needs` list complete instead). Edits to the required list are
+Ruleset edits (`gh api repos/switchroom/switchroom/rulesets/16470166`), not
+classic branch protection.
 
 - **Sentinel pattern:** `lint` / `bun-test` / `vitest` / `uat-gate` are
   always-running sentinel jobs that aggregate path-gated heavy runs
@@ -171,9 +172,10 @@ branch protection.
 - `gh pr checks <n>` is the source of truth. `mergeStateStatus`: `CLEAN`
   ready, `BLOCKED` pending/failed required check, `DIRTY` merge conflict,
   `UNSTABLE` = optional checks pending (usually fine).
-- Image build cache is **GHCR registry** (`:buildcache` tags), not
-  `type=gha` (#1965 — SAS-token expiry hard-failed heavy builds). `cache-to`
-  is gated off PR events; PRs read cache only.
+- Image build cache is **GHCR registry**, not `type=gha` (#1965 — SAS-token
+  expiry hard-failed heavy builds). base/dependents build per-arch on native
+  runners and use `:buildcache-<arch>` tags; hindsight/voice keep plain
+  `:buildcache`. `cache-to` is gated off PR events; PRs read cache only.
 
 ## UAT — the live end-to-end gate
 
