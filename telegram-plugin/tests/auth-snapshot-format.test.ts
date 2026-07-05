@@ -18,6 +18,7 @@ import {
   renderFallbackAnnouncement,
   buildSnapshotKeyboard,
   buildSnapshotsFromState,
+  zipProbeResults,
   buildSnapshotsFromCachedState,
   reviveLastQuota,
   THROTTLING_THRESHOLD_PCT,
@@ -719,6 +720,80 @@ describe('buildSnapshotKeyboard', () => {
     const before = buildSnapshotKeyboard(snaps, { now: new Date('2026-05-14T23:00:00Z') })
       .flat().map((b) => b.text);
     expect(before).not.toContain('Switch fleet → refilled@x');
+  });
+
+  it('demo mode masks the switch-button label but keeps the real label in callback_data', () => {
+    __resetDemoMaskCachesForTest();
+    const snaps: AccountSnapshot[] = [
+      snap({ label: 'ken.real@example.com', isActive: true, quota: quota({ fiveHourUtilizationPct: 5 }) }),
+      snap({ label: 'alt.real@example.com', quota: quota({ fiveHourUtilizationPct: 5 }) }),
+    ];
+    const rows = buildSnapshotKeyboard(snaps, { now: NOW, demo: true });
+    const switchBtn = rows.flat().find((b) => b.callbackData?.startsWith('auth:use:'));
+    expect(switchBtn).toBeDefined();
+    // Label masked — the real email never appears on screen…
+    expect(switchBtn!.text).not.toContain('alt.real@example.com');
+    // …but the broker still gets the real label to act on.
+    expect(switchBtn!.callbackData).toBe('auth:use:alt.real@example.com');
+  });
+
+  it('demo mode flips the refresh callback to auth:refresh:demo so a ↻ tap stays masked', () => {
+    const snaps: AccountSnapshot[] = [
+      snap({ label: 'a@x', isActive: true, quota: quota({}) }),
+    ];
+    const demoRows = buildSnapshotKeyboard(snaps, { demo: true }).flat();
+    expect(demoRows.find((b) => b.text === '↻ Refresh')?.callbackData).toBe('auth:refresh:demo');
+    const plainRows = buildSnapshotKeyboard(snaps).flat();
+    expect(plainRows.find((b) => b.text === '↻ Refresh')?.callbackData).toBe('auth:refresh');
+  });
+});
+
+// ── zipProbeResults ──────────────────────────────────────────────────
+
+describe('zipProbeResults', () => {
+  const okResult = { ok: true as const, data: quota({ fiveHourUtilizationPct: 5 }) };
+
+  it('returns quotas parallel to labels with no staleCachedAtMs when everything is live', () => {
+    const { quotas, staleCachedAtMs } = zipProbeResults(
+      ['a@x', 'b@x'],
+      [
+        { label: 'a@x', result: okResult, served: 'live' },
+        { label: 'b@x', result: okResult, served: 'live' },
+      ],
+    );
+    expect(quotas).toHaveLength(2);
+    expect(quotas.every((q) => q.ok)).toBe(true);
+    expect(staleCachedAtMs).toBeUndefined();
+  });
+
+  it('surfaces the OLDEST capturedAt among cache-served rows (#2495 Change 2)', () => {
+    const { staleCachedAtMs } = zipProbeResults(
+      ['a@x', 'b@x', 'c@x'],
+      [
+        { label: 'a@x', result: okResult, served: 'live' },
+        { label: 'b@x', result: okResult, served: 'cache', capturedAt: 5_000 },
+        { label: 'c@x', result: okResult, served: 'cache', capturedAt: 2_000 },
+      ],
+    );
+    expect(staleCachedAtMs).toBe(2_000);
+  });
+
+  it('degrades a missing per-label row to ok:false, preserving input order', () => {
+    const { quotas } = zipProbeResults(
+      ['a@x', 'gone@x'],
+      [{ label: 'a@x', result: okResult }],
+    );
+    expect(quotas[0]!.ok).toBe(true);
+    expect(quotas[1]!.ok).toBe(false);
+    expect((quotas[1] as { ok: false; reason: string }).reason).toContain('no result');
+  });
+
+  it('ignores served:"cache" rows without capturedAt (no false staleness)', () => {
+    const { staleCachedAtMs } = zipProbeResults(
+      ['a@x'],
+      [{ label: 'a@x', result: okResult, served: 'cache' }],
+    );
+    expect(staleCachedAtMs).toBeUndefined();
   });
 });
 
