@@ -72,4 +72,22 @@ describe("hindsight recall overrides — observations + trivial-skip", () => {
     expect(s.recallMaxMemories).toBe(8);
     expect(s.recallMinOverlap).toBe(0.1);
   });
+
+  // #2816 tag-filter port — INTENTIONALLY DORMANT (see the decision comment in
+  // renderHindsightSettingsOverrides + reference/rfcs/hindsight-synthesis-
+  // layers.md). The scaffold must NOT set any recall tag filter: doing so would
+  // silently scope every agent's recall to a per-bank tag taxonomy no RFC
+  // specifies. The vendor defaults (empty recallTags → no-op pass-through) must
+  // survive scaffold untouched. If a future RFC wires memory.recall.tags, delete
+  // this guard and replace it with a positive assertion.
+  it("#2816: leaves the recall tag filters at the vendor no-op defaults (dormant)", () => {
+    const s = settingsAfterInstall();
+    // Either absent (inherit vendor default) or explicitly the no-op empty set,
+    // but never a scaffold-imposed non-empty filter.
+    expect(s.recallTags === undefined || (Array.isArray(s.recallTags) && (s.recallTags as unknown[]).length === 0)).toBe(true);
+    expect(s.recallTagGroups === undefined || s.recallTagGroups === null).toBe(true);
+    expect(s.recallAdditionalBankFilters === undefined ||
+      (typeof s.recallAdditionalBankFilters === "object" &&
+        Object.keys(s.recallAdditionalBankFilters as object).length === 0)).toBe(true);
+  });
 });

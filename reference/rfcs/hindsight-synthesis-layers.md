@@ -224,7 +224,18 @@ Two things landed adjacent to this RFC that change its framing:
   ~L879), landed 2026-07-05. But **no scaffold override sets any tag filter**
   — the config keys are absent, so the filters collapse to a no-op (empty
   filter = pass-through). This is a ready-made hook for future recall shaping
-  (e.g. scoping additional-bank recall to specific tags), currently dormant.
+  (e.g. scoping additional-bank recall to specific tags), and it is
+  **deliberately kept dormant** (decision, not oversight): tag-scoped recall is
+  orthogonal to Phase 2's mission/disposition specialization and this RFC does
+  not specify a per-bank tag taxonomy, so wiring a first-class
+  `memory.recall.tags` surface now would be speculative generality. The
+  intentional-dormancy is documented at the point of decision in
+  `renderHindsightSettingsOverrides` (`src/agents/scaffold.ts`) with a
+  `TODO(#2816)` naming exactly how to wire it (mirror the `recallTypes`
+  cascade + `HINDSIGHT_RECALL_TAGS` start.sh export) if a future RFC calls for
+  it. The env-var escape hatch (`HINDSIGHT_RECALL_TAGS` /
+  `HINDSIGHT_RECALL_TAGS_MATCH` / `HINDSIGHT_RECALL_TAG_GROUPS` in
+  `lib/config.py`) remains available to advanced operators in the meantime.
 
 ## Proposal — phased, with current status
 
@@ -245,17 +256,22 @@ wall-timeout): that would blow warm TTFO (~1.7s) into seconds and multiply
 per-turn tokens. Reflect stays reserved for explicit "what do you know about
 me" asks.
 
-**Phase 2 — Specialize each bank. — PARTIAL.** Per-agent `retain_mission` /
-`bank_mission` are now first-class config and a generic
-`DEFAULT_RETAIN_MISSION` is seeded at scaffold, so specialists can be shaped
-rather than merely isolated, and three banks (`assistant`, `lawgpt`,
-`ziggy`) carry a specialized `bank_mission` today. **Still open:**
-`reflect_mission`, `observations_mission`, and `disposition` are not wired
-through switchroom config — `disposition` is uniform
-`{empathy:3, literalism:3, skepticism:3}` on every bank. Completing this
-phase means threading the remaining mission/disposition fields from the
-agent's profile (a coach extracts/voices differently than a lawyer).
-Operator-config-driven (no-self-escalation clean).
+**Phase 2 — Specialize each bank. — SHIPPED (#2855).** Per-agent
+`retain_mission` / `bank_mission` were made first-class config with a generic
+`DEFAULT_RETAIN_MISSION` seeded at scaffold; #2855 then threaded the remaining
+knobs — `reflect_mission`, `observations_mission`, and per-bank `disposition`
+— through the full config cascade (`AgentMemorySchema` in
+`src/config/schema.ts`, cascade merge in `src/config/merge.ts` with per-key
+`disposition` inheritance) and into BOTH the scaffold and reconcile bank-update
+paths in `src/agents/scaffold.ts` via `resolveBankMissionExtras` +
+`updateBankMissions` (`src/memory/hindsight.ts`). `disposition` is no longer
+uniform `{empathy:3, literalism:3, skepticism:3}`: built-in
+`PROFILE_MEMORY_DEFAULTS` differentiate the specialists on a zero-YAML install
+(a `health-coach` leans empathy-high, `coding`/`executive-assistant` lean
+skeptical + literal), and operator config overrides per-key. The mechanism is
+general — any bank can set these fields; the RFC's three named banks
+(`assistant`, `lawgpt`, `ziggy`) are just the first adopters, not a hard-coded
+list. Operator-config-driven (no-self-escalation clean).
 
 **Phase 3 — Directives as the "corrections stick" path. — PARTIAL /
 guidance-only.** The intent is to route user-stated preferences/rules into
