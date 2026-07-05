@@ -139,6 +139,15 @@ durable record, not a memory of a chat message that scrolled away.
   ways this job would fail even if every feature worked (mirrors the CAUTION in
   `see-my-whole-fleet-from-one-screen.md`).
 
+## Related
+
+- [`see-my-whole-fleet-from-one-screen`](see-my-whole-fleet-from-one-screen.md) --
+  the read-mostly operator console; this job is the act-on-it counterpart.
+- [`idempotent-update-and-restart`](idempotent-update-and-restart.md) -- the
+  update/restart operations whose progress this job narrates.
+- [`know-what-my-agent-is-doing`](know-what-my-agent-is-doing.md) -- the same
+  answered-in-the-chat, never-a-parallel-surface discipline, per turn.
+
 > [!CAUTION]
 > If the rollout status becomes a pinned parallel surface, this job has failed
 > even if it shows every phase perfectly. Durable artifact + in-chat narration

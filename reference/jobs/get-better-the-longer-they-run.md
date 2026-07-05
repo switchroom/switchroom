@@ -95,6 +95,15 @@ just the happy path.
   every turn without the operator paying for it on turns that didn't change
   anything.
 
+## Related
+
+- [`remember-across-sessions`](remember-across-sessions.md) -- the memory
+  substrate a lesson has to land in to bind.
+- [`feel-like-a-colleague`](feel-like-a-colleague.md) -- the standing-team
+  outcome that improvement over time serves.
+- [`extend-without-forking`](extend-without-forking.md) -- self-served skill
+  fixes ride the same config-not-fork extension surface.
+
 ---
 
 > **Implementation:** the how lives in `reference/rfcs/agent-self-improvement.md`

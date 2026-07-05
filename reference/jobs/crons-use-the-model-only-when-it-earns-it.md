@@ -114,3 +114,13 @@ no-ops, interactive-session-only on any model fire, no zombie fires.
   zero `claude -p` / SDK / API callsites on the scheduled path.
 - *Determinism:* the tier selector is a pure function of observable signals.
   Same inputs, same tier, fully enumerable, no model in the decision loop.
+
+## Related
+
+- [`keep-my-subscription-honest`](keep-my-subscription-honest.md) -- the
+  outcome-level bill-honesty contract this job's tiering enforces on the
+  scheduled path.
+- [`survive-reboots-and-real-life`](survive-reboots-and-real-life.md) --
+  scheduled fires must also survive restarts without duplicating or dropping.
+- [`fleet-stays-healthy`](fleet-stays-healthy.md) -- the same gate-first,
+  model-only-when-it-earns-it discipline applied to fleet health scans.
