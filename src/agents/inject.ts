@@ -29,11 +29,8 @@
  * signal and queue or refuse non-idle injects.
  */
 
-import { execFile, execFileSync } from "node:child_process";
-import { promisify } from "node:util";
+import { execFileSync } from "node:child_process";
 import { withPaneLock } from "./pane-lock.js";
-
-const execFileAsync = promisify(execFile);
 
 /**
  * Per-command metadata for the inject allowlist. `expectsOutput` is a
@@ -681,8 +678,3 @@ export async function injectSlashCommandWith(
     ...(truncated ? { diagnostic: "truncated_output" as const } : {}),
   };
 }
-
-// Avoid unused-import warning when execFileAsync is reserved for
-// future async refactor. Re-exported so callers that want the promise
-// form can grab it.
-export const _execFileAsync = execFileAsync;
