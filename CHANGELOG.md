@@ -1,6 +1,8 @@
 # Changelog
 
-## unreleased — hostd self-bump: one-call agent-driven fleet rolls
+## v0.17.2 — hostd self-service rolls
+
+### PR A — hostd self-bump on stale-CLI rollout (#2833)
 
 - **hostd self-bumps on a stale-CLI rollout instead of refusing** (#2645):
   hostd's CLI is baked into its image, so it is older than EVERY freshly
@@ -24,6 +26,18 @@
   rollout terminal warnings now name exactly what stays on the prior version
   (web dashboard, host operator CLI) with the host-side finish commands
   (#2645 item 3).
+
+### PR B — keep broker operator socket across hostd rollouts (#2832)
+
+- **hostd-driven rollouts no longer drop the vault-broker operator socket**:
+  `resolveOperatorUid()` read only `SUDO_UID` → `getuid()`; when `apply` is
+  shelled out by hostd it runs as root without sudo, so it returned
+  `undefined` and `generateCompose` omitted the operator-socket bind — which
+  broke host-shell `switchroom vault …` and made the litellm key-confirm
+  probe fail, silently stripping litellm routing fleet-wide (observed on the
+  v0.17.1 roll). `SWITCHROOM_HOSTD_OPERATOR_UID` (already injected into
+  hostd, same host-fact pattern as `SWITCHROOM_HOST_HOME`/`_TZ`) is now the
+  final fallback; sudo/`getuid()` still win when present.
 
 ## v0.16.50 — Fleet-wide webkite render config
 
