@@ -657,8 +657,24 @@ mkdir -p "$TELEGRAM_STATE_DIR" 2>/dev/null || true
 # .handoff-briefing.md and merged alongside (or instead of) .handoff.md.
 HANDOFF_FILE="{{agentDir}}/.handoff.md"
 HANDOFF_BRIEFING_FILE="{{agentDir}}/.handoff-briefing.md"
+# Decide whether the on-disk briefing is stale and must be rebuilt (#2790).
+# A clean shutdown leaves a non-empty .handoff.md; a *later* hard crash never
+# fires the Stop hook, so that stale briefing would otherwise be re-injected
+# — hiding the crashed session's turns and reorienting the agent from old
+# context. Rebuild when .handoff.md is empty OR when the newest session JSONL
+# is newer than .handoff.md (i.e. a session ran after the briefing was written).
+_LATEST_JSONL=$(_find_latest_jsonl "$CLAUDE_CONFIG_DIR/projects")
+_HANDOFF_STALE=0
 if [ ! -s "$HANDOFF_FILE" ]; then
-  _LATEST_JSONL=$(_find_latest_jsonl "$CLAUDE_CONFIG_DIR/projects")
+  _HANDOFF_STALE=1
+elif [ -n "$_LATEST_JSONL" ]; then
+  _JSONL_MOD=$(_stat_mtime "$_LATEST_JSONL")
+  _HANDOFF_MOD=$(_stat_mtime "$HANDOFF_FILE")
+  if [ "$_JSONL_MOD" -gt "$_HANDOFF_MOD" ]; then
+    _HANDOFF_STALE=1
+  fi
+fi
+if [ "$_HANDOFF_STALE" = "1" ]; then
   if [ -n "$_LATEST_JSONL" ]; then
     _LAST_MOD=$(_stat_mtime "$_LATEST_JSONL")
     _NOW=$(date +%s)
@@ -704,6 +720,11 @@ $_HANDOFF_CONTENT"
     APPEND_PROMPT="$_HANDOFF_CONTENT"
   fi
 fi
+# Consume the briefing sidecars once injected (#2790). Leaving them on disk
+# lets a later hard crash (which never fires the Stop hook to refresh them)
+# re-serve this now-stale briefing on the next boot. Removing them means the
+# staleness guard above starts from a clean slate every boot.
+rm -f "$HANDOFF_BRIEFING_FILE" "$HANDOFF_FILE" 2>/dev/null || true
 {{else}}
 APPEND_PROMPT={{#if systemPromptAppendShellQuoted}}{{{systemPromptAppendShellQuoted}}}{{else}}""{{/if}}
 {{/if}}
