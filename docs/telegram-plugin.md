@@ -63,6 +63,24 @@ The header carries the **real dispatch task** (the `description` passed to the `
 
 The feed is on by default. To disable it per-agent, set `SWITCHROOM_WORKER_ACTIVITY_FEED=0` in the agent's gateway environment.
 
+### Chat-legible memory (remembered / forgot)
+
+When the agent **materially changes what it remembers** during a turn — stores a new standing directive, or invalidates/demotes an existing memory — the gateway surfaces **one terse line** in the originating chat/topic:
+
+```
+📌 remembered: "Always prefer TypeScript for this user's projects"
+✂️ forgot: superseded deploy runbook
+```
+
+This makes memory honest and legible without being noisy. It is deliberately **sparse and material-only**:
+
+- Fires only on `mcp__hindsight__create_directive` (📌 remembered) and `mcp__hindsight__invalidate_memory` / the `switchroom memory demote` tag path (✂️ forgot).
+- **Never** on ordinary recall, and **never** on routine consolidation — a per-turn "here's what I remember" line would itself be the "regurgitating old facts unprompted" anti-pattern the `remember-across-sessions` job forbids.
+
+Detection is a deterministic tool-call observation (no model call, no polling). The line is a **real message** in the originating topic (never the operator DM), so it's durable and observable.
+
+The surface is **on by default** (kill-switch: `SWITCHROOM_MEMORY_LEGIBILITY=0`). To disable it per-agent, set `SWITCHROOM_MEMORY_LEGIBILITY=0` in the agent's gateway environment.
+
 ### Message history
 
 A local SQLite database records every inbound and outbound message. After a Claude Code restart, the agent can call `get_recent_messages` to recover context instead of asking "what were we doing?". History survives process restarts and session resets.
@@ -197,3 +215,4 @@ The switchroom fork reads additional env vars from `start.sh`:
 | `SWITCHROOM_AGENT_NAME` | Auto-set by scaffold | Agent name for self-restart detection |
 | `SWITCHROOM_CONFIG` | Auto-set by scaffold | Path to switchroom.yaml for config resolution |
 | `SWITCHROOM_WORKER_ACTIVITY_FEED` | Gateway env (kill-switch) | On by default; `0` disables the background worker-activity feed. See "Background worker activity feed" above |
+| `SWITCHROOM_MEMORY_LEGIBILITY` | Gateway env (kill-switch) | On by default; `0` disables the sparse "📌 remembered / ✂️ forgot" memory surface. See "Chat-legible memory" above |
