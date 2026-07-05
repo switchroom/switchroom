@@ -2039,14 +2039,25 @@ const POST_ANSWER_LIVENESS_STALE_MS = parsePostAnswerLivenessMs(
  * message self-blocks. See the snapshot at the inbound handler.
  */
 function turnInFlightForGate(): boolean {
-  if (!isDeliveryCutoverEnabled()) return claudeBusyKeys.size > 0
+  // Include pendingPermissions in the "turn busy" signal (#2841): after the
+  // first interim reply, `releaseTurnBufferGate` clears claudeBusyKeys/machine
+  // even though a permission card is still outstanding and claude is still
+  // blocked mid-turn waiting for the tap verdict. A new inbound that arrives
+  // in this window would see turnInFlightAtReceipt=false and deliver directly,
+  // landing while claude's bridge is suspended in the permission-notification
+  // handler — displacing the approval and orphaning the pending brevo/MCP call.
+  // Keeping the gate closed for as long as there is an outstanding approval
+  // card prevents that race. The gate reopens when the card is tapped or times
+  // out (pendingPermissions.delete in finalizeCallback / TTL sweep).
+  const hasPendingApproval = pendingPermissions.size > 0
+  if (!isDeliveryCutoverEnabled()) return claudeBusyKeys.size > 0 || hasPendingApproval
   // Machine is authoritative. Run the log-only drift canary (#2794): the
   // imperative `claudeBusyKeys` shadow is still live in parallel, so a
   // dangerous over-hold divergence (machine holds the gate while the
   // imperative view is idle) is surfaced without changing behaviour. The
   // benign orphan-dangle direction — the wedge the machine self-heals — is
   // NOT flagged. `probeGateParity` returns the machine value unchanged.
-  return probeGateParity(isMachineInTurn(), claudeBusyKeys.size)
+  return probeGateParity(isMachineInTurn(), claudeBusyKeys.size) || hasPendingApproval
 }
 
 /**

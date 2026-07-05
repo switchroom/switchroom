@@ -309,6 +309,15 @@ for _stray_claude in \
 done
 rm -rf "$HOME/.npm-global/lib/node_modules/@anthropic-ai/claude-code" 2>/dev/null || true
 unset _stray_claude
+# Re-seat the canonical symlink so claude v2.1.x+ self-check ("claude command
+# at $HOME/.local/bin/claude missing or broken") stays silent. The prune loop
+# above removes any stale shadow install; this symlink points back to the
+# immutable image binary so the path is present but can never drift (the target
+# is /usr/local/bin/claude, which is baked at image build time). The symlink is
+# removed again by the prune loop on the NEXT boot, then re-created here —
+# idempotent. `mkdir -p` is safe: the dir already exists or is about to be created.
+mkdir -p "$HOME/.local/bin"
+ln -sf /usr/local/bin/claude "$HOME/.local/bin/claude"
 
 # ── Root-tier agent: provision the docker CLI ────────────────────────
 # The root debugging agent (`root: true`) has /var/run/docker.sock
