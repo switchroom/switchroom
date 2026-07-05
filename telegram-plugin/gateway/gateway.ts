@@ -438,6 +438,7 @@ import { chatKey, chatKeyWithSuffix, chatIdOfChatKey } from './chat-key.js'
 import { shadowEmit, isMachineInTurn, isDeliveryCutoverEnabled } from './inbound-delivery-machine-shadow.js'
 import type { ChatKey as _ChatKey } from './inbound-delivery-machine.js'
 import { dispatchEffects, isDispatchEnabled } from './inbound-delivery-machine-dispatch.js'
+import { probeGateParity } from './gate-parity-probe.js'
 import { maybeFireWarmup } from './prefix-warmup.js'
 import {
   buildVaultGrantApprovedInbound,
@@ -2038,7 +2039,14 @@ const POST_ANSWER_LIVENESS_STALE_MS = parsePostAnswerLivenessMs(
  * message self-blocks. See the snapshot at the inbound handler.
  */
 function turnInFlightForGate(): boolean {
-  return isDeliveryCutoverEnabled() ? isMachineInTurn() : claudeBusyKeys.size > 0
+  if (!isDeliveryCutoverEnabled()) return claudeBusyKeys.size > 0
+  // Machine is authoritative. Run the log-only drift canary (#2794): the
+  // imperative `claudeBusyKeys` shadow is still live in parallel, so a
+  // dangerous over-hold divergence (machine holds the gate while the
+  // imperative view is idle) is surfaced without changing behaviour. The
+  // benign orphan-dangle direction — the wedge the machine self-heals — is
+  // NOT flagged. `probeGateParity` returns the machine value unchanged.
+  return probeGateParity(isMachineInTurn(), claudeBusyKeys.size)
 }
 
 /**
