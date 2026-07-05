@@ -106,6 +106,7 @@ These are considered improvements over the base method, not defects:
 
 - **RFCs are terse design docs, not job-spec hybrids.** Failure-mode thinking (the "Good / bad" section) lives in the job spec. Mechanism lives in the RFC. The two never collapse into one doc.
 - **Two RFC doc-classes, one folder.** A `serves:` key means a ship-coupled RFC delivering a specific job. A `backs:` key means a standing design record defending an invariant. Both live in `rfcs/`; frontmatter tells them apart.
+- **Job specs carry a terse subset of the full template.** They keep the frontmatter plus Good / bad, Prove it, Verdict, Production-readiness, and Related, and omit the full template's today's-alternatives, the-bet, measures-of-success, what-the-job-requires, and abandon-signal sections. The specs are short by design; the product spec's job index and the UAT harness carry that weight.
 - **No STRATEGY, decisions, or job-links artefacts.** A single-operator subscription product has no accounts, renewals, or stakeholder portfolios to join across. Those templates exist in the method for multi-product organisations; they add no signal here.
 
 ## `rfcs/` holds two kinds of doc — that's intended

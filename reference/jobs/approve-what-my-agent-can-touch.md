@@ -151,6 +151,15 @@ per-resource, every resume a synthesized turn.
 - *Reliability:* an approval that lands resumes the turn; a denied or
   restart-interrupted grant never strands the agent silently.
 
+## Related
+
+- [`share-auth-across-the-fleet`](share-auth-across-the-fleet.md) -- the
+  credential plane the grants draw on; this job gates what that pool hands out.
+- [`act-in-my-tools-with-an-identity`](act-in-my-tools-with-an-identity.md) --
+  what the agent does with a granted identity once the operator has approved it.
+- [`operate-the-fleet-from-telegram`](operate-the-fleet-from-telegram.md) --
+  the other one-tap, in-chat operator control surface.
+
 ---
 
 > **Implementation:** the *how* lives in `reference/rfcs/access-model.md` (the
