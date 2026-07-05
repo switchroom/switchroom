@@ -5067,7 +5067,10 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
           type: "command",
           command: wrap(
             "hook:workspace-dynamic",
-            `${useInjectOnChange ? `env SWITCHROOM_INJECT_ON_CHANGE=1 ` : ""}bash "${join(DOCKER_BIN_PATH, "workspace-dynamic-hook.sh")}"`,
+            // inject-on-change is the unconditional default in the hook; only
+            // thread the negation env when an agent opts out via
+            // channels.telegram.inject_on_change: false.
+            `${useInjectOnChange ? "" : `env SWITCHROOM_INJECT_ON_CHANGE=0 `}bash "${join(DOCKER_BIN_PATH, "workspace-dynamic-hook.sh")}"`,
           ),
           timeout: 5,
         },

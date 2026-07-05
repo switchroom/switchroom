@@ -40,6 +40,9 @@ function runHook(opts: {
   sessionId?: string;
   prompt?: string;
   injectOnChange?: boolean;
+  // When true, leave SWITCHROOM_INJECT_ON_CHANGE unset entirely so the hook's
+  // own default (inject-on-change ON) is exercised.
+  omitInjectEnv?: boolean;
 }): RunResult {
   const {
     agentName = "test-agent",
@@ -50,6 +53,7 @@ function runHook(opts: {
     sessionId = "session-abc123",
     prompt = "hello world",
     injectOnChange = true,
+    omitInjectEnv = false,
   } = opts;
 
   const stdin = JSON.stringify({ session_id: sessionId, prompt });
@@ -61,6 +65,9 @@ function runHook(opts: {
     SWITCHROOM_INJECT_ON_CHANGE: injectOnChange ? "1" : "0",
     SWITCHROOM_AGENT_NAME: agentName,
   };
+  if (omitInjectEnv) {
+    delete env.SWITCHROOM_INJECT_ON_CHANGE;
+  }
   if (stateDir !== undefined) {
     env.TELEGRAM_STATE_DIR = stateDir;
   }
@@ -202,6 +209,26 @@ describe("workspace-dynamic-hook.sh (inject-on-change mode)", () => {
     expect(r.stdout).toContain("mem content");
     expect(r.stdout).not.toContain("this should never appear");
     expect(r.stdout).not.toContain("HEARTBEAT.md");
+  });
+
+  it("inject-on-change is the default when the env var is unset (suppresses second turn)", () => {
+    const payload = "# Project Context (dynamic workspace files)\n\n## MEMORY.md\ndefault-on content\n";
+    makeShim(shimDir, payload);
+
+    const fakeAgentDir = join(tmp, "agent");
+    const wsDir = join(fakeAgentDir, "workspace");
+    mkdirSync(wsDir, { recursive: true });
+    writeFileSync(join(wsDir, "MEMORY.md"), "default-on content");
+
+    const a = runHook({ cacheDir, shimDir, stateDir, agentDirOverride: fakeAgentDir, omitInjectEnv: true });
+    expect(a.exitCode).toBe(0);
+    expect(a.stdout).toContain("default-on content");
+
+    // Same session, same content: with the var unset the hook must still
+    // suppress (inject-on-change is the baked-in default).
+    const b = runHook({ cacheDir, shimDir, stateDir, agentDirOverride: fakeAgentDir, omitInjectEnv: true });
+    expect(b.exitCode).toBe(0);
+    expect(b.stdout).toBe("");
   });
 
   it("legacy mode (inject_on_change=0) emits every turn", () => {
