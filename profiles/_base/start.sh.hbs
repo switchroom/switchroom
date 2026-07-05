@@ -828,6 +828,27 @@ if command -v switchroom >/dev/null 2>&1; then
   unset sr_wk_pair sr_wk_env sr_wk_key sr_wk_val
 fi
 
+# Fleet-wide webkite render config (#2805). Seed the image-baked default
+# (/opt/switchroom/webkite/config.toml) into the XDG location webkite reads
+# ($HOME/.config/webkite/config.toml) so JS-heavy SPA/booking pages render
+# via the baked-in cloakbrowser instead of returning a static shell.
+#
+# copy-if-absent — deliberately non-clobbering:
+#   * If an operator authored ~/.switchroom/webkite/config.toml it is
+#     bind-mounted RO onto this exact target (see src/agents/compose.ts);
+#     the file then already exists, so we skip and the operator override
+#     wins.
+#   * Otherwise the target is a writable per-agent-home path and we drop the
+#     baked default in. Durable across rebuilds because the SOURCE is the
+#     image, not a hand-placed per-agent file.
+if [ -f /opt/switchroom/webkite/config.toml ] \
+   && [ ! -f "$HOME/.config/webkite/config.toml" ]; then
+  mkdir -p "$HOME/.config/webkite" 2>/dev/null || true
+  cp /opt/switchroom/webkite/config.toml "$HOME/.config/webkite/config.toml" 2>/dev/null \
+    && echo "webkite: seeded fleet render config to \$HOME/.config/webkite/config.toml" >&2 \
+    || echo "webkite: could not seed render config (non-fatal)" >&2
+fi
+
 # LiteLLM routing (opt-in, #litellm). When SWITCHROOM_LITELLM is set (compose
 # env, gated on litellm.enabled && keyConfirmed), route the unmodified `claude`
 # CLI through the operator's LiteLLM proxy at ANTHROPIC_BASE_URL: fetch the
