@@ -95,7 +95,7 @@ cd "{{agentDir}}" || exit 1
 # can distinguish cron spend from main-session spend per agent.
 # FAIL-OPEN: missing key OR unreachable proxy → strip routing env, fall back to
 # direct OAuth. An outage must never take the cron session dark.
-if [ -n "$SWITCHROOM_LITELLM" ] && command -v switchroom >/dev/null 2>&1; then
+if [ -n "${SWITCHROOM_LITELLM:-}" ] && command -v switchroom >/dev/null 2>&1; then
   sr_ll_key="$(switchroom vault get "litellm/{{name}}/api-key" 2>/dev/null || true)"
   sr_ll_ok=""
   if [ -z "$sr_ll_key" ]; then
