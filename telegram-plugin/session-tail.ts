@@ -158,9 +158,14 @@ function parseChannelMeta(content: string): {
   messageId: string | null
   threadId: string | null
 } {
-  // Look for `chat_id="..."` etc in the channel XML tag
+  // Look for `chat_id="..."` etc in the channel XML tag. LEFT-ANCHOR on an
+  // attribute boundary (start-of-string or a whitespace/quote before the name)
+  // so `message_id` matches ONLY the real attribute — never a same-suffix
+  // sibling like `target_message_id`, `reply_to_message_id`, or
+  // `original_message_id`. Without the boundary, grab('message_id') would
+  // match the FIRST `*_message_id` substring, mis-attributing the enqueue's id.
   const grab = (key: string): string | null => {
-    const m = content.match(new RegExp(`${key}="([^"]+)"`))
+    const m = content.match(new RegExp(`(?:^|[\\s"'])${key}="([^"]+)"`))
     return m ? m[1] : null
   }
   return {

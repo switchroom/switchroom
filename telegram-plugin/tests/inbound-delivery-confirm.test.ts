@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import {
   ackDelivery,
   createDeliveryQueue,
+  extractEnqueueMessageIds,
   forgetDelivery,
   isTrackableResumeSynthetic,
   shouldTrackDelivery,
@@ -147,6 +148,103 @@ describe('ackDelivery — message-id-matched (cross-source false-ack guard)', ()
     const q = fresh()
     trackDelivery(q, 'chat:_', { text: 'x' }, 0) // no messageId
     expect(ackDelivery(q, 'chat:_', '5001')).toBe(true)
+    expect(q.pending.size).toBe(0)
+  })
+})
+
+// Regression for #2786 — the enqueue-ack mismatch that re-delivers a RUNNING
+// turn (a duplicate turn / double-actioned user message). Delivery-confirm
+// re-parses the `<channel message_id="…">` envelope back out of the transcript
+// to match the ack. When the composer merges/reorders inbound envelopes, the
+// single re-parsed id can belong to a sibling, so strict equality mis-concludes
+// "never delivered" and the sweep re-delivers a turn already running. Passing
+// the raw enqueue content lets the ack tolerate that by scanning every id.
+describe('ackDelivery — composer-tolerant match (#2786 duplicate-turn guard)', () => {
+  const envelope = (id: string, text: string) =>
+    `<channel source="telegram" chat_id="555" message_id="${id}" user="ken">${text}</channel>`
+
+  it('reproduces the bug: strict re-parsed id mismatch would NOT ack (pre-fix)', () => {
+    const q = fresh()
+    trackDelivery(q, 'chat:_', { text: 'run the deploy' }, 0, '5002')
+    // Composer merged an earlier sibling first, so parseChannelMeta re-parsed
+    // the FIRST id (5001), not our tracked 5002. Without the content, no ack →
+    // the sweep would re-deliver the already-running turn (the duplicate).
+    expect(ackDelivery(q, 'chat:_', '5001')).toBe(false)
+    expect(sweep(q, 15_000, TIMEOUT)).toHaveLength(1) // would double-action
+  })
+
+  it('acks when the tracked id appears anywhere in the merged enqueue content', () => {
+    const q = fresh()
+    trackDelivery(q, 'chat:_', { text: 'run the deploy' }, 0, '5002')
+    const merged = `${envelope('5001', 'hi')}\n${envelope('5002', 'run the deploy')}`
+    // First-parsed id is the sibling's 5001, but our 5002 is present in content.
+    expect(ackDelivery(q, 'chat:_', '5001', merged)).toBe(true)
+    expect(q.pending.size).toBe(0)
+    expect(sweep(q, 15_000, TIMEOUT)).toHaveLength(0) // no duplicate turn
+  })
+
+  it('acks on a reformatted single envelope where content still carries the id', () => {
+    const q = fresh()
+    trackDelivery(q, 'chat:_', { text: 'x' }, 0, '5002')
+    // Re-parse yielded null (wrapper reformatted) but the id survives in content.
+    expect(ackDelivery(q, 'chat:_', null, envelope('5002', 'x'))).toBe(true)
+    expect(q.pending.size).toBe(0)
+  })
+
+  it('preserves the cross-source false-ack guard: a synthetic turn whose content lacks our id does NOT ack', () => {
+    const q = fresh()
+    trackDelivery(q, 'chat:_', { text: 'real user msg' }, 0, '5002')
+    // A cron/resume turn under the same key — its envelope carries a fabricated
+    // id, never the user's 5002. Even with content scanning, it must not ack.
+    const cron = envelope('1716123456789', 'scheduled digest')
+    expect(ackDelivery(q, 'chat:_', '1716123456789', cron)).toBe(false)
+    expect(q.pending.size).toBe(1)
+    expect(sweep(q, 15_000, TIMEOUT)).toHaveLength(1) // user msg re-delivered, not dropped
+  })
+
+  it('extractEnqueueMessageIds pulls every id from a merged envelope', () => {
+    const merged = `${envelope('5001', 'a')}\n${envelope('5002', 'b')}`
+    expect(extractEnqueueMessageIds(merged)).toEqual(['5001', '5002'])
+    expect(extractEnqueueMessageIds('no envelope here')).toEqual([])
+  })
+
+  // Regression for the unanchored-regex substring collision (silent-drop
+  // hazard on this never-drop path). `target_message_id`, `reply_to_message_id`,
+  // `original_message_id`, `card_message_id` etc. all END in `message_id="…"`.
+  // An unanchored /message_id="([^"]+)"/ grabs those siblings' values as if they
+  // were the real `message_id`, so a synthetic-source turn that merely REFERENCES
+  // message 5002 (e.g. `reply_to_message_id="5002"`) — without actually being
+  // message 5002 — would false-ack and silently drop the still-pending real
+  // inbound 5002. The regex must match ONLY the real `message_id` attribute.
+  it('does NOT extract same-suffix sibling attributes (target_/reply_to_/original_/card_message_id)', () => {
+    const content =
+      'target_message_id="5002" reply_to_message_id="5003" ' +
+      'original_message_id="5004" card_message_id="5005"'
+    expect(extractEnqueueMessageIds(content)).toEqual([])
+  })
+
+  it('extracts the real message_id even when a sibling *_message_id sits alongside it', () => {
+    const content =
+      '<channel source="reaction" chat_id="555" target_message_id="5002" ' +
+      'message_id="9999" user="ken">reacted</channel>'
+    // Only the real attribute (9999) is pulled — never the referenced 5002.
+    expect(extractEnqueueMessageIds(content)).toEqual(['9999'])
+  })
+
+  it('a sibling *_message_id="5002" reference does NOT false-ack a pending entry keyed on 5002 (substring-collision guard)', () => {
+    const q = fresh()
+    trackDelivery(q, 'chat:_', { text: 'real user msg 5002' }, 0, '5002')
+    // A synthetic-source turn (its own id 8000) merely REFERENCES 5002 via
+    // sibling attributes — it is not message 5002 itself.
+    const synthetic =
+      '<channel source="reaction" chat_id="555" message_id="8000" ' +
+      'target_message_id="5002" reply_to_message_id="5002" user="ken">👍</channel>'
+    expect(ackDelivery(q, 'chat:_', '8000', synthetic)).toBe(false)
+    // The real inbound 5002 is still pending — it strands and re-delivers, not dropped.
+    expect(q.pending.size).toBe(1)
+    expect(sweep(q, 15_000, TIMEOUT)).toHaveLength(1)
+    // Its own genuine envelope (real message_id="5002") later acks it cleanly.
+    expect(ackDelivery(q, 'chat:_', '5002', envelope('5002', 'real user msg 5002'))).toBe(true)
     expect(q.pending.size).toBe(0)
   })
 })
