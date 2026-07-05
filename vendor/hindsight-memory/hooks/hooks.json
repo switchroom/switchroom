@@ -27,6 +27,15 @@
         "hooks": [
           {
             "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/directive_verify.py\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/retain.py\"",
             "timeout": 15,
             "async": true

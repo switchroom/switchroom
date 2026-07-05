@@ -258,6 +258,8 @@ Two things it deliberately does **not** do (both are hard invariants):
 
 Detection is intentionally inclusive (the nudge is cheap and advisory, so a false positive just costs a few tokens and is ignored), with a guard against the obvious pleasantry shapes (`always happy to help`, `never mind`).
 
+**Post-turn verification (the same knob).** The advisory nudge still relies on the model *choosing* to act on it. To close the residual gap for the clear-cut case, a **Stop-hook verifier** runs after the turn: it re-checks the human turn against a **narrow, high-precision** durable-rule regex — a strict subset of the nudge detector (explicit framings only: `from now on`, `as a rule`, `you should always`, `call me …`, `remember to …`, `don't … again`; bare `always`/`stop …` and world-fact corrections are excluded) — and if the turn stated a durable rule but the model recorded **no** `create_directive` call, it **blocks the stop once** to re-prompt the model to persist it. This keeps the two invariants above: no model call (pure regex), no silent write (the block is a re-prompt; the model still authors the directive itself, visibly). The block fires **at most once per turn** (a `stop_hook_active` loop guard), and its reason explicitly authorizes "if this was really a one-off, don't create a directive — just finish", so a false positive costs one bounded continuation, never a spurious directive. This verifier shares the `memory.directive_capture_nudge` knob — disabling the nudge disables the verifier too.
+
 ```yaml
 defaults:
   memory:

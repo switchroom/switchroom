@@ -2240,7 +2240,20 @@ describe("installHindsightPlugin", () => {
     // Hook script copied
     expect(existsSync(join(result!.pluginDir, "scripts", "recall.py"))).toBe(true);
     expect(existsSync(join(result!.pluginDir, "scripts", "retain.py"))).toBe(true);
+    // #2848 Stage C — deterministic correction-capture Stop verify hook.
+    expect(existsSync(join(result!.pluginDir, "scripts", "directive_verify.py"))).toBe(true);
     expect(existsSync(join(result!.pluginDir, "hooks", "hooks.json"))).toBe(true);
+    // The Stop event wires BOTH the directive-capture verify (sync, blocking)
+    // and retain (async). Verify is registered so a durable correction the
+    // model dropped gets a single re-prompt to persist it.
+    const hooksJson = JSON.parse(
+      readFileSync(join(result!.pluginDir, "hooks", "hooks.json"), "utf8"),
+    );
+    const stopCommands = (hooksJson.hooks.Stop as Array<{ hooks: Array<{ command: string }> }>)
+      .flatMap((g) => g.hooks.map((h) => h.command))
+      .join(" ");
+    expect(stopCommands).toContain("directive_verify.py");
+    expect(stopCommands).toContain("retain.py");
   });
 
   it("falls back to agent name when no explicit collection is set", () => {
