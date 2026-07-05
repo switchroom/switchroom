@@ -6847,8 +6847,61 @@ const inboundSpool = STATIC
         existsSync: (p) => existsSync(p),
         statSizeSync: (p) => statSync(p).size,
       },
+      // #2789 B: durability degradation must be visible, not silent. When
+      // spool appends start failing we're back to in-memory-only — a
+      // later crash loses those messages. Latched log so the operator /
+      // health surface sees the transition rather than a silent downgrade.
+      onDegraded: (info) => {
+        process.stderr.write(
+          `telegram gateway: inbound-spool durability ` +
+          `${info.degraded ? 'DEGRADED to in-memory-only' : 'RECOVERED'} ` +
+          `path=${info.path} consecutiveFailures=${info.consecutiveFailures}` +
+          `${info.error != null ? ` error=${info.error}` : ''}\n`,
+        )
+      },
     })
-const pendingInboundBuffer = createPendingInboundBuffer({ spool: inboundSpool })
+
+// #2789 A: the in-memory cap eviction used to silently drop the oldest
+// buffered inbound within a live session (the durable spool copy only
+// replays at boot / escalates after 15 min). Surface it as a coalesced,
+// per-chat "messages deferred" notice so the eviction is visible — the
+// evicted message still lives in the spool, so it is deferred, not lost.
+const EVICT_NOTICE_COOLDOWN_MS = 5 * 60 * 1000
+const evictNoticeByChat = new Map<string, number>()
+const pendingInboundBuffer = createPendingInboundBuffer({
+  spool: inboundSpool,
+  onEvict: (_agent, evicted) => {
+    const chat = evicted.chatId
+    const evThread =
+      typeof evicted.meta?.threadId === 'string' && evicted.meta.threadId
+        ? Number(evicted.meta.threadId)
+        : undefined
+    const key = `${chat}:${evThread ?? '-'}`
+    const last = evictNoticeByChat.get(key)
+    const nowMs = Date.now()
+    // Coalesce: at most one deferral notice per chat per cooldown so a
+    // sustained >32 burst posts one line, not one per evicted message.
+    if (last != null && nowMs - last < EVICT_NOTICE_COOLDOWN_MS) return
+    evictNoticeByChat.set(key, nowMs)
+    const threadOpts = evThread != null ? { message_thread_id: evThread } : {}
+    // Honesty: the evicted message is NOT re-pushed into the buffer
+    // in-session — its only in-session resolution is the escalation sweep
+    // (sweepEscalations, ~15 min), which either delivers it or posts the
+    // "couldn't deliver … please resend" retraction. So this notice must
+    // NOT promise a prompt pickup ("shortly"), or it would contradict a
+    // later escalation. Word it to match that reality: saved, handled when
+    // the current turn frees up, and prompted-to-resend if it can't be.
+    void swallowingApiCall(
+      () =>
+        bot.api.sendMessage(
+          chat,
+          "⏳ Messages are arriving faster than I can process them. Your messages are saved and will be handled once I finish the current turn — if any can't be picked up, I'll ask you to resend it.",
+          { ...threadOpts },
+        ),
+      { chat_id: chat, verb: 'inbound-buffer-eviction' },
+    )
+  },
+})
 
 // PR2 obligation-ledger idle sweep. Re-present an OPEN obligation only at a
 // CLEAN idle: no turn in flight AND the inbound buffer is empty — so the
@@ -8559,7 +8612,7 @@ if (!STATIC) {
     // promise EXPLICITLY (honest failure) instead of letting it sit
     // forever. This is what makes the guarantee deterministic: every
     // queued message ends either delivered or visibly retracted.
-    inboundSpool?.sweepEscalations((e, { postNotice }) => {
+    inboundSpool?.sweepEscalations((e, { postNotice, droppedCount }) => {
       const chat = e.msg.chatId
       const escThread =
         typeof e.msg.meta?.threadId === 'string' && e.msg.meta.threadId
@@ -8578,13 +8631,17 @@ if (!STATIC) {
       // outage that re-ages a synthetic into the bound every 15 min posts ONE
       // notice, not one per cycle (the 2026-06-09 marko "please resend" spam).
       if (!postNotice) return
+      // #2789 C: report the REAL number of dropped messages for this chat
+      // in this sweep rather than under-counting a multi-message drop as a
+      // single one.
+      const n = droppedCount > 0 ? droppedCount : 1
+      const noticeText =
+        n === 1
+          ? "⚠️ I couldn't deliver an earlier message to the agent after repeated retries (it survived restarts but the agent never picked it up). Please resend it."
+          : `⚠️ I couldn't deliver ${n} earlier messages to the agent after repeated retries (they survived restarts but the agent never picked them up). Please resend them.`
       void swallowingApiCall(
         () =>
-          bot.api.sendMessage(
-            chat,
-            "⚠️ I couldn't deliver an earlier message to the agent after repeated retries (it survived restarts but the agent never picked it up). Please resend it.",
-            { ...threadOpts },
-          ),
+          bot.api.sendMessage(chat, noticeText, { ...threadOpts }),
         { chat_id: chat, verb: 'inbound-spool-escalation' },
       )
     })

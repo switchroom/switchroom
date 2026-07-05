@@ -159,6 +159,21 @@ export interface InboundSpoolOptions {
    *  `escalateAfterMs` here) or back-to-back attempts wouldn't coalesce.
    *  Default 30 min. */
   escalateNoticeCooldownMs?: number
+  /**
+   * #2789 B: fired whenever spool durability changes state — an append
+   * fails (durability has silently degraded to in-memory-only, so a
+   * later crash loses those messages) or recovers. Latches: called once
+   * on the transition into degraded and once on the transition back to
+   * healthy, not on every append. Lets the gateway raise a health
+   * signal instead of quietly continuing as if the durable promise
+   * still held. Best-effort — a throw here never breaks delivery.
+   */
+  onDegraded?: (info: {
+    degraded: boolean
+    consecutiveFailures: number
+    path: string
+    error?: string
+  }) => void
 }
 
 export interface ReplayEntry {
@@ -199,13 +214,25 @@ export interface InboundSpool {
    *  `escalateNoticeCooldownMs` — a burst of undeliverable inbounds (e.g.
    *  a synthetic re-created every 15 min while the agent is down, across
    *  restarts) yields ONE notice, not one per entry. The window is
-   *  persisted, so it holds across a gateway restart. Returns the count
-   *  of entries dropped. Safe to call on a timer. */
+   *  persisted, so it holds across a gateway restart. `droppedCount` is
+   *  the real number of entries dropped for that entry's chat in THIS
+   *  sweep, so the coalesced notice reports the true multi-message loss
+   *  count instead of under-reporting it as one (#2789 C). Returns the
+   *  total count of entries dropped. Safe to call on a timer. */
   sweepEscalations: (
-    onEscalate: (e: ReplayEntry, opts: { postNotice: boolean }) => void,
+    onEscalate: (
+      e: ReplayEntry,
+      opts: { postNotice: boolean; droppedCount: number },
+    ) => void,
   ) => number
   /** Test/observability: count of live (un-acked) ids. */
   liveCount: () => number
+  /** #2789 B: true while spool appends are failing — durability has
+   *  degraded to in-memory-only. A health signal the gateway can surface
+   *  instead of quietly dropping the durability guarantee. */
+  isDegraded: () => boolean
+  /** #2789 B: consecutive append failures since the last success. */
+  appendFailureCount: () => number
 }
 
 export function createInboundSpool(opts: InboundSpoolOptions): InboundSpool {
@@ -226,6 +253,13 @@ export function createInboundSpool(opts: InboundSpoolOptions): InboundSpool {
   // window survives a gateway restart (the actual 2026-06-09 spam: a
   // synthetic re-aged into the bound every 15 min across many restarts).
   const escAttemptByChat = new Map<string, number>()
+
+  // #2789 B: append-durability health. `consecutiveAppendFailures`
+  // counts failed appends since the last success; `degraded` latches so
+  // the onDegraded callback fires exactly once per state transition
+  // (into degraded / back to healthy) rather than on every append.
+  let consecutiveAppendFailures = 0
+  let degraded = false
 
   function parseLine(line: string): SpoolRecord | null {
     const s = line.trim()
@@ -288,15 +322,52 @@ export function createInboundSpool(opts: InboundSpoolOptions): InboundSpool {
   function appendRecord(rec: SpoolRecord): void {
     try {
       fs.appendFileSync(path, JSON.stringify(rec) + '\n')
+      // #2789 B: a successful append after a failure run means the spool
+      // is durable again — un-latch degraded state and surface recovery
+      // so the health signal clears.
+      if (consecutiveAppendFailures > 0) {
+        log(
+          `inbound-spool: append recovered path=${path} after ` +
+          `${consecutiveAppendFailures} failure(s) — durability restored\n`,
+        )
+        consecutiveAppendFailures = 0
+        if (degraded) {
+          degraded = false
+          try {
+            opts.onDegraded?.({ degraded: false, consecutiveFailures: 0, path })
+          } catch {
+            /* health signal is best-effort; never break delivery */
+          }
+        }
+      }
     } catch (err) {
       // Durability is best-effort relative to fs availability; a spool
-      // write failure must NOT break live delivery. Log loudly — a
-      // persistently failing spool means we're back to in-memory-only
-      // semantics and the operator should know.
+      // write failure must NOT break live delivery. But it must NOT be
+      // SILENT either (#2789 B) — a persistently failing spool means
+      // we're back to in-memory-only semantics and a later crash loses
+      // the message. Log loudly on every failure AND raise a latched
+      // health signal on the transition into degraded so the operator /
+      // health surface knows the durability guarantee is gone.
+      consecutiveAppendFailures++
+      const message = (err as Error).message
       log(
         `inbound-spool: append FAILED path=${path} id=${rec.id} t=${rec.t}: ` +
-        `${(err as Error).message} — durability degraded to in-memory\n`,
+        `${message} — durability degraded to in-memory ` +
+        `(consecutive failures=${consecutiveAppendFailures})\n`,
       )
+      if (!degraded) {
+        degraded = true
+        try {
+          opts.onDegraded?.({
+            degraded: true,
+            consecutiveFailures: consecutiveAppendFailures,
+            path,
+            error: message,
+          })
+        } catch {
+          /* health signal is best-effort; never break delivery */
+        }
+      }
     }
   }
 
@@ -399,10 +470,25 @@ export function createInboundSpool(opts: InboundSpoolOptions): InboundSpool {
     sweepEscalations(onEscalate) {
       const tNow = now()
       const cutoff = tNow - escalateAfterMs
+      // First pass (#2789 C): identify the entries to drop and count them
+      // per chat so the (coalesced) notice reports the REAL number of
+      // dropped messages instead of under-counting a multi-message drop
+      // as a single one. Iteration order is preserved so the tombstone /
+      // esc append order is unchanged.
+      const toDrop: {
+        id: string
+        e: { agent: string; msg: InboundMessage; firstAt: number }
+      }[] = []
+      const perChatCount = new Map<string, number>()
+      for (const [id, e] of live.entries()) {
+        if (e.firstAt > cutoff) continue
+        toDrop.push({ id, e })
+        const key = escChatKey(e.msg)
+        perChatCount.set(key, (perChatCount.get(key) ?? 0) + 1)
+      }
       let dropped = 0
       let posted = 0
-      for (const [id, e] of [...live.entries()]) {
-        if (e.firstAt > cutoff) continue
+      for (const { id, e } of toDrop) {
         live.delete(id)
         appendRecord({ t: 'ack', id }) // tombstone — promise retracted
         // Coalesce the user-facing notice per chat on a SLIDING window:
@@ -420,7 +506,13 @@ export function createInboundSpool(opts: InboundSpoolOptions): InboundSpool {
           typeof threadRaw === 'string' && threadRaw.length > 0 ? threadRaw : undefined
         appendRecord({ t: 'esc', chat: e.msg.chatId, thread, at: tNow })
         try {
-          onEscalate({ agent: e.agent, msg: e.msg }, { postNotice })
+          // #2789 C: hand the caller the real per-chat drop count for
+          // THIS sweep so the notice it posts can say "N messages" rather
+          // than under-reporting a multi-message drop as a single one.
+          onEscalate(
+            { agent: e.agent, msg: e.msg },
+            { postNotice, droppedCount: perChatCount.get(key) ?? 1 },
+          )
         } catch (err) {
           log(`inbound-spool: onEscalate threw id=${id}: ${(err as Error).message}\n`)
         }
@@ -440,6 +532,12 @@ export function createInboundSpool(opts: InboundSpoolOptions): InboundSpool {
     },
     liveCount() {
       return live.size
+    },
+    isDegraded() {
+      return degraded
+    },
+    appendFailureCount() {
+      return consecutiveAppendFailures
     },
   }
 }
