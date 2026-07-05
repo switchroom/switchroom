@@ -88,7 +88,7 @@ invariant, a job spec, a design record), never collapsed into one.
 
 ## How this repo instantiates ProductOS
 
-Switchroom is the canonical worked example of the [ProductOS method](../../ProductOS/).
+Switchroom is the canonical worked example of the [ProductOS method](https://github.com/mekenthompson/ProductOS).
 The map from each reference doc to its method anchor or template:
 
 | Reference doc | ProductOS anchor / template |
