@@ -35,6 +35,7 @@ from directive_verify import (  # noqa: E402
     directive_recorded_after,
     evaluate,
     find_last_human_turn,
+    is_synthetic_inbound,
     looks_like_durable_directive,
 )
 from recall import looks_like_standing_rule  # noqa: E402
@@ -305,6 +306,96 @@ class TestEvaluate(unittest.TestCase):
     def test_never_raises_on_garbage(self):
         # Defensive: evaluate must degrade to None, never raise.
         self.assertIsNone(evaluate({}, self.ON))
+
+
+class TestSyntheticInbound(unittest.TestCase):
+    """Non-interactive turns (cron / synthesized inbounds) must never trip the
+    blocking directive re-prompt — they aren't human corrections.
+    """
+
+    def test_cron_source_is_synthetic(self):
+        self.assertTrue(
+            is_synthetic_inbound('<channel source="cron">Time for the daily digest.</channel>')
+        )
+
+    def test_various_synthetic_sources(self):
+        for src in (
+            "cron",
+            "reaction",
+            "resume_interrupted",
+            "resume_watchdog_timeout",
+            "vault_grant_approved",
+            "subagent_handback",
+            "obligation_represent",
+        ):
+            with self.subTest(src=src):
+                self.assertTrue(
+                    is_synthetic_inbound(f'<channel source="{src}" foo="bar">body</channel>')
+                )
+
+    def test_self_closing_synthetic_source(self):
+        self.assertTrue(is_synthetic_inbound('<channel source="reaction"/>'))
+
+    def test_telegram_source_is_human(self):
+        self.assertFalse(
+            is_synthetic_inbound('<channel source="telegram" chat_id="1" user="ken">hi</channel>')
+        )
+
+    def test_no_envelope_is_human(self):
+        # Interactive session: no channel envelope → treated as human.
+        self.assertFalse(is_synthetic_inbound("From now on, always use British spelling."))
+
+    def test_non_string_is_not_synthetic(self):
+        for bad in (None, 123, [], {}):
+            self.assertFalse(is_synthetic_inbound(bad))
+
+    def test_cron_turn_with_durable_shape_does_not_block(self):
+        # A cron inbound whose text happens to contain a durable-rule phrasing
+        # must STILL be allowed — capture only makes sense on human turns.
+        import json
+        import tempfile
+
+        msgs = [
+            {
+                "role": "user",
+                "content": (
+                    '<channel source="cron">Reminder: from now on, always '
+                    "post the digest at 8am.</channel>"
+                ),
+            },
+            {"role": "assistant", "content": "Posted the digest."},
+        ]
+        fd, path = tempfile.mkstemp(suffix=".jsonl")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for m in msgs:
+                f.write(json.dumps({"type": m["role"], "message": m}) + "\n")
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        hook = {"transcript_path": path, "stop_hook_active": False}
+        self.assertIsNone(evaluate(hook, {"directiveCaptureNudge": True}))
+
+    def test_telegram_turn_with_durable_shape_still_blocks(self):
+        # Control: the SAME durable phrasing on a genuine telegram inbound
+        # must still block (proves the synthetic guard didn't over-reach).
+        import json
+        import tempfile
+
+        msgs = [
+            {
+                "role": "user",
+                "content": (
+                    '<channel source="telegram" chat_id="1" user="ken">From now '
+                    "on, always use British spelling.</channel>"
+                ),
+            },
+            {"role": "assistant", "content": "Got it."},
+        ]
+        fd, path = tempfile.mkstemp(suffix=".jsonl")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for m in msgs:
+                f.write(json.dumps({"type": m["role"], "message": m}) + "\n")
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        hook = {"transcript_path": path, "stop_hook_active": False}
+        self.assertEqual(evaluate(hook, {"directiveCaptureNudge": True}), _VERIFY_BLOCK_REASON)
 
 
 class TestBlockReason(unittest.TestCase):

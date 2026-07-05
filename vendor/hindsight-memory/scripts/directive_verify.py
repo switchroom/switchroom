@@ -142,6 +142,42 @@ _INJECTED_MARKERS = (
     "Relevant memories from past conversations",
 )
 
+# Genuine human inbound channels. A "user" turn whose `<channel source="...">`
+# envelope names anything else is a SYNTHESIZED / cron inbound built by the
+# gateway (see telegram-plugin/gateway/*-inbound-builder.ts + reaction /
+# resume / vault-grant / subagent / obligation builders) — a machine turn, NOT
+# a human correction. The blocking re-prompt must never fire on those: nagging
+# the model to persist a "durable rule" on a cron digest or a resume synthetic
+# is pure noise. Interactive sessions carry NO channel envelope and are treated
+# as human. Kept as a whitelist so any NEW synthetic source is skipped by
+# default rather than accidentally nagged on.
+_HUMAN_INBOUND_SOURCES = frozenset({"telegram"})
+
+# Pulls the source attribute out of the gateway's leading `<channel ...>`
+# envelope. Handles both open (`<channel source="telegram" ...>`) and
+# self-closing (`<channel source="reaction"/>`) forms.
+_CHANNEL_SOURCE_RE = re.compile(r"""<channel\b[^>]*\bsource=["']([^"']+)["']""")
+
+
+def is_synthetic_inbound(text) -> bool:
+    """True when this turn's opening human message is a synthesized/cron
+    inbound rather than a genuine human message.
+
+    Detection is purely on the gateway-prepended ``<channel source="...">``
+    envelope: a ``source`` outside ``_HUMAN_INBOUND_SOURCES`` (``cron``,
+    ``reaction``, ``resume_interrupted``, ``vault_grant_approved``,
+    ``subagent_handback``, ``obligation_represent``, …) marks a non-human turn.
+    No envelope (interactive session) → treated as human. Injected channel tags
+    in a human's own body are neutralised upstream by the channel-envelope
+    sanitiser, so the only real ``<channel source=`` is the gateway's.
+    """
+    if not isinstance(text, str):
+        return False
+    m = _CHANNEL_SOURCE_RE.search(text)
+    if not m:
+        return False
+    return m.group(1).strip().lower() not in _HUMAN_INBOUND_SOURCES
+
 
 def looks_like_durable_directive(text) -> bool:
     """High-precision test for an explicit, durable standing rule.
@@ -283,6 +319,14 @@ def evaluate(hook_input: dict, config: dict) -> str | None:
 
     idx, text = find_last_human_turn(messages)
     if idx is None:
+        return None
+
+    # Non-interactive turn guard: cron / synthesized-inbound turns (resume,
+    # reaction, vault-grant, subagent-handback, obligation-represent, …) are
+    # machine turns, not human corrections. Never block Stop to nag capture on
+    # them — that's spurious. (See is_synthetic_inbound.)
+    if is_synthetic_inbound(text):
+        debug_log(config, "Directive-capture verify: synthetic/cron inbound, allowing stop")
         return None
 
     if not looks_like_durable_directive(text):

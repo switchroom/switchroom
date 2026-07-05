@@ -147,6 +147,23 @@ def run_retain(hook_input: dict, force: bool = False) -> dict:
 
     debug_log(config, f"Retain hook_input keys: {list(hook_input.keys())} force={force}")
 
+    # Blocked-Stop double-fire guard (switchroom #2848 Phase 3): when
+    # directive_verify.py blocks a Stop, the model continues and the Stop
+    # event fires AGAIN, this time carrying ``stop_hook_active: true``.
+    # Retaining on that second fire would (a) POST a duplicate transcript
+    # document and (b) at retainEveryNTurns>1 call increment_turn_count a
+    # second time for the SAME logical turn — drifting the cadence throttle.
+    # Skip the re-fire entirely BEFORE any store or turn-count increment.
+    # A forced SessionEnd sweep (force=True) is a distinct hook event and
+    # must always flush, so it is exempt.
+    if not force and hook_input.get("stop_hook_active"):
+        debug_log(
+            config,
+            "Stop re-fire (stop_hook_active=true) — skipping retain to avoid "
+            "duplicate document / turn-count drift",
+        )
+        return {"status": "skipped", "reason": "stop_hook_active"}
+
     session_id = hook_input.get("session_id", "unknown")
     transcript_path = hook_input.get("transcript_path", "")
 

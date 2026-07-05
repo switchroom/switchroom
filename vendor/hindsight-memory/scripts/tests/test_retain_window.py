@@ -18,12 +18,13 @@ Stdlib-only; runs under `python3 -m unittest discover tests/`.
 import os
 import sys
 import unittest
+from unittest import mock
 
 SCRIPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 
-from retain import select_retain_window  # noqa: E402
+from retain import run_retain, select_retain_window  # noqa: E402
 
 
 def _transcript(num_turns: int) -> list:
@@ -255,6 +256,70 @@ class SelectRetainWindowForce(unittest.TestCase):
             all_messages=messages, force=False,
         )
         self.assertEqual(_user_turn_indices(result), [7, 8, 9])  # last 3 turns
+
+
+class RunRetainStopHookActiveGuard(unittest.TestCase):
+    """switchroom #2848 Phase 3 — blocked-Stop double-fire guard.
+
+    When directive_verify.py blocks a Stop, the model continues and the Stop
+    event fires AGAIN with ``stop_hook_active: true``. run_retain must no-op on
+    that re-fire — no store, no increment_turn_count — so the same logical turn
+    can't produce a duplicate transcript document or drift the cadence counter.
+    """
+
+    _CONFIG = {"autoRetain": True, "retainEveryNTurns": 10, "retainMode": "chunked"}
+
+    def test_stop_hook_active_noops_no_store_no_increment(self):
+        hook_input = {
+            "session_id": "s1",
+            "transcript_path": "/some/path.jsonl",
+            "stop_hook_active": True,
+        }
+        with mock.patch("retain.load_config", return_value=self._CONFIG), \
+                mock.patch("retain.increment_turn_count") as inc, \
+                mock.patch("retain.read_transcript") as read_t, \
+                mock.patch("retain.get_api_url") as get_url:
+            result = run_retain(hook_input, force=False)
+        # Early-return skip with the dedicated reason.
+        self.assertEqual(result.get("status"), "skipped")
+        self.assertEqual(result.get("reason"), "stop_hook_active")
+        # No cadence increment, no transcript read, no API resolution/store.
+        inc.assert_not_called()
+        read_t.assert_not_called()
+        get_url.assert_not_called()
+
+    def test_first_stop_not_guarded(self):
+        # The FIRST Stop (no stop_hook_active) must NOT be short-circuited by
+        # this guard — it proceeds into normal retain flow (which we stub out
+        # right after the guard by making the transcript empty).
+        hook_input = {
+            "session_id": "s2",
+            "transcript_path": "/some/path.jsonl",
+            "stop_hook_active": False,
+        }
+        with mock.patch("retain.load_config", return_value=self._CONFIG), \
+                mock.patch("retain.read_transcript", return_value=[]) as read_t:
+            result = run_retain(hook_input, force=False)
+        # Got past the guard into the flow — proven by the transcript read.
+        read_t.assert_called_once()
+        self.assertEqual(result.get("status"), "skipped")
+        self.assertEqual(result.get("reason"), "empty transcript")
+
+    def test_forced_session_end_sweep_exempt_from_guard(self):
+        # A forced (SessionEnd) sweep is a distinct hook event and must always
+        # flush even if stop_hook_active happens to be set — the guard is
+        # gated on `not force`.
+        hook_input = {
+            "session_id": "s3",
+            "transcript_path": "/some/path.jsonl",
+            "stop_hook_active": True,
+        }
+        with mock.patch("retain.load_config", return_value=self._CONFIG), \
+                mock.patch("retain.read_transcript", return_value=[]) as read_t:
+            result = run_retain(hook_input, force=True)
+        # force=True bypasses the stop_hook_active guard → reaches transcript read.
+        read_t.assert_called_once()
+        self.assertEqual(result.get("reason"), "empty transcript")
 
 
 if __name__ == "__main__":
