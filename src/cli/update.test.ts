@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   planUpdate,
+  resolveHindsightPinTag,
   runUpdate,
   isGitCheckout,
   rebuildRefusalMessage,
@@ -85,6 +86,64 @@ describe("planUpdate", () => {
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
+  });
+
+  // #2851: `memory setup` never reads release.pin, so the refresh-hindsight
+  // step must thread the resolved target through as `--tag <version>` (like
+  // `switchroom rollout` does) — otherwise the recreate floats to `:latest`
+  // and the memory singleton drifts a version behind the pinned fleet.
+  describe("refresh-hindsight pins the recreate to the release target (#2851)", () => {
+    const findRefresh = (opts: Parameters<typeof planUpdate>[0]) =>
+      planUpdate({ composePath: "unused-for-run", memoryBackendHindsight: true, ...opts }).find(
+        (s) => s.name === "refresh-hindsight",
+      )!;
+
+    it("threads --tag <version> when this run passes --pin vX.Y.Z", () => {
+      const runner = fakeRunner();
+      findRefresh({ pin: "v0.17.5", runner: runner.fn }).run();
+      expect(runner.calls).toHaveLength(1);
+      expect(runner.calls[0]!.args.slice(-5)).toEqual([
+        "memory",
+        "setup",
+        "--recreate",
+        "--tag",
+        "v0.17.5",
+      ]);
+    });
+
+    it("omits --tag (floating :latest) when there is no pin", () => {
+      const runner = fakeRunner();
+      // hindsightPinTag:"" is the explicit floating override — avoids reading
+      // the developer's real ~/.switchroom config in this unit test.
+      findRefresh({ hindsightPinTag: "", runner: runner.fn }).run();
+      expect(runner.calls).toHaveLength(1);
+      expect(runner.calls[0]!.args.slice(-3)).toEqual(["memory", "setup", "--recreate"]);
+      expect(runner.calls[0]!.args).not.toContain("--tag");
+    });
+
+    it("leaves hindsight floating under a --channel override", () => {
+      const runner = fakeRunner();
+      // channel short-circuits before any config read.
+      findRefresh({ channel: "dev", runner: runner.fn }).run();
+      expect(runner.calls[0]!.args).not.toContain("--tag");
+    });
+
+    it("does not pin a sha-<hash> --pin (no per-sha hindsight image published)", () => {
+      const runner = fakeRunner();
+      findRefresh({ pin: "sha-abc1234", runner: runner.fn }).run();
+      expect(runner.calls[0]!.args).not.toContain("--tag");
+    });
+  });
+
+  describe("resolveHindsightPinTag", () => {
+    it("returns a vX.Y.Z --pin verbatim, undefined for sha / channel / empty override", () => {
+      expect(resolveHindsightPinTag({ pin: "v0.17.5" })).toBe("v0.17.5");
+      expect(resolveHindsightPinTag({ pin: "sha-deadbeef" })).toBeUndefined();
+      expect(resolveHindsightPinTag({ pin: "v0.17.5", channel: "dev" })).toBeUndefined();
+      // Explicit floating override wins over everything (and reads no config).
+      expect(resolveHindsightPinTag({ hindsightPinTag: "", pin: "v0.17.5" })).toBeUndefined();
+      expect(resolveHindsightPinTag({ hindsightPinTag: "v0.16.11" })).toBe("v0.16.11");
+    });
   });
 
   it("inserts regen-compose-for-release-override BEFORE pull-images when --channel is set", () => {
