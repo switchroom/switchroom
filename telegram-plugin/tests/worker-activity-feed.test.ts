@@ -637,7 +637,7 @@ describe('rolling window — createWorkerActivityFeed narrative accumulation', (
 // ─── Worker heartbeat (option a — suffix-only, never opens a new message) ─────
 
 describe('createWorkerActivityFeed — heartbeat', () => {
-  it('(i) a tick fires a re-render with a climbing · Ns suffix on a stale worker', async () => {
+  it('(i) a tick fires a re-render with a climbing · Ns suffix showing the current step\'s OWN elapsed', async () => {
     const bot = makeFakeBot()
     let clock = 10_000
     const feed = createWorkerActivityFeed({
@@ -649,22 +649,50 @@ describe('createWorkerActivityFeed — heartbeat', () => {
       setInterval: () => 1,
       clearInterval: () => {},
     })
-    // First paint at elapsed 0 (firstPaintMin default 8000 — use 9000).
+    // First paint at elapsed 0 (firstPaintMin default 8000 — use 9000). The
+    // narrative line 'pulling data' lands here, so the current step starts now.
     clock = 19_000
     await feed.update('w1', 'chat', view({ elapsedMs: 9000, latestSummary: 'pulling data' }))
     expect(bot.sent).toHaveLength(1)
-    const dispatchAt = clock - 9000
+    const stepStart = clock // step began when the '→' line first appeared
 
-    // Advance past the staleness window so the heartbeat ticks.
-    clock = 26_000 // lastEditAt(19000) + 7000 ≥ heartbeatTickMs(6000) and ≥ minEditInterval
+    // Advance well past the per-step 10s gate so the heartbeat renders a suffix.
+    clock = 32_000 // step is now 13s old; lastEditAt(19000)+13000 ≥ heartbeatTickMs
     feed.heartbeatTick()
-    await feed.update('w1', 'chat', view({ elapsedMs: 16_000, latestSummary: 'pulling data' })).catch(() => {})
+    await feed.update('w1', 'chat', view({ elapsedMs: 22_000, latestSummary: 'pulling data' })).catch(() => {})
     // Drain the chain.
-    await feed.update('w1', 'chat', view({ elapsedMs: 16_000, latestSummary: 'pulling data' }))
+    await feed.update('w1', 'chat', view({ elapsedMs: 22_000, latestSummary: 'pulling data' }))
     const edit1 = bot.edits.find((e) => /· \d+s\*\*/.test(e.text))
     expect(edit1).toBeDefined()
-    // The suffix reflects the LIVE elapsed (now - dispatchAt), not the stale view.
-    expect(edit1!.text).toContain(`· ${Math.floor((26_000 - dispatchAt) / 1000)}s`)
+    // The step suffix reflects the STEP's OWN elapsed (now - stepStart), NOT
+    // the worker total — the header already carries the total.
+    expect(edit1!.text).toContain(`· ${Math.floor((32_000 - stepStart) / 1000)}s`)
+  })
+
+  it('(i-a) suppresses the step suffix while the current step is younger than the 10s gate', async () => {
+    const bot = makeFakeBot()
+    let clock = 10_000
+    const feed = createWorkerActivityFeed({
+      bot,
+      now: () => clock,
+      minEditIntervalMs: 2500,
+      heartbeatTickMs: 6000,
+      setInterval: () => 1,
+      clearInterval: () => {},
+    })
+    // Step begins here.
+    clock = 19_000
+    await feed.update('w1', 'chat', view({ elapsedMs: 9000, latestSummary: 'pulling data' }))
+    expect(bot.sent).toHaveLength(1)
+
+    // Heartbeat only 7s into the step — under STEP_TIMER_MIN_MS (10s), so no
+    // `· Ns` suffix on the '→' line yet (the header total still climbs).
+    clock = 26_000
+    feed.heartbeatTick()
+    await feed.update('w1', 'chat', view({ elapsedMs: 16_000, latestSummary: 'pulling data' })).catch(() => {})
+    await feed.update('w1', 'chat', view({ elapsedMs: 16_000, latestSummary: 'pulling data' }))
+    const stepSuffixEdit = bot.edits.find((e) => /· \d+s\*\*/.test(e.text))
+    expect(stepSuffixEdit).toBeUndefined()
   })
 
   it('(i-b) heartbeat repaint keeps the header master elapsed >= the step timer (same clock anchor)', async () => {
