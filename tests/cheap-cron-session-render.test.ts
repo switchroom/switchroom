@@ -153,7 +153,7 @@ describe("cron-session.sh LiteLLM routing — mirrors start.sh boot block", () =
   });
 
   it("is gated on SWITCHROOM_LITELLM — inert when not set", () => {
-    expect(out).toContain('if [ -n "$SWITCHROOM_LITELLM" ]');
+    expect(out).toContain('if [ -n "${SWITCHROOM_LITELLM:-}" ]');
   });
 
   it("exports ANTHROPIC_CUSTOM_HEADERS and CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY on success", () => {

@@ -64,7 +64,7 @@ if [ "$SWITCHROOM_RUNTIME" = "docker" ] && [ -z "$SWITCHROOM_DOCKER_TMUX_INNER" 
   #
   # SWITCHROOM_AGENT_NAME is injected by compose env (compose.ts:1816)
   # so it is available here, before the inner-pass export at line ~320.
-  if [ -n "$SWITCHROOM_LITELLM" ] && [ -z "$ANTHROPIC_CUSTOM_HEADERS" ] && command -v switchroom >/dev/null 2>&1; then
+  if [ -n "${SWITCHROOM_LITELLM:-}" ] && [ -z "$ANTHROPIC_CUSTOM_HEADERS" ] && command -v switchroom >/dev/null 2>&1; then
     sr_ll_key="$(switchroom vault get "litellm/$SWITCHROOM_AGENT_NAME/api-key" 2>/dev/null || true)"
     sr_ll_ok=""
     if [ -z "$sr_ll_key" ]; then
@@ -884,7 +884,7 @@ fi
 # per-session cost/issue tracking is handled out-of-band by correlating
 # LiteLLM's request log against switchroom's turn ledger, never by mutating the
 # claude protocol.
-if [ -n "$SWITCHROOM_LITELLM" ] && command -v switchroom >/dev/null 2>&1; then
+if [ -n "${SWITCHROOM_LITELLM:-}" ] && command -v switchroom >/dev/null 2>&1; then
   sr_ll_key="$(switchroom vault get "litellm/$SWITCHROOM_AGENT_NAME/api-key" 2>/dev/null || true)"
   sr_ll_ok=""
   if [ -z "$sr_ll_key" ]; then

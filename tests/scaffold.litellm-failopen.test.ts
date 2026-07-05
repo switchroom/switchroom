@@ -60,7 +60,7 @@ describe("scaffoldAgent: LiteLLM fail-open boot contract (#litellm)", () => {
     const startSh = readFileSync(join(res.agentDir, "start.sh"), "utf-8");
 
     // Gated on the same SWITCHROOM_LITELLM marker compose injects.
-    expect(startSh).toContain('if [ -n "$SWITCHROOM_LITELLM" ]');
+    expect(startSh).toContain('if [ -n "${SWITCHROOM_LITELLM:-}" ]');
 
     // Boot reachability probe against the proxy's unauthenticated liveness
     // endpoint (so a key-less probe still works).
