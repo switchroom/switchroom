@@ -59,8 +59,14 @@ class HindsightClient:
 
         Upstream 55ef70679. NOTE: recall.py deliberately does not pass the
         override — its 8s timeout is a hook-budget invariant.
+
+        The override is clamped to >= 1: a zero/negative env value would
+        otherwise reach urlopen as a nonsensical timeout (0 fails every
+        request immediately), turning a config typo into a dead client.
         """
-        return self.request_timeout_override if self.request_timeout_override is not None else timeout
+        if self.request_timeout_override is None:
+            return timeout
+        return max(1, self.request_timeout_override)
 
     def _headers(self) -> dict:
         headers = {

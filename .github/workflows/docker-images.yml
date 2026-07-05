@@ -267,18 +267,34 @@ jobs:
           set -euo pipefail
           IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/switchroom-base"
           SHA_SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
+          # Stale-dispatch guard (#2818 follow-up): a workflow_dispatch
+          # on main runs against the tip AT DISPATCH TIME; if main has
+          # advanced since, pushing :latest would REGRESS it behind a
+          # newer push run's :latest. Skip :latest (keep :sha-<7>) when
+          # the checked-out sha is no longer main's tip. Fail-open: if
+          # ls-remote can't answer, keep pushing :latest — the guard is
+          # a safety net, not a new failure mode for the recovery lever.
+          PUSH_LATEST=true
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            MAIN_TIP=$(git ls-remote "https://github.com/${{ github.repository }}" refs/heads/main | cut -f1 || true)
+            if [[ -n "$MAIN_TIP" && "$MAIN_TIP" != "${{ github.sha }}" ]]; then
+              PUSH_LATEST=false
+              echo "::notice title=stale dispatch::checked-out ${{ github.sha }} is no longer main tip ($MAIN_TIP) — skipping :latest, pushing :sha-${SHA_SHORT} only."
+            fi
+          fi
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             TAG_VERSION="${GITHUB_REF#refs/tags/}"
             TAG_ARGS=(-t "${IMAGE}:${TAG_VERSION}" -t "${IMAGE}:latest")
-          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+          elif [[ "${{ github.ref }}" == "refs/heads/main" && "$PUSH_LATEST" == "true" ]]; then
             # PR C: keep :latest as the canonical install per
             # docs/operators/install.md, BUT also publish :sha-<7> for
             # rollback / promote.yml retagging. (:dev is gated by the
             # smoke-test job and assigned by promote-to-dev — never here.)
             TAG_ARGS=(-t "${IMAGE}:latest" -t "${IMAGE}:sha-${SHA_SHORT}")
           else
-            # dispatch on a non-main, non-tag ref: publish only the
-            # per-commit tag; never move :latest from an odd ref.
+            # dispatch on a non-main/non-tag ref, or a stale main
+            # dispatch: publish only the per-commit tag; never move
+            # :latest from an odd ref or an outdated main sha.
             TAG_ARGS=(-t "${IMAGE}:sha-${SHA_SHORT}")
           fi
           docker buildx imagetools create "${TAG_ARGS[@]}" \
@@ -418,10 +434,19 @@ jobs:
           set -euo pipefail
           IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/switchroom-${{ matrix.image }}"
           SHA_SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
+          # Stale-dispatch guard — see merge-base for rationale.
+          PUSH_LATEST=true
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            MAIN_TIP=$(git ls-remote "https://github.com/${{ github.repository }}" refs/heads/main | cut -f1 || true)
+            if [[ -n "$MAIN_TIP" && "$MAIN_TIP" != "${{ github.sha }}" ]]; then
+              PUSH_LATEST=false
+              echo "::notice title=stale dispatch::checked-out ${{ github.sha }} is no longer main tip ($MAIN_TIP) — skipping :latest, pushing :sha-${SHA_SHORT} only."
+            fi
+          fi
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             TAG_VERSION="${GITHUB_REF#refs/tags/}"
             TAG_ARGS=(-t "${IMAGE}:${TAG_VERSION}" -t "${IMAGE}:latest")
-          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+          elif [[ "${{ github.ref }}" == "refs/heads/main" && "$PUSH_LATEST" == "true" ]]; then
             TAG_ARGS=(-t "${IMAGE}:latest" -t "${IMAGE}:sha-${SHA_SHORT}")
           else
             TAG_ARGS=(-t "${IMAGE}:sha-${SHA_SHORT}")
@@ -473,13 +498,29 @@ jobs:
         run: |
           IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/switchroom-hindsight"
           SHA_SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
+          # Stale-dispatch guard — see merge-base for rationale.
+          PUSH_LATEST=true
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            MAIN_TIP=$(git ls-remote "https://github.com/${{ github.repository }}" refs/heads/main | cut -f1 || true)
+            if [[ -n "$MAIN_TIP" && "$MAIN_TIP" != "${{ github.sha }}" ]]; then
+              PUSH_LATEST=false
+              echo "::notice title=stale dispatch::checked-out ${{ github.sha }} is no longer main tip ($MAIN_TIP) — skipping :latest, pushing :sha-${SHA_SHORT} only."
+            fi
+          fi
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             TAG_VERSION="${GITHUB_REF#refs/tags/}"
             echo "tags=${IMAGE}:${TAG_VERSION},${IMAGE}:latest" >> "$GITHUB_OUTPUT"
-          elif [[ ( "${{ github.event_name }}" == "push" || "${{ github.event_name }}" == "workflow_dispatch" ) && "${{ github.ref }}" == "refs/heads/main" ]]; then
+          elif [[ "${{ github.ref }}" == "refs/heads/main" && "$PUSH_LATEST" == "true" ]]; then
             echo "tags=${IMAGE}:latest,${IMAGE}:sha-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
-          else
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
             echo "tags=${IMAGE}:pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          else
+            # dispatch on a non-main/non-tag ref, or a stale main
+            # dispatch: sha tag only. Previously a non-main dispatch
+            # fell into the pr-<number> branch with an EMPTY number,
+            # producing an invalid `:pr-` reference and failing the
+            # push (#2816 review follow-up).
+            echo "tags=${IMAGE}:sha-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build (and push on main/tag) hindsight
@@ -546,13 +587,26 @@ jobs:
         run: |
           IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/switchroom-voice"
           SHA_SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
+          # Stale-dispatch guard — see merge-base for rationale.
+          PUSH_LATEST=true
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            MAIN_TIP=$(git ls-remote "https://github.com/${{ github.repository }}" refs/heads/main | cut -f1 || true)
+            if [[ -n "$MAIN_TIP" && "$MAIN_TIP" != "${{ github.sha }}" ]]; then
+              PUSH_LATEST=false
+              echo "::notice title=stale dispatch::checked-out ${{ github.sha }} is no longer main tip ($MAIN_TIP) — skipping :latest, pushing :sha-${SHA_SHORT} only."
+            fi
+          fi
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             TAG_VERSION="${GITHUB_REF#refs/tags/}"
             echo "tags=${IMAGE}:${TAG_VERSION},${IMAGE}:latest" >> "$GITHUB_OUTPUT"
-          elif [[ ( "${{ github.event_name }}" == "push" || "${{ github.event_name }}" == "workflow_dispatch" ) && "${{ github.ref }}" == "refs/heads/main" ]]; then
+          elif [[ "${{ github.ref }}" == "refs/heads/main" && "$PUSH_LATEST" == "true" ]]; then
             echo "tags=${IMAGE}:latest,${IMAGE}:sha-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
-          else
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
             echo "tags=${IMAGE}:pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          else
+            # dispatch on a non-main/non-tag ref, or a stale main
+            # dispatch: sha tag only (see build-hindsight's twin branch).
+            echo "tags=${IMAGE}:sha-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build (and push on main/tag) voice
@@ -735,7 +789,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [base, agent, broker, kernel, hostd, auth-broker, hindsight, voice]
+        # Keep in sync with the merge-dependents matrix + base +
+        # hindsight/voice: every image that publishes :sha-<7> on main
+        # must be promoted here, or its :dev tag silently stops
+        # advancing (web was missing until #2818's follow-up).
+        image: [base, agent, broker, kernel, hostd, auth-broker, web, hindsight, voice]
     steps:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
