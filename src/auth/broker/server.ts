@@ -1715,6 +1715,9 @@ export class AuthBroker {
       process.stdout.write(
         `auth-broker: fleet-quota-probe shows ACTIVE ${label} exhausted — proactive failover\n`,
       );
+      // Audit parity with the consumer sensor: a proactive mark leaves a
+      // durable audit record, not just a stdout line (#2845 review nit).
+      this.audit({ op: "mark-exhausted", identity: { kind: "operator" }, account: label, accountKind: "claude", ok: true });
       await this.markExhaustedAndRoll(label, decision.until ?? undefined, { kind: "operator" });
     }
   }
@@ -1960,7 +1963,13 @@ export class AuthBroker {
    */
   private exhaustionLiveCorroborated(account: string): boolean {
     const snapshot = this.lastQuotaCache[account];
-    if (!snapshot || !snapshotFresh(snapshot, this.now())) return false;
+    // Tighter freshness ceiling than the serving path's 24h default
+    // (#2845 review nit): a durable promote must be backed by a snapshot
+    // younger than one 5h refill period, else a stale walled reading
+    // (fleet probing disabled / degraded) could promote off an account
+    // whose window already refilled. With default probing (minutes-old
+    // snapshots) this never binds.
+    if (!snapshot || !snapshotFresh(snapshot, this.now(), MARK_EXHAUSTED_DEFAULT_MS)) return false;
     if (!snapshotWalled(snapshot)) return false;
     return !overageLiftsWall(snapshot, this.isOverageAllowed(account));
   }
