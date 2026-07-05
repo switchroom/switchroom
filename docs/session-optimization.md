@@ -25,6 +25,13 @@ Switchroom agents have three mechanisms that survive restarts and compaction:
    - `continue` — always pass `--continue`. Flaky on large transcripts; only use if you know your sessions stay small.
    - `none` — fresh every time, no briefing.
 
+   **Session-JSONL retention (#2792).** Session transcripts accumulate one JSONL per session under `<agentDir>/.claude/projects/`. The Stop hook prunes old ones after building the briefing (so the handoff source is never touched), bounded by two `session_continuity` fields (same shallow per-key cascade merge as the rest of the block — set fleet-wide under `defaults.session_continuity` or override per agent/profile):
+
+   - `session_retention_max_count` — keep at most this many newest transcripts (default `20`; `0` disables the count bound).
+   - `session_retention_max_age_days` — prune transcripts older than this many days (default `30`; `0` disables the age bound).
+
+   A transcript is deleted only when it is **both** over the count bound **and** older than the age bound; the newest two sessions are always retained regardless.
+
 2. **Hindsight memory** — auto-retain fires every 10 turns, saving the full transcript to a semantic bank. Auto-recall fires every turn, bringing back relevant memories. Important facts survive compaction and restart because they're stored externally.
 
 3. **Telegram history** — SQLite buffer of every inbound/outbound message. `get_recent_messages` lets the agent recover recent chat context after a restart, regardless of resume mode.

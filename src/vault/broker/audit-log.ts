@@ -110,6 +110,108 @@ export interface AuditLoggerOptions {
    * Defaults to ~/.switchroom/vault-audit.log (resolved via os.homedir()).
    */
   path?: string;
+  /**
+   * Size-based rotation threshold in bytes (issue #2792 item B). When the
+   * active log grows past this size, it is rotated to `<path>.1` (shifting
+   * `.1`→`.2`, …) before the next append. `0`/`undefined` uses the default;
+   * a negative value disables rotation entirely. Env override:
+   * `SWITCHROOM_VAULT_AUDIT_MAX_BYTES`.
+   */
+  maxBytes?: number;
+  /**
+   * How many rotated files to retain (`<path>.1` … `<path>.<maxFiles>`).
+   * The oldest is deleted when it would exceed this count. `0`/`undefined`
+   * uses the default. Env override: `SWITCHROOM_VAULT_AUDIT_MAX_FILES`.
+   */
+  maxFiles?: number;
+}
+
+/**
+ * Default rotation threshold: 32 MiB. At ~300 bytes/row this is ~100k
+ * audit rows per file — a generous forensic window that still bounds the
+ * active file. Conservative: rotation preserves rows (nothing is
+ * truncated in place), and the hash chain continues seamlessly across the
+ * rotation boundary (see createAuditLogger).
+ */
+export const DEFAULT_AUDIT_MAX_BYTES = 32 * 1024 * 1024;
+/**
+ * Default number of rotated files retained. Total on-disk audit history is
+ * bounded at roughly `(maxFiles + 1) * maxBytes`. The oldest rotated file
+ * is deleted past this count — that DOES discard tamper-evidence for the
+ * very oldest rows, so operators who need an unbounded forensic archive
+ * should raise this or ship rows off-box.
+ */
+export const DEFAULT_AUDIT_MAX_FILES = 5;
+
+/**
+ * Resolve the effective rotation config from options + env overrides.
+ * Negative maxBytes disables rotation.
+ */
+function resolveRotation(opts: AuditLoggerOptions): {
+  maxBytes: number;
+  maxFiles: number;
+} {
+  const envBytes = Number(process.env.SWITCHROOM_VAULT_AUDIT_MAX_BYTES);
+  const envFiles = Number(process.env.SWITCHROOM_VAULT_AUDIT_MAX_FILES);
+  const maxBytes =
+    opts.maxBytes !== undefined && opts.maxBytes !== 0
+      ? opts.maxBytes
+      : Number.isFinite(envBytes) && envBytes !== 0
+        ? envBytes
+        : DEFAULT_AUDIT_MAX_BYTES;
+  const maxFiles =
+    opts.maxFiles !== undefined && opts.maxFiles > 0
+      ? opts.maxFiles
+      : Number.isFinite(envFiles) && envFiles > 0
+        ? envFiles
+        : DEFAULT_AUDIT_MAX_FILES;
+  return { maxBytes, maxFiles };
+}
+
+/**
+ * Rotate the audit log: `<path>.(n-1)` → `<path>.n`, dropping the oldest
+ * past `maxFiles`, then `<path>` → `<path>.1`. The active path is left
+ * absent so the next append re-creates an empty file; the in-process hash
+ * chain is intentionally NOT reset, so the first row of the new file links
+ * back to the last row of `<path>.1` and cross-file continuity holds.
+ * Best-effort: any failure is reported and rotation is skipped (the
+ * current file keeps growing rather than losing data).
+ */
+function rotateAuditLog(logPath: string, maxFiles: number): void {
+  // Delete the oldest retained file if it exists — it would fall off the
+  // window after the shift.
+  const oldest = `${logPath}.${maxFiles}`;
+  if (fs.existsSync(oldest)) {
+    try {
+      fs.unlinkSync(oldest);
+    } catch (err) {
+      process.stderr.write(
+        `[vault-audit] ERROR: could not drop oldest rotation ${oldest}: ${(err as Error).message}\n`,
+      );
+    }
+  }
+  // Shift .(n-1) → .n for n = maxFiles down to 2.
+  for (let n = maxFiles - 1; n >= 1; n--) {
+    const from = `${logPath}.${n}`;
+    const to = `${logPath}.${n + 1}`;
+    if (!fs.existsSync(from)) continue;
+    try {
+      fs.renameSync(from, to);
+    } catch (err) {
+      process.stderr.write(
+        `[vault-audit] ERROR: could not rotate ${from} → ${to}: ${(err as Error).message}\n`,
+      );
+      return;
+    }
+  }
+  // Finally, active → .1.
+  try {
+    fs.renameSync(logPath, `${logPath}.1`);
+  } catch (err) {
+    process.stderr.write(
+      `[vault-audit] ERROR: could not rotate active audit log ${logPath}: ${(err as Error).message}\n`,
+    );
+  }
 }
 
 /**
@@ -162,8 +264,25 @@ export function createAuditLogger(opts: AuditLoggerOptions = {}): AuditLogger {
   // so a failed append can't desync the chain from disk.
   let chain: ChainState = seedChain(logPath);
 
+  // Rotation config (issue #2792 item B). A negative maxBytes disables
+  // rotation; the chain state is preserved across rotations so cross-file
+  // tamper-evidence continuity holds.
+  const rotation = resolveRotation(opts);
+
   return {
     write(entry: AuditEntry): void {
+      // Size-based rotation check before the append. Best-effort:
+      // stat failures leave the file untouched (grow rather than lose).
+      if (rotation.maxBytes > 0) {
+        try {
+          const size = fs.statSync(logPath).size;
+          if (size >= rotation.maxBytes) {
+            rotateAuditLog(logPath, rotation.maxFiles);
+          }
+        } catch {
+          // No file yet (first write) or stat error — nothing to rotate.
+        }
+      }
       // Build the chained JSON line. Control characters are not a
       // concern for the fields we log (ISO timestamps, key names, unit
       // names, pid numbers); JSON.stringify handles them anyway.

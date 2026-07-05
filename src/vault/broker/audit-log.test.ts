@@ -20,6 +20,7 @@ import {
   defaultAuditLogPath,
   type AuditEntry,
 } from "./audit-log.js";
+import { verifyAuditLog } from "../../util/audit-hashchain.js";
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
@@ -282,6 +283,66 @@ describe("callerFromPeer", () => {
     // a literal `caller: ""` entry.
     const caller = callerFromPeer({ pid: 42, systemdUnit: "" });
     expect(caller).toBe("pid:42");
+  });
+});
+
+// ─── size-based rotation (#2792 item B) ───────────────────────────────────────
+
+describe("createAuditLogger rotation", () => {
+  function writeN(logger: ReturnType<typeof createAuditLogger>, n: number): void {
+    for (let i = 0; i < n; i++) {
+      logger.write({
+        ts: "2026-04-28T14:33:00.000Z",
+        op: "get",
+        key: `k/${i}`,
+        caller: "agent:test",
+        pid: 1,
+        result: "allowed",
+      });
+    }
+  }
+
+  it("rotates the active log to .1 once it exceeds maxBytes", () => {
+    // Tiny threshold so a couple of rows trip it.
+    const audit = createAuditLogger({ path: logPath, maxBytes: 200, maxFiles: 3 });
+    writeN(audit, 10);
+    expect(fs.existsSync(`${logPath}.1`)).toBe(true);
+    // Active file exists and is smaller than the full history.
+    expect(fs.existsSync(logPath)).toBe(true);
+  });
+
+  it("retains at most maxFiles rotated files, dropping the oldest", () => {
+    const audit = createAuditLogger({ path: logPath, maxBytes: 120, maxFiles: 2 });
+    writeN(audit, 40);
+    expect(fs.existsSync(`${logPath}.1`)).toBe(true);
+    expect(fs.existsSync(`${logPath}.2`)).toBe(true);
+    // .3 must never exist — the window is bounded at maxFiles.
+    expect(fs.existsSync(`${logPath}.3`)).toBe(false);
+  });
+
+  it("continues the hash chain across a rotation boundary", () => {
+    const audit = createAuditLogger({ path: logPath, maxBytes: 150, maxFiles: 5 });
+    writeN(audit, 20);
+    // Concatenate rotated files (oldest → newest) + active, in order, and
+    // verify the chain is unbroken across the rotation seam.
+    const parts: string[] = [];
+    for (let n = 5; n >= 1; n--) {
+      if (fs.existsSync(`${logPath}.${n}`)) {
+        parts.push(fs.readFileSync(`${logPath}.${n}`, "utf8"));
+      }
+    }
+    parts.push(fs.readFileSync(logPath, "utf8"));
+    const verdict = verifyAuditLog(parts.join(""));
+    // Chain continues across rotation: no tampering, and exactly one
+    // segment (the in-process chain state is preserved across renames).
+    expect(verdict.state).toBe("ok");
+    expect(verdict.segments).toBe(1);
+  });
+
+  it("does not rotate when maxBytes is negative (disabled)", () => {
+    const audit = createAuditLogger({ path: logPath, maxBytes: -1 });
+    writeN(audit, 50);
+    expect(fs.existsSync(`${logPath}.1`)).toBe(false);
   });
 });
 

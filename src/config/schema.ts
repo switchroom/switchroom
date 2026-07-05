@@ -667,6 +667,29 @@ export const SessionContinuitySchema = z
         "can blow out the context window even with prefix caching, and " +
         "--continue replay is known-fragile at scale.",
       ),
+    session_retention_max_count: z
+      .number()
+      .int()
+      .nonnegative()
+      .optional()
+      .describe(
+        "Session-JSONL retention (issue #2792): keep at most this many " +
+        "newest session transcripts under .claude/projects; older ones " +
+        "past both this count and the age bound are pruned by the Stop " +
+        "hook. The newest sessions (and the handoff source) are always " +
+        "kept. Default 20; set 0 to disable the count bound.",
+      ),
+    session_retention_max_age_days: z
+      .number()
+      .int()
+      .nonnegative()
+      .optional()
+      .describe(
+        "Session-JSONL retention (issue #2792): prune session transcripts " +
+        "older than this many days (a file is deleted only when it is BOTH " +
+        "over the count bound and older than this). Default 30; set 0 to " +
+        "disable the age bound.",
+      ),
   })
   .optional();
 
