@@ -274,6 +274,33 @@ describe("mergeAgentConfig", () => {
     expect(result.memory?.recall?.cache_ttl_secs).toBe(30); // agent override
   });
 
+  it("deep-merges memory.disposition one level (agent overrides a single trait)", () => {
+    // Same per-key semantics as recall: overriding one disposition trait must
+    // leave the profile/defaults' other traits in place, not replace the whole
+    // object.
+    const defaults: AgentDefaults = {
+      memory: { disposition: { skepticism: 4, literalism: 4, empathy: 3 } },
+    };
+    const agent = baseAgent({
+      memory: { disposition: { empathy: 5 } },
+    });
+    const result = mergeAgentConfig(defaults, agent);
+    expect(result.memory?.disposition).toEqual({
+      skepticism: 4, // preserved from defaults
+      literalism: 4, // preserved from defaults
+      empathy: 5, // agent override
+    });
+  });
+
+  it("cascades whole memory.disposition from defaults when agent omits it", () => {
+    const defaults: AgentDefaults = {
+      memory: { disposition: { skepticism: 2, literalism: 2, empathy: 5 } },
+    };
+    const agent = baseAgent({ memory: { collection: "coach" } });
+    const result = mergeAgentConfig(defaults, agent);
+    expect(result.memory?.disposition).toEqual({ skepticism: 2, literalism: 2, empathy: 5 });
+  });
+
   it("prepends defaults.schedule to agent.schedule", () => {
     const defaults: AgentDefaults = {
       schedule: [{ cron: "0 8 * * *", prompt: "Morning check-in" }],

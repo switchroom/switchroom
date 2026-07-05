@@ -629,7 +629,7 @@ import { shouldEmitNotionMcp } from "../config/notion-workspace-acl.js";
 import { reconcileAgentDefaultSkills } from "./reconcile-default-skills.js";
 import { applyTelegramProgressGuidance } from "./sub-agent-telegram-prompt.js";
 import type { McpServerConfig } from "../memory/hindsight.js";
-import { createBank, updateBankMissions, DEFAULT_RETAIN_MISSION, isHindsightEnabled } from "../memory/hindsight.js";
+import { createBank, updateBankMissions, DEFAULT_RETAIN_MISSION, resolveBankMissionExtras, isHindsightEnabled } from "../memory/hindsight.js";
 import { loadTopicState } from "../telegram/state.js";
 import { resolveDualPath } from "../config/paths.js";
 import { resolvePath } from "../config/loader.js";
@@ -4340,8 +4340,23 @@ export function scaffoldAgent(
       const userRetainMission = agentConfig.memory?.retain_mission;
       const seededRetainMission = userRetainMission ?? DEFAULT_RETAIN_MISSION;
 
-      const missions: { bank_mission?: string; retain_mission?: string } = {
+      // reflect_mission / observations_mission / disposition, layering the
+      // resolved config over the built-in profile defaults (Phase 2). Config
+      // wins; disposition merges per-key.
+      const extras = resolveBankMissionExtras(
+        agentConfig.memory,
+        agentConfig.extends ?? DEFAULT_PROFILE,
+      );
+
+      const missions: {
+        bank_mission?: string;
+        retain_mission?: string;
+        reflect_mission?: string;
+        observations_mission?: string;
+        disposition?: { skepticism?: number; literalism?: number; empathy?: number };
+      } = {
         retain_mission: seededRetainMission,
+        ...extras,
       };
       if (userBankMission) {
         missions.bank_mission = userBankMission;
@@ -6328,15 +6343,32 @@ export function reconcileAgent(
     bankOpsChain.then((bankReady) => {
       if (!bankReady) return;
 
-      if (agentConfig.memory?.bank_mission || agentConfig.memory?.retain_mission) {
-        const missions: { bank_mission?: string; retain_mission?: string } = {};
-        if (agentConfig.memory?.bank_mission) {
-          missions.bank_mission = agentConfig.memory.bank_mission;
-        }
-        if (agentConfig.memory?.retain_mission) {
-          missions.retain_mission = agentConfig.memory.retain_mission;
-        }
+      // Reconcile still does NOT seed the DEFAULT_RETAIN_MISSION (that stays
+      // scaffold-only, so an operator's customized retain mission is never
+      // clobbered). But it DOES push reflect_mission / observations_mission /
+      // disposition — including the built-in profile defaults — so EXISTING
+      // banks pick up Phase 2 changes on `switchroom apply`, not only fresh
+      // ones. Config wins over profile defaults; disposition merges per-key.
+      const extras = resolveBankMissionExtras(
+        agentConfig.memory,
+        agentConfig.extends ?? DEFAULT_PROFILE,
+      );
 
+      const missions: {
+        bank_mission?: string;
+        retain_mission?: string;
+        reflect_mission?: string;
+        observations_mission?: string;
+        disposition?: { skepticism?: number; literalism?: number; empathy?: number };
+      } = { ...extras };
+      if (agentConfig.memory?.bank_mission) {
+        missions.bank_mission = agentConfig.memory.bank_mission;
+      }
+      if (agentConfig.memory?.retain_mission) {
+        missions.retain_mission = agentConfig.memory.retain_mission;
+      }
+
+      if (Object.keys(missions).length > 0) {
         updateBankMissions(apiUrl, hindsightBankId, missions, { timeoutMs: 5000 })
           .then((result) => {
             if (result.ok) {

@@ -333,11 +333,66 @@ export const AgentMemorySchema = z
     bank_mission: z
       .string()
       .optional()
-      .describe("Bank-level mission statement used during recall to contextualize results"),
+      .describe(
+        "Bank-level mission statement used during recall to contextualize " +
+        "results. NOTE: this is an alias for the Hindsight engine's " +
+        "`reflect_mission` field (verified live: switchroom's bank_mission " +
+        "lands in `config.reflect_mission`). Prefer `reflect_mission` going " +
+        "forward; `bank_mission` is retained for back-compat. If both are " +
+        "set, `reflect_mission` wins. Cascade: override."
+      ),
+    reflect_mission: z
+      .string()
+      .optional()
+      .describe(
+        "Mission/context steering Hindsight Reflect operations (the bank's " +
+        "'who am I / what matters' framing applied during recall). The " +
+        "engine-accurate name for what `bank_mission` sets. Cascade: override."
+      ),
     retain_mission: z
       .string()
       .optional()
-      .describe("Instructions for the fact extraction LLM during retain"),
+      .describe("Instructions for the fact extraction LLM during retain. Cascade: override."),
+    observations_mission: z
+      .string()
+      .optional()
+      .describe(
+        "Steers what the observation-consolidation LLM synthesises from raw " +
+        "facts (the higher-order 'what patterns matter' lens). Cascade: override."
+      ),
+    disposition: z
+      .object({
+        skepticism: z
+          .number()
+          .int()
+          .min(1)
+          .max(5)
+          .optional()
+          .describe("How much the bank doubts unverified claims (1-5; engine default 3)."),
+        literalism: z
+          .number()
+          .int()
+          .min(1)
+          .max(5)
+          .optional()
+          .describe("How literally the bank reads statements vs inferring intent (1-5; engine default 3)."),
+        empathy: z
+          .number()
+          .int()
+          .min(1)
+          .max(5)
+          .optional()
+          .describe("How much the bank weights emotional/relational context (1-5; engine default 3)."),
+      })
+      .optional()
+      .describe(
+        "Personality traits (1-5 each) steering how this bank frames recall, " +
+        "reflect, and observation synthesis — a coach leans empathy-high, a " +
+        "lawyer/analyst leans skepticism/literalism-high. Maps to the engine's " +
+        "flat `disposition_skepticism`/`_literalism`/`_empathy` fields. " +
+        "Cascade: per-key merge (an agent overrides individual traits and " +
+        "inherits the rest, matching `recall`)."
+      ),
     recall: z
       .object({
         max_memories: z
