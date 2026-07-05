@@ -37,6 +37,7 @@ function makeTurn(overrides: Partial<Turn> = {}): Turn {
     assistant_reply_preview: null,
     tool_call_count: null,
     interrupt_reason: null,
+    resumed_at: null,
     created_at: 1_000_000,
     updated_at: 1_000_000,
     ...overrides,
