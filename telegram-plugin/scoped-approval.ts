@@ -214,6 +214,65 @@ export function sweepScopedGrants(store: ScopedGrantStore, now: number): void {
   }
 }
 
+/** Total number of live-or-not grant entries across all agents. Cheap change
+ *  signal for "did a sweep remove anything?" (sweeps only ever remove). */
+export function countScopedGrants(store: ScopedGrantStore): number {
+  let n = 0;
+  for (const list of store.values()) n += list.length;
+  return n;
+}
+
+/**
+ * A single grant flattened for on-disk persistence. Carries the agent it
+ * belongs to (the store is keyed by agent), the narrow rule/signature, and
+ * the ABSOLUTE wall-clock expiry — never a relative TTL, so a reload can
+ * never extend a window (the restart-doesn't-extend invariant). No grant
+ * time is stored because nothing needs it: expiry is the only gate.
+ */
+export interface SerializedScopedGrant {
+  readonly agent: string;
+  readonly rule: string;
+  readonly expiresAt: number;
+}
+
+/** Flatten the per-agent store to a plain array for JSON persistence. */
+export function serializeScopedGrants(store: ScopedGrantStore): SerializedScopedGrant[] {
+  const out: SerializedScopedGrant[] = [];
+  for (const [agent, list] of store) {
+    for (const g of list) out.push({ agent, rule: g.rule, expiresAt: g.expiresAt });
+  }
+  return out;
+}
+
+/**
+ * Rebuild the store from persisted entries at gateway boot. Entries already
+ * at/past `now` are DROPPED (expiry is absolute — a restart never revives or
+ * extends a window). Malformed rows are skipped defensively (fail-closed:
+ * an unparseable grant simply doesn't exist → the action re-cards). A
+ * duplicate rule for one agent collapses to the latest expiry, mirroring
+ * `recordScopedGrant`'s replace-not-accumulate behaviour.
+ */
+export function deserializeScopedGrants(
+  data: readonly unknown[],
+  now: number,
+): ScopedGrantStore {
+  const store: ScopedGrantStore = new Map();
+  if (!Array.isArray(data)) return store;
+  for (const raw of data) {
+    if (!raw || typeof raw !== "object") continue;
+    const entry = raw as Partial<SerializedScopedGrant>;
+    if (typeof entry.agent !== "string" || entry.agent.length === 0) continue;
+    if (typeof entry.rule !== "string" || entry.rule.length === 0) continue;
+    if (typeof entry.expiresAt !== "number" || !Number.isFinite(entry.expiresAt)) continue;
+    if (entry.expiresAt <= now) continue; // absolute expiry already elapsed → drop
+    const list = store.get(entry.agent) ?? [];
+    const others = list.filter((g) => g.rule !== entry.rule);
+    others.push({ rule: entry.rule, expiresAt: entry.expiresAt });
+    store.set(entry.agent, others);
+  }
+  return store;
+}
+
 /**
  * Heuristic destructive/irreversible-command detector. FAIL-CLOSED: when
  * a command can't be read or looks risky, return `true` so it is never

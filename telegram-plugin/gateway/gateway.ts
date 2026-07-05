@@ -563,7 +563,9 @@ import {
   recordScopedGrant,
   lookupScopedGrant,
   sweepScopedGrants,
+  countScopedGrants,
 } from '../scoped-approval.js'
+import { createScopedGrantStore } from './scoped-grant-store.js'
 import { grantRestartDecision, type GrantRestartDecision } from './grant-restart.js'
 import { synthesizeAllowRuleDiff, extractAddedAllowRule } from '../permission-diff.js'
 import {
@@ -4630,7 +4632,16 @@ function sweepStaleAlwaysAllowCorrelations(now = Date.now()): void {
 // bridge's untimed sessionAllowRules), fixed-window, fail-closed. Keyed by
 // agent name for per-agent isolation. All policy lives in
 // ../scoped-approval.ts (pure + unit-tested); this gateway only wires it.
-const scopedGrants: ScopedGrantStore = new Map()
+//
+// Persisted across gateway restarts (#2863): a bounce (fleet roll / config
+// apply / failover probe) used to wipe every window, re-carding an action the
+// operator allowed minutes ago. The store mirrors to a tiny STATE_DIR JSON
+// file; reload drops entries already past their ABSOLUTE expiry (a restart
+// never extends a window). Kill switch SWITCHROOM_SCOPED_GRANT_PERSIST=0 boots
+// empty and never writes. Fail-closed lookup semantics are unchanged — a
+// reloaded grant runs the same lookupScopedGrant gate as an in-memory one.
+const scopedGrantStore = createScopedGrantStore(STATE_DIR)
+const scopedGrants: ScopedGrantStore = scopedGrantStore.load(Date.now())
 const selfAgentName = (): string => process.env.SWITCHROOM_AGENT_NAME ?? ''
 
 // `ask_user` MCP tool — open prompts awaiting a user button-tap.
@@ -5268,8 +5279,14 @@ const pendingStateReaper = setInterval(() => {
     if (now > v.expiresAt) vaultPassphraseCache.delete(k)
   }
   // Drop expired "⏱ 30 min" scoped grants. (Lookup already fails closed on
-  // expiry; this just keeps the map from accumulating dead entries.)
+  // expiry; this just keeps the map from accumulating dead entries.) Persist
+  // the removal so a restart between sweeps can't resurrect a swept grant —
+  // only write when the sweep actually changed something (sweeps only remove).
+  const scopedGrantsBefore = countScopedGrants(scopedGrants)
   sweepScopedGrants(scopedGrants, now)
+  if (countScopedGrants(scopedGrants) !== scopedGrantsBefore) {
+    scopedGrantStore.save(scopedGrants)
+  }
   for (const [k, v] of deferredSecrets) {
     if (now - v.staged_at > DEFERRED_SECRET_TTL_MS) deferredSecrets.delete(k)
   }
@@ -23319,6 +23336,9 @@ bot.on('callback_query:data', async ctx => {
   permCardStore.remove(request_id)
   if (timeBox && grantAgent) {
     recordScopedGrant(scopedGrants, grantAgent, timeBox.rule, Date.now(), scopedTtl)
+    // Write-through so the window survives a gateway restart (#2863). Absolute
+    // expiry is baked into the entry, so a reload can't extend it.
+    scopedGrantStore.save(scopedGrants)
     process.stderr.write(
       `telegram gateway: scoped-approval granted via Allow rule="${timeBox.rule}" ` +
       `agent=${grantAgent} ttl_ms=${scopedTtl} (request_id=${request_id})\n`,
