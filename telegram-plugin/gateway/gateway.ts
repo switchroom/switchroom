@@ -6884,11 +6884,18 @@ const pendingInboundBuffer = createPendingInboundBuffer({
     if (last != null && nowMs - last < EVICT_NOTICE_COOLDOWN_MS) return
     evictNoticeByChat.set(key, nowMs)
     const threadOpts = evThread != null ? { message_thread_id: evThread } : {}
+    // Honesty: the evicted message is NOT re-pushed into the buffer
+    // in-session — its only in-session resolution is the escalation sweep
+    // (sweepEscalations, ~15 min), which either delivers it or posts the
+    // "couldn't deliver … please resend" retraction. So this notice must
+    // NOT promise a prompt pickup ("shortly"), or it would contradict a
+    // later escalation. Word it to match that reality: saved, handled when
+    // the current turn frees up, and prompted-to-resend if it can't be.
     void swallowingApiCall(
       () =>
         bot.api.sendMessage(
           chat,
-          "⏳ Messages are arriving faster than I can process them, so some are being deferred — they're saved and will be picked up shortly. If anything seems missed, please resend it.",
+          "⏳ Messages are arriving faster than I can process them. Your messages are saved and will be handled once I finish the current turn — if any can't be picked up, I'll ask you to resend it.",
           { ...threadOpts },
         ),
       { chat_id: chat, verb: 'inbound-buffer-eviction' },
