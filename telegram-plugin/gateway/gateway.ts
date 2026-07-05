@@ -616,6 +616,7 @@ import {
   findLatestTurnIfInterrupted,
   findRecentTurnsForChat,
   getTurnByKey,
+  markTurnResumed,
 } from '../registry/turns-schema.js'
 import {
   buildResumeInterruptedInbound,
@@ -6943,6 +6944,25 @@ if (bootResumeInbound != null) {
     inboundSpool.put(bootResumeInbound.agent, bootResumeInbound.msg)
   } else {
     pendingInboundBuffer.push(bootResumeInbound.agent, bootResumeInbound.msg)
+  }
+  // At-most-once resume (#2793 part A): now that the resume inbound is
+  // DURABLY committed (spooled, or buffered in STATIC mode), stamp the
+  // turn's `resumed_at` so a later restart can't re-mint a fresh resume for
+  // the same turn and re-run side effects that already executed. This is
+  // synchronous and runs before any async delivery/ack can interleave, so
+  // the ledger is set before the spool entry can be consumed — closing the
+  // accept-vs-consume double-execution window. Stamping AFTER the durable
+  // put (never before) means a crash in between leaves the turn un-stamped
+  // and the resume is retried, not silently dropped.
+  const resumeTurnKey = bootResumeInbound.msg.meta?.resume_turn_key
+  if (turnsDb != null && typeof resumeTurnKey === 'string' && resumeTurnKey.length > 0) {
+    try {
+      markTurnResumed(turnsDb, resumeTurnKey)
+    } catch (err) {
+      process.stderr.write(
+        `telegram gateway: markTurnResumed failed turnKey=${resumeTurnKey}: ${(err as Error).message}\n`,
+      )
+    }
   }
 }
 // Boot-replay: re-queue every un-acked spooled inbound into the

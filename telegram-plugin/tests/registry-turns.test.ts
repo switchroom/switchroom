@@ -19,6 +19,8 @@ import {
   findOrphanedTurns,
   markOrphanedWithTimeoutClassification,
   findLatestTurnIfInterrupted,
+  markTurnResumed,
+  getTurnByKey,
 } from '../registry/turns-schema.js'
 
 // Convenience: the boot reaper with no live hang marker — every open turn
@@ -504,6 +506,71 @@ describe('findLatestTurnIfInterrupted', () => {
     recordTurnEnd(db, { turnKey: 'ddd:1', endedVia: 'sigterm' })
     recordTurnEnd(db, { turnKey: 'ddd:2', endedVia: 'stop' })
     expect(findLatestTurnIfInterrupted(db)).toBeNull()
+    db.close()
+  })
+
+  // ── #2793 part A: resume is at-most-once via the `resumed_at` ledger ──
+  // Repro: without the ledger, an interrupted turn whose resume ran its
+  // side effects but never reached a clean 'stop' (process died before the
+  // follow-up turn wrote ended_at, or the resume inbound was accepted but
+  // never consumed) stays "latest + not clean" — so every subsequent boot
+  // re-mints a fresh resume and DOUBLE-EXECUTES. The ledger makes it null
+  // after the first commit.
+  it('re-fires an interrupted turn until it is stamped resumed (double-exec repro)', () => {
+    const db = openTurnsDbInMemory()
+    recordTurnStart(db, { turnKey: 'res:1', chatId: 'res' })
+    recordTurnEnd(db, { turnKey: 'res:1', endedVia: 'restart' })
+    // Boot 1: the turn is interrupted and still unresumed → it is returned
+    // (the gateway will mint a resume for it).
+    const first = findLatestTurnIfInterrupted(db)
+    expect(first).not.toBeNull()
+    expect(first!.turn_key).toBe('res:1')
+    expect(first!.resumed_at).toBeNull()
+    // Gateway durably queues the resume, then stamps the ledger.
+    markTurnResumed(db, 'res:1', 1_700_000_000_000)
+    // Boot 2 (crash happened after side effects, turn still 'restart' with
+    // no clean follow-up): the SAME turn must NOT be resumed again.
+    expect(findLatestTurnIfInterrupted(db)).toBeNull()
+    db.close()
+  })
+
+  it('does not re-fire even an OPEN (ended_at IS NULL) turn once resumed', () => {
+    const db = openTurnsDbInMemory()
+    recordTurnStart(db, { turnKey: 'res:2', chatId: 'res' })
+    // Still open (never reaped to a terminal ended_via), but already resumed
+    // once — the accept-but-never-consumed window. Must not re-fire.
+    markTurnResumed(db, 'res:2')
+    expect(findLatestTurnIfInterrupted(db)).toBeNull()
+    db.close()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// markTurnResumed — the at-most-once resume ledger (#2793 part A)
+// ---------------------------------------------------------------------------
+
+describe('markTurnResumed', () => {
+  it('stamps resumed_at on the target turn', () => {
+    const db = openTurnsDbInMemory()
+    recordTurnStart(db, { turnKey: 'mk:1', chatId: 'mk' })
+    recordTurnEnd(db, { turnKey: 'mk:1', endedVia: 'restart' })
+    markTurnResumed(db, 'mk:1', 1_700_000_000_000)
+    expect(getTurnByKey(db, 'mk:1')!.resumed_at).toBe(1_700_000_000_000)
+    db.close()
+  })
+
+  it('is first-write-wins: a second stamp does not overwrite the first', () => {
+    const db = openTurnsDbInMemory()
+    recordTurnStart(db, { turnKey: 'mk:2', chatId: 'mk' })
+    markTurnResumed(db, 'mk:2', 1_700_000_000_000)
+    markTurnResumed(db, 'mk:2', 1_800_000_000_000)
+    expect(getTurnByKey(db, 'mk:2')!.resumed_at).toBe(1_700_000_000_000)
+    db.close()
+  })
+
+  it('no-ops for an unknown turn_key', () => {
+    const db = openTurnsDbInMemory()
+    expect(() => markTurnResumed(db, 'nope:1')).not.toThrow()
     db.close()
   })
 })
