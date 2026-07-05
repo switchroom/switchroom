@@ -37,9 +37,13 @@ permissions:
   # :buildcache cache-from). Build-only — nothing is pushed.
   packages: read
 
+# workflow_dispatch runs get their own concurrency group (keyed by
+# run id) so scheduled runs on the same ref can't cancel a manually
+# requested one — dispatch is the manual re-trigger lever, so it must
+# not be cancellable (same pattern as docker-images.yml, #1336).
 concurrency:
-  group: ci-full-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-full-${{ github.event_name == 'workflow_dispatch' && format('dispatch-{0}', github.run_id) || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 env:
   REGISTRY: ghcr.io

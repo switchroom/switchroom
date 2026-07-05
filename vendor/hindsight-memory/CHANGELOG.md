@@ -16,6 +16,10 @@
   rewrite: filters compose with sender-bank routing (per-bank overrides
   apply to sender banks too) and are part of the recall cache key
   (`_tag_filter_sig`) so a filter change can't serve stale cached results.
+  Note: because the key now joins an extra part (empty string when filters
+  are unused), every cache key rotates ONCE across this upgrade boundary —
+  the first recall per session after upgrading is a cache miss. Within a
+  version, keys are unchanged as long as filters stay unused.
 - `55ef70679` — optional `requestTimeoutSeconds` /
   `HINDSIGHT_REQUEST_TIMEOUT_SECONDS` global request-timeout override in
   `HindsightClient` (adapted to our `_request`). Wired into retain.py only;

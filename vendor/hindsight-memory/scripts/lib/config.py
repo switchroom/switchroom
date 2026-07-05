@@ -151,16 +151,21 @@ def _cast_env(value: str, typ):
         if typ is float:
             return float(value)
         if typ is list:
-            # JSON list first (upstream 962140eef), else fall through to the
-            # comma-separated fallback in the except branch below.
+            # JSON list first (upstream 962140eef). A value that parses as
+            # JSON but is NOT a list (e.g. `42`, `"x"`, `{}`) is a config
+            # mistake, not a comma-separated string — return None so the
+            # default is kept (matches upstream; fail-open). Only values
+            # that don't parse as JSON at all take the comma-split path.
             try:
                 parsed = json.loads(value)
-                if isinstance(parsed, list):
-                    return parsed
             except ValueError:
-                pass
-            # Comma-separated → list of trimmed, non-empty strings.
-            return [t.strip() for t in value.split(",") if t.strip()]
+                if value.lstrip().startswith(("[", "{")):
+                    # Looks like intended JSON but doesn't parse —
+                    # malformed config, not a comma list. Keep default.
+                    return None
+                # Comma-separated → list of trimmed, non-empty strings.
+                return [t.strip() for t in value.split(",") if t.strip()]
+            return parsed if isinstance(parsed, list) else None
         if typ is dict:
             # JSON only (dict or list accepted — tag_groups may be a list).
             parsed = json.loads(value)

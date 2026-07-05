@@ -41,9 +41,14 @@ on:
 permissions:
   contents: read
 
+# workflow_dispatch runs get their own concurrency group (keyed by
+# run id) so pushes to the same ref can't cancel a manually requested
+# recovery run — dispatch is the recovery lever advertised above, so
+# it must not be cancellable by the very traffic it recovers from
+# (same pattern as docker-images.yml, #1336).
 concurrency:
-  group: docker-e2e-${{ github.ref }}
-  cancel-in-progress: true
+  group: docker-e2e-${{ github.event_name == 'workflow_dispatch' && format('dispatch-{0}', github.run_id) || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
   # ─── Path-change filter (skip-as-pass pattern, #1320 followup) ────
