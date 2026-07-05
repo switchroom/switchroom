@@ -69,6 +69,50 @@ def read_transcript(transcript_path: str) -> list:
     return messages
 
 
+def select_retain_window(
+    retain_mode: str,
+    retain_every_n: int,
+    overlap_turns: int,
+    all_messages: list,
+) -> tuple:
+    """Decide which messages to retain and whether to send as a full window.
+
+    Returns ``(messages_to_retain, retain_full_window)``.
+
+    SWITCHROOM DIVERGENCE (Phase 6b — candidate to upstream to
+    vectorize-io/hindsight): the chunked sliding-window is decoupled from
+    the ``retainEveryNTurns > 1`` throttle. Upstream only sliced a window
+    when ``retain_every_n > 1``; with ``retainEveryNTurns=1`` (switchroom's
+    every-turn crash-durability setting, applied in scaffold.ts) chunked
+    mode fell through to full-session and re-consolidated the ENTIRE
+    accumulated transcript on every Stop fire — an unbounded, per-turn cost.
+
+    Decoupling is safe because window selection and the throttle answer two
+    independent questions: the throttle decides *whether* to fire this turn
+    (still owned by run_retain, unchanged); this function only decides *what*
+    to retain once a fire happens. A chunked window of
+    ``max(retain_every_n, 1) + overlap_turns`` turns is correct for any
+    ``retain_every_n >= 1``. With ``retain_every_n=1, overlap=2`` the window
+    is the 3 most-recent turns.
+
+    Durability invariant (jtbd-memory-survives-restart UAT): the window
+    always extends to the END of the transcript (``slice_last_turns_by_user_boundary``
+    returns ``messages[start:]``), so the turn that just completed — the one
+    whose Stop hook is firing — is ALWAYS included. Every turn fires (no
+    throttle at n=1), so every turn's content is retained on its own fire.
+    No fact can fall outside every window.
+    """
+    if retain_mode == "chunked":
+        # Sliding window: N turns + configured overlap. max(retain_every_n, 1)
+        # keeps the window valid at n=1 (the decoupling); for n>1 this equals
+        # the previous `retain_every_n + overlap_turns` (behaviour unchanged).
+        window_turns = max(retain_every_n, 1) + overlap_turns
+        messages_to_retain = slice_last_turns_by_user_boundary(all_messages, window_turns)
+        return messages_to_retain, True
+    # Full session mode: retain all messages, always as a full window.
+    return list(all_messages), True
+
+
 def run_retain(hook_input: dict, force: bool = False) -> dict:
     """Run the auto-retain flow.
 
@@ -104,7 +148,8 @@ def run_retain(hook_input: dict, force: bool = False) -> dict:
 
     debug_log(config, f"Read {len(all_messages)} messages from transcript")
 
-    # Retention mode: full session (default) or chunked (legacy)
+    # Retention mode: full session (vendor default) or chunked. Switchroom
+    # runs chunked at retainEveryNTurns=1 (see select_retain_window / scaffold.ts).
     retain_mode = config.get("retainMode", "full-session")
     retain_every_n = max(1, config.get("retainEveryNTurns", 1))
     retain_full_window = False
@@ -118,19 +163,20 @@ def run_retain(hook_input: dict, force: bool = False) -> dict:
             debug_log(config, f"Turn {turn_count}/{retain_every_n}, skipping retain (next at turn {next_at})")
             return {"status": "skipped", "reason": "throttled"}
 
-    if retain_mode == "chunked" and retain_every_n > 1:
-        # Sliding window: N turns + configured overlap
-        overlap_turns = config.get("retainOverlapTurns", 0)
-        window_turns = retain_every_n + overlap_turns
-        messages_to_retain = slice_last_turns_by_user_boundary(all_messages, window_turns)
-        retain_full_window = True
+    # Window selection is decoupled from the throttle above — see
+    # select_retain_window() for the switchroom-divergence rationale
+    # (Phase 6b: chunked window-slicing now works at retainEveryNTurns=1).
+    overlap_turns = config.get("retainOverlapTurns", 0)
+    messages_to_retain, retain_full_window = select_retain_window(
+        retain_mode, retain_every_n, overlap_turns, all_messages
+    )
+    if retain_mode == "chunked":
+        window_turns = max(retain_every_n, 1) + overlap_turns
         debug_log(
             config,
             f"Chunked retain firing (window: {window_turns} turns, {len(messages_to_retain)} messages)",
         )
     else:
-        # Full session mode: retain all messages, always as full window
-        retain_full_window = True
         debug_log(config, f"Full session retain: {len(all_messages)} messages")
 
     # Format transcript

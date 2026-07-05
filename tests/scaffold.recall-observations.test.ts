@@ -57,6 +57,15 @@ describe("hindsight recall overrides — observations + trivial-skip", () => {
     expect(s.recallSkipTrivial).toBe(true);
   });
 
+  it("Phase 6b: retainMode is chunked (windowed retain), retainEveryNTurns stays 1", () => {
+    const s = settingsAfterInstall();
+    // Chunked + every-turn: keep crash durability (retain every turn), but
+    // slice a recent window per fire instead of re-consolidating the whole
+    // transcript. Depends on the paired vendor retain.py divergence.
+    expect(s.retainMode).toBe("chunked");
+    expect(s.retainEveryNTurns).toBe(1);
+  });
+
   it("regression: the pre-existing memory overrides still apply", () => {
     const s = settingsAfterInstall();
     expect(s.retainEveryNTurns).toBe(1);

@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Changed (switchroom divergence)
+
+- **retain.py: decouple chunked window-slicing from the `retainEveryNTurns > 1`
+  throttle** (switchroom Phase 6b). Previously the chunked sliding-window only
+  applied when `retainEveryNTurns > 1`; with `retainEveryNTurns=1` (switchroom
+  sets this in `scaffold.ts` for every-turn crash durability) chunked mode fell
+  through to full-session and re-consolidated the entire accumulated transcript
+  on every Stop fire. Window selection is now extracted into a pure
+  `select_retain_window()` helper and slices a window of
+  `max(retainEveryNTurns, 1) + retainOverlapTurns` turns whenever
+  `retainMode == "chunked"`, independent of the throttle. The throttle-skip
+  logic (`retain_every_n > 1` firing cadence) is unchanged, so `> 1` behaviour
+  and the full-session default are equivalent. This is a deliberate switchroom
+  divergence from pristine vendor and is a **candidate to upstream to
+  vectorize-io/hindsight** — decoupling *what* to retain from *whether* to fire
+  this turn is a general improvement, not switchroom-specific.
+
 ### Ported from upstream (vectorize-io/hindsight, `hindsight-integrations/claude-code/`)
 
 - `c5a61db2b` — raise `_check_health` default timeout 2s→10s in
