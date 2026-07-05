@@ -2648,8 +2648,8 @@ describe("hostd self-bump (#2645)", () => {
       prior_hostd_version: "0.16.0",
     });
 
-    // Helper spawned detached with the target image + host-path mounts;
-    // target image existence probed first.
+    // Helper spawned detached with host-path mounts; target image
+    // existence probed first.
     const dockerCalls = readFileSync(dockerRec, "utf8");
     expect(dockerCalls).toContain(
       "manifest inspect ghcr.io/switchroom/switchroom-hostd:v0.16.5",
@@ -2657,6 +2657,14 @@ describe("hostd self-bump (#2645)", () => {
     expect(dockerCalls).toContain("run -d --rm --name switchroom-hostd-selfbump");
     expect(dockerCalls).toContain(
       "-v /host/op/.switchroom/hostd:/host/op/.switchroom/hostd",
+    );
+    // The helper runs from the OLD (guaranteed-local) image so `run -d`
+    // returns fast; the target is only fetched by its `compose pull`.
+    const runLine = dockerCalls
+      .split("\n")
+      .find((l) => l.includes("run -d --rm"))!;
+    expect(runLine).toContain(
+      "/bin/sh ghcr.io/switchroom/switchroom-hostd:v0.16.0 -c",
     );
     // The rollout CLI child was NOT spawned — the roll resumes post-recreate.
     expect(existsSync(cliRec)).toBe(false);
@@ -2752,6 +2760,60 @@ describe("hostd self-bump (#2645)", () => {
     const retry = await hostdRequest(
       { socketPath: sock },
       { v: 1, op: "rollout", request_id: "ro-sb-3b", args: { pin: "v0.16.5" } },
+    );
+    expect(retry.error ?? "").not.toContain("fleet-mutation lock");
+  });
+
+  it("watcher rolls the bump back when the HELPER (pull/up) fails after spawning", async () => {
+    // The helper spawns fine but its pull/compose script fails — the
+    // container exits nonzero (the script PROPAGATES the failure; a
+    // trailing bare echo would mask it as 0), `docker wait` reports it,
+    // and the still-alive old hostd restores the compose, deletes the
+    // marker, releases the lock and writes a loud terminal row instead of
+    // leaving the caller polling a perpetual `started`.
+    writeFileSync(composePath(), composeSeed);
+    const dockerRec = join(tmp, "selfbump-docker-3w.txt");
+    await server.stop();
+    server = new HostdServer({
+      homeDir: tmp,
+      agentUids: { klanker: 10001 },
+      config: { agents: { klanker: { admin: true } } },
+      switchroomBin: stubBin,
+      dockerBin: writeDockerStub({ rec: dockerRec, waitCode: 1 }),
+      auditLogPath: join(tmp, "audit-selfbump-3w.log"),
+      allowNonLinux: true,
+      selfVersion: "0.16.0",
+      hostHomeDir: "/host/op",
+    });
+    await server.start();
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+
+    const resp = await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "rollout", request_id: "ro-sb-3w", args: { pin: "v0.16.5" } },
+    );
+    // The spawn itself succeeded, so the caller still gets `started`…
+    expect(resp.result).toBe("started");
+    await new Promise((r) => setTimeout(r, 400));
+
+    // …but the watcher then observed the failure and rolled everything back.
+    expect(readFileSync(composePath(), "utf8")).toContain("v0.16.0");
+    expect(readFileSync(composePath(), "utf8")).not.toContain("v0.16.5");
+    expect(existsSync(markerPath())).toBe(false);
+    const rows = readFileSync(join(tmp, "audit-selfbump-3w.log"), "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    const terminal = rows.find(
+      (r) => r.request_id === "ro-sb-3w" && r.phase === "terminal",
+    );
+    expect(terminal).toBeDefined();
+    expect(terminal!.result).toBe("error");
+    expect(String(terminal!.error)).toContain("helper failed");
+    // Lock released — a follow-up roll isn't lock-denied.
+    const retry = await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "rollout", request_id: "ro-sb-3wb", args: { pin: "v0.16.5" } },
     );
     expect(retry.error ?? "").not.toContain("fleet-mutation lock");
   });

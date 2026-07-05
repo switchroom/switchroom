@@ -145,7 +145,8 @@ describe("pending-rollout marker", () => {
 describe("selfBumpHelperArgs", () => {
   const args = selfBumpHelperArgs({
     hostdDirHostPath: "/home/op/.switchroom/hostd",
-    image: "ghcr.io/switchroom/switchroom-hostd:v0.17.0",
+    helperImage: "ghcr.io/switchroom/switchroom-hostd:v0.16.49",
+    targetImage: "ghcr.io/switchroom/switchroom-hostd:v0.17.0",
   });
 
   it("is a detached, self-removing, labeled sibling", () => {
@@ -162,18 +163,41 @@ describe("selfBumpHelperArgs", () => {
     ]);
   });
 
-  it("pulls then ups the hostd compose project from the target image", () => {
+  it("runs the helper on the OLD (local) image, never the target", () => {
+    // The target image would make `docker run -d` pull multi-GB
+    // synchronously and blow the caller's wire timeout; the old image is
+    // pinned local by the running container. The target is only fetched
+    // by the script's own `compose pull`.
+    // argv tail is [..., "--entrypoint", "/bin/sh", <image>, "-c", <script>]
+    expect(args[args.length - 3]).toBe(
+      "ghcr.io/switchroom/switchroom-hostd:v0.16.49",
+    );
+    // The target ref appears only inside the script (log line), never as
+    // the `docker run` image argument.
+    expect(args.slice(0, -1)).not.toContain(
+      "ghcr.io/switchroom/switchroom-hostd:v0.17.0",
+    );
+  });
+
+  it("pulls then ups the hostd compose project", () => {
     const script = args[args.length - 1]!;
-    expect(args).toContain("ghcr.io/switchroom/switchroom-hostd:v0.17.0");
     expect(script).toContain(
-      "docker compose -p switchroom-hostd -f /home/op/.switchroom/hostd/docker-compose.yml pull",
+      'docker compose -p switchroom-hostd -f "/home/op/.switchroom/hostd/docker-compose.yml" pull',
     );
     expect(script).toContain(
-      "docker compose -p switchroom-hostd -f /home/op/.switchroom/hostd/docker-compose.yml up -d",
+      'docker compose -p switchroom-hostd -f "/home/op/.switchroom/hostd/docker-compose.yml" up -d',
     );
     // pull failure must short-circuit the up (old hostd keeps serving).
-    expect(script).toContain("pull >> ");
     expect(script.indexOf("pull")).toBeLessThan(script.indexOf("up -d"));
     expect(script).toContain("&&");
+  });
+
+  it("PROPAGATES the pull/up exit status as the container exit code", () => {
+    // A trailing bare `echo` would mask every failure as exit 0, making
+    // the daemon's docker-wait watcher blind and leaving the
+    // fleet-mutation lock held forever on a failed bump.
+    const script = args[args.length - 1]!;
+    expect(script).toContain("rc=$?");
+    expect(script.trimEnd().endsWith("exit $rc")).toBe(true);
   });
 });

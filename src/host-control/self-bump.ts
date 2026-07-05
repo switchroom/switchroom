@@ -218,23 +218,39 @@ export function isMarkerFresh(
  * time to flush the `started` response to the caller before the recreate
  * SIGTERMs it.
  *
- * The helper runs the TARGET hostd image: it is already the image being
- * pulled, and it carries the docker CLI + compose plugin the script needs.
+ * The helper runs the CURRENTLY-RUNNING (old) hostd image, NOT the target:
+ * the old image is guaranteed local (the running container pins it), so
+ * `docker run -d` returns in well under a second — running the TARGET
+ * image here would make `run -d` synchronously pull a multi-GB image and
+ * blow the caller's wire timeout before the `started` response ever lands.
+ * The target image is fetched by the script's own `compose pull`, async to
+ * the response. The old image carries the same docker CLI + compose plugin
+ * the script needs.
+ *
+ * The script PROPAGATES the pull/up exit status as the container's exit
+ * code — the daemon's `docker wait` watcher keys on it to detect a failed
+ * bump while the old hostd is still alive (a trailing bare `echo` would
+ * mask every failure as exit 0 and leave the fleet-mutation lock held
+ * forever).
  */
 export function selfBumpHelperArgs(opts: {
   /** HOST path of `~/.switchroom/hostd` (compose file + log live here). */
   hostdDirHostPath: string;
-  /** Target hostd image ref (registry/owner preserved from the compose). */
-  image: string;
+  /** Image to RUN the helper from — the currently-running (old) hostd
+   *  image ref, guaranteed local. */
+  helperImage: string;
+  /** Target image ref, for the log line only (the bumped compose file is
+   *  what actually names it to `compose pull`). */
+  targetImage: string;
 }): string[] {
   const composePath = `${opts.hostdDirHostPath}/docker-compose.yml`;
   const logPath = `${opts.hostdDirHostPath}/${SELF_BUMP_LOG_FILENAME}`;
   const script =
     `sleep 2; ` +
-    `echo \"selfbump $(date -u) → ${opts.image}\" >> ${logPath} 2>&1; ` +
-    `docker compose -p switchroom-hostd -f ${composePath} pull >> ${logPath} 2>&1 && ` +
-    `docker compose -p switchroom-hostd -f ${composePath} up -d >> ${logPath} 2>&1; ` +
-    `echo \"selfbump done rc=$?\" >> ${logPath} 2>&1`;
+    `echo \"selfbump $(date -u) -> ${opts.targetImage}\" >> \"${logPath}\" 2>&1; ` +
+    `docker compose -p switchroom-hostd -f \"${composePath}\" pull >> \"${logPath}\" 2>&1 && ` +
+    `docker compose -p switchroom-hostd -f \"${composePath}\" up -d >> \"${logPath}\" 2>&1; ` +
+    `rc=$?; echo \"selfbump done rc=$rc\" >> \"${logPath}\" 2>&1; exit $rc`;
   return [
     "run",
     "-d",
@@ -249,7 +265,7 @@ export function selfBumpHelperArgs(opts: {
     `${opts.hostdDirHostPath}:${opts.hostdDirHostPath}`,
     "--entrypoint",
     "/bin/sh",
-    opts.image,
+    opts.helperImage,
     "-c",
     script,
   ];

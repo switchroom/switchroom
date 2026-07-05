@@ -1689,6 +1689,18 @@ export class HostdServer {
 
     const ts = new Date().toISOString().replace(/[:.]/g, "-");
     const bakPath = `${composePath}.bak-selfbump-${ts}`;
+    // Prune old self-bump backups (keep the newest few) — one accrues per
+    // release rolled, and the hostd dir already drowned in compose baks once.
+    try {
+      const baks = readdirSync(this.hostdDirPath())
+        .filter((f) => f.startsWith("docker-compose.yml.bak-selfbump-"))
+        .sort();
+      for (const f of baks.slice(0, Math.max(0, baks.length - 4))) {
+        unlinkSync(join(this.hostdDirPath(), f));
+      }
+    } catch {
+      // best-effort housekeeping
+    }
     const markerPath = join(this.hostdDirPath(), SELF_BUMP_MARKER_FILENAME);
     const marker: PendingRolloutMarker = {
       v: 1,
@@ -1749,7 +1761,14 @@ export class HostdServer {
     const helper = await this.runDocker(
       selfBumpHelperArgs({
         hostdDirHostPath: this.hostdDirHostPath(),
-        image: bumped.newImageRef,
+        // Run the helper on the OLD (currently-running, guaranteed-local)
+        // image so `docker run -d` returns immediately — the target image
+        // is fetched by the helper's own `compose pull`, async to this
+        // request. Running the target here would synchronously pull a
+        // multi-GB image inside this await and blow the caller's wire
+        // timeout before the `started` response lands.
+        helperImage: bumped.oldImageRef,
+        targetImage: bumped.newImageRef,
       }),
     ).catch((e) => ({
       exit_code: -1,
@@ -1787,7 +1806,21 @@ export class HostdServer {
     void this.runDocker(["wait", SELF_BUMP_HELPER_CONTAINER])
       .then((w) => {
         const code = Number.parseInt(w.stdout.trim(), 10);
-        if (w.exit_code === 0 && code === 0) return; // recreate imminent
+        if (w.exit_code !== 0 || !Number.isFinite(code)) {
+          // `docker wait` ITSELF failed (daemon hiccup, or the container
+          // was already auto-removed after a success we raced). Do NOT
+          // roll back on ambiguity: on a successful bump this container
+          // is about to be recreated, and a spurious compose restore
+          // would drift the on-disk tag below the running version. The
+          // marker staleness cutoff + the still-stale resume check are
+          // the backstop for a genuinely failed bump we couldn't observe.
+          process.stderr.write(
+            `hostd: self-bump watcher could not read the helper's exit ` +
+              `code (docker wait rc=${w.exit_code}): ${tail(w.stderr).trim()}\n`,
+          );
+          return;
+        }
+        if (code === 0) return; // bump succeeded — recreate imminent
         rollbackBump();
         entry.result = "error";
         entry.finished_at = Date.now();
