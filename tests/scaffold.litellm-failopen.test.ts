@@ -73,9 +73,11 @@ describe("scaffoldAgent: LiteLLM fail-open boot contract (#litellm)", () => {
     );
 
     // FAIL-OPEN: on missing key OR unreachable proxy, strip ALL routing env so
-    // claude talks to Anthropic directly on its OAuth credential.
+    // claude talks to Anthropic directly on its OAuth credential. The root URL
+    // (SWITCHROOM_LITELLM_BASE) must be dropped too — asserted explicitly (not
+    // as a prefix) so it can't silently fall out of the unset list.
     expect(startSh).toContain(
-      "unset ANTHROPIC_BASE_URL ANTHROPIC_SMALL_FAST_MODEL SWITCHROOM_LITELLM",
+      "unset ANTHROPIC_BASE_URL ANTHROPIC_SMALL_FAST_MODEL SWITCHROOM_LITELLM SWITCHROOM_LITELLM_BASE",
     );
 
     // The lapse must be logged, not silent (both fallback branches → stderr).
