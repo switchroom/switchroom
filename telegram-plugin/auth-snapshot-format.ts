@@ -859,6 +859,14 @@ export interface SnapshotKeyboardOpts {
    *  keyboard agrees with the card body instead of defaulting to a second
    *  `new Date()`. Defaults to wall-clock. */
   now?: Date;
+  /**
+   * Demo mode (the `/auth demo` / `/usage demo` suffix). Masks the
+   * account-email in each switch-button LABEL (the callback_data keeps the
+   * real label — the broker needs it to act) and flips the refresh callback
+   * to `auth:refresh:demo` so a ↻ tap re-renders the card still masked
+   * instead of leaking the real emails mid-screen-recording.
+   */
+  demo?: boolean;
 }
 
 /**
@@ -891,14 +899,14 @@ export function buildSnapshotKeyboard(
   for (const t of switchTargets) {
     rows.push([
       {
-        text: `Switch fleet → ${t.label}`,
+        text: `Switch fleet → ${opts.demo ? maskEmail(t.label) : t.label}`,
         callbackData: `auth:use:${t.label}`,
       },
     ]);
   }
 
   rows.push([
-    { text: '↻ Refresh', callbackData: 'auth:refresh' },
+    { text: '↻ Refresh', callbackData: opts.demo ? 'auth:refresh:demo' : 'auth:refresh' },
     { text: '/usage', insertText: '/usage' },
     { text: '+ Add', insertText: '/auth add ' },
   ]);
@@ -918,6 +926,46 @@ function switchPriority(s: AccountSnapshot, now: Date = new Date()): number {
 // ── shared HTML escape ───────────────────────────────────────────────
 
 // ── snapshot assembly helper ─────────────────────────────────────────
+
+/**
+ * One per-account row of a broker `probe-quota` response. Mirrors the
+ * shape `AuthBrokerClient.probeQuota` returns (src/auth/broker/client.ts)
+ * without importing across the package boundary.
+ */
+export interface ProbeQuotaResultRow {
+  label: string;
+  result: QuotaResult;
+  /** #2495 Change 2 — how this result was sourced. */
+  served?: 'live' | 'cache';
+  /** Unix ms the served snapshot was captured (set when served==="cache"). */
+  capturedAt?: number;
+}
+
+/**
+ * Zip a broker `probe-quota` response back onto the account list, in input
+ * order, and surface cache staleness. Shared by every /auth-surface caller
+ * (/auth show, /usage, the ↻ refresh callback) so the "⚠ cached Nm ago"
+ * footer logic can't drift between them (#2495 Change 2).
+ *
+ * Returns `quotas` parallel to `labels` (a missing row degrades to an
+ * `ok:false` result, never a hole) and `staleCachedAtMs` — the OLDEST
+ * `capturedAt` among cache-served rows, undefined when everything was live.
+ */
+export function zipProbeResults(
+  labels: readonly string[],
+  results: readonly ProbeQuotaResultRow[],
+): { quotas: QuotaResult[]; staleCachedAtMs?: number } {
+  let staleCachedAtMs: number | undefined;
+  const quotas = labels.map((label): QuotaResult => {
+    const hit = results.find((r) => r.label === label);
+    if (!hit) return { ok: false, reason: 'broker returned no result for account' };
+    if (hit.served === 'cache' && hit.capturedAt != null) {
+      staleCachedAtMs = staleCachedAtMs == null ? hit.capturedAt : Math.min(staleCachedAtMs, hit.capturedAt);
+    }
+    return hit.result;
+  });
+  return staleCachedAtMs != null ? { quotas, staleCachedAtMs } : { quotas };
+}
 
 /**
  * Given the broker's `listState` data + a parallel array of live quota

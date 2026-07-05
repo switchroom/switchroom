@@ -574,7 +574,7 @@ import {
   QUOTA_WATCH_CLAIM_WINDOW_MS,
   isLiveCorroboration,
 } from '../quota-watch.js'
-import { buildSnapshotsFromState, buildSnapshotsFromCachedState } from '../auth-snapshot-format.js'
+import { buildSnapshotsFromState, buildSnapshotsFromCachedState, zipProbeResults } from '../auth-snapshot-format.js'
 import { maskUsername, maskVaultKey } from '../demo-mask.js'
 import {
   writeTurnActiveMarker,
@@ -19284,19 +19284,9 @@ bot.command("auth", async ctx => {
         const { results } = await client.probeQuota(accounts.map((a) => a.label))
         // #2495 Change 2 — the broker tags each result `served:"live"|"cache"`
         // (TTL hit or failed-probe fallback). When ANY account was served from
-        // cache, surface the OLDEST snapshot's capturedAt so the card stamps
-        // "⚠ cached Nm ago" instead of a false live stamp.
-        let staleCachedAtMs: number | undefined
-        // Preserve input order (broker also preserves it, but be defensive).
-        const quotas = accounts.map((a) => {
-          const hit = results.find((r) => r.label === a.label)
-          if (!hit) return { ok: false as const, reason: "broker returned no result for account" }
-          if (hit.served === 'cache' && hit.capturedAt != null) {
-            staleCachedAtMs = staleCachedAtMs == null ? hit.capturedAt : Math.min(staleCachedAtMs, hit.capturedAt)
-          }
-          return hit.result
-        })
-        return { quotas, staleCachedAtMs }
+        // cache, zipProbeResults surfaces the OLDEST snapshot's capturedAt so
+        // the card stamps "⚠ cached Nm ago" instead of a false live stamp.
+        return zipProbeResults(accounts.map((a) => a.label), results)
       } catch (err) {
         // Surface a uniform per-account failure so the dashboard renders
         // gracefully (label badge stays UNKNOWN) instead of falling back
@@ -21283,13 +21273,18 @@ async function handleAuthDashboardCallback(ctx: Context): Promise<void> {
   }
 
   // auth:refresh — re-render the /auth snapshot in-place with a fresh
-  // live probe. Replaces the message body; keyboard stays.
-  if (data === 'auth:refresh') {
+  // live probe. Replaces the message body; keyboard stays. The `:demo`
+  // variant re-renders with email masking intact (a ↻ tap on an
+  // `/auth demo` / `/usage demo` card must not unmask mid-recording).
+  if (data === 'auth:refresh' || data === 'auth:refresh:demo') {
+    const refreshDemo = data === 'auth:refresh:demo'
     // Freshness throttle: each refresh fan-fires N live api.anthropic.com
-    // probes (one per account, force=true bypasses the 5-min cache).
-    // Without this, a user double-tapping the ↻ button burns through
-    // their account's RPM budget on duplicate work. Cap at one per
-    // AUTH_REFRESH_THROTTLE_MS per (chat, message) pair.
+    // probes (one per account — forceLive bypasses the broker's 45s
+    // probe-on-open TTL, because an explicit ↻ tap is the user asking
+    // for live-now data). Without this, a user double-tapping the ↻
+    // button burns through their account's RPM budget on duplicate
+    // work. Cap at one per AUTH_REFRESH_THROTTLE_MS per (chat, message)
+    // pair.
     const refreshMsg = ctx.callbackQuery?.message
     if (refreshMsg) {
       const key = `${refreshMsg.chat.id}:${refreshMsg.message_id}`
@@ -21315,24 +21310,34 @@ async function handleAuthDashboardCallback(ctx: Context): Promise<void> {
       }
       const state = await client.listState()
       // Broker-routed probe (#1336) — see gateway.ts:8910 for diagnosis.
+      // forceLive=true: an explicit ↻ tap must bypass the broker's
+      // probe-on-open TTL — pre-fix, a tap inside the TTL window served
+      // the cached snapshot while stamping "Live · refreshed 0s ago".
       const probeResp = state.accounts.length > 0
-        ? await client.probeQuota(state.accounts.map((a) => a.label)).catch(() => ({ results: [] }))
+        ? await client.probeQuota(state.accounts.map((a) => a.label), undefined, true).catch(() => ({ results: [] }))
         : { results: [] }
-      const quotas = state.accounts.map((a) => {
-        const hit = probeResp.results.find((r) => r.label === a.label)
-        return hit?.result ?? { ok: false as const, reason: 'broker returned no result for account' }
-      })
+      // #2495 Change 2 — even under forceLive a failed upstream probe falls
+      // back to the broker cache (served:"cache"); stamp "⚠ cached Nm ago"
+      // instead of a false live stamp, same as the /auth and /usage paths.
+      const { quotas, staleCachedAtMs } = zipProbeResults(
+        state.accounts.map((a) => a.label),
+        probeResp.results,
+      )
       const tz = process.env.SWITCHROOM_TIMEZONE ?? process.env.TZ ?? 'UTC'
       const { renderAuthSnapshotFormat2, buildSnapshotsFromState, buildSnapshotKeyboard } = await import(
         '../auth-snapshot-format.js'
       )
       const snapshots = buildSnapshotsFromState(state, quotas)
+      // Single clock for card body + keyboard so health classification
+      // can't disagree between the two (#2495 folded nit A).
+      const renderNow = new Date()
       const text = renderAuthSnapshotFormat2(snapshots, {
         tz,
-        now: new Date(),
-        liveProbedAtMs: Date.now(),
+        now: renderNow,
+        demo: refreshDemo,
+        ...(staleCachedAtMs != null ? { staleCachedAtMs } : { liveProbedAtMs: renderNow.getTime() }),
       })
-      const kbRows = buildSnapshotKeyboard(snapshots)
+      const kbRows = buildSnapshotKeyboard(snapshots, { now: renderNow, demo: refreshDemo })
       const inline_keyboard = kbRows.map((row) =>
         row.map((b) => {
           if (b.callbackData) return { text: b.text, callback_data: b.callbackData }
@@ -21797,14 +21802,10 @@ bot.command('usage', async ctx => {
         // which we surface as a "⚠ cached Nm ago" footer instead of a false
         // live stamp.
         const probeResp = await client.probeQuota(state.accounts.map((a) => a.label)).catch(() => ({ results: [] }))
-        let staleCachedAtMs: number | undefined
-        const quotas = state.accounts.map((a) => {
-          const hit = probeResp.results.find((r) => r.label === a.label)
-          if (hit?.served === 'cache' && hit.capturedAt != null) {
-            staleCachedAtMs = staleCachedAtMs == null ? hit.capturedAt : Math.min(staleCachedAtMs, hit.capturedAt)
-          }
-          return hit?.result ?? { ok: false as const, reason: 'broker returned no result for account' }
-        })
+        const { quotas, staleCachedAtMs } = zipProbeResults(
+          state.accounts.map((a) => a.label),
+          probeResp.results,
+        )
         const { renderAuthSnapshotFormat2, buildSnapshotsFromState, buildSnapshotKeyboard } = await import(
           '../auth-snapshot-format.js'
         )
@@ -21821,7 +21822,7 @@ bot.command('usage', async ctx => {
         // /auth snapshot does. switchroomReply routes through the rich path
         // (replyWithRichMessage), which accepts reply_markup. Build a grammy
         // InlineKeyboard so the markup type matches switchroomReply's contract.
-        const kbRows = buildSnapshotKeyboard(snapshots, { now: new Date() })
+        const kbRows = buildSnapshotKeyboard(snapshots, { now: new Date(), demo })
         const keyboard = new InlineKeyboard()
         kbRows.forEach((row, ri) => {
           if (ri > 0) keyboard.row()

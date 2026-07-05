@@ -403,7 +403,7 @@ export async function handleAuthCommand(
       let keyboard: AuthCommandReply['keyboard']
       if (liveQuotas && liveQuotas.length === state.accounts.length) {
         const snapshots = buildSnapshotsFromState(state, liveQuotas)
-        keyboard = buildSnapshotKeyboard(snapshots, { now: new Date() })
+        keyboard = buildSnapshotKeyboard(snapshots, { now: new Date(), demo: ctx.demo })
       }
       return {
         text: renderShowText(state, Date.now(), {
