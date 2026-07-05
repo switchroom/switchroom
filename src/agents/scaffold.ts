@@ -2574,6 +2574,29 @@ function renderHindsightSettingsOverrides(
   if (additionalBanks.length > 0) {
     settings.recallAdditionalBanks = [...additionalBanks];
   }
+  // #2816 tag-filter port — INTENTIONALLY DORMANT (do not wire without an RFC).
+  // The vendored recall.py reads `recallTags` / `recallTagsMatch` /
+  // `recallTagGroups` / `recallAdditionalBankFilters` (upstream 962140eef, and
+  // the env overrides HINDSIGHT_RECALL_TAGS / _TAGS_MATCH / _TAG_GROUPS exist in
+  // vendor/hindsight-memory/scripts/lib/config.py). But switchroom deliberately
+  // does NOT set any of them here, and there is no memory.recall.tags config
+  // surface in src/config/schema.ts — so the filters collapse to their no-op
+  // pass-through default (empty filter = match everything).
+  //
+  // This is a decision, not an oversight. reference/rfcs/hindsight-synthesis-
+  // layers.md frames the port as "a ready-made hook for future recall shaping
+  // (e.g. scoping additional-bank recall to specific tags), currently dormant" —
+  // explicitly future work, NOT part of the Phase 2 bank-specialization goals
+  // (which are mission/disposition-driven, already wired via updateBankMissions
+  // + resolveBankMissionExtras). Wiring a first-class tag surface now would mean
+  // inventing a per-bank tag taxonomy the RFC does not specify. The env-var
+  // escape hatch above remains available to advanced operators in the meantime.
+  //
+  // TODO(#2816): if/when an RFC calls for tag-scoped recall, add a
+  // `memory.recall.tags` (+ match/groups) cascade knob mirroring the
+  // `recallTypes` wiring above and export it through profiles/_base/start.sh.hbs
+  // (HINDSIGHT_RECALL_TAGS), letting the env value win over this scaffold
+  // default — then set settings.recallTags here from the resolved config.
   return JSON.stringify(settings, null, 2) + "\n";
 }
 
