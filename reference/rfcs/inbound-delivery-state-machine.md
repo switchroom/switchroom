@@ -292,6 +292,48 @@ effects array drives the same outcome. Same shadow→live pattern,
 same kill-switch env knob. Out of scope for this section; PR 3b
 prerequisites must land first.
 
+## Hard removal plan — finish the cutover (#2794)
+
+> Added under issue **#2794** (cleanup audit item 2: machine + shadow +
+> imperative dispatch all live at once). This is the standing checklist
+> that keeps the shadow from living indefinitely. Each unchecked box is a
+> remaining PR toward "machine authoritative, shadow + imperative paths
+> deleted." **Do NOT close #2794 until every box is checked.**
+
+State of the triple-maintained paths as of this checklist:
+
+| Concern | Machine (authoritative?) | Shadow / imperative still live? |
+|---|---|---|
+| bridgeUp drain (inbound + perm-verdict redelivery) | **Yes** — dispatched via `dispatchEffects` (PR3a) | Imperative drain only under kill-switch `SWITCHROOM_DELIVERY_MACHINE_CUTOVER=0` (gateway.ts bridgeUp handler) |
+| turn-in-flight GATE (`turnInFlightForGate`) | **Yes** — `isMachineInTurn()` | `claudeBusyKeys` set still fully maintained + reaped in parallel; read on kill-switch path. **Drift canary added (`gate-parity-probe.ts`, #2794).** |
+| `turnEnd` lifecycle | No — shadow-only (`shadowEmit`) | Imperative `purgeReactionTracking` / `endCurrentTurnAtomic` + multi-callsite emits (RFC PR3b step 1 audit) |
+| `inbound` routing (deliver vs buffer) | No — shadow-only | Imperative `if (turnInFlight) buffer else deliver` in `handleInbound` |
+| poke ladder + `firePoke` | No | Imperative silence-poke |
+| perm-verdict deliver/persist (non-bridgeUp) | No | Imperative |
+
+Checklist (each box = one baked PR; keep the kill-switch until PR4):
+
+- [x] **PR3a** — dispatcher + bridgeUp effect execution. *(done)*
+- [x] **Gate cutover** — `turnInFlightForGate` reads the machine. *(done, #2794 adds the drift canary so the parallel `claudeBusyKeys` shadow can't silently diverge in the dangerous `machine_over_holds` direction before it is deleted.)*
+- [ ] **PR3b step 1** — fix the `turnEnd` emit callsites (delete the
+  duplicate bare-purge emits at the 5831/5989/1601 sites; thread `turn`
+  explicitly at 6130/6258; force `outboundEmitted=false` at the
+  silence-poke fallback). Prereq for a safe `turnEnd` cutover.
+- [ ] **PR3b step 2** — flip `shadowEmit({kind:'turnEnd'})` →
+  `dispatchEvent` inside `endCurrentTurnAtomic`; remove the imperative
+  cleanups from `purgeReactionTracking`.
+- [ ] **PR3c** — inbound cutover: `handleInbound` dispatches an inbound
+  Event; the machine's `deliverToBridge`/`bufferInbound` effects replace
+  the imperative in-handler routing.
+- [ ] **PR4** — delete the kill-switch fallback branches, the
+  `claudeBusyKeys` set + its reaper, `gate-parity-probe.ts`, and the
+  redundant silence-poke/purge primitives. Net −200…−500 lines.
+
+Each step must keep the delivery-reliability guarantees from #2787
+(confirm-sweep scoping) and #2801 (enqueue-ack) intact — the machine's
+`drainBuffer` effect already routes through `redeliverBufferedInbound` +
+`onUserInboundDelivered` so the deliver-until-acked sweep survives.
+
 ## What this RFC does NOT cover
 
 - **The boot-time cost** of cold-starting claude + the gateway. The state machine doesn't help; it's pure model-side latency. Tracked separately under "cold-start optimization" (Sprint 4 of the vision-aligned roadmap: defer handoff, async boot card, pre-warm session).
