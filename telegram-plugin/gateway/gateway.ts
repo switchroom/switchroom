@@ -12,7 +12,7 @@
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context, type Api } from 'grammy'
 import { run, type RunnerHandle } from '@grammyjs/runner'
 import type { ReactionTypeEmoji } from 'grammy/types'
-import { randomBytes } from 'crypto'
+import { randomBytes, createHash } from 'crypto'
 import { execFileSync, execSync, spawn } from 'child_process'
 import {
   readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync,
@@ -475,6 +475,12 @@ import {
   buildVaultSaveFailedInbound,
   buildVaultSaveDiscardedInbound,
 } from './vault-grant-inbound-builders.js'
+import { renderMentalModelProposeCard } from './mental-model-propose-card.js'
+import {
+  resolveMentalModelProposal,
+  type MentalModelPendingProposal,
+} from './mental-model-propose-resolve.js'
+import { readDeclaredMentalModelNames } from './mental-model-propose-diff.js'
 import {
   parseSkillProposalCallback,
   buildSkillProposalApplyInbound,
@@ -4772,6 +4778,38 @@ function sweepStaleAlwaysAllowCorrelations(now = Date.now()): void {
   }
 }
 
+// Sibling of pendingAlwaysAllowCorrelations for the agent-proposes →
+// human-approves MENTAL MODEL flow (hindsight Phase 5). When the operator
+// taps Approve on a mental-model PROPOSAL card, the gateway dispatches a
+// `config_propose_edit` appending the model to memory.mental_models[]; hostd
+// then calls back for operator approval. We pre-register the exact diff here
+// so that callback auto-approves WITHOUT a second card (the operator already
+// approved on the proposal card). Forge-resistance: the auto-resolve match is
+// an EXACT byte-match of the inbound diff against the diff the gateway itself
+// synthesized and queued — an agent-forged edit finds no entry and falls
+// through to a real operator card. Single-shot + a dedicated TTL sweep.
+//
+// TTL: this correlation must outlive the WHOLE config-edit approval budget,
+// NOT the 30s "always allow" window. The mental-model resolve dispatches
+// `config_propose_edit` to hostd with a 720s timeout (see the 720_000 dispatch
+// budgets below); hostd's approval callback can legitimately arrive any time
+// within that window if the operator taps slowly. Reusing the 30s
+// ALWAYS_ALLOW_CORRELATION_TTL_MS would sweep the correlation out from under a
+// slow-but-valid tap, dropping the auto-approve and surfacing a SECOND card
+// for an edit the operator already approved. Size it to the hostd budget.
+const MENTAL_MODEL_CORRELATION_TTL_MS = 720_000
+const pendingMentalModelCorrelations = new Map<string, { agentName: string; unifiedDiff: string; createdAt: number }>()
+function mentalModelCorrelationKey(agentName: string, unifiedDiff: string): string {
+  return `${agentName}::${createHash('sha256').update(unifiedDiff).digest('hex')}`
+}
+function sweepStaleMentalModelCorrelations(now = Date.now()): void {
+  for (const [key, entry] of pendingMentalModelCorrelations) {
+    if (now - entry.createdAt > MENTAL_MODEL_CORRELATION_TTL_MS) {
+      pendingMentalModelCorrelations.delete(key)
+    }
+  }
+}
+
 // Scoped-approval store: the 30-min window that backs the "✅ Allow" tap for
 // narrow non-destructive scopes (not a separate button — it IS what Allow
 // means for those). Operator-tapped, gateway-side ONLY (never pushed to the
@@ -5111,6 +5149,56 @@ function sweepPendingVaultRequestAccesses(): void {
   for (const [k, v] of pendingVaultRequestAccesses) {
     if (v.staged_at < cutoff) pendingVaultRequestAccesses.delete(k)
   }
+}
+
+/**
+ * Staged agent-initiated MENTAL MODEL proposal (hindsight Phase 5). The agent
+ * calls `mental_model_propose`; the operator taps Approve/Deny on the card.
+ * Mirrors PendingVaultRequestAccess — no memory content is staged here, only
+ * the proposed DECLARATION (name + source_query + optional knobs). On Approve
+ * the model becomes a first-class declared model in memory.mental_models[] via
+ * the operator-approved config-edit path; on Deny nothing is written.
+ */
+interface PendingMentalModelPropose {
+  agent: string
+  chat_id: string
+  card_message_id?: number
+  threadId?: number
+  /** Proposed declaration, snake_case (matches memory.mental_models[] schema). */
+  spec: {
+    name: string
+    source_query: string
+    refresh_after_consolidation?: boolean
+    max_tokens?: number
+  }
+  reason?: string
+  staged_at: number
+}
+const pendingMentalModelProposes = new Map<string, PendingMentalModelPropose>()
+const MENTAL_MODEL_PROPOSE_TTL_MS = approvalTtlMs()
+function sweepPendingMentalModelProposes(): void {
+  const cutoff = Date.now() - MENTAL_MODEL_PROPOSE_TTL_MS
+  for (const [k, v] of pendingMentalModelProposes) {
+    if (v.staged_at < cutoff) pendingMentalModelProposes.delete(k)
+  }
+}
+
+// Per-agent sliding-window rate limit for mental-model proposals: at most
+// MENTAL_MODEL_PROPOSE_MAX_PER_WINDOW cards per MENTAL_MODEL_PROPOSE_WINDOW_MS.
+// A candidate model is a deliberate, rare curation act — an agent that
+// re-proposes in a loop should be throttled so the operator is never spammed.
+const mentalModelProposeTimes: number[] = []
+const MENTAL_MODEL_PROPOSE_WINDOW_MS = 60 * 60 * 1000
+const MENTAL_MODEL_PROPOSE_MAX_PER_WINDOW = 5
+function checkMentalModelProposeRate(now = Date.now()): { ok: true } | { ok: false; retryAtMs: number } {
+  const cutoff = now - MENTAL_MODEL_PROPOSE_WINDOW_MS
+  while (mentalModelProposeTimes.length > 0 && mentalModelProposeTimes[0]! < cutoff) {
+    mentalModelProposeTimes.shift()
+  }
+  if (mentalModelProposeTimes.length >= MENTAL_MODEL_PROPOSE_MAX_PER_WINDOW) {
+    return { ok: false, retryAtMs: mentalModelProposeTimes[0]! + MENTAL_MODEL_PROPOSE_WINDOW_MS }
+  }
+  return { ok: true }
 }
 
 /**
@@ -8498,11 +8586,24 @@ const ipcServer: IpcServer = createIpcServer({
         // field, or any other byte difference) won't match → falls
         // through to a real operator approval card.
         const added = extractAddedAllowRule(msg.unifiedDiff)
-        if (!added) return null
-        const key = `${msg.agentName}::${added}`
-        const entry = pendingAlwaysAllowCorrelations.get(key)
-        if (entry && entry.unifiedDiff === msg.unifiedDiff) {
-          pendingAlwaysAllowCorrelations.delete(key)
+        if (added) {
+          const key = `${msg.agentName}::${added}`
+          const entry = pendingAlwaysAllowCorrelations.get(key)
+          if (entry && entry.unifiedDiff === msg.unifiedDiff) {
+            pendingAlwaysAllowCorrelations.delete(key)
+            return 'approve'
+          }
+        }
+        // hindsight Phase 5: a mental-model PROPOSAL the operator already
+        // approved on the proposal card. The gateway pre-registered the EXACT
+        // diff; auto-approve on a byte-exact match (the security gate), so no
+        // second card is posted. Any forged/other edit finds no entry and
+        // falls through to a real operator card.
+        sweepStaleMentalModelCorrelations()
+        const mmKey = mentalModelCorrelationKey(msg.agentName, msg.unifiedDiff)
+        const mmEntry = pendingMentalModelCorrelations.get(mmKey)
+        if (mmEntry && mmEntry.unifiedDiff === msg.unifiedDiff) {
+          pendingMentalModelCorrelations.delete(mmKey)
           return 'approve'
         }
         return null
@@ -9034,6 +9135,7 @@ const ALLOWED_TOOLS = new Set([
   'vault_request_save',
   'vault_request_access',
   'request_secret',
+  'mental_model_propose',
   'linear_agent_activity',
   'linear_create_issue',
   'linear_agent_setup',
@@ -9080,6 +9182,8 @@ async function executeToolCall(tool: string, args: Record<string, unknown>): Pro
       return executeVaultRequestAccess(args)
     case 'request_secret':
       return executeRequestSecret(args)
+    case 'mental_model_propose':
+      return executeMentalModelPropose(args)
     case 'linear_agent_activity':
       return executeLinearAgentActivity(args)
     case 'linear_create_issue':
@@ -11703,6 +11807,166 @@ async function executeVaultRequestAccess(args: Record<string, unknown>): Promise
       {
         type: 'text',
         text: `vault_request_access: card sent (stage_id=${stageId}, key=${key}, scope=${scopeRaw}). Wait for the operator to tap Approve or Deny — do not retry the vault read until you see a confirmation message. If the card times out (10 min) you can re-request.`,
+      },
+    ],
+  }
+}
+
+/** Read the live switchroom.yaml bytes for diff/dup-check. Mirrors the
+ *  always-allow persistence path's config read. */
+function readLiveSwitchroomConfigText(): string {
+  const cfgPath = process.env.SWITCHROOM_CONFIG ?? findSwitchroomConfigFile()
+  return readFileSync(cfgPath, 'utf8')
+}
+
+const MENTAL_MODEL_NAME_REGEX = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/
+
+function buildMentalModelProposeKeyboard(stageId: string): { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } {
+  return {
+    inline_keyboard: [
+      [
+        { text: '✅ Approve', callback_data: `mmp:approve:${stageId}` },
+        { text: '🚫 Deny', callback_data: `mmp:deny:${stageId}` },
+      ],
+    ],
+  }
+}
+
+/**
+ * `mental_model_propose` tool (hindsight Phase 5) — the agent surfaces a
+ * candidate mental model for the operator to approve. Mirrors the
+ * `vault_request_access` shape: the agent can only PROPOSE; the [Approve]/[Deny]
+ * tap is operator-gated (handleMentalModelProposeCallback), so an agent can
+ * never self-approve. On Approve the proposal is DECLARED — appended to the
+ * agent's memory.mental_models[] via the operator-approved config-edit path
+ * (reusing config_propose_edit apply+reconcile) — and ensured in the bank. On
+ * Deny nothing is written. Guardrails enforced here BEFORE any card:
+ * duplicate-name rejection against the agent's already-declared models, and a
+ * per-agent rate limit so proposals stay non-spammy.
+ */
+async function executeMentalModelPropose(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
+  const chat_id = String(args.chat_id ?? '')
+  if (!chat_id) throw new Error('mental_model_propose: chat_id is required')
+  const name = typeof args.name === 'string' ? args.name.trim() : ''
+  if (!name) throw new Error('mental_model_propose: name is required')
+  if (!MENTAL_MODEL_NAME_REGEX.test(name)) {
+    throw new Error('mental_model_propose: name must be a slug (letters/digits/_/-, ≤64 chars, e.g. `training-plan-state`)')
+  }
+  const source_query = typeof args.source_query === 'string' ? args.source_query.trim() : ''
+  if (!source_query) throw new Error('mental_model_propose: source_query is required')
+  // Accept `why` as an alias for `reason` (mirrors the vault tools).
+  const reason =
+    typeof args.reason === 'string' ? args.reason : typeof args.why === 'string' ? args.why : undefined
+  let refresh_after_consolidation: boolean | undefined
+  if (args.refresh_after_consolidation !== undefined) {
+    if (typeof args.refresh_after_consolidation !== 'boolean') {
+      throw new Error('mental_model_propose: refresh_after_consolidation must be a boolean')
+    }
+    refresh_after_consolidation = args.refresh_after_consolidation
+  }
+  let max_tokens: number | undefined
+  if (args.max_tokens !== undefined) {
+    const n = Number(args.max_tokens)
+    if (!Number.isInteger(n) || n <= 0) {
+      throw new Error('mental_model_propose: max_tokens must be a positive integer')
+    }
+    max_tokens = n
+  }
+  assertAllowedChat(chat_id)
+
+  const agentSlug = process.env.SWITCHROOM_AGENT_NAME || 'agent'
+
+  // Rate limit: a proposal is a rare, deliberate curation act — throttle so a
+  // looping agent can never spam the operator with cards.
+  const rate = checkMentalModelProposeRate()
+  if (!rate.ok) {
+    const retryAtIso = new Date(rate.retryAtMs).toISOString()
+    return {
+      content: [
+        {
+          type: 'text',
+          text:
+            `mental_model_propose: RATE-LIMITED (max ${MENTAL_MODEL_PROPOSE_MAX_PER_WINDOW} proposals/hour). ` +
+            `No card was posted. Next slot opens at ${retryAtIso}. Proposing mental models is meant to be ` +
+            `rare — batch or wait rather than re-firing.`,
+        },
+      ],
+    }
+  }
+
+  // Duplicate-name guard: reject a proposal for a model already DECLARED for
+  // this agent, BEFORE posting a card (the name is the idempotent-ensure key).
+  try {
+    const configText = readLiveSwitchroomConfigText()
+    const declared = readDeclaredMentalModelNames(configText, agentSlug)
+    if (declared.includes(name)) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text:
+              `mental_model_propose: '${name}' is ALREADY a declared mental model for ${agentSlug} ` +
+              `(memory.mental_models[]). No card was posted — it already exists and is ensured in your ` +
+              `bank. Pick a different name if you meant a NEW model, or just use the existing one.`,
+          },
+        ],
+      }
+    }
+  } catch (err) {
+    // Config read failed (transient) — fall through to the card. The approve
+    // path re-reads and re-checks (dupe guard is defense-in-depth), so a
+    // redundant card is harmless; suppressing a needed card is not.
+    process.stderr.write(`telegram gateway: mental_model_propose dup pre-check read failed: ${(err as Error).message}\n`)
+  }
+
+  const stageId = randomBytes(4).toString('hex')
+  const pending: PendingMentalModelPropose = {
+    agent: agentSlug,
+    chat_id,
+    spec: {
+      name,
+      source_query,
+      ...(refresh_after_consolidation !== undefined ? { refresh_after_consolidation } : {}),
+      ...(max_tokens !== undefined ? { max_tokens } : {}),
+    },
+    ...(reason ? { reason } : {}),
+    staged_at: Date.now(),
+  }
+  pendingMentalModelProposes.set(stageId, pending)
+  sweepPendingMentalModelProposes()
+
+  const text = renderMentalModelProposeCard({
+    agent: agentSlug,
+    name,
+    source_query,
+    ...(reason ? { reason } : {}),
+    ...(refresh_after_consolidation !== undefined ? { refresh_after_consolidation } : {}),
+  })
+  const threadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
+  if (threadId != null) pending.threadId = threadId
+  const sent = await retryWithThreadFallback<{ message_id: number }>(
+    robustApiCall,
+    (tid) =>
+      lockedBot.api.sendRichMessage(chat_id, richMessage(text), {
+        reply_markup: buildMentalModelProposeKeyboard(stageId),
+        ...(tid != null && Number.isFinite(tid) ? { message_thread_id: tid } : {}),
+      }),
+    { threadId, chat_id, verb: 'mental_model_propose.card' },
+  )
+  pending.card_message_id = sent.message_id
+  // Only count a proposal against the rate budget once its card actually
+  // posted (validation errors / dupes don't consume the budget).
+  mentalModelProposeTimes.push(Date.now())
+
+  return {
+    content: [
+      {
+        type: 'text',
+        text:
+          `mental_model_propose: card sent (stage_id=${stageId}, name=${name}). Wait for the operator to tap ` +
+          `Approve or Deny — END YOUR TURN cleanly. A fresh inbound arrives with the outcome ` +
+          `(source=mental_model_proposal_applied / mental_model_proposal_denied). Do NOT re-propose this ` +
+          `model while the card is open.`,
       },
     ],
   }
@@ -20368,6 +20632,167 @@ async function handleSkillProposalCallback(ctx: Context, data: string): Promise<
   )
 }
 
+/**
+ * hindsight Phase 5 — handle a tap on the mental-model PROPOSAL card.
+ *   mmp:approve:<stageId> — declare the model: append it to the agent's
+ *                           memory.mental_models[] via the operator-approved
+ *                           config-edit path (reused config_propose_edit
+ *                           apply+reconcile; reconcile ensures it), then wake
+ *                           the agent with an "applied" inbound.
+ *   mmp:deny:<stageId>    — drop the proposal; NOTHING is written; wake the
+ *                           agent with a "denied" inbound.
+ *
+ * Authorization: the tapper MUST be on the gateway's allowFrom list — an agent
+ * can PROPOSE but can never self-approve (identical gate to the vault flow).
+ */
+async function handleMentalModelProposeCallback(ctx: Context, data: string): Promise<void> {
+  const senderId = String(ctx.from?.id ?? '')
+  const access = loadAccess()
+  if (!access.allowFrom.includes(senderId)) {
+    // Self-approve is impossible: only an allow-listed operator can resolve
+    // the card. A tap from anyone else (incl. a compromised agent identity) is
+    // refused here.
+    await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+    return
+  }
+  const parts = data.split(':')
+  if (parts.length < 3) {
+    await ctx.answerCallbackQuery({ text: 'Bad request' }).catch(() => {})
+    return
+  }
+  const action = parts[1]
+  const stageId = parts.slice(2).join(':')
+  const pending = pendingMentalModelProposes.get(stageId)
+  if (!pending) {
+    await ctx.answerCallbackQuery({ text: 'Card expired — ask the agent to re-propose.' }).catch(() => {})
+    if (ctx.callbackQuery?.message) {
+      await ctx.api
+        .editMessageText(
+          ctx.callbackQuery.message.chat.id,
+          ctx.callbackQuery.message.message_id,
+          richMessage('⌛ _This mental-model proposal card expired before you tapped. Ask the agent to re-propose if it still stands._'),
+          { reply_markup: { inline_keyboard: [] } },
+        )
+        .catch(() => {})
+    }
+    return
+  }
+  if (action !== 'approve' && action !== 'deny') {
+    await ctx.answerCallbackQuery({ text: 'Bad request' }).catch(() => {})
+    return
+  }
+  // Single-shot: remove the pending entry immediately so a double-tap can't
+  // resolve twice.
+  pendingMentalModelProposes.delete(stageId)
+
+  const proposal: MentalModelPendingProposal = {
+    agent: pending.agent,
+    chat_id: pending.chat_id,
+    ...(pending.threadId != null ? { threadId: pending.threadId } : {}),
+    spec: pending.spec,
+    ...(pending.reason ? { reason: pending.reason } : {}),
+  }
+
+  const resolveDeps = {
+    readConfigText: () => readLiveSwitchroomConfigText(),
+    registerPreApproval: (agent: string, diff: string) => {
+      pendingMentalModelCorrelations.set(mentalModelCorrelationKey(agent, diff), {
+        agentName: agent,
+        unifiedDiff: diff,
+        createdAt: Date.now(),
+      })
+    },
+    clearPreApproval: (agent: string, diff: string) => {
+      pendingMentalModelCorrelations.delete(mentalModelCorrelationKey(agent, diff))
+    },
+    dispatchConfigEdit: async (a: { agent: string; diff: string; reason: string }) => {
+      const req: HostdRequest = {
+        v: 1,
+        op: 'config_propose_edit',
+        request_id: hostdRequestId('gw-mental-model'),
+        args: {
+          unified_diff: a.diff,
+          reason: a.reason,
+          target_path: '/state/config/switchroom.yaml',
+        },
+      }
+      // config_propose_edit blocks on validate→approve→apply→reconcile
+      // (5-10 min on a busy host) — allow 12 min. The operator already
+      // approved on the proposal card, so hostd's config-approval callback
+      // auto-resolves via the pre-registered correlation (no second card).
+      const resp = await tryHostdDispatch(a.agent, req, 720_000)
+      if (resp === 'not-configured') {
+        return { state: 'error' as const, reason: 'hostd config-edit is not configured (host_control disabled or socket absent)' }
+      }
+      if (resp.result === 'completed') return { state: 'applied' as const }
+      if (resp.result === 'denied') return { state: 'denied' as const, reason: resp.error ?? 'operator/host denied the edit' }
+      return { state: 'error' as const, reason: resp.error ?? `hostd returned '${resp.result}'` }
+    },
+    // Ensure is delegated to reconcile: config_propose_edit's apply triggers a
+    // reconcile which runs ensureDeclaredMentalModels (#2874) for the newly
+    // declared model — the authoritative, correctly-scoped ensure. We
+    // deliberately do NOT add a redundant gateway-side ensure (it would need
+    // the agent's bank id + a reachable Hindsight endpoint from the gateway).
+    injectInbound: (inbound: InboundMessage) => {
+      deliverResumeSyntheticOrBuffer(pending.agent, inbound)
+    },
+    log: (m: string) => process.stderr.write(`telegram gateway: ${m}\n`),
+  }
+
+  if (action === 'deny') {
+    await ctx.answerCallbackQuery({ text: '🚫 Denied' }).catch(() => {})
+    await resolveMentalModelProposal('deny', proposal, stageId, senderId, resolveDeps)
+    if (pending.card_message_id != null) {
+      await ctx.api
+        .editMessageText(
+          pending.chat_id,
+          pending.card_message_id,
+          richMessage(`🚫 _Denied. **${escapeHtmlForTg(pending.agent)}**'s mental model \`${pending.spec.name}\` was not declared._`),
+          { reply_markup: { inline_keyboard: [] } },
+        )
+        .catch(() => {})
+    }
+    return
+  }
+
+  // Approve. Ack immediately + show an interim state, then persist in the
+  // background (config_propose_edit can take minutes), then edit the card with
+  // the real outcome. The turn resumes via the synthetic inbound injected by
+  // resolveMentalModelProposal — not by this card edit.
+  await ctx.answerCallbackQuery({ text: '✅ Declaring the model…' }).catch(() => {})
+  if (pending.card_message_id != null) {
+    await ctx.api
+      .editMessageText(
+        pending.chat_id,
+        pending.card_message_id,
+        richMessage(`⏳ _Declaring **${escapeHtmlForTg(pending.agent)}**'s mental model \`${pending.spec.name}\` — appending to config + ensuring…_`),
+        { reply_markup: { inline_keyboard: [] } },
+      )
+      .catch(() => {})
+  }
+  void (async () => {
+    let result
+    try {
+      result = await resolveMentalModelProposal('approve', proposal, stageId, senderId, resolveDeps)
+    } catch (err) {
+      process.stderr.write(`telegram gateway: mental_model_propose approve threw: ${(err as Error).message}\n`)
+      result = { outcome: 'failed' as const, reason: (err as Error).message }
+    }
+    if (pending.card_message_id != null) {
+      const label =
+        result.outcome === 'applied'
+          ? `✅ **Declared** ${escapeHtmlForTg(pending.agent)}'s mental model \`${pending.spec.name}\` — appended to \`memory.mental_models[]\` and ensured. Restart the agent to load it if it isn't picked up automatically.`
+          : `⚠️ **Did NOT declare** \`${pending.spec.name}\`${'reason' in result && result.reason ? ` — ${escapeHtmlForTg(result.reason)}` : ''}. Nothing was written.`
+      await ctx.api
+        .editMessageText(pending.chat_id, pending.card_message_id, richMessage(label), {
+          reply_markup: { inline_keyboard: [] },
+          link_preview_options: { is_disabled: true },
+        })
+        .catch(() => {})
+    }
+  })()
+}
+
 async function handleVaultRequestAccessCallback(ctx: Context, data: string): Promise<void> {
   const senderId = String(ctx.from?.id ?? '')
   const access = loadAccess()
@@ -22906,6 +23331,15 @@ bot.on('callback_query:data', async ctx => {
   //   vsp:decline:<stageId> — drop the request, notify the agent
   if (data.startsWith('vsp:')) {
     await handleSecretRequestCallback(ctx, data)
+    return
+  }
+
+  // hindsight Phase 5: agent-proposes → human-approves mental-model card.
+  //   mmp:approve:<stageId> — declare the model (append memory.mental_models[]
+  //                           via operator-approved config edit) + ensure it
+  //   mmp:deny:<stageId>    — drop the proposal; NOTHING is written
+  if (data.startsWith('mmp:')) {
+    await handleMentalModelProposeCallback(ctx, data)
     return
   }
 

@@ -646,3 +646,123 @@ function stripCallerAllow(
   }
   return clone;
 }
+
+/**
+ * Authorize a NON-admin `config_propose_edit` (or the specialized
+ * mental-model proposal path) against the mental-model self-scope contract:
+ * a non-admin agent may APPEND declared mental models to its OWN
+ * `agents.<caller>.memory.mental_models[]`, and nothing else.
+ *
+ * This is the second half of the invariant-clean Phase 5 shape (companion to
+ * `assertSelfScopedAllowEdit`): #2874 made `memory.mental_models[]` the
+ * operator-declared desired state; the agent-proposes → human-approves flow
+ * lets an agent surface a candidate that, on operator approval, becomes a
+ * first-class declared model. The operator tap is the human gate; THIS check
+ * proves the edit can ONLY grow the caller's own declared-model list — a
+ * proposal can never touch another agent, a different field, the cascade
+ * defaults, or any other setting. So a forged proposal diff that smuggles in
+ * (say) a `tools.allow` widen or a secrets ACL change is rejected here.
+ *
+ * Additive-only by the model's NAME (the idempotent-ensure key): every model
+ * declared before must still be declared after (no silent removal/replacement),
+ * and stripping `agents.<caller>.memory.mental_models` from both sides must
+ * leave byte-identical (structural) remainders.
+ *
+ * Pure: parses both YAML blobs, no I/O. Returns `{ ok: false }` (deny, not
+ * throw) on any parse failure so the caller stays on the safe side.
+ */
+export function assertSelfScopedMentalModelEdit(
+  beforeContent: string,
+  afterContent: string,
+  caller: string,
+): SelfScopeResult {
+  let before: Record<string, unknown>;
+  let after: Record<string, unknown>;
+  try {
+    before = toObject(parseDocument(beforeContent, { merge: false, strict: false }).toJS());
+    after = toObject(parseDocument(afterContent, { merge: false, strict: false }).toJS());
+  } catch (e) {
+    return { ok: false, detail: `self-scope: config did not parse (${(e as Error).message})` };
+  }
+
+  // 1. Additive-only on the caller's own declared models, BY NAME AND CONTENT.
+  //    Every model declared before must still be declared after AND be
+  //    byte-for-byte identical (same source_query / max_tokens /
+  //    refresh_after_consolidation). Only brand-NEW names may appear. This is
+  //    the load-bearing guard: step 2 strips the whole mental_models array
+  //    before comparing, so an in-place REWRITE that keeps all the names (e.g.
+  //    silently repointing an existing model's source_query, or bumping its
+  //    max_tokens) is invisible there — it must be caught here, or a "propose"
+  //    tap could smuggle an edit to an already-approved model.
+  const beforeModels = readCallerMentalModels(before, caller);
+  const afterByName = new Map<string, unknown>();
+  for (const m of readCallerMentalModels(after, caller)) {
+    const n = m && typeof m === "object" ? (m as { name?: unknown }).name : undefined;
+    if (typeof n === "string" && !afterByName.has(n)) afterByName.set(n, m);
+  }
+  for (const m of beforeModels) {
+    const n = m && typeof m === "object" ? (m as { name?: unknown }).name : undefined;
+    if (typeof n !== "string") continue; // malformed pre-existing entry — step 2's structural check is the backstop
+    if (!afterByName.has(n)) {
+      return {
+        ok: false,
+        detail: `self-scope: edit removes existing mental model "${n}" from agents.${caller}.memory.mental_models`,
+      };
+    }
+    if (!isDeepStrictEqual(m, afterByName.get(n))) {
+      return {
+        ok: false,
+        detail:
+          `self-scope: edit rewrites existing mental model "${n}" ` +
+          `(append-only: an existing declared model is immutable — only NEW models may be added)`,
+      };
+    }
+  }
+
+  // 2. Nothing else changed: strip agents.<caller>.memory.mental_models from
+  //    both sides (identically) and require deep structural equality of the
+  //    remainder. Collapsing an emptied `memory` object handles the case where
+  //    the edit CREATES `memory:`/`mental_models:` that didn't exist before.
+  //    (This proves nothing OUTSIDE the array moved; step 1 above proves the
+  //    array only GREW — existing entries unchanged.)
+  const beforeStripped = stripCallerMentalModels(before, caller);
+  const afterStripped = stripCallerMentalModels(after, caller);
+  if (!isDeepStrictEqual(beforeStripped, afterStripped)) {
+    return {
+      ok: false,
+      detail:
+        `self-scope: edit changes config outside agents.${caller}.memory.mental_models ` +
+        `(a non-admin agent may only append its own declared mental models)`,
+    };
+  }
+  return { ok: true };
+}
+
+function readCallerMentalModels(cfg: Record<string, unknown>, caller: string): unknown[] {
+  const agents = cfg.agents;
+  if (!agents || typeof agents !== "object") return [];
+  const agent = (agents as Record<string, unknown>)[caller];
+  if (!agent || typeof agent !== "object") return [];
+  const memory = (agent as Record<string, unknown>).memory;
+  if (!memory || typeof memory !== "object") return [];
+  const models = (memory as Record<string, unknown>).mental_models;
+  return Array.isArray(models) ? models : [];
+}
+
+function stripCallerMentalModels(
+  cfg: Record<string, unknown>,
+  caller: string,
+): Record<string, unknown> {
+  const clone = structuredClone(cfg);
+  const agents = clone.agents;
+  if (!agents || typeof agents !== "object") return clone;
+  const agent = (agents as Record<string, unknown>)[caller];
+  if (!agent || typeof agent !== "object") return clone;
+  const memory = (agent as Record<string, unknown>).memory;
+  if (!memory || typeof memory !== "object") return clone;
+  delete (memory as Record<string, unknown>).mental_models;
+  if (Object.keys(memory as Record<string, unknown>).length === 0) {
+    delete (agent as Record<string, unknown>).memory;
+  }
+  return clone;
+}
