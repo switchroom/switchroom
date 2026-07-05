@@ -160,6 +160,15 @@ principal's chat jobs). Pin:
   [`track-plan-quota-live`](track-plan-quota-live.md), remain answered in
   the chat.
 
+## Related
+
+- [`know-what-my-agent-is-doing`](know-what-my-agent-is-doing.md) -- the
+  principal-facing per-turn signal this screen must never cannibalise.
+- [`operate-the-fleet-from-telegram`](operate-the-fleet-from-telegram.md) --
+  acting on the fleet once you can see it.
+- [`fleet-stays-healthy`](fleet-stays-healthy.md) -- the ranked health view
+  that shares this operator-only surface.
+
 > [!CAUTION]
 > If the dashboard starts being where a principal goes, this job has failed
 > even if every feature works.

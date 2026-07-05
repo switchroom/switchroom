@@ -166,6 +166,15 @@ cheerful "done" over a silently-dead agent.
 - *Defaults:* a fresh setup produces a working, conversational agent with no
   required config. The "batteries included" principle check is the gate.
 
+## Related
+
+- [`run-a-fleet-of-specialists`](run-a-fleet-of-specialists.md) -- the fleet
+  this job bootstraps from a clean box.
+- [`extend-without-forking`](extend-without-forking.md) -- growing the fleet
+  after first contact, config only.
+- [`restart-and-know-what-im-running`](restart-and-know-what-im-running.md) --
+  the same loud-not-silent readiness bar, applied to every later restart.
+
 ---
 
 > **Implementation:** the how (the setup-wizard steps, the pairing

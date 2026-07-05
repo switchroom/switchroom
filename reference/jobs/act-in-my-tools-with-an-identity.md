@@ -190,6 +190,15 @@ identity is always surfaced.
   mint a new identity or widen a grant. `single-tenant` — one operator's
   tokens and identities, never shared across tenants.
 
+## Related
+
+- [`approve-what-my-agent-can-touch`](approve-what-my-agent-can-touch.md) --
+  how the operator grants the identity and scope this job acts under.
+- [`share-auth-across-the-fleet`](share-auth-across-the-fleet.md) -- the
+  credential plane behind the per-agent acting identities.
+- [`know-what-my-agent-is-doing`](know-what-my-agent-is-doing.md) -- seeing
+  and steering the tool-side action from Telegram.
+
 ---
 
 > **Implementation:** the *how* lives in `docs/webhook-ingest.md` and

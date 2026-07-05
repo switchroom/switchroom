@@ -1,6 +1,6 @@
 ---
 artefact: host-control daemon (switchroom-hostd)
-serves: jobs/idempotent-update-and-restart.md
+serves: idempotent-update-and-restart
 status: Draft v3 (docker-first correction)
 ---
 
