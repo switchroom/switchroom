@@ -285,6 +285,7 @@ import {
 } from '../active-reactions.js'
 import { sweepActiveReactions } from '../active-reactions-sweep.js'
 import { flushOnAgentDisconnect } from './disconnect-flush.js'
+import { markBusyKeyLockstep, reapOrphanBusyKeys } from './busy-key-reaper.js'
 import { PreambleSuppressor } from './preamble-suppressor.js'
 import {
   fetchFolderPage,
@@ -423,6 +424,7 @@ import {
   forgetDelivery,
   shouldTrackDelivery,
   isTrackableResumeSynthetic,
+  isRedeliverySuspended,
   type PendingDelivery,
 } from './inbound-delivery-confirm.js'
 import { createPendingPermissionBuffer } from './pending-permission-decisions.js'
@@ -1590,6 +1592,18 @@ const activeTurnStartedAt = new Map<string, number>()
 // reading activeTurnStartedAt because they want the receipt timestamp.
 const claudeBusyKeys = new Set<string>()
 
+// #2787 Mechanism B — insertion timestamps for the busy keys above, so the
+// confirm sweep can reap an orphaned marker. `busy` is stamped EAGERLY at
+// delivery and cleared only at turn_end; a delivered-but-never-enqueued inbound
+// (e.g. a composer strand or an enqueue-ack mismatch) therefore leaves its key
+// stuck forever, wedging the legacy-regime idle-drain (turnInFlightForGate reads
+// claudeBusyKeys.size) for EVERY topic until the ~300s silence poke — the
+// 5-minute all-topics stall of #1922. The reaper (reapOrphanBusyKeys) uses these
+// timestamps to bound that dangle. The delivery-machine cutover regime is already
+// immune (it tracks one activeTurn + TTL tick, never a per-key set); this bounds
+// the legacy path it hasn't replaced yet.
+const claudeBusyKeySince = new Map<string, number>()
+
 /**
  * #2527 observability: count emoji transitions per status-reaction controller
  * so `turn_no_reply_warn` can report how many reaction changes happened while
@@ -1623,8 +1637,66 @@ function markClaudeBusyForInbound(m: {
     if (Number.isFinite(n)) tid = n
   }
   const key = chatKey(m.chatId, tid)
-  claudeBusyKeys.add(key)
+  // #2787: lockstep add + idle→busy timestamp. Keyed on set membership (see
+  // busy-key-reaper.ts) so a re-mark after a disconnect flush (which cleared
+  // claudeBusyKeys directly) always re-stamps a fresh Date.now() and the orphan
+  // TTL measures the CURRENT dangle, never a stale pre-disconnect timestamp.
+  markBusyKeyLockstep(claudeBusyKeys, claudeBusyKeySince, key, Date.now())
   return key
+}
+
+// #2787 Mechanism B — reap orphaned busy markers. Called from the confirm sweep
+// ONLY once `currentTurn == null` has been asserted: with no turn in flight, any
+// surviving claudeBusyKeys entry is definitionally an orphan (a real turn would
+// hold currentTurn non-null), so clearing a stale one can never clobber a live
+// turn. Also prunes timestamp entries whose key already left the set (e.g. a
+// disconnect flush cleared claudeBusyKeys directly) so the map can't grow
+// unbounded.
+//
+// SLOW-DELIVERY SAFETY (the #1922 hazard): `currentTurn == null` is NOT proof of
+// idle — busy is marked EAGERLY at delivery, and the gateway→claude enqueue-ack
+// lag can be up to ~5 MINUTES under load (#1922). During that eager-mark→enqueue
+// window `currentTurn` is null yet the turn is real-and-merely-slow, so a bare
+// time-grace reaper could reap a genuine delivery and re-open the idle-drain gate
+// while claude is about to process the very inbound whose key it just reaped
+// (duplicate / concurrent delivery on the CORE inbound path). A time grace alone
+// cannot distinguish "slow" from "orphaned".
+//
+// So the reap is PROOF-GATED, not just time-gated (option (b), the load-bearing
+// guarantee): a key is reaped ONLY when it has NO corresponding entry in the
+// delivery-confirm queue (`deliveryQueue.pending`). A slow-but-real inbound is
+// tracked there from delivery until claude's `enqueue` ack lands (or forever, via
+// the never-drop re-deliver loop), so any key still awaiting its turn is present
+// and skipped — no matter how slow. Only a key that is busy-marked yet has no
+// pending delivery is a TRUE orphan: either it was acked (its turn ran and should
+// have cleared busy at turn_end — a genuinely stuck marker) or it was a
+// steer/interrupt inbound that shouldTrackDelivery excludes (it amends a running
+// turn, so with currentTurn == null its marker is likewise stale). Reaping only
+// these can never clobber a slow delivery.
+//
+// The time grace is retained as defense-in-depth on top of the proof gate, raised
+// to a default well above the observed enqueue-ack lag and env-tunable via the
+// config cascade. This bounds the legacy-regime idle-drain wedge from ~300s
+// (silence poke) to the grace window without racing a slow delivery.
+//
+// Config cascade: SWITCHROOM_BUSY_ORPHAN_TTL_MS is an OVERRIDE-mode scalar
+// (defaults → profiles → agents; a lower layer's value replaces, not merges).
+// Default 360_000ms (6 min) — comfortably above the ~5-min #1922 tail so the
+// grace never trips on a merely-slow delivery even if the proof gate is bypassed.
+// Clamped to a positive finite value; a degenerate override falls back to default.
+const _busyOrphanTtlRaw = process.env.SWITCHROOM_BUSY_ORPHAN_TTL_MS
+const _busyOrphanTtlParsed =
+  _busyOrphanTtlRaw != null && _busyOrphanTtlRaw !== '' ? Number(_busyOrphanTtlRaw) : 360_000
+const CLAUDE_BUSY_ORPHAN_TTL_MS =
+  Number.isFinite(_busyOrphanTtlParsed) && _busyOrphanTtlParsed > 0 ? _busyOrphanTtlParsed : 360_000
+function reapOrphanBusyKeysNow(now: number): void {
+  reapOrphanBusyKeys(claudeBusyKeys, claudeBusyKeySince, now, {
+    ttlMs: CLAUDE_BUSY_ORPHAN_TTL_MS,
+    // Proof gate — a key still tracked in the delivery-confirm queue is a
+    // slow-but-real inbound awaiting its enqueue ack, never an orphan (#1922).
+    hasPendingDelivery: (key) => deliveryQueue.pending.has(key),
+    log: (msg) => process.stderr.write(`${msg}\n`),
+  })
 }
 
 // ─── Reliable inbound delivery: deliver-until-acked (the marko drop-wedge) ─
@@ -3271,6 +3343,7 @@ function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
   // the markClaudeBusyForInbound on the delivery path. Safe no-op
   // when the key was never marked (synthetic purge from a sweep).
   claudeBusyKeys.delete(key)
+  claudeBusyKeySince.delete(key) // #2787: keep the orphan-TTL map in lockstep
   // #2527: clear the per-key reaction-transition counter and first-reply
   // sentinel alongside the controller so we don't leak state across turns.
   reactionTransitionCounts.delete(key)
@@ -3456,6 +3529,7 @@ function releaseTurnBufferGate(key: string, endingTurn?: CurrentTurn): void {
   // PR3b: keep claudeBusyKeys in sync — same lifecycle as the
   // activeTurnStartedAt entry it's mirroring here.
   claudeBusyKeys.delete(key)
+  claudeBusyKeySince.delete(key) // #2787: keep the orphan-TTL map in lockstep
   // Shadow trace so the structural turn-end metric still records.
   // outboundEmitted=true is correct here — we only reach this from
   // executeReply AFTER an outbound landed.
@@ -4459,7 +4533,7 @@ const STATUS_QUERY_RE = /^\s*status\??\s*$/i
 
 // ─── Permission handling ──────────────────────────────────────────────────
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
-const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string; startedAt: number; card_text: string; cards: { chatId: string; messageId: number }[] }>()
+const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string; startedAt: number; card_text: string; cards: { chatId: string; messageId: number; threadId?: number | null }[] }>()
 // PERMISSION_TTL_MS / ttlForTool / the timed-out card builder now live in
 // ./permission-timeout.ts (pure + unit-testable). hostd gated verbs get a
 // 30-min window; everything else keeps the 10-min default.
@@ -6650,19 +6724,56 @@ async function redeliverStrandedInbound(p: PendingDelivery<InboundMessage>): Pro
     forgetDelivery(deliveryQueue, p.key)
   }
 }
+// #2787 Mechanism A — which chats/topics currently hold a live permission or
+// ask_user card. A pending card is a live interaction for ITS OWN chat, so the
+// confirm sweep must not re-clear the composer + re-send there. But the OLD guard
+// (`pendingPermissions.size > 0 || pendingAskUser.size > 0 → return`) suspended
+// the sweep GLOBALLY: one card parked in a single topic (or in the operator DM,
+// a different chatId entirely) froze re-delivery of every stranded inbound across
+// EVERY topic until that one card resolved. This scopes the suspension to the
+// card's own target. Returns per-topic chatKeys where the topic is known and bare
+// chatIds where it isn't (a card fanned to operator DMs records chatId only, and
+// a whole-chat suspension is the safe conservative fallback there); the callsite
+// tests a delivery entry against both renderings.
+function sweepSuspendedTargets(): { keys: Set<string>; chats: Set<string> } {
+  const keys = new Set<string>()
+  const chats = new Set<string>()
+  for (const p of pendingPermissions.values()) {
+    for (const c of p.cards) {
+      if (c.threadId != null) keys.add(chatKey(c.chatId, c.threadId))
+      else chats.add(c.chatId)
+    }
+    // A permission whose card send hasn't resolved yet (cards still empty) has
+    // no recorded target — suspend nothing for it; the next sweep sees it once
+    // the send resolves, and the currentTurn guard already covers the in-turn
+    // window a fresh permission request lives in.
+  }
+  for (const a of pendingAskUser.values()) {
+    if (a.threadId != null) keys.add(chatKey(a.chatId, a.threadId))
+    else chats.add(a.chatId)
+  }
+  return { keys, chats }
+}
+
 const _deliveryConfirmSweep = setInterval(() => {
   if (!DELIVERY_CONFIRM_ENABLED) return
   // Re-deliver ONLY when claude is genuinely idle. `currentTurn` is set solely
   // by the enqueue session-event and nulled at turn-end, so `currentTurn != null`
   // means a real turn is in flight — re-clearing the composer + re-sending now
-  // would clobber it (the exact mid-turn wedge this queue exists to prevent). A
-  // pending permission / ask_user prompt is likewise a live interaction. Defer:
-  // leave the entry pending (it isn't acked) so the next idle sweep retries.
+  // would clobber it (the exact mid-turn wedge this queue exists to prevent).
   // NB: claudeBusyKeys (turnInFlightForGate) is set EAGERLY at delivery and
   // stays set through a strand, so it is NOT a usable "idle" signal here.
   if (currentTurn != null) return
-  if (pendingPermissions.size > 0 || pendingAskUser.size > 0) return
+  // #2787 Mechanism B: no turn in flight → reap any orphaned busy marker so a
+  // delivered-but-never-enqueued inbound can't wedge the idle-drain globally.
+  reapOrphanBusyKeysNow(Date.now())
+  // #2787 Mechanism A: a pending permission / ask_user card suspends re-delivery
+  // ONLY for its own chat/topic — never globally. Skip just the stranded entries
+  // whose target holds a live card; sweep the rest so unrelated topics keep
+  // getting re-delivered.
+  const suspended = sweepSuspendedTargets()
   for (const p of sweepDeliveryQueue(deliveryQueue, Date.now(), DELIVERY_CONFIRM_TIMEOUT_MS)) {
+    if (isRedeliverySuspended(p.key, suspended)) continue
     void redeliverStrandedInbound(p)
   }
 }, DELIVERY_CONFIRM_SWEEP_MS)
@@ -7317,6 +7428,7 @@ const ipcServer: IpcServer = createIpcServer({
       activeReactionMsgIds,
       activeTurnStartedAt,
       claudeBusyKeys,
+      claudeBusyKeySince,
       activeDraftStreams,
       clearActiveReactions: () => {
         const ad = resolveAgentDirFromEnv()
@@ -7542,7 +7654,7 @@ const ipcServer: IpcServer = createIpcServer({
       // found"), re-send thread-less into the main chat so the card still
       // ARRIVES rather than vanishing → 10-min TTL auto-deny → wedge.
       // allow-raw-bot-api: wrapped in retryWithThreadFallback (retry policy); topic-aware send
-      void retryWithThreadFallback<{ message_id: number }>(
+      void retryWithThreadFallback<{ message_id: number; message_thread_id?: number }>(
         robustApiCall,
         (tid) =>
           bot.api.sendRichMessage(chatId, richMessage(text), {
@@ -7558,7 +7670,19 @@ const ipcServer: IpcServer = createIpcServer({
         // guard the lookup.
         const pend = pendingPermissions.get(requestId)
         if (pend && sent && typeof sent.message_id === 'number') {
-          pend.cards.push({ chatId, messageId: sent.message_id })
+          // #2787: record where the card ACTUALLY LANDED so the confirm sweep
+          // scopes its re-delivery suspension to the real chat/topic. When
+          // retryWithThreadFallback hit THREAD_NOT_FOUND (stale/renumbered
+          // topic) it re-sent thread-less into the main chat — the returned
+          // Message then carries no message_thread_id, so we must record the
+          // landed topic (undefined → suspend by bare chatId), NOT the stale
+          // requested `threadId`. Keying suspension on the stale topic would
+          // leave the main-chat card unsuspended (a re-deliver could clobber
+          // the live card) while needlessly suspending a topic that holds
+          // nothing. `sent.message_thread_id` reflects reality in all three
+          // cases: topic success → tid, main-chat / fallback → undefined.
+          const landedThreadId = sent.message_thread_id ?? undefined
+          pend.cards.push({ chatId, messageId: sent.message_id, threadId: landedThreadId })
           permCardStore.add({
             requestId,
             chatId,

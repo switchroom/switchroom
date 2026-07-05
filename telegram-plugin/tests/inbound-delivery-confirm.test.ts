@@ -5,11 +5,13 @@ import {
   createDeliveryQueue,
   extractEnqueueMessageIds,
   forgetDelivery,
+  isRedeliverySuspended,
   isTrackableResumeSynthetic,
   shouldTrackDelivery,
   sweep,
   trackDelivery,
   type DeliveryQueue,
+  type SuspendedTargets,
 } from '../gateway/inbound-delivery-confirm.js'
 
 /**
@@ -108,6 +110,52 @@ describe('inbound-delivery-confirm (reliable deliver-until-acked queue)', () => 
     forgetDelivery(q, 'chat:_')
     expect(q.pending.size).toBe(0)
     expect(sweep(q, 999_999, TIMEOUT)).toHaveLength(0)
+  })
+})
+
+// Regression for #2787 Mechanism A — a permission / ask_user card must suspend
+// the confirm sweep ONLY for its own chat/topic, never globally. Before the fix
+// the gateway early-returned the whole sweep whenever ANY card was pending
+// anywhere, so one card parked in a single topic (or the operator DM) froze
+// re-delivery of every stranded inbound across every topic until it resolved —
+// the ~5-minute all-topics stall of #1922. isRedeliverySuspended encodes the
+// scoped decision the sweep now makes per swept entry.
+describe('isRedeliverySuspended — per-topic sweep suspension (#2787 Mechanism A)', () => {
+  const none: SuspendedTargets = { keys: new Set(), chats: new Set() }
+
+  it('no cards open → nothing is suspended (sweep runs for every topic)', () => {
+    expect(isRedeliverySuspended('-100:4', none)).toBe(false)
+    expect(isRedeliverySuspended('555:_', none)).toBe(false)
+  })
+
+  it('reproduces the global-stall fix: a card in topic A does NOT suspend topic B', () => {
+    // A permission card is open in supergroup topic 4; a DIFFERENT topic (7) and
+    // an unrelated DM both have inbounds stranded in the composer.
+    const suspended: SuspendedTargets = { keys: new Set(['-100:4']), chats: new Set() }
+    expect(isRedeliverySuspended('-100:4', suspended)).toBe(true) // the card's own topic — deferred
+    expect(isRedeliverySuspended('-100:7', suspended)).toBe(false) // sibling topic keeps flowing
+    expect(isRedeliverySuspended('555:_', suspended)).toBe(false) // unrelated DM keeps flowing
+  })
+
+  it('a card fanned to the operator DM (chatId only, topic unknown) suspends just that chat', () => {
+    const suspended: SuspendedTargets = { keys: new Set(), chats: new Set(['999']) }
+    expect(isRedeliverySuspended('999:_', suspended)).toBe(true) // operator DM — deferred
+    expect(isRedeliverySuspended('-100:4', suspended)).toBe(false) // every topic elsewhere flows
+    expect(isRedeliverySuspended('555:_', suspended)).toBe(false)
+  })
+
+  it('drives the actual sweep: stranded siblings still re-deliver while one topic holds a card', () => {
+    const q = createDeliveryQueue<{ text: string }>()
+    trackDelivery(q, '-100:4', { text: 'msg in the card topic' }, 0)
+    trackDelivery(q, '-100:7', { text: 'msg in a sibling topic' }, 0)
+    trackDelivery(q, '555:_', { text: 'dm msg' }, 0)
+    const suspended: SuspendedTargets = { keys: new Set(['-100:4']), chats: new Set() }
+    // The gateway loop: sweep, then skip only entries suspended for their target.
+    const redelivered = sweep(q, 15_000, TIMEOUT).filter(
+      (p) => !isRedeliverySuspended(p.key, suspended),
+    )
+    const keys = redelivered.map((p) => p.key).sort()
+    expect(keys).toEqual(['-100:7', '555:_']) // the card's topic held; the rest flowed
   })
 })
 

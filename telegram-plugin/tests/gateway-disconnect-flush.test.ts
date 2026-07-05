@@ -58,6 +58,11 @@ function makeDeps(agentName: string | null) {
     'chat1:thr1:msg1',
     'chat2:thr2:msg2',
   ])
+  // #2787: shadow timestamp map, kept in lockstep with claudeBusyKeys.
+  const claudeBusyKeySince = new Map<string, number>([
+    ['chat1:thr1:msg1', 100],
+    ['chat2:thr2:msg2', 200],
+  ])
   const activeDraftStreams = new Map<string, FakeStream>([
     ['chat1:thr1:r1', { isFinal: () => false, finalize: finalizeA }],
     ['chat2:thr2:r2', { isFinal: () => true, finalize: finalizeB }],
@@ -74,6 +79,7 @@ function makeDeps(agentName: string | null) {
       activeReactionMsgIds,
       activeTurnStartedAt,
       claudeBusyKeys,
+      claudeBusyKeySince,
       activeDraftStreams,
       clearActiveReactions,
       disposeProgressDriver,
@@ -175,6 +181,7 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
       ]),
       activeTurnStartedAt: new Map<string, number>([['ghost:thr:msg', 100]]),
       claudeBusyKeys: new Set<string>(['ghost:thr:msg']),
+      claudeBusyKeySince: new Map<string, number>([['ghost:thr:msg', 100]]),
       activeDraftStreams: new Map<string, FakeStream>(),
       clearActiveReactions,
       disposeProgressDriver,
@@ -232,6 +239,7 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
       activeReactionMsgIds: new Map<string, { chatId: string; messageId: number }>(),
       activeTurnStartedAt: new Map<string, number>([['real-turn:thr:msg', 100]]),
       claudeBusyKeys: new Set<string>(['real-turn:thr:msg']),
+      claudeBusyKeySince: new Map<string, number>([['real-turn:thr:msg', 100]]),
       activeDraftStreams: new Map<string, FakeStream>(),
       clearActiveReactions: vi.fn(),
       disposeProgressDriver: vi.fn(),
@@ -266,6 +274,7 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
       // activeTurnStartedAt was never set because cron bypasses
       // handleInbound's fresh-turn branch.
       claudeBusyKeys: new Set<string>(['cron-only-key:_']),
+      claudeBusyKeySince: new Map<string, number>([['cron-only-key:_', 100]]),
       activeDraftStreams: new Map<string, FakeStream>(),
       clearActiveReactions: vi.fn(),
       disposeProgressDriver: vi.fn(),
@@ -306,6 +315,7 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
     flushOnAgentDisconnect({
       ...baseDeps,
       claudeBusyKeys: new Set<string>(['k1:_']),
+      claudeBusyKeySince: new Map<string, number>([['k1:_', 100]]),
       log,
     })
     expect(log.mock.calls.some((c: unknown[]) =>
@@ -316,6 +326,7 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
     flushOnAgentDisconnect({
       ...baseDeps,
       claudeBusyKeys: new Set<string>(['k1:_', 'k2:1']),
+      claudeBusyKeySince: new Map<string, number>([['k1:_', 100], ['k2:1', 100]]),
       log,
     })
     expect(log.mock.calls.some((c: unknown[]) =>
@@ -333,6 +344,7 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
       activeReactionMsgIds: new Map<string, { chatId: string; messageId: number }>(),
       activeTurnStartedAt: new Map<string, number>(),
       claudeBusyKeys: new Set<string>(),
+      claudeBusyKeySince: new Map<string, number>(),
       activeDraftStreams: new Map<string, FakeStream>(),
       clearActiveReactions: vi.fn(),
       disposeProgressDriver: vi.fn(),
@@ -352,6 +364,7 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
       activeReactionMsgIds: new Map<string, { chatId: string; messageId: number }>(),
       activeTurnStartedAt: new Map<string, number>([['ghost:thr:msg', 100]]),
       claudeBusyKeys: new Set<string>(['ghost:thr:msg']),
+      claudeBusyKeySince: new Map<string, number>([['ghost:thr:msg', 100]]),
       activeDraftStreams: new Map<string, FakeStream>(),
       clearActiveReactions: vi.fn(),
       disposeProgressDriver: vi.fn(),

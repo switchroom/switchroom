@@ -164,6 +164,43 @@ export function sweep<M>(
   return redeliver
 }
 
+/**
+ * #2787 — the set of chats/topics that currently hold a live permission or
+ * `ask_user` card, against which a swept entry is tested before re-delivery.
+ *
+ *   - `keys`  — full `chatKey(chatId, threadId)` values (topic known). A card
+ *               routed to a specific forum topic suspends re-delivery ONLY for
+ *               that topic; sibling topics in the same supergroup keep flowing.
+ *   - `chats` — bare chatIds (topic unknown — e.g. a permission card fanned to
+ *               the operator DMs records only the chatId). The conservative
+ *               fallback is to suspend the whole chat; that chat is almost never
+ *               a busy multi-topic supergroup, so the global stall is still gone.
+ */
+export interface SuspendedTargets {
+  readonly keys: ReadonlySet<string>
+  readonly chats: ReadonlySet<string>
+}
+
+/**
+ * #2787 Mechanism A — should re-delivery of a stranded inbound on `key` be
+ * suspended because a live permission / `ask_user` card is open for ITS OWN
+ * chat/topic?
+ *
+ * A pending card is a live interaction for its target: re-clearing the composer
+ * and re-sending there would clobber it. But the OLD gateway guard suspended the
+ * ENTIRE confirm sweep whenever ANY card was pending anywhere — so one card
+ * parked in a single topic (or the operator DM, a different chatId) froze
+ * re-delivery of every stranded inbound across EVERY topic until it resolved
+ * (the #1922 all-topics stall). Scoping the check to the card's own target keeps
+ * unrelated topics being re-delivered while the card sits open.
+ */
+export function isRedeliverySuspended(key: string, suspended: SuspendedTargets): boolean {
+  if (suspended.keys.has(key)) return true
+  const idx = key.indexOf(':')
+  const chatId = idx < 0 ? key : key.slice(0, idx)
+  return suspended.chats.has(chatId)
+}
+
 /** Forget a key without acking (e.g. the bridge went offline and the message
  *  was handed back to the offline buffer, which owns it now). */
 export function forgetDelivery<M>(q: DeliveryQueue<M>, key: string): void {
