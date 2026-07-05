@@ -52,13 +52,6 @@ export type DryRunResult = DryRunOk | DryRunErr;
 const MIN_CRON_INTERVAL_SECS = 5 * 60;
 
 /**
- * Hard-coded minimum interval for an agent-authored cron entry. Exported
- * so the approval-card PR can wire it into the operator UI; for now it's
- * compile-time only.
- */
-export const MIN_CRON_INTERVAL_SECONDS = MIN_CRON_INTERVAL_SECS;
-
-/**
  * Best-effort cron-interval check. We parse the simple star-slash-n minute form
  * and reject anything tighter than every-5-minutes. More elaborate
  * expressions pass through this check (we don't bring in a full cron

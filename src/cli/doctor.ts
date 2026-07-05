@@ -1386,7 +1386,7 @@ export function checkPendingRetainsQueue(
  * `switchroom doctor` run on a multi-agent host.
  * @internal exported for testing
  */
-export type ReadErrorKind = "enoent" | "eacces" | "other";
+type ReadErrorKind = "enoent" | "eacces" | "other";
 export function classifyReadError(err: unknown): ReadErrorKind {
   const code = (err as NodeJS.ErrnoException)?.code;
   if (code === "ENOENT") return "enoent";
@@ -1406,7 +1406,7 @@ export function classifyReadError(err: unknown): ReadErrorKind {
  *              fine; render as `warn`, not `fail`
  *   other    — anything else (corrupted FS, etc.); rare
  */
-export type FileReadResult =
+type FileReadResult =
   | { kind: "ok"; content: string }
   | { kind: "enoent" }
   | { kind: "eacces"; error: string }
@@ -2142,7 +2142,7 @@ export function mffEnvPath(config?: SwitchroomConfig): string {
  * can fully validate.
  * @internal exported for testing
  */
-export type MffEnvState = "absent" | "agent-private" | "readable";
+type MffEnvState = "absent" | "agent-private" | "readable";
 export function mffEnvState(envPath: string): MffEnvState {
   if (!existsSync(envPath)) return "absent";
   try {

@@ -3352,13 +3352,6 @@ export function isSafeExecArgvElement(s: string): boolean {
   return !/[\u0000-\u001f\u007f]/.test(s);
 }
 
-/** Probe whether an agent socket exists at the canonical in-container
- *  path. Used by gateway integration (Phase 2) to decide between
- *  daemon-call vs spawn-detached fallback. */
-export function hostdSocketPathForAgent(agentName: string): string {
-  return `/run/switchroom/hostd/${agentName}/sock`;
-}
-
 // Exported for symmetry with src/vault/broker — most callers use the
 // class methods, but tests + cli wrappers reach in.
 export { readdirSync };
