@@ -708,11 +708,19 @@ jobs:
     # for the fresh-namespace edge (no :latest to retag from). This
     # `if:` requires smoke-test SUCCESS but only non-failure
     # (success or skipped) from hindsight/voice/retag-unchanged.
-    needs: [smoke-test, build-hindsight, build-voice, retag-unchanged]
+    # merge-base is a producing job too: it creates base:sha-<short> on
+    # main pushes (build-base only pushes per-arch scratch tags now),
+    # and it never legitimately skips on a main push — so require hard
+    # success. Without it, a transient merge-base failure would let the
+    # base leg's absence-tolerant branch below misread the missing
+    # base:sha-<short> as a benign skip and silently hold base:dev back
+    # while the other :dev tags advance.
+    needs: [smoke-test, merge-base, build-hindsight, build-voice, retag-unchanged]
     if: >-
       !cancelled() &&
       github.event_name == 'push' && github.ref == 'refs/heads/main' &&
       needs.smoke-test.result == 'success' &&
+      needs.merge-base.result == 'success' &&
       needs.build-hindsight.result != 'failure' && needs.build-hindsight.result != 'cancelled' &&
       needs.build-voice.result != 'failure' && needs.build-voice.result != 'cancelled' &&
       needs.retag-unchanged.result != 'failure' && needs.retag-unchanged.result != 'cancelled'
