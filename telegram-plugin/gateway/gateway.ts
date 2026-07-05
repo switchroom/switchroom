@@ -93,6 +93,11 @@ import {
 import { StatusReactionController } from '../status-reactions.js'
 import { DeferredDoneReactions } from '../reaction-defer.js'
 import { createWorkerActivityFeed, isWorkerActivityFeedEnabled } from '../worker-activity-feed.js'
+import {
+  detectMemoryLegibilityEvent,
+  isMemoryLegibilityEnabled,
+  renderMemoryLegibilityLine,
+} from '../memory-legibility.js'
 import { reconcilePin, type PinBotApi } from '../status-pin-driver.js'
 import type { PinState, DesiredPin } from '../status-pin.js'
 import { decidePinAction } from '../status-pin.js'
@@ -6222,6 +6227,12 @@ const SILENCE_DEFER_INFLIGHT_TOOLS = process.env.SWITCHROOM_SILENCE_DEFER_INFLIG
 // and null currentTurn mid-work. Default ON; SWITCHROOM_SILENCE_LIVENESS_PRODUCTION=0
 // restores the legacy "only a real reply resets the clock" behaviour.
 const SILENCE_LIVENESS_PRODUCTION = process.env.SWITCHROOM_SILENCE_LIVENESS_PRODUCTION !== '0'
+// Sparse chat-legible memory (#2849, hindsight Phase 4). Surface ONE terse
+// line in the originating chat/topic when the interactive session materially
+// changes what it remembers (create_directive / invalidate / demote) — never
+// on ordinary recall or routine consolidation. Default ON;
+// SWITCHROOM_MEMORY_LEGIBILITY=0 disables it.
+const MEMORY_LEGIBILITY_ENABLED = isMemoryLegibilityEnabled(process.env.SWITCHROOM_MEMORY_LEGIBILITY)
 
 /**
  * Feed-survival predicate — the single source of truth for "is this turn
@@ -12269,6 +12280,52 @@ function clearActivitySummary(turn: CurrentTurn, finalHtmlOverride?: string | nu
   })
 }
 
+/**
+ * #2849 hindsight Phase 4 — sparse chat-legible memory.
+ *
+ * Fire-and-forget: if this main-agent tool call is a material memory
+ * operation (create_directive → 📌 remembered; invalidate/demote → ✂️
+ * forgot), send ONE terse real message into the turn's originating
+ * chat/topic. Routes on `turn.sessionChatId` / `turn.sessionThreadId`
+ * (the originating topic, never the operator DM), through
+ * `retryWithThreadFallback` so a deleted forum topic can't crash the
+ * gateway. Non-material tool calls return silently — no line on ordinary
+ * recall or routine consolidation. Kill-switch: SWITCHROOM_MEMORY_LEGIBILITY=0.
+ */
+function surfaceMemoryLegibility(
+  turn: CurrentTurn,
+  toolName: string,
+  input: Record<string, unknown> | undefined,
+): void {
+  if (!MEMORY_LEGIBILITY_ENABLED) return
+  const event = detectMemoryLegibilityEvent(toolName, input)
+  if (event == null) return
+  const chatId = turn.sessionChatId
+  const threadId = turn.sessionThreadId
+  const line = renderMemoryLegibilityLine(event)
+  process.stderr.write(
+    `telegram gateway: memory-legibility ${event.kind} chat=${chatId} ` +
+      `thread=${threadId ?? '-'} tool=${toolName}\n`,
+  )
+  void retryWithThreadFallback(
+    robustApiCall,
+    (tid) =>
+      bot.api.sendMessage(chatId, line, {
+        parse_mode: 'HTML',
+        // Status surface, not the user's answer — never ping the device.
+        disable_notification: true,
+        ...(tid != null ? { message_thread_id: tid } : {}),
+      }),
+    { threadId, chat_id: chatId, verb: 'memory-legibility.sendMessage' },
+  ).catch((err) => {
+    process.stderr.write(
+      `telegram gateway: memory-legibility send failed: ${
+        err instanceof Error ? err.message : String(err)
+      }\n`,
+    )
+  })
+}
+
 function handleSessionEvent(ev: SessionEvent): void {
   switch (ev.kind) {
     case 'enqueue': {
@@ -12567,6 +12624,14 @@ function handleSessionEvent(ev: SessionEvent): void {
       // of dropping. The answer-stream's own dedup handles overlap
       // with the reply tool's payload.
       preambleSuppressor.onTool({ isReplyTool: isTelegramSurfaceTool(ev.toolName) })
+      // #2849 Phase 4 — sparse chat-legible memory. Surface ONE terse line in
+      // the originating chat/topic when this tool call materially changes what
+      // the agent remembers (create_directive / invalidate / demote). Fires
+      // BEFORE the `if (!ctrl) return` status-reaction gate below so it works
+      // on turns with no active status-reaction controller. Deterministic
+      // tool-call observation — no model call, no polling; ordinary recall and
+      // routine consolidation never reach here (they aren't material tools).
+      surfaceMemoryLegibility(turn, ev.toolName, ev.input)
       const ctrl = activeStatusReactions.get(statusKey(turn.sessionChatId, turn.sessionThreadId))
       const name = ev.toolName
       // Phase tracking removed in #553 PR 5 — phases only fed the
