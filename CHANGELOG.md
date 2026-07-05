@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.17.4 — Fix "Always allow" not sticking
+
+`config_propose_edit` in hostd now passes `--only <agent>` to `switchroom apply`,
+scoping reconcile to just the requesting agent (~8s) instead of the full fleet
+(2+ min). The full-fleet apply was exceeding the gateway's 60s dispatch timeout,
+causing "Always allow" taps to silently fail — the permission was granted for the
+session but never written to disk.
+
 ## v0.17.3 — LiteLLM Anthropic pass-through
 
 ### Claude routes via the /anthropic pass-through, not the model-mapped path (#2835)
