@@ -10577,6 +10577,14 @@ async function executeProgressUpdate(args: Record<string, unknown>): Promise<unk
 
   assertAllowedChat(chat_id)
 
+  // Outbound secret scrub (#2044). progress_update was the ONLY send site not
+  // calling redactOutboundText, so a secret the agent echoed into a progress
+  // line reached Telegram unmasked (reply/stream_reply/edit_message/turn_flush
+  // all redact). Mask BEFORE the 300-char truncation below: a secret straddling
+  // the 300-char cut would otherwise be sliced apart and evade the detector, so
+  // redaction has to run on the full untruncated text first.
+  text = redactOutboundText(text, 'progress_update')
+
   // Truncate to 300 chars
   if (text.length > 300) {
     text = text.slice(0, 299) + '…'

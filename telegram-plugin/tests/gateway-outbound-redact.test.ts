@@ -70,6 +70,18 @@ describe('gateway outbound secret-scrub — structural wiring', () => {
     expect(scrubSiteIdx).toBeGreaterThan(redactIdx) // mask BEFORE the voice scrub + send
   })
 
+  it('progress_update: scrubs at entry, BEFORE the 300-char truncation', () => {
+    // progress_update was the only send site not calling redactOutboundText.
+    // The mask MUST run before the truncation so a secret straddling the
+    // 300-char cut can't be sliced apart and evade the token-shape detector.
+    const start = src.indexOf('async function executeProgressUpdate(')
+    const redactIdx = src.indexOf(`redactOutboundText(text, 'progress_update')`, start)
+    const truncIdx = src.indexOf('Truncate to 300 chars', start)
+    expect(start).toBeGreaterThan(0)
+    expect(redactIdx).toBeGreaterThan(start)
+    expect(truncIdx).toBeGreaterThan(redactIdx) // mask BEFORE the slice
+  })
+
   it('does not log the secret value when a mask fires', () => {
     const idx = src.indexOf('function redactOutboundText(')
     const body = src.slice(idx, idx + 400)
