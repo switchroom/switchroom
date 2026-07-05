@@ -47,8 +47,19 @@
  */
 
 import { createHash, createHmac, randomBytes, createCipheriv, createDecipheriv } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeSync,
+} from "node:fs";
+import { basename, dirname, resolve } from "node:path";
 
 const FORMAT_VERSION = 0x01;
 const SALT_LEN = 16;
@@ -214,11 +225,29 @@ export function decryptAutoUnlock(blob: Buffer, machineId?: string): string {
  */
 export function writeAutoUnlockFile(passphrase: string, filePath: string): void {
   const blob = encryptAutoUnlock(passphrase);
-  mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 });
-  writeFileSync(filePath, blob, { mode: 0o600 });
-  // writeFileSync respects mode only on file creation; chmod for the
-  // existing-file case so re-running enable-auto-unlock tightens perms even
-  // if the user loosened them by hand.
+  const dir = dirname(filePath);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // Write-temp-then-rename so an interrupted write can never leave a
+  // truncated blob at filePath (readAutoUnlockFile would then fail to
+  // decrypt and the vault couldn't auto-unlock on boot). fsync the tmp
+  // contents before rename so the data is durable, not just the dirent.
+  const tmp = resolve(dir, `.${basename(filePath)}.${process.pid}.${Date.now()}.tmp`);
+  try {
+    const fd = openSync(tmp, "wx", 0o600);
+    try {
+      writeSync(fd, blob);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(tmp, filePath);
+  } catch (err) {
+    try { if (existsSync(tmp)) unlinkSync(tmp); } catch {}
+    throw err;
+  }
+  // rename respects the tmp file's mode, but chmod for the existing-file
+  // case so re-running enable-auto-unlock tightens perms even if the user
+  // loosened them by hand.
   chmodSync(filePath, 0o600);
 }
 

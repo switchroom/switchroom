@@ -1,6 +1,6 @@
 # Crash reports
 
-When the watchdog (`bin/bridge-watchdog.sh`) decides to kill an agent
+When the watchdog (`src/agents/wedge-watchdog.ts`) decides to kill an agent
 because it looks wedged — bridge stale, turn-active marker stuck,
 journal silent past the hard threshold — it first snapshots the
 agent's tmux pane scrollback to a crash-report file. RCA tooling can
@@ -61,19 +61,17 @@ less ~/.switchroom/agents/klanker/crash-reports/2026-05-06T01-59-37Z-turn-hang.t
   watchdog logs the error to its journal trail but proceeds with the
   restart.
 
-## Two implementations, one stream
+## Implementation
 
-Both `bin/bridge-watchdog.sh` (bash, hot path) and
-`src/agents/tmux.ts` (TypeScript, used by lifecycle/crash-detection
-code paths) write to the same directory using the same naming
-scheme and header format. RCA tooling reads from one stream
-regardless of which path produced the file. If you change one
-implementation, change the other.
+Pane capture lives in `src/agents/tmux.ts` (`captureAgentPane`), used
+by the watchdog and lifecycle/crash-detection code paths. (An earlier
+bash mirror, `bin/bridge-watchdog.sh`, has been removed — the
+TypeScript path is now the only implementation.)
 
 ## Disabling
 
 There's no env knob today. To disable, comment out the
-`capture_pane_before_restart` calls in `bridge-watchdog.sh` — the
-function itself is best-effort and never blocks the restart, so
+`captureAgentPane` calls in `src/agents/tmux.ts` — the function
+itself is best-effort and never blocks the restart, so
 leaving it on costs nothing for healthy agents (the file write only
 fires on actual restart events, which are rare on a healthy host).

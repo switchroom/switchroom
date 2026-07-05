@@ -125,7 +125,7 @@ is auto-reported. In addition, action-level boundaries call
 Current boundaries:
 
 - `src/cli/setup.ts` — setup wizard catch-all (`action: "setup"`)
-- `src/cli/init.ts` — init catch-all (`action: "init"`)
+- `src/cli/apply.ts` — apply catch-all (`action: "apply"`; `src/cli/init.ts` was folded into `apply`)
 - `src/web/api.ts` — agent start/stop/restart handlers
 - `telegram-plugin/gateway/gateway.ts` — gateway top-level (`source: "gateway"`,
   installed via `analytics-posthog.installGlobalErrorHandlers()`). Uncaught
