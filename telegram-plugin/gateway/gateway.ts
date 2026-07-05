@@ -124,6 +124,13 @@ import {
   computeBootSweepStripTargets,
   distinctRequestIds,
 } from './permission-rearm.js'
+import { createMissedApprovalsStore, type MissedApproval } from './missed-approvals-store.js'
+import {
+  renderMissedApprovalsDigest,
+  missedApprovalsKeyboard,
+  parseMissedApprovalCallback,
+  buildMissedApprovalRetryInbound,
+} from './missed-approvals-card.js'
 import { pickRecoveredPermissionOrigin } from './permission-card-origin.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
 import { appendActivityLabel, clipNarrative, renderActivityFeedWithNested, formatStepSuffix, type SessionActivityHeader } from '../tool-activity-summary.js'
@@ -680,6 +687,12 @@ process.on('beforeExit', () => {
 // ─── Env + state dir ──────────────────────────────────────────────────────
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const permCardStore = createPermissionCardStore(STATE_DIR)
+// #2862 — missed-approvals re-offer. Persisted list of approvals that
+// TTL-expired while the operator was away; a digest card is posted on the
+// operator's next activity. Kill switch: SWITCHROOM_MISSED_APPROVAL_REOFFER=0.
+const missedApprovalsStore = createMissedApprovalsStore(STATE_DIR)
+const MISSED_APPROVAL_REOFFER_ENABLED =
+  process.env.SWITCHROOM_MISSED_APPROVAL_REOFFER !== '0'
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
@@ -4593,6 +4606,131 @@ function clearPermissionTimeoutSuppression(reason: string): void {
     `telegram gateway: permission no-repeat suppression cleared (${n} sig(s)) — ${reason}\n`,
   )
 }
+
+// #2862 — missed-approvals re-offer digest. Called from every operator-activity
+// path that clears no-repeat suppression (inbound, /approve|/deny, card verdict):
+// on the FIRST activity after ≥1 approval TTL-expired while the operator was
+// away, post ONE compact digest card per origin surface listing the misses,
+// then promote those pending entries into a delivered-digest record (the posted
+// card is now the durable record in chat). Best-effort + fire-and-forget: never
+// blocks or throws into the hot inbound/callback path. Kill switch (=0) makes
+// this a no-op AND the auto-deny append below a no-op, so the whole feature is off.
+function maybePostMissedApprovalDigest(reason: string): void {
+  if (!MISSED_APPROVAL_REOFFER_ENABLED) return
+  const pending = missedApprovalsStore.listPending()
+  if (pending.length === 0) return
+  // Group by origin surface so each card lands where its cards were posted.
+  const groups = new Map<string, MissedApproval[]>()
+  for (const e of pending) {
+    const key = `${e.chatId}::${e.threadId ?? ''}`
+    const g = groups.get(key)
+    if (g) g.push(e)
+    else groups.set(key, [e])
+  }
+  for (const entries of groups.values()) {
+    const first = entries[0]
+    const chatId = first.chatId
+    const threadId = first.threadId ?? undefined
+    const digestId = randomBytes(4).toString('hex')
+    const text = renderMissedApprovalsDigest(entries, {
+      agentName: process.env.SWITCHROOM_AGENT_NAME ?? null,
+    })
+    void swallowingApiCall(
+      () =>
+        // allow-raw-bot-api: routed through swallowingApiCall retry policy; thread-aware digest card
+        bot.api.sendMessage(chatId, text, {
+          parse_mode: 'HTML',
+          reply_markup: missedApprovalsKeyboard(digestId),
+          ...(threadId != null && threadId !== 1 ? { message_thread_id: threadId } : {}),
+        }),
+      { chat_id: chatId, verb: 'missed-approval-digest', ...(threadId != null ? { threadId } : {}) },
+    )
+    // Promote synchronously (before the async send resolves) so a second
+    // operator-activity event racing in sees an empty pending list and can't
+    // double-post — "one card per accumulated batch" holds.
+    missedApprovalsStore.promoteToDigest({
+      digestId,
+      chatId,
+      threadId: first.threadId ?? null,
+      entries,
+      deliveredAt: Date.now(),
+    })
+  }
+  process.stderr.write(
+    `telegram gateway: missed-approval digest posted (${pending.length} entr(y/ies), ` +
+    `${groups.size} surface(s)) — ${reason}\n`,
+  )
+}
+
+// #2862 — handle a Retry / Dismiss tap on a missed-approvals digest card.
+//   missre:retry:<id>   — inject a synthetic inbound asking the agent to
+//                         re-attempt the actions (claude-native; re-raises a
+//                         fresh approval card). NEVER a verdict / re-execution.
+//   missre:dismiss:<id> — clear the record + edit the card closed.
+async function handleMissedApprovalCallback(ctx: Context, data: string): Promise<void> {
+  const senderId = String(ctx.from?.id ?? '')
+  const access = loadAccess()
+  if (!access.allowFrom.includes(senderId)) {
+    await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+    return
+  }
+  const parsed = parseMissedApprovalCallback(data)
+  if (parsed == null) {
+    await ctx.answerCallbackQuery({ text: 'Bad request' }).catch(() => {})
+    return
+  }
+  const digest = missedApprovalsStore.getDigest(parsed.digestId)
+  if (digest == null) {
+    await ctx.answerCallbackQuery({ text: 'This digest already actioned or expired.' }).catch(() => {})
+    if (ctx.callbackQuery?.message) {
+      await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => {})
+    }
+    return
+  }
+
+  if (parsed.action === 'dismiss') {
+    missedApprovalsStore.removeDigest(parsed.digestId)
+    await ctx.answerCallbackQuery({ text: '🚫 Dismissed — cleared.' }).catch(() => {})
+    if (ctx.callbackQuery?.message && 'text' in ctx.callbackQuery.message) {
+      await ctx
+        .editMessageText(
+          `${escapeHtmlForTg(ctx.callbackQuery.message.text ?? '')}\n\n🚫 <i>Dismissed.</i>`,
+          { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+        )
+        .catch(() => {})
+    }
+    return
+  }
+
+  // Retry — consume the record, then inject a synthetic inbound to the ORIGIN
+  // surface asking the agent to re-attempt. This rides the same synthesized-
+  // inbound path cron uses; the agent naturally re-raises a fresh approval card.
+  missedApprovalsStore.removeDigest(parsed.digestId)
+  const agent = process.env.SWITCHROOM_AGENT_NAME ?? ''
+  const synthetic = buildMissedApprovalRetryInbound({
+    ctx: {
+      agent,
+      chat_id: digest.chatId,
+      ...(digest.threadId != null ? { threadId: digest.threadId } : {}),
+    },
+    actions: digest.entries.map(e => e.action),
+    operatorId: senderId,
+  })
+  const delivered = deliverResumeSyntheticOrBuffer(agent, synthetic)
+  await ctx.answerCallbackQuery({ text: '🔁 Asking the agent to retry…' }).catch(() => {})
+  if (ctx.callbackQuery?.message && 'text' in ctx.callbackQuery.message) {
+    await ctx
+      .editMessageText(
+        `${escapeHtmlForTg(ctx.callbackQuery.message.text ?? '')}\n\n🔁 <i>Retrying — asked the agent.</i>`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+      )
+      .catch(() => {})
+  }
+  process.stderr.write(
+    `telegram gateway: missed-approval retry injection agent=${agent} ` +
+    `digest=${parsed.digestId} actions=${digest.entries.length} delivered=${delivered}\n`,
+  )
+}
 // Permission/approval-card origin recovery (marko Rentals-budget, 2026-06-17).
 // When `currentTurn` was force-closed by the orphaned-reply backstop but the
 // claude session kept running into a permission-gated tool, recover the card's
@@ -5260,6 +5398,23 @@ const pendingStateReaper = setInterval(() => {
           permissionSignature(v.tool_name, v.input_preview),
           now,
         )
+      }
+      // #2862 — record the miss so it can be re-offered when the operator
+      // returns. Anchor to the card's own origin surface (where the operator
+      // would have tapped), so the digest lands in the same topic — not a
+      // fanned-out DM. Skip if the card was never posted anywhere.
+      if (MISSED_APPROVAL_REOFFER_ENABLED) {
+        const origin = v.cards[0]
+        if (origin != null) {
+          missedApprovalsStore.add({
+            requestId: k,
+            toolName: v.tool_name,
+            action: naturalAction(v.tool_name, v.input_preview),
+            chatId: origin.chatId,
+            threadId: origin.threadId ?? null,
+            timedOutAt: now,
+          })
+        }
       }
       process.stderr.write(
         `telegram gateway: permission TTL expired — auto-deny request=${k} ` +
@@ -14519,6 +14674,8 @@ async function handleInbound(
   // present, so reset any no-repeat suppression: the next time the agent asks
   // for something that timed out earlier, they should see a fresh card.
   clearPermissionTimeoutSuppression('operator inbound')
+  // #2862 — operator is back; re-offer any approvals that timed out meanwhile.
+  maybePostMissedApprovalDigest('operator inbound')
 
   // Capture wall-clock receive time for inbound_ack metric (#203).
   // Must be after gate() so early-exit paths (drop/pair) don't skew the delta.
@@ -18271,6 +18428,8 @@ async function handlePermissionSlash(ctx: Context, behavior: 'allow' | 'deny'): 
   }
   // Operator answered via slash ⇒ present; reset no-repeat suppression.
   clearPermissionTimeoutSuppression('operator answered via /approve|/deny')
+  // #2862 — operator is present; re-offer any approvals that timed out meanwhile.
+  maybePostMissedApprovalDigest('operator answered via /approve|/deny')
   // Forward to connected bridges — same IPC the button handler uses.
   dispatchPermissionVerdict({ type: 'permission', requestId: request_id, behavior })
   resumeReactionAfterVerdict()
@@ -22679,6 +22838,15 @@ bot.on('callback_query:data', async ctx => {
     return
   }
 
+  // #2862: missed-approvals re-offer digest.
+  //   missre:retry:<id>   — inject a synthetic inbound asking the agent to
+  //                         re-attempt (re-raises a fresh approval card)
+  //   missre:dismiss:<id> — clear the record + edit the card closed
+  if (data.startsWith('missre:')) {
+    await handleMissedApprovalCallback(ctx, data)
+    return
+  }
+
   // Issue #969 P2b: vault recent-denial one-tap approval.
   //   vrd:<agent>:<key> — mint a 30-day read-grant for the agent + key
   // Posted by /vault audit <agent> in the "Recent denials" section.
@@ -23325,6 +23493,8 @@ bot.on('callback_query:data', async ctx => {
   // Operator tapped a verdict ⇒ they are present; reset no-repeat suppression
   // so a later identical ask is shown fresh rather than silently short-circuited.
   clearPermissionTimeoutSuppression('operator answered a permission card')
+  // #2862 — operator is present; re-offer any approvals that timed out meanwhile.
+  maybePostMissedApprovalDigest('operator answered a permission card')
   const pd = pendingPermissions.get(request_id)
   const resumeAction = pd ? naturalAction(pd.tool_name, pd.input_preview) : ''
   const scopedTtl = scopedApprovalTtlMs()
