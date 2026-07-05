@@ -14,6 +14,7 @@
  */
 
 import { describe, it, expect } from 'vitest'
+import { readFileSync } from 'node:fs'
 import {
   decideTurnFlush,
   isSilentFlushMarker,
@@ -238,18 +239,63 @@ describe('#2798 turn-flush block separation — real multi-block transcript shap
 // (stripExcessBold).
 // ---------------------------------------------------------------------------
 describe('#2798 turn-flush punctuation/bold parity with reply', () => {
-  // The shared deterministic format chain both send sites now apply, in order.
-  // replyFormatChain mirrors gateway executeReply (lines ~8924/8937/9175);
-  // turnFlushFormatChain mirrors the turn_end backstop (lines ~13571/added/
-  // 13708). They are deliberately IDENTICAL — that identity IS the parity
-  // contract this test guards; a future edit to only one gateway site would
-  // break byte-parity and red this test.
-  function replyFormatChain(text: string): string {
-    let t = normalizeParagraphBreaks(repairEscapedWhitespace(text))
-    t = stripExcessBold(normalizePunctuation(t))
-    return addParagraphSpacers(t)
-  }
-  function turnFlushFormatChain(text: string): string {
+  // SOURCE-STRUCTURAL guard (house pattern: gateway-outbound-redact.test.ts
+  // reads gateway.ts source and asserts the relative position of calls).
+  //
+  // The reply-parity contract is that the turn_flush backstop applies the SAME
+  // `stripExcessBold(normalizePunctuation(...))` normalization the reply path
+  // applies, in the SAME slot — after redactOutboundText, before scrubVoice.
+  //
+  // A prior version of this suite "guarded" that contract by defining two
+  // BYTE-IDENTICAL local functions (replyFormatChain / turnFlushFormatChain)
+  // and asserting `toBe` between them. That was tautological: the two locals
+  // were equal by construction regardless of what gateway.ts did, so deleting
+  // the normalization line from the turn_flush branch reddened NO test. The
+  // assertions below instead read the gateway source and pin the actual call
+  // ordering, so removing the `stripExcessBold(normalizePunctuation(capturedText))`
+  // line from the turn_flush branch REDS this suite — which is the exact
+  // regression #2798/#2813 shipped to prevent.
+  const gatewaySrc = readFileSync(
+    new URL('../gateway/gateway.ts', import.meta.url),
+    'utf8',
+  )
+
+  it('reply path: normalizes AFTER redact and BEFORE the voice scrub', () => {
+    const start = gatewaySrc.indexOf('async function executeReply(')
+    const redactIdx = gatewaySrc.indexOf(`redactOutboundText(text, 'reply')`, start)
+    const normIdx = gatewaySrc.indexOf('stripExcessBold(normalizePunctuation(text))', start)
+    const scrubIdx = gatewaySrc.indexOf('scrubVoice(text)', start)
+    expect(start).toBeGreaterThan(0)
+    expect(redactIdx).toBeGreaterThan(start)
+    expect(normIdx).toBeGreaterThan(redactIdx) // normalize AFTER the reply redact
+    expect(scrubIdx).toBeGreaterThan(normIdx) // ...and BEFORE the voice scrub
+  })
+
+  it('turn-flush backstop: applies the SAME normalization in the SAME slot (REDS if the line is removed)', () => {
+    const redactIdx = gatewaySrc.indexOf(`redactOutboundText(capturedText, 'turn_flush')`)
+    // The normalization call the reply path uses, verbatim, on the turn_flush
+    // variable. This indexOf is what returns -1 (→ assertion fails) if the
+    // `stripExcessBold(normalizePunctuation(capturedText))` line is deleted
+    // from the turn_flush branch.
+    const normIdx = gatewaySrc.indexOf('stripExcessBold(normalizePunctuation(capturedText))', redactIdx)
+    const scrubIdx = gatewaySrc.indexOf('scrubVoice(capturedText)', redactIdx)
+    expect(redactIdx).toBeGreaterThan(0)
+    expect(normIdx).toBeGreaterThan(redactIdx) // normalize AFTER the turn_flush redact
+    expect(scrubIdx).toBeGreaterThan(normIdx) // ...and BEFORE the voice scrub — mirrors reply
+  })
+
+  it('both send sites share the identical `stripExcessBold(normalizePunctuation(` wrapper', () => {
+    // Parity, structurally: the exact normalization wrapper the reply path uses
+    // is the one the turn_flush branch uses — same call, not a lookalike.
+    expect(gatewaySrc).toContain('stripExcessBold(normalizePunctuation(text))')
+    expect(gatewaySrc).toContain('stripExcessBold(normalizePunctuation(capturedText))')
+  })
+
+  // Behavioural coverage (kept from the original suite): reconstruct the
+  // deterministic format chain both sites apply and assert the REAL
+  // strip/normalize behaviour the added step provides — the over-bold block is
+  // stripped, unicode bullets become GFM list items, dashes are normalized.
+  function formatChain(text: string): string {
     let t = normalizeParagraphBreaks(repairEscapedWhitespace(text))
     t = stripExcessBold(normalizePunctuation(t))
     return addParagraphSpacers(t)
@@ -262,12 +308,8 @@ describe('#2798 turn-flush punctuation/bold parity with reply', () => {
     '• first bullet\n• second bullet\n\n' +
     'A range like 2019 – 2024 and a spaced em-dash a — b for good measure.'
 
-  it('produces byte-identical output to the reply format chain', () => {
-    expect(turnFlushFormatChain(input)).toBe(replyFormatChain(input))
-  })
-
   it('strips the over-bold block and normalizes bullets/dashes exactly as reply does', () => {
-    const out = turnFlushFormatChain(input)
+    const out = formatChain(input)
     // stripExcessBold removed the ** markers from the over-bolded paragraph
     // (the step turn-flush was missing) — the text survives, the markers do not.
     expect(out).not.toContain('**This whole paragraph')
