@@ -69,9 +69,27 @@ if [ "$SWITCHROOM_RUNTIME" = "docker" ] && [ -z "$SWITCHROOM_DOCKER_TMUX_INNER" 
     sr_ll_ok=""
     if [ -z "$sr_ll_key" ]; then
       echo "litellm(outer): no virtual key for agent '$SWITCHROOM_AGENT_NAME' — gateway will use direct OAuth (no tracking/guardrail)" >&2
-    elif command -v curl >/dev/null 2>&1 && [ -n "$ANTHROPIC_BASE_URL" ] \
-         && ! curl -fsS -m 5 -o /dev/null "${SWITCHROOM_LITELLM_BASE:-${ANTHROPIC_BASE_URL%/anthropic}}/health/liveliness" 2>/dev/null; then
-      echo "litellm(outer): proxy unreachable at ${SWITCHROOM_LITELLM_BASE:-$ANTHROPIC_BASE_URL} — falling back to direct OAuth (no tracking/guardrail this session)" >&2
+    elif command -v curl >/dev/null 2>&1 && [ -n "$ANTHROPIC_BASE_URL" ]; then
+      # Bounded retry probe (co-boot race fix, 2026-07): when the whole stack
+      # co-boots, the litellm proxy's heavy Python app is often not yet healthy
+      # in the first few seconds. A single one-shot probe fails-open and takes
+      # this agent dark (untracked) for the WHOLE session. Poll the liveliness
+      # endpoint every ~3s for up to 120s (hard budget) and only fall open if
+      # it is STILL unreachable after that whole window.
+      sr_ll_url="${SWITCHROOM_LITELLM_BASE:-${ANTHROPIC_BASE_URL%/anthropic}}/health/liveliness"
+      sr_ll_deadline=$(( $(date +%s) + 120 ))
+      sr_ll_up=""
+      while :; do
+        if curl -fsS -m 5 -o /dev/null "$sr_ll_url" 2>/dev/null; then sr_ll_up="1"; break; fi
+        [ "$(date +%s)" -ge "$sr_ll_deadline" ] && break
+        sleep 3
+      done
+      if [ -z "$sr_ll_up" ]; then
+        echo "litellm(outer): proxy unreachable at ${SWITCHROOM_LITELLM_BASE:-$ANTHROPIC_BASE_URL} after 120s of retries — falling back to direct OAuth (no tracking/guardrail this session)" >&2
+      else
+        sr_ll_ok="1"
+      fi
+      unset sr_ll_url sr_ll_deadline sr_ll_up
     else
       sr_ll_ok="1"
     fi
@@ -911,9 +929,27 @@ if [ -n "${SWITCHROOM_LITELLM:-}" ] && command -v switchroom >/dev/null 2>&1; th
   sr_ll_ok=""
   if [ -z "$sr_ll_key" ]; then
     echo "litellm: no virtual key for agent '$SWITCHROOM_AGENT_NAME' — falling back to direct OAuth (no tracking/guardrail)" >&2
-  elif command -v curl >/dev/null 2>&1 && [ -n "$ANTHROPIC_BASE_URL" ] \
-       && ! curl -fsS -m 5 -o /dev/null "${SWITCHROOM_LITELLM_BASE:-${ANTHROPIC_BASE_URL%/anthropic}}/health/liveliness" 2>/dev/null; then
-    echo "litellm: proxy unreachable at ${SWITCHROOM_LITELLM_BASE:-$ANTHROPIC_BASE_URL} — falling back to direct OAuth (no tracking/guardrail this session)" >&2
+  elif command -v curl >/dev/null 2>&1 && [ -n "$ANTHROPIC_BASE_URL" ]; then
+    # Bounded retry probe (co-boot race fix, 2026-07): when the whole stack
+    # co-boots, the litellm proxy's heavy Python app is often not yet healthy
+    # in the first few seconds. A single one-shot probe fails-open and takes
+    # this agent dark (untracked) for the WHOLE session. Poll the liveliness
+    # endpoint every ~3s for up to 120s (hard budget) and only fall open if
+    # it is STILL unreachable after that whole window.
+    sr_ll_url="${SWITCHROOM_LITELLM_BASE:-${ANTHROPIC_BASE_URL%/anthropic}}/health/liveliness"
+    sr_ll_deadline=$(( $(date +%s) + 120 ))
+    sr_ll_up=""
+    while :; do
+      if curl -fsS -m 5 -o /dev/null "$sr_ll_url" 2>/dev/null; then sr_ll_up="1"; break; fi
+      [ "$(date +%s)" -ge "$sr_ll_deadline" ] && break
+      sleep 3
+    done
+    if [ -z "$sr_ll_up" ]; then
+      echo "litellm: proxy unreachable at ${SWITCHROOM_LITELLM_BASE:-$ANTHROPIC_BASE_URL} after 120s of retries — falling back to direct OAuth (no tracking/guardrail this session)" >&2
+    else
+      sr_ll_ok="1"
+    fi
+    unset sr_ll_url sr_ll_deadline sr_ll_up
   else
     sr_ll_ok="1"
   fi
