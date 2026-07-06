@@ -14,9 +14,11 @@ description: >
   user" — that lives in profile banks, so never propose an identity model here
   (the operator's review of the card, not any code guard, is the only gate — so
   it's on you to honor).
-  Do NOT use when the operator directly asks you to CREATE one specific named
-  model whose shape you know — call create_mental_model directly.
-allowed-tools: mcp__hindsight__list_banks mcp__hindsight__get_bank_stats mcp__hindsight__list_mental_models mcp__hindsight__get_mental_model mcp__hindsight__reflect mcp__hindsight__recall mcp__hindsight__create_mental_model mcp__switchroom-telegram__mental_model_propose
+  Even when the operator directly asks you to CREATE one specific named model
+  whose shape you know, PROPOSE it through the approve/deny card — never call
+  create_mental_model directly (it is not pre-approved; the propose card is the
+  only sanctioned write path, Fix 1.2 / #2903).
+allowed-tools: mcp__hindsight__list_banks mcp__hindsight__get_bank_stats mcp__hindsight__list_mental_models mcp__hindsight__get_mental_model mcp__hindsight__reflect mcp__hindsight__recall mcp__switchroom-telegram__mental_model_propose
 ---
 
 # mental-model-curator — Propose standing knowledge models from your own bank
@@ -33,8 +35,9 @@ job is to make each proposal so obviously right that a glance is enough.
 
 ## Why propose instead of create
 
-You have direct `create_mental_model` access. This skill deliberately routes
-through `mcp__switchroom-telegram__mental_model_propose` instead, because a
+You do NOT have direct `create_mental_model` access — it is deliberately not
+pre-approved (Fix 1.2 / #2903). Every mental-model write routes through
+`mcp__switchroom-telegram__mental_model_propose`, because a
 standing model is a persistent, always-in-context artifact with real cost
 (recall/reflect spend, and — if `refresh_after_consolidation` is on — invisible
 post-consolidation spend). A human should decide which of those the agent runs.

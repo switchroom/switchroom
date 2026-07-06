@@ -242,26 +242,74 @@ def find_last_human_turn(messages: list) -> tuple:
     return None, ""
 
 
-def _directive_call_present(content) -> bool:
-    """True if a message's content contains a create_directive tool_use."""
+def _directive_call_ids(content) -> list:
+    """Return the tool_use ids of any create_directive calls in a message's
+    content (empty list if none)."""
+    ids = []
     if not isinstance(content, list):
-        return False
+        return ids
     for p in content:
         if not isinstance(p, dict) or p.get("type") != "tool_use":
             continue
         name = p.get("name", "")
         if isinstance(name, str) and "create_directive" in name:
-            return True
-    return False
+            # Track the id so we can pair it with its tool_result and reject a
+            # call whose write ERRORED. A call with no id still counts as a
+            # (best-effort) attempt — see _directive_call_present.
+            ids.append(p.get("id"))
+    return ids
+
+
+def _directive_call_present(content) -> bool:
+    """True if a message's content contains a create_directive tool_use."""
+    return len(_directive_call_ids(content)) > 0
+
+
+# SWITCHROOM DIVERGENCE (#2903, Fix 1.3): a create_directive tool_use whose
+# tool_result came back with an error must NOT count as "recorded". A hindsight
+# tools/call returns HTTP 200 + is_error:true on failure (engine down / renamed
+# arg / isError envelope); without this the verifier would see the call, treat
+# the correction as captured, and never fire its one bounded re-prompt — the
+# same false-success class that made chat show "📌 remembered" for a failed
+# write. We scan subsequent user messages for the matching tool_result id and
+# treat is_error:true (or an error-shaped text result) as NOT-recorded.
+def _errored_tool_use_ids(messages: list) -> set:
+    """Collect tool_use ids whose tool_result reported an error."""
+    errored = set()
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for p in content:
+            if not isinstance(p, dict) or p.get("type") != "tool_result":
+                continue
+            if p.get("is_error") is True:
+                tid = p.get("tool_use_id")
+                if tid is not None:
+                    errored.add(tid)
+    return errored
 
 
 def directive_recorded_after(messages: list, start_index: int) -> bool:
-    """True if any assistant turn after ``start_index`` called create_directive."""
+    """True if any assistant turn after ``start_index`` called create_directive
+    with a SUCCESSFUL result. A call whose tool_result errored does not count
+    (SWITCHROOM DIVERGENCE #2903, Fix 1.3) — so the verifier still re-prompts
+    once for a durable rule whose write failed."""
+    errored = _errored_tool_use_ids(messages)
     for msg in messages[start_index + 1:]:
         if not isinstance(msg, dict) or msg.get("role") != "assistant":
             continue
-        if _directive_call_present(msg.get("content")):
-            return True
+        ids = _directive_call_ids(msg.get("content"))
+        if not ids:
+            continue
+        # Recorded only if at least one create_directive call did NOT error.
+        # A call with a None id (older/testing shape carrying no id) has no
+        # pairable result, so treat it as a successful attempt (prior behaviour).
+        for tid in ids:
+            if tid is None or tid not in errored:
+                return True
     return False
 
 

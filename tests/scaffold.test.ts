@@ -1881,7 +1881,13 @@ describe("reconcileAgent", () => {
     const after = JSON.parse(readFileSync(settingsPath, "utf-8"));
     expect(after.mcpServers.hindsight).toBeDefined();
     expect(after.mcpServers.hindsight.url).toBe("http://localhost:18888/mcp/");
-    expect(after.permissions.allow).toContain("mcp__hindsight__*");
+    // Fix 1.2 (#2903): enumerated allow-list, NOT a wildcard/bare server grant.
+    expect(after.permissions.allow).not.toContain("mcp__hindsight__*");
+    expect(after.permissions.allow).not.toContain("mcp__hindsight");
+    expect(after.permissions.allow).toContain("mcp__hindsight__recall");
+    expect(after.permissions.allow).toContain("mcp__hindsight__retain");
+    // Mental-model writes must NOT be pre-approved — they go through the propose card.
+    expect(after.permissions.allow).not.toContain("mcp__hindsight__create_mental_model");
   });
 
   it("rewrites .mcp.json for switchroom-telegram-plugin agents to include hindsight", () => {
@@ -2156,7 +2162,7 @@ describe("reconcileAgent", () => {
 
     const settingsPath = join(tmpDir, "test-agent", ".claude", "settings.json");
     const beforeReconcile = JSON.parse(readFileSync(settingsPath, "utf-8"));
-    expect(beforeReconcile.permissions.allow).toContain("mcp__hindsight__*");
+    expect(beforeReconcile.permissions.allow).toContain("mcp__hindsight__recall");
 
     // Reconcile against a config with backend=none
     const withoutMemory = buildSwitchroomConfig(agentConfig, {
@@ -2166,7 +2172,7 @@ describe("reconcileAgent", () => {
     reconcileAgent("test-agent", agentConfig, tmpDir, telegramConfig, withoutMemory);
 
     const after = JSON.parse(readFileSync(settingsPath, "utf-8"));
-    expect(after.permissions.allow).not.toContain("mcp__hindsight__*");
+    expect(after.permissions.allow).not.toContain("mcp__hindsight__recall");
     expect(after.mcpServers.hindsight).toBeUndefined();
   });
 });

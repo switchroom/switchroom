@@ -325,6 +325,27 @@ describe("generateHindsightComposeSnippet — tmpfs ownership", () => {
     expect(tmpfsLine).toMatch(/mode=0700\b/);
   });
 
+  it("publishes both ports on 127.0.0.1 only — the tokenless API must never bind 0.0.0.0 (Fix 1.1)", async () => {
+    const { generateHindsightComposeSnippet, HINDSIGHT_DEFAULT_API_PORT } =
+      await import("../../src/setup/hindsight.js");
+    const snippet = generateHindsightComposeSnippet();
+    const portLines = snippet
+      .split("\n")
+      .filter((l) => /^\s+-\s+"[\d.:]+:\d+"\s*$/.test(l));
+    // Both the API and UI published ports must be present and loopback-bound.
+    expect(portLines.length).toBeGreaterThanOrEqual(2);
+    for (const line of portLines) {
+      expect(line, `port binding must be loopback-only: ${line}`).toMatch(
+        /"127\.0\.0\.1:/,
+      );
+    }
+    expect(snippet).toContain(`"127.0.0.1:${HINDSIGHT_DEFAULT_API_PORT}:8888"`);
+    expect(snippet).toContain('"127.0.0.1:19999:9999"');
+    // Guard against a regression that drops the host-IP prefix entirely.
+    expect(snippet).not.toMatch(/-\s+"\d+:8888"/);
+    expect(snippet).not.toMatch(/-\s+"\d+:9999"/);
+  });
+
   it("emits shm_size so the compose path matches the docker-run shm fix (2026-06-06 outage)", async () => {
     const { generateHindsightComposeSnippet, HINDSIGHT_DEFAULT_SHM_SIZE: shm } =
       await import("../../src/setup/hindsight.js");

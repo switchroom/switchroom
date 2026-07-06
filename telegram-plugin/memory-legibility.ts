@@ -134,6 +134,60 @@ export function detectMemoryLegibilityEvent(
   return { kind: 'forgot', detail }
 }
 
+/**
+ * Confirm-before-legibility stager (Fix 1.3, #2903).
+ *
+ * A material memory op is detected on the `tool_use` event, but the write is
+ * not yet confirmed — the hindsight `tools/call` can still fail (engine down,
+ * `isError` envelope) and return an error `tool_result`. Sending the 📌/✂️ line
+ * on the tool_use would claim "remembered" for a write that then failed.
+ *
+ * This stager holds detected events keyed by `toolUseId`. `confirm` returns the
+ * event to send ONLY on a successful result; a failed result (`isError`) drops
+ * it and returns null. Pure and I/O-free so the send/no-send decision is unit-
+ * testable independent of the gateway's Telegram plumbing.
+ *
+ * `M` is caller-side routing metadata (chat/thread) carried opaquely.
+ */
+export class MemoryLegibilityStager<M> {
+  private pending = new Map<string, { event: MemoryLegibilityEvent; meta: M }>()
+  /** Bound the map so a turn that never emits a matching tool_result (crash
+   *  mid-tool) can't leak entries unboundedly. */
+  constructor(private readonly cap = 256) {}
+
+  /** Stage a detected event awaiting result confirmation. */
+  stage(toolUseId: string, event: MemoryLegibilityEvent, meta: M): void {
+    if (this.pending.size >= this.cap) {
+      const oldest = this.pending.keys().next().value
+      if (oldest != null) this.pending.delete(oldest)
+    }
+    this.pending.set(toolUseId, { event, meta })
+  }
+
+  /**
+   * Resolve a staged event on its matching tool_result. Returns the event +
+   * meta to send on CONFIRMED success; returns null when the write errored,
+   * when nothing was staged for this id, or when the id is empty. Always
+   * consumes the staged entry.
+   */
+  confirm(
+    toolUseId: string | null | undefined,
+    isError: boolean | undefined,
+  ): { event: MemoryLegibilityEvent; meta: M } | null {
+    if (toolUseId == null || toolUseId.length === 0) return null
+    const staged = this.pending.get(toolUseId)
+    if (staged == null) return null
+    this.pending.delete(toolUseId)
+    if (isError === true) return null
+    return staged
+  }
+
+  /** Test/introspection helper: number of currently-staged events. */
+  get size(): number {
+    return this.pending.size
+  }
+}
+
 /** HTML-escape for parse_mode:'HTML' (escape the 3 entity-significant chars). */
 function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')

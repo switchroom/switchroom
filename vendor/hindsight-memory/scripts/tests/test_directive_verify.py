@@ -224,6 +224,63 @@ class TestDirectiveDetection(unittest.TestCase):
         ]
         self.assertFalse(directive_recorded_after(msgs, 1))
 
+    def _mk_id(self, name, tid):
+        return {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": tid, "name": name, "input": {}}
+            ],
+        }
+
+    def _result(self, tid, is_error):
+        return {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tid,
+                    "is_error": is_error,
+                    "content": "boom" if is_error else "ok",
+                }
+            ],
+        }
+
+    def test_errored_create_directive_is_not_recorded(self):
+        # SWITCHROOM DIVERGENCE #2903 Fix 1.3: a create_directive whose result
+        # errored must NOT count as recorded, so the verifier re-prompts once.
+        msgs = [
+            {"role": "user", "content": "call me Ken"},
+            self._mk_id("mcp__hindsight__create_directive", "toolu_1"),
+            self._result("toolu_1", True),
+        ]
+        self.assertFalse(directive_recorded_after(msgs, 0))
+
+    def test_successful_create_directive_with_result_is_recorded(self):
+        msgs = [
+            {"role": "user", "content": "call me Ken"},
+            self._mk_id("mcp__hindsight__create_directive", "toolu_1"),
+            self._result("toolu_1", False),
+        ]
+        self.assertTrue(directive_recorded_after(msgs, 0))
+
+    def test_one_failed_one_successful_directive_is_recorded(self):
+        msgs = [
+            {"role": "user", "content": "call me Ken"},
+            self._mk_id("mcp__hindsight__create_directive", "toolu_1"),
+            self._result("toolu_1", True),
+            self._mk_id("mcp__hindsight__create_directive", "toolu_2"),
+            self._result("toolu_2", False),
+        ]
+        self.assertTrue(directive_recorded_after(msgs, 0))
+
+    def test_call_without_id_still_counts_as_attempt(self):
+        # Older/testing shape with no tool_use id has no pairable result.
+        msgs = [
+            {"role": "user", "content": "call me Ken"},
+            self._mk("mcp__hindsight__create_directive"),
+        ]
+        self.assertTrue(directive_recorded_after(msgs, 0))
+
 
 class TestEvaluate(unittest.TestCase):
     ON = {"directiveCaptureNudge": True}

@@ -97,6 +97,7 @@ import {
   detectMemoryLegibilityEvent,
   isMemoryLegibilityEnabled,
   renderMemoryLegibilityLine,
+  MemoryLegibilityStager,
 } from '../memory-legibility.js'
 import {
   ConsolidationRateLimiter,
@@ -13058,21 +13059,31 @@ function clearActivitySummary(turn: CurrentTurn, finalHtmlOverride?: string | nu
  * gateway. Non-material tool calls return silently — no line on ordinary
  * recall or routine consolidation. Kill-switch: SWITCHROOM_MEMORY_LEGIBILITY=0.
  */
-function surfaceMemoryLegibility(
-  turn: CurrentTurn,
-  toolName: string,
-  input: Record<string, unknown> | undefined,
+/**
+ * Fix 1.3 (#2903): a memory-legibility line must render only AFTER the write
+ * is confirmed. We stage the detected event on `tool_use` (keyed by
+ * `toolUseId`) and flush the 📌/✂️ line on the matching SUCCESSFUL
+ * `tool_result` — a failed write (engine down / isError envelope) drops the
+ * staged line, so chat never claims "remembered" for a write that errored.
+ *
+ * A hindsight `tools/call` returns HTTP 200 + `is_error:true` on failure, and
+ * Claude Code surfaces that on the transcript `tool_result` block, which
+ * `session-tail` projects onto `ev.isError`. That is the confirmed-success
+ * signal we gate on.
+ */
+interface MemoryLegibilityRoute {
+  chatId: string
+  threadId: number | undefined
+  toolName: string
+}
+const memoryLegibilityStager = new MemoryLegibilityStager<MemoryLegibilityRoute>()
+
+function sendMemoryLegibilityLine(
+  event: NonNullable<ReturnType<typeof detectMemoryLegibilityEvent>>,
+  chatId: string,
+  threadId: number | undefined,
 ): void {
-  if (!MEMORY_LEGIBILITY_ENABLED) return
-  const event = detectMemoryLegibilityEvent(toolName, input)
-  if (event == null) return
-  const chatId = turn.sessionChatId
-  const threadId = turn.sessionThreadId
   const line = renderMemoryLegibilityLine(event)
-  process.stderr.write(
-    `telegram gateway: memory-legibility ${event.kind} chat=${chatId} ` +
-      `thread=${threadId ?? '-'} tool=${toolName}\n`,
-  )
   void retryWithThreadFallback(
     robustApiCall,
     (tid) =>
@@ -13090,6 +13101,60 @@ function surfaceMemoryLegibility(
       }\n`,
     )
   })
+}
+
+/** Stage a material memory event observed on `tool_use`. Nothing is sent yet;
+ *  the line is flushed by `confirmMemoryLegibility` on a successful result. */
+function surfaceMemoryLegibility(
+  turn: CurrentTurn,
+  toolName: string,
+  toolUseId: string | null | undefined,
+  input: Record<string, unknown> | undefined,
+): void {
+  if (!MEMORY_LEGIBILITY_ENABLED) return
+  const event = detectMemoryLegibilityEvent(toolName, input)
+  if (event == null) return
+  const chatId = turn.sessionChatId
+  const threadId = turn.sessionThreadId
+  // Without a toolUseId we cannot correlate a result to confirm success. This
+  // effectively never happens (Claude Code always stamps a tool_use id), so
+  // rather than claim an unconfirmed "remembered", we skip and log.
+  if (toolUseId == null || toolUseId.length === 0) {
+    process.stderr.write(
+      `telegram gateway: memory-legibility ${event.kind} SKIPPED (no toolUseId) ` +
+        `chat=${chatId} tool=${toolName}\n`,
+    )
+    return
+  }
+  memoryLegibilityStager.stage(toolUseId, event, { chatId, threadId, toolName })
+  process.stderr.write(
+    `telegram gateway: memory-legibility ${event.kind} STAGED chat=${chatId} ` +
+      `thread=${threadId ?? '-'} tool=${toolName} id=${toolUseId}\n`,
+  )
+}
+
+/** Flush (or drop) a staged memory-legibility line on its matching
+ *  `tool_result`. Sends only on confirmed success; a failed write is dropped
+ *  so chat never claims "remembered" for a write that errored. */
+function confirmMemoryLegibility(
+  toolUseId: string | null | undefined,
+  isError: boolean | undefined,
+): void {
+  const resolved = memoryLegibilityStager.confirm(toolUseId, isError)
+  if (resolved == null) {
+    if (isError === true) {
+      process.stderr.write(
+        `telegram gateway: memory-legibility DROPPED (write errored) id=${toolUseId}\n`,
+      )
+    }
+    return
+  }
+  const { event, meta } = resolved
+  process.stderr.write(
+    `telegram gateway: memory-legibility ${event.kind} CONFIRMED chat=${meta.chatId} ` +
+      `thread=${meta.threadId ?? '-'} tool=${meta.toolName} id=${toolUseId}\n`,
+  )
+  sendMemoryLegibilityLine(event, meta.chatId, meta.threadId)
 }
 
 /**
@@ -13456,7 +13521,7 @@ function handleSessionEvent(ev: SessionEvent): void {
       // on turns with no active status-reaction controller. Deterministic
       // tool-call observation — no model call, no polling; ordinary recall and
       // routine consolidation never reach here (they aren't material tools).
-      surfaceMemoryLegibility(turn, ev.toolName, ev.input)
+      surfaceMemoryLegibility(turn, ev.toolName, ev.toolUseId, ev.input)
       const ctrl = activeStatusReactions.get(statusKey(turn.sessionChatId, turn.sessionThreadId))
       const name = ev.toolName
       // Phase tracking removed in #553 PR 5 — phases only fed the
@@ -13887,6 +13952,9 @@ function handleSessionEvent(ev: SessionEvent): void {
     }
     case 'tool_result': {
       if (ev.toolUseId) typingWrapper.onToolResult(ev.toolUseId)
+      // Fix 1.3 (#2903): flush a staged 📌/✂️ memory-legibility line only on a
+      // CONFIRMED-successful write; a failed write (ev.isError) drops it.
+      confirmMemoryLegibility(ev.toolUseId, ev.isError)
       return
     }
     case 'sub_agent_tool_use': {
