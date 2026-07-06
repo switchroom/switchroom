@@ -447,30 +447,27 @@ function pctCells(
 }
 
 /**
- * The Status cell: for a blocked account, when the binding window comes back
- * (`back <when>`); for a healthy/throttling account, when the soonest window
- * refills (`refills <when>`). `<when>` is the tz-aware absolute time (date shown
- * only when not today) plus the concise relative hint in parens.
+ * The per-window reset cell (`5h resets` / `7d resets`): the tz-aware absolute
+ * reset time for THAT specific window (date shown only when not today) plus the
+ * concise relative hint in parens — e.g. `1:20 PM (in 2h)`.
+ *
+ * Degrades in lockstep with `pctCells` so the percentage cell and its reset cell
+ * always agree: no quota → probe-failed message (or `—`); thin probe → `quota
+ * unknown`; missing reset on an otherwise-present window → `—`.
  */
-function statusCell(snap: AccountSnapshot, now: Date, tz: string): string {
+function windowResetCell(
+  snap: AccountSnapshot,
+  now: Date,
+  tz: string,
+  win: '5h' | '7d',
+): string {
   if (!snap.quota) {
-    return snap.quotaError ? `probe failed (${snap.quotaError})` : 'probe failed';
+    return snap.quotaError ? `probe failed (${snap.quotaError})` : '—';
   }
   if (isProbeThin(snap.quota)) return 'quota unknown';
-  const q = snap.quota;
-  const health = classifyHealth(snap, now);
-  if (health === 'blocked') {
-    const win = bindingWindow(q);
-    const reset = win === '5h' ? q.fiveHourResetAt : q.sevenDayResetAt;
-    if (!reset) return 'back — (reset unknown)';
-    return `back ${formatStatusTime(reset, now, tz)} (in ${formatRelative(reset, now)})`;
-  }
-  // healthy / throttling — show the soonest refill across both windows.
-  const fiveIn = q.fiveHourResetAt ? q.fiveHourResetAt.getTime() - now.getTime() : Infinity;
-  const sevenIn = q.sevenDayResetAt ? q.sevenDayResetAt.getTime() - now.getTime() : Infinity;
-  const soonest = fiveIn <= sevenIn ? q.fiveHourResetAt : q.sevenDayResetAt;
-  if (!soonest) return 'refills —';
-  return `refills ${formatStatusTime(soonest, now, tz)} (in ${formatRelative(soonest, now)})`;
+  const reset = win === '5h' ? snap.quota.fiveHourResetAt : snap.quota.sevenDayResetAt;
+  if (!reset) return '—';
+  return `${formatStatusTime(reset, now, tz)} (in ${formatRelative(reset, now)})`;
 }
 
 export function renderAuthSnapshotFormat2(
@@ -495,8 +492,8 @@ export function renderAuthSnapshotFormat2(
 
   if (ordered.length > 0) {
     lines.push('');
-    lines.push('| State | Account | 5h | 7d | Status |');
-    lines.push('| --- | --- | --- | --- | --- |');
+    lines.push('| State | Account | 5h | 5h resets | 7d | 7d resets |');
+    lines.push('| --- | --- | --- | --- | --- | --- |');
     for (const s of ordered) {
       const emoji = HEALTH_EMOJI[classifyHealth(s, now)];
       // Account cell: FULL email, never truncated; active gets a (active) suffix.
@@ -512,9 +509,10 @@ export function renderAuthSnapshotFormat2(
       // tableCell wrap around the finished span.
       const accountCell = `\`${codeSpanSafe(s.isActive ? `${label} (active)` : label)}\``;
       const { five, seven } = pctCells(s, now);
-      const status = statusCell(s, now, tz);
+      const fiveReset = windowResetCell(s, now, tz, '5h');
+      const sevenReset = windowResetCell(s, now, tz, '7d');
       lines.push(
-        `| ${emoji} | ${tableCell(accountCell)} | ${five} | ${seven} | ${tableCell(status)} |`,
+        `| ${emoji} | ${tableCell(accountCell)} | ${five} | ${tableCell(fiveReset)} | ${seven} | ${tableCell(sevenReset)} |`,
       );
     }
   }
