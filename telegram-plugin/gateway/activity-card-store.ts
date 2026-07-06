@@ -278,6 +278,82 @@ export async function runActivityCardBootReaper(args: {
 }
 
 /**
+ * Mid-session periodic orphan reaper (#2918). The boot reaper above only runs
+ * once at startup, so a card whose owning turn's process dies MID-session (SDK
+ * subprocess SIGKILL / OOM / crash) without a clean finalize stays frozen on
+ * its last "working…" frame until the NEXT gateway boot — hours later. This
+ * variant runs inside the LIVE gateway on a timer and finalizes ONLY records
+ * that are demonstrably orphaned:
+ *
+ *   - `isLive(record)` — the caller's liveness predicate (gateway:
+ *     `currentTurnMap.byKey.has(record.turnKey)` OR the singleton `currentTurn`
+ *     mirror owns this topic). A record whose topic is still live is NEVER
+ *     touched, so the currently-spinning card of an in-flight turn is safe.
+ *   - age gate — `now - startedAt >= ttlMs`, a secondary guard so a card that
+ *     JUST opened (before its turn populated the live map) is protected.
+ *
+ * Same AT-MOST-ONCE contract as the boot reaper: each record is deleted from
+ * the store BEFORE its finalize/unpin is attempted, and failures are swallowed
+ * without retry. The two reapers share `runOneCardFinalize` semantics via the
+ * identical delete-first ordering — a boot reaper and a mid-session sweep can
+ * never double-finalize the same message (whichever deletes the record first
+ * wins; the other sees an empty/short list).
+ */
+export async function runActivityCardMidSessionReaper(args: {
+  path: string
+  fs: ActivityCardStoreFsSeam
+  /** True IFF the record's topic is still owned by a live in-flight turn. */
+  isLive: (record: ActivityCardRecord) => boolean
+  ttlMs: number
+  now?: number
+  finalizeCard: (record: ActivityCardRecord) => Promise<unknown>
+  unpinCard: (record: ActivityCardRecord) => Promise<unknown>
+  log?: (line: string) => void
+}): Promise<{ finalized: number; vanished: number; unpinned: number; total: number }> {
+  const log = args.log ?? ((l: string) => process.stderr.write(l))
+  const now = args.now ?? Date.now()
+  const cutoff = now - args.ttlMs
+  const persisted = loadActivityCards(args.path, args.fs)
+  // Only ownerless cards aged past the TTL. Liveness does the real work; the
+  // age gate only closes the just-opened-not-yet-tracked race window.
+  const stale = persisted.filter(
+    (r) => !args.isLive(r) && r.startedAt <= cutoff,
+  )
+  if (stale.length === 0) return { finalized: 0, vanished: 0, unpinned: 0, total: 0 }
+  let finalized = 0
+  let vanished = 0
+  let unpinned = 0
+  for (const record of stale) {
+    // Delete BEFORE the edit — the same idempotency guard the boot reaper uses.
+    clearActivityCardRecord(args.path, args.fs, record.turnKey, record.activityMessageId, log)
+    try {
+      const res = await args.finalizeCard(record)
+      if (res != null) finalized++
+      else vanished++
+    } catch (err) {
+      log(
+        `activity-card-store: mid-session reaper finalize failed ` +
+          `(chat=${record.chatId} msg=${record.activityMessageId}): ` +
+          `${(err as Error).message}\n`,
+      )
+    }
+    if (record.pinned) {
+      try {
+        await args.unpinCard(record)
+        unpinned++
+      } catch (err) {
+        log(
+          `activity-card-store: mid-session reaper unpin failed ` +
+            `(chat=${record.chatId} msg=${record.activityMessageId}): ` +
+            `${(err as Error).message}\n`,
+        )
+      }
+    }
+  }
+  return { finalized, vanished, unpinned, total: stale.length }
+}
+
+/**
  * Honest finalize text for an orphaned card — the single edit the boot
  * reaper applies. Mirrors `silentEndFallbackText`'s honesty-about-elapsed
  * convention (`telegram-plugin/silent-end.ts`): degenerate/unknown durations

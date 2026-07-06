@@ -497,6 +497,84 @@ export function markOrphanedWithTimeoutClassification(
   return { reaped: (timeoutTurnKey ? 1 : 0) + rest.changes, timeoutTurnKey }
 }
 
+export interface ReapStaleOpenTurnsOpts {
+  /**
+   * The set of turn_keys that belong to a turn still LIVE in this process's
+   * memory (the gateway's `currentTurnMap` registry keys plus the singleton
+   * `currentTurn` mirror). A row whose turn_key is in this set is NEVER
+   * reaped — it is a genuinely in-flight turn whose spinner must keep
+   * spinning, however long it runs. This is the load-bearing liveness
+   * predicate: age alone must never reap; only an open row with NO live
+   * owner qualifies.
+   */
+  activeTurnKeys: ReadonlySet<string>
+  /**
+   * Minimum age (ms, measured from `started_at`) before an ownerless open row
+   * is swept. A secondary guard against races — a turn that has JUST started
+   * but not yet populated the live set (or a row recorded microseconds ago) is
+   * protected until it ages past this. Liveness (activeTurnKeys) does the real
+   * work; the TTL only closes the "recorded-but-not-yet-tracked" window.
+   */
+  ttlMs: number
+  /** Injectable clock for tests. */
+  now?: number
+}
+
+export interface ReapStaleOpenTurnsResult {
+  /** Rows stamped `ended_via='restart'` by this sweep. */
+  reaped: number
+  /** The turn_keys that were stamped, for logging / card finalization. */
+  reapedTurnKeys: string[]
+}
+
+/**
+ * Mid-session periodic reaper (#2918). The boot-time
+ * `markOrphanedWithTimeoutClassification` only runs once, right after
+ * `openTurnsDb` — so a turn whose owning process dies MID-session (the SDK
+ * subprocess is SIGKILLed / OOMs / crashes) without a clean `recordTurnEnd`
+ * leaves its row `ended_at IS NULL`, and its activity card keeps spinning
+ * until the NEXT gateway boot (often many hours later). This sweep runs on a
+ * periodic timer inside the live gateway and stamps those ownerless open rows
+ * `ended_via='restart'` (the same clean-interrupt classification the boot
+ * reaper uses for a non-hung orphan) so the stale card can be finalized
+ * without waiting for a restart.
+ *
+ * CORRECTNESS: only rows that are BOTH (a) not owned by any live turn
+ * (`turn_key ∉ activeTurnKeys`) AND (b) older than `ttlMs` are swept. A
+ * healthy in-flight turn — however long it runs — is always in
+ * `activeTurnKeys` and is never touched. Never invents a new state; reuses
+ * `'restart'` so the existing resume/report policy applies unchanged.
+ */
+export function reapStaleOpenTurns(
+  db: SqliteDatabase,
+  opts: ReapStaleOpenTurnsOpts,
+): ReapStaleOpenTurnsResult {
+  const now = opts.now ?? Date.now()
+  const cutoff = now - opts.ttlMs
+  // Candidate = open row aged past the TTL. Liveness is filtered in JS against
+  // the injected active set (avoids brittle SQL IN-list binding).
+  const candidates = db.prepare(`
+    SELECT turn_key FROM turns
+    WHERE ended_at IS NULL AND started_at <= ?
+  `).all(cutoff) as { turn_key: string }[]
+
+  const stamp = db.prepare(`
+    UPDATE turns
+    SET ended_at   = ?,
+        ended_via  = 'restart',
+        updated_at = ?
+    WHERE turn_key = ? AND ended_at IS NULL
+  `)
+
+  const reapedTurnKeys: string[] = []
+  for (const { turn_key } of candidates) {
+    if (opts.activeTurnKeys.has(turn_key)) continue // live — never reap
+    const r = stamp.run(now, now, turn_key) as { changes: number }
+    if (r.changes > 0) reapedTurnKeys.push(turn_key)
+  }
+  return { reaped: reapedTurnKeys.length, reapedTurnKeys }
+}
+
 /**
  * Return the most recent N turns for `chatId` (any state — running or ended),
  * ordered by started_at DESC. Used by the idle-footer renderer to decide

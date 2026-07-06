@@ -35,6 +35,7 @@ import {
   writeActivityCardRecord,
   clearActivityCardRecord,
   runActivityCardBootReaper,
+  runActivityCardMidSessionReaper,
   restartOrphanCardFinalizeText,
   type ActivityCardRecord,
   type ActivityCardStoreFsSeam,
@@ -432,5 +433,98 @@ describe('restartOrphanCardFinalizeText', () => {
     const text = restartOrphanCardFinalizeText(Date.now() + 10_000) // future — negative elapsed
     expect(text).toContain('Interrupted by a gateway restart')
     expect(text).not.toContain('was running')
+  })
+})
+
+describe('runActivityCardMidSessionReaper (#2918 mid-session sweep)', () => {
+  const NOW = 2_000_000_000_000
+  const TTL = 15 * 60_000
+
+  it('finalizes + unpins an ownerless stale card, and deletes its record', async () => {
+    const dead = card({ turnKey: 'c:dead', activityMessageId: 715, startedAt: NOW - 30 * 60_000 })
+    const { fs, files } = memFs()
+    writeActivityCardRecord(PATH, fs, dead)
+    const finalized: number[] = []
+    const unpinned: number[] = []
+    const res = await runActivityCardMidSessionReaper({
+      path: PATH, fs,
+      isLive: () => false, // process gone, no live owner
+      ttlMs: TTL, now: NOW,
+      finalizeCard: async (r) => { finalized.push(r.activityMessageId); return { message_id: r.activityMessageId } },
+      unpinCard: async (r) => { unpinned.push(r.activityMessageId); return true },
+    })
+    expect(res).toEqual({ finalized: 1, vanished: 0, unpinned: 1, total: 1 })
+    expect(finalized).toEqual([715])
+    expect(unpinned).toEqual([715])
+    // Record deleted BEFORE the edit (at-most-once idempotency guard).
+    expect(loadActivityCards(PATH, fs)).toEqual([])
+    void files
+  })
+
+  it('NEVER touches a live card (isLive true) — spinner keeps spinning', async () => {
+    const live = card({ turnKey: 'c:live', activityMessageId: 900, startedAt: NOW - 6 * 60 * 60_000 })
+    const { fs } = memFs()
+    writeActivityCardRecord(PATH, fs, live)
+    let edits = 0
+    const res = await runActivityCardMidSessionReaper({
+      path: PATH, fs,
+      isLive: (r) => r.turnKey === 'c:live',
+      ttlMs: TTL, now: NOW,
+      finalizeCard: async () => { edits++; return {} },
+      unpinCard: async () => true,
+    })
+    expect(res.total).toBe(0)
+    expect(edits).toBe(0)
+    // Live record untouched on disk.
+    expect(loadActivityCards(PATH, fs)).toHaveLength(1)
+  })
+
+  it('does not reap an ownerless card younger than the TTL (race guard)', async () => {
+    const fresh = card({ turnKey: 'c:fresh', startedAt: NOW - 60_000 })
+    const { fs } = memFs()
+    writeActivityCardRecord(PATH, fs, fresh)
+    let edits = 0
+    const res = await runActivityCardMidSessionReaper({
+      path: PATH, fs,
+      isLive: () => false,
+      ttlMs: TTL, now: NOW,
+      finalizeCard: async () => { edits++; return {} },
+      unpinCard: async () => true,
+    })
+    expect(res.total).toBe(0)
+    expect(edits).toBe(0)
+    expect(loadActivityCards(PATH, fs)).toHaveLength(1)
+  })
+
+  it('reaps the dead card while sparing a concurrently-live one', async () => {
+    const { fs } = memFs()
+    writeActivityCardRecord(PATH, fs, card({ turnKey: 'c:dead', activityMessageId: 1, startedAt: NOW - 30 * 60_000 }))
+    writeActivityCardRecord(PATH, fs, card({ turnKey: 'c:live', activityMessageId: 2, startedAt: NOW - 30 * 60_000 }))
+    const finalized: number[] = []
+    const res = await runActivityCardMidSessionReaper({
+      path: PATH, fs,
+      isLive: (r) => r.turnKey === 'c:live',
+      ttlMs: TTL, now: NOW,
+      finalizeCard: async (r) => { finalized.push(r.activityMessageId); return {} },
+      unpinCard: async () => true,
+    })
+    expect(res.total).toBe(1)
+    expect(finalized).toEqual([1])
+    const remaining = loadActivityCards(PATH, fs)
+    expect(remaining).toHaveLength(1)
+    expect(remaining[0]!.turnKey).toBe('c:live')
+  })
+
+  it('counts a benign-400 (vanished) card as vanished, not finalized', async () => {
+    const { fs } = memFs()
+    writeActivityCardRecord(PATH, fs, card({ turnKey: 'c:gone', pinned: false, startedAt: NOW - 30 * 60_000 }))
+    const res = await runActivityCardMidSessionReaper({
+      path: PATH, fs,
+      isLive: () => false,
+      ttlMs: TTL, now: NOW,
+      finalizeCard: async () => undefined, // robustApiCall swallowed a benign 400
+      unpinCard: async () => true,
+    })
+    expect(res).toEqual({ finalized: 0, vanished: 1, unpinned: 0, total: 1 })
   })
 })

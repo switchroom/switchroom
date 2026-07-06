@@ -419,6 +419,7 @@ import {
   writeActivityCardRecord,
   clearActivityCardRecord,
   runActivityCardBootReaper,
+  runActivityCardMidSessionReaper,
   restartOrphanCardFinalizeText,
   type ActivityCardStoreFsSeam,
 } from './activity-card-store.js'
@@ -662,6 +663,7 @@ import {
   findRecentTurnsForChat,
   getTurnByKey,
   markTurnResumed,
+  reapStaleOpenTurns,
 } from '../registry/turns-schema.js'
 import {
   buildResumeInterruptedInbound,
@@ -6230,6 +6232,127 @@ async function activityCardBootReaper(): Promise<void> {
     )
   }
 }
+// ─── Mid-session stale-card reaper (#2918) ──────────────────────────────────
+// The boot reapers (markOrphanedWithTimeoutClassification + activityCardBoot-
+// Reaper) run ONCE at startup. A turn whose owning SDK subprocess dies
+// mid-session (SIGKILL / OOM / crash) without a clean end leaves its turns-DB
+// row `ended_at IS NULL` and its activity card frozen on "working…" until the
+// NEXT gateway boot — often many hours. This periodic sweep, running inside the
+// live gateway, finalizes those orphans without waiting for a restart.
+//
+// LIVENESS (the critical correctness guard): a turn/card is reaped ONLY when no
+// live in-flight turn owns it. The live set is derived from `currentTurnMap`
+// (per-topic byKey) PLUS the singleton `currentTurn` mirror, so it is correct
+// whether or not the per-topic-isolation flag is on. A healthy long-running
+// turn is always in that set and is never swept. A TTL gate is a secondary
+// guard against the just-started-not-yet-tracked race.
+//
+// Kill switch: set SWITCHROOM_MID_SESSION_CARD_REAPER=0 to disable (clean
+// revert, mirrors #2919). TTL/interval overridable via env for tuning.
+const MID_SESSION_CARD_REAPER_ENABLED =
+  process.env.SWITCHROOM_MID_SESSION_CARD_REAPER !== '0'
+const MID_SESSION_CARD_REAPER_TTL_MS = (() => {
+  const v = Number(process.env.SWITCHROOM_MID_SESSION_CARD_REAPER_TTL_MS)
+  return Number.isFinite(v) && v > 0 ? v : 15 * 60_000 // 15 min
+})()
+const MID_SESSION_CARD_REAPER_INTERVAL_MS = (() => {
+  const v = Number(process.env.SWITCHROOM_MID_SESSION_CARD_REAPER_INTERVAL_MS)
+  return Number.isFinite(v) && v > 0 ? v : 5 * 60_000 // 5 min
+})()
+
+// Snapshot the turn_keys / topic keys owned by a live in-flight turn right now.
+function liveTurnKeySets(): { registryKeys: Set<string>; topicKeys: Set<string> } {
+  const registryKeys = new Set<string>()
+  const topicKeys = new Set<string>()
+  const add = (t: CurrentTurn | null | undefined): void => {
+    if (t == null) return
+    if (t.registryKey != null && t.registryKey.length > 0) registryKeys.add(t.registryKey)
+    topicKeys.add(statusKey(t.sessionChatId, t.sessionThreadId))
+  }
+  for (const t of currentTurnMap.byKey.values()) add(t)
+  add(currentTurn) // flag-OFF store + most-recent mirror
+  return { registryKeys, topicKeys }
+}
+
+async function runMidSessionCardReaper(): Promise<void> {
+  if (!MID_SESSION_CARD_REAPER_ENABLED) return
+  const now = Date.now()
+  const { registryKeys, topicKeys } = liveTurnKeySets()
+
+  // 1) Stamp ownerless open turns-DB rows (the durable spinner signal).
+  if (turnsDb != null) {
+    try {
+      const { reaped, reapedTurnKeys } = reapStaleOpenTurns(turnsDb, {
+        activeTurnKeys: registryKeys,
+        ttlMs: MID_SESSION_CARD_REAPER_TTL_MS,
+        now,
+      })
+      if (reaped > 0) {
+        process.stderr.write(
+          `telegram gateway: mid-session reaper stamped ${reaped} orphaned turn(s) ` +
+            `as 'restart' (${reapedTurnKeys.join(',')})\n`,
+        )
+      }
+    } catch (err) {
+      process.stderr.write(
+        `telegram gateway: mid-session turn reaper error: ${(err as Error).message}\n`,
+      )
+    }
+  }
+
+  // 2) Finalize the leftover visible activity card(s) for those dead turns.
+  if (activityCardPersistEnabled) {
+    try {
+      const { finalized, vanished, total } = await runActivityCardMidSessionReaper({
+        path: ACTIVITY_CARD_STORE_PATH,
+        fs: activityCardStoreFs,
+        isLive: (record) => topicKeys.has(record.turnKey),
+        ttlMs: MID_SESSION_CARD_REAPER_TTL_MS,
+        now,
+        finalizeCard: (record) =>
+          robustApiCall(
+            () =>
+              lockedBot.api.editMessageText(
+                record.chatId,
+                record.activityMessageId,
+                richMessage(restartOrphanCardFinalizeText(record.startedAt)),
+                {},
+              ),
+            {
+              chat_id: record.chatId,
+              ...(record.threadId != null ? { threadId: record.threadId } : {}),
+              verb: 'activity-card.mid-session-reap-finalize',
+            },
+          ),
+        unpinCard: (record) =>
+          robustApiCall(
+            () => lockedBot.api.unpinChatMessage(record.chatId, record.activityMessageId),
+            {
+              chat_id: record.chatId,
+              ...(record.threadId != null ? { threadId: record.threadId } : {}),
+              verb: 'activity-card.mid-session-reap-unpin',
+            },
+          ),
+      })
+      if (total > 0) {
+        process.stderr.write(
+          `telegram gateway: activity-card: mid-session finalized ${finalized}/${total} ` +
+            `(vanished ${vanished}/${total}) orphaned card(s) (at-most-once)\n`,
+        )
+      }
+    } catch (err) {
+      process.stderr.write(
+        `telegram gateway: mid-session card reaper error: ${(err as Error).message}\n`,
+      )
+    }
+  }
+}
+
+const midSessionCardReaper = setInterval(() => {
+  void runMidSessionCardReaper()
+}, MID_SESSION_CARD_REAPER_INTERVAL_MS)
+midSessionCardReaper.unref()
+
 // NOTE: statusPinBootCleanup() is deliberately NOT invoked here at import time.
 // The status-pin store is a SHARED per-agent file, and cleanup issues real
 // unpinChatMessage calls. On a double-boot the losing gateway must NOT touch
@@ -26593,6 +26716,20 @@ void (async () => {
                 ownedWorktreeCwds({
                   self: process.env.SWITCHROOM_AGENT_NAME,
                   listRecords: listWorktreeRecords,
+                  // Durable, non-env identity fallback (#1116 / #2893): when
+                  // SWITCHROOM_AGENT_NAME is somehow unset, derive this
+                  // agent's own identity from its own directory so worktree
+                  // ownership still resolves (env is only the fast path).
+                  // `watcherAgentDir` is guaranteed non-null in this branch
+                  // (the whole watcher is gated on it above). Kill-switch
+                  // SWITCHROOM_WORKTREE_IDENTITY_FALLBACK=0 restores the
+                  // pre-fix env-only behaviour.
+                  agentDir:
+                    process.env.SWITCHROOM_WORKTREE_IDENTITY_FALLBACK === '0'
+                      ? undefined
+                      : watcherAgentDir,
+                  log: (msg) =>
+                    process.stderr.write(`telegram gateway: ${msg}\n`),
                 }),
               // Bug 0 fix: previously omitted, leaving the watcher unable to
               // write liveness/stall/turn_end updates to the registry DB.
