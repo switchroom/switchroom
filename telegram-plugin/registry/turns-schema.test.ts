@@ -21,6 +21,7 @@ import {
   recordTurnEnd,
   findRecentTurnsForChat,
   getTurnByKey,
+  reapStaleOpenTurns,
 } from './turns-schema.js'
 
 // ---------------------------------------------------------------------------
@@ -154,6 +155,102 @@ describe('getTurnByKey', () => {
     const turn = getTurnByKey(db, 'dm:7')
     expect(turn?.chat_id).toBe('12345')
     expect(turn?.thread_id).toBeNull()
+    db.close()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// reapStaleOpenTurns — mid-session periodic orphan sweep (#2918)
+// ---------------------------------------------------------------------------
+
+describe('reapStaleOpenTurns (#2918 mid-session sweep)', () => {
+  // Helper: force a row's started_at into the past so the TTL gate is met.
+  function ageRow(db: ReturnType<typeof openTurnsDbInMemory>, turnKey: string, startedAt: number): void {
+    db.prepare('UPDATE turns SET started_at = ? WHERE turn_key = ?').run(startedAt, turnKey)
+  }
+
+  it('stamps an ownerless open row aged past the TTL as restart', () => {
+    const db = openTurnsDbInMemory()
+    const now = 1_000_000_000_000
+    recordTurnStart(db, { turnKey: 'dm:dead', chatId: '111' })
+    ageRow(db, 'dm:dead', now - 30 * 60_000) // 30 min old
+    const res = reapStaleOpenTurns(db, {
+      activeTurnKeys: new Set<string>(), // process gone → no live owner
+      ttlMs: 15 * 60_000,
+      now,
+    })
+    expect(res.reaped).toBe(1)
+    expect(res.reapedTurnKeys).toEqual(['dm:dead'])
+    const turn = getTurnByKey(db, 'dm:dead')
+    expect(turn?.ended_at).toBe(now)
+    expect(turn?.ended_via).toBe('restart')
+    db.close()
+  })
+
+  it('NEVER touches a healthy in-flight turn (turn_key in activeTurnKeys)', () => {
+    const db = openTurnsDbInMemory()
+    const now = 1_000_000_000_000
+    recordTurnStart(db, { turnKey: 'dm:live', chatId: '222' })
+    // Even though it is aged well past the TTL, a live owner protects it.
+    ageRow(db, 'dm:live', now - 6 * 60 * 60_000) // 6h "long-running" turn
+    const res = reapStaleOpenTurns(db, {
+      activeTurnKeys: new Set(['dm:live']),
+      ttlMs: 15 * 60_000,
+      now,
+    })
+    expect(res.reaped).toBe(0)
+    const turn = getTurnByKey(db, 'dm:live')
+    expect(turn?.ended_at).toBeNull()
+    expect(turn?.ended_via).toBeNull()
+    db.close()
+  })
+
+  it('does not reap an ownerless row younger than the TTL (race guard)', () => {
+    const db = openTurnsDbInMemory()
+    const now = 1_000_000_000_000
+    recordTurnStart(db, { turnKey: 'dm:fresh', chatId: '333' })
+    ageRow(db, 'dm:fresh', now - 60_000) // 1 min old, ownerless
+    const res = reapStaleOpenTurns(db, {
+      activeTurnKeys: new Set<string>(),
+      ttlMs: 15 * 60_000,
+      now,
+    })
+    expect(res.reaped).toBe(0)
+    expect(getTurnByKey(db, 'dm:fresh')?.ended_at).toBeNull()
+    db.close()
+  })
+
+  it('reaps the dead orphan while sparing a concurrently-live turn', () => {
+    const db = openTurnsDbInMemory()
+    const now = 1_000_000_000_000
+    recordTurnStart(db, { turnKey: 'dm:dead', chatId: '111' })
+    recordTurnStart(db, { turnKey: 'dm:live', chatId: '222' })
+    ageRow(db, 'dm:dead', now - 30 * 60_000)
+    ageRow(db, 'dm:live', now - 30 * 60_000)
+    const res = reapStaleOpenTurns(db, {
+      activeTurnKeys: new Set(['dm:live']),
+      ttlMs: 15 * 60_000,
+      now,
+    })
+    expect(res.reapedTurnKeys).toEqual(['dm:dead'])
+    expect(getTurnByKey(db, 'dm:dead')?.ended_via).toBe('restart')
+    expect(getTurnByKey(db, 'dm:live')?.ended_at).toBeNull()
+    db.close()
+  })
+
+  it('leaves already-ended rows alone (idempotent)', () => {
+    const db = openTurnsDbInMemory()
+    const now = 1_000_000_000_000
+    recordTurnStart(db, { turnKey: 'dm:done', chatId: '444' })
+    ageRow(db, 'dm:done', now - 30 * 60_000)
+    recordTurnEnd(db, { turnKey: 'dm:done', endedVia: 'stop' })
+    const res = reapStaleOpenTurns(db, {
+      activeTurnKeys: new Set<string>(),
+      ttlMs: 15 * 60_000,
+      now,
+    })
+    expect(res.reaped).toBe(0)
+    expect(getTurnByKey(db, 'dm:done')?.ended_via).toBe('stop')
     db.close()
   })
 })
