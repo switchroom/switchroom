@@ -12789,8 +12789,8 @@ function feedHeartbeatTick(): void {
   // an already-open card) — which is exactly how the 0-label card used to FREEZE
   // during a long silent tool. So split the two cases: OPEN when no card exists,
   // and otherwise re-render the "Working…" card with a fresh wall-clock elapsed
-  // through the SAME cardDrainGate / mayDrain / openOrEditCard('liveness') EDIT
-  // path the labelled branch below uses. Model-independent (reads only
+  // through the SAME cardDrainGate / mayDrain / liveness EDIT path the labelled
+  // branch below uses. Model-independent (reads only
   // `now - startedAt`), so a blocked tool call can't starve it; edit-only, so it
   // never push-notifies. `composeTurnActivity` returns null on empty mirrorLines,
   // so this uses the `renderActivityFeedWithNested(['Working…'])` fallback via

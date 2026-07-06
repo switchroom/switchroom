@@ -315,7 +315,7 @@ describe('façade delegates to the existing emission primitives (call-site liter
   })
 })
 
-describe('the 7 drain sites route through the façade with producers preserved verbatim', () => {
+describe('the 8 drain sites route through the façade with producers preserved verbatim', () => {
   it('the narrative SHOW site routes via openOrEditCard("narrative") + the producer-"narrative" drain', () => {
     const body = fnSrc('showNarrativeStep')
     expect(body).toMatch(/openOrEditCard\('narrative'/)
@@ -325,26 +325,30 @@ describe('the 7 drain sites route through the façade with producers preserved v
     expect(body).toMatch(/ea\.mayDrain\(turn\)/)
   })
 
-  it('both liveness sites route via openOrEditCard("liveness") + producer-"liveness" drains (one in openLivenessFeedIfDue, one in feedHeartbeatTick)', () => {
+  it('all liveness sites route via openOrEditCard("liveness") + producer-"liveness" drains (one in openLivenessFeedIfDue, two in feedHeartbeatTick)', () => {
     // The early-card-open refactor extracted the 0-tool liveness OPEN out of
     // feedHeartbeatTick into the shared `openLivenessFeedIfDue` helper (so the
     // 6 s heartbeat and the enqueue-time early-open timer reach ONE open path
-    // and never double-open). So the two liveness sites now live in:
-    //   - openLivenessFeedIfDue: the 0-tool early-open / climb;
-    //   - feedHeartbeatTick:     the labelled-feed stale-step maintain.
-    // Both must still route via the façade with the producer arg verbatim.
+    // and never double-open). deterministic-turn-liveness.md Phase 1 then added
+    // the 0-label CLIMB of an already-open card back into feedHeartbeatTick (an
+    // EDIT, never an OPEN — so it does not double-open). So the liveness sites now
+    // live in:
+    //   - openLivenessFeedIfDue: the 0-tool early-OPEN;
+    //   - feedHeartbeatTick:     the 0-label CLIMB of an already-open card
+    //                            (Phase 1) + the labelled-feed stale-step maintain.
+    // All must still route via the façade with the producer arg verbatim.
     const earlyOpen = fnSrc('openLivenessFeedIfDue')
     const heartbeat = fnSrc('feedHeartbeatTick')
     const opens = [
       ...earlyOpen.matchAll(/openOrEditCard\('liveness'/g),
       ...heartbeat.matchAll(/openOrEditCard\('liveness'/g),
     ]
-    expect(opens).toHaveLength(2)
+    expect(opens).toHaveLength(3)
     const drains = [
       ...earlyOpen.matchAll(/drainActivitySummary\(turn,\s*'liveness'\)/g),
       ...heartbeat.matchAll(/drainActivitySummary\(turn,\s*'liveness'\)/g),
     ]
-    expect(drains).toHaveLength(2)
+    expect(drains).toHaveLength(3)
     // The literal the feed-heartbeat oracle greps must still be present in both.
     expect(earlyOpen).toMatch(/turn\.activityInFlight = drainActivitySummary/)
     expect(heartbeat).toMatch(/turn\.activityInFlight = drainActivitySummary/)
@@ -366,8 +370,9 @@ describe('the 7 drain sites route through the façade with producers preserved v
 
   it('every routed drain site guards the single-flight via ea.mayDrain(turn), not a bare activityInFlight read', () => {
     const mayDrainGuards = [...gatewaySrc.matchAll(/if \(ea\.mayDrain\(turn\)\)/g)]
-    // narrative + 2 liveness + tool + 2 sub-agent + 1 post-answer bg-liveness (Fix 2) = 7.
-    expect(mayDrainGuards).toHaveLength(7)
+    // narrative + 3 liveness (early-open + Phase-1 0-label climb + labelled maintain)
+    // + tool + 2 sub-agent + 1 post-answer bg-liveness (Fix 2) = 8.
+    expect(mayDrainGuards).toHaveLength(8)
   })
 })
 
@@ -487,11 +492,12 @@ describe('mayDrainCardNow — PR-4d card-drain gate (pure read; gateway holds th
     expect(ctxFn).toMatch(/turnInFlight:\s*turnInFlightForGate\(\)/)
   })
 
-  it('the 7 card-drain sites each route their guarded block through cardDrainGate (single-flight gate stays byte-identical)', () => {
-    // Option A: the 7 `if (ea.mayDrain(turn))` guards + drainActivitySummary
+  it('the 8 card-drain sites each route their guarded block through cardDrainGate (single-flight gate stays byte-identical)', () => {
+    // Option A: the 8 `if (ea.mayDrain(turn))` guards + drainActivitySummary
     // thunks stay byte-identical, wrapped by the centralized helper.
-    // 6 original + 1 new post-answer background-agent liveness drain (Fix 2).
+    // 6 original + 1 post-answer background-agent liveness drain (Fix 2) +
+    // 1 Phase-1 0-label climb (deterministic-turn-liveness.md).
     const wraps = [...gatewaySrc.matchAll(/cardDrainGate\(turn, ea, \(\) => \{/g)]
-    expect(wraps).toHaveLength(7)
+    expect(wraps).toHaveLength(8)
   })
 })
