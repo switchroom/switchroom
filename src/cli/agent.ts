@@ -308,7 +308,7 @@ function buildStatusInputs(
   if (isHindsightEnabled(config)) {
     const baseUrl =
       (config.memory?.config?.url as string | undefined) ??
-      "http://localhost:8888/mcp/";
+      "http://localhost:18888/mcp/";
     hindsightApiUrl = baseUrl.endsWith("/mcp/")
       ? baseUrl
       : baseUrl.replace(/\/$/, "") + "/mcp/";
@@ -898,7 +898,7 @@ export function registerAgentCommand(program: Command): void {
         let hindsightBankId = name;
         if (isHindsightEnabled(config)) {
           const baseUrl = (config.memory?.config?.url as string | undefined)
-            ?? "http://localhost:8888/mcp/";
+            ?? "http://localhost:18888/mcp/";
           // Normalize to end in /mcp/
           hindsightApiUrl = baseUrl.endsWith("/mcp/")
             ? baseUrl

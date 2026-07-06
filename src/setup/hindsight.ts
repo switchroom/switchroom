@@ -2,10 +2,34 @@ import { execFileSync } from "node:child_process";
 import { createServer } from "node:net";
 
 /**
- * Default Hindsight ports (upstream defaults).
+ * Default Hindsight host ports.
+ *
+ * The API port defaults to **18888**, NOT the upstream default of 8888.
+ * 8888 is a heavily-contended port on a typical host — Coolify, nginx
+ * front-proxies, tunnel gateways, and Jupyter all grab it. Because the
+ * hindsight container runs `--network host` and binds `HINDSIGHT_API_PORT`
+ * directly on the host, a default of 8888 collided with a foreign listener
+ * (nginx-tunnel-gateway on 127.0.0.1:8888) and crash-looped for hours while
+ * fleet memory was silently down (2026-07 incident). Defaulting to 18888
+ * — a port nothing else conventionally claims — removes the collision at the
+ * source. `pickHindsightPorts()` + the caller-side preflight still guard
+ * against 18888 itself being occupied.
+ *
+ * The UI port stays at 9999 (uncontended in the incident); it is
+ * informational and unused by switchroom.
  */
-export const HINDSIGHT_DEFAULT_API_PORT = 8888;
+export const HINDSIGHT_DEFAULT_API_PORT = 18888;
 export const HINDSIGHT_DEFAULT_UI_PORT = 9999;
+
+/**
+ * Default MCP endpoint URL switchroom writes into agent `.mcp.json` /
+ * `memory.config.url` when the operator hasn't overridden it. Derived from
+ * `HINDSIGHT_DEFAULT_API_PORT` so the scaffolded URL and the container's
+ * bound port can never silently drift apart — the exact failure mode behind
+ * the 2026-07 outage (agents pointed at 18888 while the container bound
+ * 8888). Change the port in ONE place and both move together.
+ */
+export const HINDSIGHT_DEFAULT_MCP_URL = `http://127.0.0.1:${HINDSIGHT_DEFAULT_API_PORT}/mcp/`;
 
 /**
  * Default cap on observations per *tag scope*.
@@ -341,6 +365,75 @@ export function isPortFree(port: number): Promise<boolean> {
 }
 
 /**
+ * Best-effort: describe the process currently holding `port`, for a loud
+ * preflight error. Returns a short "pid 1234 (nginx)" style string, or null
+ * when nothing readable holds it (or the probe tools aren't available). Never
+ * throws — this is decoration on an error message, not a control-flow signal.
+ */
+export function describePortHolder(port: number): string | null {
+  // `ss` is present on virtually every modern Linux host and needs no root
+  // to list listeners with their owning process (-p). Fall back to `lsof`.
+  const probes: Array<[string, string[]]> = [
+    ["ss", ["-ltnpH", `sport = :${port}`]],
+    ["lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN"]],
+  ];
+  for (const [cmd, args] of probes) {
+    try {
+      const out = execFileSync(cmd, args, {
+        stdio: "pipe",
+        encoding: "utf-8",
+      }).trim();
+      if (!out) continue;
+      // ss users:(("nginx",pid=1234,fd=6))  |  lsof: nginx 1234 ...
+      const ssMatch = out.match(/users:\(\("([^"]+)",pid=(\d+)/);
+      if (ssMatch) return `pid ${ssMatch[2]} (${ssMatch[1]})`;
+      const firstDataLine = out
+        .split("\n")
+        .map((l) => l.trim())
+        .find((l) => l && !/^COMMAND\b/.test(l));
+      if (firstDataLine) {
+        const parts = firstDataLine.split(/\s+/);
+        if (cmd === "lsof" && parts.length >= 2) {
+          return `pid ${parts[1]} (${parts[0]})`;
+        }
+        return firstDataLine.slice(0, 80);
+      }
+    } catch {
+      // tool missing / non-zero exit — try the next probe.
+    }
+  }
+  return null;
+}
+
+/**
+ * Preflight guard run by callers immediately before `startHindsight()`.
+ * Verifies the chosen host ports are actually bindable RIGHT NOW; if a
+ * foreign process already holds one, returns the offending port + a
+ * best-effort holder description so the caller can fail LOUD (or reassign)
+ * instead of launching a container that will crash-loop on `[Errno 98]
+ * address already in use`.
+ *
+ * This closes the exact gap behind the 2026-07 outage: the `--recreate`
+ * path reused the previously-published host port via
+ * `getRunningHindsightPorts()` and handed it straight to `docker run`,
+ * with no free-check — so when a foreign service (nginx) had claimed that
+ * port in the meantime, hindsight crash-looped silently.
+ *
+ * Returns `null` when both ports are free.
+ */
+export async function preflightHindsightPorts(ports: {
+  apiPort: number;
+  uiPort: number;
+}): Promise<{ port: number; holder: string | null } | null> {
+  for (const port of [ports.apiPort, ports.uiPort]) {
+    if (!(await isPortFree(port))) {
+      return { port, holder: describePortHolder(port) };
+    }
+  }
+  return null;
+}
+
+/**
  * Find a free port starting at `start`, incrementing until one is found
  * or `maxAttempts` ports have been tried.
  */
@@ -616,6 +709,13 @@ export function pullHindsightImage(imageTag?: string): void {
  * `pickHindsightPorts()`.
  */
 export function getRunningHindsightPorts(): { apiPort: number; uiPort: number } | null {
+  // The container's INTERNAL ports are fixed by the image (8888 API, 9999 UI)
+  // regardless of what host port they're published on. `docker port` is keyed
+  // by the container port, so these are constants — NOT the host defaults.
+  // (Before the 18888 default this coincidentally equaled the host default;
+  // decoupling them here keeps recreate working after the default moved.)
+  const CONTAINER_API_PORT = 8888;
+  const CONTAINER_UI_PORT = 9999;
   const readPort = (containerPort: number): number | null => {
     try {
       const out = execFileSync(
@@ -632,12 +732,12 @@ export function getRunningHindsightPorts(): { apiPort: number; uiPort: number } 
       return null;
     }
   };
-  const apiPort = readPort(HINDSIGHT_DEFAULT_API_PORT);
+  const apiPort = readPort(CONTAINER_API_PORT);
   if (apiPort === null) return null;
   // The UI port is informational (unused by switchroom); reuse it if
-  // readable, else derive the standard pair (8888→9999, 18888→19999).
+  // readable, else derive the standard pair (18888→19999, 8888→9999).
   const uiPort =
-    readPort(HINDSIGHT_DEFAULT_UI_PORT) ??
+    readPort(CONTAINER_UI_PORT) ??
     (apiPort === HINDSIGHT_DEFAULT_API_PORT ? HINDSIGHT_DEFAULT_UI_PORT : 19999);
   return { apiPort, uiPort };
 }
@@ -661,13 +761,14 @@ export function getHindsightStatus(): string | null {
 
 /**
  * Get the MCP server config for Hindsight via HTTP endpoint.
- * Hindsight exposes MCP via Streamable HTTP at localhost:8888/mcp.
+ * Hindsight exposes MCP via Streamable HTTP; switchroom publishes it on the
+ * host at HINDSIGHT_DEFAULT_MCP_URL (127.0.0.1:18888/mcp/ by default).
  */
 export function getHindsightMcpUrl(): {
   url: string;
 } {
   return {
-    url: "http://localhost:8888/mcp/",
+    url: HINDSIGHT_DEFAULT_MCP_URL,
   };
 }
 
@@ -688,8 +789,11 @@ export function generateHindsightComposeSnippet(): string {
     `    image: ${HINDSIGHT_IMAGE}`,
     "    container_name: switchroom-hindsight",
     "    ports:",
-    "      - \"8888:8888\"",
-    "      - \"9999:9999\"",
+    // Host side 18888/19999 → container 8888/9999. The host port MUST match
+    // HINDSIGHT_DEFAULT_API_PORT / the scaffolded memory.config.url or agents
+    // point at a dead URL (see the 2026-07 outage).
+    `      - "${HINDSIGHT_DEFAULT_API_PORT}:8888"`,
+    "      - \"19999:9999\"",
     "    environment:",
     `      - HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE=${HINDSIGHT_DEFAULT_MAX_OBSERVATIONS_PER_SCOPE}`,
     "      - HINDSIGHT_API_LLM_PROVIDER=claude-code",

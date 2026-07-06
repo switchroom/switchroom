@@ -29,7 +29,7 @@ import type { AgentConfig, SwitchroomConfig } from "../config/schema.js";
 import { loadManifest, detectDrift, type DriftProbers } from "../manifest.js";
 import { probeHindsight, isHindsightEnabled, fetchHindsightToolsList, collectProfileBanks } from "../memory/hindsight.js";
 import { inspectBankHealth, staleMentalModels, corruptedMentalModels, recentUnextracted, ageDays } from "../memory/bank-health.js";
-import { checkHindsightContainerHealth, classifyToolContract } from "./doctor-memory.js";
+import { checkHindsightContainerHealth, classifyToolContract, checkHindsightHealthEndpoint } from "./doctor-memory.js";
 import { isDockerMode, runDockerChecks } from "./doctor-docker.js";
 import { runAuthBrokerChecks } from "./doctor-auth-broker.js";
 import { runHostdChecks } from "./doctor-hostd.js";
@@ -1170,7 +1170,7 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
   }
 
   const url = (config.memory?.config?.url as string | undefined)
-    ?? "http://localhost:8888/mcp/";
+    ?? "http://localhost:18888/mcp/";
 
   const results: CheckResult[] = [];
 
@@ -1249,6 +1249,11 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
   // (shm exhaustion or OAuth quota 429). These surface both from the local
   // container's shm config + recent logs; no-ops on a remote/dockerless setup.
   results.push(...checkHindsightContainerHealth());
+
+  // Memory-down signal (#outage 2026-07): a GET /health != 200 means the
+  // backend is down / crash-looping — otherwise invisible, since auto-recall
+  // and retain fail with no user-facing error. Make the outage loud here.
+  results.push(await checkHindsightHealthEndpoint(url));
 
   // Per-agent bank ingest health (2026-06-10 incident class): a bank can be
   // reachable and growing while fact extraction silently yields ZERO memory

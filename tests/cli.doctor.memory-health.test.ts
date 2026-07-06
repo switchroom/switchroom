@@ -6,6 +6,8 @@ import {
   classifyExtractionLogs,
   checkHindsightContainerHealth,
   classifyToolContract,
+  classifyHindsightHealthProbe,
+  checkHindsightHealthEndpoint,
   type AdvertisedTool,
   MIN_HINDSIGHT_SHM_BYTES,
 } from "../src/cli/doctor-memory.js";
@@ -150,5 +152,52 @@ describe("checkHindsightContainerHealth (docker wrapper)", () => {
     const results = checkHindsightContainerHealth({ exec });
     expect(results.find((r) => r.name === "hindsight shm-size")?.status).toBe("fail");
     expect(results.find((r) => r.name === "hindsight extraction")?.status).toBe("fail");
+  });
+});
+
+// ─── Memory-down /health signal (2026-07 outage) ─────────────────────────────
+//
+// The outage was invisible: hindsight crash-looped on an occupied port while
+// auto-recall/retain failed silently (no user-facing error). A GET /health
+// check makes the outage LOUD in `switchroom doctor`.
+describe("classifyHindsightHealthProbe — memory-down signal", () => {
+  it("200 → ok", () => {
+    const r = classifyHindsightHealthProbe(200, 18888);
+    expect(r.status).toBe("ok");
+    expect(r.detail).toContain("18888");
+  });
+
+  it("null (connection refused / crash-loop) → fail, names the silent-outage risk", () => {
+    const r = classifyHindsightHealthProbe(null, 18888);
+    expect(r.status).toBe("fail");
+    expect(r.detail).toMatch(/down or crash-looping|silently/i);
+    expect(r.fix).toContain("switchroom memory");
+  });
+
+  it("non-200 (e.g. 503) → fail", () => {
+    const r = classifyHindsightHealthProbe(503, 18888);
+    expect(r.status).toBe("fail");
+    expect(r.detail).toContain("503");
+  });
+});
+
+describe("checkHindsightHealthEndpoint — async probe wrapper", () => {
+  it("derives /health from the MCP url and reports ok on 200", async () => {
+    const seen: string[] = [];
+    const fetchImpl = (async (u: string | URL) => {
+      seen.push(String(u));
+      return { status: 200 } as Response;
+    }) as unknown as typeof fetch;
+    const r = await checkHindsightHealthEndpoint("http://127.0.0.1:18888/mcp/", { fetchImpl });
+    expect(seen[0]).toBe("http://127.0.0.1:18888/health");
+    expect(r.status).toBe("ok");
+  });
+
+  it("a rejected fetch (container down) fails closed to a loud fail", async () => {
+    const fetchImpl = (async () => {
+      throw new Error("connect ECONNREFUSED 127.0.0.1:18888");
+    }) as unknown as typeof fetch;
+    const r = await checkHindsightHealthEndpoint("http://127.0.0.1:18888/mcp/", { fetchImpl });
+    expect(r.status).toBe("fail");
   });
 });
