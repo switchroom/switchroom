@@ -39,7 +39,7 @@ Hindsight is a memory bank with semantic search, knowledge graph, entity resolut
 
 ### Day-to-day tools
 - `mcp__hindsight__recall` — semantic-search the bank for relevant past memories. Auto-fires on every inbound user message via the plugin's UserPromptSubmit hook (you'll see "Relevant memories from past conversations" in your context). Call manually when you need a more specific query than the auto-fired one.
-- `mcp__hindsight__retain` — store a new memory. The plugin automatically retains the conversation transcript every ~10 turns via the Stop hook, so you usually don't need this. Call manually for significant decisions, corrections, or facts you want immediately searchable.
+- `mcp__hindsight__retain` — store a new memory. The plugin auto-retains every turn via the Stop hook, but in chunked mode each retain only processes a small recent window (~3 turns) — so it captures memory promptly and survives restarts without re-sending the whole transcript, and you usually don't need this. Call manually for significant decisions, corrections, or facts you want immediately searchable.
 - `mcp__hindsight__reflect` — Hindsight's LLM-powered "answer this query using the bank's content + directives". Use when the user asks a question that requires synthesis across multiple past memories.
 
 ### Mental Models
@@ -68,7 +68,7 @@ Don't retain:
 - Sensitive content the user explicitly asked you to not remember
 - Things already in a mental model — they'll be re-derived from underlying memories
 
-The plugin's auto-retain (Stop hook) handles transcript-level storage on a 10-turn cadence, so you don't need to manually retain everything. Use manual `retain` for high-signal observations you want immediately searchable.
+The plugin's auto-retain (Stop hook) fires every turn, but in chunked mode each retain only processes a small recent window (~3 turns) — so storage stays prompt and cheap and survives restarts without re-sending the whole transcript, and you don't need to manually retain everything. Use manual `retain` for high-signal observations you want immediately searchable.
 
 ## Sub-Agent Delegation
 

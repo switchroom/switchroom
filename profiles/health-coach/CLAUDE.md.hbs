@@ -34,7 +34,7 @@ Recommend the user consult a professional for: persistent pain/injury, medical c
 Claude Code's file-based auto-memory is disabled. Use **Hindsight** MCP tools:
 
 - `mcp__hindsight__recall` — search past memories. Auto-fires on every message.
-- `mcp__hindsight__retain` — store important facts. Auto-retains every ~10 turns.
+- `mcp__hindsight__retain` — store important facts. Auto-retains every turn (chunked, a small ~3-turn window each time), so it's prompt and cheap.
 - `mcp__hindsight__create_mental_model` — maintain a "fitness profile" mental model.
 
 Save proactively: workout logs, goals, PRs, preferences, patterns (e.g. "poor sleep on Sundays"), injuries/limitations. Only Hindsight memories survive session compaction.
