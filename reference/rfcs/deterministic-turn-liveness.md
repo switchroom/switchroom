@@ -294,18 +294,42 @@ on tick".
 ## Compatibility & rollout
 
 - **Additive and gated.** The climb rides the existing card and the
-  existing heartbeat tick; no schema or transport change. It stays behind
-  the existing liveness flag lineage (`turn-liveness-primitive.md`'s
-  `SWITCHROOM_TG_LIVENESS_FLOOR`), default-on with a clean revert.
-- **PR sequencing:**
-  1. **Phase 1 + Phase 4** in one PR — the fix and the test that proves it
-     (transport regression test fails on base, passes on the branch). Never
-     land the mechanism without the outcome test in the same PR.
+  existing heartbeat tick; no schema or transport change. Its kill switch
+  is the heartbeat's own gate — `SWITCHROOM_FEED_HEARTBEAT=0`
+  (`FEED_HEARTBEAT_ENABLED`) — default-on with a clean revert. (The
+  `SWITCHROOM_TG_LIVENESS_FLOOR` flag from `turn-liveness-primitive.md`
+  gates the separate one-shot floor path, not this climb.)
+- **PR sequencing (as shipped):**
+  1. **Phase 1 + Phase 4b (transport regression test) + 4d
+     (enshrining-test inversion)** in one PR — the fix and the test that
+     proves it (transport regression test fails on base, passes on the
+     branch). Never land the mechanism without the outcome test in the
+     same PR. The Phase 4a DM/channel UAT twins and the 4c fuzz invariant
+     did **not** ship in this PR — they follow as a tracked subsequent PR
+     via the UAT harness; channel-path climb parity is unverified until
+     then.
   2. **Phase 2** (silent-end fallback audit + hardening) as a second PR —
      narrower blast radius, its own UAT.
   3. **Phase 3 + Phase 5** as docs/cleanup — remove the vestigial send,
      document the boundary, update the job spec Prove-it and the PR-delta
-     policy.
+     policy. Not landed with PRs 1–2; the vestigial 45s path stays
+     in-tree until this PR.
+
+### Known gaps (out of scope, not closed by this RFC)
+
+1. **Restart mid-turn.** The climb's card handle (`activityMessageId`)
+   and the current-turn state live in gateway memory; a gateway restart
+   mid-turn permanently freezes the pre-restart card — the new process
+   has no handle to resume editing it. The resumed turn opens a fresh
+   card; the old one is never finalized.
+2. **Worktree-isolated sub-agents.** The activity watcher's project-slug
+   filter does not match worktree-isolated sub-agents' cwd, so no live
+   worker feed surfaces for them once the parent turn ends.
+
+Both are pre-existing and orthogonal to the climb, named here so the
+guarantee is not read as broader than delivered. Each needs its own
+follow-up (persist/rehydrate or boot-time reaping of orphaned cards;
+worktree-aware slug matching).
 - **Fleet restart discipline.** No fleet restart until the operator
   confirms; stagger restarts across agents (a card-edit-path change is
   visible on the very next turn, so a bad edit should not hit the whole
@@ -323,13 +347,12 @@ a forum topic alike.
 
 ## Open questions
 
-- **Climb cadence.** Is one `FEED_HEARTBEAT_MIN_STALE_MS` window the right
-  edit interval, or should the visible clock tick coarser (e.g. round to 5s)
-  to avoid a jittery counter? The bound (~6–12s) holds either way; this is a
+- **Climb cadence — resolved in PR 1.** One `FEED_HEARTBEAT_MIN_STALE_MS`
+  window (6s, equal to the tick, with an explicit min-stale guard); the
+  visible bound is ~6–12s between edits. Coarser clock rounding remains a
   polish call.
-- **Elapsed origin.** Does the climb count from turn-start or from
-  card-open (~1.2s in)? Card-open is simpler; turn-start is more honest.
-  Lean turn-start, confirm against the `ObservedMessage` shape.
+- **Elapsed origin — resolved in PR 1.** Turn-start: the climb renders
+  `Date.now() - turn.startedAt`.
 - **Dark-turn guard vs `SubagentStop`/`StopFailure`.** The primitive staged
   real `SubagentStop`/`StopFailure` wiring. Should the dark-turn guard hang
   off those terminal boundaries once they land, or stay on the existing
