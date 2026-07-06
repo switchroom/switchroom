@@ -3,7 +3,7 @@ artifact: Hindsight primitive fit — use the synthesis layers the memory job de
 serves: remember-across-sessions
 advances-outcome: standing-team
 relates: jobs/run-a-fleet-of-specialists.md, jobs/feel-like-a-colleague.md
-status: partially shipped (rev. 2026-07-05); phases 1 + 6a + 6b live, 2/3/5 open — status record + remaining work
+status: mostly shipped (rev. 2026-07-06); phases 1 + 2 + 4 + 6a + 6b live, 3 shipped-as-nudge+verifier, 5 shipped first slice — status record + remaining tail
 ---
 
 # Hindsight synthesis layers — what we run vs. what the job asks for
@@ -21,31 +21,40 @@ as **bad** ("raw transcript dumping passed off as memory", "grab-bag",
 ("curated, semantic, retrieved by relevance", "honest legible answer about
 what it believes and why").
 
-**This document has since become a status record.** Phase 1 shipped
-(observations are now recalled), Phase 6a shipped (recall is gated on
-trivial turns), Phase 6b shipped (retain is now a chunked window instead of
-re-consolidating the whole transcript every turn — #2830, rolled fleet-wide
-in v0.17.5), and per-speaker / shared-bank recall landed as an adjacent
-feature. Several premises the original proposal rested on have also *moved*:
-per-agent user-profile mental models were retired (#2447), so the "one
-auto-seeded model everywhere" gap the RFC described no longer exists. The
+**This document has since become a status record, and most of it has now
+shipped.** As of 2026-07-06: Phase 1 shipped (observations are now recalled),
+Phase 2 shipped (#2855 threaded `reflect_mission` / `observations_mission` /
+per-bank `disposition` through the full cascade into scaffold + reconcile),
+Phase 4 shipped its sparse chat-legible surface (#2858 — the 📌/✂️ tool-observation
+lines, with the #2872 consolidation-webhook 🧠 side present in code but dormant
+pending an engine that emits the webhook), Phase 3 shipped as a deterministic
+nudge + verifier (#2864/#2873 — regex-detect → nudge → one bounded verifier
+block; the *model* still authors the directive), Phase 5 shipped its first
+slices (#2874/#2875 declarative + agent-proposes→operator-confirms, #2883 the
+default-on `mental-model-curator` skill fleet-wide), Phase 6a shipped (recall
+is gated on trivial turns), and Phase 6b shipped (retain is now a chunked
+window instead of re-consolidating the whole transcript every turn — #2830,
+rolled fleet-wide in v0.17.5). Per-speaker / shared-bank recall landed as an
+adjacent feature. Several premises the original proposal rested on have also
+*moved*: per-agent user-profile mental models were retired (#2447), so the
+"one auto-seeded model everywhere" gap the RFC described no longer exists. The
 analysis and phased structure below are preserved; each phase now carries an
 explicit **SHIPPED / PARTIAL / NOT-STARTED** marker, and the evidence
 section keeps the original 2026-06-18 snapshot with a "Status as of
-2026-07-05" correction under each bullet.
+2026-07-06" correction under each bullet.
 
 This remains a design record. It does not change a job spec or an invariant;
 it argues for using capability we already pay for, within the lines.
 
-## Per-phase status at a glance (2026-07-05)
+## Per-phase status at a glance (2026-07-06)
 
 | Phase | Status | One-line |
 |---|---|---|
 | 1. Consume observations | **SHIPPED** (#2425/#2427) | `recallTypes` now includes `observation` |
-| 2. Per-agent missions/disposition | **PARTIAL** | `retain_mission`/`bank_mission` configurable + generic default seeded + 3 banks specialized; `reflect_mission`/`observations_mission`/`disposition` unwired |
-| 3. Directives ("corrections stick") | **PARTIAL / guidance-only** | wired as a model *instruction* in the profile; no deterministic hook routes corrections into `create_directive` |
-| 4. Chat-legible memory (sparse) | **NOT-STARTED** | only a transient `📚 recalling memories` spinner exists (#303); no store/correct legibility line |
-| 5. Curated mental models per specialist | **NOT-STARTED** as automation | and arguably *regressed* — user-profile auto-seeding was removed in #2447 |
+| 2. Per-agent missions/disposition | **SHIPPED** (#2855) | `retain_mission`/`bank_mission` + `reflect_mission`/`observations_mission`/per-bank `disposition` now threaded through the cascade into scaffold + reconcile; `PROFILE_MEMORY_DEFAULTS` differentiate specialists on a zero-YAML install |
+| 3. Directives ("corrections stick") | **SHIPPED as nudge+verifier** (#2864/#2873) | deterministic regex-detect → Stage B nudge → one bounded Stage C verifier block; the *model* still authors the `create_directive` call (not a hook-side write) |
+| 4. Chat-legible memory (sparse) | **SHIPPED** (#2858) | 📌 remembered / ✂️ forgot from deterministic tool-observation; the 🧠 consolidation-webhook side (#2872) is present in code but **dormant** — the pinned image emits no `consolidation.completed` webhook and it is OFF by default |
+| 5. Curated mental models per specialist | **SHIPPED first slice** (#2874/#2875/#2883) | declarative `memory.mental_models[]` + agent-proposes→operator-confirms `mental_model_propose` card + default-on `mental-model-curator` skill; autonomous creation still explicitly out |
 | 6a. Gate recall on trivial turns | **SHIPPED** | `recallSkipTrivial=true` + `_is_trivial_stateless()` guard |
 | 6b. Right-size retain cadence | **SHIPPED** (#2830/#2831) | chunked windowed retain at `retainEveryNTurns=1` — vendor `retain.py` patched (`select_retain_window()`) to decouple window-slicing from the `>1` throttle; savings not yet measured (#2847) |
 
@@ -116,18 +125,22 @@ it argues for using capability we already pay for, within the lines.
   are keyed per agent (satisfies isolation), but each bank's `retain_mission`
   / `reflect_mission` / `disposition` (skepticism/literalism/empathy)
   appeared generic rather than shaped per specialist.
-  - **Status as of 2026-07-05 — PARTIAL / CHANGED.** A generic
-    `DEFAULT_RETAIN_MISSION` is now seeded at scaffold
-    (`src/memory/hindsight.ts:188`, applied in `scaffold.ts` ~L4304 as
-    `seededRetainMission`), and per-agent `retain_mission` / `bank_mission`
-    are first-class config (`src/config/schema.ts`, ~L333/L337). Live
-    `bank_mission` is specialized on `assistant`, `lawgpt`, and `ziggy`;
-    empty on `carrie`, `marko`, `reggie`, `test-harness`. `disposition` is
-    uniformly `{empathy:3, literalism:3, skepticism:3}` across **all** banks.
-    `reflect_mission`, `observations_mission`, and `disposition` are **not
-    wired anywhere in `src/`**. So specialization is real but partial: the
-    retain/bank mission levers exist and are used on a few banks; the rest of
-    the mission/disposition surface is untouched.
+  - **Status as of 2026-07-06 — SHIPPED (#2855).** A generic
+    `DEFAULT_RETAIN_MISSION` is seeded at scaffold (`src/memory/hindsight.ts`,
+    applied in `scaffold.ts` as `seededRetainMission`), and #2855 then made the
+    remaining knobs first-class: `retain_mission` / `bank_mission` /
+    `reflect_mission` / `observations_mission` / per-bank `disposition` all
+    live in `AgentMemorySchema` (`src/config/schema.ts`, ~L333-L464), cascade
+    through `src/config/merge.ts` with per-key `disposition` inheritance, and
+    are applied in BOTH the scaffold and reconcile bank-update paths via
+    `resolveBankMissionExtras` + `updateBankMissions` (`scaffold.ts` ~L4390,
+    `src/memory/hindsight.ts`). `disposition` is no longer uniformly
+    `{empathy:3, literalism:3, skepticism:3}`: built-in `PROFILE_MEMORY_DEFAULTS`
+    differentiate the specialists on a zero-YAML install (health-coach leans
+    empathy-high; coding / executive-assistant lean skeptical + literal), and
+    operator config overrides per key. The mechanism is general — the named
+    banks (`assistant`, `lawgpt`, `ziggy`) are just the first adopters, not a
+    hard-coded list. Operator-config-driven (no-self-escalation clean).
 
 ## Supply side — the four tiers (what each is)
 
@@ -150,14 +163,14 @@ config today.
 
 | Primitive | Serves | Today (2026-07-05) | Verdict |
 |---|---|---|---|
-| **Mental models** | remember ("ask what it believes about you → legible answer"); colleague (continuity) | auto-seeding **retired** (#2447); 0–several topical models, hand-curated | opportunity moved — profile knowledge now lives in dedicated profile banks, not a per-agent model |
+| **Mental models** | remember ("ask what it believes about you → legible answer"); colleague (continuity) | auto-seeding **retired** (#2447); now **declarative + agent-proposes→confirms** (Phase 5, #2874/#2875) + default-on `mental-model-curator` skill (#2883) | first slice shipped — operator-curated / proposed, never silent self-write |
 | **Observations** | remember ("curated, by relevance, not grab-bag"; inspectable) | **now recalled** (Phase 1) | **consumed** — the wasted-spend gap is closed |
-| **Directives** | colleague + remember ("rules set once stay respected"; "correction sticks") | model *instruction* only, no deterministic routing | still the most invariant-clean primitive — lean in |
+| **Directives** | colleague + remember ("rules set once stay respected"; "correction sticks") | model instruction + **deterministic regex nudge + one bounded verifier block** (Phase 3, #2864/#2873) | shipped as nudge+verifier — model still authors the write; not a hook-side write |
 | **reflect** | remember ("what do you know about me") | explicit asks only | underleveraged as a recall path |
-| **Bank missions + disposition** | fleet-of-specialists ("persona without own memory is cosplay") | retain/bank mission wired + 3 banks specialized; disposition uniform | partial specialization lever |
+| **Bank missions + disposition** | fleet-of-specialists ("persona without own memory is cosplay") | retain/bank/reflect/observations missions + per-bank disposition all wired (#2855); `PROFILE_MEMORY_DEFAULTS` differentiate specialists | **shipped** specialization lever |
 | **recall** (raw) | remember (necessary) | core path, now three-tier | keep — grab-bag tier, but denser with observations |
 | Entity graph / links / cooccurrences | improves recall relevance (plumbing) | auto-built | keep as infra; not a vision lever |
-| Webhooks (`consolidation.completed`) | could make memory chat-legible | unused | invariant-fix lever (Phase 4, not started) |
+| Webhooks (`consolidation.completed`) | could make memory chat-legible (the 🧠 update side) | consumer shipped (#2872) but **dormant** — pinned image emits no such webhook, OFF by default | Phase 4 update-side lever, awaiting the engine webhook |
 | Transfer / audit-log / async-ops tools | marginal to the jobs | unused | leave |
 
 ## Where Hindsight would *not* help — invariant tensions
@@ -178,16 +191,29 @@ against switchroom's lines. Status of each, updated for 2026-07-05:
    Whatever remains is still background model-spend the operator didn't
    initiate (also brushes
    [`crons-use-the-model-only-when-it-earns-it`](../jobs/crons-use-the-model-only-when-it-earns-it.md)).
-2. **Invisible recall injection vs "honest, legible recall."** *Still open.*
-   The `<hindsight_memories>` block is hidden `additionalContext`. Phase 4
-   (chat-legible "remembered: X") has not started; the only surfaced signal
-   is a transient `📚 recalling memories` spinner (`recall.py`, #303) that
-   shows *that* recall ran, not *what* was recalled.
+2. **Invisible recall injection vs "honest, legible recall."** *Substantially
+   addressed by Phase 4 (#2858), on the store/correct side.* The
+   `<hindsight_memories>` recall block is still hidden `additionalContext`, but
+   the *store/correct* side is now legible: a genuine `create_directive` fires
+   a terse `📌 remembered: "…"` line and an `invalidate_memory` / demote fires
+   `✂️ forgot: …`, both in the originating chat/topic
+   (`telegram-plugin/memory-legibility.ts`, default-on). The transient
+   `📚 recalling memories` spinner (`recall.py`, #303) still signals *that*
+   recall ran. The remaining gap is the *update* side — the background
+   consolidation engine distilling new durable observations — whose
+   `🧠 updated what I know about Y` consumer exists
+   (`telegram-plugin/consolidation-legibility.ts`, #2872) but stays dormant:
+   the pinned image emits no `consolidation.completed` webhook and the surface
+   is OFF by default (`SWITCHROOM_CONSOLIDATION_LEGIBILITY=1` to opt in).
 3. **Auto-creating mental models vs `on-leash` / `no-self-escalation`.**
-   *Resolved / over-corrected.* The auto-seeding path was removed in #2447,
-   so no agent enriches its own model structure unprompted. If anything the
-   pendulum swung the other way: there is now *no* automated model curation
-   at all (see Phase 5).
+   *Resolved, and now re-armed the invariant-clean way.* The blind auto-seeding
+   path was removed in #2447, so no agent enriches its own model structure
+   unprompted. Phase 5's first slice (#2874/#2875) then re-introduced curation
+   *without* crossing the tension: models are either operator-declared in
+   `switchroom.yaml` or agent-**proposed** through the `mental_model_propose`
+   approve/deny card (agent can never self-approve; hostd is the sole config
+   writer). The default-on `mental-model-curator` skill (#2883) proposes, never
+   silently creates. Autonomous creation stays explicitly out of scope.
 4. **No time-based decay is actually aligned.** *Confirmed live.* Hindsight
    never forgets (recency is a soft ±10% weight); the job calls silent
    forgetting bad and wants *explicit* demote/correct, which exists and is
@@ -273,48 +299,97 @@ general — any bank can set these fields; the RFC's three named banks
 (`assistant`, `lawgpt`, `ziggy`) are just the first adopters, not a hard-coded
 list. Operator-config-driven (no-self-escalation clean).
 
-**Phase 3 — Directives as the "corrections stick" path. — PARTIAL /
-guidance-only.** The intent is to route user-stated preferences/rules into
-`create_directive` (user-authored, verbatim, chat-legible) rather than hoping
-recall re-surfaces them. Today this is wired only as a **model instruction**:
-`profiles/default/CLAUDE.md.hbs` (~L53, with supporting guidance ~L61) tells
-the agent to call `create_directive` when the user gives a correction or
-"always do X" rule. There is **no deterministic hook** that detects a
-correction and routes it into `create_directive` — it relies entirely on the
-model choosing to call the tool. The invariant-alignment argument holds; the
-reliability gap (guidance vs. guaranteed capture) is the remaining work.
+**Phase 3 — Directives as the "corrections stick" path. — SHIPPED as
+nudge+verifier (#2864/#2873).** The intent is to route user-stated
+preferences/rules into `create_directive` (user-authored, verbatim,
+chat-legible) rather than hoping recall re-surfaces them. Beyond the baseline
+model instruction in `profiles/default/CLAUDE.md.hbs`, two deterministic hooks
+now backstop it — but note the honest shape: this is **regex-detect → nudge →
+one bounded verifier block, and the model still writes the directive** (no
+hook-side write):
+- **Stage B nudge** (`vendor/hindsight-memory/scripts/recall.py`,
+  UserPromptSubmit): regex-detects correction / standing-rule-shaped inbound
+  ("always/never …", "from now on …", "stop doing …", a stated preference,
+  "that's wrong, it's …") and appends a terse advisory to the turn's
+  `additionalContext` telling the model to persist the rule with
+  `create_directive` **if it IS durable** — the model does the judgment
+  in-session.
+- **Stage C verifier** (`vendor/hindsight-memory/scripts/directive_verify.py`,
+  Stop): after the turn, re-checks the human turn against a high-precision
+  durable-rule regex and, if the model recorded no `create_directive` call,
+  blocks the stop **once** to re-prompt capture (closes the "model ignored the
+  nudge" gap). The single-block guard prevents a re-prompt loop.
 
-**Phase 4 — Make memory chat-legible (sparse, not per-turn). —
-NOT-STARTED.** The goal is a terse "remembered: X" / "updated what I know
-about Y" line so recall and consolidation stop being invisible, closing
-tensions (1) and (2). The **only** legibility surface shipped is a transient
-`📚 recalling memories` spinner (`recall.py`, #303), which signals *that*
-recall ran, not *what* was stored or corrected — it is not the store/correct
-line this phase specifies. When built, this **must be sparse and
-material-only**, never default-on-every-turn: the job lists "regurgitating
-old facts unprompted just to prove it remembered" as a top anti-pattern, so a
-per-turn legibility line would *become* that anti-pattern. Surface only on a
-genuine store/correct, or on request. The `consolidation.completed` webhook
-can drive the update side without polling.
+Both are pure detection — no model callsite, no silent hook-side write. The
+whole capture path is opt-out per-agent via `memory.directive_capture_nudge`
+(schema default **true**; `src/config/schema.ts` ~L468), exported to the hooks
+as `HINDSIGHT_DIRECTIVE_CAPTURE_NUDGE`, which disables **both** stages. The
+reliability gap Stage A measured (~55% miss rate on durable corrections) is
+what these close; the residual work is dedup (a restated rule can still
+re-nudge / re-block — tracked as Fix 6.2) and optionally splitting the nudge
+from the block behind a separate `directive_capture_verify` knob.
 
-**Phase 5 — Curated mental models per specialist. — NOT-STARTED as
-automation (and arguably regressed).** The original gap was framed as "one
-auto-seeded model everywhere → curate more selectively." That framing is now
-**wrong**: #2447 *removed* per-agent user-profile auto-seeding, and profile
-knowledge moved into dedicated profile banks (`ken-profile`, `lisa-profile`)
-reached via per-speaker routing (see Developments above). So the real gap
-today is **no automated per-specialist curation at all** — the few topical
-models that exist (`assistant`: 2, `lawgpt`: 5) were hand-built. In that
-sense the auto-seeding removal was a net simplification for the profile use
-case but a *regression* for "the fleet grows its own pinned models." If
-revived, this stays deliberately **not** autonomous creation (tension 3):
-operator-curated, or agent-proposes → operator-confirms in chat. Curate
-**selectively**: a model set to `refresh_after_consolidation` (off by
-default) adds bounded (~2048 token) post-consolidation refresh spend and can
-hit the 300s reflect wall-timeout (observed historically on this fleet), so
-more refresh-enabled models is more invisible background cost. Their upside is
-real on the *explicit* reflect path (fresh models let reflect short-circuit
-the lower tiers → faster); they do not speed the hot recall path.
+**Phase 4 — Make memory chat-legible (sparse, not per-turn). — SHIPPED
+(store/correct side, #2858); update side dormant (#2872).** The goal is a
+terse "remembered: X" / "updated what I know about Y" line so recall and
+consolidation stop being invisible, closing tensions (1) and (2). The
+**store/correct side is live**: `telegram-plugin/memory-legibility.ts` watches
+the main-agent turn stream (deterministic tool-call observation, no model call,
+no polling) and surfaces exactly two lines — `📌 remembered: "<directive>"` on
+a `create_directive`, and `✂️ forgot: <reason>` on an `invalidate_memory` or a
+demote-tagged `update_memory`. It is **sparse and material-only** by
+construction: an ordinary `recall` / `reflect` / benign `update_memory` returns
+null from the classifier, so no line fires — honoring the job's "regurgitating
+old facts unprompted" anti-pattern. Default-on, opt-out via
+`SWITCHROOM_MEMORY_LEGIBILITY=0`. The transient `📚 recalling memories` spinner
+(`recall.py`, #303) still shows *that* recall ran.
+
+The **update side** — the background consolidation engine distilling new
+durable observations, surfaced as `🧠 updated what I know about Y` — has its
+consumer shipped in code (`telegram-plugin/consolidation-legibility.ts` +
+`src/web/webhook-gateway-record.ts`, #2872) but stays **deliberately dormant**:
+it depends on a `consolidation.completed` webhook the pinned hindsight image
+(v0.8.4) does not emit, and it is OFF by default
+(`SWITCHROOM_CONSOLIDATION_LEGIBILITY=1` to opt in). Its schema must be pinned
+with upstream before it is enabled fleet-wide.
+
+**Phase 5 — Curated mental models per specialist. — SHIPPED first slice
+(#2874/#2875/#2883).** The original gap was framed as "one auto-seeded model
+everywhere → curate more selectively." That framing was superseded: #2447
+*removed* per-agent user-profile auto-seeding, and profile knowledge moved into
+dedicated profile banks (`ken-profile`, `lisa-profile`) reached via per-speaker
+routing (see Developments above). Phase 5 re-armed curation the invariant-clean
+way — see the companion note
+[`hindsight-phase5-mental-model-curation.md`](hindsight-phase5-mental-model-curation.md).
+Two slices shipped:
+- **Declarative (#2874).** `memory.mental_models[]` (`{ name, source_query,
+  refresh_after_consolidation?, max_tokens? }`, per-agent tier only, with a
+  duplicate-name guard) is ensured create-if-absent by exact name on both
+  scaffold and reconcile via `ensureDeclaredMentalModels`
+  (`src/memory/hindsight.ts`, wired `scaffold.ts` ~L4428) — best-effort, 5s
+  per-model timeout, never blocks. Zero declarations = zero models
+  (byte-for-byte the post-#2447 behaviour); there is no default model.
+- **Agent-proposes → operator-confirms (#2875).** The
+  `mental_model_propose(chat_id, name, source_query, …)` gateway MCP tool
+  mirrors the `vault_request_access` shape: it posts a `[✅ Approve] [🚫 Deny]`
+  card, and on approval the gateway appends the model to the agent's
+  `memory.mental_models[]` through hostd's `config_propose_edit` apply+reconcile
+  (hostd is the sole config writer). The agent can never self-approve; the
+  non-admin self-scope gate is widened by exactly one narrow rule (append to
+  its OWN `memory.mental_models[]`).
+- **Curator skill (#2883).** A **default-on, fleet-wide**
+  `mental-model-curator` skill (`skills/mental-model-curator/`, injected via
+  `src/memory/scaffold-integration.ts`) directs the agent to survey its OWN
+  bank and **propose** well-earned models through the card — never bulk-create.
+
+Autonomous creation stays deliberately **out** (tension 3). Curate
+**selectively**: a model set to `refresh_after_consolidation` (off by default)
+adds bounded (~2048 token) post-consolidation refresh spend and can hit the
+reflect wall-timeout, so more refresh-enabled models is more invisible
+background cost. Their upside is real on the *explicit* reflect path (fresh
+models let reflect short-circuit the lower tiers → faster); they do not speed
+the hot recall path. Deferred: proposals from a scheduled reflection (cron),
+and any fleet-wide default model.
 
 **Phase 6 — Two near-free hot-path levers (UX + speed + tokens).** Not
 synthesis-tier work, but large responsiveness/cost wins that cross no
@@ -408,36 +483,51 @@ Per-phase scorecard against the three axes (status-annotated):
 | Phase | Status | UX | Speed | Tokens |
 |---|---|---|---|---|
 | 1. Consume observations | SHIPPED | curated, not grab-bag | bounded (+1 arm; rerank capped at 300) | denser → ≤ same; no model call |
-| 2. Per-agent missions/disposition | PARTIAL | specialized recall (3 banks) | neutral (shapes extraction) | slight win — less noise stored |
-| 3. Directives ("corrections stick") | PARTIAL | strong when it fires | negligible | small fixed per-turn cost if always injected |
-| 4. Chat-legible (sparse) | NOT-STARTED | legible **iff** sparse | negligible | minor output tokens |
-| 5. Curated mental models | NOT-STARTED | + faster *reflect* | neutral on hot path | background refresh spend; timeout risk |
+| 2. Per-agent missions/disposition | SHIPPED (#2855) | specialized recall + voice | neutral (shapes extraction) | slight win — less noise stored |
+| 3. Directives ("corrections stick") | SHIPPED as nudge+verifier (#2864/#2873) | strong — deterministic nudge + one bounded re-prompt | negligible (regex detection, no model call) | tiny — advisory text only when a rule is detected |
+| 4. Chat-legible (sparse) | SHIPPED store/correct (#2858); update side dormant (#2872) | legible **and** sparse (material-only classifier) | negligible | minor output tokens on genuine store/correct |
+| 5. Curated mental models | SHIPPED first slice (#2874/#2875/#2883) | + faster *reflect*; operator-curated / proposed | neutral on hot path | background refresh spend only if refresh-enabled (off by default) |
 | 6a. Gate recall on trivial turns | SHIPPED | trivial turns feel instant | **win** — skips ~1–2s arm | **win** — drops ~1024 tok on trivial turns |
 | 6b. Right-size retain cadence | SHIPPED (#2830) | unchanged | unchanged | **win — shipped**; chunked window, flat-per-fire; savings unmeasured (#2847) |
 
-Net read: **Phases 1, 6a, and 6b have shipped.** 1 and 6a moved recall from
-the job's *bad* column toward its *good* column at near-zero (1) or negative
-(6a) cost; 6b (#2830) took on the biggest token lever — the every-turn
-`full-session` reconsolidation draw — with a vendor patch that decouples
-chunked window-slicing from the throttle (the config flip alone was never
-enough), and its realized savings are pending measurement (#2847). **Phase 2**
-is partially in (bank/retain missions). **Phase 3** exists as guidance but not
-as a guaranteed path. **Phase 4** is untouched. **Phase 5** changed shape
-entirely (profile knowledge moved to dedicated banks).
+Net read: **Phases 1, 2, 4, 6a, and 6b have shipped, and 3 + 5 shipped their
+first substantive slices.** 1 and 6a moved recall from the job's *bad* column
+toward its *good* column at near-zero (1) or negative (6a) cost; 6b (#2830)
+took on the biggest token lever — the every-turn `full-session`
+reconsolidation draw — with a vendor patch that decouples chunked
+window-slicing from the throttle (the config flip alone was never enough), and
+its realized savings are pending measurement (#2847). **Phase 2** (#2855) is
+fully in — all mission knobs + per-bank disposition cascade into scaffold and
+reconcile. **Phase 3** (#2864/#2873) shipped as a deterministic nudge + one
+bounded verifier block (not a guaranteed hook-side write — the model still
+authors the directive; dedup is the residual gap). **Phase 4** (#2858) shipped
+the sparse store/correct legibility surface; its consolidation-webhook update
+side (#2872) is present but dormant. **Phase 5** (#2874/#2875/#2883) shipped
+declarative models + agent-proposes→operator-confirms + the default-on
+`mental-model-curator` skill; autonomous creation stays out. The remaining tail
+is measurement (#2847), directive dedup (Fix 6.2), and the dormant
+consolidation webhook (pending upstream schema pin).
 
 ## Verdict check (the four-part rule)
 
 - **Advances an outcome?** Yes, `standing-team`, via the core memory job and
-  the specialist job. Phases 1 and 6a already moved recall toward the "good"
-  column (curated observations in, trivial-turn cost out).
+  the specialist job. Phases 1, 2, 4, 6a already moved recall + storage toward
+  the "good" column (curated observations in, specialized banks, chat-legible
+  store/correct, trivial-turn cost out).
 - **Satisfies the job spec?** Shipped work moved recall from the job's *bad*
   column (grab-bag/raw) toward its *good* column
-  (curated/legible/by-relevance); the remaining open phases (3, 4) are where
-  the "legible" and "corrections stick" criteria still have gaps.
-- **Passes the three principle checks?** Defaults: shipped phases (1, 6a) are
-  config defaults, no operator assembly. Docs: behavior improved without new
-  user-facing concepts. Consistency: same vault/config cascade. Speed/tokens:
-  net-positive or measured (see *Speed & token budget*).
+  (curated/legible/by-relevance): observations are consumed, corrections are
+  nudged+verified into directives (Phase 3), stores/corrects are chat-legible
+  (Phase 4), and specialists carry curated models (Phase 5). Residual gaps:
+  directive dedup, the dormant consolidation-webhook update line, and measured
+  token savings.
+- **Passes the three principle checks?** Defaults: shipped phases are config
+  defaults, no operator assembly (directive-capture nudge, memory legibility,
+  and the curator skill are all default-on/opt-out). Docs: behavior improved
+  with the new legibility lines documented in the operator runbook. Consistency:
+  same vault/config cascade; mental-model writes go through the same hostd
+  config-writer leash. Speed/tokens: net-positive or measured (see *Speed &
+  token budget*).
 - **Crosses an invariant?** No. Each phase is shaped to avoid the tensions
   named above (no autonomous self-writes; legibility added, not removed). The
   #2447 auto-seeding removal actively *resolved* tension (3).
