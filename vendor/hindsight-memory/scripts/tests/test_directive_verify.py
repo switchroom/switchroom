@@ -364,6 +364,56 @@ class TestEvaluate(unittest.TestCase):
         # Defensive: evaluate must degrade to None, never raise.
         self.assertIsNone(evaluate({}, self.ON))
 
+    # --- #2903 Fix 6.2: verify-knob split + directive dedup ------------------
+
+    def test_verify_knob_off_keeps_nudge_but_drops_block(self):
+        # directiveCaptureNudge on (Stage B still nudges) but
+        # directiveCaptureVerify off → the Stop block must NOT fire.
+        msgs = [
+            {"role": "user", "content": "From now on, always use British spelling."},
+            {"role": "assistant", "content": "Got it."},
+        ]
+        path = self._write_transcript(msgs)
+        cfg = {"directiveCaptureNudge": True, "directiveCaptureVerify": False}
+        self.assertIsNone(evaluate(self._hook(msgs, path), cfg))
+        # Sanity: with the knob left default (on) the same turn DOES block.
+        self.assertEqual(evaluate(self._hook(msgs, path), self.ON), _VERIFY_BLOCK_REASON)
+
+    def test_allows_when_rule_already_an_active_directive(self):
+        # The turn restates a rule that is ALREADY in the injected
+        # <active_directives> block; the model correctly declines to re-create
+        # it. The verifier must NOT block (dedup).
+        active_block = (
+            "<active_directives>\n"
+            "The following are HARD RULES the agent must follow on this turn.\n\n"
+            "1. [P10] spelling: Always use British spelling in all replies.\n"
+            "</active_directives>"
+        )
+        msgs = [
+            {"role": "user", "content": active_block},
+            {"role": "user", "content": "From now on, always use British spelling please."},
+            {"role": "assistant", "content": "That's already how I write — noted."},
+        ]
+        path = self._write_transcript(msgs)
+        self.assertIsNone(evaluate(self._hook(msgs, path), self.ON))
+
+    def test_blocks_when_active_directive_is_a_different_rule(self):
+        # An unrelated active directive must NOT suppress the block for a new
+        # durable rule.
+        active_block = (
+            "<active_directives>\n"
+            "The following are HARD RULES the agent must follow on this turn.\n\n"
+            "1. [P10] tz: Always show times in UTC.\n"
+            "</active_directives>"
+        )
+        msgs = [
+            {"role": "user", "content": active_block},
+            {"role": "user", "content": "From now on, always use British spelling."},
+            {"role": "assistant", "content": "Got it."},
+        ]
+        path = self._write_transcript(msgs)
+        self.assertEqual(evaluate(self._hook(msgs, path), self.ON), _VERIFY_BLOCK_REASON)
+
 
 class TestSyntheticInbound(unittest.TestCase):
     """Non-interactive turns (cron / synthesized inbounds) must never trip the

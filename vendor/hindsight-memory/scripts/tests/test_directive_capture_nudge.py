@@ -131,6 +131,12 @@ class TestNudgeAppendedWithoutDisturbingRecall(unittest.TestCase):
         self.assertIn("create_directive", _DIRECTIVE_CAPTURE_NUDGE)
         self.assertIn("directive_capture_check", _DIRECTIVE_CAPTURE_NUDGE)
 
+    def test_nudge_carries_the_dedup_caveat(self):
+        # #2903 Fix 6.2: the nudge must tell the model NOT to re-create a rule
+        # that already exists as an active directive.
+        self.assertIn("already exists", _DIRECTIVE_CAPTURE_NUDGE)
+        self.assertIn("active_directives", _DIRECTIVE_CAPTURE_NUDGE)
+
     def test_combine_appends_nudge_after_recall_block(self):
         base = "<hindsight_memories>\n…\n</hindsight_memories>"
         out = _combine_context(base, _DIRECTIVE_CAPTURE_NUDGE)

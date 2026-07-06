@@ -738,6 +738,38 @@ export function assertSelfScopedMentalModelEdit(
   return { ok: true };
 }
 
+/**
+ * The non-admin `config_propose_edit` admission decision: an edit is admitted
+ * if it is EITHER a self-scoped `tools.allow` widen (the "🔁 Always allow"
+ * persistence path) OR a self-scoped append to the caller's own
+ * `memory.mental_models[]` (the agent-proposes → human-approves curation path).
+ * Only when BOTH fail is the edit denied. This encapsulates the exact either/or
+ * branch enforced in `HostControlServer` so it is unit-testable without standing
+ * up the full server (the historical gap: the branch was only pinned via its two
+ * component validators, never the OR-combination itself).
+ *
+ * On denial, `detail` surfaces the tools.allow failure (the most-common mode)
+ * and `mentalModelDetail` carries the mental-model failure for diagnostics.
+ * Pure: delegates to the two component validators, no I/O.
+ */
+export function admitSelfScopedNonAdminEdit(
+  beforeContent: string,
+  afterContent: string,
+  caller: string,
+):
+  | { ok: true; via: "tools.allow" | "mental_models" }
+  | { ok: false; detail: string; mentalModelDetail: string } {
+  const allowScope = assertSelfScopedAllowEdit(beforeContent, afterContent, caller);
+  if (allowScope.ok) return { ok: true, via: "tools.allow" };
+  const mentalModelScope = assertSelfScopedMentalModelEdit(beforeContent, afterContent, caller);
+  if (mentalModelScope.ok) return { ok: true, via: "mental_models" };
+  return {
+    ok: false,
+    detail: allowScope.detail,
+    mentalModelDetail: mentalModelScope.detail,
+  };
+}
+
 function readCallerMentalModels(cfg: Record<string, unknown>, caller: string): unknown[] {
   const agents = cfg.agents;
   if (!agents || typeof agents !== "object") return [];

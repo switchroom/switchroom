@@ -5181,20 +5181,45 @@ interface PendingMentalModelPropose {
 }
 const pendingMentalModelProposes = new Map<string, PendingMentalModelPropose>()
 const MENTAL_MODEL_PROPOSE_TTL_MS = approvalTtlMs()
+// Sweep expired pending proposals. For any entry past its TTL we ALSO edit the
+// posted card's keyboard away, so a stale card left in the chat can't be tapped
+// into a "Card expired" answer — the operator sees the ⌛ expiry inline instead.
+// Best-effort: card edits are fire-and-forget (the entry is removed regardless).
 function sweepPendingMentalModelProposes(): void {
   const cutoff = Date.now() - MENTAL_MODEL_PROPOSE_TTL_MS
   for (const [k, v] of pendingMentalModelProposes) {
-    if (v.staged_at < cutoff) pendingMentalModelProposes.delete(k)
+    if (v.staged_at < cutoff) {
+      pendingMentalModelProposes.delete(k)
+      if (v.card_message_id != null) {
+        void lockedBot.api
+          .editMessageText(
+            v.chat_id,
+            v.card_message_id,
+            richMessage('⌛ _This mental-model proposal card expired. Ask the agent to re-propose if it still stands._'),
+            { reply_markup: { inline_keyboard: [] } },
+          )
+          .catch(() => {})
+      }
+    }
   }
 }
 
-// Per-agent sliding-window rate limit for mental-model proposals: at most
+// Sliding-window rate limit for mental-model proposals: at most
 // MENTAL_MODEL_PROPOSE_MAX_PER_WINDOW cards per MENTAL_MODEL_PROPOSE_WINDOW_MS.
-// A candidate model is a deliberate, rare curation act — an agent that
-// re-proposes in a loop should be throttled so the operator is never spammed.
+// The window is per-gateway-process, and since each agent runs its own gateway
+// process (keyed by $SWITCHROOM_AGENT_NAME), one process == one agent — so this
+// throttle is effectively per-agent. A candidate model is a deliberate, rare
+// curation act — an agent that re-proposes in a loop should be throttled so the
+// operator is never spammed.
 const mentalModelProposeTimes: number[] = []
 const MENTAL_MODEL_PROPOSE_WINDOW_MS = 60 * 60 * 1000
 const MENTAL_MODEL_PROPOSE_MAX_PER_WINDOW = 5
+// Mirror the memory.mental_models[] schema caps (src/config/schema.ts): a
+// source_query capped at 2000 chars and max_tokens capped at 8192. Enforced
+// up-front in executeMentalModelPropose so a proposal that would fail hostd
+// config validation never reaches an approval card.
+const MENTAL_MODEL_SOURCE_QUERY_MAX = 2000
+const MENTAL_MODEL_MAX_TOKENS_CAP = 8192
 function checkMentalModelProposeRate(now = Date.now()): { ok: true } | { ok: false; retryAtMs: number } {
   const cutoff = now - MENTAL_MODEL_PROPOSE_WINDOW_MS
   while (mentalModelProposeTimes.length > 0 && mentalModelProposeTimes[0]! < cutoff) {
@@ -11959,6 +11984,15 @@ async function executeMentalModelPropose(args: Record<string, unknown>): Promise
   }
   const source_query = typeof args.source_query === 'string' ? args.source_query.trim() : ''
   if (!source_query) throw new Error('mental_model_propose: source_query is required')
+  // Enforce the memory.mental_models[] schema cap (src/config/schema.ts) up-front
+  // so the operator never approves a card that then fails hostd config validation.
+  // The 2000-char ceiling also keeps the rendered card under Telegram's 4096-char
+  // message limit.
+  if (source_query.length > MENTAL_MODEL_SOURCE_QUERY_MAX) {
+    throw new Error(
+      `mental_model_propose: source_query is ${source_query.length} chars; the schema caps it at ${MENTAL_MODEL_SOURCE_QUERY_MAX} (a standing reflection query, not a document). Shorten it.`,
+    )
+  }
   // Accept `why` as an alias for `reason` (mirrors the vault tools).
   const reason =
     typeof args.reason === 'string' ? args.reason : typeof args.why === 'string' ? args.why : undefined
@@ -11974,6 +12008,13 @@ async function executeMentalModelPropose(args: Record<string, unknown>): Promise
     const n = Number(args.max_tokens)
     if (!Number.isInteger(n) || n <= 0) {
       throw new Error('mental_model_propose: max_tokens must be a positive integer')
+    }
+    // Enforce the schema ceiling (src/config/schema.ts) here so the card can't be
+    // approved into a config-validation failure downstream.
+    if (n > MENTAL_MODEL_MAX_TOKENS_CAP) {
+      throw new Error(
+        `mental_model_propose: max_tokens ${n} exceeds the schema cap of ${MENTAL_MODEL_MAX_TOKENS_CAP} (a mental model is a standing summary, not a corpus).`,
+      )
     }
     max_tokens = n
   }
@@ -20944,6 +20985,24 @@ async function handleMentalModelProposeCallback(ctx: Context, data: string): Pro
   }
   if (action !== 'approve' && action !== 'deny') {
     await ctx.answerCallbackQuery({ text: 'Bad request' }).catch(() => {})
+    return
+  }
+  // Enforce the TTL at TAP time, not just on the next propose's sweep. Without
+  // this, a card left untapped past its TTL is still resolvable if no fresh
+  // proposal has run the sweep — an operator could approve a stale proposal.
+  if (Date.now() - pending.staged_at > MENTAL_MODEL_PROPOSE_TTL_MS) {
+    pendingMentalModelProposes.delete(stageId)
+    await ctx.answerCallbackQuery({ text: 'Card expired — ask the agent to re-propose.' }).catch(() => {})
+    if (pending.card_message_id != null) {
+      await ctx.api
+        .editMessageText(
+          pending.chat_id,
+          pending.card_message_id,
+          richMessage('⌛ _This mental-model proposal card expired before you tapped. Ask the agent to re-propose if it still stands._'),
+          { reply_markup: { inline_keyboard: [] } },
+        )
+        .catch(() => {})
+    }
     return
   }
   // Single-shot: remove the pending entry immediately so a double-tap can't
