@@ -8,6 +8,9 @@ import {
   classifyToolContract,
   classifyHindsightHealthProbe,
   checkHindsightHealthEndpoint,
+  classifyConsolidationBacklog,
+  CONSOLIDATION_BACKLOG_WARN,
+  CONSOLIDATION_BACKLOG_FAIL,
   type AdvertisedTool,
   MIN_HINDSIGHT_SHM_BYTES,
 } from "../src/cli/doctor-memory.js";
@@ -56,6 +59,41 @@ describe("classifyToolContract — live contract-drift detector", () => {
     for (const tool of Object.keys(EXPECTED_HINDSIGHT_TOOLS)) {
       expect(names.has(tool), `${tool} in EXPECTED_HINDSIGHT_TOOLS but not the snapshot`).toBe(true);
     }
+  });
+});
+
+describe("classifyConsolidationBacklog (#2903 fix 5.3)", () => {
+  it("ok when the queue is drained", () => {
+    const r = classifyConsolidationBacklog(0);
+    expect(r.status).toBe("ok");
+    expect(r.detail).toMatch(/drained/);
+  });
+
+  it("ok (not warn) just below the warn threshold", () => {
+    const r = classifyConsolidationBacklog(CONSOLIDATION_BACKLOG_WARN - 1);
+    expect(r.status).toBe("ok");
+  });
+
+  it("warns once the queue crosses the warn threshold", () => {
+    const r = classifyConsolidationBacklog(CONSOLIDATION_BACKLOG_WARN);
+    expect(r.status).toBe("warn");
+    expect(r.detail).toContain(`${CONSOLIDATION_BACKLOG_WARN} pending`);
+  });
+
+  it("fails when the queue is deep enough to be wedged", () => {
+    const r = classifyConsolidationBacklog(CONSOLIDATION_BACKLOG_FAIL);
+    expect(r.status).toBe("fail");
+    expect(r.fix).toBeDefined();
+  });
+
+  it("includes the oldest-op age when it is known", () => {
+    const r = classifyConsolidationBacklog(CONSOLIDATION_BACKLOG_WARN, 7200);
+    expect(r.detail).toMatch(/oldest 120m old/);
+  });
+
+  it("omits the age clause when age is unknown (REST /stats has no per-op age — #2847)", () => {
+    const r = classifyConsolidationBacklog(CONSOLIDATION_BACKLOG_WARN, null);
+    expect(r.detail).not.toMatch(/oldest/);
   });
 });
 

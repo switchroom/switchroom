@@ -59,6 +59,67 @@ export function classifyShmSize(bytes: number): CheckResult {
 }
 
 /**
+ * Backlog thresholds for the consolidation queue. With the #2894 throttle
+ * (MAX_SLOTS=1, ~7 consolidation ops/hour drained against a fleet retaining
+ * every turn) the queue can build silently — the only prior signal was a 2h
+ * queue-lag WARNING written to `docker logs` by `hindsight-maintenance.sh`.
+ * A deep queue means retains are landing but not yet consolidated into recall.
+ * WARN ≈ several hours of backlog; FAIL ≈ ~a day+, likely wedged.
+ */
+export const CONSOLIDATION_BACKLOG_WARN = 25;
+export const CONSOLIDATION_BACKLOG_FAIL = 200;
+
+/**
+ * Pure: classify the consolidation-queue backlog into a doctor result so
+ * `switchroom doctor` surfaces queue depth (and, when available, the oldest
+ * pending op's age) instead of it hiding in docker logs.
+ *
+ * `queueDepth` is the count of pending/processing async operations across all
+ * banks (summed from each bank's `/stats.pending_operations`). `oldestAgeSecs`
+ * is the age of the oldest pending op when known, else `null` — the REST
+ * `/stats` surface exposes depth but not per-op age, so precise age
+ * measurement is deferred to the #2847 follow-up (the maintenance loop already
+ * logs it). Never throws.
+ */
+export function classifyConsolidationBacklog(
+  queueDepth: number,
+  oldestAgeSecs: number | null = null,
+): CheckResult {
+  const ageStr =
+    oldestAgeSecs !== null && oldestAgeSecs > 0
+      ? `, oldest ${Math.round(oldestAgeSecs / 60)}m old`
+      : "";
+  const base = `${queueDepth} pending consolidation op(s)${ageStr}`;
+  if (queueDepth >= CONSOLIDATION_BACKLOG_FAIL) {
+    return {
+      name: "hindsight consolidation backlog",
+      status: "fail",
+      detail:
+        `${base} — queue is deep enough to be wedged; retains are landing but ` +
+        `not consolidating into recall (drains ~7 ops/hr under the #2894 throttle)`,
+      fix:
+        "Check `docker logs switchroom-hindsight` for the queue-lag WARNING and " +
+        "consolidation errors (quota/429/shm); restart with `switchroom memory " +
+        "--restart` if the worker is stuck.",
+    };
+  }
+  if (queueDepth >= CONSOLIDATION_BACKLOG_WARN) {
+    return {
+      name: "hindsight consolidation backlog",
+      status: "warn",
+      detail:
+        `${base} — building faster than it drains (~7 ops/hr under the #2894 ` +
+        `throttle); recall may lag recent turns until it catches up`,
+    };
+  }
+  return {
+    name: "hindsight consolidation backlog",
+    status: "ok",
+    detail: queueDepth > 0 ? base : "queue drained (0 pending)",
+  };
+}
+
+/**
  * Pure: classify recent hindsight logs for fact-extraction health. Catches the
  * two silent-write failure modes by their log signatures.
  */

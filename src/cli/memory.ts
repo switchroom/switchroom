@@ -22,6 +22,7 @@ import {
   getRunningHindsightPorts,
   preflightHindsightPorts,
   HINDSIGHT_DEFAULT_API_PORT,
+  HINDSIGHT_DEFAULT_MCP_URL,
   type LiteLLMHindsightConfig,
 } from "../setup/hindsight.js";
 import { getViaBrokerStructured } from "../vault/broker/client.js";
@@ -659,7 +660,7 @@ export function registerMemoryCommand(program: Command): void {
           const collection = getCollectionForAgent(agent, config);
           const apiUrl =
             (config.memory?.config?.url as string | undefined) ??
-            "http://localhost:18888/mcp/";
+            HINDSIGHT_DEFAULT_MCP_URL;
           const timeoutMs = Math.max(500, parseInt(opts.timeout, 10) || 5000);
 
           console.log(
@@ -713,7 +714,7 @@ export function registerMemoryCommand(program: Command): void {
   // memory.recall.additional_banks. Single-tenant — the operator's own data
   // in the operator's Hindsight instance.
   const restBase = (url: string | undefined): string =>
-    (url ?? "http://127.0.0.1:18888/mcp/")
+    (url ?? HINDSIGHT_DEFAULT_MCP_URL)
       .replace(/\/mcp\/?$/, "")
       .replace(/\/$/, "");
   const VALID_BANK = /^[a-zA-Z0-9_.-]+$/;

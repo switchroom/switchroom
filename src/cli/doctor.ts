@@ -28,8 +28,9 @@ import { getSlotInfos, type SlotInfo } from "../auth/accounts.js";
 import type { AgentConfig, SwitchroomConfig } from "../config/schema.js";
 import { loadManifest, detectDrift, type DriftProbers } from "../manifest.js";
 import { probeHindsight, isHindsightEnabled, fetchHindsightToolsList, collectProfileBanks } from "../memory/hindsight.js";
+import { HINDSIGHT_DEFAULT_MCP_URL } from "../setup/hindsight.js";
 import { inspectBankHealth, staleMentalModels, corruptedMentalModels, recentUnextracted, ageDays } from "../memory/bank-health.js";
-import { checkHindsightContainerHealth, classifyToolContract, checkHindsightHealthEndpoint } from "./doctor-memory.js";
+import { checkHindsightContainerHealth, classifyToolContract, checkHindsightHealthEndpoint, classifyConsolidationBacklog } from "./doctor-memory.js";
 import { isDockerMode, runDockerChecks } from "./doctor-docker.js";
 import { runAuthBrokerChecks } from "./doctor-auth-broker.js";
 import { runHostdChecks } from "./doctor-hostd.js";
@@ -1080,6 +1081,22 @@ export async function checkBankIngestHealth(
     ),
   );
 
+  // Fleet-wide consolidation backlog (#2903 fix 5.3): sum the pending-op
+  // count across every reachable bank so `switchroom doctor` shows the queue
+  // depth the #2894 throttle can silently build. Oldest-pending age isn't on
+  // the REST /stats surface (measurement follow-up: #2847), so age is unknown.
+  let totalPending = 0;
+  let anyBankReachable = false;
+  for (const [, , h] of inspected) {
+    if (h.ok) {
+      anyBankReachable = true;
+      totalPending += h.pendingOperations;
+    }
+  }
+  if (anyBankReachable) {
+    results.push(classifyConsolidationBacklog(totalPending));
+  }
+
   for (const [bankId, agents, h] of inspected) {
     const label =
       `bank ${bankId}` +
@@ -1170,7 +1187,7 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
   }
 
   const url = (config.memory?.config?.url as string | undefined)
-    ?? "http://localhost:18888/mcp/";
+    ?? HINDSIGHT_DEFAULT_MCP_URL;
 
   const results: CheckResult[] = [];
 

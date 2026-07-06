@@ -32,6 +32,15 @@ export const HINDSIGHT_DEFAULT_UI_PORT = 9999;
 export const HINDSIGHT_DEFAULT_MCP_URL = `http://127.0.0.1:${HINDSIGHT_DEFAULT_API_PORT}/mcp/`;
 
 /**
+ * Default REST base URL (no `/mcp/` suffix) for hindsight's HTTP API — the
+ * form the vendored plugin's hooks expect as `HINDSIGHT_API_URL`. Derived
+ * from {@link HINDSIGHT_DEFAULT_MCP_URL} so the port lives in exactly one
+ * place: every `?? "http://127.0.0.1:18888"` literal fallback that used to be
+ * scattered across scaffold/doctor/agent/memory should reference this instead.
+ */
+export const HINDSIGHT_DEFAULT_API_BASE_URL = HINDSIGHT_DEFAULT_MCP_URL.replace(/\/mcp\/?$/, "");
+
+/**
  * Default cap on observations per *tag scope*.
  *
  * Upstream Hindsight defaults `HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE`
@@ -595,8 +604,10 @@ export function startHindsight(
     // Reflect wall timeout — let large-bank mental-model refreshes finish
     // (vendor 300s times out on 12k+ obs banks → stale user-profile models).
     "-e", `HINDSIGHT_API_REFLECT_WALL_TIMEOUT=${HINDSIGHT_DEFAULT_REFLECT_WALL_TIMEOUT_S}`,
-    // Consolidation throughput (modest): fewer LLM round-trips per round +
-    // one more concurrent bank during backlog recovery. See constants above.
+    // Consolidation concurrency: throttled by #2894 to a hard ceiling of
+    // MAX_SLOTS 1 × LLM_PARALLELISM 2 = 2 concurrent model calls (was 18), so
+    // consolidation can never exhaust the shared failover quota. Batch size 12
+    // and per-round scope 100 bound tokens/scope per op. See constants above.
     "-e", `HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE=${HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE}`,
     "-e", `HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS=${HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS}`,
     "-e", `HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM=${HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM}`,
@@ -637,9 +648,16 @@ export function startHindsight(
     // HINDSIGHT_DEFAULT_SHM_SIZE) or all writes/queries fail with
     // "No space left on device". Keep in sync with the compose snippet.
     `--shm-size=${HINDSIGHT_DEFAULT_SHM_SIZE}`,
-    // Restart a wedged API: docker had no liveness signal for hindsight,
-    // so an unresponsive server (or a never-booting one) stayed "up"
-    // forever. python3 is always present in the image; curl/wget are not.
+    // Liveness signal for a wedged API: docker had no health probe for
+    // hindsight, so an unresponsive server (or a never-booting one) stayed
+    // "up" forever. This marks the container "unhealthy" in `docker inspect`
+    // / `docker ps` so operators and the doctor probe can SEE the wedge.
+    // NOTE: vanilla Docker does NOT auto-restart an unhealthy container —
+    // `--restart always` acts on process EXIT only, never on health status.
+    // So this is visibility, not a self-heal; an unhealthy-but-not-exited
+    // API keeps running until something (operator / an autoheal sidecar)
+    // acts on the status. See PR follow-up for the restart-on-unhealthy
+    // mechanism. python3 is always present in the image; curl/wget are not.
     "--health-cmd", litellm
       ? `python3 -c 'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen("http://localhost:${apiPort}/health",timeout=4).getcode()==200 else 1)'`
       : HINDSIGHT_HEALTHCHECK_CMD,
@@ -743,11 +761,57 @@ export function getRunningHindsightPorts(): { apiPort: number; uiPort: number } 
     }
   };
   const apiPort = readPort(CONTAINER_API_PORT);
+  if (apiPort !== null) {
+    // The UI port is informational (unused by switchroom); reuse it if
+    // readable, else derive the standard pair (18888→19999, 8888→9999).
+    const uiPort =
+      readPort(CONTAINER_UI_PORT) ??
+      (apiPort === HINDSIGHT_DEFAULT_API_PORT ? HINDSIGHT_DEFAULT_UI_PORT : 19999);
+    return { apiPort, uiPort };
+  }
+  // `docker port` returns NOTHING for a `--network host` container (the
+  // deployed litellm shape runs `--network host`, no -p publishing), so a
+  // port-reassigned host-network deployment would otherwise fall back to the
+  // 18888 default and strand `memory.config.url`. Recover the real ports from
+  // the container's env, where `startHindsight` writes `HINDSIGHT_API_PORT`
+  // for exactly this mode.
+  return getHindsightPortsFromEnv();
+}
+
+/**
+ * Fallback for {@link getRunningHindsightPorts}: read the host ports from the
+ * running container's environment (`docker inspect --format '{{.Config.Env}}'`).
+ * Used for `--network host` deployments where `docker port` yields nothing.
+ * Reads `HINDSIGHT_API_PORT`; the UI port is informational, so it's derived
+ * from the API port (18888→19999, else 9999) unless a `HINDSIGHT_UI_PORT`-like
+ * var is present. Returns null when the container isn't inspectable or the API
+ * port env var is absent.
+ */
+function getHindsightPortsFromEnv(): { apiPort: number; uiPort: number } | null {
+  let env: string;
+  try {
+    env = execFileSync(
+      "docker",
+      ["inspect", "--format", "{{.Config.Env}}", "switchroom-hindsight"],
+      { stdio: "pipe", encoding: "utf-8" },
+    );
+  } catch {
+    return null;
+  }
+  // `{{.Config.Env}}` renders the env slice as a space-separated, bracketed
+  // Go list: `[FOO=1 HINDSIGHT_API_PORT=18888 BAR=baz]`. Values never contain
+  // spaces here (they're ports/URLs/keys), so a token split is sufficient.
+  const readVar = (name: string): number | null => {
+    const re = new RegExp(`(?:^|[\\s\\[])${name}=([^\\s\\]]+)`);
+    const m = env.match(re);
+    if (!m) return null;
+    const n = Number(m[1]);
+    return Number.isInteger(n) && n > 0 ? n : null;
+  };
+  const apiPort = readVar("HINDSIGHT_API_PORT");
   if (apiPort === null) return null;
-  // The UI port is informational (unused by switchroom); reuse it if
-  // readable, else derive the standard pair (18888→19999, 8888→9999).
   const uiPort =
-    readPort(CONTAINER_UI_PORT) ??
+    readVar("HINDSIGHT_UI_PORT") ??
     (apiPort === HINDSIGHT_DEFAULT_API_PORT ? HINDSIGHT_DEFAULT_UI_PORT : 19999);
   return { apiPort, uiPort };
 }
