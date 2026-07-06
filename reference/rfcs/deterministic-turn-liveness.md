@@ -322,14 +322,23 @@ on tick".
    mid-turn permanently freezes the pre-restart card — the new process
    has no handle to resume editing it. The resumed turn opens a fresh
    card; the old one is never finalized.
-2. **Worktree-isolated sub-agents.** The activity watcher's project-slug
-   filter does not match worktree-isolated sub-agents' cwd, so no live
-   worker feed surfaces for them once the parent turn ends.
+2. ~~**Worktree-isolated sub-agents.**~~ **Closed** by a follow-up PR
+   (`telegram-plugin/subagent-watcher.ts` `extraWatchCwdsProvider` +
+   `telegram-plugin/gateway/gateway.ts` wiring against
+   `src/worktree/registry.ts`'s `listRecords()`). Deterministic guarantee
+   added: sub-agent activity in a worktree-isolated cwd this agent itself
+   claimed surfaces in the worker feed / `subagentActivityAt` exactly like
+   a same-cwd sub-agent — the watcher now watches the project-dir slug for
+   every worktree path owned by this agent (`ownerAgent` match against
+   `SWITCHROOM_AGENT_NAME`), re-derived fresh on every rescan tick, in
+   addition to `agentCwd`. Genuinely foreign project dirs (not a slug the
+   agent's own `agentCwd` or a worktree it owns maps to) are still
+   skipped — the #1116 protection is preserved, not widened to a wildcard
+   watch.
 
-Both are pre-existing and orthogonal to the climb, named here so the
-guarantee is not read as broader than delivered. Each needs its own
-follow-up (persist/rehydrate or boot-time reaping of orphaned cards;
-worktree-aware slug matching).
+Gap 1 is pre-existing and orthogonal to the climb, named here so the
+guarantee is not read as broader than delivered. It needs its own
+follow-up (persist/rehydrate or boot-time reaping of orphaned cards).
 - **Fleet restart discipline.** No fleet restart until the operator
   confirms; stagger restarts across agents (a card-edit-path change is
   visible on the very next turn, so a bad edit should not hit the whole

@@ -559,6 +559,7 @@ import {
   startSubagentWatcher,
   type SubagentWatcherHandle,
 } from '../subagent-watcher.js'
+import { listRecords as listWorktreeRecords } from '../../src/worktree/registry.js'
 import {
   startBootCard,
   resolvePersonaName,
@@ -26295,6 +26296,28 @@ void (async () => {
               // accident no longer pollute the watcher with phantom
               // registrations + ENOENT log spam + false stalls.
               agentCwd: watcherAgentDir,
+              // Gap 2 (deterministic-turn-liveness.md "Known gaps"): a
+              // sub-agent dispatched into a `switchroom worktree claim`
+              // cwd runs under a different project-dir slug than
+              // `agentCwd` above, so the #1116 foreign-slug filter would
+              // otherwise skip it forever — no activity stamp, no `🛠
+              // Worker` feed for the entire run. Re-derive, fresh on every
+              // rescan tick, the set of worktree paths this agent itself
+              // currently owns (registry records are the deterministic
+              // source of truth for "cwds this agent's sub-agents may run
+              // in") and let the watcher also watch those slugs.
+              // Best-effort: a registry read failure (e.g. no worktree dir
+              // on an agent that never claims one) must not affect the
+              // primary agentCwd watch.
+              extraWatchCwdsProvider: () => {
+                try {
+                  return listWorktreeRecords()
+                    .filter((r) => r.ownerAgent === process.env.SWITCHROOM_AGENT_NAME)
+                    .map((r) => r.path)
+                } catch {
+                  return []
+                }
+              },
               // Bug 0 fix: previously omitted, leaving the watcher unable to
               // write liveness/stall/turn_end updates to the registry DB.
               // Liveness writes are now persisted across the gateway lifetime.
