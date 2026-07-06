@@ -2,7 +2,7 @@
 artifact: Deterministic turn liveness — the framework owns "alive", the model owns "what"
 backs: chat-is-the-single-source-of-truth
 serves: jobs/know-what-my-agent-is-doing.md
-status: design v1 — regression fix; re-founds turn-liveness-primitive.md's mid-turn floor as a climbing card edit, not a one-shot text send
+status: Phases 1, 2, 4b, 4d landed (PR 1/2). Phase 3 + Phase 5 landed, Phase 4a authored (this PR). Phase 4c authored as a fixed-shape live scaffold, not the full randomized corpus — see Known gaps.
 ---
 
 # Deterministic turn liveness: the framework owns "alive", the model owns "what"
@@ -221,6 +221,21 @@ mid-turn floor.** Therefore:
 No inert code may imply an absent guarantee. Either the machinery delivers
 or it is removed with a pointer to what does.
 
+**Landed (this PR).** `onMidTurnFloor` (`telegram-plugin/gateway/gateway.ts`)
+now returns early for the busy-but-silent (non-approval) case, with a comment
+pointing at Phase 1. This is provably NOT a behaviour change: before this PR,
+`formatFrameworkFallbackText('working', …, blockedOnApproval=false)`
+(`telegram-plugin/silence-poke.ts`) already returned `null` unconditionally
+for that branch (#2667), so the handler already sent nothing for it — the
+early return makes the no-op explicit in the CALLER instead of implicit in
+the callee's return value. The approval-blocked branch (`blockedOnApproval
+=== true`) is untouched: same threshold gate (`decideMidTurnFloor` /
+`SILENCE_FLOOR_MS`), same text, same silent send. The decision machinery
+(`decideMidTurnFloor`, `tryMidTurnFloor`, `midTurnFloorEnabled`,
+`turn-liveness-floor.ts`) is unchanged and still load-bearing — it is what
+gates the surviving approval-blocked re-ping, so it is NOT vestigial and
+was not removed.
+
 ### Phase 4 — outcome-based test wall
 
 Structural source-greps are retired as *sole* coverage for liveness. The
@@ -230,6 +245,15 @@ wall is behavioural, on the real surface.
 on `uat/scenarios/jtbd-liveness-feed-open-dm.test.ts`), each with a `-dm`
 and a `-channel` twin (surface parity is a production-readiness bar in the
 job spec):
+
+**Landed (this PR — authored, not run from this sandbox; `uat-gate` /
+`uat-fuzz` / the test-harness agent execute them):**
+`jtbd-liveness-climb-{dm,channel}.test.ts` (40s silent tool),
+`jtbd-liveness-narration-{dm,channel}.test.ts` (narrated work),
+`silent-end-recovery-{dm,channel}.test.ts` (dark turn — the `-dm` file
+already existed from Phase 2; this PR adds the `-channel` twin). Each
+asserts no mid-turn ping inline (there is no separate "across all" test —
+the ping-free assertion is baked into every scenario above per the design).
 
 - **40s silent tool** → card **edited ≥4 times**, elapsed **climbing**;
   hard-fail on a freeze (zero edits across the gap).
@@ -268,6 +292,15 @@ on tick".
   after this change. #2667 muted a guarantee as a side effect of a
   legitimate anti-nag change precisely because no one had to state the
   delta.
+
+**Landed (this PR).** `reference/jobs/know-what-my-agent-is-doing.md` §
+Prove-it gained four new bullets: the card-climb DM/channel twins, the
+narration-survives-the-climb DM/channel twins, the dark-turn-fires-once
+DM/channel twins, and the live dead-air fuzz scaffold (with its scope
+honestly noted). The PR-declaration rule is now written down in
+`CONTRIBUTING.md` § Submitting a PR (step 8) — the concrete "wherever the
+repo keeps such contribution rules" surface, since `CONTRIBUTING.md` is
+the file that already owns "what we look for in PRs".
 
 ## Alternatives considered
 
@@ -313,7 +346,12 @@ on tick".
   3. **Phase 3 + Phase 5** as docs/cleanup — remove the vestigial send,
      document the boundary, update the job spec Prove-it and the PR-delta
      policy. Not landed with PRs 1–2; the vestigial 45s path stays
-     in-tree until this PR.
+     in-tree until this PR. **Landed** — see the Phase 3 / Phase 5 sections
+     above for exactly what changed. This same PR additionally authors the
+     Phase 4a DM/channel UAT twins (deferred from PR 1) and a Phase 4c
+     live-transport fuzz scaffold (see Known gaps for its honest scope
+     limit) — these were not blocking Phase 3/5 but were bundled since they
+     complete the outcome-based test wall this RFC promises.
 
 ### Known gaps (out of scope, not closed by this RFC)
 
@@ -357,6 +395,21 @@ on tick".
 Gap 1 is pre-existing and orthogonal to the climb, named here so the
 guarantee is not read as broader than delivered. It needs its own
 follow-up (persist/rehydrate or boot-time reaping of orphaned cards).
+
+3. **Phase 4c live-transport corpus breadth.** The full randomized
+   message-timing × turn-length × tool-churn × sub-agent-fan-out × surface ×
+   role corpus is authored and proven at the DECISION layer only
+   (`telegram-plugin/tests/turn-liveness-invariant.test.ts`, 2000 shapes ×
+   both surfaces, runs on every CI pass — fast, free, no live quota). This
+   PR adds `telegram-plugin/uat/scenarios/fuzz-liveness-climb-dm.test.ts`, a
+   handful (3) of hand-picked, FIXED silent-tool shapes run on the real
+   surface under `uat-fuzz` — genuinely useful (it catches a live-transport
+   regression the decision-layer fuzz cannot, since that fuzz stubs the
+   send), but it is not the same-breadth randomized live corpus the design
+   describes. A true randomized live corpus needs a dedicated long-running
+   canary budget (each live turn burns real subscription quota and
+   30-90s wall-clock; 2000 shapes is not realistic per-PR or even
+   per-release). Tracked here rather than silently claimed as done.
 - **Fleet restart discipline.** No fleet restart until the operator
   confirms; stagger restarts across agents (a card-edit-path change is
   visible on the very next turn, so a bad edit should not hit the whole

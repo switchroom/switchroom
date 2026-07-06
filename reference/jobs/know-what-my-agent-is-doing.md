@@ -121,6 +121,34 @@ Named by job × surface, pointing at real scenarios in
   wired-host twin (follow-on): `jtbd-liveness-floor-dm` / `-channel` with
   `SWITCHROOM_SILENCE_FLOOR_MS` lowered so the beat lands within test
   wall-clock. Design: `reference/rfcs/turn-liveness-primitive.md`.
+- **Deterministic card climb on a silent tool (DM + channel)** —
+  `jtbd-liveness-climb-dm`, `jtbd-liveness-climb-channel`. *Watch:* a 40s
+  silent `Bash` call (no tool label, no narration) edits the SAME activity
+  card ≥4 times with a non-decreasing `Working · Ns` elapsed; a mid-turn ping
+  never fires. *Invariant:* dead air between visible updates never exceeds
+  the Phase-1 bound (~6-12s); a frozen/repeated elapsed value across all
+  edits is a hard failure — the exact pre-fix freeze. Design:
+  `reference/rfcs/deterministic-turn-liveness.md` Phase 1 + Phase 4a.
+- **Narration survives the climb (DM + channel)** — `jtbd-liveness-narration-dm`,
+  `jtbd-liveness-narration-channel`. *Watch:* when the model DOES narrate
+  mid-turn, its own words land on the card (not overwritten by the climb) and
+  a mid-turn ping never fires. *Invariant:* the climb only fills gaps the
+  model leaves; narration is unregressed.
+- **Dark-turn fallback fires exactly once (DM + channel)** —
+  `silent-end-recovery-dm`, `silent-end-recovery-channel`. *Watch:* a turn
+  that ends without a delivered reply gets exactly one fallback message on
+  the real surface (not a stubbed decision). *Invariant:* the `exhausted`
+  latch gives fire-once; asserted transport-side, in a DM and a supergroup
+  alike. Design: `reference/rfcs/deterministic-turn-liveness.md` Phase 2.
+- **Dead-air bound across turn shapes, live-transport scaffold (DM)** —
+  `fuzz-liveness-climb-dm` (`uat-fuzz`, non-required). *Watch:* a handful of
+  hand-picked silent-tool shapes never exceed the dead-air bound and never
+  buzz mid-turn. *Scope note:* the full randomized message-timing × tool-churn
+  × sub-agent-fan-out × surface corpus lives at the decision layer
+  (`turn-liveness-invariant.test.ts`, 2000 shapes, every CI run); a
+  same-breadth LIVE corpus is not yet authored (quota + wall-clock cost) —
+  tracked as a follow-up in `reference/rfcs/deterministic-turn-liveness.md`
+  Known gaps.
 - **Restart mid-conversation (DM + channel)** —
   `jtbd-message-during-restart-dm` / `-channel`,
   `jtbd-always-on-after-restart-dm`, `jtbd-interrupted-turn-resumes-dm`.
