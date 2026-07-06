@@ -357,20 +357,35 @@ the file that already owns "what we look for in PRs".
 
 1. ~~**Restart mid-turn.**~~ **Closed** by a follow-up PR
    (`telegram-plugin/gateway/activity-card-store.ts` + gateway wiring in
-   `telegram-plugin/gateway/gateway.ts`). Deterministic guarantee added: no
-   card orphaned by a gateway restart stays visually frozen (or pinned) —
-   it is finalized with one honest edit, and unpinned, on the very next
-   boot. The minimal card handle (chatId, threadId, activityMessageId,
-   startedAt, pinned) is persisted to `TELEGRAM_STATE_DIR/activity-cards-
-   pending.json` the moment a card OPENs and cleared the moment it closes
-   normally — mirroring `status-pin-store.ts`'s durable-snapshot shape
-   byte-for-byte. On boot, after winning the startup mutex (same ordering
-   constraint as `statusPinBootCleanup`), a one-shot, model-free reaper
-   reads any leftover record, deletes it from disk BEFORE attempting its
-   edit/unpin (the idempotency guard — a second boot performs zero edits
-   and zero unpins), and finalizes the orphaned card with a single
-   `editMessageText` (never a new message — no ping) plus an
-   `unpinChatMessage` for cards that were pinned on open. The resumed turn
+   `telegram-plugin/gateway/gateway.ts`). Deterministic guarantee added
+   (**AT-MOST-ONCE**, be precise about it): a card orphaned by a gateway
+   restart is finalized with one honest edit, and unpinned, on the next boot —
+   **best-effort, not guaranteed-delivered**. The reaper deletes each record
+   BEFORE attempting its edit and does NOT retry, so if that single edit fails
+   (flood-wait exhausted, transient 5xx, chat momentarily unreachable) the
+   orphan is **forfeit** and stays frozen. This is a deliberate trade: a
+   retry-until-success design cannot preserve the second-boot-zero-edits
+   idempotency property across a crash between a successful edit and its
+   post-edit delete (that window would re-edit an already-finalized card), and
+   a stale re-finalize on a chat the user has moved on from is worse than one
+   frozen orphan. So the honest promise is "finalized AT MOST ONCE, on the next
+   boot, best-effort", NOT "finalized on the very next boot". The minimal card
+   handle (chatId, threadId, activityMessageId, startedAt, pinned) is persisted
+   to `TELEGRAM_STATE_DIR/activity-cards-pending.json` the moment a card OPENs
+   (with `pinned` mirroring the ACTUAL pin decision — `PIN_STATUS_WHILE_WORKING`
+   — not an unconditional `true`) and cleared, ID-SCOPED (so a fresh live turn
+   that upserts under the same topic key mid-reap keeps its own record — the
+   reap-race guard), the moment it closes normally — mirroring
+   `status-pin-store.ts`'s durable-snapshot shape. On boot, after winning the
+   startup mutex (same ordering constraint as `statusPinBootCleanup`), a
+   one-shot, model-free reaper reads any leftover record, deletes it from disk
+   BEFORE attempting its edit/unpin (the idempotency guard — a second boot
+   performs zero edits and zero unpins), and finalizes the orphaned card with a
+   single `editMessageText` (never a new message — no ping) plus an
+   `unpinChatMessage` for cards that were actually pinned on open (the reaper's
+   unpin is defense-in-depth; `statusPinBootCleanup` owns the primary unpin). A
+   benign-400 (card already deleted) is reported as `vanished`, not counted as a
+   finalize, so the boot log doesn't over-report the guarantee. The resumed turn
    (if any) is NOT made to resume climbing the old card — it opens its own
    fresh card; honest finalization, not resumption, was the goal. Scoped
    out: the standalone worker-activity-feed's `messageId` (a separate,

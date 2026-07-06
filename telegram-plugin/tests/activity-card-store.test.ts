@@ -199,6 +199,9 @@ describe('runActivityCardBootReaper — transport-boundary outcome tests', () =>
           messageId: record.activityMessageId,
           text: restartOrphanCardFinalizeText(record.startedAt),
         })
+        // A truthy result models a REAL delivered edit (grammy returns the
+        // edited Message); a benign-400 would resolve to undefined instead.
+        return { message_id: record.activityMessageId }
       },
       unpinCard: async (record) => {
         unpins.push({ chatId: record.chatId, messageId: record.activityMessageId })
@@ -214,7 +217,7 @@ describe('runActivityCardBootReaper — transport-boundary outcome tests', () =>
     expect(unpins).toHaveLength(1)
     expect(unpins[0]).toEqual({ chatId: '-100123', messageId: 715 })
 
-    expect(res).toEqual({ finalized: 1, unpinned: 1, total: 1 })
+    expect(res).toEqual({ finalized: 1, vanished: 0, unpinned: 1, total: 1 })
     // Record gone — nothing left for a future boot to re-finalize.
     expect(loadActivityCards(PATH, fs)).toEqual([])
   })
@@ -231,6 +234,7 @@ describe('runActivityCardBootReaper — transport-boundary outcome tests', () =>
       fs,
       finalizeCard: async () => {
         edits++
+        return { ok: true }
       },
       unpinCard: async () => {
         unpins++
@@ -245,6 +249,7 @@ describe('runActivityCardBootReaper — transport-boundary outcome tests', () =>
       fs,
       finalizeCard: async () => {
         edits++
+        return { ok: true }
       },
       unpinCard: async () => {
         unpins++
@@ -252,7 +257,7 @@ describe('runActivityCardBootReaper — transport-boundary outcome tests', () =>
     })
     expect(edits).toBe(1) // unchanged
     expect(unpins).toBe(1) // unchanged
-    expect(res2).toEqual({ finalized: 0, unpinned: 0, total: 0 })
+    expect(res2).toEqual({ finalized: 0, vanished: 0, unpinned: 0, total: 0 })
   })
 
   it('a record with pinned:false (or absent) is finalized but never unpinned', async () => {
@@ -262,7 +267,7 @@ describe('runActivityCardBootReaper — transport-boundary outcome tests', () =>
     const res = await runActivityCardBootReaper({
       path: PATH,
       fs,
-      finalizeCard: async () => {},
+      finalizeCard: async () => ({ ok: true }),
       unpinCard: async () => {
         unpins++
       },
@@ -279,12 +284,13 @@ describe('runActivityCardBootReaper — transport-boundary outcome tests', () =>
       fs,
       finalizeCard: async () => {
         calls++
+        return { ok: true }
       },
       unpinCard: async () => {
         calls++
       },
     })
-    expect(res).toEqual({ finalized: 0, unpinned: 0, total: 0 })
+    expect(res).toEqual({ finalized: 0, vanished: 0, unpinned: 0, total: 0 })
     expect(calls).toBe(0)
   })
 
@@ -302,7 +308,7 @@ describe('runActivityCardBootReaper — transport-boundary outcome tests', () =>
         unpinCalled = true
       },
     })
-    expect(res).toEqual({ finalized: 0, unpinned: 1, total: 1 })
+    expect(res).toEqual({ finalized: 0, vanished: 0, unpinned: 1, total: 1 })
     expect(unpinCalled).toBe(true)
     expect(loadActivityCards(PATH, fs)).toEqual([])
   })
@@ -316,12 +322,13 @@ describe('runActivityCardBootReaper — transport-boundary outcome tests', () =>
       fs,
       finalizeCard: async () => {
         editCalls++
+        return { ok: true }
       },
       unpinCard: async () => {
         throw new Error('message to unpin not found')
       },
     })
-    expect(res).toEqual({ finalized: 1, unpinned: 0, total: 1 })
+    expect(res).toEqual({ finalized: 1, vanished: 0, unpinned: 0, total: 1 })
     expect(editCalls).toBe(1)
     expect(loadActivityCards(PATH, fs)).toEqual([])
   })
@@ -337,12 +344,13 @@ describe('runActivityCardBootReaper — transport-boundary outcome tests', () =>
       fs,
       finalizeCard: async (r) => {
         edited.push(r.activityMessageId)
+        return { message_id: r.activityMessageId }
       },
       unpinCard: async (r) => {
         unpinned.push(r.activityMessageId)
       },
     })
-    expect(res).toEqual({ finalized: 2, unpinned: 2, total: 2 })
+    expect(res).toEqual({ finalized: 2, vanished: 0, unpinned: 2, total: 2 })
     expect(edited.sort()).toEqual([1, 2])
     expect(unpinned.sort()).toEqual([1, 2])
     expect(loadActivityCards(PATH, fs)).toEqual([])
@@ -363,6 +371,53 @@ describe('runActivityCardBootReaper — transport-boundary outcome tests', () =>
     // At the moment finalizeCard ran, the record was ALREADY gone from disk —
     // so a crash right here (or a concurrent second boot) can never re-reap it.
     expect(onDiskDuringFinalize).toEqual([])
+  })
+
+  it('a benign-400 (finalizeCard resolves undefined) counts as vanished, not finalized', async () => {
+    const { fs } = memFs()
+    writeActivityCardRecord(PATH, fs, card({ pinned: false }))
+    // robustApiCall swallows "message to edit not found" / "not modified" and
+    // resolves to undefined — nothing was delivered, so it must not be counted
+    // as a finalize (the pre-fix boot log over-reported the guarantee).
+    const res = await runActivityCardBootReaper({
+      path: PATH,
+      fs,
+      finalizeCard: async () => undefined,
+      unpinCard: async () => {},
+    })
+    expect(res).toEqual({ finalized: 0, vanished: 1, unpinned: 0, total: 1 })
+    expect(loadActivityCards(PATH, fs)).toEqual([])
+  })
+
+  it('reap-race guard: an id-scoped clear leaves a live turn\'s fresh upsert (same turnKey) intact', async () => {
+    const { fs } = memFs()
+    // The reaper loads this OLD card (id=715) and finalizes it…
+    writeActivityCardRecord(PATH, fs, card({ turnKey: 'c:_', activityMessageId: 715 }))
+    await runActivityCardBootReaper({
+      path: PATH,
+      fs,
+      finalizeCard: async () => {
+        // …but MID-REAP (e.g. during a 429 flood-wait) a fresh live turn opens a
+        // NEW card under the same topic key (id=999). Its record must survive.
+        writeActivityCardRecord(PATH, fs, card({ turnKey: 'c:_', activityMessageId: 999 }))
+        return { ok: true }
+      },
+      unpinCard: async () => {},
+    })
+    // The id-scoped clear removed only the OLD (715) row; the live 999 row is
+    // still protected. A turnKey-only clear would have wiped it.
+    const remaining = loadActivityCards(PATH, fs)
+    expect(remaining).toHaveLength(1)
+    expect(remaining[0]!.activityMessageId).toBe(999)
+  })
+
+  it('clearActivityCardRecord with a mismatched id is a no-op (does not drop a same-turnKey different-id row)', () => {
+    const { fs } = memFs()
+    writeActivityCardRecord(PATH, fs, card({ turnKey: 'c:_', activityMessageId: 999 }))
+    clearActivityCardRecord(PATH, fs, 'c:_', 715) // wrong id
+    expect(loadActivityCards(PATH, fs)).toHaveLength(1)
+    clearActivityCardRecord(PATH, fs, 'c:_', 999) // matching id
+    expect(loadActivityCards(PATH, fs)).toEqual([])
   })
 })
 

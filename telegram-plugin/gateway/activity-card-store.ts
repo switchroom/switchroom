@@ -26,12 +26,23 @@
  * fails open to `[]` — never crashes boot, worst case an orphan isn't cleaned
  * up this boot, no worse than pre-fix behaviour.
  *
- * Idempotency: the reaper deletes a record from the on-disk store BEFORE
- * attempting its finalizing edit (not after), so a crash mid-reap, or a
- * second boot re-reading the file, can never double-edit the same message. A
- * failed edit (message already deleted, chat gone, etc.) is swallowed — the
- * record is already gone from disk regardless of whether the edit itself
- * succeeded.
+ * DELIVERED GUARANTEE — AT-MOST-ONCE finalization (be honest about it):
+ * the reaper deletes a record from the on-disk store BEFORE attempting its
+ * finalizing edit (not after) and swallows every Telegram failure with no
+ * retry. That ordering buys strict idempotency — a crash mid-reap, or a second
+ * boot re-reading the file, can never double-edit or double-unpin the same
+ * message — at the cost of durability: if the single edit fails (flood-wait
+ * exhausted, transient 5xx, chat momentarily unreachable), the orphaned card is
+ * FORFEIT and stays frozen, because its record is already gone. So the promise
+ * is NOT "finalized on the very next boot" — it is "finalized AT MOST ONCE, on
+ * the next boot, best-effort". We deliberately chose at-most-once over
+ * at-least-once: a retry-until-success design cannot preserve the
+ * second-boot-zero-edits property across a crash between a successful edit and
+ * its post-edit delete (that window would re-edit an already-finalized card),
+ * and a stale re-finalize on a chat the user has since moved on from is a worse
+ * failure than one frozen orphan. A benign-400 (message already
+ * deleted/vanished, or "not modified") is NOT counted as a finalize — nothing
+ * was delivered — see the `vanished` tally in `runActivityCardBootReaper`.
  */
 
 export interface ActivityCardStoreFsSeam {
@@ -155,16 +166,30 @@ export function writeActivityCardRecord(
  * Remove the card-handle row for `turnKey`, if present. Called the moment a
  * card closes/finalizes normally (clearActivitySummary), and by the boot
  * reaper (BEFORE attempting the finalizing edit — the idempotency guard).
+ *
+ * REAP-RACE guard: when `activityMessageId` is supplied, only a row matching
+ * BOTH `turnKey` AND `activityMessageId` is removed. During a slow multi-record
+ * reap (e.g. a 429 flood-wait between records), a fresh live turn can upsert a
+ * NEW record under the same `turnKey` (its own, different `activityMessageId`).
+ * A turnKey-only clear would then delete the LIVE card's durable protection.
+ * Scoping the clear to the exact message id the reaper (or the closing turn) is
+ * handling leaves the live card's record intact. Omit `activityMessageId` only
+ * when you genuinely mean "clear whatever row exists for this topic".
  */
 export function clearActivityCardRecord(
   path: string,
   fs: ActivityCardStoreFsSeam,
   turnKey: string,
+  activityMessageId?: number,
   log: (line: string) => void = (l) => process.stderr.write(l),
 ): void {
   const current = loadActivityCards(path, fs)
   if (current.length === 0) return
-  const next = current.filter((c) => c.turnKey !== turnKey)
+  const next = current.filter(
+    (c) =>
+      c.turnKey !== turnKey ||
+      (activityMessageId !== undefined && c.activityMessageId !== activityMessageId),
+  )
   if (next.length === current.length) return
   persistActivityCards(path, fs, next, log)
 }
@@ -198,24 +223,37 @@ export function clearActivityCardRecord(
 export async function runActivityCardBootReaper(args: {
   path: string
   fs: ActivityCardStoreFsSeam
+  /** Returns the Telegram result: a truthy value (the edited Message) on a
+   *  real delivered edit, or `null`/`undefined` when the underlying
+   *  `robustApiCall` swallowed a benign 400 (message already deleted /
+   *  vanished / "not modified") — i.e. nothing was actually finalized. */
   finalizeCard: (record: ActivityCardRecord) => Promise<unknown>
   unpinCard: (record: ActivityCardRecord) => Promise<unknown>
   log?: (line: string) => void
-}): Promise<{ finalized: number; unpinned: number; total: number }> {
+}): Promise<{ finalized: number; vanished: number; unpinned: number; total: number }> {
   const log = args.log ?? ((l: string) => process.stderr.write(l))
   const persisted = loadActivityCards(args.path, args.fs)
-  if (persisted.length === 0) return { finalized: 0, unpinned: 0, total: 0 }
+  if (persisted.length === 0) return { finalized: 0, vanished: 0, unpinned: 0, total: 0 }
   let finalized = 0
+  let vanished = 0
   let unpinned = 0
   for (const record of persisted) {
     // Delete BEFORE attempting the edit/unpin — the idempotency guard. If the
     // gateway crashes here, or a second boot re-reads the file, this record
     // no longer exists on disk, so it can never be finalized or unpinned
-    // twice.
-    clearActivityCardRecord(args.path, args.fs, record.turnKey, log)
+    // twice. Scoped to the exact activityMessageId (reap-race guard): a live
+    // turn that upserted a fresh card under the same turnKey mid-reap keeps
+    // its own (different-id) record.
+    clearActivityCardRecord(args.path, args.fs, record.turnKey, record.activityMessageId, log)
     try {
-      await args.finalizeCard(record)
-      finalized++
+      // Count a finalize ONLY when the edit actually landed. robustApiCall
+      // resolves to undefined on a benign-400 (the card was already deleted or
+      // the chat is gone) — that delivered nothing, so it is a `vanished`
+      // orphan, not a `finalized` one. Counting it as finalized (the pre-fix
+      // behaviour) over-reported the guarantee in the boot log.
+      const res = await args.finalizeCard(record)
+      if (res != null) finalized++
+      else vanished++
     } catch (err) {
       log(
         `activity-card-store: boot reaper finalize failed ` +
@@ -236,7 +274,7 @@ export async function runActivityCardBootReaper(args: {
       }
     }
   }
-  return { finalized, unpinned, total: persisted.length }
+  return { finalized, vanished, unpinned, total: persisted.length }
 }
 
 /**
