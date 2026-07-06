@@ -81,6 +81,19 @@ describe("start.sh: gateway-consumed env exported before the gateway fork", () =
     expect(throttleIdx).toBeLessThan(forkIdx);
   });
 
+  it("hoists SWITCHROOM_AGENT_NAME AHEAD of the gateway fork so the daemon always has its identity (#1116 / #2893 durable-identity fix)", () => {
+    const startSh = renderStartSh();
+    const forkIdx = startSh.indexOf(GATEWAY_FORK);
+    expect(forkIdx).toBeGreaterThan(-1);
+
+    const nameIdx = startSh.indexOf('export SWITCHROOM_AGENT_NAME=');
+    expect(nameIdx).toBeGreaterThan(-1);
+    // The FIRST occurrence (outer-pass hoist) must precede the fork, or a
+    // non-docker / compose-env-less gateway starts with identity UNSET and its
+    // worktree-ownership filter collapses to [] (no live worker feed).
+    expect(nameIdx).toBeLessThan(forkIdx);
+  });
+
   it("still re-exports the same vars in the inner pass (after the fork) for claude", () => {
     const startSh = renderStartSh();
     const forkIdx = startSh.indexOf(GATEWAY_FORK);
