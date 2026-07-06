@@ -6477,11 +6477,15 @@ function parsePositiveMsEnv(name: string, fallbackMs: number): number {
 }
 const SILENCE_FALLBACK_MS = parsePositiveMsEnv('SWITCHROOM_SILENCE_FALLBACK_MS', 300_000)
 const SILENCE_FALLBACK_HARD_MS = parsePositiveMsEnv('SWITCHROOM_SILENCE_FALLBACK_HARD_MS', 900_000)
-// #2527 — mid-turn liveness floor threshold (default 45s). The early, quiet
-// beat: a `user` turn working silently this long without a substantive answer
-// gets ONE honest "still on it" interim, so the ambient 👀 never masquerades
-// as "done". Strictly below SILENCE_FALLBACK_MS (the loud 300s unwedge).
-// Whole floor is kill-switchable via SWITCHROOM_TG_LIVENESS_FLOOR=0.
+// #2527 — mid-turn liveness floor threshold (default 45s). Still gates the
+// decision (`decideMidTurnFloor`, role + delivery + fire-once + timing) for a
+// `user` turn working silently this long without a substantive answer.
+// Phase 3 (deterministic-turn-liveness.md): the busy-but-silent case no
+// longer sends TEXT at this threshold — the climbing card (Phase 1) covers
+// it. The ONE surviving delivery gated by this threshold is the
+// approval-blocked re-ping (see `onMidTurnFloor` below). Strictly below
+// SILENCE_FALLBACK_MS (the loud 300s unwedge). Whole floor is
+// kill-switchable via SWITCHROOM_TG_LIVENESS_FLOOR=0.
 const SILENCE_FLOOR_MS = parsePositiveMsEnv('SWITCHROOM_SILENCE_FLOOR_MS', 45_000)
 // #2527 — role-aware terminal reaction honesty (the "thumbs-up false done"
 // fix). Default ON; SWITCHROOM_TG_TERMINAL_HONESTY=0 reverts to always-👍.
@@ -6585,10 +6589,19 @@ silencePoke.startTimer({
     if (statusKey(turn.sessionChatId, turn.sessionThreadId) !== key) return null
     return { role: turn.role, finalAnswerDelivered: turn.finalAnswerDelivered }
   },
-  // #2527 — the early, quiet liveness beat. Honest text from the longest
-  // in-flight tool (model-free, claude-native), routed through the SAME send
-  // path as the 300s fallback; pings OFF (this is the gentle beat, not the
-  // loud unwedge) and the turn is NOT torn down — it keeps working.
+  // Phase 3 (reference/rfcs/deterministic-turn-liveness.md): the busy-but-
+  // silent TEXT floor is retired. The climbing card (Phase 1 — the 0-label
+  // branch of `feedHeartbeatTick` / `runSilentTurnHeartbeatTick` above) IS
+  // the mid-turn floor now: it edits the already-open activity card's
+  // elapsed clock every `FEED_HEARTBEAT_MIN_STALE_MS`, model-independent, no
+  // ping. This handler still decides/fires via `decideMidTurnFloor` (the
+  // timing + role + fire-once machinery in `silence-poke.ts` /
+  // `turn-liveness-floor.ts` is unchanged and still load-bearing — see
+  // below), but its ONLY surviving delivery is the approval-blocked re-ping.
+  // Do not re-add a generic "still working…" text send here believing this
+  // path covers the silent-tool case; it does not, and re-adding one would
+  // reintroduce the exact banned cadence ping `conversational-pacing.md`
+  // retired in #2667.
   onMidTurnFloor: async (ctx) => {
     // Late-fire guard, mirroring the fallback: a clean turn-end can race the
     // tick. If the turn is gone, stay silent.
@@ -6596,19 +6609,19 @@ silencePoke.startTimer({
     const blockedOnApproval = activeStatusReactions
       .get(statusKey(ctx.chatId, ctx.threadId))
       ?.isAwaiting() ?? false
+    // The one surviving text case: the turn is parked on an approval card
+    // waiting for YOUR tap. That's not a stall — it names the real blocker —
+    // so it keeps this quiet re-ping (`conversational-pacing.md` § Silence-
+    // poke fallback names this one of the two surviving honest cases). The
+    // busy-but-silent (non-approval) case sends nothing here; the card climb
+    // (Phase 1) is its only signal now.
+    if (!blockedOnApproval) return
     const text = silencePoke.formatFrameworkFallbackText(
       'working',
       ctx.silenceMs,
       ctx.inFlightTools,
       blockedOnApproval,
     )
-    // The stall-notice stop-gap is retired: `formatFrameworkFallbackText`
-    // returns null for the pure-liveness "still working / running <Tool>"
-    // beat (the only string it still emits is the approval-blocked re-ping).
-    // The early quiet floor beat existed ONLY to surface that stall notice, so
-    // with the notice gone there is nothing to send here unless the turn is
-    // parked on an approval card. Skip silently otherwise; the live draft +
-    // the model's own pacing beats carry progress.
     if (text == null) return
     try {
       await robustApiCall(
