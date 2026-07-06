@@ -88,10 +88,13 @@ describe('activity-card-store — persistence primitives', () => {
 
   it('(a) card open → state persisted (round-trips a written record)', () => {
     const { fs } = memFs()
-    writeActivityCardRecord(PATH, fs, card())
+    // Construct ONCE — card() stamps `startedAt: Date.now() - 60_000`, so two
+    // separate calls can straddle a millisecond and flake the deep-equal.
+    const record = card()
+    writeActivityCardRecord(PATH, fs, record)
     const loaded = loadActivityCards(PATH, fs)
     expect(loaded).toHaveLength(1)
-    expect(loaded[0]).toEqual(card())
+    expect(loaded[0]).toEqual(record)
   })
 
   it('a fresh OPEN for the same topic replaces (upserts) the stale row, not appends', () => {
