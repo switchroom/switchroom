@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.17.10 — Hindsight reliability: close the FK-race memory-loss window + review-finding hardening
+
+Ships the fix for a silent memory-loss race in Hindsight plus the hardening
+findings from a full review of the memory implementation. The headline is the
+cross-task foreign-key race that could drop a whole retain batch on the
+document re-ingest path; the rest tightens security, runtime correctness, docs,
+and the propose-card / directive flow.
+
+### Hindsight FK-race fix — no more silent memory loss on re-ingest (#2899)
+
+The retain pipeline resolved entities (Phase 1) and inserted the
+`unit_entities` child rows (Phase 2) in separate transactions. In the window
+between them, graph-maintenance `prune_orphan_entities` could delete an entity
+that Phase 1 had already resolved but Phase 2 had not yet referenced — it
+momentarily looks like an orphan — so the Phase-2 insert violated
+`fk_unit_entities_entity_id_entities`, was classified non-retryable, and the
+entire `batch_retain` was dropped (silent memory loss, worst on the document
+re-ingest / re-consolidation path). Fixed with a same-transaction
+`reassert_entities()` (`INSERT ... ON CONFLICT DO NOTHING`) on the Phase-2
+connection immediately before the child insert: an entity referenced by a live
+unit is by definition not an orphan, so resurrecting it is correct and closes
+the window regardless of pruner timing. Carried as a self-verifying build-patch
+in `docker/Dockerfile.hindsight` with fail-loud `assert n == 1` anchors and a
+hermetic guard test.
+
+### Review-finding hardening (#2905, #2907, #2908, #2909)
+
+- **P1 security (#2905):** loopback-only compose ports, gate mental-model
+  writes behind confirm, confirm-before-legibility.
+- **P3 runtime (#2907):** correct the healthcheck claim, fix host-network port
+  reuse, restore consolidation-backlog visibility (opt-in fleet backlog row),
+  dedupe the port constant.
+- **P2 docs (#2908):** sync the synthesis-layers RFC + operator runbook to the
+  shipped state and fix stale comments.
+- **P4 flow (#2909):** harden the propose-card lifecycle, dedup directives, and
+  decouple the vendor envelope grammar.
+
+### Test env-coupling fixes (#2913)
+
+Decoupled two tests from the hardened-container environment so CI is
+deterministic: the recall-exit-codes tests no longer assume `/tmp` is
+exec-mounted, and the scaffold tilde-path test now controls
+`SWITCHROOM_HOST_HOME` (which outranks `HOME`). Test-only; no product change.
+
 ## v0.17.9 — Agents curate their own memory: mental-model-curator skill + permanent Hindsight port-collision fix
 
 Ships the user-facing counterpart to v0.17.8's Phase 5 mental-model machinery —
