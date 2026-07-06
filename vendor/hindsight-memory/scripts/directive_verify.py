@@ -58,6 +58,10 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib.config import debug_log, load_config  # noqa: E402
+from lib.directives import (  # noqa: E402
+    parse_active_directives_block,
+    rule_already_captured,
+)
 
 # Reuse Stage B's pleasantry scrub so "as always" / "always happy to help"
 # can't trip the high-confidence detector either. Imported lazily-safe: if
@@ -127,6 +131,9 @@ _VERIFY_BLOCK_REASON = (
     "If it is genuinely a durable rule, call "
     "mcp__hindsight__create_directive NOW (verbatim, in the user's own "
     "words), then briefly confirm you have saved it.\n"
+    "UNLESS an equivalent active directive already exists (see the "
+    "<active_directives> block for this turn) — in that case it is already "
+    "saved; do NOT create a duplicate, just finish.\n"
     "If, on reflection, it was only a one-off instruction for this task, do "
     "NOT create a directive — just finish your reply normally.\n"
     "This verification fires once per turn.\n"
@@ -139,44 +146,20 @@ _INJECTED_MARKERS = (
     "<directive_capture_check>",
     "<directive_capture_verify>",
     "<hindsight_memories>",
+    # recall.py injects the bank's active directives as a top-of-prompt block;
+    # it is hook-injected context, not a human turn (#2903 Fix 6.2).
+    "<active_directives>",
     "Relevant memories from past conversations",
 )
 
-# Genuine human inbound channels. A "user" turn whose `<channel source="...">`
-# envelope names anything else is a SYNTHESIZED / cron inbound built by the
-# gateway (see telegram-plugin/gateway/*-inbound-builder.ts + reaction /
-# resume / vault-grant / subagent / obligation builders) — a machine turn, NOT
-# a human correction. The blocking re-prompt must never fire on those: nagging
-# the model to persist a "durable rule" on a cron digest or a resume synthetic
-# is pure noise. Interactive sessions carry NO channel envelope and are treated
-# as human. Kept as a whitelist so any NEW synthetic source is skipped by
-# default rather than accidentally nagged on.
-_HUMAN_INBOUND_SOURCES = frozenset({"telegram"})
-
-# Pulls the source attribute out of the gateway's leading `<channel ...>`
-# envelope. Handles both open (`<channel source="telegram" ...>`) and
-# self-closing (`<channel source="reaction"/>`) forms.
-_CHANNEL_SOURCE_RE = re.compile(r"""<channel\b[^>]*\bsource=["']([^"']+)["']""")
-
-
-def is_synthetic_inbound(text) -> bool:
-    """True when this turn's opening human message is a synthesized/cron
-    inbound rather than a genuine human message.
-
-    Detection is purely on the gateway-prepended ``<channel source="...">``
-    envelope: a ``source`` outside ``_HUMAN_INBOUND_SOURCES`` (``cron``,
-    ``reaction``, ``resume_interrupted``, ``vault_grant_approved``,
-    ``subagent_handback``, ``obligation_represent``, …) marks a non-human turn.
-    No envelope (interactive session) → treated as human. Injected channel tags
-    in a human's own body are neutralised upstream by the channel-envelope
-    sanitiser, so the only real ``<channel source=`` is the gateway's.
-    """
-    if not isinstance(text, str):
-        return False
-    m = _CHANNEL_SOURCE_RE.search(text)
-    if not m:
-        return False
-    return m.group(1).strip().lower() not in _HUMAN_INBOUND_SOURCES
+# SWITCHROOM DIVERGENCE (#2903 Fix 6.3): the `<channel source="...">` envelope
+# grammar and the human-source whitelist used to be hard-coded inline here,
+# silently coupling this vendored Python guard to the switchroom gateway's TS
+# wire format. Extracted to lib/switchroom_envelope.py so a TS-side envelope
+# change has ONE obvious Python counterpart to update (and its own test) rather
+# than breaking this guard undetected. `is_synthetic_inbound` is re-exported for
+# backward compatibility with existing tests/callers.
+from lib.switchroom_envelope import is_synthetic_inbound  # noqa: E402,F401
 
 
 def looks_like_durable_directive(text) -> bool:
@@ -292,6 +275,27 @@ def _errored_tool_use_ids(messages: list) -> set:
     return errored
 
 
+def collect_active_directive_contents(messages: list) -> list:
+    """Gather the CONTENT strings of every active directive injected into this
+    turn's context.
+
+    recall.py injects an ``<active_directives>`` block (the bank's currently
+    active directives) into the UserPromptSubmit context; it shows up in the
+    transcript as an injected user message. We parse those back out so the
+    verifier can tell whether a restated rule is ALREADY stored — in which case
+    the model correctly declines to re-create it and we must NOT block (#2903
+    Fix 6.2). Pure string parsing; no API call.
+    """
+    contents: list = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        text = _message_text(msg.get("content"))
+        if "<active_directives>" in text:
+            contents.extend(parse_active_directives_block(text))
+    return contents
+
+
 def directive_recorded_after(messages: list, start_index: int) -> bool:
     """True if any assistant turn after ``start_index`` called create_directive
     with a SUCCESSFUL result. A call whose tool_result errored does not count
@@ -355,6 +359,12 @@ def evaluate(hook_input: dict, config: dict) -> str | None:
         debug_log(config, "Directive-capture verify: feature disabled, allowing stop")
         return None
 
+    # #2873/#2903 Fix 6.2 — the BLOCK is separately gated: an operator can keep
+    # the advisory Stage B nudge while dropping the more intrusive Stop block.
+    if not config.get("directiveCaptureVerify", True):
+        debug_log(config, "Directive-capture verify: block disabled (nudge-only), allowing stop")
+        return None
+
     # Loop / one-off guard: if we already blocked once this turn, respect the
     # model's second judgment and never re-block.
     if hook_input.get("stop_hook_active"):
@@ -382,6 +392,18 @@ def evaluate(hook_input: dict, config: dict) -> str | None:
 
     if directive_recorded_after(messages, idx):
         debug_log(config, "Directive-capture verify: create_directive already called, allowing stop")
+        return None
+
+    # Dedup (#2903 Fix 6.2): if the restated rule is already covered by an
+    # active directive injected into this turn's <active_directives> block, the
+    # model CORRECTLY declined to re-create a duplicate — blocking here would
+    # nag it to double-store. Allow stop.
+    existing = collect_active_directive_contents(messages)
+    if existing and rule_already_captured(text, existing):
+        debug_log(
+            config,
+            "Directive-capture verify: rule already covered by an active directive, allowing stop",
+        )
         return None
 
     debug_log(

@@ -687,8 +687,10 @@ _DIRECTIVE_CAPTURE_NUDGE = (
     "for how you should behave going forward — not a one-off request for "
     "this task — persist it NOW with mcp__hindsight__create_directive "
     "(verbatim, in the user’s own words) BEFORE you answer, so the "
-    "correction survives future sessions. If it’s only a one-off "
-    "instruction, ignore this note and just answer.\n"
+    "correction survives future sessions. UNLESS an equivalent active "
+    "directive already exists (see any <active_directives> block above) — "
+    "in that case it is already saved; do NOT create a duplicate. If it’s "
+    "only a one-off instruction, ignore this note and just answer.\n"
     "</directive_capture_check>"
 )
 

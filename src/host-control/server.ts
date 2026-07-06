@@ -81,8 +81,7 @@ import { parseUpdateResultLine } from "../cli/update.js";
 import { parseAuditLine, latestRolloutRowForRequest } from "./audit-reader.js";
 import {
   validateConfigEdit,
-  assertSelfScopedAllowEdit,
-  assertSelfScopedMentalModelEdit,
+  admitSelfScopedNonAdminEdit,
 } from "./config-edit-validator.js";
 import { classifyBlastRadius } from "./config-blast-radius.js";
 import type { ApprovalGateway } from "./approval-gateway.js";
@@ -2176,38 +2175,33 @@ export class HostdServer {
       } catch {
         beforeContent = "";
       }
-      const allowScope = assertSelfScopedAllowEdit(
+      // A non-admin edit is admitted if it is EITHER a self-scoped tools.allow
+      // widen (the "🔁 Always allow" path) OR a self-scoped append to the
+      // caller's own memory.mental_models[] (the agent-proposes → human-
+      // approves curation path). Only when BOTH fail is the edit rejected. The
+      // either/or combination lives in admitSelfScopedNonAdminEdit so it is
+      // unit-testable without standing up this server. On denial we surface the
+      // tools.allow detail (the historical, most-common failure mode) and
+      // document the mental-models path in `.why()`.
+      const admission = admitSelfScopedNonAdminEdit(
         beforeContent,
         verdict.postApplyContent,
         caller.name,
       );
-      // A non-admin edit is admitted if it is EITHER a self-scoped tools.allow
-      // widen (the "🔁 Always allow" path) OR a self-scoped append to the
-      // caller's own memory.mental_models[] (the agent-proposes → human-
-      // approves curation path). Only when BOTH fail is the edit rejected. We
-      // surface the tools.allow detail (the historical, most-common failure
-      // mode) and document the mental-models path in `.why()`.
-      if (!allowScope.ok) {
-        const mentalModelScope = assertSelfScopedMentalModelEdit(
-          beforeContent,
-          verdict.postApplyContent,
-          caller.name,
-        );
-        if (!mentalModelScope.ok) {
-          return err("E_NOT_SELF_SCOPED", allowScope.detail)
-            .why(
-              "non-admin agents may only add rules to their own " +
-                "agents.<self>.tools.allow OR append their own " +
-                "agents.<self>.memory.mental_models via config_propose_edit " +
-                `(mental-model check: ${mentalModelScope.detail})`,
-            )
-            .fixBadInput("unified_diff")
-            .op("config_propose_edit")
-            .caller("agent")
-            .agentName(caller.name)
-            .asDenied()
-            .build(req.request_id, Date.now() - started);
-        }
+      if (!admission.ok) {
+        return err("E_NOT_SELF_SCOPED", admission.detail)
+          .why(
+            "non-admin agents may only add rules to their own " +
+              "agents.<self>.tools.allow OR append their own " +
+              "agents.<self>.memory.mental_models via config_propose_edit " +
+              `(mental-model check: ${admission.mentalModelDetail})`,
+          )
+          .fixBadInput("unified_diff")
+          .op("config_propose_edit")
+          .caller("agent")
+          .agentName(caller.name)
+          .asDenied()
+          .build(req.request_id, Date.now() - started);
       }
     }
     // ── Approval card ───────────────────────────────────────────────
