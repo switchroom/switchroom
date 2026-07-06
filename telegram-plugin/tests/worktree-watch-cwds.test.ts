@@ -9,13 +9,16 @@
  * Run with:
  *   bun test telegram-plugin/tests/worktree-watch-cwds.test.ts
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 import {
   ownedWorktreeCwds,
+  __resetIdentityEscalationForTests,
   type WorktreeOwnershipRecord,
 } from "../worktree-watch-cwds.js";
 
 const idPath = (p: string) => p; // identity realpath for deterministic tests
+
+beforeEach(() => __resetIdentityEscalationForTests());
 
 describe("ownedWorktreeCwds", () => {
   const records: WorktreeOwnershipRecord[] = [
@@ -25,16 +28,108 @@ describe("ownedWorktreeCwds", () => {
     { path: "/wt/ownerless" }, // ownerAgent undefined
   ];
 
-  it("returns NOTHING when the agent identity is unset (fail-closed, no #1116 leak)", () => {
+  it("returns NOTHING when the agent identity is unset and no durable fallback given (fail-closed, no #1116 leak)", () => {
     expect(
       ownedWorktreeCwds({ self: undefined, listRecords: () => records, realpath: idPath }),
     ).toEqual([]);
   });
 
-  it("returns NOTHING when the agent identity is empty string", () => {
+  it("returns NOTHING when the agent identity is empty string and no durable fallback given", () => {
     expect(
       ownedWorktreeCwds({ self: "", listRecords: () => records, realpath: idPath }),
     ).toEqual([]);
+  });
+
+  // ---- Layer 2: durable, non-env identity fallback (#1116 / #2893) ----
+
+  it("(a) env SET → ownership resolves exactly as before (fast path unchanged)", () => {
+    expect(
+      ownedWorktreeCwds({
+        self: "klanker",
+        agentDir: "/home/x/.switchroom/agents/SHOULD_BE_IGNORED",
+        listRecords: () => records,
+        realpath: idPath,
+      }),
+    ).toEqual(["/wt/mine-1", "/wt/mine-2"]);
+  });
+
+  it("(b) env UNSET but agentDir present → identity derived from dir basename, ownership resolves", () => {
+    const out = ownedWorktreeCwds({
+      self: undefined,
+      agentDir: "/home/x/.switchroom/agents/klanker",
+      listRecords: () => records,
+      realpath: idPath,
+    });
+    expect(out).toEqual(["/wt/mine-1", "/wt/mine-2"]);
+  });
+
+  it("(b) env EMPTY but agentDir present → same durable derivation", () => {
+    const out = ownedWorktreeCwds({
+      self: "",
+      agentDir: "/home/x/.switchroom/agents/klanker",
+      listRecords: () => records,
+      realpath: idPath,
+    });
+    expect(out).toEqual(["/wt/mine-1", "/wt/mine-2"]);
+  });
+
+  it("(b) durable fallback NEVER mis-attributes: a dir for a different agent matches only THAT agent's records, never klanker's", () => {
+    // agentDir names 'reggie' → resolves reggie's worktrees, never klanker's
+    // or the ownerless ones. A wrong basename fails-closed to [], it can never
+    // attribute to the WRONG owner.
+    const out = ownedWorktreeCwds({
+      self: undefined,
+      agentDir: "/home/x/.switchroom/agents/reggie",
+      listRecords: () => records,
+      realpath: idPath,
+    });
+    expect(out).toEqual(["/wt/theirs"]);
+    expect(out).not.toContain("/wt/ownerless");
+  });
+
+  it("(c) BOTH env and agentDir unavailable → returns [] AND emits an escalated ERROR (no throw, no mis-attribution)", () => {
+    const logs: string[] = [];
+    const out = ownedWorktreeCwds({
+      self: undefined,
+      agentDir: undefined,
+      listRecords: () => records,
+      realpath: idPath,
+      log: (m) => logs.push(m),
+    });
+    expect(out).toEqual([]);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain("ERROR");
+    expect(logs[0]).toContain("identity resolution FAILED");
+  });
+
+  it("(c) blank agentDir (whitespace) is treated as unavailable → [] + escalated error", () => {
+    const logs: string[] = [];
+    const out = ownedWorktreeCwds({
+      self: "",
+      agentDir: "   ",
+      listRecords: () => records,
+      realpath: idPath,
+      log: (m) => logs.push(m),
+    });
+    expect(out).toEqual([]);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain("identity resolution FAILED");
+  });
+
+  it("(c) the escalated error is one-shot per process (not re-logged every rescan tick)", () => {
+    const logs: string[] = [];
+    const call = () =>
+      ownedWorktreeCwds({
+        self: undefined,
+        agentDir: undefined,
+        listRecords: () => records,
+        realpath: idPath,
+        log: (m) => logs.push(m),
+      });
+    call();
+    call();
+    call();
+    expect(logs).toHaveLength(1);
   });
 
   it("does NOT match ownerless records even when identity is set", () => {

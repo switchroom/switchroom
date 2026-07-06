@@ -33,6 +33,19 @@ if [ "$SWITCHROOM_RUNTIME" = "docker" ] && [ -z "$SWITCHROOM_DOCKER_TMUX_INNER" 
   # same path the rest of start.sh + the MCP sidecar expects.
   export TELEGRAM_STATE_DIR="{{agentDir}}/telegram"
 
+  # SWITCHROOM_AGENT_NAME is the canonical "which agent am I" identity. It is
+  # normally supplied by the container env (compose.ts) so it is already
+  # present here, but the authoritative inner-pass export lives at line ~387,
+  # AFTER the gateway fork below. On any runtime where the compose env is NOT
+  # the source (non-docker / local dev), the forked gateway daemon would then
+  # start with the var UNSET — which collapses its worktree-ownership filter
+  # (worktree-watch-cwds.ts) to [], so a worktree-isolated background
+  # sub-agent gets NO live progress feed for its whole run (#1116 / #2893).
+  # Hoist the export here, before the fork, so the gateway ALWAYS has its
+  # identity on the fast path regardless of runtime. Idempotent with the
+  # compose env and the inner-pass export. Pinned by the scaffold-order test.
+  export SWITCHROOM_AGENT_NAME="{{name}}"
+
   # Gateway-consumed env MUST be exported HERE, before the gateway fork
   # below. The gateway daemon reads channels.telegram.* knobs (and any
   # agent env) from process.env at startup — e.g. SWITCHROOM_TG_STREAM_
