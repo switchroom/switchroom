@@ -1732,6 +1732,12 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
     // worktrees) must never break the tail loop, so it just yields no
     // extra slugs for this tick.
     let allowedSlugs: Set<string> | null = null
+    // Did the extra-cwd provider run cleanly this tick? A transient failure
+    // (registry read hiccup) must NOT permanently mislabel an owned worktree
+    // slug as "foreign": we still skip it this tick (it isn't provably ours
+    // right now), but we do NOT latch the one-shot warning, so the next clean
+    // tick re-includes and re-derives it instead of staying silently excluded.
+    let providerOk = true
     if (expectedProjectSlug != null) {
       allowedSlugs = new Set([expectedProjectSlug])
       if (extraWatchCwdsProvider != null) {
@@ -1740,6 +1746,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
             allowedSlugs.add(sanitizeCwdToProjectName(cwd))
           }
         } catch (err) {
+          providerOk = false
           log?.(`subagent-watcher: extraWatchCwdsProvider error: ${(err as Error).message}`)
         }
       }
@@ -1751,12 +1758,19 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       // Skip foreign project dirs so their stale subagent JSONLs (which
       // Claude Code reaps mid-session) don't pollute the watcher's registry.
       if (allowedSlugs != null && !allowedSlugs.has(pDir)) {
-        if (!warnedForeignSlugs.has(pDir)) {
+        // A slug that is now allowed must clear any stale "foreign" latch, so a
+        // slug that was transiently excluded (or later genuinely goes foreign)
+        // re-warns rather than staying mislabeled forever.
+        if (providerOk && !warnedForeignSlugs.has(pDir)) {
           warnedForeignSlugs.add(pDir)
-          log?.(`subagent-watcher: skipping foreign project dir ${pDir} (expected ${expectedProjectSlug})`)
+          const allowed = [...allowedSlugs].join(', ')
+          log?.(`subagent-watcher: skipping foreign project dir ${pDir} (allowed: ${allowed})`)
         }
         continue
       }
+      // Owned/allowed this tick — drop any prior foreign latch so a future
+      // genuine foreign appearance of the same slug re-warns.
+      warnedForeignSlugs.delete(pDir)
       const projectPath = join(projectsRoot, pDir)
       let sessionDirs: string[]
       try {

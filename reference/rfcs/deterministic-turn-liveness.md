@@ -390,7 +390,19 @@ the file that already owns "what we look for in PRs".
    addition to `agentCwd`. Genuinely foreign project dirs (not a slug the
    agent's own `agentCwd` or a worktree it owns maps to) are still
    skipped — the #1116 protection is preserved, not widened to a wildcard
-   watch.
+   watch. The ownership predicate is fail-CLOSED, hardened by a review
+   follow-up (`telegram-plugin/worktree-watch-cwds.ts`,
+   `ownedWorktreeCwds`): an unset/empty `SWITCHROOM_AGENT_NAME` contributes
+   NOTHING (a naive `ownerAgent === undefined` would otherwise match every
+   ownerless host-global record — reintroducing #1116), a registry read
+   failure yields `[]` without disturbing the base `agentCwd` watch, and the
+   owned paths are `realpathSync`'d so a symlinked base
+   (`/tmp`→`/private/tmp`) derives the physical slug Claude Code actually
+   mints. Complementarily, `claimWorktree` (`src/worktree/claim.ts`) now
+   defaults `ownerAgent` from `SWITCHROOM_AGENT_NAME` so a plain
+   `worktree claim` (no `-a/--agent`) still produces an OWNED record —
+   without it, an ownerless claim would be filtered out and the sub-agent
+   would stay invisible, the very Gap-2 failure this closes.
 
 Gap 1 is pre-existing and orthogonal to the climb, named here so the
 guarantee is not read as broader than delivered. It needs its own
