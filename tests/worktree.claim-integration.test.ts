@@ -96,6 +96,48 @@ describe("claim / release / list integration", () => {
     expect(recs).toHaveLength(3);
   });
 
+  it("defaults ownerAgent from SWITCHROOM_AGENT_NAME when the flag is omitted (Gap-2 fix)", async () => {
+    // A plain `switchroom worktree claim <repo>` (no -a/--agent) inside an
+    // agent container must still produce an OWNED record, else the gateway's
+    // ownership filter hides the sub-agent's liveness. #2893 review fix.
+    const origName = process.env.SWITCHROOM_AGENT_NAME;
+    process.env.SWITCHROOM_AGENT_NAME = "klanker";
+    try {
+      await claimWorktree({ repo: repoDir, taskName: "owned-by-default" });
+      const rec = listRecords().find((r) => r.branch.includes("owned-by-default"));
+      expect(rec?.ownerAgent).toBe("klanker");
+    } finally {
+      if (origName === undefined) delete process.env.SWITCHROOM_AGENT_NAME;
+      else process.env.SWITCHROOM_AGENT_NAME = origName;
+    }
+  });
+
+  it("an explicit ownerAgent still wins over the ambient default", async () => {
+    const origName = process.env.SWITCHROOM_AGENT_NAME;
+    process.env.SWITCHROOM_AGENT_NAME = "klanker";
+    try {
+      await claimWorktree({ repo: repoDir, taskName: "explicit-owner", ownerAgent: "reggie" });
+      const rec = listRecords().find((r) => r.branch.includes("explicit-owner"));
+      expect(rec?.ownerAgent).toBe("reggie");
+    } finally {
+      if (origName === undefined) delete process.env.SWITCHROOM_AGENT_NAME;
+      else process.env.SWITCHROOM_AGENT_NAME = origName;
+    }
+  });
+
+  it("leaves ownerAgent unset when neither flag nor env is present", async () => {
+    const origName = process.env.SWITCHROOM_AGENT_NAME;
+    delete process.env.SWITCHROOM_AGENT_NAME;
+    try {
+      await claimWorktree({ repo: repoDir, taskName: "no-owner" });
+      const rec = listRecords().find((r) => r.branch.includes("no-owner"));
+      expect(rec?.ownerAgent).toBeUndefined();
+    } finally {
+      if (origName === undefined) delete process.env.SWITCHROOM_AGENT_NAME;
+      else process.env.SWITCHROOM_AGENT_NAME = origName;
+    }
+  });
+
   it("list_worktrees shows all active claims", async () => {
     await claimWorktree({ repo: repoDir, taskName: "task-a", ownerAgent: "worker1" });
     await claimWorktree({ repo: repoDir, taskName: "task-b", ownerAgent: "worker2" });

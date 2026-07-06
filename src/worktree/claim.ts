@@ -171,6 +171,18 @@ export async function claimWorktree(
     mkdirSync(baseDir, { recursive: true });
     worktreePath = join(baseDir, `${id}-${taskSuffix}`);
 
+    // Default ownership from the ambient agent identity when the caller
+    // didn't pass one explicitly. A worktree an agent claims WITHOUT the CLI
+    // `-a/--agent` flag would otherwise produce an ownerless record, which the
+    // gateway's `extraWatchCwdsProvider` filters out — so the sub-agent running
+    // in it stays invisible in the worker feed (Known-Gap-2 regression). An
+    // agent always claims its own worktrees, so `SWITCHROOM_AGENT_NAME` is the
+    // correct owner when no explicit owner is given. Empty string is treated as
+    // unset (never write a falsy owner).
+    const ambientOwner = process.env.SWITCHROOM_AGENT_NAME;
+    const ownerAgent =
+      input.ownerAgent ?? (ambientOwner != null && ambientOwner !== "" ? ambientOwner : undefined);
+
     const now = new Date().toISOString();
     const record = {
       id,
@@ -180,7 +192,7 @@ export async function claimWorktree(
       path: worktreePath,
       createdAt: now,
       heartbeatAt: now,
-      ownerAgent: input.ownerAgent,
+      ownerAgent,
     };
 
     // ATOMIC: write registry record BEFORE git operation.

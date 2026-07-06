@@ -567,6 +567,7 @@ import {
   type SubagentWatcherHandle,
 } from '../subagent-watcher.js'
 import { listRecords as listWorktreeRecords } from '../../src/worktree/registry.js'
+import { ownedWorktreeCwds } from '../worktree-watch-cwds.js'
 import {
   startBootCard,
   resolvePersonaName,
@@ -26437,15 +26438,16 @@ void (async () => {
               // Best-effort: a registry read failure (e.g. no worktree dir
               // on an agent that never claims one) must not affect the
               // primary agentCwd watch.
-              extraWatchCwdsProvider: () => {
-                try {
-                  return listWorktreeRecords()
-                    .filter((r) => r.ownerAgent === process.env.SWITCHROOM_AGENT_NAME)
-                    .map((r) => r.path)
-                } catch {
-                  return []
-                }
-              },
+              extraWatchCwdsProvider: () =>
+                // Fail-CLOSED ownership filter (unset identity ⇒ nothing;
+                // ownerless records excluded; registry throw ⇒ []). Extracted
+                // to telegram-plugin/worktree-watch-cwds.ts so the #1116 /
+                // Gap-2 ownership predicate is under direct unit test — see
+                // telegram-plugin/tests/worktree-watch-cwds.test.ts.
+                ownedWorktreeCwds({
+                  self: process.env.SWITCHROOM_AGENT_NAME,
+                  listRecords: listWorktreeRecords,
+                }),
               // Bug 0 fix: previously omitted, leaving the watcher unable to
               // write liveness/stall/turn_end updates to the registry DB.
               // Liveness writes are now persisted across the gateway lifetime.
