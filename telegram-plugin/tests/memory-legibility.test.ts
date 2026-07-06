@@ -4,6 +4,7 @@ import {
   detectMemoryLegibilityEvent,
   isMemoryLegibilityEnabled,
   renderMemoryLegibilityLine,
+  MemoryLegibilityStager,
   CREATE_DIRECTIVE_TOOL,
   INVALIDATE_MEMORY_TOOL,
   UPDATE_MEMORY_TOOL,
@@ -116,6 +117,53 @@ describe('detectMemoryLegibilityEvent — extracts the human detail', () => {
       kind: 'remembered',
       detail: '',
     })
+  })
+})
+
+describe('MemoryLegibilityStager — confirm-before-legibility (Fix 1.3, #2903)', () => {
+  const evt = { kind: 'remembered' as const, detail: 'Always prefer TypeScript' }
+
+  it('sends the line only on a CONFIRMED-successful tool_result', () => {
+    const s = new MemoryLegibilityStager<{ chatId: string }>()
+    s.stage('toolu_ok', evt, { chatId: '123' })
+    expect(s.size).toBe(1)
+    const resolved = s.confirm('toolu_ok', undefined) // undefined isError = success
+    expect(resolved).not.toBeNull()
+    expect(resolved!.event).toEqual(evt)
+    expect(resolved!.meta).toEqual({ chatId: '123' })
+    expect(s.size).toBe(0) // consumed
+  })
+
+  it('does NOT send on a FAILED write — a failed create_directive shows NO line', () => {
+    const s = new MemoryLegibilityStager<{ chatId: string }>()
+    s.stage('toolu_fail', evt, { chatId: '123' })
+    // is_error:true on the tool_result (engine down / isError envelope)
+    const resolved = s.confirm('toolu_fail', true)
+    expect(resolved).toBeNull()
+    // the staged entry is consumed even on failure — no leak, no later re-send
+    expect(s.size).toBe(0)
+  })
+
+  it('returns null when no event was staged for the id (non-material tool result)', () => {
+    const s = new MemoryLegibilityStager<{ chatId: string }>()
+    expect(s.confirm('unknown-id', undefined)).toBeNull()
+  })
+
+  it('returns null for an empty/missing toolUseId (cannot correlate → no unconfirmed send)', () => {
+    const s = new MemoryLegibilityStager<{ chatId: string }>()
+    expect(s.confirm('', undefined)).toBeNull()
+    expect(s.confirm(null, undefined)).toBeNull()
+    expect(s.confirm(undefined, undefined)).toBeNull()
+  })
+
+  it('evicts the oldest staged entry past the cap so a crashy turn cannot leak', () => {
+    const s = new MemoryLegibilityStager<{ n: number }>(2)
+    s.stage('a', evt, { n: 1 })
+    s.stage('b', evt, { n: 2 })
+    s.stage('c', evt, { n: 3 }) // evicts 'a'
+    expect(s.size).toBe(2)
+    expect(s.confirm('a', undefined)).toBeNull() // evicted
+    expect(s.confirm('c', undefined)).not.toBeNull()
   })
 })
 

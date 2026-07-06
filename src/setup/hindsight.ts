@@ -802,8 +802,11 @@ export function generateHindsightComposeSnippet(): string {
     // Host side 18888/19999 → container 8888/9999. The host port MUST match
     // HINDSIGHT_DEFAULT_API_PORT / the scaffolded memory.config.url or agents
     // point at a dead URL (see the 2026-07 outage).
-    `      - "${HINDSIGHT_DEFAULT_API_PORT}:8888"`,
-    "      - \"19999:9999\"",
+    // Bind to 127.0.0.1 only: the hindsight API is TOKENLESS, so publishing on
+    // 0.0.0.0 would expose the unauthenticated MCP/REST surface to the network.
+    // This mirrors the startHindsight() docker-run path, which binds loopback.
+    `      - "127.0.0.1:${HINDSIGHT_DEFAULT_API_PORT}:8888"`,
+    "      - \"127.0.0.1:19999:9999\"",
     "    environment:",
     `      - HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE=${HINDSIGHT_DEFAULT_MAX_OBSERVATIONS_PER_SCOPE}`,
     "      - HINDSIGHT_API_LLM_PROVIDER=claude-code",

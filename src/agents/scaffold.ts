@@ -947,13 +947,75 @@ const SWITCHROOM_TELEGRAM_MCP_TOOLS = [
 ];
 
 /**
- * Pre-approved MCP tool names for the Hindsight memory server.
- * When the memory backend is hindsight we pre-approve the wildcard so
- * the agent can recall and store memories without prompting.
+ * Mental-model WRITE tools on the Hindsight server that are deliberately
+ * NOT pre-approved. These mutate engine-tier mental models, and the
+ * agent-proposes / human-approves gate (the `mental_model_propose` card,
+ * see reference/rfcs/hindsight-phase5-mental-model-curation.md) is the
+ * only sanctioned path to them. Pre-approving them (e.g. via a
+ * `mcp__hindsight__*` wildcard) silently bypasses that gate — the very
+ * regression this list guards against. Leaving them off the allow-list
+ * means a direct agent call falls through to the normal permission
+ * prompt instead of the propose card, which is acceptable (the curator
+ * skill is instructed to always propose, never call these directly).
  */
-const HINDSIGHT_MCP_TOOLS = [
-  "mcp__hindsight",
-  "mcp__hindsight__*",
+export const HINDSIGHT_MENTAL_MODEL_WRITE_TOOLS = [
+  "mcp__hindsight__create_mental_model",
+  "mcp__hindsight__update_mental_model",
+  "mcp__hindsight__delete_mental_model",
+  "mcp__hindsight__refresh_mental_model",
+];
+
+/**
+ * Pre-approved MCP tool names for the Hindsight memory server.
+ *
+ * This is an ENUMERATED allow-list, deliberately NOT a `mcp__hindsight__*`
+ * wildcard and NOT a bare `mcp__hindsight` server grant (either of which
+ * would pre-approve every tool on the server). It enumerates the
+ * read / retain / reflect / directive tools the agent uses autonomously,
+ * and OMITS the mental-model write tools in
+ * `HINDSIGHT_MENTAL_MODEL_WRITE_TOOLS`, which must go through the
+ * agent-proposes / human-approves propose card instead (Fix 1.2, #2903).
+ *
+ * When adding a hindsight tool to the surface, add it here explicitly —
+ * a wildcard is banned so the next mental-model-write addition can't
+ * silently ride in ungated. The permission surface is pinned by
+ * tests/agents/hindsight-permission-surface.test.ts against
+ * tests/fixtures/hindsight-tools-list.snapshot.json.
+ */
+export const HINDSIGHT_MCP_TOOLS = [
+  // Retain / reflect / recall — the day-to-day store + query surface.
+  "mcp__hindsight__recall",
+  "mcp__hindsight__retain",
+  "mcp__hindsight__sync_retain",
+  "mcp__hindsight__reflect",
+  // Directives — captured autonomously (directive-capture nudge/verifier).
+  "mcp__hindsight__create_directive",
+  "mcp__hindsight__update_bank",
+  "mcp__hindsight__delete_directive",
+  "mcp__hindsight__list_directives",
+  // Banks.
+  "mcp__hindsight__create_bank",
+  "mcp__hindsight__get_bank",
+  "mcp__hindsight__get_bank_stats",
+  "mcp__hindsight__list_banks",
+  "mcp__hindsight__delete_bank",
+  // Memories.
+  "mcp__hindsight__get_memory",
+  "mcp__hindsight__list_memories",
+  "mcp__hindsight__clear_memories",
+  // Documents.
+  "mcp__hindsight__get_document",
+  "mcp__hindsight__list_documents",
+  "mcp__hindsight__delete_document",
+  // Mental models — READ ONLY (writes go through the propose card).
+  "mcp__hindsight__get_mental_model",
+  "mcp__hindsight__list_mental_models",
+  // Tags.
+  "mcp__hindsight__list_tags",
+  // Operations.
+  "mcp__hindsight__get_operation",
+  "mcp__hindsight__list_operations",
+  "mcp__hindsight__cancel_operation",
 ];
 
 /**
