@@ -23,13 +23,15 @@
  *   - Job spec: `reference/jobs/remember-across-sessions.md`
  *   - The `consolidation.completed` webhook the RFC names as the poll-free
  *     driver for the "updated what I know about Y" side does NOT exist in
- *     the pinned hindsight image (v0.8.2) — it is RFC-only. This v1 ships
+ *     the pinned hindsight image (v0.8.4) — it is RFC-only. This v1 ships
  *     the tool-observation path; the webhook stays a follow-up.
  *
  * Reuse: `classifyMemoryToolCall` / `detectMemoryLegibilityEvent` are the
  * single, reusable "did a directive-create / invalidate happen in this
- * turn?" primitive. Phase 3 Stage B (#2848) imports these rather than
- * re-deriving the tool-name matching inline.
+ * turn?" primitive on the TypeScript gateway side. Phase 3 Stage B (#2848)
+ * runs as a vendored Python hook (`recall.py`) and CANNOT import this TS
+ * module — it mirrors the same hindsight tool-name matching independently.
+ * Keep the two in sync by hand when the tool surface changes.
  */
 
 import { stripMarkdown, truncate } from './card-format.js'
@@ -93,7 +95,8 @@ function hasDemoteTag(input: Record<string, unknown> | undefined): boolean {
  * Classify a single tool call as a material memory operation, or null if
  * it isn't one. This is the reusable detection primitive: it answers "did a
  * directive-create / invalidate happen in this turn?" with no rendering
- * concern. #2848 Stage B imports this.
+ * concern. #2848 Stage B (the vendored Python `recall.py` hook) mirrors this
+ * matching independently — it cannot import this TS module.
  */
 export function classifyMemoryToolCall(
   toolName: string,

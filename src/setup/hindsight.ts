@@ -343,7 +343,7 @@ export const HINDSIGHT_DEFAULT_PIDS_LIMIT = 1000;
  * segment ... No space left on device` and ALL memory writes/queries die
  * (2026-06-06 fleet outage). 2g gives comfortable headroom over the
  * observed peak while staying well under `HINDSIGHT_DEFAULT_MEM_LIMIT`
- * (4g) so shm can't starve the app. Applies to BOTH the standalone
+ * (8g) so shm can't starve the app. Applies to BOTH the standalone
  * `docker run` path and the compose snippet below — keep them in sync.
  */
 export const HINDSIGHT_DEFAULT_SHM_SIZE = "2g";
@@ -485,7 +485,7 @@ export async function pickHindsightPorts(): Promise<{
   if (apiPort === null || uiPort === null) {
     throw new Error(
       "Could not find a free port for Hindsight. " +
-        "Stop whatever is using 8888 / 9999 / 18888 / 19999 and retry.",
+        "Stop whatever is using 18888 / 19999 and retry.",
     );
   }
   return { apiPort, uiPort };
@@ -562,8 +562,9 @@ export interface LiteLLMHindsightConfig {
  * `auth-broker-hindsight-sock` (chowned by the broker to the consumer
  * UID, see `auth.consumers[]` in switchroom.yaml).
  *
- * @param ports - Optional host port mapping. If omitted, tries upstream
- *   defaults (8888/9999) then 18888/19999.
+ * @param ports - Optional host port mapping. If omitted, falls back to the
+ *   switchroom defaults (`HINDSIGHT_DEFAULT_API_PORT` 18888 /
+ *   `HINDSIGHT_DEFAULT_UI_PORT` 9999).
  * @param litellm - Optional LiteLLM routing config. When provided, the
  *   container uses `--network host` so 127.0.0.1:4010 is reachable, and
  *   the claude subprocess inherits LiteLLM proxy env vars. The API port is
