@@ -6140,8 +6140,11 @@ async function statusPinBootCleanup(): Promise<void> {
  * the pure `runActivityCardBootReaper` — binds the live fs seam, a real
  * Telegram edit, and the gateway logger. Finalizes ANY card left open by a
  * prior (crashed/restarted) session with ONE honest edit — never a new
- * message, so no ping — and never re-attempts across boots (the pure routine
- * deletes each record from disk before attempting its edit).
+ * message, so no ping. Guarantee is AT-MOST-ONCE: the pure routine deletes each
+ * record before attempting its edit and does not retry, so a failed edit
+ * forfeits that orphan rather than risk a double-finalize on a later boot (see
+ * the module doc in activity-card-store.ts for the full tradeoff). A benign-400
+ * (card already gone) is reported as `vanished`, not `finalized`.
  *
  * MUST run ONLY after this gateway wins the startup mutex (the store is a
  * shared per-agent file; a losing double-boot would finalize a card the
@@ -6152,14 +6155,19 @@ async function statusPinBootCleanup(): Promise<void> {
  * turn (if any) opens its own fresh card. Honest finalization, not
  * resumption, is the goal (see the module doc in activity-card-store.ts).
  *
- * After the finalizing edit, also unpins the card (every fresh card is
- * silently pinned on open, `reconcileStatusPin('fg:'+key, …)`) — a frozen
- * card that's ALSO still pinned is a worse orphan, glued to the top of the
- * chat forever. Only attempted for a record with `pinned: true`.
+ * After the finalizing edit, also unpins the card, but ONLY for a record whose
+ * persisted `pinned` flag is true — i.e. the card was actually pin-eligible on
+ * open (`PIN_STATUS_WHILE_WORKING`). This unpin is DEFENSE-IN-DEPTH, not the
+ * primary unpin path: `statusPinBootCleanup` already unpins orphaned status
+ * pins from its own durable store on boot. The reaper's unpin is belt-and-
+ * braces for the case where the two stores disagree; the record's `pinned`
+ * flag must therefore reflect the ACTUAL pin outcome (see the open path), not
+ * an unconditional `true`, or the reaper would attempt an unpin on a card that
+ * was never pinned.
  */
 async function activityCardBootReaper(): Promise<void> {
   if (!activityCardPersistEnabled) return
-  const { finalized, unpinned, total } = await runActivityCardBootReaper({
+  const { finalized, vanished, unpinned, total } = await runActivityCardBootReaper({
     path: ACTIVITY_CARD_STORE_PATH,
     fs: activityCardStoreFs,
     finalizeCard: (record) =>
@@ -6189,8 +6197,9 @@ async function activityCardBootReaper(): Promise<void> {
   })
   if (total > 0) {
     process.stderr.write(
-      `telegram gateway: activity-card: finalized ${finalized}/${total}, ` +
-        `unpinned ${unpinned}/${total} orphaned card(s) from a prior session\n`,
+      `telegram gateway: activity-card: finalized ${finalized}/${total} ` +
+        `(vanished ${vanished}/${total}), unpinned ${unpinned}/${total} ` +
+        `orphaned card(s) from a prior session (at-most-once)\n`,
     )
   }
 }
@@ -12648,10 +12657,16 @@ async function drainActivitySummary(
               threadId: thread ?? null,
               activityMessageId: sent.message_id,
               startedAt: turn.startedAt,
-              // The OPEN below unconditionally silently-pins the fresh card
-              // (`reconcileStatusPin('fg:'+key, …)`) — mirror that here so
-              // the boot reaper knows to unpin it too, not just finalize it.
-              pinned: true,
+              // Mirror the ACTUAL pin decision, not an unconditional `true`:
+              // the OPEN below silently-pins the fresh card only when
+              // `PIN_STATUS_WHILE_WORKING` is on (`reconcileStatusPin` no-ops
+              // when it's off, and can also fail on missing supergroup
+              // rights). Persisting `pinned: true` regardless would make the
+              // boot reaper attempt an unpin on a card that was never pinned.
+              // The reaper's unpin is defense-in-depth anyway
+              // (`statusPinBootCleanup` owns the primary unpin), so tracking
+              // the flag honestly is what matters here.
+              pinned: PIN_STATUS_WHILE_WORKING,
             })
           }
           // Status-pin: the per-turn status message just opened — it's the
@@ -13003,6 +13018,10 @@ function clearActivitySummary(turn: CurrentTurn, finalHtmlOverride?: string | nu
         ACTIVITY_CARD_STORE_PATH,
         activityCardStoreFs,
         statusKey(chat, thread),
+        // Scope to this card's exact id (reap-race guard): only drop the row
+        // for the card THIS turn is closing, never a fresher card another
+        // turn may have already upserted under the same topic key.
+        id,
       )
     }
     if (CLEAR_STATUS_ON_COMPLETION) {
