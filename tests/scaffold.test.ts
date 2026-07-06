@@ -209,7 +209,13 @@ describe("scaffoldAgent", () => {
     // credentials/..., etc. Without the symlink the tilde resolves to
     // a path that doesn't exist inside the container.
     const prevHome = process.env.HOME;
+    // hostHomeForBake() prefers SWITCHROOM_HOST_HOME over HOME (src/agents/
+    // scaffold.ts). In a hostd/container context that var is set to the real
+    // host home, which would override our HOME fixture and bake a different
+    // path — so clear it and let HOME drive the bake for this test.
+    const prevHostHome = process.env.SWITCHROOM_HOST_HOME;
     process.env.HOME = "/home/op";
+    delete process.env.SWITCHROOM_HOST_HOME;
     try {
       const config = makeAgentConfig();
       const result = scaffoldAgent("tilde-agent", config, tmpDir, telegramConfig);
@@ -225,6 +231,8 @@ describe("scaffoldAgent", () => {
     } finally {
       if (prevHome === undefined) delete process.env.HOME;
       else process.env.HOME = prevHome;
+      if (prevHostHome === undefined) delete process.env.SWITCHROOM_HOST_HOME;
+      else process.env.SWITCHROOM_HOST_HOME = prevHostHome;
     }
   });
 

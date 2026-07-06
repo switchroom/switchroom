@@ -37,8 +37,10 @@ executes.
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 
 
@@ -46,6 +48,52 @@ SCRIPTS_DIR = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "scripts")
 )
 RECALL_PY = os.path.join(SCRIPTS_DIR, "recall.py")
+
+
+def _dir_is_exec_capable(path):
+    """Return True iff a file created under ``path`` can be executed.
+
+    pytest's ``tmp_path`` defaults to the system temp dir, which on
+    hardened hosts / CI containers is frequently mounted ``noexec``
+    (verify with ``findmnt -T /tmp``). recall.py invokes the
+    ``switchroom`` CLI *by name* via ``subprocess.run`` — that resolves
+    to our on-PATH shim, which must therefore live on an
+    exec-capable filesystem or the call dies with PermissionError and
+    the shim never runs. Probe the real invariant rather than assuming.
+    """
+    try:
+        probe = os.path.join(path, ".exec_probe.sh")
+        with open(probe, "w") as fh:
+            fh.write("#!/usr/bin/env bash\nexit 0\n")
+        os.chmod(probe, 0o755)
+        rc = subprocess.run([probe], capture_output=True).returncode
+        os.unlink(probe)
+        return rc == 0
+    except (OSError, PermissionError):
+        return False
+
+
+def _make_exec_bindir(tmp_path):
+    """Create the shim ``bin`` directory on an exec-capable filesystem.
+
+    Prefer ``tmp_path`` itself (keeps everything colocated); fall back
+    to a self-cleaning temp dir next to this test file — which lives in
+    the repo checkout, an exec-capable ext4/overlay mount — when the
+    default temp root is ``noexec``.
+    """
+    if _dir_is_exec_capable(str(tmp_path)):
+        bindir = tmp_path / "bin"
+        bindir.mkdir(exist_ok=True)
+        return bindir
+    fallback_root = tempfile.mkdtemp(
+        prefix="sw-recall-bin-", dir=os.path.dirname(__file__)
+    )
+    import atexit
+
+    atexit.register(shutil.rmtree, fallback_root, ignore_errors=True)
+    import pathlib
+
+    return pathlib.Path(fallback_root)
 
 
 def _run_recall_with_injected_fault(
@@ -105,8 +153,7 @@ def _run_recall_with_injected_fault(
     # Path manipulation for the switchroom shim. We always isolate
     # PATH so the test doesn't accidentally invoke a real `switchroom`
     # on the host — that would write to a real state dir.
-    bindir = tmp_path / "bin"
-    bindir.mkdir(exist_ok=True)
+    bindir = _make_exec_bindir(tmp_path)
     if switchroom_shim is not None:
         sw = bindir / "switchroom"
         sw.write_text(switchroom_shim)
