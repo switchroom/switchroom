@@ -20,6 +20,7 @@ import {
   pickHindsightPorts,
   pullHindsightImage,
   getRunningHindsightPorts,
+  preflightHindsightPorts,
   HINDSIGHT_DEFAULT_API_PORT,
   type LiteLLMHindsightConfig,
 } from "../setup/hindsight.js";
@@ -368,6 +369,45 @@ export function registerMemoryCommand(program: Command): void {
         );
       }
 
+      // Preflight: NEVER hand an occupied host port to `docker run` — that's
+      // the 2026-07 outage (the --recreate path reused the previously-bound
+      // port with no free-check, so hindsight crash-looped on `[Errno 98]
+      // address already in use` while fleet memory was silently down). The
+      // reuse path (getRunningHindsightPorts) especially bypasses
+      // pickHindsightPorts entirely, so re-validate here for BOTH paths.
+      let conflict = await preflightHindsightPorts(ports);
+      if (conflict) {
+        const heldBy = conflict.holder ? ` (held by ${conflict.holder})` : "";
+        console.log(
+          chalk.yellow(
+            `\n  Chosen Hindsight port ${conflict.port} is occupied${heldBy}; ` +
+            `selecting a free port instead of crash-looping.`,
+          ),
+        );
+        // Re-pick from scratch (skips the occupied port via findFreePort).
+        try {
+          ports = await pickHindsightPorts();
+        } catch (err) {
+          console.error(chalk.red(`\n  ${(err as Error).message}\n`));
+          process.exit(1);
+        }
+        conflict = await preflightHindsightPorts(ports);
+        if (conflict) {
+          const stillHeldBy = conflict.holder ? ` (held by ${conflict.holder})` : "";
+          console.error(
+            chalk.red(
+              `\n  Refusing to start Hindsight: port ${conflict.port} is still ` +
+              `occupied${stillHeldBy} after reassignment. Free it and retry ` +
+              `\`switchroom memory --start\`.\n`,
+            ),
+          );
+          process.exit(1);
+        }
+        console.log(
+          chalk.green(`  Reassigned Hindsight to port ${ports.apiPort}/${ports.uiPort}.`),
+        );
+      }
+
       // RFC H §4.8 — hindsight runs in broker-fed mode against the
       // upstream `claude-code` LLM provider. No API key is needed; the
       // entrypoint shim fetches OAuth credentials from the auth-broker
@@ -584,7 +624,7 @@ export function registerMemoryCommand(program: Command): void {
           const collection = getCollectionForAgent(agent, config);
           const apiUrl =
             (config.memory?.config?.url as string | undefined) ??
-            "http://localhost:8888/mcp/";
+            "http://localhost:18888/mcp/";
           const timeoutMs = Math.max(500, parseInt(opts.timeout, 10) || 5000);
 
           console.log(
@@ -638,7 +678,7 @@ export function registerMemoryCommand(program: Command): void {
   // memory.recall.additional_banks. Single-tenant — the operator's own data
   // in the operator's Hindsight instance.
   const restBase = (url: string | undefined): string =>
-    (url ?? "http://127.0.0.1:8888/mcp/")
+    (url ?? "http://127.0.0.1:18888/mcp/")
       .replace(/\/mcp\/?$/, "")
       .replace(/\/$/, "");
   const VALID_BANK = /^[a-zA-Z0-9_.-]+$/;

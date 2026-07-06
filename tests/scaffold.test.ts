@@ -1092,7 +1092,7 @@ describe("scaffoldAgent", () => {
 
     expect(settings.mcpServers).toBeDefined();
     expect(settings.mcpServers.hindsight).toBeDefined();
-    expect(settings.mcpServers.hindsight.url).toBe("http://localhost:8888/mcp/");
+    expect(settings.mcpServers.hindsight.url).toBe("http://127.0.0.1:18888/mcp/");
     expect(settings.mcpServers.hindsight.type).toBe("http");
   });
 

@@ -37,9 +37,12 @@ import {
   isPortFree,
   findFreePort,
   pickHindsightPorts,
+  preflightHindsightPorts,
   HINDSIGHT_DEFAULT_API_PORT,
   HINDSIGHT_DEFAULT_UI_PORT,
+  HINDSIGHT_DEFAULT_MCP_URL,
 } from "../src/setup/hindsight.js";
+import { generateHindsightMcpConfig } from "../src/memory/hindsight.js";
 
 // ─── validateBotToken ────────────────────────────────────────────────────────
 
@@ -549,6 +552,85 @@ describe("pickHindsightPorts", () => {
       expect(ports.apiPort).toBeGreaterThanOrEqual(18888);
     } finally {
       blocker.close();
+    }
+  });
+});
+
+// ─── Hindsight port-collision regression (2026-07 outage) ────────────────────
+//
+// The bundled Hindsight container runs `--network host` and binds
+// HINDSIGHT_API_PORT directly on the host. When it defaulted to 8888 it
+// collided with a foreign listener (nginx-tunnel-gateway on 127.0.0.1:8888)
+// and crash-looped for ~9h while fleet memory was silently down. These pins
+// guard the three invariants that fix locks in.
+describe("Hindsight port-collision regression", () => {
+  it("defaults the API port to 18888 (guards against silent revert to 8888)", () => {
+    // The exact revert that would re-open the outage.
+    expect(HINDSIGHT_DEFAULT_API_PORT).toBe(18888);
+    expect(HINDSIGHT_DEFAULT_API_PORT).not.toBe(8888);
+  });
+
+  it("scaffolded memory.config.url port matches the launcher's default port", () => {
+    // The url/port drift that caused the outage: agents on 18888 while the
+    // container bound 8888. Both must derive from the same constant.
+    expect(HINDSIGHT_DEFAULT_MCP_URL).toContain(`:${HINDSIGHT_DEFAULT_API_PORT}/`);
+
+    // The default the scaffolder actually writes into an agent's .mcp.json
+    // (no operator override) must equal that URL — same port, no drift.
+    const cfg = generateHindsightMcpConfig("shared", {
+      backend: "hindsight",
+      config: {},
+    } as never);
+    expect(cfg.url).toBe(HINDSIGHT_DEFAULT_MCP_URL);
+    const urlPort = new URL(cfg.url as string).port;
+    expect(Number(urlPort)).toBe(HINDSIGHT_DEFAULT_API_PORT);
+  });
+
+  it("preflight reports the occupied port when a foreign listener holds it", async () => {
+    // Use a high, almost-certainly-free port to simulate the foreign listener
+    // (the default may already be held by a live hindsight on the test host).
+    const PORT = 45211;
+    if (!(await isPortFree(PORT))) return; // host busy — skip rather than flake
+    const blocker = await bindPort(PORT);
+    try {
+      const conflict = await preflightHindsightPorts({
+        apiPort: PORT,
+        uiPort: HINDSIGHT_DEFAULT_UI_PORT,
+      });
+      expect(conflict).not.toBeNull();
+      expect(conflict?.port).toBe(PORT);
+    } finally {
+      blocker.close();
+    }
+  });
+
+  it("preflight returns null when both chosen ports are free", async () => {
+    // Pick a high, almost-certainly-free pair rather than the defaults (CI
+    // may already run hindsight). 45201/45202 are outside any service range.
+    const a = await isPortFree(45201);
+    const b = await isPortFree(45202);
+    if (!a || !b) return; // host busy on these — skip rather than flake
+    const conflict = await preflightHindsightPorts({ apiPort: 45201, uiPort: 45202 });
+    expect(conflict).toBeNull();
+  });
+
+  it("port selection never hands an occupied port to docker run", async () => {
+    // Occupy the preferred default (if it's free to occupy); the resolver must
+    // return a DIFFERENT, actually-bindable port — never the occupied one
+    // (the crash-loop input). If the default is ALREADY held on this host, the
+    // fallback path is exercised without us binding it.
+    const defaultFree = await isPortFree(HINDSIGHT_DEFAULT_API_PORT);
+    const blocker = defaultFree ? await bindPort(HINDSIGHT_DEFAULT_API_PORT) : null;
+    try {
+      const ports = await pickHindsightPorts();
+      expect(ports.apiPort).not.toBe(HINDSIGHT_DEFAULT_API_PORT);
+      // The selected port must be free RIGHT NOW (what preflight verifies
+      // before docker run) — never an occupied port handed to `docker run`.
+      expect(await isPortFree(ports.apiPort)).toBe(true);
+      const conflict = await preflightHindsightPorts(ports);
+      expect(conflict).toBeNull();
+    } finally {
+      blocker?.close();
     }
   });
 });

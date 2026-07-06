@@ -43,7 +43,7 @@ describe("generateHindsightMcpConfig", () => {
     const memConfig = makeMemoryConfig();
     const result = generateHindsightMcpConfig("my-collection", memConfig);
 
-    expect(result.url).toBe("http://localhost:8888/mcp/");
+    expect(result.url).toBe("http://127.0.0.1:18888/mcp/");
     expect(result.command).toBeUndefined();
     expect(result.args).toBeUndefined();
   });
@@ -54,7 +54,7 @@ describe("generateHindsightMcpConfig", () => {
     });
     const result = generateHindsightMcpConfig("local-col", memConfig);
 
-    expect(result.url).toBe("http://localhost:8888/mcp/");
+    expect(result.url).toBe("http://127.0.0.1:18888/mcp/");
   });
 });
 
@@ -224,7 +224,7 @@ describe("getHindsightMcpUrl", () => {
   it("returns HTTP URL for Hindsight MCP endpoint", () => {
     const result = getHindsightMcpUrl();
 
-    expect(result.url).toBe("http://localhost:8888/mcp/");
+    expect(result.url).toBe("http://127.0.0.1:18888/mcp/");
   });
 });
 

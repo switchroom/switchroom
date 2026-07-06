@@ -2426,7 +2426,7 @@ export function installHindsightPlugin(
   // /mcp/ MCP endpoint URL — strip the suffix.
   const bankId = agentMemory?.collection ?? agentName;
   const mcpUrl = (memory.config?.url as string | undefined)
-    ?? "http://127.0.0.1:8888/mcp/";
+    ?? "http://127.0.0.1:18888/mcp/";
   const apiBaseUrl = mcpUrl.replace(/\/mcp\/?$/, "").replace(/\/$/, "");
 
   return { pluginDir: destPath, apiBaseUrl, bankId };
@@ -3368,7 +3368,7 @@ export function scaffoldAgent(
   const hindsightBankId = agentConfig.memory?.collection ?? name;
   const hindsightApiBaseUrl = (switchroomConfig?.memory?.config?.url as string | undefined)
     ? (switchroomConfig!.memory!.config!.url as string).replace(/\/mcp\/?$/, "").replace(/\/$/, "")
-    : "http://127.0.0.1:8888";
+    : "http://127.0.0.1:18888";
   // Cascading recall cap. Per-agent value already merged from defaults
   // by config/merge.ts (memory is shallow-merged), so reading
   // agentConfig.memory.recall.max_memories here picks up the resolved
@@ -5501,7 +5501,7 @@ export function reconcileAgent(
   const hindsightBankId = agentConfig.memory?.collection ?? name;
   const hindsightApiBaseUrl = (switchroomConfig.memory?.config?.url as string | undefined)
     ? (switchroomConfig.memory!.config!.url as string).replace(/\/mcp\/?$/, "").replace(/\/$/, "")
-    : "http://127.0.0.1:8888";
+    : "http://127.0.0.1:18888";
   const hindsightRecallMaxMemories = agentConfig.memory?.recall?.max_memories;
   const hindsightRecallCacheTtlSecs = agentConfig.memory?.recall?.cache_ttl_secs;
   const hindsightRecallMinOverlap = agentConfig.memory?.recall?.min_overlap;

@@ -1045,8 +1045,8 @@ async function stepMemoryBackend(
 
     if (isHindsightRunning()) {
       spin.stop(chalk.green(`${STEP_DONE} Hindsight container started (switchroom-hindsight)`));
-      console.log(chalk.gray("  API: http://localhost:8888/mcp"));
-      console.log(chalk.gray("  UI:  http://localhost:9999"));
+      console.log(chalk.gray("  API: http://localhost:18888/mcp"));
+      console.log(chalk.gray("  UI:  http://localhost:19999"));
     } else {
       spin.stop(chalk.yellow("Container started but may still be initializing"));
     }

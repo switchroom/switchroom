@@ -156,6 +156,79 @@ export function checkHindsightContainerHealth(
 }
 
 /**
+ * Pure: classify the result of a `GET <hindsight>/health` probe into a doctor
+ * result. A memory outage (container down, crash-looping on a port collision,
+ * or wedged) is otherwise SILENT — auto-recall failing produces no user-facing
+ * error, so the fleet goes amnesiac unnoticed (the 2026-07 incident ran ~9h
+ * before anyone noticed). A non-200 /health flips this red.
+ *
+ * `status` is the HTTP status code, or `null` when the request never completed
+ * (connection refused / timeout — the crash-loop signature).
+ */
+export function classifyHindsightHealthProbe(
+  status: number | null,
+  port: number,
+): CheckResult {
+  if (status === 200) {
+    return {
+      name: "hindsight /health",
+      status: "ok",
+      detail: `200 at :${port} — memory backend live`,
+    };
+  }
+  if (status === null) {
+    return {
+      name: "hindsight /health",
+      status: "fail",
+      detail:
+        `no response on :${port} — the container is down or crash-looping ` +
+        `(fleet memory is silently OFF: auto-recall/retain fail with no user error)`,
+      fix:
+        "Check `docker logs switchroom-hindsight` for `[Errno 98] address " +
+        "already in use` (a foreign process on the port) and run " +
+        "`switchroom memory --start` — the launcher now preflights the port " +
+        "and reassigns instead of crash-looping.",
+    };
+  }
+  return {
+    name: "hindsight /health",
+    status: "fail",
+    detail: `HTTP ${status} at :${port} — memory backend unhealthy`,
+    fix: "Inspect `docker logs switchroom-hindsight`; restart with `switchroom memory --restart`.",
+  };
+}
+
+/**
+ * Best-effort async wrapper: GET `<mcpUrl origin>/health` and classify it.
+ * Derives the health URL from the MCP url (strips the `/mcp/` suffix). Fails
+ * closed to a `fail` result (never throws) so a memory outage surfaces even
+ * when the probe itself errors.
+ */
+export async function checkHindsightHealthEndpoint(
+  mcpUrl: string,
+  opts: { fetchImpl?: typeof fetch; timeoutMs?: number } = {},
+): Promise<CheckResult> {
+  const doFetch = opts.fetchImpl ?? fetch;
+  const timeoutMs = opts.timeoutMs ?? 4000;
+  const origin = mcpUrl.replace(/\/mcp\/?$/, "").replace(/\/$/, "");
+  const healthUrl = `${origin}/health`;
+  const port = (() => {
+    const m = origin.match(/:(\d+)(?:$|\/)/);
+    return m ? parseInt(m[1], 10) : 80;
+  })();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await doFetch(healthUrl, { signal: controller.signal });
+    return classifyHindsightHealthProbe(res.status, port);
+  } catch {
+    return classifyHindsightHealthProbe(null, port);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * An advertised hindsight tool as returned by tools/list — just the bits the
  * contract check needs.
  */

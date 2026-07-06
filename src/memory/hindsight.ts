@@ -1,5 +1,6 @@
 import type { SwitchroomConfig, MemoryBackendConfig } from "../config/schema.js";
 import { resolveUsers } from "../config/users.js";
+import { HINDSIGHT_DEFAULT_API_PORT, HINDSIGHT_DEFAULT_MCP_URL } from "../setup/hindsight.js";
 
 export interface McpServerConfig {
   type?: string;
@@ -26,17 +27,17 @@ export interface McpServerConfig {
  * Generate the MCP server config entry for Hindsight.
  *
  * Hindsight exposes MCP via Streamable HTTP at /mcp/. The host/port can be
- * overridden in switchroom.yaml's memory.config.url; defaults to localhost:8888
- * (the upstream default). Note that 8888 conflicts with Coolify and other
- * common services — host the container on 18888 and set memory.config.url
- * accordingly.
+ * overridden in switchroom.yaml's memory.config.url; defaults to 127.0.0.1:18888
+ * (HINDSIGHT_DEFAULT_MCP_URL). The upstream default of 8888 conflicts with
+ * Coolify, nginx front-proxies and tunnel gateways — hence the 18888 default,
+ * which the launcher binds and the scaffolding writes in lockstep.
  */
 export function generateHindsightMcpConfig(
   collection: string,
   memoryConfig: MemoryBackendConfig,
 ): McpServerConfig {
   const url = (memoryConfig.config?.url as string | undefined)
-    ?? "http://localhost:8888/mcp/";
+    ?? HINDSIGHT_DEFAULT_MCP_URL;
   return {
     type: "http",
     url,
@@ -67,8 +68,8 @@ export function generateDockerComposeSnippet(
     "hindsight:",
     "  image: ghcr.io/vectorize-io/hindsight:latest",
     "  ports:",
-    "    - \"8888:8888\"",
-    "    - \"9999:9999\"",
+    `    - "${HINDSIGHT_DEFAULT_API_PORT}:8888"`,
+    "    - \"19999:9999\"",
     "  environment:",
     ...envLines,
     "  volumes:",
