@@ -100,3 +100,107 @@ export function silentTurnClimbRender(input: SilentTurnClimbInput): string | nul
     header,
   )
 }
+
+/**
+ * The per-turn view `runSilentTurnHeartbeatTick` reads — a structural subset of
+ * the gateway's `CurrentTurn`, kept transport-free so this module (and its test)
+ * never imports the gateway.
+ */
+export interface SilentTurnTickView {
+  /** `turn.mirrorLines.length` at tick time. */
+  mirrorLineCount: number
+  /** `turn.activityMessageId` at tick time (null ⇒ no card open yet). */
+  activityMessageId: number | null
+  /** `turn.labeledToolCount` — surfaced in the card header. */
+  labeledToolCount: number
+  /** `now - turn.startedAt` at tick time. */
+  ageMs: number
+  /** The labelled branch's stale floor (`FEED_HEARTBEAT_MIN_STALE_MS`). The
+   *  climb applies the SAME guard for symmetry: a turn younger than one stale
+   *  window is fresh (its card just opened ~1.2s in), so no climb edit yet.
+   *  Without this the climb relied on the tick interval == the stale window
+   *  (both 6s today) — an implicit coupling this guard makes explicit. */
+  minStaleMs: number
+}
+
+/**
+ * The gateway seams the tick drives, injected as thunks so THIS function — the
+ * shipped 0-label branch of `feedHeartbeatTick` — is directly executable in a
+ * test with spies at each seam. The gateway wires the real implementations
+ * (`openLivenessFeedIfDue`, `turn.activityPendingRender = …`, `cardDrainGate`,
+ * `ea.mayDrain`, `ea.openOrEditCard('liveness', …)`,
+ * `drainActivitySummary(turn, 'liveness')`); the wiring is pinned structurally
+ * in tests/feed-heartbeat-liveness-open.test.ts.
+ */
+export interface SilentTurnTickDeps {
+  /** The one shared OPEN path (`openLivenessFeedIfDue(turn)`). Owns the open;
+   *  the climb never opens (reply-is-last gating lives on the open path). */
+  openLivenessFeedIfDue: () => void
+  /** Stage the climb render (`turn.activityPendingRender = rendered`). */
+  setPendingRender: (rendered: string) => void
+  /** The centralized chatLock-serialized card-drain gate
+   *  (`cardDrainGate(turn, ea, run)`). */
+  cardDrainGate: (run: () => void) => void
+  /** The single-flight pure read (`ea.mayDrain(turn)`). */
+  mayDrain: () => boolean
+  /** The emission-authority façade routing (`ea.openOrEditCard('liveness', apply)`).
+   *  With a card open this only ever EDITs — Telegram edits don't push-notify. */
+  openOrEditCard: (apply: () => void) => void
+  /** The drain kick-off (`turn.activityInFlight = drainActivitySummary(turn,
+   *  'liveness')`) — the transport writer (sendMessage / editMessageText via
+   *  robustApiCall) lives behind this seam. */
+  drain: () => void
+}
+
+/**
+ * The REAL 0-label branch of `feedHeartbeatTick` (deterministic-turn-liveness.md
+ * Phase 1) — extracted here so the shipped decision logic is directly under
+ * outcome-based test (`tests/silent-turn-climb-transport.test.ts`); the gateway
+ * IIFE cannot be imported in-process, so the tick body lives in this module and
+ * the gateway calls it with its real deps.
+ *
+ * Returns true when the tick was handled by the 0-label path (the caller must
+ * stop — the labelled-feed heartbeat does not run), false when a tool label has
+ * surfaced (`mirrorLineCount > 0`) and the labelled branch owns the tick.
+ *
+ * Behaviour:
+ *   - no card open yet → delegate to the one shared OPEN path (never opens here);
+ *   - card open + turn younger than `minStaleMs` → fresh, no edit yet (the same
+ *     stale-guard the labelled branch applies to its step elapsed);
+ *   - card open + stale → stage the climbing "Working · Ns" render and EDIT it
+ *     through the same cardDrainGate → mayDrain → openOrEditCard → drain gate
+ *     sequence the labelled branch uses. Deterministic + framework-owned: reads
+ *     only wall-clock `ageMs`, so a blocked tool call cannot starve it.
+ */
+export function runSilentTurnHeartbeatTick(
+  view: SilentTurnTickView,
+  deps: SilentTurnTickDeps,
+): boolean {
+  if (view.mirrorLineCount !== 0) return false
+  if (view.activityMessageId == null) {
+    deps.openLivenessFeedIfDue()
+    return true
+  }
+  // Stale-guard (symmetry with the labelled branch's `elapsed <
+  // FEED_HEARTBEAT_MIN_STALE_MS` check): the 0-label "step" starts at turn
+  // start, so `ageMs` IS its elapsed. A younger turn's card just opened.
+  if (view.ageMs < view.minStaleMs) return true
+  const rendered = silentTurnClimbRender({
+    mirrorLineCount: view.mirrorLineCount,
+    activityMessageId: view.activityMessageId,
+    labeledToolCount: view.labeledToolCount,
+    ageMs: view.ageMs,
+  })
+  if (rendered == null) return true
+  deps.setPendingRender(rendered)
+  deps.cardDrainGate(() => {
+    if (deps.mayDrain()) {
+      // Maintains an already-open card (guarded above on activityMessageId !=
+      // null) → only ever EDITs. 'liveness' producer is correct.
+      deps.openOrEditCard(() => {
+        deps.drain()
+      })
+    }
+  })
+  return true
+}

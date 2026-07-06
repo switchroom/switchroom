@@ -74,29 +74,38 @@ describe('H-1: feedHeartbeatTick liveness-open threshold', () => {
     expect(initBlock).toMatch(/1[_]?200/)
   })
 
-  it('the 0-tool liveness branch OPENS via the shared helper AND CLIMBS an already-open card', () => {
+  it('the 0-label tick routes through the REAL extracted tick body with the gateway deps wired verbatim', () => {
     // deterministic-turn-liveness.md Phase 1 + Phase 4(d): the prior version of
     // this test enshrined the freeze — it asserted only that the branch delegates
     // to `openLivenessFeedIfDue` (which no-ops once a card is open), which is
     // exactly why a busy-but-silent 0-label card used to freeze. The property is
-    // now INVERTED: on an already-open card the branch must CLIMB on each tick.
-    //
-    // Structural cross-check only; the load-bearing proof is the outcome-based
-    // transport test (tests/silent-turn-climb-transport.test.ts) which asserts
-    // >=4 climbing edits reach the transport during a 40s silent tool.
+    // now INVERTED: the 0-label tick must route through the extracted
+    // `runSilentTurnHeartbeatTick` (feed-heartbeat-climb.ts) — the shipped tick
+    // body that CLIMBS an already-open card — with the gateway's REAL deps
+    // (the shared OPEN helper, cardDrainGate, ea.mayDrain,
+    // ea.openOrEditCard('liveness'), the 'liveness' drain) wired at the call
+    // site. Removing or mis-wiring this call site fails HERE; the tick body's
+    // behaviour is proven outcome-based in
+    // tests/silent-turn-climb-transport.test.ts (>=4 climbing edits across a
+    // 40s silent tool, edit-only, gate sequence in order).
     const body = feedHeartbeatTickSrc()
-    const start = body.indexOf('if (turn.mirrorLines.length === 0)')
+    const start = body.indexOf('runSilentTurnHeartbeatTick(')
     expect(start).toBeGreaterThan(-1)
     const branch = body.slice(start)
     const end = branch.indexOf('// Labelled-feed heartbeat')
     const scoped = end === -1 ? branch : branch.slice(0, end)
-    // OPEN path: still routed through the one shared helper (no double-open).
-    expect(scoped).toMatch(/openLivenessFeedIfDue\(turn\)/)
-    // CLIMB path: an already-open card is re-rendered every tick via
-    // silentTurnClimbRender and edited through the drain gate — no longer a freeze.
-    expect(scoped).toMatch(/silentTurnClimbRender\(/)
-    expect(scoped).toMatch(/turn\.activityMessageId == null/)
-    expect(scoped).toMatch(/drainActivitySummary\(turn, 'liveness'\)/)
+    // The real deps, wired verbatim at the call site:
+    expect(scoped).toMatch(/openLivenessFeedIfDue:\s*\(\)\s*=>\s*openLivenessFeedIfDue\(turn\)/)
+    expect(scoped).toMatch(/setPendingRender:\s*\(rendered\)\s*=>\s*\{\s*turn\.activityPendingRender = rendered\s*\}/)
+    expect(scoped).toMatch(/cardDrainGate:\s*\(run\)\s*=>\s*cardDrainGate\(turn, ea, run\)/)
+    expect(scoped).toMatch(/mayDrain:\s*\(\)\s*=>\s*ea\.mayDrain\(turn\)/)
+    expect(scoped).toMatch(/openOrEditCard:\s*\(apply\)\s*=>\s*ea\.openOrEditCard\('liveness', apply\)/)
+    expect(scoped).toMatch(/drain:\s*\(\)\s*=>\s*\{\s*turn\.activityInFlight = drainActivitySummary\(turn, 'liveness'\)\s*\}/)
+    // The view carries the wall-clock elapsed + the labelled branch's stale floor.
+    expect(scoped).toMatch(/ageMs:\s*Date\.now\(\)\s*-\s*turn\.startedAt/)
+    expect(scoped).toMatch(/minStaleMs:\s*FEED_HEARTBEAT_MIN_STALE_MS/)
+    // A handled tick (0-label branch) stops before the labelled heartbeat.
+    expect(scoped).toMatch(/if \(handled\) return/)
   })
 
   it('the WHEN-gate (shouldEarlyOpenLiveness) precedes the drain call inside openLivenessFeedIfDue', () => {

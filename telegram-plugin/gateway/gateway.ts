@@ -142,7 +142,7 @@ import {
 import { pickRecoveredPermissionOrigin } from './permission-card-origin.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
 import { appendActivityLabel, clipNarrative, renderActivityFeedWithNested, formatStepSuffix, type SessionActivityHeader } from '../tool-activity-summary.js'
-import { silentTurnClimbRender } from '../feed-heartbeat-climb.js'
+import { runSilentTurnHeartbeatTick } from '../feed-heartbeat-climb.js'
 import { REPLY_TOOLS, isDraftOfReply } from '../narrative-dedup.js'
 import { toolLabel } from '../tool-labels.js'
 import { createTypingWrapper } from '../typing-wrap.js'
@@ -12790,35 +12790,34 @@ function feedHeartbeatTick(): void {
   // during a long silent tool. So split the two cases: OPEN when no card exists,
   // and otherwise re-render the "Working…" card with a fresh wall-clock elapsed
   // through the SAME cardDrainGate / mayDrain / liveness EDIT path the labelled
-  // branch below uses. Model-independent (reads only
-  // `now - startedAt`), so a blocked tool call can't starve it; edit-only, so it
-  // never push-notifies. `composeTurnActivity` returns null on empty mirrorLines,
-  // so this uses the `renderActivityFeedWithNested(['Working…'])` fallback via
-  // `silentTurnClimbRender` — the same render `openLivenessFeedIfDue` opens with.
-  if (turn.mirrorLines.length === 0) {
-    if (turn.activityMessageId == null) {
-      openLivenessFeedIfDue(turn)
-      return
-    }
-    const rendered = silentTurnClimbRender({
-      mirrorLineCount: turn.mirrorLines.length,
-      activityMessageId: turn.activityMessageId,
-      labeledToolCount: turn.labeledToolCount,
-      ageMs: Date.now() - turn.startedAt,
-    })
-    if (rendered == null) return
-    turn.activityPendingRender = rendered
+  // branch below uses. Model-independent (reads only `now - startedAt`), so a
+  // blocked tool call can't starve it; edit-only, so it never push-notifies.
+  //
+  // The tick BODY lives in feed-heartbeat-climb.ts (`runSilentTurnHeartbeatTick`)
+  // so the shipped decision logic is directly under the outcome-based regression
+  // test (tests/silent-turn-climb-transport.test.ts) — this gateway IIFE cannot
+  // be imported in-process. This call site only wires the REAL deps; the wiring
+  // shape is pinned structurally by tests/feed-heartbeat-liveness-open.test.ts.
+  {
     const ea = emissionAuthorityFor(turn)
-    cardDrainGate(turn, ea, () => {
-      if (ea.mayDrain(turn)) {
-        // Maintains an already-open card (guarded above on activityMessageId !=
-        // null) → only ever EDITs. 'liveness' producer is correct.
-        ea.openOrEditCard('liveness', () => {
-          turn.activityInFlight = drainActivitySummary(turn, 'liveness')
-        })
-      }
-    })
-    return
+    const handled = runSilentTurnHeartbeatTick(
+      {
+        mirrorLineCount: turn.mirrorLines.length,
+        activityMessageId: turn.activityMessageId,
+        labeledToolCount: turn.labeledToolCount,
+        ageMs: Date.now() - turn.startedAt,
+        minStaleMs: FEED_HEARTBEAT_MIN_STALE_MS,
+      },
+      {
+        openLivenessFeedIfDue: () => openLivenessFeedIfDue(turn),
+        setPendingRender: (rendered) => { turn.activityPendingRender = rendered },
+        cardDrainGate: (run) => cardDrainGate(turn, ea, run),
+        mayDrain: () => ea.mayDrain(turn),
+        openOrEditCard: (apply) => ea.openOrEditCard('liveness', apply),
+        drain: () => { turn.activityInFlight = drainActivitySummary(turn, 'liveness') },
+      },
+    )
+    if (handled) return
   }
 
   // Labelled-feed heartbeat: keep a stale in-progress step visibly advancing.
