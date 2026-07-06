@@ -11,11 +11,12 @@ description: >
   "what recurring questions do I keep re-deriving", and typos like "propose
   knowlege models". Do NOT use for storing a single fact/preference/decision —
   that is retain, not a mental model. Do NOT use for identity or "who is the
-  user" — that lives in profile banks and an identity model is forbidden here.
+  user" — that lives in profile banks, so never propose an identity model here
+  (the operator's review of the card, not any code guard, is the only gate — so
+  it's on you to honor).
   Do NOT use when the operator directly asks you to CREATE one specific named
   model whose shape you know — call create_mental_model directly.
-license: MIT
-compatibility: claude-code
+allowed-tools: mcp__hindsight__list_banks mcp__hindsight__get_bank_stats mcp__hindsight__list_mental_models mcp__hindsight__get_mental_model mcp__hindsight__reflect mcp__hindsight__recall mcp__hindsight__create_mental_model mcp__switchroom-telegram__mental_model_propose
 ---
 
 # mental-model-curator — Propose standing knowledge models from your own bank
@@ -88,9 +89,10 @@ you can't point to the underlying content, it's not a candidate.
 ### 4. Frame each candidate correctly
 
 - **`source_query` must be a DOMAIN question**, never an identity / "who is the
-  user" question. Identity lives in dedicated profile banks; an identity model is
-  explicitly forbidden — it previously caused a wrong-fact contradiction bug and
-  was removed. If a candidate is really "facts about the user", discard it.
+  user" question. Identity lives in dedicated profile banks; never propose an
+  identity-based model — the operator, not the platform, is the only gate, so
+  this is on you to honor (one previously caused a wrong-fact contradiction bug).
+  If a candidate is really "facts about the user", discard it.
 - **`refresh_after_consolidation` defaults OFF.** Only set it true when the model
   genuinely tracks fast-moving state that must be current the moment memory
   consolidates. It adds invisible post-consolidation spend and timeout risk, so
