@@ -352,6 +352,41 @@ export function registerMemoryCommand(program: Command): void {
       let ports: { apiPort: number; uiPort: number };
       if (reusePorts) {
         ports = reusePorts;
+        // Migration hazard: --recreate pins the container to the SAME host
+        // port it currently publishes, but fresh scaffolding now defaults
+        // memory.config.url to HINDSIGHT_DEFAULT_API_PORT (18888). If the
+        // reused port diverges AND no agent has an explicit memory.config.url,
+        // agents may be repointed to a dead URL. Warn loudly; do NOT
+        // auto-migrate (too risky mid-recreate).
+        if (reusePorts.apiPort !== HINDSIGHT_DEFAULT_API_PORT) {
+          let explicitUrl: string | undefined;
+          try {
+            explicitUrl = getConfig(program).memory?.config?.url;
+          } catch {
+            explicitUrl = undefined;
+          }
+          if (!explicitUrl) {
+            console.log(
+              chalk.yellow(
+                `\n  ⚠  MIGRATION HAZARD: reusing stale host port ${reusePorts.apiPort} ` +
+                `for switchroom-hindsight, but scaffolding now defaults to ` +
+                `${HINDSIGHT_DEFAULT_API_PORT} and no explicit memory.config.url is set.`,
+              ),
+            );
+            console.log(
+              chalk.yellow(
+                `  Agents may be repointed to a dead URL (http://127.0.0.1:${HINDSIGHT_DEFAULT_API_PORT}/mcp/) ` +
+                `while the container listens on ${reusePorts.apiPort}.`,
+              ),
+            );
+            console.log(
+              chalk.yellow(
+                `  Fix: set memory.config.url: http://127.0.0.1:${reusePorts.apiPort}/mcp/ explicitly, ` +
+                `or migrate the container to port ${HINDSIGHT_DEFAULT_API_PORT}.\n`,
+              ),
+            );
+          }
+        }
       } else {
         try {
           ports = await pickHindsightPorts();

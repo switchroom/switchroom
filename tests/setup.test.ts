@@ -633,6 +633,43 @@ describe("Hindsight port-collision regression", () => {
       blocker?.close();
     }
   });
+
+  // The `switchroom setup` Hindsight step (setup.ts) was the last uncovered
+  // crash-loop path: it called `startHindsight(undefined, litellmCfg)` with no
+  // ports arg, bypassing the pick+preflight guard `switchroom memory` applies,
+  // so a fresh install with 18888 occupied would crash-loop. It must route the
+  // launch through the SAME pick+preflight helpers.
+  it("setup.ts routes its Hindsight launch through the pick+preflight guard", () => {
+    const src = readFileSync(resolve(import.meta.dirname, "../src/cli/setup.ts"), "utf-8");
+    // Must no longer blind-launch on the default port.
+    expect(src).not.toContain("startHindsight(undefined");
+    // Must use the shared guard helpers (not a parallel implementation) and
+    // hand the chosen ports to startHindsight.
+    expect(src).toContain("pickHindsightPorts");
+    expect(src).toContain("preflightHindsightPorts");
+    expect(src).toContain("startHindsight(ports");
+  });
+
+  it("setup's port guard selects a free port instead of binding the occupied default", async () => {
+    // Mirror the exact pick+preflight sequence setup.ts now performs, proving
+    // it selects a bindable port when the default (18888) is occupied rather
+    // than blindly handing 18888 to `docker run`.
+    const defaultFree = await isPortFree(HINDSIGHT_DEFAULT_API_PORT);
+    const blocker = defaultFree ? await bindPort(HINDSIGHT_DEFAULT_API_PORT) : null;
+    try {
+      let ports = await pickHindsightPorts();
+      let conflict = await preflightHindsightPorts(ports);
+      if (conflict) {
+        ports = await pickHindsightPorts();
+        conflict = await preflightHindsightPorts(ports);
+      }
+      expect(conflict).toBeNull();
+      expect(ports.apiPort).not.toBe(HINDSIGHT_DEFAULT_API_PORT);
+      expect(await isPortFree(ports.apiPort)).toBe(true);
+    } finally {
+      blocker?.close();
+    }
+  });
 });
 
 // ─── resolveOrPromptToken precedence (install-validation #31) ────────────────
