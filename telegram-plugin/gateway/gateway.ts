@@ -142,6 +142,7 @@ import {
 import { pickRecoveredPermissionOrigin } from './permission-card-origin.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
 import { appendActivityLabel, clipNarrative, renderActivityFeedWithNested, formatStepSuffix, type SessionActivityHeader } from '../tool-activity-summary.js'
+import { silentTurnClimbRender } from '../feed-heartbeat-climb.js'
 import { REPLY_TOOLS, isDraftOfReply } from '../narrative-dedup.js'
 import { toolLabel } from '../tool-labels.js'
 import { createTypingWrapper } from '../typing-wrap.js'
@@ -12585,11 +12586,15 @@ async function drainActivitySummary(
 }
 
 /**
- * Open (or climb) the minimal "Working…" liveness card for a 0-label turn once
- * it has been alive >= FEED_LIVENESS_OPEN_MS. The ONE place the liveness card
- * may OPEN — both the enqueue-time early-open timer
- * (`scheduleEarlyLivenessOpen`) and the 6 s heartbeat call through here, so a
- * card opened by one caller is a clean no-op for the other:
+ * OPEN the minimal "Working…" liveness card for a 0-label turn once it has been
+ * alive >= FEED_LIVENESS_OPEN_MS. The ONE place the liveness card may OPEN — both
+ * the enqueue-time early-open timer (`scheduleEarlyLivenessOpen`) and the 6 s
+ * heartbeat call through here, so a card opened by one caller is a clean no-op
+ * for the other. This function OPENS only; it does NOT climb an already-open card
+ * (its WHEN-gate `shouldEarlyOpenLiveness` returns false once `activityMessageId`
+ * is set). The 0-label CLIMB of an already-open card lives at the heartbeat call
+ * site via `silentTurnClimbRender` (deterministic-turn-liveness.md Phase 1) — so
+ * BOTH the labelled and the 0-label branches now keep the card visibly climbing.
  *   - `drainActivitySummary` OPENs when `activityMessageId == null` and EDITs
  *     once it is set, so a second call after an open just maintains the card;
  *   - the `mirrorLines.length === 0` guard at the heartbeat call site (and the
@@ -12774,12 +12779,45 @@ function feedHeartbeatTick(): void {
   // sends (opens) when activityMessageId is null and edits (maintains) once set
   // — so this one branch handles both the open and the climb.
   //
-  // The open/climb logic lives in ONE place (`openLivenessFeedIfDue`) so the
+  // The OPEN logic lives in ONE place (`openLivenessFeedIfDue`) so the
   // enqueue-time early-open timer (`scheduleEarlyLivenessOpen`) and this 6 s
   // heartbeat both reach the same drain — there is exactly one path that can
   // OPEN the liveness card, so the two callers can never double-open or race.
+  //
+  // Phase 1 climb (deterministic-turn-liveness.md): once the card IS open, the
+  // OPEN path no-ops (its WHEN-gate `shouldEarlyOpenLiveness` returns false for
+  // an already-open card) — which is exactly how the 0-label card used to FREEZE
+  // during a long silent tool. So split the two cases: OPEN when no card exists,
+  // and otherwise re-render the "Working…" card with a fresh wall-clock elapsed
+  // through the SAME cardDrainGate / mayDrain / openOrEditCard('liveness') EDIT
+  // path the labelled branch below uses. Model-independent (reads only
+  // `now - startedAt`), so a blocked tool call can't starve it; edit-only, so it
+  // never push-notifies. `composeTurnActivity` returns null on empty mirrorLines,
+  // so this uses the `renderActivityFeedWithNested(['Working…'])` fallback via
+  // `silentTurnClimbRender` — the same render `openLivenessFeedIfDue` opens with.
   if (turn.mirrorLines.length === 0) {
-    openLivenessFeedIfDue(turn)
+    if (turn.activityMessageId == null) {
+      openLivenessFeedIfDue(turn)
+      return
+    }
+    const rendered = silentTurnClimbRender({
+      mirrorLineCount: turn.mirrorLines.length,
+      activityMessageId: turn.activityMessageId,
+      labeledToolCount: turn.labeledToolCount,
+      ageMs: Date.now() - turn.startedAt,
+    })
+    if (rendered == null) return
+    turn.activityPendingRender = rendered
+    const ea = emissionAuthorityFor(turn)
+    cardDrainGate(turn, ea, () => {
+      if (ea.mayDrain(turn)) {
+        // Maintains an already-open card (guarded above on activityMessageId !=
+        // null) → only ever EDITs. 'liveness' producer is correct.
+        ea.openOrEditCard('liveness', () => {
+          turn.activityInFlight = drainActivitySummary(turn, 'liveness')
+        })
+      }
+    })
     return
   }
 

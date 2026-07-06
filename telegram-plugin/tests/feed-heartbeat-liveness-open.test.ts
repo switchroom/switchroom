@@ -25,9 +25,12 @@
  *      `openLivenessFeedIfDue` BEFORE the drain — a turn that hasn't passed the
  *      threshold, or one whose card is already open, returns early (no
  *      double-open).
- *   4. The 0-tool branch of `feedHeartbeatTick` delegates to that one shared
- *      helper rather than inlining the open — so the heartbeat and the
- *      enqueue-time timer can never double-open.
+ *   4. The 0-tool branch of `feedHeartbeatTick` OPENS via that one shared helper
+ *      (so the heartbeat and the enqueue-time timer can never double-open) AND,
+ *      once a card is open, CLIMBS it every tick via `silentTurnClimbRender`
+ *      (deterministic-turn-liveness.md Phase 1) — the freeze this test used to
+ *      enshrine is inverted. The outcome-based proof is the transport test
+ *      `silent-turn-climb-transport.test.ts`.
  *
  * These are STRUCTURAL (source-read) assertions; the gateway IIFE can't be
  * instantiated in-process. Pattern matches silence-liveness-wiring.test.ts.
@@ -71,17 +74,29 @@ describe('H-1: feedHeartbeatTick liveness-open threshold', () => {
     expect(initBlock).toMatch(/1[_]?200/)
   })
 
-  it('the 0-tool liveness branch delegates to the shared openLivenessFeedIfDue helper', () => {
-    // The open logic lives in ONE place so the heartbeat and the enqueue-time
-    // early-open timer cannot double-open. The 0-tool branch must call the
-    // shared helper rather than inline its own open.
+  it('the 0-tool liveness branch OPENS via the shared helper AND CLIMBS an already-open card', () => {
+    // deterministic-turn-liveness.md Phase 1 + Phase 4(d): the prior version of
+    // this test enshrined the freeze — it asserted only that the branch delegates
+    // to `openLivenessFeedIfDue` (which no-ops once a card is open), which is
+    // exactly why a busy-but-silent 0-label card used to freeze. The property is
+    // now INVERTED: on an already-open card the branch must CLIMB on each tick.
+    //
+    // Structural cross-check only; the load-bearing proof is the outcome-based
+    // transport test (tests/silent-turn-climb-transport.test.ts) which asserts
+    // >=4 climbing edits reach the transport during a 40s silent tool.
     const body = feedHeartbeatTickSrc()
     const start = body.indexOf('if (turn.mirrorLines.length === 0)')
     expect(start).toBeGreaterThan(-1)
     const branch = body.slice(start)
     const end = branch.indexOf('// Labelled-feed heartbeat')
     const scoped = end === -1 ? branch : branch.slice(0, end)
+    // OPEN path: still routed through the one shared helper (no double-open).
     expect(scoped).toMatch(/openLivenessFeedIfDue\(turn\)/)
+    // CLIMB path: an already-open card is re-rendered every tick via
+    // silentTurnClimbRender and edited through the drain gate — no longer a freeze.
+    expect(scoped).toMatch(/silentTurnClimbRender\(/)
+    expect(scoped).toMatch(/turn\.activityMessageId == null/)
+    expect(scoped).toMatch(/drainActivitySummary\(turn, 'liveness'\)/)
   })
 
   it('the WHEN-gate (shouldEarlyOpenLiveness) precedes the drain call inside openLivenessFeedIfDue', () => {
