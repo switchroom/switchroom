@@ -80,6 +80,35 @@ export interface SilentEndDeps {
  */
 export const SILENT_END_MAX_RETRIES = 2
 
+/**
+ * User-facing fallback text delivered when a user-message turn ends with no
+ * final answer AND the deterministic Stop-hook re-prompt has already been
+ * exhausted (#1161). Without this the user only sees the progress card
+ * vanish; silence must never be the failure mode.
+ *
+ * PR #2892 (reference/rfcs/deterministic-turn-liveness.md Phase 2
+ * hardening): include the turn's elapsed so the fallback is honest about
+ * how long the user actually waited, instead of a generic apology with no
+ * timing. A degenerate/unknown duration (missing, non-finite, or <= 0 —
+ * e.g. a turn whose `startedAt` was never stamped) omits the waited clause
+ * rather than printing a nonsensical "(waited 0s)".
+ *
+ * Lives here (not gateway.ts) so the transport-boundary tests exercise the
+ * REAL string (tests/silent-end-transport.test.ts), not a hand-maintained
+ * copy — gateway.ts is not importable in tests.
+ */
+export function silentEndFallbackText(turnDurationMs: number | undefined): string {
+  const elapsed =
+    typeof turnDurationMs === 'number' && Number.isFinite(turnDurationMs) && turnDurationMs > 0
+      ? ` (waited ${Math.round(turnDurationMs / 1000)}s)`
+      : ''
+  return (
+    '⚠️ The agent finished working but didn’t send a reply' +
+    elapsed +
+    ' — your last message may not have been answered. Please try asking again.'
+  )
+}
+
 function resolveStateDir(deps?: SilentEndDeps): string {
   if (deps?.stateDir != null) return deps.stateDir
   const env = process.env.TELEGRAM_STATE_DIR
@@ -291,6 +320,16 @@ export function recordSilentTurnEnd(
           `(retryCount=${prev.retryCount}) but a reply was delivered since ` +
           `${prev.timestamp} — treating as satisfied-but-misdetected, not exhausted\n`,
       )
+      // MUST clear before writing (adversarial review of #2892):
+      // writeSilentEndState re-inherits retryCount whenever the on-disk
+      // turnKey matches — which it ALWAYS does here, since turnKey is the
+      // stable statusKey(chatId, threadId). Writing over the stale record
+      // directly would start the "fresh" ladder at retryCount=MAX: the
+      // Stop hook would see retryCount >= MAX_RETRIES and never re-prompt,
+      // while this call just returned exhausted:false so no fallback fires
+      // either — pure silence, strictly worse than the pre-fix behaviour.
+      // Clearing first makes the new record genuinely start at retryCount=0.
+      clearSilentEndState(args.turnKey, deps)
       writeSilentEndState(args, deps)
       return { exhausted: false }
     }

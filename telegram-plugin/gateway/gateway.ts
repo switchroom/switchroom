@@ -171,7 +171,7 @@ import { decideSilentReplyAnchor } from '../silent-reply-anchor.js'
 import { classifyInbound } from '../inbound-classifier.js'
 import * as silencePoke from '../silence-poke.js'
 import * as pendingProgress from '../pending-work-progress.js'
-import { writeSilentEndState, clearSilentEndState, recordUndeliveredTurnEnd, type SilentEndDeps } from '../silent-end.js'
+import { writeSilentEndState, clearSilentEndState, recordUndeliveredTurnEnd, silentEndFallbackText, type SilentEndDeps } from '../silent-end.js'
 import { isFinalAnswerReply, isSubstantiveFinalReply, FINAL_ANSWER_MIN_CHARS } from '../final-answer-detect.js'
 import { deriveTurnRole, decideTerminalReason, parsePostAnswerLivenessMs, evaluatePostAnswerLiveness, type LoopRole } from '../turn-liveness-floor.js'
 import { createAnswerStream, type AnswerStreamHandle } from '../answer-stream.js'
@@ -251,26 +251,9 @@ import { validateStringArray } from './access-validator.js'
  */
 const REPLY_TO_TEXT_MAX = 200
 
-/**
- * #1161 — user-facing fallback delivered when a user-message turn ends
- * with zero outbound messages AND the deterministic Stop-hook re-prompt
- * has already been exhausted. Without this the user only sees the
- * progress card vanish; silence must never be the failure mode.
- */
-function silentEndFallbackText(turnDurationMs: number | undefined): string {
-  // reference/rfcs/deterministic-turn-liveness.md Phase 2 hardening: include
-  // the turn's elapsed so the fallback is honest about how long the user
-  // actually waited, instead of a generic apology with no timing.
-  const elapsed =
-    typeof turnDurationMs === 'number' && Number.isFinite(turnDurationMs) && turnDurationMs >= 0
-      ? ` (waited ${Math.round(turnDurationMs / 1000)}s)`
-      : ''
-  return (
-    '⚠️ The agent finished working but didn’t send a reply' +
-    elapsed +
-    ' — your last message may not have been answered. Please try asking again.'
-  )
-}
+// #1161 silent-end fallback text now lives in ../silent-end.ts
+// (`silentEndFallbackText`, imported above) so the transport-boundary
+// tests exercise the real string — see PR #2892.
 import { splitMarkdownChunks, hardSliceToCap, repairEscapedWhitespace, normalizeParagraphBreaks, addParagraphSpacers, normalizePunctuation, stripExcessBold, escapeMarkdown, hardenCardBreaks, RICH_MESSAGE_MAX_CHARS } from '../format.js'
 import { richMessage } from '../rich-send.js'
 import { scrubVoice } from '../text-voice-scrub.js'
@@ -14494,7 +14477,8 @@ function handleSessionEvent(ev: SessionEvent): void {
         // this path. The turn-flush 'flush' branch also returns earlier
         // (and sets finalAnswerDelivered=true defensively).
         if (turn.finalAnswerDelivered === false) {
-          // #2xxx Phase 2 hardening: wire the represent-guard-style staleness
+          // PR #2892 (deterministic-turn-liveness RFC Phase 2) hardening:
+          // wire the represent-guard-style staleness
           // check (`recordSilentTurnEnd`'s `hasOutboundDeliveredSince` dep) so
           // an exhausted-looking record left over from a PRIOR, already-
           // answered turn on this same chat/thread (statusKey is not a

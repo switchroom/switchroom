@@ -13,12 +13,16 @@
  * This file reproduces the EXACT call sequence at the gateway's turn_end
  * handler (gateway.ts ~14486-14535: `if (turn.finalAnswerDelivered ===
  * false) { const silentEnd = recordUndeliveredTurnEnd(...); if
- * (silentEnd.exhausted) { <send> } }`) against a spy transport, using the
- * REAL exported `recordUndeliveredTurnEnd` / `clearSilentEndState` /
+ * (silentEnd.exhausted) { <send> } }`) against a spy transport standing in
+ * for `bot.api.sendMessage`, using the REAL exported
+ * `recordUndeliveredTurnEnd` / `silentEndFallbackText` /
  * `isFinalAnswerReply` — same pattern `silent-end-integration.test.ts`
  * already established for testing gateway call-sites that aren't
  * themselves exported (gateway.ts is a multi-thousand-line module with
  * process-level side effects on import; see that file's "KNOWN GAP" note).
+ * The spy asserts the SEND CALL is made (outcome, not a stubbed decision
+ * callback); it does not drive grammY itself — that last hop stays covered
+ * by the UAT harness.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mkdtempSync, rmSync, writeFileSync as writeFileSyncState } from 'node:fs'
@@ -28,6 +32,7 @@ import {
   writeSilentEndState,
   readSilentEndState,
   recordUndeliveredTurnEnd,
+  silentEndFallbackText,
   SILENT_END_MAX_RETRIES,
   type SilentEndDeps,
 } from '../silent-end.js'
@@ -66,20 +71,12 @@ function makeTransport() {
   }
 }
 
-function fallbackText(turnDurationMs: number): string {
-  // Mirrors gateway.ts's silentEndFallbackText(turnDurationMs) exactly —
-  // the elapsed-inclusion hardening from this PR.
-  const elapsed = ` (waited ${Math.round(turnDurationMs / 1000)}s)`
-  return (
-    '⚠️ The agent finished working but didn’t send a reply' +
-    elapsed +
-    ' — your last message may not have been answered. Please try asking again.'
-  )
-}
-
 /**
  * Faithful reproduction of the gateway's turn_end branch
- * (gateway.ts ~14486-14535). Real functions in, spy transport out.
+ * (gateway.ts ~14486-14535). Real functions in, spy transport out —
+ * including the REAL `silentEndFallbackText` (exported from
+ * silent-end.ts so the assertions below validate the shipped copy,
+ * not a hand-maintained duplicate).
  */
 function simulateTurnEnd(
   args: {
@@ -98,7 +95,7 @@ function simulateTurnEnd(
       deps,
     )
     if (silentEnd.exhausted) {
-      transport.send(args.chatId, fallbackText(args.turnDurationMs))
+      transport.send(args.chatId, silentEndFallbackText(args.turnDurationMs))
     }
     return silentEnd
   }
@@ -240,6 +237,15 @@ describe('silent-end dark-turn guard — transport-boundary outcome tests (RFC P
 
     expect(result?.exhausted).toBe(false)
     expect(transport.sent).toHaveLength(0)
+    // CRITICAL (adversarial review of #2892): the "fresh retry cycle" must
+    // actually be fresh. writeSilentEndState re-inherits retryCount when
+    // the on-disk turnKey matches (which it ALWAYS does here — turnKey is
+    // statusKey). If the staleness branch writes without clearing first,
+    // the new record starts at retryCount=MAX: the Stop hook
+    // (silent-end-interrupt-stop.mjs) sees retryCount >= MAX_RETRIES and
+    // never re-prompts, while the gateway just got exhausted:false and
+    // sent no fallback either — pure silence, worse than no fix at all.
+    expect(readSilentEndState()!.retryCount).toBe(0)
   })
 
   it('(d3) staleness hardening does NOT suppress a genuine, fresh exhaustion (no reply since the record)', () => {
