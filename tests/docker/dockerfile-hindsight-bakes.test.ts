@@ -176,6 +176,50 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
+  it("keeps the unit_entities FK-race fix (assert-guarded, fail-loud)", () => {
+    // Upstream v0.8.4 defect: retain Phase-1 (entity resolution) and Phase-2
+    // (the unit_entities child insert) run in SEPARATE committed transactions.
+    // graph_maintenance.prune_orphan_entities can delete an entity in that
+    // window (it momentarily has no unit_entities reference), so Phase-2's
+    // bulk_insert_unit_entities then violates fk_unit_entities_entity_id_entities
+    // — deterministic, non-retryable, memory silently dropped (fires on
+    // session_handoff re-ingest). The build-time patch makes Phase-2 re-assert
+    // (resurrect) the parent entity row in the SAME transaction as the child
+    // insert (INSERT ... ON CONFLICT DO NOTHING), threading the entity metadata
+    // Phase-1 already holds. Proven 15/15 RED -> 0/15 with memories persisted on
+    // the real retain orchestrator path. Self-verifying (asserts each anchor
+    // exactly once against unmodified upstream v0.8.4 before patching, re-asserts
+    // the result). Guard the patch block so nobody silently deletes it.
+
+    // The exact-once anchor guard (fail-loud on upstream drift).
+    expect(dockerfile).toMatch(
+      /assert n == 1, \(\s*\n\s*f"switchroom hindsight FK-race patch: anchor found \{n\}x/,
+    );
+    // The new idempotent same-txn re-assert op.
+    expect(dockerfile).toMatch(/async def reassert_entities\(/);
+    expect(dockerfile).toMatch(/INSERT INTO \{table\} \(id, bank_id, canonical_name\)/);
+    expect(dockerfile).toMatch(/ON CONFLICT DO NOTHING/);
+    // The entity_records threading param on the link path.
+    expect(dockerfile).toMatch(
+      /entity_records: dict\[str, dict\] \| None = None,/,
+    );
+    // The orchestrator wires entity_records from the Phase-1 result into Phase-2.
+    expect(dockerfile).toMatch(
+      /entity_records=phase1\.entities\.entity_records/,
+    );
+    // Post-replace re-assertions must be present (verification-on-build).
+    expect(dockerfile).toMatch(
+      /assert "async def reassert_entities\(" in ops_new,/,
+    );
+    expect(dockerfile).toMatch(
+      /assert "entity_records\.get\(str\(eid\)\)" in er_new,/,
+    );
+    // The success line proves the block ran to completion.
+    expect(dockerfile).toMatch(
+      /switchroom hindsight unit_entities FK-race patch: reassert_entities \+ entity_records threading applied/,
+    );
+  });
+
   it("preserves upstream's start-all.sh as the post-shim CMD", () => {
     // The shim does broker auth, then `exec "$@"` which is whatever
     // CMD docker passes — must be upstream's start-all.sh so the

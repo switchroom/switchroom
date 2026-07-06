@@ -148,6 +148,301 @@ assert "max_turns=1,  # Single-turn" not in t, "switchroom max_turns/ToolSearch 
 print("switchroom max_turns/ToolSearch standard-call fix: standard LLM call now sends tools=[] + max_turns=2 (ToolSearch can no longer wall the turn)")
 PYEOF
 
+# unit_entities FK-race fix: upstream v0.8.4 defect (to-be-filed upstream issue).
+# Entity resolution (retain Phase-1) and the unit_entities child insert (Phase-2)
+# run in SEPARATE committed transactions. Between them, graph_maintenance's
+# prune_orphan_entities can delete an entity that momentarily has no
+# unit_entities reference — so the Phase-2 bulk_insert_unit_entities then
+# violates fk_unit_entities_entity_id_entities. It is deterministic and
+# NON-retryable, so the memory is silently dropped. It fires on session_handoff
+# re-ingest (observed live). Deterministic repro flips 15/15 RED -> 0/15 with
+# memories persisted once the fix is in.
+#
+# Fix (proven end-to-end on the real retain orchestrator path in an isolated
+# scratch container): Phase-2 re-asserts the parent entity row in the SAME
+# transaction as the child insert (INSERT ... ON CONFLICT DO NOTHING),
+# resurrecting any concurrently-pruned parent before the FK is checked — a live
+# unit's referent is not an orphan. This threads the minimal entity metadata
+# Phase-1 already holds (entity_id, bank_id, canonical_name; the name is NOT NULL
+# and unrecoverable once the row is pruned, so it must be carried through) from
+# resolve_entities_only up through the Phase-1 result into the Phase-2 link call.
+# Callers that don't pass entity_records keep the exact pre-existing behavior.
+#
+# Self-verifying: each anchor asserts exactly-once against unmodified upstream
+# v0.8.4 source; the build FAILS LOUDLY if upstream reformats any of the six
+# touched functions, so we never silently ship a half-applied patch or drop the
+# fix. Guarded by tests/docker/dockerfile-hindsight-bakes.test.ts.
+RUN python3 - <<'PYEOF'
+import pathlib
+
+BASE = pathlib.Path("/app/api/hindsight_api/engine")
+
+
+def apply(rel, edits):
+    f = BASE / rel
+    s = f.read_text()
+    for anchor, repl in edits:
+        n = s.count(anchor)
+        assert n == 1, (
+            f"switchroom hindsight FK-race patch: anchor found {n}x (expected 1) "
+            f"in {rel} — upstream reformatted; re-author this patch in "
+            f"docker/Dockerfile.hindsight. Anchor head: {anchor.splitlines()[0]!r}"
+        )
+        s = s.replace(anchor, repl, 1)
+    f.write_text(s)
+    return s
+
+
+# ---- 1. db/ops_postgresql.py : add idempotent reassert_entities() ----
+ops_new = apply("db/ops_postgresql.py", [
+    (
+        "            bank_id,\n"
+        "            missing_names,\n"
+        "        )\n"
+        "\n"
+        "    async def bulk_insert_unit_entities(",
+        "            bank_id,\n"
+        "            missing_names,\n"
+        "        )\n"
+        "\n"
+        "    async def reassert_entities(\n"
+        "        self,\n"
+        "        conn: DatabaseConnection,\n"
+        "        table: str,\n"
+        "        entity_ids: list,\n"
+        "        bank_ids: list,\n"
+        "        canonical_names: list,\n"
+        "    ) -> None:\n"
+        '        """Re-assert (id, bank_id, canonical_name) entity rows idempotently.\n'
+        "\n"
+        "        Resurrects any parent entity that graph_maintenance.prune_orphan_entities\n"
+        "        deleted in the window between Phase-1 resolution and the Phase-2\n"
+        "        unit_entities child insert. Runs on the SAME connection/transaction as\n"
+        "        the child insert, so the FK is satisfied at check time regardless of\n"
+        "        prune timing. ON CONFLICT DO NOTHING leaves a still-present row untouched.\n"
+        '        """\n'
+        "        await conn.execute(\n"
+        '            f"""\n'
+        "            INSERT INTO {table} (id, bank_id, canonical_name)\n"
+        "            SELECT i, b, n\n"
+        "            FROM unnest($1::uuid[], $2::text[], $3::text[]) AS t(i, b, n)\n"
+        "            ON CONFLICT DO NOTHING\n"
+        '            """,\n'
+        "            entity_ids,\n"
+        "            bank_ids,\n"
+        "            canonical_names,\n"
+        "        )\n"
+        "\n"
+        "    async def bulk_insert_unit_entities(",
+    ),
+])
+
+# ---- 2. entity_resolver.py : entity_records param + same-txn reassert ----
+er_new = apply("entity_resolver.py", [
+    (
+        "        unit_entity_pairs: list[tuple[str, str]] | list[tuple[str, str, datetime | None]],\n"
+        "        conn=None,\n"
+        "    ):",
+        "        unit_entity_pairs: list[tuple[str, str]] | list[tuple[str, str, datetime | None]],\n"
+        "        conn=None,\n"
+        "        entity_records: dict[str, dict] | None = None,\n"
+        "    ):",
+    ),
+    (
+        "            async with acquire_with_retry(self.pool) as conn:\n"
+        "                return await self._link_units_to_entities_batch_impl(conn, normalized)\n"
+        "        else:\n"
+        "            return await self._link_units_to_entities_batch_impl(conn, normalized)",
+        "            async with acquire_with_retry(self.pool) as conn:\n"
+        "                return await self._link_units_to_entities_batch_impl(conn, normalized, entity_records)\n"
+        "        else:\n"
+        "            return await self._link_units_to_entities_batch_impl(conn, normalized, entity_records)",
+    ),
+    (
+        "    async def _link_units_to_entities_batch_impl(self, conn, unit_entity_pairs: list[tuple[str, str, datetime | None]]):",
+        "    async def _link_units_to_entities_batch_impl(self, conn, unit_entity_pairs: list[tuple[str, str, datetime | None]], entity_records: dict[str, dict] | None = None):",
+    ),
+    (
+        "        unit_ids = [p[0] for p in sorted_pairs]\n"
+        "        entity_ids = [p[1] for p in sorted_pairs]\n"
+        "\n"
+        "        await self._ops.bulk_insert_unit_entities(",
+        "        unit_ids = [p[0] for p in sorted_pairs]\n"
+        "        entity_ids = [p[1] for p in sorted_pairs]\n"
+        "\n"
+        "        # Race guard: re-assert the parent entity rows in the SAME transaction\n"
+        "        # as the child insert below, resurrecting any entity that\n"
+        "        # graph_maintenance pruned in the Phase-1 -> Phase-2 window. A live\n"
+        "        # unit's referent is not an orphan. No-op when the rows already exist.\n"
+        "        if entity_records:\n"
+        "            reassert_ids: list = []\n"
+        "            reassert_banks: list = []\n"
+        "            reassert_names: list = []\n"
+        "            seen: set = set()\n"
+        "            for eid in entity_ids:\n"
+        "                if eid in seen:\n"
+        "                    continue\n"
+        "                seen.add(eid)\n"
+        "                rec = entity_records.get(eid)\n"
+        "                if rec is None:\n"
+        "                    rec = entity_records.get(str(eid))\n"
+        "                if not rec:\n"
+        "                    continue\n"
+        '                bank_id = rec.get("bank_id")\n'
+        '                canonical_name = rec.get("canonical_name")\n'
+        "                if bank_id is None or canonical_name is None:\n"
+        "                    continue\n"
+        "                reassert_ids.append(eid)\n"
+        "                reassert_banks.append(bank_id)\n"
+        "                reassert_names.append(canonical_name)\n"
+        "            if reassert_ids:\n"
+        "                await self._ops.reassert_entities(\n"
+        "                    conn,\n"
+        '                    fq_table("entities"),\n'
+        "                    reassert_ids,\n"
+        "                    reassert_banks,\n"
+        "                    reassert_names,\n"
+        "                )\n"
+        "\n"
+        "        await self._ops.bulk_insert_unit_entities(",
+    ),
+])
+
+# ---- 3. retain/types.py : EntityResolutionResult gains entity_records ----
+apply("retain/types.py", [
+    (
+        "    resolved_entity_ids: list[str]\n"
+        "    entity_to_unit: list[tuple]\n"
+        "    unit_to_entity_ids: dict[str, list[str]]\n"
+        "\n"
+        "\n"
+        "@dataclass\n"
+        "class Phase1Result:",
+        "    resolved_entity_ids: list[str]\n"
+        "    entity_to_unit: list[tuple]\n"
+        "    unit_to_entity_ids: dict[str, list[str]]\n"
+        "    # id -> {\"bank_id\":.., \"canonical_name\":..} for the resolved entities so\n"
+        "    # Phase-2's unit_entities child insert can re-assert (resurrect) a parent\n"
+        "    # entity concurrently pruned by graph_maintenance, in the same transaction.\n"
+        "    entity_records: dict[str, dict] | None = None\n"
+        "\n"
+        "\n"
+        "@dataclass\n"
+        "class Phase1Result:",
+    ),
+])
+
+# ---- 4. retain/link_utils.py : build + return entity_records (4-tuple) ----
+apply("retain/link_utils.py", [
+    (
+        '        _log(log_buffer, "  [6.2] Entity resolution (batched): 0 entities", level="debug")\n'
+        "        return [], [], {}",
+        '        _log(log_buffer, "  [6.2] Entity resolution (batched): 0 entities", level="debug")\n'
+        "        return [], [], {}, {}",
+    ),
+    (
+        "    _log(\n"
+        "        log_buffer,\n"
+        '        f"  [6.2] Entity resolution (batched): {len(all_entities_flat)} entities resolved in {time.time() - step_start:.3f}s",\n'
+        '        level="debug",\n'
+        "    )\n"
+        "\n"
+        "    return resolved_entity_ids, entity_to_unit, unit_to_entity_ids",
+        "    _log(\n"
+        "        log_buffer,\n"
+        '        f"  [6.2] Entity resolution (batched): {len(all_entities_flat)} entities resolved in {time.time() - step_start:.3f}s",\n'
+        '        level="debug",\n'
+        "    )\n"
+        "\n"
+        "    # Thread minimal entity metadata (id -> bank_id + canonical_name) so the\n"
+        "    # Phase-2 unit_entities child insert can re-assert a concurrently-pruned\n"
+        "    # parent in the SAME transaction. canonical_name is NOT NULL and gone once\n"
+        "    # graph_maintenance prunes the row, so it must be carried from here.\n"
+        "    entity_records: dict[str, dict] = {}\n"
+        "    for idx, ent in enumerate(all_entities_flat):\n"
+        "        eid = resolved_entity_ids[idx]\n"
+        '        name = ent.get("text")\n'
+        "        if eid is None or not name:\n"
+        "            continue\n"
+        '        entity_records.setdefault(str(eid), {"bank_id": bank_id, "canonical_name": name})\n'
+        "\n"
+        "    return resolved_entity_ids, entity_to_unit, unit_to_entity_ids, entity_records",
+    ),
+])
+
+# ---- 5. retain/entity_processing.py : 4-tuple early return ----
+apply("retain/entity_processing.py", [
+    (
+        "    if not unit_ids or not facts:\n"
+        "        return [], [], {}",
+        "    if not unit_ids or not facts:\n"
+        "        return [], [], {}, {}",
+    ),
+])
+
+# ---- 6. retain/orchestrator.py : unpack + store + thread entity_records ----
+apply("retain/orchestrator.py", [
+    (
+        "        resolved_entity_ids, entity_to_unit, unit_to_entity_ids = await entity_processing.resolve_entities(",
+        "        resolved_entity_ids, entity_to_unit, unit_to_entity_ids, entity_records = await entity_processing.resolve_entities(",
+    ),
+    (
+        "        entities=EntityResolutionResult(\n"
+        "            resolved_entity_ids=resolved_entity_ids,\n"
+        "            entity_to_unit=entity_to_unit,\n"
+        "            unit_to_entity_ids=unit_to_entity_ids,\n"
+        "        ),",
+        "        entities=EntityResolutionResult(\n"
+        "            resolved_entity_ids=resolved_entity_ids,\n"
+        "            entity_to_unit=entity_to_unit,\n"
+        "            unit_to_entity_ids=unit_to_entity_ids,\n"
+        "            entity_records=entity_records,\n"
+        "        ),",
+    ),
+    (
+        "    unit_to_entity_ids: dict[str, list[str]],\n"
+        "    semantic_ann_links: list[tuple],\n"
+        "    skip_semantic_links: bool = False,\n"
+        "    outbox_callback=None,\n"
+        "    ops=None,\n"
+        ") -> list[list[str]]:",
+        "    unit_to_entity_ids: dict[str, list[str]],\n"
+        "    semantic_ann_links: list[tuple],\n"
+        "    skip_semantic_links: bool = False,\n"
+        "    outbox_callback=None,\n"
+        "    ops=None,\n"
+        "    entity_records: dict[str, dict] | None = None,\n"
+        ") -> list[list[str]]:",
+    ),
+    (
+        "        await entity_resolver.link_units_to_entities_batch(unit_entity_pairs, conn=conn)",
+        "        await entity_resolver.link_units_to_entities_batch(\n"
+        "            unit_entity_pairs, conn=conn, entity_records=entity_records\n"
+        "        )",
+    ),
+    (
+        "                        unit_to_entity_ids=phase1.entities.unit_to_entity_ids,\n"
+        "                        semantic_ann_links=[],",
+        "                        unit_to_entity_ids=phase1.entities.unit_to_entity_ids,\n"
+        "                        entity_records=phase1.entities.entity_records,\n"
+        "                        semantic_ann_links=[],",
+    ),
+    (
+        "                    unit_to_entity_ids=phase1.entities.unit_to_entity_ids,\n"
+        "                    semantic_ann_links=phase1.semantic_ann_links,",
+        "                    unit_to_entity_ids=phase1.entities.unit_to_entity_ids,\n"
+        "                    entity_records=phase1.entities.entity_records,\n"
+        "                    semantic_ann_links=phase1.semantic_ann_links,",
+    ),
+])
+
+# ---- Post-conditions: fail loud if any edit silently no-oped ----
+assert "async def reassert_entities(" in ops_new, "switchroom hindsight FK-race patch: reassert_entities missing after patch"
+assert "entity_records.get(str(eid))" in er_new, "switchroom hindsight FK-race patch: reassert lookup fallback missing after patch"
+assert "entity_records=phase1.entities.entity_records" in (BASE / "retain/orchestrator.py").read_text(), "switchroom hindsight FK-race patch: orchestrator threading missing after patch"
+print("switchroom hindsight unit_entities FK-race patch: reassert_entities + entity_records threading applied (Phase-2 resurrects concurrently-pruned parent in same txn)")
+PYEOF
+
 # Pin the upstream `hindsight` user to UID 11000 to match
 # `HINDSIGHT_DEFAULT_UID` in src/setup/hindsight.ts (and the
 # `auth.consumers[hindsight].uid` value the operator writes in
