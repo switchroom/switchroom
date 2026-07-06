@@ -335,7 +335,10 @@ describe("Principles/consistency — every operator approval card uses the same 
     // handleAuthDashboardCallback at the dispatcher.
     // `vsp:` added in #2045 (request_secret secure save-card) — handled by
     // handleSecretRequestCallback at the dispatcher.
-    const expectedPrefixes = ["vrs", "vra", "vrd", "vd", "vg", "op", "auth", "vsp"];
+    // `mmp:` added for mental_model_propose (hindsight Phase 5) — the
+    // agent-proposes → human-approves mental-model card; mmp:approve/deny
+    // are handled by handleMentalModelProposeCallback at the dispatcher.
+    const expectedPrefixes = ["vrs", "vra", "vrd", "vd", "vg", "op", "auth", "vsp", "mmp"];
     for (const p of expectedPrefixes) {
       expect(
         gatewaySrc,
