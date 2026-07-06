@@ -45,7 +45,7 @@
 
 import { describe, expect, it } from "vitest";
 import { spinUp } from "../harness.js";
-import { isActivityFeedMessage } from "../assertions.js";
+import { isActivityFeedMessage, isFrameworkFallbackText } from "../assertions.js";
 import type { ObservedMessage } from "../driver.js";
 
 const MIN_CLIMB_EDITS = 4;
@@ -123,6 +123,20 @@ describe("uat: deterministic turn liveness — silent-tool card climb (DM)", () 
           }
 
           if (m.edited) continue;
+          // Attributable-answer gate: a framework mid-turn/dark-turn fallback
+          // TEXT send (the exact #2667 erosion this wall guards against — a
+          // re-added "still working…" ping) must NOT be swallowed as the
+          // turn's answer. Classify it as a mid-turn erosion regardless of its
+          // silent flag, so the first loud mid-turn message trips the
+          // assertion instead of masquerading as the reply.
+          if (isFrameworkFallbackText(m.text)) {
+            otherLoudMessage = otherLoudMessage ?? m;
+            console.log(
+              `[liveness-climb-dm] framework fallback text mid-turn at +${Date.now() - sentAt}ms: ` +
+                JSON.stringify(m.text.slice(0, 120)),
+            );
+            continue;
+          }
           if (!answer && m.text.trim().length > 0) {
             answer = m;
             console.log(`[liveness-climb-dm] answer at +${Date.now() - sentAt}ms.`);
@@ -136,10 +150,14 @@ describe("uat: deterministic turn liveness — silent-tool card climb (DM)", () 
         }
         await iter.return?.();
 
-        // No mid-turn notification ping, on the card OR any other message.
+        // No mid-turn erosion: neither a device-buzzing ping (silent=false on
+        // a non-final message) NOR a framework fallback TEXT send (a
+        // "still working…"-class mid-turn message — the climb is an edit-only
+        // card, never a text send).
         expect(
           otherLoudMessage,
-          `a mid-turn message pinged the user's device (silent=false): ` +
+          `a mid-turn message eroded the ping-free/edit-only guarantee ` +
+            `(loud ping or framework fallback text): ` +
             JSON.stringify(otherLoudMessage?.text?.slice(0, 120)),
         ).toBeNull();
 
@@ -171,12 +189,25 @@ describe("uat: deterministic turn liveness — silent-tool card climb (DM)", () 
         }
 
         // Climbing property: elapsed samples must be non-decreasing (never
-        // freezes/rewinds across edits of the same card).
+        // rewinds across edits of the same card)…
         for (let i = 1; i < elapsedSamples.length; i++) {
           expect(
             elapsedSamples[i],
             `elapsed suffix went backwards/froze across edits: ${JSON.stringify(elapsedSamples)}`,
           ).toBeGreaterThanOrEqual(elapsedSamples[i - 1]);
+        }
+        // …and, when we have the full climb (≥MIN_CLIMB_EDITS parsed samples),
+        // it must actually CLIMB — a frozen/repeated elapsed value across all
+        // edits is the exact pre-Phase-1 freeze and a hard failure (this backs
+        // the job-spec Prove-it claim; non-decreasing alone would pass a
+        // frozen card).
+        if (elapsedSamples.length >= MIN_CLIMB_EDITS) {
+          expect(
+            elapsedSamples[elapsedSamples.length - 1],
+            `HARD FAIL — the elapsed suffix never advanced across ${elapsedSamples.length} ` +
+              `card edits (frozen at ${JSON.stringify(elapsedSamples)}). A repeated elapsed ` +
+              "value across all edits is the pre-Phase-1 freeze this fix closes.",
+          ).toBeGreaterThan(elapsedSamples[0]);
         }
 
         expect(answer, "FAIL — no answer arrived within budget; the turn may be wedged.").not.toBeNull();
