@@ -414,6 +414,13 @@ import {
   type StatusPinPersistOp,
   type TrackedStatusPin,
 } from './status-pin-store.js'
+import {
+  writeActivityCardRecord,
+  clearActivityCardRecord,
+  runActivityCardBootReaper,
+  restartOrphanCardFinalizeText,
+  type ActivityCardStoreFsSeam,
+} from './activity-card-store.js'
 import { driveEscalation } from './escalation-drive.js'
 import { shouldSuppressRepresent } from './represent-guard.js'
 import { shouldDeferEscalationForBridge } from './escalation-bridge-gate.js'
@@ -6030,6 +6037,22 @@ const statusPinStoreFs = {
 }
 const statusPinPersistEnabled = !STATIC && PIN_STATUS_WHILE_WORKING
 
+// Durable card-handle snapshot for the mid-turn activity card (Known Gap 1,
+// `reference/rfcs/deterministic-turn-liveness.md`). Persisted on card OPEN,
+// cleared on normal close/finalize; a boot-time reaper (wired alongside
+// `statusPinBootCleanup`, same startup-mutex ordering constraint) finalizes
+// any leftover record with one honest edit so a gateway restart mid-turn can
+// never leave the card frozen forever. STATIC mode skips disk (dry-run, no
+// durable volume) — same gate as the status-pin store.
+const ACTIVITY_CARD_STORE_PATH = join(STATE_DIR, 'activity-cards-pending.json')
+const activityCardStoreFs: ActivityCardStoreFsSeam = {
+  readFileSync: (p: string) => readFileSync(p, 'utf8'),
+  writeFileSync: (p: string, d: string) => writeFileSync(p, d),
+  renameSync: (a: string, b: string) => renameSync(a, b),
+  existsSync: (p: string) => existsSync(p),
+}
+const activityCardPersistEnabled = !STATIC
+
 // Slot-banner pin persistence (#421 crash-recovery). The slot banner is pinned
 // in the owner chat when the agent is on a non-default OAuth slot. Rather than a
 // parallel store + second boot hook, its pin is persisted in the SAME
@@ -6108,6 +6131,66 @@ async function statusPinBootCleanup(): Promise<void> {
     process.stderr.write(
       `telegram gateway: status-pin: cleared ${cleared}/${total} ` +
         `orphaned pin(s) from a prior session\n`,
+    )
+  }
+}
+/**
+ * Boot-time orphan-card reaper (Known Gap 1,
+ * `reference/rfcs/deterministic-turn-liveness.md`). Thin gateway wrapper over
+ * the pure `runActivityCardBootReaper` — binds the live fs seam, a real
+ * Telegram edit, and the gateway logger. Finalizes ANY card left open by a
+ * prior (crashed/restarted) session with ONE honest edit — never a new
+ * message, so no ping — and never re-attempts across boots (the pure routine
+ * deletes each record from disk before attempting its edit).
+ *
+ * MUST run ONLY after this gateway wins the startup mutex (the store is a
+ * shared per-agent file; a losing double-boot would finalize a card the
+ * still-alive holder's in-flight turn still legitimately owns) — identical
+ * ordering constraint to `statusPinBootCleanup`.
+ *
+ * Deliberately does NOT attempt to resume climbing the old card: the resumed
+ * turn (if any) opens its own fresh card. Honest finalization, not
+ * resumption, is the goal (see the module doc in activity-card-store.ts).
+ *
+ * After the finalizing edit, also unpins the card (every fresh card is
+ * silently pinned on open, `reconcileStatusPin('fg:'+key, …)`) — a frozen
+ * card that's ALSO still pinned is a worse orphan, glued to the top of the
+ * chat forever. Only attempted for a record with `pinned: true`.
+ */
+async function activityCardBootReaper(): Promise<void> {
+  if (!activityCardPersistEnabled) return
+  const { finalized, unpinned, total } = await runActivityCardBootReaper({
+    path: ACTIVITY_CARD_STORE_PATH,
+    fs: activityCardStoreFs,
+    finalizeCard: (record) =>
+      robustApiCall(
+        () =>
+          lockedBot.api.editMessageText(
+            record.chatId,
+            record.activityMessageId,
+            richMessage(restartOrphanCardFinalizeText(record.startedAt)),
+            {},
+          ),
+        {
+          chat_id: record.chatId,
+          ...(record.threadId != null ? { threadId: record.threadId } : {}),
+          verb: 'activity-card.boot-reap-finalize',
+        },
+      ),
+    unpinCard: (record) =>
+      robustApiCall(
+        () => lockedBot.api.unpinChatMessage(record.chatId, record.activityMessageId),
+        {
+          chat_id: record.chatId,
+          ...(record.threadId != null ? { threadId: record.threadId } : {}),
+          verb: 'activity-card.boot-reap-unpin',
+        },
+      ),
+  })
+  if (total > 0) {
+    process.stderr.write(
+      `telegram gateway: activity-card: finalized ${finalized}/${total}, ` +
+        `unpinned ${unpinned}/${total} orphaned card(s) from a prior session\n`,
     )
   }
 }
@@ -6416,6 +6499,7 @@ function ensureIssuesCard(chatId: string, threadId: number | undefined): void {
     // LOSING double-boot never unpins the live holder's legitimate pins.
     // Fire-and-forget: cleanup is best-effort and must not block boot.
     void statusPinBootCleanup()
+    void activityCardBootReaper()
   } catch (err) {
     process.stderr.write(
       `telegram gateway: boot.lock_acquire_failed err=${(err as Error).message} agent=${SWITCHROOM_AGENT_NAME}\n`,
@@ -6432,6 +6516,7 @@ function ensureIssuesCard(chatId: string, threadId: number | undefined): void {
       // successful writePidFile here means no live holder was detected, so
       // running orphan cleanup is consistent with the pre-mutex behaviour.
       void statusPinBootCleanup()
+      void activityCardBootReaper()
     } catch (writeErr) {
       process.stderr.write(`telegram gateway: writePidFile failed: ${writeErr}\n`)
     }
@@ -12537,6 +12622,25 @@ async function drainActivitySummary(
           )
           turn.activityMessageId = sent.message_id
           turn.activityEverOpened = true
+          // Known Gap 1 (deterministic-turn-liveness.md) — persist the
+          // minimal card handle the moment it opens, so a gateway restart
+          // mid-turn has something to finalize on next boot instead of
+          // leaving this card frozen forever. Fire-and-forget/best-effort:
+          // a failed persist degrades to the pre-fix (in-memory-only)
+          // behaviour, never blocks the card opening.
+          if (activityCardPersistEnabled) {
+            writeActivityCardRecord(ACTIVITY_CARD_STORE_PATH, activityCardStoreFs, {
+              turnKey: statusKey(chat, thread),
+              chatId: chat,
+              threadId: thread ?? null,
+              activityMessageId: sent.message_id,
+              startedAt: turn.startedAt,
+              // The OPEN below unconditionally silently-pins the fresh card
+              // (`reconcileStatusPin('fg:'+key, …)`) — mirror that here so
+              // the boot reaper knows to unpin it too, not just finalize it.
+              pinned: true,
+            })
+          }
           // Status-pin: the per-turn status message just opened — it's the
           // in-flight "what it's doing" surface. Silently pin it so the turn
           // stays in view when the feed scrolls past. Keyed to the same
@@ -12877,6 +12981,17 @@ function clearActivitySummary(turn: CurrentTurn, finalHtmlOverride?: string | nu
     if (turn.activityMessageId == null) return
     const id = turn.activityMessageId
     turn.activityMessageId = null
+    // Known Gap 1 (deterministic-turn-liveness.md) — the card is closing
+    // normally (about to be deleted or finalized below), so drop its durable
+    // handle too: a normal close must never leave a stale record for the
+    // boot reaper to "finalize" a message that's already been handled.
+    if (activityCardPersistEnabled) {
+      clearActivityCardRecord(
+        ACTIVITY_CARD_STORE_PATH,
+        activityCardStoreFs,
+        statusKey(chat, thread),
+      )
+    }
     if (CLEAR_STATUS_ON_COMPLETION) {
       try {
         await robustApiCall(

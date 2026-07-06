@@ -1,0 +1,255 @@
+/**
+ * activity-card-store.ts — durable handle for the mid-turn activity card, so a
+ * gateway restart mid-turn can finalize the orphaned card instead of leaving it
+ * frozen forever.
+ *
+ * Why this exists (reference/rfcs/deterministic-turn-liveness.md Known Gap 1):
+ * `CurrentTurn.activityMessageId` / `startedAt` and the live `currentTurn`
+ * itself live ONLY in gateway memory. If the gateway restarts while a turn's
+ * activity card is open, the new process has no handle to the old card — it
+ * is never edited again and sits frozen on its last pre-restart text forever.
+ * The resumed turn (if any) opens a FRESH card; the old one is orphaned.
+ *
+ * The fix mirrors `status-pin-store.ts` byte-for-byte in shape: a tiny durable
+ * snapshot on the per-agent state volume (STATE_DIR), written whenever a card
+ * OPENS, cleared the moment it closes/finalizes normally. On boot, AFTER this
+ * gateway wins the startup mutex (same ordering constraint as the status-pin
+ * cleanup — this is a shared per-agent file, so a losing double-boot must
+ * never touch it), a one-shot reaper reads any leftover record and finalizes
+ * the orphaned card with a SINGLE honest edit (never a new message — edits do
+ * not notify, so no ping). We do NOT attempt to resume climbing the old card
+ * across the restart; the resumed turn (if any) owns a fresh card. Honest
+ * finalization — not resumption — is the goal.
+ *
+ * Crash-safety: write-tmp + atomic rename (identical convention to
+ * status-pin-store.ts / obligation-store.ts). A corrupt or unreadable file
+ * fails open to `[]` — never crashes boot, worst case an orphan isn't cleaned
+ * up this boot, no worse than pre-fix behaviour.
+ *
+ * Idempotency: the reaper deletes a record from the on-disk store BEFORE
+ * attempting its finalizing edit (not after), so a crash mid-reap, or a
+ * second boot re-reading the file, can never double-edit the same message. A
+ * failed edit (message already deleted, chat gone, etc.) is swallowed — the
+ * record is already gone from disk regardless of whether the edit itself
+ * succeeded.
+ */
+
+export interface ActivityCardStoreFsSeam {
+  readFileSync: (path: string) => string
+  writeFileSync: (path: string, data: string) => void
+  /** Atomic same-dir replace (POSIX rename) so a crash mid-write can't tear
+   *  the snapshot. */
+  renameSync: (from: string, to: string) => void
+  existsSync: (path: string) => boolean
+}
+
+/** One persisted card handle: enough to identify and finalize the orphaned
+ *  Telegram message on a future boot, without any live turn state. */
+export interface ActivityCardRecord {
+  /** Stable per-topic key (`statusKey(chatId, threadId)` shape) — also the
+   *  upsert key: a fresh OPEN for the same topic replaces any stale row. */
+  turnKey: string
+  chatId: string
+  threadId: number | null
+  activityMessageId: number
+  /** Wall-clock ms the turn started — carried through so the finalize text
+   *  can be honest about elapsed time even after a restart. */
+  startedAt: number
+  /** Whether this card was silently pinned when it opened (the gateway pins
+   *  every fresh activity card via `reconcileStatusPin('fg:'+turnKey, …)`).
+   *  The boot reaper must unpin it too — a frozen card that's ALSO still
+   *  pinned is a worse orphan (it stays glued to the top of the chat
+   *  forever). Optional so a v1-shape record (pre-unpin-tracking) still
+   *  loads and degrades to "don't attempt an unpin", never a crash. */
+  pinned?: boolean
+}
+
+interface SnapshotEnvelope {
+  v: 1
+  cards: ActivityCardRecord[]
+}
+
+function isCardRow(x: unknown): x is ActivityCardRecord {
+  if (x == null || typeof x !== 'object') return false
+  const o = x as Record<string, unknown>
+  return (
+    typeof o.turnKey === 'string' &&
+    o.turnKey.length > 0 &&
+    typeof o.chatId === 'string' &&
+    o.chatId.length > 0 &&
+    (o.threadId === null || typeof o.threadId === 'number') &&
+    typeof o.activityMessageId === 'number' &&
+    typeof o.startedAt === 'number' &&
+    (o.pinned === undefined || typeof o.pinned === 'boolean')
+  )
+}
+
+/**
+ * Load the persisted card-handle set. Returns [] on a missing, unreadable, or
+ * malformed file — fail-open, never throws.
+ */
+export function loadActivityCards(
+  path: string,
+  fs: ActivityCardStoreFsSeam,
+): ActivityCardRecord[] {
+  if (!fs.existsSync(path)) return []
+  let raw = ''
+  try {
+    raw = fs.readFileSync(path)
+  } catch {
+    return []
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return []
+  }
+  if (parsed == null || typeof parsed !== 'object') return []
+  const env = parsed as Record<string, unknown>
+  if (env.v !== 1 || !Array.isArray(env.cards)) return []
+  return env.cards.filter(isCardRow)
+}
+
+/**
+ * Persist the card-handle set atomically (write sibling tmp → rename). Never
+ * throws — a write failure is logged and the store degrades to in-memory-only
+ * for this process (same contract as `status-pin-store.ts`).
+ */
+export function persistActivityCards(
+  path: string,
+  fs: ActivityCardStoreFsSeam,
+  snapshot: readonly ActivityCardRecord[],
+  log: (line: string) => void = (l) => process.stderr.write(l),
+): void {
+  const env: SnapshotEnvelope = { v: 1, cards: [...snapshot] }
+  const tmp = path + '.tmp'
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(env))
+    fs.renameSync(tmp, path)
+  } catch (err) {
+    log(
+      `activity-card-store: persist FAILED path=${path}: ${(err as Error).message} — ` +
+        `durability degraded to in-memory\n`,
+    )
+  }
+}
+
+/**
+ * Upsert the card-handle row for `turnKey` (replacing any stale row for the
+ * same topic — e.g. a prior turn's card that was never cleared). Called the
+ * moment a card OPENs (activityMessageId transitions null → set).
+ */
+export function writeActivityCardRecord(
+  path: string,
+  fs: ActivityCardStoreFsSeam,
+  record: ActivityCardRecord,
+  log: (line: string) => void = (l) => process.stderr.write(l),
+): void {
+  const current = loadActivityCards(path, fs)
+  const others = current.filter((c) => c.turnKey !== record.turnKey)
+  persistActivityCards(path, fs, [...others, record], log)
+}
+
+/**
+ * Remove the card-handle row for `turnKey`, if present. Called the moment a
+ * card closes/finalizes normally (clearActivitySummary), and by the boot
+ * reaper (BEFORE attempting the finalizing edit — the idempotency guard).
+ */
+export function clearActivityCardRecord(
+  path: string,
+  fs: ActivityCardStoreFsSeam,
+  turnKey: string,
+  log: (line: string) => void = (l) => process.stderr.write(l),
+): void {
+  const current = loadActivityCards(path, fs)
+  if (current.length === 0) return
+  const next = current.filter((c) => c.turnKey !== turnKey)
+  if (next.length === current.length) return
+  persistActivityCards(path, fs, next, log)
+}
+
+/**
+ * Boot-time orphan reaper, extracted as a pure routine over injected seams
+ * (mirrors `runStatusPinBootCleanup`). The gateway's thin wrapper binds the
+ * live fs, a Telegram edit call, and the logger.
+ *
+ * CRITICAL ordering, identical constraint to the status-pin cleanup: the
+ * caller MUST only invoke this AFTER winning the startup mutex. The store is
+ * a shared per-agent file; a losing double-boot running this would finalize
+ * cards the still-alive holder's in-flight turn still legitimately owns.
+ *
+ * Deletes each record from disk BEFORE attempting its edit/unpin (not
+ * after), so a crash mid-reap, or a second boot re-reading the file, can
+ * never re-finalize (and thus never double-edit, never double-unpin) the
+ * same message. `finalizeCard` / `unpinCard` failures (message already
+ * deleted, chat unreachable, permissions changed, already-unpinned, etc.)
+ * are swallowed — non-fatal, logged, and never re-attempted since the
+ * record is already gone.
+ *
+ * Unpin runs AFTER the finalizing edit, only for a record with `pinned:
+ * true` (a v1-shape record with no `pinned` field is left un-unpinned —
+ * conservative degrade, not a crash), and its failure is independent of the
+ * edit's outcome (an edit failure — e.g. message already deleted — must not
+ * skip the unpin attempt, since Telegram allows unpinning a deleted
+ * message's id to no-op harmlessly, and conversely an unpin failure must
+ * never re-attempt the edit).
+ */
+export async function runActivityCardBootReaper(args: {
+  path: string
+  fs: ActivityCardStoreFsSeam
+  finalizeCard: (record: ActivityCardRecord) => Promise<unknown>
+  unpinCard: (record: ActivityCardRecord) => Promise<unknown>
+  log?: (line: string) => void
+}): Promise<{ finalized: number; unpinned: number; total: number }> {
+  const log = args.log ?? ((l: string) => process.stderr.write(l))
+  const persisted = loadActivityCards(args.path, args.fs)
+  if (persisted.length === 0) return { finalized: 0, unpinned: 0, total: 0 }
+  let finalized = 0
+  let unpinned = 0
+  for (const record of persisted) {
+    // Delete BEFORE attempting the edit/unpin — the idempotency guard. If the
+    // gateway crashes here, or a second boot re-reads the file, this record
+    // no longer exists on disk, so it can never be finalized or unpinned
+    // twice.
+    clearActivityCardRecord(args.path, args.fs, record.turnKey, log)
+    try {
+      await args.finalizeCard(record)
+      finalized++
+    } catch (err) {
+      log(
+        `activity-card-store: boot reaper finalize failed ` +
+          `(chat=${record.chatId} msg=${record.activityMessageId}): ` +
+          `${(err as Error).message}\n`,
+      )
+    }
+    if (record.pinned) {
+      try {
+        await args.unpinCard(record)
+        unpinned++
+      } catch (err) {
+        log(
+          `activity-card-store: boot reaper unpin failed ` +
+            `(chat=${record.chatId} msg=${record.activityMessageId}): ` +
+            `${(err as Error).message}\n`,
+        )
+      }
+    }
+  }
+  return { finalized, unpinned, total: persisted.length }
+}
+
+/**
+ * Honest finalize text for an orphaned card — the single edit the boot
+ * reaper applies. Mirrors `silentEndFallbackText`'s honesty-about-elapsed
+ * convention (`telegram-plugin/silent-end.ts`): degenerate/unknown durations
+ * omit the elapsed clause rather than printing a nonsensical "(0s)".
+ */
+export function restartOrphanCardFinalizeText(startedAt: number): string {
+  const elapsedMs = Date.now() - startedAt
+  const elapsed =
+    Number.isFinite(elapsedMs) && elapsedMs > 0
+      ? ` (was running ${Math.round(elapsedMs / 1000)}s)`
+      : ''
+  return `⚠️ Interrupted by a gateway restart${elapsed} — this turn did not finish.`
+}

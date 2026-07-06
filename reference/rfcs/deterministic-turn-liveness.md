@@ -317,11 +317,29 @@ on tick".
 
 ### Known gaps (out of scope, not closed by this RFC)
 
-1. **Restart mid-turn.** The climb's card handle (`activityMessageId`)
-   and the current-turn state live in gateway memory; a gateway restart
-   mid-turn permanently freezes the pre-restart card — the new process
-   has no handle to resume editing it. The resumed turn opens a fresh
-   card; the old one is never finalized.
+1. ~~**Restart mid-turn.**~~ **Closed** by a follow-up PR
+   (`telegram-plugin/gateway/activity-card-store.ts` + gateway wiring in
+   `telegram-plugin/gateway/gateway.ts`). Deterministic guarantee added: no
+   card orphaned by a gateway restart stays visually frozen (or pinned) —
+   it is finalized with one honest edit, and unpinned, on the very next
+   boot. The minimal card handle (chatId, threadId, activityMessageId,
+   startedAt, pinned) is persisted to `TELEGRAM_STATE_DIR/activity-cards-
+   pending.json` the moment a card OPENs and cleared the moment it closes
+   normally — mirroring `status-pin-store.ts`'s durable-snapshot shape
+   byte-for-byte. On boot, after winning the startup mutex (same ordering
+   constraint as `statusPinBootCleanup`), a one-shot, model-free reaper
+   reads any leftover record, deletes it from disk BEFORE attempting its
+   edit/unpin (the idempotency guard — a second boot performs zero edits
+   and zero unpins), and finalizes the orphaned card with a single
+   `editMessageText` (never a new message — no ping) plus an
+   `unpinChatMessage` for cards that were pinned on open. The resumed turn
+   (if any) is NOT made to resume climbing the old card — it opens its own
+   fresh card; honest finalization, not resumption, was the goal. Scoped
+   out: the standalone worker-activity-feed's `messageId` (a separate,
+   lower-traffic surface — `WorkerActivityFeed` doesn't carry per-turn
+   liveness semantics the same way, and folding it in would double this
+   PR's surface area for a rarer failure mode); left for a follow-up if it
+   proves to matter in practice.
 2. ~~**Worktree-isolated sub-agents.**~~ **Closed** by a follow-up PR
    (`telegram-plugin/subagent-watcher.ts` `extraWatchCwdsProvider` +
    `telegram-plugin/gateway/gateway.ts` wiring against
