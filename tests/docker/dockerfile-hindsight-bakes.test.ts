@@ -127,6 +127,55 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
+  it("keeps the #2392 claude_code env-isolation patch (assert-guarded, fail-loud)", () => {
+    // The #2392 build-time patch neutralizes upstream's env isolation
+    // (mkdtemp CONFIG_DIR + SECURESTORAGE="") that breaks file-based
+    // creds. It is self-verifying: it asserts the upstream anchor is
+    // present before patching. Guard the patch block itself so nobody
+    // silently deletes it.
+    expect(dockerfile).toMatch(
+      /assert OLD_PATH in s, "switchroom #2392 patch:/,
+    );
+    expect(dockerfile).toMatch(
+      /path = "\/run\/claude-creds"  # switchroom #2392:/,
+    );
+  });
+
+  it("keeps the max_turns/ToolSearch standard-call fix (assert-guarded, fail-loud)", () => {
+    // The STANDARD LLM-call path in claude_code_llm.py builds
+    // ClaudeAgentOptions with allowed_tools=[] but WITHOUT tools=[], so
+    // the built-in CLI tools stay loaded and ToolSearch burns the single
+    // max_turns=1 turn → "Reached maximum number of turns (1)" → wasted
+    // retries / failed memory ops. This build-time patch brings the
+    // standard path to parity with the tool-calling path (tools=[] +
+    // max_turns=2). It is self-verifying (asserts the anchor exists once
+    // before patching, re-asserts the result). Guard the patch block so
+    // nobody silently deletes it and reintroduces the max_turns wall.
+
+    // The exact-once assert on the pre-patch anchor (fail-loud on drift).
+    expect(dockerfile).toMatch(
+      /assert s\.count\(OLD\) == 1, "switchroom max_turns\/ToolSearch standard-call fix:/,
+    );
+    // The OLD anchor reconstructs the upstream (pre-patch) standard-call shape.
+    expect(dockerfile).toMatch(
+      /max_turns=1,  # Single-turn for API-style interactions/,
+    );
+    // The NEW replacement adds tools=[] + max_turns=2 on the standard path.
+    expect(dockerfile).toMatch(
+      /tools=\[\],  # switchroom: disable built-in CLI tools so ToolSearch/,
+    );
+    expect(dockerfile).toMatch(
+      /max_turns=2,  # switchroom: headroom so a stray ToolSearch turn/,
+    );
+    // Post-replace re-assertions must be present (verification-on-build).
+    expect(dockerfile).toMatch(
+      /assert "            tools=\[\],  # switchroom" in t,/,
+    );
+    expect(dockerfile).toMatch(
+      /assert "max_turns=1,  # Single-turn" not in t,/,
+    );
+  });
+
   it("preserves upstream's start-all.sh as the post-shim CMD", () => {
     // The shim does broker auth, then `exec "$@"` which is whatever
     // CMD docker passes — must be upstream's start-all.sh so the
