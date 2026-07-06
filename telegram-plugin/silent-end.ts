@@ -49,6 +49,17 @@ export interface SilentEndDeps {
   stateDir?: string
   /** stderr writer (defaults to `process.stderr.write`). */
   log?: (line: string) => void
+  /**
+   * Has a genuine assistant reply been delivered to this chat (optionally
+   * scoped to thread) at or after `sinceMs`? Same predicate shape as
+   * `history.hasOutboundDeliveredSince` / the represent-guard's dep
+   * (`gateway/represent-guard.ts`) — injected here so the exhaustion check
+   * below is a pure, testable decision. When omitted (history unavailable,
+   * or callers that don't wire it), the check is skipped and the guard
+   * falls back to the pre-existing turnKey/retryCount bookkeeping only —
+   * never suppress on doubt.
+   */
+  hasOutboundDeliveredSince?: (chatId: string, sinceMs: number, threadId?: number | null) => boolean
 }
 
 /**
@@ -255,6 +266,34 @@ export function recordSilentTurnEnd(
     prev.turnKey === args.turnKey &&
     prev.retryCount >= SILENT_END_MAX_RETRIES
   ) {
+    // Staleness guard (mirrors the represent-guard's #2472 fix,
+    // `gateway/represent-guard.ts:shouldSuppressRepresent`): `turnKey` here
+    // is `statusKey(chatId, threadId)` — stable across every turn on the
+    // same chat/thread, NOT a per-turn nonce (unlike the obligation
+    // ledger's `originTurnId`). The whole mechanism depends on a reply
+    // ALWAYS clearing this state file via `clearSilentEndState` at the
+    // send-site. `clearSilentEndState` is fail-silent by design (state
+    // corruption / a write race must never crash the gateway), so if a
+    // clear is ever missed, a stale `retryCount >= MAX_RETRIES` record
+    // from an OLD, already-answered turn would be misread as "this
+    // brand-new dark turn already exhausted its re-prompt budget" —
+    // firing the user-facing fallback immediately, without the turn ever
+    // going through the Stop-hook re-prompt ladder. Before trusting that
+    // reading, verify against real delivery history: has a genuine reply
+    // landed on this chat/thread since the stale record was last written?
+    // If so, the record is satisfied-but-misdetected — drop it silently
+    // and let this dark turn start its OWN fresh retry cycle instead of
+    // inheriting someone else's spent budget.
+    if (deps?.hasOutboundDeliveredSince?.(args.chatId, prev.timestamp, args.threadId)) {
+      emitLog(
+        deps,
+        `silent-end: stale exhausted record for turnKey=${args.turnKey} ` +
+          `(retryCount=${prev.retryCount}) but a reply was delivered since ` +
+          `${prev.timestamp} — treating as satisfied-but-misdetected, not exhausted\n`,
+      )
+      writeSilentEndState(args, deps)
+      return { exhausted: false }
+    }
     clearSilentEndState(args.turnKey, deps)
     emitLog(
       deps,

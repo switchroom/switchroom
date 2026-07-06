@@ -171,7 +171,7 @@ import { decideSilentReplyAnchor } from '../silent-reply-anchor.js'
 import { classifyInbound } from '../inbound-classifier.js'
 import * as silencePoke from '../silence-poke.js'
 import * as pendingProgress from '../pending-work-progress.js'
-import { writeSilentEndState, clearSilentEndState, recordUndeliveredTurnEnd } from '../silent-end.js'
+import { writeSilentEndState, clearSilentEndState, recordUndeliveredTurnEnd, type SilentEndDeps } from '../silent-end.js'
 import { isFinalAnswerReply, isSubstantiveFinalReply, FINAL_ANSWER_MIN_CHARS } from '../final-answer-detect.js'
 import { deriveTurnRole, decideTerminalReason, parsePostAnswerLivenessMs, evaluatePostAnswerLiveness, type LoopRole } from '../turn-liveness-floor.js'
 import { createAnswerStream, type AnswerStreamHandle } from '../answer-stream.js'
@@ -257,9 +257,20 @@ const REPLY_TO_TEXT_MAX = 200
  * has already been exhausted. Without this the user only sees the
  * progress card vanish; silence must never be the failure mode.
  */
-const SILENT_END_FALLBACK_TEXT =
-  '⚠️ The agent finished working but didn’t send a reply — your last ' +
-  'message may not have been answered. Please try asking again.'
+function silentEndFallbackText(turnDurationMs: number | undefined): string {
+  // reference/rfcs/deterministic-turn-liveness.md Phase 2 hardening: include
+  // the turn's elapsed so the fallback is honest about how long the user
+  // actually waited, instead of a generic apology with no timing.
+  const elapsed =
+    typeof turnDurationMs === 'number' && Number.isFinite(turnDurationMs) && turnDurationMs >= 0
+      ? ` (waited ${Math.round(turnDurationMs / 1000)}s)`
+      : ''
+  return (
+    '⚠️ The agent finished working but didn’t send a reply' +
+    elapsed +
+    ' — your last message may not have been answered. Please try asking again.'
+  )
+}
 import { splitMarkdownChunks, hardSliceToCap, repairEscapedWhitespace, normalizeParagraphBreaks, addParagraphSpacers, normalizePunctuation, stripExcessBold, escapeMarkdown, hardenCardBreaks, RICH_MESSAGE_MAX_CHARS } from '../format.js'
 import { richMessage } from '../rich-send.js'
 import { scrubVoice } from '../text-voice-scrub.js'
@@ -14483,11 +14494,27 @@ function handleSessionEvent(ev: SessionEvent): void {
         // this path. The turn-flush 'flush' branch also returns earlier
         // (and sets finalAnswerDelivered=true defensively).
         if (turn.finalAnswerDelivered === false) {
-          const silentEnd = recordUndeliveredTurnEnd({
-            chatId,
-            threadId: threadId ?? null,
-            turnKey: tKey,
-          })
+          // #2xxx Phase 2 hardening: wire the represent-guard-style staleness
+          // check (`recordSilentTurnEnd`'s `hasOutboundDeliveredSince` dep) so
+          // an exhausted-looking record left over from a PRIOR, already-
+          // answered turn on this same chat/thread (statusKey is not a
+          // per-turn nonce) can never be misread as this turn's spent
+          // re-prompt budget. Falls back to the pre-existing turnKey/
+          // retryCount-only check when history is unavailable.
+          const silentEndDeps: SilentEndDeps | undefined = HISTORY_ENABLED
+            ? {
+                hasOutboundDeliveredSince: (cid, sinceMs, tid) =>
+                  hasOutboundDeliveredSince(cid, sinceMs, tid, 1),
+              }
+            : undefined
+          const silentEnd = recordUndeliveredTurnEnd(
+            {
+              chatId,
+              threadId: threadId ?? null,
+              turnKey: tKey,
+            },
+            silentEndDeps,
+          )
           if (silentEnd.exhausted) {
             process.stderr.write(
               `telegram gateway: WARN silent-end fallback — agent stayed ` +
@@ -14499,7 +14526,7 @@ function handleSessionEvent(ev: SessionEvent): void {
               (tid) =>
                 bot.api.sendMessage(
                   chatId,
-                  SILENT_END_FALLBACK_TEXT,
+                  silentEndFallbackText(turnDurationMs),
                   tid != null ? { message_thread_id: tid } : {},
                 ),
               { threadId, chat_id: chatId, verb: 'silent-end-fallback.sendMessage' },
