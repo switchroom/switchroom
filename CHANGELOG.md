@@ -1,5 +1,51 @@
 # Changelog
 
+## v0.17.9 — Agents curate their own memory: mental-model-curator skill + permanent Hindsight port-collision fix
+
+Ships the user-facing counterpart to v0.17.8's Phase 5 mental-model machinery —
+a default-on skill that lets an agent survey its own memory and *propose*
+curated mental models — and permanently closes the Hindsight host-port
+collision that could take fleet memory down silently.
+
+### mental-model-curator bundled skill — default-on (#2883)
+
+Adds a new **default-on** bundled skill, `mental-model-curator`, that has an
+agent use its most capable model to review its **own** Hindsight memory bank and
+**propose** well-formed mental models ("knowledge models") to the operator
+through the approve/deny proposal card — never blindly self-creating them.
+Because each mental model carries real recall/reflect (and optional
+post-consolidation) cost, every candidate is routed through
+`mcp__switchroom-telegram__mental_model_propose` so a human ratifies it; agents
+cannot self-approve, by design. The `SKILL.md` teaches a disciplined workflow:
+check `get_bank_stats` and **stop on an empty/thin bank** (it synthesizes to
+confident noise), read existing models and **semantically dedupe** (the propose
+flow only hard-rejects exact-name dupes), survey recurring themes via
+`reflect`/`recall` and cluster them into standing questions the bank actually
+backs, and frame each `source_query` as a **domain** question — never identity /
+"who is the user" (identity lives in profile banks; an identity model is
+explicitly forbidden after it caused a wrong-fact contradiction bug).
+`refresh_after_consolidation` defaults **off** and models stay tight. This turns
+the v0.17.8 Phase 5 propose/approve plumbing into an ability agents actually
+reach for.
+
+### Permanent Hindsight port-collision fix + fresh-install/upgrade hardening (#2885)
+
+`switchroom-hindsight` runs `--network host` and binds `HINDSIGHT_API_PORT`
+directly on the host, so the launcher could hand an **already-occupied** host
+port to `docker run` and then silently crash-loop — fleet memory goes down
+invisibly because a failing auto-recall surfaces no user-facing error. In the
+field this crash-looped ~72× (`[Errno 98] address already in use: 8888`) with
+memory silently down for ~9h, because the old **default port 8888** collided
+with a host `nginx-tunnel-gateway` publishing `127.0.0.1:8888:80`, and because
+the `--recreate` path reused the previously-published port via
+`getRunningHindsightPorts()` without any free-check. Fixes:
+**default API port 8888 → 18888** (`HINDSIGHT_DEFAULT_API_PORT`; UI stays 9999),
+`pickHindsightPorts()` no longer prefers the contended 8888, the recreate path
+now runs the free-check instead of blindly rebinding the old port, plus a **loud
+preflight** and a **memory-down health check** so a bind failure is visible
+instead of silent — all covered by new regression tests. Internal reliability;
+no config change required on upgrade.
+
 ## v0.17.8 — Hindsight synthesis layers complete: specialized banks + curated mental models
 
 Closes out the Hindsight synthesis-layers RFC
