@@ -212,6 +212,24 @@ export interface SubagentWatcherConfig {
    */
   agentCwd?: string
   /**
+   * Additional cwds (beyond `agentCwd`) whose Claude-Code project-dir slug
+   * should also be watched. Gap 2 of `deterministic-turn-liveness.md`: a
+   * sub-agent dispatched with worktree isolation (`switchroom worktree
+   * claim`) runs with a *different* cwd than the parent agent, so its
+   * `agent-*.jsonl` lands under a different `.claude/projects/<slug>/`
+   * tree than `expectedProjectSlug` — the #1116 foreign-slug filter then
+   * silently skips it forever (no activity stamp, no `🛠 Worker` feed).
+   *
+   * Called fresh on every rescan tick (cheap — reads a handful of small
+   * JSON records from the worktree registry) so a worktree claimed or
+   * released mid-run is picked up/dropped without a watcher restart.
+   * Deterministic guarantee this preserves: only cwds this agent's own
+   * sub-agents can legitimately run in are ever added — a worktree record
+   * not owned by this agent is never included, so this does not widen the
+   * #1116 foreign-project protection into a wildcard watch.
+   */
+  extraWatchCwdsProvider?: () => string[]
+  /**
    * How often to re-scan for new subagent dirs (ms). Default 1000.
    */
   rescanMs?: number
@@ -1173,6 +1191,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
   const expectedProjectSlug = config.agentCwd != null
     ? sanitizeCwdToProjectName(config.agentCwd)
     : null
+  const extraWatchCwdsProvider = config.extraWatchCwdsProvider ?? null
   // One-shot logging: warn the first time a foreign slug is observed
   // so silent regressions are visible without re-running with debug.
   const warnedForeignSlugs = new Set<string>()
@@ -1706,11 +1725,32 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       projectDirs = fs.readdirSync(projectsRoot) as string[]
     } catch { return }
 
+    // Gap 2 (deterministic-turn-liveness.md): re-derive the set of
+    // worktree-isolated slugs this agent's own sub-agents may legitimately
+    // run in, fresh on every tick. Best-effort — a registry read hiccup
+    // (e.g. the worktree dir not existing on an agent that never uses
+    // worktrees) must never break the tail loop, so it just yields no
+    // extra slugs for this tick.
+    let allowedSlugs: Set<string> | null = null
+    if (expectedProjectSlug != null) {
+      allowedSlugs = new Set([expectedProjectSlug])
+      if (extraWatchCwdsProvider != null) {
+        try {
+          for (const cwd of extraWatchCwdsProvider()) {
+            allowedSlugs.add(sanitizeCwdToProjectName(cwd))
+          }
+        } catch (err) {
+          log?.(`subagent-watcher: extraWatchCwdsProvider error: ${(err as Error).message}`)
+        }
+      }
+    }
+
     for (const pDir of projectDirs) {
-      // Issue #1116: filter to the agent's own slug. Skip foreign
-      // project dirs so their stale subagent JSONLs (which Claude
-      // Code reaps mid-session) don't pollute the watcher's registry.
-      if (expectedProjectSlug != null && pDir !== expectedProjectSlug) {
+      // Issue #1116: filter to the agent's own slug (plus, per Gap 2, any
+      // worktree-isolated slugs this agent's own sub-agents may run in).
+      // Skip foreign project dirs so their stale subagent JSONLs (which
+      // Claude Code reaps mid-session) don't pollute the watcher's registry.
+      if (allowedSlugs != null && !allowedSlugs.has(pDir)) {
         if (!warnedForeignSlugs.has(pDir)) {
           warnedForeignSlugs.add(pDir)
           log?.(`subagent-watcher: skipping foreign project dir ${pDir} (expected ${expectedProjectSlug})`)

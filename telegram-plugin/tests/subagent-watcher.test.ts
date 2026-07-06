@@ -1296,6 +1296,145 @@ describe('startSubagentWatcher', () => {
     })
   })
 
+  // ─── deterministic-turn-liveness.md Known-Gap 2 — worktree-isolated sub-agents ──
+
+  describe('worktree-isolated sub-agent visibility (turn-liveness Known Gap 2)', () => {
+    /**
+     * A sub-agent dispatched with `switchroom worktree claim` runs under a
+     * different cwd than the parent agent, so Claude Code mints a
+     * *different* `.claude/projects/<slug>/` tree for it. Pre-fix, the
+     * #1116 foreign-slug filter above skips that slug forever — no
+     * activity stamp, no `🛠 Worker` feed, for the whole worktree worker's
+     * run. `extraWatchCwdsProvider` closes that gap: any cwd it returns is
+     * treated as a first-class watched slug, same as `agentCwd`.
+     */
+
+    let tmpRoot = ''
+    const startedWatchers: Array<{ stop(): void }> = []
+
+    beforeEach(() => {
+      tmpRoot = mkdtempSync(join(tmpdir(), 'switchroom-watcher-worktree-gap2-'))
+    })
+
+    afterEach(() => {
+      while (startedWatchers.length) {
+        try { startedWatchers.pop()?.stop() } catch { /* ignore */ }
+      }
+      try { rmSync(tmpRoot, { recursive: true, force: true }) } catch { /* ignore */ }
+    })
+
+    function startWatcherSync(opts: {
+      agentDir: string
+      agentCwd?: string
+      extraWatchCwdsProvider?: () => string[]
+    }): {
+      logs: string[]
+      poll: () => void
+      watcher: ReturnType<typeof startSubagentWatcher>
+    } {
+      const logs: string[] = []
+      const intervals: Array<{ fn: () => void; ref: number }> = []
+      let nextRef = 1
+      const watcher = startSubagentWatcher({
+        agentDir: opts.agentDir,
+        ...(opts.agentCwd !== undefined ? { agentCwd: opts.agentCwd } : {}),
+        ...(opts.extraWatchCwdsProvider !== undefined
+          ? { extraWatchCwdsProvider: opts.extraWatchCwdsProvider }
+          : {}),
+        stallThresholdMs: 60_000,
+        rescanMs: 500,
+        now: () => Date.now(),
+        setInterval: (fn) => {
+          const ref = nextRef++
+          intervals.push({ fn, ref })
+          return { ref }
+        },
+        clearInterval: () => {},
+        setTimeout: () => ({ ref: 0 }),
+        clearTimeout: () => {},
+        log: (msg) => logs.push(msg),
+      })
+      startedWatchers.push(watcher)
+      return { logs, poll: () => intervals[0]?.fn(), watcher }
+    }
+
+    it('watches a worktree-isolated cwd slug returned by extraWatchCwdsProvider', () => {
+      const agentDir = join(tmpRoot, 'agent')
+      const agentCwd = '/home/test/agent-own'
+      const worktreeCwd = '/home/test/.switchroom/worktrees/wt-abc123'
+      const ownSubagents = join(agentDir, '.claude', 'projects', '-home-test-agent-own', 'sess-A', 'subagents')
+      const worktreeSlug = join(
+        agentDir,
+        '.claude',
+        'projects',
+        '-home-test--switchroom-worktrees-wt-abc123',
+        'sess-B',
+        'subagents',
+      )
+      mkdirSync(ownSubagents, { recursive: true })
+      mkdirSync(worktreeSlug, { recursive: true })
+      writeFileSync(
+        join(ownSubagents, 'agent-ownworker.jsonl'),
+        buildJSONL(subAgentUserMsg('legit work')),
+      )
+      writeFileSync(
+        join(worktreeSlug, 'agent-worktreeworker.jsonl'),
+        buildJSONL(subAgentUserMsg('worktree-isolated work')),
+      )
+
+      // Pre-fix acceptance: without extraWatchCwdsProvider, the worktree
+      // slug is a "foreign" slug per #1116 and is skipped — this is the
+      // regression this test guards against.
+      const preFix = startWatcherSync({ agentDir, agentCwd })
+      preFix.poll()
+      expect(preFix.watcher.getRegistry().has('worktreeworker')).toBe(false)
+      preFix.watcher.stop()
+
+      const h = startWatcherSync({
+        agentDir,
+        agentCwd,
+        extraWatchCwdsProvider: () => [worktreeCwd],
+      })
+      h.poll()
+
+      const reg = h.watcher.getRegistry()
+      expect(reg.has('ownworker')).toBe(true)
+      expect(reg.has('worktreeworker')).toBe(true)
+    })
+
+    it('still skips a genuinely foreign project dir not returned by extraWatchCwdsProvider', () => {
+      const agentDir = join(tmpRoot, 'agent')
+      const agentCwd = '/home/test/agent-own'
+      const worktreeCwd = '/home/test/.switchroom/worktrees/wt-abc123'
+      const ownSubagents = join(agentDir, '.claude', 'projects', '-home-test-agent-own', 'sess-A', 'subagents')
+      const foreignSubagents = join(agentDir, '.claude', 'projects', '-home-test-agent-foreign', 'sess-C', 'subagents')
+      mkdirSync(ownSubagents, { recursive: true })
+      mkdirSync(foreignSubagents, { recursive: true })
+      writeFileSync(
+        join(ownSubagents, 'agent-ownworker.jsonl'),
+        buildJSONL(subAgentUserMsg('legit work')),
+      )
+      writeFileSync(
+        join(foreignSubagents, 'agent-foreignworker.jsonl'),
+        buildJSONL(subAgentUserMsg('a sibling agent, not a registered worktree')),
+      )
+
+      const h = startWatcherSync({
+        agentDir,
+        agentCwd,
+        // Registers a worktree cwd that is NOT the foreign dir above —
+        // proves extraWatchCwdsProvider adds only what it explicitly
+        // names, never a wildcard.
+        extraWatchCwdsProvider: () => [worktreeCwd],
+      })
+      h.poll()
+
+      const reg = h.watcher.getRegistry()
+      expect(reg.has('ownworker')).toBe(true)
+      expect(reg.has('foreignworker')).toBe(false)
+    })
+  })
+
   describe('issue #1116 — terminal cleanup must not re-fire completion (Bug B)', () => {
     /**
      * Pre-#1116: after `TERMINAL_CLEANUP_GRACE_MS` (30s) elapsed,
