@@ -109,6 +109,45 @@ assert NEW_PATH in t and OLD_SS not in t and 'mkdtemp(prefix="hindsight-claude-c
 print("switchroom #2392: claude_code env isolation neutralized (CLAUDE_CONFIG_DIR=/run/claude-creds, SECURESTORAGE override dropped)")
 PYEOF
 
+# max_turns/ToolSearch standard-call fix: the STANDARD (non-tool) LLM-call
+# path in claude_code_llm.py builds `ClaudeAgentOptions` with
+# `allowed_tools=[]` but WITHOUT `tools=[]`. Clearing allowed_tools does NOT
+# unload the built-in Claude Code CLI tools — they stay resident, so on a
+# plain text-generation call Claude burns its single `max_turns=1` turn on a
+# ToolSearch step and then errors with "Reached maximum number of turns (1)".
+# The provider retries, wasting tokens and intermittently failing memory ops
+# (fact extraction / recall). The TOOL-calling path further down the SAME
+# file already carries the correct shape (`tools=[]` + `max_turns=2`, with a
+# comment) — this patch brings the standard path to parity: drop the built-in
+# CLI tools entirely so ToolSearch can't fire, and give one turn of headroom
+# so a stray tool turn can't wall a tool-less generation. Anchored tightly on
+# the `# Single-turn for API-style interactions` comment so we touch ONLY the
+# standard path, never the tool-calling one. Self-verifying: the build FAILS
+# LOUDLY if upstream reformats this call, so we never silently ship the
+# regression.
+RUN python3 - <<'PYEOF'
+import pathlib
+f = pathlib.Path("/app/api/hindsight_api/engine/providers/claude_code_llm.py")
+s = f.read_text()
+OLD = (
+    "            max_turns=1,  # Single-turn for API-style interactions\n"
+    "            allowed_tools=[],  # Disable tools for standard LLM calls\n"
+)
+NEW = (
+    "            tools=[],  # switchroom: disable built-in CLI tools so ToolSearch can't consume the single turn (max_turns wall / wasted-retry fix)\n"
+    "            max_turns=2,  # switchroom: headroom so a stray ToolSearch turn can't wall a tool-less text-gen call\n"
+    "            allowed_tools=[],  # Disable tools for standard LLM calls\n"
+)
+assert s.count(OLD) == 1, "switchroom max_turns/ToolSearch standard-call fix: the standard-call ClaudeAgentOptions anchor (max_turns=1 # Single-turn for API-style interactions + allowed_tools=[]) was not found exactly once — upstream reformatted the standard-call ClaudeAgentOptions; re-author this patch in docker/Dockerfile.hindsight"
+s = s.replace(OLD, NEW, 1)
+f.write_text(s)
+t = f.read_text()
+assert NEW in t, "switchroom max_turns/ToolSearch standard-call fix: verification failed — patched block not present"
+assert "            tools=[],  # switchroom" in t, "switchroom max_turns/ToolSearch standard-call fix: tools=[] not present on the standard path after patch"
+assert "max_turns=1,  # Single-turn" not in t, "switchroom max_turns/ToolSearch standard-call fix: a bare max_turns=1 standard-call still remains after patch"
+print("switchroom max_turns/ToolSearch standard-call fix: standard LLM call now sends tools=[] + max_turns=2 (ToolSearch can no longer wall the turn)")
+PYEOF
+
 # Pin the upstream `hindsight` user to UID 11000 to match
 # `HINDSIGHT_DEFAULT_UID` in src/setup/hindsight.ts (and the
 # `auth.consumers[hindsight].uid` value the operator writes in

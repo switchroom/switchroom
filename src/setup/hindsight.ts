@@ -256,36 +256,40 @@ export const HINDSIGHT_DEFAULT_RECALL_MAX_CONCURRENT = 8;
 export const HINDSIGHT_DEFAULT_REFLECT_WALL_TIMEOUT_S = 600;
 
 /**
- * Consolidation throughput knobs (modest, reversible). Consolidation is
- * LLM-bound via the claude-code provider (observed ~510s/op), so a deep
- * backlog (e.g. after a stall) drains slowly. Two conservative levers:
+ * Consolidation throughput knobs — throttled HARD for shared-quota safety.
+ * Consolidation is LLM-bound via the claude-code provider (observed
+ * ~510s/op), and every concurrent op is a live claude (Sonnet) subprocess
+ * spending the subscription's quota.
  *
- * - LLM_BATCH_SIZE 8→12: more facts per LLM call → fewer round-trips per
- *   round, so less per-call overhead at ~the same total tokens. Kept
- *   modest (not 16+) to avoid diluting per-fact synthesis quality.
- * - CONSOLIDATION_MAX_SLOTS 2→3: one more bank consolidates concurrently,
- *   which matters during multi-bank backlog recovery. Kept to 3 (not
- *   higher) because every slot is a concurrent claude subprocess on the
- *   shared subscription — more would risk contending with the fleet's own
- *   model usage (subscription-honest). Both revert via the env vars.
+ * Since 2026-07-05 hindsight is UNPINNED (auth.consumers[hindsight] has no
+ * `account:`) — it follows the fleet-active account and shares the SAME
+ * live-turn quota the agents use. That makes the hard ceiling on concurrent
+ * model calls (MAX_SLOTS × LLM_PARALLELISM) a direct tax on the fleet: on
+ * 2026-07-06 an 18-way consolidation fan-out (3 × 6) across multiple banks
+ * exhausted the shared account (429 rate-limit wall) and starved live agent
+ * turns. Operator decision: hindsight keeps sharing the fleet's failover,
+ * but consolidation must NEVER be able to exhaust the quota — so the
+ * concurrency ceiling is throttled to 1 × 2 = 2 concurrent model calls
+ * (was 18), and per-round scope is cut so an op can't monopolise a slot for
+ * long.
  *
- * Two more (added after the 2026-06-19 backlog dig): these target a
- * single backed-up bank, where MAX_SLOTS doesn't help (slots parallelise
- * ACROSS banks, but the bottleneck is one bank's per-op rate). The hard
- * ceiling on concurrent model calls is MAX_SLOTS × LLM_PARALLELISM, so we
- * keep it fleet-safe: 3 × 6 = 18 (was 3 × 4 = 12), NOT a reckless
- * doubling that would starve the fleet's interactive model usage.
- * - LLM_PARALLELISM 4→6: more tag-groups consolidated concurrently WITHIN
- *   one op → faster per-op drain on a single bank.
- * - MAX_MEMORIES_PER_ROUND 100→300: a larger scope clears in one op
- *   instead of re-queuing, cutting per-op setup overhead.
- * Pairs with the 8g memory limit below (more in-flight consolidation =
- * more RSS). All operator-overridable via the generated compose / -e.
+ * - MAX_SLOTS 1: at most one bank consolidates at a time (no cross-bank
+ *   fan-out — that fan-out is exactly what walled the account).
+ * - LLM_PARALLELISM 2: at most two tag-groups in flight within that one op.
+ *   1 × 2 = 2 concurrent claude subprocesses, ceiling.
+ * - MAX_MEMORIES_PER_ROUND 100: bounded scope per op → faster slot release,
+ *   more re-queue points where the fleet can reclaim the quota.
+ * - LLM_BATCH_SIZE 12 (unchanged): facts per LLM call — tokens-per-call, not
+ *   concurrency, so it doesn't affect the shared-quota ceiling.
+ * Consolidation now drains slower by design; that is the accepted trade for
+ * never walling the live fleet. All values remain operator-overridable via
+ * the generated compose / -e (raise them only with a dedicated isolated
+ * account pinned back on the consumer).
  */
 export const HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE = 12;
-export const HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS = 3;
-export const HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM = 6;
-export const HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND = 300;
+export const HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS = 1;
+export const HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM = 2;
+export const HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND = 100;
 
 /**
  * Container resource caps (memory + pids only; CPU intentionally NOT capped).
