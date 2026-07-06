@@ -1,6 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import {
   isActivityFeedMessage,
+  isFrameworkFallbackText,
+  isLivenessCardMessage,
   isWorkerFeedMessage,
   WORKER_FEED_RE,
 } from "./assertions.js";
@@ -82,5 +84,72 @@ describe("isActivityFeedMessage", () => {
 
   it("does NOT match an empty message", () => {
     expect(isActivityFeedMessage(feed("   "))).toBe(false);
+  });
+
+  // The regression that silently broke the whole liveness-climb test wall
+  // (deterministic-turn-liveness.md Phase 4a): the climb card carries the
+  // two-line `renderActivityHeader`, which the pure-arrow predicate could
+  // never match — so it was classified as the answer and every climb test
+  // exited vacuously. isActivityFeedMessage must now recognise the header.
+  it("matches the Phase-1 climb card (two-line header + Working… body)", () => {
+    expect(
+      isActivityFeedMessage(feed("🤖 Agent\n12s · 0 tools\n→ Working…")),
+    ).toBe(true);
+    expect(
+      isActivityFeedMessage(feed("🤖 Agent\n2m05s · 0 tools\n→ Working…")),
+    ).toBe(true);
+  });
+
+  it("matches a headered narration card (header + narrated → step)", () => {
+    expect(
+      isActivityFeedMessage(feed("🤖 Agent\n18s · 2 tools\n✓ Checking the hostname\n→ Writing the file")),
+    ).toBe(true);
+  });
+});
+
+describe("isLivenessCardMessage", () => {
+  it("matches the climbing Working… card (running header)", () => {
+    expect(isLivenessCardMessage(feed("🤖 Agent\n12s · 0 tools\n→ Working…"))).toBe(true);
+    expect(isLivenessCardMessage(feed("🤖 Agent\n1m41s · 3 tools\n→ Working…"))).toBe(true);
+  });
+
+  it("matches the done header shape", () => {
+    expect(isLivenessCardMessage(feed("🤖 Agent\ndone · 3 tools · 41s\n✓ Ran the check"))).toBe(true);
+  });
+
+  it("matches a header with a description on line 1", () => {
+    expect(isLivenessCardMessage(feed("🤖 Agent · summarising the logs\n8s · 1 tool\n→ Working…"))).toBe(true);
+  });
+
+  it("does NOT match a plain reply", () => {
+    expect(isLivenessCardMessage(feed("done! I created the file and listed it."))).toBe(false);
+  });
+
+  it("does NOT match a reply that opens with an emoji but is prose", () => {
+    expect(
+      isLivenessCardMessage(feed("🤖 Agent here — I finished the task.\nAll four steps done.")),
+    ).toBe(false);
+  });
+
+  it("does NOT match when prose follows the header", () => {
+    expect(
+      isLivenessCardMessage(feed("🤖 Agent\n12s · 0 tools\nHere is your answer.")),
+    ).toBe(false);
+  });
+
+  it("does NOT match a bare single header line", () => {
+    expect(isLivenessCardMessage(feed("🤖 Agent"))).toBe(false);
+  });
+});
+
+describe("isFrameworkFallbackText", () => {
+  it("flags the mid-turn / dark-turn fallback wording", () => {
+    expect(isFrameworkFallbackText("⚠️ still working… (no update from agent in 5 min)")).toBe(true);
+    expect(isFrameworkFallbackText("The agent finished working but didn't send a reply.")).toBe(true);
+    expect(isFrameworkFallbackText("I'm blocked — waiting for your approval to proceed.")).toBe(true);
+  });
+
+  it("does NOT flag an ordinary answer", () => {
+    expect(isFrameworkFallbackText("Done — I created /tmp/foo and wrote a file in it.")).toBe(false);
   });
 });

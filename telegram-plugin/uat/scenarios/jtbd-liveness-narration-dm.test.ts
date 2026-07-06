@@ -17,8 +17,36 @@
 
 import { describe, expect, it } from "vitest";
 import { spinUp } from "../harness.js";
-import { isActivityFeedMessage } from "../assertions.js";
+import { isActivityFeedMessage, isFrameworkFallbackText } from "../assertions.js";
 import type { ObservedMessage } from "../driver.js";
+
+/**
+ * Extract the narration/tool body lines of an activity card, dropping the
+ * two-line header (`🤖 Agent` / `<elapsed> · <N> tools`) and the bare
+ * `Working…` placeholder the 0-label climb paints. Whatever remains is
+ * model-authored narration or tool labels — the content this scenario proves
+ * still lands on the card mid-turn.
+ */
+function narratedBodyLines(text: string): string[] {
+  return text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0)
+    // strip glyphs so a `→ Working…` placeholder compares as `Working…`
+    .map((l) => l.replace(/^[→✓↳]+\s*/u, "").trim())
+    .filter(
+      (l) =>
+        l.length > 0 &&
+        // header line 1 (emoji + label, optional description)
+        !/^(?:🤖|🛠[️]?|⚙[️]?)\s/u.test(l) &&
+        // header line 2 (elapsed · tools, running or done)
+        !/^(?:(?:\d+m)?\d+s\s*·\s*\d+\s+tools?|(?:done|failed)\s*·)/iu.test(l) &&
+        // the bare climb placeholder is NOT narration
+        !/^Working(?:\s*[·…]|$)/i.test(l) &&
+        // rolling-overflow header is not narration
+        !/^\+?\d+\s+earlier/i.test(l),
+    );
+}
 
 const OVERALL_BUDGET_MS = 130_000;
 
@@ -62,19 +90,27 @@ describe("uat: deterministic turn liveness — narration lands mid-turn (DM)", (
           if (m.senderUserId === sc.driverUserId) continue;
 
           if (isActivityFeedMessage(m)) {
-            // Anything on the card that ISN'T the bare "Working…" placeholder
-            // or a "Working · Ns" climb suffix is model narration.
-            if (!/^Working(\s*[·…]|$)/i.test(m.text.trim())) {
-              narrationSamples.push(m.text);
+            // The card carries the two-line header + (climb placeholder |
+            // narrated body). Any body line that ISN'T the header or the bare
+            // "Working…" placeholder is model narration landing mid-turn.
+            const narrated = narratedBodyLines(m.text);
+            if (narrated.length > 0) {
+              narrationSamples.push(narrated.join(" | "));
               console.log(
                 `[liveness-narration-dm] narrated card content at +${Date.now() - sentAt}ms: ` +
-                  JSON.stringify(m.text.slice(0, 140)),
+                  JSON.stringify(narrated.join(" | ").slice(0, 140)),
               );
             }
             if (m.edited && m.silent === false) otherLoudMessage = otherLoudMessage ?? m;
             continue;
           }
           if (m.edited) continue;
+          // A framework fallback TEXT send is a mid-turn erosion, not the
+          // answer — reject it from the answer lane so it trips the assertion.
+          if (isFrameworkFallbackText(m.text)) {
+            otherLoudMessage = otherLoudMessage ?? m;
+            continue;
+          }
           if (!answer && m.text.trim().length > 0) {
             answer = m;
             continue;
@@ -94,9 +130,13 @@ describe("uat: deterministic turn liveness — narration lands mid-turn (DM)", (
               "card (model may have batched steps or the turn was too fast). Not " +
               "necessarily a regression — but worth a human look if this recurs.",
           );
-        } else {
-          expect(narrationSamples.length).toBeGreaterThan(0);
         }
+        // (No tautological `expect(narrationSamples.length).toBeGreaterThan(0)`
+        //  in the else-branch — it was asserting a condition the branch already
+        //  guarantees. The meaningful signals are the ping-free assertion above
+        //  and the answer-arrived assertion below; narration presence is
+        //  logged, not force-asserted, since a live model may legitimately
+        //  batch its steps.)
 
         expect(answer, "FAIL — no answer arrived within budget; the turn may be wedged.").not.toBeNull();
       } finally {

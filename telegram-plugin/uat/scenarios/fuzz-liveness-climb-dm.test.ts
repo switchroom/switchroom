@@ -19,18 +19,21 @@
  * see the RFC's Known gaps / follow-up list, where this limitation is named
  * explicitly rather than left implicit.
  *
- * Each case fires a turn shape, watches the SAME two invariants the keystone
- * (Phase 1) and the dark-turn guard (Phase 2) promise on the real surface:
+ * Each case fires a turn shape and watches the two Phase-1 (keystone)
+ * invariants on the real surface — this is a climb/dead-air fuzz, NOT a
+ * dark-turn fuzz (the dark-turn at-most-once latch is proven in the
+ * `silent-end-recovery-{dm,channel}` scenarios, not here):
  *
  *   - dead air between VISIBLE updates (card edits, narration, or the final
  *     answer) never exceeds `MAX_DEAD_AIR_MS` — generous slack over the
  *     ~6-12s Phase-1 bound to absorb live Bot API + model latency jitter;
- *   - zero mid-turn device buzz (no non-final message with `silent===false`).
+ *   - zero mid-turn erosion: no non-final message with `silent===false`, and
+ *     no framework fallback TEXT send masquerading as the answer.
  */
 
 import { describe, expect, it } from "vitest";
 import { spinUp } from "../harness.js";
-import { isActivityFeedMessage } from "../assertions.js";
+import { isActivityFeedMessage, isFrameworkFallbackText } from "../assertions.js";
 import type { ObservedMessage } from "../driver.js";
 
 const MAX_DEAD_AIR_MS = 25_000; // generous slack over the ~6-12s Phase-1 bound
@@ -107,6 +110,13 @@ describe("uat-fuzz: liveness dead-air bound across a handful of turn shapes (Pha
               continue;
             }
             if (m.edited) continue;
+            // A framework fallback TEXT send is a mid-turn erosion, not the
+            // answer — never let it be swallowed as the reply (else a re-added
+            // "still working…" ping would pass this fuzz vacuously).
+            if (isFrameworkFallbackText(m.text)) {
+              loudMidTurn = loudMidTurn ?? m;
+              continue;
+            }
             if (!answer && m.text.trim().length > 0) {
               answer = m;
               const gap = now - lastVisibleAt;

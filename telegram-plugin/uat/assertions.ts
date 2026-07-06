@@ -47,15 +47,79 @@ export function isWorkerFeedMessage(m: ObservedMessage): boolean {
 const ACTIVITY_FEED_LINE_RE = /^[→✓]\s/u;
 
 /**
+ * A body line of the activity card: an in-progress `→`, a done `✓`, a nested
+ * child `↳`, or the rolling `✓ +N earlier…` / `↳ +N earlier…` overflow
+ * headers (both covered by the leading glyph). Distinct from
+ * {@link ACTIVITY_FEED_LINE_RE} in that it does NOT require the trailing space
+ * — `↳→ …` nested-in-progress lines render glyph-adjacent.
+ */
+const ACTIVITY_BODY_LINE_RE = /^[→✓↳]/u;
+
+/**
+ * The two-line header `renderActivityHeader`
+ * (telegram-plugin/tool-activity-summary.ts) prepends to the session
+ * activity / liveness card — the shape the pure-arrow
+ * {@link ACTIVITY_FEED_LINE_RE} predicate could never match, which is why the
+ * Phase-1 climb card (`silentTurnClimbRender`) was mis-classified as the
+ * answer and the whole climb test wall passed vacuously
+ * (`deterministic-turn-liveness.md` Phase 4a). Telegram strips the bold/italic
+ * entities, so the OBSERVED lines are:
+ *
+ *   line 1: `<emoji> <label>`            e.g. `🤖 Agent`   (optionally ` · <description>`)
+ *   line 2 running: `<elapsed> · <N> tool(s)`              e.g. `12s · 0 tools`, `2m05s · 3 tools`
+ *   line 2 done:    `<state> · <N> tools · <elapsed>`       e.g. `done · 3 tools · 41s`
+ *
+ * Elapsed is `formatFeedElapsed`: `<N>s` under a minute, else `<M>m<SS>s`.
+ */
+const LIVENESS_HEADER_L1_RE = /^(?:🤖|🛠[️]?|⚙[️]?)\s+\S/u;
+const LIVENESS_ELAPSED = String.raw`(?:\d+m)?\d+s`;
+const LIVENESS_HEADER_L2_RE = new RegExp(
+  `^(?:${LIVENESS_ELAPSED}\\s*·\\s*\\d+\\s+tools?` +
+    `|(?:done|failed)\\s*·\\s*\\d+\\s+tools?\\s*·\\s*${LIVENESS_ELAPSED})$`,
+  "iu",
+);
+
+/**
+ * True when `m` is the session activity / liveness card that carries the
+ * two-line `renderActivityHeader` (emoji + label, then the climbing
+ * `<elapsed> · <N> tools` status), followed only by `→`/`✓`/`↳` body lines.
+ *
+ * This is the card the Phase-1 climb (`feed-heartbeat-climb.ts`) and every
+ * headered activity feed render. The predicate stays strict — it requires
+ * BOTH header lines to match their exact shape — so a real reply that merely
+ * opens with an emoji or contains an arrow is never misclassified (the same
+ * documented reason the pure-arrow predicate demands every line be an activity
+ * line).
+ */
+export function isLivenessCardMessage(m: ObservedMessage): boolean {
+  const lines = m.text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+  if (lines.length < 2) return false;
+  if (!LIVENESS_HEADER_L1_RE.test(lines[0])) return false;
+  if (!LIVENESS_HEADER_L2_RE.test(lines[1])) return false;
+  // Any remaining line must be an activity body line — the moment prose
+  // appears below the header, this is no longer the card (guards against a
+  // reply that happens to lead with a header-shaped emoji).
+  return lines.slice(2).every((l) => ACTIVITY_BODY_LINE_RE.test(l));
+}
+
+/**
  * True when `m` is the live tool-activity feed (the one-message list of
  * "what the agent is doing this turn") rather than the agent's reply. A
- * message qualifies only when EVERY non-empty line is an activity line —
- * so a real reply that merely contains an arrow is never misclassified.
+ * message qualifies when EITHER every non-empty line is a pure activity line
+ * (`→`/`✓`, the header-less feed) OR it carries the two-line liveness header
+ * (see {@link isLivenessCardMessage}) — so a real reply that merely contains
+ * an arrow is never misclassified.
  *
  * Recall/reply scenarios must skip this in addition to
  * {@link isWorkerFeedMessage}: on a turn that uses tools, the feed paints
  * `→ Finding the right tool` as its own bot message before the real answer
- * lands, and an `expectMessage(/\S/)` would otherwise latch onto it.
+ * lands, and an `expectMessage(/\S/)` would otherwise latch onto it. Before
+ * this predicate learned the header shape, the Phase-1 climb card (which
+ * ALWAYS carries the header) slipped through as an "answer" and silently
+ * broke the entire liveness-climb test wall.
  */
 export function isActivityFeedMessage(m: ObservedMessage): boolean {
   const lines = m.text
@@ -63,7 +127,8 @@ export function isActivityFeedMessage(m: ObservedMessage): boolean {
     .map((l) => l.trim())
     .filter((l) => l.length > 0);
   if (lines.length === 0) return false;
-  return lines.every((l) => ACTIVITY_FEED_LINE_RE.test(l));
+  if (lines.every((l) => ACTIVITY_FEED_LINE_RE.test(l))) return true;
+  return isLivenessCardMessage(m);
 }
 
 /**
@@ -81,6 +146,25 @@ export function isAnswer(m: ObservedMessage, driverUserId: number): boolean {
     !isActivityFeedMessage(m) &&
     m.text.trim().length > 0
   );
+}
+
+/**
+ * Wording of the framework's own mid-turn / dark-turn fallback sends — the
+ * exact erosion class the liveness test wall exists to catch. A re-added
+ * cadence "still working…" text ping (the #2667 shape the RFC bans) or a
+ * dark-turn fallback would carry one of these phrases. Scenarios use this to
+ * REJECT such a message from the "answer" lane: without it, the first loud
+ * mid-turn framework send is swallowed as the turn's answer and the ping-free
+ * guarantee passes vacuously. Keep in sync with `SILENT_END_FALLBACK_TEXT`
+ * (gateway.ts) and `formatFrameworkFallbackText` (silence-poke.ts).
+ */
+export const FRAMEWORK_FALLBACK_RE =
+  /still working|no update from agent|didn't send a reply|finished working but|waiting for your approval/i;
+
+/** True when `text` reads like a framework mid-turn/dark-turn fallback send
+ *  (see {@link FRAMEWORK_FALLBACK_RE}) rather than a model-authored answer. */
+export function isFrameworkFallbackText(text: string): boolean {
+  return FRAMEWORK_FALLBACK_RE.test(text);
 }
 
 export interface ReplyIsLastOptions {
