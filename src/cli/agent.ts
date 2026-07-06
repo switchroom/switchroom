@@ -7,6 +7,7 @@ import { getSchedulerState, formatSchedulerState } from "../agents/scheduler-sta
 import YAML from "yaml";
 import { resolveAgentsDir, loadConfig } from "../config/loader.js";
 import { isHindsightEnabled } from "../memory/hindsight.js";
+import { HINDSIGHT_DEFAULT_MCP_URL } from "../setup/hindsight.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 import { withConfigError, getConfig, getConfigPath } from "./helpers.js";
 import { scaffoldAgent, reconcileAgent, buildSettingsHooksBlock, detectHooksDrift, SWITCHROOM_DEFAULT_MAIN_MODEL, SWITCHROOM_DEFAULT_THINKING_EFFORT } from "../agents/scaffold.js";
@@ -308,7 +309,7 @@ function buildStatusInputs(
   if (isHindsightEnabled(config)) {
     const baseUrl =
       (config.memory?.config?.url as string | undefined) ??
-      "http://localhost:18888/mcp/";
+      HINDSIGHT_DEFAULT_MCP_URL;
     hindsightApiUrl = baseUrl.endsWith("/mcp/")
       ? baseUrl
       : baseUrl.replace(/\/$/, "") + "/mcp/";
@@ -898,7 +899,7 @@ export function registerAgentCommand(program: Command): void {
         let hindsightBankId = name;
         if (isHindsightEnabled(config)) {
           const baseUrl = (config.memory?.config?.url as string | undefined)
-            ?? "http://localhost:18888/mcp/";
+            ?? HINDSIGHT_DEFAULT_MCP_URL;
           // Normalize to end in /mcp/
           hindsightApiUrl = baseUrl.endsWith("/mcp/")
             ? baseUrl

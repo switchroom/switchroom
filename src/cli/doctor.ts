@@ -28,8 +28,9 @@ import { getSlotInfos, type SlotInfo } from "../auth/accounts.js";
 import type { AgentConfig, SwitchroomConfig } from "../config/schema.js";
 import { loadManifest, detectDrift, type DriftProbers } from "../manifest.js";
 import { probeHindsight, isHindsightEnabled, fetchHindsightToolsList, collectProfileBanks } from "../memory/hindsight.js";
+import { HINDSIGHT_DEFAULT_MCP_URL } from "../setup/hindsight.js";
 import { inspectBankHealth, staleMentalModels, corruptedMentalModels, recentUnextracted, ageDays } from "../memory/bank-health.js";
-import { checkHindsightContainerHealth, classifyToolContract, checkHindsightHealthEndpoint } from "./doctor-memory.js";
+import { checkHindsightContainerHealth, classifyToolContract, checkHindsightHealthEndpoint, classifyConsolidationBacklog } from "./doctor-memory.js";
 import { isDockerMode, runDockerChecks } from "./doctor-docker.js";
 import { runAuthBrokerChecks } from "./doctor-auth-broker.js";
 import { runHostdChecks } from "./doctor-hostd.js";
@@ -1055,7 +1056,7 @@ function probeAuthBrokerSocket(
 export async function checkBankIngestHealth(
   config: SwitchroomConfig,
   url: string,
-  opts?: { fetchImpl?: typeof fetch; now?: Date },
+  opts?: { fetchImpl?: typeof fetch; now?: Date; includeConsolidationBacklog?: boolean },
 ): Promise<CheckResult[]> {
   const results: CheckResult[] = [];
   const now = opts?.now ?? new Date();
@@ -1079,6 +1080,25 @@ export async function checkBankIngestHealth(
       [bankId, agents, await inspectBankHealth(url, bankId, { fetchImpl: opts?.fetchImpl })] as const,
     ),
   );
+
+  // Fleet-wide consolidation backlog (#2903 fix 5.3): sum the pending-op
+  // count across every reachable bank so `switchroom doctor` shows the queue
+  // depth the #2894 throttle can silently build. Oldest-pending age isn't on
+  // the REST /stats surface (measurement follow-up: #2847), so age is unknown.
+  // Gated off by default so the per-bank ingest contract stays clean for
+  // callers/tests that only want bank rows; the CLI doctor opts in below.
+  let backlogRow: CheckResult | undefined;
+  if (opts?.includeConsolidationBacklog) {
+    let totalPending = 0;
+    let anyBankReachable = false;
+    for (const [, , h] of inspected) {
+      if (h.ok) {
+        anyBankReachable = true;
+        totalPending += h.pendingOperations;
+      }
+    }
+    if (anyBankReachable) backlogRow = classifyConsolidationBacklog(totalPending);
+  }
 
   for (const [bankId, agents, h] of inspected) {
     const label =
@@ -1156,6 +1176,7 @@ export async function checkBankIngestHealth(
     }
     results.push({ name: label, status: "ok", detail: summary });
   }
+  if (backlogRow) results.push(backlogRow);
   return results;
 }
 
@@ -1170,7 +1191,7 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
   }
 
   const url = (config.memory?.config?.url as string | undefined)
-    ?? "http://localhost:18888/mcp/";
+    ?? HINDSIGHT_DEFAULT_MCP_URL;
 
   const results: CheckResult[] = [];
 
@@ -1260,7 +1281,7 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
   // units per document (consumer quota wall / shm exhaustion) — the agent
   // keeps "remembering" nothing and no surface goes red. Inspect each bank's
   // REST surface for unextracted documents and stale mental models.
-  results.push(...(await checkBankIngestHealth(config, url)));
+  results.push(...(await checkBankIngestHealth(config, url, { includeConsolidationBacklog: true })));
 
   // Per-agent bank health checks
   for (const [agentName, agentConfig] of Object.entries(config.agents)) {
