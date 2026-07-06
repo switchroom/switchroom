@@ -569,11 +569,17 @@ export function startHindsight(
   // configuration, not secrets. Setting `HINDSIGHT_API_LLM_PROVIDER` to
   // `claude-code` selects the subscription-honest path; pinning
   // `HINDSIGHT_API_LLM_MODEL` keeps memory ops on the same Claude model
-  // the agent fleet uses (see HINDSIGHT_DEFAULT_MODEL above).
+  // the agent fleet uses (see HINDSIGHT_DEFAULT_MODEL above). NOTE: for the
+  // `claude-code` provider, `HINDSIGHT_API_LLM_MODEL` does NOT control the
+  // embedded `claude` CLI — the CLI reads `ANTHROPIC_MODEL`, and without it
+  // falls back to its own default (opus), silently running every memory op
+  // (fact extraction, recall synthesis, consolidation) on the wrong model.
+  // So we ALSO set `ANTHROPIC_MODEL` — that's what actually pins the model.
   const envArgs: string[] = [
     "-e", `HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE=${HINDSIGHT_DEFAULT_MAX_OBSERVATIONS_PER_SCOPE}`,
     "-e", "HINDSIGHT_API_LLM_PROVIDER=claude-code",
     "-e", `HINDSIGHT_API_LLM_MODEL=${HINDSIGHT_DEFAULT_MODEL}`,
+    "-e", `ANTHROPIC_MODEL=${HINDSIGHT_DEFAULT_MODEL}`,
     "-e", `HINDSIGHT_API_MCP_STATELESS=${HINDSIGHT_DEFAULT_MCP_STATELESS}`,
     // Reranker smart-defaults (v0.13.22) — see constants above for
     // rationale. Each closes a vendor-default gap that hurts our
@@ -798,6 +804,7 @@ export function generateHindsightComposeSnippet(): string {
     `      - HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE=${HINDSIGHT_DEFAULT_MAX_OBSERVATIONS_PER_SCOPE}`,
     "      - HINDSIGHT_API_LLM_PROVIDER=claude-code",
     `      - HINDSIGHT_API_LLM_MODEL=${HINDSIGHT_DEFAULT_MODEL}`,
+    `      - ANTHROPIC_MODEL=${HINDSIGHT_DEFAULT_MODEL}`,
     `      - HINDSIGHT_API_MCP_STATELESS=${HINDSIGHT_DEFAULT_MCP_STATELESS}`,
     `      - HINDSIGHT_API_RERANKER_LOCAL_BUCKET_BATCHING=${HINDSIGHT_DEFAULT_RERANKER_BUCKET_BATCHING}`,
     `      - HINDSIGHT_API_RERANKER_MAX_CANDIDATES=${HINDSIGHT_DEFAULT_RERANKER_MAX_CANDIDATES}`,

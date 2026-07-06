@@ -152,6 +152,10 @@ describe("hindsight broker-fed mode (#1245)", () => {
       if (args[i] === "-e") envPairs.push(args[i + 1] as string);
     }
     expect(envPairs).toContain("HINDSIGHT_API_LLM_MODEL=claude-sonnet-5");
+    // For the claude-code provider the embedded `claude` CLI reads
+    // ANTHROPIC_MODEL, not HINDSIGHT_API_LLM_MODEL — without it the CLI
+    // falls back to its own default (opus) and silently burns quota.
+    expect(envPairs).toContain("ANTHROPIC_MODEL=claude-sonnet-5");
   });
 
   it("raises the reflect wall timeout (vendor 300s times out large-bank mental-model refresh)", async () => {
