@@ -1056,7 +1056,7 @@ function probeAuthBrokerSocket(
 export async function checkBankIngestHealth(
   config: SwitchroomConfig,
   url: string,
-  opts?: { fetchImpl?: typeof fetch; now?: Date },
+  opts?: { fetchImpl?: typeof fetch; now?: Date; includeConsolidationBacklog?: boolean },
 ): Promise<CheckResult[]> {
   const results: CheckResult[] = [];
   const now = opts?.now ?? new Date();
@@ -1085,16 +1085,19 @@ export async function checkBankIngestHealth(
   // count across every reachable bank so `switchroom doctor` shows the queue
   // depth the #2894 throttle can silently build. Oldest-pending age isn't on
   // the REST /stats surface (measurement follow-up: #2847), so age is unknown.
-  let totalPending = 0;
-  let anyBankReachable = false;
-  for (const [, , h] of inspected) {
-    if (h.ok) {
-      anyBankReachable = true;
-      totalPending += h.pendingOperations;
+  // Gated off by default so the per-bank ingest contract stays clean for
+  // callers/tests that only want bank rows; the CLI doctor opts in below.
+  let backlogRow: CheckResult | undefined;
+  if (opts?.includeConsolidationBacklog) {
+    let totalPending = 0;
+    let anyBankReachable = false;
+    for (const [, , h] of inspected) {
+      if (h.ok) {
+        anyBankReachable = true;
+        totalPending += h.pendingOperations;
+      }
     }
-  }
-  if (anyBankReachable) {
-    results.push(classifyConsolidationBacklog(totalPending));
+    if (anyBankReachable) backlogRow = classifyConsolidationBacklog(totalPending);
   }
 
   for (const [bankId, agents, h] of inspected) {
@@ -1173,6 +1176,7 @@ export async function checkBankIngestHealth(
     }
     results.push({ name: label, status: "ok", detail: summary });
   }
+  if (backlogRow) results.push(backlogRow);
   return results;
 }
 
@@ -1277,7 +1281,7 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
   // units per document (consumer quota wall / shm exhaustion) — the agent
   // keeps "remembering" nothing and no surface goes red. Inspect each bank's
   // REST surface for unextracted documents and stale mental models.
-  results.push(...(await checkBankIngestHealth(config, url)));
+  results.push(...(await checkBankIngestHealth(config, url, { includeConsolidationBacklog: true })));
 
   // Per-agent bank health checks
   for (const [agentName, agentConfig] of Object.entries(config.agents)) {

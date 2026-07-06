@@ -387,6 +387,30 @@ describe("checkBankIngestHealth (doctor)", () => {
     // the agent-less profile bank must NOT render the empty "()" label
     expect(names).not.toContain("bank ken-profile ()");
   });
+
+  it("omits the fleet consolidation-backlog row unless opted in (#2903 fix 5.3)", async () => {
+    const BACKLOGGED = {
+      stats: { total_documents: 5, total_nodes: 50, pending_operations: 250 },
+      documents: { items: [{ id: "d1", created_at: "2026-06-09T00:00:00Z", text_length: 100, memory_unit_count: 2 }] },
+      models: { items: [] },
+    };
+    const cfg = minimalConfig({ marko: {} });
+    const fetchImpl = fakeFetchFor({ marko: BACKLOGGED });
+
+    // Default: per-bank rows only, no backlog aggregate (protects the contract
+    // the other tests in this file assert exact lengths against).
+    const bare = await checkBankIngestHealth(cfg, "http://x/mcp/", { fetchImpl, now: NOW });
+    expect(bare.some((r) => /backlog/i.test(r.name))).toBe(false);
+
+    // Opted in (as the CLI doctor does): the aggregate row is appended last.
+    const withBacklog = await checkBankIngestHealth(cfg, "http://x/mcp/", {
+      fetchImpl,
+      now: NOW,
+      includeConsolidationBacklog: true,
+    });
+    expect(withBacklog.length).toBe(bare.length + 1);
+    expect(/backlog/i.test(withBacklog[withBacklog.length - 1].name)).toBe(true);
+  });
 });
 
 const CORRUPT_MODEL_BANK = {
