@@ -2425,6 +2425,13 @@ type CurrentTurn = {
   // step that emits no new label doesn't read as frozen (the feed is otherwise
   // pull-only). undefined until the first label of the turn renders.
   lastToolLabelAt?: number
+  // Wall-clock timestamp of the last 0-label liveness heartbeat EDIT (the
+  // silent-tool case: card already open, mirrorLines still empty). Gates the
+  // heartbeat's climbing-elapsed EDIT so two edits are never closer than
+  // FEED_HEARTBEAT_MIN_STALE_MS even under timer jitter. undefined until the
+  // first post-open liveness heartbeat edit; naturally reset per turn (fresh
+  // turn object). See `feedHeartbeatTick` 0-label branch.
+  livenessHeartbeatAt?: number
   // Fix 2 (post-answer background-agent liveness): wall-clock timestamp last
   // updated by the sub-agent/workflow watcher's onProgress callback whenever
   // it surfaces a NEW sub-agent step AFTER this turn's substantive answer was
@@ -12779,7 +12786,46 @@ function feedHeartbeatTick(): void {
   // heartbeat both reach the same drain — there is exactly one path that can
   // OPEN the liveness card, so the two callers can never double-open or race.
   if (turn.mirrorLines.length === 0) {
-    openLivenessFeedIfDue(turn)
+    // First tick before any card exists → OPEN through the single open path
+    // (`openLivenessFeedIfDue` → `shouldEarlyOpenLiveness`, gated on
+    // `activityMessageId == null`). Keep this untouched.
+    if (turn.activityMessageId == null) {
+      openLivenessFeedIfDue(turn)
+      return
+    }
+    // Card already open but the turn is STILL 0-label — a single long SILENT
+    // tool (no tool_label, no `text` narration → mirrorLines stays empty).
+    // `shouldEarlyOpenLiveness` returns false once `activityMessageId != null`,
+    // so `openLivenessFeedIfDue` would drain nothing and the card would freeze
+    // at its ~FEED_LIVENESS_OPEN_MS open until the tool returns — unbounded dead
+    // air. Take the SAME climbing-elapsed EDIT path the labelled (>0) branch
+    // below uses, rendering the liveness placeholder so the card advances every
+    // heartbeat, model-independently, until a real label arrives or the tool
+    // returns. Gated so two edits are never closer than FEED_HEARTBEAT_MIN_STALE_MS.
+    const age = Date.now() - turn.startedAt
+    const sinceLastBeat = turn.livenessHeartbeatAt == null ? age : Date.now() - turn.livenessHeartbeatAt
+    if (sinceLastBeat < FEED_HEARTBEAT_MIN_STALE_MS) return
+    const livenessHeader: SessionActivityHeader = {
+      label: 'Agent', elapsedMs: age, toolCount: turn.labeledToolCount, state: 'running',
+    }
+    // Mirror `openLivenessFeedIfDue`'s render idiom: liveness card is one step
+    // whose start IS the turn start, so `age` is the step's own elapsed.
+    const rendered = renderActivityFeedWithNested(['Working…'], [], false, formatStepSuffix(age), undefined, livenessHeader)
+    if (rendered == null) return
+    turn.activityPendingRender = rendered
+    turn.livenessHeartbeatAt = Date.now()
+    const ea = emissionAuthorityFor(turn)
+    // Same centralized chatLock-serialized card-drain gate + single-flight
+    // `mayDrain` as the >0 branch — no separate transport, no throttle collision.
+    cardDrainGate(turn, ea, () => {
+      if (ea.mayDrain(turn)) {
+        // Maintains an already-open card (guarded above on activityMessageId !=
+        // null) → only ever EDITs. 'liveness' is correct.
+        ea.openOrEditCard('liveness', () => {
+          turn.activityInFlight = drainActivitySummary(turn, 'liveness')
+        })
+      }
+    })
     return
   }
 

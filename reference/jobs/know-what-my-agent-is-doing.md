@@ -121,6 +121,12 @@ Named by job × surface, pointing at real scenarios in
   wired-host twin (follow-on): `jtbd-liveness-floor-dm` / `-channel` with
   `SWITCHROOM_SILENCE_FLOOR_MS` lowered so the beat lands within test
   wall-clock. Design: `reference/rfcs/turn-liveness-primitive.md`.
+- **Activity-card liveness during a silent tool (DM)** — `jtbd-liveness-feed-open-dm`,
+  `jtbd-liveness-feed-heartbeat-dm`. *Watch:* the `Working…` card opens on a
+  tool-less/silent turn and keeps advancing; narration surfaces in the card the
+  moment the model emits it. *Invariant:* the activity card is edited at least
+  every ~12s while a silent tool runs (never frozen at open); narration surfaces
+  when the model emits it. Regression guard: `telegram-plugin/tests/feed-heartbeat-zero-label-freeze.test.ts`.
 - **Restart mid-conversation (DM + channel)** —
   `jtbd-message-during-restart-dm` / `-channel`,
   `jtbd-always-on-after-restart-dm`, `jtbd-interrupted-turn-resumes-dm`.
