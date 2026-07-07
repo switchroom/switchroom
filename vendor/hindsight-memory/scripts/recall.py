@@ -373,12 +373,18 @@ def _is_demoted_memory(memory) -> bool:
 
 # Switchroom #475 — lexical-overlap relevance gate.
 #
-# Hindsight's HTTP API does not return similarity scores. Without a
-# score the existing `recallMaxMemories` cap acts as a *floor* on
-# low-relevance prompts: weak matches still fill the slot up to N,
-# mis-steering the model. This gate computes Jaccard overlap between
-# the user's query terms and each memory's text terms, and drops
-# memories below a configurable threshold.
+# Hindsight's HTTP recall API DOES return per-result relevance scores
+# (`RecallResult.scores.final`, plus `.semantic`/`.keyword`/`.reranker`);
+# the merged multi-bank set is now sorted by `scores.final` before the
+# `recallMaxMemories` cap (see the sort just before the cap in
+# process_recall) so the most relevant memories survive the head-slice
+# regardless of which bank they came from. This gate is a *complementary*,
+# opt-in absolute precision floor: `scores.final` is a relative rank that
+# still orders weakly-matching memories rather than excluding them, so on a
+# low-relevance prompt the top-N could still be low-signal. The Jaccard
+# overlap between the user's query terms and each memory's text terms is a
+# query-independent absolute measure that drops memories below a
+# configurable threshold outright — something the relative sort does not do.
 #
 # Threshold default is 0.0 (disabled) so the gate is opt-in initially.
 # Operators tune via `memory.recall.min_overlap` in switchroom.yaml or
@@ -467,6 +473,40 @@ def _filter_by_overlap(results, query: str, threshold: float):
         else:
             dropped += 1
     return kept, dropped
+
+
+def _result_final_score(m) -> float:
+    """Return a result's engine relevance score (`scores.final`).
+
+    Switchroom Phase-1 precision. The Hindsight recall response attaches a
+    `scores` object to every result whose required `final` field is the
+    engine's combined ranking score (reranker + recency/temporal/proof
+    boosts). Results missing a usable score sort last so a malformed or
+    score-less entry can never starve a properly-ranked one.
+    """
+    if isinstance(m, dict):
+        scores = m.get("scores")
+        if isinstance(scores, dict):
+            val = scores.get("final")
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                return float(val)
+    return float("-inf")
+
+
+def _sort_by_final_score(results):
+    """Sort merged multi-bank results by `scores.final` descending, in place.
+
+    Switchroom Phase-1 bank-starvation fix. The recall path appends
+    additional-bank (profile / shared / sender) results after the own-bank
+    results, then head-slices at `recallMaxMemories`. Before this sort, a
+    full own-bank result set silently dropped every additional-bank memory
+    at the cap regardless of relevance. Sorting by the engine's real
+    relevance score before the cap means the cap keeps the most relevant
+    memories cross-bank. Python's sort is stable, so ties preserve the
+    prior own-bank-first insertion order.
+    """
+    results.sort(key=_result_final_score, reverse=True)
+    return results
 
 
 def _write_recall_log(entry: dict) -> None:
@@ -986,6 +1026,11 @@ def main():
             tags=recall_tags,
             tags_match=tags_match,
             tag_groups=tag_groups,
+            # Switchroom Phase-1 precision — prefer deduped observation
+            # statements over the raw facts they supersede, backfilling freed
+            # slots for denser coverage inside the same budget. On by default;
+            # operators can pin off via `recallPreferObservations: false`.
+            prefer_observations=config.get("recallPreferObservations", True),
             # 8s in-script timeout leaves 4s headroom inside the 12s
             # UserPromptSubmit hook ceiling (see hooks.json:20) for cache
             # write + block formatting. Tightened from 10s in switchroom
@@ -1031,6 +1076,10 @@ def main():
                 tags=extra_tags,
                 tags_match=extra_tags_match,
                 tag_groups=extra_tag_groups,
+                # Switchroom Phase-1 precision — prefer deduped observation
+                # statements here too so additional banks contribute their
+                # densest statements to the merged, score-sorted set.
+                prefer_observations=config.get("recallPreferObservations", True),
                 # 8s in-script timeout leaves 4s headroom inside the 12s
                 # UserPromptSubmit hook ceiling (see hooks.json:20) for cache
                 # write + block formatting. Tightened from 10s in switchroom
@@ -1098,6 +1147,15 @@ def main():
             )
     else:
         overlap_dropped = 0
+
+    # Switchroom Phase-1 precision — sort the merged primary + additional-bank
+    # result set by the engine's relevance score (`scores.final`) descending
+    # BEFORE the head-slice cap below. Previously additional-bank results were
+    # appended after own-bank results and sliced off, silently starving
+    # profile / shared / sender banks whenever own-bank filled the cap. Sorting
+    # by real relevance first means the cap keeps the most relevant memories
+    # regardless of source bank. Stable sort: ties keep own-bank-first order.
+    _sort_by_final_score(results)
 
     # Switchroom-local: client-side count cap. Plugin v0.4.0 has no
     # `recallTopK` in the Claude Code integration (Openclaw-only), and a
