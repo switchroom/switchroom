@@ -1,5 +1,65 @@
 # Changelog
 
+## v0.17.11 — Telegram rich-message rendering (default-on) + Hindsight recall precision + gateway FIFO/reaper hardening
+
+Ships the Telegram-native rich-formatting engine end to end and flips it
+default-ON fleet-wide (with a per-agent killswitch) after a live-wire
+verification pass confirmed every construct except `__underline__` renders as
+its intended Bot API 10.1 entity. Also ships Hindsight recall-precision Phase
+1, per-operation LLM model config, an OpenRouter-by-default routing change for
+Hindsight LLM ops, and two gateway correctness fixes (rapid-fire DM ordering,
+stale activity-card reaping).
+
+### Telegram-native rich-message rendering — default-on with a killswitch (#2928, #2929, #2930, #2932, #2934, #2936, #2937)
+
+Delivers the full pipeline behind `SWITCHROOM_RICH_RENDER`: a markdown parser
+and typed IR (#2928), an IR → Bot API 10.1 markdown renderer covering
+bold/italic/strike/code/links/spoiler/highlight/expandable blockquotes/tables/
+lists (#2930, #2932), and a nested-list tight-spacing fix that preserves
+mdast's tight/loose distinction instead of hardcoding newline behavior
+(#2936). A live-wire probe against the real Bot API — inspecting Telegram's
+own returned message entities, not a visual guess — confirmed spoiler and
+highlight both render correctly (reversing earlier UAT-harness evidence that
+had flagged spoiler as broken; that was a harness decode limitation, not a
+wire failure) and surfaced the one real exclusion: `__underline__` has no
+Telegram markdown equivalent and degrades cleanly to bold. Docs and the
+governing RFC were reconciled to this ground truth (#2929, #2937). The flag
+is now default `"1"` in `defaults.env`; an agent can still opt out with
+`env: { SWITCHROOM_RICH_RENDER: "0" }`, which wins per the standard
+agent-overrides-defaults config merge.
+
+### Hindsight recall precision + LLM routing (#2924, #2925, #2931, #2933, #2935)
+
+- **Phase-1 recall precision (#2931, #2933):** score-sort ordering and a
+  `prefer_observations` bias in `client.recall()`.
+- **LLM routing (#2924, #2925, #2935):** a durable top-level `hindsight.llm`
+  config knob (provider + model), OpenRouter-via-LiteLLM as the new default
+  for Hindsight's retain/reflect/consolidation ops instead of always pinning
+  Claude, and per-operation overrides (`hindsight.llm.{retain,reflect,consolidation}`)
+  that inherit from the global knob when unset.
+
+### Gateway hardening (#2917/#2919, #2918/#2921, #1116/#2893/#2920)
+
+- **Rapid-fire DM ordering:** fixed a FIFO-ordering bug where the inbound→bridge
+  delivery gate read a stale `turnInFlight` snapshot instead of a live value,
+  causing out-of-order emission under rapid-fire DMs.
+- **Stale activity-card reaper:** added a periodic mid-session reaper for
+  orphaned turns (owning SDK subprocess died mid-session) — previously only
+  reaped at boot, leaving a frozen "working…" card until the next restart.
+- **Worktree-worker identity:** harden identity resolution to fall back to
+  config, not just env, fixing lost live-progress feeds for worktree-isolated
+  sub-agents when `SWITCHROOM_AGENT_NAME` was unset or the registry read
+  failed.
+
+### Also in this release
+
+- `/model <sr-*>` non-Claude model switches now do a session-only relaunch
+  instead of failing in the native picker (#2927).
+- `/usage` card split into per-window reset columns (5h/7d each get their own
+  reset-time column) (#2889).
+- Doc-only: corrected the Hindsight auto-retain cadence description
+  (every-turn chunked, not every ~10 turns) (#2898).
+
 ## v0.17.10 — Hindsight reliability: close the FK-race memory-loss window + review-finding hardening
 
 Ships the fix for a silent memory-loss race in Hindsight plus the hardening
