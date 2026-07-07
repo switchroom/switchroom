@@ -132,6 +132,15 @@ path, and delivery never touches anything outside the agent's own folder.
   the end-to-end scenario exists. Channel-routing bugs have hidden in
   DM-only coverage before.
 
+## Related
+
+- [`talk-to-agents-from-anywhere`](talk-to-agents-from-anywhere.md) -- the
+  phone-first chat surface a deliverable has to be openable from.
+- [`approve-what-my-agent-can-touch`](approve-what-my-agent-can-touch.md) --
+  the operator grant behind the Drive scope delivery writes with.
+- [`feel-like-a-colleague`](feel-like-a-colleague.md) -- a colleague hands
+  you the document, not a path on their machine.
+
 ---
 
 > **Implementation:** the `deliver-file` CLI verb (`src/cli/deliver-file.ts`),

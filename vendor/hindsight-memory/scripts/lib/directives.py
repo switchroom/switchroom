@@ -16,6 +16,7 @@ stderr. We never raise to the caller — directives are nice-to-have on the
 recall path; a directive-fetch failure must not kill the recall block.
 """
 
+import re
 import sys
 from typing import Optional
 
@@ -117,3 +118,90 @@ def format_active_directives_block(directives: list, max_directives: int = MAX_D
 
     lines.append("</active_directives>")
     return "\n".join(lines)
+
+
+# --- Directive dedup (switchroom #2903 Fix 6.2) --------------------------------
+#
+# A user restating a rule that is ALREADY an active directive should not get
+# re-nudged, and the Stage C verifier must not BLOCK the turn where the model
+# correctly declines to re-create the duplicate. The verifier can see the
+# directives that were injected THIS turn (recall.py emits the
+# <active_directives> block into the prompt), so it reads them back out of the
+# transcript and treats a rule already covered there as "already captured".
+#
+# Matching is a deterministic lexical-overlap heuristic (no model call, no API
+# call — the verifier is on the Stop critical path). It is intentionally
+# lenient: a false "already captured" only means we skip a re-prompt (the rule
+# is genuinely already stored in that case), whereas a false "not captured"
+# re-blocks a turn the model correctly finished. So we err toward treating a
+# strong token overlap as a duplicate.
+
+# Parses the numbered "N. [P<pri>] <name>: <content>" body lines out of a
+# rendered <active_directives> block (see format_active_directives_block).
+_ACTIVE_DIRECTIVE_LINE_RE = re.compile(
+    r"^\s*\d+\.\s*\[P-?\d+\]\s*[^:]*:\s*(?P<content>.+?)\s*$"
+)
+
+# Low-signal words stripped before overlap scoring so "always"/"you"/"please"
+# framing doesn't inflate similarity between two unrelated rules.
+_DEDUP_STOPWORDS = frozenset(
+    {
+        "the", "a", "an", "to", "of", "and", "or", "for", "in", "on", "at",
+        "is", "are", "be", "you", "your", "i", "we", "me", "my", "it", "that",
+        "this", "with", "as", "so", "do", "dont", "don", "not", "never",
+        "always", "please", "should", "must", "want", "from", "now", "on",
+        "going", "forward", "forwards", "future", "rule", "remember", "call",
+        "use", "using", "make", "sure", "when", "if", "just", "will", "can",
+    }
+)
+
+
+def _dedup_tokens(text: str) -> set:
+    """Normalize text into a set of significant lower-case word tokens."""
+    if not isinstance(text, str):
+        return set()
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    return {w for w in words if w not in _DEDUP_STOPWORDS and len(w) > 1}
+
+
+def parse_active_directives_block(text: str) -> list:
+    """Extract the directive CONTENT strings from a rendered
+    <active_directives> block (as produced by format_active_directives_block).
+
+    Returns [] when the block is absent or malformed. Pure string parsing.
+    """
+    if not isinstance(text, str) or "<active_directives>" not in text:
+        return []
+    # Isolate the block body between the tags (tolerate missing close tag).
+    body = text.split("<active_directives>", 1)[1]
+    body = body.split("</active_directives>", 1)[0]
+    contents = []
+    for line in body.splitlines():
+        m = _ACTIVE_DIRECTIVE_LINE_RE.match(line)
+        if m:
+            contents.append(m.group("content").strip())
+    return contents
+
+
+def rule_already_captured(
+    rule_text: str, directive_contents: list, threshold: float = 0.6
+) -> bool:
+    """True when ``rule_text`` is lexically well-covered by an EXISTING active
+    directive in ``directive_contents``.
+
+    Coverage = |rule_tokens ∩ directive_tokens| / |rule_tokens| for the
+    best-matching directive. A high coverage ratio means the restated rule adds
+    (almost) no new significant words over one already stored — i.e. a
+    duplicate. Deterministic; no model/API call.
+    """
+    rule_tokens = _dedup_tokens(rule_text)
+    if not rule_tokens:
+        return False
+    for content in directive_contents:
+        d_tokens = _dedup_tokens(content)
+        if not d_tokens:
+            continue
+        covered = len(rule_tokens & d_tokens) / len(rule_tokens)
+        if covered >= threshold:
+            return True
+    return False

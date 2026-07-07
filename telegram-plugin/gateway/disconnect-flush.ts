@@ -42,6 +42,12 @@ export interface DisconnectFlushDeps<Ctrl extends { finalize: (reason?: 'done' |
    *  activeTurnStartedAt — the bridge just died, every turn it
    *  was handed is dead by definition. */
   claudeBusyKeys: Set<string>
+  /** #2787: insertion-timestamp map for `claudeBusyKeys`, backing the orphan
+   *  reaper. MUST stay in lockstep with `claudeBusyKeys` at every clear site —
+   *  a stale timestamp surviving a clear makes a later re-marked key look
+   *  >TTL-old and get reaped against a live delivery. Deleted alongside every
+   *  `claudeBusyKeys.delete`/`.clear` below. */
+  claudeBusyKeySince: Map<string, number>
 
   /** Open draft-stream handles keyed by chat:thread:replyId. */
   activeDraftStreams: Map<string, Stream>
@@ -82,6 +88,7 @@ export function flushOnAgentDisconnect<
     activeReactionMsgIds,
     activeTurnStartedAt,
     claudeBusyKeys,
+    claudeBusyKeySince,
     activeDraftStreams,
     clearActiveReactions,
     disposeProgressDriver,
@@ -109,6 +116,7 @@ export function flushOnAgentDisconnect<
     activeReactionMsgIds.delete(key)
     activeTurnStartedAt.delete(key)
     claudeBusyKeys.delete(key)
+    claudeBusyKeySince.delete(key) // #2787: keep orphan-TTL map in lockstep
   }
   clearActiveReactions()
 
@@ -129,6 +137,7 @@ export function flushOnAgentDisconnect<
       activeTurnStartedAt.delete(k)
       activeReactionMsgIds.delete(k)
       claudeBusyKeys.delete(k)
+      claudeBusyKeySince.delete(k) // #2787: keep orphan-TTL map in lockstep
     }
     log(
       `telegram gateway: disconnect-flush swept ${danglingKeys.length} dangling turn key(s) ` +
@@ -156,6 +165,8 @@ export function flushOnAgentDisconnect<
     const orphanCount = claudeBusyKeys.size
     const orphanKeys = [...claudeBusyKeys]
     claudeBusyKeys.clear()
+    // #2787: keep the orphan-TTL map in lockstep with the set it shadows.
+    for (const k of orphanKeys) claudeBusyKeySince.delete(k)
     log(
       `telegram gateway: disconnect-flush cleared ${orphanCount} orphan claudeBusyKeys ` +
       `entr${orphanCount === 1 ? 'y' : 'ies'} (synthetic-inbound deliveries that never turn_ended)` +

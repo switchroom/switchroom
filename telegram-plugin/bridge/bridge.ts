@@ -30,6 +30,7 @@ import { createIpcClient, type IpcClientHandle } from './ipc-client.js'
 import { buildEffectiveToolSchemas, LINEAR_ENV } from './tool-filter.js'
 import type { InboundMessage, PermissionEvent, StatusEvent } from '../gateway/ipc-protocol.js'
 import { matchesAllowRule } from '../permission-rule.js'
+import { createOutstandingPermissionLedger } from './permission-ledger.js'
 
 installPluginLogger()
 
@@ -75,7 +76,7 @@ const mcp = new Server(
     instructions: [
       'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. A single message may carry SEVERAL attachments (a forwarded album or a text+multi-image burst): when attachment_count is set (>1), also handle the numbered siblings — image_path_2, image_path_3, … (Read each) and attachment_file_id_2, attachment_file_id_3, … (download_attachment each). Process every one, not just the first. Reply with the reply tool — pass chat_id back. The reply and stream_reply tools quote-reply to the latest inbound user message by default, so you do NOT need to pass reply_to for normal responses. Pass reply_to (a message_id) only when quoting a specific earlier message, or pass quote:false to send a bare (non-quoted) message.',
+      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. A single message may carry SEVERAL attachments (a forwarded album or a text+multi-image burst): when attachment_count is set (>1), also handle the numbered siblings — image_path_2, image_path_3, … (Read each) and attachment_file_id_2, attachment_file_id_3, … (download_attachment each). Process every one, not just the first. Reply with the reply tool — pass chat_id back. The reply tool quote-replies to the latest inbound user message by default, so you do NOT need to pass reply_to for normal responses. Pass reply_to (a message_id) only when quoting a specific earlier message, or pass quote:false to send a bare (non-quoted) message.',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, edit_message for interim progress updates, and delete_message when you need to truly remove a message (prefer edit_message if you just want to change text — delete is for retraction). Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings. Use send_typing to show a typing indicator during long operations. Use pin_message to pin important outputs. Use forward_message to quote/resurface earlier messages.',
       '',
@@ -125,46 +126,6 @@ const TOOL_SCHEMAS = [
                 callback_data: { type: 'string', description: 'Opaque tag delivered back to the agent on tap. Max 58 chars (gateway prepends an `agent:` prefix to the 64-byte Telegram limit). Mutually exclusive with url.' },
                 ack_text: { type: 'string', description: 'Toast text shown to the user the instant they tap this button (#710). Default "✓ received". Max ~200 chars (Telegram answerCallbackQuery limit). Has no effect on URL buttons.' },
                 single_use: { type: 'boolean', description: 'When true (default) tapping any single_use button on the message removes the entire keyboard so the user can\'t double-fire. Set false on buttons that should stay tappable (e.g. a "Refresh" button). If ANY button on the message has single_use:false the keyboard is preserved on tap.' },
-              },
-              required: ['text'],
-            },
-          },
-        },
-      },
-      required: ['chat_id', 'text'],
-    },
-  },
-  {
-    name: 'stream_reply',
-    description:
-      'Post the final answer for this turn. The plugin renders an event-driven progress card (Plan → Run → Done with live tool bullets, elapsed time, and status emoji) for free while the turn is in-flight, so you do not need to narrate intermediate progress. Call `stream_reply` exactly once per turn with done=true and the complete answer text. Hard cap is 32768 chars (the rich-message wire limit) — longer text is dropped by a defensive guard, so use `reply` for anything that long (it chunks). Calling with done=false is an error in this environment (the progress card already owns the mid-turn surface). inline_keyboard adds tappable buttons under the final message — see `reply` for shape and constraints.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        chat_id: { type: 'string' },
-        text: { type: 'string', description: 'Full text snapshot. NOT a delta — pass the complete current content each call.' },
-        done: { type: 'boolean', description: 'Must be true. Posts this text as the final answer for the turn and locks the message.' },
-        message_thread_id: { type: 'string', description: 'Forum topic thread ID. Auto-applied from the last inbound message if not specified.' },
-        origin_turn_id: { type: 'string', description: 'In a forum supergroup, pass back the origin_turn_id attribute from the <channel> message you are answering. It pins the reply to that message\'s topic even if another topic\'s turn started meanwhile. Omit in DMs / single-topic chats.' },
-        format: { type: 'string', enum: ['html', 'markdownv2', 'text'], description: "Rendering mode. 'html' (default) converts markdown to Telegram HTML." },
-        reply_to: { type: 'string', description: 'Message ID to quote-reply to. Overrides the default (latest inbound).' },
-        quote: { type: 'boolean', description: 'Opt out of the default quote-reply behavior. Default: true. Ignored when reply_to is explicitly set.' },
-        protect_content: { type: 'boolean', description: 'When true, Telegram prevents the message from being forwarded or saved.' },
-        quote_text: { type: 'string', description: 'Surgical quote: specific text to highlight from the reply_to message. Requires reply_to.' },
-        disable_notification: { type: 'boolean', description: 'When true, the INITIAL message send is silent (no device ping). Has no effect on subsequent edits — Telegram never pings on editMessageText. Default false. Use for mid-turn stream starts you do not want to ping; omit on the final answer.' },
-        inline_keyboard: {
-          type: 'array',
-          description: '2D array of tappable buttons under the final message. Same shape and constraints as `reply.inline_keyboard` — each button has `text` and EXACTLY ONE of `url` or `callback_data`, plus optional `ack_text` (custom tap-toast; default "✓ received") and `single_use` (default true; set false to keep the keyboard tappable after a tap). Tap on a callback_data button is delivered to this agent as an inbound channel event with meta.button_callback_data set.',
-          items: {
-            type: 'array',
-            items: {
-              type: 'object',
-              properties: {
-                text: { type: 'string' },
-                url: { type: 'string' },
-                callback_data: { type: 'string' },
-                ack_text: { type: 'string', description: 'Toast text shown on tap. Default "✓ received".' },
-                single_use: { type: 'boolean', description: 'Default true. Set false to keep the keyboard tappable after this button is tapped.' },
               },
               required: ['text'],
             },
@@ -458,6 +419,24 @@ const TOOL_SCHEMAS = [
     },
   },
   {
+    name: 'mental_model_propose',
+    description:
+      "Propose a Hindsight MENTAL MODEL for the operator to approve (agent-proposes → human-approves, hindsight Phase 5). Use this when — over real work — you notice a recurring, domain-specific question worth maintaining a standing, semantically-refreshed answer to from YOUR bank (e.g. a coach's `training-plan-state`, a lawyer's `open-matters`). You may PROPOSE but can NEVER self-approve: this renders a Telegram [Approve]/[Deny] card to the operator. On Approve the model is DECLARED — appended to your `memory.mental_models[]` in switchroom.yaml via the operator-approved config-edit path — and ensured in your bank (it then refreshes from your bank content). On Deny nothing is written. This is NOT for identity/'who is the user' (dedicated profile banks own that) and NOT a substitute for `retain` (store a fact) or `create_mental_model` where you already have direct Hindsight tools — it is the leashed, human-gated way to add a DURABLE declared model to your config. After firing this tool, END YOUR TURN cleanly — a fresh inbound arrives (`<channel source=\"mental_model_proposal_applied\">` / `mental_model_proposal_denied`) once the operator decides. Do NOT propose a model whose name is already declared (it is rejected), and do NOT spam (one card per proposal; the operator sees every one).",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        chat_id: { type: 'string', description: 'Chat to render the approval card in (use the chat_id of the user message that triggered the workflow).' },
+        name: { type: 'string', description: 'Stable model name — the idempotent-ensure identity key (lowercase kebab/snake, e.g. `training-plan-state`). Must be UNIQUE among your already-declared models or the proposal is rejected.' },
+        source_query: { type: 'string', description: 'The reflection query the model answers, semantically refreshed from your bank content (e.g. "What is the athlete\'s current training plan, recent sessions, and open adjustments?"). Frame it as a DOMAIN question, never an identity question.' },
+        reason: { type: 'string', description: 'REQUIRED in practice — one-line rationale rendered on the card (e.g. "I keep re-deriving the plan state every session; a standing model would save the lookup"). Omitting it renders "why: not provided" and the operator will usually Deny.' },
+        refresh_after_consolidation: { type: 'boolean', description: 'Refresh this model after each consolidation. Defaults OFF — refresh adds bounded background model-spend + timeout risk (RFC Phase 5). Only set true when the model genuinely needs to track fast-moving state.' },
+        max_tokens: { type: 'number', description: 'Optional cap on the synthesized model\'s token size.' },
+        message_thread_id: { type: 'string', description: 'Forum topic thread ID. Auto-applied from the last inbound message if not specified.' },
+      },
+      required: ['chat_id', 'name', 'source_query'],
+    },
+  },
+  {
     name: 'linear_agent_activity',
     description:
       'Emit a structured Linear AgentActivity against an agent session (#2298). Use this ONLY inside a turn that was woken by a Linear agent session (the inbound carries meta.source="linear" and meta.agent_session_id) — pass that agent_session_id back here. Linear renders activities as status chips + a timeline on the issue, so the human sees acknowledge → work → result. Emit a `thought` within ~10s of being woken so the session does not look dead, then `message`(s) as you make progress, and finally exactly one terminal `complete` (work done) or `error` (you could not proceed). body is required for thought/message/error and optional for complete. Resolves the agent\'s Linear app token from the vault; on VAULT-BROKER-DENIED it returns an error instructing you to vault_request_access for `linear/<agent>/token`.',
@@ -622,6 +601,40 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 // added by either is honoured by all.
 const sessionAllowRules = new Set<string>()
 
+// #2861: outstanding permission-request ledger. Every permission_request from
+// claude is recorded here and re-sent on each IPC (re)connect, so a request
+// that arrives while the gateway is down (or that the gateway lost across a
+// restart) is redelivered instead of dropped. Deleted in onPermission when a
+// verdict is delivered. Kill switch: SWITCHROOM_PERMISSION_REARM=0 reverts to
+// the legacy drop-when-disconnected behavior.
+const outstandingPermissions = createOutstandingPermissionLedger()
+const permissionRearmEnabled = process.env.SWITCHROOM_PERMISSION_REARM !== '0'
+
+/**
+ * Re-send every outstanding permission_request to the gateway. Called on each
+ * IPC (re)connect via the ipc-client onConnect hook. The gateway dedupes /
+ * re-arms them idempotently (gateway/permission-rearm.ts), so re-sending on
+ * every reconnect is safe. Never answers a card — re-transmits the question.
+ */
+function flushOutstandingPermissionRequests(): void {
+  if (!permissionRearmEnabled) return
+  if (!ipc || !ipc.isConnected()) return
+  const pending = outstandingPermissions.all()
+  if (pending.length === 0) return
+  process.stderr.write(
+    `telegram bridge: re-sending ${pending.length} outstanding permission request(s) on gateway (re)connect\n`,
+  )
+  for (const p of pending) {
+    ipc.sendPermissionRequest({
+      type: 'permission_request',
+      requestId: p.request_id,
+      toolName: p.tool_name,
+      description: p.description,
+      inputPreview: p.input_preview,
+    })
+  }
+}
+
 mcp.setNotificationHandler(
   z.object({
     method: z.literal('notifications/claude/channel/permission_request'),
@@ -655,8 +668,29 @@ mcp.setNotificationHandler(
         return
       }
     }
+    // #2861: record the request in the outstanding ledger BEFORE the connect
+    // check so it survives a disconnected gateway and is re-sent on reconnect.
+    // It's deleted in onPermission when the verdict is delivered.
+    if (permissionRearmEnabled) {
+      outstandingPermissions.add({
+        request_id: params.request_id,
+        tool_name: params.tool_name,
+        description: params.description,
+        input_preview: params.input_preview,
+      })
+    }
     if (!ipc || !ipc.isConnected()) {
-      process.stderr.write('telegram bridge: permission_request received but not connected to gateway\n')
+      // BUFFER, don't drop (#2861 R2). The request is in the ledger; the
+      // onConnect flush re-sends it once the gateway is reachable. Falls back
+      // to the legacy drop only when re-arm is killed.
+      if (permissionRearmEnabled) {
+        process.stderr.write(
+          `telegram bridge: permission_request buffered (gateway offline), will re-send on reconnect ` +
+          `request_id=${params.request_id}\n`,
+        )
+      } else {
+        process.stderr.write('telegram bridge: permission_request received but not connected to gateway\n')
+      }
       return
     }
     ipc.sendPermissionRequest({
@@ -698,6 +732,9 @@ function onPermission(msg: PermissionEvent): void {
   if (msg.rule) {
     sessionAllowRules.add(msg.rule)
   }
+  // #2861: verdict delivered → drop the request from the outstanding ledger so
+  // a later reconnect doesn't re-send an already-resolved approval.
+  outstandingPermissions.delete(msg.requestId)
   mcp.notification({
     method: 'notifications/claude/channel/permission',
     params: {
@@ -876,6 +913,8 @@ async function main(): Promise<void> {
     onInbound,
     onPermission,
     onStatus,
+    // #2861: re-send outstanding permission requests on every (re)connect.
+    onConnect: flushOutstandingPermissionRequests,
     log: (msg) => process.stderr.write(`telegram bridge: ipc: ${msg}\n`),
     // #2307 Tier-1: the cron-session bridge shares the agent's STATE_DIR
     // (access.json / history / gateway.sock) but writes its liveness file to a

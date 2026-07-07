@@ -12,7 +12,7 @@
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context, type Api } from 'grammy'
 import { run, type RunnerHandle } from '@grammyjs/runner'
 import type { ReactionTypeEmoji } from 'grammy/types'
-import { randomBytes } from 'crypto'
+import { randomBytes, createHash } from 'crypto'
 import { execFileSync, execSync, spawn } from 'child_process'
 import {
   readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync,
@@ -93,6 +93,20 @@ import {
 import { StatusReactionController } from '../status-reactions.js'
 import { DeferredDoneReactions } from '../reaction-defer.js'
 import { createWorkerActivityFeed, isWorkerActivityFeedEnabled } from '../worker-activity-feed.js'
+import {
+  detectMemoryLegibilityEvent,
+  isMemoryLegibilityEnabled,
+  renderMemoryLegibilityLine,
+  MemoryLegibilityStager,
+} from '../memory-legibility.js'
+import {
+  ConsolidationRateLimiter,
+  consolidationSignature,
+  detectConsolidationEvent,
+  isConsolidationLegibilityEnabled,
+  renderConsolidationLine,
+} from '../consolidation-legibility.js'
+import type { WebhookGatewayRecord } from '../../src/web/webhook-gateway-record.js'
 import { reconcilePin, type PinBotApi } from '../status-pin-driver.js'
 import type { PinState, DesiredPin } from '../status-pin.js'
 import { decidePinAction } from '../status-pin.js'
@@ -111,10 +125,25 @@ import {
   type PermissionCardRef,
 } from './permission-timeout.js'
 import { renderVaultRequestAccessCard } from './vault-request-access-card.js'
-import { createPermissionCardStore } from './permission-card-store.js'
+import { createPermissionCardStore, type PersistedPermCard } from './permission-card-store.js'
+import {
+  isPermissionRearmEnabled,
+  permissionRearmGraceMs,
+  classifyPermissionRequest,
+  computeBootSweepStripTargets,
+  distinctRequestIds,
+} from './permission-rearm.js'
+import { createMissedApprovalsStore, type MissedApproval } from './missed-approvals-store.js'
+import {
+  renderMissedApprovalsDigest,
+  missedApprovalsKeyboard,
+  parseMissedApprovalCallback,
+  buildMissedApprovalRetryInbound,
+} from './missed-approvals-card.js'
 import { pickRecoveredPermissionOrigin } from './permission-card-origin.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
-import { appendActivityLabel, clipNarrative, renderActivityFeedWithNested, type SessionActivityHeader } from '../tool-activity-summary.js'
+import { appendActivityLabel, clipNarrative, renderActivityFeedWithNested, formatStepSuffix, type SessionActivityHeader } from '../tool-activity-summary.js'
+import { runSilentTurnHeartbeatTick } from '../feed-heartbeat-climb.js'
 import { REPLY_TOOLS, isDraftOfReply } from '../narrative-dedup.js'
 import { toolLabel } from '../tool-labels.js'
 import { createTypingWrapper } from '../typing-wrap.js'
@@ -144,7 +173,7 @@ import { decideSilentReplyAnchor } from '../silent-reply-anchor.js'
 import { classifyInbound } from '../inbound-classifier.js'
 import * as silencePoke from '../silence-poke.js'
 import * as pendingProgress from '../pending-work-progress.js'
-import { writeSilentEndState, clearSilentEndState, recordUndeliveredTurnEnd } from '../silent-end.js'
+import { writeSilentEndState, clearSilentEndState, recordUndeliveredTurnEnd, silentEndFallbackText, type SilentEndDeps } from '../silent-end.js'
 import { isFinalAnswerReply, isSubstantiveFinalReply, FINAL_ANSWER_MIN_CHARS } from '../final-answer-detect.js'
 import { deriveTurnRole, decideTerminalReason, parsePostAnswerLivenessMs, evaluatePostAnswerLiveness, type LoopRole } from '../turn-liveness-floor.js'
 import { createAnswerStream, type AnswerStreamHandle } from '../answer-stream.js'
@@ -224,16 +253,10 @@ import { validateStringArray } from './access-validator.js'
  */
 const REPLY_TO_TEXT_MAX = 200
 
-/**
- * #1161 — user-facing fallback delivered when a user-message turn ends
- * with zero outbound messages AND the deterministic Stop-hook re-prompt
- * has already been exhausted. Without this the user only sees the
- * progress card vanish; silence must never be the failure mode.
- */
-const SILENT_END_FALLBACK_TEXT =
-  '⚠️ The agent finished working but didn’t send a reply — your last ' +
-  'message may not have been answered. Please try asking again.'
-import { splitMarkdownChunks, hardSliceToCap, repairEscapedWhitespace, normalizeParagraphBreaks, addParagraphSpacers, normalizePunctuation, stripExcessBold, escapeMarkdown, RICH_MESSAGE_MAX_CHARS } from '../format.js'
+// #1161 silent-end fallback text now lives in ../silent-end.ts
+// (`silentEndFallbackText`, imported above) so the transport-boundary
+// tests exercise the real string — see PR #2892.
+import { splitMarkdownChunks, hardSliceToCap, repairEscapedWhitespace, normalizeParagraphBreaks, addParagraphSpacers, normalizePunctuation, stripExcessBold, escapeMarkdown, hardenCardBreaks, RICH_MESSAGE_MAX_CHARS } from '../format.js'
 import { richMessage } from '../rich-send.js'
 import { scrubVoice } from '../text-voice-scrub.js'
 import {
@@ -285,6 +308,7 @@ import {
 } from '../active-reactions.js'
 import { sweepActiveReactions } from '../active-reactions-sweep.js'
 import { flushOnAgentDisconnect } from './disconnect-flush.js'
+import { markBusyKeyLockstep, reapOrphanBusyKeys } from './busy-key-reaper.js'
 import { PreambleSuppressor } from './preamble-suppressor.js'
 import {
   fetchFolderPage,
@@ -385,6 +409,7 @@ import {
 import { loadObligations, persistObligations } from './obligation-store.js'
 import {
   loadStatusPins,
+  mutateStatusPinRow,
   pinnedMessageIsOurs,
   reconcileAndPersistStatusPin,
   runStatusPinBootCleanup,
@@ -392,8 +417,17 @@ import {
   type StatusPinPersistOp,
   type TrackedStatusPin,
 } from './status-pin-store.js'
+import {
+  writeActivityCardRecord,
+  clearActivityCardRecord,
+  runActivityCardBootReaper,
+  runActivityCardMidSessionReaper,
+  restartOrphanCardFinalizeText,
+  type ActivityCardStoreFsSeam,
+} from './activity-card-store.js'
 import { driveEscalation } from './escalation-drive.js'
 import { shouldSuppressRepresent } from './represent-guard.js'
+import { shouldDeferEscalationForBridge } from './escalation-bridge-gate.js'
 import { createInboundSpool } from './inbound-spool.js'
 import { purgeStaleTurnsForChat } from './turn-state-purge.js'
 import { decideInboundDelivery } from './inbound-delivery-gate.js'
@@ -424,6 +458,7 @@ import {
   forgetDelivery,
   shouldTrackDelivery,
   isTrackableResumeSynthetic,
+  isRedeliverySuspended,
   type PendingDelivery,
 } from './inbound-delivery-confirm.js'
 import { createPendingPermissionBuffer } from './pending-permission-decisions.js'
@@ -436,6 +471,7 @@ import { chatKey, chatKeyWithSuffix, chatIdOfChatKey } from './chat-key.js'
 import { shadowEmit, isMachineInTurn, isDeliveryCutoverEnabled } from './inbound-delivery-machine-shadow.js'
 import type { ChatKey as _ChatKey } from './inbound-delivery-machine.js'
 import { dispatchEffects, isDispatchEnabled } from './inbound-delivery-machine-dispatch.js'
+import { probeGateParity } from './gate-parity-probe.js'
 import { maybeFireWarmup } from './prefix-warmup.js'
 import {
   buildVaultGrantApprovedInbound,
@@ -445,6 +481,12 @@ import {
   buildVaultSaveFailedInbound,
   buildVaultSaveDiscardedInbound,
 } from './vault-grant-inbound-builders.js'
+import { renderMentalModelProposeCard } from './mental-model-propose-card.js'
+import {
+  resolveMentalModelProposal,
+  type MentalModelPendingProposal,
+} from './mental-model-propose-resolve.js'
+import { readDeclaredMentalModelNames } from './mental-model-propose-diff.js'
 import {
   parseSkillProposalCallback,
   buildSkillProposalApplyInbound,
@@ -528,6 +570,8 @@ import {
   startSubagentWatcher,
   type SubagentWatcherHandle,
 } from '../subagent-watcher.js'
+import { listRecords as listWorktreeRecords } from '../../src/worktree/registry.js'
+import { ownedWorktreeCwds } from '../worktree-watch-cwds.js'
 import {
   startBootCard,
   resolvePersonaName,
@@ -548,7 +592,9 @@ import {
   recordScopedGrant,
   lookupScopedGrant,
   sweepScopedGrants,
+  countScopedGrants,
 } from '../scoped-approval.js'
+import { createScopedGrantStore } from './scoped-grant-store.js'
 import { grantRestartDecision, type GrantRestartDecision } from './grant-restart.js'
 import { synthesizeAllowRuleDiff, extractAddedAllowRule } from '../permission-diff.js'
 import {
@@ -571,7 +617,7 @@ import {
   QUOTA_WATCH_CLAIM_WINDOW_MS,
   isLiveCorroboration,
 } from '../quota-watch.js'
-import { buildSnapshotsFromState, buildSnapshotsFromCachedState } from '../auth-snapshot-format.js'
+import { buildSnapshotsFromState, buildSnapshotsFromCachedState, zipProbeResults } from '../auth-snapshot-format.js'
 import { maskUsername, maskVaultKey } from '../demo-mask.js'
 import {
   writeTurnActiveMarker,
@@ -618,13 +664,15 @@ import {
   findLatestTurnIfInterrupted,
   findRecentTurnsForChat,
   getTurnByKey,
+  markTurnResumed,
+  reapStaleOpenTurns,
 } from '../registry/turns-schema.js'
 import {
   buildResumeInterruptedInbound,
   buildResumeWatchdogReportInbound,
   selectResumeBuilder,
 } from './resume-inbound-builder.js'
-import { applySubagentsSchema, getSubagentByJsonlId } from '../registry/subagents-schema.js'
+import { applySubagentsSchema, getSubagentByJsonlId, resolveSubagentOriginTurnKey } from '../registry/subagents-schema.js'
 import { resolveWorkerFeedDispatch, type WorkerFeedDispatch } from './worker-feed-dispatch.js'
 import {
   resolveSubagentStatusSurface,
@@ -662,6 +710,12 @@ process.on('beforeExit', () => {
 // ─── Env + state dir ──────────────────────────────────────────────────────
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const permCardStore = createPermissionCardStore(STATE_DIR)
+// #2862 — missed-approvals re-offer. Persisted list of approvals that
+// TTL-expired while the operator was away; a digest card is posted on the
+// operator's next activity. Kill switch: SWITCHROOM_MISSED_APPROVAL_REOFFER=0.
+const missedApprovalsStore = createMissedApprovalsStore(STATE_DIR)
+const MISSED_APPROVAL_REOFFER_ENABLED =
+  process.env.SWITCHROOM_MISSED_APPROVAL_REOFFER !== '0'
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
@@ -1410,9 +1464,15 @@ function resolveSubagentOriginChat(
 ): { chatId: string; threadId?: number } | null {
   if (turnsDb == null) return null
   try {
-    const sub = getSubagentByJsonlId(turnsDb, agentId)
-    if (sub?.parent_turn_key == null) return null
-    const turn = getTurnByKey(turnsDb, sub.parent_turn_key)
+    // Transitive walk: a NESTED (depth-2+) worker's own parent_turn_key is
+    // NULL by construction (its dispatching context is another sub-agent,
+    // not a gateway turn) — resolveSubagentOriginTurnKey follows the
+    // parent_agent_id chain to the ancestor row that WAS stamped at
+    // main-turn dispatch time, so nested cards + handbacks route to the
+    // originating chat/topic instead of falling back to the owner DM.
+    const originKey = resolveSubagentOriginTurnKey(turnsDb, agentId)
+    if (originKey == null) return null
+    const turn = getTurnByKey(turnsDb, originKey)
     if (turn == null || turn.chat_id.length === 0) return null
     const threadNum =
       turn.thread_id != null && turn.thread_id.length > 0
@@ -1543,8 +1603,8 @@ const deferredDoneReactions = new DeferredDoneReactions<StatusReactionController
   purge: (key) => purgeReactionTracking(key),
 })
 
-// #546 — outbound content-dedup window. PR #599 introduced the four read
-// sites (`outboundDedup.check` / `.record` in executeReply, executeStreamReply,
+// #546 — outbound content-dedup window. PR #599 introduced the read
+// sites (`outboundDedup.check` / `.record` in executeReply and
 // turn-flush) but the declaration was lost in a merge somewhere — every reply
 // path threw `outboundDedup is not defined` at runtime, blocking ALL outbound
 // from the agent. Restore the module-level singleton here.
@@ -1584,6 +1644,18 @@ const activeTurnStartedAt = new Map<string, number>()
 // reading activeTurnStartedAt because they want the receipt timestamp.
 const claudeBusyKeys = new Set<string>()
 
+// #2787 Mechanism B — insertion timestamps for the busy keys above, so the
+// confirm sweep can reap an orphaned marker. `busy` is stamped EAGERLY at
+// delivery and cleared only at turn_end; a delivered-but-never-enqueued inbound
+// (e.g. a composer strand or an enqueue-ack mismatch) therefore leaves its key
+// stuck forever, wedging the legacy-regime idle-drain (turnInFlightForGate reads
+// claudeBusyKeys.size) for EVERY topic until the ~300s silence poke — the
+// 5-minute all-topics stall of #1922. The reaper (reapOrphanBusyKeys) uses these
+// timestamps to bound that dangle. The delivery-machine cutover regime is already
+// immune (it tracks one activeTurn + TTL tick, never a per-key set); this bounds
+// the legacy path it hasn't replaced yet.
+const claudeBusyKeySince = new Map<string, number>()
+
 /**
  * #2527 observability: count emoji transitions per status-reaction controller
  * so `turn_no_reply_warn` can report how many reaction changes happened while
@@ -1617,8 +1689,66 @@ function markClaudeBusyForInbound(m: {
     if (Number.isFinite(n)) tid = n
   }
   const key = chatKey(m.chatId, tid)
-  claudeBusyKeys.add(key)
+  // #2787: lockstep add + idle→busy timestamp. Keyed on set membership (see
+  // busy-key-reaper.ts) so a re-mark after a disconnect flush (which cleared
+  // claudeBusyKeys directly) always re-stamps a fresh Date.now() and the orphan
+  // TTL measures the CURRENT dangle, never a stale pre-disconnect timestamp.
+  markBusyKeyLockstep(claudeBusyKeys, claudeBusyKeySince, key, Date.now())
   return key
+}
+
+// #2787 Mechanism B — reap orphaned busy markers. Called from the confirm sweep
+// ONLY once `currentTurn == null` has been asserted: with no turn in flight, any
+// surviving claudeBusyKeys entry is definitionally an orphan (a real turn would
+// hold currentTurn non-null), so clearing a stale one can never clobber a live
+// turn. Also prunes timestamp entries whose key already left the set (e.g. a
+// disconnect flush cleared claudeBusyKeys directly) so the map can't grow
+// unbounded.
+//
+// SLOW-DELIVERY SAFETY (the #1922 hazard): `currentTurn == null` is NOT proof of
+// idle — busy is marked EAGERLY at delivery, and the gateway→claude enqueue-ack
+// lag can be up to ~5 MINUTES under load (#1922). During that eager-mark→enqueue
+// window `currentTurn` is null yet the turn is real-and-merely-slow, so a bare
+// time-grace reaper could reap a genuine delivery and re-open the idle-drain gate
+// while claude is about to process the very inbound whose key it just reaped
+// (duplicate / concurrent delivery on the CORE inbound path). A time grace alone
+// cannot distinguish "slow" from "orphaned".
+//
+// So the reap is PROOF-GATED, not just time-gated (option (b), the load-bearing
+// guarantee): a key is reaped ONLY when it has NO corresponding entry in the
+// delivery-confirm queue (`deliveryQueue.pending`). A slow-but-real inbound is
+// tracked there from delivery until claude's `enqueue` ack lands (or forever, via
+// the never-drop re-deliver loop), so any key still awaiting its turn is present
+// and skipped — no matter how slow. Only a key that is busy-marked yet has no
+// pending delivery is a TRUE orphan: either it was acked (its turn ran and should
+// have cleared busy at turn_end — a genuinely stuck marker) or it was a
+// steer/interrupt inbound that shouldTrackDelivery excludes (it amends a running
+// turn, so with currentTurn == null its marker is likewise stale). Reaping only
+// these can never clobber a slow delivery.
+//
+// The time grace is retained as defense-in-depth on top of the proof gate, raised
+// to a default well above the observed enqueue-ack lag and env-tunable via the
+// config cascade. This bounds the legacy-regime idle-drain wedge from ~300s
+// (silence poke) to the grace window without racing a slow delivery.
+//
+// Config cascade: SWITCHROOM_BUSY_ORPHAN_TTL_MS is an OVERRIDE-mode scalar
+// (defaults → profiles → agents; a lower layer's value replaces, not merges).
+// Default 360_000ms (6 min) — comfortably above the ~5-min #1922 tail so the
+// grace never trips on a merely-slow delivery even if the proof gate is bypassed.
+// Clamped to a positive finite value; a degenerate override falls back to default.
+const _busyOrphanTtlRaw = process.env.SWITCHROOM_BUSY_ORPHAN_TTL_MS
+const _busyOrphanTtlParsed =
+  _busyOrphanTtlRaw != null && _busyOrphanTtlRaw !== '' ? Number(_busyOrphanTtlRaw) : 360_000
+const CLAUDE_BUSY_ORPHAN_TTL_MS =
+  Number.isFinite(_busyOrphanTtlParsed) && _busyOrphanTtlParsed > 0 ? _busyOrphanTtlParsed : 360_000
+function reapOrphanBusyKeysNow(now: number): void {
+  reapOrphanBusyKeys(claudeBusyKeys, claudeBusyKeySince, now, {
+    ttlMs: CLAUDE_BUSY_ORPHAN_TTL_MS,
+    // Proof gate — a key still tracked in the delivery-confirm queue is a
+    // slow-but-real inbound awaiting its enqueue ack, never an orphan (#1922).
+    hasPendingDelivery: (key) => deliveryQueue.pending.has(key),
+    log: (msg) => process.stderr.write(`${msg}\n`),
+  })
 }
 
 // ─── Reliable inbound delivery: deliver-until-acked (the marko drop-wedge) ─
@@ -1941,13 +2071,8 @@ const POST_ANSWER_LIVENESS_STALE_MS = parsePostAnswerLivenessMs(
   process.env.SWITCHROOM_POST_ANSWER_LIVENESS_STALE_MS,
 ) || 30_000
 
-/** Compact mm/ss-ish elapsed for the live feed suffix: "18s", "1m05s". */
-function formatFeedElapsed(ms: number): string {
-  const s = Math.floor(ms / 1000)
-  if (s < 60) return `${s}s`
-  const m = Math.floor(s / 60)
-  return `${m}m${(s % 60).toString().padStart(2, '0')}s`
-}
+// Live-feed step suffixes render via `formatStepSuffix` (tool-activity-summary):
+// the CURRENT step's own elapsed, shown only past STEP_TIMER_MIN_MS (10 s).
 
 /**
  * Authoritative "is a turn in flight?" for every gate that previously
@@ -1964,7 +2089,25 @@ function formatFeedElapsed(ms: number): string {
  * message self-blocks. See the snapshot at the inbound handler.
  */
 function turnInFlightForGate(): boolean {
-  return isDeliveryCutoverEnabled() ? isMachineInTurn() : claudeBusyKeys.size > 0
+  // Include pendingPermissions in the "turn busy" signal (#2841): after the
+  // first interim reply, `releaseTurnBufferGate` clears claudeBusyKeys/machine
+  // even though a permission card is still outstanding and claude is still
+  // blocked mid-turn waiting for the tap verdict. A new inbound that arrives
+  // in this window would see turnInFlightAtReceipt=false and deliver directly,
+  // landing while claude's bridge is suspended in the permission-notification
+  // handler — displacing the approval and orphaning the pending brevo/MCP call.
+  // Keeping the gate closed for as long as there is an outstanding approval
+  // card prevents that race. The gate reopens when the card is tapped or times
+  // out (pendingPermissions.delete in finalizeCallback / TTL sweep).
+  const hasPendingApproval = pendingPermissions.size > 0
+  if (!isDeliveryCutoverEnabled()) return claudeBusyKeys.size > 0 || hasPendingApproval
+  // Machine is authoritative. Run the log-only drift canary (#2794): the
+  // imperative `claudeBusyKeys` shadow is still live in parallel, so a
+  // dangerous over-hold divergence (machine holds the gate while the
+  // imperative view is idle) is surfaced without changing behaviour. The
+  // benign orphan-dangle direction — the wedge the machine self-heals — is
+  // NOT flagged. `probeGateParity` returns the machine value unchanged.
+  return probeGateParity(isMachineInTurn(), claudeBusyKeys.size) || hasPendingApproval
 }
 
 /**
@@ -3270,6 +3413,7 @@ function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
   // the markClaudeBusyForInbound on the delivery path. Safe no-op
   // when the key was never marked (synthetic purge from a sweep).
   claudeBusyKeys.delete(key)
+  claudeBusyKeySince.delete(key) // #2787: keep the orphan-TTL map in lockstep
   // #2527: clear the per-key reaction-transition counter and first-reply
   // sentinel alongside the controller so we don't leak state across turns.
   reactionTransitionCounts.delete(key)
@@ -3455,6 +3599,7 @@ function releaseTurnBufferGate(key: string, endingTurn?: CurrentTurn): void {
   // PR3b: keep claudeBusyKeys in sync — same lifecycle as the
   // activeTurnStartedAt entry it's mirroring here.
   claudeBusyKeys.delete(key)
+  claudeBusyKeySince.delete(key) // #2787: keep the orphan-TTL map in lockstep
   // Shadow trace so the structural turn-end metric still records.
   // outboundEmitted=true is correct here — we only reach this from
   // executeReply AFTER an outbound landed.
@@ -4458,7 +4603,7 @@ const STATUS_QUERY_RE = /^\s*status\??\s*$/i
 
 // ─── Permission handling ──────────────────────────────────────────────────
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
-const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string; startedAt: number; card_text: string; cards: { chatId: string; messageId: number }[] }>()
+const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string; startedAt: number; card_text: string; cards: { chatId: string; messageId: number; threadId?: number | null }[] }>()
 // PERMISSION_TTL_MS / ttlForTool / the timed-out card builder now live in
 // ./permission-timeout.ts (pure + unit-testable). hostd gated verbs get a
 // 30-min window; everything else keeps the 10-min default.
@@ -4482,6 +4627,131 @@ function clearPermissionTimeoutSuppression(reason: string): void {
   permissionTimeoutSignatures.clear()
   process.stderr.write(
     `telegram gateway: permission no-repeat suppression cleared (${n} sig(s)) — ${reason}\n`,
+  )
+}
+
+// #2862 — missed-approvals re-offer digest. Called from every operator-activity
+// path that clears no-repeat suppression (inbound, /approve|/deny, card verdict):
+// on the FIRST activity after ≥1 approval TTL-expired while the operator was
+// away, post ONE compact digest card per origin surface listing the misses,
+// then promote those pending entries into a delivered-digest record (the posted
+// card is now the durable record in chat). Best-effort + fire-and-forget: never
+// blocks or throws into the hot inbound/callback path. Kill switch (=0) makes
+// this a no-op AND the auto-deny append below a no-op, so the whole feature is off.
+function maybePostMissedApprovalDigest(reason: string): void {
+  if (!MISSED_APPROVAL_REOFFER_ENABLED) return
+  const pending = missedApprovalsStore.listPending()
+  if (pending.length === 0) return
+  // Group by origin surface so each card lands where its cards were posted.
+  const groups = new Map<string, MissedApproval[]>()
+  for (const e of pending) {
+    const key = `${e.chatId}::${e.threadId ?? ''}`
+    const g = groups.get(key)
+    if (g) g.push(e)
+    else groups.set(key, [e])
+  }
+  for (const entries of groups.values()) {
+    const first = entries[0]
+    const chatId = first.chatId
+    const threadId = first.threadId ?? undefined
+    const digestId = randomBytes(4).toString('hex')
+    const text = renderMissedApprovalsDigest(entries, {
+      agentName: process.env.SWITCHROOM_AGENT_NAME ?? null,
+    })
+    void swallowingApiCall(
+      () =>
+        // allow-raw-bot-api: routed through swallowingApiCall retry policy; thread-aware digest card
+        bot.api.sendMessage(chatId, text, {
+          parse_mode: 'HTML',
+          reply_markup: missedApprovalsKeyboard(digestId),
+          ...(threadId != null && threadId !== 1 ? { message_thread_id: threadId } : {}),
+        }),
+      { chat_id: chatId, verb: 'missed-approval-digest', ...(threadId != null ? { threadId } : {}) },
+    )
+    // Promote synchronously (before the async send resolves) so a second
+    // operator-activity event racing in sees an empty pending list and can't
+    // double-post — "one card per accumulated batch" holds.
+    missedApprovalsStore.promoteToDigest({
+      digestId,
+      chatId,
+      threadId: first.threadId ?? null,
+      entries,
+      deliveredAt: Date.now(),
+    })
+  }
+  process.stderr.write(
+    `telegram gateway: missed-approval digest posted (${pending.length} entr(y/ies), ` +
+    `${groups.size} surface(s)) — ${reason}\n`,
+  )
+}
+
+// #2862 — handle a Retry / Dismiss tap on a missed-approvals digest card.
+//   missre:retry:<id>   — inject a synthetic inbound asking the agent to
+//                         re-attempt the actions (claude-native; re-raises a
+//                         fresh approval card). NEVER a verdict / re-execution.
+//   missre:dismiss:<id> — clear the record + edit the card closed.
+async function handleMissedApprovalCallback(ctx: Context, data: string): Promise<void> {
+  const senderId = String(ctx.from?.id ?? '')
+  const access = loadAccess()
+  if (!access.allowFrom.includes(senderId)) {
+    await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+    return
+  }
+  const parsed = parseMissedApprovalCallback(data)
+  if (parsed == null) {
+    await ctx.answerCallbackQuery({ text: 'Bad request' }).catch(() => {})
+    return
+  }
+  const digest = missedApprovalsStore.getDigest(parsed.digestId)
+  if (digest == null) {
+    await ctx.answerCallbackQuery({ text: 'This digest already actioned or expired.' }).catch(() => {})
+    if (ctx.callbackQuery?.message) {
+      await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => {})
+    }
+    return
+  }
+
+  if (parsed.action === 'dismiss') {
+    missedApprovalsStore.removeDigest(parsed.digestId)
+    await ctx.answerCallbackQuery({ text: '🚫 Dismissed — cleared.' }).catch(() => {})
+    if (ctx.callbackQuery?.message && 'text' in ctx.callbackQuery.message) {
+      await ctx
+        .editMessageText(
+          `${escapeHtmlForTg(ctx.callbackQuery.message.text ?? '')}\n\n🚫 <i>Dismissed.</i>`,
+          { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+        )
+        .catch(() => {})
+    }
+    return
+  }
+
+  // Retry — consume the record, then inject a synthetic inbound to the ORIGIN
+  // surface asking the agent to re-attempt. This rides the same synthesized-
+  // inbound path cron uses; the agent naturally re-raises a fresh approval card.
+  missedApprovalsStore.removeDigest(parsed.digestId)
+  const agent = process.env.SWITCHROOM_AGENT_NAME ?? ''
+  const synthetic = buildMissedApprovalRetryInbound({
+    ctx: {
+      agent,
+      chat_id: digest.chatId,
+      ...(digest.threadId != null ? { threadId: digest.threadId } : {}),
+    },
+    actions: digest.entries.map(e => e.action),
+    operatorId: senderId,
+  })
+  const delivered = deliverResumeSyntheticOrBuffer(agent, synthetic)
+  await ctx.answerCallbackQuery({ text: '🔁 Asking the agent to retry…' }).catch(() => {})
+  if (ctx.callbackQuery?.message && 'text' in ctx.callbackQuery.message) {
+    await ctx
+      .editMessageText(
+        `${escapeHtmlForTg(ctx.callbackQuery.message.text ?? '')}\n\n🔁 <i>Retrying — asked the agent.</i>`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+      )
+      .catch(() => {})
+  }
+  process.stderr.write(
+    `telegram gateway: missed-approval retry injection agent=${agent} ` +
+    `digest=${parsed.digestId} actions=${digest.entries.length} delivered=${delivered}\n`,
   )
 }
 // Permission/approval-card origin recovery (marko Rentals-budget, 2026-06-17).
@@ -4517,13 +4787,54 @@ function sweepStaleAlwaysAllowCorrelations(now = Date.now()): void {
   }
 }
 
+// Sibling of pendingAlwaysAllowCorrelations for the agent-proposes →
+// human-approves MENTAL MODEL flow (hindsight Phase 5). When the operator
+// taps Approve on a mental-model PROPOSAL card, the gateway dispatches a
+// `config_propose_edit` appending the model to memory.mental_models[]; hostd
+// then calls back for operator approval. We pre-register the exact diff here
+// so that callback auto-approves WITHOUT a second card (the operator already
+// approved on the proposal card). Forge-resistance: the auto-resolve match is
+// an EXACT byte-match of the inbound diff against the diff the gateway itself
+// synthesized and queued — an agent-forged edit finds no entry and falls
+// through to a real operator card. Single-shot + a dedicated TTL sweep.
+//
+// TTL: this correlation must outlive the WHOLE config-edit approval budget,
+// NOT the 30s "always allow" window. The mental-model resolve dispatches
+// `config_propose_edit` to hostd with a 720s timeout (see the 720_000 dispatch
+// budgets below); hostd's approval callback can legitimately arrive any time
+// within that window if the operator taps slowly. Reusing the 30s
+// ALWAYS_ALLOW_CORRELATION_TTL_MS would sweep the correlation out from under a
+// slow-but-valid tap, dropping the auto-approve and surfacing a SECOND card
+// for an edit the operator already approved. Size it to the hostd budget.
+const MENTAL_MODEL_CORRELATION_TTL_MS = 720_000
+const pendingMentalModelCorrelations = new Map<string, { agentName: string; unifiedDiff: string; createdAt: number }>()
+function mentalModelCorrelationKey(agentName: string, unifiedDiff: string): string {
+  return `${agentName}::${createHash('sha256').update(unifiedDiff).digest('hex')}`
+}
+function sweepStaleMentalModelCorrelations(now = Date.now()): void {
+  for (const [key, entry] of pendingMentalModelCorrelations) {
+    if (now - entry.createdAt > MENTAL_MODEL_CORRELATION_TTL_MS) {
+      pendingMentalModelCorrelations.delete(key)
+    }
+  }
+}
+
 // Scoped-approval store: the 30-min window that backs the "✅ Allow" tap for
 // narrow non-destructive scopes (not a separate button — it IS what Allow
 // means for those). Operator-tapped, gateway-side ONLY (never pushed to the
 // bridge's untimed sessionAllowRules), fixed-window, fail-closed. Keyed by
 // agent name for per-agent isolation. All policy lives in
 // ../scoped-approval.ts (pure + unit-tested); this gateway only wires it.
-const scopedGrants: ScopedGrantStore = new Map()
+//
+// Persisted across gateway restarts (#2863): a bounce (fleet roll / config
+// apply / failover probe) used to wipe every window, re-carding an action the
+// operator allowed minutes ago. The store mirrors to a tiny STATE_DIR JSON
+// file; reload drops entries already past their ABSOLUTE expiry (a restart
+// never extends a window). Kill switch SWITCHROOM_SCOPED_GRANT_PERSIST=0 boots
+// empty and never writes. Fail-closed lookup semantics are unchanged — a
+// reloaded grant runs the same lookupScopedGrant gate as an in-memory one.
+const scopedGrantStore = createScopedGrantStore(STATE_DIR)
+const scopedGrants: ScopedGrantStore = scopedGrantStore.load(Date.now())
 const selfAgentName = (): string => process.env.SWITCHROOM_AGENT_NAME ?? ''
 
 // `ask_user` MCP tool — open prompts awaiting a user button-tap.
@@ -4850,6 +5161,81 @@ function sweepPendingVaultRequestAccesses(): void {
 }
 
 /**
+ * Staged agent-initiated MENTAL MODEL proposal (hindsight Phase 5). The agent
+ * calls `mental_model_propose`; the operator taps Approve/Deny on the card.
+ * Mirrors PendingVaultRequestAccess — no memory content is staged here, only
+ * the proposed DECLARATION (name + source_query + optional knobs). On Approve
+ * the model becomes a first-class declared model in memory.mental_models[] via
+ * the operator-approved config-edit path; on Deny nothing is written.
+ */
+interface PendingMentalModelPropose {
+  agent: string
+  chat_id: string
+  card_message_id?: number
+  threadId?: number
+  /** Proposed declaration, snake_case (matches memory.mental_models[] schema). */
+  spec: {
+    name: string
+    source_query: string
+    refresh_after_consolidation?: boolean
+    max_tokens?: number
+  }
+  reason?: string
+  staged_at: number
+}
+const pendingMentalModelProposes = new Map<string, PendingMentalModelPropose>()
+const MENTAL_MODEL_PROPOSE_TTL_MS = approvalTtlMs()
+// Sweep expired pending proposals. For any entry past its TTL we ALSO edit the
+// posted card's keyboard away, so a stale card left in the chat can't be tapped
+// into a "Card expired" answer — the operator sees the ⌛ expiry inline instead.
+// Best-effort: card edits are fire-and-forget (the entry is removed regardless).
+function sweepPendingMentalModelProposes(): void {
+  const cutoff = Date.now() - MENTAL_MODEL_PROPOSE_TTL_MS
+  for (const [k, v] of pendingMentalModelProposes) {
+    if (v.staged_at < cutoff) {
+      pendingMentalModelProposes.delete(k)
+      if (v.card_message_id != null) {
+        void lockedBot.api
+          .editMessageText(
+            v.chat_id,
+            v.card_message_id,
+            richMessage('⌛ _This mental-model proposal card expired. Ask the agent to re-propose if it still stands._'),
+            { reply_markup: { inline_keyboard: [] } },
+          )
+          .catch(() => {})
+      }
+    }
+  }
+}
+
+// Sliding-window rate limit for mental-model proposals: at most
+// MENTAL_MODEL_PROPOSE_MAX_PER_WINDOW cards per MENTAL_MODEL_PROPOSE_WINDOW_MS.
+// The window is per-gateway-process, and since each agent runs its own gateway
+// process (keyed by $SWITCHROOM_AGENT_NAME), one process == one agent — so this
+// throttle is effectively per-agent. A candidate model is a deliberate, rare
+// curation act — an agent that re-proposes in a loop should be throttled so the
+// operator is never spammed.
+const mentalModelProposeTimes: number[] = []
+const MENTAL_MODEL_PROPOSE_WINDOW_MS = 60 * 60 * 1000
+const MENTAL_MODEL_PROPOSE_MAX_PER_WINDOW = 5
+// Mirror the memory.mental_models[] schema caps (src/config/schema.ts): a
+// source_query capped at 2000 chars and max_tokens capped at 8192. Enforced
+// up-front in executeMentalModelPropose so a proposal that would fail hostd
+// config validation never reaches an approval card.
+const MENTAL_MODEL_SOURCE_QUERY_MAX = 2000
+const MENTAL_MODEL_MAX_TOKENS_CAP = 8192
+function checkMentalModelProposeRate(now = Date.now()): { ok: true } | { ok: false; retryAtMs: number } {
+  const cutoff = now - MENTAL_MODEL_PROPOSE_WINDOW_MS
+  while (mentalModelProposeTimes.length > 0 && mentalModelProposeTimes[0]! < cutoff) {
+    mentalModelProposeTimes.shift()
+  }
+  if (mentalModelProposeTimes.length >= MENTAL_MODEL_PROPOSE_MAX_PER_WINDOW) {
+    return { ok: false, retryAtMs: mentalModelProposeTimes[0]! + MENTAL_MODEL_PROPOSE_WINDOW_MS }
+  }
+  return { ok: true }
+}
+
+/**
  * Mint an approval-kernel decision row for a deferred-secret card
  * (MIGRATION.md §1). Best-effort: if the kernel/broker is unreachable, we
  * return null and the caller proceeds with the legacy-only path so the
@@ -5143,6 +5529,23 @@ const pendingStateReaper = setInterval(() => {
           now,
         )
       }
+      // #2862 — record the miss so it can be re-offered when the operator
+      // returns. Anchor to the card's own origin surface (where the operator
+      // would have tapped), so the digest lands in the same topic — not a
+      // fanned-out DM. Skip if the card was never posted anywhere.
+      if (MISSED_APPROVAL_REOFFER_ENABLED) {
+        const origin = v.cards[0]
+        if (origin != null) {
+          missedApprovalsStore.add({
+            requestId: k,
+            toolName: v.tool_name,
+            action: naturalAction(v.tool_name, v.input_preview),
+            chatId: origin.chatId,
+            threadId: origin.threadId ?? null,
+            timedOutAt: now,
+          })
+        }
+      }
       process.stderr.write(
         `telegram gateway: permission TTL expired — auto-deny request=${k} ` +
         `tool=${v.tool_name} (no operator response in ` +
@@ -5161,8 +5564,14 @@ const pendingStateReaper = setInterval(() => {
     if (now > v.expiresAt) vaultPassphraseCache.delete(k)
   }
   // Drop expired "⏱ 30 min" scoped grants. (Lookup already fails closed on
-  // expiry; this just keeps the map from accumulating dead entries.)
+  // expiry; this just keeps the map from accumulating dead entries.) Persist
+  // the removal so a restart between sweeps can't resurrect a swept grant —
+  // only write when the sweep actually changed something (sweeps only remove).
+  const scopedGrantsBefore = countScopedGrants(scopedGrants)
   sweepScopedGrants(scopedGrants, now)
+  if (countScopedGrants(scopedGrants) !== scopedGrantsBefore) {
+    scopedGrantStore.save(scopedGrants)
+  }
   for (const [k, v] of deferredSecrets) {
     if (now - v.staged_at > DEFERRED_SECRET_TTL_MS) deferredSecrets.delete(k)
   }
@@ -5659,22 +6068,53 @@ const statusPinStoreFs = {
 }
 const statusPinPersistEnabled = !STATIC && PIN_STATUS_WHILE_WORKING
 
-// The full live claim set as persisted rows (confirmed pins), from the Maps.
-function snapshotStatusPins(): PersistedStatusPin[] {
-  const snapshot: PersistedStatusPin[] = []
-  for (const [pinKey, state] of statusPinState) {
-    const chatId = statusPinChatIds.get(pinKey)
-    if (chatId == null) continue
-    snapshot.push({ pinKey, chatId, messageId: state.messageId })
-  }
-  return snapshot
+// Durable card-handle snapshot for the mid-turn activity card (Known Gap 1,
+// `reference/rfcs/deterministic-turn-liveness.md`). Persisted on card OPEN,
+// cleared on normal close/finalize; a boot-time reaper (wired alongside
+// `statusPinBootCleanup`, same startup-mutex ordering constraint) finalizes
+// any leftover record with one honest edit so a gateway restart mid-turn can
+// never leave the card frozen forever. STATIC mode skips disk (dry-run, no
+// durable volume) — same gate as the status-pin store.
+const ACTIVITY_CARD_STORE_PATH = join(STATE_DIR, 'activity-cards-pending.json')
+const activityCardStoreFs: ActivityCardStoreFsSeam = {
+  readFileSync: (p: string) => readFileSync(p, 'utf8'),
+  writeFileSync: (p: string, d: string) => writeFileSync(p, d),
+  renameSync: (a: string, b: string) => renameSync(a, b),
+  existsSync: (p: string) => existsSync(p),
 }
+const activityCardPersistEnabled = !STATIC
 
-// The live claim set EXCLUDING one key — used by reconcileAndPersistStatusPin so
-// it can rewrite the whole set atomically while it flips that one key's record
-// between pending / confirmed / absent.
-function snapshotStatusPinsExcept(exceptKey: string): PersistedStatusPin[] {
-  return snapshotStatusPins().filter((p) => p.pinKey !== exceptKey)
+// Slot-banner pin persistence (#421 crash-recovery). The slot banner is pinned
+// in the owner chat when the agent is on a non-default OAuth slot. Rather than a
+// parallel store + second boot hook, its pin is persisted in the SAME
+// status-pins.json store under a distinct `banner:` pinKey, so the ONE existing
+// runStatusPinBootCleanup unpins an orphaned banner on boot for free. Every
+// write to the shared store is a per-key read-modify-write under the store's
+// per-path lock (mutateStatusPinRow / reconcileAndPersistStatusPin), so the two
+// pin kinds (map-backed status pins + this banner row) can never clobber each
+// other's rows — the "other" rows always come from the authoritative on-disk
+// file, never from a possibly-stale in-memory snapshot.
+const BANNER_PIN_KEY = 'banner:owner'
+// Banner persistence rides the same "store is usable" gate as status pins minus
+// the worker-pin feature flag: the banner is an independent feature, so it must
+// persist/recover whenever there's a real state volume (STATIC = no volume/dry
+// run → no-op). The boot-cleanup gate below is widened to cover this.
+const bannerPinPersistEnabled = !STATIC
+
+// Persist (or drop) the slot-banner's pin row into the shared store. Routes
+// through mutateStatusPinRow: a read-modify-write for ONLY the banner:owner key,
+// serialised on the store's per-path lock, so the live fg:/wk: status-pin rows
+// on disk are carried through unchanged and never clobbered. Best-effort +
+// gated: no-op when the store isn't usable (STATIC). Fire-and-forget — the
+// mutation never rejects (persist is fail-open, load is fail-open).
+function persistBannerRow(row: PersistedStatusPin | null): void {
+  if (!bannerPinPersistEnabled) return
+  void mutateStatusPinRow(
+    STATUS_PIN_STORE_PATH,
+    statusPinStoreFs,
+    BANNER_PIN_KEY,
+    row,
+  )
 }
 
 // The Bot API surface the pin driver needs. `lockedBot` is defined later; wrap
@@ -5707,7 +6147,11 @@ function statusPinApi(): PinBotApi {
  * positives.
  */
 async function statusPinBootCleanup(): Promise<void> {
-  if (!statusPinPersistEnabled) return
+  // Runs when EITHER pin kind could have written the shared store: the
+  // map-backed status pins (statusPinPersistEnabled) or the slot banner
+  // (bannerPinPersistEnabled). A single cleanup drains ALL orphaned rows —
+  // status pins AND banner alike — since they share status-pins.json.
+  if (!statusPinPersistEnabled && !bannerPinPersistEnabled) return
   const api = statusPinApi()
   const { cleared, total } = await runStatusPinBootCleanup({
     path: STATUS_PIN_STORE_PATH,
@@ -5721,6 +6165,196 @@ async function statusPinBootCleanup(): Promise<void> {
     )
   }
 }
+/**
+ * Boot-time orphan-card reaper (Known Gap 1,
+ * `reference/rfcs/deterministic-turn-liveness.md`). Thin gateway wrapper over
+ * the pure `runActivityCardBootReaper` — binds the live fs seam, a real
+ * Telegram edit, and the gateway logger. Finalizes ANY card left open by a
+ * prior (crashed/restarted) session with ONE honest edit — never a new
+ * message, so no ping. Guarantee is AT-MOST-ONCE: the pure routine deletes each
+ * record before attempting its edit and does not retry, so a failed edit
+ * forfeits that orphan rather than risk a double-finalize on a later boot (see
+ * the module doc in activity-card-store.ts for the full tradeoff). A benign-400
+ * (card already gone) is reported as `vanished`, not `finalized`.
+ *
+ * MUST run ONLY after this gateway wins the startup mutex (the store is a
+ * shared per-agent file; a losing double-boot would finalize a card the
+ * still-alive holder's in-flight turn still legitimately owns) — identical
+ * ordering constraint to `statusPinBootCleanup`.
+ *
+ * Deliberately does NOT attempt to resume climbing the old card: the resumed
+ * turn (if any) opens its own fresh card. Honest finalization, not
+ * resumption, is the goal (see the module doc in activity-card-store.ts).
+ *
+ * After the finalizing edit, also unpins the card, but ONLY for a record whose
+ * persisted `pinned` flag is true — i.e. the card was actually pin-eligible on
+ * open (`PIN_STATUS_WHILE_WORKING`). This unpin is DEFENSE-IN-DEPTH, not the
+ * primary unpin path: `statusPinBootCleanup` already unpins orphaned status
+ * pins from its own durable store on boot. The reaper's unpin is belt-and-
+ * braces for the case where the two stores disagree; the record's `pinned`
+ * flag must therefore reflect the ACTUAL pin outcome (see the open path), not
+ * an unconditional `true`, or the reaper would attempt an unpin on a card that
+ * was never pinned.
+ */
+async function activityCardBootReaper(): Promise<void> {
+  if (!activityCardPersistEnabled) return
+  const { finalized, vanished, unpinned, total } = await runActivityCardBootReaper({
+    path: ACTIVITY_CARD_STORE_PATH,
+    fs: activityCardStoreFs,
+    finalizeCard: (record) =>
+      robustApiCall(
+        () =>
+          lockedBot.api.editMessageText(
+            record.chatId,
+            record.activityMessageId,
+            richMessage(restartOrphanCardFinalizeText(record.startedAt)),
+            {},
+          ),
+        {
+          chat_id: record.chatId,
+          ...(record.threadId != null ? { threadId: record.threadId } : {}),
+          verb: 'activity-card.boot-reap-finalize',
+        },
+      ),
+    unpinCard: (record) =>
+      robustApiCall(
+        () => lockedBot.api.unpinChatMessage(record.chatId, record.activityMessageId),
+        {
+          chat_id: record.chatId,
+          ...(record.threadId != null ? { threadId: record.threadId } : {}),
+          verb: 'activity-card.boot-reap-unpin',
+        },
+      ),
+  })
+  if (total > 0) {
+    process.stderr.write(
+      `telegram gateway: activity-card: finalized ${finalized}/${total} ` +
+        `(vanished ${vanished}/${total}), unpinned ${unpinned}/${total} ` +
+        `orphaned card(s) from a prior session (at-most-once)\n`,
+    )
+  }
+}
+// ─── Mid-session stale-card reaper (#2918) ──────────────────────────────────
+// The boot reapers (markOrphanedWithTimeoutClassification + activityCardBoot-
+// Reaper) run ONCE at startup. A turn whose owning SDK subprocess dies
+// mid-session (SIGKILL / OOM / crash) without a clean end leaves its turns-DB
+// row `ended_at IS NULL` and its activity card frozen on "working…" until the
+// NEXT gateway boot — often many hours. This periodic sweep, running inside the
+// live gateway, finalizes those orphans without waiting for a restart.
+//
+// LIVENESS (the critical correctness guard): a turn/card is reaped ONLY when no
+// live in-flight turn owns it. The live set is derived from `currentTurnMap`
+// (per-topic byKey) PLUS the singleton `currentTurn` mirror, so it is correct
+// whether or not the per-topic-isolation flag is on. A healthy long-running
+// turn is always in that set and is never swept. A TTL gate is a secondary
+// guard against the just-started-not-yet-tracked race.
+//
+// Kill switch: set SWITCHROOM_MID_SESSION_CARD_REAPER=0 to disable (clean
+// revert, mirrors #2919). TTL/interval overridable via env for tuning.
+const MID_SESSION_CARD_REAPER_ENABLED =
+  process.env.SWITCHROOM_MID_SESSION_CARD_REAPER !== '0'
+const MID_SESSION_CARD_REAPER_TTL_MS = (() => {
+  const v = Number(process.env.SWITCHROOM_MID_SESSION_CARD_REAPER_TTL_MS)
+  return Number.isFinite(v) && v > 0 ? v : 15 * 60_000 // 15 min
+})()
+const MID_SESSION_CARD_REAPER_INTERVAL_MS = (() => {
+  const v = Number(process.env.SWITCHROOM_MID_SESSION_CARD_REAPER_INTERVAL_MS)
+  return Number.isFinite(v) && v > 0 ? v : 5 * 60_000 // 5 min
+})()
+
+// Snapshot the turn_keys / topic keys owned by a live in-flight turn right now.
+function liveTurnKeySets(): { registryKeys: Set<string>; topicKeys: Set<string> } {
+  const registryKeys = new Set<string>()
+  const topicKeys = new Set<string>()
+  const add = (t: CurrentTurn | null | undefined): void => {
+    if (t == null) return
+    if (t.registryKey != null && t.registryKey.length > 0) registryKeys.add(t.registryKey)
+    topicKeys.add(statusKey(t.sessionChatId, t.sessionThreadId))
+  }
+  for (const t of currentTurnMap.byKey.values()) add(t)
+  add(currentTurn) // flag-OFF store + most-recent mirror
+  return { registryKeys, topicKeys }
+}
+
+async function runMidSessionCardReaper(): Promise<void> {
+  if (!MID_SESSION_CARD_REAPER_ENABLED) return
+  const now = Date.now()
+  const { registryKeys, topicKeys } = liveTurnKeySets()
+
+  // 1) Stamp ownerless open turns-DB rows (the durable spinner signal).
+  if (turnsDb != null) {
+    try {
+      const { reaped, reapedTurnKeys } = reapStaleOpenTurns(turnsDb, {
+        activeTurnKeys: registryKeys,
+        ttlMs: MID_SESSION_CARD_REAPER_TTL_MS,
+        now,
+      })
+      if (reaped > 0) {
+        process.stderr.write(
+          `telegram gateway: mid-session reaper stamped ${reaped} orphaned turn(s) ` +
+            `as 'restart' (${reapedTurnKeys.join(',')})\n`,
+        )
+      }
+    } catch (err) {
+      process.stderr.write(
+        `telegram gateway: mid-session turn reaper error: ${(err as Error).message}\n`,
+      )
+    }
+  }
+
+  // 2) Finalize the leftover visible activity card(s) for those dead turns.
+  if (activityCardPersistEnabled) {
+    try {
+      const { finalized, vanished, total } = await runActivityCardMidSessionReaper({
+        path: ACTIVITY_CARD_STORE_PATH,
+        fs: activityCardStoreFs,
+        isLive: (record) => topicKeys.has(record.turnKey),
+        ttlMs: MID_SESSION_CARD_REAPER_TTL_MS,
+        now,
+        finalizeCard: (record) =>
+          robustApiCall(
+            () =>
+              lockedBot.api.editMessageText(
+                record.chatId,
+                record.activityMessageId,
+                richMessage(restartOrphanCardFinalizeText(record.startedAt)),
+                {},
+              ),
+            {
+              chat_id: record.chatId,
+              ...(record.threadId != null ? { threadId: record.threadId } : {}),
+              verb: 'activity-card.mid-session-reap-finalize',
+            },
+          ),
+        unpinCard: (record) =>
+          robustApiCall(
+            () => lockedBot.api.unpinChatMessage(record.chatId, record.activityMessageId),
+            {
+              chat_id: record.chatId,
+              ...(record.threadId != null ? { threadId: record.threadId } : {}),
+              verb: 'activity-card.mid-session-reap-unpin',
+            },
+          ),
+      })
+      if (total > 0) {
+        process.stderr.write(
+          `telegram gateway: activity-card: mid-session finalized ${finalized}/${total} ` +
+            `(vanished ${vanished}/${total}) orphaned card(s) (at-most-once)\n`,
+        )
+      }
+    } catch (err) {
+      process.stderr.write(
+        `telegram gateway: mid-session card reaper error: ${(err as Error).message}\n`,
+      )
+    }
+  }
+}
+
+const midSessionCardReaper = setInterval(() => {
+  void runMidSessionCardReaper()
+}, MID_SESSION_CARD_REAPER_INTERVAL_MS)
+midSessionCardReaper.unref()
+
 // NOTE: statusPinBootCleanup() is deliberately NOT invoked here at import time.
 // The status-pin store is a SHARED per-agent file, and cleanup issues real
 // unpinChatMessage calls. On a double-boot the losing gateway must NOT touch
@@ -5818,7 +6452,6 @@ async function reconcileStatusPinInner(
     pinKey,
     chatId,
     op,
-    snapshotOthers: () => snapshotStatusPinsExcept(pinKey),
     applyPin: runReconcile,
   })
   if (next == null) {
@@ -6027,6 +6660,7 @@ function ensureIssuesCard(chatId: string, threadId: number | undefined): void {
     // LOSING double-boot never unpins the live holder's legitimate pins.
     // Fire-and-forget: cleanup is best-effort and must not block boot.
     void statusPinBootCleanup()
+    void activityCardBootReaper()
   } catch (err) {
     process.stderr.write(
       `telegram gateway: boot.lock_acquire_failed err=${(err as Error).message} agent=${SWITCHROOM_AGENT_NAME}\n`,
@@ -6043,6 +6677,7 @@ function ensureIssuesCard(chatId: string, threadId: number | undefined): void {
       // successful writePidFile here means no live holder was detected, so
       // running orphan cleanup is consistent with the pre-mutex behaviour.
       void statusPinBootCleanup()
+      void activityCardBootReaper()
     } catch (writeErr) {
       process.stderr.write(`telegram gateway: writePidFile failed: ${writeErr}\n`)
     }
@@ -6088,11 +6723,15 @@ function parsePositiveMsEnv(name: string, fallbackMs: number): number {
 }
 const SILENCE_FALLBACK_MS = parsePositiveMsEnv('SWITCHROOM_SILENCE_FALLBACK_MS', 300_000)
 const SILENCE_FALLBACK_HARD_MS = parsePositiveMsEnv('SWITCHROOM_SILENCE_FALLBACK_HARD_MS', 900_000)
-// #2527 — mid-turn liveness floor threshold (default 45s). The early, quiet
-// beat: a `user` turn working silently this long without a substantive answer
-// gets ONE honest "still on it" interim, so the ambient 👀 never masquerades
-// as "done". Strictly below SILENCE_FALLBACK_MS (the loud 300s unwedge).
-// Whole floor is kill-switchable via SWITCHROOM_TG_LIVENESS_FLOOR=0.
+// #2527 — mid-turn liveness floor threshold (default 45s). Still gates the
+// decision (`decideMidTurnFloor`, role + delivery + fire-once + timing) for a
+// `user` turn working silently this long without a substantive answer.
+// Phase 3 (deterministic-turn-liveness.md): the busy-but-silent case no
+// longer sends TEXT at this threshold — the climbing card (Phase 1) covers
+// it. The ONE surviving delivery gated by this threshold is the
+// approval-blocked re-ping (see `onMidTurnFloor` below). Strictly below
+// SILENCE_FALLBACK_MS (the loud 300s unwedge). Whole floor is
+// kill-switchable via SWITCHROOM_TG_LIVENESS_FLOOR=0.
 const SILENCE_FLOOR_MS = parsePositiveMsEnv('SWITCHROOM_SILENCE_FLOOR_MS', 45_000)
 // #2527 — role-aware terminal reaction honesty (the "thumbs-up false done"
 // fix). Default ON; SWITCHROOM_TG_TERMINAL_HONESTY=0 reverts to always-👍.
@@ -6109,6 +6748,25 @@ const SILENCE_DEFER_INFLIGHT_TOOLS = process.env.SWITCHROOM_SILENCE_DEFER_INFLIG
 // and null currentTurn mid-work. Default ON; SWITCHROOM_SILENCE_LIVENESS_PRODUCTION=0
 // restores the legacy "only a real reply resets the clock" behaviour.
 const SILENCE_LIVENESS_PRODUCTION = process.env.SWITCHROOM_SILENCE_LIVENESS_PRODUCTION !== '0'
+// Sparse chat-legible memory (#2849, hindsight Phase 4). Surface ONE terse
+// line in the originating chat/topic when the interactive session materially
+// changes what it remembers (create_directive / invalidate / demote) — never
+// on ordinary recall or routine consolidation. Default ON;
+// SWITCHROOM_MEMORY_LEGIBILITY=0 disables it.
+const MEMORY_LEGIBILITY_ENABLED = isMemoryLegibilityEnabled(process.env.SWITCHROOM_MEMORY_LEGIBILITY)
+// Consolidation-driven legibility (#2849 follow-up, hindsight Phase 4). The
+// "updated what I know about Y" side, driven by the background
+// `consolidation.completed` webhook rather than a foreground tool call.
+// OPT-IN (default OFF), unlike MEMORY_LEGIBILITY_ENABLED above: this path is
+// fed by an unbounded background engine + a webhook the pinned hindsight image
+// does not yet emit, so the RFC keeps it "sparse … clearly gated".
+const CONSOLIDATION_LEGIBILITY_ENABLED = isConsolidationLegibilityEnabled(
+  process.env.SWITCHROOM_CONSOLIDATION_LEGIBILITY,
+)
+// One long-lived limiter across all consolidation events — collapses a burst
+// of material consolidations to at most one line per interval, and suppresses
+// an identical "updated about X" line inside the dedup window.
+const consolidationRateLimiter = new ConsolidationRateLimiter()
 
 /**
  * Feed-survival predicate — the single source of truth for "is this turn
@@ -6177,10 +6835,19 @@ silencePoke.startTimer({
     if (statusKey(turn.sessionChatId, turn.sessionThreadId) !== key) return null
     return { role: turn.role, finalAnswerDelivered: turn.finalAnswerDelivered }
   },
-  // #2527 — the early, quiet liveness beat. Honest text from the longest
-  // in-flight tool (model-free, claude-native), routed through the SAME send
-  // path as the 300s fallback; pings OFF (this is the gentle beat, not the
-  // loud unwedge) and the turn is NOT torn down — it keeps working.
+  // Phase 3 (reference/rfcs/deterministic-turn-liveness.md): the busy-but-
+  // silent TEXT floor is retired. The climbing card (Phase 1 — the 0-label
+  // branch of `feedHeartbeatTick` / `runSilentTurnHeartbeatTick` above) IS
+  // the mid-turn floor now: it edits the already-open activity card's
+  // elapsed clock every `FEED_HEARTBEAT_MIN_STALE_MS`, model-independent, no
+  // ping. This handler still decides/fires via `decideMidTurnFloor` (the
+  // timing + role + fire-once machinery in `silence-poke.ts` /
+  // `turn-liveness-floor.ts` is unchanged and still load-bearing — see
+  // below), but its ONLY surviving delivery is the approval-blocked re-ping.
+  // Do not re-add a generic "still working…" text send here believing this
+  // path covers the silent-tool case; it does not, and re-adding one would
+  // reintroduce the exact banned cadence ping `conversational-pacing.md`
+  // retired in #2667.
   onMidTurnFloor: async (ctx) => {
     // Late-fire guard, mirroring the fallback: a clean turn-end can race the
     // tick. If the turn is gone, stay silent.
@@ -6188,19 +6855,19 @@ silencePoke.startTimer({
     const blockedOnApproval = activeStatusReactions
       .get(statusKey(ctx.chatId, ctx.threadId))
       ?.isAwaiting() ?? false
+    // The one surviving text case: the turn is parked on an approval card
+    // waiting for YOUR tap. That's not a stall — it names the real blocker —
+    // so it keeps this quiet re-ping (`conversational-pacing.md` § Silence-
+    // poke fallback names this one of the two surviving honest cases). The
+    // busy-but-silent (non-approval) case sends nothing here; the card climb
+    // (Phase 1) is its only signal now.
+    if (!blockedOnApproval) return
     const text = silencePoke.formatFrameworkFallbackText(
       'working',
       ctx.silenceMs,
       ctx.inFlightTools,
       blockedOnApproval,
     )
-    // The stall-notice stop-gap is retired: `formatFrameworkFallbackText`
-    // returns null for the pure-liveness "still working / running <Tool>"
-    // beat (the only string it still emits is the approval-blocked re-ping).
-    // The early quiet floor beat existed ONLY to surface that stall notice, so
-    // with the notice gone there is nothing to send here unless the turn is
-    // parked on an approval card. Skip silently otherwise; the live draft +
-    // the model's own pacing beats carry progress.
     if (text == null) return
     try {
       await robustApiCall(
@@ -6631,19 +7298,56 @@ async function redeliverStrandedInbound(p: PendingDelivery<InboundMessage>): Pro
     forgetDelivery(deliveryQueue, p.key)
   }
 }
+// #2787 Mechanism A — which chats/topics currently hold a live permission or
+// ask_user card. A pending card is a live interaction for ITS OWN chat, so the
+// confirm sweep must not re-clear the composer + re-send there. But the OLD guard
+// (`pendingPermissions.size > 0 || pendingAskUser.size > 0 → return`) suspended
+// the sweep GLOBALLY: one card parked in a single topic (or in the operator DM,
+// a different chatId entirely) froze re-delivery of every stranded inbound across
+// EVERY topic until that one card resolved. This scopes the suspension to the
+// card's own target. Returns per-topic chatKeys where the topic is known and bare
+// chatIds where it isn't (a card fanned to operator DMs records chatId only, and
+// a whole-chat suspension is the safe conservative fallback there); the callsite
+// tests a delivery entry against both renderings.
+function sweepSuspendedTargets(): { keys: Set<string>; chats: Set<string> } {
+  const keys = new Set<string>()
+  const chats = new Set<string>()
+  for (const p of pendingPermissions.values()) {
+    for (const c of p.cards) {
+      if (c.threadId != null) keys.add(chatKey(c.chatId, c.threadId))
+      else chats.add(c.chatId)
+    }
+    // A permission whose card send hasn't resolved yet (cards still empty) has
+    // no recorded target — suspend nothing for it; the next sweep sees it once
+    // the send resolves, and the currentTurn guard already covers the in-turn
+    // window a fresh permission request lives in.
+  }
+  for (const a of pendingAskUser.values()) {
+    if (a.threadId != null) keys.add(chatKey(a.chatId, a.threadId))
+    else chats.add(a.chatId)
+  }
+  return { keys, chats }
+}
+
 const _deliveryConfirmSweep = setInterval(() => {
   if (!DELIVERY_CONFIRM_ENABLED) return
   // Re-deliver ONLY when claude is genuinely idle. `currentTurn` is set solely
   // by the enqueue session-event and nulled at turn-end, so `currentTurn != null`
   // means a real turn is in flight — re-clearing the composer + re-sending now
-  // would clobber it (the exact mid-turn wedge this queue exists to prevent). A
-  // pending permission / ask_user prompt is likewise a live interaction. Defer:
-  // leave the entry pending (it isn't acked) so the next idle sweep retries.
+  // would clobber it (the exact mid-turn wedge this queue exists to prevent).
   // NB: claudeBusyKeys (turnInFlightForGate) is set EAGERLY at delivery and
   // stays set through a strand, so it is NOT a usable "idle" signal here.
   if (currentTurn != null) return
-  if (pendingPermissions.size > 0 || pendingAskUser.size > 0) return
+  // #2787 Mechanism B: no turn in flight → reap any orphaned busy marker so a
+  // delivered-but-never-enqueued inbound can't wedge the idle-drain globally.
+  reapOrphanBusyKeysNow(Date.now())
+  // #2787 Mechanism A: a pending permission / ask_user card suspends re-delivery
+  // ONLY for its own chat/topic — never globally. Skip just the stranded entries
+  // whose target holds a live card; sweep the rest so unrelated topics keep
+  // getting re-delivered.
+  const suspended = sweepSuspendedTargets()
   for (const p of sweepDeliveryQueue(deliveryQueue, Date.now(), DELIVERY_CONFIRM_TIMEOUT_MS)) {
+    if (isRedeliverySuspended(p.key, suspended)) continue
     void redeliverStrandedInbound(p)
   }
 }, DELIVERY_CONFIRM_SWEEP_MS)
@@ -6716,8 +7420,61 @@ const inboundSpool = STATIC
         existsSync: (p) => existsSync(p),
         statSizeSync: (p) => statSync(p).size,
       },
+      // #2789 B: durability degradation must be visible, not silent. When
+      // spool appends start failing we're back to in-memory-only — a
+      // later crash loses those messages. Latched log so the operator /
+      // health surface sees the transition rather than a silent downgrade.
+      onDegraded: (info) => {
+        process.stderr.write(
+          `telegram gateway: inbound-spool durability ` +
+          `${info.degraded ? 'DEGRADED to in-memory-only' : 'RECOVERED'} ` +
+          `path=${info.path} consecutiveFailures=${info.consecutiveFailures}` +
+          `${info.error != null ? ` error=${info.error}` : ''}\n`,
+        )
+      },
     })
-const pendingInboundBuffer = createPendingInboundBuffer({ spool: inboundSpool })
+
+// #2789 A: the in-memory cap eviction used to silently drop the oldest
+// buffered inbound within a live session (the durable spool copy only
+// replays at boot / escalates after 15 min). Surface it as a coalesced,
+// per-chat "messages deferred" notice so the eviction is visible — the
+// evicted message still lives in the spool, so it is deferred, not lost.
+const EVICT_NOTICE_COOLDOWN_MS = 5 * 60 * 1000
+const evictNoticeByChat = new Map<string, number>()
+const pendingInboundBuffer = createPendingInboundBuffer({
+  spool: inboundSpool,
+  onEvict: (_agent, evicted) => {
+    const chat = evicted.chatId
+    const evThread =
+      typeof evicted.meta?.threadId === 'string' && evicted.meta.threadId
+        ? Number(evicted.meta.threadId)
+        : undefined
+    const key = `${chat}:${evThread ?? '-'}`
+    const last = evictNoticeByChat.get(key)
+    const nowMs = Date.now()
+    // Coalesce: at most one deferral notice per chat per cooldown so a
+    // sustained >32 burst posts one line, not one per evicted message.
+    if (last != null && nowMs - last < EVICT_NOTICE_COOLDOWN_MS) return
+    evictNoticeByChat.set(key, nowMs)
+    const threadOpts = evThread != null ? { message_thread_id: evThread } : {}
+    // Honesty: the evicted message is NOT re-pushed into the buffer
+    // in-session — its only in-session resolution is the escalation sweep
+    // (sweepEscalations, ~15 min), which either delivers it or posts the
+    // "couldn't deliver … please resend" retraction. So this notice must
+    // NOT promise a prompt pickup ("shortly"), or it would contradict a
+    // later escalation. Word it to match that reality: saved, handled when
+    // the current turn frees up, and prompted-to-resend if it can't be.
+    void swallowingApiCall(
+      () =>
+        bot.api.sendMessage(
+          chat,
+          "⏳ Messages are arriving faster than I can process them. Your messages are saved and will be handled once I finish the current turn — if any can't be picked up, I'll ask you to resend it.",
+          { ...threadOpts },
+        ),
+      { chat_id: chat, verb: 'inbound-buffer-eviction' },
+    )
+  },
+})
 
 // PR2 obligation-ledger idle sweep. Re-present an OPEN obligation only at a
 // CLEAN idle: no turn in flight AND the inbound buffer is empty — so the
@@ -6887,6 +7644,22 @@ function obligationSweep(): void {
   // normal close path) — close silently instead of alarming the user with a
   // false "I may have missed this". This is Fix 4: escalate only on knowledge,
   // not doubt. Fall back to false (safe: never suppresses) if history unavailable.
+  //
+  // #2788 Gap A — bridge-flap gate. The escalate branch DIRECT-SENDS (via
+  // bot.api.sendMessage below), bypassing the bridge. So while the bridge is
+  // down the represent branch is naturally stranded (bridge → buffer) but this
+  // branch would still fire a false "I may have missed this", even though the
+  // real reply is merely queued behind a transient outage. Defer: if the bridge
+  // is not alive, leave the obligation OPEN and re-drive on a later sweep once
+  // it recovers. Obligations survive bridge death (durable ledger, re-evaluated
+  // every sweep), so this deferral adds NO unbounded liveness dependency — the
+  // whole gateway already rests on the bridge eventually reconnecting.
+  if (shouldDeferEscalationForBridge({ bridgeAlive: ipcServer.getClient(agent)?.isAlive() === true })) {
+    process.stderr.write(
+      `telegram gateway: obligation escalation deferred — bridge down (nudge waits for reconnect) origin=${o.originTurnId}\n`,
+    )
+    return
+  }
   if (HISTORY_ENABLED && hasOutboundDeliveredSince(o.chatId, o.openedAt, o.threadId)) {
     process.stderr.write(
       `telegram gateway: obligation closed silently — outbound delivered since open origin=${o.originTurnId}\n`,
@@ -6944,6 +7717,25 @@ if (bootResumeInbound != null) {
     inboundSpool.put(bootResumeInbound.agent, bootResumeInbound.msg)
   } else {
     pendingInboundBuffer.push(bootResumeInbound.agent, bootResumeInbound.msg)
+  }
+  // At-most-once resume (#2793 part A): now that the resume inbound is
+  // DURABLY committed (spooled, or buffered in STATIC mode), stamp the
+  // turn's `resumed_at` so a later restart can't re-mint a fresh resume for
+  // the same turn and re-run side effects that already executed. This is
+  // synchronous and runs before any async delivery/ack can interleave, so
+  // the ledger is set before the spool entry can be consumed — closing the
+  // accept-vs-consume double-execution window. Stamping AFTER the durable
+  // put (never before) means a crash in between leaves the turn un-stamped
+  // and the resume is retried, not silently dropped.
+  const resumeTurnKey = bootResumeInbound.msg.meta?.resume_turn_key
+  if (turnsDb != null && typeof resumeTurnKey === 'string' && resumeTurnKey.length > 0) {
+    try {
+      markTurnResumed(turnsDb, resumeTurnKey)
+    } catch (err) {
+      process.stderr.write(
+        `telegram gateway: markTurnResumed failed turnKey=${resumeTurnKey}: ${(err as Error).message}\n`,
+      )
+    }
   }
 }
 // Boot-replay: re-queue every un-acked spooled inbound into the
@@ -7041,6 +7833,81 @@ function dispatchPermissionVerdict(ev: PermissionEvent): void {
     process.stderr.write(
       `telegram gateway: permission verdict buffered (bridge offline) ` +
       `request=${ev.requestId} behavior=${ev.behavior}\n`,
+    )
+  }
+}
+
+/**
+ * #2861 re-arm: a `permission_request` re-sent by the bridge after a gateway
+ * restart, for a request_id that's NO LONGER in `pendingPermissions` but is
+ * still in the persisted card store. Restore the in-memory pending entry with
+ * the ORIGINAL `startedAt` (so the existing TTL clock keeps running from the
+ * original ask — an already-expired re-arm drops straight into the TTL
+ * auto-deny sweep, which correctly unwedges claude) and re-attach the inline
+ * keyboard on the EXISTING message(s) via editMessageText — never a new card.
+ *
+ * NEVER answers the card: only the question is restored (no-self-escalation).
+ */
+function rearmPermissionFromStore(
+  msg: PermissionRequestForward,
+  persisted: PersistedPermCard[],
+): void {
+  const { requestId, toolName, description, inputPreview } = msg
+  // Original clock: take the earliest persisted startedAt (all entries for one
+  // request share it, but be defensive).
+  const startedAt = persisted.reduce(
+    (min, c) => (c.startedAt < min ? c.startedAt : min),
+    persisted[0].startedAt,
+  )
+  const cardText = persisted[0].cardText
+  const cards = persisted.map(c => ({ chatId: c.chatId, messageId: c.messageId }))
+  pendingPermissions.set(requestId, {
+    tool_name: toolName,
+    description,
+    input_preview: inputPreview,
+    startedAt,
+    card_text: cardText,
+    cards,
+  })
+  process.stderr.write(
+    `telegram gateway: re-arming permission card(s) for request=${requestId} ` +
+    `tool=${toolName} (${cards.length} card(s), original startedAt preserved)\n`,
+  )
+  // Re-attach the keyboard on each surviving card message. Message-id-targeted
+  // edit — no thread needed, so THREAD_NOT_FOUND is not in the blast radius.
+  const showAlways = resolveScopedAllowChoices(toolName, inputPreview) != null
+  const keyboard = buildPermissionActionRow(requestId, showAlways)
+  for (const c of cards) {
+    void swallowingApiCall(
+      // allow-raw-bot-api: routed through swallowingApiCall (retry policy); message-id-targeted edit (no thread to lose). Re-attaches the Allow/Deny keyboard on the persisted card after a gateway restart.
+      () => bot.api.editMessageText(c.chatId, c.messageId, richMessage(cardText), { reply_markup: keyboard }),
+      { chat_id: c.chatId, verb: 'permission_request.rearm' },
+    )
+  }
+}
+
+/**
+ * Strip a single stale permission card: drop its keyboard and show the
+ * "gateway restarted" notice. Shared by the boot-sweep (immediate legacy path
+ * and the #2861 grace-period path). Best-effort — a deleted/inaccessible card
+ * is swallowed, never fatal.
+ */
+async function stripStalePermissionCard(card: PersistedPermCard): Promise<void> {
+  const toolLabel = card.toolName ?? 'unknown tool'
+  const notice = `🔒 **${toolLabel}**\n\n⚠️ *Gateway restarted — this request is no longer active. Ask your agent to try again if needed.*`
+  try {
+    // allow-raw-bot-api: targeted by message_id; no thread needed; fire-and-forget boot sweep
+    await bot.api.editMessageText(
+      card.chatId,
+      card.messageId,
+      richMessage(notice),
+      { reply_markup: { inline_keyboard: [] } },
+    )
+  } catch (err) {
+    // Card may already be deleted, edited, or in an inaccessible chat — benign
+    process.stderr.write(
+      `telegram gateway: boot-sweep: stale-card strip failed ` +
+      `${card.chatId}:${card.messageId}: ${(err as Error).message}\n`,
     )
   }
 }
@@ -7279,6 +8146,7 @@ const ipcServer: IpcServer = createIpcServer({
       activeReactionMsgIds,
       activeTurnStartedAt,
       claudeBusyKeys,
+      claudeBusyKeySince,
       activeDraftStreams,
       clearActiveReactions: () => {
         const ad = resolveAgentDirFromEnv()
@@ -7413,6 +8281,38 @@ const ipcServer: IpcServer = createIpcServer({
 
   onPermissionRequest(_client: IpcClient, msg: PermissionRequestForward) {
     const { requestId, toolName, description, inputPreview } = msg
+    // #2861 idempotent re-send handling. The bridge re-sends every outstanding
+    // permission_request on each IPC (re)connect, so the same request_id can
+    // arrive more than once. Disposition:
+    //   duplicate → already live in pendingPermissions; ignore (no 2nd card).
+    //   rearm     → gone from memory (gateway restarted) but the persisted card
+    //               store still has it; restore + re-attach keyboard in place.
+    //   fresh     → new ask; fall through to the normal card-posting path.
+    // Either re-claim marks the id so the grace-period boot-sweep won't strip
+    // it. Kill switch SWITCHROOM_PERMISSION_REARM=0 skips this entirely (legacy
+    // behavior: a re-send would post a duplicate card, as before this fix).
+    if (isPermissionRearmEnabled()) {
+      const persisted = pendingPermissions.has(requestId)
+        ? []
+        : permCardStore.loadAll().filter(e => e.requestId === requestId)
+      const disposition = classifyPermissionRequest({
+        hasPending: pendingPermissions.has(requestId),
+        persistedCount: persisted.length,
+      })
+      if (disposition === 'duplicate') {
+        process.stderr.write(
+          `telegram gateway: permission_request duplicate re-send ignored ` +
+          `request=${requestId} (already pending)\n`,
+        )
+        return
+      }
+      if (disposition === 'rearm') {
+        // Re-arm restores the pending entry; the grace-period boot-sweep
+        // preserves anything live in pendingPermissions, so it won't strip it.
+        rearmPermissionFromStore(msg, persisted)
+        return
+      }
+    }
     // "⏱ 30 min" short-circuit: if the operator tapped a live scoped grant
     // covering this exact request, auto-allow without posting a card. CRITICAL:
     // dispatch WITHOUT a `rule` so the bridge does NOT cache it untimed
@@ -7504,7 +8404,7 @@ const ipcServer: IpcServer = createIpcServer({
       // found"), re-send thread-less into the main chat so the card still
       // ARRIVES rather than vanishing → 10-min TTL auto-deny → wedge.
       // allow-raw-bot-api: wrapped in retryWithThreadFallback (retry policy); topic-aware send
-      void retryWithThreadFallback<{ message_id: number }>(
+      void retryWithThreadFallback<{ message_id: number; message_thread_id?: number }>(
         robustApiCall,
         (tid) =>
           bot.api.sendRichMessage(chatId, richMessage(text), {
@@ -7520,7 +8420,19 @@ const ipcServer: IpcServer = createIpcServer({
         // guard the lookup.
         const pend = pendingPermissions.get(requestId)
         if (pend && sent && typeof sent.message_id === 'number') {
-          pend.cards.push({ chatId, messageId: sent.message_id })
+          // #2787: record where the card ACTUALLY LANDED so the confirm sweep
+          // scopes its re-delivery suspension to the real chat/topic. When
+          // retryWithThreadFallback hit THREAD_NOT_FOUND (stale/renumbered
+          // topic) it re-sent thread-less into the main chat — the returned
+          // Message then carries no message_thread_id, so we must record the
+          // landed topic (undefined → suspend by bare chatId), NOT the stale
+          // requested `threadId`. Keying suspension on the stale topic would
+          // leave the main-chat card unsuspended (a re-deliver could clobber
+          // the live card) while needlessly suspending a topic that holds
+          // nothing. `sent.message_thread_id` reflects reality in all three
+          // cases: topic success → tid, main-chat / fallback → undefined.
+          const landedThreadId = sent.message_thread_id ?? undefined
+          pend.cards.push({ chatId, messageId: sent.message_id, threadId: landedThreadId })
           permCardStore.add({
             requestId,
             chatId,
@@ -7929,11 +8841,24 @@ const ipcServer: IpcServer = createIpcServer({
         // field, or any other byte difference) won't match → falls
         // through to a real operator approval card.
         const added = extractAddedAllowRule(msg.unifiedDiff)
-        if (!added) return null
-        const key = `${msg.agentName}::${added}`
-        const entry = pendingAlwaysAllowCorrelations.get(key)
-        if (entry && entry.unifiedDiff === msg.unifiedDiff) {
-          pendingAlwaysAllowCorrelations.delete(key)
+        if (added) {
+          const key = `${msg.agentName}::${added}`
+          const entry = pendingAlwaysAllowCorrelations.get(key)
+          if (entry && entry.unifiedDiff === msg.unifiedDiff) {
+            pendingAlwaysAllowCorrelations.delete(key)
+            return 'approve'
+          }
+        }
+        // hindsight Phase 5: a mental-model PROPOSAL the operator already
+        // approved on the proposal card. The gateway pre-registered the EXACT
+        // diff; auto-approve on a byte-exact match (the security gate), so no
+        // second card is posted. Any forged/other edit finds no entry and
+        // falls through to a real operator card.
+        sweepStaleMentalModelCorrelations()
+        const mmKey = mentalModelCorrelationKey(msg.agentName, msg.unifiedDiff)
+        const mmEntry = pendingMentalModelCorrelations.get(mmKey)
+        if (mmEntry && mmEntry.unifiedDiff === msg.unifiedDiff) {
+          pendingMentalModelCorrelations.delete(mmKey)
           return 'approve'
         }
         return null
@@ -8066,11 +8991,45 @@ const ipcServer: IpcServer = createIpcServer({
     // frequent cron, or a crashed cron session) falls back to the MAIN agent
     // bridge so the fire lands now; it routes cheap again once the session is
     // up. See deliverInjectWithFallback.
+    // #2793 part B — durable cron boot-replay. A fire the scheduler is
+    // REPLAYING across a restart carries `meta.replay_fire_ms`; route it
+    // through the durable inbound spool so accept and consume are ledgered
+    // separately (mirrors the real-inbound path). The scheduler's own
+    // scheduler.jsonl records the fire at socket-accept, which stops
+    // findMissedFires from re-firing it — but a socket accept is NOT proof
+    // the session consumed it. Spooling here means: if the session isn't up
+    // (accepted-but-not-consumed), the entry stays un-acked and the spool's
+    // boot-replay re-delivers it on the next gateway boot (closes the
+    // silent-loss window); and the stable `spoolId` (keyed on the replayed
+    // fire) dedups a re-replay so it lands at most once (closes the
+    // double-fire window). Live cron ticks never set replay_fire_ms, so they
+    // keep the fire-and-forget path unchanged. STATIC mode has no spool —
+    // fall through to the legacy path.
+    const isDurableReplay =
+      inboundSpool != null &&
+      typeof msg.inbound.meta?.replay_fire_ms === 'string' &&
+      msg.inbound.meta.replay_fire_ms.length > 0
+    if (isDurableReplay && inboundSpool != null) {
+      // Durable ACCEPT: put before delivery so a crash between accept and
+      // consume leaves the entry recoverable (boot-replay re-delivers).
+      // Idempotent by stable spoolId — a re-replay of the same missed fire
+      // is a no-op while the prior entry is still un-acked.
+      inboundSpool.put(msg.agentName, msg.inbound as unknown as InboundMessage)
+    }
     const { target, delivered, fellBackToMain } = deliverInjectWithFallback(
       msg.agentName,
       msg.inbound.meta,
       (t) => ipcServer.sendToAgent(t, msg.inbound),
     )
+    if (isDurableReplay && inboundSpool != null && delivered) {
+      // Durable CONSUME: the fire reached a live bridge, so tombstone the
+      // spool entry (same "delivered to a live registered bridge" ack
+      // semantics the inbound spool uses — see its v1 scope note). On a
+      // miss we leave it un-acked: the pendingInboundBuffer.push below
+      // buffers it for the reconnect drain, and the durable spool copy is
+      // re-delivered on the next boot if this process dies first.
+      inboundSpool.ack(msg.inbound as unknown as InboundMessage)
+    }
     if (fellBackToMain) {
       process.stderr.write(
         `telegram gateway: cron fire fell back to main session (no cron bridge) agent=${msg.agentName} prompt_key=${promptKey}\n`,
@@ -8309,6 +9268,7 @@ const ipcServer: IpcServer = createIpcServer({
           {
             inject: webhookInject,
             log: (s) => process.stderr.write(`telegram gateway: ${s}`),
+            onConsolidation: surfaceConsolidationLegibility,
           },
         ),
     })
@@ -8380,7 +9340,7 @@ if (!STATIC) {
     // promise EXPLICITLY (honest failure) instead of letting it sit
     // forever. This is what makes the guarantee deterministic: every
     // queued message ends either delivered or visibly retracted.
-    inboundSpool?.sweepEscalations((e, { postNotice }) => {
+    inboundSpool?.sweepEscalations((e, { postNotice, droppedCount }) => {
       const chat = e.msg.chatId
       const escThread =
         typeof e.msg.meta?.threadId === 'string' && e.msg.meta.threadId
@@ -8399,13 +9359,17 @@ if (!STATIC) {
       // outage that re-ages a synthetic into the bound every 15 min posts ONE
       // notice, not one per cycle (the 2026-06-09 marko "please resend" spam).
       if (!postNotice) return
+      // #2789 C: report the REAL number of dropped messages for this chat
+      // in this sweep rather than under-counting a multi-message drop as a
+      // single one.
+      const n = droppedCount > 0 ? droppedCount : 1
+      const noticeText =
+        n === 1
+          ? "⚠️ I couldn't deliver an earlier message to the agent after repeated retries (it survived restarts but the agent never picked it up). Please resend it."
+          : `⚠️ I couldn't deliver ${n} earlier messages to the agent after repeated retries (they survived restarts but the agent never picked them up). Please resend them.`
       void swallowingApiCall(
         () =>
-          bot.api.sendMessage(
-            chat,
-            "⚠️ I couldn't deliver an earlier message to the agent after repeated retries (it survived restarts but the agent never picked it up). Please resend it.",
-            { ...threadOpts },
-          ),
+          bot.api.sendMessage(chat, noticeText, { ...threadOpts }),
         { chat_id: chat, verb: 'inbound-spool-escalation' },
       )
     })
@@ -8417,7 +9381,7 @@ if (!STATIC) {
 /** Allowlisted tool names that bridges may invoke via IPC. Prevents a rogue
  *  bridge from calling arbitrary functions by name. */
 const ALLOWED_TOOLS = new Set([
-  'reply', 'stream_reply', 'progress_update', 'react', 'download_attachment',
+  'reply', 'progress_update', 'react', 'download_attachment',
   'edit_message', 'send_typing', 'pin_message', 'delete_message',
   'forward_message', 'get_recent_messages',
   'send_checklist', 'update_checklist',
@@ -8426,6 +9390,7 @@ const ALLOWED_TOOLS = new Set([
   'vault_request_save',
   'vault_request_access',
   'request_secret',
+  'mental_model_propose',
   'linear_agent_activity',
   'linear_create_issue',
   'linear_agent_setup',
@@ -8438,8 +9403,6 @@ async function executeToolCall(tool: string, args: Record<string, unknown>): Pro
   switch (tool) {
     case 'reply':
       return executeReply(args)
-    case 'stream_reply':
-      return executeStreamReply(args)
     case 'progress_update':
       return executeProgressUpdate(args)
     case 'react':
@@ -8474,6 +9437,8 @@ async function executeToolCall(tool: string, args: Record<string, unknown>): Pro
       return executeVaultRequestAccess(args)
     case 'request_secret':
       return executeRequestSecret(args)
+    case 'mental_model_propose':
+      return executeMentalModelPropose(args)
     case 'linear_agent_activity':
       return executeLinearAgentActivity(args)
     case 'linear_create_issue':
@@ -9016,7 +9981,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // delivery-channel decision must NOT pollute final-answer CLASSIFICATION: a
   // final answer the model intended to ping is STILL the final answer even when
   // the framework silences the actual ping. Classify on the model's original
-  // intent (what executeStreamReply already does), so an over-ping-silenced
+  // intent (what executeReply already does), so an over-ping-silenced
   // final answer sets finalAnswerDelivered=true — fixing both a spurious
   // silent-end re-prompt and a false 'undelivered' (😐) terminal reaction.
   const modelDisableNotification = args.disable_notification === true
@@ -10112,441 +11077,6 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   return { content: [{ type: 'text', text: result }] }
 }
 
-async function executeStreamReply(args: Record<string, unknown>): Promise<unknown> {
-  // #1664 — pin the turn at entry; see executeReply for the rationale.
-  const turn = currentTurn
-  if (!args.chat_id) throw new Error('stream_reply: chat_id is required')
-  if (args.text == null || args.text === '') throw new Error('stream_reply: text is required and cannot be empty')
-  // chat_id allowlist fallback — mirrors executeReply (~8725). stream_reply is
-  // the primary final-answer path, so a wrong/late chat_id (int/string mismatch,
-  // or the model echoing the wrong identifier after a silence poke flipped
-  // currentTurn to null) would otherwise fail assertAllowedChat in the stream
-  // controller → an invisible reply. Rewrite args.chat_id in place so every
-  // downstream consumer (origin resolution, dedup key, the send) sees the
-  // corrected value. Tier 1: live turn's sessionChatId. Tier 2: last-known
-  // turn's chat (survives silence poke — Bug D fix; currentTurn is null).
-  {
-    const _rawChatId = String(args.chat_id ?? '')
-    const resolved = resolveChatIdFallback(
-      _rawChatId,
-      loadAccess(),
-      turn?.sessionChatId,
-      lastActiveTurnChatId,
-      turn != null,
-    )
-    if (resolved.tier !== 'raw') {
-      process.stderr.write(
-        `telegram gateway: stream_reply: model passed chat_id "${_rawChatId}" (not allowlisted) — ` +
-          `routing to ${resolved.tier} turn chat "${resolved.chatId}"\n`,
-      )
-      args.chat_id = resolved.chatId
-    }
-  }
-  // Thread precedence (matches executeReply; component 3 — turn-origin
-  // routing): when the model passes no explicit message_thread_id, inject
-  // the ORIGIN turn's thread (matched by origin_turn_id) — authoritative
-  // even after currentTurn flips — falling back to the live turn's thread
-  // when no origin is resolvable (legacy #1664). Injecting into
-  // args.message_thread_id threads every downstream consumer consistently
-  // (dedup key, voice-scrub metric, draft transport, the send), so a
-  // streamed handback/synthetic-turn reply lands in the right supergroup
-  // topic and a late stream-reply can't be stolen by a successor turn. DM:
-  // every tier undefined → unchanged. Kill switch off → legacy live-turn
-  // injection only.
-  // Origin resolution is hoisted UNCONDITIONALLY (outside the
-  // message_thread_id==null guard below) so the obligation-close path has
-  // the correct routedOriginTurn even when the model explicitly passes
-  // message_thread_id (forum-topic streams). Without this hoist, Fix 1
-  // is a no-op for forum-topic streams — the origin is never resolved and
-  // closeObligationOnSubstantiveReply falls through to the live-turn
-  // fallback. Matches executeReply's unconditional resolution. Thread
-  // injection still stays scoped to the message_thread_id==null branch —
-  // only the obligation-close input changes.
-  let streamRoutedOriginTurn: CurrentTurn | null = null
-  // Track whether the origin was found via echo (for the routing log below).
-  let streamOriginVia: 'echo' | 'quoted' | null = null
-  if (TURN_ORIGIN_ROUTING_ENABLED) {
-    // Origin precedence: model echo first, then the framework-owned quoted
-    // message_id as a deterministic fallback (mirrors executeReply).
-    const echoedTurn = findTurnByOriginId(args.origin_turn_id as string | undefined)
-    const quotedTurn =
-      echoedTurn == null ? findTurnByQuotedMessageId(String(args.chat_id), args.reply_to) : null
-    const originTurn = echoedTurn ?? quotedTurn
-    streamRoutedOriginTurn = originTurn ?? null
-    streamOriginVia = originTurn == null ? null : echoedTurn != null ? 'echo' : 'quoted'
-  }
-  if (args.message_thread_id == null) {
-    let injected: number | undefined
-    if (TURN_ORIGIN_ROUTING_ENABLED) {
-      injected = resolveAnswerThreadWithLog(
-        String(args.chat_id),
-        undefined,
-        streamRoutedOriginTurn,
-        streamOriginVia,
-        turn,
-        'stream_reply',
-      )
-    } else {
-      injected = turn?.sessionThreadId
-    }
-    if (injected != null) args.message_thread_id = String(injected)
-  }
-
-  // Outbound secret scrub (#2044): mask before the dedup key, the draft
-  // stream sends, and the history record. stream_reply carries the FULL
-  // text-so-far on every call, so redacting each call keeps the answer-
-  // stream's incremental diffing comparing redacted-against-redacted.
-  args.text = redactOutboundText(args.text as string, 'stream_reply')
-
-  // Voice scrub (PR #1683 follow-up). Modern Claude on the fleet
-  // uses the answer-stream / draft-stream path for multi-paragraph
-  // replies — the model emits via stream_reply and the original
-  // PR #1683 scrub site (executeReply) never sees the text. klanker's
-  // 2026-05-24 log showed model output with em-dashes routed via
-  // stream_reply done=true, materializing as sendMessage with no
-  // scrub. Mirror the executeReply pattern here: scrub BEFORE the
-  // outbound-dedup check (so retries see the scrubbed key) and
-  // mutate args.text so all downstream consumers (the stream-
-  // controller, dedup record, history record) see the scrubbed
-  // version. Kill switch: SWITCHROOM_DISABLE_VOICE_SCRUB.
-  {
-    // Cross-path consistency (#2755): normalizePunctuation runs BEFORE
-    // scrubVoice here, matching the reply/edit paths, so a spaced em-dash
-    // gets the same comma treatment on every outbound path (scrubVoice
-    // would otherwise see the raw dash first on this path only and apply
-    // its period substitution). handleStreamReply's own deps run
-    // normalizePunctuation again downstream — it is idempotent, so the
-    // second pass is a no-op. Side effect: scrubVoice's dash telemetry
-    // (voice_scrub_applied) drops to ~zero on this path since the dashes
-    // are consumed here first — deliberate.
-    args.text = normalizePunctuation(args.text as string)
-    const scrub = scrubVoice(args.text as string)
-    if (scrub.replaced > 0) {
-      args.text = scrub.scrubbed
-      emitRuntimeMetric({
-        kind: 'voice_scrub_applied',
-        chatKey: statusKey(String(args.chat_id ?? ''), args.message_thread_id != null
-          ? Number(args.message_thread_id) : undefined),
-        replaced: scrub.replaced,
-        site: 'stream_reply',
-      })
-    }
-  }
-
-  // #546 dedup check: stream_reply done=true is the most-common
-  // retry shape — claude-code re-emits the final-text call when
-  // the previous bridge missed the ack. If turn-flush already sent
-  // the same content, swallow the retry and return success.
-  // Only check on done=true (the terminal call); intermediate
-  // streaming chunks are progress edits, not full sends.
-  if (args.done === true) {
-    const sChatId = String(args.chat_id ?? '')
-    const sThreadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
-    const sText = args.text as string
-    const dup = outboundDedup.check(sChatId, sThreadId, sText, Date.now(), currentTurn?.registryKey ?? null)
-    if (dup != null) {
-      process.stderr.write(
-        `telegram gateway: stream_reply: deduped (#546) chatId=${sChatId} ` +
-        `ageMs=${dup.ageMs} preview=${JSON.stringify(dup.preview)}\n`,
-      )
-      return { content: [{ type: 'text', text: 'sent (deduped — same content sent via earlier path)' }] }
-    }
-  }
-
-  const access = loadAccess()
-  // Detect chat type for throttle-default selection.
-  // Private (DM) chats have positive numeric IDs; groups/channels are negative.
-  const streamChatId = String(args.chat_id ?? '')
-  const streamIsPrivate = isDmChatId(streamChatId)
-  const streamIsForumTopic = args.message_thread_id != null && args.message_thread_id !== ''
-  // Pre-allocated draft handoff removed in #553 PR 5 — draft-stream
-  // now allocates a fresh draft id on its first send. The pre-alloc
-  // path has been retired along with the placeholder text it was
-  // designed to overwrite cleanly.
-
-  // #271: validate + namespace callback_data for stream_reply. Same
-  // wrapping as executeReply — URL buttons pass through, callback_data
-  // gets the `agent:` prefix so the dispatcher can route taps back to
-  // this agent. Only attached on done=true so buttons land on the
-  // final answer message, not on intermediate draft edits.
-  let streamReplyMarkup: { inline_keyboard: AnyButton[][] } | undefined
-  let streamButtonMeta: Map<string, AgentButtonMeta> | undefined
-  const rawStreamKeyboard = args.inline_keyboard as AnyButton[][] | undefined
-  if (rawStreamKeyboard != null && Boolean(args.done)) {
-    const validationErrors = validateInlineKeyboard(rawStreamKeyboard)
-    if (validationErrors.length > 0) {
-      const summary = validationErrors
-        .map((e) => `${e.path}.${e.field}: ${e.reason}`)
-        .join('; ')
-      throw new Error(`inline_keyboard validation failed: ${summary}`)
-    }
-    streamButtonMeta = extractAgentButtonMeta(rawStreamKeyboard)
-    streamReplyMarkup = { inline_keyboard: wrapAgentCallbacks(rawStreamKeyboard) }
-  }
-
-  // #1122 KPI: stream_reply's FIRST emit is a fresh user-visible outbound
-  // message (subsequent calls edit the same message — no device ping).
-  // Snapshot state BEFORE handleStreamReply to detect first-emit precisely.
-  {
-    const streamThreadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
-    const sKeyBefore = streamKey(streamChatId, streamThreadId)
-    if (!activeDraftStreams.has(sKeyBefore)) {
-      const sKey = statusKey(streamChatId, streamThreadId)
-      signalTracker.noteOutbound(sKey, Date.now())
-      silencePoke.noteOutbound(sKey, Date.now())
-      // PR3b-cutover: feed lastOutboundAt to the delivery machine (see
-      // executeReply) so its TTL tick suppresses an active-turn fallback.
-      shadowEmit({ kind: 'modelOutbound', key: sKey as _ChatKey, at: Date.now() })
-      // #2527: emit turn_reply_timing on the first stream_reply of the turn,
-      // mirroring the same gate in executeReply. Guards with firstTextReplyLogged
-      // so a turn that calls reply first and stream_reply second doesn't double-emit.
-      if (turn != null && !firstTextReplyLogged.has(sKey)) {
-        firstTextReplyLogged.add(sKey)
-        logStreamingEvent({
-          kind: 'turn_reply_timing',
-          chatId: streamChatId,
-          threadId: streamThreadId,
-          turnId: turn.turnId,
-          timeToFirstTextReplyMs: Date.now() - turn.gatewayReceiveAt,
-        })
-      }
-      // #1741 — see executeReply for the rationale: only a plausibly-
-      // final stream_reply clears the silent-end state. An interim
-      // ack via stream_reply must NOT clear; the Stop hook needs
-      // the state to persist if turn_end fails to land.
-      if (
-        isFinalAnswerReply({
-          text: (args.text as string | undefined) ?? '',
-          disableNotification: args.disable_notification === true,
-          done: args.done === true,
-        })
-      ) {
-        clearSilentEndState(sKey)
-      }
-    }
-  }
-
-  // Lever 2 (design §9 lever 2): finalize the activity card BEFORE the stream
-  // send so the card keeps its lower message_id and the reply is structurally
-  // last. ONLY for a *substantive* final (a stream_reply done=true or ≥200
-  // chars) — for a short pinging interim chunk do NOTHING (finalizing an ack
-  // early would close → reopen → emit more, the #2141 ack-then-work feed, R3).
-  // `clearActivitySummary` edits in place + nulls activityMessageId; the sticky
-  // latch set here blocks any post-reply re-OPEN below the answer.
-  if (
-    turn != null
-    && isSubstantiveFinalReply({
-      text: (args.text as string | undefined) ?? '',
-      disableNotification: args.disable_notification === true,
-      done: args.done === true,
-    })
-  ) {
-    // PR-4a: routed through the emission-authority façade (no-op delegates —
-    // the latch-set and the finalize run exactly as before).
-    const ea = emissionAuthorityFor(turn)
-    ea.markSubstantiveFinalDelivered(() => {
-      turn.finalAnswerEverDelivered = true
-      if (turn.finalAnswerDeliveredAt == null) turn.finalAnswerDeliveredAt = Date.now()
-    })
-    ea.finalizeCard(() => {
-      clearActivitySummary(turn)
-    })
-  }
-
-  const result = await handleStreamReply(
-    {
-      chat_id: streamChatId,
-      text: args.text as string,
-      done: Boolean(args.done),
-      message_thread_id: args.message_thread_id as string | undefined,
-      format: args.format as string | undefined,
-      reply_to: args.reply_to as string | undefined,
-      quote: args.quote as boolean | undefined,
-      ...(args.protect_content === true ? { protect_content: true } : {}),
-      ...(args.quote_text != null ? { quote_text: args.quote_text as string } : {}),
-      ...(streamReplyMarkup != null ? { reply_markup: streamReplyMarkup } : {}),
-      ...(args.disable_notification === true ? { disable_notification: true } : {}),
-    },
-    { activeDraftStreams, suppressPtyPreview },
-    {
-      // grammy's Bot<Context, Api<RawApi>> has a wider api shape than the
-      // local StreamBotApi interface, but is structurally compatible at
-      // runtime (StreamBotApi is a subset). Cast through unknown to
-      // bypass the structural-typing strictness.
-      bot: lockedBot as unknown as { api: import('../stream-controller.js').StreamBotApi },
-      retry: robustApiCall,
-      repairEscapedWhitespace,
-      normalizeParagraphBreaks,
-      normalizePunctuation,
-      stripExcessBold,
-      addParagraphSpacers,
-      assertAllowedChat,
-      resolveThreadId,
-      disableLinkPreview: access.disableLinkPreview !== false,
-      defaultFormat: access.parseMode ?? 'html',
-      logStreamingEvent,
-      isPrivateChat: streamIsPrivate,
-      isForumTopic: streamIsForumTopic,
-      // Issue #310: deliver the outbound count bump BEFORE forceCompleteTurn
-      // so the terminal render sees outboundDeliveredCount > 0. The handler
-      // calls this dep in that order internally.
-      recordOutboundDelivered: (chatId, threadId) => {
-        progressDriver?.recordOutboundDelivered(
-          chatId,
-          threadId != null ? String(threadId) : undefined,
-        )
-      },
-      forceCompleteTurn: (chatId, threadId) => {
-        progressDriver?.forceCompleteTurn({
-          chatId,
-          threadId: threadId != null ? String(threadId) : undefined,
-        })
-      },
-      historyEnabled: HISTORY_ENABLED,
-      recordOutbound,
-      ...(HISTORY_ENABLED ? { getLatestInboundMessageId } : {}),
-      writeError: (line) => process.stderr.write(line),
-      // When the operator sets `channels.telegram.stream_throttle_ms` in yaml,
-      // the env override wins; otherwise draft-stream's DM/group defaults apply
-      // (400 ms for DMs, 1000 ms for groups). `throttleMs: undefined` passes
-      // through to draft-stream where the per-chat-type default applies.
-      ...(STREAM_THROTTLE_MS_OVERRIDE != null ? { throttleMs: STREAM_THROTTLE_MS_OVERRIDE } : {}),
-      progressCardActive: streamMode === 'checklist',
-    },
-  )
-  // Issue #137: bump the per-turn outbound counter on every successful
-  // stream_reply call (partial OR final). Even a single chunk landing
-  // proves the delivery path worked. messageId may be null when the
-  // call only updated the streaming draft and didn't sendMessage on
-  // this invocation — that case still counts as activity.
-  if (result.messageId != null) {
-    try {
-      progressDriver?.recordOutboundDelivered(
-        String(args.chat_id ?? ''),
-        args.message_thread_id as string | undefined,
-      )
-    } catch { /* best-effort signal */ }
-    // Issue #203: stream_reply is the agent's primary reply path. Without
-    // ticking the silent-gap tracker here, turn_signal_gap reports the
-    // entire turn duration as silent for any turn that uses stream_reply
-    // — which per CLAUDE.md guidance is most of them. The metric would be
-    // worse than no metric. Tick on every successful delivery (partial or
-    // final) so the gap measurement reflects real silent intervals.
-    try {
-      const threadIdNum = args.message_thread_id != null
-        ? Number(args.message_thread_id)
-        : undefined
-      signalTracker.noteSignal(
-        statusKey(String(args.chat_id ?? ''), threadIdNum),
-        Date.now(),
-      )
-    } catch { /* best-effort signal */ }
-  }
-  // #710: stash agent-button meta keyed by the final message id so the
-  // callback handler can honor ack_text / single_use on tap.
-  if (
-    args.done === true
-    && result.messageId != null
-    && streamButtonMeta != null
-    && streamButtonMeta.size > 0
-  ) {
-    rememberAgentButtonMeta(String(args.chat_id ?? ''), result.messageId, streamButtonMeta)
-  }
-  // #546 dedup record: capture the final stream_reply text on the
-  // terminal call so a subsequent retry (different bridge, same
-  // content) lands as a no-op instead of a second message.
-  if (args.done === true && result.messageId != null) {
-    const sChatId = String(args.chat_id ?? '')
-    const sThreadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
-    outboundDedup.record(sChatId, sThreadId, args.text as string, Date.now(), currentTurn?.registryKey ?? null)
-    // #1445 cross-turn pending-async ambient. The terminal stream_reply
-    // (done=true) is the user-visible anchor for any cross-turn wait
-    // that follows. Capture it so if this turn ends with a pending
-    // async dispatch, the framework edits THIS message in place at
-    // intervals.
-    //
-    // #2669 — capture whether the stream-reply-handler sent literally
-    // (format:'text') so the cross-turn edit tick re-edits with the same
-    // shape. The default rich-markdown path re-edits via the rich path.
-    const streamFormat = (args.format as string | undefined) ?? (access.parseMode ?? 'html')
-    const streamLiteralText = streamFormat === 'text'
-    // #1760 primary fix — clear any stale prior-turn ticker before
-    // re-anchoring on stream_reply done. See the matching comment at
-    // the executeReply finalize site.
-    pendingProgress.clearPending(statusKey(sChatId, sThreadId), 'reply_finalize')
-    pendingProgress.noteOutbound(statusKey(sChatId, sThreadId), {
-      messageId: result.messageId,
-      text: args.text as string,
-      literalText: streamLiteralText,
-    })
-  }
-  // #1664 — mark the turn's final answer as delivered. For stream_reply a
-  // call with done=true IS the final answer by definition (the model
-  // explicitly closed the stream). A non-terminal stream_reply chunk also
-  // counts when it carries the final-answer signals — notification-bearing
-  // OR substantive length — via the same `isFinalAnswerReply` predicate
-  // executeReply uses. See the CurrentTurn.finalAnswerDelivered doc-comment
-  // for why replyCalled is not a sufficient signal here.
-  if (
-    turn != null &&
-    isFinalAnswerReply({
-      text: (args.text as string | undefined) ?? '',
-      disableNotification: args.disable_notification === true,
-      done: args.done === true,
-    })
-  ) {
-    turn.finalAnswerDelivered = true
-    // Feed-reopen refinement: a stream_reply done=true (or a ≥200-char
-    // chunk) is substantive; a short pinging non-done chunk is an ack. Only
-    // the latter should re-open the feed on subsequent post-answer work.
-    turn.finalAnswerSubstantive = isSubstantiveFinalReply({
-      text: (args.text as string | undefined) ?? '',
-      disableNotification: args.disable_notification === true,
-      done: args.done === true,
-    })
-    // Sticky ordering latch (lever 1): set once a SUBSTANTIVE final lands;
-    // never cleared by reopen. The card OPEN gate keys on this sticky latch.
-    if (turn.finalAnswerSubstantive) turn.finalAnswerEverDelivered = true
-    if (turn.finalAnswerSubstantive && turn.finalAnswerDeliveredAt == null) turn.finalAnswerDeliveredAt = Date.now()
-    if (turn.finalAnswerSubstantive) closeObligationOnSubstantiveReply(args, turn, streamRoutedOriginTurn)
-    // #1744 follow-up — stream_reply edge case. The first-emit gate at
-    // L5178 only clears silent-end state on the FIRST emit of a stream.
-    // If a stream's first emit was ack-shaped (disable_notification:true,
-    // short text, no done) it correctly did NOT clear the state. But a
-    // LATER emit in the same stream may flip `done=true` or carry
-    // substantive text — that's the real final answer landing, and the
-    // state file must be cleared here too. clearSilentEndState is
-    // idempotent (no-op when the file is absent or the turnKey doesn't
-    // match), so calling it unconditionally on every final-answer-shaped
-    // emit is safe even if the first-emit path already cleared.
-    const streamThreadIdForClear = args.message_thread_id != null
-      ? Number(args.message_thread_id)
-      : undefined
-    clearSilentEndState(statusKey(streamChatId, streamThreadIdForClear))
-  }
-  // v0.13.30 follow-up — release the buffer gate on every successful
-  // stream_reply too. Same rationale as executeReply: short replies
-  // with `disable_notification: true` would otherwise wedge the gate
-  // forever. `result.status` is always 'updated' | 'finalized'
-  // (stream-reply-handler.ts:305) at this point — earlier failures
-  // throw or return before reaching here.
-  {
-    const sChat = String(args.chat_id ?? '')
-    const sThread = resolveThreadId(sChat, args.message_thread_id as string | undefined)
-    // Component 1: pass the turn (finalAnswerDelivered set above for a
-    // final stream emit). Interim stream chunks leave it false → no
-    // cross-topic drain until the done=true / substantive emit lands.
-    releaseTurnBufferGate(statusKey(sChat, sThread), turn ?? undefined)
-    // Component 5: reap the queued-status placeholder for THIS turn's
-    // topic once the final answer landed. Key on the turn's own session
-    // thread (where the placeholder lives), not the answer's resolved one.
-    if (turn?.finalAnswerDelivered === true) {
-      reapQueuedStatus(turn.sessionChatId, turn.sessionThreadId)
-    }
-  }
-  return { content: [{ type: 'text', text: `${result.status} (id: ${result.messageId ?? 'pending'})` }] }
-}
-
 async function executeProgressUpdate(args: Record<string, unknown>): Promise<unknown> {
   if (!args.chat_id) throw new Error('progress_update: chat_id is required')
   if (!args.text) throw new Error('progress_update: text is required')
@@ -10557,6 +11087,14 @@ async function executeProgressUpdate(args: Record<string, unknown>): Promise<unk
   const key = statusKey(chat_id, threadId)
 
   assertAllowedChat(chat_id)
+
+  // Outbound secret scrub (#2044). progress_update was the ONLY send site not
+  // calling redactOutboundText, so a secret the agent echoed into a progress
+  // line reached Telegram unmasked (reply/stream_reply/edit_message/turn_flush
+  // all redact). Mask BEFORE the 300-char truncation below: a secret straddling
+  // the 300-char cut would otherwise be sliced apart and evade the detector, so
+  // redaction has to run on the full untruncated text first.
+  text = redactOutboundText(text, 'progress_update')
 
   // Truncate to 300 chars
   if (text.length > 300) {
@@ -10997,7 +11535,10 @@ function renderVaultRequestSaveCard(req: PendingVaultRequestSave, agentSlug: str
   }
   lines.push('')
   lines.push(`_Tap Save to write to the host vault, Rename to change the key name, or Discard to drop it. The value is held in this chat's gateway memory until you decide._`)
-  return lines.join('\n')
+  // hardenCardBreaks: labelled field lines (key: / why:) would soft-collapse
+  // into one blob under the GFM rich renderer; this card is sent direct via
+  // richMessage, bypassing the switchroomReply chokepoint.
+  return hardenCardBreaks(lines.join('\n'))
 }
 
 /**
@@ -11498,6 +12039,8 @@ async function executeVaultRequestAccess(args: Record<string, unknown>): Promise
   pendingVaultRequestAccesses.set(stageId, pending)
   sweepPendingVaultRequestAccesses()
 
+  // renderVaultRequestAccessCard self-hardens its field line breaks (this card
+  // is sent direct, bypassing the switchroomReply chokepoint).
   const text = renderVaultRequestAccessCard(pending)
   const threadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
   // Remember the agent's working topic so the grant-outcome inbound resumes in it.
@@ -11519,6 +12062,182 @@ async function executeVaultRequestAccess(args: Record<string, unknown>): Promise
       {
         type: 'text',
         text: `vault_request_access: card sent (stage_id=${stageId}, key=${key}, scope=${scopeRaw}). Wait for the operator to tap Approve or Deny — do not retry the vault read until you see a confirmation message. If the card times out (10 min) you can re-request.`,
+      },
+    ],
+  }
+}
+
+/** Read the live switchroom.yaml bytes for diff/dup-check. Mirrors the
+ *  always-allow persistence path's config read. */
+function readLiveSwitchroomConfigText(): string {
+  const cfgPath = process.env.SWITCHROOM_CONFIG ?? findSwitchroomConfigFile()
+  return readFileSync(cfgPath, 'utf8')
+}
+
+const MENTAL_MODEL_NAME_REGEX = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/
+
+function buildMentalModelProposeKeyboard(stageId: string): { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } {
+  return {
+    inline_keyboard: [
+      [
+        { text: '✅ Approve', callback_data: `mmp:approve:${stageId}` },
+        { text: '🚫 Deny', callback_data: `mmp:deny:${stageId}` },
+      ],
+    ],
+  }
+}
+
+/**
+ * `mental_model_propose` tool (hindsight Phase 5) — the agent surfaces a
+ * candidate mental model for the operator to approve. Mirrors the
+ * `vault_request_access` shape: the agent can only PROPOSE; the [Approve]/[Deny]
+ * tap is operator-gated (handleMentalModelProposeCallback), so an agent can
+ * never self-approve. On Approve the proposal is DECLARED — appended to the
+ * agent's memory.mental_models[] via the operator-approved config-edit path
+ * (reusing config_propose_edit apply+reconcile) — and ensured in the bank. On
+ * Deny nothing is written. Guardrails enforced here BEFORE any card:
+ * duplicate-name rejection against the agent's already-declared models, and a
+ * per-agent rate limit so proposals stay non-spammy.
+ */
+async function executeMentalModelPropose(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
+  const chat_id = String(args.chat_id ?? '')
+  if (!chat_id) throw new Error('mental_model_propose: chat_id is required')
+  const name = typeof args.name === 'string' ? args.name.trim() : ''
+  if (!name) throw new Error('mental_model_propose: name is required')
+  if (!MENTAL_MODEL_NAME_REGEX.test(name)) {
+    throw new Error('mental_model_propose: name must be a slug (letters/digits/_/-, ≤64 chars, e.g. `training-plan-state`)')
+  }
+  const source_query = typeof args.source_query === 'string' ? args.source_query.trim() : ''
+  if (!source_query) throw new Error('mental_model_propose: source_query is required')
+  // Enforce the memory.mental_models[] schema cap (src/config/schema.ts) up-front
+  // so the operator never approves a card that then fails hostd config validation.
+  // The 2000-char ceiling also keeps the rendered card under Telegram's 4096-char
+  // message limit.
+  if (source_query.length > MENTAL_MODEL_SOURCE_QUERY_MAX) {
+    throw new Error(
+      `mental_model_propose: source_query is ${source_query.length} chars; the schema caps it at ${MENTAL_MODEL_SOURCE_QUERY_MAX} (a standing reflection query, not a document). Shorten it.`,
+    )
+  }
+  // Accept `why` as an alias for `reason` (mirrors the vault tools).
+  const reason =
+    typeof args.reason === 'string' ? args.reason : typeof args.why === 'string' ? args.why : undefined
+  let refresh_after_consolidation: boolean | undefined
+  if (args.refresh_after_consolidation !== undefined) {
+    if (typeof args.refresh_after_consolidation !== 'boolean') {
+      throw new Error('mental_model_propose: refresh_after_consolidation must be a boolean')
+    }
+    refresh_after_consolidation = args.refresh_after_consolidation
+  }
+  let max_tokens: number | undefined
+  if (args.max_tokens !== undefined) {
+    const n = Number(args.max_tokens)
+    if (!Number.isInteger(n) || n <= 0) {
+      throw new Error('mental_model_propose: max_tokens must be a positive integer')
+    }
+    // Enforce the schema ceiling (src/config/schema.ts) here so the card can't be
+    // approved into a config-validation failure downstream.
+    if (n > MENTAL_MODEL_MAX_TOKENS_CAP) {
+      throw new Error(
+        `mental_model_propose: max_tokens ${n} exceeds the schema cap of ${MENTAL_MODEL_MAX_TOKENS_CAP} (a mental model is a standing summary, not a corpus).`,
+      )
+    }
+    max_tokens = n
+  }
+  assertAllowedChat(chat_id)
+
+  const agentSlug = process.env.SWITCHROOM_AGENT_NAME || 'agent'
+
+  // Rate limit: a proposal is a rare, deliberate curation act — throttle so a
+  // looping agent can never spam the operator with cards.
+  const rate = checkMentalModelProposeRate()
+  if (!rate.ok) {
+    const retryAtIso = new Date(rate.retryAtMs).toISOString()
+    return {
+      content: [
+        {
+          type: 'text',
+          text:
+            `mental_model_propose: RATE-LIMITED (max ${MENTAL_MODEL_PROPOSE_MAX_PER_WINDOW} proposals/hour). ` +
+            `No card was posted. Next slot opens at ${retryAtIso}. Proposing mental models is meant to be ` +
+            `rare — batch or wait rather than re-firing.`,
+        },
+      ],
+    }
+  }
+
+  // Duplicate-name guard: reject a proposal for a model already DECLARED for
+  // this agent, BEFORE posting a card (the name is the idempotent-ensure key).
+  try {
+    const configText = readLiveSwitchroomConfigText()
+    const declared = readDeclaredMentalModelNames(configText, agentSlug)
+    if (declared.includes(name)) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text:
+              `mental_model_propose: '${name}' is ALREADY a declared mental model for ${agentSlug} ` +
+              `(memory.mental_models[]). No card was posted — it already exists and is ensured in your ` +
+              `bank. Pick a different name if you meant a NEW model, or just use the existing one.`,
+          },
+        ],
+      }
+    }
+  } catch (err) {
+    // Config read failed (transient) — fall through to the card. The approve
+    // path re-reads and re-checks (dupe guard is defense-in-depth), so a
+    // redundant card is harmless; suppressing a needed card is not.
+    process.stderr.write(`telegram gateway: mental_model_propose dup pre-check read failed: ${(err as Error).message}\n`)
+  }
+
+  const stageId = randomBytes(4).toString('hex')
+  const pending: PendingMentalModelPropose = {
+    agent: agentSlug,
+    chat_id,
+    spec: {
+      name,
+      source_query,
+      ...(refresh_after_consolidation !== undefined ? { refresh_after_consolidation } : {}),
+      ...(max_tokens !== undefined ? { max_tokens } : {}),
+    },
+    ...(reason ? { reason } : {}),
+    staged_at: Date.now(),
+  }
+  pendingMentalModelProposes.set(stageId, pending)
+  sweepPendingMentalModelProposes()
+
+  const text = renderMentalModelProposeCard({
+    agent: agentSlug,
+    name,
+    source_query,
+    ...(reason ? { reason } : {}),
+    ...(refresh_after_consolidation !== undefined ? { refresh_after_consolidation } : {}),
+  })
+  const threadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
+  if (threadId != null) pending.threadId = threadId
+  const sent = await retryWithThreadFallback<{ message_id: number }>(
+    robustApiCall,
+    (tid) =>
+      lockedBot.api.sendRichMessage(chat_id, richMessage(text), {
+        reply_markup: buildMentalModelProposeKeyboard(stageId),
+        ...(tid != null && Number.isFinite(tid) ? { message_thread_id: tid } : {}),
+      }),
+    { threadId, chat_id, verb: 'mental_model_propose.card' },
+  )
+  pending.card_message_id = sent.message_id
+  // Only count a proposal against the rate budget once its card actually
+  // posted (validation errors / dupes don't consume the budget).
+  mentalModelProposeTimes.push(Date.now())
+
+  return {
+    content: [
+      {
+        type: 'text',
+        text:
+          `mental_model_propose: card sent (stage_id=${stageId}, name=${name}). Wait for the operator to tap ` +
+          `Approve or Deny — END YOUR TURN cleanly. A fresh inbound arrives with the outcome ` +
+          `(source=mental_model_proposal_applied / mental_model_proposal_denied). Do NOT re-propose this ` +
+          `model while the card is open.`,
       },
     ],
   }
@@ -12093,6 +12812,31 @@ async function drainActivitySummary(
           )
           turn.activityMessageId = sent.message_id
           turn.activityEverOpened = true
+          // Known Gap 1 (deterministic-turn-liveness.md) — persist the
+          // minimal card handle the moment it opens, so a gateway restart
+          // mid-turn has something to finalize on next boot instead of
+          // leaving this card frozen forever. Fire-and-forget/best-effort:
+          // a failed persist degrades to the pre-fix (in-memory-only)
+          // behaviour, never blocks the card opening.
+          if (activityCardPersistEnabled) {
+            writeActivityCardRecord(ACTIVITY_CARD_STORE_PATH, activityCardStoreFs, {
+              turnKey: statusKey(chat, thread),
+              chatId: chat,
+              threadId: thread ?? null,
+              activityMessageId: sent.message_id,
+              startedAt: turn.startedAt,
+              // Mirror the ACTUAL pin decision, not an unconditional `true`:
+              // the OPEN below silently-pins the fresh card only when
+              // `PIN_STATUS_WHILE_WORKING` is on (`reconcileStatusPin` no-ops
+              // when it's off, and can also fail on missing supergroup
+              // rights). Persisting `pinned: true` regardless would make the
+              // boot reaper attempt an unpin on a card that was never pinned.
+              // The reaper's unpin is defense-in-depth anyway
+              // (`statusPinBootCleanup` owns the primary unpin), so tracking
+              // the flag honestly is what matters here.
+              pinned: PIN_STATUS_WHILE_WORKING,
+            })
+          }
           // Status-pin: the per-turn status message just opened — it's the
           // in-flight "what it's doing" surface. Silently pin it so the turn
           // stays in view when the feed scrolls past. Keyed to the same
@@ -12137,11 +12881,15 @@ async function drainActivitySummary(
 }
 
 /**
- * Open (or climb) the minimal "Working…" liveness card for a 0-label turn once
- * it has been alive >= FEED_LIVENESS_OPEN_MS. The ONE place the liveness card
- * may OPEN — both the enqueue-time early-open timer
- * (`scheduleEarlyLivenessOpen`) and the 6 s heartbeat call through here, so a
- * card opened by one caller is a clean no-op for the other:
+ * OPEN the minimal "Working…" liveness card for a 0-label turn once it has been
+ * alive >= FEED_LIVENESS_OPEN_MS. The ONE place the liveness card may OPEN — both
+ * the enqueue-time early-open timer (`scheduleEarlyLivenessOpen`) and the 6 s
+ * heartbeat call through here, so a card opened by one caller is a clean no-op
+ * for the other. This function OPENS only; it does NOT climb an already-open card
+ * (its WHEN-gate `shouldEarlyOpenLiveness` returns false once `activityMessageId`
+ * is set). The 0-label CLIMB of an already-open card lives at the heartbeat call
+ * site via `silentTurnClimbRender` (deterministic-turn-liveness.md Phase 1) — so
+ * BOTH the labelled and the 0-label branches now keep the card visibly climbing.
  *   - `drainActivitySummary` OPENs when `activityMessageId == null` and EDITs
  *     once it is set, so a second call after an open just maintains the card;
  *   - the `mirrorLines.length === 0` guard at the heartbeat call site (and the
@@ -12173,7 +12921,10 @@ function openLivenessFeedIfDue(turn: CurrentTurn): void {
   const livenessHeader: SessionActivityHeader = {
     label: 'Agent', elapsedMs: age, toolCount: turn.labeledToolCount, state: 'running',
   }
-  const rendered = renderActivityFeedWithNested(lines, [], false, ` · ${formatFeedElapsed(age)}`, undefined, livenessHeader)
+  // Liveness card is a single "step" whose start is the turn start, so `age`
+  // IS the step's own elapsed. formatStepSuffix keeps the `→` line timer-free
+  // until the step has run ≥ STEP_TIMER_MIN_MS (header total still shows).
+  const rendered = renderActivityFeedWithNested(lines, [], false, formatStepSuffix(age), undefined, livenessHeader)
   if (rendered == null) return
   turn.activityPendingRender = rendered
   const ea = emissionAuthorityFor(turn)
@@ -12293,8 +13044,10 @@ function feedHeartbeatTick(): void {
       label: 'Agent', elapsedMs: age, toolCount: turn.labeledToolCount, state: 'running',
     }
     const lines = turn.mirrorLines.length > 0 ? turn.mirrorLines : ['Working in background…']
+    // `subagentAt` is the worker's last ADVANCE — the current step's start —
+    // so this suffix is already per-step. formatStepSuffix adds the 10 s gate.
     const elapsed = Date.now() - subagentAt
-    const rendered = renderActivityFeedWithNested(lines, [], false, ` · ${formatFeedElapsed(elapsed)}`, undefined, livenessHeader)
+    const rendered = renderActivityFeedWithNested(lines, [], false, formatStepSuffix(elapsed), undefined, livenessHeader)
     if (rendered == null) return
     turn.activityPendingRender = rendered
     const ea = emissionAuthorityFor(turn)
@@ -12321,13 +13074,45 @@ function feedHeartbeatTick(): void {
   // sends (opens) when activityMessageId is null and edits (maintains) once set
   // — so this one branch handles both the open and the climb.
   //
-  // The open/climb logic lives in ONE place (`openLivenessFeedIfDue`) so the
+  // The OPEN logic lives in ONE place (`openLivenessFeedIfDue`) so the
   // enqueue-time early-open timer (`scheduleEarlyLivenessOpen`) and this 6 s
   // heartbeat both reach the same drain — there is exactly one path that can
   // OPEN the liveness card, so the two callers can never double-open or race.
-  if (turn.mirrorLines.length === 0) {
-    openLivenessFeedIfDue(turn)
-    return
+  //
+  // Phase 1 climb (deterministic-turn-liveness.md): once the card IS open, the
+  // OPEN path no-ops (its WHEN-gate `shouldEarlyOpenLiveness` returns false for
+  // an already-open card) — which is exactly how the 0-label card used to FREEZE
+  // during a long silent tool. So split the two cases: OPEN when no card exists,
+  // and otherwise re-render the "Working…" card with a fresh wall-clock elapsed
+  // through the SAME cardDrainGate / mayDrain / liveness EDIT path the labelled
+  // branch below uses. Model-independent (reads only `now - startedAt`), so a
+  // blocked tool call can't starve it; edit-only, so it never push-notifies.
+  //
+  // The tick BODY lives in feed-heartbeat-climb.ts (`runSilentTurnHeartbeatTick`)
+  // so the shipped decision logic is directly under the outcome-based regression
+  // test (tests/silent-turn-climb-transport.test.ts) — this gateway IIFE cannot
+  // be imported in-process. This call site only wires the REAL deps; the wiring
+  // shape is pinned structurally by tests/feed-heartbeat-liveness-open.test.ts.
+  {
+    const ea = emissionAuthorityFor(turn)
+    const handled = runSilentTurnHeartbeatTick(
+      {
+        mirrorLineCount: turn.mirrorLines.length,
+        activityMessageId: turn.activityMessageId,
+        labeledToolCount: turn.labeledToolCount,
+        ageMs: Date.now() - turn.startedAt,
+        minStaleMs: FEED_HEARTBEAT_MIN_STALE_MS,
+      },
+      {
+        openLivenessFeedIfDue: () => openLivenessFeedIfDue(turn),
+        setPendingRender: (rendered) => { turn.activityPendingRender = rendered },
+        cardDrainGate: (run) => cardDrainGate(turn, ea, run),
+        mayDrain: () => ea.mayDrain(turn),
+        openOrEditCard: (apply) => ea.openOrEditCard('liveness', apply),
+        drain: () => { turn.activityInFlight = drainActivitySummary(turn, 'liveness') },
+      },
+    )
+    if (handled) return
   }
 
   // Labelled-feed heartbeat: keep a stale in-progress step visibly advancing.
@@ -12335,7 +13120,10 @@ function feedHeartbeatTick(): void {
   if (turn.lastToolLabelAt == null) return // feed not driven by a labelled step
   const elapsed = Date.now() - turn.lastToolLabelAt
   if (elapsed < FEED_HEARTBEAT_MIN_STALE_MS) return // step is fresh; feed advancing normally
-  const rendered = composeTurnActivity(turn, false, ` · ${formatFeedElapsed(elapsed)}`)
+  // `lastToolLabelAt` resets on every new tool label, so `elapsed` is the
+  // CURRENT step's own run time. formatStepSuffix holds the timer back until
+  // the step passes STEP_TIMER_MIN_MS (10 s) — header total is unaffected.
+  const rendered = composeTurnActivity(turn, false, formatStepSuffix(elapsed))
   if (rendered == null) return
   turn.activityPendingRender = rendered
   const ea = emissionAuthorityFor(turn)
@@ -12389,6 +13177,21 @@ function clearActivitySummary(turn: CurrentTurn, finalHtmlOverride?: string | nu
     if (turn.activityMessageId == null) return
     const id = turn.activityMessageId
     turn.activityMessageId = null
+    // Known Gap 1 (deterministic-turn-liveness.md) — the card is closing
+    // normally (about to be deleted or finalized below), so drop its durable
+    // handle too: a normal close must never leave a stale record for the
+    // boot reaper to "finalize" a message that's already been handled.
+    if (activityCardPersistEnabled) {
+      clearActivityCardRecord(
+        ACTIVITY_CARD_STORE_PATH,
+        activityCardStoreFs,
+        statusKey(chat, thread),
+        // Scope to this card's exact id (reap-race guard): only drop the row
+        // for the card THIS turn is closing, never a fresher card another
+        // turn may have already upserted under the same topic key.
+        id,
+      )
+    }
     if (CLEAR_STATUS_ON_COMPLETION) {
       try {
         await robustApiCall(
@@ -12427,6 +13230,175 @@ function clearActivitySummary(turn: CurrentTurn, finalHtmlOverride?: string | nu
         process.stderr.write(`telegram gateway: activity-summary finalize failed: ${msg}\n`)
       }
     }
+  })
+}
+
+/**
+ * #2849 hindsight Phase 4 — sparse chat-legible memory.
+ *
+ * Fire-and-forget: if this main-agent tool call is a material memory
+ * operation (create_directive → 📌 remembered; invalidate/demote → ✂️
+ * forgot), send ONE terse real message into the turn's originating
+ * chat/topic. Routes on `turn.sessionChatId` / `turn.sessionThreadId`
+ * (the originating topic, never the operator DM), through
+ * `retryWithThreadFallback` so a deleted forum topic can't crash the
+ * gateway. Non-material tool calls return silently — no line on ordinary
+ * recall or routine consolidation. Kill-switch: SWITCHROOM_MEMORY_LEGIBILITY=0.
+ */
+/**
+ * Fix 1.3 (#2903): a memory-legibility line must render only AFTER the write
+ * is confirmed. We stage the detected event on `tool_use` (keyed by
+ * `toolUseId`) and flush the 📌/✂️ line on the matching SUCCESSFUL
+ * `tool_result` — a failed write (engine down / isError envelope) drops the
+ * staged line, so chat never claims "remembered" for a write that errored.
+ *
+ * A hindsight `tools/call` returns HTTP 200 + `is_error:true` on failure, and
+ * Claude Code surfaces that on the transcript `tool_result` block, which
+ * `session-tail` projects onto `ev.isError`. That is the confirmed-success
+ * signal we gate on.
+ */
+interface MemoryLegibilityRoute {
+  chatId: string
+  threadId: number | undefined
+  toolName: string
+}
+const memoryLegibilityStager = new MemoryLegibilityStager<MemoryLegibilityRoute>()
+
+function sendMemoryLegibilityLine(
+  event: NonNullable<ReturnType<typeof detectMemoryLegibilityEvent>>,
+  chatId: string,
+  threadId: number | undefined,
+): void {
+  const line = renderMemoryLegibilityLine(event)
+  void retryWithThreadFallback(
+    robustApiCall,
+    (tid) =>
+      bot.api.sendMessage(chatId, line, {
+        parse_mode: 'HTML',
+        // Status surface, not the user's answer — never ping the device.
+        disable_notification: true,
+        ...(tid != null ? { message_thread_id: tid } : {}),
+      }),
+    { threadId, chat_id: chatId, verb: 'memory-legibility.sendMessage' },
+  ).catch((err) => {
+    process.stderr.write(
+      `telegram gateway: memory-legibility send failed: ${
+        err instanceof Error ? err.message : String(err)
+      }\n`,
+    )
+  })
+}
+
+/** Stage a material memory event observed on `tool_use`. Nothing is sent yet;
+ *  the line is flushed by `confirmMemoryLegibility` on a successful result. */
+function surfaceMemoryLegibility(
+  turn: CurrentTurn,
+  toolName: string,
+  toolUseId: string | null | undefined,
+  input: Record<string, unknown> | undefined,
+): void {
+  if (!MEMORY_LEGIBILITY_ENABLED) return
+  const event = detectMemoryLegibilityEvent(toolName, input)
+  if (event == null) return
+  const chatId = turn.sessionChatId
+  const threadId = turn.sessionThreadId
+  // Without a toolUseId we cannot correlate a result to confirm success. This
+  // effectively never happens (Claude Code always stamps a tool_use id), so
+  // rather than claim an unconfirmed "remembered", we skip and log.
+  if (toolUseId == null || toolUseId.length === 0) {
+    process.stderr.write(
+      `telegram gateway: memory-legibility ${event.kind} SKIPPED (no toolUseId) ` +
+        `chat=${chatId} tool=${toolName}\n`,
+    )
+    return
+  }
+  memoryLegibilityStager.stage(toolUseId, event, { chatId, threadId, toolName })
+  process.stderr.write(
+    `telegram gateway: memory-legibility ${event.kind} STAGED chat=${chatId} ` +
+      `thread=${threadId ?? '-'} tool=${toolName} id=${toolUseId}\n`,
+  )
+}
+
+/** Flush (or drop) a staged memory-legibility line on its matching
+ *  `tool_result`. Sends only on confirmed success; a failed write is dropped
+ *  so chat never claims "remembered" for a write that errored. */
+function confirmMemoryLegibility(
+  toolUseId: string | null | undefined,
+  isError: boolean | undefined,
+): void {
+  const resolved = memoryLegibilityStager.confirm(toolUseId, isError)
+  if (resolved == null) {
+    if (isError === true) {
+      process.stderr.write(
+        `telegram gateway: memory-legibility DROPPED (write errored) id=${toolUseId}\n`,
+      )
+    }
+    return
+  }
+  const { event, meta } = resolved
+  process.stderr.write(
+    `telegram gateway: memory-legibility ${event.kind} CONFIRMED chat=${meta.chatId} ` +
+      `thread=${meta.threadId ?? '-'} tool=${meta.toolName} id=${toolUseId}\n`,
+  )
+  sendMemoryLegibilityLine(event, meta.chatId, meta.threadId)
+}
+
+/**
+ * #2849 hindsight Phase 4 (follow-up) — consolidation-driven legibility.
+ *
+ * The gateway-side sink for a verified `hindsight` / `consolidation.completed`
+ * webhook. `recordWebhookEvent` has already logged the event for audit and
+ * resolved the agent's channel target; this decides whether it is MATERIAL
+ * (a genuine store/correct — else nothing), rate-limits it hard, and — only
+ * if it clears both gates — sends ONE terse "🧠 updated what I know about Y"
+ * real message with notifications suppressed. Never injects a model turn.
+ * OPT-IN via SWITCHROOM_CONSOLIDATION_LEGIBILITY.
+ */
+function surfaceConsolidationLegibility(
+  rec: WebhookGatewayRecord,
+  target: { chatId: string; threadId?: number },
+): void {
+  if (!CONSOLIDATION_LEGIBILITY_ENABLED) return
+  const event = detectConsolidationEvent(rec.payload)
+  if (event == null) return // routine no-op consolidation — surface nothing
+  const agent = rec.agent
+  // Rate-limiter clock MUST be wall-clock (Date.now()), never rec.ts: rec.ts
+  // can be derived from the (attacker-influenceable) webhook payload, and a
+  // spoofed far-past / far-future timestamp would poison the per-agent
+  // min-interval gate — either permanently opening it (stale ts always older
+  // than the window) or jamming it shut. The limiter only cares about "how
+  // long since the last surface on THIS gateway", which is a local wall-clock
+  // question.
+  if (!consolidationRateLimiter.allow(agent, consolidationSignature(event), Date.now())) {
+    process.stderr.write(
+      `telegram gateway: consolidation-legibility ${event.kind} rate-limited ` +
+        `agent=${agent} topic='${event.topic}'\n`,
+    )
+    return
+  }
+  const chatId = target.chatId
+  const threadId = target.threadId
+  const line = renderConsolidationLine(event)
+  process.stderr.write(
+    `telegram gateway: consolidation-legibility ${event.kind} chat=${chatId} ` +
+      `thread=${threadId ?? '-'} agent=${agent}\n`,
+  )
+  void retryWithThreadFallback(
+    robustApiCall,
+    (tid) =>
+      bot.api.sendMessage(chatId, line, {
+        parse_mode: 'HTML',
+        // Status surface, not the user's answer — never ping the device.
+        disable_notification: true,
+        ...(tid != null ? { message_thread_id: tid } : {}),
+      }),
+    { threadId, chat_id: chatId, verb: 'consolidation-legibility.sendMessage' },
+  ).catch((err) => {
+    process.stderr.write(
+      `telegram gateway: consolidation-legibility send failed: ${
+        err instanceof Error ? err.message : String(err)
+      }\n`,
+    )
   })
 }
 
@@ -12595,6 +13567,13 @@ function handleSessionEvent(ev: SessionEvent): void {
             deliveryQueue,
             chatKey(ev.chatId, ev.threadId != null ? Number(ev.threadId) : null),
             ev.messageId,
+            // #2786 — pass the raw enqueue envelope so the ack survives the
+            // composer merging/reordering inbound wrappers (the single
+            // re-parsed `ev.messageId` can then belong to a sibling, not our
+            // tracked message). The tolerant match scans all ids in this
+            // content; a synthetic-source turn still lacks the user id, so the
+            // cross-source false-ack guard holds.
+            ev.rawContent,
           )
         }
         // PR3b-cutover: feed the authoritative turn-start to the delivery
@@ -12721,6 +13700,14 @@ function handleSessionEvent(ev: SessionEvent): void {
       // of dropping. The answer-stream's own dedup handles overlap
       // with the reply tool's payload.
       preambleSuppressor.onTool({ isReplyTool: isTelegramSurfaceTool(ev.toolName) })
+      // #2849 Phase 4 — sparse chat-legible memory. Surface ONE terse line in
+      // the originating chat/topic when this tool call materially changes what
+      // the agent remembers (create_directive / invalidate / demote). Fires
+      // BEFORE the `if (!ctrl) return` status-reaction gate below so it works
+      // on turns with no active status-reaction controller. Deterministic
+      // tool-call observation — no model call, no polling; ordinary recall and
+      // routine consolidation never reach here (they aren't material tools).
+      surfaceMemoryLegibility(turn, ev.toolName, ev.toolUseId, ev.input)
       const ctrl = activeStatusReactions.get(statusKey(turn.sessionChatId, turn.sessionThreadId))
       const name = ev.toolName
       // Phase tracking removed in #553 PR 5 — phases only fed the
@@ -13151,6 +14138,9 @@ function handleSessionEvent(ev: SessionEvent): void {
     }
     case 'tool_result': {
       if (ev.toolUseId) typingWrapper.onToolResult(ev.toolUseId)
+      // Fix 1.3 (#2903): flush a staged 📌/✂️ memory-legibility line only on a
+      // CONFIRMED-successful write; a failed write (ev.isError) drops it.
+      confirmMemoryLegibility(ev.toolUseId, ev.isError)
       return
     }
     case 'sub_agent_tool_use': {
@@ -13543,6 +14533,18 @@ function handleSessionEvent(ev: SessionEvent): void {
 
       if (flushDecision.kind === 'flush') {
         let capturedText = flushDecision.text
+        // #2798 — turn-flush delivers the model's terminal prose when it
+        // skipped reply/stream_reply, but historically bypassed the reply
+        // path's markdown normalization entirely. Mirror executeReply's front
+        // of pipeline here so the backstop renders identically: repair LLM
+        // JSON-escape bungles (literal `\n`), then promote lone prose paragraph
+        // breaks into GFM hard breaks so the Bot API 10.1 rich path doesn't
+        // collapse them (lists/tables/code left untouched). Runs BEFORE the
+        // redact/scrub below, exactly as reply orders it (repair → normalize →
+        // redact → scrub), so masking sees the repaired text. The matching
+        // addParagraphSpacers pass runs on the send side just before
+        // splitMarkdownChunks (see below).
+        capturedText = normalizeParagraphBreaks(repairEscapedWhitespace(capturedText))
         // Component 3 — origin-thread backstop. `chatId`/`threadId` are
         // captured from the turn atom (turn.sessionChatId/sessionThreadId)
         // at the top of this turn_end handler, NOT from the live
@@ -13561,6 +14563,15 @@ function handleSessionEvent(ev: SessionEvent): void {
         // three reply tools. Mirror the voice scrub: mask before the send,
         // the preview, and recordOutbound.
         capturedText = redactOutboundText(capturedText, 'turn_flush')
+
+        // #2798 reply-parity — normalize dashes/bullets and trip the over-bold
+        // guard deterministically, on code-masked text. This is the SAME chain
+        // the reply path applies (`stripExcessBold(normalizePunctuation(text))`)
+        // in the SAME order: after redact, before scrubVoice. Without it the
+        // turn-flush backstop rendered punctuation/bold differently from an
+        // identical reply. Kept inline to mirror reply exactly — a shared helper
+        // is a deliberate future refactor, not this change.
+        capturedText = stripExcessBold(normalizePunctuation(capturedText))
 
         // Voice scrub (PR #1683 follow-up). Turn-flush is the path
         // that fires when the model emits raw transcript text WITHOUT
@@ -13673,7 +14684,14 @@ function handleSessionEvent(ev: SessionEvent): void {
             link_preview_options: { is_disabled: true },
           }
           const limit = RICH_MESSAGE_MAX_CHARS
-          const htmlChunks = splitMarkdownChunks(capturedText, limit)
+          // #2798 / #2692 — inject visible blank-line spacers into prose `\n\n`
+          // gaps before splitting, exactly as executeReply does. The rich GFM
+          // renderer collapses a bare `\n\n` gap TIGHT, so without this the
+          // paragraph boundaries from the '\n\n' block join (turn-flush-safety
+          // .ts) would still render jammed together. Mirrors reply's
+          // `addParagraphSpacers(text)` on the non-literal path.
+          const renderedText = addParagraphSpacers(capturedText)
+          const htmlChunks = splitMarkdownChunks(renderedText, limit)
           const sentIds: number[] = []
           try {
             // #654 deterministic double-message fix. If the progress
@@ -13879,11 +14897,28 @@ function handleSessionEvent(ev: SessionEvent): void {
         // this path. The turn-flush 'flush' branch also returns earlier
         // (and sets finalAnswerDelivered=true defensively).
         if (turn.finalAnswerDelivered === false) {
-          const silentEnd = recordUndeliveredTurnEnd({
-            chatId,
-            threadId: threadId ?? null,
-            turnKey: tKey,
-          })
+          // PR #2892 (deterministic-turn-liveness RFC Phase 2) hardening:
+          // wire the represent-guard-style staleness
+          // check (`recordSilentTurnEnd`'s `hasOutboundDeliveredSince` dep) so
+          // an exhausted-looking record left over from a PRIOR, already-
+          // answered turn on this same chat/thread (statusKey is not a
+          // per-turn nonce) can never be misread as this turn's spent
+          // re-prompt budget. Falls back to the pre-existing turnKey/
+          // retryCount-only check when history is unavailable.
+          const silentEndDeps: SilentEndDeps | undefined = HISTORY_ENABLED
+            ? {
+                hasOutboundDeliveredSince: (cid, sinceMs, tid) =>
+                  hasOutboundDeliveredSince(cid, sinceMs, tid, 1),
+              }
+            : undefined
+          const silentEnd = recordUndeliveredTurnEnd(
+            {
+              chatId,
+              threadId: threadId ?? null,
+              turnKey: tKey,
+            },
+            silentEndDeps,
+          )
           if (silentEnd.exhausted) {
             process.stderr.write(
               `telegram gateway: WARN silent-end fallback — agent stayed ` +
@@ -13895,7 +14930,7 @@ function handleSessionEvent(ev: SessionEvent): void {
               (tid) =>
                 bot.api.sendMessage(
                   chatId,
-                  SILENT_END_FALLBACK_TEXT,
+                  silentEndFallbackText(turnDurationMs),
                   tid != null ? { message_thread_id: tid } : {},
                 ),
               { threadId, chat_id: chatId, verb: 'silent-end-fallback.sendMessage' },
@@ -14415,6 +15450,8 @@ async function handleInbound(
   // present, so reset any no-repeat suppression: the next time the agent asks
   // for something that timed out earlier, they should see a fresh card.
   clearPermissionTimeoutSuppression('operator inbound')
+  // #2862 — operator is back; re-offer any approvals that timed out meanwhile.
+  maybePostMissedApprovalDigest('operator inbound')
 
   // Capture wall-clock receive time for inbound_ack metric (#203).
   // Must be after gate() so early-exit paths (drop/pair) don't skew the delta.
@@ -15859,8 +16896,17 @@ async function switchroomReply(
   }
   // #2669: `options.html` now means "render `text` as GFM markdown via the
   // rich-message path" (legacy field name kept). Plain otherwise.
+  //
+  // Every deterministic slash-command card ships through this html branch as
+  // RAW markdown (no reply-path normalization). Under the Bot API 10.1 GFM
+  // renderer a lone `\n` is a SOFT break, so a card whose builder stacks
+  // labelled fields with single `\n` (e.g. `/usage`, `/model`, `/auth`)
+  // renders as one run-on blob. `hardenCardBreaks` promotes those lone
+  // field breaks to GFM hard breaks (`  \n`) while leaving lists / tables /
+  // fenced code / blockquotes / headings on their native single `\n` — the
+  // same treatment the direct-send cards get from `stackCardLines`.
   if (options.html) {
-    await ctx.replyWithRichMessage(richMessage(text), replyOpts)
+    await ctx.replyWithRichMessage(richMessage(hardenCardBreaks(text)), replyOpts)
   } else {
     await ctx.reply(text, replyOpts)
   }
@@ -17305,7 +18351,14 @@ function buildModelDeps(restartCtx?: ModelDepsRestartContext): ModelMenuDeps & M
   const deps: ModelMenuDeps & ModelCommandDeps = {
     discover: (a) => discoverModels(a),
     discoverSrModels: async () => {
-      const base = process.env.ANTHROPIC_BASE_URL
+      // /model/info lives on the ROOT proxy (model-mapped surface), NOT the
+      // Anthropic pass-through that ANTHROPIC_BASE_URL now points at
+      // (<root>/anthropic). Prefer SWITCHROOM_LITELLM_BASE (the root emitted
+      // by compose.ts); fall back to stripping a trailing /anthropic off
+      // ANTHROPIC_BASE_URL so an agent booted from a pre-passthrough compose
+      // (base_url == root) still resolves correctly.
+      const base = process.env.SWITCHROOM_LITELLM_BASE
+        ?? process.env.ANTHROPIC_BASE_URL?.replace(/\/anthropic\/?$/, '')
       const headers = process.env.ANTHROPIC_CUSTOM_HEADERS
       if (!base || !headers) return []
       const keyMatch = headers.match(/x-litellm-api-key:\s*Bearer\s*(\S+)/)
@@ -18169,6 +19222,8 @@ async function handlePermissionSlash(ctx: Context, behavior: 'allow' | 'deny'): 
   }
   // Operator answered via slash ⇒ present; reset no-repeat suppression.
   clearPermissionTimeoutSuppression('operator answered via /approve|/deny')
+  // #2862 — operator is present; re-offer any approvals that timed out meanwhile.
+  maybePostMissedApprovalDigest('operator answered via /approve|/deny')
   // Forward to connected bridges — same IPC the button handler uses.
   dispatchPermissionVerdict({ type: 'permission', requestId: request_id, behavior })
   resumeReactionAfterVerdict()
@@ -18313,6 +19368,17 @@ async function refreshPinnedBanner(reason: string): Promise<void> {
       prevState: pinnedBannerState,
       onError: (phase, err) => {
         process.stderr.write(`telegram gateway: banner ${phase} failed (${reason}): ${err}\n`)
+      },
+      // Durable pin persistence into the SHARED status-pin store (distinct
+      // `banner:` pinKey). persist-BEFORE-pin ordering: pending() lands before
+      // the pinChatMessage call so a crash in that window is recoverable by the
+      // one runStatusPinBootCleanup on next boot. Best-effort / gated no-op.
+      persist: {
+        pending: (chatId, messageId) =>
+          persistBannerRow({ pinKey: BANNER_PIN_KEY, chatId, messageId, pending: true }),
+        confirm: (chatId, messageId) =>
+          persistBannerRow({ pinKey: BANNER_PIN_KEY, chatId, messageId }),
+        clear: () => persistBannerRow(null),
       },
     })
   } catch (err) {
@@ -19401,19 +20467,9 @@ bot.command("auth", async ctx => {
         const { results } = await client.probeQuota(accounts.map((a) => a.label))
         // #2495 Change 2 — the broker tags each result `served:"live"|"cache"`
         // (TTL hit or failed-probe fallback). When ANY account was served from
-        // cache, surface the OLDEST snapshot's capturedAt so the card stamps
-        // "⚠ cached Nm ago" instead of a false live stamp.
-        let staleCachedAtMs: number | undefined
-        // Preserve input order (broker also preserves it, but be defensive).
-        const quotas = accounts.map((a) => {
-          const hit = results.find((r) => r.label === a.label)
-          if (!hit) return { ok: false as const, reason: "broker returned no result for account" }
-          if (hit.served === 'cache' && hit.capturedAt != null) {
-            staleCachedAtMs = staleCachedAtMs == null ? hit.capturedAt : Math.min(staleCachedAtMs, hit.capturedAt)
-          }
-          return hit.result
-        })
-        return { quotas, staleCachedAtMs }
+        // cache, zipProbeResults surfaces the OLDEST snapshot's capturedAt so
+        // the card stamps "⚠ cached Nm ago" instead of a false live stamp.
+        return zipProbeResults(accounts.map((a) => a.label), results)
       } catch (err) {
         // Surface a uniform per-account failure so the dashboard renders
         // gracefully (label badge stays UNKNOWN) instead of falling back
@@ -20023,6 +21079,185 @@ async function handleSkillProposalCallback(ctx: Context, data: string): Promise<
     `telegram gateway: skill_proposal_apply injection agent=${agent} ` +
     `proposal=${proposal.id} slug=${proposal.skill_slug} delivered=${delivered}\n`,
   )
+}
+
+/**
+ * hindsight Phase 5 — handle a tap on the mental-model PROPOSAL card.
+ *   mmp:approve:<stageId> — declare the model: append it to the agent's
+ *                           memory.mental_models[] via the operator-approved
+ *                           config-edit path (reused config_propose_edit
+ *                           apply+reconcile; reconcile ensures it), then wake
+ *                           the agent with an "applied" inbound.
+ *   mmp:deny:<stageId>    — drop the proposal; NOTHING is written; wake the
+ *                           agent with a "denied" inbound.
+ *
+ * Authorization: the tapper MUST be on the gateway's allowFrom list — an agent
+ * can PROPOSE but can never self-approve (identical gate to the vault flow).
+ */
+async function handleMentalModelProposeCallback(ctx: Context, data: string): Promise<void> {
+  const senderId = String(ctx.from?.id ?? '')
+  const access = loadAccess()
+  if (!access.allowFrom.includes(senderId)) {
+    // Self-approve is impossible: only an allow-listed operator can resolve
+    // the card. A tap from anyone else (incl. a compromised agent identity) is
+    // refused here.
+    await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+    return
+  }
+  const parts = data.split(':')
+  if (parts.length < 3) {
+    await ctx.answerCallbackQuery({ text: 'Bad request' }).catch(() => {})
+    return
+  }
+  const action = parts[1]
+  const stageId = parts.slice(2).join(':')
+  const pending = pendingMentalModelProposes.get(stageId)
+  if (!pending) {
+    await ctx.answerCallbackQuery({ text: 'Card expired — ask the agent to re-propose.' }).catch(() => {})
+    if (ctx.callbackQuery?.message) {
+      await ctx.api
+        .editMessageText(
+          ctx.callbackQuery.message.chat.id,
+          ctx.callbackQuery.message.message_id,
+          richMessage('⌛ _This mental-model proposal card expired before you tapped. Ask the agent to re-propose if it still stands._'),
+          { reply_markup: { inline_keyboard: [] } },
+        )
+        .catch(() => {})
+    }
+    return
+  }
+  if (action !== 'approve' && action !== 'deny') {
+    await ctx.answerCallbackQuery({ text: 'Bad request' }).catch(() => {})
+    return
+  }
+  // Enforce the TTL at TAP time, not just on the next propose's sweep. Without
+  // this, a card left untapped past its TTL is still resolvable if no fresh
+  // proposal has run the sweep — an operator could approve a stale proposal.
+  if (Date.now() - pending.staged_at > MENTAL_MODEL_PROPOSE_TTL_MS) {
+    pendingMentalModelProposes.delete(stageId)
+    await ctx.answerCallbackQuery({ text: 'Card expired — ask the agent to re-propose.' }).catch(() => {})
+    if (pending.card_message_id != null) {
+      await ctx.api
+        .editMessageText(
+          pending.chat_id,
+          pending.card_message_id,
+          richMessage('⌛ _This mental-model proposal card expired before you tapped. Ask the agent to re-propose if it still stands._'),
+          { reply_markup: { inline_keyboard: [] } },
+        )
+        .catch(() => {})
+    }
+    return
+  }
+  // Single-shot: remove the pending entry immediately so a double-tap can't
+  // resolve twice.
+  pendingMentalModelProposes.delete(stageId)
+
+  const proposal: MentalModelPendingProposal = {
+    agent: pending.agent,
+    chat_id: pending.chat_id,
+    ...(pending.threadId != null ? { threadId: pending.threadId } : {}),
+    spec: pending.spec,
+    ...(pending.reason ? { reason: pending.reason } : {}),
+  }
+
+  const resolveDeps = {
+    readConfigText: () => readLiveSwitchroomConfigText(),
+    registerPreApproval: (agent: string, diff: string) => {
+      pendingMentalModelCorrelations.set(mentalModelCorrelationKey(agent, diff), {
+        agentName: agent,
+        unifiedDiff: diff,
+        createdAt: Date.now(),
+      })
+    },
+    clearPreApproval: (agent: string, diff: string) => {
+      pendingMentalModelCorrelations.delete(mentalModelCorrelationKey(agent, diff))
+    },
+    dispatchConfigEdit: async (a: { agent: string; diff: string; reason: string }) => {
+      const req: HostdRequest = {
+        v: 1,
+        op: 'config_propose_edit',
+        request_id: hostdRequestId('gw-mental-model'),
+        args: {
+          unified_diff: a.diff,
+          reason: a.reason,
+          target_path: '/state/config/switchroom.yaml',
+        },
+      }
+      // config_propose_edit blocks on validate→approve→apply→reconcile
+      // (5-10 min on a busy host) — allow 12 min. The operator already
+      // approved on the proposal card, so hostd's config-approval callback
+      // auto-resolves via the pre-registered correlation (no second card).
+      const resp = await tryHostdDispatch(a.agent, req, 720_000)
+      if (resp === 'not-configured') {
+        return { state: 'error' as const, reason: 'hostd config-edit is not configured (host_control disabled or socket absent)' }
+      }
+      if (resp.result === 'completed') return { state: 'applied' as const }
+      if (resp.result === 'denied') return { state: 'denied' as const, reason: resp.error ?? 'operator/host denied the edit' }
+      return { state: 'error' as const, reason: resp.error ?? `hostd returned '${resp.result}'` }
+    },
+    // Ensure is delegated to reconcile: config_propose_edit's apply triggers a
+    // reconcile which runs ensureDeclaredMentalModels (#2874) for the newly
+    // declared model — the authoritative, correctly-scoped ensure. We
+    // deliberately do NOT add a redundant gateway-side ensure (it would need
+    // the agent's bank id + a reachable Hindsight endpoint from the gateway).
+    injectInbound: (inbound: InboundMessage) => {
+      deliverResumeSyntheticOrBuffer(pending.agent, inbound)
+    },
+    log: (m: string) => process.stderr.write(`telegram gateway: ${m}\n`),
+  }
+
+  if (action === 'deny') {
+    await ctx.answerCallbackQuery({ text: '🚫 Denied' }).catch(() => {})
+    await resolveMentalModelProposal('deny', proposal, stageId, senderId, resolveDeps)
+    if (pending.card_message_id != null) {
+      await ctx.api
+        .editMessageText(
+          pending.chat_id,
+          pending.card_message_id,
+          richMessage(`🚫 _Denied. **${escapeHtmlForTg(pending.agent)}**'s mental model \`${pending.spec.name}\` was not declared._`),
+          { reply_markup: { inline_keyboard: [] } },
+        )
+        .catch(() => {})
+    }
+    return
+  }
+
+  // Approve. Ack immediately + show an interim state, then persist in the
+  // background (config_propose_edit can take minutes), then edit the card with
+  // the real outcome. The turn resumes via the synthetic inbound injected by
+  // resolveMentalModelProposal — not by this card edit.
+  await ctx.answerCallbackQuery({ text: '✅ Declaring the model…' }).catch(() => {})
+  if (pending.card_message_id != null) {
+    await ctx.api
+      .editMessageText(
+        pending.chat_id,
+        pending.card_message_id,
+        richMessage(`⏳ _Declaring **${escapeHtmlForTg(pending.agent)}**'s mental model \`${pending.spec.name}\` — appending to config + ensuring…_`),
+        { reply_markup: { inline_keyboard: [] } },
+      )
+      .catch(() => {})
+  }
+  void (async () => {
+    let result
+    try {
+      result = await resolveMentalModelProposal('approve', proposal, stageId, senderId, resolveDeps)
+    } catch (err) {
+      process.stderr.write(`telegram gateway: mental_model_propose approve threw: ${(err as Error).message}\n`)
+      result = { outcome: 'failed' as const, reason: (err as Error).message }
+    }
+    if (pending.card_message_id != null) {
+      const label =
+        result.outcome === 'applied'
+          ? `✅ **Declared** ${escapeHtmlForTg(pending.agent)}'s mental model \`${pending.spec.name}\` — appended to \`memory.mental_models[]\` and ensured. Restart the agent to load it if it isn't picked up automatically.`
+          : `⚠️ **Did NOT declare** \`${pending.spec.name}\`${'reason' in result && result.reason ? ` — ${escapeHtmlForTg(result.reason)}` : ''}. Nothing was written.`
+      await ctx.api
+        .editMessageText(pending.chat_id, pending.card_message_id, richMessage(label), {
+          reply_markup: { inline_keyboard: [] },
+          link_preview_options: { is_disabled: true },
+        })
+        .catch(() => {})
+    }
+  })()
 }
 
 async function handleVaultRequestAccessCallback(ctx: Context, data: string): Promise<void> {
@@ -21400,13 +22635,18 @@ async function handleAuthDashboardCallback(ctx: Context): Promise<void> {
   }
 
   // auth:refresh — re-render the /auth snapshot in-place with a fresh
-  // live probe. Replaces the message body; keyboard stays.
-  if (data === 'auth:refresh') {
+  // live probe. Replaces the message body; keyboard stays. The `:demo`
+  // variant re-renders with email masking intact (a ↻ tap on an
+  // `/auth demo` / `/usage demo` card must not unmask mid-recording).
+  if (data === 'auth:refresh' || data === 'auth:refresh:demo') {
+    const refreshDemo = data === 'auth:refresh:demo'
     // Freshness throttle: each refresh fan-fires N live api.anthropic.com
-    // probes (one per account, force=true bypasses the 5-min cache).
-    // Without this, a user double-tapping the ↻ button burns through
-    // their account's RPM budget on duplicate work. Cap at one per
-    // AUTH_REFRESH_THROTTLE_MS per (chat, message) pair.
+    // probes (one per account — forceLive bypasses the broker's 45s
+    // probe-on-open TTL, because an explicit ↻ tap is the user asking
+    // for live-now data). Without this, a user double-tapping the ↻
+    // button burns through their account's RPM budget on duplicate
+    // work. Cap at one per AUTH_REFRESH_THROTTLE_MS per (chat, message)
+    // pair.
     const refreshMsg = ctx.callbackQuery?.message
     if (refreshMsg) {
       const key = `${refreshMsg.chat.id}:${refreshMsg.message_id}`
@@ -21432,24 +22672,34 @@ async function handleAuthDashboardCallback(ctx: Context): Promise<void> {
       }
       const state = await client.listState()
       // Broker-routed probe (#1336) — see gateway.ts:8910 for diagnosis.
+      // forceLive=true: an explicit ↻ tap must bypass the broker's
+      // probe-on-open TTL — pre-fix, a tap inside the TTL window served
+      // the cached snapshot while stamping "Live · refreshed 0s ago".
       const probeResp = state.accounts.length > 0
-        ? await client.probeQuota(state.accounts.map((a) => a.label)).catch(() => ({ results: [] }))
+        ? await client.probeQuota(state.accounts.map((a) => a.label), undefined, true).catch(() => ({ results: [] }))
         : { results: [] }
-      const quotas = state.accounts.map((a) => {
-        const hit = probeResp.results.find((r) => r.label === a.label)
-        return hit?.result ?? { ok: false as const, reason: 'broker returned no result for account' }
-      })
+      // #2495 Change 2 — even under forceLive a failed upstream probe falls
+      // back to the broker cache (served:"cache"); stamp "⚠ cached Nm ago"
+      // instead of a false live stamp, same as the /auth and /usage paths.
+      const { quotas, staleCachedAtMs } = zipProbeResults(
+        state.accounts.map((a) => a.label),
+        probeResp.results,
+      )
       const tz = process.env.SWITCHROOM_TIMEZONE ?? process.env.TZ ?? 'UTC'
       const { renderAuthSnapshotFormat2, buildSnapshotsFromState, buildSnapshotKeyboard } = await import(
         '../auth-snapshot-format.js'
       )
       const snapshots = buildSnapshotsFromState(state, quotas)
+      // Single clock for card body + keyboard so health classification
+      // can't disagree between the two (#2495 folded nit A).
+      const renderNow = new Date()
       const text = renderAuthSnapshotFormat2(snapshots, {
         tz,
-        now: new Date(),
-        liveProbedAtMs: Date.now(),
+        now: renderNow,
+        demo: refreshDemo,
+        ...(staleCachedAtMs != null ? { staleCachedAtMs } : { liveProbedAtMs: renderNow.getTime() }),
       })
-      const kbRows = buildSnapshotKeyboard(snapshots)
+      const kbRows = buildSnapshotKeyboard(snapshots, { now: renderNow, demo: refreshDemo })
       const inline_keyboard = kbRows.map((row) =>
         row.map((b) => {
           if (b.callbackData) return { text: b.text, callback_data: b.callbackData }
@@ -21914,14 +23164,10 @@ bot.command('usage', async ctx => {
         // which we surface as a "⚠ cached Nm ago" footer instead of a false
         // live stamp.
         const probeResp = await client.probeQuota(state.accounts.map((a) => a.label)).catch(() => ({ results: [] }))
-        let staleCachedAtMs: number | undefined
-        const quotas = state.accounts.map((a) => {
-          const hit = probeResp.results.find((r) => r.label === a.label)
-          if (hit?.served === 'cache' && hit.capturedAt != null) {
-            staleCachedAtMs = staleCachedAtMs == null ? hit.capturedAt : Math.min(staleCachedAtMs, hit.capturedAt)
-          }
-          return hit?.result ?? { ok: false as const, reason: 'broker returned no result for account' }
-        })
+        const { quotas, staleCachedAtMs } = zipProbeResults(
+          state.accounts.map((a) => a.label),
+          probeResp.results,
+        )
         const { renderAuthSnapshotFormat2, buildSnapshotsFromState, buildSnapshotKeyboard } = await import(
           '../auth-snapshot-format.js'
         )
@@ -21938,7 +23184,7 @@ bot.command('usage', async ctx => {
         // /auth snapshot does. switchroomReply routes through the rich path
         // (replyWithRichMessage), which accepts reply_markup. Build a grammy
         // InlineKeyboard so the markup type matches switchroomReply's contract.
-        const kbRows = buildSnapshotKeyboard(snapshots, { now: new Date() })
+        const kbRows = buildSnapshotKeyboard(snapshots, { now: new Date(), demo })
         const keyboard = new InlineKeyboard()
         kbRows.forEach((row, ri) => {
           if (ri > 0) keyboard.row()
@@ -22582,6 +23828,15 @@ bot.on('callback_query:data', async ctx => {
     return
   }
 
+  // hindsight Phase 5: agent-proposes → human-approves mental-model card.
+  //   mmp:approve:<stageId> — declare the model (append memory.mental_models[]
+  //                           via operator-approved config edit) + ensure it
+  //   mmp:deny:<stageId>    — drop the proposal; NOTHING is written
+  if (data.startsWith('mmp:')) {
+    await handleMentalModelProposeCallback(ctx, data)
+    return
+  }
+
   // #2670: one-tap skill-improvement proposal card.
   //   skprop:approve:<id> — apply the stored draft via the personal-skill
   //                         write pipeline (inject a turn; agent writes it)
@@ -22589,6 +23844,15 @@ bot.on('callback_query:data', async ctx => {
   //                         isn't re-proposed
   if (data.startsWith('skprop:')) {
     await handleSkillProposalCallback(ctx, data)
+    return
+  }
+
+  // #2862: missed-approvals re-offer digest.
+  //   missre:retry:<id>   — inject a synthetic inbound asking the agent to
+  //                         re-attempt (re-raises a fresh approval card)
+  //   missre:dismiss:<id> — clear the record + edit the card closed
+  if (data.startsWith('missre:')) {
+    await handleMissedApprovalCallback(ctx, data)
     return
   }
 
@@ -23238,6 +24502,8 @@ bot.on('callback_query:data', async ctx => {
   // Operator tapped a verdict ⇒ they are present; reset no-repeat suppression
   // so a later identical ask is shown fresh rather than silently short-circuited.
   clearPermissionTimeoutSuppression('operator answered a permission card')
+  // #2862 — operator is present; re-offer any approvals that timed out meanwhile.
+  maybePostMissedApprovalDigest('operator answered a permission card')
   const pd = pendingPermissions.get(request_id)
   const resumeAction = pd ? naturalAction(pd.tool_name, pd.input_preview) : ''
   const scopedTtl = scopedApprovalTtlMs()
@@ -23249,6 +24515,9 @@ bot.on('callback_query:data', async ctx => {
   permCardStore.remove(request_id)
   if (timeBox && grantAgent) {
     recordScopedGrant(scopedGrants, grantAgent, timeBox.rule, Date.now(), scopedTtl)
+    // Write-through so the window survives a gateway restart (#2863). Absolute
+    // expiry is baked into the entry, so a reload can't extend it.
+    scopedGrantStore.save(scopedGrants)
     process.stderr.write(
       `telegram gateway: scoped-approval granted via Allow rule="${timeBox.rule}" ` +
       `agent=${grantAgent} ttl_ms=${scopedTtl} (request_id=${request_id})\n`,
@@ -25017,39 +26286,68 @@ void (async () => {
         // tracks the live turn from there.
         try { removeTurnActiveMarker(STATE_DIR) } catch { /* best-effort */ }
 
-        // Strip stale permission cards from prior gateway session. Any entry
-        // still in the store was never resolved (gateway died before the
-        // operator tapped or the reaper ran). The operator might have seen
-        // those cards and tapped them — if so, they got STALE_TAP_NOTICE
-        // ("already resolved") which is misleading. Edit the messages to
-        // remove the keyboard and show a clear "restarted" notice instead.
-        void (async () => {
-          const stale = permCardStore.loadAll()
-          if (stale.length === 0) return
-          process.stderr.write(
-            `telegram gateway: boot-sweep: stripping ${stale.length} stale permission card(s) from prior gateway session\n`,
-          )
-          for (const card of stale) {
-            const toolLabel = card.toolName ?? 'unknown tool'
-            const notice = `🔒 **${toolLabel}**\n\n⚠️ *Gateway restarted — this request is no longer active. Ask your agent to try again if needed.*`
-            try {
-              // allow-raw-bot-api: targeted by message_id; no thread needed; fire-and-forget boot sweep
-              await bot.api.editMessageText(
-                card.chatId,
-                card.messageId,
-                richMessage(notice),
-                { reply_markup: { inline_keyboard: [] } },
-              )
-            } catch (err) {
-              // Card may already be deleted, edited, or in an inaccessible chat — benign
-              process.stderr.write(
-                `telegram gateway: boot-sweep: stale-card strip failed ` +
-                `${card.chatId}:${card.messageId}: ${(err as Error).message}\n`,
-              )
-            }
+        // Boot-sweep for permission cards from a prior gateway session. Any
+        // entry still in the store was never resolved (gateway died before the
+        // operator tapped or the reaper ran).
+        //
+        // #2861: DON'T strip immediately. A still-live claude session's bridge
+        // re-sends its outstanding permission_requests on IPC reconnect within
+        // a few seconds — re-arming the persisted card instead of losing the
+        // suspended turn. So we wait a grace window (~90 s) and only strip
+        // entries that were NOT re-claimed by a bridge re-send in the meantime.
+        // A genuinely dead session (container recreate → new bridge, empty
+        // ledger) never re-sends, so those still get the "restarted" notice.
+        //
+        // Kill switch SWITCHROOM_PERMISSION_REARM=0 reverts to the legacy
+        // immediate strip-everything sweep.
+        if (!isPermissionRearmEnabled()) {
+          void (async () => {
+            const stale = permCardStore.loadAll()
+            if (stale.length === 0) return
+            process.stderr.write(
+              `telegram gateway: boot-sweep: stripping ${stale.length} stale permission card(s) from prior gateway session\n`,
+            )
+            for (const card of stale) await stripStalePermissionCard(card)
+            permCardStore.clear()
+          })()
+        } else {
+          const bootStale = permCardStore.loadAll()
+          if (bootStale.length > 0) {
+            const graceMs = permissionRearmGraceMs()
+            process.stderr.write(
+              `telegram gateway: boot-sweep: ${bootStale.length} pending permission card(s) from prior ` +
+              `session; deferring strip ${graceMs}ms to allow bridge re-arm (#2861)\n`,
+            )
+            setTimeout(() => {
+              void (async () => {
+                // Reload — some entries may have been resolved (tap/TTL) during
+                // the grace window, which removes them from the store.
+                const remaining = permCardStore.loadAll()
+                // Preserve anything currently LIVE in pendingPermissions: that
+                // covers both re-armed cards (a bridge re-send restored them)
+                // AND fresh cards born during the grace window (a new approval
+                // posted after boot). Only cards with no live pending entry —
+                // a genuinely dead session that never reconnected — are stripped.
+                const liveRequestIds = new Set(pendingPermissions.keys())
+                const toStrip = computeBootSweepStripTargets(remaining, liveRequestIds)
+                if (toStrip.length === 0) {
+                  process.stderr.write(
+                    `telegram gateway: boot-sweep: all pending permission cards re-armed or still live — nothing to strip\n`,
+                  )
+                  return
+                }
+                process.stderr.write(
+                  `telegram gateway: boot-sweep: stripping ${toStrip.length} dead-session permission card(s) ` +
+                  `after ${graceMs}ms grace (of ${remaining.length} still persisted, ${liveRequestIds.size} live)\n`,
+                )
+                for (const card of toStrip) await stripStalePermissionCard(card)
+                // Remove ONLY the stripped request_ids — re-armed entries stay
+                // persisted so a subsequent restart re-arms them again.
+                for (const id of distinctRequestIds(toStrip)) permCardStore.remove(id)
+              })()
+            }, graceMs).unref?.()
           }
-          permCardStore.clear()
-        })()
+        }
 
         // Boot-time pin sweep
         try {
@@ -25510,6 +26808,43 @@ void (async () => {
               // accident no longer pollute the watcher with phantom
               // registrations + ENOENT log spam + false stalls.
               agentCwd: watcherAgentDir,
+              // Gap 2 (deterministic-turn-liveness.md "Known gaps"): a
+              // sub-agent dispatched into a `switchroom worktree claim`
+              // cwd runs under a different project-dir slug than
+              // `agentCwd` above, so the #1116 foreign-slug filter would
+              // otherwise skip it forever — no activity stamp, no `🛠
+              // Worker` feed for the entire run. Re-derive, fresh on every
+              // rescan tick, the set of worktree paths this agent itself
+              // currently owns (registry records are the deterministic
+              // source of truth for "cwds this agent's sub-agents may run
+              // in") and let the watcher also watch those slugs.
+              // Best-effort: a registry read failure (e.g. no worktree dir
+              // on an agent that never claims one) must not affect the
+              // primary agentCwd watch.
+              extraWatchCwdsProvider: () =>
+                // Fail-CLOSED ownership filter (unset identity ⇒ nothing;
+                // ownerless records excluded; registry throw ⇒ []). Extracted
+                // to telegram-plugin/worktree-watch-cwds.ts so the #1116 /
+                // Gap-2 ownership predicate is under direct unit test — see
+                // telegram-plugin/tests/worktree-watch-cwds.test.ts.
+                ownedWorktreeCwds({
+                  self: process.env.SWITCHROOM_AGENT_NAME,
+                  listRecords: listWorktreeRecords,
+                  // Durable, non-env identity fallback (#1116 / #2893): when
+                  // SWITCHROOM_AGENT_NAME is somehow unset, derive this
+                  // agent's own identity from its own directory so worktree
+                  // ownership still resolves (env is only the fast path).
+                  // `watcherAgentDir` is guaranteed non-null in this branch
+                  // (the whole watcher is gated on it above). Kill-switch
+                  // SWITCHROOM_WORKTREE_IDENTITY_FALLBACK=0 restores the
+                  // pre-fix env-only behaviour.
+                  agentDir:
+                    process.env.SWITCHROOM_WORKTREE_IDENTITY_FALLBACK === '0'
+                      ? undefined
+                      : watcherAgentDir,
+                  log: (msg) =>
+                    process.stderr.write(`telegram gateway: ${msg}\n`),
+                }),
               // Bug 0 fix: previously omitted, leaving the watcher unable to
               // write liveness/stall/turn_end updates to the registry DB.
               // Liveness writes are now persisted across the gateway lifetime.
@@ -25596,6 +26931,27 @@ void (async () => {
                   } catch { /* best-effort */ }
                 }
                 const isBackground = dispatch.isBackground
+                // NESTED (depth-2+) worker terminal: its live status surfaced
+                // via the worker feed (see onProgress), so finalize that card
+                // cleanly — never leave it frozen mid-"→ step". But NO user
+                // handback: its result returns to its DISPATCHING WORKER as
+                // the Task tool result (the depth-1 worker folds it into its
+                // own handback); injecting a second gateway handback would
+                // double-report the same work.
+                if (dispatch.isNested) {
+                  if (workerFeedEnabled) {
+                    void workerActivityFeed?.finish(agentId, {
+                      description: dispatch.feedDescription,
+                      lastTool: null,
+                      toolCount,
+                      latestSummary: resultText,
+                      elapsedMs: durationMs,
+                      state: outcome === 'failed' ? 'failed' : 'done',
+                    })
+                    reconcileWorkerPin(agentId, null, false)
+                  }
+                  return
+                }
                 if (!isBackground) {
                   // Model A — a foreground sub-agent finished. Collapse its
                   // nested child block from the parent's activity draft; the
@@ -25795,7 +27151,18 @@ void (async () => {
                     dispatch = resolveWorkerFeedDispatch(getSubagentByJsonlId(turnsDb, agentId), description)
                   } catch { /* best-effort */ }
                 }
-                const isBackground = dispatch.isBackground
+                // A NESTED (depth-2+) worker surfaces via the worker feed
+                // regardless of its own background flag: its "parent" is a
+                // worker, not the gateway's live turn, so nesting it into
+                // `currentTurn` would attribute it to an unrelated turn.
+                const isBackground = dispatch.isBackground || dispatch.isNested
+                // The live step line for THIS tick: the friendly tool label on
+                // tool ticks, else the narrative. Previously the worker feed
+                // was fed ONLY `latestSummary` (prose), so a tools-only worker
+                // — the common case — had a card that heartbeat-edited but
+                // never grew past "starting…" (the frozen-card symptom). The
+                // foreground nest path below already used this precedence.
+                const stepLine = (progressLine != null && progressLine.length > 0) ? progressLine : latestSummary
                 if (!isBackground) {
                   // Model A — a foreground sub-agent runs inside the parent's
                   // turn, so its live narrative nests under the parent's
@@ -25811,7 +27178,14 @@ void (async () => {
                   // the worker feed (owner-DM fallback), not into the void.
                   const surface = resolveSubagentStatusSurface({
                     isBackground: false,
-                    liveTurnPresent: currentTurn != null,
+                    // A ROW-LESS worker must not nest into the live turn: with
+                    // no registry row we cannot know it belongs to this turn
+                    // (it is most often a nested dispatch whose row hasn't
+                    // linked yet), and polluting the parent's card misroutes
+                    // it. Route it via the orphan worker-feed path instead —
+                    // once the row links (watcher retry, ≤ a poll tick) the
+                    // classification self-corrects.
+                    liveTurnPresent: currentTurn != null && dispatch.hasRow,
                     workerFeedEnabled,
                     orphanStatusEnabled,
                   })
@@ -25825,7 +27199,7 @@ void (async () => {
                         description: dispatch.feedDescription,
                         lastTool,
                         toolCount,
-                        latestSummary,
+                        latestSummary: stepLine,
                         elapsedMs,
                         state: 'running',
                       },
@@ -25866,9 +27240,12 @@ void (async () => {
                     narrative = []
                     turn.foregroundSubAgents.set(agentId, narrative)
                   }
-                  // Dedup against the immediately-preceding line — the watcher
-                  // re-emits the same narrative across ticks while a tool runs.
-                  if (narrative[narrative.length - 1] !== child) {
+                  // Dedup within the whole rolling window (mirrors the worker
+                  // feed's accumulateNarrative): the watcher re-emits the same
+                  // narrative across ticks, and a preamble + its tool label can
+                  // repeat non-adjacently (A,B,A) — both must collapse to one
+                  // ordered step.
+                  if (!narrative.includes(child)) {
                     narrative.push(child)
                     if (narrative.length > FOREGROUND_SUBAGENT_ACCUM_MAX) {
                       narrative.splice(0, narrative.length - FOREGROUND_SUBAGENT_ACCUM_MAX)
@@ -25960,7 +27337,10 @@ void (async () => {
                       description: dispatch.feedDescription,
                       lastTool,
                       toolCount,
-                      latestSummary,
+                      // The tick's step line (tool label on tool ticks, prose
+                      // on text ticks) — NOT bare latestSummary, which starved
+                      // tools-only workers of steps (frozen "starting…").
+                      latestSummary: stepLine,
                       elapsedMs,
                       state: 'running',
                     },

@@ -147,6 +147,17 @@ RUN apt-get update \
  && PIPX_HOME=${CLOAKBROWSER_PIPX_HOME} PIPX_BIN_DIR=/usr/local/bin \
     pipx install cloakbrowser
 
+# Fleet-wide webkite render config (#2805). Baked here at a NON-HOME image
+# path so it survives container rebuilds and is identical across the fleet;
+# profiles/_base/start.sh.hbs re-syncs it into $HOME/.config/webkite/config.toml
+# at boot whenever they differ ($HOME is a persistent bind mount, so a
+# write-once seed would go stale; an RO operator override still wins). Without this,
+# webkite has no render.routes/providers config and classifies JS-heavy SPA
+# pages (e.g. palacecinemas.com.au session times) as thin_article with
+# has_renderers=false, returning only the static shell. Same rare-changed
+# bake zone as cloakbrowser above so a src-only PR doesn't re-pay it.
+COPY docker/webkite/config.toml /opt/switchroom/webkite/config.toml
+
 # Phase 2 cron-fold-in: the in-agent scheduler's node-cron runtime dep.
 # Bundle is built by scripts/build.mjs with --external node-cron, so the
 # image must provide it. node-cron is pure JS (no native compilation),

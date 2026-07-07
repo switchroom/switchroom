@@ -25,9 +25,12 @@
  *      `openLivenessFeedIfDue` BEFORE the drain — a turn that hasn't passed the
  *      threshold, or one whose card is already open, returns early (no
  *      double-open).
- *   4. The 0-tool branch of `feedHeartbeatTick` delegates to that one shared
- *      helper rather than inlining the open — so the heartbeat and the
- *      enqueue-time timer can never double-open.
+ *   4. The 0-tool branch of `feedHeartbeatTick` OPENS via that one shared helper
+ *      (so the heartbeat and the enqueue-time timer can never double-open) AND,
+ *      once a card is open, CLIMBS it every tick via `silentTurnClimbRender`
+ *      (deterministic-turn-liveness.md Phase 1) — the freeze this test used to
+ *      enshrine is inverted. The outcome-based proof is the transport test
+ *      `silent-turn-climb-transport.test.ts`.
  *
  * These are STRUCTURAL (source-read) assertions; the gateway IIFE can't be
  * instantiated in-process. Pattern matches silence-liveness-wiring.test.ts.
@@ -71,17 +74,38 @@ describe('H-1: feedHeartbeatTick liveness-open threshold', () => {
     expect(initBlock).toMatch(/1[_]?200/)
   })
 
-  it('the 0-tool liveness branch delegates to the shared openLivenessFeedIfDue helper', () => {
-    // The open logic lives in ONE place so the heartbeat and the enqueue-time
-    // early-open timer cannot double-open. The 0-tool branch must call the
-    // shared helper rather than inline its own open.
+  it('the 0-label tick routes through the REAL extracted tick body with the gateway deps wired verbatim', () => {
+    // deterministic-turn-liveness.md Phase 1 + Phase 4(d): the prior version of
+    // this test enshrined the freeze — it asserted only that the branch delegates
+    // to `openLivenessFeedIfDue` (which no-ops once a card is open), which is
+    // exactly why a busy-but-silent 0-label card used to freeze. The property is
+    // now INVERTED: the 0-label tick must route through the extracted
+    // `runSilentTurnHeartbeatTick` (feed-heartbeat-climb.ts) — the shipped tick
+    // body that CLIMBS an already-open card — with the gateway's REAL deps
+    // (the shared OPEN helper, cardDrainGate, ea.mayDrain,
+    // ea.openOrEditCard('liveness'), the 'liveness' drain) wired at the call
+    // site. Removing or mis-wiring this call site fails HERE; the tick body's
+    // behaviour is proven outcome-based in
+    // tests/silent-turn-climb-transport.test.ts (>=4 climbing edits across a
+    // 40s silent tool, edit-only, gate sequence in order).
     const body = feedHeartbeatTickSrc()
-    const start = body.indexOf('if (turn.mirrorLines.length === 0)')
+    const start = body.indexOf('runSilentTurnHeartbeatTick(')
     expect(start).toBeGreaterThan(-1)
     const branch = body.slice(start)
     const end = branch.indexOf('// Labelled-feed heartbeat')
     const scoped = end === -1 ? branch : branch.slice(0, end)
-    expect(scoped).toMatch(/openLivenessFeedIfDue\(turn\)/)
+    // The real deps, wired verbatim at the call site:
+    expect(scoped).toMatch(/openLivenessFeedIfDue:\s*\(\)\s*=>\s*openLivenessFeedIfDue\(turn\)/)
+    expect(scoped).toMatch(/setPendingRender:\s*\(rendered\)\s*=>\s*\{\s*turn\.activityPendingRender = rendered\s*\}/)
+    expect(scoped).toMatch(/cardDrainGate:\s*\(run\)\s*=>\s*cardDrainGate\(turn, ea, run\)/)
+    expect(scoped).toMatch(/mayDrain:\s*\(\)\s*=>\s*ea\.mayDrain\(turn\)/)
+    expect(scoped).toMatch(/openOrEditCard:\s*\(apply\)\s*=>\s*ea\.openOrEditCard\('liveness', apply\)/)
+    expect(scoped).toMatch(/drain:\s*\(\)\s*=>\s*\{\s*turn\.activityInFlight = drainActivitySummary\(turn, 'liveness'\)\s*\}/)
+    // The view carries the wall-clock elapsed + the labelled branch's stale floor.
+    expect(scoped).toMatch(/ageMs:\s*Date\.now\(\)\s*-\s*turn\.startedAt/)
+    expect(scoped).toMatch(/minStaleMs:\s*FEED_HEARTBEAT_MIN_STALE_MS/)
+    // A handled tick (0-label branch) stops before the labelled heartbeat.
+    expect(scoped).toMatch(/if \(handled\) return/)
   })
 
   it('the WHEN-gate (shouldEarlyOpenLiveness) precedes the drain call inside openLivenessFeedIfDue', () => {

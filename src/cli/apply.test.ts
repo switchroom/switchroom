@@ -2,13 +2,19 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { existsSync } from "node:fs";
+import { Command } from "commander";
 import {
   runApply,
+  runApplyDryRun,
   runApplyPreflight,
+  registerApplyCommand,
+  parseComposeServiceNames,
   isInAgentContainer,
   IN_AGENT_CONTAINER_APPLY_MSG,
 } from "./apply.js";
 import * as scaffoldModule from "../agents/scaffold.js";
+import * as profilesModule from "../agents/profiles.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 
 /**
@@ -672,5 +678,113 @@ describe("runApply", () => {
       // Last arg is the recursion guard.
       expect(argv[argv.length - 1]).toBe("--skip-self-elevate");
     });
+  });
+});
+
+describe("apply --dry-run", () => {
+  // Sandbox HOME so the vault-passphrase probe (auto-unlock blob lookup)
+  // and any homedir()-anchored reads don't touch the real ~/.switchroom.
+  let _origHome: string | undefined;
+  let _homeSandbox: string | undefined;
+  beforeEach(async () => {
+    _origHome = process.env.HOME;
+    _homeSandbox = await mkdtemp(join(tmpdir(), "switchroom-dryrun-home-"));
+    process.env.HOME = _homeSandbox;
+  });
+  afterEach(() => {
+    if (_origHome !== undefined) process.env.HOME = _origHome;
+    else delete process.env.HOME;
+  });
+
+  it("registers the --dry-run flag on the apply command", () => {
+    const program = new Command();
+    registerApplyCommand(program);
+    const apply = program.commands.find((c) => c.name() === "apply");
+    expect(apply).toBeDefined();
+    const flags = apply!.options.map((o) => o.long);
+    expect(flags).toContain("--dry-run");
+  });
+
+  it("a clean dry-run reports 'would succeed' and writes NOTHING", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "switchroom-dryrun-clean-"));
+    const outPath = join(dir, "nested", "docker-compose.yml");
+    const sink: string[] = [];
+
+    const res = await runApplyDryRun(
+      makeStubConfig(join(dir, "agents")),
+      { outPath, dryRun: true },
+      { writeOut: (s) => sink.push(s), writeErr: (s) => sink.push(s), ...SKIP_COMPOSE_PREFLIGHT },
+    );
+
+    expect(res.wouldSucceed).toBe(true);
+    expect(res.blocking).toEqual([]);
+    // The compose file must NOT have been written — dry-run is read-only.
+    expect(existsSync(outPath)).toBe(false);
+    // And the whole nested dir the real apply would have mkdir'd stays absent.
+    expect(existsSync(join(dir, "nested"))).toBe(false);
+    // Report mentions success.
+    expect(sink.join("")).toMatch(/would SUCCEED/i);
+  });
+
+  it("computes the would-be compose in memory (imageTag + services)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "switchroom-dryrun-compose-"));
+    const outPath = join(dir, "docker-compose.yml");
+    const sink: string[] = [];
+
+    const res = await runApplyDryRun(
+      makeStubConfig(join(dir, "agents")),
+      { outPath, dryRun: true },
+      { writeOut: (s) => sink.push(s), writeErr: (s) => sink.push(s), ...SKIP_COMPOSE_PREFLIGHT },
+    );
+
+    expect(res.imageTag).toBeTruthy();
+    // No prior compose on disk → every service is "added".
+    expect(res.previousImageTag).toBeNull();
+    expect(res.addedServices.length).toBeGreaterThan(0);
+    expect(existsSync(outPath)).toBe(false);
+  });
+
+  it("exits non-zero (wouldSucceed=false) when a profile fails to resolve", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "switchroom-dryrun-badprofile-"));
+    const outPath = join(dir, "docker-compose.yml");
+    const sink: string[] = [];
+
+    // Reproduce the v0.17.0 incident: the profiles dir doesn't resolve in
+    // this context, so getProfilePath throws "Profile not found".
+    const spy = vi
+      .spyOn(profilesModule, "getProfilePath")
+      .mockImplementation(() => {
+        throw new Error("Profile not found: default (searched /profiles)");
+      });
+    try {
+      const res = await runApplyDryRun(
+        makeStubConfig(join(dir, "agents")),
+        { outPath, dryRun: true },
+        { writeOut: (s) => sink.push(s), writeErr: (s) => sink.push(s), ...SKIP_COMPOSE_PREFLIGHT },
+      );
+      expect(res.wouldSucceed).toBe(false);
+      expect(res.blocking.some((b) => /Profile not found/.test(b))).toBe(true);
+      expect(existsSync(outPath)).toBe(false);
+      expect(sink.join("")).toMatch(/would FAIL/i);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("parseComposeServiceNames extracts top-level service keys only", () => {
+    const compose = [
+      "services:",
+      "  klanker:",
+      "    image: ghcr.io/switchroom/switchroom-agent:v1",
+      "    volumes:",
+      "      - /a:/b",
+      "  vault-broker:",
+      "    image: ghcr.io/switchroom/switchroom-broker:v1",
+      "networks:",
+      "  default:",
+      "volumes:",
+      "  klanker-state:",
+    ].join("\n");
+    expect(parseComposeServiceNames(compose)).toEqual(["klanker", "vault-broker"]);
   });
 });

@@ -209,7 +209,13 @@ describe("scaffoldAgent", () => {
     // credentials/..., etc. Without the symlink the tilde resolves to
     // a path that doesn't exist inside the container.
     const prevHome = process.env.HOME;
+    // hostHomeForBake() prefers SWITCHROOM_HOST_HOME over HOME (src/agents/
+    // scaffold.ts). In a hostd/container context that var is set to the real
+    // host home, which would override our HOME fixture and bake a different
+    // path — so clear it and let HOME drive the bake for this test.
+    const prevHostHome = process.env.SWITCHROOM_HOST_HOME;
     process.env.HOME = "/home/op";
+    delete process.env.SWITCHROOM_HOST_HOME;
     try {
       const config = makeAgentConfig();
       const result = scaffoldAgent("tilde-agent", config, tmpDir, telegramConfig);
@@ -225,6 +231,8 @@ describe("scaffoldAgent", () => {
     } finally {
       if (prevHome === undefined) delete process.env.HOME;
       else process.env.HOME = prevHome;
+      if (prevHostHome === undefined) delete process.env.SWITCHROOM_HOST_HOME;
+      else process.env.SWITCHROOM_HOST_HOME = prevHostHome;
     }
   });
 
@@ -801,7 +809,6 @@ describe("scaffoldAgent", () => {
     const expectedTools = [
       "mcp__switchroom-telegram", // bare server name
       "mcp__switchroom-telegram__reply",
-      "mcp__switchroom-telegram__stream_reply",
       "mcp__switchroom-telegram__react",
       "mcp__switchroom-telegram__edit_message",
       "mcp__switchroom-telegram__send_typing",
@@ -1093,7 +1100,7 @@ describe("scaffoldAgent", () => {
 
     expect(settings.mcpServers).toBeDefined();
     expect(settings.mcpServers.hindsight).toBeDefined();
-    expect(settings.mcpServers.hindsight.url).toBe("http://localhost:8888/mcp/");
+    expect(settings.mcpServers.hindsight.url).toBe("http://127.0.0.1:18888/mcp/");
     expect(settings.mcpServers.hindsight.type).toBe("http");
   });
 
@@ -1882,7 +1889,13 @@ describe("reconcileAgent", () => {
     const after = JSON.parse(readFileSync(settingsPath, "utf-8"));
     expect(after.mcpServers.hindsight).toBeDefined();
     expect(after.mcpServers.hindsight.url).toBe("http://localhost:18888/mcp/");
-    expect(after.permissions.allow).toContain("mcp__hindsight__*");
+    // Fix 1.2 (#2903): enumerated allow-list, NOT a wildcard/bare server grant.
+    expect(after.permissions.allow).not.toContain("mcp__hindsight__*");
+    expect(after.permissions.allow).not.toContain("mcp__hindsight");
+    expect(after.permissions.allow).toContain("mcp__hindsight__recall");
+    expect(after.permissions.allow).toContain("mcp__hindsight__retain");
+    // Mental-model writes must NOT be pre-approved — they go through the propose card.
+    expect(after.permissions.allow).not.toContain("mcp__hindsight__create_mental_model");
   });
 
   it("rewrites .mcp.json for switchroom-telegram-plugin agents to include hindsight", () => {
@@ -2157,7 +2170,7 @@ describe("reconcileAgent", () => {
 
     const settingsPath = join(tmpDir, "test-agent", ".claude", "settings.json");
     const beforeReconcile = JSON.parse(readFileSync(settingsPath, "utf-8"));
-    expect(beforeReconcile.permissions.allow).toContain("mcp__hindsight__*");
+    expect(beforeReconcile.permissions.allow).toContain("mcp__hindsight__recall");
 
     // Reconcile against a config with backend=none
     const withoutMemory = buildSwitchroomConfig(agentConfig, {
@@ -2167,7 +2180,7 @@ describe("reconcileAgent", () => {
     reconcileAgent("test-agent", agentConfig, tmpDir, telegramConfig, withoutMemory);
 
     const after = JSON.parse(readFileSync(settingsPath, "utf-8"));
-    expect(after.permissions.allow).not.toContain("mcp__hindsight__*");
+    expect(after.permissions.allow).not.toContain("mcp__hindsight__recall");
     expect(after.mcpServers.hindsight).toBeUndefined();
   });
 });
@@ -2241,7 +2254,20 @@ describe("installHindsightPlugin", () => {
     // Hook script copied
     expect(existsSync(join(result!.pluginDir, "scripts", "recall.py"))).toBe(true);
     expect(existsSync(join(result!.pluginDir, "scripts", "retain.py"))).toBe(true);
+    // #2848 Stage C — deterministic correction-capture Stop verify hook.
+    expect(existsSync(join(result!.pluginDir, "scripts", "directive_verify.py"))).toBe(true);
     expect(existsSync(join(result!.pluginDir, "hooks", "hooks.json"))).toBe(true);
+    // The Stop event wires BOTH the directive-capture verify (sync, blocking)
+    // and retain (async). Verify is registered so a durable correction the
+    // model dropped gets a single re-prompt to persist it.
+    const hooksJson = JSON.parse(
+      readFileSync(join(result!.pluginDir, "hooks", "hooks.json"), "utf8"),
+    );
+    const stopCommands = (hooksJson.hooks.Stop as Array<{ hooks: Array<{ command: string }> }>)
+      .flatMap((g) => g.hooks.map((h) => h.command))
+      .join(" ");
+    expect(stopCommands).toContain("directive_verify.py");
+    expect(stopCommands).toContain("retain.py");
   });
 
   it("falls back to agent name when no explicit collection is set", () => {

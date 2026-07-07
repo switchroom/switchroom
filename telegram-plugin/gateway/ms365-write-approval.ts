@@ -31,6 +31,7 @@
 
 import type { IpcClient } from "./ipc-server.js";
 import type { RequestMs365ApprovalMessage } from "./ipc-protocol.js";
+import { hardenCardBreaks } from "../format.js";
 
 // ────────────────────────────────────────────────────────────────────────
 // Wire shape — validates an inbound preview payload
@@ -188,7 +189,10 @@ export function buildMs365CardText(p: Ms365WritePreview): string {
   lines.push(
     "⚠️ Weak attestation (RFC §8 v1): operator should click through to verify the actual change before approving. Structural diff coming v1.5.",
   );
-  return lines.join("\n");
+  // hardenCardBreaks: labelled field lines (Agent:/Tool:/Item:/Account:/Size:…)
+  // would soft-collapse into one blob under the GFM rich renderer; this card is
+  // posted direct (not via the switchroomReply chokepoint).
+  return hardenCardBreaks(lines.join("\n"));
 }
 
 function truncate(s: string, n: number): string {

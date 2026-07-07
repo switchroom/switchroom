@@ -60,7 +60,7 @@ describe("reconcileAndRestartAgent — Phase F cron-only hot reload", () => {
       mkConfig("foo"),
       "/state/agents",
       undefined,
-      { silent: true, force: true },
+      { silent: true },
       deps,
     );
 
@@ -87,12 +87,56 @@ describe("reconcileAndRestartAgent — Phase F cron-only hot reload", () => {
       mkConfig("foo"),
       "/state/agents",
       undefined,
-      { silent: true, force: true },
+      { silent: true },
       deps,
     );
 
     expect(deps.applyCronChangesHot).toHaveBeenCalledWith("foo", changes);
     expect(deps.restartAgent).not.toHaveBeenCalled();
+  });
+
+  it("cron-only changes + force → recreate wins (no hot path, #2779)", async () => {
+    const changes = ["/state/agents/foo/.claude-cron/.mcp.json"];
+    const deps = mkDeps({
+      reconcileAgent: vi.fn(() => ({ agentDir: "/state/agents/foo", changes })) as never,
+    });
+
+    const res = await reconcileAndRestartAgent(
+      "foo",
+      mkConfig("foo"),
+      "/state/agents",
+      undefined,
+      { silent: true, force: true },
+      deps,
+    );
+
+    // force is an explicit demand to recreate on the target image — the
+    // cron-only classification must NOT short-circuit it.
+    expect(deps.applyCronChangesHot).not.toHaveBeenCalled();
+    expect(deps.restartAgent).toHaveBeenCalledTimes(1);
+    expect(res.restarted).toBe(true);
+  });
+
+  it("cron-only changes + releaseOverride (pin) → recreate wins (no hot path, #2779)", async () => {
+    const changes = ["/state/agents/foo/.claude-cron/.mcp.json"];
+    const deps = mkDeps({
+      reconcileAgent: vi.fn(() => ({ agentDir: "/state/agents/foo", changes })) as never,
+    });
+
+    const res = await reconcileAndRestartAgent(
+      "foo",
+      mkConfig("foo"),
+      "/state/agents",
+      undefined,
+      { silent: true, releaseOverride: { pin: "v1.2.3" } },
+      deps,
+    );
+
+    // A one-shot pin (hostd rollout image bump) must reach the container —
+    // the cron-only hot path would leave it on the old image.
+    expect(deps.applyCronChangesHot).not.toHaveBeenCalled();
+    expect(deps.restartAgent).toHaveBeenCalledTimes(1);
+    expect(res.restarted).toBe(true);
   });
 
   it("non-cron change → restartAgent called, applyCronChangesHot NOT called", async () => {
@@ -186,7 +230,7 @@ describe("reconcileAndRestartAgent — compose regen before recreate (pin self-h
     const deps = mkDeps({
       reconcileAgent: vi.fn(() => ({ agentDir: "/state/agents/foo", changes: ["/state/agents/foo/telegram/cron-0.sh"] })) as never,
     });
-    await reconcileAndRestartAgent("foo", mkConfig("foo"), "/state/agents", undefined, { silent: true, force: true }, deps);
+    await reconcileAndRestartAgent("foo", mkConfig("foo"), "/state/agents", undefined, { silent: true }, deps);
     expect(deps.writeComposeFile).not.toHaveBeenCalled();
     expect(deps.restartAgent).not.toHaveBeenCalled();
   });

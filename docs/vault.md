@@ -288,6 +288,17 @@ Fields:
 | `agent_name` | string? | Agent slug derived from the bind socket path — the trusted identity used for the ACL decision (path-as-identity) |
 | `result` | string | `"allowed"`, `"denied:<reason>"`, or `"error:<detail>"` |
 
+### Rotation (bounded growth — #2792)
+
+The audit log is append-only, so on a long-lived host it would grow without bound. It is size-rotated: once the active `vault-audit.log` passes **32 MiB** (default) it is renamed to `vault-audit.log.1` (shifting `.1`→`.2`, …), and **5** rotated files (default) are retained — total on-disk history is bounded at roughly `(maxFiles + 1) × maxBytes`. The per-row tamper-evidence hash chain **continues across the rotation seam** (the in-process chain state is preserved, so the first row of a new file links back to the last row of `.1`); concatenate `…​.5 .4 .3 .2 .1` + the active file, oldest-first, to verify the full chain. Note the oldest rotated file is *deleted* past `maxFiles`, which discards tamper-evidence for the very oldest rows — operators who need an unbounded forensic archive should raise the limits or ship rows off-box.
+
+Overrides (broker-level env vars, read at broker startup):
+
+```sh
+SWITCHROOM_VAULT_AUDIT_MAX_BYTES=67108864   # rotate at 64 MiB; negative disables rotation
+SWITCHROOM_VAULT_AUDIT_MAX_FILES=10         # retain 10 rotated files
+```
+
 ### Grep examples
 
 ```sh

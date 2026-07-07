@@ -1,11 +1,45 @@
 import { execFileSync } from "node:child_process";
 import { createServer } from "node:net";
+import { isClaudeModel } from "../../telegram-plugin/gateway/model-command.js";
 
 /**
- * Default Hindsight ports (upstream defaults).
+ * Default Hindsight host ports.
+ *
+ * The API port defaults to **18888**, NOT the upstream default of 8888.
+ * 8888 is a heavily-contended port on a typical host — Coolify, nginx
+ * front-proxies, tunnel gateways, and Jupyter all grab it. Because the
+ * hindsight container runs `--network host` and binds `HINDSIGHT_API_PORT`
+ * directly on the host, a default of 8888 collided with a foreign listener
+ * (nginx-tunnel-gateway on 127.0.0.1:8888) and crash-looped for hours while
+ * fleet memory was silently down (2026-07 incident). Defaulting to 18888
+ * — a port nothing else conventionally claims — removes the collision at the
+ * source. `pickHindsightPorts()` + the caller-side preflight still guard
+ * against 18888 itself being occupied.
+ *
+ * The UI port stays at 9999 (uncontended in the incident); it is
+ * informational and unused by switchroom.
  */
-export const HINDSIGHT_DEFAULT_API_PORT = 8888;
+export const HINDSIGHT_DEFAULT_API_PORT = 18888;
 export const HINDSIGHT_DEFAULT_UI_PORT = 9999;
+
+/**
+ * Default MCP endpoint URL switchroom writes into agent `.mcp.json` /
+ * `memory.config.url` when the operator hasn't overridden it. Derived from
+ * `HINDSIGHT_DEFAULT_API_PORT` so the scaffolded URL and the container's
+ * bound port can never silently drift apart — the exact failure mode behind
+ * the 2026-07 outage (agents pointed at 18888 while the container bound
+ * 8888). Change the port in ONE place and both move together.
+ */
+export const HINDSIGHT_DEFAULT_MCP_URL = `http://127.0.0.1:${HINDSIGHT_DEFAULT_API_PORT}/mcp/`;
+
+/**
+ * Default REST base URL (no `/mcp/` suffix) for hindsight's HTTP API — the
+ * form the vendored plugin's hooks expect as `HINDSIGHT_API_URL`. Derived
+ * from {@link HINDSIGHT_DEFAULT_MCP_URL} so the port lives in exactly one
+ * place: every `?? "http://127.0.0.1:18888"` literal fallback that used to be
+ * scattered across scaffold/doctor/agent/memory should reference this instead.
+ */
+export const HINDSIGHT_DEFAULT_API_BASE_URL = HINDSIGHT_DEFAULT_MCP_URL.replace(/\/mcp\/?$/, "");
 
 /**
  * Default cap on observations per *tag scope*.
@@ -104,6 +138,18 @@ export function hindsightImageRef(tag?: string): string {
  * generated compose snippet.
  */
 export const HINDSIGHT_DEFAULT_MODEL = "claude-sonnet-5";
+
+/**
+ * Default LiteLLM model for Hindsight's LLM ops when the `litellm` routing
+ * carve-out is enabled and no `memory.config.llm_model` override is set.
+ * OpenRouter (not Anthropic OAuth) so background memory-op cost (fact
+ * extraction, recall synthesis, consolidation) doesn't burn the Claude
+ * subscription quota (added 2026-07-07, per Ken). Must be a model_name
+ * registered in litellm's model_list, routed via the model-mapped path (see
+ * {@link isClaudeModel}), NOT the Anthropic pass-through.
+ */
+export const HINDSIGHT_DEFAULT_LITELLM_MODEL =
+  "openrouter/google/gemini-3.1-flash-lite";
 
 /**
  * Run hindsight's MCP server in stateless HTTP mode.
@@ -232,36 +278,40 @@ export const HINDSIGHT_DEFAULT_RECALL_MAX_CONCURRENT = 8;
 export const HINDSIGHT_DEFAULT_REFLECT_WALL_TIMEOUT_S = 600;
 
 /**
- * Consolidation throughput knobs (modest, reversible). Consolidation is
- * LLM-bound via the claude-code provider (observed ~510s/op), so a deep
- * backlog (e.g. after a stall) drains slowly. Two conservative levers:
+ * Consolidation throughput knobs — throttled HARD for shared-quota safety.
+ * Consolidation is LLM-bound via the claude-code provider (observed
+ * ~510s/op), and every concurrent op is a live claude (Sonnet) subprocess
+ * spending the subscription's quota.
  *
- * - LLM_BATCH_SIZE 8→12: more facts per LLM call → fewer round-trips per
- *   round, so less per-call overhead at ~the same total tokens. Kept
- *   modest (not 16+) to avoid diluting per-fact synthesis quality.
- * - CONSOLIDATION_MAX_SLOTS 2→3: one more bank consolidates concurrently,
- *   which matters during multi-bank backlog recovery. Kept to 3 (not
- *   higher) because every slot is a concurrent claude subprocess on the
- *   shared subscription — more would risk contending with the fleet's own
- *   model usage (subscription-honest). Both revert via the env vars.
+ * Since 2026-07-05 hindsight is UNPINNED (auth.consumers[hindsight] has no
+ * `account:`) — it follows the fleet-active account and shares the SAME
+ * live-turn quota the agents use. That makes the hard ceiling on concurrent
+ * model calls (MAX_SLOTS × LLM_PARALLELISM) a direct tax on the fleet: on
+ * 2026-07-06 an 18-way consolidation fan-out (3 × 6) across multiple banks
+ * exhausted the shared account (429 rate-limit wall) and starved live agent
+ * turns. Operator decision: hindsight keeps sharing the fleet's failover,
+ * but consolidation must NEVER be able to exhaust the quota — so the
+ * concurrency ceiling is throttled to 1 × 2 = 2 concurrent model calls
+ * (was 18), and per-round scope is cut so an op can't monopolise a slot for
+ * long.
  *
- * Two more (added after the 2026-06-19 backlog dig): these target a
- * single backed-up bank, where MAX_SLOTS doesn't help (slots parallelise
- * ACROSS banks, but the bottleneck is one bank's per-op rate). The hard
- * ceiling on concurrent model calls is MAX_SLOTS × LLM_PARALLELISM, so we
- * keep it fleet-safe: 3 × 6 = 18 (was 3 × 4 = 12), NOT a reckless
- * doubling that would starve the fleet's interactive model usage.
- * - LLM_PARALLELISM 4→6: more tag-groups consolidated concurrently WITHIN
- *   one op → faster per-op drain on a single bank.
- * - MAX_MEMORIES_PER_ROUND 100→300: a larger scope clears in one op
- *   instead of re-queuing, cutting per-op setup overhead.
- * Pairs with the 8g memory limit below (more in-flight consolidation =
- * more RSS). All operator-overridable via the generated compose / -e.
+ * - MAX_SLOTS 1: at most one bank consolidates at a time (no cross-bank
+ *   fan-out — that fan-out is exactly what walled the account).
+ * - LLM_PARALLELISM 2: at most two tag-groups in flight within that one op.
+ *   1 × 2 = 2 concurrent claude subprocesses, ceiling.
+ * - MAX_MEMORIES_PER_ROUND 100: bounded scope per op → faster slot release,
+ *   more re-queue points where the fleet can reclaim the quota.
+ * - LLM_BATCH_SIZE 12 (unchanged): facts per LLM call — tokens-per-call, not
+ *   concurrency, so it doesn't affect the shared-quota ceiling.
+ * Consolidation now drains slower by design; that is the accepted trade for
+ * never walling the live fleet. All values remain operator-overridable via
+ * the generated compose / -e (raise them only with a dedicated isolated
+ * account pinned back on the consumer).
  */
 export const HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE = 12;
-export const HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS = 3;
-export const HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM = 6;
-export const HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND = 300;
+export const HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS = 1;
+export const HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM = 2;
+export const HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND = 100;
 
 /**
  * Container resource caps (memory + pids only; CPU intentionally NOT capped).
@@ -306,7 +356,7 @@ export const HINDSIGHT_DEFAULT_PIDS_LIMIT = 1000;
  * segment ... No space left on device` and ALL memory writes/queries die
  * (2026-06-06 fleet outage). 2g gives comfortable headroom over the
  * observed peak while staying well under `HINDSIGHT_DEFAULT_MEM_LIMIT`
- * (4g) so shm can't starve the app. Applies to BOTH the standalone
+ * (8g) so shm can't starve the app. Applies to BOTH the standalone
  * `docker run` path and the compose snippet below — keep them in sync.
  */
 export const HINDSIGHT_DEFAULT_SHM_SIZE = "2g";
@@ -338,6 +388,75 @@ export function isPortFree(port: number): Promise<boolean> {
     });
     server.listen(port, "127.0.0.1");
   });
+}
+
+/**
+ * Best-effort: describe the process currently holding `port`, for a loud
+ * preflight error. Returns a short "pid 1234 (nginx)" style string, or null
+ * when nothing readable holds it (or the probe tools aren't available). Never
+ * throws — this is decoration on an error message, not a control-flow signal.
+ */
+export function describePortHolder(port: number): string | null {
+  // `ss` is present on virtually every modern Linux host and needs no root
+  // to list listeners with their owning process (-p). Fall back to `lsof`.
+  const probes: Array<[string, string[]]> = [
+    ["ss", ["-ltnpH", `sport = :${port}`]],
+    ["lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN"]],
+  ];
+  for (const [cmd, args] of probes) {
+    try {
+      const out = execFileSync(cmd, args, {
+        stdio: "pipe",
+        encoding: "utf-8",
+      }).trim();
+      if (!out) continue;
+      // ss users:(("nginx",pid=1234,fd=6))  |  lsof: nginx 1234 ...
+      const ssMatch = out.match(/users:\(\("([^"]+)",pid=(\d+)/);
+      if (ssMatch) return `pid ${ssMatch[2]} (${ssMatch[1]})`;
+      const firstDataLine = out
+        .split("\n")
+        .map((l) => l.trim())
+        .find((l) => l && !/^COMMAND\b/.test(l));
+      if (firstDataLine) {
+        const parts = firstDataLine.split(/\s+/);
+        if (cmd === "lsof" && parts.length >= 2) {
+          return `pid ${parts[1]} (${parts[0]})`;
+        }
+        return firstDataLine.slice(0, 80);
+      }
+    } catch {
+      // tool missing / non-zero exit — try the next probe.
+    }
+  }
+  return null;
+}
+
+/**
+ * Preflight guard run by callers immediately before `startHindsight()`.
+ * Verifies the chosen host ports are actually bindable RIGHT NOW; if a
+ * foreign process already holds one, returns the offending port + a
+ * best-effort holder description so the caller can fail LOUD (or reassign)
+ * instead of launching a container that will crash-loop on `[Errno 98]
+ * address already in use`.
+ *
+ * This closes the exact gap behind the 2026-07 outage: the `--recreate`
+ * path reused the previously-published host port via
+ * `getRunningHindsightPorts()` and handed it straight to `docker run`,
+ * with no free-check — so when a foreign service (nginx) had claimed that
+ * port in the meantime, hindsight crash-looped silently.
+ *
+ * Returns `null` when both ports are free.
+ */
+export async function preflightHindsightPorts(ports: {
+  apiPort: number;
+  uiPort: number;
+}): Promise<{ port: number; holder: string | null } | null> {
+  for (const port of [ports.apiPort, ports.uiPort]) {
+    if (!(await isPortFree(port))) {
+      return { port, holder: describePortHolder(port) };
+    }
+  }
+  return null;
 }
 
 /**
@@ -379,7 +498,7 @@ export async function pickHindsightPorts(): Promise<{
   if (apiPort === null || uiPort === null) {
     throw new Error(
       "Could not find a free port for Hindsight. " +
-        "Stop whatever is using 8888 / 9999 / 18888 / 19999 and retry.",
+        "Stop whatever is using 18888 / 19999 and retry.",
     );
   }
   return { apiPort, uiPort };
@@ -443,6 +562,13 @@ export interface LiteLLMHindsightConfig {
   baseUrl: string;
   /** Per-service virtual key for spend attribution. */
   apiKey: string;
+  /**
+   * LiteLLM model_name for Hindsight's LLM ops. Defaults to
+   * {@link HINDSIGHT_DEFAULT_LITELLM_MODEL} when omitted. A Claude model/alias
+   * (per {@link isClaudeModel}) rides the Anthropic OAuth pass-through;
+   * anything else rides the model-mapped route.
+   */
+  model?: string;
 }
 
 /**
@@ -456,8 +582,9 @@ export interface LiteLLMHindsightConfig {
  * `auth-broker-hindsight-sock` (chowned by the broker to the consumer
  * UID, see `auth.consumers[]` in switchroom.yaml).
  *
- * @param ports - Optional host port mapping. If omitted, tries upstream
- *   defaults (8888/9999) then 18888/19999.
+ * @param ports - Optional host port mapping. If omitted, falls back to the
+ *   switchroom defaults (`HINDSIGHT_DEFAULT_API_PORT` 18888 /
+ *   `HINDSIGHT_DEFAULT_UI_PORT` 9999).
  * @param litellm - Optional LiteLLM routing config. When provided, the
  *   container uses `--network host` so 127.0.0.1:4010 is reachable, and
  *   the claude subprocess inherits LiteLLM proxy env vars. The API port is
@@ -472,15 +599,32 @@ export function startHindsight(
   const apiPort = ports?.apiPort ?? HINDSIGHT_DEFAULT_API_PORT;
   const uiPort = ports?.uiPort ?? HINDSIGHT_DEFAULT_UI_PORT;
 
+  // Resolve the model BEFORE building envArgs: with litellm routing enabled
+  // the default shifts to a cheap OpenRouter model (HINDSIGHT_DEFAULT_LITELLM_MODEL)
+  // instead of Claude, unless the operator set memory.config.llm_model
+  // (threaded through as litellm.model). Direct-OAuth mode (no litellm, or
+  // fail-open) always stays on HINDSIGHT_DEFAULT_MODEL — no proxy exists to
+  // translate a non-Claude model name.
+  const resolvedModel = litellm
+    ? (litellm.model ?? HINDSIGHT_DEFAULT_LITELLM_MODEL)
+    : HINDSIGHT_DEFAULT_MODEL;
+
   // Non-secret env stays on `-e` — provider name + observation cap are
   // configuration, not secrets. Setting `HINDSIGHT_API_LLM_PROVIDER` to
   // `claude-code` selects the subscription-honest path; pinning
-  // `HINDSIGHT_API_LLM_MODEL` keeps memory ops on the same Claude model
-  // the agent fleet uses (see HINDSIGHT_DEFAULT_MODEL above).
+  // `HINDSIGHT_API_LLM_MODEL` keeps memory ops on the resolved model (see
+  // HINDSIGHT_DEFAULT_MODEL / HINDSIGHT_DEFAULT_LITELLM_MODEL above). NOTE:
+  // for the `claude-code` provider, `HINDSIGHT_API_LLM_MODEL` does NOT
+  // control the embedded `claude` CLI — the CLI reads `ANTHROPIC_MODEL`, and
+  // without it falls back to its own default (opus), silently running every
+  // memory op (fact extraction, recall synthesis, consolidation) on the
+  // wrong model. So we ALSO set `ANTHROPIC_MODEL` — that's what actually
+  // pins the model.
   const envArgs: string[] = [
     "-e", `HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE=${HINDSIGHT_DEFAULT_MAX_OBSERVATIONS_PER_SCOPE}`,
     "-e", "HINDSIGHT_API_LLM_PROVIDER=claude-code",
-    "-e", `HINDSIGHT_API_LLM_MODEL=${HINDSIGHT_DEFAULT_MODEL}`,
+    "-e", `HINDSIGHT_API_LLM_MODEL=${resolvedModel}`,
+    "-e", `ANTHROPIC_MODEL=${resolvedModel}`,
     "-e", `HINDSIGHT_API_MCP_STATELESS=${HINDSIGHT_DEFAULT_MCP_STATELESS}`,
     // Reranker smart-defaults (v0.13.22) — see constants above for
     // rationale. Each closes a vendor-default gap that hurts our
@@ -492,8 +636,10 @@ export function startHindsight(
     // Reflect wall timeout — let large-bank mental-model refreshes finish
     // (vendor 300s times out on 12k+ obs banks → stale user-profile models).
     "-e", `HINDSIGHT_API_REFLECT_WALL_TIMEOUT=${HINDSIGHT_DEFAULT_REFLECT_WALL_TIMEOUT_S}`,
-    // Consolidation throughput (modest): fewer LLM round-trips per round +
-    // one more concurrent bank during backlog recovery. See constants above.
+    // Consolidation concurrency: throttled by #2894 to a hard ceiling of
+    // MAX_SLOTS 1 × LLM_PARALLELISM 2 = 2 concurrent model calls (was 18), so
+    // consolidation can never exhaust the shared failover quota. Batch size 12
+    // and per-round scope 100 bound tokens/scope per op. See constants above.
     "-e", `HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE=${HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE}`,
     "-e", `HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS=${HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS}`,
     "-e", `HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM=${HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM}`,
@@ -505,13 +651,23 @@ export function startHindsight(
     // 127.0.0.1:4010 (LiteLLM) is directly reachable, identical to how
     // agent containers work. Explicit port env vars preserve the same
     // external ports (18888/19999) the operator is used to.
+    const litellmRoot = litellm.baseUrl.replace(/\/+$/, "");
+    // Claude models ride the Anthropic pass-through (<root>/anthropic,
+    // raw byte-forward, OAuth) — the model-mapped route re-chunks the SSE
+    // stream and stalls long Claude responses mid-flight (the 2026-07-05
+    // stall). Any other model (e.g. OpenRouter) MUST use the model-mapped
+    // root instead — the pass-through only forwards to the real Anthropic
+    // API, so a non-Claude model_name there 404s / always fails open.
+    const anthropicBaseUrl = isClaudeModel(resolvedModel)
+      ? `${litellmRoot}/anthropic`
+      : litellmRoot;
     envArgs.push(
       // HINDSIGHT_API_PORT is the only port knob the upstream config.py
       // recognizes; the CP service has no equivalent env var override.
       "-e", `HINDSIGHT_API_PORT=${apiPort}`,
       // LiteLLM routing: inherited by the claude_agent_sdk subprocess so
       // consolidation/reflect calls hit the proxy for spend tracking.
-      "-e", `ANTHROPIC_BASE_URL=${litellm.baseUrl}`,
+      "-e", `ANTHROPIC_BASE_URL=${anthropicBaseUrl}`,
       "-e", `ANTHROPIC_CUSTOM_HEADERS=x-litellm-api-key: Bearer ${litellm.apiKey}\nx-litellm-customer-id: hindsight\nx-litellm-tags: service:hindsight`,
     );
   }
@@ -530,9 +686,16 @@ export function startHindsight(
     // HINDSIGHT_DEFAULT_SHM_SIZE) or all writes/queries fail with
     // "No space left on device". Keep in sync with the compose snippet.
     `--shm-size=${HINDSIGHT_DEFAULT_SHM_SIZE}`,
-    // Restart a wedged API: docker had no liveness signal for hindsight,
-    // so an unresponsive server (or a never-booting one) stayed "up"
-    // forever. python3 is always present in the image; curl/wget are not.
+    // Liveness signal for a wedged API: docker had no health probe for
+    // hindsight, so an unresponsive server (or a never-booting one) stayed
+    // "up" forever. This marks the container "unhealthy" in `docker inspect`
+    // / `docker ps` so operators and the doctor probe can SEE the wedge.
+    // NOTE: vanilla Docker does NOT auto-restart an unhealthy container —
+    // `--restart always` acts on process EXIT only, never on health status.
+    // So this is visibility, not a self-heal; an unhealthy-but-not-exited
+    // API keeps running until something (operator / an autoheal sidecar)
+    // acts on the status. See PR follow-up for the restart-on-unhealthy
+    // mechanism. python3 is always present in the image; curl/wget are not.
     "--health-cmd", litellm
       ? `python3 -c 'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen("http://localhost:${apiPort}/health",timeout=4).getcode()==200 else 1)'`
       : HINDSIGHT_HEALTHCHECK_CMD,
@@ -612,6 +775,13 @@ export function pullHindsightImage(imageTag?: string): void {
  * `pickHindsightPorts()`.
  */
 export function getRunningHindsightPorts(): { apiPort: number; uiPort: number } | null {
+  // The container's INTERNAL ports are fixed by the image (8888 API, 9999 UI)
+  // regardless of what host port they're published on. `docker port` is keyed
+  // by the container port, so these are constants — NOT the host defaults.
+  // (Before the 18888 default this coincidentally equaled the host default;
+  // decoupling them here keeps recreate working after the default moved.)
+  const CONTAINER_API_PORT = 8888;
+  const CONTAINER_UI_PORT = 9999;
   const readPort = (containerPort: number): number | null => {
     try {
       const out = execFileSync(
@@ -628,12 +798,58 @@ export function getRunningHindsightPorts(): { apiPort: number; uiPort: number } 
       return null;
     }
   };
-  const apiPort = readPort(HINDSIGHT_DEFAULT_API_PORT);
+  const apiPort = readPort(CONTAINER_API_PORT);
+  if (apiPort !== null) {
+    // The UI port is informational (unused by switchroom); reuse it if
+    // readable, else derive the standard pair (18888→19999, 8888→9999).
+    const uiPort =
+      readPort(CONTAINER_UI_PORT) ??
+      (apiPort === HINDSIGHT_DEFAULT_API_PORT ? HINDSIGHT_DEFAULT_UI_PORT : 19999);
+    return { apiPort, uiPort };
+  }
+  // `docker port` returns NOTHING for a `--network host` container (the
+  // deployed litellm shape runs `--network host`, no -p publishing), so a
+  // port-reassigned host-network deployment would otherwise fall back to the
+  // 18888 default and strand `memory.config.url`. Recover the real ports from
+  // the container's env, where `startHindsight` writes `HINDSIGHT_API_PORT`
+  // for exactly this mode.
+  return getHindsightPortsFromEnv();
+}
+
+/**
+ * Fallback for {@link getRunningHindsightPorts}: read the host ports from the
+ * running container's environment (`docker inspect --format '{{.Config.Env}}'`).
+ * Used for `--network host` deployments where `docker port` yields nothing.
+ * Reads `HINDSIGHT_API_PORT`; the UI port is informational, so it's derived
+ * from the API port (18888→19999, else 9999) unless a `HINDSIGHT_UI_PORT`-like
+ * var is present. Returns null when the container isn't inspectable or the API
+ * port env var is absent.
+ */
+function getHindsightPortsFromEnv(): { apiPort: number; uiPort: number } | null {
+  let env: string;
+  try {
+    env = execFileSync(
+      "docker",
+      ["inspect", "--format", "{{.Config.Env}}", "switchroom-hindsight"],
+      { stdio: "pipe", encoding: "utf-8" },
+    );
+  } catch {
+    return null;
+  }
+  // `{{.Config.Env}}` renders the env slice as a space-separated, bracketed
+  // Go list: `[FOO=1 HINDSIGHT_API_PORT=18888 BAR=baz]`. Values never contain
+  // spaces here (they're ports/URLs/keys), so a token split is sufficient.
+  const readVar = (name: string): number | null => {
+    const re = new RegExp(`(?:^|[\\s\\[])${name}=([^\\s\\]]+)`);
+    const m = env.match(re);
+    if (!m) return null;
+    const n = Number(m[1]);
+    return Number.isInteger(n) && n > 0 ? n : null;
+  };
+  const apiPort = readVar("HINDSIGHT_API_PORT");
   if (apiPort === null) return null;
-  // The UI port is informational (unused by switchroom); reuse it if
-  // readable, else derive the standard pair (8888→9999, 18888→19999).
   const uiPort =
-    readPort(HINDSIGHT_DEFAULT_UI_PORT) ??
+    readVar("HINDSIGHT_UI_PORT") ??
     (apiPort === HINDSIGHT_DEFAULT_API_PORT ? HINDSIGHT_DEFAULT_UI_PORT : 19999);
   return { apiPort, uiPort };
 }
@@ -657,13 +873,14 @@ export function getHindsightStatus(): string | null {
 
 /**
  * Get the MCP server config for Hindsight via HTTP endpoint.
- * Hindsight exposes MCP via Streamable HTTP at localhost:8888/mcp.
+ * Hindsight exposes MCP via Streamable HTTP; switchroom publishes it on the
+ * host at HINDSIGHT_DEFAULT_MCP_URL (127.0.0.1:18888/mcp/ by default).
  */
 export function getHindsightMcpUrl(): {
   url: string;
 } {
   return {
-    url: "http://localhost:8888/mcp/",
+    url: HINDSIGHT_DEFAULT_MCP_URL,
   };
 }
 
@@ -684,12 +901,19 @@ export function generateHindsightComposeSnippet(): string {
     `    image: ${HINDSIGHT_IMAGE}`,
     "    container_name: switchroom-hindsight",
     "    ports:",
-    "      - \"8888:8888\"",
-    "      - \"9999:9999\"",
+    // Host side 18888/19999 → container 8888/9999. The host port MUST match
+    // HINDSIGHT_DEFAULT_API_PORT / the scaffolded memory.config.url or agents
+    // point at a dead URL (see the 2026-07 outage).
+    // Bind to 127.0.0.1 only: the hindsight API is TOKENLESS, so publishing on
+    // 0.0.0.0 would expose the unauthenticated MCP/REST surface to the network.
+    // This mirrors the startHindsight() docker-run path, which binds loopback.
+    `      - "127.0.0.1:${HINDSIGHT_DEFAULT_API_PORT}:8888"`,
+    "      - \"127.0.0.1:19999:9999\"",
     "    environment:",
     `      - HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE=${HINDSIGHT_DEFAULT_MAX_OBSERVATIONS_PER_SCOPE}`,
     "      - HINDSIGHT_API_LLM_PROVIDER=claude-code",
     `      - HINDSIGHT_API_LLM_MODEL=${HINDSIGHT_DEFAULT_MODEL}`,
+    `      - ANTHROPIC_MODEL=${HINDSIGHT_DEFAULT_MODEL}`,
     `      - HINDSIGHT_API_MCP_STATELESS=${HINDSIGHT_DEFAULT_MCP_STATELESS}`,
     `      - HINDSIGHT_API_RERANKER_LOCAL_BUCKET_BATCHING=${HINDSIGHT_DEFAULT_RERANKER_BUCKET_BATCHING}`,
     `      - HINDSIGHT_API_RERANKER_MAX_CANDIDATES=${HINDSIGHT_DEFAULT_RERANKER_MAX_CANDIDATES}`,
@@ -740,14 +964,16 @@ export function generateHindsightComposeSnippet(): string {
  * same `name` is already present, leaves it untouched.
  *
  * @param configPath  absolute path to switchroom.yaml
- * @param account     account label to pin the consumer to (typically
- *                    `auth.active` at setup time)
+ * @param account     optional account label to PIN the consumer to. Omit
+ *                    (the default since the consumer-unpin change) to
+ *                    register the consumer follow-active: it rides the
+ *                    fleet `auth.active` with the same failover agents get.
  * @param uid         UID to chown the consumer socket to;
  *                    defaults to HINDSIGHT_DEFAULT_UID
  */
 export async function ensureHindsightConsumer(
   configPath: string,
-  account: string,
+  account?: string,
   uid: number = HINDSIGHT_DEFAULT_UID,
 ): Promise<{ added: boolean; reason: string }> {
   const fs = await import("node:fs");
@@ -793,7 +1019,7 @@ export async function ensureHindsightConsumer(
 
   const entry = new YAMLMap();
   entry.set("name", HINDSIGHT_CONSUMER_NAME);
-  entry.set("account", account);
+  if (account !== undefined) entry.set("account", account);
   entry.set("uid", uid);
   consumersNode.add(entry);
 

@@ -150,4 +150,31 @@ describe("dispatchAsInbound", () => {
     const wire = JSON.parse(JSON.stringify(dispatcher.calls[0]!.msg));
     expect(validateGatewayMessage(wire)).toBe(true);
   });
+
+  // #2793 part B — a boot-replay stamps meta.replay_fire_ms so the gateway
+  // routes it through the durable inbound spool (accept vs consume ledgered
+  // separately) and spoolId derives a stable dedup key from the replayed
+  // fire. A live tick leaves it unset and keeps the fire-and-forget path.
+  it("emits meta.replay_fire_ms when replayFireMs is set (boot-replay)", () => {
+    const dispatcher = captureDispatcher();
+    const result = dispatchAsInbound(
+      sampleEntry,
+      { chatId: "-100", now: () => 1_700_000_000_000, replayFireMs: 1_699_999_980_000 },
+      dispatcher,
+    );
+    expect(result.message.meta.replay_fire_ms).toBe("1699999980000");
+    // still a valid wire message (meta is Record<string,string>).
+    const wire = JSON.parse(JSON.stringify(dispatcher.calls[0]!.msg));
+    expect(validateGatewayMessage(wire)).toBe(true);
+  });
+
+  it("omits replay_fire_ms for a live tick (byte-identical to today)", () => {
+    const dispatcher = captureDispatcher();
+    const result = dispatchAsInbound(
+      sampleEntry,
+      { chatId: "-100", now: () => 1_700_000_000_000 },
+      dispatcher,
+    );
+    expect(result.message.meta.replay_fire_ms).toBeUndefined();
+  });
 });

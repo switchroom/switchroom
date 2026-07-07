@@ -509,7 +509,16 @@ describe('projectSubagentLine', () => {
     // rendering."
     expect(events.length).toBe(2)
     expect(events[0].kind).toBe('sub_agent_tool_use')
-    expect(events[1]).toEqual({ kind: 'sub_agent_nested_spawn', agentId: 'X' })
+    // The nested_spawn now ALSO carries the dispatch toolUseId + input so
+    // the watcher can key the nested worker's registry row
+    // (recordNestedSubagentDispatch — the depth-2+ card fix). Rendering is
+    // unchanged: still no sub_agent_tool_use for the nested Agent.
+    expect(events[1]).toEqual({
+      kind: 'sub_agent_nested_spawn',
+      agentId: 'X',
+      toolUseId: 'toolu_b',
+      input: { description: 'nested', prompt: 'nested-p' },
+    })
   })
 
   it('emits sub_agent_text + sub_agent_tool_use in source order for [text, tool_use]', () => {

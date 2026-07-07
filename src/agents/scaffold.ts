@@ -213,7 +213,7 @@ value back into chat.
 
 ### Formatting — make it scannable
 
-\`reply\` and \`stream_reply\` render rich Markdown (Bot API 10.1) for you, so
+\`reply\` renders rich Markdown (Bot API 10.1) for you, so
 \`**bold**\` becomes bold and backtick-wrapped text becomes monospace. Your full
 formatting floor card — the toolkit and when to reach for each — is injected
 into your system prompt every session; this is the conversational summary.
@@ -266,7 +266,7 @@ phone. Optimise it for a thumb scroll, not a terminal dump:
   wins.
 
 Every turn that answers a user message ends with a user-visible
-\`reply\` (or \`stream_reply\` done=true) — Telegram is all the user
+\`reply\` — Telegram is all the user
 sees; your terminal output never reaches them.`;
 
 /**
@@ -421,8 +421,8 @@ right answer at all. Structure exists for the reader, not the writer: a two-item
 bullet list is worse than a sentence, a heading on a three-line reply is noise. When
 in doubt, shorter and plainer wins.
 
-Every turn that answers a user message ends with a user-visible \`reply\` (or
-\`stream_reply\` done=true) — Telegram is all the user sees; your terminal output
+Every turn that answers a user message ends with a user-visible \`reply\`
+— Telegram is all the user sees; your terminal output
 never reaches them.`;
 
 /**
@@ -629,7 +629,7 @@ import { shouldEmitNotionMcp } from "../config/notion-workspace-acl.js";
 import { reconcileAgentDefaultSkills } from "./reconcile-default-skills.js";
 import { applyTelegramProgressGuidance } from "./sub-agent-telegram-prompt.js";
 import type { McpServerConfig } from "../memory/hindsight.js";
-import { createBank, updateBankMissions, DEFAULT_RETAIN_MISSION, isHindsightEnabled } from "../memory/hindsight.js";
+import { createBank, updateBankMissions, ensureDeclaredMentalModels, DEFAULT_RETAIN_MISSION, resolveBankMissionExtras, isHindsightEnabled } from "../memory/hindsight.js";
 import { loadTopicState } from "../telegram/state.js";
 import { resolveDualPath } from "../config/paths.js";
 import { resolvePath } from "../config/loader.js";
@@ -644,6 +644,7 @@ import {
   seedCronConfigDir,
   loadUserConfig,
 } from "../setup/onboarding.js";
+import { HINDSIGHT_DEFAULT_MCP_URL, HINDSIGHT_DEFAULT_API_BASE_URL } from "../setup/hindsight.js";
 import { ensureBareClone } from "../repos/bare-clone.js";
 import {
   ensureAgentWorktree,
@@ -935,7 +936,6 @@ export function setupPlugins(agentDir: string, useSwitchroomPlugin = false): voi
 const SWITCHROOM_TELEGRAM_MCP_TOOLS = [
   "mcp__switchroom-telegram",
   "mcp__switchroom-telegram__reply",
-  "mcp__switchroom-telegram__stream_reply",
   "mcp__switchroom-telegram__react",
   "mcp__switchroom-telegram__edit_message",
   "mcp__switchroom-telegram__send_typing",
@@ -948,13 +948,75 @@ const SWITCHROOM_TELEGRAM_MCP_TOOLS = [
 ];
 
 /**
- * Pre-approved MCP tool names for the Hindsight memory server.
- * When the memory backend is hindsight we pre-approve the wildcard so
- * the agent can recall and store memories without prompting.
+ * Mental-model WRITE tools on the Hindsight server that are deliberately
+ * NOT pre-approved. These mutate engine-tier mental models, and the
+ * agent-proposes / human-approves gate (the `mental_model_propose` card,
+ * see reference/rfcs/hindsight-phase5-mental-model-curation.md) is the
+ * only sanctioned path to them. Pre-approving them (e.g. via a
+ * `mcp__hindsight__*` wildcard) silently bypasses that gate — the very
+ * regression this list guards against. Leaving them off the allow-list
+ * means a direct agent call falls through to the normal permission
+ * prompt instead of the propose card, which is acceptable (the curator
+ * skill is instructed to always propose, never call these directly).
  */
-const HINDSIGHT_MCP_TOOLS = [
-  "mcp__hindsight",
-  "mcp__hindsight__*",
+export const HINDSIGHT_MENTAL_MODEL_WRITE_TOOLS = [
+  "mcp__hindsight__create_mental_model",
+  "mcp__hindsight__update_mental_model",
+  "mcp__hindsight__delete_mental_model",
+  "mcp__hindsight__refresh_mental_model",
+];
+
+/**
+ * Pre-approved MCP tool names for the Hindsight memory server.
+ *
+ * This is an ENUMERATED allow-list, deliberately NOT a `mcp__hindsight__*`
+ * wildcard and NOT a bare `mcp__hindsight` server grant (either of which
+ * would pre-approve every tool on the server). It enumerates the
+ * read / retain / reflect / directive tools the agent uses autonomously,
+ * and OMITS the mental-model write tools in
+ * `HINDSIGHT_MENTAL_MODEL_WRITE_TOOLS`, which must go through the
+ * agent-proposes / human-approves propose card instead (Fix 1.2, #2903).
+ *
+ * When adding a hindsight tool to the surface, add it here explicitly —
+ * a wildcard is banned so the next mental-model-write addition can't
+ * silently ride in ungated. The permission surface is pinned by
+ * tests/agents/hindsight-permission-surface.test.ts against
+ * tests/fixtures/hindsight-tools-list.snapshot.json.
+ */
+export const HINDSIGHT_MCP_TOOLS = [
+  // Retain / reflect / recall — the day-to-day store + query surface.
+  "mcp__hindsight__recall",
+  "mcp__hindsight__retain",
+  "mcp__hindsight__sync_retain",
+  "mcp__hindsight__reflect",
+  // Directives — captured autonomously (directive-capture nudge/verifier).
+  "mcp__hindsight__create_directive",
+  "mcp__hindsight__update_bank",
+  "mcp__hindsight__delete_directive",
+  "mcp__hindsight__list_directives",
+  // Banks.
+  "mcp__hindsight__create_bank",
+  "mcp__hindsight__get_bank",
+  "mcp__hindsight__get_bank_stats",
+  "mcp__hindsight__list_banks",
+  "mcp__hindsight__delete_bank",
+  // Memories.
+  "mcp__hindsight__get_memory",
+  "mcp__hindsight__list_memories",
+  "mcp__hindsight__clear_memories",
+  // Documents.
+  "mcp__hindsight__get_document",
+  "mcp__hindsight__list_documents",
+  "mcp__hindsight__delete_document",
+  // Mental models — READ ONLY (writes go through the propose card).
+  "mcp__hindsight__get_mental_model",
+  "mcp__hindsight__list_mental_models",
+  // Tags.
+  "mcp__hindsight__list_tags",
+  // Operations.
+  "mcp__hindsight__get_operation",
+  "mcp__hindsight__list_operations",
+  "mcp__hindsight__cancel_operation",
 ];
 
 /**
@@ -1802,7 +1864,7 @@ function buildHumanizerEnvVars(
  * baseline 79,056 tok under `auto`, unchanged even by the per-tool diet).
  * `true` forces deferral of every tool NOT pinned via
  * `_meta["anthropic/alwaysLoad"]` — switchroom pins the load-bearing hot path
- * (reply / stream_reply / etc. in the telegram bridge; hindsight + agent-config
+ * (reply / etc. in the telegram bridge; hindsight + agent-config
  * server-wide), so the reply path stays loaded while the heavy business-MCP +
  * cold-tool surface defers. Canary (test-harness, 2026-06-18): baseline
  * 79,056 → 47,064 tok (~40%) with the reply UAT still passing.
@@ -2427,7 +2489,7 @@ export function installHindsightPlugin(
   // /mcp/ MCP endpoint URL — strip the suffix.
   const bankId = agentMemory?.collection ?? agentName;
   const mcpUrl = (memory.config?.url as string | undefined)
-    ?? "http://127.0.0.1:8888/mcp/";
+    ?? HINDSIGHT_DEFAULT_MCP_URL;
   const apiBaseUrl = mcpUrl.replace(/\/mcp\/?$/, "").replace(/\/$/, "");
 
   return { pluginDir: destPath, apiBaseUrl, bankId };
@@ -2440,6 +2502,9 @@ export function installHindsightPlugin(
  *
  * Currently overrides:
  *   - `retainEveryNTurns`: 10 → 1 (capture every turn, not every 10th)
+ *   - `retainMode`: full-session → chunked (Phase 6b: window, not whole
+ *     transcript, re-consolidated per fire; paired with the vendor
+ *     retain.py divergence)
  *   - `recallMaxMemories`: 12 → 8 (tighter prompt, less model noise)
  *   - `recallMinOverlap`: 0.0 → 0.10 (drop weak Jaccard-overlap matches)
  *
@@ -2486,6 +2551,40 @@ function renderHindsightSettingsOverrides(
   // Override: every turn retains (no throttle). See the rationale in
   // installHindsightPlugin() above.
   settings.retainEveryNTurns = 1;
+  // Phase 6b (RFC reference/rfcs/hindsight-synthesis-layers.md): switch from
+  // the vendor default retainMode="full-session" to "chunked" while keeping
+  // retainEveryNTurns=1. This is the crux of Phase 6b option A — keep the
+  // every-turn crash durability that retainEveryNTurns=1 buys (a ≤2-turn
+  // session still retains its token before a restart; the jtbd-memory-
+  // survives-restart UAT), but STOP re-consolidating the whole accumulated
+  // transcript on every Stop fire. Under full-session × every-turn, each fire
+  // re-sent the entire growing transcript to Hindsight's consolidation engine
+  // — the ~1M-tokens/day/agent invisible spend. In chunked mode retain.py
+  // slices only the recent window (retainOverlapTurns + retainEveryNTurns
+  // turns) per fire.
+  //
+  // This override is INERT without the paired vendor patch: upstream retain.py
+  // gated chunked window-slicing on `retainEveryNTurns > 1`, so chunked at
+  // n=1 silently fell back to full-session. The switchroom divergence in
+  // vendor/hindsight-memory/scripts/retain.py (select_retain_window) decouples
+  // the window slice from that throttle, which is what makes chunked+every-turn
+  // actually take effect. See that file's header comment + the CHANGELOG entry.
+  //
+  // Durability holds because the window always extends to the END of the
+  // transcript, so the turn that just completed (whose Stop hook is firing)
+  // is always inside the window, and every turn fires at n=1 — so each turn's
+  // content is retained on its own fire. No fact can fall outside every window.
+  //
+  // No operator override surface yet: switchroom.yaml exposes memory.recall.*
+  // (see AgentMemorySchema in src/config/schema.ts) but no memory.retain.mode
+  // key, so this is the scaffold default for every agent. If a retain-mode
+  // cascade is added later, wire it here (mirroring the recall knobs) and let
+  // the env/config value win over this default.
+  settings.retainMode = "chunked";
+  // retainOverlapTurns stays at the vendor default (2) → window = 3 recent
+  // turns at retainEveryNTurns=1. That's a comfortable safety margin for the
+  // restart guarantee (the firing turn plus the two before it), so no explicit
+  // override is warranted.
   // v0.13.22 smart defaults: at our recallBudget=low the vendor's 12
   // memories is generous; 8 keeps prompt noise down without hurting
   // the substantive recall@N (top-8 carries the same dominant facts
@@ -2520,6 +2619,15 @@ function renderHindsightSettingsOverrides(
   // opt OUT via memory.recall.skip_trivial=false in switchroom.yaml
   // (exported as HINDSIGHT_RECALL_SKIP_TRIVIAL only when overridden).
   settings.recallSkipTrivial = true;
+  // #2848 Stage B: deterministic directive-capture nudge ON by default.
+  // Stage A audit found a ~55% miss rate on durable corrections (guidance-
+  // only capture is a per-agent lottery), so recall.py regex-detects
+  // correction-shaped inbound and nudges the model to persist it with
+  // create_directive — the model does the judgment in-session (no model
+  // callsite). Operators opt OUT per-agent via memory.directive_capture_nudge
+  // =false (exported as HINDSIGHT_DIRECTIVE_CAPTURE_NUDGE only when overridden;
+  // the env value wins over this settings.json default).
+  settings.directiveCaptureNudge = true;
   // Static shared-bank recall (RFC reference/rfcs/per-speaker-memory-routing.md,
   // ship-B): recall these extra banks on every turn, merged into the agent's
   // own bank results. Sourced from memory.recall.additional_banks (cascaded);
@@ -2529,6 +2637,29 @@ function renderHindsightSettingsOverrides(
   if (additionalBanks.length > 0) {
     settings.recallAdditionalBanks = [...additionalBanks];
   }
+  // #2816 tag-filter port — INTENTIONALLY DORMANT (do not wire without an RFC).
+  // The vendored recall.py reads `recallTags` / `recallTagsMatch` /
+  // `recallTagGroups` / `recallAdditionalBankFilters` (upstream 962140eef, and
+  // the env overrides HINDSIGHT_RECALL_TAGS / _TAGS_MATCH / _TAG_GROUPS exist in
+  // vendor/hindsight-memory/scripts/lib/config.py). But switchroom deliberately
+  // does NOT set any of them here, and there is no memory.recall.tags config
+  // surface in src/config/schema.ts — so the filters collapse to their no-op
+  // pass-through default (empty filter = match everything).
+  //
+  // This is a decision, not an oversight. reference/rfcs/hindsight-synthesis-
+  // layers.md frames the port as "a ready-made hook for future recall shaping
+  // (e.g. scoping additional-bank recall to specific tags), currently dormant" —
+  // explicitly future work, NOT part of the Phase 2 bank-specialization goals
+  // (which are mission/disposition-driven, already wired via updateBankMissions
+  // + resolveBankMissionExtras). Wiring a first-class tag surface now would mean
+  // inventing a per-bank tag taxonomy the RFC does not specify. The env-var
+  // escape hatch above remains available to advanced operators in the meantime.
+  //
+  // TODO(#2816): if/when an RFC calls for tag-scoped recall, add a
+  // `memory.recall.tags` (+ match/groups) cascade knob mirroring the
+  // `recallTypes` wiring above and export it through profiles/_base/start.sh.hbs
+  // (HINDSIGHT_RECALL_TAGS), letting the env value win over this scaffold
+  // default — then set settings.recallTags here from the resolved config.
   return JSON.stringify(settings, null, 2) + "\n";
 }
 
@@ -2590,6 +2721,9 @@ interface BuildWorkspaceContextArgs {
   // each undefined unless the operator overrode the switchroom default.
   hindsightRecallTypes?: string;
   hindsightRecallSkipTrivial?: string;
+  // #2848 Stage B — directive-capture nudge opt-out. Stringified bool,
+  // undefined unless the operator overrode the switchroom default (on).
+  hindsightDirectiveCaptureNudge?: string;
   // PR6 — supergroup-mode topic tagging. JSON map of {alias: thread_id}
   // injected as HINDSIGHT_TOPIC_ALIASES_JSON so retain.py can resolve
   // numeric thread_ids to human alias names in memory metadata.
@@ -2630,6 +2764,7 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightRecallMinOverlap,
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
+    hindsightDirectiveCaptureNudge,
     hindsightTopicAliasesJson,
     hindsightSenderBanksJson,
     hindsightTopicFilterMode,
@@ -2709,6 +2844,7 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightRecallMinOverlap,
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
+    hindsightDirectiveCaptureNudge,
     // PR6 — only emit the env-export blocks when we actually have a
     // value, so `{{#if hindsightTopicAliasesJsonQ}}` and friends are
     // false-y for fleet-shared / DM agents (the dominant case).
@@ -3303,7 +3439,7 @@ export function scaffoldAgent(
   const hindsightBankId = agentConfig.memory?.collection ?? name;
   const hindsightApiBaseUrl = (switchroomConfig?.memory?.config?.url as string | undefined)
     ? (switchroomConfig!.memory!.config!.url as string).replace(/\/mcp\/?$/, "").replace(/\/$/, "")
-    : "http://127.0.0.1:8888";
+    : HINDSIGHT_DEFAULT_API_BASE_URL;
   // Cascading recall cap. Per-agent value already merged from defaults
   // by config/merge.ts (memory is shallow-merged), so reading
   // agentConfig.memory.recall.max_memories here picks up the resolved
@@ -3330,6 +3466,15 @@ export function scaffoldAgent(
     agentConfig.memory?.recall?.skip_trivial === undefined
       ? undefined
       : String(agentConfig.memory.recall.skip_trivial);
+  // #2848 Stage B — directive-capture nudge cascade. undefined unless the
+  // operator overrode the switchroom default (on). Exported only when set
+  // (see start.sh.hbs), so an unset value leaves the on-by-default
+  // settings.json override in force. Top-level memory.* knob (not under
+  // memory.recall) — it gates a correction-detection nudge, not recall tuning.
+  const hindsightDirectiveCaptureNudge =
+    agentConfig.memory?.directive_capture_nudge === undefined
+      ? undefined
+      : String(agentConfig.memory.directive_capture_nudge);
 
   // PR6 — supergroup-mode topic tagging. Build the {alias: thread_id}
   // JSON for retain.py + recall.py to resolve numeric thread_ids to
@@ -3387,6 +3532,7 @@ export function scaffoldAgent(
     hindsightRecallMinOverlap,
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
+    hindsightDirectiveCaptureNudge,
     hindsightTopicAliasesJson,
     hindsightSenderBanksJson,
     hindsightTopicFilterMode,
@@ -3683,7 +3829,7 @@ export function scaffoldAgent(
         },
         // Tool-search right-sizing (P4-B): the server is NO LONGER pinned
         // wholesale. The bridge pins the load-bearing hot tools (reply /
-        // stream_reply / get_recent_messages / react / edit_message /
+        // get_recent_messages / react / edit_message /
         // send_typing / download_attachment) individually via the native
         // per-tool `_meta["anthropic/alwaysLoad"]` annotation, so they
         // never defer (no orphaned-reply round-trip), while the ~14 cold
@@ -4312,8 +4458,23 @@ export function scaffoldAgent(
       const userRetainMission = agentConfig.memory?.retain_mission;
       const seededRetainMission = userRetainMission ?? DEFAULT_RETAIN_MISSION;
 
-      const missions: { bank_mission?: string; retain_mission?: string } = {
+      // reflect_mission / observations_mission / disposition, layering the
+      // resolved config over the built-in profile defaults (Phase 2). Config
+      // wins; disposition merges per-key.
+      const extras = resolveBankMissionExtras(
+        agentConfig.memory,
+        agentConfig.extends ?? DEFAULT_PROFILE,
+      );
+
+      const missions: {
+        bank_mission?: string;
+        retain_mission?: string;
+        reflect_mission?: string;
+        observations_mission?: string;
+        disposition?: { skepticism?: number; literalism?: number; empathy?: number };
+      } = {
         retain_mission: seededRetainMission,
+        ...extras,
       };
       if (userBankMission) {
         missions.bank_mission = userBankMission;
@@ -4330,6 +4491,28 @@ export function scaffoldAgent(
         })
         .catch((err) => {
           console.warn(`  ${chalk.yellow("⚠")} Bank mission update error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
+        });
+
+      // Ensure operator-DECLARED per-specialist mental models (Phase 5). Only
+      // models named in memory.mental_models are created — no blind seeding
+      // (that is the #2447 regression this avoids). Best-effort; never blocks.
+      ensureDeclaredMentalModels(
+        apiUrl,
+        hindsightBankId,
+        agentConfig.memory?.mental_models,
+        { timeoutMs: 5000 },
+      )
+        .then((outcomes) => {
+          for (const o of outcomes) {
+            if (o.ok) {
+              console.log(`  ${chalk.green("✓")} Mental model "${o.name}" ready for ${formatAgentBankLabel(name, hindsightBankId)}`);
+            } else {
+              console.warn(`  ${chalk.yellow("⚠")} Failed to ensure mental model "${o.name}" for ${formatAgentBankLabel(name, hindsightBankId)}: ${o.reason}`);
+            }
+          }
+        })
+        .catch((err) => {
+          console.warn(`  ${chalk.yellow("⚠")} Mental model ensure error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
         });
     });
   }
@@ -4644,7 +4827,7 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
           ],
         },
         {
-          // #2053 defense-in-depth: drop a reply/stream_reply call whose
+          // #2053 defense-in-depth: drop a reply call whose
           // payload is only the silent sentinel (NO_REPLY/HEARTBEAT_OK),
           // so the sentinel can never reach chat regardless of any
           // nag-loop behaviour. No matcher — the hook self-filters by
@@ -5041,7 +5224,7 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
     'request. A wall of text the user has to re-read to find the one fact ' +
     'that matters is the failure this exists to prevent.\n\n' +
     'CRITICAL: "answer" means a call to the reply tool ' +
-    '(mcp__switchroom-telegram__reply, or stream_reply with done=true). ' +
+    '(mcp__switchroom-telegram__reply). ' +
     'Your terminal/transcript text is NEVER delivered to Telegram — the ' +
     'user sees only what you send through the reply tool. After a long ' +
     'tool sequence (scheduling, multi-step research, sub-agent handback), ' +
@@ -5389,7 +5572,7 @@ export function reconcileAgent(
   const hindsightBankId = agentConfig.memory?.collection ?? name;
   const hindsightApiBaseUrl = (switchroomConfig.memory?.config?.url as string | undefined)
     ? (switchroomConfig.memory!.config!.url as string).replace(/\/mcp\/?$/, "").replace(/\/$/, "")
-    : "http://127.0.0.1:8888";
+    : HINDSIGHT_DEFAULT_API_BASE_URL;
   const hindsightRecallMaxMemories = agentConfig.memory?.recall?.max_memories;
   const hindsightRecallCacheTtlSecs = agentConfig.memory?.recall?.cache_ttl_secs;
   const hindsightRecallMinOverlap = agentConfig.memory?.recall?.min_overlap;
@@ -5404,6 +5587,15 @@ export function reconcileAgent(
     agentConfig.memory?.recall?.skip_trivial === undefined
       ? undefined
       : String(agentConfig.memory.recall.skip_trivial);
+  // #2848 Stage B — directive-capture nudge cascade. undefined unless the
+  // operator overrode the switchroom default (on). Exported only when set
+  // (see start.sh.hbs), so an unset value leaves the on-by-default
+  // settings.json override in force. Top-level memory.* knob (not under
+  // memory.recall) — it gates a correction-detection nudge, not recall tuning.
+  const hindsightDirectiveCaptureNudge =
+    agentConfig.memory?.directive_capture_nudge === undefined
+      ? undefined
+      : String(agentConfig.memory.directive_capture_nudge);
   // PR6 — mirror scaffoldAgent's computation. Both paths feed
   // buildWorkspaceContext, so the template sees identical shape.
   const topicAliases = agentConfig.channels?.telegram?.topic_aliases;
@@ -5485,6 +5677,7 @@ export function reconcileAgent(
       hindsightRecallMinOverlap,
       hindsightRecallTypes,
       hindsightRecallSkipTrivial,
+      hindsightDirectiveCaptureNudge,
       // PR6 — supergroup-mode topic tagging env vars. Same gate as
       // buildWorkspaceContext: only emit the shell-quoted JSON when
       // we actually have a topic_aliases map.
@@ -6036,7 +6229,7 @@ export function reconcileAgent(
         },
         // Tool-search right-sizing (P4-B): the server is NO LONGER pinned
         // wholesale. The bridge pins the load-bearing hot tools (reply /
-        // stream_reply / get_recent_messages / react / edit_message /
+        // get_recent_messages / react / edit_message /
         // send_typing / download_attachment) individually via the native
         // per-tool `_meta["anthropic/alwaysLoad"]` annotation, so they
         // never defer (no orphaned-reply round-trip), while the ~14 cold
@@ -6188,6 +6381,7 @@ export function reconcileAgent(
       hindsightRecallMinOverlap,
       hindsightRecallTypes,
       hindsightRecallSkipTrivial,
+      hindsightDirectiveCaptureNudge,
       hindsightTopicAliasesJson,
       hindsightSenderBanksJson,
       hindsightTopicFilterMode,
@@ -6300,15 +6494,32 @@ export function reconcileAgent(
     bankOpsChain.then((bankReady) => {
       if (!bankReady) return;
 
-      if (agentConfig.memory?.bank_mission || agentConfig.memory?.retain_mission) {
-        const missions: { bank_mission?: string; retain_mission?: string } = {};
-        if (agentConfig.memory?.bank_mission) {
-          missions.bank_mission = agentConfig.memory.bank_mission;
-        }
-        if (agentConfig.memory?.retain_mission) {
-          missions.retain_mission = agentConfig.memory.retain_mission;
-        }
+      // Reconcile still does NOT seed the DEFAULT_RETAIN_MISSION (that stays
+      // scaffold-only, so an operator's customized retain mission is never
+      // clobbered). But it DOES push reflect_mission / observations_mission /
+      // disposition — including the built-in profile defaults — so EXISTING
+      // banks pick up Phase 2 changes on `switchroom apply`, not only fresh
+      // ones. Config wins over profile defaults; disposition merges per-key.
+      const extras = resolveBankMissionExtras(
+        agentConfig.memory,
+        agentConfig.extends ?? DEFAULT_PROFILE,
+      );
 
+      const missions: {
+        bank_mission?: string;
+        retain_mission?: string;
+        reflect_mission?: string;
+        observations_mission?: string;
+        disposition?: { skepticism?: number; literalism?: number; empathy?: number };
+      } = { ...extras };
+      if (agentConfig.memory?.bank_mission) {
+        missions.bank_mission = agentConfig.memory.bank_mission;
+      }
+      if (agentConfig.memory?.retain_mission) {
+        missions.retain_mission = agentConfig.memory.retain_mission;
+      }
+
+      if (Object.keys(missions).length > 0) {
         updateBankMissions(apiUrl, hindsightBankId, missions, { timeoutMs: 5000 })
           .then((result) => {
             if (result.ok) {
@@ -6321,6 +6532,29 @@ export function reconcileAgent(
             console.warn(`  ${chalk.yellow("⚠")} Bank mission update error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
           });
       }
+
+      // Ensure operator-DECLARED per-specialist mental models (Phase 5) on
+      // reconcile too — declared models are the desired steady state, so a
+      // newly-added declaration lands on the next apply/restart. Only named
+      // models are created; nothing is auto-seeded. Best-effort; never blocks.
+      ensureDeclaredMentalModels(
+        apiUrl,
+        hindsightBankId,
+        agentConfig.memory?.mental_models,
+        { timeoutMs: 5000 },
+      )
+        .then((outcomes) => {
+          for (const o of outcomes) {
+            if (o.ok) {
+              console.log(`  ${chalk.green("✓")} Mental model "${o.name}" ready for ${formatAgentBankLabel(name, hindsightBankId)}`);
+            } else {
+              console.warn(`  ${chalk.yellow("⚠")} Failed to ensure mental model "${o.name}" for ${formatAgentBankLabel(name, hindsightBankId)}: ${o.reason}`);
+            }
+          }
+        })
+        .catch((err) => {
+          console.warn(`  ${chalk.yellow("⚠")} Mental model ensure error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
+        });
     });
   }
 

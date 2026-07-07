@@ -8,7 +8,7 @@
  * (`SILENCE_FALLBACK_MS`, default 300 000 ms) even while it is visibly
  * progressing. The silence clock is reset by:
  *
- *   - A fresh `reply` or `stream_reply` first-emit (any real user-visible send).
+ *   - A fresh `reply` first-emit (any real user-visible send).
  *   - `SILENCE_LIVENESS_PRODUCTION` ON (the default): a new tool-activity label
  *     appearing on the feed, or an answer-stream draft update.
  *

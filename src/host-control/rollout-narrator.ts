@@ -159,6 +159,12 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
    */
   private static seqFor(phase: RolloutPhase): number {
     switch (phase.phase) {
+      case "self-bump":
+      case "self-bump-done":
+        // #2645 — hostd self-refresh precedes the roll proper. Co-timed with
+        // apply's window (equal-seq is refine-only, and the daemon feeds
+        // self-bump → self-bump-done → apply strictly in order).
+        return 0;
       case "apply":
         return 0; // always first
       case "canary-start":

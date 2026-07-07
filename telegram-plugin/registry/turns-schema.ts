@@ -108,6 +108,18 @@ export interface Turn {
    * cleanly-restarted (`'restart'`) orphans.
    */
   interrupt_reason: string | null
+  /**
+   * Ms epoch at which a boot-resume/report inbound was durably queued for
+   * this interrupted turn (see `markTurnResumed`). It is the at-most-once
+   * ledger for resume: `findLatestTurnIfInterrupted` treats a turn with a
+   * non-null `resumed_at` as already handled and never re-fires it. This
+   * distinguishes "we already committed a resume for this turn (side
+   * effects may have run)" from "work incomplete, never resumed" — closing
+   * the accept-vs-consume double-execution window (#2793 part A) where the
+   * "latest turn not clean" proxy re-minted a fresh resume on every restart.
+   * Null for turns that were never resumed.
+   */
+  resumed_at: number | null
   created_at: number
   updated_at: number
 }
@@ -148,6 +160,7 @@ const SCHEMA_SQL = `
     assistant_reply_preview TEXT,
     tool_call_count         INTEGER,
     interrupt_reason        TEXT,
+    resumed_at              INTEGER,
     created_at              INTEGER NOT NULL,
     updated_at              INTEGER NOT NULL
   );
@@ -169,6 +182,14 @@ const PHASE2_MIGRATIONS = [
   `ALTER TABLE turns ADD COLUMN interrupt_reason TEXT`,
 ]
 
+// Column added for at-most-once resume (#2793 part A). Stamped when the
+// gateway durably queues a boot-resume inbound for an interrupted turn, so a
+// subsequent restart cannot re-mint a fresh resume for the same turn (which
+// would re-run side effects that already executed before the crash).
+const PHASE3_MIGRATIONS = [
+  `ALTER TABLE turns ADD COLUMN resumed_at INTEGER`,
+]
+
 function applySchema(db: SqliteDatabase): void {
   db.exec('PRAGMA journal_mode = WAL')
   db.exec('PRAGMA synchronous = NORMAL')
@@ -185,7 +206,7 @@ function applySchema(db: SqliteDatabase): void {
   // Run migrations. SQLite doesn't support "ADD COLUMN IF NOT EXISTS", so
   // we swallow the "duplicate column" error to stay idempotent on
   // pre-existing registry.db files.
-  for (const sql of [...PHASE1_MIGRATIONS, ...PHASE2_MIGRATIONS]) {
+  for (const sql of [...PHASE1_MIGRATIONS, ...PHASE2_MIGRATIONS, ...PHASE3_MIGRATIONS]) {
     try {
       db.exec(sql)
     } catch (err) {
@@ -261,6 +282,7 @@ interface RawTurnRow {
   assistant_reply_preview: string | null
   tool_call_count: number | null
   interrupt_reason: string | null
+  resumed_at: number | null
   created_at: number
   updated_at: number
 }
@@ -281,6 +303,7 @@ function mapRow(row: RawTurnRow): Turn {
     assistant_reply_preview: row.assistant_reply_preview,
     tool_call_count: row.tool_call_count,
     interrupt_reason: row.interrupt_reason,
+    resumed_at: row.resumed_at,
     created_at: row.created_at,
     updated_at: row.updated_at,
   }
@@ -474,6 +497,84 @@ export function markOrphanedWithTimeoutClassification(
   return { reaped: (timeoutTurnKey ? 1 : 0) + rest.changes, timeoutTurnKey }
 }
 
+export interface ReapStaleOpenTurnsOpts {
+  /**
+   * The set of turn_keys that belong to a turn still LIVE in this process's
+   * memory (the gateway's `currentTurnMap` registry keys plus the singleton
+   * `currentTurn` mirror). A row whose turn_key is in this set is NEVER
+   * reaped — it is a genuinely in-flight turn whose spinner must keep
+   * spinning, however long it runs. This is the load-bearing liveness
+   * predicate: age alone must never reap; only an open row with NO live
+   * owner qualifies.
+   */
+  activeTurnKeys: ReadonlySet<string>
+  /**
+   * Minimum age (ms, measured from `started_at`) before an ownerless open row
+   * is swept. A secondary guard against races — a turn that has JUST started
+   * but not yet populated the live set (or a row recorded microseconds ago) is
+   * protected until it ages past this. Liveness (activeTurnKeys) does the real
+   * work; the TTL only closes the "recorded-but-not-yet-tracked" window.
+   */
+  ttlMs: number
+  /** Injectable clock for tests. */
+  now?: number
+}
+
+export interface ReapStaleOpenTurnsResult {
+  /** Rows stamped `ended_via='restart'` by this sweep. */
+  reaped: number
+  /** The turn_keys that were stamped, for logging / card finalization. */
+  reapedTurnKeys: string[]
+}
+
+/**
+ * Mid-session periodic reaper (#2918). The boot-time
+ * `markOrphanedWithTimeoutClassification` only runs once, right after
+ * `openTurnsDb` — so a turn whose owning process dies MID-session (the SDK
+ * subprocess is SIGKILLed / OOMs / crashes) without a clean `recordTurnEnd`
+ * leaves its row `ended_at IS NULL`, and its activity card keeps spinning
+ * until the NEXT gateway boot (often many hours later). This sweep runs on a
+ * periodic timer inside the live gateway and stamps those ownerless open rows
+ * `ended_via='restart'` (the same clean-interrupt classification the boot
+ * reaper uses for a non-hung orphan) so the stale card can be finalized
+ * without waiting for a restart.
+ *
+ * CORRECTNESS: only rows that are BOTH (a) not owned by any live turn
+ * (`turn_key ∉ activeTurnKeys`) AND (b) older than `ttlMs` are swept. A
+ * healthy in-flight turn — however long it runs — is always in
+ * `activeTurnKeys` and is never touched. Never invents a new state; reuses
+ * `'restart'` so the existing resume/report policy applies unchanged.
+ */
+export function reapStaleOpenTurns(
+  db: SqliteDatabase,
+  opts: ReapStaleOpenTurnsOpts,
+): ReapStaleOpenTurnsResult {
+  const now = opts.now ?? Date.now()
+  const cutoff = now - opts.ttlMs
+  // Candidate = open row aged past the TTL. Liveness is filtered in JS against
+  // the injected active set (avoids brittle SQL IN-list binding).
+  const candidates = db.prepare(`
+    SELECT turn_key FROM turns
+    WHERE ended_at IS NULL AND started_at <= ?
+  `).all(cutoff) as { turn_key: string }[]
+
+  const stamp = db.prepare(`
+    UPDATE turns
+    SET ended_at   = ?,
+        ended_via  = 'restart',
+        updated_at = ?
+    WHERE turn_key = ? AND ended_at IS NULL
+  `)
+
+  const reapedTurnKeys: string[] = []
+  for (const { turn_key } of candidates) {
+    if (opts.activeTurnKeys.has(turn_key)) continue // live — never reap
+    const r = stamp.run(now, now, turn_key) as { changes: number }
+    if (r.changes > 0) reapedTurnKeys.push(turn_key)
+  }
+  return { reaped: reapedTurnKeys.length, reapedTurnKeys }
+}
+
 /**
  * Return the most recent N turns for `chatId` (any state — running or ended),
  * ordered by started_at DESC. Used by the idle-footer renderer to decide
@@ -560,6 +661,38 @@ const INTERRUPTED_VIA: ReadonlySet<TurnEndedVia> = new Set<TurnEndedVia>([
 ])
 
 /**
+ * Stamp `resumed_at` on an interrupted turn at the moment the gateway has
+ * DURABLY committed to resuming it (the boot-resume inbound is on the
+ * inbound spool / in-memory buffer). This is the at-most-once ledger for
+ * resume: once stamped, `findLatestTurnIfInterrupted` no longer returns the
+ * turn, so a subsequent restart cannot mint a SECOND, distinct resume for
+ * the same turn and re-run side effects that already executed before the
+ * crash (#2793 part A).
+ *
+ * Ordering matters: the caller must stamp only AFTER the resume inbound is
+ * durably spooled (synchronously, before any async delivery can ack it), so
+ * a crash between "decide to resume" and "persist the resume" can never mark
+ * a turn resumed that was never actually spooled. The spool's own
+ * at-least-once redelivery (keyed on `resume_turn_key`) still guarantees the
+ * one committed resume is delivered; this ledger only prevents re-minting.
+ *
+ * Idempotent and first-write-wins: an already-stamped turn keeps its
+ * original `resumed_at`. No-ops if `turnKey` is not found.
+ */
+export function markTurnResumed(
+  db: SqliteDatabase,
+  turnKey: string,
+  now: number = Date.now(),
+): void {
+  db.prepare(`
+    UPDATE turns
+    SET resumed_at = ?,
+        updated_at = ?
+    WHERE turn_key = ? AND resumed_at IS NULL
+  `).run(now, now, turnKey)
+}
+
+/**
  * Return the single most-recently-started turn IFF it was interrupted
  * (`ended_at IS NULL`, or `ended_via` in {restart, sigterm, timeout,
  * unknown}). Returns null when the latest turn ended cleanly (`'stop'`)
@@ -576,6 +709,14 @@ const INTERRUPTED_VIA: ReadonlySet<TurnEndedVia> = new Set<TurnEndedVia>([
  * Ordering uses `started_at DESC` (not `updated_at`) so the boot reaper,
  * which mass-stamps orphans with identical timestamps, can't reorder the
  * temporal "last turn" the user actually remembers.
+ *
+ * At-most-once (#2793 part A): a turn that already carries `resumed_at` was
+ * committed to a resume on an earlier boot. Even if it never reached a clean
+ * `'stop'` (its resume ran side effects but the process died before the
+ * follow-up turn wrote `ended_at`, or the resume inbound was accepted but
+ * never consumed), it is NOT re-fired — the "latest turn not clean" proxy
+ * would otherwise re-mint a fresh resume on every restart and double-execute
+ * side effects. Resume is at-most-once per turn.
  */
 export function findLatestTurnIfInterrupted(db: SqliteDatabase): Turn | null {
   const row = db.prepare(`
@@ -585,6 +726,7 @@ export function findLatestTurnIfInterrupted(db: SqliteDatabase): Turn | null {
   `).get() as RawTurnRow | undefined
   if (!row) return null
   const turn = mapRow(row)
+  if (turn.resumed_at != null) return null
   if (turn.ended_at == null) return turn
   if (turn.ended_via != null && INTERRUPTED_VIA.has(turn.ended_via)) return turn
   return null

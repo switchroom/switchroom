@@ -8,6 +8,8 @@ import {
   renderActivityFeedWithNested,
   renderActivityHeader,
   formatFeedElapsed,
+  formatStepSuffix,
+  STEP_TIMER_MIN_MS,
   type SessionActivityHeader,
 } from "../tool-activity-summary.js";
 import { STATUS_ROLLING_LINES, STATUS_LINE_MAX } from "../status-no-truncate.js";
@@ -779,6 +781,20 @@ describe("formatFeedElapsed — elapsed formatter", () => {
     expect(formatFeedElapsed(60_000)).toBe("1m00s");
     expect(formatFeedElapsed(65_000)).toBe("1m05s");
     expect(formatFeedElapsed(125_000)).toBe("2m05s");
+  });
+});
+
+describe("formatStepSuffix — per-step suffix with 10s gate", () => {
+  it("returns empty string while the step is younger than STEP_TIMER_MIN_MS", () => {
+    expect(formatStepSuffix(0)).toBe("");
+    expect(formatStepSuffix(9_999)).toBe("");
+    expect(formatStepSuffix(STEP_TIMER_MIN_MS - 1)).toBe("");
+  });
+
+  it("renders ` · <elapsed>` once the step reaches the gate", () => {
+    expect(formatStepSuffix(STEP_TIMER_MIN_MS)).toBe(" · 10s");
+    expect(formatStepSuffix(13_000)).toBe(" · 13s");
+    expect(formatStepSuffix(65_000)).toBe(" · 1m05s");
   });
 });
 

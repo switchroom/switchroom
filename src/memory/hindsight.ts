@@ -1,5 +1,6 @@
 import type { SwitchroomConfig, MemoryBackendConfig } from "../config/schema.js";
 import { resolveUsers } from "../config/users.js";
+import { HINDSIGHT_DEFAULT_API_PORT, HINDSIGHT_DEFAULT_MCP_URL } from "../setup/hindsight.js";
 
 export interface McpServerConfig {
   type?: string;
@@ -26,17 +27,17 @@ export interface McpServerConfig {
  * Generate the MCP server config entry for Hindsight.
  *
  * Hindsight exposes MCP via Streamable HTTP at /mcp/. The host/port can be
- * overridden in switchroom.yaml's memory.config.url; defaults to localhost:8888
- * (the upstream default). Note that 8888 conflicts with Coolify and other
- * common services — host the container on 18888 and set memory.config.url
- * accordingly.
+ * overridden in switchroom.yaml's memory.config.url; defaults to 127.0.0.1:18888
+ * (HINDSIGHT_DEFAULT_MCP_URL). The upstream default of 8888 conflicts with
+ * Coolify, nginx front-proxies and tunnel gateways — hence the 18888 default,
+ * which the launcher binds and the scaffolding writes in lockstep.
  */
 export function generateHindsightMcpConfig(
   collection: string,
   memoryConfig: MemoryBackendConfig,
 ): McpServerConfig {
   const url = (memoryConfig.config?.url as string | undefined)
-    ?? "http://localhost:8888/mcp/";
+    ?? HINDSIGHT_DEFAULT_MCP_URL;
   return {
     type: "http",
     url,
@@ -67,8 +68,8 @@ export function generateDockerComposeSnippet(
     "hindsight:",
     "  image: ghcr.io/vectorize-io/hindsight:latest",
     "  ports:",
-    "    - \"8888:8888\"",
-    "    - \"9999:9999\"",
+    `    - "${HINDSIGHT_DEFAULT_API_PORT}:8888"`,
+    "    - \"19999:9999\"",
     "  environment:",
     ...envLines,
     "  volumes:",
@@ -189,6 +190,103 @@ export const DEFAULT_RETAIN_MISSION =
   "Extract user preferences, ongoing projects, recurring commitments, " +
   "important context, and durable facts that should help across future " +
   "conversations. Skip one-off chatter and temporary task noise.";
+
+/**
+ * Hindsight bank disposition traits (1-5 each). Mirrors the engine's flat
+ * `disposition_skepticism` / `disposition_literalism` / `disposition_empathy`
+ * config fields (confirmed against the live `/v1/bank-template-schema`:
+ * integers 1-5, engine default 3 when null). switchroom models them as one
+ * nested object for ergonomic YAML and flattens at the API boundary.
+ */
+export interface BankDisposition {
+  skepticism?: number;
+  literalism?: number;
+  empathy?: number;
+}
+
+/**
+ * Extra bank-mission fields threaded through the config cascade (Phase 2 of
+ * `reference/rfcs/hindsight-synthesis-layers.md` — "a persona without its own
+ * memory is cosplay"; banks should be *specialized*, not merely isolated).
+ *
+ * `reflect_mission` and `observations_mission` are string config fields;
+ * `disposition` flattens to the three `disposition_*` integer fields.
+ */
+export interface BankMissionExtras {
+  reflect_mission?: string;
+  observations_mission?: string;
+  disposition?: BankDisposition;
+}
+
+/**
+ * Code-level memory defaults keyed by built-in **filesystem** profile
+ * (`agents.<name>.extends`). These differentiate the specialists so the
+ * feature works on a fresh `switchroom setup` with zero YAML (defaults
+ * principle) — a coach leans empathy-high, an analyst/EA leans skeptical and
+ * literal. Operator config (already cascaded) overrides these per-key.
+ *
+ * Only `disposition` + `observations_mission` are defaulted here; the
+ * persona statement (`reflect_mission` / `bank_mission`) stays operator-driven
+ * so there is no code-vs-yaml persona conflict. Profiles not listed inherit
+ * the engine default (all traits 3, no observations mission).
+ */
+export const PROFILE_MEMORY_DEFAULTS: Record<string, BankMissionExtras> = {
+  "health-coach": {
+    disposition: { skepticism: 2, literalism: 2, empathy: 5 },
+    observations_mission:
+      "Synthesise the person's wellbeing patterns, motivations, and emotional " +
+      "context — how habits, setbacks, and encouragement connect over time.",
+  },
+  "executive-assistant": {
+    disposition: { skepticism: 4, literalism: 4, empathy: 3 },
+  },
+  coding: {
+    disposition: { skepticism: 4, literalism: 5, empathy: 2 },
+  },
+};
+
+/**
+ * Merge two dispositions per-key (override wins on each trait, inherits the
+ * rest). Returns undefined when neither side sets anything.
+ */
+function mergeDisposition(
+  base: BankDisposition | undefined,
+  over: BankDisposition | undefined,
+): BankDisposition | undefined {
+  if (!base && !over) return undefined;
+  const merged: BankDisposition = { ...(base ?? {}), ...(over ?? {}) };
+  return Object.keys(merged).length > 0 ? merged : undefined;
+}
+
+/**
+ * Resolve the effective {@link BankMissionExtras} for an agent by layering
+ * the resolved memory config over the built-in profile defaults
+ * ({@link PROFILE_MEMORY_DEFAULTS}). Config wins; disposition merges per-key.
+ *
+ * Used by BOTH the scaffold and reconcile bank-update paths in
+ * `src/agents/scaffold.ts`, so existing banks pick up profile/config changes
+ * on `switchroom apply` — not only freshly scaffolded ones.
+ */
+export function resolveBankMissionExtras(
+  memory:
+    | { reflect_mission?: string; observations_mission?: string; disposition?: BankDisposition }
+    | undefined,
+  profileName: string,
+): BankMissionExtras {
+  const pd = PROFILE_MEMORY_DEFAULTS[profileName] ?? {};
+  const out: BankMissionExtras = {};
+
+  const reflect = memory?.reflect_mission ?? pd.reflect_mission;
+  if (reflect != null) out.reflect_mission = reflect;
+
+  const observations = memory?.observations_mission ?? pd.observations_mission;
+  if (observations != null) out.observations_mission = observations;
+
+  const disposition = mergeDisposition(pd.disposition, memory?.disposition);
+  if (disposition) out.disposition = disposition;
+
+  return out;
+}
 
 /**
  * Parse a Hindsight MCP response body.
@@ -341,23 +439,66 @@ export async function probeHindsight(
 }
 
 /**
- * Ensure the user-profile Mental Model exists for a bank.
+ * A single operator-declared mental model for a bank.
  *
- * Creates the Mental Model if it doesn't exist, idempotent on subsequent calls.
- * The MM is pre-computed via reflection and answers "what do we know about the user?"
+ * These are the Phase-5 "curated per-specialist" models: named, opt-in,
+ * operator-authored in `switchroom.yaml` (`memory.mental_models`). Unlike the
+ * retired auto-seeded "user-profile" model (#2447), NOTHING is created unless
+ * the operator explicitly declares it — so zero declarations means zero models,
+ * exactly matching post-#2447 behaviour. This deliberately does NOT reintroduce
+ * a fixed identity model: "who the user is" stays owned by the dedicated profile
+ * banks (`users.*.profile_bank`), never a per-agent mental model.
+ */
+export interface MentalModelSpec {
+  /** Stable model name (the identity key for idempotent ensure). */
+  name: string;
+  /** The reflection query the model answers, refreshed from bank content. */
+  sourceQuery: string;
+  /**
+   * When true, Hindsight refreshes the model after each consolidation. Defaults
+   * OFF (undefined) — refresh adds bounded background model-spend + timeout risk
+   * (see RFC Phase 5), so it is opt-in per model.
+   */
+  refreshAfterConsolidation?: boolean;
+  /** Optional cap on the synthesized model's token size. */
+  maxTokens?: number;
+}
+
+/**
+ * Ensure a single, operator-declared Mental Model exists for a bank.
+ *
+ * Idempotent: creates the model if no model with `spec.name` exists, otherwise
+ * a no-op success. Matches existence by exact item NAME (a substring check
+ * false-positives across sibling models — see the history in the list step).
  *
  * @param apiUrl Hindsight MCP endpoint (e.g. "http://127.0.0.1:18888/mcp/")
  * @param bankId The bank ID to create the MM in
- * @param opts Optional fetch implementation and timeout
+ * @param spec   The declared model (name + source_query + optional knobs)
+ * @param opts   Optional fetch implementation and timeout
  * @returns {ok: true} on success, {ok: false, reason} on error
  */
-export async function ensureUserProfileMentalModel(
+export async function ensureMentalModel(
   apiUrl: string,
   bankId: string,
+  spec: MentalModelSpec,
   opts?: { fetchImpl?: typeof fetch; timeoutMs?: number }
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
   const fetchImpl = opts?.fetchImpl ?? fetch;
   const timeoutMs = opts?.timeoutMs ?? 5000;
+
+  // Only send optional args when set — keeps the create payload minimal and
+  // schema-clean (props verified against tests/fixtures/hindsight-tools-list).
+  const createArguments: Record<string, unknown> = {
+    name: spec.name,
+    source_query: spec.sourceQuery,
+  };
+  if (spec.refreshAfterConsolidation !== undefined) {
+    createArguments.trigger_refresh_after_consolidation =
+      spec.refreshAfterConsolidation;
+  }
+  if (spec.maxTokens !== undefined) {
+    createArguments.max_tokens = spec.maxTokens;
+  }
 
   try {
     const controller = new AbortController();
@@ -442,7 +583,7 @@ export async function ensureUserProfileMentalModel(
         if (models && typeof models === "string") {
           const parsed = JSON.parse(models) as { items?: Array<{ name?: string }> };
           const items = Array.isArray(parsed?.items) ? parsed.items : [];
-          if (items.some((m) => m?.name === "user-profile")) {
+          if (items.some((m) => m?.name === spec.name)) {
             return { ok: true }; // Already exists (by exact name)
           }
         }
@@ -469,25 +610,18 @@ export async function ensureUserProfileMentalModel(
         method: "tools/call",
         params: {
           name: "create_mental_model",
-          arguments: {
-            name: "user-profile",
-            // The server's create_mental_model argument is `source_query`, not
-            // `query` (an upstream rename). Passing `query` returns HTTP 200
-            // with isError:true "Missing required argument: source_query" — and
-            // because the old code only checked `createResponse.ok` (HTTP
-            // status), it reported {ok:true} while creating NOTHING. That broke
-            // the user-profile mental model fleet-wide (the "knows you" feature):
-            // banks had zero mental models despite "ready". Fixed: correct arg +
-            // the isError check below.
-            source_query:
-              "What are the key facts, preferences, context, and communication style about the user I talk to? Summarize what matters for making the agent feel like it knows them.",
-            // NOTE: do NOT send `types` — create_mental_model's schema does not
-            // accept it (props: name, source_query, mental_model_id, tags,
-            // max_tokens, trigger_refresh_after_consolidation, bank_id), so the
-            // server SILENTLY DROPS it (isError stays false). The mental model
-            // draws across fact types from its source_query regardless. Adding a
-            // schema-unknown arg back here reds memory.hindsight-contract.fixture.
-          },
+          // The server's create_mental_model argument is `source_query`, not
+          // `query` (an upstream rename). Passing `query` returns HTTP 200 with
+          // isError:true "Missing required argument: source_query" — and if a
+          // caller only checked `createResponse.ok` (HTTP status), it would
+          // report {ok:true} while creating NOTHING (the isError check below
+          // guards that). Optional knobs (trigger_refresh_after_consolidation,
+          // max_tokens) are added by the caller in `createArguments` only when
+          // set. Do NOT add `types` — it is not in create_mental_model's schema
+          // (props: name, source_query, mental_model_id, tags, max_tokens,
+          // trigger_refresh_after_consolidation, bank_id); the server silently
+          // drops it and it reds memory.hindsight-contract.fixture.
+          arguments: createArguments,
         },
       }),
       signal: controller.signal,
@@ -523,6 +657,111 @@ export async function ensureUserProfileMentalModel(
     }
     return { ok: false, reason: String(err) };
   }
+}
+
+/**
+ * The source_query for the (retired-from-auto-wiring) user-profile model.
+ * Kept as a named constant so the dormant dashboard "Build profile" path and
+ * its tests share one definition. NOT auto-created by scaffold/reconcile any
+ * more (#2447) — dedicated profile banks own user identity.
+ */
+export const USER_PROFILE_SOURCE_QUERY =
+  "What are the key facts, preferences, context, and communication style about the user I talk to? Summarize what matters for making the agent feel like it knows them.";
+
+/**
+ * Ensure the user-profile Mental Model exists for a bank.
+ *
+ * DORMANT auto-wiring: scaffold/reconcile no longer call this (#2447 retired
+ * per-agent user-profile models in favour of dedicated profile banks). Kept for
+ * the operator-triggered dashboard "Build profile" path. Thin wrapper over the
+ * generalized {@link ensureMentalModel}.
+ */
+export async function ensureUserProfileMentalModel(
+  apiUrl: string,
+  bankId: string,
+  opts?: { fetchImpl?: typeof fetch; timeoutMs?: number }
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  return ensureMentalModel(
+    apiUrl,
+    bankId,
+    { name: "user-profile", sourceQuery: USER_PROFILE_SOURCE_QUERY },
+    opts
+  );
+}
+
+/**
+ * The raw shape of a `memory.mental_models[]` entry as it lands from
+ * switchroom.yaml (snake_case, post-cascade). Mapped to {@link MentalModelSpec}
+ * by {@link ensureDeclaredMentalModels}.
+ */
+export interface DeclaredMentalModelConfig {
+  name: string;
+  source_query: string;
+  refresh_after_consolidation?: boolean;
+  max_tokens?: number;
+}
+
+/**
+ * The result of ensuring one declared model, for legible scaffold/reconcile
+ * logging.
+ */
+export interface EnsureMentalModelOutcome {
+  name: string;
+  ok: boolean;
+  reason?: string;
+}
+
+/**
+ * Ensure every operator-DECLARED mental model exists for a bank (Phase 5).
+ *
+ * This is the invariant-clean replacement for the retired auto-seeding (#2447):
+ * it creates ONLY the models the operator named in `memory.mental_models`, so
+ * an agent with no declarations gets no models (identical to post-#2447
+ * behaviour). No fixed "user-profile" identity model is implied — that domain
+ * stays with the dedicated profile banks. Each model is ensured idempotently
+ * (create-if-absent by exact name); best-effort and never throws, so a slow or
+ * down Hindsight never blocks scaffold/reconcile.
+ *
+ * @param apiUrl  Hindsight MCP endpoint
+ * @param bankId  The agent's bank id
+ * @param models  The declared models (may be undefined / empty → no-op)
+ * @param opts    Optional fetch impl + per-model timeout
+ * @returns per-model outcomes (empty array when nothing was declared)
+ */
+export async function ensureDeclaredMentalModels(
+  apiUrl: string,
+  bankId: string,
+  models: DeclaredMentalModelConfig[] | undefined,
+  opts?: { fetchImpl?: typeof fetch; timeoutMs?: number }
+): Promise<EnsureMentalModelOutcome[]> {
+  if (!models || models.length === 0) return [];
+
+  const outcomes: EnsureMentalModelOutcome[] = [];
+  const seen = new Set<string>();
+  for (const m of models) {
+    // Defensive de-dupe (schema also rejects dupes) so one bad config can't
+    // double-create; first declaration wins.
+    if (seen.has(m.name)) continue;
+    seen.add(m.name);
+
+    const spec: MentalModelSpec = {
+      name: m.name,
+      sourceQuery: m.source_query,
+      refreshAfterConsolidation: m.refresh_after_consolidation,
+      maxTokens: m.max_tokens,
+    };
+    try {
+      const result = await ensureMentalModel(apiUrl, bankId, spec, opts);
+      outcomes.push(
+        result.ok
+          ? { name: m.name, ok: true }
+          : { name: m.name, ok: false, reason: result.reason }
+      );
+    } catch (err) {
+      outcomes.push({ name: m.name, ok: false, reason: String(err) });
+    }
+  }
+  return outcomes;
 }
 
 /**
@@ -693,7 +932,13 @@ export async function createBank(
 export async function updateBankMissions(
   apiUrl: string,
   bankId: string,
-  missions: { bank_mission?: string; retain_mission?: string },
+  missions: {
+    bank_mission?: string;
+    retain_mission?: string;
+    reflect_mission?: string;
+    observations_mission?: string;
+    disposition?: BankDisposition;
+  },
   opts?: { fetchImpl?: typeof fetch; timeoutMs?: number }
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
   const fetchImpl = opts?.fetchImpl ?? fetch;
@@ -761,13 +1006,34 @@ export async function updateBankMissions(
           // NOT a top-level `retain_mission` — that is a CONFIG field and must
           // go through `config_updates` (verified live: the server SILENTLY
           // DROPPED a top-level retain_mission, so the retain-steering half of
-          // every mission update was a live no-op). Route it correctly.
+          // every mission update was a live no-op). Every other steering field
+          // is a config field too and routes the same way.
+          //
+          // The engine stores the top-level `mission` as `config.reflect_mission`
+          // (verified live: switchroom's bank_mission lands there). So
+          // `reflect_mission` and `bank_mission` target the SAME field — when
+          // the explicit `reflect_mission` is set we route it through
+          // config_updates and drop the top-level `mission` so the two can't
+          // race; a bare `bank_mission` keeps the legacy top-level route.
           arguments: {
             bank_id: bankId,
-            ...(missions.bank_mission != null ? { mission: missions.bank_mission } : {}),
-            ...(missions.retain_mission != null
-              ? { config_updates: { retain_mission: missions.retain_mission } }
+            ...(missions.reflect_mission == null && missions.bank_mission != null
+              ? { mission: missions.bank_mission }
               : {}),
+            ...(() => {
+              const configUpdates: Record<string, unknown> = {};
+              if (missions.retain_mission != null)
+                configUpdates.retain_mission = missions.retain_mission;
+              if (missions.reflect_mission != null)
+                configUpdates.reflect_mission = missions.reflect_mission;
+              if (missions.observations_mission != null)
+                configUpdates.observations_mission = missions.observations_mission;
+              const d = missions.disposition;
+              if (d?.skepticism != null) configUpdates.disposition_skepticism = d.skepticism;
+              if (d?.literalism != null) configUpdates.disposition_literalism = d.literalism;
+              if (d?.empathy != null) configUpdates.disposition_empathy = d.empathy;
+              return Object.keys(configUpdates).length > 0 ? { config_updates: configUpdates } : {};
+            })(),
           },
         },
       }),

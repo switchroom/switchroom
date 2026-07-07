@@ -28,8 +28,9 @@ import { getSlotInfos, type SlotInfo } from "../auth/accounts.js";
 import type { AgentConfig, SwitchroomConfig } from "../config/schema.js";
 import { loadManifest, detectDrift, type DriftProbers } from "../manifest.js";
 import { probeHindsight, isHindsightEnabled, fetchHindsightToolsList, collectProfileBanks } from "../memory/hindsight.js";
+import { HINDSIGHT_DEFAULT_MCP_URL } from "../setup/hindsight.js";
 import { inspectBankHealth, staleMentalModels, corruptedMentalModels, recentUnextracted, ageDays } from "../memory/bank-health.js";
-import { checkHindsightContainerHealth, classifyToolContract } from "./doctor-memory.js";
+import { checkHindsightContainerHealth, classifyToolContract, checkHindsightHealthEndpoint, classifyConsolidationBacklog } from "./doctor-memory.js";
 import { isDockerMode, runDockerChecks } from "./doctor-docker.js";
 import { runAuthBrokerChecks } from "./doctor-auth-broker.js";
 import { runHostdChecks } from "./doctor-hostd.js";
@@ -987,7 +988,7 @@ export function checkHindsightConsumer(
       name: "hindsight consumer",
       status: "warn",
       detail:
-        `auth.consumers[hindsight] -> ${entry.account} (uid ${entry.uid ?? 0}); ` +
+        `auth.consumers[hindsight] -> ${entry.account ?? "(follows active)"} (uid ${entry.uid ?? 0}); ` +
         `couldn't query auth-broker container (not running / docker unavailable)`,
       fix:
         "Check `auth-broker: service health` row above; if the broker is " +
@@ -1000,7 +1001,7 @@ export function checkHindsightConsumer(
       name: "hindsight consumer",
       status: "warn",
       detail:
-        `auth.consumers[hindsight] -> ${entry.account} (uid ${entry.uid ?? 0}); ` +
+        `auth.consumers[hindsight] -> ${entry.account ?? "(follows active)"} (uid ${entry.uid ?? 0}); ` +
         `auth-broker is running but socket not bound at /run/switchroom/auth-broker/${entry.name}/sock`,
       fix:
         "Run `switchroom apply` to refresh compose and rebind per-consumer sockets.",
@@ -1010,7 +1011,7 @@ export function checkHindsightConsumer(
   return {
     name: "hindsight consumer",
     status: "ok",
-    detail: `auth.consumers[hindsight] -> ${entry.account} (uid ${entry.uid ?? 0})`,
+    detail: `auth.consumers[hindsight] -> ${entry.account ?? "(follows active)"} (uid ${entry.uid ?? 0})`,
   };
 }
 
@@ -1055,7 +1056,7 @@ function probeAuthBrokerSocket(
 export async function checkBankIngestHealth(
   config: SwitchroomConfig,
   url: string,
-  opts?: { fetchImpl?: typeof fetch; now?: Date },
+  opts?: { fetchImpl?: typeof fetch; now?: Date; includeConsolidationBacklog?: boolean },
 ): Promise<CheckResult[]> {
   const results: CheckResult[] = [];
   const now = opts?.now ?? new Date();
@@ -1079,6 +1080,25 @@ export async function checkBankIngestHealth(
       [bankId, agents, await inspectBankHealth(url, bankId, { fetchImpl: opts?.fetchImpl })] as const,
     ),
   );
+
+  // Fleet-wide consolidation backlog (#2903 fix 5.3): sum the pending-op
+  // count across every reachable bank so `switchroom doctor` shows the queue
+  // depth the #2894 throttle can silently build. Oldest-pending age isn't on
+  // the REST /stats surface (measurement follow-up: #2847), so age is unknown.
+  // Gated off by default so the per-bank ingest contract stays clean for
+  // callers/tests that only want bank rows; the CLI doctor opts in below.
+  let backlogRow: CheckResult | undefined;
+  if (opts?.includeConsolidationBacklog) {
+    let totalPending = 0;
+    let anyBankReachable = false;
+    for (const [, , h] of inspected) {
+      if (h.ok) {
+        anyBankReachable = true;
+        totalPending += h.pendingOperations;
+      }
+    }
+    if (anyBankReachable) backlogRow = classifyConsolidationBacklog(totalPending);
+  }
 
   for (const [bankId, agents, h] of inspected) {
     const label =
@@ -1156,6 +1176,7 @@ export async function checkBankIngestHealth(
     }
     results.push({ name: label, status: "ok", detail: summary });
   }
+  if (backlogRow) results.push(backlogRow);
   return results;
 }
 
@@ -1170,7 +1191,7 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
   }
 
   const url = (config.memory?.config?.url as string | undefined)
-    ?? "http://localhost:8888/mcp/";
+    ?? HINDSIGHT_DEFAULT_MCP_URL;
 
   const results: CheckResult[] = [];
 
@@ -1250,12 +1271,17 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
   // container's shm config + recent logs; no-ops on a remote/dockerless setup.
   results.push(...checkHindsightContainerHealth());
 
+  // Memory-down signal (#outage 2026-07): a GET /health != 200 means the
+  // backend is down / crash-looping — otherwise invisible, since auto-recall
+  // and retain fail with no user-facing error. Make the outage loud here.
+  results.push(await checkHindsightHealthEndpoint(url));
+
   // Per-agent bank ingest health (2026-06-10 incident class): a bank can be
   // reachable and growing while fact extraction silently yields ZERO memory
   // units per document (consumer quota wall / shm exhaustion) — the agent
   // keeps "remembering" nothing and no surface goes red. Inspect each bank's
   // REST surface for unextracted documents and stale mental models.
-  results.push(...(await checkBankIngestHealth(config, url)));
+  results.push(...(await checkBankIngestHealth(config, url, { includeConsolidationBacklog: true })));
 
   // Per-agent bank health checks
   for (const [agentName, agentConfig] of Object.entries(config.agents)) {
@@ -1386,7 +1412,7 @@ export function checkPendingRetainsQueue(
  * `switchroom doctor` run on a multi-agent host.
  * @internal exported for testing
  */
-export type ReadErrorKind = "enoent" | "eacces" | "other";
+type ReadErrorKind = "enoent" | "eacces" | "other";
 export function classifyReadError(err: unknown): ReadErrorKind {
   const code = (err as NodeJS.ErrnoException)?.code;
   if (code === "ENOENT") return "enoent";
@@ -1406,7 +1432,7 @@ export function classifyReadError(err: unknown): ReadErrorKind {
  *              fine; render as `warn`, not `fail`
  *   other    — anything else (corrupted FS, etc.); rare
  */
-export type FileReadResult =
+type FileReadResult =
   | { kind: "ok"; content: string }
   | { kind: "enoent" }
   | { kind: "eacces"; error: string }
@@ -2142,7 +2168,7 @@ export function mffEnvPath(config?: SwitchroomConfig): string {
  * can fully validate.
  * @internal exported for testing
  */
-export type MffEnvState = "absent" | "agent-private" | "readable";
+type MffEnvState = "absent" | "agent-private" | "readable";
 export function mffEnvState(envPath: string): MffEnvState {
   if (!existsSync(envPath)) return "absent";
   try {

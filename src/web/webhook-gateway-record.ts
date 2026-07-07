@@ -93,7 +93,23 @@ export interface RecordDeps {
    * land without a gateway restart (webhook events are infrequent).
    */
   loadConfig?: () => ReturnType<typeof loadSwitchroomConfig>
+  /**
+   * Consolidation-legibility sink (hindsight Phase 4). Called for a
+   * verified `hindsight` / `consolidation.completed` event with the agent's
+   * resolved channel target. The gateway owns the enablement gate, the
+   * materiality check, the rate limit, and the terse-line `sendMessage`;
+   * this handler stays send-free. Absent (or no chat target) → the event is
+   * still recorded above for audit, just not surfaced.
+   */
+  onConsolidation?: (
+    rec: WebhookGatewayRecord,
+    target: { chatId: string; threadId?: number },
+  ) => void
 }
+
+/** Wire source + event that drives the consolidation-legibility surface. */
+export const HINDSIGHT_WEBHOOK_SOURCE = 'hindsight'
+export const CONSOLIDATION_COMPLETED_EVENT = 'consolidation.completed'
 
 /**
  * Persist a forwarded webhook event and fire matching dispatch rules.
@@ -152,6 +168,40 @@ export function recordWebhookEvent(
   log(
     `webhook-gateway: agent='${agent}' source='${rec.source}' event='${rec.event_type}' recorded ts=${now}\n`,
   )
+
+  // ── Consolidation-legibility (hindsight Phase 4) ──────────────────────────
+  // A background `consolidation.completed` webhook. The event is already
+  // recorded above for audit; here we delegate to the gateway-supplied sink
+  // to (maybe) surface a terse "🧠 updated what I know about Y" line. It is
+  // NEVER injected as a model turn — this is a discrete status line, not a
+  // wake. Return without falling through to the dispatch-rule matcher.
+  if (
+    rec.source === HINDSIGHT_WEBHOOK_SOURCE &&
+    rec.event_type === CONSOLIDATION_COMPLETED_EVENT
+  ) {
+    try {
+      if (deps.onConsolidation) {
+        const config = (deps.loadConfig ?? loadSwitchroomConfig)()
+        const target = resolveChannelTarget(config, agent)
+        if (target) {
+          deps.onConsolidation(rec, {
+            chatId: target.chatId,
+            ...(target.threadId !== undefined ? { threadId: target.threadId } : {}),
+          })
+        } else {
+          log(
+            `consolidation-legibility: agent='${agent}' skipped — no chat target ` +
+              `(forum_chat_id / chat_id unset)\n`,
+          )
+        }
+      }
+    } catch (err) {
+      log(
+        `consolidation-legibility: agent='${agent}' surface error (event recorded): ${(err as Error).message}\n`,
+      )
+    }
+    return { status: 'ok', ts: now }
+  }
 
   // ── Linear AgentSessionEvent (#2298) ──────────────────────────────────────
   // A first-class Linear agent session (an @mention or a delegation) ALWAYS

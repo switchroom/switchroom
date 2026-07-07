@@ -386,6 +386,7 @@ export function getBuiltinDefaultSkillEntries(): BuiltinSkillEntry[] {
     "switchroom-status",
     "switchroom-health",
     "switchroom-runtime",
+    "mental-model-curator",
   ] as const;
   return [
     ...anthropic.map((key) => ({ key, optOutKey: key, source: "anthropic" as const })),

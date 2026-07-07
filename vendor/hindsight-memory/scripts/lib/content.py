@@ -167,13 +167,48 @@ def truncate_recall_query(query: str, latest_query: str, max_chars: int) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _is_tool_result_only_user_message(message: dict) -> bool:
+    """True when a ``role="user"`` message carries ONLY tool_result blocks.
+
+    SWITCHROOM DIVERGENCE (candidate to upstream to vectorize-io/hindsight):
+    Claude Code emits tool results as ``role="user"`` messages whose content
+    is a list of ``{"type": "tool_result", ...}`` blocks — they are NOT
+    human turns. A genuine human turn has text (a string, or a content list
+    with at least one non-tool_result block, e.g. ``{"type": "text"}`` or an
+    image). Treating tool_result messages as turn boundaries lets a tool-heavy
+    turn (≥N sequential tool rounds) fill a fixed-size retain window with
+    tool_result messages and push the actual human message OUTSIDE the window
+    — silently dropping the fact from that fire, and from every later fire
+    (whose window starts even further from the human message). On restart the
+    fact is gone. This helper lets the boundary counter skip those messages so
+    "window = N turns" means N *human* turns regardless of tool volume.
+    """
+    if message.get("role") != "user":
+        return False
+    content = message.get("content")
+    if isinstance(content, list):
+        blocks = [b for b in content if isinstance(b, dict)]
+        # A non-empty content list that is ENTIRELY tool_result blocks.
+        if blocks and all(b.get("type") == "tool_result" for b in blocks):
+            return True
+    return False
+
+
 def slice_last_turns_by_user_boundary(messages: list, turns: int) -> list:
     """Slice messages to the last N turns, where a turn starts at a user message.
 
     Port of: sliceLastTurnsByUserBoundary() in index.js
 
-    Walks backward counting user messages as turn boundaries. Returns
-    messages from the Nth user boundary to the end.
+    Walks backward counting GENUINE HUMAN user messages as turn boundaries.
+    Returns messages from the Nth human boundary to the end.
+
+    SWITCHROOM DIVERGENCE (candidate to upstream): tool_result messages carry
+    ``role="user"`` in the Claude Code transcript but are not human turns; they
+    are skipped as boundaries (see ``_is_tool_result_only_user_message``). This
+    keeps the fixed-size retain window anchored to human turns so a tool-heavy
+    turn can never push the human's fact outside the window (silent memory loss).
+    Affects both the retain window-slice and the recall context slice — both
+    want "N human turns", not "N transcript user-messages".
     """
     if not isinstance(messages, list) or not messages or turns <= 0:
         return []
@@ -182,7 +217,8 @@ def slice_last_turns_by_user_boundary(messages: list, turns: int) -> list:
     start_index = -1
 
     for i in range(len(messages) - 1, -1, -1):
-        if messages[i].get("role") == "user":
+        msg = messages[i]
+        if msg.get("role") == "user" and not _is_tool_result_only_user_message(msg):
             user_turns_seen += 1
             if user_turns_seen >= turns:
                 start_index = i
@@ -221,10 +257,13 @@ def format_memories(results: list) -> str:
 def format_current_time() -> str:
     """Format current UTC time for recall context.
 
+    The "UTC" suffix is explicit so client LLMs do not misread the
+    value as local time when reasoning about wall-clock context.
+
     Port of: formatCurrentTimeForRecall() in index.js
     """
     now = datetime.now(timezone.utc)
-    return now.strftime("%Y-%m-%d %H:%M")
+    return now.strftime("%Y-%m-%d %H:%M UTC")
 
 
 # ---------------------------------------------------------------------------

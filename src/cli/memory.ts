@@ -20,7 +20,9 @@ import {
   pickHindsightPorts,
   pullHindsightImage,
   getRunningHindsightPorts,
+  preflightHindsightPorts,
   HINDSIGHT_DEFAULT_API_PORT,
+  HINDSIGHT_DEFAULT_MCP_URL,
   type LiteLLMHindsightConfig,
 } from "../setup/hindsight.js";
 import { getViaBrokerStructured } from "../vault/broker/client.js";
@@ -43,7 +45,11 @@ async function resolveLiteLLMForHindsight(
   if (!topLiteLLM?.enabled || !topLiteLLM.base_url) return undefined;
   const result = await getViaBrokerStructured("litellm/hindsight/api-key").catch(() => null);
   if (!result || result.kind !== "ok" || result.entry.kind !== "string") return undefined;
-  return { baseUrl: topLiteLLM.base_url, apiKey: result.entry.value };
+  return {
+    baseUrl: topLiteLLM.base_url,
+    apiKey: result.entry.value,
+    model: config.memory?.config?.llm_model,
+  };
 }
 
 interface RecallLogEntry {
@@ -351,6 +357,41 @@ export function registerMemoryCommand(program: Command): void {
       let ports: { apiPort: number; uiPort: number };
       if (reusePorts) {
         ports = reusePorts;
+        // Migration hazard: --recreate pins the container to the SAME host
+        // port it currently publishes, but fresh scaffolding now defaults
+        // memory.config.url to HINDSIGHT_DEFAULT_API_PORT (18888). If the
+        // reused port diverges AND no agent has an explicit memory.config.url,
+        // agents may be repointed to a dead URL. Warn loudly; do NOT
+        // auto-migrate (too risky mid-recreate).
+        if (reusePorts.apiPort !== HINDSIGHT_DEFAULT_API_PORT) {
+          let explicitUrl: string | undefined;
+          try {
+            explicitUrl = getConfig(program).memory?.config?.url;
+          } catch {
+            explicitUrl = undefined;
+          }
+          if (!explicitUrl) {
+            console.log(
+              chalk.yellow(
+                `\n  ⚠  MIGRATION HAZARD: reusing stale host port ${reusePorts.apiPort} ` +
+                `for switchroom-hindsight, but scaffolding now defaults to ` +
+                `${HINDSIGHT_DEFAULT_API_PORT} and no explicit memory.config.url is set.`,
+              ),
+            );
+            console.log(
+              chalk.yellow(
+                `  Agents may be repointed to a dead URL (http://127.0.0.1:${HINDSIGHT_DEFAULT_API_PORT}/mcp/) ` +
+                `while the container listens on ${reusePorts.apiPort}.`,
+              ),
+            );
+            console.log(
+              chalk.yellow(
+                `  Fix: set memory.config.url: http://127.0.0.1:${reusePorts.apiPort}/mcp/ explicitly, ` +
+                `or migrate the container to port ${HINDSIGHT_DEFAULT_API_PORT}.\n`,
+              ),
+            );
+          }
+        }
       } else {
         try {
           ports = await pickHindsightPorts();
@@ -365,6 +406,45 @@ export function registerMemoryCommand(program: Command): void {
             `  Port ${HINDSIGHT_DEFAULT_API_PORT} is already in use; ` +
             `using ${ports.apiPort}/${ports.uiPort} instead.`
           )
+        );
+      }
+
+      // Preflight: NEVER hand an occupied host port to `docker run` — that's
+      // the 2026-07 outage (the --recreate path reused the previously-bound
+      // port with no free-check, so hindsight crash-looped on `[Errno 98]
+      // address already in use` while fleet memory was silently down). The
+      // reuse path (getRunningHindsightPorts) especially bypasses
+      // pickHindsightPorts entirely, so re-validate here for BOTH paths.
+      let conflict = await preflightHindsightPorts(ports);
+      if (conflict) {
+        const heldBy = conflict.holder ? ` (held by ${conflict.holder})` : "";
+        console.log(
+          chalk.yellow(
+            `\n  Chosen Hindsight port ${conflict.port} is occupied${heldBy}; ` +
+            `selecting a free port instead of crash-looping.`,
+          ),
+        );
+        // Re-pick from scratch (skips the occupied port via findFreePort).
+        try {
+          ports = await pickHindsightPorts();
+        } catch (err) {
+          console.error(chalk.red(`\n  ${(err as Error).message}\n`));
+          process.exit(1);
+        }
+        conflict = await preflightHindsightPorts(ports);
+        if (conflict) {
+          const stillHeldBy = conflict.holder ? ` (held by ${conflict.holder})` : "";
+          console.error(
+            chalk.red(
+              `\n  Refusing to start Hindsight: port ${conflict.port} is still ` +
+              `occupied${stillHeldBy} after reassignment. Free it and retry ` +
+              `\`switchroom memory --start\`.\n`,
+            ),
+          );
+          process.exit(1);
+        }
+        console.log(
+          chalk.green(`  Reassigned Hindsight to port ${ports.apiPort}/${ports.uiPort}.`),
         );
       }
 
@@ -584,7 +664,7 @@ export function registerMemoryCommand(program: Command): void {
           const collection = getCollectionForAgent(agent, config);
           const apiUrl =
             (config.memory?.config?.url as string | undefined) ??
-            "http://localhost:8888/mcp/";
+            HINDSIGHT_DEFAULT_MCP_URL;
           const timeoutMs = Math.max(500, parseInt(opts.timeout, 10) || 5000);
 
           console.log(
@@ -638,7 +718,7 @@ export function registerMemoryCommand(program: Command): void {
   // memory.recall.additional_banks. Single-tenant — the operator's own data
   // in the operator's Hindsight instance.
   const restBase = (url: string | undefined): string =>
-    (url ?? "http://127.0.0.1:8888/mcp/")
+    (url ?? HINDSIGHT_DEFAULT_MCP_URL)
       .replace(/\/mcp\/?$/, "")
       .replace(/\/$/, "");
   const VALID_BANK = /^[a-zA-Z0-9_.-]+$/;

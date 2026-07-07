@@ -47,6 +47,16 @@ describe("Dockerfile.agent bakes", () => {
       /COPY\s+dist\/agent-scheduler\/index\.js\s+\/opt\/switchroom\/agent-scheduler\/index\.js/,
     );
   });
+
+  // #2805: fleet-wide webkite render config baked at a non-HOME image path
+  // (start.sh.hbs seeds it to ~/.config/webkite/config.toml at boot). Without
+  // the COPY the image ships no render config and JS-heavy SPA pages return
+  // only the static shell.
+  it("bakes the fleet webkite render config", () => {
+    expect(dockerfile).toMatch(
+      /COPY\s+docker\/webkite\/config\.toml\s+\/opt\/switchroom\/webkite\/config\.toml/,
+    );
+  });
 });
 
 describe("Dockerfile.agent ships every hook script the scaffold invokes", () => {

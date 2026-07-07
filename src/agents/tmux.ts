@@ -7,11 +7,11 @@
 // callers (watchdog, lifecycle crash detector) treat capture failure
 // as best-effort and continue with the restart regardless.
 //
-// Naming/retention contract is shared with the bash mirror in
-// `bin/bridge-watchdog.sh` (capture_pane_before_restart). Keep the
-// two paths in sync: same socket convention (`switchroom-<agent>`),
-// same target session (`<agent>`), same output dir, same header
-// format. If you change one, change the other.
+// This is the sole implementation: same socket convention
+// (`switchroom-<agent>`), same target session (`<agent>`), same output
+// dir, same header format. (An earlier bash mirror,
+// `bin/bridge-watchdog.sh`'s `capture_pane_before_restart`, has been
+// removed.)
 
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";

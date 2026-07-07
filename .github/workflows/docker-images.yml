@@ -9,11 +9,30 @@ name: docker-images
 #   - tag push v*: same matrix, push as `:<tag>` and `:latest`.
 #   - pull_request: build only (no push) to validate Dockerfile changes.
 #
-# Two parallel pipelines:
-#   - build-base + build-dependents: switchroom-{base,agent,broker,kernel,
-#     hostd,auth-broker}. Dependents extend base, so base builds first.
+# Pipelines (perf rework, follows #2807):
+#   - build-base + build-dependents run as a PER-ARCH matrix on NATIVE
+#     runners (amd64 on ubuntu-latest, arm64 on ubuntu-24.04-arm) — no
+#     QEMU emulation. Each arch leg pushes a temporary
+#     `:sha-<short>-<arch>` tag; the merge-base / merge-dependents jobs
+#     then stitch the two arch images into the final multi-arch
+#     manifest (`:latest` / `:sha-<short>` / `:vX.Y.Z`) with
+#     `docker buildx imagetools create` — a manifest-only operation, no
+#     rebuild, no re-export. Registry build caches are per-arch
+#     (`:buildcache-<arch>`) so the two legs don't thrash each other.
 #   - build-hindsight: extends upstream `vectorize-io/hindsight:latest`,
 #     no switchroom-base dependency. Runs in parallel with build-base.
+#     DELIBERATELY still single-job multi-arch via QEMU: it's path-gated
+#     on main pushes and rarely builds, so the per-arch split isn't
+#     worth its job-count cost here.
+#   - build-voice: standalone CUDA image, amd64-only by design (see job
+#     comment) — no QEMU, no split.
+#
+# SBOM/provenance policy (WS9-F3, relaxed — operator-approved): full
+# `provenance: mode=max` + `sbom: true` attestation now runs on TAG
+# pushes (release artifacts) only. PR / main-push / dispatch builds set
+# provenance=false and sbom off — attestation generation + export was a
+# large share of every warm build's wall time, and the verification
+# story (`switchroom update` pull-side checks) targets release images.
 #
 # This workflow is staged at docs/proposed/docker-images.yml because the
 # OAuth token used to land code changes here lacks the `workflow` scope
@@ -43,9 +62,16 @@ permissions:
   contents: read
   packages: write
 
+# workflow_dispatch runs get their own concurrency group (keyed by
+# run id) so a busy merge train on main can't cancel a manually
+# requested full build — dispatch is the recovery lever for exactly
+# the case where push runs keep superseding each other before a
+# path-gated image (e.g. hindsight) gets rebuilt (#1336, and observed
+# live on 2026-07-05: three successive merges cancelled both the push
+# run carrying a hindsight pin bump and the recovery dispatch).
 concurrency:
-  group: docker-images-${{ github.ref }}
-  cancel-in-progress: true
+  group: docker-images-${{ github.event_name == 'workflow_dispatch' && format('dispatch-{0}', github.run_id) || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 env:
   REGISTRY: ghcr.io
@@ -54,8 +80,71 @@ env:
   IMAGE_NAMESPACE: ${{ github.repository_owner }}
 
 jobs:
-  build-base:
+  # ─── Path-change filter (sentinel pattern, see ci-lint.yml) ───────
+  # PRs that don't touch image inputs skip the whole build matrix —
+  # previously EVERY PR paid ~9 image builds. Filters live in
+  # .github/path-filters.yml (keys: images / hindsight / voice).
+  #
+  # Gating policy:
+  #   - build-base / build-dependents: PRs gated on `images`; every
+  #     non-PR event (main push, tag, dispatch) always builds — we
+  #     don't gamble on the release path. (The `images` filter is NOT
+  #     complete enough to skip main-push builds: dependents bake
+  #     dist/ bundles derived from all of src/, which the filter only
+  #     partially covers — see retag-unchanged below for the images
+  #     where a filter-driven skip IS sound.)
+  #   - build-hindsight / build-voice: also path-gated on MAIN PUSHES
+  #     (`hindsight` / `voice` keys) — they extend upstream bases, not
+  #     switchroom-base, and rarely change; their filters enumerate
+  #     their FULL build input set, so an unchanged filter provably
+  #     means an identical image. When skipped on a main push, the
+  #     retag-unchanged job re-points `:sha-<short>` at the existing
+  #     `:latest` manifest instead of re-building/re-exporting. Tags +
+  #     dispatch still always build them.
+  #
+  # This job itself skips on tag pushes / workflow_dispatch (dorny has
+  # no diff base there); downstream `if:`s use `!cancelled()` so a
+  # skipped `changes` doesn't auto-skip the builds on those events.
+  #
+  # NOTE (required checks): Ruleset 16470166 must require the
+  # `images-ok` sentinel below INSTEAD of the individual build jobs —
+  # a path-skipped required matrix context would hard-block irrelevant
+  # PRs (#1343 lesson). Because only the sentinel is required, the
+  # per-arch job renames in this rework don't touch branch protection;
+  # keep the sentinel's `needs` list complete when adding jobs.
+  changes:
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
+    timeout-minutes: 1
+    outputs:
+      images: ${{ steps.filter.outputs.images }}
+      hindsight: ${{ steps.filter.outputs.hindsight }}
+      voice: ${{ steps.filter.outputs.voice }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - name: Filter changed paths
+        id: filter
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706  # v4.0.2
+        with:
+          filters: .github/path-filters.yml
+
+  build-base:
+    needs: changes
+    # Non-PR events (main push / tag / dispatch): always build.
+    # PRs: only when image inputs changed. `!cancelled()` because
+    # `changes` is skipped on tag/dispatch and a skipped need would
+    # otherwise auto-skip this job.
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.images == 'true') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # PR validation: amd64 only — PRs don't merge until amd64 is
+        # green anyway, and the arm64 artifact is only consumed from
+        # main/tag pushes. Non-PR: both arches, each on a NATIVE
+        # runner (no QEMU).
+        arch: ${{ github.event_name == 'pull_request' && fromJSON('["amd64"]') || fromJSON('["amd64","arm64"]') }}
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -80,20 +169,12 @@ jobs:
           bun install
           npm run build
 
-      - name: Set up QEMU (only when arm64 build runs)
-        # QEMU is only needed for cross-arch arm64 emulation on amd64
-        # hosts. PR builds are amd64-only (see `platforms` below), so
-        # skip the QEMU setup — saves ~5s + cuts the resulting image
-        # surface area.
-        if: github.event_name != 'pull_request'
-        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3  # v4.1.0
-
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
 
       - name: Log in to GHCR (push only on main / tags)
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0  # v4.4.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -104,32 +185,25 @@ jobs:
         run: |
           IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/switchroom-base"
           SHA_SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
-          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            TAG_VERSION="${GITHUB_REF#refs/tags/}"
-            echo "tags=${IMAGE}:${TAG_VERSION},${IMAGE}:latest" >> "$GITHUB_OUTPUT"
-          elif [[ ( "${{ github.event_name }}" == "push" || "${{ github.event_name }}" == "workflow_dispatch" ) && "${{ github.ref }}" == "refs/heads/main" ]]; then
-            # PR C: keep :latest as the canonical install per
-            # docs/operators/install.md, BUT also publish :sha-<7> for
-            # rollback / promote.yml retagging. (The :dev floating tag
-            # is gated by the smoke-test job and assigned by a separate
-            # retag step below — NOT included in this initial push so
-            # that a failed smoke run can't leave a broken :dev behind.)
-            echo "tags=${IMAGE}:latest,${IMAGE}:sha-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
-          else
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             # PR builds: synthesize a non-pushed tag for build-only mode.
             echo "tags=${IMAGE}:pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          else
+            # Every push path (main / tag / dispatch) pushes ONLY the
+            # per-arch scratch tag here; merge-base assigns the real
+            # tags (:latest / :sha-<short> / :vX.Y.Z) from the merged
+            # multi-arch manifest. Nothing user-facing moves until the
+            # merge job runs, so a failed arch leg can't leave a
+            # single-arch :latest behind.
+            echo "tags=${IMAGE}:sha-${SHA_SHORT}-${{ matrix.arch }}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build (and push on main/tag) base
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+      - name: Build (and push on main/tag) base ${{ matrix.arch }}
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
         with:
           context: .
           file: docker/Dockerfile.base
-          # PR validation: amd64 only — arm64 via QEMU is ~3-4 min per
-          # image and PRs don't merge until amd64 is green anyway. Full
-          # multi-arch matrix runs on push to main + tags where the
-          # arm64 artifact is consumed by operators.
-          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
+          platforms: linux/${{ matrix.arch }}
           tags: ${{ steps.tags.outputs.tags }}
           push: ${{ github.event_name != 'pull_request' }}
           # Cache via GHCR registry, not type=gha (#1965). The GHA
@@ -142,13 +216,21 @@ jobs:
           # and a miss is a non-fatal cold build. cache-to is gated to
           # non-PR events: fork PRs have no GHCR write token, and a
           # failed cache export would break the required build check.
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/switchroom-base:buildcache
-          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}/switchroom-base:buildcache,mode=max,image-manifest=true,oci-mediatypes=true', github.repository_owner) || '' }}
-          # sec WS9-F3 (#1418): signed build provenance + SBOM so an
-          # operator's `switchroom update` pull can verify the image
-          # was built by THIS pipeline from THIS source (SLSA-style).
-          provenance: mode=max
-          sbom: true
+          #
+          # Per-arch cache tag (:buildcache-<arch>) so the native-runner
+          # legs don't overwrite each other's cache; the legacy mixed
+          # :buildcache is kept as a read-only fallback so the first
+          # run after this split isn't fully cold.
+          cache-from: |
+            type=registry,ref=ghcr.io/${{ github.repository_owner }}/switchroom-base:buildcache-${{ matrix.arch }}
+            type=registry,ref=ghcr.io/${{ github.repository_owner }}/switchroom-base:buildcache
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}/switchroom-base:buildcache-{1},mode=max,image-manifest=true,oci-mediatypes=true', github.repository_owner, matrix.arch) || '' }}
+          # sec WS9-F3 (#1418, relaxed per header): signed provenance +
+          # SBOM only on tag pushes — release artifacts are what
+          # `switchroom update` verifies; attestation on every main/PR
+          # build was pure export overhead.
+          provenance: ${{ startsWith(github.ref, 'refs/tags/v') && 'mode=max' || 'false' }}
+          sbom: ${{ startsWith(github.ref, 'refs/tags/v') }}
           # CACHE_BUST is paired with the `ARG CACHE_BUST` in
           # Dockerfile.base immediately before `npm install -g
           # @anthropic-ai/claude-code@latest`. `github.run_attempt`
@@ -162,12 +244,76 @@ jobs:
           build-args: |
             CACHE_BUST=${{ github.run_attempt }}
 
-  build-dependents:
+  # Stitch the per-arch base images into the final multi-arch manifest.
+  # Manifest-only (`imagetools create`): no rebuild, no layer re-export.
+  merge-base:
     needs: build-base
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && needs.build-base.result == 'success' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0  # v4.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge per-arch images into multi-arch tags
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/switchroom-base"
+          SHA_SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
+          # Stale-dispatch guard (#2818 follow-up): a workflow_dispatch
+          # on main runs against the tip AT DISPATCH TIME; if main has
+          # advanced since, pushing :latest would REGRESS it behind a
+          # newer push run's :latest. Skip :latest (keep :sha-<7>) when
+          # the checked-out sha is no longer main's tip. Fail-open: if
+          # ls-remote can't answer, keep pushing :latest — the guard is
+          # a safety net, not a new failure mode for the recovery lever.
+          PUSH_LATEST=true
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            MAIN_TIP=$(git ls-remote "https://github.com/${{ github.repository }}" refs/heads/main | cut -f1 || true)
+            if [[ -n "$MAIN_TIP" && "$MAIN_TIP" != "${{ github.sha }}" ]]; then
+              PUSH_LATEST=false
+              echo "::notice title=stale dispatch::checked-out ${{ github.sha }} is no longer main tip ($MAIN_TIP) — skipping :latest, pushing :sha-${SHA_SHORT} only."
+            fi
+          fi
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAG_VERSION="${GITHUB_REF#refs/tags/}"
+            TAG_ARGS=(-t "${IMAGE}:${TAG_VERSION}" -t "${IMAGE}:latest")
+          elif [[ "${{ github.ref }}" == "refs/heads/main" && "$PUSH_LATEST" == "true" ]]; then
+            # PR C: keep :latest as the canonical install per
+            # docs/operators/install.md, BUT also publish :sha-<7> for
+            # rollback / promote.yml retagging. (:dev is gated by the
+            # smoke-test job and assigned by promote-to-dev — never here.)
+            TAG_ARGS=(-t "${IMAGE}:latest" -t "${IMAGE}:sha-${SHA_SHORT}")
+          else
+            # dispatch on a non-main/non-tag ref, or a stale main
+            # dispatch: publish only the per-commit tag; never move
+            # :latest from an odd ref or an outdated main sha.
+            TAG_ARGS=(-t "${IMAGE}:sha-${SHA_SHORT}")
+          fi
+          docker buildx imagetools create "${TAG_ARGS[@]}" \
+            "${IMAGE}:sha-${SHA_SHORT}-amd64" \
+            "${IMAGE}:sha-${SHA_SHORT}-arm64"
+
+  build-dependents:
+    # Per-arch dependents FROM the per-arch base scratch tag pushed by
+    # build-base — no wait on merge-base (it runs in parallel).
+    needs: [changes, build-base]
+    # Same gate as build-base, plus an explicit success check on the
+    # base build — `!cancelled()` alone would let dependents run past
+    # a FAILED base (unlike the default all-needs-succeeded semantics
+    # it replaces).
+    if: ${{ !cancelled() && needs.build-base.result == 'success' && (github.event_name != 'pull_request' || needs.changes.outputs.images == 'true') }}
     strategy:
       fail-fast: false
       matrix:
+        arch: ${{ github.event_name == 'pull_request' && fromJSON('["amd64"]') || fromJSON('["amd64","arm64"]') }}
         image:
           - { name: agent,        file: docker/Dockerfile.agent }
           - { name: broker,       file: docker/Dockerfile.broker }
@@ -179,6 +325,7 @@ jobs:
           # job (PR #1310) that runs in parallel with build-base
           # because Dockerfile.hindsight extends upstream
           # `vectorize-io/hindsight:latest`, not switchroom-base.
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -203,16 +350,12 @@ jobs:
           bun install
           npm run build
 
-      - name: Set up QEMU (only when arm64 build runs)
-        if: github.event_name != 'pull_request'
-        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3  # v4.1.0
-
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
 
       - name: Log in to GHCR (push only on main / tags)
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0  # v4.4.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -224,25 +367,24 @@ jobs:
           IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/switchroom-${{ matrix.image.name }}"
           BASE="${REGISTRY}/${IMAGE_NAMESPACE}/switchroom-base"
           SHA_SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
-          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            TAG_VERSION="${GITHUB_REF#refs/tags/}"
-            echo "tags=${IMAGE}:${TAG_VERSION},${IMAGE}:latest" >> "$GITHUB_OUTPUT"
-            echo "base=${BASE}:${TAG_VERSION}" >> "$GITHUB_OUTPUT"
-          elif [[ ( "${{ github.event_name }}" == "push" || "${{ github.event_name }}" == "workflow_dispatch" ) && "${{ github.ref }}" == "refs/heads/main" ]]; then
-            echo "tags=${IMAGE}:latest,${IMAGE}:sha-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
-            echo "base=${BASE}:sha-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
-          else
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             echo "tags=${IMAGE}:pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
-            # On PRs the base wasn't pushed, so depend on local layer cache.
+            # On PRs the base wasn't pushed, so depend on the published
+            # :latest (multi-arch; buildx resolves the amd64 leg).
             echo "base=${BASE}:latest" >> "$GITHUB_OUTPUT"
+          else
+            # Per-arch scratch tag; merge-dependents assigns the real
+            # tags from the merged manifest (see build-base comment).
+            echo "tags=${IMAGE}:sha-${SHA_SHORT}-${{ matrix.arch }}" >> "$GITHUB_OUTPUT"
+            echo "base=${BASE}:sha-${SHA_SHORT}-${{ matrix.arch }}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build (and push on main/tag) ${{ matrix.image.name }}
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+      - name: Build (and push on main/tag) ${{ matrix.image.name }} ${{ matrix.arch }}
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
         with:
           context: .
           file: ${{ matrix.image.file }}
-          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
+          platforms: linux/${{ matrix.arch }}
           tags: ${{ steps.tags.outputs.tags }}
           push: ${{ github.event_name != 'pull_request' }}
           build-args: |
@@ -253,12 +395,65 @@ jobs:
           # hard-failed the build, blocking releases. Registry cache has no
           # SAS expiry; a miss degrades to a cold build. cache-to gated to
           # non-PR (fork PRs can't write GHCR; export failure would break
-          # the required check). Per-image :buildcache tag, mode=max.
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/switchroom-${{ matrix.image.name }}:buildcache
-          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}/switchroom-{1}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true', github.repository_owner, matrix.image.name) || '' }}
-          # sec WS9-F3 (#1418): provenance + SBOM on every fleet image.
-          provenance: mode=max
-          sbom: true
+          # the required check). Per-image, per-arch :buildcache-<arch>
+          # tag, mode=max; legacy :buildcache kept as read-only fallback
+          # for the first post-split run.
+          cache-from: |
+            type=registry,ref=ghcr.io/${{ github.repository_owner }}/switchroom-${{ matrix.image.name }}:buildcache-${{ matrix.arch }}
+            type=registry,ref=ghcr.io/${{ github.repository_owner }}/switchroom-${{ matrix.image.name }}:buildcache
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}/switchroom-{1}:buildcache-{2},mode=max,image-manifest=true,oci-mediatypes=true', github.repository_owner, matrix.image.name, matrix.arch) || '' }}
+          # sec WS9-F3 (#1418, relaxed per header): attestation on tag
+          # pushes only.
+          provenance: ${{ startsWith(github.ref, 'refs/tags/v') && 'mode=max' || 'false' }}
+          sbom: ${{ startsWith(github.ref, 'refs/tags/v') }}
+
+  # Stitch the per-arch dependent images into their final multi-arch
+  # manifests. Same pattern as merge-base.
+  merge-dependents:
+    needs: build-dependents
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && needs.build-dependents.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [agent, broker, kernel, hostd, auth-broker, web]
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0  # v4.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge per-arch images into multi-arch tags
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/switchroom-${{ matrix.image }}"
+          SHA_SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
+          # Stale-dispatch guard — see merge-base for rationale.
+          PUSH_LATEST=true
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            MAIN_TIP=$(git ls-remote "https://github.com/${{ github.repository }}" refs/heads/main | cut -f1 || true)
+            if [[ -n "$MAIN_TIP" && "$MAIN_TIP" != "${{ github.sha }}" ]]; then
+              PUSH_LATEST=false
+              echo "::notice title=stale dispatch::checked-out ${{ github.sha }} is no longer main tip ($MAIN_TIP) — skipping :latest, pushing :sha-${SHA_SHORT} only."
+            fi
+          fi
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAG_VERSION="${GITHUB_REF#refs/tags/}"
+            TAG_ARGS=(-t "${IMAGE}:${TAG_VERSION}" -t "${IMAGE}:latest")
+          elif [[ "${{ github.ref }}" == "refs/heads/main" && "$PUSH_LATEST" == "true" ]]; then
+            TAG_ARGS=(-t "${IMAGE}:latest" -t "${IMAGE}:sha-${SHA_SHORT}")
+          else
+            TAG_ARGS=(-t "${IMAGE}:sha-${SHA_SHORT}")
+          fi
+          docker buildx imagetools create "${TAG_ARGS[@]}" \
+            "${IMAGE}:sha-${SHA_SHORT}-amd64" \
+            "${IMAGE}:sha-${SHA_SHORT}-arm64"
 
   build-hindsight:
     # Hindsight extends upstream `ghcr.io/vectorize-io/hindsight:latest`
@@ -266,6 +461,18 @@ jobs:
     # base job and runs in parallel. See docker/Dockerfile.hindsight
     # for why we extend instead of running upstream as-is (claude-code
     # provider + claude-agent-sdk + UID pin).
+    #
+    # Path-gated on PRs AND main pushes (see `changes` header): the
+    # hindsight context rarely changes; when it's unchanged on a main
+    # push this job skips and retag-unchanged re-points :sha-<short>
+    # at the existing :latest manifest. Tags + workflow_dispatch always
+    # build.
+    #
+    # Still single-job multi-arch via QEMU (NOT split per-arch like
+    # base/dependents): this job is skipped on almost every main push,
+    # so doubling its job count buys nothing on the common path.
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') || needs.changes.outputs.hindsight == 'true') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -273,14 +480,14 @@ jobs:
 
       - name: Set up QEMU (only when arm64 build runs)
         if: github.event_name != 'pull_request'
-        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3  # v4.1.0
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8  # v4.2.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
 
       - name: Log in to GHCR (push only on main / tags)
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0  # v4.4.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -291,17 +498,33 @@ jobs:
         run: |
           IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/switchroom-hindsight"
           SHA_SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
+          # Stale-dispatch guard — see merge-base for rationale.
+          PUSH_LATEST=true
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            MAIN_TIP=$(git ls-remote "https://github.com/${{ github.repository }}" refs/heads/main | cut -f1 || true)
+            if [[ -n "$MAIN_TIP" && "$MAIN_TIP" != "${{ github.sha }}" ]]; then
+              PUSH_LATEST=false
+              echo "::notice title=stale dispatch::checked-out ${{ github.sha }} is no longer main tip ($MAIN_TIP) — skipping :latest, pushing :sha-${SHA_SHORT} only."
+            fi
+          fi
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             TAG_VERSION="${GITHUB_REF#refs/tags/}"
             echo "tags=${IMAGE}:${TAG_VERSION},${IMAGE}:latest" >> "$GITHUB_OUTPUT"
-          elif [[ ( "${{ github.event_name }}" == "push" || "${{ github.event_name }}" == "workflow_dispatch" ) && "${{ github.ref }}" == "refs/heads/main" ]]; then
+          elif [[ "${{ github.ref }}" == "refs/heads/main" && "$PUSH_LATEST" == "true" ]]; then
             echo "tags=${IMAGE}:latest,${IMAGE}:sha-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
-          else
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
             echo "tags=${IMAGE}:pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          else
+            # dispatch on a non-main/non-tag ref, or a stale main
+            # dispatch: sha tag only. Previously a non-main dispatch
+            # fell into the pr-<number> branch with an EMPTY number,
+            # producing an invalid `:pr-` reference and failing the
+            # push (#2816 review follow-up).
+            echo "tags=${IMAGE}:sha-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build (and push on main/tag) hindsight
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
         with:
           context: .
           file: docker/Dockerfile.hindsight
@@ -311,9 +534,10 @@ jobs:
           # GHCR registry cache, not type=gha — #1965 (see build-base).
           cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/switchroom-hindsight:buildcache
           cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}/switchroom-hindsight:buildcache,mode=max,image-manifest=true,oci-mediatypes=true', github.repository_owner) || '' }}
-          # sec WS9-F3 (#1418): provenance + SBOM on the hindsight image too.
-          provenance: mode=max
-          sbom: true
+          # sec WS9-F3 (#1418, relaxed per header): attestation on tag
+          # pushes only.
+          provenance: ${{ startsWith(github.ref, 'refs/tags/v') && 'mode=max' || 'false' }}
+          sbom: ${{ startsWith(github.ref, 'refs/tags/v') }}
 
   build-voice:
     # Voice STT sidecar (PR-B2 follow-up). Like build-hindsight this is a
@@ -335,17 +559,24 @@ jobs:
     # hosts are amd64. Building an arm64 leg would emit an image that can't
     # actually run GPU STT, so we don't (this is the one fleet image that
     # is single-arch by design — every other image is amd64+arm64).
+    #
+    # Path-gated on PRs AND main pushes like build-hindsight (see the
+    # `changes` header): the CUDA layers make voice the heaviest build
+    # and its context almost never changes; retag-unchanged covers the
+    # skipped-on-main-push case. Tags + dispatch always build.
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') || needs.changes.outputs.voice == 'true') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
 
       - name: Log in to GHCR (push only on main / tags)
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0  # v4.4.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -356,17 +587,30 @@ jobs:
         run: |
           IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/switchroom-voice"
           SHA_SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
+          # Stale-dispatch guard — see merge-base for rationale.
+          PUSH_LATEST=true
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            MAIN_TIP=$(git ls-remote "https://github.com/${{ github.repository }}" refs/heads/main | cut -f1 || true)
+            if [[ -n "$MAIN_TIP" && "$MAIN_TIP" != "${{ github.sha }}" ]]; then
+              PUSH_LATEST=false
+              echo "::notice title=stale dispatch::checked-out ${{ github.sha }} is no longer main tip ($MAIN_TIP) — skipping :latest, pushing :sha-${SHA_SHORT} only."
+            fi
+          fi
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             TAG_VERSION="${GITHUB_REF#refs/tags/}"
             echo "tags=${IMAGE}:${TAG_VERSION},${IMAGE}:latest" >> "$GITHUB_OUTPUT"
-          elif [[ ( "${{ github.event_name }}" == "push" || "${{ github.event_name }}" == "workflow_dispatch" ) && "${{ github.ref }}" == "refs/heads/main" ]]; then
+          elif [[ "${{ github.ref }}" == "refs/heads/main" && "$PUSH_LATEST" == "true" ]]; then
             echo "tags=${IMAGE}:latest,${IMAGE}:sha-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
-          else
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
             echo "tags=${IMAGE}:pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          else
+            # dispatch on a non-main/non-tag ref, or a stale main
+            # dispatch: sha tag only (see build-hindsight's twin branch).
+            echo "tags=${IMAGE}:sha-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build (and push on main/tag) voice
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
         with:
           context: .
           file: docker/Dockerfile.voice
@@ -382,9 +626,76 @@ jobs:
           # the required build check).
           cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/switchroom-voice:buildcache
           cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}/switchroom-voice:buildcache,mode=max,image-manifest=true,oci-mediatypes=true', github.repository_owner) || '' }}
-          # sec WS9-F3 (#1418): provenance + SBOM on the voice image too.
-          provenance: mode=max
-          sbom: true
+          # sec WS9-F3 (#1418, relaxed per header): attestation on tag
+          # pushes only.
+          provenance: ${{ startsWith(github.ref, 'refs/tags/v') && 'mode=max' || 'false' }}
+          sbom: ${{ startsWith(github.ref, 'refs/tags/v') }}
+
+  # ─── Skip re-export of unchanged images (main pushes) ─────────────
+  # hindsight / voice enumerate their FULL build-input set in
+  # .github/path-filters.yml, so "filter says unchanged" provably means
+  # "the image content is identical to the previous main build". When
+  # their build jobs are path-skipped on a main push, this job re-points
+  # `:sha-<short>` at the existing `:latest` manifest with
+  # `docker buildx imagetools create` (same no-rebuild pattern as
+  # promote-to-dev) — every main commit then has a complete
+  # per-commit tag set with zero build/export cost.
+  #
+  # DELIBERATELY NOT applied to base/dependents: their images bake dist/
+  # bundles derived from effectively all of src/, which the `images`
+  # filter only partially covers — a filter-driven "unchanged" verdict
+  # there would be unsound, and a content-digest scheme short of
+  # actually building is exactly the fragile hashing we avoid. Their
+  # skip-cost is instead attacked by the native-arm64 split + the
+  # attestation relaxation above.
+  retag-unchanged:
+    needs: changes
+    if: >-
+      !cancelled() &&
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      needs.changes.result == 'success' &&
+      (needs.changes.outputs.hindsight != 'true' || needs.changes.outputs.voice != 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0  # v4.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Retag :latest as :sha-<7> for path-skipped images
+        env:
+          HINDSIGHT_CHANGED: ${{ needs.changes.outputs.hindsight }}
+          VOICE_CHANGED: ${{ needs.changes.outputs.voice }}
+        run: |
+          set -euo pipefail
+          SHA_SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
+          retag() {
+            local name="$1"
+            local IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/switchroom-${name}"
+            # Tolerate a missing :latest (fresh fork / first-ever run):
+            # only a genuine NOT-FOUND is a benign skip; any other
+            # inspect error fails loudly (same discipline as
+            # promote-to-dev — never mask registry/auth trouble).
+            local out
+            if out=$(docker buildx imagetools inspect "${IMAGE}:latest" 2>&1); then
+              docker buildx imagetools create -t "${IMAGE}:sha-${SHA_SHORT}" "${IMAGE}:latest"
+              echo "retagged ${IMAGE}:latest -> ${IMAGE}:sha-${SHA_SHORT} (inputs unchanged this commit)"
+            elif printf '%s' "$out" | grep -qiE 'manifest unknown|not found|404|no such manifest|MANIFEST_UNKNOWN'; then
+              echo "::notice title=retag-unchanged skipped::${IMAGE}:latest absent (never built in this namespace) — nothing to retag."
+            else
+              echo "::error title=retag-unchanged failed::inspecting ${IMAGE}:latest failed with a non-absence error (registry/auth/network?)."
+              printf '%s\n' "$out"
+              exit 1
+            fi
+          }
+          if [ "$HINDSIGHT_CHANGED" != "true" ]; then retag hindsight; fi
+          if [ "$VOICE_CHANGED" != "true" ]; then retag voice; fi
 
   # PR C: smoke test the freshly-pushed :sha-<7> agent image — runs the
   # MCP tools/list harness inside a throwaway container with the
@@ -395,7 +706,9 @@ jobs:
   # smoke run leaves :sha-<7> pushed (for rollback) but does NOT
   # promote to :dev. Job timeout 5 min.
   smoke-test:
-    needs: [build-dependents]
+    # merge-dependents is what creates :sha-<7> now (the per-arch build
+    # jobs only push scratch tags).
+    needs: [merge-dependents]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -417,7 +730,7 @@ jobs:
         run: bun install
 
       - name: Log in to GHCR (smoke pulls private images)
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0  # v4.4.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -446,21 +759,47 @@ jobs:
     # (job green path not taken) could be misread by the retag step as
     # a benign "image unchanged" skip. With build-hindsight in `needs`,
     # a missing `:sha-<short>` at promote time provably means
-    # "build succeeded but context unchanged → buildx cache hit, nothing
-    # pushed", never "build failed".
-    needs: [smoke-test, build-hindsight, build-voice]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # "build succeeded but context unchanged → nothing pushed", never
+    # "build failed".
+    # Since the hindsight/voice builds became path-gated on main pushes
+    # too, their `needs` result can legitimately be `skipped` here — a
+    # skip means "context unchanged this commit"; retag-unchanged (also
+    # in `needs`) then re-points :sha-<short> at :latest, so the retag
+    # step below normally finds it. Its absence-tolerance is retained
+    # for the fresh-namespace edge (no :latest to retag from). This
+    # `if:` requires smoke-test SUCCESS but only non-failure
+    # (success or skipped) from hindsight/voice/retag-unchanged.
+    # merge-base is a producing job too: it creates base:sha-<short> on
+    # main pushes (build-base only pushes per-arch scratch tags now),
+    # and it never legitimately skips on a main push — so require hard
+    # success. Without it, a transient merge-base failure would let the
+    # base leg's absence-tolerant branch below misread the missing
+    # base:sha-<short> as a benign skip and silently hold base:dev back
+    # while the other :dev tags advance.
+    needs: [smoke-test, merge-base, build-hindsight, build-voice, retag-unchanged]
+    if: >-
+      !cancelled() &&
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      needs.smoke-test.result == 'success' &&
+      needs.merge-base.result == 'success' &&
+      needs.build-hindsight.result != 'failure' && needs.build-hindsight.result != 'cancelled' &&
+      needs.build-voice.result != 'failure' && needs.build-voice.result != 'cancelled' &&
+      needs.retag-unchanged.result != 'failure' && needs.retag-unchanged.result != 'cancelled'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        image: [base, agent, broker, kernel, hostd, auth-broker, hindsight, voice]
+        # Keep in sync with the merge-dependents matrix + base +
+        # hindsight/voice: every image that publishes :sha-<7> on main
+        # must be promoted here, or its :dev tag silently stops
+        # advancing (web was missing until #2818's follow-up).
+        image: [base, agent, broker, kernel, hostd, auth-broker, web, hindsight, voice]
     steps:
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
 
       - name: Log in to GHCR
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0  # v4.4.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -472,22 +811,15 @@ jobs:
           SHA_SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
           IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/switchroom-${{ matrix.image }}"
           SRC="${IMAGE}:sha-${SHA_SHORT}"
-          # An image whose build context is unchanged for this commit is
-          # a 100% buildx cache hit and pushes NOTHING — so its per-commit
-          # `:sha-<short>` tag never gets created. This is the norm for
-          # `hindsight` (it extends upstream `vectorize-io/hindsight`, not
-          # `switchroom-base`, so most main commits don't touch its
-          # context). Hard-failing the retag here turned that into a
-          # whole-run red on `docker-images` for every hindsight-untouched
-          # release (e.g. v0.12.15 / dc508a9), even though the fleet is
-          # fine: `:latest` is pushed inline by the build jobs, and the
-          # existing `:dev` already points at the last good build.
-          #
-          # promote-to-dev `needs: [smoke-test, build-hindsight]`, so by
-          # the time this runs EVERY image's build job has SUCCEEDED — a
-          # missing `:sha-<short>` therefore provably means "cache hit,
-          # nothing pushed", never "build failed". In that case the
-          # existing `:dev` is already the last good build → skip.
+          # An image whose build was path-skipped this commit normally
+          # has its `:sha-<short>` created by retag-unchanged above; the
+          # absence branch remains for the fresh-namespace edge (no
+          # :latest existed to retag from). promote-to-dev `needs` every
+          # producing job, so by the time this runs a missing
+          # `:sha-<short>` provably means "nothing was ever pushed for
+          # this image in this namespace", never "build failed" — the
+          # existing `:dev` (if any) is already the last good build →
+          # skip.
           #
           # CRITICAL: only skip on a genuine NOT-FOUND. A transient
           # registry/auth/network error from `imagetools inspect` must
@@ -498,9 +830,60 @@ jobs:
             docker buildx imagetools create -t "${IMAGE}:dev" "$SRC"
             echo "promoted $SRC -> ${IMAGE}:dev"
           elif printf '%s' "$out" | grep -qiE 'manifest unknown|not found|404|no such manifest|MANIFEST_UNKNOWN'; then
-            echo "::notice title=promote-to-dev skipped::$SRC absent (build context unchanged this commit — buildx cache hit, nothing pushed). Existing ${IMAGE}:dev retained; nothing to re-promote."
+            echo "::notice title=promote-to-dev skipped::$SRC absent (nothing pushed for this image). Existing ${IMAGE}:dev retained; nothing to re-promote."
           else
             echo "::error title=promote-to-dev failed::inspecting $SRC failed with a non-absence error (registry/auth/network?) — NOT masking a possibly-real promotion."
             printf '%s\n' "$out"
             exit 1
           fi
+
+  # ─── Sentinel ─────────────────────────────────────────────────────
+  # Branch-protection-required context (see ci-lint.yml header for the
+  # pattern). ALWAYS runs and aggregates the path-gated build jobs:
+  # pass when every build succeeded OR was legitimately path-skipped;
+  # fail when any build/merge/retag failed/cancelled, or when the
+  # `changes` filter job itself broke on an event where it gates (can't
+  # trust a skip produced by broken infra). Ruleset 16470166 should
+  # require `images-ok` as THE single required context for this
+  # workflow — keep this `needs` list complete when adding jobs.
+  images-ok:
+    needs:
+      - changes
+      - build-base
+      - merge-base
+      - build-dependents
+      - merge-dependents
+      - build-hindsight
+      - build-voice
+      - retag-unchanged
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Verdict
+        run: |
+          c='${{ needs.changes.result }}'
+          # `changes` is intentionally skipped on tag pushes /
+          # workflow_dispatch (no diff base) — skipped is fine; only a
+          # failure/cancel is infra breakage.
+          if [ "$c" = "failure" ] || [ "$c" = "cancelled" ]; then
+            echo "::error::changes=$c — path-filter infra failed; can't trust skip"
+            exit 1
+          fi
+          fail=0
+          for pair in \
+            "build-base=${{ needs.build-base.result }}" \
+            "merge-base=${{ needs.merge-base.result }}" \
+            "build-dependents=${{ needs.build-dependents.result }}" \
+            "merge-dependents=${{ needs.merge-dependents.result }}" \
+            "build-hindsight=${{ needs.build-hindsight.result }}" \
+            "build-voice=${{ needs.build-voice.result }}" \
+            "retag-unchanged=${{ needs.retag-unchanged.result }}"; do
+            job="${pair%%=*}"; r="${pair#*=}"
+            if [ "$r" = "failure" ] || [ "$r" = "cancelled" ]; then
+              echo "::error::${job}=${r} — real build failure, blocking"
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] || exit 1
+          echo "changes=$c → pass (builds green or path-skipped)"

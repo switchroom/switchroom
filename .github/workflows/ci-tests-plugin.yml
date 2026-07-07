@@ -38,31 +38,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 1
     outputs:
-      relevant: ${{ steps.filter.outputs.relevant }}
+      relevant: ${{ steps.filter.outputs.plugin }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - name: Filter changed paths
         id: filter
-        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d  # v4.0.1
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706  # v4.0.2
         with:
-          filters: |
-            relevant:
-              - 'telegram-plugin/**'
-              - 'package.json'
-              - 'bun.lock'
-              - 'telegram-plugin/package.json'
-              - 'telegram-plugin/bun.lock'
-              - '.github/actions/setup-switchroom/**'
-              - '.github/workflows/ci-tests-plugin.yml'
-              # sec WS9-F1 (#1402): don't skip→pass the required gate on
-              # a security-load-bearing non-telegram-plugin change. See
-              # ci-tests-core.yml for the rationale.
-              - 'profiles/**'
-              - 'bin/**'
-              - 'skills/**'
-              - 'docker/**'
-              - '.github/workflows/**'
+          # Shared external filters file — the sec WS9-F1 (#1402)
+          # security-load-bearing path list is defined ONCE there and
+          # anchored into each workflow's filter key. See the header of
+          # .github/path-filters.yml for the rationale.
+          filters: .github/path-filters.yml
 
   bun-test-run:
     needs: changes

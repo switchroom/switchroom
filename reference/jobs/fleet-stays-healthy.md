@@ -135,6 +135,15 @@ not just the happy path, and the sensor stays model-free across it.
   It is operator tooling (like the fleet dashboard), so `telegram-only` and
   `chat-is-the-single-source-of-truth` hold.
 
+## Related
+
+- [`see-my-whole-fleet-from-one-screen`](see-my-whole-fleet-from-one-screen.md) --
+  the operator surface the ranked health view lives beside.
+- [`crons-use-the-model-only-when-it-earns-it`](crons-use-the-model-only-when-it-earns-it.md) --
+  the gate-first cost discipline the nightly sensor inherits.
+- [`know-what-my-agent-is-doing`](know-what-my-agent-is-doing.md) -- per-turn
+  visibility; this job is its fleet-wide, over-time counterpart.
+
 ---
 
 > **Implementation:** the how lives in `reference/rfcs/fleet-health.md`

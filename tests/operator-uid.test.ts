@@ -8,9 +8,12 @@ import {
 } from "../src/cli/operator-uid.js";
 
 const savedSudoUid = process.env.SUDO_UID;
+const savedHostdUid = process.env.SWITCHROOM_HOSTD_OPERATOR_UID;
 afterEach(() => {
   if (savedSudoUid === undefined) delete process.env.SUDO_UID;
   else process.env.SUDO_UID = savedSudoUid;
+  if (savedHostdUid === undefined) delete process.env.SWITCHROOM_HOSTD_OPERATOR_UID;
+  else process.env.SWITCHROOM_HOSTD_OPERATOR_UID = savedHostdUid;
   vi.restoreAllMocks();
 });
 
@@ -28,9 +31,35 @@ describe("resolveOperatorUid", () => {
     expect(resolveOperatorUid()).toBe(1000);
   });
 
-  it("returns undefined when running as real root with no SUDO_UID", () => {
+  it("returns undefined when running as real root with no SUDO_UID and no hostd uid", () => {
+    delete process.env.SUDO_UID;
+    delete process.env.SWITCHROOM_HOSTD_OPERATOR_UID;
+    vi.spyOn(process, "getuid").mockReturnValue(0);
+    expect(resolveOperatorUid()).toBeUndefined();
+  });
+
+  it("falls back to SWITCHROOM_HOSTD_OPERATOR_UID under root with no SUDO_UID (hostd-spawned apply)", () => {
+    delete process.env.SUDO_UID;
+    process.env.SWITCHROOM_HOSTD_OPERATOR_UID = "1000";
+    vi.spyOn(process, "getuid").mockReturnValue(0);
+    expect(resolveOperatorUid()).toBe(1000);
+  });
+
+  it("prefers a real getuid()/SUDO_UID over SWITCHROOM_HOSTD_OPERATOR_UID", () => {
+    process.env.SWITCHROOM_HOSTD_OPERATOR_UID = "1000";
+    process.env.SUDO_UID = "1234";
+    expect(resolveOperatorUid()).toBe(1234);
+    delete process.env.SUDO_UID;
+    vi.spyOn(process, "getuid").mockReturnValue(4242);
+    expect(resolveOperatorUid()).toBe(4242);
+  });
+
+  it("ignores an invalid SWITCHROOM_HOSTD_OPERATOR_UID (0 / non-numeric)", () => {
     delete process.env.SUDO_UID;
     vi.spyOn(process, "getuid").mockReturnValue(0);
+    process.env.SWITCHROOM_HOSTD_OPERATOR_UID = "0";
+    expect(resolveOperatorUid()).toBeUndefined();
+    process.env.SWITCHROOM_HOSTD_OPERATOR_UID = "notanumber";
     expect(resolveOperatorUid()).toBeUndefined();
   });
 });

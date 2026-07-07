@@ -127,6 +127,99 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
+  it("keeps the #2392 claude_code env-isolation patch (assert-guarded, fail-loud)", () => {
+    // The #2392 build-time patch neutralizes upstream's env isolation
+    // (mkdtemp CONFIG_DIR + SECURESTORAGE="") that breaks file-based
+    // creds. It is self-verifying: it asserts the upstream anchor is
+    // present before patching. Guard the patch block itself so nobody
+    // silently deletes it.
+    expect(dockerfile).toMatch(
+      /assert OLD_PATH in s, "switchroom #2392 patch:/,
+    );
+    expect(dockerfile).toMatch(
+      /path = "\/run\/claude-creds"  # switchroom #2392:/,
+    );
+  });
+
+  it("keeps the max_turns/ToolSearch standard-call fix (assert-guarded, fail-loud)", () => {
+    // The STANDARD LLM-call path in claude_code_llm.py builds
+    // ClaudeAgentOptions with allowed_tools=[] but WITHOUT tools=[], so
+    // the built-in CLI tools stay loaded and ToolSearch burns the single
+    // max_turns=1 turn → "Reached maximum number of turns (1)" → wasted
+    // retries / failed memory ops. This build-time patch brings the
+    // standard path to parity with the tool-calling path (tools=[] +
+    // max_turns=2). It is self-verifying (asserts the anchor exists once
+    // before patching, re-asserts the result). Guard the patch block so
+    // nobody silently deletes it and reintroduces the max_turns wall.
+
+    // The exact-once assert on the pre-patch anchor (fail-loud on drift).
+    expect(dockerfile).toMatch(
+      /assert s\.count\(OLD\) == 1, "switchroom max_turns\/ToolSearch standard-call fix:/,
+    );
+    // The OLD anchor reconstructs the upstream (pre-patch) standard-call shape.
+    expect(dockerfile).toMatch(
+      /max_turns=1,  # Single-turn for API-style interactions/,
+    );
+    // The NEW replacement adds tools=[] + max_turns=2 on the standard path.
+    expect(dockerfile).toMatch(
+      /tools=\[\],  # switchroom: disable built-in CLI tools so ToolSearch/,
+    );
+    expect(dockerfile).toMatch(
+      /max_turns=2,  # switchroom: headroom so a stray ToolSearch turn/,
+    );
+    // Post-replace re-assertions must be present (verification-on-build).
+    expect(dockerfile).toMatch(
+      /assert "            tools=\[\],  # switchroom" in t,/,
+    );
+    expect(dockerfile).toMatch(
+      /assert "max_turns=1,  # Single-turn" not in t,/,
+    );
+  });
+
+  it("keeps the unit_entities FK-race fix (assert-guarded, fail-loud)", () => {
+    // Upstream v0.8.4 defect: retain Phase-1 (entity resolution) and Phase-2
+    // (the unit_entities child insert) run in SEPARATE committed transactions.
+    // graph_maintenance.prune_orphan_entities can delete an entity in that
+    // window (it momentarily has no unit_entities reference), so Phase-2's
+    // bulk_insert_unit_entities then violates fk_unit_entities_entity_id_entities
+    // — deterministic, non-retryable, memory silently dropped (fires on
+    // session_handoff re-ingest). The build-time patch makes Phase-2 re-assert
+    // (resurrect) the parent entity row in the SAME transaction as the child
+    // insert (INSERT ... ON CONFLICT DO NOTHING), threading the entity metadata
+    // Phase-1 already holds. Proven 15/15 RED -> 0/15 with memories persisted on
+    // the real retain orchestrator path. Self-verifying (asserts each anchor
+    // exactly once against unmodified upstream v0.8.4 before patching, re-asserts
+    // the result). Guard the patch block so nobody silently deletes it.
+
+    // The exact-once anchor guard (fail-loud on upstream drift).
+    expect(dockerfile).toMatch(
+      /assert n == 1, \(\s*\n\s*f"switchroom hindsight FK-race patch: anchor found \{n\}x/,
+    );
+    // The new idempotent same-txn re-assert op.
+    expect(dockerfile).toMatch(/async def reassert_entities\(/);
+    expect(dockerfile).toMatch(/INSERT INTO \{table\} \(id, bank_id, canonical_name\)/);
+    expect(dockerfile).toMatch(/ON CONFLICT DO NOTHING/);
+    // The entity_records threading param on the link path.
+    expect(dockerfile).toMatch(
+      /entity_records: dict\[str, dict\] \| None = None,/,
+    );
+    // The orchestrator wires entity_records from the Phase-1 result into Phase-2.
+    expect(dockerfile).toMatch(
+      /entity_records=phase1\.entities\.entity_records/,
+    );
+    // Post-replace re-assertions must be present (verification-on-build).
+    expect(dockerfile).toMatch(
+      /assert "async def reassert_entities\(" in ops_new,/,
+    );
+    expect(dockerfile).toMatch(
+      /assert "entity_records\.get\(str\(eid\)\)" in er_new,/,
+    );
+    // The success line proves the block ran to completion.
+    expect(dockerfile).toMatch(
+      /switchroom hindsight unit_entities FK-race patch: reassert_entities \+ entity_records threading applied/,
+    );
+  });
+
   it("preserves upstream's start-all.sh as the post-shim CMD", () => {
     // The shim does broker auth, then `exec "$@"` which is whatever
     // CMD docker passes — must be upstream's start-all.sh so the

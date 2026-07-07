@@ -23,6 +23,8 @@ from lib.directives import (  # noqa: E402
     MAX_DIRECTIVES,
     fetch_active_directives,
     format_active_directives_block,
+    parse_active_directives_block,
+    rule_already_captured,
 )
 
 
@@ -205,6 +207,53 @@ class FormatActiveDirectivesBlockTests(unittest.TestCase):
         self.assertIn("2. [P10] d1", out)
         self.assertNotIn("3. [P10] d2", out)
         self.assertIn("(+3 more, omitted)", out)
+
+
+class TestDirectiveDedup(unittest.TestCase):
+    """#2903 Fix 6.2 — parse a rendered <active_directives> block back to
+    content strings, and detect whether a restated rule is already covered."""
+
+    def _block(self, *contents):
+        directives = [
+            {"name": f"d{i}", "content": c, "priority": 10 - i}
+            for i, c in enumerate(contents)
+        ]
+        return format_active_directives_block(directives)
+
+    def test_roundtrip_parse(self):
+        block = self._block(
+            "Always use British spelling in replies.",
+            "Show all times in UTC.",
+        )
+        parsed = parse_active_directives_block(block)
+        self.assertEqual(
+            parsed,
+            ["Always use British spelling in replies.", "Show all times in UTC."],
+        )
+
+    def test_parse_absent_block_is_empty(self):
+        self.assertEqual(parse_active_directives_block("no block here"), [])
+        self.assertEqual(parse_active_directives_block(None), [])
+
+    def test_captured_when_restated_rule_overlaps_existing(self):
+        contents = parse_active_directives_block(
+            self._block("Always use British spelling in all replies.")
+        )
+        self.assertTrue(
+            rule_already_captured("From now on, always use British spelling please.", contents)
+        )
+
+    def test_not_captured_for_unrelated_rule(self):
+        contents = parse_active_directives_block(self._block("Always show times in UTC."))
+        self.assertFalse(
+            rule_already_captured("From now on, always use British spelling.", contents)
+        )
+
+    def test_not_captured_against_empty_directives(self):
+        self.assertFalse(rule_already_captured("Always use British spelling.", []))
+
+    def test_empty_rule_is_not_captured(self):
+        self.assertFalse(rule_already_captured("", ["Always use British spelling."]))
 
 
 if __name__ == "__main__":

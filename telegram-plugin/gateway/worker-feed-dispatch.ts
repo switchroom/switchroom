@@ -8,6 +8,23 @@ export interface WorkerFeedDispatch {
    * ("🛠 Worker · <feedDescription>").
    */
   feedDescription: string
+  /**
+   * True when a registry row was found for the worker. A MISSING row must
+   * not be silently read as "foreground" by callers deciding the status
+   * surface — a row-less worker is most often a nested (depth-2+) dispatch
+   * whose row hasn't linked yet, and nesting it into an unrelated live main
+   * turn (or dropping it) is exactly the depth-2+ freeze/misroute bug.
+   */
+  hasRow: boolean
+  /**
+   * True when the row records a NESTED dispatch (spawned by another
+   * sub-agent — `parent_agent_id` set). A nested worker can never nest into
+   * the gateway's current turn (its parent is a worker, not a live turn),
+   * so callers must surface it via the worker feed regardless of its own
+   * background flag, and must not deliver a user handback for it (its
+   * result returns to its dispatching worker as the Task tool result).
+   */
+  isNested: boolean
 }
 
 /**
@@ -33,5 +50,7 @@ export function resolveWorkerFeedDispatch(
   return {
     isBackground: sub?.background ?? false,
     feedDescription: (sub?.description ?? '') || watcherDescription,
+    hasRow: sub != null,
+    isNested: sub?.parent_agent_id != null,
   }
 }

@@ -250,7 +250,13 @@ export type RolloutPhaseName =
   | "agent-start"
   | "agent-done"
   | "persist-pin"
-  | "hostd-web-deferred";
+  | "hostd-web-deferred"
+  // #2645 — hostd self-bump. Emitted by the DAEMON directly (never via the
+  // child's stdout sentinel): "self-bump" when the old hostd hands its own
+  // recreate to the sibling helper, "self-bump-done" when the new hostd
+  // resumes the roll at boot.
+  | "self-bump"
+  | "self-bump-done";
 
 export interface RolloutPhase {
   phase: RolloutPhaseName;
@@ -317,6 +323,8 @@ export function parseRolloutPhaseLine(line: string): RolloutPhase | null {
     "agent-done",
     "persist-pin",
     "hostd-web-deferred",
+    "self-bump",
+    "self-bump-done",
   ]);
   if (typeof o.phase !== "string" || !PHASES.has(o.phase)) return null;
   if (typeof o.target !== "string") return null;
@@ -845,8 +853,11 @@ export function registerRolloutCommand(program: Command): void {
           `agents on v${cli}, fail the canary, and leave compose downgraded ` +
           `below what's running. ` +
           (hostdCtx
-            ? `Refresh hostd's CLI first — host-side: \`switchroom hostd install ` +
-              `--tag ${target}\` — then re-run the roll.`
+            ? `Normally hostd SELF-BUMPS before this child ever spawns ` +
+              `(#2645) — seeing this refusal means the self-bump was ` +
+              `skipped or resumed while still stale. Refresh hostd's CLI ` +
+              `host-side: \`switchroom hostd install --tag ${target}\` — ` +
+              `then re-run the roll.`
             : `Upgrade this CLI to >= ${target} first (e.g. \`switchroom update ` +
               `--pin ${target}\`, or rebuild your checkout), then re-run.`) +
           ` Nothing was changed.`;
@@ -996,10 +1007,21 @@ export function registerRolloutCommand(program: Command): void {
       // the plan (it would SIGKILL this very process). Surface that as a
       // deferral note so the operator knows to refresh host-side.
       if (hostdCtx) {
+        // #2645 item 3 — name EXACTLY what is still on the prior version so
+        // "rollout done" is never misread as "everything's on the new
+        // version". hostd itself is current on this path when the roll was
+        // preceded by a self-bump (the daemon tag-bumps its own compose
+        // before spawning this child); web + the host-installed operator
+        // CLI never are.
         result.warnings.push(
-          "hostd/web refresh deferred — run host-side (`switchroom webd install` " +
-            "/ `switchroom hostd install`). An agent-invoked rollout cannot " +
-            "recreate its own hostd container without killing itself.",
+          `still on the PRIOR version after this roll: switchroom-web ` +
+            `(host-side: \`switchroom webd install --tag ${target}\`) and the ` +
+            `host operator CLI (\`sudo npm i -g switchroom@${normalizeVersion(target)}\`). ` +
+            `hostd's compose was tag-bumped by the self-bump when one ran; a ` +
+            `full hostd template regen (only needed when a release changes ` +
+            `hostd's mounts/env) is \`switchroom hostd install --tag ${target}\` ` +
+            `host-side. An agent-invoked rollout cannot recreate its own hostd ` +
+            `container mid-roll without killing itself.`,
         );
         // #2726 — narrate the deferral as a phase so the durable log + the
         // narration surface show "hostd/web deferred" between the last agent

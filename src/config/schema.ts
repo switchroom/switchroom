@@ -333,11 +333,154 @@ export const AgentMemorySchema = z
     bank_mission: z
       .string()
       .optional()
-      .describe("Bank-level mission statement used during recall to contextualize results"),
+      .describe(
+        "Bank-level mission statement used during recall to contextualize " +
+        "results. NOTE: this is an alias for the Hindsight engine's " +
+        "`reflect_mission` field (verified live: switchroom's bank_mission " +
+        "lands in `config.reflect_mission`). Prefer `reflect_mission` going " +
+        "forward; `bank_mission` is retained for back-compat. If both are " +
+        "set, `reflect_mission` wins. Cascade: override."
+      ),
+    reflect_mission: z
+      .string()
+      .optional()
+      .describe(
+        "Mission/context steering Hindsight Reflect operations (the bank's " +
+        "'who am I / what matters' framing applied during recall). The " +
+        "engine-accurate name for what `bank_mission` sets. Cascade: override."
+      ),
     retain_mission: z
       .string()
       .optional()
-      .describe("Instructions for the fact extraction LLM during retain"),
+      .describe("Instructions for the fact extraction LLM during retain. Cascade: override."),
+    mental_models: z
+      .array(
+        z.object({
+          name: z
+            .string()
+            .min(1)
+            .describe(
+              "Stable model name (identity key for idempotent ensure). Two " +
+              "declarations with the same name in one agent are rejected."
+            ),
+          source_query: z
+            .string()
+            .min(1)
+            .max(2000)
+            .describe(
+              "The reflection query the model answers, semantically " +
+              "refreshed from the bank's content. Capped at 2000 chars — a " +
+              "standing reflection query, not a document; the ceiling also " +
+              "bounds what an agent-proposed model can smuggle past the " +
+              "operator approval card."
+            ),
+          refresh_after_consolidation: z
+            .boolean()
+            .optional()
+            .describe(
+              "Refresh this model after each consolidation. Defaults OFF — " +
+              "refresh adds bounded background model-spend + timeout risk " +
+              "(RFC Phase 5), so it is opt-in per model."
+            ),
+          max_tokens: z
+            .number()
+            .int()
+            .positive()
+            .max(8192)
+            .optional()
+            .describe(
+              "Cap on the synthesized model's token size. Upper-bounded at " +
+              "8192 — a mental model is a standing summary, not a corpus; the " +
+              "ceiling also caps what an agent-proposed model can request."
+            ),
+        })
+      )
+      .superRefine((models, ctx) => {
+        const seen = new Set<string>();
+        for (let i = 0; i < models.length; i++) {
+          const key = models[i].name;
+          if (seen.has(key)) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: [i, "name"],
+              message:
+                `duplicate mental_models name "${key}" — model names must be ` +
+                `unique within an agent (they are the idempotent-ensure key)`,
+            });
+          }
+          seen.add(key);
+        }
+      })
+      .optional()
+      .describe(
+        "Operator-declared, per-specialist Hindsight mental models (RFC " +
+        "Phase 5). Named, opt-in curated reflections this agent's bank should " +
+        "carry — e.g. a coach's 'training-plan-state' or a lawyer's " +
+        "'open-matters'. Ensured idempotently at scaffold/reconcile: NOTHING " +
+        "is created unless declared here (zero declarations = zero models, " +
+        "matching post-#2447 behaviour), and no fixed identity model is " +
+        "reintroduced — 'who the user is' stays owned by dedicated profile " +
+        "banks (users.*.profile_bank), never a per-agent model. Per-agent " +
+        "ONLY: intentionally not accepted at the defaults/profile tier, so a " +
+        "model can never be fleet-seeded — each specialist opts in on its own " +
+        "(the invariant-clean inverse of the retired blind auto-seeding)."
+      ),
+    observations_mission: z
+      .string()
+      .optional()
+      .describe(
+        "Steers what the observation-consolidation LLM synthesises from raw " +
+        "facts (the higher-order 'what patterns matter' lens). Cascade: override."
+      ),
+    disposition: z
+      .object({
+        skepticism: z
+          .number()
+          .int()
+          .min(1)
+          .max(5)
+          .optional()
+          .describe("How much the bank doubts unverified claims (1-5; engine default 3)."),
+        literalism: z
+          .number()
+          .int()
+          .min(1)
+          .max(5)
+          .optional()
+          .describe("How literally the bank reads statements vs inferring intent (1-5; engine default 3)."),
+        empathy: z
+          .number()
+          .int()
+          .min(1)
+          .max(5)
+          .optional()
+          .describe("How much the bank weights emotional/relational context (1-5; engine default 3)."),
+      })
+      .optional()
+      .describe(
+        "Personality traits (1-5 each) steering how this bank frames recall, " +
+        "reflect, and observation synthesis — a coach leans empathy-high, a " +
+        "lawyer/analyst leans skepticism/literalism-high. Maps to the engine's " +
+        "flat `disposition_skepticism`/`_literalism`/`_empathy` fields. " +
+        "Cascade: per-key merge (an agent overrides individual traits and " +
+        "inherits the rest, matching `recall`)."
+      ),
+    directive_capture_nudge: z
+      .boolean()
+      .optional()
+      .describe(
+        "Deterministic directive-capture nudge (issue #2848 Stage B). When " +
+        "on (switchroom default true — Stage A measured a ~55% miss rate on " +
+        "durable corrections), the auto-recall hook regex-detects correction " +
+        "/ standing-rule-shaped inbound (\"always/never …\", \"from now on …\", " +
+        "\"stop doing …\", a stated preference, \"that's wrong, it's …\") and " +
+        "appends a terse advisory to the turn's context telling the model to " +
+        "persist the rule with mcp__hindsight__create_directive if it IS " +
+        "durable. Detection is pure regex — the model does the judgment " +
+        "in-session and calls create_directive itself (no model callsite, no " +
+        "silent hook-side write). Set false to disable per-agent. " +
+        "Cascade: override (per-agent wins over default)."
+      ),
     recall: z
       .object({
         max_memories: z
@@ -666,6 +809,29 @@ export const SessionContinuitySchema = z
         "instead of --continue. Default 2_000_000 (~2MB). Large transcripts " +
         "can blow out the context window even with prefix caching, and " +
         "--continue replay is known-fragile at scale.",
+      ),
+    session_retention_max_count: z
+      .number()
+      .int()
+      .nonnegative()
+      .optional()
+      .describe(
+        "Session-JSONL retention (issue #2792): keep at most this many " +
+        "newest session transcripts under .claude/projects; older ones " +
+        "past both this count and the age bound are pruned by the Stop " +
+        "hook. The newest sessions (and the handoff source) are always " +
+        "kept. Default 20; set 0 to disable the count bound.",
+      ),
+    session_retention_max_age_days: z
+      .number()
+      .int()
+      .nonnegative()
+      .optional()
+      .describe(
+        "Session-JSONL retention (issue #2792): prune session transcripts " +
+        "older than this many days (a file is deleted only when it is BOTH " +
+        "over the count bound and older than this). Default 30; set 0 to " +
+        "disable the age bound.",
       ),
   })
   .optional();
@@ -2057,6 +2223,10 @@ const profileFields = {
       // agents) hindsight-native by default, with per-agent `file: true` opt-in.
       file: z.boolean().optional(),
       isolation: z.enum(["default", "strict"]).optional(),
+      // Mirror of AgentMemorySchema.directive_capture_nudge — accepted at the
+      // defaults/profile tier too, so `defaults.memory.directive_capture_nudge:
+      // false` can disable the #2848 nudge fleet-wide (per-agent `true` opt-in).
+      directive_capture_nudge: z.boolean().optional(),
       recall: z
         .object({
           max_memories: z.number().int().min(0).optional(),
@@ -2855,6 +3025,18 @@ export const MemoryBackendConfigSchema = z.object({
         .string()
         .optional()
         .describe("Embedding model (e.g., 'nomic-embed-text')"),
+      llm_model: z
+        .string()
+        .optional()
+        .describe(
+          "LiteLLM model name for Hindsight's LLM ops (retain/reflect/" +
+          "consolidation) when the top-level `litellm.enabled` carve-out is " +
+          "on. Defaults to a cheap OpenRouter model (routed via LiteLLM's " +
+          "model-mapped path, not the Anthropic OAuth pass-through) to keep " +
+          "background memory-op cost off the Claude subscription quota. Set " +
+          "to a `claude-*` model name to route it back through the OAuth " +
+          "pass-through instead. Has no effect when litellm is disabled.",
+        ),
       api_key: z
         .string()
         .optional()
@@ -3331,10 +3513,14 @@ export const SwitchroomConfigSchema = z.object({
             account: z
               .string()
               .min(1)
+              .optional()
               .describe(
-                "Pinned account label for this consumer. `get-credentials` returns " +
-                "this account's credentials; `mark-exhausted` from this consumer " +
-                "only affects this account.",
+                "Optional pinned account label for this consumer. When set, " +
+                "`get-credentials` serves this account (with automatic failover " +
+                "while it is quota-exhausted) and `mark-exhausted` from this " +
+                "consumer attributes to it — use a pin for quota isolation. " +
+                "When omitted, the consumer follows the fleet `auth.active` " +
+                "exactly like an agent: same account swaps, same failover.",
               ),
             uid: z
               .number()

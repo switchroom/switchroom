@@ -22,7 +22,13 @@ import {
   HINDSIGHT_BROKER_SOCK_VOLUME,
   HINDSIGHT_IMAGE,
   HINDSIGHT_DEFAULT_SHM_SIZE,
+  HINDSIGHT_DEFAULT_MODEL,
+  HINDSIGHT_DEFAULT_LITELLM_MODEL,
+  getRunningHindsightPorts,
+  HINDSIGHT_DEFAULT_API_PORT,
+  HINDSIGHT_DEFAULT_UI_PORT,
 } from "../../src/setup/hindsight.js";
+import { SWITCHROOM_DEFAULT_MAIN_MODEL } from "../../src/agents/scaffold.js";
 
 const mockedExec = execFileSync as unknown as ReturnType<typeof vi.fn>;
 
@@ -62,7 +68,7 @@ describe("hindsight broker-fed mode (#1245)", () => {
     expect(args).not.toContain("--entrypoint");
   });
 
-  it("adds a container healthcheck so docker restarts a wedged API", () => {
+  it("adds a container healthcheck that marks a wedged API unhealthy (visibility, not auto-restart)", () => {
     startHindsight({ apiPort: 8888, uiPort: 9999 });
     const args = findRunArgs();
     expect(args).toContain("--health-cmd");
@@ -152,6 +158,10 @@ describe("hindsight broker-fed mode (#1245)", () => {
       if (args[i] === "-e") envPairs.push(args[i + 1] as string);
     }
     expect(envPairs).toContain("HINDSIGHT_API_LLM_MODEL=claude-sonnet-5");
+    // For the claude-code provider the embedded `claude` CLI reads
+    // ANTHROPIC_MODEL, not HINDSIGHT_API_LLM_MODEL — without it the CLI
+    // falls back to its own default (opus) and silently burns quota.
+    expect(envPairs).toContain("ANTHROPIC_MODEL=claude-sonnet-5");
   });
 
   it("raises the reflect wall timeout (vendor 300s times out large-bank mental-model refresh)", async () => {
@@ -182,8 +192,11 @@ describe("hindsight broker-fed mode (#1245)", () => {
     expect(envPairs).toContain(`HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM=${h.HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM}`);
     expect(envPairs).toContain(`HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND=${h.HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND}`);
     // Subscription-honest ceiling: concurrent model calls = slots × parallelism.
-    // Keep it well under a reckless level (was 12; bumped to 18, cap the guard at 24).
-    expect(h.HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS * h.HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM).toBeLessThanOrEqual(24);
+    // #2894 throttled this to a hard ceiling of 1 × 2 = 2 after an 18-way
+    // fan-out exhausted the shared failover quota (2026-07-06 token-burn).
+    // The old guard (≤24) let that exact 18-way fan-out pass — this pins the
+    // ceiling at ≤2 so any regression that re-raises slots/parallelism trips it.
+    expect(h.HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS * h.HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM).toBeLessThanOrEqual(2);
     const snippet = h.generateHindsightComposeSnippet();
     expect(snippet).toContain(`HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM=${h.HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM}`);
     expect(snippet).toContain(`HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND=${h.HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND}`);
@@ -307,6 +320,131 @@ describe("hindsight broker-fed mode (#1245)", () => {
 // in its OWN compose project rather than via `docker run`) had the same
 // tmpfs ownership bug. Pin the tmpfs flag shape here so the two
 // codepaths can't drift.
+describe("getRunningHindsightPorts — host-network env fallback (#2903 fix 5.2)", () => {
+  beforeEach(() => {
+    mockedExec.mockReset();
+  });
+
+  it("reads HINDSIGHT_API_PORT from `docker inspect` env when `docker port` is empty (--network host)", () => {
+    // A `--network host` container publishes no port mappings, so
+    // `docker port` returns "" — the code must then recover the real host
+    // port from the container's environment.
+    mockedExec.mockImplementation((_cmd: string, args: string[]) => {
+      if (args[0] === "port") return ""; // host-network: no mappings
+      if (args[0] === "inspect") {
+        // `{{.Config.Env}}` renders as a bracketed, space-separated Go list.
+        return "[PATH=/usr/bin HINDSIGHT_API_PORT=28888 ANTHROPIC_BASE_URL=http://127.0.0.1:4010/anthropic]\n";
+      }
+      return "";
+    });
+    const ports = getRunningHindsightPorts();
+    expect(ports).toEqual({ apiPort: 28888, uiPort: 19999 });
+  });
+
+  it("still prefers `docker port` output when the container publishes mappings", () => {
+    mockedExec.mockImplementation((_cmd: string, args: string[]) => {
+      // args = ["port", "switchroom-hindsight", "<containerPort>/tcp"]
+      if (args[0] === "port" && args[2] === "8888/tcp") return "127.0.0.1:18888\n";
+      if (args[0] === "port" && args[2] === "9999/tcp") return "127.0.0.1:9999\n";
+      return "";
+    });
+    const ports = getRunningHindsightPorts();
+    expect(ports).toEqual({ apiPort: HINDSIGHT_DEFAULT_API_PORT, uiPort: HINDSIGHT_DEFAULT_UI_PORT });
+  });
+
+  it("returns null when neither `docker port` nor inspect env yield an API port", () => {
+    mockedExec.mockImplementation((_cmd: string, args: string[]) => {
+      if (args[0] === "port") return "";
+      if (args[0] === "inspect") return "[PATH=/usr/bin FOO=bar]\n";
+      return "";
+    });
+    expect(getRunningHindsightPorts()).toBeNull();
+  });
+});
+
+describe("hindsight/scaffold model pin (#2903 fix 5.4)", () => {
+  it("HINDSIGHT_DEFAULT_MODEL stays in lockstep with SWITCHROOM_DEFAULT_MAIN_MODEL", () => {
+    // A fleet model bump must move memory ops too; if these drift, hindsight's
+    // retain/reflect/consolidation silently run on a stale model.
+    expect(HINDSIGHT_DEFAULT_MODEL).toBe(SWITCHROOM_DEFAULT_MAIN_MODEL);
+  });
+});
+
+describe("hindsight LiteLLM model routing (2026-07-07)", () => {
+  beforeEach(() => {
+    mockedExec.mockReset();
+    mockedExec.mockReturnValue("");
+  });
+
+  function envVal(args: string[], key: string): string | undefined {
+    for (let i = 0; i < args.length - 1; i++) {
+      if (args[i] === "-e" && (args[i + 1] as string).startsWith(`${key}=`)) {
+        return (args[i + 1] as string).slice(key.length + 1);
+      }
+    }
+    return undefined;
+  }
+
+  it("without litellm, stays on HINDSIGHT_DEFAULT_MODEL and sets no ANTHROPIC_BASE_URL", () => {
+    startHindsight({ apiPort: 8888, uiPort: 9999 });
+    const args = findRunArgs();
+    expect(envVal(args, "ANTHROPIC_MODEL")).toBe(HINDSIGHT_DEFAULT_MODEL);
+    expect(envVal(args, "HINDSIGHT_API_LLM_MODEL")).toBe(HINDSIGHT_DEFAULT_MODEL);
+    expect(envVal(args, "ANTHROPIC_BASE_URL")).toBeUndefined();
+  });
+
+  it("with litellm and no model override, defaults to HINDSIGHT_DEFAULT_LITELLM_MODEL routed via the model-mapped root (no /anthropic suffix)", () => {
+    startHindsight(
+      { apiPort: 8888, uiPort: 9999 },
+      { baseUrl: "http://127.0.0.1:4010", apiKey: "sk-test" },
+    );
+    const args = findRunArgs();
+    expect(envVal(args, "ANTHROPIC_MODEL")).toBe(HINDSIGHT_DEFAULT_LITELLM_MODEL);
+    expect(envVal(args, "HINDSIGHT_API_LLM_MODEL")).toBe(HINDSIGHT_DEFAULT_LITELLM_MODEL);
+    expect(envVal(args, "ANTHROPIC_BASE_URL")).toBe("http://127.0.0.1:4010");
+  });
+
+  it("with litellm and an explicit claude-* model override, rides the Anthropic pass-through (/anthropic suffix)", () => {
+    startHindsight(
+      { apiPort: 8888, uiPort: 9999 },
+      { baseUrl: "http://127.0.0.1:4010", apiKey: "sk-test", model: "claude-sonnet-5" },
+    );
+    const args = findRunArgs();
+    expect(envVal(args, "ANTHROPIC_MODEL")).toBe("claude-sonnet-5");
+    expect(envVal(args, "ANTHROPIC_BASE_URL")).toBe("http://127.0.0.1:4010/anthropic");
+  });
+
+  it("with litellm and an explicit non-Claude model override, rides the model-mapped root", () => {
+    startHindsight(
+      { apiPort: 8888, uiPort: 9999 },
+      { baseUrl: "http://127.0.0.1:4010/", apiKey: "sk-test", model: "openrouter/minimax/minimax-m3" },
+    );
+    const args = findRunArgs();
+    expect(envVal(args, "ANTHROPIC_MODEL")).toBe("openrouter/minimax/minimax-m3");
+    // Trailing slash on baseUrl must not survive into the resolved URL.
+    expect(envVal(args, "ANTHROPIC_BASE_URL")).toBe("http://127.0.0.1:4010");
+  });
+
+  // Regression: the routing split must use the same Claude-alias set as the
+  // rest of the product (telegram-plugin/gateway/model-command.ts's
+  // isClaudeModel/MODEL_ALIASES), not a narrower hand-rolled list. A bare
+  // "opus"/"haiku"/"default" override is a legitimate thing an operator would
+  // type (it's what /model accepts everywhere else) — misrouting it to the
+  // model-mapped root would 404 against real Anthropic-shaped names.
+  it.each(["opus", "haiku", "default", "OPUS"])(
+    "treats the Claude alias %s as pass-through-eligible (case-insensitive)",
+    (alias) => {
+      startHindsight(
+        { apiPort: 8888, uiPort: 9999 },
+        { baseUrl: "http://127.0.0.1:4010", apiKey: "sk-test", model: alias },
+      );
+      const args = findRunArgs();
+      expect(envVal(args, "ANTHROPIC_MODEL")).toBe(alias);
+      expect(envVal(args, "ANTHROPIC_BASE_URL")).toBe("http://127.0.0.1:4010/anthropic");
+    },
+  );
+});
+
 describe("generateHindsightComposeSnippet — tmpfs ownership", () => {
   it("emits uid + gid on the /run/claude-creds tmpfs entry", async () => {
     const { generateHindsightComposeSnippet } = await import("../../src/setup/hindsight.js");
@@ -319,6 +457,27 @@ describe("generateHindsightComposeSnippet — tmpfs ownership", () => {
     expect(tmpfsLine).toMatch(/uid=11000\b/);
     expect(tmpfsLine).toMatch(/gid=11000\b/);
     expect(tmpfsLine).toMatch(/mode=0700\b/);
+  });
+
+  it("publishes both ports on 127.0.0.1 only — the tokenless API must never bind 0.0.0.0 (Fix 1.1)", async () => {
+    const { generateHindsightComposeSnippet, HINDSIGHT_DEFAULT_API_PORT } =
+      await import("../../src/setup/hindsight.js");
+    const snippet = generateHindsightComposeSnippet();
+    const portLines = snippet
+      .split("\n")
+      .filter((l) => /^\s+-\s+"[\d.:]+:\d+"\s*$/.test(l));
+    // Both the API and UI published ports must be present and loopback-bound.
+    expect(portLines.length).toBeGreaterThanOrEqual(2);
+    for (const line of portLines) {
+      expect(line, `port binding must be loopback-only: ${line}`).toMatch(
+        /"127\.0\.0\.1:/,
+      );
+    }
+    expect(snippet).toContain(`"127.0.0.1:${HINDSIGHT_DEFAULT_API_PORT}:8888"`);
+    expect(snippet).toContain('"127.0.0.1:19999:9999"');
+    // Guard against a regression that drops the host-IP prefix entirely.
+    expect(snippet).not.toMatch(/-\s+"\d+:8888"/);
+    expect(snippet).not.toMatch(/-\s+"\d+:9999"/);
   });
 
   it("emits shm_size so the compose path matches the docker-run shm fix (2026-06-06 outage)", async () => {

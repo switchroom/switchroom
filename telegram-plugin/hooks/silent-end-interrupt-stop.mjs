@@ -193,8 +193,7 @@ function main() {
         'This turn is ending without your final answer reaching the user. ' +
         'If you wrote an answer as plain text (not via a tool), the user ' +
         'cannot see it — only text sent through the reply tool is delivered. ' +
-        'Send your final answer now by calling mcp__switchroom-telegram__reply ' +
-        '(or mcp__switchroom-telegram__stream_reply with done=true). ' +
+        'Send your final answer now by calling mcp__switchroom-telegram__reply. ' +
         'If your final answer has already reached the user, or you ' +
         'intentionally have nothing to add, reply with exactly NO_REPLY.',
     }),

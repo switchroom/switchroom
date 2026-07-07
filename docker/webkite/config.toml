@@ -1,0 +1,88 @@
+# Fleet-wide webkite render config (switchroom #2805).
+#
+# Baked into the agent image at /opt/switchroom/webkite/config.toml and
+# seeded to ~/.config/webkite/config.toml at boot by profiles/_base/start.sh.hbs
+# (copy-if-absent). Because the source lives in the image it is durable
+# across container rebuilds and identical fleet-wide — NOT a per-agent
+# hand-placed file. An operator-authored override still wins: if
+# ~/.switchroom/webkite/config.toml exists it is bind-mounted RO onto the
+# same target (see src/agents/compose.ts) and start.sh leaves it untouched.
+#
+# EVERY key below is verified against the shipped `webkite` binary's own
+# schema (`webkite config list --all` + the embedded default-config
+# template + `struct RouteConfig`/`struct ProviderConfig` field lists).
+# Do not add invented keys: webkite parses config leniently (unknown keys
+# are silently ignored), so a typo becomes a silent no-op, not an error.
+
+[render]
+# Enable browser rendering. (Also the webkite default, pinned here for
+# intent + so an operator lowering a global default can't silently
+# disable fleet rendering.)
+enabled = true
+
+# Auto-spawn the baked-in local cloakbrowser (stealth Chromium) when a
+# render is needed and no explicit CDP provider is set. This is THE local
+# render backend — we deliberately do NOT declare a `type = "cdp"`
+# provider, because doing so disables auto_spawn and would require a
+# CDP server already listening on the URL. With auto_spawn on, routes may
+# still reference the local renderer by the name "cloakbrowser".
+auto_spawn = true
+
+# Render-chain preset: try the local cloakbrowser first, fall back to the
+# cloud providers (Cloudflare / Firecrawl) declared below only if local
+# render fails. Values: local-first | remote-first | local-only | remote-only.
+profile = "local-first"
+
+# Cloud render fallbacks. Credentials are injected into the agent process
+# env at boot from the vault-broker (CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN
+# / FIRECRAWL_API_KEY — see profiles/_base/start.sh.hbs and .mcp.json). A
+# provider with no resolvable credentials is skipped with a warning, so
+# declaring both is safe even on agents that were never granted the keys.
+[[render.providers]]
+name = "cloudflare"
+type = "cloudflare"
+
+[[render.providers]]
+name = "firecrawl"
+type = "firecrawl"
+
+# ── Force-render routes for known JS-gated / SPA pages ──────────────────
+#
+# webkite's auto-heuristic classifies content-empty SPA shells as
+# `thin_article`. With renderers configured (above) a thin_article page
+# already ESCALATES to a render attempt on its own — that is the
+# "heuristic bump" the issue asks for, and it needs no extra key. These
+# routes are belt-and-suspenders for hosts we KNOW are JS-gated: they
+# force a render up front (skipping the static fetch + heuristic guess)
+# and pin the provider order to local-first, cloud-fallback.
+#
+# `domains` is matched against the request host (www is NOT auto-stripped
+# in matching, so list both the bare and www forms). `mode = "force"`
+# forces a render. `exclusive = false` lets a failed route provider spill
+# into the global chain rather than hard-failing.
+#
+# NOTE (webkite 0.4.0): a per-route post-render wait / dropdown-click
+# interaction hook is NOT expressible in the config schema — RouteConfig
+# has exactly {domains, providers, mode, exclusive}. The wait-for-selector
+# capability exists only as a per-call flag (`--wait-for-selector`, or the
+# `wait_for_selector` arg on the `webkite_read` MCP tool), which the agent
+# passes at read time. For the Palace cinema-selector case the agent should
+# call webkite_read with wait_for_selector set to the session-times
+# container. See the issue's post-merge verification notes.
+
+[[render.routes]]
+domains = ["palacecinemas.com.au", "www.palacecinemas.com.au"]
+providers = ["cloakbrowser", "cloudflare"]
+mode = "force"
+exclusive = false
+
+# Operator-extensible: add other JS-gated ticketing / booking hosts here
+# (both bare + www forms). Left minimal on purpose — forcing render on a
+# host that doesn't need it only costs latency, but inventing domains that
+# don't exist adds noise. Example shape:
+#
+# [[render.routes]]
+# domains = ["tickets.example-cinema.com.au", "www.example-cinema.com.au"]
+# providers = ["cloakbrowser", "cloudflare"]
+# mode = "force"
+# exclusive = false

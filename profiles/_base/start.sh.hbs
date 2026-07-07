@@ -33,6 +33,19 @@ if [ "$SWITCHROOM_RUNTIME" = "docker" ] && [ -z "$SWITCHROOM_DOCKER_TMUX_INNER" 
   # same path the rest of start.sh + the MCP sidecar expects.
   export TELEGRAM_STATE_DIR="{{agentDir}}/telegram"
 
+  # SWITCHROOM_AGENT_NAME is the canonical "which agent am I" identity. It is
+  # normally supplied by the container env (compose.ts) so it is already
+  # present here, but the authoritative inner-pass export lives at line ~387,
+  # AFTER the gateway fork below. On any runtime where the compose env is NOT
+  # the source (non-docker / local dev), the forked gateway daemon would then
+  # start with the var UNSET — which collapses its worktree-ownership filter
+  # (worktree-watch-cwds.ts) to [], so a worktree-isolated background
+  # sub-agent gets NO live progress feed for its whole run (#1116 / #2893).
+  # Hoist the export here, before the fork, so the gateway ALWAYS has its
+  # identity on the fast path regardless of runtime. Idempotent with the
+  # compose env and the inner-pass export. Pinned by the scaffold-order test.
+  export SWITCHROOM_AGENT_NAME="{{name}}"
+
   # Gateway-consumed env MUST be exported HERE, before the gateway fork
   # below. The gateway daemon reads channels.telegram.* knobs (and any
   # agent env) from process.env at startup — e.g. SWITCHROOM_TG_STREAM_
@@ -64,14 +77,32 @@ if [ "$SWITCHROOM_RUNTIME" = "docker" ] && [ -z "$SWITCHROOM_DOCKER_TMUX_INNER" 
   #
   # SWITCHROOM_AGENT_NAME is injected by compose env (compose.ts:1816)
   # so it is available here, before the inner-pass export at line ~320.
-  if [ -n "$SWITCHROOM_LITELLM" ] && [ -z "$ANTHROPIC_CUSTOM_HEADERS" ] && command -v switchroom >/dev/null 2>&1; then
+  if [ -n "${SWITCHROOM_LITELLM:-}" ] && [ -z "$ANTHROPIC_CUSTOM_HEADERS" ] && command -v switchroom >/dev/null 2>&1; then
     sr_ll_key="$(switchroom vault get "litellm/$SWITCHROOM_AGENT_NAME/api-key" 2>/dev/null || true)"
     sr_ll_ok=""
     if [ -z "$sr_ll_key" ]; then
       echo "litellm(outer): no virtual key for agent '$SWITCHROOM_AGENT_NAME' — gateway will use direct OAuth (no tracking/guardrail)" >&2
-    elif command -v curl >/dev/null 2>&1 && [ -n "$ANTHROPIC_BASE_URL" ] \
-         && ! curl -fsS -m 5 -o /dev/null "${ANTHROPIC_BASE_URL%/}/health/liveliness" 2>/dev/null; then
-      echo "litellm(outer): proxy unreachable at $ANTHROPIC_BASE_URL — falling back to direct OAuth (no tracking/guardrail this session)" >&2
+    elif command -v curl >/dev/null 2>&1 && [ -n "$ANTHROPIC_BASE_URL" ]; then
+      # Bounded retry probe (co-boot race fix, 2026-07): when the whole stack
+      # co-boots, the litellm proxy's heavy Python app is often not yet healthy
+      # in the first few seconds. A single one-shot probe fails-open and takes
+      # this agent dark (untracked) for the WHOLE session. Poll the liveliness
+      # endpoint every ~3s for up to 120s (hard budget) and only fall open if
+      # it is STILL unreachable after that whole window.
+      sr_ll_url="${SWITCHROOM_LITELLM_BASE:-${ANTHROPIC_BASE_URL%/anthropic}}/health/liveliness"
+      sr_ll_deadline=$(( $(date +%s) + 120 ))
+      sr_ll_up=""
+      while :; do
+        if curl -fsS -m 5 -o /dev/null "$sr_ll_url" 2>/dev/null; then sr_ll_up="1"; break; fi
+        [ "$(date +%s)" -ge "$sr_ll_deadline" ] && break
+        sleep 3
+      done
+      if [ -z "$sr_ll_up" ]; then
+        echo "litellm(outer): proxy unreachable at ${SWITCHROOM_LITELLM_BASE:-$ANTHROPIC_BASE_URL} after 120s of retries — falling back to direct OAuth (no tracking/guardrail this session)" >&2
+      else
+        sr_ll_ok="1"
+      fi
+      unset sr_ll_url sr_ll_deadline sr_ll_up
     else
       sr_ll_ok="1"
     fi
@@ -81,7 +112,7 @@ x-litellm-customer-id: $SWITCHROOM_AGENT_NAME
 x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:-default}"
       export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
     else
-      unset ANTHROPIC_BASE_URL ANTHROPIC_SMALL_FAST_MODEL SWITCHROOM_LITELLM
+      unset ANTHROPIC_BASE_URL ANTHROPIC_SMALL_FAST_MODEL SWITCHROOM_LITELLM SWITCHROOM_LITELLM_BASE
     fi
     unset sr_ll_key sr_ll_ok
   fi
@@ -303,12 +334,26 @@ for _stray_claude in \
   "$HOME/.local/bin/claude" \
   "$HOME/bin/claude"; do
   if [ -e "$_stray_claude" ] || [ -L "$_stray_claude" ]; then
+    # Skip our own canonical symlink re-seated at end of this block — it points
+    # back to the image binary and is not a shadow install. Any other file or
+    # symlink at this path (e.g. npm self-install, manual copy) is pruned.
+    if [ -L "$_stray_claude" ] && [ "$(readlink "$_stray_claude" 2>/dev/null)" = "/usr/local/bin/claude" ]; then
+      continue
+    fi
     echo "start.sh: pruning user-local claude shadow at $_stray_claude (image binary is authoritative)" >&2
     rm -f "$_stray_claude"
   fi
 done
 rm -rf "$HOME/.npm-global/lib/node_modules/@anthropic-ai/claude-code" 2>/dev/null || true
 unset _stray_claude
+# Re-seat the canonical symlink so claude v2.1.x+ self-check ("claude command
+# at $HOME/.local/bin/claude missing or broken") stays silent. The prune loop
+# above skips this canonical pointer (via the readlink guard) and removes only
+# genuine shadow installs; the ln -sf below creates the symlink on first boot
+# and is a no-op on subsequent boots. `mkdir -p` is safe: the dir already exists
+# or is about to be created.
+mkdir -p "$HOME/.local/bin"
+ln -sf /usr/local/bin/claude "$HOME/.local/bin/claude"
 
 # ── Root-tier agent: provision the docker CLI ────────────────────────
 # The root debugging agent (`root: true`) has /var/run/docker.sock
@@ -418,6 +463,14 @@ export HINDSIGHT_RECALL_TYPES="{{hindsightRecallTypes}}"
 # it; set false to always run recall.
 {{#if hindsightRecallSkipTrivial}}
 export HINDSIGHT_RECALL_SKIP_TRIVIAL={{hindsightRecallSkipTrivial}}
+{{/if}}
+# #2848 Stage B — directive-capture nudge (memory.directive_capture_nudge
+# cascade). On by default (plugin settings.json): recall.py regex-detects
+# correction / standing-rule-shaped inbound and nudges the model to persist
+# it with create_directive if durable. Export only when the operator overrode
+# it; set false to disable the nudge for this agent.
+{{#if hindsightDirectiveCaptureNudge}}
+export HINDSIGHT_DIRECTIVE_CAPTURE_NUDGE={{hindsightDirectiveCaptureNudge}}
 {{/if}}
 # PR6 — supergroup-mode topic tagging. JSON map of {alias: thread_id}
 # parsed by retain.py + recall.py to (a) stamp chat_id/thread_id/topic_alias
@@ -657,8 +710,24 @@ mkdir -p "$TELEGRAM_STATE_DIR" 2>/dev/null || true
 # .handoff-briefing.md and merged alongside (or instead of) .handoff.md.
 HANDOFF_FILE="{{agentDir}}/.handoff.md"
 HANDOFF_BRIEFING_FILE="{{agentDir}}/.handoff-briefing.md"
+# Decide whether the on-disk briefing is stale and must be rebuilt (#2790).
+# A clean shutdown leaves a non-empty .handoff.md; a *later* hard crash never
+# fires the Stop hook, so that stale briefing would otherwise be re-injected
+# — hiding the crashed session's turns and reorienting the agent from old
+# context. Rebuild when .handoff.md is empty OR when the newest session JSONL
+# is newer than .handoff.md (i.e. a session ran after the briefing was written).
+_LATEST_JSONL=$(_find_latest_jsonl "$CLAUDE_CONFIG_DIR/projects")
+_HANDOFF_STALE=0
 if [ ! -s "$HANDOFF_FILE" ]; then
-  _LATEST_JSONL=$(_find_latest_jsonl "$CLAUDE_CONFIG_DIR/projects")
+  _HANDOFF_STALE=1
+elif [ -n "$_LATEST_JSONL" ]; then
+  _JSONL_MOD=$(_stat_mtime "$_LATEST_JSONL")
+  _HANDOFF_MOD=$(_stat_mtime "$HANDOFF_FILE")
+  if [ "$_JSONL_MOD" -gt "$_HANDOFF_MOD" ]; then
+    _HANDOFF_STALE=1
+  fi
+fi
+if [ "$_HANDOFF_STALE" = "1" ]; then
   if [ -n "$_LATEST_JSONL" ]; then
     _LAST_MOD=$(_stat_mtime "$_LATEST_JSONL")
     _NOW=$(date +%s)
@@ -704,6 +773,11 @@ $_HANDOFF_CONTENT"
     APPEND_PROMPT="$_HANDOFF_CONTENT"
   fi
 fi
+# Consume the briefing sidecars once injected (#2790). Leaving them on disk
+# lets a later hard crash (which never fires the Stop hook to refresh them)
+# re-serve this now-stale briefing on the next boot. Removing them means the
+# staleness guard above starts from a clean slate every boot.
+rm -f "$HANDOFF_BRIEFING_FILE" "$HANDOFF_FILE" 2>/dev/null || true
 {{else}}
 APPEND_PROMPT={{#if systemPromptAppendShellQuoted}}{{{systemPromptAppendShellQuoted}}}{{else}}""{{/if}}
 {{/if}}
@@ -807,6 +881,36 @@ if command -v switchroom >/dev/null 2>&1; then
   unset sr_wk_pair sr_wk_env sr_wk_key sr_wk_val
 fi
 
+# Fleet-wide webkite render config (#2805). Seed the image-baked default
+# (/opt/switchroom/webkite/config.toml) into the XDG location webkite reads
+# ($HOME/.config/webkite/config.toml) so JS-heavy SPA/booking pages render
+# via the baked-in cloakbrowser instead of returning a static shell.
+#
+# REFRESH-from-image, not copy-if-absent. $HOME (/state/agent/home) is a
+# host-PERSISTENT bind mount (see src/agents/compose.ts), so a copy-if-absent
+# seed would write once and then the stale home copy would shadow every future
+# image-shipped config update forever — the config would be un-updatable
+# fleet-wide after first boot. Instead re-sync the target from the baked
+# default whenever they differ, so an image bump always propagates.
+#
+# Operator override still wins: an operator-authored
+# ~/.switchroom/webkite/config.toml is bind-mounted RO onto this exact target
+# (compose.ts). We detect that mount and leave it untouched; even absent the
+# mountpoint check, a cp onto the RO mount fails harmlessly and the override
+# is preserved.
+if [ -f /opt/switchroom/webkite/config.toml ]; then
+  sr_wk_target="$HOME/.config/webkite/config.toml"
+  if mountpoint -q "$sr_wk_target" 2>/dev/null; then
+    : # operator override bind-mounted RO — never clobber it
+  elif ! cmp -s /opt/switchroom/webkite/config.toml "$sr_wk_target" 2>/dev/null; then
+    mkdir -p "$HOME/.config/webkite" 2>/dev/null || true
+    cp /opt/switchroom/webkite/config.toml "$sr_wk_target" 2>/dev/null \
+      && echo "webkite: synced fleet render config to \$HOME/.config/webkite/config.toml" >&2 \
+      || echo "webkite: could not sync render config (non-fatal)" >&2
+  fi
+  unset sr_wk_target
+fi
+
 # LiteLLM routing (opt-in, #litellm). When SWITCHROOM_LITELLM is set (compose
 # env, gated on litellm.enabled && keyConfirmed), route the unmodified `claude`
 # CLI through the operator's LiteLLM proxy at ANTHROPIC_BASE_URL: fetch the
@@ -839,14 +943,32 @@ fi
 # Empty by default (proxy not confirmed live); set to "1" only on a successful
 # liveliness probe. Deliberately NOT unset with the sr_ll_* scratch vars.
 _LITELLM_OK=""
-if [ -n "$SWITCHROOM_LITELLM" ] && command -v switchroom >/dev/null 2>&1; then
+if [ -n "${SWITCHROOM_LITELLM:-}" ] && command -v switchroom >/dev/null 2>&1; then
   sr_ll_key="$(switchroom vault get "litellm/$SWITCHROOM_AGENT_NAME/api-key" 2>/dev/null || true)"
   sr_ll_ok=""
   if [ -z "$sr_ll_key" ]; then
     echo "litellm: no virtual key for agent '$SWITCHROOM_AGENT_NAME' — falling back to direct OAuth (no tracking/guardrail)" >&2
-  elif command -v curl >/dev/null 2>&1 && [ -n "$ANTHROPIC_BASE_URL" ] \
-       && ! curl -fsS -m 5 -o /dev/null "${ANTHROPIC_BASE_URL%/}/health/liveliness" 2>/dev/null; then
-    echo "litellm: proxy unreachable at $ANTHROPIC_BASE_URL — falling back to direct OAuth (no tracking/guardrail this session)" >&2
+  elif command -v curl >/dev/null 2>&1 && [ -n "$ANTHROPIC_BASE_URL" ]; then
+    # Bounded retry probe (co-boot race fix, 2026-07): when the whole stack
+    # co-boots, the litellm proxy's heavy Python app is often not yet healthy
+    # in the first few seconds. A single one-shot probe fails-open and takes
+    # this agent dark (untracked) for the WHOLE session. Poll the liveliness
+    # endpoint every ~3s for up to 120s (hard budget) and only fall open if
+    # it is STILL unreachable after that whole window.
+    sr_ll_url="${SWITCHROOM_LITELLM_BASE:-${ANTHROPIC_BASE_URL%/anthropic}}/health/liveliness"
+    sr_ll_deadline=$(( $(date +%s) + 120 ))
+    sr_ll_up=""
+    while :; do
+      if curl -fsS -m 5 -o /dev/null "$sr_ll_url" 2>/dev/null; then sr_ll_up="1"; break; fi
+      [ "$(date +%s)" -ge "$sr_ll_deadline" ] && break
+      sleep 3
+    done
+    if [ -z "$sr_ll_up" ]; then
+      echo "litellm: proxy unreachable at ${SWITCHROOM_LITELLM_BASE:-$ANTHROPIC_BASE_URL} after 120s of retries — falling back to direct OAuth (no tracking/guardrail this session)" >&2
+    else
+      sr_ll_ok="1"
+    fi
+    unset sr_ll_url sr_ll_deadline sr_ll_up
   else
     sr_ll_ok="1"
   fi
@@ -868,7 +990,7 @@ x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:
   else
     # Fail-open: drop every routing var so the claude CLI talks to Anthropic
     # directly on its OAuth credential (subscription path), unproxied.
-    unset ANTHROPIC_BASE_URL ANTHROPIC_SMALL_FAST_MODEL SWITCHROOM_LITELLM
+    unset ANTHROPIC_BASE_URL ANTHROPIC_SMALL_FAST_MODEL SWITCHROOM_LITELLM SWITCHROOM_LITELLM_BASE
   fi
   unset sr_ll_key sr_ll_ok
 fi

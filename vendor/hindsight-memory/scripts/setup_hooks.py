@@ -48,6 +48,15 @@ def build_hooks(plugin_root: str) -> dict:
                 "hooks": [
                     {
                         "type": "command",
+                        "command": f'python3 "{plugin_root}/scripts/directive_verify.py"',
+                        "timeout": 10,
+                    }
+                ]
+            },
+            {
+                "hooks": [
+                    {
+                        "type": "command",
                         "command": f'python3 "{plugin_root}/scripts/retain.py"',
                         "timeout": 15,
                         "async": True,

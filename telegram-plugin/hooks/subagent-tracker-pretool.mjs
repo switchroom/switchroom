@@ -54,7 +54,8 @@ const SCHEMA_SQL = `
     ended_at          INTEGER,
     status            TEXT    NOT NULL,
     result_summary    TEXT,
-    jsonl_agent_id    TEXT
+    jsonl_agent_id    TEXT,
+    parent_agent_id   TEXT
   );
   CREATE INDEX IF NOT EXISTS subagents_turn      ON subagents(parent_turn_key);
   CREATE INDEX IF NOT EXISTS subagents_status    ON subagents(status);
@@ -198,6 +199,13 @@ function writeRow(dbPath, { id, parentSessionId, parentTurnKey, agentType, descr
         if (hasJsonlCol == null) {
           db.exec('ALTER TABLE subagents ADD COLUMN jsonl_agent_id TEXT')
           db.exec('CREATE INDEX IF NOT EXISTS subagents_jsonl_id ON subagents(jsonl_agent_id)')
+        }
+        // Migrate older DBs that pre-date parent_agent_id (nested-worker keying).
+        const hasParentAgentCol = db
+          .prepare("SELECT name FROM pragma_table_info('subagents') WHERE name = 'parent_agent_id'")
+          .get()
+        if (hasParentAgentCol == null) {
+          db.exec('ALTER TABLE subagents ADD COLUMN parent_agent_id TEXT')
         }
         // Verify the marker-derived parent_turn_key (snapParams[2]) actually has
         // a row in the turns table before trusting it. The gateway writes the

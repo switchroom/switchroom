@@ -1,5 +1,492 @@
 # Changelog
 
+## v0.17.10 — Hindsight reliability: close the FK-race memory-loss window + review-finding hardening
+
+Ships the fix for a silent memory-loss race in Hindsight plus the hardening
+findings from a full review of the memory implementation. The headline is the
+cross-task foreign-key race that could drop a whole retain batch on the
+document re-ingest path; the rest tightens security, runtime correctness, docs,
+and the propose-card / directive flow.
+
+### Hindsight FK-race fix — no more silent memory loss on re-ingest (#2899)
+
+The retain pipeline resolved entities (Phase 1) and inserted the
+`unit_entities` child rows (Phase 2) in separate transactions. In the window
+between them, graph-maintenance `prune_orphan_entities` could delete an entity
+that Phase 1 had already resolved but Phase 2 had not yet referenced — it
+momentarily looks like an orphan — so the Phase-2 insert violated
+`fk_unit_entities_entity_id_entities`, was classified non-retryable, and the
+entire `batch_retain` was dropped (silent memory loss, worst on the document
+re-ingest / re-consolidation path). Fixed with a same-transaction
+`reassert_entities()` (`INSERT ... ON CONFLICT DO NOTHING`) on the Phase-2
+connection immediately before the child insert: an entity referenced by a live
+unit is by definition not an orphan, so resurrecting it is correct and closes
+the window regardless of pruner timing. Carried as a self-verifying build-patch
+in `docker/Dockerfile.hindsight` with fail-loud `assert n == 1` anchors and a
+hermetic guard test.
+
+### Review-finding hardening (#2905, #2907, #2908, #2909)
+
+- **P1 security (#2905):** loopback-only compose ports, gate mental-model
+  writes behind confirm, confirm-before-legibility.
+- **P3 runtime (#2907):** correct the healthcheck claim, fix host-network port
+  reuse, restore consolidation-backlog visibility (opt-in fleet backlog row),
+  dedupe the port constant.
+- **P2 docs (#2908):** sync the synthesis-layers RFC + operator runbook to the
+  shipped state and fix stale comments.
+- **P4 flow (#2909):** harden the propose-card lifecycle, dedup directives, and
+  decouple the vendor envelope grammar.
+
+### Test env-coupling fixes (#2913)
+
+Decoupled two tests from the hardened-container environment so CI is
+deterministic: the recall-exit-codes tests no longer assume `/tmp` is
+exec-mounted, and the scaffold tilde-path test now controls
+`SWITCHROOM_HOST_HOME` (which outranks `HOME`). Test-only; no product change.
+
+## v0.17.9 — Agents curate their own memory: mental-model-curator skill + permanent Hindsight port-collision fix
+
+Ships the user-facing counterpart to v0.17.8's Phase 5 mental-model machinery —
+a default-on skill that lets an agent survey its own memory and *propose*
+curated mental models — and permanently closes the Hindsight host-port
+collision that could take fleet memory down silently.
+
+### mental-model-curator bundled skill — default-on (#2883)
+
+Adds a new **default-on** bundled skill, `mental-model-curator`, that has an
+agent use its most capable model to review its **own** Hindsight memory bank and
+**propose** well-formed mental models ("knowledge models") to the operator
+through the approve/deny proposal card — never blindly self-creating them.
+Because each mental model carries real recall/reflect (and optional
+post-consolidation) cost, every candidate is routed through
+`mcp__switchroom-telegram__mental_model_propose` so a human ratifies it; agents
+cannot self-approve, by design. The `SKILL.md` teaches a disciplined workflow:
+check `get_bank_stats` and **stop on an empty/thin bank** (it synthesizes to
+confident noise), read existing models and **semantically dedupe** (the propose
+flow only hard-rejects exact-name dupes), survey recurring themes via
+`reflect`/`recall` and cluster them into standing questions the bank actually
+backs, and frame each `source_query` as a **domain** question — never identity /
+"who is the user" (identity lives in profile banks; an identity model is
+explicitly forbidden after it caused a wrong-fact contradiction bug).
+`refresh_after_consolidation` defaults **off** and models stay tight. This turns
+the v0.17.8 Phase 5 propose/approve plumbing into an ability agents actually
+reach for.
+
+### Permanent Hindsight port-collision fix + fresh-install/upgrade hardening (#2885)
+
+`switchroom-hindsight` runs `--network host` and binds `HINDSIGHT_API_PORT`
+directly on the host, so the launcher could hand an **already-occupied** host
+port to `docker run` and then silently crash-loop — fleet memory goes down
+invisibly because a failing auto-recall surfaces no user-facing error. In the
+field this crash-looped ~72× (`[Errno 98] address already in use: 8888`) with
+memory silently down for ~9h, because the old **default port 8888** collided
+with a host `nginx-tunnel-gateway` publishing `127.0.0.1:8888:80`, and because
+the `--recreate` path reused the previously-published port via
+`getRunningHindsightPorts()` without any free-check. Fixes:
+**default API port 8888 → 18888** (`HINDSIGHT_DEFAULT_API_PORT`; UI stays 9999),
+`pickHindsightPorts()` no longer prefers the contended 8888, the recreate path
+now runs the free-check instead of blindly rebinding the old port, plus a **loud
+preflight** and a **memory-down health check** so a bind failure is visible
+instead of silent — all covered by new regression tests. Internal reliability;
+no config change required on upgrade.
+
+## v0.17.8 — Hindsight synthesis layers complete: specialized banks + curated mental models
+
+Closes out the Hindsight synthesis-layers RFC
+(`reference/rfcs/hindsight-synthesis-layers.md`) — Phases 2 through 5 — so
+memory banks are *specialized*, corrections *stick*, and per-specialist mental
+models can be curated without ever crossing the no-silent-self-write line.
+
+### PR A — Close out bank specialization (hindsight Phase 2 / #2871)
+
+Phase 2's core mission/disposition threading (`reflect_mission`,
+`observations_mission`, per-bank `disposition`) already landed via #2855
+(shipped in v0.17.7). This resolves the phase's one remaining open item — the
+dormant #2816 recall tag-filter port — by **documenting it as intentionally
+dormant** rather than wiring a speculative per-bank tag taxonomy the RFC
+doesn't specify. `scaffold.ts` gains a decision comment + `TODO(#2816)`
+spelling out exactly how to wire it later (the `HINDSIGHT_RECALL_TAGS` env
+escape hatch stays available to advanced operators), and a new regression test
+locks the scaffold to the vendor no-op defaults so no agent's recall is
+silently tag-scoped. RFC Phase 2 marked SHIPPED; no runtime behavior change.
+
+### PR B — Deterministic correction capture that sticks (hindsight Phase 3 / #2873)
+
+Extends the Stage-B directive-capture *nudge* (#2864) with a **Stage-C
+Stop-hook post-turn verifier** (`vendor/hindsight-memory/scripts/directive_verify.py`).
+Stage B was purely advisory — when the model silently ignored the nudge a
+durable correction was lost the same way it was pre-Stage-B (Stage A measured a
+~55% miss rate). The verifier isolates the human turn, tests it against a
+**narrow, high-precision** durable-rule regex (a strict subset of Stage B's
+detector, AND-gated on `looks_like_standing_rule`), and — if a durable rule was
+stated but **no** `create_directive` fired — blocks the stop **once** to
+re-prompt capture. Invariant-clean, identical to Stage B: pure-regex detection
+(no model callsite), no silent hook-side write (the model still authors the
+directive verbatim, visible in chat), at-most-once per turn with an explicit
+one-off escape. Reuses the `memory.directive_capture_nudge` knob (disabling the
+nudge disables the verifier). **Also fixes a retain double-fire**: the block
+re-fires the Stop event, so `retain.py` now early-returns under
+`stop_hook_active=true` to avoid POSTing a duplicate transcript document and
+double-incrementing the retain cadence counter.
+
+### PR C — Consolidation-driven remembered/updated surface (hindsight Phase 4 / #2872)
+
+Adds the poll-free **UPDATE** side of the Phase 4 chat-legible memory surface,
+the background counterpart to the foreground store/forget path shipped in
+#2858 (v0.17.7). When the consolidation engine distils a new durable
+observation (or supersedes a stale one) it emits a `consolidation.completed`
+webhook and the gateway surfaces ONE terse line
+(`🧠 updated what I know about "…"` / `🧠 revised …`). New pure
+`consolidation-legibility.ts` module (materiality filter + per-agent rate
+limiter: 10-min interval, 1-h identical-line dedup); `recordWebhookEvent`
+routes the verified event to a **send-free** sink, still audited to
+`webhook-events.jsonl`, **never** injected as a model turn. No model call, no
+polling, no `claude -p`. **Plumbed but dormant** — gated OFF by default
+(`SWITCHROOM_CONSOLIDATION_LEGIBILITY`, opt-in), and the pinned hindsight
+image (v0.8.4) does **not** yet emit `consolidation.completed`, so the consumer
+stays inert until that upstream event ships. The payload parser tolerates
+several plausible field aliases; whoever lands the hindsight-side emitter
+should pin the exact schema.
+
+### PR D — Operator-declared per-agent mental models (hindsight Phase 5 / #2874)
+
+Lands the **operator-curated declarative** half of Phase 5, plus the design
+note (`reference/rfcs/hindsight-phase5-mental-model-curation.md`). Adds
+`memory.mental_models[]` (`{ name, source_query, refresh_after_consolidation?,
+max_tokens? }`), accepted at the **per-agent tier only**, consumed by a
+generalized `ensureMentalModel` / `ensureDeclaredMentalModels` on scaffold +
+reconcile. Avoids every harm that #2447 removed by construction: **no blind
+seeding** (zero declarations = byte-for-byte post-#2447 behavior, no default
+model), **no identity collision** (profile banks still own "who the user is";
+these answer *domain* questions), **no self-escalation** (declarations are
+operator-edited in `switchroom.yaml`), and **no fleet-wide over-seeding** (never
+accepted at `defaults`/profile tier). Refresh is opt-in, off by default.
+
+### PR E — Agent-proposes / human-approves mental models (hindsight Phase 5 / #2875)
+
+Adds the **second half** of the Phase 5 shape on top of PR D: the agent
+**proposes** a mental model, the human **approves in chat**, and on approval it
+becomes a first-class declared model in `agents.<self>.memory.mental_models[]`
+— consumed by the exact `ensureDeclaredMentalModels` path from PR D. New
+`mental_model_propose` gateway MCP tool mirrors the `vault_request_access`
+shape: renders a `[✅ Approve] [🚫 Deny]` card, ends the turn, resumes via a
+synthetic inbound. On approve, the gateway builds a unified diff **appending**
+the model and submits it through hostd's `config_propose_edit` apply+reconcile
+machinery (hostd stays the sole config writer); the #1977 single-tap
+correlation avoids a second card since the operator already approved on the
+proposal card. Guardrails: propose-only/self-approve impossible (operator-only
+tap + hostd gate), duplicate-name rejected before any card, per-agent ≤5
+cards/hour, a narrow self-scope gate letting a non-admin agent append **only**
+to its own `memory.mental_models[]`. Nothing is created before the human taps;
+live-session-only (no 3am cards into an empty topic).
+
+## v0.17.7 — Approvals survive restarts + specialized, chat-legible memory
+
+### PR A — Re-arm approval cards across restarts + bridge request ledger (#2861/#2867)
+
+Pending tool-permission approvals lived only in the gateway's in-memory
+`pendingPermissions` map and died two ways, both closed here. A gateway
+restart used to strip the persisted card ("Gateway restarted…") while the
+claude session stayed suspended inside the MCP permission call — no verdict
+was ever dispatched and the turn wedged (marko's gateway booted ~14× on
+fleet-roll day, killing every pending card each time). And the bridge dropped
+permission requests whenever the gateway IPC was down, so no card ever posted
+and claude hung indefinitely. The existing `permission-card-store.ts`
+persistence is now used to **re-arm** the question after a restart (restoring
+`pendingPermissions` with the original `startedAt` and re-attaching the
+keyboard on the existing message — never a fresh card), and the bridge keeps
+an outstanding-request ledger keyed by `request_id`, buffering disconnected
+requests and re-sending them on every reconnect. Re-arm restores only the
+question, never a verdict (no-self-escalation); kill switch
+`SWITCHROOM_PERMISSION_REARM=0`.
+
+### PR B — Re-offer missed approvals when the operator returns after TTL (#2862/#2866)
+
+When an approval card TTL-expires with the operator away, the gateway
+auto-denies (timeout-is-not-denial) — but nothing re-offered the approval when
+the operator came back, so cron-fired gated work was silently dropped (marko's
+brevo nurture-drip batches died this way two days running). At TTL auto-deny
+the miss is now appended to a persisted digest in `STATE_DIR`
+(`missed-approvals-store.ts`); on the first operator-activity event after ≥1
+miss accumulates, the gateway posts **one** compact digest card per origin
+surface. **Retry** synthesizes an inbound asking the agent to re-attempt the
+action (the same synthesized-inbound path cron uses — it re-raises a fresh
+approval card, never a synthesized verdict); **Dismiss** clears the record.
+Kill switch `SWITCHROOM_MISSED_APPROVAL_REOFFER=0`.
+
+### PR C — Persist scoped grants across restarts (#2863/#2865)
+
+The gateway's 30-min scoped-approval windows (`scopedGrants`) were in-memory
+only, so any bounce — fleet roll, config apply, failover probe — wiped every
+window and an action the operator had allowed minutes ago re-carded
+immediately, reading as "my approval didn't stick." They now persist to a tiny
+`STATE_DIR/scoped-grants.json` (same pattern as the card store). Entries carry
+the absolute wall-clock `expiresAt` captured at the original tap, so a restart
+can never *extend* a window (grant at T, reload at T+29min → ~1 min left); the
+reloaded grant runs the identical fail-closed gate. Kill switch
+`SWITCHROOM_SCOPED_GRANT_PERSIST=0`.
+
+### PR D — Route cron boot-replays through the durable inbound spool (#2793 part B / #2860)
+
+Cron boot-replay was ledgered at socket-accept in the scheduler, not at
+consumption, opening two windows: a replay accepted but never consumed (bridge
+not up yet) was recorded delivered and dropped (silent-loss), and the
+accept-time ledger couldn't distinguish "consumed" from "accepted" so a
+re-replay across a restart could re-run it (double-fire). A boot-replay now
+carries `meta.replay_fire_ms` and routes through the durable inbound spool —
+`put` on accept, `ack` only on confirmed delivery — with a stable `spoolId`
+keyed on `(chatId, schedule_index, replay_fire_ms)`. Re-replays dedup to one
+entry (closes double-fire) and un-acked entries re-deliver on the next boot
+(closes silent-loss): at-least-once with dedup. (Part A, at-most-once resume,
+shipped earlier in #2808.)
+
+### PR E — Sparse, chat-legible memory surface (hindsight Phase 4 / #2858)
+
+Surfaces ONE terse line in the originating chat/topic when the interactive
+session *materially* changes what it remembers: `📌 remembered: "<directive>"`
+on `create_directive`, `✂️ forgot: …` on an invalidate / demote-from-recall.
+Deterministic tool-call observation — no model call, no polling, no `claude
+-p`. It's sparse and material-only: **no line on ordinary recall, no line on
+routine consolidation**, avoiding the "regurgitating old facts unprompted"
+anti-pattern. New reusable `memory-legibility.ts` module (whose
+`detectMemoryLegibilityEvent` primitive PR F imports rather than re-deriving);
+kill switch `SWITCHROOM_MEMORY_LEGIBILITY=0` (default ON). Serves
+`remember-across-sessions`.
+
+### PR F — Deterministic directive-capture nudge (#2848 Stage B / #2864)
+
+Stage A measured a **~55% miss rate** on durable corrections — capture was a
+per-agent lottery (clerk held 0 directives across 449 messages). The vendored
+recall hook (UserPromptSubmit) now regex-detects correction / standing-rule-
+shaped inbound and appends a terse advisory to the turn's `additionalContext`
+telling the model to persist the rule with `create_directive` **if** it's
+durable — the model still does the judgment in-session and calls the tool
+itself (no silent hook-side write, no new model callsite). A negative guard
+scrubs pleasantry shapes ("always happy to help") before matching. Config knob
+`memory.directive_capture_nudge` (default ON). Serves
+`remember-across-sessions`.
+
+### PR G — Thread reflect/observations mission + disposition through the cascade (#2855)
+
+Phase 2 of the hindsight synthesis-layers RFC — banks should be *specialized*,
+not merely isolated. Wires the remaining bank-steering levers through the
+config cascade: `reflect_mission` and `observations_mission` (string,
+override) and `disposition {skepticism, literalism, empathy}` (1–5 each,
+per-key merge). Verified against the live engine: `disposition` is three flat
+1–5 integer fields (modeled as one nested object in YAML, flattened at the API
+boundary), and switchroom's existing `bank_mission` **is** the engine's
+`reflect_mission` (kept as a documented alias). Built-in profiles ship
+differentiated defaults (`health-coach` empathy-high 2/2/5,
+`executive-assistant` 4/4/3, `coding` 4/5/2) so a fresh setup needs zero
+config. Operator-config-driven only — no agent self-modification of its own
+bank missions.
+
+### PR H — Pin the refresh-hindsight recreate to the release target (#2851/#2856)
+
+`switchroom update`'s `refresh-hindsight` step recreated the hindsight
+singleton via `memory setup --recreate` with no `--tag`, so it always pulled
+floating `:latest` even on a version-pinned fleet — the hole that left the
+v0.17.5 roll's `switchroom-hindsight` on `:latest`. The target is now resolved
+lazily (`--pin`, else the persisted `release.pin`) and threaded as `--tag
+<version>`. Only a concrete `vX.Y.Z` is pinnable; a `sha-` pin, a floating
+`--channel`, or no pin still floats to `:latest` (the standalone default,
+unchanged).
+
+### PR I — `switchroom apply --dry-run` (#2829)
+
+Adds a real `--dry-run` to `switchroom apply`: it runs the full
+compose-regeneration + validation pipeline **in memory** and reports what a
+real apply would do — profile resolution per agent, vault provisioning gaps
+(broker reachability, new-key provisioning), and would-be compose changes
+(image-tag deltas) — **without** writing the compose file, persisting
+anything, or touching a container. Exits non-zero when a real apply would
+fail. Closes the gap behind the v0.17.0 rollout incident, where
+`rollout --dry-run` only printed the step plan and never exercised the
+config-regeneration that actually failed (`apply --dry-run` errored with
+`unknown option`).
+
+### PR J — Docs: fix ProductOS link + conform reference/ to current templates (#2868)
+
+Fixes the 404ing `../../ProductOS/` relative link in `reference/README.md`,
+and brings `reference/` into conformance with the current ProductOS templates
+after the front-door revamp: adds the missing `## Related` section to the 9 job
+specs that lacked it (all 23 now carry the full terse subset) and fixes two
+RFCs using path-style `serves:` values to the bare-slug scheme.
+
+## v0.17.6 — Durable fleet failover: persisted active, proactive roll, unpinned consumers
+
+### PR A — Honest ↻ Refresh on /auth and /usage cards (#2843)
+
+The cards' ↻ Refresh button served up-to-45s-cached quota while stamping
+"Live · refreshed 0s ago". It now passes `forceLive` (an explicit tap is
+the user asking for live-now data, still throttled to one per 5s per
+message), stamps "⚠ cached Nm ago" whenever any account was served from
+cache, and keeps demo-mode email masking across refresh (switch-button
+labels are masked too). The served/capturedAt zip logic is extracted as
+`zipProbeResults` with unit tests so the footer logic can't drift.
+
+### PR B — Durable fleet failover (#2845)
+
+Root cause of the 2026-07-05 walled-fleet incident: account swaps lived
+only in broker memory, so every broker/agent recreate reloaded the stale
+yaml `auth.active` and re-poisoned the fleet with a quota-walled account;
+an idle fleet never proactively recovered at all.
+
+- **Persisted active override** (`state/auth-broker/active-override.json`)
+  — written on every `set-active` and every corroborated roll; applied at
+  boot + SIGHUP. A hand-edited yaml `auth.active` wins and drops the
+  override (operator intent is never overridden by stale automation).
+- **Auto-promote on roll** — `mark-exhausted` with a successful roll
+  promotes the target to nominal `auth.active` (persisted). Gated on a
+  fresh (≤5h) live snapshot proving the wall, so a bogus mark keeps the
+  old self-reverting window semantics. Note: after a corroborated wall
+  the fleet *stays* on the promoted account when the old one refills —
+  no auto-revert to the previous primary.
+- **Proactive fleet failover** — the broker's periodic per-account probe
+  now rolls the fleet the moment the ACTIVE account's fresh probe shows
+  exhaustion (boot + interval; kill switch
+  `SWITCHROOM_DISABLE_FLEET_QUOTA_PROBE=1`). No failed agent turn needed.
+
+### PR C — Optional consumer pin: unpinned consumers follow the fleet active (#2852)
+
+`auth.consumers[].account` is now optional. An unpinned consumer (the new
+`switchroom setup` default for hindsight) rides `auth.active` exactly like
+an agent: same swaps, same failover, mark-exhausted attributes to the
+active. Pinned consumers keep the existing quota-isolation semantics.
+Config note: a pin-less consumer entry requires this broker version —
+unpin yaml only after the fleet is on v0.17.6. Also folds in #2845 review
+hardening: proactive marks write durable audit records, and the durable-
+promote corroboration ceiling tightens from 24h to one 5h refill period.
+
+## v0.17.5 — Fix approval card race + start.sh claude command warning
+
+### PR A — Hold inbound delivery gate while approval card is outstanding (#2840)
+
+After the first interim reply, `releaseTurnBufferGate` cleared `claudeBusyKeys`
+even when claude was still blocked on an outstanding approval card. A new
+inbound arriving in that window saw `turnInFlightAtReceipt=false`, delivered
+directly, and displaced the approval context — orphaning the pending MCP call
+(observed: Brevo post approval tapped, but email send never executed).
+
+`turnInFlightForGate()` now returns `true` while `pendingPermissions` is
+non-empty, keeping the gate closed from card-post through the operator tap or
+10-minute auto-deny TTL.
+
+### PR B — Structural regression tests + prune loop guard (#2841)
+
+- Structural pins in `permission-no-repeat-wiring.test.ts` asserting both code
+  paths of `turnInFlightForGate()` include `pendingPermissions.size > 0`. Future
+  refactors that drop the guard will fail CI.
+- `start.sh` prune loop skips the canonical `$HOME/.local/bin/claude` symlink
+  (via `readlink` guard) to avoid spurious "pruning shadow" log on subsequent
+  boots.
+
+### PR C — Fix stale comment in start.sh re-seat block (#2842)
+
+Corrects a one-sentence comment that said the prune loop "removes" the symlink
+on the next boot — after the #2841 guard it now skips (preserves) it.
+
+Also re-seats `$HOME/.local/bin/claude → /usr/local/bin/claude` at boot,
+silencing the claude v2.1.x+ "claude command missing or broken" startup warning.
+
+## v0.17.4 — Fix "Always allow" not sticking
+
+`config_propose_edit` in hostd now passes `--only <agent>` to `switchroom apply`,
+scoping reconcile to just the requesting agent (~8s) instead of the full fleet
+(2+ min). The full-fleet apply was exceeding the gateway's 60s dispatch timeout,
+causing "Always allow" taps to silently fail — the permission was granted for the
+session but never written to disk.
+
+## v0.17.3 — LiteLLM Anthropic pass-through
+
+### Claude routes via the /anthropic pass-through, not the model-mapped path (#2835)
+
+Routing Claude (opus) through LiteLLM's model-mapped `/v1/messages` route
+re-chunks the upstream SSE stream, which stalled long responses mid-flight
+("API Error: Response stalled mid-stream" after minutes — the 2026-07-05
+marko incident). Claude now points at LiteLLM's **Anthropic pass-through**
+(`<root>/anthropic/v1/messages`), which raw-forwards and streams native SSE
+bytes — same shape as direct OAuth, no re-chunk.
+
+- `compose.ts` emits `ANTHROPIC_BASE_URL=<root>/anthropic` for the claude
+  CLI, plus a new `SWITCHROOM_LITELLM_BASE=<root>` for the two consumers
+  that need the root proxy surface, not the pass-through: start.sh's
+  `/health/liveliness` boot probe and the gateway's `/model/info`
+  non-Claude (`sr-*`) model discovery.
+- `start.sh` (outer + inner) + `cron-session.sh` health probes and the
+  gateway's `discoverSrModels` now target the root; hindsight's
+  claude_agent_sdk subprocess also routes via the pass-through.
+- OAuth still rides in `Authorization` (forwarded upstream unchanged); the
+  virtual key rides in `x-litellm-api-key` — the split that keeps this
+  subscription-native. Non-Claude models stay on the model-mapped root path
+  via the virtual key.
+- Pairs with a LiteLLM proxy bump to v1.91.0 ("disable proxy buffering on
+  streaming SSE responses") on the operator's deployment.
+
+## v0.17.2 — hostd self-service rolls
+
+### PR A — hostd self-bump on stale-CLI rollout (#2833)
+
+- **hostd self-bumps on a stale-CLI rollout instead of refusing** (#2645):
+  hostd's CLI is baked into its image, so it is older than EVERY freshly
+  tagged release — which made every agent-invoked `rollout` to a new version
+  fail `preflight-stale-cli`, with a host-shell-only remedy (`switchroom
+  hostd install --tag …`). The root agent could never roll a release by
+  itself; agents worked around it by hand-editing hostd's compose file. Now,
+  when the pin is newer than hostd's own CLI, hostd: verifies the target
+  image is pullable (`docker manifest inspect` — refuses cleanly when the
+  docker-images workflow hasn't finished), tag-bumps its own compose in
+  place (backup kept), writes a resume marker, and hands its own recreate to
+  a detached sibling helper container (`docker run -d --rm`, docker.sock +
+  hostd dir only — a sibling survives the recreate that would SIGKILL any
+  in-container driver, brick scenario #1/#2458). The NEW hostd finds the
+  marker at boot and relaunches the roll under the SAME request_id, so the
+  audit hash-chain, in-chat narration and `get_status` all continue
+  seamlessly. Marker is single-shot (deleted before validation), staleness-
+  capped at 15 min, and shape-validated; a failed helper is caught by a
+  `docker wait` watcher that rolls the compose bump back and writes a loud
+  terminal row. New `self-bump` / `self-bump-done` narration phases. The
+  rollout terminal warnings now name exactly what stays on the prior version
+  (web dashboard, host operator CLI) with the host-side finish commands
+  (#2645 item 3).
+
+### PR B — keep broker operator socket across hostd rollouts (#2832)
+
+- **hostd-driven rollouts no longer drop the vault-broker operator socket**:
+  `resolveOperatorUid()` read only `SUDO_UID` → `getuid()`; when `apply` is
+  shelled out by hostd it runs as root without sudo, so it returned
+  `undefined` and `generateCompose` omitted the operator-socket bind — which
+  broke host-shell `switchroom vault …` and made the litellm key-confirm
+  probe fail, silently stripping litellm routing fleet-wide (observed on the
+  v0.17.1 roll). `SWITCHROOM_HOSTD_OPERATOR_UID` (already injected into
+  hostd, same host-fact pattern as `SWITCHROOM_HOST_HOME`/`_TZ`) is now the
+  final fallback; sudo/`getuid()` still win when present.
+
+## v0.16.50 — Fleet-wide webkite render config
+
+### Web extraction
+
+- **Baked-in webkite render config so JS-heavy sites render** (#2805): the
+  fleet ships cloakbrowser (stealth Chromium) baked into the agent image, but
+  carried no webkite render config, so webkite's auto-heuristic classified
+  JS-gated SPA/booking pages (e.g. `palacecinemas.com.au` session times) as
+  `thin_article` with `has_renderers: false` and returned only the static
+  shell. A default `config.toml` is now baked to `/opt/switchroom/webkite/`
+  in `Dockerfile.agent` and re-synced to `~/.config/webkite/config.toml` at
+  boot by `start.sh` whenever the two differ (NOT copy-if-absent: `$HOME` is a
+  host-persistent bind mount, so a write-once seed would let a stale home copy
+  shadow every future image update; refresh-from-image keeps the fleet
+  current). An operator-authored `~/.switchroom/webkite/config.toml` override
+  is bind-mounted RO onto the same target and still wins (detected and left
+  untouched). It enables render, keeps the baked-in local cloakbrowser as the
+  auto-spawned primary backend with Cloudflare/Firecrawl as cloud fallback
+  (`profile = "local-first"`), and force-renders known JS-gated domains via
+  `[[render.routes]]`. Every
+  key was verified against the shipped `webkite` binary's own schema. NOTE: a
+  per-route post-render wait/interaction hook is not expressible in webkite
+  0.4.0's `RouteConfig` (only `domains`/`providers`/`mode`/`exclusive`); the
+  wait-for-selector path remains a per-call `webkite_read` argument.
+
 ## v0.16.47 — Admin-key passphrase prompt made unmissable
 
 A single focused Telegram fix on top of v0.16.46.

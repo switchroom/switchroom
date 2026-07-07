@@ -637,7 +637,7 @@ describe('rolling window — createWorkerActivityFeed narrative accumulation', (
 // ─── Worker heartbeat (option a — suffix-only, never opens a new message) ─────
 
 describe('createWorkerActivityFeed — heartbeat', () => {
-  it('(i) a tick fires a re-render with a climbing · Ns suffix on a stale worker', async () => {
+  it('(i) a tick fires a re-render with a climbing · Ns suffix showing the current step\'s OWN elapsed', async () => {
     const bot = makeFakeBot()
     let clock = 10_000
     const feed = createWorkerActivityFeed({
@@ -649,22 +649,50 @@ describe('createWorkerActivityFeed — heartbeat', () => {
       setInterval: () => 1,
       clearInterval: () => {},
     })
-    // First paint at elapsed 0 (firstPaintMin default 8000 — use 9000).
+    // First paint at elapsed 0 (firstPaintMin default 8000 — use 9000). The
+    // narrative line 'pulling data' lands here, so the current step starts now.
     clock = 19_000
     await feed.update('w1', 'chat', view({ elapsedMs: 9000, latestSummary: 'pulling data' }))
     expect(bot.sent).toHaveLength(1)
-    const dispatchAt = clock - 9000
+    const stepStart = clock // step began when the '→' line first appeared
 
-    // Advance past the staleness window so the heartbeat ticks.
-    clock = 26_000 // lastEditAt(19000) + 7000 ≥ heartbeatTickMs(6000) and ≥ minEditInterval
+    // Advance well past the per-step 10s gate so the heartbeat renders a suffix.
+    clock = 32_000 // step is now 13s old; lastEditAt(19000)+13000 ≥ heartbeatTickMs
     feed.heartbeatTick()
-    await feed.update('w1', 'chat', view({ elapsedMs: 16_000, latestSummary: 'pulling data' })).catch(() => {})
+    await feed.update('w1', 'chat', view({ elapsedMs: 22_000, latestSummary: 'pulling data' })).catch(() => {})
     // Drain the chain.
-    await feed.update('w1', 'chat', view({ elapsedMs: 16_000, latestSummary: 'pulling data' }))
+    await feed.update('w1', 'chat', view({ elapsedMs: 22_000, latestSummary: 'pulling data' }))
     const edit1 = bot.edits.find((e) => /· \d+s\*\*/.test(e.text))
     expect(edit1).toBeDefined()
-    // The suffix reflects the LIVE elapsed (now - dispatchAt), not the stale view.
-    expect(edit1!.text).toContain(`· ${Math.floor((26_000 - dispatchAt) / 1000)}s`)
+    // The step suffix reflects the STEP's OWN elapsed (now - stepStart), NOT
+    // the worker total — the header already carries the total.
+    expect(edit1!.text).toContain(`· ${Math.floor((32_000 - stepStart) / 1000)}s`)
+  })
+
+  it('(i-a) suppresses the step suffix while the current step is younger than the 10s gate', async () => {
+    const bot = makeFakeBot()
+    let clock = 10_000
+    const feed = createWorkerActivityFeed({
+      bot,
+      now: () => clock,
+      minEditIntervalMs: 2500,
+      heartbeatTickMs: 6000,
+      setInterval: () => 1,
+      clearInterval: () => {},
+    })
+    // Step begins here.
+    clock = 19_000
+    await feed.update('w1', 'chat', view({ elapsedMs: 9000, latestSummary: 'pulling data' }))
+    expect(bot.sent).toHaveLength(1)
+
+    // Heartbeat only 7s into the step — under STEP_TIMER_MIN_MS (10s), so no
+    // `· Ns` suffix on the '→' line yet (the header total still climbs).
+    clock = 26_000
+    feed.heartbeatTick()
+    await feed.update('w1', 'chat', view({ elapsedMs: 16_000, latestSummary: 'pulling data' })).catch(() => {})
+    await feed.update('w1', 'chat', view({ elapsedMs: 16_000, latestSummary: 'pulling data' }))
+    const stepSuffixEdit = bot.edits.find((e) => /· \d+s\*\*/.test(e.text))
+    expect(stepSuffixEdit).toBeUndefined()
   })
 
   it('(i-b) heartbeat repaint keeps the header master elapsed >= the step timer (same clock anchor)', async () => {
@@ -1110,5 +1138,56 @@ describe('header row + rolling overflow survive in the unified worker render', (
     expect(out).toContain('🛠 **Worker**')
     expect(out).toContain('_10s · ')
     expect(isValidWorkerMarkdown(out)).toBe(true)
+  })
+})
+
+// ─── Dedup — non-adjacent repeats within the rolling window (unified cards) ──
+
+describe('narrative dedup — non-adjacent repeats collapse (A,B,A)', () => {
+  it('a line already in the rolling window is not re-appended', async () => {
+    const bot = makeFakeBot()
+    let clock = 10_000
+    const feed = createWorkerActivityFeed({ bot, now: () => clock, minEditIntervalMs: 0 })
+
+    // The live-observed duplication: a preamble ("Look for nested subagents
+    // structure") surfaces, another step lands, then the same text re-fires
+    // (e.g. as the Task tool's describeToolUse label for the same step).
+    const seq = [
+      'Look for nested subagents structure',
+      'Inspect subagents dir files',
+      'Look for nested subagents structure', // non-adjacent repeat — must collapse
+      'Inspect subagents dir files',         // non-adjacent repeat — must collapse
+      'Tail the child jsonl',
+    ]
+    for (const line of seq) {
+      clock += 1000
+      await feed.update('w-dedup', 'chat', view({ latestSummary: line }))
+    }
+
+    const last = bot.edits.at(-1) ?? bot.sent.at(-1)!
+    const count = (needle: string): number => last.text.split(needle).length - 1
+    expect(count('Look for nested subagents structure')).toBe(1)
+    expect(count('Inspect subagents dir files')).toBe(1)
+    expect(last.text).toContain('Tail the child jsonl')
+    // Source order preserved: first occurrence wins its slot.
+    expect(last.text.indexOf('Look for nested subagents structure'))
+      .toBeLessThan(last.text.indexOf('Inspect subagents dir files'))
+  })
+
+  it('a legitimate revisit re-appears once the earlier copy scrolls out of the window', async () => {
+    const bot = makeFakeBot()
+    let clock = 10_000
+    const feed = createWorkerActivityFeed({ bot, now: () => clock, minEditIntervalMs: 0 })
+
+    await feed.update('w2', 'chat', view({ latestSummary: 'step-repeat' }))
+    // Push STATUS_ROLLING_LINES distinct lines so 'step-repeat' scrolls out.
+    for (let i = 0; i < STATUS_ROLLING_LINES; i++) {
+      clock += 1000
+      await feed.update('w2', 'chat', view({ latestSummary: `filler-${i}` }))
+    }
+    clock += 1000
+    await feed.update('w2', 'chat', view({ latestSummary: 'step-repeat' }))
+    const last = bot.edits.at(-1)!
+    expect(last.text).toContain('step-repeat')
   })
 })

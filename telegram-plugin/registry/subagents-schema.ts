@@ -104,6 +104,18 @@ export interface Subagent {
   result_summary: string | null
   /** JSONL filename stem (e.g. "a37ad7639ae61476c") for watcher ID linkage. */
   jsonl_agent_id: string | null
+  /**
+   * JSONL stem of the DISPATCHING sub-agent, for a NESTED (depth-2+) worker
+   * — one spawned by another sub-agent rather than by the main session.
+   * NULL for a main-session dispatch. Written by the watcher when it
+   * observes an Agent/Task tool_use inside a worker's own JSONL
+   * (recordNestedSubagentDispatch). Enables transitive origin-chat
+   * resolution: a nested worker whose parent_turn_key can never be stamped
+   * (its dispatching context is a background worker that outlives the main
+   * turn, so turn-active.json is gone) inherits routing from its ancestor
+   * chain instead.
+   */
+  parent_agent_id: string | null
 }
 
 export interface RecordSubagentStartArgs {
@@ -194,7 +206,8 @@ const SUBAGENTS_SCHEMA_SQL = `
     ended_at          INTEGER,
     status            TEXT    NOT NULL,
     result_summary    TEXT,
-    jsonl_agent_id    TEXT
+    jsonl_agent_id    TEXT,
+    parent_agent_id   TEXT
   );
   CREATE INDEX IF NOT EXISTS subagents_turn      ON subagents(parent_turn_key);
   CREATE INDEX IF NOT EXISTS subagents_status    ON subagents(status);
@@ -220,6 +233,12 @@ export function applySubagentsSchema(db: SqliteDatabase): void {
   const hasJsonlId = cols.some((c) => c.name === 'jsonl_agent_id')
   if (!hasJsonlId) {
     db.exec('ALTER TABLE subagents ADD COLUMN jsonl_agent_id TEXT')
+  }
+  // Idempotent migration for DBs created before parent_agent_id existed
+  // (nested-worker keying — see the Subagent.parent_agent_id doc).
+  const hasParentAgentId = cols.some((c) => c.name === 'parent_agent_id')
+  if (!hasParentAgentId) {
+    db.exec('ALTER TABLE subagents ADD COLUMN parent_agent_id TEXT')
   }
   // Always (re-)apply the index. `IF NOT EXISTS` makes this a no-op when it
   // already exists. Splitting it from SUBAGENTS_SCHEMA_SQL is what fixes the
@@ -296,6 +315,7 @@ interface RawSubagentRow {
   status: string
   result_summary: string | null
   jsonl_agent_id: string | null
+  parent_agent_id?: string | null
 }
 
 function mapSubagentRow(row: RawSubagentRow): Subagent {
@@ -312,6 +332,7 @@ function mapSubagentRow(row: RawSubagentRow): Subagent {
     status: row.status as SubagentStatus,
     result_summary: row.result_summary,
     jsonl_agent_id: row.jsonl_agent_id,
+    parent_agent_id: row.parent_agent_id ?? null,
   }
 }
 
@@ -578,4 +599,108 @@ export function getSubagent(db: SqliteDatabase, id: string): Subagent | null {
     | RawSubagentRow
     | undefined
   return row ? mapSubagentRow(row) : null
+}
+
+// ---------------------------------------------------------------------------
+// Nested (depth-2+) worker keying — the unified progress-card fix
+// ---------------------------------------------------------------------------
+
+export interface RecordNestedSubagentDispatchArgs {
+  /** tool_use id of the nested Agent/Task dispatch — the subagents PK the
+   *  child's meta.json `toolUseId` will later link against. */
+  toolUseId: string
+  /** JSONL stem of the DISPATCHING worker (the parent sub-agent). */
+  parentJsonlAgentId: string
+  agentType?: string | null
+  description?: string | null
+  /** `run_in_background` from the nested dispatch's tool_input. */
+  background: boolean
+  now: number
+}
+
+/**
+ * Record a NESTED sub-agent dispatch observed by the watcher in a worker's
+ * own JSONL (a `sub_agent_tool_use` whose tool is Agent/Task).
+ *
+ * Why this exists: the PreToolUse tracker hook derives `parent_turn_key`
+ * from the gateway's `turn-active.json` marker, which only exists during
+ * the MAIN turn. A nested worker is dispatched by a background depth-1
+ * worker that outlives that turn, so the marker is gone → the hook stamps
+ * NULL (or, under concurrent dispatch, the hook's write can be lost
+ * entirely). The row is then missing/unattributed: origin-chat resolution
+ * returns null (card misroutes to the owner DM), `resolveWorkerFeedDispatch`
+ * defaults the worker to foreground, and the card freezes on "starting…"
+ * forever. The watcher, however, tails the parent worker's JSONL and SEES
+ * the nested dispatch — so it is the reliable recorder for depth-2+.
+ *
+ * Behaviour (idempotent, safe to call on every observation):
+ *   - INSERT OR IGNORE a row keyed on the dispatch tool_use_id (harmless
+ *     no-op when the pretool hook's row already landed).
+ *   - Stamp `parent_agent_id` (the dispatching worker's JSONL stem) when
+ *     not already set.
+ *   - Inherit `parent_turn_key` transitively from the parent worker's row
+ *     when NULL — the parent's row was stamped at ITS dispatch (main turn
+ *     still active), so the chain bottoms out at a real turn key.
+ */
+export function recordNestedSubagentDispatch(
+  db: SqliteDatabase,
+  args: RecordNestedSubagentDispatchArgs,
+): void {
+  db.prepare(`
+    INSERT OR IGNORE INTO subagents
+      (id, parent_session_id, parent_turn_key, agent_type, description,
+       background, started_at, last_activity_at, status, jsonl_agent_id,
+       parent_agent_id)
+    VALUES (?, NULL, NULL, ?, ?, ?, ?, ?, 'running', NULL, ?)
+  `).run(
+    args.toolUseId,
+    args.agentType ?? null,
+    args.description ?? null,
+    args.background ? 1 : 0,
+    args.now,
+    args.now,
+    args.parentJsonlAgentId,
+  )
+  // Repair path for a hook-inserted row: stamp nested parentage and inherit
+  // the origin turn key from the parent worker's row when missing. COALESCE
+  // keeps any value already present (hook-stamped or previously inherited).
+  db.prepare(`
+    UPDATE subagents
+    SET parent_agent_id = COALESCE(parent_agent_id, ?),
+        parent_turn_key = COALESCE(
+          parent_turn_key,
+          (SELECT p.parent_turn_key FROM subagents p
+           WHERE p.jsonl_agent_id = ? LIMIT 1)
+        )
+    WHERE id = ?
+  `).run(args.parentJsonlAgentId, args.parentJsonlAgentId, args.toolUseId)
+}
+
+/**
+ * Resolve the ORIGIN turn key for a worker, walking the nested-parent chain.
+ *
+ * Depth-1: the row's own `parent_turn_key`. Depth-2+: when NULL, follow
+ * `parent_agent_id` (the dispatching worker's JSONL stem) up the chain until
+ * a row with a non-NULL `parent_turn_key` is found. Bounded (default 5 hops)
+ * and cycle-safe. Returns null when nothing in the chain is attributed —
+ * callers keep their existing DM fallback.
+ */
+export function resolveSubagentOriginTurnKey(
+  db: SqliteDatabase,
+  jsonlAgentId: string,
+  maxHops = 5,
+): string | null {
+  const seen = new Set<string>()
+  let currentJsonlId: string | null = jsonlAgentId
+  for (let hop = 0; hop <= maxHops && currentJsonlId != null; hop++) {
+    if (seen.has(currentJsonlId)) return null
+    seen.add(currentJsonlId)
+    const row = db
+      .prepare('SELECT parent_turn_key, parent_agent_id FROM subagents WHERE jsonl_agent_id = ? LIMIT 1')
+      .get(currentJsonlId) as { parent_turn_key: string | null; parent_agent_id: string | null } | undefined
+    if (row == null) return null
+    if (row.parent_turn_key != null && row.parent_turn_key.length > 0) return row.parent_turn_key
+    currentJsonlId = row.parent_agent_id ?? null
+  }
+  return null
 }

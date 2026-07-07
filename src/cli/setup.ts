@@ -36,6 +36,9 @@ import {
   stopHindsight,
   ensureHindsightConsumer,
   HINDSIGHT_CONSUMER_NAME,
+  HINDSIGHT_DEFAULT_API_PORT,
+  pickHindsightPorts,
+  preflightHindsightPorts,
   type LiteLLMHindsightConfig,
 } from "../setup/hindsight.js";
 import { getViaBrokerStructured } from "../vault/broker/client.js";
@@ -910,7 +913,11 @@ async function resolveLiteLLMForHindsight(
   if (!topLiteLLM?.enabled || !topLiteLLM.base_url) return undefined;
   const result = await getViaBrokerStructured("litellm/hindsight/api-key").catch(() => null);
   if (!result || result.kind !== "ok" || result.entry.kind !== "string") return undefined;
-  return { baseUrl: topLiteLLM.base_url, apiKey: result.entry.value };
+  return {
+    baseUrl: topLiteLLM.base_url,
+    apiKey: result.entry.value,
+    model: config.memory?.config?.llm_model,
+  };
 }
 
 async function stepMemoryBackend(
@@ -983,22 +990,17 @@ async function stepMemoryBackend(
   } catch { /* vault unreachable; skip the courtesy note */ }
 
   // Register the hindsight consumer in switchroom.yaml so the auth-broker
-  // binds a per-consumer UDS for it on next `switchroom apply`.
-  const activeAccount = config.auth?.active;
-  if (!activeAccount) {
-    console.log(
-      chalk.yellow(
-        `  No auth.active account set — skipping consumer registration. ` +
-          `Run \`switchroom auth use <label>\` and re-run setup.`,
-      ),
-    );
-  } else {
+  // binds a per-consumer UDS for it on next `switchroom apply`. Registered
+  // UNPINNED (no `account:`): the consumer follows the fleet `auth.active`
+  // with the same failover agents get. Operators who want quota isolation
+  // can add an explicit `account:` pin afterwards.
+  {
     try {
-      const result = await ensureHindsightConsumer(switchroomConfigPath, activeAccount);
+      const result = await ensureHindsightConsumer(switchroomConfigPath);
       if (result.added) {
         console.log(
           chalk.green(
-            `  ${STEP_DONE} Registered auth.consumers[${HINDSIGHT_CONSUMER_NAME}] = ${activeAccount}`,
+            `  ${STEP_DONE} Registered auth.consumers[${HINDSIGHT_CONSUMER_NAME}] (follows the fleet active account)`,
           ),
         );
       } else {
@@ -1039,19 +1041,75 @@ async function stepMemoryBackend(
     stopHindsight();
   }
 
+  // Pick + preflight host ports through the SAME guard `switchroom memory`
+  // uses, so a fresh install never hands an occupied host port to
+  // `docker run` (the 2026-07 crash-loop: hindsight died on `[Errno 98]
+  // address already in use` while fleet memory was silently down). Upstream
+  // default 18888/19999 first, fall back to a free pair if occupied.
+  let ports: { apiPort: number; uiPort: number };
+  try {
+    ports = await pickHindsightPorts();
+  } catch (err) {
+    console.log(chalk.red(`  ${(err as Error).message}`));
+    return;
+  }
+  if (ports.apiPort !== HINDSIGHT_DEFAULT_API_PORT) {
+    console.log(
+      chalk.yellow(
+        `  Port ${HINDSIGHT_DEFAULT_API_PORT} is already in use; ` +
+          `using ${ports.apiPort}/${ports.uiPort} instead.`,
+      ),
+    );
+  }
+
+  // Preflight: NEVER hand an occupied host port to `docker run`. If the
+  // chosen port is occupied, re-pick from scratch; if still occupied, abort
+  // loudly rather than crash-looping.
+  let conflict = await preflightHindsightPorts(ports);
+  if (conflict) {
+    const heldBy = conflict.holder ? ` (held by ${conflict.holder})` : "";
+    console.log(
+      chalk.yellow(
+        `  Chosen Hindsight port ${conflict.port} is occupied${heldBy}; ` +
+          `selecting a free port instead of crash-looping.`,
+      ),
+    );
+    try {
+      ports = await pickHindsightPorts();
+    } catch (err) {
+      console.log(chalk.red(`  ${(err as Error).message}`));
+      return;
+    }
+    conflict = await preflightHindsightPorts(ports);
+    if (conflict) {
+      const stillHeldBy = conflict.holder ? ` (held by ${conflict.holder})` : "";
+      console.log(
+        chalk.red(
+          `  Refusing to start Hindsight: port ${conflict.port} is still ` +
+            `occupied${stillHeldBy} after reassignment. Free it and re-run ` +
+            "`switchroom setup`.",
+        ),
+      );
+      return;
+    }
+    console.log(
+      chalk.green(`  Reassigned Hindsight to port ${ports.apiPort}/${ports.uiPort}.`),
+    );
+  }
+
   // Start the container in broker-fed mode (no API key).
   const spin = spinner("Starting Hindsight Docker container...");
   try {
     const litellmCfg = await resolveLiteLLMForHindsight(config);
-    startHindsight(undefined, litellmCfg);
+    startHindsight(ports, litellmCfg);
     if (litellmCfg) {
       console.log(chalk.gray("  LiteLLM routing enabled (--network host, ANTHROPIC_BASE_URL set)."));
     }
 
     if (isHindsightRunning()) {
       spin.stop(chalk.green(`${STEP_DONE} Hindsight container started (switchroom-hindsight)`));
-      console.log(chalk.gray("  API: http://localhost:8888/mcp"));
-      console.log(chalk.gray("  UI:  http://localhost:9999"));
+      console.log(chalk.gray(`  API: http://localhost:${ports.apiPort}/mcp`));
+      console.log(chalk.gray(`  UI:  http://localhost:${ports.uiPort}`));
     } else {
       spin.stop(chalk.yellow("Container started but may still be initializing"));
     }

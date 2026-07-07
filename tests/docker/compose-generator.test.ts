@@ -1771,9 +1771,29 @@ describe("agent service env — LiteLLM routing injection (opt-in)", () => {
       litellmConfirmedAgents: new Set(["clerk"]),
     });
     const env = envBlockFor(out, "clerk");
-    expect(env).toMatch(/ANTHROPIC_BASE_URL:\s*"http:\/\/127\.0\.0\.1:4010"/);
+    // claude → Anthropic pass-through (<root>/anthropic), NOT the model-mapped
+    // /v1/messages route (which re-chunks the SSE stream and stalls opus).
+    expect(env).toMatch(/ANTHROPIC_BASE_URL:\s*"http:\/\/127\.0\.0\.1:4010\/anthropic"/);
+    // Root proxy URL kept for start.sh's health probe + gateway /model/info.
+    expect(env).toMatch(/SWITCHROOM_LITELLM_BASE:\s*"http:\/\/127\.0\.0\.1:4010"/);
     expect(env).toMatch(/ANTHROPIC_SMALL_FAST_MODEL:\s*"claude-haiku-4-5-20251001"/);
     expect(env).toMatch(/SWITCHROOM_LITELLM:\s*"1"/);
+  });
+
+  it("points ANTHROPIC_BASE_URL at /anthropic pass-through and normalizes a trailing slash on the root", () => {
+    const out = generateCompose({
+      config: makeConfig({
+        clerk: {
+          litellm: { enabled: true, base_url: "http://127.0.0.1:4010/" },
+        },
+      }),
+      litellmConfirmedAgents: new Set(["clerk"]),
+    });
+    const env = envBlockFor(out, "clerk");
+    // trailing slash collapsed → exactly one /anthropic, no //
+    expect(env).toMatch(/ANTHROPIC_BASE_URL:\s*"http:\/\/127\.0\.0\.1:4010\/anthropic"/);
+    expect(env).toMatch(/SWITCHROOM_LITELLM_BASE:\s*"http:\/\/127\.0\.0\.1:4010"/);
+    expect(env).not.toMatch(/anthropic\/anthropic/);
   });
 
   it("does NOT inject when enabled but the key is NOT confirmed in the vault (blocker-2 gate)", () => {
@@ -1843,7 +1863,8 @@ describe("agent service env — LiteLLM routing injection (opt-in)", () => {
       litellmConfirmedAgents: new Set(["clerk"]),
     });
     const env = envBlockFor(out, "clerk");
-    expect(env).toMatch(/ANTHROPIC_BASE_URL:\s*"http:\/\/127\.0\.0\.1:4010"/);
+    expect(env).toMatch(/ANTHROPIC_BASE_URL:\s*"http:\/\/127\.0\.0\.1:4010\/anthropic"/);
+    expect(env).toMatch(/SWITCHROOM_LITELLM_BASE:\s*"http:\/\/127\.0\.0\.1:4010"/);
     expect(env).toMatch(/SWITCHROOM_LITELLM:\s*"1"/);
     expect(env).toMatch(/ANTHROPIC_SMALL_FAST_MODEL:\s*"claude-haiku-4-5-20251001"/);
   });

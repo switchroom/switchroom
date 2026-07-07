@@ -192,6 +192,25 @@ export function formatFeedElapsed(ms: number): string {
   return `${m}m${(s % 60).toString().padStart(2, '0')}s`
 }
 
+/**
+ * Minimum time the CURRENT step must have been running before its own
+ * `· <elapsed>` suffix appears on the `→` line. Under this, no suffix — a
+ * fresh step reads cleaner without a timer, and the header total already
+ * carries the turn/worker elapsed.
+ */
+export const STEP_TIMER_MIN_MS = 10_000
+
+/**
+ * Live-suffix for the in-progress step line: the STEP's OWN elapsed (time
+ * since that step started — NOT the turn/worker total, which lives in the
+ * header). Empty string until the step has run ≥ STEP_TIMER_MIN_MS, so the
+ * suffix never duplicates the header total on a young step.
+ */
+export function formatStepSuffix(stepElapsedMs: number): string {
+  if (stepElapsedMs < STEP_TIMER_MIN_MS) return ''
+  return ` · ${formatFeedElapsed(stepElapsedMs)}`
+}
+
 // ─── Truncation pipeline (the single correctness-critical primitive) ────────
 //
 // Per RAW line, in this EXACT order:

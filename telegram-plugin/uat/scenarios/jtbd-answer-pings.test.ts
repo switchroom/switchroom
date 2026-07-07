@@ -17,15 +17,14 @@
  * Runs under CI `uat-gate`; the full live MTProto run needs the test-harness
  * agent + a vault session, so locally this self-skips green (no driver).
  *
- * Scope caveat: this end-to-end scenario only exercises PR-2's upgrade code
- * path when the harness model delivers its final answer via the `reply` tool.
- * If the model answers via `stream_reply` instead, that path bypasses the
- * over-ping safety net entirely (it never reaches `decideOverPing`), so the
- * upgrade-over-ack logic is never touched. The model's tool choice isn't
- * forceable here, which makes this scenario a WEAKER backstop than the unit
- * matrix — the real proof of the upgrade behaviour lives in the deterministic
- * unit tests in `over-ping-final-answer-decoupling.test.ts`. Treat this as a
- * live smoke-test of the happy path, not the source of truth.
+ * Scope caveat: this end-to-end scenario exercises PR-2's upgrade code path
+ * when the harness model delivers its final answer via the `reply` tool —
+ * which is now the single final-answer tool (the redundant `stream_reply`
+ * tool was retired). The model's exact phrasing isn't forceable here, which
+ * makes this scenario a WEAKER backstop than the unit matrix — the real proof
+ * of the upgrade behaviour lives in the deterministic unit tests in
+ * `over-ping-final-answer-decoupling.test.ts`. Treat this as a live
+ * smoke-test of the happy path, not the source of truth.
  */
 import { describe, it, expect, beforeAll } from "vitest";
 import { spinUp, type Scenario } from "../harness.js";

@@ -265,12 +265,11 @@ If the user asks whether scheduled runs were missed during downtime: the schedul
 
 ## Telegram plugin reference — "what MCP tools", "how does reply work"
 
-The `switchroom-telegram` plugin is an enhanced fork of the official Telegram MCP plugin and is the default for all switchroom agents. It exposes **10 MCP tools** (all prefixed `mcp__switchroom-telegram__`):
+The `switchroom-telegram` plugin is an enhanced fork of the official Telegram MCP plugin and is the default for all switchroom agents. It exposes **9 MCP tools** (all prefixed `mcp__switchroom-telegram__`):
 
 | Tool | Purpose |
 |---|---|
-| `reply` | Send a text/photo message, with optional `reply_to` for threaded quotes |
-| `stream_reply` | Incrementally stream a long reply (edits the same message as tokens arrive) |
+| `reply` | Send a text/photo message — the single final-answer tool; chunks anything over Telegram's 4096-char limit. Optional `reply_to` for threaded quotes |
 | `react` | Emoji reaction on an inbound or outbound message |
 | `edit_message` | Modify an earlier bot message's text |
 | `delete_message` | Remove an earlier bot message |

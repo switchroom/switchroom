@@ -29,8 +29,21 @@ import { join } from "node:path";
 /**
  * Resolve the real invoking operator's uid even under sudo. `sudo`
  * exports the underlying user's uid as `SUDO_UID` (process.getuid()
- * would return 0). Falls back to getuid() when >0, else undefined
- * (root with no SUDO_UID, or non-POSIX where getuid is unavailable).
+ * would return 0). Falls back to getuid() when >0, then to the
+ * hostd-injected `SWITCHROOM_HOSTD_OPERATOR_UID`, else undefined
+ * (non-POSIX where getuid is unavailable, or root with neither hint).
+ *
+ * The hostd fallback is load-bearing: `switchroom apply` shelled out by
+ * hostd runs as root WITHOUT sudo, so `SUDO_UID` is unset and getuid()
+ * is 0 — resolveOperatorUid() would return undefined and generateCompose
+ * then omits the broker's operator-socket bind (compose.ts gates it on
+ * operatorUid !== undefined). That silently breaks host-shell vault
+ * access AND the litellm key-confirm probe on the *next* apply (which
+ * strips litellm routing fleet-wide). hostd already exports the real
+ * host operator uid as SWITCHROOM_HOSTD_OPERATOR_UID (same host-fact
+ * injection pattern as SWITCHROOM_HOST_HOME) — consume it here so a
+ * hostd-driven rollout emits the operator socket just like a host-shell
+ * `sudo apply` does.
  */
 export function resolveOperatorUid(): number | undefined {
   const sudoUid = process.env.SUDO_UID;
@@ -41,6 +54,11 @@ export function resolveOperatorUid(): number | undefined {
   if (typeof process.getuid === "function") {
     const uid = process.getuid();
     if (uid > 0) return uid;
+  }
+  const hostdUid = process.env.SWITCHROOM_HOSTD_OPERATOR_UID;
+  if (hostdUid !== undefined) {
+    const parsed = parseInt(hostdUid, 10);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
   }
   return undefined;
 }

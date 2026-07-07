@@ -79,7 +79,7 @@ describe("start.sh: LiteLLM ANTHROPIC_CUSTOM_HEADERS hoisted before gateway fork
     const startSh = renderStartSh();
 
     // Must check SWITCHROOM_LITELLM (same gate as inner block).
-    expect(startSh).toContain('if [ -n "$SWITCHROOM_LITELLM" ] && [ -z "$ANTHROPIC_CUSTOM_HEADERS" ]');
+    expect(startSh).toContain('if [ -n "${SWITCHROOM_LITELLM:-}" ] && [ -z "$ANTHROPIC_CUSTOM_HEADERS" ]');
   });
 
   it("outer block exports ANTHROPIC_CUSTOM_HEADERS with litellm headers before the gateway fork", () => {

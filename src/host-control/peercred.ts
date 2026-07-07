@@ -14,6 +14,11 @@
  * an agent cannot forge identity by renaming its in-container view.
  */
 
+import {
+  parseSocketIdentity,
+  type SocketIdentity as BrokerSocketIdentity,
+} from "../broker-common/peercred-path.js";
+
 /** Subdir form on the in-container view: `/run/switchroom/hostd/<agent>/sock`. */
 const SOCKET_PATH_CONTAINER_SUBDIR_RE =
   /^\/run\/switchroom\/hostd\/([a-zA-Z0-9][a-zA-Z0-9_-]*)\/sock$/;
@@ -41,9 +46,7 @@ const SOCKET_PATH_HOST_SUBDIR_RE =
  */
 const RESERVED_AGENT_NAMES = new Set(["operator", "hostd"]);
 
-export type SocketIdentity =
-  | { kind: "agent"; name: string }
-  | { kind: "operator" };
+export type SocketIdentity = BrokerSocketIdentity;
 
 /**
  * Parse a bind-path or connect-path to an identity. Returns null
@@ -57,19 +60,19 @@ export type SocketIdentity =
  * One operator shape (host view only — the operator never connects
  * via a per-agent in-container socket):
  *   - `*\/.switchroom/hostd/operator/sock`
+ *
+ * #2795: the parse+operator+reserved gate is the shared broker-plane
+ * primitive (`src/broker-common/peercred-path.ts`); this call site supplies
+ * only the hostd-specific patterns + reserved set. Semantics are identical
+ * to the pre-#2795 inline implementation.
  */
 export function socketPathToIdentity(
   socketPath: string,
 ): SocketIdentity | null {
-  if (typeof socketPath !== "string" || socketPath.length === 0) return null;
-  const m =
-    socketPath.match(SOCKET_PATH_CONTAINER_SUBDIR_RE) ??
-    socketPath.match(SOCKET_PATH_HOST_SUBDIR_RE);
-  if (!m) return null;
-  const name = m[1];
-  if (name === "operator") return { kind: "operator" };
-  if (RESERVED_AGENT_NAMES.has(name)) return null;
-  return { kind: "agent", name };
+  return parseSocketIdentity(socketPath, {
+    patterns: [SOCKET_PATH_CONTAINER_SUBDIR_RE, SOCKET_PATH_HOST_SUBDIR_RE],
+    reservedNames: RESERVED_AGENT_NAMES,
+  });
 }
 
 /** True iff `name` is reserved by another identity kind and may not

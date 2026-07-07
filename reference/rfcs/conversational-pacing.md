@@ -1,6 +1,6 @@
 ---
 artefact: Telegram conversational pacing + silence-poke safety net
-serves: jobs/know-what-my-agent-is-doing.md
+serves: know-what-my-agent-is-doing
 status: design v2 — the five-beat human-feel model (supersedes v1's card-era pacing)
 ---
 

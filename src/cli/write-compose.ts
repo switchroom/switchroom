@@ -185,8 +185,29 @@ export function resolveHostHomeForCompose(): string {
   return homedir();
 }
 
-/** Generate the compose content and write it (mode 0600). Always writes — same as apply. */
-export async function writeComposeFile(opts: WriteComposeOpts): Promise<WriteComposeResult> {
+export interface ComputeComposeResult {
+  /** The generated compose YAML content (not yet written to disk). */
+  content: string;
+  /** The agent image tag baked into `content`. */
+  imageTag: string;
+  /** Content currently on disk at `composePath`, or null if none. */
+  previous: string | null;
+  /** The agent image tag previously on disk (for drift logging), or null. */
+  previousImageTag: string | null;
+}
+
+/**
+ * Generate the compose content IN MEMORY and read the current on-disk
+ * compose for comparison — WITHOUT writing anything. Shared by
+ * {@link writeComposeFile} (which then persists) and the `apply --dry-run`
+ * path (which only reports the would-be diff). Extracting this keeps the
+ * two paths byte-identical: a dry-run computes exactly the content a real
+ * apply would write.
+ */
+export async function computeComposeContent(
+  opts: Omit<WriteComposeOpts, "buildMode" | "buildContext"> &
+    Pick<WriteComposeOpts, "buildMode" | "buildContext">,
+): Promise<ComputeComposeResult> {
   const release = resolveRelease({ override: opts.releaseOverride, root: opts.config.release });
   const imageTag = resolveImageTag(release);
   const operatorUid = resolveOperatorUid();
@@ -236,6 +257,14 @@ export async function writeComposeFile(opts: WriteComposeOpts): Promise<WriteCom
     previous = null;
   }
   const previousImageTag = previous ? (AGENT_IMAGE_TAG_RE.exec(previous)?.[1] ?? null) : null;
+
+  return { content, imageTag, previous, previousImageTag };
+}
+
+/** Generate the compose content and write it (mode 0600). Always writes — same as apply. */
+export async function writeComposeFile(opts: WriteComposeOpts): Promise<WriteComposeResult> {
+  const { content, imageTag, previous, previousImageTag } = await computeComposeContent(opts);
+  const operatorUid = resolveOperatorUid();
 
   await mkdir(dirname(opts.composePath), { recursive: true });
   // Last-known-good backup + atomic write. If a deploy regenerates a bad

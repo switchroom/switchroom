@@ -59,6 +59,67 @@ export function classifyShmSize(bytes: number): CheckResult {
 }
 
 /**
+ * Backlog thresholds for the consolidation queue. With the #2894 throttle
+ * (MAX_SLOTS=1, ~7 consolidation ops/hour drained against a fleet retaining
+ * every turn) the queue can build silently — the only prior signal was a 2h
+ * queue-lag WARNING written to `docker logs` by `hindsight-maintenance.sh`.
+ * A deep queue means retains are landing but not yet consolidated into recall.
+ * WARN ≈ several hours of backlog; FAIL ≈ ~a day+, likely wedged.
+ */
+export const CONSOLIDATION_BACKLOG_WARN = 25;
+export const CONSOLIDATION_BACKLOG_FAIL = 200;
+
+/**
+ * Pure: classify the consolidation-queue backlog into a doctor result so
+ * `switchroom doctor` surfaces queue depth (and, when available, the oldest
+ * pending op's age) instead of it hiding in docker logs.
+ *
+ * `queueDepth` is the count of pending/processing async operations across all
+ * banks (summed from each bank's `/stats.pending_operations`). `oldestAgeSecs`
+ * is the age of the oldest pending op when known, else `null` — the REST
+ * `/stats` surface exposes depth but not per-op age, so precise age
+ * measurement is deferred to the #2847 follow-up (the maintenance loop already
+ * logs it). Never throws.
+ */
+export function classifyConsolidationBacklog(
+  queueDepth: number,
+  oldestAgeSecs: number | null = null,
+): CheckResult {
+  const ageStr =
+    oldestAgeSecs !== null && oldestAgeSecs > 0
+      ? `, oldest ${Math.round(oldestAgeSecs / 60)}m old`
+      : "";
+  const base = `${queueDepth} pending consolidation op(s)${ageStr}`;
+  if (queueDepth >= CONSOLIDATION_BACKLOG_FAIL) {
+    return {
+      name: "hindsight consolidation backlog",
+      status: "fail",
+      detail:
+        `${base} — queue is deep enough to be wedged; retains are landing but ` +
+        `not consolidating into recall (drains ~7 ops/hr under the #2894 throttle)`,
+      fix:
+        "Check `docker logs switchroom-hindsight` for the queue-lag WARNING and " +
+        "consolidation errors (quota/429/shm); restart with `switchroom memory " +
+        "--restart` if the worker is stuck.",
+    };
+  }
+  if (queueDepth >= CONSOLIDATION_BACKLOG_WARN) {
+    return {
+      name: "hindsight consolidation backlog",
+      status: "warn",
+      detail:
+        `${base} — building faster than it drains (~7 ops/hr under the #2894 ` +
+        `throttle); recall may lag recent turns until it catches up`,
+    };
+  }
+  return {
+    name: "hindsight consolidation backlog",
+    status: "ok",
+    detail: queueDepth > 0 ? base : "queue drained (0 pending)",
+  };
+}
+
+/**
  * Pure: classify recent hindsight logs for fact-extraction health. Catches the
  * two silent-write failure modes by their log signatures.
  */
@@ -153,6 +214,79 @@ export function checkHindsightContainerHealth(
   }
 
   return results;
+}
+
+/**
+ * Pure: classify the result of a `GET <hindsight>/health` probe into a doctor
+ * result. A memory outage (container down, crash-looping on a port collision,
+ * or wedged) is otherwise SILENT — auto-recall failing produces no user-facing
+ * error, so the fleet goes amnesiac unnoticed (the 2026-07 incident ran ~9h
+ * before anyone noticed). A non-200 /health flips this red.
+ *
+ * `status` is the HTTP status code, or `null` when the request never completed
+ * (connection refused / timeout — the crash-loop signature).
+ */
+export function classifyHindsightHealthProbe(
+  status: number | null,
+  port: number,
+): CheckResult {
+  if (status === 200) {
+    return {
+      name: "hindsight /health",
+      status: "ok",
+      detail: `200 at :${port} — memory backend live`,
+    };
+  }
+  if (status === null) {
+    return {
+      name: "hindsight /health",
+      status: "fail",
+      detail:
+        `no response on :${port} — the container is down or crash-looping ` +
+        `(fleet memory is silently OFF: auto-recall/retain fail with no user error)`,
+      fix:
+        "Check `docker logs switchroom-hindsight` for `[Errno 98] address " +
+        "already in use` (a foreign process on the port) and run " +
+        "`switchroom memory --start` — the launcher now preflights the port " +
+        "and reassigns instead of crash-looping.",
+    };
+  }
+  return {
+    name: "hindsight /health",
+    status: "fail",
+    detail: `HTTP ${status} at :${port} — memory backend unhealthy`,
+    fix: "Inspect `docker logs switchroom-hindsight`; restart with `switchroom memory --restart`.",
+  };
+}
+
+/**
+ * Best-effort async wrapper: GET `<mcpUrl origin>/health` and classify it.
+ * Derives the health URL from the MCP url (strips the `/mcp/` suffix). Fails
+ * closed to a `fail` result (never throws) so a memory outage surfaces even
+ * when the probe itself errors.
+ */
+export async function checkHindsightHealthEndpoint(
+  mcpUrl: string,
+  opts: { fetchImpl?: typeof fetch; timeoutMs?: number } = {},
+): Promise<CheckResult> {
+  const doFetch = opts.fetchImpl ?? fetch;
+  const timeoutMs = opts.timeoutMs ?? 4000;
+  const origin = mcpUrl.replace(/\/mcp\/?$/, "").replace(/\/$/, "");
+  const healthUrl = `${origin}/health`;
+  const port = (() => {
+    const m = origin.match(/:(\d+)(?:$|\/)/);
+    return m ? parseInt(m[1], 10) : 80;
+  })();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await doFetch(healthUrl, { signal: controller.signal });
+    return classifyHindsightHealthProbe(res.status, port);
+  } catch {
+    return classifyHindsightHealthProbe(null, port);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**

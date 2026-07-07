@@ -7,6 +7,11 @@ import {
   findLatestSessionJsonl,
   DEFAULT_MAX_TURNS,
 } from "../agents/handoff-summarizer.js";
+import {
+  pruneSessionJsonl,
+  DEFAULT_SESSION_RETENTION_MAX_COUNT,
+  DEFAULT_SESSION_RETENTION_MAX_AGE_DAYS,
+} from "../agents/session-retention.js";
 
 /**
  * `switchroom handoff <agent>` — build the agent's session handoff
@@ -46,7 +51,7 @@ export function registerHandoffCommand(program: Command): void {
           // containers the file isn't mounted — fall back to defaults
           // rather than failing the Stop hook (#1745). Anything other
           // than ConfigError still propagates.
-          let agentConfig: { session_continuity?: { enabled?: boolean; max_turns_in_briefing?: number } } | undefined;
+          let agentConfig: { session_continuity?: { enabled?: boolean; max_turns_in_briefing?: number; session_retention_max_count?: number; session_retention_max_age_days?: number } } | undefined;
           let agentDir: string;
           try {
             const config = getConfig(program);
@@ -97,6 +102,24 @@ export function registerHandoffCommand(program: Command): void {
             maxTurns: cappedMaxTurns,
           });
           process.stderr.write(`handoff: ${status}\n`);
+
+          // Session-JSONL retention (#2792). Runs after the briefing is
+          // built so the newest transcript — the handoff source — is
+          // never pruned. Best-effort; never blocks shutdown.
+          const retention = pruneSessionJsonl(claudeConfigDir, {
+            maxCount:
+              continuity?.session_retention_max_count ??
+              DEFAULT_SESSION_RETENTION_MAX_COUNT,
+            maxAgeDays:
+              continuity?.session_retention_max_age_days ??
+              DEFAULT_SESSION_RETENTION_MAX_AGE_DAYS,
+            keepPath: jsonl,
+          });
+          if (retention.deleted > 0) {
+            process.stderr.write(
+              `handoff: pruned ${retention.deleted} old session transcript(s)\n`,
+            );
+          }
         },
       ),
     );

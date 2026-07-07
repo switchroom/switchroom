@@ -49,6 +49,17 @@ export interface SilentEndDeps {
   stateDir?: string
   /** stderr writer (defaults to `process.stderr.write`). */
   log?: (line: string) => void
+  /**
+   * Has a genuine assistant reply been delivered to this chat (optionally
+   * scoped to thread) at or after `sinceMs`? Same predicate shape as
+   * `history.hasOutboundDeliveredSince` / the represent-guard's dep
+   * (`gateway/represent-guard.ts`) — injected here so the exhaustion check
+   * below is a pure, testable decision. When omitted (history unavailable,
+   * or callers that don't wire it), the check is skipped and the guard
+   * falls back to the pre-existing turnKey/retryCount bookkeeping only —
+   * never suppress on doubt.
+   */
+  hasOutboundDeliveredSince?: (chatId: string, sinceMs: number, threadId?: number | null) => boolean
 }
 
 /**
@@ -68,6 +79,35 @@ export interface SilentEndDeps {
  * model under the same prompt.
  */
 export const SILENT_END_MAX_RETRIES = 2
+
+/**
+ * User-facing fallback text delivered when a user-message turn ends with no
+ * final answer AND the deterministic Stop-hook re-prompt has already been
+ * exhausted (#1161). Without this the user only sees the progress card
+ * vanish; silence must never be the failure mode.
+ *
+ * PR #2892 (reference/rfcs/deterministic-turn-liveness.md Phase 2
+ * hardening): include the turn's elapsed so the fallback is honest about
+ * how long the user actually waited, instead of a generic apology with no
+ * timing. A degenerate/unknown duration (missing, non-finite, or <= 0 —
+ * e.g. a turn whose `startedAt` was never stamped) omits the waited clause
+ * rather than printing a nonsensical "(waited 0s)".
+ *
+ * Lives here (not gateway.ts) so the transport-boundary tests exercise the
+ * REAL string (tests/silent-end-transport.test.ts), not a hand-maintained
+ * copy — gateway.ts is not importable in tests.
+ */
+export function silentEndFallbackText(turnDurationMs: number | undefined): string {
+  const elapsed =
+    typeof turnDurationMs === 'number' && Number.isFinite(turnDurationMs) && turnDurationMs > 0
+      ? ` (waited ${Math.round(turnDurationMs / 1000)}s)`
+      : ''
+  return (
+    '⚠️ The agent finished working but didn’t send a reply' +
+    elapsed +
+    ' — your last message may not have been answered. Please try asking again.'
+  )
+}
 
 function resolveStateDir(deps?: SilentEndDeps): string {
   if (deps?.stateDir != null) return deps.stateDir
@@ -255,6 +295,44 @@ export function recordSilentTurnEnd(
     prev.turnKey === args.turnKey &&
     prev.retryCount >= SILENT_END_MAX_RETRIES
   ) {
+    // Staleness guard (mirrors the represent-guard's #2472 fix,
+    // `gateway/represent-guard.ts:shouldSuppressRepresent`): `turnKey` here
+    // is `statusKey(chatId, threadId)` — stable across every turn on the
+    // same chat/thread, NOT a per-turn nonce (unlike the obligation
+    // ledger's `originTurnId`). The whole mechanism depends on a reply
+    // ALWAYS clearing this state file via `clearSilentEndState` at the
+    // send-site. `clearSilentEndState` is fail-silent by design (state
+    // corruption / a write race must never crash the gateway), so if a
+    // clear is ever missed, a stale `retryCount >= MAX_RETRIES` record
+    // from an OLD, already-answered turn would be misread as "this
+    // brand-new dark turn already exhausted its re-prompt budget" —
+    // firing the user-facing fallback immediately, without the turn ever
+    // going through the Stop-hook re-prompt ladder. Before trusting that
+    // reading, verify against real delivery history: has a genuine reply
+    // landed on this chat/thread since the stale record was last written?
+    // If so, the record is satisfied-but-misdetected — drop it silently
+    // and let this dark turn start its OWN fresh retry cycle instead of
+    // inheriting someone else's spent budget.
+    if (deps?.hasOutboundDeliveredSince?.(args.chatId, prev.timestamp, args.threadId)) {
+      emitLog(
+        deps,
+        `silent-end: stale exhausted record for turnKey=${args.turnKey} ` +
+          `(retryCount=${prev.retryCount}) but a reply was delivered since ` +
+          `${prev.timestamp} — treating as satisfied-but-misdetected, not exhausted\n`,
+      )
+      // MUST clear before writing (adversarial review of #2892):
+      // writeSilentEndState re-inherits retryCount whenever the on-disk
+      // turnKey matches — which it ALWAYS does here, since turnKey is the
+      // stable statusKey(chatId, threadId). Writing over the stale record
+      // directly would start the "fresh" ladder at retryCount=MAX: the
+      // Stop hook would see retryCount >= MAX_RETRIES and never re-prompt,
+      // while this call just returned exhausted:false so no fallback fires
+      // either — pure silence, strictly worse than the pre-fix behaviour.
+      // Clearing first makes the new record genuinely start at retryCount=0.
+      clearSilentEndState(args.turnKey, deps)
+      writeSilentEndState(args, deps)
+      return { exhausted: false }
+    }
     clearSilentEndState(args.turnKey, deps)
     emitLog(
       deps,

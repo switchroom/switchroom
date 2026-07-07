@@ -343,6 +343,70 @@ describe("statusPairedText", () => {
   });
 });
 
+// Regression: the Bot API 10.1 rich-message (GFM) renderer collapses a LONE
+// `\n` between two non-blank lines into a SPACE (soft break), so a card built
+// with `lines.join("\n")` renders as one run-on blob. The deterministic card
+// builders MUST route through `stackCardLines`, which promotes every inter-
+// field break to a GFM hard break (`  \n`) and keeps intentional `\n\n` block
+// gaps. These tests pin that so the "/status renders as a giant run-on blob"
+// bug can't silently regress.
+describe("card line-break hardening (GFM soft-break blob fix)", () => {
+  const meta: AgentMetadata = {
+    ...baseMeta,
+    agentName: "assistant",
+    model: "sonnet",
+    status: "running",
+    uptime: "3h",
+    auth: { authenticated: true, subscription_type: "Max", expires_in: "29 days", auth_source: "oauth" },
+    live: [
+      { status: "ok", label: "Broker", detail: "running" },
+      { status: "ok", label: "Kernel", detail: "up" },
+    ],
+    audit: {
+      version: "v0.3.0",
+      tools: "all",
+      skills: "git, vault",
+      limits: "idle 30m",
+      channel: "switchroom",
+      memoryBank: "assistant",
+    },
+  };
+
+  // Every adjacent field-pair inside a block is separated by a GFM hard break,
+  // and NO two adjacent non-blank content lines are joined by a bare `\n`
+  // (which would soft-collapse into a blob). Block separators stay `\n\n`.
+  const assertNoSoftJoin = (out: string) => {
+    const nl = out.split("\n");
+    for (let i = 0; i < nl.length - 1; i++) {
+      const cur = nl[i];
+      const next = nl[i + 1];
+      if (cur.trim() === "" || next.trim() === "") continue; // `\n\n` block gap
+      // A hardened line ends in the two-space GFM hard-break marker.
+      expect(cur.endsWith("  ")).toBe(true);
+    }
+  };
+
+  it("/status: fields are hard-broken, not soft-collapsed into a blob", () => {
+    const out = statusPairedText({ user: "@ken", meta });
+    // Adjacent fields inside the identity block use a GFM hard break.
+    expect(out).toContain("Auth: ✓ Max · expires 29 days  \n");
+    // Health rows stack (hard break before each 🟢 row).
+    expect(out).toContain("  \n🟢 **Kernel**");
+    // Audit rows stack.
+    expect(out).toContain("**Version** v0.3.0  \n");
+    // Blocks stay separated by a real paragraph gap.
+    expect(out).toContain("\n\n**Health**");
+    assertNoSoftJoin(out);
+  });
+
+  it("/start, /help, /commands, /status-pending all hard-break their lines", () => {
+    assertNoSoftJoin(startText("assistant", false));
+    assertNoSoftJoin(helpText("assistant"));
+    assertNoSoftJoin(switchroomHelpText("assistant"));
+    assertNoSoftJoin(statusPendingText("abc-123"));
+  });
+});
+
 // Local alias for the audit shape — duplicates the AgentMetadata.audit
 // type so the test file doesn't have to re-import it just for one
 // hostile-input fixture.

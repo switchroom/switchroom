@@ -43,7 +43,7 @@ describe("generateHindsightMcpConfig", () => {
     const memConfig = makeMemoryConfig();
     const result = generateHindsightMcpConfig("my-collection", memConfig);
 
-    expect(result.url).toBe("http://localhost:8888/mcp/");
+    expect(result.url).toBe("http://127.0.0.1:18888/mcp/");
     expect(result.command).toBeUndefined();
     expect(result.args).toBeUndefined();
   });
@@ -54,7 +54,7 @@ describe("generateHindsightMcpConfig", () => {
     });
     const result = generateHindsightMcpConfig("local-col", memConfig);
 
-    expect(result.url).toBe("http://localhost:8888/mcp/");
+    expect(result.url).toBe("http://127.0.0.1:18888/mcp/");
   });
 });
 
@@ -224,7 +224,7 @@ describe("getHindsightMcpUrl", () => {
   it("returns HTTP URL for Hindsight MCP endpoint", () => {
     const result = getHindsightMcpUrl();
 
-    expect(result.url).toBe("http://localhost:8888/mcp/");
+    expect(result.url).toBe("http://127.0.0.1:18888/mcp/");
   });
 });
 
@@ -252,6 +252,8 @@ describe("generateHindsightComposeSnippet (broker-fed, #1245)", () => {
   it("pins HINDSIGHT_API_LLM_MODEL to the switchroom-default sonnet", () => {
     const snippet = generateHindsightComposeSnippet();
     expect(snippet).toContain("HINDSIGHT_API_LLM_MODEL=claude-sonnet-5");
+    // ANTHROPIC_MODEL is what actually pins the claude-code provider's model.
+    expect(snippet).toContain("ANTHROPIC_MODEL=claude-sonnet-5");
   });
 
   it("sets HINDSIGHT_API_MCP_STATELESS=true (immune to hindsight bounces)", () => {

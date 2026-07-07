@@ -79,6 +79,7 @@ export default defineConfig({
       "**/node_modules/**",
       "**/dist/**",
       "**/src/vault/grants.test.ts",
+      "**/src/vault/grants-db.test.ts",
       // Approval-kernel suites use bun:sqlite — run via test:bun.
       "**/src/vault/approvals/kernel.test.ts",
       "**/src/vault/approvals/approval-origin.test.ts",
@@ -182,7 +183,6 @@ export default defineConfig({
       "**/telegram-plugin/gateway/webhook-ingest-server.test.ts",
       "**/telegram-plugin/tests/progress-update.test.ts",
       "**/telegram-plugin/tests/quota-cache.test.ts",
-      "**/telegram-plugin/tests/silent-reply-guard.test.ts",
       "**/telegram-plugin/tests/unhandled-rejection-policy.test.ts",
       // The following tests transitively import bun:sqlite (via grants-db.ts
       // or bun:test) and therefore can't run under vitest/Node. Each is
@@ -221,12 +221,14 @@ export default defineConfig({
       "**/telegram-plugin/tests/subagent-tracker-hooks.test.ts",
       // subagent-watcher-parent-turn-key.test.ts uses bun:sqlite + bun:test — run via test:bun.
       "**/telegram-plugin/tests/subagent-watcher-parent-turn-key.test.ts",
+      // subagent-nested-dispatch.test.ts uses bun:sqlite + bun:test — run via test:bun.
+      "**/telegram-plugin/tests/subagent-nested-dispatch.test.ts",
+      // nested-worker-visibility-harness.test.ts uses bun:sqlite + bun:test — run via test:bun.
+      "**/telegram-plugin/tests/nested-worker-visibility-harness.test.ts",
       // subagents-bugs.test.ts uses bun:sqlite + bun:test — excluded here, run via test:bun.
       "**/telegram-plugin/registry/subagents-bugs.test.ts",
       // subagents-schema-init-order.test.ts uses bun:sqlite + bun:test — excluded here, run via test:bun.
       "**/telegram-plugin/tests/subagents-schema-init-order.test.ts",
-      // resolve-calling-subagent.test.ts uses bun:test + bun:sqlite — excluded here, run via test:bun.
-      "**/telegram-plugin/tests/resolve-calling-subagent.test.ts",
       // secret-guard-pretool.test.ts uses bun:test (NDJSON unix-socket
       // integration test for the PreToolUse hook) — excluded here, run via
       // test:bun. Without this exclude, the cross-package vitest pass on

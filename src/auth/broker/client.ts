@@ -34,7 +34,6 @@
  */
 
 import * as net from "node:net";
-import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
@@ -754,13 +753,4 @@ export async function withAuthBrokerClient<T>(
   } finally {
     await client.close();
   }
-}
-
-/**
- * Probe whether the broker socket exists on disk — useful for the CLI
- * to give a clearer error message when the daemon isn't running at all
- * (vs a connect that times out for other reasons).
- */
-export function authBrokerSocketExists(opts?: AuthBrokerClientOpts): boolean {
-  return existsSync(resolveAuthBrokerSocketPath(opts));
 }

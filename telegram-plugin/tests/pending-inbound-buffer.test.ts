@@ -95,6 +95,59 @@ describe('pending-inbound-buffer', () => {
     expect(drained.map((m) => m.meta?.source)).toEqual(['m3', 'm4', 'm5'])
   })
 
+  // #2789 A: a >cap burst mid-turn used to evict the oldest SILENTLY —
+  // the durable spool copy only replays at boot / escalates after 15 min,
+  // so within a live session the evicted message was just gone with no
+  // user-visible signal. onEvict makes the eviction non-silent so the
+  // caller can surface a coalesced "messages deferred" notice.
+  it('#2789 A: fires onEvict with the evicted message on cap eviction (not a silent drop)', () => {
+    const evicted: InboundMessage[] = []
+    const buf = createPendingInboundBuffer({
+      capPerAgent: 3,
+      log: () => {},
+      onEvict: (_agent, m) => evicted.push(m),
+    })
+    // Fill to cap — no eviction yet, no notice.
+    buf.push('a', inbound('m1', 1))
+    buf.push('a', inbound('m2', 2))
+    buf.push('a', inbound('m3', 3))
+    expect(evicted).toHaveLength(0)
+    // The 4th push overflows the cap → oldest (m1) evicted → onEvict fires.
+    buf.push('a', inbound('m4', 4))
+    expect(evicted.map((m) => m.meta?.source)).toEqual(['m1'])
+    // The 5th evicts m2.
+    buf.push('a', inbound('m5', 5))
+    expect(evicted.map((m) => m.meta?.source)).toEqual(['m1', 'm2'])
+  })
+
+  it('#2789 A: a >32 burst produces one onEvict per evicted entry, never a silent drop', () => {
+    const evicted: InboundMessage[] = []
+    const buf = createPendingInboundBuffer({
+      log: () => {}, // default cap = 32
+      onEvict: (_agent, m) => evicted.push(m),
+    })
+    // 40 messages into a 32-cap buffer → exactly 8 evictions, all reported.
+    for (let i = 1; i <= 40; i++) buf.push('a', inbound(`m${i}`, i))
+    expect(buf.depth('a')).toBe(32)
+    expect(evicted).toHaveLength(8)
+    expect(evicted.map((m) => m.meta?.source)).toEqual([
+      'm1', 'm2', 'm3', 'm4', 'm5', 'm6', 'm7', 'm8',
+    ])
+  })
+
+  it('#2789 A: a throwing onEvict never breaks the push hot path', () => {
+    const buf = createPendingInboundBuffer({
+      capPerAgent: 1,
+      log: () => {},
+      onEvict: () => {
+        throw new Error('notice failed')
+      },
+    })
+    buf.push('a', inbound('m1', 1))
+    expect(() => buf.push('a', inbound('m2', 2))).not.toThrow()
+    expect(buf.depth('a')).toBe(1)
+  })
+
   it('push returns false when eviction occurred', () => {
     const buf = createPendingInboundBuffer({ capPerAgent: 2, log: () => {} })
     expect(buf.push('a', inbound('m1'))).toBe(true)

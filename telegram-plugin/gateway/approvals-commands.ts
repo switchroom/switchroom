@@ -13,7 +13,7 @@
  * add on top of the same client. Tracked in the migration TODO inline.
  */
 
-import { escapeMarkdown, codeSpanSafe } from '../format.js';
+import { escapeMarkdown, codeSpanSafe, hardenCardBreaks } from '../format.js';
 import type { Bot, Context } from "grammy";
 import { richMessage } from "../rich-send.js";
 import {
@@ -84,7 +84,11 @@ export function registerApprovalsCommands(
           );
         })
         .join("\n");
-      await ctx.replyWithRichMessage(richMessage(`**Active approvals**\n\n${summary}\n\n${detail}`));
+      // hardenCardBreaks: the per-agent `summary` rows and per-decision
+      // `detail` rows are single-`\n`-joined field lines that would soft-
+      // collapse into one blob under the GFM rich renderer. Harden them into
+      // GFM hard breaks (block gaps between the three sections preserved).
+      await ctx.replyWithRichMessage(richMessage(hardenCardBreaks(`**Active approvals**\n\n${summary}\n\n${detail}`)));
       return;
     }
 

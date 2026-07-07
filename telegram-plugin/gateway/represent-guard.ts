@@ -14,14 +14,22 @@
  * no Telegram, no SQLite; the gateway injects `hasOutboundDeliveredSince` as a
  * predicate. The single load-bearing subtlety lives here in one testable place:
  *
- *   The cutoff is `lastRepresentedAt` (the time of the PREVIOUS represent), NOT
- *   `openedAt`. On the FIRST represent (`lastRepresentedAt` undefined) the guard
- *   is a no-op, so the genuine "agent wrote a plain-text answer and never called
- *   the reply tool" case still re-presents ONCE. Only the SECOND-and-later
- *   represent is gated — exactly where a reply that landed BETWEEN fires must
- *   suppress the re-ask. A reply that predates the last represent (e.g. the
- *   original plain-text answer) does not count, because it is not evidence the
- *   most recent represent was answered.
+ *   For the SECOND-and-later represent the cutoff is `lastRepresentedAt` (the
+ *   time of the PREVIOUS represent), NOT `openedAt` — exactly where a reply that
+ *   landed BETWEEN fires must suppress the re-ask, while a reply that predates
+ *   the last represent (e.g. the original plain-text answer) does not count,
+ *   because it is not evidence the most recent represent was answered.
+ *
+ *   For the FIRST represent (`lastRepresentedAt` undefined) the cutoff is
+ *   `openedAt` (#2788 Gap B). Previously the first represent was an unconditional
+ *   no-op, leaving a narrow window: if a genuine reply was already delivered
+ *   since the obligation was RAISED but its routing didn't resolve back to the
+ *   origin (so the ledger's normal close path missed it), the first represent
+ *   emitted a false "you never answered". Deduping against outbound history from
+ *   `openedAt` closes that window WITHOUT breaking the genuine "agent wrote a
+ *   plain-text answer and never called the reply tool" case: that case records NO
+ *   outbound row, so `hasOutboundDeliveredSince` reports false and the single
+ *   re-ask still fires.
  */
 
 /** The obligation fields the represent guard inspects. */
@@ -29,6 +37,8 @@ export interface RepresentGuardObligation {
   readonly originTurnId: string
   readonly chatId: string
   readonly threadId?: number
+  /** Wall-clock ms this obligation was RAISED — the FIRST-represent cutoff (#2788). */
+  readonly openedAt?: number
   /** Wall-clock ms this obligation was most recently re-presented, if ever. */
   readonly lastRepresentedAt?: number
 }
@@ -65,8 +75,15 @@ export function shouldSuppressRepresent(
   deps: RepresentGuardDeps,
 ): boolean {
   if (!deps.historyEnabled) return false
-  // First represent: nothing to compare against — let the single re-ask fire so
-  // the genuine plain-text-no-reply case is preserved.
-  if (o.lastRepresentedAt == null) return false
+  // First represent (#2788 Gap B): dedup against outbound history from `openedAt`.
+  // A genuine reply already delivered since the obligation was raised means the
+  // user WAS answered — suppress the false "you never answered". The genuine
+  // plain-text-no-reply case records no outbound row, so the predicate reports
+  // false there and the single re-ask still fires. If `openedAt` is unknown we
+  // cannot dedup safely, so fall back to the prior no-op (never suppress).
+  if (o.lastRepresentedAt == null) {
+    if (o.openedAt == null) return false
+    return deps.hasOutboundDeliveredSince(o.chatId, o.openedAt, o.threadId)
+  }
   return deps.hasOutboundDeliveredSince(o.chatId, o.lastRepresentedAt, o.threadId)
 }

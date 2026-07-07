@@ -147,7 +147,7 @@ Keep them short (one or two sentences). Don't narrate every step, the pinned
 progress card shows that for free. Don't send an update on a trivial one-shot
 task. Send them when a colleague would genuinely want to know what's happening.
 
-Final answers still go through \`stream_reply\` with done=true as usual,
+Final answers still go through \`reply\` as usual,
 \`progress_update\` is only for mid-turn check-ins.`;
 }
 

@@ -31,8 +31,3 @@ export function withPaneLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
   });
   return run;
 }
-
-/** Test seam — count of currently-tracked pane chains. */
-export function _paneLockSize(): number {
-  return tails.size;
-}

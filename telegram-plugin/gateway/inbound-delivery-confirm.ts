@@ -73,6 +73,36 @@ export function trackDelivery<M>(
 }
 
 /**
+ * Extract every `message_id="…"` value carried in a rendered enqueue envelope.
+ *
+ * The `enqueue` session-event's message id (`enqueueMessageId`) is a SINGLE
+ * value re-parsed from the transcript by `parseChannelMeta`, which grabs the
+ * FIRST `message_id` it finds. When claude's composer MERGES several inbound
+ * envelopes into one turn (or reformats the wrapper), that first-parsed id can
+ * be a sibling's — not the tracked message's — even though the tracked
+ * message's envelope is right there in the same content. Strict equality then
+ * mis-concludes "never delivered" and the sweep re-delivers a turn that is
+ * already running (#2786). Scanning ALL ids in the raw content makes the ack
+ * tolerant of that reorder/merge: the tracked id is present iff its envelope
+ * was delivered, regardless of parse order.
+ *
+ * The regex is LEFT-ANCHORED on an attribute boundary (start-of-string or a
+ * whitespace/quote before the name) so it matches ONLY the real `message_id`
+ * attribute — never a same-suffix sibling like `target_message_id`,
+ * `reply_to_message_id`, `original_message_id`, or `card_message_id`. This is
+ * what makes the tolerant-path match safe on a never-drop code path: a
+ * substring collision on some other `*_message_id` attribute cannot false-ack
+ * (and thus silently drop) a real user message still waiting to land.
+ */
+export function extractEnqueueMessageIds(content: string): string[] {
+  const ids: string[] = []
+  const re = /(?:^|[\s"'])message_id="([^"]+)"/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(content)) != null) ids.push(m[1]!)
+  return ids
+}
+
+/**
  * Ack a delivery — call from the `enqueue` session-event (claude started a
  * turn). `enqueue` fires for EVERY turn start regardless of source (user
  * inbound, cron, subagent-handback, vault-resume, restart-marker), so acking
@@ -80,21 +110,36 @@ export function trackDelivery<M>(
  * silently drop — a real user message still waiting under the same key. So
  * ack ONLY when the enqueue's source message id matches the tracked one.
  *
- * Matching rule: if we recorded a messageId for the pending entry, require the
- * enqueue's `enqueueMessageId` to equal it. If we never recorded one (legacy /
- * defensive null), fall back to key-only ack. Returns true if an entry was
- * cleared.
+ * Matching rule (composer-tolerant, #2786): if we recorded a messageId for the
+ * pending entry, ack when EITHER
+ *   - the single re-parsed `enqueueMessageId` equals it (the fast path), OR
+ *   - the tracked id appears among the message ids carried in `enqueueContent`
+ *     (the tolerant path — survives the composer merging/reordering envelopes
+ *     so the first-parsed id belongs to a sibling, not the tracked message).
+ * Matching on the exact `message_id="…"` token — not a loose substring —
+ * preserves the cross-source false-ack guard: a synthetic-source turn (cron /
+ * resume / vault) never carries the real user message's id, so it still can't
+ * clear a user message that is genuinely still waiting to land. If we never
+ * recorded a messageId (legacy / defensive null), fall back to key-only ack.
+ * Returns true if an entry was cleared.
  */
 export function ackDelivery<M>(
   q: DeliveryQueue<M>,
   key: string,
   enqueueMessageId: string | null = null,
+  enqueueContent: string | null = null,
 ): boolean {
   const entry = q.pending.get(key)
   if (!entry) return false
-  // A different message started this turn — don't ack ours (it may still be
-  // waiting to land; the sweep will re-deliver it if it stranded).
-  if (entry.messageId != null && entry.messageId !== enqueueMessageId) return false
+  if (entry.messageId != null) {
+    const matches =
+      entry.messageId === enqueueMessageId ||
+      (enqueueContent != null &&
+        extractEnqueueMessageIds(enqueueContent).includes(entry.messageId))
+    // A different message started this turn — don't ack ours (it may still be
+    // waiting to land; the sweep will re-deliver it if it stranded).
+    if (!matches) return false
+  }
   q.pending.delete(key)
   return true
 }
@@ -117,6 +162,43 @@ export function sweep<M>(
     redeliver.push(entry)
   }
   return redeliver
+}
+
+/**
+ * #2787 — the set of chats/topics that currently hold a live permission or
+ * `ask_user` card, against which a swept entry is tested before re-delivery.
+ *
+ *   - `keys`  — full `chatKey(chatId, threadId)` values (topic known). A card
+ *               routed to a specific forum topic suspends re-delivery ONLY for
+ *               that topic; sibling topics in the same supergroup keep flowing.
+ *   - `chats` — bare chatIds (topic unknown — e.g. a permission card fanned to
+ *               the operator DMs records only the chatId). The conservative
+ *               fallback is to suspend the whole chat; that chat is almost never
+ *               a busy multi-topic supergroup, so the global stall is still gone.
+ */
+export interface SuspendedTargets {
+  readonly keys: ReadonlySet<string>
+  readonly chats: ReadonlySet<string>
+}
+
+/**
+ * #2787 Mechanism A — should re-delivery of a stranded inbound on `key` be
+ * suspended because a live permission / `ask_user` card is open for ITS OWN
+ * chat/topic?
+ *
+ * A pending card is a live interaction for its target: re-clearing the composer
+ * and re-sending there would clobber it. But the OLD gateway guard suspended the
+ * ENTIRE confirm sweep whenever ANY card was pending anywhere — so one card
+ * parked in a single topic (or the operator DM, a different chatId) froze
+ * re-delivery of every stranded inbound across EVERY topic until it resolved
+ * (the #1922 all-topics stall). Scoping the check to the card's own target keeps
+ * unrelated topics being re-delivered while the card sits open.
+ */
+export function isRedeliverySuspended(key: string, suspended: SuspendedTargets): boolean {
+  if (suspended.keys.has(key)) return true
+  const idx = key.indexOf(':')
+  const chatId = idx < 0 ? key : key.slice(0, idx)
+  return suspended.chats.has(chatId)
 }
 
 /** Forget a key without acking (e.g. the bridge went offline and the message

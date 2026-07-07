@@ -540,6 +540,23 @@ function emitImageOrBuild(
 }
 
 /**
+ * Emit a `logging:` block capping the Docker json-file log driver.
+ *
+ * `restart: always` services run for weeks; without a cap the json-file
+ * sink (distinct from the in-container `service.log`, cf. #739) grows
+ * unbounded and fills the host disk. A full disk then breaks every write
+ * path fleet-wide — the failure ancestor behind many durability bugs.
+ * 10 MB × 3 files bounds each container to ~30 MB of stdout/stderr.
+ */
+function emitLogging(lines: string[]): void {
+  lines.push(`    logging:`);
+  lines.push(`      driver: json-file`);
+  lines.push(`      options:`);
+  lines.push(`        max-size: "10m"`);
+  lines.push(`        max-file: "3"`);
+}
+
+/**
  * Emit the `voice-sidecar` singleton service (PR-B2) — a local GPU
  * speech-to-text server (faster-whisper) the gateway POSTs voice bytes to
  * when the host's voice verdict is `local`. Caller gates emission on the
@@ -576,6 +593,7 @@ function emitVoiceSidecarService(
   lines.push(`      switchroom.role: "voice-sidecar"`);
   lines.push(`      switchroom.fleet: "${containerNamePrefix}"`);
   lines.push(`    restart: always`);
+  emitLogging(lines);
   // GPU passthrough — requires the nvidia-container-toolkit on the host
   // (the PR-B1 `containerToolkit` probe; a `local` verdict implies it).
   lines.push(`    deploy:`);
@@ -1286,6 +1304,7 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   lines.push(`      switchroom.role: "broker"`);
   lines.push(`      switchroom.fleet: "${containerNamePrefix}"`);
   lines.push(`    restart: always`);
+  emitLogging(lines);
   // Liveness probe — bind-presence. The broker creates per-agent
   // socket directories at startup and binds `<dir>/sock` for each
   // configured agent. If at least one bind has happened, the daemon
@@ -1516,6 +1535,7 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   lines.push(`      switchroom.role: "kernel"`);
   lines.push(`      switchroom.fleet: "${containerNamePrefix}"`);
   lines.push(`    restart: always`);
+  emitLogging(lines);
   // Mirror the broker's bind-presence healthcheck — same failure-mode
   // surface (kernel binds per-agent sockets at
   // /run/switchroom/kernel/<agent>/sock; silently exits or hangs the
@@ -1608,6 +1628,7 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   lines.push(`      switchroom.role: "auth-broker"`);
   lines.push(`      switchroom.fleet: "${containerNamePrefix}"`);
   lines.push(`    restart: always`);
+  emitLogging(lines);
   // Bind-presence healthcheck — same probe pattern as vault-broker /
   // approval-kernel (PR #898). Empty-fleet trade-off applies: a
   // switchroom install with zero agents and zero consumers reports
@@ -1859,6 +1880,7 @@ function emitAgentService(
     lines.push(`    network_mode: host`);
   }
   lines.push(`    restart: always`);
+  emitLogging(lines);
   lines.push(`    init: false`);
   // PTY allocation — claude's interactive mode requires a TTY at stdin
   // (the alt-screen UI, autoaccept-poll keystrokes, and the `--print`
@@ -2162,17 +2184,31 @@ function emitAgentService(
   // ANTHROPIC_BASE_URL without a key makes every claude call hit the proxy
   // unauthenticated — a silently-broken agent. So a failed/absent provision
   // ⇒ no routing env ⇒ the agent keeps the normal broker-OAuth Anthropic
-  // path (degraded-but-working) rather than a dead proxy path. When both
-  // gates pass: ANTHROPIC_BASE_URL → proxy, ANTHROPIC_SMALL_FAST_MODEL pins
-  // the fast lane, SWITCHROOM_LITELLM=1 tells start.sh to fetch the key from
-  // the vault and export it as the x-litellm-api-key Bearer (the SECRET is
-  // NEVER emitted here — only the marker). Set BEFORE the userEnv merge so
-  // these system-managed keys are authoritative (the merge only fills env[k]
-  // when undefined). base_url is required for the marker to be useful; only
-  // emit the trio when it resolved.
+  // path (degraded-but-working) rather than a dead proxy path.
+  //
+  // ANTHROPIC_BASE_URL points the `claude` CLI at LiteLLM's **Anthropic
+  // pass-through** endpoint (`<root>/anthropic`), NOT the model-mapped
+  // `/v1/messages` route. The pass-through raw-forwards the request and
+  // streams the upstream SSE bytes natively; the model-mapped route
+  // translate→ChatCompletion→re-emit→re-chunks the stream, which stalls
+  // long opus responses mid-flight ("API Error: Response stalled
+  // mid-stream" — the 2026-07-05 marko incident). claude appends
+  // `/v1/messages`, so `<root>/anthropic` → `<root>/anthropic/v1/messages`,
+  // exactly the pass-through path. OAuth still rides in Authorization
+  // (forwarded upstream unchanged); the virtual key rides in the
+  // x-litellm-api-key header start.sh exports — that split is what keeps
+  // this subscription-native. SWITCHROOM_LITELLM_BASE keeps the ROOT proxy
+  // URL for the two consumers that need the model-mapped/admin surface, NOT
+  // the pass-through: start.sh's `/health/liveliness` probe and the
+  // gateway's `/model/info` non-Claude (sr-*) model discovery. Set BEFORE
+  // the userEnv merge so these system-managed keys are authoritative (the
+  // merge only fills env[k] when undefined). base_url is required for the
+  // markers to be useful; only emit the set when it resolved.
   if (a.litellm.enabled && a.litellm.keyConfirmed && a.litellm.baseUrl) {
+    const root = a.litellm.baseUrl.replace(/\/+$/, "");
     env.SWITCHROOM_LITELLM = "1";
-    env.ANTHROPIC_BASE_URL = a.litellm.baseUrl;
+    env.SWITCHROOM_LITELLM_BASE = root;
+    env.ANTHROPIC_BASE_URL = `${root}/anthropic`;
     env.ANTHROPIC_SMALL_FAST_MODEL = a.litellm.smallFastModel;
   }
   // SWITCHROOM_VOICE_ENGINE: the host's voice-transcription verdict
@@ -2508,8 +2544,13 @@ function emitAgentService(
     );
   }
   // Operator-authored shared webkite config (e.g. defaults.format,
-  // proxy rotation file). Optional — agents work fine without it,
-  // using webkite's built-in defaults.
+  // proxy rotation file). Optional OVERRIDE — the fleet already ships a
+  // baked-in default render config (#2805): Dockerfile.agent bakes
+  // docker/webkite/config.toml to /opt/switchroom/webkite/config.toml and
+  // start.sh.hbs seeds it to ~/.config/webkite/config.toml (copy-if-absent).
+  // When this operator file exists it is bind-mounted RO onto the SAME
+  // target, so the file is present at boot and start.sh's copy-if-absent
+  // skips — i.e. the operator override wins over the baked default.
   if (existsSync(`${probeHome}/.switchroom/webkite/config.toml`)) {
     lines.push(
       `      - ${homePrefix}/.switchroom/webkite/config.toml:/state/agent/home/.config/webkite/config.toml:ro`,

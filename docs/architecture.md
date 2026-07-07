@@ -91,7 +91,7 @@ Inbound path:
     -> claude sees it as a new user turn
 
 Outbound path:
-  claude calls MCP tool (reply / stream_reply / react / etc.)
+  claude calls MCP tool (reply / react / etc.)
     -> MCP child sends payload over Unix socket to gateway
     -> gateway calls Telegram Bot API
     -> message delivered to user

@@ -66,6 +66,19 @@ export interface PendingInboundBufferOptions {
    * than the old silent in-memory drop).
    */
   spool?: InboundSpool
+  /**
+   * Called when the in-memory cap forces an eviction of the OLDEST
+   * entry (#2789 defect A). The evicted message is NOT lost — `push`
+   * still records it durably in the spool (boot-replayed / escalated) —
+   * but within a live session it will not be re-delivered until boot or
+   * escalation, so the eviction must not be SILENT the way it was
+   * before. The caller wires this to a coalesced "N messages deferred"
+   * user-facing notice tied to the spool, turning a silent in-session
+   * drop into a visible deferral (chat-is-the-single-source-of-truth:
+   * surface the loss window, don't hide it). Best-effort: a throw here
+   * never breaks the push hot path.
+   */
+  onEvict?: (agent: string, evicted: InboundMessage) => void
 }
 
 /**
@@ -304,6 +317,19 @@ export function createPendingInboundBuffer(
           `pending-inbound-buffer: agent=${agent} cap=${cap} reached — ` +
           `dropped oldest entry source=${dropped?.meta?.source ?? '-'} ts=${dropped?.ts ?? '-'}\n`,
         )
+        // #2789 A: the cap eviction is no longer a SILENT in-session
+        // drop. `dropped` still lives in the durable spool (it was
+        // spool.put on its own push), so it survives to boot-replay /
+        // escalation — but it won't be re-delivered THIS session. Hand
+        // it to the caller so a coalesced "N messages deferred" notice
+        // can be surfaced. Best-effort: never let the notice break push.
+        if (dropped != null && opts.onEvict != null) {
+          try {
+            opts.onEvict(agent, dropped)
+          } catch {
+            /* user-facing notice is best-effort; never break the hot path */
+          }
+        }
       }
       q.push(msg)
       // Durable record FIRST-class to the in-memory queue: spool BEFORE

@@ -34,6 +34,7 @@
 
 import { describe, it, expect } from "vitest";
 import { spinUp } from "../harness.js";
+import type { ObservedMessage } from "../driver.js";
 
 // The prompt pushes the model into a tool-heavy state where it has
 // produced "an answer" internally but hasn't yet realised it must
@@ -77,12 +78,33 @@ describe("uat: silent-end recovery", () => {
         // fallback wording ("still working… (no update from agent
         // in N min)") that means the silent-end loop fired AND the
         // model didn't recover. Acceptable outcome — the user got
-        // something — but a design-health alarm. Log it.
-        if (/no update from agent/i.test(reply.text)) {
+        // something — but a design-health alarm. Log it AND assert the
+        // `exhausted` latch gave fire-once (transport-side), matching the
+        // channel twin exactly — the job-spec Prove-it claim is
+        // "asserted transport-side in a DM AND a supergroup alike", so the
+        // DM twin must make the same exactly-once assertion, not just warn.
+        if (/no update from agent|didn't send a reply/i.test(reply.text)) {
           console.warn(
             `[silent-end-recovery] reply was the framework fallback — `
             + `model never replied on its own. Reply text: ${JSON.stringify(reply.text.slice(0, 200))}`,
           );
+
+          // No SECOND fallback-shaped message should follow within a short
+          // window (the `exhausted` latch gives fire-once).
+          let secondFallback: ObservedMessage | null = null;
+          try {
+            secondFallback = await sc.expectMessage(
+              /no update from agent|didn't send a reply/i,
+              { from: "bot", timeout: 15_000 },
+            );
+          } catch {
+            // Timeout is the expected/good outcome — no second fallback fired.
+          }
+          expect(
+            secondFallback,
+            "the dark-turn/framework fallback fired MORE than once for the same turn "
+            + "(the `exhausted` latch should give fire-once)",
+          ).toBeNull();
         }
       } finally {
         await sc.tearDown();

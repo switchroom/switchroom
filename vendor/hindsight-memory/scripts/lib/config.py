@@ -37,9 +37,42 @@ DEFAULTS = {
     # scores, so this is the switchroom-side quality filter — see #475.
     "recallMinOverlap": 0.0,
     "recallTypes": ["world", "experience"],
+    # Switchroom #2848 Stage B/C — deterministic directive capture.
+    # When on (switchroom default; pinned true in the copied plugin
+    # settings.json by applyHindsightSettingsOverrides), TWO deterministic
+    # hooks share this knob:
+    #   * Stage B (recall.py, UserPromptSubmit): regex-detects correction /
+    #     standing-rule-shaped inbound and appends a terse advisory to the
+    #     turn's additionalContext telling the model to persist the rule with
+    #     create_directive if it IS durable.
+    #   * Stage C (directive_verify.py, Stop): after the turn, re-checks the
+    #     human turn against a HIGH-PRECISION durable-rule regex and, if the
+    #     model recorded no create_directive call, blocks the stop ONCE to
+    #     re-prompt capture (closes the "model ignored the nudge" gap).
+    # Both are pure detection — no model callsite, no silent hook-side write;
+    # the model authors the directive in-session (chat-legible). Operators opt
+    # out per-agent via memory.directive_capture_nudge=false →
+    # HINDSIGHT_DIRECTIVE_CAPTURE_NUDGE (disables BOTH hooks).
+    "directiveCaptureNudge": True,
+    # Switchroom #2873/#2903 Fix 6.2 — the BLOCKING half (Stage C
+    # directive_verify.py Stop hook) split out from the advisory nudge. When
+    # True (default) the verifier may block the stop once to re-prompt capture;
+    # when False the Stage B nudge still fires but the Stop hook NEVER blocks
+    # (advisory-only mode). Lets an operator keep the gentle nudge while dropping
+    # the more intrusive block. Gated UNDER directiveCaptureNudge: turning the
+    # nudge off disables both regardless of this knob. Operators opt out
+    # per-agent via memory.directive_capture_verify=false →
+    # HINDSIGHT_DIRECTIVE_CAPTURE_VERIFY.
+    "directiveCaptureVerify": True,
     "recallContextTurns": 1,
     "recallMaxQueryChars": 800,
     "recallRoles": ["user", "assistant"],
+    # Upstream 962140eef — optional recall tag filters passed through to the
+    # recall API, plus per-additional-bank overrides keyed by bank ID.
+    "recallTags": [],
+    "recallTagsMatch": "any",
+    "recallTagGroups": None,
+    "recallAdditionalBankFilters": {},
     "recallPromptPreamble": (
         "Relevant memories from past conversations (prioritize recent when "
         "conflicting). Only use memories that are directly useful to continue "
@@ -63,6 +96,12 @@ DEFAULTS = {
     "daemonIdleTimeout": 0,
     "embedVersion": "latest",
     "embedPackagePath": None,
+    # Upstream 55ef70679 — optional global HTTP request timeout override
+    # (seconds). None = keep each call's own default. NOTE: switchroom's
+    # recall.py deliberately does NOT wire this override into its client —
+    # recall carries its own 8s hook-budget timeout (see recall.py). This
+    # mainly benefits retain's 15s timeout on slow/loaded servers.
+    "requestTimeoutSeconds": None,
     # Bank
     "bankId": None,
     "bankIdPrefix": "",
@@ -107,10 +146,28 @@ ENV_OVERRIDES = {
     # from agents.<name>.memory.recall.skip_trivial only on override; the
     # switchroom default is on (recall.py falls back to True).
     "HINDSIGHT_RECALL_SKIP_TRIVIAL": ("recallSkipTrivial", bool),
+    # Switchroom #2848 Stage B: directive-capture nudge on/off. Set by
+    # start.sh from agents.<name>.memory.directive_capture_nudge only when
+    # the operator overrode it; the switchroom default is on (settings.json
+    # pins true; recall.py falls back to True).
+    "HINDSIGHT_DIRECTIVE_CAPTURE_NUDGE": ("directiveCaptureNudge", bool),
+    # Switchroom #2873/#2903 Fix 6.2: the Stage C block on/off, independent of
+    # the Stage B nudge. Set by start.sh from
+    # agents.<name>.memory.directive_capture_verify only when the operator
+    # overrode it; the switchroom default is on.
+    "HINDSIGHT_DIRECTIVE_CAPTURE_VERIFY": ("directiveCaptureVerify", bool),
     "HINDSIGHT_RECALL_MAX_QUERY_CHARS": ("recallMaxQueryChars", int),
     "HINDSIGHT_RECALL_CONTEXT_TURNS": ("recallContextTurns", int),
+    # Upstream 962140eef — recall tag filters. The tags env var accepts JSON
+    # or a comma-separated list; the others must be JSON.
+    "HINDSIGHT_RECALL_TAGS": ("recallTags", list),
+    "HINDSIGHT_RECALL_TAGS_MATCH": ("recallTagsMatch", str),
+    "HINDSIGHT_RECALL_TAG_GROUPS": ("recallTagGroups", dict),
+    "HINDSIGHT_RECALL_ADDITIONAL_BANK_FILTERS": ("recallAdditionalBankFilters", dict),
     "HINDSIGHT_API_PORT": ("apiPort", int),
     "HINDSIGHT_DAEMON_IDLE_TIMEOUT": ("daemonIdleTimeout", int),
+    # Upstream 55ef70679 — global request timeout override.
+    "HINDSIGHT_REQUEST_TIMEOUT_SECONDS": ("requestTimeoutSeconds", int),
     "HINDSIGHT_EMBED_VERSION": ("embedVersion", str),
     "HINDSIGHT_EMBED_PACKAGE_PATH": ("embedPackagePath", str),
     "HINDSIGHT_DYNAMIC_BANK_ID": ("dynamicBankId", bool),
@@ -131,8 +188,27 @@ def _cast_env(value: str, typ):
         if typ is float:
             return float(value)
         if typ is list:
-            # Comma-separated → list of trimmed, non-empty strings.
-            return [t.strip() for t in value.split(",") if t.strip()]
+            # JSON list first (upstream 962140eef). A value that parses as
+            # JSON but is NOT a list (e.g. `42`, `"x"`, `{}`) is a config
+            # mistake, not a comma-separated string — return None so the
+            # default is kept (matches upstream; fail-open). Only values
+            # that don't parse as JSON at all take the comma-split path.
+            try:
+                parsed = json.loads(value)
+            except ValueError:
+                if value.lstrip().startswith(("[", "{")):
+                    # Looks like intended JSON but doesn't parse —
+                    # malformed config, not a comma list. Keep default.
+                    return None
+                # Comma-separated → list of trimmed, non-empty strings.
+                return [t.strip() for t in value.split(",") if t.strip()]
+            return parsed if isinstance(parsed, list) else None
+        if typ is dict:
+            # JSON only (dict or list accepted — tag_groups may be a list).
+            parsed = json.loads(value)
+            if isinstance(parsed, (dict, list)):
+                return parsed
+            return None
         return value
     except (ValueError, AttributeError):
         return None

@@ -1,11 +1,14 @@
 """Tests for lib/content.py — pure content-processing functions."""
 
+import re
+
 import pytest
 
 from lib.content import (
     _extract_text_content,
     _is_channel_message_tool,
     compose_recall_query,
+    format_current_time,
     format_memories,
     prepare_retention_transcript,
     slice_last_turns_by_user_boundary,
@@ -113,6 +116,64 @@ class TestSliceLastTurnsByUserBoundary:
     def test_non_list_returns_empty(self):
         assert slice_last_turns_by_user_boundary(None, 1) == []
 
+    # --- switchroom divergence: tool_result user-messages are NOT turns ---
+
+    @staticmethod
+    def _tool_result(tuid: str, text: str) -> dict:
+        # Claude Code emits tool results as role="user" with a content list of
+        # tool_result blocks (the shape read_transcript produces).
+        return {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": tuid, "content": text}],
+        }
+
+    def test_tool_result_messages_are_not_turn_boundaries(self):
+        # One human turn + 3 tool rounds. Requesting 1 turn must anchor to the
+        # human message, NOT the newest tool_result — otherwise a tool-heavy
+        # turn drops the human's text from the window (silent memory loss).
+        msgs = [
+            {"role": "user", "content": "human fact"},
+            {"role": "assistant", "content": "a"},
+            self._tool_result("t1", "r1"),
+            {"role": "assistant", "content": "a"},
+            self._tool_result("t2", "r2"),
+            {"role": "assistant", "content": "a"},
+            self._tool_result("t3", "r3"),
+            {"role": "assistant", "content": "a"},
+        ]
+        result = slice_last_turns_by_user_boundary(msgs, 1)
+        assert result[0]["content"] == "human fact"
+        assert result == msgs  # only 1 human turn, so the whole thing is kept
+
+    def test_counts_human_turns_only_across_tool_heavy_turns(self):
+        # 2 human turns, each followed by a tool round. Requesting 1 human turn
+        # slices to the SECOND human message, not into the first turn's tools.
+        msgs = [
+            {"role": "user", "content": "human one"},
+            {"role": "assistant", "content": "a"},
+            self._tool_result("t1", "r1"),
+            {"role": "user", "content": "human two"},
+            {"role": "assistant", "content": "a"},
+            self._tool_result("t2", "r2"),
+        ]
+        result = slice_last_turns_by_user_boundary(msgs, 1)
+        assert result[0]["content"] == "human two"
+
+    def test_mixed_text_and_tool_result_block_is_a_boundary(self):
+        # A user message with BOTH text and a tool_result block still counts as
+        # a human turn (conservative — only pure tool_result messages are skipped).
+        msgs = [
+            {"role": "user", "content": "older"},
+            {"role": "assistant", "content": "a"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "human with attached result"},
+                {"type": "tool_result", "tool_use_id": "t1", "content": "r1"},
+            ]},
+            {"role": "assistant", "content": "a"},
+        ]
+        result = slice_last_turns_by_user_boundary(msgs, 1)
+        assert result[0]["content"][0]["text"] == "human with attached result"
+
 
 # ---------------------------------------------------------------------------
 # compose_recall_query
@@ -155,6 +216,53 @@ class TestComposeRecallQuery:
         result = compose_recall_query("query", msgs, recall_context_turns=2, recall_roles=["user"])
         assert "user msg" in result
         assert "assistant msg" not in result
+
+    # --- switchroom divergence: the recall context slice counts HUMAN turns,
+    # not tool_result pseudo-turns (follow-up to #2830, closing the reviewer nit
+    # that the retain path had a test but the recall path — the OTHER caller of
+    # slice_last_turns_by_user_boundary — did not).
+
+    def test_tool_heavy_prior_turn_keeps_human_text_in_recall_context(self):
+        # A prior human turn stating a fact, then 3 sequential tool rounds
+        # (Claude Code emits tool results as role="user"). recall_context_turns=2
+        # asks for the latest turn + one prior HUMAN turn. If the tool_result
+        # messages were counted as boundaries the human fact would be sliced
+        # out; the guard skips them so the fact lands in "Prior context:".
+        messages = [
+            {"role": "user", "content": "my prod database is called ORCHID_PRIMARY"},
+            {"role": "assistant", "content": "let me look that up"},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "TOOLPAYLOAD_1"}]},
+            {"role": "assistant", "content": "checking more"},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t2", "content": "TOOLPAYLOAD_2"}]},
+            {"role": "assistant", "content": "one more"},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t3", "content": "TOOLPAYLOAD_3"}]},
+            {"role": "assistant", "content": "here is your schema"},
+        ]
+        result = compose_recall_query("what port does it listen on", messages, recall_context_turns=2)
+        assert "Prior context:" in result
+        assert "ORCHID_PRIMARY" in result  # human turn survived the tool-heavy turn
+        assert "TOOLPAYLOAD" not in result  # tool_result payload is not human context
+
+    def test_recall_context_anchors_to_human_turns_across_tool_volume(self):
+        # Two prior human turns, each followed by tool rounds. Asking for 3
+        # context turns (latest + 2 prior HUMAN) must reach past all the
+        # tool_result messages to the oldest human turn — tool volume must not
+        # consume the turn budget.
+        messages = [
+            {"role": "user", "content": "the deploy key is FALCON_9_KEY"},
+            {"role": "assistant", "content": "looking"},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "out a"}]},
+            {"role": "assistant", "content": "more"},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t2", "content": "out b"}]},
+            {"role": "user", "content": "and remind me of the region too"},
+            {"role": "assistant", "content": "checking region"},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t3", "content": "out c"}]},
+            {"role": "assistant", "content": "region is ap-southeast-2"},
+        ]
+        result = compose_recall_query("put those together for me", messages, recall_context_turns=3)
+        assert "Prior context:" in result
+        assert "FALCON_9_KEY" in result
+        assert "and remind me of the region too" in result
 
 
 # ---------------------------------------------------------------------------
@@ -469,3 +577,18 @@ class TestPrepareRetentionTranscript:
         transcript, _ = prepare_retention_transcript(msgs, retain_full_window=True, include_tool_calls=False)
         assert "[role: user]" in transcript
         assert "[user:end]" in transcript
+
+
+# ---------------------------------------------------------------------------
+# format_current_time
+# ---------------------------------------------------------------------------
+
+
+class TestFormatCurrentTime:
+    def test_includes_utc_suffix(self):
+        # The "UTC" suffix prevents client LLMs from misreading the
+        # timestamp as local time.
+        assert format_current_time().endswith(" UTC")
+
+    def test_format_shape(self):
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC", format_current_time())

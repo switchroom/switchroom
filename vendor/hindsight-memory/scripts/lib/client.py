@@ -44,9 +44,29 @@ def _validate_api_url(url: str) -> str:
 class HindsightClient:
     """HTTP client for the Hindsight API."""
 
-    def __init__(self, api_url: str, api_token: Optional[str] = None):
+    def __init__(
+        self,
+        api_url: str,
+        api_token: Optional[str] = None,
+        request_timeout_override: Optional[int] = None,
+    ):
         self.api_url = _validate_api_url(api_url)
         self.api_token = api_token
+        self.request_timeout_override = request_timeout_override
+
+    def _resolve_timeout(self, timeout: int) -> int:
+        """Return the override if configured, otherwise the caller's timeout.
+
+        Upstream 55ef70679. NOTE: recall.py deliberately does not pass the
+        override — its 8s timeout is a hook-budget invariant.
+
+        The override is clamped to >= 1: a zero/negative env value would
+        otherwise reach urlopen as a nonsensical timeout (0 fails every
+        request immediately), turning a config typo into a dead client.
+        """
+        if self.request_timeout_override is None:
+            return timeout
+        return max(1, self.request_timeout_override)
 
     def _headers(self) -> dict:
         headers = {
@@ -58,6 +78,7 @@ class HindsightClient:
         return headers
 
     def _request(self, method: str, path: str, body: Optional[dict] = None, timeout: int = DEFAULT_TIMEOUT) -> dict:
+        timeout = self._resolve_timeout(timeout)
         url = f"{self.api_url}{path}"
         data = json.dumps(body).encode() if body else None
         req = urllib.request.Request(url, data=data, headers=self._headers(), method=method)
@@ -100,6 +121,9 @@ class HindsightClient:
         max_tokens: int = 1024,
         budget: str = "mid",
         types: Optional[list] = None,
+        tags: Optional[list] = None,
+        tags_match: Optional[str] = None,
+        tag_groups: Optional[object] = None,
         timeout: int = 10,
     ) -> dict:
         """Recall memories from a bank.
@@ -115,6 +139,12 @@ class HindsightClient:
             body["budget"] = budget
         if types:
             body["types"] = types
+        if tags:
+            body["tags"] = tags
+        if tags_match:
+            body["tags_match"] = tags_match
+        if tag_groups:
+            body["tag_groups"] = tag_groups
         return self._request("POST", path, body, timeout=timeout)
 
     def retain(

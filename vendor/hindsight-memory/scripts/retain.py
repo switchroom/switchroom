@@ -69,6 +69,60 @@ def read_transcript(transcript_path: str) -> list:
     return messages
 
 
+def select_retain_window(
+    retain_mode: str,
+    retain_every_n: int,
+    overlap_turns: int,
+    all_messages: list,
+    force: bool = False,
+) -> tuple:
+    """Decide which messages to retain and whether to send as a full window.
+
+    Returns ``(messages_to_retain, retain_full_window)``.
+
+    SWITCHROOM DIVERGENCE (Phase 6b — candidate to upstream to
+    vectorize-io/hindsight): the chunked sliding-window is decoupled from
+    the ``retainEveryNTurns > 1`` throttle. Upstream only sliced a window
+    when ``retain_every_n > 1``; with ``retainEveryNTurns=1`` (switchroom's
+    every-turn crash-durability setting, applied in scaffold.ts) chunked
+    mode fell through to full-session and re-consolidated the ENTIRE
+    accumulated transcript on every Stop fire — an unbounded, per-turn cost.
+
+    Decoupling is safe because window selection and the throttle answer two
+    independent questions: the throttle decides *whether* to fire this turn
+    (still owned by run_retain, unchanged); this function only decides *what*
+    to retain once a fire happens. A chunked window of
+    ``max(retain_every_n, 1) + overlap_turns`` turns is correct for any
+    ``retain_every_n >= 1``. With ``retain_every_n=1, overlap=2`` the window
+    is the 3 most-recent HUMAN turns (tool_result messages don't count as
+    turns — see slice_last_turns_by_user_boundary).
+
+    ``force=True`` (SessionEnd final retain) widens chunked mode to a
+    full-session sweep — belt-and-braces so a graceful shutdown always flushes
+    the whole session even if per-turn windowing had an edge. This costs a
+    full sweep only ONCE per session (at end), not per turn.
+
+    Durability invariant (jtbd-memory-survives-restart UAT): the window
+    always extends to the END of the transcript (``slice_last_turns_by_user_boundary``
+    returns ``messages[start:]``), so the turn that just completed — the one
+    whose Stop hook is firing — is ALWAYS included. Every turn fires (no
+    throttle at n=1), so every turn's content is retained on its own fire.
+    Boundaries are counted on human messages only, so a tool-heavy turn can't
+    push the human's fact outside the window. No fact can fall outside every
+    window.
+    """
+    if retain_mode == "chunked" and not force:
+        # Sliding window: N turns + configured overlap. max(retain_every_n, 1)
+        # keeps the window valid at n=1 (the decoupling); for n>1 this equals
+        # the previous `retain_every_n + overlap_turns` (behaviour unchanged).
+        window_turns = max(retain_every_n, 1) + overlap_turns
+        messages_to_retain = slice_last_turns_by_user_boundary(all_messages, window_turns)
+        return messages_to_retain, True
+    # Full session: vendor full-session mode, OR a forced (SessionEnd) chunked
+    # sweep. Retain all messages, always as a full window.
+    return list(all_messages), True
+
+
 def run_retain(hook_input: dict, force: bool = False) -> dict:
     """Run the auto-retain flow.
 
@@ -93,6 +147,23 @@ def run_retain(hook_input: dict, force: bool = False) -> dict:
 
     debug_log(config, f"Retain hook_input keys: {list(hook_input.keys())} force={force}")
 
+    # Blocked-Stop double-fire guard (switchroom #2848 Phase 3): when
+    # directive_verify.py blocks a Stop, the model continues and the Stop
+    # event fires AGAIN, this time carrying ``stop_hook_active: true``.
+    # Retaining on that second fire would (a) POST a duplicate transcript
+    # document and (b) at retainEveryNTurns>1 call increment_turn_count a
+    # second time for the SAME logical turn — drifting the cadence throttle.
+    # Skip the re-fire entirely BEFORE any store or turn-count increment.
+    # A forced SessionEnd sweep (force=True) is a distinct hook event and
+    # must always flush, so it is exempt.
+    if not force and hook_input.get("stop_hook_active"):
+        debug_log(
+            config,
+            "Stop re-fire (stop_hook_active=true) — skipping retain to avoid "
+            "duplicate document / turn-count drift",
+        )
+        return {"status": "skipped", "reason": "stop_hook_active"}
+
     session_id = hook_input.get("session_id", "unknown")
     transcript_path = hook_input.get("transcript_path", "")
 
@@ -104,7 +175,8 @@ def run_retain(hook_input: dict, force: bool = False) -> dict:
 
     debug_log(config, f"Read {len(all_messages)} messages from transcript")
 
-    # Retention mode: full session (default) or chunked (legacy)
+    # Retention mode: full session (vendor default) or chunked. Switchroom
+    # runs chunked at retainEveryNTurns=1 (see select_retain_window / scaffold.ts).
     retain_mode = config.get("retainMode", "full-session")
     retain_every_n = max(1, config.get("retainEveryNTurns", 1))
     retain_full_window = False
@@ -118,19 +190,25 @@ def run_retain(hook_input: dict, force: bool = False) -> dict:
             debug_log(config, f"Turn {turn_count}/{retain_every_n}, skipping retain (next at turn {next_at})")
             return {"status": "skipped", "reason": "throttled"}
 
-    if retain_mode == "chunked" and retain_every_n > 1:
-        # Sliding window: N turns + configured overlap
-        overlap_turns = config.get("retainOverlapTurns", 0)
-        window_turns = retain_every_n + overlap_turns
-        messages_to_retain = slice_last_turns_by_user_boundary(all_messages, window_turns)
-        retain_full_window = True
+    # Window selection is decoupled from the throttle above — see
+    # select_retain_window() for the switchroom-divergence rationale
+    # (Phase 6b: chunked window-slicing now works at retainEveryNTurns=1).
+    overlap_turns = config.get("retainOverlapTurns", 0)
+    messages_to_retain, retain_full_window = select_retain_window(
+        retain_mode, retain_every_n, overlap_turns, all_messages, force=force
+    )
+    if retain_mode == "chunked" and not force:
+        window_turns = max(retain_every_n, 1) + overlap_turns
         debug_log(
             config,
-            f"Chunked retain firing (window: {window_turns} turns, {len(messages_to_retain)} messages)",
+            f"Chunked retain firing (window: {window_turns} human turns, {len(messages_to_retain)} messages)",
+        )
+    elif retain_mode == "chunked" and force:
+        debug_log(
+            config,
+            f"Chunked retain, forced full-session sweep (SessionEnd): {len(all_messages)} messages",
         )
     else:
-        # Full session mode: retain all messages, always as full window
-        retain_full_window = True
         debug_log(config, f"Full session retain: {len(all_messages)} messages")
 
     # Format transcript
@@ -156,7 +234,14 @@ def run_retain(hook_input: dict, force: bool = False) -> dict:
 
     api_token = config.get("hindsightApiToken")
     try:
-        client = HindsightClient(api_url, api_token)
+        # Upstream 55ef70679 — honor the optional requestTimeoutSeconds
+        # override (retain runs outside the recall hook budget, so a longer
+        # timeout is safe here; recall.py deliberately omits this).
+        client = HindsightClient(
+            api_url,
+            api_token,
+            request_timeout_override=config.get("requestTimeoutSeconds"),
+        )
     except ValueError as e:
         print(f"[Hindsight] Invalid API URL: {e}", file=sys.stderr)
         return {"status": "failed", "error": e, "payload": None}

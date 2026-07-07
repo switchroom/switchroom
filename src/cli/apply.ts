@@ -69,7 +69,8 @@ import { refreshAgentConnectionHealth } from "../agents/connection-health.js";
 import type { VaultAclResult } from "./doctor-mcp-secrets.js";
 import { installUpdatePromptHook } from "./update-prompt-hook.js";
 import { allocateAgentUid } from "../agents/compose.js";
-import { writeComposeFile, resolveHostSwitchroomConfigPath, resolveHostHomeForCompose } from "./write-compose.js";
+import { writeComposeFile, computeComposeContent, resolveHostSwitchroomConfigPath, resolveHostHomeForCompose } from "./write-compose.js";
+import { getProfilePath } from "../agents/profiles.js";
 import { detectInstallType } from "./install-detect.js";
 import {
   resolveOperatorUid,
@@ -147,6 +148,22 @@ export interface ApplyOptions {
    * to write start.sh / .mcp.json / settings.json (issue #902).
    */
   composeOnly?: boolean;
+  /**
+   * Validate-only: run the full compose-regeneration + validation
+   * pipeline IN MEMORY (resolve every agent's profile, probe the
+   * vault-broker for key-provisioning gaps, compute the would-be
+   * compose) and print a report — WITHOUT writing the compose file,
+   * persisting anything, or touching any container. Handled by the
+   * dedicated {@link runApplyDryRun} path, not by `runApply`.
+   *
+   * Exists because `rollout --dry-run` only prints the step plan; it
+   * never exercises the config-regeneration that actually fails (the
+   * v0.17.0 rollout incident: profile-not-found, vault-broker
+   * unreachable, and passphrase-needed-for-new-keys all surfaced only
+   * once the real apply mutated state). `apply --dry-run` is the
+   * pre-flight that catches those BEFORE anything is mutated.
+   */
+  dryRun?: boolean;
 }
 
 export interface ApplyDeps {
@@ -312,15 +329,21 @@ export async function provisionLiteLLMKeys(
 
     const alreadyProvisioned: string[] = [];
     const unprovisionedNew: string[] = [];
+    const brokerUnreachable: string[] = [];
     for (const { name } of optedIn) {
       const vaultKey = `litellm/${name}/api-key`;
       const existing = await getViaBrokerStructured(vaultKey);
       if (existing.kind === "ok") {
         alreadyProvisioned.push(name);
+      } else if (existing.kind === "unreachable") {
+        // #2781: broker unreachable is an environment limitation (hostd's
+        // container has no broker socket by construction) — we can't
+        // provision OR confirm, so degrade to a warning rather than fail
+        // apply. The agent keeps its previous routing env either way.
+        brokerUnreachable.push(name);
       } else {
-        // kind === "not_found" (genuinely new) or "unreachable" (can't confirm
-        // it's provisioned) — either way, this agent is not known-good and must
-        // be surfaced, not silently skipped.
+        // kind === "not_found" (genuinely new) or "denied" — this agent is
+        // not known-good and must be surfaced, not silently skipped.
         unprovisionedNew.push(name);
       }
     }
@@ -333,6 +356,16 @@ export async function provisionLiteLLMKeys(
         chalk.gray(
           `  ~ litellm: ${alreadyProvisioned.length} agent(s) already provisioned ` +
           `(${alreadyProvisioned.join(", ")}) — unaffected by missing passphrase.\n`,
+        ),
+      );
+    }
+
+    if (brokerUnreachable.length > 0) {
+      ctx.writeErr(
+        chalk.yellow(
+          `  ! litellm: vault-broker unreachable — could not verify/provision ` +
+          `${brokerUnreachable.length} agent(s) (${brokerUnreachable.join(", ")}); ` +
+          `they keep their previous routing env.\n`,
         ),
       );
     }
@@ -438,13 +471,20 @@ export async function provisionLiteLLMKeys(
         continue;
       }
       if (existing.kind === "unreachable") {
-        failures.push({
-          agent: name,
-          message: `litellm: vault-broker unreachable (${existing.msg ?? "no detail"}); cannot provision key.`,
-        });
+        // #2781: an unreachable broker is an ENVIRONMENT limitation, not a
+        // provisioning error — hostd's in-container `switchroom apply` has no
+        // broker socket mounted BY CONSTRUCTION, so treating this as a
+        // scaffold failure made every hostd reconcile exit 1 (12/12 "failed")
+        // and rolled back every config_propose_edit. Degrade to a WARNING,
+        // mirroring the "Hindsight unreachable — skipping bank creation"
+        // path: the agent keeps whatever routing env its previous provision
+        // gave it, and apply exits 0 if nothing else failed. Genuine
+        // provisioning errors (bad ref / write denial with the broker
+        // reachable) below still land in `failures`.
         ctx.writeErr(
-          chalk.red(
-            `  x litellm/${name}: vault-broker unreachable — agent will not get routing env.\n`,
+          chalk.yellow(
+            `  ! litellm/${name}: vault-broker unreachable (${existing.msg ?? "no detail"}) — ` +
+            `skipping key provisioning; agent keeps its previous routing env.\n`,
           ),
         );
         continue;
@@ -1588,6 +1628,301 @@ export async function runApply(
 }
 
 /**
+ * Read-only probe of the LiteLLM per-agent (and hindsight-service)
+ * virtual-key provisioning state. Mirrors the split that
+ * `provisionLiteLLMKeys` computes, but performs NO writes — used by the
+ * `apply --dry-run` path to report vault-provisioning gaps before a real
+ * apply mutates anything.
+ *
+ * `passphraseAvailable` reports whether the operator vault passphrase can
+ * be recovered non-interactively (env or machine-id auto-unlock blob) — a
+ * NEW key can only be provisioned when it is. `unprovisionedNew` are
+ * opted-in agents with no key in the vault yet; `brokerUnreachable` are
+ * agents we couldn't verify because the broker socket wasn't reachable
+ * (an environment limitation, not a hard failure).
+ */
+export async function probeVaultProvisioning(
+  config: SwitchroomConfig,
+  agentNames: string[],
+  home: string,
+): Promise<{
+  optedInCount: number;
+  passphraseAvailable: boolean;
+  alreadyProvisioned: string[];
+  unprovisionedNew: string[];
+  brokerUnreachable: string[];
+  needsHindsight: boolean;
+}> {
+  const optedIn: string[] = [];
+  for (const name of agentNames) {
+    const agentConfig = config.agents[name];
+    if (!agentConfig) continue;
+    const resolved = resolveAgentConfig(config.defaults, config.profiles, agentConfig);
+    if (effectiveLiteLLMEnabled(config, resolved.litellm)) optedIn.push(name);
+  }
+  const needsHindsight =
+    (config as { litellm?: { enabled?: boolean } }).litellm?.enabled === true &&
+    (config as { memory?: { backend?: string } }).memory?.backend === "hindsight";
+
+  const passphraseAvailable = (await resolveOperatorVaultPassphrase(home)) !== null;
+
+  const alreadyProvisioned: string[] = [];
+  const unprovisionedNew: string[] = [];
+  const brokerUnreachable: string[] = [];
+
+  if (optedIn.length > 0) {
+    const { getViaBrokerStructured } = await import("../vault/broker/client.js");
+    for (const name of optedIn) {
+      const existing = await getViaBrokerStructured(`litellm/${name}/api-key`);
+      if (existing.kind === "ok") alreadyProvisioned.push(name);
+      else if (existing.kind === "unreachable") brokerUnreachable.push(name);
+      else unprovisionedNew.push(name); // not_found / denied
+    }
+  }
+
+  return {
+    optedInCount: optedIn.length,
+    passphraseAvailable,
+    alreadyProvisioned,
+    unprovisionedNew,
+    brokerUnreachable,
+    needsHindsight,
+  };
+}
+
+/** Parse the top-level service names out of a generated compose YAML. */
+export function parseComposeServiceNames(compose: string): string[] {
+  const lines = compose.split("\n");
+  const names: string[] = [];
+  let inServices = false;
+  for (const line of lines) {
+    if (/^services:\s*$/.test(line)) {
+      inServices = true;
+      continue;
+    }
+    // A new top-level key (column 0, non-space) ends the services block.
+    if (inServices && /^\S/.test(line)) break;
+    if (!inServices) continue;
+    // Service entries are keyed at exactly two-space indent: `  <name>:`.
+    const m = /^ {2}([A-Za-z0-9_.-]+):\s*$/.exec(line);
+    if (m) names.push(m[1]);
+  }
+  return names;
+}
+
+export interface ApplyDryRunResult {
+  /** Conditions that would make a real apply exit non-zero. */
+  blocking: string[];
+  /** Non-fatal advisories (a real apply would still succeed). */
+  warnings: string[];
+  /** Informational lines (would-change summary, would-provision, etc.). */
+  info: string[];
+  /** Agent image tag a real apply would bake into the compose. */
+  imageTag: string | null;
+  /** Agent image tag currently on disk, or null. */
+  previousImageTag: string | null;
+  /** True when the would-be compose differs from what's on disk. */
+  composeChanged: boolean;
+  /** Service names present in the new compose but not the old. */
+  addedServices: string[];
+  /** Service names present in the old compose but not the new. */
+  removedServices: string[];
+  /** True when a real apply would succeed (no blocking conditions). */
+  wouldSucceed: boolean;
+}
+
+/**
+ * `apply --dry-run` — run the full compose-regeneration + validation
+ * pipeline IN MEMORY and report what a real apply would do, WITHOUT
+ * writing the compose file, persisting anything, or touching a container.
+ *
+ * Catches the failure modes that the v0.17.0 rollout surfaced only AFTER
+ * the real apply had already started mutating state:
+ *   - profile-resolution failures (`Profile not found: default …`);
+ *   - vault-broker unreachable (can't verify/provision keys);
+ *   - vault passphrase unavailable for NEW keys that need provisioning.
+ *
+ * Returns a structured result; the CLI handler exits non-zero when
+ * `wouldSucceed` is false. Deliberately does NOT call `runApply`,
+ * `writeComposeFile`, `scaffoldAgent`, `alignAgentUid`, or any broker
+ * reload — every step here is read-only.
+ */
+export async function runApplyDryRun(
+  config: SwitchroomConfig,
+  options: ApplyOptions,
+  deps: ApplyDeps = {},
+  switchroomConfigPath?: string,
+): Promise<ApplyDryRunResult> {
+  const writeOut = deps.writeOut ?? ((s) => process.stdout.write(s));
+  const writeErr = deps.writeErr ?? ((s) => process.stderr.write(s));
+
+  const blocking: string[] = [];
+  const warnings: string[] = [];
+  const info: string[] = [];
+
+  writeOut(
+    chalk.bold("\nDry-run: validating switchroom config (no changes will be written)...\n"),
+  );
+
+  // ── 1. Preflight (vault present, docker compose v2, agent-container guard)
+  try {
+    runApplyPreflight(config, { detectComposeV2: deps.detectComposeV2 });
+  } catch (err) {
+    blocking.push(`preflight: ${(err as Error).message}`);
+  }
+
+  const allAgentNames = Object.keys(config.agents ?? {});
+  const agentNames =
+    options.only !== undefined ? [options.only] : allAgentNames;
+  if (options.only !== undefined && !allAgentNames.includes(options.only)) {
+    blocking.push(
+      `apply --only=${options.only}: no such agent in switchroom.yaml ` +
+      `(defined: ${allAgentNames.join(", ") || "none"}).`,
+    );
+  }
+
+  // ── 2. Profile resolution — the #1 thing rollout --dry-run missed.
+  for (const name of agentNames) {
+    const agentConfig = config.agents[name];
+    if (!agentConfig) continue;
+    const profileName = agentConfig.extends ?? "default";
+    try {
+      getProfilePath(profileName);
+      // Also exercise the cascade merge so a malformed profile block fails here.
+      resolveAgentConfig(config.defaults, config.profiles, agentConfig);
+    } catch (err) {
+      blocking.push(
+        `profile '${profileName}' for agent '${name}': ${(err as Error).message}`,
+      );
+    }
+  }
+
+  // ── 3. Vault provisioning gaps (broker reachability + new-key passphrase).
+  try {
+    const probe = await probeVaultProvisioning(config, agentNames, homedir());
+    if (probe.alreadyProvisioned.length > 0) {
+      info.push(
+        `litellm: ${probe.alreadyProvisioned.length} agent(s) already provisioned ` +
+        `(${probe.alreadyProvisioned.join(", ")}).`,
+      );
+    }
+    if (probe.brokerUnreachable.length > 0) {
+      // #2781: unreachable broker is an environment limitation, not a hard
+      // failure — a real apply degrades to a warning and keeps previous env.
+      warnings.push(
+        `litellm: vault-broker unreachable — could not verify/provision ` +
+        `${probe.brokerUnreachable.length} agent(s) ` +
+        `(${probe.brokerUnreachable.join(", ")}); they keep their previous routing env.`,
+      );
+    }
+    const pending = [
+      ...probe.unprovisionedNew,
+      ...(probe.needsHindsight ? ["hindsight (service)"] : []),
+    ];
+    if (pending.length > 0) {
+      if (probe.passphraseAvailable) {
+        info.push(
+          `litellm: would provision ${pending.length} new virtual key(s) ` +
+          `(${pending.join(", ")}) — vault passphrase is available.`,
+        );
+      } else {
+        // Mirrors provisionLiteLLMKeys pushing these to failures[] → exit 1.
+        blocking.push(
+          `litellm: ${pending.length} agent(s)/service(s) need a NEW vault key ` +
+          `(${pending.join(", ")}) but the vault passphrase is unavailable ` +
+          `(no SWITCHROOM_VAULT_PASSPHRASE env and machine-id auto-unlock blob ` +
+          `missing/undecryptable) — a real apply could not provision them.`,
+        );
+      }
+    }
+  } catch (err) {
+    warnings.push(`litellm: provisioning probe failed — ${(err as Error).message}`);
+  }
+
+  // ── 4. Compute the would-be compose IN MEMORY (no write).
+  let imageTag: string | null = null;
+  let previousImageTag: string | null = null;
+  let composeChanged = false;
+  let addedServices: string[] = [];
+  let removedServices: string[] = [];
+  try {
+    const computed = await computeComposeContent({
+      config,
+      composePath: options.outPath ?? DEFAULT_COMPOSE_PATH,
+      switchroomConfigPath,
+      releaseOverride: options.releaseOverride,
+      buildMode: options.buildLocal ? "local" : "pull",
+      buildContext: options.buildContext,
+    });
+    imageTag = computed.imageTag;
+    previousImageTag = computed.previousImageTag;
+    composeChanged = computed.previous !== computed.content;
+    const newServices = parseComposeServiceNames(computed.content);
+    const oldServices = computed.previous
+      ? parseComposeServiceNames(computed.previous)
+      : [];
+    addedServices = newServices.filter((s) => !oldServices.includes(s));
+    removedServices = oldServices.filter((s) => !newServices.includes(s));
+
+    if (previousImageTag === null) {
+      info.push(`compose: no existing compose on disk — a real apply would create it.`);
+    } else if (previousImageTag !== imageTag) {
+      info.push(
+        `compose: agent image would change ${previousImageTag} → ${imageTag}.`,
+      );
+    } else {
+      info.push(`compose: agent image unchanged (${imageTag}).`);
+    }
+    if (addedServices.length > 0) {
+      info.push(`compose: services added: ${addedServices.join(", ")}.`);
+    }
+    if (removedServices.length > 0) {
+      info.push(`compose: services removed: ${removedServices.join(", ")}.`);
+    }
+    if (previousImageTag !== null && !composeChanged) {
+      info.push(`compose: no change (would be byte-identical to the current file).`);
+    }
+  } catch (err) {
+    blocking.push(`compose generation: ${(err as Error).message}`);
+  }
+
+  // ── 5. Report ─────────────────────────────────────────────────────
+  for (const line of info) writeOut(chalk.gray(`  ~ ${line}\n`));
+  for (const line of warnings) writeErr(chalk.yellow(`  ! ${line}\n`));
+  for (const line of blocking) writeErr(chalk.red(`  x ${line}\n`));
+
+  const wouldSucceed = blocking.length === 0;
+  writeOut("\n");
+  if (wouldSucceed) {
+    writeOut(
+      chalk.green.bold(
+        `Dry-run: a real apply would SUCCEED. ` +
+        `${allAgentNames.length} agent(s) validated; nothing was written.\n`,
+      ),
+    );
+  } else {
+    writeErr(
+      chalk.red.bold(
+        `Dry-run: a real apply would FAIL — ${blocking.length} blocking ` +
+        `condition(s) above. Nothing was written.\n`,
+      ),
+    );
+  }
+
+  return {
+    blocking,
+    warnings,
+    info,
+    imageTag,
+    previousImageTag,
+    composeChanged,
+    addedServices,
+    removedServices,
+    wouldSucceed,
+  };
+}
+
+/**
  * Resolution block printed when one or more agents fail to scaffold.
  * Tells the operator their two real options (sudo or `--compose-only`)
  * so the next step is obvious. Returns the formatted string so the
@@ -1616,6 +1951,22 @@ export function formatScaffoldFailureResolution(
     `ERROR: Scaffolded ${scaffolded}/${agentsTotal} agents. ${fail} failed.`,
   );
   lines.push("");
+  // #2781: the 0700/privilege-escalation guidance below is only the right
+  // diagnosis when at least one failure actually IS a permission failure.
+  // Printing it for, e.g., litellm/vault failures misdirected operators at
+  // sudo when the problem was elsewhere. Non-permission failures get a
+  // generic pointer at the per-agent error lines instead.
+  const hasPermissionFailure = failures.some((f) =>
+    /EACCES|EPERM|permission denied/i.test(f.message),
+  );
+  if (!hasPermissionFailure) {
+    lines.push(
+      `${fail} agent(s) failed to scaffold — see the per-agent error lines above`,
+    );
+    lines.push("for the specific cause(s).");
+    lines.push("");
+    return lines.join("\n");
+  }
   lines.push(
     "Per-agent state dirs are mode 0700 owned by per-agent UIDs (the v0.7+",
   );
@@ -1874,6 +2225,10 @@ export function registerApplyCommand(program: Command): void {
       "Skip the per-agent scaffold loop entirely; only (re)generate the compose file. Use in CI / scripts that can't chown into per-agent state dirs (mode 0700, owned by per-agent UIDs in v0.7+ docker mode). The full apply still runs preflight + emits compose; only the start.sh / .mcp.json / settings.json refresh is skipped.",
     )
     .option(
+      "--dry-run",
+      "Validate only: run the full compose-regeneration + validation pipeline IN MEMORY (resolve every agent's profile, probe the vault-broker for key-provisioning gaps, compute the would-be compose) and print a report — without writing the compose file, persisting anything, or touching a container. Exits non-zero if a real apply would fail (e.g. a profile can't resolve). Use as a pre-flight before a `rollout`/`update` (which only print the step plan, not the config-regeneration that actually fails).",
+    )
+    .option(
       "--no-doctor",
       "Skip the post-apply doctor sweep that surfaces stale start.sh / unhealthy agents (#929). Default: doctor runs after a successful scaffold so the operator sees whether the v0.7+ post-Phase-4 supervisor block is now in place. `switchroom update` passes this internally to avoid running doctor twice (it has its own doctor step).",
     )
@@ -1912,6 +2267,7 @@ export function registerApplyCommand(program: Command): void {
         allowUnaligned?: boolean;
         only?: string;
         composeOnly?: boolean;
+        dryRun?: boolean;
         printSudoCmd?: boolean;
         skipSelfElevate?: boolean;
         channel?: "dev" | "rc" | "latest";
@@ -1949,6 +2305,42 @@ export function registerApplyCommand(program: Command): void {
             const argv = ["sudo", ...buildSelfElevateArgv()];
             process.stdout.write(argv.join(" ") + "\n");
             process.exit(0);
+          }
+
+          // ─── Dry-run (validate-only) ────────────────────────────
+          //
+          // Runs the full compose-regeneration + validation pipeline in
+          // memory and reports what a real apply would do, WITHOUT
+          // writing the compose, persisting anything, self-elevating, or
+          // touching a container. Handled here — before the sudo
+          // pre-check — because it is entirely read-only and must never
+          // escalate. Exits non-zero when a real apply would fail.
+          if (opts.dryRun) {
+            const dry = await runApplyDryRun(
+              config,
+              {
+                buildLocal: !!opts.buildLocal,
+                buildContext:
+                  typeof opts.buildLocal === "string" ? opts.buildLocal : process.cwd(),
+                outPath: opts.out,
+                only: opts.only,
+                releaseOverride: opts.channel
+                  ? { channel: opts.channel }
+                  : opts.pin
+                    ? { pin: opts.pin }
+                    : undefined,
+                dryRun: true,
+              },
+              {},
+              switchroomConfigPath,
+            );
+            await captureEvent("apply_dry_run", {
+              agents_total: Object.keys(config.agents ?? {}).length,
+              would_succeed: dry.wouldSucceed,
+              blocking: dry.blocking.length,
+              warnings: dry.warnings.length,
+            });
+            process.exit(dry.wouldSucceed ? 0 : 1);
           }
           if (
             !opts.skipSelfElevate

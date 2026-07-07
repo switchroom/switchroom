@@ -7,6 +7,7 @@ import { getSchedulerState, formatSchedulerState } from "../agents/scheduler-sta
 import YAML from "yaml";
 import { resolveAgentsDir, loadConfig } from "../config/loader.js";
 import { isHindsightEnabled } from "../memory/hindsight.js";
+import { HINDSIGHT_DEFAULT_MCP_URL } from "../setup/hindsight.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 import { withConfigError, getConfig, getConfigPath } from "./helpers.js";
 import { scaffoldAgent, reconcileAgent, buildSettingsHooksBlock, detectHooksDrift, SWITCHROOM_DEFAULT_MAIN_MODEL, SWITCHROOM_DEFAULT_THINKING_EFFORT } from "../agents/scaffold.js";
@@ -308,7 +309,7 @@ function buildStatusInputs(
   if (isHindsightEnabled(config)) {
     const baseUrl =
       (config.memory?.config?.url as string | undefined) ??
-      "http://localhost:8888/mcp/";
+      HINDSIGHT_DEFAULT_MCP_URL;
     hindsightApiUrl = baseUrl.endsWith("/mcp/")
       ? baseUrl
       : baseUrl.replace(/\/$/, "") + "/mcp/";
@@ -636,7 +637,14 @@ export async function reconcileAndRestartAgent(
   if (allChanges.length > 0) {
     const kinds = allChanges.map((p) => classifyChangeKind(p));
     const allCron = kinds.every((k) => k === "cron");
-    if (allCron) {
+    // The cron-only hot path skips the container recreate — but --force and a
+    // one-shot release override (`--pin <target>` on the hostd rollout path)
+    // are explicit demands to recreate on the TARGET image. If we take the hot
+    // path there, an agent with only cron-tagged drift (e.g.
+    // `.claude-cron/.mcp.json`) stays on the OLD image and the roll's
+    // version-assert stalls. Force/pin must always win over classification.
+    // Fixes #2779.
+    if (allCron && !opts.force && !opts.releaseOverride) {
       const r = deps.applyCronChangesHot(name, allChanges);
       log(
         chalk.cyan(
@@ -891,7 +899,7 @@ export function registerAgentCommand(program: Command): void {
         let hindsightBankId = name;
         if (isHindsightEnabled(config)) {
           const baseUrl = (config.memory?.config?.url as string | undefined)
-            ?? "http://localhost:8888/mcp/";
+            ?? HINDSIGHT_DEFAULT_MCP_URL;
           // Normalize to end in /mcp/
           hindsightApiUrl = baseUrl.endsWith("/mcp/")
             ? baseUrl

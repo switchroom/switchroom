@@ -20,6 +20,7 @@
 
 import { escapeHtmlForTg } from '../shared/bot-runtime.js'
 import { codeSpanSafe } from './approval-card.js'
+import { hardenCardBreaks } from '../format.js'
 
 /** Minimal shape the card needs — a subset of PendingVaultRequestAccess. */
 export interface VaultRequestAccessCardInput {
@@ -57,5 +58,8 @@ export function renderVaultRequestAccessCard(
   lines.push(
     `_Tap Approve to mint a scoped grant token (same flow as \`switchroom vault grant\`). Tap Deny to refuse — the agent will receive a denial result._`,
   )
-  return lines.join('\n')
+  // hardenCardBreaks: the labelled field lines (key: / scope:…/ why:) would
+  // soft-collapse into one blob under the GFM rich renderer; this card is sent
+  // direct via richMessage, bypassing the switchroomReply chokepoint.
+  return hardenCardBreaks(lines.join('\n'))
 }

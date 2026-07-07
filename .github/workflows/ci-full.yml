@@ -1,0 +1,270 @@
+name: ci-full
+
+# Nightly UNFILTERED sweep — the safety net behind the path-filtered
+# fast path.
+#
+# The PR-facing workflows optimise for velocity: ci-tests-core runs
+# `vitest --changed`, every changes-gated job skips on irrelevant
+# paths, docker-e2e rides an image cache, and docker-images is
+# path-gated on PRs (and hindsight/voice even on main pushes). Each of
+# those optimisations has a theoretical false-negative mode (a stale
+# path filter, an import-graph edge --changed misses, a poisoned image
+# cache, a Dockerfile that only breaks on a cold build). This workflow
+# closes the loop: once a day it runs EVERYTHING from scratch on main
+# with no filters, no --changed, and no warm caches on the e2e path.
+#
+# Jobs are defined directly (not via workflow_call reuse) because the
+# existing workflows' jobs are event-gated (`github.event_name ==
+# 'push' || relevant == 'true'`) — under a `schedule` caller they would
+# all skip; converting them would complicate the required-check
+# workflows for no PR-path benefit. The duplicated steps mirror their
+# sources 1:1 — when editing ci-tests-core / ci-tests-plugin /
+# ci-tests-python / docker-e2e / docker-images, keep the twin job here
+# in sync.
+#
+# Deliberately NOT scheduled: ci-uat / ci-evals — they burn real
+# subscription quota and stay dispatch-only.
+
+on:
+  schedule:
+    # 16:00 UTC = 02:00 AEST — quiet hours for the fleet's operators.
+    - cron: "0 16 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # docker-images-build pulls private GHCR images (BASE_IMAGE +
+  # :buildcache cache-from). Build-only — nothing is pushed.
+  packages: read
+
+# workflow_dispatch runs get their own concurrency group (keyed by
+# run id) so scheduled runs on the same ref can't cancel a manually
+# requested one — dispatch is the manual re-trigger lever, so it must
+# not be cancellable (same pattern as docker-images.yml, #1336).
+concurrency:
+  group: ci-full-${{ github.event_name == 'workflow_dispatch' && format('dispatch-{0}', github.run_id) || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: ${{ github.repository_owner }}
+
+jobs:
+  # ─── Lint (mirrors ci-lint.yml lint-run) ──────────────────────────
+  lint-full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - name: Set up workspace
+        uses: ./.github/actions/setup-switchroom
+      - name: Run lint
+        run: bun lint
+
+  # ─── Full vitest suite (mirrors ci-tests-core.yml, no --changed) ──
+  build-dist:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - name: Set up workspace
+        uses: ./.github/actions/setup-switchroom
+      - name: Build dist/
+        run: bun scripts/build.mjs
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: dist-built-full
+          path: dist/
+          retention-days: 1
+          if-no-files-found: error
+
+  vitest-full:
+    needs: build-dist
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    env:
+      TELEGRAM_BOT_TOKEN: "123456:stub-for-tests"
+      VITEST_MAX_FORKS: "2"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - name: Set up workspace
+        uses: ./.github/actions/setup-switchroom
+        with:
+          install-jq: "true"
+      - name: Download dist artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: dist-built-full
+          path: dist/
+      - name: Restore exec bits on bundled CLIs
+        # Artifact zip strips POSIX exec bits — see ci-tests-core.yml.
+        run: |
+          chmod +x dist/cli/*.js dist/cli/*.mjs 2>/dev/null || true
+      - name: Vitest shard ${{ matrix.shard }}/4 (full suite)
+        run: bunx vitest run --shard ${{ matrix.shard }}/4
+
+  # ─── Plugin bun tests (mirrors ci-tests-plugin.yml bun-test-run) ──
+  bun-test-full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      TELEGRAM_BOT_TOKEN: "123456:stub-for-tests"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - name: Set up workspace
+        uses: ./.github/actions/setup-switchroom
+      - name: Bun test (telegram-plugin)
+        working-directory: telegram-plugin
+        run: |
+          bun test \
+            admin-commands gateway registry secret-detect tests \
+            channel-envelope-safety.test.ts
+
+  # ─── Python tests (mirrors ci-tests-python.yml unittest) ──────────
+  python-full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - name: Run unittest discover (hindsight scripts)
+        working-directory: vendor/hindsight-memory/scripts
+        run: python3 -m unittest discover tests/
+      - name: Run voice-sidecar unittests
+        working-directory: docker/voice-sidecar
+        run: python3 -m unittest discover -s . -p 'test_*.py'
+
+  # ─── Docker e2e, forced COLD path (mirrors docker-e2e.yml e2e) ────
+  # Deliberately no actions/cache restore: the nightly job exists to
+  # prove the from-scratch build sequence still works even when every
+  # PR-path run has been riding the warm tarball for weeks.
+  docker-e2e-full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - name: Set up workspace
+        uses: ./.github/actions/setup-switchroom
+      - name: Build dist/
+        run: bun scripts/build.mjs
+      - name: Set up Docker Buildx
+        # `docker` driver, not docker-container — build-images.sh chains
+        # FROM switchroom/base:phase1b-test via the local daemon (see
+        # docker-e2e.yml).
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
+        with:
+          driver: docker
+      - name: Build phase1b-test images (cold)
+        run: bash tests/docker/build-images.sh
+      - name: Tag phase2a-test / phase2b-test aliases
+        run: |
+          docker tag switchroom/broker:phase1b-test switchroom/broker:phase2a-test
+          docker tag switchroom/kernel:phase1b-test switchroom/kernel:phase2b-test
+      - name: Run docker e2e suite (with pre/post snapshot gate)
+        run: bash scripts/ci/docker-snapshot-gate.sh
+      - name: Capture broker / kernel logs on failure
+        if: failure()
+        run: |
+          echo "::group::docker ps -a"
+          docker ps -a || true
+          echo "::endgroup::"
+          for c in $(docker ps -aq --filter label=switchroom.test=phase2c); do
+            echo "::group::logs $c"
+            docker logs "$c" 2>&1 | tail -200 || true
+            echo "::endgroup::"
+          done
+      - name: Label-scoped teardown
+        if: always()
+        run: |
+          for label in switchroom.test=phase1b switchroom.test=phase2a switchroom.test=phase2b switchroom.test=phase2c; do
+            ids=$(docker ps -aq --filter label=$label 2>/dev/null || true)
+            if [ -n "$ids" ]; then
+              docker rm -f $ids 2>/dev/null || true
+            fi
+          done
+
+  # ─── Full image-build validation (mirrors docker-images.yml, BUILD
+  # ONLY — push: false, so :latest / :dev / :sha-* are never touched
+  # and no fresh claude@latest is silently republished) ──────────────
+  # amd64-only like the PR path; dependents resolve BASE_IMAGE from the
+  # published :latest exactly as PR builds do, so every leg is
+  # independent (no base→dependents ordering needed).
+  docker-images-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          # `cache` names each image's registry buildcache tag: since
+          # docker-images.yml split base/dependents into per-arch
+          # native-runner builds, their caches are per-arch
+          # (:buildcache-<arch>); this amd64-only job reads the amd64
+          # one. hindsight/voice stayed single-job and keep the plain
+          # :buildcache tag.
+          - { name: base,        file: docker/Dockerfile.base,        dist: true,  base-arg: false, cache: buildcache-amd64 }
+          - { name: agent,       file: docker/Dockerfile.agent,       dist: true,  base-arg: true,  cache: buildcache-amd64 }
+          - { name: broker,      file: docker/Dockerfile.broker,      dist: true,  base-arg: true,  cache: buildcache-amd64 }
+          - { name: kernel,      file: docker/Dockerfile.kernel,      dist: true,  base-arg: true,  cache: buildcache-amd64 }
+          - { name: hostd,       file: docker/Dockerfile.hostd,       dist: true,  base-arg: true,  cache: buildcache-amd64 }
+          - { name: auth-broker, file: docker/Dockerfile.auth-broker, dist: true,  base-arg: true,  cache: buildcache-amd64 }
+          - { name: web,         file: docker/Dockerfile.web,         dist: true,  base-arg: true,  cache: buildcache-amd64 }
+          - { name: hindsight,   file: docker/Dockerfile.hindsight,   dist: false, base-arg: false, cache: buildcache }
+          - { name: voice,       file: docker/Dockerfile.voice,       dist: false, base-arg: false, cache: buildcache }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Set up Node (for dist/ bundling)
+        if: matrix.image.dist
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: "22"
+
+      - name: Set up Bun (build.mjs invokes bun build)
+        if: matrix.image.dist
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: latest
+
+      - name: Install deps + build dist/
+        if: matrix.image.dist
+        run: |
+          bun install
+          npm run build
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
+
+      - name: Log in to GHCR (cache-from + BASE_IMAGE pulls only)
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0  # v4.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build ${{ matrix.image.name }} (validation only, no push)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
+        with:
+          context: .
+          file: ${{ matrix.image.file }}
+          platforms: linux/amd64
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/switchroom-${{ matrix.image.name }}:ci-full
+          push: false
+          build-args: ${{ matrix.image.base-arg && format('BASE_IMAGE={0}/{1}/switchroom-base:latest', env.REGISTRY, env.IMAGE_NAMESPACE) || '' }}
+          # Read-only registry cache (never cache-to — #1965 pattern,
+          # and this job must not pollute the release cache). Second
+          # line is the legacy pre-per-arch-split tag as a fallback.
+          cache-from: |
+            type=registry,ref=ghcr.io/${{ github.repository_owner }}/switchroom-${{ matrix.image.name }}:${{ matrix.image.cache }}
+            type=registry,ref=ghcr.io/${{ github.repository_owner }}/switchroom-${{ matrix.image.name }}:buildcache

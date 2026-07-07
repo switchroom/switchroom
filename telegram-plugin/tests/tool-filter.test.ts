@@ -15,7 +15,6 @@ import {
 // A representative slice mirroring the real TOOL_SCHEMAS names.
 const SAMPLE: NamedTool[] = [
   { name: 'reply', description: 'r' },
-  { name: 'stream_reply', description: 's' },
   { name: 'get_recent_messages', description: 'g' },
   { name: 'react', description: 'k' },
   { name: 'edit_message', description: 'e' },
@@ -58,10 +57,9 @@ describe('buildEffectiveToolSchemas — per-tool deferral pins (B)', () => {
     }
   })
 
-  it('the reply path (reply/stream_reply) is ALWAYS pinned — never defers', () => {
+  it('the reply path (reply) is ALWAYS pinned — never defers', () => {
     const out = buildEffectiveToolSchemas(SAMPLE, { linearEnabled: false })
     expect(metaOf(out, 'reply')).toEqual({ 'anthropic/alwaysLoad': true })
-    expect(metaOf(out, 'stream_reply')).toEqual({ 'anthropic/alwaysLoad': true })
   })
 
   it('cold tools carry NO _meta (so they defer under tool-search)', () => {

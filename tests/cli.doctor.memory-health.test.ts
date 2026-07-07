@@ -6,6 +6,11 @@ import {
   classifyExtractionLogs,
   checkHindsightContainerHealth,
   classifyToolContract,
+  classifyHindsightHealthProbe,
+  checkHindsightHealthEndpoint,
+  classifyConsolidationBacklog,
+  CONSOLIDATION_BACKLOG_WARN,
+  CONSOLIDATION_BACKLOG_FAIL,
   type AdvertisedTool,
   MIN_HINDSIGHT_SHM_BYTES,
 } from "../src/cli/doctor-memory.js";
@@ -54,6 +59,41 @@ describe("classifyToolContract — live contract-drift detector", () => {
     for (const tool of Object.keys(EXPECTED_HINDSIGHT_TOOLS)) {
       expect(names.has(tool), `${tool} in EXPECTED_HINDSIGHT_TOOLS but not the snapshot`).toBe(true);
     }
+  });
+});
+
+describe("classifyConsolidationBacklog (#2903 fix 5.3)", () => {
+  it("ok when the queue is drained", () => {
+    const r = classifyConsolidationBacklog(0);
+    expect(r.status).toBe("ok");
+    expect(r.detail).toMatch(/drained/);
+  });
+
+  it("ok (not warn) just below the warn threshold", () => {
+    const r = classifyConsolidationBacklog(CONSOLIDATION_BACKLOG_WARN - 1);
+    expect(r.status).toBe("ok");
+  });
+
+  it("warns once the queue crosses the warn threshold", () => {
+    const r = classifyConsolidationBacklog(CONSOLIDATION_BACKLOG_WARN);
+    expect(r.status).toBe("warn");
+    expect(r.detail).toContain(`${CONSOLIDATION_BACKLOG_WARN} pending`);
+  });
+
+  it("fails when the queue is deep enough to be wedged", () => {
+    const r = classifyConsolidationBacklog(CONSOLIDATION_BACKLOG_FAIL);
+    expect(r.status).toBe("fail");
+    expect(r.fix).toBeDefined();
+  });
+
+  it("includes the oldest-op age when it is known", () => {
+    const r = classifyConsolidationBacklog(CONSOLIDATION_BACKLOG_WARN, 7200);
+    expect(r.detail).toMatch(/oldest 120m old/);
+  });
+
+  it("omits the age clause when age is unknown (REST /stats has no per-op age — #2847)", () => {
+    const r = classifyConsolidationBacklog(CONSOLIDATION_BACKLOG_WARN, null);
+    expect(r.detail).not.toMatch(/oldest/);
   });
 });
 
@@ -150,5 +190,52 @@ describe("checkHindsightContainerHealth (docker wrapper)", () => {
     const results = checkHindsightContainerHealth({ exec });
     expect(results.find((r) => r.name === "hindsight shm-size")?.status).toBe("fail");
     expect(results.find((r) => r.name === "hindsight extraction")?.status).toBe("fail");
+  });
+});
+
+// ─── Memory-down /health signal (2026-07 outage) ─────────────────────────────
+//
+// The outage was invisible: hindsight crash-looped on an occupied port while
+// auto-recall/retain failed silently (no user-facing error). A GET /health
+// check makes the outage LOUD in `switchroom doctor`.
+describe("classifyHindsightHealthProbe — memory-down signal", () => {
+  it("200 → ok", () => {
+    const r = classifyHindsightHealthProbe(200, 18888);
+    expect(r.status).toBe("ok");
+    expect(r.detail).toContain("18888");
+  });
+
+  it("null (connection refused / crash-loop) → fail, names the silent-outage risk", () => {
+    const r = classifyHindsightHealthProbe(null, 18888);
+    expect(r.status).toBe("fail");
+    expect(r.detail).toMatch(/down or crash-looping|silently/i);
+    expect(r.fix).toContain("switchroom memory");
+  });
+
+  it("non-200 (e.g. 503) → fail", () => {
+    const r = classifyHindsightHealthProbe(503, 18888);
+    expect(r.status).toBe("fail");
+    expect(r.detail).toContain("503");
+  });
+});
+
+describe("checkHindsightHealthEndpoint — async probe wrapper", () => {
+  it("derives /health from the MCP url and reports ok on 200", async () => {
+    const seen: string[] = [];
+    const fetchImpl = (async (u: string | URL) => {
+      seen.push(String(u));
+      return { status: 200 } as Response;
+    }) as unknown as typeof fetch;
+    const r = await checkHindsightHealthEndpoint("http://127.0.0.1:18888/mcp/", { fetchImpl });
+    expect(seen[0]).toBe("http://127.0.0.1:18888/health");
+    expect(r.status).toBe("ok");
+  });
+
+  it("a rejected fetch (container down) fails closed to a loud fail", async () => {
+    const fetchImpl = (async () => {
+      throw new Error("connect ECONNREFUSED 127.0.0.1:18888");
+    }) as unknown as typeof fetch;
+    const r = await checkHindsightHealthEndpoint("http://127.0.0.1:18888/mcp/", { fetchImpl });
+    expect(r.status).toBe("fail");
   });
 });

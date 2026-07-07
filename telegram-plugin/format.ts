@@ -132,8 +132,18 @@ export function repairEscapedWhitespace(text: string): string {
 interface MaskedCode {
   masked: string
   restore: (s: string) => string
-  /** The placeholder prefix injected for each masked region (fence or span). */
+  /**
+   * The placeholder prefix injected for FENCED-BLOCK masks only. A masked
+   * fenced block occupies a whole line, so `isFenceOpenLine` / `isMarkerLine`
+   * treat a line that STARTS with this prefix as a block construct. INLINE
+   * code spans get a DISTINCT prefix (see maskCodeRegions) that deliberately
+   * does NOT start with this one — so a line that merely opens with an inline
+   * span (e.g. `\`key\` = \`value\``) reads as ordinary prose and still gets
+   * its line break hardened.
+   */
   placeholder: string
+  /** Remove EVERY mask (fenced + inline) — used to measure visible length. */
+  stripPlaceholders: (s: string) => string
 }
 
 /**
@@ -144,31 +154,40 @@ interface MaskedCode {
  * Fenced blocks are extracted FIRST and only when CLOSED (matching ```), so an
  * unclosed fence is left intact rather than misparsed by the inline pass. Inline
  * spans use `[^\`\n]+` — the same definition the chunker treats as code.
+ *
+ * Fenced and inline masks carry DISTINCT prefixes (`\x00RMF…` vs `\x00RMI…`).
+ * This matters because the fenced prefix is what the block-structure predicates
+ * (`isFenceOpenLine`, `isMarkerLine`) use to recognise a standalone masked code
+ * block. Sharing one prefix (the pre-fix bug) made a line that merely STARTS
+ * with an inline code span look like a fenced block, so its lone `\n` was never
+ * hardened and the card collapsed into one run-on line (real victim:
+ * `/vault get` rendering `\`key\` = \`value\``).
  */
 function maskCodeRegions(text: string, nonce: string): MaskedCode {
-  const CODE_MASK_PH = `\x00RM${nonce}_`
+  const FENCE_MASK_PH = `\x00RMF${nonce}_`
+  const INLINE_MASK_PH = `\x00RMI${nonce}_`
   const codeMasks: string[] = []
 
   const masked = text
     .replace(/```[\s\S]*?```/g, (m) => {
       const idx = codeMasks.length
       codeMasks.push(m)
-      return `${CODE_MASK_PH}${idx}\x00`
+      return `${FENCE_MASK_PH}${idx}\x00`
     })
     .replace(/`[^`\n]+`/g, (m) => {
       const idx = codeMasks.length
       codeMasks.push(m)
-      return `${CODE_MASK_PH}${idx}\x00`
+      return `${INLINE_MASK_PH}${idx}\x00`
     })
 
-  const restoreRe = new RegExp(
-    `${CODE_MASK_PH.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\d+)\x00`,
-    'g',
-  )
+  // Restore / strip match EITHER prefix, keyed on the shared index space.
+  const escNonce = nonce.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const anyMaskRe = new RegExp(`\x00RM[FI]${escNonce}_(\\d+)\x00`, 'g')
   const restore = (s: string): string =>
-    s.replace(restoreRe, (_m, idx) => codeMasks[Number(idx)] ?? _m)
+    s.replace(anyMaskRe, (_m, idx) => codeMasks[Number(idx)] ?? _m)
+  const stripPlaceholders = (s: string): string => s.replace(anyMaskRe, '')
 
-  return { masked, restore, placeholder: CODE_MASK_PH }
+  return { masked, restore, placeholder: FENCE_MASK_PH, stripPlaceholders }
 }
 
 // ---------------------------------------------------------------------------
@@ -342,6 +361,92 @@ export function normalizeParagraphBreaks(text: string): string {
   out = ensureBlockBoundaries(out, placeholder)
 
   return restore(out)
+}
+
+// ---------------------------------------------------------------------------
+// Card line-break hardener — for DETERMINISTIC command/card bodies
+// ---------------------------------------------------------------------------
+
+/**
+ * Harden the lone `\n` line breaks of a DETERMINISTIC card body into GFM hard
+ * breaks (`  \n`, two trailing spaces) so every field lands on its own line
+ * under Telegram's Bot API 10.1 rich-message (GFM) renderer.
+ *
+ * Why this exists (the run-on-blob bug): the rich path (#2669) renders a lone
+ * `\n` between two non-blank lines as a *soft* break — the two lines collapse
+ * onto the same visual line with a space between them. Agent PROSE is repaired
+ * on the reply path by `normalizeParagraphBreaks`, but the ~98 slash-command
+ * card replies dispatched through `switchroomReply(…, { html: true })` are sent
+ * as RAW markdown with no normalization. Their builders stack short labelled
+ * fields (`**5h window** …`, `**Model** …`, `Auth: ✓ Max …`) joined by a single
+ * `\n`, so the whole card renders as one run-on blob.
+ *
+ * A deterministic card is NOT free prose — every newline its builder emits is
+ * an INTENDED line break. So this hardener promotes UNCONDITIONALLY (no
+ * sentence-terminal-punctuation gate, unlike `normalizeParagraphBreaks`) with
+ * one exception: a line that participates in a genuine GFM block construct
+ * (list / table / blockquote / heading / fenced code) keeps its single `\n` so
+ * its native stacking / contiguity survives — a monospace table inside a ```
+ * fence is never touched (it is code-masked AND the fence lines are excluded).
+ * Real `\n\n` paragraph gaps (a builder's block separators) are preserved.
+ *
+ * This is the string-level sibling of `stackCardLines` (card-format.ts), which
+ * does the same promotion from a pre-split `string[]` of guaranteed
+ * single-line, non-block entries. Use `hardenCardBreaks` where the card body is
+ * already an assembled string (e.g. the `switchroomReply` chokepoint) and may
+ * legitimately contain GFM block constructs.
+ *
+ * Runs on code-masked text and is idempotent — a break already hardened to
+ * `  \n` re-hardens to the same `  \n`.
+ */
+export function hardenCardBreaks(text: string): string {
+  if (!text.includes('\n')) return text
+
+  const nonce = Math.random().toString(36).slice(2)
+  const { masked, restore, placeholder } = maskCodeRegions(text, nonce)
+
+  // Collapse 3+ newline runs to a single clean `\n\n` gap (mirrors
+  // normalizeParagraphBreaks step 1) so a stray extra blank line never becomes
+  // an oversized gap. A genuine one-blank-line `\n\n` block gap is preserved.
+  const out = masked.replace(/\n{3,}/g, '\n\n')
+
+  // A line participating in a GFM block construct whose single-`\n` contiguity
+  // must survive (its interior must NOT get a hard break).
+  const isBlockConstructLine = (line: string): boolean =>
+    isListItemLine(line) ||
+    isTableRowLine(line) ||
+    isTableDelimiterLine(line) ||
+    isBlockquoteLine(line) ||
+    isHeadingLine(line) ||
+    isFenceOpenLine(line, placeholder)
+
+  const lines = out.split('\n')
+  const pieces: string[] = []
+  for (let i = 0; i < lines.length; i++) {
+    let line = lines[i]
+    const isLast = i === lines.length - 1
+    const next = isLast ? '' : lines[i + 1]
+    // Promote only between two non-blank content lines where NEITHER is a GFM
+    // block-construct line (so lists / tables / quotes / headings / fences keep
+    // their native single-`\n` stacking). A blank current/next line is a `\n\n`
+    // paragraph gap — never promote across it.
+    const promote =
+      !isLast &&
+      line.trim() !== '' &&
+      next.trim() !== '' &&
+      !isBlockConstructLine(line) &&
+      !isBlockConstructLine(next)
+    if (promote) {
+      // Strip trailing whitespace so a re-run emits exactly one `  \n` (never
+      // accumulate spaces). Include `\r` for CRLF sources.
+      line = line.replace(/[ \t\r]+$/, '')
+    }
+    pieces.push(line)
+    if (isLast) break
+    pieces.push(promote ? '  \n' : '\n')
+  }
+
+  return restore(pieces.join(''))
 }
 
 // ---------------------------------------------------------------------------
@@ -623,14 +728,11 @@ export function stripExcessBold(text: string): string {
   if (!text.includes('**')) return text
 
   const nonce = Math.random().toString(36).slice(2)
-  const { masked, restore, placeholder } = maskCodeRegions(text, nonce)
+  const { masked, restore, placeholder, stripPlaceholders } = maskCodeRegions(text, nonce)
 
-  // Non-code character budget: masked text with the placeholders removed.
-  const placeholderRe = new RegExp(
-    `${placeholder.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\d+\x00`,
-    'g',
-  )
-  const visible = masked.replace(placeholderRe, '')
+  // Non-code character budget: masked text with BOTH fenced + inline masks
+  // removed (stripPlaceholders handles the two distinct prefixes).
+  const visible = stripPlaceholders(masked)
   if (visible.length < 100) return restore(masked)
 
   let boldChars = 0

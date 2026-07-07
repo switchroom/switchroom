@@ -48,6 +48,14 @@ export interface IpcClientOptions {
   onInbound: (msg: InboundMessage) => void;
   onPermission: (msg: PermissionEvent) => void;
   onStatus: (msg: StatusEvent) => void;
+  /**
+   * Called every time the socket (re)connects and has registered — i.e. on
+   * the initial connect AND on each background reconnect. The bridge uses
+   * this to flush its outstanding permission-request ledger so approvals
+   * that arrived while the gateway was down are re-sent (#2861). Best-effort:
+   * a throw here is logged, never propagated into the socket open path.
+   */
+  onConnect?: () => void;
   log?: (msg: string) => void;
   reconnectDelayMs?: number;
   maxReconnectDelayMs?: number;
@@ -93,6 +101,7 @@ export function createIpcClient(options: IpcClientOptions): Promise<IpcClientHan
     onInbound,
     onPermission,
     onStatus,
+    onConnect,
     log = () => {},
     reconnectDelayMs = 2000,
     maxReconnectDelayMs = 30000,
@@ -237,6 +246,16 @@ export function createIpcClient(options: IpcClientOptions): Promise<IpcClientHan
             sendRegister();
             startHeartbeat();
             log(`connected to ${socketPath}`);
+            // Fire the (re)connect hook AFTER register + heartbeat so the
+            // bridge's ledger flush writes onto a live, registered socket.
+            // Best-effort: never let a callback throw abort the open path.
+            if (onConnect) {
+              try {
+                onConnect();
+              } catch (err) {
+                log(`onConnect hook threw: ${err}`);
+              }
+            }
             resolve();
           },
           data(sock, data) {

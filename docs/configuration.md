@@ -181,6 +181,35 @@ agents:
 
 > **Note:** this generates the *memory* wiring only. Who may **drive** an agent (`access.allowFrom`) is still paired at agent creation as today — generating access from `users:` is a future phase.
 
+### Specializing a bank — missions & disposition
+
+A persona without its own memory is cosplay: banks should be *specialized*, not merely isolated. Four `memory.*` fields steer how a bank extracts, recalls, and synthesizes — a coach should read its notes differently than a lawyer.
+
+| Field | Type | Cascade | Steers |
+| --- | --- | --- | --- |
+| `reflect_mission` | string | override | The bank's "who am I / what matters" framing applied during recall/reflect. Engine-accurate name for what `bank_mission` sets. |
+| `bank_mission` | string | override | **Alias** for `reflect_mission` (retained for back-compat — switchroom's `bank_mission` lands in the engine's `reflect_mission`). If both are set, `reflect_mission` wins. |
+| `retain_mission` | string | override | What the fact-extraction LLM keeps during auto-retain. Defaults to a curated mission on fresh agents. |
+| `observations_mission` | string | override | What the observation-consolidation LLM synthesizes from raw facts (the higher-order "what patterns matter" lens). |
+| `disposition` | object | **per-key merge** | Personality traits (`skepticism` / `literalism` / `empathy`, each `1`–`5`, engine default `3`) shaping recall/reflect/observation framing. |
+
+```yaml
+agents:
+  gymbro:
+    extends: health-coach
+    memory:
+      observations_mission: "Track motivation, adherence, and how setbacks connect to encouragement."
+      disposition:
+        empathy: 5        # overrides just this trait; skepticism/literalism
+                          # inherit the health-coach profile default (2/2)
+```
+
+`disposition` deep-merges one level (like `recall`): overriding a single trait leaves the profile's other traits in place. The other three fields override wholesale.
+
+**Zero-config defaults.** Built-in profiles ship differentiated dispositions so a fresh `switchroom setup` needs no YAML — `health-coach` leans empathy-high (`2/2/5`), `executive-assistant` leans precise (`4/4/3`), `coding` leans skeptical + literal (`4/5/2`). Operator config overrides these per-key.
+
+All four apply at **both** scaffold (fresh agents) and reconcile (`switchroom apply` updates existing banks) — except the `retain_mission` *default*, which is seeded only at scaffold so a customized retain mission is never clobbered.
+
 ### Demoting individual memories from auto-recall
 
 If one specific memory keeps surfacing in the recall block and isn't useful (over-broad world fact, stale context, etc.), tag it with `[demote-from-recall]` — or `demote-from-recall` / `no-recall`, all three work. The memory stays in the bank, `mcp__hindsight__reflect` and manual recall can still find it, but auto-recall skips it.
@@ -215,6 +244,34 @@ clerk:
 Use this to answer "is 12 the right cap?" — if `CAP` fires on most turns, the bank has more relevant content than 12 lets through; consider raising. If `CAP` rarely fires and `avg` stays well below the cap, the cap isn't the lever and other tuning (`recallBudget`, retain hygiene) probably matters more.
 
 The log is bounded to the last ~5000 events per agent.
+
+### Making corrections stick — `memory.directive_capture_nudge`
+
+Hindsight **directives** are the primitive that makes a standing rule survive a restart: user-authored, verbatim, and re-injected into every turn. But whether a correction actually *becomes* a directive was, historically, guidance-only — the model is told to call `create_directive` when you give it a durable rule, and inconsistently does. An audit (issue #2848) measured a **~55% miss rate** on clear-cut durable corrections: the same broadcast correction was captured by one agent and silently dropped by two others.
+
+`memory.directive_capture_nudge` (default **on**) closes that gap. On every inbound the auto-recall hook runs a **deterministic regex** over the message; when it looks correction- or standing-rule-shaped — `always`/`never`, `from now on`, `stop doing …`, a stated preference, `call me …`, `that's wrong, it's …` — it appends a terse advisory to the turn's context reminding the model that *if* this is a durable rule (not a one-off), it should persist it with `create_directive` before answering.
+
+Two things it deliberately does **not** do (both are hard invariants):
+
+- **No extra model call.** Detection is pure regex; the *judgment* — is this actually a standing rule? — happens inside the interactive `claude` session, on the operator's subscription. There is no classifier callsite.
+- **No silent write.** The hook only nudges. The model decides and calls `create_directive` itself, visible in chat — the hook never writes a directive you didn't see.
+
+Detection is intentionally inclusive (the nudge is cheap and advisory, so a false positive just costs a few tokens and is ignored), with a guard against the obvious pleasantry shapes (`always happy to help`, `never mind`).
+
+**Post-turn verification (the same knob).** The advisory nudge still relies on the model *choosing* to act on it. To close the residual gap for the clear-cut case, a **Stop-hook verifier** runs after the turn: it re-checks the human turn against a **narrow, high-precision** durable-rule regex — a strict subset of the nudge detector (explicit framings only: `from now on`, `as a rule`, `you should always`, `call me …`, `remember to …`, `don't … again`; bare `always`/`stop …` and world-fact corrections are excluded) — and if the turn stated a durable rule but the model recorded **no** `create_directive` call, it **blocks the stop once** to re-prompt the model to persist it. This keeps the two invariants above: no model call (pure regex), no silent write (the block is a re-prompt; the model still authors the directive itself, visibly). The block fires **at most once per turn** (a `stop_hook_active` loop guard), and its reason explicitly authorizes "if this was really a one-off, don't create a directive — just finish", so a false positive costs one bounded continuation, never a spurious directive. This verifier shares the `memory.directive_capture_nudge` knob — disabling the nudge disables the verifier too.
+
+```yaml
+defaults:
+  memory:
+    directive_capture_nudge: false   # disable fleet-wide (not recommended — Stage A proved a real gap)
+
+agents:
+  clerk:
+    memory:
+      directive_capture_nudge: true  # per-agent opt back in
+```
+
+**Cascade: override** (per-agent wins over profile/defaults). Omit the field to inherit the on-by-default. Operationally the knob threads the same way as the other recall tuning: the switchroom default is pinned in the plugin's `settings.json`, and `start.sh` exports `HINDSIGHT_DIRECTIVE_CAPTURE_NUDGE` only when you override it (the env value wins at plugin load). Serves the `remember-across-sessions` job.
 
 ### Server-side caps on the Hindsight container
 

@@ -97,6 +97,14 @@ your agents are on the latest code.
    `refactor:`, `test:`) + short imperative description.
 7. PR body: what changed, why, and how to test it. A short test-plan
    checklist is appreciated.
+8. **Liveness-surface PRs declare their guarantee delta.** Any PR touching
+   `feedHeartbeatTick`, `feed-open-gate.ts`, `silence-poke.ts`,
+   `turn-liveness-floor.ts`, or the card-edit path must state, in the PR
+   body, what the framework still guarantees to deliver WITHOUT the model
+   after the change — added or removed. See
+   `reference/rfcs/deterministic-turn-liveness.md` Phase 5: a legitimate
+   anti-nag change (#2667) muted a guarantee as a side effect precisely
+   because no one had to state the delta at review time.
 
 ## What we look for
 

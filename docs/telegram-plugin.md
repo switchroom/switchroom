@@ -8,12 +8,11 @@ The official Telegram plugin provides basic message send/receive. Switchroom's f
 
 ## What the switchroom fork adds
 
-### Message tools (12 MCP tools)
+### Message tools (11 MCP tools)
 
 | Tool | What it does |
 |------|-------------|
-| `reply` | Send text, photos, or documents. Supports threading, topic routing, multi-file attachments, inline keyboard URL buttons, `protect_content`, `quote_text`, and an optional `accent` status header (`in-progress`/`done`/`issue`). |
-| `stream_reply` | Edit a single message in place as work progresses (~1/sec throttle). Same `accent` and inline-keyboard support as `reply`. Optional `lane` parameter splits parallel streams (e.g. `thinking` vs default answer) per chat+thread. |
+| `reply` | Send the final answer — text, photos, or documents; the single final-answer tool. Chunks anything over Telegram's 4096-char limit. Supports threading, topic routing, multi-file attachments, inline keyboard URL buttons, `protect_content`, `quote_text`, and an optional `accent` status header (`in-progress`/`done`/`issue`). |
 | `react` | Add emoji reactions to messages (Telegram whitelist: 👍 👎 ❤️ 🔥 👀 🎉 etc). |
 | `edit_message` | Update a previously sent message. |
 | `delete_message` | Remove a bot-sent message (48h Telegram limit). |
@@ -27,11 +26,11 @@ The official Telegram plugin provides basic message send/receive. Switchroom's f
 
 ### Status accent headers
 
-Both `reply` and `stream_reply` accept an optional `accent: 'in-progress' | 'done' | 'issue'` parameter that prepends a status indicator line (`🔵 In progress…`, `✅ Done`, `⚠️ Issue`) above the message body. Use it for status communication on long-running work and completion announcements; omit it for routine conversational replies. (#328)
+`reply` accepts an optional `accent: 'in-progress' | 'done' | 'issue'` parameter that prepends a status indicator line (`🔵 In progress…`, `✅ Done`, `⚠️ Issue`) above the message body. Use it for status communication on long-running work and completion announcements; omit it for routine conversational replies. (#328)
 
 ### Inline keyboard URL buttons
 
-`reply` and `stream_reply` accept an `inline_keyboard` parameter — an array of rows, each row an array of `{ text, url }` buttons — for tap-to-open links rendered as Telegram inline buttons (#271).
+`reply` accepts an `inline_keyboard` parameter — an array of rows, each row an array of `{ text, url }` buttons — for tap-to-open links rendered as Telegram inline buttons (#271).
 
 ### Emoji status reactions
 
@@ -63,6 +62,41 @@ The header carries the **real dispatch task** (the `description` passed to the `
 (Failures finalize to `⚠️ Worker failed · …`.) It's the same "live, growing message" shape the agent's own answer uses — not a separate pinned card. Independently, the turn's 👍 (done) reaction is **held** while any background worker is still running, so the reaction never implies the work finished while a worker is still grinding.
 
 The feed is on by default. To disable it per-agent, set `SWITCHROOM_WORKER_ACTIVITY_FEED=0` in the agent's gateway environment.
+
+### Chat-legible memory (remembered / forgot)
+
+When the agent **materially changes what it remembers** during a turn — stores a new standing directive, or invalidates/demotes an existing memory — the gateway surfaces **one terse line** in the originating chat/topic:
+
+```
+📌 remembered: "Always prefer TypeScript for this user's projects"
+✂️ forgot: superseded deploy runbook
+```
+
+This makes memory honest and legible without being noisy. It is deliberately **sparse and material-only**:
+
+- Fires only on `mcp__hindsight__create_directive` (📌 remembered) and `mcp__hindsight__invalidate_memory` / the `switchroom memory demote` tag path (✂️ forgot).
+- **Never** on ordinary recall, and **never** on routine consolidation — a per-turn "here's what I remember" line would itself be the "regurgitating old facts unprompted" anti-pattern the `remember-across-sessions` job forbids.
+
+Detection is a deterministic tool-call observation (no model call, no polling). The line is a **real message** in the originating topic (never the operator DM), so it's durable and observable.
+
+The surface is **on by default** (kill-switch: `SWITCHROOM_MEMORY_LEGIBILITY=0`). To disable it per-agent, set `SWITCHROOM_MEMORY_LEGIBILITY=0` in the agent's gateway environment.
+
+#### Consolidation-driven "updated what I know" (opt-in)
+
+The store/forget lines above are driven by the **foreground** session's own tool calls. The **background** consolidation engine — which distils new durable observations and supersedes stale ones between turns — is invisible to that path. When hindsight emits a `consolidation.completed` webhook, the gateway can surface a terse companion line for a *genuine* store/correct:
+
+```
+🧠 updated what I know about "your deploy preferences"
+🧠 revised what I know about "the old runbook"
+```
+
+This is **off by default** and opt-in per agent: set `SWITCHROOM_CONSOLIDATION_LEGIBILITY=1` in the gateway environment. It is gated more tightly than the tool-observation path because it is fed by an unbounded background engine:
+
+- **Material-only** — a line surfaces *only* when a consolidation actually stored or corrected a durable memory; the overwhelmingly common no-op consolidation surfaces nothing.
+- **Rate-limited** — at most one line per agent per 10 minutes, and an identical "updated about X" line is suppressed for an hour, so a burst of material consolidations collapses to a single line.
+- **Never a wake** — the webhook is recorded for audit and surfaced as a discrete status message (notifications suppressed); it never injects a model turn.
+
+The webhook flows through the existing peercred-gated ingest socket (`webhook_via_gateway`); the pinned hindsight image does not yet emit `consolidation.completed`, so this consumer is dormant until that upstream event exists — which is why it ships off by default.
 
 ### Message history
 
@@ -181,10 +215,9 @@ agents:
         stream_mode: pty   # opt out of the checklist card
 ```
 
-Progress-card messages are sent on a dedicated `lane: "progress"` via
-`stream_reply` so they don't collide with the answer message. The final
-answer still lands separately via the model's `reply` / `stream_reply`
-call.
+Progress-card messages are sent on a dedicated `lane: "progress"` via the
+internal stream-reply handler so they don't collide with the answer message.
+The final answer still lands separately via the model's `reply` call.
 
 ## Configuration
 
@@ -199,3 +232,5 @@ The switchroom fork reads additional env vars from `start.sh`:
 | `SWITCHROOM_AGENT_NAME` | Auto-set by scaffold | Agent name for self-restart detection |
 | `SWITCHROOM_CONFIG` | Auto-set by scaffold | Path to switchroom.yaml for config resolution |
 | `SWITCHROOM_WORKER_ACTIVITY_FEED` | Gateway env (kill-switch) | On by default; `0` disables the background worker-activity feed. See "Background worker activity feed" above |
+| `SWITCHROOM_MEMORY_LEGIBILITY` | Gateway env (kill-switch) | On by default; `0` disables the sparse "📌 remembered / ✂️ forgot" memory surface. See "Chat-legible memory" above |
+| `SWITCHROOM_CONSOLIDATION_LEGIBILITY` | Gateway env (opt-in) | Off by default; `1`/`true`/`on`/`yes` enables the rate-limited "🧠 updated what I know about Y" line driven by the `consolidation.completed` webhook. See "Consolidation-driven" above |
