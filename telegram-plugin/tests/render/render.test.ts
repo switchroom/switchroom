@@ -190,6 +190,25 @@ describe("render: block palette", () => {
   it("nested list round-trips structurally", () => {
     assertRoundTripsStructurally("- a\n  - nested1\n  - nested2\n- b");
   });
+  it("tight 3-level nested list stays tight — no injected blank lines (regression)", () => {
+    // Regression: `renderListItem` used to join an item's paragraph and its
+    // nested sub-list with a blank line (renderBlocks' `\n\n`), turning a tight
+    // nested list into `- a\n\n  - b\n\n    - c\n- d`. Tight lists must stay
+    // tight: exact-string round trip, no blank line injected anywhere.
+    const md = "- a\n  - b\n    - c\n- d";
+    expect(render(parse(md))).toBe(md);
+  });
+  it("loose list keeps its blank lines between top-level items (tight/loose distinction)", () => {
+    // The fix must NOT hardcode single-newline everywhere: a genuinely loose
+    // list (blank line between items in the source) round-trips WITH the blank
+    // lines preserved.
+    const md = "- a\n\n- b\n\n- c";
+    expect(render(parse(md))).toBe(md);
+  });
+  it("loose item with a trailing paragraph keeps its internal blank line", () => {
+    const md = "- a\n\n  more about a\n\n- b";
+    expect(render(parse(md))).toBe(md);
+  });
   it("thematic break", () => {
     expect(render(parse("---"))).toBe("---");
   });
