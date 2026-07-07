@@ -164,6 +164,57 @@ describe("hindsight broker-fed mode (#1245)", () => {
     expect(envPairs).toContain("ANTHROPIC_MODEL=claude-sonnet-5");
   });
 
+  const envPairsFromArgs = (args: string[]): string[] => {
+    const out: string[] = [];
+    for (let i = 0; i < args.length - 1; i++) {
+      if (args[i] === "-e") out.push(args[i + 1] as string);
+    }
+    return out;
+  };
+
+  it("honors the hindsight.llm override (provider + model) from switchroom.yaml", () => {
+    startHindsight({ apiPort: 8888, uiPort: 9999 }, undefined, undefined, {
+      provider: "claude-code",
+      model: "openrouter/z-ai/glm-5.2",
+    });
+    const env = envPairsFromArgs(findRunArgs());
+    expect(env).toContain("HINDSIGHT_API_LLM_PROVIDER=claude-code");
+    expect(env).toContain("HINDSIGHT_API_LLM_MODEL=openrouter/z-ai/glm-5.2");
+    // claude-code provider ALSO pins ANTHROPIC_MODEL for the subprocess.
+    expect(env).toContain("ANTHROPIC_MODEL=openrouter/z-ai/glm-5.2");
+  });
+
+  it("falls back to the hard-coded defaults when hindsight.llm is absent (no ANTHROPIC_MODEL drift)", () => {
+    startHindsight({ apiPort: 8888, uiPort: 9999 });
+    const env = envPairsFromArgs(findRunArgs());
+    expect(env).toContain("HINDSIGHT_API_LLM_PROVIDER=claude-code");
+    expect(env).toContain("HINDSIGHT_API_LLM_MODEL=claude-sonnet-5");
+    // Default is still claude-code, so ANTHROPIC_MODEL tracks the default model.
+    expect(env).toContain("ANTHROPIC_MODEL=claude-sonnet-5");
+  });
+
+  it("does NOT set ANTHROPIC_MODEL for a non-claude-code provider", () => {
+    startHindsight({ apiPort: 8888, uiPort: 9999 }, undefined, undefined, {
+      provider: "openai",
+      model: "gpt-4o",
+    });
+    const env = envPairsFromArgs(findRunArgs());
+    expect(env).toContain("HINDSIGHT_API_LLM_PROVIDER=openai");
+    expect(env).toContain("HINDSIGHT_API_LLM_MODEL=gpt-4o");
+    expect(env.some((e) => e.startsWith("ANTHROPIC_MODEL="))).toBe(false);
+  });
+
+  it("compose snippet reflects the hindsight.llm override", async () => {
+    const { generateHindsightComposeSnippet } = await import("../../src/setup/hindsight.js");
+    const snippet = generateHindsightComposeSnippet({
+      provider: "claude-code",
+      model: "openrouter/z-ai/glm-5.2",
+    });
+    expect(snippet).toContain("HINDSIGHT_API_LLM_PROVIDER=claude-code");
+    expect(snippet).toContain("HINDSIGHT_API_LLM_MODEL=openrouter/z-ai/glm-5.2");
+    expect(snippet).toContain("ANTHROPIC_MODEL=openrouter/z-ai/glm-5.2");
+  });
+
   it("raises the reflect wall timeout (vendor 300s times out large-bank mental-model refresh)", async () => {
     const { HINDSIGHT_DEFAULT_REFLECT_WALL_TIMEOUT_S: t } = await import("../../src/setup/hindsight.js");
     expect(t).toBeGreaterThan(300);

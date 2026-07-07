@@ -572,6 +572,47 @@ export interface LiteLLMHindsightConfig {
 }
 
 /**
+ * Operator override for the hindsight container's LLM (both fields
+ * optional). Sourced from the top-level `hindsight.llm` block in
+ * switchroom.yaml (see `HindsightConfigSchema` in `src/config/schema.ts`)
+ * and threaded through `startHindsight` / `generateHindsightComposeSnippet`.
+ *
+ * When absent (or a field is absent), the container falls back to the
+ * subscription-honest defaults: provider=`claude-code`, model=
+ * {@link HINDSIGHT_DEFAULT_MODEL}. So an operator who sets nothing gets the
+ * exact prior behaviour.
+ */
+export interface HindsightLlmConfig {
+  /** `HINDSIGHT_API_LLM_PROVIDER`. Default `claude-code`. */
+  provider?: string;
+  /** `HINDSIGHT_API_LLM_MODEL`. Default {@link HINDSIGHT_DEFAULT_MODEL}. */
+  model?: string;
+}
+
+/**
+ * Resolve the effective hindsight LLM provider + model from an optional
+ * operator override, applying the hard-coded fallbacks. Shared by the
+ * `docker run` path ({@link startHindsight}) and the compose-gen path
+ * ({@link generateHindsightComposeSnippet}) so they never drift.
+ */
+export function resolveHindsightLlm(
+  llm?: HindsightLlmConfig,
+  litellm?: LiteLLMHindsightConfig,
+): { provider: string; model: string } {
+  const provider = llm?.provider?.trim() || "claude-code";
+  // Model precedence: an explicit `hindsight.llm.model` always wins. Absent
+  // that, with LiteLLM routing enabled the default shifts to a cheap
+  // OpenRouter model (litellm.model ?? HINDSIGHT_DEFAULT_LITELLM_MODEL)
+  // instead of Claude — the proxy can translate a non-Claude model name.
+  // Direct-OAuth mode (no litellm, or fail-open) stays on
+  // HINDSIGHT_DEFAULT_MODEL, since no proxy exists to translate it.
+  const model =
+    llm?.model?.trim() ||
+    (litellm ? (litellm.model ?? HINDSIGHT_DEFAULT_LITELLM_MODEL) : HINDSIGHT_DEFAULT_MODEL);
+  return { provider, model };
+}
+
+/**
  * Start the Hindsight Docker container in **broker-fed** mode (RFC H §4.8).
  *
  * Hindsight uses the upstream `claude-code` LLM provider, which routes
@@ -595,36 +636,28 @@ export function startHindsight(
   ports?: { apiPort: number; uiPort: number },
   litellm?: LiteLLMHindsightConfig,
   imageTag?: string,
+  llm?: HindsightLlmConfig,
 ): void {
   const apiPort = ports?.apiPort ?? HINDSIGHT_DEFAULT_API_PORT;
   const uiPort = ports?.uiPort ?? HINDSIGHT_DEFAULT_UI_PORT;
 
-  // Resolve the model BEFORE building envArgs: with litellm routing enabled
-  // the default shifts to a cheap OpenRouter model (HINDSIGHT_DEFAULT_LITELLM_MODEL)
-  // instead of Claude, unless the operator set memory.config.llm_model
-  // (threaded through as litellm.model). Direct-OAuth mode (no litellm, or
-  // fail-open) always stays on HINDSIGHT_DEFAULT_MODEL — no proxy exists to
-  // translate a non-Claude model name.
-  const resolvedModel = litellm
-    ? (litellm.model ?? HINDSIGHT_DEFAULT_LITELLM_MODEL)
-    : HINDSIGHT_DEFAULT_MODEL;
+  // Effective LLM provider + model, applying the operator override
+  // (top-level `hindsight.llm` in switchroom.yaml) over the hard-coded
+  // subscription-honest fallbacks. With LiteLLM routing enabled and no
+  // explicit `hindsight.llm.model`, the model default shifts to a cheap
+  // OpenRouter model (HINDSIGHT_DEFAULT_LITELLM_MODEL) — see
+  // resolveHindsightLlm — since the proxy can translate a non-Claude name.
+  const { provider: llmProvider, model: llmModel } = resolveHindsightLlm(llm, litellm);
 
   // Non-secret env stays on `-e` — provider name + observation cap are
-  // configuration, not secrets. Setting `HINDSIGHT_API_LLM_PROVIDER` to
-  // `claude-code` selects the subscription-honest path; pinning
-  // `HINDSIGHT_API_LLM_MODEL` keeps memory ops on the resolved model (see
-  // HINDSIGHT_DEFAULT_MODEL / HINDSIGHT_DEFAULT_LITELLM_MODEL above). NOTE:
-  // for the `claude-code` provider, `HINDSIGHT_API_LLM_MODEL` does NOT
-  // control the embedded `claude` CLI — the CLI reads `ANTHROPIC_MODEL`, and
-  // without it falls back to its own default (opus), silently running every
-  // memory op (fact extraction, recall synthesis, consolidation) on the
-  // wrong model. So we ALSO set `ANTHROPIC_MODEL` — that's what actually
-  // pins the model.
+  // configuration, not secrets. `HINDSIGHT_API_LLM_PROVIDER=claude-code`
+  // selects the subscription-honest path; `HINDSIGHT_API_LLM_MODEL` pins the
+  // memory-ops model (default HINDSIGHT_DEFAULT_MODEL, or the cheap LiteLLM
+  // default, operator-overridable via `hindsight.llm`).
   const envArgs: string[] = [
     "-e", `HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE=${HINDSIGHT_DEFAULT_MAX_OBSERVATIONS_PER_SCOPE}`,
-    "-e", "HINDSIGHT_API_LLM_PROVIDER=claude-code",
-    "-e", `HINDSIGHT_API_LLM_MODEL=${resolvedModel}`,
-    "-e", `ANTHROPIC_MODEL=${resolvedModel}`,
+    "-e", `HINDSIGHT_API_LLM_PROVIDER=${llmProvider}`,
+    "-e", `HINDSIGHT_API_LLM_MODEL=${llmModel}`,
     "-e", `HINDSIGHT_API_MCP_STATELESS=${HINDSIGHT_DEFAULT_MCP_STATELESS}`,
     // Reranker smart-defaults (v0.13.22) — see constants above for
     // rationale. Each closes a vendor-default gap that hurts our
@@ -646,6 +679,14 @@ export function startHindsight(
     "-e", `HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND=${HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND}`,
   ];
 
+  // The `claude-code` provider drives an underlying claude subprocess; pin
+  // `ANTHROPIC_MODEL` to the same model so the subprocess (and any LiteLLM
+  // proxy it routes through, below) targets it. Only meaningful for the
+  // claude-code path — other providers ignore it.
+  if (llmProvider === "claude-code") {
+    envArgs.push("-e", `ANTHROPIC_MODEL=${llmModel}`);
+  }
+
   if (litellm) {
     // Host-network mode: the container shares the host network stack so
     // 127.0.0.1:4010 (LiteLLM) is directly reachable, identical to how
@@ -658,7 +699,7 @@ export function startHindsight(
     // stall). Any other model (e.g. OpenRouter) MUST use the model-mapped
     // root instead — the pass-through only forwards to the real Anthropic
     // API, so a non-Claude model_name there 404s / always fails open.
-    const anthropicBaseUrl = isClaudeModel(resolvedModel)
+    const anthropicBaseUrl = isClaudeModel(llmModel)
       ? `${litellmRoot}/anthropic`
       : litellmRoot;
     envArgs.push(
@@ -894,7 +935,16 @@ export function getHindsightMcpUrl(): {
  * container chowns and binds the per-consumer socket inside it). The
  * hindsight compose project is separate; it consumes the volume.
  */
-export function generateHindsightComposeSnippet(): string {
+export function generateHindsightComposeSnippet(llm?: HindsightLlmConfig): string {
+  const { provider: llmProvider, model: llmModel } = resolveHindsightLlm(llm);
+  const environment = [
+    `      - HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE=${HINDSIGHT_DEFAULT_MAX_OBSERVATIONS_PER_SCOPE}`,
+    `      - HINDSIGHT_API_LLM_PROVIDER=${llmProvider}`,
+    `      - HINDSIGHT_API_LLM_MODEL=${llmModel}`,
+    // Mirror of the docker-run path: with the claude-code provider, pin
+    // ANTHROPIC_MODEL to the same model for the underlying claude subprocess.
+    ...(llmProvider === "claude-code" ? [`      - ANTHROPIC_MODEL=${llmModel}`] : []),
+  ];
   return [
     "services:",
     "  switchroom-hindsight:",
@@ -910,10 +960,7 @@ export function generateHindsightComposeSnippet(): string {
     `      - "127.0.0.1:${HINDSIGHT_DEFAULT_API_PORT}:8888"`,
     "      - \"127.0.0.1:19999:9999\"",
     "    environment:",
-    `      - HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE=${HINDSIGHT_DEFAULT_MAX_OBSERVATIONS_PER_SCOPE}`,
-    "      - HINDSIGHT_API_LLM_PROVIDER=claude-code",
-    `      - HINDSIGHT_API_LLM_MODEL=${HINDSIGHT_DEFAULT_MODEL}`,
-    `      - ANTHROPIC_MODEL=${HINDSIGHT_DEFAULT_MODEL}`,
+    ...environment,
     `      - HINDSIGHT_API_MCP_STATELESS=${HINDSIGHT_DEFAULT_MCP_STATELESS}`,
     `      - HINDSIGHT_API_RERANKER_LOCAL_BUCKET_BATCHING=${HINDSIGHT_DEFAULT_RERANKER_BUCKET_BATCHING}`,
     `      - HINDSIGHT_API_RERANKER_MAX_CANDIDATES=${HINDSIGHT_DEFAULT_RERANKER_MAX_CANDIDATES}`,

@@ -1696,6 +1696,53 @@ export const LiteLLMConfigSchema = z
   );
 
 /**
+ * Fleet-singleton Hindsight (memory backend) configuration.
+ *
+ * Hindsight runs as a single shared container, so this is a top-level block
+ * (a fleet singleton like `litellm:` / `fleet_health:`), NOT a per-agent /
+ * per-profile knob. Today the only field is `llm`: the provider + model the
+ * container uses for its LLM operations (retain / reflect / consolidation —
+ * recall is local-only, no LLM). Both sub-fields are optional; when either is
+ * absent, `startHindsight()` (src/setup/hindsight.ts) falls back to the
+ * hard-coded defaults (provider=claude-code, model=HINDSIGHT_DEFAULT_MODEL) so
+ * an operator who never sets this sees the exact prior behaviour.
+ *
+ * When `provider` is `claude-code` (the subscription-honest default), the
+ * container also inherits `ANTHROPIC_MODEL=<model>` so the underlying claude
+ * subprocess (and any LiteLLM proxy it routes through) targets the same model.
+ */
+export const HindsightConfigSchema = z.object({
+  llm: z
+    .object({
+      provider: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "Hindsight LLM provider (upstream `HINDSIGHT_API_LLM_PROVIDER`). " +
+          "Defaults to `claude-code` (subscription-honest, broker-fed OAuth). " +
+          "Any litellm-routable provider the upstream image supports is valid.",
+        ),
+      model: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "Hindsight LLM model (upstream `HINDSIGHT_API_LLM_MODEL`). Defaults " +
+          "to HINDSIGHT_DEFAULT_MODEL. Any model your LiteLLM proxy can route " +
+          "is valid, e.g. `openrouter/z-ai/glm-5.2` when routing through the " +
+          "fleet proxy. With provider=claude-code this value is ALSO exported " +
+          "as `ANTHROPIC_MODEL` to the claude subprocess.",
+        ),
+    })
+    .optional()
+    .describe(
+      "LLM knob for the hindsight container. Both fields optional; unset " +
+      "fields fall back to the hard-coded defaults.",
+    ),
+});
+
+/**
  * Top-level microsoft_workspace config block — RFC #1873 (Microsoft 365
  * integration). Centralizes Microsoft OAuth client credentials and the
  * org-mode opt-in.
@@ -3480,6 +3527,15 @@ export const SwitchroomConfigSchema = z.object({
     "— mutually exclusive. Per-agent `release` REPLACES this entirely.",
   ),
   memory: MemoryBackendConfigSchema.optional(),
+  hindsight: HindsightConfigSchema.optional().describe(
+    "Fleet-singleton Hindsight (memory backend) configuration. Currently " +
+    "just the LLM knob (provider + model) used for retain/reflect/" +
+    "consolidation. Both fields optional; when unset the container falls " +
+    "back to provider=claude-code + the hard-coded HINDSIGHT_DEFAULT_MODEL " +
+    "so nothing changes for operators who don't set it. Read at container " +
+    "launch by startHindsight() (src/setup/hindsight.ts) — takes effect on " +
+    "the next `switchroom apply` / `memory setup --recreate`.",
+  ),
   vault: VaultConfigSchema.optional(),
   auth: z
     .object({
@@ -3807,6 +3863,7 @@ export type MemoryBackendConfig = z.infer<typeof MemoryBackendConfigSchema>;
 export type VaultConfig = z.infer<typeof VaultConfigSchema>;
 export type DriveConfig = z.infer<typeof DriveConfigSchema>;
 export type LiteLLMConfig = z.infer<typeof LiteLLMConfigSchema>;
+export type HindsightConfig = z.infer<typeof HindsightConfigSchema>;
 export type AgentDriveConfig = z.infer<typeof AgentDriveConfigSchema>;
 export type VaultBrokerConfig = z.infer<typeof VaultConfigSchema>["broker"];
 export type QuotaConfig = z.infer<typeof QuotaConfigSchema>;

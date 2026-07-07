@@ -466,8 +466,9 @@ export function registerMemoryCommand(program: Command): void {
 
       console.log(chalk.gray("  Starting Hindsight Docker container..."));
       try {
-        const litellmCfg = await resolveLiteLLMForHindsight(getConfig(program));
-        startHindsight(ports, litellmCfg, opts.tag);
+        const hindsightConfig = getConfig(program);
+        const litellmCfg = await resolveLiteLLMForHindsight(hindsightConfig);
+        startHindsight(ports, litellmCfg, opts.tag, hindsightConfig.hindsight?.llm);
         if (litellmCfg) {
           console.log(chalk.gray("  LiteLLM routing enabled for hindsight (--network host)."));
         }
@@ -522,7 +523,7 @@ export function registerMemoryCommand(program: Command): void {
     .description("Output a docker-compose snippet for Hindsight (broker-fed mode)")
     .action(() => {
       console.log(chalk.bold("\n# Add this to your docker-compose.yml:\n"));
-      console.log(generateHindsightComposeSnippet());
+      console.log(generateHindsightComposeSnippet(getConfig(program).hindsight?.llm));
       console.log();
     });
 
