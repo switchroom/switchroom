@@ -54,6 +54,19 @@ describe("maybeRenderOutbound", () => {
     } as NodeJS.ProcessEnv);
     expect(r.text).toContain("just some plain text");
   });
+
+  it("flag ON round-trips underline / spoiler / highlight", () => {
+    const on = { SWITCHROOM_RICH_RENDER: "1" } as NodeJS.ProcessEnv;
+    expect(maybeRenderOutbound("__u__", on).text).toBe("__u__");
+    expect(maybeRenderOutbound("a ||s|| b", on).text).toBe("a ||s|| b");
+    expect(maybeRenderOutbound("a ==m== b", on).text).toBe("a ==m== b");
+  });
+
+  it("flag OFF passes new constructs through untouched too", () => {
+    const raw = "__u__ and ||s|| and ==m==";
+    const r = maybeRenderOutbound(raw, {} as NodeJS.ProcessEnv);
+    expect(r.text).toBe(raw);
+  });
 });
 
 describe("renderOutbound (flag-independent)", () => {

@@ -13,13 +13,15 @@
 // Telegram HTML tag mapping (for the next increment — NOT implemented here):
 //
 //   Inline
-//     plain   -> (raw text, HTML-escaped)
-//     bold    -> <b>…</b>
-//     italic  -> <i>…</i>
-//     strike  -> <s>…</s>
-//     spoiler -> <tg-spoiler>…</tg-spoiler>
-//     code    -> <code>…</code>
-//     link    -> <a href="…">…</a>
+//     plain     -> (raw text, HTML-escaped)
+//     bold      -> <b>…</b>                 (markdown `**…**`)
+//     italic    -> <i>…</i>                 (markdown `*…*`)
+//     underline -> <u>…</u>                 (markdown `__…__`, Bot API 10.1)
+//     strike    -> <s>…</s>                 (markdown `~~…~~`)
+//     spoiler   -> <tg-spoiler>…</tg-spoiler> (markdown `||…||`)
+//     highlight -> <mark>…</mark>           (markdown `==…==`, Bot API 10.1)
+//     code      -> <code>…</code>
+//     link      -> <a href="…">…</a>
 //
 //   Block
 //     paragraph      -> children joined; blocks separated by "\n\n"
@@ -58,13 +60,33 @@ export interface ItalicNode extends Pos {
   children: Inline[];
 }
 
+/** Telegram underline (<u>…</u>). In Bot API 10.1 rich markdown the `__…__`
+ *  double-underscore run is UNDERLINE — distinct from `**…**` bold, even though
+ *  GFM/micromark folds both into a single `strong` mdast node. `parse.ts`
+ *  disambiguates the two by looking at the run's source delimiter. */
+export interface UnderlineNode extends Pos {
+  type: "underline";
+  children: Inline[];
+}
+
 export interface StrikeNode extends Pos {
   type: "strike";
   children: Inline[];
 }
 
+/** Telegram spoiler (<tg-spoiler>…</tg-spoiler>), markdown `||…||`. GFM has no
+ *  spoiler syntax, so `parse.ts` recognises the `||…||` delimiter in a
+ *  post-parse pass over `plain` text. */
 export interface SpoilerNode extends Pos {
   type: "spoiler";
+  children: Inline[];
+}
+
+/** Telegram highlight / marked text (<mark>…</mark>), markdown `==…==` (Bot API
+ *  10.1). Like spoiler, recognised by `parse.ts` in a post-parse pass over
+ *  `plain` text (GFM has no highlight syntax). */
+export interface HighlightNode extends Pos {
+  type: "highlight";
   children: Inline[];
 }
 
@@ -83,8 +105,10 @@ export type Inline =
   | PlainNode
   | BoldNode
   | ItalicNode
+  | UnderlineNode
   | StrikeNode
   | SpoilerNode
+  | HighlightNode
   | CodeNode
   | LinkNode;
 

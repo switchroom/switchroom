@@ -67,6 +67,6 @@ export function maybeRenderOutbound(
   env: NodeJS.ProcessEnv = process.env,
   maxLen: number = RICH_MESSAGE_MAX_CHARS,
 ): RenderResult {
-  if (!richRenderEnabled(env)) return { text, mode: "markdown" };
+  if (!richRenderEnabled(env)) return { text, mode: "markdown", degradations: [] };
   return renderOutbound(text, maxLen);
 }

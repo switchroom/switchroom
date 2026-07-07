@@ -55,10 +55,14 @@ function renderInline(node: Inline): string {
       return `**${renderInlineChildren(node.children)}**`;
     case "italic":
       return `*${renderInlineChildren(node.children)}*`;
+    case "underline":
+      return `__${renderInlineChildren(node.children)}__`;
     case "strike":
       return `~~${renderInlineChildren(node.children)}~~`;
     case "spoiler":
       return `||${renderInlineChildren(node.children)}||`;
+    case "highlight":
+      return `==${renderInlineChildren(node.children)}==`;
     case "code":
       return `\`${codeSpanSafe(node.text)}\``;
     case "link":
@@ -206,8 +210,68 @@ export function render(doc: Document): string {
 }
 
 // ---------------------------------------------------------------------------
-// Oversized-content safe fallback
+// Construct allowlist (gap #2: escape/degrade anything unsupported)
 // ---------------------------------------------------------------------------
+
+// The IR node types this renderer emits NATIVE Telegram markup for. The IR
+// union is closed and TypeScript's exhaustiveness `default` branches in
+// `renderInline` / `renderBlock` already escape any unknown variant to literal
+// text rather than emitting a broken tag — so the allowlist is enforced at
+// COMPILE time. These runtime constants make the allowlist inspectable (and
+// unit-testable: a test asserts every IR `type` appears here, so adding an IR
+// node without teaching the renderer to render it fails the build), which is
+// the concrete "construct-allowlist validator" that pairs with the expandable-
+// blockquote / spoiler / underline additions.
+export const SUPPORTED_INLINE = [
+  "plain",
+  "bold",
+  "italic",
+  "underline",
+  "strike",
+  "spoiler",
+  "highlight",
+  "code",
+  "link",
+] as const;
+
+export const SUPPORTED_BLOCK = [
+  "paragraph",
+  "heading",
+  "blockquote",
+  "code-block",
+  "list",
+  "thematic-break",
+  "table",
+] as const;
+
+// ---------------------------------------------------------------------------
+// Oversized / malformed-content safe fallback
+// ---------------------------------------------------------------------------
+
+/** Which construct degraded. `document` = the whole message fell back to
+ *  plain text. */
+export type DegradationConstruct = "table" | "code-block" | "blockquote" | "document";
+
+/** Why a construct could not be emitted as a proper rich construct.
+ *   - `table-malformed`    : the table's structure is not renderable as a rich
+ *                            GFM table (e.g. no columns, ragged rows); emitted
+ *                            as a preformatted code fence instead.
+ *   - `oversize`           : a single atomic block alone exceeds the wire cap;
+ *                            emitted as plain source text.
+ *   - `document-oversize`  : the whole document still exceeds the cap after
+ *                            per-block substitution; sent as plain text with no
+ *                            rich wrapper. */
+export type DegradationReason = "table-malformed" | "oversize" | "document-oversize";
+
+/** A tracked degradation — WHY a construct fell back from its native rich form
+ *  to a plain/code rendering. Returned on `RenderResult` so the caller can log
+ *  / surface it instead of the fallback happening silently. */
+export interface Degradation {
+  construct: DegradationConstruct;
+  reason: DegradationReason;
+  /** Human-readable detail for logs / telemetry. */
+  detail: string;
+}
 
 export interface RenderResult {
   /** The rendered text to send. */
@@ -215,6 +279,43 @@ export interface RenderResult {
   /** "markdown": send as rich `{ markdown }`. "plain": send as a literal
    *  string with no rich wrapper (structure stripped, content preserved). */
   mode: "markdown" | "plain";
+  /** Constructs that could not be emitted in their native rich form, each with
+   *  a tracked reason. Empty when everything rendered natively. Never silently
+   *  degrade — a caller can log/telemeter these. */
+  degradations: Degradation[];
+}
+
+/**
+ * Classify a table that cannot render as a proper rich GFM table. Returns a
+ * human-readable reason string, or null when the table is well-formed.
+ *
+ * mdast normally normalises tables, but a table folded from degraded/adversarial
+ * source (or a future IR producer) can still be structurally unrenderable — no
+ * header columns, or body rows whose cell count doesn't match the header. Such a
+ * table would emit pipes that Telegram renders as broken/literal text, so we
+ * catch it here and fall back to a preformatted code fence (content preserved,
+ * degradation tracked) rather than shipping a broken row.
+ */
+function tableDegradationReason(node: TableNode): string | null {
+  const cols = node.header.cells.length;
+  if (cols === 0) return "table has no header columns";
+  for (let i = 0; i < node.rows.length; i++) {
+    const n = node.rows[i].cells.length;
+    if (n !== cols) {
+      return `row ${i + 1} has ${n} cell(s), expected ${cols} to match the header`;
+    }
+  }
+  return null;
+}
+
+/** Wrap a block's raw source text in a widened preformatted code fence — the
+ *  degraded rendering for a malformed table (content verbatim, no broken
+ *  markup). Fence-widening mirrors `renderCodeBlock`. */
+function degradeToCodeFence(source: string, node: Block): string {
+  const raw = source.slice(node.start, node.end);
+  const longestRun = Math.max(0, ...(raw.match(/`+/g) ?? []).map((run) => run.length));
+  const fence = "`".repeat(Math.max(3, longestRun + 1));
+  return `${fence}\n${raw}\n${fence}`;
 }
 
 /**
@@ -271,29 +372,53 @@ export function renderSafe(
   source: string,
   maxLen: number = RICH_MESSAGE_MAX_CHARS,
 ): RenderResult {
-  const full = render(doc);
+  const degradations: Degradation[] = [];
+
+  // Per-block render, degrading a MALFORMED table (any size) to a preformatted
+  // code fence up front so a structurally-unrenderable table never ships as
+  // broken pipes — and the reason is recorded, not swallowed.
+  const rendered = doc.blocks.map((block) => {
+    if (block.type === "table") {
+      const reason = tableDegradationReason(block);
+      if (reason != null) {
+        degradations.push({ construct: "table", reason: "table-malformed", detail: reason });
+        return { block, text: degradeToCodeFence(source, block) };
+      }
+    }
+    return { block, text: renderBlock(block) };
+  });
+
+  const full = rendered.map((r) => r.text).join("\n\n");
   if (full.length <= maxLen) {
-    return { text: full, mode: "markdown" };
+    return { text: full, mode: "markdown", degradations };
   }
 
-  const rendered = doc.blocks.map((block) => ({
-    block,
-    text: renderBlock(block),
-  }));
-
+  // Oversized: swap any atomic block whose OWN rendered form alone exceeds the
+  // cap for its raw plain-text source (a construct that can't be safely
+  // bisected), recording an `oversize` degradation for each.
   const swapped = rendered.map(({ block, text }) => {
     if (isAtomicBlock(block) && text.length > maxLen) {
+      degradations.push({
+        construct: block.type as DegradationConstruct,
+        reason: "oversize",
+        detail: `${block.type} of ${text.length} chars exceeds the ${maxLen}-char cap; sent as plain source text`,
+      });
       return escapeMarkdown(plainSlice(source, block));
     }
     return text;
   });
   const patched = swapped.join("\n\n");
   if (patched.length <= maxLen) {
-    return { text: patched, mode: "markdown" };
+    return { text: patched, mode: "markdown", degradations };
   }
 
   // Still oversized (or a giant atomic block never fit even as plain text) —
   // fall all the way back to plain text for the whole document. Never
   // truncate here; that is the length-based chunker's job downstream.
-  return { text: source, mode: "plain" };
+  degradations.push({
+    construct: "document",
+    reason: "document-oversize",
+    detail: `rendered document of ${patched.length} chars exceeds the ${maxLen}-char cap; sent as plain text without the rich wrapper`,
+  });
+  return { text: source, mode: "plain", degradations };
 }
