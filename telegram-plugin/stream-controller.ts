@@ -21,6 +21,7 @@
 
 import { createDraftStream, type DraftStreamHandle } from './draft-stream.js'
 import { richMessage, isParseEntitiesError } from './rich-send.js'
+import { maybeRenderOutbound } from './render/rich-render.js'
 
 /**
  * Minimal bot.api surface the controller needs. Real callers pass grammy's
@@ -224,12 +225,22 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
   // control previews via entity detection), so strip it for the rich path.
   const doSend = (text: string, opts: StreamSendOpts) => {
     if (literalText) return bot.api.sendMessage(chatId, text, opts)
+    // Flag-gated rich render (`SWITCHROOM_RICH_RENDER`, default OFF — returns
+    // the text untouched as markdown when off, so this is a no-op for every
+    // agent until an operator opts in). A `plain` result (oversized/unsafe
+    // content renderSafe declined to emit as rich) sends WITHOUT the wrapper.
+    const rendered = maybeRenderOutbound(text)
+    if (rendered.mode === 'plain') return bot.api.sendMessage(chatId, rendered.text, opts)
     const richOpts = { ...opts }
     delete richOpts.link_preview_options
-    return bot.api.sendRichMessage(chatId, richMessage(text), richOpts)
+    return bot.api.sendRichMessage(chatId, richMessage(rendered.text), richOpts)
   }
-  const doEdit = (id: number, text: string, opts: StreamSendOpts) =>
-    bot.api.editMessageText(chatId, id, literalText ? text : richMessage(text), opts)
+  const doEdit = (id: number, text: string, opts: StreamSendOpts) => {
+    if (literalText) return bot.api.editMessageText(chatId, id, text, opts)
+    const rendered = maybeRenderOutbound(text)
+    if (rendered.mode === 'plain') return bot.api.editMessageText(chatId, id, rendered.text, opts)
+    return bot.api.editMessageText(chatId, id, richMessage(rendered.text), opts)
+  }
 
   return createDraftStream(
     async (text) => {
