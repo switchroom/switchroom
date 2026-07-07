@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createServer } from "node:net";
+import { isClaudeModel } from "../../telegram-plugin/gateway/model-command.js";
 
 /**
  * Default Hindsight host ports.
@@ -145,23 +146,10 @@ export const HINDSIGHT_DEFAULT_MODEL = "claude-sonnet-5";
  * extraction, recall synthesis, consolidation) doesn't burn the Claude
  * subscription quota (added 2026-07-07, per Ken). Must be a model_name
  * registered in litellm's model_list, routed via the model-mapped path (see
- * {@link isAnthropicPassthroughModel}), NOT the Anthropic pass-through.
+ * {@link isClaudeModel}), NOT the Anthropic pass-through.
  */
 export const HINDSIGHT_DEFAULT_LITELLM_MODEL =
   "openrouter/google/gemini-3.1-flash-lite";
-
-/**
- * Whether `model` should ride LiteLLM's Anthropic pass-through
- * (`<root>/anthropic`, raw byte-forward, OAuth-authenticated — see the
- * 2026-07-05 opus-stall fix) rather than the model-mapped route
- * (`<root>`, translates protocol/auth per model_name). Only real Anthropic
- * model names/aliases are pass-through-eligible; anything else (OpenRouter,
- * etc.) needs the model-mapped route since the pass-through only forwards to
- * the real Anthropic API.
- */
-function isAnthropicPassthroughModel(model: string): boolean {
-  return model.startsWith("claude-") || model === "sonnet" || model === "fable";
-}
 
 /**
  * Run hindsight's MCP server in stateless HTTP mode.
@@ -576,9 +564,9 @@ export interface LiteLLMHindsightConfig {
   apiKey: string;
   /**
    * LiteLLM model_name for Hindsight's LLM ops. Defaults to
-   * {@link HINDSIGHT_DEFAULT_LITELLM_MODEL} when omitted. A `claude-*`
-   * model/alias rides the Anthropic OAuth pass-through; anything else rides
-   * the model-mapped route (see {@link isAnthropicPassthroughModel}).
+   * {@link HINDSIGHT_DEFAULT_LITELLM_MODEL} when omitted. A Claude model/alias
+   * (per {@link isClaudeModel}) rides the Anthropic OAuth pass-through;
+   * anything else rides the model-mapped route.
    */
   model?: string;
 }
@@ -670,7 +658,7 @@ export function startHindsight(
     // stall). Any other model (e.g. OpenRouter) MUST use the model-mapped
     // root instead — the pass-through only forwards to the real Anthropic
     // API, so a non-Claude model_name there 404s / always fails open.
-    const anthropicBaseUrl = isAnthropicPassthroughModel(resolvedModel)
+    const anthropicBaseUrl = isClaudeModel(resolvedModel)
       ? `${litellmRoot}/anthropic`
       : litellmRoot;
     envArgs.push(

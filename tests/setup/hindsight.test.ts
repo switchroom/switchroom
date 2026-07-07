@@ -424,6 +424,25 @@ describe("hindsight LiteLLM model routing (2026-07-07)", () => {
     // Trailing slash on baseUrl must not survive into the resolved URL.
     expect(envVal(args, "ANTHROPIC_BASE_URL")).toBe("http://127.0.0.1:4010");
   });
+
+  // Regression: the routing split must use the same Claude-alias set as the
+  // rest of the product (telegram-plugin/gateway/model-command.ts's
+  // isClaudeModel/MODEL_ALIASES), not a narrower hand-rolled list. A bare
+  // "opus"/"haiku"/"default" override is a legitimate thing an operator would
+  // type (it's what /model accepts everywhere else) — misrouting it to the
+  // model-mapped root would 404 against real Anthropic-shaped names.
+  it.each(["opus", "haiku", "default", "OPUS"])(
+    "treats the Claude alias %s as pass-through-eligible (case-insensitive)",
+    (alias) => {
+      startHindsight(
+        { apiPort: 8888, uiPort: 9999 },
+        { baseUrl: "http://127.0.0.1:4010", apiKey: "sk-test", model: alias },
+      );
+      const args = findRunArgs();
+      expect(envVal(args, "ANTHROPIC_MODEL")).toBe(alias);
+      expect(envVal(args, "ANTHROPIC_BASE_URL")).toBe("http://127.0.0.1:4010/anthropic");
+    },
+  );
 });
 
 describe("generateHindsightComposeSnippet — tmpfs ownership", () => {
