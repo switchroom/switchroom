@@ -1101,7 +1101,7 @@ async function stepMemoryBackend(
   const spin = spinner("Starting Hindsight Docker container...");
   try {
     const litellmCfg = await resolveLiteLLMForHindsight(config);
-    startHindsight(ports, litellmCfg);
+    startHindsight(ports, litellmCfg, undefined, config.hindsight?.llm);
     if (litellmCfg) {
       console.log(chalk.gray("  LiteLLM routing enabled (--network host, ANTHROPIC_BASE_URL set)."));
     }
