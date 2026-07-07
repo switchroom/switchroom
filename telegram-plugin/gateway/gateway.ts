@@ -20001,25 +20001,21 @@ async function runQuotaWatch(opts: { bootTick?: boolean } = {}): Promise<void> {
     }
   } catch (err) {
     process.stderr.write(`telegram gateway: quota-watch: probe for crossing accounts failed: ${err}\n`)
-    if (!tuning.sendOnProbeFail) {
-      // A quota notification must never carry numbers we could not verify
-      // live. Leave the crossing accounts' state untouched — the
-      // transition re-evaluates (and re-probes) on the next 15-min tick.
-      // Persist any reconciles already applied, then bail.
-      if (reconciledCount > 0) {
-        try {
-          saveQuotaWatchState(stateDir, mutatedState)
-        } catch (saveErr) {
-          process.stderr.write(`telegram gateway: quota-watch state persist failed: ${saveErr}\n`)
-        }
+    // A quota notification must never carry numbers we could not verify
+    // live. Leave the crossing accounts' state untouched — the
+    // transition re-evaluates (and re-probes) on the next 15-min tick.
+    // Persist any reconciles already applied, then bail.
+    if (reconciledCount > 0) {
+      try {
+        saveQuotaWatchState(stateDir, mutatedState)
+      } catch (saveErr) {
+        process.stderr.write(`telegram gateway: quota-watch state persist failed: ${saveErr}\n`)
       }
-      process.stderr.write(
-        `telegram gateway: quota-watch: deferring ${pendingTransitions.length} notification(s) until probe succeeds\n`,
-      )
-      return
     }
-    // Legacy (SWITCHROOM_QUOTA_WATCH_SEND_ON_PROBE_FAIL=1): fall through
-    // and send from cached data.
+    process.stderr.write(
+      `telegram gateway: quota-watch: deferring ${pendingTransitions.length} notification(s) until probe succeeds\n`,
+    )
+    return
   }
 
   // Build final notifications, enriching the snapshot with fresh probe
@@ -20069,7 +20065,7 @@ async function runQuotaWatch(opts: { bootTick?: boolean } = {}): Promise<void> {
         // State normalised by the time of the probe — don't notify.
         continue
       }
-    } else if (!tuning.sendOnProbeFail) {
+    } else {
       // No verified fresh data for this account (per-account probe failure
       // or label missing from the batch result). Same rule as the batch
       // throw above: never send unverified numbers. State untouched —

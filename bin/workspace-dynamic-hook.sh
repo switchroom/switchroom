@@ -10,14 +10,13 @@
 # Configuration is via env vars (set at start.sh time):
 #
 #   SWITCHROOM_AGENT_NAME       - The agent name (required, set in start.sh)
-#   SWITCHROOM_INJECT_ON_CHANGE - When "1", enables inject-on-change
-#                                 semantics: content is only emitted when the
-#                                 session_id changes or file content changes.
-#                                 When "0" or unset (legacy mode), content is
-#                                 emitted every turn as before (full emit).
-#                                 Default in new agents is "1" (set by
-#                                 scaffold.ts when inject_on_change is true,
-#                                 the default).
+#   SWITCHROOM_INJECT_ON_CHANGE - Inject-on-change semantics are the default:
+#                                 content is only emitted when the session_id
+#                                 changes or file content changes. Set to "0"
+#                                 to opt out and emit every turn (legacy full
+#                                 emit) — scaffold.ts threads this negation
+#                                 only when an agent sets
+#                                 channels.telegram.inject_on_change: false.
 #
 # Failure modes (all silent — workspace injection must never block the turn):
 #   - switchroom CLI missing  → exit 0 with no output
@@ -29,7 +28,7 @@
 set -u
 
 AGENT_NAME="${SWITCHROOM_AGENT_NAME:-}"
-INJECT_ON_CHANGE="${SWITCHROOM_INJECT_ON_CHANGE:-0}"
+INJECT_ON_CHANGE="${SWITCHROOM_INJECT_ON_CHANGE:-1}"
 
 if [ -z "$AGENT_NAME" ]; then
   exit 0
@@ -43,7 +42,7 @@ fi
 # Inject-on-change: read session_id from stdin JSON (when enabled)
 # ---------------------------------------------------------------------------
 SESSION_ID=""
-if [ "$INJECT_ON_CHANGE" = "1" ]; then
+if [ "$INJECT_ON_CHANGE" != "0" ]; then
   # Read stdin (non-blocking: if no stdin supplied in tests, just skip).
   if ! [ -t 0 ]; then
     STDIN_JSON=$(cat 2>/dev/null || true)
@@ -118,7 +117,7 @@ if [ -f "$BODY_FILE" ]; then
     # In inject-on-change mode, also check the session-state file — if the
     # session_id matches the last-emitted session AND the hash matches, we
     # can suppress entirely (model already has this content in context).
-    if [ "$INJECT_ON_CHANGE" = "1" ] && [ -n "$SESSION_ID" ]; then
+    if [ "$INJECT_ON_CHANGE" != "0" ] && [ -n "$SESSION_ID" ]; then
       SESSION_STATE_DIR="${TELEGRAM_STATE_DIR:-${HOME:-/tmp}/.claude/switchroom-hookcache}/.hook-state"
       SESSION_STATE_FILE="$SESSION_STATE_DIR/ws-dynamic.$SESSION_ID"
       if [ -f "$SESSION_STATE_FILE" ]; then
@@ -201,7 +200,7 @@ _ws_record_session_state() {
 if [ -n "$NEW_HASH" ] && [ "$NEW_HASH" = "$OLD_HASH" ] && [ -f "$BODY_FILE" ]; then
   # Content unchanged since last render. In inject-on-change mode, check if
   # we already injected this content in the current session — if so, suppress.
-  if [ "$INJECT_ON_CHANGE" = "1" ] && [ -n "$SESSION_ID" ]; then
+  if [ "$INJECT_ON_CHANGE" != "0" ] && [ -n "$SESSION_ID" ]; then
     SESSION_STATE_DIR="${TELEGRAM_STATE_DIR:-${HOME:-/tmp}/.claude/switchroom-hookcache}/.hook-state"
     SESSION_STATE_FILE="$SESSION_STATE_DIR/ws-dynamic.$SESSION_ID"
     if [ -f "$SESSION_STATE_FILE" ]; then
@@ -222,7 +221,7 @@ else
   if [ -n "$NEW_HASH" ]; then
     printf '%s\n' "$NEW_HASH" > "$CACHE_FILE" 2>/dev/null || true
     printf '%s\n' "$WS_DYNAMIC" > "$BODY_FILE" 2>/dev/null || true
-    if [ "$INJECT_ON_CHANGE" = "1" ] && [ -n "$SESSION_ID" ]; then
+    if [ "$INJECT_ON_CHANGE" != "0" ] && [ -n "$SESSION_ID" ]; then
       _ws_record_session_state "$NEW_HASH" "$SESSION_ID"
     fi
   fi

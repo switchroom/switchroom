@@ -286,7 +286,9 @@ describe("inject_on_change command format drift detection", () => {
     expect(drifted).toBe(true);
   });
 
-  it("new env-prefix workspace-dynamic command is not-drift vs itself under inject_on_change=true", () => {
+  it("default workspace-dynamic command carries no inject-on-change env and is not-drift vs itself", () => {
+    // inject-on-change is the unconditional hook default now, so the
+    // scaffolded command threads no SWITCHROOM_INJECT_ON_CHANGE env.
     const agentConfig = makeAgentConfig({
       channels: { telegram: { inject_on_change: true } },
     });
@@ -297,40 +299,42 @@ describe("inject_on_change command format drift detection", () => {
       useSwitchroomPlugin: false,
     };
     const expected = buildSettingsHooksBlock(params);
-    // Check workspace-dynamic command has the env prefix.
     const ups = expected.UserPromptSubmit as Array<{ hooks: Array<{ command: string }> }>;
     const wsDynCmd = ups.flatMap(e => e.hooks.map(h => h.command))
       .find(c => c.includes("workspace-dynamic-hook.sh"));
     expect(wsDynCmd).toBeDefined();
-    expect(wsDynCmd).toContain("env SWITCHROOM_INJECT_ON_CHANGE=1");
+    expect(wsDynCmd).not.toContain("SWITCHROOM_INJECT_ON_CHANGE");
     // And it must not-drift vs itself.
     const { drifted } = detectHooksDrift(expected, expected);
     expect(drifted).toBe(false);
   });
 
-  it("old bare-assignment workspace-dynamic command is detected as drift", () => {
-    const agentConfig = makeAgentConfig({
-      channels: { telegram: { inject_on_change: true } },
-    });
-    const expected = buildSettingsHooksBlock({
+  it("opt-out (inject_on_change=false) threads env=0 and drifts vs the default form", () => {
+    const optOut = buildSettingsHooksBlock({
       agentName: "test-agent",
-      agentConfig,
+      agentConfig: makeAgentConfig({
+        channels: { telegram: { inject_on_change: false } },
+      }),
       hindsightEnabled: false,
       useSwitchroomPlugin: false,
     });
+    const ups = optOut.UserPromptSubmit as Array<{ hooks: Array<{ command: string }> }>;
+    const wsDynCmd = ups.flatMap(e => e.hooks.map(h => h.command))
+      .find(c => c.includes("workspace-dynamic-hook.sh"));
+    expect(wsDynCmd).toBeDefined();
+    expect(wsDynCmd).toContain("env SWITCHROOM_INJECT_ON_CHANGE=0");
 
-    const stale = JSON.parse(JSON.stringify(expected)) as typeof expected;
-    const ups = stale.UserPromptSubmit as Array<{ hooks: Array<{ command: string }> }>;
-    for (const entry of ups) {
-      for (const hook of entry.hooks) {
-        if (hook.command.includes("workspace-dynamic-hook.sh")) {
-          // Old broken format without `env` prefix.
-          hook.command = hook.command.replace("env SWITCHROOM_INJECT_ON_CHANGE=1 bash", "SWITCHROOM_INJECT_ON_CHANGE=1 bash");
-        }
-      }
-    }
-
-    const { drifted } = detectHooksDrift(expected, stale as Record<string, unknown>);
+    // Default (no opt-out) form is the drift baseline: the opt-out command
+    // differs, so drift detection must fire against it.
+    const dflt = buildSettingsHooksBlock({
+      agentName: "test-agent",
+      agentConfig: makeAgentConfig({
+        channels: { telegram: { inject_on_change: true } },
+      }),
+      hindsightEnabled: false,
+      useSwitchroomPlugin: false,
+    });
+    const { drifted } = detectHooksDrift(dflt, optOut as Record<string, unknown>);
     expect(drifted).toBe(true);
   });
 });
