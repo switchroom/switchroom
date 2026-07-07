@@ -287,15 +287,22 @@ describe("scaffoldAgent", () => {
     const config = makeAgentConfig();
     const result = scaffoldAgent("no-model-agent", config, tmpDir, telegramConfig);
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
-    expect(startSh).toContain("--model 'claude-sonnet-5'");
+    // The configured/default model is baked as the seed for $_EFFECTIVE_MODEL,
+    // which the exec line then passes through via --model "$_EFFECTIVE_MODEL".
+    expect(startSh).toContain("_EFFECTIVE_MODEL='claude-sonnet-5'");
+    expect(startSh).toContain('--model "$_EFFECTIVE_MODEL"');
   });
 
   it("start.sh respects an explicit model override", () => {
     const config = makeAgentConfig({ model: "claude-opus-4-7" });
     const result = scaffoldAgent("opus-agent", config, tmpDir, telegramConfig);
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
-    expect(startSh).toContain("--model 'claude-opus-4-7'");
-    expect(startSh).not.toContain("claude-sonnet-5");
+    // The explicit yaml model is baked into the $_EFFECTIVE_MODEL seed and reaches launch.
+    expect(startSh).toContain("_EFFECTIVE_MODEL='claude-opus-4-7'");
+    expect(startSh).toContain('--model "$_EFFECTIVE_MODEL"');
+    // The default sonnet model must NOT be baked as the effective-model seed
+    // (a doc comment may still reference it as an example — only the seed matters).
+    expect(startSh).not.toContain("_EFFECTIVE_MODEL='claude-sonnet-5'");
   });
 
   it("start.sh includes --permission-mode flag when permission_mode is set", () => {
@@ -2816,9 +2823,10 @@ describe("scaffoldAgent with global defaults cascade", () => {
     );
 
     expect(settings.model).toBe("claude-opus-4-7");
-    // And --model is appended to exec claude in start.sh
+    // And the model is baked as the $_EFFECTIVE_MODEL seed and passed to exec claude in start.sh
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
-    expect(startSh).toContain("--model 'claude-opus-4-7'");
+    expect(startSh).toContain("_EFFECTIVE_MODEL='claude-opus-4-7'");
+    expect(startSh).toContain('--model "$_EFFECTIVE_MODEL"');
   });
 
   it("exports user env vars in start.sh in declaration order", () => {
@@ -3329,7 +3337,8 @@ describe("scaffoldAgent with global defaults cascade", () => {
 
     const startSh = readFileSync(join(tmpDir, "rec-phase2", "start.sh"), "utf-8");
     expect(startSh).toContain("export NEW_VAR='hello'");
-    expect(startSh).toContain("--model 'claude-sonnet-5'");
+    expect(startSh).toContain("_EFFECTIVE_MODEL='claude-sonnet-5'");
+    expect(startSh).toContain('--model "$_EFFECTIVE_MODEL"');
   });
 
   it("is a no-op when switchroom.yaml has no defaults block (backcompat)", () => {

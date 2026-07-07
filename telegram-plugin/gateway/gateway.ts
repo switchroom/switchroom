@@ -346,6 +346,7 @@ import {
   buildModelMenu,
   handleModelMenuCallback,
   isSrToClaudeTransition,
+  isValidModelArg,
   MODEL_CALLBACK_PREFIX,
   MODEL_CALLBACK_HEADER,
   MODEL_CALLBACK_SR,
@@ -357,6 +358,7 @@ import {
   type ModelMenuReply,
 } from './model-command.js'
 import { discoverModels, selectModel } from '../../src/agents/model-picker.js'
+import { resolveMainModel } from '../../src/agents/scaffold.js'
 import {
   parseEffortCommand,
   handleEffortCommand,
@@ -18346,7 +18348,7 @@ interface ModelDepsRestartContext {
 }
 
 function buildModelDeps(restartCtx?: ModelDepsRestartContext): ModelMenuDeps & ModelCommandDeps {
-  return {
+  const deps: ModelMenuDeps & ModelCommandDeps = {
     discover: (a) => discoverModels(a),
     discoverSrModels: async () => {
       // /model/info lives on the ROOT proxy (model-mapped surface), NOT the
@@ -18452,7 +18454,25 @@ function buildModelDeps(restartCtx?: ModelDepsRestartContext): ModelMenuDeps & M
         )
       }
     },
+    /**
+     * Session-only switch TO an sr-* (LiteLLM/OpenRouter) model. claude's
+     * native `/model` picker rejects unknown sr-* ids, so we can't inject.
+     * Write the token to the `.session-model-override` carrier file (start.sh
+     * consumes it on the next boot and launches `claude --model <token>`), set
+     * the in-memory session-model so /status stays honest across the restart
+     * window, then run the SAME restart dispatch as scheduleRestart above.
+     */
+    scheduleModelRelaunch: async (model: string, reason: string) => {
+      const agentDir = resolveAgentDirFromEnv()
+      if (!agentDir) throw new Error('agent dir unresolvable — cannot write session-model carrier')
+      // Carrier: single line, token + newline, no quoting (start.sh strips
+      // whitespace and shape-gates). One-shot — consumed on the next boot.
+      writeFileSync(join(agentDir, '.session-model-override'), `${model}\n`, 'utf8')
+      activeSessionModelOverride = model
+      await deps.scheduleRestart(reason)
+    },
   }
+  return deps
 }
 
 function modelMenuReplyMarkup(reply: ModelMenuReply): InlineKeyboard | undefined {
@@ -23508,14 +23528,41 @@ bot.on('callback_query:data', async ctx => {
     // We track whether we applied the interim edit so we can skip the
     // toastOnly short-circuit if we did — a toastOnly return after the interim
     // edit would leave the menu stuck button-less.
-    let didInterimSrEdit = false
+    // sr-* TARGET tap: switch TO a non-Claude (LiteLLM/OpenRouter) model.
+    // Parity with the text `/model sr-*` path — claude's native picker rejects
+    // unknown sr-* ids, so an in-place inject can't set them. Carry the token
+    // across a graceful restart (the `.session-model-override` carrier) and
+    // relaunch `claude --model sr-*`. Session-only; reverts to the configured
+    // default on the next restart. The sr-* → Claude direction is handled below
+    // via the SELECT/alias outcome + isSrToClaudeTransition.
     if (data.startsWith(MODEL_CALLBACK_SR)) {
-      const srLabel = escapeHtmlForTg(srFriendlyLabel(data.slice(MODEL_CALLBACK_SR.length)))
+      const srName = data.slice(MODEL_CALLBACK_SR.length)
+      const srLabel = escapeHtmlForTg(srFriendlyLabel(srName))
+      if (!isValidModelArg(srName)) {
+        await ctx
+          .editMessageText(richMessage('❌ Invalid model name'), { reply_markup: { inline_keyboard: [] } })
+          .catch(() => {})
+        return
+      }
       await ctx
-        .editMessageText(richMessage(`⏳ Switching session to **${srLabel}**…`), { reply_markup: { inline_keyboard: [] } })
+        .editMessageText(
+          richMessage(`🔄 Switching session to **${srLabel}** — restarting (~30s). _Session-only; reverts to the configured default on the next restart._`),
+          { reply_markup: { inline_keyboard: [] } },
+        )
         .catch(() => {})
-      didInterimSrEdit = true
+      try {
+        await modelDeps.scheduleModelRelaunch(srName, `user: /model ${srName} (session-only relaunch, menu)`)
+      } catch (err) {
+        await ctx
+          .editMessageText(
+            richMessage(`❌ Could not switch to **${srLabel}**: ${escapeHtmlForTg((err as Error)?.message ?? String(err))}`),
+            { reply_markup: { inline_keyboard: [] } },
+          )
+          .catch(() => {})
+      }
+      return
     }
+    const didInterimSrEdit = false
     try {
       const prevSessionModel = activeSessionModelOverride
       const outcome = await handleModelMenuCallback(data, modelDeps)
@@ -26498,6 +26545,73 @@ void (async () => {
             process.stderr.write(`telegram gateway: writeSessionMarker failed: ${err}\n`)
           }
         } catch {}
+
+        // ─── Session-model re-hydration + LiteLLM-down alert (session relaunch) ───
+        //
+        // start.sh writes the EFFECTIVE launched model to `.active-session-model`
+        // on every boot (the model actually passed to `claude --model`). Re-hydrate
+        // the in-memory session-model override from it so `/status` and the welcome
+        // card stay honest after a session-relaunch restart. Only treat it as an
+        // override when it differs from the configured/default model — a plain boot
+        // on the configured model leaves the override null.
+        //
+        // Also consume the `.session-model-alert` sentinel: start.sh drops it when
+        // it had to DROP an sr-* override because LiteLLM was unreachable at boot
+        // (booting on the configured default instead of 4xx-ing against Anthropic).
+        // We turn it into a loud Telegram message to the operator, then delete it.
+        try {
+          const smAgentDir = resolveAgentDirFromEnv()
+          if (smAgentDir) {
+            const activePath = join(smAgentDir, '.active-session-model')
+            if (existsSync(activePath)) {
+              try {
+                const launched = readFileSync(activePath, 'utf8').trim()
+                const configured = (() => {
+                  type AgentListResp = { agents: Array<{ name: string; model?: string | null }> }
+                  const d = switchroomExecJson<AgentListResp>(['agent', 'list'])
+                  const raw = d?.agents?.find(a => a.name === getMyAgentName())?.model ?? null
+                  // Resolve through the SAME resolver start.sh's scaffold uses, so an
+                  // unset (`null`) or `model: "default"` config value maps to the
+                  // switchroom default model id — matching the EFFECTIVE model start.sh
+                  // wrote to `.active-session-model`. Comparing the raw (unresolved)
+                  // value would flag every ordinary restart of a default-model agent as
+                  // a phantom session override.
+                  return resolveMainModel(raw ?? undefined)
+                })()
+                activeSessionModelOverride =
+                  launched.length > 0 && launched !== configured ? launched : null
+              } catch { /* leave override as-is on a bad read */ }
+            }
+
+            const alertPath = join(smAgentDir, '.session-model-alert')
+            if (existsSync(alertPath)) {
+              let alertText: string | null = null
+              try {
+                alertText = readFileSync(alertPath, 'utf8').trim()
+              } catch { alertText = null }
+              try { unlinkSync(alertPath) } catch { /* best-effort */ }
+              if (alertText && alertText.length > 0) {
+                // Notify EVERY operator, not just allowFrom[0]. Each send is wrapped
+                // in its own catch so one operator's failure (blocked bot, bad chat
+                // id) never stops the rest, and the outer boot flow never crashes.
+                const operators = loadAccess().allowFrom
+                for (const operator of operators) {
+                  if (!operator) continue
+                  void lockedBot.api
+                    .sendMessage(operator, `⚠️ ${alertText}`)
+                    .catch((err: unknown) =>
+                      process.stderr.write(
+                        `telegram gateway: session-model alert send failed for ${operator}: ${(err as Error)?.message ?? String(err)}\n`,
+                      ),
+                    )
+                }
+                process.stderr.write(`telegram gateway: session-model: LiteLLM-down override drop — ${alertText}\n`)
+              }
+            }
+          }
+        } catch (err) {
+          process.stderr.write(`telegram gateway: session-model re-hydration failed: ${(err as Error)?.message ?? String(err)}\n`)
+        }
 
         // Credit-exhaustion watcher (#348). Reads `<agentDir>/.claude/.claude.json`
         // for `cachedExtraUsageDisabledReason`. Fires a Telegram notification

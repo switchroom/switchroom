@@ -2864,6 +2864,14 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     // (e.g. tests with no HOME) the template's {{#if hostHomeQ}} guard renders
     // the symlink block as a no-op.
     hostHomeQ: hostHomeQForBake(),
+    // modelQ is the CONFIGURED default only. It is NOT the last word on the
+    // launched model: start.sh applies a runtime session-only override at boot
+    // if the gateway wrote a `.session-model-override` carrier (Telegram
+    // `/model <sr-*>` → graceful relaunch on a non-Anthropic LiteLLM model).
+    // That override is one-shot + session-scoped — it reverts to modelQ on the
+    // next restart and is never persisted here or to switchroom.yaml. See
+    // profiles/_base/start.sh.hbs (Session-only model override) and
+    // telegram-plugin/gateway/model-command.ts.
     modelQ: shellSingleQuote(resolveMainModel(agentConfig.model)),
     ...buildCronSessionContext(agentConfig),
     thinkingEffort: agentConfig.thinking_effort ?? SWITCHROOM_DEFAULT_THINKING_EFFORT,
