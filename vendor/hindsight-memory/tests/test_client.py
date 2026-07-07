@@ -274,6 +274,49 @@ class TestHindsightClientRecallTagFilters:
         assert "tag_groups" not in captured["body"]
 
 
+class TestHindsightClientPreferObservations:
+    """Switchroom Phase-1 — prefer_observations forwarded in the recall body."""
+
+    def test_forwards_prefer_observations_true(self):
+        c = HindsightClient("http://localhost:9077")
+        captured = {}
+
+        def fake_open(req, timeout=None):
+            captured["body"] = json.loads(req.data.decode())
+            return FakeResp({"results": []})
+
+        with patch("urllib.request.urlopen", side_effect=fake_open):
+            c.recall("bank", "query", prefer_observations=True)
+
+        assert captured["body"]["prefer_observations"] is True
+
+    def test_forwards_prefer_observations_false(self):
+        c = HindsightClient("http://localhost:9077")
+        captured = {}
+
+        def fake_open(req, timeout=None):
+            captured["body"] = json.loads(req.data.decode())
+            return FakeResp({"results": []})
+
+        with patch("urllib.request.urlopen", side_effect=fake_open):
+            c.recall("bank", "query", prefer_observations=False)
+
+        assert captured["body"]["prefer_observations"] is False
+
+    def test_omits_prefer_observations_when_unset(self):
+        c = HindsightClient("http://localhost:9077")
+        captured = {}
+
+        def fake_open(req, timeout=None):
+            captured["body"] = json.loads(req.data.decode())
+            return FakeResp({"results": []})
+
+        with patch("urllib.request.urlopen", side_effect=fake_open):
+            c.recall("bank", "query")
+
+        assert "prefer_observations" not in captured["body"]
+
+
 class TestRequestTimeoutOverride:
     """Upstream 55ef70679 — the constructor override replaces the per-call
     timeout that recall/retain/_request would otherwise use. When unset,

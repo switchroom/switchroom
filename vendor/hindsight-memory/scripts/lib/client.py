@@ -124,11 +124,19 @@ class HindsightClient:
         tags: Optional[list] = None,
         tags_match: Optional[str] = None,
         tag_groups: Optional[object] = None,
+        prefer_observations: Optional[bool] = None,
         timeout: int = 10,
     ) -> dict:
         """Recall memories from a bank.
 
-        Returns the raw API response dict with 'results' list.
+        Returns the raw API response dict with 'results' list. Each result
+        carries a `scores` object (`RecallScores`) whose `final` field is the
+        engine's combined ranking score — callers sort the merged multi-bank
+        set by it before applying any count cap.
+
+        `prefer_observations=True` asks the engine to prefer deduped
+        observation statements over the raw facts they supersede, backfilling
+        the freed slots — denser coverage inside the same token/count budget.
         """
         path = f"/v1/default/banks/{urllib.parse.quote(bank_id, safe='')}/memories/recall"
         body = {
@@ -145,6 +153,8 @@ class HindsightClient:
             body["tags_match"] = tags_match
         if tag_groups:
             body["tag_groups"] = tag_groups
+        if prefer_observations is not None:
+            body["prefer_observations"] = prefer_observations
         return self._request("POST", path, body, timeout=timeout)
 
     def retain(
