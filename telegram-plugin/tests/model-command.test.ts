@@ -38,6 +38,7 @@ function okResult(output: string): InjectResult {
 function makeDeps(overrides: Partial<ModelCommandDeps> = {}) {
   const calls: Array<{ agent: string; command: string }> = [];
   const restartCalls: string[] = [];
+  const relaunchCalls: Array<{ model: string; reason: string }> = [];
   const deps: ModelCommandDeps = {
     inject: async (agent, command) => {
       calls.push({ agent, command });
@@ -50,9 +51,10 @@ function makeDeps(overrides: Partial<ModelCommandDeps> = {}) {
     preBlock: (s) => `<pre>${s}</pre>`,
     getActiveSessionModel: () => null,
     scheduleRestart: async (reason) => { restartCalls.push(reason); },
+    scheduleModelRelaunch: async (model, reason) => { relaunchCalls.push({ model, reason }); },
     ...overrides,
   };
-  return { deps, calls, restartCalls };
+  return { deps, calls, restartCalls, relaunchCalls };
 }
 
 describe("parseModelCommand", () => {
@@ -355,16 +357,6 @@ describe("handleModelCommand — sr-* → Claude graceful restart", () => {
     expect(reply.text).toContain("Set model to sonnet");
   });
 
-  it("does NOT restart when switching from Claude to sr-* (no session override)", async () => {
-    const { deps, calls, restartCalls } = makeDeps({
-      getActiveSessionModel: () => null,
-    });
-    await handleModelCommand({ kind: "set", model: "sr-gemini-2.5-pro" }, deps);
-    // sr-* is not a Claude model — no restart
-    expect(restartCalls).toHaveLength(0);
-    expect(calls).toHaveLength(1);
-  });
-
   it("surfaces scheduleRestart failures without propagating the error", async () => {
     const { deps, calls } = makeDeps({
       getActiveSessionModel: () => "sr-deepseek-r1",
@@ -383,6 +375,64 @@ describe("handleModelCommand — sr-* → Claude graceful restart", () => {
     await handleModelCommand({ kind: "set", model: "opus" }, deps);
     expect(calls).toHaveLength(1);
     expect(restartCalls).toHaveLength(0);
+  });
+});
+
+describe("handleModelCommand — Claude → sr-* session relaunch", () => {
+  it("schedules a model relaunch (carrier) instead of injecting for an sr-* target", async () => {
+    const { deps, calls, restartCalls, relaunchCalls } = makeDeps({
+      getActiveSessionModel: () => null,
+    });
+    const reply = await handleModelCommand({ kind: "set", model: "sr-glm-5" }, deps);
+    // Must NOT inject (claude's picker rejects sr-* ids)
+    expect(calls).toHaveLength(0);
+    // Must NOT use the sr→claude scheduleRestart path
+    expect(restartCalls).toHaveLength(0);
+    // Must schedule the carrier-based relaunch with the full sr-* id
+    expect(relaunchCalls).toHaveLength(1);
+    expect(relaunchCalls[0].model).toBe("sr-glm-5");
+    expect(reply.text).toContain("sr-glm-5");
+    expect(reply.text).toContain("30s");
+    expect(reply.html).toBe(true);
+  });
+
+  it("expands a short sr alias then relaunches on the full id", async () => {
+    const { deps, calls, relaunchCalls } = makeDeps({ getActiveSessionModel: () => null });
+    await handleModelCommand({ kind: "set", model: "glm" }, deps);
+    expect(calls).toHaveLength(0);
+    expect(relaunchCalls).toHaveLength(1);
+    expect(relaunchCalls[0].model).toBe("sr-glm-5");
+  });
+
+  it("Claude target still uses the instant inject path (no relaunch)", async () => {
+    const { deps, calls, relaunchCalls, restartCalls } = makeDeps({
+      getActiveSessionModel: () => null,
+    });
+    await handleModelCommand({ kind: "set", model: "sonnet" }, deps);
+    expect(calls).toHaveLength(1);
+    expect(relaunchCalls).toHaveLength(0);
+    expect(restartCalls).toHaveLength(0);
+  });
+
+  it("sr-* → Claude still takes the scheduleRestart path (not scheduleModelRelaunch)", async () => {
+    const { deps, calls, restartCalls, relaunchCalls } = makeDeps({
+      getActiveSessionModel: () => "sr-glm-5",
+    });
+    await handleModelCommand({ kind: "set", model: "opus" }, deps);
+    expect(calls).toHaveLength(0);
+    expect(relaunchCalls).toHaveLength(0);
+    expect(restartCalls).toHaveLength(1);
+  });
+
+  it("surfaces scheduleModelRelaunch failures without propagating the error", async () => {
+    const { deps, calls } = makeDeps({
+      getActiveSessionModel: () => null,
+      scheduleModelRelaunch: async () => { throw new Error("carrier write failed"); },
+    });
+    const reply = await handleModelCommand({ kind: "set", model: "sr-glm-5" }, deps);
+    expect(calls).toHaveLength(0);
+    expect(reply.text).toContain("Could not schedule model switch");
+    expect(reply.text).toContain("carrier write failed");
   });
 });
 
@@ -433,11 +483,13 @@ describe("SR_MODEL_ALIASES / expandSrAlias", () => {
     }
   });
 
-  it("handleModelCommand injects expanded sr-* id, not the short alias", async () => {
-    const { deps, calls } = makeDeps({ getActiveSessionModel: () => null });
+  it("handleModelCommand relaunches on the expanded sr-* id, not the short alias", async () => {
+    const { deps, calls, relaunchCalls } = makeDeps({ getActiveSessionModel: () => null });
     await handleModelCommand({ kind: "set", model: "flash" }, deps);
-    expect(calls).toHaveLength(1);
-    expect(calls[0].command).toBe("/model sr-gemini-2.5-flash");
+    // sr-* targets no longer inject — they carrier-relaunch on the full id.
+    expect(calls).toHaveLength(0);
+    expect(relaunchCalls).toHaveLength(1);
+    expect(relaunchCalls[0].model).toBe("sr-gemini-2.5-flash");
   });
 
   it("handleModelCommand with alias schedules restart when session is on sr-*", async () => {

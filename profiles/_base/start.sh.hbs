@@ -833,6 +833,12 @@ fi
 # per-session cost/issue tracking is handled out-of-band by correlating
 # LiteLLM's request log against switchroom's turn ledger, never by mutating the
 # claude protocol.
+# _LITELLM_OK is read by the session-model-override block below: an sr-*
+# (LiteLLM/OpenRouter) session override must be DROPPED when the proxy is
+# unreachable at boot, or claude would 4xx an unknown model against Anthropic.
+# Empty by default (proxy not confirmed live); set to "1" only on a successful
+# liveliness probe. Deliberately NOT unset with the sr_ll_* scratch vars.
+_LITELLM_OK=""
 if [ -n "$SWITCHROOM_LITELLM" ] && command -v switchroom >/dev/null 2>&1; then
   sr_ll_key="$(switchroom vault get "litellm/$SWITCHROOM_AGENT_NAME/api-key" 2>/dev/null || true)"
   sr_ll_ok=""
@@ -845,6 +851,7 @@ if [ -n "$SWITCHROOM_LITELLM" ] && command -v switchroom >/dev/null 2>&1; then
     sr_ll_ok="1"
   fi
   if [ -n "$sr_ll_ok" ]; then
+    _LITELLM_OK="1"
     # Newline-separated Name: Value pairs (claude CLI ANTHROPIC_CUSTOM_HEADERS format).
     # Tags: agent:<name> for per-agent spend tracking; profile:<profile> for
     # fleet-level cost breakdown by role. Per-turn tags (cron vs telegram) are
@@ -866,16 +873,63 @@ x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:
   unset sr_ll_key sr_ll_ok
 fi
 
+# --- Session-only model override (carrier: .session-model-override) ---
+#
+# The Telegram `/model <sr-*>` switch can't use claude's in-REPL `/model`
+# picker for non-Anthropic (LiteLLM/OpenRouter `sr-*`) models — the CLI's
+# native picker rejects unknown ids ("Model not found"). Instead the gateway
+# writes the chosen model token to `.session-model-override` and gracefully
+# restarts the agent; THIS boot picks it up and launches `claude --model
+# <token>` directly (no picker validation at launch — LiteLLM routes it).
+#
+# One-shot + session-only: the carrier is consumed (rm) on this one boot
+# regardless of validity, so the next restart reverts to the configured
+# default `{{{modelQ}}}`. Mirrors the `.force-fresh-session` marker's
+# gateway↔start.sh round-trip. See telegram-plugin/gateway/model-command.ts.
+# NB {{{modelQ}}} is already shell-single-quoted by the scaffold (it renders as
+# a quoted token, e.g. 'claude-sonnet-5'), so it is assigned BARE here — never
+# inside additional double quotes, which would embed the literal quote chars in
+# the value and break `claude --model`.
+_EFFECTIVE_MODEL={{{modelQ}}}
+if [ -f "{{agentDir}}/.session-model-override" ]; then
+  _override="$(tr -d '[:space:]' < "{{agentDir}}/.session-model-override" 2>/dev/null || true)"
+  rm -f "{{agentDir}}/.session-model-override"
+  if printf '%s' "$_override" | grep -Eq '^[A-Za-z0-9][]A-Za-z0-9._[-]{0,99}$'; then
+    _EFFECTIVE_MODEL="$_override"
+    # LiteLLM-down guard (operator decision 2026-07): an sr-* override with the
+    # proxy unreachable at boot must NOT 4xx an unknown model against Anthropic.
+    # Drop the override back to the configured default, log LOUDLY, and drop an
+    # alert sentinel the gateway turns into a Telegram message to the operator.
+    case "$_override" in
+      sr-*)
+        if [ -z "$_LITELLM_OK" ]; then
+          _EFFECTIVE_MODEL={{{modelQ}}}
+          echo "session-model: LiteLLM proxy unreachable at boot — DROPPING sr-* override '$_override', booting on configured default '$_EFFECTIVE_MODEL' instead (would otherwise 4xx against Anthropic)" >&2
+          echo "session-model: the requested sr-* model is UNAVAILABLE this session; re-issue /model $_override once LiteLLM is reachable" >&2
+          printf 'LiteLLM proxy was unreachable at boot, so the session-only model switch to `%s` was dropped — the agent booted on its configured default `%s` instead. Re-issue /model %s once LiteLLM is reachable.\n' "$_override" "$_EFFECTIVE_MODEL" "$_override" > "{{agentDir}}/.session-model-alert" 2>/dev/null || true
+        fi
+        ;;
+    esac
+  else
+    echo "session-model: ignoring malformed .session-model-override (failed shape gate) — using configured default '$_EFFECTIVE_MODEL'" >&2
+  fi
+  unset _override
+fi
+# Record the EFFECTIVE launched model so the gateway can re-hydrate its
+# in-memory session-model state after this restart, keeping /status and the
+# welcome card honest. Overwrite (not consumed) — the gateway reads it at boot.
+printf '%s\n' "$_EFFECTIVE_MODEL" > "{{agentDir}}/.active-session-model" 2>/dev/null || true
+
 {{#if useSwitchroomPlugin}}
 if [ -n "$APPEND_PROMPT" ]; then
-  exec claude $CONTINUE_FLAG --dangerously-load-development-channels server:switchroom-telegram --plugin-dir "{{securityPluginDir}}"{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}} $SR_FLEET_ARG{{#if modelQ}} --model {{{modelQ}}}{{/if}}{{#if thinkingEffort}} --effort {{thinkingEffort}}{{/if}}{{#if permissionMode}} --permission-mode {{permissionMode}}{{/if}}{{#if fallbackModelQ}} --fallback-model {{{fallbackModelQ}}}{{/if}} --append-system-prompt "$APPEND_PROMPT"{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
+  exec claude $CONTINUE_FLAG --dangerously-load-development-channels server:switchroom-telegram --plugin-dir "{{securityPluginDir}}"{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}} $SR_FLEET_ARG --model "$_EFFECTIVE_MODEL"{{#if thinkingEffort}} --effort {{thinkingEffort}}{{/if}}{{#if permissionMode}} --permission-mode {{permissionMode}}{{/if}}{{#if fallbackModelQ}} --fallback-model {{{fallbackModelQ}}}{{/if}} --append-system-prompt "$APPEND_PROMPT"{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
 else
-  exec claude $CONTINUE_FLAG --dangerously-load-development-channels server:switchroom-telegram --plugin-dir "{{securityPluginDir}}"{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}} $SR_FLEET_ARG{{#if modelQ}} --model {{{modelQ}}}{{/if}}{{#if thinkingEffort}} --effort {{thinkingEffort}}{{/if}}{{#if permissionMode}} --permission-mode {{permissionMode}}{{/if}}{{#if fallbackModelQ}} --fallback-model {{{fallbackModelQ}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
+  exec claude $CONTINUE_FLAG --dangerously-load-development-channels server:switchroom-telegram --plugin-dir "{{securityPluginDir}}"{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}} $SR_FLEET_ARG --model "$_EFFECTIVE_MODEL"{{#if thinkingEffort}} --effort {{thinkingEffort}}{{/if}}{{#if permissionMode}} --permission-mode {{permissionMode}}{{/if}}{{#if fallbackModelQ}} --fallback-model {{{fallbackModelQ}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
 fi
 {{else}}
 if [ -n "$APPEND_PROMPT" ]; then
-  exec claude $CONTINUE_FLAG --channels plugin:telegram@claude-plugins-official --plugin-dir "{{securityPluginDir}}"{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}} $SR_FLEET_ARG{{#if modelQ}} --model {{{modelQ}}}{{/if}}{{#if thinkingEffort}} --effort {{thinkingEffort}}{{/if}}{{#if permissionMode}} --permission-mode {{permissionMode}}{{/if}}{{#if fallbackModelQ}} --fallback-model {{{fallbackModelQ}}}{{/if}} --append-system-prompt "$APPEND_PROMPT"{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
+  exec claude $CONTINUE_FLAG --channels plugin:telegram@claude-plugins-official --plugin-dir "{{securityPluginDir}}"{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}} $SR_FLEET_ARG --model "$_EFFECTIVE_MODEL"{{#if thinkingEffort}} --effort {{thinkingEffort}}{{/if}}{{#if permissionMode}} --permission-mode {{permissionMode}}{{/if}}{{#if fallbackModelQ}} --fallback-model {{{fallbackModelQ}}}{{/if}} --append-system-prompt "$APPEND_PROMPT"{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
 else
-  exec claude $CONTINUE_FLAG --channels plugin:telegram@claude-plugins-official --plugin-dir "{{securityPluginDir}}"{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}} $SR_FLEET_ARG{{#if modelQ}} --model {{{modelQ}}}{{/if}}{{#if thinkingEffort}} --effort {{thinkingEffort}}{{/if}}{{#if permissionMode}} --permission-mode {{permissionMode}}{{/if}}{{#if fallbackModelQ}} --fallback-model {{{fallbackModelQ}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
+  exec claude $CONTINUE_FLAG --channels plugin:telegram@claude-plugins-official --plugin-dir "{{securityPluginDir}}"{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}} $SR_FLEET_ARG --model "$_EFFECTIVE_MODEL"{{#if thinkingEffort}} --effort {{thinkingEffort}}{{/if}}{{#if permissionMode}} --permission-mode {{permissionMode}}{{/if}}{{#if fallbackModelQ}} --fallback-model {{{fallbackModelQ}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
 fi
 {{/if}}

@@ -133,6 +133,18 @@ export interface ModelCommandDeps {
    * mechanism as the `/restart` command (hostd-first, SIGTERM fallback).
    */
   scheduleRestart: (reason: string) => Promise<void>
+  /**
+   * Schedule a session-only switch TO a non-Claude (`sr-*` LiteLLM/OpenRouter)
+   * model. claude's in-REPL `/model` picker rejects unknown `sr-*` ids, so an
+   * inject can't set them. Instead the gateway writes the chosen token to the
+   * `.session-model-override` carrier file and gracefully restarts the agent;
+   * the next boot launches `claude --model <token>` directly (LiteLLM routes
+   * it, no picker validation). Session-only: reverts to the configured default
+   * on the following restart. Wired to the same restart dispatch as
+   * `scheduleRestart`, plus the carrier write. `model` is the full `sr-*` id
+   * (already alias-expanded); `reason` is stamped as the restart reason.
+   */
+  scheduleModelRelaunch: (model: string, reason: string) => Promise<void>
 }
 
 export interface ModelCommandReply {
@@ -152,6 +164,7 @@ function helpText(deps: ModelCommandDeps, reason?: string): ModelCommandReply {
     '\`/model\` — show the configured model',
     `\`/model <name>\` — switch the live session (${MODEL_ALIASES.map(a => `\`${a}\``).join(' · ')} or a full model id)`,
     `_OpenRouter shortcuts:_ ${srAliasExamples}`,
+    '_OpenRouter (sr-\\*) switches restart the session (~30s); Claude switches apply instantly._',
     PERSIST_NOTE,
   )
   return { text: lines.join('\n'), html: true }
@@ -209,6 +222,30 @@ export async function handleModelCommand(
       text: [
         `Switching from \`${deps.escapeHtml(currentSession)}\` back to Claude — restarting session cleanly. Claude will be ready in ~30s.`,
         PERSIST_NOTE,
+      ].join('\n'),
+      html: true,
+    }
+  }
+
+  // Claude → sr-*: an in-place inject can't set a non-Anthropic model — claude's
+  // native `/model` picker rejects the unknown `sr-*` id ("Model not found").
+  // Carry the token across a graceful restart and relaunch `claude --model
+  // sr-*` directly (LiteLLM routes it). Session-only: reverts to the configured
+  // default on the next restart. The sr-* → Claude direction is handled above.
+  if (isSrModel(model)) {
+    try {
+      await deps.scheduleModelRelaunch(model, `user: /model ${model} (session-only relaunch)`)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      return {
+        text: `❌ Could not schedule model switch: ${deps.escapeHtml(msg)}`,
+        html: true,
+      }
+    }
+    return {
+      text: [
+        `Switching to \`${deps.escapeHtml(model)}\` — restarting session (~30s).`,
+        '_Session-only — reverts to the configured default on the next restart._',
       ].join('\n'),
       html: true,
     }
