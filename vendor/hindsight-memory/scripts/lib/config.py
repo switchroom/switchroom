@@ -33,10 +33,17 @@ DEFAULTS = {
     # user's query terms and a memory's text terms. Memories below this
     # threshold are dropped before formatting. 0.0 disables the gate
     # (current behaviour: inject everything Hindsight returns up to the
-    # count cap). Hindsight's HTTP API does not expose similarity
-    # scores, so this is the switchroom-side quality filter — see #475.
+    # count cap). NOTE: Hindsight's HTTP recall API DOES return per-result
+    # relevance scores (`scores.final`, plus `.semantic`/`.keyword`/
+    # `.reranker`) — verified at runtime — and recall.py now reads and
+    # sorts the merged set by `scores.final`. This Jaccard gate is a
+    # separate lexical-overlap quality filter layered on top — see #475.
     "recallMinOverlap": 0.0,
     "recallTypes": ["world", "experience"],
+    # Switchroom-local: when True (default; Ken-approved ON) recall biases
+    # toward synthesized `observation`-tier facts. Escape hatch: pin off via
+    # `recallPreferObservations: false` in the user config — read in recall.py.
+    "recallPreferObservations": True,
     # Switchroom #2848 Stage B/C — deterministic directive capture.
     # When on (switchroom default; pinned true in the copied plugin
     # settings.json by applyHindsightSettingsOverrides), TWO deterministic
