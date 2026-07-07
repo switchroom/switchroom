@@ -95,6 +95,47 @@ takes an exclusive lock).
 | `SWITCHROOM_HINDSIGHT_BACKUP_KEEP` | `7` | rotated backups retained |
 | `SWITCHROOM_HINDSIGHT_RETENTION_DAYS` | `30` | completed-op prune age |
 
+## LLM model selection (`hindsight.llm`)
+
+The shared hindsight container runs its LLM operations (retain / reflect /
+consolidation — recall is local-only, no LLM) through whatever model the
+top-level `hindsight.llm` block selects. The flat form sets a **global
+default** for every op:
+
+```yaml
+hindsight:
+  llm:
+    provider: claude-code               # global default provider
+    model: openrouter/z-ai/glm-5.2      # global default model
+```
+
+Each op can be overridden individually with an optional `retain` / `reflect`
+/ `consolidation` sub-block. Any field you omit inherits the global (that is
+the engine's own fallback — switchroom emits only the vars you set, so an
+absent op sends nothing):
+
+```yaml
+hindsight:
+  llm:
+    provider: claude-code
+    model: openrouter/z-ai/glm-5.2      # global default stays as-is
+    retain:
+      model: gpt-oss-20b                # cheap model for ingestion
+    reflect:
+      model: gpt-oss-120b               # stronger model for synthesis
+    # consolidation: omitted → inherits the global model
+```
+
+Per-op fields: `model`, `provider`, `base_url`, `api_key` (all optional,
+`base_url`/`api_key` are passthrough for a per-op provider that needs its own
+endpoint/credential; `api_key` accepts a `vault:` reference). These map to the
+engine's `HINDSIGHT_API_<OP>_LLM_MODEL` / `_PROVIDER` / `_BASE_URL` /
+`_API_KEY` env vars, with the global `HINDSIGHT_API_LLM_*` as the fallback for
+anything unset.
+
+Takes effect on the next `switchroom memory setup` / rollout recreate of the
+hindsight container (env is read at container launch).
+
 ## Health
 
 The container now carries a Docker **healthcheck** (`/health` via
