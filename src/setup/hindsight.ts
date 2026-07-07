@@ -706,6 +706,15 @@ export function startHindsight(
       // HINDSIGHT_API_PORT is the only port knob the upstream config.py
       // recognizes; the CP service has no equivalent env var override.
       "-e", `HINDSIGHT_API_PORT=${apiPort}`,
+      // In host-network mode the container shares the host's network stack,
+      // so the CP dashboard's dataplane calls resolve `localhost:<port>`
+      // against host-bound listeners. The image default for the dataplane
+      // URL is `http://localhost:8888`, but 8888 is where we MOVED OFF (it's
+      // squatted on this host by an unrelated container → the dashboard's
+      // data calls 502 while the API is healthy on ${apiPort}). Pin the CP
+      // dataplane URL to the SAME port the API actually binds so it tracks
+      // any auto-bump instead of the stale 8888 default.
+      "-e", `HINDSIGHT_CP_DATAPLANE_API_URL=http://localhost:${apiPort}`,
       // LiteLLM routing: inherited by the claude_agent_sdk subprocess so
       // consolidation/reflect calls hit the proxy for spend tracking.
       "-e", `ANTHROPIC_BASE_URL=${anthropicBaseUrl}`,
@@ -944,6 +953,15 @@ export function generateHindsightComposeSnippet(llm?: HindsightLlmConfig): strin
     // Mirror of the docker-run path: with the claude-code provider, pin
     // ANTHROPIC_MODEL to the same model for the underlying claude subprocess.
     ...(llmProvider === "claude-code" ? [`      - ANTHROPIC_MODEL=${llmModel}`] : []),
+    // Pin the CP dashboard's dataplane URL to the port the API actually
+    // binds INSIDE the container. This compose path is bridge-networked
+    // (host ${HINDSIGHT_DEFAULT_API_PORT} → container 8888), so the API binds
+    // the image default 8888 internally and there is no host-port collision
+    // in the container's own netns. We still set the var explicitly (rather
+    // than leaning on the image default) so it stays correct and matches the
+    // docker-run path, where host-network mode requires it point at the
+    // moved-off API port to dodge the squatted-8888 → 502 dashboard bug.
+    `      - HINDSIGHT_CP_DATAPLANE_API_URL=http://localhost:8888`,
   ];
   return [
     "services:",

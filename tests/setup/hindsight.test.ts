@@ -215,6 +215,39 @@ describe("hindsight broker-fed mode (#1245)", () => {
     expect(snippet).toContain("ANTHROPIC_MODEL=openrouter/z-ai/glm-5.2");
   });
 
+  it("pins HINDSIGHT_CP_DATAPLANE_API_URL at the API port in host-network (litellm) mode, not squatted 8888", () => {
+    startHindsight({ apiPort: 18888, uiPort: 19999 }, {
+      baseUrl: "http://127.0.0.1:4010",
+      apiKey: "sk-test",
+    });
+    const args = findRunArgs();
+    // Host-network mode should be in effect.
+    expect(args).toContain("--network");
+    const env = envPairsFromArgs(args);
+    // The API binds 18888; the CP dataplane URL MUST track it (not the
+    // image-default localhost:8888, which is squatted on the host → 502).
+    expect(env).toContain("HINDSIGHT_API_PORT=18888");
+    expect(env).toContain("HINDSIGHT_CP_DATAPLANE_API_URL=http://localhost:18888");
+    expect(env).not.toContain("HINDSIGHT_CP_DATAPLANE_API_URL=http://localhost:8888");
+  });
+
+  it("tracks an auto-bumped API port in the CP dataplane URL (not hardcoded 18888)", () => {
+    startHindsight({ apiPort: 18890, uiPort: 19999 }, {
+      baseUrl: "http://127.0.0.1:4010",
+      apiKey: "sk-test",
+    });
+    const env = envPairsFromArgs(findRunArgs());
+    expect(env).toContain("HINDSIGHT_CP_DATAPLANE_API_URL=http://localhost:18890");
+  });
+
+  it("compose snippet sets HINDSIGHT_CP_DATAPLANE_API_URL for the CP dashboard", async () => {
+    const { generateHindsightComposeSnippet } = await import("../../src/setup/hindsight.js");
+    // Bridge-networked compose: the API binds container-internal 8888.
+    expect(generateHindsightComposeSnippet()).toContain(
+      "HINDSIGHT_CP_DATAPLANE_API_URL=http://localhost:8888",
+    );
+  });
+
   it("raises the reflect wall timeout (vendor 300s times out large-bank mental-model refresh)", async () => {
     const { HINDSIGHT_DEFAULT_REFLECT_WALL_TIMEOUT_S: t } = await import("../../src/setup/hindsight.js");
     expect(t).toBeGreaterThan(300);
