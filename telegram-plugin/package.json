@@ -33,7 +33,13 @@
     "@secretlint/types": "^12.2.0",
     "@xterm/headless": "^6.0.0",
     "grammy": "^1.44",
+    "mdast-util-from-markdown": "^2.0.2",
+    "mdast-util-gfm": "^3.0.0",
+    "micromark-extension-gfm": "^3.0.0",
     "posthog-node": "^5.29.2"
+  },
+  "devDependencies": {
+    "@types/mdast": "^4.0.4"
   },
   "engines": {
     "node": ">=20.11.0"
