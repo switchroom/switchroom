@@ -213,6 +213,32 @@ Established with the product owner. Phase 2 ships when:
 
 ---
 
+## 6a. Live-wire construct verification (2026-07, default-on gate)
+
+Before flipping `SWITCHROOM_RICH_RENDER` default-on, every "soft" construct was
+proven directly against the Bot API `sendRichMessage` endpoint — the actual wire
+path — and the returned `rich_message` structure (Telegram's own parse) was
+inspected, not eyeballed. Ground truth:
+
+| Construct | Markdown emitted | Telegram entity returned | Verdict |
+| --- | --- | --- | --- |
+| Bold | `**b**` | `bold` | ✅ ships |
+| Italic | `_i_` | `italic` | ✅ ships |
+| Strikethrough | `~~s~~` | `strikethrough` | ✅ ships |
+| Inline code | `` `c` `` | `code` | ✅ ships |
+| Link | `[t](url)` | `url` (text-link) | ✅ ships |
+| **Spoiler** | `\|\|s\|\|` | `spoiler` | ✅ ships — **live-confirmed** (supersedes the earlier UAT "soft" note, which was an MTProto-decoder limitation in the test harness, not a wire failure) |
+| **Highlight** | `==h==` | `marked` | ✅ ships — live-confirmed |
+| **Underline** | `__u__` | `bold` ❌ | **EXCLUDED** — Telegram's rich-message markdown parser reads `__…__` identically to `**…**`; there is no markdown token for underline on this path. `__u__` degrades to a clean **bold** entity (not broken markup), so no code change is needed, but underline is not a distinctly-supported construct. Documented in `reference/telegram-formatting-guide.md`. |
+| 3-level nested list | tight `-`/indent | nested `list`/`paragraph` blocks, no injected blank lines | ✅ ships (tight-list spacing fixed, PR #2936) |
+| Table | GFM pipe table | `table` with per-column `align` | ✅ ships |
+| Blockquote | `> …` | `blockquote` | ✅ ships |
+
+**Exclusion:** underline. Everything else in the palette renders as its intended
+Telegram entity on the live wire.
+
+---
+
 ## 7. Rollout
 
 - **Ship dark.** Phase 2 lands behind a per-agent flag, default off. Merging the

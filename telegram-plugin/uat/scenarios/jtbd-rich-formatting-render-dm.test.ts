@@ -116,13 +116,18 @@ const SAMPLE_LINES = [
  * trip on the uat-host (PR #2745 first live run: present set was
  * `bold, italic, code, strikethrough, text_link, blockquote, pre`).
  *
- * `spoiler` is deliberately NOT hard-asserted: on the live wire the `||…||`
- * span did NOT surface as a `spoiler`/`textMarked` entity (the model either
- * dropped the syntax or Telegram's chat-message GFM parser doesn't map it the
- * way the IV table-of-contents `textMarked` node does). Rather than red the
- * whole render gate on a construct the round trip doesn't reliably produce, we
- * observe spoiler softly (logged below). The decoder's `textMarked → spoiler`
- * mapping is still pinned deterministically by the hosted unit suite.
+ * `spoiler` is soft-observed HERE only because of THIS harness's decode path:
+ * the `||…||` span did NOT reliably surface as a `spoiler`/`textMarked` entity
+ * through the MTProto send→IV→decode round trip the UAT driver uses. This is a
+ * harness-decoder limitation, NOT a wire failure: a 2026-07 direct probe of the
+ * Bot API `sendRichMessage` endpoint (the actual production send path) confirmed
+ * `||spoiler||` DOES parse to a `spoiler` entity and `==highlight==` to `marked`
+ * on the live wire — see `reference/rfcs/telegram-native-formatting.md` §6a.
+ * Spoiler ships default-on; it stays soft here purely so this MTProto-decode
+ * gate doesn't red on its own decode gap. (Underline `__…__`, by contrast, is a
+ * genuine wire exclusion — it parses as bold; see §6a.) The decoder's
+ * `textMarked → spoiler` mapping is still pinned deterministically by the
+ * hosted unit suite.
  *
  * Lists and dividers carry no first-class Bot API entity (they render as
  * bulleted/numbered/rule TEXT), so they are asserted on `reply.text` below.
