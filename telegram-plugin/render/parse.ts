@@ -14,14 +14,27 @@
 //     degrades to a `plain` inline (or a paragraph wrapping one) carrying the
 //     raw source slice, rather than being dropped.
 //
-// Spoiler handling (IR has a `spoiler` node, mdast/GFM has no spoiler concept):
-//   Increment 1 does NOT emit `spoiler` nodes. GFM has no spoiler syntax, and
-//   introducing the switchroom `||…||` convention means teaching micromark a
-//   custom inline extension — out of scope for the parser+IR increment. The IR
-//   type stays in place; a later increment adds a micromark inline extension
-//   (or a post-parse pass over `plain` text) that recognises the spoiler
-//   delimiter and emits `SpoilerNode`. Until then spoiler delimiters fold into
-//   `plain`/`emphasis` text like any other characters.
+// Underline vs bold (`__…__` vs `**…**`):
+//   Telegram's Bot API 10.1 rich markdown reads a `__…__` double-underscore run
+//   as UNDERLINE and a `**…**` run as BOLD. GFM/micromark folds BOTH into one
+//   `strong` mdast node with no record of which delimiter was used. This module
+//   disambiguates by reading the run's source delimiter off its UTF-16 offsets
+//   (`source.slice(start, start+2)`): `__` → `underline`, anything else →
+//   `bold`. A single `_…_` / `*…*` run stays `italic` (emphasis) either way.
+//
+// Spoiler + highlight handling (`||…||`, `==…==`):
+//   The IR carries `spoiler` and `highlight` nodes but GFM/micromark has no
+//   syntax for either — both delimiters fold into ordinary `plain` text. Rather
+//   than teach micromark two custom inline extensions, this module recognises
+//   them in a POST-PARSE pass over the folded `plain` nodes (`expandPlainNode`),
+//   splitting a `||secret||` / `==marked==` run into the matching
+//   `SpoilerNode` / `HighlightNode`. Recognition is per-`plain`-node: the
+//   delimited content must be a single contiguous plain-text run on one line
+//   (formatting INSIDE a spoiler — `||**bold**||` — is left as literal
+//   delimiters, since `**bold**` is already its own mdast node). A delimiter
+//   that does not form a closed, non-empty, single-line pair stays literal
+//   plain text and is re-escaped on render. This faithfully mirrors Telegram's
+//   own reading of the delimiters.
 //
 // Blockquote expandable handling:
 //   The IR carries `expandable: boolean` for Telegram's expandable blockquote
@@ -54,6 +67,7 @@ import type {
   Document,
   Inline,
   ListItem,
+  PlainNode,
   Pos,
   TableCell,
   TableRow,
@@ -132,8 +146,17 @@ function foldInline(node: PhrasingContent, source: string): Inline {
   switch (node.type) {
     case "text":
       return { type: "plain", text: node.value, ...pos(node) };
-    case "strong":
-      return { type: "bold", children: foldInlineChildren(node, source), ...pos(node) };
+    case "strong": {
+      // GFM folds both `**…**` (bold) and `__…__` (underline) into one `strong`
+      // node. Recover the intended construct from the source delimiter.
+      const p = pos(node);
+      const underline = source.slice(p.start, p.start + 2) === "__";
+      return {
+        type: underline ? "underline" : "bold",
+        children: foldInlineChildren(node, source),
+        ...p,
+      };
+    }
     case "emphasis":
       return { type: "italic", children: foldInlineChildren(node, source), ...pos(node) };
     case "delete":
@@ -154,8 +177,81 @@ function foldInline(node: PhrasingContent, source: string): Inline {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Post-parse inline-marker recognition (spoiler `||…||`, highlight `==…==`)
+// ---------------------------------------------------------------------------
+
+/** The post-parse inline delimiters GFM/micromark doesn't natively model. Each
+ *  matches a CLOSED, NON-EMPTY, single-line delimited run inside `plain` text.
+ *  `delim` is the delimiter length (both are 2 chars). */
+const INLINE_MARKER_SPECS: ReadonlyArray<{
+  type: "spoiler" | "highlight";
+  re: RegExp;
+  delim: number;
+}> = [
+  { type: "spoiler", re: /\|\|([^|\n]+)\|\|/, delim: 2 },
+  { type: "highlight", re: /==([^=\n]+)==/, delim: 2 },
+];
+
+function mkPlain(text: string, start: number, end: number): PlainNode {
+  return { type: "plain", text, start, end };
+}
+
+/** Split a single `plain` node's text into `plain` / `spoiler` / `highlight`
+ *  nodes by recognising `||…||` and `==…==` runs. Offsets are exact when the
+ *  node's source slice equals its decoded text (the common no-escape case);
+ *  otherwise every produced piece inherits the original node's span (still a
+ *  valid in-bounds offset, just not byte-slice-exact). Recurses so a marker
+ *  nested in plain text after another marker is also recognised. */
+function expandPlainNode(node: PlainNode, source: string): Inline[] {
+  const text = node.text;
+  if (text.length === 0) return [node];
+  const exact = source.slice(node.start, node.end) === text;
+  const abs = (k: number): number => (exact ? node.start + k : node.start);
+  const absEnd = (k: number): number => (exact ? node.start + k : node.end);
+
+  // Earliest marker match across all delimiter kinds.
+  let best:
+    | { idx: number; full: number; inner: string; type: "spoiler" | "highlight"; delim: number }
+    | null = null;
+  for (const spec of INLINE_MARKER_SPECS) {
+    const m = spec.re.exec(text);
+    if (m != null && m[1].length > 0 && (best === null || m.index < best.idx)) {
+      best = { idx: m.index, full: m[0].length, inner: m[1], type: spec.type, delim: spec.delim };
+    }
+  }
+  if (best === null) return [node];
+
+  const out: Inline[] = [];
+  if (best.idx > 0) out.push(mkPlain(text.slice(0, best.idx), abs(0), abs(best.idx)));
+
+  const innerStart = abs(best.idx + best.delim);
+  const innerEnd = absEnd(best.idx + best.delim + best.inner.length);
+  const innerPlain = mkPlain(best.inner, innerStart, innerEnd);
+  out.push({
+    type: best.type,
+    children: expandPlainNode(innerPlain, source),
+    start: abs(best.idx),
+    end: absEnd(best.idx + best.full),
+  });
+
+  const rest = text.slice(best.idx + best.full);
+  if (rest.length > 0) {
+    out.push(...expandPlainNode(mkPlain(rest, abs(best.idx + best.full), node.end), source));
+  }
+  return out;
+}
+
+/** Fold a run of mdast phrasing children into IR inlines, then run the
+ *  post-parse spoiler/highlight recognition over the produced `plain` nodes. */
+function buildInlines(children: ReadonlyArray<MdastNode>, source: string): Inline[] {
+  return children
+    .map((c) => foldInline(c as PhrasingContent, source))
+    .flatMap((n) => (n.type === "plain" ? expandPlainNode(n, source) : [n]));
+}
+
 function foldInlineChildren(node: MdastParent, source: string): Inline[] {
-  return node.children.map((c) => foldInline(c as PhrasingContent, source));
+  return buildInlines(node.children, source);
 }
 
 function foldTableRow(
@@ -163,7 +259,7 @@ function foldTableRow(
   source: string,
 ): TableRow {
   const cells: TableCell[] = row.children.map((cell) => ({
-    children: cell.children.map((c) => foldInline(c as PhrasingContent, source)),
+    children: buildInlines(cell.children, source),
     ...pos(cell),
   }));
   return { cells, ...pos(row) };

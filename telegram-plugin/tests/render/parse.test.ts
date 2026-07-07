@@ -253,6 +253,89 @@ describe("parse: astral-plane emoji offsets are UTF-16 units", () => {
   });
 });
 
+describe("parse: underline vs bold (`__` vs `**`)", () => {
+  it("folds a `__…__` run into an underline node (not bold)", () => {
+    const md = "__underlined__";
+    const doc = parse(md);
+    const u = (doc.blocks[0] as any).children[0];
+    expect(u.type).toBe("underline");
+    expect(u.children[0]).toMatchObject({ type: "plain", text: "underlined" });
+    expect(md.slice(u.start, u.end)).toBe(md);
+  });
+
+  it("keeps a `**…**` run as bold", () => {
+    const b = (parse("**strong**").blocks[0] as any).children[0];
+    expect(b.type).toBe("bold");
+  });
+
+  it("keeps single-delimiter `_…_` as italic", () => {
+    const i = (parse("_em_").blocks[0] as any).children[0];
+    expect(i.type).toBe("italic");
+  });
+
+  it("recovers nested bold inside underline with offsets intact", () => {
+    const md = "__a **b** c__";
+    const doc = parse(md);
+    const u = (doc.blocks[0] as any).children[0];
+    expect(u.type).toBe("underline");
+    expect(md.slice(u.start, u.end)).toBe(md);
+    const bold = u.children.find((c: any) => c.type === "bold");
+    expect(bold).toBeDefined();
+    expect(md.slice(bold.start, bold.end)).toBe("**b**");
+    assertOffsetsRoundTrip(doc.blocks[0], md);
+  });
+});
+
+describe("parse: spoiler (`||…||`) + highlight (`==…==`)", () => {
+  it("splits `||secret||` into a spoiler node", () => {
+    const md = "before ||secret|| after";
+    const doc = parse(md);
+    const kids = (doc.blocks[0] as any).children;
+    expect(kids.map((k: any) => k.type)).toEqual(["plain", "spoiler", "plain"]);
+    const sp = kids[1];
+    expect(sp.children[0]).toMatchObject({ type: "plain", text: "secret" });
+    expect(md.slice(sp.start, sp.end)).toBe("||secret||");
+    assertOffsetsRoundTrip(doc.blocks[0], md);
+  });
+
+  it("splits `==marked==` into a highlight node", () => {
+    const md = "a ==marked== b";
+    const doc = parse(md);
+    const kids = (doc.blocks[0] as any).children;
+    const hi = kids.find((k: any) => k.type === "highlight");
+    expect(hi).toBeDefined();
+    expect(hi.children[0]).toMatchObject({ type: "plain", text: "marked" });
+    expect(md.slice(hi.start, hi.end)).toBe("==marked==");
+  });
+
+  it("recognises both delimiters in one run", () => {
+    const md = "||s|| and ==m==";
+    const types = (parse(md).blocks[0] as any).children.map((c: any) => c.type);
+    expect(types).toContain("spoiler");
+    expect(types).toContain("highlight");
+  });
+
+  it("leaves an unclosed / single delimiter as literal plain text", () => {
+    // `a || b` has no closing `||` — must NOT become a spoiler.
+    const kids = (parse("a || b").blocks[0] as any).children;
+    expect(kids.every((k: any) => k.type === "plain")).toBe(true);
+  });
+});
+
+describe("parse: nested lists", () => {
+  it("folds a nested sub-list under a list item", () => {
+    const md = "- a\n  - nested1\n  - nested2\n- b";
+    const doc = parse(md);
+    const list = doc.blocks[0] as any;
+    expect(list.type).toBe("list");
+    const item0Kinds = list.items[0].children.map((c: any) => c.type);
+    expect(item0Kinds).toContain("list");
+    const nested = list.items[0].children.find((c: any) => c.type === "list");
+    expect(nested.items).toHaveLength(2);
+    assertOffsetsRoundTrip(list, md);
+  });
+});
+
 describe("expandable blockquote (Bot API 10.1 `**>` marker)", () => {
   it("parses a single-line `**>` quote into an expandable blockquote", () => {
     const md = "**> a collapsible line";

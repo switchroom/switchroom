@@ -1,8 +1,13 @@
 import { describe, it, expect } from "vitest";
 import { parse } from "../../render/parse.js";
-import { render, renderSafe } from "../../render/render.js";
+import {
+  render,
+  renderSafe,
+  SUPPORTED_INLINE,
+  SUPPORTED_BLOCK,
+} from "../../render/render.js";
 import { RICH_MESSAGE_MAX_CHARS } from "../../format.js";
-import type { Document } from "../../render/ir.js";
+import type { Document, TableNode } from "../../render/ir.js";
 
 /** Round-trip helper: parse markdown -> IR -> render -> re-parse, and assert
  *  the RE-PARSED IR is structurally equivalent to the original (ignoring
@@ -43,8 +48,23 @@ describe("render: inline palette", () => {
       "[label](https://example.com)",
     );
   });
+  it("underline", () => {
+    expect(render(parse("__hi__"))).toBe("__hi__");
+  });
+  it("spoiler round-trips through the `||…||` delimiter", () => {
+    expect(render(parse("a ||hidden|| b"))).toBe("a ||hidden|| b");
+  });
+  it("highlight round-trips through the `==…==` delimiter", () => {
+    expect(render(parse("a ==marked== b"))).toBe("a ==marked== b");
+  });
+  it("underline vs bold stay distinct through a round trip", () => {
+    assertRoundTripsStructurally("__under__ and **bold**");
+  });
   it("nested inline spans", () => {
     assertRoundTripsStructurally("**bold *and italic* text**");
+  });
+  it("nested bold inside underline", () => {
+    assertRoundTripsStructurally("__a **b** c__");
   });
   it("escapes markdown-special characters in plain text", () => {
     const out = render(parse("cost is 5 dollars"));
@@ -167,6 +187,9 @@ describe("render: block palette", () => {
   it("task list item checked state", () => {
     assertRoundTripsStructurally("- [x] done\n- [ ] not done");
   });
+  it("nested list round-trips structurally", () => {
+    assertRoundTripsStructurally("- a\n  - nested1\n  - nested2\n- b");
+  });
   it("thematic break", () => {
     expect(render(parse("---"))).toBe("---");
   });
@@ -212,6 +235,127 @@ describe("render: full document", () => {
       "2. step two",
     ].join("\n");
     assertRoundTripsStructurally(md);
+  });
+});
+
+describe("render: construct allowlist", () => {
+  it("SUPPORTED_INLINE + SUPPORTED_BLOCK cover every IR node type the parser can emit", () => {
+    // Every construct that appears in this mixed document must be in the
+    // allowlist — otherwise the renderer's exhaustiveness `default` would have
+    // escaped it to literal text (the gap-#2 safety net) rather than emitting
+    // native markup.
+    const md = [
+      "# H",
+      "",
+      "__u__ **b** *i* ~~s~~ `c` ||sp|| ==hi== [l](https://e.com)",
+      "",
+      "> quote",
+      "",
+      "```ts\nx\n```",
+      "",
+      "- a\n- b",
+      "",
+      "---",
+      "",
+      "| A |\n| --- |\n| 1 |",
+    ].join("\n");
+    const doc = parse(md);
+    const inlineTypes = new Set<string>();
+    const blockTypes = new Set<string>();
+    const walkI = (n: any) => {
+      inlineTypes.add(n.type);
+      (n.children ?? []).forEach(walkI);
+    };
+    const walkB = (n: any) => {
+      blockTypes.add(n.type);
+      switch (n.type) {
+        case "paragraph":
+        case "heading":
+          n.children.forEach(walkI);
+          break;
+        case "blockquote":
+          n.children.forEach(walkB);
+          break;
+        case "list":
+          n.items.forEach((it: any) => it.children.forEach(walkB));
+          break;
+        case "table":
+          [n.header, ...n.rows].forEach((r: any) =>
+            r.cells.forEach((c: any) => c.children.forEach(walkI)),
+          );
+          break;
+        // code-block, thematic-break: leaf blocks, no children to walk.
+      }
+    };
+    doc.blocks.forEach(walkB);
+    for (const t of blockTypes) expect(SUPPORTED_BLOCK).toContain(t as any);
+    for (const t of inlineTypes) expect(SUPPORTED_INLINE).toContain(t as any);
+  });
+});
+
+describe("renderSafe: degradation tracking", () => {
+  it("reports no degradations for a clean under-cap document", () => {
+    const result = renderSafe(parse("**hi**"), "**hi**", RICH_MESSAGE_MAX_CHARS);
+    expect(result.degradations).toEqual([]);
+  });
+
+  it("degrades a MALFORMED table to a code fence and records `table-malformed`", () => {
+    // A structurally-broken table (header has 1 column, a body row has 2).
+    // mdast normalises real tables, so synthesise the broken IR directly.
+    const src = "| A |\n| --- |\n| 1 | 2 |";
+    const bad: Document = {
+      blocks: [
+        {
+          type: "table",
+          start: 0,
+          end: src.length,
+          align: [],
+          header: { cells: [{ children: [], start: 0, end: 1 }], start: 0, end: 1 },
+          rows: [
+            {
+              cells: [
+                { children: [], start: 0, end: 1 },
+                { children: [], start: 0, end: 1 },
+              ],
+              start: 0,
+              end: 2,
+            },
+          ],
+        } as TableNode,
+      ],
+    };
+    const result = renderSafe(bad, src, RICH_MESSAGE_MAX_CHARS);
+    expect(result.mode).toBe("markdown");
+    expect(result.degradations).toHaveLength(1);
+    expect(result.degradations[0]).toMatchObject({
+      construct: "table",
+      reason: "table-malformed",
+    });
+    // Content preserved as a preformatted code fence (not broken pipes).
+    expect(result.text).toContain(src);
+    expect(result.text.startsWith("```")).toBe(true);
+  });
+
+  it("records an `oversize` degradation when an atomic block is swapped to plain source", () => {
+    const smallPara = "Summary line.";
+    const hugeRow = "| " + "x".repeat(200) + " |";
+    const rows = Array.from({ length: 50 }, () => hugeRow).join("\n");
+    const md = `${smallPara}\n\n| Col |\n| --- |\n${rows}`;
+    const result = renderSafe(parse(md), md, 500);
+    // At least one degradation with an oversize/document reason is recorded.
+    expect(result.degradations.length).toBeGreaterThan(0);
+    expect(
+      result.degradations.some((d) => d.reason === "oversize" || d.reason === "document-oversize"),
+    ).toBe(true);
+  });
+
+  it("records a `document-oversize` degradation on whole-doc plain fallback", () => {
+    const hugeRow = "| " + "x".repeat(2000) + " |";
+    const rows = Array.from({ length: 100 }, () => hugeRow).join("\n");
+    const md = `| Col |\n| --- |\n${rows}`;
+    const result = renderSafe(parse(md), md, 50);
+    expect(result.mode).toBe("plain");
+    expect(result.degradations.some((d) => d.reason === "document-oversize")).toBe(true);
   });
 });
 

@@ -58,7 +58,12 @@ function walkInline(node: Inline, out: FlatEntity[]) {
       break
     case 'plain':
       break
+    case 'underline':
     case 'spoiler':
+    case 'highlight':
+      // No dedicated oracle EntityType for these Bot API 10.1 constructs yet;
+      // recurse so any nested bold/italic/code/link inside them is still
+      // collected for the cross-check.
       node.children.forEach((c) => walkInline(c, out))
       break
   }
