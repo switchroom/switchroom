@@ -894,7 +894,10 @@ _EFFECTIVE_MODEL={{{modelQ}}}
 if [ -f "{{agentDir}}/.session-model-override" ]; then
   _override="$(tr -d '[:space:]' < "{{agentDir}}/.session-model-override" 2>/dev/null || true)"
   rm -f "{{agentDir}}/.session-model-override"
-  if printf '%s' "$_override" | grep -Eq '^[A-Za-z0-9][]A-Za-z0-9._[-]{0,99}$'; then
+  # Shape gate — kept aligned with MODEL_ARG_RE in telegram-plugin/gateway/model-command.ts.
+  # `/` is allowed for OpenRouter-style `sr-vendor/model` ids; it is not a shell
+  # metachar inside the double-quoted `claude --model "$_EFFECTIVE_MODEL"` usage below.
+  if printf '%s' "$_override" | grep -Eq '^[A-Za-z0-9][]A-Za-z0-9._[/-]{0,99}$'; then
     _EFFECTIVE_MODEL="$_override"
     # LiteLLM-down guard (operator decision 2026-07): an sr-* override with the
     # proxy unreachable at boot must NOT 4xx an unknown model against Anthropic.

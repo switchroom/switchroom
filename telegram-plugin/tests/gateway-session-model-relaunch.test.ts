@@ -58,17 +58,23 @@ describe('gateway boot: session-model re-hydration + LiteLLM-down alert', () => 
   it('re-hydrates activeSessionModelOverride from .active-session-model', () => {
     const idx = GATEWAY_SRC.indexOf("join(smAgentDir, '.active-session-model')")
     expect(idx).toBeGreaterThan(0)
-    const win = GATEWAY_SRC.slice(idx - 200, idx + 700)
+    const win = GATEWAY_SRC.slice(idx - 200, idx + 1400)
     // Only an override when the launched model differs from the configured one.
     expect(win).toMatch(/launched\.length > 0 && launched !== configured \? launched : null/)
+    // The configured value must be resolved through resolveMainModel (the SAME
+    // resolver start.sh's scaffold uses) so an unset/`default` model config does
+    // not get flagged as a phantom session override on an ordinary restart.
+    expect(win).toContain('resolveMainModel(raw ?? undefined)')
   })
 
-  it('consumes the .session-model-alert sentinel, sends it to the operator, and deletes it', () => {
+  it('consumes the .session-model-alert sentinel, notifies ALL operators, and deletes it', () => {
     const idx = GATEWAY_SRC.indexOf("join(smAgentDir, '.session-model-alert')")
     expect(idx).toBeGreaterThan(0)
-    const win = GATEWAY_SRC.slice(idx, idx + 900)
+    const win = GATEWAY_SRC.slice(idx, idx + 1100)
     expect(win).toContain('unlinkSync(alertPath)')
-    expect(win).toContain('loadAccess().allowFrom[0]')
+    // Broadcasts to every operator in allowFrom, not just allowFrom[0].
+    expect(win).toContain('const operators = loadAccess().allowFrom')
+    expect(win).toContain('for (const operator of operators)')
     expect(win).toContain('lockedBot.api')
     expect(win).toContain('.sendMessage(operator')
   })

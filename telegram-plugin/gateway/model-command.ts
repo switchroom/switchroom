@@ -52,11 +52,14 @@ export const MODEL_ALIASES = ['opus', 'sonnet', 'haiku', 'fable', 'default'] as 
  * Shape gate for the model argument. This string is typed literally
  * into the agent's tmux pane, so the gate is strict by construction:
  * one token, alphanumeric start, then alphanumerics plus the chars
- * that appear in real model ids (`.` `_` `-` and the `[1m]`-style
- * variant brackets). No whitespace means no second token can ride
+ * that appear in real model ids (`.` `_` `-` `/` and the `[1m]`-style
+ * variant brackets). `/` is allowed for OpenRouter-style
+ * `sr-vendor/model` ids; it is not a shell metachar inside the
+ * double-quoted `claude --model "$_EFFECTIVE_MODEL"` usage, so it can't
+ * break the launch. No whitespace means no second token can ride
  * along; no control characters means no newline/Enter smuggling.
  */
-const MODEL_ARG_RE = /^[A-Za-z0-9][A-Za-z0-9._\[\]-]{0,99}$/
+const MODEL_ARG_RE = /^[A-Za-z0-9][A-Za-z0-9._/\[\]-]{0,99}$/
 
 export function isValidModelArg(arg: string): boolean {
   return MODEL_ARG_RE.test(arg)

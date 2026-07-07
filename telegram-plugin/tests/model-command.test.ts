@@ -113,8 +113,17 @@ describe("isValidModelArg", () => {
       expect(isValidModelArg(good), good).toBe(true);
     }
   });
+  it("accepts OpenRouter-style sr-vendor/model ids (embedded slash)", () => {
+    // `/` is a legal char in a model id — needed for OpenRouter-style
+    // `sr-vendor/model` routing. It is NOT a shell metachar inside the
+    // double-quoted `claude --model "$_EFFECTIVE_MODEL"` launch, so it is
+    // safe. Kept aligned with the shell shape gate in profiles/_base/start.sh.hbs.
+    for (const good of ["sr-openrouter/gpt-5", "sr-vendor/model", "sr-mistralai/mixtral-8x7b"]) {
+      expect(isValidModelArg(good), good).toBe(true);
+    }
+  });
   it("rejects whitespace, metacharacters, and over-long strings", () => {
-    for (const bad of ["", " ", "a b", "a;b", "a/b", "-x", "a".repeat(120), "a\tb", "a\nb"]) {
+    for (const bad of ["", " ", "a b", "a;b", "-x", "a".repeat(120), "a\tb", "a\nb", "/leading"]) {
       expect(isValidModelArg(bad), JSON.stringify(bad)).toBe(false);
     }
   });

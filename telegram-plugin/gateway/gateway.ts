@@ -334,6 +334,7 @@ import {
   type ModelMenuReply,
 } from './model-command.js'
 import { discoverModels, selectModel } from '../../src/agents/model-picker.js'
+import { resolveMainModel } from '../../src/agents/scaffold.js'
 import {
   parseEffortCommand,
   handleEffortCommand,
@@ -25270,7 +25271,14 @@ void (async () => {
                 const configured = (() => {
                   type AgentListResp = { agents: Array<{ name: string; model?: string | null }> }
                   const d = switchroomExecJson<AgentListResp>(['agent', 'list'])
-                  return d?.agents?.find(a => a.name === getMyAgentName())?.model ?? null
+                  const raw = d?.agents?.find(a => a.name === getMyAgentName())?.model ?? null
+                  // Resolve through the SAME resolver start.sh's scaffold uses, so an
+                  // unset (`null`) or `model: "default"` config value maps to the
+                  // switchroom default model id — matching the EFFECTIVE model start.sh
+                  // wrote to `.active-session-model`. Comparing the raw (unresolved)
+                  // value would flag every ordinary restart of a default-model agent as
+                  // a phantom session override.
+                  return resolveMainModel(raw ?? undefined)
                 })()
                 activeSessionModelOverride =
                   launched.length > 0 && launched !== configured ? launched : null
@@ -25285,13 +25293,17 @@ void (async () => {
               } catch { alertText = null }
               try { unlinkSync(alertPath) } catch { /* best-effort */ }
               if (alertText && alertText.length > 0) {
-                const operator = loadAccess().allowFrom[0]
-                if (operator) {
+                // Notify EVERY operator, not just allowFrom[0]. Each send is wrapped
+                // in its own catch so one operator's failure (blocked bot, bad chat
+                // id) never stops the rest, and the outer boot flow never crashes.
+                const operators = loadAccess().allowFrom
+                for (const operator of operators) {
+                  if (!operator) continue
                   void lockedBot.api
                     .sendMessage(operator, `⚠️ ${alertText}`)
                     .catch((err: unknown) =>
                       process.stderr.write(
-                        `telegram gateway: session-model alert send failed: ${(err as Error)?.message ?? String(err)}\n`,
+                        `telegram gateway: session-model alert send failed for ${operator}: ${(err as Error)?.message ?? String(err)}\n`,
                       ),
                     )
                 }
