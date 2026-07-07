@@ -126,7 +126,11 @@ function renderListItem(item: ListItem, ordered: boolean, index: number): string
   const checkbox =
     item.checked === null ? "" : item.checked ? "[x] " : "[ ] ";
   const marker = ordered ? `${index}. ` : "- ";
-  const body = renderBlocks(item.children);
+  // Tight item (spread=false): join the item's block children with a single
+  // newline so a paragraph and its nested sub-list stay adjacent — no spurious
+  // blank line injected before the sub-list. Loose item (spread=true): keep the
+  // blank-line separation the source author intended.
+  const body = renderBlocksJoined(item.children, item.spread ? "\n\n" : "\n");
   const lines = body.split("\n");
   const first = `${marker}${checkbox}${lines[0] ?? ""}`;
   const contIndent = " ".repeat(marker.length);
@@ -138,9 +142,13 @@ function renderListItem(item: ListItem, ordered: boolean, index: number): string
 
 function renderList(node: ListNode): string {
   const start = node.startNumber ?? 1;
+  // Loose list (spread=true): a blank line between top-level items, as the
+  // source author wrote them. Tight list (spread=false, the common case and
+  // all nested sub-lists): siblings on adjacent lines, single newline.
+  const sep = node.spread ? "\n\n" : "\n";
   return node.items
     .map((item, i) => renderListItem(item, node.ordered, start + i))
-    .join("\n");
+    .join(sep);
 }
 
 /** Render a single cell's inline content for a table (no line breaks — GFM
@@ -200,8 +208,16 @@ function renderBlock(node: Block): string {
   }
 }
 
+/** Join a run of blocks with an explicit separator. Blockquote children and
+ *  the top-level document use a blank line (`\n\n`); tight list items pass a
+ *  single newline so a nested sub-list stays adjacent to its item's paragraph
+ *  (see `renderListItem`). */
+function renderBlocksJoined(blocks: Block[], sep: string): string {
+  return blocks.map(renderBlock).join(sep);
+}
+
 function renderBlocks(blocks: Block[]): string {
-  return blocks.map(renderBlock).join("\n\n");
+  return renderBlocksJoined(blocks, "\n\n");
 }
 
 /** Render a full IR `Document` to Bot API 10.1 rich GFM markdown. */

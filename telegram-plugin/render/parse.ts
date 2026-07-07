@@ -303,12 +303,18 @@ function foldBlock(
       const items: ListItem[] = node.children.map((li) => ({
         children: li.children.map((c) => foldBlock(c, source, expandableLineStarts)),
         checked: li.checked ?? null,
+        // mdast `listItem.spread`: whether this item's block children are
+        // separated by a blank line. Tight (false) keeps a paragraph and its
+        // nested sub-list adjacent so no blank line is injected on render.
+        spread: li.spread ?? false,
         ...pos(li),
       }));
       return {
         type: "list",
         ordered: node.ordered ?? false,
         startNumber: node.ordered ? node.start ?? 1 : null,
+        // mdast `list.spread`: loose (true) vs tight (false) at the list level.
+        spread: node.spread ?? false,
         items,
         ...pos(node),
       };
