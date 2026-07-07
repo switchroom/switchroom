@@ -3025,6 +3025,18 @@ export const MemoryBackendConfigSchema = z.object({
         .string()
         .optional()
         .describe("Embedding model (e.g., 'nomic-embed-text')"),
+      llm_model: z
+        .string()
+        .optional()
+        .describe(
+          "LiteLLM model name for Hindsight's LLM ops (retain/reflect/" +
+          "consolidation) when the top-level `litellm.enabled` carve-out is " +
+          "on. Defaults to a cheap OpenRouter model (routed via LiteLLM's " +
+          "model-mapped path, not the Anthropic OAuth pass-through) to keep " +
+          "background memory-op cost off the Claude subscription quota. Set " +
+          "to a `claude-*` model name to route it back through the OAuth " +
+          "pass-through instead. Has no effect when litellm is disabled.",
+        ),
       api_key: z
         .string()
         .optional()

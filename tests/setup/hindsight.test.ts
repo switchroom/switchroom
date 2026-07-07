@@ -23,6 +23,7 @@ import {
   HINDSIGHT_IMAGE,
   HINDSIGHT_DEFAULT_SHM_SIZE,
   HINDSIGHT_DEFAULT_MODEL,
+  HINDSIGHT_DEFAULT_LITELLM_MODEL,
   getRunningHindsightPorts,
   HINDSIGHT_DEFAULT_API_PORT,
   HINDSIGHT_DEFAULT_UI_PORT,
@@ -367,6 +368,81 @@ describe("hindsight/scaffold model pin (#2903 fix 5.4)", () => {
     // retain/reflect/consolidation silently run on a stale model.
     expect(HINDSIGHT_DEFAULT_MODEL).toBe(SWITCHROOM_DEFAULT_MAIN_MODEL);
   });
+});
+
+describe("hindsight LiteLLM model routing (2026-07-07)", () => {
+  beforeEach(() => {
+    mockedExec.mockReset();
+    mockedExec.mockReturnValue("");
+  });
+
+  function envVal(args: string[], key: string): string | undefined {
+    for (let i = 0; i < args.length - 1; i++) {
+      if (args[i] === "-e" && (args[i + 1] as string).startsWith(`${key}=`)) {
+        return (args[i + 1] as string).slice(key.length + 1);
+      }
+    }
+    return undefined;
+  }
+
+  it("without litellm, stays on HINDSIGHT_DEFAULT_MODEL and sets no ANTHROPIC_BASE_URL", () => {
+    startHindsight({ apiPort: 8888, uiPort: 9999 });
+    const args = findRunArgs();
+    expect(envVal(args, "ANTHROPIC_MODEL")).toBe(HINDSIGHT_DEFAULT_MODEL);
+    expect(envVal(args, "HINDSIGHT_API_LLM_MODEL")).toBe(HINDSIGHT_DEFAULT_MODEL);
+    expect(envVal(args, "ANTHROPIC_BASE_URL")).toBeUndefined();
+  });
+
+  it("with litellm and no model override, defaults to HINDSIGHT_DEFAULT_LITELLM_MODEL routed via the model-mapped root (no /anthropic suffix)", () => {
+    startHindsight(
+      { apiPort: 8888, uiPort: 9999 },
+      { baseUrl: "http://127.0.0.1:4010", apiKey: "sk-test" },
+    );
+    const args = findRunArgs();
+    expect(envVal(args, "ANTHROPIC_MODEL")).toBe(HINDSIGHT_DEFAULT_LITELLM_MODEL);
+    expect(envVal(args, "HINDSIGHT_API_LLM_MODEL")).toBe(HINDSIGHT_DEFAULT_LITELLM_MODEL);
+    expect(envVal(args, "ANTHROPIC_BASE_URL")).toBe("http://127.0.0.1:4010");
+  });
+
+  it("with litellm and an explicit claude-* model override, rides the Anthropic pass-through (/anthropic suffix)", () => {
+    startHindsight(
+      { apiPort: 8888, uiPort: 9999 },
+      { baseUrl: "http://127.0.0.1:4010", apiKey: "sk-test", model: "claude-sonnet-5" },
+    );
+    const args = findRunArgs();
+    expect(envVal(args, "ANTHROPIC_MODEL")).toBe("claude-sonnet-5");
+    expect(envVal(args, "ANTHROPIC_BASE_URL")).toBe("http://127.0.0.1:4010/anthropic");
+  });
+
+  it("with litellm and an explicit non-Claude model override, rides the model-mapped root", () => {
+    startHindsight(
+      { apiPort: 8888, uiPort: 9999 },
+      { baseUrl: "http://127.0.0.1:4010/", apiKey: "sk-test", model: "openrouter/minimax/minimax-m3" },
+    );
+    const args = findRunArgs();
+    expect(envVal(args, "ANTHROPIC_MODEL")).toBe("openrouter/minimax/minimax-m3");
+    // Trailing slash on baseUrl must not survive into the resolved URL.
+    expect(envVal(args, "ANTHROPIC_BASE_URL")).toBe("http://127.0.0.1:4010");
+  });
+
+  // Regression: the routing split must use the same Claude-alias set as the
+  // rest of the product (telegram-plugin/gateway/model-command.ts's
+  // isClaudeModel/MODEL_ALIASES), not a narrower hand-rolled list. A bare
+  // "opus"/"haiku"/"default" override is a legitimate thing an operator would
+  // type (it's what /model accepts everywhere else) — misrouting it to the
+  // model-mapped root would 404 against real Anthropic-shaped names.
+  it.each(["opus", "haiku", "default", "OPUS"])(
+    "treats the Claude alias %s as pass-through-eligible (case-insensitive)",
+    (alias) => {
+      startHindsight(
+        { apiPort: 8888, uiPort: 9999 },
+        { baseUrl: "http://127.0.0.1:4010", apiKey: "sk-test", model: alias },
+      );
+      const args = findRunArgs();
+      expect(envVal(args, "ANTHROPIC_MODEL")).toBe(alias);
+      expect(envVal(args, "ANTHROPIC_BASE_URL")).toBe("http://127.0.0.1:4010/anthropic");
+    },
+  );
 });
 
 describe("generateHindsightComposeSnippet — tmpfs ownership", () => {
