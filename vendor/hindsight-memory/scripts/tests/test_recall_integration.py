@@ -74,6 +74,7 @@ class _FakeClient:
         tags=None,
         tags_match=None,
         tag_groups=None,
+        prefer_observations=None,
         timeout=10,
     ):
         self.recall_calls.append(
