@@ -913,7 +913,11 @@ async function resolveLiteLLMForHindsight(
   if (!topLiteLLM?.enabled || !topLiteLLM.base_url) return undefined;
   const result = await getViaBrokerStructured("litellm/hindsight/api-key").catch(() => null);
   if (!result || result.kind !== "ok" || result.entry.kind !== "string") return undefined;
-  return { baseUrl: topLiteLLM.base_url, apiKey: result.entry.value };
+  return {
+    baseUrl: topLiteLLM.base_url,
+    apiKey: result.entry.value,
+    model: config.memory?.config?.llm_model,
+  };
 }
 
 async function stepMemoryBackend(

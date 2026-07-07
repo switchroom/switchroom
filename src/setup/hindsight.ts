@@ -139,6 +139,31 @@ export function hindsightImageRef(tag?: string): string {
 export const HINDSIGHT_DEFAULT_MODEL = "claude-sonnet-5";
 
 /**
+ * Default LiteLLM model for Hindsight's LLM ops when the `litellm` routing
+ * carve-out is enabled and no `memory.config.llm_model` override is set.
+ * OpenRouter (not Anthropic OAuth) so background memory-op cost (fact
+ * extraction, recall synthesis, consolidation) doesn't burn the Claude
+ * subscription quota (added 2026-07-07, per Ken). Must be a model_name
+ * registered in litellm's model_list, routed via the model-mapped path (see
+ * {@link isAnthropicPassthroughModel}), NOT the Anthropic pass-through.
+ */
+export const HINDSIGHT_DEFAULT_LITELLM_MODEL =
+  "openrouter/google/gemini-3.1-flash-lite";
+
+/**
+ * Whether `model` should ride LiteLLM's Anthropic pass-through
+ * (`<root>/anthropic`, raw byte-forward, OAuth-authenticated — see the
+ * 2026-07-05 opus-stall fix) rather than the model-mapped route
+ * (`<root>`, translates protocol/auth per model_name). Only real Anthropic
+ * model names/aliases are pass-through-eligible; anything else (OpenRouter,
+ * etc.) needs the model-mapped route since the pass-through only forwards to
+ * the real Anthropic API.
+ */
+function isAnthropicPassthroughModel(model: string): boolean {
+  return model.startsWith("claude-") || model === "sonnet" || model === "fable";
+}
+
+/**
  * Run hindsight's MCP server in stateless HTTP mode.
  *
  * Upstream defaults to stateful (`HINDSIGHT_API_MCP_STATELESS=false`):
@@ -549,6 +574,13 @@ export interface LiteLLMHindsightConfig {
   baseUrl: string;
   /** Per-service virtual key for spend attribution. */
   apiKey: string;
+  /**
+   * LiteLLM model_name for Hindsight's LLM ops. Defaults to
+   * {@link HINDSIGHT_DEFAULT_LITELLM_MODEL} when omitted. A `claude-*`
+   * model/alias rides the Anthropic OAuth pass-through; anything else rides
+   * the model-mapped route (see {@link isAnthropicPassthroughModel}).
+   */
+  model?: string;
 }
 
 /**
@@ -579,21 +611,32 @@ export function startHindsight(
   const apiPort = ports?.apiPort ?? HINDSIGHT_DEFAULT_API_PORT;
   const uiPort = ports?.uiPort ?? HINDSIGHT_DEFAULT_UI_PORT;
 
+  // Resolve the model BEFORE building envArgs: with litellm routing enabled
+  // the default shifts to a cheap OpenRouter model (HINDSIGHT_DEFAULT_LITELLM_MODEL)
+  // instead of Claude, unless the operator set memory.config.llm_model
+  // (threaded through as litellm.model). Direct-OAuth mode (no litellm, or
+  // fail-open) always stays on HINDSIGHT_DEFAULT_MODEL — no proxy exists to
+  // translate a non-Claude model name.
+  const resolvedModel = litellm
+    ? (litellm.model ?? HINDSIGHT_DEFAULT_LITELLM_MODEL)
+    : HINDSIGHT_DEFAULT_MODEL;
+
   // Non-secret env stays on `-e` — provider name + observation cap are
   // configuration, not secrets. Setting `HINDSIGHT_API_LLM_PROVIDER` to
   // `claude-code` selects the subscription-honest path; pinning
-  // `HINDSIGHT_API_LLM_MODEL` keeps memory ops on the same Claude model
-  // the agent fleet uses (see HINDSIGHT_DEFAULT_MODEL above). NOTE: for the
-  // `claude-code` provider, `HINDSIGHT_API_LLM_MODEL` does NOT control the
-  // embedded `claude` CLI — the CLI reads `ANTHROPIC_MODEL`, and without it
-  // falls back to its own default (opus), silently running every memory op
-  // (fact extraction, recall synthesis, consolidation) on the wrong model.
-  // So we ALSO set `ANTHROPIC_MODEL` — that's what actually pins the model.
+  // `HINDSIGHT_API_LLM_MODEL` keeps memory ops on the resolved model (see
+  // HINDSIGHT_DEFAULT_MODEL / HINDSIGHT_DEFAULT_LITELLM_MODEL above). NOTE:
+  // for the `claude-code` provider, `HINDSIGHT_API_LLM_MODEL` does NOT
+  // control the embedded `claude` CLI — the CLI reads `ANTHROPIC_MODEL`, and
+  // without it falls back to its own default (opus), silently running every
+  // memory op (fact extraction, recall synthesis, consolidation) on the
+  // wrong model. So we ALSO set `ANTHROPIC_MODEL` — that's what actually
+  // pins the model.
   const envArgs: string[] = [
     "-e", `HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE=${HINDSIGHT_DEFAULT_MAX_OBSERVATIONS_PER_SCOPE}`,
     "-e", "HINDSIGHT_API_LLM_PROVIDER=claude-code",
-    "-e", `HINDSIGHT_API_LLM_MODEL=${HINDSIGHT_DEFAULT_MODEL}`,
-    "-e", `ANTHROPIC_MODEL=${HINDSIGHT_DEFAULT_MODEL}`,
+    "-e", `HINDSIGHT_API_LLM_MODEL=${resolvedModel}`,
+    "-e", `ANTHROPIC_MODEL=${resolvedModel}`,
     "-e", `HINDSIGHT_API_MCP_STATELESS=${HINDSIGHT_DEFAULT_MCP_STATELESS}`,
     // Reranker smart-defaults (v0.13.22) — see constants above for
     // rationale. Each closes a vendor-default gap that hurts our
@@ -620,17 +663,23 @@ export function startHindsight(
     // 127.0.0.1:4010 (LiteLLM) is directly reachable, identical to how
     // agent containers work. Explicit port env vars preserve the same
     // external ports (18888/19999) the operator is used to.
+    const litellmRoot = litellm.baseUrl.replace(/\/+$/, "");
+    // Claude models ride the Anthropic pass-through (<root>/anthropic,
+    // raw byte-forward, OAuth) — the model-mapped route re-chunks the SSE
+    // stream and stalls long Claude responses mid-flight (the 2026-07-05
+    // stall). Any other model (e.g. OpenRouter) MUST use the model-mapped
+    // root instead — the pass-through only forwards to the real Anthropic
+    // API, so a non-Claude model_name there 404s / always fails open.
+    const anthropicBaseUrl = isAnthropicPassthroughModel(resolvedModel)
+      ? `${litellmRoot}/anthropic`
+      : litellmRoot;
     envArgs.push(
       // HINDSIGHT_API_PORT is the only port knob the upstream config.py
       // recognizes; the CP service has no equivalent env var override.
       "-e", `HINDSIGHT_API_PORT=${apiPort}`,
       // LiteLLM routing: inherited by the claude_agent_sdk subprocess so
-      // consolidation/reflect calls hit the proxy for spend tracking. Point
-      // at the Anthropic pass-through (<root>/anthropic), not the model-mapped
-      // route — the latter re-chunks the SSE stream and stalls long Claude
-      // responses mid-flight (the 2026-07-05 stall). hindsight only makes
-      // Claude calls, so it has no /model/info discovery to keep on the root.
-      "-e", `ANTHROPIC_BASE_URL=${litellm.baseUrl.replace(/\/+$/, "")}/anthropic`,
+      // consolidation/reflect calls hit the proxy for spend tracking.
+      "-e", `ANTHROPIC_BASE_URL=${anthropicBaseUrl}`,
       "-e", `ANTHROPIC_CUSTOM_HEADERS=x-litellm-api-key: Bearer ${litellm.apiKey}\nx-litellm-customer-id: hindsight\nx-litellm-tags: service:hindsight`,
     );
   }
