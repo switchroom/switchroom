@@ -70,10 +70,10 @@ Bot API 10.1 rich messages.
 | --- | --- | --- |
 | Bold | `**text**` | The one key fact, not decoration. |
 | Italic | `*text*` or `_text_` | Light emphasis, labels, asides. |
-| Underline | `__text__` | Bot API 10.1 GFM extension. Use sparingly — reads like a link. |
+| Underline | — (not supported) | **`__text__` renders as BOLD**, not underline — Telegram's rich-message markdown parser reads a `__…__` run identically to `**…**` (live-verified against the Bot API, 2026-07). There is no markdown token for underline on this path; don't rely on it. |
 | Strikethrough | `~~text~~` | Retractions, "was X now Y". |
-| Spoiler | `\|\|text\|\|` | Hidden until tapped — surprises, long-answer punchlines. |
-| Highlight / marked | `==text==` | The `=` is an `escapeMarkdown` special, so dynamic text won't trigger it by accident. |
+| Spoiler | `\|\|text\|\|` | Hidden until tapped — surprises, long-answer punchlines. Live-verified: surfaces as a `spoiler` entity on the wire (2026-07). |
+| Highlight / marked | `==text==` | Live-verified: surfaces as a `marked` entity on the wire (2026-07). The `=` is an `escapeMarkdown` special, so dynamic text won't trigger it by accident. |
 | Inline code | `` `text` `` | Identifiers, tap-to-copy. Content is literal — no escaping inside. |
 | Subscript | `~text~` (single tilde) | **Falls back to literal text** in rich messages (Bot API 10.1) — the only GFM construct that doesn't render. Avoid. |
 | Superscript | `^text^` | **Falls back to literal text** in rich messages — avoid (use words, e.g. "squared"). |
@@ -109,8 +109,10 @@ Bot API 10.1 rich messages.
 
 > Reach for the exotic spans (spoiler, highlight, math, custom emoji) only when they
 > genuinely serve the reader. The floor card's "why" applies: structure for the reader,
-> not the writer. Note sub/superscript is the one exception — it does NOT render (falls
-> back to literal text), so don't use it.
+> not the writer. Two constructs do NOT render as intended and should be avoided:
+> **sub/superscript** falls back to literal text, and **underline (`__text__`) renders
+> as bold** (Telegram's rich-message markdown has no underline token — live-verified).
+> Spoiler (`||…||`) and highlight (`==…==`) DO render correctly on this path.
 
 ### Escaping rules
 
