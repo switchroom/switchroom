@@ -215,6 +215,74 @@ describe("hindsight broker-fed mode (#1245)", () => {
     expect(snippet).toContain("ANTHROPIC_MODEL=openrouter/z-ai/glm-5.2");
   });
 
+  it("emits per-op LLM env vars (retain / reflect) alongside the global (#2925 follow-up)", () => {
+    startHindsight({ apiPort: 8888, uiPort: 9999 }, undefined, undefined, {
+      provider: "claude-code",
+      model: "openrouter/z-ai/glm-5.2",
+      retain: { model: "gpt-oss-20b" },
+      reflect: { model: "gpt-oss-120b", provider: "openrouter" },
+    });
+    const env = envPairsFromArgs(findRunArgs());
+    // Global still present (backward-compat) …
+    expect(env).toContain("HINDSIGHT_API_LLM_MODEL=openrouter/z-ai/glm-5.2");
+    // … and the per-op overrides ride on top.
+    expect(env).toContain("HINDSIGHT_API_RETAIN_LLM_MODEL=gpt-oss-20b");
+    expect(env).toContain("HINDSIGHT_API_REFLECT_LLM_MODEL=gpt-oss-120b");
+    expect(env).toContain("HINDSIGHT_API_REFLECT_LLM_PROVIDER=openrouter");
+  });
+
+  it("emits per-op provider/base_url/api_key passthrough only for the fields set", () => {
+    startHindsight({ apiPort: 8888, uiPort: 9999 }, undefined, undefined, {
+      model: "glm-5.2",
+      consolidation: {
+        model: "gpt-oss-120b",
+        provider: "openrouter",
+        base_url: "http://127.0.0.1:4010",
+        api_key: "sk-consol",
+      },
+    });
+    const env = envPairsFromArgs(findRunArgs());
+    expect(env).toContain("HINDSIGHT_API_CONSOLIDATION_LLM_MODEL=gpt-oss-120b");
+    expect(env).toContain("HINDSIGHT_API_CONSOLIDATION_LLM_PROVIDER=openrouter");
+    expect(env).toContain("HINDSIGHT_API_CONSOLIDATION_LLM_BASE_URL=http://127.0.0.1:4010");
+    expect(env).toContain("HINDSIGHT_API_CONSOLIDATION_LLM_API_KEY=sk-consol");
+  });
+
+  it("does NOT emit a per-op var for an op with no override (engine falls back to global)", () => {
+    startHindsight({ apiPort: 8888, uiPort: 9999 }, undefined, undefined, {
+      model: "glm-5.2",
+      retain: { model: "gpt-oss-20b" },
+      // reflect + consolidation absent → no per-op vars for them.
+    });
+    const env = envPairsFromArgs(findRunArgs());
+    expect(env).toContain("HINDSIGHT_API_RETAIN_LLM_MODEL=gpt-oss-20b");
+    expect(env.some((e) => e.startsWith("HINDSIGHT_API_REFLECT_LLM_MODEL="))).toBe(false);
+    expect(env.some((e) => e.startsWith("HINDSIGHT_API_CONSOLIDATION_LLM_MODEL="))).toBe(false);
+    // An empty per-op block emits nothing either.
+    expect(env.some((e) => e.startsWith("HINDSIGHT_API_RETAIN_LLM_PROVIDER="))).toBe(false);
+  });
+
+  it("flat single-model form emits NO per-op vars (backward compat)", () => {
+    startHindsight({ apiPort: 8888, uiPort: 9999 }, undefined, undefined, {
+      provider: "claude-code",
+      model: "openrouter/z-ai/glm-5.2",
+    });
+    const env = envPairsFromArgs(findRunArgs());
+    expect(env).toContain("HINDSIGHT_API_LLM_MODEL=openrouter/z-ai/glm-5.2");
+    expect(env.some((e) => /^HINDSIGHT_API_(RETAIN|REFLECT|CONSOLIDATION)_LLM_MODEL=/.test(e))).toBe(false);
+  });
+
+  it("compose snippet emits per-op LLM env vars too", async () => {
+    const { generateHindsightComposeSnippet } = await import("../../src/setup/hindsight.js");
+    const snippet = generateHindsightComposeSnippet({
+      model: "glm-5.2",
+      retain: { model: "gpt-oss-20b" },
+      reflect: { model: "gpt-oss-120b" },
+    });
+    expect(snippet).toContain("HINDSIGHT_API_RETAIN_LLM_MODEL=gpt-oss-20b");
+    expect(snippet).toContain("HINDSIGHT_API_REFLECT_LLM_MODEL=gpt-oss-120b");
+  });
+
   it("pins HINDSIGHT_CP_DATAPLANE_API_URL at the API port in host-network (litellm) mode, not squatted 8888", () => {
     startHindsight({ apiPort: 18888, uiPort: 19999 }, {
       baseUrl: "http://127.0.0.1:4010",

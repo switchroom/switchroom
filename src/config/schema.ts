@@ -1711,6 +1711,47 @@ export const LiteLLMConfigSchema = z
  * container also inherits `ANTHROPIC_MODEL=<model>` so the underlying claude
  * subprocess (and any LiteLLM proxy it routes through) targets the same model.
  */
+const HindsightPerOpLlmSchema = z
+  .object({
+    model: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        "Per-op model (upstream `HINDSIGHT_API_<OP>_LLM_MODEL`). Absent → " +
+        "inherit the global `hindsight.llm.model`.",
+      ),
+    provider: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        "Per-op provider (upstream `HINDSIGHT_API_<OP>_LLM_PROVIDER`). " +
+        "Absent → inherit the global `hindsight.llm.provider`.",
+      ),
+    base_url: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        "Per-op base URL (upstream `HINDSIGHT_API_<OP>_LLM_BASE_URL`). " +
+        "Optional passthrough; absent → inherit the global.",
+      ),
+    api_key: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        "Per-op API key (upstream `HINDSIGHT_API_<OP>_LLM_API_KEY`). Literal " +
+        "or `vault:` reference. Optional passthrough; absent → inherit global.",
+      ),
+  })
+  .describe(
+    "Per-operation LLM override. Every field optional; an unset field (or " +
+    "an omitted op block) inherits the global `hindsight.llm.*`, which is " +
+    "already the engine's fallback — switchroom emits only the vars set.",
+  );
+
 export const HindsightConfigSchema = z.object({
   llm: z
     .object({
@@ -1721,7 +1762,8 @@ export const HindsightConfigSchema = z.object({
         .describe(
           "Hindsight LLM provider (upstream `HINDSIGHT_API_LLM_PROVIDER`). " +
           "Defaults to `claude-code` (subscription-honest, broker-fed OAuth). " +
-          "Any litellm-routable provider the upstream image supports is valid.",
+          "Any litellm-routable provider the upstream image supports is valid. " +
+          "Serves as the GLOBAL default for every op absent a per-op override.",
         ),
       model: z
         .string()
@@ -1732,13 +1774,28 @@ export const HindsightConfigSchema = z.object({
           "to HINDSIGHT_DEFAULT_MODEL. Any model your LiteLLM proxy can route " +
           "is valid, e.g. `openrouter/z-ai/glm-5.2` when routing through the " +
           "fleet proxy. With provider=claude-code this value is ALSO exported " +
-          "as `ANTHROPIC_MODEL` to the claude subprocess.",
+          "as `ANTHROPIC_MODEL` to the claude subprocess. Serves as the GLOBAL " +
+          "default for every op absent a per-op override.",
         ),
+      retain: HindsightPerOpLlmSchema.optional().describe(
+        "Per-op override for the `retain` LLM op (memory ingestion). Emits " +
+        "`HINDSIGHT_API_RETAIN_LLM_*`. Absent → uses the global model/provider.",
+      ),
+      reflect: HindsightPerOpLlmSchema.optional().describe(
+        "Per-op override for the `reflect` LLM op (synthesis / mental-model " +
+        "refresh). Emits `HINDSIGHT_API_REFLECT_LLM_*`. Absent → uses global.",
+      ),
+      consolidation: HindsightPerOpLlmSchema.optional().describe(
+        "Per-op override for the `consolidation` LLM op (background memory " +
+        "merge). Emits `HINDSIGHT_API_CONSOLIDATION_LLM_*`. Absent → global.",
+      ),
     })
     .optional()
     .describe(
-      "LLM knob for the hindsight container. Both fields optional; unset " +
-      "fields fall back to the hard-coded defaults.",
+      "LLM knob for the hindsight container. The flat `provider`/`model` set " +
+      "the global default (backward-compatible); optional `retain`/`reflect`/" +
+      "`consolidation` blocks override individual ops. All fields optional; " +
+      "unset fields fall back to the hard-coded defaults.",
     ),
 });
 

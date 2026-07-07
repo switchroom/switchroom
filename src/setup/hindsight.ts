@@ -587,6 +587,65 @@ export interface HindsightLlmConfig {
   provider?: string;
   /** `HINDSIGHT_API_LLM_MODEL`. Default {@link HINDSIGHT_DEFAULT_MODEL}. */
   model?: string;
+  /** Per-op override for the `retain` LLM op. Falls back to the global. */
+  retain?: HindsightPerOpLlmConfig;
+  /** Per-op override for the `reflect` LLM op. Falls back to the global. */
+  reflect?: HindsightPerOpLlmConfig;
+  /** Per-op override for the `consolidation` LLM op. Falls back to the global. */
+  consolidation?: HindsightPerOpLlmConfig;
+}
+
+/**
+ * Per-operation LLM override (retain / reflect / consolidation). The engine
+ * reads `HINDSIGHT_API_<OP>_LLM_MODEL` (+ `_PROVIDER` / `_BASE_URL` /
+ * `_API_KEY` siblings) and, for any field NOT set, falls back to the global
+ * `HINDSIGHT_API_LLM_*`. So switchroom only emits the vars an operator
+ * actually configured — an absent field means "inherit the global", which is
+ * already the engine's behaviour. All fields optional.
+ */
+export interface HindsightPerOpLlmConfig {
+  /** `HINDSIGHT_API_<OP>_LLM_MODEL`. */
+  model?: string;
+  /** `HINDSIGHT_API_<OP>_LLM_PROVIDER`. */
+  provider?: string;
+  /** `HINDSIGHT_API_<OP>_LLM_BASE_URL`. snake_case to match the zod config shape. */
+  base_url?: string;
+  /** `HINDSIGHT_API_<OP>_LLM_API_KEY`. snake_case to match the zod config shape. */
+  api_key?: string;
+}
+
+/** The three LLM ops that support a per-op model override. */
+const HINDSIGHT_LLM_OPS = ["retain", "reflect", "consolidation"] as const;
+type HindsightLlmOp = (typeof HINDSIGHT_LLM_OPS)[number];
+
+/**
+ * Resolve the per-op LLM env vars from an optional operator override. Returns
+ * a flat `[key, value]` list — ONLY the vars an operator actually set, so an
+ * unconfigured op (or unset field) emits nothing and the engine transparently
+ * falls back to the global `HINDSIGHT_API_LLM_*`. Never emits empty values.
+ *
+ * Shared by the `docker run` path ({@link startHindsight}) and the compose-gen
+ * path ({@link generateHindsightComposeSnippet}) so they never drift.
+ */
+export function resolveHindsightPerOpLlm(
+  llm?: HindsightLlmConfig,
+): Array<[string, string]> {
+  const out: Array<[string, string]> = [];
+  if (!llm) return out;
+  for (const op of HINDSIGHT_LLM_OPS) {
+    const cfg = llm[op as HindsightLlmOp] as HindsightPerOpLlmConfig | undefined;
+    if (!cfg) continue;
+    const prefix = `HINDSIGHT_API_${op.toUpperCase()}_LLM`;
+    const model = cfg.model?.trim();
+    const provider = cfg.provider?.trim();
+    const baseUrl = cfg.base_url?.trim();
+    const apiKey = cfg.api_key?.trim();
+    if (model) out.push([`${prefix}_MODEL`, model]);
+    if (provider) out.push([`${prefix}_PROVIDER`, provider]);
+    if (baseUrl) out.push([`${prefix}_BASE_URL`, baseUrl]);
+    if (apiKey) out.push([`${prefix}_API_KEY`, apiKey]);
+  }
+  return out;
 }
 
 /**
@@ -649,6 +708,11 @@ export function startHindsight(
   // resolveHindsightLlm — since the proxy can translate a non-Claude name.
   const { provider: llmProvider, model: llmModel } = resolveHindsightLlm(llm, litellm);
 
+  // Per-op LLM overrides (retain / reflect / consolidation). Only the vars an
+  // operator actually configured are emitted; an unset op inherits the global
+  // HINDSIGHT_API_LLM_* in the engine, so we emit nothing for it.
+  const perOpLlm = resolveHindsightPerOpLlm(llm);
+
   // Non-secret env stays on `-e` — provider name + observation cap are
   // configuration, not secrets. `HINDSIGHT_API_LLM_PROVIDER=claude-code`
   // selects the subscription-honest path; `HINDSIGHT_API_LLM_MODEL` pins the
@@ -658,6 +722,8 @@ export function startHindsight(
     "-e", `HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE=${HINDSIGHT_DEFAULT_MAX_OBSERVATIONS_PER_SCOPE}`,
     "-e", `HINDSIGHT_API_LLM_PROVIDER=${llmProvider}`,
     "-e", `HINDSIGHT_API_LLM_MODEL=${llmModel}`,
+    // Per-op LLM overrides (only the configured vars — see resolveHindsightPerOpLlm).
+    ...perOpLlm.flatMap(([k, v]) => ["-e", `${k}=${v}`]),
     "-e", `HINDSIGHT_API_MCP_STATELESS=${HINDSIGHT_DEFAULT_MCP_STATELESS}`,
     // Reranker smart-defaults (v0.13.22) — see constants above for
     // rationale. Each closes a vendor-default gap that hurts our
@@ -946,10 +1012,13 @@ export function getHindsightMcpUrl(): {
  */
 export function generateHindsightComposeSnippet(llm?: HindsightLlmConfig): string {
   const { provider: llmProvider, model: llmModel } = resolveHindsightLlm(llm);
+  const perOpLlm = resolveHindsightPerOpLlm(llm);
   const environment = [
     `      - HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE=${HINDSIGHT_DEFAULT_MAX_OBSERVATIONS_PER_SCOPE}`,
     `      - HINDSIGHT_API_LLM_PROVIDER=${llmProvider}`,
     `      - HINDSIGHT_API_LLM_MODEL=${llmModel}`,
+    // Per-op LLM overrides (only the configured vars — see resolveHindsightPerOpLlm).
+    ...perOpLlm.map(([k, v]) => `      - ${k}=${v}`),
     // Mirror of the docker-run path: with the claude-code provider, pin
     // ANTHROPIC_MODEL to the same model for the underlying claude subprocess.
     ...(llmProvider === "claude-code" ? [`      - ANTHROPIC_MODEL=${llmModel}`] : []),
