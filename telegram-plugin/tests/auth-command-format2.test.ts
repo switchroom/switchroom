@@ -94,7 +94,7 @@ describe('renderShowText — Format 2 vs legacy', () => {
     expect(out).toContain('🔋 **Auth — fleet status**');
     expect(out).toContain('Recommendation:');
     // GFM table card (#2700): State emoji per row, not group headers.
-    expect(out).toContain('| State | Account | 5h | 7d | Status |');
+    expect(out).toContain('| State | Account | 5h | 5h resets | 7d | 7d resets |');
     expect(out).toContain('| 🔴 |'); // the blocked account's State cell
     expect(out).toContain('| 🟢 |'); // a healthy account's State cell
     expect(out).not.toContain('**BLOCKED**');

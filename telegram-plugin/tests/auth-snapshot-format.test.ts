@@ -262,11 +262,13 @@ describe('renderAuthSnapshotFormat2', () => {
     return rows;
   }
 
-  it('renders a GFM table with the State/Account/5h/7d/Status header', () => {
+  it('renders a GFM table with the State/Account/5h/5h resets/7d/7d resets header', () => {
     const out = renderAuthSnapshotFormat2(fixtureSnaps, { now: NOW, tz: 'UTC' });
     expect(out).toContain('🔋 **Auth — fleet status**');
-    expect(out).toContain('| State | Account | 5h | 7d | Status |');
-    expect(out).toContain('| --- | --- | --- | --- | --- |');
+    expect(out).toContain('| State | Account | 5h | 5h resets | 7d | 7d resets |');
+    expect(out).toContain('| --- | --- | --- | --- | --- | --- |');
+    // The single collapsed Status column is gone.
+    expect(out).not.toContain('| 7d | Status |');
     // No legacy group headers / health-section titles remain.
     expect(out).not.toContain('**BLOCKED**');
     expect(out).not.toContain('**HEALTHY**');
@@ -307,16 +309,22 @@ describe('renderAuthSnapshotFormat2', () => {
     expect(bob).toBeLessThan(alice);
   });
 
-  it('Status column shows "back <when>" for a blocked account', () => {
+  it('reset columns show a "<time> (in ...)" cell for a blocked account (7d binding window)', () => {
     const rows = tableRows(renderAuthSnapshotFormat2(fixtureSnaps, { now: NOW, tz: 'UTC' }));
     const bob = rows.find((r) => r[1].includes('bob@example.com'))!;
-    expect(bob[4]).toMatch(/^back .* \(in .+\)$/);
+    // bob is 7d-maxed; its 7d reset (2026-05-17T10:00Z) is ~2 days out and still
+    // renders in its own reset cell — no "back" prefix in the new per-window shape.
+    expect(bob[5]).toMatch(/^.* \(in .+\)$/);
+    expect(bob[5]).not.toContain('back');
   });
 
-  it('Status column shows "refills <when>" for a healthy account', () => {
+  it('reset columns show a "<time> (in ...)" cell for each window of a healthy account', () => {
     const rows = tableRows(renderAuthSnapshotFormat2(fixtureSnaps, { now: NOW, tz: 'UTC' }));
     const you = rows.find((r) => r[1].includes('you@example.com'))!;
-    expect(you[4]).toMatch(/^refills .* \(in .+\)$/);
+    // 5h resets cell [3] and 7d resets cell [5] both carry a relative hint.
+    expect(you[3]).toMatch(/^.* \(in .+\)$/);
+    expect(you[5]).toMatch(/^.* \(in .+\)$/);
+    expect(you[3]).not.toContain('refills');
   });
 
   it('NEVER displays a percentage over 100% even on an over-cap account', () => {
@@ -330,13 +338,15 @@ describe('renderAuthSnapshotFormat2', () => {
     ];
     const rows = tableRows(renderAuthSnapshotFormat2(overSnaps, { now: NOW, tz: 'UTC' }));
     expect(rows[0][2]).toBe('100%'); // 5h
-    expect(rows[0][3]).toBe('100%'); // 7d
-    // And the blocked state still surfaces via the emoji (🔴) + Status.
+    expect(rows[0][4]).toBe('100%'); // 7d
+    // And the blocked state still surfaces via the emoji (🔴). No resets known
+    // (fixture has no reset timestamps) → both reset cells degrade to "—".
     expect(rows[0][0]).toBe('🔴');
-    expect(rows[0][4]).toMatch(/^back/);
+    expect(rows[0][3]).toBe('—'); // 5h resets
+    expect(rows[0][5]).toBe('—'); // 7d resets
   });
 
-  it('renders dates in the Status column only when NOT today (user tz)', () => {
+  it('renders dates in the reset columns only when NOT today (user tz)', () => {
     // now = Fri 3:00 PM Melbourne. A reset later the SAME Melbourne day shows
     // time-only; a reset on the next day shows the weekday.
     const MEL = 'Australia/Melbourne';
@@ -349,8 +359,9 @@ describe('renderAuthSnapshotFormat2', () => {
       }) }),
     ];
     const todayRows = tableRows(renderAuthSnapshotFormat2(sameDay, { now: NOW_MEL, tz: MEL }));
-    expect(todayRows[0][4]).toContain('9:00 PM');
-    expect(todayRows[0][4]).not.toMatch(/Mon|Tue|Wed|Thu|Fri|Sat|Sun/);
+    // 5h resets cell [3] — same Melbourne day → time only.
+    expect(todayRows[0][3]).toContain('9:00 PM');
+    expect(todayRows[0][3]).not.toMatch(/Mon|Tue|Wed|Thu|Fri|Sat|Sun/);
 
     const nextDay = [
       snap({ label: 'tomorrow@example.com', isActive: true, quota: quota({
@@ -360,7 +371,8 @@ describe('renderAuthSnapshotFormat2', () => {
       }) }),
     ];
     const tomorrowRows = tableRows(renderAuthSnapshotFormat2(nextDay, { now: NOW_MEL, tz: MEL }));
-    expect(tomorrowRows[0][4]).toContain('Sat 1:00 AM');
+    // 5h resets cell [3] — next Melbourne day → weekday prefix.
+    expect(tomorrowRows[0][3]).toContain('Sat 1:00 AM');
   });
 
   it('emits a recommendation footer that names a healthy alternative when active is throttling', () => {
@@ -1120,14 +1132,16 @@ describe('#2494 — renderAuthSnapshotFormat2 row rendering (out_of_credits demo
     expect(allText).toContain('Switch fleet → carol@example.com');
   });
 
-  it('quota-exhausted row shows a 🔴 + "back <when>" Status, not "billing disabled"', () => {
+  it('quota-exhausted row shows a 🔴 + its 5h reset time in the reset cell, not "billing disabled"', () => {
     const futureReset = new Date(NOW.getTime() + 45 * 60_000);
     const out = renderAuthSnapshotFormat2(
       [snap({ label: 'ex@x', isActive: true, quota: quota({ fiveHourUtilizationPct: 100, fiveHourResetAt: futureReset }) })],
       { now: NOW },
     );
     expect(out).toContain('| 🔴 |');
-    expect(out).toMatch(/back .* \(in 45m\)/);
+    // The 5h reset (45m out) renders in its own reset cell — no "back" prefix.
+    expect(out).toMatch(/\(in 45m\)/);
+    expect(out).not.toContain('back ');
     expect(out).not.toContain('billing disabled');
     expect(out).not.toContain('overage off');
   });
