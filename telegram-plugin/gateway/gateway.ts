@@ -430,7 +430,7 @@ import { shouldSuppressRepresent } from './represent-guard.js'
 import { shouldDeferEscalationForBridge } from './escalation-bridge-gate.js'
 import { createInboundSpool } from './inbound-spool.js'
 import { purgeStaleTurnsForChat } from './turn-state-purge.js'
-import { decideInboundDelivery } from './inbound-delivery-gate.js'
+import { decideInboundDelivery, reserveInboundDelivery } from './inbound-delivery-gate.js'
 import { mayDrainBufferedInbound, shouldArmNoReplyDrain } from './serialize-drain-gate.js'
 import { decideFeedReopen } from './feed-reopen-gate.js'
 import {
@@ -1953,6 +1953,25 @@ const obligationEscalateInFlight = new Set<string>()
 // drain on the bare turn-end signal.
 const SERIALIZE_UNTIL_REPLIED_ENABLED =
   process.env.SWITCHROOM_SERIALIZE_UNTIL_REPLIED !== '0'
+// #2917 — rapid-fire per-chat FIFO. The #1556 delivery gate documents its
+// `turnInFlight` input as a LIVE read ("evaluated at delivery time — not a
+// receipt-time snapshot"), but handleInbound passes a receipt-time snapshot
+// (`turnInFlightAtReceipt`) taken at function entry. Under rapid-fire two
+// same-chat inbounds each snapshot "idle" during the other's async lead-in
+// (attachment download, composer-clear), both pass the gate, and both are
+// delivered — so replies come back reordered (observed 1,2,4,5,3,7,8,6). The
+// fix reads the gate LIVE off `claudeBusyKeys` (which does NOT yet contain
+// THIS inbound's own key — that is only marked at delivery — so it can't
+// self-block) AND reserves the key synchronously BEFORE the composer-clear
+// await, so a concurrent same-chat inbound observes the reservation and
+// buffers behind it, preserving FIFO. Nothing is dropped: a buffered inbound
+// drains on turn-complete / idle exactly as before. Kill switch (=0) restores
+// the receipt-snapshot behaviour. Only the non-cutover path is affected — the
+// delivery-machine cutover keeps its own at-receipt machine snapshot (reading
+// the machine live WOULD self-block, since its inbound event already advanced
+// it for this key).
+const SERIALIZE_INBOUND_DELIVERY_ENABLED =
+  process.env.SWITCHROOM_SERIALIZE_INBOUND_DELIVERY !== '0'
 // Component 2 (bounded no-reply escape hatch). A turn that legitimately
 // ends with NO reply (handback ack, NO_REPLY marker, silent-end) sets
 // finalAnswerDelivered=false and would block the serialize gate forever.
@@ -16694,21 +16713,32 @@ async function handleInbound(
     effectiveText,
   })
 
-  if (
-    decideInboundDelivery({
-      turnInFlight: turnInFlightAtReceipt,
-      isSteering,
-      // Interrupt-marker carve-out (2026-05-24): the `!`-prefixed body
-      // must bypass the "buffer-until-turn-complete" gate because the
-      // SIGINT'd turn often doesn't emit turn_complete, leaving the
-      // body stranded in pendingInboundBuffer indefinitely. The
-      // `interrupt` const is computed at the start of handleInbound
-      // (line ~7606) and remains in scope here. When the user fires
-      // `!`-with-body, this delivers the body as a fresh inbound to
-      // the freshly-killed bridge.
-      isInterrupt: interrupt.isInterrupt,
-    }) === 'buffer-until-idle'
-  ) {
+  // #2917: read the gate LIVE (not the receipt snapshot) on the default path
+  // so a sibling same-chat inbound delivered during THIS handler's async
+  // lead-in is observed here. Reading `claudeBusyKeys` live is self-block-safe:
+  // THIS inbound's own key is only added at delivery (below), never by the
+  // fresh-turn init bundle — so the live read never sees its own key. The
+  // delivery-machine cutover keeps its at-receipt machine snapshot (a live
+  // machine read WOULD self-block, since the inbound event already advanced
+  // the machine for this key). Kill switch (=0) restores the pure snapshot.
+  const gateTurnInFlight =
+    SERIALIZE_INBOUND_DELIVERY_ENABLED && machineInTurnAtReceipt == null
+      ? claudeBusyKeys.size > 0
+      : turnInFlightAtReceipt
+  const deliveryGate = reserveInboundDelivery({
+    turnInFlight: gateTurnInFlight,
+    isSteering,
+    // Interrupt-marker carve-out (2026-05-24): the `!`-prefixed body
+    // must bypass the "buffer-until-turn-complete" gate because the
+    // SIGINT'd turn often doesn't emit turn_complete, leaving the
+    // body stranded in pendingInboundBuffer indefinitely. The
+    // `interrupt` const is computed at the start of handleInbound
+    // (line ~7606) and remains in scope here. When the user fires
+    // `!`-with-body, this delivers the body as a fresh inbound to
+    // the freshly-killed bridge.
+    isInterrupt: interrupt.isInterrupt,
+  })
+  if (deliveryGate.decision === 'buffer-until-idle') {
     pendingInboundBuffer.push(selfAgent, inboundMsg)
     process.stderr.write(
       `telegram gateway: inbound held mid-turn agent=${selfAgent} ` +
@@ -16730,6 +16760,18 @@ async function handleInbound(
       postQueuedStatus(chat_id, messageThreadId, inFlightThread)
     }
     return
+  }
+
+  // #2917: reserve the chat's busy key SYNCHRONOUSLY here — before the
+  // composer-clear await below — so a concurrent same-chat inbound reaching
+  // the LIVE gate above observes this in-flight delivery and buffers behind it
+  // (per-chat FIFO). Without this, both handlers pass the gate during each
+  // other's async lead-in and race to the bridge, reordering the replies.
+  // Only fresh-turn deliveries reserve (steering/interrupt amend a running
+  // turn and must not). Released below if the send misses (bridge offline).
+  let reservedBusyKey: string | null = null
+  if (deliveryGate.reserve && SERIALIZE_INBOUND_DELIVERY_ENABLED && machineInTurnAtReceipt == null) {
+    reservedBusyKey = markClaudeBusyForInbound(inboundMsg)
   }
 
   // Pre-send composer clear (the marko wedge). The inbound is about to be
@@ -16761,7 +16803,10 @@ async function handleInbound(
 
   const delivered = ipcServer.sendToAgent(selfAgent, inboundMsg)
   if (delivered) {
-    const busyKey = markClaudeBusyForInbound(inboundMsg)
+    // Reuse the key reserved synchronously above (#2917) when present, else
+    // mark now — markClaudeBusyForInbound is idempotent (lockstep re-stamp),
+    // so a re-mark is safe and returns the same chat key.
+    const busyKey = reservedBusyKey ?? markClaudeBusyForInbound(inboundMsg)
     // Track until claude acks via `enqueue` (the marko drop-wedge): if no ack
     // lands, the message stranded in the composer and the sweep re-delivers
     // it. Track ONLY messages that produce an `enqueue` to ack against —
@@ -16783,6 +16828,15 @@ async function handleInbound(
     }
   }
   if (!delivered) {
+    // #2917: the synchronous reservation assumed delivery; the send missed
+    // (bridge offline), so release it in lockstep — otherwise the orphaned
+    // busy key would gate every subsequent inbound into the buffer until the
+    // orphan reaper clears it. The message itself is buffered below, so FIFO
+    // is still preserved (it drains in order on the next bridge register).
+    if (reservedBusyKey != null) {
+      claudeBusyKeys.delete(reservedBusyKey)
+      claudeBusyKeySince.delete(reservedBusyKey)
+    }
     // Only persist fresh user turns to the durable spool. Steering / `!`
     // interrupt / empty bodies are mid-turn amendments or no-ops that would
     // arrive orphaned if replayed as a fresh turn after a restart — drop them

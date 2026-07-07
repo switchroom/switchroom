@@ -116,3 +116,29 @@ export function decideInboundDelivery(
   if (input.turnInFlight) return 'buffer-until-idle'
   return 'deliver'
 }
+
+/**
+ * #2917 — atomic check-and-reserve for per-chat outbound FIFO.
+ *
+ * `decideInboundDelivery` decides deliver-vs-buffer, but on the concurrent
+ * `handleInbound` path that decision and the busy-mark that records "a turn is
+ * now in flight for this chat" are separated by an `await` (attachment
+ * download, composer-clear). Two same-chat inbounds can therefore each read
+ * "idle" during the other's async lead-in and both deliver — the replies then
+ * come back reordered. This helper couples the decision with a `reserve` flag:
+ * a FRESH-TURN deliver must reserve the chat's busy key SYNCHRONOUSLY (before
+ * any await) so the next same-chat inbound sees it and buffers behind it.
+ *
+ * `reserve` is true ONLY for a fresh-turn deliver. Steering / interrupt
+ * inbounds deliver mid-turn WITHOUT starting a turn, so they must not reserve
+ * (reserving would wedge the running turn's key). A buffered decision never
+ * reserves.
+ */
+export function reserveInboundDelivery(
+  input: InboundDeliveryGateInput,
+): { decision: InboundDeliveryDecision; reserve: boolean } {
+  const decision = decideInboundDelivery(input)
+  const reserve =
+    decision === 'deliver' && !input.isSteering && input.isInterrupt !== true
+  return { decision, reserve }
+}
