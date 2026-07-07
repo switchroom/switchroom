@@ -56,8 +56,19 @@
 import { describe, it, expect } from "vitest";
 import { spinUp } from "../harness.js";
 import type { ObservedMessage } from "../driver.js";
+import { richRenderEnabled } from "../../render/rich-render.js";
 
 const AGENT = "test-harness";
+
+// The rich-render wiring (parse -> IR -> renderSafe -> sendRichMessage) is
+// gated behind `SWITCHROOM_RICH_RENDER` (default OFF). The expandable /
+// collapsible round-trip proof below only runs when BOTH the driver creds AND
+// the flag are present — the flag must be set in the gateway process under
+// test for the renderer to actually shape the outbound message, so gating the
+// scenario on the same flag keeps it honest (no false green when the wiring
+// isn't live). When the flag is off, this scenario self-skips green exactly
+// like the credential-less case.
+const RICH_RENDER_ON = richRenderEnabled();
 
 // The driver session is the load-bearing credential. Absent it, spinUp()
 // throws in resolveConfig — so guard at describe level and self-skip green.
@@ -242,6 +253,82 @@ function kindsPresent(msg: ObservedMessage): Set<string> {
                   ...(e.url ? { url: e.url } : {}),
                   ...(e.language ? { language: e.language } : {}),
                 })),
+              ),
+          );
+        } finally {
+          await sc.tearDown();
+        }
+      },
+      120_000,
+    );
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Rich-render wiring proof — expandable / collapsible content round-trip.
+//
+// This is the piece the unit suite CANNOT prove: that a REAL markdown reply
+// carrying the Bot API 10.1 expandable-blockquote marker (`**> `) flows
+// through the live send path — parse.ts (marker -> IR `expandable: true`) ->
+// render.ts (IR -> `**> ` markdown) -> renderSafe -> sendRichMessage — and
+// that Telegram actually parses it back to a blockquote entity on the wire.
+//
+// Runs ONLY when the rich-render flag is on in this process (see
+// RICH_RENDER_ON) AND the driver creds are present; self-skips green
+// otherwise, so default CI (flag off) never reds on it.
+// ---------------------------------------------------------------------------
+
+const EXP_MARKER = "COLLAPSE9";
+const EXPANDABLE_SAMPLE = [
+  `Reply with EXACTLY this and NOTHING else, keeping ${EXP_MARKER} verbatim:`,
+  "",
+  `${EXP_MARKER}: here is a collapsible section.`,
+  "",
+  "**> first hidden line of the expandable quote",
+  "> second hidden line",
+  "> third hidden line",
+].join("\n");
+
+(HAS_DRIVER_CREDS && RICH_RENDER_ON ? describe : describe.skip)(
+  "uat: expandable/collapsible content round-trips through the live renderer",
+  () => {
+    it(
+      "a `**>` reply parses -> renders -> sends -> decodes as a blockquote entity",
+      async () => {
+        const sc = await spinUp({ agent: AGENT });
+        try {
+          await sc.sendDM(EXPANDABLE_SAMPLE);
+
+          const reply = await sc.expectMessage(
+            (m: ObservedMessage) =>
+              m.text.includes(EXP_MARKER) || m.text === "\x01",
+            { from: "bot", timeout: 90_000 },
+          );
+
+          // Decode regression gate (same as the primary scenario).
+          expect(
+            reply.text,
+            "expandable reply decoded as the \\x01 unsupported-media sentinel",
+          ).not.toBe("\x01");
+          expect(reply.text).toContain(EXP_MARKER);
+
+          // The collapsible construct must survive as a real blockquote entity
+          // on the wire — proof the parse->render->send path produced valid
+          // Bot API 10.1 markdown, not stray `**>` literal text.
+          const present = kindsPresent(reply);
+          expect(
+            [...present],
+            `expandable quote did not decode as a blockquote entity ` +
+              `(present kinds: ${[...present].join(", ")})`,
+          ).toContain("blockquote");
+
+          // The quoted body text must round-trip (content never lost).
+          expect(reply.text).toContain("first hidden line");
+
+          console.info(
+            "[uat] expandable round-trip entity structure: " +
+              JSON.stringify(
+                reply.entities.map((e) => ({ kind: e.kind, text: e.text })),
               ),
           );
         } finally {

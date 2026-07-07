@@ -252,3 +252,59 @@ describe("parse: astral-plane emoji offsets are UTF-16 units", () => {
     expect(md.slice(bold.start, bold.end)).not.toBe("*go**");
   });
 });
+
+describe("expandable blockquote (Bot API 10.1 `**>` marker)", () => {
+  it("parses a single-line `**>` quote into an expandable blockquote", () => {
+    const md = "**> a collapsible line";
+    const doc = parse(md);
+    const bq = doc.blocks[0] as any;
+    expect(bq.type).toBe("blockquote");
+    expect(bq.expandable).toBe(true);
+  });
+
+  it("marks a multi-line quote expandable when the FIRST line carries `**>`", () => {
+    const md = "**> line one\n> line two\n> line three";
+    const doc = parse(md);
+    const bq = doc.blocks[0] as any;
+    expect(bq.type).toBe("blockquote");
+    expect(bq.expandable).toBe(true);
+    // All three quoted lines fold into ONE blockquote.
+    expect(bq.children.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("leaves a plain `>` quote non-expandable", () => {
+    const doc = parse("> just an ordinary quote");
+    const bq = doc.blocks[0] as any;
+    expect(bq.type).toBe("blockquote");
+    expect(bq.expandable).toBe(false);
+  });
+
+  it("keeps content offsets byte-identical to the ORIGINAL source", () => {
+    const md = "**> quoted body here";
+    const doc = parse(md);
+    const bq = doc.blocks[0] as any;
+    // The marker rewrite (`**>` -> `  >`) is length-preserving, so the inner
+    // text still slices out of the ORIGINAL markdown exactly.
+    const plain = bq.children[0].children[0];
+    expect(md.slice(plain.start, plain.end)).toBe("quoted body here");
+    assertOffsetsRoundTrip(bq, md);
+  });
+
+  it("only recognises the marker at column 0 (leading indent is not expandable)", () => {
+    // The renderer only ever emits `**>` at column 0; a leading-indented
+    // variant is deliberately NOT treated as an expandable quote (matching it
+    // would push the length-preserving rewrite past the 3-space blockquote
+    // budget into indented-code-block territory).
+    const md = "   **> indented";
+    const doc = parse(md);
+    const bq = doc.blocks[0] as any;
+    expect(bq.expandable).not.toBe(true);
+  });
+
+  it("does not treat inline `**` bold followed by `>` mid-line as expandable", () => {
+    // `**bold** > text` is a paragraph, not a quote — the marker must be at
+    // line start.
+    const doc = parse("**bold** > not a quote");
+    expect(doc.blocks[0].type).toBe("paragraph");
+  });
+});

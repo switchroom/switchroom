@@ -24,10 +24,19 @@
 //   `plain`/`emphasis` text like any other characters.
 //
 // Blockquote expandable handling:
-//   The IR carries `expandable: boolean` for Telegram's `<blockquote
-//   expandable>`. GFM blockquotes have no expandable marker, so Increment 1
-//   always sets `expandable = false`. TODO(next increment): recognise the
-//   `‖…‖` / expandable source convention and set the flag.
+//   The IR carries `expandable: boolean` for Telegram's expandable blockquote
+//   (Bot API 10.1). GFM has no expandable marker; the switchroom render path
+//   emits `**> ` on the FIRST line of an expandable quote (`render.ts` /
+//   `reference/telegram-formatting-guide.md`). micromark does NOT understand
+//   `**> ` as a blockquote — the leading `**` makes the line a paragraph with
+//   an unclosed strong-emphasis run — so this module pre-transforms each
+//   `**>` marker into a plain `  >` marker of IDENTICAL length (`**` → two
+//   spaces) before handing the text to mdast. Length preservation keeps every
+//   UTF-16 source offset (and therefore the never-lose-text round-trip
+//   invariant against the ORIGINAL source) exactly intact — only the two
+//   marker characters differ, and they are never part of quoted content. The
+//   set of line-start offsets that carried the marker is threaded into
+//   `foldBlock` so the matching blockquote nodes get `expandable: true`.
 
 import { fromMarkdown } from "mdast-util-from-markdown";
 import { gfm } from "micromark-extension-gfm";
@@ -65,6 +74,52 @@ function pos(node: MdastNode): Pos {
 function slice(source: string, node: MdastNode): string {
   const { start, end } = pos(node);
   return source.slice(start, end);
+}
+
+/** The Bot API 10.1 expandable-blockquote marker: `**>` at the very start of
+ *  a line (column 0). This is exactly what the render path emits
+ *  (`render.ts` writes `**> ` on the first line of an expandable quote; see
+ *  `reference/telegram-formatting-guide.md`). Matching only at column 0 keeps
+ *  the length-preserving rewrite (`**` → two spaces) inside CommonMark's
+ *  3-space blockquote-indent budget — allowing leading indent here would push
+ *  the rewritten `  >` past 3 spaces and turn it into an indented code block. */
+const EXPANDABLE_MARKER_RE = /^\*\*>/;
+
+/** Pre-transform expandable-blockquote markers so mdast can parse them as
+ *  ordinary blockquotes, WITHOUT shifting any source offset. Each line that
+ *  opens with `**>` has its two `*` characters replaced by two spaces
+ *  (`**>` → `  >`), which micromark reads as a normal (optionally
+ *  1–3-space-indented) blockquote line. Returns the rewritten text plus the
+ *  set of line-start offsets that carried the marker — `foldBlock` uses that
+ *  set to flip `expandable: true` on the produced blockquote nodes. */
+function markExpandableQuotes(markdown: string): {
+  text: string;
+  expandableLineStarts: Set<number>;
+} {
+  const expandableLineStarts = new Set<number>();
+  let out = "";
+  let offset = 0;
+  // Split keeping the trailing newline on each line so offsets are exact.
+  for (const line of markdown.split(/(?<=\n)/)) {
+    if (EXPANDABLE_MARKER_RE.test(line)) {
+      expandableLineStarts.add(offset);
+      // Replace the leading two `*` chars with two spaces; the `>` and
+      // everything after it are untouched (`**> x` -> `  > x`), a valid
+      // 2-space-indented blockquote that mdast parses normally.
+      out += "  " + line.slice(2);
+    } else {
+      out += line;
+    }
+    offset += line.length;
+  }
+  return { text: out, expandableLineStarts };
+}
+
+/** Offset of the start of the line containing `offset` in `source`. */
+function lineStart(source: string, offset: number): number {
+  let i = offset;
+  while (i > 0 && source[i - 1] !== "\n") i--;
+  return i;
 }
 
 /** mdast `AlignType` (null | 'left' | 'right' | 'center') passes through
@@ -114,7 +169,11 @@ function foldTableRow(
   return { cells, ...pos(row) };
 }
 
-function foldBlock(node: RootContent, source: string): Block {
+function foldBlock(
+  node: RootContent,
+  source: string,
+  expandableLineStarts: Set<number>,
+): Block {
   switch (node.type) {
     case "paragraph":
       return { type: "paragraph", children: foldInlineChildren(node, source), ...pos(node) };
@@ -125,14 +184,18 @@ function foldBlock(node: RootContent, source: string): Block {
         children: foldInlineChildren(node, source),
         ...pos(node),
       };
-    case "blockquote":
+    case "blockquote": {
+      const p = pos(node);
+      // A blockquote is expandable when its FIRST line carried the `**>`
+      // marker in the original source (recorded by markExpandableQuotes).
+      const expandable = expandableLineStarts.has(lineStart(source, p.start));
       return {
         type: "blockquote",
-        children: node.children.map((c) => foldBlock(c, source)),
-        // GFM has no expandable marker — always false in Increment 1.
-        expandable: false,
-        ...pos(node),
+        children: node.children.map((c) => foldBlock(c, source, expandableLineStarts)),
+        expandable,
+        ...p,
       };
+    }
     case "code":
       return {
         type: "code-block",
@@ -142,7 +205,7 @@ function foldBlock(node: RootContent, source: string): Block {
       };
     case "list": {
       const items: ListItem[] = node.children.map((li) => ({
-        children: li.children.map((c) => foldBlock(c, source)),
+        children: li.children.map((c) => foldBlock(c, source, expandableLineStarts)),
         checked: li.checked ?? null,
         ...pos(li),
       }));
@@ -180,11 +243,19 @@ function foldBlock(node: RootContent, source: string): Block {
 
 /** Parse a markdown string into the typed IR Document. */
 export function parse(markdown: string): Document {
-  const tree = fromMarkdown(markdown, {
+  // Rewrite expandable-blockquote markers (`**>` → `  >`) so micromark parses
+  // them as ordinary blockquotes. The rewrite is length-preserving, so mdast's
+  // offsets are valid against BOTH the rewritten and the original text — we
+  // parse the rewritten text but fold against the ORIGINAL `markdown`, keeping
+  // every source slice byte-identical to the caller's input.
+  const { text: rewritten, expandableLineStarts } = markExpandableQuotes(markdown);
+  const tree = fromMarkdown(rewritten, {
     extensions: [gfm()],
     mdastExtensions: [gfmFromMarkdown()],
   });
   return {
-    blocks: tree.children.map((child) => foldBlock(child, markdown)),
+    blocks: tree.children.map((child) =>
+      foldBlock(child, markdown, expandableLineStarts),
+    ),
   };
 }
