@@ -2462,7 +2462,11 @@ export function installHindsightPlugin(
   // after every copy so they survive reconcile/restart.
   //
   // `retainEveryNTurns: 1` (override from vendor default `10`): the
-  // vendor's default throttles auto-retention to every 10 turns. For
+  // vendor's default throttles auto-retention to every 10th turn, so a
+  // short session can end before retention ever fires. Switchroom sets it
+  // to 1 so the Stop hook retains every turn (paired with chunked mode,
+  // each retain only slices a small recent window, so per-turn cost stays
+  // low). For
   // switchroom's "always-on specialist exec-assistant" vision, that
   // throttle is wrong — users expect "please remember this" or even a
   // single fact-sharing turn to survive a restart. The jtbd-memory-
