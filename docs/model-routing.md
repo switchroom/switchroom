@@ -39,12 +39,33 @@ These must always hold.
   Claude/Anthropic model on the subscription we use the subscription OAuth
   token, never an `sk-ant` API key. This holds even when the request passes
   through LiteLLM: the gateway *meters*, it does not re-auth.
-- **I2 — Compliant metering.** LiteLLM observes subscription traffic by
-  forwarding the client's `Authorization: Bearer <oauth>` header straight
-  through to Anthropic via `forward_client_headers_to_llm_api: true`, scoped to
+- **I2 — Compliant metering (convention-enforced, not code-guaranteed).**
+  LiteLLM observes subscription traffic by forwarding the client's
+  `Authorization: Bearer <oauth>` header straight through to Anthropic via
+  `forward_client_headers_to_llm_api: true`, and this flag must be scoped to
   Claude models only. Non-Claude / OpenRouter model entries must never forward
-  the `Authorization` header. The proxy holds no Anthropic key of its own for
+  the `Authorization` header; the proxy holds no Anthropic key of its own for
   these models and must not substitute one.
+  **This scoping is enforced by convention in the operator-maintained LiteLLM
+  proxy config, not by any switchroom code.** That config is a Coolify-hosted
+  file at
+  `/host/data/coolify/services/vhz4jc1tzvk6gdql8jueiwq4/litellm-config.yaml`;
+  switchroom emits **no** `litellm_settings` or `model_list` (grep the tree —
+  the only occurrences are documentation comments), so it neither writes nor
+  validates this flag. The operator places
+  `forward_client_headers_to_llm_api: true` under individual Claude entries in
+  `model_group_settings` and leaves it off both globally (in `litellm_settings`,
+  where it is a Boolean master switch) and on every `openrouter/*` /
+  non-Claude entry. **Concrete risk — a one-line misconfig is an OAuth leak:**
+  setting the flag globally under `litellm_settings`, or adding it to any
+  `openrouter/*` `model_group_settings` entry, would forward the subscription
+  OAuth `Authorization: Bearer` token to OpenRouter (a third party). The live
+  config currently does this correctly — the flag appears only under Claude
+  model groups (`claude-opus-*`, `claude-sonnet-*`, `sonnet`, `claude-haiku-*`,
+  `claude-fable-5`, `fable`), never in `litellm_settings` or under any
+  OpenRouter/OpenAI entry, and the config's own comments warn against the
+  global form — but I2 holds **only** as long as that operator convention is
+  maintained. It is not automatically guaranteed.
 - **I3 — The auth broker owns OAuth.** The `switchroom-auth-broker` singleton
   is the sole writer of every consumer's `.claude/credentials.json` (agents and
   Hindsight alike) and owns the refresh loop; this is what enables account
@@ -126,6 +147,19 @@ File:line citations are against the v0.17.11 tree.
   writer) — unconditional, outside the `litellm` branch
   (`src/setup/hindsight.ts:844`) — and runs `--network host` only when LiteLLM
   is active (`:824-826`).
+- **Hindsight DOES hold a live OAuth credential.** The broker socket is mounted
+  unconditionally and the broker writes a real subscription OAuth credential to
+  the container's `/run/claude-creds/.credentials.json` (a `mode=0700` tmpfs at
+  `src/setup/hindsight.ts:851`; the broker keeps it re-pointed on account
+  failover — see `src/auth/broker/server.test.ts:3169`). So the safeguard that
+  stops hindsight's background memory ops from burning the Claude subscription
+  is **not** credential-absence — the credential is present. It is purely that
+  `ANTHROPIC_BASE_URL` points at LiteLLM (`http://127.0.0.1:4010`, verified
+  live) and the configured models are non-Anthropic (the live global is
+  `openrouter/z-ai/glm-5.2`), so `claude` never opens a direct Anthropic
+  connection. If hindsight were ever booted with a Claude *global* model **and**
+  the apply-time litellm branch were skipped (see G2), that same mounted
+  credential would route Claude traffic on the subscription.
 - The `claude-code` provider itself lives in the *upstream* Hindsight image,
   not this repo; switchroom steers it only via env, and the spawned `claude`
   subprocess inherits `ANTHROPIC_BASE_URL` / `ANTHROPIC_CUSTOM_HEADERS`.
@@ -146,12 +180,29 @@ Ranked, highest-leverage first.
   override under a non-Claude global (or vice-versa) can hit the wrong
   endpoint. This blocks the "configurable per-activity, Claude natively /
   non-Claude via LiteLLM" target.
-- **G2 — LiteLLM is not a hard guarantee (fail-open).** When the virtual key is
-  missing or the proxy is unreachable at boot, both agents and Hindsight drop
-  to direct Anthropic OAuth (untracked). This is a deliberate
-  availability-over-tracking choice (operator decision 2026-06-28,
-  `profiles/_base/start.sh.hbs:927-932`) — logged loudly, not enforced. Record
-  it as an explicit, accepted trade-off, not a silent bug.
+- **G2 — LiteLLM is not a hard guarantee — but only AGENTS fail-open; Hindsight
+  fails-CLOSED.** These two consumers behave oppositely on a proxy outage, and
+  an earlier draft wrongly claimed both fail-open.
+  - **Agents fail-open.** `start.sh` runs a bounded boot liveliness probe
+    (`profiles/_base/start.sh.hbs:927-932` for the rationale; the probe/strip
+    logic at `:946-994`). If the virtual key is missing or the proxy is
+    unreachable after the retry window, it strips the routing env
+    (`unset ANTHROPIC_BASE_URL …`) and the `claude` CLI falls back to the direct
+    broker-OAuth Anthropic path (untracked, unguarded). This is a deliberate
+    availability-over-tracking choice (operator decision 2026-06-28) — logged
+    loudly, re-probed every boot, an explicit accepted trade-off, not a silent
+    bug.
+  - **Hindsight does NOT do this.** `src/setup/hindsight.ts` sets
+    `ANTHROPIC_BASE_URL` **statically at apply / container-create time** inside
+    the `if (litellm)` branch (`:756`, the env emitted at `:786`) with **no
+    boot probe** and no runtime fallback. If the proxy is DOWN at request time,
+    hindsight **hard-fails the memory op** (the `claude` subprocess cannot reach
+    its base URL) rather than falling back to the subscription. Hindsight's
+    *only* direct-OAuth mode is the apply-time case where **no** `litellm`
+    config is passed at all (the whole `if (litellm)` block is skipped, so
+    `ANTHROPIC_BASE_URL` is never set and `claude` talks to Anthropic directly).
+    There is no availability-over-tracking fallback for a proxy that dies
+    *after* apply.
 - **G3 — Hindsight global default is internally inconsistent when LiteLLM is
   on.** `resolveHindsightLlm` defaults `provider` to `claude-code` but shifts
   the default `model` to a non-Claude OpenRouter model
@@ -165,3 +216,33 @@ Ranked, highest-leverage first.
 - **G5 — The `claude-code` provider is an upstream black box.** Switchroom can
   only steer it via env and cannot enforce that a non-`claude-code` per-op
   provider still traverses LiteLLM.
+- **G6 — OpenRouter account-credit exhaustion takes a memory op-class dark with
+  no fallback and no alerting.** Hindsight's non-Claude ops route through a
+  single funded OpenRouter account; when its credit runs out, every affected
+  op-class fails silently. **Observed 2026-07-07:** ~1,616 `Insufficient
+  credits` 402s for `openrouter/z-ai/glm-5.2` (customer=`hindsight`) spanning
+  ~22:08→00:20 UTC. Consolidation — which inherits the live global model
+  `openrouter/z-ai/glm-5.2` (an operator override of the G3 code default) —
+  stalled and kept re-polling for the whole window; it self-recovered only once
+  the credits were topped up. There is **no degradation path**: memory ops
+  depend on a funded OpenRouter account, and nothing falls back, alerts, or
+  down-shifts when it empties. Complements G2 (proxy-down hard-fail) — this is
+  the *account-out-of-funds* failure mode, equally undegraded and additionally
+  unmonitored.
+
+## Verification
+
+The 2026-07-08 revision (I2 reframing, the G2 agents-vs-Hindsight correction,
+the Hindsight-credential clarification, and G6) came from a **live adversarial
+review on 2026-07-08**. Findings were confirmed against ground truth, not
+inferred: LiteLLM spend logs + tags and Hindsight container logs were read
+directly, and `/proc/<pid>/environ` of the spawned `claude` binary was
+inspected to confirm the routing env. That check verified non-Claude models
+(`gpt-oss-120b`, `openrouter/z-ai/glm-5.2`, etc.) are **genuinely served via
+OpenRouter through LiteLLM** — `api.anthropic.com` cannot serve
+`gpt-oss-120b`, so a successful response to that model is proof the request
+did not touch the Anthropic subscription endpoint. The live LiteLLM config
+(`/host/data/coolify/services/vhz4jc1tzvk6gdql8jueiwq4/litellm-config.yaml`)
+and Hindsight's live container env (`ANTHROPIC_BASE_URL=http://127.0.0.1:4010`,
+global model `openrouter/z-ai/glm-5.2`) were also read directly for the I2 and
+Hindsight-credential claims above.
