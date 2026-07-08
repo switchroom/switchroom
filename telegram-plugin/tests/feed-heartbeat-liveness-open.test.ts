@@ -153,6 +153,17 @@ describe('H-2: feedHeartbeatTick post-answer background-agent liveness (Fix 2 / 
     expect(postAnswerBlock).toMatch(/livenessVerdict\s*!==\s*'emit'/)
   })
 
+  it('Fix 3: post-answer branch feeds stillDispatched from turn.foregroundSubAgents so a tracked foreground sub-agent bypasses the staleness cap', () => {
+    const body = feedHeartbeatTickSrc()
+    const afterPostAnswer = body.split('if (turn.finalAnswerDelivered)')[1] ?? ''
+    const postAnswerBlock = afterPostAnswer.split('\n  }\n')[0] ?? ''
+    // A positive foreground-tracking signal must be computed and threaded
+    // into the pure decision — this is what stops the card freezing mid-
+    // delegation while a foreground Task/Agent is still outstanding.
+    expect(postAnswerBlock).toMatch(/stillDispatched\s*=\s*turn\.foregroundSubAgents\.size\s*>\s*0/)
+    expect(postAnswerBlock).toMatch(/stillDispatched,/)
+  })
+
   it('staleness cap (concern 3) is parsed default-ON (30s) from SWITCHROOM_POST_ANSWER_LIVENESS_STALE_MS', () => {
     // The cap const must default to 30_000 when the env is unset (the `|| 30_000`
     // fallback over the positive-or-0 parse) so the post-answer card stops

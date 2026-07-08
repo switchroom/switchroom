@@ -137,6 +137,54 @@ describe('Claude Code event-stream contract (canary)', () => {
     ).toBe(false)
   })
 
+  it('CANARY (Fix 3 precondition): Task tool_use still projects {id, name, input} — the shape the foreground-sub-agent-tracking / post-answer-liveness-freeze fix keys "still dispatched" off of', () => {
+    // The Fix 3 gap-closer (turn-liveness-floor.ts `stillDispatched`) is only
+    // as good as `turn.foregroundSubAgents` staying populated for the
+    // lifetime of a real Task dispatch. That population is driven by THIS
+    // exact tool_use projection (toolName === 'Task') plus the matching
+    // tool_result closing it out — if a future Claude Code release renames
+    // `name`/`input`/`id` or nests them differently, the fix silently goes
+    // inert (stillDispatched always false, freeze regresses) rather than
+    // failing loudly. Pin the shape here so drift fails CI instead.
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: {
+        id: 'msg_task',
+        stop_reason: 'tool_use',
+        content: [
+          {
+            type: 'tool_use',
+            id: 'toolu_task_1',
+            name: 'Task',
+            input: { description: 'Investigate the freeze bug', subagent_type: 'worker' },
+          },
+        ],
+      },
+    })
+    const evs = projectTranscriptLine(line)
+    expect(evs).toEqual([
+      {
+        kind: 'tool_use',
+        toolName: 'Task',
+        toolUseId: 'toolu_task_1',
+        input: { description: 'Investigate the freeze bug', subagent_type: 'worker' },
+      },
+    ])
+    // The matching tool_result (Task returning) must still carry tool_use_id
+    // so the gateway can close out the foreground-sub-agent tracking entry.
+    const resultLine = JSON.stringify({
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_task_1', is_error: false, content: 'done' }] },
+    })
+    const resultEvs = projectTranscriptLine(resultLine)
+    expect(resultEvs).toHaveLength(1)
+    // `is_error: false` projects to `isError: undefined` (only `true` is
+    // ever stamped — see session-tail.ts's `c.is_error === true ? true :
+    // undefined`), so assert the falsy/absent form, not a literal `false`.
+    expect(resultEvs[0]).toMatchObject({ kind: 'tool_result', toolUseId: 'toolu_task_1' })
+    expect((resultEvs[0] as { isError?: boolean }).isError).toBeFalsy()
+  })
+
   it('sub-agent kickoff: first user message string prompt fires sub_agent_started', () => {
     const st = { hasEmittedStart: false }
     const line = JSON.stringify({

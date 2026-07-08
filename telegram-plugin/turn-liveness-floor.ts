@@ -227,13 +227,47 @@ export interface PostAnswerLivenessInput {
   now: number
   /** Staleness cap in ms; `<= 0` disables the cap. */
   staleCapMs: number
+  /**
+   * A POSITIVE, independent signal that a sub-agent dispatch is still known to
+   * be outstanding (e.g. `turn.foregroundSubAgents.size > 0` — a foreground
+   * `Task`/`Agent` this turn dispatched and has not yet reported finished).
+   *
+   * ## The gap this closes
+   *
+   * The staleness cap above was built to stop the card climbing FOREVER once
+   * a worker's `onFinish` froze `subagentActivityAt` and nothing further would
+   * ever arrive — but the ONLY signal it read (`now - subagentActivityAt`) is
+   * identical whether the worker (a) actually finished, or (b) is still
+   * genuinely running a SINGLE long silent step (one long Bash call, a slow
+   * fetch) that simply hasn't produced a NEW distinguishable watcher tick.
+   * Case (b) is exactly the scenario `feed-heartbeat-climb.ts`'s 0-label climb
+   * and `worker-activity-feed.ts`'s own heartbeat both exist to handle
+   * deterministically elsewhere — this post-answer branch alone lacked that
+   * fallback, so it froze the card mid-delegation (the confirmed operator
+   * symptom: "Running a command" stuck for 41s / 3m12s while a sub-agent ran
+   * underneath).
+   *
+   * When `stillDispatched` is `true` we have POSITIVE evidence the worker has
+   * not reported completion, so the staleness cap is bypassed entirely and the
+   * verdict stays `'emit'` — the caller keeps climbing the card deterministically
+   * off wall-clock elapsed exactly like the sibling 0-label/worker-feed paths.
+   * When `false` (no such tracking available — e.g. a purely-background worker
+   * with no foreground registration), the ORIGINAL cap behaviour is preserved
+   * unchanged, so the runaway-climb-after-completion protection this cap was
+   * built for still applies wherever we have no better signal.
+   */
+  stillDispatched: boolean
 }
 
 export function evaluatePostAnswerLiveness(input: PostAnswerLivenessInput): PostAnswerLivenessVerdict {
-  const { subagentActivityAt, finalAnswerDeliveredAt, now, staleCapMs } = input
+  const { subagentActivityAt, finalAnswerDeliveredAt, now, staleCapMs, stillDispatched } = input
   const answeredAt = finalAnswerDeliveredAt ?? 0
   // idle-gap: nothing surfaced after the answer → silent (reply-is-last preserved).
   if (subagentActivityAt == null || subagentActivityAt <= answeredAt) return 'idle'
+  // A positive "still dispatched" signal overrides the staleness cap — we KNOW
+  // the worker hasn't reported done, so a quiet stretch is a long silent step,
+  // not completion. Never freeze the card while that's true.
+  if (stillDispatched) return 'emit'
   // staleness cap: the worker's last advance is older than the cap → stop emitting.
   if (staleCapMs > 0 && now - subagentActivityAt >= staleCapMs) return 'stale'
   return 'emit'

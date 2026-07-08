@@ -40,7 +40,12 @@ import { describe, it, expect } from 'vitest'
 import * as realFs from 'fs'
 import { startSubagentWatcher } from '../subagent-watcher.js'
 import { mayOpenActivityCard } from '../gateway/feed-open-gate.js'
-import { clipNarrative, appendActivityLabel } from '../tool-activity-summary.js'
+import {
+  clipNarrative,
+  appendActivityLabel,
+  renderActivityFeedWithNested,
+  formatStepSuffix,
+} from '../tool-activity-summary.js'
 import { evaluatePostAnswerLiveness } from '../turn-liveness-floor.js'
 import {
   createWorkerActivityFeed,
@@ -249,6 +254,7 @@ describe('Fix 2: post-answer background-agent liveness (watcher → gate → liv
       finalAnswerDeliveredAt: currentTurn!.finalAnswerDeliveredAt,
       now: currentTime + 5, // a heartbeat tick moments after the stamp
       staleCapMs: 30_000,
+      stillDispatched: false,
     })
     expect(verdictInWindow).toBe('emit')
   })
@@ -262,6 +268,7 @@ describe('Fix 2: post-answer background-agent liveness (watcher → gate → liv
       finalAnswerDeliveredAt: 1000,
       now: 50_000,
       staleCapMs: 30_000,
+      stillDispatched: false,
     })
     expect(verdict).toBe('idle')
   })
@@ -273,6 +280,7 @@ describe('Fix 2: post-answer background-agent liveness (watcher → gate → liv
         finalAnswerDeliveredAt: 1000,
         now: 1500,
         staleCapMs: 30_000,
+        stillDispatched: false,
       }),
     ).toBe('idle')
   })
@@ -310,9 +318,14 @@ describe('Fix 2 / concern 2: currentTurn nulls at turn_end → heartbeat path in
 
   // The gateway's feedHeartbeatTick post-answer entry, reduced to its decision:
   // `if (turn == null) return` (no-turn), else the REAL evaluatePostAnswerLiveness.
+  // `stillDispatched` defaults to false (a purely-background worker, no
+  // foreground `turn.foregroundSubAgents` tracking) so these existing tests
+  // keep proving the ORIGINAL staleness-cap behaviour is preserved for that
+  // case; a dedicated Fix-3 describe block below covers `stillDispatched: true`.
   function heartbeatVerdict(
     currentTurn: { finalAnswerDelivered: boolean; finalAnswerDeliveredAt?: number; subagentActivityAt?: number } | null,
     now: number,
+    stillDispatched = false,
   ): 'no-turn' | 'pre-answer' | ReturnType<typeof evaluatePostAnswerLiveness> {
     const turn = currentTurn
     if (turn == null) return 'no-turn' // gateway: `if (turn == null) return`
@@ -322,6 +335,7 @@ describe('Fix 2 / concern 2: currentTurn nulls at turn_end → heartbeat path in
       finalAnswerDeliveredAt: turn.finalAnswerDeliveredAt,
       now,
       staleCapMs: 30_000,
+      stillDispatched,
     })
   }
 
@@ -374,6 +388,146 @@ describe('Fix 2 / concern 2: currentTurn nulls at turn_end → heartbeat path in
     // and the card stops climbing `running` forever (the concern-3 bug).
     expect(heartbeatVerdict(currentTurn, 2000 + 30_000)).toBe('stale')
     expect(heartbeatVerdict(currentTurn, 2000 + 90_000)).toBe('stale')
+  })
+})
+
+// ─── Fix 3 — sub-agent-delegation freeze (operator-confirmed: card frozen on
+//     "Running a command" for 41s / 3m12s while a sub-agent ran underneath) ──
+
+describe('Fix 3: a still-tracked foreground sub-agent bypasses the staleness cap (no mid-delegation freeze)', () => {
+  /**
+   * Reproduces the EXACT scenario the operator's 3 screenshots showed: a
+   * foreground `Task`/`Agent` dispatch is still outstanding (one long silent
+   * step — no new watcher narrative tick), so `subagentActivityAt` stops
+   * advancing, yet the worker has NOT reported finished. Before Fix 3 the
+   * staleness cap could not tell this apart from genuine completion and froze
+   * the card after 30s regardless. `stillDispatched: true` — sourced from
+   * `turn.foregroundSubAgents.size > 0` at the real call site — is the
+   * positive signal that closes the gap.
+   */
+
+  // Local copy of the gateway's post-answer decision (same as the "Fix 2 /
+  // concern 2" describe block above — duplicated here rather than hoisted to
+  // module scope so each describe stays self-contained/readable).
+  function heartbeatVerdict(
+    currentTurn: { finalAnswerDelivered: boolean; finalAnswerDeliveredAt?: number; subagentActivityAt?: number } | null,
+    now: number,
+    stillDispatched = false,
+  ): 'no-turn' | 'pre-answer' | ReturnType<typeof evaluatePostAnswerLiveness> {
+    const turn = currentTurn
+    if (turn == null) return 'no-turn'
+    if (!turn.finalAnswerDelivered) return 'pre-answer'
+    return evaluatePostAnswerLiveness({
+      subagentActivityAt: turn.subagentActivityAt,
+      finalAnswerDeliveredAt: turn.finalAnswerDeliveredAt,
+      now,
+      staleCapMs: 30_000,
+      stillDispatched,
+    })
+  }
+
+  it('long silent single step (41s, no new narrative) — bypasses the cap while still dispatched', () => {
+    const turn = {
+      finalAnswerDelivered: true,
+      finalAnswerDeliveredAt: 1000,
+      subagentActivityAt: 2000 as number | undefined,
+    }
+    const currentTurn: typeof turn | null = turn
+    // 41s after the last (and only) narrative advance — well past the 30s cap.
+    // Legacy (stillDispatched: false) behaviour would already be 'stale' here
+    // (proven by the concern-3 test above); with a tracked foreground worker
+    // it must stay 'emit' so the card keeps climbing instead of freezing.
+    expect(heartbeatVerdict(currentTurn, 2000 + 41_000, /* stillDispatched */ true)).toBe('emit')
+  })
+
+  it('long silent single step (3m12s) — still bypasses the cap while still dispatched', () => {
+    const turn = {
+      finalAnswerDelivered: true,
+      finalAnswerDeliveredAt: 1000,
+      subagentActivityAt: 2000 as number | undefined,
+    }
+    const currentTurn: typeof turn | null = turn
+    const threeMinTwelveSecMs = 3 * 60_000 + 12_000
+    expect(heartbeatVerdict(currentTurn, 2000 + threeMinTwelveSecMs, true)).toBe('emit')
+  })
+
+  it('once the foreground sub-agent is no longer tracked (finished), the cap re-applies normally', () => {
+    // The gateway removes the agentId from `turn.foregroundSubAgents` when it
+    // finishes (gateway.ts ~27032/27037) — `stillDispatched` then reads false
+    // again and the ORIGINAL runaway-climb protection re-engages exactly as
+    // before Fix 3. This is the adversarial check that Fix 3 doesn't remove
+    // the cap's protection outright, only bypasses it while genuinely unknown.
+    const turn = {
+      finalAnswerDelivered: true,
+      finalAnswerDeliveredAt: 1000,
+      subagentActivityAt: 2000 as number | undefined,
+    }
+    const currentTurn: typeof turn | null = turn
+    expect(heartbeatVerdict(currentTurn, 2000 + 41_000, false)).toBe('stale')
+  })
+
+  it('idle-gap suppression still wins over stillDispatched (no watcher activity ever ⇒ silent, reply-is-last preserved)', () => {
+    // Adversarial check: a turn that dispatched a foreground sub-agent but has
+    // had NO watcher tick at all since the answer (subagentActivityAt
+    // undefined) must stay 'idle', never 'emit', even if stillDispatched is
+    // true — a still-registered worker with zero ticks yet is not the same as
+    // one whose last tick went stale. This preserves the reply-is-last
+    // invariant for a turn that answered and dispatched but hasn't surfaced
+    // any post-answer step yet.
+    const turn = {
+      finalAnswerDelivered: true,
+      finalAnswerDeliveredAt: 1000,
+      subagentActivityAt: undefined as number | undefined,
+    }
+    const currentTurn: typeof turn | null = turn
+    expect(heartbeatVerdict(currentTurn, 50_000, true)).toBe('idle')
+  })
+
+  it('end-to-end: the RENDERED card text keeps changing across real heartbeat ticks while a foreground sub-agent is silently working (not just the verdict function)', () => {
+    // Full simulated turn: dispatch a foreground Task, one narrative tick
+    // lands, then NOTHING further for over three minutes (one long silent
+    // Bash inside the sub-agent) — the exact operator-reported shape. Drives
+    // the REAL `evaluatePostAnswerLiveness` verdict AND the REAL
+    // `renderActivityFeedWithNested`/`composeTurnActivity`-shaped render at
+    // each tick, asserting the VISIBLE text (not an internal label) actually
+    // climbs instead of freezing.
+    const turn = {
+      finalAnswerDelivered: true,
+      finalAnswerDeliveredAt: 1_000,
+      subagentActivityAt: 2_000 as number | undefined,
+      mirrorLines: ['Delegating to a sub-agent'],
+      foregroundSubAgents: new Map<string, string[]>([['agent-1', ['Running a command']]]),
+    }
+
+    function renderCardAt(now: number): string | null {
+      const verdict = evaluatePostAnswerLiveness({
+        subagentActivityAt: turn.subagentActivityAt,
+        finalAnswerDeliveredAt: turn.finalAnswerDeliveredAt,
+        now,
+        staleCapMs: 30_000,
+        stillDispatched: turn.foregroundSubAgents.size > 0,
+      })
+      if (verdict !== 'emit') return null // the pre-Fix-3 freeze point
+      const childLines = [...turn.foregroundSubAgents.values()].flat()
+      const header = { label: 'Agent', elapsedMs: now - 0, toolCount: 1, state: 'running' as const }
+      return renderActivityFeedWithNested(turn.mirrorLines, childLines, false, formatStepSuffix(now - turn.subagentActivityAt!), undefined, header)
+    }
+
+    const tick1 = renderCardAt(2_000 + 6_000) // 6s after the last tick
+    const tick2 = renderCardAt(2_000 + 41_000) // 41s — the first operator-reported freeze point
+    const tick3 = renderCardAt(2_000 + (3 * 60_000 + 12_000)) // 3m12s — the second
+
+    expect(tick1).not.toBeNull()
+    expect(tick2).not.toBeNull()
+    expect(tick3).not.toBeNull()
+    // The visible text must actually differ tick-over-tick (climbing elapsed),
+    // not be frozen at the same string for minutes.
+    expect(tick2).not.toBe(tick1)
+    expect(tick3).not.toBe(tick2)
+    // And it must contain the growing wall-clock evidence the operator was
+    // missing — a live elapsed suffix on the nested step.
+    expect(tick2).toContain('41s')
+    expect(tick3).toContain('3m12s')
   })
 })
 
