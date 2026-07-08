@@ -1,8 +1,8 @@
 {
   "name": "switchroom",
   "//version": "NOT the release version — source of truth is the git tag, resolved by scripts/build.mjs:resolveVersion() (see CLAUDE.md > Standard release process). This field is stale by design and only the Layer-4 dev/non-tag fallback for build.mjs + src/cli/resolve-version.ts; do NOT bump it expecting a release to pick it up. npm-pack tarball naming needs a real version — do that as an UNCOMMITTED pack-time bump (see release step 6), never a committed one.",
-  "version": "0.15.48",
-  "description": "Run Claude Code 24/7 on your Claude Pro/Max subscription over Telegram. Open-source alternative to OpenClaw and NanoClaw \u2014 no API keys.",
+  "version": "0.18.0",
+  "description": "Run Claude Code 24/7 on your Claude Pro/Max subscription over Telegram. Open-source alternative to OpenClaw and NanoClaw — no API keys.",
   "type": "module",
   "bin": {
     "switchroom": "./dist/cli/switchroom.js"
