@@ -283,7 +283,7 @@ export function resolveAgentsDir(config: SwitchroomConfig): string {
   if (override && override.length > 0 && override.startsWith("/")) {
     return override;
   }
-  return resolveDualPath(config.switchroom.agents_dir);
+  return resolveDualPath(config.switchroom.agents_dir || "~/.switchroom/agents");
 }
 
 export function resolvePath(pathStr: string): string {

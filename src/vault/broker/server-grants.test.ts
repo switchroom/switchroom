@@ -93,14 +93,18 @@ describe("VaultBroker: grant operations (mint_grant / list_grants / revoke_grant
   let auditEntries: AuditEntry[];
   let prevNonLinuxFlag: string | undefined;
   // #1561: the broker resolves `~/.switchroom/agents/<agent>/.vault-token`
-  // via `os.homedir()` when minting grants. Without overriding HOME the
-  // mint path writes into the operator's REAL `~/.switchroom/agents/`,
-  // creating fixture-named dirs (myagent, agent1, …) — and on this
-  // shared host that propagated into a vault-rewrite that destroyed the
-  // live vault.enc (incident 2026-05-20, see PR). Override HOME for the
-  // duration of the test so every `os.homedir()`-derived path stays
-  // inside `tmpDir`. Restored in afterEach.
-  let prevHome: string | undefined;
+  // via `resolveAgentsDir()` when minting grants. Without overriding
+  // SWITCHROOM_AGENTS_DIR the mint path writes into the operator's REAL
+  // `~/.switchroom/agents/`, creating fixture-named dirs (myagent,
+  // agent1, …) — and on this shared host that propagated into a
+  // vault-rewrite that destroyed the live vault.enc (incident
+  // 2026-05-20, see PR). Override SWITCHROOM_AGENTS_DIR for the duration
+  // of the test — this is the reliable override honored by
+  // resolveAgentsDir() (unlike mutating process.env.HOME, which
+  // os.homedir() does not reread after process start). Restored in
+  // afterEach.
+  let agentsDir: string;
+  let prevAgentsDirEnv: string | undefined;
 
   beforeEach(async () => {
     prevNonLinuxFlag = process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
@@ -109,10 +113,11 @@ describe("VaultBroker: grant operations (mint_grant / list_grants / revoke_grant
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "broker-grants-test-"));
     socketPath = path.join(tmpDir, "test.sock");
 
-    // MUST come BEFORE broker.start() — the broker captures `os.homedir()`
-    // when constructing token write paths during mint_grant.
-    prevHome = process.env.HOME;
-    process.env.HOME = tmpDir;
+    // MUST come BEFORE broker.start() — the broker resolves the agents
+    // dir when constructing token write paths during mint_grant.
+    agentsDir = path.join(tmpDir, "agents");
+    prevAgentsDirEnv = process.env.SWITCHROOM_AGENTS_DIR;
+    process.env.SWITCHROOM_AGENTS_DIR = agentsDir;
 
     grantsDb = makeInMemoryGrantsDb();
     auditEntries = [];
@@ -131,10 +136,10 @@ describe("VaultBroker: grant operations (mint_grant / list_grants / revoke_grant
   afterEach(() => {
     broker.stop();
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
-    if (prevHome === undefined) {
-      delete process.env.HOME;
+    if (prevAgentsDirEnv === undefined) {
+      delete process.env.SWITCHROOM_AGENTS_DIR;
     } else {
-      process.env.HOME = prevHome;
+      process.env.SWITCHROOM_AGENTS_DIR = prevAgentsDirEnv;
     }
     if (prevNonLinuxFlag === undefined) {
       delete process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
@@ -176,13 +181,7 @@ describe("VaultBroker: grant operations (mint_grant / list_grants / revoke_grant
 
     expect(resp.ok).toBe(true);
     if (resp.ok && "token" in resp) {
-      const expectedPath = path.join(
-        os.homedir(),
-        ".switchroom",
-        "agents",
-        "myagent",
-        ".vault-token",
-      );
+      const expectedPath = path.join(agentsDir, "myagent", ".vault-token");
       expect(fs.existsSync(expectedPath)).toBe(true);
       const fileContent = fs.readFileSync(expectedPath, "utf8");
       expect(fileContent).toBe(resp.token);
@@ -272,9 +271,7 @@ describe("VaultBroker: grant operations (mint_grant / list_grants / revoke_grant
     expect(mintResp.ok).toBe(true);
     if (!mintResp.ok || !("id" in mintResp)) return;
 
-    const tokenPath = path.join(
-      os.homedir(), ".switchroom", "agents", "myagent", ".vault-token",
-    );
+    const tokenPath = path.join(agentsDir, "myagent", ".vault-token");
     expect(fs.existsSync(tokenPath)).toBe(true);
 
     await rpc(socketPath, { v: 1, op: "revoke_grant", id: mintResp.id });

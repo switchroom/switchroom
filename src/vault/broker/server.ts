@@ -33,7 +33,7 @@ import * as path from "node:path";
 import type { SwitchroomConfig } from "../../config/schema.js";
 import { openVault, saveVault, VaultError, type VaultEntry } from "../vault.js";
 import { inspectVaultLayout } from "../migrate-layout.js";
-import { resolvePath } from "../../config/loader.js";
+import { resolvePath, resolveAgentsDir } from "../../config/loader.js";
 import {
   AutoUnlockDecryptError,
   DEFAULT_AUTO_UNLOCK_PATH,
@@ -2384,7 +2384,10 @@ export class VaultBroker {
       // creation and the bytes being committed. Rename is atomic on Linux
       // for same-filesystem moves.
       try {
-        const tokenDir = path.join(os.homedir(), ".switchroom", "agents", agent);
+        const agentsDir = this.config
+          ? resolveAgentsDir(this.config)
+          : path.join(os.homedir(), ".switchroom", "agents");
+        const tokenDir = path.join(agentsDir, agent);
         mkdirSync(tokenDir, { recursive: true });
         const tokenPath = path.join(tokenDir, ".vault-token");
         const tmpPath = `${tokenPath}.tmp.${process.pid}`;
@@ -2490,13 +2493,10 @@ export class VaultBroker {
           )
           .get(id);
         if (row && AgentNameSchema.safeParse(row.agent_slug).success) {
-          const tokenPath = path.join(
-            os.homedir(),
-            ".switchroom",
-            "agents",
-            row.agent_slug,
-            ".vault-token",
-          );
+          const agentsDir = this.config
+            ? resolveAgentsDir(this.config)
+            : path.join(os.homedir(), ".switchroom", "agents");
+          const tokenPath = path.join(agentsDir, row.agent_slug, ".vault-token");
           if (existsSync(tokenPath)) {
             try { unlinkSync(tokenPath); } catch { /* best-effort */ }
           }

@@ -29,6 +29,7 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as fs from "node:fs";
+import { Database } from "bun:sqlite";
 import { VaultBroker } from "./server.js";
 import {
   encodeRequest,
@@ -38,6 +39,13 @@ import {
 } from "./protocol.js";
 import type { VaultEntry } from "../vault.js";
 import { createAuditLogger, type AuditEntry } from "./audit-log.js";
+import { migrateGrantsSchema } from "../grants.js";
+
+function makeInMemoryGrantsDb(): Database {
+  const db = new Database(":memory:");
+  migrateGrantsSchema(db);
+  return db;
+}
 
 const SECRETS: Record<string, VaultEntry> = {
   k1: { kind: "string", value: "v1" },
@@ -106,6 +114,16 @@ describe("broker mint_grant attest_via_posture", () => {
   let prevNonLinuxFlag: string | undefined;
   let prevNodeEnv: string | undefined;
   let prevReqOpFlag: string | undefined;
+  // These tests run a live, unlocked broker (`_testPassphrase` set) whose
+  // happy-path mint/put calls reach past the attestation gate and into the
+  // real mint_grant token-write + grants-DB-open steps. Without both of
+  // these overrides they touch the operator's REAL ~/.switchroom/agents/
+  // and ~/.switchroom/vault-grants.db — confirmed empirically: this file
+  // had leaked 64+ "uat-agent" rows into the live production grants DB
+  // before this fix. See server-grants.test.ts for the same class of bug.
+  let agentsDir: string;
+  let prevAgentsDirEnv: string | undefined;
+  let grantsDb: Database;
 
   beforeEach(() => {
     prevNonLinuxFlag = process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
@@ -119,6 +137,12 @@ describe("broker mint_grant attest_via_posture", () => {
     delete process.env.SWITCHROOM_REQUIRE_OPERATOR_APPROVAL_MINT;
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "broker-mint-posture-"));
     socketPath = path.join(tmpDir, "test.sock");
+
+    agentsDir = path.join(tmpDir, "agents");
+    prevAgentsDirEnv = process.env.SWITCHROOM_AGENTS_DIR;
+    process.env.SWITCHROOM_AGENTS_DIR = agentsDir;
+
+    grantsDb = makeInMemoryGrantsDb();
     audit = [];
   });
 
@@ -126,6 +150,8 @@ describe("broker mint_grant attest_via_posture", () => {
     if (broker) broker.stop();
     broker = null;
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    if (prevAgentsDirEnv === undefined) delete process.env.SWITCHROOM_AGENTS_DIR;
+    else process.env.SWITCHROOM_AGENTS_DIR = prevAgentsDirEnv;
     if (prevNonLinuxFlag === undefined) delete process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
     else process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX = prevNonLinuxFlag;
     if (prevNodeEnv === undefined) delete process.env.NODE_ENV;
@@ -144,6 +170,7 @@ describe("broker mint_grant attest_via_posture", () => {
     return new VaultBroker({
       _testSecrets: opts.passphrase ? cloneSecrets() : undefined,
       _testConfig: opts.config,
+      _testGrantsDb: grantsDb,
       _testPassphrase: opts.passphrase,
       _testAgentName: opts.agentName,
       _testAuditLogger: auditor as any,
