@@ -398,16 +398,31 @@ export const EXTRA_CLAUDE_ALIASES: ReadonlyArray<{ alias: string; label: string 
  * Friendly display names for sr-* synthetic model names. An sr-* model in
  * LiteLLM has no entry in `model_group_settings.*.forward_client_headers_to_llm_api`
  * so the Anthropic OAuth credential is NEVER forwarded — safe to route to
- * OpenRouter. Names here are display-only; the raw `sr-*` id is what gets
- * injected into the agent's session. See reference/rfcs/litellm-max-subscription-invariants.md § I6.
+ * OpenRouter. Names here are display-only (used by srFriendlyLabel for /status
+ * and switch confirmations); the raw `sr-*` id is what gets injected into the
+ * agent's session. This table is a SUPERSET of the menu-reachable set
+ * (SR_MODEL_ALIASES): it also labels models that are only reachable by typing
+ * the full `/model sr-<name>` (manual passthrough), so those still get a
+ * friendly name without appearing as a keyboard button.
+ * See reference/rfcs/litellm-max-subscription-invariants.md § I6.
  */
 export const SR_MODEL_LABELS: Record<string, string> = {
   'sr-gemini-2.5-pro': 'Gemini 2.5 Pro',
   'sr-gemini-2.5-flash': 'Gemini 2.5 Flash',
   'sr-deepseek-r1': 'DeepSeek R1',
   'sr-deepseek-v3': 'DeepSeek V3',
-  'sr-glm-5': 'GLM-5',
+  // sr-glm-5 now targets glm-5.2 in the live litellm config — label bumped to match.
+  'sr-glm-5': 'GLM-5.2',
   'sr-codex-5.5': 'Codex 5.5',
+  // OpenRouter coverage (pairs with the live litellm sr-* model_name additions).
+  'sr-gpt-oss-20b': 'GPT-OSS 20B',
+  'sr-gpt-oss-120b': 'GPT-OSS 120B',
+  'sr-gpt-5.5': 'GPT-5.5',
+  'sr-gpt-5-codex': 'GPT-5 Codex',
+  'sr-gpt-5.2-codex': 'GPT-5.2 Codex',
+  'sr-gemini-flash-lite': 'Gemini 3.1 Flash Lite',
+  'sr-minimax-m3': 'MiniMax M3',
+  'sr-deepseek-v4-flash': 'DeepSeek V4 Flash',
 }
 
 /**
@@ -488,10 +503,15 @@ function headerRow(label: string): ModelMenuKeyboardButton[] {
  * requires ANTHROPIC_CUSTOM_HEADERS (a litellm key) to be set on the gateway
  * process. switchroom never sets that env on the gateway, so in production
  * discoverSrModels() always returns [] and the external group was silently
- * empty. The six SR_MODEL_ALIASES targets are the sr-* names the litellm
- * config actually exposes, so seeding from them makes the group reliable
- * without the missing env — while still merging any live results on hosts
- * that do configure discovery.
+ * empty. The six SR_MODEL_ALIASES targets are the CURATED main sr-* set, so
+ * seeding from them makes the group reliable without the missing env — while
+ * still merging any live results on hosts that do configure discovery.
+ *
+ * Deliberately a SUBSET: the litellm config exposes more sr-* models than this
+ * (the full OpenRouter catalogue). Those extras are display-labelled in
+ * SR_MODEL_LABELS and remain typeable via `/model <full-sr-name>` (manual
+ * passthrough — the set path is a shape gate, no whitelist), but they are kept
+ * OUT of SR_MODEL_ALIASES on purpose so the keyboard stays small and curated.
  *
  * Subscription-honest: ONLY the curated sr-* aliases surface as buttons. Raw
  * gpt-4o / openrouter/* dupes / voyage-* embeddings never do.
