@@ -79,6 +79,34 @@ describe("scaffoldAgent: session-only model override carrier (start.sh)", () => 
     return m ? m[1].trim() : "";
   }
 
+  /**
+   * Run the extracted block with routing env seeded the way the litellm block
+   * above would leave it on a REACHABLE proxy: ANTHROPIC_BASE_URL points at the
+   * `/anthropic` passthrough, SWITCHROOM_LITELLM_BASE at the router root. Returns
+   * both the effective model and the ANTHROPIC_BASE_URL the block leaves set, so
+   * we can assert the sr-* passthrough→router repoint.
+   */
+  const PASSTHROUGH = "http://litellm:4010/anthropic";
+  const ROUTER_ROOT = "http://litellm:4010";
+  function runBlockRouting(litellmOk: string): { effective: string; baseUrl: string } {
+    const script = [
+      "set -e",
+      `export ANTHROPIC_BASE_URL=${JSON.stringify(PASSTHROUGH)}`,
+      `export SWITCHROOM_LITELLM_BASE=${JSON.stringify(ROUTER_ROOT)}`,
+      `_LITELLM_OK=${JSON.stringify(litellmOk)}`,
+      block,
+      'echo "EFFECTIVE=$_EFFECTIVE_MODEL"',
+      'echo "BASEURL=$ANTHROPIC_BASE_URL"',
+    ].join("\n");
+    const out = execFileSync("bash", ["-c", script], { encoding: "utf-8" });
+    const eff = out.match(/EFFECTIVE=(.*)/);
+    const base = out.match(/BASEURL=(.*)/);
+    return {
+      effective: eff ? eff[1].trim() : "",
+      baseUrl: base ? base[1].trim() : "",
+    };
+  }
+
   it("renders the carrier + companion file wiring in start.sh", () => {
     expect(block).toContain(".session-model-override");
     expect(block).toContain(".active-session-model");
@@ -130,5 +158,53 @@ describe("scaffoldAgent: session-only model override carrier (start.sh)", () => 
     writeFileSync(join(agentDir, ".session-model-override"), "claude-opus-4-8\n");
     expect(runBlock("")).toBe("claude-opus-4-8");
     expect(existsSync(join(agentDir, ".session-model-alert"))).toBe(false);
+  });
+
+  // --- sr-* passthrough→router repoint (fleet-wide /model <sr-*> fix) ---------
+  // The default ANTHROPIC_BASE_URL points at the LiteLLM `/anthropic`
+  // PASSTHROUGH (a raw byte-forward to api.anthropic.com added 2026-07-05 to
+  // dodge the Opus SSE re-chunk stall). That passthrough is model-agnostic:
+  // it ships EVERY request to Anthropic regardless of --model, so an sr-*
+  // OpenRouter model 4xxs "model not found". When an sr-* override is picked up
+  // AND LiteLLM is reachable, start.sh must repoint ANTHROPIC_BASE_URL onto the
+  // LiteLLM router root so /v1/messages routes by model name to OpenRouter.
+  it("sr-* override + LiteLLM up → repoints ANTHROPIC_BASE_URL off /anthropic onto the router root", () => {
+    writeFileSync(join(agentDir, ".session-model-override"), "sr-glm-5\n");
+    const { effective, baseUrl } = runBlockRouting("1");
+    // Launches the requested OpenRouter model.
+    expect(effective).toBe("sr-glm-5");
+    // Repointed to the LiteLLM router root — the `/anthropic` passthrough suffix
+    // is gone, so claude's /v1/messages hits LiteLLM's model router.
+    expect(baseUrl).toBe(ROUTER_ROOT);
+    expect(baseUrl.endsWith("/anthropic")).toBe(false);
+  });
+
+  it("no override (Claude default) → KEEPS the /anthropic passthrough (guards the Opus SSE fix)", () => {
+    // No carrier: default Claude session must retain the passthrough endpoint.
+    const { effective, baseUrl } = runBlockRouting("1");
+    expect(effective).toBe(DEFAULT_MODEL);
+    expect(baseUrl).toBe(PASSTHROUGH);
+    expect(baseUrl.endsWith("/anthropic")).toBe(true);
+  });
+
+  it("claude-* override → KEEPS the /anthropic passthrough (only sr-* repoints)", () => {
+    writeFileSync(join(agentDir, ".session-model-override"), "claude-opus-4-8\n");
+    const { effective, baseUrl } = runBlockRouting("1");
+    expect(effective).toBe("claude-opus-4-8");
+    expect(baseUrl).toBe(PASSTHROUGH);
+    expect(baseUrl.endsWith("/anthropic")).toBe(true);
+  });
+
+  it("sr-* override + LiteLLM DOWN → override dropped to default, passthrough untouched, alert written", () => {
+    writeFileSync(join(agentDir, ".session-model-override"), "sr-glm-5\n");
+    const { effective, baseUrl } = runBlockRouting("");
+    // Dropped back to configured default (existing fail-safe behavior).
+    expect(effective).toBe(DEFAULT_MODEL);
+    // No repoint when the proxy is down — endpoint left as-is.
+    expect(baseUrl).toBe(PASSTHROUGH);
+    // Operator alert sentinel written.
+    const alert = readFileSync(join(agentDir, ".session-model-alert"), "utf-8");
+    expect(alert).toContain("sr-glm-5");
+    expect(alert).toContain("LiteLLM");
   });
 });

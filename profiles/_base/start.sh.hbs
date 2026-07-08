@@ -75,6 +75,13 @@ if [ "$SWITCHROOM_RUNTIME" = "docker" ] && [ -z "$SWITCHROOM_DOCKER_TMUX_INNER" 
   #   - proxy down    → log + strip ALL routing env (fail-open)
   #   - ANTHROPIC_CUSTOM_HEADERS already set → skip (idempotent)
   #
+  # NOTE (2026-07-08): the INNER block no longer strips routing on a
+  # proxy-UNREACHABLE boot (it holds the route so it self-heals — see the long
+  # note there). This OUTER gateway-hoist path still fail-opens on unreachable,
+  # matching its own dedicated contract test (scaffold.litellm-gateway-outer).
+  # Aligning it is a deliberate follow-up, tracked in the PR, kept out of this
+  # surgical change to avoid touching the separately-asserted gateway contract.
+  #
   # SWITCHROOM_AGENT_NAME is injected by compose env (compose.ts:1816)
   # so it is available here, before the inner-pass export at line ~320.
   if [ -n "${SWITCHROOM_LITELLM:-}" ] && [ -z "$ANTHROPIC_CUSTOM_HEADERS" ] && command -v switchroom >/dev/null 2>&1; then
@@ -924,12 +931,21 @@ fi
 # content-safety guardrails — it never alters the model or Claude's operation.
 # See reference/invariants.md § "Operator-controlled gateway carve-out".
 #
-# FAIL-OPEN (operator decision 2026-06-28): if the key is missing OR the proxy
-# is unreachable at boot, strip the routing env and fall back to the direct
-# broker-OAuth Anthropic path, logging the reason LOUDLY. Availability wins over
-# tracking/guardrails — a proxy outage must never take an agent dark. The
-# tradeoff is an explicit, logged guardrail lapse for that session, not a silent
-# one. Re-probed on every (re)boot, so recovery is automatic.
+# TWO boot failure modes, handled DIFFERENTLY (2026-07-08 — was a single
+# fail-open path that silently took an agent off-proxy for its whole lifetime):
+#   - MISSING KEY (no per-agent virtual key in the vault): fail-open — strip the
+#     routing env and fall back to the direct broker-OAuth Anthropic path,
+#     logging LOUDLY. Without a key there is nothing to authenticate to the
+#     proxy with, so there is no metered route to self-heal into.
+#   - PROXY UNREACHABLE at boot (key present, liveliness probe fails within the
+#     retry window): do NOT strip. Leave ANTHROPIC_BASE_URL / SWITCHROOM_LITELLM*
+#     pointed at the proxy (the socat forwarder at 127.0.0.1:4010 self-heals
+#     per-connection) and emit a LOUD warning. Claude traffic FAILS+retries until
+#     the proxy returns, then routes through it automatically — the metered path
+#     stays the metered path. We deliberately do NOT silently fall back to
+#     untracked direct Anthropic on a transient blip: an agent that boots during
+#     a brief litellm outage previously never routed through litellm again until
+#     a manual restart. Re-probed on every (re)boot.
 #
 # Static tags (x-litellm-customer-id / x-litellm-tags) give per-AGENT
 # attribution in LiteLLM. Per-SESSION is NOT achievable here: claude sends no
@@ -946,8 +962,13 @@ _LITELLM_OK=""
 if [ -n "${SWITCHROOM_LITELLM:-}" ] && command -v switchroom >/dev/null 2>&1; then
   sr_ll_key="$(switchroom vault get "litellm/$SWITCHROOM_AGENT_NAME/api-key" 2>/dev/null || true)"
   sr_ll_ok=""
+  sr_ll_unreachable=""
   if [ -z "$sr_ll_key" ]; then
-    echo "litellm: no virtual key for agent '$SWITCHROOM_AGENT_NAME' — falling back to direct OAuth (no tracking/guardrail)" >&2
+    echo "==================== litellm FAIL-OPEN ====================" >&2
+    echo "WARNING: no litellm virtual key for agent '$SWITCHROOM_AGENT_NAME'." >&2
+    echo "WARNING: falling back to direct Anthropic OAuth (untracked, unguarded)" >&2
+    echo "WARNING: — cannot authenticate to the proxy without a key." >&2
+    echo "==========================================================" >&2
   elif command -v curl >/dev/null 2>&1 && [ -n "$ANTHROPIC_BASE_URL" ]; then
     # Bounded retry probe (co-boot race fix, 2026-07): when the whole stack
     # co-boots, the litellm proxy's heavy Python app is often not yet healthy
@@ -964,7 +985,16 @@ if [ -n "${SWITCHROOM_LITELLM:-}" ] && command -v switchroom >/dev/null 2>&1; th
       sleep 3
     done
     if [ -z "$sr_ll_up" ]; then
-      echo "litellm: proxy unreachable at ${SWITCHROOM_LITELLM_BASE:-$ANTHROPIC_BASE_URL} after 120s of retries — falling back to direct OAuth (no tracking/guardrail this session)" >&2
+      # Proxy unreachable at boot but the key is present. Do NOT strip routing:
+      # leave it pointed at litellm so the fleet self-heals once the proxy is
+      # back (the socat forwarder at 127.0.0.1:4010 reconnects per-connection).
+      sr_ll_unreachable="1"
+      echo "==================== litellm UNREACHABLE ====================" >&2
+      echo "WARNING: litellm proxy unreachable at ${SWITCHROOM_LITELLM_BASE:-$ANTHROPIC_BASE_URL} after 120s of retries;" >&2
+      echo "WARNING: Claude traffic will FAIL until it recovers — routing LEFT IN PLACE" >&2
+      echo "WARNING: so it self-heals (socat forwarder reconnects per-connection)." >&2
+      echo "WARNING: NOT falling back to untracked direct Anthropic OAuth." >&2
+      echo "============================================================" >&2
     else
       sr_ll_ok="1"
     fi
@@ -987,12 +1017,19 @@ x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:
     # models configured in the proxy appear in the /model picker and can be
     # selected via --model. Without this, the CLI only knows its bundled list.
     export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+  elif [ -n "$sr_ll_unreachable" ]; then
+    # Proxy unreachable at boot: routing intentionally LEFT IN PLACE (loud
+    # warning already emitted above) so it self-heals when litellm returns.
+    # _LITELLM_OK stays empty so any sr-* session model override is still
+    # dropped below (claude would 4xx an unknown model against a down endpoint).
+    # NO unset here — that permanent strip was the bug this branch fixes.
+    :
   else
-    # Fail-open: drop every routing var so the claude CLI talks to Anthropic
-    # directly on its OAuth credential (subscription path), unproxied.
+    # Missing key fail-open: drop every routing var so the claude CLI talks to
+    # Anthropic directly on its OAuth credential (subscription path), unproxied.
     unset ANTHROPIC_BASE_URL ANTHROPIC_SMALL_FAST_MODEL SWITCHROOM_LITELLM SWITCHROOM_LITELLM_BASE
   fi
-  unset sr_ll_key sr_ll_ok
+  unset sr_ll_key sr_ll_ok sr_ll_unreachable
 fi
 
 # --- Session-only model override (carrier: .session-model-override) ---
@@ -1032,6 +1069,20 @@ if [ -f "{{agentDir}}/.session-model-override" ]; then
           echo "session-model: LiteLLM proxy unreachable at boot — DROPPING sr-* override '$_override', booting on configured default '$_EFFECTIVE_MODEL' instead (would otherwise 4xx against Anthropic)" >&2
           echo "session-model: the requested sr-* model is UNAVAILABLE this session; re-issue /model $_override once LiteLLM is reachable" >&2
           printf 'LiteLLM proxy was unreachable at boot, so the session-only model switch to `%s` was dropped — the agent booted on its configured default `%s` instead. Re-issue /model %s once LiteLLM is reachable.\n' "$_override" "$_EFFECTIVE_MODEL" "$_override" > "{{agentDir}}/.session-model-alert" 2>/dev/null || true
+        else
+          # sr-* (OpenRouter) models route by MODEL NAME through LiteLLM's normal
+          # endpoint. The default ANTHROPIC_BASE_URL points at the `/anthropic`
+          # PASSTHROUGH (raw byte-forward to api.anthropic.com, chosen to avoid the
+          # Opus SSE re-chunk stall for Claude traffic) — but the passthrough is
+          # model-agnostic and ships EVERY request to Anthropic regardless of
+          # --model, so an sr-* model 4xxs as "model not found". Repoint at the
+          # LiteLLM root so claude's /v1/messages hits LiteLLM's model router →
+          # OpenRouter. Claude (default) sessions are unaffected — they keep the
+          # /anthropic passthrough.
+          if [ -n "$SWITCHROOM_LITELLM_BASE" ]; then
+            export ANTHROPIC_BASE_URL="$SWITCHROOM_LITELLM_BASE"
+            echo "session-model: sr-* override '$_override' — repointed ANTHROPIC_BASE_URL to LiteLLM router '$SWITCHROOM_LITELLM_BASE' (off /anthropic passthrough) so it routes to OpenRouter" >&2
+          fi
         fi
         ;;
     esac
