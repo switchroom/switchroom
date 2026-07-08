@@ -6,7 +6,7 @@
  *   - createBrokerClient WITHOUT agent slug → no token field in request
  *   - Token file present but unreadable (EACCES) → warn + no token
  *   - Token file present and valid → token included in get/list requests
- *   - Token present but broker returns grant-expired → VaultTokenRejectedError thrown
+ *   - Token present but broker returns grant-expired → falls through to standing ACL (#1496)
  *   - Token present but broker returns grant-revoked → VaultTokenRejectedError thrown
  *   - No token → broker denied → GetResult "denied" (no throw)
  *
@@ -317,7 +317,12 @@ describe("createBrokerClient — token rejected (grant-expired / grant-revoked)"
     vi.restoreAllMocks();
   });
 
-  it("throws VaultTokenRejectedError(grant-expired) and writes to stderr — does NOT silently fall back", async () => {
+  it("get with EXPIRED token → falls through to standing ACL (client does NOT throw) — #1496 owner divergence", async () => {
+    // #1496 (2026-05-18) deliberately changed the broker's read-path so
+    // grant-expired (unlike grant-revoked) falls through to the standing
+    // ACL instead of hard-denying — an unusable token must never be MORE
+    // restrictive than presenting no token. This client must not throw
+    // in that case; it only throws on grant-revoked (below).
     const { token, id } = await mintGrant(grantsDb, "myagent", ["foo"], 3600);
     // Backdate the expiry
     const past = Math.floor(Date.now() / 1000) - 100;
@@ -328,20 +333,14 @@ describe("createBrokerClient — token rejected (grant-expired / grant-revoked)"
     fs.mkdirSync(path.dirname(tokenPath), { recursive: true });
     fs.writeFileSync(tokenPath, token + "\n", { mode: 0o600 });
 
-    const stderrMsgs: string[] = [];
-    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(
-      (msg: string | Uint8Array) => { stderrMsgs.push(String(msg)); return true; },
-    );
-
     try {
       const client = createBrokerClient(slug, { socket: socketPath });
 
-      await expect(client.get("foo")).rejects.toThrow(VaultTokenRejectedError);
-      await expect(client.get("foo")).rejects.toMatchObject({ reason: "grant-expired" });
-
-      // Stderr must mention the error so the operator knows
-      expect(stderrMsgs.some((m) => m.includes("[vault-broker] ERROR"))).toBe(true);
-      expect(stderrMsgs.some((m) => m.includes("grant-expired"))).toBe(true);
+      const result = await client.get("foo");
+      // Falls through to the no-token peercred/ACL path — in this
+      // harness that's "denied" (test process isn't a known cron
+      // unit), never a thrown VaultTokenRejectedError.
+      expect(result.kind).toBe("denied");
     } finally {
       try { fs.rmSync(path.dirname(tokenPath), { recursive: true, force: true }); } catch { /* ignore */ }
     }
@@ -386,8 +385,10 @@ describe("createBrokerClient — token rejected (grant-expired / grant-revoked)"
     }
   });
 
-  // #226 review-fix: list() must hard-fail on token rejection, not return null silently.
-  it("list() throws VaultTokenRejectedError(grant-expired) — same hard-fail as get()", async () => {
+  // #1496 changed list()'s grant-expired handling to match get(): falls
+  // through to the standing ACL rather than hard-failing (only
+  // grant-revoked hard-denies). This mirrors the get() case above.
+  it("list() with EXPIRED token → falls through to standing ACL (does NOT throw)", async () => {
     const { token, id } = await mintGrant(grantsDb, "myagent", ["foo"], 3600);
     const past = Math.floor(Date.now() / 1000) - 100;
     grantsDb.run("UPDATE vault_grants SET expires_at = ? WHERE id = ?", [past, id]);
@@ -397,17 +398,13 @@ describe("createBrokerClient — token rejected (grant-expired / grant-revoked)"
     fs.mkdirSync(path.dirname(tokenPath), { recursive: true });
     fs.writeFileSync(tokenPath, token + "\n", { mode: 0o600 });
 
-    const stderrMsgs: string[] = [];
-    vi.spyOn(process.stderr, "write").mockImplementation(
-      (msg: string | Uint8Array) => { stderrMsgs.push(String(msg)); return true; },
-    );
-
     try {
       const client = createBrokerClient(slug, { socket: socketPath });
 
-      await expect(client.list()).rejects.toThrow(VaultTokenRejectedError);
-      await expect(client.list()).rejects.toMatchObject({ reason: "grant-expired" });
-      expect(stderrMsgs.some((m) => m.includes("grant-expired"))).toBe(true);
+      const keys = await client.list();
+      // Falls through to the no-token ACL-filtered list — empty in this
+      // harness (config.agents = {}), never a thrown error.
+      expect(Array.isArray(keys)).toBe(true);
     } finally {
       try { fs.rmSync(path.dirname(tokenPath), { recursive: true, force: true }); } catch { /* ignore */ }
     }

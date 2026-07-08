@@ -17,10 +17,15 @@
  *   createBrokerClient(agentSlug?, opts?) reads ~/.switchroom/agents/<slug>/.vault-token
  *   at init time and includes the token in every get/list request. If the file
  *   is missing or unreadable, the client falls through to peercred ACL silently.
- *   If a token IS present but the broker rejects it with grant-expired or
- *   grant-revoked, the client writes a clear message to stderr and throws so
- *   the cron exits non-zero — silent fallback to peercred is intentionally
- *   NOT done in that case (an operator must mint a fresh grant).
+ *   If a token IS present but the broker rejects it with grant-revoked, the
+ *   client writes a clear message to stderr and throws so the cron exits
+ *   non-zero — silent fallback to peercred is intentionally NOT done in that
+ *   case (an operator must mint a fresh grant). Per #1496 (2026-05-18), an
+ *   expired/invalid token on the read path instead falls through to the
+ *   standing ACL server-side — the same as revoked used to, this client's
+ *   assertTokenAccepted() only ever sees "grant-expired" in a response if the
+ *   broker's own fall-through were ever removed, so it stays defensive but is
+ *   not expected to fire in production.
  */
 
 import * as net from "node:net";
@@ -144,7 +149,8 @@ export interface BrokerClientOpts {
  * Public so tests can locate the file without duplicating the path formula.
  */
 export function vaultTokenFilePath(agentSlug: string): string {
-  return join(homedir(), ".switchroom", "agents", agentSlug, ".vault-token");
+  const base = process.env.SWITCHROOM_AGENTS_DIR || join(homedir(), ".switchroom", "agents");
+  return join(base, agentSlug, ".vault-token");
 }
 
 /**

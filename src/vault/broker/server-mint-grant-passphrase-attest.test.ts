@@ -107,6 +107,12 @@ describe("VaultBroker: mint_grant passphrase attestation (#1012 Phase 2)", () =>
   let grantsDb: Database;
   let auditEntries: AuditEntry[];
   let prevNonLinuxFlag: string | undefined;
+  // mint_grant writes a token file under resolveAgentsDir() — override
+  // SWITCHROOM_AGENTS_DIR so this test's "gymbro" mints never touch the
+  // operator's real ~/.switchroom/agents/gymbro/ (see #1561 incident on
+  // server-grants.test.ts for the class of bug this prevents).
+  let agentsDir: string;
+  let prevAgentsDirEnv: string | undefined;
 
   beforeEach(async () => {
     prevNonLinuxFlag = process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
@@ -118,6 +124,10 @@ describe("VaultBroker: mint_grant passphrase attestation (#1012 Phase 2)", () =>
 
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "broker-mint-attest-test-"));
     socketPath = path.join(tmpDir, "gymbro.sock");
+
+    agentsDir = path.join(tmpDir, "agents");
+    prevAgentsDirEnv = process.env.SWITCHROOM_AGENTS_DIR;
+    process.env.SWITCHROOM_AGENTS_DIR = agentsDir;
 
     grantsDb = makeInMemoryGrantsDb();
     auditEntries = [];
@@ -150,6 +160,11 @@ describe("VaultBroker: mint_grant passphrase attestation (#1012 Phase 2)", () =>
       fs.rmSync(tmpDir, { recursive: true, force: true });
     } catch {
       /* ignore */
+    }
+    if (prevAgentsDirEnv === undefined) {
+      delete process.env.SWITCHROOM_AGENTS_DIR;
+    } else {
+      process.env.SWITCHROOM_AGENTS_DIR = prevAgentsDirEnv;
     }
     if (prevNonLinuxFlag === undefined) {
       delete process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;

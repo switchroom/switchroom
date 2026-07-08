@@ -84,6 +84,12 @@ describe("VaultBroker: PUT with write-grant (#969 P1b)", () => {
   let grantsDb: Database;
   let auditEntries: AuditEntry[];
   let prevNonLinuxFlag: string | undefined;
+  // mint_grant writes a token file under resolveAgentsDir() — override
+  // SWITCHROOM_AGENTS_DIR so this suite's mints never touch the operator's
+  // real ~/.switchroom/agents/ (same class of bug fixed in
+  // server-grants.test.ts / server-mint-grant-posture-attest.test.ts).
+  let agentsDir: string;
+  let prevAgentsDirEnv: string | undefined;
   const PASSPHRASE = "test-pass-phrase-for-this-test-only";
 
   beforeEach(async () => {
@@ -93,6 +99,10 @@ describe("VaultBroker: PUT with write-grant (#969 P1b)", () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "broker-write-grant-test-"));
     socketPath = path.join(tmpDir, "test.sock");
     vaultPath = path.join(tmpDir, "vault.enc");
+
+    agentsDir = path.join(tmpDir, "agents");
+    prevAgentsDirEnv = process.env.SWITCHROOM_AGENTS_DIR;
+    process.env.SWITCHROOM_AGENTS_DIR = agentsDir;
 
     // Real vault file on disk seeded with `existing_key` — broker PUT
     // calls saveVault, so the on-disk file must exist and the broker
@@ -126,6 +136,11 @@ describe("VaultBroker: PUT with write-grant (#969 P1b)", () => {
   afterEach(() => {
     broker.stop();
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    if (prevAgentsDirEnv === undefined) {
+      delete process.env.SWITCHROOM_AGENTS_DIR;
+    } else {
+      process.env.SWITCHROOM_AGENTS_DIR = prevAgentsDirEnv;
+    }
     if (prevNonLinuxFlag === undefined) {
       delete process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
     } else {

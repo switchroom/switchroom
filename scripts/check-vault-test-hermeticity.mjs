@@ -93,9 +93,19 @@ const HOME_RESOLUTION_PATTERNS = [
  *
  * The `=` here is intentional (assignment, not equality). We allow both
  * `process.env.HOME = ...` and the destructuring/spread forms.
+ *
+ * NOTE: `process.env.HOME = tmpDir` does NOT actually isolate anything —
+ * `os.homedir()` is cached by the Node/bun runtime at process start and
+ * does not reread `process.env.HOME` afterward (confirmed empirically).
+ * The reliable override honored by `resolveAgentsDir()` (which the
+ * broker's mint_grant/revoke_grant token-write paths call) is
+ * `process.env.SWITCHROOM_AGENTS_DIR`. Kept HOME here for legacy-pattern
+ * detection so old offenders still get flagged if they lose their (inert)
+ * mitigation comment; new tests should use SWITCHROOM_AGENTS_DIR instead.
  */
 const HOME_OVERRIDE_PATTERNS = [
-  /\bprocess\.env\.HOME\s*=/,                // direct assignment
+  /\bprocess\.env\.HOME\s*=/,                // direct assignment (legacy — does not actually isolate os.homedir())
+  /\bprocess\.env\.SWITCHROOM_AGENTS_DIR\s*=/, // the reliable override honored by resolveAgentsDir()
   /\bsetEnv\s*\(\s*["']HOME["']/,            // a helper like setEnv("HOME", ...)
 ];
 
@@ -246,12 +256,15 @@ if (isCli) {
   process.stderr.write(
     "\n" +
     "Each flagged test resolves the operator's REAL home through `os.homedir()`\n" +
-    "(or a literal `~/.switchroom` string) without setting `process.env.HOME`\n" +
-    "to a tmpdir first. On a shared production-treated host this corrupts\n" +
-    "`~/.switchroom/agents/` and, transitively, `vault/vault.enc` — incident\n" +
-    "2026-05-20. Fix: in the test's `beforeEach` (BEFORE `broker.start()`):\n\n" +
-    "    const prevHome = process.env.HOME;\n" +
-    "    process.env.HOME = tmpDir;\n\n" +
+    "(or a literal `~/.switchroom` string) without an isolation override.\n" +
+    "On a shared production-treated host this corrupts `~/.switchroom/agents/`\n" +
+    "and, transitively, `vault/vault.enc` — incident 2026-05-20. Fix: in the\n" +
+    "test's `beforeEach` (BEFORE `broker.start()`), set SWITCHROOM_AGENTS_DIR\n" +
+    "to a tmpdir — this is the override actually honored by resolveAgentsDir()\n" +
+    "(unlike `process.env.HOME`, which os.homedir() does not reread after\n" +
+    "process start):\n\n" +
+    "    const prevAgentsDirEnv = process.env.SWITCHROOM_AGENTS_DIR;\n" +
+    "    process.env.SWITCHROOM_AGENTS_DIR = path.join(tmpDir, \"agents\");\n\n" +
     "and restore in `afterEach`. If the test is INTENTIONALLY exercising the\n" +
     "real-home resolution (rare — usually a dedicated guard regression test),\n" +
     "add a comment containing `SWITCHROOM_HERMETICITY_LINT: allow-real-home`\n" +

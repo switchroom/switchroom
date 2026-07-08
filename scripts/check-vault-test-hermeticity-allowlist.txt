@@ -28,8 +28,6 @@ src/vault/broker/auto-unlock.test.ts
 src/vault/broker/client-token.test.ts
 src/vault/broker/scope.test.ts
 src/vault/broker/server-approvals.test.ts
-src/vault/broker/server-mint-grant-passphrase-attest.test.ts
-src/vault/broker/server-mint-grant-posture-attest.test.ts
 src/vault/broker/server-passphrase-attest.test.ts
 src/vault/broker/server-token-fallthrough.test.ts
 # Below are flagged on the literal "~/.switchroom" socket string inside their
@@ -41,6 +39,5 @@ src/vault/broker/server-token-fallthrough.test.ts
 # future test that DOES rely on the config string can't accidentally land
 # the literal.
 src/vault/broker/server-unlock.test.ts
-src/vault/broker/server-write-grants.test.ts
 src/vault/broker/server.test.ts
 src/vault/resolver-via-broker.test.ts
