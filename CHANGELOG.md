@@ -1,5 +1,54 @@
 # Changelog
 
+## v0.18.0 — Model-routing hardening: boot self-heal, full OpenRouter sr-* coverage, subscription-compliance docs
+
+Hardens the LiteLLM routing layer so a boot-time proxy outage can no longer
+strand an agent on direct-untracked OAuth for its whole life, opens up the
+`/model` command to every registered OpenRouter model without bloating the menu,
+and documents the routing architecture and its subscription-compliance
+invariants end to end. LiteLLM stays an *optional* metering gateway layered over
+subscription-native Claude OAuth — the fail-open model is the load-bearing
+property, and this release makes it precise about *when* to fail open.
+
+### Model-routing & subscription-compliance docs (#2939)
+
+Adds `docs/model-routing.md` documenting the routing architecture: LiteLLM as an
+OPTIONAL metering gateway layered over subscription-native Claude OAuth, the
+fail-open model (agents boot-probe litellm liveliness and, on missing-key or
+unreachable proxy, strip routing → direct OAuth only), and the
+subscription-compliance invariants that keep Claude traffic on the OAuth path
+rather than a metered API path. Establishes the ground truth the following two
+fixes are written against.
+
+### Boot self-heal — keep routing in place when the proxy is unreachable (#2940)
+
+Splits the boot fail-open into two distinct modes across BOTH the outer
+gateway-hoist and inner claude-process blocks of `start.sh.hbs`, instead of
+collapsing every probe failure into "strip routing":
+
+- **MISSING virtual key** → strip routing and fall back to direct OAuth (the key
+  will never appear on its own; nothing to wait for).
+- **Proxy UNREACHABLE** → keep the routing env in place with a loud, non-fatal
+  warning, so the agent self-heals the moment litellm recovers instead of being
+  pinned to direct-untracked OAuth for the rest of its life.
+
+Also routes `ANTHROPIC_BASE_URL` by model class in `compose.ts` (`isClaudeModel`
+→ `/anthropic` passthrough, everything else → litellm root) and adds a
+post-resolution `sr-*` passthrough→router repoint gate so non-Claude default
+models route correctly. Regression tests execute the extracted bash dispatch and
+assert the routing env survives an unreachable proxy vs. is stripped on a
+missing key.
+
+### Full OpenRouter sr-* coverage via `/model` passthrough (#2941)
+
+The `/model` menu keyboard stays curated to the main models, but typing
+`/model sr-<any-registered-openrouter-id>` now passes through and switches — a
+shape-gate only, no whitelist. Adds 8 display labels (GPT-OSS 20B/120B, GPT-5.5,
+GPT-5 Codex, GPT-5.2 Codex, Gemini 3.1 Flash Lite, MiniMax M3, DeepSeek V4 Flash)
+and bumps the `sr-glm-5` label to GLM-5.2. `SR_MODEL_ALIASES` (the 6-entry menu
+source) is intentionally left unchanged so the keyboard isn't bloated — the new
+models are typeable, not menued.
+
 ## v0.17.11 — Telegram rich-message rendering (default-on) + Hindsight recall precision + gateway FIFO/reaper hardening
 
 Ships the Telegram-native rich-formatting engine end to end and flips it
