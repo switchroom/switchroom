@@ -42,6 +42,7 @@ interface MakeConfigAgent {
   admin?: boolean;
   root?: boolean;
   env?: Record<string, string>;
+  model?: string;
   bind_mounts?: Array<{ source: string; target?: string; mode?: "ro" | "rw" }>;
   resources?: { memory?: string; memory_reservation?: string; pids_limit?: number; cpus?: number };
   timezone?: string;
@@ -87,6 +88,7 @@ function makeConfig(
           admin: cfg.admin,
           root: cfg.root,
           env: cfg.env,
+          model: cfg.model,
           bind_mounts: cfg.bind_mounts,
           resources: cfg.resources,
           timezone: cfg.timezone,
@@ -3261,5 +3263,51 @@ describe("generateCompose — voice-sidecar (PR-B2)", () => {
       else process.env.HOME = prevHome;
       rmSync(homeDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("generateCompose — LiteLLM ANTHROPIC_BASE_URL model-class routing", () => {
+  // A Claude default rides the `<root>/anthropic` raw pass-through (dodges the
+  // Opus SSE re-chunk stall). A non-Claude DEFAULT (`model: sr-glm-5`) has no
+  // `.session-model-override` carrier, so it MUST be pointed at the model-mapped
+  // router root at compose time or it 4xxs on every call against the pass-
+  // through. Mirrors the isClaudeModel split src/setup/hindsight.ts applies.
+  const ROOT = "http://litellm.internal:4010";
+
+  function composeFor(model: string | undefined, confirmed = true): string {
+    const config = makeConfig(
+      { router: { model } },
+      { litellm: { enabled: true, base_url: ROOT } },
+    );
+    return generateCompose({
+      config,
+      litellmConfirmedAgents: confirmed ? new Set(["router"]) : undefined,
+    });
+  }
+
+  it("non-Claude configured model → ANTHROPIC_BASE_URL has NO /anthropic suffix (router root)", () => {
+    const out = composeFor("sr-glm-5");
+    expect(out).toContain(`ANTHROPIC_BASE_URL: "${ROOT}"`);
+    expect(out).not.toContain(`ANTHROPIC_BASE_URL: "${ROOT}/anthropic"`);
+    // Router markers still present.
+    expect(out).toContain(`SWITCHROOM_LITELLM_BASE: "${ROOT}"`);
+    expect(out).toContain('SWITCHROOM_LITELLM: "1"');
+  });
+
+  it("Claude configured model → ANTHROPIC_BASE_URL keeps the /anthropic pass-through", () => {
+    const out = composeFor("claude-opus-4-8");
+    expect(out).toContain(`ANTHROPIC_BASE_URL: "${ROOT}/anthropic"`);
+  });
+
+  it("unset model (fleet default is Claude) → keeps the /anthropic pass-through", () => {
+    const out = composeFor(undefined);
+    expect(out).toContain(`ANTHROPIC_BASE_URL: "${ROOT}/anthropic"`);
+  });
+
+  it("no virtual key confirmed → NO routing env injected at all (fail-safe)", () => {
+    const out = composeFor("sr-glm-5", false);
+    // keyConfirmed false ⇒ the whole routing block is skipped, so the proxy URL
+    // never appears for this agent (no unauthenticated proxy calls).
+    expect(out).not.toContain(ROOT);
   });
 });

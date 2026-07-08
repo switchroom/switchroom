@@ -207,4 +207,79 @@ describe("scaffoldAgent: session-only model override carrier (start.sh)", () => 
     expect(alert).toContain("sr-glm-5");
     expect(alert).toContain("LiteLLM");
   });
+
+  // --- CONFIGURED-DEFAULT sr-* (persistent, NO override carrier) --------------
+  // An agent whose switchroom.yaml sets `model: sr-glm-5` has no
+  // `.session-model-override` file, so the repoint MUST also cover the
+  // configured-default path (the post-resolution gate), or the agent 4xxs on
+  // every call against the /anthropic passthrough. Scaffold a dedicated agent
+  // with a non-Claude default and drive its block directly.
+  it("configured-default sr-* (no override) + LiteLLM up → repoints to router root", () => {
+    const smTmp = mkdtempSync(join(tmpdir(), "switchroom-session-model-srdef-"));
+    try {
+      const name = "sr-default-agent";
+      const cfg = makeAgentConfig({ model: "sr-glm-5" } as Partial<AgentConfig>);
+      const res = scaffoldAgent(name, cfg, smTmp, telegramConfig, makeSwitchroomConfig(name, cfg));
+      const startSh = readFileSync(join(res.agentDir, "start.sh"), "utf-8");
+      const start = startSh.indexOf("# --- Session-only model override");
+      const anchor = startSh.indexOf('printf \'%s\\n\' "$_EFFECTIVE_MODEL" > ');
+      const end = startSh.indexOf("\n", anchor);
+      const srBlock = startSh.slice(start, end);
+
+      // The configured default is baked into the block as sr-glm-5 (no carrier).
+      expect(srBlock).toContain("_EFFECTIVE_MODEL='sr-glm-5'");
+
+      // LiteLLM reachable → post-resolution gate repoints off /anthropic.
+      const script = [
+        "set -e",
+        `export ANTHROPIC_BASE_URL=${JSON.stringify(PASSTHROUGH)}`,
+        `export SWITCHROOM_LITELLM_BASE=${JSON.stringify(ROUTER_ROOT)}`,
+        "_LITELLM_OK=1",
+        srBlock,
+        'echo "EFFECTIVE=$_EFFECTIVE_MODEL"',
+        'echo "BASEURL=$ANTHROPIC_BASE_URL"',
+      ].join("\n");
+      const out = execFileSync("bash", ["-c", script], { encoding: "utf-8" });
+      expect(out).toContain("EFFECTIVE=sr-glm-5");
+      expect(out).toContain(`BASEURL=${ROUTER_ROOT}`);
+      expect(out).not.toContain(`BASEURL=${PASSTHROUGH}`);
+    } finally {
+      rmSync(smTmp, { recursive: true, force: true });
+    }
+  });
+
+  it("configured-default sr-* (no override) + LiteLLM DOWN → non-fatal, no crash, no Claude fallback", () => {
+    const smTmp = mkdtempSync(join(tmpdir(), "switchroom-session-model-srdown-"));
+    try {
+      const name = "sr-default-agent";
+      const cfg = makeAgentConfig({ model: "sr-glm-5" } as Partial<AgentConfig>);
+      const res = scaffoldAgent(name, cfg, smTmp, telegramConfig, makeSwitchroomConfig(name, cfg));
+      const startSh = readFileSync(join(res.agentDir, "start.sh"), "utf-8");
+      const start = startSh.indexOf("# --- Session-only model override");
+      const anchor = startSh.indexOf('printf \'%s\\n\' "$_EFFECTIVE_MODEL" > ');
+      const end = startSh.indexOf("\n", anchor);
+      const srBlock = startSh.slice(start, end);
+
+      // Proxy down: compose already pointed a non-Claude default at the router
+      // root, so we simulate that starting env. The block must NOT crash and
+      // must NOT rewrite the effective model to a Claude default — a persistent
+      // sr-* agent runs degraded until litellm returns.
+      const script = [
+        "set -e",
+        `export ANTHROPIC_BASE_URL=${JSON.stringify(ROUTER_ROOT)}`,
+        `export SWITCHROOM_LITELLM_BASE=${JSON.stringify(ROUTER_ROOT)}`,
+        '_LITELLM_OK=""',
+        srBlock,
+        'echo "EFFECTIVE=$_EFFECTIVE_MODEL"',
+        'echo "BASEURL=$ANTHROPIC_BASE_URL"',
+      ].join("\n");
+      const out = execFileSync("bash", ["-c", script], { encoding: "utf-8" });
+      // Effective model stays sr-glm-5 (no Claude fallback for a persistent default).
+      expect(out).toContain("EFFECTIVE=sr-glm-5");
+      // Routing left in place (still the router root compose set).
+      expect(out).toContain(`BASEURL=${ROUTER_ROOT}`);
+    } finally {
+      rmSync(smTmp, { recursive: true, force: true });
+    }
+  });
 });
