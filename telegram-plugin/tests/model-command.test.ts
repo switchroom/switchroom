@@ -445,6 +445,70 @@ describe("handleModelCommand — Claude → sr-* session relaunch", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Manual full-sr-* passthrough (Ken 2026-07-08): the /model MENU stays curated
+// to the main SR_MODEL_ALIASES set, but typing `/model <any registered sr-*>`
+// must switch to that exact model — the set path is a SHAPE gate only, with NO
+// whitelist against SR_MODEL_LABELS / SR_MODEL_ALIASES. These guard that any
+// arbitrary sr-* id passes through verbatim and schedules the relaunch on the
+// exact id (not rejected, not remapped, not injected).
+// ---------------------------------------------------------------------------
+describe("handleModelCommand — arbitrary sr-* passthrough (no whitelist)", () => {
+  // sr-* names that are NOT in SR_MODEL_ALIASES (so not menu-reachable) but ARE
+  // registered in the live litellm config — must still switch when typed.
+  const ARBITRARY_SR = [
+    "sr-gpt-oss-120b",
+    "sr-gpt-oss-20b",
+    "sr-minimax-m3",
+    "sr-gemini-flash-lite",
+    "sr-gpt-5.5",
+    "sr-gpt-5-codex",
+    "sr-gpt-5.2-codex",
+    "sr-deepseek-v4-flash",
+  ];
+
+  it("each arbitrary sr-* passes the shape gate and isSrModel", () => {
+    for (const name of ARBITRARY_SR) {
+      expect(isValidModelArg(name), `${name} must pass MODEL_ARG_RE`).toBe(true);
+      expect(isSrModel(name), `${name} must be recognised as sr-*`).toBe(true);
+      expect(isClaudeModel(name)).toBe(false);
+    }
+  });
+
+  it("relaunches on the exact typed id — not rejected, not remapped", async () => {
+    for (const name of ARBITRARY_SR) {
+      const { deps, calls, restartCalls, relaunchCalls } = makeDeps({
+        getActiveSessionModel: () => null,
+      });
+      const reply = await handleModelCommand({ kind: "set", model: name }, deps);
+      // Never injected (claude's picker rejects sr-* ids).
+      expect(calls, `${name} must not inject`).toHaveLength(0);
+      // Never the sr→claude restart path (source session is Claude here).
+      expect(restartCalls, `${name} must not scheduleRestart`).toHaveLength(0);
+      // Scheduled the carrier relaunch on the EXACT id (no alias remap).
+      expect(relaunchCalls).toHaveLength(1);
+      expect(relaunchCalls[0].model, `${name} must relaunch verbatim`).toBe(name);
+      expect(reply.text).toContain(name);
+    }
+  });
+
+  it("parseModelCommand accepts arbitrary sr-* ids as a set command", () => {
+    for (const name of ARBITRARY_SR) {
+      expect(parseModelCommand(`/model ${name}`)).toEqual({ kind: "set", model: name });
+    }
+  });
+
+  it("switching FROM an arbitrary sr-* back to Claude takes the restart path", async () => {
+    const { deps, calls, restartCalls, relaunchCalls } = makeDeps({
+      getActiveSessionModel: () => "sr-gpt-oss-120b",
+    });
+    await handleModelCommand({ kind: "set", model: "opus" }, deps);
+    expect(calls).toHaveLength(0);
+    expect(relaunchCalls).toHaveLength(0);
+    expect(restartCalls).toHaveLength(1);
+  });
+});
+
 describe("inject allowlist contract", () => {
   it("/model stays on the inject allowlist (the set path depends on it)", async () => {
     const { INJECT_COMMANDS } = await import("../../src/agents/inject.js");
@@ -748,6 +812,58 @@ describe("SR_MODEL_LABELS", () => {
   it("has friendly names for the standard sr-* models", () => {
     expect(SR_MODEL_LABELS["sr-gemini-2.5-pro"]).toBe("Gemini 2.5 Pro");
     expect(SR_MODEL_LABELS["sr-deepseek-r1"]).toBe("DeepSeek R1");
+  });
+
+  it("bumps sr-glm-5 label to GLM-5.2 (now targets glm-5.2 in litellm)", () => {
+    expect(SR_MODEL_LABELS["sr-glm-5"]).toBe("GLM-5.2");
+  });
+
+  it("has friendly names for the new OpenRouter sr-* models (display-only)", () => {
+    expect(SR_MODEL_LABELS["sr-gpt-oss-20b"]).toBe("GPT-OSS 20B");
+    expect(SR_MODEL_LABELS["sr-gpt-oss-120b"]).toBe("GPT-OSS 120B");
+    expect(SR_MODEL_LABELS["sr-gpt-5.5"]).toBe("GPT-5.5");
+    expect(SR_MODEL_LABELS["sr-gpt-5-codex"]).toBe("GPT-5 Codex");
+    expect(SR_MODEL_LABELS["sr-gpt-5.2-codex"]).toBe("GPT-5.2 Codex");
+    expect(SR_MODEL_LABELS["sr-gemini-flash-lite"]).toBe("Gemini 3.1 Flash Lite");
+    expect(SR_MODEL_LABELS["sr-minimax-m3"]).toBe("MiniMax M3");
+    expect(SR_MODEL_LABELS["sr-deepseek-v4-flash"]).toBe("DeepSeek V4 Flash");
+  });
+});
+
+describe("menu stays curated — new OpenRouter models are display-only, not in the picker", () => {
+  // The 8 new models are typeable (manual passthrough) but must NOT bloat the
+  // /model keyboard. externalModelNames() seeds the picker from SR_MODEL_ALIASES
+  // values, so these ids must be ABSENT from both the alias table and the picker
+  // list. This locks in Ken's "menu = main models only" decision.
+  const NEW_SR = [
+    "sr-gpt-oss-20b",
+    "sr-gpt-oss-120b",
+    "sr-gpt-5.5",
+    "sr-gpt-5-codex",
+    "sr-gpt-5.2-codex",
+    "sr-gemini-flash-lite",
+    "sr-minimax-m3",
+    "sr-deepseek-v4-flash",
+  ];
+
+  it("SR_MODEL_ALIASES stays the curated 6-entry main set (no new short aliases)", () => {
+    expect(Object.keys(SR_MODEL_ALIASES).sort()).toEqual(
+      ["codex", "deepseek", "flash", "gemini", "glm", "r1"],
+    );
+    // None of the new sr-* ids are an alias target.
+    const targets = new Set(Object.values(SR_MODEL_ALIASES));
+    for (const name of NEW_SR) {
+      expect(targets.has(name), `${name} must NOT be an alias target`).toBe(false);
+    }
+  });
+
+  it("externalModelNames (picker seed) excludes the new models", () => {
+    const picker = externalModelNames([]);
+    for (const name of NEW_SR) {
+      expect(picker.includes(name), `${name} must NOT appear in the picker`).toBe(false);
+    }
+    // The curated main set is still exactly the alias targets.
+    expect(picker.sort()).toEqual([...new Set(Object.values(SR_MODEL_ALIASES))].sort());
   });
 });
 
