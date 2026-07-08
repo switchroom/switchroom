@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.18.2 — Fix progress-card freeze during foreground sub-agent delegation
+
+The Telegram progress card could freeze mid-turn (observed stuck at 41s and
+3m12s) while a foreground sub-agent was still working underneath. Fixes on top
+of v0.18.1.
+
+### Keep the post-answer liveness card climbing during sub-agent delegation (#2947)
+
+`evaluatePostAnswerLiveness` (`turn-liveness-floor.ts`) had a single signal —
+elapsed time since the last watcher tick vs. a hardcoded 30s staleness cap —
+with no way to distinguish "sub-agent finished" from "sub-agent silently
+mid-step." Once a long silent step exceeded 30s the verdict flipped to
+`'stale'` and the card stopped updating, exactly the reported freeze.
+
+Adds a `stillDispatched` input, sourced at the call site from the pre-existing
+`turn.foregroundSubAgents.size > 0` lifecycle map, that bypasses the cap only
+while a foreground sub-agent is genuinely still tracked; the cap re-engages
+normally the moment the sub-agent completes. Background workers
+(`worker-activity-feed.ts`) were unaffected — they run their own independent,
+clock-driven heartbeat and were never subject to this cap.
+
+New regression coverage renders the actual card text at the reported 41s/3m12s
+marks (not just the internal verdict), and `claude-code-event-contract.test.ts`
+was hardened into a version-drift canary so a future Claude Code CLI change to
+the session-transcript JSONL shape fails CI loudly instead of silently
+degrading.
+
 ## v0.18.1 — Fix inbound-delivery wedge (intercepted messages) + vault test-isolation leak
 
 Two fixes on top of v0.18.0. The gateway fix is fleet-wide: the wedge it closes
