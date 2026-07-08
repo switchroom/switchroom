@@ -15484,30 +15484,32 @@ async function handleInbound(
   // network RTT) but not a user-perceived end-to-end measurement.
   const inboundReceivedAt = Date.now()
 
-  // Phase 2b shadow: inbound arrival. Emit BEFORE the snapshot/gate
-  // logic so the machine sees the event at the same point in time the
-  // imperative code would. The machine internally handles fresh-turn
-  // vs mid-turn — its decision will be visible in the gw-trace shadow
-  // line emitted to stderr.
-  const _shadowKey = statusKey(ctx.chat?.id != null ? String(ctx.chat.id) : '0', ctx.message?.message_thread_id) as _ChatKey
-  // PR3b-cutover: snapshot the machine's in-turn state BEFORE the
-  // inbound event advances it. A fresh-turn inbound transitions the
-  // machine idle→in_turn; reading after the emit would see THIS
-  // message's own just-started turn and self-block it (the same
-  // self-block hazard the claudeBusyKeys snapshot below guards). When
-  // the kill-switch is off this is null and the gate uses the legacy
+  // PR3b-cutover: snapshot the machine's in-turn state AT RECEIPT, before
+  // this handler emits the `inbound` event (that emit is DEFERRED below to
+  // the delivery-commit point — search DEFERRED_INBOUND_EMIT). A fresh-turn
+  // inbound transitions the machine idle→in_turn; reading after the emit
+  // would see THIS message's own just-started turn and self-block it (the
+  // same self-block hazard the claudeBusyKeys snapshot below guards). Null
+  // when the kill-switch is off, in which case the gate uses the legacy
   // claudeBusyKeys read.
+  //
+  // WHY THE INBOUND EMIT IS DEFERRED (overlord /usage wedge, 2026-07-08):
+  // the `inbound` event drives the now-AUTHORITATIVE turn-in-flight gate
+  // (turnInFlightForGate → isMachineInTurn). Emitting it HERE — at handler
+  // entry, before the intercept gauntlet below (permission-reply, /auth
+  // paste-back, interrupt-empty, secret-detect drop, …) — drove the machine
+  // into `bridge_alive_in_turn` for messages that then EARLY-RETURN as an
+  // intercept and never become a turn. No delivery, no claudeBusyKeys mark,
+  // and critically no `turnEnd` ever fires, so the machine held the gate
+  // closed until the 5-min TTL tick force-cleared it — buffering every
+  // subsequent inbound (including /usage) the whole time. That is exactly
+  // the dangerous `machine_over_holds` divergence gate-parity-probe.ts
+  // flags. The imperative claudeBusyKeys tracker got it right (never marked
+  // busy for the intercepted message); the machine was mis-fed. Fix: emit
+  // `inbound` only once the message clears every intercept and reaches the
+  // deliver-or-buffer decision, keeping the machine in lockstep with the
+  // imperative delivery lifecycle it models.
   const machineInTurnAtReceipt = isDeliveryCutoverEnabled() ? isMachineInTurn() : null
-  shadowEmit({
-    kind: 'inbound',
-    key: _shadowKey,
-    msg: {
-      msgId: ctx.message?.message_id ?? 0,
-      isSteering: false, // refined in PR 3 — for now shadow conservatively classifies as non-steering
-      payload: null,
-    },
-    at: Date.now(),
-  })
 
   // #1556 self-blocking fix (v0.12.22): snapshot the live turn-state
   // BEFORE the fresh-turn branch (line ~7357) sets activeTurnStartedAt
@@ -16703,6 +16705,29 @@ async function handleInbound(
     }
     return
   }
+
+  // DEFERRED_INBOUND_EMIT — drive the delivery state machine's `inbound`
+  // event HERE, not at handler entry. Every intercept/early-return above
+  // (permission-reply, /auth paste-back, interrupt-empty, secret-detect
+  // drop, drop/pair) has been passed, so any message reaching this point is
+  // a genuine turn the imperative code is about to deliver or buffer. That
+  // keeps the machine's authoritative turn-in-flight state in lockstep with
+  // the imperative delivery it models and can never be advanced into
+  // `bridge_alive_in_turn` by a message that never becomes a turn — the
+  // overlord /usage wedge of 2026-07-08 (see machineInTurnAtReceipt above).
+  // isSteering is now the real classification (computed at ~line 16289), so
+  // the machine correctly distinguishes a mid-turn steer (delivered, no new
+  // turn) from a fresh turn.
+  shadowEmit({
+    kind: 'inbound',
+    key: statusKey(chat_id, messageThreadId) as _ChatKey,
+    msg: {
+      msgId: msgId ?? 0,
+      isSteering,
+      payload: null,
+    },
+    at: Date.now(),
+  })
 
   // PR2 obligation-ledger OPEN — BEFORE the buffer-until-idle / deliver split so
   // a mid-turn cross-topic inbound (the 715 case) is tracked whether it is
