@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.18.1 — Fix inbound-delivery wedge (intercepted messages) + vault test-isolation leak
+
+Two fixes on top of v0.18.0. The gateway fix is fleet-wide: the wedge it closes
+could silently stop an agent from receiving *any* Telegram inbound for minutes.
+
+### Defer the delivery-machine inbound emit past the intercept gauntlet (#2945)
+
+`handleInbound` drove the delivery state machine's `inbound` event **eagerly at
+handler entry**, before the intercept/early-return paths (permission-reply,
+`/auth` paste-back, interrupt empty-body, secret-detect drop, drop/pair). Since
+the machine is now authoritative for the turn-in-flight gate
+(`turnInFlightForGate → isMachineInTurn`), an intercepted message — e.g. an
+operator approval reply — drove the machine `idle → bridge_alive_in_turn` and
+then early-returned as an intercept: no delivery, no `claudeBusyKeys` mark, and
+critically no `turnEnd`. The machine held the gate closed until the 5-minute
+`TURN_TTL_MS` tick force-cleared it, buffering **every** subsequent inbound
+(including `/usage`) the whole time — the exact `machine_over_holds` divergence
+`gate-parity-probe.ts` was built to flag (observed live on `overlord`,
+2026-07-08).
+
+The `inbound` emit now fires at the delivery-commit point (after every
+intercept, before the deliver-or-buffer decision) and carries the real
+`isSteering` classification. The machine can no longer be advanced into a turn
+by a message that never becomes one, keeping it in lockstep with the imperative
+delivery lifecycle it models. Kill switch (`SWITCHROOM_DELIVERY_MACHINE_CUTOVER=0`)
+still reverts to the legacy `claudeBusyKeys` read. New source-pin
+`inbound-emit-after-intercepts.test.ts` fails on the pre-fix layout.
+
+### Vault token/grant paths respect `SWITCHROOM_AGENTS_DIR` (#2944)
+
+`vaultTokenFilePath()` and the mint/revoke-grant paths ignored
+`SWITCHROOM_AGENTS_DIR`, so a test that forgot `_testGrantsDb` silently wrote to
+the real production grants DB — the vector that leaked 64 fake `uat-agent` grant
+rows into `vault-grants.db` over months. The token-file path now honors the
+override. (Follow-up tracked: `openGrantsDb()` still lacks a
+`safeGrantsDbPath()` guard analogous to the vault/audit-log guards.)
+
 ## v0.18.0 — Model-routing hardening: boot self-heal, full OpenRouter sr-* coverage, subscription-compliance docs
 
 Hardens the LiteLLM routing layer so a boot-time proxy outage can no longer
