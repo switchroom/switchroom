@@ -82,6 +82,8 @@ export function assertPlausibleHostHome(homePrefix: string): void {
 }
 import { scheduleNeedsCronSession } from "../scheduler/cron-routing.js";
 import { applyDefaultTier } from "../scheduler/tier-selector.js";
+import { resolveMainModel } from "./scaffold.js";
+import { isClaudeModel } from "../../telegram-plugin/gateway/model-command.js";
 import { resolveAgentConfig } from "../config/merge.js";
 import { resolveTimezone } from "../config/timezone.js";
 import { isReservedAgentName } from "../vault/broker/peercred.js";
@@ -740,6 +742,19 @@ interface AgentServiceData {
     smallFastModel: string;
   };
   /**
+   * Cascade-resolved configured DEFAULT model for this agent (via
+   * `resolveMainModel`, so `undefined`/"default" → the known-good fleet
+   * default and any explicit id/alias passes through). Load-bearing for
+   * LiteLLM routing: `emitAgentService` gates `ANTHROPIC_BASE_URL` on the
+   * model CLASS — Claude models ride the `<root>/anthropic` raw pass-through
+   * (dodges the Opus SSE re-chunk stall), but a non-Claude default (e.g.
+   * `model: sr-glm-5`) MUST hit the model-mapped router root, because the
+   * pass-through is model-agnostic and always forwards to Anthropic (an sr-*
+   * model 4xxs "model not found" there). Same `isClaudeModel` split
+   * `src/setup/hindsight.ts` already applies for its subprocess.
+   */
+  model: string;
+  /**
    * Resolved IANA timezone for this agent (e.g. "Australia/Melbourne").
    * Walks the four-step cascade in `resolveTimezone`:
    * agent → profile (via merge) → switchroom.timezone → server detection
@@ -846,6 +861,11 @@ export function describeAgents(
             ?.small_fast_model ??
           "claude-haiku-4-5-20251001",
       },
+      // Cascade-resolved configured default model (gates ANTHROPIC_BASE_URL
+      // model-class routing in emitAgentService). resolveMainModel maps
+      // undefined/"default" → the fleet default and passes explicit ids/aliases
+      // (incl. non-Claude sr-*) through unchanged.
+      model: resolveMainModel(resolved.model),
       // Resolve once at describe-time so the same value lands in TZ
       // and SWITCHROOM_TIMEZONE in `emitAgentService`. The resolver
       // is pure modulo the server-detection probes, so two consecutive
@@ -2208,7 +2228,14 @@ function emitAgentService(
     const root = a.litellm.baseUrl.replace(/\/+$/, "");
     env.SWITCHROOM_LITELLM = "1";
     env.SWITCHROOM_LITELLM_BASE = root;
-    env.ANTHROPIC_BASE_URL = `${root}/anthropic`;
+    // Route by model CLASS (mirror src/setup/hindsight.ts): a Claude default
+    // rides the `<root>/anthropic` raw pass-through (dodges the Opus SSE
+    // re-chunk stall), but a non-Claude default (e.g. `model: sr-glm-5`) has
+    // NO `.session-model-override` carrier, so start.sh's sr-* repoint would
+    // never fire — it would 4xx on every call against the model-agnostic
+    // pass-through. Point it straight at the model-mapped router root so a
+    // persistent sr-* default routes to OpenRouter from the first turn.
+    env.ANTHROPIC_BASE_URL = isClaudeModel(a.model) ? `${root}/anthropic` : root;
     env.ANTHROPIC_SMALL_FAST_MODEL = a.litellm.smallFastModel;
   }
   // SWITCHROOM_VOICE_ENGINE: the host's voice-transcription verdict

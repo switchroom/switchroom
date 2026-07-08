@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { scaffoldAgent } from "../src/agents/scaffold.js";
@@ -97,24 +98,84 @@ describe("start.sh: LiteLLM ANTHROPIC_CUSTOM_HEADERS hoisted before gateway fork
     expect(headersIdx2, "inner ANTHROPIC_CUSTOM_HEADERS export not found").toBeGreaterThan(forkIdx);
   });
 
-  it("outer block has fail-open behavior matching the inner block", () => {
+  it("outer block splits missing-key (strip) vs unreachable (KEEP routing) like the inner block", () => {
     const startSh = renderStartSh();
-
-    // Both fallback log lines must be present (one per fallback branch).
-    const outerFallbackCount = (
-      startSh.match(/litellm\(outer\): .*falling back to direct OAuth/g) ?? []
-    ).length;
-    // Two fallback branches: missing key and unreachable proxy.
-    expect(outerFallbackCount).toBeGreaterThanOrEqual(1);
-
-    // Fail-open: on unreachable proxy, strip routing env in the outer block too.
-    // The outer `unset` must appear before the gateway fork.
     const forkIdx = startSh.indexOf(GATEWAY_FORK);
+    const outerBlockIdx = startSh.indexOf(LITELLM_GATE);
+    // Slice to the OUTER block only (marker → gateway fork) so these assertions
+    // never accidentally match the inner (claude-process) block.
+    const outerSlice = startSh.slice(outerBlockIdx, forkIdx);
+
+    // The unreachable branch is now distinguished by its own flag — it must NOT
+    // fall through to the fail-open unset.
+    expect(outerSlice).toContain('sr_ll_unreachable="1"');
+    // The unreachable branch keeps routing and loud-warns (routing must survive
+    // into the inner tmux pass — the inner self-heal block is gated on
+    // SWITCHROOM_LITELLM, which the old strip removed HERE).
+    expect(outerSlice).toContain("routing LEFT IN PLACE");
+    expect(outerSlice).toContain("NOT falling back to untracked direct Anthropic OAuth");
+    // The OLD unreachable-strip log is gone from the outer block.
+    expect(outerSlice).not.toContain(
+      "falling back to direct OAuth (no tracking/guardrail this session)",
+    );
+
+    // MISSING-KEY still fails open: the strip remains, guarded by the else
+    // branch, and appears before the gateway fork.
     const outerUnsetIdx = startSh.indexOf(
       "unset ANTHROPIC_BASE_URL ANTHROPIC_SMALL_FAST_MODEL SWITCHROOM_LITELLM",
     );
-    expect(outerUnsetIdx, "fail-open unset not found").toBeGreaterThan(-1);
+    expect(outerUnsetIdx, "missing-key fail-open unset not found").toBeGreaterThan(-1);
     expect(outerUnsetIdx).toBeLessThan(forkIdx);
+    expect(outerSlice).toContain("no virtual key for agent");
+  });
+
+  it("outer dispatch (executed): UNREACHABLE keeps routing env, MISSING KEY strips it", () => {
+    const startSh = renderStartSh();
+    // Extract JUST the outer dispatch (decision + scratch cleanup): from the
+    // FIRST `if [ -n "$sr_ll_ok" ]` (outer precedes inner) through the first
+    // `unset sr_ll_key sr_ll_ok sr_ll_unreachable`. This runs the real strip-vs-
+    // keep code paths without the 120s probe loop.
+    const dispStart = startSh.indexOf('if [ -n "$sr_ll_ok" ]; then');
+    const dispEndMarker = "unset sr_ll_key sr_ll_ok sr_ll_unreachable";
+    const dispEnd = startSh.indexOf(dispEndMarker, dispStart) + dispEndMarker.length;
+    expect(dispStart).toBeGreaterThan(-1);
+    expect(dispEnd).toBeGreaterThan(dispStart);
+    const dispatch = startSh.slice(dispStart, dispEnd);
+
+    const runDispatch = (preset: { ok: string; unreachable: string }): Record<string, string> => {
+      const script = [
+        "set -e",
+        "export SWITCHROOM_AGENT_NAME=a",
+        "export SWITCHROOM_AGENT_PROFILE=default",
+        'export ANTHROPIC_BASE_URL="http://litellm:4010/anthropic"',
+        "export ANTHROPIC_SMALL_FAST_MODEL=claude-haiku-4-5",
+        "export SWITCHROOM_LITELLM=1",
+        'export SWITCHROOM_LITELLM_BASE="http://litellm:4010"',
+        "sr_ll_key=k",
+        `sr_ll_ok=${JSON.stringify(preset.ok)}`,
+        `sr_ll_unreachable=${JSON.stringify(preset.unreachable)}`,
+        dispatch,
+        'echo "BASEURL=${ANTHROPIC_BASE_URL:-__UNSET__}"',
+        'echo "LITELLM=${SWITCHROOM_LITELLM:-__UNSET__}"',
+        'echo "LLBASE=${SWITCHROOM_LITELLM_BASE:-__UNSET__}"',
+      ].join("\n");
+      const out = execFileSync("bash", ["-c", script], { encoding: "utf-8" });
+      return Object.fromEntries(
+        [...out.matchAll(/^(BASEURL|LITELLM|LLBASE)=(.*)$/gm)].map((m) => [m[1], m[2].trim()]),
+      );
+    };
+
+    // Proxy unreachable → routing env SURVIVES (must reach the tmux exec env).
+    const unreachable = runDispatch({ ok: "", unreachable: "1" });
+    expect(unreachable.BASEURL).toBe("http://litellm:4010/anthropic");
+    expect(unreachable.LITELLM).toBe("1");
+    expect(unreachable.LLBASE).toBe("http://litellm:4010");
+
+    // Missing key → fail-open strip (all routing vars gone).
+    const missingKey = runDispatch({ ok: "", unreachable: "" });
+    expect(missingKey.BASEURL).toBe("__UNSET__");
+    expect(missingKey.LITELLM).toBe("__UNSET__");
+    expect(missingKey.LLBASE).toBe("__UNSET__");
   });
 
   it("outer block is inside the SWITCHROOM_DOCKER_TMUX_INNER guard (outer-only section)", () => {
