@@ -13044,11 +13044,19 @@ function feedHeartbeatTick(): void {
     //               durable record once it completes.
     //   - 'emit'  → genuine in-flight post-answer activity; render the card below.
     const subagentAt = turn.subagentActivityAt
+    // Fix 3 (sub-agent-delegation freeze): a foreground `Task`/`Agent` still
+    // tracked in `turn.foregroundSubAgents` is POSITIVE evidence the worker
+    // has not reported finished — see the doc comment on
+    // `PostAnswerLivenessInput.stillDispatched` in turn-liveness-floor.ts for
+    // why this must bypass the staleness cap rather than let a single long
+    // silent step freeze the card mid-delegation.
+    const stillDispatched = turn.foregroundSubAgents.size > 0
     const livenessVerdict = evaluatePostAnswerLiveness({
       subagentActivityAt: subagentAt,
       finalAnswerDeliveredAt: turn.finalAnswerDeliveredAt,
       now: Date.now(),
       staleCapMs: POST_ANSWER_LIVENESS_STALE_MS,
+      stillDispatched,
     })
     if (livenessVerdict !== 'emit' || subagentAt == null) return // idle gap or stale worker → stay silent (the `== null` also narrows subagentAt for the elapsed below)
     // A background worker is genuinely active after the answer. Open or maintain
