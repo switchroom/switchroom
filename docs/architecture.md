@@ -129,6 +129,8 @@ The main agent loop does **not** use `claude -p`. Agents run interactive — by 
 
 **Hindsight** — runs as a separate Docker container (`ghcr.io/vectorize-io/hindsight:latest`) exposing its API on `localhost:18888`. Mounted into each agent's `claude` process as an MCP plugin. Provides semantic memory, knowledge graph, entity resolution, and directives.
 
+**Model routing (optional LiteLLM gateway)** — an opt-in metering layer that agents and Hindsight can route through without leaving the subscription. It forwards the client's OAuth `Authorization` header unchanged to Anthropic (metering only, no re-auth) and fails open to the direct broker-OAuth path when the proxy is down. Non-Claude models (OpenRouter, etc.) are additionally supported through the same proxy. See [`model-routing.md`](model-routing.md).
+
 **Per-agent `.claude/`** — each agent has a fully isolated Claude config directory at `~/.switchroom/agents/<agent>/.claude/` on the host, bind-mounted into the container at `/agent/.claude/`. Separate auth credentials, separate `settings.json`, separate plugin config, separate transcript store.
 
 **Config cascade** — agent config is resolved at apply time from `switchroom.yaml`: global defaults, then profile (`extends:`), then per-agent overrides. The rendered config is written into the agent's directory and the compose file is re-emitted. `switchroom apply` is the canonical reconcile.

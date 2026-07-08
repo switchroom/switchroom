@@ -99,7 +99,9 @@ takes an exclusive lock).
 
 The shared hindsight container runs its LLM operations (retain / reflect /
 consolidation — recall is local-only, no LLM) through whatever model the
-top-level `hindsight.llm` block selects. The flat form sets a **global
+top-level `hindsight.llm` block selects. For how this routing keeps Claude
+traffic subscription-native and where the per-op routing gaps are, see
+[`docs/model-routing.md`](../model-routing.md). The flat form sets a **global
 default** for every op:
 
 ```yaml
