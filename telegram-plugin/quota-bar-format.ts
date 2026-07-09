@@ -11,10 +11,10 @@
  * do not reformat without re-confirming):
  *
  * ```
- * - **ken.thompson@outlook.com.au** (active)
+ * - **you@example.com** (active)
  * - 🟢 5h `[┃░░░░░░░░░] 0% / 4h20m left`
  * - 🟡 7d `[████┃█░░░░] 47% / 3d1h left`
- * - **me@kenthompson.com.au** (exhausted)
+ * - **alice@example.com** (exhausted)
  * - 🟢 5h `[┃░░░░░░░░░] 0% / resets now`
  * - 🔴 7d `[██████┃███] 100% / 2d16h left`
  * ```
