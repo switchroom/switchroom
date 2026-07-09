@@ -428,6 +428,21 @@ agents:
         sub_agent_tick_interval_ms: 15000
 ```
 
+### Advanced env: orphaned-reply liveness window
+
+`SWITCHROOM_ORPHANED_REPLY_STREAM_WINDOW_MS` (default `120000` = 2 min) is an
+env-only advanced override on the gateway's orphaned-reply backstop. The
+backstop force-ends a turn that has captured assistant text but never called
+`reply`; its 30 s fuse used to be reset only by `tool_label` / `text` stream
+events, so a long model reasoning pause (which emits neither) could force-end a
+genuinely-live turn mid-work. The gateway now stamps a per-turn liveness marker
+on *any* genuine stream event; if one landed within this window the fuse re-arms
+instead of firing. Raise it to make longer reasoning pauses survivable at the
+cost of slower detection of a genuine hang; lower it to catch a wedged turn
+sooner at the risk of clipping a long think. Most operators never touch this —
+the default is tuned for real production reasoning pauses. Set as a plugin
+environment variable, not a `switchroom.yaml` field.
+
 ## Profiles
 
 Profiles are named partial configs that agents inherit from via `extends: <name>`. They can be defined in two places:

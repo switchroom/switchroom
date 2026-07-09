@@ -1,21 +1,22 @@
 /**
- * Unit tests for the activity-feed-teardown fix (orphaned-reply backstop).
+ * Unit tests for the orphaned-reply backstop, repointed at the REAL
+ * LivenessTracker (the thinking-pause fix seam) — no replica decision helpers.
  *
  * Root cause: the orphaned-reply backstop fired a synthetic turn_end
- * (`durationMs: -1`) after 30 s of silence, even mid-tool-call. That nulled
+ * (`durationMs: -1`) after 30 s of silence, even mid-work. That nulled
  * `currentTurn` and dropped every subsequent `tool_label`, darkening the live
  * activity feed for the rest of the turn.
  *
- * Fix: three layers described in the PR.
- *   PRIMARY   — fuse fires mid-tool → re-arm instead (bounded by ORPHANED_REPLY_MAX_REARMS).
- *   SECONDARY — tool_label re-arms the fuse so active label streams keep it fresh.
- *   DEFENSIVE — turn_end entry rejects the synthetic event if tools are in flight.
- *
- * These tests cover the pure / unit-testable surfaces:
- *   - shouldArmOrphanedReplyTimeout (existing, now with midToolCall param)
- *   - ORPHANED_REPLY_MAX_REARMS constant math
- *   - The re-arm guard logic (pure decision extracted from the closure)
- *   - The defensive turn_end discriminator (durationMs === -1 + in-flight check)
+ * Fix layers (all now expressed through `LivenessTracker`):
+ *   PRIMARY   — the fuse fires mid-work → re-arm instead. `decideOnExpiry`
+ *               re-arms while working OR recently-streaming OR human-waiting,
+ *               bounded by ORPHANED_REPLY_MAX_REARMS for the working /
+ *               recently-streaming cases (human-wait is uncapped).
+ *   SECONDARY — a genuine stream event (`onStreamEvent`) re-stamps liveness and
+ *               zeroes the rearm counter, so an actively-progressing turn never
+ *               hits the cap.
+ *   DEFENSIVE — the gateway rejects a synthetic turn_end while the turn is
+ *               legitimately working OR recently streaming (`recentlyStreaming`).
  */
 
 import { describe, it, expect } from 'vitest'
@@ -23,37 +24,24 @@ import {
   shouldArmOrphanedReplyTimeout,
   ORPHANED_REPLY_TIMEOUT_MS,
   ORPHANED_REPLY_MAX_REARMS,
+  ORPHANED_REPLY_STREAM_WINDOW_MS,
+  LivenessTracker,
 } from '../context-exhaustion.js'
 import { ToolFlightTracker } from '../gateway/interrupt-defer.js'
 
-// ---------------------------------------------------------------------------
-// Helpers — pure decision functions mirroring the gateway closure logic.
-// These extract the discriminable parts of the fix so they are unit-testable
-// without instantiating the full gateway.
-// ---------------------------------------------------------------------------
+const W = ORPHANED_REPLY_STREAM_WINDOW_MS
+const MAX = ORPHANED_REPLY_MAX_REARMS
 
 /**
- * Mirrors the PRIMARY fix decision inside the setTimeout callback:
- * should the backstop re-arm (true) or fire turn_end (false)?
+ * A tracker whose last stream event is far enough in the past that
+ * `recentlyStreaming` is false at `now`, so the ONLY thing keeping the turn
+ * alive in a `decideOnExpiry` call is the `working` / `humanWaiting` inputs.
+ * Lets us test the "no liveness except the tool" decisions in isolation.
  */
-function shouldRearmInsteadOfFire(opts: {
-  midToolCall: boolean
-  rearmCount: number
-  maxRearms: number
-}): boolean {
-  return opts.midToolCall && opts.rearmCount < opts.maxRearms
+function staleTracker(): LivenessTracker {
+  return new LivenessTracker(0)
 }
-
-/**
- * Mirrors the DEFENSIVE fix at turn_end entry:
- * should a synthetic turn_end (durationMs === -1) be suppressed?
- */
-function shouldSuppressSyntheticTurnEnd(opts: {
-  durationMs: number
-  midToolCall: boolean
-}): boolean {
-  return opts.durationMs === -1 && opts.midToolCall
-}
+const STALE_NOW = W + 10_000 // gap > window → recentlyStreaming false
 
 // ---------------------------------------------------------------------------
 // Tests: ORPHANED_REPLY_MAX_REARMS constant
@@ -66,7 +54,6 @@ describe('ORPHANED_REPLY_MAX_REARMS', () => {
 
   it('combined with ORPHANED_REPLY_TIMEOUT_MS covers at least 10 min of tool activity', () => {
     const coverageMs = ORPHANED_REPLY_MAX_REARMS * ORPHANED_REPLY_TIMEOUT_MS
-    // 20 × 30 000 ms = 600 000 ms = 10 min
     expect(coverageMs).toBeGreaterThanOrEqual(10 * 60 * 1000)
   })
 
@@ -76,165 +63,138 @@ describe('ORPHANED_REPLY_MAX_REARMS', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Tests: PRIMARY fix — re-arm guard
+// Tests: PRIMARY fix — re-arm via decideOnExpiry (REAL tracker)
 // ---------------------------------------------------------------------------
 
-describe('PRIMARY fix: re-arm guard (shouldRearmInsteadOfFire)', () => {
-  it('re-arms when a tool is in flight and rearm count is under the cap', () => {
-    expect(shouldRearmInsteadOfFire({ midToolCall: true, rearmCount: 0, maxRearms: 20 })).toBe(true)
-    expect(shouldRearmInsteadOfFire({ midToolCall: true, rearmCount: 19, maxRearms: 20 })).toBe(true)
+describe('PRIMARY fix: re-arm guard (LivenessTracker.decideOnExpiry)', () => {
+  it('re-arms while working and under the cap (recentlyStreaming false)', () => {
+    const t = staleTracker()
+    const d = t.decideOnExpiry({ working: true, humanWaiting: false, now: STALE_NOW, windowMs: W, maxRearms: MAX })
+    expect(d).toEqual({ rearm: true, countsAgainstCap: true })
   })
 
-  it('fires once rearm count reaches the cap, even mid-tool-call', () => {
-    expect(shouldRearmInsteadOfFire({ midToolCall: true, rearmCount: 20, maxRearms: 20 })).toBe(false)
-    expect(shouldRearmInsteadOfFire({ midToolCall: true, rearmCount: 21, maxRearms: 20 })).toBe(false)
-  })
-
-  it('fires immediately when no tool is in flight, regardless of rearm count', () => {
-    expect(shouldRearmInsteadOfFire({ midToolCall: false, rearmCount: 0, maxRearms: 20 })).toBe(false)
-    expect(shouldRearmInsteadOfFire({ midToolCall: false, rearmCount: 5, maxRearms: 20 })).toBe(false)
-  })
-
-  it('rearm count transitions: 0 → cap-1 → cap fires', () => {
-    const max = ORPHANED_REPLY_MAX_REARMS
-    for (let i = 0; i < max; i++) {
-      expect(shouldRearmInsteadOfFire({ midToolCall: true, rearmCount: i, maxRearms: max })).toBe(true)
+  it('fires once the working rearm count reaches the cap (recentlyStreaming false)', () => {
+    const t = staleTracker()
+    let last: { rearm: boolean } | undefined
+    for (let k = 0; k <= MAX; k++) {
+      last = t.decideOnExpiry({ working: true, humanWaiting: false, now: STALE_NOW, windowMs: W, maxRearms: MAX })
     }
-    // At exactly the cap: fire
-    expect(shouldRearmInsteadOfFire({ midToolCall: true, rearmCount: max, maxRearms: max })).toBe(false)
+    // MAX re-arms proceeded (counter 1..MAX); the (MAX+1)th fires.
+    expect(last!.rearm).toBe(false)
+    expect(t.orphanedReplyRearmCount).toBe(MAX)
+  })
+
+  it('fires immediately when nothing keeps the turn alive (idle, not recently streaming)', () => {
+    const t = staleTracker()
+    const d = t.decideOnExpiry({ working: false, humanWaiting: false, now: STALE_NOW, windowMs: W, maxRearms: MAX })
+    expect(d).toEqual({ rearm: false, countsAgainstCap: false })
+  })
+
+  it('re-arms while recently streaming even when NOT working (thinking-pause survival)', () => {
+    const t = new LivenessTracker(0)
+    t.onStreamEvent('text', undefined, 0)
+    const d = t.decideOnExpiry({ working: false, humanWaiting: false, now: 30_000, windowMs: W, maxRearms: MAX })
+    expect(d).toEqual({ rearm: true, countsAgainstCap: true })
   })
 })
 
 // ---------------------------------------------------------------------------
-// Tests: DEFENSIVE fix — synthetic turn_end suppressor
+// Tests: DEFENSIVE fix — recentlyStreaming keeps the synthetic turn_end at bay
 // ---------------------------------------------------------------------------
 
-describe('DEFENSIVE fix: synthetic turn_end suppressor', () => {
-  it('suppresses a synthetic turn_end (durationMs === -1) when tools are in flight', () => {
-    expect(shouldSuppressSyntheticTurnEnd({ durationMs: -1, midToolCall: true })).toBe(true)
+describe('DEFENSIVE fix: recentlyStreaming suppression window', () => {
+  it('is true within the window of the last genuine stream event', () => {
+    const t = new LivenessTracker(0)
+    t.onStreamEvent('tool_use', undefined, 5_000)
+    expect(t.recentlyStreaming(5_000, W)).toBe(true)
+    expect(t.recentlyStreaming(5_000 + W - 1, W)).toBe(true)
   })
 
-  it('does NOT suppress a synthetic turn_end when no tools are in flight', () => {
-    // No tools → the backstop should fire normally (turn is genuinely orphaned)
-    expect(shouldSuppressSyntheticTurnEnd({ durationMs: -1, midToolCall: false })).toBe(false)
+  it('is false once the window lapses (genuine hang, teardown proceeds)', () => {
+    const t = new LivenessTracker(0)
+    t.onStreamEvent('tool_use', undefined, 5_000)
+    expect(t.recentlyStreaming(5_000 + W, W)).toBe(false)
   })
 
-  it('does NOT suppress an authoritative turn_end (durationMs >= 0)', () => {
-    expect(shouldSuppressSyntheticTurnEnd({ durationMs: 0, midToolCall: true })).toBe(false)
-    expect(shouldSuppressSyntheticTurnEnd({ durationMs: 1, midToolCall: true })).toBe(false)
-    expect(shouldSuppressSyntheticTurnEnd({ durationMs: 12345, midToolCall: true })).toBe(false)
-    expect(shouldSuppressSyntheticTurnEnd({ durationMs: 0, midToolCall: false })).toBe(false)
-  })
-
-  it('only durationMs === -1 is the synthetic discriminator', () => {
-    // Values near -1 must not accidentally trigger suppression
-    expect(shouldSuppressSyntheticTurnEnd({ durationMs: -2, midToolCall: true })).toBe(false)
-    expect(shouldSuppressSyntheticTurnEnd({ durationMs: -0.5, midToolCall: true })).toBe(false)
+  it('a synthetic turn_end (-1) does not extend the window', () => {
+    const t = new LivenessTracker(0)
+    t.onStreamEvent('tool_use', undefined, 5_000)
+    t.onStreamEvent('turn_end', -1, 5_500) // ignored
+    expect(t.lastStreamEventAt).toBe(5_000)
+    expect(t.recentlyStreaming(5_000 + W, W)).toBe(false)
   })
 })
 
 // ---------------------------------------------------------------------------
-// Tests: ToolFlightTracker integration with the guard logic
+// Tests: ToolFlightTracker → working input → decideOnExpiry
 // ---------------------------------------------------------------------------
 
-describe('ToolFlightTracker + guard integration', () => {
-  it('re-arm fires when a Bash tool is in flight', () => {
-    const tracker = new ToolFlightTracker()
-    tracker.onEvent({ kind: 'tool_use', toolUseId: 'bash_1' })
-
-    expect(shouldRearmInsteadOfFire({
-      midToolCall: tracker.isMidToolCall(),
-      rearmCount: 0,
-      maxRearms: ORPHANED_REPLY_MAX_REARMS,
-    })).toBe(true)
+describe('ToolFlightTracker drives the `working` input', () => {
+  it('re-arm fires when a Bash tool is in flight (working=true)', () => {
+    const flight = new ToolFlightTracker()
+    flight.onEvent({ kind: 'tool_use', toolUseId: 'bash_1' })
+    const t = staleTracker()
+    const d = t.decideOnExpiry({
+      working: flight.isMidToolCall(),
+      humanWaiting: false,
+      now: STALE_NOW,
+      windowMs: W,
+      maxRearms: MAX,
+    })
+    expect(d.rearm).toBe(true)
   })
 
-  it('fires normally after tool_result completes the tool', () => {
-    const tracker = new ToolFlightTracker()
-    tracker.onEvent({ kind: 'tool_use', toolUseId: 'bash_1' })
-    tracker.onEvent({ kind: 'tool_result', toolUseId: 'bash_1' })
-
-    expect(shouldRearmInsteadOfFire({
-      midToolCall: tracker.isMidToolCall(),
-      rearmCount: 0,
-      maxRearms: ORPHANED_REPLY_MAX_REARMS,
-    })).toBe(false)
-  })
-
-  it('defensive guard suppresses synthetic turn_end mid-Bash', () => {
-    const tracker = new ToolFlightTracker()
-    tracker.onEvent({ kind: 'tool_use', toolUseId: 'bash_2' })
-
-    expect(shouldSuppressSyntheticTurnEnd({
-      durationMs: -1,
-      midToolCall: tracker.isMidToolCall(),
-    })).toBe(true)
-  })
-
-  it('defensive guard allows synthetic turn_end after all tools complete', () => {
-    const tracker = new ToolFlightTracker()
-    tracker.onEvent({ kind: 'tool_use', toolUseId: 'bash_2' })
-    tracker.onEvent({ kind: 'tool_result', toolUseId: 'bash_2' })
-
-    expect(shouldSuppressSyntheticTurnEnd({
-      durationMs: -1,
-      midToolCall: tracker.isMidToolCall(),
-    })).toBe(false)
+  it('fires normally after tool_result completes the tool (working=false, not recently streaming)', () => {
+    const flight = new ToolFlightTracker()
+    flight.onEvent({ kind: 'tool_use', toolUseId: 'bash_1' })
+    flight.onEvent({ kind: 'tool_result', toolUseId: 'bash_1' })
+    const t = staleTracker()
+    const d = t.decideOnExpiry({
+      working: flight.isMidToolCall(),
+      humanWaiting: false,
+      now: STALE_NOW,
+      windowMs: W,
+      maxRearms: MAX,
+    })
+    expect(d.rearm).toBe(false)
   })
 
   it('parallel tools: re-arm persists while ANY tool is in flight', () => {
-    const tracker = new ToolFlightTracker()
-    tracker.onEvent({ kind: 'tool_use', toolUseId: 'read_1' })
-    tracker.onEvent({ kind: 'tool_use', toolUseId: 'read_2' })
-    tracker.onEvent({ kind: 'tool_use', toolUseId: 'edit_1' })
+    const flight = new ToolFlightTracker()
+    flight.onEvent({ kind: 'tool_use', toolUseId: 'read_1' })
+    flight.onEvent({ kind: 'tool_use', toolUseId: 'read_2' })
+    flight.onEvent({ kind: 'tool_use', toolUseId: 'edit_1' })
+    const t = staleTracker()
+    expect(
+      t.decideOnExpiry({ working: flight.isMidToolCall(), humanWaiting: false, now: STALE_NOW, windowMs: W, maxRearms: MAX }).rearm,
+    ).toBe(true)
 
-    // Still re-arming: 3 tools open
-    expect(shouldRearmInsteadOfFire({
-      midToolCall: tracker.isMidToolCall(),
-      rearmCount: 0,
-      maxRearms: ORPHANED_REPLY_MAX_REARMS,
-    })).toBe(true)
+    flight.onEvent({ kind: 'tool_result', toolUseId: 'read_1' })
+    flight.onEvent({ kind: 'tool_result', toolUseId: 'read_2' })
+    expect(
+      t.decideOnExpiry({ working: flight.isMidToolCall(), humanWaiting: false, now: STALE_NOW, windowMs: W, maxRearms: MAX }).rearm,
+    ).toBe(true) // edit_1 still open
 
-    // Two complete
-    tracker.onEvent({ kind: 'tool_result', toolUseId: 'read_1' })
-    tracker.onEvent({ kind: 'tool_result', toolUseId: 'read_2' })
-
-    // Still re-arming: edit_1 open
-    expect(shouldRearmInsteadOfFire({
-      midToolCall: tracker.isMidToolCall(),
-      rearmCount: 1,
-      maxRearms: ORPHANED_REPLY_MAX_REARMS,
-    })).toBe(true)
-
-    // All complete
-    tracker.onEvent({ kind: 'tool_result', toolUseId: 'edit_1' })
-
-    expect(shouldRearmInsteadOfFire({
-      midToolCall: tracker.isMidToolCall(),
-      rearmCount: 2,
-      maxRearms: ORPHANED_REPLY_MAX_REARMS,
-    })).toBe(false)
+    flight.onEvent({ kind: 'tool_result', toolUseId: 'edit_1' })
+    const t2 = staleTracker() // fresh so the earlier rearms don't confound the cap
+    expect(
+      t2.decideOnExpiry({ working: flight.isMidToolCall(), humanWaiting: false, now: STALE_NOW, windowMs: W, maxRearms: MAX }).rearm,
+    ).toBe(false) // all complete, not recently streaming → fire
   })
 
   it('cap fires even mid-tool after 20 re-arms (wedged tool surfaces)', () => {
-    const tracker = new ToolFlightTracker()
-    tracker.onEvent({ kind: 'tool_use', toolUseId: 'hung_bash' })
-
-    // First 20 re-arms proceed
-    for (let i = 0; i < ORPHANED_REPLY_MAX_REARMS; i++) {
-      expect(shouldRearmInsteadOfFire({
-        midToolCall: tracker.isMidToolCall(),
-        rearmCount: i,
-        maxRearms: ORPHANED_REPLY_MAX_REARMS,
-      })).toBe(true)
+    const flight = new ToolFlightTracker()
+    flight.onEvent({ kind: 'tool_use', toolUseId: 'hung_bash' })
+    const t = staleTracker()
+    for (let i = 0; i < MAX; i++) {
+      expect(
+        t.decideOnExpiry({ working: flight.isMidToolCall(), humanWaiting: false, now: STALE_NOW, windowMs: W, maxRearms: MAX }).rearm,
+      ).toBe(true)
     }
-
-    // 21st: cap exceeded — fire despite in-flight
-    expect(shouldRearmInsteadOfFire({
-      midToolCall: tracker.isMidToolCall(),
-      rearmCount: ORPHANED_REPLY_MAX_REARMS,
-      maxRearms: ORPHANED_REPLY_MAX_REARMS,
-    })).toBe(false)
+    // Cap exceeded — fire despite in-flight.
+    expect(
+      t.decideOnExpiry({ working: flight.isMidToolCall(), humanWaiting: false, now: STALE_NOW, windowMs: W, maxRearms: MAX }).rearm,
+    ).toBe(false)
   })
 })
 

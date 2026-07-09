@@ -294,6 +294,7 @@ import {
   shouldArmOrphanedReplyTimeout,
   ORPHANED_REPLY_TIMEOUT_MS,
   ORPHANED_REPLY_MAX_REARMS,
+  LivenessTracker,
 } from '../context-exhaustion.js'
 import {
   decideTurnFlush,
@@ -2371,13 +2372,15 @@ type CurrentTurn = {
   silentAnchorText: string
   capturedText: string[]
   orphanedReplyTimeoutId: ReturnType<typeof setTimeout> | null
-  // How many times the orphaned-reply backstop timer has been re-armed
-  // mid-tool-call instead of firing a synthetic turn_end. Bounded so a
-  // genuinely wedged single long-running tool still surfaces: the cap is
-  // ORPHANED_REPLY_MAX_REARMS (20 × 30 s = 10 min of genuine tool activity).
-  // Reset to 0 on a fresh enqueue; NOT reset on text/tool_label re-arms —
-  // only a new turn resets the budget.
-  orphanedReplyRearmCount: number
+  // Per-turn liveness tracker for the orphaned-reply backstop. Owns
+  // `lastStreamEventAt` (stamped on ANY genuine stream event so a model
+  // reasoning pause keeps the turn "recently streaming" and re-arms the fuse
+  // instead of firing) and the rearm counter (bounded by
+  // ORPHANED_REPLY_MAX_REARMS so a genuinely wedged single tool that never
+  // streams still surfaces after the cap). The counter is zeroed on every
+  // genuine stream event, so the cap only bites CONSECUTIVE silent expiries.
+  // Fresh instance per enqueue (below). See context-exhaustion.ts.
+  liveness: LivenessTracker
   // Component 3 (turn-origin reply routing). A stable per-turn identity,
   // `${registryKey-or-chatKey}#${startedAt}`, assigned when the turn
   // starts and stamped into the inbound meta (`origin_turn_id`) so a reply
@@ -6740,6 +6743,11 @@ function parsePositiveMsEnv(name: string, fallbackMs: number): number {
   const n = Number(raw)
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallbackMs
 }
+// Orphaned-reply "recently streaming" window (thinking-pause fix). If a genuine
+// stream event landed within this window, the fuse re-arms instead of firing —
+// so a long model reasoning pause (which emits no text/tool events) is
+// survivable while a genuine multi-minute hang still surfaces. Default 120 s.
+const ORPHANED_REPLY_STREAM_WINDOW_MS = parsePositiveMsEnv('SWITCHROOM_ORPHANED_REPLY_STREAM_WINDOW_MS', 120_000)
 const SILENCE_FALLBACK_MS = parsePositiveMsEnv('SWITCHROOM_SILENCE_FALLBACK_MS', 300_000)
 const SILENCE_FALLBACK_HARD_MS = parsePositiveMsEnv('SWITCHROOM_SILENCE_FALLBACK_HARD_MS', 900_000)
 // #2527 — mid-turn liveness floor threshold (default 45s). Still gates the
@@ -12555,20 +12563,32 @@ function resetOrphanedReplyTimeout(): void {
           }
           return false
         })()
-        if (working || humanWaiting) {
-          const underCap = t.orphanedReplyRearmCount < ORPHANED_REPLY_MAX_REARMS
-          if (humanWaiting || underCap) {
-            t.orphanedReplyRearmCount++
-            process.stderr.write(
-              `telegram gateway: orphaned-reply fuse expired — re-arming` +
-              ` (rearm ${t.orphanedReplyRearmCount}/${ORPHANED_REPLY_MAX_REARMS},` +
-              ` in_flight=${toolFlightTracker.inFlightCount()},` +
-              ` human_wait=${humanWaiting},` +
-              ` bg_work=${pendingProgress.hasPendingAsyncDispatch(turnKey)})\n`,
-            )
-            resetOrphanedReplyTimeout()
-            return
-          }
+        // Route the rearm decision through the per-turn LivenessTracker. It
+        // rearms when working OR recently-streaming (thinking-pause survival)
+        // OR human-waiting; working/recently-streaming rearms count against
+        // ORPHANED_REPLY_MAX_REARMS while human-wait rearms stay uncapped.
+        const now = Date.now()
+        const recentlyStreaming = t.liveness.recentlyStreaming(now, ORPHANED_REPLY_STREAM_WINDOW_MS)
+        const decision = t.liveness.decideOnExpiry({
+          working,
+          humanWaiting,
+          now,
+          windowMs: ORPHANED_REPLY_STREAM_WINDOW_MS,
+          maxRearms: ORPHANED_REPLY_MAX_REARMS,
+        })
+        if (decision.rearm) {
+          process.stderr.write(
+            `telegram gateway: orphaned-reply fuse expired — re-arming` +
+            ` (rearm ${t.liveness.orphanedReplyRearmCount}/${ORPHANED_REPLY_MAX_REARMS},` +
+            ` in_flight=${toolFlightTracker.inFlightCount()},` +
+            ` human_wait=${humanWaiting},` +
+            ` recently_streaming=${recentlyStreaming},` +
+            ` bg_work=${pendingProgress.hasPendingAsyncDispatch(turnKey)})\n`,
+          )
+          resetOrphanedReplyTimeout()
+          return
+        }
+        if (decision.countsAgainstCap) {
           process.stderr.write(
             `telegram gateway: orphaned-reply rearm cap reached (${ORPHANED_REPLY_MAX_REARMS}) — forcing backstop despite working state\n`,
           )
@@ -13430,6 +13450,22 @@ function surfaceConsolidationLegibility(
 }
 
 function handleSessionEvent(ev: SessionEvent): void {
+  // Per-turn liveness stamp (orphaned-reply thinking-pause fix). Stamp
+  // lastStreamEventAt AND reset the rearm counter on ANY genuine stream event,
+  // under ONE shared predicate: a live turn is present and this is not the
+  // synthetic durationMs===-1 turn_end (the fire callback's own re-dispatch).
+  // The counter reset MUST live here at the dispatcher — NOT inside
+  // resetOrphanedReplyTimeout() (which is called from the fire callback one
+  // line after the counter increments) and NOT tied to a single case (e.g.
+  // tool_result does not call resetOrphanedReplyTimeout). onStreamEvent applies
+  // the `!(turn_end && -1)` half of the predicate internally.
+  {
+    const liveTurn = currentTurn
+    if (liveTurn != null) {
+      const durationMs = ev.kind === 'turn_end' ? ev.durationMs : undefined
+      liveTurn.liveness.onStreamEvent(ev.kind, durationMs, Date.now())
+    }
+  }
   switch (ev.kind) {
     case 'enqueue': {
       // Drain any orphaned typing-wrap entries left over from a crashed
@@ -13465,6 +13501,14 @@ function handleSessionEvent(ev: SessionEvent): void {
           prior.answerStream.forceNewMessage()
           prior.answerStream.stop()
           prior.answerStream = null
+        }
+        // Bounded-leak hardening (A5): clear the prior turn's orphaned-reply
+        // fuse before it is superseded. The fire callback re-reads currentTurn
+        // and no-ops on a stale turn, but proactively clearing the timer avoids
+        // a bounded pile-up of dangling timers across rapid steer/queue turns.
+        if (prior?.orphanedReplyTimeoutId != null) {
+          clearTimeout(prior.orphanedReplyTimeoutId)
+          prior.orphanedReplyTimeoutId = null
         }
         // #1067: swap the entire turn atom in one assignment. Every
         // handler captures `const turn = currentTurn` at entry, so a
@@ -13525,7 +13569,9 @@ function handleSessionEvent(ev: SessionEvent): void {
           silentAnchorText: '',
           capturedText: [],
           orphanedReplyTimeoutId: null,
-          orphanedReplyRearmCount: 0,
+          // Fresh liveness tracker: lastStreamEventAt seeded to the turn start
+          // so a turn that never streams still trips the fuse after windowMs.
+          liveness: new LivenessTracker(startedAt),
           turnId,
           registryKey: null,
           noReplyDrainTimer: null,
@@ -14195,10 +14241,25 @@ function handleSessionEvent(ev: SessionEvent): void {
       if (ev.durationMs === -1) {
         const turn = currentTurn
         const key = turn != null ? statusKey(turn.sessionChatId, turn.sessionThreadId) : ''
-        if (isLegitimatelyWorking(key)) {
+        // Widened to also suppress while the turn is RECENTLY STREAMING — a
+        // model reasoning pause emits no tool/text events (so
+        // isLegitimatelyWorking is false) but a genuine stream landed within
+        // the window, so the turn is alive and must not be torn down.
+        // ACCEPTED TRADE-OFF (F3): the context-exhaustion recovery latency via
+        // THIS backstop path grows from ~30 s to ~120-150 s, because the
+        // "Prompt is too long" marker is itself a genuine `text` event that
+        // stamps recentlyStreaming. This is acceptable — the primary
+        // context-exhaustion teardown is the immediate `endCurrentTurnAtomic`
+        // in `case 'text'` (isContextExhaustionText) above; this backstop only
+        // matters if that path is missed, and it still COMPLETES once the
+        // window lapses. Recovery is delayed, never suppressed forever.
+        const recentlyStreaming =
+          turn != null && turn.liveness.recentlyStreaming(Date.now(), ORPHANED_REPLY_STREAM_WINDOW_MS)
+        if (isLegitimatelyWorking(key) || recentlyStreaming) {
           process.stderr.write(
             `telegram gateway: synthetic turn_end suppressed — legitimately working` +
             ` (in_flight=${toolFlightTracker.inFlightCount()},` +
+            ` recently_streaming=${recentlyStreaming},` +
             ` bg_work=${turn != null ? pendingProgress.hasPendingAsyncDispatch(key) : false})\n`,
           )
           return
