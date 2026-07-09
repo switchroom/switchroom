@@ -33,6 +33,28 @@
  * delivery obligation.
  */
 
+// Verified complete (2026-07-09, adversarial-review follow-up): `reply`
+// and `stream_reply` are the ONLY two MCP tools whose payload is the
+// model's free-text final-answer content reaching the user — the exact
+// scope `final-answer-detect.ts`'s own docstring claims ("plain assistant
+// transcript text instead of a `reply` / `stream_reply` tool call").
+// Cross-checked the full tool surface in `telegram-plugin/bridge/bridge.ts`
+// (`TOOL_SCHEMAS`, kept in sync with `gateway/gateway.ts`): `edit_message`
+// explicitly does NOT ping/deliver a fresh answer (its own description says
+// "send a new reply when a long task completes"); `react`, `pin_message`,
+// `delete_message`, `forward_message`, `send_typing`, `download_attachment`,
+// `get_recent_messages` carry no model-authored answer text at all;
+// `send_checklist` / `send_sticker` / `send_gif` / `ask_user` /
+// `update_checklist` deliver structured/templated content, not the turn's
+// prose answer, and are intentionally a different interaction pattern (a
+// question or a fixed artifact, not "the answer"). `stream_reply` sends its
+// FULL cumulative text snapshot on every call (not incremental chunks —
+// see `stream-reply-handler.ts` docstring), and each call is its own
+// `tool_use` block in the transcript in chronological order, so the
+// "last delivery event wins" walk below already treats a stream's final
+// (`done:true`) call as the qualifying one regardless of how many
+// intermediate non-final `stream_reply` calls preceded it. No gap found;
+// re-verify only if a new outbound-delivery tool is added to bridge.ts.
 const REPLY_TOOLS = new Set([
   'mcp__switchroom-telegram__reply',
   'mcp__switchroom-telegram__stream_reply',

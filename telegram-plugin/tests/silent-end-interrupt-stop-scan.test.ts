@@ -278,6 +278,29 @@ describe('scanTurnForFinalReply — trailing undelivered content after an early 
     expect(r.decided).toBe('allow')
     expect(r.reason).toBe('silent-marker-text')
   })
+
+  it('reverse case: an EARLIER NO_REPLY silence marker followed by later undelivered prose → block', () => {
+    // Mirror image of the "trailing NO_REPLY overrides" allow-case above.
+    // Here the model signals silence FIRST — as plain transcript text,
+    // not through the reply tool — and then keeps going, writing a real
+    // substantive answer afterward that it never sent through `reply` or
+    // `stream_reply`. The NO_REPLY marker is a "deliver" event (silence is
+    // a valid outcome), but it must not amnesty content written AFTER it,
+    // same failure shape as the original "at least once" bug: a naive scan
+    // that stops at the FIRST qualifying delivery/silence event would
+    // return 'allow' here and the trailing answer would be silently
+    // dropped. The fix's "last delivery event, then check for trailing
+    // text" walk must still catch this.
+    const text = jsonl(
+      ENQUEUE,
+      assistantText('Nothing to report right now.\nNO_REPLY'),
+      assistantToolUse('Bash', { command: 'ls' }),
+      assistantText('Wait, actually I found something you need to know: ' + 'Y'.repeat(300)),
+    )
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('block')
+    expect(r.reason).toBe('trailing-text-after-reply')
+  })
 })
 
 describe('scanTurnForFinalReply — silent-marker carve-out', () => {
