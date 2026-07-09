@@ -184,6 +184,125 @@ describe('scanTurnForFinalReply — final-reply detection', () => {
   })
 })
 
+// ── "at least once" bug regression — trailing content after an early
+//    qualifying reply must still block ────────────────────────────────
+
+describe('scanTurnForFinalReply — trailing undelivered content after an early qualifying reply (bug repro)', () => {
+  it('early notification-bearing ack + later substantive plain text → block (not "reply called once" amnesty)', () => {
+    // Repro of the confirmed incident: the agent (1) got a background-task
+    // notification, (2) called reply ONCE early with a short, stale ack —
+    // notification-bearing (disable_notification unset/false), which
+    // ALWAYS qualifies as "final" under isFinalAnswerReply regardless of
+    // text length — then (3) wrote a large substantive verdict as plain
+    // assistant text with NO second reply call. The pre-fix scan returned
+    // 'allow' on the first qualifying block and never looked further; the
+    // fix must walk the whole turn and catch the undelivered trailing text.
+    const text = jsonl(
+      ENQUEUE,
+      assistantToolUse('mcp__switchroom-telegram__reply', { text: 'running now' }),
+      assistantToolUse('Bash', { command: 'ls' }),
+      assistantToolUse('Read', { file_path: '/tmp/x' }),
+      assistantText('Here is the actual verdict after investigation: ' + 'X'.repeat(300)),
+    )
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('block')
+    expect(r.reason).toBe('trailing-text-after-reply')
+    // turnKey/chatId must still be populated so the gateway's retry
+    // bookkeeping works exactly as it does for the zero-reply block path.
+    expect(r.chatId).toBe('111')
+    expect(r.turnKey).toBe('111:_')
+  })
+
+  it('early qualifying reply + trailing short (but non-empty) undelivered text → block (no minimum-length carve-out)', () => {
+    const text = jsonl(
+      ENQUEUE,
+      assistantToolUse('mcp__switchroom-telegram__reply', { text: 'ok', disable_notification: false }),
+      assistantText('actually, one more thing you should know'),
+    )
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('block')
+    expect(r.reason).toBe('trailing-text-after-reply')
+  })
+
+  it('final qualifying reply is the LAST content block → allow (healthy shape, no false positive)', () => {
+    const text = jsonl(
+      ENQUEUE,
+      assistantText('Let me check that.'),
+      assistantToolUse('Bash', { command: 'ls' }),
+      assistantToolUse('mcp__switchroom-telegram__reply', {
+        text: 'Here is your answer.',
+        disable_notification: false,
+      }),
+    )
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('allow')
+    expect(r.reason).toBe('final-reply')
+  })
+
+  it('turn ends on a tool_result with no trailing text at all → allow (not a normal-turn false positive)', () => {
+    // A turn whose very last assistant content is the delivering
+    // reply tool_use, followed only by a (user-role) tool_result line —
+    // never any further assistant text. Must not be flagged.
+    const text = jsonl(
+      ENQUEUE,
+      assistantToolUse('mcp__switchroom-telegram__reply', {
+        text: 'Done — here is the summary.',
+        disable_notification: false,
+      }),
+      JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', content: 'ok' }] } }),
+    )
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('allow')
+    expect(r.reason).toBe('final-reply')
+  })
+
+  it('undelivered text sandwiched between two qualifying replies is superseded by the LATER reply → allow', () => {
+    const text = jsonl(
+      ENQUEUE,
+      assistantToolUse('mcp__switchroom-telegram__reply', { text: 'first answer', disable_notification: false }),
+      assistantText('actually let me reconsider that'),
+      assistantToolUse('mcp__switchroom-telegram__reply', { text: 'corrected final answer', disable_notification: false }),
+    )
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('allow')
+    expect(r.reason).toBe('final-reply')
+  })
+
+  it('explicit trailing NO_REPLY after an earlier qualifying reply overrides → allow (intentional final silence)', () => {
+    const text = jsonl(
+      ENQUEUE,
+      assistantToolUse('mcp__switchroom-telegram__reply', { text: 'draft answer', disable_notification: false }),
+      assistantText('actually, scrap that, nothing more to add\nNO_REPLY'),
+    )
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('allow')
+    expect(r.reason).toBe('silent-marker-text')
+  })
+
+  it('reverse case: an EARLIER NO_REPLY silence marker followed by later undelivered prose → block', () => {
+    // Mirror image of the "trailing NO_REPLY overrides" allow-case above.
+    // Here the model signals silence FIRST — as plain transcript text,
+    // not through the reply tool — and then keeps going, writing a real
+    // substantive answer afterward that it never sent through `reply` or
+    // `stream_reply`. The NO_REPLY marker is a "deliver" event (silence is
+    // a valid outcome), but it must not amnesty content written AFTER it,
+    // same failure shape as the original "at least once" bug: a naive scan
+    // that stops at the FIRST qualifying delivery/silence event would
+    // return 'allow' here and the trailing answer would be silently
+    // dropped. The fix's "last delivery event, then check for trailing
+    // text" walk must still catch this.
+    const text = jsonl(
+      ENQUEUE,
+      assistantText('Nothing to report right now.\nNO_REPLY'),
+      assistantToolUse('Bash', { command: 'ls' }),
+      assistantText('Wait, actually I found something you need to know: ' + 'Y'.repeat(300)),
+    )
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('block')
+    expect(r.reason).toBe('trailing-text-after-reply')
+  })
+})
+
 describe('scanTurnForFinalReply — silent-marker carve-out', () => {
   it('NO_REPLY → allow', () => {
     const text = jsonl(

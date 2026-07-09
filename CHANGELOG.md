@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Stop hook: catch a dropped final reply written after an earlier qualifying reply
+
+The `silent-end-interrupt-stop.mjs` Stop hook's transcript scan
+(`scanTurnForFinalReply` in `silent-end-scan.mjs`) returned `allow` on the
+FIRST qualifying `reply`/`stream_reply` tool call it found while scanning a
+turn forward — effectively "was `reply` called at least once this turn?"
+rather than "did the turn's actual final answer reach the user?". A turn that
+(1) called `reply` early with a short, notification-bearing interim ack (which
+always qualifies as "final" under `isFinalAnswerReply`, regardless of length),
+then (2) kept working and wrote a substantive plain-text verdict afterward
+with no second `reply` call, slipped through the hook undetected — the real
+answer never reached the user and the hook reported `hookErrors: []`,
+`preventedContinuation: false`. The scan now walks the full turn, finds the
+LAST qualifying delivery/silence event, and blocks if any plain assistant
+text was written after it and never (re-)sent through a delivery tool — same
+posture as the existing zero-reply block path, without flagging turns that
+simply end on a delivering `reply` tool_use with nothing after it.
+
 ## v0.18.3 — Watchdog thinking-pause fix, acceptEdits fleet default, Claude CLI 2.1.205, configurable retain cadence
 
 ### Gateway: orphaned-reply watchdog survives model thinking pauses (#2949)
