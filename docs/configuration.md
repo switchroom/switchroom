@@ -111,6 +111,50 @@ The cap applies to the *combined* result list across the primary bank and any `r
 
 Operationally: the cap is set via the `HINDSIGHT_RECALL_MAX_MEMORIES` env var that `start.sh` exports. The vendored plugin's `recall.py` slices results client-side before formatting (plugin v0.4.0 has no `recallTopK` setting on the Claude Code integration — only Openclaw exposes it).
 
+### Tuning auto-retain cadence — `memory.retain.every_n_turns` / `overlap_turns`
+
+The plugin's Stop hook consolidates recent conversation into the bank on a
+cadence. `memory.retain.every_n_turns` controls how often it fires (in turns);
+`memory.retain.overlap_turns` controls how many extra recent turns are folded
+into each chunked retain window on top of that — so the window is
+`overlap_turns + every_n_turns` recent turns per fire.
+
+```yaml
+defaults:
+  memory:
+    retain:
+      every_n_turns: 3   # switchroom default — retain every 3rd turn
+      overlap_turns: 1   # switchroom default — +1 turn of window overlap
+
+agents:
+  archivist:
+    memory:
+      retain:
+        every_n_turns: 1  # tighter crash durability for a critical bank
+```
+
+**Defaults are `3` / `1`** (the vendor plugin defaults are `10` / `2`). These
+were raised from an earlier hardcoded `1` / `2`: once retain/consolidation
+moved to a **local reasoning model** (Ollama `gpt-oss-20b`), the every-turn
+cadence with large overlapping windows made the model run away — single
+retains generating 22k–37k output tokens over 100–200s and starving workers.
+`3` / `1` yields roughly 3× fewer, smaller retains.
+
+**Crash-durability tradeoff:** at `every_n_turns: 1` every turn was retained on
+its own fire, so a fact shared in a 1–2 turn session always survived a restart.
+At the default `3`, retention fires every 3rd turn, so up to ~3 turns of
+transcript can be lost on a hard crash before the next fire. That is an
+intentional swap of a little crash durability for far cheaper, calmer retains.
+Set `every_n_turns: 1` (per-agent or fleet-wide under `defaults`) to get the
+tight every-turn guarantee back; chatty banks can raise it further.
+
+`min` is `1` for `every_n_turns` and `0` for `overlap_turns`. Cascade:
+per-field merge (an agent may override one knob and inherit the other from
+`defaults`/profile). Both values are stamped into the plugin's `settings.json`
+on **every** scaffold/reconcile, so the yaml value is authoritative and
+**survives `switchroom apply`** regenerating that file (unlike a hand-edit,
+which reconcile would revert).
+
 ### Shared / profile recall banks — `memory.recall.additional_banks`
 
 By default an agent recalls only its own bank. Point `additional_banks` at one or more extra Hindsight banks and the recall hook queries them too on every turn, **merging** their hits into the agent's own results (each extra bank gets an 8s timeout and is non-fatal on failure). Use this for a shared operator/household profile every agent should know — preferences, projects, people — kept consistent fleet-wide.

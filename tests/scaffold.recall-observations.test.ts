@@ -57,18 +57,31 @@ describe("hindsight recall overrides — observations + trivial-skip", () => {
     expect(s.recallSkipTrivial).toBe(true);
   });
 
-  it("Phase 6b: retainMode is chunked (windowed retain), retainEveryNTurns stays 1", () => {
+  it("Phase 6b: retainMode is chunked (windowed retain); retain cadence defaults to 3 / 1", () => {
     const s = settingsAfterInstall();
-    // Chunked + every-turn: keep crash durability (retain every turn), but
-    // slice a recent window per fire instead of re-consolidating the whole
-    // transcript. Depends on the paired vendor retain.py divergence.
+    // Chunked retain: slice a recent window per fire instead of
+    // re-consolidating the whole transcript. Depends on the paired vendor
+    // retain.py divergence. Cadence defaults to the switchroom scaffold
+    // values (every 3rd turn, +1 overlap turn) — raised from the historical
+    // 1 / 2 so the local reasoning consolidation model doesn't run away.
     expect(s.retainMode).toBe("chunked");
+    expect(s.retainEveryNTurns).toBe(3);
+    expect(s.retainOverlapTurns).toBe(1);
+  });
+
+  it("retain cadence is operator-configurable via memory.retain.*", () => {
+    // Fleet-wide override under defaults, plus a per-agent override that wins.
+    config.defaults = { memory: { retain: { every_n_turns: 5, overlap_turns: 2 } } } as SwitchroomConfig["defaults"];
+    config.agents = { probe: { memory: { retain: { every_n_turns: 1 } } } } as unknown as SwitchroomConfig["agents"];
+    const s = settingsAfterInstall();
+    // Per-agent every_n_turns wins; overlap_turns inherits the defaults tier.
     expect(s.retainEveryNTurns).toBe(1);
+    expect(s.retainOverlapTurns).toBe(2);
   });
 
   it("regression: the pre-existing memory overrides still apply", () => {
     const s = settingsAfterInstall();
-    expect(s.retainEveryNTurns).toBe(1);
+    expect(s.retainEveryNTurns).toBe(3);
     expect(s.recallMaxMemories).toBe(8);
     expect(s.recallMinOverlap).toBe(0.1);
   });

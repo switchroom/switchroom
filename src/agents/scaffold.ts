@@ -2433,6 +2433,12 @@ export function installHindsightPlugin(
   // uses the EXPECTED post-override rendering for that one file.
   const destPath = join(agentDir, ".claude", "plugins", "hindsight-memory");
   const additionalBanks = resolveUsers(switchroomConfig, agentName).additionalBanks;
+  // Resolve the auto-retain cadence knobs from the CASCADED config
+  // (defaults → profile → agent), mirroring how the recall knobs are read
+  // in the env-export path (see resolveHindsightRetainConfig). These drive
+  // the stamped settings.json values below, so a switchroom.yaml
+  // `memory.retain.*` override is authoritative and survives reconcile.
+  const retainConfig = resolveHindsightRetainConfig(switchroomConfig, agentName);
   let expectedSettings: string | null = null;
   try {
     const vendorSettingsPath = join(sourcePath, "settings.json");
@@ -2440,6 +2446,7 @@ export function installHindsightPlugin(
       expectedSettings = renderHindsightSettingsOverrides(
         readFileSync(vendorSettingsPath, "utf-8"),
         additionalBanks,
+        retainConfig,
       );
     }
   } catch {
@@ -2461,22 +2468,28 @@ export function installHindsightPlugin(
   // default settings.json. Vendor stays untouched; overrides are applied
   // after every copy so they survive reconcile/restart.
   //
-  // `retainEveryNTurns: 1` (override from vendor default `10`): the
-  // vendor's default throttles auto-retention to every 10th turn, so a
-  // short session can end before retention ever fires. Switchroom sets it
-  // to 1 so the Stop hook retains every turn (paired with chunked mode,
-  // each retain only slices a small recent window, so per-turn cost stays
-  // low). For
-  // switchroom's "always-on specialist exec-assistant" vision, that
-  // throttle is wrong — users expect "please remember this" or even a
-  // single fact-sharing turn to survive a restart. The jtbd-memory-
-  // survives-restart UAT exposed the gap (2026-05-20): a 2-turn
-  // session NEVER hit the retention threshold, so the token was lost
-  // on restart. Setting retainEveryNTurns=1 makes every Stop hook
-  // trigger retention. Cost: more frequent hindsight API calls
-  // (cheap — async POST to a local container). Memory is the moat
-  // (reference/jobs/remember-across-sessions.md); paying for it on every
-  // turn is correct.
+  // `retainEveryNTurns` / `retainOverlapTurns` (override from vendor
+  // defaults `10` / `2`): the vendor default throttles auto-retention to
+  // every 10th turn, so a short session can end before retention ever
+  // fires. Switchroom stamps the CASCADED config value (defaults →
+  // profile → agent, `memory.retain.every_n_turns` / `.overlap_turns`),
+  // falling back to the switchroom scaffold defaults of 3 / 1 when unset.
+  //
+  // History: this used to be a hardcoded 1 / 2 (retain every single turn,
+  // 3-turn window). That guaranteed a ≤2-turn fact-sharing session
+  // survived a restart (the jtbd-memory-survives-restart UAT, 2026-05-20),
+  // but once retain/consolidation moved to a LOCAL Ollama reasoning model
+  // (gpt-oss-20b), the every-turn cadence with large overlapping windows
+  // made the model run away (single retains generating 22k–37k output
+  // tokens over 100–200s, starving workers). Default 3 / 1 = ~3× fewer,
+  // smaller retains. Tradeoff: at n=3, up to ~3 turns of transcript can be
+  // lost on a hard crash instead of ≤2 — an intentional swap of a little
+  // crash durability for far cheaper, calmer retains. Operators who need
+  // the tight every-turn guarantee back set `memory.retain.every_n_turns: 1`
+  // in switchroom.yaml (per-agent or fleet-wide under `defaults`); chatty
+  // banks can raise it further. Making it a yaml knob also makes the value
+  // update-proof — it survives `switchroom apply`/reconcile, which
+  // regenerates this settings.json and would otherwise revert hand-edits.
   // Resolve the effective extra recall banks for this agent — the static
   // shared-bank foundation for per-user memory (ship-B; RFC
   // reference/rfcs/per-speaker-memory-routing.md). Read from the CASCADED
@@ -2486,7 +2499,7 @@ export function installHindsightPlugin(
   // per-agent value. Now also folds in the `knows`-assigned user/bank profiles
   // (user concept, RFC reference/rfcs/user-concept.md); resolveUsers() handles
   // the cascade + union (defaults ∪ agent, generated ∪ explicit) itself.
-  applyHindsightSettingsOverrides(destPath, additionalBanks);
+  applyHindsightSettingsOverrides(destPath, additionalBanks, retainConfig);
 
   // Resolve the agent's bank/collection name and the Hindsight REST URL.
   // The plugin's hooks expect HINDSIGHT_API_URL (the REST base), not the
@@ -2500,12 +2513,57 @@ export function installHindsightPlugin(
 }
 
 /**
+ * Switchroom scaffold defaults for the hindsight auto-retain cadence,
+ * used when switchroom.yaml leaves `memory.retain.*` unset. Raised from
+ * the historical 1 / 2 after retain/consolidation moved to a local
+ * reasoning model that ran away on every-turn overlapping payloads — see
+ * the rationale comment in installHindsightPlugin().
+ */
+const HINDSIGHT_DEFAULT_RETAIN_EVERY_N_TURNS = 3;
+const HINDSIGHT_DEFAULT_RETAIN_OVERLAP_TURNS = 1;
+
+/** Resolved auto-retain cadence for an agent (post-cascade, defaults applied). */
+interface HindsightRetainConfig {
+  everyNTurns: number;
+  overlapTurns: number;
+}
+
+/**
+ * Resolve the effective auto-retain cadence for an agent from the CASCADED
+ * config (defaults → profile → agent), applying the switchroom scaffold
+ * defaults when `memory.retain.*` is unset. Mirrors how the recall knobs
+ * are resolved in the env-export path (resolveAgentConfig, then read the
+ * merged `memory.recall.*`).
+ */
+function resolveHindsightRetainConfig(
+  switchroomConfig: SwitchroomConfig | undefined,
+  agentName: string,
+): HindsightRetainConfig {
+  const resolved = switchroomConfig
+    ? resolveAgentConfig(
+        switchroomConfig.defaults,
+        switchroomConfig.profiles,
+        // Some scaffold paths install the plugin for an agent that isn't in
+        // the `agents` map yet (fresh scaffold); resolve against an empty
+        // agent so the defaults/profile tiers still apply.
+        switchroomConfig.agents[agentName] ?? ({} as AgentConfig),
+      )
+    : undefined;
+  const retain = resolved?.memory?.retain;
+  return {
+    everyNTurns: retain?.every_n_turns ?? HINDSIGHT_DEFAULT_RETAIN_EVERY_N_TURNS,
+    overlapTurns: retain?.overlap_turns ?? HINDSIGHT_DEFAULT_RETAIN_OVERLAP_TURNS,
+  };
+}
+
+/**
  * Merge switchroom-specific overrides into the vendored hindsight
  * plugin's `settings.json`. Idempotent — runs after every plugin
  * copy on every scaffold/reconcile/restart.
  *
  * Currently overrides:
- *   - `retainEveryNTurns`: 10 → 1 (capture every turn, not every 10th)
+ *   - `retainEveryNTurns`: 10 → configured (default 3; `memory.retain.every_n_turns`)
+ *   - `retainOverlapTurns`: 2 → configured (default 1; `memory.retain.overlap_turns`)
  *   - `retainMode`: full-session → chunked (Phase 6b: window, not whole
  *     transcript, re-consolidated per fire; paired with the vendor
  *     retain.py divergence)
@@ -2520,6 +2578,7 @@ export function installHindsightPlugin(
 function applyHindsightSettingsOverrides(
   pluginDestPath: string,
   additionalBanks: readonly string[],
+  retainConfig: HindsightRetainConfig,
 ): void {
   const settingsPath = join(pluginDestPath, "settings.json");
   if (!existsSync(settingsPath)) return; // vendor structure changed; bail safely
@@ -2529,7 +2588,7 @@ function applyHindsightSettingsOverrides(
   } catch {
     return;
   }
-  const next = renderHindsightSettingsOverrides(raw, additionalBanks);
+  const next = renderHindsightSettingsOverrides(raw, additionalBanks, retainConfig);
   if (next == null) return; // malformed settings; don't make it worse
   writeFileSyncIfChanged(settingsPath, next);
 }
@@ -2545,6 +2604,7 @@ function applyHindsightSettingsOverrides(
 function renderHindsightSettingsOverrides(
   raw: string,
   additionalBanks: readonly string[],
+  retainConfig: HindsightRetainConfig,
 ): string | null {
   let settings: Record<string, unknown>;
   try {
@@ -2552,43 +2612,40 @@ function renderHindsightSettingsOverrides(
   } catch {
     return null; // vendor's settings.json malformed; don't make it worse
   }
-  // Override: every turn retains (no throttle). See the rationale in
-  // installHindsightPlugin() above.
-  settings.retainEveryNTurns = 1;
+  // Override: auto-retain cadence, from the cascaded config (defaults 3 / 1).
+  // See the rationale in installHindsightPlugin() above — the yaml knob
+  // (memory.retain.every_n_turns / .overlap_turns) is authoritative and,
+  // being stamped here on every scaffold/reconcile, survives `switchroom
+  // apply` regenerating this file.
+  settings.retainEveryNTurns = retainConfig.everyNTurns;
   // Phase 6b (RFC reference/rfcs/hindsight-synthesis-layers.md): switch from
-  // the vendor default retainMode="full-session" to "chunked" while keeping
-  // retainEveryNTurns=1. This is the crux of Phase 6b option A — keep the
-  // every-turn crash durability that retainEveryNTurns=1 buys (a ≤2-turn
-  // session still retains its token before a restart; the jtbd-memory-
-  // survives-restart UAT), but STOP re-consolidating the whole accumulated
-  // transcript on every Stop fire. Under full-session × every-turn, each fire
-  // re-sent the entire growing transcript to Hindsight's consolidation engine
-  // — the ~1M-tokens/day/agent invisible spend. In chunked mode retain.py
-  // slices only the recent window (retainOverlapTurns + retainEveryNTurns
-  // turns) per fire.
+  // the vendor default retainMode="full-session" to "chunked". This is the
+  // crux of Phase 6b option A — STOP re-consolidating the whole accumulated
+  // transcript on every Stop fire. Under full-session, each fire re-sent the
+  // entire growing transcript to Hindsight's consolidation engine — the
+  // ~1M-tokens/day/agent invisible spend. In chunked mode retain.py slices
+  // only the recent window (retainOverlapTurns + retainEveryNTurns turns) per
+  // fire.
   //
-  // This override is INERT without the paired vendor patch: upstream retain.py
-  // gated chunked window-slicing on `retainEveryNTurns > 1`, so chunked at
-  // n=1 silently fell back to full-session. The switchroom divergence in
-  // vendor/hindsight-memory/scripts/retain.py (select_retain_window) decouples
-  // the window slice from that throttle, which is what makes chunked+every-turn
-  // actually take effect. See that file's header comment + the CHANGELOG entry.
+  // Crash-durability note: at the historical retainEveryNTurns=1 every turn
+  // retained on its own fire, so no fact could fall outside a window and a
+  // ≤2-turn session always survived a restart (the jtbd-memory-survives-
+  // restart UAT). At the current default of 3, retention fires every 3rd
+  // turn, so up to ~3 turns of transcript can be lost on a hard crash before
+  // the next fire — the intentional tradeoff for smaller, calmer retains that
+  // don't run the local reasoning consolidation model away. Operators who
+  // need the tight guarantee back set memory.retain.every_n_turns: 1.
   //
-  // Durability holds because the window always extends to the END of the
-  // transcript, so the turn that just completed (whose Stop hook is firing)
-  // is always inside the window, and every turn fires at n=1 — so each turn's
-  // content is retained on its own fire. No fact can fall outside every window.
-  //
-  // No operator override surface yet: switchroom.yaml exposes memory.recall.*
-  // (see AgentMemorySchema in src/config/schema.ts) but no memory.retain.mode
-  // key, so this is the scaffold default for every agent. If a retain-mode
-  // cascade is added later, wire it here (mirroring the recall knobs) and let
-  // the env/config value win over this default.
+  // This chunked override is INERT without the paired vendor patch: upstream
+  // retain.py gated chunked window-slicing on `retainEveryNTurns > 1`. The
+  // switchroom divergence in vendor/hindsight-memory/scripts/retain.py
+  // (select_retain_window) decouples the window slice from that throttle,
+  // which is what makes chunked retain actually take effect. See that file's
+  // header comment + the CHANGELOG entry.
   settings.retainMode = "chunked";
-  // retainOverlapTurns stays at the vendor default (2) → window = 3 recent
-  // turns at retainEveryNTurns=1. That's a comfortable safety margin for the
-  // restart guarantee (the firing turn plus the two before it), so no explicit
-  // override is warranted.
+  // retainOverlapTurns from the cascaded config (default 1) → window =
+  // overlap_turns + every_n_turns recent turns per fire (default 1 + 3 = 4).
+  settings.retainOverlapTurns = retainConfig.overlapTurns;
   // v0.13.22 smart defaults: at our recallBudget=low the vendor's 12
   // memories is generous; 8 keeps prompt noise down without hurting
   // the substantive recall@N (top-8 carries the same dominant facts

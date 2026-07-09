@@ -579,6 +579,42 @@ export const AgentMemorySchema = z
       })
       .optional()
       .describe("Auto-recall tuning knobs"),
+    retain: z
+      .object({
+        every_n_turns: z
+          .number()
+          .int()
+          .min(1)
+          .optional()
+          .describe(
+            "How often the Stop hook fires auto-retention, in turns. The " +
+            "vendor plugin default is 10 (a short session can end before " +
+            "retention ever fires); switchroom's scaffold default is 3. " +
+            "Lower = more frequent, smaller retains + tighter crash " +
+            "durability (at 1, every turn is retained before a restart can " +
+            "lose it); higher = fewer, larger retains + less LLM churn. " +
+            "Raised from the historical 1 to 3 because the local reasoning " +
+            "consolidation model (Ollama gpt-oss-20b) ran away on the large " +
+            "overlapping every-turn payloads. Set to 1 for the old " +
+            "every-turn crash-durability guarantee. Min 1. Cascade: " +
+            "per-field merge (agent wins over default).",
+          ),
+        overlap_turns: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe(
+            "Extra recent turns included in each chunked retain window on " +
+            "top of `every_n_turns`, so window = overlap_turns + " +
+            "every_n_turns recent turns. Vendor default is 2; switchroom's " +
+            "scaffold default is 1 (smaller payloads for the local " +
+            "reasoning consolidation model). Higher = more redundant " +
+            "context re-sent per fire. Min 0. Cascade: per-field merge.",
+          ),
+      })
+      .optional()
+      .describe("Auto-retain (Stop-hook consolidation) cadence knobs"),
   })
   .optional();
 
