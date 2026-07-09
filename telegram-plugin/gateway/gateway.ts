@@ -1527,6 +1527,64 @@ function resolveSubagentOriginChat(
   }
 }
 
+/**
+ * Tracks worker-feed agents whose owner-DM fallback has already been
+ * logged, so `resolveWorkerFeedChat` emits the routing-decision line once
+ * per agent instead of every watcher tick (~1/s). Capped FIFO at 256 — a
+ * late duplicate log is harmless (one extra stderr line), and the cap keeps
+ * the set bounded across a long gateway lifetime even if origin resolution
+ * is persistently broken fleet-wide (history disabled → every nested worker
+ * hits the fallback). A gateway restart clears it.
+ */
+const WORKER_FEED_FALLBACK_LOG_CAP = 256
+const workerFeedOwnerDmFallbackLogged = new Set<string>()
+
+/**
+ * Resolve a worker-feed destination chat with a guaranteed last resort.
+ *
+ * The universal-liveness contract is "any active work has a card, at any
+ * nesting depth, with or without a parent turn open." Origin resolution
+ * (`resolveSubagentOriginChat`) only succeeds when the ancestor turn row is
+ * in `turnsDb` and history is enabled; a depth-2+ worker whose chain can't
+ * be walked (history disabled, row reaped, ancestor never stamped) would
+ * otherwise fall through `fleetChatId || allowFrom[0]` and, if those are
+ * empty too, hit the `chatId.length === 0` skip in `workerActivityFeed.update`
+ * — painting NOTHING, silently. That is the one path most likely to violate
+ * "any and all active work has a card."
+ *
+ * This never returns `''`: the precedence is origin chat → fleet chat →
+ * first allowed chat (the owner DM). The owner DM is the durable floor —
+ * "wrong chat" beats "no card." A one-line routing-decision log flags the
+ * fallback so an operator can see the misroute without it reading as an
+ * error (it isn't one — the card surfaced).
+ */
+function resolveWorkerFeedChat(
+  agentId: string,
+  fleetChatId: string,
+): { chatId: string; threadId?: number } {
+  const origin = resolveSubagentOriginChat(agentId)
+  if (origin != null && origin.chatId.length > 0) return origin
+  if (fleetChatId.length > 0) return { chatId: fleetChatId }
+  const ownerDm = loadAccess().allowFrom[0] ?? ''
+  if (origin == null && fleetChatId.length === 0 && ownerDm.length > 0) {
+    // Routing decision, not a warning: origin resolution failed and no
+    // fleet chat is configured, so the nested worker's card lands in the
+    // owner DM. Logged ONCE per agent so the misroute is auditable
+    // without spamming every tick (the watcher drives onProgress ~1/s).
+    if (!workerFeedOwnerDmFallbackLogged.has(agentId)) {
+      workerFeedOwnerDmFallbackLogged.add(agentId)
+      if (workerFeedOwnerDmFallbackLogged.size > WORKER_FEED_FALLBACK_LOG_CAP) {
+        const oldest = workerFeedOwnerDmFallbackLogged.values().next().value
+        if (oldest != null) workerFeedOwnerDmFallbackLogged.delete(oldest)
+      }
+      process.stderr.write(
+        `telegram gateway: worker-feed origin unresolved agent=${agentId} — routing card to owner DM\n`,
+      )
+    }
+  }
+  return { chatId: ownerDm, threadId: origin?.threadId }
+}
+
 // ─── Periodic history reaper (#1073) ──────────────────────────────────────
 // The init-time prune in history.ts only touched the `messages` table.
 // `subagents` and `turns` in registry.db grew unbounded — every Agent()
@@ -4109,9 +4167,26 @@ async function resolveCompactCard(
       { chat_id: card.chatId, verb: `proactiveCompact.${kind}` },
     );
   } catch (err) {
+    // Best-effort status-card edit — a transport hiccup (429 / "not
+    // modified" / message gone) is not a liveness-logic error and must
+    // not log a "card edit failed" warning (the warning-as-excuse-for-a-
+    // stale-card anti-pattern). Only a genuine unexpected error warrants
+    // a line; transport classes are silent.
+    const desc = err instanceof Error ? err.message : String(err);
+    const low = desc.toLowerCase();
+    if (
+      low.includes('not modified') ||
+      low.includes('not found') ||
+      low.includes("can't be edited") ||
+      low.includes('cannot be edited') ||
+      low.includes('not enough rights') ||
+      low.includes('429') ||
+      low.includes('retry after')
+    ) {
+      return;
+    }
     process.stderr.write(
-      `telegram gateway: proactive-compact ${kind} card edit failed: ` +
-        `${err instanceof Error ? err.message : String(err)}\n`,
+      `telegram gateway: proactive-compact ${kind} card edit failed: ${desc}\n`,
     );
   }
 }
@@ -12935,7 +13010,22 @@ async function drainActivitySummary(
         turn.activityLastSentRender = target
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
-        if (!msg.includes('message is not modified')) {
+        const low = msg.toLowerCase()
+        // Transport-class failures (429, message gone, "not modified") must
+        // NOT inflate `activityDrainFailures` — that counter flags a turn as
+        // DEGRADED on turn-end, and a transient rate-limit or an
+        // already-deleted message is not a logic defect. Counting them would
+        // false-flag a healthy turn. "not modified" is success; gone/429 are
+        // retried or harmless. Only a genuine send/open failure counts.
+        const isTransport =
+          low.includes('not modified') ||
+          low.includes('not found') ||
+          low.includes("can't be edited") ||
+          low.includes('cannot be edited') ||
+          low.includes('not enough rights') ||
+          low.includes('429') ||
+          low.includes('retry after')
+        if (!isTransport) {
           turn.activityDrainFailures += 1
           // Surface the failing anchor + topic: the resume-400 bug fed a
           // fabricated 13-digit message_id as the reply anchor here, so every
@@ -13285,7 +13375,23 @@ function clearActivitySummary(turn: CurrentTurn, finalHtmlOverride?: string | nu
           { chat_id: chat, ...(thread != null ? { threadId: thread } : {}), verb: 'activity-summary.delete' },
         )
       } catch (err) {
-        process.stderr.write(`telegram gateway: activity-summary delete failed: ${err}\n`)
+        // Best-effort teardown of a status card. A transport-class failure
+        // (message already deleted, chat gone, 429) is not a liveness-logic
+        // error — "message to delete not found" is the desired end state
+        // here, and a 429 on a teardown delete is retried by robustApiCall.
+        // Stay silent on those; warn only on a genuinely unexpected error.
+        const msg = err instanceof Error ? err.message : String(err)
+        const low = msg.toLowerCase()
+        if (
+          low.includes('not modified') ||
+          low.includes('not found') ||
+          low.includes('not enough rights') ||
+          low.includes('429') ||
+          low.includes('retry after')
+        ) {
+          return
+        }
+        process.stderr.write(`telegram gateway: activity-summary delete failed: ${msg}\n`)
       }
       return
     }
@@ -13311,10 +13417,26 @@ function clearActivitySummary(turn: CurrentTurn, finalHtmlOverride?: string | nu
         { chat_id: chat, ...(thread != null ? { threadId: thread } : {}), verb: 'activity-summary.finalize' },
       )
     } catch (err) {
+      // Same transport-class discipline as the delete path: the card
+      // finalize is a best-effort liveness edit. "not modified" = the card
+      // already shows the finalized body (success); "not found" / "not
+      // enough rights" = the message is gone (nothing to finalize); 429 is
+      // retried by robustApiCall. None of those are liveness-logic errors
+      // and none warrant a stderr warning. Warn only on the unexpected.
       const msg = err instanceof Error ? err.message : String(err)
-      if (!msg.includes('message is not modified')) {
-        process.stderr.write(`telegram gateway: activity-summary finalize failed: ${msg}\n`)
+      const low = msg.toLowerCase()
+      if (
+        low.includes('not modified') ||
+        low.includes('not found') ||
+        low.includes("can't be edited") ||
+        low.includes('cannot be edited') ||
+        low.includes('not enough rights') ||
+        low.includes('429') ||
+        low.includes('retry after')
+      ) {
+        return
       }
+      process.stderr.write(`telegram gateway: activity-summary finalize failed: ${msg}\n`)
     }
   })
 }
@@ -27435,8 +27557,8 @@ void (async () => {
                     orphanStatusEnabled,
                   })
                   if (surface === 'worker-feed') {
-                    const origin = resolveSubagentOriginChat(agentId)
-                    const wkChat = origin?.chatId || fleetChatId || (loadAccess().allowFrom[0] ?? '')
+                    const wk = resolveWorkerFeedChat(agentId, fleetChatId)
+                    const wkChat = wk.chatId
                     void workerActivityFeed?.update(
                       agentId,
                       wkChat,
@@ -27448,7 +27570,7 @@ void (async () => {
                         elapsedMs,
                         state: 'running',
                       },
-                      origin?.threadId,
+                      wk.threadId,
                     )?.then(() => reconcileWorkerPin(agentId, wkChat, true))
                     return
                   }
@@ -27573,8 +27695,8 @@ void (async () => {
                 // resolved (the pinned-card fleet that used to carry the chat
                 // is gone — see resolveSubagentOriginChat).
                 if (workerFeedEnabled) {
-                  const origin = resolveSubagentOriginChat(agentId)
-                  const wkChat = origin?.chatId || fleetChatId || (loadAccess().allowFrom[0] ?? '')
+                  const wk = resolveWorkerFeedChat(agentId, fleetChatId)
+                  const wkChat = wk.chatId
                   void workerActivityFeed?.update(
                     agentId,
                     wkChat,
@@ -27589,7 +27711,7 @@ void (async () => {
                       elapsedMs,
                       state: 'running',
                     },
-                    origin?.threadId,
+                    wk.threadId,
                   )?.then(() => reconcileWorkerPin(agentId, wkChat, true))
                   return
                 }

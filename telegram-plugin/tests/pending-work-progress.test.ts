@@ -49,9 +49,11 @@ function setup(): Capture {
 }
 
 async function flush(): Promise<void> {
-  // Allow the fire-and-forget promise chain in tick() to settle.
-  await Promise.resolve()
-  await Promise.resolve()
+  // Allow the fire-and-forget promise chain in tick() to settle. The chain
+  // is `.then(editMessage).then(emitMetric).catch(...)` with an async
+  // editMessage, so it spans several microtask hops — a single macrotask
+  // boundary (setTimeout 0) drains them all deterministically.
+  await new Promise((r) => setTimeout(r, 0))
 }
 
 describe('pending-work-progress', () => {
@@ -557,5 +559,116 @@ describe('pending-work-progress', () => {
     __tickForTests(cap.now)
     await flush()
     expect(cap.edits).toHaveLength(1)
+  })
+
+  // ─── review finding #2: transport-hiccup classification ────────────────────
+  // A best-effort liveness surface must not log a scary "edit failed" warning
+  // for recoverable/permanent transport outcomes, and must stop retrying a
+  // dead anchor. "not modified" counts as success; "gone" clears state; 429 /
+  // transient leave state for the next tick — all silently.
+  it('#2: "message is not modified" counts as a successful edit (no warning, metric emitted)', async () => {
+    const cap = setup()
+    const errs: string[] = []
+    const origStderr = process.stderr.write.bind(process.stderr)
+    process.stderr.write = ((s: string) => { errs.push(s); return true }) as typeof process.stderr.write
+    try {
+      let calls = 0
+      __setDepsForTests({
+        editMessage: async () => {
+          calls++
+          if (calls === 1) throw new Error('Bad Request: message is not modified')
+          cap.edits.push({} as PendingProgressEditCtx)
+        },
+        emitMetric: (e) => cap.metrics.push(e),
+        nowMs: () => cap.now,
+      })
+      startTurn(KEY)
+      noteAsyncDispatch(KEY)
+      noteOutbound(KEY, { messageId: 100, text: 'working' })
+      noteTurnEnd(KEY)
+
+      cap.now = EDIT_INTERVAL_MS
+      __tickForTests(cap.now)
+      // The .catch hop needs an extra microtask drain beyond the 2-await flush.
+      await flush()
+      await Promise.resolve()
+      // The not-modified outcome is success — an `edited` metric was emitted.
+      expect(cap.metrics.some((m) => m.kind === 'pending_progress_edited')).toBe(true)
+      // No scary "edit failed" stderr for a transport-class outcome.
+      expect(errs.some((e) => e.includes('edit failed'))).toBe(false)
+    } finally {
+      process.stderr.write = origStderr
+    }
+  })
+
+  it('#2: a gone anchor (message not found) clears state so the tick stops retrying it, silently', async () => {
+    const cap = setup()
+    const errs: string[] = []
+    const origStderr = process.stderr.write.bind(process.stderr)
+    process.stderr.write = ((s: string) => { errs.push(s); return true }) as typeof process.stderr.write
+    try {
+      let calls = 0
+      __setDepsForTests({
+        editMessage: async () => {
+          calls++
+          throw new Error('Bad Request: message to edit not found')
+        },
+        emitMetric: (e) => cap.metrics.push(e),
+        nowMs: () => cap.now,
+      })
+      startTurn(KEY)
+      noteAsyncDispatch(KEY)
+      noteOutbound(KEY, { messageId: 100, text: 'working' })
+      noteTurnEnd(KEY)
+
+      cap.now = EDIT_INTERVAL_MS
+      __tickForTests(cap.now)
+      await flush()
+      await Promise.resolve()
+      expect(calls).toBe(1)
+      // No warning for a transport-gone outcome.
+      expect(errs.some((e) => e.includes('edit failed'))).toBe(false)
+
+      // Next tick — the anchor was cleared, so no retry against the dead id.
+      cap.now = EDIT_INTERVAL_MS * 3
+      __tickForTests(cap.now)
+      await flush()
+      await Promise.resolve()
+      expect(calls).toBe(1) // no second attempt
+    } finally {
+      process.stderr.write = origStderr
+    }
+  })
+
+  it('#2: a 429 / transient error leaves state intact for the next tick, silently', async () => {
+    const cap = setup()
+    const errs: string[] = []
+    const origStderr = process.stderr.write.bind(process.stderr)
+    process.stderr.write = ((s: string) => { errs.push(s); return true }) as typeof process.stderr.write
+    try {
+      let calls = 0
+      __setDepsForTests({
+        editMessage: async () => {
+          calls++
+          throw { error_code: 429, parameters: { retry_after: 1 }, message: 'Too Many Requests' }
+        },
+        emitMetric: (e) => cap.metrics.push(e),
+        nowMs: () => cap.now,
+      })
+      startTurn(KEY)
+      noteAsyncDispatch(KEY)
+      noteOutbound(KEY, { messageId: 100, text: 'working' })
+      noteTurnEnd(KEY)
+
+      cap.now = EDIT_INTERVAL_MS
+      __tickForTests(cap.now)
+      await flush()
+      await Promise.resolve()
+      // State survives — the anchor is still there to retry next tick.
+      expect(__getStateForTests(KEY)?.anchorMessageId).toBe(100)
+      expect(errs.some((e) => e.includes('edit failed'))).toBe(false)
+    } finally {
+      process.stderr.write = origStderr
+    }
   })
 })
