@@ -575,6 +575,67 @@ describe('startSubagentWatcher', () => {
       expect(narrativeCues[0]).toContain('find the repo')
     })
 
+    it('narration-clobber regression: a narration cue immediately followed by its resolving tool_use in the same poll does NOT get overwritten by the tool-label cue', () => {
+      // Reproduces the bug: sub_agent_text ("On it...") + sub_agent_tool_use
+      // (Bash) land in the SAME jsonl-tail read, so both the narrative
+      // resolution (fireNarrativeProgress) and the tool-description
+      // onProgress fire within one loop iteration over `events`. Since the
+      // card renders replace-on-write, the tool-label call previously always
+      // clobbered the narration call that fired moments earlier — narration
+      // was staged and "SHOWN" per the dedup gate, but never actually
+      // visible on the pinned card. Assert only ONE onProgress cue fires for
+      // this tick, and it's the narration (progressLine == null), not the
+      // tool label.
+      const allCues: Array<{ progressLine?: string; latestSummary: string }> = []
+      const agentDir = join(tmpRoot, 'agent')
+      const subagentsDir = join(agentDir, '.claude', 'projects', 'p1', 'session-abc', 'subagents')
+      mkdirSync(subagentsDir, { recursive: true })
+      const jsonlPath = join(subagentsDir, 'agent-deadbeef.jsonl')
+      const h = startWatcherSync({
+        agentDir,
+        onProgress: ({ progressLine, latestSummary }) => {
+          allCues.push({ progressLine, latestSummary })
+        },
+      })
+      writeFileSync(jsonlPath, buildJSONL(subAgentUserMsg('Find the repo')))
+      h.poll()
+      // Narration text + its resolving tool_use appended and tailed together
+      // in a single poll — this is the "same tick" race.
+      appendFileSync(
+        jsonlPath,
+        buildJSONL(subAgentAssistantText('On it. Let me find the repo.'), subAgentToolUse('Bash', 'b1')),
+      )
+      h.poll()
+      expect(allCues.length).toBe(1)
+      expect(allCues[0].progressLine).toBeUndefined()
+      expect(allCues[0].latestSummary).toContain('find the repo')
+    })
+
+    it('unregressed: two sub_agent_tool_use events with no narration between them both still show tool labels (named foreground blindspot)', () => {
+      // Guards against the clobber-guard fix over-suppressing: narrativeJustFired
+      // must be false for a tool_use that has no preceding pending narrative,
+      // so back-to-back tool calls (a researcher reading files with no prose)
+      // must both still surface a progressLine.
+      const toolCues: Array<string | undefined> = []
+      const agentDir = join(tmpRoot, 'agent')
+      const subagentsDir = join(agentDir, '.claude', 'projects', 'p1', 'session-abc', 'subagents')
+      mkdirSync(subagentsDir, { recursive: true })
+      const jsonlPath = join(subagentsDir, 'agent-deadbeef.jsonl')
+      const h = startWatcherSync({
+        agentDir,
+        onProgress: ({ progressLine }) => {
+          if (progressLine != null) toolCues.push(progressLine)
+        },
+      })
+      writeFileSync(jsonlPath, buildJSONL(subAgentUserMsg('Find the repo')))
+      h.poll()
+      appendFileSync(jsonlPath, buildJSONL(subAgentToolUse('Bash', 'b1')))
+      h.poll()
+      appendFileSync(jsonlPath, buildJSONL(subAgentToolUse('Bash', 'b2')))
+      h.poll()
+      expect(toolCues.length).toBe(2)
+    })
+
     it('narrative gate: trailing narration at turn_end is SHOWN', () => {
       const narrativeCues: string[] = []
       const agentDir = join(tmpRoot, 'agent')

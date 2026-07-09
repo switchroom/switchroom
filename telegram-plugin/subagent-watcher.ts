@@ -918,8 +918,8 @@ export function readSubTail(
       // (stage-on-text, resolve-on-tool/turn_end) can replay a previously
       // pending block exactly once. `latestSummary` carries the worker's
       // narrative result (entry.lastResultText), never tool labels.
-      const fireNarrativeProgress = (): void => {
-        if (onProgress == null || entry.state !== 'running' || entry.historical) return
+      const fireNarrativeProgress = (): boolean => {
+        if (onProgress == null || entry.state !== 'running' || entry.historical) return false
         try {
           onProgress({
             agentId: entry.agentId,
@@ -933,8 +933,10 @@ export function readSubTail(
             lastTool: entry.lastTool,
             toolCount: entry.toolCount,
           })
+          return true
         } catch (cbErr) {
           log?.(`subagent-watcher: onProgress callback error ${entry.agentId}: ${(cbErr as Error).message}`)
+          return false
         }
       }
       // Resolve a pending sub-agent narrative against a lookahead event.
@@ -952,21 +954,27 @@ export function readSubTail(
       //     compare the trailing block against the worker's last reply text
       //     (`entry.lastReplyText`) and suppress a draft. Background workers
       //     never set lastReplyText, so their trailing narration still SHOWs.
+      // Returns true iff a narrative onProgress cue actually fired this
+      // call — callers use this to skip a redundant/clobbering tool-label
+      // onProgress cue for the SAME tick (see #1042 below: without this,
+      // the tool-description onProgress unconditionally fires right after
+      // and its replace-on-write onProgress always wins, so the narration
+      // shown here is never actually visible on the pinned card).
       const resolvePendingSubNarrative = (
         toolName: string | null,
         toolInput: Record<string, unknown> | undefined,
-      ): void => {
-        if (entry.pendingNarrative == null) return
+      ): boolean => {
+        if (entry.pendingNarrative == null) return false
         const pending = entry.pendingNarrative
         entry.pendingNarrative = null
         if (toolName != null && REPLY_TOOLS.has(toolName)) {
           const replyText = typeof toolInput?.text === 'string' ? (toolInput.text as string) : ''
-          if (isDraftOfReply(pending.text, replyText)) return // draft of the reply → SUPPRESS
+          if (isDraftOfReply(pending.text, replyText)) return false // draft of the reply → SUPPRESS
         } else if (toolName == null && entry.lastReplyText != null && entry.lastReplyText.length > 0) {
           // turn_end path: suppress a trailing draft of the delivered answer.
-          if (isDraftOfReply(pending.text, entry.lastReplyText)) return
+          if (isDraftOfReply(pending.text, entry.lastReplyText)) return false
         }
-        fireNarrativeProgress()
+        return fireNarrativeProgress()
       }
       for (const ev of events) {
         const idleSecBeforeBump = Math.round((now - entry.lastActivityAt) / 1000)
@@ -1012,7 +1020,7 @@ export function readSubTail(
           // this tool is the lookahead that decides it (SHOW unless it drafts
           // a reply tool's text). Runs before the tool's own progress cue so
           // a working preamble surfaces just ahead of its tool step.
-          resolvePendingSubNarrative(ev.toolName, ev.input)
+          const narrativeJustFired = resolvePendingSubNarrative(ev.toolName, ev.input)
           // NIT 3: capture a foreground sub-agent's actual reply text so the
           // turn_end path can suppress a trailing draft of it (see
           // resolvePendingSubNarrative). Only REPLY_TOOLS carry the answer.
@@ -1039,7 +1047,17 @@ export function readSubTail(
           // stays the worker's narrative result (never polluted with tool
           // labels — the handback payload depends on it). Pure jsonl-tail →
           // render, no model call.
-          if (onProgress != null && entry.state === 'running' && !entry.historical) {
+          //
+          // Clobber guard: if a pending narrative just fired an onProgress
+          // cue THIS SAME tick (above), skip this one — replace-on-write
+          // rendering means whichever onProgress call fires last wins, so
+          // firing both back-to-back always threw away the narration in
+          // favour of the generic tool label. Narration already told the
+          // user what's happening for this tick; the label is redundant
+          // here. When nothing preceded this tool call (no pending
+          // narrative), this still fires — that's the named foreground
+          // blindspot fix, unchanged.
+          if (onProgress != null && entry.state === 'running' && !entry.historical && !narrativeJustFired) {
             const toolLine = describeToolUse(ev.toolName, ev.input ?? {})
             if (toolLine != null && toolLine.length > 0) {
               try {
