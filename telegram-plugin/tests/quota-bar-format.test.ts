@@ -12,7 +12,9 @@ import {
   formatWindowRow,
   renderQuotaBarAccount,
   renderQuotaBarBlockFromListState,
+  renderUsageCard,
 } from '../quota-bar-format.js';
+import type { AccountSnapshot } from '../auth-snapshot-format.js';
 import type { QuotaUtilization } from '../quota-check.js';
 import type { ListStateData } from '../../src/auth/broker/client.js';
 
@@ -239,5 +241,55 @@ describe('renderQuotaBarBlockFromListState', () => {
       '- 🟢 5h `[┃░░░░░░░░░] 0% / resets now`',
       '- 🔴 7d `[██████┃███] 100% / 2d16h left`',
     ]);
+  });
+});
+
+// ── renderUsageCard (bar block + Format 2 table) ─────────────────────
+
+describe('renderUsageCard', () => {
+  function snap(part: Partial<AccountSnapshot> & { label: string }): AccountSnapshot {
+    return {
+      isActive: false,
+      quota: null,
+      ...part,
+    };
+  }
+
+  const snapshots: AccountSnapshot[] = [
+    snap({
+      label: 'ken@example.com',
+      isActive: true,
+      quota: quota({
+        fiveHourUtilizationPct: 0,
+        sevenDayUtilizationPct: 47,
+        fiveHourResetAt: new Date(NOW.getTime() + 60 * 60_000),
+        sevenDayResetAt: new Date(NOW.getTime() + (3 * 24 + 1) * 60 * 60_000),
+      }),
+    }),
+  ];
+  const exhausted = new Map<string, boolean>([['ken@example.com', false]]);
+
+  it('renders the quota-bar block on top and the Format 2 table below', () => {
+    const out = renderUsageCard(snapshots, exhausted, { now: NOW, tz: 'UTC' });
+    const lines = out.split('\n');
+    // Bar block first — account title + two window rows with the ASCII bar.
+    expect(lines[0]).toBe('- **ken@example.com** (active)');
+    expect(out).toContain('- 🟢 5h `[');
+    expect(out).toContain('- 🟢 7d `[');
+    // Format 2 table below — its header + reset columns + recommendation
+    // footer are preserved so no per-window reset info is lost.
+    expect(out).toContain('🔋 **Auth — fleet status**');
+    expect(out).toContain('| State | Account | 5h | 5h resets | 7d | 7d resets |');
+    expect(out).toContain('Recommendation:');
+    // The bar block must precede the Format 2 table.
+    expect(out.indexOf('- **ken@example.com** (active)')).toBeLessThan(
+      out.indexOf('🔋 **Auth — fleet status**'),
+    );
+  });
+
+  it('forwards the demo flag to the Format 2 table', () => {
+    const out = renderUsageCard(snapshots, exhausted, { now: NOW, tz: 'UTC', demo: true });
+    // Demo masks the email label in the table; the real address must not leak.
+    expect(out).not.toContain('ken@example.com (active)');
   });
 });

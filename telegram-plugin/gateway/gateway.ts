@@ -23367,12 +23367,19 @@ bot.command('usage', async ctx => {
           state.accounts.map((a) => a.label),
           probeResp.results,
         )
-        const { renderAuthSnapshotFormat2, buildSnapshotsFromState, buildSnapshotKeyboard } = await import(
+        const { buildSnapshotsFromState, buildSnapshotKeyboard } = await import(
           '../auth-snapshot-format.js'
         )
+        const { renderUsageCard } = await import('../quota-bar-format.js')
         const tz = process.env.SWITCHROOM_TIMEZONE ?? process.env.TZ ?? 'UTC'
         const snapshots = buildSnapshotsFromState(state, quotas)
-        const text = renderAuthSnapshotFormat2(snapshots, {
+        // Compact quota-bar block on top (at-a-glance headroom + pace tick),
+        // Format 2 table below (preserves the per-window absolute reset
+        // times/dates + recommendation footer — no info lost).
+        const exhaustedByLabel = new Map<string, boolean>(
+          state.accounts.map((a) => [a.label, a.exhausted]),
+        )
+        const text = renderUsageCard(snapshots, exhaustedByLabel, {
           tz,
           now: new Date(),
           demo,

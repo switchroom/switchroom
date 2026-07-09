@@ -39,7 +39,12 @@
 import type { QuotaUtilization } from './quota-check.js';
 import { refillNormalizedUtils, isProbeThin } from '../src/auth/quota.js';
 import type { AccountState, ListStateData } from '../src/auth/broker/client.js';
-import { reviveLastQuota, type AccountSnapshot } from './auth-snapshot-format.js';
+import {
+  reviveLastQuota,
+  renderAuthSnapshotFormat2,
+  type AccountSnapshot,
+  type SnapshotRenderOpts,
+} from './auth-snapshot-format.js';
 import { escapeMarkdown } from './card-format.js';
 
 // ── dot thresholds ───────────────────────────────────────────────────
@@ -254,4 +259,29 @@ export function renderQuotaBarBlockFromListState(
     capturedAtMs: acc.last_quota?.capturedAt,
   }));
   return renderQuotaBarBlock(snapshots, exhaustedByLabel, { now });
+}
+
+/**
+ * The live `/usage` card: the compact quota-bar block on top (at-a-glance
+ * headroom + pace tick per window), followed by the full Format 2
+ * health-grouped table below.
+ *
+ * The bar block answers "how much headroom / how far through the reset
+ * window" at a glance; the table underneath preserves the per-window
+ * absolute reset times/dates (the #2889 reset columns) and the
+ * recommendation footer — the bar rows only carry a compact relative
+ * "time-left", so appending the table keeps that information from being
+ * lost. `opts` (tz / now / liveProbedAtMs / staleCachedAtMs / demo) is
+ * forwarded to the Format 2 renderer unchanged; the same `now` is shared
+ * with the bar block so the two halves can't disagree on the clock.
+ */
+export function renderUsageCard(
+  snapshots: AccountSnapshot[],
+  exhaustedByLabel: ReadonlyMap<string, boolean>,
+  opts: SnapshotRenderOpts = {},
+): string {
+  const now = opts.now ?? new Date();
+  const bar = renderQuotaBarBlock(snapshots, exhaustedByLabel, { now });
+  const table = renderAuthSnapshotFormat2(snapshots, { ...opts, now });
+  return `${bar}\n\n${table}`;
 }
