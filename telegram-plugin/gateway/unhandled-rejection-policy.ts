@@ -126,7 +126,27 @@ export function classifyRejection(
     // handler shut the process down. reconcileStatusPin now absorbs its own
     // errors (primary fix); this entry is defense-in-depth so ANY leaked
     // pin-rights 400 from any path is log-only, not fatal.
-    desc.includes('not enough rights')
+    desc.includes('not enough rights') ||
+    // 'group chat was upgraded to a supergroup chat' fires when a send
+    // targets a basic-group chat_id that Telegram has since migrated to
+    // a supergroup (new id format -100xxxxxxxxxx). Telegram sometimes
+    // surfaces the replacement id via `error.parameters.migrate_to_chat_id`
+    // but not reliably for every send method, so this handler can't always
+    // auto-repair the stale id — it can only make the failure non-fatal.
+    // This crashed marko's gateway on 2026-07-09 (and recurred from the
+    // same stale-id root cause on 2026-06-07 and 2026-06-09): a send to an
+    // old pre-migration group id crashed the WHOLE gateway process for
+    // every agent/chat, not just the one stale chat. A single unmigrated
+    // chat_id in cached state must never be fatal — log it so the stale id
+    // can be tracked down and fixed, but keep serving every other chat.
+    desc.includes('group chat was upgraded to a supergroup chat') ||
+    // Broader class: any 400 whose description signals the target
+    // chat_id itself is no longer valid (migrated, deactivated, or
+    // otherwise unresolvable). These are all "this one destination is
+    // broken", never "the gateway is broken" — same log-only posture as
+    // 'chat not found' above.
+    desc.includes('chat_id is empty') ||
+    desc.includes('group chat was deactivated')
   ) {
     return 'log_only'
   }
