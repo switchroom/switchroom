@@ -274,6 +274,16 @@ export interface SnapshotRenderOpts {
    */
   staleCachedAtMs?: number;
   /**
+   * True when the live probe returned no usable data for ANY account (probe
+   * threw / timed out / returned zero rows) AND nothing was served from
+   * cache either. The footer renders `⚠ probe failed — no live data`
+   * instead of a false bare `_Live_`. Subscription-honesty: a "Live" footer
+   * next to "no data" rows is the exact lie this closes. `staleCachedAtMs`
+   * (cache-served data) takes precedence over this; this takes precedence
+   * over the bare-`Live` fallback.
+   */
+  probeFailed?: boolean;
+  /**
    * Demo mode (the `/usage demo` / `/auth demo` suffix). When true, every
    * account label is run through `maskEmail` before rendering so a screen
    * recording shows stable realistic fakes instead of the operator's real
@@ -521,11 +531,15 @@ export function renderAuthSnapshotFormat2(
   lines.push(`_${recommendation(snapshots, now, opts.demo ?? false)}_`);
   // #2495 Change 2 — a failed probe-on-open renders an explicit "cached Nm
   // ago" warning, never a false live stamp. The degraded variant takes
-  // precedence over the live stamp.
+  // precedence over the live stamp. A TOTAL probe failure (no rows, no
+  // cache) renders an explicit "probe failed" marker — without it the
+  // bare-else rendered `_Live_` next to no-data rows (the honesty gap).
   if (opts.staleCachedAtMs != null) {
     lines.push(`_⚠ cached ${formatAgeStamp(opts.staleCachedAtMs, now)}_`);
   } else if (opts.liveProbedAtMs != null) {
     lines.push(`_Live · refreshed ${formatAgeStamp(opts.liveProbedAtMs, now)}_`);
+  } else if (opts.probeFailed) {
+    lines.push('_⚠ probe failed — no live data_');
   } else {
     lines.push('_Live_');
   }

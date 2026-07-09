@@ -23018,7 +23018,15 @@ async function handleAuthDashboardCallback(ctx: Context): Promise<void> {
         tz,
         now: renderNow,
         demo: refreshDemo,
-        ...(staleCachedAtMs != null ? { staleCachedAtMs } : { liveProbedAtMs: renderNow.getTime() }),
+        // Honesty backstop (same as /usage): a TOTAL probe failure (zero
+        // result rows, nothing served from cache) renders an explicit
+        // "probe failed" marker instead of a false "Live" footer next to
+        // no-data rows.
+        ...(staleCachedAtMs != null
+          ? { staleCachedAtMs }
+          : probeResp.results.length > 0
+            ? { liveProbedAtMs: renderNow.getTime() }
+            : { probeFailed: true }),
       })
       const kbRows = buildSnapshotKeyboard(snapshots, { now: renderNow, demo: refreshDemo })
       const inline_keyboard = kbRows.map((row) =>
@@ -23516,9 +23524,17 @@ bot.command('usage', async ctx => {
           // #2495 Change 2 — a TTL-hit / failed-probe fallback is tagged
           // served:"cache"; surface it as `⚠ cached Nm ago` instead of a
           // false live stamp. Otherwise stamp the live refresh time.
+          // Honesty backstop: a TOTAL probe failure (the .catch above
+          // returned `{results: []}` and nothing was served from cache)
+          // must render an explicit "probe failed" marker, NOT a false
+          // "Live" stamp next to "⚠️ no data" rows. Without this the
+          // footer claimed "Live · refreshed 0s ago" while every account
+          // row said "no data — probe failed" (#2959 review finding).
           ...(staleCachedAtMs != null
             ? { staleCachedAtMs }
-            : { liveProbedAtMs: renderNow.getTime() }),
+            : probeResp.results.length > 0
+              ? { liveProbedAtMs: renderNow.getTime() }
+              : { probeFailed: true }),
         })
         // Preserve the Switch/Refresh/usage/Add inline keyboard on the
         // rich-message render — the table card carries the same actions the

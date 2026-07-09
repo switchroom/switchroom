@@ -241,8 +241,22 @@ export interface UsageCardRenderOpts extends QuotaBarRenderOpts {
    */
   staleCachedAtMs?: number;
   /** Timestamp of the most recent live probe; renders "Live · refreshed Nm
-   *  ago" when no stale-cache marker applies. Omit to render a bare "Live". */
+   *  ago" when no stale-cache marker applies. Omit to render a bare "Live".
+   *  Do NOT set this when the probe failed and no live data was obtained —
+   *  set `probeFailed: true` instead so the footer doesn't claim "Live". */
   liveProbedAtMs?: number;
+  /**
+   * True when the live probe returned no usable data for ANY account (the
+   * probe threw / timed out / returned zero rows, AND nothing was served
+   * from cache either). The footer then renders an explicit `⚠ probe failed
+   * — no live data` instead of a false "Live" stamp. Subscription-honesty:
+   * the /usage card exists to tell the operator the truth about quota state,
+   * so a footer that says "Live" while every row shows "⚠️ no data" is the
+   * exact lie this flag closes. Takes precedence over `liveProbedAtMs`;
+   * `staleCachedAtMs` (cache-served data) still takes precedence over this
+   * because in that case there IS real data, just stale.
+   */
+  probeFailed?: boolean;
 }
 
 /**
@@ -328,11 +342,17 @@ export function renderUsageCard(
   const lines = [bar];
   // Actionable cross-account verdict — restored from renderAuthSnapshotFormat2.
   lines.push(`_${recommendation(snapshots, now, demo)}_`);
-  // Freshness signal: stale-cache warning takes precedence over a live stamp.
+  // Freshness signal: stale-cache warning takes precedence over a live stamp,
+  // which takes precedence over an explicit probe-failed marker (no live data
+  // AND no cache — the card is showing "⚠️ no data" rows, so "Live" would be
+  // a lie). The probeFailed branch is the honesty backstop: without it, a
+  // total probe failure rendered a bare `_Live_` footer next to no-data rows.
   if (opts.staleCachedAtMs != null) {
     lines.push(`_⚠ cached ${formatAgeStamp(opts.staleCachedAtMs, now)}_`);
   } else if (opts.liveProbedAtMs != null) {
     lines.push(`_Live · refreshed ${formatAgeStamp(opts.liveProbedAtMs, now)}_`);
+  } else if (opts.probeFailed) {
+    lines.push('_⚠ probe failed — no live data_');
   } else {
     lines.push('_Live_');
   }

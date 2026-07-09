@@ -431,6 +431,27 @@ describe('renderAuthSnapshotFormat2', () => {
     expect(out).not.toContain('Live · refreshed');
   });
 
+  it('#2959 honesty fix — probeFailed renders an explicit marker instead of a false bare "Live" footer', () => {
+    // Total probe failure: no rows, no cache. The footer must not claim
+    // "Live" next to no-data rows. Pre-fix this rendered a bare `_Live_`.
+    const out = renderAuthSnapshotFormat2(fixtureSnaps.slice(0, 1), {
+      now: NOW,
+      probeFailed: true,
+    });
+    expect(out).toContain('_⚠ probe failed — no live data_');
+    expect(out).not.toContain('_Live_');
+  });
+
+  it('#2959 honesty fix — staleCachedAtMs (real cached data) takes precedence over probeFailed', () => {
+    const out = renderAuthSnapshotFormat2(fixtureSnaps.slice(0, 1), {
+      now: NOW,
+      staleCachedAtMs: NOW.getTime() - 2 * 60_000,
+      probeFailed: true,
+    });
+    expect(out).toContain('⚠ cached 2m ago');
+    expect(out).not.toContain('probe failed');
+  });
+
   // ── demo mode (the `/usage demo` / `/auth demo` suffix) ──────────────
   describe('demo mode masks email labels', () => {
     it('WITHOUT demo, the real account emails still render', () => {
