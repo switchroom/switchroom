@@ -344,6 +344,80 @@ describe("createAuditLogger rotation", () => {
     writeN(audit, 50);
     expect(fs.existsSync(`${logPath}.1`)).toBe(false);
   });
+
+  // ── copy-then-truncate rotation (#2953) ────────────────────────────────
+  // The active log is bind-mounted into the broker container as a SINGLE
+  // FILE, which makes it a mount point. rename() cannot replace an active
+  // mount point (EBUSY), so rotation must copy-then-truncate: snapshot the
+  // bytes to `.1`, then ftruncate the active file in place. These tests
+  // pin that behaviour — the active inode must survive rotation (proving we
+  // truncate rather than rename/recreate), `.1` must carry the old content,
+  // and the live file must be truncated yet immediately writable again.
+  it("preserves the active file's inode across rotation (truncate-in-place, not rename)", () => {
+    const audit = createAuditLogger({ path: logPath, maxBytes: 200, maxFiles: 3 });
+    // First write creates the file — capture its inode.
+    writeN(audit, 1);
+    const inodeBefore = fs.statSync(logPath).ino;
+    // Push past the threshold to force a rotation.
+    writeN(audit, 20);
+    expect(fs.existsSync(`${logPath}.1`)).toBe(true);
+    const inodeAfter = fs.statSync(logPath).ino;
+    // Same inode ⇒ we truncated the original file rather than replacing it.
+    // This is exactly the property that makes rotation survive a single-file
+    // bind mount (the mount point is preserved).
+    expect(inodeAfter).toBe(inodeBefore);
+  });
+
+  it("snapshots old content to .1 and leaves the active file truncated but writable", () => {
+    const audit = createAuditLogger({ path: logPath, maxBytes: 200, maxFiles: 3 });
+    // Write enough to cross the threshold at least once.
+    writeN(audit, 12);
+    expect(fs.existsSync(`${logPath}.1`)).toBe(true);
+
+    // The rotated snapshot carries the earlier rows.
+    const rotatedRows = readLines(`${logPath}.1`);
+    expect(rotatedRows.length).toBeGreaterThan(0);
+    for (const line of rotatedRows) {
+      expect(() => JSON.parse(line)).not.toThrow();
+    }
+
+    // The active file is smaller than the total history would have been —
+    // it was truncated, not left to grow unbounded (the #2953 symptom).
+    const activeSize = fs.statSync(logPath).size;
+    const rotatedSize = fs.statSync(`${logPath}.1`).size;
+    expect(activeSize).toBeLessThanOrEqual(rotatedSize + 400);
+
+    // The active file is still writable after truncation — a subsequent
+    // append lands cleanly and parses as JSON.
+    audit.write({
+      ts: "2026-04-28T15:00:00.000Z",
+      op: "get",
+      key: "post/rotation",
+      caller: "agent:test",
+      pid: 2,
+      result: "allowed",
+    });
+    const activeRows = readLines(logPath);
+    expect(activeRows.length).toBeGreaterThan(0);
+    const last = JSON.parse(activeRows[activeRows.length - 1]) as AuditEntry;
+    expect(last.key).toBe("post/rotation");
+  });
+
+  it("rotation raw logic: copy-then-truncate over a pre-populated file", () => {
+    // Isolate the copy-then-truncate contract from the size-trigger: write a
+    // fat file, then force a rotation by writing one more row past a tiny
+    // threshold, and assert the snapshot+truncate invariants directly.
+    const audit = createAuditLogger({ path: logPath, maxBytes: 100, maxFiles: 2 });
+    writeN(audit, 1);
+    const firstRow = fs.readFileSync(logPath, "utf8");
+    expect(firstRow.trim().length).toBeGreaterThan(0);
+    // Next write trips the threshold (file already > 100 bytes), rotating.
+    writeN(audit, 1);
+    expect(fs.existsSync(`${logPath}.1`)).toBe(true);
+    // The snapshot begins with the very first row we wrote.
+    const snapshot = fs.readFileSync(`${logPath}.1`, "utf8");
+    expect(snapshot.startsWith(firstRow.split("\n")[0])).toBe(true);
+  });
 });
 
 // ─── defaultAuditLogPath ──────────────────────────────────────────────────────
