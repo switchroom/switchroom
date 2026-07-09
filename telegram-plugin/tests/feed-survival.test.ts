@@ -47,6 +47,8 @@ import { ToolFlightTracker } from '../gateway/interrupt-defer.js'
 import {
   ORPHANED_REPLY_TIMEOUT_MS,
   ORPHANED_REPLY_MAX_REARMS,
+  ORPHANED_REPLY_STREAM_WINDOW_MS,
+  LivenessTracker,
 } from '../context-exhaustion.js'
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -522,5 +524,42 @@ describe('silence-poke — hard ceiling bounds the defer', () => {
     __tickForTests(700_000) // additional tick after ceiling
     expect(f.fallbacks).toHaveLength(1) // only fires once
     expect(__getStateForTests('chat:0')!.fallbackFired).toBe(true)
+  })
+})
+
+// ─── Thinking-pause liveness via the REAL LivenessTracker (orphaned-reply fix) ─
+
+describe('silence-poke — thinking-pause liveness via the real LivenessTracker', () => {
+  // Drives the REAL LivenessTracker as the isLegitimatelyWorking source: a
+  // genuine stream event within ORPHANED_REPLY_STREAM_WINDOW_MS keeps the feed
+  // alive (a model reasoning pause is survivable); a gap longer than the window
+  // with no work tears the feed down.
+  it('a stream event within the window keeps the feed alive (thinking-pause survivable)', () => {
+    let clockNow = 0
+    const tracker = new LivenessTracker(0)
+    const f = setupSilenceDeps({
+      thresholds: { fallback: 300_000, fallbackHardCeiling: 900_000 },
+      isLegitimatelyWorking: () => tracker.recentlyStreaming(clockNow, ORPHANED_REPLY_STREAM_WINDOW_MS),
+    })
+    startTurn('chat:0', 0)
+    // A genuine stream event lands mid-turn (e.g. the model resumes after a
+    // reasoning pause) — only 50s before the 300s fallback tick.
+    tracker.onStreamEvent('text', undefined, 250_000)
+    clockNow = 300_000
+    __tickForTests(300_000) // 50s since last stream < 120s window → deferred
+    expect(f.fallbacks).toHaveLength(0)
+  })
+
+  it('no stream event for longer than the window tears the feed down', () => {
+    let clockNow = 0
+    const tracker = new LivenessTracker(0) // seed at t=0, nothing after
+    const f = setupSilenceDeps({
+      thresholds: { fallback: 300_000, fallbackHardCeiling: 900_000 },
+      isLegitimatelyWorking: () => tracker.recentlyStreaming(clockNow, ORPHANED_REPLY_STREAM_WINDOW_MS),
+    })
+    startTurn('chat:0', 0)
+    clockNow = 300_000
+    __tickForTests(300_000) // 300s since last stream >> 120s window → fires
+    expect(f.fallbacks).toHaveLength(1)
   })
 })
