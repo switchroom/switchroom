@@ -88,11 +88,17 @@ function normalizeTelegramKey(raw: string): string {
  *     first-declared entry wins, the later duplicate is dropped whole
  *     (not just the colliding id) so the alert is unambiguous about which
  *     entry lost
+ *   - a `telegram_id`/username already claimed by an earlier (different)
+ *     entry key — same first-declared-wins convention: the later duplicate
+ *     is dropped whole so the alert is unambiguous about which entry lost
+ *     and we never silently last-write-wins a numeric id into the wrong
+ *     person's name
  */
 export function buildPersonDirectory(entries: readonly RawPersonEntry[]): BuildPersonDirectoryResult {
   const byTelegramKey: Record<string, PersonDirectoryEntry> = {}
   const dropped: DroppedPersonEntry[] = []
   const personIdOwner = new Map<string, string>() // person_id (lowercased) -> owning entry key
+  const telegramKeyOwner = new Map<string, string>() // normalized telegram id/username -> owning entry key
 
   for (const raw of entries) {
     const key = typeof raw.key === 'string' ? raw.key.trim() : ''
@@ -129,8 +135,23 @@ export function buildPersonDirectory(entries: readonly RawPersonEntry[]): BuildP
       continue
     }
 
+    const collidingTelegramKey = telegramKeys.find((tk) => {
+      const existingTkOwner = telegramKeyOwner.get(tk)
+      return existingTkOwner != null && existingTkOwner !== key
+    })
+    if (collidingTelegramKey != null) {
+      const existingTkOwner = telegramKeyOwner.get(collidingTelegramKey)
+      dropped.push({
+        key,
+        reason: `duplicate telegram_id "${collidingTelegramKey}" already claimed by users.${existingTkOwner}`,
+      })
+      personIdOwner.delete(personIdLower)
+      continue
+    }
+
     const entry: PersonDirectoryEntry = { key, personId, telegramKeys }
     for (const tk of telegramKeys) {
+      telegramKeyOwner.set(tk, key)
       byTelegramKey[tk] = entry
     }
   }
@@ -227,4 +248,25 @@ export function resolvePersonName(directory: PersonDirectory, opts: ResolvePerso
   const memberConfirmed =
     allowFromNormalized.includes(idKey) || (usernameKey != null && allowFromNormalized.includes(usernameKey))
   return memberConfirmed ? entry.personId : undefined
+}
+
+/**
+ * Fail-open call-site wrapper around `resolvePersonName`, for use at the
+ * `handleInbound` call site (gateway.ts). This feature's whole design
+ * point is "never blocks or denies anything" (module doc above) — a throw
+ * from resolution must fall back to the raw id/username, not abort message
+ * handling. Mirrors the same defensive pattern already used for
+ * `readPeopleFile` (gateway.ts) and `runPersonDirectoryBootCheck` (this
+ * file): catch, fall back, never propagate.
+ */
+export function safeResolvePersonName(
+  directory: PersonDirectory,
+  opts: ResolvePersonOptions,
+  rawFallback: string,
+): string {
+  try {
+    return resolvePersonName(directory, opts) ?? rawFallback
+  } catch {
+    return rawFallback
+  }
 }

@@ -187,7 +187,7 @@ import { gatewayStartupRetry } from './startup-network-retry.js'
 import { writeQuarantineMarker } from './quarantine.js'
 import {
   runPersonDirectoryBootCheck,
-  resolvePersonName,
+  safeResolvePersonName,
   type PersonDirectory,
   type RawPersonEntry,
 } from './resolve-person.js'
@@ -16695,12 +16695,16 @@ async function handleInbound(
   // membership can't be positively confirmed from access.json's allowFrom.
   // Never touches access.json itself and never blocks/denies anything.
   const rawUser = from.username ?? String(from.id)
-  const displayUser = resolvePersonName(PERSON_DIRECTORY, {
-    telegramId: String(from.id),
-    username: from.username,
-    isDm: isDmChatId(chat_id),
-    groupAllowFrom: access.groups[chat_id]?.allowFrom,
-  }) ?? rawUser
+  const displayUser = safeResolvePersonName(
+    PERSON_DIRECTORY,
+    {
+      telegramId: String(from.id),
+      username: from.username,
+      isDm: isDmChatId(chat_id),
+      groupAllowFrom: access.groups[chat_id]?.allowFrom,
+    },
+    rawUser,
+  )
   const inboundMsg: InboundMessage = {
     type: 'inbound',
     chatId: chat_id,

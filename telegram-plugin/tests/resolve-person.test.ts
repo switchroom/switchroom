@@ -1,8 +1,10 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import {
   buildPersonDirectory,
   resolvePersonName,
   runPersonDirectoryBootCheck,
+  safeResolvePersonName,
+  type PersonDirectory,
   type RawPersonEntry,
 } from '../gateway/resolve-person.js'
 
@@ -77,6 +79,24 @@ describe('buildPersonDirectory — per-entry validation drops only the bad entry
     expect(dropped[0]?.reason).toMatch(/duplicate person_id/)
   })
 
+  it('drops a duplicate telegram_id claimed by a different person_id (later entry loses), keeps the first entry intact — no silent last-write-wins', () => {
+    const dupe: RawPersonEntry = { key: 'imposter', person_id: 'Imposter', telegram_ids: ['8201250670'] }
+    const { directory, dropped } = buildPersonDirectory([LISA, dupe])
+    expect(directory.byTelegramKey['8201250670']?.personId).toBe('Lisa')
+    expect(dropped).toHaveLength(1)
+    expect(dropped[0]?.key).toBe('imposter')
+    expect(dropped[0]?.reason).toMatch(/duplicate telegram_id/)
+  })
+
+  it('telegram_id collision on boot check fires the config-warning alert path, does not blank the whole directory', () => {
+    const dupe: RawPersonEntry = { key: 'imposter', person_id: 'Imposter', telegram_ids: ['8201250670'] }
+    const result = runPersonDirectoryBootCheck(() => [LISA, KEN, dupe])
+    expect(result.alertDetail).not.toBeNull()
+    expect(result.alertDetail).toContain('imposter')
+    expect(result.directory.byTelegramKey['8201250670']?.personId).toBe('Lisa')
+    expect(result.directory.byTelegramKey['mekenthompson']?.personId).toBe('Ken')
+  })
+
   it('drops an entry with a missing users: map key', () => {
     const bad: RawPersonEntry = { key: '', person_id: 'Nobody', telegram_ids: ['1'] }
     const { directory, dropped } = buildPersonDirectory([LISA, bad])
@@ -149,6 +169,54 @@ describe('resolvePersonName — chat scoping', () => {
       groupAllowFrom: ['mekenthompson'],
     })
     expect(name).toBe('Ken')
+  })
+})
+
+describe('safeResolvePersonName — fail-open call-site wrapper used by handleInbound', () => {
+  it('happy path: resolves same as resolvePersonName when nothing throws', () => {
+    const { directory } = buildPersonDirectory([LISA])
+    const name = safeResolvePersonName(directory, { telegramId: '8201250670', isDm: true }, 'raw-fallback')
+    expect(name).toBe('Lisa')
+  })
+
+  it('unresolved id: falls back to the raw id/username, same as today\'s behavior', () => {
+    const { directory } = buildPersonDirectory([LISA])
+    const name = safeResolvePersonName(directory, { telegramId: '000', isDm: true }, 'raw-fallback')
+    expect(name).toBe('raw-fallback')
+  })
+
+  it('resolution throwing (e.g. a malformed opts shape at the call site) is swallowed — falls back to the raw id/username instead of propagating and aborting handleInbound', () => {
+    const { directory } = buildPersonDirectory([LISA])
+    // Force resolvePersonName's internal normalizeTelegramKey to throw by
+    // passing a non-string telegramId past the type system, simulating an
+    // unexpected runtime shape from the Telegram payload.
+    const name = safeResolvePersonName(
+      directory,
+      { telegramId: undefined as unknown as string, isDm: true },
+      'raw-fallback',
+    )
+    expect(name).toBe('raw-fallback')
+  })
+
+  it('a directory whose lookup throws is also swallowed, not propagated', () => {
+    const throwingDirectory: PersonDirectory = {
+      byTelegramKey: new Proxy(
+        {},
+        {
+          get() {
+            throw new Error('boom: directory lookup exploded')
+          },
+        },
+      ),
+    }
+    const spy = vi.fn()
+    try {
+      const name = safeResolvePersonName(throwingDirectory, { telegramId: '8201250670', isDm: true }, 'raw-fallback')
+      expect(name).toBe('raw-fallback')
+    } catch (err) {
+      spy(err)
+    }
+    expect(spy).not.toHaveBeenCalled()
   })
 })
 
