@@ -385,6 +385,28 @@ describe('renderUsageCard', () => {
     expect(out.split('\n').pop()).toBe('_⚠ cached 1m ago_');
   });
 
+  it('probeFailed renders an explicit "probe failed" marker instead of a false "Live" footer (#2959 honesty fix)', () => {
+    // A total probe failure: zero result rows, nothing served from cache.
+    // Every account row renders "⚠️ no data — probe failed"; the footer
+    // must NOT claim "Live". Pre-fix this rendered a bare `_Live_`.
+    const out = renderUsageCard(snapshots, exhausted, { now: NOW, probeFailed: true });
+    expect(out.split('\n').pop()).toBe('_⚠ probe failed — no live data_');
+    expect(out).not.toContain('_Live');
+    expect(out).not.toContain('cached');
+  });
+
+  it('probeFailed does not override real cached data (cache takes precedence)', () => {
+    // If some rows WERE served from cache, there IS real (stale) data —
+    // the cache marker must win over the probe-failed marker.
+    const out = renderUsageCard(snapshots, exhausted, {
+      now: NOW,
+      staleCachedAtMs: NOW.getTime() - 2 * 60_000,
+      probeFailed: true,
+    });
+    expect(out.split('\n').pop()).toBe('_⚠ cached 2m ago_');
+    expect(out).not.toContain('probe failed');
+  });
+
   it('handles an invalid/NaN reset date without emitting "NaN" or corrupting the bar', () => {
     const bad: AccountSnapshot[] = [
       snap({
