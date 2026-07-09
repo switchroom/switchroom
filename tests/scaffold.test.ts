@@ -553,7 +553,10 @@ describe("scaffoldAgent", () => {
         "WebSearch",
         "AskUserQuestion",
       ]);
-      expect(settings.permissions.defaultMode).toBeUndefined();
+      // acceptEdits is now the switchroom built-in default for EVERY agent
+      // (decoupled from the `[all]` wildcard) — a plain non-wildcard agent
+      // with no permission_mode / no fleet default gets it too.
+      expect(settings.permissions.defaultMode).toBe("acceptEdits");
     } finally {
       if (prev === undefined) delete process.env.SWITCHROOM_WEBKITE_BINARY;
       else process.env.SWITCHROOM_WEBKITE_BINARY = prev;

@@ -2759,6 +2759,68 @@ function resolveSwitchroomCliPath(): string {
  * closing the gap where `reconcileAgent` used to rebuild a 7-key subset
  * and silently render `""` for anything else.
  */
+/**
+ * The `permissions.defaultMode` values Claude Code accepts in
+ * .claude/settings.json. This is a SUBSET of the schema's `permission_mode`
+ * enum — `auto` and `dontAsk` are valid `--permission-mode` CLI flags but
+ * have no settings.json defaultMode equivalent, so they degrade to the
+ * built-in default in resolvePermissionDefaultMode().
+ */
+const VALID_SETTINGS_DEFAULT_MODES = [
+  "default",
+  "acceptEdits",
+  "plan",
+  "bypassPermissions",
+] as const;
+type SettingsDefaultMode = (typeof VALID_SETTINGS_DEFAULT_MODES)[number];
+
+/** The switchroom-wide built-in default permission mode (no yaml needed). */
+const SWITCHROOM_DEFAULT_PERMISSION_MODE: SettingsDefaultMode = "acceptEdits";
+
+/**
+ * Resolve the settings.json `permissions.defaultMode` for an agent.
+ *
+ * Precedence (highest wins):
+ *   1. agentConfig.permission_mode                 — per-agent override
+ *   2. switchroomConfig.defaults?.permission_mode  — fleet-wide override
+ *   3. "acceptEdits"                               — switchroom built-in default
+ *
+ * This is deliberately INDEPENDENT of the `[all]` tools wildcard: the wildcard
+ * drives allow-list expansion (ALL_BUILTIN_TOOLS) only, never the mode default.
+ * So every agent gets a defaultMode — an [all] agent still defaults to
+ * acceptEdits, and an explicit per-agent `permission_mode: default` wins even
+ * over the wildcard.
+ *
+ * NOTE: resolveAgentConfig / merge.ts already folds `defaults.permission_mode`
+ * into `agentConfig.permission_mode` (per-agent wins, defaults fill blanks),
+ * so (2) is a belt-and-suspenders fallback for any caller that passes an
+ * unmerged config — it never changes the outcome once the cascade has run.
+ */
+function resolvePermissionDefaultMode(
+  agentConfig: AgentConfig,
+  switchroomConfig?: SwitchroomConfig,
+): SettingsDefaultMode {
+  const raw =
+    agentConfig.permission_mode ??
+    switchroomConfig?.defaults?.permission_mode ??
+    SWITCHROOM_DEFAULT_PERMISSION_MODE;
+  if ((VALID_SETTINGS_DEFAULT_MODES as readonly string[]).includes(raw)) {
+    return raw as SettingsDefaultMode;
+  }
+  // `raw` is a schema-valid permission_mode with no settings.json defaultMode
+  // equivalent (auto/dontAsk), or an unexpected value. The `--permission-mode`
+  // CLI flag (start.sh.hbs) still carries the original value; for the
+  // settings.json defaultMode we degrade to the built-in default and warn.
+  console.warn(
+    chalk.yellow(
+      `[switchroom] permission_mode "${raw}" has no settings.json defaultMode ` +
+      `equivalent — using "${SWITCHROOM_DEFAULT_PERMISSION_MODE}" for ` +
+      `permissions.defaultMode (the --permission-mode CLI flag still carries "${raw}").`,
+    ),
+  );
+  return SWITCHROOM_DEFAULT_PERMISSION_MODE;
+}
+
 interface BuildWorkspaceContextArgs {
   name: string;
   agentDir: string;
@@ -2810,11 +2872,11 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     agentDir,
     agentConfig,
     telegramConfig,
+    switchroomConfig,
     switchroomConfigPath,
     topicId,
     tools,
     permissionAllow,
-    hasAllWildcard,
     resolvedBotToken,
     rawBotToken,
     hindsightAutoRecallEnabled,
@@ -2850,7 +2912,11 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
       ...INTERACTIVE_TUI_FLEET_DENY_TOOLS,
     ]),
     permissionAllow,
-    defaultModeAcceptEdits: hasAllWildcard,
+    // settings.json permissions.defaultMode. Decoupled from the `[all]` tools
+    // wildcard (#PR): the built-in switchroom default is acceptEdits for EVERY
+    // agent, overridable per-agent via permission_mode or fleet-wide via
+    // defaults.permission_mode. See resolvePermissionDefaultMode.
+    defaultMode: resolvePermissionDefaultMode(agentConfig, switchroomConfig),
     memory: agentConfig.memory,
     model: agentConfig.model,
     mcpServers: agentConfig.mcp_servers
@@ -5959,11 +6025,14 @@ export function reconcileAgent(
     settings.permissions = settings.permissions ?? {};
     settings.permissions.allow = desiredAllow;
     settings.permissions.deny = desiredDeny;
-    if (hasAllWildcard) {
-      settings.permissions.defaultMode = "acceptEdits";
-    } else {
-      delete settings.permissions.defaultMode;
-    }
+    // defaultMode is now emitted for EVERY agent (decoupled from the `[all]`
+    // wildcard) and MUST stay byte-identical to the scaffold path's
+    // buildWorkspaceContext → settings.json.hbs render. See
+    // resolvePermissionDefaultMode for the precedence rule.
+    settings.permissions.defaultMode = resolvePermissionDefaultMode(
+      agentConfig,
+      switchroomConfig,
+    );
 
     // mcpServers: rebuild from current switchroom.yaml. Preserves user-defined
     // mcp_servers from agentConfig.mcp_servers in addition to the built-ins.

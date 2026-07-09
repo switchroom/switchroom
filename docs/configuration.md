@@ -26,6 +26,7 @@ Each field type has specific merge behavior when values exist at multiple layers
 |-------|---------|-------------|
 | `model` | override | Claude model (`claude-opus-4-8`, `claude-sonnet-5`, `claude-haiku-4-5`). Haiku is the default for the handoff summarizer; agents typically use opus or sonnet. |
 | `thinking_effort` | override | Adaptive-thinking effort passed as `--effort` (`low`/`medium`/`high`/`xhigh`/`max`). Defaults to `low` when unset. **On Opus 4.x keep this at `low`** — `medium`+ emits thinking blocks that the bundled claude CLI can mis-merge under concurrent sub-agents, causing `400 'thinking blocks cannot be modified'` (issue #1978). `switchroom doctor` warns on the risky combo. Removing the field does *not* help: Opus 4.8 defaults `effort=high` when `--effort` is omitted. |
+| `permission_mode` | override | Permission mode for the agent's Claude session. Drives the `--permission-mode` CLI flag AND the `.claude/settings.json` `permissions.defaultMode`. **The switchroom built-in default is `acceptEdits`** — every agent auto-accepts edits with no yaml needed. Override per-agent here or fleet-wide via `defaults.permission_mode`; per-agent wins. Valid values: `acceptEdits`, `default`, `plan`, `bypassPermissions` (settings.json `defaultMode`), plus `auto`/`dontAsk` (CLI-flag only — these fall back to `acceptEdits` for `defaultMode`). See [Permission mode & auto-accept](#permission-mode--auto-accept). |
 | `extends` | — | Named profile to inherit from |
 | `tools.allow` / `tools.deny` | union | Tool permissions |
 | `soul` | per-field (**seed-time only**) | Agent persona (name, style, boundaries). Cascades per-field, but **only at first scaffold** — it seeds `workspace/SOUL.md`, which is then user-owned (see [Persona & SOUL.md ownership](#persona--soulmd-ownership)). Editing `soul:` later does **not** change an agent whose SOUL.md already exists. |
@@ -76,6 +77,45 @@ Each field type has specific merge behavior when values exist at multiple layers
 | `cli_args` | concatenate | Escape hatch: extra `exec claude` flags |
 | `google_workspace` | deep merge | Google Drive/Docs/Sheets/Calendar integration. `google_client_id` / `google_client_secret` are install-wide (top level only); `tier` + `approvers` cascade per-agent. See § Google Workspace below. |
 | `notion_workspace` | deep merge top-level; per-agent `databases:` list REPLACES (does not concatenate) | Notion integration. Top-level `vault_key` + `databases:` map cascade via deep merge so a profile can add a DB without clobbering top-level entries. The per-agent `databases:` allowlist is **override** — an agent's list replaces the parent's, so a specialist agent inheriting a profile can narrow to fewer DBs. See § Notion Workspace below and [notion-integration.md](notion-integration.md). |
+
+## Permission mode & auto-accept
+
+Switchroom sets `.claude/settings.json` `permissions.defaultMode` to
+**`acceptEdits`** for **every** agent out of the box — auto-accept of file
+edits is the switchroom default on **any** install, with **no yaml needed**.
+This is deliberately decoupled from the `tools.allow: [all]` wildcard (which
+only drives allow-list expansion): a plain agent with a read-only tool set
+still gets `acceptEdits`.
+
+Override it two ways, with the usual switchroom precedence (per-agent wins):
+
+```yaml
+# Fleet-wide default for every agent
+defaults:
+  permission_mode: plan
+
+agents:
+  scout:
+    # Per-agent override — beats the fleet default AND the built-in default,
+    # even for an [all]-wildcard agent.
+    permission_mode: default
+```
+
+Resolution (highest wins):
+
+1. `agents.<name>.permission_mode` — per-agent override
+2. `defaults.permission_mode` — fleet-wide override
+3. `acceptEdits` — the switchroom built-in default
+
+Valid values: `acceptEdits`, `default`, `plan`, `bypassPermissions` map
+directly to the settings.json `defaultMode`. `auto` and `dontAsk` are also
+accepted (they drive the `--permission-mode` CLI flag) but have **no**
+settings.json `defaultMode` equivalent, so for `defaultMode` they fall back to
+`acceptEdits` with a warning — the CLI flag still carries the raw value. An
+unrecognized value is rejected at config-parse time by the schema.
+
+`permission_mode` is independent of `dangerous_mode` (the
+`--dangerously-skip-permissions` path), which is unchanged.
 
 ## Built-in MCP Servers
 
