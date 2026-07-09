@@ -97,6 +97,35 @@ describe('buildPersonDirectory — per-entry validation drops only the bad entry
     expect(result.directory.byTelegramKey['mekenthompson']?.personId).toBe('Ken')
   })
 
+  // ── #2957 honesty fix: broadcast alertDetail must not surface the
+  //    person_id human-name value (the display path chat-scopes names;
+  //    the config-warning card fans out to EVERY allowFrom chat, incl.
+  //    groups where the named person may not be a member). The verbose
+  //    reason stays in the private logLine. ─────────────────────────
+  it('duplicate person_id: alertDetail scrubs the person_id value (keeps key + class); logLine keeps it', () => {
+    const dupe: RawPersonEntry = { key: 'lisa2', person_id: 'Lisa', telegram_ids: ['555'] }
+    const result = runPersonDirectoryBootCheck(() => [LISA, dupe])
+    expect(result.alertDetail).not.toBeNull()
+    // Broadcast-safe: names the losing config key + the collision class,
+    // but NOT the human-name "Lisa" value nor which name it collided with.
+    expect(result.alertDetail).toContain('lisa2')
+    expect(result.alertDetail).toContain('duplicate person_id already claimed')
+    expect(result.alertDetail).not.toContain('"Lisa"')
+    // Private stderr log keeps the verbose detail.
+    expect(result.logLine).toContain('"Lisa"')
+  })
+
+  it('duplicate telegram_id: alertDetail scrubs the colliding id; logLine keeps it', () => {
+    const dupe: RawPersonEntry = { key: 'imposter', person_id: 'Imposter', telegram_ids: ['8201250670'] }
+    const result = runPersonDirectoryBootCheck(() => [LISA, dupe])
+    expect(result.alertDetail).not.toBeNull()
+    expect(result.alertDetail).toContain('imposter')
+    expect(result.alertDetail).toContain('duplicate telegram_id already claimed')
+    // The colliding telegram id value is scrubbed from the broadcast.
+    expect(result.alertDetail).not.toContain('8201250670')
+    expect(result.logLine).toContain('8201250670')
+  })
+
   it('drops an entry with a missing users: map key', () => {
     const bad: RawPersonEntry = { key: '', person_id: 'Nobody', telegram_ids: ['1'] }
     const { directory, dropped } = buildPersonDirectory([LISA, bad])
@@ -249,8 +278,13 @@ describe('runPersonDirectoryBootCheck — one-time boot validation + alerting', 
     })
     expect(result.alertDetail).not.toBeNull()
     expect(result.alertDetail).toContain('crashed')
-    expect(result.alertDetail).toContain('disk read exploded')
+    // alertDetail is broadcast to every allowFrom chat (incl. groups), so
+    // the raw error message — which may carry a host path or other detail
+    // — is scrubbed from it. The full message stays in the private logLine.
+    expect(result.alertDetail).not.toContain('disk read exploded')
+    expect(result.alertDetail).toContain('see gateway stderr for detail')
     expect(result.directory.byTelegramKey).toEqual({})
     expect(result.logLine).toContain('CRASHED')
+    expect(result.logLine).toContain('disk read exploded')
   })
 })
