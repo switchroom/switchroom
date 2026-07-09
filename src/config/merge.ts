@@ -395,6 +395,18 @@ export function mergeAgentConfig(
       if (k === "recall" && base.recall && typeof v === "object" && v !== null && !Array.isArray(v)) {
         combined[k] = { ...base.recall, ...(v as Record<string, unknown>) };
       } else if (
+        k === "retain" &&
+        (base as { retain?: unknown }).retain &&
+        typeof v === "object" && v !== null && !Array.isArray(v)
+      ) {
+        // Same one-level-deep merge as `recall`: an agent may override a
+        // single retain knob (e.g. every_n_turns) and inherit the profile's
+        // overlap_turns, rather than replacing the whole retain object.
+        combined[k] = {
+          ...((base as { retain?: Record<string, unknown> }).retain),
+          ...(v as Record<string, unknown>),
+        };
+      } else if (
         k === "disposition" &&
         (base as { disposition?: unknown }).disposition &&
         typeof v === "object" && v !== null && !Array.isArray(v)

@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.18.3 — Operator-configurable Hindsight auto-retain cadence
+
+The plugin's auto-retain cadence (`retainEveryNTurns` / `retainOverlapTurns`)
+was hardcoded at scaffold to `1` / `2` — retain every single turn with a 3-turn
+overlapping window. That guaranteed a 1–2 turn fact-sharing session survived a
+restart, and was correct while retain/consolidation ran on a cheap remote
+model. Once the fleet moved retain/consolidation to a **local reasoning model**
+(Ollama `gpt-oss-20b`), the every-turn cadence with large overlapping payloads
+made the model run away — single retains observed generating 22k–37k output
+tokens over 100–200s, starving workers.
+
+### Make retain cadence configurable + change defaults to 3 / 1
+
+Adds two optional per-agent+defaults knobs under `memory.retain`:
+
+- `every_n_turns` (int, min 1, **default 3**) → plugin `retainEveryNTurns`
+- `overlap_turns` (int, min 0, **default 1**) → plugin `retainOverlapTurns`
+
+The resolved cascade value (defaults → profile → agent, per-field merge like
+`memory.recall`) is stamped into each agent's plugin `settings.json` on **every**
+scaffold/reconcile, so the yaml value is authoritative and **survives
+`switchroom apply`** regenerating that file — a hand-edit to `settings.json`
+was previously reverted on the next reconcile.
+
+The default change `1`/`2` → `3`/`1` yields ~3× fewer, smaller retains.
+**Tradeoff:** at `every_n_turns: 3`, up to ~3 turns of transcript can be lost on
+a hard crash before the next retain fires, instead of ≤2 at the old every-turn
+cadence. Operators who need the tight crash-durability guarantee set
+`memory.retain.every_n_turns: 1` (per-agent or fleet-wide under `defaults`);
+chatty banks can raise it further.
+
+Schema: `AgentMemorySchema.retain` (`src/config/schema.ts`), deep-merged in
+`src/config/merge.ts` alongside `recall`. Scaffold wiring:
+`resolveHindsightRetainConfig` + `renderHindsightSettingsOverrides` in
+`src/agents/scaffold.ts`. Docs: `docs/configuration.md` ("Tuning auto-retain
+cadence").
+
 ## v0.18.2 — Fix progress-card freeze during foreground sub-agent delegation
 
 The Telegram progress card could freeze mid-turn (observed stuck at 41s and
