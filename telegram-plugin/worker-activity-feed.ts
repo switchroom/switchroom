@@ -221,6 +221,28 @@ interface WorkerHandle {
   /** Last view rendered into the message (drives the heartbeat re-render). */
   lastView: WorkerActivityView | null
   /**
+   * A terminal (`finish`) view whose edit could not land yet — most often
+   * because a 429 cooldown was in effect when `doFinish` ran. The heartbeat
+   * re-drives `doFinish` with this view once the cooldown expires so a
+   * transport hiccup can't leave the card stuck on its last running render
+   * ("worker done, card says running"). Cleared on a successful terminal
+   * edit, on a permanent failure (message gone), or when the handle is
+   * deleted. Null when no finalize is pending.
+   */
+  pendingFinish: WorkerActivityView | null
+  /**
+   * Latched in `doFinish` before the terminal edit. A late watcher
+   * `onProgress` tick that arrives after `finish()` queued its chain (but
+   * before the `.finally(handles.delete)` microtask drains) must NOT
+   * resurrect the handle and paint a fresh `running` message on an
+   * already-finalized worker. The heartbeat's orphan-paint guard
+   * (`if (!handles.has(h.agentId)) continue`) only covers the heartbeat
+   * tick — this flag covers the `update` entry point. Set synchronously
+   * inside `doFinish` (runs on the chain), checked synchronously in
+   * `update` before handle creation.
+   */
+  finished: boolean
+  /**
    * Wall-clock ms the worker was dispatched, derived from `now - view.elapsedMs`
    * on the first update. The heartbeat computes a live elapsed from this so the
    * `· Ns` suffix climbs even when no fresh view arrives.
@@ -244,6 +266,47 @@ function extractRetryAfterSecs(err: unknown): number | null {
   const ra = e.parameters?.retry_after
   if (typeof ra === 'number' && Number.isFinite(ra) && ra > 0) return ra
   return null
+}
+
+/**
+ * Classify a card-edit transport error. Card edits are a best-effort
+ * liveness surface — a recoverable hiccup must never freeze the card, and
+ * a permanent failure must never log a scary warning for something with
+ * nothing to update.
+ *
+ *   'not_modified' — content identical to what's already shown. The card
+ *     already reads correctly; treat as SUCCESS (no retry, no warning).
+ *   'rate_limited' — 429 with retry_after. Back off; the heartbeat re-drives
+ *     the edit after cooldown (running renders + deferred terminal edits).
+ *   'gone'         — message/chat deleted or edit window expired. Nothing to
+ *     update; drop the handle silently (no warning — there is no card).
+ *   'transient'    — anything else (network blip, 5xx). Retry on the next
+ *     heartbeat tick; don't spam stderr.
+ */
+type EditOutcome = 'not_modified' | 'rate_limited' | 'gone' | 'transient'
+function classifyEditError(err: unknown): EditOutcome {
+  const retryAfter = extractRetryAfterSecs(err)
+  if (retryAfter != null) return 'rate_limited'
+  const desc =
+    err instanceof Error ? err.message : err != null && typeof err === 'object' && 'description' in err
+      ? String((err as { description?: unknown }).description)
+      : String(err)
+  const low = desc.toLowerCase()
+  // "message is not modified" / "message was not modified" — Telegram's
+  // identical-content signal. The card already shows the right thing.
+  if (low.includes('not modified')) return 'not_modified'
+  // Message or chat no longer exists, or the edit window (48h) has closed.
+  // "message to edit not found" / "message to delete not found" / "chat not
+  // found" / "message can't be edited". Nothing to update.
+  if (
+    low.includes('not found') ||
+    low.includes("can't be edited") ||
+    low.includes('cannot be edited') ||
+    low.includes('not enough rights')
+  ) {
+    return 'gone'
+  }
+  return 'transient'
 }
 
 /**
@@ -294,6 +357,28 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
     })
   const clearIntervalFn = opts.clearInterval ?? ((handle: unknown) => clearInterval(handle as ReturnType<typeof setInterval>))
   const handles = new Map<string, WorkerHandle>()
+  /**
+   * Agent ids that have been finalized (`doFinish` latched). Survives handle
+   * deletion so a LATE watcher `onProgress` tick — which can arrive after
+   * `finish()`'s chain has fully settled and the handle was deleted — cannot
+   * resurrect a fresh handle and paint a running card on a worker that is
+   * already done. The per-handle `finished` flag only covers the narrow
+   * window between latch and delete; this set is the durable gate. A late
+   * tick arrives within seconds of finish (watcher poll cadence), so the set
+   * only needs to cover recent finalizations — capped at FINALIZED_CAP and
+   * trimmed FIFO to stay bounded across a long gateway lifetime.
+   */
+  const finalized = new Set<string>()
+  const FINALIZED_CAP = 256
+  function markFinalized(agentId: string): void {
+    if (finalized.has(agentId)) return
+    finalized.add(agentId)
+    if (finalized.size > FINALIZED_CAP) {
+      // Map-free FIFO trim: Set iterates in insertion order; drop the oldest.
+      const oldest = finalized.values().next().value
+      if (oldest != null) finalized.delete(oldest)
+    }
+  }
   let heartbeatTimer: unknown = null
 
   function sendOptsFor(h: WorkerHandle): Record<string, unknown> {
@@ -384,39 +469,99 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
           `thread=${h.threadId ?? '-'} msgId=${h.messageId} bytes=${body.length}`,
       )
     } catch (err) {
-      noteRateLimited(h, err, 'edit')
-      // Stale message_id (manually deleted / edit window gone). Re-post
-      // on the next tick rather than now, so we don't double-down inside
-      // a cooldown.
-      log(`worker-feed: edit failed, will re-post: ${(err as Error).message}`)
-      h.messageId = null
-      h.lastBody = null
+      const outcome = classifyEditError(err)
+      if (outcome === 'rate_limited') {
+        noteRateLimited(h, err, 'edit')
+        return
+      }
+      if (outcome === 'not_modified') {
+        // Card already shows this body — record it as landed and move on.
+        h.lastBody = body
+        h.lastEditAt = nowFn()
+        return
+      }
+      if (outcome === 'gone') {
+        // Message/chat deleted or edit window closed — there is no card to
+        // update. Drop the handle silently; a fresh first-paint on the next
+        // running tick re-establishes one if the worker is still active. No
+        // warning: "no card" is not a liveness-logic error.
+        h.messageId = null
+        h.lastBody = null
+        return
+      }
+      // 'transient' — network blip / 5xx. Leave the handle intact; the
+      // heartbeat re-attempts on its next tick. Log at debug, not stderr-warn:
+      // a transport hiccup on a best-effort card is not "shit code", it's a
+      // retryable blip the framework rides out deterministically.
+      log(`worker-feed: edit transient error agent=${h.agentId}: ${(err as Error).message}`)
     }
   }
 
   async function doFinish(h: WorkerHandle, view: WorkerActivityView): Promise<void> {
+    // Latch FIRST, before any early return. A `running`-cue tick arriving
+    // after `finish()` queued this chain (but before its `.finally(delete)`
+    // drains) would otherwise resurrect a handle via `update()` and paint a
+    // fresh running message on a finalized worker. Setting this synchronously
+    // on the chain — ahead of the cooldown/no-message guards — makes the
+    // gate in `update()` authoritative regardless of which guard path runs.
+    // The durable `finalized` set survives the subsequent handle deletion so
+    // a tick arriving AFTER the full settle still can't resurrect.
+    h.finished = true
+    markFinalized(h.agentId)
     // No message ever posted → nothing to finalize. The worker's result
     // reaches the user via the handback reply; a bare "done" recap with
     // no preceding activity would be noise.
-    if (h.messageId == null) return
+    if (h.messageId == null) {
+      h.pendingFinish = null
+      return
+    }
     if (nowFn() < h.cooldownUntil) {
-      // Honour the flood-wait; a terminal edit isn't worth a ban. The
-      // message is left at its last running render — stale but harmless.
+      // Honour the flood-wait; a terminal edit isn't worth a ban. But
+      // unlike the prior "stale but harmless" surrender, STAGE the terminal
+      // view so the heartbeat re-drives the finalize edit the instant the
+      // cooldown expires — a transport hiccup can no longer leave a
+      // finished worker's card stuck on its last running render.
+      h.pendingFinish = view
       return
     }
     const body = renderWorkerActivity({ ...view, narrativeLines: h.narrative })
-    if (body === h.lastBody) return
+    if (body === h.lastBody) {
+      h.pendingFinish = null
+      return
+    }
     try {
       await opts.bot.editMessageText(h.chatId, h.messageId, body, sendOptsFor(h))
       h.lastBody = body
       h.lastEditAt = nowFn()
+      h.pendingFinish = null
       log(
         `worker-feed: finish agent=${h.agentId} chat=${h.chatId} ` +
           `thread=${h.threadId ?? '-'} msgId=${h.messageId} state=${view.state} bytes=${body.length}`,
       )
     } catch (err) {
-      noteRateLimited(h, err, 'finish')
-      log(`worker-feed: finish edit failed: ${(err as Error).message}`)
+      const outcome = classifyEditError(err)
+      if (outcome === 'rate_limited') {
+        noteRateLimited(h, err, 'finish')
+        // Re-stage for the heartbeat to re-drive after cooldown.
+        h.pendingFinish = view
+        return
+      }
+      if (outcome === 'not_modified') {
+        // Card already shows the finalized body — terminal edit succeeded.
+        h.lastBody = body
+        h.lastEditAt = nowFn()
+        h.pendingFinish = null
+        return
+      }
+      if (outcome === 'gone') {
+        // Message/chat gone — no card to finalize. Drop silently; the
+        // handback reply carries the result regardless.
+        h.pendingFinish = null
+        return
+      }
+      // 'transient' — re-stage for a heartbeat retry; log at debug.
+      h.pendingFinish = view
+      log(`worker-feed: finish transient error agent=${h.agentId}: ${(err as Error).message}`)
     }
   }
 
@@ -456,6 +601,36 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       // (which would orphan a card that never finalizes). Restores the
       // structural safety the pre-first-paint `messageId == null` skip gave.
       if (!handles.has(h.agentId)) continue
+
+      // Deferred-finalize re-drive: a terminal edit that hit a 429 cooldown
+      // (or a transient error) was staged on `pendingFinish` by `doFinish`.
+      // Re-drive it once the cooldown has expired so a finished worker's card
+      // can't get stuck on its last running render. This is the deterministic
+      // backstop that replaces the old "stale but harmless" surrender — the
+      // framework owns ALIVE-and-done, wall-clock driven, no model in the loop.
+      // (The handle is still in the map because `finish()`'s `.finally(delete)`
+      // is chained AFTER `doFinish` and won't drain while a re-drive keeps the
+      // chain busy; once the terminal edit lands, `pendingFinish` is cleared
+      // and the `.finally` runs on the next chain settle.)
+      if (h.pendingFinish != null && now >= h.cooldownUntil) {
+        const view = h.pendingFinish
+        h.chain = h.chain
+          .then(() => doFinish(h, view))
+          .catch((err) => {
+            log(`worker-feed: heartbeat finalize re-drive error ${h.agentId}: ${(err as Error).message}`)
+          })
+          .finally(() => {
+            // Mirror `finish()`'s teardown: once the re-driven `doFinish`
+            // clears `pendingFinish` (terminal edit landed OR permanently
+            // failed), drop the handle. If it re-staged (another 429), the
+            // handle survives for the next heartbeat tick to retry.
+            if (handles.get(h.agentId)?.pendingFinish == null) {
+              handles.delete(h.agentId)
+            }
+          })
+        continue
+      }
+
       if (h.lastView == null) continue
       if (h.lastView.state !== 'running') continue
       if (now < h.cooldownUntil) continue
@@ -523,7 +698,19 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       // No chat to post to (owner DM unconfigured) — don't create a
       // handle that would retry a failing send('') every tick.
       if (chatId.length === 0) return Promise.resolve()
-      let h = handles.get(agentId)
+      // Resurrection guard: a worker that has already been finalized
+      // (`doFinish` latched `finalized`) must not get a fresh running cue.
+      // A late watcher `onProgress` tick can arrive after `finish()`'s chain
+      // has fully settled and the handle was deleted — without this durable
+      // gate the tick would create a brand-new handle and paint a fresh
+      // `running` message on an already-done worker (the card lies). The
+      // heartbeat's orphan-paint guard covers the heartbeat tick only; the
+      // per-handle `finished` flag covers the pre-delete window; this set
+      // covers the post-delete window.
+      if (finalized.has(agentId)) return Promise.resolve()
+      const existing = handles.get(agentId)
+      if (existing?.finished === true) return Promise.resolve()
+      let h = existing
       if (h == null) {
         h = {
           agentId,
@@ -538,6 +725,8 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
           lastView: null,
           dispatchAtMs: null,
           stepStartedAtMs: null,
+          finished: false,
+          pendingFinish: null,
         }
         handles.set(agentId, h)
       }
@@ -556,11 +745,27 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
           log(`worker-feed: finish chain error ${agentId}: ${(err as Error).message}`)
         })
         .finally(() => {
-          handles.delete(agentId)
+          // Only tear down the handle once the terminal edit has actually
+          // landed (or permanently failed). If `doFinish` staged the edit on
+          // `pendingFinish` (a 429 cooldown / transient error was in effect),
+          // the handle must survive so the heartbeat can re-drive the
+          // finalize after cooldown. The heartbeat's re-drive chain ends by
+          // re-entering `doFinish`, which clears `pendingFinish` on success
+          // or permanent-failure — so this `.finally` deletes on the NEXT
+          // chain settle once there is nothing left to finalize. Without this
+          // guard, the `.finally` would delete the handle (and its staged
+          // pendingFinish) immediately after the first staged doFinish,
+          // stranding the card on its last running render.
+          if (handles.get(agentId)?.pendingFinish == null) {
+            handles.delete(agentId)
+          }
         })
       return h.chain
     },
     drop(agentId) {
+      // A dropped worker is also done — mark finalized so a late watcher
+      // tick can't resurrect a running card on it (same gate as `finish`).
+      markFinalized(agentId)
       handles.delete(agentId)
     },
     heartbeatTick,

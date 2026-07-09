@@ -419,9 +419,15 @@ function tick(now: number): void {
       newText,
       literalText: s.anchorLiteralText,
     }
-    // Fire-and-forget so a slow edit doesn't block the tick loop.
-    // Errors are logged but never bubble (a 429 / "message not modified"
-    // / chat-deleted is a soft failure).
+    // Fire-and-forget so a slow edit doesn't block the tick loop. The
+    // production `editMessage` dep is `swallowingApiCall`-wrapped, which
+    // catches every transport outcome (not-modified / not-found / 429 /
+    // network) upstream and never rejects — so in production this `.catch`
+    // is a backstop that rarely fires. It is kept as a contract-level guard
+    // (a throwing dep, or a future non-swallowing wiring, must not log a
+    // scary "edit failed" warning for a best-effort liveness surface nor
+    // keep hammering a dead anchor). Only a genuinely unexpected error
+    // reaches the fallthrough; transport classes are silent.
     void Promise.resolve()
       .then(() => activeDeps!.editMessage(editCtx))
       .then(() => {
@@ -432,10 +438,39 @@ function tick(now: number): void {
         })
       })
       .catch((err) => {
-        process.stderr.write(
-          `pending-work-progress: edit failed key=${key} ` +
-            `msg=${editCtx.messageId}: ${(err as Error).message}\n`,
-        )
+        const desc =
+          err instanceof Error ? err.message : err != null && typeof err === 'object' && 'description' in err
+            ? String((err as { description?: unknown }).description)
+            : String(err)
+        const low = desc.toLowerCase()
+        // "message is not modified" — the anchor already shows this suffix.
+        // The card is correct; count it as an edit and move on silently.
+        if (low.includes('not modified')) {
+          activeDeps!.emitMetric?.({
+            kind: 'pending_progress_edited',
+            chatKey: key,
+            elapsedMs: elapsed,
+          })
+          return
+        }
+        // Message / chat gone, or the 48h edit window closed. The anchor
+        // is dead — stop retrying it (clear state) so the tick isn't
+        // hammering a non-existent message every EDIT_INTERVAL_MS. The
+        // next outbound reply re-establishes a fresh anchor. Silent: no
+        // card to update is not a liveness-logic error.
+        if (
+          low.includes('not found') ||
+          low.includes("can't be edited") ||
+          low.includes('cannot be edited') ||
+          low.includes('not enough rights')
+        ) {
+          clearPending(key, 'stale_turn')
+          return
+        }
+        // 429 / transient network blip — leave state intact; the next tick
+        // retries. No stderr: a transport hiccup on a best-effort card is
+        // not a logic error, and the production wiring already applies
+        // retry_after backoff upstream.
       })
   }
 }

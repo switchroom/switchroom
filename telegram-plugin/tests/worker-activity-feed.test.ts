@@ -945,6 +945,103 @@ describe('createWorkerActivityFeed — heartbeat', () => {
   })
 })
 
+// ─── Resurrection guard + deferred finalize (review findings #2 & #3) ─────────
+// #3: a late watcher onProgress tick arriving after `finish()` queued its
+//    chain must NOT resurrect the handle and paint a fresh running message.
+// #2: a terminal edit that hit a 429 cooldown stages on `pendingFinish` and
+//    is re-driven by the heartbeat after cooldown — the card can't get stuck
+//    on its last running render. "not modified" / message-gone are success/drop.
+describe('createWorkerActivityFeed — resurrection guard + deferred finalize', () => {
+  const drain = () => new Promise((r) => setTimeout(r, 0))
+
+  it('#3: a late update tick after finish does not resurrect a running card', async () => {
+    const bot = makeFakeBot()
+    let clock = 10_000
+    const feed = createWorkerActivityFeed({ bot, now: () => clock, minEditIntervalMs: 0 })
+    await feed.update('w1', 'chat', view({ toolCount: 1, latestSummary: 'step one' }))
+    expect(bot.sent).toHaveLength(1)
+
+    await feed.finish('w1', view({ state: 'done', toolCount: 1, latestSummary: 'done result' }))
+    // finish landed a terminal edit and dropped the handle.
+    expect(bot.edits.some((e) => e.text.includes('_done ·'))).toBe(true)
+    expect(feed.has('w1')).toBe(false)
+
+    // Late watcher tick arrives AFTER finish. Pre-fix this would create a
+    // fresh handle and paint a new running message on a finalized worker.
+    clock = 12_000
+    await feed.update('w1', 'chat', view({ toolCount: 2, latestSummary: 'step two' }))
+    expect(bot.sent).toHaveLength(1) // no new running message
+    expect(feed.has('w1')).toBe(false)
+    expect(feed.size).toBe(0)
+  })
+
+  it('#2: a 429 on the finish edit stages pendingFinish; the heartbeat re-drives it after cooldown', async () => {
+    const bot = makeFakeBot()
+    let clock = 10_000
+    const feed = createWorkerActivityFeed({
+      bot,
+      now: () => clock,
+      minEditIntervalMs: 0,
+      heartbeatTickMs: 6000,
+      setInterval: () => 1,
+      clearInterval: () => {},
+    })
+    await feed.update('w1', 'chat', view({ toolCount: 1, latestSummary: 'running step' }))
+    expect(bot.sent).toHaveLength(1)
+
+    // The terminal edit hits a 429 with a 2s retry_after.
+    bot.failNextEditWith = { error_code: 429, parameters: { retry_after: 2 } }
+    await feed.finish('w1', view({ state: 'done', toolCount: 1, latestSummary: 'final result' }))
+    await drain()
+    // No terminal edit landed yet — the last edit is still the running render.
+    expect(bot.edits.some((e) => e.text.includes('_done ·'))).toBe(false)
+
+    // Inside the cooldown — a heartbeat tick must NOT retry (would re-429).
+    clock = 11_000
+    feed.heartbeatTick()
+    await drain()
+    expect(bot.edits.some((e) => e.text.includes('_done ·'))).toBe(false)
+
+    // Past the cooldown (10_000 + 2000 + 500 jitter = 12_500) — the heartbeat
+    // re-drives the deferred finalize and the terminal edit lands.
+    clock = 13_000
+    feed.heartbeatTick()
+    await drain()
+    expect(bot.edits.some((e) => e.text.includes('_done ·'))).toBe(true)
+    expect(feed.has('w1')).toBe(false) // handle dropped after the terminal edit landed
+  })
+
+  it('#2: "message is not modified" on finish is treated as success (card already correct)', async () => {
+    const bot = makeFakeBot()
+    let clock = 10_000
+    const feed = createWorkerActivityFeed({ bot, now: () => clock, minEditIntervalMs: 0 })
+    await feed.update('w1', 'chat', view({ toolCount: 1, latestSummary: 'x' }))
+    expect(bot.sent).toHaveLength(1)
+
+    bot.failNextEditWith = new Error('Bad Request: message is not modified')
+    await feed.finish('w1', view({ state: 'done', toolCount: 1, latestSummary: 'x' }))
+    await drain()
+    // The handle is dropped — the not-modified outcome is success, no retry.
+    expect(feed.has('w1')).toBe(false)
+  })
+
+  it('#2: a gone message on finish drops the handle silently (no card to finalize)', async () => {
+    const bot = makeFakeBot()
+    const logs: string[] = []
+    let clock = 10_000
+    const feed = createWorkerActivityFeed({ bot, now: () => clock, minEditIntervalMs: 0, log: (m) => logs.push(m) })
+    await feed.update('w1', 'chat', view({ toolCount: 1, latestSummary: 'x' }))
+    expect(bot.sent).toHaveLength(1)
+
+    bot.failNextEditWith = new Error('Bad Request: message to edit not found')
+    await feed.finish('w1', view({ state: 'done', toolCount: 1, latestSummary: 'done' }))
+    await drain()
+    expect(feed.has('w1')).toBe(false)
+    // No scary "finish edit failed" warning for a transport-gone outcome.
+    expect(logs.some((l) => l.includes('finish edit failed'))).toBe(false)
+  })
+})
+
 // ─── Extreme-edge: single oversized narrative line (no-truncate ON) ──────────
 // Reproduces the bug where accumulateNarrative's char-budget splice would push
 // the oversized line then immediately splice it out, making the narrative empty
