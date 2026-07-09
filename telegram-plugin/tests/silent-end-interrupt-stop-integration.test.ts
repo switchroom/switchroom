@@ -190,6 +190,59 @@ describe('silent-end-interrupt-stop.mjs — integration', () => {
     expect(state.retryCount).toBe(SILENT_END_MAX_RETRIES)
   })
 
+  it('blocks + writes retryCount=1 when an early qualifying reply is followed by an undelivered verdict (trailing-content bug repro)', () => {
+    // Confirmed-incident shape: (1) a background-task notification
+    // arrives, (2) the agent calls reply ONCE early with a stale,
+    // notification-bearing ack ("running now" — disable_notification
+    // unset, so it satisfies isFinalAnswerReply regardless of length),
+    // (3) the agent then does more work and writes a large substantive
+    // verdict as plain assistant text with NO second reply call. Pre-fix,
+    // the hook's "reply called at least once this turn" check allowed
+    // this to slip through silently — the trailing verdict never reached
+    // the user. Post-fix the hook must block on this shape exactly like
+    // the zero-reply case.
+    const transcript = writeTranscript(tmp, [
+      ENQUEUE,
+      reply('running now'),
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'ls' } }] } },
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Read', input: { file_path: '/tmp/x' } }] } },
+      {
+        type: 'assistant',
+        message: { content: [{ type: 'text', text: 'Here is the actual verdict: ' + 'X'.repeat(300) }] },
+      },
+    ])
+    const r = runHook({
+      event: { session_id: 's1', transcript_path: transcript },
+      stateDir,
+    })
+    expect(r.status).toBe(0)
+    const out = JSON.parse(r.stdout)
+    expect(out.decision).toBe('block')
+    expect(out.reason).toMatch(/Send your final answer/)
+    const statePath = join(stateDir, 'silent-end-pending.json')
+    expect(existsSync(statePath)).toBe(true)
+    const state = JSON.parse(readFileSync(statePath, 'utf8'))
+    expect(state.retryCount).toBe(1)
+    expect(state.chatId).toBe('111')
+    expect(state.turnKey).toBe('111:_')
+  })
+
+  it('does NOT false-positive on a normal single-reply turn ending on the reply tool_use', () => {
+    const transcript = writeTranscript(tmp, [
+      ENQUEUE,
+      { type: 'assistant', message: { content: [{ type: 'text', text: 'Let me check.' }] } },
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'ls' } }] } },
+      reply('Here is your answer.', { disable_notification: false }),
+    ])
+    const r = runHook({
+      event: { session_id: 's1', transcript_path: transcript },
+      stateDir,
+    })
+    expect(r.status).toBe(0)
+    expect(r.stdout.trim()).toBe('')
+    expect(existsSync(join(stateDir, 'silent-end-pending.json'))).toBe(false)
+  })
+
   it('NO_REPLY in transcript → allow stop, no state file written', () => {
     const transcript = writeTranscript(tmp, [
       ENQUEUE,
