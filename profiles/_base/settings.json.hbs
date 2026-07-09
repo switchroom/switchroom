@@ -21,8 +21,8 @@
 {
   "permissions": {
     "allow": {{{json permissionAllow}}},
-    "deny": {{{json toolsDeny}}}{{#if defaultModeAcceptEdits}},
-    "defaultMode": "acceptEdits"{{/if}}
+    "deny": {{{json toolsDeny}}},
+    "defaultMode": "{{defaultMode}}"
   }{{#if hindsightEnabled}},
   "autoMemoryEnabled": false{{/if}}{{#if mcpServers}},
   "mcpServers": {{{json mcpServers}}}

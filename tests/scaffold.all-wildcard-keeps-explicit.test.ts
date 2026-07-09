@@ -97,7 +97,8 @@ describe("scaffold: tools.allow [all] keeps explicit additions (klanker re-ask f
     expect(allow).toContain("Bash");
     expect(allow).toContain("Edit");
     expect(allow).not.toContain("all");
-    // hasAllWildcard drives defaultMode acceptEdits.
+    // acceptEdits is the switchroom built-in default (now decoupled from the
+    // wildcard) — an [all] agent with no override still gets it.
     expect(settings.permissions.defaultMode).toBe("acceptEdits");
   });
 
