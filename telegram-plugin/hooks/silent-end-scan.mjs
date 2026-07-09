@@ -221,6 +221,16 @@ function buildBlockResult(envelope, reason) {
  * (the model narrating before it sends) — only text that comes AFTER
  * the last delivery event counts as a drop.
  *
+ * Substance floor (#2956 review): the trailing-text check only BLOCKS
+ * when the trailing text is SUBSTANTIVE — at least FINAL_ANSWER_MIN_CHARS
+ * (the same bar `isFinalAnswerReply` uses to recognise a real answer). A
+ * SHORT trailing pleasantry / closer after a delivered reply ("Let me
+ * know if you need anything else.") is not a dropped answer and must not
+ * trigger a re-prompt (no-spam / single-answer invariant). A long
+ * trailing verdict the model forgot to send still blocks. The floor keeps
+ * the "at least once" guarantee for real dropped answers while stopping a
+ * false-positive that burned retry budget on healthy turns.
+ *
  * @param {string} jsonl
  * @returns {{ decided: 'allow' | 'block' | 'unknown', reason: string, turnKey?: string, chatId?: string, threadId?: number | null }}
  */
@@ -275,7 +285,16 @@ export function scanTurnForFinalReply(jsonl) {
         if (endsWithSilentMarker(String(c.text ?? ''))) {
           blocks.push({ kind: 'deliver', reason: 'silent-marker-text' })
         } else if (String(c.text ?? '').trim().length > 0) {
-          blocks.push({ kind: 'text' })
+          // Carry the trimmed char count so the trailing-content check
+          // (step 3) can apply a substance floor: a SHORT trailing text
+          // after a delivered reply (a pleasantry / closer like "Let me
+          // know if you need anything else.") is NOT a dropped answer and
+          // must not trigger a re-prompt (no-spam invariant). Only
+          // SUBSTANTIVE trailing text — at least FINAL_ANSWER_MIN_CHARS,
+          // the same bar `isFinalAnswerReply` uses to recognise a real
+          // answer — counts as "undelivered content the user was waiting
+          // on". #2956 review finding.
+          blocks.push({ kind: 'text', chars: String(c.text ?? '').trim().length })
         }
         continue
       }
@@ -322,7 +341,7 @@ export function scanTurnForFinalReply(jsonl) {
   }
   const sawUndeliveredTextAfterAllow = blocks
     .slice(lastAllowBlockIdx + 1)
-    .some((b) => b.kind === 'text')
+    .some((b) => b.kind === 'text' && (b.chars ?? 0) >= FINAL_ANSWER_MIN_CHARS)
 
   if (lastAllowBlockIdx === -1) {
     // No qualifying delivery/silence event anywhere in the turn.
