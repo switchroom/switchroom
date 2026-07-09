@@ -123,6 +123,17 @@ describe('buildBar', () => {
     expect(bar[1]).toBe('█');
     expect(bar).toContain('┃');
   });
+  it('over-pace: quota fill visibly punches through past the time-elapsed tick', () => {
+    // 80% quota used, only 30% of the way through the window — burning
+    // faster than the clock. Fill (8 cells) extends past the tick
+    // (index round(0.3*9)=3), so filled cells appear on BOTH sides of the
+    // tick — that's the "punch through" signal the operator asked for.
+    const bar = buildBar(80, 0.3);
+    expect(bar).toBe('███┃████░░');
+    const tickIndex = bar.indexOf('┃');
+    const filledAfterTick = bar.slice(tickIndex + 1).includes('█');
+    expect(filledAfterTick).toBe(true); // fill visibly overtakes the pace marker
+  });
 });
 
 // ── accountStatus ────────────────────────────────────────────────────
@@ -244,7 +255,8 @@ describe('renderQuotaBarBlockFromListState', () => {
   });
 });
 
-// ── renderUsageCard (bar block + Format 2 table) ─────────────────────
+// ── renderUsageCard (bar block only — /usage no longer appends the ─────
+// Format 2 table underneath; see gateway.ts's `bot.command('usage', ...)`)
 
 describe('renderUsageCard', () => {
   function snap(part: Partial<AccountSnapshot> & { label: string }): AccountSnapshot {
@@ -269,27 +281,34 @@ describe('renderUsageCard', () => {
   ];
   const exhausted = new Map<string, boolean>([['ken@example.com', false]]);
 
-  it('renders the quota-bar block on top and the Format 2 table below', () => {
-    const out = renderUsageCard(snapshots, exhausted, { now: NOW, tz: 'UTC' });
+  it('renders ONLY the quota-bar block — no Format 2 table underneath', () => {
+    const out = renderUsageCard(snapshots, exhausted, { now: NOW });
     const lines = out.split('\n');
-    // Bar block first — account title + two window rows with the ASCII bar.
+    // Bar block — account title + two window rows with the ASCII bar.
     expect(lines[0]).toBe('- **ken@example.com** (active)');
     expect(out).toContain('- 🟢 5h `[');
     expect(out).toContain('- 🟢 7d `[');
-    // Format 2 table below — its header + reset columns + recommendation
-    // footer are preserved so no per-window reset info is lost.
-    expect(out).toContain('🔋 **Auth — fleet status**');
-    expect(out).toContain('| State | Account | 5h | 5h resets | 7d | 7d resets |');
-    expect(out).toContain('Recommendation:');
-    // The bar block must precede the Format 2 table.
-    expect(out.indexOf('- **ken@example.com** (active)')).toBeLessThan(
-      out.indexOf('🔋 **Auth — fleet status**'),
-    );
+    // Reset info is carried by the bar rows themselves (relative
+    // time-left), not a separate table.
+    expect(out).toContain('1h0m left');
+    expect(out).toContain('left');
+    // The old Format 2 table must be fully gone from this card.
+    expect(out).not.toContain('🔋 **Auth — fleet status**');
+    expect(out).not.toContain('| State | Account | 5h | 5h resets | 7d | 7d resets |');
+    expect(out).not.toContain('Recommendation:');
+    // Exactly 3 lines: title + 5h row + 7d row, no trailing table.
+    expect(lines).toHaveLength(3);
   });
 
-  it('forwards the demo flag to the Format 2 table', () => {
-    const out = renderUsageCard(snapshots, exhausted, { now: NOW, tz: 'UTC', demo: true });
-    // Demo masks the email label in the table; the real address must not leak.
-    expect(out).not.toContain('ken@example.com (active)');
+  it('masks the account-email label in demo mode', () => {
+    const out = renderUsageCard(snapshots, exhausted, { now: NOW, demo: true });
+    expect(out).not.toContain('ken@example.com');
+    // Bar rows are unaffected; only the title-line label is masked.
+    expect(out).toContain('5h `[');
+  });
+
+  it('does not mask the label when demo is omitted', () => {
+    const out = renderUsageCard(snapshots, exhausted, { now: NOW });
+    expect(out).toContain('- **ken@example.com** (active)');
   });
 });
