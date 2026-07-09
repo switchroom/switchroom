@@ -225,14 +225,56 @@ function rotateAuditLog(logPath: string, maxFiles: number): void {
   // Finally, snapshot active → .1 by COPYING the bytes, then truncate the
   // active file in place. Copy first: if the copy fails we leave the active
   // file untouched (grow rather than lose rows). Only after the snapshot is
-  // safely on disk do we truncate the live file back to zero length.
+  // durably on stable storage do we truncate the live file back to zero
+  // length.
+  //
+  // DURABILITY (#2955 review): `copyFileSync` returning does NOT mean the
+  // bytes are on stable storage — they may sit in the page cache. Truncate
+  // is an explicit data-destroying op, so without an fsync of the snapshot
+  // between copy and truncate, a host-crash window loses rows AND leaves
+  // the active file zeroed. fsync the `.1` snapshot (and best-effort the
+  // parent dir) before truncating — matches `vault.ts`'s durability
+  // discipline and makes the "safely on disk" claim below literally true.
+  const snapshotPath = `${logPath}.1`;
   try {
-    fs.copyFileSync(logPath, `${logPath}.1`);
+    fs.copyFileSync(logPath, snapshotPath);
   } catch (err) {
     process.stderr.write(
-      `[vault-audit] ERROR: could not snapshot active audit log ${logPath} → ${logPath}.1: ${(err as Error).message}\n`,
+      `[vault-audit] ERROR: could not snapshot active audit log ${logPath} → ${snapshotPath}: ${(err as Error).message}\n`,
     );
     return;
+  }
+  // Durably persist the snapshot before destroying the source. Best-effort:
+  // some filesystems reject fsync, but a failed fsync here is still safer
+  // than skipping it — we proceed to truncate only when the snapshot has
+  // been open + flushed. If the fsync throws, leave the active file intact
+  // (grow rather than risk losing rows to a truncate on an unflushed copy).
+  try {
+    const fd = fs.openSync(snapshotPath, "r");
+    try {
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch (err) {
+    process.stderr.write(
+      `[vault-audit] ERROR: could not fsync audit snapshot ${snapshotPath}; leaving active log intact to avoid data loss: ${(err as Error).message}\n`,
+    );
+    return;
+  }
+  // Best-effort fsync of the parent dir so the snapshot's dirent update is
+  // persisted (POSIX permits a post-copy crash to lose the dirent otherwise).
+  // A failure here is non-fatal — the data is flushed; only the directory
+  // entry update is at risk, and re-running rotation is idempotent.
+  try {
+    const dirFd = fs.openSync(path.dirname(snapshotPath), "r");
+    try {
+      fs.fsyncSync(dirFd);
+    } finally {
+      fs.closeSync(dirFd);
+    }
+  } catch {
+    /* best-effort: some filesystems refuse fsync on directories */
   }
   try {
     // truncate(2) resets length to 0 while preserving the inode, mode, and
