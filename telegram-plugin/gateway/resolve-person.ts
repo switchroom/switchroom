@@ -63,6 +63,17 @@ export interface PersonDirectory {
 export interface DroppedPersonEntry {
   key: string
   reason: string
+  /**
+   * Name-scrubbed reason CLASS — the same rejection without the embedded
+   * `person_id` human-name value or the colliding telegram id. Used to
+   * build the broadcast `alertDetail` so a config-warning card (which
+   * `emitGatewayOperatorEvent` sends to EVERY `allowFrom` chat, including
+   * group chats where the named person may NOT be a member) never surfaces
+   * a human name that the display path (`resolvePersonName`) deliberately
+   * chat-scopes. The verbose `reason` is still carried for the operator's
+   * own stderr `logLine` (private, not broadcast).
+   */
+  reasonClass: string
 }
 
 export interface BuildPersonDirectoryResult {
@@ -105,15 +116,15 @@ export function buildPersonDirectory(entries: readonly RawPersonEntry[]): BuildP
     const personId = typeof raw.person_id === 'string' ? raw.person_id.trim() : ''
 
     if (key.length === 0) {
-      dropped.push({ key: raw.key || '(unknown)', reason: 'missing users: map key' })
+      dropped.push({ key: raw.key || '(unknown)', reason: 'missing users: map key', reasonClass: 'missing users: map key' })
       continue
     }
     if (personId.length === 0) {
-      dropped.push({ key, reason: 'empty or missing person_id' })
+      dropped.push({ key, reason: 'empty or missing person_id', reasonClass: 'empty or missing person_id' })
       continue
     }
     if (!Array.isArray(raw.telegram_ids) || raw.telegram_ids.length === 0) {
-      dropped.push({ key, reason: 'no telegram_ids to resolve against' })
+      dropped.push({ key, reason: 'no telegram_ids to resolve against', reasonClass: 'no telegram_ids to resolve against' })
       continue
     }
 
@@ -122,7 +133,14 @@ export function buildPersonDirectory(entries: readonly RawPersonEntry[]): BuildP
     if (existingOwner != null && existingOwner !== key) {
       dropped.push({
         key,
+        // Verbose reason (stderr logLine only — private to the operator):
+        // names the person_id value + the owning config key.
         reason: `duplicate person_id "${personId}" already claimed by users.${existingOwner}`,
+        // reasonClass (broadcast alertDetail): scrubs the human-name
+        // person_id value; keeps the entry key + collision class. A
+        // config-warning card fans out to every allowFrom chat, so the
+        // name must not travel further than the display path allows.
+        reasonClass: `duplicate person_id already claimed by users.${existingOwner}`,
       })
       continue
     }
@@ -130,7 +148,7 @@ export function buildPersonDirectory(entries: readonly RawPersonEntry[]): BuildP
 
     const telegramKeys = [...new Set(raw.telegram_ids.map(normalizeTelegramKey).filter((k) => k.length > 0))]
     if (telegramKeys.length === 0) {
-      dropped.push({ key, reason: 'telegram_ids contained no usable id/username' })
+      dropped.push({ key, reason: 'telegram_ids contained no usable id/username', reasonClass: 'telegram_ids contained no usable id/username' })
       personIdOwner.delete(personIdLower)
       continue
     }
@@ -144,6 +162,9 @@ export function buildPersonDirectory(entries: readonly RawPersonEntry[]): BuildP
       dropped.push({
         key,
         reason: `duplicate telegram_id "${collidingTelegramKey}" already claimed by users.${existingTkOwner}`,
+        // Scrub the colliding telegram id/username from the broadcast
+        // reason; keep the owning config key (operator-chosen slug).
+        reasonClass: `duplicate telegram_id already claimed by users.${existingTkOwner}`,
       })
       personIdOwner.delete(personIdLower)
       continue
@@ -189,12 +210,20 @@ export function runPersonDirectoryBootCheck(readEntries: () => RawPersonEntry[])
     const { directory, dropped } = buildPersonDirectory(rawEntries)
 
     if (dropped.length > 0) {
-      const summary = dropped.map((d) => `${d.key} (${d.reason})`).join('; ')
+      // Broadcast-safe summary for `alertDetail` (fans out to EVERY
+      // allowFrom chat via emitGatewayOperatorEvent, including group chats
+      // where the named person may not be a member): built from
+      // `reasonClass`, which scrubs the embedded person_id human-name
+      // value and the colliding telegram id. The verbose `reason`
+      // (names the values) is kept for the operator's own stderr
+      // `logLine` — private, never broadcast.
+      const alertSummary = dropped.map((d) => `${d.key} (${d.reasonClass})`).join('; ')
+      const logSummary = dropped.map((d) => `${d.key} (${d.reason})`).join('; ')
       const plural = dropped.length === 1 ? 'y' : 'ies'
       return {
         directory,
-        alertDetail: `person_id: dropped ${dropped.length} malformed users: entr${plural} at boot — ${summary}`,
-        logLine: `telegram gateway: person_id boot validation dropped ${dropped.length} entr${plural}: ${summary}`,
+        alertDetail: `person_id: dropped ${dropped.length} malformed users: entr${plural} at boot — ${alertSummary}`,
+        logLine: `telegram gateway: person_id boot validation dropped ${dropped.length} entr${plural}: ${logSummary}`,
       }
     }
 
@@ -209,7 +238,10 @@ export function runPersonDirectoryBootCheck(readEntries: () => RawPersonEntry[])
     const msg = err instanceof Error ? err.message : String(err)
     return {
       directory: { byTelegramKey: {} },
-      alertDetail: `person_id boot validation crashed — name resolution disabled this boot (fail-open, raw ids/usernames will show): ${msg}`,
+      // Crash alertDetail scrubs the raw error message too — it can
+      // carry a filesystem path or other host detail that shouldn't fan
+      // out to every allowFrom chat. The full message stays in logLine.
+      alertDetail: `person_id boot validation crashed — name resolution disabled this boot (fail-open, raw ids/usernames will show); see gateway stderr for detail`,
       logLine: `telegram gateway: person_id boot validation CRASHED (name resolution disabled this boot, raw ids will show — fail-open): ${msg}`,
     }
   }
