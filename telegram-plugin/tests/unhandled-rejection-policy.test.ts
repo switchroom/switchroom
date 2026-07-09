@@ -96,6 +96,25 @@ describe('classifyRejection — benign Telegram 400s', () => {
     )
     expect(classifyRejection(err)).toBe('log_only')
   })
+  it('returns "log_only" for "group chat was upgraded to a supergroup chat" (marko 2026-07-09, recurring 2026-06-07/2026-06-09)', () => {
+    // A send targeted a basic-group chat_id that Telegram had since
+    // migrated to a supergroup (new -100xxxxxxxxxx id). This crashed the
+    // ENTIRE gateway process (every agent/chat) over a single stale
+    // cached chat_id — the same root cause recurred three times across a
+    // month because the crash-on-leak behavior masked the underlying
+    // stale-id bug instead of just logging it. A migrated/invalid
+    // destination chat must never take down the whole gateway.
+    const err = grammyError(
+      400,
+      'Bad Request: group chat was upgraded to a supergroup chat',
+    )
+    expect(classifyRejection(err)).toBe('log_only')
+  })
+
+  it('returns "log_only" for "group chat was deactivated"', () => {
+    const err = grammyError(400, 'Bad Request: group chat was deactivated')
+    expect(classifyRejection(err)).toBe('log_only')
+  })
 })
 
 describe('classifyRejection — genuine errors still crash', () => {
