@@ -452,6 +452,58 @@ describe("scaffoldAgent", () => {
     expect(access.groups["-1001234567890"].requireMention).toBe(false);
   });
 
+  it("generates telegram/people.json (empty entries) even with no users: block", () => {
+    const config = makeAgentConfig({});
+    const result = scaffoldAgent("no-people", config, tmpDir, telegramConfig);
+    const people = JSON.parse(
+      readFileSync(join(result.agentDir, "telegram", "people.json"), "utf-8"),
+    );
+    expect(people).toEqual({ entries: [] });
+  });
+
+  it("projects users: person_id entries into telegram/people.json (raw, undeduped)", () => {
+    const config = makeAgentConfig({});
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      users: {
+        lisa: { telegram_ids: ["8201250670"], profile_bank: "lisa-profile", person_id: "Lisa" },
+        ken: { telegram_ids: ["111"], profile_bank: "ken-profile" }, // no person_id — excluded
+      },
+      agents: { "people-agent": config },
+    } as SwitchroomConfig;
+    const result = scaffoldAgent("people-agent", config, tmpDir, telegramConfig, switchroomConfig);
+    const people = JSON.parse(
+      readFileSync(join(result.agentDir, "telegram", "people.json"), "utf-8"),
+    );
+    expect(people.entries).toEqual([{ key: "lisa", person_id: "Lisa", telegram_ids: ["8201250670"] }]);
+  });
+
+  it("people.json is config-derived — re-scaffolding (the `switchroom apply` reconcile path) regenerates it, unlike writeIfMissing access.json", () => {
+    const config = makeAgentConfig({});
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      users: { lisa: { telegram_ids: ["8201250670"], profile_bank: "lisa-profile", person_id: "Lisa" } },
+      agents: { "people-rescaffold": config },
+    } as SwitchroomConfig;
+    scaffoldAgent("people-rescaffold", config, tmpDir, telegramConfig, switchroomConfig);
+
+    // Simulate a users: edit, then re-run `switchroom apply` (which calls
+    // scaffoldAgent again, idempotently, for every configured agent) —
+    // people.json must pick up the change, unlike the writeIfMissing
+    // access.json.
+    const switchroomConfig2: SwitchroomConfig = {
+      ...switchroomConfig,
+      users: { lisa: { telegram_ids: ["8201250670"], profile_bank: "lisa-profile", person_id: "Lisa Renamed" } },
+    } as SwitchroomConfig;
+    scaffoldAgent("people-rescaffold", config, tmpDir, telegramConfig, switchroomConfig2);
+    const people = JSON.parse(
+      readFileSync(join(tmpDir, "people-rescaffold", "telegram", "people.json"), "utf-8"),
+    );
+    expect(people.entries[0].person_id).toBe("Lisa Renamed");
+  });
+
   it("projects channels.telegram.coalesce.window_ms into access.coalescingGapMs", () => {
     const config = makeAgentConfig({
       channels: { telegram: { coalesce: { window_ms: 1200 } } },

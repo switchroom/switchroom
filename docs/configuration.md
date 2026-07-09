@@ -265,6 +265,30 @@ agents:
 
 > **Note:** this generates the *memory* wiring only. Who may **drive** an agent (`access.allowFrom`) is still paired at agent creation as today — generating access from `users:` is a future phase.
 
+### Greeting by name — `users.<key>.person_id`
+
+By default, an inbound Telegram message only carries the sender's raw numeric id or `@username` — an agent can't greet a known person by name or reason about "who is this" without hard-coding the id somewhere. `person_id` closes that gap:
+
+```yaml
+users:
+  lisa: { telegram_ids: ["8201250670"], profile_bank: lisa-profile, person_id: "Lisa" }
+```
+
+When Lisa messages an agent, the `<channel>` tag's `user` attribute (and the `meta.user` field the model sees) shows `Lisa` instead of the raw id/username. `meta.user_id` is always still the raw numeric id — nothing here changes the id the agent actually authenticates against.
+
+**What `person_id` is not:**
+
+- **Not a stable identity system.** It's a free-text display label, the same discipline as picking a `profile_bank` name — pick something broadly safe to show, not a secret.
+- **Not exposed as a tool.** There is no MCP tool to look up or resolve a `person_id` — it only ever shows up passively in the inbound `<channel>` tag.
+- **Not hot-reloaded.** The gateway builds its name-resolution table exactly once, at boot, from the config as scaffolded. **Editing `person_id` (or `telegram_ids`) requires restarting the agent** (`switchroom agent restart <name>`, or the equivalent `agent_restart` tool) before the change takes effect — the gateway never re-reads it while running.
+- **Not merged with `access.json`.** `access.json` is the fail-**closed** allow-list that decides whether an agent responds to a chat/sender at all — a completely separate concern, never touched by this feature. Name resolution is fail-**open**: an id that doesn't resolve (or a person the gateway can't confirm is a member of *this* chat — see below) just falls back to today's behavior, the raw id/username. It never blocks or denies a message.
+
+**Chat-scoped, not broadcast.** A resolved name is only shown in a chat/group the person is actually confirmed to be a member of (per that chat's `allowFrom`, the same data `access.json` already tracks). In a 1:1 DM the chat *is* the sender, so the name always resolves. In a group, the sender's id or username must be explicitly present in that group's `allowFrom` — an unrestricted or empty `allowFrom` means membership can't be positively confirmed, so the raw id/username is shown instead. This exists because a name that's perfectly safe to show in a private DM could be a bigger disclosure if broadcast into every group the agent happens to sit in.
+
+**Accepted soft mitigation.** There is **no automated enforcement** that a configured `person_id` stays safe to show if a group's membership changes *after* the entry is written (e.g. someone is removed from a group chat but the `switchroom.yaml` entry isn't updated). This is an operator-discipline convention, the same trust model as every other free-text label in `users:` — not a closed gap. Given only two `person_id`s are configured fleet-wide today, this is accepted as a low-severity risk rather than a blocker; revisit if the fleet-wide `users:` list grows meaningfully.
+
+**Malformed entries are dropped individually, not fleet-wide.** A bad `users:` entry — an empty `person_id`, no `telegram_ids`, or a `person_id` already claimed by a different user — drops **only that one entry** at boot; every other configured person still resolves normally. The gateway posts a low-severity "config warning" operator alert (same fleet-alert channel as credential/quota issues, tagged so it never pages like a real outage) naming which entry was dropped and why. If the boot-time check itself fails unexpectedly, that failure is *also* alerted (not silently swallowed) — name resolution is disabled for that boot, but nothing else is affected.
+
 ### Specializing a bank — missions & disposition
 
 A persona without its own memory is cosplay: banks should be *specialized*, not merely isolated. Four `memory.*` fields steer how a bank extracts, recalls, and synthesizes — a coach should read its notes differently than a lawyer.

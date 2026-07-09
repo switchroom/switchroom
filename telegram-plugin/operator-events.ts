@@ -26,6 +26,7 @@ export type OperatorEventKind =
   | 'agent-restarted-unexpectedly'
   | 'unknown-4xx'
   | 'unknown-5xx'
+  | 'config-warning'
 
 export interface OperatorEvent {
   kind: OperatorEventKind
@@ -372,6 +373,26 @@ export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
         keyboard: {
           inline_keyboard: [
             [{ text: '⏳ Wait', callback_data: `op:dismiss:${encodeURIComponent(ev.agent)}` }],
+          ],
+        },
+      }
+
+    // Deliberately low-severity framing (ℹ️, Dismiss-only — no Restart /
+    // Reauth / Show-logs actions): config-warning is for boot-time config
+    // problems (e.g. a dropped `person_id` entry) that must be visible to
+    // the operator but MUST NOT read like a real outage or page anyone.
+    case 'config-warning':
+      return {
+        text: [
+          `ℹ️ **Config warning** for **${agent}**.`,
+          detail ? `_${detail}_` : '',
+          `Non-urgent — config will keep working with today's fallback behavior.`,
+        ]
+          .filter(Boolean)
+          .join('\n'),
+        keyboard: {
+          inline_keyboard: [
+            [{ text: '❌ Dismiss', callback_data: `op:dismiss:${encodeURIComponent(ev.agent)}` }],
           ],
         },
       }

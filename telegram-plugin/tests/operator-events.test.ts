@@ -253,6 +253,21 @@ describe('renderOperatorEvent — unknown-5xx', () => {
   })
 })
 
+describe('renderOperatorEvent — config-warning', () => {
+  it('is framed as non-urgent (dismiss-only, no restart/reauth/logs actions)', () => {
+    const { text, keyboard } = renderOperatorEvent(
+      makeEvent('config-warning', { detail: 'person_id: dropped 1 malformed users: entry at boot — lisa (empty person_id)' }),
+    )
+    expect(text).toContain('Config warning')
+    expect(text).toContain('Non-urgent')
+    const buttons = keyboard.inline_keyboard.flat()
+    expect(buttons.every(b => b.callback_data?.includes('dismiss'))).toBe(true)
+    expect(buttons.some(b => b.callback_data?.includes('restart'))).toBe(false)
+    expect(buttons.some(b => b.callback_data?.includes('reauth'))).toBe(false)
+    expect(buttons.some(b => b.callback_data?.includes('logs'))).toBe(false)
+  })
+})
+
 describe('renderOperatorEvent — markdown escaping (#2669)', () => {
   it('passes < > literally in agent name (markdown, #2669)', () => {
     const { text } = renderOperatorEvent(makeEvent('unknown-4xx', { agent: '<evil>' }))
@@ -276,6 +291,7 @@ describe('renderOperatorEvent — all kinds produce valid keyboard structure', (
     'agent-restarted-unexpectedly',
     'unknown-4xx',
     'unknown-5xx',
+    'config-warning',
   ]
 
   for (const kind of allKinds) {
