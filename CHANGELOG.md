@@ -1,6 +1,44 @@
 # Changelog
 
-## v0.18.3 — Operator-configurable Hindsight auto-retain cadence
+## v0.18.3 — Watchdog thinking-pause fix, acceptEdits fleet default, Claude CLI 2.1.205, configurable retain cadence
+
+### Gateway: orphaned-reply watchdog survives model thinking pauses (#2949)
+
+The orphaned-reply watchdog force-ended a live turn if no `reply` landed
+within its timeout, but a long model *thinking* pause (no stream events, no
+tool calls) looked identical to a hung turn. Turns doing real reasoning were
+being cut off mid-thought. The watchdog now tracks recent stream activity
+(`LivenessTracker`): it only force-ends when the turn is genuinely idle, and
+re-arms while the model is still streaming — with the existing re-arm cap
+intact so a truly wedged turn still gets reaped. Fixes premature turn
+termination during extended reasoning.
+
+### acceptEdits is now the built-in default permission mode (#2951)
+
+Every agent now defaults to `acceptEdits` (auto-accept file edits) without any
+yaml — previously only agents with an `allow: [all]` wildcard got it, so a
+couple of agents silently sat in ask-before-edit mode and could stall on an
+edit prompt they can't answer. Override fleet-wide via
+`defaults.permission_mode` or per-agent via `permission_mode`; an explicit
+override now wins over the wildcard path too.
+
+**Behavior change:** plain agents with no `permission_mode` that previously
+inherited Claude Code's ask-before-edit default flip to `acceptEdits` on their
+next scaffold/reconcile. For non-interactive Telegram agents this is the
+correct posture (they can't answer an edit prompt — ask-mode just stalls), but
+any operator relying on ask-mode as a safety brake should set
+`permission_mode: default` explicitly to keep it.
+
+### Bundle Claude Code CLI 2.1.205 (#2951)
+
+Bumps the bundled Claude Code CLI `2.1.199` → `2.1.205` in both
+`docker/Dockerfile.base` and `docker/Dockerfile.hindsight`. Rolls up upstream
+fixes for background/forked sessions losing `ANTHROPIC_BASE_URL` (401s),
+SessionStart-hook idle-reaping, and background agents stuck as failed/completed
+after a `SendMessage` resume. The `default`→`Manual` mode rename (2.1.200) is
+backward-compatible; emitted `settings.json` values are unaffected.
+
+### Operator-configurable Hindsight auto-retain cadence (default 3 / 1) (#2950)
 
 The plugin's auto-retain cadence (`retainEveryNTurns` / `retainOverlapTurns`)
 was hardcoded at scaffold to `1` / `2` — retain every single turn with a 3-turn
