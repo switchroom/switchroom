@@ -94,6 +94,11 @@ skill **except** the universal `cli`/`status`/`health` trio — see
 - `switchroom-install` — bootstrap switchroom on a fresh machine
 - `switchroom-manage` — add/remove/reinstall/list agents (fleet-level)
 - `switchroom-architecture` — internal design context for fleet-management decisions
+- `switchroom-release` — cut and ship a release end-to-end (CHANGELOG →
+  tag → npm publish → images → rollout gate). Enforces the npm-publish +
+  image-build gates that were historically skipped (v0.18.4/v0.18.5
+  shipped to the fleet but never hit npm). See
+  `.github/workflows/npm-publish.yml` + CLAUDE.md > Release.
 - `switchroom-runtime` — conditional runtime protocols: the agent
   answering for *itself* about a crash, restart, hand-off resume, or
   mid-turn interrupt ("why did you restart?", "did you crash?", "still
@@ -121,6 +126,7 @@ Current `<repo>/skills/` inventory:
 | `switchroom-install` | foreman-only (auto when `role: foreman`) | First-time bootstrap on a fresh machine |
 | `switchroom-manage` | foreman-only (auto when `role: foreman`) | Add/remove/reinstall/list agents (fleet-level) |
 | `switchroom-architecture` | foreman-only (auto when `role: foreman`) | Internal design context for fleet-mgmt decisions |
+| `switchroom-release` | foreman-only (auto when `role: foreman`) | Cut + ship a release; gates npm publish + images before rollout |
 | `switchroom-runtime` | foreman-only (auto when `role: foreman`) | Agent answering for itself about crash/restart/interrupt/hand-off |
 | `humanizer` | developer (opt-in) | Strips AI-writing patterns from replies; opt in via `defaults.skills` |
 | `humanizer-calibrate` | developer (opt-in) | Builds a personal voice template; companion to `humanizer` |
@@ -128,8 +134,8 @@ Current `<repo>/skills/` inventory:
 | `telegram-test-harness` | developer (opt-in) | Guidance for writing Telegram tests against the harness |
 | `token-helpers` | developer (opt-in) | Library skill — OAuth token refresh for Google Calendar / MS Graph |
 
-That's the full `skills/` tree (19 directories: 7 vendored Anthropic +
-7 `switchroom-*` + `humanizer`/`humanizer-calibrate` + `file-bug` +
+That's the full `skills/` tree (20 directories: 7 vendored Anthropic +
+8 `switchroom-*` + `humanizer`/`humanizer-calibrate` + `file-bug` +
 `telegram-test-harness` + `token-helpers`). Verify with `ls skills/`.
 
 Real fleet agents (clerk, klanker, etc.) load their personal skills from `~/.switchroom/skills/` — that directory holds calendar, compass, coolify, doctor-appointments, fully-kiosk, garmin, and similar. **The repo doesn't track those** — they're operator-managed.

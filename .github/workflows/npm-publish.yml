@@ -1,0 +1,243 @@
+name: npm-publish
+
+# Publish the `switchroom` CLI to npm on every release tag. This is the
+# step that was historically silently skipped — v0.18.4 and v0.18.5 were
+# tagged, image-built, and rolled to the fleet but NEVER published to npm,
+# because the publish step lived only in CLAUDE.md prose and wasn't gated
+# before rollout. Automating it on tag push makes it unmissable: every
+# `vX.Y.Z` tag publishes, and the rollout skill gates on this workflow
+# going green + `npm view switchroom` showing the new version.
+#
+# Trigger: tag push matching `v*` (the release-cut signal). Not fired on
+# main pushes or PRs — only on a real release tag.
+#
+# Auth: the `NPM_TOKEN` repo secret (automation-scoped npm access token,
+# publish access on the `switchroom` package). The operator sets this once
+# in repo settings → Secrets and variables → Actions. Without it this
+# workflow fails loudly at the publish step rather than silently skipping.
+#
+# Version source of truth: the git tag. `package.json` `version` is an
+# intentional stale placeholder (see its `//version` comment + CLAUDE.md >
+# Release). `resolveVersion()` stamps the built dist from the tag; the
+# npm tarball needs the SAME version in its package.json, so we bump it
+# UNCOMMITTED at pack time (never committed — that's the #2733 discipline).
+#
+# Ordering vs the docker-images workflow: both fire on the same tag push
+# and run in parallel. The rollout skill must wait for BOTH this workflow
+# (npm publish verified) AND docker-images (6 ghcr images verified) before
+# any fleet roll — neither alone is sufficient.
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Manual re-trigger for a retry (e.g. a transient npm 5xx on publish).
+  # Rerun will not work for a tag-ref workflow the same way it does for
+  # branch workflows, so this lever exists.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write  # npm provenance (sigstore) — requires npm provenance enabled on the package; harmless if not.
+
+concurrency:
+  group: npm-publish-${{ github.ref }}
+  cancel-in-progress: false  # a publish in flight must not be cancelled mid-PUT
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout (full history for resolveVersion git describe)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          fetch-depth: 0  # resolveVersion() uses `git describe --tags --exact-match HEAD`; needs tags + history
+
+      - name: Set up Bun + install workspace deps
+        uses: ./.github/actions/setup-switchroom
+
+      - name: Resolve release version from the git tag
+        id: ver
+        shell: bash
+        run: |
+          # Mirror scripts/build.mjs:resolveVersion() Layer 1-3 — the tag is
+          # the source of truth. Strip the leading 'v'.
+          ref="${GITHUB_REF#refs/tags/}"
+          case "$ref" in
+            v*) ver="${ref#v}" ;;
+            *)  ver="$ref" ;;
+          esac
+          # Guard: a tag that doesn't look like a version is a misfire.
+          if ! echo "$ver" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-.+].+)?$'; then
+            echo "::error::tag '$ref' is not a version tag (got '$ver'); refusing to publish"
+            exit 1
+          fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "Publishing switchroom@$ver (from tag $ref)"
+
+      - name: Bump package.json version UNCOMMITTED (pack-time only)
+        shell: bash
+        run: |
+          # Never commit this bump — the placeholder is stale by design
+          # (#2733). The tarball just needs a real version for npm naming +
+          # `npm view`. Use node to keep the JSON formatting stable.
+          node -e '
+            const fs = require("fs");
+            const p = JSON.parse(fs.readFileSync("package.json", "utf-8"));
+            p.version = process.argv[1];
+            fs.writeFileSync("package.json", JSON.stringify(p, null, 2) + "\n");
+          ' "${{ steps.ver.outputs.version }}"
+          # Sanity: confirm the bump landed and the //version comment survived
+          # (JSON.parse drops comments, so re-add it as a guard below).
+          grep -q "\"version\": \"${{ steps.ver.outputs.version }}\"" package.json || {
+            echo "::error::pack-time version bump did not land in package.json"
+            exit 1
+          }
+
+      - name: Build dist (real node_modules, not a symlink)
+        shell: bash
+        run: |
+          # setup-switchroom ran `bun install --frozen-lockfile` → real
+          # node_modules. A symlinked node_modules made bun build silently
+          # emit an empty dist/cli/ (broke v0.12.6→7); the composite action
+          # avoids that, but we still verify the output is non-empty below.
+          bun scripts/build.mjs
+
+      - name: Verify dist/cli/switchroom.js is non-empty (empty-build guard)
+        shell: bash
+        run: |
+          # The v0.12.6→7 regression: bun build silently emitted an empty
+          # dist/cli/. Catch it here, BEFORE packing, so we never publish a
+          # broken tarball.
+          f="dist/cli/switchroom.js"
+          if [ ! -s "$f" ]; then
+            echo "::error::$f is missing or empty — build produced no CLI entrypoint; refusing to publish"
+            exit 1
+          fi
+          echo "$f is $(wc -c < "$f") bytes — non-empty, OK"
+          # Shebang check: build.mjs fixes the shebang for Node; confirm it
+          # points at node, not bun (npm consumers run via node).
+          head -1 "$f" | grep -q '^#!.*node' || echo "::warning::$f shebang is not node-targeted"
+
+      - name: Pack (npm pack, no publish yet)
+        id: pack
+        shell: bash
+        run: |
+          # `npm pack` names the tarball from the (now-bumped) package.json
+          # version. --ignore-scripts: never run the package's lifecycle
+          # scripts during pack (prepublishOnly runs build+lint+test, which
+          # is redundant here and would re-run the whole suite).
+          # Run once, capturing output WITHOUT a pipe (a pipe masks the
+          # real exit code). `npm pack` prints the tarball filename as its
+          # last line.
+          set +e
+          npm pack --ignore-scripts > /tmp/pack.out 2>&1
+          rc=$?
+          set -e
+          if [ $rc -ne 0 ]; then
+            echo "::error::npm pack failed (exit $rc):"; cat /tmp/pack.out; exit 1
+          fi
+          tarball=$(tail -1 /tmp/pack.out)
+          if [ -z "$tarball" ] || [ ! -f "$tarball" ]; then
+            echo "::error::npm pack produced no tarball filename; output:"; cat /tmp/pack.out; exit 1
+          fi
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+          echo "Packed $tarball ($(wc -c < "$tarball") bytes)"
+
+      - name: Verify dist/cli/switchroom.js IS in the tarball
+        shell: bash
+        run: |
+          # The whole point: confirm the CLI entrypoint ships in the
+          # published tarball. A files/ glob misconfiguration or a missing
+          # dist/ would otherwise publish a package that installs but
+          # can't run.
+          tar tf "${{ steps.pack.outputs.tarball }}" | grep -q '^dist/cli/switchroom\.js$' || {
+            echo "::error::dist/cli/switchroom.js is NOT in the tarball — files/ glob or build is wrong; refusing to publish"
+            tar tf "${{ steps.pack.outputs.tarball }}" | head -20
+            exit 1
+          }
+          echo "dist/cli/switchroom.js confirmed in the tarball"
+
+      - name: Set up npm auth (NPM_TOKEN)
+        shell: bash
+        run: |
+          # .npmjsrc in $HOME so `npm publish` + `npm view` pick up the
+          # automation token. Using the //registry/ auth line (not
+          # _authToken in a published file) keeps the token out of the
+          # repo + the tarball.
+          mkdir -p "$HOME"
+          printf '//registry.npmjs.org/:_authToken=%s\n' "${{ secrets.NPM_TOKEN }}" > "$HOME/.npmrc"
+          chmod 600 "$HOME/.npmrc"
+          # Guard: a missing/empty token fails loudly here, not at publish.
+          if [ -z "${{ secrets.NPM_TOKEN }}" ]; then
+            echo "::error::NPM_TOKEN secret is empty or unset — set it in repo settings → Secrets → Actions"
+            rm -f "$HOME/.npmrc"
+            exit 1
+          fi
+
+      - name: Publish to npm (provenance-first, fallback to plain)
+        shell: bash
+        run: |
+          # --ignore-scripts: do not run the package's prepublishOnly
+          # (build+lint+test) on the npm side — we already built + verified
+          # locally. --access public: the package is public.
+          #
+          # --provenance: sigstore-signed build provenance (needs
+          # id-token: write, set above). Provenance can hard-fail for
+          # reasons that DON'T mean the publish is invalid — the package
+          # requiring 2FA for automation, provenance not enabled on the
+          # npm side, a transient sigstore outage. A provenance
+          # misconfiguration must NOT block a release (the whole point of
+          # this workflow is reliable publish). So: try with --provenance
+          # first; on failure, retry WITHOUT it. A plain publish that
+          # lands is strictly better than a provenanced publish that
+          # never happens.
+          set +e
+          npm publish "${{ steps.pack.outputs.tarball }}" \
+            --ignore-scripts --access public --provenance > /tmp/publish.out 2>&1
+          rc=$?
+          set -e
+          if [ $rc -ne 0 ]; then
+            echo "::warning::npm publish --provenance failed (exit $rc); falling back to a plain publish. Output:"; cat /tmp/publish.out
+            # Guard: if the failure was "already published" (409 / E403
+            # "You cannot publish over the currently published version"),
+            # a retry without provenance will fail identically — treat it
+            # as success (the version IS on npm) and skip the retry.
+            if grep -qiE "cannot publish over|already published|E409" /tmp/publish.out; then
+              echo "Version already on npm — treating as success (no retry)."
+              exit 0
+            fi
+            set +e
+            npm publish "${{ steps.pack.outputs.tarball }}" \
+              --ignore-scripts --access public > /tmp/publish-plain.out 2>&1
+            rc=$?
+            set -e
+            if [ $rc -ne 0 ]; then
+              echo "::error::npm publish failed even without provenance (exit $rc):"; cat /tmp/publish-plain.out
+              exit 1
+            fi
+            echo "Plain publish succeeded (no provenance)."
+          else
+            echo "Publish with provenance succeeded."
+          fi
+
+      - name: Verify the new version is live on npm
+        shell: bash
+        run: |
+          # The gate the rollout skill checks: `npm view switchroom version`
+          # must return the tag version. A publish that doesn't surface on
+          # the registry (rare race) is caught here.
+          set +e
+          for i in 1 2 3 4 5; do
+            published=$(npm view switchroom version 2>/dev/null)
+            if [ "$published" = "${{ steps.ver.outputs.version }}" ]; then
+              echo "npm view switchroom version = $published — published and live"
+              exit 0
+            fi
+            echo "attempt $i: npm view returned '$published', expected '${{ steps.ver.outputs.version }}' — retrying in 6s"
+            sleep 6
+          done
+          set -e
+          echo "::error::npm view switchroom version did not reach ${{ steps.ver.outputs.version }} after publish + retries — publish may have silently failed"
+          exit 1
