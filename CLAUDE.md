@@ -302,29 +302,46 @@ DB, audit log, scaffolds). A test that writes there corrupts a running fleet
 
 ## Release (condensed — full landmine detail in git history)
 
+**Follow the `switchroom-release` skill for the full ordered checklist.**
+The two gates below (npm publish + images) are HARD prerequisites for
+rollout — v0.18.4 and v0.18.5 shipped to the fleet but were never
+published to npm because publish wasn't gated. Don't let that recur.
+
 - **Version source of truth is the git tag**, resolved by
   `scripts/build.mjs:resolveVersion()`. The committed `package.json`
   `version` is a stale placeholder by design (see its `//version` comment) —
   never bump it in a commit. Release = CHANGELOG consolidation PR → merge →
-  tag `vX.Y.Z` on the merge commit → push tag (triggers `docker-images`).
-- `npm pack` names the tarball from the stale version — bump `package.json`
-  **uncommitted** at pack time; verify `dist/cli/switchroom.js` is in the
-  tarball before `npm publish --ignore-scripts`. Never pipe the build through
-  `tail` (masks a failed exit). Release builds need a **real
-  `node_modules`**, not a worktree symlink — a symlinked `node_modules` made
-  `bun build` silently emit an empty `dist/cli/` (broke v0.12.6→7).
+  tag `vX.Y.Z` on the merge commit → push tag (triggers `docker-images`
+  AND `npm-publish` in parallel).
+- **npm publish is automated by `.github/workflows/npm-publish.yml`** on
+  tag push: it does the uncommitted pack-time `package.json` bump, builds,
+  verifies `dist/cli/switchroom.js` is non-empty AND in the tarball (the
+  v0.12.6→7 empty-build guard), `npm publish --ignore-scripts
+  --provenance`, and verifies `npm view switchroom version` shows the new
+  version. Needs the `NPM_TOKEN` repo secret (set once). **Do NOT roll
+  the fleet until this workflow is green AND `npm view switchroom version`
+  returns the tag version.** Never run `npm publish` by hand from an
+  agent container (no npm auth there); fix the workflow, don't side-step
+  it. Release builds need a **real `node_modules`**, not a worktree
+  symlink — a symlinked one made `bun build` silently emit an empty
+  `dist/cli/` (broke v0.12.6→7); the workflow's setup-switchroom action
+  avoids this and the empty-build guard catches it.
 - Create the GitHub Release (`gh release create`) — historically silently
   dropped. The naive `awk '/^## vX/,/^## v/'` CHANGELOG range collapses to
   one line; use a start-flag awk instead.
 - The web container is a separate compose project
   (`~/.switchroom/web/docker-compose.yml`) — `switchroom update` doesn't
   touch it; pull + up manually.
-- Fleet rollout: canary on test-harness first (UAT above), then staggered
-  per-agent `switchroom agent restart <name> --wait --force` with a
-  `--version` assertion per agent (guards the `:latest` pull-race). Deploy
-  only from the host shell or via hostd (`SWITCHROOM_HOST_HOME` invariant —
-  `reference/rfcs/deploy-reliability.md`); never via an ad-hoc container
-  mounting the operator home.
+- **Fleet rollout — only after BOTH gates pass:** npm publish verified
+  (above) AND `docker-images` verified (`docker manifest inspect
+  ghcr.io/switchroom/<image>:vX.Y.Z` for agent, auth-broker, kernel,
+  broker, web, hostd). Then canary on test-harness first (UAT above),
+  then staggered per-agent `switchroom agent restart <name> --wait
+  --force` with a `--version` assertion per agent (guards the `:latest`
+  pull-race). Deploy only from the host shell or via hostd
+  (`SWITCHROOM_HOST_HOME` invariant — `reference/rfcs/deploy-reliability.md`);
+  never via an ad-hoc container mounting the operator home.
+
 
 ## Secrets & safety rails
 
