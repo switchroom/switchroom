@@ -23362,8 +23362,9 @@ bot.command('usage', async ctx => {
         // flight; a TTL-hit or failed-probe fallback is tagged served:"cache",
         // which we surface as a "⚠ cached Nm ago" footer instead of a false
         // live stamp.
+        const renderNow = new Date()
         const probeResp = await client.probeQuota(state.accounts.map((a) => a.label)).catch(() => ({ results: [] }))
-        const { quotas } = zipProbeResults(
+        const { quotas, staleCachedAtMs } = zipProbeResults(
           state.accounts.map((a) => a.label),
           probeResp.results,
         )
@@ -23372,19 +23373,30 @@ bot.command('usage', async ctx => {
         )
         const { renderUsageCard } = await import('../quota-bar-format.js')
         const snapshots = buildSnapshotsFromState(state, quotas)
-        // /usage renders ONLY the compact quota-bar block (at-a-glance
-        // headroom + pace tick per window) — the old Format 2 table
+        // /usage renders the compact quota-bar block (at-a-glance headroom +
+        // pace tick per window) plus a two-line footer — the actionable
+        // cross-account recommendation verdict and the freshness marker (`⚠
+        // cached Nm ago` when the probe was served stale from cache, else
+        // `Live · refreshed Nm ago`). The old Format 2 table
         // (renderAuthSnapshotFormat2) is no longer appended here (operator
         // call, 2026-07-10): the two views were redundant and the table
         // doubled the message length. Every per-window reset the table
         // carried has an equivalent in the bar rows' `pct% / <time-left>`
-        // segment, just relative instead of absolute — no info lost.
+        // segment, just relative instead of absolute — no info lost; the
+        // recommendation + cached/live footer the table used to carry are
+        // preserved by renderUsageCard.
         const exhaustedByLabel = new Map<string, boolean>(
           state.accounts.map((a) => [a.label, a.exhausted]),
         )
         const text = renderUsageCard(snapshots, exhaustedByLabel, {
-          now: new Date(),
+          now: renderNow,
           demo,
+          // #2495 Change 2 — a TTL-hit / failed-probe fallback is tagged
+          // served:"cache"; surface it as `⚠ cached Nm ago` instead of a
+          // false live stamp. Otherwise stamp the live refresh time.
+          ...(staleCachedAtMs != null
+            ? { staleCachedAtMs }
+            : { liveProbedAtMs: renderNow.getTime() }),
         })
         // Preserve the Switch/Refresh/usage/Add inline keyboard on the
         // rich-message render — the table card carries the same actions the
