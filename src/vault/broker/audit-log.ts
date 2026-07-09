@@ -170,12 +170,29 @@ function resolveRotation(opts: AuditLoggerOptions): {
 
 /**
  * Rotate the audit log: `<path>.(n-1)` → `<path>.n`, dropping the oldest
- * past `maxFiles`, then `<path>` → `<path>.1`. The active path is left
- * absent so the next append re-creates an empty file; the in-process hash
- * chain is intentionally NOT reset, so the first row of the new file links
- * back to the last row of `<path>.1` and cross-file continuity holds.
- * Best-effort: any failure is reported and rotation is skipped (the
+ * past `maxFiles`, then snapshot `<path>` → `<path>.1` and truncate the
+ * active file back to zero bytes IN PLACE.
+ *
+ * Why copy-then-truncate rather than rename (issue #2953): in the deployed
+ * topology the active log is bind-mounted into the broker container as a
+ * SINGLE FILE (not its parent directory), which makes `<path>` a mount
+ * point inside the container's mount namespace. `rename(2)` cannot replace
+ * an active mount point, so `rename(<path>, <path>.1)` fails with EBUSY on
+ * every attempt and the log grows unbounded. Copying the bytes out to
+ * `<path>.1` and then `ftruncate`-ing the original to length 0 keeps the
+ * active inode/mount point in place, so it works regardless of whether the
+ * operator mounts the file or its parent directory.
+ *
+ * The active file is truncated (not deleted/recreated), so its inode, mode,
+ * and — critically — its bind mount survive. The in-process hash chain is
+ * intentionally NOT reset, so the first row appended after truncation links
+ * back to the last row now living in `<path>.1` and cross-file continuity
+ * holds. Best-effort: any failure is reported and rotation is skipped (the
  * current file keeps growing rather than losing data).
+ *
+ * NOTE: the `.1 … .maxFiles` rotated files are ordinary files created by
+ * this function inside the log's directory, so shifting them with `rename`
+ * is safe — only the active `<path>` is (potentially) a mount point.
  */
 function rotateAuditLog(logPath: string, maxFiles: number): void {
   // Delete the oldest retained file if it exists — it would fall off the
@@ -190,7 +207,8 @@ function rotateAuditLog(logPath: string, maxFiles: number): void {
       );
     }
   }
-  // Shift .(n-1) → .n for n = maxFiles down to 2.
+  // Shift .(n-1) → .n for n = maxFiles down to 2. These are ordinary files
+  // (never mount points), so rename is fine.
   for (let n = maxFiles - 1; n >= 1; n--) {
     const from = `${logPath}.${n}`;
     const to = `${logPath}.${n + 1}`;
@@ -204,12 +222,26 @@ function rotateAuditLog(logPath: string, maxFiles: number): void {
       return;
     }
   }
-  // Finally, active → .1.
+  // Finally, snapshot active → .1 by COPYING the bytes, then truncate the
+  // active file in place. Copy first: if the copy fails we leave the active
+  // file untouched (grow rather than lose rows). Only after the snapshot is
+  // safely on disk do we truncate the live file back to zero length.
   try {
-    fs.renameSync(logPath, `${logPath}.1`);
+    fs.copyFileSync(logPath, `${logPath}.1`);
   } catch (err) {
     process.stderr.write(
-      `[vault-audit] ERROR: could not rotate active audit log ${logPath}: ${(err as Error).message}\n`,
+      `[vault-audit] ERROR: could not snapshot active audit log ${logPath} → ${logPath}.1: ${(err as Error).message}\n`,
+    );
+    return;
+  }
+  try {
+    // truncate(2) resets length to 0 while preserving the inode, mode, and
+    // any bind mount at this path — unlike rename, which would fail EBUSY on
+    // a single-file bind mount (issue #2953).
+    fs.truncateSync(logPath, 0);
+  } catch (err) {
+    process.stderr.write(
+      `[vault-audit] ERROR: could not truncate active audit log ${logPath}: ${(err as Error).message}\n`,
     );
   }
 }
