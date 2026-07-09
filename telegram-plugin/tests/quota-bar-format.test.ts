@@ -12,7 +12,9 @@ import {
   formatWindowRow,
   renderQuotaBarAccount,
   renderQuotaBarBlockFromListState,
+  renderUsageCard,
 } from '../quota-bar-format.js';
+import type { AccountSnapshot } from '../auth-snapshot-format.js';
 import type { QuotaUtilization } from '../quota-check.js';
 import type { ListStateData } from '../../src/auth/broker/client.js';
 
@@ -72,6 +74,10 @@ describe('formatTimeLeft', () => {
   it('drops the hours segment when exactly on a day boundary', () => {
     expect(formatTimeLeft(new Date(NOW.getTime() + 2 * 24 * 60 * 60_000), NOW)).toBe('2d left');
   });
+  it('returns "resets now" (never "NaNm left") for an invalid reset date', () => {
+    expect(formatTimeLeft(new Date('not-a-date'), NOW)).toBe('resets now');
+    expect(formatTimeLeft(new Date(NaN), NOW)).toBe('resets now');
+  });
 });
 
 // ── elapsedFraction ──────────────────────────────────────────────────
@@ -92,6 +98,10 @@ describe('elapsedFraction', () => {
   it('is ~0.5 halfway through the window', () => {
     const frac = elapsedFraction(new Date(NOW.getTime() + fiveHourMs / 2), fiveHourMs, NOW);
     expect(frac).toBeCloseTo(0.5, 5);
+  });
+  it('is 0 (never NaN) for an invalid reset date', () => {
+    expect(elapsedFraction(new Date('not-a-date'), fiveHourMs, NOW)).toBe(0);
+    expect(elapsedFraction(new Date(NaN), fiveHourMs, NOW)).toBe(0);
   });
 });
 
@@ -120,6 +130,17 @@ describe('buildBar', () => {
     expect(bar[0]).toBe('█');
     expect(bar[1]).toBe('█');
     expect(bar).toContain('┃');
+  });
+  it('over-pace: quota fill visibly punches through past the time-elapsed tick', () => {
+    // 80% quota used, only 30% of the way through the window — burning
+    // faster than the clock. Fill (8 cells) extends past the tick
+    // (index round(0.3*9)=3), so filled cells appear on BOTH sides of the
+    // tick — that's the "punch through" signal the operator asked for.
+    const bar = buildBar(80, 0.3);
+    expect(bar).toBe('███┃████░░');
+    const tickIndex = bar.indexOf('┃');
+    const filledAfterTick = bar.slice(tickIndex + 1).includes('█');
+    expect(filledAfterTick).toBe(true); // fill visibly overtakes the pace marker
   });
 });
 
@@ -179,13 +200,32 @@ describe('renderQuotaBarAccount', () => {
     expect(lines[1]).toContain('🟢 5h');
     expect(lines[2]).toContain('🟢 7d');
   });
-  it('degrades gracefully to 0%/no-reset rows when quota is missing', () => {
+  it('renders a distinct probe-failed warning (never a healthy green 0% bar) when quota is null', () => {
+    // #2959 blocking bug: a failed probe must NOT be indistinguishable from a
+    // fresh account with full headroom (🟢 0%). It must carry a ⚠️ glyph and a
+    // "no data" label, with no green dot and no fake 0% bar.
     const lines = renderQuotaBarAccount('nobody@example.com', false, false, null, NOW);
     expect(lines).toEqual([
       '- **nobody@example.com** (idle)',
-      '- 🟢 5h `[┃░░░░░░░░░] 0% / resets now`',
-      '- 🟢 7d `[┃░░░░░░░░░] 0% / resets now`',
+      '- ⚠️ 5h `no data — probe failed`',
+      '- ⚠️ 7d `no data — probe failed`',
     ]);
+    const body = lines.join('\n');
+    expect(body).not.toContain('🟢');
+    expect(body).not.toContain('0%');
+  });
+
+  it('renders a distinct thin-probe warning (never a healthy green 0% bar) when the probe is thin', () => {
+    // A thin/headerless probe carries no real utilization — must degrade to the
+    // same ⚠️ data-quality gap, not a confident 🟢 0%.
+    const thin = quota({ fiveHourUtilPresent: false, sevenDayUtilPresent: false });
+    const lines = renderQuotaBarAccount('thin@example.com', false, false, thin, NOW);
+    expect(lines).toEqual([
+      '- **thin@example.com** (idle)',
+      '- ⚠️ 5h `no data — thin probe`',
+      '- ⚠️ 7d `no data — thin probe`',
+    ]);
+    expect(lines.join('\n')).not.toContain('🟢');
   });
 });
 
@@ -239,5 +279,144 @@ describe('renderQuotaBarBlockFromListState', () => {
       '- 🟢 5h `[┃░░░░░░░░░] 0% / resets now`',
       '- 🔴 7d `[██████┃███] 100% / 2d16h left`',
     ]);
+  });
+});
+
+// ── renderUsageCard (bar block only — /usage no longer appends the ─────
+// Format 2 table underneath; see gateway.ts's `bot.command('usage', ...)`)
+
+describe('renderUsageCard', () => {
+  function snap(part: Partial<AccountSnapshot> & { label: string }): AccountSnapshot {
+    return {
+      isActive: false,
+      quota: null,
+      ...part,
+    };
+  }
+
+  const snapshots: AccountSnapshot[] = [
+    snap({
+      label: 'ken@example.com',
+      isActive: true,
+      quota: quota({
+        fiveHourUtilizationPct: 0,
+        sevenDayUtilizationPct: 47,
+        fiveHourResetAt: new Date(NOW.getTime() + 60 * 60_000),
+        sevenDayResetAt: new Date(NOW.getTime() + (3 * 24 + 1) * 60 * 60_000),
+      }),
+    }),
+  ];
+  const exhausted = new Map<string, boolean>([['ken@example.com', false]]);
+
+  it('renders the quota-bar block plus a recommendation + freshness footer — no Format 2 table', () => {
+    const out = renderUsageCard(snapshots, exhausted, { now: NOW });
+    const lines = out.split('\n');
+    // Bar block — account title + two window rows with the ASCII bar.
+    expect(lines[0]).toBe('- **ken@example.com** (active)');
+    expect(out).toContain('- 🟢 5h `[');
+    expect(out).toContain('- 🟢 7d `[');
+    // Reset info is carried by the bar rows themselves (relative
+    // time-left), not a separate table.
+    expect(out).toContain('1h0m left');
+    expect(out).toContain('left');
+    // The old Format 2 TABLE must be fully gone from this card.
+    expect(out).not.toContain('🔋 **Auth — fleet status**');
+    expect(out).not.toContain('| State | Account | 5h | 5h resets | 7d | 7d resets |');
+    // ...but the actionable recommendation footer is RESTORED (#2959 review).
+    expect(out).toContain('Recommendation: stay on ken@example.com.');
+    // Freshness marker present (no stamp supplied → bare "Live").
+    expect(lines[lines.length - 1]).toBe('_Live_');
+    // 3 bar lines + recommendation + freshness = 5.
+    expect(lines).toHaveLength(5);
+  });
+
+  it('restores the "switch now" recommendation footer for a BLOCKED active account', () => {
+    // Matches the old renderAuthSnapshotFormat2 / recommendation() logic: an
+    // active account maxed on a window, with a healthy alternative, yields the
+    // most actionable line — "switch to Y now".
+    const blocked: AccountSnapshot[] = [
+      snap({
+        label: 'active@example.com',
+        isActive: true,
+        quota: quota({ fiveHourUtilizationPct: 100, sevenDayUtilizationPct: 100 }),
+      }),
+      snap({
+        label: 'healthy@example.com',
+        isActive: false,
+        quota: quota({ fiveHourUtilizationPct: 5, sevenDayUtilizationPct: 10 }),
+      }),
+    ];
+    const ex = new Map<string, boolean>([
+      ['active@example.com', true],
+      ['healthy@example.com', false],
+    ]);
+    const out = renderUsageCard(blocked, ex, { now: NOW });
+    expect(out).toContain(
+      '_Recommendation: active active@example.com is BLOCKED — switch to healthy@example.com now._',
+    );
+  });
+
+  it('shows a "⚠ cached Nm ago" marker for stale-cache-served data instead of a live stamp', () => {
+    const out = renderUsageCard(snapshots, exhausted, {
+      now: NOW,
+      staleCachedAtMs: NOW.getTime() - 3 * 60_000,
+    });
+    const lines = out.split('\n');
+    expect(lines[lines.length - 1]).toBe('_⚠ cached 3m ago_');
+    expect(out).not.toContain('_Live');
+  });
+
+  it('shows a "Live · refreshed" stamp when the probe was live', () => {
+    const out = renderUsageCard(snapshots, exhausted, {
+      now: NOW,
+      liveProbedAtMs: NOW.getTime() - 5_000,
+    });
+    const lines = out.split('\n');
+    expect(lines[lines.length - 1]).toBe('_Live · refreshed 5s ago_');
+    expect(out).not.toContain('cached');
+  });
+
+  it('stale-cache marker takes precedence over a live stamp when both are supplied', () => {
+    const out = renderUsageCard(snapshots, exhausted, {
+      now: NOW,
+      staleCachedAtMs: NOW.getTime() - 60_000,
+      liveProbedAtMs: NOW.getTime(),
+    });
+    expect(out.split('\n').pop()).toBe('_⚠ cached 1m ago_');
+  });
+
+  it('handles an invalid/NaN reset date without emitting "NaN" or corrupting the bar', () => {
+    const bad: AccountSnapshot[] = [
+      snap({
+        label: 'ken@example.com',
+        isActive: true,
+        quota: quota({
+          fiveHourUtilizationPct: 10,
+          sevenDayUtilizationPct: 20,
+          fiveHourResetAt: new Date('not-a-date'),
+          sevenDayResetAt: new Date(NaN),
+        }),
+      }),
+    ];
+    const out = renderUsageCard(bad, exhausted, { now: NOW });
+    expect(out).not.toContain('NaN');
+    // Malformed reset → treated as "resets now", tick at index 0.
+    expect(out).toContain('/ resets now`');
+    for (const line of out.split('\n')) {
+      const m = line.match(/\[(.+?)\]/);
+      if (m) expect(m[1].length).toBe(10); // bar stays exactly 10 cells
+    }
+  });
+
+  it('masks the account-email label in demo mode', () => {
+    const out = renderUsageCard(snapshots, exhausted, { now: NOW, demo: true });
+    expect(out).not.toContain('ken@example.com');
+    // Bar rows are unaffected; only the title-line label is masked.
+    expect(out).toContain('5h `[');
+  });
+
+  it('does not mask the label when demo is omitted', () => {
+    const out = renderUsageCard(snapshots, exhausted, { now: NOW });
+    expect(out).toContain('- **ken@example.com** (active)');
   });
 });
