@@ -39,13 +39,9 @@
 import type { QuotaUtilization } from './quota-check.js';
 import { refillNormalizedUtils, isProbeThin } from '../src/auth/quota.js';
 import type { AccountState, ListStateData } from '../src/auth/broker/client.js';
-import {
-  reviveLastQuota,
-  renderAuthSnapshotFormat2,
-  type AccountSnapshot,
-  type SnapshotRenderOpts,
-} from './auth-snapshot-format.js';
+import { reviveLastQuota, type AccountSnapshot } from './auth-snapshot-format.js';
 import { escapeMarkdown } from './card-format.js';
+import { maskEmail } from './demo-mask.js';
 
 // ── dot thresholds ───────────────────────────────────────────────────
 
@@ -186,6 +182,7 @@ export function renderQuotaBarAccount(
   exhausted: boolean,
   quota: QuotaUtilization | null,
   now: Date = new Date(),
+  demo = false,
 ): string[] {
   const status = accountStatus(isActive, exhausted);
   // Title line wraps `label` in GFM `**bold**`, NOT a code span — so this
@@ -194,7 +191,8 @@ export function renderQuotaBarAccount(
   // inside literal `code spans` — see format.ts). Using codeSpanSafe here
   // was a bug: a label containing e.g. `**` or `[x](url)` would break the
   // bold run or inject a markdown link into the card.
-  const lines: string[] = [`- **${escapeMarkdown(label)}** (${status})`];
+  const displayLabel = demo ? maskEmail(label) : label;
+  const lines: string[] = [`- **${escapeMarkdown(displayLabel)}** (${status})`];
   if (!quota || isProbeThin(quota)) {
     // Data-quality gap: still emit the two rows so the block stays
     // shape-stable, but at 0%/unknown-reset rather than fabricating numbers.
@@ -210,6 +208,8 @@ export function renderQuotaBarAccount(
 
 export interface QuotaBarRenderOpts {
   now?: Date;
+  /** Demo mode (the `/usage demo` suffix) — masks account-email labels. */
+  demo?: boolean;
 }
 
 /**
@@ -227,10 +227,13 @@ export function renderQuotaBarBlock(
   opts: QuotaBarRenderOpts = {},
 ): string {
   const now = opts.now ?? new Date();
+  const demo = opts.demo ?? false;
   const lines: string[] = [];
   for (const snap of snapshots) {
     const exhausted = exhaustedByLabel.get(snap.label) ?? false;
-    lines.push(...renderQuotaBarAccount(snap.label, snap.isActive, exhausted, snap.quota, now));
+    lines.push(
+      ...renderQuotaBarAccount(snap.label, snap.isActive, exhausted, snap.quota, now, demo),
+    );
   }
   return lines.join('\n');
 }
@@ -262,26 +265,22 @@ export function renderQuotaBarBlockFromListState(
 }
 
 /**
- * The live `/usage` card: the compact quota-bar block on top (at-a-glance
- * headroom + pace tick per window), followed by the full Format 2
- * health-grouped table below.
- *
- * The bar block answers "how much headroom / how far through the reset
- * window" at a glance; the table underneath preserves the per-window
- * absolute reset times/dates (the #2889 reset columns) and the
- * recommendation footer — the bar rows only carry a compact relative
- * "time-left", so appending the table keeps that information from being
- * lost. `opts` (tz / now / liveProbedAtMs / staleCachedAtMs / demo) is
- * forwarded to the Format 2 renderer unchanged; the same `now` is shared
- * with the bar block so the two halves can't disagree on the clock.
+ * The live `/usage` card — the compact quota-bar block, and ONLY the bar
+ * block. `/usage` used to append the full Format 2 health-grouped table
+ * (`renderAuthSnapshotFormat2`) underneath; the operator asked for the bar
+ * card alone (2026-07-10) since the two views were redundant and the table
+ * doubled the message length. Every field the table carried per-account
+ * (5h/7d utilization + reset) has an equivalent in the bar rows — the `pct%
+ * / <time-left>` segment of each window row is the reset info, just
+ * relative instead of absolute. `opts.now` is shared with the bar block;
+ * `opts.demo` masks account-email labels in the title line the same way the
+ * table used to.
  */
 export function renderUsageCard(
   snapshots: AccountSnapshot[],
   exhaustedByLabel: ReadonlyMap<string, boolean>,
-  opts: SnapshotRenderOpts = {},
+  opts: QuotaBarRenderOpts = {},
 ): string {
   const now = opts.now ?? new Date();
-  const bar = renderQuotaBarBlock(snapshots, exhaustedByLabel, { now });
-  const table = renderAuthSnapshotFormat2(snapshots, { ...opts, now });
-  return `${bar}\n\n${table}`;
+  return renderQuotaBarBlock(snapshots, exhaustedByLabel, { now, demo: opts.demo });
 }

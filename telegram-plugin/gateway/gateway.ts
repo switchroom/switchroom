@@ -23363,7 +23363,7 @@ bot.command('usage', async ctx => {
         // which we surface as a "⚠ cached Nm ago" footer instead of a false
         // live stamp.
         const probeResp = await client.probeQuota(state.accounts.map((a) => a.label)).catch(() => ({ results: [] }))
-        const { quotas, staleCachedAtMs } = zipProbeResults(
+        const { quotas } = zipProbeResults(
           state.accounts.map((a) => a.label),
           probeResp.results,
         )
@@ -23371,19 +23371,20 @@ bot.command('usage', async ctx => {
           '../auth-snapshot-format.js'
         )
         const { renderUsageCard } = await import('../quota-bar-format.js')
-        const tz = process.env.SWITCHROOM_TIMEZONE ?? process.env.TZ ?? 'UTC'
         const snapshots = buildSnapshotsFromState(state, quotas)
-        // Compact quota-bar block on top (at-a-glance headroom + pace tick),
-        // Format 2 table below (preserves the per-window absolute reset
-        // times/dates + recommendation footer — no info lost).
+        // /usage renders ONLY the compact quota-bar block (at-a-glance
+        // headroom + pace tick per window) — the old Format 2 table
+        // (renderAuthSnapshotFormat2) is no longer appended here (operator
+        // call, 2026-07-10): the two views were redundant and the table
+        // doubled the message length. Every per-window reset the table
+        // carried has an equivalent in the bar rows' `pct% / <time-left>`
+        // segment, just relative instead of absolute — no info lost.
         const exhaustedByLabel = new Map<string, boolean>(
           state.accounts.map((a) => [a.label, a.exhausted]),
         )
         const text = renderUsageCard(snapshots, exhaustedByLabel, {
-          tz,
           now: new Date(),
           demo,
-          ...(staleCachedAtMs != null ? { staleCachedAtMs } : { liveProbedAtMs: Date.now() }),
         })
         // Preserve the Switch/Refresh/usage/Add inline keyboard on the
         // rich-message render — the table card carries the same actions the
