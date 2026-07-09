@@ -213,11 +213,30 @@ describe('scanTurnForFinalReply — trailing undelivered content after an early 
     expect(r.turnKey).toBe('111:_')
   })
 
-  it('early qualifying reply + trailing short (but non-empty) undelivered text → block (no minimum-length carve-out)', () => {
+  it('early qualifying reply + trailing SHORT pleasantry → allow (#2956 review: substance floor, no-spam)', () => {
+    // A short trailing text after a delivered reply (a closer like "let me
+    // know if you need anything else.") is NOT a dropped answer — it's a
+    // pleasantry the persona prompts discourage but which must not burn
+    // retry budget or force a redundant second reply. Only SUBSTANTIVE
+    // trailing text (≥ FINAL_ANSWER_MIN_CHARS) blocks. Pre-fix this
+    // false-positive blocked and re-prompted a healthy turn.
     const text = jsonl(
       ENQUEUE,
       assistantToolUse('mcp__switchroom-telegram__reply', { text: 'ok', disable_notification: false }),
       assistantText('actually, one more thing you should know'),
+    )
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('allow')
+  })
+
+it('early qualifying reply + trailing SUBSTANTIVE undelivered text (≥ floor) → block (at-least-once holds)', () => {
+    // The substance floor must NOT weaken the at-least-once guarantee for
+    // a real dropped answer: a long trailing verdict the model forgot to
+    // send still blocks. The trailing text here clears FINAL_ANSWER_MIN_CHARS.
+    const text = jsonl(
+      ENQUEUE,
+      assistantToolUse('mcp__switchroom-telegram__reply', { text: 'ok', disable_notification: false }),
+      assistantText('Here is the actual verdict after investigation: ' + 'X'.repeat(200)),
     )
     const r = scanTurnForFinalReply(text)
     expect(r.decided).toBe('block')
