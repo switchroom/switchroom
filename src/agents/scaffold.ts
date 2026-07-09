@@ -596,7 +596,7 @@ export function maybeWriteCronMcp(
   seedCronConfigDir(agentDir, Object.keys(cronServers));
   return path;
 }
-import { resolveUsers } from "../config/users.js";
+import { resolveUsers, resolvePersonEntries } from "../config/users.js";
 import {
   resolveAgentConfig,
   translateHooksToClaudeShape,
@@ -4363,6 +4363,18 @@ export function scaffoldAgent(
     telegramConfig,
   );
 
+  // --- Telegram people.json (person_id name resolution) ---
+  // Config-derived only (no runtime state to preserve, unlike access.json)
+  // — regenerate on every scaffold/reconcile so a `users:` edit is picked
+  // up. The running gateway itself only reads this file ONCE at boot
+  // (no hot-reload — docs/configuration.md); a config change here needs an
+  // agent restart to take effect.
+  writeFileSyncIfChanged(
+    join(agentDir, "telegram", "people.json"),
+    buildPeopleJson(switchroomConfig),
+    0o600,
+  );
+
   // --- Sub-agent definitions (.claude/agents/<name>.md) ---
   //
   // Render each sub-agent from the merged `subagents:` config into a
@@ -6913,6 +6925,28 @@ export function reconcileConfiguredGroup(
       `(responds to all topics; requireMention=false)`,
     ),
   );
+}
+
+/**
+ * `telegram/people.json` — a plain, config-derived projection of `users:`
+ * entries that carry a `person_id` (docs/configuration.md). Deliberately a
+ * SIBLING file to `access.json`, never merged into it: `access.json` is the
+ * fail-CLOSED access-control allowlist (a different concern, gateway-owned
+ * at runtime, written `writeIfMissing`); this file is fail-OPEN display
+ * data only, purely derived from static config, so it's regenerated every
+ * time `scaffoldAgent` runs (the `switchroom apply` reconcile path calls
+ * `scaffoldAgent` idempotently for every configured agent) via
+ * `writeFileSyncIfChanged` (not `writeIfMissing`) — there's no runtime
+ * state here to preserve.
+ *
+ * All semantic validation (dedup, dropping malformed entries, the
+ * fleet-alert on a dropped entry) happens gateway-side at boot
+ * (`telegram-plugin/gateway/resolve-person.ts`), not here — this is a dumb
+ * projection only.
+ */
+function buildPeopleJson(switchroomConfig: SwitchroomConfig | undefined): string {
+  const entries = switchroomConfig ? resolvePersonEntries(switchroomConfig) : [];
+  return JSON.stringify({ entries }, null, 2) + "\n";
 }
 
 function buildAccessJson(

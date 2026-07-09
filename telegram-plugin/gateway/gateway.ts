@@ -185,6 +185,12 @@ import {
 import { clearStaleTelegramPollingState } from '../startup-reset.js'
 import { gatewayStartupRetry } from './startup-network-retry.js'
 import { writeQuarantineMarker } from './quarantine.js'
+import {
+  runPersonDirectoryBootCheck,
+  safeResolvePersonName,
+  type PersonDirectory,
+  type RawPersonEntry,
+} from './resolve-person.js'
 // RFC H §7.3: auth-dashboard + auth-slot-parser deleted. Three chat
 // verbs (/auth show | use | rotate) talk to switchroom-auth-broker
 // via the thin client in src/auth/broker/client.ts.
@@ -721,6 +727,12 @@ const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
+// person_id name resolution (docs/configuration.md). Sibling to
+// access.json but a COMPLETELY SEPARATE, purely config-derived file —
+// scaffold regenerates it on every reconcile via writeFileSyncIfChanged,
+// the gateway never mutates it, and (unlike access.json) it is read
+// exactly ONCE at boot into PERSON_DIRECTORY below — no hot-reload.
+const PEOPLE_FILE = join(STATE_DIR, 'people.json')
 
 /**
  * Trigger a restart of the agent + gateway pair.
@@ -1223,6 +1235,33 @@ const BOOT_ACCESS: Access | null = STATIC
 function loadAccess(): Access {
   return BOOT_ACCESS ?? readAccessFile()
 }
+
+/**
+ * Read `people.json` (the scaffold's plain projection of `users:` entries
+ * that carry a `person_id`). Fail-open: ENOENT or corrupt/malformed JSON
+ * returns an empty array rather than throwing — this feature must never
+ * block startup. Unlike `access.json` this file is never gateway-mutated,
+ * so there's no "move corrupt file aside" concern; the scaffold owns and
+ * regenerates it on every reconcile.
+ */
+function readPeopleFile(): RawPersonEntry[] {
+  try {
+    const raw = readFileSync(PEOPLE_FILE, 'utf8')
+    const parsed = JSON.parse(raw) as { entries?: unknown }
+    if (!Array.isArray(parsed.entries)) return []
+    return parsed.entries as RawPersonEntry[]
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Boot-time-only person-name directory (see resolve-person.ts module doc).
+ * Populated exactly once by the boot-validation block in the startup IIFE
+ * below, then never reassigned or re-read from disk again for the life of
+ * this process — a config change requires an agent restart.
+ */
+let PERSON_DIRECTORY: PersonDirectory = { byTelegramKey: {} }
 
 function assertAllowedChat(chat_id: string | number): void {
   const id = String(chat_id)
@@ -16650,12 +16689,28 @@ async function handleInbound(
     TOPIC_FRAMING_ENABLED && messageThreadId != null
       ? 'This message belongs to the current topic only — answer ONLY this question, in this topic. Do not also answer a pending message from another topic.'
       : undefined
+  // person_id name resolution (docs/configuration.md, resolve-person.ts):
+  // chat-scoped, boot-time-static lookup — falls back to today's raw
+  // id/username behavior (fail-open) whenever unresolved or when group
+  // membership can't be positively confirmed from access.json's allowFrom.
+  // Never touches access.json itself and never blocks/denies anything.
+  const rawUser = from.username ?? String(from.id)
+  const displayUser = safeResolvePersonName(
+    PERSON_DIRECTORY,
+    {
+      telegramId: String(from.id),
+      username: from.username,
+      isDm: isDmChatId(chat_id),
+      groupAllowFrom: access.groups[chat_id]?.allowFrom,
+    },
+    rawUser,
+  )
   const inboundMsg: InboundMessage = {
     type: 'inbound',
     chatId: chat_id,
     ...(messageThreadId != null ? { threadId: messageThreadId } : {}),
     messageId: msgId ?? 0,
-    user: from.username ?? String(from.id),
+    user: displayUser,
     userId: from.id,
     ts: ctx.message?.date ?? Math.floor(Date.now() / 1000),
     text: effectiveText,
@@ -16670,7 +16725,7 @@ async function handleInbound(
     meta: {
       chat_id,
       ...(msgId != null ? { message_id: String(msgId) } : {}),
-      user: from.username ?? String(from.id),
+      user: displayUser,
       user_id: String(from.id),
       ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
       ...(messageThreadId != null ? { message_thread_id: String(messageThreadId) } : {}),
@@ -26380,6 +26435,32 @@ void (async () => {
 
       if (!didOneTimeSetup) {
         didOneTimeSetup = true
+
+        // person_id name resolution (docs/configuration.md, resolve-person.ts):
+        // ONE-TIME boot validation, NOT periodic. `PERSON_DIRECTORY` is
+        // built exactly once, here, from the static in-memory `people.json`
+        // the scaffold projected from `switchroom.yaml`'s `users:` block —
+        // a config change requires an agent restart, this never re-reads.
+        // The orchestration (per-entry validation + dead-man's-switch) is
+        // in the pure, unit-tested `runPersonDirectoryBootCheck` — this
+        // block only performs the resulting I/O (stderr log + the EXISTING
+        // fleet-alert path at low/config severity, kind: 'config-warning',
+        // which must never page like a real outage).
+        {
+          const bootCheck = runPersonDirectoryBootCheck(readPeopleFile)
+          PERSON_DIRECTORY = bootCheck.directory
+          process.stderr.write(bootCheck.logLine + '\n')
+          if (bootCheck.alertDetail != null) {
+            emitGatewayOperatorEvent({
+              kind: 'config-warning',
+              agent: process.env.SWITCHROOM_AGENT_NAME ?? '-',
+              detail: bootCheck.alertDetail,
+              suggestedActions: [],
+              firstSeenAt: new Date(),
+            })
+          }
+        }
+
         void registerSwitchroomBotCommands().catch(() => {})
 
         // #613 fix: pre-warm the chatAvailableReactions cache for every

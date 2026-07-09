@@ -58,6 +58,45 @@ SessionStart-hook idle-reaping, and background agents stuck as failed/completed
 after a `SendMessage` resume. The `default`→`Manual` mode rename (2.1.200) is
 backward-compatible; emitted `settings.json` values are unaffected.
 
+### Greet by name — Telegram user id resolution via `users.<key>.person_id`
+
+Inbound Telegram messages only ever carried the sender's raw numeric id/username,
+so an agent couldn't greet a known person by name without hard-coding an id
+somewhere. Adds an optional `person_id` field on `users:` entries
+(`lisa: { telegram_ids: [...], profile_bank: ..., person_id: "Lisa" }`); when
+set, the `<channel>` tag's `user` attribute shows the display name instead of
+the raw id/username (`meta.user_id` is unchanged — still the raw numeric id).
+
+Design constraints, by intent:
+
+- **Not a tool** — never exposed to agents as a callable MCP tool, purely a
+  passive `<channel>` attribute.
+- **Not hot-reloaded** — the gateway's name-resolution table is built once at
+  boot from the config as scaffolded; editing `person_id` requires an agent
+  restart to take effect.
+- **Fail-open, and completely separate from `access.json`** — `access.json` is
+  the fail-**closed** allow-list deciding whether an agent responds at all; this
+  feature never touches it. An id that doesn't resolve just falls back to
+  today's raw-id behavior, never blocking or denying anything.
+- **Chat-scoped** — a resolved name is only shown in a chat/group the person is
+  confirmed to be a member of (via that chat's `access.json` `allowFrom`); an
+  unrestricted/empty `allowFrom` means membership can't be confirmed, so the
+  raw id/username shows instead. A DM always resolves (the chat IS the sender).
+  Prevents a name that's fine to show 1:1 from leaking into every group the
+  agent sits in.
+- **Per-entry, boot-time-only validation** — a malformed `users:` entry (empty
+  `person_id`, no `telegram_ids`, or a `person_id` collision) drops only that
+  one entry (not fleet-wide) and posts a low-severity "config warning" operator
+  alert (reuses the existing fleet-alert channel, tagged so it never pages like
+  a real outage) naming the entry and why. The check itself is dead-man's-switch
+  protected — if it crashes, that's alerted too, with name resolution disabled
+  (fail-open) for that boot rather than failing silently.
+- **Accepted soft mitigation** — there's no automated enforcement that a
+  `person_id` stays safe if a group's membership changes after the entry is
+  written; documented as an operator-discipline convention in
+  `docs/configuration.md`, accepted at today's fleet-wide scale (two
+  configured users) rather than a closed gap.
+
 ### Operator-configurable Hindsight auto-retain cadence (default 3 / 1) (#2950)
 
 The plugin's auto-retain cadence (`retainEveryNTurns` / `retainOverlapTurns`)

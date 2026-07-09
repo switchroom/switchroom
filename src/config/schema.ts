@@ -3574,6 +3574,23 @@ export const UserSchema = z.object({
       "Hindsight bank holding this user's memory profile (author via " +
       "`switchroom memory profile add <bank> ...`).",
     ),
+  person_id: z
+    .string()
+    .optional()
+    .describe(
+      "Free-text display name projected into the inbound `<channel>` " +
+      "tag's `user` attribute (e.g. \"Lisa\") so an agent can greet by " +
+      "name instead of only seeing the raw Telegram id/username. NOT a " +
+      "stable identity system — just a label. Resolution is boot-time-only " +
+      "(no hot-reload; a config change needs an agent restart) and " +
+      "chat-scoped (a resolved name is only shown in a chat/group the " +
+      "person is actually a member of, per that chat's access.json " +
+      "membership — never broadcast into every chat the agent operates " +
+      "in). Keep this broadly safe to show, the same discipline as " +
+      "picking a `profile_bank` name: there is no automated enforcement " +
+      "that a `person_id` stays safe if a group's membership changes " +
+      "later — see docs/configuration.md.",
+    ),
 });
 export type User = z.infer<typeof UserSchema>;
 

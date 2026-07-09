@@ -72,3 +72,35 @@ export function resolveUsers(
 
   return { senderBanks, additionalBanks };
 }
+
+/**
+ * Raw projection of `users:` entries that carry a `person_id` (see
+ * `UserSchema.person_id` in schema.ts). This is a DUMB projection only — no
+ * dedup, no shape validation beyond what the schema already enforces, no
+ * dropping of malformed entries. That semantic validation happens
+ * gateway-side (`telegram-plugin/gateway/resolve-person.ts`'s
+ * `buildPersonDirectory`) at agent boot, because only the gateway process
+ * can reach the fleet-alert path used to surface a dropped entry.
+ *
+ * Scaffolded into each agent's `telegram/people.json` (a plain
+ * config-derived projection, regenerated on every scaffold/reconcile via
+ * `writeFileSyncIfChanged` — unlike `access.json`, this file is never
+ * mutated by the running gateway, so there's no "boot merge" step to
+ * preserve).
+ */
+export interface RawPersonEntry {
+  /** The `users:` map key (e.g. "lisa") — used only for alert messages. */
+  key: string;
+  person_id: string;
+  telegram_ids: string[];
+}
+
+export function resolvePersonEntries(config: SwitchroomConfig): RawPersonEntry[] {
+  const users = config.users ?? {};
+  const entries: RawPersonEntry[] = [];
+  for (const [key, u] of Object.entries(users)) {
+    if (!u.person_id) continue;
+    entries.push({ key, person_id: u.person_id, telegram_ids: u.telegram_ids });
+  }
+  return entries;
+}
