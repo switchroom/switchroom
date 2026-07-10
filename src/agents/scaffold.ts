@@ -3074,6 +3074,11 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     resumeMode: agentConfig.session_continuity?.resume_mode ?? "handoff",
     resumeMaxBytes:
       agentConfig.session_continuity?.resume_max_bytes ?? 2_000_000,
+    // Boot-resume policy for in-flight-turn recovery across restarts
+    // (session_continuity.boot_resume; default 'in-flight'). Threaded to the
+    // gateway process as SWITCHROOM_BOOT_RESUME (exported before the gateway
+    // fork in start.sh — the gateway reads it at boot-resume time).
+    bootResumeMode: agentConfig.session_continuity?.boot_resume ?? "in-flight",
     // True only when the generated start.sh can actually set CONTINUE_FLAG="--continue"
     // at runtime (i.e. resume_mode is 'auto' or 'continue'). In handoff/none mode the
     // case branches for auto/continue are omitted entirely so the literal string
@@ -5904,6 +5909,10 @@ export function reconcileAgent(
       resumeMode: agentConfig.session_continuity?.resume_mode ?? "handoff",
       resumeMaxBytes:
         agentConfig.session_continuity?.resume_max_bytes ?? 2_000_000,
+      // Boot-resume policy (session_continuity.boot_resume; default
+      // 'in-flight'). Threaded to the gateway as SWITCHROOM_BOOT_RESUME.
+      // Mirror of buildWorkspaceContext — reconcile must keep parity.
+      bootResumeMode: agentConfig.session_continuity?.boot_resume ?? "in-flight",
     };
     const beforeStartSh = existsSync(startShPath)
       ? readFileSync(startShPath, "utf-8")

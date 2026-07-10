@@ -183,43 +183,91 @@ export function resolveShutdownMarker(
 }
 
 /**
+ * Boot-resume policy, from `session_continuity.boot_resume`
+ * (SWITCHROOM_BOOT_RESUME env). Governs whether a clean/deliberate
+ * shutdown suppresses auto-resume of a genuinely in-flight turn:
+ *
+ *   - 'always'   — always resume interrupted work, even after a clean
+ *                  shutdown (equivalent to SWITCHROOM_BOOT_RESUME_ALWAYS=1).
+ *   - 'in-flight' — (DEFAULT) resume work that was genuinely in flight at
+ *                  shutdown, even after a deliberate/operator restart. This
+ *                  is the whole point: a sanctioned restart that lands mid-
+ *                  turn must not silently drop the work. The boot-resume
+ *                  block only runs when a pending interrupted turn exists —
+ *                  i.e. when there IS in-flight work — so in this mode the
+ *                  clean-shutdown gate never swallows real work.
+ *   - 'never'    — the #2585 quota-saving posture: suppress AUTO-resume on a
+ *                  fresh clean shutdown. NOTE the caller still delivers a
+ *                  passive REPORT inbound in this case (silence is never
+ *                  acceptable when work was in flight); this flag only
+ *                  downgrades an active resume to a passive notice.
+ */
+export type BootResumeMode = 'always' | 'in-flight' | 'never';
+
+/** The product default (2026-07): resume genuinely in-flight work even
+ *  after a deliberate restart. Restores the pre-#2585 recovery of real
+ *  work while keeping #2585's "don't replay abandoned work" intent for the
+ *  no-in-flight-turn case (which is a no-op — the boot block never runs
+ *  without a pending turn). */
+export const DEFAULT_BOOT_RESUME_MODE: BootResumeMode = 'in-flight';
+
+/**
+ * Parse the SWITCHROOM_BOOT_RESUME env value into a BootResumeMode. Unknown
+ * / empty / undefined falls back to the default ('in-flight'). Case- and
+ * separator-insensitive ("in_flight", "inflight", "IN-FLIGHT" all map to
+ * 'in-flight') so a config typo degrades to the safe default rather than a
+ * silent misparse.
+ */
+export function parseBootResumeMode(raw: string | undefined | null): BootResumeMode {
+  if (typeof raw !== 'string') return DEFAULT_BOOT_RESUME_MODE;
+  const norm = raw.trim().toLowerCase().replace(/[_\s]+/g, '-');
+  if (norm === 'always') return 'always';
+  if (norm === 'never') return 'never';
+  if (norm === 'in-flight' || norm === 'inflight') return 'in-flight';
+  return DEFAULT_BOOT_RESUME_MODE;
+}
+
+/**
  * Pure decision: should the boot-resume path SUPPRESS the active
  * resume_interrupted inbound because the prior shutdown was clean?
  *
- * A clean marker present and fresh (<= maxAgeMs, default 60s) means the
- * prior shutdown was operator/roll/CLI-initiated — NOT a crash. In that
- * case auto-resuming interrupted work is wasteful: the agent was asked to
- * stop, it stopped cleanly, and the "interrupted" turn was implicitly
- * abandoned by that decision. Burning a full model turn to replay it on
- * every operator restart wastes subscription quota for no user benefit.
+ * This block is only ever consulted when a pending INTERRUPTED turn
+ * exists — i.e. there IS genuinely in-flight work to recover. The product
+ * decision (2026-07, superseding #2585) is that a deliberate restart must
+ * NOT silently drop that work, so the DEFAULT mode ('in-flight') never
+ * suppresses. #2585's quota-saving posture survives only as the opt-in
+ * 'never' mode — and even then the caller downgrades to a passive REPORT
+ * rather than going silent.
  *
- * Returns true ONLY when:
+ * Returns true (suppress the ACTIVE resume) ONLY when:
+ *   - mode === 'never', AND
  *   - a clean marker is present, AND
  *   - the marker is younger than maxAgeMs (default 60s), AND
- *   - the SWITCHROOM_BOOT_RESUME_ALWAYS escape hatch is not set.
+ *   - neither forceAlways nor mode 'always' is set.
  *
- * Returns false when:
- *   - no marker (crash / OOM / unexpected kill — resume normally), OR
- *   - marker is stale (>= maxAgeMs — something stalled; treat as crash), OR
- *   - forceAlways is true (the escape hatch is active).
+ * Returns false (resume normally) when:
+ *   - mode is 'always' or 'in-flight' (the default), OR
+ *   - forceAlways is true (SWITCHROOM_BOOT_RESUME_ALWAYS=1 escape hatch), OR
+ *   - no marker (crash / OOM / unexpected kill), OR
+ *   - marker is stale (>= maxAgeMs — clean shutdown that stalled mid-drain;
+ *     preserves the ">60s slow-rollout already resumes" behaviour).
  *
- * The forceAlways parameter maps to the env var
- * SWITCHROOM_BOOT_RESUME_ALWAYS=1, which restores the pre-gate behaviour
- * unconditionally. Pass it in as a parsed boolean so this function stays
- * pure and testable without touching process.env.
- *
- * Keeping this pure makes the decision unit-testable in bun test without
- * spinning up the gateway.
+ * forceAlways maps to SWITCHROOM_BOOT_RESUME_ALWAYS=1 and is preserved for
+ * back-compat: it forces resume regardless of mode. Passed in as a parsed
+ * boolean + mode so this function stays pure and testable.
  */
 export function shouldSuppressBootResume(
   marker: CleanShutdownMarker | null,
   now: number,
-  { maxAgeMs = DEFAULT_MAX_AGE_MS, forceAlways = false }: {
+  { maxAgeMs = DEFAULT_MAX_AGE_MS, forceAlways = false, mode = DEFAULT_BOOT_RESUME_MODE }: {
     maxAgeMs?: number;
     forceAlways?: boolean;
+    mode?: BootResumeMode;
   } = {},
 ): boolean {
   if (forceAlways) return false;
+  if (mode === 'always' || mode === 'in-flight') return false;
+  // mode === 'never': the legacy #2585 clean-shutdown gate.
   if (marker === null) return false;
   const age = now - marker.ts;
   if (age < 0) return false; // clock skew defence — treat as stale

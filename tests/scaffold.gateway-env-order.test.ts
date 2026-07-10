@@ -94,6 +94,22 @@ describe("start.sh: gateway-consumed env exported before the gateway fork", () =
     expect(nameIdx).toBeLessThan(forkIdx);
   });
 
+  it("hoists SWITCHROOM_BOOT_RESUME AHEAD of the gateway fork so the boot-resume policy reaches the daemon", () => {
+    const startSh = renderStartSh();
+    const forkIdx = startSh.indexOf(GATEWAY_FORK);
+    expect(forkIdx).toBeGreaterThan(-1);
+
+    const bootResumeIdx = startSh.indexOf("export SWITCHROOM_BOOT_RESUME=");
+    expect(bootResumeIdx).toBeGreaterThan(-1);
+    // The gateway reads SWITCHROOM_BOOT_RESUME at boot-resume time; if it were
+    // exported only after the fork (like SWITCHROOM_RESUME_MODE, which drives
+    // the inner claude --continue path), the daemon would never see it and
+    // every agent would silently default.
+    expect(bootResumeIdx).toBeLessThan(forkIdx);
+    // Default value when session_continuity.boot_resume is unset.
+    expect(startSh).toContain('export SWITCHROOM_BOOT_RESUME="in-flight"');
+  });
+
   it("still re-exports the same vars in the inner pass (after the fork) for claude", () => {
     const startSh = renderStartSh();
     const forkIdx = startSh.indexOf(GATEWAY_FORK);

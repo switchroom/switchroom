@@ -846,6 +846,22 @@ export const SessionContinuitySchema = z
         "can blow out the context window even with prefix caching, and " +
         "--continue replay is known-fragile at scale.",
       ),
+    boot_resume: z
+      .enum(["always", "in-flight", "never"])
+      .optional()
+      .describe(
+        "How the gateway auto-resumes a turn that was IN FLIGHT when the " +
+        "agent restarted. 'in-flight' (default) resumes genuinely " +
+        "interrupted work even after a deliberate/operator restart — a " +
+        "sanctioned restart landing mid-turn no longer silently drops the " +
+        "work. 'always' forces resume unconditionally (same as the " +
+        "SWITCHROOM_BOOT_RESUME_ALWAYS=1 escape hatch). 'never' is the " +
+        "quota-saving posture: don't auto-replay work across a clean " +
+        "restart — but the user is STILL sent a passive notice of what was " +
+        "in flight (silence is never used). Independent of the at-most-once " +
+        "resume ledger and the bounded resume-chain loop-guard, which always " +
+        "apply. Threaded to the gateway as SWITCHROOM_BOOT_RESUME.",
+      ),
     session_retention_max_count: z
       .number()
       .int()

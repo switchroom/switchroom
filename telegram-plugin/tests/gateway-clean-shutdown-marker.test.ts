@@ -36,6 +36,7 @@ import {
   clearCleanShutdownMarker,
   shouldSuppressRecoveryBanner,
   shouldSuppressBootResume,
+  parseBootResumeMode,
   resolveShutdownMarker,
   DEFAULT_MAX_AGE_MS,
   EXTERNAL_RESTART_FALLBACK_REASON,
@@ -350,77 +351,117 @@ describe("resolveShutdownMarker (SIGTERM-handler sequencing)", () => {
 // ---------------------------------------------------------------------------
 
 describe("shouldSuppressBootResume", () => {
-  // Core contract: clean shutdown (fresh marker) → suppress; crash (no marker
-  // or stale) → do not suppress; forceAlways override → never suppress.
+  // Product decision 2026-07 (supersedes #2585): the DEFAULT mode is
+  // 'in-flight' — a genuinely in-flight turn resumes even after a clean /
+  // deliberate restart, so a fresh clean marker NO LONGER suppresses by
+  // default. Suppression survives only as the opt-in 'never' mode.
 
-  it("returns false when no marker is present (crash/OOM — resume as before)", () => {
-    expect(shouldSuppressBootResume(null, Date.now())).toBe(false);
-  });
-
-  it("returns true for a fresh clean-shutdown marker (operator/roll restart — suppress)", () => {
+  it("DEFAULT (in-flight): fresh clean marker does NOT suppress — in-flight work resumes", () => {
+    // This is the core regression fix: a deliberate restart landing mid-turn
+    // must not silently drop the work.
     const now = 1_700_000_000_000;
     const marker: CleanShutdownMarker = { ts: now - 5_000, signal: "SIGTERM" };
-    expect(shouldSuppressBootResume(marker, now)).toBe(true);
+    expect(shouldSuppressBootResume(marker, now)).toBe(false);
+    // Explicit 'in-flight' behaves identically to the default.
+    expect(shouldSuppressBootResume(marker, now, { mode: "in-flight" })).toBe(false);
   });
 
-  it("returns true at age=0 (marker written right before boot)", () => {
+  it("mode 'never': returns false when no marker is present (crash/OOM — resume)", () => {
+    expect(shouldSuppressBootResume(null, Date.now(), { mode: "never" })).toBe(false);
+  });
+
+  it("mode 'never': returns true for a fresh clean-shutdown marker (suppress)", () => {
+    const now = 1_700_000_000_000;
+    const marker: CleanShutdownMarker = { ts: now - 5_000, signal: "SIGTERM" };
+    expect(shouldSuppressBootResume(marker, now, { mode: "never" })).toBe(true);
+  });
+
+  it("mode 'never': returns true at age=0 (marker written right before boot)", () => {
     const now = 1_700_000_000_000;
     const marker: CleanShutdownMarker = { ts: now, signal: "SIGTERM" };
-    expect(shouldSuppressBootResume(marker, now)).toBe(true);
+    expect(shouldSuppressBootResume(marker, now, { mode: "never" })).toBe(true);
   });
 
-  it("returns false when marker age equals maxAgeMs (boundary is exclusive)", () => {
+  it("mode 'never': false when marker age equals maxAgeMs (boundary is exclusive)", () => {
     const now = 1_700_000_000_000;
     const marker: CleanShutdownMarker = { ts: now - DEFAULT_MAX_AGE_MS, signal: "SIGTERM" };
-    expect(shouldSuppressBootResume(marker, now)).toBe(false);
+    expect(shouldSuppressBootResume(marker, now, { mode: "never" })).toBe(false);
   });
 
-  it("returns false for a stale marker (drain took >60s — treat as crash)", () => {
+  it("mode 'never': false for a stale marker (drain took >60s — slow rollout resumes)", () => {
+    // Preserves the ">60s already resumes" behaviour even under 'never'.
     const now = 1_700_000_000_000;
     const marker: CleanShutdownMarker = { ts: now - 90_000, signal: "SIGTERM" };
-    expect(shouldSuppressBootResume(marker, now)).toBe(false);
+    expect(shouldSuppressBootResume(marker, now, { mode: "never" })).toBe(false);
   });
 
-  it("treats clock skew (future ts) as stale to avoid false suppression", () => {
+  it("mode 'never': treats clock skew (future ts) as stale to avoid false suppression", () => {
     const now = 1_700_000_000_000;
     const marker: CleanShutdownMarker = { ts: now + 10_000, signal: "SIGTERM" };
-    expect(shouldSuppressBootResume(marker, now)).toBe(false);
+    expect(shouldSuppressBootResume(marker, now, { mode: "never" })).toBe(false);
   });
 
-  it("respects a custom maxAgeMs", () => {
+  it("mode 'never': respects a custom maxAgeMs", () => {
     const now = 1_700_000_000_000;
     const marker: CleanShutdownMarker = { ts: now - 30_000, signal: "SIGTERM" };
-    expect(shouldSuppressBootResume(marker, now, { maxAgeMs: 60_000 })).toBe(true);
-    expect(shouldSuppressBootResume(marker, now, { maxAgeMs: 10_000 })).toBe(false);
+    expect(shouldSuppressBootResume(marker, now, { mode: "never", maxAgeMs: 60_000 })).toBe(true);
+    expect(shouldSuppressBootResume(marker, now, { mode: "never", maxAgeMs: 10_000 })).toBe(false);
   });
 
-  it("forceAlways=true disables suppression even for a fresh clean marker (escape hatch)", () => {
+  it("forceAlways=true disables suppression even under 'never' + fresh marker (escape hatch)", () => {
     // SWITCHROOM_BOOT_RESUME_ALWAYS=1 must restore unconditional resume.
     const now = 1_700_000_000_000;
     const marker: CleanShutdownMarker = { ts: now - 1_000, signal: "SIGTERM" };
-    expect(shouldSuppressBootResume(marker, now, { forceAlways: true })).toBe(false);
+    expect(shouldSuppressBootResume(marker, now, { mode: "never", forceAlways: true })).toBe(false);
   });
 
-  it("forceAlways=false has no effect (default behaviour is the gate)", () => {
+  it("mode 'always': never suppresses, even with a fresh clean marker", () => {
     const now = 1_700_000_000_000;
     const marker: CleanShutdownMarker = { ts: now - 1_000, signal: "SIGTERM" };
-    expect(shouldSuppressBootResume(marker, now, { forceAlways: false })).toBe(true);
+    expect(shouldSuppressBootResume(marker, now, { mode: "always" })).toBe(false);
   });
 
-  it("works for SIGTERM and SIGINT (signal value is opaque)", () => {
+  it("mode 'never': works for SIGTERM and SIGINT (signal value is opaque)", () => {
     const now = 1_700_000_000_000;
-    expect(shouldSuppressBootResume({ ts: now, signal: "SIGTERM" }, now)).toBe(true);
-    expect(shouldSuppressBootResume({ ts: now, signal: "SIGINT" }, now)).toBe(true);
+    expect(shouldSuppressBootResume({ ts: now, signal: "SIGTERM" }, now, { mode: "never" })).toBe(true);
+    expect(shouldSuppressBootResume({ ts: now, signal: "SIGINT" }, now, { mode: "never" })).toBe(true);
   });
 
-  it("works with a marker that carries a reason field (rollout attribution is preserved)", () => {
+  it("mode 'never': works with a marker that carries a reason field", () => {
     const now = 1_700_000_000_000;
     const marker: CleanShutdownMarker = {
       ts: now - 2_000,
       signal: "SIGTERM",
       reason: "operator: switchroom update",
     };
-    expect(shouldSuppressBootResume(marker, now)).toBe(true);
+    expect(shouldSuppressBootResume(marker, now, { mode: "never" })).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Boot-resume mode parsing
+// ---------------------------------------------------------------------------
+
+describe("parseBootResumeMode", () => {
+  it("defaults to 'in-flight' for undefined/null/empty/unknown", () => {
+    expect(parseBootResumeMode(undefined)).toBe("in-flight");
+    expect(parseBootResumeMode(null)).toBe("in-flight");
+    expect(parseBootResumeMode("")).toBe("in-flight");
+    expect(parseBootResumeMode("bogus")).toBe("in-flight");
+  });
+
+  it("parses the three canonical values", () => {
+    expect(parseBootResumeMode("always")).toBe("always");
+    expect(parseBootResumeMode("in-flight")).toBe("in-flight");
+    expect(parseBootResumeMode("never")).toBe("never");
+  });
+
+  it("is case- and separator-insensitive", () => {
+    expect(parseBootResumeMode("ALWAYS")).toBe("always");
+    expect(parseBootResumeMode("In-Flight")).toBe("in-flight");
+    expect(parseBootResumeMode("in_flight")).toBe("in-flight");
+    expect(parseBootResumeMode("inflight")).toBe("in-flight");
+    expect(parseBootResumeMode("  never  ")).toBe("never");
   });
 });
 
@@ -446,9 +487,14 @@ describe("gateway.ts boot-resume clean-shutdown gate (source-level)", () => {
     expect(gatewaySource).toContain("readCleanShutdownMarker(bootResumeMarkerPath)");
   });
 
-  it("calls shouldSuppressBootResume with the marker, now, and forceAlways", () => {
+  it("calls shouldSuppressBootResume with the marker, now, forceAlways, and mode", () => {
     expect(gatewaySource).toContain("shouldSuppressBootResume(bootResumeCleanMarker, Date.now()");
     expect(gatewaySource).toContain("forceAlways: bootResumeForceAlways");
+    expect(gatewaySource).toContain("mode: bootResumeMode");
+  });
+
+  it("parses the boot-resume mode from SWITCHROOM_BOOT_RESUME", () => {
+    expect(gatewaySource).toContain("parseBootResumeMode(process.env.SWITCHROOM_BOOT_RESUME)");
   });
 
   it("provides the SWITCHROOM_BOOT_RESUME_ALWAYS escape hatch", () => {
@@ -458,6 +504,18 @@ describe("gateway.ts boot-resume clean-shutdown gate (source-level)", () => {
 
   it("logs a diagnostic when boot-resume is suppressed", () => {
     expect(gatewaySource).toContain("boot-resume suppressed (clean shutdown");
+  });
+
+  it("still delivers a passive report (never silence) when resume is suppressed", () => {
+    // Requirement: silence is never acceptable when work was in flight.
+    // The suppressed path builds a deferred-report inbound, not nothing.
+    expect(gatewaySource).toContain("defer-suppressed");
+    expect(gatewaySource).toContain("buildResumeDeferredReportInbound");
+  });
+
+  it("caps the resume chain with a loop-guard (no unbounded resume-of-resume)", () => {
+    expect(gatewaySource).toContain("decideBootResumeKind");
+    expect(gatewaySource).toContain("defer-loop");
   });
 });
 

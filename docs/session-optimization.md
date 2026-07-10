@@ -32,6 +32,14 @@ Switchroom agents have three mechanisms that survive restarts and compaction:
 
    A transcript is deleted only when it is **both** over the count bound **and** older than the age bound; the newest two sessions are always retained regardless.
 
+   **In-flight resume across restarts (`session_continuity.boot_resume`).** Independent of `resume_mode` (which governs transcript replay), this controls whether a turn that was genuinely *in flight* when the agent restarted is auto-resumed. It exists because a **deliberate** restart (operator `agent restart`, a rollout, `systemctl restart`) that lands mid-turn used to be silently swallowed — the work was dropped and the user never told. Threaded to the gateway as `SWITCHROOM_BOOT_RESUME`.
+
+   - `in-flight` — **default**. Resume genuinely interrupted work even after a deliberate restart. A sanctioned restart no longer silently drops in-flight work.
+   - `always` — force resume unconditionally (equivalent to the `SWITCHROOM_BOOT_RESUME_ALWAYS=1` escape hatch).
+   - `never` — the quota-saving posture: don't auto-replay work across a clean restart. The user is **still** sent a passive notice of what was in flight — silence is never used.
+
+   Two safety rails always apply, regardless of mode: the **at-most-once ledger** (`resumed_at`) means a given turn resumes at most once, and a **bounded resume-chain loop-guard** means a resume turn that is itself interrupted by another restart is *not* re-resumed (it downgrades to a passive report) — so repeated restarts can never form an endless resume loop. The 60s clean-shutdown marker freshness window is likewise preserved: a slow rollout (>60s) still resumes.
+
 2. **Hindsight memory** — auto-retain fires every 10 turns, saving the full transcript to a semantic bank. Auto-recall fires every turn, bringing back relevant memories. Important facts survive compaction and restart because they're stored externally.
 
 3. **Telegram history** — SQLite buffer of every inbound/outbound message. `get_recent_messages` lets the agent recover recent chat context after a restart, regardless of resume mode.
