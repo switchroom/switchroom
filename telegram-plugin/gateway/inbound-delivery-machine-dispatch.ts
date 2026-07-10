@@ -7,17 +7,40 @@
  * (b) execute the returned effects against real I/O. This module owns
  * step (b) for the cutover.
  *
- * Scope of THIS PR — bridgeUp only:
- *   - drainBuffer                       → executed
- *   - redeliverPersistedPermVerdicts    → executed
+ * Effects wired to real executors (all effect kinds now handled):
+ *   - drainBuffer                       → redeliverBufferedInbound
+ *   - redeliverPersistedPermVerdicts    → pendingPermissionBuffer.drain → send
+ *   - deliverToBridge                   → client.send / ipcServer.sendToAgent
+ *   - bufferInbound                     → pendingInboundBuffer.push
+ *   - persistInbound                    → inboundSpool.put
+ *   - deliverPermVerdict                → client.send / ipcServer.sendToAgent
+ *   - persistPermVerdict                → pendingPermissionBuffer.push
+ *   - setTurnStarted / clearTurnStarted → onSetTurnStarted / onClearTurnStarted
+ *   - noteOutbound                      → onNoteOutbound
+ *   - firePoke                          → onFirePoke
  *   - logTrace                          → executed
  *
- * Other effects (deliverToBridge, bufferInbound, persistInbound,
- * setTurnStarted, clearTurnStarted, noteOutbound, firePoke,
- * deliverPermVerdict, persistPermVerdict) still flow through their
- * existing imperative paths in `gateway.ts`. The dispatcher logs them
- * as `not-yet-cutover` so a future PR can wire them without grep-and-
- * pray. NEVER silently no-op: the trace is the gate.
+ * IMPORTANT — this module executing an effect is NOT the same as the
+ * gateway being cut over for that effect. The gateway currently only
+ * calls `dispatchEffects()` with the **bridgeUp** effect set
+ * (`drainBuffer` / `redeliverPersistedPermVerdicts` / `logTrace`).
+ * The inbound-routing effects (deliverToBridge / bufferInbound /
+ * persistInbound) and the turn-lifecycle / poke / perm-verdict effects
+ * are wired here so PR3c (inbound cutover) can flip `handleInbound` to
+ * dispatch through the machine WITHOUT further wiring — but the live
+ * imperative paths in `gateway.ts` still own those flows today (see the
+ * "Hard removal plan" checklist in the RFC: PR3b/PR3c/PR4 remain open).
+ * Wiring an effect whose live driver is still imperative causes NO
+ * double-execution because the gateway never passes that effect kind to
+ * this dispatcher yet. The effect-level unit + equivalence tests gate
+ * the wiring so PR3c is a one-line call-site flip, not a rewrite.
+ *
+ * The gateway-internal turn/poke effects (setTurnStarted,
+ * clearTurnStarted, noteOutbound, firePoke) map to gateway-scope state
+ * (`claudeBusyKeys`, the silence-poke ladder) that this decoupled module
+ * cannot reach directly, so they are dispatched through OPTIONAL
+ * callbacks on the ctx. When a callback is absent the effect logs an
+ * `unwired` trace rather than silently no-opping — the trace is the gate.
  *
  * Kill switch: `SWITCHROOM_DELIVERY_MACHINE_CUTOVER=0` disables
  * dispatcher execution and the gateway falls back to imperative-only.
@@ -26,10 +49,11 @@
 
 import type {
   Effect,
+  ChatKey,
   InboundMessage as MachineInboundMessage,
 } from './inbound-delivery-machine.js'
 import type { IpcServer, IpcClient } from './ipc-server.js'
-import type { InboundMessage } from './ipc-protocol.js'
+import type { InboundMessage, PermissionEvent } from './ipc-protocol.js'
 import type { PendingInboundBuffer } from './pending-inbound-buffer.js'
 import { redeliverBufferedInbound } from './pending-inbound-buffer.js'
 import type { InboundSpool } from './inbound-spool.js'
@@ -54,6 +78,15 @@ export interface DispatchCtx {
    * (clerk lost-message incident, 2026-06-03.)
    */
   readonly onUserInboundDelivered?: (merged: InboundMessage) => void
+  // ── Gateway-internal turn/poke effect callbacks ──────────────────
+  // These effects map to gateway-scope state (`claudeBusyKeys`, the
+  // silence-poke ladder) that this decoupled module cannot reach. The
+  // gateway supplies them when it flips inbound routing through the
+  // machine (PR3c). Absent → the effect logs an `unwired` trace.
+  readonly onSetTurnStarted?: (key: ChatKey, at: number) => void
+  readonly onClearTurnStarted?: (key: ChatKey) => void
+  readonly onNoteOutbound?: (key: ChatKey, at: number) => void
+  readonly onFirePoke?: (key: ChatKey, level: 'soft' | 'firm' | 'fallback') => void
 }
 
 const enabled = process.env.SWITCHROOM_DELIVERY_MACHINE_CUTOVER !== '0'
@@ -168,20 +201,126 @@ function dispatchOne(effect: Effect, ctx: DispatchCtx): void {
       return
     }
 
-    // The cases below are KNOWN effect kinds that this PR does NOT
-    // cut over. The imperative paths still run for them; the
-    // dispatcher logs the event so future cutover PRs can grep for
-    // exactly the call sites to migrate.
-    case 'deliverToBridge':
-    case 'bufferInbound':
-    case 'persistInbound':
-    case 'setTurnStarted':
-    case 'clearTurnStarted':
-    case 'noteOutbound':
-    case 'firePoke':
-    case 'deliverPermVerdict':
+    case 'deliverToBridge': {
+      // Route a single inbound to the live bridge. The machine's
+      // InboundMessage.payload carries the real ipc-protocol
+      // InboundMessage; the machine treats it as opaque.
+      const msg = effect.msg.payload as InboundMessage
+      let ok = false
+      try {
+        if (ctx.client) {
+          ctx.client.send(msg)
+          ok = true
+        } else {
+          ok = ctx.ipcServer.sendToAgent(ctx.selfAgent, msg)
+        }
+      } catch (err) {
+        log(
+          `telegram gateway: dispatch deliverToBridge send threw agent=${ctx.selfAgent} ` +
+            `key=${effect.key}: ${(err as Error).message}\n`,
+        )
+        ok = false
+      }
+      if (ok && ctx.onUserInboundDelivered) {
+        // Enrol in the deliver-until-acked sweep — a socket write is not
+        // proof claude consumed it (see onUserInboundDelivered doc).
+        // Pass UNCONDITIONALLY, mirroring the drainBuffer path above:
+        // the callback self-gates via shouldTrackDelivery (inbound-
+        // delivery-confirm.ts), which REJECTS sourced messages and
+        // tracks real user inbounds (meta.source undefined) — exactly
+        // the messages the sweep protects. Do NOT pre-filter on
+        // meta.source here; an inverted guard would skip user inbounds
+        // and enrol only messages the inner gate discards.
+        try {
+          ctx.onUserInboundDelivered(msg)
+        } catch {
+          /* enrolment is best-effort; never breaks delivery */
+        }
+      }
+      log(`gw-trace dispatch deliverToBridge key=${effect.key} ok=${ok}\n`)
+      return
+    }
+
+    case 'bufferInbound': {
+      const msg = effect.msg.payload as InboundMessage
+      const buffered = ctx.pendingInboundBuffer.push(ctx.selfAgent, msg)
+      log(`gw-trace dispatch bufferInbound key=${effect.key} buffered=${buffered}\n`)
+      return
+    }
+
+    case 'persistInbound': {
+      // Durable spool. `pendingInboundBuffer.push` already spools when a
+      // spool is attached to the buffer, so a persistInbound paired with
+      // a bufferInbound is idempotent (put() is idempotent by spoolId).
+      const msg = effect.msg.payload as InboundMessage
+      const put = ctx.inboundSpool ? ctx.inboundSpool.put(ctx.selfAgent, msg) : false
+      log(`gw-trace dispatch persistInbound key=${effect.key} put=${put}\n`)
+      return
+    }
+
+    case 'deliverPermVerdict': {
+      // Branch order differs from the imperative twin
+      // (gateway.ts dispatchPermissionVerdict), which always goes via
+      // `ipcServer.sendToAgent` — it runs outside any bridgeUp context,
+      // so it has no just-registered client handle. Here `ctx.client`
+      // is preferred WHEN PRESENT for the same reason as drainBuffer /
+      // redeliverPersistedPermVerdicts above: on the bridgeUp path the
+      // registry lookup may not yet observe the just-registered client,
+      // and a direct send to the connecting socket is the reliable
+      // route. PR3c's live call site for machine-driven permVerdict
+      // events (non-bridgeUp) must construct the ctx WITHOUT `client`,
+      // which makes this branch behave exactly like the twin
+      // (sendToAgent). Note the twin additionally buffers on a failed
+      // send; the machine models that as a separate persistPermVerdict
+      // effect (bridge_dead state), so no fallback push here.
+      const ev = effect.verdict.payload as PermissionEvent
+      let ok = false
+      try {
+        if (ctx.client) {
+          ctx.client.send(ev as never)
+          ok = true
+        } else {
+          ok = ctx.ipcServer.sendToAgent(ctx.selfAgent, ev as never)
+        }
+      } catch (err) {
+        log(
+          `telegram gateway: dispatch deliverPermVerdict send threw agent=${ctx.selfAgent} ` +
+            `request=${effect.verdict.requestId}: ${(err as Error).message}\n`,
+        )
+        ok = false
+      }
+      log(`gw-trace dispatch deliverPermVerdict request=${effect.verdict.requestId} ok=${ok}\n`)
+      return
+    }
+
     case 'persistPermVerdict': {
-      log(`gw-trace dispatch not-yet-cutover effect=${effect.kind}\n`)
+      const ev = effect.verdict.payload as PermissionEvent
+      const pushed = ctx.pendingPermissionBuffer.push(ctx.selfAgent, ev)
+      log(`gw-trace dispatch persistPermVerdict request=${effect.verdict.requestId} pushed=${pushed}\n`)
+      return
+    }
+
+    case 'setTurnStarted': {
+      if (ctx.onSetTurnStarted) ctx.onSetTurnStarted(effect.key, effect.at)
+      else log(`gw-trace dispatch unwired effect=setTurnStarted key=${effect.key}\n`)
+      return
+    }
+
+    case 'clearTurnStarted': {
+      if (ctx.onClearTurnStarted) ctx.onClearTurnStarted(effect.key)
+      else log(`gw-trace dispatch unwired effect=clearTurnStarted key=${effect.key}\n`)
+      return
+    }
+
+    case 'noteOutbound': {
+      if (ctx.onNoteOutbound) ctx.onNoteOutbound(effect.key, effect.at)
+      else log(`gw-trace dispatch unwired effect=noteOutbound key=${effect.key}\n`)
+      return
+    }
+
+    case 'firePoke': {
+      if (ctx.onFirePoke) ctx.onFirePoke(effect.key, effect.level)
+      else log(`gw-trace dispatch unwired effect=firePoke key=${effect.key} level=${effect.level}\n`)
       return
     }
   }
