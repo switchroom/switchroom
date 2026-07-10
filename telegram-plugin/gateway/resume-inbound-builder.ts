@@ -49,12 +49,97 @@ export function humanizeElapsed(ms: number): string {
   return `~${days} day${days === 1 ? '' : 's'}`
 }
 
+/**
+ * A sub-agent that was still in flight when the turn was interrupted. The
+ * gateway derives these from the registry (`listNonTerminalSubagentsForTurn`)
+ * — every non-terminal (`running` / `stalled`) worker of the interrupted turn.
+ * Kept to just the display fields so the builder stays pure (no SQLite import).
+ */
+export interface InterruptedSubagent {
+  /** Agent type / label (e.g. 'worker', 'researcher'). */
+  agentType?: string | null
+  /** Human-readable dispatch prompt / task description. */
+  description?: string | null
+  /** Current registry status ('running' | 'stalled'). Informational only. */
+  status?: string | null
+}
+
+/** Max chars of each sub-agent's dispatch prompt included in the inbound. */
+const SUBAGENT_PROMPT_MAX = 200
+/** Max number of sub-agents listed (the rest are summarised as a count). */
+const SUBAGENT_LIST_CAP = 10
+
+function truncatePrompt(s: string, max: number): string {
+  const t = s.trim()
+  if (t.length <= max) return t
+  // Codepoint-safe truncation: slice by code POINTS, not UTF-16 code units —
+  // a naive `.slice()` can split a surrogate pair (emoji, astral-plane CJK)
+  // and leave a lone surrogate that renders as U+FFFD in the inbound.
+  const points = Array.from(t)
+  if (points.length <= max) return t
+  return points.slice(0, max - 1).join('').trimEnd() + '…'
+}
+
+/**
+ * Render the compact "these workers died with the restart" block appended to
+ * an interrupted-turn inbound. Empty string when there were no in-flight
+ * sub-agents (so the inbound is unchanged in the common case). Bounded: at
+ * most `SUBAGENT_LIST_CAP` entries, each prompt truncated to
+ * `SUBAGENT_PROMPT_MAX` chars, with an overflow count for the remainder.
+ *
+ * The closing instruction is mode-aware, mirroring the two builders'
+ * contracts:
+ *   - `assertive: true` (the `resume_interrupted` path, whose inbound already
+ *     says "just resume") → imperative: re-dispatch the ones still needed
+ *     before declaring the task done.
+ *   - `assertive: false` (the `resume_watchdog_timeout` path — an ask-first
+ *     contract: "Do NOT silently resume … ask whether to retry") → deferred:
+ *     IF the user asks to retry, the workers will need re-dispatching. An
+ *     unconditional re-dispatch imperative here would contradict that
+ *     hang-safety gate.
+ */
+export function renderInterruptedSubagentsBlock(
+  subs: InterruptedSubagent[] | undefined,
+  opts: { assertive: boolean } = { assertive: true },
+): string {
+  if (!subs || subs.length === 0) return ''
+  const shown = subs.slice(0, SUBAGENT_LIST_CAP)
+  const lines = shown.map((s, i) => {
+    const type = s.agentType?.trim() ? s.agentType.trim() : 'sub-agent'
+    const desc = s.description?.trim()
+      ? truncatePrompt(s.description, SUBAGENT_PROMPT_MAX)
+      : '(no task description recorded)'
+    return `  ${i + 1}. [${type}] ${desc}`
+  })
+  const overflow =
+    subs.length > SUBAGENT_LIST_CAP
+      ? `\n  …and ${subs.length - SUBAGENT_LIST_CAP} more.`
+      : ''
+  const count = subs.length
+  const closing = opts.assertive
+    ? `\nRe-dispatch the ones still needed before declaring the task done — ` +
+      `don't assume their work landed.`
+    : `\nIf the user asks you to retry, they'll need re-dispatching — ` +
+      `don't assume their work landed.`
+  return (
+    `\n\nWhen the restart hit, ${count} sub-agent${count === 1 ? ' was' : 's were'} still ` +
+    `in flight. These sub-agents were killed by the restart and did NOT complete:\n` +
+    lines.join('\n') +
+    overflow +
+    closing
+  )
+}
+
 export interface ResumeInboundContext {
   /** The interrupted turn, straight from the registry. */
   turn: Turn
   /** Wall-clock ms. Drives `ts`, `messageId`, and the elapsed framing.
    *  Defaults to Date.now(). */
   nowMs?: number
+  /** Sub-agents that were still non-terminal when the turn was interrupted.
+   *  Rendered into the inbound so the resumed session knows what to
+   *  re-dispatch. Omitted / empty → the inbound is unchanged. */
+  subagents?: InterruptedSubagent[]
 }
 
 /**
@@ -161,7 +246,8 @@ export function buildResumeInterruptedInbound(ctx: ResumeInboundContext): Inboun
       `plain language) so they're not left wondering — then carry on with the ` +
       `actual task. Do not ask whether to resume; just resume. If even after ` +
       `reading the recent messages you genuinely can't tell what the work was, ` +
-      `say so and ask.`,
+      `say so and ask.` +
+      renderInterruptedSubagentsBlock(ctx.subagents),
     meta,
   }
 }
@@ -220,7 +306,10 @@ export function buildResumeWatchdogReportInbound(
       `after ${idle} of no progress, and roughly what it was doing. Then ask ` +
       `whether they want you to retry it or take a different angle. Report ` +
       `only the honest cause — no observable progress for that long — don't ` +
-      `speculate about a deeper root cause you can't see.`,
+      `speculate about a deeper root cause you can't see.` +
+      // Deferred (non-assertive) form: this is the ask-first path — the killed
+      // workers are listed as facts, but re-dispatch waits on the user's call.
+      renderInterruptedSubagentsBlock(ctx.subagents, { assertive: false }),
     meta,
   }
 }
@@ -335,7 +424,11 @@ export function buildResumeDeferredReportInbound(
       `flight (call get_recent_messages for this chat if you need the full ` +
       `original request — the quoted preview is only the first ~200 ` +
       `characters), then ask whether they want you to pick it back up or drop ` +
-      `it. If you genuinely can't tell what the work was, say so and ask.`,
+      `it. If you genuinely can't tell what the work was, say so and ask.` +
+      // Deferred (non-assertive) form, same as the watchdog path: this is an
+      // ask-first inbound — killed workers are named as facts, but
+      // re-dispatch waits on the user's call.
+      renderInterruptedSubagentsBlock(ctx.subagents, { assertive: false }),
     meta,
   }
 }

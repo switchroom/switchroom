@@ -23,6 +23,8 @@ import {
   selectResumeBuilder,
   decideBootResumeKind,
   RESUME_SYNTHETIC_PROMPT_PREFIX,
+  renderInterruptedSubagentsBlock,
+  type InterruptedSubagent,
 } from '../gateway/resume-inbound-builder.js'
 import type { Turn, TurnEndedVia } from '../registry/turns-schema.js'
 
@@ -159,6 +161,155 @@ describe('buildResumeInterruptedInbound', () => {
     expect(msg.meta.chat_id).toBe('-1001234567890')
     expect(msg.meta.message_thread_id).toBe('42')
     expect(msg.threadId).toBe(42)
+  })
+})
+
+describe('interrupted sub-agent block', () => {
+  const twoRunning: InterruptedSubagent[] = [
+    { agentType: 'worker', description: 'refactor the auth module and add tests', status: 'running' },
+    { agentType: 'researcher', description: 'survey the pricing pages of 5 competitors', status: 'running' },
+  ]
+
+  it('renderInterruptedSubagentsBlock lists each worker with type + prompt', () => {
+    const block = renderInterruptedSubagentsBlock(twoRunning)
+    expect(block).toContain('2 sub-agents were still')
+    expect(block).toContain('did NOT complete')
+    expect(block).toContain('[worker]')
+    expect(block).toContain('refactor the auth module and add tests')
+    expect(block).toContain('[researcher]')
+    expect(block).toContain('survey the pricing pages of 5 competitors')
+    expect(block).toContain('Re-dispatch the ones still needed')
+  })
+
+  it('returns empty string when there are no in-flight sub-agents', () => {
+    expect(renderInterruptedSubagentsBlock(undefined)).toBe('')
+    expect(renderInterruptedSubagentsBlock([])).toBe('')
+  })
+
+  it('interrupted-turn inbound contains BOTH running sub-agents', () => {
+    const msg = buildResumeInterruptedInbound({ turn: makeTurn(), subagents: twoRunning })
+    expect(msg.text).toContain('refactor the auth module and add tests')
+    expect(msg.text).toContain('survey the pricing pages of 5 competitors')
+    expect(msg.text).toContain('did NOT complete')
+    expect(msg.text).toContain('Re-dispatch the ones still needed')
+  })
+
+  it('interrupted-turn inbound is UNCHANGED when no sub-agents were running', () => {
+    const withNone = buildResumeInterruptedInbound({ turn: makeTurn(), subagents: [] })
+    const bare = buildResumeInterruptedInbound({ turn: makeTurn() })
+    expect(withNone.text).toBe(bare.text)
+    expect(withNone.text).not.toContain('did NOT complete')
+  })
+
+  it('truncates each dispatch prompt to ~200 chars', () => {
+    const long = 'x'.repeat(400)
+    const block = renderInterruptedSubagentsBlock([{ agentType: 'worker', description: long }])
+    // The 400-char prompt must not survive in full; the entry line is capped.
+    expect(block).not.toContain(long)
+    expect(block).toContain('…')
+    // 200-char cap → the truncated slice (199 chars + ellipsis) is present.
+    expect(block).toContain('x'.repeat(199))
+    expect(block).not.toContain('x'.repeat(201))
+  })
+
+  it('caps the list at 10 and summarises the remainder', () => {
+    const many: InterruptedSubagent[] = Array.from({ length: 14 }, (_, i) => ({
+      agentType: 'worker',
+      description: `task number ${i + 1}`,
+    }))
+    const block = renderInterruptedSubagentsBlock(many)
+    expect(block).toContain('14 sub-agents were still')
+    expect(block).toContain('task number 10')
+    expect(block).not.toContain('task number 11')
+    expect(block).toContain('…and 4 more.')
+    // Exactly 10 numbered entries rendered.
+    const numbered = block.match(/^\s+\d+\. \[/gm) ?? []
+    expect(numbered.length).toBe(10)
+  })
+
+  it('falls back to a generic label + placeholder when type/prompt are missing', () => {
+    const block = renderInterruptedSubagentsBlock([{ agentType: null, description: null }])
+    expect(block).toContain('[sub-agent]')
+    expect(block).toContain('(no task description recorded)')
+  })
+
+  it('singularises a single killed sub-agent', () => {
+    const block = renderInterruptedSubagentsBlock([{ agentType: 'worker', description: 'do X' }])
+    expect(block).toContain('1 sub-agent was still')
+    expect(block).not.toContain('1 sub-agents')
+  })
+
+  it('codepoint-safe truncation never splits a surrogate pair', () => {
+    // 199 ASCII chars, then an astral-plane emoji (2 UTF-16 code units)
+    // straddling the cap. A code-unit slice would cut the pair in half and
+    // leave a lone surrogate; the codepoint-safe slice must not.
+    const desc = 'a'.repeat(199) + '🚀' + 'b'.repeat(50)
+    const block = renderInterruptedSubagentsBlock([{ agentType: 'worker', description: desc }])
+    expect(block).toContain('…')
+    // No lone surrogates anywhere in the rendered block.
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(block)).toBe(false)
+    expect(block).toBe(block.normalize('NFC')) // sanity: still a well-formed string
+  })
+
+  it('the watchdog report inbound carries the block in DEFERRED form (ask-first contract)', () => {
+    const msg = buildResumeWatchdogReportInbound({
+      turn: makeTurn({ ended_via: 'timeout' }),
+      idleMs: 300_000,
+      subagents: twoRunning,
+    })
+    expect(msg.text).toContain('did NOT complete')
+    expect(msg.text).toContain('refactor the auth module and add tests')
+    // Deferred wording: re-dispatch is conditional on the user asking to retry…
+    expect(msg.text).toContain("If the user asks you to retry, they'll need re-dispatching")
+    expect(msg.text).toContain("don't assume their work landed")
+    // …and the resume-path imperative must NOT appear — it would contradict
+    // the watchdog inbound's "Do NOT silently resume … ask" hang-safety gate.
+    expect(msg.text).not.toContain('Re-dispatch the ones still needed')
+    expect(msg.text).not.toContain('before declaring the task done')
+  })
+
+  it('the resume-path inbound keeps the assertive imperative (and not the deferred form)', () => {
+    const msg = buildResumeInterruptedInbound({ turn: makeTurn(), subagents: twoRunning })
+    expect(msg.text).toContain('Re-dispatch the ones still needed before declaring the task done')
+    expect(msg.text).not.toContain('If the user asks you to retry')
+  })
+
+  for (const reason of ['loop-guard', 'clean-restart-suppressed'] as const) {
+    it(`the deferred report (${reason}) carries the block in DEFERRED form — suppressed resumes still name worker deaths`, () => {
+      const msg = buildResumeDeferredReportInbound({
+        turn: makeTurn(),
+        reason,
+        subagents: twoRunning,
+      })
+      expect(msg.text).toContain('did NOT complete')
+      expect(msg.text).toContain('refactor the auth module and add tests')
+      expect(msg.text).toContain('survey the pricing pages of 5 competitors')
+      // Deferred wording only — never the resume-path imperative, which would
+      // contradict this inbound's "Do NOT silently resume … ask" contract.
+      expect(msg.text).toContain("If the user asks you to retry, they'll need re-dispatching")
+      expect(msg.text).not.toContain('Re-dispatch the ones still needed')
+      expect(msg.text).not.toContain('before declaring the task done')
+      // Appending the block must not disturb the loop-guard anchor at pos 0.
+      expect(msg.text.startsWith(RESUME_SYNTHETIC_PROMPT_PREFIX)).toBe(true)
+    })
+  }
+
+  it('deferred report without subagents is unchanged (no block)', () => {
+    const withNone = buildResumeDeferredReportInbound({ turn: makeTurn(), reason: 'loop-guard', subagents: [] })
+    const bare = buildResumeDeferredReportInbound({ turn: makeTurn(), reason: 'loop-guard' })
+    expect(withNone.text).toBe(bare.text)
+    expect(withNone.text).not.toContain('did NOT complete')
+  })
+
+  it('appending the block preserves the RESUME_SYNTHETIC_PROMPT_PREFIX anchor on resume + watchdog inbounds too', () => {
+    const resume = buildResumeInterruptedInbound({ turn: makeTurn(), subagents: twoRunning })
+    expect(resume.text.startsWith(RESUME_SYNTHETIC_PROMPT_PREFIX)).toBe(true)
+    const report = buildResumeWatchdogReportInbound({
+      turn: makeTurn({ ended_via: 'timeout' }),
+      idleMs: 300_000,
+      subagents: twoRunning,
+    })
+    expect(report.text.startsWith(RESUME_SYNTHETIC_PROMPT_PREFIX)).toBe(true)
   })
 })
 

@@ -688,7 +688,8 @@ import {
   buildResumeDeferredReportInbound,
   decideBootResumeKind,
 } from './resume-inbound-builder.js'
-import { applySubagentsSchema, getSubagentByJsonlId, resolveSubagentOriginTurnKey } from '../registry/subagents-schema.js'
+import { applySubagentsSchema, getSubagentByJsonlId, resolveSubagentOriginTurnKey, listNonTerminalSubagentsForTurn } from '../registry/subagents-schema.js'
+import type { InterruptedSubagent } from './resume-inbound-builder.js'
 import { resolveWorkerFeedDispatch, type WorkerFeedDispatch } from './worker-feed-dispatch.js'
 import {
   resolveSubagentStatusSurface,
@@ -1543,8 +1544,32 @@ try {
       maxAgeMs: RESUME_MAX_AGE_MS,
     })
 
+    // Sub-agents that were still in flight (running / stalled — non-terminal)
+    // when the turn was killed. Read HERE, at module top, BEFORE the
+    // subagent-watcher's boot scan + reaper run: the watcher never deletes
+    // these rows (it only flips running→stalled and marks files historical
+    // in-memory), and this accessor already includes 'stalled', so the data
+    // survives either ordering — but reading pre-watcher keeps it simplest.
+    // Threaded into ALL the builders below (resume, watchdog report, and the
+    // deferred report) so the session gets an explicit killed-workers block —
+    // it must not declare the task done on ghost workers, and even a
+    // suppressed/loop-guarded resume must still NAME the deaths.
+    let interruptedSubagents: InterruptedSubagent[] = []
+    try {
+      interruptedSubagents = listNonTerminalSubagentsForTurn(turnsDb, pending.turn_key).map(
+        (s) => ({ agentType: s.agent_type, description: s.description, status: s.status }),
+      )
+    } catch (err) {
+      process.stderr.write(
+        `telegram gateway: boot-resume subagent lookup failed (${(err as Error).message}) — continuing without worker list\n`,
+      )
+    }
+
     if (bootResumeKind === 'resume') {
-      bootResumeInbound = { agent: selfAgent, msg: buildResumeInterruptedInbound({ turn: pending }) }
+      bootResumeInbound = {
+        agent: selfAgent,
+        msg: buildResumeInterruptedInbound({ turn: pending, subagents: interruptedSubagents }),
+      }
     } else if (bootResumeKind === 'report') {
       // idleMs: this boot's measured marker age if it just classified this
       // turn; otherwise recover it from the persisted interrupt_reason (a
@@ -1559,7 +1584,7 @@ try {
       if (idleMs == null) idleMs = Math.max(0, Date.now() - pending.started_at)
       bootResumeInbound = {
         agent: selfAgent,
-        msg: buildResumeWatchdogReportInbound({ turn: pending, idleMs }),
+        msg: buildResumeWatchdogReportInbound({ turn: pending, idleMs, subagents: interruptedSubagents }),
       }
     } else if (bootResumeKind === 'defer-loop' || bootResumeKind === 'defer-suppressed') {
       // Passive deferred-report: work was in flight but we decline to
@@ -1570,6 +1595,7 @@ try {
         msg: buildResumeDeferredReportInbound({
           turn: pending,
           reason: bootResumeKind === 'defer-loop' ? 'loop-guard' : 'clean-restart-suppressed',
+          subagents: interruptedSubagents,
         }),
       }
     }

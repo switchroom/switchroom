@@ -105,7 +105,7 @@ By default, every restart starts a **fresh `claude` session** — the in-flight 
   - **`resume_interrupted`** (operator restart / SIGTERM / crash): pick the work back up and carry it to completion. Briefly tell the user you're resuming and roughly how long ago it was interrupted — then just do it. Do NOT ask whether to resume.
   - **`resume_watchdog_timeout`** (hang-watchdog killed it after no progress): do NOT silently resume — it may hang the same way. Tell the user plainly that your last turn was killed after N minutes of no progress, roughly what it was doing, and ask whether to retry or take a different angle. Report only the honest cause; don't invent a deeper root cause.
   The one-shot `SWITCHROOM_PENDING_*` env vars are passive forensic context for the wake-audit / "why did you restart" protocols — not the resume trigger.
-- **`.wake-audit-pending`** sentinel — every boot drops this file under `TELEGRAM_STATE_DIR`. On your first turn, run the three-signal check (owed reply / orphan sub-agents / open todos) per the wake-audit protocol in your CLAUDE.md, then `rm -f` the sentinel.
+- **`.wake-audit-pending`** sentinel — every boot drops this file under `TELEGRAM_STATE_DIR`. On your first turn, run the three-signal check (owed reply / orphan sub-agents / open todos) per the wake-audit protocol in the `switchroom-runtime` skill (`skills/switchroom-runtime/SKILL.md`), then `rm -f` the sentinel.
 
 A config-summary greeting card is sent automatically by the SessionStart hook — you don't need to announce yourself. If your context feels thin (after compaction or any fresh session), proactively recall from Hindsight before proceeding.
 

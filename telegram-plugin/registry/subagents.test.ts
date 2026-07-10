@@ -30,6 +30,7 @@ import {
   getSubagent,
   reapStuckRunningRows,
   countRunningBackgroundSubagents,
+  listNonTerminalSubagentsForTurn,
 } from './subagents-schema.js'
 
 // ---------------------------------------------------------------------------
@@ -663,5 +664,45 @@ describe('reapStuckRunningRows', () => {
     const result = reapStuckRunningRows(db, { ttlMs: 100, now: 9999 })
     expect(result.reaped).toBe(5)
     expect(result.ids.sort()).toEqual(['sa-0', 'sa-1', 'sa-2', 'sa-3', 'sa-4'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// listNonTerminalSubagentsForTurn — the boot-resume accessor
+// ---------------------------------------------------------------------------
+
+describe('listNonTerminalSubagentsForTurn', () => {
+  it('returns running + stalled workers of a turn, excluding terminals, ordered by started_at', () => {
+    const db = openFreshSubagentsDbInMemory()
+    const turn = 'chat-1:7'
+    recordSubagentStart(db, { id: 'sa-run', parentTurnKey: turn, agentType: 'worker', description: 'refactor auth', background: true, startedAt: 1000 })
+    recordSubagentStart(db, { id: 'sa-stall', parentTurnKey: turn, agentType: 'researcher', description: 'survey competitors', background: true, startedAt: 2000 })
+    recordSubagentStall(db, { id: 'sa-stall', stalledAt: 3000 })
+    recordSubagentStart(db, { id: 'sa-done', parentTurnKey: turn, agentType: 'worker', description: 'done work', background: true, startedAt: 500 })
+    recordSubagentEnd(db, { id: 'sa-done', endedAt: 4000, status: 'completed' })
+    recordSubagentStart(db, { id: 'sa-fail', parentTurnKey: turn, background: true, startedAt: 600 })
+    recordSubagentEnd(db, { id: 'sa-fail', endedAt: 4100, status: 'failed' })
+
+    const rows = listNonTerminalSubagentsForTurn(db, turn)
+    expect(rows.map((r) => r.id)).toEqual(['sa-run', 'sa-stall']) // started_at ASC, terminals excluded
+    expect(rows[0].agent_type).toBe('worker')
+    expect(rows[0].description).toBe('refactor auth')
+    expect(rows[1].status).toBe('stalled')
+    db.close()
+  })
+
+  it('does not return workers of a different turn', () => {
+    const db = openFreshSubagentsDbInMemory()
+    recordSubagentStart(db, { id: 'sa-a', parentTurnKey: 'chat:1', background: true, startedAt: 1000 })
+    recordSubagentStart(db, { id: 'sa-b', parentTurnKey: 'chat:2', background: true, startedAt: 1000 })
+    const rows = listNonTerminalSubagentsForTurn(db, 'chat:1')
+    expect(rows.map((r) => r.id)).toEqual(['sa-a'])
+    db.close()
+  })
+
+  it('returns empty for a turn with no in-flight workers', () => {
+    const db = openFreshSubagentsDbInMemory()
+    expect(listNonTerminalSubagentsForTurn(db, 'nope:0')).toEqual([])
+    db.close()
   })
 })
