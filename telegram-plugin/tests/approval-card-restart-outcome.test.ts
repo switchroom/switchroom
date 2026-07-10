@@ -16,8 +16,16 @@
  * together — file-backed durable store + real missed-approvals store + real
  * expiry sweep + real timeout builders — across a simulated gateway bounce
  * (store re-instantiation from the same state dir), asserting the promised
- * OUTCOMES rather than any one module's contract. The user-visible acceptance
- * twin is `uat/scenarios/vault-card-survives-gateway-restart-dm.test.ts`.
+ * OUTCOMES rather than any one module's contract.
+ *
+ * SCOPE CAVEAT: the expiry predicate / remove / deliver / recordMiss closures
+ * below are TEST-SUPPLIED stand-ins for gateway.ts's inline closures (which
+ * close over module-level gateway state and can't be imported without a
+ * production refactor). This suite therefore proves the modules COMPOSE
+ * correctly; that gateway.ts actually wires them this way is pinned
+ * separately by pending-card-durability-wiring.test.ts's source greps. The
+ * user-visible acceptance twin is
+ * `uat/scenarios/vault-card-survives-gateway-restart-dm.test.ts`.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
@@ -35,7 +43,11 @@ import { expirePendingCard, sweepExpiredEntries } from '../gateway/pending-card-
 import { buildVaultAccessTimeoutInbound } from '../gateway/approval-timeout-inbound-builders.js'
 import type { InboundMessage } from '../gateway/ipc-protocol.js'
 
-const TTL_MS = 60 * 60_000 // the 60-min default the spec names
+// Test-local stand-in for the 60-min default the spec names. The production
+// TTL comes from approvalTtlMs() in gateway/permission-timeout.ts; this suite
+// does NOT assert that config plumbing — only how the modules behave around
+// whatever TTL the sweep predicate encodes.
+const TTL_MS = 60 * 60_000
 const NOW = 1_700_000_000_000
 
 function accessCard(overrides: Partial<PersistedVaultAccessCard> = {}): PersistedVaultAccessCard {
@@ -63,7 +75,7 @@ describe('approval/restart continuation — spec outcomes across a gateway bounc
     rmSync(stateDir, { recursive: true, force: true })
   })
 
-  it('a still-valid card survives the bounce intact, and a post-restart tap resolution works', () => {
+  it('a still-valid card record survives the bounce intact, and removing it clears the durable store', () => {
     // Gateway process #1 stages the card.
     const before = createPendingCardStore(stateDir)
     const card = accessCard()
@@ -73,10 +85,14 @@ describe('approval/restart continuation — spec outcomes across a gateway bounc
     const after = createPendingCardStore(stateDir)
     const restored = after.loadAll()
     expect(restored).toHaveLength(1)
-    expect(restored[0]).toEqual(card) // metadata intact, TTL clock preserved
+    // Metadata roundtrips byte-identical — stagedAt included, so the expiry
+    // deadline the sweep computes from it is unchanged by the bounce.
+    expect(restored[0]).toEqual(card)
 
-    // The operator taps the still-live keyboard: resolution removes the
-    // durable record exactly like a pre-restart tap would.
+    // Post-restart resolution path (what a tap handler does with the store):
+    // remove() drops the durable record so a later boot can't resurrect it.
+    // The tap handler's Telegram/grant side is NOT exercised here — that's
+    // the UAT twin's job.
     after.remove(card.stageId)
     expect(after.loadAll()).toHaveLength(0)
   })
@@ -151,8 +167,29 @@ describe('approval/restart continuation — spec outcomes across a gateway bounc
     // Durable record is gone — a later boot can't resurrect the card.
     expect(store.loadAll()).toHaveLength(0)
 
-    // A second reaper tick (or a second boot sweep) never double-fires.
-    sweep()
+    // A second boot's sweep restores from the (now empty) durable store and
+    // therefore fires nothing — the remove() step cleared BOTH the in-memory
+    // map and the store, so no later process can re-deliver the wake. (The
+    // intra-process single-shot ordering guarantee — remove() before any
+    // fallible side effect — is pinned behaviorally in
+    // pending-card-expiry.test.ts, not here.)
+    const rebootMap = new Map<string, PersistedVaultAccessCard>(
+      createPendingCardStore(stateDir)
+        .loadAll()
+        .map(e => [e.stageId, e as PersistedVaultAccessCard]),
+    )
+    expect(rebootMap.size).toBe(0)
+    let secondBootExpiries = 0
+    sweepExpiredEntries(
+      rebootMap,
+      (v, now) => v.stagedAt < now - TTL_MS,
+      () => {
+        secondBootExpiries += 1
+      },
+      NOW,
+      () => {},
+    )
+    expect(secondBootExpiries).toBe(0)
     expect(delivered).toHaveLength(1)
   })
 

@@ -67,8 +67,11 @@ describe("uat: denied vault request resumes the parked turn (DM)", () => {
 
         // 4. The deny synthetic must wake the parked turn: a substantive
         //    bot reply that acknowledges the denial arrives unprompted.
+        //    Edits are excluded — the gateway's own "🚫 Denied" edit of the
+        //    approval card must not satisfy this; only a genuinely NEW
+        //    message from a resumed turn counts.
         const reply = await sc.expectMessage(
-          (m) => DENY_RESUME_FRAMING.test(m.text) && m.text.length > 40,
+          (m) => !m.edited && DENY_RESUME_FRAMING.test(m.text) && m.text.length > 40,
           { from: "bot", timeout: RESUME_BUDGET_MS },
         );
         expect(reply.text).toMatch(DENY_RESUME_FRAMING);

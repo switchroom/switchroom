@@ -124,8 +124,10 @@ describe.skip("uat: approval card survives a gateway restart (DM, #2989)", () =>
         }
 
         // 5. Grant lands and the parked agent resumes without a nudge.
+        //    Edits excluded — the "✅ Granted" edit of the card itself must
+        //    not satisfy this; only a NEW message from the resumed turn does.
         const resumed = await sc.expectMessage(
-          (m) => /(granted|access|vault get|succe)/i.test(m.text) && m.text.length > 40,
+          (m) => !m.edited && /(granted|access|vault get|succe)/i.test(m.text) && m.text.length > 40,
           { from: "bot", timeout: RESUME_BUDGET_MS },
         );
         expect(resumed.text.length).toBeGreaterThan(40);

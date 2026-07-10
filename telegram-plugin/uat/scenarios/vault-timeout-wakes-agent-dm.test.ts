@@ -71,9 +71,11 @@ const TIMEOUT_FRAMING =
 
           // 3. TTL elapses → reaper fires the vault_grant_timeout synthetic →
           //    a substantive bot reply arrives with timeout (never denial)
-          //    framing, with no further driver message.
+          //    framing, with no further driver message. Edits are excluded —
+          //    the reaper's own "timed out" edit of the approval card must
+          //    not satisfy this; only a NEW message from the woken turn does.
           const reply = await sc.expectMessage(
-            (m) => TIMEOUT_FRAMING.test(m.text) && m.text.length > 40,
+            (m) => !m.edited && TIMEOUT_FRAMING.test(m.text) && m.text.length > 40,
             { from: "bot", timeout: WAKE_BUDGET_MS },
           );
           expect(reply.text).toMatch(TIMEOUT_FRAMING);

@@ -28,6 +28,11 @@ const AGENT = "test-harness";
 const MID_TURN_MS = 10_000;        // let the turn get in-flight before the bounce
 const RESUME_BUDGET_MS = 180_000;  // boot + resume + reply
 const QUIET_WINDOW_MS = 90_000;    // after the resume completes, no second resume may fire
+// Messages landing within this window of the FIRST resume-framed reply are
+// treated as the same resumed turn (e.g. a progress line plus the final
+// answer of one turn) — only a resume-framed message AFTER it counts as a
+// second resume for the at-most-once bound.
+const SAME_TURN_GRACE_MS = 20_000;
 
 const RESUME_FRAMING = /resum|picking .*back|interrupted|cut off|just restarted/i;
 
@@ -73,9 +78,11 @@ const sudoOk = canShellSudo();
           kickRestartDetached(AGENT);
 
           // 1. In-flight work resumes: quota-saving suppression must NOT
-          //    swallow a turn that was mid-flight at the bounce.
+          //    swallow a turn that was mid-flight at the bounce. Edits are
+          //    excluded — a progress-card edit must not satisfy this; only
+          //    a genuinely NEW message from the resumed turn counts.
           const reply = await sc.expectMessage(
-            (m) => RESUME_FRAMING.test(m.text),
+            (m) => !m.edited && RESUME_FRAMING.test(m.text),
             { from: "bot", timeout: RESUME_BUDGET_MS },
           );
           expect(reply.text).toMatch(RESUME_FRAMING);
@@ -83,10 +90,18 @@ const sudoOk = canShellSudo();
 
           // 2. Bounded chain: with the interruption resolved, no SECOND
           //    resume-framed turn may fire (at-most-once per interruption).
+          //    Edits are excluded, and messages within SAME_TURN_GRACE_MS of
+          //    the first reply are deduped as part of the SAME resumed turn
+          //    (two resume-ish lines in one turn are not a second resume).
+          const firstReplyAt = reply.date.getTime();
           let second: unknown = null;
           try {
             second = await sc.expectMessage(
-              (m) => RESUME_FRAMING.test(m.text),
+              (m) =>
+                !m.edited &&
+                m.messageId !== reply.messageId &&
+                m.date.getTime() > firstReplyAt + SAME_TURN_GRACE_MS &&
+                RESUME_FRAMING.test(m.text),
               { from: "bot", timeout: QUIET_WINDOW_MS },
             );
           } catch {
