@@ -15,10 +15,12 @@
  * Contract:
  *   1. If a stored file_id exists → send BY id (no disk read, no upload). On
  *      success capture the returned id (Telegram may echo the same one).
- *   2. If the stored id is REJECTED as invalid (expired / wrong id — a 400)
- *      → fall through to the upload path and refresh the stored id so a stale
- *      id can never permanently break Listen. Any OTHER send error is a real
- *      failure and is surfaced (no silent re-upload storm).
+ *   2. If the stored id send fails with ANY HTTP 400 → treat the id as
+ *      stale/invalid (regardless of the exact wording), fall through to the
+ *      upload path ONCE and refresh the stored id so a dead id can never
+ *      permanently break Listen. Any NON-400 error (network / 5xx / 403
+ *      blocked-by-user) is a real failure and is surfaced (no silent
+ *      re-upload storm, no papering over a 403).
  *   3. If no id yet → load the audio (disk fast-path or on-demand synth) and
  *      send it as an InputFile, capturing the returned file_id for next time.
  */
@@ -55,6 +57,24 @@ export function isInvalidTelegramFileIdError(err: unknown): boolean {
   )
 }
 
+/**
+ * True iff `err` is an HTTP 400-class Telegram rejection (grammy `error_code`
+ * 400), regardless of the description wording. This is the re-upload trigger:
+ * a send-by-file_id that fails with a 400 is treated as a stale/invalid id and
+ * recovered by re-uploading from disk ONCE, superseding the narrower
+ * substring-matched {@link isInvalidTelegramFileIdError}. Rationale: a
+ * re-upload is always safe recovery and can never be worse than re-hitting a
+ * guaranteed-failing id, whereas Telegram may return a stale-id 400 with
+ * wording outside the known substring set. Non-400 errors (network / 5xx /
+ * 403 blocked-by-user) are NOT 400 and must remain real failures — never
+ * re-uploaded. Duck-typed so this module stays grammy-free.
+ */
+export function isHttp400Error(err: unknown): boolean {
+  if (err == null || typeof err !== 'object') return false
+  const e = err as { error_code?: unknown }
+  return e.error_code === 400
+}
+
 export type ReuseFileIdDeps = {
   /** The entry's stored Telegram file_id, or null if none captured yet. */
   fileId: string | null
@@ -69,8 +89,12 @@ export type ReuseFileIdDeps = {
   sendByUpload: (audio: Uint8Array) => Promise<SentVoiceMessage>
   /** Persist a freshly captured/refreshed file_id onto the cache entry. */
   onFileId: (fileId: string) => void
-  /** Classify a `sendByFileId` rejection: true → stale id, re-upload; else a
-   *  real failure. Defaults to {@link isInvalidTelegramFileIdError}. */
+  /** Classify a `sendByFileId` rejection: true → re-upload from disk once +
+   *  refresh the id; false → surface as a real failure. Defaults to
+   *  {@link isHttp400Error} — ANY HTTP 400 is treated as a stale/invalid id
+   *  (safe recovery), superseding the narrower substring-matched
+   *  {@link isInvalidTelegramFileIdError}. Non-400 errors (network / 5xx /
+   *  403) stay real failures and never re-upload. */
   isInvalidFileIdError?: (err: unknown) => boolean
   log?: (line: string) => void
 }
@@ -86,7 +110,7 @@ export type ReuseFileIdResult =
  * contract. Never throws — send failures are returned as `{ ok: false }`.
  */
 export async function sendVoiceReusingFileId(deps: ReuseFileIdDeps): Promise<ReuseFileIdResult> {
-  const isStale = deps.isInvalidFileIdError ?? isInvalidTelegramFileIdError
+  const shouldReupload = deps.isInvalidFileIdError ?? isHttp400Error
 
   // 1. Fast path — reuse the stored file_id. No disk read, no re-upload.
   if (deps.fileId != null && deps.fileId.length > 0) {
@@ -96,10 +120,15 @@ export async function sendVoiceReusingFileId(deps: ReuseFileIdDeps): Promise<Reu
       if (fresh != null) deps.onFileId(fresh)
       return { ok: true, path: 'file_id', refreshed: false }
     } catch (err) {
-      if (!isStale(err)) {
+      if (!shouldReupload(err)) {
+        // Non-400 (network / 5xx / 403 blocked-by-user) — a real failure, not a
+        // stale id. Never re-upload; surface it so the caller can retry/report.
         return { ok: false, reason: 'send-failed', error: err }
       }
-      // Stale id — invalidate by re-uploading below and refreshing the id.
+      // Any 400 — treat the stored id as stale/invalid regardless of wording and
+      // recover by re-uploading below ONCE + refreshing the id. This can never
+      // be worse than re-hitting a guaranteed-failing id, and covers stale-id
+      // 400s whose text falls outside isInvalidTelegramFileIdError's substrings.
       deps.log?.(
         `voice-ondemand: stored file_id rejected (${String(
           (err as { description?: unknown; message?: unknown })?.description ??

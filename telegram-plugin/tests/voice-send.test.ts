@@ -18,6 +18,7 @@ import {
   sendVoiceReusingFileId,
   extractVoiceFileId,
   isInvalidTelegramFileIdError,
+  isHttp400Error,
   type SentVoiceMessage,
 } from '../voice-send.js'
 import { VoiceOnDemandCache } from '../voice-ondemand.js'
@@ -141,6 +142,86 @@ describe('sendVoiceReusingFileId — file_id reuse contract', () => {
     expect(uploaded).toBe(0) // did NOT paper over a 403 with an upload
   })
 
+  it('(C1) UNKNOWN-wording 400: re-uploads + refreshes id even outside the stale-id substrings', async () => {
+    // A 400 whose text is NOT in isInvalidTelegramFileIdError's substring set.
+    // Pre-tweak (substring-gated) this classified as send-failed and never
+    // refreshed the id; post-tweak ANY 400 recovers via re-upload.
+    let byFileId = 0
+    let uploaded = 0
+    let refreshedTo: string | null = null
+
+    const err400 = grammy400('Bad Request: some brand-new file rejection wording')
+    expect(isInvalidTelegramFileIdError(err400)).toBe(false) // guard: outside old substrings
+    expect(isHttp400Error(err400)).toBe(true) // but IS a 400 → now re-uploadable
+
+    const res = await sendVoiceReusingFileId({
+      fileId: 'STALE_ID',
+      sendByFileId: async () => {
+        byFileId++
+        throw err400
+      },
+      loadAudio: async () => OGG,
+      sendByUpload: async () => {
+        uploaded++
+        return sentWithFileId('FRESH_ID')
+      },
+      onFileId: (id) => {
+        refreshedTo = id
+      },
+    })
+
+    expect(res).toEqual({ ok: true, path: 'upload', refreshed: true })
+    expect(byFileId).toBe(1) // tried the id once
+    expect(uploaded).toBe(1) // then re-uploaded on the unknown 400
+    expect(refreshedTo).toBe('FRESH_ID') // stored id refreshed, not left stale
+  })
+
+  it('(C1) a network error (no error_code) still does NOT re-upload', async () => {
+    let uploaded = 0
+    const res = await sendVoiceReusingFileId({
+      fileId: 'FILE_ID_1',
+      sendByFileId: async () => {
+        throw new Error('ECONNRESET') // no error_code → not a 400
+      },
+      loadAudio: async () => OGG,
+      sendByUpload: async () => {
+        uploaded++
+        return null
+      },
+      onFileId: () => {},
+    })
+    expect(res.ok).toBe(false)
+    expect(uploaded).toBe(0) // transient network error is a real failure, not a re-upload
+  })
+
+  it('(C1) re-upload after a 400 ALSO fails → returns failure, no second re-upload', async () => {
+    let byFileId = 0
+    let uploaded = 0
+    let refreshed: string | null = null
+
+    const res = await sendVoiceReusingFileId({
+      fileId: 'STALE_ID',
+      sendByFileId: async () => {
+        byFileId++
+        throw grammy400('Bad Request: totally unfamiliar 400 wording')
+      },
+      loadAudio: async () => OGG,
+      sendByUpload: async () => {
+        uploaded++
+        throw grammy400('Bad Request: upload also rejected') // recovery send fails too
+      },
+      onFileId: (id) => {
+        refreshed = id
+      },
+    })
+
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.reason).toBe('send-failed')
+    expect(byFileId).toBe(1) // id tried once
+    expect(uploaded).toBe(1) // re-uploaded exactly once — NO second attempt / loop
+    expect(refreshed).toBeNull() // failed upload never refreshed the id
+  })
+
   it('no-audio on the upload path returns { ok:false, reason:"no-audio" }', async () => {
     const res = await sendVoiceReusingFileId({
       fileId: null,
@@ -178,6 +259,16 @@ describe('extractVoiceFileId / isInvalidTelegramFileIdError', () => {
     ).toBe(false)
     expect(isInvalidTelegramFileIdError(new Error('network'))).toBe(false)
     expect(isInvalidTelegramFileIdError(null)).toBe(false)
+  })
+
+  it('isHttp400Error: true only for error_code 400, wording-agnostic', () => {
+    expect(isHttp400Error(grammy400('any wording at all'))).toBe(true)
+    expect(isHttp400Error(grammy400('Bad Request: chat not found'))).toBe(true) // 400 regardless of text
+    expect(isHttp400Error(Object.assign(new Error('x'), { error_code: 403 }))).toBe(false)
+    expect(isHttp400Error(Object.assign(new Error('x'), { error_code: 500 }))).toBe(false)
+    expect(isHttp400Error(new Error('network'))).toBe(false) // no error_code
+    expect(isHttp400Error(null)).toBe(false)
+    expect(isHttp400Error(undefined)).toBe(false)
   })
 })
 
