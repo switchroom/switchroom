@@ -2,7 +2,73 @@
 
 ## Unreleased
 
-### Stop hook: catch a dropped final reply written after an earlier qualifying reply
+## v0.18.6 — Progress-card liveness fixes, adversarial review hardening, npm-publish release gate
+
+### Worker-activity feed: resurrection race, nested silent-drop, stale finalize (#2960)
+
+Three live bugs in the progress-card / turn-liveness surface. (1) A late
+watcher `onProgress` tick arriving after `finish()` settled resurrected a
+worker-feed handle and painted a running card on an already-finalized worker
+— gated now by a `finished` flag + a durable `finalized` Set. (2) A terminal
+`finish` edit that hit a 429 cooldown surrendered with "stale but harmless";
+it now stages on `pendingFinish` and the heartbeat re-drives it after cooldown.
+(3) A depth-2+ nested worker whose origin chat couldn't be resolved fell
+through to a silent no-card skip; `resolveWorkerFeedChat` now always falls
+back to the owner DM (never `''`). Also tightens warning discipline so
+transport hiccups on the best-effort card surface no longer log scary "edit
+failed" lines nor inflate the turn-DEGRADED counter.
+
+### /usage + /auth footer no longer claims "Live" on a total probe failure (#2961)
+
+The quota-card freshness footer stamped `liveProbedAtMs` whenever
+`staleCachedAtMs` was unset — but a total probe failure (`probeQuota().catch`
+→ `{results: []}`) left it undefined with zero rows, so the footer rendered
+`_Live · refreshed 0s ago_` next to every row showing `⚠️ no data — probe
+failed`. A "Live" footer beside no-data rows is the subscription-honesty lie
+the card exists to prevent. New `probeFailed` opt renders an explicit
+`⚠ probe failed — no live data` footer; `staleCachedAtMs` (real cache) still
+wins.
+
+### person_id: scrub human names from the broadcast config-warning alert (#2962)
+
+The person_id boot check built its broadcast `alertDetail` from the verbose
+`dropped[].reason`, which embedded the `person_id` human-name value. The
+config-warning card fans out to every `allowFrom` chat, including groups
+where the named person may not be a member — bypassing the display path's
+chat-scoping. Split into a verbose `reason` (private stderr `logLine`) and a
+name-scrubbed `reasonClass` (broadcast `alertDetail`); the crash-path error
+message is scrubbed too.
+
+### vault-broker: fsync the rotated audit-log snapshot before truncating (#2963)
+
+`rotateAuditLog` did `copyFileSync` then `truncateSync` with no fsync of the
+snapshot between them — a host-crash window could lose rows AND zero the
+active file, and `seedChain` would restart the hash chain from genesis. The
+`.1` snapshot is now fsync'd (plus best-effort parent dir) before the active
+file is truncated, matching `vault.ts`'s durability discipline. If the
+snapshot fsync throws, the active log is left intact (grow > lose).
+
+### Stop hook: substance floor on trailing-text-after-reply (#2964)
+
+The trailing-content check blocked on ANY plain text after the last delivery
+event — no length floor — so a short trailing pleasantry ("Let me know if you
+need anything else.") after a delivered reply triggered a block + re-prompt,
+burning retry budget. The check now requires ≥ `FINAL_ANSWER_MIN_CHARS`
+(the same bar answer-detection uses); a long trailing verdict the model
+forgot to send still blocks (at-least-once holds).
+
+### Release: automate npm publish on tag + gate rollout on it (#2965)
+
+v0.18.4 and v0.18.5 were tagged, image-built, and rolled to the fleet but
+never published to npm (the publish step was CLAUDE.md prose, not gated).
+New `npm-publish.yml` workflow fires on every `v*` tag push (parallel with
+`docker-images`): uncommitted pack-time version bump, build, empty-dist
+guard, `npm publish` with `NPM_TOKEN` (provenance-first, plain-fallback),
+and verifies `npm view switchroom version` before going green. New
+`switchroom-release` skill makes npm-publish + image-build HARD GATES
+before fleet rollout. Closes the "shipped to fleet but not on npm" gap.
+
+### Stop hook: catch a dropped final reply written after an earlier qualifying reply (#2956)
 
 The `silent-end-interrupt-stop.mjs` Stop hook's transcript scan
 (`scanTurnForFinalReply` in `silent-end-scan.mjs`) returned `allow` on the
