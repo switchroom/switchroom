@@ -64,6 +64,29 @@ describe('createTypingWrapper', () => {
     expect(deps.startTypingLoop).toHaveBeenCalledTimes(1)
   })
 
+  it('fix #7: does NOT stop typing when the first of two parallel tools resolves while the second is still running', () => {
+    const deps = makeDeps()
+    const w = createTypingWrapper(deps)
+    // Two overlapping tool_use blocks on the same lane. The first fires the
+    // loop immediately; the second (still in-flight) uses the debounce.
+    w.onToolUse('t1', 'chat-A', 'Bash')
+    w.onToolUse('t2', 'chat-A', 'Read')
+    expect(deps.startTypingLoop).toHaveBeenCalledTimes(1)
+    // Let t2's debounce fire so it's a live, started entry on the lane too.
+    vi.advanceTimersByTime(500)
+    expect(deps.startTypingLoop).toHaveBeenCalledTimes(2)
+
+    // t1 resolves first — with the pre-fix boolean Set, this deleted the
+    // lane and stopped the loop even though t2 is still running.
+    w.onToolResult('t1')
+    expect(deps.stopTypingLoop).not.toHaveBeenCalled()
+
+    // t2 resolves too — now the lane's ref-count hits zero and the loop stops.
+    w.onToolResult('t2')
+    expect(deps.stopTypingLoop).toHaveBeenCalledTimes(1)
+    expect(deps.stopTypingLoop).toHaveBeenCalledWith('chat-A', null)
+  })
+
   it('starts then stops typing when a single slow tool completes', () => {
     const deps = makeDeps()
     const w = createTypingWrapper(deps)

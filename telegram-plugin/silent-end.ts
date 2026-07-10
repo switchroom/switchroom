@@ -60,6 +60,8 @@ export interface SilentEndDeps {
    * never suppress on doubt.
    */
   hasOutboundDeliveredSince?: (chatId: string, sinceMs: number, threadId?: number | null) => boolean
+  /** Wall-clock now, ms. Defaults to `Date.now`; injectable for tests. */
+  now?: () => number
 }
 
 /**
@@ -79,6 +81,31 @@ export interface SilentEndDeps {
  * model under the same prompt.
  */
 export const SILENT_END_MAX_RETRIES = 2
+
+/**
+ * Fix #8 (adversarial-validation progress-card fix pass): `turnKey` is the
+ * STABLE `statusKey(chatId, threadId)` — it never changes across turns on
+ * the same chat/thread — so `writeSilentEndState`'s "inherit retryCount IFF
+ * turnKey matches" rule has no per-turn discriminator on its own. Normally
+ * that's fine because `clearSilentEndState` always fires the moment a reply
+ * lands, wiping the exhausted record before the next turn starts. But if the
+ * gateway's own exhaust-read-and-clear is bypassed (crash/interrupt mid-turn,
+ * `gateway.ts` ~turn_end handler never runs), an exhausted
+ * (`retryCount >= SILENT_END_MAX_RETRIES`) record can survive into a LATER,
+ * unrelated turn. That later turn's first silent-end would then misread the
+ * old record as "this turn already exhausted its ladder" and skip its own
+ * re-prompt entirely.
+ *
+ * A record legitimately re-written within one turn's own retry ladder is
+ * always fresh (each Stop-hook block re-writes `timestamp`), so bounding by
+ * age is a safe, cheap staleness signal that doesn't require a new identity
+ * field: any record older than a turn's plausible lifetime could not still
+ * be "this turn's" in-flight retry state, and is therefore stale-carryover,
+ * not an active ladder. 30 minutes comfortably exceeds any real single-turn
+ * Stop-hook retry cycle (seconds, not minutes) while staying well inside the
+ * fleet's other staleness bounds (e.g. the 3h boot-resume window).
+ */
+export const SILENT_END_STALE_RECORD_MAX_AGE_MS = 30 * 60_000
 
 /**
  * User-facing fallback text delivered when a user-message turn ends with no
@@ -313,12 +340,30 @@ export function recordSilentTurnEnd(
     // If so, the record is satisfied-but-misdetected — drop it silently
     // and let this dark turn start its OWN fresh retry cycle instead of
     // inheriting someone else's spent budget.
-    if (deps?.hasOutboundDeliveredSince?.(args.chatId, prev.timestamp, args.threadId)) {
+    // Fix #8: age-based staleness bound. `turnKey` has no per-turn nonce
+    // (see SILENT_END_STALE_RECORD_MAX_AGE_MS doc), so a record whose
+    // `timestamp` is older than a turn's plausible lifetime cannot belong to
+    // THIS dark turn's own retry ladder even absent any delivery evidence —
+    // it's carryover from a prior turn whose gateway-side clear was
+    // bypassed (crash/interrupt). Check this before (and independent of)
+    // the delivery-based check below so a bypassed-clear record is caught
+    // even when no reply was ever delivered on the chat/thread at all.
+    const now = deps?.now?.() ?? Date.now()
+    const staleByAge = now - prev.timestamp > SILENT_END_STALE_RECORD_MAX_AGE_MS
+    if (
+      staleByAge ||
+      deps?.hasOutboundDeliveredSince?.(args.chatId, prev.timestamp, args.threadId)
+    ) {
       emitLog(
         deps,
-        `silent-end: stale exhausted record for turnKey=${args.turnKey} ` +
-          `(retryCount=${prev.retryCount}) but a reply was delivered since ` +
-          `${prev.timestamp} — treating as satisfied-but-misdetected, not exhausted\n`,
+        staleByAge
+          ? `silent-end: stale exhausted record for turnKey=${args.turnKey} ` +
+              `(retryCount=${prev.retryCount}, age=${now - prev.timestamp}ms > ` +
+              `${SILENT_END_STALE_RECORD_MAX_AGE_MS}ms) — treating as carryover ` +
+              `from a prior turn, not exhausted\n`
+          : `silent-end: stale exhausted record for turnKey=${args.turnKey} ` +
+              `(retryCount=${prev.retryCount}) but a reply was delivered since ` +
+              `${prev.timestamp} — treating as satisfied-but-misdetected, not exhausted\n`,
       )
       // MUST clear before writing (adversarial review of #2892):
       // writeSilentEndState re-inherits retryCount whenever the on-disk

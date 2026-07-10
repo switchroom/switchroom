@@ -63,6 +63,75 @@ describe('resolveWorkerFeedDispatch (#2002 regression pin)', () => {
   })
 })
 
+describe('gateway onFinish — fix #1: resultText-driven handback fallback (model)', () => {
+  // Mirrors the exact fallback gateway.ts's onFinish handler applies on top
+  // of `resolveWorkerFeedDispatch`'s own result (gateway.ts, onFinish
+  // handler, right after computing `dispatch`):
+  //
+  //   let isBackground = dispatch.isBackground
+  //   if (!dispatch.hasRow && entryBackground == null && resultText.trim().length > 0) {
+  //     isBackground = true
+  //   }
+  //
+  // This is the worst case of the #1 bug: the DB row was never linked
+  // (unlinked `jsonl_agent_id`) AND the watcher's own cached
+  // `entry.background` was also never observed (both `resolveWorkerFeedDispatch`
+  // fallbacks came up empty). A finished worker with actual narrative
+  // result text is far more likely a dropped background handback than a
+  // legitimate foreground no-op, so this degrades to background rather
+  // than silently discarding the result.
+  function applyOnFinishBackgroundFallback(
+    dispatch: { isBackground: boolean; hasRow: boolean },
+    entryBackground: boolean | undefined,
+    resultText: string,
+  ): boolean {
+    let isBackground = dispatch.isBackground
+    if (!dispatch.hasRow && entryBackground == null && resultText.trim().length > 0) {
+      isBackground = true
+    }
+    return isBackground
+  }
+
+  it('meta-missing path: no row, no entry.background, non-empty resultText → routes a handback', () => {
+    const dispatch = resolveWorkerFeedDispatch(null, 'sub-agent', undefined)
+    const result = applyOnFinishBackgroundFallback(dispatch, undefined, 'Here is what I found...')
+    expect(result).toBe(true)
+  })
+
+  it('no-fuzzy-candidate path: no row, no entry.background, non-empty resultText → routes a handback', () => {
+    // Same shape as above — the ambiguous-fuzzy-match-refused case (fix #3)
+    // also leaves jsonl_agent_id unlinked, landing in the same no-row state.
+    const dispatch = resolveWorkerFeedDispatch(null, 'sub-agent', undefined)
+    const result = applyOnFinishBackgroundFallback(dispatch, undefined, 'Task complete: 3 files changed.')
+    expect(result).toBe(true)
+  })
+
+  it('empty resultText with no row/no entry.background does NOT escalate (true foreground no-op preserved)', () => {
+    const dispatch = resolveWorkerFeedDispatch(null, 'sub-agent', undefined)
+    const result = applyOnFinishBackgroundFallback(dispatch, undefined, '   ')
+    expect(result).toBe(false)
+  })
+
+  it('entry.background=false (watcher DID observe it as foreground) is trusted over resultText', () => {
+    const dispatch = resolveWorkerFeedDispatch(null, 'sub-agent', false)
+    const result = applyOnFinishBackgroundFallback(dispatch, false, 'Some prose result anyway.')
+    expect(result).toBe(false)
+  })
+
+  it('entry.background=true (watcher DID observe it) is trusted directly, no resultText fallback needed', () => {
+    const dispatch = resolveWorkerFeedDispatch(null, 'sub-agent', true)
+    const result = applyOnFinishBackgroundFallback(dispatch, true, '')
+    expect(result).toBe(true)
+  })
+
+  it('a present DB row is authoritative — the resultText fallback never overrides a real foreground row', () => {
+    const sub = makeSub({ background: false })
+    const dispatch = resolveWorkerFeedDispatch(sub, 'sub-agent', undefined)
+    const result = applyOnFinishBackgroundFallback(dispatch, undefined, 'Long narrative result...')
+    expect(result).toBe(false)
+  })
+})
+
 // Deterministic PRNG (mulberry32) so a failing case is reproducible from the
 // printed seed rather than flaking once and vanishing.
 function mulberry32(seed: number): () => number {
@@ -137,6 +206,52 @@ describe('resolveWorkerFeedDispatch — randomized property sweep', () => {
       // 5. Pure + deterministic: identical inputs yield a deep-equal result.
       expect(resolveWorkerFeedDispatch(sub, watcher), ctx).toEqual(out)
     }
+  })
+})
+
+describe('resolveWorkerFeedDispatch — fix #1(+#2): entryBackground fallback', () => {
+  it('falls back to entryBackground=true when the registry row is missing (unlinked jsonl_agent_id)', () => {
+    // Simulates onFinish firing for a background worker whose DB row was
+    // never linked via `jsonl_agent_id` (meta.json missing, or the fuzzy
+    // backfill match never fired) — the watcher's own cached
+    // `entry.background` (seeded at dispatch time / kept fresh by
+    // `readSubTail`'s liveness lookup) is the only signal left.
+    const out = resolveWorkerFeedDispatch(null, 'sub-agent', true)
+    expect(out.isBackground).toBe(true)
+    expect(out.hasRow).toBe(false)
+  })
+
+  it('falls back to entryBackground=false when the row is missing and the entry was foreground', () => {
+    const out = resolveWorkerFeedDispatch(null, 'sub-agent', false)
+    expect(out.isBackground).toBe(false)
+  })
+
+  it('defaults to false when the row is missing AND entryBackground was never observed (undefined)', () => {
+    // Both fallbacks come up empty — worst case, matches pre-fix
+    // behaviour (isBackground=false) at the resolver level. The gateway's
+    // onFinish handler applies its OWN further fallback on top of this
+    // (routing a handback anyway when resultText is non-empty) — that's
+    // pinned separately in the gateway-level test, not here.
+    const out = resolveWorkerFeedDispatch(null, 'sub-agent', undefined)
+    expect(out.isBackground).toBe(false)
+    expect(out.hasRow).toBe(false)
+  })
+
+  it('a present registry row always wins over entryBackground, even when they disagree', () => {
+    // The DB row is the authoritative source whenever it's actually
+    // linked — entryBackground is a pure fallback for the unlinked case,
+    // never a second vote.
+    const sub = makeSub({ background: true })
+    const out = resolveWorkerFeedDispatch(sub, 'sub-agent', false)
+    expect(out.isBackground).toBe(true)
+  })
+
+  it('omitting entryBackground entirely preserves prior 2-arg call-site behaviour', () => {
+    // #2002-era callers pass only 2 args — the optional 3rd param must not
+    // change their observed result.
+    expect(resolveWorkerFeedDispatch(null, 'sub-agent')).toEqual(
+      resolveWorkerFeedDispatch(null, 'sub-agent', undefined),
+    )
   })
 })
 

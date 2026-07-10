@@ -43,12 +43,25 @@ export interface WorkerFeedDispatch {
  * decision again: a regression here silently reverts the feed header to
  * "· sub-agent".
  */
+/**
+ * `entryBackground` (fix #1(+#2)): the in-memory watcher entry's own cached
+ * `background` flag (`WorkerEntry.background`), passed by the gateway as a
+ * graceful-degradation fallback for when the registry row (`sub`) is
+ * missing — most often because `jsonl_agent_id` never linked (unreadable
+ * meta.json, or an ambiguous fuzzy backfill — see fix #3). Without this, a
+ * missing row hard-defaults `isBackground` to `false`, silently dropping a
+ * completed background worker's handback (the gateway's `onFinish` treats
+ * `false` as "nothing to deliver — it returns inline"). Ignored entirely
+ * when `sub` resolves — the registry row is always the authoritative
+ * source once it links.
+ */
 export function resolveWorkerFeedDispatch(
   sub: Subagent | null,
   watcherDescription: string,
+  entryBackground?: boolean,
 ): WorkerFeedDispatch {
   return {
-    isBackground: sub?.background ?? false,
+    isBackground: sub?.background ?? entryBackground ?? false,
     feedDescription: (sub?.description ?? '') || watcherDescription,
     hasRow: sub != null,
     isNested: sub?.parent_agent_id != null,
