@@ -408,6 +408,8 @@ import {
   intentForRestartReason,
   readSessionModelFile,
   RELAUNCH_MODEL_INTENT_FILE,
+  GATEWAY_SHUTDOWN_INTENT_REASON_PREFIX,
+  clearStaleGatewayShutdownIntent,
 } from './session-model-file.js'
 import { discoverModels, selectModel } from '../../src/agents/model-picker.js'
 import { resolveMainModel } from '../../src/agents/scaffold.js'
@@ -421,7 +423,9 @@ import {
   type EffortMenuReply,
 } from './effort-command.js'
 import {
-  createPendingSessionCommandSlot,
+  createPendingSessionCommandSlots,
+  drainCapDecision as pendingCmdDrainCapDecision,
+  shutdownResolutionEdits as pendingCmdShutdownResolutionEdits,
   ackText as pendingCmdAckText,
   supersededText as pendingCmdSupersededText,
   restartSupersededText as pendingCmdRestartSupersededText,
@@ -974,6 +978,24 @@ function triggerSelfRestart(
   } catch (err) {
     process.stderr.write(`telegram gateway: restart spawn failed for ${targetAgent}: ${err}\n`)
     return false
+  }
+}
+
+// #3018 finding 4: a gateway-only bounce (supervisor relaunch, bare gateway
+// unit restart) leaves the shutdown handler's deploy-survival keep-intent
+// stamp on disk UNCONSUMED — start.sh only runs on a container-level boot.
+// If this gateway boot still sees a gateway-shutdown-stamped intent, the
+// preceding bounce was gateway-only: clear it so a genuine crash inside the
+// 10-min freshness window can't be converted into a "keep" (crash-reverts
+// policy intact). A real container stop/deploy consumes the file in start.sh
+// before any gateway boots, so a legitimate deploy stamp is never touched;
+// triggerSelfRestart / user-slash stamps use un-prefixed reasons.
+{
+  const bootSmDir = resolveAgentDirFromEnv()
+  if (bootSmDir != null && clearStaleGatewayShutdownIntent(bootSmDir)) {
+    process.stderr.write(
+      'telegram gateway: cleared stale gateway-shutdown relaunch-model intent (previous bounce was gateway-only — container never restarted)\n',
+    )
   }
 }
 
@@ -2631,14 +2653,16 @@ async function deliverButtonTapInbound(
 const pendingRestarts = new Map<string, number>()  // agentName -> timestamp when restart was requested
 
 // Deterministic ack-queue-apply-confirm for /model + /effort issued mid-turn
-// (#3017). Single-valued, last-write-wins. Enqueued at the busy gates (typed
+// (#3017). One slot per kind (model|effort): same-kind last-write-wins,
+// cross-kind coexist (#3018 finding 2). Enqueued at the busy gates (typed
 // and menu), drained at the SAME model-idle gate as pendingRestarts (turn
 // complete + the reaper cap), which then EDITS the ack card into the
 // confirmation. See pending-session-command.ts for the contract.
-const pendingSessionCommand = createPendingSessionCommandSlot()
+const pendingSessionCommand = createPendingSessionCommandSlots()
 // Bounded drain-cap for a queued /model|/effort command whose session never
 // cleanly idles — mirrors PENDING_RESTART_DRAIN_CAP_MS. After this, force the
-// apply-or-report so the ack card never dangles unresolved.
+// apply-or-report so the ack card never dangles unresolved — but ONLY while
+// no turn is in flight (#3018 finding 1; see drainCapDecision).
 const PENDING_CMD_DRAIN_CAP_MS = 60_000
 
 // ─── Proactive context compaction (session.max_context_tokens) ──────────
@@ -6418,15 +6442,31 @@ const pendingStateReaper = setInterval(() => {
       triggerSelfRestart(agentName, 'restart-drain-cap-forced', 100)
     }
   }
-  // Drain cap for a queued /model|/effort command (#3017): if the session
+  // Drain cap for queued /model|/effort commands (#3017): if the session
   // never cleanly idled, force the apply-or-report so the ack card never
   // dangles unresolved. drainPendingSessionCommand no-ops on an idle-gate race
   // (its own re-entrancy guard) and reports honestly when a restart is pending.
-  const queued = pendingSessionCommand.get()
-  if (queued != null && now - queued.requestedAt > PENDING_CMD_DRAIN_CAP_MS) {
-    const waitedSec = Math.round((now - queued.requestedAt) / 1000)
+  // #3018 finding 1: NEVER force while a turn is genuinely in flight — a
+  // forced mid-turn drain hits the typed model handler's busy gate (edits the
+  // ack card into the old "try again" refusal, choice destroyed) and /effort
+  // has no busy gate at all (would type into the live claude input). The cap
+  // only rescues the missed-idle-gate case; mid-turn we keep waiting and the
+  // idle gate drains at turn end.
+  const queuedCmds = pendingSessionCommand.list()
+  const cmdDecision = pendingCmdDrainCapDecision(
+    queuedCmds,
+    now,
+    PENDING_CMD_DRAIN_CAP_MS,
+    turnInFlightForGate(),
+  )
+  if (cmdDecision === 'defer-turn-in-flight') {
     process.stderr.write(
-      `telegram gateway: [pending-cmd-drain] forcing kind=${queued.kind} target=${queued.targetLabel} waited=${waitedSec}s threshold=${Math.round(PENDING_CMD_DRAIN_CAP_MS / 1000)}s\n`,
+      `telegram gateway: [pending-cmd-drain] deferred reason=turn-in-flight queued=${queuedCmds.map(c => c.kind).join(',')}\n`,
+    )
+  } else if (cmdDecision === 'force') {
+    const oldest = Math.min(...queuedCmds.map(c => c.requestedAt))
+    process.stderr.write(
+      `telegram gateway: [pending-cmd-drain] forcing queued=${queuedCmds.map(c => `${c.kind}:${c.targetLabel}`).join(',')} waited=${Math.round((now - oldest) / 1000)}s threshold=${Math.round(PENDING_CMD_DRAIN_CAP_MS / 1000)}s\n`,
     )
     void drainPendingSessionCommand()
   }
@@ -20072,9 +20112,10 @@ async function editPendingCommandCard(chatId: string, messageId: number, text: s
 }
 
 /**
- * Enqueue a mid-turn session command (last-write-wins). If it displaces an
- * earlier queued command, edit that stale ack card into a "superseded" note so
- * the operator's replaced choice is never silently lost.
+ * Enqueue a mid-turn session command (same-kind last-write-wins; a /model and
+ * a /effort coexist). If it displaces an earlier same-kind command, edit that
+ * stale ack card into a "superseded" note so the operator's replaced choice is
+ * never silently lost.
  */
 function enqueueSessionCommand(cmd: PendingSessionCommand): void {
   const displaced = pendingSessionCommand.set(cmd)
@@ -20085,6 +20126,12 @@ function enqueueSessionCommand(cmd: PendingSessionCommand): void {
       pendingCmdSupersededText(displaced, cmd, escapeHtmlForTg),
     )
   }
+  // #3018 finding 5 — enqueue/turn-end race: if the idle gate fired between
+  // the busy check and this enqueue, no further turn-end will drain the slot
+  // and the command would sit until the reaper cap. If the session is idle
+  // NOW, kick the drain immediately (re-entrancy-guarded, no-op if a racing
+  // drain already ran).
+  if (!turnInFlightForGate()) void drainPendingSessionCommand()
 }
 
 /** Apply a queued typed/menu-alias model command at idle; return the reply body. */
@@ -20128,43 +20175,44 @@ async function applyQueuedEffortCommand(cmd: PendingSessionCommand): Promise<str
 let pendingCmdDraining = false
 
 /**
- * Drain the queued session command when the agent goes idle: apply it, then
- * edit the ack card into the confirmation (or a failure banner). Called from
- * the model-idle gate (turn complete) and the reaper drain-cap. No-op when the
- * slot is empty. If a restart is also pending the session is going away — a
- * Claude-model / effort session change would not survive, so report that
- * honestly rather than falsely confirming.
+ * Drain the queued session command(s) when the agent goes idle: apply each,
+ * then edit its ack card into the confirmation (or a failure banner). Called
+ * from the model-idle gate (turn complete), the post-enqueue idle kick, and
+ * the reaper drain-cap. No-op when the slots are empty. If a restart is (or
+ * becomes — a model apply can itself enqueue one) pending, the session is
+ * going away — a Claude-model / effort session change would not survive, so
+ * report that honestly rather than falsely confirming.
  */
 async function drainPendingSessionCommand(): Promise<void> {
   if (pendingCmdDraining) return
   if (pendingSessionCommand.size === 0) return
   pendingCmdDraining = true
-  const cmd = pendingSessionCommand.take()
   try {
-    if (cmd == null) return
-    if (pendingRestarts.size > 0) {
-      await editPendingCommandCard(
-        cmd.ackChatId,
-        cmd.ackMessageId,
-        pendingCmdRestartSupersededText(cmd, escapeHtmlForTg),
-      )
-      return
+    for (const cmd of pendingSessionCommand.takeAll()) {
+      if (pendingRestarts.size > 0) {
+        await editPendingCommandCard(
+          cmd.ackChatId,
+          cmd.ackMessageId,
+          pendingCmdRestartSupersededText(cmd, escapeHtmlForTg),
+        )
+        continue
+      }
+      let body: string
+      try {
+        body =
+          cmd.kind === 'model'
+            ? await applyQueuedModelCommand(cmd)
+            : await applyQueuedEffortCommand(cmd)
+      } catch (err) {
+        await editPendingCommandCard(
+          cmd.ackChatId,
+          cmd.ackMessageId,
+          `❌ Couldn’t apply the queued ${cmd.kind} switch to \`${escapeHtmlForTg(cmd.targetLabel)}\`: ${escapeHtmlForTg((err as Error)?.message ?? String(err))}`,
+        )
+        continue
+      }
+      await editPendingCommandCard(cmd.ackChatId, cmd.ackMessageId, body)
     }
-    let body: string
-    try {
-      body =
-        cmd.kind === 'model'
-          ? await applyQueuedModelCommand(cmd)
-          : await applyQueuedEffortCommand(cmd)
-    } catch (err) {
-      await editPendingCommandCard(
-        cmd.ackChatId,
-        cmd.ackMessageId,
-        `❌ Couldn’t apply the queued ${cmd.kind} switch to \`${escapeHtmlForTg(cmd.targetLabel)}\`: ${escapeHtmlForTg((err as Error)?.message ?? String(err))}`,
-      )
-      return
-    }
-    await editPendingCommandCard(cmd.ackChatId, cmd.ackMessageId, body)
   } finally {
     pendingCmdDraining = false
   }
@@ -25518,7 +25566,12 @@ async function shutdown(signal: string): Promise<void> {
         const hasOverride = readSessionModelFile(smDir) != null
         const intentAlreadyStamped = existsSync(join(smDir, RELAUNCH_MODEL_INTENT_FILE))
         if (hasOverride && !intentAlreadyStamped) {
-          writeRelaunchModelIntent(smDir, 'keep', `graceful ${signal} shutdown (deploy/rolling restart) — preserving user-chosen session model`)
+          // The GATEWAY_SHUTDOWN_INTENT_REASON_PREFIX makes this stamp
+          // recognisable at the next GATEWAY boot: a gateway-only bounce never
+          // runs start.sh, so a leftover stamp with this prefix is cleared at
+          // boot (clearStaleGatewayShutdownIntent) instead of lingering to
+          // convert a later genuine crash into a "keep" (#3018 finding 4).
+          writeRelaunchModelIntent(smDir, 'keep', `${GATEWAY_SHUTDOWN_INTENT_REASON_PREFIX} graceful ${signal} shutdown (deploy/rolling restart) — preserving user-chosen session model`)
           process.stderr.write(`telegram gateway: shutdown.session_model_keep_stamped signal=${signal}\n`)
         }
       }
@@ -25527,6 +25580,27 @@ async function shutdown(signal: string): Promise<void> {
     }
   } else {
     process.stderr.write(`telegram gateway: shutdown.clean_marker_skipped signal=${signal} (crash path — banner will fire on next boot)\n`)
+  }
+
+  // #3018 finding 3: resolve any queued /model|/effort ack cards. The gateway
+  // (and with it the queue) is going away — without this the ack card dangles
+  // at "the moment this turn finishes" forever and the operator's choice is
+  // silently lost. Edit each into the restart-superseded text ("re-issue once
+  // the agent is back"). Best-effort and time-bounded so a wedged Telegram
+  // API can't block shutdown.
+  const orphanedCmdEdits = pendingCmdShutdownResolutionEdits(pendingSessionCommand, escapeHtmlForTg)
+  if (orphanedCmdEdits.length > 0) {
+    process.stderr.write(
+      `telegram gateway: shutdown.pending_cmd_resolved count=${orphanedCmdEdits.length}\n`,
+    )
+    await Promise.race([
+      Promise.allSettled(
+        orphanedCmdEdits.map(e => editPendingCommandCard(e.chatId, e.messageId, e.text)),
+      ),
+      new Promise<void>(resolve => {
+        setTimeout(resolve, SHUTDOWN_PROGRESS_FLUSH_BUDGET_MS).unref()
+      }),
+    ])
   }
 
   // Stage 3c: stamp any in-flight turn as endedVia='sigterm' (or 'restart'

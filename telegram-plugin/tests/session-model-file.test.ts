@@ -19,6 +19,9 @@ import {
   clearRelaunchModelIntent,
   readConfiguredDefaultModel,
   intentForRestartReason,
+  readRelaunchModelIntent,
+  clearStaleGatewayShutdownIntent,
+  GATEWAY_SHUTDOWN_INTENT_REASON_PREFIX,
   SESSION_MODEL_FILE,
   RELAUNCH_MODEL_INTENT_FILE,
   CONFIGURED_DEFAULT_MODEL_FILE,
@@ -114,6 +117,47 @@ describe('intentForRestartReason — the triggerSelfRestart per-reason table (RF
 
   it('unknown gateway reasons default to keep (only gateway code calls triggerSelfRestart; crashes never do)', () => {
     expect(intentForRestartReason('some-future-recovery-path')).toBe('keep')
+  })
+})
+
+describe('readRelaunchModelIntent', () => {
+  it('round-trips a stamped intent; null when absent / corrupt / malformed', () => {
+    expect(readRelaunchModelIntent(dir)).toBeNull()
+    writeRelaunchModelIntent(dir, 'keep', 'watchdog recovery')
+    const rec = readRelaunchModelIntent(dir)!
+    expect(rec.intent).toBe('keep')
+    expect(rec.reason).toBe('watchdog recovery')
+    expect(Math.abs(Date.now() - rec.ts)).toBeLessThan(5000)
+    writeFileSync(join(dir, RELAUNCH_MODEL_INTENT_FILE), '{broken')
+    expect(readRelaunchModelIntent(dir)).toBeNull()
+    writeFileSync(join(dir, RELAUNCH_MODEL_INTENT_FILE), '{"intent":"maybe","reason":"x","ts":1}\n')
+    expect(readRelaunchModelIntent(dir)).toBeNull()
+  })
+})
+
+describe('clearStaleGatewayShutdownIntent (#3018 finding 4 — a gateway-only bounce must not leave a keep stamp)', () => {
+  it('clears ONLY a gateway-shutdown-stamped intent and reports it', () => {
+    writeRelaunchModelIntent(
+      dir,
+      'keep',
+      `${GATEWAY_SHUTDOWN_INTENT_REASON_PREFIX} graceful SIGTERM shutdown (deploy/rolling restart) — preserving user-chosen session model`,
+    )
+    expect(clearStaleGatewayShutdownIntent(dir)).toBe(true)
+    expect(existsSync(join(dir, RELAUNCH_MODEL_INTENT_FILE))).toBe(false)
+    // Idempotent: a second call finds nothing.
+    expect(clearStaleGatewayShutdownIntent(dir)).toBe(false)
+  })
+
+  it('never touches a triggerSelfRestart / user-slash stamp (un-prefixed reason)', () => {
+    writeRelaunchModelIntent(dir, 'keep', 'sr-to-claude-model-switch')
+    expect(clearStaleGatewayShutdownIntent(dir)).toBe(false)
+    expect(readRelaunchModelIntent(dir)!.reason).toBe('sr-to-claude-model-switch')
+  })
+
+  it('is a safe no-op on an absent or corrupt intent file', () => {
+    expect(clearStaleGatewayShutdownIntent(dir)).toBe(false)
+    writeFileSync(join(dir, RELAUNCH_MODEL_INTENT_FILE), 'not json')
+    expect(clearStaleGatewayShutdownIntent(dir)).toBe(false)
   })
 })
 

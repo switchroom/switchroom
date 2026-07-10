@@ -17,12 +17,17 @@
  *      finishes"), deterministically QUEUE the request, then APPLY the moment
  *      the agent goes idle and EDIT the ack card into the confirmation.
  *
- * This is a SINGLE-VALUED per-agent slot, last-write-wins: a rapid `/model
- * fable` then `/model opus` queues only the latest (the earlier ack card is
- * edited to "superseded"). It reuses the same idle-gate discipline as
- * `pendingRestarts` / proactive `/compact` — drained at the model-idle gate
- * (`activeTurnStartedAt.size === 0`) with a bounded reaper fallback so a
- * session that never cleanly idles still applies-or-reports.
+ * This is a PER-KIND slot store (one slot for `model`, one for `effort`):
+ * same-kind last-write-wins — a rapid `/model fable` then `/model opus`
+ * queues only the latest (the earlier ack card is edited to "superseded") —
+ * while cross-kind requests coexist (a queued `/effort` never displaces a
+ * queued `/model`; both apply at idle). It reuses the same idle-gate
+ * discipline as `pendingRestarts` / proactive `/compact` — drained at the
+ * model-idle gate (`activeTurnStartedAt.size === 0`) with a bounded reaper
+ * fallback so a session that never cleanly idles still applies-or-reports.
+ * The reaper cap DEFERS while a turn is genuinely in flight (see
+ * `drainCapDecision`): forcing mid-turn would hit the typed handler's busy
+ * refusal (dropping the choice) or type into the live claude input.
  *
  * The apply itself (running the real handler, recording the session-model
  * override, editing the ack card) lives in the gateway — this module is the
@@ -67,44 +72,113 @@ export interface PendingSessionCommand {
   requestedAt: number
 }
 
-export interface PendingSessionCommandSlot {
-  /** The queued command, or null when the slot is empty. */
-  get(): PendingSessionCommand | null
+export interface PendingSessionCommandSlots {
+  /** The queued command of that kind, or null when its slot is empty. */
+  get(kind: PendingCommandKind): PendingSessionCommand | null
   /**
-   * Enqueue last-write-wins. Returns the command it DISPLACED (if any) so the
-   * caller can edit that stale ack card into a "superseded" note.
+   * Enqueue. SAME-KIND last-write-wins: returns the same-kind command it
+   * DISPLACED (if any) so the caller can edit that stale ack card into a
+   * "superseded" note. CROSS-KIND commands coexist — a `/effort` never
+   * displaces a queued `/model` and vice versa.
    */
   set(cmd: PendingSessionCommand): PendingSessionCommand | null
-  /** Atomically remove and return the queued command (the drain's read). */
-  take(): PendingSessionCommand | null
-  /** Drop the queued command without applying it. */
+  /** Atomically remove and return the queued command of that kind. */
+  take(kind: PendingCommandKind): PendingSessionCommand | null
+  /**
+   * Atomically remove and return ALL queued commands in enqueue order (a
+   * same-kind re-enqueue moves to the back). The drain's and shutdown's read.
+   */
+  takeAll(): PendingSessionCommand[]
+  /** Snapshot of every queued command WITHOUT removing (the reaper's overdue check). */
+  list(): PendingSessionCommand[]
+  /** Drop every queued command without applying it. */
   clear(): void
-  /** 0 or 1 — mirrors the `pendingRestarts.size` gate shape. */
+  /** 0..2 — mirrors the `pendingRestarts.size` gate shape. */
   readonly size: number
 }
 
-/** Create an empty single-valued slot. */
-export function createPendingSessionCommandSlot(): PendingSessionCommandSlot {
-  let slot: PendingSessionCommand | null = null
+/** Create an empty per-kind slot store. */
+export function createPendingSessionCommandSlots(): PendingSessionCommandSlots {
+  const slots = new Map<PendingCommandKind, PendingSessionCommand>()
   return {
-    get: () => slot,
+    get: (kind: PendingCommandKind) => slots.get(kind) ?? null,
     set(cmd: PendingSessionCommand): PendingSessionCommand | null {
-      const displaced = slot
-      slot = cmd
+      const displaced = slots.get(cmd.kind) ?? null
+      // Delete-then-set so a same-kind re-enqueue moves to the BACK of the
+      // enqueue order — takeAll applies in latest-request order.
+      slots.delete(cmd.kind)
+      slots.set(cmd.kind, cmd)
       return displaced
     },
-    take(): PendingSessionCommand | null {
-      const cur = slot
-      slot = null
+    take(kind: PendingCommandKind): PendingSessionCommand | null {
+      const cur = slots.get(kind) ?? null
+      slots.delete(kind)
       return cur
     },
+    takeAll(): PendingSessionCommand[] {
+      const all = [...slots.values()]
+      slots.clear()
+      return all
+    },
+    list: () => [...slots.values()],
     clear(): void {
-      slot = null
+      slots.clear()
     },
     get size(): number {
-      return slot == null ? 0 : 1
+      return slots.size
     },
   }
+}
+
+/**
+ * What the reaper's bounded drain-cap should do this tick.
+ *
+ *   - 'wait'                 — nothing queued long enough; keep waiting.
+ *   - 'defer-turn-in-flight' — something IS overdue, but a turn is genuinely
+ *     in flight. Forcing a drain now would destroy the queued command: the
+ *     typed model path hits handleModelCommand's busy gate (the old "try
+ *     again" refusal, choice dropped) and /effort would type into the live
+ *     claude input. The cap only rescues the MISSED-IDLE-GATE case, so keep
+ *     waiting — the idle gate drains at turn end.
+ *   - 'force'                — overdue AND idle: the idle gate was missed;
+ *     force the apply-or-report so the ack card never dangles unresolved.
+ */
+export type DrainCapDecision = 'wait' | 'defer-turn-in-flight' | 'force'
+
+export function drainCapDecision(
+  queued: readonly PendingSessionCommand[],
+  now: number,
+  capMs: number,
+  turnInFlight: boolean,
+): DrainCapDecision {
+  const overdue = queued.some(c => now - c.requestedAt > capMs)
+  if (!overdue) return 'wait'
+  return turnInFlight ? 'defer-turn-in-flight' : 'force'
+}
+
+/** One best-effort ack-card edit the caller should perform. */
+export interface PendingCommandCardEdit {
+  chatId: string
+  messageId: number
+  text: string
+}
+
+/**
+ * Gateway-shutdown resolution for queued commands: EMPTY the slots and return
+ * the ack-card edits that tell the operator their queued choice cannot apply
+ * (the session is going away with the gateway) and must be re-issued after
+ * boot. Without this, a SIGTERM leaves the ack card dangling at "the moment
+ * this turn finishes" forever and the choice is silently lost.
+ */
+export function shutdownResolutionEdits(
+  slots: PendingSessionCommandSlots,
+  escapeHtml: (s: string) => string,
+): PendingCommandCardEdit[] {
+  return slots.takeAll().map(cmd => ({
+    chatId: cmd.ackChatId,
+    messageId: cmd.ackMessageId,
+    text: restartSupersededText(cmd, escapeHtml),
+  }))
 }
 
 const KIND_NOUN: Record<PendingCommandKind, string> = {
