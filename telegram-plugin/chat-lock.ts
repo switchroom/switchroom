@@ -70,6 +70,19 @@ export function createChatLock(): ChatLock {
     const tracked = next.finally(() => {
       if (chains.get(key) === tracked) chains.delete(key)
     })
+    // `tracked` is a SECOND promise derived from `next`, retained only in
+    // the `chains` map for ordering. The caller awaits `next` (and handles
+    // its rejection); `tracked` is picked up by the NEXT queued call via
+    // `prior.then(fn, fn)`. But when this is the TAIL call on the key —
+    // the common single-reply case — nothing ever attaches a handler to
+    // `tracked`, so a rejected `next` surfaces as an UNHANDLED REJECTION
+    // and (per the gateway's unhandledRejection policy) crashes + reboots
+    // the whole gateway. This bit any failing send that was last in its
+    // (chat,thread) lane: sendPhoto PHOTO_INVALID_DIMENSIONS, sendMediaGroup,
+    // editMessageText MESSAGE_TOO_LONG, deleteMessage "can't be deleted",
+    // etc. Swallow the rejection on the internal tracking promise ONLY —
+    // the caller's `next` still carries the real error for normal handling.
+    tracked.catch(() => {})
     chains.set(key, tracked)
     return next
   }

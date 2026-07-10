@@ -183,6 +183,7 @@ import {
   createRetryApiCall,
   createSwallowingRetryApiCall,
   retryWithThreadFallback,
+  isPhotoDimensionRejectError,
 } from '../retry-api-call.js'
 import { installTgPostLogger, withTgPostTags } from '../shared/bot-runtime.js'
 import { floodStatePath, makeFloodWaitRecorder } from '../flood-circuit-breaker.js'
@@ -11805,22 +11806,57 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // crash when the user deletes the topic mid-flight.
   const replyParams =
     reply_to != null && replyMode !== 'off' ? { reply_parameters: { message_id: reply_to } } : {}
-  if (allPhotos) {
-    const media = files.map((f) => ({
-      type: 'photo' as const,
-      media: new InputFile(f),
-    }))
-    const sent = await retryWithThreadFallback(
+  // Send one file as a document, routed through the same thread-fallback
+  // policy as the photo path. `InputFile` streams are single-use, so a
+  // document retry after a failed sendPhoto must build a FRESH InputFile
+  // from the path. Returns the sent message (with its echoed thread id).
+  const sendAsDocument = (f: string) =>
+    retryWithThreadFallback<{ message_id: number; message_thread_id?: number }>(
       robustApiCall,
       (tid) => {
         const baseOpts = {
           ...replyParams,
           ...(tid != null ? { message_thread_id: tid } : {}),
         }
-        return lockedBot.api.sendMediaGroup(chat_id, media, baseOpts)
+        // allow-raw-bot-api: wrapped in retryWithThreadFallback (retry policy); topic-aware document fallback
+        return lockedBot.api.sendDocument(chat_id, new InputFile(f), baseOpts)
       },
-      { threadId, chat_id, verb: 'sendMediaGroup' },
+      { threadId, chat_id, verb: 'sendDocument' },
     )
+
+  if (allPhotos) {
+    const media = files.map((f) => ({
+      type: 'photo' as const,
+      media: new InputFile(f),
+    }))
+    let sent: Array<{ message_id: number; message_thread_id?: number }>
+    try {
+      sent = await retryWithThreadFallback(
+        robustApiCall,
+        (tid) => {
+          const baseOpts = {
+            ...replyParams,
+            ...(tid != null ? { message_thread_id: tid } : {}),
+          }
+          return lockedBot.api.sendMediaGroup(chat_id, media, baseOpts)
+        },
+        { threadId, chat_id, verb: 'sendMediaGroup' },
+      )
+    } catch (err) {
+      // Graceful fallback: one bad photo in the album (e.g. a tall phone
+      // screenshot → PHOTO_INVALID_DIMENSIONS) fails the WHOLE media group.
+      // Rather than surface an error, re-send each file individually as a
+      // document so the user still receives all of them. See #klanker
+      // 2026-07-10 incident + isPhotoDimensionRejectError.
+      if (!isPhotoDimensionRejectError(err)) throw err
+      process.stderr.write(
+        `telegram gateway: sendMediaGroup rejected the photo album ` +
+        `(${err instanceof Error ? err.message : String(err)}); ` +
+        `falling back to per-file sendDocument\n`,
+      )
+      sent = []
+      for (const f of files) sent.push(await sendAsDocument(f))
+    }
     if (threadId != null) {
       // If the fallback dropped the thread id, propagate that decision
       // to subsequent calls in this reply (no further retries needed).
@@ -11836,19 +11872,35 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
       const ext = extname(f).toLowerCase()
       const input = new InputFile(f)
       const isPhoto = PHOTO_EXTS.has(ext)
-      const sent = await retryWithThreadFallback<{ message_id: number; message_thread_id?: number }>(
-        robustApiCall,
-        (tid) => {
-          const baseOpts = {
-            ...replyParams,
-            ...(tid != null ? { message_thread_id: tid } : {}),
-          }
-          return isPhoto
-            ? lockedBot.api.sendPhoto(chat_id, input, baseOpts)
-            : lockedBot.api.sendDocument(chat_id, input, baseOpts)
-        },
-        { threadId, chat_id, verb: isPhoto ? 'sendPhoto' : 'sendDocument' },
-      )
+      let sent: { message_id: number; message_thread_id?: number }
+      try {
+        sent = await retryWithThreadFallback<{ message_id: number; message_thread_id?: number }>(
+          robustApiCall,
+          (tid) => {
+            const baseOpts = {
+              ...replyParams,
+              ...(tid != null ? { message_thread_id: tid } : {}),
+            }
+            return isPhoto
+              ? lockedBot.api.sendPhoto(chat_id, input, baseOpts)
+              : lockedBot.api.sendDocument(chat_id, input, baseOpts)
+          },
+          { threadId, chat_id, verb: isPhoto ? 'sendPhoto' : 'sendDocument' },
+        )
+      } catch (err) {
+        // Graceful fallback: an image Telegram won't accept as a photo
+        // (dimensions out of range / too large — a tall phone screenshot
+        // is the canonical trigger, PHOTO_INVALID_DIMENSIONS) is re-sent
+        // as a document so the user still receives the file instead of
+        // getting nothing. Non-photo-dimension errors propagate as before.
+        if (!(isPhoto && isPhotoDimensionRejectError(err))) throw err
+        process.stderr.write(
+          `telegram gateway: sendPhoto rejected ${f} ` +
+          `(${err instanceof Error ? err.message : String(err)}); ` +
+          `falling back to sendDocument\n`,
+        )
+        sent = await sendAsDocument(f)
+      }
       // Mirror the threadId-clear above so the *next* file in the
       // loop skips the doomed thread without paying for another
       // round trip + retry.
