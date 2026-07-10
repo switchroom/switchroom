@@ -22,7 +22,6 @@ import {
 import type { DispatchCtx } from '../gateway/inbound-delivery-machine-dispatch'
 import { createPendingInboundBuffer } from '../gateway/pending-inbound-buffer'
 import { createPendingPermissionBuffer } from '../gateway/pending-permission-decisions'
-import type { Effect } from '../gateway/inbound-delivery-machine'
 
 function makeCtx(overrides?: Partial<DispatchCtx>): {
   ctx: DispatchCtx
@@ -184,57 +183,93 @@ describe('dispatchEffects — kill switch', () => {
   })
 })
 
-describe('dispatchOne — not-yet-cutover effects log without throwing', () => {
-  const notYet: Effect['kind'][] = [
-    'deliverToBridge',
-    'bufferInbound',
-    'persistInbound',
-    'setTurnStarted',
-    'clearTurnStarted',
-    'noteOutbound',
-    'firePoke',
-    'deliverPermVerdict',
-    'persistPermVerdict',
-  ]
+describe('dispatchEffects — inbound-routing effects (PR3c wiring)', () => {
+  const k = 'c1:_' as never
+  const ipcMsg = { type: 'inbound' as const, id: 'm1', chat_id: '1', text: 'hi', meta: { source: 'telegram' } }
 
-  for (const kind of notYet) {
-    it(`'${kind}' logs not-yet-cutover and does NOT touch primitives`, () => {
-      const { ctx, sendToAgent, clientSend, logs } = makeCtx()
-      // Construct a minimal valid effect for each kind. Most carry a
-      // payload that the dispatcher ignores in this PR.
-      const effect = synthesizeNotYetCutoverEffect(kind)
-      expect(() => __dispatchOneForTests(effect, ctx)).not.toThrow()
-      expect(sendToAgent).not.toHaveBeenCalled()
-      expect(clientSend).not.toHaveBeenCalled()
-      expect(logs.some((l) => l.includes(`not-yet-cutover effect=${kind}`))).toBe(true)
-    })
-  }
+  it('deliverToBridge sends the payload to the client', () => {
+    const { ctx, clientSend } = makeCtx()
+    __dispatchOneForTests({ kind: 'deliverToBridge', key: k, msg: { msgId: 1, isSteering: false, payload: ipcMsg } }, ctx)
+    expect(clientSend).toHaveBeenCalledTimes(1)
+    expect(clientSend).toHaveBeenCalledWith(ipcMsg)
+  })
+
+  it('deliverToBridge falls back to ipcServer.sendToAgent with no client', () => {
+    const { ctx, sendToAgent } = makeCtx({ client: undefined })
+    __dispatchOneForTests({ kind: 'deliverToBridge', key: k, msg: { msgId: 1, isSteering: false, payload: ipcMsg } }, ctx)
+    expect(sendToAgent).toHaveBeenCalledWith('test-agent', ipcMsg)
+  })
+
+  it('deliverToBridge enrols in the deliver-until-acked sweep', () => {
+    const onUserInboundDelivered = vi.fn()
+    const { ctx } = makeCtx({ onUserInboundDelivered })
+    __dispatchOneForTests({ kind: 'deliverToBridge', key: k, msg: { msgId: 1, isSteering: false, payload: ipcMsg } }, ctx)
+    expect(onUserInboundDelivered).toHaveBeenCalledWith(ipcMsg)
+  })
+
+  it('bufferInbound pushes onto the pending inbound buffer', () => {
+    const { ctx, inbound, clientSend } = makeCtx()
+    __dispatchOneForTests({ kind: 'bufferInbound', key: k, msg: { msgId: 1, isSteering: false, payload: ipcMsg } }, ctx)
+    expect(inbound.depth('test-agent')).toBe(1)
+    expect(clientSend).not.toHaveBeenCalled()
+  })
+
+  it('persistInbound puts to the spool when one is attached', () => {
+    const put = vi.fn(() => true)
+    const { ctx } = makeCtx({ inboundSpool: { put } as never })
+    __dispatchOneForTests({ kind: 'persistInbound', key: k, msg: { msgId: 1, isSteering: false, payload: ipcMsg } }, ctx)
+    expect(put).toHaveBeenCalledWith('test-agent', ipcMsg)
+  })
+
+  it('persistInbound is a safe no-op when no spool is attached', () => {
+    const { ctx } = makeCtx({ inboundSpool: null })
+    expect(() =>
+      __dispatchOneForTests({ kind: 'persistInbound', key: k, msg: { msgId: 1, isSteering: false, payload: ipcMsg } }, ctx),
+    ).not.toThrow()
+  })
 })
 
-function synthesizeNotYetCutoverEffect(kind: Effect['kind']): Effect {
+describe('dispatchEffects — perm-verdict effects', () => {
+  const permEv = { type: 'permission_decision' as const, requestId: 'r1', behavior: 'allow' as const, updatedInput: {}, timestamp: 0 }
+
+  it('deliverPermVerdict sends the payload to the client', () => {
+    const { ctx, clientSend } = makeCtx()
+    __dispatchOneForTests({ kind: 'deliverPermVerdict', verdict: { requestId: 'r1', behavior: 'allow', payload: permEv } }, ctx)
+    expect(clientSend).toHaveBeenCalledWith(permEv)
+  })
+
+  it('persistPermVerdict pushes onto the pending permission buffer', () => {
+    const { ctx, perm, clientSend } = makeCtx()
+    __dispatchOneForTests({ kind: 'persistPermVerdict', verdict: { requestId: 'r1', behavior: 'allow', payload: permEv } }, ctx)
+    expect(clientSend).not.toHaveBeenCalled()
+    expect(perm.drain('test-agent')).toEqual([permEv])
+  })
+})
+
+describe('dispatchEffects — turn/poke callbacks', () => {
   const k = 'c1:_' as never
-  const msg = { msgId: 1, isSteering: false, payload: null } as never
-  const verdict = { requestId: 'r', behavior: 'allow' as const, payload: null } as never
-  switch (kind) {
-    case 'deliverToBridge':
-      return { kind, key: k, msg }
-    case 'bufferInbound':
-      return { kind, key: k, msg }
-    case 'persistInbound':
-      return { kind, key: k, msg }
-    case 'setTurnStarted':
-      return { kind, key: k, at: 0 }
-    case 'clearTurnStarted':
-      return { kind, key: k }
-    case 'noteOutbound':
-      return { kind, key: k, at: 0 }
-    case 'firePoke':
-      return { kind, key: k, level: 'fallback' }
-    case 'deliverPermVerdict':
-      return { kind, verdict }
-    case 'persistPermVerdict':
-      return { kind, verdict }
-    default:
-      throw new Error(`unreachable: ${kind}`)
-  }
-}
+
+  it('setTurnStarted / clearTurnStarted / noteOutbound / firePoke fire their callbacks', () => {
+    const onSetTurnStarted = vi.fn()
+    const onClearTurnStarted = vi.fn()
+    const onNoteOutbound = vi.fn()
+    const onFirePoke = vi.fn()
+    const { ctx } = makeCtx({ onSetTurnStarted, onClearTurnStarted, onNoteOutbound, onFirePoke })
+    __dispatchOneForTests({ kind: 'setTurnStarted', key: k, at: 7 }, ctx)
+    __dispatchOneForTests({ kind: 'clearTurnStarted', key: k }, ctx)
+    __dispatchOneForTests({ kind: 'noteOutbound', key: k, at: 9 }, ctx)
+    __dispatchOneForTests({ kind: 'firePoke', key: k, level: 'fallback' }, ctx)
+    expect(onSetTurnStarted).toHaveBeenCalledWith(k, 7)
+    expect(onClearTurnStarted).toHaveBeenCalledWith(k)
+    expect(onNoteOutbound).toHaveBeenCalledWith(k, 9)
+    expect(onFirePoke).toHaveBeenCalledWith(k, 'fallback')
+  })
+
+  it('logs an `unwired` trace (never silently no-ops) when a callback is absent', () => {
+    const { ctx, logs } = makeCtx()
+    __dispatchOneForTests({ kind: 'setTurnStarted', key: k, at: 0 }, ctx)
+    __dispatchOneForTests({ kind: 'firePoke', key: k, level: 'soft' }, ctx)
+    expect(logs.some((l) => l.includes('unwired effect=setTurnStarted'))).toBe(true)
+    expect(logs.some((l) => l.includes('unwired effect=firePoke'))).toBe(true)
+  })
+})
