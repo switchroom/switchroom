@@ -25,15 +25,17 @@
  * complete the write — the caller degrades gracefully (tells the agent the
  * value was lost to a restart). `request_secret` never holds a value at
  * staging time (the value arrives after the tap), so its metadata is safe to
- * persist. The `check-no-pii-secrets` guard and the accompanying test pin the
- * "no value field" invariant.
+ * persist. The "no value field" invariant is enforced by the record types
+ * below (PersistedVaultSaveCard has no `value` member, so a callsite can't
+ * compile one in) and pinned by the on-disk sentinel test in
+ * pending-card-store.test.ts.
  *
  * File format: JSON array of PersistedApprovalCard objects. Written
  * synchronously (mode 0o600) to avoid interleaving on concurrent card posts;
  * production rate is a handful of cards, so the file stays tiny.
  */
 
-import { readFileSync, writeFileSync, unlinkSync } from 'node:fs'
+import { readFileSync, writeFileSync, unlinkSync, chmodSync } from 'node:fs'
 import { join } from 'node:path'
 
 /** The four agent-initiated approval-card families we persist. */
@@ -125,6 +127,10 @@ export function createPendingCardStore(stateDir: string): PendingCardStore {
   function write(entries: PersistedApprovalCard[]): void {
     try {
       writeFileSync(filePath, JSON.stringify(entries), { encoding: 'utf-8', mode: 0o600 })
+      // `mode` only applies when writeFileSync CREATES the file; an existing
+      // file keeps its prior perms. Re-assert 0600 on every write so the file
+      // can never stay laxer than intended.
+      chmodSync(filePath, 0o600)
     } catch (err) {
       process.stderr.write(
         `telegram gateway: pending-card-store write failed: ${(err as Error).message}\n`,

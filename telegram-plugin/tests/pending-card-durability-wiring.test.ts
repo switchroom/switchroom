@@ -132,9 +132,12 @@ describe('resolution clears the durable store (Defect A)', () => {
 // ─── Defect B: TTL expiry wakes the parked agent ──────────────────────────
 
 describe('TTL expiry wakes the parked agent (Defect B)', () => {
-  it('the periodic reaper runs the approval-card expiry sweep', () => {
+  it('the periodic reaper runs the approval-card expiry sweep inside try/catch', () => {
     const reaper = slice(GATEWAY, 'const pendingStateReaper = setInterval', 12000)
-    expect(reaper).toMatch(/sweepExpiredApprovalCards\(now\)/)
+    // The sweep call must be guarded like the sibling sweepStaleTurnActiveMarker:
+    // an escaped throw inside this setInterval callback reaches uncaughtException
+    // and takes the whole gateway down.
+    expect(reaper).toMatch(/try\s*\{\s*sweepExpiredApprovalCards\(now\)\s*\}\s*catch/)
   })
 
   it('sweepExpiredApprovalCards runs all four family sweeps', () => {
@@ -145,14 +148,19 @@ describe('TTL expiry wakes the parked agent (Defect B)', () => {
     expect(fn).toMatch(/sweepSecretRequests\(now\)/)
   })
 
-  it('each expire* helper injects a TIMEOUT synthetic + records a missed approval', () => {
+  it('each expire* helper routes through the guarded expirePendingCard core', () => {
     for (const [fnName, builder] of [
       ['function expireVaultAccessCard', 'buildVaultAccessTimeoutInbound'],
       ['function expireVaultSaveCard', 'buildVaultSaveTimeoutInbound'],
       ['function expireSecretRequestCard', 'buildSecretRequestTimeoutInbound'],
       ['function expireMentalModelProposeCard', 'buildMentalModelProposeTimeoutInbound'],
     ] as const) {
-      const fn = slice(GATEWAY, fnName, 1600)
+      const fn = slice(GATEWAY, fnName, 2400)
+      // The pure core owns ordering + fault isolation (delete-before-deliver,
+      // recordMiss-before-deliver, guarded deliver) — pinned BEHAVIORALLY in
+      // pending-card-expiry.test.ts. Here we pin that the gateway routes each
+      // family through it with the right dependencies.
+      expect(fn, fnName).toMatch(/expirePendingCard\(\{/)
       expect(fn, fnName).toMatch(new RegExp(builder))
       // turn-safe injection gate
       expect(fn, fnName).toMatch(/deliverResumeSyntheticOrBuffer\(/)
@@ -161,6 +169,18 @@ describe('TTL expiry wakes the parked agent (Defect B)', () => {
       // card edited to expired + store cleared
       expect(fn, fnName).toMatch(/editCardExpired\(/)
       expect(fn, fnName).toMatch(/pendingCardStore\.remove\(stageId\)/)
+    }
+  })
+
+  it('each family sweep is per-entry guarded via sweepExpiredEntries', () => {
+    for (const fnName of [
+      'function sweepPendingVaultRequestAccesses',
+      'function sweepPendingVaultRequestSaves',
+      'function sweepPendingMentalModelProposes',
+      'function sweepSecretRequests',
+    ]) {
+      const fn = slice(GATEWAY, fnName, 500)
+      expect(fn, fnName).toMatch(/sweepExpiredEntries\(/)
     }
   })
 

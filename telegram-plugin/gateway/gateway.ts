@@ -133,6 +133,7 @@ import {
   buildSecretRequestTimeoutInbound,
   buildMentalModelProposeTimeoutInbound,
 } from './approval-timeout-inbound-builders.js'
+import { expirePendingCard, sweepExpiredEntries } from './pending-card-expiry.js'
 import {
   isPermissionRearmEnabled,
   permissionRearmGraceMs,
@@ -5395,10 +5396,13 @@ const pendingVaultRequestSaves = new Map<string, PendingVaultRequestSave>()
 // races ahead of the card the operator is still looking at.
 const VAULT_REQUEST_SAVE_TTL_MS = approvalTtlMs()
 function sweepPendingVaultRequestSaves(now = Date.now()): void {
-  const cutoff = now - VAULT_REQUEST_SAVE_TTL_MS
-  for (const [k, v] of pendingVaultRequestSaves) {
-    if (v.staged_at < cutoff) expireVaultSaveCard(k, v, now)
-  }
+  sweepExpiredEntries(
+    pendingVaultRequestSaves,
+    (v, n) => v.staged_at < n - VAULT_REQUEST_SAVE_TTL_MS,
+    expireVaultSaveCard,
+    now,
+    cardExpiryLog,
+  )
 }
 
 /**
@@ -5442,10 +5446,13 @@ const pendingVaultRequestAccesses = new Map<string, PendingVaultRequestAccess>()
 // approval-card lifetime (config-driven, 60-min default) — see approvalTtlMs.
 const VAULT_REQUEST_ACCESS_TTL_MS = approvalTtlMs()
 function sweepPendingVaultRequestAccesses(now = Date.now()): void {
-  const cutoff = now - VAULT_REQUEST_ACCESS_TTL_MS
-  for (const [k, v] of pendingVaultRequestAccesses) {
-    if (v.staged_at < cutoff) expireVaultAccessCard(k, v, now)
-  }
+  sweepExpiredEntries(
+    pendingVaultRequestAccesses,
+    (v, n) => v.staged_at < n - VAULT_REQUEST_ACCESS_TTL_MS,
+    expireVaultAccessCard,
+    now,
+    cardExpiryLog,
+  )
 }
 
 /**
@@ -5478,10 +5485,13 @@ const MENTAL_MODEL_PROPOSE_TTL_MS = approvalTtlMs()
 // into a "Card expired" answer — the operator sees the ⌛ expiry inline instead.
 // Best-effort: card edits are fire-and-forget (the entry is removed regardless).
 function sweepPendingMentalModelProposes(now = Date.now()): void {
-  const cutoff = now - MENTAL_MODEL_PROPOSE_TTL_MS
-  for (const [k, v] of pendingMentalModelProposes) {
-    if (v.staged_at < cutoff) expireMentalModelProposeCard(k, v, now)
-  }
+  sweepExpiredEntries(
+    pendingMentalModelProposes,
+    (v, n) => v.staged_at < n - MENTAL_MODEL_PROPOSE_TTL_MS,
+    expireMentalModelProposeCard,
+    now,
+    cardExpiryLog,
+  )
 }
 
 // Sliding-window rate limit for mental-model proposals: at most
@@ -5725,13 +5735,19 @@ function isAutoFallbackCooldownActive(_agentName: string, now: number): boolean 
 // requesting agent (it ends its turn to wait for the operator's tap). Before
 // this, an unanswered card that TTL-expired left the agent parked FOREVER: the
 // lazy sweep just deleted the in-memory entry and nothing woke the agent. Each
-// expire* helper mirrors the permission-card timeout path (#2411 / #2862):
-//   1. edit the card to a ⌛ expired state + strip its keyboard,
-//   2. inject a TIMEOUT-outcome synthetic inbound (turn-gated via
-//      deliverResumeSyntheticOrBuffer) so the agent can re-request or degrade,
-//   3. record it in missedApprovalsStore so it's re-offered when the operator
-//      returns,
-//   4. drop the in-memory entry AND its durable store record.
+// expire* helper mirrors the permission-card timeout path (#2411 / #2862) by
+// routing through the pure `expirePendingCard` core (pending-card-expiry.ts),
+// whose ordering + fault-isolation contract is behaviorally pinned by
+// pending-card-expiry.test.ts:
+//   1. drop the in-memory entry AND its durable store record FIRST (single-
+//      shot — a second tick can never double-fire the wake),
+//   2. edit the card to a ⌛ expired state + strip its keyboard (best-effort),
+//   3. record it in missedApprovalsStore BEFORE delivering, so a throwing
+//      deliver can't lose the re-offer for the operator's return,
+//   4. inject a TIMEOUT-outcome synthetic inbound (turn-gated via
+//      deliverResumeSyntheticOrBuffer, guarded — a half-dead IPC socket that
+//      throws on write is contained, never escaping the reaper's setInterval
+//      callback into an uncaughtException gateway shutdown).
 // Called from BOTH the lazy sweeps (on next stage) and the pendingStateReaper
 // (every 60s — the authoritative timer so an idle gateway still wakes agents).
 
@@ -5762,32 +5778,41 @@ function recordMissedApproval(opts: {
   })
 }
 
+const cardExpiryLog = (msg: string): void => {
+  process.stderr.write(`telegram gateway: ${msg}\n`)
+}
+
 function expireVaultAccessCard(stageId: string, v: PendingVaultRequestAccess, now: number): void {
-  pendingVaultRequestAccesses.delete(stageId)
-  pendingCardStore.remove(stageId)
-  void editCardExpired(
-    v.chat_id,
-    v.card_message_id,
-    `⌛ _This vault access request for \`${escapeHtmlForTg(v.key)}\` timed out before you tapped. Ask **${escapeHtmlForTg(v.agent)}** to re-request if it still stands._`,
-  )
   const timeoutMinutes = Math.round(VAULT_REQUEST_ACCESS_TTL_MS / 60000)
-  const inbound = buildVaultAccessTimeoutInbound({
-    agent: v.agent,
-    chatId: v.chat_id,
-    ...(v.threadId != null ? { threadId: v.threadId } : {}),
-    stageId,
-    timeoutMinutes,
-    key: v.key,
-    scope: v.scope,
-  })
-  const delivered = deliverResumeSyntheticOrBuffer(v.agent, inbound)
-  recordMissedApproval({
-    stageId,
-    toolName: 'vault_request_access',
-    action: `grant ${v.agent} ${v.scope} access to \`${v.key}\``,
-    chatId: v.chat_id,
-    ...(v.threadId != null ? { threadId: v.threadId } : {}),
-    now,
+  const { delivered } = expirePendingCard({
+    remove: () => {
+      pendingVaultRequestAccesses.delete(stageId)
+      pendingCardStore.remove(stageId)
+    },
+    editCard: () => void editCardExpired(
+      v.chat_id,
+      v.card_message_id,
+      `⌛ _This vault access request for \`${escapeHtmlForTg(v.key)}\` timed out before you tapped. Ask **${escapeHtmlForTg(v.agent)}** to re-request if it still stands._`,
+    ),
+    buildInbound: () => buildVaultAccessTimeoutInbound({
+      agent: v.agent,
+      chatId: v.chat_id,
+      ...(v.threadId != null ? { threadId: v.threadId } : {}),
+      stageId,
+      timeoutMinutes,
+      key: v.key,
+      scope: v.scope,
+    }),
+    deliver: (inbound) => deliverResumeSyntheticOrBuffer(v.agent, inbound),
+    recordMiss: () => recordMissedApproval({
+      stageId,
+      toolName: 'vault_request_access',
+      action: `grant ${v.agent} ${v.scope} access to \`${v.key}\``,
+      chatId: v.chat_id,
+      ...(v.threadId != null ? { threadId: v.threadId } : {}),
+      now,
+    }),
+    log: cardExpiryLog,
   })
   process.stderr.write(
     `telegram gateway: vault_request_access TTL expired — wake agent=${v.agent} ` +
@@ -5796,30 +5821,35 @@ function expireVaultAccessCard(stageId: string, v: PendingVaultRequestAccess, no
 }
 
 function expireVaultSaveCard(stageId: string, v: PendingVaultRequestSave, now: number): void {
-  pendingVaultRequestSaves.delete(stageId)
-  pendingCardStore.remove(stageId)
-  void editCardExpired(
-    v.chat_id,
-    v.card_message_id,
-    `⌛ _This vault-save card for \`${escapeHtmlForTg(v.key)}\` timed out before you tapped. The secret was NOT stored. Ask **${escapeHtmlForTg(v.agent)}** to re-issue if you still want to save._`,
-  )
   const timeoutMinutes = Math.round(VAULT_REQUEST_SAVE_TTL_MS / 60000)
-  const inbound = buildVaultSaveTimeoutInbound({
-    agent: v.agent,
-    chatId: v.chat_id,
-    ...(v.threadId != null ? { threadId: v.threadId } : {}),
-    stageId,
-    timeoutMinutes,
-    key: v.key,
-  })
-  const delivered = deliverResumeSyntheticOrBuffer(v.agent, inbound)
-  recordMissedApproval({
-    stageId,
-    toolName: 'vault_request_save',
-    action: `save the secret \`${v.key}\` for ${v.agent}`,
-    chatId: v.chat_id,
-    ...(v.threadId != null ? { threadId: v.threadId } : {}),
-    now,
+  const { delivered } = expirePendingCard({
+    remove: () => {
+      pendingVaultRequestSaves.delete(stageId)
+      pendingCardStore.remove(stageId)
+    },
+    editCard: () => void editCardExpired(
+      v.chat_id,
+      v.card_message_id,
+      `⌛ _This vault-save card for \`${escapeHtmlForTg(v.key)}\` timed out before you tapped. The secret was NOT stored. Ask **${escapeHtmlForTg(v.agent)}** to re-issue if you still want to save._`,
+    ),
+    buildInbound: () => buildVaultSaveTimeoutInbound({
+      agent: v.agent,
+      chatId: v.chat_id,
+      ...(v.threadId != null ? { threadId: v.threadId } : {}),
+      stageId,
+      timeoutMinutes,
+      key: v.key,
+    }),
+    deliver: (inbound) => deliverResumeSyntheticOrBuffer(v.agent, inbound),
+    recordMiss: () => recordMissedApproval({
+      stageId,
+      toolName: 'vault_request_save',
+      action: `save the secret \`${v.key}\` for ${v.agent}`,
+      chatId: v.chat_id,
+      ...(v.threadId != null ? { threadId: v.threadId } : {}),
+      now,
+    }),
+    log: cardExpiryLog,
   })
   process.stderr.write(
     `telegram gateway: vault_request_save TTL expired — wake agent=${v.agent} ` +
@@ -5828,30 +5858,35 @@ function expireVaultSaveCard(stageId: string, v: PendingVaultRequestSave, now: n
 }
 
 function expireSecretRequestCard(stageId: string, v: PendingSecretRequest, now: number): void {
-  pendingSecretRequests.delete(stageId)
-  pendingCardStore.remove(stageId)
-  void editCardExpired(
-    v.chat_id,
-    v.card_message_id,
-    `⌛ _This secret-request card for \`${escapeHtmlForTg(v.key)}\` timed out before you provided it. Ask **${escapeHtmlForTg(v.agent)}** to re-request if it still needs the value._`,
-  )
   const timeoutMinutes = Math.round(PENDING_SECRET_REQUEST_TTL_MS / 60000)
-  const inbound = buildSecretRequestTimeoutInbound({
-    agent: v.agent,
-    chatId: v.chat_id,
-    ...(v.threadId != null ? { threadId: v.threadId } : {}),
-    stageId,
-    timeoutMinutes,
-    key: v.key,
-  })
-  const delivered = deliverResumeSyntheticOrBuffer(v.agent, inbound)
-  recordMissedApproval({
-    stageId,
-    toolName: 'request_secret',
-    action: `provide the secret \`${v.key}\` for ${v.agent}`,
-    chatId: v.chat_id,
-    ...(v.threadId != null ? { threadId: v.threadId } : {}),
-    now,
+  const { delivered } = expirePendingCard({
+    remove: () => {
+      pendingSecretRequests.delete(stageId)
+      pendingCardStore.remove(stageId)
+    },
+    editCard: () => void editCardExpired(
+      v.chat_id,
+      v.card_message_id,
+      `⌛ _This secret-request card for \`${escapeHtmlForTg(v.key)}\` timed out before you provided it. Ask **${escapeHtmlForTg(v.agent)}** to re-request if it still needs the value._`,
+    ),
+    buildInbound: () => buildSecretRequestTimeoutInbound({
+      agent: v.agent,
+      chatId: v.chat_id,
+      ...(v.threadId != null ? { threadId: v.threadId } : {}),
+      stageId,
+      timeoutMinutes,
+      key: v.key,
+    }),
+    deliver: (inbound) => deliverResumeSyntheticOrBuffer(v.agent, inbound),
+    recordMiss: () => recordMissedApproval({
+      stageId,
+      toolName: 'request_secret',
+      action: `provide the secret \`${v.key}\` for ${v.agent}`,
+      chatId: v.chat_id,
+      ...(v.threadId != null ? { threadId: v.threadId } : {}),
+      now,
+    }),
+    log: cardExpiryLog,
   })
   process.stderr.write(
     `telegram gateway: request_secret TTL expired — wake agent=${v.agent} ` +
@@ -5860,30 +5895,35 @@ function expireSecretRequestCard(stageId: string, v: PendingSecretRequest, now: 
 }
 
 function expireMentalModelProposeCard(stageId: string, v: PendingMentalModelPropose, now: number): void {
-  pendingMentalModelProposes.delete(stageId)
-  pendingCardStore.remove(stageId)
-  void editCardExpired(
-    v.chat_id,
-    v.card_message_id,
-    `⌛ _This mental-model proposal card for \`${escapeHtmlForTg(v.spec.name)}\` timed out before you tapped. Ask **${escapeHtmlForTg(v.agent)}** to re-propose if it still stands._`,
-  )
   const timeoutMinutes = Math.round(MENTAL_MODEL_PROPOSE_TTL_MS / 60000)
-  const inbound = buildMentalModelProposeTimeoutInbound({
-    agent: v.agent,
-    chatId: v.chat_id,
-    ...(v.threadId != null ? { threadId: v.threadId } : {}),
-    stageId,
-    timeoutMinutes,
-    name: v.spec.name,
-  })
-  const delivered = deliverResumeSyntheticOrBuffer(v.agent, inbound)
-  recordMissedApproval({
-    stageId,
-    toolName: 'mental_model_propose',
-    action: `declare the mental model \`${v.spec.name}\` for ${v.agent}`,
-    chatId: v.chat_id,
-    ...(v.threadId != null ? { threadId: v.threadId } : {}),
-    now,
+  const { delivered } = expirePendingCard({
+    remove: () => {
+      pendingMentalModelProposes.delete(stageId)
+      pendingCardStore.remove(stageId)
+    },
+    editCard: () => void editCardExpired(
+      v.chat_id,
+      v.card_message_id,
+      `⌛ _This mental-model proposal card for \`${escapeHtmlForTg(v.spec.name)}\` timed out before you tapped. Ask **${escapeHtmlForTg(v.agent)}** to re-propose if it still stands._`,
+    ),
+    buildInbound: () => buildMentalModelProposeTimeoutInbound({
+      agent: v.agent,
+      chatId: v.chat_id,
+      ...(v.threadId != null ? { threadId: v.threadId } : {}),
+      stageId,
+      timeoutMinutes,
+      name: v.spec.name,
+    }),
+    deliver: (inbound) => deliverResumeSyntheticOrBuffer(v.agent, inbound),
+    recordMiss: () => recordMissedApproval({
+      stageId,
+      toolName: 'mental_model_propose',
+      action: `declare the mental model \`${v.spec.name}\` for ${v.agent}`,
+      chatId: v.chat_id,
+      ...(v.threadId != null ? { threadId: v.threadId } : {}),
+      now,
+    }),
+    log: cardExpiryLog,
   })
   process.stderr.write(
     `telegram gateway: mental_model_propose TTL expired — wake agent=${v.agent} ` +
@@ -5892,7 +5932,9 @@ function expireMentalModelProposeCard(stageId: string, v: PendingMentalModelProp
 }
 
 // Run all four agent-initiated approval-card expiry sweeps. Called from the
-// pendingStateReaper (the authoritative 60s timer).
+// pendingStateReaper (the authoritative 60s timer). Each family sweep is
+// per-entry guarded via sweepExpiredEntries, so one throwing expiry (dead IPC
+// socket, store IO error) can't skip the remaining entries or families.
 function sweepExpiredApprovalCards(now: number): void {
   sweepPendingVaultRequestAccesses(now)
   sweepPendingVaultRequestSaves(now)
@@ -6115,7 +6157,17 @@ const pendingStateReaper = setInterval(() => {
   // the authoritative timer — before this the only expiry path was a lazy
   // sweep on the NEXT stage, so an agent that ended its turn to wait on one of
   // these cards could sit parked forever if no further request ever staged.
-  sweepExpiredApprovalCards(now)
+  // try/catch matches the sibling sweepStaleTurnActiveMarker guard: an escaped
+  // throw inside this setInterval callback would reach uncaughtException and
+  // take the WHOLE gateway down (per-entry faults are already contained inside
+  // sweepExpiredEntries/expirePendingCard; this is the outer belt).
+  try {
+    sweepExpiredApprovalCards(now)
+  } catch (err) {
+    process.stderr.write(
+      `telegram gateway: approval-card expiry sweep failed: ${(err as Error).message}\n`,
+    )
+  }
   // #550: sweep a stale turn-active marker. Defence-in-depth for the
   // case where neither the turn_end arm nor onTurnComplete fired (SDK
   // killed before the JSONL turn_duration record, compaction window,
@@ -12212,9 +12264,13 @@ const PENDING_SECRET_REQUEST_TTL_MS = 30 * 60_000 // card lifetime
 const ARMED_SECRET_CAPTURE_TTL_MS = 10 * 60_000   // window to send the value after tapping
 
 function sweepSecretRequests(now = Date.now()): void {
-  for (const [k, v] of pendingSecretRequests) {
-    if (now - v.staged_at > PENDING_SECRET_REQUEST_TTL_MS) expireSecretRequestCard(k, v, now)
-  }
+  sweepExpiredEntries(
+    pendingSecretRequests,
+    (v, n) => n - v.staged_at > PENDING_SECRET_REQUEST_TTL_MS,
+    expireSecretRequestCard,
+    now,
+    cardExpiryLog,
+  )
   // armedSecretCaptures is a TRANSIENT post-tap window (never persisted): it's
   // only set after the operator taps [Provide securely], and the request is
   // no longer parked-on-a-card. Just drop stale ones — no wake needed.

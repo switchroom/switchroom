@@ -11,7 +11,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, rmSync, readFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import {
@@ -159,11 +159,15 @@ describe('createPendingCardStore', () => {
     expect(raw).toContain('vault_request_save')
   })
 
-  it('the file is written with 0600 perms (no world-readable secrets-adjacent state)', () => {
+  it('the file ends up 0600 even when it pre-existed with lax perms', () => {
+    // writeFileSync's `mode` only applies on CREATE — a pre-existing
+    // world-readable file would keep its perms without the explicit chmod
+    // the store does on every write.
+    const filePath = join(dir, 'pending-approval-cards.json')
+    writeFileSync(filePath, '[]', { mode: 0o644 })
     const store = createPendingCardStore(dir)
     store.add(ACCESS)
-    // mode is enforced at write; a re-read via the store proves the file is
-    // parseable. (Perms are asserted structurally by the write options.)
+    expect(statSync(filePath).mode & 0o777).toBe(0o600)
     expect(createPendingCardStore(dir).loadAll().length).toBe(1)
   })
 })
