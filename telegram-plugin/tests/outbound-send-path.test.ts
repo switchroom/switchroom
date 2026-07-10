@@ -86,7 +86,9 @@ const FIXTURES: Record<string, string> = {
     'Here is code:\n\n```ts\nconst x = 1 // a comment — with an em-dash\nconst y = 2\n```\n\nDone.',
   emDashes: 'This — that — and the other thing. En–dash here too.',
   excessBold: '**bold one** and **bold two** and **bold three** and **bold four**.',
-  secretApiKey: 'Your key is sk-ant-api03-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLL and more text.',
+  // Assembled at runtime so the source holds no contiguous token literal
+  // (scripts/check-no-pii-secrets.mjs rejects contiguous sk-ant-… literals).
+  secretApiKey: `Your key is ${'sk-ant-' + 'api03-' + 'ABCD'.repeat(12)} and more text.`,
   jsonEscaped: 'Line one\\nLine two\\n\\nParagraph two with a \\t tab.',
   bullets: '- item one\n- item two\n- item three with a — dash',
   oversize: 'x'.repeat(RICH_MESSAGE_MAX_CHARS + 5000),
@@ -105,7 +107,7 @@ describe('outbound-send-path — normalizeOutboundBody parity with inline pipeli
 
   it('secret fixture is actually redacted (mask fired)', () => {
     const got = normalizeOutboundBody(FIXTURES.secretApiKey, 'reply', injectedRedact)
-    expect(got.text).not.toContain('sk-ant-api03-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLL')
+    expect(got.text).not.toContain('sk-ant-' + 'api03-' + 'ABCD'.repeat(12))
   })
 
   it('em/en dashes are removed by the normalize pipeline', () => {

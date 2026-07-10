@@ -123,9 +123,9 @@ export function computeReplyChunks(args: {
  * the wire cap. Byte-identical to the inline `sendChunkResplit` piece
  * computation. Pure.
  */
-export function resplitOversizeChunk(chunkText: string): string[] {
-  const subPieces = splitMarkdownChunks(chunkText, RICH_MESSAGE_MAX_CHARS)
-  return subPieces.length > 1 ? subPieces : hardSliceToCap(chunkText, RICH_MESSAGE_MAX_CHARS)
+export function resplitOversizeChunk(piece: string): string[] {
+  const subPieces = splitMarkdownChunks(piece, RICH_MESSAGE_MAX_CHARS)
+  return subPieces.length > 1 ? subPieces : hardSliceToCap(piece, RICH_MESSAGE_MAX_CHARS)
 }
 
 /**
