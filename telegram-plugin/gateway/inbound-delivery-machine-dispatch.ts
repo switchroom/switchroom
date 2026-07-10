@@ -20,20 +20,21 @@
  *   - firePoke                          → onFirePoke
  *   - logTrace                          → executed
  *
- * IMPORTANT — this module executing an effect is NOT the same as the
- * gateway being cut over for that effect. The gateway currently only
- * calls `dispatchEffects()` with the **bridgeUp** effect set
- * (`drainBuffer` / `redeliverPersistedPermVerdicts` / `logTrace`).
- * The inbound-routing effects (deliverToBridge / bufferInbound /
- * persistInbound) and the turn-lifecycle / poke / perm-verdict effects
- * are wired here so PR3c (inbound cutover) can flip `handleInbound` to
- * dispatch through the machine WITHOUT further wiring — but the live
- * imperative paths in `gateway.ts` still own those flows today (see the
- * "Hard removal plan" checklist in the RFC: PR3b/PR3c/PR4 remain open).
- * Wiring an effect whose live driver is still imperative causes NO
- * double-execution because the gateway never passes that effect kind to
- * this dispatcher yet. The effect-level unit + equivalence tests gate
- * the wiring so PR3c is a one-line call-site flip, not a rewrite.
+ * Live call sites (post PR3c flip, #2794):
+ *   - bridgeUp (gateway onClientRegistered): drainBuffer /
+ *     redeliverPersistedPermVerdicts / logTrace.
+ *   - handleInbound DEFERRED_INBOUND_EMIT: the inbound-routing effects
+ *     (deliverToBridge / bufferInbound / persistInbound / setTurnStarted)
+ *     are AUTHORITATIVE when the cutover is on — the imperative twin in
+ *     gateway.ts runs only under the kill switch or the documented
+ *     carve-outs (interrupt-while-in-turn, bridge_dead). The twin is
+ *     deleted in PR4 after the 48h bake (see the "Hard removal plan"
+ *     checklist in the RFC: PR3b step 2 / PR4 remain open).
+ *   - turnEnd lifecycle effects remain shadow-only: the imperative
+ *     turn-end sites (purgeReactionTracking / releaseTurnBufferGate)
+ *     already execute the effect-equivalents with gates the machine does
+ *     not model yet (serialize-until-replied drain); PR3b step 2 tracks
+ *     that flip.
  *
  * The gateway-internal turn/poke effects (setTurnStarted,
  * clearTurnStarted, noteOutbound, firePoke) map to gateway-scope state
@@ -84,6 +85,17 @@ export interface DispatchCtx {
   // gateway supplies them when it flips inbound routing through the
   // machine (PR3c). Absent → the effect logs an `unwired` trace.
   readonly onSetTurnStarted?: (key: ChatKey, at: number) => void
+  /**
+   * Optional: observe the outcome of a `deliverToBridge` effect. The
+   * imperative twin branches on `sendToAgent`'s boolean (delivered →
+   * steer-ack + busy-mark + delivery-confirm tracking; miss → release
+   * reservation + durable-buffer + restart notice). The machine cannot
+   * model a send that fails while the bridge is nominally alive, so the
+   * PR3c live call site needs the result to run the same post-send
+   * branches the twin runs. Called once per deliverToBridge effect,
+   * after the send attempt, before `onUserInboundDelivered` enrolment.
+   */
+  readonly onDeliverResult?: (key: ChatKey, ok: boolean, msg: InboundMessage) => void
   readonly onClearTurnStarted?: (key: ChatKey) => void
   readonly onNoteOutbound?: (key: ChatKey, at: number) => void
   readonly onFirePoke?: (key: ChatKey, level: 'soft' | 'firm' | 'fallback') => void
@@ -220,6 +232,13 @@ function dispatchOne(effect: Effect, ctx: DispatchCtx): void {
             `key=${effect.key}: ${(err as Error).message}\n`,
         )
         ok = false
+      }
+      if (ctx.onDeliverResult) {
+        try {
+          ctx.onDeliverResult(effect.key, ok, msg)
+        } catch {
+          /* observer is best-effort; never breaks delivery */
+        }
       }
       if (ok && ctx.onUserInboundDelivered) {
         // Enrol in the deliver-until-acked sweep — a socket write is not
