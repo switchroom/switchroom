@@ -47,8 +47,8 @@ describe('#2555 run-hook.sh exit-134 tolerance', () => {
     )
   }
 
-  const run = () =>
-    spawnSync('sh', [wrapper, 'sh', fake], { encoding: 'utf-8' })
+  const run = (input = '') =>
+    spawnSync('sh', [wrapper, 'sh', fake], { encoding: 'utf-8', input })
 
   const attempts = () => Number(readFileSync(counter, 'utf-8').trim())
 
@@ -85,5 +85,48 @@ describe('#2555 run-hook.sh exit-134 tolerance', () => {
     writeFileSync(fake, `#!/bin/sh\necho "$UV_THREADPOOL_SIZE"\nexit 0\n`)
     const r = run()
     expect(r.stdout.trim()).toBe('1')
+  })
+
+  it('replays the SAME stdin payload on the retry (scanner never sees empty input)', () => {
+    // Fake: attempt 0 reads stdin then aborts 134; attempt 1 reads stdin and
+    // records it, then exits 0. If stdin were not preserved, the recorded
+    // payload on the retry would be empty.
+    const seen = join(dir, 'seen-stdin')
+    writeFileSync(
+      fake,
+      [
+        '#!/bin/sh',
+        `n=$(cat "${counter}")`,
+        `echo "$((n + 1))" > "${counter}"`,
+        'data=$(cat)', // drain stdin (the abort-after-read scenario)
+        `echo "$data" > "${seen}.$n"`,
+        '[ "$n" = "0" ] && exit 134',
+        'exit 0',
+      ].join('\n'),
+    )
+    const r = run('SECRET-PAYLOAD-123')
+    expect(r.status).toBe(0)
+    expect(attempts()).toBe(2)
+    // The RETRY (attempt 1) must have received the full payload, not empty.
+    expect(readFileSync(`${seen}.1`, 'utf-8').trim()).toBe('SECRET-PAYLOAD-123')
+  })
+
+  it('FAILS CLOSED (propagates 134) for a security hook that aborts twice', () => {
+    // A genuinely broken secret scanner must NOT silently pass — exit 0 after
+    // two aborts would be a silent security bypass.
+    const secFake = join(dir, 'secret-guard-pretool.mjs')
+    writeFileSync(
+      secFake,
+      [
+        '#!/bin/sh',
+        `n=$(cat "${counter}")`,
+        `echo "$((n + 1))" > "${counter}"`,
+        'exit 134',
+      ].join('\n'),
+    )
+    const r = spawnSync('sh', [wrapper, 'sh', secFake], { encoding: 'utf-8', input: '{}' })
+    expect(r.status).toBe(134) // fail closed — NOT skipped
+    expect(attempts()).toBe(2)
+    expect(r.stderr).toMatch(/FAILING CLOSED/)
   })
 })
