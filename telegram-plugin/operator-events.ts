@@ -27,6 +27,7 @@ export type OperatorEventKind =
   | 'unknown-4xx'
   | 'unknown-5xx'
   | 'config-warning'
+  | 'always-allow-persist-failed'
 
 export interface OperatorEvent {
   kind: OperatorEventKind
@@ -387,6 +388,29 @@ export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
           `ℹ️ **Config warning** for **${agent}**.`,
           detail ? `_${detail}_` : '',
           `Non-urgent — config will keep working with today's fallback behavior.`,
+        ]
+          .filter(Boolean)
+          .join('\n'),
+        keyboard: {
+          inline_keyboard: [
+            [{ text: '❌ Dismiss', callback_data: `op:dismiss:${encodeURIComponent(ev.agent)}` }],
+          ],
+        },
+      }
+
+    // #2973 pt.3 — a durable "Always allow" persist exhausted its retry
+    // budget (always-allow-persist-queue.ts) or hit a non-retryable error
+    // (e.g. E_CONFIG_EDIT_DISABLED). MUST be a NEW message, not a card
+    // edit — the original permission card was already edited to the
+    // interim "saving durably in background…" state and card edits don't
+    // ping the operator, so a silent edit here would leave the failure
+    // unnoticed indefinitely.
+    case 'always-allow-persist-failed':
+      return {
+        text: [
+          `⚠️ Your "Always allow" for **${agent}** didn't stick.`,
+          detail ? `_${detail}_` : '',
+          `It will ask again.`,
         ]
           .filter(Boolean)
           .join('\n'),

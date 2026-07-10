@@ -292,6 +292,7 @@ describe('renderOperatorEvent — all kinds produce valid keyboard structure', (
     'unknown-4xx',
     'unknown-5xx',
     'config-warning',
+    'always-allow-persist-failed',
   ]
 
   for (const kind of allKinds) {
