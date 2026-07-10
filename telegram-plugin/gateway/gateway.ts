@@ -18740,9 +18740,18 @@ function buildModelDeps(restartCtx?: ModelDepsRestartContext): ModelMenuDeps & M
     scheduleRestart: async (reason: string) => {
       const name = getMyAgentName()
       // Debounce: mirror the /restart command's 15 s guard to prevent
-      // double-dispatch on a rapid double-tap of /model <claude-alias>.
+      // double-dispatch on a rapid double-tap of /model <claude-alias>. This
+      // path previously `return`ed silently — indistinguishable from a
+      // successful dispatch — so a model switch caught in the window was a
+      // silent no-op while the caller reported success. THROW a tagged error
+      // so scheduleModelRelaunch can react (keep the in-flight restart's carrier,
+      // tell the operator honestly) instead of falsely claiming the switch stuck.
       const existing = readRestartMarker()
-      if (existing && Date.now() - existing.ts < 15_000) return
+      if (existing && Date.now() - existing.ts < 15_000) {
+        const e = new Error('a restart is already in flight — try again in ~15s')
+        ;(e as { code?: string }).code = 'restart_in_flight'
+        throw e
+      }
       if (restartCtx) {
         writeRestartMarker({
           chat_id: restartCtx.chatId,
@@ -18792,9 +18801,25 @@ function buildModelDeps(restartCtx?: ModelDepsRestartContext): ModelMenuDeps & M
       if (!agentDir) throw new Error('agent dir unresolvable — cannot write session-model carrier')
       // Carrier: single line, token + newline, no quoting (start.sh strips
       // whitespace and shape-gates). One-shot — consumed on the next boot.
+      const prevOverride = activeSessionModelOverride
       writeFileSync(join(agentDir, '.session-model-override'), `${model}\n`, 'utf8')
       activeSessionModelOverride = model
-      await deps.scheduleRestart(reason)
+      try {
+        await deps.scheduleRestart(reason)
+      } catch (err) {
+        const carrierPath = join(agentDir, '.session-model-override')
+        // A restart already in flight OWNS the carrier we just wrote — it will
+        // consume our token at boot, so the switch is queued, not lost: keep the
+        // carrier + override and let the caller tell the operator "~15s". Any
+        // OTHER dispatch failure means no restart is coming, so roll BOTH back —
+        // a lingering carrier/override would lie to /status and mis-launch the
+        // NEXT ordinary restart.
+        if ((err as { code?: string })?.code !== 'restart_in_flight') {
+          try { rmSync(carrierPath, { force: true }) } catch { /* best-effort */ }
+          activeSessionModelOverride = prevOverride
+        }
+        throw err
+      }
     },
   }
   return deps
@@ -18823,6 +18848,15 @@ bot.command('model', async ctx => {
     return
   }
   const reply = await handleModelCommand(parsed, deps)
+  // Record a POSITIVELY-CONFIRMED typed switch so /status reflects what's
+  // actually running — the SAME in-memory override the menu callback path sets
+  // (buildAgentMetadata reads activeSessionModelOverride as sessionModel). Only
+  // set on the confirmed inject path; the sr-*/relaunch paths already set the
+  // override inside scheduleModelRelaunch, and an unverified switch carries no
+  // selectedModel so /status is never lied to.
+  if (reply.selectedModel) {
+    activeSessionModelOverride = reply.selectedModel
+  }
   await switchroomReply(ctx, reply.text, { html: reply.html })
 })
 
@@ -23949,6 +23983,25 @@ bot.on('callback_query:data', async ctx => {
             { reply_markup: { inline_keyboard: [] } },
           )
           .catch(() => {})
+        // Carry the requested Claude model across the restart via the SAME
+        // `.session-model-override` carrier a Claude → sr-* switch uses — otherwise
+        // boot launches the CONFIGURED default and the tapped model is silently
+        // dropped. `selectedModelToken` is a real `claude --model` token (alias or
+        // full claude-* id); a "Default"-row tap yields no token → boot the
+        // configured default (correct). start.sh's LiteLLM-down guard only drops
+        // sr-* overrides, so a Claude token is never dropped.
+        {
+          const agentDir = resolveAgentDirFromEnv()
+          const token = outcome.selectedModelToken
+          if (agentDir && token) {
+            try {
+              writeFileSync(join(agentDir, '.session-model-override'), `${token}\n`, 'utf8')
+              activeSessionModelOverride = token
+            } catch (e) {
+              process.stderr.write(`telegram gateway: sr-to-claude carrier write failed: ${(e as Error)?.message ?? String(e)}\n`)
+            }
+          }
+        }
         // Write the restart marker so the post-restart boot card edits into this chat.
         writeRestartMarker({ chat_id: cbChatId, thread_id: cbThreadId ?? null, ack_message_id: null, ts: Date.now() })
         stampUserRestartReason('user: sr-to-claude model switch (menu)')
