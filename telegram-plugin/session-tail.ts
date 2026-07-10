@@ -42,6 +42,7 @@ function isMultiAgentEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
 }
 import { classifyClaudeError, type OperatorEventKind } from './operator-events.js'
 import { createToolLabelSidecar, type ToolLabelSidecar } from './tool-label-sidecar.js'
+import { isModelSentinel } from './model-label.js'
 
 /** Match Claude Code's cli.js VX() function. */
 export function sanitizeCwdToProjectName(cwd: string): string {
@@ -92,6 +93,13 @@ export type SessionEvent =
   | { kind: 'enqueue'; chatId: string | null; messageId: string | null; threadId: string | null; rawContent: string; isSync?: boolean }
   | { kind: 'dequeue' }
   | { kind: 'thinking' }
+  // Live model in use for the MAIN session, extracted from `message.model` on
+  // each `type:"assistant"` transcript line (the exact model that served that
+  // API call). Emitted FIRST among a line's events so a card rendered on the
+  // same batch already reflects the current model. Sentinels (`<synthetic>` on
+  // compaction lines, fixture junk) are filtered at projection — see
+  // isModelSentinel — so this only ever carries a real resolved model id.
+  | { kind: 'model'; model: string }
   | { kind: 'tool_use'; toolName: string; toolUseId?: string | null; input?: Record<string, unknown>; precomputedLabel?: string }
   // Real-time tool label from the PreToolUse-hook sidecar — fires when the
   // hook writes the label (synchronous at tool-call time), independent of
@@ -115,6 +123,11 @@ export type SessionEvent =
   // filename stem (e.g. "aac6f1…"). Routed through the same ingest path
   // as parent events; the reducer fans them out to per-sub-agent state.
   | { kind: 'sub_agent_started'; agentId: string; firstPromptText: string; subagentType?: string }
+  // Live model in use for a SUB-AGENT, extracted from `message.model` on each
+  // of its `type:"assistant"` transcript lines. Same contract as the main
+  // `model` kind (sentinel-filtered, emitted first) but agent-scoped so the
+  // watcher can track it per WorkerEntry and thread it onto the worker card.
+  | { kind: 'sub_agent_model'; agentId: string; model: string }
   | { kind: 'sub_agent_tool_use'; agentId: string; toolUseId: string | null; toolName: string; input?: Record<string, unknown>; precomputedLabel?: string }
   // Same shared contract as the main-agent `text` kind — see its doc above
   // (including the `lastInMessage` projection-artifact note). The wire-kind
@@ -320,6 +333,15 @@ export function projectTranscriptLine(line: string): SessionEvent[] {
     const content = message?.content as Array<Record<string, unknown>> | undefined
     if (!Array.isArray(content)) return []
     const events: SessionEvent[] = []
+    // Live model capture: `message.model` is the exact resolved model that
+    // served THIS assistant API call. Emit it FIRST (before the content events)
+    // so a card rendered on the same read batch already carries the current
+    // model. Sentinels (`<synthetic>` on compaction lines, fixture junk) are
+    // skipped — the reducer keeps the last real value.
+    const mainModel = message?.model
+    if (typeof mainModel === 'string' && !isModelSentinel(mainModel)) {
+      events.push({ kind: 'model', model: mainModel })
+    }
     // Text→narrative projection comes from the ONE shared kernel
     // (projectAssistantTextBlocks): it owns the empty-drop + blockIndex +
     // lastInMessage contract. We emit its events at their source positions
@@ -468,6 +490,12 @@ export function projectSubagentLine(
     const content = message?.content as Array<Record<string, unknown>> | undefined
     if (!Array.isArray(content)) return []
     const events: SessionEvent[] = []
+    // Live model capture (sub-agent tier): same contract as the main-agent
+    // branch — emit the sub-agent's resolved model first, sentinel-filtered.
+    const subModel = message?.model
+    if (typeof subModel === 'string' && !isModelSentinel(subModel)) {
+      events.push({ kind: 'sub_agent_model', agentId, model: subModel })
+    }
     // Text→narrative projection comes from the SAME shared kernel as the
     // main agent (projectAssistantTextBlocks): one source for the empty-drop
     // + blockIndex + lastInMessage contract. The `make` adapter only changes

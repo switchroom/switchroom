@@ -108,6 +108,45 @@ describe('subagent-tracker-pretool', () => {
     expect(row!.last_activity_at).toBe(row!.started_at)
   })
 
+  it('persists tool_input.model as the first-paint model on the row', () => {
+    const event = {
+      session_id: 'sess-model',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_model001',
+      tool_input: {
+        subagent_type: 'worker',
+        description: 'Build with a pinned model',
+        run_in_background: true,
+        model: 'claude-opus-4-8',
+      },
+    }
+    const result = runHook(PRETOOL_SCRIPT, event)
+    expect(result.status).toBe(0)
+
+    const db = openDb()
+    const row = db.prepare('SELECT model FROM subagents WHERE id = ?').get('toolu_model001') as
+      | { model: string | null }
+      | undefined
+    expect(row?.model).toBe('claude-opus-4-8')
+  })
+
+  it('leaves model null when the Agent dispatch carries no model', () => {
+    const event = {
+      session_id: 'sess-nomodel',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_nomodel001',
+      tool_input: { subagent_type: 'worker', description: 'no model', run_in_background: false },
+    }
+    const result = runHook(PRETOOL_SCRIPT, event)
+    expect(result.status).toBe(0)
+
+    const db = openDb()
+    const row = db.prepare('SELECT model FROM subagents WHERE id = ?').get('toolu_nomodel001') as
+      | { model: string | null }
+      | undefined
+    expect(row?.model ?? null).toBeNull()
+  })
+
   it('does not write a row when tool_name is not Agent', () => {
     const event = {
       session_id: 'sess-abc123',

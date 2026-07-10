@@ -519,6 +519,60 @@ describe('startSubagentWatcher', () => {
       expect(toolTick?.latestSummary).toBe('')
     })
 
+    it('captures message.model into entry.currentModel and threads it onto onProgress', () => {
+      const progress: Array<{ model?: string }> = []
+      const agentDir = join(tmpRoot, 'agent')
+      const subagentsDir = join(agentDir, '.claude', 'projects', 'p1', 'session-abc', 'subagents')
+      mkdirSync(subagentsDir, { recursive: true })
+      const jsonlPath = join(subagentsDir, 'agent-deadbeef.jsonl')
+
+      const h = startWatcherSync({
+        agentDir,
+        onProgress: ({ model }) => { progress.push({ model }) },
+      })
+      writeFileSync(jsonlPath, buildJSONL(subAgentUserMsg('Research the competitors')))
+      h.poll()
+
+      // Assistant line carrying a resolved model + a tool_use (drives an
+      // onProgress tick). The model event is projected first, so the entry's
+      // currentModel is set before the tool tick fires.
+      appendFileSync(jsonlPath, buildJSONL({
+        type: 'assistant',
+        message: {
+          model: 'claude-opus-4-8',
+          content: [{ type: 'tool_use', name: 'Read', id: 'r1', input: { file_path: '/x/CLAUDE.md' } }],
+        },
+      }))
+      h.poll()
+
+      expect(h.watcher.getRegistry().get('deadbeef')?.currentModel).toBe('claude-opus-4-8')
+      const modelled = progress.find((p) => p.model != null)
+      expect(modelled?.model).toBe('claude-opus-4-8')
+    })
+
+    it('ignores a synthetic model sentinel, keeping the last real model', () => {
+      const agentDir = join(tmpRoot, 'agent')
+      const subagentsDir = join(agentDir, '.claude', 'projects', 'p1', 'session-abc', 'subagents')
+      mkdirSync(subagentsDir, { recursive: true })
+      const jsonlPath = join(subagentsDir, 'agent-deadbeef.jsonl')
+
+      const h = startWatcherSync({ agentDir })
+      writeFileSync(jsonlPath, buildJSONL(subAgentUserMsg('Research')))
+      h.poll()
+      appendFileSync(jsonlPath, buildJSONL({
+        type: 'assistant',
+        message: { model: 'claude-opus-4-8', content: [{ type: 'tool_use', name: 'Read', id: 'r1', input: {} }] },
+      }))
+      h.poll()
+      // A compaction/synthetic line — must NOT clobber the last real model.
+      appendFileSync(jsonlPath, buildJSONL({
+        type: 'assistant',
+        message: { model: '<synthetic>', content: [{ type: 'tool_use', name: 'Bash', id: 'b1', input: {} }] },
+      }))
+      h.poll()
+      expect(h.watcher.getRegistry().get('deadbeef')?.currentModel).toBe('claude-opus-4-8')
+    })
+
     it('narrative gate: a draft-then-reply sub_agent_text is SUPPRESSED (no progress cue)', () => {
       // The worker composes its answer as a text block, then calls
       // stream_reply with near-identical text. The narrative cue must be

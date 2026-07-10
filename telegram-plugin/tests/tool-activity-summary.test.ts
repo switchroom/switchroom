@@ -723,6 +723,28 @@ describe("renderActivityHeader — two-line header builder", () => {
     const [h1] = renderActivityHeader("🤖", "Agent", "run a_b & c*d", 5_000, 1, "running");
     expect(h1).toContain("run a\\_b & c\\*d");
   });
+
+  it("appends the friendly live model to the running metrics line", () => {
+    const [, h2] = renderActivityHeader("🤖", "Agent", "", 120_000, 14, "running", "claude-opus-4-8");
+    expect(h2).toBe("_2m00s · 14 tools · opus 4.8_");
+  });
+
+  it("appends the friendly live model to the done metrics line", () => {
+    const [, h2] = renderActivityHeader("🤖", "Agent", "", 65_000, 3, "done", "claude-sonnet-5");
+    expect(h2).toBe("_done · 3 tools · 1m05s · sonnet 5_");
+  });
+
+  it("shows an sr-* model id verbatim on the metrics line", () => {
+    const [, h2] = renderActivityHeader("🛠", "Worker", "run tests", 10_000, 2, "running", "sr-glm-5");
+    expect(h2).toBe("_10s · 2 tools · sr-glm-5_");
+  });
+
+  it("omits the model tag for a sentinel / absent value", () => {
+    const [, h2none] = renderActivityHeader("🤖", "Agent", "", 15_000, 7, "running");
+    expect(h2none).toBe("_15s · 7 tools_");
+    const [, h2synth] = renderActivityHeader("🤖", "Agent", "", 15_000, 7, "running", "<synthetic>");
+    expect(h2synth).toBe("_15s · 7 tools_");
+  });
 });
 
 describe("agent flat path routes through the shared step-feed primitive", () => {
@@ -813,6 +835,21 @@ describe("renderActivityFeed — header param (main-session card fix)", () => {
     // Step feed follows the header.
     expect(out).toContain("~~_✓ Reading CLAUDE.md_~~");
     expect(out).toContain("**→ Searching memory**");
+  });
+
+  it("threads the header model through the flat and nested feed paths", () => {
+    const header: SessionActivityHeader = {
+      label: "Agent",
+      elapsedMs: 120_000,
+      toolCount: 14,
+      state: "running",
+      model: "claude-opus-4-8",
+    };
+    const flat = renderActivityFeed(["Searching memory"], false, "", undefined, header)!;
+    expect(flat).toContain("_2m00s · 14 tools · opus 4.8_");
+    // Nested path (with a child line) carries the same model tag.
+    const nested = renderActivityFeedWithNested(["Reading"], ["nested step"], false, "", undefined, header)!;
+    expect(nested).toContain("· opus 4.8_");
   });
 
   it("prepends the done header when final=true", () => {

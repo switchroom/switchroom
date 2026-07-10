@@ -91,6 +91,7 @@ import {
 } from './status-no-truncate.js'
 import { escapeMarkdown, stripMarkdown, truncate, stackCardLines } from './card-format.js'
 import { isTelegramSurfaceTool } from './tool-names.js'
+import { formatModelLabel } from './model-label.js'
 
 /**
  * Optional header for the main-session activity card, matching the worker
@@ -106,6 +107,14 @@ export interface SessionActivityHeader {
   elapsedMs: number
   toolCount: number
   state: 'running' | 'done'
+  /**
+   * Live model in use, as a raw resolved model id (e.g. `claude-opus-4-8`,
+   * `sr-glm-5`) sourced from the transcript. Rendered as a short friendly form
+   * appended to the metrics line (`… · opus 4.8`). Omitted when unknown — the
+   * card never guesses from config. Formatting + sentinel-filtering live in
+   * `formatModelLabel` (model-label.ts).
+   */
+  model?: string
 }
 
 /**
@@ -173,14 +182,19 @@ export function renderActivityHeader(
   elapsedMs: number,
   toolCount: number,
   state: 'running' | 'done' | 'failed',
+  model?: string,
 ): [string, string] {
   const toolWord = toolCount === 1 ? 'tool' : 'tools'
   const elapsed = formatFeedElapsed(elapsedMs)
   const descPart = description.length > 0 ? ` · _${escapeMarkdown(description)}_` : ''
   const line1 = `${emoji} **${escapeMarkdown(label)}**${descPart}`
+  // Subtle live-model tag: joins the existing dot-separated metrics (never a new
+  // line). formatModelLabel returns null for absent/sentinel values → no suffix.
+  const modelLabel = formatModelLabel(model)
+  const modelPart = modelLabel != null ? ` · ${escapeMarkdown(modelLabel)}` : ''
   const line2 = state === 'running'
-    ? `_${elapsed} · ${toolCount} ${toolWord}_`
-    : `_${state} · ${toolCount} ${toolWord} · ${elapsed}_`
+    ? `_${elapsed} · ${toolCount} ${toolWord}${modelPart}_`
+    : `_${state} · ${toolCount} ${toolWord} · ${elapsed}${modelPart}_`
   return [line1, line2]
 }
 
@@ -270,6 +284,9 @@ export interface StatusCardHeader {
   elapsedMs: number
   toolCount: number
   state: 'running' | 'done' | 'failed'
+  /** Live model id (raw, e.g. `claude-opus-4-8`) — rendered as a short friendly
+   *  tag on the metrics line via `formatModelLabel`. Omitted when unknown. */
+  model?: string
 }
 
 /** Inputs to the unified status-card renderer. */
@@ -321,6 +338,7 @@ export function renderStatusCard(opts: StatusCardOpts): string | null {
         // when the result block is empty. The agent surface never passes
         // 'failed', so only the worker card is affected.
         header.state,
+        header.model,
       )
     : []
 
@@ -476,6 +494,7 @@ export function renderActivityFeed(
           elapsedMs: header.elapsedMs,
           toolCount: header.toolCount,
           state: header.state,
+          model: header.model,
         }
       : undefined,
     steps: lines,
@@ -527,6 +546,7 @@ export function renderActivityFeedWithNested(
           elapsedMs: header.elapsedMs,
           toolCount: header.toolCount,
           state: header.state,
+          model: header.model,
         }
       : undefined,
     steps: lines,

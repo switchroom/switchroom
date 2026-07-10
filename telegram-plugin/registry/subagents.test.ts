@@ -26,6 +26,7 @@ import {
   recordSubagentStall,
   recordSubagentResume,
   bumpSubagentActivity,
+  recordSubagentModel,
   getSubagent,
   reapStuckRunningRows,
   countRunningBackgroundSubagents,
@@ -66,6 +67,54 @@ describe('migration on fresh DB', () => {
   it('schema is idempotent — applying twice does not throw', () => {
     const db = openFreshSubagentsDbInMemory()
     expect(() => applySubagentsSchema(db)).not.toThrow()
+    db.close()
+  })
+
+  it('creates the model column on a fresh DB', () => {
+    const db = openFreshSubagentsDbInMemory()
+    const cols = db.prepare("SELECT name FROM pragma_table_info('subagents')").all() as { name: string }[]
+    expect(cols.map((c) => c.name)).toContain('model')
+    db.close()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Live-model column — migration + record helper
+// ---------------------------------------------------------------------------
+
+describe('live-model column', () => {
+  it('migrates a pre-model subagents table by adding the model column (idempotent)', () => {
+    const db = openFreshSubagentsDbInMemory()
+    // Simulate a legacy table with no model column.
+    db.exec('ALTER TABLE subagents DROP COLUMN model')
+    let cols = db.prepare("SELECT name FROM pragma_table_info('subagents')").all() as { name: string }[]
+    expect(cols.map((c) => c.name)).not.toContain('model')
+    // Re-applying the schema must add it back, and be safe to repeat.
+    applySubagentsSchema(db)
+    applySubagentsSchema(db)
+    cols = db.prepare("SELECT name FROM pragma_table_info('subagents')").all() as { name: string }[]
+    expect(cols.map((c) => c.name)).toContain('model')
+    db.close()
+  })
+
+  it('recordSubagentStart leaves model null; recordSubagentModel persists on change', () => {
+    const db = openFreshSubagentsDbInMemory()
+    const now = Date.now()
+    recordSubagentStart(db, { id: 'toolu_m1', background: true, startedAt: now, jsonlAgentId: 'a1' })
+    expect(getSubagent(db, 'toolu_m1')?.model).toBeNull()
+
+    recordSubagentModel(db, { id: 'toolu_m1', model: 'claude-opus-4-8' })
+    expect(getSubagent(db, 'toolu_m1')?.model).toBe('claude-opus-4-8')
+
+    // Update-on-change: a later model overwrites.
+    recordSubagentModel(db, { id: 'toolu_m1', model: 'sr-glm-5' })
+    expect(getSubagent(db, 'toolu_m1')?.model).toBe('sr-glm-5')
+    db.close()
+  })
+
+  it('recordSubagentModel no-ops gracefully on a missing id', () => {
+    const db = openFreshSubagentsDbInMemory()
+    expect(() => recordSubagentModel(db, { id: 'nope', model: 'claude-opus-4-8' })).not.toThrow()
     db.close()
   })
 })

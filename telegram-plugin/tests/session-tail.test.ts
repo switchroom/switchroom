@@ -345,6 +345,42 @@ describe('projectTranscriptLine', () => {
       messageId: '103',
     })
   })
+
+  // ─── Live model capture (message.model) ──────────────────────────────
+  it('emits a model event (first) from message.model on an assistant line', () => {
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: {
+        model: 'claude-opus-4-8',
+        content: [{ type: 'tool_use', name: 'Bash', id: 'toolu_01', input: {} }],
+      },
+    })
+    // Model event is emitted BEFORE the content events so a same-batch render
+    // already reflects the current model.
+    expect(projectTranscriptLine(line)).toEqual([
+      { kind: 'model', model: 'claude-opus-4-8' },
+      { kind: 'tool_use', toolName: 'Bash', toolUseId: 'toolu_01', input: {} },
+    ])
+  })
+
+  it('skips a synthetic model sentinel (keeps no model event)', () => {
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: {
+        model: '<synthetic>',
+        content: [{ type: 'thinking', thinking: '...' }],
+      },
+    })
+    expect(projectTranscriptLine(line)).toEqual([{ kind: 'thinking' }])
+  })
+
+  it('omits the model event when message.model is absent', () => {
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'thinking', thinking: '...' }] },
+    })
+    expect(projectTranscriptLine(line)).toEqual([{ kind: 'thinking' }])
+  })
 })
 
 // ─── Bug 1 regression: per-file cursor state survives re-attachment ────
@@ -488,6 +524,34 @@ describe('projectSubagentLine', () => {
     expect(events2).toEqual([
       { kind: 'sub_agent_tool_result', agentId: 'aaa', toolUseId: 'toolu_x', isError: undefined },
     ])
+  })
+
+  it('emits sub_agent_model (first) from message.model on a sub-agent assistant line', () => {
+    const st = { hasEmittedStart: true }
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: {
+        model: 'sr-glm-5',
+        content: [{ type: 'tool_use', id: 'toolu_a', name: 'Read', input: { file_path: '/a' } }],
+      },
+    })
+    const events = projectSubagentLine(line, 'X', st)
+    expect(events[0]).toEqual({ kind: 'sub_agent_model', agentId: 'X', model: 'sr-glm-5' })
+    expect(events[1].kind).toBe('sub_agent_tool_use')
+  })
+
+  it('skips a synthetic sub-agent model sentinel', () => {
+    const st = { hasEmittedStart: true }
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: {
+        model: '<synthetic>',
+        content: [{ type: 'tool_use', id: 'toolu_a', name: 'Read', input: { file_path: '/a' } }],
+      },
+    })
+    const events = projectSubagentLine(line, 'X', st)
+    expect(events.some((e) => e.kind === 'sub_agent_model')).toBe(false)
+    expect(events[0].kind).toBe('sub_agent_tool_use')
   })
 
   it('emits sub_agent_tool_use for regular tools; nested Agent fires ONLY nested_spawn', () => {

@@ -143,6 +143,8 @@ import {
 import { pickRecoveredPermissionOrigin } from './permission-card-origin.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
 import { appendActivityLabel, clipNarrative, renderActivityFeedWithNested, formatStepSuffix, type SessionActivityHeader } from '../tool-activity-summary.js'
+import { formatModelLabel } from '../model-label.js'
+import { createSessionModelSource } from './session-model-source.js'
 import { runSilentTurnHeartbeatTick } from '../feed-heartbeat-climb.js'
 import { REPLY_TOOLS, isDraftOfReply } from '../narrative-dedup.js'
 import { toolLabel } from '../tool-labels.js'
@@ -2502,6 +2504,13 @@ type CurrentTurn = {
   // resume protocol uses this to decide "did the previous turn actually
   // finish a reply, or was it interrupted before commit?".
   lastAssistantDone: boolean
+  // Live model in use for THIS turn, sourced from the main transcript's
+  // `message.model` (the exact resolved model per API call) via the session-tail
+  // `model` event — never from config or launch-time state. Updated on change;
+  // undefined until the turn's first assistant line lands. Rendered onto the
+  // activity/liveness card header's metrics line (e.g. "2m · 14 tools · opus 4.8")
+  // and preferred by /status's buildAgentMetadata over the in-memory override.
+  currentModel?: string
   // Phase 1 of #332: count of tool_use events in the current turn, for
   // the tool_call_count column in the turns registry.
   toolCallCount: number
@@ -2627,6 +2636,16 @@ type CurrentTurn = {
 // is never written and this is exactly the old singleton.
 let currentTurn: CurrentTurn | null = null
 const currentTurnMap = new CurrentTurnMap<CurrentTurn>()
+// Freshness-aware /status session-model source. Two writers: the session-tail
+// `model` event (each assistant line's `message.model` — ground truth for the
+// last API call, survives between turns) and the #2982 /model override (set
+// the instant a switch is confirmed — the ONLY truthful source in the
+// idle-after-switch window, before the next assistant line lands). Every write
+// is seq-stamped and `resolve()` prefers the NEWER observation, so neither
+// source can go stale behind the other (session-model-source.ts, pinned by
+// tests/session-model-source.test.ts). buildAgentMetadata reads resolve();
+// the /model command paths write via setOverride.
+const sessionModelSource = createSessionModelSource()
 // Captures the most-recently-started turn's sessionChatId. Unlike currentTurn,
 // this is NOT cleared by the silence poke (firePoke/clearTurnStarted). It lets
 // the Bug B fallback in executeReply route to the correct chat even when the
@@ -12771,6 +12790,7 @@ function composeTurnActivity(turn: CurrentTurn, final = false, liveSuffix = ''):
     elapsedMs: turn.startedAt > 0 ? Date.now() - turn.startedAt : 0,
     toolCount: turn.labeledToolCount,
     state: final ? 'done' : 'running',
+    model: turn.currentModel,
   }
   return renderActivityFeedWithNested(turn.mirrorLines, childLines, final, liveSuffix, stepCount, header)
 }
@@ -13088,6 +13108,7 @@ function openLivenessFeedIfDue(turn: CurrentTurn): void {
   const lines = turn.mirrorLines.length > 0 ? turn.mirrorLines : ['Working…']
   const livenessHeader: SessionActivityHeader = {
     label: 'Agent', elapsedMs: age, toolCount: turn.labeledToolCount, state: 'running',
+    model: turn.currentModel,
   }
   // Liveness card is a single "step" whose start is the turn start, so `age`
   // IS the step's own elapsed. formatStepSuffix keeps the `→` line timer-free
@@ -13218,6 +13239,7 @@ function feedHeartbeatTick(): void {
     const age = Date.now() - turn.startedAt
     const livenessHeader: SessionActivityHeader = {
       label: 'Agent', elapsedMs: age, toolCount: turn.labeledToolCount, state: 'running',
+      model: turn.currentModel,
     }
     const lines = turn.mirrorLines.length > 0 ? turn.mirrorLines : ['Working in background…']
     // `subagentAt` is the worker's last ADVANCE — the current step's start —
@@ -13407,6 +13429,7 @@ function clearActivitySummary(turn: CurrentTurn, finalHtmlOverride?: string | nu
       const livenessElapsed = turn.startedAt > 0 ? Date.now() - turn.startedAt : 0
       const livenessHeader: SessionActivityHeader = {
         label: 'Agent', elapsedMs: livenessElapsed, toolCount: turn.labeledToolCount, state: 'done',
+        model: turn.currentModel,
       }
       finalHtml = renderActivityFeedWithNested(['Working…'], [], true, '', undefined, livenessHeader)
     }
@@ -13897,6 +13920,22 @@ function handleSessionEvent(ev: SessionEvent): void {
       return
     }
     case 'dequeue': return
+    case 'model': {
+      // Live model capture for the main turn. The session-tail projection
+      // already filtered sentinels (`<synthetic>` compaction lines), so any
+      // value reaching here is a real resolved model id. Record it on the turn
+      // (update-on-change) so the activity/liveness card header and /status
+      // render the model actually serving this turn's API calls — transcript-
+      // sourced, never config. Also note it on the freshness-aware session-model
+      // source so a /status query between turns still reflects the last model
+      // (and a fresh assistant line reclaims the source from a /model override).
+      const turn = currentTurn
+      if (turn != null) {
+        turn.currentModel = ev.model
+      }
+      sessionModelSource.noteTranscriptModel(ev.model)
+      return
+    }
     case 'thinking': {
       // #1067: snapshot the turn atom at handler entry. Even though this
       // handler is sync, the principle is uniform across all event arms
@@ -18463,13 +18502,12 @@ function buildAgentAudit(agentName: string): AgentAudit | undefined {
 // broker's fleet-wide `ListStateData` payload via
 // `buildAuthSummaryFromBroker`, with billingType pulled from the
 // agent's `.claude.json` (the broker doesn't track plan tier).
-/**
- * Live session-model override set by the `/model` picker (session-only). Held
- * in gateway memory so it clears on restart, the same point at which claude's
- * session reverts to the configured model — keeping `/status` honest without
- * a persisted store. Null when no session switch is active.
- */
-let activeSessionModelOverride: string | null = null
+// The live session-model override set by the `/model` picker (session-only)
+// lives on `sessionModelSource` (setOverride/getOverride, declared beside the
+// currentTurn globals). Held in gateway memory so it clears on restart, the
+// same point at which claude's session reverts to the configured model —
+// keeping `/status` honest without a persisted store. `resolve()` arbitrates
+// freshness against the transcript-observed model (#2982 idle-switch window).
 
 async function buildAgentMetadata(agentName: string): Promise<AgentMetadata> {
   type AgentListResp = {
@@ -18499,7 +18537,18 @@ async function buildAgentMetadata(agentName: string): Promise<AgentMetadata> {
   return {
     agentName,
     model: a?.model ?? null,
-    sessionModel: activeSessionModelOverride,
+    // The FRESHEST session-model observation wins (session-model-source.ts):
+    // the transcript's `message.model` (ground truth for the last API call)
+    // vs the #2982 /model override (the only truthful source in the idle-
+    // after-switch window, before the next assistant line). Both rendered
+    // through formatModelLabel for a consistent short form; an override value
+    // that isn't model-shaped (an already-friendly "Opus 4.8" label) passes
+    // through verbatim. Never sourced from config.
+    sessionModel: (() => {
+      const resolved = sessionModelSource.resolve()
+      if (resolved == null) return null
+      return formatModelLabel(resolved.model) ?? resolved.model
+    })(),
     extendsProfile: (a?.extends ?? a?.template) ?? null,
     topicName: a?.topic_name ?? null,
     topicEmoji: a?.topic_emoji ?? null,
@@ -18730,7 +18779,7 @@ function buildModelDeps(restartCtx?: ModelDepsRestartContext): ModelMenuDeps & M
     },
     escapeHtml: escapeHtmlForTg,
     preBlock,
-    getActiveSessionModel: () => activeSessionModelOverride,
+    getActiveSessionModel: () => sessionModelSource.getOverride(),
     /**
      * Graceful restart for sr-* → Claude model switch. Same mechanism as
      * the /restart command: writes a restart marker (so the post-restart
@@ -18801,9 +18850,9 @@ function buildModelDeps(restartCtx?: ModelDepsRestartContext): ModelMenuDeps & M
       if (!agentDir) throw new Error('agent dir unresolvable — cannot write session-model carrier')
       // Carrier: single line, token + newline, no quoting (start.sh strips
       // whitespace and shape-gates). One-shot — consumed on the next boot.
-      const prevOverride = activeSessionModelOverride
+      const prevOverride = sessionModelSource.getOverride()
       writeFileSync(join(agentDir, '.session-model-override'), `${model}\n`, 'utf8')
-      activeSessionModelOverride = model
+      sessionModelSource.setOverride(model)
       try {
         await deps.scheduleRestart(reason)
       } catch (err) {
@@ -18816,7 +18865,7 @@ function buildModelDeps(restartCtx?: ModelDepsRestartContext): ModelMenuDeps & M
         // NEXT ordinary restart.
         if ((err as { code?: string })?.code !== 'restart_in_flight') {
           try { rmSync(carrierPath, { force: true }) } catch { /* best-effort */ }
-          activeSessionModelOverride = prevOverride
+          sessionModelSource.setOverride(prevOverride)
         }
         throw err
       }
@@ -18850,12 +18899,12 @@ bot.command('model', async ctx => {
   const reply = await handleModelCommand(parsed, deps)
   // Record a POSITIVELY-CONFIRMED typed switch so /status reflects what's
   // actually running — the SAME in-memory override the menu callback path sets
-  // (buildAgentMetadata reads activeSessionModelOverride as sessionModel). Only
+  // (buildAgentMetadata resolves it via sessionModelSource). Only
   // set on the confirmed inject path; the sr-*/relaunch paths already set the
   // override inside scheduleModelRelaunch, and an unverified switch carries no
   // selectedModel so /status is never lied to.
   if (reply.selectedModel) {
-    activeSessionModelOverride = reply.selectedModel
+    sessionModelSource.setOverride(reply.selectedModel)
   }
   await switchroomReply(ctx, reply.text, { html: reply.html })
 })
@@ -23955,13 +24004,13 @@ bot.on('callback_query:data', async ctx => {
     }
     const didInterimSrEdit = false
     try {
-      const prevSessionModel = activeSessionModelOverride
+      const prevSessionModel = sessionModelSource.getOverride()
       const outcome = await handleModelMenuCallback(data, modelDeps)
       // Record a successful session switch so /status reflects what's
       // actually running. In-memory only → clears when the gateway (and thus
       // claude's session) restarts, exactly matching the session-only scope.
       if (outcome.selectedModel) {
-        activeSessionModelOverride = outcome.selectedModel
+        sessionModelSource.setOverride(outcome.selectedModel)
       }
       // toastOnly: leave the menu untouched — but only if we haven't already
       // cleared its buttons with the interim sr-* edit. If we have, fall
@@ -23996,7 +24045,7 @@ bot.on('callback_query:data', async ctx => {
           if (agentDir && token) {
             try {
               writeFileSync(join(agentDir, '.session-model-override'), `${token}\n`, 'utf8')
-              activeSessionModelOverride = token
+              sessionModelSource.setOverride(token)
             } catch (e) {
               process.stderr.write(`telegram gateway: sr-to-claude carrier write failed: ${(e as Error)?.message ?? String(e)}\n`)
             }
@@ -27014,8 +27063,9 @@ void (async () => {
                   // a phantom session override.
                   return resolveMainModel(raw ?? undefined)
                 })()
-                activeSessionModelOverride =
-                  launched.length > 0 && launched !== configured ? launched : null
+                sessionModelSource.setOverride(
+                  launched.length > 0 && launched !== configured ? launched : null,
+                )
               } catch { /* leave override as-is on a bad read */ }
             }
 
@@ -27402,6 +27452,10 @@ void (async () => {
                       latestSummary: resultText,
                       elapsedMs: durationMs,
                       state: outcome === 'failed' ? 'failed' : 'done',
+                      // Persisted (registry) model — the last one the watcher
+                      // recorded from the worker's transcript — so the terminal
+                      // card keeps the model tag even with no live entry.
+                      model: dispatch.feedModel ?? undefined,
                     })
                     reconcileWorkerPin(agentId, null, false)
                   }
@@ -27479,6 +27533,7 @@ void (async () => {
                       latestSummary: resultText,
                       elapsedMs: durationMs,
                       state: outcome === 'failed' ? 'failed' : 'done',
+                      model: dispatch.feedModel ?? undefined,
                     })
                     // Status-pin: worker done — drop its pin.
                     reconcileWorkerPin(agentId, null, false)
@@ -27498,6 +27553,7 @@ void (async () => {
                     latestSummary: resultText,
                     elapsedMs: durationMs,
                     state: outcome === 'failed' ? 'failed' : 'done',
+                    model: dispatch.feedModel ?? undefined,
                   })
                   // Status-pin: worker done — drop its pin.
                   reconcileWorkerPin(agentId, null, false)
@@ -27584,7 +27640,7 @@ void (async () => {
               // suppresses stale-after-restart delivery (a 4-h-old
               // "still working (5m)" would be a lie). Sweep on handback
               // lives in the `onFinish` block just above.
-              onProgress: ({ agentId, description, latestSummary, elapsedMs, prevBucketIdx, setBucketIdx, lastTool, toolCount, progressLine }) => {
+              onProgress: ({ agentId, description, latestSummary, elapsedMs, prevBucketIdx, setBucketIdx, lastTool, toolCount, progressLine, model }) => {
                 let fleetChatId = ''
                 try {
                   const fleets = progressDriver?.peekAllFleets() ?? []
@@ -27618,6 +27674,13 @@ void (async () => {
                 // never grew past "starting…" (the frozen-card symptom). The
                 // foreground nest path below already used this precedence.
                 const stepLine = (progressLine != null && progressLine.length > 0) ? progressLine : latestSummary
+                // Live model for the worker card: prefer the transcript-sourced
+                // model on the entry (threaded via onProgress) and fall back to
+                // the dispatch-time model persisted on the registry row
+                // (tool_input.model) until the worker's first assistant line
+                // lands. Undefined when neither is known — the card omits it,
+                // never guessing from config.
+                const feedModel = model ?? dispatch.feedModel ?? undefined
                 if (!isBackground) {
                   // Model A — a foreground sub-agent runs inside the parent's
                   // turn, so its live narrative nests under the parent's
@@ -27657,6 +27720,7 @@ void (async () => {
                         latestSummary: stepLine,
                         elapsedMs,
                         state: 'running',
+                        model: feedModel,
                       },
                       wk.threadId,
                     )?.then(() => reconcileWorkerPin(agentId, wkChat, true))
@@ -27798,6 +27862,7 @@ void (async () => {
                       latestSummary: stepLine,
                       elapsedMs,
                       state: 'running',
+                      model: feedModel,
                     },
                     wk.threadId,
                   )?.then(() => reconcileWorkerPin(agentId, wkChat, true))

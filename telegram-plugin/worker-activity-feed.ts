@@ -70,6 +70,14 @@ export interface WorkerActivityView {
   /** Wall-clock since dispatch, ms. */
   elapsedMs: number
   state: WorkerActivityState
+  /**
+   * Live model the worker is running, as a raw resolved model id sourced from
+   * its transcript (`message.model`) or, before its first assistant line, the
+   * dispatch-time `tool_input.model` persisted on the registry row. Rendered as
+   * a short friendly tag on the worker card's metrics line. Omitted when
+   * unknown — never guessed from config.
+   */
+  model?: string
 }
 
 export interface BotApiForWorkerFeed {
@@ -133,6 +141,7 @@ export function renderWorkerActivity(v: WorkerActivityView, liveSuffix = ''): st
     elapsedMs: v.elapsedMs,
     toolCount: v.toolCount,
     state: v.state,
+    model: v.model,
   }
 
   // Terminal: latestSummary carries the worker's final result text (gateway
