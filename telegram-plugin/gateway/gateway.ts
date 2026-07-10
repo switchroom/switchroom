@@ -5661,7 +5661,12 @@ type PendingVaultOp =
       startedAt: number
     }
 const VAULT_INPUT_TTL_MS = 5 * 60 * 1000
-const pendingVaultOps = new Map<string, PendingVaultOp>()
+// Storage extracted to pending-state-stores.ts (#2996 Phase 3 step 2): the
+// store owns the Map + co-locates the delete-past-TTL sweep the reaper drove
+// inline. TTL + direction stay here (byte-identical: now - startedAt > TTL).
+const pendingVaultOps = createSweepableStore<PendingVaultOp>(
+  (v, now) => now - v.startedAt > VAULT_INPUT_TTL_MS,
+)
 
 // Secret-detection staging: ambiguous hits the user must confirm before we
 // store/delete. Also holds the deferred "we need a passphrase before we can
@@ -6390,9 +6395,7 @@ const pendingStateReaper = setInterval(() => {
   for (const [k, v] of pendingAuthRmFlows) {
     if (now >= v.expiresAt) pendingAuthRmFlows.delete(k)
   }
-  for (const [k, v] of pendingVaultOps) {
-    if (now - v.startedAt > VAULT_INPUT_TTL_MS) pendingVaultOps.delete(k)
-  }
+  pendingVaultOps.sweep(now)
   for (const [k, v] of pendingPermissions) {
     // hostd gated fleet-mutation verbs get a longer (30-min) human-scale
     // decision window than the 10-min default (Bug 2 fix #2).
