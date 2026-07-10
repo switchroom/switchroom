@@ -387,6 +387,7 @@ import {
   MODEL_CALLBACK_PREFIX,
   MODEL_CALLBACK_HEADER,
   MODEL_CALLBACK_SR,
+  MODEL_CALLBACK_ALIAS,
   MODEL_CALLBACK_PAGE_EXTERNAL,
   MODEL_CALLBACK_PAGE_MAIN,
   srFriendlyLabel,
@@ -405,6 +406,8 @@ import {
   writeRelaunchModelIntent,
   clearRelaunchModelIntent,
   intentForRestartReason,
+  readSessionModelFile,
+  RELAUNCH_MODEL_INTENT_FILE,
 } from './session-model-file.js'
 import { discoverModels, selectModel } from '../../src/agents/model-picker.js'
 import { resolveMainModel } from '../../src/agents/scaffold.js'
@@ -417,6 +420,14 @@ import {
   type EffortCommandDeps,
   type EffortMenuReply,
 } from './effort-command.js'
+import {
+  createPendingSessionCommandSlot,
+  ackText as pendingCmdAckText,
+  supersededText as pendingCmdSupersededText,
+  restartSupersededText as pendingCmdRestartSupersededText,
+  type PendingSessionCommand,
+} from './pending-session-command.js'
+import type { EffortLevel } from './effort-command.js'
 import { registerSwitchroomBotCommands } from './register-bot-commands.js'
 import { registerOpsInfoCommands } from './bot-commands-ops-info.js'
 import { applyEffort } from '../../src/agents/effort-picker.js'
@@ -2619,6 +2630,17 @@ async function deliverButtonTapInbound(
 
 const pendingRestarts = new Map<string, number>()  // agentName -> timestamp when restart was requested
 
+// Deterministic ack-queue-apply-confirm for /model + /effort issued mid-turn
+// (#3017). Single-valued, last-write-wins. Enqueued at the busy gates (typed
+// and menu), drained at the SAME model-idle gate as pendingRestarts (turn
+// complete + the reaper cap), which then EDITS the ack card into the
+// confirmation. See pending-session-command.ts for the contract.
+const pendingSessionCommand = createPendingSessionCommandSlot()
+// Bounded drain-cap for a queued /model|/effort command whose session never
+// cleanly idles — mirrors PENDING_RESTART_DRAIN_CAP_MS. After this, force the
+// apply-or-report so the ack card never dangles unresolved.
+const PENDING_CMD_DRAIN_CAP_MS = 60_000
+
 // ─── Proactive context compaction (session.max_context_tokens) ──────────
 //
 // Opt-in: when the resolved agent config sets session.max_context_tokens,
@@ -4103,6 +4125,13 @@ function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
   // serialize gate): a pending self-restart or proactive compaction must
   // fire when claude is idle regardless of whether the last turn replied.
   if (!turnInFlightForGate()) {
+    // Apply any /model|/effort command queued mid-turn (#3017) BEFORE the
+    // restart drain reads the pending-restart map — drainPendingSessionCommand
+    // itself checks pendingRestarts and, when a restart is also pending,
+    // reports "restarting" on the ack card instead of a false confirmation.
+    // The sr-*→Claude menu apply may ITSELF enqueue a restart, which the
+    // restart drain below then picks up. Async + best-effort (own try/catch).
+    void drainPendingSessionCommand()
     if (pendingRestarts.size > 0) {
       for (const [agentName, _timestamp] of pendingRestarts.entries()) {
         triggerSelfRestart(agentName, 'turn-complete-pending-restart');
@@ -6388,6 +6417,18 @@ const pendingStateReaper = setInterval(() => {
       pendingRestarts.delete(agentName)
       triggerSelfRestart(agentName, 'restart-drain-cap-forced', 100)
     }
+  }
+  // Drain cap for a queued /model|/effort command (#3017): if the session
+  // never cleanly idled, force the apply-or-report so the ack card never
+  // dangles unresolved. drainPendingSessionCommand no-ops on an idle-gate race
+  // (its own re-entrancy guard) and reports honestly when a restart is pending.
+  const queued = pendingSessionCommand.get()
+  if (queued != null && now - queued.requestedAt > PENDING_CMD_DRAIN_CAP_MS) {
+    const waitedSec = Math.round((now - queued.requestedAt) / 1000)
+    process.stderr.write(
+      `telegram gateway: [pending-cmd-drain] forcing kind=${queued.kind} target=${queued.targetLabel} waited=${waitedSec}s threshold=${Math.round(PENDING_CMD_DRAIN_CAP_MS / 1000)}s\n`,
+    )
+    void drainPendingSessionCommand()
   }
 }, 60_000)
 pendingStateReaper.unref()
@@ -19866,6 +19907,269 @@ function modelMenuReplyMarkup(reply: ModelMenuReply): InlineKeyboard | undefined
   return kb
 }
 
+/**
+ * Record a POSITIVELY-CONFIRMED typed `/model` switch: set the in-memory
+ * override so `/status` reflects the live model and persist the sticky
+ * `.session-model` carrier. Shared by the live `bot.command('model')` handler
+ * and the deferred (queued mid-turn) apply so both record identically. Returns
+ * a persist-warning suffix to append to the reply body (empty when clean).
+ *
+ * The `/status` honesty invariant lives here: only `reply.selectedModel`
+ * (present only on a confirmed switch) records; an unverified inject records
+ * nothing. `/model default` clears the carrier idempotently.
+ */
+function recordTypedModelSwitch(
+  reply: { text: string; selectedModel?: string },
+  requestedModelArg: string | null,
+  deps: ModelCommandDeps,
+): string {
+  const requested = requestedModelArg != null ? expandSrAlias(requestedModelArg) : null
+  if (requested?.toLowerCase() === 'default') {
+    const smDir = resolveAgentDirFromEnv()
+    if (smDir) clearSessionModelFile(smDir)
+    if (reply.selectedModel) sessionModelSource.setOverride(null)
+    return ''
+  }
+  if (!reply.selectedModel) return ''
+  sessionModelSource.setOverride(reply.selectedModel)
+  const smDir = resolveAgentDirFromEnv()
+  if (smDir && requested && isValidModelArg(requested) && !isSrModel(requested)) {
+    try {
+      writeSessionModelFile(
+        smDir,
+        requested,
+        readConfiguredDefaultModel(smDir) ??
+          resolveMainModel(deps.getConfiguredModel() ?? undefined),
+      )
+    } catch (err) {
+      process.stderr.write(
+        `telegram gateway: session-model persist failed (typed /model): ${(err as Error)?.message ?? String(err)}\n`,
+      )
+      return '\n⚠️ Couldn’t persist the sticky override — the switch is live now but won’t survive a relaunch.'
+    }
+  }
+  return ''
+}
+
+/**
+ * Record a model-MENU callback outcome (persist/clear sticky override) and
+ * drive an sr-*→Claude graceful restart when the tap crosses that boundary.
+ * Extracted from the live `mdl:*` dispatcher so the deferred (queued mid-turn)
+ * apply records + restarts identically. Does NOT edit any Telegram message —
+ * callers own the card edit. Returns a restart notice when a session restart
+ * was scheduled (the card should then drop its keyboard).
+ */
+function recordModelMenuSideEffects(
+  outcome: Awaited<ReturnType<typeof handleModelMenuCallback>>,
+  modelDeps: ModelCommandDeps,
+  cbChatId: string,
+  cbThreadId: number | undefined,
+  prevSessionModel: string | null,
+): { restartNotice?: string } {
+  // Record a successful session switch so /status reflects what's actually
+  // running, and persist the STICKY override
+  // (reference/rfcs/session-model-stickiness.md): the canonical token (never
+  // the display label) goes to the durable `.session-model`; a confirmed
+  // "Default (recommended)" selection clears it instead.
+  if (outcome.selectedModel) {
+    sessionModelSource.setOverride(outcome.selectedModel)
+    const smDir = resolveAgentDirFromEnv()
+    if (smDir && outcome.selectedModelToken) {
+      try {
+        writeSessionModelFile(
+          smDir,
+          outcome.selectedModelToken,
+          readConfiguredDefaultModel(smDir) ??
+            resolveMainModel(modelDeps.getConfiguredModel() ?? undefined),
+        )
+      } catch (err) {
+        outcome.reply.text +=
+          '\n⚠️ Couldn’t persist the sticky override — the switch is live now but won’t survive a relaunch.'
+        process.stderr.write(
+          `telegram gateway: session-model persist failed (menu): ${(err as Error)?.message ?? String(err)}\n`,
+        )
+      }
+    }
+  }
+  if (outcome.clearedDefault) {
+    const smDir = resolveAgentDirFromEnv()
+    if (smDir) clearSessionModelFile(smDir)
+  }
+
+  // sr-* → Claude transition: the picker-select only changes the session model
+  // label, but the sr-* LiteLLM routing context persists until the session is
+  // torn down — a graceful restart (same mechanism as /restart) is required.
+  if (outcome.selectedModel && isSrToClaudeTransition(prevSessionModel, outcome.selectedModel)) {
+    const agentName = getMyAgentName()
+    // Carry the requested Claude model across the restart via the SAME durable
+    // `.session-model` override a Claude → sr-* switch uses — otherwise boot
+    // launches the CONFIGURED default and the tapped model is silently dropped.
+    const agentDir = resolveAgentDirFromEnv()
+    const token = outcome.selectedModelToken
+    if (agentDir && token) {
+      try {
+        writeSessionModelFile(
+          agentDir,
+          token,
+          readConfiguredDefaultModel(agentDir) ??
+            resolveMainModel(modelDeps.getConfiguredModel() ?? undefined),
+        )
+        sessionModelSource.setOverride(token)
+      } catch (e) {
+        process.stderr.write(`telegram gateway: sr-to-claude session-model write failed: ${(e as Error)?.message ?? String(e)}\n`)
+      }
+    } else if (agentDir) {
+      // Default-row tap while on sr-*: the restart must land on the configured
+      // default — a stale sticky override would resurrect the old model.
+      clearSessionModelFile(agentDir)
+    }
+    // Write the restart marker so the post-restart boot card edits into this chat.
+    writeRestartMarker({ chat_id: cbChatId, thread_id: cbThreadId ?? null, ack_message_id: null, ts: Date.now() })
+    stampUserRestartReason('user: sr-to-claude model switch (menu)')
+    if (turnInFlightForGate()) {
+      // Defer restart until the in-flight turn completes (same gate as /restart).
+      pendingRestarts.set(agentName, Date.now())
+    } else {
+      void sweepBeforeSelfRestart().finally(() =>
+        triggerSelfRestart(agentName, 'sr-to-claude-model-switch', 1500),
+      )
+    }
+    return {
+      restartNotice: `🔄 Switching from **${escapeHtmlForTg(prevSessionModel!)}** back to Claude — restarting session cleanly. Claude will be ready in ~30s.`,
+    }
+  }
+  return {}
+}
+
+// ─── Mid-turn ack-queue-apply-confirm for /model + /effort (#3017) ──────────
+//
+// See pending-session-command.ts for the contract. The busy gates ENQUEUE
+// here + ACK; drainPendingSessionCommand() APPLIES the moment the agent idles
+// (from the same model-idle gate that drains pendingRestarts, plus the reaper
+// cap) and EDITS the ack card into the confirmation.
+
+/**
+ * Edit a queued command's ack card (chatId+messageId) into a new body,
+ * dropping any inline keyboard. Best-effort — a deleted card just logs.
+ * Mirrors redeliverBufferedInbound's edit-on-deliver via the shared retry
+ * policy so flood-wait / not-found are handled by the standard wrapper.
+ */
+async function editPendingCommandCard(chatId: string, messageId: number, text: string): Promise<void> {
+  try {
+    await robustApiCall(
+      () =>
+        // allow-raw-bot-api: deferred command-card edit routed through robustApiCall (not in the THREAD_NOT_FOUND blast pattern)
+        lockedBot.api.editMessageText(chatId, messageId, richMessage(hardenCardBreaks(text)), {
+          reply_markup: { inline_keyboard: [] },
+        }),
+      { chat_id: chatId, verb: 'pending-cmd-card' },
+    )
+  } catch (err) {
+    process.stderr.write(
+      `telegram gateway: pending-command card edit failed chat=${chatId} msg=${messageId}: ${(err as Error)?.message ?? String(err)}\n`,
+    )
+  }
+}
+
+/**
+ * Enqueue a mid-turn session command (last-write-wins). If it displaces an
+ * earlier queued command, edit that stale ack card into a "superseded" note so
+ * the operator's replaced choice is never silently lost.
+ */
+function enqueueSessionCommand(cmd: PendingSessionCommand): void {
+  const displaced = pendingSessionCommand.set(cmd)
+  if (displaced) {
+    void editPendingCommandCard(
+      displaced.ackChatId,
+      displaced.ackMessageId,
+      pendingCmdSupersededText(displaced, cmd, escapeHtmlForTg),
+    )
+  }
+}
+
+/** Apply a queued typed/menu-alias model command at idle; return the reply body. */
+async function applyQueuedModelCommand(cmd: PendingSessionCommand): Promise<string> {
+  const deps = buildModelDeps({ chatId: cmd.chatId, threadId: cmd.threadId })
+  if (cmd.origin === 'menu') {
+    // Menu SELECT (mdl:s:<tag>) — replay the callback handler (discovery is
+    // idle-safe now) and record via the shared side-effects helper.
+    const prevSessionModel = sessionModelSource.getOverride()
+    const outcome = await handleModelMenuCallback(cmd.arg, deps)
+    const { restartNotice } = recordModelMenuSideEffects(
+      outcome,
+      deps,
+      cmd.chatId,
+      cmd.threadId,
+      prevSessionModel,
+    )
+    return restartNotice ?? outcome.reply.text
+  }
+  // Typed (and alias/sr menu taps converted to typed at enqueue): run the real
+  // handler + shared recording.
+  const reply = await handleModelCommand({ kind: 'set', model: cmd.arg }, deps)
+  const warning = recordTypedModelSwitch(reply, cmd.arg, deps)
+  return reply.text + warning
+}
+
+/** Apply a queued typed/menu effort command at idle; return the reply body. */
+async function applyQueuedEffortCommand(cmd: PendingSessionCommand): Promise<string> {
+  const deps = buildEffortDeps()
+  if (cmd.origin === 'menu') {
+    const outcome = await handleEffortMenuCallback(cmd.arg, deps)
+    return outcome.reply.text
+  }
+  const reply = await handleEffortCommand({ kind: 'set', level: cmd.arg as EffortLevel }, deps)
+  return reply.text
+}
+
+// Synchronous re-entrancy guard — the idle gate can fire several times per
+// turn-end; the async apply must not double-dispatch before the first settles
+// (mirrors compactDispatching).
+let pendingCmdDraining = false
+
+/**
+ * Drain the queued session command when the agent goes idle: apply it, then
+ * edit the ack card into the confirmation (or a failure banner). Called from
+ * the model-idle gate (turn complete) and the reaper drain-cap. No-op when the
+ * slot is empty. If a restart is also pending the session is going away — a
+ * Claude-model / effort session change would not survive, so report that
+ * honestly rather than falsely confirming.
+ */
+async function drainPendingSessionCommand(): Promise<void> {
+  if (pendingCmdDraining) return
+  if (pendingSessionCommand.size === 0) return
+  pendingCmdDraining = true
+  const cmd = pendingSessionCommand.take()
+  try {
+    if (cmd == null) return
+    if (pendingRestarts.size > 0) {
+      await editPendingCommandCard(
+        cmd.ackChatId,
+        cmd.ackMessageId,
+        pendingCmdRestartSupersededText(cmd, escapeHtmlForTg),
+      )
+      return
+    }
+    let body: string
+    try {
+      body =
+        cmd.kind === 'model'
+          ? await applyQueuedModelCommand(cmd)
+          : await applyQueuedEffortCommand(cmd)
+    } catch (err) {
+      await editPendingCommandCard(
+        cmd.ackChatId,
+        cmd.ackMessageId,
+        `❌ Couldn’t apply the queued ${cmd.kind} switch to \`${escapeHtmlForTg(cmd.targetLabel)}\`: ${escapeHtmlForTg((err as Error)?.message ?? String(err))}`,
+      )
+      return
+    }
+    await editPendingCommandCard(cmd.ackChatId, cmd.ackMessageId, body)
+  } finally {
+    pendingCmdDraining = false
+  }
+}
+
 bot.command('model', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   const text = ctx.message?.text ?? ctx.channelPost?.text ?? ''
@@ -19878,50 +20182,38 @@ bot.command('model', async ctx => {
     await switchroomReply(ctx, menu.text, { html: true, reply_markup: modelMenuReplyMarkup(menu) })
     return
   }
+  // Mid-turn: instead of dead-ending ("Try again in a moment"), ACK + QUEUE +
+  // apply-on-idle + confirm (#3017). The typed set path either injects into
+  // claude's input box or triggers a carrier restart — both unsafe mid-turn.
+  if (parsed.kind === 'set' && deps.isBusy()) {
+    const target = expandSrAlias(parsed.model)
+    const sent = await ctx.replyWithRichMessage(
+      richMessage(hardenCardBreaks(pendingCmdAckText('model', target, escapeHtmlForTg))),
+      threadId != null ? { message_thread_id: threadId } : {},
+    )
+    enqueueSessionCommand({
+      kind: 'model',
+      origin: 'typed',
+      arg: target,
+      targetLabel: target,
+      chatId,
+      threadId,
+      ackChatId: chatId,
+      ackMessageId: (sent as { message_id: number }).message_id,
+      requestedAt: Date.now(),
+    })
+    return
+  }
   const reply = await handleModelCommand(parsed, deps)
   // Record a POSITIVELY-CONFIRMED typed switch so /status reflects what's
-  // actually running — the SAME in-memory override the menu callback path sets
-  // (buildAgentMetadata resolves it via sessionModelSource). Only
-  // set on the confirmed inject path; the sr-*/relaunch paths already set the
-  // override inside scheduleModelRelaunch, and an unverified switch carries no
-  // selectedModel so /status is never lied to.
-  const requested = parsed.kind === 'set' ? expandSrAlias(parsed.model) : null
-  let persistWarning = ''
-  if (requested?.toLowerCase() === 'default') {
-    // `/model default` clears the sticky file even WITHOUT a positive
-    // confirmation: claude's arg-form switch can be silent, and a surviving
-    // sticky file would resurrect the old model on the next keep-relaunch.
-    // Clearing is idempotent; the in-memory override change stays gated on a
-    // confirmed switch so an unverified inject never lies to /status.
-    const smDir = resolveAgentDirFromEnv()
-    if (smDir) clearSessionModelFile(smDir)
-    if (reply.selectedModel) sessionModelSource.setOverride(null)
-  } else if (reply.selectedModel) {
-    sessionModelSource.setOverride(reply.selectedModel)
-    // Durable stickiness: persist the REQUESTED canonical token — never
-    // the confirmation's display label ("Opus 4.8"), which `claude
-    // --model` would reject on the next boot. sr-* switches never reach
-    // here (they go through scheduleModelRelaunch, which persists).
-    const smDir = resolveAgentDirFromEnv()
-    if (smDir && requested && isValidModelArg(requested) && !isSrModel(requested)) {
-      try {
-        writeSessionModelFile(
-          smDir,
-          requested,
-          readConfiguredDefaultModel(smDir) ??
-            resolveMainModel(deps.getConfiguredModel() ?? undefined),
-        )
-      } catch (err) {
-        // The reply body already promises stickiness — never let the promise
-        // and the disk disagree silently.
-        persistWarning =
-          '\n⚠️ Couldn’t persist the sticky override — the switch is live now but won’t survive a relaunch.'
-        process.stderr.write(
-          `telegram gateway: session-model persist failed (typed /model): ${(err as Error)?.message ?? String(err)}\n`,
-        )
-      }
-    }
-  }
+  // actually running (shared with the deferred/menu paths). The sr-*/relaunch
+  // paths already set the override inside scheduleModelRelaunch; an unverified
+  // switch carries no selectedModel so /status is never lied to.
+  const persistWarning = recordTypedModelSwitch(
+    reply,
+    parsed.kind === 'set' ? parsed.model : null,
+    deps,
+  )
   await switchroomReply(ctx, reply.text + persistWarning, { html: reply.html })
 })
 
@@ -19965,6 +20257,30 @@ bot.command('effort', async ctx => {
   if (parsed.kind === 'show') {
     const menu = buildEffortMenu(deps)
     await switchroomReply(ctx, menu.text, { html: true, reply_markup: effortMenuReplyMarkup(menu) })
+    return
+  }
+  // Mid-turn: ACK + QUEUE + apply-on-idle + confirm (#3017) — parity with
+  // /model. `applyEffort` mid-turn silently maybe-failed ("couldn't confirm it
+  // applied") before this gate existed. `currentTurn !== null` is the same
+  // busy signal the model path reads via deps.isBusy().
+  if (parsed.kind === 'set' && currentTurn !== null) {
+    const chatId = String(ctx.chat!.id)
+    const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
+    const sent = await ctx.replyWithRichMessage(
+      richMessage(hardenCardBreaks(pendingCmdAckText('effort', parsed.level, escapeHtmlForTg))),
+      threadId != null ? { message_thread_id: threadId } : {},
+    )
+    enqueueSessionCommand({
+      kind: 'effort',
+      origin: 'typed',
+      arg: parsed.level,
+      targetLabel: parsed.level,
+      chatId,
+      threadId,
+      ackChatId: chatId,
+      ackMessageId: (sent as { message_id: number }).message_id,
+      requestedAt: Date.now(),
+    })
     return
   }
   const reply = await handleEffortCommand(parsed, deps)
@@ -22704,9 +23020,37 @@ bot.on('callback_query:data', async ctx => {
       await ctx.answerCallbackQuery({ text: 'Not authorized.' })
       return
     }
-    // No picker-driving (the inline `/effort <level>` form sets it
-    // directly via the inject primitive), so no mid-turn guard is needed
-    // here — just ack and apply.
+    // Mid-turn: ACK + QUEUE + apply-on-idle + confirm (#3017). `applyEffort`
+    // types `/effort <level>` into claude's input box + drives the confirm
+    // modal — mid-turn that queues the text as user input instead of switching
+    // (the silent maybe-fail this fix closes). Parity with the model-menu gate.
+    const effLevel = data.startsWith('eff:s:') ? data.slice('eff:s:'.length) : null
+    const effCardMsgId = ctx.callbackQuery?.message?.message_id
+    if (effLevel != null && currentTurn !== null && effCardMsgId != null) {
+      await ctx
+        .answerCallbackQuery({ text: '📥 Queued — applies when the turn ends' })
+        .catch(() => {})
+      const effChatId = String(ctx.chat?.id ?? '')
+      const effThreadId = resolveThreadId(effChatId, ctx.callbackQuery?.message?.message_thread_id)
+      await ctx
+        .editMessageText(richMessage(hardenCardBreaks(pendingCmdAckText('effort', effLevel, escapeHtmlForTg))), {
+          reply_markup: { inline_keyboard: [] },
+        })
+        .catch(() => {})
+      enqueueSessionCommand({
+        kind: 'effort',
+        origin: 'menu',
+        arg: data,
+        targetLabel: effLevel,
+        chatId: effChatId,
+        threadId: effThreadId,
+        ackChatId: effChatId,
+        ackMessageId: effCardMsgId,
+        requestedAt: Date.now(),
+      })
+      return
+    }
+    // Idle: apply directly. No picker-driving concern — just ack and apply.
     await ctx.answerCallbackQuery({ text: 'Setting effort…' }).catch(() => {})
     try {
       const outcome = await handleEffortMenuCallback(data, buildEffortDeps())
@@ -22745,12 +23089,51 @@ bot.on('callback_query:data', async ctx => {
     const cbChatId = String(ctx.chat?.id ?? '')
     const cbThreadId = resolveThreadId(cbChatId, ctx.callbackQuery?.message?.message_thread_id)
     const modelDeps = buildModelDeps({ chatId: cbChatId, threadId: cbThreadId })
-    // Mid-turn refusal is INSTANT (a sync isBusy() check, no picker drive),
-    // so handle it before the "Working…" ack: toast WHY and leave the menu
-    // message untouched (buttons intact) so the operator taps again when
-    // idle. Editing the menu into a button-less "try again" line was the
-    // "nothing happened" report — the menu looked dead.
+    // Mid-turn (#3017): a model-SWITCH tap no longer dead-ends. ACK + QUEUE +
+    // apply-on-idle + confirm — the tap edits the menu card into the ack, which
+    // the idle drain then edits into the confirmation. Non-switch taps (Refresh
+    // / page-nav / header) still just toast — they drive the picker (discovery)
+    // which is unsafe mid-turn and carry no operator choice to preserve.
     if (modelDeps.isBusy()) {
+      // Classify: sr-*/alias taps carry a real model token → queue as a typed
+      // apply (reuses the typed drain + recording). A select tag (mdl:s:<tag>)
+      // needs idle discovery to resolve → queue as a menu apply (replayed).
+      const cardMsgId = ctx.callbackQuery?.message?.message_id
+      let queueArg: string | null = null
+      let queueOrigin: 'typed' | 'menu' = 'menu'
+      let queueLabel = 'the selected model'
+      if (data.startsWith(MODEL_CALLBACK_SR)) {
+        const srName = data.slice(MODEL_CALLBACK_SR.length)
+        if (isValidModelArg(srName)) { queueArg = srName; queueOrigin = 'typed'; queueLabel = srFriendlyLabel(srName) }
+      } else if (data.startsWith(MODEL_CALLBACK_ALIAS)) {
+        const alias = data.slice(MODEL_CALLBACK_ALIAS.length)
+        if (isValidModelArg(alias)) { queueArg = alias; queueOrigin = 'typed'; queueLabel = alias }
+      } else if (data.startsWith('mdl:s:')) {
+        queueArg = data; queueOrigin = 'menu'
+      }
+      if (queueArg != null && cardMsgId != null) {
+        await ctx
+          .answerCallbackQuery({ text: '📥 Queued — applies when the turn ends' })
+          .catch(() => {})
+        await ctx
+          .editMessageText(richMessage(hardenCardBreaks(pendingCmdAckText('model', queueLabel, escapeHtmlForTg))), {
+            reply_markup: { inline_keyboard: [] },
+          })
+          .catch(() => {})
+        enqueueSessionCommand({
+          kind: 'model',
+          origin: queueOrigin,
+          arg: queueArg,
+          targetLabel: queueLabel,
+          chatId: cbChatId,
+          threadId: cbThreadId,
+          ackChatId: cbChatId,
+          ackMessageId: cardMsgId,
+          requestedAt: Date.now(),
+        })
+        return
+      }
+      // Non-switch tap (or unresolvable) — keep the menu intact, just toast.
       await ctx
         .answerCallbackQuery({ text: '⏳ Agent is mid-turn — tap again when it’s idle', show_alert: false })
         .catch(() => {})
@@ -22814,105 +23197,32 @@ bot.on('callback_query:data', async ctx => {
       }
       return
     }
-    const didInterimSrEdit = false
     try {
       const prevSessionModel = sessionModelSource.getOverride()
       const outcome = await handleModelMenuCallback(data, modelDeps)
-      // Record a successful session switch so /status reflects what's
-      // actually running, and persist the STICKY override
-      // (reference/rfcs/session-model-stickiness.md): the canonical token
-      // (never the display label) goes to the durable `.session-model`; a
-      // confirmed "Default (recommended)" selection clears it instead.
-      if (outcome.selectedModel) {
-        sessionModelSource.setOverride(outcome.selectedModel)
-        const smDir = resolveAgentDirFromEnv()
-        if (smDir && outcome.selectedModelToken) {
-          try {
-            writeSessionModelFile(
-              smDir,
-              outcome.selectedModelToken,
-              readConfiguredDefaultModel(smDir) ??
-                resolveMainModel(modelDeps.getConfiguredModel() ?? undefined),
-            )
-          } catch (err) {
-            // The banner already promises stickiness — surface the failure on
-            // the same card instead of only stderr.
-            outcome.reply.text +=
-              '\n⚠️ Couldn’t persist the sticky override — the switch is live now but won’t survive a relaunch.'
-            process.stderr.write(
-              `telegram gateway: session-model persist failed (menu): ${(err as Error)?.message ?? String(err)}\n`,
-            )
-          }
-        }
-      }
-      if (outcome.clearedDefault) {
-        const smDir = resolveAgentDirFromEnv()
-        if (smDir) clearSessionModelFile(smDir)
-      }
-      // toastOnly: leave the menu untouched — but only if we haven't already
-      // cleared its buttons with the interim sr-* edit. If we have, fall
-      // through to the final edit so the message is recovered (busyReply or
-      // the full menu) rather than left permanently button-less.
-      if (outcome.toastOnly && !didInterimSrEdit) return
-
-      // sr-* → Claude transition via the model menu: trigger a graceful restart.
-      // Switching FROM an sr-* (LiteLLM/OpenRouter) model BACK to a Claude model
-      // via the picker requires a session restart — the picker-select only changes
-      // the session model label, but the sr-* LiteLLM routing context persists
-      // until the session is torn down. Same mechanism as the /restart command.
-      if (outcome.selectedModel && isSrToClaudeTransition(prevSessionModel, outcome.selectedModel)) {
-        const agentName = getMyAgentName()
-        // Replace the menu with a restart notice (no buttons — session is ending).
+      // toastOnly: leave the menu untouched — a mid-turn refusal keeps its
+      // buttons so the operator can tap again. (In the enqueue world this
+      // branch is unreachable — the dispatcher enqueues switches mid-turn
+      // before ever calling the handler — but retained for callers that skip
+      // the dispatcher gate.)
+      if (outcome.toastOnly) return
+      // Record the switch (persist/clear sticky override) + drive an sr-*→Claude
+      // graceful restart when needed. Shared with the deferred (queued) apply so
+      // both surfaces record identically. Returns a restart notice when a
+      // session restart was scheduled.
+      const { restartNotice } = recordModelMenuSideEffects(
+        outcome,
+        modelDeps,
+        cbChatId,
+        cbThreadId,
+        prevSessionModel,
+      )
+      if (restartNotice) {
         await ctx
-          .editMessageText(
-            richMessage(`🔄 Switching from **${escapeHtmlForTg(prevSessionModel!)}** back to Claude — restarting session cleanly. Claude will be ready in ~30s.`),
-            { reply_markup: { inline_keyboard: [] } },
-          )
+          .editMessageText(richMessage(restartNotice), { reply_markup: { inline_keyboard: [] } })
           .catch(() => {})
-        // Carry the requested Claude model across the restart via the SAME
-        // durable `.session-model` override a Claude → sr-* switch uses —
-        // otherwise boot launches the CONFIGURED default and the tapped model
-        // is silently dropped. `selectedModelToken` is a real `claude --model`
-        // token (alias or full claude-* id); a "Default"-row tap yields no
-        // token → clear the override and boot the configured default
-        // (correct). start.sh's LiteLLM-down guard only skips sr-* overrides,
-        // so a Claude token is never dropped.
-        {
-          const agentDir = resolveAgentDirFromEnv()
-          const token = outcome.selectedModelToken
-          if (agentDir && token) {
-            try {
-              writeSessionModelFile(
-                agentDir,
-                token,
-                readConfiguredDefaultModel(agentDir) ??
-                  resolveMainModel(modelDeps.getConfiguredModel() ?? undefined),
-              )
-              sessionModelSource.setOverride(token)
-            } catch (e) {
-              process.stderr.write(`telegram gateway: sr-to-claude session-model write failed: ${(e as Error)?.message ?? String(e)}\n`)
-            }
-          } else if (agentDir) {
-            // Default-row tap while on sr-*: the restart must land on the
-            // configured default — a stale sticky override would resurrect
-            // the old model on the next keep-relaunch.
-            clearSessionModelFile(agentDir)
-          }
-        }
-        // Write the restart marker so the post-restart boot card edits into this chat.
-        writeRestartMarker({ chat_id: cbChatId, thread_id: cbThreadId ?? null, ack_message_id: null, ts: Date.now() })
-        stampUserRestartReason('user: sr-to-claude model switch (menu)')
-        if (turnInFlightForGate()) {
-          // Defer restart until the in-flight turn completes (same gate as /restart).
-          pendingRestarts.set(agentName, Date.now())
-        } else {
-          void sweepBeforeSelfRestart().finally(() =>
-            triggerSelfRestart(agentName, 'sr-to-claude-model-switch', 1500),
-          )
-        }
         return
       }
-
       await ctx
         .editMessageText(richMessage(outcome.reply.text), {
           reply_markup: modelMenuReplyMarkup(outcome.reply) ?? { inline_keyboard: [] },
@@ -25190,6 +25500,30 @@ async function shutdown(signal: string): Promise<void> {
       process.stderr.write(`telegram gateway: shutdown.clean_marker_written signal=${signal} reason=${JSON.stringify(next.reason ?? '')} preserved=${prior?.reason === next.reason && prior != null} path=${GATEWAY_CLEAN_SHUTDOWN_MARKER_PATH}\n`)
     } catch (err) {
       process.stderr.write(`telegram gateway: shutdown.clean_marker_write_failed err=${(err as Error).message}\n`)
+    }
+    // #3017 — persist a Telegram-set model across a GRACEFUL deploy/restart.
+    // Boot default is REVERT, and an EXTERNAL deploy (SIGTERM to PID 1 from
+    // `switchroom apply` / `docker compose up`) never routes through
+    // triggerSelfRestart, so it stamps no `.relaunch-model-intent` and start.sh
+    // drops the user's `/model` choice (the overlord `fable`→`opus` revert on
+    // the v0.18.9 roll). A graceful OS-signal shutdown IS a clean, planned
+    // bounce — stamp keep-intent for an active `.session-model` override so the
+    // chosen model survives and start.sh re-confirms it via `.session-model-alert`
+    // on boot. Respect an intent an initiator already stamped (a /restart stamps
+    // 'revert' before SIGTERM): only stamp when none exists. A crash routes
+    // through the non-OS-signal branch and still reverts (safe side preserved).
+    try {
+      const smDir = resolveAgentDirFromEnv()
+      if (smDir != null) {
+        const hasOverride = readSessionModelFile(smDir) != null
+        const intentAlreadyStamped = existsSync(join(smDir, RELAUNCH_MODEL_INTENT_FILE))
+        if (hasOverride && !intentAlreadyStamped) {
+          writeRelaunchModelIntent(smDir, 'keep', `graceful ${signal} shutdown (deploy/rolling restart) — preserving user-chosen session model`)
+          process.stderr.write(`telegram gateway: shutdown.session_model_keep_stamped signal=${signal}\n`)
+        }
+      }
+    } catch (err) {
+      process.stderr.write(`telegram gateway: shutdown.session_model_keep_stamp_failed err=${(err as Error).message}\n`)
     }
   } else {
     process.stderr.write(`telegram gateway: shutdown.clean_marker_skipped signal=${signal} (crash path — banner will fire on next boot)\n`)
