@@ -2,6 +2,118 @@
 
 ## Unreleased
 
+## v0.18.8 — No more silent waits, stale pins, or phantom failovers
+
+### Stale worker pins get reaped instead of squatting the chat (#3001)
+
+A worker's pinned progress card could outlive the work: a missed
+completion event or a restart mid-dispatch left the pin up until some
+later boot happened to sweep it. Restart now means reset — any pinned
+message whose work didn't finish is unpinned. A mid-session `wk:` pin
+reaper (step 3 of the existing 5-min sweep) unpins when the sub-agent
+registry row is terminal or the claim outlives a 6h TTL, with a
+registry-confirmed **running** worker exempt from the TTL so a healthy
+long job never churns. Deliberate `pin_message` tool pins are now
+tracked with a 7-day TTL and deliberately survive restarts (a tool pin
+has no "work finished" event). Boot sweeps became retry-safe: a failed
+unpin is retained with an attempt counter (cap 5) and retried next
+boot instead of forfeiting the orphan. Kill switch
+`SWITCHROOM_WORKER_PIN_REAPER=0`.
+
+### A quick question behind a long tool call gets an ack, not silence (#2995)
+
+A mid-turn ping buffered behind one long blocking tool call (`gh pr
+checks --watch`, a slow build) waited minutes with only a 👀 reaction —
+from the phone it read as ignored. The gateway now posts a
+deterministic, model-free, silent-notification card into the inbound's
+own chat/topic when the ping lands mid-tool-call and the current step
+is older than 12s: "⏳ Queued — currently inside `Bash: …`; I'll answer
+when this step finishes" (steers say "Steer noted", never "Queued" —
+classification stays visible). A ping during a still-young step gets
+one deferred re-check at the threshold, so it's never forgotten. The
+card reuses the queued-status lifecycle (promoted when the turn starts,
+deleted when the answer lands), at most one per turn per topic, zero
+tokens. Kill switch `SWITCHROOM_MIDFLIGHT_BUSY_ACK=0`.
+
+### Resource exhaustion degrades loudly instead of muting the agent (#2915, #2923, #2555)
+
+Three field failure modes where a resource limit made an agent silently,
+fully mute. (a) switchroom-web crash-looped 417× when its single-file
+config bind resolved to a directory: a new startup guard names the real
+remedy (`--force-recreate`) and applies persisted, bounded exponential
+crash backoff (capped 1 min) so a persistent failure fails loudly once
+then paces. (b) tmpfs ENOSPC wedged the send path into a tight retry
+loop that tripped Telegram's per-bot flood ban (~68 min), and every
+restart's boot card extended the ban: local resource errors
+(ENOSPC/EDQUOT/EIO/ENOMEM) are no longer retried against the API, and a
+new flood circuit breaker persists each observed 429 window so a
+restart during an active ban suppresses the boot card. (c) Hardening
+for Node SIGABRT under cgroup memory pressure before hook code runs.
+
+### Memory writes can no longer silently lie about success (#2976)
+
+`src/memory` was ~16:1 src-to-test lines; the write path could report
+success on Hindsight's HTTP 200 + `isError:true` envelope — a silent
+no-op is silent data loss. 35 new tests pin the MCP write ops and the
+bank-health read surface (extraction-gap fingerprinting, corrupted-
+model detection, staleness). Plus a real integrity fix: mental-model
+`source_query`/`name` fields were persisting HTML-escaped (`R&amp;D`
+steering recall instead of `R&D`) — canonical entities are now decoded
+at the config write boundary, and the dup guard compares decoded names.
+
+### A transient 429 no longer masquerades as quota exhaustion (#2922, #2586)
+
+A server-side transient `rate_limit_error` ("**not your usage limit**")
+was classified as `quota_exhausted` by a negation-blind substring
+match — firing a phantom fleet failover card that self-cancelled, a dead
+turn, and raw `b'{...}'` error lines leaking into chat. Transient-
+upstream signals now classify as `overload` (the calm path Claude Code
+retries internally), genuine usage-limit hits still fail over, and raw
+API-error TUI lines are dropped before they reach chat. Separately, the
+Microsoft 365 MCP launcher stops hammering the auth-broker on a
+crash-looping softeria (14.7k credential fetches in 7 days): it
+re-spawns with the still-valid cached token under exponential backoff
+(1s→30s), no broker call.
+
+### /model switches survive the restarts you meant, revert on the ones you didn't (#2993)
+
+A confirmed `/model X` switch is now a durable session-scoped override,
+and whether a boot keeps it is decided by explicit restart intent
+stamped by the gateway before every switchroom-managed bounce. Boot
+default is **revert**: crashes, raw `docker restart`, host reboots, and
+deploys land back on the yaml model — announced, never silent. `/clear`
+and `/new` keep the override; `/restart`, hostd restarts, and rollouts
+revert it; a yaml `model:` change invalidates it with a notice;
+`/model default` clears it. Overrides expire after 7 days.
+
+### Over-long formatted replies split instead of vanishing (#2994)
+
+When markdown escaping grew a long reply past Telegram's wire cap, the
+old path collapsed it to plain text and sent it via a 4096-cap call —
+silently dropping the entire answer. `renderOutboundChunks` now
+re-splits the raw source at safe boundaries (never bisecting a code
+fence or table row) and re-renders each piece under its wire cap;
+formatting is recovered instead of dumped, and tail pieces land as
+fresh messages.
+
+### Repeat 🔊 Listen taps play near-instantly (#2992)
+
+Every tap of the voice Listen button re-uploaded the audio bytes to
+Telegram — an upload round-trip per tap. The first successful send now
+captures Telegram's reusable `file_id`; second and later taps send by
+id (no disk read, no upload). A stale id falls back to re-upload and
+refreshes; audio is still only ever sent on a button tap.
+
+### Outcome-based coverage for the approval/restart continuation contract (#2991)
+
+Tests only. Every outcome promised by the v0.18.7 approval/restart
+specs (#2985) is now mapped to a test, with the gaps closed: new UAT
+scenarios for deny-resumes-turn, timeout-wakes-agent,
+card-survives-gateway-restart, and deliberate-restart-resumes, plus a
+module-composition test proving the durable-card store, expiry sweep,
+and inbound builders compose. Purely additive — 5 new test files, no
+source changes.
+
 ## v0.18.7 — Work continues after approval cards and restarts
 
 ### Deliberate restarts no longer silently drop in-flight work (#2988)
