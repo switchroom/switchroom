@@ -69,6 +69,32 @@ export function detectModelUnavailable(
   const sample = stderr.length > 16_384 ? stderr.slice(0, 16_384) : stderr
   const lower = sample.toLowerCase()
 
+  // ── 0. Transient / server-side 429 (NOT account quota) — issue #2922 ────
+  // Anthropic emits a `rate_limit_error` whose message explicitly negates the
+  // account-quota reading: "Server is temporarily limiting requests (not your
+  // usage limit)". A negation-blind substring match on "usage limit" (step 1
+  // below) would misclassify this as `quota_exhausted`, firing a phantom fleet
+  // failover that self-cancels and leaves the turn dead. These are upstream
+  // throttles Claude Code retries internally with backoff — classify them as
+  // `overload` (the calm rate-limit path) BEFORE the quota substrings run, so
+  // the negation is honoured and no failover is announced.
+  const transientUpstreamSignals = [
+    'not your usage limit',
+    'not your account',
+    "not your account's",
+    'temporarily limiting requests',
+    'temporarily rate',
+    'server is temporarily',
+    'would exceed your account’s rate limit',
+    "would exceed your account's rate limit",
+  ]
+  if (transientUpstreamSignals.some(s => lower.includes(s))) {
+    const resetAt = parseResetTime(sample)
+    return resetAt !== undefined
+      ? { kind: 'overload', resetAt, raw: stderr }
+      : { kind: 'overload', raw: stderr }
+  }
+
   // ── 1. Quota / billing exhaustion ──────────────────────────────────────
   const quotaSignals = [
     'out of extra usage',

@@ -76,6 +76,47 @@ describe('detectModelUnavailable — overload / 429 / 5xx strings', () => {
   })
 })
 
+describe('detectModelUnavailable — transient upstream 429 vs account quota (#2922)', () => {
+  // The load-bearing regression: a server-side transient 429 whose message
+  // explicitly negates the account-quota reading ("not your usage limit")
+  // was misclassified as `quota_exhausted` by the negation-blind "usage limit"
+  // substring, firing a phantom fleet failover + dead turn. It must classify
+  // as `overload` (the calm rate-limit path Claude Code retries internally).
+  it("classifies the live-incident 'not your usage limit' 429 as overload, NOT quota_exhausted", () => {
+    const raw =
+      "API Error: Server is temporarily limiting requests (not your usage limit) · " +
+      'b\'{"type":"error","error":{"type":"rate_limit_error","message":' +
+      '"This request would exceed your account\'s rate limit. Please try again later."}}\''
+    const d = detectModelUnavailable(raw)
+    expect(d?.kind).toBe('overload')
+    expect(d?.kind).not.toBe('quota_exhausted')
+  })
+
+  it("classifies bare 'temporarily limiting requests' as overload", () => {
+    expect(
+      detectModelUnavailable('Server is temporarily limiting requests')?.kind,
+    ).toBe('overload')
+  })
+
+  it("classifies \"would exceed your account's rate limit\" as overload", () => {
+    expect(
+      detectModelUnavailable(
+        "This request would exceed your account's rate limit. Please try again later.",
+      )?.kind,
+    ).toBe('overload')
+  })
+
+  it('still classifies a genuine account usage-limit hit as quota_exhausted', () => {
+    // Guard against over-correction: real quota exhaustion must stay quota.
+    expect(
+      detectModelUnavailable("You've hit your limit · resets 8:50am (Australia/Melbourne)")?.kind,
+    ).toBe('quota_exhausted')
+    expect(detectModelUnavailable('Reached usage limit for the 5h window')?.kind).toBe(
+      'quota_exhausted',
+    )
+  })
+})
+
 describe('detectModelUnavailable — network failures', () => {
   it('classifies ECONNREFUSED', () => {
     expect(detectModelUnavailable('connect ECONNREFUSED 1.2.3.4:443')?.kind).toBe('network')
