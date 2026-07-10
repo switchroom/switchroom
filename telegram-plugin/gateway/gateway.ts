@@ -24951,14 +24951,27 @@ bot.on('callback_query:data', async ctx => {
           // gets picked up by the boot/periodic drain instead of quietly
           // requiring the operator to notice and re-tap.
           if (!editLockHint) {
-            alwaysAllowPersistQueue.enqueue({
-              agentName,
-              rule: chosen.rule,
-              grantPhrase,
-              chatId: ctx.chat?.id != null ? String(ctx.chat.id) : undefined,
-              threadId: (ctx.callbackQuery?.message as { message_thread_id?: number } | undefined)?.message_thread_id,
-              error: failReason,
-            })
+            try {
+              await alwaysAllowPersistQueue.enqueue({
+                agentName,
+                rule: chosen.rule,
+                grantPhrase,
+                chatId: ctx.chat?.id != null ? String(ctx.chat.id) : undefined,
+                threadId: (ctx.callbackQuery?.message as { message_thread_id?: number } | undefined)?.message_thread_id,
+                error: failReason,
+              })
+            } catch (enqueueErr) {
+              // The retry queue's own write failed (disk full, perms, …) —
+              // don't pretend this landed. Fold it into the operator-facing
+              // failReason so the "did NOT save" card is honest about the
+              // retry mechanism ALSO having failed, not just the original
+              // dispatch (#2973 adversarial review pt.2).
+              const enqueueMsg = (enqueueErr as Error).message
+              process.stderr.write(
+                `telegram gateway: always-allow enqueue for retry FAILED: ${enqueueMsg} (request_id=${request_id})\n`,
+              )
+              failReason = `${failReason} (retry queue also failed to persist: ${enqueueMsg})`
+            }
           }
         }
       }

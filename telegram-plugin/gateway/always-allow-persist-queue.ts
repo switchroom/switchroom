@@ -31,10 +31,24 @@
  * convention — see {@link MAX_ATTEMPTS}, {@link MAX_AGE_MS}, and
  * {@link MAX_QUEUE_SIZE} below, and the tests that pin them.
  *
- * File format + fault-tolerance mirrors `missed-approvals-store.ts`: a
- * single bounded JSON array, written synchronously, mode 0o600. No file
- * I/O failure here may throw into the caller — writes/reads degrade to
- * a no-op/empty-list rather than crashing the gateway.
+ * File format mirrors `missed-approvals-store.ts`: a single bounded JSON
+ * array, written synchronously, mode 0o600.
+ *
+ * Failure semantics (hardened post-#2973 adversarial review): a failed
+ * READ degrades to an empty list — a corrupt/missing queue file is not
+ * fatal, it just means "nothing queued yet". A failed WRITE is a
+ * different story: silently swallowing it would mean `enqueue()` tells
+ * its caller "queued for retry" when nothing was actually persisted to
+ * disk, and a concurrent `recordAttempt()`/`remove()` would silently
+ * fail to advance the queue's on-disk state. So `write()` PROPAGATES
+ * (throws) on failure, and `enqueue()` / `recordAttempt()` / `remove()`
+ * let that throw reach their own caller rather than pretending the
+ * mutation landed. `drainAlwaysAllowPersistQueue` below catches around
+ * each entry so one entry's write failure can't take down the rest of
+ * the drain pass; callers in the gateway (the interactive "Always
+ * allow" tap path) are responsible for catching enqueue() failures and
+ * reflecting them in the operator-facing message rather than claiming
+ * success.
  */
 
 import { readFileSync, writeFileSync, unlinkSync } from 'node:fs'
@@ -80,7 +94,10 @@ interface FileShape {
 export interface AlwaysAllowPersistQueue {
   /** Enqueue (or refresh) a failed persist for retry. Idempotent on
    * `(agentName, rule)` — an existing entry is updated in place rather
-   * than duplicated. */
+   * than duplicated. Serialized (via an in-process lock) relative to
+   * every other read-modify-write on the queue file, and REJECTS if the
+   * underlying write fails — callers must not treat a settled promise
+   * as "persisted" without checking for rejection. */
   enqueue(entry: {
     agentName: string
     rule: string
@@ -88,27 +105,32 @@ export interface AlwaysAllowPersistQueue {
     chatId?: string
     threadId?: number | null
     error?: string
-  }): void
+  }): Promise<void>
   /** All entries currently due for a retry attempt (nextAttemptAt <= now),
    * oldest first. Does NOT filter by attempts/age — callers should apply
    * {@link isExhausted} to decide terminal-failure vs. retry. */
   listDue(now?: number): AlwaysAllowPersistEntry[]
   /** Every entry in the queue, regardless of due-ness. */
   listAll(): AlwaysAllowPersistEntry[]
-  /** Record the outcome of a retry attempt for `id`.
+  /** Record the outcome of a retry attempt for `id`. Serialized relative
+   * to `enqueue`/`remove`/other `recordAttempt` calls on the same queue
+   * file — never races a concurrent mutation into a lost update.
    *  - `success: true` → dequeue.
    *  - `success: false` → increment attempts, compute the next backoff
    *    (honoring `retryAfterMs` when supplied), and re-persist — UNLESS
    *    the entry is now exhausted (see {@link isExhausted}), in which case
    *    it is dropped and the caller should have already emitted the
    *    terminal-failure notice.
+   * REJECTS if the underlying write fails — the caller must not assume
+   * the state change was durably persisted just because this returned.
    */
   recordAttempt(
     id: string,
     outcome: { success: true } | { success: false; error: string; retryAfterMs?: number },
-  ): void
-  /** Remove an entry outright (e.g. after emitting its terminal notice). */
-  remove(id: string): void
+  ): Promise<void>
+  /** Remove an entry outright (e.g. after emitting its terminal notice).
+   * Serialized like the other mutators; REJECTS if the write fails. */
+  remove(id: string): Promise<void>
   /** Delete the backing file entirely. */
   clear(): void
 }
@@ -142,6 +164,27 @@ export function computeBackoffMs(attempts: number, retryAfterMs?: number): numbe
 export function createAlwaysAllowPersistQueue(stateDir: string): AlwaysAllowPersistQueue {
   const filePath = join(stateDir, 'always-allow-persist-queue.json')
 
+  // ── In-process mutex ──────────────────────────────────────────────────
+  // enqueue / recordAttempt / remove are each a read-modify-write cycle
+  // against the SAME file. Node is single-threaded, but these operations
+  // are exposed as async (their callers `await` a hostd round trip, a
+  // drain pass, etc.), so two calls CAN interleave across a microtask/
+  // macrotask boundary — a naive "read, mutate, write" per call is a
+  // classic lost-update race (#2973 pt.3): call A reads, call B reads the
+  // same pre-A-write snapshot, B writes, A writes — B's update vanishes.
+  // Fix: every read-modify-write against `filePath` is queued through this
+  // single promise chain, so at most one is ever in flight at a time,
+  // regardless of how many callers invoke enqueue/recordAttempt/remove
+  // "concurrently".
+  let lock: Promise<unknown> = Promise.resolve()
+  function withLock<T>(fn: () => T): Promise<T> {
+    const result = lock.then(fn, fn) // run fn even if the previous link rejected
+    // Swallow the rejection on the CHAIN (not on `result`) so one failed
+    // mutation doesn't wedge the lock for everything queued after it.
+    lock = result.catch(() => {})
+    return result
+  }
+
   function read(): FileShape {
     try {
       const raw = readFileSync(filePath, 'utf-8')
@@ -152,54 +195,54 @@ export function createAlwaysAllowPersistQueue(stateDir: string): AlwaysAllowPers
     }
   }
 
+  /** Unlike `read()`, a write failure is NOT swallowed — it propagates so
+   * the caller (enqueue/recordAttempt/remove) finds out its mutation did
+   * not actually land on disk (disk full, permissions, etc.) instead of
+   * silently proceeding as if it had. */
   function write(f: FileShape): void {
-    try {
-      writeFileSync(filePath, JSON.stringify(f), { encoding: 'utf-8', mode: 0o600 })
-    } catch (err) {
-      process.stderr.write(
-        `telegram gateway: always-allow-persist-queue write failed: ${(err as Error).message}\n`,
-      )
-    }
+    writeFileSync(filePath, JSON.stringify(f), { encoding: 'utf-8', mode: 0o600 })
   }
 
   return {
     enqueue(args) {
-      const id = makeEntryId(args.agentName, args.rule)
-      const f = read()
-      const now = Date.now()
-      const idx = f.entries.findIndex(e => e.id === id)
-      if (idx >= 0) {
-        // Already queued (e.g. a second tap failed the same way) — keep
-        // its attempt history/createdAt (age bound is from FIRST failure),
-        // just refresh the description fields and last error.
-        f.entries[idx] = {
-          ...f.entries[idx]!,
-          grantPhrase: args.grantPhrase,
-          chatId: args.chatId,
-          threadId: args.threadId,
-          lastError: args.error,
+      return withLock(() => {
+        const id = makeEntryId(args.agentName, args.rule)
+        const f = read()
+        const now = Date.now()
+        const idx = f.entries.findIndex(e => e.id === id)
+        if (idx >= 0) {
+          // Already queued (e.g. a second tap failed the same way) — keep
+          // its attempt history/createdAt (age bound is from FIRST failure),
+          // just refresh the description fields and last error.
+          f.entries[idx] = {
+            ...f.entries[idx]!,
+            grantPhrase: args.grantPhrase,
+            chatId: args.chatId,
+            threadId: args.threadId,
+            lastError: args.error,
+          }
+        } else {
+          if (f.entries.length >= MAX_QUEUE_SIZE) {
+            // Bounded — drop the oldest to make room rather than growing
+            // without limit under a failure storm.
+            f.entries.sort((a, b) => a.createdAt - b.createdAt)
+            f.entries = f.entries.slice(f.entries.length - MAX_QUEUE_SIZE + 1)
+          }
+          f.entries.push({
+            id,
+            agentName: args.agentName,
+            rule: args.rule,
+            grantPhrase: args.grantPhrase,
+            chatId: args.chatId,
+            threadId: args.threadId,
+            attempts: 1,
+            createdAt: now,
+            nextAttemptAt: now + computeBackoffMs(1),
+            lastError: args.error,
+          })
         }
-      } else {
-        if (f.entries.length >= MAX_QUEUE_SIZE) {
-          // Bounded — drop the oldest to make room rather than growing
-          // without limit under a failure storm.
-          f.entries.sort((a, b) => a.createdAt - b.createdAt)
-          f.entries = f.entries.slice(f.entries.length - MAX_QUEUE_SIZE + 1)
-        }
-        f.entries.push({
-          id,
-          agentName: args.agentName,
-          rule: args.rule,
-          grantPhrase: args.grantPhrase,
-          chatId: args.chatId,
-          threadId: args.threadId,
-          attempts: 1,
-          createdAt: now,
-          nextAttemptAt: now + computeBackoffMs(1),
-          lastError: args.error,
-        })
-      }
-      write(f)
+        write(f)
+      })
     },
 
     listDue(now = Date.now()) {
@@ -213,40 +256,44 @@ export function createAlwaysAllowPersistQueue(stateDir: string): AlwaysAllowPers
     },
 
     recordAttempt(id, outcome) {
-      const f = read()
-      const idx = f.entries.findIndex(e => e.id === id)
-      if (idx === -1) return
-      if (outcome.success) {
-        f.entries.splice(idx, 1)
+      return withLock(() => {
+        const f = read()
+        const idx = f.entries.findIndex(e => e.id === id)
+        if (idx === -1) return
+        if (outcome.success) {
+          f.entries.splice(idx, 1)
+          write(f)
+          return
+        }
+        const entry = f.entries[idx]!
+        const attempts = entry.attempts + 1
+        const updated: AlwaysAllowPersistEntry = {
+          ...entry,
+          attempts,
+          lastError: outcome.error,
+          nextAttemptAt: Date.now() + computeBackoffMs(attempts, outcome.retryAfterMs),
+        }
+        if (isExhausted(updated)) {
+          // Exhausted — drop it. The caller is responsible for having
+          // emitted (or being about to emit) the terminal-failure notice;
+          // this store only owns the bounded-retry bookkeeping.
+          f.entries.splice(idx, 1)
+        } else {
+          f.entries[idx] = updated
+        }
         write(f)
-        return
-      }
-      const entry = f.entries[idx]!
-      const attempts = entry.attempts + 1
-      const updated: AlwaysAllowPersistEntry = {
-        ...entry,
-        attempts,
-        lastError: outcome.error,
-        nextAttemptAt: Date.now() + computeBackoffMs(attempts, outcome.retryAfterMs),
-      }
-      if (isExhausted(updated)) {
-        // Exhausted — drop it. The caller is responsible for having
-        // emitted (or being about to emit) the terminal-failure notice;
-        // this store only owns the bounded-retry bookkeeping.
-        f.entries.splice(idx, 1)
-      } else {
-        f.entries[idx] = updated
-      }
-      write(f)
+      })
     },
 
     remove(id) {
-      const f = read()
-      const filtered = f.entries.filter(e => e.id !== id)
-      if (filtered.length !== f.entries.length) {
-        f.entries = filtered
-        write(f)
-      }
+      return withLock(() => {
+        const f = read()
+        const filtered = f.entries.filter(e => e.id !== id)
+        if (filtered.length !== f.entries.length) {
+          f.entries = filtered
+          write(f)
+        }
+      })
     },
 
     clear() {
@@ -321,13 +368,13 @@ export async function drainAlwaysAllowPersistQueue(
         log(
           `always-allow-persist-queue: rule already persisted, no-op dequeue agent=${entry.agentName} rule=${entry.rule}\n`,
         )
-        queue.recordAttempt(entry.id, { success: true })
+        await recordAttemptSafely(entry, { success: true })
         continue
       }
 
       const diff = deps.synthesizeDiff(entry.agentName, entry.rule, configText)
       if (diff == null) {
-        recordFailure(entry, 'could not re-synthesize diff from fresh config read')
+        await recordFailure(entry, 'could not re-synthesize diff from fresh config read')
         continue
       }
 
@@ -336,17 +383,36 @@ export async function drainAlwaysAllowPersistQueue(
         log(
           `always-allow-persist-queue: retry succeeded agent=${entry.agentName} rule=${entry.rule} attempts=${entry.attempts}\n`,
         )
-        queue.recordAttempt(entry.id, { success: true })
+        await recordAttemptSafely(entry, { success: true })
       } else {
-        recordFailure(entry, result.error, result.retryAfterMs)
+        await recordFailure(entry, result.error, result.retryAfterMs)
       }
     } catch (err) {
       // Never let one entry's unexpected throw take down the drain pass.
-      recordFailure(entry, `unexpected error: ${(err as Error).message}`)
+      await recordFailure(entry, `unexpected error: ${(err as Error).message}`)
     }
   }
 
-  function recordFailure(entry: AlwaysAllowPersistEntry, error: string, retryAfterMs?: number): void {
+  /** `queue.recordAttempt` now REJECTS on a write failure (disk full,
+   * permissions, …) rather than silently pretending the state change
+   * persisted. The drain loop must not let that reject take down the
+   * whole pass (or the other due entries) — log it and move on; the
+   * entry stays in whatever state the last successful write left it in,
+   * and will be picked up again on the next drain pass. */
+  async function recordAttemptSafely(
+    entry: AlwaysAllowPersistEntry,
+    outcome: { success: true } | { success: false; error: string; retryAfterMs?: number },
+  ): Promise<void> {
+    try {
+      await queue.recordAttempt(entry.id, outcome)
+    } catch (err) {
+      log(
+        `always-allow-persist-queue: recordAttempt write failed (state change NOT persisted) agent=${entry.agentName} rule=${entry.rule}: ${(err as Error).message}\n`,
+      )
+    }
+  }
+
+  async function recordFailure(entry: AlwaysAllowPersistEntry, error: string, retryAfterMs?: number): Promise<void> {
     const willBeExhausted = isExhausted({ attempts: entry.attempts + 1, createdAt: entry.createdAt })
     log(
       `always-allow-persist-queue: retry failed agent=${entry.agentName} rule=${entry.rule} attempts=${entry.attempts + 1} exhausted=${willBeExhausted} error=${error}\n`,
@@ -360,6 +426,6 @@ export async function drainAlwaysAllowPersistQueue(
         )
       }
     }
-    queue.recordAttempt(entry.id, { success: false, error, retryAfterMs })
+    await recordAttemptSafely(entry, { success: false, error, retryAfterMs })
   }
 }

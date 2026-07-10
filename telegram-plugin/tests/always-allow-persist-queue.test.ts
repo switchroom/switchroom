@@ -12,13 +12,31 @@
  *   - a retry that finds the rule already persisted is a no-op dequeue
  *     (no duplicate-rule risk, no redispatch);
  *   - bounds are structural: MAX_ATTEMPTS, MAX_AGE_MS, MAX_QUEUE_SIZE,
- *     MAX_BACKOFF_MS all cap out — nothing retries indefinitely.
+ *     MAX_BACKOFF_MS all cap out — nothing retries indefinitely;
+ *   - concurrent read-modify-write operations against the queue file
+ *     (two overlapping enqueue()s, an enqueue() racing a drain's
+ *     recordAttempt(), etc.) are serialized — no lost update, no
+ *     duplicated/corrupted rule (adversarial review pt.1/pt.3);
+ *   - a write failure (disk full, permissions, …) PROPAGATES to the
+ *     caller of enqueue/recordAttempt/remove rather than being silently
+ *     swallowed (adversarial review pt.2).
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+
+// Partial mock of node:fs so individual tests can force a `writeFileSync`
+// failure (disk full / permissions / read-only fs) without needing real
+// filesystem faults (we run as root in CI/containers, so chmod-based
+// permission tricks don't reliably fail). `readFileSync`/other exports
+// stay real via `importOriginal`.
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>()
+  return { ...actual, writeFileSync: vi.fn(actual.writeFileSync) }
+})
+
 import {
   createAlwaysAllowPersistQueue,
   drainAlwaysAllowPersistQueue,
@@ -61,80 +79,80 @@ describe('createAlwaysAllowPersistQueue', () => {
     expect(q.listDue()).toEqual([])
   })
 
-  it('enqueue + listAll returns the entry with attempts=1', () => {
+  it('enqueue + listAll returns the entry with attempts=1', async () => {
     const q = createAlwaysAllowPersistQueue(dir)
-    q.enqueue(baseArgs())
+    await q.enqueue(baseArgs())
     const all = q.listAll()
     expect(all).toHaveLength(1)
     expect(all[0].attempts).toBe(1)
     expect(all[0].id).toBe(makeEntryId('clerk', 'Skill(calendar)'))
   })
 
-  it('is idempotent per (agent, rule) — a second failure updates, not duplicates', () => {
+  it('is idempotent per (agent, rule) — a second failure updates, not duplicates', async () => {
     const q = createAlwaysAllowPersistQueue(dir)
-    q.enqueue(baseArgs({ error: 'first' }))
-    q.enqueue(baseArgs({ error: 'second' }))
+    await q.enqueue(baseArgs({ error: 'first' }))
+    await q.enqueue(baseArgs({ error: 'second' }))
     expect(q.listAll()).toHaveLength(1)
     expect(q.listAll()[0].lastError).toBe('second')
   })
 
-  it('listDue only returns entries whose backoff has elapsed', () => {
+  it('listDue only returns entries whose backoff has elapsed', async () => {
     const q = createAlwaysAllowPersistQueue(dir)
-    q.enqueue(baseArgs())
+    await q.enqueue(baseArgs())
     const now = Date.now()
     // Not due yet — backoff for attempt 1 is BASE_BACKOFF_MS.
     expect(q.listDue(now)).toEqual([])
     expect(q.listDue(now + BASE_BACKOFF_MS + 1)).toHaveLength(1)
   })
 
-  it('survives reload (boot drain picks up a queued entry after restart)', () => {
+  it('survives reload (boot drain picks up a queued entry after restart)', async () => {
     const q1 = createAlwaysAllowPersistQueue(dir)
-    q1.enqueue(baseArgs())
+    await q1.enqueue(baseArgs())
     const q2 = createAlwaysAllowPersistQueue(dir)
     expect(q2.listAll()).toHaveLength(1)
   })
 
-  it('recordAttempt(success) dequeues', () => {
+  it('recordAttempt(success) dequeues', async () => {
     const q = createAlwaysAllowPersistQueue(dir)
-    q.enqueue(baseArgs())
+    await q.enqueue(baseArgs())
     const id = q.listAll()[0].id
-    q.recordAttempt(id, { success: true })
+    await q.recordAttempt(id, { success: true })
     expect(q.listAll()).toEqual([])
   })
 
-  it('recordAttempt(failure) increments attempts and pushes nextAttemptAt out', () => {
+  it('recordAttempt(failure) increments attempts and pushes nextAttemptAt out', async () => {
     const q = createAlwaysAllowPersistQueue(dir)
-    q.enqueue(baseArgs())
+    await q.enqueue(baseArgs())
     const id = q.listAll()[0].id
     const before = q.listAll()[0].nextAttemptAt
-    q.recordAttempt(id, { success: false, error: 'boom' })
+    await q.recordAttempt(id, { success: false, error: 'boom' })
     const after = q.listAll()[0]
     expect(after.attempts).toBe(2)
     expect(after.nextAttemptAt).toBeGreaterThan(before)
   })
 
-  it('recordAttempt drops the entry once MAX_ATTEMPTS is reached', () => {
+  it('recordAttempt drops the entry once MAX_ATTEMPTS is reached', async () => {
     // enqueue() itself counts as attempt 1 (the original failed dispatch
     // that triggered the enqueue) — so MAX_ATTEMPTS total tries is reached
     // after (MAX_ATTEMPTS - 1) further recordAttempt(failure) calls.
     const q = createAlwaysAllowPersistQueue(dir)
-    q.enqueue(baseArgs())
+    await q.enqueue(baseArgs())
     const id = q.listAll()[0].id
     for (let i = 0; i < MAX_ATTEMPTS - 2; i++) {
-      q.recordAttempt(id, { success: false, error: 'boom' })
+      await q.recordAttempt(id, { success: false, error: 'boom' })
     }
     // One more failure reaches attempts===MAX_ATTEMPTS and drops it.
     expect(q.listAll()[0].attempts).toBe(MAX_ATTEMPTS - 1)
-    q.recordAttempt(id, { success: false, error: 'boom' })
+    await q.recordAttempt(id, { success: false, error: 'boom' })
     expect(q.listAll()).toEqual([])
   })
 
-  it('honors a structured retryAfterMs floor on backoff', () => {
+  it('honors a structured retryAfterMs floor on backoff', async () => {
     const q = createAlwaysAllowPersistQueue(dir)
-    q.enqueue(baseArgs())
+    await q.enqueue(baseArgs())
     const id = q.listAll()[0].id
     const now = Date.now()
-    q.recordAttempt(id, { success: false, error: 'rate limited', retryAfterMs: 20 * 60_000 })
+    await q.recordAttempt(id, { success: false, error: 'rate limited', retryAfterMs: 20 * 60_000 })
     const entry = q.listAll()[0]
     // 20 minutes is bigger than the exponential value at attempt 2, so the
     // hint should win (but never exceed MAX_BACKOFF_MS).
@@ -142,27 +160,173 @@ describe('createAlwaysAllowPersistQueue', () => {
     expect(entry.nextAttemptAt - now).toBeLessThanOrEqual(MAX_BACKOFF_MS + 1000)
   })
 
-  it('bounds the queue at MAX_QUEUE_SIZE, dropping the oldest', () => {
+  it('bounds the queue at MAX_QUEUE_SIZE, dropping the oldest', async () => {
     const q = createAlwaysAllowPersistQueue(dir)
     for (let i = 0; i < MAX_QUEUE_SIZE + 5; i++) {
-      q.enqueue(baseArgs({ agentName: `agent${i}`, rule: 'Bash' }))
+      await q.enqueue(baseArgs({ agentName: `agent${i}`, rule: 'Bash' }))
     }
     expect(q.listAll().length).toBeLessThanOrEqual(MAX_QUEUE_SIZE)
   })
 
-  it('remove() drops an entry outright', () => {
+  it('remove() drops an entry outright', async () => {
     const q = createAlwaysAllowPersistQueue(dir)
-    q.enqueue(baseArgs())
+    await q.enqueue(baseArgs())
     const id = q.listAll()[0].id
-    q.remove(id)
+    await q.remove(id)
     expect(q.listAll()).toEqual([])
   })
 
-  it('clear() wipes the backing file', () => {
+  it('clear() wipes the backing file', async () => {
     const q = createAlwaysAllowPersistQueue(dir)
-    q.enqueue(baseArgs())
+    await q.enqueue(baseArgs())
     q.clear()
     expect(q.listAll()).toEqual([])
+  })
+})
+
+describe('createAlwaysAllowPersistQueue — concurrency (#2973 adversarial review pt.1/pt.3)', () => {
+  let dir: string
+  beforeEach(() => { dir = makeTmpDir() })
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
+
+  it('two concurrent enqueue() calls for the SAME (agent, rule) race but do not duplicate or corrupt the entry', async () => {
+    const q = createAlwaysAllowPersistQueue(dir)
+    // Fire both "concurrently" — no await between them — simulating two
+    // overlapping "Always allow" taps racing against each other, the
+    // exact scenario from the original bug report.
+    await Promise.all([
+      q.enqueue(baseArgs({ error: 'attempt-A' })),
+      q.enqueue(baseArgs({ error: 'attempt-B' })),
+    ])
+    const all = q.listAll()
+    // Exactly one entry — never duplicated, never lost.
+    expect(all).toHaveLength(1)
+    expect(all[0].id).toBe(makeEntryId('clerk', 'Skill(calendar)'))
+    // One of the two attempts' error message won — not corrupted/merged
+    // into something neither caller wrote.
+    expect(['attempt-A', 'attempt-B']).toContain(all[0].lastError)
+  })
+
+  it('two concurrent enqueue() calls for DIFFERENT rules both land — no lost update', async () => {
+    const q = createAlwaysAllowPersistQueue(dir)
+    await Promise.all([
+      q.enqueue(baseArgs({ rule: 'Skill(calendar)' })),
+      q.enqueue(baseArgs({ rule: 'Skill(email)' })),
+      q.enqueue(baseArgs({ rule: 'Bash(ls:*)' })),
+    ])
+    const all = q.listAll()
+    expect(all).toHaveLength(3)
+    const rules = all.map(e => e.rule).sort()
+    expect(rules).toEqual(['Bash(ls:*)', 'Skill(calendar)', 'Skill(email)'])
+  })
+
+  it('many concurrent enqueue() calls interleaved with recordAttempt on an unrelated id never lose an update', async () => {
+    const q = createAlwaysAllowPersistQueue(dir)
+    // Seed one entry to record against concurrently with fresh enqueues —
+    // simulates a drain's recordAttempt() racing new "Always allow" taps.
+    await q.enqueue(baseArgs({ agentName: 'seed', rule: 'Read' }))
+    const seedId = makeEntryId('seed', 'Read')
+
+    const ops: Promise<void>[] = []
+    for (let i = 0; i < 10; i++) {
+      ops.push(q.enqueue(baseArgs({ agentName: `agent${i}`, rule: 'Bash' })))
+    }
+    ops.push(q.recordAttempt(seedId, { success: false, error: 'racing' }))
+
+    await Promise.all(ops)
+
+    const all = q.listAll()
+    // 10 fresh entries + the seed entry (updated, not dropped/duplicated).
+    expect(all).toHaveLength(11)
+    const seed = all.find(e => e.id === seedId)
+    expect(seed).toBeDefined()
+    expect(seed!.attempts).toBe(2)
+    expect(seed!.lastError).toBe('racing')
+    for (let i = 0; i < 10; i++) {
+      expect(all.some(e => e.id === makeEntryId(`agent${i}`, 'Bash'))).toBe(true)
+    }
+  })
+
+  it('a concurrent enqueue() racing recordAttempt(success) on the SAME id does not resurrect a dequeued entry with corrupted state', async () => {
+    const q = createAlwaysAllowPersistQueue(dir)
+    await q.enqueue(baseArgs())
+    const id = q.listAll()[0].id
+
+    // One racer dequeues via success, the other refreshes via enqueue
+    // (e.g. a second failed tap landing right as the drain's redispatch
+    // for the SAME rule succeeds). Whichever wins, the on-disk file must
+    // stay well-formed and never contain two entries for the same id.
+    await Promise.all([
+      q.recordAttempt(id, { success: true }),
+      q.enqueue(baseArgs({ error: 'second-tap-failure' })),
+    ])
+
+    const all = q.listAll()
+    const matching = all.filter(e => e.id === id)
+    expect(matching.length).toBeLessThanOrEqual(1)
+  })
+})
+
+describe('createAlwaysAllowPersistQueue — write failures propagate (#2973 adversarial review pt.2)', () => {
+  let dir: string
+  beforeEach(() => { dir = makeTmpDir() })
+  afterEach(() => {
+    vi.restoreAllMocks()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('enqueue() rejects when the underlying writeFileSync throws (disk full / permissions)', async () => {
+    const q = createAlwaysAllowPersistQueue(dir)
+    vi.mocked(writeFileSync).mockImplementationOnce(() => {
+      throw new Error('ENOSPC: no space left on device')
+    })
+    await expect(q.enqueue(baseArgs())).rejects.toThrow(/ENOSPC/)
+    // The caller was told it failed — and indeed nothing was persisted.
+    expect(q.listAll()).toEqual([])
+  })
+
+  it('recordAttempt() rejects when the underlying writeFileSync throws, and does not pretend the state change landed', async () => {
+    const q = createAlwaysAllowPersistQueue(dir)
+    await q.enqueue(baseArgs())
+    const id = q.listAll()[0].id
+
+    vi.mocked(writeFileSync).mockImplementationOnce(() => {
+      throw new Error('EACCES: permission denied')
+    })
+    await expect(q.recordAttempt(id, { success: true })).rejects.toThrow(/EACCES/)
+
+    // The entry is still there — the (failed) dequeue never actually
+    // persisted, so a fresh read must still see it, not silently vanish.
+    expect(q.listAll()).toHaveLength(1)
+    expect(q.listAll()[0].id).toBe(id)
+  })
+
+  it('remove() rejects when the underlying writeFileSync throws', async () => {
+    const q = createAlwaysAllowPersistQueue(dir)
+    await q.enqueue(baseArgs())
+    const id = q.listAll()[0].id
+
+    vi.mocked(writeFileSync).mockImplementationOnce(() => {
+      throw new Error('EROFS: read-only file system')
+    })
+    await expect(q.remove(id)).rejects.toThrow(/EROFS/)
+
+    expect(q.listAll()).toHaveLength(1)
+  })
+
+  it('a write failure does not wedge the in-process lock — a later successful call still lands', async () => {
+    const q = createAlwaysAllowPersistQueue(dir)
+    vi.mocked(writeFileSync).mockImplementationOnce(() => {
+      throw new Error('ENOSPC: no space left on device')
+    })
+    await expect(q.enqueue(baseArgs({ error: 'first' }))).rejects.toThrow(/ENOSPC/)
+
+    // Disk recovered — the NEXT call (real writeFileSync) must succeed,
+    // proving the failed link didn't leave the mutex permanently locked.
+    await q.enqueue(baseArgs({ error: 'second' }))
+    const all = q.listAll()
+    expect(all).toHaveLength(1)
+    expect(all[0].lastError).toBe('second')
   })
 })
 
@@ -205,7 +369,7 @@ describe('drainAlwaysAllowPersistQueue', () => {
 
   it('a retryable failure retries after backoff with a fresh config read and succeeds; entry removed', async () => {
     const q = createAlwaysAllowPersistQueue(dir)
-    q.enqueue(baseArgs())
+    await q.enqueue(baseArgs())
     const readConfigText = vi.fn(() => 'agents:\n  clerk:\n    tools:\n      allow: [Read]\n')
     const dispatchConfigEdit = vi.fn(async () => ({ ok: true as const }))
     const deps = makeDeps({ readConfigText, dispatchConfigEdit })
@@ -231,7 +395,7 @@ describe('drainAlwaysAllowPersistQueue', () => {
 
   it('a retry that finds the rule already persisted is a no-op dequeue (no redispatch)', async () => {
     const q = createAlwaysAllowPersistQueue(dir)
-    q.enqueue(baseArgs({ rule: 'Read' })) // "Read" will already be in the fresh allow list
+    await q.enqueue(baseArgs({ rule: 'Read' })) // "Read" will already be in the fresh allow list
     const dispatchConfigEdit = vi.fn(async () => ({ ok: true as const }))
     const deps = makeDeps({
       resolveAllowList: () => ['Read'],
@@ -253,7 +417,7 @@ describe('drainAlwaysAllowPersistQueue', () => {
     // that triggered the enqueue) — so the drain loop's dispatchConfigEdit
     // fires (MAX_ATTEMPTS - 1) times before the entry is exhausted/dropped.
     const q = createAlwaysAllowPersistQueue(dir)
-    q.enqueue(baseArgs())
+    await q.enqueue(baseArgs())
     const notifyTerminalFailure = vi.fn()
     const dispatchConfigEdit = vi.fn(async () => ({ ok: false as const, error: 'E_PATCH_APPLY_FAILED' }))
     const deps = makeDeps({
@@ -279,7 +443,7 @@ describe('drainAlwaysAllowPersistQueue', () => {
 
   it('never retries indefinitely: attempts and age are both hard bounds (no drain call exceeds MAX_ATTEMPTS-1 dispatches for one entry)', async () => {
     const q = createAlwaysAllowPersistQueue(dir)
-    q.enqueue(baseArgs())
+    await q.enqueue(baseArgs())
     const dispatchConfigEdit = vi.fn(async () => ({ ok: false as const, error: 'boom' }))
     const deps = makeDeps({ resolveAllowList: () => [], dispatchConfigEdit, notifyTerminalFailure: vi.fn() })
 
@@ -297,7 +461,7 @@ describe('drainAlwaysAllowPersistQueue', () => {
 
   it('a config read failure is treated as retryable, not a crash', async () => {
     const q = createAlwaysAllowPersistQueue(dir)
-    q.enqueue(baseArgs())
+    await q.enqueue(baseArgs())
     const deps = makeDeps({
       readConfigText: () => { throw new Error('ENOENT') },
     })
@@ -313,7 +477,7 @@ describe('drainAlwaysAllowPersistQueue', () => {
 
   it('a null re-synthesized diff is treated as retryable, not a crash', async () => {
     const q = createAlwaysAllowPersistQueue(dir)
-    q.enqueue(baseArgs())
+    await q.enqueue(baseArgs())
     const deps = makeDeps({ synthesizeDiff: () => null })
 
     vi.useFakeTimers()
@@ -323,5 +487,31 @@ describe('drainAlwaysAllowPersistQueue', () => {
 
     expect(q.listAll()).toHaveLength(1)
     expect(q.listAll()[0].attempts).toBe(2)
+  })
+
+  it('a drain-time write failure on recordAttempt does not crash the pass and other due entries still get processed', async () => {
+    const q = createAlwaysAllowPersistQueue(dir)
+    await q.enqueue(baseArgs({ agentName: 'clerk', rule: 'Skill(calendar)' }))
+    await q.enqueue(baseArgs({ agentName: 'clerk', rule: 'Skill(email)' }))
+    const dispatchConfigEdit = vi.fn(async () => ({ ok: true as const }))
+    const deps = makeDeps({ resolveAllowList: () => [], dispatchConfigEdit })
+
+    // Both entries' recordAttempt writes fail — the drain pass must
+    // swallow that (log it) rather than throwing out of
+    // drainAlwaysAllowPersistQueue and abandoning remaining entries.
+    vi.mocked(writeFileSync).mockImplementation(() => {
+      throw new Error('EIO: i/o error')
+    })
+
+    vi.useFakeTimers()
+    vi.advanceTimersByTime(BASE_BACKOFF_MS + 1000)
+    await expect(drainAlwaysAllowPersistQueue(q, deps)).resolves.toBeUndefined()
+    vi.useRealTimers()
+
+    // Both entries were attempted despite the persistent write failure.
+    expect(dispatchConfigEdit).toHaveBeenCalledTimes(2)
+    // Since the "success" recordAttempt write failed, the entries are
+    // still present on next read (state change did NOT silently land).
+    expect(q.listAll()).toHaveLength(2)
   })
 })
