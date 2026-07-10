@@ -28,6 +28,35 @@ import { parseDocument } from "yaml";
 import { generateUnifiedDiff } from "../../src/web/config-diff.js";
 
 /**
+ * Decode the canonical six HTML/XML entities to their literal characters —
+ * the write-boundary half of the #2976 fix.
+ *
+ * The failure it kills: a model copies HTML-escaped entities out of its own
+ * (Telegram-HTML-rendered) context into a mental-model `name` / `source_query`,
+ * and nothing decodes them before they persist. The result is a bank with a
+ * model literally named `Nutrition Protocol &amp; Deficit Status`, or a
+ * reflection query that steers recall on `R&amp;D` instead of `R&D` — a
+ * durable, silent corruption of a memory-integrity field. Normalizing here, at
+ * the switchroom-owned write boundary that feeds the persisted config, means an
+ * escaped name/query can never LAND in `memory.mental_models[]`.
+ *
+ * SINGLE PASS by design (matches issue #2976's success criteria): a
+ * double-escaped `R&amp;amp;D` decodes ONE layer to `R&amp;D`, not all the way
+ * to `R&D` — we only undo the escaping switchroom itself applied when it
+ * rendered the model's prior output, never the user's literal intent. `&amp;`
+ * is decoded LAST so `&amp;lt;` collapses to `&lt;` (one layer), not `<`.
+ */
+export function decodeCanonicalEntities(s: string): string {
+  return s
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+/**
  * A proposed mental model, in the same snake_case shape the
  * `memory.mental_models[]` schema (#2874) accepts. `name` + `source_query`
  * are required; the knobs are opt-in and only serialised when set (a minimal
@@ -125,20 +154,31 @@ export function buildMentalModelAppendDiff(args: {
   }
 
   // Duplicate-name guard (defense-in-depth; the executor also checks up front
-  // so it never even posts a card for a dupe).
+  // so it never even posts a card for a dupe). Compare on the DECODED name so a
+  // re-propose of an entity-escaped variant collides with the already-stored
+  // literal (#2976) rather than sneaking in a corrupted twin.
+  const decodedName = decodeCanonicalEntities(spec.name);
   const existing = readDeclaredMentalModelNames(configText, agentName);
-  if (existing.includes(spec.name)) {
+  if (existing.includes(decodedName)) {
     return {
       ok: false,
       error: "duplicate",
-      detail: `mental model "${spec.name}" is already declared for ${agentName}`,
+      detail: `mental model "${decodedName}" is already declared for ${agentName}`,
     };
   }
 
+  // #2976 write-boundary normalization: decode any HTML/XML entities the model
+  // may have copied out of its own escaped context so the LITERAL characters
+  // land in config — never `&amp;` / `&lt;` etc. Applied to both the identity
+  // key (`name`, also the idempotent-ensure key) and the recall-steering
+  // `source_query`. Duplicate-name guard runs on the decoded name below.
+  const name = decodedName;
+  const source_query = decodeCanonicalEntities(spec.source_query);
+
   // Assemble the minimal, schema-clean declaration node.
   const item: Record<string, unknown> = {
-    name: spec.name,
-    source_query: spec.source_query,
+    name,
+    source_query,
   };
   if (spec.refresh_after_consolidation !== undefined) {
     item.refresh_after_consolidation = spec.refresh_after_consolidation;
