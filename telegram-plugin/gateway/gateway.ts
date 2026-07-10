@@ -2443,6 +2443,110 @@ function deliverResumeSyntheticOrBuffer(agent: string, inbound: InboundMessage):
   return delivered
 }
 
+/** Outcome of routing an agent-authored button tap through the turn-safe
+ *  delivery machinery. `buffered-mid-turn` and `delivered` both mean "the tap
+ *  will be actioned" (the mid-turn case flushes on turn-complete); only
+ *  `buffered-bridge-offline` needs the user-facing "agent is restarting" notice. */
+type ButtonTapDeliveryOutcome = 'delivered' | 'buffered-mid-turn' | 'buffered-bridge-offline'
+
+/**
+ * Deliver an agent-authored inline-keyboard button tap (`agent:` callback_data)
+ * through the SAME turn-safe machinery as a normal Telegram inbound, instead of
+ * the old raw `sendToAgent` + buffer-only-on-bridge-miss.
+ *
+ * THE BUG (#271 button path, verified 2026-07): the `agent:` callback handler
+ * delivered the synthesized tap inbound with a bare `ipcServer.sendToAgent`,
+ * marked busy, and buffered ONLY when the bridge was offline. It never ran the
+ * #1556 turn gate — so a tap landing WHILE a turn is in flight fired the MCP
+ * channel notification mid-turn, typed into the CLI composer, and stranded there
+ * (the lawgpt/marko wedge). It also skipped the pre-send composer clear and the
+ * deliver-until-acked tracking, so a stranded tap was never sweep-redelivered.
+ *
+ * Fix: reuse the resume-synthetic turn gate (mid-turn → `buffer-until-idle`, the
+ * turn-complete hook + idle-drain flush it the instant claude goes idle), the
+ * pre-send composer clear, and the delivery-confirm tracking — exactly like the
+ * `handleInbound` fresh-turn path. A button tap carries no `meta.source` and a
+ * non-empty body, so `shouldTrackDelivery` enrols it; we additionally require a
+ * real `meta.message_id` so the `enqueue` ack has something to match (else the
+ * never-drop sweep would storm). The tap UX is unchanged — the ack toast, the
+ * single-use keyboard strip, and the bridge-offline spool + restart notice all
+ * stay at the call site; only delivery timing/safety changes.
+ */
+async function deliverButtonTapInbound(
+  agent: string,
+  inbound: InboundMessage,
+): Promise<ButtonTapDeliveryOutcome> {
+  // #1556 turn gate — same authoritative "is a turn in flight?" read the
+  // resume-synthetic path uses. Mid-turn → hold in the pending-inbound buffer;
+  // the turn-complete hook + idle-drain timer flush it when claude goes idle,
+  // where it lands cleanly as a fresh turn instead of stranding in the composer.
+  const { decision, reserve } = reserveInboundDelivery({
+    turnInFlight: turnInFlightForGate(),
+    isSteering: false,
+    isInterrupt: false,
+  })
+  if (decision === 'buffer-until-idle') {
+    pendingInboundBuffer.push(agent, inbound)
+    return 'buffered-mid-turn'
+  }
+  // #2917 per-chat FIFO: reserve the chat's busy key SYNCHRONOUSLY — before the
+  // composer-clear await below — so a concurrent same-chat inbound reaching the
+  // live gate observes this in-flight delivery and buffers behind it. Released
+  // in lockstep below if the send misses (bridge offline).
+  let reservedBusyKey: string | null = null
+  if (reserve && SERIALIZE_INBOUND_DELIVERY_ENABLED) {
+    reservedBusyKey = markClaudeBusyForInbound(inbound)
+  }
+  // Pre-send composer clear (the marko wedge) — wipe stale typed-ahead / ghost
+  // text so the channel notification lands at a clean line and auto-submits.
+  // Soft-fail by contract: a clear failure must NEVER block delivery.
+  if (agent) {
+    try {
+      const { clearAgentComposer } = await import('../../src/agents/tmux.js')
+      const cleared = clearAgentComposer({ agentName: agent })
+      if ('error' in cleared) {
+        process.stderr.write(
+          `telegram gateway: button-tap pre-send composer-clear soft-failed agent=${agent}: ${cleared.error} — delivering anyway\n`,
+        )
+      }
+    } catch (err) {
+      process.stderr.write(
+        `telegram gateway: button-tap pre-send composer-clear threw agent=${agent}: ${(err as Error).message} — delivering anyway\n`,
+      )
+    }
+  }
+  const delivered = ipcServer.sendToAgent(agent, inbound)
+  if (delivered) {
+    const busyKey = reservedBusyKey ?? markClaudeBusyForInbound(inbound)
+    // Track until claude acks via `enqueue` so the deliver-until-acked sweep
+    // re-delivers a tap stranded in the composer. Only when we have a real
+    // message_id to match the ack against — otherwise the never-drop loop storms.
+    if (
+      DELIVERY_CONFIRM_ENABLED &&
+      inbound.meta?.message_id != null &&
+      inbound.meta.message_id !== '' &&
+      shouldTrackDelivery({
+        isSteering: false,
+        isInterrupt: false,
+        hasSource: inbound.meta?.source != null,
+        effectiveText: inbound.text,
+      })
+    ) {
+      trackDelivery(deliveryQueue, busyKey, inbound, Date.now(), String(inbound.messageId))
+    }
+    return 'delivered'
+  }
+  // Bridge offline: release the synchronous reservation in lockstep (else the
+  // orphaned busy key gates every later inbound into the buffer), then spool the
+  // tap so it replays on reconnect — same behaviour as before this fix.
+  if (reservedBusyKey != null) {
+    claudeBusyKeys.delete(reservedBusyKey)
+    claudeBusyKeySince.delete(reservedBusyKey)
+  }
+  pendingInboundBuffer.push(agent, inbound)
+  return 'buffered-bridge-offline'
+}
+
 const pendingRestarts = new Map<string, number>()  // agentName -> timestamp when restart was requested
 
 // ─── Proactive context compaction (session.max_context_tokens) ──────────
@@ -7580,6 +7684,19 @@ function trackRedeliveredInbound(merged: InboundMessage): void {
       hasSource: merged.meta?.source != null,
       effectiveText: merged.text,
     })
+  ) {
+    return
+  }
+  // Button-tap anti-storm guard — mirrors the immediate-delivery path in
+  // deliverButtonTapInbound. A tap synthesized without a source message
+  // (`cbMessageId == null` → `messageId: 0`, no meta.message_id) has no id
+  // the `enqueue` ack can ever match, so enrolling it would make the
+  // never-drop sweep re-deliver it until TTL. The immediate path skips
+  // tracking for such taps; a tap that buffered mid-turn and flushed through
+  // here must be skipped identically (asymmetry = a storm on one path only).
+  if (
+    merged.meta?.button_callback === 'true' &&
+    (merged.meta.message_id == null || merged.meta.message_id === '')
   ) {
     return
   }
@@ -24760,17 +24877,17 @@ bot.on('callback_query:data', async ctx => {
     process.stderr.write(
       `telegram gateway: button_callback chatId=${cbChatId} user=${ctx.from.id} data=${JSON.stringify(agentCb.raw)} btnText=${JSON.stringify(buttonText ?? null)}\n`,
     )
-    // Registered-keyed delivery + buffer-on-miss (same fix as the
-    // normal-inbound path above): broadcast()/clientCount() lost the
-    // tap whenever the bridge was mid-reconnect (clientCount() counts
-    // unregistered sockets, so the notice was suppressed AND nothing
-    // was actually queued). sendToAgent → pendingInboundBuffer (drained
-    // by onClientRegistered) makes the "queued" promise real.
+    // #271 turn-safety: route the tap through the SAME turn-safe delivery
+    // machinery as a normal inbound (deliverButtonTapInbound) instead of a raw
+    // sendToAgent. A tap landing mid-turn now buffers until idle (never strands
+    // in the composer, #1556), a delivered tap is composer-cleared first and
+    // tracked so the redelivery sweep rescues a strand, and a bridge-offline tap
+    // still spools + shows the restart notice below (unchanged UX). The old raw
+    // path (sendToAgent → pendingInboundBuffer, drained by onClientRegistered)
+    // fixed only the bridge-mid-reconnect drop; it never gated on turn state.
     const selfAgentBtn = process.env.SWITCHROOM_AGENT_NAME ?? ''
-    const btnDelivered = ipcServer.sendToAgent(selfAgentBtn, inboundMsg)
-    if (btnDelivered) markClaudeBusyForInbound(inboundMsg)
-    if (!btnDelivered) {
-      pendingInboundBuffer.push(selfAgentBtn, inboundMsg)
+    const btnOutcome = await deliverButtonTapInbound(selfAgentBtn, inboundMsg)
+    if (btnOutcome === 'buffered-bridge-offline') {
       // No registered bridge — the agent's mid-restart. Tell the user
       // so they don't think the button silently swallowed their tap;
       // the tap is genuinely buffered now and replays on reconnect.

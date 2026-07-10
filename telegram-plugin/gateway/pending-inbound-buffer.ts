@@ -150,9 +150,19 @@ export function redeliverBufferedInbound(
  *  approvals, subagent handbacks, warmup, reaction triggers) all tag a
  *  `meta.source`; the user-message inbound built in gateway.ts sets none.
  *  Restricting to source-less inbounds keeps merge-on-drain away from the
- *  #1150 wake-up class entirely. */
+ *  #1150 wake-up class entirely.
+ *
+ *  Button taps (#271, `meta.button_callback`) are ALSO excluded even though
+ *  they carry no `meta.source`: `mergeRun` keeps only the anchor (last)
+ *  message's meta, so a tap merged with an adjacent buffered user text would
+ *  silently drop its `button_callback_data`/`button_text` whenever the text
+ *  is last — the agent would see the `[user tapped button: …]` line without
+ *  the machine-readable payload. Taps deliver individually. */
 function isMergeableUserInbound(msg: InboundMessage): boolean {
-  return msg.type === 'inbound' && (msg.meta == null || msg.meta.source == null)
+  return (
+    msg.type === 'inbound' &&
+    (msg.meta == null || (msg.meta.source == null && msg.meta.button_callback == null))
+  )
 }
 
 function inboundHasMedia(msg: InboundMessage): boolean {
