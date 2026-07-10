@@ -176,6 +176,7 @@ import {
   isMessageTooLongError,
 } from '../retry-api-call.js'
 import { installTgPostLogger, withTgPostTags } from '../shared/bot-runtime.js'
+import { floodStatePath, makeFloodWaitRecorder } from '../flood-circuit-breaker.js'
 import { buildAttachmentPath, assertInsideInbox } from '../attachment-path.js'
 import { logStreamingEvent } from '../streaming-metrics.js'
 import * as signalTracker from '../turn-signal-tracker.js'
@@ -4888,8 +4889,16 @@ const typingWrapper = createTypingWrapper({
 // ─── Robust API call wrapper ──────────────────────────────────────────────
 // Extracted to telegram-plugin/retry-api-call.ts so it's unit-testable in
 // isolation; the gateway just composes the pure policy with its own logger.
+// #2923: the shared flood-wait marker. Every observed 429 retry_after window
+// is persisted here via onFloodWait, and both boot-card callsites consult the
+// SAME file to suppress a restart card while a per-bot flood ban is open (so a
+// restart doesn't post into the window and extend the ban). Falls back to a
+// no-op recorder when TELEGRAM_STATE_DIR is unset (dev/one-shot contexts).
+// STATE_DIR always resolves (env or a ~/.claude fallback), so this is live.
+const FLOOD_STATE_PATH = floodStatePath(STATE_DIR)
 const robustApiCall = createRetryApiCall({
   log: (line) => process.stderr.write(line),
+  onFloodWait: makeFloodWaitRecorder(FLOOD_STATE_PATH),
 })
 
 // Fire-and-forget wrapper for outbound surfaces that previously had
@@ -8862,6 +8871,7 @@ const ipcServer: IpcServer = createIpcServer({
             dockerMode: process.env.SWITCHROOM_RUNTIME === 'docker',
             configSnapshotPath: join(resolvedAgentDirForCard, '.config-snapshot.json'),
             bootCardStatePath: join(resolvedAgentDirForCard, '.boot-card-msgid.json'),
+            floodStatePath: FLOOD_STATE_PATH,
             ...(updateOutcomeLine ? { updateOutcomeLine } : {}),
           }, ackMsgId).then(handle => {
             activeBootCard = handle
@@ -27852,6 +27862,7 @@ void (async () => {
                       dockerMode: process.env.SWITCHROOM_RUNTIME === 'docker',
                       configSnapshotPath: join(resolvedAgentDirForBootCard, '.config-snapshot.json'),
                       bootCardStatePath: join(resolvedAgentDirForBootCard, '.boot-card-msgid.json'),
+                      floodStatePath: FLOOD_STATE_PATH,
                       ...(updateOutcomeLine ? { updateOutcomeLine } : {}),
                     }, ackMsgId)
                     activeBootCard = handle

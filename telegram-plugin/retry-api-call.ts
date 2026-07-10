@@ -89,7 +89,9 @@ export function isLocalResourceError(err: unknown): boolean {
   }
   const msg = err instanceof Error ? err.message : String(err ?? '')
   return (
-    /ENOSPC|EDQUOT|ENOMEM\b/.test(msg) ||
+    // Word-boundaried so a substring can't false-match; covers the same set
+    // as the errno code list above (ENOSPC/EDQUOT/EIO/ENOMEM).
+    /\b(ENOSPC|EDQUOT|EIO|ENOMEM)\b/.test(msg) ||
     /no space left on device/i.test(msg) ||
     /disk quota exceeded/i.test(msg)
   )

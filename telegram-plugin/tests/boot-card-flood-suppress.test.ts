@@ -11,7 +11,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { startBootCard } from '../gateway/boot-card.js'
 import type { BotApiForBootCard } from '../gateway/boot-card.js'
-import { computeFloodWait, writeFloodState, floodStatePath } from '../flood-circuit-breaker.js'
+import { computeFloodWait, writeFloodState, floodStatePath, makeFloodWaitRecorder } from '../flood-circuit-breaker.js'
+import { createRetryApiCall } from '../retry-api-call.js'
+import { errors } from './fake-bot-api.js'
 
 let dir: string
 
@@ -77,4 +79,33 @@ it('POSTS normally when no flood state file exists (back-compat)', async () => {
   const { bot, sends } = makeBot()
   await startBootCard('chat1', undefined, bot, mkOpts(p, 1_000_000), undefined, () => {})
   expect(sends).toEqual(['chat1'])
+})
+
+it('INTEGRATION: a 429 through the real retry path suppresses a later boot card', async () => {
+  // Wire the two halves exactly as gateway.ts does: the retry wrapper's
+  // onFloodWait recorder and the boot card BOTH point at the same file.
+  const p = floodStatePath(dir)
+  const now = 5_000_000
+  const retry = createRetryApiCall({
+    sleep: async () => {}, // don't actually wait out the flood
+    onFloodWait: makeFloodWaitRecorder(p, () => now),
+  })
+
+  // Drive a real GrammyError 429 through the wrapper (first call floods, then
+  // succeeds) — this is what records the window on disk.
+  let n = 0
+  await retry(async () => {
+    if (n++ === 0) throw errors.floodWait(4116) // ~68 min ban
+    return 'ok'
+  })
+
+  // Now a restart's boot card must be suppressed via the SAME file.
+  const { bot, sends } = makeBot()
+  const logs: string[] = []
+  const handle = await startBootCard('chat1', undefined, bot, mkOpts(p, now), undefined, (l) =>
+    logs.push(l),
+  )
+  expect(sends).toEqual([]) // not posted into the open ban window
+  expect(handle.messageId).toBe(-1)
+  expect(logs.join('')).toMatch(/SUPPRESSED/)
 })

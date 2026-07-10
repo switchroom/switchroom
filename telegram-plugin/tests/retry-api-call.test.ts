@@ -523,9 +523,12 @@ describe('#2923 — LOCAL resource exhaustion is NOT retried (avoids flood ban)'
     expect(isLocalResourceError(Object.assign(new Error('x'), { code: 'ENOMEM' }))).toBe(true)
   })
 
-  it('classifies by message when no code is present', () => {
+  it('classifies by message when no code is present (incl. EIO, word-boundaried)', () => {
     expect(isLocalResourceError(new Error('ENOSPC: no space left on device, write'))).toBe(true)
     expect(isLocalResourceError(new Error('disk quota exceeded'))).toBe(true)
+    expect(isLocalResourceError(new Error('EIO: i/o error, write'))).toBe(true)
+    // No false match on a substring (e.g. a word containing the letters).
+    expect(isLocalResourceError(new Error('DENOSPCX not a real code'))).toBe(false)
   })
 
   it('does NOT classify a remote GrammyError or ordinary error', () => {
