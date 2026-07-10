@@ -154,6 +154,21 @@ jobs:
           echo ".npmignore present: $([ -f .npmignore ] && echo yes || echo no)"
           echo ".gitignore dist/ line present: $(grep -c '^dist/' .gitignore 2>/dev/null || echo 0)"
 
+      - name: Debug — what does npm pack think it includes? (dry-run)
+        shell: bash
+        run: |
+          # Diagnostic: `npm pack --dry-run` lists what npm WOULD pack and
+          # why (ignored / excluded / included). Run BEFORE the real pack so
+          # a dist/ exclusion is visible in the log with its reason, instead
+          # of only the post-pack guard failing. This step is debug-only —
+          # it never publishes and is safe to leave on.
+          echo "=== ls dist/cli (on-disk check) ==="
+          ls -la dist/cli/ | head
+          echo "=== npm pack --dry-run (dist/ entries + total) ==="
+          npm pack --dry-run --ignore-scripts 2>&1 | grep -iE "dist/|tarball|total files|package size|excluded|ignored" | head -40
+          echo "=== npm pack --dry-run --json (dist inclusion, machine-readable) ==="
+          npm pack --dry-run --ignore-scripts --json 2>&1 | python3 -c "import sys,json; d=json.load(sys.stdin); ents=d[0].get('entryCount','?'); files=[f['path'] for f in d[0].get('files',[])]; print('entry count:',ents); print('dist entries:',sum(1 for f in files if f.startswith('dist/'))); print('first dist:',next((f for f in files if f.startswith('dist/cli/switchroom')),'NONE'))" 2>&1 || echo "(json parse skipped)"
+
       - name: Pack (npm pack, no publish yet)
         id: pack
         shell: bash
