@@ -21,7 +21,7 @@
 
 import { createDraftStream, type DraftStreamHandle } from './draft-stream.js'
 import { richMessage, isParseEntitiesError } from './rich-send.js'
-import { maybeRenderOutbound } from './render/rich-render.js'
+import { renderOutboundChunks } from './render/rich-render.js'
 
 /**
  * Minimal bot.api surface the controller needs. Real callers pass grammy's
@@ -223,81 +223,137 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
   // `format:'text'` stream (plain sendMessage, no rich wrapper).
   // sendRichMessage does NOT accept link_preview_options (rich messages
   // control previews via entity detection), so strip it for the rich path.
-  const doSend = (text: string, opts: StreamSendOpts) => {
-    if (literalText) return bot.api.sendMessage(chatId, text, opts)
-    // Flag-gated rich render (`SWITCHROOM_RICH_RENDER`, default OFF — returns
-    // the text untouched as markdown when off, so this is a no-op for every
-    // agent until an operator opts in). A `plain` result (oversized/unsafe
-    // content renderSafe declined to emit as rich) sends WITHOUT the wrapper.
-    const rendered = maybeRenderOutbound(text)
-    if (rendered.mode === 'plain') return bot.api.sendMessage(chatId, rendered.text, opts)
+  // Render the outbound body into 1+ wire-cap-respecting pieces. The common
+  // case is a SINGLE piece whose output is identical to the pre-existing
+  // `maybeRenderOutbound` path; a body whose markdown-escaping pushed the
+  // rendered form past the cap splits into several pieces, each of which fits
+  // its own wire cap and never bisects a fenced block / table row (see
+  // `renderOutboundChunks`). Flag OFF (default) and a literal `format:'text'`
+  // stream both yield a single passthrough piece — no behavioural change.
+  const renderPieces = (text: string): { text: string; rich: boolean }[] => {
+    if (literalText) return [{ text, rich: false }]
+    // A `plain`-mode piece (oversized/unsafe content renderSafe declined to
+    // emit as rich) sends WITHOUT the rich wrapper.
+    return renderOutboundChunks(text).map((r) => ({ text: r.text, rich: r.mode !== 'plain' }))
+  }
+  // Send ONE rendered piece. Rich pieces go through sendRichMessage (with
+  // link_preview_options stripped — rich messages control previews via entity
+  // detection); plain pieces (and literal streams) through sendMessage.
+  const sendPiece = (piece: { text: string; rich: boolean }, opts: StreamSendOpts) => {
+    if (!piece.rich) return bot.api.sendMessage(chatId, piece.text, opts)
     const richOpts = { ...opts }
     delete richOpts.link_preview_options
-    return bot.api.sendRichMessage(chatId, richMessage(rendered.text), richOpts)
+    return bot.api.sendRichMessage(chatId, richMessage(piece.text), richOpts)
   }
-  const doEdit = (id: number, text: string, opts: StreamSendOpts) => {
-    if (literalText) return bot.api.editMessageText(chatId, id, text, opts)
-    const rendered = maybeRenderOutbound(text)
-    if (rendered.mode === 'plain') return bot.api.editMessageText(chatId, id, rendered.text, opts)
-    return bot.api.editMessageText(chatId, id, richMessage(rendered.text), opts)
+  const editPiece = (id: number, piece: { text: string; rich: boolean }, opts: StreamSendOpts) => {
+    if (!piece.rich) return bot.api.editMessageText(chatId, id, piece.text, opts)
+    return bot.api.editMessageText(chatId, id, richMessage(piece.text), opts)
   }
 
   return createDraftStream(
     async (text) => {
-      try {
-        const sent = await retry(
-          () => doSend(text, sendOpts),
-          { threadId, chat_id: chatId },
-        )
-        onSend?.(sent.message_id, text.length)
-        return sent.message_id
-      } catch (err) {
-        if (!literalText && isParseEntitiesError(err)) {
-          // First send rejected because the markdown couldn't be parsed.
-          // There is no message_id to edit (the send 400'd before any
-          // message was created), so a single fresh send as PLAIN text
-          // (no rich wrapper, so the parser never runs) is the correct
-          // recovery — see issue #657. The raw markdown source is itself
-          // readable, so we send it verbatim.
-          warn?.(
-            `stream-controller: send parse-entities rejected — retrying once as plain text (${err instanceof Error ? err.message : String(err)})`,
-          )
+      // Render → 1+ cap-respecting pieces. The FIRST piece's message_id anchors
+      // the stream (later edits target it); any overflow pieces are sent after
+      // it. For the common single-piece case this is exactly one send.
+      const pieces = renderPieces(text)
+      let anchorId: number | undefined
+      for (let pi = 0; pi < pieces.length; pi++) {
+        const piece = pieces[pi]
+        try {
           const sent = await retry(
-            () => bot.api.sendMessage(chatId, text, sendOpts),
+            () => sendPiece(piece, sendOpts),
             { threadId, chat_id: chatId },
           )
-          onSend?.(sent.message_id, text.length)
-          return sent.message_id
+          if (anchorId == null) anchorId = sent.message_id
+        } catch (err) {
+          if (!literalText && piece.rich && isParseEntitiesError(err)) {
+            // Piece rejected because its markdown couldn't be parsed. There is
+            // no message_id to edit (the send 400'd before any message was
+            // created), so recover with a single fresh PLAIN send of the same
+            // body (no rich wrapper, so the parser never runs) — see issue #657.
+            warn?.(
+              `stream-controller: send parse-entities rejected — retrying once as plain text (${err instanceof Error ? err.message : String(err)})`,
+            )
+            // Resend the RAW source verbatim (readable, and the exact
+            // pre-existing #657 contract) rather than the escaped/rendered
+            // body. For a single-piece stream (the common case) this is the
+            // whole message; for a rare oversize split each piece falls back
+            // to its own body below.
+            const fallbackBody = pieces.length === 1 ? text : piece.text
+            const sent = await retry(
+              () => bot.api.sendMessage(chatId, fallbackBody, sendOpts),
+              { threadId, chat_id: chatId },
+            )
+            if (anchorId == null) anchorId = sent.message_id
+          } else {
+            throw err
+          }
         }
-        throw err
       }
+      onSend?.(anchorId as number, text.length)
+      return anchorId as number
     },
     async (id, text) => {
+      const pieces = renderPieces(text)
+      const head = pieces[0]
+      // Edit the anchor message in place with the FIRST piece.
       try {
         await retry(
-          () => doEdit(id, text, baseOpts),
+          () => editPiece(id, head, baseOpts),
           { threadId, chat_id: chatId },
         )
         onEdit?.(id, text.length)
       } catch (err) {
-        if (!literalText && isParseEntitiesError(err)) {
+        if (!literalText && head.rich && isParseEntitiesError(err)) {
           // Edit rejected because the markdown couldn't be parsed — DO NOT
           // send a fresh message. The whole point of issue #657 is that the
           // previous implementation sent a duplicate message every time a
           // parse rejection fired. Retry the edit on the SAME message_id as
-          // PLAIN text (no rich wrapper, so the parser never runs). The raw
-          // markdown source is itself readable, so we send it verbatim.
+          // PLAIN text (no rich wrapper, so the parser never runs).
           warn?.(
             `stream-controller: edit parse-entities rejected — retrying same id=${id} as plain text (${err instanceof Error ? err.message : String(err)})`,
           )
+          // Re-edit the SAME id with the RAW source verbatim (the exact #657
+          // contract). For a single-piece stream (common case) this is the
+          // whole body; a rare oversize split edits the head piece's body.
+          const fallbackBody = pieces.length === 1 ? text : head.text
           await retry(
-            () => bot.api.editMessageText(chatId, id, text, baseOpts),
+            () => bot.api.editMessageText(chatId, id, fallbackBody, baseOpts),
             { threadId, chat_id: chatId },
           )
           onEdit?.(id, text.length)
-          return
+        } else {
+          throw err
         }
-        throw err
+      }
+      // Oversize tail: the anchor message can hold only the first piece. A body
+      // this large is effectively the terminal stream state, so the remaining
+      // pieces are appended as fresh messages — each obeying its own wire cap —
+      // rather than dropped. This is the fix for the chunk-boundary bug: the old
+      // whole-document plain degradation shipped a ~32k body through the plain
+      // 4096-char `sendMessage` endpoint, which Telegram rejected outright.
+      for (let pi = 1; pi < pieces.length; pi++) {
+        const piece = pieces[pi]
+        try {
+          const sent = await retry(
+            () => sendPiece(piece, sendOpts),
+            { threadId, chat_id: chatId },
+          )
+          onSend?.(sent.message_id, piece.text.length)
+        } catch (err) {
+          if (!literalText && piece.rich && isParseEntitiesError(err)) {
+            warn?.(
+              `stream-controller: overflow-piece parse-entities rejected — sending as plain text (${err instanceof Error ? err.message : String(err)})`,
+            )
+            const sent = await retry(
+              () => bot.api.sendMessage(chatId, piece.text, sendOpts),
+              { threadId, chat_id: chatId },
+            )
+            onSend?.(sent.message_id, piece.text.length)
+          } else {
+            throw err
+          }
+        }
       }
     },
     {
