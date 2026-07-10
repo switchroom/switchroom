@@ -75,6 +75,15 @@ describe('gateway: scheduleModelRelaunch dep (durable .session-model)', () => {
     expect(win).toContain("!== 'restart_in_flight'")
   })
 
+  it('the non-in-flight rollback ALSO clears the keep-intent (a live intent with no restart coming would wrongly KEEP across a crash)', () => {
+    const idx = GATEWAY_SRC.indexOf('scheduleModelRelaunch: async')
+    const win = GATEWAY_SRC.slice(idx, idx + 2400)
+    const inFlightIdx = win.indexOf("!== 'restart_in_flight'")
+    const clearIdx = win.indexOf('clearRelaunchModelIntent(agentDir)')
+    expect(inFlightIdx).toBeGreaterThan(0)
+    expect(clearIdx).toBeGreaterThan(inFlightIdx)
+  })
+
   it('reuses the same scheduleRestart dispatch (not a bespoke restart path)', () => {
     const idx = GATEWAY_SRC.indexOf('scheduleModelRelaunch: async')
     const win = GATEWAY_SRC.slice(idx, idx + 1800)
@@ -86,11 +95,23 @@ describe('gateway: intent writers on the restart verbs', () => {
   it('model-switch scheduleRestart stamps keep-intent before the hostd dispatch', () => {
     const idx = GATEWAY_SRC.indexOf('scheduleRestart: async (reason: string)')
     expect(idx).toBeGreaterThan(0)
-    const win = GATEWAY_SRC.slice(idx, idx + 2600)
+    const win = GATEWAY_SRC.slice(idx, idx + 3200)
     const keepIdx = win.indexOf("writeRelaunchModelIntent(smDir, 'keep', reason)")
     const dispatchIdx = win.indexOf("op: 'agent_restart'")
     expect(keepIdx).toBeGreaterThan(0)
     expect(dispatchIdx).toBeGreaterThan(keepIdx)
+  })
+
+  it('scheduleRestart clears the keep-intent when hostd refuses (failed dispatch → no live intent on disk)', () => {
+    const idx = GATEWAY_SRC.indexOf('scheduleRestart: async (reason: string)')
+    const win = GATEWAY_SRC.slice(idx, idx + 3200)
+    const failIdx = win.indexOf('hostd restart failed')
+    const clearIdx = win.indexOf('clearRelaunchModelIntent(smDir)')
+    expect(clearIdx).toBeGreaterThan(0)
+    expect(failIdx).toBeGreaterThan(clearIdx) // cleared before the throw's message
+    // And it sits in the same error branch as clearRestartMarker.
+    const markerIdx = win.indexOf('clearRestartMarker()')
+    expect(clearIdx).toBeGreaterThan(markerIdx)
   })
 
   it('/restart stamps an explicit revert intent (reason honesty) before dispatch', () => {
@@ -153,13 +174,36 @@ describe('gateway: typed /model persists the REQUESTED canonical token', () => {
   it('persists expandSrAlias(parsed.model), and `/model default` clears file + in-memory override', () => {
     const idx = GATEWAY_SRC.indexOf("const requested = parsed.kind === 'set' ? expandSrAlias(parsed.model) : null")
     expect(idx).toBeGreaterThan(0)
-    const win = GATEWAY_SRC.slice(idx, idx + 1800)
+    const win = GATEWAY_SRC.slice(idx, idx + 2400)
     expect(win).toContain("requested?.toLowerCase() === 'default'")
     expect(win).toContain('sessionModelSource.setOverride(null)')
     expect(win).toContain('clearSessionModelFile(smDir)')
     // Non-default: the requested token (shape-gated, non-sr) is what persists.
     expect(win).toContain('isValidModelArg(requested) && !isSrModel(requested)')
     expect(win).toMatch(/writeSessionModelFile\(\s*smDir,\s*requested/)
+  })
+
+  it('`/model default` file-clear is NOT gated on a positive confirmation (silent-switch path must not resurrect)', () => {
+    const idx = GATEWAY_SRC.indexOf("const requested = parsed.kind === 'set' ? expandSrAlias(parsed.model) : null")
+    const win = GATEWAY_SRC.slice(idx, idx + 2400)
+    // The default branch clears the file unconditionally, and only the
+    // in-memory override change is confirmation-gated inside it.
+    const clearIdx = win.indexOf('if (smDir) clearSessionModelFile(smDir)')
+    const gatedOverrideIdx = win.indexOf('if (reply.selectedModel) sessionModelSource.setOverride(null)')
+    expect(clearIdx).toBeGreaterThan(0)
+    expect(gatedOverrideIdx).toBeGreaterThan(clearIdx)
+    // And the whole default branch is not nested in an `if (reply.selectedModel)` block:
+    const between = win.slice(0, clearIdx)
+    expect(between).not.toContain('if (reply.selectedModel) {')
+  })
+
+  it('a persist failure is surfaced ON THE REPLY, not just stderr (typed + menu paths)', () => {
+    expect(GATEWAY_SRC.match(/won’t survive a relaunch/g)?.length ?? 0).toBeGreaterThanOrEqual(2)
+    const typedIdx = GATEWAY_SRC.indexOf('persistWarning =')
+    expect(typedIdx).toBeGreaterThan(0)
+    expect(GATEWAY_SRC).toContain('reply.text + persistWarning')
+    // Menu path appends onto the outgoing card text.
+    expect(GATEWAY_SRC).toContain('outcome.reply.text +=')
   })
 })
 

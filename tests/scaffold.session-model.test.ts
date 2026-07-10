@@ -242,6 +242,20 @@ describe("scaffoldAgent: session-model stickiness boot resolver (start.sh)", () 
     expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
   });
 
+  it("keep + MULTILINE .session-model (two model fields on two lines) → rejected, boots default", () => {
+    // The sed extraction emits one match per matching LINE and `grep -Eq`
+    // passes if ANY line matches — without the newline check a multiline
+    // value (each line individually shape-valid) would reach `claude
+    // --model`. Parity with parseSessionModel's single-string strictness.
+    writeFileSync(
+      join(agentDir, ".session-model"),
+      `${sessionModelJson("sr-glm-5")}${sessionModelJson("sr-evil-2")}`,
+    );
+    writeFileSync(join(agentDir, ".relaunch-model-intent"), intentJson("keep"));
+    expect(runBlock("1")).toBe(DEFAULT_MODEL);
+    expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
+  });
+
   it("keep + configuredDefaultAtWrite mismatch (yaml model changed) → INVALIDATES + announces", () => {
     writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8", "claude-old-model"));
     writeFileSync(join(agentDir, ".relaunch-model-intent"), intentJson("keep"));

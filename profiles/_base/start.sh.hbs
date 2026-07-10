@@ -1146,7 +1146,11 @@ if [ -f "{{agentDir}}/.session-model" ]; then
   # telegram-plugin/gateway/model-command.ts. `/` is allowed for
   # OpenRouter-style `sr-vendor/model` ids; it is not a shell metachar inside
   # the double-quoted `claude --model "$_EFFECTIVE_MODEL"` usage below.
-  elif ! printf '%s' "$_sm_model" | grep -Eq '^[A-Za-z0-9][]A-Za-z0-9._[/-]{0,99}$'; then
+  # The wc -c/-l check rejects EMPTY and MULTILINE values first: the sed
+  # extraction above emits one match per matching LINE, and `grep -Eq`
+  # passes if ANY line matches — a multiline value must never reach
+  # `claude --model` (parity with parseSessionModel's single-string check).
+  elif [ "$(printf '%s' "$_sm_model" | wc -c)" -eq 0 ] || [ "$(printf '%s' "$_sm_model" | wc -l)" -ne 0 ] || ! printf '%s' "$_sm_model" | grep -Eq '^[A-Za-z0-9][]A-Za-z0-9._[/-]{0,99}$'; then
     rm -f "{{agentDir}}/.session-model"
     echo "session-model: ignoring malformed .session-model (failed shape gate) — using configured default '$_EFFECTIVE_MODEL'" >&2
   elif [ "$_sm_cfg" != "$_EFFECTIVE_MODEL" ]; then

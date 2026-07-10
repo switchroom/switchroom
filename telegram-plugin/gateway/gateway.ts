@@ -388,6 +388,7 @@ import {
   clearSessionModelFile,
   readConfiguredDefaultModel,
   writeRelaunchModelIntent,
+  clearRelaunchModelIntent,
   intentForRestartReason,
 } from './session-model-file.js'
 import { discoverModels, selectModel } from '../../src/agents/model-picker.js'
@@ -19580,9 +19581,15 @@ function buildModelDeps(restartCtx?: ModelDepsRestartContext): ModelMenuDeps & M
         )
         return
       }
-      // hostd is configured but returned an error/denied result.
+      // hostd is configured but returned an error/denied result. No restart
+      // is coming, so the keep-intent stamped above must not linger — a
+      // crash within its 10-min freshness window would wrongly KEEP.
       if (hostdResp.result !== 'started' && hostdResp.result !== 'completed') {
         clearRestartMarker()
+        {
+          const smDir = resolveAgentDirFromEnv()
+          if (smDir) clearRelaunchModelIntent(smDir)
+        }
         throw new Error(
           `hostd restart failed (result=${hostdResp.result}): ${hostdResp.error ?? '(no details)'}`,
         )
@@ -19618,10 +19625,14 @@ function buildModelDeps(restartCtx?: ModelDepsRestartContext): ModelMenuDeps & M
         // the file + override and let the caller tell the operator "~15s".
         // Any OTHER dispatch failure means no restart is coming, so roll BOTH
         // back — a lingering file/override would lie to /status and
-        // mis-launch the NEXT relaunch.
+        // mis-launch the NEXT relaunch. The keep-intent goes with them
+        // (belt-and-braces: scheduleRestart's failure branch clears it too):
+        // a fresh keep on disk with no restart coming would wrongly KEEP
+        // across a crash inside its 10-min window.
         if ((err as { code?: string })?.code !== 'restart_in_flight') {
           restoreSessionModelFileRaw(agentDir, prevFileRaw)
           sessionModelSource.setOverride(prevOverride)
+          clearRelaunchModelIntent(agentDir)
         }
         throw err
       }
@@ -19659,40 +19670,44 @@ bot.command('model', async ctx => {
   // set on the confirmed inject path; the sr-*/relaunch paths already set the
   // override inside scheduleModelRelaunch, and an unverified switch carries no
   // selectedModel so /status is never lied to.
-  if (reply.selectedModel) {
-    const requested = parsed.kind === 'set' ? expandSrAlias(parsed.model) : null
-    if (requested?.toLowerCase() === 'default') {
-      // `/model default` clears the sticky override (the native inject above
-      // already realigned claude's own saved default, keeping the live
-      // process truthful). Clear both the durable file and the in-memory
-      // override — the session is back on the configured default.
-      sessionModelSource.setOverride(null)
-      const smDir = resolveAgentDirFromEnv()
-      if (smDir) clearSessionModelFile(smDir)
-    } else {
-      sessionModelSource.setOverride(reply.selectedModel)
-      // Durable stickiness: persist the REQUESTED canonical token — never
-      // the confirmation's display label ("Opus 4.8"), which `claude
-      // --model` would reject on the next boot. sr-* switches never reach
-      // here (they go through scheduleModelRelaunch, which persists).
-      const smDir = resolveAgentDirFromEnv()
-      if (smDir && requested && isValidModelArg(requested) && !isSrModel(requested)) {
-        try {
-          writeSessionModelFile(
-            smDir,
-            requested,
-            readConfiguredDefaultModel(smDir) ??
-              resolveMainModel(deps.getConfiguredModel() ?? undefined),
-          )
-        } catch (err) {
-          process.stderr.write(
-            `telegram gateway: session-model persist failed (typed /model): ${(err as Error)?.message ?? String(err)}\n`,
-          )
-        }
+  const requested = parsed.kind === 'set' ? expandSrAlias(parsed.model) : null
+  let persistWarning = ''
+  if (requested?.toLowerCase() === 'default') {
+    // `/model default` clears the sticky file even WITHOUT a positive
+    // confirmation: claude's arg-form switch can be silent, and a surviving
+    // sticky file would resurrect the old model on the next keep-relaunch.
+    // Clearing is idempotent; the in-memory override change stays gated on a
+    // confirmed switch so an unverified inject never lies to /status.
+    const smDir = resolveAgentDirFromEnv()
+    if (smDir) clearSessionModelFile(smDir)
+    if (reply.selectedModel) sessionModelSource.setOverride(null)
+  } else if (reply.selectedModel) {
+    sessionModelSource.setOverride(reply.selectedModel)
+    // Durable stickiness: persist the REQUESTED canonical token — never
+    // the confirmation's display label ("Opus 4.8"), which `claude
+    // --model` would reject on the next boot. sr-* switches never reach
+    // here (they go through scheduleModelRelaunch, which persists).
+    const smDir = resolveAgentDirFromEnv()
+    if (smDir && requested && isValidModelArg(requested) && !isSrModel(requested)) {
+      try {
+        writeSessionModelFile(
+          smDir,
+          requested,
+          readConfiguredDefaultModel(smDir) ??
+            resolveMainModel(deps.getConfiguredModel() ?? undefined),
+        )
+      } catch (err) {
+        // The reply body already promises stickiness — never let the promise
+        // and the disk disagree silently.
+        persistWarning =
+          '\n⚠️ Couldn’t persist the sticky override — the switch is live now but won’t survive a relaunch.'
+        process.stderr.write(
+          `telegram gateway: session-model persist failed (typed /model): ${(err as Error)?.message ?? String(err)}\n`,
+        )
       }
     }
   }
-  await switchroomReply(ctx, reply.text, { html: reply.html })
+  await switchroomReply(ctx, reply.text + persistWarning, { html: reply.html })
 })
 
 // `/effort` — show or switch the reasoning effort for the live session.
@@ -24861,6 +24876,10 @@ bot.on('callback_query:data', async ctx => {
                 resolveMainModel(modelDeps.getConfiguredModel() ?? undefined),
             )
           } catch (err) {
+            // The banner already promises stickiness — surface the failure on
+            // the same card instead of only stderr.
+            outcome.reply.text +=
+              '\n⚠️ Couldn’t persist the sticky override — the switch is live now but won’t survive a relaunch.'
             process.stderr.write(
               `telegram gateway: session-model persist failed (menu): ${(err as Error)?.message ?? String(err)}\n`,
             )
