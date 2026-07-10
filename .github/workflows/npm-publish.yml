@@ -153,19 +153,24 @@ jobs:
           # dist/ would otherwise publish a package that installs but
           # can't run.
           #
-          # IMPORTANT: npm tarballs nest every entry under a `package/`
-          # prefix (that's npm's convention — `tar tf` prints
-          # `package/dist/cli/switchroom.js`, not `dist/cli/switchroom.js`).
-          # The first attempt at this guard matched `^dist/cli/switchroom\.js$`
-          # (no `package/` prefix) and so NEVER matched — falsely blocking
-          # every publish with "dist NOT in the tarball" even though the
-          # dry-run + tarball size proved it was. Match the real path.
-          tar tf "${{ steps.pack.outputs.tarball }}" | grep -q '^package/dist/cli/switchroom\.js$' || {
+          # Two gotchas that bit earlier attempts:
+          #  1. npm tarballs nest every entry under a `package/` prefix, so
+          #     `tar tf` prints `package/dist/cli/switchroom.js` — match
+          #     THAT, not `dist/cli/switchroom.js`.
+          #  2. The shell runs with `set -o pipefail`. `tar tf | grep -q`
+          #     fails under pipefail: grep exits 0 on first match and closes
+          #     the pipe, tar takes SIGPIPE (exit 141), and pipefail makes
+          #     the pipeline return 141 — so the guard fired even when the
+          #     file WAS present. Dump the listing to a temp file first, then
+          #     grep it (no pipe, no pipefail trap).
+          tar tf "${{ steps.pack.outputs.tarball }}" > /tmp/tarball-list.txt
+          if grep -q '^package/dist/cli/switchroom\.js$' /tmp/tarball-list.txt; then
+            echo "dist/cli/switchroom.js confirmed in the tarball"
+          else
             echo "::error::dist/cli/switchroom.js is NOT in the tarball — files/ glob or build is wrong; refusing to publish"
-            tar tf "${{ steps.pack.outputs.tarball }}" | grep -E 'dist/' | head -20
+            grep -E 'package/dist/' /tmp/tarball-list.txt | head -20
             exit 1
-          }
-          echo "dist/cli/switchroom.js confirmed in the tarball"
+          fi
 
       - name: Set up npm auth (NPM_TOKEN)
         shell: bash
