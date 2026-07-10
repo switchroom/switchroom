@@ -26,9 +26,14 @@ import { resolveOperatorUid } from "./operator-uid.js";
 import { resolveAgentConfig } from "../config/merge.js";
 
 /** Minimal structural view of a broker structured-get result (see
- *  src/vault/broker/client.ts `getViaBrokerStructured`). We only branch on
- *  `kind` here, so a `{ kind }`-only shape keeps this decoupled + testable. */
-type BrokerGetResult = { kind: string };
+ *  src/vault/broker/client.ts `getViaBrokerStructured`). We branch on `kind`
+ *  plus — for kind "denied" — the underlying broker error `code`: the client
+ *  rolls LOCKED, DENIED, BAD_REQUEST and INTERNAL all up into "denied", and
+ *  only the code distinguishes a transient broker condition (vault LOCKED
+ *  during the routine apply/relock window; INTERNAL error) from a genuine
+ *  grant/ACL DENIED. Treating them alike would silently strip a routed agent
+ *  on every relock — the exact bug class this resolver exists to prevent. */
+type BrokerGetResult = { kind: string; code?: string };
 type BrokerGetFn = (key: string) => Promise<BrokerGetResult>;
 
 /**
@@ -71,16 +76,20 @@ export function agentHadLiteLLMRouting(
  * that ALL model traffic stays proxy-routed for cost/token tracking; a broker
  * blip must never silently downgrade a routed agent to untracked direct OAuth):
  *
- *   - key genuinely NOT FOUND (broker answered `not_found`/`denied`) → the
- *     agent legitimately has no key → leave it unconfirmed → routing stripped.
- *   - broker UNREACHABLE / timed out (or the client import failed) → we do NOT
- *     know the key status. Silently stripping here is the bug: writeComposeFile
- *     runs on `agent restart` too, so a container recreated during a broker
- *     blip would boot on untracked direct OAuth. Instead we PRESERVE the
- *     agent's prior verdict baked into the on-disk compose (`previousCompose`)
- *     and emit a loud warning naming the affected agents. If there is no prior
- *     compose (first-ever apply) the agent stays unconfirmed — it was never
- *     routed, so that is the safe default.
+ *   - broker ANSWERED with a definitive "no key for you": `not_found`
+ *     (UNKNOWN_KEY — the key isn't there) or a genuine grant/ACL `DENIED` →
+ *     the agent legitimately has no usable key → leave it unconfirmed →
+ *     routing stripped.
+ *   - broker CANNOT answer right now: UNREACHABLE / timed out, client import
+ *     failed, vault LOCKED (routine during the apply/relock window), or an
+ *     INTERNAL broker error → we do NOT know the key status. Silently
+ *     stripping here is the bug: writeComposeFile runs on `agent restart` too,
+ *     so a container recreated during a broker blip would boot on untracked
+ *     direct OAuth. Instead we PRESERVE the agent's prior verdict baked into
+ *     the on-disk compose (`previousCompose`) and emit a loud warning naming
+ *     the affected agents. If there is no prior compose (first-ever apply) the
+ *     agent stays unconfirmed — it was never routed, so that is the safe
+ *     default.
  *
  * Best-effort — never throws. `deps.getKey` is injectable for tests; production
  * callers pass none and it dynamic-imports the real broker client.
@@ -128,9 +137,17 @@ export async function resolveLiteLLMConfirmedAgents(
         confirmed.add(name);
       } else if (r.kind === "unreachable") {
         unreachableAgents.push(name);
+      } else if (r.kind === "denied" && r.code !== "DENIED") {
+        // The client collapses LOCKED / DENIED / BAD_REQUEST / INTERNAL into
+        // kind "denied". Only a genuine grant/ACL DENIED is a definitive "no
+        // key for you". LOCKED (the vault relocks routinely during apply) and
+        // INTERNAL are transient broker states — and BAD_REQUEST / an absent
+        // code means WE (or a protocol skew) are at fault, not the key. All of
+        // those mean "status unknown" ⇒ preserve, never silently strip.
+        unreachableAgents.push(name);
       }
-      // not_found / denied ⇒ broker answered "no key" ⇒ legitimate strip
-      // (leave out of the confirmed set).
+      // not_found (UNKNOWN_KEY) / denied with code DENIED ⇒ broker answered
+      // definitively "no usable key" ⇒ legitimate strip (leave unconfirmed).
     } catch {
       // An unexpected throw from the client is broker-layer trouble, not a
       // "no key" answer — treat it as unreachable (preserve, don't strip).
@@ -150,9 +167,15 @@ export async function resolveLiteLLMConfirmedAgents(
       }
     }
     // LOUD warning — naming every affected agent — so a broker blip during an
-    // apply/restart is visible in the operator's console, not silent.
+    // apply/restart is visible in the operator's console, not silent. This
+    // INTENTIONALLY repeats on every writeComposeFile invocation while the
+    // broker stays unavailable (apply and each agent restart): each run is a
+    // separate operator-visible operation whose routing verdict was degraded,
+    // and deduping across process invocations would need on-disk state for no
+    // real gain.
     console.warn(
-      `switchroom: vault-broker unreachable while resolving LiteLLM key status for ` +
+      `switchroom: vault-broker unreachable or unable to answer (locked/internal) ` +
+      `while resolving LiteLLM key status for ` +
       `${unreachableAgents.length} opted-in agent(s): ${unreachableAgents.join(", ")}. ` +
       `Refusing to silently strip proxy routing (that would boot them on untracked ` +
       `direct OAuth). Re-run \`switchroom apply\` once the broker is back to reconcile.`,

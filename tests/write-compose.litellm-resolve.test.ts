@@ -117,6 +117,49 @@ describe("resolveLiteLLMConfirmedAgents — broker outage vs key-not-found", () 
     expect(warnSpy).not.toHaveBeenCalled();
   });
 
+  it("STRIPS an agent on a genuine grant/ACL DENIED (broker answered definitively)", async () => {
+    const config = makeConfig(["alpha"]);
+    const prior = composeWith(["alpha"], ["alpha"]);
+    const confirmed = await resolveLiteLLMConfirmedAgents(config, prior, {
+      getKey: async () => ({ kind: "denied", code: "DENIED" }),
+    });
+    // A real ACL denial means "no usable key" — the strip is legitimate and
+    // the prior verdict must NOT rescue it.
+    expect(confirmed.has("alpha")).toBe(false);
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it("PRESERVES routing on LOCKED — the client rolls it into kind 'denied' (the relock window)", async () => {
+    // The broker returns LOCKED whenever the vault is locked, which happens
+    // routinely during the apply/relock window — and the client collapses it
+    // into kind "denied". Treating that as a definitive no-key answer would be
+    // a silent strip of a routed agent on every relock. The code must be
+    // classified: LOCKED ⇒ status unknown ⇒ preserve + warn.
+    const config = makeConfig(["alpha"]);
+    const prior = composeWith(["alpha"], ["alpha"]);
+    const confirmed = await resolveLiteLLMConfirmedAgents(config, prior, {
+      getKey: async () => ({ kind: "denied", code: "LOCKED" }),
+    });
+    expect(confirmed.has("alpha")).toBe(true);
+    expect(warnSpy).toHaveBeenCalled();
+    const warned = warnSpy.mock.calls.flat().join("\n");
+    expect(warned).toContain("alpha");
+    expect(warned).toContain("PRESERVED");
+  });
+
+  it("PRESERVES routing on INTERNAL — transient broker error, not a no-key answer", async () => {
+    const config = makeConfig(["alpha"]);
+    const prior = composeWith(["alpha"], ["alpha"]);
+    const confirmed = await resolveLiteLLMConfirmedAgents(config, prior, {
+      getKey: async () => ({ kind: "denied", code: "INTERNAL" }),
+    });
+    expect(confirmed.has("alpha")).toBe(true);
+    expect(warnSpy).toHaveBeenCalled();
+    const warned = warnSpy.mock.calls.flat().join("\n");
+    expect(warned).toContain("alpha");
+    expect(warned).toContain("PRESERVED");
+  });
+
   it("PRESERVES routing for an unreachable agent that was routed on disk", async () => {
     const config = makeConfig(["alpha"]);
     const prior = composeWith(["alpha"], ["alpha"]);

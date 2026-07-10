@@ -107,9 +107,10 @@ cd "{{agentDir}}" || exit 1
 #     the proxy AND export the auth header so the session authenticates the
 #     moment the proxy recovers (the socat forwarder reconnects per-connection),
 #     LOUD log. Never a silent untracked direct-OAuth fallback.
-# Retry budget is DELIBERATELY short (3 attempts / ~15s) vs start.sh's 120s: a
-# cron fire is latency-sensitive and short-lived, and unreachable now KEEPS
-# routing anyway, so a long boot-probe would only add dead latency for no gain.
+# Retry budget is DELIBERATELY short — 3 attempts, worst-case ~25s (3×5s curl
+# timeouts + 2×5s sleeps) — vs start.sh's 120s: a cron fire is
+# latency-sensitive and short-lived, and unreachable now KEEPS routing anyway,
+# so a long boot-probe would only add dead latency for no gain.
 if [ -n "${SWITCHROOM_LITELLM:-}" ] && command -v switchroom >/dev/null 2>&1; then
   sr_ll_key="$(switchroom vault get "litellm/{{name}}/api-key" 2>/dev/null || true)"
   sr_ll_ok=""
@@ -117,7 +118,8 @@ if [ -n "${SWITCHROOM_LITELLM:-}" ] && command -v switchroom >/dev/null 2>&1; th
   if [ -z "$sr_ll_key" ]; then
     echo "litellm(cron): no virtual key for '{{name}}' — falling back to direct OAuth (untracked, unguarded)" >&2
   elif command -v curl >/dev/null 2>&1 && [ -n "$ANTHROPIC_BASE_URL" ]; then
-    # Bounded retry probe — short budget for cron latency (3 attempts, ~15s).
+    # Bounded retry probe — short budget for cron latency (3 attempts,
+    # worst-case ~25s: 3×5s curl timeouts + 2×5s sleeps).
     sr_ll_url="${SWITCHROOM_LITELLM_BASE:-${ANTHROPIC_BASE_URL%/anthropic}}/health/liveliness"
     sr_ll_try=0
     sr_ll_up=""

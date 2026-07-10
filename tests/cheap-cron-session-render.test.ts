@@ -197,7 +197,7 @@ describe("cron-session.sh LiteLLM routing — mirrors start.sh boot block", () =
   });
 
   it("dispatch (executed): UNREACHABLE keeps routing + HEADER, MISSING KEY strips it", () => {
-    // Slice JUST the decision dispatch (skips the 15s probe loop): from the
+    // Slice JUST the decision dispatch (skips the ~25s probe loop): from the
     // shared decision `if` through the scratch-var cleanup, driven by preset
     // flags — the real strip-vs-keep code paths without any sleeping.
     const dispStart = out.indexOf(
