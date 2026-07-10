@@ -273,6 +273,44 @@ describe('interrupted sub-agent block', () => {
     expect(msg.text).toContain('Re-dispatch the ones still needed before declaring the task done')
     expect(msg.text).not.toContain('If the user asks you to retry')
   })
+
+  for (const reason of ['loop-guard', 'clean-restart-suppressed'] as const) {
+    it(`the deferred report (${reason}) carries the block in DEFERRED form — suppressed resumes still name worker deaths`, () => {
+      const msg = buildResumeDeferredReportInbound({
+        turn: makeTurn(),
+        reason,
+        subagents: twoRunning,
+      })
+      expect(msg.text).toContain('did NOT complete')
+      expect(msg.text).toContain('refactor the auth module and add tests')
+      expect(msg.text).toContain('survey the pricing pages of 5 competitors')
+      // Deferred wording only — never the resume-path imperative, which would
+      // contradict this inbound's "Do NOT silently resume … ask" contract.
+      expect(msg.text).toContain("If the user asks you to retry, they'll need re-dispatching")
+      expect(msg.text).not.toContain('Re-dispatch the ones still needed')
+      expect(msg.text).not.toContain('before declaring the task done')
+      // Appending the block must not disturb the loop-guard anchor at pos 0.
+      expect(msg.text.startsWith(RESUME_SYNTHETIC_PROMPT_PREFIX)).toBe(true)
+    })
+  }
+
+  it('deferred report without subagents is unchanged (no block)', () => {
+    const withNone = buildResumeDeferredReportInbound({ turn: makeTurn(), reason: 'loop-guard', subagents: [] })
+    const bare = buildResumeDeferredReportInbound({ turn: makeTurn(), reason: 'loop-guard' })
+    expect(withNone.text).toBe(bare.text)
+    expect(withNone.text).not.toContain('did NOT complete')
+  })
+
+  it('appending the block preserves the RESUME_SYNTHETIC_PROMPT_PREFIX anchor on resume + watchdog inbounds too', () => {
+    const resume = buildResumeInterruptedInbound({ turn: makeTurn(), subagents: twoRunning })
+    expect(resume.text.startsWith(RESUME_SYNTHETIC_PROMPT_PREFIX)).toBe(true)
+    const report = buildResumeWatchdogReportInbound({
+      turn: makeTurn({ ended_via: 'timeout' }),
+      idleMs: 300_000,
+      subagents: twoRunning,
+    })
+    expect(report.text.startsWith(RESUME_SYNTHETIC_PROMPT_PREFIX)).toBe(true)
+  })
 })
 
 describe('buildResumeWatchdogReportInbound', () => {

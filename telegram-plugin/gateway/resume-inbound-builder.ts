@@ -424,7 +424,11 @@ export function buildResumeDeferredReportInbound(
       `flight (call get_recent_messages for this chat if you need the full ` +
       `original request — the quoted preview is only the first ~200 ` +
       `characters), then ask whether they want you to pick it back up or drop ` +
-      `it. If you genuinely can't tell what the work was, say so and ask.`,
+      `it. If you genuinely can't tell what the work was, say so and ask.` +
+      // Deferred (non-assertive) form, same as the watchdog path: this is an
+      // ask-first inbound — killed workers are named as facts, but
+      // re-dispatch waits on the user's call.
+      renderInterruptedSubagentsBlock(ctx.subagents, { assertive: false }),
     meta,
   }
 }
