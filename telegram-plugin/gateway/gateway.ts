@@ -5703,7 +5703,13 @@ interface DeferredSecret {
    */
   kernel_request_id?: string
 }
-const deferredSecrets = new Map<string, DeferredSecret>()
+// Storage extracted to pending-state-stores.ts (#2996 Phase 3 step 2). The
+// isExpired predicate reads DEFERRED_SECRET_TTL_MS lazily at sweep time (it is
+// declared below this const but only referenced when the reaper sweeps, so the
+// TDZ never bites). Direction preserved: now - staged_at > TTL.
+const deferredSecrets = createSweepableStore<DeferredSecret>(
+  (v, now) => now - v.staged_at > DEFERRED_SECRET_TTL_MS,
+)
 
 /**
  * Agent-initiated save staging (issue #969 P1a). When an agent calls the
@@ -6488,9 +6494,7 @@ const pendingStateReaper = setInterval(() => {
   if (countScopedGrants(scopedGrants) !== scopedGrantsBefore) {
     scopedGrantStore.save(scopedGrants)
   }
-  for (const [k, v] of deferredSecrets) {
-    if (now - v.staged_at > DEFERRED_SECRET_TTL_MS) deferredSecrets.delete(k)
-  }
+  deferredSecrets.sweep(now)
   // Agent-initiated approval cards (vault_request_access / vault_request_save /
   // request_secret / mental_model_propose): expire past-TTL entries and WAKE
   // the parked agent (timeout synthetic + missed-approvals re-offer). This is
