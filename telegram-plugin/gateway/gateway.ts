@@ -5480,8 +5480,14 @@ interface PendingAskUser {
 }
 const pendingAskUser = new Map<string, PendingAskUser>()
 
-// Reauth flows
-const pendingReauthFlows = new Map<string, { agent: string; startedAt: number }>()
+// Reauth flows. Storage extracted to pending-state-stores.ts (#2996 Phase 3
+// step 2): the store owns the Map + co-locates the delete-past-TTL sweep the
+// reaper drove inline. Direction preserved: now - startedAt > TTL. The sweep
+// call stays in the SAME reaper position (first, ahead of the OAuth-code
+// cluster) so the awaitingAuthCodeAt contiguity pin is unaffected.
+const pendingReauthFlows = createSweepableStore<{ agent: string; startedAt: number }>(
+  (v, now) => now - v.startedAt > REAUTH_INTERCEPT_TTL_MS,
+)
 const REAUTH_INTERCEPT_TTL_MS = 10 * 60_000
 
 // #710: per-message agent-button metadata (ack_text / single_use). Keyed by
@@ -6372,9 +6378,7 @@ function restorePendingApprovalCards(): number {
 const pendingStateReaper = setInterval(() => {
   const now = Date.now()
   // OAuth-code state grouped first (pinned by secret-detect-oauth-code.test.ts).
-  for (const [k, v] of pendingReauthFlows) {
-    if (now - v.startedAt > REAUTH_INTERCEPT_TTL_MS) pendingReauthFlows.delete(k)
-  }
+  pendingReauthFlows.sweep(now)
   for (const [k, v] of pendingAuthAddFlows) {
     if (now - v.startedAt > REAUTH_INTERCEPT_TTL_MS) {
       cancelAccountAuthSession(v)
