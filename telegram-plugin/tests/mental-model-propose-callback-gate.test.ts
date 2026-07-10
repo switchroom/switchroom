@@ -41,16 +41,19 @@ describe('handleMentalModelProposeCallback — authorization gate', () => {
 })
 
 describe('handleMentalModelProposeCallback — TTL enforced at tap time', () => {
-  it('checks staged_at against MENTAL_MODEL_PROPOSE_TTL_MS at tap and edits the card away', () => {
+  it('checks staged_at against MENTAL_MODEL_PROPOSE_TTL_MS at tap and routes through the shared expiry path', () => {
     const block = proposeCallbackBlock()
     expect(block).toMatch(/Date\.now\(\) - pending\.staged_at > MENTAL_MODEL_PROPOSE_TTL_MS/)
-    // The expired branch deletes the pending entry and clears the keyboard so a
-    // stale card can't be tapped into an approval.
+    // The expired branch routes through expireMentalModelProposeCard, which
+    // deletes the pending entry, clears the durable store, edits the card away
+    // (keyboard stripped), AND wakes the parked agent with a timeout synthetic —
+    // so a stale card can't be tapped into an approval and the agent isn't left
+    // parked. (The helper's delete/clear/wake behavior is pinned in
+    // pending-card-durability-wiring.test.ts.)
     const ttlBranch =
       block.split('Date.now() - pending.staged_at > MENTAL_MODEL_PROPOSE_TTL_MS')[1]?.split('Single-shot')[0] ?? ''
-    expect(ttlBranch).toMatch(/pendingMentalModelProposes\.delete\(stageId\)/)
+    expect(ttlBranch).toMatch(/expireMentalModelProposeCard\(stageId, pending, Date\.now\(\)\)/)
     expect(ttlBranch).toMatch(/expired/)
-    expect(ttlBranch).toMatch(/inline_keyboard: \[\]/)
   })
 })
 

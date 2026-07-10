@@ -126,6 +126,13 @@ import {
 } from './permission-timeout.js'
 import { renderVaultRequestAccessCard } from './vault-request-access-card.js'
 import { createPermissionCardStore, type PersistedPermCard } from './permission-card-store.js'
+import { createPendingCardStore, type PersistedApprovalCard } from './pending-card-store.js'
+import {
+  buildVaultAccessTimeoutInbound,
+  buildVaultSaveTimeoutInbound,
+  buildSecretRequestTimeoutInbound,
+  buildMentalModelProposeTimeoutInbound,
+} from './approval-timeout-inbound-builders.js'
 import {
   isPermissionRearmEnabled,
   permissionRearmGraceMs,
@@ -724,6 +731,14 @@ process.on('beforeExit', () => {
 // ─── Env + state dir ──────────────────────────────────────────────────────
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const permCardStore = createPermissionCardStore(STATE_DIR)
+// Durable store for the four AGENT-INITIATED approval-card families
+// (vault_request_access / vault_request_save / request_secret /
+// mental_model_propose). Persists card METADATA only — never any secret value
+// (see pending-card-store.ts secrets-hygiene note). Restored at boot so a
+// post-restart tap on a still-valid card works like a pre-restart tap, and
+// swept in the pendingStateReaper so an unanswered card wakes the parked agent
+// on TTL instead of leaving it parked forever.
+const pendingCardStore = createPendingCardStore(STATE_DIR)
 // #2862 — missed-approvals re-offer. Persisted list of approvals that
 // TTL-expired while the operator was away; a digest card is posted on the
 // operator's next activity. Kill switch: SWITCHROOM_MISSED_APPROVAL_REOFFER=0.
@@ -5367,16 +5382,22 @@ interface PendingVaultRequestSave {
   why?: string
   /** Unix-ms timestamp; entries are reaped after VAULT_REQUEST_SAVE_TTL_MS. */
   staged_at: number
+  /** Set on entries RESTORED from disk after a gateway restart. The staged
+   *  secret `value` is held in memory only (never persisted — secrets
+   *  hygiene), so a restored entry has an empty value and cannot complete the
+   *  write. A Save tap on such a card degrades gracefully: it tells the agent
+   *  the value was lost to a restart instead of writing an empty secret. */
+  restoredWithoutValue?: boolean
 }
 const pendingVaultRequestSaves = new Map<string, PendingVaultRequestSave>()
 // Gateway-side reap window for a staged vault-save card. Tracks the operator
 // approval-card lifetime (config-driven, 60-min default) so the reap never
 // races ahead of the card the operator is still looking at.
 const VAULT_REQUEST_SAVE_TTL_MS = approvalTtlMs()
-function sweepPendingVaultRequestSaves(): void {
-  const cutoff = Date.now() - VAULT_REQUEST_SAVE_TTL_MS
+function sweepPendingVaultRequestSaves(now = Date.now()): void {
+  const cutoff = now - VAULT_REQUEST_SAVE_TTL_MS
   for (const [k, v] of pendingVaultRequestSaves) {
-    if (v.staged_at < cutoff) pendingVaultRequestSaves.delete(k)
+    if (v.staged_at < cutoff) expireVaultSaveCard(k, v, now)
   }
 }
 
@@ -5420,10 +5441,10 @@ const pendingVaultRequestAccesses = new Map<string, PendingVaultRequestAccess>()
 // Gateway-side reap window for a staged vault-access card. Tracks the operator
 // approval-card lifetime (config-driven, 60-min default) — see approvalTtlMs.
 const VAULT_REQUEST_ACCESS_TTL_MS = approvalTtlMs()
-function sweepPendingVaultRequestAccesses(): void {
-  const cutoff = Date.now() - VAULT_REQUEST_ACCESS_TTL_MS
+function sweepPendingVaultRequestAccesses(now = Date.now()): void {
+  const cutoff = now - VAULT_REQUEST_ACCESS_TTL_MS
   for (const [k, v] of pendingVaultRequestAccesses) {
-    if (v.staged_at < cutoff) pendingVaultRequestAccesses.delete(k)
+    if (v.staged_at < cutoff) expireVaultAccessCard(k, v, now)
   }
 }
 
@@ -5456,22 +5477,10 @@ const MENTAL_MODEL_PROPOSE_TTL_MS = approvalTtlMs()
 // posted card's keyboard away, so a stale card left in the chat can't be tapped
 // into a "Card expired" answer — the operator sees the ⌛ expiry inline instead.
 // Best-effort: card edits are fire-and-forget (the entry is removed regardless).
-function sweepPendingMentalModelProposes(): void {
-  const cutoff = Date.now() - MENTAL_MODEL_PROPOSE_TTL_MS
+function sweepPendingMentalModelProposes(now = Date.now()): void {
+  const cutoff = now - MENTAL_MODEL_PROPOSE_TTL_MS
   for (const [k, v] of pendingMentalModelProposes) {
-    if (v.staged_at < cutoff) {
-      pendingMentalModelProposes.delete(k)
-      if (v.card_message_id != null) {
-        void lockedBot.api
-          .editMessageText(
-            v.chat_id,
-            v.card_message_id,
-            richMessage('⌛ _This mental-model proposal card expired. Ask the agent to re-propose if it still stands._'),
-            { reply_markup: { inline_keyboard: [] } },
-          )
-          .catch(() => {})
-      }
-    }
+    if (v.staged_at < cutoff) expireMentalModelProposeCard(k, v, now)
   }
 }
 
@@ -5709,6 +5718,264 @@ function isAutoFallbackCooldownActive(_agentName: string, now: number): boolean 
   }
 }
 
+// ── Agent-initiated approval-card TTL expiry → wake the parked agent ────────
+//
+// The four agent-initiated approval-card families (vault_request_access /
+// vault_request_save / request_secret / mental_model_propose) each park the
+// requesting agent (it ends its turn to wait for the operator's tap). Before
+// this, an unanswered card that TTL-expired left the agent parked FOREVER: the
+// lazy sweep just deleted the in-memory entry and nothing woke the agent. Each
+// expire* helper mirrors the permission-card timeout path (#2411 / #2862):
+//   1. edit the card to a ⌛ expired state + strip its keyboard,
+//   2. inject a TIMEOUT-outcome synthetic inbound (turn-gated via
+//      deliverResumeSyntheticOrBuffer) so the agent can re-request or degrade,
+//   3. record it in missedApprovalsStore so it's re-offered when the operator
+//      returns,
+//   4. drop the in-memory entry AND its durable store record.
+// Called from BOTH the lazy sweeps (on next stage) and the pendingStateReaper
+// (every 60s — the authoritative timer so an idle gateway still wakes agents).
+
+async function editCardExpired(chatId: string, messageId: number | undefined, body: string): Promise<void> {
+  if (messageId == null) return
+  await lockedBot.api
+    // allow-raw-bot-api: message-id-targeted edit (no thread to lose); best-effort card-expiry strip from the reaper (no grammy ctx). Dropping reply_markup strips the stale keyboard atomically with the text edit.
+    .editMessageText(chatId, messageId, richMessage(body), { reply_markup: { inline_keyboard: [] } })
+    .catch(() => {})
+}
+
+function recordMissedApproval(opts: {
+  stageId: string
+  toolName: string
+  action: string
+  chatId: string
+  threadId?: number
+  now: number
+}): void {
+  if (!MISSED_APPROVAL_REOFFER_ENABLED) return
+  missedApprovalsStore.add({
+    requestId: opts.stageId,
+    toolName: opts.toolName,
+    action: opts.action,
+    chatId: opts.chatId,
+    threadId: opts.threadId ?? null,
+    timedOutAt: opts.now,
+  })
+}
+
+function expireVaultAccessCard(stageId: string, v: PendingVaultRequestAccess, now: number): void {
+  pendingVaultRequestAccesses.delete(stageId)
+  pendingCardStore.remove(stageId)
+  void editCardExpired(
+    v.chat_id,
+    v.card_message_id,
+    `⌛ _This vault access request for \`${escapeHtmlForTg(v.key)}\` timed out before you tapped. Ask **${escapeHtmlForTg(v.agent)}** to re-request if it still stands._`,
+  )
+  const timeoutMinutes = Math.round(VAULT_REQUEST_ACCESS_TTL_MS / 60000)
+  const inbound = buildVaultAccessTimeoutInbound({
+    agent: v.agent,
+    chatId: v.chat_id,
+    ...(v.threadId != null ? { threadId: v.threadId } : {}),
+    stageId,
+    timeoutMinutes,
+    key: v.key,
+    scope: v.scope,
+  })
+  const delivered = deliverResumeSyntheticOrBuffer(v.agent, inbound)
+  recordMissedApproval({
+    stageId,
+    toolName: 'vault_request_access',
+    action: `grant ${v.agent} ${v.scope} access to \`${v.key}\``,
+    chatId: v.chat_id,
+    ...(v.threadId != null ? { threadId: v.threadId } : {}),
+    now,
+  })
+  process.stderr.write(
+    `telegram gateway: vault_request_access TTL expired — wake agent=${v.agent} ` +
+    `key=${v.key} stage=${stageId} delivered=${delivered}\n`,
+  )
+}
+
+function expireVaultSaveCard(stageId: string, v: PendingVaultRequestSave, now: number): void {
+  pendingVaultRequestSaves.delete(stageId)
+  pendingCardStore.remove(stageId)
+  void editCardExpired(
+    v.chat_id,
+    v.card_message_id,
+    `⌛ _This vault-save card for \`${escapeHtmlForTg(v.key)}\` timed out before you tapped. The secret was NOT stored. Ask **${escapeHtmlForTg(v.agent)}** to re-issue if you still want to save._`,
+  )
+  const timeoutMinutes = Math.round(VAULT_REQUEST_SAVE_TTL_MS / 60000)
+  const inbound = buildVaultSaveTimeoutInbound({
+    agent: v.agent,
+    chatId: v.chat_id,
+    ...(v.threadId != null ? { threadId: v.threadId } : {}),
+    stageId,
+    timeoutMinutes,
+    key: v.key,
+  })
+  const delivered = deliverResumeSyntheticOrBuffer(v.agent, inbound)
+  recordMissedApproval({
+    stageId,
+    toolName: 'vault_request_save',
+    action: `save the secret \`${v.key}\` for ${v.agent}`,
+    chatId: v.chat_id,
+    ...(v.threadId != null ? { threadId: v.threadId } : {}),
+    now,
+  })
+  process.stderr.write(
+    `telegram gateway: vault_request_save TTL expired — wake agent=${v.agent} ` +
+    `key=${v.key} stage=${stageId} delivered=${delivered}\n`,
+  )
+}
+
+function expireSecretRequestCard(stageId: string, v: PendingSecretRequest, now: number): void {
+  pendingSecretRequests.delete(stageId)
+  pendingCardStore.remove(stageId)
+  void editCardExpired(
+    v.chat_id,
+    v.card_message_id,
+    `⌛ _This secret-request card for \`${escapeHtmlForTg(v.key)}\` timed out before you provided it. Ask **${escapeHtmlForTg(v.agent)}** to re-request if it still needs the value._`,
+  )
+  const timeoutMinutes = Math.round(PENDING_SECRET_REQUEST_TTL_MS / 60000)
+  const inbound = buildSecretRequestTimeoutInbound({
+    agent: v.agent,
+    chatId: v.chat_id,
+    ...(v.threadId != null ? { threadId: v.threadId } : {}),
+    stageId,
+    timeoutMinutes,
+    key: v.key,
+  })
+  const delivered = deliverResumeSyntheticOrBuffer(v.agent, inbound)
+  recordMissedApproval({
+    stageId,
+    toolName: 'request_secret',
+    action: `provide the secret \`${v.key}\` for ${v.agent}`,
+    chatId: v.chat_id,
+    ...(v.threadId != null ? { threadId: v.threadId } : {}),
+    now,
+  })
+  process.stderr.write(
+    `telegram gateway: request_secret TTL expired — wake agent=${v.agent} ` +
+    `key=${v.key} stage=${stageId} delivered=${delivered}\n`,
+  )
+}
+
+function expireMentalModelProposeCard(stageId: string, v: PendingMentalModelPropose, now: number): void {
+  pendingMentalModelProposes.delete(stageId)
+  pendingCardStore.remove(stageId)
+  void editCardExpired(
+    v.chat_id,
+    v.card_message_id,
+    `⌛ _This mental-model proposal card for \`${escapeHtmlForTg(v.spec.name)}\` timed out before you tapped. Ask **${escapeHtmlForTg(v.agent)}** to re-propose if it still stands._`,
+  )
+  const timeoutMinutes = Math.round(MENTAL_MODEL_PROPOSE_TTL_MS / 60000)
+  const inbound = buildMentalModelProposeTimeoutInbound({
+    agent: v.agent,
+    chatId: v.chat_id,
+    ...(v.threadId != null ? { threadId: v.threadId } : {}),
+    stageId,
+    timeoutMinutes,
+    name: v.spec.name,
+  })
+  const delivered = deliverResumeSyntheticOrBuffer(v.agent, inbound)
+  recordMissedApproval({
+    stageId,
+    toolName: 'mental_model_propose',
+    action: `declare the mental model \`${v.spec.name}\` for ${v.agent}`,
+    chatId: v.chat_id,
+    ...(v.threadId != null ? { threadId: v.threadId } : {}),
+    now,
+  })
+  process.stderr.write(
+    `telegram gateway: mental_model_propose TTL expired — wake agent=${v.agent} ` +
+    `name=${v.spec.name} stage=${stageId} delivered=${delivered}\n`,
+  )
+}
+
+// Run all four agent-initiated approval-card expiry sweeps. Called from the
+// pendingStateReaper (the authoritative 60s timer).
+function sweepExpiredApprovalCards(now: number): void {
+  sweepPendingVaultRequestAccesses(now)
+  sweepPendingVaultRequestSaves(now)
+  sweepPendingMentalModelProposes(now)
+  sweepSecretRequests(now)
+}
+
+// Boot restore: repopulate the four in-memory approval-card maps from the
+// durable store so a post-restart tap on a still-valid card resolves normally
+// (approve → grant + synthetic; deny → denial synthetic) instead of hitting
+// the "Card expired" tombstone. Entries already past their TTL are left for
+// the reaper's next tick, which wakes the parked agent via the timeout path.
+// vault_request_save entries restore WITHOUT their staged value (never
+// persisted) and are flagged `restoredWithoutValue` so a Save tap degrades
+// gracefully rather than writing an empty secret.
+function restorePendingApprovalCards(): number {
+  let restored = 0
+  for (const e of pendingCardStore.loadAll()) {
+    try {
+      if (e.family === 'vault_request_access') {
+        pendingVaultRequestAccesses.set(e.stageId, {
+          agent: e.agent,
+          chat_id: e.chatId,
+          ...(e.cardMessageId != null ? { card_message_id: e.cardMessageId } : {}),
+          ...(e.threadId != null ? { threadId: e.threadId } : {}),
+          key: e.key,
+          scope: e.scope,
+          ...(e.reason != null ? { reason: e.reason } : {}),
+          ttl_seconds: e.ttlSeconds,
+          staged_at: e.stagedAt,
+        })
+        restored++
+      } else if (e.family === 'vault_request_save') {
+        pendingVaultRequestSaves.set(e.stageId, {
+          agent: e.agent,
+          chat_id: e.chatId,
+          ...(e.cardMessageId != null ? { card_message_id: e.cardMessageId } : {}),
+          ...(e.threadId != null ? { threadId: e.threadId } : {}),
+          key: e.key,
+          kind: e.kind,
+          value: '', // never persisted — secrets hygiene
+          ...(e.why != null ? { why: e.why } : {}),
+          staged_at: e.stagedAt,
+          restoredWithoutValue: true,
+        })
+        restored++
+      } else if (e.family === 'request_secret') {
+        pendingSecretRequests.set(e.stageId, {
+          agent: e.agent,
+          chat_id: e.chatId,
+          ...(e.cardMessageId != null ? { card_message_id: e.cardMessageId } : {}),
+          ...(e.threadId != null ? { threadId: e.threadId } : {}),
+          key: e.key,
+          ...(e.reason != null ? { reason: e.reason } : {}),
+          staged_at: e.stagedAt,
+        })
+        restored++
+      } else if (e.family === 'mental_model_propose') {
+        pendingMentalModelProposes.set(e.stageId, {
+          agent: e.agent,
+          chat_id: e.chatId,
+          ...(e.cardMessageId != null ? { card_message_id: e.cardMessageId } : {}),
+          ...(e.threadId != null ? { threadId: e.threadId } : {}),
+          spec: e.spec,
+          ...(e.reason != null ? { reason: e.reason } : {}),
+          staged_at: e.stagedAt,
+        })
+        restored++
+      }
+    } catch (err) {
+      process.stderr.write(
+        `telegram gateway: pending-card restore skipped a malformed entry: ${(err as Error).message}\n`,
+      )
+    }
+  }
+  if (restored > 0) {
+    process.stderr.write(
+      `telegram gateway: restored ${restored} pending approval card(s) from prior gateway session\n`,
+    )
+  }
+  return restored
+}
+
 // 60-second sweep drops anything past its documented TTL.
 const pendingStateReaper = setInterval(() => {
   const now = Date.now()
@@ -5842,6 +6109,13 @@ const pendingStateReaper = setInterval(() => {
   for (const [k, v] of deferredSecrets) {
     if (now - v.staged_at > DEFERRED_SECRET_TTL_MS) deferredSecrets.delete(k)
   }
+  // Agent-initiated approval cards (vault_request_access / vault_request_save /
+  // request_secret / mental_model_propose): expire past-TTL entries and WAKE
+  // the parked agent (timeout synthetic + missed-approvals re-offer). This is
+  // the authoritative timer — before this the only expiry path was a lazy
+  // sweep on the NEXT stage, so an agent that ended its turn to wait on one of
+  // these cards could sit parked forever if no further request ever staged.
+  sweepExpiredApprovalCards(now)
   // #550: sweep a stale turn-active marker. Defence-in-depth for the
   // case where neither the turn_end arm nor onTurnComplete fired (SDK
   // killed before the JSONL turn_duration record, compaction window,
@@ -11879,6 +12153,21 @@ async function executeVaultRequestSave(args: Record<string, unknown>): Promise<{
     { threadId, chat_id, verb: 'vault_request_save.card' },
   )
   pending.card_message_id = sent.message_id
+  // Persist card METADATA (never the staged `value` — secrets hygiene) so a
+  // gateway restart doesn't strand the parked agent. A restored Save tap can't
+  // complete (value is gone) and degrades to a "value lost to restart" wake-up.
+  pendingCardStore.add({
+    family: 'vault_request_save',
+    stageId,
+    agent: pending.agent,
+    chatId: pending.chat_id,
+    ...(pending.card_message_id != null ? { cardMessageId: pending.card_message_id } : {}),
+    ...(pending.threadId != null ? { threadId: pending.threadId } : {}),
+    key: pending.key,
+    kind: pending.kind,
+    ...(pending.why != null ? { why: pending.why } : {}),
+    stagedAt: pending.staged_at,
+  })
 
   return {
     content: [
@@ -11922,11 +12211,13 @@ const armedSecretCaptures = new Map<string, ArmedSecretCapture>()
 const PENDING_SECRET_REQUEST_TTL_MS = 30 * 60_000 // card lifetime
 const ARMED_SECRET_CAPTURE_TTL_MS = 10 * 60_000   // window to send the value after tapping
 
-function sweepSecretRequests(): void {
-  const now = Date.now()
+function sweepSecretRequests(now = Date.now()): void {
   for (const [k, v] of pendingSecretRequests) {
-    if (now - v.staged_at > PENDING_SECRET_REQUEST_TTL_MS) pendingSecretRequests.delete(k)
+    if (now - v.staged_at > PENDING_SECRET_REQUEST_TTL_MS) expireSecretRequestCard(k, v, now)
   }
+  // armedSecretCaptures is a TRANSIENT post-tap window (never persisted): it's
+  // only set after the operator taps [Provide securely], and the request is
+  // no longer parked-on-a-card. Just drop stale ones — no wake needed.
   for (const [k, v] of armedSecretCaptures) {
     if (now - v.armed_at > ARMED_SECRET_CAPTURE_TTL_MS) armedSecretCaptures.delete(k)
   }
@@ -11976,7 +12267,10 @@ async function executeRequestSecret(args: Record<string, unknown>): Promise<{ co
   // Dedupe: one open request per (chat, key). Drop any prior stage for
   // the same target so the operator never sees stacked cards.
   for (const [sid, p] of pendingSecretRequests) {
-    if (p.chat_id === chat_id && p.key === key) pendingSecretRequests.delete(sid)
+    if (p.chat_id === chat_id && p.key === key) {
+      pendingSecretRequests.delete(sid)
+      pendingCardStore.remove(sid)
+    }
   }
 
   const stageId = randomBytes(4).toString('hex')
@@ -11998,6 +12292,21 @@ async function executeRequestSecret(args: Record<string, unknown>): Promise<{ co
     { threadId, chat_id, verb: 'request_secret.card' },
   )
   pending.card_message_id = sent.message_id
+  // Persist card metadata so a gateway restart doesn't strand the parked
+  // agent. request_secret holds NO value at staging time (the value arrives
+  // after the operator taps [Provide securely]), so nothing sensitive lands
+  // on disk here.
+  pendingCardStore.add({
+    family: 'request_secret',
+    stageId,
+    agent: pending.agent,
+    chatId: pending.chat_id,
+    ...(pending.card_message_id != null ? { cardMessageId: pending.card_message_id } : {}),
+    ...(pending.threadId != null ? { threadId: pending.threadId } : {}),
+    key: pending.key,
+    ...(pending.reason != null ? { reason: pending.reason } : {}),
+    stagedAt: pending.staged_at,
+  })
 
   return {
     content: [
@@ -12046,6 +12355,7 @@ async function captureProvidedSecret(
   armedSecretCaptures.delete(chat_id)
   const pending = pendingSecretRequests.get(armed.stageId)
   pendingSecretRequests.delete(armed.stageId)
+  pendingCardStore.remove(armed.stageId)
 
   // Delete the raw message FIRST — surfaces a warning if it fails.
   if (msgId != null) await deleteSensitiveMessage(chat_id, msgId, 'provided secret value')
@@ -12161,6 +12471,7 @@ async function handleSecretRequestCallback(ctx: Context, data: string): Promise<
 
   if (action === 'decline') {
     pendingSecretRequests.delete(stageId)
+    pendingCardStore.remove(stageId)
     armedSecretCaptures.delete(pending.chat_id)
     await ctx.answerCallbackQuery({ text: 'Declined.' }).catch(() => {})
     if (pending.card_message_id != null) {
@@ -12328,12 +12639,27 @@ async function executeVaultRequestAccess(args: Record<string, unknown>): Promise
     { threadId, chat_id, verb: 'vault_request_access.card' },
   )
   pending.card_message_id = sent.message_id
+  // Persist card metadata (no secret material — this flow stages only the ACL
+  // request) so a gateway restart doesn't strand the parked agent.
+  pendingCardStore.add({
+    family: 'vault_request_access',
+    stageId,
+    agent: pending.agent,
+    chatId: pending.chat_id,
+    ...(pending.card_message_id != null ? { cardMessageId: pending.card_message_id } : {}),
+    ...(pending.threadId != null ? { threadId: pending.threadId } : {}),
+    key: pending.key,
+    scope: pending.scope,
+    ...(pending.reason != null ? { reason: pending.reason } : {}),
+    ttlSeconds: pending.ttl_seconds,
+    stagedAt: pending.staged_at,
+  })
 
   return {
     content: [
       {
         type: 'text',
-        text: `vault_request_access: card sent (stage_id=${stageId}, key=${key}, scope=${scopeRaw}). Wait for the operator to tap Approve or Deny — do not retry the vault read until you see a confirmation message. If the card times out (10 min) you can re-request.`,
+        text: `vault_request_access: card sent (stage_id=${stageId}, key=${key}, scope=${scopeRaw}). Wait for the operator to tap Approve or Deny — do not retry the vault read until you see a confirmation message. If the card times out (${Math.round(VAULT_REQUEST_ACCESS_TTL_MS / 60000)} min) you can re-request.`,
       },
     ],
   }
@@ -12497,6 +12823,19 @@ async function executeMentalModelPropose(args: Record<string, unknown>): Promise
     { threadId, chat_id, verb: 'mental_model_propose.card' },
   )
   pending.card_message_id = sent.message_id
+  // Persist card metadata (the proposed DECLARATION is not secret material) so
+  // a gateway restart doesn't strand the parked agent.
+  pendingCardStore.add({
+    family: 'mental_model_propose',
+    stageId,
+    agent: pending.agent,
+    chatId: pending.chat_id,
+    ...(pending.card_message_id != null ? { cardMessageId: pending.card_message_id } : {}),
+    ...(pending.threadId != null ? { threadId: pending.threadId } : {}),
+    spec: pending.spec,
+    ...(pending.reason != null ? { reason: pending.reason } : {}),
+    stagedAt: pending.staged_at,
+  })
   // Only count a proposal against the rate budget once its card actually
   // posted (validation errors / dupes don't consume the budget).
   mentalModelProposeTimes.push(Date.now())
@@ -21313,6 +21652,7 @@ async function performVaultAccessApproval(
       const visible = await listViaBroker()
       if (visible !== null && visible.includes(pending.key)) {
         pendingVaultRequestAccesses.delete(stageId)
+        pendingCardStore.remove(stageId)
         if (pending.card_message_id != null) {
           await ctx.api
             .editMessageText(
@@ -21411,6 +21751,7 @@ async function performVaultAccessApproval(
     // the agent to re-issue, or the broker error message will tell
     // them the next step.
     pendingVaultRequestAccesses.delete(stageId)
+    pendingCardStore.remove(stageId)
     if (pending.card_message_id != null) {
       await ctx.api
         .editMessageText(
@@ -21442,6 +21783,7 @@ async function performVaultAccessApproval(
   }
 
   pendingVaultRequestAccesses.delete(stageId)
+  pendingCardStore.remove(stageId)
   if (pending.card_message_id != null) {
     const days = Math.round(pending.ttl_seconds / 86400)
     const footer =
@@ -21650,23 +21992,17 @@ async function handleMentalModelProposeCallback(ctx: Context, data: string): Pro
   // this, a card left untapped past its TTL is still resolvable if no fresh
   // proposal has run the sweep — an operator could approve a stale proposal.
   if (Date.now() - pending.staged_at > MENTAL_MODEL_PROPOSE_TTL_MS) {
-    pendingMentalModelProposes.delete(stageId)
-    await ctx.answerCallbackQuery({ text: 'Card expired — ask the agent to re-propose.' }).catch(() => {})
-    if (pending.card_message_id != null) {
-      await ctx.api
-        .editMessageText(
-          pending.chat_id,
-          pending.card_message_id,
-          richMessage('⌛ _This mental-model proposal card expired before you tapped. Ask the agent to re-propose if it still stands._'),
-          { reply_markup: { inline_keyboard: [] } },
-        )
-        .catch(() => {})
-    }
+    // Expired between post and tap: route through the shared expiry path so the
+    // parked agent is WOKEN (timeout synthetic + missed-approvals re-offer) and
+    // the durable store entry is cleared — not just a silent map delete.
+    expireMentalModelProposeCard(stageId, pending, Date.now())
+    await ctx.answerCallbackQuery({ text: 'Card expired — the agent was notified.' }).catch(() => {})
     return
   }
   // Single-shot: remove the pending entry immediately so a double-tap can't
   // resolve twice.
   pendingMentalModelProposes.delete(stageId)
+  pendingCardStore.remove(stageId)
 
   const proposal: MentalModelPendingProposal = {
     agent: pending.agent,
@@ -21808,6 +22144,7 @@ async function handleVaultRequestAccessCallback(ctx: Context, data: string): Pro
 
   if (action === 'deny') {
     pendingVaultRequestAccesses.delete(stageId)
+    pendingCardStore.remove(stageId)
     await ctx.answerCallbackQuery({ text: '🚫 Denied' }).catch(() => {})
     if (pending.card_message_id != null) {
       await ctx.api
@@ -22030,6 +22367,7 @@ async function handleVaultRequestSaveCallback(ctx: Context, data: string): Promi
 
   if (action === 'discard') {
     pendingVaultRequestSaves.delete(stageId)
+    pendingCardStore.remove(stageId)
     await ctx.answerCallbackQuery({ text: '🚫 Discarded' }).catch(() => {})
     if (pending.card_message_id != null) {
       await ctx.api
@@ -22100,6 +22438,43 @@ async function handleVaultRequestSaveCallback(ctx: Context, data: string): Promi
     // stale "spinning" state on the button while we run the write.
     await ctx.answerCallbackQuery({ text: '⏳ Saving…' }).catch(() => {})
 
+    // Restored-after-restart guard: the staged secret VALUE is held in gateway
+    // memory only and is never persisted (secrets hygiene). If this card was
+    // restored from disk after a gateway restart, the value is gone — we CANNOT
+    // complete the write. Degrade gracefully: strip the card, wake the agent
+    // with a save-failed (value-lost) synthetic so it re-requests, and stop.
+    if (pending.restoredWithoutValue || pending.value.length === 0) {
+      pendingVaultRequestSaves.delete(stageId)
+      pendingCardStore.remove(stageId)
+      if (pending.card_message_id != null) {
+        await ctx.api
+          .editMessageText(
+            pending.chat_id,
+            pending.card_message_id,
+            richMessage(`⚠️ _The staged value for \`${escapeHtmlForTg(pending.key)}\` was lost to a gateway restart — nothing was saved. Ask **${escapeHtmlForTg(pending.agent)}** to re-issue \`vault_request_save\` if you still want to store it._`),
+            { reply_markup: { inline_keyboard: [] } },
+          )
+          .catch(() => {})
+      }
+      const lostInbound = buildVaultSaveFailedInbound({
+        ctx: {
+          agent: pending.agent,
+          key: pending.key,
+          chat_id: pending.chat_id,
+          ...(pending.threadId != null ? { threadId: pending.threadId } : {}),
+        },
+        stageId,
+        operatorId: senderId,
+        reason: 'staged value lost to a gateway restart — re-request the save',
+      })
+      const lDelivered = deliverResumeSyntheticOrBuffer(pending.agent, lostInbound)
+      process.stderr.write(
+        `telegram gateway: vault_request_save value lost to restart — wake agent=${pending.agent} ` +
+        `key=${pending.key} stage=${stageId} delivered=${lDelivered}\n`,
+      )
+      return
+    }
+
     // #1115 follow-up: the save-approve flow now mirrors the access-
     // approve flow under telegram-id mode — broker `put` accepts
     // `attest_via_posture: true` (server.ts:1448-1500), so the
@@ -22135,6 +22510,7 @@ async function handleVaultRequestSaveCallback(ctx: Context, data: string): Promi
             .catch(() => {})
         }
         pendingVaultRequestSaves.delete(stageId)
+        pendingCardStore.remove(stageId)
         return
       }
       // defaultVaultWrite spawns `switchroom vault set <key>` with the
@@ -22166,6 +22542,7 @@ async function handleVaultRequestSaveCallback(ctx: Context, data: string): Promi
       // retry by re-invoking the same MCP tool, but the value will be
       // re-staged with a new ID. Drop the current stage.
       pendingVaultRequestSaves.delete(stageId)
+      pendingCardStore.remove(stageId)
       // Wake the waiting agent with the failure (symmetric with the
       // success/discard paths) so it doesn't assume vault:<key> exists.
       const failReason =
@@ -22191,6 +22568,7 @@ async function handleVaultRequestSaveCallback(ctx: Context, data: string): Promi
 
     // Success — mask the value in the card for visual confirmation.
     pendingVaultRequestSaves.delete(stageId)
+    pendingCardStore.remove(stageId)
     if (pending.card_message_id != null) {
       await ctx.api
         .editMessageText(
@@ -26980,6 +27358,18 @@ void (async () => {
               })()
             }, graceMs).unref?.()
           }
+        }
+
+        // Restore the four agent-initiated approval-card families from the
+        // durable store so a post-restart tap on a still-valid card resolves
+        // normally instead of hitting the "Card expired" tombstone (and an
+        // already-expired entry gets woken by the reaper's next tick).
+        try {
+          restorePendingApprovalCards()
+        } catch (err) {
+          process.stderr.write(
+            `telegram gateway: pending approval-card restore failed: ${(err as Error).message}\n`,
+          )
         }
 
         // Boot-time pin sweep
