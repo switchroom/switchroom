@@ -137,6 +137,7 @@ import {
 } from './approval-timeout-inbound-builders.js'
 import { expirePendingCard } from './pending-card-expiry.js'
 import { createSweepableCardStore } from './approval-card-stores.js'
+import { createSweepableStore, createPlainStore } from './pending-state-stores.js'
 import {
   isPermissionRearmEnabled,
   permissionRearmGraceMs,
@@ -5398,14 +5399,15 @@ const PERMISSION_CARD_ORIGIN_MAX_AGE_MS = 30 * 60_000
 // other field finds no entry and falls through to a real operator card.
 // Single-shot (deleted on match) + 30s TTL sweep so a stale correlation
 // can't be replayed.
-const pendingAlwaysAllowCorrelations = new Map<string, { agentName: string; rule: string; unifiedDiff: string; createdAt: number }>()
 const ALWAYS_ALLOW_CORRELATION_TTL_MS = 30_000
+// Storage extracted to pending-state-stores.ts (#2996 Phase 3 step 2): the
+// store owns the Map + co-locates the delete-past-TTL sweep. The TTL and its
+// comparison direction stay here in the injected predicate (byte-identical).
+const pendingAlwaysAllowCorrelations = createSweepableStore<{ agentName: string; rule: string; unifiedDiff: string; createdAt: number }>(
+  (entry, now) => now - entry.createdAt > ALWAYS_ALLOW_CORRELATION_TTL_MS,
+)
 function sweepStaleAlwaysAllowCorrelations(now = Date.now()): void {
-  for (const [key, entry] of pendingAlwaysAllowCorrelations) {
-    if (now - entry.createdAt > ALWAYS_ALLOW_CORRELATION_TTL_MS) {
-      pendingAlwaysAllowCorrelations.delete(key)
-    }
-  }
+  pendingAlwaysAllowCorrelations.sweep(now)
 }
 
 // Sibling of pendingAlwaysAllowCorrelations for the agent-proposes →
@@ -5428,16 +5430,17 @@ function sweepStaleAlwaysAllowCorrelations(now = Date.now()): void {
 // slow-but-valid tap, dropping the auto-approve and surfacing a SECOND card
 // for an edit the operator already approved. Size it to the hostd budget.
 const MENTAL_MODEL_CORRELATION_TTL_MS = 720_000
-const pendingMentalModelCorrelations = new Map<string, { agentName: string; unifiedDiff: string; createdAt: number }>()
+// Storage extracted to pending-state-stores.ts (#2996 Phase 3 step 2). Same
+// pattern as pendingAlwaysAllowCorrelations, but the predicate closes over the
+// larger 720s TTL that must outlive the whole config-edit approval budget.
+const pendingMentalModelCorrelations = createSweepableStore<{ agentName: string; unifiedDiff: string; createdAt: number }>(
+  (entry, now) => now - entry.createdAt > MENTAL_MODEL_CORRELATION_TTL_MS,
+)
 function mentalModelCorrelationKey(agentName: string, unifiedDiff: string): string {
   return `${agentName}::${createHash('sha256').update(unifiedDiff).digest('hex')}`
 }
 function sweepStaleMentalModelCorrelations(now = Date.now()): void {
-  for (const [key, entry] of pendingMentalModelCorrelations) {
-    if (now - entry.createdAt > MENTAL_MODEL_CORRELATION_TTL_MS) {
-      pendingMentalModelCorrelations.delete(key)
-    }
-  }
+  pendingMentalModelCorrelations.sweep(now)
 }
 
 // Scoped-approval store: the 30-min window that backs the "✅ Allow" tap for
@@ -5475,10 +5478,19 @@ interface PendingAskUser {
   timer: ReturnType<typeof setTimeout>
   startedAt: number
 }
-const pendingAskUser = new Map<string, PendingAskUser>()
+// Storage extracted to pending-state-stores.ts (#2996 Phase 3 step 2). Plain
+// store (no TTL sweep): entries are bounded by per-entry timers and cleared on
+// resolution / shutdown / chat-close, not by the reaper.
+const pendingAskUser = createPlainStore<PendingAskUser>()
 
-// Reauth flows
-const pendingReauthFlows = new Map<string, { agent: string; startedAt: number }>()
+// Reauth flows. Storage extracted to pending-state-stores.ts (#2996 Phase 3
+// step 2): the store owns the Map + co-locates the delete-past-TTL sweep the
+// reaper drove inline. Direction preserved: now - startedAt > TTL. The sweep
+// call stays in the SAME reaper position (first, ahead of the OAuth-code
+// cluster) so the awaitingAuthCodeAt contiguity pin is unaffected.
+const pendingReauthFlows = createSweepableStore<{ agent: string; startedAt: number }>(
+  (v, now) => now - v.startedAt > REAUTH_INTERCEPT_TTL_MS,
+)
 const REAUTH_INTERCEPT_TTL_MS = 10 * 60_000
 
 // #710: per-message agent-button metadata (ack_text / single_use). Keyed by
@@ -5490,7 +5502,11 @@ const REAUTH_INTERCEPT_TTL_MS = 10 * 60_000
 // design: when this map is empty (e.g. fresh process) the defaults apply
 // (`'✓ received'` toast + strip keyboard) — the agent only loses any
 // custom ack_text override.
-const agentButtonMeta = new Map<string, Map<string, AgentButtonMeta>>()
+// Storage extracted to pending-state-stores.ts (#2996 Phase 3 step 2). Plain
+// store (no TTL sweep): bounded by the AGENT_BUTTON_META_MAX LRU cap enforced
+// in rememberAgentButtonMeta, not the reaper. keys().next().value gives the
+// oldest insertion for eviction — Map-surface parity preserved.
+const agentButtonMeta = createPlainStore<Map<string, AgentButtonMeta>>()
 const AGENT_BUTTON_META_MAX = 1000
 function rememberAgentButtonMeta(
   chatId: string | number,
@@ -5508,7 +5524,11 @@ function rememberAgentButtonMeta(
 }
 
 // Vault
-const vaultPassphraseCache = new Map<string, { passphrase: string; expiresAt: number }>()
+// Storage extracted to pending-state-stores.ts (#2996 Phase 3 step 2). Absolute
+// expiry: the sweep deletes when now > expiresAt (direction preserved verbatim).
+const vaultPassphraseCache = createSweepableStore<{ passphrase: string; expiresAt: number }>(
+  (v, now) => now > v.expiresAt,
+)
 const VAULT_PASSPHRASE_TTL_MS = 30 * 60 * 1000
 
 /**
@@ -5658,7 +5678,12 @@ type PendingVaultOp =
       startedAt: number
     }
 const VAULT_INPUT_TTL_MS = 5 * 60 * 1000
-const pendingVaultOps = new Map<string, PendingVaultOp>()
+// Storage extracted to pending-state-stores.ts (#2996 Phase 3 step 2): the
+// store owns the Map + co-locates the delete-past-TTL sweep the reaper drove
+// inline. TTL + direction stay here (byte-identical: now - startedAt > TTL).
+const pendingVaultOps = createSweepableStore<PendingVaultOp>(
+  (v, now) => now - v.startedAt > VAULT_INPUT_TTL_MS,
+)
 
 // Secret-detection staging: ambiguous hits the user must confirm before we
 // store/delete. Also holds the deferred "we need a passphrase before we can
@@ -5691,7 +5716,13 @@ interface DeferredSecret {
    */
   kernel_request_id?: string
 }
-const deferredSecrets = new Map<string, DeferredSecret>()
+// Storage extracted to pending-state-stores.ts (#2996 Phase 3 step 2). The
+// isExpired predicate reads DEFERRED_SECRET_TTL_MS lazily at sweep time (it is
+// declared below this const but only referenced when the reaper sweeps, so the
+// TDZ never bites). Direction preserved: now - staged_at > TTL.
+const deferredSecrets = createSweepableStore<DeferredSecret>(
+  (v, now) => now - v.staged_at > DEFERRED_SECRET_TTL_MS,
+)
 
 /**
  * Agent-initiated save staging (issue #969 P1a). When an agent calls the
@@ -6354,9 +6385,7 @@ function restorePendingApprovalCards(): number {
 const pendingStateReaper = setInterval(() => {
   const now = Date.now()
   // OAuth-code state grouped first (pinned by secret-detect-oauth-code.test.ts).
-  for (const [k, v] of pendingReauthFlows) {
-    if (now - v.startedAt > REAUTH_INTERCEPT_TTL_MS) pendingReauthFlows.delete(k)
-  }
+  pendingReauthFlows.sweep(now)
   for (const [k, v] of pendingAuthAddFlows) {
     if (now - v.startedAt > REAUTH_INTERCEPT_TTL_MS) {
       cancelAccountAuthSession(v)
@@ -6387,9 +6416,7 @@ const pendingStateReaper = setInterval(() => {
   for (const [k, v] of pendingAuthRmFlows) {
     if (now >= v.expiresAt) pendingAuthRmFlows.delete(k)
   }
-  for (const [k, v] of pendingVaultOps) {
-    if (now - v.startedAt > VAULT_INPUT_TTL_MS) pendingVaultOps.delete(k)
-  }
+  pendingVaultOps.sweep(now)
   for (const [k, v] of pendingPermissions) {
     // hostd gated fleet-mutation verbs get a longer (30-min) human-scale
     // decision window than the 10-min default (Bug 2 fix #2).
@@ -6468,9 +6495,7 @@ const pendingStateReaper = setInterval(() => {
   for (const [sig, at] of permissionTimeoutSignatures) {
     if (now - at > PERMISSION_DUPLICATE_WINDOW_MS) permissionTimeoutSignatures.delete(sig)
   }
-  for (const [k, v] of vaultPassphraseCache) {
-    if (now > v.expiresAt) vaultPassphraseCache.delete(k)
-  }
+  vaultPassphraseCache.sweep(now)
   // Drop expired "⏱ 30 min" scoped grants. (Lookup already fails closed on
   // expiry; this just keeps the map from accumulating dead entries.) Persist
   // the removal so a restart between sweeps can't resurrect a swept grant —
@@ -6480,9 +6505,7 @@ const pendingStateReaper = setInterval(() => {
   if (countScopedGrants(scopedGrants) !== scopedGrantsBefore) {
     scopedGrantStore.save(scopedGrants)
   }
-  for (const [k, v] of deferredSecrets) {
-    if (now - v.staged_at > DEFERRED_SECRET_TTL_MS) deferredSecrets.delete(k)
-  }
+  deferredSecrets.sweep(now)
   // Agent-initiated approval cards (vault_request_access / vault_request_save /
   // request_secret / mental_model_propose): expire past-TTL entries and WAKE
   // the parked agent (timeout synthetic + missed-approvals re-offer). This is
@@ -12663,7 +12686,12 @@ interface PendingSecretRequest {
 // chat_id -> the armed capture: the operator's NEXT message in this chat is
 // the value for `key`. Set when [Provide securely] is tapped.
 interface ArmedSecretCapture { key: string; agent: string; stageId: string; armed_at: number; threadId?: number }
-const armedSecretCaptures = new Map<string, ArmedSecretCapture>()
+// Storage extracted to pending-state-stores.ts (#2996 Phase 3 step 2). Swept by
+// sweepSecretRequests (below) — a plain delete-past-TTL, no wake (transient
+// post-tap window). Direction preserved: now - armed_at > TTL.
+const armedSecretCaptures = createSweepableStore<ArmedSecretCapture>(
+  (v, now) => now - v.armed_at > ARMED_SECRET_CAPTURE_TTL_MS,
+)
 const PENDING_SECRET_REQUEST_TTL_MS = 30 * 60_000 // card lifetime
 const ARMED_SECRET_CAPTURE_TTL_MS = 10 * 60_000   // window to send the value after tapping
 // stageId -> request (lives until tapped or TTL). Storage extracted to
@@ -12680,9 +12708,7 @@ function sweepSecretRequests(now = Date.now()): void {
   // armedSecretCaptures is a TRANSIENT post-tap window (never persisted): it's
   // only set after the operator taps [Provide securely], and the request is
   // no longer parked-on-a-card. Just drop stale ones — no wake needed.
-  for (const [k, v] of armedSecretCaptures) {
-    if (now - v.armed_at > ARMED_SECRET_CAPTURE_TTL_MS) armedSecretCaptures.delete(k)
-  }
+  armedSecretCaptures.sweep(now)
 }
 
 function buildSecretRequestKeyboard(stageId: string): { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } {
