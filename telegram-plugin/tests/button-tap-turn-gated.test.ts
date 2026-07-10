@@ -31,6 +31,8 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { decideInboundDelivery } from "../gateway/inbound-delivery-gate.js";
 import { shouldTrackDelivery } from "../gateway/inbound-delivery-confirm.js";
+import { planBufferedRedelivery } from "../gateway/pending-inbound-buffer.js";
+import type { InboundMessage } from "../gateway/ipc-protocol.js";
 
 const gatewaySrc = readFileSync(
   resolve(__dirname, "..", "gateway", "gateway.ts"),
@@ -160,5 +162,102 @@ describe("agent button taps use the turn-gate (mid-turn → buffer)", () => {
       expect(handler).toMatch(/keyboardIsSingleUse\(metaForMessage\)/);
       expect(handler).toMatch(/editMessageReplyMarkup/);
     });
+  });
+
+  describe("flush-path anti-storm guard (trackRedeliveredInbound)", () => {
+    it("skips tracking an id-less button tap, mirroring the immediate path", () => {
+      // The immediate path (deliverButtonTapInbound) refuses to enrol a tap
+      // without a real meta.message_id — the `enqueue` ack could never match
+      // it, so the never-drop sweep would re-fire until TTL. A tap that
+      // buffered mid-turn and flushed through trackRedeliveredInbound must be
+      // skipped by the SAME rule, or the storm exists on one path only.
+      const start = gatewaySrc.indexOf("function trackRedeliveredInbound");
+      expect(start, "trackRedeliveredInbound missing").toBeGreaterThan(0);
+      const body = gatewaySrc.slice(
+        start,
+        gatewaySrc.indexOf("\n}", start) + 2,
+      );
+      // The guard: button_callback-tagged AND no meta.message_id → return
+      // before trackDelivery.
+      const guardIdx = body.indexOf("merged.meta?.button_callback === 'true'");
+      const trackIdx = body.indexOf("trackDelivery(");
+      expect(guardIdx, "button-tap message_id guard missing").toBeGreaterThan(0);
+      expect(guardIdx, "guard must precede trackDelivery").toBeLessThan(trackIdx);
+      expect(body).toMatch(
+        /merged\.meta\.message_id == null \|\| merged\.meta\.message_id === ''/,
+      );
+    });
+  });
+});
+
+describe("buffered button taps never merge with adjacent user messages", () => {
+  const userMsg = (text: string, ts: number): InboundMessage => ({
+    type: "inbound",
+    chatId: "c1",
+    messageId: ts,
+    user: "u",
+    userId: 42,
+    ts,
+    text,
+    meta: { chat_id: "c1", user: "u", user_id: "42", ts: String(ts) },
+  });
+  // A tap inbound as the agent: callback handler builds it — same chat/user
+  // as the surrounding texts, no meta.source, button_callback tagged.
+  const tapMsg = (raw: string, ts: number): InboundMessage => ({
+    type: "inbound",
+    chatId: "c1",
+    messageId: ts,
+    user: "u",
+    userId: 42,
+    ts,
+    text: `[user tapped button: ${raw}]`,
+    meta: {
+      chat_id: "c1",
+      message_id: String(ts),
+      user: "u",
+      user_id: "42",
+      ts: String(ts),
+      button_callback: "true",
+      button_callback_data: raw,
+      button_text: "Approve",
+    },
+  });
+
+  it("a mid-turn tap buffered between user texts delivers individually", () => {
+    // Without the exclusion, the source-less tap merged with the adjacent
+    // texts and mergeRun kept only the anchor (last) message's meta —
+    // silently dropping button_callback_data/button_text whenever a text was
+    // last. The agent then saw the human-readable tap line without the
+    // machine-readable payload.
+    const plan = planBufferedRedelivery([
+      userMsg("first", 1),
+      tapMsg("approve_pr_547", 2),
+      userMsg("second", 3),
+    ]);
+    expect(plan.map((p) => p.merged.text)).toEqual([
+      "first",
+      "[user tapped button: approve_pr_547]",
+      "second",
+    ]);
+    // The tap keeps its full button meta intact.
+    const tap = plan[1]!.merged;
+    expect(tap.meta.button_callback).toBe("true");
+    expect(tap.meta.button_callback_data).toBe("approve_pr_547");
+    expect(tap.meta.button_text).toBe("Approve");
+  });
+
+  it("a tap followed by a user text does not merge (text-last would drop the payload)", () => {
+    const plan = planBufferedRedelivery([
+      tapMsg("hold", 1),
+      userMsg("also do the thing", 2),
+    ]);
+    expect(plan).toHaveLength(2);
+    expect(plan[0]!.merged.meta.button_callback_data).toBe("hold");
+  });
+
+  it("plain user texts still merge around the exclusion (no regression)", () => {
+    const plan = planBufferedRedelivery([userMsg("a", 1), userMsg("b", 2)]);
+    expect(plan).toHaveLength(1);
+    expect(plan[0]!.merged.text).toBe("a\nb");
   });
 });

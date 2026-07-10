@@ -7631,6 +7631,19 @@ function trackRedeliveredInbound(merged: InboundMessage): void {
   ) {
     return
   }
+  // Button-tap anti-storm guard — mirrors the immediate-delivery path in
+  // deliverButtonTapInbound. A tap synthesized without a source message
+  // (`cbMessageId == null` → `messageId: 0`, no meta.message_id) has no id
+  // the `enqueue` ack can ever match, so enrolling it would make the
+  // never-drop sweep re-deliver it until TTL. The immediate path skips
+  // tracking for such taps; a tap that buffered mid-turn and flushed through
+  // here must be skipped identically (asymmetry = a storm on one path only).
+  if (
+    merged.meta?.button_callback === 'true' &&
+    (merged.meta.message_id == null || merged.meta.message_id === '')
+  ) {
+    return
+  }
   const key = chatKey(merged.chatId, merged.threadId != null ? Number(merged.threadId) : null)
   trackDelivery(
     deliveryQueue,
