@@ -25,6 +25,15 @@ export interface WorkerFeedDispatch {
    * result returns to its dispatching worker as the Task tool result).
    */
   isNested: boolean
+  /**
+   * Dispatch-time / last-persisted model for the worker, from the registry
+   * row's `model` column (seeded by the pretool hook from `tool_input.model`,
+   * later updated by the watcher from the worker's transcript). The FIRST-PAINT
+   * fallback the worker card renders before the live watcher entry has observed
+   * a transcript model. Null when the row is missing or never carried a model —
+   * the card then omits the model rather than guessing from config.
+   */
+  feedModel: string | null
 }
 
 /**
@@ -65,5 +74,6 @@ export function resolveWorkerFeedDispatch(
     feedDescription: (sub?.description ?? '') || watcherDescription,
     hasRow: sub != null,
     isNested: sub?.parent_agent_id != null,
+    feedModel: sub?.model ?? null,
   }
 }

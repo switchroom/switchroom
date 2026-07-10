@@ -55,7 +55,8 @@ const SCHEMA_SQL = `
     status            TEXT    NOT NULL,
     result_summary    TEXT,
     jsonl_agent_id    TEXT,
-    parent_agent_id   TEXT
+    parent_agent_id   TEXT,
+    model             TEXT
   );
   CREATE INDEX IF NOT EXISTS subagents_turn      ON subagents(parent_turn_key);
   CREATE INDEX IF NOT EXISTS subagents_status    ON subagents(status);
@@ -157,14 +158,14 @@ function spawnSql(dbPath, sql, cb) {
 // DB write
 // ---------------------------------------------------------------------------
 
-function writeRow(dbPath, { id, parentSessionId, parentTurnKey, agentType, description, background, now }, done) {
+function writeRow(dbPath, { id, parentSessionId, parentTurnKey, agentType, description, background, model, now }, done) {
   const INSERT_SQL = `
     INSERT OR IGNORE INTO subagents
       (id, parent_session_id, parent_turn_key, agent_type, description,
-       background, started_at, last_activity_at, status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running')
+       background, started_at, last_activity_at, status, model)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)
   `
-  const params = [id, parentSessionId, parentTurnKey, agentType, description, background, now, now]
+  const params = [id, parentSessionId, parentTurnKey, agentType, description, background, now, now, model ?? null]
 
   // Resolve a synchronous SQLite binding. Try in order:
   //   1. node:sqlite (Node 22+, production path) — exposes DatabaseSync
@@ -206,6 +207,13 @@ function writeRow(dbPath, { id, parentSessionId, parentTurnKey, agentType, descr
           .get()
         if (hasParentAgentCol == null) {
           db.exec('ALTER TABLE subagents ADD COLUMN parent_agent_id TEXT')
+        }
+        // Migrate older DBs that pre-date the live-model column.
+        const hasModelCol = db
+          .prepare("SELECT name FROM pragma_table_info('subagents') WHERE name = 'model'")
+          .get()
+        if (hasModelCol == null) {
+          db.exec('ALTER TABLE subagents ADD COLUMN model TEXT')
         }
         // Verify the marker-derived parent_turn_key (snapParams[2]) actually has
         // a row in the turns table before trusting it. The gateway writes the
@@ -363,6 +371,13 @@ function main() {
       agentType: input.subagent_type ?? null,
       description: input.description ?? null,
       background: input.run_in_background === true ? 1 : 0,
+      // First-paint model for the worker card: the Agent tool payload carries
+      // the model the sub-agent will run under (`tool_input.model`), available
+      // BEFORE the sub-agent writes its first assistant line. Persisted so the
+      // card can render the model from dispatch; the watcher later overwrites it
+      // from the worker's own transcript (transcript wins). Only a non-empty
+      // string is stored — never guess from config.
+      model: typeof input.model === 'string' && input.model.length > 0 ? input.model : null,
       now: Date.now(),
     },
     (err) => {

@@ -17,6 +17,7 @@ function makeSub(over: Partial<Subagent>): Subagent {
     result_summary: null,
     jsonl_agent_id: 'a37ad7639ae61476c',
     parent_agent_id: null,
+    model: null,
     ...over,
   }
 }
@@ -60,6 +61,16 @@ describe('resolveWorkerFeedDispatch (#2002 regression pin)', () => {
     // The gateway gates the feed on isBackground; a registry miss must not
     // flip a foreground turn into a background one.
     expect(resolveWorkerFeedDispatch(null, '').isBackground).toBe(false)
+  })
+
+  it('surfaces the persisted registry model as feedModel (first-paint fallback)', () => {
+    const sub = makeSub({ background: true, model: 'claude-opus-4-8' })
+    expect(resolveWorkerFeedDispatch(sub, 'sub-agent').feedModel).toBe('claude-opus-4-8')
+  })
+
+  it('feedModel is null when the row is missing or carries no model', () => {
+    expect(resolveWorkerFeedDispatch(null, 'sub-agent').feedModel).toBeNull()
+    expect(resolveWorkerFeedDispatch(makeSub({ model: null }), 'sub-agent').feedModel).toBeNull()
   })
 })
 

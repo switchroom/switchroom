@@ -86,6 +86,17 @@ describe('renderWorkerActivity', () => {
     expect(out).not.toContain('<code>')
   })
 
+  it('renders the friendly live model on the worker metrics line', () => {
+    const out = renderWorkerActivity(view({ model: 'claude-sonnet-5' }))
+    expect(out).toContain('_10s · 3 tools · sonnet 5_')
+  })
+
+  it('omits the model tag when the worker model is unknown', () => {
+    const out = renderWorkerActivity(view())
+    expect(out).toContain('_10s · 3 tools_')
+    expect(out).not.toContain('· sonnet')
+  })
+
   it('shows a "starting…" line when no step has run yet', () => {
     const out = renderWorkerActivity(view({ lastTool: null, latestSummary: '' }))
     expect(out).toContain('🛠 **Worker**')

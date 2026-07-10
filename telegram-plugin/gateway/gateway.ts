@@ -143,6 +143,7 @@ import {
 import { pickRecoveredPermissionOrigin } from './permission-card-origin.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
 import { appendActivityLabel, clipNarrative, renderActivityFeedWithNested, formatStepSuffix, type SessionActivityHeader } from '../tool-activity-summary.js'
+import { formatModelLabel } from '../model-label.js'
 import { runSilentTurnHeartbeatTick } from '../feed-heartbeat-climb.js'
 import { REPLY_TOOLS, isDraftOfReply } from '../narrative-dedup.js'
 import { toolLabel } from '../tool-labels.js'
@@ -2502,6 +2503,13 @@ type CurrentTurn = {
   // resume protocol uses this to decide "did the previous turn actually
   // finish a reply, or was it interrupted before commit?".
   lastAssistantDone: boolean
+  // Live model in use for THIS turn, sourced from the main transcript's
+  // `message.model` (the exact resolved model per API call) via the session-tail
+  // `model` event — never from config or launch-time state. Updated on change;
+  // undefined until the turn's first assistant line lands. Rendered onto the
+  // activity/liveness card header's metrics line (e.g. "2m · 14 tools · opus 4.8")
+  // and preferred by /status's buildAgentMetadata over the in-memory override.
+  currentModel?: string
   // Phase 1 of #332: count of tool_use events in the current turn, for
   // the tool_call_count column in the turns registry.
   toolCallCount: number
@@ -2627,6 +2635,23 @@ type CurrentTurn = {
 // is never written and this is exactly the old singleton.
 let currentTurn: CurrentTurn | null = null
 const currentTurnMap = new CurrentTurnMap<CurrentTurn>()
+// Last-seen MAIN-transcript model per session chat, sourced from the
+// `message.model` on each assistant line (session-tail `model` event). This is
+// the ground truth for "what model is the main agent actually running" — it
+// survives between turns (unlike `currentTurn`, nulled at turn end), so a
+// /status query landing in the idle gap still reflects the real model instead
+// of the launch-time / in-memory override. buildAgentMetadata prefers this over
+// the override when present. Bounded implicitly by the single-tenant chat set.
+const lastTranscriptModelByChat = new Map<string, string>()
+// Chat-agnostic most-recent main-transcript model — the fallback /status uses
+// (buildAgentMetadata has no chat context, and single-tenant agents have one
+// main session). Updated alongside the per-chat map.
+let lastMainTranscriptModel: string | null = null
+function rememberTranscriptModel(chatId: string | null | undefined, model: string): void {
+  lastMainTranscriptModel = model
+  if (chatId == null || chatId.length === 0) return
+  lastTranscriptModelByChat.set(chatId, model)
+}
 // Captures the most-recently-started turn's sessionChatId. Unlike currentTurn,
 // this is NOT cleared by the silence poke (firePoke/clearTurnStarted). It lets
 // the Bug B fallback in executeReply route to the correct chat even when the
@@ -12771,6 +12796,7 @@ function composeTurnActivity(turn: CurrentTurn, final = false, liveSuffix = ''):
     elapsedMs: turn.startedAt > 0 ? Date.now() - turn.startedAt : 0,
     toolCount: turn.labeledToolCount,
     state: final ? 'done' : 'running',
+    model: turn.currentModel,
   }
   return renderActivityFeedWithNested(turn.mirrorLines, childLines, final, liveSuffix, stepCount, header)
 }
@@ -13088,6 +13114,7 @@ function openLivenessFeedIfDue(turn: CurrentTurn): void {
   const lines = turn.mirrorLines.length > 0 ? turn.mirrorLines : ['Working…']
   const livenessHeader: SessionActivityHeader = {
     label: 'Agent', elapsedMs: age, toolCount: turn.labeledToolCount, state: 'running',
+    model: turn.currentModel,
   }
   // Liveness card is a single "step" whose start is the turn start, so `age`
   // IS the step's own elapsed. formatStepSuffix keeps the `→` line timer-free
@@ -13218,6 +13245,7 @@ function feedHeartbeatTick(): void {
     const age = Date.now() - turn.startedAt
     const livenessHeader: SessionActivityHeader = {
       label: 'Agent', elapsedMs: age, toolCount: turn.labeledToolCount, state: 'running',
+      model: turn.currentModel,
     }
     const lines = turn.mirrorLines.length > 0 ? turn.mirrorLines : ['Working in background…']
     // `subagentAt` is the worker's last ADVANCE — the current step's start —
@@ -13407,6 +13435,7 @@ function clearActivitySummary(turn: CurrentTurn, finalHtmlOverride?: string | nu
       const livenessElapsed = turn.startedAt > 0 ? Date.now() - turn.startedAt : 0
       const livenessHeader: SessionActivityHeader = {
         label: 'Agent', elapsedMs: livenessElapsed, toolCount: turn.labeledToolCount, state: 'done',
+        model: turn.currentModel,
       }
       finalHtml = renderActivityFeedWithNested(['Working…'], [], true, '', undefined, livenessHeader)
     }
@@ -13897,6 +13926,21 @@ function handleSessionEvent(ev: SessionEvent): void {
       return
     }
     case 'dequeue': return
+    case 'model': {
+      // Live model capture for the main turn. The session-tail projection
+      // already filtered sentinels (`<synthetic>` compaction lines), so any
+      // value reaching here is a real resolved model id. Record it on the turn
+      // (update-on-change) so the activity/liveness card header and /status
+      // render the model actually serving this turn's API calls — transcript-
+      // sourced, never config. Also mirror it onto the sessionModel override
+      // store so a /status query between turns still reflects the last model.
+      const turn = currentTurn
+      if (turn != null) {
+        turn.currentModel = ev.model
+        rememberTranscriptModel(turn.sessionChatId, ev.model)
+      }
+      return
+    }
     case 'thinking': {
       // #1067: snapshot the turn atom at handler entry. Even though this
       // handler is sync, the principle is uniform across all event arms
@@ -18499,7 +18543,16 @@ async function buildAgentMetadata(agentName: string): Promise<AgentMetadata> {
   return {
     agentName,
     model: a?.model ?? null,
-    sessionModel: activeSessionModelOverride,
+    // Prefer the LIVE model actually serving turns, read from the main
+    // transcript's `message.model` (the ground truth for what the session is
+    // running right now) and rendered in the same short friendly form the
+    // cards use. Fall back to the in-memory /model override (kept truthful +
+    // friendly by #2982) when no transcript model has been observed yet — a
+    // fresh boot before the first assistant line, or an sr-* relaunch window.
+    // Never sourced from config. Surgical per PR #2982 overlap.
+    sessionModel:
+      (lastMainTranscriptModel != null ? formatModelLabel(lastMainTranscriptModel) : null) ??
+      activeSessionModelOverride,
     extendsProfile: (a?.extends ?? a?.template) ?? null,
     topicName: a?.topic_name ?? null,
     topicEmoji: a?.topic_emoji ?? null,
@@ -27402,6 +27455,10 @@ void (async () => {
                       latestSummary: resultText,
                       elapsedMs: durationMs,
                       state: outcome === 'failed' ? 'failed' : 'done',
+                      // Persisted (registry) model — the last one the watcher
+                      // recorded from the worker's transcript — so the terminal
+                      // card keeps the model tag even with no live entry.
+                      model: dispatch.feedModel ?? undefined,
                     })
                     reconcileWorkerPin(agentId, null, false)
                   }
@@ -27479,6 +27536,7 @@ void (async () => {
                       latestSummary: resultText,
                       elapsedMs: durationMs,
                       state: outcome === 'failed' ? 'failed' : 'done',
+                      model: dispatch.feedModel ?? undefined,
                     })
                     // Status-pin: worker done — drop its pin.
                     reconcileWorkerPin(agentId, null, false)
@@ -27498,6 +27556,7 @@ void (async () => {
                     latestSummary: resultText,
                     elapsedMs: durationMs,
                     state: outcome === 'failed' ? 'failed' : 'done',
+                    model: dispatch.feedModel ?? undefined,
                   })
                   // Status-pin: worker done — drop its pin.
                   reconcileWorkerPin(agentId, null, false)
@@ -27584,7 +27643,7 @@ void (async () => {
               // suppresses stale-after-restart delivery (a 4-h-old
               // "still working (5m)" would be a lie). Sweep on handback
               // lives in the `onFinish` block just above.
-              onProgress: ({ agentId, description, latestSummary, elapsedMs, prevBucketIdx, setBucketIdx, lastTool, toolCount, progressLine }) => {
+              onProgress: ({ agentId, description, latestSummary, elapsedMs, prevBucketIdx, setBucketIdx, lastTool, toolCount, progressLine, model }) => {
                 let fleetChatId = ''
                 try {
                   const fleets = progressDriver?.peekAllFleets() ?? []
@@ -27618,6 +27677,13 @@ void (async () => {
                 // never grew past "starting…" (the frozen-card symptom). The
                 // foreground nest path below already used this precedence.
                 const stepLine = (progressLine != null && progressLine.length > 0) ? progressLine : latestSummary
+                // Live model for the worker card: prefer the transcript-sourced
+                // model on the entry (threaded via onProgress) and fall back to
+                // the dispatch-time model persisted on the registry row
+                // (tool_input.model) until the worker's first assistant line
+                // lands. Undefined when neither is known — the card omits it,
+                // never guessing from config.
+                const feedModel = model ?? dispatch.feedModel ?? undefined
                 if (!isBackground) {
                   // Model A — a foreground sub-agent runs inside the parent's
                   // turn, so its live narrative nests under the parent's
@@ -27657,6 +27723,7 @@ void (async () => {
                         latestSummary: stepLine,
                         elapsedMs,
                         state: 'running',
+                        model: feedModel,
                       },
                       wk.threadId,
                     )?.then(() => reconcileWorkerPin(agentId, wkChat, true))
@@ -27798,6 +27865,7 @@ void (async () => {
                       latestSummary: stepLine,
                       elapsedMs,
                       state: 'running',
+                      model: feedModel,
                     },
                     wk.threadId,
                   )?.then(() => reconcileWorkerPin(agentId, wkChat, true))

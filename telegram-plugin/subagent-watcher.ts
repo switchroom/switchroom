@@ -48,7 +48,7 @@ import { sanitiseToolArg } from './fleet-state.js'
 import { clipNarrative, describeToolUse } from './tool-activity-summary.js'
 import { REPLY_TOOLS, isDraftOfReply } from './narrative-dedup.js'
 import { truncate } from './card-format.js'
-import { bumpSubagentActivity, recordSubagentStall, recordSubagentResume, recordSubagentEnd, reapStuckRunningRows, countRunningBackgroundSubagents, recordNestedSubagentDispatch } from './registry/subagents-schema.js'
+import { bumpSubagentActivity, recordSubagentStall, recordSubagentResume, recordSubagentEnd, reapStuckRunningRows, countRunningBackgroundSubagents, recordNestedSubagentDispatch, recordSubagentModel } from './registry/subagents-schema.js'
 import { touchTurnActiveMarker } from './gateway/turn-active-marker.js'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -220,6 +220,17 @@ export interface WorkerEntry {
    * the row has been observed at least once.
    */
   background?: boolean
+  /**
+   * Live model this worker is running, as a raw resolved model id (e.g.
+   * `claude-opus-4-8`). Set from the worker's OWN transcript `message.model`
+   * (`sub_agent_model` event) — the authoritative live source — and persisted to
+   * the registry row on change (recordSubagentModel) so boot-replay / handback
+   * cards can render it without a live entry. Threaded onto the onProgress
+   * payload so the worker card's metrics line shows the model. Undefined until
+   * the worker's first assistant line lands; before that the card falls back to
+   * the dispatch-time `tool_input.model` persisted on the registry row.
+   */
+  currentModel?: string
 }
 
 export interface SubagentWatcherConfig {
@@ -462,6 +473,12 @@ export interface SubagentWatcherConfig {
      *  feed. Undefined on `sub_agent_text` ticks — the gateway falls back
      *  to `latestSummary` (the narrative line), preserving prior behavior. */
     progressLine?: string
+    /** Live model this worker is running (raw resolved id, e.g.
+     *  `claude-opus-4-8`), from `WorkerEntry.currentModel`. Threaded onto the
+     *  worker/nested card's metrics line. Undefined before the worker's first
+     *  assistant line — the gateway then falls back to the registry's
+     *  dispatch-time model. */
+    model?: string
   }) => void
   /** `Date.now` override for tests. */
   now?: () => number
@@ -874,6 +891,8 @@ export function readSubTail(
     /** Friendly display line for THIS tick (set on tool ticks; see the
      *  SubagentWatcherConfig.onProgress doc). */
     progressLine?: string
+    /** Live model this worker is running (see SubagentWatcherConfig.onProgress). */
+    model?: string
   }) => void,
 ): void {
   try {
@@ -1003,6 +1022,7 @@ export function readSubTail(
             },
             lastTool: entry.lastTool,
             toolCount: entry.toolCount,
+            model: entry.currentModel,
           })
           return true
         } catch (cbErr) {
@@ -1086,6 +1106,31 @@ export function readSubTail(
           }
           log?.(`subagent-watcher: stall cleared for ${entry.agentId} (activity resumed after ${idleSecBeforeBump}s — re-arming detection)`)
         }
+        if (ev.kind === 'sub_agent_model') {
+          // Live model capture for this worker. The projection already filtered
+          // sentinels, so `ev.model` is a real resolved id. Record it on the
+          // entry (transcript wins over the dispatch-time tool_input.model) and
+          // persist to the registry row on CHANGE — update-on-change like
+          // last_activity_at — so a boot-replay / handback card can render the
+          // model without a live entry. No card render here: the model rides the
+          // next onProgress tick's payload (below).
+          if (entry.currentModel !== ev.model) {
+            entry.currentModel = ev.model
+            if (db != null) {
+              try {
+                const rowRef = db
+                  .prepare('SELECT id FROM subagents WHERE jsonl_agent_id = ?')
+                  .get(entry.agentId) as { id: string } | null
+                if (rowRef != null) {
+                  recordSubagentModel(db, { id: rowRef.id, model: ev.model })
+                }
+              } catch (dbErr) {
+                log?.(`subagent-watcher: model DB write error ${entry.agentId}: ${(dbErr as Error).message}`)
+              }
+            }
+          }
+          continue
+        }
         if (ev.kind === 'sub_agent_tool_use') {
           // Narrative-dedup gate step 2: a sub_agent_text block was pending;
           // this tool is the lookahead that decides it (SHOW unless it drafts
@@ -1144,6 +1189,7 @@ export function readSubTail(
                   lastTool: entry.lastTool,
                   toolCount: entry.toolCount,
                   progressLine: toolLine,
+                  model: entry.currentModel,
                 })
               } catch (cbErr) {
                 log?.(`subagent-watcher: onProgress (tool) callback error ${entry.agentId}: ${(cbErr as Error).message}`)

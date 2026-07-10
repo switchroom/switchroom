@@ -116,6 +116,16 @@ export interface Subagent {
    * chain instead.
    */
   parent_agent_id: string | null
+  /**
+   * Live model the sub-agent is running, as a raw resolved model id (e.g.
+   * `claude-opus-4-8`, `sr-glm-5`). Seeded at dispatch from the Agent tool's
+   * `tool_input.model` (first-paint fallback, written by the pretool hook), then
+   * updated on change by the watcher from the worker's own transcript
+   * `message.model` (transcript wins). Persisted so boot-replay / handback cards
+   * can render the model even with no live watcher entry. NULL when never
+   * observed — the card omits the model rather than guessing from config.
+   */
+  model: string | null
 }
 
 export interface RecordSubagentStartArgs {
@@ -207,7 +217,8 @@ const SUBAGENTS_SCHEMA_SQL = `
     status            TEXT    NOT NULL,
     result_summary    TEXT,
     jsonl_agent_id    TEXT,
-    parent_agent_id   TEXT
+    parent_agent_id   TEXT,
+    model             TEXT
   );
   CREATE INDEX IF NOT EXISTS subagents_turn      ON subagents(parent_turn_key);
   CREATE INDEX IF NOT EXISTS subagents_status    ON subagents(status);
@@ -239,6 +250,12 @@ export function applySubagentsSchema(db: SqliteDatabase): void {
   const hasParentAgentId = cols.some((c) => c.name === 'parent_agent_id')
   if (!hasParentAgentId) {
     db.exec('ALTER TABLE subagents ADD COLUMN parent_agent_id TEXT')
+  }
+  // Idempotent migration for DBs created before the live-model column existed
+  // (progress-card live model — see the Subagent.model doc).
+  const hasModel = cols.some((c) => c.name === 'model')
+  if (!hasModel) {
+    db.exec('ALTER TABLE subagents ADD COLUMN model TEXT')
   }
   // Always (re-)apply the index. `IF NOT EXISTS` makes this a no-op when it
   // already exists. Splitting it from SUBAGENTS_SCHEMA_SQL is what fixes the
@@ -316,6 +333,7 @@ interface RawSubagentRow {
   result_summary: string | null
   jsonl_agent_id: string | null
   parent_agent_id?: string | null
+  model?: string | null
 }
 
 function mapSubagentRow(row: RawSubagentRow): Subagent {
@@ -333,6 +351,7 @@ function mapSubagentRow(row: RawSubagentRow): Subagent {
     result_summary: row.result_summary,
     jsonl_agent_id: row.jsonl_agent_id,
     parent_agent_id: row.parent_agent_id ?? null,
+    model: row.model ?? null,
   }
 }
 
@@ -564,6 +583,29 @@ export function bumpSubagentActivity(db: SqliteDatabase, args: BumpSubagentActiv
     SET last_activity_at = ?
     WHERE id = ?
   `).run(args.ts, args.id)
+}
+
+export interface RecordSubagentModelArgs {
+  id: string
+  /** Raw resolved model id (e.g. `claude-opus-4-8`). Callers pass only
+   *  non-sentinel, non-empty values — the watcher filters at the projection. */
+  model: string
+}
+
+/**
+ * Persist the live model on a subagent row (update-on-change, like
+ * last_activity_at). Written by the watcher whenever it observes a NEW model on
+ * the worker's transcript, so a later boot-replay / handback card renders the
+ * model even with no live in-memory entry. Unconditional UPDATE by `id`; no-ops
+ * gracefully if the row is not found. Idempotent — the caller only calls it on
+ * an actual change, but a repeat write is harmless.
+ */
+export function recordSubagentModel(db: SqliteDatabase, args: RecordSubagentModelArgs): void {
+  db.prepare(`
+    UPDATE subagents
+    SET model = ?
+    WHERE id = ?
+  `).run(args.model, args.id)
 }
 
 /**
