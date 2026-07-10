@@ -27,15 +27,12 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
-// Partial mock of node:fs so individual tests can force a `writeFileSync`
-// failure (disk full / permissions / read-only fs) without needing real
-// filesystem faults (we run as root in CI/containers, so chmod-based
-// permission tricks don't reliably fail). `readFileSync`/other exports
-// stay real via `importOriginal`.
-vi.mock('node:fs', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('node:fs')>()
-  return { ...actual, writeFileSync: vi.fn(actual.writeFileSync) }
-})
+// Tests that need to force a `writeFileSync` failure (disk full /
+// permissions / read-only fs) pass one in via `createAlwaysAllowPersistQueue`'s
+// injectable `writeFileSyncFn` param (see `makeControllableWrite` below)
+// rather than mocking `node:fs` — we run as root in CI/containers, so
+// chmod-based permission tricks don't reliably fail, and bun's test runner
+// doesn't support mocking node:fs built-ins.
 
 import {
   createAlwaysAllowPersistQueue,
@@ -267,32 +264,50 @@ describe('createAlwaysAllowPersistQueue — concurrency (#2973 adversarial revie
   })
 })
 
+/** A `writeFileSync`-shaped fn that runs the real node:fs implementation
+ * unless armed via `failNext()` (throws once, then reverts to real writes)
+ * or `failAlways()` (throws on every call from here on) — lets a test force
+ * writes to fail while everything before/after actually lands on disk. */
+function makeControllableWrite() {
+  let armedMessage: string | null = null
+  let alwaysFail = false
+  const fn = ((...args: Parameters<typeof writeFileSync>) => {
+    if (alwaysFail) throw new Error(armedMessage ?? 'forced write failure')
+    if (armedMessage !== null) {
+      const message = armedMessage
+      armedMessage = null
+      throw new Error(message)
+    }
+    return writeFileSync(...args)
+  }) as typeof writeFileSync
+  return {
+    fn,
+    failNext: (message: string) => { armedMessage = message },
+    failAlways: (message: string) => { armedMessage = message; alwaysFail = true },
+  }
+}
+
 describe('createAlwaysAllowPersistQueue — write failures propagate (#2973 adversarial review pt.2)', () => {
   let dir: string
   beforeEach(() => { dir = makeTmpDir() })
-  afterEach(() => {
-    vi.restoreAllMocks()
-    rmSync(dir, { recursive: true, force: true })
-  })
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
 
   it('enqueue() rejects when the underlying writeFileSync throws (disk full / permissions)', async () => {
-    const q = createAlwaysAllowPersistQueue(dir)
-    vi.mocked(writeFileSync).mockImplementationOnce(() => {
-      throw new Error('ENOSPC: no space left on device')
-    })
+    const write = makeControllableWrite()
+    const q = createAlwaysAllowPersistQueue(dir, write.fn)
+    write.failNext('ENOSPC: no space left on device')
     await expect(q.enqueue(baseArgs())).rejects.toThrow(/ENOSPC/)
     // The caller was told it failed — and indeed nothing was persisted.
     expect(q.listAll()).toEqual([])
   })
 
   it('recordAttempt() rejects when the underlying writeFileSync throws, and does not pretend the state change landed', async () => {
-    const q = createAlwaysAllowPersistQueue(dir)
+    const write = makeControllableWrite()
+    const q = createAlwaysAllowPersistQueue(dir, write.fn)
     await q.enqueue(baseArgs())
     const id = q.listAll()[0].id
 
-    vi.mocked(writeFileSync).mockImplementationOnce(() => {
-      throw new Error('EACCES: permission denied')
-    })
+    write.failNext('EACCES: permission denied')
     await expect(q.recordAttempt(id, { success: true })).rejects.toThrow(/EACCES/)
 
     // The entry is still there — the (failed) dequeue never actually
@@ -302,23 +317,21 @@ describe('createAlwaysAllowPersistQueue — write failures propagate (#2973 adve
   })
 
   it('remove() rejects when the underlying writeFileSync throws', async () => {
-    const q = createAlwaysAllowPersistQueue(dir)
+    const write = makeControllableWrite()
+    const q = createAlwaysAllowPersistQueue(dir, write.fn)
     await q.enqueue(baseArgs())
     const id = q.listAll()[0].id
 
-    vi.mocked(writeFileSync).mockImplementationOnce(() => {
-      throw new Error('EROFS: read-only file system')
-    })
+    write.failNext('EROFS: read-only file system')
     await expect(q.remove(id)).rejects.toThrow(/EROFS/)
 
     expect(q.listAll()).toHaveLength(1)
   })
 
   it('a write failure does not wedge the in-process lock — a later successful call still lands', async () => {
-    const q = createAlwaysAllowPersistQueue(dir)
-    vi.mocked(writeFileSync).mockImplementationOnce(() => {
-      throw new Error('ENOSPC: no space left on device')
-    })
+    const write = makeControllableWrite()
+    const q = createAlwaysAllowPersistQueue(dir, write.fn)
+    write.failNext('ENOSPC: no space left on device')
     await expect(q.enqueue(baseArgs({ error: 'first' }))).rejects.toThrow(/ENOSPC/)
 
     // Disk recovered — the NEXT call (real writeFileSync) must succeed,
@@ -490,7 +503,8 @@ describe('drainAlwaysAllowPersistQueue', () => {
   })
 
   it('a drain-time write failure on recordAttempt does not crash the pass and other due entries still get processed', async () => {
-    const q = createAlwaysAllowPersistQueue(dir)
+    const write = makeControllableWrite()
+    const q = createAlwaysAllowPersistQueue(dir, write.fn)
     await q.enqueue(baseArgs({ agentName: 'clerk', rule: 'Skill(calendar)' }))
     await q.enqueue(baseArgs({ agentName: 'clerk', rule: 'Skill(email)' }))
     const dispatchConfigEdit = vi.fn(async () => ({ ok: true as const }))
@@ -499,9 +513,7 @@ describe('drainAlwaysAllowPersistQueue', () => {
     // Both entries' recordAttempt writes fail — the drain pass must
     // swallow that (log it) rather than throwing out of
     // drainAlwaysAllowPersistQueue and abandoning remaining entries.
-    vi.mocked(writeFileSync).mockImplementation(() => {
-      throw new Error('EIO: i/o error')
-    })
+    write.failAlways('EIO: i/o error')
 
     vi.useFakeTimers()
     vi.advanceTimersByTime(BASE_BACKOFF_MS + 1000)

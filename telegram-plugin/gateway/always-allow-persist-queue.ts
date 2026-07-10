@@ -161,7 +161,14 @@ export function computeBackoffMs(attempts: number, retryAfterMs?: number): numbe
   return exp
 }
 
-export function createAlwaysAllowPersistQueue(stateDir: string): AlwaysAllowPersistQueue {
+export function createAlwaysAllowPersistQueue(
+  stateDir: string,
+  /** Injectable for tests to force a write failure (disk full / permissions /
+   * read-only fs) without real filesystem faults — we run as root in CI/
+   * containers, so chmod-based permission tricks don't reliably fail, and
+   * bun's test runner doesn't support mocking node:fs built-ins. */
+  writeFileSyncFn: typeof writeFileSync = writeFileSync,
+): AlwaysAllowPersistQueue {
   const filePath = join(stateDir, 'always-allow-persist-queue.json')
 
   // ── In-process mutex ──────────────────────────────────────────────────
@@ -200,7 +207,7 @@ export function createAlwaysAllowPersistQueue(stateDir: string): AlwaysAllowPers
    * not actually land on disk (disk full, permissions, etc.) instead of
    * silently proceeding as if it had. */
   function write(f: FileShape): void {
-    writeFileSync(filePath, JSON.stringify(f), { encoding: 'utf-8', mode: 0o600 })
+    writeFileSyncFn(filePath, JSON.stringify(f), { encoding: 'utf-8', mode: 0o600 })
   }
 
   return {
