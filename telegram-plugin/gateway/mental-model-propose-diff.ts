@@ -28,23 +28,37 @@ import { parseDocument } from "yaml";
 import { generateUnifiedDiff } from "../../src/web/config-diff.js";
 
 /**
- * Decode the canonical six HTML/XML entities to their literal characters —
- * the write-boundary half of the #2976 fix.
+ * Decode the canonical six HTML/XML entities to their literal characters — the
+ * config-write-boundary layer of the #2976 defense-in-depth.
  *
- * The failure it kills: a model copies HTML-escaped entities out of its own
- * (Telegram-HTML-rendered) context into a mental-model `name` / `source_query`,
- * and nothing decodes them before they persist. The result is a bank with a
- * model literally named `Nutrition Protocol &amp; Deficit Status`, or a
- * reflection query that steers recall on `R&amp;D` instead of `R&D` — a
- * durable, silent corruption of a memory-integrity field. Normalizing here, at
- * the switchroom-owned write boundary that feeds the persisted config, means an
- * escaped name/query can never LAND in `memory.mental_models[]`.
+ * SCOPE / reachability (be honest about which half is load-bearing):
+ *   - `source_query` decode is the REACHABLE half. A model can copy escaped
+ *     entities out of its Telegram-HTML-rendered context into a proposal's
+ *     free-form `source_query`, and undecoded it would steer recall on `R&amp;D`
+ *     instead of `R&D` — a durable, silent corruption of a memory-integrity
+ *     field. Normalizing here means an escaped query can never LAND in
+ *     `memory.mental_models[]`.
+ *   - `name` decode is REDUNDANT belt-and-suspenders. The `mental_model_propose`
+ *     gateway tool already slug-validates `name` against
+ *     /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/ BEFORE this runs, so an entity-bearing
+ *     name is rejected upstream and can't reach here. It's kept only so this
+ *     write boundary is self-contained if that gate ever moves.
+ *   - The observed in-NAME corruption (`Nutrition Protocol &amp; Deficit Status`,
+ *     klanker 2026-07-06) actually arrived via the DIRECT `create_mental_model`
+ *     Hindsight tool (`ensureMentalModel`, undecoded), NOT this propose path.
+ *     That vector is OUT OF SCOPE here — covered by the steering.ts context-
+ *     hygiene + in-service `Dockerfile.hindsight` normalization follow-ups.
  *
  * SINGLE PASS by design (matches issue #2976's success criteria): a
  * double-escaped `R&amp;amp;D` decodes ONE layer to `R&amp;D`, not all the way
  * to `R&D` — we only undo the escaping switchroom itself applied when it
  * rendered the model's prior output, never the user's literal intent. `&amp;`
  * is decoded LAST so `&amp;lt;` collapses to `&lt;` (one layer), not `<`.
+ *
+ * Accepted tradeoff: a `source_query` a human genuinely intended to contain a
+ * literal `&amp;` / `&lt;` / etc. (rare — a reflection question, not markup)
+ * will have that one layer decoded. Steering queries reading as escaped HTML is
+ * the far more common and more harmful case, so we optimize for it.
  */
 export function decodeCanonicalEntities(s: string): string {
   return s
@@ -169,9 +183,11 @@ export function buildMentalModelAppendDiff(args: {
 
   // #2976 write-boundary normalization: decode any HTML/XML entities the model
   // may have copied out of its own escaped context so the LITERAL characters
-  // land in config — never `&amp;` / `&lt;` etc. Applied to both the identity
-  // key (`name`, also the idempotent-ensure key) and the recall-steering
-  // `source_query`. Duplicate-name guard runs on the decoded name below.
+  // land in config — never `&amp;` / `&lt;` etc. The load-bearing target is the
+  // free-form `source_query`; the `name` decode is redundant with the gateway
+  // slug gate (an entity-bearing name is rejected upstream) and kept only so
+  // this boundary is self-contained. Duplicate-name guard runs on the decoded
+  // name above.
   const name = decodedName;
   const source_query = decodeCanonicalEntities(spec.source_query);
 

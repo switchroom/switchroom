@@ -1,18 +1,27 @@
 /**
- * Regression coverage for #2976 — HTML-entity corruption in mental-model names.
+ * Regression coverage for #2976 — HTML-entity corruption in mental-model
+ * fields, config-write-boundary layer.
  *
- * A model copies HTML-escaped entities out of its own (Telegram-HTML-rendered)
- * context into a `create_mental_model` / propose call, and nothing decoded them
- * before they persisted — so banks ended up with models literally named
- * `Nutrition Protocol &amp; Deficit Status` and reflection queries steering on
- * `R&amp;D` instead of `R&D` (observed live, klanker 2026-07-06).
+ * Reachability (stated plainly so these tests don't over-claim):
+ *   - `source_query` decode is the REACHABLE/load-bearing half: a proposal's
+ *     free-form query can carry escaped entities the model copied out of its
+ *     Telegram-HTML context, and undecoded it steers recall on `R&amp;D`
+ *     instead of `R&D`.
+ *   - `name` decode is REDUNDANT with the gateway slug gate
+ *     (/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/ rejects an entity-bearing name before
+ *     `buildMentalModelAppendDiff` ever runs). It's belt-and-suspenders; the
+ *     name-path tests here exercise the boundary directly (bypassing the gate)
+ *     to prove the normalization, NOT to imply the propose path could carry the
+ *     bug.
+ *   - The observed in-NAME corruption (`Nutrition Protocol &amp; Deficit
+ *     Status`, klanker 2026-07-06) actually arrived via the DIRECT
+ *     `create_mental_model` Hindsight tool, which this PR does not touch — that
+ *     vector is out of scope (steering.ts / Dockerfile.hindsight follow-ups).
  *
- * These tests pin the switchroom-owned WRITE-BOUNDARY normalization: the
- * proposed name + source_query are decoded to their literal characters BEFORE
- * they are synthesized into the config diff, so an escaped value can never land
- * in `memory.mental_models[]`. Each assertion below FAILS against the pre-fix
- * code (which serialized `spec.name` / `spec.source_query` verbatim) and passes
- * after.
+ * These tests pin the switchroom-owned WRITE-BOUNDARY normalization: name +
+ * source_query are decoded to their literal characters BEFORE synthesis into
+ * the config diff. Each assertion below FAILS against the pre-fix code (which
+ * serialized `spec.name` / `spec.source_query` verbatim) and passes after.
  */
 
 import { describe, it, expect } from "vitest";
