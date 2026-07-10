@@ -375,10 +375,21 @@ import {
   MODEL_CALLBACK_PAGE_EXTERNAL,
   MODEL_CALLBACK_PAGE_MAIN,
   srFriendlyLabel,
+  expandSrAlias,
+  isSrModel,
   type ModelMenuDeps,
   type ModelCommandDeps,
   type ModelMenuReply,
 } from './model-command.js'
+import {
+  writeSessionModelFile,
+  readSessionModelFileRaw,
+  restoreSessionModelFileRaw,
+  clearSessionModelFile,
+  readConfiguredDefaultModel,
+  writeRelaunchModelIntent,
+  intentForRestartReason,
+} from './session-model-file.js'
 import { discoverModels, selectModel } from '../../src/agents/model-picker.js'
 import { resolveMainModel } from '../../src/agents/scaffold.js'
 import {
@@ -908,6 +919,16 @@ function triggerSelfRestart(
       )
       return false
     }
+    // Session-model stickiness (reference/rfcs/session-model-stickiness.md):
+    // boot default is REVERT, so every switchroom-managed bounce must stamp
+    // its intent BEFORE the SIGTERM is even scheduled (write-before-kill
+    // invariant — pinned by gateway-session-model-relaunch.test.ts). The
+    // per-reason table classifies recovery/model-switch bounces as "keep"
+    // and the deliberate inline restart button as "revert".
+    {
+      const smDir = resolveAgentDirFromEnv()
+      if (smDir) writeRelaunchModelIntent(smDir, intentForRestartReason(reason), reason)
+    }
     process.stderr.write(
       `telegram gateway: restart-via-SIGTERM-PID1 agent=${targetAgent} reason=${reason} (docker)\n`,
     )
@@ -919,6 +940,10 @@ function triggerSelfRestart(
     return true
   }
   // Legacy systemd path.
+  if (targetAgent === selfAgent) {
+    const smDir = resolveAgentDirFromEnv()
+    if (smDir) writeRelaunchModelIntent(smDir, intentForRestartReason(reason), reason)
+  }
   process.stderr.write(
     `telegram gateway: restart-via-systemctl agent=${targetAgent} reason=${reason}\n`,
   )
@@ -19527,6 +19552,15 @@ function buildModelDeps(restartCtx?: ModelDepsRestartContext): ModelMenuDeps & M
         })
       }
       stampUserRestartReason(reason)
+      // Model-switch restarts are switchroom-managed relaunches: the session
+      // override (written by the caller before this dispatch) must survive
+      // the bounce, so stamp keep-intent BEFORE dispatch (boot default is
+      // revert). hostd shells through `switchroom agent restart`, which
+      // deliberately writes no intent of its own.
+      {
+        const smDir = resolveAgentDirFromEnv()
+        if (smDir) writeRelaunchModelIntent(smDir, 'keep', reason)
+      }
       await sweepBeforeSelfRestart()
       const hostdResp = await tryHostdDispatch(name, {
         v: 1,
@@ -19555,33 +19589,38 @@ function buildModelDeps(restartCtx?: ModelDepsRestartContext): ModelMenuDeps & M
       }
     },
     /**
-     * Session-only switch TO an sr-* (LiteLLM/OpenRouter) model. claude's
-     * native `/model` picker rejects unknown sr-* ids, so we can't inject.
-     * Write the token to the `.session-model-override` carrier file (start.sh
-     * consumes it on the next boot and launches `claude --model <token>`), set
-     * the in-memory session-model so /status stays honest across the restart
-     * window, then run the SAME restart dispatch as scheduleRestart above.
+     * Switch TO a model that needs a relaunch (sr-* LiteLLM/OpenRouter ids,
+     * which claude's native `/model` picker rejects, and the sr-to-claude
+     * direction). Write the DURABLE `.session-model` override (start.sh
+     * applies it on every keep-relaunch boot and launches `claude --model
+     * <token>`), set the in-memory session-model so /status stays honest
+     * across the restart window, then run the SAME restart dispatch as
+     * scheduleRestart above — which stamps the keep-intent this boot needs.
      */
     scheduleModelRelaunch: async (model: string, reason: string) => {
       const agentDir = resolveAgentDirFromEnv()
-      if (!agentDir) throw new Error('agent dir unresolvable — cannot write session-model carrier')
-      // Carrier: single line, token + newline, no quoting (start.sh strips
-      // whitespace and shape-gates). One-shot — consumed on the next boot.
+      if (!agentDir) throw new Error('agent dir unresolvable — cannot write session-model file')
       const prevOverride = sessionModelSource.getOverride()
-      writeFileSync(join(agentDir, '.session-model-override'), `${model}\n`, 'utf8')
+      const prevFileRaw = readSessionModelFileRaw(agentDir)
+      writeSessionModelFile(
+        agentDir,
+        model,
+        readConfiguredDefaultModel(agentDir) ??
+          resolveMainModel(deps.getConfiguredModel() ?? undefined),
+      )
       sessionModelSource.setOverride(model)
       try {
         await deps.scheduleRestart(reason)
       } catch (err) {
-        const carrierPath = join(agentDir, '.session-model-override')
-        // A restart already in flight OWNS the carrier we just wrote — it will
-        // consume our token at boot, so the switch is queued, not lost: keep the
-        // carrier + override and let the caller tell the operator "~15s". Any
-        // OTHER dispatch failure means no restart is coming, so roll BOTH back —
-        // a lingering carrier/override would lie to /status and mis-launch the
-        // NEXT ordinary restart.
+        // A restart already in flight OWNS the override we just wrote — its
+        // boot (stamped keep by the in-flight path's own intent, last-writer-
+        // wins) will apply our token, so the switch is queued, not lost: keep
+        // the file + override and let the caller tell the operator "~15s".
+        // Any OTHER dispatch failure means no restart is coming, so roll BOTH
+        // back — a lingering file/override would lie to /status and
+        // mis-launch the NEXT relaunch.
         if ((err as { code?: string })?.code !== 'restart_in_flight') {
-          try { rmSync(carrierPath, { force: true }) } catch { /* best-effort */ }
+          restoreSessionModelFileRaw(agentDir, prevFileRaw)
           sessionModelSource.setOverride(prevOverride)
         }
         throw err
@@ -19621,7 +19660,37 @@ bot.command('model', async ctx => {
   // override inside scheduleModelRelaunch, and an unverified switch carries no
   // selectedModel so /status is never lied to.
   if (reply.selectedModel) {
-    sessionModelSource.setOverride(reply.selectedModel)
+    const requested = parsed.kind === 'set' ? expandSrAlias(parsed.model) : null
+    if (requested?.toLowerCase() === 'default') {
+      // `/model default` clears the sticky override (the native inject above
+      // already realigned claude's own saved default, keeping the live
+      // process truthful). Clear both the durable file and the in-memory
+      // override — the session is back on the configured default.
+      sessionModelSource.setOverride(null)
+      const smDir = resolveAgentDirFromEnv()
+      if (smDir) clearSessionModelFile(smDir)
+    } else {
+      sessionModelSource.setOverride(reply.selectedModel)
+      // Durable stickiness: persist the REQUESTED canonical token — never
+      // the confirmation's display label ("Opus 4.8"), which `claude
+      // --model` would reject on the next boot. sr-* switches never reach
+      // here (they go through scheduleModelRelaunch, which persists).
+      const smDir = resolveAgentDirFromEnv()
+      if (smDir && requested && isValidModelArg(requested) && !isSrModel(requested)) {
+        try {
+          writeSessionModelFile(
+            smDir,
+            requested,
+            readConfiguredDefaultModel(smDir) ??
+              resolveMainModel(deps.getConfiguredModel() ?? undefined),
+          )
+        } catch (err) {
+          process.stderr.write(
+            `telegram gateway: session-model persist failed (typed /model): ${(err as Error)?.message ?? String(err)}\n`,
+          )
+        }
+      }
+    }
   }
   await switchroomReply(ctx, reply.text, { html: reply.html })
 })
@@ -19734,6 +19803,13 @@ bot.command('restart', async ctx => {
     // greeting card shows "Restarted  user: /restart from chat" instead
     // of whatever reason the downstream CLI would default to.
     stampUserRestartReason('user: /restart from chat')
+    // /restart is a DELIBERATE restart: the session model reverts to the
+    // configured default. Absence of intent would revert anyway (boot
+    // default) — the explicit stamp is reason-honesty for the boot notice.
+    {
+      const smDir = resolveAgentDirFromEnv()
+      if (smDir) writeRelaunchModelIntent(smDir, 'revert', 'user: /restart from chat')
+    }
     await sweepBeforeSelfRestart()
     const hostdResp = await tryHostdDispatch(getMyAgentName(), {
       v: 1,
@@ -19892,6 +19968,12 @@ async function handleNewCommand(ctx: Context): Promise<void> {
   // Stamp user attribution so the next greeting shows "Restarted  user:
   // /new" / "user: /reset" rather than the downstream CLI default.
   stampUserRestartReason(`user: /${kind} from chat`)
+  // /new and /reset start a fresh CONVERSATION, not a fresh model choice:
+  // the sticky session-model override KEEPS across them (contract row 7).
+  // Boot default is revert, so the keep-intent must land before dispatch.
+  if (agentDir != null) {
+    writeRelaunchModelIntent(agentDir, 'keep', `user: /${kind} from chat`)
+  }
   await sweepBeforeSelfRestart()
   const hostdResp = await tryHostdDispatch(getMyAgentName(), {
     v: 1,
@@ -24727,7 +24809,7 @@ bot.on('callback_query:data', async ctx => {
     // sr-* TARGET tap: switch TO a non-Claude (LiteLLM/OpenRouter) model.
     // Parity with the text `/model sr-*` path — claude's native picker rejects
     // unknown sr-* ids, so an in-place inject can't set them. Carry the token
-    // across a graceful restart (the `.session-model-override` carrier) and
+    // across a graceful restart (the durable `.session-model` override) and
     // relaunch `claude --model sr-*`. Session-only; reverts to the configured
     // default on the next restart. The sr-* → Claude direction is handled below
     // via the SELECT/alias outcome + isSrToClaudeTransition.
@@ -24763,10 +24845,31 @@ bot.on('callback_query:data', async ctx => {
       const prevSessionModel = sessionModelSource.getOverride()
       const outcome = await handleModelMenuCallback(data, modelDeps)
       // Record a successful session switch so /status reflects what's
-      // actually running. In-memory only → clears when the gateway (and thus
-      // claude's session) restarts, exactly matching the session-only scope.
+      // actually running, and persist the STICKY override
+      // (reference/rfcs/session-model-stickiness.md): the canonical token
+      // (never the display label) goes to the durable `.session-model`; a
+      // confirmed "Default (recommended)" selection clears it instead.
       if (outcome.selectedModel) {
         sessionModelSource.setOverride(outcome.selectedModel)
+        const smDir = resolveAgentDirFromEnv()
+        if (smDir && outcome.selectedModelToken) {
+          try {
+            writeSessionModelFile(
+              smDir,
+              outcome.selectedModelToken,
+              readConfiguredDefaultModel(smDir) ??
+                resolveMainModel(modelDeps.getConfiguredModel() ?? undefined),
+            )
+          } catch (err) {
+            process.stderr.write(
+              `telegram gateway: session-model persist failed (menu): ${(err as Error)?.message ?? String(err)}\n`,
+            )
+          }
+        }
+      }
+      if (outcome.clearedDefault) {
+        const smDir = resolveAgentDirFromEnv()
+        if (smDir) clearSessionModelFile(smDir)
       }
       // toastOnly: leave the menu untouched — but only if we haven't already
       // cleared its buttons with the interim sr-* edit. If we have, fall
@@ -24789,22 +24892,33 @@ bot.on('callback_query:data', async ctx => {
           )
           .catch(() => {})
         // Carry the requested Claude model across the restart via the SAME
-        // `.session-model-override` carrier a Claude → sr-* switch uses — otherwise
-        // boot launches the CONFIGURED default and the tapped model is silently
-        // dropped. `selectedModelToken` is a real `claude --model` token (alias or
-        // full claude-* id); a "Default"-row tap yields no token → boot the
-        // configured default (correct). start.sh's LiteLLM-down guard only drops
-        // sr-* overrides, so a Claude token is never dropped.
+        // durable `.session-model` override a Claude → sr-* switch uses —
+        // otherwise boot launches the CONFIGURED default and the tapped model
+        // is silently dropped. `selectedModelToken` is a real `claude --model`
+        // token (alias or full claude-* id); a "Default"-row tap yields no
+        // token → clear the override and boot the configured default
+        // (correct). start.sh's LiteLLM-down guard only skips sr-* overrides,
+        // so a Claude token is never dropped.
         {
           const agentDir = resolveAgentDirFromEnv()
           const token = outcome.selectedModelToken
           if (agentDir && token) {
             try {
-              writeFileSync(join(agentDir, '.session-model-override'), `${token}\n`, 'utf8')
+              writeSessionModelFile(
+                agentDir,
+                token,
+                readConfiguredDefaultModel(agentDir) ??
+                  resolveMainModel(modelDeps.getConfiguredModel() ?? undefined),
+              )
               sessionModelSource.setOverride(token)
             } catch (e) {
-              process.stderr.write(`telegram gateway: sr-to-claude carrier write failed: ${(e as Error)?.message ?? String(e)}\n`)
+              process.stderr.write(`telegram gateway: sr-to-claude session-model write failed: ${(e as Error)?.message ?? String(e)}\n`)
             }
+          } else if (agentDir) {
+            // Default-row tap while on sr-*: the restart must land on the
+            // configured default — a stale sticky override would resurrect
+            // the old model on the next keep-relaunch.
+            clearSessionModelFile(agentDir)
           }
         }
         // Write the restart marker so the post-restart boot card edits into this chat.

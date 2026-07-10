@@ -201,7 +201,7 @@ describe("handleModelCommand — set", () => {
     const reply = await handleModelCommand({ kind: "set", model: "opus" }, deps);
     expect(calls).toEqual([{ agent: "klanker", command: "/model opus" }]);
     expect(reply.text).toContain("<pre>⏺ Set model to sonnet</pre>");
-    expect(reply.text).toContain("Session-only");
+    expect(reply.text).toContain("Sticky across switchroom-managed relaunches");
     expect(reply.html).toBe(true);
     // A verified confirmation records the live model so /status stays honest
     // (bug 1: the typed path never recorded the switch before).
@@ -444,7 +444,7 @@ describe("handleModelCommand — busy gate + honest unverified reporting", () =>
     const reply = await handleModelCommand({ kind: "set", model: "claude-bogus" }, deps);
     expect(reply.text).toContain("did not take");
     expect(reply.text).toContain("Model not found");
-    expect(reply.text).not.toContain("Session-only");
+    expect(reply.text).not.toContain("Sticky across switchroom-managed relaunches");
     expect(reply.selectedModel).toBeUndefined();
   });
 
