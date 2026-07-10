@@ -308,6 +308,13 @@ export async function runActivityCardBootReaper(args: {
             { ...record, finalizeAttempted: true, unpinAttempts: attempts },
             log,
           )
+        } else {
+          log(
+            `activity-card-store: boot reaper FORFEITING card unpin after ` +
+              `${attempts} failed attempts ` +
+              `(chat=${record.chatId} msg=${record.activityMessageId}) — ` +
+              `will not retry again\n`,
+          )
         }
       }
     }

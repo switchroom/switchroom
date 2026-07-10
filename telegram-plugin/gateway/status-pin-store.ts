@@ -258,6 +258,13 @@ export async function runStatusPinBootCleanup(args: {
         // orphan permanently (retry-safe boot sweep, #3001).
         next.push({ ...pin, attempts })
         retained++
+      } else {
+        log(
+          `status-pin-store: boot cleanup FORFEITING pin after ` +
+            `${attempts} failed unpin attempts ` +
+            `(key=${pin.pinKey} chat=${pin.chatId} msg=${pin.messageId}) — ` +
+            `will not retry again\n`,
+        )
       }
     }
   }

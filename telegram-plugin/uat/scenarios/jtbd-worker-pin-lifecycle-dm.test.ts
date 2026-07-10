@@ -164,12 +164,25 @@ describe("uat: worker-pin lifecycle + restart rule (#3001, DM)", () => {
         await sc.sendDM(bgDispatchPrompt(30));
         await sc.expectMessage(/.+/, { from: "bot", timeout: 45_000 });
 
-        const pinned = await nextPinEvent(
-          pinIter,
-          (p) => p.pinned,
-          90_000,
-          "worker pin",
-        );
+        // Latch onto the 🛠 Worker feed pin specifically — the parent turn's
+        // own fg: status pin can land first, and a bare `p.pinned` predicate
+        // would seize it and then wait on the wrong messageId's unpin. Keep
+        // consuming pin events until one resolves to a worker-feed message
+        // (AC-1's sanity fetch, applied inside the wait loop).
+        const pinDeadline = Date.now() + 90_000;
+        let pinned: ObservedPin | null = null;
+        while (pinned == null) {
+          const candidate = await nextPinEvent(
+            pinIter,
+            (p) => p.pinned,
+            Math.max(1, pinDeadline - Date.now()),
+            "worker-feed pin",
+          );
+          const msg = await sc.driver
+            .getMessage(sc.botUserId, candidate.messageId)
+            .catch(() => null);
+          if (msg != null && WORKER_FEED_RE.test(msg.text)) pinned = candidate;
+        }
 
         // Force the restart MID-dispatch: the wk: claim is persisted in
         // status-pins.json; the dying session never runs its completion

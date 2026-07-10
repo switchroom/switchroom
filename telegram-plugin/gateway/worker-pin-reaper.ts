@@ -22,13 +22,16 @@
  *   - `terminal` — the registry says the worker reached a terminal status
  *     (completed | failed): its work is finished, the pin must go, however
  *     young it is. (A missed onFinish is exactly this case.)
- *   - `ttl` — the pin has been held past `ttlMs`. Secondary guard for a
- *     worker whose registry row never linked / never terminalises (`stalled`
- *     rows fall back to this gate rather than being treated as terminal — a
- *     stalled worker may still recover and repin naturally).
+ *   - `ttl` — the pin has been held past `ttlMs` AND the registry cannot
+ *     vouch for the worker (no row / never linked / `stalled` / lookup
+ *     error). A registry-confirmed RUNNING row exempts the pin from the TTL
+ *     entirely: a healthy 7h worker keeps its pin for the whole run instead
+ *     of churning unpin→re-pin every TTL. The stall detector demotes a dead
+ *     worker's row out of 'running' within ~60s, so the TTL still catches
+ *     true zombies.
  *
- * A running worker younger than the TTL is NEVER touched — a healthy
- * long-running worker keeps its pin for the whole legitimate run.
+ * A worker the registry can't vouch for is still never touched before the
+ * TTL — the sweep can only ever shorten a stale pin's life, not a live one's.
  */
 
 /** Default TTL for a held worker pin: 6 hours. Rationale: worker turns are
@@ -63,16 +66,29 @@ export function workerAgentIdOfPinKey(pinKey: string): string | null {
   return agentId.length > 0 ? agentId : null
 }
 
+/** The registry's view of a worker, distilled for the reap decision.
+ *  - 'terminal' — row exists in completed | failed: reap now.
+ *  - 'running'  — row exists and is still 'running': NEVER reap, not even
+ *    past the TTL. A healthy 7h worker must not get unpinned mid-run only
+ *    for the next feed edit to re-pin it (pin/unpin churn every TTL). The
+ *    subagent-watcher's stall detection demotes a dead worker's row out of
+ *    'running' within ~60s of its JSONL going quiet, so a true zombie can
+ *    only hold 'running' briefly — the TTL still catches everything the
+ *    registry has lost track of.
+ *  - 'unknown'  — no row / never linked / 'stalled' / lookup error: the
+ *    TTL gate applies (the registry can't vouch for it). */
+export type WorkerRegistryStatus = 'terminal' | 'running' | 'unknown'
+
 /**
  * Decide which claimed worker pins to unpin now. Pure: the registry lookup is
- * an injected predicate (`isTerminal` must return true ONLY for a row in a
- * terminal status — completed | failed — and false for running / stalled /
- * missing / lookup-error; a DB hiccup must degrade to "keep the pin", never
- * to a spurious unpin).
+ * an injected predicate (`statusOf` must return 'terminal' ONLY for a row in
+ * completed | failed, 'running' only for a live 'running' row, and 'unknown'
+ * for stalled / missing / lookup-error; a DB hiccup must degrade to 'unknown'
+ * — kept until the TTL — never to a spurious 'terminal' unpin).
  */
 export function decideWorkerPinReaps(args: {
   pins: Iterable<WorkerPinCandidate>
-  isTerminal: (agentId: string) => boolean
+  statusOf: (agentId: string) => WorkerRegistryStatus
   ttlMs: number
   now: number
 }): WorkerPinReap[] {
@@ -81,10 +97,15 @@ export function decideWorkerPinReaps(args: {
     const agentId = workerAgentIdOfPinKey(pin.pinKey)
     if (agentId == null) continue // not a worker pin — never ours to reap
     if (pin.chatId.length === 0) continue // can't unpin without a chat
-    if (args.isTerminal(agentId)) {
+    const status = args.statusOf(agentId)
+    if (status === 'terminal') {
       reaps.push({ ...pin, reason: 'terminal' })
       continue
     }
+    // A registry-confirmed RUNNING worker keeps its pin regardless of age —
+    // the TTL only reaps pins the registry can't vouch for (see
+    // WorkerRegistryStatus doc).
+    if (status === 'running') continue
     if (args.now - pin.pinnedAt >= args.ttlMs) {
       reaps.push({ ...pin, reason: 'ttl' })
     }

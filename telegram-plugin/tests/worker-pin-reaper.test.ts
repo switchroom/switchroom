@@ -29,7 +29,7 @@ describe("decideWorkerPinReaps (#3001 mid-session wk: sweep)", () => {
   it("reaps a pin whose worker is terminal, however young the pin is", () => {
     const reaps = decideWorkerPinReaps({
       pins: [pin({ pinnedAt: NOW - 1_000 })],
-      isTerminal: () => true,
+      statusOf: () => 'terminal' as const,
       ttlMs: TTL,
       now: NOW,
     });
@@ -41,7 +41,7 @@ describe("decideWorkerPinReaps (#3001 mid-session wk: sweep)", () => {
   it("reaps a non-terminal pin once it exceeds the TTL", () => {
     const reaps = decideWorkerPinReaps({
       pins: [pin({ pinnedAt: NOW - TTL })],
-      isTerminal: () => false,
+      statusOf: () => 'unknown' as const,
       ttlMs: TTL,
       now: NOW,
     });
@@ -49,10 +49,10 @@ describe("decideWorkerPinReaps (#3001 mid-session wk: sweep)", () => {
     expect(reaps[0].reason).toBe("ttl");
   });
 
-  it("NEVER touches a running worker younger than the TTL", () => {
+  it("NEVER touches a pin younger than the TTL when the registry cannot vouch (unknown)", () => {
     const reaps = decideWorkerPinReaps({
       pins: [pin({ pinnedAt: NOW - TTL + 1 })],
-      isTerminal: () => false,
+      statusOf: () => 'unknown' as const,
       ttlMs: TTL,
       now: NOW,
     });
@@ -66,7 +66,7 @@ describe("decideWorkerPinReaps (#3001 mid-session wk: sweep)", () => {
         pin({ pinKey: "banner:owner", pinnedAt: NOW - 10 * TTL }),
         pin({ pinKey: "tool:123:9", pinnedAt: NOW - 10 * TTL }),
       ],
-      isTerminal: () => true,
+      statusOf: () => 'terminal' as const,
       ttlMs: TTL,
       now: NOW,
     });
@@ -76,41 +76,54 @@ describe("decideWorkerPinReaps (#3001 mid-session wk: sweep)", () => {
   it("skips a candidate with no chat id (cannot unpin without one)", () => {
     const reaps = decideWorkerPinReaps({
       pins: [pin({ chatId: "", pinnedAt: NOW - 10 * TTL })],
-      isTerminal: () => true,
+      statusOf: () => 'terminal' as const,
       ttlMs: TTL,
       now: NOW,
     });
     expect(reaps).toHaveLength(0);
   });
 
-  it("terminality is consulted per-agent and wins over the TTL gate", () => {
+  it("a registry-confirmed RUNNING worker keeps its pin PAST the TTL (no unpin/re-pin churn on healthy long workers)", () => {
+    const reaps = decideWorkerPinReaps({
+      pins: [pin({ pinnedAt: NOW - 10 * TTL })],
+      statusOf: () => 'running' as const,
+      ttlMs: TTL,
+      now: NOW,
+    });
+    expect(reaps).toHaveLength(0);
+  });
+
+  it("status is consulted per-agent: terminal reaps young, running exempts old, unknown falls to the TTL gate", () => {
     const seen: string[] = [];
     const reaps = decideWorkerPinReaps({
       pins: [
         pin({ pinKey: "wk:done", pinnedAt: NOW - 1_000 }),
-        pin({ pinKey: "wk:running", pinnedAt: NOW - 1_000 }),
-        pin({ pinKey: "wk:old-running", pinnedAt: NOW - TTL - 1 }),
+        pin({ pinKey: "wk:running-old", pinnedAt: NOW - TTL - 1 }),
+        pin({ pinKey: "wk:unknown-young", pinnedAt: NOW - 1_000 }),
+        pin({ pinKey: "wk:unknown-old", pinnedAt: NOW - TTL - 1 }),
       ],
-      isTerminal: (agentId) => {
+      statusOf: (agentId) => {
         seen.push(agentId);
-        return agentId === "done";
+        if (agentId === "done") return "terminal";
+        if (agentId === "running-old") return "running";
+        return "unknown";
       },
       ttlMs: TTL,
       now: NOW,
     });
-    expect(seen).toEqual(["done", "running", "old-running"]);
+    expect(seen).toEqual(["done", "running-old", "unknown-young", "unknown-old"]);
     expect(reaps.map((r) => [r.pinKey, r.reason])).toEqual([
       ["wk:done", "terminal"],
-      ["wk:old-running", "ttl"],
+      ["wk:unknown-old", "ttl"],
     ]);
   });
 
-  it("a throwing-in-caller-terms predicate is the caller's contract: false keeps the pin (registry hiccup never unpins)", () => {
-    // The gateway wraps its DB lookup and degrades to `false`. This pins the
-    // pure module's side of the contract: false + young pin = untouched.
+  it("registry hiccup ('unknown') never unpins a young pin — the caller's contract on statusOf degrade", () => {
+    // The gateway wraps its DB lookup and degrades to 'unknown'. This pins the
+    // pure module's side of the contract: unknown + young pin = untouched.
     const reaps = decideWorkerPinReaps({
       pins: [pin()],
-      isTerminal: () => false,
+      statusOf: () => 'unknown' as const,
       ttlMs: TTL,
       now: NOW,
     });

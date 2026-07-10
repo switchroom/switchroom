@@ -7204,13 +7204,18 @@ async function runMidSessionCardReaper(): Promise<void> {
         }))
       const reaps = decideWorkerPinReaps({
         pins: candidates,
-        isTerminal: (agentId) => {
-          if (turnsDb == null) return false
+        statusOf: (agentId) => {
+          if (turnsDb == null) return 'unknown'
           try {
             const row = getSubagentByJsonlId(turnsDb, agentId)
-            return row != null && (row.status === 'completed' || row.status === 'failed')
+            if (row == null) return 'unknown'
+            if (row.status === 'completed' || row.status === 'failed') return 'terminal'
+            // A live 'running' row exempts the pin from the TTL (no churn on
+            // healthy long workers); 'stalled' degrades to 'unknown' → TTL.
+            if (row.status === 'running') return 'running'
+            return 'unknown'
           } catch {
-            return false // DB hiccup degrades to "keep the pin"
+            return 'unknown' // DB hiccup degrades to "keep until TTL"
           }
         },
         ttlMs: WORKER_PIN_REAPER_TTL_MS,
