@@ -22,6 +22,7 @@ import {
 import type { DispatchCtx } from '../gateway/inbound-delivery-machine-dispatch'
 import { createPendingInboundBuffer } from '../gateway/pending-inbound-buffer'
 import { createPendingPermissionBuffer } from '../gateway/pending-permission-decisions'
+import { createInboundSpool } from '../gateway/inbound-spool'
 
 function makeCtx(overrides?: Partial<DispatchCtx>): {
   ctx: DispatchCtx
@@ -207,6 +208,20 @@ describe('dispatchEffects — inbound-routing effects (PR3c wiring)', () => {
     expect(onUserInboundDelivered).toHaveBeenCalledWith(ipcMsg)
   })
 
+  it('deliverToBridge DOES pass the enrolment callback for a real user inbound (NO meta.source)', () => {
+    // The primary live case: real user messages carry NO meta.source,
+    // and they are exactly the messages shouldTrackDelivery tracks. A
+    // dispatcher-side pre-filter on meta.source would skip them (the
+    // review HIGH on PR #3006) — the callback must fire unconditionally
+    // and self-gate inside the gateway.
+    const noSourceMsg = { type: 'inbound' as const, id: 'u1', chat_id: '1', text: 'hi', meta: {} }
+    const onUserInboundDelivered = vi.fn()
+    const { ctx, clientSend } = makeCtx({ onUserInboundDelivered })
+    __dispatchOneForTests({ kind: 'deliverToBridge', key: k, msg: { msgId: 2, isSteering: false, payload: noSourceMsg } }, ctx)
+    expect(clientSend).toHaveBeenCalledWith(noSourceMsg)
+    expect(onUserInboundDelivered).toHaveBeenCalledWith(noSourceMsg)
+  })
+
   it('bufferInbound pushes onto the pending inbound buffer', () => {
     const { ctx, inbound, clientSend } = makeCtx()
     __dispatchOneForTests({ kind: 'bufferInbound', key: k, msg: { msgId: 1, isSteering: false, payload: ipcMsg } }, ctx)
@@ -226,6 +241,45 @@ describe('dispatchEffects — inbound-routing effects (PR3c wiring)', () => {
     expect(() =>
       __dispatchOneForTests({ kind: 'persistInbound', key: k, msg: { msgId: 1, isSteering: false, payload: ipcMsg } }, ctx),
     ).not.toThrow()
+  })
+
+  it('bufferInbound + persistInbound with a spool attached to the buffer does NOT double-spool (idempotent by spoolId)', () => {
+    // The machine emits bufferInbound AND persistInbound as a pair for a
+    // mid-turn / bridge-dead inbound. When the ctx's buffer is
+    // constructed with the SAME durable spool (the production wiring),
+    // buffer.push already spools — so the paired persistInbound's
+    // spool.put must dedupe by spoolId, leaving exactly ONE live entry.
+    const spoolPath = '/state/agent/telegram/inbound-spool.jsonl'
+    const files = new Map<string, string>()
+    const fs = {
+      appendFileSync: (p: string, d: string) => files.set(p, (files.get(p) ?? '') + d),
+      readFileSync: (p: string) => files.get(p) ?? '',
+      writeFileSync: (p: string, d: string) => files.set(p, d),
+      renameSync: (from: string, to: string) => {
+        files.set(to, files.get(from) ?? '')
+        files.delete(from)
+      },
+      existsSync: (p: string) => files.has(p),
+      statSizeSync: (p: string) => Buffer.byteLength(files.get(p) ?? ''),
+    }
+    const spool = createInboundSpool({ path: spoolPath, fs, log: () => {} })
+    const buffer = createPendingInboundBuffer({ spool, log: () => {} })
+    const { ctx } = makeCtx({ pendingInboundBuffer: buffer, inboundSpool: spool })
+    // Spool-identifiable message shape (spoolId reads chatId/messageId).
+    const durableMsg = {
+      type: 'inbound' as const,
+      chatId: 'c1',
+      messageId: 77,
+      user: 'u',
+      userId: 1,
+      ts: 1000,
+      text: 'hold me',
+      meta: {},
+    }
+    __dispatchOneForTests({ kind: 'bufferInbound', key: k, msg: { msgId: 77, isSteering: false, payload: durableMsg } }, ctx)
+    __dispatchOneForTests({ kind: 'persistInbound', key: k, msg: { msgId: 77, isSteering: false, payload: durableMsg } }, ctx)
+    expect(buffer.depth('test-agent')).toBe(1)
+    expect(spool.liveCount()).toBe(1) // no double-spool
   })
 })
 

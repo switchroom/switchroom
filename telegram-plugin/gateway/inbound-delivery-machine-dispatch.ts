@@ -221,9 +221,16 @@ function dispatchOne(effect: Effect, ctx: DispatchCtx): void {
         )
         ok = false
       }
-      if (ok && ctx.onUserInboundDelivered && msg.meta?.source !== undefined) {
+      if (ok && ctx.onUserInboundDelivered) {
         // Enrol in the deliver-until-acked sweep — a socket write is not
         // proof claude consumed it (see onUserInboundDelivered doc).
+        // Pass UNCONDITIONALLY, mirroring the drainBuffer path above:
+        // the callback self-gates via shouldTrackDelivery (inbound-
+        // delivery-confirm.ts), which REJECTS sourced messages and
+        // tracks real user inbounds (meta.source undefined) — exactly
+        // the messages the sweep protects. Do NOT pre-filter on
+        // meta.source here; an inverted guard would skip user inbounds
+        // and enrol only messages the inner gate discards.
         try {
           ctx.onUserInboundDelivered(msg)
         } catch {
@@ -252,6 +259,20 @@ function dispatchOne(effect: Effect, ctx: DispatchCtx): void {
     }
 
     case 'deliverPermVerdict': {
+      // Branch order differs from the imperative twin
+      // (gateway.ts dispatchPermissionVerdict), which always goes via
+      // `ipcServer.sendToAgent` — it runs outside any bridgeUp context,
+      // so it has no just-registered client handle. Here `ctx.client`
+      // is preferred WHEN PRESENT for the same reason as drainBuffer /
+      // redeliverPersistedPermVerdicts above: on the bridgeUp path the
+      // registry lookup may not yet observe the just-registered client,
+      // and a direct send to the connecting socket is the reliable
+      // route. PR3c's live call site for machine-driven permVerdict
+      // events (non-bridgeUp) must construct the ctx WITHOUT `client`,
+      // which makes this branch behave exactly like the twin
+      // (sendToAgent). Note the twin additionally buffers on a failed
+      // send; the machine models that as a separate persistPermVerdict
+      // effect (bridge_dead state), so no fallback push here.
       const ev = effect.verdict.payload as PermissionEvent
       let ok = false
       try {

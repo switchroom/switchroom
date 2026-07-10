@@ -1,18 +1,13 @@
 /**
- * Dispatch-equivalence harness for the inbound-delivery state-machine
- * cutover (#2794 / #2996 Phase 1).
+ * Machine→dispatcher coverage + self-consistency harness for the
+ * inbound-delivery state-machine cutover (#2794 / #2996 Phase 1).
  *
- * The RFC's cutover protocol requires that BEFORE the imperative twins
- * (`markClaudeBusyForInbound`, `reapOrphanBusyKeysNow`, the legacy
- * `turnInFlightForGate` claudeBusyKeys branch) are deleted, we prove the
- * machine + dispatcher reproduce the same observable I/O the imperative
- * paths perform — in the same order.
+ * SCOPE — what this file proves, and what it deliberately does NOT:
  *
- * This harness does exactly that end-to-end WITHOUT touching production
- * behavior: it drives realistic event schedules (the same shapes the
- * gateway's `shadowEmit` call sites feed the machine — bridge flap,
- * fresh turn, mid-turn buffering, steering, turn-end drain, permission
- * verdicts across a bridge outage, stale-turn fallback) through the PURE
+ * It drives realistic event schedules (the same shapes the gateway's
+ * `shadowEmit` call sites feed the machine — bridge flap, fresh turn,
+ * mid-turn buffering, steering, turn-end drain, permission verdicts
+ * across a bridge outage, stale-turn fallback) through the PURE
  * `transition()` function, collects the returned effect sequence, then
  * replays that sequence through the REAL `dispatchEffects()` against a
  * recording fake-deps object. It asserts:
@@ -23,11 +18,17 @@
  *   3. Invariant #1 at the dispatch layer: an inbound is delivered XOR
  *      (buffered AND persisted) — never both, never neither.
  *
- * If a future edit to the machine adds an effect kind the dispatcher
- * doesn't execute, the "no unhandled effect" recorder assertion fails
- * loudly — the gate that lets PR3c flip the live call site to
- * `dispatchEffects` as a one-liner, and lets PR4 delete the twins
- * knowing the machine path is equivalent.
+ * It does NOT invoke the imperative twins (`markClaudeBusyForInbound`,
+ * the legacy `turnInFlightForGate` claudeBusyKeys branch,
+ * `dispatchPermissionVerdict`, the silence-poke ladder), so it is NOT a
+ * proof that machine path and imperative path produce identical I/O.
+ * Twin-equivalence evidence for PR4 (twin deletion) must come from the
+ * live shadow trace + gate-parity-probe bake per the RFC's cutover
+ * protocol — do NOT cite this file as that proof.
+ *
+ * What it DOES gate: if a future edit adds an effect kind the
+ * dispatcher doesn't execute, the "no unhandled effect" assertion fails
+ * loudly — keeping PR3c's live call-site flip a one-liner.
  */
 
 import { describe, expect, it } from 'vitest'
@@ -86,7 +87,7 @@ function makeRecorder(): Recorder {
     pendingPermissionBuffer: perm,
     client: client as never,
     log: () => {},
-    onUserInboundDelivered: () => {},
+    onUserInboundDelivered: (m) => ops.push(`enrol:${(m as { id?: string }).id}`),
     onSetTurnStarted: (key, at) => ops.push(`setTurn:${key}:${at}`),
     onClearTurnStarted: (key) => ops.push(`clearTurn:${key}`),
     onNoteOutbound: (key) => ops.push(`noteOutbound:${key}`),
@@ -135,6 +136,15 @@ const inMsg = (id: number, steer = false): MachineInbound => ({
   isSteering: steer,
   payload: { type: 'inbound', id: `m${id}`, chat_id: '1', text: `t${id}`, meta: { source: 'telegram' } },
 })
+// Real user inbound — NO meta.source. This is the primary live case:
+// shouldTrackDelivery (inbound-delivery-confirm.ts) only tracks
+// no-source messages, so fixtures that all carry a source would mask a
+// broken enrolment guard (the exact HIGH found in review of PR #3006).
+const userMsg = (id: number): MachineInbound => ({
+  msgId: id,
+  isSteering: false,
+  payload: { type: 'inbound', id: `m${id}`, chat_id: '1', text: `t${id}`, meta: {} },
+})
 const verdict = (r: string) => ({
   requestId: r,
   behavior: 'allow' as const,
@@ -175,6 +185,10 @@ const SCHEDULES: Record<string, Event[]> = {
     { kind: 'bridgeUp', at: 0 },
     { kind: 'inbound', key: K('1'), msg: inMsg(1), at: 10 },
     { kind: 'tick', now: 10 + 300_001 }, // past TURN_TTL, no outbound → firePoke
+  ],
+  fresh_turn_user_no_source: [
+    { kind: 'bridgeUp', at: 0 },
+    { kind: 'inbound', key: K('1'), msg: userMsg(1), at: 10 }, // real user inbound, no meta.source
   ],
   overlapping_turn_no_spurious_fallback: [
     { kind: 'bridgeUp', at: 0 },
@@ -283,6 +297,17 @@ describe('dispatch-equivalence: machine effects → dispatcher I/O', () => {
     dispatchEffects(effects, ctx)
     expect(ops).toContain('poke:1:_:fallback')
     expect(ops).toContain('clearTurn:1:_')
+  })
+
+  it('fresh_turn_user_no_source: a real user inbound (no meta.source) is delivered AND enrolled in the deliver-until-acked sweep', () => {
+    const { effects } = runMachine(SCHEDULES.fresh_turn_user_no_source)
+    const { ctx, ops } = makeRecorder()
+    dispatchEffects(effects, ctx)
+    expect(ops).toContain('send:inbound:m1')
+    // The enrolment callback MUST fire for no-source user inbounds —
+    // shouldTrackDelivery inside the gateway callback is the gate, not
+    // a dispatcher-side meta.source pre-filter (review HIGH, PR #3006).
+    expect(ops).toContain('enrol:m1')
   })
 
   it('overlapping_turn_no_spurious_fallback: recent outbound suppresses the poke', () => {
