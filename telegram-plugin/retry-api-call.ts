@@ -63,7 +63,47 @@ export interface RetryApiCallConfig {
   observer?: RetryObserver
   /** Optional log sink for flood-wait / network lines. */
   log?: (line: string) => void
+  /**
+   * Fires whenever a Telegram 429 flood-wait is observed, BEFORE the sleep.
+   * The circuit-breaker (#2923) persists the flood-wait window here so that
+   * a container restart during an active ban can suppress non-essential
+   * sends (boot cards) instead of feeding the same per-bot-token flood
+   * counter and prolonging the ban. Best-effort; a throw here is swallowed.
+   */
+  onFloodWait?: (retryAfterSec: number) => void
 }
+
+/**
+ * True when the thrown error is a LOCAL resource-exhaustion failure —
+ * ENOSPC (disk/tmpfs full), EDQUOT (quota), EIO, or ENOMEM — rather than a
+ * remote Telegram API failure. Issue #2923: an agent's tmpfs filling up
+ * wedges the outbound send's local staging step; retrying that as if it
+ * were a transient REMOTE failure hammers the Bot API and trips a per-bot
+ * flood ban. A local disk error must NOT drive remote retries — surface it
+ * as a distinct, non-retryable degraded state instead.
+ */
+export function isLocalResourceError(err: unknown): boolean {
+  const code = (err as { code?: unknown })?.code
+  if (typeof code === 'string' && ['ENOSPC', 'EDQUOT', 'EIO', 'ENOMEM'].includes(code)) {
+    return true
+  }
+  const msg = err instanceof Error ? err.message : String(err ?? '')
+  return (
+    // Word-boundaried so a substring can't false-match; covers the same set
+    // as the errno code list above (ENOSPC/EDQUOT/EIO/ENOMEM).
+    /\b(ENOSPC|EDQUOT|EIO|ENOMEM)\b/.test(msg) ||
+    /no space left on device/i.test(msg) ||
+    /disk quota exceeded/i.test(msg)
+  )
+}
+
+/**
+ * Marker error thrown when `retryApiCall` refuses to retry a LOCAL
+ * resource-exhaustion failure (#2923). Callers can detect this to surface a
+ * "degraded: local disk full" state rather than treating it like a remote
+ * send failure worth retrying.
+ */
+export const LOCAL_RESOURCE_EXHAUSTED = 'LOCAL_RESOURCE_EXHAUSTED'
 
 const DEFAULT_SLEEP = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 
@@ -83,6 +123,7 @@ export function createRetryApiCall(
   const sleep = config.sleep ?? DEFAULT_SLEEP
   const observer = config.observer
   const log = config.log
+  const onFloodWait = config.onFloodWait
 
   return async function retryApiCall<T>(
     fn: () => Promise<T>,
@@ -96,12 +137,33 @@ export function createRetryApiCall(
         const msg = err instanceof Error ? err.message : String(err)
         const desc = isGrammyErr ? (err as GrammyError).description : msg
 
+        // LOCAL resource exhaustion (#2923) — ENOSPC/EDQUOT/EIO/ENOMEM. This
+        // is a LOCAL disk/memory failure, not a remote API failure: retrying
+        // it in a tight loop is exactly what tripped the per-bot flood ban.
+        // Do NOT retry. Throw a distinct, non-retryable marker so the caller
+        // surfaces a degraded "local disk full" state and backs off hard.
+        if (isLocalResourceError(err)) {
+          log?.(
+            `telegram gateway: LOCAL resource exhaustion (${(err as { code?: string }).code ?? 'disk/mem'}) — ` +
+              `not retrying the send (would feed a flood ban); surfacing degraded state\n`,
+          )
+          observer?.onGiveUp?.({ attempts: attempt + 1, error: err })
+          throw Object.assign(new Error(LOCAL_RESOURCE_EXHAUSTED), { original: err })
+        }
+
         // Flood-wait — sleep retry_after and try again.
         if (isGrammyErr && (err as GrammyError).error_code === 429) {
           const retryAfter = Number(
             (err as GrammyError).parameters?.retry_after ?? 5,
           )
           const delayMs = retryAfter * 1000
+          // Persist the flood window so a restart during the ban can suppress
+          // non-essential sends instead of extending it (#2923 circuit breaker).
+          try {
+            onFloodWait?.(retryAfter)
+          } catch {
+            /* best-effort — never let the breaker hook break the retry path */
+          }
           log?.(`telegram gateway: 429 rate limited, waiting ${retryAfter}s\n`)
           observer?.onRetry?.({ attempt, reason: 'flood_wait', delayMs })
           await sleep(delayMs)

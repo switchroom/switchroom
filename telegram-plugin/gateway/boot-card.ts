@@ -69,6 +69,7 @@ import {
 } from './config-snapshot.js'
 import { join } from 'path'
 import { bootCardChatKey, loadBootCardMsgId, saveBootCardMsgId } from './boot-card-msgid.js'
+import { suppressNonEssentialSendMs } from '../flood-circuit-breaker.js'
 import { loadConfig as _loadSwitchroomConfig } from '../../src/config/loader.js'
 import { resolveAgentConfig as _resolveAgentConfig } from '../../src/config/merge.js'
 
@@ -605,6 +606,16 @@ export interface RunProbesOpts {
    * behaviour.
    */
   bootCardStatePath?: string
+  /**
+   * #2923 flood-wait circuit breaker. Path to the persisted flood-wait
+   * marker. When a Telegram per-bot flood ban is active, posting a boot card
+   * on restart is a NON-ESSENTIAL send straight into the open window that can
+   * reset/extend the ban — so if this path shows an active flood-wait, the
+   * boot card is SUPPRESSED (logged, not sent). Omit to always post.
+   */
+  floodStatePath?: string
+  /** Injectable clock for the flood-wait check (tests). Defaults to Date.now. */
+  nowMs?: () => number
 }
 
 /** Run all six probes concurrently with their own per-probe timeouts.
@@ -651,6 +662,22 @@ export async function startBootCard(
   const logger = log ?? ((l: string) => process.stderr.write(l))
   const setTimeoutFn = opts.setTimeoutImpl ?? setTimeout
   const settleMs = opts.settleWindowMs ?? SETTLE_WINDOW_MS
+
+  // #2923 circuit breaker: if a per-bot Telegram flood ban is active, do NOT
+  // post the boot card. It's a non-essential restart-time send straight into
+  // the open flood window — the exact thing that resets/extends the ban and
+  // keeps the agent mute for longer. Skip loudly (log) and return a no-op.
+  if (opts.floodStatePath != null) {
+    const now = (opts.nowMs ?? Date.now)()
+    const remainingMs = suppressNonEssentialSendMs(opts.floodStatePath, now)
+    if (remainingMs > 0) {
+      logger(
+        `telegram gateway: boot-card: SUPPRESSED — Telegram flood-wait active for ~${Math.round(remainingMs / 1000)}s; ` +
+          `not posting a restart card into the open ban window (issue #2923)\n`,
+      )
+      return { messageId: -1, complete: () => {} }
+    }
+  }
 
   // Render and post the bare ack line immediately. The user gets
   // confirmation that the agent is back without waiting on probes.

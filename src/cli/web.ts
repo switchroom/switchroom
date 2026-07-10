@@ -1,8 +1,58 @@
 import type { Command } from "commander";
 import chalk from "chalk";
+import { join } from "node:path";
+import { homedir } from "node:os";
 import { startWebServer } from "../web/server.js";
 import { withConfigError, getConfig, getConfigPath } from "./helpers.js";
+import { ConfigError } from "../config/loader.js";
+import {
+  detectConfigMountFault,
+  nextCrashBackoff,
+  readCrashState,
+  writeCrashState,
+  clearCrashState,
+} from "../web/startup-guard.js";
 import { captureEvent } from "../analytics/posthog.js";
+
+/**
+ * #2915 — when the long-running web container fails to start (config
+ * unreadable, e.g. the stale single-file-bind directory-inode fault), fail
+ * LOUDLY once and then PACE subsequent `restart: always` relaunches with a
+ * persisted, bounded exponential backoff, instead of crash-looping the host
+ * hundreds of times per minute. Diagnoses the directory-inode case with an
+ * actionable recreate remedy. Sleeps the backoff, then re-throws so the
+ * normal ConfigError handler prints + exits non-zero.
+ */
+async function handleWebStartupFailure(
+  err: unknown,
+  configPath: string | undefined,
+  stateFile: string,
+): Promise<never> {
+  if (err instanceof ConfigError && configPath) {
+    const fault = detectConfigMountFault(configPath);
+    if (fault) {
+      console.error(chalk.red(fault.message));
+    }
+  }
+  const { state, delayMs } = nextCrashBackoff(readCrashState(stateFile), Date.now());
+  writeCrashState(stateFile, state);
+  if (delayMs > 0) {
+    console.error(
+      chalk.yellow(
+        `switchroom-web: startup has failed ${state.count}× in a row — backing off ` +
+          `${Math.round(delayMs / 1000)}s before exit so \`restart: always\` doesn't ` +
+          `crash-loop the host (issue #2915).`,
+      ),
+    );
+    await new Promise<void>((r) => setTimeout(r, delayMs));
+  }
+  throw err;
+}
+
+/** Default location of the web crash-loop backoff marker. */
+export function webCrashStatePath(): string {
+  return join(homedir(), ".switchroom", "web", ".crashloop-state.json");
+}
 
 export function registerWebCommand(program: Command): void {
   program
@@ -12,7 +62,18 @@ export function registerWebCommand(program: Command): void {
     .option("-b, --bind <host>", "Host/IP to bind to (default: 127.0.0.1, localhost-only)", "127.0.0.1")
     .action(
       withConfigError(async (opts) => {
-        const config = getConfig(program);
+        const configPath = getConfigPath(program);
+        const stateFile = webCrashStatePath();
+        let config;
+        try {
+          config = getConfig(program);
+        } catch (err) {
+          await handleWebStartupFailure(err, configPath, stateFile);
+          throw err; // unreachable (handleWebStartupFailure always throws) — narrows `config`
+        }
+        // Config loaded cleanly — the crash loop (if any) is broken; reset
+        // the backoff counter so a future failure starts fresh.
+        clearCrashState(stateFile);
         const port = parseInt(opts.port, 10);
         const hostname = opts.bind as string;
 
