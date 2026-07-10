@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+## v0.18.9 — The delivery state machine takes the wheel
+
+### Inbound delivery is now machine-authoritative by default (#2794, #3012)
+
+The inbound-delivery state machine — landed piece by piece behind a
+shadow trace since #2794 — now owns the deliver-vs-buffer decision for
+real. `handleInbound` dispatches the machine's effects (`deliverToBridge`,
+`bufferInbound`+`persistInbound`, `setTurnStarted`) instead of the
+imperative twin, with the twin's post-send behavior (steer ack, busy-key
+mirror, delivery-confirm tracking, miss-path restart notice) mirrored
+bit-for-bit. Two documented carve-outs still route imperatively:
+`!`-interrupts mid-turn (the machine would buffer a message that must
+deliver) and `bridge_dead` (the twin's drop-not-replay semantics are the
+contract). Review caught a steer-miss hazard before it shipped: the miss
+branch wiped the chat's busy key unconditionally, which on a steer-miss
+belongs to the original in-flight turn — the release is now guarded on
+the key this dispatch actually stamped. Kill switch
+`SWITCHROOM_DELIVERY_MACHINE_CUTOVER=0` restores legacy routing verbatim;
+the flip bakes 48h on live fleet traffic (shadow trace + gate-parity
+probe watching for drift) before the imperative twins are deleted (PR4).
+
+### gateway.ts sheds 2,300+ lines into testable modules (#2996)
+
+The gateway decomposition continued across seven merged extractions
+(#3006–#3011, #3013): the outbound send path, approval-card and long-tail
+pending state behind sweepable store modules, bot-commands and ops/info
+CLI, an invocable `executeReply` send-loop harness, full machine-effect
+dispatch wiring with a 19-test dispatch-equivalence harness, and —
+largest — the nine callback-query handler families (vault grants/saves/
+defers, grant wizard, mental-model proposals, skill proposals, operator
+events, auth dashboard) moved verbatim into
+`callback-query-handlers.ts` behind an injected deps surface with a new
+41-test harness. `gateway.ts` dropped from 29,064 to 26,737 lines, and
+the entire approval-card tap surface is now unit-testable. Behavior-
+preserving throughout — structural pin suites carry the contract.
+
+### Docs tell the truth about streaming (#3005)
+
+`messaging/copy-kit.md` realigned with the current vision/spec set (four
+pillars, canonical tagline, hold-the-leash observability, honest overage
+footnote), and the README no longer claims replies stream in place —
+switchroom shows a live progress surface while working and sends whole
+messages, and now says so.
+
 ## v0.18.8 — No more silent waits, stale pins, or phantom failovers
 
 ### Stale worker pins get reaped instead of squatting the chat (#3001)
