@@ -174,6 +174,61 @@ export function writeRelaunchModelIntent(
   }
 }
 
+/**
+ * Reason prefix the gateway's SIGTERM/SIGINT shutdown handler stamps on its
+ * deploy-survival keep-intent (#3017/#3018). Distinguishable on purpose:
+ * a gateway-only bounce (supervisor relaunch, bare gateway-unit restart)
+ * leaves that stamp UNCONSUMED on disk — start.sh only runs on a container
+ * boot — and the next gateway boot uses this prefix to recognise and clear
+ * the stale stamp (see clearStaleGatewayShutdownIntent).
+ */
+export const GATEWAY_SHUTDOWN_INTENT_REASON_PREFIX = 'gateway-shutdown:'
+
+export interface RelaunchModelIntentRecord {
+  intent: RelaunchModelIntent
+  reason: string
+  ts: number
+}
+
+/** Parsed `.relaunch-model-intent`, or null when absent / corrupt / malformed. */
+export function readRelaunchModelIntent(agentDir: string): RelaunchModelIntentRecord | null {
+  try {
+    const raw = readFileSync(join(agentDir, RELAUNCH_MODEL_INTENT_FILE), 'utf8')
+    const parsed = JSON.parse(raw) as Partial<RelaunchModelIntentRecord>
+    if (
+      (parsed.intent !== 'keep' && parsed.intent !== 'revert') ||
+      typeof parsed.reason !== 'string' ||
+      typeof parsed.ts !== 'number'
+    ) {
+      return null
+    }
+    return { intent: parsed.intent, reason: parsed.reason, ts: parsed.ts }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Boot-time cleanup for the gateway-only-bounce hole (#3018 finding 4).
+ *
+ * A container-level stop/deploy consumes `.relaunch-model-intent` in start.sh
+ * BEFORE any gateway boots. So if a freshly-booting GATEWAY still sees an
+ * intent that a gateway shutdown handler stamped (reason carries
+ * GATEWAY_SHUTDOWN_INTENT_REASON_PREFIX), the preceding bounce was
+ * gateway-only — the container never restarted and the stamp is stale.
+ * Left in place, it could convert a genuine crash within the 10-min
+ * freshness window into a "keep", breaking the crash-reverts policy.
+ * Clear it. Never touches a triggerSelfRestart / user-slash stamp (those
+ * use their own un-prefixed reasons and precede a container bounce).
+ * Returns true when a stale stamp was cleared.
+ */
+export function clearStaleGatewayShutdownIntent(agentDir: string): boolean {
+  const rec = readRelaunchModelIntent(agentDir)
+  if (rec == null || !rec.reason.startsWith(GATEWAY_SHUTDOWN_INTENT_REASON_PREFIX)) return false
+  clearRelaunchModelIntent(agentDir)
+  return true
+}
+
 /** Remove a stamped intent (rollback of a failed dispatch). Best-effort. */
 export function clearRelaunchModelIntent(agentDir: string): void {
   try {

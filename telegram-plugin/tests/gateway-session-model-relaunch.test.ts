@@ -137,22 +137,28 @@ describe('gateway: intent writers on the restart verbs', () => {
 
 describe('gateway: model-menu callback persists the sticky override', () => {
   it('a confirmed selection persists the canonical token (selectedModelToken), never the display label', () => {
-    const idx = GATEWAY_SRC.indexOf('const outcome = await handleModelMenuCallback(data, modelDeps)')
+    // Recording extracted into recordModelMenuSideEffects (#3017) — shared by the
+    // live dispatcher and the deferred (queued mid-turn) apply so both record
+    // identically.
+    const idx = GATEWAY_SRC.indexOf('function recordModelMenuSideEffects')
     expect(idx).toBeGreaterThan(0)
-    const win = GATEWAY_SRC.slice(idx, idx + 1600)
+    const win = GATEWAY_SRC.slice(idx, idx + 2400)
     expect(win).toContain('outcome.selectedModelToken')
     expect(win).toMatch(/writeSessionModelFile\(\s*smDir,\s*outcome\.selectedModelToken/)
   })
 
   it('a confirmed "Default" selection CLEARS the sticky file', () => {
-    const idx = GATEWAY_SRC.indexOf('const outcome = await handleModelMenuCallback(data, modelDeps)')
-    const win = GATEWAY_SRC.slice(idx, idx + 1800)
+    const idx = GATEWAY_SRC.indexOf('function recordModelMenuSideEffects')
+    const win = GATEWAY_SRC.slice(idx, idx + 2400)
     expect(win).toContain('outcome.clearedDefault')
     expect(win).toContain('clearSessionModelFile(smDir)')
   })
 
   it('the sr-* callback branch calls scheduleModelRelaunch, not inject', () => {
-    const idx = GATEWAY_SRC.indexOf('if (data.startsWith(MODEL_CALLBACK_SR))')
+    // Anchor on the sr-* TARGET dispatcher branch specifically (a mid-turn
+    // busy-gate #3017 also matches `if (data.startsWith(MODEL_CALLBACK_SR))`, so
+    // anchor on the relaunch call that is unique to the idle apply branch).
+    const idx = GATEWAY_SRC.indexOf('const srLabel = escapeHtmlForTg(srFriendlyLabel(srName))')
     expect(idx).toBeGreaterThan(0)
     const win = GATEWAY_SRC.slice(idx, idx + 1400)
     expect(win).toContain('modelDeps.scheduleModelRelaunch(srName')
@@ -172,7 +178,9 @@ describe('gateway: model-menu callback persists the sticky override', () => {
 
 describe('gateway: typed /model persists the REQUESTED canonical token', () => {
   it('persists expandSrAlias(parsed.model), and `/model default` clears file + in-memory override', () => {
-    const idx = GATEWAY_SRC.indexOf("const requested = parsed.kind === 'set' ? expandSrAlias(parsed.model) : null")
+    // Recording extracted into recordTypedModelSwitch (#3017) — shared by the
+    // live `bot.command('model')` handler and the deferred (queued mid-turn) apply.
+    const idx = GATEWAY_SRC.indexOf('function recordTypedModelSwitch')
     expect(idx).toBeGreaterThan(0)
     const win = GATEWAY_SRC.slice(idx, idx + 2400)
     expect(win).toContain("requested?.toLowerCase() === 'default'")
@@ -184,7 +192,7 @@ describe('gateway: typed /model persists the REQUESTED canonical token', () => {
   })
 
   it('`/model default` file-clear is NOT gated on a positive confirmation (silent-switch path must not resurrect)', () => {
-    const idx = GATEWAY_SRC.indexOf("const requested = parsed.kind === 'set' ? expandSrAlias(parsed.model) : null")
+    const idx = GATEWAY_SRC.indexOf('function recordTypedModelSwitch')
     const win = GATEWAY_SRC.slice(idx, idx + 2400)
     // The default branch clears the file unconditionally, and only the
     // in-memory override change is confirmation-gated inside it.
