@@ -110,9 +110,27 @@ describe("scaffoldAgent: LiteLLM fail-open boot contract (#litellm)", () => {
     expect(innerBlock).toContain("routing LEFT IN PLACE");
     expect(innerBlock).toContain("NOT falling back to untracked direct Anthropic OAuth");
 
-    // The unreachable branch dispatch must be a no-op (routing kept), guarded by
-    // the flag — never the unset. Assert the elif dispatch exists.
-    expect(innerBlock).toContain('elif [ -n "$sr_ll_unreachable" ]');
+    // NEW CONTRACT (boot-while-proxy-down self-heal): the header-export arm now
+    // fires for BOTH the reachable AND the unreachable branch (key in hand), so
+    // the virtual key reaches the process env and requests authenticate the
+    // moment the proxy recovers instead of 401-ing until a manual restart. The
+    // decision `if` therefore ORs the two flags…
+    expect(innerBlock).toContain(
+      'if [ -n "$sr_ll_ok" ] || [ -n "$sr_ll_unreachable" ]; then',
+    );
+    // …the OLD `elif`-no-op branch (headers NOT exported on unreachable — the
+    // bug) is gone…
+    expect(innerBlock).not.toContain('elif [ -n "$sr_ll_unreachable" ]');
+    // …and the probe outcome now gates ONLY the _LITELLM_OK flag (sr-* override
+    // drop), via a nested probe-only `if` inside the shared arm.
+    expect(innerBlock).toContain('if [ -n "$sr_ll_ok" ]; then');
+    expect(innerBlock).toContain('_LITELLM_OK="1"');
+    // Header + gateway-discovery exports live in the SHARED arm (before the
+    // nested probe-only gate) so they fire on the unreachable branch too.
+    expect(
+      innerBlock.indexOf("export ANTHROPIC_CUSTOM_HEADERS="),
+      "header export must precede the probe-only _LITELLM_OK gate",
+    ).toBeLessThan(innerBlock.indexOf('_LITELLM_OK="1"'));
 
     // MISSING-KEY branch is still logged LOUDLY (not silent).
     expect(innerBlock).toContain("no litellm virtual key for agent");

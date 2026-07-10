@@ -25,6 +25,43 @@ import { isDockerRuntime } from "../runtime-mode.js";
 import { resolveOperatorUid } from "./operator-uid.js";
 import { resolveAgentConfig } from "../config/merge.js";
 
+/** Minimal structural view of a broker structured-get result (see
+ *  src/vault/broker/client.ts `getViaBrokerStructured`). We branch on `kind`
+ *  plus — for kind "denied" — the underlying broker error `code`: the client
+ *  rolls LOCKED, DENIED, BAD_REQUEST and INTERNAL all up into "denied", and
+ *  only the code distinguishes a transient broker condition (vault LOCKED
+ *  during the routine apply/relock window; INTERNAL error) from a genuine
+ *  grant/ACL DENIED. Treating them alike would silently strip a routed agent
+ *  on every relock — the exact bug class this resolver exists to prevent. */
+type BrokerGetResult = { kind: string; code?: string };
+type BrokerGetFn = (key: string) => Promise<BrokerGetResult>;
+
+/**
+ * Does the on-disk compose already route this agent through the proxy? Parses
+ * the agent's service block (`  agent-<name>:`) for `SWITCHROOM_LITELLM: "1"`.
+ * Targeted string/regex parse (same posture as `AGENT_IMAGE_TAG_RE` above) —
+ * cheaper and less brittle here than a full YAML load of a file we generated.
+ */
+export function agentHadLiteLLMRouting(
+  composeContent: string,
+  agentName: string,
+): boolean {
+  const lines = composeContent.split("\n");
+  const header = `  agent-${agentName}:`;
+  let i = lines.indexOf(header);
+  if (i < 0) return false;
+  for (i = i + 1; i < lines.length; i++) {
+    const line = lines[i];
+    // The block ends at the next service (2-space indent, non-space) or any
+    // top-level key (0-indent). Env vars live at deeper indent, so they never
+    // trip these guards.
+    if (/^ {2}\S/.test(line)) break;
+    if (/^\S/.test(line)) break;
+    if (/^\s+SWITCHROOM_LITELLM:\s*"1"\s*$/.test(line)) return true;
+  }
+  return false;
+}
+
 /**
  * Probe the vault-broker for which opted-in agents already have a LiteLLM
  * virtual key (`litellm/<agent>/api-key`). Used to gate routing-env injection
@@ -35,12 +72,32 @@ import { resolveAgentConfig } from "../config/merge.js";
  * (provisioning runs before this probe on the apply path; the reconcile path
  * sees whatever was already provisioned).
  *
- * Fail-safe: if the broker is unreachable, an agent's key is treated as NOT
- * confirmed (returns it out of the set) so we never emit a key-less proxy
- * route. Best-effort — never throws.
+ * Two failure modes, deliberately NOT treated alike (the product invariant is
+ * that ALL model traffic stays proxy-routed for cost/token tracking; a broker
+ * blip must never silently downgrade a routed agent to untracked direct OAuth):
+ *
+ *   - broker ANSWERED with a definitive "no key for you": `not_found`
+ *     (UNKNOWN_KEY — the key isn't there) or a genuine grant/ACL `DENIED` →
+ *     the agent legitimately has no usable key → leave it unconfirmed →
+ *     routing stripped.
+ *   - broker CANNOT answer right now: UNREACHABLE / timed out, client import
+ *     failed, vault LOCKED (routine during the apply/relock window), or an
+ *     INTERNAL broker error → we do NOT know the key status. Silently
+ *     stripping here is the bug: writeComposeFile runs on `agent restart` too,
+ *     so a container recreated during a broker blip would boot on untracked
+ *     direct OAuth. Instead we PRESERVE the agent's prior verdict baked into
+ *     the on-disk compose (`previousCompose`) and emit a loud warning naming
+ *     the affected agents. If there is no prior compose (first-ever apply) the
+ *     agent stays unconfirmed — it was never routed, so that is the safe
+ *     default.
+ *
+ * Best-effort — never throws. `deps.getKey` is injectable for tests; production
+ * callers pass none and it dynamic-imports the real broker client.
  */
-async function resolveLiteLLMConfirmedAgents(
+export async function resolveLiteLLMConfirmedAgents(
   config: SwitchroomConfig,
+  previousCompose: string | null,
+  deps?: { getKey?: BrokerGetFn },
 ): Promise<Set<string>> {
   const confirmed = new Set<string>();
   // Determine opted-in agents (effective enabled = agent ?? top-level ?? false).
@@ -56,18 +113,85 @@ async function resolveLiteLLMConfirmedAgents(
   }
   if (optedIn.length === 0) return confirmed;
 
-  try {
-    const { getViaBrokerStructured } = await import("../vault/broker/client.js");
-    for (const name of optedIn) {
-      try {
-        const r = await getViaBrokerStructured(`litellm/${name}/api-key`);
-        if (r.kind === "ok") confirmed.add(name);
-      } catch {
-        // treat as not-confirmed (fail-safe)
+  // Resolve the broker getter (injected for tests, else the real client). A
+  // failed import means the broker layer is unavailable ⇒ EVERY opted-in agent
+  // is "unreachable" (never silently strip the whole fleet — the outer-catch bug).
+  let getKey: BrokerGetFn | null = deps?.getKey ?? null;
+  if (!getKey) {
+    try {
+      ({ getViaBrokerStructured: getKey } = await import("../vault/broker/client.js"));
+    } catch {
+      getKey = null;
+    }
+  }
+
+  const unreachableAgents: string[] = [];
+  for (const name of optedIn) {
+    if (!getKey) {
+      unreachableAgents.push(name);
+      continue;
+    }
+    try {
+      const r = await getKey(`litellm/${name}/api-key`);
+      if (r.kind === "ok") {
+        confirmed.add(name);
+      } else if (r.kind === "unreachable") {
+        unreachableAgents.push(name);
+      } else if (r.kind === "denied" && r.code !== "DENIED") {
+        // The client collapses LOCKED / DENIED / BAD_REQUEST / INTERNAL into
+        // kind "denied". Only a genuine grant/ACL DENIED is a definitive "no
+        // key for you". LOCKED (the vault relocks routinely during apply) and
+        // INTERNAL are transient broker states — and BAD_REQUEST / an absent
+        // code means WE (or a protocol skew) are at fault, not the key. All of
+        // those mean "status unknown" ⇒ preserve, never silently strip.
+        unreachableAgents.push(name);
+      }
+      // not_found (UNKNOWN_KEY) / denied with code DENIED ⇒ broker answered
+      // definitively "no usable key" ⇒ legitimate strip (leave unconfirmed).
+    } catch {
+      // An unexpected throw from the client is broker-layer trouble, not a
+      // "no key" answer — treat it as unreachable (preserve, don't strip).
+      unreachableAgents.push(name);
+    }
+  }
+
+  if (unreachableAgents.length > 0) {
+    const preserved: string[] = [];
+    const couldNotPreserve: string[] = [];
+    for (const name of unreachableAgents) {
+      if (previousCompose && agentHadLiteLLMRouting(previousCompose, name)) {
+        confirmed.add(name);
+        preserved.push(name);
+      } else {
+        couldNotPreserve.push(name);
       }
     }
-  } catch {
-    // broker client import / connection failure ⇒ nothing confirmed
+    // LOUD warning — naming every affected agent — so a broker blip during an
+    // apply/restart is visible in the operator's console, not silent. This
+    // INTENTIONALLY repeats on every writeComposeFile invocation while the
+    // broker stays unavailable (apply and each agent restart): each run is a
+    // separate operator-visible operation whose routing verdict was degraded,
+    // and deduping across process invocations would need on-disk state for no
+    // real gain.
+    console.warn(
+      `switchroom: vault-broker unreachable or unable to answer (locked/internal) ` +
+      `while resolving LiteLLM key status for ` +
+      `${unreachableAgents.length} opted-in agent(s): ${unreachableAgents.join(", ")}. ` +
+      `Refusing to silently strip proxy routing (that would boot them on untracked ` +
+      `direct OAuth). Re-run \`switchroom apply\` once the broker is back to reconcile.`,
+    );
+    if (preserved.length > 0) {
+      console.warn(
+        `switchroom: PRESERVED existing proxy routing from the on-disk compose for: ` +
+        `${preserved.join(", ")}.`,
+      );
+    }
+    if (couldNotPreserve.length > 0) {
+      console.warn(
+        `switchroom: no prior routing verdict on disk for: ${couldNotPreserve.join(", ")} ` +
+        `— leaving them unrouted (they were not previously routed).`,
+      );
+    }
   }
   return confirmed;
 }
@@ -222,9 +346,19 @@ export async function computeComposeContent(
     ? resolveHostSwitchroomConfigPath(opts.switchroomConfigPath)
     : undefined;
 
+  // Read the compose currently on disk BEFORE resolving key status: the
+  // LiteLLM resolver needs it to preserve an agent's prior routing verdict
+  // when the broker is unreachable (never silently strip on a broker blip).
+  let previous: string | null = null;
+  try {
+    previous = await readFile(opts.composePath, "utf8");
+  } catch {
+    previous = null;
+  }
+
   // Which opted-in agents have a LiteLLM key in the vault — gates routing-env
   // injection so a key-less agent never boots a dead proxy route (#litellm).
-  const litellmConfirmedAgents = await resolveLiteLLMConfirmedAgents(opts.config);
+  const litellmConfirmedAgents = await resolveLiteLLMConfirmedAgents(opts.config, previous);
 
   const content = generateCompose({
     config: opts.config,
@@ -250,12 +384,6 @@ export async function computeComposeContent(
     operatorUid,
   });
 
-  let previous: string | null = null;
-  try {
-    previous = await readFile(opts.composePath, "utf8");
-  } catch {
-    previous = null;
-  }
   const previousImageTag = previous ? (AGENT_IMAGE_TAG_RE.exec(previous)?.[1] ?? null) : null;
 
   return { content, imageTag, previous, previousImageTag };

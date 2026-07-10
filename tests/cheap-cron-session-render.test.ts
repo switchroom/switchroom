@@ -9,6 +9,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { renderTemplate } from "../src/agents/profiles.js";
 import { scheduleNeedsCronSession } from "../src/scheduler/cron-routing.js";
@@ -156,18 +157,101 @@ describe("cron-session.sh LiteLLM routing — mirrors start.sh boot block", () =
     expect(out).toContain('if [ -n "${SWITCHROOM_LITELLM:-}" ]');
   });
 
-  it("exports ANTHROPIC_CUSTOM_HEADERS and CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY on success", () => {
+  it("exports ANTHROPIC_CUSTOM_HEADERS and CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY when key present", () => {
     expect(out).toContain("x-litellm-api-key: Bearer $sr_ll_key");
-    expect(out).toContain("x-litellm-customer-id: $SWITCHROOM_AGENT_NAME");
-    expect(out).toContain("x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME");
+    // Attribution now uses the compile-time-literal cron identity (marko-cron)
+    // consistently — no longer a runtime $SWITCHROOM_AGENT_NAME (drift fix). The
+    // value is identical (line 69 sets SWITCHROOM_AGENT_NAME=$CRON_NAME).
+    expect(out).toContain("x-litellm-customer-id: marko-cron");
+    expect(out).toContain("x-litellm-tags: agent:marko-cron");
+    expect(out).not.toContain("x-litellm-customer-id: $SWITCHROOM_AGENT_NAME");
     expect(out).toContain("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1");
   });
 
-  it("fail-open: unsets ALL routing vars so claude falls back to direct OAuth", () => {
+  it("MISSING KEY fails open: unsets ALL routing vars → direct OAuth, loud log", () => {
     expect(out).toContain(
       "unset ANTHROPIC_BASE_URL ANTHROPIC_SMALL_FAST_MODEL SWITCHROOM_LITELLM",
     );
+    // The missing-key branch still fails open (correct — no metered route).
+    expect(out).toContain("no virtual key for 'marko'");
     expect(out).toContain("falling back to direct OAuth");
+  });
+
+  it("PROXY UNREACHABLE with key does NOT fail open — keeps routing + self-heals (ported from start.sh)", () => {
+    // The pre-#2940 cron logic unset routing on unreachable → untracked direct
+    // OAuth for the fire. The new contract keeps routing in place, loud-warns,
+    // and exports the header so it self-heals when the proxy returns.
+    expect(out).toContain('sr_ll_unreachable="1"');
+    expect(out).toContain("routing LEFT IN PLACE");
+    expect(out).toContain("NOT falling back to untracked direct Anthropic OAuth");
+    // The header-export arm fires for BOTH ok and unreachable (key in hand).
+    expect(out).toContain('if [ -n "$sr_ll_ok" ] || [ -n "$sr_ll_unreachable" ]; then');
+    // The old fail-open-on-unreachable log wording is gone.
+    expect(out).not.toContain("no tracking/guardrail this session");
+  });
+
+  it("bounded SHORT retry budget (3 attempts) — not start.sh's 120s deadline", () => {
+    // Cron latency budget: a few quick retries, then keep routing anyway.
+    expect(out).toContain('[ "$sr_ll_try" -ge 3 ]');
+    expect(out).not.toContain("+ 120 ))"); // no 120s boot-probe deadline here
+  });
+
+  it("dispatch (executed): UNREACHABLE keeps routing + HEADER, MISSING KEY strips it", () => {
+    // Slice JUST the decision dispatch (skips the ~25s probe loop): from the
+    // shared decision `if` through the scratch-var cleanup, driven by preset
+    // flags — the real strip-vs-keep code paths without any sleeping.
+    const dispStart = out.indexOf(
+      'if [ -n "$sr_ll_ok" ] || [ -n "$sr_ll_unreachable" ]; then',
+    );
+    const endMarker = "unset sr_ll_key sr_ll_ok sr_ll_unreachable";
+    const dispEnd = out.indexOf(endMarker, dispStart) + endMarker.length;
+    expect(dispStart).toBeGreaterThan(-1);
+    expect(dispEnd).toBeGreaterThan(dispStart);
+    const dispatch = out.slice(dispStart, dispEnd);
+
+    const runDispatch = (preset: { ok: string; unreachable: string }): Record<string, string> => {
+      const script = [
+        "set -e",
+        "unset ANTHROPIC_CUSTOM_HEADERS",
+        "export SWITCHROOM_AGENT_NAME=marko-cron",
+        "export SWITCHROOM_AGENT_PROFILE=default",
+        'export ANTHROPIC_BASE_URL="http://litellm:4010/anthropic"',
+        "export ANTHROPIC_SMALL_FAST_MODEL=claude-haiku-4-5",
+        "export SWITCHROOM_LITELLM=1",
+        'export SWITCHROOM_LITELLM_BASE="http://litellm:4010"',
+        "sr_ll_key=k",
+        `sr_ll_ok=${JSON.stringify(preset.ok)}`,
+        `sr_ll_unreachable=${JSON.stringify(preset.unreachable)}`,
+        dispatch,
+        'echo "BASEURL=${ANTHROPIC_BASE_URL:-__UNSET__}"',
+        'echo "LITELLM=${SWITCHROOM_LITELLM:-__UNSET__}"',
+        'if [ -n "${ANTHROPIC_CUSTOM_HEADERS:-}" ]; then echo "HEADERS=SET"; else echo "HEADERS=__UNSET__"; fi',
+        'case "${ANTHROPIC_CUSTOM_HEADERS:-}" in *"Bearer k"*) echo "KEYINHEADER=YES";; *) echo "KEYINHEADER=NO";; esac',
+        'case "${ANTHROPIC_CUSTOM_HEADERS:-}" in *"customer-id: marko-cron"*) echo "CRONID=YES";; *) echo "CRONID=NO";; esac',
+      ].join("\n");
+      const cmdOut = execFileSync("bash", ["-c", script], { encoding: "utf-8" });
+      return Object.fromEntries(
+        [...cmdOut.matchAll(/^(BASEURL|LITELLM|HEADERS|KEYINHEADER|CRONID)=(.*)$/gm)].map((m) => [
+          m[1],
+          m[2].trim(),
+        ]),
+      );
+    };
+
+    // Proxy unreachable → routing SURVIVES and the auth header is exported with
+    // the key + cron identity, so the fire self-heals instead of running dark.
+    const unreachable = runDispatch({ ok: "", unreachable: "1" });
+    expect(unreachable.BASEURL).toBe("http://litellm:4010/anthropic");
+    expect(unreachable.LITELLM).toBe("1");
+    expect(unreachable.HEADERS).toBe("SET");
+    expect(unreachable.KEYINHEADER).toBe("YES");
+    expect(unreachable.CRONID).toBe("YES");
+
+    // Missing key → fail-open strip (routing gone; no header).
+    const missingKey = runDispatch({ ok: "", unreachable: "" });
+    expect(missingKey.BASEURL).toBe("__UNSET__");
+    expect(missingKey.LITELLM).toBe("__UNSET__");
+    expect(missingKey.HEADERS).toBe("__UNSET__");
   });
 
   it("LiteLLM block appears BEFORE the tmux new-session call", () => {

@@ -87,36 +87,75 @@ CRON_APPEND_PROMPT="You are the cheap background cron worker for {{name}}. You r
 # claude's project key matches the pre-seeded trust state (.claude-cron).
 cd "{{agentDir}}" || exit 1
 
-# LiteLLM routing for the cron session — mirrors start.sh's boot block.
+# LiteLLM routing for the cron session — ports start.sh's boot contract.
 # IMPORTANT: the vault key is provisioned under the BASE agent name ({{name}}),
 # NOT the cron identity ({{name}}-cron). Use the Handlebars template var so the
-# lookup is a compile-time literal — no fragile runtime suffix-stripping.
-# Attribution headers carry $SWITCHROOM_AGENT_NAME (= {{name}}-cron) so LiteLLM
-# can distinguish cron spend from main-session spend per agent.
-# FAIL-OPEN: missing key OR unreachable proxy → strip routing env, fall back to
-# direct OAuth. An outage must never take the cron session dark.
+# lookup is a compile-time literal — no fragile runtime suffix-stripping. The
+# attribution headers use the SAME compile-time-literal form ({{name}}-cron,
+# identical to $SWITCHROOM_AGENT_NAME here — line 69 exports it) so this block
+# refers to the agent one consistent way instead of mixing a template literal
+# for the key with a runtime env var for the tags. Cron spend is attributed to
+# {{name}}-cron so LiteLLM distinguishes it from main-session spend per agent.
+#
+# Two boot failure modes, handled DIFFERENTLY (ported 2026-07 from start.sh so
+# cron no longer fails OPEN on a transient blip and silently runs UNTRACKED
+# direct OAuth for the fire — the product invariant is all model traffic stays
+# proxy-routed for cost/token tracking):
+#   - MISSING KEY → fail-open: strip routing, fall back to direct OAuth, LOUD
+#     log. Without a key there is no metered route to reach — correct here.
+#   - PROXY UNREACHABLE with key in hand → do NOT strip. Keep routing pointed at
+#     the proxy AND export the auth header so the session authenticates the
+#     moment the proxy recovers (the socat forwarder reconnects per-connection),
+#     LOUD log. Never a silent untracked direct-OAuth fallback.
+# Retry budget is DELIBERATELY short — 3 attempts, worst-case ~25s (3×5s curl
+# timeouts + 2×5s sleeps) — vs start.sh's 120s: a cron fire is
+# latency-sensitive and short-lived, and unreachable now KEEPS routing anyway,
+# so a long boot-probe would only add dead latency for no gain.
 if [ -n "${SWITCHROOM_LITELLM:-}" ] && command -v switchroom >/dev/null 2>&1; then
   sr_ll_key="$(switchroom vault get "litellm/{{name}}/api-key" 2>/dev/null || true)"
   sr_ll_ok=""
+  sr_ll_unreachable=""
   if [ -z "$sr_ll_key" ]; then
-    echo "litellm: no virtual key for cron '{{name}}' — falling back to direct OAuth (no tracking/guardrail)" >&2
-  elif command -v curl >/dev/null 2>&1 && [ -n "$ANTHROPIC_BASE_URL" ] \
-       && ! curl -fsS -m 5 -o /dev/null "${SWITCHROOM_LITELLM_BASE:-${ANTHROPIC_BASE_URL%/anthropic}}/health/liveliness" 2>/dev/null; then
-    echo "litellm: proxy unreachable at ${SWITCHROOM_LITELLM_BASE:-$ANTHROPIC_BASE_URL} — falling back to direct OAuth (no tracking/guardrail this session)" >&2
+    echo "litellm(cron): no virtual key for '{{name}}' — falling back to direct OAuth (untracked, unguarded)" >&2
+  elif command -v curl >/dev/null 2>&1 && [ -n "$ANTHROPIC_BASE_URL" ]; then
+    # Bounded retry probe — short budget for cron latency (3 attempts,
+    # worst-case ~25s: 3×5s curl timeouts + 2×5s sleeps).
+    sr_ll_url="${SWITCHROOM_LITELLM_BASE:-${ANTHROPIC_BASE_URL%/anthropic}}/health/liveliness"
+    sr_ll_try=0
+    sr_ll_up=""
+    while :; do
+      if curl -fsS -m 5 -o /dev/null "$sr_ll_url" 2>/dev/null; then sr_ll_up="1"; break; fi
+      sr_ll_try=$(( sr_ll_try + 1 ))
+      [ "$sr_ll_try" -ge 3 ] && break
+      sleep 5
+    done
+    if [ -z "$sr_ll_up" ]; then
+      # Proxy unreachable but the key is present. Do NOT strip: keep routing so
+      # the cron session self-heals once the proxy is back.
+      sr_ll_unreachable="1"
+      echo "litellm(cron): proxy unreachable at ${SWITCHROOM_LITELLM_BASE:-$ANTHROPIC_BASE_URL} after 3 retries — routing LEFT IN PLACE so it self-heals; NOT falling back to untracked direct Anthropic OAuth." >&2
+    else
+      sr_ll_ok="1"
+    fi
+    unset sr_ll_url sr_ll_try sr_ll_up
   else
     sr_ll_ok="1"
   fi
-  if [ -n "$sr_ll_ok" ]; then
+  if [ -n "$sr_ll_ok" ] || [ -n "$sr_ll_unreachable" ]; then
+    # Key fetched successfully — export the auth header REGARDLESS of the probe
+    # outcome so the virtual key reaches the process env. On unreachable this is
+    # what lets the session authenticate the moment the proxy recovers instead
+    # of 401-ing (the same self-heal fix as start.sh's inner/outer blocks).
     export ANTHROPIC_CUSTOM_HEADERS="x-litellm-api-key: Bearer $sr_ll_key
-x-litellm-customer-id: $SWITCHROOM_AGENT_NAME
-x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:-default}"
+x-litellm-customer-id: {{name}}-cron
+x-litellm-tags: agent:{{name}}-cron,profile:${SWITCHROOM_AGENT_PROFILE:-default}"
     export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
   else
-    # Fail-open: drop every routing var so the claude CLI talks to Anthropic
-    # directly on its OAuth credential (subscription path), unproxied.
+    # Missing-key fail-open: drop every routing var so the claude CLI talks to
+    # Anthropic directly on its OAuth credential (subscription path), unproxied.
     unset ANTHROPIC_BASE_URL ANTHROPIC_SMALL_FAST_MODEL SWITCHROOM_LITELLM SWITCHROOM_LITELLM_BASE
   fi
-  unset sr_ll_key sr_ll_ok
+  unset sr_ll_key sr_ll_ok sr_ll_unreachable
 fi
 
 # Create the cron tmux session DETACHED (-d), not in attach mode. This is a
