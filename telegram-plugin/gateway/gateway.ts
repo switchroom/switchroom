@@ -311,8 +311,6 @@ import {
   switchroomHelpText as buildSwitchroomHelpText,
   restartAckText as buildRestartAckText,
   newSessionAckText as buildNewSessionAckText,
-  TELEGRAM_BASE_COMMANDS,
-  TELEGRAM_SWITCHROOM_COMMANDS,
   type AgentMetadata, type AuthSummary, type StatusProbeRow,
 } from '../welcome-text.js'
 import {
@@ -412,6 +410,7 @@ import {
   type EffortCommandDeps,
   type EffortMenuReply,
 } from './effort-command.js'
+import { registerSwitchroomBotCommands } from './register-bot-commands.js'
 import { applyEffort } from '../../src/agents/effort-picker.js'
 import { type BannerState } from '../slot-banner.js'
 import { refreshBanner } from '../slot-banner-driver.js'
@@ -24985,22 +24984,6 @@ bot.command('commands', async ctx => {
   await switchroomReply(ctx, buildSwitchroomHelpText(getMyAgentName()), { html: true })
 })
 
-async function registerSwitchroomBotCommands(): Promise<void> {
-  // Slash-menu is deliberately trimmed from the full command catalogue.
-  // See telegram-plugin/welcome-text.ts TELEGRAM_MENU_COMMANDS for the
-  // rationale (mobile UX focus; ops primitives stay typable but out of
-  // the autocomplete clutter). /commands surfaces the full list.
-  await bot.api.setMyCommands(
-    [...TELEGRAM_BASE_COMMANDS, ...TELEGRAM_SWITCHROOM_COMMANDS],
-    { scope: { type: 'all_private_chats' } },
-  )
-  // Group chats don't support /start pairing, so only the switchroom
-  // commands are registered there.
-  await bot.api.setMyCommands(
-    TELEGRAM_SWITCHROOM_COMMANDS,
-    { scope: { type: 'all_group_chats' } },
-  )
-}
 
 // ─── Inline-button handler (permissions) ──────────────────────────────────
 // Handles `perm:(allow|deny|always|asn|asb|back):<id>` — permission request buttons
@@ -27961,7 +27944,7 @@ void (async () => {
         // lifetime.
         scheduleAlwaysAllowPersistDrain()
 
-        void registerSwitchroomBotCommands().catch(() => {})
+        void registerSwitchroomBotCommands(bot).catch(() => {})
 
         // #613 fix: pre-warm the chatAvailableReactions cache for every
         // chat in access.allowFrom. Without this, the FIRST inbound
