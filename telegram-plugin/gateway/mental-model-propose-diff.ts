@@ -28,6 +28,49 @@ import { parseDocument } from "yaml";
 import { generateUnifiedDiff } from "../../src/web/config-diff.js";
 
 /**
+ * Decode the canonical six HTML/XML entities to their literal characters — the
+ * config-write-boundary layer of the #2976 defense-in-depth.
+ *
+ * SCOPE / reachability (be honest about which half is load-bearing):
+ *   - `source_query` decode is the REACHABLE half. A model can copy escaped
+ *     entities out of its Telegram-HTML-rendered context into a proposal's
+ *     free-form `source_query`, and undecoded it would steer recall on `R&amp;D`
+ *     instead of `R&D` — a durable, silent corruption of a memory-integrity
+ *     field. Normalizing here means an escaped query can never LAND in
+ *     `memory.mental_models[]`.
+ *   - `name` decode is REDUNDANT belt-and-suspenders. The `mental_model_propose`
+ *     gateway tool already slug-validates `name` against
+ *     /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/ BEFORE this runs, so an entity-bearing
+ *     name is rejected upstream and can't reach here. It's kept only so this
+ *     write boundary is self-contained if that gate ever moves.
+ *   - The observed in-NAME corruption (`Nutrition Protocol &amp; Deficit Status`,
+ *     klanker 2026-07-06) actually arrived via the DIRECT `create_mental_model`
+ *     Hindsight tool (`ensureMentalModel`, undecoded), NOT this propose path.
+ *     That vector is OUT OF SCOPE here — covered by the steering.ts context-
+ *     hygiene + in-service `Dockerfile.hindsight` normalization follow-ups.
+ *
+ * SINGLE PASS by design (matches issue #2976's success criteria): a
+ * double-escaped `R&amp;amp;D` decodes ONE layer to `R&amp;D`, not all the way
+ * to `R&D` — we only undo the escaping switchroom itself applied when it
+ * rendered the model's prior output, never the user's literal intent. `&amp;`
+ * is decoded LAST so `&amp;lt;` collapses to `&lt;` (one layer), not `<`.
+ *
+ * Accepted tradeoff: a `source_query` a human genuinely intended to contain a
+ * literal `&amp;` / `&lt;` / etc. (rare — a reflection question, not markup)
+ * will have that one layer decoded. Steering queries reading as escaped HTML is
+ * the far more common and more harmful case, so we optimize for it.
+ */
+export function decodeCanonicalEntities(s: string): string {
+  return s
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+/**
  * A proposed mental model, in the same snake_case shape the
  * `memory.mental_models[]` schema (#2874) accepts. `name` + `source_query`
  * are required; the knobs are opt-in and only serialised when set (a minimal
@@ -125,20 +168,33 @@ export function buildMentalModelAppendDiff(args: {
   }
 
   // Duplicate-name guard (defense-in-depth; the executor also checks up front
-  // so it never even posts a card for a dupe).
+  // so it never even posts a card for a dupe). Compare on the DECODED name so a
+  // re-propose of an entity-escaped variant collides with the already-stored
+  // literal (#2976) rather than sneaking in a corrupted twin.
+  const decodedName = decodeCanonicalEntities(spec.name);
   const existing = readDeclaredMentalModelNames(configText, agentName);
-  if (existing.includes(spec.name)) {
+  if (existing.includes(decodedName)) {
     return {
       ok: false,
       error: "duplicate",
-      detail: `mental model "${spec.name}" is already declared for ${agentName}`,
+      detail: `mental model "${decodedName}" is already declared for ${agentName}`,
     };
   }
 
+  // #2976 write-boundary normalization: decode any HTML/XML entities the model
+  // may have copied out of its own escaped context so the LITERAL characters
+  // land in config — never `&amp;` / `&lt;` etc. The load-bearing target is the
+  // free-form `source_query`; the `name` decode is redundant with the gateway
+  // slug gate (an entity-bearing name is rejected upstream) and kept only so
+  // this boundary is self-contained. Duplicate-name guard runs on the decoded
+  // name above.
+  const name = decodedName;
+  const source_query = decodeCanonicalEntities(spec.source_query);
+
   // Assemble the minimal, schema-clean declaration node.
   const item: Record<string, unknown> = {
-    name: spec.name,
-    source_query: spec.source_query,
+    name,
+    source_query,
   };
   if (spec.refresh_after_consolidation !== undefined) {
     item.refresh_after_consolidation = spec.refresh_after_consolidation;
