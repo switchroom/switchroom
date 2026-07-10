@@ -42,6 +42,19 @@ without ever turning the chat into a place a raw credential lives.
   doesn't hand over the next.
 - A granted request **auto-resumes the turn**. The operator taps Allow and
   the agent picks up where it left off, without a nudge.
+- A **denied or expired** request resumes the turn too. The agent hears the
+  outcome, states plainly what it now can't do, and continues or degrades —
+  it is never left parked forever waiting on a card that was already
+  answered.
+- Cards **time out** (60-min default) and the timeout wakes the agent as a
+  *timeout, not a denial*: the agent says the request went unanswered and
+  what it's doing about it, rather than treating silence as a "no". An
+  expired card is **re-offered when the operator returns** (missed-approvals),
+  the same way a permission card is.
+- An approval card **survives a gateway restart**. A tap on a still-valid
+  card after a restart works; a card that expired during the outage is
+  re-offered on the operator's return. The card is durable state, not a
+  live-process artifact that a bounce silently voids.
 - If the operator pastes a secret anyway, the bot deletes the original
   message and confirms. The plaintext leaves the chat, the value lands in
   the vault, the agent never receives it.
@@ -70,6 +83,12 @@ without ever turning the chat into a place a raw credential lives.
   identity, a posture mint of a crown-jewel key.
 - A grant that lands but the turn dies anyway, forcing the operator to
   re-prompt the work they already approved.
+- A denied or timed-out card that strands the agent silently — parked
+  waiting on an outcome that already arrived, with no resume.
+- A card whose tap tells the operator to "ask the agent to re-request"
+  while the agent is parked waiting on that very card and structurally
+  cannot re-request. The stale-card path must resume or re-offer, never
+  hand the operator a dead-end instruction.
 - A false-positive redaction that eats the operator's ordinary question
   just because it said the word "token".
 
@@ -110,6 +129,25 @@ Named by job × surface, pointing at real scenarios in
   resumes on the operator's Allow tap without a re-prompt. *Invariant:*
   `claude-native` — the resume is a synthesized turn injected into the
   interactive session, not a new programmatic model call.
+- **Denied request resumes the turn (DM)** — `vault-deny-resumes-turn-dm`.
+  *Watch:* the operator taps Deny; the parked turn resumes, the agent states
+  what it now can't do and continues or degrades, never left waiting on a
+  card it already got an answer to. *Invariant:* `claude-native` — the
+  resume is a synthesized turn on the deny outcome, not a new programmatic
+  call, and never a silent strand.
+- **Timeout wakes the agent as timeout-not-denial (DM)** —
+  `vault-timeout-wakes-agent-dm`. *Watch:* the card ages past the 60-min
+  default with no tap; the agent is woken with a *timeout, not denial*
+  outcome, says the request went unanswered, and the expired card is
+  re-offered when the operator returns. *Invariant:* `no-self-escalation` —
+  a timeout is never read as a grant, and re-offer keeps the operator in the
+  loop.
+- **Card survives a gateway restart (DM)** —
+  `vault-card-survives-gateway-restart-dm`. *Watch:* a card issued before a
+  gateway restart is still tappable after it; a tap on the still-valid card
+  grants and resumes, and a card that expired during the outage is re-offered
+  on return. *Invariant:* `no-self-escalation` — card state is durable across
+  a bounce, never voided into a silent strand or a self-grant.
 - **One-tap allow off the audit log (DM)** — `vault-audit-allow-dm`.
   *Watch:* operator taps Allow on a recent denial and the agent's next read
   succeeds. *Invariant:* `no-self-escalation` — the denied path offers a
@@ -148,8 +186,11 @@ per-resource, every resume a synthesized turn.
   sourced the same way; per-resource, never blanket.
 - *Tiering:* irreversible / admin-credential actions sit behind the operator
   passphrase, a factor the agent structurally lacks, never a tap alone.
-- *Reliability:* an approval that lands resumes the turn; a denied or
-  restart-interrupted grant never strands the agent silently.
+- *Reliability:* an approval that lands resumes the turn; a denied,
+  timed-out, or restart-interrupted grant never strands the agent silently —
+  each wakes it with its outcome (a timeout as *timeout, not denial*). Cards
+  are durable across a gateway restart and re-offered when they expired
+  during an outage.
 
 ## Related
 

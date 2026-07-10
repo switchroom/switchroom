@@ -33,6 +33,15 @@ language, at the point it affects them.
   detail to know whether the in-flight work survived.
 - An interrupted turn either resumes or is explicitly named as lost, never
   dropped on the floor in silence.
+- A **deliberate** restart (an operator restart, a rollout) that interrupts
+  an in-flight turn resumes it exactly as a crash does. The quota-saving
+  suppression that skips a resume applies **only when nothing was in flight**;
+  it never becomes an excuse to swallow work that was mid-turn when the
+  operator bounced the agent.
+- **Sub-agents and workers killed by a restart are surfaced in the resume.**
+  The parent re-dispatches the ones still needed, or names their loss
+  per-worker. A parent turn never "resumes" while the work it dispatched
+  stays silently dead.
 - Context exhaustion reads as a named event the user understands, not a
   mysterious refusal.
 - Transient failures (network, tool, upstream) retry sensibly; the user
@@ -88,10 +97,12 @@ Named by job × surface, pointing at real scenarios.
   a restart is never silent about what happened.
 
 **Fuzz corpus:** vary failure kind (reboot × crash × context-exhaustion ×
-network flap × upgrade-mid-session) × timing (idle vs mid-turn vs during
-boot window) × surface (DM vs forum channel) × scheduled-job-due-during-
-outage. The invariants must hold across the corpus: always comes back,
-never silently, work resumed or named-as-lost.
+network flap × upgrade-mid-session × deliberate-restart × rollout) × timing
+(idle vs mid-turn vs during boot window) × surface (DM vs forum channel) ×
+scheduled-job-due-during-outage × sub-agent-in-flight-at-restart ×
+approval-card-outstanding-at-restart. The invariants must hold across the
+corpus: always comes back, never silently, work resumed or named-as-lost —
+including dispatched sub-agent work and an outstanding approval card.
 
 ## Verdict
 

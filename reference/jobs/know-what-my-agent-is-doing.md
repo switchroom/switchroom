@@ -47,7 +47,9 @@ close that gap so the user never has to ask.
 - Sub-agent and background work is visible in the same thread. No separate
   surface to hunt for. True in a DM and in a forum channel alike.
 - Failures, limits, crashes, and restarts are always spoken. The user is
-  told what happened and what resumes.
+  told what happened and what resumes. A worker orphaned by a restart is
+  narrated in the worker feed — re-dispatched or named as lost — not silently
+  absent from the thread it was running in.
 - Scrolling back a week later reads as a real conversation, not a deleted
   widget.
 - When work outlives the visible feed — fast turns scroll it away, background
