@@ -55,6 +55,57 @@ describe("stream-controller enforces the wire cap on the post-escape body", () =
     }
   }, 30000);
 
+  it("BLOCKER: multi-update oversize stream emits tails ONCE, not per edit tick", async () => {
+    // Reproduces the duplicate-flood blocker: an oversize body splits into N
+    // pieces. The FIRST flush (send path) emits the anchor + (N-1) tail
+    // messages. Every SUBSEQUENT throttled flush routes through the EDIT
+    // callback. The pre-fix code re-sent all (N-1) tails as brand-new messages
+    // on each edit tick, so `sent.length` grew by (N-1) every update. After the
+    // fix, tails are parked once and edited in place — `sent.length` is flat.
+    process.env.SWITCHROOM_RICH_RENDER = "1";
+    const bot = createFakeBotApi({ startMessageId: 3000 });
+    const unit = "a_b*c|d ";
+    // Near-cap body that degrades to plain and splits into several pieces.
+    const base = unit.repeat(Math.floor((RICH_MESSAGE_MAX_CHARS - 20) / unit.length));
+    // Distinct short prefix per flush so the HEAD piece actually changes —
+    // an unchanged head yields a not-modified edit, which short-circuits before
+    // the tail loop and would hide the duplicate-resend bug.
+    const bodyFor = (i: number) => `v${i} ${base}`;
+
+    const stream = createStreamController({
+      bot: bot as unknown as Parameters<typeof createStreamController>[0]["bot"],
+      chatId: "c1",
+      throttleMs: 0,
+    });
+
+    // First flush → send path: anchor + tails, emitted exactly once.
+    await stream.update(bodyFor(1));
+    const afterFirst = bot.state.sent.length;
+    expect(afterFirst).toBeGreaterThan(1); // genuinely multi-piece
+
+    // Drive several more oversize updates — each routes through the EDIT
+    // callback. The count must NOT grow: tails are edited in place, not resent.
+    await stream.update(bodyFor(2));
+    expect(bot.state.sent.length).toBe(afterFirst);
+    await stream.update(bodyFor(3));
+    expect(bot.state.sent.length).toBe(afterFirst);
+    await stream.update(bodyFor(4));
+    expect(bot.state.sent.length).toBe(afterFirst);
+    await stream.finalize();
+
+    // Final: exactly the anchor + tail set, no duplicates across the lifetime.
+    expect(bot.state.sent.length).toBe(afterFirst);
+    const ids = bot.state.sent.map((s) => s.message_id);
+    expect(new Set(ids).size).toBe(ids.length); // no duplicate message ids
+
+    // Every currently-visible message fits its wire cap and (for plain) 4096.
+    for (const s of bot.state.sent) {
+      const cur = bot.textOf(s.message_id) ?? "";
+      expect(cur.length).toBeLessThanOrEqual(RICH_MESSAGE_MAX_CHARS);
+      if (!s.rich) expect(cur.length).toBeLessThanOrEqual(PLAIN_CAP);
+    }
+  }, 30000);
+
   it("flag OFF leaves the single-send path untouched", async () => {
     const bot = createFakeBotApi({ startMessageId: 2000 });
     const stream = createStreamController({

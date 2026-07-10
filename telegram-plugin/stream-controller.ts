@@ -250,47 +250,128 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
     return bot.api.editMessageText(chatId, id, richMessage(piece.text), opts)
   }
 
+  // Overflow-tail bookkeeping, shared across the send + edit closures for the
+  // whole stream lifetime. A body large enough to split into several
+  // wire-cap pieces anchors on piece[0] (edited in place by draft-stream) and
+  // parks pieces[1..n] as follow-up messages. The draft-stream edit callback
+  // fires on EVERY throttled flush as a streamed answer grows, so we MUST NOT
+  // re-send those tails each tick (that flooded the chat with duplicates — the
+  // blocker this fix closes). Instead we remember each tail's message_id the
+  // first time it is emitted and edit it in place on later flushes; a tail that
+  // did not exist on a prior flush (the piece count grew) is sent fresh once.
+  // End state after finalize: anchor + one message per tail piece, no dupes.
+  const tailIds: number[] = []
+  const tailLastText: string[] = []
+
+  // Emit or update a single tail piece (0-based index `ti` = piece index - 1).
+  // Sends a fresh message the first time; edits in place (skipping unchanged
+  // text) thereafter. A non-parse failure is logged as a partial-delivery
+  // warning and swallowed so the remaining tail pieces still get a chance to
+  // land — never a silent drop, never an abort of pieces K..N (concern C1).
+  const upsertTail = async (ti: number, piece: { text: string; rich: boolean }): Promise<void> => {
+    const existingId = tailIds[ti]
+    if (existingId != null) {
+      if (tailLastText[ti] === piece.text) return // unchanged — skip the API call
+      try {
+        await retry(() => editPiece(existingId, piece, baseOpts), { threadId, chat_id: chatId })
+        tailLastText[ti] = piece.text
+        onEdit?.(existingId, piece.text.length)
+      } catch (err) {
+        if (!literalText && piece.rich && isParseEntitiesError(err)) {
+          warn?.(
+            `stream-controller: tail-piece #${ti + 1} edit parse-entities rejected — retrying same id=${existingId} as plain text (${err instanceof Error ? err.message : String(err)})`,
+          )
+          await retry(
+            () => bot.api.editMessageText(chatId, existingId, piece.text, baseOpts),
+            { threadId, chat_id: chatId },
+          )
+          tailLastText[ti] = piece.text
+          onEdit?.(existingId, piece.text.length)
+        } else {
+          // Best-effort continue: leave tailLastText[ti] stale so the next
+          // flush retries this piece, and surface the partial delivery loudly.
+          warn?.(
+            `stream-controller: tail-piece #${ti + 1} edit FAILED (id=${existingId}) — partial delivery, this piece may be stale (${err instanceof Error ? err.message : String(err)})`,
+          )
+        }
+      }
+      return
+    }
+    // First emission of this tail piece → a fresh follow-up message.
+    try {
+      const sent = await retry(() => sendPiece(piece, sendOpts), { threadId, chat_id: chatId })
+      tailIds[ti] = sent.message_id
+      tailLastText[ti] = piece.text
+      onSend?.(sent.message_id, piece.text.length)
+    } catch (err) {
+      if (!literalText && piece.rich && isParseEntitiesError(err)) {
+        warn?.(
+          `stream-controller: tail-piece #${ti + 1} send parse-entities rejected — sending as plain text (${err instanceof Error ? err.message : String(err)})`,
+        )
+        const sent = await retry(
+          () => bot.api.sendMessage(chatId, piece.text, sendOpts),
+          { threadId, chat_id: chatId },
+        )
+        tailIds[ti] = sent.message_id
+        tailLastText[ti] = piece.text
+        onSend?.(sent.message_id, piece.text.length)
+      } else {
+        // Best-effort continue: no id recorded, so the next flush re-attempts
+        // this piece rather than silently dropping pieces K..N (concern C1).
+        warn?.(
+          `stream-controller: tail-piece #${ti + 1} send FAILED — partial delivery, this and later pieces may be missing this flush (${err instanceof Error ? err.message : String(err)})`,
+        )
+      }
+    }
+  }
+
   return createDraftStream(
     async (text) => {
       // Render → 1+ cap-respecting pieces. The FIRST piece's message_id anchors
-      // the stream (later edits target it); any overflow pieces are sent after
-      // it. For the common single-piece case this is exactly one send.
+      // the stream (later edits target it); any overflow pieces are parked as
+      // follow-up messages via upsertTail. For the common single-piece case
+      // this is exactly one send.
       const pieces = renderPieces(text)
+      const head = pieces[0]
       let anchorId: number | undefined
-      for (let pi = 0; pi < pieces.length; pi++) {
-        const piece = pieces[pi]
-        try {
+      try {
+        const sent = await retry(
+          () => sendPiece(head, sendOpts),
+          { threadId, chat_id: chatId },
+        )
+        anchorId = sent.message_id
+      } catch (err) {
+        if (!literalText && head.rich && isParseEntitiesError(err)) {
+          // Piece rejected because its markdown couldn't be parsed. There is
+          // no message_id to edit (the send 400'd before any message was
+          // created), so recover with a single fresh PLAIN send of the same
+          // body (no rich wrapper, so the parser never runs) — see issue #657.
+          warn?.(
+            `stream-controller: send parse-entities rejected — retrying once as plain text (${err instanceof Error ? err.message : String(err)})`,
+          )
+          // Resend the RAW source verbatim (readable, and the exact
+          // pre-existing #657 contract) rather than the escaped/rendered
+          // body. For a single-piece stream (the common case) this is the
+          // whole message; for a rare oversize split the head falls back to
+          // its own body and each tail to its own body below.
+          const fallbackBody = pieces.length === 1 ? text : head.text
           const sent = await retry(
-            () => sendPiece(piece, sendOpts),
+            () => bot.api.sendMessage(chatId, fallbackBody, sendOpts),
             { threadId, chat_id: chatId },
           )
-          if (anchorId == null) anchorId = sent.message_id
-        } catch (err) {
-          if (!literalText && piece.rich && isParseEntitiesError(err)) {
-            // Piece rejected because its markdown couldn't be parsed. There is
-            // no message_id to edit (the send 400'd before any message was
-            // created), so recover with a single fresh PLAIN send of the same
-            // body (no rich wrapper, so the parser never runs) — see issue #657.
-            warn?.(
-              `stream-controller: send parse-entities rejected — retrying once as plain text (${err instanceof Error ? err.message : String(err)})`,
-            )
-            // Resend the RAW source verbatim (readable, and the exact
-            // pre-existing #657 contract) rather than the escaped/rendered
-            // body. For a single-piece stream (the common case) this is the
-            // whole message; for a rare oversize split each piece falls back
-            // to its own body below.
-            const fallbackBody = pieces.length === 1 ? text : piece.text
-            const sent = await retry(
-              () => bot.api.sendMessage(chatId, fallbackBody, sendOpts),
-              { threadId, chat_id: chatId },
-            )
-            if (anchorId == null) anchorId = sent.message_id
-          } else {
-            throw err
-          }
+          anchorId = sent.message_id
+        } else {
+          throw err
         }
       }
-      onSend?.(anchorId as number, text.length)
+      // C2: report the ACTUAL emitted anchor-piece length, not the full body
+      // length — the anchor only holds the head piece, and the tails report
+      // their own lengths via upsertTail.
+      onSend?.(anchorId as number, head.text.length)
+      // Park overflow pieces (first-time send records their ids for reuse).
+      for (let pi = 1; pi < pieces.length; pi++) {
+        await upsertTail(pi - 1, pieces[pi])
+      }
       return anchorId as number
     },
     async (id, text) => {
@@ -302,7 +383,8 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
           () => editPiece(id, head, baseOpts),
           { threadId, chat_id: chatId },
         )
-        onEdit?.(id, text.length)
+        // C2: report the actual head-piece length, not the full body length.
+        onEdit?.(id, head.text.length)
       } catch (err) {
         if (!literalText && head.rich && isParseEntitiesError(err)) {
           // Edit rejected because the markdown couldn't be parsed — DO NOT
@@ -321,39 +403,19 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
             () => bot.api.editMessageText(chatId, id, fallbackBody, baseOpts),
             { threadId, chat_id: chatId },
           )
-          onEdit?.(id, text.length)
+          onEdit?.(id, head.text.length)
         } else {
           throw err
         }
       }
-      // Oversize tail: the anchor message can hold only the first piece. A body
-      // this large is effectively the terminal stream state, so the remaining
-      // pieces are appended as fresh messages — each obeying its own wire cap —
-      // rather than dropped. This is the fix for the chunk-boundary bug: the old
-      // whole-document plain degradation shipped a ~32k body through the plain
-      // 4096-char `sendMessage` endpoint, which Telegram rejected outright.
+      // Oversize tail: the anchor message holds only the first piece. On EVERY
+      // edit flush we UPDATE the parked tail messages in place (or send a tail
+      // that only just came into existence) — we never re-send tails already
+      // emitted on a prior flush. This is the fix for the duplicate-flood
+      // blocker: the previous code re-sent pieces[1..n] as brand-new messages
+      // on each throttled edit tick.
       for (let pi = 1; pi < pieces.length; pi++) {
-        const piece = pieces[pi]
-        try {
-          const sent = await retry(
-            () => sendPiece(piece, sendOpts),
-            { threadId, chat_id: chatId },
-          )
-          onSend?.(sent.message_id, piece.text.length)
-        } catch (err) {
-          if (!literalText && piece.rich && isParseEntitiesError(err)) {
-            warn?.(
-              `stream-controller: overflow-piece parse-entities rejected — sending as plain text (${err instanceof Error ? err.message : String(err)})`,
-            )
-            const sent = await retry(
-              () => bot.api.sendMessage(chatId, piece.text, sendOpts),
-              { threadId, chat_id: chatId },
-            )
-            onSend?.(sent.message_id, piece.text.length)
-          } else {
-            throw err
-          }
-        }
+        await upsertTail(pi - 1, pieces[pi])
       }
     },
     {
