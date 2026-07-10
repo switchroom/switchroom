@@ -174,8 +174,6 @@ import {
   createRetryApiCall,
   createSwallowingRetryApiCall,
   retryWithThreadFallback,
-  isHtmlParseRejectError,
-  isMessageTooLongError,
 } from '../retry-api-call.js'
 import { installTgPostLogger, withTgPostTags } from '../shared/bot-runtime.js'
 import { floodStatePath, makeFloodWaitRecorder } from '../flood-circuit-breaker.js'
@@ -288,7 +286,8 @@ import {
   normalizeOutboundBody,
   computeEffectiveText,
   computeReplyChunks,
-  resplitOversizeChunk,
+  sendReplyChunks,
+  type ReplyChunkSendDeps,
 } from './outbound-send-path.js'
 import {
   validateInlineKeyboard,
@@ -11673,158 +11672,83 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     }
   }
 
+  // #2996 step 1 — the chunk-send loop (with its THREAD_NOT_FOUND / oversize
+  // re-split / parse-reject fallback ladder and partial-failure contract) is
+  // relocated verbatim to outbound-send-path.ts's `sendReplyChunks` so it is
+  // unit-testable against a fake bot API (gateway.ts is not importable —
+  // Bun.listen + boot logic run at import). The raw `bot.api.*` calls stay HERE
+  // as thin injected adapters (retry wrapping + allow-raw-bot-api markers
+  // preserved), so the module is bot-agnostic and the check-bot-api-wrapping
+  // allowlist is unchanged. The caller still builds the per-chunk option shape
+  // (byte-identical). `sentIds` is threaded by reference; `threadId` /
+  // `previewMessageId` come back for the file-send + history code below.
+  const chunkSendDeps: ReplyChunkSendDeps = {
+    sendRich: (opts, body, tid) =>
+      robustApiCall(
+        // allow-raw-bot-api: injected chunk-loop adapter — sendRichMessage routed through robustApiCall; THREAD_NOT_FOUND handled by sendReplyChunks' fallback ladder
+        () => lockedBot.api.sendRichMessage(chat_id, body as never, opts as never),
+        { threadId: tid, chat_id },
+      ),
+    sendLiteral: (opts, txt, tid) =>
+      robustApiCall(
+        // allow-raw-bot-api: injected chunk-loop adapter — literal format:'text' send routed through robustApiCall; THREAD_NOT_FOUND handled by sendReplyChunks
+        () => lockedBot.api.sendMessage(chat_id, txt, opts as never),
+        { threadId: tid, chat_id },
+      ),
+    sendLiteralRaw: (opts, txt) =>
+      // allow-raw-bot-api: literal last-resort fallback (plaintext parse-reject / length re-split); wrapping would re-enter the parse/length policy that just rejected the payload
+      lockedBot.api.sendMessage(chat_id, txt, opts as never),
+    sendRichRaw: (opts, body) =>
+      // allow-raw-bot-api: rich length-error re-split last resort; wrapping would re-enter the chunk-loop's own classification on an already-classified length failure
+      lockedBot.api.sendRichMessage(chat_id, body as never, opts as never),
+    editPreview: (mid, body, opts, tid) =>
+      robustApiCall(
+        // allow-raw-bot-api: preview edit-in-place routed through robustApiCall; thread fallback handled by sendReplyChunks
+        () => lockedBot.api.editMessageText(chat_id, mid, body as never, opts as never),
+        { threadId: tid, chat_id },
+      ),
+    richMessage,
+    logOutbound,
+    deleteStalePreview,
+    stderr: (s: string) => { process.stderr.write(s) },
+  }
   try {
-    for (let i = 0; i < chunks.length; i++) {
-      // PR-C2: voice-only mode with a successful synthesis suppresses the
-      // text body — the spoken voice note IS the reply. Bail before the
-      // first chunk send (sentIds stays empty for text); the voice send
-      // below lands the answer. Any other mode (voice+text, or voice-only
-      // that fell back) sends the text chunks as normal.
-      if (suppressText) break
-      const shouldReplyTo =
-        reply_to != null && replyMode !== 'off' && (replyMode === 'all' || i === 0)
-      const isLastChunk = i === chunks.length - 1
-      const sendOpts = {
-        ...(shouldReplyTo
-          ? {
-              reply_parameters: {
-                message_id: reply_to,
-                ...(quoteText != null ? { quote: { text: quoteText, position: 0 } } : {}),
-              },
-            }
-          : {}),
-        ...(threadId != null ? { message_thread_id: threadId } : {}),
-        ...(disableLinkPreview ? { link_preview_options: { is_disabled: true } } : {}),
-        ...(replyMarkup != null && isLastChunk ? { reply_markup: replyMarkup } : {}),
-        ...(protectContent ? { protect_content: true } : {}),
-        ...(disableNotification ? { disable_notification: true } : {}),
-      }
-
-      // The body argument for send/edit: a rich-markdown wrapper on the
-      // default path, or the literal string for `format:'text'` (#2669).
-      const richOrPlain = (s: string) => (literalText ? s : richMessage(s))
-
-      if (i === 0 && previewMessageId != null) {
+    const _sendResult = await sendReplyChunks(chunkSendDeps, {
+      chatId: chat_id,
+      chunks,
+      literalText,
+      suppressText,
+      threadId,
+      previewMessageId,
+      sentIds,
+      buildSendOpts: (i, isLastChunk, tid) => {
+        const shouldReplyTo =
+          reply_to != null && replyMode !== 'off' && (replyMode === 'all' || i === 0)
+        return {
+          ...(shouldReplyTo
+            ? {
+                reply_parameters: {
+                  message_id: reply_to,
+                  ...(quoteText != null ? { quote: { text: quoteText, position: 0 } } : {}),
+                },
+              }
+            : {}),
+          ...(tid != null ? { message_thread_id: tid } : {}),
+          ...(disableLinkPreview ? { link_preview_options: { is_disabled: true } } : {}),
+          ...(replyMarkup != null && isLastChunk ? { reply_markup: replyMarkup } : {}),
+          ...(protectContent ? { protect_content: true } : {}),
+          ...(disableNotification ? { disable_notification: true } : {}),
+        }
+      },
+      buildPreviewEditOpts: (isLastChunk) => {
         const editOpts: Record<string, unknown> = {}
         if (disableLinkPreview) editOpts.link_preview_options = { is_disabled: true }
         if (replyMarkup != null && isLastChunk) editOpts.reply_markup = replyMarkup
-        try {
-          await robustApiCall(
-            () => lockedBot.api.editMessageText(chat_id, previewMessageId!, richOrPlain(chunks[i]), editOpts),
-            { threadId, chat_id },
-          )
-          sentIds.push(previewMessageId!)
-          previewMessageId = null
-          continue
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err)
-          if (/not modified/i.test(msg)) {
-            sentIds.push(previewMessageId!)
-            previewMessageId = null
-            continue
-          }
-          process.stderr.write(`telegram gateway: preview edit-in-place failed (${msg}), sending fresh\n`)
-          await deleteStalePreview(previewMessageId!)
-          previewMessageId = null
-        }
-      }
-
-      // Last-resort: resend this chunk as plain text (no rich wrapper, so
-      // the markdown parser never runs). Keeps thread / reply / markup
-      // params; only the formatting is sacrificed. Used when Telegram
-      // rejects our markdown — better an unformatted answer than a
-      // vanished one. The raw markdown source is itself readable prose, so
-      // we send it verbatim rather than strip anything.
-      const sendChunkPlainText = async (opts: Record<string, unknown>): Promise<void> => {
-        const plain =
-          chunks[i].length > 0
-            ? chunks[i]
-            : '⚠️ (a fragment could not be rendered for Telegram)'
-        // allow-raw-bot-api: plaintext last-resort fallback; wrapping would re-enter the parse policy that just rejected the payload
-        const sent = await lockedBot.api.sendMessage(chat_id, plain, opts as never)
-        sentIds.push(sent.message_id)
-        logOutbound('reply', chat_id, sent.message_id, plain.length, `chunk=${i + 1}/${chunks.length} plaintext-fallback`)
-        process.stderr.write(
-          `telegram gateway: markdown parse-reject — resent chunk ${i + 1}/${chunks.length} as plain text\n`,
-        )
-      }
-
-      // Literal `format:'text'` sends bypass the rich parser entirely
-      // (plain sendMessage, no markdown). The default path ships rich
-      // markdown via sendRichMessage. Both resolve to a Message with a
-      // message_id, which is all the caller reads.
-      const sendChunk = (opts: Record<string, unknown>): Promise<{ message_id: number }> => {
-        if (literalText) {
-          // allow-raw-bot-api: literal format:'text' send; the chunk-loop's own THREAD_NOT_FOUND + parse-reject handling wraps this
-          return lockedBot.api.sendMessage(chat_id, chunks[i], opts as never)
-        }
-        // sendRichMessage does NOT accept link_preview_options (rich messages
-        // control previews via entity detection) — drop it for the rich path.
-        const richOpts = { ...opts }
-        delete (richOpts as { link_preview_options?: unknown }).link_preview_options
-        // allow-raw-bot-api: sendRichMessage is not in the THREAD_NOT_FOUND blast pattern; thread fallback handled in the catch below
-        return lockedBot.api.sendRichMessage(chat_id, richMessage(chunks[i]), richOpts as never)
-      }
-
-      // Length-error recovery: a single pre-computed chunk can still exceed the
-      // wire cap when splitMarkdownChunks hit an indivisible region and emitted
-      // it whole (a giant fenced block, a no-boundary blob). Telegram answers
-      // with RICH_MESSAGE_TEXT_TOO_LONG / MESSAGE_TOO_LONG. Re-split this chunk
-      // at a harder boundary and send each piece, rather than misclassifying it
-      // as a parse-reject (which would resend the same oversized payload as
-      // plain text) or surfacing the raw 400.
-      const sendChunkResplit = async (opts: Record<string, unknown>): Promise<void> => {
-        // Re-split at the same cap; for a truly indivisible block this still
-        // yields one oversized piece, but a hard character-cut on the rendered
-        // markdown at least keeps each delivered piece under the wire cap.
-        const pieces = resplitOversizeChunk(chunks[i])
-        for (let p = 0; p < pieces.length; p++) {
-          let sent: { message_id: number }
-          if (literalText) {
-            // allow-raw-bot-api: length-error re-split last resort (literal text); wrapping would re-enter the chunk-loop's own classification on an already-classified length failure.
-            sent = await lockedBot.api.sendMessage(chat_id, pieces[p], opts as never)
-          } else {
-            const ro = { ...opts }
-            delete (ro as { link_preview_options?: unknown }).link_preview_options
-            // allow-raw-bot-api: length-error re-split last resort (rich); wrapping would re-enter the chunk-loop's own classification on an already-classified length failure.
-            sent = await lockedBot.api.sendRichMessage(chat_id, richMessage(pieces[p]), ro as never)
-          }
-          sentIds.push(sent.message_id)
-          logOutbound('reply', chat_id, sent.message_id, pieces[p].length, `chunk=${i + 1}/${chunks.length} resplit=${p + 1}/${pieces.length}`)
-        }
-        process.stderr.write(
-          `telegram gateway: rich body too long — re-split chunk ${i + 1}/${chunks.length} into ${pieces.length} piece(s)\n`,
-        )
-      }
-
-      try {
-        const sent = await robustApiCall(() => sendChunk(sendOpts), { threadId, chat_id })
-        sentIds.push(sent.message_id)
-        logOutbound('reply', chat_id, sent.message_id, chunks[i].length, `chunk=${i + 1}/${chunks.length}`)
-      } catch (err) {
-        if (err instanceof Error && err.message === 'THREAD_NOT_FOUND') {
-          threadId = undefined
-          const retryOpts = { ...sendOpts }
-          delete (retryOpts as any).message_thread_id
-          try {
-            const sent = await sendChunk(retryOpts)
-            sentIds.push(sent.message_id)
-          } catch (retryErr) {
-            // Thread dropped, AND another failure: length → re-split,
-            // parse-reject → plain text, else propagate.
-            if (isMessageTooLongError(retryErr)) await sendChunkResplit(retryOpts)
-            else if (isHtmlParseRejectError(retryErr)) await sendChunkPlainText(retryOpts)
-            else throw retryErr
-          }
-        } else if (isMessageTooLongError(err)) {
-          await sendChunkResplit(sendOpts)
-        } else if (isHtmlParseRejectError(err)) {
-          await sendChunkPlainText(sendOpts)
-        } else {
-          throw err
-        }
-      }
-    }
+        return editOpts
+      },
+    })
+    threadId = _sendResult.threadId
+    previewMessageId = _sendResult.previewMessageId
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     throw new Error(`reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${msg}`)
