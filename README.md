@@ -89,7 +89,7 @@ Full new-user walkthrough, zero to first Telegram message in ~15 minutes, plus t
 | **Claude Pro/Max auth** | OAuth, not API keys. No per-token billing. Fleet-wide active account plus fallback order, broker-owned refresh and credential fanout. |
 | **Always available** | Long-running service per agent. Survives reboots, network drops, your laptop closing. Resumes mid-turn with a wake-audit. |
 | **Honest status** | Every topic shows plain-language state: quiet, working, or idle. Never a black box, never silent, never a tool-call log to babysit. |
-| **Live replies** | The reply streams in place while the agent works, with a Steer button to redirect mid-turn. Posted in the topic, not pinned, no stale cards. |
+| **Live progress, whole replies** | A live progress surface shows what the agent is doing while it works, with a Steer button to redirect mid-turn. The reply itself lands as a whole message when the work is done (long replies chunked), posted in the topic, not pinned, no stale cards. |
 | **Sub-agents** | Opus plans, Sonnet implements. Delegated work surfaces as live rows in a shared fleet block. |
 | **Config cascade** | Defaults, then profiles, then per-agent YAML. Change one line, every agent updates. |
 | **Scheduled tasks** | Cron-syntax tasks that fire across reboots. Headless secret access through the vault broker. |
@@ -149,7 +149,7 @@ You (Telegram)
            │                             │                        ├─ .claude/agents/*.md (sub-agents)
            ├─ Deterministic status       ├─ Approval kernel ◄─────┤   settings.json (tools, hooks, MCP)
            │   (quiet/working/idle)      │   (action grants)      ├─ Hindsight plugin (memory)
-           ├─ Live step streaming        ├─ Vault broker ◄────────┤   Drive MCP, Playwright MCP, …
+           ├─ Live progress surface      ├─ Vault broker ◄────────┤   Drive MCP, Playwright MCP, …
            ├─ Sub-agent fleet block      │   (per-agent ACL)      ├─ in-agent scheduler sidecar
            ├─ SQLite history             ├─ Auth broker ◄─────────┤   (cron, fires across reboots)
            └─ Emoji reactions            │   (OAuth refresh,       │
