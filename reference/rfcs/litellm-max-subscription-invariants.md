@@ -104,22 +104,27 @@ places in the `model` field of its API requests, NOT prefixed with `anthropic/`.
 - model_name: anthropic/claude-sonnet-4-6
 ```
 
-**Current verified list (2026-06-28):**
+**Current verified list (2026-07-10):**
 - `claude-opus-4-8`
-- `claude-sonnet-4-6`
+- `claude-sonnet-5`
+- `claude-fable-5`
 - `claude-haiku-4-5-20251001`
+- `claude-opus-4-7` (stale — kept only as a drift-alias source, see below)
+- `claude-sonnet-4-6` (stale — kept only as a drift-alias source, see below)
 
 Update this list (and `forward_client_headers_to_llm_api`) whenever the CLI
 ships a new model. The CLI's `/model` picker is the authoritative source.
 
-**Sanctioned drift-aliases (deliberate, live).** The fleet runs a small set of
-`model_aliases` that map a name an *older* CLI still sends on the wire to the
-current live model, so an agent on a lagging CLI build keeps routing instead of
-4xxing on an unknown model. These are intentional and NOT a violation of the
-"names must match" rule above — the alias target is another **Anthropic** model,
-so OAuth forwarding (I1/I2) is unaffected and no credential crosses to a
-non-Anthropic upstream (contrast I6, which bars aliasing a Claude name to a
-non-Anthropic target). Currently sanctioned:
+**Sanctioned drift-aliases.** The fleet runs a small set of `model_aliases`
+that map a name an *older* CLI still sends on the wire to the current live
+model, so an agent on a lagging CLI build keeps routing instead of 4xxing on
+an unknown model. These are intentional and NOT a violation of the "names must
+match" rule above — the alias target is another **Anthropic** model, so OAuth
+forwarding (I1/I2) is unaffected and no credential crosses to a non-Anthropic
+upstream (contrast I6, which bars aliasing a Claude name to a non-Anthropic
+target). The deployed litellm proxy config lives OUT-OF-TREE (operator
+infrastructure), so this repo can't pin it — the set below was verified against
+the live deployment on 2026-07-10:
 
 - `claude-opus-4-7` → `claude-opus-4-8`
 - `claude-sonnet-4-6` → `claude-sonnet-5`
@@ -189,8 +194,10 @@ OpenRouter, a credential leak.
 
 **Rule:** the boot gate (`_LITELLM_OK` / `sr_ll_*` in
 `profiles/_base/start.sh.hbs`, ~1002-1011) handles two failure modes
-DIFFERENTLY. This contract applies to both the interactive session and the
-cron session (`profiles/_base/cron-session.sh.hbs`).
+DIFFERENTLY. The contract covers every session kind: it is shipped for the
+interactive session; the cron session
+(`profiles/_base/cron-session.sh.hbs`) is ported to the same contract in
+#2981.
 
 - **Missing virtual key** (no `litellm/<agent>/api-key` in the vault): **fail
   open** — strip the routing env and fall back to direct Anthropic OAuth,

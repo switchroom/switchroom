@@ -54,9 +54,9 @@ A gateway the operator runs (e.g. self-hosted LiteLLM) MAY sit between the
    unrestricted.
 3. **Opt-in, default OFF, availability preserved.** No agent routes through a
    gateway unless the operator turns it on. A gateway problem never silences
-   the fleet, but the recovery is split by cause (the two-mode boot contract in
-   `profiles/_base/start.sh.hbs`, applied to both interactive and cron
-   sessions):
+   the fleet, but the recovery is split by cause (the two-mode boot contract,
+   shipped for interactive sessions in `profiles/_base/start.sh.hbs`; cron
+   sessions are ported to the same contract in #2981):
    - **Missing virtual key** (no per-agent key in the vault): **fail open** to
      the direct subscription path. There is nothing to authenticate to the
      proxy with, so routing env is stripped and the agent talks to Anthropic

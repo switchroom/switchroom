@@ -99,20 +99,22 @@ function looksLikeAlreadyExists(status: number, body: string): boolean {
 /**
  * Heuristic: does a /key/info error response mean "the proxy does not recognize
  * this virtual key" (DB drift) — as opposed to a bad master key or a transient
- * server error? Only a clear not-found on a 400/404 counts, so we never
- * destructively re-provision on an ambiguous failure (a 401/403 from a bad
- * master key, a 5xx blip). LiteLLM surfaces an unknown key as a 400 whose body
- * mentions the key was not found / is invalid.
+ * server error? Only a clear not-found semantic counts, so we never
+ * destructively re-provision on an ambiguous failure (a bare 401/403 from a
+ * bad master key, a 5xx blip, a non-drift 400). LiteLLM has surfaced an
+ * unknown key as a 400 "not found in DB" across versions, and its auth path
+ * can report it as a 401 "Authentication Error: Key not found" — so 401/403
+ * count ONLY when the body carries the not-found semantic; a bare 401/403
+ * stays ambiguous (→ `unreachable`: skip, warn, keep the stored key).
  */
 function looksLikeUnknownKey(status: number, body: string): boolean {
-  if (status !== 400 && status !== 404) return false;
+  if (status !== 400 && status !== 401 && status !== 403 && status !== 404) return false;
   const t = body.toLowerCase();
   return (
     t.includes("not found") ||
     t.includes("does not exist") ||
     t.includes("no such key") ||
-    t.includes("no key found") ||
-    t.includes("invalid")
+    t.includes("no key found")
   );
 }
 
@@ -410,8 +412,8 @@ export async function validateKey(
   if (resp.ok) return { kind: "valid" };
   const body = await safeText(resp);
   if (looksLikeUnknownKey(resp.status, body)) return { kind: "unknown" };
-  // 401/403 (bad master key), 5xx, or any other ambiguous error — do NOT
-  // re-provision; keep the stored key and let the caller warn.
+  // Bare 401/403 (bad master key, no not-found semantic), 5xx, or any other
+  // ambiguous error — do NOT re-provision; keep the stored key and warn.
   return { kind: "unreachable", detail: `HTTP ${resp.status}: ${body.slice(0, 200)}` };
 }
 

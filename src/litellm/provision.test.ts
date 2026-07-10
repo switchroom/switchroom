@@ -362,10 +362,29 @@ describe("validateKey", () => {
     expect((r as { detail: string }).detail).toMatch(/ECONNREFUSED/);
   });
 
-  it("treats a 401 (bad master key) as unreachable, NOT unknown (no destructive re-provision)", async () => {
+  it("returns unknown on a 401 with a clear not-found semantic (auth-path drift shape)", async () => {
+    // Some LiteLLM auth-path shapes report an unknown virtual key as a 401
+    // "Authentication Error: Key not found" — that IS drift, not a bad master
+    // key, so it must trigger re-provisioning.
+    const fetchFn: FetchFn = async () =>
+      mockResponse({ ok: false, status: 401, text: "Authentication Error: Key not found in DB" });
+    const r = await validateKey({ baseUrl: "http://h", masterKey: "m", key: "sk-gone" }, fetchFn);
+    expect(r).toEqual({ kind: "unknown" });
+  });
+
+  it("treats a BARE 401 (bad master key, no not-found semantic) as unreachable, NOT unknown", async () => {
     const fetchFn: FetchFn = async () =>
       mockResponse({ ok: false, status: 401, text: "Authentication Error: invalid master key" });
     const r = await validateKey({ baseUrl: "http://h", masterKey: "bad", key: "sk-x" }, fetchFn);
+    expect(r.kind).toBe("unreachable");
+  });
+
+  it("treats a non-drift 400 'invalid' body as unreachable (no unnecessary key churn)", async () => {
+    // "invalid" alone is NOT a drift signal — a malformed-request 400 must not
+    // trigger a destructive re-provision.
+    const fetchFn: FetchFn = async () =>
+      mockResponse({ ok: false, status: 400, text: "invalid request: bad key format" });
+    const r = await validateKey({ baseUrl: "http://h", masterKey: "m", key: "sk-x" }, fetchFn);
     expect(r.kind).toBe("unreachable");
   });
 
