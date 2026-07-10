@@ -104,7 +104,15 @@ describe("runApply", () => {
       vault: { path: fakeVault },
       telegram: { bot_token: "vault:telegram_bot_token" },
     } as unknown as SwitchroomConfig;
-    expect(() => runApplyPreflight(cfg)).toThrow(/vault/i);
+    // SKIP_COMPOSE_PREFLIGHT: this test pins the VAULT-missing throw, but
+    // runApplyPreflight computes the compose check first (the in-agent-
+    // container redirect needs both signals) — without the dep-injection
+    // seam this was the only test in the suite spawning a REAL unbounded
+    // `docker compose version` subprocess, which flaked past the 5s test
+    // budget on loaded CI runners (PR #2980 shard timeout). Real docker
+    // detection stays covered by the dedicated "compose v2 preflight"
+    // tests below (deterministic: stubbed error / emptied PATH).
+    expect(() => runApplyPreflight(cfg, SKIP_COMPOSE_PREFLIGHT)).toThrow(/vault/i);
   });
 
   describe("UID alignment failure handling", () => {
