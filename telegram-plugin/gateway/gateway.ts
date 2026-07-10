@@ -135,6 +135,11 @@ import {
 } from './permission-rearm.js'
 import { createMissedApprovalsStore, type MissedApproval } from './missed-approvals-store.js'
 import {
+  createAlwaysAllowPersistQueue,
+  drainAlwaysAllowPersistQueue,
+  type AlwaysAllowDrainDeps,
+} from './always-allow-persist-queue.js'
+import {
   renderMissedApprovalsDigest,
   missedApprovalsKeyboard,
   parseMissedApprovalCallback,
@@ -398,7 +403,7 @@ import {
   _resetHostdEnabledCache,
 } from './hostd-dispatch.js'
 import { formatUpdateStatusLine } from './update-status-line.js'
-import type { HostdRequest } from '../../src/host-control/protocol.js'
+import type { HostdRequest, HostdResponse } from '../../src/host-control/protocol.js'
 import type { AgentAudit } from '../welcome-text.js'
 import { shouldSweepChatAtBoot } from './boot-sweep-filter.js'
 import { startWebhookIngestServer } from './webhook-ingest-server.js'
@@ -725,6 +730,113 @@ const permCardStore = createPermissionCardStore(STATE_DIR)
 const missedApprovalsStore = createMissedApprovalsStore(STATE_DIR)
 const MISSED_APPROVAL_REOFFER_ENABLED =
   process.env.SWITCHROOM_MISSED_APPROVAL_REOFFER !== '0'
+// #2973 pt.2 — durable retry queue for "🔁 Always allow" persists that
+// fail for a retryable reason (stale config view, rate limit, transient
+// hostd error). Drained at boot (below) and on a periodic timer so a
+// gateway restart mid-persist never loses the retry.
+const alwaysAllowPersistQueue = createAlwaysAllowPersistQueue(STATE_DIR)
+
+/** Read a hostd `error_envelope`'s structured `retry_after` fix (if
+ * present) as a millisecond delay from now. Returns undefined for any
+ * other fix kind / missing envelope / unparsable timestamp — callers
+ * fall back to plain exponential backoff in that case. */
+function extractRetryAfterMs(resp: HostdResponse): number | undefined {
+  const fix = resp.error_envelope?.fix
+  if (fix == null || fix.kind !== 'retry_after') return undefined
+  const at = Date.parse(fix.retry_at)
+  if (Number.isNaN(at)) return undefined
+  return Math.max(0, at - Date.now())
+}
+
+/**
+ * Build a FRESH dependency set for `drainAlwaysAllowPersistQueue` — a new
+ * factory call per drain pass, not a cached singleton, so every attempt
+ * re-reads config from disk (the #2973 stale-container-side-view failure
+ * class is fixed by never reusing a snapshot across retries).
+ */
+function alwaysAllowDrainDeps(): AlwaysAllowDrainDeps {
+  return {
+    readConfigText: () => {
+      const cfgPath = process.env.SWITCHROOM_CONFIG ?? SWITCHROOM_CONFIG ?? findSwitchroomConfigFile()
+      return readFileSync(cfgPath, 'utf8')
+    },
+    resolveAllowList: (_configText, agentName) => {
+      const cfg = loadSwitchroomConfig()
+      const rawAgent = cfg.agents?.[agentName]
+      if (!rawAgent) return []
+      const resolved = resolveAgentConfig(cfg.defaults, cfg.profiles, rawAgent)
+      return (resolved as { tools?: { allow?: string[] } }).tools?.allow ?? []
+    },
+    isRulePersisted,
+    synthesizeDiff: (agentName, rule, configText) =>
+      synthesizeAllowRuleDiff({ agentName, rule, configText }),
+    dispatchConfigEdit: async (entry, unifiedDiff) => {
+      const req: HostdRequest = {
+        v: 1,
+        op: 'config_propose_edit',
+        request_id: hostdRequestId('gw-always-allow-retry'),
+        args: {
+          unified_diff: unifiedDiff,
+          reason: `Operator 'always allow' retry: ${entry.agentName} can ${entry.grantPhrase}`,
+          target_path: '/state/config/switchroom.yaml',
+        },
+      }
+      const resp = await tryHostdDispatch(entry.agentName, req, 720_000)
+      if (resp === 'not-configured') {
+        return { ok: false as const, error: 'hostd not-configured (retry queue requires host_control.enabled)' }
+      }
+      if (resp.result === 'completed') return { ok: true as const }
+      return {
+        ok: false as const,
+        error: resp.error ?? `hostd ${resp.result}`,
+        retryAfterMs: extractRetryAfterMs(resp),
+      }
+    },
+    // #2973 pt.3 — loud terminal failure. A card edit doesn't ping the
+    // operator (the original permission card was already edited to the
+    // "saving durably in background…" interim state); this posts a NEW
+    // message instead, via the same operator-event broadcast every other
+    // fleet alert uses.
+    notifyTerminalFailure: (entry, reason) => {
+      emitGatewayOperatorEvent({
+        kind: 'always-allow-persist-failed',
+        agent: entry.agentName,
+        detail: `"${entry.grantPhrase}" (rule \`${entry.rule}\`) — ${reason}`,
+        suggestedActions: [],
+        firstSeenAt: new Date(),
+      })
+    },
+    log: (line) => process.stderr.write(line),
+  }
+}
+
+/** ~10 min between periodic drain passes — frequent enough that a
+ * retryable failure (rate limit, transient hostd hiccup) resolves within
+ * a reasonable window, infrequent enough to never look like polling. */
+const ALWAYS_ALLOW_DRAIN_INTERVAL_MS = 10 * 60_000
+
+/**
+ * Boot drain (picks up anything a prior gateway process queued right
+ * before a restart — success criterion: "restarting the gateway mid-
+ * persist does not lose the queued entry") + a periodic timer thereafter.
+ * Called once at gateway startup. Every pass is independently
+ * fault-tolerant — `drainAlwaysAllowPersistQueue` never throws.
+ */
+function scheduleAlwaysAllowPersistDrain(): void {
+  void drainAlwaysAllowPersistQueue(alwaysAllowPersistQueue, alwaysAllowDrainDeps()).catch((err) => {
+    process.stderr.write(
+      `telegram gateway: always-allow-persist-queue boot drain failed: ${(err as Error).message}\n`,
+    )
+  })
+  const timer = setInterval(() => {
+    void drainAlwaysAllowPersistQueue(alwaysAllowPersistQueue, alwaysAllowDrainDeps()).catch((err) => {
+      process.stderr.write(
+        `telegram gateway: always-allow-persist-queue periodic drain failed: ${(err as Error).message}\n`,
+      )
+    })
+  }, ALWAYS_ALLOW_DRAIN_INTERVAL_MS)
+  timer.unref?.()
+}
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
@@ -24831,6 +24943,23 @@ bot.on('callback_query:data', async ctx => {
           process.stderr.write(
             `telegram gateway: always-allow hostd FAILED: ${failReason} (request_id=${request_id})\n`,
           )
+          // #2973 pt.2 — enqueue for the durable retry queue UNLESS the
+          // failure is non-retryable (config edits locked — retrying
+          // won't help until the operator flips the flag; that case
+          // keeps today's honest "did NOT save" card only). Everything
+          // else (stale config view, transient hostd error, rate limit)
+          // gets picked up by the boot/periodic drain instead of quietly
+          // requiring the operator to notice and re-tap.
+          if (!editLockHint) {
+            alwaysAllowPersistQueue.enqueue({
+              agentName,
+              rule: chosen.rule,
+              grantPhrase,
+              chatId: ctx.chat?.id != null ? String(ctx.chat.id) : undefined,
+              threadId: (ctx.callbackQuery?.message as { message_thread_id?: number } | undefined)?.message_thread_id,
+              error: failReason,
+            })
+          }
         }
       }
 
@@ -26720,6 +26849,12 @@ void (async () => {
             })
           }
         }
+
+        // #2973 pt.2 — drain any always-allow persists left queued by a
+        // prior gateway process (e.g. one that restarted mid-persist),
+        // then keep draining periodically for the rest of this process's
+        // lifetime.
+        scheduleAlwaysAllowPersistDrain()
 
         void registerSwitchroomBotCommands().catch(() => {})
 

@@ -156,6 +156,73 @@ function locateAllowLine(
   return null;
 }
 
+/** Internal: a located multi-line flow list (`allow:` then `[` on a
+ * subsequent line, one entry per line, closing `]` on its own line — the
+ * shape clerk's config uses, `switchroom.yaml:507-514`). */
+interface MultilineFlowList {
+  /** 0-based index of the line containing the opening `[`. */
+  openIdx: number;
+  /** 0-based index of the line containing the matching closing `]`. */
+  closeIdx: number;
+  /** Indentation to use for a newly-inserted entry line. */
+  itemIndent: number;
+  /** 0-based index of the last existing entry line, or -1 if the list is
+   * empty (`[` immediately followed by `]`, possibly across lines). */
+  lastEntryIdx: number;
+}
+
+/**
+ * Scan forward from `scanStart` (the line right after `allow:` when its
+ * inline remainder is empty) for a flow list whose opening `[` is on its
+ * OWN subsequent line (issue #2973 — clerk's exact shape). Tracks bracket
+ * depth char-by-char so a matching `]` is found even several lines down.
+ * Returns null if the first non-blank/comment line doesn't open a flow
+ * list, or the list is unterminated within the block.
+ */
+function locateMultilineFlowList(
+  lines: string[],
+  scanStart: number,
+  blockEnd: number,
+): MultilineFlowList | null {
+  let i = scanStart;
+  while (i < blockEnd && isBlankOrComment(lines[i]!)) i++;
+  if (i >= blockEnd) return null;
+  const firstLine = lines[i]!;
+  if (!firstLine.trim().startsWith("[")) return null;
+  const openIdx = i;
+
+  let depth = 0;
+  let closeIdx = -1;
+  for (let j = openIdx; j < blockEnd && closeIdx === -1; j++) {
+    const line = lines[j]!;
+    for (const ch of line) {
+      if (ch === "[") depth++;
+      else if (ch === "]") {
+        depth--;
+        if (depth === 0) {
+          closeIdx = j;
+          break;
+        }
+      }
+    }
+  }
+  if (closeIdx === -1) return null; // unterminated — caller falls back.
+
+  // Entry lines: strictly between the open and close bracket lines,
+  // one per line (the observed shape). Lines that carry entries AND a
+  // bracket on the same line (e.g. inline `[ all,`) aren't split out
+  // here — they're handled upstream by the single-line flow-list case.
+  let lastEntryIdx = -1;
+  for (let j = openIdx + 1; j < closeIdx; j++) {
+    if (isBlankOrComment(lines[j]!)) continue;
+    lastEntryIdx = j;
+  }
+  const itemIndent =
+    lastEntryIdx !== -1 ? indentOf(lines[lastEntryIdx]!) : indentOf(firstLine) + 2;
+
+  return { openIdx, closeIdx, itemIndent, lastEntryIdx };
+}
+
 /**
  * Build a unified-diff hunk from a contiguous slice of the original
  * file. `lines` is the whole file split on `\n`. The hunk replaces the
@@ -282,6 +349,45 @@ export function synthesizeAllowRuleDiff(
     return wrapDiff(hunk);
   }
 
+  // Case (a2): multi-line flow list — `allow:` has an EMPTY inline
+  // remainder, but the `[` opens on a subsequent line and entries run one
+  // per line down to a closing `]` on its own line (clerk's exact shape,
+  // issue #2973). Must be checked before the block-sequence fallback below
+  // — that fallback would otherwise misread the `[`/entries/`]` lines as
+  // block-sequence context and insert a `- <rule>` line ABOVE the `[`,
+  // corrupting the YAML (`E_YAML_UNSAFE_CONSTRUCT`).
+  if (inlineTrimmed.length === 0) {
+    const flow = locateMultilineFlowList(lines, allow.idx + 1, block.agentBlockEnd);
+    if (flow) {
+      if (flow.lastEntryIdx === -1) {
+        // Empty multi-line list (`[` immediately followed by `]`) — insert
+        // the first entry right after the opening bracket line.
+        const insertAt = flow.openIdx + 1;
+        const added = [`${" ".repeat(flow.itemIndent)}${rule}`];
+        const hunk = buildHunk(lines, insertAt, insertAt, [], added);
+        return wrapDiff(hunk);
+      }
+      // Ensure the current last entry carries a trailing comma (YAML flow
+      // sequences accept it, and it's required here since we're adding a
+      // sibling entry on its own line), then append the new entry —
+      // replacing the single last-entry line with both lines.
+      const lastLine = lines[flow.lastEntryIdx]!;
+      const lastTrimmedEnd = lastLine.replace(/\s+$/, "");
+      const fixedLast = lastTrimmedEnd.endsWith(",")
+        ? lastTrimmedEnd
+        : `${lastTrimmedEnd},`;
+      const itemLine = `${" ".repeat(flow.itemIndent)}${rule}`;
+      const hunk = buildHunk(
+        lines,
+        flow.lastEntryIdx,
+        flow.lastEntryIdx + 1,
+        [lastLine],
+        [fixedLast, itemLine],
+      );
+      return wrapDiff(hunk);
+    }
+  }
+
   // Case (b): block sequence. Find the last `- ` entry at indent
   // allow.indent + 2 and insert a new entry after it.
   const itemIndent = allow.indent + 2;
@@ -348,6 +454,14 @@ export function extractAddedAllowRule(unifiedDiff: string): string | null {
       })
       .filter((x): x is string => x !== null);
     if (items.length === 1) return items[0]!;
+    // Multi-line flow-list first-entry insert (list was empty): a single
+    // bare `+` line with no `- ` prefix — the plain entry text itself,
+    // possibly comma-suffixed.
+    if (items.length === 0 && plus.length === 1) {
+      const bare = plus[0]!.trim();
+      const stripped = bare.endsWith(",") ? bare.slice(0, -1).trim() : bare;
+      return stripped.length > 0 ? stripped : null;
+    }
     return null;
   }
 
@@ -366,6 +480,20 @@ export function extractAddedAllowRule(unifiedDiff: string): string | null {
       if (before[i] !== after[i]) return null;
     }
     return added;
+  }
+
+  // Multi-line flow-list append: one `-` line (the previous last entry)
+  // replaced by TWO `+` lines — that same entry now comma-terminated,
+  // plus the new entry on its own line.
+  if (minus.length === 1 && plus.length === 2) {
+    const orig = minus[0]!.trim();
+    const first = plus[0]!.trim();
+    const second = plus[1]!.trim();
+    const origStripped = orig.endsWith(",") ? orig.slice(0, -1).trim() : orig;
+    const firstStripped = first.endsWith(",") ? first.slice(0, -1).trim() : first;
+    if (firstStripped !== origStripped) return null;
+    const added = second.endsWith(",") ? second.slice(0, -1).trim() : second;
+    return added.length > 0 ? added : null;
   }
 
   return null;

@@ -178,6 +178,89 @@ describe('synthesizeAllowRuleDiff — structural cases', () => {
     }
   })
 
+  it('(a2) multi-line flow list (clerk\'s exact shape, #2973): appends before the closing ]', () => {
+    // Mirrors switchroom.yaml:507-514 — `allow:` has an empty inline
+    // remainder, `[` opens on the NEXT line, one entry per line, `]`
+    // closes on its own line with no trailing comma on the last entry.
+    const cfg = cfgWith(
+      [
+        '  clerk:',
+        '    topic_name: clerk',
+        '    purpose: clerk',
+        '    tools:',
+        '      allow:',
+        '        [',
+        '          all,',
+        '          mcp__ms-365__*,',
+        '          mcp__ms-365__verify-login,',
+        '          mcp__ms-365__list-mail-messages',
+        '        ]',
+        '    model: opus',
+      ].join('\n'),
+    )
+    const diff = synthesizeAllowRuleDiff({ agentName: 'clerk', rule: 'Skill(calendar)', configText: cfg })
+    expect(diff).not.toBeNull()
+    expect(diff).toContain('--- a/switchroom.yaml')
+    expect(diff).toContain('+++ b/switchroom.yaml')
+    const res = applyViaValidator(cfg, diff!)
+    expect(res).toMatchObject({ ok: true })
+    if (res.ok) {
+      expect(allowListFor(res.postApplyContent, 'clerk')).toEqual([
+        'all',
+        'mcp__ms-365__*',
+        'mcp__ms-365__verify-login',
+        'mcp__ms-365__list-mail-messages',
+        'Skill(calendar)',
+      ])
+    }
+  })
+
+  it('(a2) multi-line flow list: last entry already comma-terminated', () => {
+    const cfg = cfgWith(
+      [
+        '  clerk:',
+        '    topic_name: clerk',
+        '    purpose: clerk',
+        '    tools:',
+        '      allow:',
+        '        [',
+        '          Read,',
+        '          Grep,',
+        '        ]',
+        '    model: opus',
+      ].join('\n'),
+    )
+    const diff = synthesizeAllowRuleDiff({ agentName: 'clerk', rule: 'Bash', configText: cfg })
+    expect(diff).not.toBeNull()
+    const res = applyViaValidator(cfg, diff!)
+    expect(res).toMatchObject({ ok: true })
+    if (res.ok) {
+      expect(allowListFor(res.postApplyContent, 'clerk')).toEqual(['Read', 'Grep', 'Bash'])
+    }
+  })
+
+  it('(a2) multi-line flow list: empty list across lines gets first entry', () => {
+    const cfg = cfgWith(
+      [
+        '  clerk:',
+        '    topic_name: clerk',
+        '    purpose: clerk',
+        '    tools:',
+        '      allow:',
+        '        [',
+        '        ]',
+        '    model: opus',
+      ].join('\n'),
+    )
+    const diff = synthesizeAllowRuleDiff({ agentName: 'clerk', rule: 'Bash', configText: cfg })
+    expect(diff).not.toBeNull()
+    const res = applyViaValidator(cfg, diff!)
+    expect(res).toMatchObject({ ok: true })
+    if (res.ok) {
+      expect(allowListFor(res.postApplyContent, 'clerk')).toEqual(['Bash'])
+    }
+  })
+
   it('multi-agent: only the target agent is touched', () => {
     const cfg = cfgWith(
       [
@@ -248,6 +331,34 @@ describe('extractAddedAllowRule — round-trips the synthesized diff', () => {
         '    purpose: clerk', '    tools:', '      allow: [ all ]', '    model: opus'].join('\n'))
     const diff = synthesizeAllowRuleDiff({ agentName: 'clerk', rule: 'Skill(mail)', configText: cfg })!
     expect(extractAddedAllowRule(diff)).toBe('Skill(mail)')
+  })
+
+  it('multi-line flow-list append (clerk\'s exact shape, #2973)', () => {
+    const cfg = cfgWith(
+      [
+        '  clerk:',
+        '    topic_name: clerk',
+        '    purpose: clerk',
+        '    tools:',
+        '      allow:',
+        '        [',
+        '          all,',
+        '          mcp__ms-365__verify-login',
+        '        ]',
+        '    model: opus',
+      ].join('\n'),
+    )
+    const diff = synthesizeAllowRuleDiff({ agentName: 'clerk', rule: 'Skill(calendar)', configText: cfg })!
+    expect(extractAddedAllowRule(diff)).toBe('Skill(calendar)')
+  })
+
+  it('multi-line flow-list first-entry insert (empty list across lines)', () => {
+    const cfg = cfgWith(
+      ['  clerk:', '    topic_name: clerk', '    purpose: clerk',
+        '    tools:', '      allow:', '        [', '        ]', '    model: opus'].join('\n'),
+    )
+    const diff = synthesizeAllowRuleDiff({ agentName: 'clerk', rule: 'Bash', configText: cfg })!
+    expect(extractAddedAllowRule(diff)).toBe('Bash')
   })
 
   it('absent tools.allow (case c) — extracts the single added rule', () => {
