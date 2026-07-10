@@ -52,9 +52,21 @@ A gateway the operator runs (e.g. self-hosted LiteLLM) MAY sit between the
    **content-safety guardrails** (PII redaction/blocking on message
    content). Observation (token/cost metering, logging, tagging) is
    unrestricted.
-3. **Opt-in, default OFF.** No agent routes through a gateway unless the
-   operator turns it on, and a gateway outage **fails open** to the direct
-   subscription path (availability is never sacrificed to the proxy).
+3. **Opt-in, default OFF, availability preserved.** No agent routes through a
+   gateway unless the operator turns it on. A gateway problem never silences
+   the fleet, but the recovery is split by cause (the two-mode boot contract in
+   `profiles/_base/start.sh.hbs`, applied to both interactive and cron
+   sessions):
+   - **Missing virtual key** (no per-agent key in the vault): **fail open** to
+     the direct subscription path. There is nothing to authenticate to the
+     proxy with, so routing env is stripped and the agent talks to Anthropic
+     directly on the forwarded OAuth — loudly logged as untracked/unguarded.
+   - **Proxy unreachable with a key present**: **keep routing and warn** — do
+     NOT fall open. Routing env is left pointed at the proxy so traffic
+     self-heals the moment it recovers (the socat forwarder reconnects
+     per-connection), rather than silently going untracked on a transient blip.
+   Failing open on an unreachable-but-keyed proxy was removed (#2940): silent
+   untracked traffic violates the cost-tracking side of this carve-out.
 4. **Non-Anthropic is a separate path.** Other models routed through the
    same gateway are off-subscription, separately billed, and **not** covered
    by the subscription-native guarantee. They are a distinct,

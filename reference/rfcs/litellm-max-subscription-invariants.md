@@ -112,6 +112,22 @@ places in the `model` field of its API requests, NOT prefixed with `anthropic/`.
 Update this list (and `forward_client_headers_to_llm_api`) whenever the CLI
 ships a new model. The CLI's `/model` picker is the authoritative source.
 
+**Sanctioned drift-aliases (deliberate, live).** The fleet runs a small set of
+`model_aliases` that map a name an *older* CLI still sends on the wire to the
+current live model, so an agent on a lagging CLI build keeps routing instead of
+4xxing on an unknown model. These are intentional and NOT a violation of the
+"names must match" rule above — the alias target is another **Anthropic** model,
+so OAuth forwarding (I1/I2) is unaffected and no credential crosses to a
+non-Anthropic upstream (contrast I6, which bars aliasing a Claude name to a
+non-Anthropic target). Currently sanctioned:
+
+- `claude-opus-4-7` → `claude-opus-4-8`
+- `claude-sonnet-4-6` → `claude-sonnet-5`
+
+Retire a drift-alias once no fleet CLI emits the stale name. Keep both the
+source and the target present in `model_list` with a matching
+`forward_client_headers_to_llm_api` entry while the alias is live.
+
 ---
 
 ## I5 — Virtual key header format is `x-litellm-api-key: Bearer <key>`
@@ -169,18 +185,39 @@ OpenRouter, a credential leak.
 
 ---
 
-## I7 — Fallback to direct OAuth on proxy unreachable (availability invariant)
+## I7 — Availability on proxy trouble is split by cause (fail-open ONLY on a missing key)
 
-**Rule:** `start.sh` MUST fall back to direct Anthropic OAuth (no proxy) when:
-- The virtual key is absent from vault, OR
-- The proxy is unreachable at `$ANTHROPIC_BASE_URL`
+**Rule:** the boot gate (`_LITELLM_OK` / `sr_ll_*` in
+`profiles/_base/start.sh.hbs`, ~1002-1011) handles two failure modes
+DIFFERENTLY. This contract applies to both the interactive session and the
+cron session (`profiles/_base/cron-session.sh.hbs`).
 
-This is the current implementation (the `sr_ll_ok` gate in start.sh). Do NOT
-remove this fallback. It is the availability guarantee that prevents a proxy
-outage from silencing the fleet.
+- **Missing virtual key** (no `litellm/<agent>/api-key` in the vault): **fail
+  open** — strip the routing env and fall back to direct Anthropic OAuth,
+  logged LOUDLY as untracked/unguarded. Without a key there is nothing to
+  authenticate to the proxy with, so there is no metered route to self-heal
+  into.
+- **Proxy unreachable at boot, key present** (the bounded liveliness probe
+  fails within its retry window): **keep routing and warn — do NOT fall
+  open.** Leave `ANTHROPIC_BASE_URL` / `SWITCHROOM_LITELLM*` pointed at the
+  proxy and emit a loud warning. Claude traffic fails+retries until the proxy
+  returns, then routes through it automatically (the socat forwarder at
+  `127.0.0.1:4010` reconnects per-connection). The metered path stays the
+  metered path.
 
-**What the fallback loses:** spend tracking, guardrails, model alias routing,
-per-agent virtual key budget limits. Log line emitted so the operator knows.
+**What fail-open (missing-key case) loses:** spend tracking, guardrails, model
+alias routing, per-agent virtual key budget limits. A log line is emitted so
+the operator knows.
+
+**History — this SUPERSEDES the original "always fail open" rule.** I7 once
+mandated falling back to direct OAuth whenever the proxy was unreachable OR the
+key was absent. That was removed (#2940 / start.sh commit `6106036c`): an agent
+that booted during a brief litellm blip fell open to **silent untracked** direct
+Anthropic and never routed through litellm again until a manual restart — which
+violates the cost-tracking invariant (the observation half of the
+`reference/invariants.md` gateway carve-out). The unreachable-with-key path now
+keeps routing so the fleet self-heals; only a genuinely missing key fails open.
+Do NOT re-introduce the removed blanket fallback.
 
 ---
 

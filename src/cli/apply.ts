@@ -295,7 +295,7 @@ export async function provisionLiteLLMKeys(
   if (optedIn.length === 0 && !needsHindsight) return; // zero-impact when the feature is off
 
   // Lazy imports — only paid for when at least one agent opts in or hindsight is wired.
-  const [{ getViaBrokerStructured, putViaBroker }, { ensureTeam, ensureKey }, { addAgentSecret }] =
+  const [{ getViaBrokerStructured, putViaBroker }, { ensureTeam, ensureKey, validateKey }, { addAgentSecret }] =
     await Promise.all([
       import("../vault/broker/client.js"),
       import("../litellm/provision.js"),
@@ -347,9 +347,36 @@ export async function provisionLiteLLMKeys(
         unprovisionedNew.push(name);
       }
     }
-    // The hindsight service key can't be probed the same idempotent way here;
-    // treat it as needing provisioning (surfaced) when the feature wants it.
-    const hindsightPending = needsHindsight;
+    // The hindsight service key uses the SAME idempotent broker probe as the
+    // per-agent keys (getViaBrokerStructured is a read — no passphrase needed),
+    // identical to the provisioning path at the bottom of this function
+    // (litellm/hindsight/api-key). Probe it before declaring it pending, so a
+    // fully-provisioned system stops pushing a spurious failures[] entry on
+    // every passphrase-less apply/reconcile. `ok` → already provisioned;
+    // `unreachable` → degrade (can't verify, don't fail — parity with the
+    // agent unreachable path, #2781); `not_found`/`denied` → genuinely pending.
+    let hindsightPending = false;
+    if (needsHindsight) {
+      const h = await getViaBrokerStructured("litellm/hindsight/api-key");
+      if (h.kind === "ok") {
+        hindsightPending = false;
+        writeOut(
+          chalk.gray(
+            `  ~ litellm/hindsight: key already provisioned (skipped) — unaffected by missing passphrase.\n`,
+          ),
+        );
+      } else if (h.kind === "unreachable") {
+        hindsightPending = false;
+        ctx.writeErr(
+          chalk.yellow(
+            `  ! litellm/hindsight: vault-broker unreachable — could not verify the ` +
+            `service key; it keeps its previous state.\n`,
+          ),
+        );
+      } else {
+        hindsightPending = true;
+      }
+    }
 
     if (alreadyProvisioned.length > 0) {
       writeOut(
@@ -455,21 +482,9 @@ export async function provisionLiteLLMKeys(
       }
 
       const vaultKey = `litellm/${name}/api-key`;
+      const alias = `agent:${name}`;
 
-      // Idempotency: skip if the vault already holds the key.
       const existing = await getViaBrokerStructured(vaultKey);
-      if (existing.kind === "ok") {
-        writeOut(chalk.gray(`  ~ litellm/${name}: key already provisioned (skipped)\n`));
-        // Still ensure the read-ACL is granted (cheap, idempotent).
-        if (configText !== null) {
-          const after = addAgentSecret(configText, name, vaultKey);
-          if (after !== configText) {
-            configText = after;
-            pendingConfigEdits = true;
-          }
-        }
-        continue;
-      }
       if (existing.kind === "unreachable") {
         // #2781: an unreachable broker is an ENVIRONMENT limitation, not a
         // provisioning error — hostd's in-container `switchroom apply` has no
@@ -490,28 +505,89 @@ export async function provisionLiteLLMKeys(
         continue;
       }
 
-      // Resolve a `vault:` admin_key via the auto-unlocked broker.
-      let masterKey = adminKeyRef;
+      // Resolve a `vault:` admin_key via the auto-unlocked broker. Failure is
+      // only FATAL on the provisioning path below — an already-provisioned agent
+      // whose admin_key ref is momentarily unresolvable keeps its key (validation
+      // is skipped), it is NOT reported as a scaffold failure.
+      let masterKey: string | null = adminKeyRef;
+      let masterKeyErr: string | null = null;
       if (isVaultReference(adminKeyRef)) {
         const refKey = parseVaultReference(adminKeyRef);
         const resolved = await getViaBrokerStructured(refKey);
         if (resolved.kind !== "ok") {
-          failures.push({
-            agent: name,
-            message:
-              `litellm: admin_key vault ref '${adminKeyRef}' did not resolve ` +
-              `(${resolved.kind}${"msg" in resolved && resolved.msg ? `: ${resolved.msg}` : ""}).`,
-          });
+          masterKey = null;
+          masterKeyErr =
+            `litellm: admin_key vault ref '${adminKeyRef}' did not resolve ` +
+            `(${resolved.kind}${"msg" in resolved && resolved.msg ? `: ${resolved.msg}` : ""}).`;
+        } else if (resolved.entry.kind !== "string") {
+          masterKey = null;
+          masterKeyErr = `litellm: admin_key vault ref '${adminKeyRef}' is not a string secret.`;
+        } else {
+          masterKey = resolved.entry.value;
+        }
+      }
+
+      // Idempotency + DB-drift validation (fix): the vault already holds a key.
+      // Pre-fix this ALWAYS skipped, blind to the proxy's own state — so a proxy
+      // DB reset/restore (without the vault) left every agent 401ing forever.
+      // Now: when we have the admin key in hand AND the proxy is reachable,
+      // validate the stored key via GET /key/info; an unknown key means DB drift
+      // and we re-provision through the same self-healing ensureKey path.
+      if (existing.kind === "ok") {
+        const storedKey = existing.entry.kind === "string" ? existing.entry.value : null;
+        let driftReprovision = false;
+        if (storedKey && masterKey) {
+          const validation = await validateKey({ baseUrl, masterKey, key: storedKey });
+          if (validation.kind === "unknown") {
+            // Proxy reachable but the key is NOT recognized (DB drift). Fall
+            // through to re-provision (ensureKey self-heals the orphaned alias)
+            // and overwrite the stale vault key.
+            driftReprovision = true;
+            ctx.writeErr(
+              chalk.yellow(
+                `  ! litellm/${name}: stored virtual key not recognized by the proxy ` +
+                `(DB drift) — re-provisioning a fresh key.\n`,
+              ),
+            );
+          } else if (validation.kind === "unreachable") {
+            // Availability-safe (#2781): an unreachable/ambiguous proxy never
+            // fails the apply — keep the stored key, warn, and move on.
+            ctx.writeErr(
+              chalk.yellow(
+                `  ! litellm/${name}: proxy unreachable during key validation ` +
+                `(${validation.detail}) — keeping the stored key unverified.\n`,
+              ),
+            );
+          } else {
+            writeOut(chalk.gray(`  ~ litellm/${name}: key already provisioned + validated (skipped)\n`));
+          }
+        } else {
+          // Can't validate (no admin key in hand, or a non-string entry) — keep
+          // the pre-fix idempotent skip. Do NOT surface masterKeyErr here: an
+          // already-provisioned agent stays good even if its admin_key ref is
+          // momentarily unresolvable.
+          writeOut(chalk.gray(`  ~ litellm/${name}: key already provisioned (skipped)\n`));
+        }
+
+        if (!driftReprovision) {
+          // Still ensure the read-ACL is granted (cheap, idempotent).
+          if (configText !== null) {
+            const after = addAgentSecret(configText, name, vaultKey);
+            if (after !== configText) {
+              configText = after;
+              pendingConfigEdits = true;
+            }
+          }
           continue;
         }
-        if (resolved.entry.kind !== "string") {
-          failures.push({
-            agent: name,
-            message: `litellm: admin_key vault ref '${adminKeyRef}' is not a string secret.`,
-          });
-          continue;
-        }
-        masterKey = resolved.entry.value;
+        // driftReprovision → fall through to the provisioning block below.
+      }
+
+      // Provisioning path (genuinely-new agent OR DB-drift re-provision). The
+      // admin key MUST resolve here.
+      if (!masterKey) {
+        failures.push({ agent: name, message: masterKeyErr ?? `litellm: admin_key unresolved` });
+        continue;
       }
 
       // Provision: ensure team, then generate the per-agent key.
@@ -530,9 +606,12 @@ export async function provisionLiteLLMKeys(
       const { key } = await ensureKey({
         baseUrl,
         masterKey,
-        alias: `agent:${name}`,
+        alias,
         team,
         metadata,
+        // Surface the orphaned-alias self-heal steps (delete + regenerate) so the
+        // operator sees the recovery instead of a silent extra round-trip.
+        log: (m) => ctx.writeErr(chalk.gray(`  ~ litellm/${name}: ${m}\n`)),
       });
 
       // Store the key in the vault via the broker WITH operator-passphrase
@@ -623,6 +702,7 @@ export async function provisionLiteLLMKeys(
             alias: "service:hindsight",
             team,
             metadata: { service: "hindsight", env: "fleet", ...(oauthAccount ? { oauth_account: oauthAccount } : {}) },
+            log: (m) => ctx.writeErr(chalk.gray(`  ~ litellm/hindsight: ${m}\n`)),
           });
           const put = await putViaBroker(
             hindsightVaultKey,
