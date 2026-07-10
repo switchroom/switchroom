@@ -23,10 +23,14 @@ const bridgeSrc = readFileSync(
   resolve(__dirname, '..', 'bridge', 'bridge.ts'),
   'utf-8',
 )
-const gatewaySrc = readFileSync(
-  resolve(__dirname, '..', 'gateway', 'gateway.ts'),
-  'utf-8',
-)
+// #2996 Phase 5: the callback-query handler families moved verbatim to
+// gateway/callback-query-handlers.ts; these pins read the gateway source
+// COMBINED with that module so the wiring assertions keep covering the
+// same runtime source text.
+const gatewaySrc =
+  readFileSync(resolve(__dirname, '..', 'gateway', 'gateway.ts'), 'utf-8') +
+  '\n' +
+  readFileSync(resolve(__dirname, '..', 'gateway', 'callback-query-handlers.ts'), 'utf-8')
 
 describe('vault_request_access (#1012)', () => {
   it('bridge advertises the tool to MCP clients', () => {

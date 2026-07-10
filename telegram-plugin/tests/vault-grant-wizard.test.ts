@@ -40,7 +40,14 @@ function readSrc(rel: string): string {
 // `telegram-plugin/docs/gateway-server-split.md` for the F4 cleanup notes.
 
 describe('/vault grant inline-keyboard wizard — gateway (#227, #262, #265)', () => {
-  const gatewaySrc = readSrc('telegram-plugin/gateway/gateway.ts')
+  // #2996 Phase 5: the callback-query handler families moved verbatim to
+  // gateway/callback-query-handlers.ts; these pins read the gateway source
+  // COMBINED with that module so the wiring assertions keep covering the
+  // same runtime source text.
+  const gatewaySrc =
+    readSrc('telegram-plugin/gateway/gateway.ts') +
+    '\n' +
+    readSrc('telegram-plugin/gateway/callback-query-handlers.ts')
 
   it('gateway.ts: dispatches /vault grant to the wizard entry', () => {
     expect(gatewaySrc).toMatch(/\/vault grant/i)
