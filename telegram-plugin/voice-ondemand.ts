@@ -49,6 +49,15 @@ export type VoiceOnDemandPayload = {
    *  the pre-synth queue after a successful background synth. Absent on
    *  pre-feature entries, on kill-switched gateways, and until the job runs. */
   filePath?: string
+  /** Telegram's reusable file_id for the audio, captured from the FIRST
+   *  successful `sendVoice` for this entry. On subsequent taps the gateway
+   *  sends BY this id (a plain string, not an InputFile) so Telegram serves
+   *  the already-uploaded bytes — no disk read, no re-upload round-trip, so
+   *  the voice note arrives near-instantly. Absent until the first send;
+   *  refreshed if a stale id is rejected and the audio is re-uploaded. It
+   *  lives on the entry, so the 7-day sweep's `prune()` drops it together
+   *  with the entry — a dead id is never resurrected. */
+  telegramFileId?: string
   /** Epoch ms the entry was stored (put time) — recorded alongside filePath
    *  per #2763 so the sweep/introspection can reason about entry age. */
   createdAt?: number
@@ -136,7 +145,7 @@ export class VoiceOnDemandCache {
       this.flush()
       return null
     }
-    const { text, voice, speed, filePath } = entry
+    const { text, voice, speed, filePath, telegramFileId } = entry
     // createdAt stays internal (persisted for sweep/introspection) so the
     // returned shape only grows when a pre-synth file actually exists —
     // pre-#2763 callers and tests see the exact old payload.
@@ -145,6 +154,7 @@ export class VoiceOnDemandCache {
       speed,
       ...(voice !== undefined ? { voice } : {}),
       ...(filePath !== undefined ? { filePath } : {}),
+      ...(telegramFileId !== undefined ? { telegramFileId } : {}),
     }
   }
 
@@ -156,6 +166,20 @@ export class VoiceOnDemandCache {
     const entry = this.store.get(token)
     if (entry == null || entry.expiresAt <= this.now()) return
     entry.filePath = filePath
+    this.flush()
+  }
+
+  /** Record (or refresh) Telegram's reusable file_id on an existing entry,
+   *  captured from a successful `sendVoice`. Mirrors {@link setFilePath}: no-op
+   *  if the entry has expired or been evicted meanwhile, and does NOT bump LRU
+   *  position or TTL — the entry's lifetime stays anchored at put time so a
+   *  captured id can never resurrect a dying entry. Passing an empty string is
+   *  ignored (nothing to store). */
+  setTelegramFileId(token: string, fileId: string): void {
+    if (fileId.length === 0) return
+    const entry = this.store.get(token)
+    if (entry == null || entry.expiresAt <= this.now()) return
+    entry.telegramFileId = fileId
     this.flush()
   }
 

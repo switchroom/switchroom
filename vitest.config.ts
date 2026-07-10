@@ -165,6 +165,8 @@ export default defineConfig({
       "**/telegram-plugin/tests/tts-normalize.test.ts",
       // voice-presynth.test.ts (#2763) imports bun:test — run via test:bun.
       "**/telegram-plugin/tests/voice-presynth.test.ts",
+      // voice-send.test.ts (file_id reuse) imports bun:test — run via test:bun.
+      "**/telegram-plugin/tests/voice-send.test.ts",
       // fleet-fallback-gate.test.ts uses bun:test — run via test:bun.
       "**/telegram-plugin/tests/fleet-fallback-gate.test.ts",
       "**/telegram-plugin/tests/ipc-server-client.test.ts",

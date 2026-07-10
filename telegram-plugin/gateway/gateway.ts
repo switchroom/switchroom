@@ -62,6 +62,7 @@ import {
   buildListenKeyboard,
   mayInjectListenButton,
 } from '../voice-ondemand.js'
+import { sendVoiceReusingFileId } from '../voice-send.js'
 import {
   PreSynthQueue,
   sweepVoiceCacheDir,
@@ -10455,6 +10456,15 @@ const voicePreSynthQueue = new PreSynthQueue({
     }
     const filePath = writeVoiceCacheFile(VOICE_CACHE_DIR, job.token, result.audio)
     voiceOnDemandCache.setFilePath(job.token, filePath)
+    // TODO(first-tap-instant): pre-mint the Telegram file_id here so even the
+    // FIRST user tap sends by id (no upload). Would require uploading this ogg
+    // once to the bot's OWN hidden storage/log chat and calling
+    // voiceOnDemandCache.setTelegramFileId(job.token, msg.voice.file_id).
+    // Deferred: no storage-chat id exists in config/env today, and the product
+    // invariant forbids sending audio to the USER's chat without a tap — so a
+    // dedicated bot-storage chat id must be added first. Until then, the first
+    // tap uploads (via the disk fast-path) and captures the id for reuse; only
+    // the second+ taps are instant.
     process.stderr.write(
       `telegram gateway: voice-presynth: cached ${result.audio.length} bytes at ${filePath} ` +
         `(${result.durationMs}ms, backlog=${voicePreSynthQueue.size})\n`,
@@ -25165,22 +25175,36 @@ bot.on('callback_query:data', async ctx => {
       }
       return undefined
     })()
-    // #2763 attach-on-tap: prefer the eagerly pre-synthesized file (written
-    // by the pre-synth queue at reply time). If it's on disk, attach it
-    // immediately — no GPU wait. Missing/unreadable file (expired + swept,
-    // crash, pre-feature entry, kill-switched gateway) falls back
-    // transparently to the lazy synth path below.
-    let audio: Uint8Array | null = null
-    if (entry.filePath != null) {
-      try {
-        audio = readFileSync(entry.filePath)
-      } catch {
-        audio = null // swept/missing — lazy fallback
-      }
+    const tok = token as string
+    const sendOpts = {
+      ...(cbMessageId != null ? { reply_parameters: { message_id: cbMessageId } } : {}),
+      ...(cbThreadId != null ? { message_thread_id: cbThreadId } : {}),
+    } as never
+    const sendVerbOpts = {
+      chat_id: cbChatId,
+      verb: 'voice-ondemand.sendVoice',
+      ...(cbThreadId != null ? { threadId: cbThreadId } : {}),
     }
-    if (audio != null) {
-      await ctx.answerCallbackQuery({ text: '🔊' }).catch(() => {})
-    } else {
+
+    // #2763 attach-on-tap: prefer the eagerly pre-synthesized file (written by
+    // the pre-synth queue at reply time). If it's on disk, attach it
+    // immediately — no GPU wait. Missing/unreadable file (expired + swept,
+    // crash, pre-feature entry, kill-switched gateway) falls back transparently
+    // to the lazy synth path. Only invoked when there's no reusable file_id (or
+    // a stored id was rejected as stale) — see sendVoiceReusingFileId.
+    const loadAudio = async (): Promise<Uint8Array | null> => {
+      let audio: Uint8Array | null = null
+      if (entry.filePath != null) {
+        try {
+          audio = readFileSync(entry.filePath)
+        } catch {
+          audio = null // swept/missing — lazy fallback
+        }
+      }
+      if (audio != null) {
+        await ctx.answerCallbackQuery({ text: '🔊' }).catch(() => {})
+        return audio
+      }
       await ctx.answerCallbackQuery({ text: '🔊 Synthesizing…' }).catch(() => {})
       // Local sidecar (kokoro) synthesis — same helper the immediate voice-out
       // path uses. On-demand is a local-engine feature; the cache is only
@@ -25190,7 +25214,7 @@ bot.on('callback_query:data', async ctx => {
         await ctx
           .answerCallbackQuery({ text: 'Voice sidecar unavailable — try again later.' })
           .catch(() => {})
-        return
+        return null
       }
       const result = await synthesizeViaSidecar({
         token: sidecarToken,
@@ -25209,33 +25233,52 @@ bot.on('callback_query:data', async ctx => {
         await ctx
           .answerCallbackQuery({ text: `Voice failed: ${result.reason}` })
           .catch(() => {})
-        return
+        return null
       }
-      audio = result.audio
+      return result.audio
     }
-    // Rebind as const so the closure below narrows to non-null (TS doesn't
-    // narrow a captured `let` inside an arrow function).
-    const audioOut: Uint8Array = audio
+
+    // Fast path: if we already captured a reusable file_id, ack instantly and
+    // send BY the id — no disk read, no re-upload. First tap (no id yet) and a
+    // stale-id fallback both go through loadAudio + InputFile below and refresh
+    // the stored id from the returned message.
+    if (entry.telegramFileId != null) {
+      await ctx.answerCallbackQuery({ text: '🔊' }).catch(() => {})
+    }
+    const sendResult = await sendVoiceReusingFileId({
+      fileId: entry.telegramFileId ?? null,
+      sendByFileId: (fid) =>
+        robustApiCall(
+          // allow-raw-bot-api: reuse Telegram's file_id — no re-upload.
+          () => bot.api.sendVoice(cbChatId, fid, sendOpts),
+          sendVerbOpts,
+        ),
+      loadAudio,
+      sendByUpload: (audioOut) =>
+        robustApiCall(
+          // allow-raw-bot-api: single native voice-note send for an on-demand Listen tap.
+          () => bot.api.sendVoice(cbChatId, new InputFile(Buffer.from(audioOut)), sendOpts),
+          sendVerbOpts,
+        ),
+      onFileId: (fid) => voiceOnDemandCache.setTelegramFileId(tok, fid),
+      log: (line) => process.stderr.write(line),
+    })
+
+    if (!sendResult.ok) {
+      // no-audio already surfaced a toast inside loadAudio; send-failed is
+      // logged non-fatally — the '🔊 Listen' keyboard is left intact so the
+      // user can retry (only a successful send strips it below).
+      if (sendResult.reason === 'send-failed') {
+        const err = sendResult.error
+        const msg = err instanceof Error ? err.message : String(err)
+        process.stderr.write(
+          `telegram gateway: voice-out on-demand: sendVoice failed (non-fatal): ${msg}\n`,
+        )
+      }
+      return
+    }
+
     try {
-      // Native voice note (NOT a document), quote-replying the button's
-      // message.
-      await robustApiCall(
-        () =>
-          bot.api.sendVoice(
-            cbChatId,
-            // allow-raw-bot-api: single native voice-note send for an on-demand Listen tap.
-            new InputFile(Buffer.from(audioOut)),
-            {
-              ...(cbMessageId != null ? { reply_parameters: { message_id: cbMessageId } } : {}),
-              ...(cbThreadId != null ? { message_thread_id: cbThreadId } : {}),
-            } as never,
-          ),
-        {
-          chat_id: cbChatId,
-          verb: 'voice-ondemand.sendVoice',
-          ...(cbThreadId != null ? { threadId: cbThreadId } : {}),
-        },
-      )
       // Single-use on SUCCESS: strip the '🔊 Listen' keyboard so the button
       // can't be re-tapped now that the audio has been delivered. Mirrors the
       // agent-button single_use strip (keyboardIsSingleUse) house style.
@@ -25259,7 +25302,7 @@ bot.on('callback_query:data', async ctx => {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       process.stderr.write(
-        `telegram gateway: voice-out on-demand: sendVoice failed (non-fatal): ${msg}\n`,
+        `telegram gateway: voice-out on-demand: strip-listen-keyboard failed (non-fatal): ${msg}\n`,
       )
     }
     return
