@@ -265,6 +265,53 @@ describe('backfillJsonlAgentId — overlapping windows / hook precedence (#2081)
   })
 })
 
+// ─── Fix #3: ambiguous fuzzy backfill refuses to link ────────────────────────
+// Legacy meta.json (no toolUseId) falls back to the fuzzy (agentType,
+// description) match. With N unlinked rows sharing that key, a bare
+// `ORDER BY started_at DESC LIMIT 1` assigned by start-order, not true
+// correspondence — a genuine mislink for a cross-topic identical dispatch.
+// The fix: link only when the candidate is UNAMBIGUOUS (exactly one match);
+// otherwise leave jsonl_agent_id NULL and let the marker/window path
+// attribute it.
+describe('backfillJsonlAgentId — fix #3: ambiguous fuzzy match refused', () => {
+  it('two unlinked rows sharing (agent_type, description) → fuzzy link refused, row stays NULL', () => {
+    insertSub({ id: 'toolu_amb_1', agentType: 'general-purpose', description: 'Run the tests', startedAt: 1000 })
+    insertSub({ id: 'toolu_amb_2', agentType: 'general-purpose', description: 'Run the tests', startedAt: 2000 })
+
+    // Legacy meta.json — no toolUseId, forces the fuzzy fallback path.
+    const jsonlPath = writeMeta('general-purpose', 'Run the tests')
+    const logs: string[] = []
+    backfillJsonlAgentId(db, jsonlPath, 'agentstem_ambiguous', (m) => logs.push(m))
+
+    // Neither candidate gets mis-assigned — both remain unlinked.
+    expect(readSub('toolu_amb_1')?.jsonl_agent_id ?? null).toBeNull()
+    expect(readSub('toolu_amb_2')?.jsonl_agent_id ?? null).toBeNull()
+    expect(logs.some((l) => l.includes('ambiguous') && l.includes('agentstem_ambiguous'))).toBe(true)
+  })
+
+  it('a SINGLE unambiguous candidate still links normally (no regression)', () => {
+    insertSub({ id: 'toolu_unamb', agentType: 'general-purpose', description: 'Unique task', startedAt: 1000 })
+
+    const jsonlPath = writeMeta('general-purpose', 'Unique task')
+    backfillJsonlAgentId(db, jsonlPath, 'agentstem_unambiguous')
+
+    expect(readSub('toolu_unamb')?.jsonl_agent_id).toBe('agentstem_unambiguous')
+  })
+
+  it('three unlinked rows sharing the same key → still refused (not just a 2-row edge case)', () => {
+    insertSub({ id: 'toolu_amb3_1', agentType: 'researcher', description: 'Investigate', startedAt: 1000 })
+    insertSub({ id: 'toolu_amb3_2', agentType: 'researcher', description: 'Investigate', startedAt: 2000 })
+    insertSub({ id: 'toolu_amb3_3', agentType: 'researcher', description: 'Investigate', startedAt: 3000 })
+
+    const jsonlPath = writeMeta('researcher', 'Investigate')
+    backfillJsonlAgentId(db, jsonlPath, 'agentstem_amb3')
+
+    expect(readSub('toolu_amb3_1')?.jsonl_agent_id ?? null).toBeNull()
+    expect(readSub('toolu_amb3_2')?.jsonl_agent_id ?? null).toBeNull()
+    expect(readSub('toolu_amb3_3')?.jsonl_agent_id ?? null).toBeNull()
+  })
+})
+
 // ─── #2506: null meta.json guard ─────────────────────────────────────────────
 // JSON.parse('null') succeeds and returns null. Before the fix, the enclosing
 // try/catch only covered the read+parse, so execution fell through to

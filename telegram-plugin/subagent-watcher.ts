@@ -193,6 +193,33 @@ export interface WorkerEntry {
    * Pre hook pending" window that froze nested cards on "starting…".
    */
   lastBackfillAttemptAt?: number
+  /**
+   * Fix #5: set on a boot-scan `running` file whose mtime passed the
+   * `inflightPromoteMaxAgeMs` freshness gate but has NOT yet shown any
+   * post-boot JSONL growth. mtime freshness alone can't distinguish a
+   * worker killed moments before the restart (indistinguishable file state)
+   * from a genuinely still-running one — so promotion is deferred until
+   * `checkBootPromotionGrowth` observes the file's size actually advance
+   * past its boot-time snapshot (real proof of life), or `deadlineAt`
+   * passes with no growth (treated as historical/orphan — never promoted).
+   * `undefined` once resolved either way.
+   */
+  bootPromotionPending?: { deadlineAt: number }
+  /**
+   * Fix #1(+#2): the `run_in_background` flag as last observed from the
+   * registry `subagents` row, carried on the entry itself rather than
+   * re-derived only at `onFinish` time. The registry row is the sole
+   * source of truth for this flag (the watcher never sees the dispatching
+   * tool_input directly), but the row is looked up by `jsonl_agent_id` —
+   * exactly the linkage that can be permanently missing (meta.json
+   * unreadable, or the fuzzy backfill found no unambiguous candidate).
+   * Once we DO observe the row (at registration or on any later liveness
+   * tick — the backfill retry can link it after the fact), we cache the
+   * flag here so a subsequent `onFinish` can fall back to it even if
+   * `getSubagentByJsonlId` fails again at finish time. `undefined` until
+   * the row has been observed at least once.
+   */
+  background?: boolean
 }
 
 export interface SubagentWatcherConfig {
@@ -271,6 +298,13 @@ export interface SubagentWatcherConfig {
    * stale-handback replay regression.
    */
   inflightPromoteMaxAgeMs?: number
+  /**
+   * Fix #9a: override for `TERMINATED_AGENT_IDS_CAP` — the bound on the
+   * `terminatedAgentIds` re-discovery dedup guard. Exposed mainly so tests
+   * can exercise eviction without inserting thousands of entries. Defaults
+   * to `TERMINATED_AGENT_IDS_CAP` (a few thousand) in production.
+   */
+  terminatedAgentIdsCap?: number
   /**
    * Kill-switch for the boot-scan promotion path. When false, a
    * running-at-boot worker is never promoted — the watcher reverts to the
@@ -390,6 +424,15 @@ export interface SubagentWatcherConfig {
      *  no `sub_agent_text` line was ever observed. Feeds the
      *  `subagent_handback` inbound. */
     resultText: string
+    /**
+     * Fix #1(+#2): the entry's own cached `background` flag (see
+     * `WorkerEntry.background`), threaded through so the gateway can fall
+     * back to it when its own registry lookup at finish time also comes up
+     * empty (unlinked `jsonl_agent_id`). `undefined` when the row was never
+     * observed by the watcher either — the gateway degrades further from
+     * there (see the onFinish handler's non-empty-resultText fallback).
+     */
+    background: boolean | undefined
   }) => void
   /**
    * #1720: fires on every `sub_agent_text` event for a running
@@ -572,6 +615,18 @@ const TERMINAL_CLEANUP_GRACE_MS = 30_000
  */
 const BACKFILL_RETRY_INTERVAL_MS = 3000
 
+/**
+ * Fix #9a: cap on `terminatedAgentIds` (the re-discovery dedup guard in
+ * `cleanupTerminalAgent` / `scanSubagentsDir`). Pre-fix the Set only grew
+ * (added on every terminal cleanup, only ever cleared wholesale in
+ * `stop()`), so a long-lived gateway with sustained sub-agent throughput
+ * accumulated ids without bound. A `Set` preserves insertion order, so once
+ * the cap is hit the OLDEST id is evicted on each new insert (simple ring
+ * buffer semantics) — recently-terminated ids (the ones actually at risk of
+ * a re-discovery race) always stay covered.
+ */
+const TERMINATED_AGENT_IDS_CAP = 5000
+
 // ─── JSONL tail per sub-agent ─────────────────────────────────────────────
 
 interface SubTail {
@@ -662,20 +717,30 @@ export function backfillJsonlAgentId(
 
   // Fallback path: fuzzy (agentType, description) match for older Claude Code
   // versions whose meta.json predates the toolUseId field.
+  //
+  // Fix #3: with N unlinked rows sharing (agent_type, description), a bare
+  // `ORDER BY started_at DESC LIMIT 1` assigns by start-order, not true
+  // correspondence — a benign FIFO for interchangeable rows, but a genuine
+  // mislink for a cross-topic identical dispatch. Read up to 2 candidates
+  // (not just 1): if more than one row shares the key, the match is
+  // ambiguous — refuse to link (leave jsonl_agent_id NULL) and let the
+  // marker/window path attribute it instead, rather than guessing.
   if (candidateId == null && (meta.agentType || meta.description)) {
-    const fuzzy = db
+    const fuzzyCandidates = db
       .prepare(`
         SELECT id FROM subagents
         WHERE jsonl_agent_id IS NULL
           AND agent_type IS ?
           AND description IS ?
         ORDER BY started_at DESC
-        LIMIT 1
+        LIMIT 2
       `)
-      .get(meta.agentType ?? null, meta.description ?? null) as { id: string } | null
-    if (fuzzy != null) {
-      candidateId = fuzzy.id
+      .all(meta.agentType ?? null, meta.description ?? null) as { id: string }[]
+    if (fuzzyCandidates.length === 1) {
+      candidateId = fuzzyCandidates[0]!.id
       log?.(`subagent-watcher: backfill fuzzy match ${agentId} → ${candidateId} (type=${meta.agentType} desc=${meta.description})`)
+    } else if (fuzzyCandidates.length > 1) {
+      log?.(`subagent-watcher: backfill fuzzy match refused for ${agentId} — ${fuzzyCandidates.length} ambiguous candidates share (type=${meta.agentType} desc=${meta.description}); leaving unlinked`)
     }
   }
 
@@ -868,6 +933,12 @@ export function readSubTail(
         } else {
           bumpSubagentActivity(db, { id: existing.id, ts: now })
           isForeground = existing.background === 0
+          // Fix #1(+#2): keep the entry's cached background flag fresh —
+          // this is also how a NESTED worker (whose row links only via the
+          // throttled backfill retry above, after the one-shot attempt at
+          // registration lost the race) picks up its background flag before
+          // its own `onFinish` fires.
+          entry.background = existing.background === 1
         }
       } catch (dbErr) {
         log?.(`subagent-watcher: liveness write error ${entry.agentId}: ${(dbErr as Error).message}`)
@@ -1233,6 +1304,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
     config.inflightPromoteMaxAgeMs
     ?? parseEnvMs('SWITCHROOM_SUBAGENT_INFLIGHT_MAX_AGE_MS')
     ?? DEFAULT_INFLIGHT_PROMOTE_MAX_AGE_MS
+  const terminatedAgentIdsCap = config.terminatedAgentIdsCap ?? TERMINATED_AGENT_IDS_CAP
   // Kill-switch: not parseEnvMs (which rejects `0`) — an explicit `=0`
   // here MUST disable promotion (revert to pre-v0.14.23 suppression).
   const bootPromoteEnabled =
@@ -1361,6 +1433,17 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       } catch (err) {
         log?.(`subagent-watcher: backfill error for ${agentId}: ${(err as Error).message}`)
       }
+      // Fix #1(+#2): if the backfill above (or an already-linked row from a
+      // prior registration attempt) resolved jsonl_agent_id, cache the
+      // row's `background` flag on the entry NOW — the earliest point it
+      // can ever be known — so it survives even if a later `onFinish`
+      // can't re-resolve the row (see `WorkerEntry.background` doc).
+      try {
+        const row = db
+          .prepare('SELECT background FROM subagents WHERE jsonl_agent_id = ?')
+          .get(agentId) as { background: number } | null
+        if (row != null) entry.background = row.background === 1
+      } catch { /* best-effort — entry.background stays undefined */ }
     }
 
     const tail: SubTail = {
@@ -1409,37 +1492,16 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       } else if (fileAgeMs > inflightPromoteMaxAgeMs) {
         log?.(`subagent-watcher: ${agentId} running at boot but stale (last write ${Math.round(fileAgeMs / 1000)}s ago > ${Math.round(inflightPromoteMaxAgeMs / 1000)}s) — leaving historical (dead prior-session worker, not in-flight)`)
       } else {
-        entry.historical = false
-        log?.(`subagent-watcher: ${agentId} was in-flight at boot — promoting to live (last write ${Math.round(fileAgeMs / 1000)}s ago; user still awaiting handback)`)
-        // The prior gateway life's registration normally linked
-        // jsonl_agent_id already, but re-run the backfill idempotently in
-        // case that life crashed before the link persisted — the handback's
-        // isBackground lookup is keyed on jsonl_agent_id, and an unlinked row
-        // would mis-resolve the worker as foreground and drop the handback.
-        if (db != null) {
-          try {
-            backfillJsonlAgentId(db, filePath, agentId, log)
-          } catch (err) {
-            log?.(`subagent-watcher: backfill error for ${agentId}: ${(err as Error).message}`)
-          }
-        }
-        // Historical/onProgress gate-ordering fix: the initial read above ran
-        // while `entry.historical` was still TRUE, so every onProgress cue it
-        // would have fired was suppressed by the `!entry.historical` guard —
-        // and the tail cursor is now at EOF, so for a quiet worker no later
-        // tick ever re-fires them. The card painted as a bare stub and froze
-        // on "starting…" forever. Re-read from the start now that the entry
-        // is live: the replayed events rebuild toolCount/lastTool/narrative
-        // AND fire onProgress so the worker's card reaches real activity.
-        entry.toolCount = 0
-        entry.lastTool = null
-        entry.pendingNarrative = null
-        tail.cursor = 0
-        tail.pendingPartial = ''
-        tail.hasEmittedStart = false
-        readSubTail(entry, tail, n, (desc) => {
-          log?.(`subagent-watcher: description updated for ${agentId}: ${desc}`)
-        }, fs, log, db, parentStateDir, config.onUnstall, undefined, config.onProgress)
+        // Fix #5: a fresh mtime alone does NOT confirm liveness — a worker
+        // killed seconds before this restart looks byte-for-byte identical
+        // to a genuinely still-running one. Defer promotion until
+        // `checkBootPromotionGrowth` observes the file actually grow AFTER
+        // this boot (real proof of life), bounded by the same
+        // `inflightPromoteMaxAgeMs` window as an outer timeout. Until then
+        // the entry stays `historical` (no stall detection, no completion
+        // synthesis) — see checkBootPromotionGrowth / promoteBootEntry.
+        entry.bootPromotionPending = { deadlineAt: n + inflightPromoteMaxAgeMs }
+        log?.(`subagent-watcher: ${agentId} running at boot (last write ${Math.round(fileAgeMs / 1000)}s ago) — awaiting post-boot JSONL growth before promoting to live (mtime freshness alone can't rule out a just-killed worker)`)
       }
     }
 
@@ -1470,6 +1532,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
         const entry = registry.get(agentId)
         const t = tails.get(agentId)
         if (!entry || !t) return
+        checkBootPromotionGrowth(entry, t, nowFn())
         readSubTail(entry, t, nowFn(), (desc) => {
           log?.(`subagent-watcher: description updated for ${agentId}: ${desc}`)
         }, fs, log, db, parentStateDir, config.onUnstall, cleanupTerminalAgent, config.onProgress)
@@ -1477,6 +1540,68 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       })
     } catch (err) {
       log?.(`subagent-watcher: fs.watch failed for ${agentId}: ${(err as Error).message}`)
+    }
+  }
+
+  /**
+   * Fix #5: the growth-confirmation half of boot promotion. Called on every
+   * tick (poll + fs.watch) for an entry that's still awaiting confirmation
+   * (`entry.bootPromotionPending` set — see the freshness-gate branch in
+   * `registerAgent`). Promotes to live the moment the file's size advances
+   * past `tail.cursor` (the boot-time snapshot — the initial full read in
+   * `registerAgent` already parked the cursor at EOF-at-boot, so ANY further
+   * growth is unambiguously post-boot). If the bounded window elapses with
+   * no growth, gives up permanently — the entry stays `historical`, so it
+   * can never synthesise a stale `completed` handback from pre-restart bytes
+   * (checkStalls / onFinish both gate on `!entry.historical`).
+   */
+  function checkBootPromotionGrowth(entry: WorkerEntry, tail: SubTail, n: number): void {
+    const pending = entry.bootPromotionPending
+    if (!pending) return
+    let size: number | null = null
+    try {
+      size = fs.statSync(entry.filePath).size
+    } catch {
+      /* unreadable — fall through to the deadline check below */
+    }
+    if (size != null && size > tail.cursor) {
+      entry.bootPromotionPending = undefined
+      entry.historical = false
+      log?.(`subagent-watcher: ${entry.agentId} confirmed live — observed post-boot JSONL growth (${tail.cursor} → ${size} bytes); promoting`)
+      // The prior gateway life's registration normally linked
+      // jsonl_agent_id already, but re-run the backfill idempotently in
+      // case that life crashed before the link persisted — the handback's
+      // isBackground lookup is keyed on jsonl_agent_id, and an unlinked row
+      // would mis-resolve the worker as foreground and drop the handback.
+      if (db != null) {
+        try {
+          backfillJsonlAgentId(db, entry.filePath, entry.agentId, log)
+        } catch (err) {
+          log?.(`subagent-watcher: backfill error for ${entry.agentId}: ${(err as Error).message}`)
+        }
+      }
+      // Historical/onProgress gate-ordering fix (carried over from the old
+      // synchronous promotion path): the initial read in registerAgent ran
+      // while `entry.historical` was still TRUE, so any onProgress cue it
+      // would have fired was suppressed, and the cursor is at EOF-at-boot —
+      // for a quiet worker no later tick would ever re-fire them. Re-read
+      // from the start now that the entry is live: the replayed events
+      // rebuild toolCount/lastTool/narrative AND fire onProgress so the
+      // worker's card reaches real activity instead of a frozen stub.
+      entry.toolCount = 0
+      entry.lastTool = null
+      entry.pendingNarrative = null
+      tail.cursor = 0
+      tail.pendingPartial = ''
+      tail.hasEmittedStart = false
+      readSubTail(entry, tail, n, (desc) => {
+        log?.(`subagent-watcher: description updated for ${entry.agentId}: ${desc}`)
+      }, fs, log, db, parentStateDir, config.onUnstall, undefined, config.onProgress)
+      return
+    }
+    if (n >= pending.deadlineAt) {
+      entry.bootPromotionPending = undefined
+      log?.(`subagent-watcher: ${entry.agentId} never observed post-boot JSONL growth within the window — leaving historical/orphan (not promoting; avoids synthesising a stale 'completed' handback from a worker killed before this restart)`)
     }
   }
 
@@ -1522,6 +1647,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
             resultText: entry.errored
               ? entry.lastResultText || entry.errorDetail || ''
               : entry.lastResultText,
+            background: entry.background,
           })
         } catch (cbErr) {
           log?.(`subagent-watcher: onFinish callback error ${agentId}: ${(cbErr as Error).message}`)
@@ -1543,6 +1669,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
             durationMs: nowFn() - entry.dispatchedAt,
             description: entry.description,
             resultText: entry.lastResultText,
+            background: entry.background,
           })
         } catch (cbErr) {
           log?.(`subagent-watcher: onFinish callback error ${agentId}: ${(cbErr as Error).message}`)
@@ -1593,6 +1720,14 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
     // Issue #1116 (Bug B): record that this agent has been fully
     // processed so a rescan that rediscovers the still-present JSONL
     // doesn't re-register and re-notify.
+    //
+    // Fix #9a: bound the Set so it can't grow unboundedly over a long-lived
+    // gateway — evict the oldest id once the cap is hit (Set iteration
+    // order is insertion order, so `.values().next().value` is the oldest).
+    if (!terminatedAgentIds.has(agentId) && terminatedAgentIds.size >= terminatedAgentIdsCap) {
+      const oldest = terminatedAgentIds.values().next().value
+      if (oldest != null) terminatedAgentIds.delete(oldest)
+    }
     terminatedAgentIds.add(agentId)
     log?.(`subagent-watcher: cleaned up terminal agent ${agentId}`)
   }
@@ -1894,6 +2029,10 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       if (entry.state !== 'running') continue
       const tail = tails.get(agentId)
       if (!tail) continue
+      // Fix #5: defensive poll-loop fallback for the same growth check the
+      // fs.watch callback runs — covers the case where fs.watch missed the
+      // event that would otherwise have confirmed liveness.
+      checkBootPromotionGrowth(entry, tail, n)
       readSubTail(entry, tail, n, (desc) => {
         log?.(`subagent-watcher: description updated for ${agentId}: ${desc}`)
       }, fs, log, db, parentStateDir, config.onUnstall, cleanupTerminalAgent, config.onProgress)

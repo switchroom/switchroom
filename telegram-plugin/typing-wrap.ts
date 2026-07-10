@@ -1,10 +1,15 @@
 // Auto-wrap tool dispatch with a Telegram typing-indicator loop so the user
-// sees a live "agent is working" signal during the 3–30s gap where the
-// progress card is deliberately suppressed (its initialDelayMs is 3s).
-// The first tool call on a given (chat, thread) fires the typing loop
-// immediately so there's no silent dead window before the progress card
-// appears. Subsequent calls on the same lane honour the debounce to avoid
-// churn. Surface tools own their own loop — see isSurfaceTool.
+// sees a live "agent is working" signal for the run of a turn. This is now
+// the PRIMARY liveness signal for short tool-using turns, not a bridge to a
+// soon-to-appear pinned progress card: the pinned card is retired
+// (`unpinProgressCardForChat = null`, see
+// `docs/diagrams/deterministic-status-anatomy.spec.md`), and the worker
+// progress card only gates in at `elapsed >= 60s OR sub-agent appeared` — for
+// most short turns it never appears at all. The first tool call on a given
+// (chat, thread) fires the typing loop immediately so there's no silent dead
+// window at turn start. Subsequent calls on the same lane honour the
+// debounce to avoid churn. Surface tools own their own loop — see
+// isSurfaceTool.
 //
 // Keying changed from `chatId` to `(chatId, threadId)` in PR3 of the
 // supergroup-mode rollout. In supergroup mode one agent owns many topics
@@ -38,17 +43,55 @@ export interface TypingWrapper {
 interface Entry {
   chatId: string
   threadId: number | null
+  lane: string
   timer: ReturnType<typeof setTimeout>
+}
+
+/**
+ * Per-lane bookkeeping: `count` is the number of outstanding (dispatched but
+ * not yet resulted) tool-uses on the lane; `started` is whether the typing
+ * loop is currently believed to be running for it. Ref-counted rather than a
+ * boolean-per-lane `Set` (pre-fix#7 shape) because two PARALLEL tool_use
+ * blocks on one lane must both hold the lane open: with a plain Set,
+ * `onToolResult` for the first one deleted the lane and stopped the loop
+ * while the second tool was still running, flickering the typing indicator
+ * off until the next tool re-fired it. Only the count reaching zero may stop
+ * the loop.
+ */
+interface LaneState {
+  count: number
   started: boolean
 }
 
 export function createTypingWrapper(deps: TypingWrapperDeps): TypingWrapper {
   const debounceMs = deps.debounceMs ?? 500
   const pending = new Map<string, Entry>()
-  // Track per-(chat,thread) lanes that already have an active typing loop
-  // so the first tool call on a lane fires immediately while subsequent
-  // calls on the same lane use the debounce.
-  const activeLanes = new Set<string>()
+  const lanes = new Map<string, LaneState>()
+
+  function laneFor(lane: string): LaneState {
+    let s = lanes.get(lane)
+    if (s == null) {
+      s = { count: 0, started: false }
+      lanes.set(lane, s)
+    }
+    return s
+  }
+
+  // Decrement the lane's outstanding count. Returns true iff the count just
+  // reached zero AND the loop was running — i.e. iff the CALLER must now
+  // call `stopTypingLoop`. This is the ref-count release: the loop only
+  // stops once every outstanding tool-use on the lane has resulted.
+  function release(lane: string): boolean {
+    const s = lanes.get(lane)
+    if (s == null) return false
+    s.count = Math.max(0, s.count - 1)
+    if (s.count === 0) {
+      const wasStarted = s.started
+      lanes.delete(lane)
+      return wasStarted
+    }
+    return false
+  }
 
   return {
     onToolUse(toolUseId, chatId, toolName, threadId) {
@@ -60,19 +103,21 @@ export function createTypingWrapper(deps: TypingWrapperDeps): TypingWrapper {
       const prior = pending.get(toolUseId)
       if (prior) {
         clearTimeout(prior.timer)
-        if (prior.started) deps.stopTypingLoop(prior.chatId, prior.threadId)
+        if (release(prior.lane)) deps.stopTypingLoop(prior.chatId, prior.threadId)
         pending.delete(toolUseId)
       }
-      // First tool on this lane: fire immediately rather than waiting for
-      // the debounce — this closes the silent dead window before the first
-      // progress card appears.
-      if (!activeLanes.has(lane)) {
+      const state = laneFor(lane)
+      state.count += 1
+      // First outstanding tool-use on this lane: fire immediately rather
+      // than waiting for the debounce — this closes the silent dead window
+      // at turn start.
+      if (state.count === 1) {
         deps.startTypingLoop(chatId, tid)
-        activeLanes.add(lane)
+        state.started = true
         const entry: Entry = {
           chatId,
           threadId: tid,
-          started: true,
+          lane,
           timer: setTimeout(() => {}, 0), // no-op sentinel
         }
         pending.set(toolUseId, entry)
@@ -81,10 +126,10 @@ export function createTypingWrapper(deps: TypingWrapperDeps): TypingWrapper {
       const entry: Entry = {
         chatId,
         threadId: tid,
-        started: false,
+        lane,
         timer: setTimeout(() => {
           deps.startTypingLoop(chatId, tid)
-          entry.started = true
+          state.started = true
         }, debounceMs),
       }
       pending.set(toolUseId, entry)
@@ -95,20 +140,22 @@ export function createTypingWrapper(deps: TypingWrapperDeps): TypingWrapper {
       const entry = pending.get(toolUseId)
       if (!entry) return
       clearTimeout(entry.timer)
-      if (entry.started) {
-        deps.stopTypingLoop(entry.chatId, entry.threadId)
-        activeLanes.delete(chatKey(entry.chatId, entry.threadId) as string)
-      }
+      if (release(entry.lane)) deps.stopTypingLoop(entry.chatId, entry.threadId)
       pending.delete(toolUseId)
     },
 
     drainAll() {
+      const stoppedLanes = new Set<string>()
       for (const entry of pending.values()) {
         clearTimeout(entry.timer)
-        if (entry.started) deps.stopTypingLoop(entry.chatId, entry.threadId)
+        const state = lanes.get(entry.lane)
+        if (state?.started && !stoppedLanes.has(entry.lane)) {
+          deps.stopTypingLoop(entry.chatId, entry.threadId)
+          stoppedLanes.add(entry.lane)
+        }
       }
       pending.clear()
-      activeLanes.clear()
+      lanes.clear()
     },
   }
 }

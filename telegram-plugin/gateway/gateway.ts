@@ -27276,7 +27276,7 @@ void (async () => {
               // Gated to background completions: foreground sub-agents
               // need nothing here, and 'orphan' is a stale historical-at-
               // boot row, not a fresh completion the user is waiting on.
-              onFinish: ({ agentId, outcome, description, resultText, toolCount, durationMs }) => {
+              onFinish: ({ agentId, outcome, description, resultText, toolCount, durationMs, background: entryBackground }) => {
                 // Reaction promotion: if the parent turn already ended
                 // with this (or another) worker still running, its 👍 was
                 // deferred (held on ✍️/⚡). Now that a worker finished,
@@ -27307,13 +27307,32 @@ void (async () => {
                 // (worker-feed-dispatch.ts, pinned by its test). Best-effort:
                 // a DB hiccup keeps the watcher's generic label rather than
                 // throwing out of the terminal handler.
-                let dispatch: WorkerFeedDispatch = resolveWorkerFeedDispatch(null, description)
+                let dispatch: WorkerFeedDispatch = resolveWorkerFeedDispatch(null, description, entryBackground)
                 if (turnsDb != null) {
                   try {
-                    dispatch = resolveWorkerFeedDispatch(getSubagentByJsonlId(turnsDb, agentId), description)
+                    dispatch = resolveWorkerFeedDispatch(getSubagentByJsonlId(turnsDb, agentId), description, entryBackground)
                   } catch { /* best-effort */ }
                 }
-                const isBackground = dispatch.isBackground
+                let isBackground = dispatch.isBackground
+                // Fix #1(+#2): the registry row never linked AND the watcher
+                // entry's own cached background flag was never observed
+                // either (both `resolveWorkerFeedDispatch` fallbacks came up
+                // empty) — this is the "DB row is unlinked" bug's worst
+                // case. A finished worker with actual narrative result text
+                // is far more likely a dropped background handback than a
+                // legitimate foreground no-op (a foreground sub-agent's
+                // result returns inline as the Task tool result — the
+                // gateway wouldn't otherwise need to route anything here).
+                // Degrade to background so the result is delivered instead
+                // of silently lost. Idempotency: this only flips the
+                // dispatch classification for THIS single onFinish call —
+                // all the existing dedup/idempotency guards below
+                // (decideSubagentHandback's spool key, completionNotified,
+                // etc.) still apply unchanged, so this cannot cause a
+                // double-handback.
+                if (!dispatch.hasRow && entryBackground == null && resultText.trim().length > 0) {
+                  isBackground = true
+                }
                 // NESTED (depth-2+) worker terminal: its live status surfaced
                 // via the worker feed (see onProgress), so finalize that card
                 // cleanly — never leave it frozen mid-"→ step". But NO user

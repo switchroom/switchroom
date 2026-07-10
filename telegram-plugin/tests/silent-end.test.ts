@@ -10,6 +10,7 @@ import {
   recordSilentTurnEnd,
   recordUndeliveredTurnEnd,
   SILENT_END_MAX_RETRIES,
+  SILENT_END_STALE_RECORD_MAX_AGE_MS,
 } from '../silent-end.js'
 import { isFinalAnswerReply } from '../final-answer-detect.js'
 
@@ -206,9 +207,53 @@ describe('recordSilentTurnEnd — #1161 exhaustion detection', () => {
       chatId: 'c', threadId: null, turnKey: 'c:_',
       retryCount: SILENT_END_MAX_RETRIES, timestamp: 0,
     }))
-    const r = recordSilentTurnEnd({ chatId: 'c', threadId: null, turnKey: 'c:_' })
+    // Pin `now` alongside the record's timestamp=0 so this exercises the
+    // genuine same-turn ladder, not fix #8's age-based staleness bound
+    // (which is covered by its own dedicated tests below).
+    const r = recordSilentTurnEnd(
+      { chatId: 'c', threadId: null, turnKey: 'c:_' },
+      { now: () => 0 },
+    )
     expect(r.exhausted).toBe(true)
     // State cleared so the Stop hook on this final turn allows the stop.
+    expect(readSilentEndState()).toBeNull()
+  })
+
+  it('fix #8: an exhausted record older than the plausible turn lifetime starts a fresh retry budget (no delivery evidence needed)', () => {
+    // A crash/interrupt bypassed the gateway's own exhaust-read-and-clear,
+    // so a spent (retryCount >= MAX) record from an OLD turn survives on
+    // disk. turnKey is the STABLE statusKey(chatId, threadId) — it matches
+    // this brand-new dark turn on the same chat/thread even though it
+    // belongs to a completely different turn instance.
+    const path = join(stateDir, 'silent-end-pending.json')
+    writeFileSync(path, JSON.stringify({
+      chatId: 'c', threadId: null, turnKey: 'c:_',
+      retryCount: SILENT_END_MAX_RETRIES, timestamp: 0,
+    }))
+    const now = SILENT_END_STALE_RECORD_MAX_AGE_MS + 1000 // just past the age bound
+    const r = recordSilentTurnEnd(
+      { chatId: 'c', threadId: null, turnKey: 'c:_' },
+      { now: () => now },
+    )
+    // Must run its OWN re-prompt ladder, not immediately fall back.
+    expect(r.exhausted).toBe(false)
+    expect(readSilentEndState()).toMatchObject({ turnKey: 'c:_', retryCount: 0 })
+  })
+
+  it('fix #8: a genuinely same-turn exhausted record (within the age bound) still reports exhausted — no regression', () => {
+    const path = join(stateDir, 'silent-end-pending.json')
+    const recentTimestamp = 1_000_000
+    writeFileSync(path, JSON.stringify({
+      chatId: 'c', threadId: null, turnKey: 'c:_',
+      retryCount: SILENT_END_MAX_RETRIES, timestamp: recentTimestamp,
+    }))
+    // Well within the plausible single-turn retry-ladder window.
+    const now = recentTimestamp + 5000
+    const r = recordSilentTurnEnd(
+      { chatId: 'c', threadId: null, turnKey: 'c:_' },
+      { now: () => now },
+    )
+    expect(r.exhausted).toBe(true)
     expect(readSilentEndState()).toBeNull()
   })
 

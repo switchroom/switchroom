@@ -224,14 +224,22 @@ describe('Gap 1 — background worker in-flight across a gateway restart', () =>
     expect(h.finishCalls[0].agentId).toBe('gap1-complete')
     expect(h.finishCalls[0].outcome).toBe('completed') // pre-fix: 'orphan' → dropped
     expect(h.finishCalls[0].resultText).toContain('root cause')
-    // The promotion is logged so the path is observable in prod.
-    expect(h.logs.some((l) => l.includes('in-flight at boot — promoting to live'))).toBe(true)
+    // Fix #5: promotion now requires an observed post-boot growth event
+    // (mtime freshness alone is refused) — the `append` above supplied it,
+    // and the promotion is logged so the path is observable in prod.
+    expect(h.logs.some((l) => l.includes('confirmed live') && l.includes('post-boot JSONL growth'))).toBe(true)
   })
 
-  it('an in-flight-at-boot worker that dies silently is rescued by stall synthesis', () => {
+  it('an in-flight-at-boot worker that dies silently (after proving liveness) is rescued by stall synthesis', () => {
     // Pre-fix, historical entries were skipped by stall detection, so a
     // worker that crossed a restart and then went silent sat running
     // forever — no handback ever. After promotion it gets the safety net.
+    //
+    // Fix #5: promotion additionally requires proof of post-boot liveness —
+    // a single real step (e.g. a narrative line) grows the JSONL past its
+    // boot-time snapshot, confirming this is NOT a worker killed moments
+    // before the restart. Only THEN does it get the stall-synthesis safety
+    // net when it subsequently goes silent for good.
     const h = makeHarness({
       agentId: 'gap1-silent',
       bootLines: [subAgentUserMsg('bg task')],
@@ -239,12 +247,41 @@ describe('Gap 1 — background worker in-flight across a gateway restart', () =>
       silentStallTerminalMs: 120_000,
     })
 
+    h.append(subAgentText('still investigating'))
+    h.advance(600) // one poll observes the post-boot growth → promotes
+
+    expect(h.watcher.getRegistry().get('gap1-silent')?.historical).toBe(false)
+
     h.advance(62_000) // stall threshold crossed
     expect(h.stallTerminalCalls).toHaveLength(0)
     h.advance(121_000) // silent-stall terminal window elapses → synthesis
     expect(h.stallTerminalCalls).toHaveLength(1)
     expect(h.finishCalls).toHaveLength(1)
     expect(h.finishCalls[0].outcome).toBe('completed')
+  })
+
+  it('fix #5: an in-flight-at-boot worker that NEVER shows post-boot growth is left historical (no stale completed handback)', () => {
+    // The bug this closes: a worker killed <15min before a restart is
+    // byte-for-byte indistinguishable from a live one by mtime alone. Absent
+    // any actual post-boot growth, it must NOT be promoted — so it can never
+    // synthesise a false 'completed' handback from the pre-restart bytes.
+    const h = makeHarness({
+      agentId: 'gap1-killed-before-restart',
+      bootLines: [subAgentUserMsg('bg task')],
+      stallThresholdMs: 60_000,
+      silentStallTerminalMs: 120_000,
+      inflightPromoteMaxAgeMs: 60_000,
+    })
+
+    // No append — the file never grows again after boot.
+    h.advance(62_000)
+    h.advance(121_000)
+    h.advance(600_000) // well past the promotion window too
+
+    expect(h.watcher.getRegistry().get('gap1-killed-before-restart')?.historical).toBe(true)
+    expect(h.stallTerminalCalls).toHaveLength(0)
+    expect(h.finishCalls).toHaveLength(0)
+    expect(h.logs.some((l) => l.includes('never observed post-boot JSONL growth'))).toBe(true)
   })
 
   it('a worker already DONE at boot stays suppressed (no spurious replay)', () => {
@@ -298,7 +335,8 @@ describe('Gap 1 freshness gate — v0.14.24 stale-replay regression', () => {
 
     expect(h.finishCalls).toHaveLength(1)
     expect(h.finishCalls[0].outcome).toBe('completed')
-    expect(h.logs.some((l) => l.includes('promoting to live'))).toBe(true)
+    // Fix #5: the append above supplies the required post-boot growth proof.
+    expect(h.logs.some((l) => l.includes('confirmed live'))).toBe(true)
   })
 
   it('kill-switch (bootPromoteEnabled=false) suppresses even a fresh running-at-boot worker', () => {
