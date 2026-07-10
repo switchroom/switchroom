@@ -2,6 +2,226 @@
 
 ## Unreleased
 
+## v0.18.7 — Work continues after approval cards and restarts
+
+### Deliberate restarts no longer silently drop in-flight work (#2988)
+
+A sanctioned restart (operator `agent restart`, rollout, `systemctl
+restart`, hostd `agent_restart`) that landed **mid-turn** silently threw
+the in-flight work away. #2585's clean-shutdown gate was meant to suppress
+resume only for a *deliberately abandoned* turn, but the boot-resume block
+only runs when a pending interrupted turn actually exists — so the gate was
+swallowing real work, not a no-op. New `session_continuity.boot_resume`
+knob (`always` | `in-flight` (new default) | `never`) plumbed through the
+cascade + scaffold and hoisted **before the gateway fork** in `start.sh`.
+The default `in-flight` never suppresses genuine in-flight work; `never`
+preserves #2585's posture but still delivers a passive `resume_deferred`
+report instead of going silent. A bounded resume-chain guard
+(`isResumeSyntheticTurn`) stops a restart-during-resume from double-running
+side effects or chaining forever — the turn resumes at most once, then
+degrades to a report.
+
+### Resume inbound tells the agent which sub-agents the restart killed (#2986)
+
+When a turn is interrupted mid-flight, its in-flight sub-agents die with
+it — but the boot resume/report inbound carried only a ~200-char prompt
+preview, so the resumed session had no idea which workers didn't finish and
+would declare the task done on ghost workers whose output never landed. The
+inbound now appends a bounded per-worker block (type/label + dispatch prompt
+truncated to 200 chars, capped at 10 with an overflow count) plus an
+explicit "re-dispatch the ones still needed" instruction, wired into both
+the resume and watchdog-report builders. New
+`listNonTerminalSubagentsForTurn` reads running + stalled workers so a
+reaper-flipped row is still surfaced; the read is best-effort (log and
+continue on failure) and the block is empty when nothing was in flight, so
+the common-case inbound is byte-for-byte unchanged.
+
+### Turn-gate agent button taps so a mid-turn tap isn't lost (#2987)
+
+Tapping an agent's approve/deny button while it was busy could silently
+vanish. The `agent:` inline-keyboard handler delivered the synthesized tap
+with a bare `sendToAgent` + busy-mark and buffered **only** when the bridge
+was offline — it never ran the #1556 turn gate the normal inbound path
+uses. A tap landing mid-turn fired the MCP notification into the CLI's TUI
+composer and raced turn-completion, stranding with nothing to rescue it.
+New `deliverButtonTapInbound` routes the tap through the same turn-safe
+machinery as a fresh inbound: `reserveInboundDelivery` gate (mid-turn →
+`buffer-until-idle`, idle → deliver now), synchronous busy-key reservation,
+pre-send composer clear, and delivery-confirm tracking so the
+deliver-until-acked sweep re-delivers a stranded tap. The idle path is
+behaviorally identical; only mid-turn taps change (buffer instead of
+strand).
+
+### Approval cards survive restarts and timeouts wake the agent (#2989)
+
+The four agent-initiated approval-card families (`vault_request_access`,
+`vault_request_save`, `request_secret`, `mental_model_propose`) each end
+the turn to wait for an operator tap — and two defects could park the agent
+forever. (A) Pending card state was in-memory only, so a gateway restart
+lost every staged entry while the live keyboard survived in Telegram; a
+later tap hit the "Card expired" tombstone with no grant and no injected
+inbound. New durable `pending-card-store.ts` persists card **metadata** at
+staging, removes it on every resolution, and restores it at boot so a
+post-restart tap resolves exactly like a pre-restart tap. A
+`vault_request_save` **value** is never written to disk — a restored save
+card is flagged `restoredWithoutValue` and degrades gracefully. (B) TTL
+sweeps were lazy (only ran when the next request staged), so an unanswered
+card parked the agent with nothing injected. The periodic
+`pendingStateReaper` now runs all four sweeps every 60s, editing each
+expired card to a ⌛ state and injecting a **TIMEOUT, not a denial**
+synthetic via the turn-safe gate, recorded in `missedApprovalsStore` for
+re-offer on operator return. Also fixes the `vault_request_access` copy
+that claimed "10 min" when the real TTL is `approvalTtlMs()` (60-min
+default).
+
+### Wedge-watchdog defers to a live approval card instead of racing it (#2978)
+
+Since #2581 the wedge-watchdog Esc-denied every per-tool permission prompt
+after ~15s — including prompts that already had a live Telegram approval
+card racing in parallel with Claude Code's TUI prompt, so a card the
+operator was about to tap got killed out from under them. The permission-
+prompt branch of `wedge-watchdog.ts` is now card-aware: before firing Esc
+it queries the gateway over the existing `gateway.sock` for a live pending
+permission (source of truth: the gateway's `pendingPermissions` map) via a
+new read-only `query_pending_permission` / `pending_permission_status`
+message pair, and defers to the card / the #2724 TTL reaper instead of
+racing it. Esc stays the fallback ceiling when the gateway is unreachable
+or times out (~2s budget) or reports no pending permission (card-less
+prompt); the gateway handler **fails closed** (`pending: false`) on an
+older build, so it degrades to byte-identical pre-#2971 behavior. A
+`SWITCHROOM_PERMISSION_CARD_AWARE=0` kill switch restores the old
+unconditional-Esc behavior. No pane-parsing, synthetic cards, or
+keystroke-approve machinery was added — Esc remains the only keystroke this
+branch ever sends.
+
+### Spec the approval/restart continuation contract (#2985)
+
+Docs. The job specs now promise the approval/restart **continuation
+contract** a verified audit found under-specified — stated as target
+outcomes, with the four fixes above landing in parallel.
+`approve-what-my-agent-can-touch.md` gains the deny/timeout wake contract
+(a DENIED or EXPIRED request resumes the turn so the agent hears the
+outcome and degrades, never left waiting), the timeout-not-denial +
+re-offer contract, and card-survives-restart durability, with new UATs
+(`vault-deny-resumes-turn-dm`, `vault-timeout-wakes-agent-dm`,
+`vault-card-survives-gateway-restart-dm`).
+`survive-reboots-and-real-life.md` adds sub-agent re-dispatch and
+deliberate-restart resume plus a sub-agent-in-flight × approval-card-
+outstanding fuzz axis; `steer-or-queue-mid-flight.md` and
+`know-what-my-agent-is-doing.md` get matching in-flight/orphaned-worker
+invariants.
+
+### /model switches always stick and /status reports the truth (#2982)
+
+The `/model` command path had seven confirmed bugs where a switch could
+silently vanish while chat reported success, or `/status` showed a model
+the session never ran. Typed `/model <claude>` never recorded the switch
+(now `handleModelCommand` returns `selectedModel` into
+`activeSessionModelOverride`, the same field the menu path sets); an
+`sr-*` → Claude switch discarded the requested model across the restart
+(both paths now route through the `.session-model-override` carrier that
+start.sh's LiteLLM-down guard never drops for a Claude token); the typed
+set had no busy gate and reported false success (now refuses mid-turn,
+claims success only on an anchored confirmation, and says "sent, but
+couldn't confirm — check /status" otherwise); `scheduleRestart`'s 15s
+debounce silently no-op'd a switch (now throws a tagged `restart_in_flight`
+the caller surfaces); a failed dispatch left a stale carrier + override
+lying to `/status` (now rolled back); and tapping Default on the
+already-default model stored the display label as an override (now a
+no-change, values normalized to a canonical token). The confirmation
+regexes were also verified against the live CLI 2.1.205 (`Set model to Opus
+4.8 and saved…` / `Model '<name>' not found`) so the headline fix isn't
+inert for the common typed-switch case.
+
+### Live model on progress cards — main agent, sub-agents, workers (#2983)
+
+Every progress / activity surface now shows the model **actually in use**,
+sourced live from the session transcripts — never from config, never from
+launch-time state. The main-agent activity card, liveness card,
+background-worker feed, nested sub-agent blocks, and workflow agent cards
+each render the model serving that agent's API calls as a subtle tag on the
+existing metrics line (`2m · 14 tools · opus 4.8`), so a worker on a
+different model than the main agent shows its own. Every `type:"assistant"`
+transcript line carries `message.model`, extracted into dedicated `model` /
+`sub_agent_model` events; a shared `isModelSentinel` skips
+compaction/synthetic (`<synthetic>`) lines. Before a sub-agent writes its
+first assistant line the card falls back to the dispatch-time
+`tool_input.model` (captured by the pretool hook, persisted on a new
+registry `model` column); once the transcript value lands it wins, and if
+neither is known the tag is omitted — never guessed from config.
+`buildAgentMetadata` now prefers the last-seen main-transcript model for
+`/status`, falling back to the `/model` override on a fresh boot / `sr-*`
+relaunch window.
+
+### LiteLLM routing self-heals through proxy outages, broker blips, and cron (#2981)
+
+Three confirmed reliability bugs in the LiteLLM proxy carve-out, all
+violating the same invariant: all model traffic must stay routed through
+the proxy for cost tracking, and an outage must degrade loudly and
+self-heal, never silently fall back to untracked direct OAuth. (1) An agent
+that booted while the proxy was down kept `ANTHROPIC_BASE_URL` pointed at
+the proxy but exported `ANTHROPIC_CUSTOM_HEADERS` only in the reachable
+arm — so once the proxy recovered every request 401'd until a manual
+restart. The header (and `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`) is
+now exported whenever the key fetch succeeded; the probe gates only the
+`_LITELLM_OK` flag. (2) `resolveLiteLLMConfirmedAgents` treated any
+vault-broker failure like key-not-found and dropped every opted-in agent,
+so any container recreated during a broker blip (writeComposeFile runs on
+`agent restart` too) silently booted on untracked OAuth. Now `unreachable`
+is distinguished from `not_found`/`denied`: on unreachable it re-parses the
+prior `SWITCHROOM_LITELLM: "1"` verdict from the current compose and keeps
+it, with a loud warning naming the affected agents. (3) Cron sessions still
+ran the pre-#2940 fail-open logic (a 5s probe that unset routing on
+unreachable); cron now obeys the same keep-routing contract on a
+deliberately short 3-attempt / ~15s retry budget.
+
+### LiteLLM provisioning self-heals orphaned keys; specs match shipped routing (#2980)
+
+Fixes LiteLLM provisioning footguns and reconciles the spec docs with the
+code that ships. (1) An orphaned key alias no longer bricks provisioning
+forever: if a prior apply generated `agent:<name>` but the vault write
+failed after, the alias lived in LiteLLM with no recoverable key and every
+later apply hard-failed `400 "Key with alias … already exists"`. `ensureKey`
+now detects the duplicate-alias 400, resolves and deletes the orphan, and
+regenerates once — idempotent and logged, with a clear manual-`curl`
+remediation error if the delete itself fails. (2) Stored keys are now
+validated against the proxy via `GET /key/info` when the admin key is in
+hand and the proxy reachable — a proxy DB reset that left every agent
+`401`ing forever under a green apply now re-provisions through the same
+self-healing path; proxy unreachable skips validation with a warning,
+never fails the apply. (3) A passphrase-less apply stops falsely reporting
+`hindsight (service)` unprovisionable on every run. (4) Docs only:
+`reference/invariants.md` and the max-subscription RFC now state the real
+split-by-cause contract (missing key → fail open; proxy unreachable with a
+key → keep routing + self-heal) shipped since #2940, replacing the stale
+blanket fail-open wording.
+
+### Always-allow persist fails ~1 in 3 (#2984)
+
+Concurrent "Always allow" taps corrupted the persisted grants: the
+multi-line flow-list YAML writer produced malformed output roughly one time
+in three (issue #2973), and a failed persist was silently dropped so the
+grant never stuck. The writer bug is fixed, and a new
+`always-allow-persist-queue.ts` retry queue captures any failed persist,
+surfaces the failure to the operator instead of failing quietly
+terminal-side, drains anything a prior gateway process left behind on
+startup, and re-drains periodically for the process lifetime.
+
+### Harden progress/status surface — dropped handbacks, frozen cards, stale replays (#2979)
+
+A full adversarially-validated review of the work-visibility / progress-
+card subsystem. **Headline:** a delegated background-worker's result could
+silently vanish — no recap, no handback, no reply — when the sub-agent's
+identity link didn't stitch; it now degrades to an in-memory `background`
+result and delivers on `resultText`. The rest is hardening: a card frozen
+"running" on a 429 cooldown now stages a deferred terminal edit re-driven
+by the heartbeat; a worker killed before a restart is no longer resurrected
+as "completed" (post-boot growth required); fuzzy backfill refuses
+ambiguous links; typing flicker under parallel tools is ref-counted; the
+retry budget is age-bound so it can't bleed across dark turns; and the id
+set is LRU-capped. Every fix carries a regression test verified to fail
+against HEAD.
+
 ## v0.18.6 — Progress-card liveness fixes, adversarial review hardening, npm-publish release gate
 
 ### Worker-activity feed: resurrection race, nested silent-drop, stale finalize (#2960)
