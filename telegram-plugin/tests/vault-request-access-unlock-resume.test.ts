@@ -22,10 +22,14 @@ import { describe, it, expect } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
-const gatewaySrc = readFileSync(
-  resolve(__dirname, '..', 'gateway', 'gateway.ts'),
-  'utf-8',
-)
+// #2996 Phase 5: the callback-query handler families moved verbatim to
+// gateway/callback-query-handlers.ts; these pins read the gateway source
+// COMBINED with that module so the wiring assertions keep covering the
+// same runtime source text.
+const gatewaySrc =
+  readFileSync(resolve(__dirname, '..', 'gateway', 'gateway.ts'), 'utf-8') +
+  '\n' +
+  readFileSync(resolve(__dirname, '..', 'gateway', 'callback-query-handlers.ts'), 'utf-8')
 
 describe('vault_request_access — tap-to-unlock-and-approve UX', () => {
   it('declares the passphrase-for-access-approve PendingVaultOp variant', () => {

@@ -33,7 +33,14 @@ import { join, dirname } from 'node:path'
 const __dir = dirname(fileURLToPath(import.meta.url))
 const pluginDir = join(__dir, '..')
 
-const gatewaySrc = readFileSync(join(pluginDir, 'gateway', 'gateway.ts'), 'utf8')
+// #2996 Phase 5: the callback-query handler families moved verbatim to
+// gateway/callback-query-handlers.ts; these pins read the gateway source
+// COMBINED with that module so the wiring assertions keep covering the
+// same runtime source text.
+const gatewaySrc =
+  readFileSync(join(pluginDir, 'gateway', 'gateway.ts'), 'utf8') +
+  '\n' +
+  readFileSync(join(pluginDir, 'gateway', 'callback-query-handlers.ts'), 'utf8')
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 

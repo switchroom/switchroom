@@ -41,10 +41,14 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { resolveVaultApprovalPosture } from '../vault-approval-posture.js'
 
-const gatewaySrc = readFileSync(
-  resolve(__dirname, '..', 'gateway', 'gateway.ts'),
-  'utf-8',
-)
+// #2996 Phase 5: the callback-query handler families moved verbatim to
+// gateway/callback-query-handlers.ts; these pins read the gateway source
+// COMBINED with that module so the wiring assertions keep covering the
+// same runtime source text.
+const gatewaySrc =
+  readFileSync(resolve(__dirname, '..', 'gateway', 'gateway.ts'), 'utf-8') +
+  '\n' +
+  readFileSync(resolve(__dirname, '..', 'gateway', 'callback-query-handlers.ts'), 'utf-8')
 
 function sliceAccessApproveBlock(): string {
   const fn =
@@ -73,7 +77,10 @@ describe('vault grant approval posture — module-level wiring', () => {
 describe('handleVaultRequestAccessCallback — posture branch', () => {
   it('mints via posture attestation (NOT in-memory passphrase) when posture is telegram-id', () => {
     const approveBlock = sliceAccessApproveBlock()
-    expect(approveBlock).toMatch(/VAULT_APPROVAL_AUTH_MODE === ['"]telegram-id['"]/)
+    // #2996 Phase 5: inside the extracted handler module the mutable gateway
+    // `let` is read via the injected getter (gateway wires it as
+    // `getVaultApprovalAuthMode: () => VAULT_APPROVAL_AUTH_MODE`).
+    expect(approveBlock).toMatch(/getVaultApprovalAuthMode\(\) === ['"]telegram-id['"]/)
     // Pinned: the call shape MUST be `{ kind: 'posture' }`. If the
     // gateway ever reverts to passing a real passphrase here, the
     // bypass surface returns.
@@ -138,7 +145,8 @@ describe('handleVaultRequestSaveCallback — posture-attested broker put (#1115 
     // calls `defaultVaultWritePosture` (posture-attested broker put,
     // no passphrase). Under passphrase mode it keeps the legacy
     // cached-passphrase + shell-out path.
-    expect(fnBlock).toMatch(/VAULT_APPROVAL_AUTH_MODE === 'telegram-id'/)
+    // #2996 Phase 5: getter read of the gateway's mutable posture `let`.
+    expect(fnBlock).toMatch(/getVaultApprovalAuthMode\(\) === 'telegram-id'/)
     expect(fnBlock).toMatch(/defaultVaultWritePosture\(/)
     // Passphrase-mode branch still present.
     expect(fnBlock).toMatch(/vaultPassphraseCache\.get\(pending\.chat_id\)/)
@@ -203,7 +211,7 @@ describe('allowlist is the first gate in every vault callback handler', () => {
         'mintGrantViaBroker',
         'performVaultAccessApproval',
         'pendingVaultOps.set',
-        "VAULT_APPROVAL_AUTH_MODE === 'telegram-id'",
+        "getVaultApprovalAuthMode() === 'telegram-id'",
         'attest_via_posture',
       ]) {
         expect(

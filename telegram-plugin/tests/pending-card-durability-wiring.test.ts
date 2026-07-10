@@ -25,6 +25,11 @@ const GATEWAY = read('gateway/gateway.ts')
 // to `<store>.sweep(now)`; the per-entry sweepExpiredEntries guard lives in the
 // store module.
 const CARD_STORES = read('gateway/approval-card-stores.ts')
+// #2996 Phase 5: the callback-query handler families (vault access/save,
+// mental-model, deferred-secret, grant wizard, operator-event, auth dashboard)
+// moved verbatim behind callback-query-handlers.ts; handler-body pins read
+// that module while staging/boot/sweep wiring stays pinned on gateway.ts.
+const CB_HANDLERS = read('gateway/callback-query-handlers.ts')
 
 function slice(src: string, header: string, span = 3000): string {
   const start = src.indexOf(header)
@@ -95,7 +100,7 @@ describe('boot restore (Defect A)', () => {
   })
 
   it('a Save tap on a restored (valueless) card degrades gracefully instead of writing empty', () => {
-    const fn = slice(GATEWAY, 'async function handleVaultRequestSaveCallback', 9000)
+    const fn = slice(CB_HANDLERS, 'async function handleVaultRequestSaveCallback', 9000)
     expect(fn).toMatch(/pending\.restoredWithoutValue \|\| pending\.value\.length === 0/)
     expect(fn).toMatch(/lost to a gateway restart/)
     expect(fn).toMatch(/buildVaultSaveFailedInbound/)
@@ -107,15 +112,15 @@ describe('boot restore (Defect A)', () => {
 describe('resolution clears the durable store (Defect A)', () => {
   it('vault access approve/deny remove from the store', () => {
     // deny path
-    const deny = slice(GATEWAY, 'async function handleVaultRequestAccessCallback', 4000)
+    const deny = slice(CB_HANDLERS, 'async function handleVaultRequestAccessCallback', 4000)
     expect(deny).toMatch(/pendingCardStore\.remove\(stageId\)/)
     // approve path (performVaultAccessApproval) removes on every terminal branch
-    const approve = slice(GATEWAY, 'async function performVaultAccessApproval', 9000)
+    const approve = slice(CB_HANDLERS, 'async function performVaultAccessApproval', 9000)
     expect(approve).toMatch(/pendingCardStore\.remove\(stageId\)/)
   })
 
   it('vault save resolution paths remove from the store', () => {
-    const fn = slice(GATEWAY, 'async function handleVaultRequestSaveCallback', 12000)
+    const fn = slice(CB_HANDLERS, 'async function handleVaultRequestSaveCallback', 12000)
     // discard / write-fail / success / passphrase-missing all clear the store.
     const count = (fn.match(/pendingCardStore\.remove\(stageId\)/g) ?? []).length
     expect(count).toBeGreaterThanOrEqual(3)
@@ -129,7 +134,7 @@ describe('resolution clears the durable store (Defect A)', () => {
   })
 
   it('mental model resolve removes from the store', () => {
-    const fn = slice(GATEWAY, 'async function handleMentalModelProposeCallback', 4000)
+    const fn = slice(CB_HANDLERS, 'async function handleMentalModelProposeCallback', 4000)
     expect(fn).toMatch(/pendingCardStore\.remove\(stageId\)/)
   })
 })
