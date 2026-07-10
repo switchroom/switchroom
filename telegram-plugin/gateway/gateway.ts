@@ -135,7 +135,8 @@ import {
   buildSecretRequestTimeoutInbound,
   buildMentalModelProposeTimeoutInbound,
 } from './approval-timeout-inbound-builders.js'
-import { expirePendingCard, sweepExpiredEntries } from './pending-card-expiry.js'
+import { expirePendingCard } from './pending-card-expiry.js'
+import { createSweepableCardStore } from './approval-card-stores.js'
 import {
   isPermissionRearmEnabled,
   permissionRearmGraceMs,
@@ -5729,20 +5730,20 @@ interface PendingVaultRequestSave {
    *  the value was lost to a restart instead of writing an empty secret. */
   restoredWithoutValue?: boolean
 }
-const pendingVaultRequestSaves = new Map<string, PendingVaultRequestSave>()
 // Gateway-side reap window for a staged vault-save card. Tracks the operator
 // approval-card lifetime (config-driven, 60-min default) so the reap never
 // races ahead of the card the operator is still looking at.
 const VAULT_REQUEST_SAVE_TTL_MS = approvalTtlMs()
-function sweepPendingVaultRequestSaves(now = Date.now()): void {
-  sweepExpiredEntries(
-    pendingVaultRequestSaves,
-    (v, n) => v.staged_at < n - VAULT_REQUEST_SAVE_TTL_MS,
-    expireVaultSaveCard,
-    now,
-    cardExpiryLog,
-  )
-}
+// Storage extracted to approval-card-stores.ts (#2996 Phase 3): the store owns
+// the Map + co-locates the TTL sweep (`.sweep(now)`); expiry LOGIC
+// (expireVaultSaveCard) is still gateway-side, injected as a thunk. Call sites
+// (get/set/delete/iteration/restore) are byte-identical — same variable, same
+// Map surface.
+const pendingVaultRequestSaves = createSweepableCardStore<PendingVaultRequestSave>({
+  isExpired: (v, n) => v.staged_at < n - VAULT_REQUEST_SAVE_TTL_MS,
+  expire: () => expireVaultSaveCard,
+  log: () => cardExpiryLog,
+})
 
 /**
  * Issue #1012 — agent-initiated vault ACL request. The agent calls
@@ -5780,19 +5781,16 @@ interface PendingVaultRequestAccess {
   /** Unix-ms timestamp; entries are reaped after VAULT_REQUEST_ACCESS_TTL_MS. */
   staged_at: number
 }
-const pendingVaultRequestAccesses = new Map<string, PendingVaultRequestAccess>()
 // Gateway-side reap window for a staged vault-access card. Tracks the operator
 // approval-card lifetime (config-driven, 60-min default) — see approvalTtlMs.
 const VAULT_REQUEST_ACCESS_TTL_MS = approvalTtlMs()
-function sweepPendingVaultRequestAccesses(now = Date.now()): void {
-  sweepExpiredEntries(
-    pendingVaultRequestAccesses,
-    (v, n) => v.staged_at < n - VAULT_REQUEST_ACCESS_TTL_MS,
-    expireVaultAccessCard,
-    now,
-    cardExpiryLog,
-  )
-}
+// Storage extracted to approval-card-stores.ts (#2996 Phase 3) — see the
+// vault-save store above for the pattern.
+const pendingVaultRequestAccesses = createSweepableCardStore<PendingVaultRequestAccess>({
+  isExpired: (v, n) => v.staged_at < n - VAULT_REQUEST_ACCESS_TTL_MS,
+  expire: () => expireVaultAccessCard,
+  log: () => cardExpiryLog,
+})
 
 /**
  * Staged agent-initiated MENTAL MODEL proposal (hindsight Phase 5). The agent
@@ -5817,21 +5815,18 @@ interface PendingMentalModelPropose {
   reason?: string
   staged_at: number
 }
-const pendingMentalModelProposes = new Map<string, PendingMentalModelPropose>()
 const MENTAL_MODEL_PROPOSE_TTL_MS = approvalTtlMs()
-// Sweep expired pending proposals. For any entry past its TTL we ALSO edit the
-// posted card's keyboard away, so a stale card left in the chat can't be tapped
-// into a "Card expired" answer — the operator sees the ⌛ expiry inline instead.
-// Best-effort: card edits are fire-and-forget (the entry is removed regardless).
-function sweepPendingMentalModelProposes(now = Date.now()): void {
-  sweepExpiredEntries(
-    pendingMentalModelProposes,
-    (v, n) => v.staged_at < n - MENTAL_MODEL_PROPOSE_TTL_MS,
-    expireMentalModelProposeCard,
-    now,
-    cardExpiryLog,
-  )
-}
+// Storage extracted to approval-card-stores.ts (#2996 Phase 3). The store's
+// `.sweep(now)` expires past-TTL proposals; for any expired entry the injected
+// expireMentalModelProposeCard ALSO edits the posted card's keyboard away, so a
+// stale card left in the chat can't be tapped into a "Card expired" answer — the
+// operator sees the ⌛ expiry inline instead. Best-effort: card edits are
+// fire-and-forget (the entry is removed regardless).
+const pendingMentalModelProposes = createSweepableCardStore<PendingMentalModelPropose>({
+  isExpired: (v, n) => v.staged_at < n - MENTAL_MODEL_PROPOSE_TTL_MS,
+  expire: () => expireMentalModelProposeCard,
+  log: () => cardExpiryLog,
+})
 
 // Sliding-window rate limit for mental-model proposals: at most
 // MENTAL_MODEL_PROPOSE_MAX_PER_WINDOW cards per MENTAL_MODEL_PROPOSE_WINDOW_MS.
@@ -6275,9 +6270,9 @@ function expireMentalModelProposeCard(stageId: string, v: PendingMentalModelProp
 // per-entry guarded via sweepExpiredEntries, so one throwing expiry (dead IPC
 // socket, store IO error) can't skip the remaining entries or families.
 function sweepExpiredApprovalCards(now: number): void {
-  sweepPendingVaultRequestAccesses(now)
-  sweepPendingVaultRequestSaves(now)
-  sweepPendingMentalModelProposes(now)
+  pendingVaultRequestAccesses.sweep(now)
+  pendingVaultRequestSaves.sweep(now)
+  pendingMentalModelProposes.sweep(now)
   sweepSecretRequests(now)
 }
 
@@ -12742,23 +12737,23 @@ interface PendingSecretRequest {
    *  in that topic, not General. */
   threadId?: number
 }
-// stageId -> request (lives until tapped or TTL).
-const pendingSecretRequests = new Map<string, PendingSecretRequest>()
 // chat_id -> the armed capture: the operator's NEXT message in this chat is
 // the value for `key`. Set when [Provide securely] is tapped.
 interface ArmedSecretCapture { key: string; agent: string; stageId: string; armed_at: number; threadId?: number }
 const armedSecretCaptures = new Map<string, ArmedSecretCapture>()
 const PENDING_SECRET_REQUEST_TTL_MS = 30 * 60_000 // card lifetime
 const ARMED_SECRET_CAPTURE_TTL_MS = 10 * 60_000   // window to send the value after tapping
+// stageId -> request (lives until tapped or TTL). Storage extracted to
+// approval-card-stores.ts (#2996 Phase 3): the store owns the Map + co-locates
+// the TTL sweep; expireSecretRequestCard (the wake logic) stays gateway-side.
+const pendingSecretRequests = createSweepableCardStore<PendingSecretRequest>({
+  isExpired: (v, n) => n - v.staged_at > PENDING_SECRET_REQUEST_TTL_MS,
+  expire: () => expireSecretRequestCard,
+  log: () => cardExpiryLog,
+})
 
 function sweepSecretRequests(now = Date.now()): void {
-  sweepExpiredEntries(
-    pendingSecretRequests,
-    (v, n) => n - v.staged_at > PENDING_SECRET_REQUEST_TTL_MS,
-    expireSecretRequestCard,
-    now,
-    cardExpiryLog,
-  )
+  pendingSecretRequests.sweep(now)
   // armedSecretCaptures is a TRANSIENT post-tap window (never persisted): it's
   // only set after the operator taps [Provide securely], and the request is
   // no longer parked-on-a-card. Just drop stale ones — no wake needed.

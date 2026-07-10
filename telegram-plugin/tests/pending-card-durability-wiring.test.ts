@@ -20,6 +20,11 @@ import { dirname, resolve } from 'node:path'
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const read = (p: string) => readFileSync(resolve(__dirname, '..', p), 'utf8')
 const GATEWAY = read('gateway/gateway.ts')
+// #2996 Phase 3: the in-memory approval-card Maps + their TTL sweeps moved
+// behind approval-card-stores.ts. The gateway now delegates each family sweep
+// to `<store>.sweep(now)`; the per-entry sweepExpiredEntries guard lives in the
+// store module.
+const CARD_STORES = read('gateway/approval-card-stores.ts')
 
 function slice(src: string, header: string, span = 3000): string {
   const start = src.indexOf(header)
@@ -141,10 +146,13 @@ describe('TTL expiry wakes the parked agent (Defect B)', () => {
   })
 
   it('sweepExpiredApprovalCards runs all four family sweeps', () => {
+    // #2996 Phase 3: three families now delegate to their store's `.sweep(now)`;
+    // request_secret still routes via sweepSecretRequests (which also sweeps the
+    // transient armedSecretCaptures) and that in turn calls the store sweep.
     const fn = slice(GATEWAY, 'function sweepExpiredApprovalCards', 600)
-    expect(fn).toMatch(/sweepPendingVaultRequestAccesses\(now\)/)
-    expect(fn).toMatch(/sweepPendingVaultRequestSaves\(now\)/)
-    expect(fn).toMatch(/sweepPendingMentalModelProposes\(now\)/)
+    expect(fn).toMatch(/pendingVaultRequestAccesses\.sweep\(now\)/)
+    expect(fn).toMatch(/pendingVaultRequestSaves\.sweep\(now\)/)
+    expect(fn).toMatch(/pendingMentalModelProposes\.sweep\(now\)/)
     expect(fn).toMatch(/sweepSecretRequests\(now\)/)
   })
 
@@ -173,14 +181,20 @@ describe('TTL expiry wakes the parked agent (Defect B)', () => {
   })
 
   it('each family sweep is per-entry guarded via sweepExpiredEntries', () => {
-    for (const fnName of [
-      'function sweepPendingVaultRequestAccesses',
-      'function sweepPendingVaultRequestSaves',
-      'function sweepPendingMentalModelProposes',
-      'function sweepSecretRequests',
+    // #2996 Phase 3: the per-entry guard moved into the store module's `.sweep`,
+    // which is a thin pass-through to the same pure sweepExpiredEntries core.
+    // The three vault/mental families delegate to that store method; the
+    // request_secret family's sweepSecretRequests delegates to it too.
+    expect(CARD_STORES).toMatch(/sweep:\s*\(now\)\s*=>\s*\n?\s*sweepExpiredEntries\(/)
+    const secretSweep = slice(GATEWAY, 'function sweepSecretRequests', 500)
+    expect(secretSweep).toMatch(/pendingSecretRequests\.sweep\(now\)/)
+    for (const store of [
+      'const pendingVaultRequestAccesses = createSweepableCardStore',
+      'const pendingVaultRequestSaves = createSweepableCardStore',
+      'const pendingMentalModelProposes = createSweepableCardStore',
+      'const pendingSecretRequests = createSweepableCardStore',
     ]) {
-      const fn = slice(GATEWAY, fnName, 500)
-      expect(fn, fnName).toMatch(/sweepExpiredEntries\(/)
+      expect(GATEWAY, store).toContain(store)
     }
   })
 
