@@ -31,6 +31,25 @@ function subAgentUserMsg(promptText: string) {
 function subAgentTurnEnd() {
   return { type: 'system', subtype: 'turn_duration', duration_ms: 1234 }
 }
+// An assistant message that STARTS a tool call (e.g. a long-running Bash
+// loop). A tool-using turn's stop_reason is 'tool_use', never 'end_turn',
+// so this does NOT terminalise the worker.
+function subAgentToolUse(toolUseId: string, name = 'Bash') {
+  return {
+    type: 'assistant',
+    message: {
+      stop_reason: 'tool_use',
+      content: [{ type: 'tool_use', id: toolUseId, name, input: { command: 'sleep 600' } }],
+    },
+  }
+}
+// A user message carrying the matching tool_result — the tool call is done.
+function subAgentToolResult(toolUseId: string) {
+  return {
+    type: 'user',
+    message: { content: [{ type: 'tool_result', tool_use_id: toolUseId, content: 'ok' }] },
+  }
+}
 
 interface Harness {
   stallCalls: Array<{ agentId: string; idleMs: number }>
@@ -43,6 +62,7 @@ interface Harness {
   fileContents: Map<string, Buffer>
   jsonlPath: string
   appendActivity: () => void
+  appendLines: (...lines: object[]) => void
 }
 
 function makeHarness(opts: {
@@ -168,6 +188,12 @@ function makeHarness(opts: {
     fileContents.set(jsonlPath, Buffer.concat([cur, Buffer.from(more, 'utf-8')]))
   }
 
+  const appendLines = (...lines: object[]): void => {
+    const cur = fileContents.get(jsonlPath) ?? Buffer.alloc(0)
+    const more = buildJSONL(...lines)
+    fileContents.set(jsonlPath, Buffer.concat([cur, Buffer.from(more, 'utf-8')]))
+  }
+
   return {
     stallCalls,
     stallTerminalCalls,
@@ -179,6 +205,7 @@ function makeHarness(opts: {
     fileContents,
     jsonlPath,
     appendActivity,
+    appendLines,
   }
 }
 
@@ -311,5 +338,75 @@ describe('subagent-watcher post-stall terminal synthesis (RFC §Bug 6)', () => {
     h.advance(300_000)
     expect(h.stallTerminalCalls).toHaveLength(0)
     expect(h.finishCalls).toHaveLength(1) // unchanged
+  })
+})
+
+describe('subagent-watcher in-flight tool-call gate (incident 2026-07-10)', () => {
+  it('does NOT synthesise terminal while a tool call is still in flight, even past silentStallTerminalMs', () => {
+    const agentId = 'inflight-no-synth'
+    const h = makeHarness({
+      agentId,
+      stallThresholdMs: 60_000,
+      silentStallTerminalMs: 300_000,
+      rescanMs: 500,
+    })
+
+    h.advance(500) // register
+    unmarkHistorical(h, agentId)
+
+    // Worker starts a long-running Bash tool call (a frame-capture loop).
+    // The transcript ends in a tool_use with NO matching tool_result — the
+    // JSONL then goes silent for the entire duration of the tool call.
+    h.appendLines(subAgentToolUse('toolu_longbash'))
+    h.advance(1_000) // poll reads the tool_use → in-flight set has 1 id
+
+    // Idle far past the stall threshold: the stall badge still fires (the
+    // worker IS quiet), but the entry is inside a legal long tool call.
+    h.advance(62_000)
+    expect(h.stallCalls).toHaveLength(1)
+
+    // Idle well past silentStallTerminalMs — with the OLD code this would
+    // finalise the live worker's card. The in-flight gate must suppress it.
+    h.advance(400_000)
+    expect(h.stallTerminalCalls).toHaveLength(0)
+    expect(h.finishCalls).toHaveLength(0)
+    expect(h.logs.some((l) => l.includes('terminal synthesis deferred'))).toBe(true)
+  })
+
+  it('synthesises terminal once the tool_result lands and idle persists', () => {
+    const agentId = 'inflight-then-synth'
+    const h = makeHarness({
+      agentId,
+      stallThresholdMs: 60_000,
+      silentStallTerminalMs: 300_000,
+      rescanMs: 500,
+    })
+
+    h.advance(500)
+    unmarkHistorical(h, agentId)
+
+    // In-flight tool call, then a long silent window — no synthesis.
+    h.appendLines(subAgentToolUse('toolu_longbash'))
+    h.advance(1_000)
+    h.advance(62_000) // stall fires
+    h.advance(400_000) // gated — no synthesis
+    expect(h.stallTerminalCalls).toHaveLength(0)
+
+    // The tool call finally completes: the matching tool_result lands.
+    // This is JSONL growth, so the un-stall path fires and the in-flight
+    // set drains — the gate re-opens.
+    h.appendLines(subAgentToolResult('toolu_longbash'))
+    h.advance(1_000)
+    expect(h.unstallCalls).toHaveLength(1)
+    expect(h.stallTerminalCalls).toHaveLength(0)
+
+    // Now the worker goes genuinely silent with nothing in flight: re-stall,
+    // then cross the terminal window — synthesis fires exactly as designed.
+    h.advance(62_000) // re-stall
+    h.advance(302_000) // past silentStallTerminalMs from the new stall
+    expect(h.stallTerminalCalls).toHaveLength(1)
+    expect(h.stallTerminalCalls[0].agentId).toBe(agentId)
+    expect(h.finishCalls).toHaveLength(1)
+    expect(h.finishCalls[0].outcome).toBe('completed')
   })
 })

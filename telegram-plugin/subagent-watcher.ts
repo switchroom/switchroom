@@ -141,6 +141,21 @@ export interface WorkerEntry {
    */
   lastTool: { name: string; sanitisedArg: string } | null
   /**
+   * Tool-use ids for tool calls this worker has STARTED but not yet
+   * finished — a `sub_agent_tool_use` was observed with no matching
+   * `sub_agent_tool_result` yet. A non-empty set means the worker is
+   * currently *inside* a tool call (e.g. a long-running `Bash` frame-
+   * capture loop that can legally run 10+ minutes with zero JSONL
+   * growth). The silent-stall terminal synthesis (checkStalls Pass 2)
+   * MUST NOT fire while this is non-empty: a frozen `lastActivityAt`
+   * during an in-flight tool call is expected, not a dead worker.
+   * Cleared on the matching `sub_agent_tool_result` and on
+   * `sub_agent_turn_end` (belt-and-braces). Tool-use lines with a null
+   * `toolUseId` can't be paired, so they don't participate — Bash and
+   * every real long-runner always carries a `toolu_…` id.
+   */
+  inflightToolUseIds: Set<string>
+  /**
    * True if the underlying JSONL file existed before the watcher started.
    * Historical entries are tracked for late state transitions but are
    * excluded from the active-workers card — the sub-agent process is long
@@ -1144,6 +1159,14 @@ export function readSubTail(
             entry.lastReplyText = ev.input.text as string
           }
           entry.toolCount++
+          // Track this as an IN-FLIGHT tool call so the silent-stall
+          // terminal synthesis (checkStalls Pass 2) doesn't misread the
+          // frozen JSONL of a long-running tool (a 10-min `Bash` loop) as
+          // a dead worker. Only pairable (non-null id) tool_uses count —
+          // Bash + every real long-runner always carries a `toolu_…` id.
+          if (ev.toolUseId != null && ev.toolUseId !== '') {
+            entry.inflightToolUseIds.add(ev.toolUseId)
+          }
           // P0 of #662: surface the most recent tool name + sanitised
           // arg so the driver's fleet-state shadow can render the
           // last-tool column on the v2 status card. Sanitiser lives in
@@ -1254,7 +1277,17 @@ export function readSubTail(
             fireNarrativeProgress() // prior pending was pure narration → SHOW
           }
           entry.pendingNarrative = { text: ev.text }
+        } else if (ev.kind === 'sub_agent_tool_result') {
+          // The tool call completed — clear it from the in-flight set so
+          // the terminal-synthesis gate re-opens. Idempotent: a result
+          // whose tool_use we never tracked (null id, parallel spill) is
+          // a harmless no-op delete.
+          if (ev.toolUseId != null && ev.toolUseId !== '') {
+            entry.inflightToolUseIds.delete(ev.toolUseId)
+          }
         } else if (ev.kind === 'sub_agent_turn_end') {
+          // Belt-and-braces: a turn boundary means nothing is in flight.
+          entry.inflightToolUseIds.clear()
           // Narrative-dedup gate step 3: a trailing sub_agent_text block with
           // nothing after it. SUPPRESS only when it drafts the foreground
           // sub-agent's delivered reply (entry.lastReplyText, set above on a
@@ -1463,6 +1496,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       lastResultText: '',
       lastProgressBucketIdx: null,
       lastTool: null,
+      inflightToolUseIds: new Set<string>(),
       historical: isHistorical,
     }
     registry.set(agentId, entry)
@@ -1862,6 +1896,20 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       if (entry.stallTerminalSynthesised) continue
       if (entry.stalledAt == null) continue
       if (n - entry.stalledAt < silentStallTerminalMs) continue
+      // In-flight tool-call gate (incident 2026-07-10): a worker whose
+      // transcript ends in a `tool_use` with no matching `tool_result`
+      // yet is NOT silent — it's *inside* a long tool call (a `Bash`
+      // frame-capture loop legally runs 10+ minutes with zero JSONL
+      // growth). Synthesising `sub_agent_turn_end` here finalises a live
+      // worker's card while it keeps running (real incident: card 16201
+      // reaped at t+13min, worker resumed 92ms later with no card). Skip
+      // synthesis until the outstanding tool_result lands; the un-stall
+      // path re-arms detection from scratch, so a genuinely-dead worker
+      // still terminalises once it goes idle with nothing in flight.
+      if (entry.inflightToolUseIds.size > 0) {
+        log?.(`subagent-watcher: silent-stall terminal synthesis deferred for ${entry.agentId} — ${entry.inflightToolUseIds.size} tool call(s) still in flight (long-running tool, not a dead worker)`)
+        continue
+      }
       entry.stallTerminalSynthesised = true
       entry.state = 'done'
       const postStallSec = Math.floor((n - entry.stalledAt) / 1000)
@@ -2103,7 +2151,21 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
   function runReaper(): void {
     if (db == null) return
     try {
-      const result = reapStuckRunningRows(db, { ttlMs: reaperTtlMs, now: nowFn() })
+      const result = reapStuckRunningRows(db, {
+        ttlMs: reaperTtlMs,
+        now: nowFn(),
+        // Liveness cross-check: never reap a row whose worker the watcher
+        // is actively tailing. A live entry is `running`, non-historical,
+        // and still in the in-memory registry (cleanupTerminalAgent drops
+        // it on real termination). The DB `last_activity_at` freezes during
+        // a long in-flight tool call and is NULL when linkage failed — both
+        // would otherwise false-positive a live worker as terminal.
+        isLive: (jsonlAgentId) => {
+          if (jsonlAgentId == null) return false
+          const entry = registry.get(jsonlAgentId)
+          return entry != null && entry.state === 'running' && !entry.historical
+        },
+      })
       if (result.reaped > 0) {
         log?.(`subagent-watcher: reaper transitioned ${result.reaped} stuck-running row(s) to stalled (ttl=${Math.round(reaperTtlMs / 60_000)}min)`)
       }

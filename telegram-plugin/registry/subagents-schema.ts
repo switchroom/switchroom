@@ -183,6 +183,20 @@ export interface ReapStuckRunningArgs {
   ttlMs: number
   /** Current time (DI for tests). */
   now: number
+  /**
+   * Optional liveness cross-check against the in-memory file-discovery
+   * registry. Called with a candidate row's `jsonl_agent_id` (null when
+   * linkage never happened); return `true` if the watcher is actively
+   * tailing a live worker for that id. When it returns true the row is
+   * NOT reaped — the DB's `last_activity_at` is a *stale* liveness signal
+   * (it's only bumped when the JSONL is linked, and it freezes during a
+   * long in-flight tool call), so a row the watcher knows is alive must
+   * not be independently classified as dead here. The watcher owns that
+   * worker's terminal transition. Incident 2026-07-10: a live, actively-
+   * card-editing worker was reaped as terminal because this cross-check
+   * didn't exist. Omit to preserve the pre-fix unconditional behaviour.
+   */
+  isLive?: (jsonlAgentId: string | null) => boolean
 }
 
 export interface ReapStuckRunningResult {
@@ -524,14 +538,23 @@ export function reapStuckRunningRows(
   args: ReapStuckRunningArgs,
 ): ReapStuckRunningResult {
   const cutoff = args.now - args.ttlMs
-  const candidates = db
+  const rows = db
     .prepare(`
-      SELECT id FROM subagents
+      SELECT id, jsonl_agent_id FROM subagents
       WHERE status = 'running'
         AND background = 1
         AND COALESCE(last_activity_at, started_at) < ?
     `)
-    .all(cutoff) as Array<{ id: string }>
+    .all(cutoff) as Array<{ id: string; jsonl_agent_id: string | null }>
+
+  // Cross-check each stale-by-DB candidate against the live in-memory
+  // registry. A worker the watcher is actively tailing is NOT dead just
+  // because its DB `last_activity_at` is stale/NULL — the watcher owns
+  // its terminal transition. Skipping these prevents the incident where a
+  // live, actively-card-editing worker was reaped as terminal.
+  const candidates = args.isLive
+    ? rows.filter((r) => !args.isLive!(r.jsonl_agent_id))
+    : rows
 
   for (const row of candidates) {
     recordSubagentStall(db, {
