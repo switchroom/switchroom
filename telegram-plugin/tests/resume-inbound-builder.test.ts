@@ -239,7 +239,19 @@ describe('interrupted sub-agent block', () => {
     expect(block).not.toContain('1 sub-agents')
   })
 
-  it('the watchdog report inbound ALSO carries the killed-worker block', () => {
+  it('codepoint-safe truncation never splits a surrogate pair', () => {
+    // 199 ASCII chars, then an astral-plane emoji (2 UTF-16 code units)
+    // straddling the cap. A code-unit slice would cut the pair in half and
+    // leave a lone surrogate; the codepoint-safe slice must not.
+    const desc = 'a'.repeat(199) + '🚀' + 'b'.repeat(50)
+    const block = renderInterruptedSubagentsBlock([{ agentType: 'worker', description: desc }])
+    expect(block).toContain('…')
+    // No lone surrogates anywhere in the rendered block.
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(block)).toBe(false)
+    expect(block).toBe(block.normalize('NFC')) // sanity: still a well-formed string
+  })
+
+  it('the watchdog report inbound carries the block in DEFERRED form (ask-first contract)', () => {
     const msg = buildResumeWatchdogReportInbound({
       turn: makeTurn({ ended_via: 'timeout' }),
       idleMs: 300_000,
@@ -247,6 +259,19 @@ describe('interrupted sub-agent block', () => {
     })
     expect(msg.text).toContain('did NOT complete')
     expect(msg.text).toContain('refactor the auth module and add tests')
+    // Deferred wording: re-dispatch is conditional on the user asking to retry…
+    expect(msg.text).toContain("If the user asks you to retry, they'll need re-dispatching")
+    expect(msg.text).toContain("don't assume their work landed")
+    // …and the resume-path imperative must NOT appear — it would contradict
+    // the watchdog inbound's "Do NOT silently resume … ask" hang-safety gate.
+    expect(msg.text).not.toContain('Re-dispatch the ones still needed')
+    expect(msg.text).not.toContain('before declaring the task done')
+  })
+
+  it('the resume-path inbound keeps the assertive imperative (and not the deferred form)', () => {
+    const msg = buildResumeInterruptedInbound({ turn: makeTurn(), subagents: twoRunning })
+    expect(msg.text).toContain('Re-dispatch the ones still needed before declaring the task done')
+    expect(msg.text).not.toContain('If the user asks you to retry')
   })
 })
 

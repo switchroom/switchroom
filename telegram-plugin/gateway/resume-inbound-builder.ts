@@ -72,7 +72,12 @@ const SUBAGENT_LIST_CAP = 10
 function truncatePrompt(s: string, max: number): string {
   const t = s.trim()
   if (t.length <= max) return t
-  return t.slice(0, max - 1).trimEnd() + '…'
+  // Codepoint-safe truncation: slice by code POINTS, not UTF-16 code units —
+  // a naive `.slice()` can split a surrogate pair (emoji, astral-plane CJK)
+  // and leave a lone surrogate that renders as U+FFFD in the inbound.
+  const points = Array.from(t)
+  if (points.length <= max) return t
+  return points.slice(0, max - 1).join('').trimEnd() + '…'
 }
 
 /**
@@ -81,9 +86,21 @@ function truncatePrompt(s: string, max: number): string {
  * sub-agents (so the inbound is unchanged in the common case). Bounded: at
  * most `SUBAGENT_LIST_CAP` entries, each prompt truncated to
  * `SUBAGENT_PROMPT_MAX` chars, with an overflow count for the remainder.
+ *
+ * The closing instruction is mode-aware, mirroring the two builders'
+ * contracts:
+ *   - `assertive: true` (the `resume_interrupted` path, whose inbound already
+ *     says "just resume") → imperative: re-dispatch the ones still needed
+ *     before declaring the task done.
+ *   - `assertive: false` (the `resume_watchdog_timeout` path — an ask-first
+ *     contract: "Do NOT silently resume … ask whether to retry") → deferred:
+ *     IF the user asks to retry, the workers will need re-dispatching. An
+ *     unconditional re-dispatch imperative here would contradict that
+ *     hang-safety gate.
  */
 export function renderInterruptedSubagentsBlock(
   subs: InterruptedSubagent[] | undefined,
+  opts: { assertive: boolean } = { assertive: true },
 ): string {
   if (!subs || subs.length === 0) return ''
   const shown = subs.slice(0, SUBAGENT_LIST_CAP)
@@ -99,13 +116,17 @@ export function renderInterruptedSubagentsBlock(
       ? `\n  …and ${subs.length - SUBAGENT_LIST_CAP} more.`
       : ''
   const count = subs.length
+  const closing = opts.assertive
+    ? `\nRe-dispatch the ones still needed before declaring the task done — ` +
+      `don't assume their work landed.`
+    : `\nIf the user asks you to retry, they'll need re-dispatching — ` +
+      `don't assume their work landed.`
   return (
     `\n\nWhen the restart hit, ${count} sub-agent${count === 1 ? ' was' : 's were'} still ` +
     `in flight. These sub-agents were killed by the restart and did NOT complete:\n` +
     lines.join('\n') +
     overflow +
-    `\nRe-dispatch the ones still needed before declaring the task done — ` +
-    `don't assume their work landed.`
+    closing
   )
 }
 
@@ -286,7 +307,9 @@ export function buildResumeWatchdogReportInbound(
       `whether they want you to retry it or take a different angle. Report ` +
       `only the honest cause — no observable progress for that long — don't ` +
       `speculate about a deeper root cause you can't see.` +
-      renderInterruptedSubagentsBlock(ctx.subagents),
+      // Deferred (non-assertive) form: this is the ask-first path — the killed
+      // workers are listed as facts, but re-dispatch waits on the user's call.
+      renderInterruptedSubagentsBlock(ctx.subagents, { assertive: false }),
     meta,
   }
 }

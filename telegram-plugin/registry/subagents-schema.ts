@@ -647,6 +647,12 @@ export function listSubagents(
  * excluded. This also makes the read robust to boot ordering: even if the
  * watcher's reaper transitions a row to `stalled` before this runs, the row is
  * still surfaced rather than dropped.
+ *
+ * Known gap: rows with NULL parent_turn_key are silently omitted — the
+ * INSERT-time stamp can be missing (no turn-active marker at dispatch, e.g.
+ * nested workers) and the watcher's async backfill may not have run before the
+ * killing restart. Those workers won't appear in the resume inbound; the
+ * wake-audit orphan-check (switchroom-runtime skill) is the backstop.
  */
 export function listNonTerminalSubagentsForTurn(
   db: SqliteDatabase,
