@@ -169,6 +169,9 @@ export default defineConfig({
       "**/telegram-plugin/tests/fleet-fallback-gate.test.ts",
       "**/telegram-plugin/tests/ipc-server-client.test.ts",
       "**/telegram-plugin/tests/ipc-server-race.test.ts",
+      // ipc-server-query-pending-permission.test.ts (#2971) drives a real
+      // createIpcServer (Bun.listen) over a tmp UDS — run via test:bun.
+      "**/telegram-plugin/tests/ipc-server-query-pending-permission.test.ts",
       "**/telegram-plugin/tests/gateway-bridge.test.ts",
       "**/telegram-plugin/tests/gateway-startup-mutex.test.ts",
       "**/telegram-plugin/tests/gateway-clean-shutdown-marker.test.ts",

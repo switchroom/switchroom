@@ -107,11 +107,19 @@ async function main(): Promise<void> {
   // detection is on (the menu branch is otherwise disabled anyway).
   const overageSelect =
     rateLimitDetect && process.env.SWITCHROOM_RATE_LIMIT_OVERAGE !== "0";
+  // #2971 — card-aware permission-prompt gate: default ON. Before Esc-ing a
+  // shape-persistent permission prompt, ask the gateway whether a live
+  // Telegram approval card already exists; if so, defer to the card + the
+  // #2724 TTL reaper instead of racing it with a keystroke. Kill switch
+  // SWITCHROOM_PERMISSION_CARD_AWARE=0 restores the old unconditional-Esc
+  // behaviour (useful if this ever needs a fast rollback).
+  const permissionCardAware = process.env.SWITCHROOM_PERMISSION_CARD_AWARE !== "0";
   try {
     console.error(
       `[autoaccept-poll] ${agentName}: entering wedge-watchdog (continuous)` +
         (rateLimitDetect ? " +rate-limit-detect" : " (rate-limit-detect OFF)") +
-        (overageSelect ? " +overage-carveout" : ""),
+        (overageSelect ? " +overage-carveout" : "") +
+        (permissionCardAware ? " +permission-card-aware" : " (permission-card-aware OFF)"),
     );
     // Runs until the container stops (maxPolls defaults to Infinity).
     const res = await runWedgeWatchdog({
@@ -129,9 +137,12 @@ async function main(): Promise<void> {
       overageDecision: overageSelect ? () => queryActiveOverageServing() : undefined,
       // #2471 — wire the manifest-stall escalation (kill/interrupt + handoff).
       requestRestart: requestWedgeRestart,
+      // #2971 — `undefined` wires the real gateway query (default export's
+      // own default); `null` disables the card-aware check entirely.
+      queryPendingPermission: permissionCardAware ? undefined : null,
     });
     console.error(
-      `[autoaccept-poll] ${agentName}: wedge-watchdog returned reason=${res.reason} fires=${res.fires} rateLimitFires=${res.rateLimitFires} overageCreditSelections=${res.overageCreditSelections} confirmModalFires=${res.confirmModalFires} permissionPromptFires=${res.permissionPromptFires} restartEscalations=${res.restartEscalations}`,
+      `[autoaccept-poll] ${agentName}: wedge-watchdog returned reason=${res.reason} fires=${res.fires} rateLimitFires=${res.rateLimitFires} overageCreditSelections=${res.overageCreditSelections} confirmModalFires=${res.confirmModalFires} permissionPromptFires=${res.permissionPromptFires} permissionPromptDeferrals=${res.permissionPromptDeferrals} restartEscalations=${res.restartEscalations}`,
     );
   } catch (err) {
     console.error(
