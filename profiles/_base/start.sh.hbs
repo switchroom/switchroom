@@ -120,17 +120,19 @@ if [ "$SWITCHROOM_RUNTIME" = "docker" ] && [ -z "$SWITCHROOM_DOCKER_TMUX_INNER" 
     else
       sr_ll_ok="1"
     fi
-    if [ -n "$sr_ll_ok" ]; then
+    if [ -n "$sr_ll_ok" ] || [ -n "$sr_ll_unreachable" ]; then
+      # Key fetched successfully — export the proxy auth header REGARDLESS of the
+      # reachability probe outcome. The header is what carries the virtual key
+      # into the process env; without it the gateway's sr-* discovery
+      # (gateway.ts discoverSrModels) is dead and, once the proxy recovers,
+      # every request 401s until a manual restart. Since routing is LEFT IN
+      # PLACE on unreachable (below/above), the header must be too so the
+      # session actually self-heals when litellm returns. The probe result gates
+      # only log wording + inner-pass _LITELLM_OK, never the header.
       export ANTHROPIC_CUSTOM_HEADERS="x-litellm-api-key: Bearer $sr_ll_key
 x-litellm-customer-id: $SWITCHROOM_AGENT_NAME
 x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:-default}"
       export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
-    elif [ -n "$sr_ll_unreachable" ]; then
-      # Proxy unreachable at boot: routing intentionally LEFT IN PLACE (loud
-      # warning already emitted) so it survives into the inner pass and
-      # self-heals once litellm returns. NO unset — the permanent strip here
-      # was what made the inner self-heal fix inert on docker.
-      :
     else
       # Missing-key fail-open: gateway talks direct OAuth, unproxied.
       unset ANTHROPIC_BASE_URL ANTHROPIC_SMALL_FAST_MODEL SWITCHROOM_LITELLM SWITCHROOM_LITELLM_BASE
@@ -1016,8 +1018,15 @@ if [ -n "${SWITCHROOM_LITELLM:-}" ] && command -v switchroom >/dev/null 2>&1; th
   else
     sr_ll_ok="1"
   fi
-  if [ -n "$sr_ll_ok" ]; then
-    _LITELLM_OK="1"
+  if [ -n "$sr_ll_ok" ] || [ -n "$sr_ll_unreachable" ]; then
+    # Key fetched successfully — export the proxy auth header REGARDLESS of the
+    # reachability probe outcome. Routing is LEFT IN PLACE on unreachable so the
+    # session self-heals when litellm returns; the header MUST survive with it,
+    # otherwise every request 401s once the proxy recovers (the "self-heals"
+    # promise below was inert without this) and gateway sr-* discovery stays
+    # dead. The probe outcome gates ONLY the _LITELLM_OK flag (sr-* override
+    # drop) and the log wording above — never the header.
+    #
     # Newline-separated Name: Value pairs (claude CLI ANTHROPIC_CUSTOM_HEADERS format).
     # Tags: agent:<name> for per-agent spend tracking; profile:<profile> for
     # fleet-level cost breakdown by role. Per-turn tags (cron vs telegram) are
@@ -1031,13 +1040,12 @@ x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:
     # models configured in the proxy appear in the /model picker and can be
     # selected via --model. Without this, the CLI only knows its bundled list.
     export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
-  elif [ -n "$sr_ll_unreachable" ]; then
-    # Proxy unreachable at boot: routing intentionally LEFT IN PLACE (loud
-    # warning already emitted above) so it self-heals when litellm returns.
-    # _LITELLM_OK stays empty so any sr-* session model override is still
-    # dropped below (claude would 4xx an unknown model against a down endpoint).
-    # NO unset here — that permanent strip was the bug this branch fixes.
-    :
+    if [ -n "$sr_ll_ok" ]; then
+      # Probe succeeded: proxy is live, so honor any sr-* session model override
+      # below. On unreachable, _LITELLM_OK stays empty so the override is dropped
+      # (claude would 4xx an unknown model against a down endpoint).
+      _LITELLM_OK="1"
+    fi
   else
     # Missing key fail-open: drop every routing var so the claude CLI talks to
     # Anthropic directly on its OAuth credential (subscription path), unproxied.

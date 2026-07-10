@@ -129,13 +129,15 @@ describe("start.sh: LiteLLM ANTHROPIC_CUSTOM_HEADERS hoisted before gateway fork
     expect(outerSlice).toContain("no virtual key for agent");
   });
 
-  it("outer dispatch (executed): UNREACHABLE keeps routing env, MISSING KEY strips it", () => {
+  it("outer dispatch (executed): UNREACHABLE keeps routing env + HEADERS, MISSING KEY strips it", () => {
     const startSh = renderStartSh();
     // Extract JUST the outer dispatch (decision + scratch cleanup): from the
-    // FIRST `if [ -n "$sr_ll_ok" ]` (outer precedes inner) through the first
+    // FIRST decision `if` (outer precedes inner) through the first
     // `unset sr_ll_key sr_ll_ok sr_ll_unreachable`. This runs the real strip-vs-
     // keep code paths without the 120s probe loop.
-    const dispStart = startSh.indexOf('if [ -n "$sr_ll_ok" ]; then');
+    const dispStart = startSh.indexOf(
+      'if [ -n "$sr_ll_ok" ] || [ -n "$sr_ll_unreachable" ]; then',
+    );
     const dispEndMarker = "unset sr_ll_key sr_ll_ok sr_ll_unreachable";
     const dispEnd = startSh.indexOf(dispEndMarker, dispStart) + dispEndMarker.length;
     expect(dispStart).toBeGreaterThan(-1);
@@ -145,6 +147,10 @@ describe("start.sh: LiteLLM ANTHROPIC_CUSTOM_HEADERS hoisted before gateway fork
     const runDispatch = (preset: { ok: string; unreachable: string }): Record<string, string> => {
       const script = [
         "set -e",
+        // The outer block's own guard requires ANTHROPIC_CUSTOM_HEADERS empty on
+        // entry; clear any value inherited from the test runner's env so the
+        // dispatch runs from the same precondition it sees at real boot.
+        "unset ANTHROPIC_CUSTOM_HEADERS",
         "export SWITCHROOM_AGENT_NAME=a",
         "export SWITCHROOM_AGENT_PROFILE=default",
         'export ANTHROPIC_BASE_URL="http://litellm:4010/anthropic"',
@@ -158,24 +164,47 @@ describe("start.sh: LiteLLM ANTHROPIC_CUSTOM_HEADERS hoisted before gateway fork
         'echo "BASEURL=${ANTHROPIC_BASE_URL:-__UNSET__}"',
         'echo "LITELLM=${SWITCHROOM_LITELLM:-__UNSET__}"',
         'echo "LLBASE=${SWITCHROOM_LITELLM_BASE:-__UNSET__}"',
+        // Collapse the (multi-line) header to a single sentinel so the regex
+        // below can capture "set vs unset" without newline handling.
+        'if [ -n "${ANTHROPIC_CUSTOM_HEADERS:-}" ]; then echo "HEADERS=SET"; else echo "HEADERS=__UNSET__"; fi',
+        // Prove the virtual key actually rode into the header (this is what
+        // authenticates to the proxy once it recovers — the whole self-heal).
+        'case "${ANTHROPIC_CUSTOM_HEADERS:-}" in *"Bearer k"*) echo "KEYINHEADER=YES";; *) echo "KEYINHEADER=NO";; esac',
       ].join("\n");
       const out = execFileSync("bash", ["-c", script], { encoding: "utf-8" });
       return Object.fromEntries(
-        [...out.matchAll(/^(BASEURL|LITELLM|LLBASE)=(.*)$/gm)].map((m) => [m[1], m[2].trim()]),
+        [...out.matchAll(/^(BASEURL|LITELLM|LLBASE|HEADERS|KEYINHEADER)=(.*)$/gm)].map((m) => [
+          m[1],
+          m[2].trim(),
+        ]),
       );
     };
 
-    // Proxy unreachable → routing env SURVIVES (must reach the tmux exec env).
+    // Proxy unreachable → routing env SURVIVES (must reach the tmux exec env)
+    // AND the auth header is exported with the key in hand, so the session
+    // self-heals (authenticates) the moment the proxy recovers instead of
+    // 401-ing until a manual restart. This header assertion is the regression
+    // guard for the boot-while-proxy-down-never-recovers bug.
     const unreachable = runDispatch({ ok: "", unreachable: "1" });
     expect(unreachable.BASEURL).toBe("http://litellm:4010/anthropic");
     expect(unreachable.LITELLM).toBe("1");
     expect(unreachable.LLBASE).toBe("http://litellm:4010");
+    expect(unreachable.HEADERS).toBe("SET");
+    expect(unreachable.KEYINHEADER).toBe("YES");
 
-    // Missing key → fail-open strip (all routing vars gone).
+    // Proxy reachable → routing + header both present (the happy path).
+    const ok = runDispatch({ ok: "1", unreachable: "" });
+    expect(ok.BASEURL).toBe("http://litellm:4010/anthropic");
+    expect(ok.LITELLM).toBe("1");
+    expect(ok.HEADERS).toBe("SET");
+    expect(ok.KEYINHEADER).toBe("YES");
+
+    // Missing key → fail-open strip (all routing vars gone; no header exported).
     const missingKey = runDispatch({ ok: "", unreachable: "" });
     expect(missingKey.BASEURL).toBe("__UNSET__");
     expect(missingKey.LITELLM).toBe("__UNSET__");
     expect(missingKey.LLBASE).toBe("__UNSET__");
+    expect(missingKey.HEADERS).toBe("__UNSET__");
   });
 
   it("outer block is inside the SWITCHROOM_DOCKER_TMUX_INNER guard (outer-only section)", () => {
