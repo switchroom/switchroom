@@ -296,6 +296,7 @@ export async function runMs365McpLauncher(
   let refreshTimer: NodeJS.Timeout | null = null;
   let restartTimer: NodeJS.Timeout | null = null;
   let restartingForRefresh = false;
+  let shuttingDown = false;
   let resolveLauncher: ((code: number) => void) | null = null;
   // Cached access token + expiry, updated on every successful fetch. Lets the
   // crash-loop backoff re-spawn softeria WITHOUT a fresh broker call (#2586).
@@ -304,6 +305,7 @@ export async function runMs365McpLauncher(
   let lastSpawnMs = 0;
 
   const exitLauncher = (code: number): void => {
+    shuttingDown = true;
     if (refreshTimer) {
       clearTimer(refreshTimer);
       refreshTimer = null;
@@ -341,6 +343,11 @@ export async function runMs365McpLauncher(
       // than exiting, so Claude Code doesn't respawn the launcher and issue a
       // fresh get-credentials broker call on every crash. A clean exit (code 0)
       // is an intentional shutdown and is propagated as before.
+      // If we're already tearing down (SIGTERM/SIGINT or exitLauncher), never
+      // start a fresh softeria — the launcher is on its way out. Relying on
+      // event-loop ordering for this was fragile; the flag is authoritative.
+      if (shuttingDown) return;
+
       const crashed = resolved !== 0;
       const tokenValid = currentCreds != null && currentCreds.expiresAt > now();
       if (crashed && tokenValid) {
@@ -350,11 +357,21 @@ export async function runMs365McpLauncher(
         if (restartAttempts < SOFTERIA_MAX_RESTARTS) {
           const delayMs = computeRestartBackoffMs(restartAttempts);
           restartAttempts += 1;
+          // Null out the dead child BEFORE scheduling the backoff re-spawn.
+          // Otherwise a refresh tick that fires during the backoff window would
+          // call killChild(dead-child) (a no-op) and then spawn its own fresh
+          // child — and when restartTimer later fires it would spawn a SECOND
+          // child, orphaning the first with its exit handler still wired →
+          // multiplying parallel softeria processes (worse than the storm this
+          // fixes). See PR #2997 review. The refresh callback also clears any
+          // pending restartTimer as belt-and-suspenders.
+          currentChild = null;
           log(
             `m365-launcher: softeria exited (code=${resolved} signal=${signal}); re-spawning with cached token in ${Math.round(delayMs / 1000)}s (attempt ${restartAttempts}/${SOFTERIA_MAX_RESTARTS}, no broker call)`,
           );
           restartTimer = setTimer(() => {
             restartTimer = null;
+            if (shuttingDown) return;
             if (currentCreds != null && currentCreds.expiresAt > now()) {
               currentChild = launchChild(currentCreds.accessToken);
             } else {
@@ -395,6 +412,14 @@ export async function runMs365McpLauncher(
     refreshTimer = setTimer(async () => {
       try {
         log("m365-launcher: refreshing token + restarting softeria");
+        // Cancel any pending crash-loop backoff re-spawn. The refresh path is
+        // about to kill + respawn softeria with fresh creds; if a backoff timer
+        // fired afterwards it would spawn a SECOND child, orphaning this one.
+        // See PR #2997 review (double-spawn / process fan-out).
+        if (restartTimer) {
+          clearTimer(restartTimer);
+          restartTimer = null;
+        }
         // Order matters: set the flag BEFORE awaiting fetchCreds. If
         // we awaited first and the child happened to die during the
         // await, the exit handler would treat it as unexpected and

@@ -614,4 +614,87 @@ describe("runMs365McpLauncher — crash-loop backoff (#2586)", () => {
     rmSync(hbDir, { recursive: true, force: true });
     delete process.env.SWITCHROOM_M365_HEARTBEAT_DIR;
   });
+
+  it("refresh firing during a pending crash-backoff does NOT double-spawn (#2997 review blocker)", async () => {
+    const hbDir = `/tmp/m365-test-dblspawn-${process.pid}-${Date.now()}`;
+    process.env.SWITCHROOM_M365_HEARTBEAT_DIR = hbDir;
+    const children = [makeFakeChild(), makeFakeChild(), makeFakeChild()];
+    let spawnCount = 0;
+    let fetchCount = 0;
+
+    // Timer registry that models real cancellation: a cleared timer must not
+    // fire. This is what lets the test prove the refresh path cancels the
+    // pending backoff timer (fix #1) rather than the harness silently allowing
+    // a second spawn.
+    interface FakeTimer {
+      cb: () => void;
+      cancelled: boolean;
+    }
+    const timers: FakeTimer[] = [];
+    const fire = (t: FakeTimer): void => {
+      if (!t.cancelled) t.cb();
+    };
+
+    const promise = runMs365McpLauncher(
+      {},
+      {
+        fetchCreds: async () => {
+          fetchCount++;
+          return {
+            accessToken: `at-${fetchCount}`,
+            expiresAt: Date.now() + 60 * 60 * 1000,
+          };
+        },
+        spawnSofteria: () =>
+          children[spawnCount++] as unknown as
+            import("node:child_process").ChildProcess,
+        setTimer: ((cb: () => void, _ms: number) => {
+          const t: FakeTimer = { cb, cancelled: false };
+          timers.push(t);
+          return t as unknown as NodeJS.Timeout;
+        }) as typeof setTimeout,
+        clearTimer: ((h: unknown) => {
+          if (h) (h as FakeTimer).cancelled = true;
+        }) as typeof clearTimeout,
+        log: () => {},
+      },
+    );
+
+    await new Promise((r) => setImmediate(r));
+    expect(spawnCount).toBe(1);
+    const refreshTimer = timers[0]; // first schedule = refresh tick
+
+    // softeria crashes → a backoff re-spawn timer is scheduled and the dead
+    // child is nulled out (fix #2).
+    children[0].exitCode = 137;
+    children[0].emit("exit", 137, null);
+    await new Promise((r) => setImmediate(r));
+    const backoffTimer = timers[1];
+    expect(backoffTimer).toBeDefined();
+    expect(backoffTimer.cancelled).toBe(false);
+
+    // The refresh tick now fires WHILE the backoff timer is still pending.
+    // It must cancel that backoff timer (fix #1) and spawn exactly one fresh
+    // child — not race the backoff into a second parallel softeria.
+    fire(refreshTimer);
+    await new Promise((r) => setTimeout(r, 30)); // let async fetch/kill settle
+
+    expect(backoffTimer.cancelled).toBe(true); // fix #1 — backoff cancelled
+    expect(spawnCount).toBe(2); // exactly one respawn (fresh-creds child)
+    expect(fetchCount).toBe(2); // the refresh fetched; backoff would not have
+
+    // Belt-and-suspenders: even if some stale reference tried to fire the
+    // cancelled backoff timer, it is a no-op — still exactly one live child.
+    fire(backoffTimer);
+    await new Promise((r) => setImmediate(r));
+    expect(spawnCount).toBe(2);
+
+    // Cleanup — the one live child exits cleanly, launcher resolves.
+    children[1].exitCode = 0;
+    children[1].emit("exit", 0, null);
+    const code = await promise;
+    expect(code).toBe(0);
+    rmSync(hbDir, { recursive: true, force: true });
+    delete process.env.SWITCHROOM_M365_HEARTBEAT_DIR;
+  });
 });

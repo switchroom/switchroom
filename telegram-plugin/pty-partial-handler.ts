@@ -123,6 +123,13 @@ function streamKey(chatId: string, threadId?: number): string {
  *
  * Returns the action taken. All state mutation happens through the
  * supplied `state` object so callers can inspect before/after.
+ *
+ * NOTE on `looksLikeRawApiError` suppression (#2922 Bug 3): this is
+ * *preview-only* scope. PTY partials are the live-streaming terminal tail,
+ * never the authoritative reply (that flows through the operator-event /
+ * reply pipelines). So the worst case of an over-eager match here is a
+ * missing streaming flicker for one snapshot — NOT a dropped user answer.
+ * That asymmetry is why the matcher can stay aggressive on raw error shapes.
  */
 export function handlePtyPartialPure(
   text: string,
