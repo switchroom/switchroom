@@ -5502,7 +5502,11 @@ const REAUTH_INTERCEPT_TTL_MS = 10 * 60_000
 // design: when this map is empty (e.g. fresh process) the defaults apply
 // (`'✓ received'` toast + strip keyboard) — the agent only loses any
 // custom ack_text override.
-const agentButtonMeta = new Map<string, Map<string, AgentButtonMeta>>()
+// Storage extracted to pending-state-stores.ts (#2996 Phase 3 step 2). Plain
+// store (no TTL sweep): bounded by the AGENT_BUTTON_META_MAX LRU cap enforced
+// in rememberAgentButtonMeta, not the reaper. keys().next().value gives the
+// oldest insertion for eviction — Map-surface parity preserved.
+const agentButtonMeta = createPlainStore<Map<string, AgentButtonMeta>>()
 const AGENT_BUTTON_META_MAX = 1000
 function rememberAgentButtonMeta(
   chatId: string | number,
