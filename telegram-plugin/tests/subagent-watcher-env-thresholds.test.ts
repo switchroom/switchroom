@@ -28,6 +28,7 @@ function makeHarness(opts: {
   configStallThresholdMs?: number
   configSilentSynthStallThresholdMs?: number
   configSilentStallTerminalMs?: number
+  configInflightTerminalCapMs?: number
   initialContent?: string
 } = {}) {
   const {
@@ -35,6 +36,7 @@ function makeHarness(opts: {
     configStallThresholdMs,
     configSilentSynthStallThresholdMs,
     configSilentStallTerminalMs,
+    configInflightTerminalCapMs,
     initialContent,
   } = opts
 
@@ -91,6 +93,7 @@ function makeHarness(opts: {
     stallThresholdMs: configStallThresholdMs,
     silentSynthesisStallThresholdMs: configSilentSynthStallThresholdMs ?? configStallThresholdMs,
     silentStallTerminalMs: configSilentStallTerminalMs,
+    inflightTerminalCapMs: configInflightTerminalCapMs,
     rescanMs: 500,
     onStall: (_id, idleMs) => stallCalls.push({ idleMs }),
     onStallTerminal: (id) => stallTerminalCalls.push({ agentId: id }),
@@ -132,6 +135,7 @@ const ENV_KEYS = [
   'SWITCHROOM_SUBAGENT_STALL_MS',
   'SWITCHROOM_SUBAGENT_SILENT_SYNTH_STALL_MS',
   'SWITCHROOM_SUBAGENT_STALL_TERMINAL_MS',
+  'SWITCHROOM_SUBAGENT_INFLIGHT_TERMINAL_CAP_MS',
 ] as const
 
 describe('subagent-watcher env-var threshold overrides', () => {
@@ -219,23 +223,28 @@ describe('subagent-watcher env-var threshold overrides', () => {
     expect(h.stallTerminalCalls).toHaveLength(0)
   })
 
-  it('a Bash-in-flight worker skips the tight stall threshold but still releases the terminal gate', () => {
-    // End-to-end of the long-runner suppression under compressed env-tuned
-    // windows: a worker mid-`Bash` (a) is NOT flagged at the tight active-loop
-    // threshold, (b) IS eventually flagged at the widened silent-synthesis
-    // window, and (c) the pass-2 terminal synthesis STILL fires the fixed
-    // window after that — the load-bearing completion-gate release is intact.
+  it('a Bash-in-flight worker skips the tight stall threshold, DEFERS terminal synthesis while the tool call is in flight, and still releases at the in-flight cap', () => {
+    // Design reconciliation (incident 2026-07-10 vs the #2777/#2782
+    // contract this test used to encode): a worker mid-`Bash` whose
+    // transcript ends in a tool_use with no matching tool_result is NOT
+    // silent — it's inside a legal long tool call — so the pass-2 terminal
+    // synthesis must NOT fire at silentStallTerminalMs (the old contract;
+    // it finalised a live worker's card). But the completion-gate release
+    // from #2777/#2782 is still load-bearing for a worker that DIED
+    // mid-tool, so the deferral is CAPPED at inflightTerminalCapMs of
+    // total idle: deferred while in flight, released at the cap.
     const h = makeHarness({
       agentId: 'env-thresh-bash',
       configStallThresholdMs: 1000, // tight active-loop threshold
       configSilentSynthStallThresholdMs: 10_000, // widened long-runner window
       configSilentStallTerminalMs: 5000, // compressed terminal window
+      configInflightTerminalCapMs: 60_000, // compressed died-mid-tool cap
       initialContent: buildJSONL(
         subAgentUserMsg('bg task'),
         { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tool-B', name: 'Bash', input: { command: 'npm test' } }] } },
       ),
     })
-    h.advance(500) // register + tail → toolCount=1, lastTool=Bash
+    h.advance(500) // register + tail → toolCount=1, lastTool=Bash, tool-B in flight
     h.unmarkHistorical()
 
     // 5s idle — well past the 1s active-loop threshold, but a Bash worker uses
@@ -248,8 +257,17 @@ describe('subagent-watcher env-var threshold overrides', () => {
     expect(h.stallCalls).toHaveLength(1)
     expect(h.stallTerminalCalls).toHaveLength(0)
 
-    // 5s post-stall → terminal synthesis releases the deferred-completion gate.
-    h.advance(6_000)
+    // 5s+ post-stall — the OLD contract synthesised here. The in-flight
+    // Bash (no tool_result yet) now defers it: a live long-runner must not
+    // have its card finalised under it.
+    h.advance(6_000) // ~17.5s total idle, < 60s cap
+    expect(h.stallTerminalCalls).toHaveLength(0)
+    expect(h.finishCalls).toHaveLength(0)
+
+    // Cross the in-flight cap (total idle ≥ 60s, tool_result still missing)
+    // → died-mid-tool: synthesis proceeds and the completion gate releases.
+    // The #2777/#2782 release guarantee survives, just later.
+    h.advance(50_000)
     expect(h.stallTerminalCalls).toHaveLength(1)
     expect(h.finishCalls).toHaveLength(1)
   })

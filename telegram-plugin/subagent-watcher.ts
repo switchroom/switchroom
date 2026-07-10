@@ -316,6 +316,21 @@ export interface SubagentWatcherConfig {
    */
   silentStallTerminalMs?: number
   /**
+   * Upper bound (ms of total JSONL idle) on the in-flight tool-call
+   * deferral of terminal synthesis. While a tool call is in flight
+   * (tool_use seen, matching tool_result not yet), synthesis is deferred —
+   * a long `Bash` legitimately freezes the JSONL for 10+ min (incident
+   * 2026-07-10). But a worker that DIES mid-tool (process killed; JSONL
+   * stops growing but is never deleted) would otherwise defer forever, and
+   * the reaper's isLive cross-check would shield it from the DB net too —
+   * wedged for the life of the gateway. Past this cap the deferral ends
+   * and synthesis proceeds. Default 45 min
+   * (DEFAULT_INFLIGHT_TERMINAL_CAP_MS) — above any legitimate single tool
+   * call, below the 1h reaper TTL. Env override
+   * `SWITCHROOM_SUBAGENT_INFLIGHT_TERMINAL_CAP_MS`.
+   */
+  inflightTerminalCapMs?: number
+  /**
    * Freshness window (ms) for promoting a running-at-boot worker file to
    * live. A file whose last write (mtime) is older than this is treated as
    * a dead prior-session worker and stays historical/suppressed, NOT
@@ -551,6 +566,12 @@ const DEFAULT_SILENT_SYNTHESIS_STALL_THRESHOLD_MS = 300_000
  * ceiling that closed-out cards used to wait on.
  */
 const DEFAULT_SILENT_STALL_TERMINAL_MS = 300_000
+// Upper bound on the in-flight tool-call deferral of terminal synthesis.
+// 45 min: comfortably above any legitimate single tool call (Bash caps at
+// 10 min per call; the incident loop ran ~10 min) but below the 1h DB
+// reaper TTL, so the watcher — not the reaper — still owns the terminal
+// transition for a worker that died mid-tool.
+const DEFAULT_INFLIGHT_TERMINAL_CAP_MS = 45 * 60_000
 
 /**
  * Tools that legitimately run for minutes with ZERO intervening JSONL
@@ -1220,6 +1241,16 @@ export function readSubTail(
             }
           }
         } else if (ev.kind === 'sub_agent_nested_spawn') {
+          // A nested Agent/Task dispatch is the same frozen-JSONL shape as
+          // a long tool call: a FOREGROUND nested child blocks this worker
+          // until it returns, with the matching tool_result only landing
+          // then — so gate terminal synthesis on it too. The existing
+          // `sub_agent_tool_result` handler clears the id (a background
+          // nested dispatch's "launched" result lands almost immediately,
+          // so it barely defers). Same cap applies.
+          if (ev.toolUseId != null && ev.toolUseId.length > 0) {
+            entry.inflightToolUseIds.add(ev.toolUseId)
+          }
           // Nested (depth-2+) dispatch keying: this worker just dispatched a
           // sub-agent of its own. The PreToolUse hook can't attribute it (the
           // main turn's turn-active.json marker is long gone for a background
@@ -1379,6 +1410,10 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
     config.silentStallTerminalMs
     ?? parseEnvMs('SWITCHROOM_SUBAGENT_STALL_TERMINAL_MS')
     ?? DEFAULT_SILENT_STALL_TERMINAL_MS
+  const inflightTerminalCapMs =
+    config.inflightTerminalCapMs
+    ?? parseEnvMs('SWITCHROOM_SUBAGENT_INFLIGHT_TERMINAL_CAP_MS')
+    ?? DEFAULT_INFLIGHT_TERMINAL_CAP_MS
   const inflightPromoteMaxAgeMs =
     config.inflightPromoteMaxAgeMs
     ?? parseEnvMs('SWITCHROOM_SUBAGENT_INFLIGHT_MAX_AGE_MS')
@@ -1902,13 +1937,27 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       // frame-capture loop legally runs 10+ minutes with zero JSONL
       // growth). Synthesising `sub_agent_turn_end` here finalises a live
       // worker's card while it keeps running (real incident: card 16201
-      // reaped at t+13min, worker resumed 92ms later with no card). Skip
-      // synthesis until the outstanding tool_result lands; the un-stall
-      // path re-arms detection from scratch, so a genuinely-dead worker
-      // still terminalises once it goes idle with nothing in flight.
+      // reaped at t+13min, worker resumed 92ms later with no card).
+      //
+      // The deferral is CAPPED, not unconditional (design reconciliation
+      // with #2777/#2782, whose contract is "a bg worker JSONL that
+      // legitimately lacks turn_end must still release the completion
+      // gate"): a worker that DIES mid-tool (process killed; JSONL frozen
+      // but never deleted) would otherwise defer forever, and the reaper's
+      // isLive cross-check would shield it from the DB net too. So: while
+      // a tool call is in flight, defer synthesis up to
+      // `inflightTerminalCapMs` of total JSONL idle (default 45 min — far
+      // above any legitimate single tool call, below the 1h reaper TTL);
+      // past the cap, synthesis proceeds. A tool_result landing at any
+      // point drains the set and re-arms normal detection via the
+      // un-stall path.
       if (entry.inflightToolUseIds.size > 0) {
-        log?.(`subagent-watcher: silent-stall terminal synthesis deferred for ${entry.agentId} — ${entry.inflightToolUseIds.size} tool call(s) still in flight (long-running tool, not a dead worker)`)
-        continue
+        const totalIdleMs = n - entry.lastActivityAt
+        if (totalIdleMs < inflightTerminalCapMs) {
+          log?.(`subagent-watcher: silent-stall terminal synthesis deferred for ${entry.agentId} — ${entry.inflightToolUseIds.size} tool call(s) still in flight, ${Math.floor(totalIdleMs / 1000)}s idle < ${Math.floor(inflightTerminalCapMs / 1000)}s cap (long-running tool, not a dead worker)`)
+          continue
+        }
+        log?.(`subagent-watcher: in-flight deferral cap reached for ${entry.agentId} (${Math.floor(totalIdleMs / 1000)}s idle >= ${Math.floor(inflightTerminalCapMs / 1000)}s cap with ${entry.inflightToolUseIds.size} tool call(s) still unresolved) — treating as died-mid-tool, proceeding with terminal synthesis`)
       }
       entry.stallTerminalSynthesised = true
       entry.state = 'done'
