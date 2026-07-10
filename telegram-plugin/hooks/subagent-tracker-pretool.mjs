@@ -243,7 +243,7 @@ function writeRow(dbPath, { id, parentSessionId, parentTurnKey, agentType, descr
     return
   }
 
-  // sqlite3 CLI fallback — two non-blocking spawns sequenced via callbacks.
+  // sqlite3 CLI fallback — non-blocking spawns sequenced via callbacks.
   // This legacy path (neither node:sqlite nor bun:sqlite available) can't
   // cheaply verify the marker's turn_key against the turns table, so drop
   // parent_turn_key and let the gateway's window backfill attribute it.
@@ -252,7 +252,15 @@ function writeRow(dbPath, { id, parentSessionId, parentTurnKey, agentType, descr
   params[2] = null
   spawnSql(dbPath, SCHEMA_SQL.replace(/\n\s+/g, ' '), (err) => {
     if (err) { done(err); return }
-    spawnSql(dbPath, fillPlaceholders(INSERT_SQL.trim(), params), done)
+    // Best-effort model-column migration for a legacy DB: the INSERT below
+    // references the model column, which a pre-model table lacks (CREATE TABLE
+    // IF NOT EXISTS is a no-op there, so the schema exec doesn't add it). The
+    // ALTER fails with "duplicate column name" when the column already exists —
+    // that error is EXPECTED and deliberately ignored; on any failure we still
+    // proceed to the INSERT, which surfaces a real problem via `done`.
+    spawnSql(dbPath, 'ALTER TABLE subagents ADD COLUMN model TEXT', () => {
+      spawnSql(dbPath, fillPlaceholders(INSERT_SQL.trim(), params), done)
+    })
   })
 }
 

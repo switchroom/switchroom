@@ -144,6 +144,7 @@ import { pickRecoveredPermissionOrigin } from './permission-card-origin.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
 import { appendActivityLabel, clipNarrative, renderActivityFeedWithNested, formatStepSuffix, type SessionActivityHeader } from '../tool-activity-summary.js'
 import { formatModelLabel } from '../model-label.js'
+import { createSessionModelSource } from './session-model-source.js'
 import { runSilentTurnHeartbeatTick } from '../feed-heartbeat-climb.js'
 import { REPLY_TOOLS, isDraftOfReply } from '../narrative-dedup.js'
 import { toolLabel } from '../tool-labels.js'
@@ -2635,23 +2636,16 @@ type CurrentTurn = {
 // is never written and this is exactly the old singleton.
 let currentTurn: CurrentTurn | null = null
 const currentTurnMap = new CurrentTurnMap<CurrentTurn>()
-// Last-seen MAIN-transcript model per session chat, sourced from the
-// `message.model` on each assistant line (session-tail `model` event). This is
-// the ground truth for "what model is the main agent actually running" — it
-// survives between turns (unlike `currentTurn`, nulled at turn end), so a
-// /status query landing in the idle gap still reflects the real model instead
-// of the launch-time / in-memory override. buildAgentMetadata prefers this over
-// the override when present. Bounded implicitly by the single-tenant chat set.
-const lastTranscriptModelByChat = new Map<string, string>()
-// Chat-agnostic most-recent main-transcript model — the fallback /status uses
-// (buildAgentMetadata has no chat context, and single-tenant agents have one
-// main session). Updated alongside the per-chat map.
-let lastMainTranscriptModel: string | null = null
-function rememberTranscriptModel(chatId: string | null | undefined, model: string): void {
-  lastMainTranscriptModel = model
-  if (chatId == null || chatId.length === 0) return
-  lastTranscriptModelByChat.set(chatId, model)
-}
+// Freshness-aware /status session-model source. Two writers: the session-tail
+// `model` event (each assistant line's `message.model` — ground truth for the
+// last API call, survives between turns) and the #2982 /model override (set
+// the instant a switch is confirmed — the ONLY truthful source in the
+// idle-after-switch window, before the next assistant line lands). Every write
+// is seq-stamped and `resolve()` prefers the NEWER observation, so neither
+// source can go stale behind the other (session-model-source.ts, pinned by
+// tests/session-model-source.test.ts). buildAgentMetadata reads resolve();
+// the /model command paths write via setOverride.
+const sessionModelSource = createSessionModelSource()
 // Captures the most-recently-started turn's sessionChatId. Unlike currentTurn,
 // this is NOT cleared by the silence poke (firePoke/clearTurnStarted). It lets
 // the Bug B fallback in executeReply route to the correct chat even when the
@@ -13932,13 +13926,14 @@ function handleSessionEvent(ev: SessionEvent): void {
       // value reaching here is a real resolved model id. Record it on the turn
       // (update-on-change) so the activity/liveness card header and /status
       // render the model actually serving this turn's API calls — transcript-
-      // sourced, never config. Also mirror it onto the sessionModel override
-      // store so a /status query between turns still reflects the last model.
+      // sourced, never config. Also note it on the freshness-aware session-model
+      // source so a /status query between turns still reflects the last model
+      // (and a fresh assistant line reclaims the source from a /model override).
       const turn = currentTurn
       if (turn != null) {
         turn.currentModel = ev.model
-        rememberTranscriptModel(turn.sessionChatId, ev.model)
       }
+      sessionModelSource.noteTranscriptModel(ev.model)
       return
     }
     case 'thinking': {
@@ -18507,13 +18502,12 @@ function buildAgentAudit(agentName: string): AgentAudit | undefined {
 // broker's fleet-wide `ListStateData` payload via
 // `buildAuthSummaryFromBroker`, with billingType pulled from the
 // agent's `.claude.json` (the broker doesn't track plan tier).
-/**
- * Live session-model override set by the `/model` picker (session-only). Held
- * in gateway memory so it clears on restart, the same point at which claude's
- * session reverts to the configured model — keeping `/status` honest without
- * a persisted store. Null when no session switch is active.
- */
-let activeSessionModelOverride: string | null = null
+// The live session-model override set by the `/model` picker (session-only)
+// lives on `sessionModelSource` (setOverride/getOverride, declared beside the
+// currentTurn globals). Held in gateway memory so it clears on restart, the
+// same point at which claude's session reverts to the configured model —
+// keeping `/status` honest without a persisted store. `resolve()` arbitrates
+// freshness against the transcript-observed model (#2982 idle-switch window).
 
 async function buildAgentMetadata(agentName: string): Promise<AgentMetadata> {
   type AgentListResp = {
@@ -18543,16 +18537,18 @@ async function buildAgentMetadata(agentName: string): Promise<AgentMetadata> {
   return {
     agentName,
     model: a?.model ?? null,
-    // Prefer the LIVE model actually serving turns, read from the main
-    // transcript's `message.model` (the ground truth for what the session is
-    // running right now) and rendered in the same short friendly form the
-    // cards use. Fall back to the in-memory /model override (kept truthful +
-    // friendly by #2982) when no transcript model has been observed yet — a
-    // fresh boot before the first assistant line, or an sr-* relaunch window.
-    // Never sourced from config. Surgical per PR #2982 overlap.
-    sessionModel:
-      (lastMainTranscriptModel != null ? formatModelLabel(lastMainTranscriptModel) : null) ??
-      activeSessionModelOverride,
+    // The FRESHEST session-model observation wins (session-model-source.ts):
+    // the transcript's `message.model` (ground truth for the last API call)
+    // vs the #2982 /model override (the only truthful source in the idle-
+    // after-switch window, before the next assistant line). Both rendered
+    // through formatModelLabel for a consistent short form; an override value
+    // that isn't model-shaped (an already-friendly "Opus 4.8" label) passes
+    // through verbatim. Never sourced from config.
+    sessionModel: (() => {
+      const resolved = sessionModelSource.resolve()
+      if (resolved == null) return null
+      return formatModelLabel(resolved.model) ?? resolved.model
+    })(),
     extendsProfile: (a?.extends ?? a?.template) ?? null,
     topicName: a?.topic_name ?? null,
     topicEmoji: a?.topic_emoji ?? null,
@@ -18783,7 +18779,7 @@ function buildModelDeps(restartCtx?: ModelDepsRestartContext): ModelMenuDeps & M
     },
     escapeHtml: escapeHtmlForTg,
     preBlock,
-    getActiveSessionModel: () => activeSessionModelOverride,
+    getActiveSessionModel: () => sessionModelSource.getOverride(),
     /**
      * Graceful restart for sr-* → Claude model switch. Same mechanism as
      * the /restart command: writes a restart marker (so the post-restart
@@ -18854,9 +18850,9 @@ function buildModelDeps(restartCtx?: ModelDepsRestartContext): ModelMenuDeps & M
       if (!agentDir) throw new Error('agent dir unresolvable — cannot write session-model carrier')
       // Carrier: single line, token + newline, no quoting (start.sh strips
       // whitespace and shape-gates). One-shot — consumed on the next boot.
-      const prevOverride = activeSessionModelOverride
+      const prevOverride = sessionModelSource.getOverride()
       writeFileSync(join(agentDir, '.session-model-override'), `${model}\n`, 'utf8')
-      activeSessionModelOverride = model
+      sessionModelSource.setOverride(model)
       try {
         await deps.scheduleRestart(reason)
       } catch (err) {
@@ -18869,7 +18865,7 @@ function buildModelDeps(restartCtx?: ModelDepsRestartContext): ModelMenuDeps & M
         // NEXT ordinary restart.
         if ((err as { code?: string })?.code !== 'restart_in_flight') {
           try { rmSync(carrierPath, { force: true }) } catch { /* best-effort */ }
-          activeSessionModelOverride = prevOverride
+          sessionModelSource.setOverride(prevOverride)
         }
         throw err
       }
@@ -18903,12 +18899,12 @@ bot.command('model', async ctx => {
   const reply = await handleModelCommand(parsed, deps)
   // Record a POSITIVELY-CONFIRMED typed switch so /status reflects what's
   // actually running — the SAME in-memory override the menu callback path sets
-  // (buildAgentMetadata reads activeSessionModelOverride as sessionModel). Only
+  // (buildAgentMetadata resolves it via sessionModelSource). Only
   // set on the confirmed inject path; the sr-*/relaunch paths already set the
   // override inside scheduleModelRelaunch, and an unverified switch carries no
   // selectedModel so /status is never lied to.
   if (reply.selectedModel) {
-    activeSessionModelOverride = reply.selectedModel
+    sessionModelSource.setOverride(reply.selectedModel)
   }
   await switchroomReply(ctx, reply.text, { html: reply.html })
 })
@@ -24008,13 +24004,13 @@ bot.on('callback_query:data', async ctx => {
     }
     const didInterimSrEdit = false
     try {
-      const prevSessionModel = activeSessionModelOverride
+      const prevSessionModel = sessionModelSource.getOverride()
       const outcome = await handleModelMenuCallback(data, modelDeps)
       // Record a successful session switch so /status reflects what's
       // actually running. In-memory only → clears when the gateway (and thus
       // claude's session) restarts, exactly matching the session-only scope.
       if (outcome.selectedModel) {
-        activeSessionModelOverride = outcome.selectedModel
+        sessionModelSource.setOverride(outcome.selectedModel)
       }
       // toastOnly: leave the menu untouched — but only if we haven't already
       // cleared its buttons with the interim sr-* edit. If we have, fall
@@ -24049,7 +24045,7 @@ bot.on('callback_query:data', async ctx => {
           if (agentDir && token) {
             try {
               writeFileSync(join(agentDir, '.session-model-override'), `${token}\n`, 'utf8')
-              activeSessionModelOverride = token
+              sessionModelSource.setOverride(token)
             } catch (e) {
               process.stderr.write(`telegram gateway: sr-to-claude carrier write failed: ${(e as Error)?.message ?? String(e)}\n`)
             }
@@ -27067,8 +27063,9 @@ void (async () => {
                   // a phantom session override.
                   return resolveMainModel(raw ?? undefined)
                 })()
-                activeSessionModelOverride =
-                  launched.length > 0 && launched !== configured ? launched : null
+                sessionModelSource.setOverride(
+                  launched.length > 0 && launched !== configured ? launched : null,
+                )
               } catch { /* leave override as-is on a bad read */ }
             }
 

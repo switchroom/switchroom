@@ -26,10 +26,12 @@ describe('gateway: scheduleModelRelaunch dep', () => {
     expect(win).toMatch(/writeFileSync\(\s*join\(agentDir, '\.session-model-override'\),\s*`\$\{model\}\\n`/)
   })
 
-  it('sets the in-memory activeSessionModelOverride before dispatching the restart', () => {
+  it('sets the in-memory session-model override before dispatching the restart', () => {
     const idx = GATEWAY_SRC.indexOf('scheduleModelRelaunch: async')
     const win = GATEWAY_SRC.slice(idx, idx + 900)
-    const setIdx = win.indexOf('activeSessionModelOverride = model')
+    // The override now lives on the freshness-aware sessionModelSource
+    // (session-model-source.ts) rather than a bare module-level variable.
+    const setIdx = win.indexOf('sessionModelSource.setOverride(model)')
     const restartIdx = win.indexOf('deps.scheduleRestart(reason)')
     expect(setIdx).toBeGreaterThan(0)
     expect(restartIdx).toBeGreaterThan(setIdx)
