@@ -439,13 +439,54 @@ describe("handleModelCommand — busy gate + honest unverified reporting", () =>
 
   it("reports a claude error output as an HONEST failure, not a switch", async () => {
     const { deps } = makeDeps({
-      inject: async () => okResult("Error: Model not found: bogus-model"),
+      inject: async () => okResult("Error: Model not found"),
     });
     const reply = await handleModelCommand({ kind: "set", model: "claude-bogus" }, deps);
     expect(reply.text).toContain("did not take");
     expect(reply.text).toContain("Model not found");
     expect(reply.text).not.toContain("Session-only");
     expect(reply.selectedModel).toBeUndefined();
+  });
+
+  it("detects claude v2.1.205's real error shape: ⎿  Model 'name' not found (TUI-probe verified)", async () => {
+    // Captured verbatim from a disposable claude v2.1.205 TUI, 2026-07-10.
+    const { deps } = makeDeps({
+      inject: async () => okResult("⎿  Model 'claude-bogus-99' not found"),
+    });
+    const reply = await handleModelCommand({ kind: "set", model: "claude-bogus-99" }, deps);
+    expect(reply.text).toContain("did not take");
+    expect(reply.text).toContain("not found");
+    expect(reply.selectedModel).toBeUndefined();
+  });
+
+  it("scrollback prose CONTAINING 'model not found' mid-sentence is NOT a failure (anchored error scan)", async () => {
+    // The error regex is line-start anchored, like the confirmation prefix —
+    // prose that merely mentions the phrase must not flip a successful switch
+    // into a reported failure (the false-FAILURE variant of the scrollback-leak
+    // class this PR eliminates).
+    const { deps } = makeDeps({
+      inject: async () => okResult("deploy failed: model not found in registry"),
+    });
+    const reply = await handleModelCommand({ kind: "set", model: "opus" }, deps);
+    expect(reply.text).not.toContain("did not take");
+    expect(reply.text).not.toContain("model not found");
+    // No confirmation either → honest unverified message, nothing recorded.
+    expect(reply.text).toContain("couldn't confirm the switch");
+    expect(reply.selectedModel).toBeUndefined();
+  });
+
+  it("recognises claude v2.1.205's real arg-form confirmation (⎿ glyph + 'and saved as your default')", async () => {
+    // Captured verbatim from a disposable claude v2.1.205 TUI, 2026-07-10:
+    // the arg form is NOT silent — it prints this line, and the ⎿ glyph
+    // survives the inject capture. The name extraction must stop at "and
+    // saved", not swallow the whole sentence.
+    const { deps } = makeDeps({
+      inject: async () =>
+        okResult("⎿  Set model to Opus 4.8 and saved as your default for new sessions"),
+    });
+    const reply = await handleModelCommand({ kind: "set", model: "opus" }, deps);
+    expect(reply.text).toContain("Set model to Opus 4.8");
+    expect(reply.selectedModel).toBe("Opus 4.8");
   });
 
   it("does NOT record an override when the confirmation is 'Kept model as' (no change)", async () => {
@@ -861,6 +902,11 @@ describe("sessionModelFromConfirmation", () => {
     expect(sessionModelFromConfirmation("Set model to Fable 5 for this session only")).toBe("Fable 5");
     expect(sessionModelFromConfirmation("Set model to Opus 4.8 (1M context) for this session only")).toBe("Opus 4.8");
     expect(sessionModelFromConfirmation("Switched to Haiku 4.5")).toBe("Haiku 4.5");
+  });
+  it("terminates the name at 'and saved' (claude v2.1.205 arg-form phrasing, TUI-probe verified)", () => {
+    expect(
+      sessionModelFromConfirmation("⎿  Set model to Opus 4.8 and saved as your default for new sessions"),
+    ).toBe("Opus 4.8");
   });
   it("returns null when no recognizable name is present", () => {
     expect(sessionModelFromConfirmation("Kept model as Opus 4.8 (default)")).toBeNull();

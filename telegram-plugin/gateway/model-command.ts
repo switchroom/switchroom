@@ -992,10 +992,20 @@ export function modelSwitchConfirmationLine(output: string): string | null {
  * claude's failure output for a bad `/model <name>` — the CLI rejects an
  * unknown id with "Model not found" / "Invalid model" / "Unknown model".
  * Detecting it lets the typed set path report an HONEST failure instead of
- * falsely claiming "switched (session)". Anchored to real phrasings, not a
- * loose word match, so ordinary scrollback prose can't false-positive.
+ * falsely claiming "switched (session)". Anchored to LINE START (behind the
+ * same optional status glyph + optional "Error:" prefix as
+ * MODEL_SWITCH_CONFIRMATION_PREFIX) so ordinary scrollback prose that merely
+ * CONTAINS the phrase mid-sentence (e.g. "deploy failed: model not found in
+ * registry") can never false-positive a successful switch into a reported
+ * failure — the false-FAILURE variant of the scrollback-leak class.
+ *
+ * Empirically verified against claude v2.1.205 (disposable TUI probe,
+ * 2026-07-10): `/model claude-bogus-99` prints
+ * `⎿  Model 'claude-bogus-99' not found` — glyph prefix `⎿`, quoted model
+ * name between "Model" and "not found". Both shapes are covered.
  */
-const MODEL_SWITCH_ERROR_RE = /\b(?:model not found|invalid model|unknown model|no such model)\b/i
+const MODEL_SWITCH_ERROR_RE =
+  /^\s*[⏺●•>⎿-]?\s*(?:Error:\s*)?(?:Model(?:\s+'[^']+')?\s+not found|Invalid model|Unknown model|No such model)\b/i
 
 /** The single capture line that reads as a claude model-switch error, or null. */
 export function modelSwitchErrorLine(output: string): string | null {
@@ -1015,7 +1025,7 @@ export function modelSwitchErrorLine(output: string): string | null {
  * label verbatim into /status.
  */
 export function isKeptModelConfirmation(confirmation: string): boolean {
-  return /^\s*[⏺●•>-]?\s*Kept model as\b/i.test(confirmation.trim())
+  return /^\s*[⏺●•>⎿-]?\s*Kept model as\b/i.test(confirmation.trim())
 }
 
 /**
@@ -1047,25 +1057,35 @@ export function isRestartInFlight(err: unknown): boolean {
 
 /**
  * claude's real model-switch confirmation always begins the line (optionally
- * behind a status glyph like `⏺` + whitespace) with one of these exact
+ * behind a status glyph like `⏺` or `⎿` + whitespace) with one of these exact
  * phrasings. Anchoring to the line start keeps ordinary scrollback prose that
  * merely *contains* words like "switched" or "set model" (e.g. "I switched the
  * deploy to blue-green") from false-positiving as a confirmation worth
  * relaying. Shared by `modelSwitchConfirmationLine` (does this line qualify?)
  * and `sessionModelFromConfirmation` (pull the name out).
+ *
+ * Empirically verified against claude v2.1.205 (disposable TUI probe,
+ * 2026-07-10): the arg form `/model opus` is NOT silent — it prints
+ * `⎿  Set model to Opus 4.8 and saved as your default for new sessions`.
+ * The `⎿` glyph survives the inject capture (isTuiChromeLine doesn't strip
+ * it), so it must be in the glyph class or every typed switch would fall
+ * through to the "couldn't confirm" branch and never record the override.
  */
 const MODEL_SWITCH_CONFIRMATION_PREFIX =
-  /^\s*[⏺●•>-]?\s*(?:Set model to|Switched to|Kept model as)\b/i
+  /^\s*[⏺●•>⎿-]?\s*(?:Set model to|Switched to|Kept model as)\b/i
 
 /**
  * Pull the model NAME out of claude's session-switch confirmation so it can
  * be shown in `/status` as the live session model. claude phrases it as
- * "Set model to <name> for this session only" (or "Switched to <name>").
- * Returns null when the confirmation doesn't carry a recognizable name (the
- * caller falls back to the tapped picker label).
+ * "Set model to <name> for this session only" / "Switched to <name>" /
+ * (v2.1.205 arg form) "Set model to <name> and saved as your default for new
+ * sessions" — the "and saved" tail must terminate the name capture or the
+ * whole sentence would be stored as the model. Returns null when the
+ * confirmation doesn't carry a recognizable name (the caller falls back to
+ * the tapped picker label).
  */
 export function sessionModelFromConfirmation(confirmation: string): string | null {
-  const m = /(?:Set model to|Switched to)\s+(.+?)(?:\s+for (?:this|the) session|\s*\(|\s*$)/i.exec(
+  const m = /(?:Set model to|Switched to)\s+(.+?)(?:\s+for (?:this|the) session|\s+and saved\b|\s*\(|\s*$)/i.exec(
     confirmation.trim(),
   )
   const name = m?.[1]?.trim()
