@@ -5511,7 +5511,11 @@ function rememberAgentButtonMeta(
 }
 
 // Vault
-const vaultPassphraseCache = new Map<string, { passphrase: string; expiresAt: number }>()
+// Storage extracted to pending-state-stores.ts (#2996 Phase 3 step 2). Absolute
+// expiry: the sweep deletes when now > expiresAt (direction preserved verbatim).
+const vaultPassphraseCache = createSweepableStore<{ passphrase: string; expiresAt: number }>(
+  (v, now) => now > v.expiresAt,
+)
 const VAULT_PASSPHRASE_TTL_MS = 30 * 60 * 1000
 
 /**
@@ -6474,9 +6478,7 @@ const pendingStateReaper = setInterval(() => {
   for (const [sig, at] of permissionTimeoutSignatures) {
     if (now - at > PERMISSION_DUPLICATE_WINDOW_MS) permissionTimeoutSignatures.delete(sig)
   }
-  for (const [k, v] of vaultPassphraseCache) {
-    if (now > v.expiresAt) vaultPassphraseCache.delete(k)
-  }
+  vaultPassphraseCache.sweep(now)
   // Drop expired "⏱ 30 min" scoped grants. (Lookup already fails closed on
   // expiry; this just keeps the map from accumulating dead entries.) Persist
   // the removal so a restart between sweeps can't resurrect a swept grant —
