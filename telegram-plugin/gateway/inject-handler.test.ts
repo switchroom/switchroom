@@ -104,6 +104,25 @@ describe('handleInjectCommand — guards', () => {
     expect(replies[0].text).toContain('Usage')
     expect(replies[0].text).toContain('/cost')
   })
+
+  it('refuses `/inject /model <name>` and points at the real /model driver', async () => {
+    // Bug 7c: /inject /model <arg> bypasses the whole /model driver (no busy
+    // gate, no sr-* carrier/base-URL repoint, no session-override recording).
+    const inject = vi.fn()
+    const { deps, replies } = makeDeps({ getArgs: () => '/model sonnet', inject })
+    await handleInjectCommand(fakeCtx(), deps)
+    expect(inject).not.toHaveBeenCalled()
+    expect(replies).toHaveLength(1)
+    expect(replies[0].text).toContain('/model sonnet')
+    expect(replies[0].text).toContain('own driver')
+  })
+
+  it('still allows bare `/inject /model` (read-only picker) through', async () => {
+    const inject = vi.fn().mockResolvedValue(okResult('/model', 'picker output'))
+    const { deps } = makeDeps({ getArgs: () => '/model', inject })
+    await handleInjectCommand(fakeCtx(), deps)
+    expect(inject).toHaveBeenCalledWith('gymbro', '/model')
+  })
 })
 
 describe('handleInjectCommand — outcome=ok', () => {

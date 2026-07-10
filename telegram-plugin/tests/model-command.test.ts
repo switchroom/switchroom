@@ -50,6 +50,7 @@ function makeDeps(overrides: Partial<ModelCommandDeps> = {}) {
       s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"),
     preBlock: (s) => `<pre>${s}</pre>`,
     getActiveSessionModel: () => null,
+    isBusy: () => false,
     scheduleRestart: async (reason) => { restartCalls.push(reason); },
     scheduleModelRelaunch: async (model, reason) => { relaunchCalls.push({ model, reason }); },
     ...overrides,
@@ -202,6 +203,9 @@ describe("handleModelCommand — set", () => {
     expect(reply.text).toContain("<pre>⏺ Set model to sonnet</pre>");
     expect(reply.text).toContain("Session-only");
     expect(reply.html).toBe(true);
+    // A verified confirmation records the live model so /status stays honest
+    // (bug 1: the typed path never recorded the switch before).
+    expect(reply.selectedModel).toBe("sonnet");
   });
 
   it("SILENT switch: suppresses raw pane scrollback instead of dumping it as a code block", async () => {
@@ -219,10 +223,13 @@ describe("handleModelCommand — set", () => {
     expect(reply.text).not.toContain("summary you asked for");
     expect(reply.text).not.toContain("rollback plan");
     expect(reply.text).not.toContain("<pre>");
-    // A clean, session-scoped confirmation is sent instead.
+    // No confirmation line was captured, so the switch is UNVERIFIED — report it
+    // honestly (never a false "switched") and record NO session override.
     expect(reply.text).toContain("/model fable");
-    expect(reply.text).toContain("switched (session)");
-    expect(reply.text).toContain("Session-only");
+    expect(reply.text).toContain("couldn't confirm the switch");
+    expect(reply.text).toContain("/status");
+    expect(reply.text).not.toContain("switched (session)");
+    expect(reply.selectedModel).toBeUndefined();
     expect(reply.html).toBe(true);
   });
 
@@ -248,12 +255,15 @@ describe("handleModelCommand — set", () => {
     const { deps } = makeDeps({ inject: async () => okResult(prose) });
     const reply = await handleModelCommand({ kind: "set", model: "fable" }, deps);
     // The anchored regex rejects all three lines, so nothing leaks and there is
-    // no <pre> block. A clean session confirmation is sent instead.
+    // no <pre> block. With no confirmation captured, the switch is UNVERIFIED —
+    // report it honestly, never a false "switched".
     expect(reply.text).not.toContain("<pre>");
     expect(reply.text).not.toContain("switched the deploy");
     expect(reply.text).not.toContain("set model behaviour");
     expect(reply.text).not.toContain("kept model changes");
-    expect(reply.text).toContain("switched (session)");
+    expect(reply.text).toContain("couldn't confirm the switch");
+    expect(reply.text).not.toContain("switched (session)");
+    expect(reply.selectedModel).toBeUndefined();
     expect(reply.html).toBe(true);
   });
 
@@ -327,49 +337,55 @@ describe("isSrModel / isClaudeModel helpers", () => {
 });
 
 describe("handleModelCommand — sr-* → Claude graceful restart", () => {
-  it("schedules restart instead of injecting when session is on sr-* and target is Claude alias", async () => {
-    const { deps, calls, restartCalls } = makeDeps({
+  it("carries the requested Claude model across the restart (relaunch carrier), never injects", async () => {
+    const { deps, calls, restartCalls, relaunchCalls } = makeDeps({
       getActiveSessionModel: () => "sr-gemini-2.5-pro",
     });
     const reply = await handleModelCommand({ kind: "set", model: "opus" }, deps);
     // Must NOT inject
     expect(calls).toHaveLength(0);
-    // Must schedule a restart
-    expect(restartCalls).toHaveLength(1);
-    expect(restartCalls[0]).toContain("opus");
-    expect(restartCalls[0]).toContain("sr-to-claude");
+    // sr→Claude now rides the SAME carrier mechanism as Claude→sr so the
+    // requested Claude model survives the restart (bug 2). The bespoke
+    // scheduleRestart-without-carrier path is gone.
+    expect(restartCalls).toHaveLength(0);
+    expect(relaunchCalls).toHaveLength(1);
+    expect(relaunchCalls[0].model).toBe("opus");
+    expect(relaunchCalls[0].reason).toContain("sr-to-claude");
     // Reply mentions the sr-* model and ~30s
     expect(reply.text).toContain("sr-gemini-2.5-pro");
     expect(reply.text).toContain("30s");
     expect(reply.html).toBe(true);
   });
 
-  it("schedules restart when session is on sr-* and target is a full claude-* id", async () => {
-    const { deps, calls, restartCalls } = makeDeps({
+  it("carries a full claude-* id across the restart when session is on sr-*", async () => {
+    const { deps, calls, restartCalls, relaunchCalls } = makeDeps({
       getActiveSessionModel: () => "sr-deepseek-r1",
     });
     const reply = await handleModelCommand({ kind: "set", model: "claude-opus-4-8" }, deps);
     expect(calls).toHaveLength(0);
-    expect(restartCalls).toHaveLength(1);
+    expect(restartCalls).toHaveLength(0);
+    expect(relaunchCalls).toHaveLength(1);
+    expect(relaunchCalls[0].model).toBe("claude-opus-4-8");
     expect(reply.text).toContain("sr-deepseek-r1");
     expect(reply.text).toContain("30s");
   });
 
   it("does NOT restart when switching between Claude models (no sr-* session)", async () => {
-    const { deps, calls, restartCalls } = makeDeps({
+    const { deps, calls, restartCalls, relaunchCalls } = makeDeps({
       getActiveSessionModel: () => "Opus 4.8",
     });
     const reply = await handleModelCommand({ kind: "set", model: "sonnet" }, deps);
-    // Normal inject path: still injects, no restart
+    // Normal inject path: still injects, no restart, no relaunch
     expect(calls).toHaveLength(1);
     expect(restartCalls).toHaveLength(0);
+    expect(relaunchCalls).toHaveLength(0);
     expect(reply.text).toContain("Set model to sonnet");
   });
 
-  it("surfaces scheduleRestart failures without propagating the error", async () => {
+  it("surfaces relaunch dispatch failures without propagating the error", async () => {
     const { deps, calls } = makeDeps({
       getActiveSessionModel: () => "sr-deepseek-r1",
-      scheduleRestart: async () => { throw new Error("hostd unreachable"); },
+      scheduleModelRelaunch: async () => { throw new Error("hostd unreachable"); },
     });
     const reply = await handleModelCommand({ kind: "set", model: "sonnet" }, deps);
     expect(calls).toHaveLength(0);
@@ -377,13 +393,68 @@ describe("handleModelCommand — sr-* → Claude graceful restart", () => {
     expect(reply.text).toContain("hostd unreachable");
   });
 
+  it("reports 'restart already in flight' honestly on a debounced dispatch (no silent no-op)", async () => {
+    const { deps } = makeDeps({
+      getActiveSessionModel: () => "sr-deepseek-r1",
+      scheduleModelRelaunch: async () => {
+        const e = new Error("a restart is already in flight — try again in ~15s");
+        (e as { code?: string }).code = "restart_in_flight";
+        throw e;
+      },
+    });
+    const reply = await handleModelCommand({ kind: "set", model: "opus" }, deps);
+    expect(reply.text).toContain("restart is already in flight");
+    expect(reply.text).toContain("15s");
+    // Never a false success.
+    expect(reply.text).not.toContain("Set model to");
+  });
+
   it("null session model (no prior override) still uses normal inject path for Claude target", async () => {
-    const { deps, calls, restartCalls } = makeDeps({
+    const { deps, calls, restartCalls, relaunchCalls } = makeDeps({
       getActiveSessionModel: () => null,
     });
     await handleModelCommand({ kind: "set", model: "opus" }, deps);
     expect(calls).toHaveLength(1);
     expect(restartCalls).toHaveLength(0);
+    expect(relaunchCalls).toHaveLength(0);
+  });
+});
+
+describe("handleModelCommand — busy gate + honest unverified reporting", () => {
+  it("refuses a typed switch while the agent is mid-turn (no inject, no relaunch)", async () => {
+    const { deps, calls, relaunchCalls } = makeDeps({ isBusy: () => true });
+    const reply = await handleModelCommand({ kind: "set", model: "opus" }, deps);
+    expect(calls).toHaveLength(0);
+    expect(relaunchCalls).toHaveLength(0);
+    expect(reply.text).toContain("mid-turn");
+    expect(reply.selectedModel).toBeUndefined();
+  });
+
+  it("refuses an sr-* switch too while mid-turn", async () => {
+    const { deps, relaunchCalls } = makeDeps({ isBusy: () => true });
+    const reply = await handleModelCommand({ kind: "set", model: "sr-glm-5" }, deps);
+    expect(relaunchCalls).toHaveLength(0);
+    expect(reply.text).toContain("mid-turn");
+  });
+
+  it("reports a claude error output as an HONEST failure, not a switch", async () => {
+    const { deps } = makeDeps({
+      inject: async () => okResult("Error: Model not found: bogus-model"),
+    });
+    const reply = await handleModelCommand({ kind: "set", model: "claude-bogus" }, deps);
+    expect(reply.text).toContain("did not take");
+    expect(reply.text).toContain("Model not found");
+    expect(reply.text).not.toContain("Session-only");
+    expect(reply.selectedModel).toBeUndefined();
+  });
+
+  it("does NOT record an override when the confirmation is 'Kept model as' (no change)", async () => {
+    const { deps } = makeDeps({
+      inject: async () => okResult("⏺ Kept model as Opus 4.8 (default)"),
+    });
+    const reply = await handleModelCommand({ kind: "set", model: "opus" }, deps);
+    // The kept line is still relayed as a confirmation, but nothing is recorded.
+    expect(reply.selectedModel).toBeUndefined();
   });
 });
 
@@ -423,14 +494,15 @@ describe("handleModelCommand — Claude → sr-* session relaunch", () => {
     expect(restartCalls).toHaveLength(0);
   });
 
-  it("sr-* → Claude still takes the scheduleRestart path (not scheduleModelRelaunch)", async () => {
+  it("sr-* → Claude rides scheduleModelRelaunch (carrier) so the Claude model survives the restart", async () => {
     const { deps, calls, restartCalls, relaunchCalls } = makeDeps({
       getActiveSessionModel: () => "sr-glm-5",
     });
     await handleModelCommand({ kind: "set", model: "opus" }, deps);
     expect(calls).toHaveLength(0);
-    expect(relaunchCalls).toHaveLength(0);
-    expect(restartCalls).toHaveLength(1);
+    expect(restartCalls).toHaveLength(0);
+    expect(relaunchCalls).toHaveLength(1);
+    expect(relaunchCalls[0].model).toBe("opus");
   });
 
   it("surfaces scheduleModelRelaunch failures without propagating the error", async () => {
@@ -498,14 +570,15 @@ describe("handleModelCommand — arbitrary sr-* passthrough (no whitelist)", () 
     }
   });
 
-  it("switching FROM an arbitrary sr-* back to Claude takes the restart path", async () => {
+  it("switching FROM an arbitrary sr-* back to Claude carries the Claude model via the relaunch carrier", async () => {
     const { deps, calls, restartCalls, relaunchCalls } = makeDeps({
       getActiveSessionModel: () => "sr-gpt-oss-120b",
     });
     await handleModelCommand({ kind: "set", model: "opus" }, deps);
     expect(calls).toHaveLength(0);
-    expect(relaunchCalls).toHaveLength(0);
-    expect(restartCalls).toHaveLength(1);
+    expect(restartCalls).toHaveLength(0);
+    expect(relaunchCalls).toHaveLength(1);
+    expect(relaunchCalls[0].model).toBe("opus");
   });
 });
 
@@ -565,14 +638,15 @@ describe("SR_MODEL_ALIASES / expandSrAlias", () => {
     expect(relaunchCalls[0].model).toBe("sr-gemini-2.5-flash");
   });
 
-  it("handleModelCommand with alias schedules restart when session is on sr-*", async () => {
-    const { deps, calls, restartCalls } = makeDeps({
+  it("handleModelCommand with a Claude alias relaunches (carrier) when session is on sr-*", async () => {
+    const { deps, calls, restartCalls, relaunchCalls } = makeDeps({
       getActiveSessionModel: () => "sr-deepseek-v3",
     });
     await handleModelCommand({ kind: "set", model: "opus" }, deps);
     expect(calls).toHaveLength(0);
-    expect(restartCalls).toHaveLength(1);
-    expect(restartCalls[0]).toContain("opus");
+    expect(restartCalls).toHaveLength(0);
+    expect(relaunchCalls).toHaveLength(1);
+    expect(relaunchCalls[0].model).toBe("opus");
   });
 });
 
@@ -745,6 +819,40 @@ describe("handleModelMenuCallback", () => {
     expect(out.reply.keyboard).toBeDefined();
     // The gateway records this so /status reflects the live session model.
     expect(out.selectedModel).toBe("Haiku 4.5");
+  });
+
+  it("tapping the Default row when already on it (Kept model as) records NO override", async () => {
+    // Bug 6: "Kept model as X" is a no-change; the old code fell back to
+    // target.label and stored "Default (recommended)" verbatim into /status.
+    const { deps } = makeMenuDeps({
+      select: async () => ({ ok: true as const, confirmation: "Kept model as Opus 4.8 (default)" }),
+    });
+    const out = await handleModelMenuCallback(modelSelectCallbackData("Default (recommended)"), deps);
+    expect(out.reply.text).toContain("✅");
+    // Crucially, NOTHING is recorded — no display label leaks into the override.
+    expect(out.selectedModel).toBeUndefined();
+    expect(out.reply.text).not.toContain("Default (recommended)");
+  });
+
+  it("a real switch on the Default row stores a canonical token, never the display label", async () => {
+    // The Default row confirms with a real model name; the /status value is that
+    // name (never "Default (recommended)"), and the carrier token is canonical.
+    const { deps } = makeMenuDeps({
+      select: async () => ({ ok: true as const, confirmation: "Set model to Opus 4.8 for this session only" }),
+    });
+    const out = await handleModelMenuCallback(modelSelectCallbackData("Default (recommended)"), deps);
+    expect(out.selectedModel).toBe("Opus 4.8");
+    // "Default (recommended)" yields no --model token → carrier boots the config default.
+    expect(out.selectedModelToken).toBeUndefined();
+  });
+
+  it("selecting an alias row exposes a canonical --model token for the sr→claude carrier", async () => {
+    const { deps } = makeMenuDeps({
+      select: async () => ({ ok: true as const, confirmation: "Set model to Sonnet for this session" }),
+    });
+    const out = await handleModelMenuCallback(modelSelectCallbackData("Sonnet"), deps);
+    expect(out.selectedModel).toBe("Sonnet");
+    expect(out.selectedModelToken).toBe("sonnet");
   });
 });
 
@@ -945,29 +1053,35 @@ describe("handleModelMenuCallback — sr-* selection", () => {
     });
   }
 
-  it("sr-* tap uses inject path, not cursor nav", async () => {
-    const { deps, calls, injectCalls } = makeMenuDepsWithSr();
+  it("sr-* tap delegates to the carrier relaunch — never a picker-rejecting inject", async () => {
+    // The gateway intercepts mdl:sr: before this function; if a direct caller
+    // reaches it, delegating to scheduleModelRelaunch is the ONLY safe path (an
+    // inject of `/model sr-*` 4xxs — picker rejects the id, base-URL never repointed).
+    const relaunch: Array<{ model: string }> = [];
+    const { deps, calls, injectCalls } = makeMenuDepsWithSr({
+      scheduleModelRelaunch: async (model) => { relaunch.push({ model }); },
+    });
     const out = await handleModelMenuCallback(`${MODEL_CALLBACK_SR}sr-gemini-2.5-pro`, deps);
-    // inject was called with the raw /model command
-    expect(injectCalls).toContainEqual({ agent: "klanker", command: "/model sr-gemini-2.5-pro" });
-    // select (cursor nav) was NOT called
+    // No inject, no cursor nav — a carrier relaunch on the exact sr-* id.
+    expect(injectCalls).toHaveLength(0);
     expect(calls.select).toHaveLength(0);
-    expect(out.answer).toContain("Set model to sonnet");
+    expect(relaunch).toEqual([{ model: "sr-gemini-2.5-pro" }]);
     expect(out.selectedModel).toBe("sr-gemini-2.5-pro");
-    // No keyboard on success: static reply path skips discover() to avoid the
-    // spurious "(picker unavailable)" line that discover() reliably produces
-    // immediately after an inject. Operator taps /model for a fresh menu.
     expect(out.reply.keyboard).toBeUndefined();
-    // Banner present and text doesn't contain picker-unavailable noise
-    expect(out.reply.text).toContain('✅');
+    expect(out.reply.text).toContain('🔄');
     expect(out.reply.text).not.toContain('picker unavailable');
   });
 
-  it("sr-* tap while busy returns toast-only with no inject", async () => {
-    const { deps, injectCalls } = makeMenuDepsWithSr({ isBusy: () => true });
+  it("sr-* tap while busy returns toast-only with no relaunch", async () => {
+    const relaunch: string[] = [];
+    const { deps, injectCalls } = makeMenuDepsWithSr({
+      isBusy: () => true,
+      scheduleModelRelaunch: async (model) => { relaunch.push(model); },
+    });
     const out = await handleModelMenuCallback(`${MODEL_CALLBACK_SR}sr-gemini-2.5-pro`, deps);
     expect(out.toastOnly).toBe(true);
     expect(injectCalls).toHaveLength(0);
+    expect(relaunch).toHaveLength(0);
   });
 
   it("rejects malformed sr-* callback data", async () => {

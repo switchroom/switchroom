@@ -146,6 +146,23 @@ export async function handleInjectCommand(ctx: Context, deps: InjectDeps): Promi
     return
   }
   const slashCommand = arg.startsWith('/') ? arg : `/${arg}`
+
+  // `/inject /model <name>` would type `/model <name>` straight into the pane,
+  // bypassing the entire /model driver — no busy gate, no sr-* carrier/base-URL
+  // repoint, no session-override recording. That path silently fails for sr-*
+  // ids and leaves /status stale for Claude ones. Route the operator to the real
+  // command. Bare `/inject /model` (no arg) still opens claude's read-only picker.
+  const injectTokens = slashCommand.split(/\s+/)
+  if (injectTokens[0]?.toLowerCase() === '/model' && injectTokens.length > 1) {
+    const modelArg = injectTokens.slice(1).join(' ')
+    await deps.reply(
+      ctx,
+      `\`/model\` has its own driver — use \`/model ${deps.escapeHtml(modelArg)}\` directly (not via \`/inject\`) so the switch is gated, recorded, and \`/status\` stays honest.`,
+      { html: true },
+    )
+    return
+  }
+
   const agentName = deps.getAgentName()
 
   let result: InjectResult
