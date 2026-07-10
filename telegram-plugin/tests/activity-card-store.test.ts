@@ -30,6 +30,7 @@
  */
 import { describe, it, expect } from 'vitest'
 import {
+  BOOT_UNPIN_MAX_ATTEMPTS,
   loadActivityCards,
   persistActivityCards,
   writeActivityCardRecord,
@@ -314,9 +315,10 @@ describe('runActivityCardBootReaper — transport-boundary outcome tests', () =>
     expect(loadActivityCards(PATH, fs)).toEqual([])
   })
 
-  it('a failing unpin (already unpinned / no rights) is non-fatal and does not re-run the edit', async () => {
+  it('retry-safe (#3001): a failing unpin is non-fatal, does not re-run the edit, and RETAINS the record for a next-boot unpin retry', async () => {
     const { fs } = memFs()
-    writeActivityCardRecord(PATH, fs, card())
+    const rec = card()
+    writeActivityCardRecord(PATH, fs, rec)
     let editCalls = 0
     const res = await runActivityCardBootReaper({
       path: PATH,
@@ -328,9 +330,52 @@ describe('runActivityCardBootReaper — transport-boundary outcome tests', () =>
       unpinCard: async () => {
         throw new Error('message to unpin not found')
       },
+      log: () => {},
     })
     expect(res).toEqual({ finalized: 1, vanished: 0, unpinned: 0, total: 1 })
     expect(editCalls).toBe(1)
+    // The record is retained (not forfeited) so the next boot retries the
+    // idempotent unpin — flagged so it can never re-run the finalize edit.
+    expect(loadActivityCards(PATH, fs)).toEqual([
+      { ...rec, finalizeAttempted: true, unpinAttempts: 1 },
+    ])
+
+    // Second boot: the retained record retries ONLY the unpin (edit stays
+    // at-most-once); on success the record is finally dropped.
+    let secondBootEdits = 0
+    const res2 = await runActivityCardBootReaper({
+      path: PATH,
+      fs,
+      finalizeCard: async () => {
+        secondBootEdits++
+        return { ok: true }
+      },
+      unpinCard: async () => ({ ok: true }),
+      log: () => {},
+    })
+    expect(secondBootEdits).toBe(0)
+    expect(res2).toEqual({ finalized: 0, vanished: 0, unpinned: 1, total: 1 })
+    expect(loadActivityCards(PATH, fs)).toEqual([])
+  })
+
+  it('retry-safe (#3001): the unpin retry is forfeited at BOOT_UNPIN_MAX_ATTEMPTS', async () => {
+    const { fs } = memFs()
+    writeActivityCardRecord(
+      PATH,
+      fs,
+      card({ finalizeAttempted: true, unpinAttempts: BOOT_UNPIN_MAX_ATTEMPTS - 1 }),
+    )
+    const res = await runActivityCardBootReaper({
+      path: PATH,
+      fs,
+      finalizeCard: async () => ({ ok: true }),
+      unpinCard: async () => {
+        throw new Error('still no rights')
+      },
+      log: () => {},
+    })
+    // Final attempt failed — record forfeited so it cannot re-fail every boot.
+    expect(res).toEqual({ finalized: 0, vanished: 0, unpinned: 0, total: 1 })
     expect(loadActivityCards(PATH, fs)).toEqual([])
   })
 

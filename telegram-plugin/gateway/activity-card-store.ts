@@ -43,6 +43,11 @@
  * failure than one frozen orphan. A benign-400 (message already
  * deleted/vanished, or "not modified") is NOT counted as a finalize — nothing
  * was delivered — see the `vanished` tally in `runActivityCardBootReaper`.
+ *
+ * The UNPIN half is different (#3001): unpinning is idempotent, so it gets
+ * AT-LEAST-ONCE (capped) semantics — a failed unpin re-persists the record
+ * with `finalizeAttempted: true` + an `unpinAttempts` counter so the next boot
+ * retries ONLY the unpin (never the edit), up to BOOT_UNPIN_MAX_ATTEMPTS.
  */
 
 export interface ActivityCardStoreFsSeam {
@@ -73,7 +78,20 @@ export interface ActivityCardRecord {
    *  forever). Optional so a v1-shape record (pre-unpin-tracking) still
    *  loads and degrades to "don't attempt an unpin", never a crash. */
   pinned?: boolean
+  /** Set when the boot reaper retains a record ONLY to retry its failed
+   *  unpin (#3001). The finalizing edit stays AT-MOST-ONCE: a retained
+   *  record's edit was already attempted, so the next boot skips the edit
+   *  and only retries the (idempotent) unpin. */
+  finalizeAttempted?: boolean
+  /** Boot-reaper unpin retry counter (#3001); the record is forfeited at
+   *  BOOT_UNPIN_MAX_ATTEMPTS. Absent = 0. */
+  unpinAttempts?: number
 }
+
+/** Cap on cross-boot unpin retries — same rationale as the status-pin
+ *  store's BOOT_UNPIN_MAX_ATTEMPTS (bound a permanently-undeliverable
+ *  unpin; unpins themselves are idempotent so retrying is safe). */
+export const BOOT_UNPIN_MAX_ATTEMPTS = 5
 
 interface SnapshotEnvelope {
   v: 1
@@ -91,7 +109,9 @@ function isCardRow(x: unknown): x is ActivityCardRecord {
     (o.threadId === null || typeof o.threadId === 'number') &&
     typeof o.activityMessageId === 'number' &&
     typeof o.startedAt === 'number' &&
-    (o.pinned === undefined || typeof o.pinned === 'boolean')
+    (o.pinned === undefined || typeof o.pinned === 'boolean') &&
+    (o.finalizeAttempted === undefined || typeof o.finalizeAttempted === 'boolean') &&
+    (o.unpinAttempts === undefined || typeof o.unpinAttempts === 'number')
   )
 }
 
@@ -245,32 +265,57 @@ export async function runActivityCardBootReaper(args: {
     // turn that upserted a fresh card under the same turnKey mid-reap keeps
     // its own (different-id) record.
     clearActivityCardRecord(args.path, args.fs, record.turnKey, record.activityMessageId, log)
-    try {
-      // Count a finalize ONLY when the edit actually landed. robustApiCall
-      // resolves to undefined on a benign-400 (the card was already deleted or
-      // the chat is gone) — that delivered nothing, so it is a `vanished`
-      // orphan, not a `finalized` one. Counting it as finalized (the pre-fix
-      // behaviour) over-reported the guarantee in the boot log.
-      const res = await args.finalizeCard(record)
-      if (res != null) finalized++
-      else vanished++
-    } catch (err) {
-      log(
-        `activity-card-store: boot reaper finalize failed ` +
-          `(chat=${record.chatId} msg=${record.activityMessageId}): ` +
-          `${(err as Error).message}\n`,
-      )
+    // The finalizing EDIT stays at-most-once: skip it for a record retained by
+    // a prior boot purely to retry its failed unpin (finalizeAttempted).
+    if (!record.finalizeAttempted) {
+      try {
+        // Count a finalize ONLY when the edit actually landed. robustApiCall
+        // resolves to undefined on a benign-400 (the card was already deleted or
+        // the chat is gone) — that delivered nothing, so it is a `vanished`
+        // orphan, not a `finalized` one. Counting it as finalized (the pre-fix
+        // behaviour) over-reported the guarantee in the boot log.
+        const res = await args.finalizeCard(record)
+        if (res != null) finalized++
+        else vanished++
+      } catch (err) {
+        log(
+          `activity-card-store: boot reaper finalize failed ` +
+            `(chat=${record.chatId} msg=${record.activityMessageId}): ` +
+            `${(err as Error).message}\n`,
+        )
+      }
     }
     if (record.pinned) {
       try {
         await args.unpinCard(record)
         unpinned++
       } catch (err) {
+        // Retry-safe unpin (#3001): unlike the edit (at-most-once by design),
+        // an unpin is idempotent — so a failed one is RE-PERSISTED with an
+        // attempt counter and retried on the next boot, up to the cap, instead
+        // of being forfeited. `finalizeAttempted` guarantees the retained
+        // record can never re-run its edit.
+        const attempts = (record.unpinAttempts ?? 0) + 1
         log(
           `activity-card-store: boot reaper unpin failed ` +
-            `(chat=${record.chatId} msg=${record.activityMessageId}): ` +
-            `${(err as Error).message}\n`,
+            `(chat=${record.chatId} msg=${record.activityMessageId} ` +
+            `attempt=${attempts}): ${(err as Error).message}\n`,
         )
+        if (attempts < BOOT_UNPIN_MAX_ATTEMPTS) {
+          writeActivityCardRecord(
+            args.path,
+            args.fs,
+            { ...record, finalizeAttempted: true, unpinAttempts: attempts },
+            log,
+          )
+        } else {
+          log(
+            `activity-card-store: boot reaper FORFEITING card unpin after ` +
+              `${attempts} failed attempts ` +
+              `(chat=${record.chatId} msg=${record.activityMessageId}) — ` +
+              `will not retry again\n`,
+          )
+        }
       }
     }
   }

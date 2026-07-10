@@ -462,6 +462,10 @@ import {
   restartOrphanCardFinalizeText,
   type ActivityCardStoreFsSeam,
 } from './activity-card-store.js'
+import {
+  decideWorkerPinReaps,
+  WORKER_PIN_TTL_MS_DEFAULT,
+} from './worker-pin-reaper.js'
 import { driveEscalation } from './escalation-drive.js'
 import { shouldSuppressRepresent } from './represent-guard.js'
 import { shouldDeferEscalationForBridge } from './escalation-bridge-gate.js'
@@ -6988,6 +6992,10 @@ const statusPinState = new Map<string, PinState>()
 // owned pins without threading the chat id through every call site. Written on
 // every desired-pinned reconcile, cleared alongside the state on unpin.
 const statusPinChatIds = new Map<string, string>()
+// Companion registry: pinKey → wall-clock ms the claim was FIRST taken (a
+// re-pin of the same key keeps the original timestamp). Feeds the TTL gate of
+// the mid-session `wk:` pin reaper (#3001); cleared alongside the state.
+const statusPinPinnedAt = new Map<string, number>()
 
 // Durable snapshot of the pin claim set on the persistent per-agent volume
 // (STATE_DIR = /state/agent/telegram in prod). Closes the crash hole: the
@@ -7039,6 +7047,22 @@ const BANNER_PIN_KEY = 'banner:owner'
 // run → no-op). The boot-cleanup gate below is widened to cover this.
 const bannerPinPersistEnabled = !STATIC
 
+// `pin_message` MCP-tool pin registration (#3001). Tool pins ride the same
+// shared status-pins.json store under `tool:<chatId>:<messageId>` keys, but
+// with a TTL row (`expiresAt`): a tool pin is a deliberate agent action with
+// no "work finished" event, so a restart does NOT reset it — boot cleanup
+// keeps unexpired tool rows and only unpins them once the TTL lapses (the
+// backstop against agent-pinned messages accumulating forever). Independent
+// of PIN_STATUS_WHILE_WORKING (it gates the auto status pin, not the tool).
+const toolPinPersistEnabled = !STATIC
+// 7 days: generous — an agent-pinned message the operator still cares about
+// after a week has usually been re-pinned or acted on; anything older is the
+// stale-pin long tail this issue exists to clear. Override for tuning.
+const TOOL_PIN_TTL_MS = (() => {
+  const v = Number(process.env.SWITCHROOM_TOOL_PIN_TTL_MS)
+  return Number.isFinite(v) && v > 0 ? v : 7 * 24 * 60 * 60_000
+})()
+
 // Persist (or drop) the slot-banner's pin row into the shared store. Routes
 // through mutateStatusPinRow: a read-modify-write for ONLY the banner:owner key,
 // serialised on the store's per-path lock, so the live fg:/wk: status-pin rows
@@ -7089,9 +7113,9 @@ async function statusPinBootCleanup(): Promise<void> {
   // map-backed status pins (statusPinPersistEnabled) or the slot banner
   // (bannerPinPersistEnabled). A single cleanup drains ALL orphaned rows —
   // status pins AND banner alike — since they share status-pins.json.
-  if (!statusPinPersistEnabled && !bannerPinPersistEnabled) return
+  if (!statusPinPersistEnabled && !bannerPinPersistEnabled && !toolPinPersistEnabled) return
   const api = statusPinApi()
-  const { cleared, total } = await runStatusPinBootCleanup({
+  const { cleared, retained, kept, total } = await runStatusPinBootCleanup({
     path: STATUS_PIN_STORE_PATH,
     fs: statusPinStoreFs,
     unpin: (chatId, messageId) => api.unpinChatMessage(chatId, messageId),
@@ -7099,7 +7123,8 @@ async function statusPinBootCleanup(): Promise<void> {
   if (total > 0) {
     process.stderr.write(
       `telegram gateway: status-pin: cleared ${cleared}/${total} ` +
-        `orphaned pin(s) from a prior session\n`,
+        `orphaned pin(s) from a prior session ` +
+        `(retained ${retained} for retry, kept ${kept} unexpired tool pin(s))\n`,
     )
   }
 }
@@ -7200,6 +7225,25 @@ const MID_SESSION_CARD_REAPER_INTERVAL_MS = (() => {
   return Number.isFinite(v) && v > 0 ? v : 5 * 60_000 // 5 min
 })()
 
+// ─── Mid-session stale worker-pin reaper (#3001) ─────────────────────────────
+// The `wk:<agentId>` pin is normally dropped by the worker's completion
+// handler, but a missed onFinish (watcher crash / SDK SIGKILL / dropped JSONL
+// tail) used to leave the pin glued to the chat until the NEXT gateway boot.
+// This sweep (piggybacking on the mid-session reaper interval) unpins a
+// claimed worker pin when the registry says its worker is TERMINAL, or when
+// the pin has been held past a TTL. Pure decision in worker-pin-reaper.ts;
+// each reap executes through reconcileStatusPin so the in-memory claim and
+// the durable store row clear together.
+//
+// Kill switch: SWITCHROOM_WORKER_PIN_REAPER=0 disables (clean revert, mirrors
+// SWITCHROOM_MID_SESSION_CARD_REAPER). TTL overridable via env for tuning.
+const WORKER_PIN_REAPER_ENABLED =
+  process.env.SWITCHROOM_WORKER_PIN_REAPER !== '0'
+const WORKER_PIN_REAPER_TTL_MS = (() => {
+  const v = Number(process.env.SWITCHROOM_WORKER_PIN_REAPER_TTL_MS)
+  return Number.isFinite(v) && v > 0 ? v : WORKER_PIN_TTL_MS_DEFAULT // 6 h
+})()
+
 // Snapshot the turn_keys / topic keys owned by a live in-flight turn right now.
 function liveTurnKeySets(): { registryKeys: Set<string>; topicKeys: Set<string> } {
   const registryKeys = new Set<string>()
@@ -7264,15 +7308,27 @@ async function runMidSessionCardReaper(): Promise<void> {
               verb: 'activity-card.mid-session-reap-finalize',
             },
           ),
-        unpinCard: (record) =>
-          robustApiCall(
+        // #3001: route through reconcileStatusPin when the pin is a live
+        // in-memory claim, so the claim AND the durable status-pins.json row
+        // clear together (the raw-API unpin left both behind — the boot sweep
+        // then re-unpinned an already-unpinned message and the service-message
+        // handler kept a phantom claim). Falls back to the raw unpin when no
+        // claim is tracked (e.g. claim already dropped out-of-band).
+        unpinCard: async (record) => {
+          const pinKey = `fg:${record.turnKey}`
+          if (statusPinState.has(pinKey)) {
+            await reconcileStatusPin(pinKey, record.chatId, { pinned: false })
+            return true
+          }
+          return robustApiCall(
             () => lockedBot.api.unpinChatMessage(record.chatId, record.activityMessageId),
             {
               chat_id: record.chatId,
               ...(record.threadId != null ? { threadId: record.threadId } : {}),
               verb: 'activity-card.mid-session-reap-unpin',
             },
-          ),
+          )
+        },
       })
       if (total > 0) {
         process.stderr.write(
@@ -7283,6 +7339,55 @@ async function runMidSessionCardReaper(): Promise<void> {
     } catch (err) {
       process.stderr.write(
         `telegram gateway: mid-session card reaper error: ${(err as Error).message}\n`,
+      )
+    }
+  }
+
+  // 3) Reap stale `wk:` worker pins (#3001): a claimed worker pin whose worker
+  //    is terminal in the registry (missed onFinish) or whose claim outlived
+  //    the TTL. Executes through reconcileStatusPin so the in-memory claim and
+  //    the durable store row clear together.
+  if (WORKER_PIN_REAPER_ENABLED && PIN_STATUS_WHILE_WORKING) {
+    try {
+      const candidates = [...statusPinState.keys()]
+        .filter((k) => k.startsWith('wk:'))
+        .map((k) => ({
+          pinKey: k,
+          chatId: statusPinChatIds.get(k) ?? '',
+          // A missing timestamp (should not happen — set on every claim)
+          // degrades to "claimed just now": terminality can still reap it,
+          // the TTL gate never can. Conservative, never a spurious unpin.
+          pinnedAt: statusPinPinnedAt.get(k) ?? now,
+        }))
+      const reaps = decideWorkerPinReaps({
+        pins: candidates,
+        statusOf: (agentId) => {
+          if (turnsDb == null) return 'unknown'
+          try {
+            const row = getSubagentByJsonlId(turnsDb, agentId)
+            if (row == null) return 'unknown'
+            if (row.status === 'completed' || row.status === 'failed') return 'terminal'
+            // A live 'running' row exempts the pin from the TTL (no churn on
+            // healthy long workers); 'stalled' degrades to 'unknown' → TTL.
+            if (row.status === 'running') return 'running'
+            return 'unknown'
+          } catch {
+            return 'unknown' // DB hiccup degrades to "keep until TTL"
+          }
+        },
+        ttlMs: WORKER_PIN_REAPER_TTL_MS,
+        now,
+      })
+      for (const reap of reaps) {
+        process.stderr.write(
+          `telegram gateway: worker-pin reaper unpinning ${reap.pinKey} ` +
+            `(chat=${reap.chatId} reason=${reap.reason})\n`,
+        )
+        await reconcileStatusPin(reap.pinKey, reap.chatId, { pinned: false })
+      }
+    } catch (err) {
+      process.stderr.write(
+        `telegram gateway: worker-pin reaper error: ${(err as Error).message}\n`,
       )
     }
   }
@@ -7373,9 +7478,11 @@ async function reconcileStatusPinInner(
     if (next == null) {
       statusPinState.delete(pinKey)
       statusPinChatIds.delete(pinKey)
+      statusPinPinnedAt.delete(pinKey)
     } else {
       statusPinState.set(pinKey, next)
       statusPinChatIds.set(pinKey, chatId)
+      if (!statusPinPinnedAt.has(pinKey)) statusPinPinnedAt.set(pinKey, Date.now())
     }
     return
   }
@@ -7395,9 +7502,11 @@ async function reconcileStatusPinInner(
   if (next == null) {
     statusPinState.delete(pinKey)
     statusPinChatIds.delete(pinKey)
+    statusPinPinnedAt.delete(pinKey)
   } else {
     statusPinState.set(pinKey, next)
     statusPinChatIds.set(pinKey, chatId)
+    if (!statusPinPinnedAt.has(pinKey)) statusPinPinnedAt.set(pinKey, Date.now())
   }
 }
 
@@ -7440,7 +7549,7 @@ async function unpinAllStatusPins(): Promise<void> {
     if (st == null) continue
     // Recover the chat id from the state map's companion key registry.
     const chatId = statusPinChatIds.get(key)
-    if (chatId == null) { statusPinState.delete(key); continue }
+    if (chatId == null) { statusPinState.delete(key); statusPinPinnedAt.delete(key); continue }
     await reconcileStatusPin(key, chatId, { pinned: false })
   }
 }
@@ -13456,10 +13565,26 @@ async function executePinMessage(args: Record<string, unknown>): Promise<unknown
   // errors are retried. THREAD_NOT_FOUND on a stale topic surfaces to the
   // agent as a tool-error — pinning a vanished message is genuinely a
   // failure the agent should see.
+  const pinMsgId = Number(args.message_id)
   await robustApiCall(
-    () => lockedBot.api.pinChatMessage(pinChatId, Number(args.message_id)),
+    () => lockedBot.api.pinChatMessage(pinChatId, pinMsgId),
     { chat_id: pinChatId, verb: 'pin_message' },
   )
+  // #3001: register the tool pin in the shared status-pin store under a
+  // `tool:` key so it is no longer fire-and-forget. Unlike work-scoped
+  // fg:/wk: rows a tool pin has no "work finished" event, so a restart does
+  // NOT reset it — boot cleanup keeps the row until its TTL, then unpins the
+  // (likely long-forgotten) message. Best-effort fire-and-forget: a store
+  // failure must never fail the tool call the pin already landed for.
+  if (toolPinPersistEnabled) {
+    const toolPinKey = `tool:${pinChatId}:${pinMsgId}`
+    void mutateStatusPinRow(STATUS_PIN_STORE_PATH, statusPinStoreFs, toolPinKey, {
+      pinKey: toolPinKey,
+      chatId: pinChatId,
+      messageId: pinMsgId,
+      expiresAt: Date.now() + TOOL_PIN_TTL_MS,
+    })
+  }
   return { content: [{ type: 'text', text: `pinned message ${args.message_id}` }] }
 }
 
