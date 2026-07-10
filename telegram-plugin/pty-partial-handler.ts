@@ -32,6 +32,7 @@ export type PtyPartialAction =
   | 'dedup-skip' // same text as the previous partial; no-op
   | 'update-existing' // pushed into an already-live stream
   | 'update-new' // created a new stream and pushed into it
+  | 'error-suppressed' // raw API-error TUI line; dropped (issue #2922 Bug 3)
 
 export interface PtyHandlerState {
   /**
@@ -84,6 +85,32 @@ export interface PtyHandlerDeps {
   writeError?: (line: string) => void
 }
 
+/**
+ * Detect a raw API-error line scraped from Claude Code's TUI — issue #2922
+ * Bug 3. When the model 429s / errors, the CLI renders an `API Error: … ·
+ * b'{"type":"error",…}'` line into the terminal; the PTY tail would otherwise
+ * scrape it as the assistant reply and relay the raw bytes verbatim to chat.
+ * These lines are suppressed here so the model-unavailable operator-event
+ * pipeline owns the user-facing rendering (a clean ⚠️ card), not the raw tail.
+ *
+ * Kept deliberately tight (anchored error markers, not any mention of "error")
+ * so genuine assistant text that happens to discuss errors is NOT swallowed.
+ */
+export function looksLikeRawApiError(text: string): boolean {
+  if (typeof text !== 'string' || text.length === 0) return false
+  const lower = text.toLowerCase()
+  return (
+    lower.includes('api error:')
+    || lower.includes('"type":"error"')
+    || lower.includes("'type': 'error'")
+    || lower.includes('rate_limit_error')
+    || lower.includes('overloaded_error')
+    || lower.includes('"is_error":true')
+    // The CLI's Python-style raw-body render: · b'{...}'
+    || / b'\{/.test(text)
+  )
+}
+
 function streamKey(chatId: string, threadId?: number): string {
   // Canonical chat-key derivation lives in gateway/chat-key.ts — keep this
   // expression in lockstep (treats 0/null/undefined the same). See #1564.
@@ -96,6 +123,13 @@ function streamKey(chatId: string, threadId?: number): string {
  *
  * Returns the action taken. All state mutation happens through the
  * supplied `state` object so callers can inspect before/after.
+ *
+ * NOTE on `looksLikeRawApiError` suppression (#2922 Bug 3): this is
+ * *preview-only* scope. PTY partials are the live-streaming terminal tail,
+ * never the authoritative reply (that flows through the operator-event /
+ * reply pipelines). So the worst case of an over-eager match here is a
+ * missing streaming flicker for one snapshot — NOT a dropped user answer.
+ * That asymmetry is why the matcher can stay aggressive on raw error shapes.
  */
 export function handlePtyPartialPure(
   text: string,
@@ -131,6 +165,11 @@ export function handlePtyPartialPure(
   })
 
   if (suppressed) return 'suppressed'
+
+  // Drop raw API-error TUI lines so they never leak to chat as the reply —
+  // the model-unavailable card (operator-event pipeline) renders these
+  // instead. See issue #2922 Bug 3.
+  if (looksLikeRawApiError(text)) return 'error-suppressed'
 
   if (state.lastPtyPreviewByChat.get(sKey) === text) return 'dedup-skip'
 

@@ -9,6 +9,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import {
   createPtyPartialHandler,
   handlePtyPartialPure,
+  looksLikeRawApiError,
   type PtyHandlerState,
   type PtyHandlerDeps,
 } from '../pty-partial-handler.js'
@@ -63,6 +64,35 @@ describe('handlePtyPartialPure', () => {
     expect(state.activeDraftStreams.size).toBe(0)
     expect(state.lastPtyPreviewByChat.size).toBe(0)
     expect(bot.api.sendMessage).not.toHaveBeenCalled()
+  })
+
+  it('suppresses a raw API-error TUI line so it never leaks to chat (#2922 Bug 3)', async () => {
+    const state = makeState({ currentSessionChatId: '1' })
+    const deps = makeDeps(bot)
+    // The exact shape Claude Code's TUI renders on a transient 429.
+    const raw =
+      "API Error: Server is temporarily limiting requests (not your usage limit) · " +
+      "b'{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\"}}'"
+    const action = handlePtyPartialPure(raw, state, deps)
+    expect(action).toBe('error-suppressed')
+    await microtaskFlush()
+    // Nothing sent — the operator-event pipeline owns the user-facing card.
+    expect(bot.api.sendMessage).not.toHaveBeenCalled()
+    expect(state.activeDraftStreams.size).toBe(0)
+    // Not recorded as a preview, so it can't poison later dedup either.
+    expect(state.lastPtyPreviewByChat.size).toBe(0)
+  })
+
+  it('does NOT suppress ordinary assistant text that merely mentions errors', async () => {
+    const state = makeState({ currentSessionChatId: '1' })
+    const action = handlePtyPartialPure(
+      "Here's how to handle an error in your retry loop:",
+      state,
+      makeDeps(bot),
+    )
+    expect(action).toBe('update-new')
+    await microtaskFlush()
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
   })
 
   it('dedups when same text arrives twice in a row', async () => {
@@ -322,5 +352,31 @@ describe('createPtyPartialHandler — session + buffer replay', () => {
 
     expect(bot.api.sendMessage).toHaveBeenCalledTimes(1) // no duplicate
     expect(state.activeDraftStreams.size).toBe(0)
+  })
+})
+
+describe('looksLikeRawApiError (#2922 Bug 3)', () => {
+  it('flags the CLI "API Error: … · b\'{…}\'" line', () => {
+    expect(
+      looksLikeRawApiError(
+        "API Error: Server is temporarily limiting requests · b'{\"type\":\"error\"}'",
+      ),
+    ).toBe(true)
+  })
+
+  it('flags a bare rate_limit_error JSON body', () => {
+    expect(
+      looksLikeRawApiError('{"type":"error","error":{"type":"rate_limit_error"}}'),
+    ).toBe(true)
+  })
+
+  it('flags overloaded_error and is_error markers', () => {
+    expect(looksLikeRawApiError('{"type":"overloaded_error"}')).toBe(true)
+    expect(looksLikeRawApiError('{"is_error":true,"content":"boom"}')).toBe(true)
+  })
+
+  it('does not flag ordinary prose mentioning "error"', () => {
+    expect(looksLikeRawApiError('I hit an error handling that request')).toBe(false)
+    expect(looksLikeRawApiError('')).toBe(false)
   })
 })

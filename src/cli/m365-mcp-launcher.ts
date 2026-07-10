@@ -61,6 +61,41 @@ export const DEFAULT_REFRESH_LEAD_MS = 5 * 60 * 1000;
  */
 export const MAX_REFRESH_INTERVAL_MS = 60 * 60 * 1000; // 1h
 
+/**
+ * Crash-loop backoff (issue #2586). When softeria exits unexpectedly the
+ * launcher used to propagate the exit and die, which made Claude Code respawn
+ * the whole MCP server — and each respawn issued a fresh `get-credentials`
+ * broker call. A crash-looping softeria therefore produced a tight
+ * `get-credentials` retry-storm (14.7k fetches/7d, ~96% of all cred fetches).
+ *
+ * Instead, while the cached access token is still valid the launcher now
+ * re-spawns softeria in-process with the SAME token — no broker call — using
+ * exponential backoff between attempts. Only when the token has expired (a
+ * genuine refresh is due) or the restart budget is exhausted does the launcher
+ * exit and defer to Claude Code / the operator.
+ */
+export const SOFTERIA_RESTART_BASE_MS = 1000; // first backoff
+export const SOFTERIA_RESTART_MAX_MS = 30 * 1000; // backoff ceiling
+/**
+ * If softeria stays up at least this long, the crash-loop counter resets — a
+ * one-off death after a healthy run shouldn't inherit prior backoff.
+ */
+export const SOFTERIA_STABLE_MS = 60 * 1000;
+/**
+ * Max consecutive rapid restarts before the launcher gives up and exits (so a
+ * genuinely broken softeria doesn't spin forever with no operator signal).
+ */
+export const SOFTERIA_MAX_RESTARTS = 6;
+
+/**
+ * Exponential backoff for the Nth consecutive crash-loop restart (0-indexed),
+ * capped at `SOFTERIA_RESTART_MAX_MS`. Exported for tests.
+ */
+export function computeRestartBackoffMs(attempt: number): number {
+  const raw = SOFTERIA_RESTART_BASE_MS * 2 ** Math.max(0, attempt);
+  return Math.min(raw, SOFTERIA_RESTART_MAX_MS);
+}
+
 export interface LauncherOptions {
   /** Whether to pass `--org-mode` to softeria (Teams/SharePoint). */
   orgMode?: boolean;
@@ -259,13 +294,25 @@ export async function runMs365McpLauncher(
   let currentChild: ChildProcess | null = null;
   let teardownStdio: (() => void) | null = null;
   let refreshTimer: NodeJS.Timeout | null = null;
+  let restartTimer: NodeJS.Timeout | null = null;
   let restartingForRefresh = false;
+  let shuttingDown = false;
   let resolveLauncher: ((code: number) => void) | null = null;
+  // Cached access token + expiry, updated on every successful fetch. Lets the
+  // crash-loop backoff re-spawn softeria WITHOUT a fresh broker call (#2586).
+  let currentCreds: { accessToken: string; expiresAt: number } | null = null;
+  let restartAttempts = 0;
+  let lastSpawnMs = 0;
 
   const exitLauncher = (code: number): void => {
+    shuttingDown = true;
     if (refreshTimer) {
       clearTimer(refreshTimer);
       refreshTimer = null;
+    }
+    if (restartTimer) {
+      clearTimer(restartTimer);
+      restartTimer = null;
     }
     if (resolveLauncher) {
       const r = resolveLauncher;
@@ -277,6 +324,7 @@ export async function runMs365McpLauncher(
   const launchChild = (accessToken: string): ChildProcess => {
     const env = buildSofteriaEnv(accessToken);
     const child = rt.spawnSofteria(env);
+    lastSpawnMs = now();
     teardownStdio = wireStdio(child);
     child.once("exit", (code, signal) => {
       if (teardownStdio) {
@@ -287,8 +335,63 @@ export async function runMs365McpLauncher(
         // Expected — refresh tick killed the child to swap creds.
         return;
       }
-      // Unexpected child exit — propagate up to claude.
       const resolved = code ?? (signal ? 128 : 0);
+
+      // Crash-loop backoff (#2586). A *crash* (non-zero exit / signal) while the
+      // cached token is still valid means softeria fell over for reasons
+      // unrelated to auth — re-spawn it in-process with the SAME token rather
+      // than exiting, so Claude Code doesn't respawn the launcher and issue a
+      // fresh get-credentials broker call on every crash. A clean exit (code 0)
+      // is an intentional shutdown and is propagated as before.
+      // If we're already tearing down (SIGTERM/SIGINT or exitLauncher), never
+      // start a fresh softeria — the launcher is on its way out. Relying on
+      // event-loop ordering for this was fragile; the flag is authoritative.
+      if (shuttingDown) return;
+
+      const crashed = resolved !== 0;
+      const tokenValid = currentCreds != null && currentCreds.expiresAt > now();
+      if (crashed && tokenValid) {
+        // Reset the counter if softeria stayed up long enough to be "stable".
+        if (now() - lastSpawnMs >= SOFTERIA_STABLE_MS) restartAttempts = 0;
+
+        if (restartAttempts < SOFTERIA_MAX_RESTARTS) {
+          const delayMs = computeRestartBackoffMs(restartAttempts);
+          restartAttempts += 1;
+          // Null out the dead child BEFORE scheduling the backoff re-spawn.
+          // Otherwise a refresh tick that fires during the backoff window would
+          // call killChild(dead-child) (a no-op) and then spawn its own fresh
+          // child — and when restartTimer later fires it would spawn a SECOND
+          // child, orphaning the first with its exit handler still wired →
+          // multiplying parallel softeria processes (worse than the storm this
+          // fixes). See PR #2997 review. The refresh callback also clears any
+          // pending restartTimer as belt-and-suspenders.
+          currentChild = null;
+          log(
+            `m365-launcher: softeria exited (code=${resolved} signal=${signal}); re-spawning with cached token in ${Math.round(delayMs / 1000)}s (attempt ${restartAttempts}/${SOFTERIA_MAX_RESTARTS}, no broker call)`,
+          );
+          restartTimer = setTimer(() => {
+            restartTimer = null;
+            if (shuttingDown) return;
+            if (currentCreds != null && currentCreds.expiresAt > now()) {
+              currentChild = launchChild(currentCreds.accessToken);
+            } else {
+              // Token expired during backoff — defer to the refresh path /
+              // Claude Code respawn for fresh creds.
+              log("m365-launcher: cached token expired during backoff — exiting for fresh creds");
+              exitLauncher(resolved);
+            }
+          }, delayMs);
+          return;
+        }
+        log(
+          `m365-launcher: softeria crash-looped ${restartAttempts}x within ${Math.round(SOFTERIA_STABLE_MS / 1000)}s — giving up, exiting`,
+        );
+        exitLauncher(resolved);
+        return;
+      }
+
+      // Token expired (a refresh is genuinely due) — propagate up to claude so
+      // it respawns the launcher and pulls fresh credentials.
       log(`m365-launcher: softeria exited unexpectedly code=${resolved} signal=${signal}`);
       exitLauncher(resolved);
     });
@@ -309,6 +412,14 @@ export async function runMs365McpLauncher(
     refreshTimer = setTimer(async () => {
       try {
         log("m365-launcher: refreshing token + restarting softeria");
+        // Cancel any pending crash-loop backoff re-spawn. The refresh path is
+        // about to kill + respawn softeria with fresh creds; if a backoff timer
+        // fired afterwards it would spawn a SECOND child, orphaning this one.
+        // See PR #2997 review (double-spawn / process fan-out).
+        if (restartTimer) {
+          clearTimer(restartTimer);
+          restartTimer = null;
+        }
         // Order matters: set the flag BEFORE awaiting fetchCreds. If
         // we awaited first and the child happened to die during the
         // await, the exit handler would treat it as unexpected and
@@ -328,6 +439,8 @@ export async function runMs365McpLauncher(
           await killChild(currentChild);
         }
         restartingForRefresh = false;
+        currentCreds = fresh;
+        restartAttempts = 0;
         currentChild = launchChild(fresh.accessToken);
         try {
           process.stdin.resume();
@@ -368,6 +481,7 @@ export async function runMs365McpLauncher(
     log(`m365-launcher: initial broker call failed — ${msg}`);
     return 1;
   }
+  currentCreds = initial;
   currentChild = launchChild(initial.accessToken);
   scheduleRefresh(initial.expiresAt);
 

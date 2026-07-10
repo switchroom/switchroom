@@ -19,7 +19,11 @@ import {
   DEFAULT_REFRESH_LEAD_MS,
   heartbeatPath,
   MAX_REFRESH_INTERVAL_MS,
+  computeRestartBackoffMs,
   runMs365McpLauncher,
+  SOFTERIA_RESTART_BASE_MS,
+  SOFTERIA_RESTART_MAX_MS,
+  SOFTERIA_MAX_RESTARTS,
   SOFTERIA_TOKEN_ENV,
   writeRefreshHeartbeat,
 } from "./m365-mcp-launcher.js";
@@ -370,8 +374,11 @@ describe("runMs365McpLauncher", () => {
     const hbDir = `/tmp/m365-test-leak-${process.pid}-${Date.now()}`;
     process.env.SWITCHROOM_M365_HEARTBEAT_DIR = hbDir;
     const child1 = makeFakeChild();
+    const child2 = makeFakeChild();
     let fetchCount = 0;
+    let spawnCount = 0;
     let savedRefreshCb: (() => void) | null = null;
+    const backoffCbs: Array<() => void> = [];
 
     const promise = runMs365McpLauncher(
       {},
@@ -384,10 +391,14 @@ describe("runMs365McpLauncher", () => {
           // Second call (refresh tick) fails
           throw new Error("broker transient failure");
         },
-        spawnSofteria: () =>
-          child1 as unknown as import("node:child_process").ChildProcess,
+        spawnSofteria: () => {
+          spawnCount++;
+          return (spawnCount === 1 ? child1 : child2) as unknown as
+            import("node:child_process").ChildProcess;
+        },
         setTimer: ((cb: () => void, _ms: number) => {
           if (!savedRefreshCb) savedRefreshCb = cb;
+          else backoffCbs.push(cb);
           return setTimeout(() => {}, 0);
         }) as typeof setTimeout,
         log: () => {},
@@ -400,14 +411,289 @@ describe("runMs365McpLauncher", () => {
     savedRefreshCb!();
     await new Promise((r) => setTimeout(r, 50));
 
-    // After refresh failure, simulate the child dying on its own
-    // (e.g. network drop). The launcher MUST propagate this as
-    // unexpected — if the flag leaked, the launcher would swallow
-    // the exit silently.
+    // After refresh failure, simulate the child crashing on its own
+    // (e.g. network drop, exit 137). The launcher MUST act on this exit —
+    // if restartingForRefresh had leaked, the exit would be swallowed
+    // silently. With the token still valid, the correct action is a
+    // crash-loop backoff re-spawn (issue #2586), NOT a launcher exit.
     child1.exitCode = 137;
     child1.emit("exit", 137, null);
+    await new Promise((r) => setImmediate(r));
+
+    // A backoff timer was scheduled (the exit was acted on, not swallowed).
+    expect(backoffCbs.length).toBeGreaterThanOrEqual(1);
+    // Fire it — softeria re-spawns in-process with the SAME cached token and
+    // no extra broker fetch.
+    backoffCbs[backoffCbs.length - 1]!();
+    await new Promise((r) => setImmediate(r));
+    expect(spawnCount).toBe(2);
+
+    // Cleanup — child2 exits cleanly so the launcher resolves.
+    child2.exitCode = 0;
+    child2.emit("exit", 0, null);
     const code = await promise;
+    expect(code).toBe(0);
+    rmSync(hbDir, { recursive: true, force: true });
+    delete process.env.SWITCHROOM_M365_HEARTBEAT_DIR;
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────
+// computeRestartBackoffMs — issue #2586
+// ────────────────────────────────────────────────────────────────────────
+
+describe("computeRestartBackoffMs", () => {
+  it("starts at the base delay for attempt 0", () => {
+    expect(computeRestartBackoffMs(0)).toBe(SOFTERIA_RESTART_BASE_MS);
+  });
+
+  it("doubles per attempt (exponential backoff)", () => {
+    expect(computeRestartBackoffMs(1)).toBe(SOFTERIA_RESTART_BASE_MS * 2);
+    expect(computeRestartBackoffMs(2)).toBe(SOFTERIA_RESTART_BASE_MS * 4);
+    expect(computeRestartBackoffMs(3)).toBe(SOFTERIA_RESTART_BASE_MS * 8);
+  });
+
+  it("caps at SOFTERIA_RESTART_MAX_MS", () => {
+    expect(computeRestartBackoffMs(100)).toBe(SOFTERIA_RESTART_MAX_MS);
+  });
+
+  it("treats negative attempts as attempt 0", () => {
+    expect(computeRestartBackoffMs(-5)).toBe(SOFTERIA_RESTART_BASE_MS);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────
+// crash-loop backoff — issue #2586 (get-credentials retry-storm)
+// ────────────────────────────────────────────────────────────────────────
+
+describe("runMs365McpLauncher — crash-loop backoff (#2586)", () => {
+  it("re-spawns softeria on crash WITHOUT a fresh broker fetch while token is valid", async () => {
+    const hbDir = `/tmp/m365-test-storm-${process.pid}-${Date.now()}`;
+    process.env.SWITCHROOM_M365_HEARTBEAT_DIR = hbDir;
+    const children = [makeFakeChild(), makeFakeChild(), makeFakeChild()];
+    let spawnCount = 0;
+    let fetchCount = 0;
+    let savedRefreshCb: (() => void) | null = null;
+    const backoffCbs: Array<() => void> = [];
+
+    const promise = runMs365McpLauncher(
+      {},
+      {
+        fetchCreds: async () => {
+          fetchCount++;
+          return { accessToken: "at-1", expiresAt: Date.now() + 60 * 60 * 1000 };
+        },
+        spawnSofteria: () => {
+          const c = children[spawnCount++];
+          return c as unknown as import("node:child_process").ChildProcess;
+        },
+        setTimer: ((cb: () => void, _ms: number) => {
+          if (!savedRefreshCb) savedRefreshCb = cb;
+          else backoffCbs.push(cb);
+          return setTimeout(() => {}, 0);
+        }) as typeof setTimeout,
+        log: () => {},
+      },
+    );
+
+    await new Promise((r) => setImmediate(r));
+    expect(spawnCount).toBe(1);
+    expect(fetchCount).toBe(1);
+
+    // softeria crashes (exit 137) twice — each time the launcher must
+    // re-spawn with the cached token and MUST NOT call fetchCreds again.
+    for (let i = 0; i < 2; i++) {
+      children[i].exitCode = 137;
+      children[i].emit("exit", 137, null);
+      await new Promise((r) => setImmediate(r));
+      backoffCbs[backoffCbs.length - 1]!();
+      await new Promise((r) => setImmediate(r));
+    }
+
+    expect(spawnCount).toBe(3); // initial + 2 re-spawns
+    expect(fetchCount).toBe(1); // NO extra broker fetch — storm defused
+
+    // Cleanup — clean exit resolves the launcher.
+    children[2].exitCode = 0;
+    children[2].emit("exit", 0, null);
+    const code = await promise;
+    expect(code).toBe(0);
+    rmSync(hbDir, { recursive: true, force: true });
+    delete process.env.SWITCHROOM_M365_HEARTBEAT_DIR;
+  });
+
+  it("propagates exit (no backoff) when the cached token has already expired", async () => {
+    const hbDir = `/tmp/m365-test-exp-${process.pid}-${Date.now()}`;
+    process.env.SWITCHROOM_M365_HEARTBEAT_DIR = hbDir;
+    const child = makeFakeChild();
+    let clock = 1_000_000;
+    const promise = runMs365McpLauncher(
+      {},
+      {
+        // Token valid for only 10ms of virtual time.
+        fetchCreds: async () => ({ accessToken: "at-1", expiresAt: clock + 10 }),
+        spawnSofteria: () =>
+          child as unknown as import("node:child_process").ChildProcess,
+        setTimer: ((_cb: () => void, _ms: number) =>
+          setTimeout(() => {}, 0)) as typeof setTimeout,
+        now: () => clock,
+        log: () => {},
+      },
+    );
+
+    await new Promise((r) => setImmediate(r));
+    // Advance virtual clock past expiry, then crash.
+    clock += 1000;
+    child.exitCode = 137;
+    child.emit("exit", 137, null);
+    const code = await promise;
+    // Token expired → launcher exits (defers to fresh-creds respawn), no
+    // in-process backoff loop.
     expect(code).toBe(137);
+    rmSync(hbDir, { recursive: true, force: true });
+    delete process.env.SWITCHROOM_M365_HEARTBEAT_DIR;
+  });
+
+  it("gives up after SOFTERIA_MAX_RESTARTS consecutive rapid crashes", async () => {
+    const hbDir = `/tmp/m365-test-giveup-${process.pid}-${Date.now()}`;
+    process.env.SWITCHROOM_M365_HEARTBEAT_DIR = hbDir;
+    // Enough children for the initial spawn + MAX_RESTARTS re-spawns.
+    const children = Array.from({ length: SOFTERIA_MAX_RESTARTS + 2 }, () =>
+      makeFakeChild(),
+    );
+    let spawnCount = 0;
+    const clock = 5_000_000;
+    let savedRefreshCb: (() => void) | null = null;
+    const backoffCbs: Array<() => void> = [];
+
+    const promise = runMs365McpLauncher(
+      {},
+      {
+        fetchCreds: async () => ({
+          accessToken: "at-1",
+          expiresAt: clock + 60 * 60 * 1000,
+        }),
+        spawnSofteria: () =>
+          children[spawnCount++] as unknown as
+            import("node:child_process").ChildProcess,
+        setTimer: ((cb: () => void, _ms: number) => {
+          if (!savedRefreshCb) savedRefreshCb = cb;
+          else backoffCbs.push(cb);
+          return setTimeout(() => {}, 0);
+        }) as typeof setTimeout,
+        // Pin the clock so every crash counts as "rapid" (never stable).
+        now: () => clock,
+        log: () => {},
+      },
+    );
+
+    await new Promise((r) => setImmediate(r));
+
+    // Crash repeatedly with no stable window between restarts.
+    let code: number | undefined;
+    let done = false;
+    promise.then((c) => {
+      code = c;
+      done = true;
+    });
+    for (let i = 0; i < SOFTERIA_MAX_RESTARTS + 1 && !done; i++) {
+      children[i].exitCode = 1;
+      children[i].emit("exit", 1, null);
+      await new Promise((r) => setImmediate(r));
+      if (backoffCbs.length > 0 && !done) {
+        backoffCbs[backoffCbs.length - 1]!();
+        await new Promise((r) => setImmediate(r));
+      }
+    }
+
+    await promise;
+    // After the restart budget is exhausted the launcher exits rather than
+    // spinning forever.
+    expect(code).toBe(1);
+    expect(spawnCount).toBeLessThanOrEqual(SOFTERIA_MAX_RESTARTS + 1);
+    rmSync(hbDir, { recursive: true, force: true });
+    delete process.env.SWITCHROOM_M365_HEARTBEAT_DIR;
+  });
+
+  it("refresh firing during a pending crash-backoff does NOT double-spawn (#2997 review blocker)", async () => {
+    const hbDir = `/tmp/m365-test-dblspawn-${process.pid}-${Date.now()}`;
+    process.env.SWITCHROOM_M365_HEARTBEAT_DIR = hbDir;
+    const children = [makeFakeChild(), makeFakeChild(), makeFakeChild()];
+    let spawnCount = 0;
+    let fetchCount = 0;
+
+    // Timer registry that models real cancellation: a cleared timer must not
+    // fire. This is what lets the test prove the refresh path cancels the
+    // pending backoff timer (fix #1) rather than the harness silently allowing
+    // a second spawn.
+    interface FakeTimer {
+      cb: () => void;
+      cancelled: boolean;
+    }
+    const timers: FakeTimer[] = [];
+    const fire = (t: FakeTimer): void => {
+      if (!t.cancelled) t.cb();
+    };
+
+    const promise = runMs365McpLauncher(
+      {},
+      {
+        fetchCreds: async () => {
+          fetchCount++;
+          return {
+            accessToken: `at-${fetchCount}`,
+            expiresAt: Date.now() + 60 * 60 * 1000,
+          };
+        },
+        spawnSofteria: () =>
+          children[spawnCount++] as unknown as
+            import("node:child_process").ChildProcess,
+        setTimer: ((cb: () => void, _ms: number) => {
+          const t: FakeTimer = { cb, cancelled: false };
+          timers.push(t);
+          return t as unknown as NodeJS.Timeout;
+        }) as typeof setTimeout,
+        clearTimer: ((h: unknown) => {
+          if (h) (h as FakeTimer).cancelled = true;
+        }) as typeof clearTimeout,
+        log: () => {},
+      },
+    );
+
+    await new Promise((r) => setImmediate(r));
+    expect(spawnCount).toBe(1);
+    const refreshTimer = timers[0]; // first schedule = refresh tick
+
+    // softeria crashes → a backoff re-spawn timer is scheduled and the dead
+    // child is nulled out (fix #2).
+    children[0].exitCode = 137;
+    children[0].emit("exit", 137, null);
+    await new Promise((r) => setImmediate(r));
+    const backoffTimer = timers[1];
+    expect(backoffTimer).toBeDefined();
+    expect(backoffTimer.cancelled).toBe(false);
+
+    // The refresh tick now fires WHILE the backoff timer is still pending.
+    // It must cancel that backoff timer (fix #1) and spawn exactly one fresh
+    // child — not race the backoff into a second parallel softeria.
+    fire(refreshTimer);
+    await new Promise((r) => setTimeout(r, 30)); // let async fetch/kill settle
+
+    expect(backoffTimer.cancelled).toBe(true); // fix #1 — backoff cancelled
+    expect(spawnCount).toBe(2); // exactly one respawn (fresh-creds child)
+    expect(fetchCount).toBe(2); // the refresh fetched; backoff would not have
+
+    // Belt-and-suspenders: even if some stale reference tried to fire the
+    // cancelled backoff timer, it is a no-op — still exactly one live child.
+    fire(backoffTimer);
+    await new Promise((r) => setImmediate(r));
+    expect(spawnCount).toBe(2);
+
+    // Cleanup — the one live child exits cleanly, launcher resolves.
+    children[1].exitCode = 0;
+    children[1].emit("exit", 0, null);
+    const code = await promise;
+    expect(code).toBe(0);
     rmSync(hbDir, { recursive: true, force: true });
     delete process.env.SWITCHROOM_M365_HEARTBEAT_DIR;
   });
