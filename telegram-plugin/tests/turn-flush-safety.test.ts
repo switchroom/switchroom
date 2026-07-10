@@ -261,10 +261,24 @@ describe('#2798 turn-flush punctuation/bold parity with reply', () => {
   )
 
   it('reply path: normalizes AFTER redact and BEFORE the voice scrub', () => {
-    const start = gatewaySrc.indexOf('async function executeReply(')
-    const redactIdx = gatewaySrc.indexOf(`redactOutboundText(text, 'reply')`, start)
-    const normIdx = gatewaySrc.indexOf('stripExcessBold(normalizePunctuation(text))', start)
-    const scrubIdx = gatewaySrc.indexOf('scrubVoice(text)', start)
+    // #2996: the reply-path entry pipeline moved into outbound-send-path.ts
+    // (`normalizeOutboundBody`). The reply path delegates to it via
+    // `normalizeOutboundBody(rawText, 'reply', redactOutboundText)`; the
+    // redact→normalize→scrub ordering is now pinned in the module source.
+    const replyDelegates = gatewaySrc.indexOf(
+      `normalizeOutboundBody(rawText, 'reply', redactOutboundText)`,
+      gatewaySrc.indexOf('async function executeReply('),
+    )
+    expect(replyDelegates).toBeGreaterThan(0)
+
+    const moduleSrc = readFileSync(
+      new URL('../gateway/outbound-send-path.ts', import.meta.url),
+      'utf8',
+    )
+    const start = moduleSrc.indexOf('export function normalizeOutboundBody(')
+    const redactIdx = moduleSrc.indexOf('redact(text, site)', start)
+    const normIdx = moduleSrc.indexOf('stripExcessBold(normalizePunctuation(text))', start)
+    const scrubIdx = moduleSrc.indexOf('scrubVoice(text)', start)
     expect(start).toBeGreaterThan(0)
     expect(redactIdx).toBeGreaterThan(start)
     expect(normIdx).toBeGreaterThan(redactIdx) // normalize AFTER the reply redact

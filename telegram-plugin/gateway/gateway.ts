@@ -280,9 +280,15 @@ const REPLY_TO_TEXT_MAX = 200
 // #1161 silent-end fallback text now lives in ../silent-end.ts
 // (`silentEndFallbackText`, imported above) so the transport-boundary
 // tests exercise the real string — see PR #2892.
-import { splitMarkdownChunks, hardSliceToCap, repairEscapedWhitespace, normalizeParagraphBreaks, addParagraphSpacers, normalizePunctuation, stripExcessBold, escapeMarkdown, hardenCardBreaks, RICH_MESSAGE_MAX_CHARS } from '../format.js'
+import { splitMarkdownChunks, repairEscapedWhitespace, normalizeParagraphBreaks, addParagraphSpacers, normalizePunctuation, stripExcessBold, escapeMarkdown, hardenCardBreaks, RICH_MESSAGE_MAX_CHARS } from '../format.js'
 import { richMessage } from '../rich-send.js'
 import { scrubVoice } from '../text-voice-scrub.js'
+import {
+  normalizeOutboundBody,
+  computeEffectiveText,
+  computeReplyChunks,
+  resplitOversizeChunk,
+} from './outbound-send-path.js'
 import {
   validateInlineKeyboard,
   type AnyButton,
@@ -4939,24 +4945,8 @@ function probeAvailableReactions(chatId: string): void {
 // ─── Text chunking ────────────────────────────────────────────────────────
 const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
 
-function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[] {
-  if (text.length <= limit) return [text]
-  const out: string[] = []
-  let rest = text
-  while (rest.length > limit) {
-    let cut = limit
-    if (mode === 'newline') {
-      const para = rest.lastIndexOf('\n\n', limit)
-      const line = rest.lastIndexOf('\n', limit)
-      const space = rest.lastIndexOf(' ', limit)
-      cut = para > limit / 2 ? para : line > limit / 2 ? line : space > 0 ? space : limit
-    }
-    out.push(rest.slice(0, cut))
-    rest = rest.slice(cut).replace(/^\n+/, '')
-  }
-  if (rest) out.push(rest)
-  return out
-}
+// The length/newline text splitter moved to outbound-send-path.ts (#2996) as
+// `chunkText`; the sole gateway caller now goes through `computeReplyChunks`.
 
 // ─── Typing indicator ─────────────────────────────────────────────────────
 // All four state maps re-keyed from `chat_id` to `chatKey(chat, thread)`
@@ -10998,37 +10988,23 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // Repair LLM JSON-escape bungles, then promote lone prose paragraph breaks
   // into GFM hard breaks so the rich path doesn't collapse them (lists/tables/
   // code are left untouched — see normalizeParagraphBreaks).
-  let text = normalizeParagraphBreaks(repairEscapedWhitespace(rawText))
-  // Outbound secret scrub (#2044): mask any secret the agent echoed BEFORE
-  // the stderr preview below, the dedup key, the send, and the history
-  // record. Mutates `text` so every downstream consumer sees the masked
-  // value, exactly like the voice scrub that follows. Runs BEFORE the
-  // punctuation/bold normalizers so a secret containing an em-dash or `**`
-  // is matched literally by the redactor before any mutation.
-  text = redactOutboundText(text, 'reply')
-  // Fleet-wide consistent formatting: normalize dashes/bullets and trip the
-  // over-bold guard deterministically, on code-masked text (same contract on
-  // reply / edit / stream paths). Runs before scrubVoice below so dashes get
-  // the comma treatment on every path; scrubVoice's dash telemetry
-  // (voice_scrub_applied) drops to ~zero here as a result — deliberate.
-  text = stripExcessBold(normalizePunctuation(text))
-  // Voice scrub (#1683): replace em / en dashes with commas / periods.
-  // Runs BEFORE outboundDedup so retries see the scrubbed key, and on the
-  // raw markdown text (the scrubber does its own code-region parking so
-  // dashes inside fences/inline code are preserved). Kill switch:
-  // `SWITCHROOM_DISABLE_VOICE_SCRUB=1`.
-  {
-    const scrub = scrubVoice(text)
-    if (scrub.replaced > 0) {
-      text = scrub.scrubbed
-      emitRuntimeMetric({
-        kind: 'voice_scrub_applied',
-        chatKey: statusKey(chat_id, args.message_thread_id != null
-          ? Number(args.message_thread_id) : undefined),
-        replaced: scrub.replaced,
-        site: 'reply',
-      })
-    }
+  // Outbound text pipeline (#2996 §3B): normalize → redact → punctuation/bold
+  // → voice-scrub, extracted verbatim into outbound-send-path.ts. The order is
+  // load-bearing (secret scrub BEFORE the punctuation/bold normalizers so a
+  // secret with an em-dash or `**` is matched literally; voice scrub last so
+  // retries see the scrubbed dedup key). The metric side effect (fired on a
+  // non-zero voice-scrub replacement) stays here — the pure module returns the
+  // replacement count and the gateway emits.
+  const _normalized = normalizeOutboundBody(rawText, 'reply', redactOutboundText)
+  let text = _normalized.text
+  if (_normalized.voiceReplaced > 0) {
+    emitRuntimeMetric({
+      kind: 'voice_scrub_applied',
+      chatKey: statusKey(chat_id, args.message_thread_id != null
+        ? Number(args.message_thread_id) : undefined),
+      replaced: _normalized.voiceReplaced,
+      site: 'reply',
+    })
   }
   process.stderr.write(`telegram channel: reply: invoked chatId=${chat_id} charCount=${text.length} preview=${JSON.stringify(text.slice(0, 80))}\n`)
   // #2527: emit time_to_first_text_reply_ms on the FIRST text reply of each
@@ -11249,7 +11225,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // jammed together — unlike the old HTML path. Inject a visible blank-line
   // spacer into prose `\n\n` gaps on the rich path only. The literal
   // (`format:'text'`) path must stay byte-exact, so it is left untouched.
-  const effectiveText: string = literalText ? text : addParagraphSpacers(text)
+  const effectiveText: string = computeEffectiveText(text, literalText)
 
   assertAllowedChat(chat_id)
 
@@ -11313,9 +11289,12 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
 
   const limit = Math.max(1, Math.min(access.textChunkLimit ?? RICH_MESSAGE_MAX_CHARS, MAX_CHUNK_LIMIT))
   const replyMode = access.replyToMode ?? 'first'
-  const chunks = literalText
-    ? chunk(effectiveText, limit, access.chunkMode ?? 'length')
-    : splitMarkdownChunks(effectiveText, limit)
+  const chunks = computeReplyChunks({
+    effectiveText,
+    literalText,
+    limit,
+    chunkMode: access.chunkMode ?? 'length',
+  })
   const sentIds: number[] = []
 
   // Outbound TTS synthesis (PR-C2). Done BEFORE the text send so a
@@ -11804,11 +11783,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
         // Re-split at the same cap; for a truly indivisible block this still
         // yields one oversized piece, but a hard character-cut on the rendered
         // markdown at least keeps each delivered piece under the wire cap.
-        const subPieces = splitMarkdownChunks(chunks[i], RICH_MESSAGE_MAX_CHARS)
-        const pieces =
-          subPieces.length > 1
-            ? subPieces
-            : hardSliceToCap(chunks[i], RICH_MESSAGE_MAX_CHARS)
+        const pieces = resplitOversizeChunk(chunks[i])
         for (let p = 0; p < pieces.length; p++) {
           let sent: { message_id: number }
           if (literalText) {

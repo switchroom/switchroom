@@ -35,8 +35,12 @@ describe('gateway outbound secret-scrub — structural wiring', () => {
   })
 
   it('reply: scrubs at entry, before the stderr preview log', () => {
+    // #2996: the entry pipeline (normalize → redact → punctuation/bold →
+    // voice-scrub) is extracted into outbound-send-path.ts. The reply path now
+    // delegates via `normalizeOutboundBody(rawText, 'reply', redactOutboundText)`
+    // — the injected redactor still runs at entry, before the stderr preview.
     const start = src.indexOf('async function executeReply(')
-    const redactIdx = src.indexOf(`redactOutboundText(text, 'reply')`, start)
+    const redactIdx = src.indexOf(`normalizeOutboundBody(rawText, 'reply', redactOutboundText)`, start)
     const previewIdx = src.indexOf('reply: invoked chatId=', start)
     expect(start).toBeGreaterThan(0)
     expect(redactIdx).toBeGreaterThan(start)
