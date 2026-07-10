@@ -34,10 +34,13 @@ language, at the point it affects them.
 - An interrupted turn either resumes or is explicitly named as lost, never
   dropped on the floor in silence.
 - A **deliberate** restart (an operator restart, a rollout) that interrupts
-  an in-flight turn resumes it exactly as a crash does. The quota-saving
-  suppression that skips a resume applies **only when nothing was in flight**;
-  it never becomes an excuse to swallow work that was mid-turn when the
-  operator bounced the agent.
+  an in-flight turn resumes it like an interrupted turn (SIGTERM/crash
+  class). The quota-saving suppression that skips a resume applies **only
+  when nothing was in flight**; it never becomes an excuse to swallow work
+  that was mid-turn when the operator bounced the agent. The resume itself
+  is bounded: a turn is resumed **at most once per interruption**, along a
+  bounded resume chain — a turn that dies again during its own resume is
+  named-as-lost, never resumed forever.
 - **Sub-agents and workers killed by a restart are surfaced in the resume.**
   The parent re-dispatches the ones still needed, or names their loss
   per-worker. A parent turn never "resumes" while the work it dispatched
@@ -83,6 +86,12 @@ Named by job × surface, pointing at real scenarios.
   *Watch:* a turn cut off by a restart is resumed and the resume turn
   completes. *Invariant:* in-flight work is resumed or named-as-lost, never
   dropped in silence.
+- **Deliberate restart resumes, bounded (DM)** —
+  `jtbd-deliberate-restart-resumes-dm`. *Watch:* an operator restart lands
+  mid-turn; the interrupted turn resumes once and runs to completion.
+  *Invariant:* at-most-once resume per interruption, along a bounded resume
+  chain — a deliberate restart never swallows in-flight work, and a resume
+  never loops forever.
 - **Memory survives a restart (DM)** — `jtbd-memory-survives-restart-dm`.
   *Watch:* the agent comes back knowing what it knew before. *Invariant:*
   the agent never resurrects amnesiac without saying so.
@@ -130,3 +139,6 @@ including dispatched sub-agent work and an outstanding approval card.
   the reboots this job handles.
 - [`steer-or-queue-mid-flight`](steer-or-queue-mid-flight.md) — how an
   in-flight task is resumed or named-as-lost after a bounce.
+- [`deterministic-turn-liveness`](../rfcs/deterministic-turn-liveness.md) —
+  the design record carrying the at-most-once, bounded-resume-chain
+  contract this job's resume promises lean on.
