@@ -187,7 +187,10 @@ visibly-progressing turn.
 ## Related
 
 - [`steer-or-queue-mid-flight`](steer-or-queue-mid-flight.md) — acting on the
-  agent once you can see what it's doing.
+  agent once you can see what it's doing; includes the mid-flight busy ack
+  (a quick question asked while the agent is stuck inside one long tool
+  call gets a silent ack naming the blocking activity within seconds,
+  proven by `jtbd-midflight-busy-ack-dm`).
 - [`track-plan-quota-live`](track-plan-quota-live.md) — the other
   answered-in-the-chat, never-a-dashboard signal.
 - [`see-my-whole-fleet-from-one-screen`](see-my-whole-fleet-from-one-screen.md) —
