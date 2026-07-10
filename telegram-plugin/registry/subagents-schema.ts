@@ -633,6 +633,37 @@ export function listSubagents(
 }
 
 /**
+ * List the sub-agents of a given parent turn that had NOT reached a terminal
+ * state (`completed` / `failed`) — i.e. `running` or `stalled`. Ordered by
+ * `started_at ASC` (dispatch order) so the resume inbound lists them the way
+ * they were spawned.
+ *
+ * This is the boot-resume accessor: when a turn is interrupted mid-flight, its
+ * in-flight workers were killed with it, so the resumed session needs to know
+ * which ones didn't finish to re-dispatch them. Deliberately includes
+ * `stalled` alongside `running` — a row the reaper flipped to `stalled` (1h
+ * TTL, JSONL linkage missing) still never completed, so it belongs in the
+ * "these died, re-dispatch if still needed" list. Only genuine terminals are
+ * excluded. This also makes the read robust to boot ordering: even if the
+ * watcher's reaper transitions a row to `stalled` before this runs, the row is
+ * still surfaced rather than dropped.
+ */
+export function listNonTerminalSubagentsForTurn(
+  db: SqliteDatabase,
+  parentTurnKey: string,
+): Subagent[] {
+  const rows = db
+    .prepare(`
+      SELECT * FROM subagents
+      WHERE parent_turn_key = ?
+        AND status NOT IN ('completed', 'failed')
+      ORDER BY started_at ASC
+    `)
+    .all(parentTurnKey) as RawSubagentRow[]
+  return rows.map(mapSubagentRow)
+}
+
+/**
  * Retrieve a single subagent row by id. Returns null if not found.
  * Useful in tests and for callers that need to inspect current state.
  */
