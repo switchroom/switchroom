@@ -149,7 +149,7 @@ export interface ModelCommandDeps {
    * Schedule a session-only switch TO a non-Claude (`sr-*` LiteLLM/OpenRouter)
    * model. claude's in-REPL `/model` picker rejects unknown `sr-*` ids, so an
    * inject can't set them. Instead the gateway writes the chosen token to the
-   * `.session-model-override` carrier file and gracefully restarts the agent;
+   * durable `.session-model` override and gracefully restarts the agent;
    * the next boot launches `claude --model <token>` directly (LiteLLM routes
    * it, no picker validation). Session-only: reverts to the configured default
    * on the following restart. Wired to the same restart dispatch as
@@ -175,7 +175,7 @@ export interface ModelCommandReply {
 }
 
 const PERSIST_NOTE =
-  '_Session-only — lasts until restart. To persist, set \`model:\` in switchroom.yaml and restart._'
+  '_Sticky across switchroom-managed relaunches (\`/new\`, watchdog recovery); reverts on \`/restart\`, agent restart, crash, or external container restart. \`/model default\` clears it. To persist, set \`model:\` in switchroom.yaml._'
 
 function helpText(deps: ModelCommandDeps, reason?: string): ModelCommandReply {
   const srAliasExamples = Object.keys(SR_MODEL_ALIASES).map(a => `\`${a}\``).join(' · ')
@@ -240,7 +240,7 @@ export async function handleModelCommand(
   // the proxy at session start, not by claude's own REPL. A graceful restart
   // is the only clean path back to the native OAuth route. Route it through the
   // SAME carrier mechanism as a Claude → sr-* switch (scheduleModelRelaunch)
-  // so the requested Claude model is written to `.session-model-override` and
+  // so the requested Claude model is written to the durable `.session-model` and
   // survives the restart — otherwise boot launches the configured default and
   // the operator's choice is silently dropped. start.sh's LiteLLM-down guard
   // only special-cases `sr-*` overrides, so a Claude token is never dropped.
@@ -294,7 +294,7 @@ export async function handleModelCommand(
     return {
       text: [
         `Switching to \`${deps.escapeHtml(model)}\` — restarting session (~30s).`,
-        '_Session-only — reverts to the configured default on the next restart._',
+        PERSIST_NOTE,
       ].join('\n'),
       html: true,
     }
@@ -744,13 +744,20 @@ export interface ModelCallbackOutcome {
   /**
    * The canonical `claude --model` token (alias or full `claude-*` id) for a
    * Claude selection, when derivable — distinct from `selectedModel` (a display
-   * name for /status). The gateway writes this to the `.session-model-override`
-   * carrier on an sr-* → Claude transition so the requested Claude model survives
-   * the restart (otherwise boot launches the configured default). Absent when the
-   * target has no derivable token (e.g. the "Default" row → boot the configured
-   * default).
+   * name for /status). The gateway persists this to the durable
+   * `.session-model` override so the confirmed switch survives
+   * switchroom-managed relaunches (and, on an sr-* → Claude transition, its own
+   * restart). Absent when the target has no derivable token.
    */
   selectedModelToken?: string
+  /**
+   * True when the confirmed selection was the "Default (recommended)" row —
+   * i.e. the session is now on the configured default and any sticky
+   * `.session-model` override must be CLEARED (there is no token to persist;
+   * persisting nothing while leaving a stale override would re-apply the old
+   * model on the next keep-relaunch).
+   */
+  clearedDefault?: boolean
   /** Short toast for answerCallbackQuery. */
   answer: string
   /** Replacement dashboard (message edit). */
@@ -872,7 +879,7 @@ export async function handleModelMenuCallback(
       answer: `Switching to ${friendlyName} — restarting (~30s)`,
       reply: await menuWithBannerStatic(
         deps,
-        `🔄 Switching session to **${deps.escapeHtml(friendlyName)}** — restarting (~30s). _Session-only; reverts to the configured default on the next restart._`,
+        `🔄 Switching session to **${deps.escapeHtml(friendlyName)}** — restarting (~30s).\n${PERSIST_NOTE}`,
       ),
       selectedModel: srName,
     }
@@ -949,11 +956,16 @@ export async function handleModelMenuCallback(
   // "Default (recommended)". If neither resolves, record nothing rather than lie.
   const token = canonicalClaudeToken(target.label)
   const selectedModel = sessionModelFromConfirmation(result.confirmation) ?? token ?? undefined
+  // The "Default (recommended)" row has no derivable token BY DESIGN — a
+  // confirmed switch to it means "back on the configured default", which the
+  // gateway must translate into clearing the sticky override.
+  const clearedDefault = token == null && /^default\b/i.test(target.label.trim())
   return {
     answer: deps.escapeHtml(result.confirmation),
     reply: await menuWithBanner(deps, `✅ ${deps.escapeHtml(result.confirmation)}`),
     ...(selectedModel ? { selectedModel } : {}),
     ...(token ? { selectedModelToken: token } : {}),
+    ...(clearedDefault ? { clearedDefault: true } : {}),
   }
 }
 
@@ -1030,7 +1042,7 @@ export function isKeptModelConfirmation(confirmation: string): boolean {
 
 /**
  * Normalize a picker ROW LABEL to a canonical `claude --model` token suitable
- * for the `.session-model-override` carrier (aliases and full `claude-*` ids —
+ * for the durable `.session-model` override (aliases and full `claude-*` ids —
  * NOT display strings like "Default (recommended)" or "Opus 4.8", which the CLI
  * flag rejects). Returns null when the label is a pure display label with no
  * derivable token: for the "Default" row that correctly means "boot the

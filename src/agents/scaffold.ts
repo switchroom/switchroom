@@ -2992,12 +2992,13 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     // the symlink block as a no-op.
     hostHomeQ: hostHomeQForBake(),
     // modelQ is the CONFIGURED default only. It is NOT the last word on the
-    // launched model: start.sh applies a runtime session-only override at boot
-    // if the gateway wrote a `.session-model-override` carrier (Telegram
-    // `/model <sr-*>` → graceful relaunch on a non-Anthropic LiteLLM model).
-    // That override is one-shot + session-scoped — it reverts to modelQ on the
-    // next restart and is never persisted here or to switchroom.yaml. See
-    // profiles/_base/start.sh.hbs (Session-only model override) and
+    // launched model: start.sh applies the durable `.session-model` override
+    // at boot when a fresh keep `.relaunch-model-intent` accompanies it
+    // (Telegram `/model` switches; contract in
+    // reference/rfcs/session-model-stickiness.md). The override reverts to
+    // modelQ on deliberate restarts / crashes / external container restarts
+    // and is never persisted here or to switchroom.yaml. See
+    // profiles/_base/start.sh.hbs (Session model resolution) and
     // telegram-plugin/gateway/model-command.ts.
     modelQ: shellSingleQuote(resolveMainModel(agentConfig.model)),
     ...buildCronSessionContext(agentConfig),

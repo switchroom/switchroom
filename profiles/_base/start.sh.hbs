@@ -980,8 +980,8 @@ fi
 # per-session cost/issue tracking is handled out-of-band by correlating
 # LiteLLM's request log against switchroom's turn ledger, never by mutating the
 # claude protocol.
-# _LITELLM_OK is read by the session-model-override block below: an sr-*
-# (LiteLLM/OpenRouter) session override must be DROPPED when the proxy is
+# _LITELLM_OK is read by the session-model resolution block below: an sr-*
+# (LiteLLM/OpenRouter) session override must NOT be applied when the proxy is
 # unreachable at boot, or claude would 4xx an unknown model against Anthropic.
 # Empty by default (proxy not confirmed live); set to "1" only on a successful
 # liveliness probe. Deliberately NOT unset with the sr_ll_* scratch vars.
@@ -1065,54 +1065,131 @@ x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:
   unset sr_ll_key sr_ll_ok sr_ll_unreachable
 fi
 
-# --- Session-only model override (carrier: .session-model-override) ---
+# --- Session model resolution (durable .session-model + .relaunch-model-intent) ---
 #
-# The Telegram `/model <sr-*>` switch can't use claude's in-REPL `/model`
-# picker for non-Anthropic (LiteLLM/OpenRouter `sr-*`) models — the CLI's
-# native picker rejects unknown ids ("Model not found"). Instead the gateway
-# writes the chosen model token to `.session-model-override` and gracefully
-# restarts the agent; THIS boot picks it up and launches `claude --model
-# <token>` directly (no picker validation at launch — LiteLLM routes it).
+# Contract: reference/rfcs/session-model-stickiness.md. A positively-
+# confirmed `/model X` switch persists as `{{agentDir}}/.session-model`
+# (one-line JSON written by the gateway). Whether THIS boot applies it is
+# decided by the one-shot `.relaunch-model-intent` file, stamped by the
+# gateway immediately before every switchroom-managed bounce:
 #
-# One-shot + session-only: the carrier is consumed (rm) on this one boot
-# regardless of validity, so the next restart reverts to the configured
-# default `{{{modelQ}}}`. Mirrors the `.force-fresh-session` marker's
-# gateway↔start.sh round-trip. See telegram-plugin/gateway/model-command.ts.
+#   fresh (<10 min by embedded ts) "keep" intent  → apply the override
+#   anything else (revert / absent / stale / corrupt) → delete the override,
+#     boot the configured default, and (when an override was actually
+#     removed) write a `.session-model-alert` notice naming why.
+#
+# Default is REVERT (operator decision 2026-07): a crash, OOM, raw
+# `docker restart`, host reboot, or deploy writes no intent and therefore
+# reverts to the yaml model. Watchdog/recovery bounces run gateway code and
+# stamp "keep" before SIGTERM, so a confirmed switch survives them.
+#
 # NB {{{modelQ}}} is already shell-single-quoted by the scaffold (it renders as
 # a quoted token, e.g. 'claude-sonnet-5'), so it is assigned BARE here — never
 # inside additional double quotes, which would embed the literal quote chars in
 # the value and break `claude --model`.
 _EFFECTIVE_MODEL={{{modelQ}}}
+# Record the RESOLVED configured default (raw, unquoted) every boot, before
+# override resolution. The gateway copies this into the override's
+# `configuredDefaultAtWrite`, so both sides of the invalidation compare below
+# come from the same resolver. Overwrite, not consumed.
+printf '%s\n' "$_EFFECTIVE_MODEL" > "{{agentDir}}/.configured-default-model" 2>/dev/null || true
+
+# Migration shim (one release, RFC §7): a leftover one-shot
+# `.session-model-override` carrier means an OLD gateway wrote it immediately
+# before this very bounce — it is the newest user intent and WINS over any
+# `.session-model` on disk. Convert (overwrite) + consume, and apply THIS
+# boot (the carrier's presence is itself the keep signal).
+_sm_keep=""
 if [ -f "{{agentDir}}/.session-model-override" ]; then
-  _override="$(tr -d '[:space:]' < "{{agentDir}}/.session-model-override" 2>/dev/null || true)"
+  _mig="$(tr -d '[:space:]' < "{{agentDir}}/.session-model-override" 2>/dev/null || true)"
   rm -f "{{agentDir}}/.session-model-override"
-  # Shape gate — kept aligned with MODEL_ARG_RE in telegram-plugin/gateway/model-command.ts.
-  # `/` is allowed for OpenRouter-style `sr-vendor/model` ids; it is not a shell
-  # metachar inside the double-quoted `claude --model "$_EFFECTIVE_MODEL"` usage below.
-  if printf '%s' "$_override" | grep -Eq '^[A-Za-z0-9][]A-Za-z0-9._[/-]{0,99}$'; then
-    _EFFECTIVE_MODEL="$_override"
-    # LiteLLM-down guard for an sr-* OVERRIDE only (operator decision 2026-07):
-    # with the proxy unreachable at boot there IS a Claude configured default to
-    # fall back to, so DROP the override rather than boot on an unreachable sr-*
-    # model that would 4xx against Anthropic — log LOUDLY and write an alert
-    # sentinel the gateway turns into a Telegram message. (The passthrough→router
-    # repoint for a LIVE sr-* — override OR configured default — is done once,
-    # post-resolution, below.)
-    case "$_override" in
+  if printf '%s' "$_mig" | grep -Eq '^[A-Za-z0-9][]A-Za-z0-9._[/-]{0,99}$'; then
+    printf '{"model":"%s","configuredDefaultAtWrite":"%s","ts":%s}\n' "$_mig" "$_EFFECTIVE_MODEL" "$(( $(date +%s) * 1000 ))" > "{{agentDir}}/.session-model" 2>/dev/null || true
+    _sm_keep="1"
+    echo "session-model: migrated legacy one-shot carrier '$_mig' to durable .session-model (applying this boot)" >&2
+  else
+    echo "session-model: ignoring malformed legacy .session-model-override (failed shape gate)" >&2
+  fi
+  unset _mig
+fi
+
+# One-shot intent: consume unconditionally, honor only a fresh "keep".
+# Freshness clock is the EMBEDDED ts (ms), never file mtime — same clock the
+# gateway writes with.
+_sm_reason=""
+if [ -f "{{agentDir}}/.relaunch-model-intent" ]; then
+  _int_raw="$(cat "{{agentDir}}/.relaunch-model-intent" 2>/dev/null || true)"
+  rm -f "{{agentDir}}/.relaunch-model-intent"
+  _int="$(printf '%s' "$_int_raw" | sed -n 's/.*"intent"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p')"
+  _int_ts="$(printf '%s' "$_int_raw" | sed -n 's/.*"ts"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p')"
+  _sm_reason="$(printf '%s' "$_int_raw" | sed -n 's/.*"reason"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  if [ "$_int" = "keep" ] && [ -n "$_int_ts" ] && [ $(( $(date +%s) * 1000 - _int_ts )) -lt 600000 ]; then
+    _sm_keep="1"
+  fi
+  unset _int_raw _int _int_ts
+fi
+
+if [ -f "{{agentDir}}/.session-model" ]; then
+  _smf="$(cat "{{agentDir}}/.session-model" 2>/dev/null || true)"
+  _sm_model="$(printf '%s' "$_smf" | sed -n 's/.*"model"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  _sm_cfg="$(printf '%s' "$_smf" | sed -n 's/.*"configuredDefaultAtWrite"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  _sm_ts="$(printf '%s' "$_smf" | sed -n 's/.*"ts"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p')"
+  if [ -z "$_sm_keep" ]; then
+    # No fresh keep intent → deliberate restart, crash, external container
+    # restart, or deploy. Revert to the configured default and say so.
+    rm -f "{{agentDir}}/.session-model"
+    _sm_why="${_sm_reason:-no keep intent — crash, external container restart, or deploy}"
+    echo "session-model: reverting to configured default '$_EFFECTIVE_MODEL' — $_sm_why (session override '$_sm_model' cleared)" >&2
+    printf 'Session model override `%s` was cleared — this relaunch reverted to the configured default `%s` (%s). Re-issue /model %s to switch back.\n' "$_sm_model" "$_EFFECTIVE_MODEL" "$_sm_why" "$_sm_model" > "{{agentDir}}/.session-model-alert" 2>/dev/null || true
+    unset _sm_why
+  # Shape gate — kept BYTE-IDENTICAL with MODEL_ARG_RE in
+  # telegram-plugin/gateway/model-command.ts. `/` is allowed for
+  # OpenRouter-style `sr-vendor/model` ids; it is not a shell metachar inside
+  # the double-quoted `claude --model "$_EFFECTIVE_MODEL"` usage below.
+  # The wc -c/-l check rejects EMPTY and MULTILINE values first: the sed
+  # extraction above emits one match per matching LINE, and `grep -Eq`
+  # passes if ANY line matches — a multiline value must never reach
+  # `claude --model` (parity with parseSessionModel's single-string check).
+  elif [ "$(printf '%s' "$_sm_model" | wc -c)" -eq 0 ] || [ "$(printf '%s' "$_sm_model" | wc -l)" -ne 0 ] || ! printf '%s' "$_sm_model" | grep -Eq '^[A-Za-z0-9][]A-Za-z0-9._[/-]{0,99}$'; then
+    rm -f "{{agentDir}}/.session-model"
+    echo "session-model: ignoring malformed .session-model (failed shape gate) — using configured default '$_EFFECTIVE_MODEL'" >&2
+  elif [ "$_sm_cfg" != "$_EFFECTIVE_MODEL" ]; then
+    # switchroom.yaml `model:` changed since the switch → the override is
+    # against a default that no longer exists. Invalidate + announce.
+    rm -f "{{agentDir}}/.session-model"
+    echo "session-model: configured default changed ('$_sm_cfg' → '$_EFFECTIVE_MODEL') — clearing session override '$_sm_model'" >&2
+    printf 'The configured default model changed (`%s` → `%s`), so your session override to `%s` was cleared — the agent booted on the new configured default. Re-issue /model %s if you still want it.\n' "$_sm_cfg" "$_EFFECTIVE_MODEL" "$_sm_model" "$_sm_model" > "{{agentDir}}/.session-model-alert" 2>/dev/null || true
+  elif [ -n "$_sm_ts" ] && [ $(( $(date +%s) * 1000 - _sm_ts )) -gt 604800000 ]; then
+    # 7-day staleness bound (belt-and-braces vs version-rollback resurrection
+    # and long-forgotten overrides).
+    rm -f "{{agentDir}}/.session-model"
+    echo "session-model: session override '$_sm_model' is older than 7 days — expiring it, using configured default '$_EFFECTIVE_MODEL'" >&2
+    printf 'Session model override `%s` expired (older than 7 days) — the agent booted on its configured default `%s`. Re-issue /model %s if you still want it.\n' "$_sm_model" "$_EFFECTIVE_MODEL" "$_sm_model" > "{{agentDir}}/.session-model-alert" 2>/dev/null || true
+  else
+    case "$_sm_model" in
       sr-*)
         if [ -z "$_LITELLM_OK" ]; then
-          _EFFECTIVE_MODEL={{{modelQ}}}
-          echo "session-model: LiteLLM proxy unreachable at boot — DROPPING sr-* override '$_override', booting on configured default '$_EFFECTIVE_MODEL' instead (would otherwise 4xx against Anthropic)" >&2
-          echo "session-model: the requested sr-* model is UNAVAILABLE this session; re-issue /model $_override once LiteLLM is reachable" >&2
-          printf 'LiteLLM proxy was unreachable at boot, so the session-only model switch to `%s` was dropped — the agent booted on its configured default `%s` instead. Re-issue /model %s once LiteLLM is reachable.\n' "$_override" "$_EFFECTIVE_MODEL" "$_override" > "{{agentDir}}/.session-model-alert" 2>/dev/null || true
+          # sr-* + LiteLLM unreachable: booting the override would 4xx against
+          # Anthropic. Boot the configured default but RETAIN the durable file
+          # — it re-applies on the next keep relaunch once the proxy is back.
+          echo "session-model: LiteLLM proxy unreachable at boot — NOT applying sr-* override '$_sm_model' this boot; booting configured default '$_EFFECTIVE_MODEL' (override retained, re-applies next relaunch)" >&2
+          printf 'LiteLLM proxy was unreachable at boot, so the session model override `%s` was not applied — the agent booted on its configured default `%s`. The override is retained and will re-apply on the next switchroom-managed relaunch once LiteLLM is reachable; /model default drops it.\n' "$_sm_model" "$_EFFECTIVE_MODEL" > "{{agentDir}}/.session-model-alert" 2>/dev/null || true
+        else
+          _EFFECTIVE_MODEL="$_sm_model"
         fi
         ;;
+      *)
+        _EFFECTIVE_MODEL="$_sm_model"
+        ;;
     esac
-  else
-    echo "session-model: ignoring malformed .session-model-override (failed shape gate) — using configured default '$_EFFECTIVE_MODEL'" >&2
+    if [ "$_EFFECTIVE_MODEL" = "$_sm_model" ]; then
+      echo "session-model: keeping session override '$_sm_model' across this switchroom-managed relaunch${_sm_reason:+ ($_sm_reason)}" >&2
+      printf 'Session model override `%s` kept across this relaunch%s. It reverts on /restart, agent restart, crash, or an external container restart; /model default clears it now.\n' "$_sm_model" "${_sm_reason:+ ($_sm_reason)}" > "{{agentDir}}/.session-model-alert" 2>/dev/null || true
+    fi
   fi
-  unset _override
+  unset _smf _sm_model _sm_cfg _sm_ts
 fi
+unset _sm_keep _sm_reason
 
 # sr-* passthrough→router repoint — ONE post-resolution gate covering BOTH the
 # /model override path AND the configured-default path (`model: sr-*` in
