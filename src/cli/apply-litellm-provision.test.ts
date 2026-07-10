@@ -30,9 +30,11 @@ vi.mock("../vault/broker/client.js", () => ({
 
 const ensureTeam = vi.fn();
 const ensureKey = vi.fn();
+const validateKey = vi.fn();
 vi.mock("../litellm/provision.js", () => ({
   ensureTeam: (...a: unknown[]) => ensureTeam(...a),
   ensureKey: (...a: unknown[]) => ensureKey(...a),
+  validateKey: (...a: unknown[]) => validateKey(...a),
 }));
 
 function makeConfig(): SwitchroomConfig {
@@ -151,6 +153,153 @@ describe("provisionLiteLLMKeys — broker-unreachable degrades to warning (#2781
     expect(failures).toHaveLength(1);
     expect(failures[0].agent).toBe("clerk");
     expect(failures[0].message).toMatch(/admin_key vault ref .* did not resolve/);
+  });
+});
+
+describe("provisionLiteLLMKeys — stored-key validation against the proxy (DB drift)", () => {
+  let prevPass: string | undefined;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    prevPass = process.env.SWITCHROOM_VAULT_PASSPHRASE;
+    process.env.SWITCHROOM_VAULT_PASSPHRASE = "test-passphrase";
+  });
+
+  afterEach(() => {
+    if (prevPass === undefined) delete process.env.SWITCHROOM_VAULT_PASSPHRASE;
+    else process.env.SWITCHROOM_VAULT_PASSPHRASE = prevPass;
+  });
+
+  it("stored key VALID on the proxy → skip, no re-provision", async () => {
+    getViaBrokerStructured.mockResolvedValue({
+      kind: "ok",
+      entry: { kind: "string", value: "sk-stored" },
+    });
+    validateKey.mockResolvedValue({ kind: "valid" });
+
+    const { ctx, failures, out } = makeSinks();
+    await provisionLiteLLMKeys(makeConfig(), ["clerk"], undefined, ctx);
+
+    expect(failures).toEqual([]);
+    expect(ensureKey).not.toHaveBeenCalled();
+    expect(putViaBroker).not.toHaveBeenCalled();
+    expect(out.join("")).toMatch(/already provisioned \+ validated/);
+  });
+
+  it("stored key UNKNOWN on the proxy (DB drift) → re-provision + rewrite vault", async () => {
+    getViaBrokerStructured.mockResolvedValue({
+      kind: "ok",
+      entry: { kind: "string", value: "sk-stale" },
+    });
+    validateKey.mockResolvedValue({ kind: "unknown" });
+    ensureKey.mockResolvedValue({ key: "sk-fresh" });
+    putViaBroker.mockResolvedValue({ kind: "ok" });
+
+    const { ctx, failures, errs } = makeSinks();
+    await provisionLiteLLMKeys(makeConfig(), ["clerk"], undefined, ctx);
+
+    expect(failures).toEqual([]);
+    expect(ensureKey).toHaveBeenCalledTimes(1);
+    // The fresh key was written back to the vault.
+    expect(putViaBroker).toHaveBeenCalledWith(
+      "litellm/clerk/api-key",
+      { kind: "string", value: "sk-fresh" },
+      expect.objectContaining({ passphrase: "test-passphrase" }),
+    );
+    expect(errs.join("")).toMatch(/not recognized by the proxy \(DB drift\)/);
+  });
+
+  it("proxy UNREACHABLE during validation → keep stored key, warn, never fail (#2781)", async () => {
+    getViaBrokerStructured.mockResolvedValue({
+      kind: "ok",
+      entry: { kind: "string", value: "sk-stored" },
+    });
+    validateKey.mockResolvedValue({ kind: "unreachable", detail: "ECONNREFUSED" });
+
+    const { ctx, failures, errs } = makeSinks();
+    await provisionLiteLLMKeys(makeConfig(), ["clerk"], undefined, ctx);
+
+    expect(failures).toEqual([]);
+    expect(ensureKey).not.toHaveBeenCalled();
+    expect(putViaBroker).not.toHaveBeenCalled();
+    expect(errs.join("")).toMatch(/proxy unreachable during key validation/);
+    expect(errs.join("")).toMatch(/keeping the stored key unverified/);
+  });
+});
+
+describe("provisionLiteLLMKeys — passphrase-less hindsight probe (fix 3)", () => {
+  let prevPass: string | undefined;
+
+  function makeHindsightConfig(): SwitchroomConfig {
+    return {
+      switchroom: { version: 1 },
+      telegram: { bot_token: "123:TEST", forum_chat_id: "-1001" },
+      litellm: {
+        enabled: true,
+        base_url: "http://127.0.0.1:4010",
+        admin_key: "sk-master-test",
+        team: "switchroom",
+      },
+      memory: { backend: "hindsight" },
+      // No litellm-opted agents — isolate the hindsight-service path.
+      agents: {},
+    } as unknown as SwitchroomConfig;
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    prevPass = process.env.SWITCHROOM_VAULT_PASSPHRASE;
+    // Force the null-passphrase branch.
+    delete process.env.SWITCHROOM_VAULT_PASSPHRASE;
+  });
+
+  afterEach(() => {
+    if (prevPass === undefined) delete process.env.SWITCHROOM_VAULT_PASSPHRASE;
+    else process.env.SWITCHROOM_VAULT_PASSPHRASE = prevPass;
+  });
+
+  it("hindsight key ALREADY provisioned → NO spurious failure (the fix)", async () => {
+    // The probe finds the service key present.
+    getViaBrokerStructured.mockResolvedValue({
+      kind: "ok",
+      entry: { kind: "string", value: "sk-hindsight" },
+    });
+
+    const { ctx, failures, out } = makeSinks();
+    await provisionLiteLLMKeys(makeHindsightConfig(), [], undefined, {
+      ...ctx,
+      home: "/nonexistent-home-for-test",
+    });
+
+    // Pre-fix this pushed a "hindsight (service)" failure on EVERY passphrase-
+    // less apply even though the key was present. It must now be clean.
+    expect(failures).toEqual([]);
+    expect(out.join("")).toMatch(/litellm\/hindsight: key already provisioned/);
+  });
+
+  it("hindsight key genuinely MISSING → still surfaced as a failure", async () => {
+    getViaBrokerStructured.mockResolvedValue({ kind: "not_found" });
+
+    const { ctx, failures } = makeSinks();
+    await provisionLiteLLMKeys(makeHindsightConfig(), [], undefined, {
+      ...ctx,
+      home: "/nonexistent-home-for-test",
+    });
+
+    expect(failures.some((f) => f.agent === "hindsight (service)")).toBe(true);
+  });
+
+  it("hindsight probe UNREACHABLE → degrade to warning, not a failure (#2781 parity)", async () => {
+    getViaBrokerStructured.mockResolvedValue({ kind: "unreachable", msg: "no broker socket" });
+
+    const { ctx, failures, errs } = makeSinks();
+    await provisionLiteLLMKeys(makeHindsightConfig(), [], undefined, {
+      ...ctx,
+      home: "/nonexistent-home-for-test",
+    });
+
+    expect(failures).toEqual([]);
+    expect(errs.join("")).toMatch(/litellm\/hindsight: vault-broker unreachable/);
   });
 });
 

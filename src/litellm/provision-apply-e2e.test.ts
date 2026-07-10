@@ -122,10 +122,24 @@ describe("provisionLiteLLMKeys — real broker e2e (blocker-1 seam)", () => {
       if (u.endsWith("/team/new")) {
         return new Response(JSON.stringify({ team_id: "t1" }), { status: 200 });
       }
-      if (u.endsWith("/key/generate")) {
+      if (u.includes("/key/generate")) {
         return new Response(JSON.stringify({ key: "sk-virtual-clerk-xyz" }), {
           status: 200,
         });
+      }
+      // Fix-2 validation probe: any stored key we might validate is "valid".
+      if (u.includes("/key/info")) {
+        return new Response(JSON.stringify({ key: "sk-virtual-clerk-xyz", info: {} }), {
+          status: 200,
+        });
+      }
+      // Fix-1 orphaned-alias self-heal helpers (not exercised on the clean
+      // generate path here, but kept coherent so an accidental hit succeeds).
+      if (u.includes("/key/list")) {
+        return new Response(JSON.stringify({ keys: [] }), { status: 200 });
+      }
+      if (u.includes("/key/delete")) {
+        return new Response(JSON.stringify({}), { status: 200 });
       }
       return new Response("not found", { status: 404 });
     }) as unknown as typeof fetch;

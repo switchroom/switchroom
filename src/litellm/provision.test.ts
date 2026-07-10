@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   ensureTeam,
   ensureKey,
+  validateKey,
   LiteLLMProvisionError,
   type FetchFn,
 } from "./provision.js";
@@ -161,5 +162,236 @@ describe("ensureKey", () => {
     await expect(
       ensureKey({ baseUrl: "http://h", masterKey: "m", alias: "a" }, fetchFn),
     ).rejects.toThrow(/socket hang up/);
+  });
+});
+
+/**
+ * Orphaned-alias self-heal: LiteLLM enforces unique key aliases (upstream
+ * #9730). If a prior apply generated `agent:<name>` but crashed before the
+ * vault write, the alias lives in LiteLLM with no recoverable key and every
+ * later /key/generate hard-fails with 400 "already exists". ensureKey must
+ * recover by deleting the orphan and regenerating.
+ */
+describe("ensureKey — orphaned-alias self-heal", () => {
+  interface Call {
+    method: string;
+    url: string;
+    body: Record<string, unknown> | null;
+  }
+
+  /** A URL/method router that also records every call for assertions. */
+  function makeRouter(
+    handlers: {
+      generate: () => ReturnType<typeof mockResponse>;
+      list?: () => ReturnType<typeof mockResponse>;
+      delete?: () => ReturnType<typeof mockResponse>;
+    },
+    calls: Call[],
+  ): FetchFn {
+    return async (url, init) => {
+      const u = String(url);
+      const method = init?.method ?? "GET";
+      const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : null;
+      calls.push({ method, url: u, body });
+      if (u.includes("/key/generate")) return handlers.generate();
+      if (u.includes("/key/list")) return (handlers.list ?? (() => mockResponse({ ok: true, status: 200, json: { keys: [] } })))();
+      if (u.includes("/key/delete")) return (handlers.delete ?? (() => mockResponse({ ok: true, status: 200, json: {} })))();
+      return mockResponse({ ok: false, status: 404, text: "not found" });
+    };
+  }
+
+  it("clean generate: one POST, no delete round-trip", async () => {
+    const calls: Call[] = [];
+    const fetchFn = makeRouter(
+      { generate: () => mockResponse({ ok: true, status: 200, json: { key: "sk-clean" } }) },
+      calls,
+    );
+    const result = await ensureKey(
+      { baseUrl: "http://h", masterKey: "m", alias: "agent:clerk", team: "switchroom" },
+      fetchFn,
+    );
+    expect(result).toEqual({ key: "sk-clean" });
+    // Exactly one call — no /key/list or /key/delete on the happy path.
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toContain("/key/generate");
+  });
+
+  it("recovers a duplicate alias: delete the orphan (by token + alias), then regenerate", async () => {
+    const calls: Call[] = [];
+    let generateCount = 0;
+    const logs: string[] = [];
+    const fetchFn = makeRouter(
+      {
+        generate: () => {
+          generateCount += 1;
+          if (generateCount === 1) {
+            return mockResponse({
+              ok: false,
+              status: 400,
+              text: "Key with alias agent:clerk already exists in DB",
+            });
+          }
+          return mockResponse({ ok: true, status: 200, json: { key: "sk-fresh" } });
+        },
+        list: () =>
+          mockResponse({
+            ok: true,
+            status: 200,
+            json: { keys: [{ token: "hashed-orphan-token", key_alias: "agent:clerk" }] },
+          }),
+        delete: () => mockResponse({ ok: true, status: 200, json: {} }),
+      },
+      calls,
+    );
+
+    const result = await ensureKey(
+      { baseUrl: "http://h", masterKey: "m", alias: "agent:clerk", team: "switchroom", log: (m) => logs.push(m) },
+      fetchFn,
+    );
+
+    expect(result).toEqual({ key: "sk-fresh" });
+    // Call sequence: generate(400) → list → delete → generate(200).
+    const seq = calls.map((c) => `${c.method} ${c.url.split("?")[0]!.replace("http://h", "")}`);
+    expect(seq).toEqual([
+      "POST /key/generate",
+      "GET /key/list",
+      "POST /key/delete",
+      "POST /key/generate",
+    ]);
+    // The delete carries BOTH the resolved token and the alias (belt + braces).
+    const del = calls.find((c) => c.url.includes("/key/delete"))!;
+    expect(del.body).toEqual({
+      key_aliases: ["agent:clerk"],
+      keys: ["hashed-orphan-token"],
+    });
+    // It logged the self-heal.
+    expect(logs.join("\n")).toMatch(/orphaned|self-healing|already exists/i);
+  });
+
+  it("recovers even when /key/list resolves no token (deletes by alias only)", async () => {
+    const calls: Call[] = [];
+    let generateCount = 0;
+    const fetchFn = makeRouter(
+      {
+        generate: () => {
+          generateCount += 1;
+          return generateCount === 1
+            ? mockResponse({ ok: false, status: 400, text: "key alias already exists" })
+            : mockResponse({ ok: true, status: 200, json: { key: "sk-by-alias" } });
+        },
+        list: () => mockResponse({ ok: true, status: 200, json: { keys: [] } }),
+        delete: () => mockResponse({ ok: true, status: 200, json: {} }),
+      },
+      calls,
+    );
+    const result = await ensureKey(
+      { baseUrl: "http://h", masterKey: "m", alias: "agent:bob" },
+      fetchFn,
+    );
+    expect(result).toEqual({ key: "sk-by-alias" });
+    const del = calls.find((c) => c.url.includes("/key/delete"))!;
+    // No `keys` field when the list resolved nothing — alias-only delete.
+    expect(del.body).toEqual({ key_aliases: ["agent:bob"] });
+  });
+
+  it("delete FAILS: surfaces a clear error naming the manual remediation", async () => {
+    const calls: Call[] = [];
+    const fetchFn = makeRouter(
+      {
+        generate: () => mockResponse({ ok: false, status: 400, text: "alias already exists" }),
+        list: () => mockResponse({ ok: true, status: 200, json: { keys: [] } }),
+        delete: () => mockResponse({ ok: false, status: 500, text: "internal error" }),
+      },
+      calls,
+    );
+    try {
+      await ensureKey({ baseUrl: "http://h", masterKey: "m", alias: "agent:zoe" }, fetchFn);
+      throw new Error("expected throw");
+    } catch (err) {
+      expect(err).toBeInstanceOf(LiteLLMProvisionError);
+      const msg = (err as LiteLLMProvisionError).message;
+      expect(msg).toMatch(/key\/delete/);
+      expect(msg).toMatch(/Manual remediation/);
+      expect(msg).toMatch(/key_aliases.*agent:zoe/);
+    }
+    // We never got to the second generate.
+    expect(calls.filter((c) => c.url.includes("/key/generate"))).toHaveLength(1);
+  });
+
+  it("second generate STILL duplicate after delete: distinct error naming remediation", async () => {
+    const calls: Call[] = [];
+    const fetchFn = makeRouter(
+      {
+        generate: () => mockResponse({ ok: false, status: 400, text: "alias already exists" }),
+        list: () => mockResponse({ ok: true, status: 200, json: { keys: [] } }),
+        delete: () => mockResponse({ ok: true, status: 200, json: {} }),
+      },
+      calls,
+    );
+    await expect(
+      ensureKey({ baseUrl: "http://h", masterKey: "m", alias: "agent:kay" }, fetchFn),
+    ).rejects.toThrow(/still reports alias .* already exists after deleting/);
+  });
+});
+
+describe("validateKey", () => {
+  it("returns valid on a 200 from /key/info", async () => {
+    const calls: string[] = [];
+    const fetchFn: FetchFn = async (url) => {
+      calls.push(String(url));
+      return mockResponse({ ok: true, status: 200, json: { key: "sk-x", info: {} } });
+    };
+    const r = await validateKey({ baseUrl: "http://h", masterKey: "m", key: "sk-x" }, fetchFn);
+    expect(r).toEqual({ kind: "valid" });
+    expect(calls[0]).toContain("/key/info?key=sk-x");
+  });
+
+  it("returns unknown on a 400 'not found' (DB drift)", async () => {
+    const fetchFn: FetchFn = async () =>
+      mockResponse({ ok: false, status: 400, text: "Authentication Error: Key not found in DB" });
+    const r = await validateKey({ baseUrl: "http://h", masterKey: "m", key: "sk-gone" }, fetchFn);
+    expect(r).toEqual({ kind: "unknown" });
+  });
+
+  it("returns unreachable on a network error (never re-provisions)", async () => {
+    const fetchFn: FetchFn = async () => {
+      throw new Error("ECONNREFUSED");
+    };
+    const r = await validateKey({ baseUrl: "http://h", masterKey: "m", key: "sk-x" }, fetchFn);
+    expect(r.kind).toBe("unreachable");
+    expect((r as { detail: string }).detail).toMatch(/ECONNREFUSED/);
+  });
+
+  it("returns unknown on a 401 with a clear not-found semantic (auth-path drift shape)", async () => {
+    // Some LiteLLM auth-path shapes report an unknown virtual key as a 401
+    // "Authentication Error: Key not found" — that IS drift, not a bad master
+    // key, so it must trigger re-provisioning.
+    const fetchFn: FetchFn = async () =>
+      mockResponse({ ok: false, status: 401, text: "Authentication Error: Key not found in DB" });
+    const r = await validateKey({ baseUrl: "http://h", masterKey: "m", key: "sk-gone" }, fetchFn);
+    expect(r).toEqual({ kind: "unknown" });
+  });
+
+  it("treats a BARE 401 (bad master key, no not-found semantic) as unreachable, NOT unknown", async () => {
+    const fetchFn: FetchFn = async () =>
+      mockResponse({ ok: false, status: 401, text: "Authentication Error: invalid master key" });
+    const r = await validateKey({ baseUrl: "http://h", masterKey: "bad", key: "sk-x" }, fetchFn);
+    expect(r.kind).toBe("unreachable");
+  });
+
+  it("treats a non-drift 400 'invalid' body as unreachable (no unnecessary key churn)", async () => {
+    // "invalid" alone is NOT a drift signal — a malformed-request 400 must not
+    // trigger a destructive re-provision.
+    const fetchFn: FetchFn = async () =>
+      mockResponse({ ok: false, status: 400, text: "invalid request: bad key format" });
+    const r = await validateKey({ baseUrl: "http://h", masterKey: "m", key: "sk-x" }, fetchFn);
+    expect(r.kind).toBe("unreachable");
+  });
+
+  it("treats a 500 as unreachable, NOT unknown", async () => {
+    const fetchFn: FetchFn = async () =>
+      mockResponse({ ok: false, status: 500, text: "internal server error" });
+    const r = await validateKey({ baseUrl: "http://h", masterKey: "m", key: "sk-x" }, fetchFn);
+    expect(r.kind).toBe("unreachable");
   });
 });
