@@ -568,6 +568,7 @@ import {
   clearCleanShutdownMarker,
   shouldSuppressRecoveryBanner,
   shouldSuppressBootResume,
+  parseBootResumeMode,
   resolveShutdownMarker,
   DEFAULT_MAX_AGE_MS as CLEAN_SHUTDOWN_MAX_AGE_MS,
 } from './clean-shutdown-marker.js'
@@ -684,7 +685,8 @@ import {
 import {
   buildResumeInterruptedInbound,
   buildResumeWatchdogReportInbound,
-  selectResumeBuilder,
+  buildResumeDeferredReportInbound,
+  decideBootResumeKind,
 } from './resume-inbound-builder.js'
 import { applySubagentsSchema, getSubagentByJsonlId, resolveSubagentOriginTurnKey } from '../registry/subagents-schema.js'
 import { resolveWorkerFeedDispatch, type WorkerFeedDispatch } from './worker-feed-dispatch.js'
@@ -1497,70 +1499,98 @@ try {
   const pending = findLatestTurnIfInterrupted(turnsDb)
   const selfAgent = process.env.SWITCHROOM_AGENT_NAME ?? ''
   if (pending != null && selfAgent) {
-    // Clean-shutdown gate: suppress auto-resume when the prior shutdown was
-    // operator/roll/CLI-initiated (clean). A clean-shutdown marker present and
-    // fresh means the agent was asked to stop; the "interrupted" turn was
-    // abandoned by that decision. Replaying it on every planned restart wastes
-    // subscription quota for no user benefit. Only unclean exits (crash/OOM/
-    // unexpected kill) should auto-resume.
+    // Boot-resume policy (2026-07, superseding #2585). The block only runs
+    // when `pending` exists — i.e. there IS genuinely in-flight work. The
+    // product decision is that a DELIBERATE restart must not silently drop
+    // that work: `session_continuity.boot_resume` (SWITCHROOM_BOOT_RESUME,
+    // default 'in-flight') resumes it even after a clean shutdown. #2585's
+    // quota-saving posture survives only as the opt-in 'never' mode — and
+    // even then we deliver a passive REPORT, never silence, because the user
+    // must always be told when in-flight work stopped.
     //
     // NOTE: GATEWAY_CLEAN_SHUTDOWN_MARKER_PATH is defined lower in this file
     // (module-init order); we compute the path inline here using the same
     // formula so we can read it at boot-resume time.
-    // SWITCHROOM_BOOT_RESUME_ALWAYS=1 is an escape hatch that restores
-    // unconditional resume if needed.
+    // SWITCHROOM_BOOT_RESUME_ALWAYS=1 remains a back-compat escape hatch that
+    // forces unconditional resume regardless of mode.
     const bootResumeMarkerPath =
       process.env.SWITCHROOM_GATEWAY_CLEAN_SHUTDOWN_MARKER ?? join(STATE_DIR, 'clean-shutdown.json')
     const bootResumeCleanMarker = readCleanShutdownMarker(bootResumeMarkerPath)
     const bootResumeForceAlways = process.env.SWITCHROOM_BOOT_RESUME_ALWAYS === '1'
+    const bootResumeMode = parseBootResumeMode(process.env.SWITCHROOM_BOOT_RESUME)
     const bootResumeSuppressed = shouldSuppressBootResume(bootResumeCleanMarker, Date.now(), {
       forceAlways: bootResumeForceAlways,
+      mode: bootResumeMode,
     })
-    if (bootResumeSuppressed) {
+
+    // 3h staleness failsafe (operator spec, 2026-06-03): never AUTO-resume
+    // interrupted work older than RESUME_MAX_AGE_MS — selectResumeBuilder
+    // downgrades a stale 'resume' to the passive 'report'. Env override
+    // SWITCHROOM_RESUME_MAX_AGE_MS (ms); set very high to disable.
+    const RESUME_MAX_AGE_MS = (() => {
+      const v = Number(process.env.SWITCHROOM_RESUME_MAX_AGE_MS)
+      return Number.isFinite(v) && v > 0 ? v : 10_800_000 // 3h
+    })()
+
+    // Decide the inbound kind (pure — see decideBootResumeKind). Precedence:
+    //   1. loop-guard  → 'defer-loop'       (never a second resume of a resume)
+    //   2. suppressed  → 'defer-suppressed' (boot_resume: never; notice, not silence)
+    //   3. otherwise   → selectResumeBuilder (resume | report | none)
+    const bootResumeKind = decideBootResumeKind({
+      pending,
+      suppressed: bootResumeSuppressed,
+      ageMs: Math.max(0, Date.now() - pending.started_at),
+      maxAgeMs: RESUME_MAX_AGE_MS,
+    })
+
+    if (bootResumeKind === 'resume') {
+      bootResumeInbound = { agent: selfAgent, msg: buildResumeInterruptedInbound({ turn: pending }) }
+    } else if (bootResumeKind === 'report') {
+      // idleMs: this boot's measured marker age if it just classified this
+      // turn; otherwise recover it from the persisted interrupt_reason (a
+      // later boot, marker already swept); else fall back to total runtime.
+      let idleMs = pending.turn_key === timeoutTurnKey && markerAgeMs != null ? markerAgeMs : null
+      if (idleMs == null && pending.interrupt_reason) {
+        try {
+          const parsed = JSON.parse(pending.interrupt_reason) as { idleMs?: unknown }
+          if (typeof parsed.idleMs === 'number' && Number.isFinite(parsed.idleMs)) idleMs = parsed.idleMs
+        } catch { /* malformed snapshot — fall through */ }
+      }
+      if (idleMs == null) idleMs = Math.max(0, Date.now() - pending.started_at)
+      bootResumeInbound = {
+        agent: selfAgent,
+        msg: buildResumeWatchdogReportInbound({ turn: pending, idleMs }),
+      }
+    } else if (bootResumeKind === 'defer-loop' || bootResumeKind === 'defer-suppressed') {
+      // Passive deferred-report: work was in flight but we decline to
+      // auto-resume (loop-guard, or boot_resume:never). Silence is never
+      // acceptable here — tell the user what was in flight and ask.
+      bootResumeInbound = {
+        agent: selfAgent,
+        msg: buildResumeDeferredReportInbound({
+          turn: pending,
+          reason: bootResumeKind === 'defer-loop' ? 'loop-guard' : 'clean-restart-suppressed',
+        }),
+      }
+    }
+
+    if (bootResumeKind === 'defer-suppressed') {
       process.stderr.write(
         `telegram gateway: boot-resume suppressed (clean shutdown` +
         `${bootResumeCleanMarker?.reason ? ` reason=${JSON.stringify(bootResumeCleanMarker.reason)}` : ''}` +
-        `) — unclean exits still resume turnKey=${pending.turn_key}\n`,
+        `, mode=${bootResumeMode}) — passive report delivered for turnKey=${pending.turn_key}\n`,
       )
-    } else {
-      // 3h staleness failsafe (operator spec, 2026-06-03): never AUTO-resume
-      // interrupted work older than RESUME_MAX_AGE_MS — selectResumeBuilder
-      // downgrades a stale 'resume' to the passive 'report' so the user is told
-      // ("I was working on X ~Nh ago") but nothing replays unprompted. Env
-      // override SWITCHROOM_RESUME_MAX_AGE_MS (ms); set very high to disable.
-      const RESUME_MAX_AGE_MS = (() => {
-        const v = Number(process.env.SWITCHROOM_RESUME_MAX_AGE_MS)
-        return Number.isFinite(v) && v > 0 ? v : 10_800_000 // 3h
-      })()
-      const kind = selectResumeBuilder(pending.ended_via, {
-        ageMs: Math.max(0, Date.now() - pending.started_at),
-        maxAgeMs: RESUME_MAX_AGE_MS,
-      })
-      if (kind === 'resume') {
-        bootResumeInbound = { agent: selfAgent, msg: buildResumeInterruptedInbound({ turn: pending }) }
-      } else if (kind === 'report') {
-        // idleMs: this boot's measured marker age if it just classified this
-        // turn; otherwise recover it from the persisted interrupt_reason (a
-        // later boot, marker already swept); else fall back to total runtime.
-        let idleMs = pending.turn_key === timeoutTurnKey && markerAgeMs != null ? markerAgeMs : null
-        if (idleMs == null && pending.interrupt_reason) {
-          try {
-            const parsed = JSON.parse(pending.interrupt_reason) as { idleMs?: unknown }
-            if (typeof parsed.idleMs === 'number' && Number.isFinite(parsed.idleMs)) idleMs = parsed.idleMs
-          } catch { /* malformed snapshot — fall through */ }
-        }
-        if (idleMs == null) idleMs = Math.max(0, Date.now() - pending.started_at)
-        bootResumeInbound = {
-          agent: selfAgent,
-          msg: buildResumeWatchdogReportInbound({ turn: pending, idleMs }),
-        }
-      }
-      if (bootResumeInbound != null) {
-        process.stderr.write(
-          `telegram gateway: boot-resume queued kind=${kind} turnKey=${pending.turn_key} ` +
-          `endedVia=${pending.ended_via ?? 'open'} chat=${pending.chat_id}\n`,
-        )
-      }
+    } else if (bootResumeKind === 'defer-loop') {
+      process.stderr.write(
+        `telegram gateway: boot-resume loop-guard tripped (interrupted turn was itself a resume) ` +
+        `— passive report delivered instead of re-resuming turnKey=${pending.turn_key}\n`,
+      )
+    }
+    if (bootResumeInbound != null) {
+      process.stderr.write(
+        `telegram gateway: boot-resume queued kind=${bootResumeKind} mode=${bootResumeMode} ` +
+        `turnKey=${pending.turn_key} endedVia=${pending.ended_via ?? 'open'} chat=${pending.chat_id}\n`,
+      )
     }
   }
 

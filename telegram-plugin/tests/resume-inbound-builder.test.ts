@@ -18,7 +18,11 @@ import {
   humanizeElapsed,
   buildResumeInterruptedInbound,
   buildResumeWatchdogReportInbound,
+  buildResumeDeferredReportInbound,
+  isResumeSyntheticTurn,
   selectResumeBuilder,
+  decideBootResumeKind,
+  RESUME_SYNTHETIC_PROMPT_PREFIX,
 } from '../gateway/resume-inbound-builder.js'
 import type { Turn, TurnEndedVia } from '../registry/turns-schema.js'
 
@@ -241,5 +245,136 @@ describe('selectResumeBuilder', () => {
   it('legacy behaviour preserved when age/maxAge omitted (blanket resume)', () => {
     expect(selectResumeBuilder('restart')).toBe('resume')
     expect(selectResumeBuilder('restart', { ageMs: MAX + 1 })).toBe('resume') // needs BOTH to cap
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Loop-guard: RESUME_SYNTHETIC_PROMPT_PREFIX / isResumeSyntheticTurn
+// ---------------------------------------------------------------------------
+
+describe('resume synthetic-turn detection (loop-guard anchor)', () => {
+  it('EVERY synthetic boot inbound text starts with the machine-stable prefix', () => {
+    // The loop-guard keys on this prefix landing in user_prompt_preview, so if
+    // a prose edit drops it the chain-cap silently breaks. Pin it here.
+    const turn = makeTurn({ user_prompt_preview: 'do the thing' })
+    expect(buildResumeInterruptedInbound({ turn }).text.startsWith(RESUME_SYNTHETIC_PROMPT_PREFIX)).toBe(true)
+    expect(
+      buildResumeWatchdogReportInbound({ turn: makeTurn({ ended_via: 'timeout' }), idleMs: 1000 }).text.startsWith(
+        RESUME_SYNTHETIC_PROMPT_PREFIX,
+      ),
+    ).toBe(true)
+    expect(
+      buildResumeDeferredReportInbound({ turn, reason: 'loop-guard' }).text.startsWith(
+        RESUME_SYNTHETIC_PROMPT_PREFIX,
+      ),
+    ).toBe(true)
+    expect(
+      buildResumeDeferredReportInbound({ turn, reason: 'clean-restart-suppressed' }).text.startsWith(
+        RESUME_SYNTHETIC_PROMPT_PREFIX,
+      ),
+    ).toBe(true)
+  })
+
+  it('isResumeSyntheticTurn is true for a turn whose preview is a synthetic prompt', () => {
+    const synthetic = buildResumeInterruptedInbound({ turn: makeTurn() })
+    // A resume turn stores the first ~200 chars of the synthetic text as its
+    // preview (channel wrapper stripped) — simulate that.
+    const resumeTurn = makeTurn({ user_prompt_preview: synthetic.text.slice(0, 200) })
+    expect(isResumeSyntheticTurn(resumeTurn)).toBe(true)
+  })
+
+  it('isResumeSyntheticTurn is false for real user work and for null preview', () => {
+    expect(isResumeSyntheticTurn(makeTurn({ user_prompt_preview: 'refactor the auth module' }))).toBe(false)
+    expect(isResumeSyntheticTurn(makeTurn({ user_prompt_preview: null }))).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// buildResumeDeferredReportInbound
+// ---------------------------------------------------------------------------
+
+describe('buildResumeDeferredReportInbound', () => {
+  it('emits source=resume_deferred and carries the dedup anchor + reason', () => {
+    const turn = makeTurn({ turn_key: 'zz:3' })
+    const msg = buildResumeDeferredReportInbound({ turn, reason: 'loop-guard' })
+    expect(msg.meta.source).toBe('resume_deferred')
+    expect(msg.meta.resume_turn_key).toBe('zz:3')
+    expect(msg.meta.defer_reason).toBe('loop-guard')
+  })
+
+  it('loop-guard framing tells the model the chain was capped, not to resume', () => {
+    const msg = buildResumeDeferredReportInbound({ turn: makeTurn(), reason: 'loop-guard' })
+    expect(msg.text.toLowerCase()).toContain('resume of earlier interrupted work')
+    expect(msg.text).toContain('Do NOT silently resume')
+  })
+
+  it('clean-restart-suppressed framing cites boot_resume: never', () => {
+    const msg = buildResumeDeferredReportInbound({ turn: makeTurn(), reason: 'clean-restart-suppressed' })
+    expect(msg.text).toContain('boot_resume: never')
+    expect(msg.text).toContain('Do NOT silently resume')
+  })
+
+  it('routes to the origin thread when the turn carried one', () => {
+    const turn = makeTurn({ chat_id: '-100999', thread_id: '77' })
+    const msg = buildResumeDeferredReportInbound({ turn, reason: 'loop-guard' })
+    expect(msg.chatId).toBe('-100999')
+    expect(msg.threadId).toBe(77)
+    expect(msg.meta.message_thread_id).toBe('77')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// decideBootResumeKind — boot-resume precedence + bounded resume chain
+// ---------------------------------------------------------------------------
+
+describe('decideBootResumeKind', () => {
+  const MAX = 10_800_000 // 3h
+
+  it('resumes genuinely in-flight work after a deliberate restart (not suppressed)', () => {
+    // The core product fix: clean restart mid-turn → resume, not silence.
+    const pending = makeTurn({ ended_via: 'restart', user_prompt_preview: 'ship the release' })
+    expect(decideBootResumeKind({ pending, suppressed: false, ageMs: 1000, maxAgeMs: MAX })).toBe('resume')
+  })
+
+  it("boot_resume:never (suppressed) → 'defer-suppressed' passive report, never silence", () => {
+    const pending = makeTurn({ ended_via: 'restart', user_prompt_preview: 'ship the release' })
+    expect(decideBootResumeKind({ pending, suppressed: true, ageMs: 1000, maxAgeMs: MAX })).toBe('defer-suppressed')
+  })
+
+  it('watchdog timeout still reports even when not suppressed', () => {
+    const pending = makeTurn({ ended_via: 'timeout', user_prompt_preview: 'ship the release' })
+    expect(decideBootResumeKind({ pending, suppressed: false, ageMs: 1000, maxAgeMs: MAX })).toBe('report')
+  })
+
+  it('BOUNDED CHAIN: a restart DURING a resume turn does NOT re-resume — loop-guard fires', () => {
+    // Simulate the chain the coordinator flagged:
+    //   A: real work, interrupted → resume R1 (turn B created from R1's text)
+    //   restart lands during B → pending is B, whose preview IS the synthetic
+    //   resume prompt. We must NOT mint a second resume (endless loop risk).
+    const r1 = buildResumeInterruptedInbound({ turn: makeTurn({ user_prompt_preview: 'real work' }) })
+    const turnB = makeTurn({ ended_via: 'restart', user_prompt_preview: r1.text.slice(0, 200) })
+    // Even though NOT suppressed (would normally resume), the loop-guard wins:
+    expect(decideBootResumeKind({ pending: turnB, suppressed: false, ageMs: 1000, maxAgeMs: MAX })).toBe('defer-loop')
+  })
+
+  it('BOUNDED CHAIN: a restart during a deferred-report turn stays capped (still defer-loop, never resume)', () => {
+    // Depth does not grow: a report-of-report is still a passive report, never
+    // a resume — so no unbounded restart→resume→restart chain can form.
+    const deferred = buildResumeDeferredReportInbound({ turn: makeTurn(), reason: 'loop-guard' })
+    const turnC = makeTurn({ ended_via: 'restart', user_prompt_preview: deferred.text.slice(0, 200) })
+    const kind = decideBootResumeKind({ pending: turnC, suppressed: false, ageMs: 1000, maxAgeMs: MAX })
+    expect(kind).toBe('defer-loop')
+    expect(kind).not.toBe('resume')
+  })
+
+  it('loop-guard takes precedence over suppression too (synthetic turn never resumes or double-reports as resume)', () => {
+    const r1 = buildResumeInterruptedInbound({ turn: makeTurn() })
+    const turnB = makeTurn({ ended_via: 'restart', user_prompt_preview: r1.text.slice(0, 200) })
+    expect(decideBootResumeKind({ pending: turnB, suppressed: true, ageMs: 1000, maxAgeMs: MAX })).toBe('defer-loop')
+  })
+
+  it('stale in-flight work downgrades to report when older than maxAgeMs', () => {
+    const pending = makeTurn({ ended_via: 'restart', user_prompt_preview: 'stale work' })
+    expect(decideBootResumeKind({ pending, suppressed: false, ageMs: MAX + 1, maxAgeMs: MAX })).toBe('report')
   })
 })

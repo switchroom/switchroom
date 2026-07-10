@@ -88,7 +88,8 @@ export function spoolId(msg: InboundMessage): string {
   // given turn can only be one or the other.
   if (
     (msg.meta?.source === 'resume_interrupted' ||
-      msg.meta?.source === 'resume_watchdog_timeout') &&
+      msg.meta?.source === 'resume_watchdog_timeout' ||
+      msg.meta?.source === 'resume_deferred') &&
     typeof msg.meta?.resume_turn_key === 'string' &&
     msg.meta.resume_turn_key.length > 0
   ) {

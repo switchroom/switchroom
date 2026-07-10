@@ -57,6 +57,36 @@ export interface ResumeInboundContext {
   nowMs?: number
 }
 
+/**
+ * Machine-stable leading token shared by EVERY synthetic boot inbound this
+ * module mints (resume, watchdog-report, deferred-report). It is the anchor
+ * the loop-guard keys on: a turn whose `user_prompt_preview` starts with
+ * this string was itself started by a synthetic boot inbound, so building
+ * ANOTHER resume for it would replay already-resumed work and could chain
+ * unboundedly across repeated restarts.
+ *
+ * `extractUserPromptPreview` strips the `<channel …>` wrapper before storing
+ * the preview, so the stored text begins with this prose prefix (not the
+ * `meta.source` attribute, which the preview drops). Every builder below
+ * MUST keep this as the first characters of its `text`; `resume-inbound-
+ * builder.test.ts` pins that contract so a prose edit can't silently break
+ * the loop-guard.
+ */
+export const RESUME_SYNTHETIC_PROMPT_PREFIX = 'You just restarted.'
+
+/**
+ * Loop-guard predicate: was this interrupted turn ITSELF started by one of
+ * this module's synthetic boot inbounds? Detected via the stored
+ * `user_prompt_preview` prefix. Used at boot to cap the auto-resume chain at
+ * depth 1 — a resume turn that is itself interrupted is NOT re-resumed
+ * (which would double-execute the resumed side effects and could loop
+ * forever); the caller downgrades to a passive deferred-report instead.
+ */
+export function isResumeSyntheticTurn(turn: Turn): boolean {
+  const p = turn.user_prompt_preview
+  return typeof p === 'string' && p.startsWith(RESUME_SYNTHETIC_PROMPT_PREFIX)
+}
+
 function threadIdNum(turn: Turn): number | undefined {
   if (turn.thread_id == null) return undefined
   const n = Number(turn.thread_id)
@@ -191,6 +221,121 @@ export function buildResumeWatchdogReportInbound(
       `whether they want you to retry it or take a different angle. Report ` +
       `only the honest cause — no observable progress for that long — don't ` +
       `speculate about a deeper root cause you can't see.`,
+    meta,
+  }
+}
+
+/** Why an auto-resume was declined in favour of a passive notice. */
+export type ResumeDeferReason = 'clean-restart-suppressed' | 'loop-guard'
+
+/**
+ * The inbound the boot-resume block should mint for an interrupted turn:
+ *   - 'resume'           → active resume (buildResumeInterruptedInbound)
+ *   - 'report'           → watchdog report (buildResumeWatchdogReportInbound)
+ *   - 'defer-loop'       → loop-guard passive notice (deferred-report)
+ *   - 'defer-suppressed' → boot_resume:never passive notice (deferred-report)
+ *   - null               → nothing (turn finished cleanly)
+ */
+export type BootResumeKind = 'resume' | 'report' | 'defer-loop' | 'defer-suppressed' | null
+
+/**
+ * Pure boot-resume decision, extracted from the gateway so the precedence
+ * (esp. the bounded resume-chain loop-guard) is unit-testable without
+ * booting a gateway. Precedence, highest first:
+ *
+ *   1. loop-guard — the interrupted turn was ITSELF a synthetic resume/report
+ *      turn (`isResumeSyntheticTurn`). NEVER mint another resume for it: that
+ *      would replay already-partly-executed work and could chain
+ *      restart→resume→restart forever. The at-most-once `resumed_at` ledger
+ *      bounds each individual turn, but each resume spawns a NEW turn, so
+ *      without this the CHAIN is unbounded. Cap it at one auto-resume by
+ *      downgrading to a passive deferred-report ('defer-loop').
+ *   2. suppressed — `boot_resume: never` on a fresh clean restart. Downgrade
+ *      to a passive deferred-report ('defer-suppressed') — a notice, never
+ *      silence.
+ *   3. otherwise — the normal age/ended_via policy (`selectResumeBuilder`).
+ */
+export function decideBootResumeKind(args: {
+  pending: Turn
+  suppressed: boolean
+  ageMs: number
+  maxAgeMs: number
+}): BootResumeKind {
+  if (isResumeSyntheticTurn(args.pending)) return 'defer-loop'
+  if (args.suppressed) return 'defer-suppressed'
+  return selectResumeBuilder(args.pending.ended_via, {
+    ageMs: args.ageMs,
+    maxAgeMs: args.maxAgeMs,
+  })
+}
+
+/**
+ * Build the `resume_deferred` inbound — a passive notice delivered when the
+ * framework declines to AUTO-resume interrupted work but must NOT stay
+ * silent (silence when work was in flight is never acceptable). Two reasons:
+ *
+ *   - 'clean-restart-suppressed' — `session_continuity.boot_resume: never`
+ *     is set and the prior shutdown was a fresh, deliberate restart. Per
+ *     that opt-in posture we don't replay the work unprompted, but we still
+ *     tell the user what was in flight so they can ask us to continue.
+ *
+ *   - 'loop-guard' — the interrupted turn was ITSELF a synthetic resume/
+ *     report turn (see `isResumeSyntheticTurn`). Auto-resuming a resume that
+ *     was interrupted again risks an unbounded restart→resume→restart chain
+ *     and double-executed side effects, so we cap the chain: report instead
+ *     of resuming, and let the user decide whether to keep going.
+ *
+ * Like the watchdog report, this is a REPORT (source `resume_deferred`), not
+ * a resume: the agent must not silently pick the work back up. The text
+ * starts with RESUME_SYNTHETIC_PROMPT_PREFIX so a further restart during
+ * THIS turn is itself detected as a synthetic turn and stays capped.
+ */
+export function buildResumeDeferredReportInbound(
+  ctx: ResumeInboundContext & { reason: ResumeDeferReason },
+): InboundMessage {
+  const ts = ctx.nowMs ?? Date.now()
+  const elapsed = humanizeElapsed(ts - ctx.turn.started_at)
+  const threadId = threadIdNum(ctx.turn)
+  const meta: Record<string, string> = {
+    source: 'resume_deferred',
+    // Origin chat/topic as channel attributes so the report turn gets a
+    // currentTurn (progress card + silence-poke) and the notice lands in the
+    // topic the work lived in. Same rationale as the other builders.
+    chat_id: ctx.turn.chat_id,
+    ...(threadId != null ? { message_thread_id: String(threadId) } : {}),
+    resume_turn_key: ctx.turn.turn_key,
+    interrupted_via: ctx.turn.ended_via ?? 'restart',
+    defer_reason: ctx.reason,
+    started_at: String(ctx.turn.started_at),
+  }
+  if (ctx.turn.user_prompt_preview) meta.original_prompt = ctx.turn.user_prompt_preview
+  const cause =
+    ctx.reason === 'loop-guard'
+      ? `Your previous turn was ALREADY a resume of earlier interrupted work, ` +
+        `and it was interrupted again by another restart ${elapsed} ago. To ` +
+        `avoid an endless restart→resume loop (and re-running work that may ` +
+        `have already partly executed), the framework has stopped ` +
+        `auto-resuming this chain.`
+      : `Your previous turn was interrupted ${elapsed} ago by a deliberate ` +
+        `restart, before it finished. This agent is configured NOT to ` +
+        `auto-resume work across deliberate restarts (boot_resume: never), so ` +
+        `it was not replayed automatically.`
+  return {
+    type: 'inbound',
+    chatId: ctx.turn.chat_id,
+    ...(threadId != null ? { threadId } : {}),
+    messageId: ts,
+    user: 'switchroom',
+    userId: 0,
+    ts,
+    text:
+      `${RESUME_SYNTHETIC_PROMPT_PREFIX} ${cause}` +
+      promptClause(ctx.turn) +
+      ` Do NOT silently resume it. Instead, briefly tell the user what was in ` +
+      `flight (call get_recent_messages for this chat if you need the full ` +
+      `original request — the quoted preview is only the first ~200 ` +
+      `characters), then ask whether they want you to pick it back up or drop ` +
+      `it. If you genuinely can't tell what the work was, say so and ask.`,
     meta,
   }
 }
