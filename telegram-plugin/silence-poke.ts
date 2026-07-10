@@ -423,6 +423,20 @@ export function formatFrameworkFallbackText(
   return null
 }
 
+/**
+ * #2995 — the LONGEST-running in-flight tool for a turn key, or null when
+ * none is tracked. Read-only accessor over `inFlightTools` for the
+ * mid-flight busy-ack: the gateway needs the blocking step's name/label
+ * and its age to decide whether (and how) to ack a buffered mid-turn
+ * inbound. Does not touch the silence clock.
+ */
+export function longestInFlightTool(key: string, now: number): ToolSnapshot | null {
+  const s = state.get(key)
+  if (s == null) return null
+  const snaps = snapshotInFlight(s, now)
+  return snaps.length > 0 ? snaps[0]! : null
+}
+
 /** Snapshot in-flight tools sorted longest-running first — for the honest
  *  floor/fallback message body. */
 function snapshotInFlight(s: SilencePokeState, now: number): ToolSnapshot[] {

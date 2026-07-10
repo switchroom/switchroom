@@ -28,6 +28,17 @@ clearly and says which, or it asks.
 > *queue*. The job underneath is unchanged: both operations must work and the
 > chosen one must be visible.
 
+There is a third mid-flight class: a **quick question that neither steers
+nor queues real work** — a status ping, "you there?", a yes/no. It queues
+like any unmarked follow-up, but it carries a latency promise the other two
+don't: when the running turn is stuck inside one long blocking tool call,
+the user must get a visible, silent acknowledgement naming the blocking
+activity **within seconds** — a deterministic framework card, not a model
+turn — so the question never reads as ignored for the minutes a
+`--watch`-style call can take. The ack states the classification ("Queued")
+and what it's waiting behind; the real answer follows when the step
+finishes.
+
 ## Good / bad
 
 **Good looks like**
@@ -41,6 +52,9 @@ clearly and says which, or it asks.
   chat, so the user reads it, never has to infer it.
 - When the input is genuinely ambiguous, the agent makes a reasonable call
   and says which it made, so the user can correct on the next message.
+- A mid-flight message during a long tool call gets a visible ack naming
+  the blocking activity within seconds, silent (no device ping), and the
+  ack is cleaned up once the real answer lands.
 - A burst (a forward of several messages, or a long paste Telegram split)
   is treated as one thought with shared context, not answered fragment by
   fragment.
@@ -58,6 +72,9 @@ clearly and says which, or it asks.
 - A queued task that inherits hallucinated context from the task before it.
 - Dropping a message because a turn was in flight. The user said something;
   it must count.
+- An ack that fires when the agent was seconds from answering — a young
+  tool step returns on its own; acking it is noise that trains the user to
+  ignore the card.
 - No way for the user to override a misclassification and have the correction
   stick.
 
@@ -79,6 +96,13 @@ clearly and says which, or it asks.
   `jtbd-rapid-followup-dm`. *Watch:* every message fired at the turn boundary
   gets its own reply. *Invariant:* no inbound is dropped to a race or a turn
   in flight.
+- **Busy ack behind a long blocking tool call (DM)** —
+  `jtbd-midflight-busy-ack-dm`. *Watch:* a mid-turn quick question sent
+  while the agent sits inside a deliberately slow blocking Bash gets a
+  silent "⏳ Queued — currently inside `<tool>`" ack within seconds, the
+  real answer arrives after the step returns, and the ack card is deleted.
+  *Invariant:* the ack is deterministic (model-free), says "Queued"
+  (classification stays visible), and never fires for a young step.
 - **Survives a restart mid-flight (DM)** — `jtbd-interrupted-turn-resumes-dm`.
   *Watch:* a task interrupted by a restart resumes and runs to completion, not
   silently dropped. *Invariant:* a restart never loses an in-flight task, a
@@ -87,7 +111,7 @@ clearly and says which, or it asks.
   silently dead under a parent that carried on.
 
 **Fuzz corpus:** vary follow-up intent (steer × queue × interrupt ×
-ambiguous) × timing (mid-tool-call × at turn boundary × rapid fire) × burst
+ambiguous) × timing (mid-tool-call × inside long single tool call × at turn boundary × rapid fire) × burst
 shape (forward × split paste × album) × restart mid-flight × surface (DM vs
 channel). The classification must stay visible and nothing the user said may
 be lost, across the corpus.

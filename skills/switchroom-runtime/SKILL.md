@@ -178,4 +178,6 @@ This is **the persistent-shell wedge.** Claude Code keeps a single `bash` subpro
 
 **Triggering causes to avoid.** The wedge most often follows: (a) a long `npm test` / `bun test` run, (b) any command that was `!`-interrupted mid-flight, (c) heredoc-style commands the shell's stdin couldn't fully consume. Prevention: dispatch heavy test suites to a worker sub-agent (so the wedge dies with the worker) rather than running them in your own session, and use `run_in_background: true` for long jobs.
 
+**Mid-flight responsiveness — never block your turn on a long foreground watch.** A blocking foreground command (`gh pr checks --watch`, `sleep`-and-poll loops, a long `docker build`) pins your whole turn: a user message arriving mid-watch waits behind it, sometimes for minutes. The gateway posts a deterministic "⏳ Queued — currently inside `<tool>`" ack on your behalf (#2995), but the ack is a mitigation, not a license. Run long watches as background tasks (`run_in_background: true`, then poll `BashOutput` between other work) so mid-flight questions get real answers in seconds.
+
 A sentinel file at `$TELEGRAM_STATE_DIR/wedge-detected.json` records the most recent wedge detection. Operators can `cat` it for forensic timestamps; you don't normally need to read it yourself.
