@@ -15,6 +15,8 @@ import {
   createSwallowingRetryApiCall,
   retryWithThreadFallback,
   isHtmlParseRejectError,
+  isLocalResourceError,
+  LOCAL_RESOURCE_EXHAUSTED,
   type RetryObserver,
 } from '../retry-api-call.js'
 import { errors, makeGrammyError } from './fake-bot-api.js'
@@ -510,5 +512,59 @@ describe('isHtmlParseRejectError', () => {
         }),
       ),
     ).toBe(true)
+  })
+})
+
+describe('#2923 — LOCAL resource exhaustion is NOT retried (avoids flood ban)', () => {
+  it('classifies ENOSPC / EDQUOT / EIO / ENOMEM by errno code', () => {
+    expect(isLocalResourceError(Object.assign(new Error('x'), { code: 'ENOSPC' }))).toBe(true)
+    expect(isLocalResourceError(Object.assign(new Error('x'), { code: 'EDQUOT' }))).toBe(true)
+    expect(isLocalResourceError(Object.assign(new Error('x'), { code: 'EIO' }))).toBe(true)
+    expect(isLocalResourceError(Object.assign(new Error('x'), { code: 'ENOMEM' }))).toBe(true)
+  })
+
+  it('classifies by message when no code is present', () => {
+    expect(isLocalResourceError(new Error('ENOSPC: no space left on device, write'))).toBe(true)
+    expect(isLocalResourceError(new Error('disk quota exceeded'))).toBe(true)
+  })
+
+  it('does NOT classify a remote GrammyError or ordinary error', () => {
+    expect(isLocalResourceError(errors.floodWait(10))).toBe(false)
+    expect(isLocalResourceError(new Error('fetch failed'))).toBe(false)
+  })
+
+  it('throws LOCAL_RESOURCE_EXHAUSTED immediately without retrying', async () => {
+    // Before the fix: an ENOSPC thrown by the send-staging step fell through
+    // to the network-retry branch pattern OR was rethrown but only after the
+    // caller kept re-driving sends — the storm that tripped the flood ban.
+    // Now it must fail FAST on the first attempt with a distinct marker.
+    const sleep = vi.fn(async () => {})
+    let calls = 0
+    const retry = createRetryApiCall({ maxRetries: 3, sleep })
+    await expect(
+      retry(async () => {
+        calls++
+        throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' })
+      }),
+    ).rejects.toThrow(LOCAL_RESOURCE_EXHAUSTED)
+    expect(calls).toBe(1) // no retry
+    expect(sleep).not.toHaveBeenCalled() // no backoff-into-flood
+  })
+
+  it('fires onFloodWait with the retry_after when a 429 is seen', async () => {
+    const seen: number[] = []
+    const sleep = vi.fn(async () => {})
+    let n = 0
+    const retry = createRetryApiCall({
+      maxRetries: 3,
+      sleep,
+      onFloodWait: (s) => seen.push(s),
+    })
+    const out = await retry(async () => {
+      if (n++ === 0) throw errors.floodWait(42)
+      return 'ok'
+    })
+    expect(out).toBe('ok')
+    expect(seen).toEqual([42])
   })
 })

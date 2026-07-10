@@ -29,6 +29,7 @@ import { createHash } from 'crypto'
 import { AsyncLocalStorage } from 'async_hooks'
 import { clearStaleTelegramPollingState } from '../startup-reset.js'
 import { createRetryApiCall } from '../retry-api-call.js'
+import { makeFloodWaitRecorder } from '../flood-circuit-breaker.js'
 import { RICH_MESSAGE_MAX_CHARS } from '../format.js'
 
 // ─── tg-post tag plumbing ─────────────────────────────────────────────────
@@ -149,9 +150,15 @@ export function installTgPostLogger(bot: Bot): void {
  * Usage:
  *   const robustApiCall = createRobustApiCall()
  */
-export function createRobustApiCall() {
+export function createRobustApiCall(opts: { floodStatePath?: string } = {}) {
   return createRetryApiCall({
     log: (line) => process.stderr.write(line),
+    // #2923: persist every observed 429 flood-wait window so a restart during
+    // the ban can suppress non-essential sends (boot cards) instead of feeding
+    // the per-bot flood counter and prolonging the ban.
+    ...(opts.floodStatePath
+      ? { onFloodWait: makeFloodWaitRecorder(opts.floodStatePath) }
+      : {}),
   })
 }
 
