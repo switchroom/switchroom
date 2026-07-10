@@ -81,8 +81,10 @@ clearly and says which, or it asks.
   in flight.
 - **Survives a restart mid-flight (DM)** — `jtbd-interrupted-turn-resumes-dm`.
   *Watch:* a task interrupted by a restart resumes and runs to completion, not
-  silently dropped. *Invariant:* a restart never loses an in-flight task or a
-  queued follow-up.
+  silently dropped. *Invariant:* a restart never loses an in-flight task, a
+  queued follow-up, **or in-flight sub-agent work** — dispatched workers that
+  the restart killed are re-dispatched or named as lost on resume, never left
+  silently dead under a parent that carried on.
 
 **Fuzz corpus:** vary follow-up intent (steer × queue × interrupt ×
 ambiguous) × timing (mid-tool-call × at turn boundary × rapid fire) × burst
