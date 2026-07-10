@@ -137,6 +137,7 @@ import {
 } from './approval-timeout-inbound-builders.js'
 import { expirePendingCard } from './pending-card-expiry.js'
 import { createSweepableCardStore } from './approval-card-stores.js'
+import { createSweepableStore, createPlainStore } from './pending-state-stores.js'
 import {
   isPermissionRearmEnabled,
   permissionRearmGraceMs,
@@ -5398,14 +5399,15 @@ const PERMISSION_CARD_ORIGIN_MAX_AGE_MS = 30 * 60_000
 // other field finds no entry and falls through to a real operator card.
 // Single-shot (deleted on match) + 30s TTL sweep so a stale correlation
 // can't be replayed.
-const pendingAlwaysAllowCorrelations = new Map<string, { agentName: string; rule: string; unifiedDiff: string; createdAt: number }>()
 const ALWAYS_ALLOW_CORRELATION_TTL_MS = 30_000
+// Storage extracted to pending-state-stores.ts (#2996 Phase 3 step 2): the
+// store owns the Map + co-locates the delete-past-TTL sweep. The TTL and its
+// comparison direction stay here in the injected predicate (byte-identical).
+const pendingAlwaysAllowCorrelations = createSweepableStore<{ agentName: string; rule: string; unifiedDiff: string; createdAt: number }>(
+  (entry, now) => now - entry.createdAt > ALWAYS_ALLOW_CORRELATION_TTL_MS,
+)
 function sweepStaleAlwaysAllowCorrelations(now = Date.now()): void {
-  for (const [key, entry] of pendingAlwaysAllowCorrelations) {
-    if (now - entry.createdAt > ALWAYS_ALLOW_CORRELATION_TTL_MS) {
-      pendingAlwaysAllowCorrelations.delete(key)
-    }
-  }
+  pendingAlwaysAllowCorrelations.sweep(now)
 }
 
 // Sibling of pendingAlwaysAllowCorrelations for the agent-proposes →
@@ -5428,16 +5430,17 @@ function sweepStaleAlwaysAllowCorrelations(now = Date.now()): void {
 // slow-but-valid tap, dropping the auto-approve and surfacing a SECOND card
 // for an edit the operator already approved. Size it to the hostd budget.
 const MENTAL_MODEL_CORRELATION_TTL_MS = 720_000
-const pendingMentalModelCorrelations = new Map<string, { agentName: string; unifiedDiff: string; createdAt: number }>()
+// Storage extracted to pending-state-stores.ts (#2996 Phase 3 step 2). Same
+// pattern as pendingAlwaysAllowCorrelations, but the predicate closes over the
+// larger 720s TTL that must outlive the whole config-edit approval budget.
+const pendingMentalModelCorrelations = createSweepableStore<{ agentName: string; unifiedDiff: string; createdAt: number }>(
+  (entry, now) => now - entry.createdAt > MENTAL_MODEL_CORRELATION_TTL_MS,
+)
 function mentalModelCorrelationKey(agentName: string, unifiedDiff: string): string {
   return `${agentName}::${createHash('sha256').update(unifiedDiff).digest('hex')}`
 }
 function sweepStaleMentalModelCorrelations(now = Date.now()): void {
-  for (const [key, entry] of pendingMentalModelCorrelations) {
-    if (now - entry.createdAt > MENTAL_MODEL_CORRELATION_TTL_MS) {
-      pendingMentalModelCorrelations.delete(key)
-    }
-  }
+  pendingMentalModelCorrelations.sweep(now)
 }
 
 // Scoped-approval store: the 30-min window that backs the "✅ Allow" tap for
