@@ -12669,7 +12669,7 @@ async function executeVaultRequestSave(args: Record<string, unknown>): Promise<{
     staged_at: Date.now(),
   }
   pendingVaultRequestSaves.set(stageId, pending)
-  sweepPendingVaultRequestSaves()
+  pendingVaultRequestSaves.sweep(Date.now())
 
   // Send the approval card. #1075: route through retryWithThreadFallback
   // so a deleted topic still lands the card on the main chat instead of
@@ -13159,7 +13159,7 @@ async function executeVaultRequestAccess(args: Record<string, unknown>): Promise
     staged_at: Date.now(),
   }
   pendingVaultRequestAccesses.set(stageId, pending)
-  sweepPendingVaultRequestAccesses()
+  pendingVaultRequestAccesses.sweep(Date.now())
 
   // renderVaultRequestAccessCard self-hardens its field line breaks (this card
   // is sent direct, bypassing the switchroomReply chokepoint).
@@ -13341,7 +13341,7 @@ async function executeMentalModelPropose(args: Record<string, unknown>): Promise
     staged_at: Date.now(),
   }
   pendingMentalModelProposes.set(stageId, pending)
-  sweepPendingMentalModelProposes()
+  pendingMentalModelProposes.sweep(Date.now())
 
   const text = renderMentalModelProposeCard({
     agent: agentSlug,
