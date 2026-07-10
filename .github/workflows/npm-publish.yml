@@ -120,55 +120,6 @@ jobs:
           # points at node, not bun (npm consumers run via node).
           head -1 "$f" | grep -q '^#!.*node' || echo "::warning::$f shebang is not node-targeted"
 
-      - name: Un-ignore dist/ for npm pack (version-proof the files whitelist)
-        shell: bash
-        run: |
-          # `dist/` is in package.json `files` (the whitelist) AND in
-          # `.gitignore` (build output, never committed). npm's rule: the
-          # `files` whitelist overrides `.gitignore`. BUT this is npm-version-
-          # dependent — on some runner-default npm versions a gitignored dir
-          # in `files` is STILL excluded from the tarball (the v0.18.6 first
-          # publish attempt hit exactly this: dist/ built + verified on disk,
-          # yet `npm pack` emitted a tarball with zero dist/ entries). The
-          # version-proof fix: temporarily strip the `dist/` line from
-          # `.gitignore` so npm never sees dist/ as ignored, regardless of
-          # which npm version the runner ships. This is an UNCOMMITTED
-          # pack-time-only edit (the commit is never made); restore after pack
-          # isn't needed because the workspace is ephemeral. Also keep
-          # `.npmignore` in place (it does NOT list dist/, and its other
-          # exclusions — vendor/, tests/ — are intentional belt-and-braces).
-          if [ -f .gitignore ]; then
-            cp .gitignore .gitignore.release-backup
-            # Remove any line that is exactly `dist/` or `dist` (keep other
-            # dist-prefixed ignore rules like `dist-cli/` intact).
-            sed -E '/^dist\/?$/d' .gitignore.release-backup > .gitignore
-            if grep -Eq '^dist/?$' .gitignore; then
-              echo "::warning::failed to strip dist/ from .gitignore — tarball may miss dist/"
-            else
-              echo "Stripped dist/ from .gitignore for pack (uncommitted, ephemeral workspace)."
-            fi
-          fi
-          # Debug: surface the npm version + ignore-file presence in the log
-          # so any future publish failure is diagnosable without a re-run.
-          echo "npm version: $(npm --version)"
-          echo ".npmignore present: $([ -f .npmignore ] && echo yes || echo no)"
-          echo ".gitignore dist/ line present: $(grep -c '^dist/' .gitignore 2>/dev/null || echo 0)"
-
-      - name: Debug — what does npm pack think it includes? (dry-run)
-        shell: bash
-        run: |
-          # Diagnostic: `npm pack --dry-run` lists what npm WOULD pack and
-          # why (ignored / excluded / included). Run BEFORE the real pack so
-          # a dist/ exclusion is visible in the log with its reason, instead
-          # of only the post-pack guard failing. This step is debug-only —
-          # it never publishes and is safe to leave on.
-          echo "=== ls dist/cli (on-disk check) ==="
-          ls -la dist/cli/ | head
-          echo "=== npm pack --dry-run (dist/ entries + total) ==="
-          npm pack --dry-run --ignore-scripts 2>&1 | grep -iE "dist/|tarball|total files|package size|excluded|ignored" | head -40
-          echo "=== npm pack --dry-run --json (dist inclusion, machine-readable) ==="
-          npm pack --dry-run --ignore-scripts --json 2>&1 | python3 -c "import sys,json; d=json.load(sys.stdin); ents=d[0].get('entryCount','?'); files=[f['path'] for f in d[0].get('files',[])]; print('entry count:',ents); print('dist entries:',sum(1 for f in files if f.startswith('dist/'))); print('first dist:',next((f for f in files if f.startswith('dist/cli/switchroom')),'NONE'))" 2>&1 || echo "(json parse skipped)"
-
       - name: Pack (npm pack, no publish yet)
         id: pack
         shell: bash
@@ -201,9 +152,17 @@ jobs:
           # published tarball. A files/ glob misconfiguration or a missing
           # dist/ would otherwise publish a package that installs but
           # can't run.
-          tar tf "${{ steps.pack.outputs.tarball }}" | grep -q '^dist/cli/switchroom\.js$' || {
+          #
+          # IMPORTANT: npm tarballs nest every entry under a `package/`
+          # prefix (that's npm's convention — `tar tf` prints
+          # `package/dist/cli/switchroom.js`, not `dist/cli/switchroom.js`).
+          # The first attempt at this guard matched `^dist/cli/switchroom\.js$`
+          # (no `package/` prefix) and so NEVER matched — falsely blocking
+          # every publish with "dist NOT in the tarball" even though the
+          # dry-run + tarball size proved it was. Match the real path.
+          tar tf "${{ steps.pack.outputs.tarball }}" | grep -q '^package/dist/cli/switchroom\.js$' || {
             echo "::error::dist/cli/switchroom.js is NOT in the tarball — files/ glob or build is wrong; refusing to publish"
-            tar tf "${{ steps.pack.outputs.tarball }}" | head -20
+            tar tf "${{ steps.pack.outputs.tarball }}" | grep -E 'dist/' | head -20
             exit 1
           }
           echo "dist/cli/switchroom.js confirmed in the tarball"
