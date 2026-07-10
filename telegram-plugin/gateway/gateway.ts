@@ -5478,7 +5478,10 @@ interface PendingAskUser {
   timer: ReturnType<typeof setTimeout>
   startedAt: number
 }
-const pendingAskUser = new Map<string, PendingAskUser>()
+// Storage extracted to pending-state-stores.ts (#2996 Phase 3 step 2). Plain
+// store (no TTL sweep): entries are bounded by per-entry timers and cleared on
+// resolution / shutdown / chat-close, not by the reaper.
+const pendingAskUser = createPlainStore<PendingAskUser>()
 
 // Reauth flows. Storage extracted to pending-state-stores.ts (#2996 Phase 3
 // step 2): the store owns the Map + co-locates the delete-past-TTL sweep the
