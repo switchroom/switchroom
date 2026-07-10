@@ -18008,6 +18008,10 @@ async function handleInbound(
   //      unconditional buffer+persist would replay a steer as a fresh turn.
   const machineDelivers = machineInboundEffects.some((e) => e.kind === 'deliverToBridge')
   const machineBuffers = machineInboundEffects.some((e) => e.kind === 'bufferInbound')
+  // ANCHORED STRING — must match the machine's bridge-dead inbound trace
+  // stage verbatim (see the anchor comment at its emit site in
+  // inbound-delivery-machine.ts + the pin test in
+  // inbound-delivery-cutover-flip.test.ts). Deleted in PR4 with the twin.
   const machineBridgeDead = machineInboundEffects.some(
     (e) => e.kind === 'logTrace' && e.stage === 'inbound_bridge_dead_buffer',
   )
@@ -18165,6 +18169,16 @@ async function handleInbound(
   // has always preceded the send attempt), not a regression of this flip.
   if (machineAuthoritative) {
     let machineDelivered = false
+    // Key stamped by THIS dispatch's setTurnStarted effect (fresh turn only —
+    // a mid-turn steer emits deliverToBridge WITHOUT setTurnStarted). The
+    // miss branch below may only release a key THIS dispatch stamped: on a
+    // steer-miss the chat's busy key belongs to the ORIGINAL in-flight turn
+    // (mirroring the twin, which only ever releases reservedBusyKey and never
+    // reserves for steers). An unconditional delete would wipe the running
+    // turn's key → false machine_over_holds parity drift during the bake +
+    // the pending-restart gate (claudeBusyKeys.size) could green-light a
+    // mid-turn restart.
+    let machineStampedKey: string | null = null
     dispatchEffects(machineInboundEffects, {
       selfAgent,
       ipcServer,
@@ -18175,6 +18189,7 @@ async function handleInbound(
       // keeps the kill-switch fallback + gate-parity-probe + pending-restart
       // gate (claudeBusyKeys.size) coherent while the twins remain live.
       onSetTurnStarted: (k, at) => {
+        machineStampedKey = k
         markBusyKeyLockstep(claudeBusyKeys, claudeBusyKeySince, k, at)
       },
       onDeliverResult: (_k, ok) => {
@@ -18201,12 +18216,21 @@ async function handleInbound(
         trackDelivery(deliveryQueue, busyKey, inboundMsg, Date.now(), String(inboundMsg.messageId))
       }
     } else {
-      // Send missed while the machine read bridge-alive. Release the busy
-      // mirror the setTurnStarted effect stamped (lockstep with the twin's
-      // reservedBusyKey release), buffer per the carve-outs, notify.
-      const missKey = statusKey(chat_id, messageThreadId)
-      claudeBusyKeys.delete(missKey)
-      claudeBusyKeySince.delete(missKey)
+      // Send missed while the machine read bridge-alive. Release ONLY a busy
+      // mirror THIS dispatch's setTurnStarted stamped (lockstep with the
+      // twin's reservedBusyKey release). A steer-miss stamped nothing — the
+      // chat key belongs to the original in-flight turn and must survive
+      // (see machineStampedKey above). Then buffer per the carve-outs, notify.
+      //
+      // Known behavior delta (documented, accepted for the bake): the
+      // machine already advanced to in_turn at the emit, so until the TTL
+      // tick / bridge-flap clears it, SUBSEQUENT inbounds are machine-
+      // buffered ("queued" busy-ack) instead of the legacy per-message send
+      // attempt + restart notice. See the RFC carve-out row + PR body.
+      if (machineStampedKey != null) {
+        claudeBusyKeys.delete(machineStampedKey)
+        claudeBusyKeySince.delete(machineStampedKey)
+      }
       if (
         shouldTrackDelivery({
           isSteering,

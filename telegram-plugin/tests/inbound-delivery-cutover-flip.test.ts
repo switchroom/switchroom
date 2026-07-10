@@ -240,6 +240,116 @@ describe('onDeliverResult observer contract (the flip’s post-send branch sourc
   })
 })
 
+describe('machine deliver path — send-miss busy-key handling (review fix, PR #3012)', () => {
+  // Mirrors the gateway's machine-deliver wiring: onSetTurnStarted stamps
+  // the busy mirror AND records the key; the miss branch releases ONLY a
+  // key THIS dispatch stamped. A steer-miss must keep the original turn's
+  // key (the twin never reserves for steers), else the wiped key fires a
+  // false machine_over_holds parity drift and the pending-restart gate
+  // (claudeBusyKeys.size) could green-light a mid-turn restart.
+  function runMissHarness(
+    effects: ReturnType<typeof transition>['effects'],
+    busyKeys: Set<string>,
+  ): { stamped: string | null } {
+    let stamped: string | null = null
+    let delivered = false
+    const { ctx } = makeCtx({ ipcServer: { sendToAgent: vi.fn(() => false) } as never })
+    dispatchEffects(effects, {
+      ...ctx,
+      onSetTurnStarted: (k) => {
+        stamped = k
+        busyKeys.add(k)
+      },
+      onDeliverResult: (_k, ok) => {
+        delivered = ok
+      },
+    })
+    expect(delivered).toBe(false)
+    // Gateway miss branch (guarded release):
+    if (stamped != null) busyKeys.delete(stamped)
+    return { stamped }
+  }
+
+  it('fresh-turn miss: the key THIS dispatch stamped is released', () => {
+    const busyKeys = new Set<string>()
+    const { effects } = transition(aliveIdle(), {
+      kind: 'inbound',
+      key: KEY,
+      msg: machineMsg(ipcMsg()),
+      at: 2000,
+    })
+    const { stamped } = runMissHarness(effects, busyKeys)
+    expect(stamped).toBe(KEY)
+    expect(busyKeys.has(KEY)).toBe(false)
+  })
+
+  it('steer miss: no setTurnStarted fired, the ORIGINAL turn\'s key survives', () => {
+    // Original fresh turn holds the busy key.
+    const busyKeys = new Set<string>([KEY])
+    const s1 = transition(aliveIdle(), {
+      kind: 'inbound',
+      key: KEY,
+      msg: machineMsg(ipcMsg()),
+      at: 2000,
+    }).state
+    const { effects } = transition(s1, {
+      kind: 'inbound',
+      key: KEY,
+      msg: machineMsg(ipcMsg(), true),
+      at: 3000,
+    })
+    expect(effects.some((e) => e.kind === 'setTurnStarted')).toBe(false)
+    const { stamped } = runMissHarness(effects, busyKeys)
+    expect(stamped).toBeNull()
+    // The in-flight turn's key was NOT wiped by the steer's send-miss.
+    expect(busyKeys.has(KEY)).toBe(true)
+  })
+})
+
+describe('carve-out routing anchors (gateway keys off these machine facts)', () => {
+  it('PIN: bridge-dead inbound emits the exact `inbound_bridge_dead_buffer` trace stage', () => {
+    // gateway.ts's machineBridgeDead carve-out matches this string verbatim
+    // to route bridge-dead inbounds to the imperative twin. A rename here
+    // silently reroutes them to the machine's buffer+persist (losing the
+    // twin's shouldTrackDelivery drop semantics + restart notice) — this
+    // pin makes the rename loud. Deleted in PR4 with the twin.
+    const dead = initialState() // bridge_dead is the initial global state
+    const { effects } = transition(dead, {
+      kind: 'inbound',
+      key: KEY,
+      msg: machineMsg(ipcMsg()),
+      at: 2000,
+    })
+    expect(effects.map((e) => e.kind)).toEqual(['bufferInbound', 'persistInbound', 'logTrace'])
+    expect(effects.find((e) => e.kind === 'logTrace')).toMatchObject({
+      stage: 'inbound_bridge_dead_buffer',
+    })
+  })
+
+  it('interrupt-while-in-turn carve-out: a mid-turn non-steering inbound buffers (gateway must reroute interrupts to the twin)', () => {
+    // The machine has no interrupt event — a `!`-interrupt body looks like a
+    // plain mid-turn inbound and would BUFFER (stranding it: the SIGINT'd
+    // turn may never emit turn_complete). gateway.ts's machineAuthoritative
+    // predicate therefore excludes `machineBuffers && isInterrupt` and falls
+    // back to the twin's deliver carve-out. This pins the machine fact the
+    // predicate rests on.
+    const s1 = transition(aliveIdle(), {
+      kind: 'inbound',
+      key: KEY,
+      msg: machineMsg(ipcMsg()),
+      at: 2000,
+    }).state
+    const { effects } = transition(s1, {
+      kind: 'inbound',
+      key: KEY,
+      msg: machineMsg(ipcMsg(), false),
+      at: 3000,
+    })
+    expect(effects.some((e) => e.kind === 'bufferInbound')).toBe(true)
+    expect(effects.some((e) => e.kind === 'deliverToBridge')).toBe(false)
+  })
+})
+
 // The env var is read at MODULE LOAD in the dispatch + shadow modules, and
 // bun's `vi` shim has no resetModules/stubEnv — so the kill-switch/default
 // assertions run the fixture probe in a SUBPROCESS with a controlled env
