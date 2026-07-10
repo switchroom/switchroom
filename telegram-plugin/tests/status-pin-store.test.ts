@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  BOOT_UNPIN_MAX_ATTEMPTS,
   loadStatusPins,
   mutateStatusPinRow,
   persistStatusPins,
@@ -195,12 +196,12 @@ describe("runStatusPinBootCleanup", () => {
       ["-100123", 715],
       ["-100999", 42],
     ]);
-    expect(res).toEqual({ cleared: 2, total: 2 });
+    expect(res).toEqual({ cleared: 2, retained: 0, kept: 0, total: 2 });
     // Store empty afterwards → no re-attempt next boot.
     expect(loadStatusPins(PATH, fs)).toEqual([]);
   });
 
-  it("a failing unpin is non-fatal and the store is still emptied", async () => {
+  it("retry-safe (#3001): a failing unpin is non-fatal, RETAINS the row with an attempt counter, and drops only the succeeded one", async () => {
     const { fs } = memFs();
     persistStatusPins(PATH, fs, [
       pin({ pinKey: "fg:c:1", chatId: "-100123", messageId: 5 }),
@@ -216,9 +217,64 @@ describe("runStatusPinBootCleanup", () => {
       log: () => {},
     });
 
-    // One failed, one succeeded — still non-fatal, store still emptied.
-    expect(res).toEqual({ cleared: 1, total: 2 });
+    // One failed, one succeeded — the failure is retained for a next-boot
+    // retry instead of forfeiting the orphan (the pre-#3001 behaviour).
+    expect(res).toEqual({ cleared: 1, retained: 1, kept: 0, total: 2 });
+    expect(loadStatusPins(PATH, fs)).toEqual([
+      { pinKey: "fg:c:1", chatId: "-100123", messageId: 5, attempts: 1 },
+    ]);
+  });
+
+  it("retry-safe (#3001): a row is forfeited once its attempts reach BOOT_UNPIN_MAX_ATTEMPTS", async () => {
+    const { fs } = memFs();
+    persistStatusPins(PATH, fs, [
+      pin({
+        pinKey: "fg:c:1",
+        chatId: "-100123",
+        messageId: 5,
+        attempts: BOOT_UNPIN_MAX_ATTEMPTS - 1,
+      }),
+    ]);
+    const res = await runStatusPinBootCleanup({
+      path: PATH,
+      fs,
+      unpin: async () => {
+        throw new Error("chat gone forever");
+      },
+      log: () => {},
+    });
+    // Final attempt failed too — forfeited, not retained: a permanently-
+    // undeliverable unpin must not re-fail on every future boot.
+    expect(res).toEqual({ cleared: 0, retained: 0, kept: 0, total: 1 });
     expect(loadStatusPins(PATH, fs)).toEqual([]);
+  });
+
+  it("tool pins (#3001): an UNEXPIRED `tool:` row survives the boot untouched; an EXPIRED one is unpinned and dropped", async () => {
+    const { fs } = memFs();
+    const now = 1_750_000_000_000;
+    persistStatusPins(PATH, fs, [
+      pin({ pinKey: "tool:-100123:70", chatId: "-100123", messageId: 70, expiresAt: now + 1 }),
+      pin({ pinKey: "tool:-100123:71", chatId: "-100123", messageId: 71, expiresAt: now }),
+      pin({ pinKey: "wk:agent-x", chatId: "-100123", messageId: 72 }),
+    ]);
+    const unpinned: number[] = [];
+    const res = await runStatusPinBootCleanup({
+      path: PATH,
+      fs,
+      unpin: async (_c, messageId) => {
+        unpinned.push(messageId);
+      },
+      now,
+      log: () => {},
+    });
+    // The expired tool pin and the work-scoped wk: pin are unpinned; the
+    // unexpired tool pin is kept for a future boot (restart ≠ reset for a
+    // deliberate agent pin with no "work finished" event).
+    expect(unpinned).toEqual([71, 72]);
+    expect(res).toEqual({ cleared: 2, retained: 0, kept: 1, total: 3 });
+    expect(loadStatusPins(PATH, fs)).toEqual([
+      { pinKey: "tool:-100123:70", chatId: "-100123", messageId: 70, expiresAt: now + 1 },
+    ]);
   });
 
   it("no-op on a fresh boot with no persisted pins (no unpin calls)", async () => {
@@ -232,7 +288,7 @@ describe("runStatusPinBootCleanup", () => {
       },
       log: () => {},
     });
-    expect(res).toEqual({ cleared: 0, total: 0 });
+    expect(res).toEqual({ cleared: 0, retained: 0, kept: 0, total: 0 });
     expect(calls).toBe(0);
   });
 
@@ -254,7 +310,7 @@ describe("runStatusPinBootCleanup", () => {
       log: () => {},
     });
     expect(unpinned).toEqual([["-100777", 314]]);
-    expect(res).toEqual({ cleared: 1, total: 1 });
+    expect(res).toEqual({ cleared: 1, retained: 0, kept: 0, total: 1 });
     expect(loadStatusPins(PATH, fs)).toEqual([]);
   });
 });

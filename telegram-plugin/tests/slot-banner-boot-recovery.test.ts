@@ -170,7 +170,7 @@ describe("slot-banner boot recovery (gateway wiring)", () => {
     const gw2 = makeGateway(fs, tg);
     const res = await gw2.bootCleanup();
 
-    expect(res).toEqual({ cleared: 1, total: 1 });
+    expect(res).toEqual({ cleared: 1, retained: 0, kept: 0, total: 1 });
     expect(tg.pinned.has(`${OWNER}:${msgId}`)).toBe(false); // orphan unpinned
     expect(loadStatusPins(PATH, fs)).toEqual([]); // store emptied
   });
@@ -220,7 +220,7 @@ describe("slot-banner boot recovery (gateway wiring)", () => {
     // Fresh boot recovers it from the pending record.
     const gw2 = makeGateway(fs, tg);
     const res = await gw2.bootCleanup();
-    expect(res).toEqual({ cleared: 1, total: 1 });
+    expect(res).toEqual({ cleared: 1, retained: 0, kept: 0, total: 1 });
     expect(tg.pinned.has(`${OWNER}:${rec[0].messageId}`)).toBe(false);
     expect(loadStatusPins(PATH, fs)).toEqual([]);
   });
@@ -241,6 +241,6 @@ describe("slot-banner boot recovery (gateway wiring)", () => {
     expect(loadStatusPins(PATH, fs)).toEqual([]);
 
     const gw2 = makeGateway(fs, tg);
-    expect(await gw2.bootCleanup()).toEqual({ cleared: 0, total: 0 });
+    expect(await gw2.bootCleanup()).toEqual({ cleared: 0, retained: 0, kept: 0, total: 0 });
   });
 });

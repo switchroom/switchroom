@@ -60,6 +60,23 @@ close that gap so the user never has to ask.
   carries no new content: it re-surfaces a message the conversation already owns.
   This is the one sanctioned pin (see `invariants.md`
   § `chat-is-the-single-source-of-truth`).
+- **The restart rule (#3001): a status pin is a claim on unfinished work, and
+  a restart resets it.** Any progress/worker pin (the per-turn status pin, the
+  `🛠 Worker` pin) whose work did not finish is unpinned on the next gateway
+  boot — the boot sweep reads the durable pin store and unpins every
+  work-scoped claim from the dead session, retrying a failed unpin on later
+  boots (capped) rather than forfeiting it. Mid-session the same guarantee
+  holds within the reaper interval: a worker pin whose worker is already
+  terminal in the registry (a missed completion event) or whose claim outlives
+  a generous TTL is unpinned without waiting for a restart. A stale pin glued
+  to the top of the chat for hours is exactly the "can't tell working from
+  stuck" failure this job exists to prevent.
+- **Tool pins are different: no "finished" event, so restart ≠ reset.** A pin
+  the agent placed deliberately via the `pin_message` tool is registered in
+  the same durable store under a `tool:` key with a generous TTL (default 7
+  days). It survives restarts untouched until the TTL lapses, then the boot
+  sweep unpins it — the backstop against deliberate pins accumulating
+  forever, without ever yanking a pin the user still wants.
 
 **Bad looks like: never ship this**
 
@@ -157,6 +174,18 @@ Named by job × surface, pointing at real scenarios in
   *Watch:* the user is told what was interrupted and the work resumes.
   *Invariant:* a restart never swallows an in-flight turn or an inbound
   silently.
+- **Worker-pin lifecycle + restart reset (DM, #3001)** —
+  `jtbd-worker-pin-lifecycle-dm`. *Watch:* the `🛠 Worker` message is silently
+  pinned while a background dispatch runs and unpinned after it completes;
+  with a forced gateway restart mid-dispatch, the orphaned worker pin is
+  unpinned by the next boot's sweep. Observers must filter pin/unpin service
+  events (`observePins`), not message edits — the card EDITS in place while
+  pinned. *Invariant:* the restart rule — no work-scoped pin survives its
+  work's death; a worker pin never outlives its worker by more than the
+  reaper interval (mid-session) or one boot (restart). Decision-layer twins:
+  `telegram-plugin/tests/worker-pin-reaper.test.ts`,
+  `status-pin-store.test.ts` (tool-pin TTL rows + retry-safe boot sweep),
+  `activity-card-store.test.ts` (retry-safe unpin retention).
 - **Status-ask rate (DM)** — `jtbd-status-query-dm`, `fuzz-status-ask-dm`.
   *Watch:* the user rarely needs to ask; when they do, it's answered as a
   real question. *Invariant:* status-ask rate is the lagging KPI for this

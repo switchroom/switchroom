@@ -12,10 +12,13 @@
  * a dead session lingers.
  *
  * This makes cleanup self-contained across restart: every pin claim persists
- * here; on boot the gateway loads the persisted set and unpins each entry
- * (a status pin from a PRIOR session is stale by definition — the turn it
- * represented is over or crashed), then clears the store. It does NOT re-adopt
- * or re-pin — it only cleans up.
+ * here; on boot the gateway loads the persisted set and unpins each
+ * work-scoped entry (a status pin from a PRIOR session is stale by definition
+ * — the turn it represented is over or crashed), dropping rows only after a
+ * successful unpin (failed ones are retained with an attempt counter for a
+ * next-boot retry — see runStatusPinBootCleanup). Time-scoped `tool:` rows
+ * (the `pin_message` MCP tool, #3001) survive boots until their `expiresAt`.
+ * It does NOT re-adopt or re-pin — it only cleans up.
  *
  * Shape choice — SNAPSHOT, not append-log, mirroring obligation-store.ts. The
  * claim set is tiny and bounded (one entry per in-flight pinned key, normally
@@ -55,7 +58,26 @@ export interface PersistedStatusPin {
   messageId: number
   /** True while the pin API call is in-flight / unconfirmed (see above). */
   pending?: boolean
+  /** Wall-clock ms after which this pin is stale and boot cleanup unpins it.
+   *  Rows WITHOUT this field are work-scoped (fg:/wk:/banner:) — stale the
+   *  moment their owning session dies, so boot cleanup unpins them
+   *  unconditionally. Rows WITH it (the `tool:` pins written by the
+   *  `pin_message` MCP tool, #3001) represent deliberate agent pins that have
+   *  no "work finished" event: they SURVIVE restarts and are only swept once
+   *  expired. */
+  expiresAt?: number
+  /** Boot-cleanup unpin retry counter (#3001). Incremented each boot the
+   *  unpin fails (flood-wait exhausted / transient 5xx); the row is retained
+   *  for retry until BOOT_UNPIN_MAX_ATTEMPTS, then forfeited. Absent = 0. */
+  attempts?: number
 }
+
+/** How many boots may retry a failing boot-cleanup unpin before the row is
+ *  forfeited. Unpins are idempotent (unpinning an already-unpinned or deleted
+ *  message no-ops), so retrying across boots is safe; the cap only bounds a
+ *  permanently-undeliverable unpin (chat gone, bot removed) so it cannot
+ *  re-fail on every boot forever. */
+export const BOOT_UNPIN_MAX_ATTEMPTS = 5
 
 /** Envelope version. v1 had no `pending` field; a v1 row loads as a confirmed
  *  pin (pending undefined). v2 adds the optional `pending` flag. Both load
@@ -74,7 +96,9 @@ function isPinRow(x: unknown): x is PersistedStatusPin {
     typeof o.chatId === 'string' &&
     o.chatId.length > 0 &&
     typeof o.messageId === 'number' &&
-    (o.pending === undefined || typeof o.pending === 'boolean')
+    (o.pending === undefined || typeof o.pending === 'boolean') &&
+    (o.expiresAt === undefined || typeof o.expiresAt === 'number') &&
+    (o.attempts === undefined || typeof o.attempts === 'number')
   )
 }
 
@@ -170,16 +194,27 @@ export function pinnedMessageIsOurs(
  * the ordering + best-effort contract is unit-testable against the REAL code
  * (the gateway's thin wrapper just binds the live fs / unpin api / logger).
  *
- * Any pin persisted by a PRIOR session is stale by definition — its turn ended
- * or the session crashed before its unpin reconcile ran. This includes records
- * left `pending` (the persist-intent-first write from `reconcileAndPersist-
- * StatusPin`): a crash between the pin API call and its confirming rewrite
- * leaves a pending record whose pin MAY have landed in Telegram, so we must
- * treat it exactly like a confirmed one and unpin it. We therefore best-effort
- * unpin EVERY persisted entry (confirmed and pending alike — a failure is
- * non-fatal) and then EMPTY the store regardless, so a permanently-
- * undeliverable unpin can't re-run on every boot. We do NOT re-adopt or re-pin.
- * Returns the counts for logging/testing.
+ * The restart rule (#3001): a WORK-SCOPED pin persisted by a PRIOR session
+ * (fg:/wk:/banner: — any row without `expiresAt`) is stale by definition — its
+ * work ended or the session crashed before its unpin reconcile ran, so
+ * restart = reset: it is unpinned here. This includes records left `pending`
+ * (the persist-intent-first write from `reconcileAndPersistStatusPin`): a
+ * crash between the pin API call and its confirming rewrite leaves a pending
+ * record whose pin MAY have landed in Telegram, so we must treat it exactly
+ * like a confirmed one and unpin it.
+ *
+ * TIME-SCOPED rows (`tool:` pins from the `pin_message` MCP tool, carrying
+ * `expiresAt`) have no "work finished" event, so a restart does NOT reset
+ * them: an unexpired row is RETAINED untouched across boots and only unpinned
+ * once `now >= expiresAt`.
+ *
+ * RETRY-SAFETY (#3001): a row is dropped only AFTER its unpin resolves. A
+ * failing unpin (flood-wait exhausted / transient 5xx) retains the row with an
+ * incremented `attempts` counter so the NEXT boot retries, up to
+ * BOOT_UNPIN_MAX_ATTEMPTS — then the row is forfeited (a permanently-
+ * undeliverable unpin must not re-fail on every boot forever). Unpins are
+ * idempotent, so the retry can never double-unpin harmfully. We do NOT
+ * re-adopt or re-pin. Returns the counts for logging/testing.
  *
  * CRITICAL: the caller MUST only invoke this AFTER winning the startup mutex.
  * The store is a shared per-agent file; on a double-boot a losing gateway
@@ -189,27 +224,45 @@ export async function runStatusPinBootCleanup(args: {
   path: string
   fs: StatusPinStoreFsSeam
   unpin: (chatId: string, messageId: number) => Promise<unknown>
+  now?: number
   log?: (line: string) => void
-}): Promise<{ cleared: number; total: number }> {
+}): Promise<{ cleared: number; retained: number; kept: number; total: number }> {
   const log = args.log ?? ((l: string) => process.stderr.write(l))
+  const now = args.now ?? Date.now()
   const persisted = loadStatusPins(args.path, args.fs)
-  if (persisted.length === 0) return { cleared: 0, total: 0 }
+  if (persisted.length === 0) return { cleared: 0, retained: 0, kept: 0, total: 0 }
   let cleared = 0
+  let retained = 0
+  let kept = 0
+  const next: PersistedStatusPin[] = []
   for (const pin of persisted) {
+    // Unexpired time-scoped row (tool: pin): deliberately survives the
+    // restart — keep it as-is, no unpin.
+    if (pin.expiresAt != null && pin.expiresAt > now) {
+      next.push(pin)
+      kept++
+      continue
+    }
     try {
       await args.unpin(pin.chatId, pin.messageId)
       cleared++
     } catch (err) {
+      const attempts = (pin.attempts ?? 0) + 1
       log(
         `status-pin-store: boot cleanup unpin failed ` +
-          `(chat=${pin.chatId} msg=${pin.messageId}): ${(err as Error).message}\n`,
+          `(chat=${pin.chatId} msg=${pin.messageId} attempt=${attempts}): ` +
+          `${(err as Error).message}\n`,
       )
+      if (attempts < BOOT_UNPIN_MAX_ATTEMPTS) {
+        // Retain for a retry on the next boot instead of forfeiting the
+        // orphan permanently (retry-safe boot sweep, #3001).
+        next.push({ ...pin, attempts })
+        retained++
+      }
     }
   }
-  // Empty the store regardless — these claims belong to a dead session; leaving
-  // them would re-attempt the same (already-tried) unpins on every future boot.
-  persistStatusPins(args.path, args.fs, [], log)
-  return { cleared, total: persisted.length }
+  persistStatusPins(args.path, args.fs, next, log)
+  return { cleared, retained, kept, total: persisted.length }
 }
 
 /**
