@@ -307,7 +307,7 @@ State of the triple-maintained paths as of this checklist:
 | bridgeUp drain (inbound + perm-verdict redelivery) | **Yes** — dispatched via `dispatchEffects` (PR3a) | Imperative drain only under kill-switch `SWITCHROOM_DELIVERY_MACHINE_CUTOVER=0` (gateway.ts bridgeUp handler) |
 | turn-in-flight GATE (`turnInFlightForGate`) | **Yes** — `isMachineInTurn()` | `claudeBusyKeys` set still fully maintained + reaped in parallel; read on kill-switch path. **Drift canary added (`gate-parity-probe.ts`, #2794).** |
 | `turnEnd` lifecycle | No — shadow-only (`shadowEmit`) | Imperative `purgeReactionTracking` / `endCurrentTurnAtomic` + multi-callsite emits (RFC PR3b step 1 audit) |
-| `inbound` routing (deliver vs buffer) | No — shadow-only | Imperative `if (turnInFlight) buffer else deliver` in `handleInbound` |
+| `inbound` routing (deliver vs buffer) | **Yes** — `handleInbound` dispatches the captured `inbound` effects via `dispatchEffects` (PR3c flip, #2794) | Imperative twin retained for kill-switch `=0` + two documented carve-outs the machine doesn't model yet (`!`-interrupt while in_turn; bridge_dead send-miss semantics — the carve-out keys off the anchored `inbound_bridge_dead_buffer` trace stage). **Known behavior delta, accepted for the bake:** after a machine-path send-miss (bridge nominally alive, `sendToAgent` false/throw) the machine stays `in_turn` until the TTL tick or a bridge flap clears it, so subsequent inbounds in that window are machine-buffered (queued busy-ack) instead of the legacy per-message send attempt + restart notice. Delete twin in PR4 after the 48h bake |
 | poke ladder + `firePoke` | No | Imperative silence-poke |
 | perm-verdict deliver/persist (non-bridgeUp) | No | Imperative |
 
@@ -322,9 +322,16 @@ Checklist (each box = one baked PR; keep the kill-switch until PR4):
 - [ ] **PR3b step 2** — flip `shadowEmit({kind:'turnEnd'})` →
   `dispatchEvent` inside `endCurrentTurnAtomic`; remove the imperative
   cleanups from `purgeReactionTracking`.
-- [ ] **PR3c** — inbound cutover: `handleInbound` dispatches an inbound
+- [x] **PR3c** — inbound cutover: `handleInbound` dispatches an inbound
   Event; the machine's `deliverToBridge`/`bufferInbound` effects replace
-  the imperative in-handler routing.
+  the imperative in-handler routing. *(flipped under #2794 — machine
+  authoritative by default; `SWITCHROOM_DELIVERY_MACHINE_CUTOVER=0`
+  restores the imperative twin verbatim. Two carve-outs still route to
+  the twin even cutover-on: `!`-interrupt while the machine reads
+  in_turn (the machine has no interrupt event; buffering would strand
+  the body) and bridge_dead (the twin's shouldTrackDelivery drop
+  carve-outs + restart notice are the contract). Twin deleted in PR4
+  after the 48h bake.)*
 - [ ] **PR4** — delete the kill-switch fallback branches, the
   `claudeBusyKeys` set + its reaper, `gate-parity-probe.ts`, and the
   redundant silence-poke/purge primitives. Net −200…−500 lines.

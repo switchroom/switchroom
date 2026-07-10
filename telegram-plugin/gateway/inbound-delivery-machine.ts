@@ -261,6 +261,14 @@ export function transition(state: State, event: Event): Transition {
       const alive = state.global.kind !== 'bridge_dead'
 
       if (!alive) {
+        // ANCHORED STRING — `inbound_bridge_dead_buffer` is load-bearing:
+        // gateway.ts's PR3c bridge-dead carve-out keys off this exact stage
+        // string to route the inbound to the imperative twin (whose
+        // shouldTrackDelivery drop semantics + restart notice are the
+        // contract the machine doesn't model). Renaming it silently reroutes
+        // that carve-out; a pin test in inbound-delivery-cutover-flip.test.ts
+        // breaks on rename. Both the string key-off and this anchor are
+        // deleted in PR4 with the twin.
         return {
           state,
           effects: [

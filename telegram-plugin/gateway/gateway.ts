@@ -17764,13 +17764,20 @@ async function handleInbound(
   // isSteering is now the real classification (computed at ~line 16289), so
   // the machine correctly distinguishes a mid-turn steer (delivered, no new
   // turn) from a fresh turn.
-  shadowEmit({
+  // PR3c cutover (#2794 / #2996): the payload now carries the REAL
+  // ipc-protocol InboundMessage (previously null) so the machine's
+  // deliverToBridge / bufferInbound / persistInbound effects are executable,
+  // and the returned effects are CAPTURED — under the cutover they are
+  // dispatched below and become the authoritative deliver-vs-buffer routing.
+  // The machine treats the payload as opaque, so the kill-switch shadow
+  // trace is unchanged.
+  const machineInboundEffects = shadowEmit({
     kind: 'inbound',
     key: statusKey(chat_id, messageThreadId) as _ChatKey,
     msg: {
       msgId: msgId ?? 0,
       isSteering,
-      payload: null,
+      payload: inboundMsg,
     },
     at: Date.now(),
   })
@@ -17783,6 +17790,72 @@ async function handleInbound(
     isInterrupt: interrupt.isInterrupt,
     effectiveText,
   })
+
+  // ── PR3c inbound cutover (#2794 / #2996 item 1) ────────────────────────
+  // The machine's effect list is now AUTHORITATIVE for the deliver-vs-buffer
+  // routing when the cutover is on: the effects captured at the emit above
+  // are executed through `dispatchEffects` (wired to real executors in
+  // #3006) instead of the imperative twin below. The twin stays fully
+  // intact as the kill-switch fallback (`SWITCHROOM_DELIVERY_MACHINE_CUTOVER=0`
+  // restores the exact legacy path) and is deleted in PR4 after the 48h bake.
+  //
+  // Two carve-outs fall back to the imperative twin even with the cutover on
+  // (both documented in the RFC as un-modeled by the machine; the twin's
+  // behavior is the contract until the machine grows the events):
+  //   1. `!`-interrupt while the machine reads in_turn — the twin's
+  //      interrupt carve-out delivers (the SIGINT'd turn may never emit
+  //      turn_complete, so buffering would strand the body; see
+  //      decideInboundDelivery). The machine has no interrupt concept yet
+  //      and would buffer.
+  //   2. machine reads bridge_dead — the twin attempts the send and, on
+  //      miss, applies the shouldTrackDelivery carve-outs (steering /
+  //      interrupt / sourced bodies are dropped, not replayed orphaned
+  //      after restart) + posts the restart notice. The machine's
+  //      unconditional buffer+persist would replay a steer as a fresh turn.
+  const machineDelivers = machineInboundEffects.some((e) => e.kind === 'deliverToBridge')
+  const machineBuffers = machineInboundEffects.some((e) => e.kind === 'bufferInbound')
+  // ANCHORED STRING — must match the machine's bridge-dead inbound trace
+  // stage verbatim (see the anchor comment at its emit site in
+  // inbound-delivery-machine.ts + the pin test in
+  // inbound-delivery-cutover-flip.test.ts). Deleted in PR4 with the twin.
+  const machineBridgeDead = machineInboundEffects.some(
+    (e) => e.kind === 'logTrace' && e.stage === 'inbound_bridge_dead_buffer',
+  )
+  const machineAuthoritative =
+    isDeliveryCutoverEnabled() &&
+    isDispatchEnabled() &&
+    !machineBridgeDead &&
+    (machineDelivers || (machineBuffers && interrupt.isInterrupt !== true))
+  if (machineAuthoritative && machineBuffers) {
+    // Machine says: mid-turn non-steering inbound → buffer until idle (the
+    // #1556 contract). dispatchEffects executes bufferInbound (+ the
+    // idempotent persistInbound — push() already spools when a spool is
+    // attached) + the logTrace. The queued-status UX below is presentation,
+    // not routing — it stays imperative on both paths until PR4.
+    dispatchEffects(machineInboundEffects, {
+      selfAgent,
+      ipcServer,
+      pendingInboundBuffer,
+      inboundSpool: inboundSpool ?? null,
+      pendingPermissionBuffer,
+    })
+    process.stderr.write(
+      `telegram gateway: inbound held mid-turn (machine) agent=${selfAgent} ` +
+      `chat=${chat_id} msg=${msgId ?? '-'} — will flush on turn-complete\n`,
+    )
+    const inFlightThreadM = currentTurn?.sessionThreadId
+    const crossTopicQueuedCardM =
+      QUEUED_STATUS_UX_ENABLED &&
+      !isDmChatId(chat_id) &&
+      messageThreadId != null &&
+      messageThreadId !== inFlightThreadM
+    if (crossTopicQueuedCardM) {
+      postQueuedStatus(chat_id, messageThreadId, inFlightThreadM)
+    } else {
+      maybePostBusyAck('buffer-until-idle', chat_id, messageThreadId ?? undefined)
+    }
+    return
+  }
 
   // #2917: read the gate LIVE (not the receipt snapshot) on the default path
   // so a sibling same-chat inbound delivered during THIS handler's async
@@ -17809,7 +17882,10 @@ async function handleInbound(
     // the freshly-killed bridge.
     isInterrupt: interrupt.isInterrupt,
   })
-  if (deliveryGate.decision === 'buffer-until-idle') {
+  // PR3c: the legacy buffer branch runs ONLY when the machine is not
+  // authoritative (kill switch / carve-out fallback) — the machine buffer
+  // path above already returned for machine-routed buffering.
+  if (!machineAuthoritative && deliveryGate.decision === 'buffer-until-idle') {
     pendingInboundBuffer.push(selfAgent, inboundMsg)
     process.stderr.write(
       `telegram gateway: inbound held mid-turn agent=${selfAgent} ` +
@@ -17850,8 +17926,12 @@ async function handleInbound(
   // other's async lead-in and race to the bridge, reordering the replies.
   // Only fresh-turn deliveries reserve (steering/interrupt amend a running
   // turn and must not). Released below if the send misses (bridge offline).
+  // PR3c: skipped when the machine is authoritative — the inbound event at
+  // DEFERRED_INBOUND_EMIT advanced the machine SYNCHRONOUSLY (idle→in_turn),
+  // so the machine itself is the pre-await reservation; the busy-key mirror
+  // is stamped by the setTurnStarted effect in the dispatch below.
   let reservedBusyKey: string | null = null
-  if (deliveryGate.reserve && SERIALIZE_INBOUND_DELIVERY_ENABLED && machineInTurnAtReceipt == null) {
+  if (!machineAuthoritative && deliveryGate.reserve && SERIALIZE_INBOUND_DELIVERY_ENABLED && machineInTurnAtReceipt == null) {
     reservedBusyKey = markClaudeBusyForInbound(inboundMsg)
   }
 
@@ -17880,6 +17960,104 @@ async function handleInbound(
         `telegram gateway: pre-send composer-clear threw agent=${selfAgent}: ${(err as Error).message} — delivering anyway\n`,
       )
     }
+  }
+
+  // ── PR3c machine deliver path (#2794) ──────────────────────────────────
+  // The machine said deliver (fresh turn: setTurnStarted + deliverToBridge;
+  // steer: deliverToBridge only). dispatchEffects executes the send; the
+  // post-send branches below mirror the imperative twin bit-for-bit:
+  // delivered → steer ack + busy-mark (idempotent, same lifecycle the twin
+  // stamps) + delivery-confirm tracking; miss → release the busy mirror in
+  // lockstep, durable-buffer per the shouldTrackDelivery carve-outs, and
+  // post the restart notice. NOTE the machine already advanced to in_turn
+  // at the emit; a send-miss therefore leaves the machine in_turn until the
+  // TTL tick clears it — identical to today's cutover behavior (the emit
+  // has always preceded the send attempt), not a regression of this flip.
+  if (machineAuthoritative) {
+    let machineDelivered = false
+    // Key stamped by THIS dispatch's setTurnStarted effect (fresh turn only —
+    // a mid-turn steer emits deliverToBridge WITHOUT setTurnStarted). The
+    // miss branch below may only release a key THIS dispatch stamped: on a
+    // steer-miss the chat's busy key belongs to the ORIGINAL in-flight turn
+    // (mirroring the twin, which only ever releases reservedBusyKey and never
+    // reserves for steers). An unconditional delete would wipe the running
+    // turn's key → false machine_over_holds parity drift during the bake +
+    // the pending-restart gate (claudeBusyKeys.size) could green-light a
+    // mid-turn restart.
+    let machineStampedKey: string | null = null
+    dispatchEffects(machineInboundEffects, {
+      selfAgent,
+      ipcServer,
+      pendingInboundBuffer,
+      inboundSpool: inboundSpool ?? null,
+      pendingPermissionBuffer,
+      // Busy-key mirror: same lockstep add markClaudeBusyForInbound does —
+      // keeps the kill-switch fallback + gate-parity-probe + pending-restart
+      // gate (claudeBusyKeys.size) coherent while the twins remain live.
+      onSetTurnStarted: (k, at) => {
+        machineStampedKey = k
+        markBusyKeyLockstep(claudeBusyKeys, claudeBusyKeySince, k, at)
+      },
+      onDeliverResult: (_k, ok) => {
+        machineDelivered = ok
+      },
+    })
+    if (machineDelivered) {
+      if (isSteering) {
+        maybePostBusyAck('steer', chat_id, messageThreadId ?? undefined)
+      }
+      // Mirror the twin: EVERY delivered inbound stamps the busy key
+      // (steer/interrupt included — idempotent lockstep re-stamp), and the
+      // returned key is what the delivery-confirm tracker matches acks on.
+      const busyKey = markClaudeBusyForInbound(inboundMsg)
+      if (
+        DELIVERY_CONFIRM_ENABLED &&
+        shouldTrackDelivery({
+          isSteering,
+          isInterrupt: interrupt.isInterrupt,
+          hasSource: inboundMsg.meta?.source != null,
+          effectiveText,
+        })
+      ) {
+        trackDelivery(deliveryQueue, busyKey, inboundMsg, Date.now(), String(inboundMsg.messageId))
+      }
+    } else {
+      // Send missed while the machine read bridge-alive. Release ONLY a busy
+      // mirror THIS dispatch's setTurnStarted stamped (lockstep with the
+      // twin's reservedBusyKey release). A steer-miss stamped nothing — the
+      // chat key belongs to the original in-flight turn and must survive
+      // (see machineStampedKey above). Then buffer per the carve-outs, notify.
+      //
+      // Known behavior delta (documented, accepted for the bake): the
+      // machine already advanced to in_turn at the emit, so until the TTL
+      // tick / bridge-flap clears it, SUBSEQUENT inbounds are machine-
+      // buffered ("queued" busy-ack) instead of the legacy per-message send
+      // attempt + restart notice. See the RFC carve-out row + PR body.
+      if (machineStampedKey != null) {
+        claudeBusyKeys.delete(machineStampedKey)
+        claudeBusyKeySince.delete(machineStampedKey)
+      }
+      if (
+        shouldTrackDelivery({
+          isSteering,
+          isInterrupt: interrupt.isInterrupt,
+          hasSource: inboundMsg.meta?.source != null,
+          effectiveText,
+        })
+      ) {
+        pendingInboundBuffer.push(selfAgent, inboundMsg)
+      }
+      const threadOptsM = messageThreadId != null ? { message_thread_id: messageThreadId } : {}
+      void swallowingApiCall(
+        () => bot.api.sendMessage(chat_id, '⏳ Agent is restarting — your message is queued and will be processed when it reconnects.', { ...threadOptsM }),
+        {
+          chat_id,
+          verb: 'agent-restarting-notice',
+          ...(messageThreadId != null ? { threadId: messageThreadId } : {}),
+        },
+      )
+    }
+    return
   }
 
   const delivered = ipcServer.sendToAgent(selfAgent, inboundMsg)
