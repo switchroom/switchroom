@@ -131,10 +131,17 @@ describe('lever 2 — finalize the card BEFORE a substantive reply send', () => 
     return after.split('\nasync function ')[0]?.split('\nfunction ')[0] ?? after
   }
 
-  it('executeReply finalizes (clearActivitySummary) before the chunk loop, gated on substantive', () => {
+  // #2996 step 1: the chunk send loop was relocated verbatim from executeReply
+  // into outbound-send-path.ts's `sendReplyChunks`, invoked here as
+  // `await sendReplyChunks(chunkSendDeps, …)`. This guard's INTENT — the
+  // lever-2 card finalize runs BEFORE the reply send — is unchanged; the send
+  // marker is now the delegation call rather than the inline `for` loop.
+  const SEND_MARKER = 'sendReplyChunks('
+
+  it('executeReply finalizes (clearActivitySummary) before the reply send, gated on substantive', () => {
     const src = executeReplySrc()
     const clearIdx = src.indexOf('clearActivitySummary(')
-    const loopIdx = src.indexOf('for (let i = 0; i < chunks.length')
+    const loopIdx = src.indexOf(SEND_MARKER)
     expect(clearIdx).toBeGreaterThan(-1)
     expect(loopIdx).toBeGreaterThan(-1)
     expect(clearIdx).toBeLessThan(loopIdx)
@@ -148,8 +155,8 @@ describe('lever 2 — finalize the card BEFORE a substantive reply send', () => 
     // An ack (non-substantive) falls through and never finalizes early, so the
     // reopen path keeps owning the card (the #2141 ack-then-work feed).
     const replySrc = executeReplySrc()
-    // The pre-loop clearActivitySummary must be the substantive-gated one.
-    const preLoop = replySrc.split('for (let i = 0; i < chunks.length')[0] ?? ''
+    // The pre-send clearActivitySummary must be the substantive-gated one.
+    const preLoop = replySrc.split(SEND_MARKER)[0] ?? ''
     const clears = [...preLoop.matchAll(/clearActivitySummary\(/g)]
     expect(clears).toHaveLength(1)
   })
