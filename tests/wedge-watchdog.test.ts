@@ -490,6 +490,10 @@ describe("runWedgeWatchdog — permission-prompt freeze", () => {
       rateLimitSignature: null,
       confirmModalSignature: null,
       manifestStallSignature: null,
+      // #2971 — disable the card-aware gate for these pre-existing
+      // plain-Esc tests (isolates them from the new branch; a real gateway
+      // socket is never touched in tests).
+      queryPendingPermission: null,
       pollIntervalMs: 0,
       now: () => 0,
       sleep: () => {},
@@ -515,6 +519,7 @@ describe("runWedgeWatchdog — permission-prompt freeze", () => {
       rateLimitSignature: null,
       confirmModalSignature: null,
       manifestStallSignature: null,
+      queryPendingPermission: null,
       pollIntervalMs: 0,
       now: () => 0,
       sleep: () => {},
@@ -535,6 +540,7 @@ describe("runWedgeWatchdog — permission-prompt freeze", () => {
       rateLimitSignature: null,
       confirmModalSignature: null,
       manifestStallSignature: null,
+      queryPendingPermission: null,
       pollIntervalMs: 0,
       now: () => 0,
       sleep: () => {},
@@ -550,6 +556,160 @@ describe("runWedgeWatchdog — permission-prompt freeze", () => {
     });
     expect(res.permissionPromptFires).toBe(0);
     expect(calls).toEqual([]);
+  });
+});
+
+// ─── Issue #2971 — card-aware permission-prompt gate ──────────────────────────
+//
+// Since PR #2581, the permission branch above Esc-denied EVERY per-tool
+// permission prompt after the shape-persistence threshold — including
+// prompts that already had a live Telegram approval card racing in
+// parallel. These tests drive the NEW `queryPendingPermission` seam
+// directly (no real gateway socket touched).
+
+describe("runWedgeWatchdog — permission-prompt card-aware gate (#2971)", () => {
+  it("SKIPS Esc when the gateway reports a live pending permission card", async () => {
+    const { send, calls } = recordSend();
+    const queryPendingPermission = async () =>
+      ({ ok: true, pending: true, requestId: "abc123" }) as const;
+    const res = await runWedgeWatchdog({
+      agentName: "carrie",
+      permissionPromptPolls: 3,
+      rateLimitSignature: null,
+      confirmModalSignature: null,
+      manifestStallSignature: null,
+      queryPendingPermission,
+      pollIntervalMs: 0,
+      now: () => 0,
+      sleep: () => {},
+      maxPolls: 3,
+      capture: captureFlicker([
+        PERMISSION_PROMPT_A,
+        PERMISSION_PROMPT_B,
+        PERMISSION_PROMPT_A,
+      ]),
+      send,
+    });
+    // No keystroke of ANY kind — the fix's hard constraint.
+    expect(calls).toEqual([]);
+    expect(res.fires).toBe(0);
+    expect(res.permissionPromptFires).toBe(0);
+    expect(res.permissionPromptDeferrals).toBe(1);
+  });
+
+  it("Escs on gateway-unreachable (ok: false) — fallback preserved", async () => {
+    const { send, calls } = recordSend();
+    const queryPendingPermission = async () =>
+      ({ ok: false, reason: "timeout" }) as const;
+    const res = await runWedgeWatchdog({
+      agentName: "carrie",
+      permissionPromptPolls: 3,
+      rateLimitSignature: null,
+      confirmModalSignature: null,
+      manifestStallSignature: null,
+      queryPendingPermission,
+      pollIntervalMs: 0,
+      now: () => 0,
+      sleep: () => {},
+      maxPolls: 3,
+      capture: captureFlicker([
+        PERMISSION_PROMPT_A,
+        PERMISSION_PROMPT_B,
+        PERMISSION_PROMPT_A,
+      ]),
+      send,
+    });
+    expect(calls).toEqual([["Escape"]]);
+    expect(res.fires).toBe(1);
+    expect(res.permissionPromptFires).toBe(1);
+    expect(res.permissionPromptDeferrals).toBe(0);
+  });
+
+  it("Escs on gateway reporting no pending permission (card-less prompt)", async () => {
+    const { send, calls } = recordSend();
+    const queryPendingPermission = async () =>
+      ({ ok: true, pending: false }) as const;
+    const res = await runWedgeWatchdog({
+      agentName: "carrie",
+      permissionPromptPolls: 3,
+      rateLimitSignature: null,
+      confirmModalSignature: null,
+      manifestStallSignature: null,
+      queryPendingPermission,
+      pollIntervalMs: 0,
+      now: () => 0,
+      sleep: () => {},
+      maxPolls: 3,
+      capture: captureFlicker([
+        PERMISSION_PROMPT_A,
+        PERMISSION_PROMPT_B,
+        PERMISSION_PROMPT_A,
+      ]),
+      send,
+    });
+    expect(calls).toEqual([["Escape"]]);
+    expect(res.fires).toBe(1);
+    expect(res.permissionPromptFires).toBe(1);
+    expect(res.permissionPromptDeferrals).toBe(0);
+  });
+
+  it("Escs when queryPendingPermission THROWS (soft-fail, defence-in-depth)", async () => {
+    const { send, calls } = recordSend();
+    const queryPendingPermission = async () => {
+      throw new Error("boom");
+    };
+    const res = await runWedgeWatchdog({
+      agentName: "carrie",
+      permissionPromptPolls: 3,
+      rateLimitSignature: null,
+      confirmModalSignature: null,
+      manifestStallSignature: null,
+      queryPendingPermission,
+      pollIntervalMs: 0,
+      now: () => 0,
+      sleep: () => {},
+      maxPolls: 3,
+      capture: captureFlicker([
+        PERMISSION_PROMPT_A,
+        PERMISSION_PROMPT_B,
+        PERMISSION_PROMPT_A,
+      ]),
+      send,
+    });
+    expect(calls).toEqual([["Escape"]]);
+    expect(res.fires).toBe(1);
+  });
+
+  it("never sends Enter or a numeric key on ANY path (deferred or Esc)", async () => {
+    for (const queryPendingPermission of [
+      async () => ({ ok: true, pending: true, requestId: "x" }) as const,
+      async () => ({ ok: true, pending: false }) as const,
+      async () => ({ ok: false, reason: "down" }) as const,
+      null,
+    ]) {
+      const { send, calls } = recordSend();
+      await runWedgeWatchdog({
+        agentName: "carrie",
+        permissionPromptPolls: 3,
+        rateLimitSignature: null,
+        confirmModalSignature: null,
+        manifestStallSignature: null,
+        queryPendingPermission,
+        pollIntervalMs: 0,
+        now: () => 0,
+        sleep: () => {},
+        maxPolls: 3,
+        capture: captureFlicker([
+          PERMISSION_PROMPT_A,
+          PERMISSION_PROMPT_B,
+          PERMISSION_PROMPT_A,
+        ]),
+        send,
+      });
+      for (const keys of calls) {
+        expect(keys).toEqual(["Escape"]);
+      }
+    }
   });
 });
 

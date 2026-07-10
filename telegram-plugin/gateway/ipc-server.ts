@@ -6,6 +6,7 @@ import type {
   InjectInboundMessage,
   SendOutboundMessage,
   QuotaWallDetectedMessage,
+  QueryPendingPermissionMessage,
   PostSkillProposalMessage,
   OperatorEventForward,
   PermissionRequestForward,
@@ -67,6 +68,18 @@ export interface IpcServerOptions {
    * don't run failover simply ignore it.
    */
   onQuotaWallDetected?: (client: IpcClient, msg: QuotaWallDetectedMessage) => void;
+  /**
+   * Issue #2971 — read-only wedge-watchdog query: is there a live pending
+   * permission request (Telegram approval card) for this agent right now?
+   * The handler MUST reply on the same connection with a
+   * `pending_permission_status` event (matching `correlationId`) sourced
+   * from the gateway's `pendingPermissions` map. Optional: when no handler
+   * is wired (older gateway build, or a test fixture that doesn't need it),
+   * the server replies `pending: false` immediately — the watchdog's
+   * existing Esc fallback then behaves exactly as it did before this
+   * feature (mixed-version safety).
+   */
+  onQueryPendingPermission?: (client: IpcClient, msg: QueryPendingPermissionMessage) => void;
   /**
    * #2670 one-tap self-improvement — persist a skill-improvement proposal
    * and post its Approve/Dismiss card. Handler persists the draft bundle to
@@ -330,6 +343,15 @@ export function validateClientMessage(msg: unknown): msg is ClientToGateway {
         && (typeof m.resetAt !== "number" || !Number.isFinite(m.resetAt as number))) return false;
       return true;
     }
+    case "query_pending_permission": {
+      // Issue #2971 — read-only wedge-watchdog probe. Wire shape only.
+      if (typeof m.agentName !== "string"
+        || !AGENT_NAME_RE.test(m.agentName as string)) return false;
+      if (typeof m.correlationId !== "string"
+        || (m.correlationId as string).length === 0
+        || (m.correlationId as string).length > 64) return false;
+      return true;
+    }
     case "request_config_approval": {
       // #1623 — hostd-initiated config-edit approval card. Wire shape
       // only; the handler module validates the diff content.
@@ -449,6 +471,7 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
     onInjectInbound,
     onSendOutbound,
     onQuotaWallDetected,
+    onQueryPendingPermission,
     onPostSkillProposal,
     onRequestDriveApproval,
     onRequestMs365Approval,
@@ -568,6 +591,23 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
         break;
       case "quota_wall_detected":
         if (onQuotaWallDetected) onQuotaWallDetected(client, msg as QuotaWallDetectedMessage);
+        break;
+      case "query_pending_permission":
+        if (onQueryPendingPermission) {
+          onQueryPendingPermission(client, msg as QueryPendingPermissionMessage);
+        } else {
+          // No handler wired — fail closed to "not pending" so the caller's
+          // Esc fallback fires (byte-identical to pre-#2971 behaviour).
+          try {
+            client.send({
+              type: "pending_permission_status",
+              correlationId: (msg as QueryPendingPermissionMessage).correlationId,
+              pending: false,
+            });
+          } catch {
+            /* best effort */
+          }
+        }
         break;
       case "request_drive_approval":
         if (onRequestDriveApproval) {

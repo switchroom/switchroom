@@ -134,6 +134,25 @@ export interface ConfigApprovalResolvedEvent {
   denySource?: "operator" | "dispatch_failure";
 }
 
+/**
+ * Issue #2971 — the wedge-watchdog's permission branch answer to
+ * `query_pending_permission`. Read-only reply sourced from the gateway's
+ * `pendingPermissions` map: `pending: true` means a live Telegram approval
+ * card (and the #2724 TTL reaper) is already racing the TUI prompt for this
+ * agent, so the watchdog must NOT Esc — the reaper's channel-delivered deny
+ * dismisses the TUI cleanly at TTL. `pending: false` means no card exists
+ * (bridge down, a `requiresUserInteraction` tool, or genuinely no live
+ * request) — the watchdog's Esc fallback is safe and expected.
+ */
+export interface PendingPermissionStatusEvent {
+  type: "pending_permission_status";
+  /** Echoes the correlationId from the originating query. */
+  correlationId: string;
+  pending: boolean;
+  /** The live `pendingPermissions` key, when `pending: true`. */
+  requestId?: string;
+}
+
 export type GatewayToClient =
   | InboundMessage
   | PermissionEvent
@@ -143,7 +162,8 @@ export type GatewayToClient =
   | DriveApprovalPostedEvent
   | Ms365ApprovalPostedEvent
   | ConfigApprovalResolvedEvent
-  | RolloutStatusPostedEvent;
+  | RolloutStatusPostedEvent
+  | PendingPermissionStatusEvent;
 
 // === Bridge (Client) -> Gateway messages ===
 
@@ -555,6 +575,27 @@ export interface RolloutStatusPostedEvent {
   reason?: string;
 }
 
+/**
+ * Issue #2971 — sent by the wedge-watchdog (autoaccept-poll sidecar) over
+ * the gateway UDS, BEFORE it would otherwise Esc a shape-persistent
+ * per-tool permission prompt. Read-only: asks whether a live Telegram
+ * approval card (`pendingPermissions`) already exists for this agent's
+ * in-flight permission request, so the watchdog can defer to the card /
+ * the #2724 TTL reaper instead of racing it with a keystroke.
+ *
+ * Trust model: same as quota_wall_detected — the socket is per-agent
+ * inside the container; `agentName` is validated server-side (and, in the
+ * gateway handler, checked against the gateway's own SWITCHROOM_AGENT_NAME)
+ * but this message can never mutate state — it only reads
+ * `pendingPermissions.size`/entries.
+ */
+export interface QueryPendingPermissionMessage {
+  type: "query_pending_permission";
+  agentName: string;
+  /** Caller-generated correlation id, echoed in the reply. */
+  correlationId: string;
+}
+
 export type ClientToGateway =
   | RegisterMessage
   | ToolCallMessage
@@ -574,4 +615,5 @@ export type ClientToGateway =
   | SendOutboundMessage
   | PostSkillProposalMessage
   | RolloutStatusPostMessage
-  | RolloutStatusEditMessage;
+  | RolloutStatusEditMessage
+  | QueryPendingPermissionMessage;

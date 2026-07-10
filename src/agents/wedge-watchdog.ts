@@ -30,6 +30,10 @@
 //     multi-poll stability before acting, and a cooldown after firing.
 
 import { capturePane, sendKeys, PROMPTS, type PromptRule } from "./autoaccept.js";
+import {
+  queryPendingPermission as defaultQueryPendingPermission,
+  type PendingPermissionQueryResult,
+} from "./permission-pending-query.js";
 
 /**
  * Blocking-modal footer signature. Deliberately strict: requires BOTH
@@ -453,6 +457,28 @@ export interface WedgeWatchdogOptions {
    */
   permissionPromptPolls?: number;
   /**
+   * Issue #2971 — card-aware gate for the permission-prompt branch. Once
+   * `permissionPromptPolls` shape-persistence is reached, the watchdog calls
+   * this BEFORE ever sending Esc, to ask the gateway whether a live Telegram
+   * approval card already exists for this agent (`pendingPermissions`).
+   *
+   *   - `{ ok: true, pending: true }`  → a card (+ the #2724 TTL reaper) owns
+   *     this prompt. Skip Esc entirely — the reaper's channel-delivered deny
+   *     dismisses the TUI at TTL with no keystroke needed.
+   *   - `{ ok: true, pending: false }` → genuinely card-less prompt (bridge
+   *     down, a `requiresUserInteraction` tool). Fall back to Esc.
+   *   - `{ ok: false }` (gateway unreachable, timed out, or an older gateway
+   *     that doesn't recognise the query) → fall back to Esc — identical to
+   *     the pre-#2971 behaviour, so a mixed-version fleet degrades safely.
+   *
+   * `undefined` (the default) → real gateway UDS round-trip via
+   * `queryPendingPermission` from `permission-pending-query.ts` (~2s budget).
+   * `null` → disable the card-aware check entirely and Esc unconditionally,
+   * exactly like before this feature existed (kill switch for tests / a
+   * rollback).
+   */
+  queryPendingPermission?: ((agentName: string) => Promise<PendingPermissionQueryResult>) | null;
+  /**
    * #2471 — semantic no-progress: a "Manifesting" + Stop-hook-error state
    * that persists past `manifestStallPolls`. The in-pane Esc evidently
    * could not clear it (the turn never ends), so this escalates to a clean
@@ -504,6 +530,10 @@ export interface WedgeWatchdogResult {
   /** Subset of `fires` that dismissed a per-tool permission-prompt TUI
    *  (the config_propose_edit / hostd-verb freeze) with a safe Esc-decline. */
   permissionPromptFires: number;
+  /** Issue #2971 — count of permission prompts where the gateway reported a
+   *  LIVE pending-permission card, so the watchdog deferred (no Esc) rather
+   *  than racing the card/TTL reaper. Disjoint from `permissionPromptFires`. */
+  permissionPromptDeferrals: number;
   /** #2471 — count of manifest-stall escalations (kill + handoff restart). */
   restartEscalations: number;
   /** Total polls executed (bounded only in tests via maxPolls). */
@@ -572,6 +602,10 @@ export async function runWedgeWatchdog(
   const manifestStallPolls =
     opts.manifestStallPolls ?? envInt("SWITCHROOM_WEDGE_MANIFEST_POLLS", DEFAULT_MANIFEST_STALL_POLLS);
   const requestRestart = opts.requestRestart;
+  // Issue #2971 — card-aware gate. `null` disables (Esc unconditionally,
+  // pre-#2971 behaviour); `undefined` (default) wires the real gateway query.
+  const queryPendingPermission =
+    opts.queryPendingPermission === null ? null : (opts.queryPendingPermission ?? defaultQueryPendingPermission);
   const maxPolls = opts.maxPolls ?? Number.POSITIVE_INFINITY;
   const now = opts.now ?? Date.now;
   const sleep = opts.sleep ?? defaultSleep;
@@ -586,6 +620,7 @@ export async function runWedgeWatchdog(
   let overageCreditSelections = 0;
   let confirmModalFires = 0;
   let permissionPromptFires = 0;
+  let permissionPromptDeferrals = 0;
   let restartEscalations = 0;
   let polls = 0;
   // #2471 — shape-persistence counters (independent of the byte-stable
@@ -800,29 +835,72 @@ export async function runWedgeWatchdog(
       stableCount = 0;
       lastKey = null;
       if (permissionPromptPresent >= permissionPromptPolls && now() >= permissionCooldownUntil) {
-        console.error(
-          `[wedge-watchdog] ${opts.agentName}: dismissing stuck per-tool ` +
-            `permission prompt (Esc == decline == safe DENY) after ` +
-            `${permissionPromptPresent} polls present ` +
-            `(~${Math.round((permissionPromptPresent * pollIntervalMs) / 1000)}s) — ` +
-            `the prompt rendered as an interactive TUI with no TTL auto-deny, ` +
-            `freezing the turn; no human to answer it`,
-        );
-        // Esc ONLY — Claude Code treats Esc as "user declined", which is the
-        // safe DENY for a non-pre-approved verb. It can NEVER land on option
-        // 1/2 ("Yes" / "Yes, and don't ask again"), so the human-in-the-loop
-        // boundary for the hostd verbs is preserved. Never send Enter/numeric.
-        try {
-          send(opts.agentName, ["Escape"]);
-        } catch (err) {
-          console.error(
-            `[wedge-watchdog] ${opts.agentName}: send threw: ${(err as Error).message}`,
-          );
+        // Issue #2971 — card-aware gate, BEFORE any keystroke. Claude Code
+        // renders this TUI AND emits the `permission_request` channel
+        // notification unconditionally in parallel — if a Telegram approval
+        // card is already live for this request, firing Esc here just races
+        // it and Esc-denies the operator's own in-flight card. Ask the
+        // gateway first.
+        let status: PendingPermissionQueryResult | null = null;
+        if (queryPendingPermission) {
+          try {
+            status = await queryPendingPermission(opts.agentName);
+          } catch (err) {
+            // Soft-fail: the query function is contracted to never throw,
+            // but defence-in-depth — treat a throw exactly like `ok: false`
+            // (gateway-unreachable), i.e. fall back to Esc.
+            console.error(
+              `[wedge-watchdog] ${opts.agentName}: queryPendingPermission threw: ${(err as Error).message} — treating as unreachable`,
+            );
+            status = { ok: false, reason: `threw: ${(err as Error).message}` };
+          }
         }
-        fires++;
-        permissionPromptFires++;
-        permissionCooldownUntil = now() + cooldownMs;
-        permissionPromptPresent = 0;
+        if (status && status.ok && status.pending) {
+          // A live card owns this prompt. Do NOT Esc — the #2724 TTL reaper
+          // delivers a deny over the channel at TTL, which dismisses the TUI
+          // cleanly with no keystroke. Cooldown throttles re-querying the
+          // gateway every poll while the card is still live; the shape
+          // streak (`permissionPromptPresent`) is left untouched — the
+          // prompt genuinely is still present, so a later Esc fallback (if
+          // the card ever disappears without resolving) still sees the full
+          // accumulated streak.
+          console.error(
+            `[wedge-watchdog] ${opts.agentName}: permission prompt has live card ` +
+              `${status.requestId ?? "(id unknown)"}, deferring to card/TTL after ` +
+              `${permissionPromptPresent} polls present ` +
+              `(~${Math.round((permissionPromptPresent * pollIntervalMs) / 1000)}s) — NOT sending Esc`,
+          );
+          permissionPromptDeferrals++;
+          permissionCooldownUntil = now() + cooldownMs;
+        } else {
+          const reason =
+            queryPendingPermission == null
+              ? "card-aware check disabled"
+              : status && status.ok
+                ? "gateway reports no pending permission (card-less prompt)"
+                : `gateway unreachable/no answer within budget${status && !status.ok ? ` (${status.reason})` : ""}`;
+          console.error(
+            `[wedge-watchdog] ${opts.agentName}: dismissing stuck per-tool ` +
+              `permission prompt (Esc == decline == safe DENY) after ` +
+              `${permissionPromptPresent} polls present ` +
+              `(~${Math.round((permissionPromptPresent * pollIntervalMs) / 1000)}s) — ${reason}`,
+          );
+          // Esc ONLY — Claude Code treats Esc as "user declined", which is the
+          // safe DENY for a non-pre-approved verb. It can NEVER land on option
+          // 1/2 ("Yes" / "Yes, and don't ask again"), so the human-in-the-loop
+          // boundary for the hostd verbs is preserved. Never send Enter/numeric.
+          try {
+            send(opts.agentName, ["Escape"]);
+          } catch (err) {
+            console.error(
+              `[wedge-watchdog] ${opts.agentName}: send threw: ${(err as Error).message}`,
+            );
+          }
+          fires++;
+          permissionPromptFires++;
+          permissionCooldownUntil = now() + cooldownMs;
+          permissionPromptPresent = 0;
+        }
       }
     } else if (isConfirmModal) {
       // #2471 — SHAPE persistence, not byte-stability: count consecutive
@@ -906,6 +984,7 @@ export async function runWedgeWatchdog(
     overageCreditSelections,
     confirmModalFires,
     permissionPromptFires,
+    permissionPromptDeferrals,
     restartEscalations,
     polls,
     reason: "max-polls",

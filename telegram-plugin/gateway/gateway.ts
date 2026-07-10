@@ -530,6 +530,7 @@ import type {
   InjectInboundMessage,
   SendOutboundMessage,
   QuotaWallDetectedMessage,
+  QueryPendingPermissionMessage,
   PostSkillProposalMessage,
   PermissionEvent,
   RolloutStatusPostMessage,
@@ -9259,6 +9260,42 @@ const ipcServer: IpcServer = createIpcServer({
         ' — triggering fleet auto-fallback\n',
     )
     void fireFleetAutoFallback(msg.agentName, untilMs)
+  },
+
+  // Issue #2971 — read-only wedge-watchdog probe: is there a live pending
+  // permission request (Telegram approval card) for this agent right now?
+  // Sourced directly from `pendingPermissions` — no mutation, no card
+  // posting, just a snapshot read. The watchdog uses this to decide whether
+  // to Esc a shape-persistent permission-prompt TUI or defer to the card /
+  // the #2724 TTL reaper. Always answered synchronously and on the SAME
+  // connection so the watchdog's short (~2s) budget can resolve promptly.
+  onQueryPendingPermission(client: IpcClient, msg: QueryPendingPermissionMessage) {
+    const self = process.env.SWITCHROOM_AGENT_NAME
+    if (self && msg.agentName !== self) {
+      process.stderr.write(
+        `telegram gateway: query_pending_permission rejected — agent mismatch (${msg.agentName} != ${self})\n`,
+      )
+      try {
+        client.send({ type: 'pending_permission_status', correlationId: msg.correlationId, pending: false })
+      } catch { /* best effort */ }
+      return
+    }
+    // Any LIVE entry answers the question — this gateway serves exactly one
+    // agent, so `pendingPermissions` is already scoped to `msg.agentName`.
+    const [requestId] = pendingPermissions.keys()
+    const pending = pendingPermissions.size > 0
+    try {
+      client.send({
+        type: 'pending_permission_status',
+        correlationId: msg.correlationId,
+        pending,
+        ...(pending && requestId ? { requestId } : {}),
+      })
+    } catch (err) {
+      process.stderr.write(
+        `telegram gateway: query_pending_permission reply failed: ${(err as Error).message}\n`,
+      )
+    }
   },
 
   // #2670 one-tap self-improvement — persist a skill-improvement proposal and
