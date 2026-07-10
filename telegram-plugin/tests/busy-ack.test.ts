@@ -14,7 +14,6 @@ import {
   BUSY_ACK_STEP_AGE_THRESHOLD_MS,
   shouldPostBusyAck,
   formatBusyAckText,
-  formatElapsed,
 } from '../gateway/busy-ack.js'
 
 const base = {
@@ -73,12 +72,21 @@ describe('formatBusyAckText — rendered card text', () => {
       gateDecision: 'buffer-until-idle',
       toolName: 'Bash',
       toolLabel: 'gh pr checks --watch',
-      turnElapsedMs: 130_000,
     })
     expect(text).toContain('Queued')
     expect(text).toContain('`Bash: gh pr checks --watch`')
-    expect(text).toContain('(2m elapsed)')
     expect(text).toMatch(/I'll answer when this step finishes/)
+  })
+
+  it('carries no point-in-time elapsed figure (a static card must not decay)', () => {
+    // The card is posted once and never re-rendered while the blocking
+    // step runs — any "(Nm elapsed)" would silently go stale on screen.
+    const text = formatBusyAckText({
+      gateDecision: 'buffer-until-idle',
+      toolName: 'Bash',
+      toolLabel: 'sleep 90',
+    })
+    expect(text).not.toMatch(/elapsed|\b\d+[sm]\b/)
   })
 
   it('steer path never says "Queued" (classification-visibility invariant)', () => {
@@ -86,12 +94,10 @@ describe('formatBusyAckText — rendered card text', () => {
       gateDecision: 'steer',
       toolName: 'Bash',
       toolLabel: 'sleep 90',
-      turnElapsedMs: 45_000,
     })
     expect(text).not.toContain('Queued')
     expect(text).toContain('Steer noted')
     expect(text).toContain('`Bash: sleep 90`')
-    expect(text).toContain('(45s elapsed)')
   })
 
   it('degrades honestly when the tool label is unknown', () => {
@@ -99,7 +105,6 @@ describe('formatBusyAckText — rendered card text', () => {
       gateDecision: 'buffer-until-idle',
       toolName: null,
       toolLabel: null,
-      turnElapsedMs: 20_000,
     })
     expect(text).toContain('Queued')
     expect(text).toContain('a long-running step')
@@ -110,21 +115,7 @@ describe('formatBusyAckText — rendered card text', () => {
       gateDecision: 'buffer-until-idle',
       toolName: 'Bash',
       toolLabel: null,
-      turnElapsedMs: 20_000,
     })
     expect(text).toContain('`Bash`')
-  })
-})
-
-describe('formatElapsed', () => {
-  it('sub-minute renders seconds, minute-plus renders whole minutes', () => {
-    expect(formatElapsed(0)).toBe('0s')
-    expect(formatElapsed(45_000)).toBe('45s')
-    expect(formatElapsed(60_000)).toBe('1m')
-    expect(formatElapsed(239_000)).toBe('3m')
-  })
-
-  it('never renders a negative elapsed', () => {
-    expect(formatElapsed(-500)).toBe('0s')
   })
 })

@@ -73,13 +73,6 @@ export function shouldPostBusyAck(input: BusyAckDecisionInput): boolean {
   return true
 }
 
-/** Compact human elapsed: 45s → "45s", 130000ms → "2m", 3.9m → "3m". */
-export function formatElapsed(ms: number): string {
-  const s = Math.max(0, Math.round(ms / 1000))
-  if (s < 60) return `${s}s`
-  return `${Math.floor(s / 60)}m`
-}
-
 export interface BusyAckTextInput {
   gateDecision: 'buffer-until-idle' | 'steer'
   /** Bare tool name as tracked (e.g. "Bash"). Null when unknown. */
@@ -87,14 +80,18 @@ export interface BusyAckTextInput {
   /** Natural-language descriptor from the PreToolUse sidecar's
    *  `toolLabel()` (e.g. `sleep 90`), or null. */
   toolLabel: string | null
-  /** Elapsed ms of the in-flight turn (receipt-anchored turn age). */
-  turnElapsedMs: number
 }
 
 /**
  * Render the card text. Deterministic, no model. The buffered variant
  * says "Queued" (classification-visibility invariant); the steer variant
  * says the steer is noted — never "Queued".
+ *
+ * Deliberately carries NO elapsed figure: the card is posted once and
+ * never re-rendered while the blocking step runs, so any point-in-time
+ * number ("2m elapsed") would silently go stale on screen — a decaying
+ * claim on a card whose whole point is honesty. The activity name alone
+ * is time-invariant.
  */
 export function formatBusyAckText(input: BusyAckTextInput): string {
   const name = input.toolName ?? 'a long-running step'
@@ -102,9 +99,8 @@ export function formatBusyAckText(input: BusyAckTextInput): string {
     input.toolLabel != null && input.toolLabel.length > 0
       ? `${name}: ${input.toolLabel}`
       : name
-  const elapsed = formatElapsed(input.turnElapsedMs)
   if (input.gateDecision === 'steer') {
-    return `⏳ Steer noted — currently inside \`${activity}\` (${elapsed} elapsed); I'll fold it in when this step finishes.`
+    return `⏳ Steer noted — currently inside \`${activity}\`; I'll fold it in when this step finishes.`
   }
-  return `⏳ Queued — currently inside \`${activity}\` (${elapsed} elapsed); I'll answer when this step finishes.`
+  return `⏳ Queued — currently inside \`${activity}\`; I'll answer when this step finishes.`
 }

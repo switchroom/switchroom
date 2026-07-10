@@ -23,9 +23,13 @@
  * 5. Assert the busy-ack card was cleaned up (deleted) once the
  *    answer landed — never a dangling "Queued" line.
  *
- * Negative case: a mid-turn ping sent IMMEDIATELY (step age < the 12s
- * threshold) gets NO busy-ack card — an ack that fires when the agent
- * was seconds from answering is the job spec's explicit Bad bullet.
+ * Negative case: a ping during a SHORT blocking step (well under the 12s
+ * threshold, and finished before the deferred re-check could ever see a
+ * 12s-old step) gets NO busy-ack card at any point — an ack that fires
+ * when the agent was seconds from answering is the job spec's explicit
+ * Bad bullet. (A young-step ping during a LONG step DOES get a deferred
+ * card once the step ages past the threshold — that is the re-check
+ * behaviour, covered by the positive case's latency budget.)
  *
  * ## Conventions
  *
@@ -43,18 +47,24 @@ import type { ObservedMessage } from "../driver.js";
 
 const AGENT = "test-harness";
 
-// The gateway constant is 12s (BUSY_ACK_STEP_AGE_THRESHOLD_MS). Wait a
-// comfortable margin past it before pinging so the step has proven long.
-const STEP_WARMUP_MS = 18_000;
+// The gateway constant is 12s (BUSY_ACK_STEP_AGE_THRESHOLD_MS). The
+// warmup is anchored to the SEND, not to observed tool start — the agent
+// needs a few seconds to open the turn and enter the Bash step — so it
+// carries a large margin: even if the tool starts ~15s after the send,
+// the step is comfortably past the threshold when the ping lands.
+const STEP_WARMUP_MS = 35_000;
 
 // Latency promise: user-visible ack within seconds of the ping. The card
-// is posted synchronously by the gateway (no model), so 10s is generous —
-// it covers mtcute polling jitter only.
+// is posted synchronously by the gateway (no model). When the ping lands
+// past the threshold the card is immediate; if the step turns out to be
+// just under, the deferred re-check posts it within (threshold − age).
+// 10s + jitter headroom covers both.
 const ACK_SLA_MS = 10_000;
 
-// The blocking sleep. Long enough that the warmup + ping + ack all land
-// while the step is still open; short enough to keep wall-clock sane.
-const SLEEP_SECS = 60;
+// The blocking sleep. Long enough that warmup + ping + ack all land while
+// the step is still open (even with a late tool start); short enough to
+// keep wall-clock sane.
+const SLEEP_SECS = 120;
 
 const BUSY_ACK_RE = /⏳ Queued — currently inside `.+`.*I'll answer when this step finishes/s;
 
@@ -103,13 +113,16 @@ describe("uat: mid-flight busy ack during a long blocking tool call (#2995)", ()
 
         // The real answer to the ping arrives AFTER the blocking step
         // returns and the buffer flushes. Any fresh non-card bot message
-        // that isn't the busy-ack or the SLEEP_DONE completion counts.
+        // that isn't the busy-ack or the SLEEP_DONE completion counts —
+        // the SLEEP_DONE exclusion is explicit (it answers the FIRST
+        // prompt, not the ping).
         const answer = await sc.expectMessage(
           (m: ObservedMessage) =>
             m.fromBot &&
             !m.edited &&
             m.messageId !== ack.messageId &&
             !BUSY_ACK_RE.test(m.text) &&
+            !/SLEEP_DONE/i.test(m.text) &&
             m.text.trim().length > 0,
           { from: "bot", timeout: (SLEEP_SECS + 90) * 1000 },
         );
@@ -142,44 +155,47 @@ describe("uat: mid-flight busy ack during a long blocking tool call (#2995)", ()
   );
 
   it(
-    "negative: a ping while the step is still young (< threshold) gets no busy-ack card",
+    "negative: a ping during a SHORT step (finishes under the threshold) never gets a busy-ack card",
     async () => {
       const sc = await spinUp({ agent: AGENT });
       try {
+        // An 8s sleep can NEVER age past the 12s threshold — neither the
+        // direct evaluation nor the deferred re-check may produce a card
+        // (the re-check re-reads live state and finds the step gone).
         await sc.sendDM(
           `For a latency test, run this exact command in the FOREGROUND ` +
             `with your Bash tool (do NOT use run_in_background): ` +
-            `\`sleep 25 && echo done\`. When it completes, reply with ` +
+            `\`sleep 8 && echo done\`. When it completes, reply with ` +
             `exactly: SHORT_SLEEP_DONE. Do not send any message before it completes.`,
         );
 
-        // Give the agent a beat to enter the Bash step, but ping while
-        // the step is still well under the 12s threshold.
+        // Give the agent a beat to enter the Bash step, then ping while
+        // the short step is (at most) a few seconds old.
         await new Promise((r) => setTimeout(r, 4_000));
         await sc.sendDM("Still with me?");
 
-        // Watch the window where a premature ack would land. No message
-        // matching the busy-ack shape may appear.
+        // Watch through the step end + the widest possible re-check window
+        // + the answer. No message matching the busy-ack shape may appear.
         let prematureAck: ObservedMessage | null = null;
         try {
           prematureAck = await sc.expectMessage(
             (m: ObservedMessage) => m.fromBot && !m.edited && BUSY_ACK_RE.test(m.text),
-            { from: "bot", timeout: 12_000 },
+            { from: "bot", timeout: 45_000 },
           );
         } catch {
-          // timeout = the correct outcome (no premature ack)
+          // timeout = the correct outcome (no ack, ever)
         }
         expect(
           prematureAck,
-          `a busy-ack fired for a young step (${JSON.stringify(
-            prematureAck?.text.slice(0, 120),
-          )}) — the agent was seconds from answering; the threshold gate ` +
-            `is not holding.`,
+          `a busy-ack fired for a step that never reached the threshold ` +
+            `(${JSON.stringify(prematureAck?.text.slice(0, 120))}) — the ` +
+            `agent was seconds from answering; the threshold/re-check ` +
+            `gates are not holding.`,
         ).toBeNull();
       } finally {
         await sc.tearDown();
       }
     },
-    120_000,
+    150_000,
   );
 });

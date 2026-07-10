@@ -41,7 +41,7 @@ import {
   resolveInterruptMaxWaitMs,
   resolveSafeBoundaryEnabled,
 } from './interrupt-defer.js'
-import { shouldPostBusyAck, formatBusyAckText } from './busy-ack.js'
+import { shouldPostBusyAck, formatBusyAckText, BUSY_ACK_STEP_AGE_THRESHOLD_MS } from './busy-ack.js'
 import {
   resolveStickerSendArgs,
   resolveGifSendArgs,
@@ -1882,9 +1882,16 @@ const activeReactionMsgIds = new Map<string, { chatId: string; messageId: number
 const queuedStatusMsgIds = new Map<string, { chatId: string; threadId: number | null; messageId: number }>()
 // #2995 mid-flight busy-ack dedupe: statusKeys that already got a busy-ack
 // card during the CURRENT turn — at most one card per turn per chat/topic
-// even after the card itself is reaped. Cleared on turn end (alongside the
-// reap in purgeReactionTracking).
+// even after the card itself is reaped. The ending turn's key is deleted in
+// purgeReactionTracking (per-key, not a global clear — a purge for topic A
+// must not reset topic B's dedupe).
 const busyAckPostedKeys = new Set<string>()
+// #2995 deferred re-check: a ping that arrives while the blocking step is
+// still YOUNG (< threshold) must not be silently forgotten — the step may
+// run for minutes more (the original #2995 silence). One timer per key,
+// armed for (threshold − stepAge); it re-evaluates live state when it
+// fires and is cancelled by purgeReactionTracking when the turn ends.
+const busyAckRecheckTimers = new Map<string, ReturnType<typeof setTimeout>>()
 // Reactions whose terminal 👍 is deferred because a background sub-agent
 // worker was still running when the parent's `turn_end` fired. Painting 👍
 // then would read as "done / nothing happening" while the worker keeps
@@ -3492,7 +3499,9 @@ function postQueuedStatus(chatId: string, bufferedThread: number, inFlightThread
  */
 function promoteQueuedStatus(chatId: string, thread: number | undefined): void {
   if (!QUEUED_STATUS_UX_ENABLED) return
-  if (thread == null) return
+  // #2995: thread == null is a DM (or General-topic) card — the busy-ack
+  // extended this lifecycle to DMs, so promote those too (statusKey keys
+  // a null thread identically at post and promote time).
   const key = statusKey(chatId, thread)
   const entry = queuedStatusMsgIds.get(key)
   if (entry == null) return
@@ -3503,7 +3512,7 @@ function promoteQueuedStatus(chatId: string, thread: number | undefined): void {
   void swallowingApiCall(
     () =>
       bot.api.editMessageText(chatId, entry.messageId, '✍️ On it — replying now.', {}),
-    { chat_id: chatId, verb: 'queued-status.promote', threadId: thread },
+    { chat_id: chatId, verb: 'queued-status.promote', ...(thread != null ? { threadId: thread } : {}) },
   )
 }
 
@@ -3547,20 +3556,47 @@ function maybePostBusyAck(
     inFlight != null ? statusKey(inFlight.sessionChatId, inFlight.sessionThreadId) : key
   const now = Date.now()
   const step = silencePoke.longestInFlightTool(inFlightKey, now)
-  const fire = shouldPostBusyAck({
-    gateDecision,
-    midToolCall: toolFlightTracker.isMidToolCall(),
-    stepAgeMs: step?.durationMs ?? null,
-    alreadyAcked: queuedStatusMsgIds.has(key) || busyAckPostedKeys.has(key),
-  })
-  if (!fire) return
+  const midToolCall = toolFlightTracker.isMidToolCall()
+  const stepAgeMs = step?.durationMs ?? null
+  const alreadyAcked = queuedStatusMsgIds.has(key) || busyAckPostedKeys.has(key)
+  const fire = shouldPostBusyAck({ gateDecision, midToolCall, stepAgeMs, alreadyAcked })
+  if (!fire) {
+    // Deferred re-check: the ONLY miss reason we re-arm for is a step that
+    // is genuinely open but still young — it may run for minutes more, and
+    // a one-shot evaluation would re-create the original #2995 silence. Arm
+    // one timer for (threshold − stepAge); everything is re-read live at
+    // fire time, and the timer is pinned to THIS turn (turnId guard) plus
+    // cancelled outright by purgeReactionTracking when the turn ends.
+    if (
+      midToolCall &&
+      !alreadyAcked &&
+      stepAgeMs != null &&
+      stepAgeMs < BUSY_ACK_STEP_AGE_THRESHOLD_MS &&
+      !busyAckRecheckTimers.has(key)
+    ) {
+      const turnIdAtSchedule = inFlight?.turnId ?? null
+      const delayMs = BUSY_ACK_STEP_AGE_THRESHOLD_MS - stepAgeMs + 250
+      busyAckRecheckTimers.set(key, setTimeout(() => {
+        busyAckRecheckTimers.delete(key)
+        // The ping is only still waiting if the SAME turn is still running
+        // (a new/ended turn means the buffered inbound is being handled —
+        // a "Queued" card then would be a lie).
+        if (turnIdAtSchedule == null || currentTurn?.turnId !== turnIdAtSchedule) return
+        maybePostBusyAck(gateDecision, chatId, threadId)
+      }, delayMs))
+    }
+    return
+  }
+  const pendingRecheck = busyAckRecheckTimers.get(key)
+  if (pendingRecheck != null) {
+    clearTimeout(pendingRecheck)
+    busyAckRecheckTimers.delete(key)
+  }
   busyAckPostedKeys.add(key)
-  const turnStartedAt = activeTurnStartedAt.get(inFlightKey)
   const text = formatBusyAckText({
     gateDecision,
     toolName: step?.name ?? null,
     toolLabel: step?.label ?? null,
-    turnElapsedMs: turnStartedAt != null ? now - turnStartedAt : step?.durationMs ?? 0,
   })
   process.stderr.write(
     `telegram gateway: mid-flight busy ack chat=${chatId} thread=${threadId ?? '-'} ` +
@@ -3938,10 +3974,17 @@ function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
     const pqThread = pqThreadPart === '_' || pqThreadPart === '' ? null : Number(pqThreadPart)
     reapQueuedStatus(pqChatId, Number.isFinite(pqThread) ? (pqThread as number) : undefined)
   }
-  // #2995 — reset the per-turn busy-ack dedupe with the turn. Clearing the
-  // whole set (not just this key) is correct: dedupe is "once per TURN per
-  // chat/topic", and a new turn is starting for whichever key comes next.
-  busyAckPostedKeys.clear()
+  // #2995 — reset the ending turn's OWN busy-ack dedupe + cancel its pending
+  // deferred re-check. Per-key, not a global clear: a purge for topic A must
+  // not reset topic B's dedupe or kill B's armed re-check. A buffered topic's
+  // entry clears when ITS turn eventually runs and ends (this same path), and
+  // the re-check timer self-guards on turnId anyway (defense-in-depth).
+  busyAckPostedKeys.delete(key)
+  const busyAckRecheck = busyAckRecheckTimers.get(key)
+  if (busyAckRecheck != null) {
+    clearTimeout(busyAckRecheck)
+    busyAckRecheckTimers.delete(key)
+  }
   // PR3b: clear the parallel-turns fleet-gate entry. Symmetric with
   // the markClaudeBusyForInbound on the delivery path. Safe no-op
   // when the key was never marked (synthetic purge from a sweep).
@@ -17893,30 +17936,25 @@ async function handleInbound(
     // know they're queued. Suppressed for DMs (no topics) and same-topic
     // queues (the in-flight turn's own card already covers them).
     const inFlightThread = currentTurn?.sessionThreadId
-    if (
+    const crossTopicQueuedCard =
       QUEUED_STATUS_UX_ENABLED &&
       !isDmChatId(chat_id) &&
       messageThreadId != null &&
       messageThreadId !== inFlightThread
-    ) {
+    if (crossTopicQueuedCard) {
       postQueuedStatus(chat_id, messageThreadId, inFlightThread)
+    } else {
+      // #2995 mid-flight busy ack — ONLY the surfaces the cross-topic card
+      // suppresses (DMs, same-topic). Mutually exclusive with
+      // postQueuedStatus above: both record into queuedStatusMsgIds only
+      // AFTER their sendMessage awaits resolve, so calling both here would
+      // race past each other's has(key) check and double-card the topic.
+      // When the running turn is inside one LONG tool step, a buffered
+      // quick question would otherwise wait minutes with only a 👀; post a
+      // silent deterministic "Queued — currently inside <tool>" card.
+      maybePostBusyAck('buffer-until-idle', chat_id, messageThreadId ?? undefined)
     }
-    // #2995 mid-flight busy ack — the surfaces the cross-topic card above
-    // suppresses (DMs, same-topic). When the running turn is inside one
-    // LONG tool step, a buffered quick question would otherwise wait
-    // minutes with only a 👀; post a silent deterministic "Queued —
-    // currently inside <tool>" card. postBusyAck is idempotent against
-    // the queuedStatusMsgIds key, so it never stacks on the card above.
-    maybePostBusyAck('buffer-until-idle', chat_id, messageThreadId ?? undefined)
     return
-  }
-
-  // #2995 — a steer delivered mid-turn while the turn is stuck inside one
-  // long tool step gets the same deterministic ack (worded as a steer, not
-  // "Queued" — classification visibility): the model can't narrate the
-  // steer until the blocking call returns.
-  if (deliveryGate.decision === 'deliver' && isSteering) {
-    maybePostBusyAck('steer', chat_id, messageThreadId ?? undefined)
   }
 
   // #2917: reserve the chat's busy key SYNCHRONOUSLY here — before the
@@ -17960,6 +17998,15 @@ async function handleInbound(
 
   const delivered = ipcServer.sendToAgent(selfAgent, inboundMsg)
   if (delivered) {
+    // #2995 — a steer delivered mid-turn while the turn is stuck inside one
+    // long tool step gets a deterministic ack (worded as a steer, not
+    // "Queued" — classification visibility): the model can't narrate the
+    // steer until the blocking call returns. Posted only AFTER the bridge
+    // dispatch succeeded — a "Steer noted" card for a send that missed
+    // (bridge offline → buffered/dropped below) would be untrue.
+    if (isSteering) {
+      maybePostBusyAck('steer', chat_id, messageThreadId ?? undefined)
+    }
     // Reuse the key reserved synchronously above (#2917) when present, else
     // mark now — markClaudeBusyForInbound is idempotent (lockstep re-stamp),
     // so a re-mark is safe and returns the same chat key.

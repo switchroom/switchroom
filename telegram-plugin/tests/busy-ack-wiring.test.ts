@@ -34,26 +34,47 @@ describe('#2995 mid-flight busy ack — gateway wiring', () => {
     expect(ackIdx).toBeGreaterThan(pushIdx)
   })
 
-  it('a mid-turn steer delivery gets the steer-worded variant', () => {
+  it('cross-topic queued status and the busy ack are mutually exclusive (no double-card race)', () => {
+    // Both helpers record into queuedStatusMsgIds only AFTER their
+    // sendMessage awaits resolve, so calling both in the same handler pass
+    // would race past each other's has(key) check and double-card the
+    // topic. The buffer branch must pick exactly one.
     expect(gatewaySrc).toMatch(
-      /deliveryGate\.decision === 'deliver' && isSteering[\s\S]{0,200}maybePostBusyAck\('steer', chat_id, messageThreadId \?\? undefined\)/,
+      /if \(crossTopicQueuedCard\) \{\s*postQueuedStatus\(chat_id, messageThreadId, inFlightThread\)\s*\} else \{/,
     )
+  })
+
+  it('a mid-turn steer gets the steer-worded variant only AFTER successful bridge dispatch', () => {
+    // A "Steer noted" card for a send that missed (bridge offline) would
+    // be untrue — the ack lives inside the `if (delivered)` branch.
+    expect(gatewaySrc).toMatch(
+      /if \(delivered\) \{[\s\S]{0,700}if \(isSteering\) \{\s*maybePostBusyAck\('steer', chat_id, messageThreadId \?\? undefined\)/,
+    )
+  })
+
+  it('an under-threshold miss arms ONE deferred re-check pinned to the running turn', () => {
+    const fn = gatewaySrc.split('function maybePostBusyAck')[1]?.split('\nfunction ')[0] ?? ''
+    // Armed only for the young-step miss, for the remaining age gap.
+    expect(fn).toMatch(/stepAgeMs < BUSY_ACK_STEP_AGE_THRESHOLD_MS &&\s*!busyAckRecheckTimers\.has\(key\)/)
+    expect(fn).toMatch(/BUSY_ACK_STEP_AGE_THRESHOLD_MS - stepAgeMs \+ 250/)
+    // The re-fire is guarded on the SAME turn still running.
+    expect(fn).toMatch(/currentTurn\?\.turnId !== turnIdAtSchedule\) return/)
+    // A posted card cancels the pending re-check.
+    expect(fn).toMatch(/clearTimeout\(pendingRecheck\)/)
   })
 
   it('the decision is fed from live tool-flight + step-age readings (pure module owns policy)', () => {
     const fn = gatewaySrc.split('function maybePostBusyAck')[1]?.split('\nfunction ')[0] ?? ''
-    expect(fn).toMatch(/shouldPostBusyAck\(\{/)
-    expect(fn).toMatch(/midToolCall: toolFlightTracker\.isMidToolCall\(\)/)
+    expect(fn).toMatch(/shouldPostBusyAck\(\{ gateDecision, midToolCall, stepAgeMs, alreadyAcked \}\)/)
+    expect(fn).toMatch(/const midToolCall = toolFlightTracker\.isMidToolCall\(\)/)
     expect(fn).toMatch(/silencePoke\.longestInFlightTool\(/)
-    expect(fn).toMatch(/stepAgeMs: step\?\.durationMs \?\? null/)
-    // Turn age is receipt-anchored (activeTurnStartedAt), per the design.
-    expect(fn).toMatch(/activeTurnStartedAt\.get\(inFlightKey\)/)
+    expect(fn).toMatch(/const stepAgeMs = step\?\.durationMs \?\? null/)
   })
 
   it('dedupe: alreadyAcked couples the live card map AND the per-turn key set', () => {
     const fn = gatewaySrc.split('function maybePostBusyAck')[1]?.split('\nfunction ')[0] ?? ''
     expect(fn).toMatch(
-      /alreadyAcked: queuedStatusMsgIds\.has\(key\) \|\| busyAckPostedKeys\.has\(key\)/,
+      /const alreadyAcked = queuedStatusMsgIds\.has\(key\) \|\| busyAckPostedKeys\.has\(key\)/,
     )
     expect(fn).toMatch(/busyAckPostedKeys\.add\(key\)/)
   })
@@ -75,9 +96,18 @@ describe('#2995 mid-flight busy ack — gateway wiring', () => {
     expect(fn).toMatch(/busy-ack\.post-race-cleanup/)
   })
 
-  it('the per-turn dedupe set is cleared at turn end (alongside the queued-status reap)', () => {
+  it('turn-end cleanup is PER-KEY: dedupe entry deleted and re-check timer cancelled for the ending turn only', () => {
     const purge = gatewaySrc.split('function purgeReactionTracking')[1]?.split('\nfunction ')[0] ?? ''
-    expect(purge).toMatch(/busyAckPostedKeys\.clear\(\)/)
+    // Per-key delete — a purge for topic A must not reset topic B's dedupe.
+    expect(purge).toMatch(/busyAckPostedKeys\.delete\(key\)/)
+    expect(purge).not.toMatch(/busyAckPostedKeys\.clear\(\)/)
+    expect(purge).toMatch(/busyAckRecheckTimers\.delete\(key\)/)
+    expect(purge).toMatch(/clearTimeout\(busyAckRecheck\)/)
+  })
+
+  it('DM cards are promoted too (promoteQueuedStatus no longer early-returns on a null thread)', () => {
+    const fn = gatewaySrc.split('function promoteQueuedStatus')[1]?.split('\nfunction ')[0] ?? ''
+    expect(fn).not.toMatch(/if \(thread == null\) return/)
   })
 
   it('kill switch defaults ON, independently disableable', () => {
