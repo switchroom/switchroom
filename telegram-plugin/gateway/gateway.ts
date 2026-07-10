@@ -12675,7 +12675,12 @@ interface PendingSecretRequest {
 // chat_id -> the armed capture: the operator's NEXT message in this chat is
 // the value for `key`. Set when [Provide securely] is tapped.
 interface ArmedSecretCapture { key: string; agent: string; stageId: string; armed_at: number; threadId?: number }
-const armedSecretCaptures = new Map<string, ArmedSecretCapture>()
+// Storage extracted to pending-state-stores.ts (#2996 Phase 3 step 2). Swept by
+// sweepSecretRequests (below) — a plain delete-past-TTL, no wake (transient
+// post-tap window). Direction preserved: now - armed_at > TTL.
+const armedSecretCaptures = createSweepableStore<ArmedSecretCapture>(
+  (v, now) => now - v.armed_at > ARMED_SECRET_CAPTURE_TTL_MS,
+)
 const PENDING_SECRET_REQUEST_TTL_MS = 30 * 60_000 // card lifetime
 const ARMED_SECRET_CAPTURE_TTL_MS = 10 * 60_000   // window to send the value after tapping
 // stageId -> request (lives until tapped or TTL). Storage extracted to
@@ -12692,9 +12697,7 @@ function sweepSecretRequests(now = Date.now()): void {
   // armedSecretCaptures is a TRANSIENT post-tap window (never persisted): it's
   // only set after the operator taps [Provide securely], and the request is
   // no longer parked-on-a-card. Just drop stale ones — no wake needed.
-  for (const [k, v] of armedSecretCaptures) {
-    if (now - v.armed_at > ARMED_SECRET_CAPTURE_TTL_MS) armedSecretCaptures.delete(k)
-  }
+  armedSecretCaptures.sweep(now)
 }
 
 function buildSecretRequestKeyboard(stageId: string): { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } {
