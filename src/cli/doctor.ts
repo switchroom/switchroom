@@ -44,7 +44,10 @@ import { runContextChecks } from "./doctor-context.js";
 import { runCredentialsMigrationChecks } from "./doctor-credentials-migration.js";
 import { runSecretAccessChecks } from "./doctor-secret-access.js";
 import { runInlinedSecretChecks } from "./doctor-inlined-secrets.js";
-import { runApprovalAttributionChecks } from "./doctor-approval-attribution.js";
+import {
+  loadLiveAllowFromAccessFiles,
+  runApprovalAttributionChecks,
+} from "./doctor-approval-attribution.js";
 import { runAuditIntegrityChecks } from "./doctor-audit-integrity.js";
 import { runAgentSmokeChecks } from "./doctor-agent-smoke.js";
 import { runVaultBrokerDurabilityChecks } from "./doctor-vault-broker-durability.js";
@@ -2902,7 +2905,15 @@ export function registerDoctorCommand(program: Command): void {
           { title: "Audit integrity (WS10-F4)", results: runAuditIntegrityChecks() },
           {
             title: "Approval attribution (WS10-F5)",
-            results: runApprovalAttributionChecks(),
+            // liveAllowFrom: the operator tap-allowlist lives in the
+            // per-agent telegram/access.json files (the gateway's ground
+            // truth), not in switchroom.yaml — union them across the fleet.
+            results: await runApprovalAttributionChecks({
+              liveAllowFrom: loadLiveAllowFromAccessFiles(
+                Object.keys(config.agents ?? {}),
+                resolveAgentsDir(config),
+              ),
+            }),
           },
           { title: "Docker (Phase 1a)", results: runDockerSection(config) },
           { title: "Auth Broker", results: runAuthBrokerChecks(config) },

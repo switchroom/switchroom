@@ -7,6 +7,7 @@ import { describe, it, expect } from "vitest";
 
 import {
   detectAttributionAnomalies,
+  loadLiveAllowFromAccessFiles,
   runApprovalAttributionChecks,
   type DecisionRow,
 } from "./doctor-approval-attribution.js";
@@ -77,18 +78,65 @@ describe("detectAttributionAnomalies", () => {
 });
 
 describe("runApprovalAttributionChecks", () => {
-  it("skips cleanly when the decisions DB can't be read", () => {
-    const r = runApprovalAttributionChecks({ loadDecisions: () => null });
+  it("skips cleanly when the decisions DB can't be read", async () => {
+    const r = await runApprovalAttributionChecks({ loadDecisions: () => null });
     expect(r).toHaveLength(1);
     expect(r[0].status).toBe("skip");
   });
 
-  it("runs the detector against injected rows", () => {
-    const r = runApprovalAttributionChecks({
+  it("runs the detector against injected rows", async () => {
+    const r = await runApprovalAttributionChecks({
       loadDecisions: () => [row({ granted_by_user_id: 999 })],
     });
     expect(
       r.find((c) => c.name.includes("granter in own approver set"))?.status,
     ).toBe("fail");
+  });
+
+  it("plumbs liveAllowFrom through to the stale-granter warn (doctor wiring contract)", async () => {
+    // Mirrors the doctor.ts call site: a defined liveAllowFrom must activate
+    // the stale-granter check. Regression guard for the check being wired
+    // with no deps (liveAllowFrom undefined → the warn was dead code).
+    const r = await runApprovalAttributionChecks({
+      loadDecisions: () => [row({ granted_by_user_id: 222 })], // 222 in own set
+      liveAllowFrom: ["111"], // …but not a live operator any more
+    });
+    expect(
+      r.find((c) => c.name.includes("still on live allowlist"))?.status,
+    ).toBe("warn");
+  });
+});
+
+describe("loadLiveAllowFromAccessFiles", () => {
+  const files: Record<string, string> = {
+    "/a/one/telegram/access.json": JSON.stringify({
+      dmPolicy: "allowlist",
+      allowFrom: ["111", "222"],
+    }),
+    "/a/two/telegram/access.json": JSON.stringify({
+      dmPolicy: "allowlist",
+      allowFrom: ["222", 333], // numeric entry → coerced to string
+    }),
+    "/a/broken/telegram/access.json": "{not json",
+  };
+  const read = (p: string) => {
+    if (!(p in files)) throw new Error("ENOENT");
+    return files[p];
+  };
+
+  it("unions allowFrom across every readable agent access.json", () => {
+    const r = loadLiveAllowFromAccessFiles(
+      ["one", "two", "broken", "missing"],
+      "/a",
+      read,
+    );
+    expect(r?.sort()).toEqual(["111", "222", "333"]);
+  });
+
+  it("returns undefined when NO access.json could be read (skip, not empty allowlist)", () => {
+    // An empty-list return would mark EVERY granter stale — undefined must
+    // disable the stale-granter check instead.
+    expect(loadLiveAllowFromAccessFiles(["missing"], "/a", read)).toBeUndefined();
+    expect(loadLiveAllowFromAccessFiles([], "/a", read)).toBeUndefined();
   });
 });

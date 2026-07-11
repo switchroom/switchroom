@@ -37,6 +37,8 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { readFileSync as fsReadFileSync } from "node:fs";
+import { join } from "node:path";
 
 import { canonicalizeApproverSet } from "../vault/approvals/canonical.js";
 
@@ -151,26 +153,110 @@ export function detectAttributionAnomalies(
 
 export interface ApprovalAttributionDeps {
   /**
-   * Loads the approval_decisions rows to inspect. Defaults to a best-effort
-   * `docker exec switchroom-vault-broker sqlite3` read of vault-grants.db;
-   * injectable for tests. Return `null` to signal "could not read" (→ skip).
+   * Loads the approval_decisions rows to inspect. Defaults to
+   * `defaultLoadDecisions` (host-file bun:sqlite read with docker-exec
+   * fallback); injectable for tests. Return `null` to signal "could not
+   * read" (→ skip).
    */
-  loadDecisions?: () => DecisionRow[] | null;
-  /** Live operator allowlist (access.allowFrom), for the stale-granter warn. */
+  loadDecisions?: () => Promise<DecisionRow[] | null> | DecisionRow[] | null;
+  /**
+   * Live operator allowlist for the stale-granter warn. The list lives in
+   * the per-agent `telegram/access.json` files (`allowFrom`) — NOT in
+   * switchroom.yaml — so the doctor call site derives it with
+   * `loadLiveAllowFromAccessFiles`. Undefined skips the stale-granter check.
+   */
   liveAllowFrom?: readonly string[];
 }
 
+const DECISIONS_SQL =
+  "SELECT id, granted_by_user_id, approver_set_canonical, decision, origin, " +
+  "COALESCE(revoked_at, -1) FROM approval_decisions;";
+
+/** Parse `sqlite3 -separator <US>` output lines into DecisionRows. */
+function parseSqlite3Lines(stdout: string, sep: string): DecisionRow[] {
+  const rows: DecisionRow[] = [];
+  for (const line of stdout.split("\n")) {
+    if (line.trim().length === 0) continue;
+    const f = line.split(sep);
+    if (f.length < 6) continue;
+    const revoked = Number(f[5]);
+    rows.push({
+      id: f[0],
+      granted_by_user_id: Number(f[1]),
+      approver_set_canonical: f[2],
+      decision: f[3],
+      origin: f[4],
+      revoked_at: revoked === -1 ? null : revoked,
+    });
+  }
+  return rows;
+}
+
 /**
- * Default loader: read active grant decisions out of the broker container's
- * vault-grants.db via `docker exec … sqlite3`. Best-effort — any failure
- * (docker missing, container down, no sqlite3, locked DB) returns `null` so
- * the caller emits a `skip`, never a false `fail`.
+ * Default loader: read approval_decisions out of vault-grants.db.
+ *
+ * Primary path — HOST-SIDE bun:sqlite read of the canonical
+ * `~/.switchroom/vault-grants.db` (grants-db.ts DEFAULT_GRANTS_DB_PATH):
+ * doctor runs on the host, and the broker container merely bind-mounts that
+ * same file to `/root/.switchroom/vault-grants.db` (compose.ts — the
+ * `${homePrefix}/.switchroom/vault-grants.db:/root/.switchroom/vault-grants.db`
+ * mount), so the host file IS the authoritative DB and needs neither docker
+ * nor a sqlite3 binary. The built CLI runs under bun (scripts/build.mjs
+ * rewrites the shebang to bun precisely because of `bun:sqlite`), so the
+ * dynamic import resolves; under vitest/node the `typeof Bun` guard skips it.
+ *
+ * Fallback — `docker exec switchroom-vault-broker sqlite3` against the
+ * IN-CONTAINER path `/root/.switchroom/vault-grants.db`. Best-effort only:
+ * requires sqlite3 in the broker image, and the container name assumes the
+ * default compose project prefix ("switchroom-"); a custom prefix makes this
+ * fallback miss and the check degrades to `skip`.
+ *
+ * Any failure on both paths returns `null` so the caller emits a `skip`,
+ * never a false `fail`.
  */
-function defaultLoadDecisions(): DecisionRow[] | null {
+async function defaultLoadDecisions(): Promise<DecisionRow[] | null> {
+  // Path 1: direct host-file read via bun:sqlite (readonly).
   try {
-    const sql =
-      "SELECT id, granted_by_user_id, approver_set_canonical, decision, origin, " +
-      "COALESCE(revoked_at, -1) FROM approval_decisions;";
+    if (typeof Bun !== "undefined") {
+      const os = await import("node:os");
+      const path = await import("node:path");
+      const fs = await import("node:fs");
+      const dbPath = path.join(os.homedir(), ".switchroom", "vault-grants.db");
+      if (fs.existsSync(dbPath)) {
+        const { Database } = await import("bun:sqlite");
+        const db = new Database(dbPath, { readonly: true });
+        try {
+          const raw = db
+            .query(
+              "SELECT id, granted_by_user_id, approver_set_canonical, decision, origin, revoked_at FROM approval_decisions",
+            )
+            .all() as Array<{
+            id: string;
+            granted_by_user_id: number;
+            approver_set_canonical: string;
+            decision: string;
+            origin: string;
+            revoked_at: number | null;
+          }>;
+          return raw.map((r) => ({
+            id: String(r.id),
+            granted_by_user_id: Number(r.granted_by_user_id),
+            approver_set_canonical: String(r.approver_set_canonical),
+            decision: String(r.decision),
+            origin: String(r.origin),
+            revoked_at: r.revoked_at === null ? null : Number(r.revoked_at),
+          }));
+        } finally {
+          db.close();
+        }
+      }
+    }
+  } catch {
+    // fall through to the docker-exec path
+  }
+
+  // Path 2: docker exec into the broker container (in-container mount path).
+  try {
     const SEP = String.fromCharCode(31); // ASCII unit separator
     const stdout = execFileSync(
       "docker",
@@ -180,48 +266,67 @@ function defaultLoadDecisions(): DecisionRow[] | null {
         "sqlite3",
         "-separator",
         SEP,
-        "/state/vault-grants.db",
-        sql,
+        "/root/.switchroom/vault-grants.db",
+        DECISIONS_SQL,
       ],
       { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 10_000 },
     );
-    const rows: DecisionRow[] = [];
-    for (const line of stdout.split("\n")) {
-      if (line.trim().length === 0) continue;
-      const f = line.split(SEP);
-      if (f.length < 6) continue;
-      const revoked = Number(f[5]);
-      rows.push({
-        id: f[0],
-        granted_by_user_id: Number(f[1]),
-        approver_set_canonical: f[2],
-        decision: f[3],
-        origin: f[4],
-        revoked_at: revoked === -1 ? null : revoked,
-      });
-    }
-    return rows;
+    return parseSqlite3Lines(stdout, SEP);
   } catch {
     return null;
   }
 }
 
 /**
+ * Derive the live operator allowlist for the stale-granter check by
+ * unioning `allowFrom` across every agent's `telegram/access.json`
+ * (`<agentsDir>/<agent>/telegram/access.json`). That file — not
+ * switchroom.yaml — is where the gateway reads its tap-authorization list
+ * (telegram-plugin/gateway/callback-query-handlers.ts `loadAccess`), so it
+ * is the ground truth the detector must compare against.
+ *
+ * Returns `undefined` when NO access.json could be read (fresh install /
+ * wrong dir) so the caller skips the stale-granter warn instead of
+ * treating every granter as stale against an empty list.
+ */
+export function loadLiveAllowFromAccessFiles(
+  agentNames: readonly string[],
+  agentsDir: string,
+  readFile: (p: string) => string = (p) => fsReadFileSync(p, "utf8"),
+): string[] | undefined {
+  const union = new Set<string>();
+  let readAny = false;
+  for (const name of agentNames) {
+    try {
+      const raw = readFile(join(agentsDir, name, "telegram", "access.json"));
+      const parsed = JSON.parse(raw) as { allowFrom?: unknown };
+      readAny = true;
+      if (Array.isArray(parsed.allowFrom)) {
+        for (const id of parsed.allowFrom) union.add(String(id));
+      }
+    } catch {
+      // missing/unreadable access.json for this agent — skip it
+    }
+  }
+  return readAny ? Array.from(union) : undefined;
+}
+
+/**
  * doctor entry point (WS10-F5 part 1). Loads the decisions and runs the pure
  * detector. Degrades to a single `skip` when the DB can't be read.
  */
-export function runApprovalAttributionChecks(
+export async function runApprovalAttributionChecks(
   deps: ApprovalAttributionDeps = {},
-): CheckResult[] {
+): Promise<CheckResult[]> {
   const load = deps.loadDecisions ?? defaultLoadDecisions;
-  const decisions = load();
+  const decisions = await load();
   if (decisions === null) {
     return [
       {
         name: "approval attribution",
         status: "skip",
         detail:
-          "could not read approval_decisions from the vault-broker container (broker down, docker unavailable, or no sqlite3) — attribution not evaluated",
+          "could not read approval_decisions from ~/.switchroom/vault-grants.db (host read) or the vault-broker container (docker exec fallback) — attribution not evaluated",
       },
     ];
   }
