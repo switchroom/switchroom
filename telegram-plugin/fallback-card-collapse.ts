@@ -45,6 +45,15 @@ export interface ModelUnavailableCardRecord {
  * Freshness ceiling for folding into a card. The fallback dispatcher runs
  * seconds after the card in the normal case; a card older than this belongs
  * to a previous incident and must not absorb an unrelated announcement.
+ *
+ * Known accepted race (#3035 review, finding 4): the record lands only
+ * AFTER the card send resolves, and stays editable for this whole window —
+ * so a LATER 'switched' outcome (a second dispatch inside the window) can
+ * edit a card whose incident was already answered. Bounded by this 5-min
+ * ceiling plus the one-shot `take` semantics (a card absorbs at most one
+ * announcement); worst case is one announcement folded into a slightly
+ * older card instead of arriving as a separate message — never a lost
+ * announcement.
  */
 export const CARD_COLLAPSE_MAX_AGE_MS = 5 * 60_000;
 

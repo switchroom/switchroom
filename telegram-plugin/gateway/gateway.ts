@@ -21800,9 +21800,14 @@ async function doFireFleetAutoFallback(triggerAgent: string, untilMs?: number): 
       // #3031 PR 3 — collapse: on a SUCCESSFUL swap, fold the announcement
       // into an EDIT of the model-unavailable card this gateway just sent to
       // this chat (single evolving card). One-shot `take` clears the record
-      // either way. Every non-switched outcome — and any edit failure —
-      // falls through to the pre-fix separate send, so an announcement
-      // ALWAYS arrives (promise-honesty on all error paths).
+      // either way. Every non-switched outcome that REACHES this loop — and
+      // any edit failure — falls through to the pre-fix separate send.
+      // Known PRE-EXISTING hole, unchanged by the collapse (#3035 review,
+      // finding 2): the all-blocked cooldown early-return above exits before
+      // this loop, so a cooldown-suppressed all-blocked REPEAT delivers
+      // neither edit nor message even when a promising card exists. The
+      // first all-blocked card of a window does arrive and answers the
+      // promise; only the repeats inside the 30-min window are silent.
       const card = modelUnavailableCardRegistry.take(String(chat_id), Date.now())
       if (decideAnnouncementDelivery(outcome.kind, card) === 'edit' && card) {
         try {

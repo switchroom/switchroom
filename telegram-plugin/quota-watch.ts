@@ -162,10 +162,15 @@ export const FLEET_ROLL_ANNOUNCE_KEY = "__fleet_roll_announce__";
 /**
  * Don't announce a roll older than this — a gateway booting hours after a
  * roll would otherwise resurrect stale news (mirrors the late-recovery
- * discipline). One hour comfortably covers the 15-min poll cadence plus
- * boot-stagger while staying inside the roll's operational relevance.
+ * discipline). CLAMPED to the broker claim window (#3035 review, finding 1):
+ * if this ceiling exceeded the claim window, a gateway with an empty
+ * quota-watch.json running its boot tick after the claim expired but before
+ * this ceiling (e.g. T+40m under the old 60m/30m split) would pass both the
+ * latch AND the expired claim → duplicate roll card. Equal horizons close
+ * that gap by construction: any roll still young enough to announce is
+ * still inside the claim window that deduped the first announcement.
  */
-export const FLEET_ROLL_MAX_AGE_MS = 60 * 60_000;
+export const FLEET_ROLL_MAX_AGE_MS = QUOTA_WATCH_CLAIM_WINDOW_MS;
 
 /**
  * Suppress the per-account 🟡 throttling push when a roll announcement for
@@ -396,12 +401,18 @@ export function evaluateQuotaWatchAccount(args: {
       lastNotifiedAt: now,
     };
     // Roll-dedupe (#3031 PR 3): a fresh broker-roll announcement for this
-    // same account already covered the news — latch silently.
+    // same account already covered the news — latch silently. FIRST
+    // post-roll episode only (#3035 review, finding 3): if this account's
+    // watch state has already advanced SINCE the roll (prev.lastNotifiedAt
+    // >= roll.at — e.g. it recovered to healthy post-roll and is now
+    // re-entering throttling), that is a genuinely NEW episode the roll
+    // card said nothing about, so it must notify normally.
     const lastRoll = args.lastRoll;
     if (
       lastRoll &&
       lastRoll.from === label &&
-      now - lastRoll.at <= QUOTA_WATCH_ROLL_DEDUP_MS
+      now - lastRoll.at <= QUOTA_WATCH_ROLL_DEDUP_MS &&
+      prev.lastNotifiedAt < lastRoll.at
     ) {
       return {
         kind: "reconcile",

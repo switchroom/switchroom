@@ -1099,3 +1099,47 @@ describe("evaluateQuotaWatchAccount — roll-announcement dedupe (#3031 PR 3)", 
     expect(d.message).toContain("fleet will prefer another account");
   });
 });
+
+// ── #3035 review fixes ───────────────────────────────────────────────────────
+
+describe("#3035 review fixes", () => {
+  it("finding 1 — roll announce ceiling never exceeds the broker claim window (no duplicate-card gap)", async () => {
+    const mod = await import("../quota-watch.js");
+    expect(FLEET_ROLL_MAX_AGE_MS).toBeLessThanOrEqual(mod.QUOTA_WATCH_CLAIM_WINDOW_MS);
+  });
+
+  it("finding 3 — roll-dedupe suppresses ONLY the first post-roll episode: a recover-then-re-throttle after the roll notifies", () => {
+    const rollAt = NOW - 20 * 60_000; // inside the 30-min dedup window
+    // Post-roll, the account recovered to healthy and the watch state
+    // advanced (lastNotifiedAt AFTER roll.at). A fresh throttling entry is
+    // a genuinely NEW episode the roll card said nothing about.
+    const prevRecoveredPostRoll = {
+      lastNotifiedHealth: "healthy" as const,
+      lastNotifiedAt: rollAt + 5 * 60_000,
+    };
+    const d = evaluateQuotaWatchAccount({
+      agentName: "lawgpt",
+      snap: THROTTLING_5H,
+      prev: prevRecoveredPostRoll,
+      now: NOW,
+      lastRoll: { from: "alice@example.com", at: rollAt },
+    });
+    expect(d.kind).toBe("notify");
+    if (d.kind !== "notify") return;
+    expect(d.transition).toBe("entered-throttling");
+  });
+
+  it("finding 3 — first post-roll episode (state pre-dates the roll) still latches silently", () => {
+    const rollAt = NOW - 60_000;
+    const d = evaluateQuotaWatchAccount({
+      agentName: "lawgpt",
+      snap: THROTTLING_5H,
+      prev: { lastNotifiedHealth: "healthy" as const, lastNotifiedAt: rollAt - 3600_000 },
+      now: NOW,
+      lastRoll: { from: "alice@example.com", at: rollAt },
+    });
+    expect(d.kind).toBe("reconcile");
+    if (d.kind !== "reconcile") return;
+    expect(d.reason).toBe("roll-announced");
+  });
+});
