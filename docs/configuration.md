@@ -581,10 +581,10 @@ Switchroom splits agent customization into two files with **opposite ownership**
 
 | File | Owner | Lifecycle |
 |------|-------|-----------|
-| `CLAUDE.md` (agent root) | **Switchroom** | Cascade-rendered from the profile; regenerated on every `apply`/`reconcile`/`update` so machinery + smart-default changes propagate fleet-wide. Hand-edits are backed up to `CLAUDE.md.before-rerender.*` and replaced. |
+| `CLAUDE.md` (agent root) | **Switchroom + You** | Two-section file split by a visible marker line (`# --- Yours (preserved across apply) ---`). ABOVE the marker is Switchroom-managed: cascade-rendered from the profile and regenerated on every `apply`/`reconcile`/`update` so machinery + smart-default changes propagate fleet-wide (above-marker hand-edits are backed up to `CLAUDE.md.before-rerender.*` and replaced). BELOW the marker is **yours** — add per-agent rules there and they are preserved verbatim across every apply. The old `workspace/CLAUDE.custom.md` sidecar is deprecated: its content migrates below the marker on first apply and the file is renamed `.deprecated`. |
 | `workspace/SOUL.md` (persona) | **You** | Seeded **once** — from the setup wizard's persona prompts, or the profile's `SOUL.md.hbs` + `soul:` config when skipped. After that it is a plain user file: `update`/`reconcile` **never** overwrite it. |
 
-This is deliberate. `CLAUDE.md` is the operating manual — you want switchroom's updates to reach it. `SOUL.md` is who the agent *is* — you want your words to stick, the way they do in OpenClaw/Hermes. The `soul:` config and profile `SOUL.md.hbs` are therefore **seed-time inputs only**; changing them later does not touch an agent whose `SOUL.md` already exists.
+This is deliberate. The managed (above-marker) part of `CLAUDE.md` is the operating manual — you want switchroom's updates to reach it — while the below-marker section is your own per-agent rules that survive every apply. `SOUL.md` is who the agent *is* — you want your words to stick, the way they do in OpenClaw/Hermes. The `soul:` config and profile `SOUL.md.hbs` are therefore **seed-time inputs only**; changing them later does not touch an agent whose `SOUL.md` already exists.
 
 **Editing the persona.** Just edit `workspace/SOUL.md` directly (it's tracked in the workspace git repo, so your edits are versioned and recoverable). `switchroom soul path <agent>` prints the path; `switchroom soul show <agent>` prints the current content.
 
