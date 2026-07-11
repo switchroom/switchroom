@@ -3,6 +3,7 @@ import {
   isDmChatId,
   collectDmChatIdsFromStores,
   createDmPinSweeper,
+  unexpiredStoreRepinIds,
   type DmPinSweeperDeps,
 } from './dm-pin-sweep'
 
@@ -177,5 +178,74 @@ describe('createDmPinSweeper', () => {
       process.off('unhandledRejection', onUnhandled)
     }
     expect(unhandled).toEqual([])
+  })
+})
+
+describe('tool-pin survival (#3001 contract, review blocker on #3074)', () => {
+  const NOW = 1_752_000_000_000
+
+  it('unexpiredStoreRepinIds keeps unexpired tool rows for the chat, drops expired / work-scoped / other-chat rows', () => {
+    const rows = [
+      // Unexpired tool pin in this chat — MUST survive.
+      { chatId: DM_A, messageId: 10, expiresAt: NOW + 60_000 },
+      // Expired tool pin — due for sweeping, NOT re-pinned.
+      { chatId: DM_A, messageId: 11, expiresAt: NOW - 1 },
+      // Work-scoped row (no expiresAt) — stale after restart, NOT re-pinned.
+      { chatId: DM_A, messageId: 12 },
+      // Unexpired tool pin in a DIFFERENT chat — not this chat's re-pin set.
+      { chatId: DM_B, messageId: 13, expiresAt: NOW + 60_000 },
+    ]
+    expect(unexpiredStoreRepinIds(rows, DM_A, NOW)).toEqual([10])
+    expect(unexpiredStoreRepinIds(rows, DM_B, NOW)).toEqual([13])
+  })
+
+  // Composition test mirroring the gateway wiring: liveTrackedMessageIds
+  // unions in-memory claims with unexpired store rows.
+  function gatewayStyleDeps(args: {
+    inMemory: number[]
+    storeRows: { chatId: string; messageId: number; expiresAt?: number }[]
+  }): ReturnType<typeof makeDeps> {
+    return makeDeps({
+      liveTrackedMessageIds: (chatId) => [
+        ...args.inMemory,
+        ...unexpiredStoreRepinIds(args.storeRows, chatId, NOW),
+      ],
+    })
+  }
+
+  it('(a) boot sweep: DM with an unexpired tool: row → unpinAll once, then that messageId re-pinned', async () => {
+    const { deps, unpinAll, pinSilent } = gatewayStyleDeps({
+      inMemory: [], // fresh boot — in-memory claims empty
+      storeRows: [{ chatId: DM_A, messageId: 777, expiresAt: NOW + 60_000 }],
+    })
+    const sweeper = createDmPinSweeper(deps)
+    await sweeper.sweep(DM_A)
+    expect(unpinAll).toHaveBeenCalledTimes(1)
+    expect(pinSilent.mock.calls).toEqual([[DM_A, 777]])
+  })
+
+  it('(b) expired tool: row is NOT re-pinned', async () => {
+    const { deps, unpinAll, pinSilent } = gatewayStyleDeps({
+      inMemory: [],
+      storeRows: [{ chatId: DM_A, messageId: 778, expiresAt: NOW - 1 }],
+    })
+    const sweeper = createDmPinSweeper(deps)
+    await sweeper.sweep(DM_A)
+    expect(unpinAll).toHaveBeenCalledTimes(1)
+    expect(pinSilent).not.toHaveBeenCalled()
+  })
+
+  it('(c) first-inbound sweep preserves an unexpired tool pin alongside a live in-memory claim, deduped', async () => {
+    const { deps, pinSilent } = gatewayStyleDeps({
+      inMemory: [500, 777], // live fg: claim + the tool pin also claimed in-memory
+      storeRows: [{ chatId: DM_A, messageId: 777, expiresAt: NOW + 60_000 }],
+    })
+    const sweeper = createDmPinSweeper(deps)
+    await sweeper.sweep(DM_A)
+    // 777 appears in BOTH sources but is re-pinned exactly once.
+    expect(pinSilent.mock.calls).toEqual([
+      [DM_A, 500],
+      [DM_A, 777],
+    ])
   })
 })

@@ -473,6 +473,7 @@ import { shouldSweepChatAtBoot } from './boot-sweep-filter.js'
 import {
   createDmPinSweeper,
   collectDmChatIdsFromStores,
+  unexpiredStoreRepinIds,
   type DmPinSweeper,
 } from './dm-pin-sweep.js'
 import { startWebhookIngestServer } from './webhook-ingest-server.js'
@@ -7877,14 +7878,34 @@ const dmPinSweeper: DmPinSweeper = createDmPinSweeper({
         }),
       { chat_id: chatId, verb: 'dm-pin-sweep.repin' },
     ),
-  // Live in-memory status-pin claims for this chat (fg:/wk:/tool:/banner:) —
-  // the messages still owned by an in-flight turn/worker that must survive the
-  // unpin-all. Empty at boot (fresh process); non-empty for a first-inbound
-  // sweep landing mid-turn.
+  // Pins that must survive the unpin-all: live in-memory status-pin claims
+  // for this chat (fg:/wk:/tool:/banner: — non-empty for a first-inbound
+  // sweep landing mid-turn) UNIONED with the deliberately-retained store
+  // rows — unexpired `tool:` pins (#3001) survive statusPinBootCleanup by
+  // design and must survive this sweep too. Read LIVE from the store so
+  // both the boot sweep (in-memory maps still empty then) and a later
+  // first-inbound sweep see them. Best-effort: a store read failure
+  // degrades to in-memory-only. The sweeper dedupes.
   liveTrackedMessageIds: (chatId) => {
     const ids: number[] = []
     for (const [key, st] of statusPinState.entries()) {
       if (statusPinChatIds.get(key) === chatId) ids.push(st.messageId)
+    }
+    if (statusPinPersistEnabled || bannerPinPersistEnabled || toolPinPersistEnabled) {
+      try {
+        ids.push(
+          ...unexpiredStoreRepinIds(
+            loadStatusPins(STATUS_PIN_STORE_PATH, statusPinStoreFs),
+            chatId,
+            Date.now(),
+          ),
+        )
+      } catch (err) {
+        process.stderr.write(
+          `telegram gateway: dm-pin-sweep: store repin scan failed ` +
+            `(chat=${chatId}): ${(err as Error).message}\n`,
+        )
+      }
     }
     return ids
   },

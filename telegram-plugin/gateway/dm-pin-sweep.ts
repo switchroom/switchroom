@@ -66,6 +66,31 @@ export function collectDmChatIdsFromStores(input: {
   return [...out]
 }
 
+/**
+ * The messageIds in `chatId` that must SURVIVE a DM unpin-all because they
+ * belong to deliberately-retained store rows: unexpired time-scoped `tool:`
+ * pins (the `pin_message` MCP tool, #3001), which `runStatusPinBootCleanup`
+ * intentionally KEEPS across restarts. Work-scoped rows (no `expiresAt`) are
+ * stale by definition after a restart and are NOT re-pin candidates; expired
+ * time-scoped rows are due for sweeping.
+ *
+ * Pure over a loaded store snapshot; the gateway binds a LIVE store read into
+ * `liveTrackedMessageIds` so BOTH the boot sweep and a first-inbound sweep
+ * see the kept rows (the in-memory claim maps are empty at boot).
+ */
+export function unexpiredStoreRepinIds(
+  rows: readonly { chatId: string; messageId: number; expiresAt?: number }[],
+  chatId: string,
+  now: number,
+): number[] {
+  const out: number[] = []
+  for (const r of rows) {
+    if (r.chatId !== chatId) continue
+    if (r.expiresAt != null && r.expiresAt > now) out.push(r.messageId)
+  }
+  return out
+}
+
 export interface DmPinSweeperDeps {
   /** Clear EVERY pinned message in a chat. Bound to the gateway's
    *  robust/retry API wrapper so a 429 flood-wait is retried, then
@@ -74,11 +99,11 @@ export interface DmPinSweeperDeps {
   /** Silently re-pin an EXISTING message (disable_notification). Bound to
    *  the gateway's robust/retry API wrapper. */
   pinSilent: (chatId: string, messageId: number) => Promise<unknown>
-  /** Live tracked pin message ids for a chat — the in-memory status-pin
-   *  claims still owned by an in-flight turn/worker. These are re-pinned
-   *  after the unpin-all so an active pin isn't collateral. Empty at boot
-   *  (fresh process, no live claims yet); non-empty on a first-inbound
-   *  sweep landing mid-turn. */
+  /** Pin message ids in this chat that must survive the unpin-all: the
+   *  in-memory status-pin claims still owned by an in-flight turn/worker,
+   *  UNIONED with the deliberately-retained store rows (unexpired `tool:`
+   *  pins, #3001 — see unexpiredStoreRepinIds). The gateway binds both
+   *  sources; duplicates are deduped by the sweeper before re-pinning. */
   liveTrackedMessageIds: (chatId: string) => number[]
   /** Gate: sweep ONLY when the gateway won the startup mutex. The stores
    *  and the chat's pins are shared per-agent state; a LOSING double-boot
@@ -114,8 +139,9 @@ export function createDmPinSweeper(deps: DmPinSweeperDeps): DmPinSweeper {
       swept.add(chatId)
 
       // Snapshot live claims BEFORE the unpin-all so we know exactly which
-      // messages to restore.
-      const liveIds = deps.liveTrackedMessageIds(chatId)
+      // messages to restore. Dedupe — the in-memory and store-row sources
+      // can both report the same messageId.
+      const liveIds = [...new Set(deps.liveTrackedMessageIds(chatId))]
 
       try {
         await deps.unpinAll(chatId)
