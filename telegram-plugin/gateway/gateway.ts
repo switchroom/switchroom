@@ -345,6 +345,7 @@ import {
   keyboardIsSingleUse,
   finalizeCallback,
   resolveTapAnnotation,
+  applyTapAnnotationEdit,
   type AgentButtonMeta,
 } from '../inline-keyboard-callbacks.js'
 import {
@@ -25885,7 +25886,11 @@ bot.on('callback_query:data', async ctx => {
       parseMode: access.parseMode ?? 'html',
       ...(sourceText != null ? { sourceText } : {}),
       ...(buttonText != null ? { label: buttonText } : {}),
-      escapeLabel: escapeHtmlForTg,
+      // escapeLabel deliberately omitted → defaults to the real HTML-entity
+      // escaper (escapeHtmlEntities). The GFM-markdown escaper
+      // (escapeHtmlForTg, #2669) is WRONG here: it doesn't escape &/</> (a
+      // label containing them would 400 the HTML editMessageText) and it
+      // garbles text under HTML parse mode (`Do_it` → `Do\_it`).
     })
 
     const warnKey = process.env.SWITCHROOM_AGENT_NAME ?? ''
@@ -25908,13 +25913,18 @@ bot.on('callback_query:data', async ctx => {
 
     if (annotation.annotate && cbMessageId != null) {
       // Single API call (Blocker 2): editMessageText accepts reply_markup, so
-      // we annotate the body AND strip the keyboard in one edit.
-      await ctx
-        .editMessageText(annotation.text as string, {
-          parse_mode: 'HTML',
-          reply_markup: { inline_keyboard: [] },
-        })
-        .catch(() => {})
+      // we annotate the body AND strip the keyboard in one edit. If the edit
+      // rejects (400 on an HTML edge case, over-long body, too-old message…),
+      // applyTapAnnotationEdit falls back to a keyboard-only strip so
+      // single-use protection still holds — the meta is deleted below either
+      // way, so a swallowed failure must not leave the keyboard live.
+      await applyTapAnnotationEdit(
+        {
+          editMessageText: (text, other) => ctx.editMessageText(text, other),
+          editMessageReplyMarkup: other => ctx.editMessageReplyMarkup(other),
+        },
+        annotation.text as string,
+      )
       if (metaForMessage != null) {
         agentButtonMeta.delete(`${cbChatId}:${cbMessageId}`)
       }

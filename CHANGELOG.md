@@ -77,7 +77,14 @@ keyboards (a re-tappable keyboard's body would diverge from its live
 state) and only when the agent's `parseMode` is the default `html` — other
 parse modes skip annotation (keyboard still stripped) and log a one-time
 warning. A retap replaces the prior confirmation line rather than
-duplicating it. Per-user timezones are out of scope for v1.
+duplicating it (dedup recognizes the default `format` shape only — a custom
+format accumulates one line per retap). Labels and body text are
+HTML-entity-escaped (`&`, `<`, `>`), and if the annotation edit fails for
+any reason the gateway falls back to a keyboard-only strip so single-use
+protection always holds. Known limitation: the annotated body is rebuilt
+from the message's plain text, so formatting entities (bold, links, code, …)
+on the original message are lost when the annotation is applied. Per-user
+timezones are out of scope for v1.
 
 ## v0.18.11 — Rollouts you can watch, poll, and survive
 

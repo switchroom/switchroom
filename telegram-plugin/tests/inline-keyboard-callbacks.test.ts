@@ -19,6 +19,8 @@ import {
   extractAgentButtonMeta,
   buildButtonConfirmation,
   resolveTapAnnotation,
+  escapeHtmlEntities,
+  applyTapAnnotationEdit,
 } from '../inline-keyboard-callbacks.js'
 
 describe('inline-keyboard-callbacks (#271)', () => {
@@ -308,6 +310,125 @@ describe('inline-keyboard-callbacks (#271)', () => {
       })
       expect(r.annotate).toBe(false)
       expect(r.warnParseMode).toBe(false)
+    })
+  })
+
+  // ─── real HTML-entity escaping (#789 round-2 blocker) ────────────────────
+  describe('escapeHtmlEntities + real-escaper wiring (#789)', () => {
+    const now = new Date('2026-07-11T09:30:00Z')
+
+    it('escapes exactly &, <, > — and nothing else (no markdown garbling)', () => {
+      expect(escapeHtmlEntities('a & b < c > d')).toBe('a &amp; b &lt; c &gt; d')
+      // The GFM escaper would turn Do_it into Do\_it; the HTML escaper must not.
+      expect(escapeHtmlEntities('Do_it `now` *bold*')).toBe('Do_it `now` *bold*')
+      // & first: no double-escaping of produced entities.
+      expect(escapeHtmlEntities('&lt;')).toBe('&amp;lt;')
+    })
+
+    it('is the DEFAULT escaper: labels with & < > render Telegram-parseable HTML', () => {
+      const line = buildButtonConfirmation({
+        template: '✅ You chose: {label} · {time}',
+        label: 'Yes & <no>',
+        timezone: 'utc',
+        now,
+      })
+      expect(line).toBe('✅ You chose: <b>Yes &amp; &lt;no&gt;</b> · 09:30')
+    })
+
+    it('escapes the BASE source text too, not just the label', () => {
+      const r = resolveTapAnnotation({
+        parseMode: 'html',
+        singleUse: true,
+        sourceText: 'Deploy <feature/x> & friends?',
+        label: 'Approve',
+        config: { enabled: true, timezone: 'utc' },
+        now,
+      })
+      expect(r.annotate).toBe(true)
+      expect(r.text).toBe(
+        'Deploy &lt;feature/x&gt; &amp; friends?\n\n✅ You chose: <b>Approve</b> · 09:30',
+      )
+      // Only the tags WE emit remain — no raw user-supplied angle brackets.
+      expect(r.text!.replace(/<\/?b>/g, '')).not.toMatch(/[<>]/)
+    })
+
+    it('retap dedup matches the annotation as Telegram returns it (plain text, no <b> tags)', () => {
+      // Telegram's message.text is plain text — entities are separate — so a
+      // real retap sees the prior line WITHOUT tags.
+      const r = resolveTapAnnotation({
+        parseMode: 'html',
+        singleUse: true,
+        sourceText: 'Deploy to prod?\n\n✅ You chose: Hold · 08:15',
+        label: 'Approve',
+        config: { enabled: true, timezone: 'utc' },
+        now,
+      })
+      expect(r.text).toBe('Deploy to prod?\n\n✅ You chose: <b>Approve</b> · 09:30')
+      expect((r.text!.match(/✅ You chose:/g) ?? []).length).toBe(1)
+    })
+
+    it('String.replace special patterns ($&, $\') in labels are inert', () => {
+      const line = buildButtonConfirmation({
+        template: '✅ You chose: {label} · {time}',
+        label: "$& $' $` $1",
+        timezone: 'utc',
+        now,
+      })
+      expect(line).toBe("✅ You chose: <b>$&amp; $' $` $1</b> · 09:30")
+    })
+  })
+
+  // ─── keyboard-strip fallback when the annotate edit rejects (#789) ───────
+  describe('applyTapAnnotationEdit (#789)', () => {
+    it('annotates via a single editMessageText call on success', async () => {
+      const calls: string[] = []
+      const outcome = await applyTapAnnotationEdit(
+        {
+          editMessageText: async (text, other) => {
+            calls.push(`text:${text}:${other.parse_mode}`)
+            expect(other.reply_markup).toEqual({ inline_keyboard: [] })
+          },
+          editMessageReplyMarkup: async () => {
+            calls.push('markup')
+          },
+        },
+        'body\n\n✅ You chose: <b>Approve</b> · 09:30',
+      )
+      expect(outcome).toBe('annotated')
+      expect(calls).toEqual(['text:body\n\n✅ You chose: <b>Approve</b> · 09:30:HTML'])
+    })
+
+    it('strips the keyboard via editMessageReplyMarkup when the edit rejects', async () => {
+      const calls: unknown[] = []
+      const outcome = await applyTapAnnotationEdit(
+        {
+          editMessageText: async () => {
+            throw new Error('400: Bad Request: can\'t parse entities')
+          },
+          editMessageReplyMarkup: async other => {
+            calls.push(other)
+          },
+        },
+        'whatever',
+      )
+      expect(outcome).toBe('stripped-fallback')
+      // Single-use protection held: the keyboard WAS stripped.
+      expect(calls).toEqual([{ reply_markup: { inline_keyboard: [] } }])
+    })
+
+    it('reports failed (without throwing) when both edits reject', async () => {
+      const outcome = await applyTapAnnotationEdit(
+        {
+          editMessageText: async () => {
+            throw new Error('400')
+          },
+          editMessageReplyMarkup: async () => {
+            throw new Error('400')
+          },
+        },
+        'whatever',
+      )
+      expect(outcome).toBe('failed')
     })
   })
 })
