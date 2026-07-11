@@ -11,8 +11,12 @@
  * These tests assert the OUTCOME: an agent that is doing things is not idle,
  * and an agent that is doing nothing still gets cleared.
  *
- * Deterministic virtual clock only (`T + n * H`) — no fake timers: this file is
- * DUAL-RUN (vitest + bun) and bun's `vi` shim has no `useFakeTimers`.
+ * Deterministic virtual clock only (`T + n * H`) — no fake timers, no
+ * `Date.now()`. Everything schedulable takes the clock as an argument, so the
+ * whole 3h window is exercised in microseconds and the suite stays portable if
+ * this file is ever moved to the bun runner. (It runs under vitest today: it is
+ * not in `package.json`'s `test:bun` list and not excluded in
+ * `vitest.config.ts`.)
  */
 
 import { describe, it, expect } from 'vitest'
