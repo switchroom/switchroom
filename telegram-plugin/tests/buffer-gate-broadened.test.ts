@@ -126,16 +126,22 @@ describe('buffer-gate release decoupled from final-answer classification', () =>
     expect(releaseIdx).toBeGreaterThan(gateBlockClose)
   })
 
-  it('the helper is invoked from executeReply only — not from new mid-turn paths', () => {
+  it('the helper is invoked from turn-terminal paths only — reply-finalize and halt', () => {
     // Sanity: nothing else should call releaseTurnBufferGate. The
     // helper is narrow on purpose. If future code adds new
-    // callsites that aren't reply-finalize, the steer-vs-queue
+    // callsites that aren't turn-terminal, the steer-vs-queue
     // semantics could drift.
     const callMatches = gatewaySrc.match(/releaseTurnBufferGate\(/g) ?? []
-    // Definition + 1 callsite (executeReply) = 2. (The retired
-    // stream_reply tool's callsite was removed with executeStreamReply.)
+    // Definition + 2 callsites = 3:
+    //   - executeReply's post-send block (reply-finalize, the original).
+    //   - executeHaltNow (#3020): an interrupt-cancelled turn never reaches
+    //     reply-finalize (the C-c killed it and no replacement inbound
+    //     follows), so the halt IS that turn's terminal — releasing there is
+    //     the deterministic sibling of the reply-path release, not a
+    //     mid-turn drift. (The retired stream_reply callsite was removed
+    //     with executeStreamReply.)
     // If this count grows the test catches it; reviewer must justify
     // any new callsite.
-    expect(callMatches.length).toBe(2)
+    expect(callMatches.length).toBe(3)
   })
 })
