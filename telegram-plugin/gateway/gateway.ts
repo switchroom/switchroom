@@ -23201,6 +23201,9 @@ const callbackQueryHandlers = createCallbackQueryHandlers({
   getAdminOnlyKeys: () => ADMIN_ONLY_KEYS,
   vaultKeyRegex: VAULT_KEY_REGEX,
   mentalModelProposeTtlMs: MENTAL_MODEL_PROPOSE_TTL_MS,
+  // #2975 Stage 1 — loud-failure funnel for a rate-window retry that also
+  // failed (cooldown + record + broadcast in one place).
+  emitOperatorEvent: emitGatewayOperatorEvent,
 })
 const {
   handleVaultRecentDenialCallback,

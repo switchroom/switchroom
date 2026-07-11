@@ -46,6 +46,14 @@ export interface MentalModelPendingProposal {
 export type ConfigEditDispatchResult =
   | { state: "applied" }
   | { state: "denied"; reason: string }
+  /**
+   * hostd threw `E_RATE_LIMITED` (the agent's config_propose_edit bucket is
+   * exhausted). `retryAtMs` is the epoch-ms parsed from the structured
+   * `fix.retry_after` hostd emits — the moment the sliding window frees a
+   * slot. #2975 Stage 1 schedules exactly ONE re-dispatch at that time so an
+   * operator-APPROVED persist is never silently lost to the throttle.
+   */
+  | { state: "rate_limited"; reason: string; retryAtMs: number }
   | { state: "error"; reason: string };
 
 export interface ResolveDeps {
@@ -79,6 +87,33 @@ export interface ResolveDeps {
   ensureModel?: (spec: MentalModelProposeSpec) => Promise<void>;
   /** Deliver a synthetic inbound to wake the agent with the outcome. */
   injectInbound: (inbound: InboundMessage) => void;
+  /**
+   * #2975 Stage 1 — schedule EXACTLY ONE bounded re-dispatch of an
+   * operator-approved persist that hostd rate-limited (`E_RATE_LIMITED`).
+   * `delayMs` is the wait until hostd's `fix.retry_after` window opens; `fn`
+   * re-runs the persist ONCE (it never re-schedules — bounded, no loop).
+   * Injectable so tests drive it with a mocked clock. When absent, a rate-
+   * limited persist can't be retried and falls straight to the loud-failure
+   * path (no silent loss).
+   *
+   * Stage-1 caveat (documented, accepted): the timer lives only in gateway
+   * memory. A gateway restart between schedule and fire LOSES the retry —
+   * acceptable for Stage 1; Stage 2 (hostd `checkPreApproved` bypass) removes
+   * the rate-limit collision entirely so no retry is needed.
+   */
+  scheduleRetry?: (delayMs: number, fn: () => void | Promise<void>) => void;
+  /**
+   * #2975 Stage 1 — edit the operator's proposal card to the
+   * "approved — applying at HH:MM (rate window)" state so a rate-deferred
+   * (but approved) change is visibly not lost while the retry is pending.
+   */
+  editProposalCardRateWindow?: (retryAtMs: number) => void;
+  /**
+   * #2975 Stage 1 — loud, operator-visible failure (operator-events path)
+   * when the single scheduled retry ALSO fails, so an approved change is
+   * never silently dropped. Must not throw.
+   */
+  notifyPersistFailed?: (reason: string) => void;
   /** Injectable clock for deterministic tests. */
   now?: () => number;
   /** Injectable git binary for the diff subprocess (tests). */
@@ -90,7 +125,14 @@ export type ResolveOutcome =
   | { outcome: "applied" }
   | { outcome: "denied" }
   | { outcome: "rejected"; reason: string }
-  | { outcome: "failed"; reason: string };
+  | { outcome: "failed"; reason: string }
+  /**
+   * #2975 Stage 1 — the persist was rate-limited but the operator already
+   * approved, so exactly one re-dispatch is scheduled at `retryAtMs`. The
+   * proposal card was edited to the "applying at HH:MM" state; the agent's
+   * turn resolves later when the retry injects its own applied/failed inbound.
+   */
+  | { outcome: "scheduled_retry"; retryAtMs: number };
 
 /**
  * Resolve an operator's Approve / Deny decision on a mental-model proposal.
@@ -145,57 +187,123 @@ export async function resolveMentalModelProposal(
     return { outcome: "rejected", reason: built.detail };
   }
 
-  // Pre-register the single-tap correlation so hostd auto-approves the edit
-  // (operator already approved on this proposal card — no second card).
-  deps.registerPreApproval(pending.agent, built.diff);
-  let dispatch: ConfigEditDispatchResult;
-  try {
-    dispatch = await deps.dispatchConfigEdit({
-      agent: pending.agent,
-      diff: built.diff,
-      reason:
-        `Declare agent-proposed mental model "${pending.spec.name}"` +
-        (pending.reason ? ` — ${pending.reason}` : ""),
-    });
-  } catch (err) {
-    dispatch = { state: "error", reason: (err as Error).message };
-  } finally {
-    // Single-shot: drop the correlation whether or not hostd consumed it.
-    deps.clearPreApproval(pending.agent, built.diff);
-  }
+  const persistReason =
+    `Declare agent-proposed mental model "${pending.spec.name}"` +
+    (pending.reason ? ` — ${pending.reason}` : "");
+  const clock = deps.now ?? Date.now;
 
-  if (dispatch.state !== "applied") {
-    deps.log?.(
-      `mental_model_propose: config edit ${dispatch.state} for ${pending.agent} "${pending.spec.name}": ${dispatch.reason}`,
+  // ONE dispatch attempt. Atomically re-registers the single-tap correlation
+  // with the SAME diff bytes each call BEFORE dispatching — the register and
+  // dispatch MUST use identical bytes (forge-resistance contract, file header
+  // lines 54-63): hostd's config-approval callback auto-resolves only on an
+  // exact byte-match, so a rebuilt/whitespace-drifted diff would fail to
+  // auto-approve and post a SECOND operator card. Because the initial and the
+  // #2975 retry both re-run this closure over the same captured `built.diff`,
+  // they are byte-identical by construction.
+  const dispatchOnce = async (): Promise<ConfigEditDispatchResult> => {
+    deps.registerPreApproval(pending.agent, built.diff);
+    try {
+      return await deps.dispatchConfigEdit({
+        agent: pending.agent,
+        diff: built.diff,
+        reason: persistReason,
+      });
+    } catch (err) {
+      return { state: "error", reason: (err as Error).message };
+    } finally {
+      // Single-shot: drop the correlation whether or not hostd consumed it.
+      deps.clearPreApproval(pending.agent, built.diff);
+    }
+  };
+
+  // Applied — belt-and-suspenders ensure (reconcile already ensures via #2874;
+  // this makes the model available without waiting for the restart). Never let
+  // an ensure failure flip a successful declaration into a "failed" inbound —
+  // the model IS declared and will be ensured at reconcile regardless.
+  const finishApplied = async (): Promise<void> => {
+    if (deps.ensureModel) {
+      try {
+        await deps.ensureModel(pending.spec);
+      } catch (err) {
+        deps.log?.(
+          `mental_model_propose: best-effort ensure threw (declaration still applied) for ${pending.agent} "${pending.spec.name}": ${(err as Error).message}`,
+        );
+      }
+    }
+    deps.injectInbound(
+      buildMentalModelProposeAppliedInbound({
+        ctx,
+        stageId,
+        operatorId,
+        nowMs: clock(),
+      }),
     );
+  };
+
+  const finishFailed = (reason: string, loud: boolean): void => {
+    deps.log?.(
+      `mental_model_propose: config edit failed for ${pending.agent} "${pending.spec.name}": ${reason}`,
+    );
+    // Loud, operator-visible failure only on the RETRY exhaustion path — the
+    // initial-failure path already surfaces via the card edit + agent inbound.
+    if (loud) {
+      try {
+        deps.notifyPersistFailed?.(reason);
+      } catch {
+        // notify must never break the failed-inbound delivery below.
+      }
+    }
     deps.injectInbound(
       buildMentalModelProposeFailedInbound({
         ctx,
         stageId,
         operatorId,
-        reason: dispatch.reason,
-        nowMs,
+        reason,
+        nowMs: clock(),
       }),
     );
+  };
+
+  const dispatch = await dispatchOnce();
+
+  // #2975 Stage 1 backstop — an operator-APPROVED persist that hostd rate-
+  // limited must NOT be silently lost. Schedule EXACTLY ONE re-dispatch at the
+  // window-open time hostd handed back in `fix.retry_after`, and flip the card
+  // to the "applying at HH:MM (rate window)" state so the operator sees it's
+  // deferred, not dropped.
+  if (dispatch.state === "rate_limited") {
+    if (deps.scheduleRetry) {
+      const { retryAtMs } = dispatch;
+      deps.editProposalCardRateWindow?.(retryAtMs);
+      const delayMs = Math.max(0, retryAtMs - clock());
+      deps.log?.(
+        `mental_model_propose: config edit rate-limited for ${pending.agent} "${pending.spec.name}"; scheduling one retry in ${delayMs}ms (window opens ${new Date(retryAtMs).toISOString()})`,
+      );
+      deps.scheduleRetry(delayMs, async () => {
+        // Bounded: this is the ONE and ONLY retry — it never re-schedules.
+        const retryResult = await dispatchOnce();
+        if (retryResult.state === "applied") {
+          await finishApplied();
+        } else {
+          // Every non-applied state (denied / rate_limited / error) carries a
+          // reason. A second rate_limit is treated as a terminal failure — the
+          // retry is bounded to one; we do NOT re-schedule.
+          finishFailed(retryResult.reason, true);
+        }
+      });
+      return { outcome: "scheduled_retry", retryAtMs };
+    }
+    // No scheduler wired — can't defer the retry; fail loudly rather than
+    // silently drop the approved change.
+    finishFailed(dispatch.reason, true);
     return { outcome: "failed", reason: dispatch.reason };
   }
 
-  // Applied. Belt-and-suspenders ensure (reconcile already ensures via #2874;
-  // this makes the model available without waiting for the restart). Never let
-  // an ensure failure flip a successful declaration into a "failed" inbound —
-  // the model IS declared and will be ensured at reconcile regardless.
-  if (deps.ensureModel) {
-    try {
-      await deps.ensureModel(pending.spec);
-    } catch (err) {
-      deps.log?.(
-        `mental_model_propose: best-effort ensure threw (declaration still applied) for ${pending.agent} "${pending.spec.name}": ${(err as Error).message}`,
-      );
-    }
+  if (dispatch.state !== "applied") {
+    finishFailed(dispatch.reason, false);
+    return { outcome: "failed", reason: dispatch.reason };
   }
 
-  deps.injectInbound(
-    buildMentalModelProposeAppliedInbound({ ctx, stageId, operatorId, nowMs }),
-  );
+  await finishApplied();
   return { outcome: "applied" };
 }
