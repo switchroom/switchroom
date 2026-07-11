@@ -79,17 +79,28 @@ function makeAllowedAclConfig(socketPath: string): SwitchroomConfig {
   } as unknown as SwitchroomConfig;
 }
 
-/** ACL config that DENIES access (cron-0 only has "other-key", not "api-key") */
+/**
+ * ACL config that DENIES access. myagent's schedule only grants "other-key".
+ * The resolvable ref points at "api-key" via a NON-bot_token field (a custom
+ * MCP env ref) so it does NOT hit checkAclByAgent's own-bot-token exception —
+ * bot_token here is a plain literal. Requesting "api-key" as myagent is
+ * therefore denied by the per-agent ACL (#1192).
+ */
 function makeDeniedAclConfig(socketPath: string): SwitchroomConfig {
   return {
     switchroom: { version: 1 },
-    telegram: { bot_token: "vault:api-key" },
+    telegram: { bot_token: "literal-not-a-vault-ref" },
     vault: {
       path: "~/.switchroom/vault.enc",
       broker: { socket: socketPath, enabled: true },
     },
     agents: {
-      myagent: { schedule: [{ secrets: ["other-key"] }] }, // NOT api-key
+      myagent: {
+        // The vault ref the resolver will try to resolve — "api-key" is NOT
+        // in schedule.secrets (only "other-key" is) and is NOT the bot token.
+        some_ref: "vault:api-key",
+        schedule: [{ secrets: ["other-key"] }],
+      },
     },
   } as unknown as SwitchroomConfig;
 }
@@ -99,13 +110,6 @@ const ALLOWED_PEER = {
   pid: 88888,
   exe: "/usr/bin/bash",
   systemdUnit: "switchroom-myagent-cron-0.service" as string | null,
-};
-
-const DENIED_PEER = {
-  uid: process.getuid?.() ?? 1000,
-  pid: 88889,
-  exe: "/usr/bin/bash",
-  systemdUnit: "switchroom-other-cron-0.service" as string | null, // not in config
 };
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -206,7 +210,9 @@ describe("resolveVaultReferencesViaBroker (structured return, issue #207)", () =
       {
         _testSecrets: cloneSecrets(),
         _testConfig: makeDeniedAclConfig(socketPath),
-        // Peer is allowed cron unit but config only grants "other-key" not "api-key"
+        // #1192: agent identity is the socket path (myagent). Config only
+        // grants "other-key", so checkAclByAgent denies "api-key".
+        _testAgentName: "myagent",
         _testIdentify: () => ALLOWED_PEER,
       },
       socketPath,
@@ -230,6 +236,7 @@ describe("resolveVaultReferencesViaBroker (structured return, issue #207)", () =
       {
         _testSecrets: cloneSecrets(),
         _testConfig: makeAllowedAclConfig(socketPath),
+        _testAgentName: "myagent",
         _testIdentify: () => ALLOWED_PEER,
       },
       socketPath,
@@ -248,13 +255,15 @@ describe("resolveVaultReferencesViaBroker (structured return, issue #207)", () =
     );
   });
 
-  it("returns { ok: false, reason: 'denied' } when peer is not a recognised cron unit", async () => {
+  it("returns { ok: false, reason: 'denied' } when the agent is not in config", async () => {
     await withBroker(
       {
         _testSecrets: cloneSecrets(),
         _testConfig: makeAllowedAclConfig(socketPath),
-        // Peer is a cron unit NOT listed in config agents
-        _testIdentify: () => DENIED_PEER,
+        // #1192: identity is the socket path. "other" is not in config.agents,
+        // so checkAclByAgent denies (the new-world equivalent of the old
+        // "unrecognised cron unit" case).
+        _testAgentName: "other",
       },
       socketPath,
       async () => {

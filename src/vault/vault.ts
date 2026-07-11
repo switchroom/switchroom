@@ -165,7 +165,7 @@ export const VAULT_FORMAT_HINTS: VaultFormatHint[] = [
  * Per-entry agent scope ACL (issue #8).
  *
  * Controls which agents may read this vault entry via the broker.
- * Evaluated AFTER the existing cron-unit ACL (checkAcl) passes.
+ * Evaluated AFTER the agent-level ACL (checkAclByAgent) passes.
  *
  * Semantics:
  *   - Neither allow nor deny set  → all agents may read (current behaviour)

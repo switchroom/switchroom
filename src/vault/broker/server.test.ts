@@ -365,6 +365,10 @@ describe("VaultBroker server: gated paths (allowed cron identity via _testIdenti
     broker = new VaultBroker({
       _testSecrets: cloneSecrets(),
       _testConfig: makeAclConfig(),
+      // #1192: identity is the per-agent socket path. _testAgentName pins the
+      // agent slug the way the real per-agent listener would; checkAclByAgent
+      // gates on it. FAKE_PEER stays for the informational audit fields.
+      _testAgentName: "myagent",
       _testIdentify: () => FAKE_PEER,
     });
     await broker.start(socketPath, undefined, undefined);
@@ -471,7 +475,8 @@ describe("VaultBroker server: list ACL scope narrowing (issue #207)", () => {
 
     broker = new VaultBroker({
       _testSecrets: cloneSecrets(),      // vault has foo + baz + filekey
-      _testConfig: makeNarrowAclConfig(), // cron only allowed to see "foo"
+      _testConfig: makeNarrowAclConfig(), // agent only allowed to see "foo"
+      _testAgentName: "myagent",          // #1192: per-agent socket identity
       _testIdentify: () => FAKE_PEER_NARROW,
     });
     await broker.start(socketPath, undefined, undefined);
@@ -678,6 +683,7 @@ describe("VaultBroker server: audit log emission (allowed cron unit)", () => {
     broker = new VaultBroker({
       _testSecrets: cloneSecrets(),
       _testConfig: makeAuditAclConfig(),
+      _testAgentName: "myagent",          // #1192: per-agent socket identity
       _testIdentify: () => FAKE_PEER,
       _testAuditLogger: createAuditLogger({ path: auditLogPath }),
     });
@@ -701,7 +707,9 @@ describe("VaultBroker server: audit log emission (allowed cron unit)", () => {
     const entry = lines[0];
     expect(entry.op).toBe("get");
     expect(entry.key).toBe("foo");
-    expect(entry.caller).toBe("switchroom-myagent-cron-0.service");
+    // #1192: caller is the socket-path agent identity ("agent:<name>"); the
+    // cgroup field still carries the informational systemd unit from peercred.
+    expect(entry.caller).toBe("agent:myagent");
     expect(entry.pid).toBe(55555);
     expect(entry.cgroup).toBe("switchroom-myagent-cron-0.service");
     expect(entry.result).toBe("allowed");
@@ -725,7 +733,7 @@ describe("VaultBroker server: audit log emission (allowed cron unit)", () => {
     // #207 review-fix: result includes the visible-key count so an operator
     // can grep for `result: "allowed:0"` (a likely misconfig signal).
     expect(entry.result).toMatch(/^allowed:\d+$/);
-    expect(entry.caller).toBe("switchroom-myagent-cron-0.service");
+    expect(entry.caller).toBe("agent:myagent");
   });
 
   it("lock: emits exactly one audit line", async () => {

@@ -30,7 +30,7 @@ arbitrary scripts.
 
 | Caller context | Broker access |
 |---|---|
-| Scheduled run for `agent-<name>` (via that agent's bound socket) | Allowed if the requested key is in `schedule[N].secrets` |
+| Scheduled run for `agent-<name>` (via that agent's bound socket) | Allowed if the requested key is in the UNION of that agent's `schedule[*].secrets` (per-agent, not per-cron-entry — see below) |
 | MCP-server launcher for `agent-<name>` (via that agent's bound socket) | Allowed if the requested key is in any of the agent's effective `mcp_servers.<name>.secrets` |
 | Interactive shell (`switchroom vault get`) | **Denied** — use `--no-broker` |
 | Claude Code / agent session | **Denied** — use `--no-broker` |
@@ -58,9 +58,25 @@ cannot be forged from userspace.
 
 The broker's ACL is misconfiguration protection, not a security boundary
 (see `docs/architecture.md`).  Allowing arbitrary agent sessions to read the
-vault would mean any skill or sub-agent could exfiltrate any secret.  A
-scheduled run receives only the keys explicitly listed in its
-`schedule[N].secrets` allowlist.
+vault would mean any skill or sub-agent could exfiltrate any secret.  An
+agent's scheduled runs receive the keys listed across its
+`schedule[*].secrets` allowlists — as a **per-agent union**.
+
+### ACL granularity is per-AGENT, not per-cron-entry
+
+Since the in-container scheduler landed (Phase 4), every one of an agent's
+crons runs inside that agent's single session/container. The broker sees
+only the agent's socket — never which schedule entry fired — so the ACL
+grants a key when it appears in **any** of the agent's `schedule[*].secrets`
+lists. There is **no** per-cron-index isolation: if `schedule[0]` declares
+`bank/token` and `schedule[1]` declares `cal/token`, both of that agent's
+crons can read both keys. This was an explicit, documented change (issue
+#1192): the old per-cron-index gate keyed on a `switchroom-<agent>-cron-<i>.
+service` systemd cgroup that the in-container scheduler no longer produces,
+so it was dead code. If two crons must not share a secret, split them into
+separate agents. `switchroom doctor` emits a WARN when an agent declares 2+
+schedule entries with divergent `secrets[]` sets, so the non-isolation is
+visible.
 
 > The CLI's denial string and some legacy ACL internals still say
 > "switchroom cron unit" — that vocabulary predates the Phase 4
@@ -142,8 +158,12 @@ agents:
           - other-token
 ```
 
-The broker enforces this list exactly: `switchroom-myagent-cron-0.service` may
-read `my-api-key` and `other-token` but nothing else.
+The broker grants `myagent` read access to `my-api-key` and `other-token`
+(and nothing else it isn't otherwise granted). Note the grant is per-AGENT:
+if `myagent` declares a second `schedule` entry with different `secrets`,
+every one of `myagent`'s crons can read the union of both lists — the ACL
+does not isolate by schedule index (see "ACL granularity is per-AGENT"
+above).
 
 ## Troubleshooting
 

@@ -51,10 +51,12 @@ minted them.
 
 ### 2. Path-as-identity
 
-The legacy cron path. Per-agent UDS sockets at
+The per-agent socket path. Per-agent UDS sockets at
 `/run/switchroom/broker/<agent>/sock` are chowned to the agent's UID, and the
-broker parses the agent name from the bind path. Schedule-declared secrets
-(`agents.<agent>.schedule[i].secrets[]` in switchroom.yaml) gate access.
+broker parses the agent name from the bind path. Access is gated by the
+**per-agent union** of schedule-declared secrets
+(`agents.<agent>.schedule[*].secrets[]` in switchroom.yaml) — there is no
+per-cron-index isolation (issue #1192; see [vault-broker.md](vault-broker.md)).
 
 Use this when:
 - Cron-fired tasks need a fixed set of secrets known at deploy time.

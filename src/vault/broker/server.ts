@@ -41,7 +41,7 @@ import {
   readAutoUnlockFile,
 } from "../auto-unlock.js";
 import { identify, socketPathToAgent, socketPathToIdentity, unlockSocketFor, type PeerInfo } from "./peercred.js";
-import { checkAcl, checkAclByAgent, checkEntryScope, agentSlugFromPeer, parseCronUnit } from "./acl.js";
+import { checkAclByAgent, checkEntryScope } from "./acl.js";
 import {
   AgentNameSchema,
   decodeRequest,
@@ -441,7 +441,7 @@ export class VaultBroker {
    * container restart.
    *
    * Safe by construction: every authorization decision reads `this.config`
-   * live (`checkAclByAgent` / `checkAcl`, the admin/root gate,
+   * live (`checkAclByAgent`, the admin/root gate,
    * `vault.broker.{approvalAuth, postureMintAgents, adminOnlyKeys}`), so
    * swapping the one field is sufficient — there are no config-derived
    * caches to recompute. The decrypted vault lives in SEPARATE fields
@@ -1174,8 +1174,15 @@ export class VaultBroker {
       // path is the trusted identity; we don't need peercred to gate.
       // Same goes for the operator socket: the bind path + 0600 chown to
       // operator UID is the trust boundary, peercred is not load-bearing.
-      if (!isOperator && agentName === null && process.platform === "linux" && peer === null) {
-        const reason = "Unable to identify caller (peercred unavailable); denying on Linux";
+      //
+      // #1192: identity is the socket path, so on Linux a non-operator
+      // caller with NO resolved agent name is denied whether or not
+      // peercred identified a peer. The legacy per-cron `checkAcl(peer,…)`
+      // path (which used to serve identified-but-not-per-agent callers) is
+      // gone — the in-container scheduler never produces a cron cgroup, so
+      // that path only ever fail-closed anyway. Fail-closed preserved.
+      if (!isOperator && agentName === null && process.platform === "linux") {
+        const reason = "Unable to identify caller (no per-agent socket identity); denying on Linux";
         this.auditLogger.write({
           ts: new Date().toISOString(),
           op: "list",
@@ -1212,8 +1219,10 @@ export class VaultBroker {
       // effect; an allow list of named agents would block (null is not in
       // any named list). The socket file mode 0600 is the outer gate for
       // that case.
-      const listAgentSlug =
-        agentName ?? (peer !== null ? agentSlugFromPeer(peer) : null);
+      // #1192: agent identity comes solely from the socket path. On the
+      // legacy/operator/non-Linux paths agentName is null and the scope
+      // filter runs with a null slug (mode-0600 + bind-path are the guards).
+      const listAgentSlug = agentName;
       let visibleKeys: string[];
       if (isOperator) {
         // Operator socket: no agent-keyed ACL (operator isn't an agent).
@@ -1237,15 +1246,10 @@ export class VaultBroker {
               checkEntryScope(entry.scope, agentName).allow,
           )
           .map(([k]) => k);
-      } else if (peer !== null && this.config !== null) {
-        visibleKeys = Object.entries(this.secrets)
-          .filter(
-            ([key, entry]) =>
-              checkAcl(peer, this.config!, key).allow &&
-              checkEntryScope(entry.scope, listAgentSlug).allow,
-          )
-          .map(([k]) => k);
       } else {
+        // Non-Linux / operator-less fallback: no agent identity to gate on
+        // (Linux non-agent callers were already denied above). Only the
+        // per-entry scope applies, with a null slug.
         visibleKeys = Object.entries(this.secrets)
           .filter(([, entry]) => checkEntryScope(entry.scope, listAgentSlug).allow)
           .map(([k]) => k);
@@ -1402,28 +1406,11 @@ export class VaultBroker {
           );
           return;
         }
-      } else if (peer !== null && this.config !== null) {
-        const aclResult = checkAcl(peer, this.config, req.key);
-        if (!aclResult.allow) {
-          writeAudit({
-            ts: new Date().toISOString(),
-            op: "get",
-            key: req.key,
-            caller: auditCaller,
-            pid: auditPid,
-            cgroup: auditCgroup,
-            result: `denied:${aclResult.reason}`,
-          });
-          socket.write(
-            encodeResponse(
-              errorResponse("DENIED", aclResult.reason),
-            ),
-          );
-          return;
-        }
-      } else if (process.platform === "linux" && peer === null) {
-        // On Linux, peercred unavailable → fail-closed
-        const reason = "Unable to identify caller (peercred unavailable); denying on Linux";
+      } else if (process.platform === "linux" && agentName === null) {
+        // #1192: on Linux a non-operator caller with no resolved per-agent
+        // socket identity is denied (fail-closed). Covers both peercred-
+        // unavailable and the retired legacy `checkAcl(peer,…)` path.
+        const reason = "Unable to identify caller (no per-agent socket identity); denying on Linux";
         this.auditLogger.write({
           ts: new Date().toISOString(),
           op: "get",
@@ -1463,9 +1450,9 @@ export class VaultBroker {
         return;
       }
 
-      // Per-entry scope check (issue #8) — runs AFTER cron-unit ACL passes.
-      const getAgentSlug =
-        agentName ?? (peer !== null ? agentSlugFromPeer(peer) : null);
+      // Per-entry scope check (issue #8) — runs AFTER the agent-level ACL
+      // passes. #1192: the caller slug is the socket-path agent identity.
+      const getAgentSlug = agentName;
       const scopeResult = checkEntryScope(entry.scope, getAgentSlug);
       if (!scopeResult.allow) {
         this.auditLogger.write({
@@ -2361,28 +2348,11 @@ export class VaultBroker {
           );
           return;
         }
-        if (peer !== null && peer.systemdUnit !== null) {
-          const parsed = parseCronUnit(peer.systemdUnit);
-          if (parsed !== null) {
-            this.auditLogger.write({
-              ts: new Date().toISOString(),
-              op: req.op,
-              caller: auditCaller,
-              pid: auditPid,
-              cgroup: auditCgroup,
-              result: "denied:cron-cannot-manage-grants",
-            });
-            socket.write(
-              encodeResponse(
-                errorResponse(
-                  "DENIED",
-                  "Grant management ops are operator-only; cron units cannot mint, list, or revoke grants",
-                ),
-              ),
-            );
-            return;
-          }
-        }
+        // #1192: the legacy per-cron-unit grant-mgmt deny (parseCronUnit on
+        // peer.systemdUnit) was removed with the rest of the dead cgroup ACL
+        // path — the in-container scheduler produces no cron cgroup, so it
+        // never fired. Grant-mgmt trust is gated by isOperator / admin agent /
+        // passphrase attestation above and the peercred-unavailable deny here.
       }
     }
 

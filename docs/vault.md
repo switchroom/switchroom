@@ -102,11 +102,11 @@ switchroom vault broker enable-auto-unlock     # store passphrase in system cred
 
 ---
 
-## Declaring per-cron secrets
+## Declaring cron secrets
 
 Cron tasks declare the vault keys they need in `switchroom.yaml` under
-`schedule[i].secrets`.  Only listed keys are accessible to that specific cron
-task — the broker denies any request for an unlisted key.
+`schedule[i].secrets`.  The broker denies any request for a key that appears
+in **none** of the agent's schedule entries.
 
 ```yaml
 agents:
@@ -115,12 +115,12 @@ agents:
       - cron: "0 8 * * *"
         prompt: "Run the morning report"
         secrets:
-          - reports/api-key           # only this key is accessible to cron task 0
+          - reports/api-key
 
       - cron: "0 20 * * *"
         prompt: "Send the evening digest"
         secrets:
-          - digest/smtp-password      # cron task 1 can only read this key
+          - digest/smtp-password
           - digest/sender-address
 ```
 
@@ -130,14 +130,26 @@ The cron script reads the secret via the broker:
 API_KEY=$(switchroom vault get reports/api-key)
 ```
 
-`secrets: []` (the default) means the cron has no vault access at all.  Any
-broker request from that cron task is denied.
+**Granularity is per-AGENT, not per-cron-entry.** The broker grants a key
+when it appears in the **union** of `schedule[*].secrets` for that agent —
+so in the example above *both* crons can read all three keys, not just the
+ones under their own entry. This is because the in-container scheduler runs
+every cron in the agent's single session, and the broker identifies the
+caller only by its per-agent socket, never by which schedule entry fired
+(issue #1192; the old per-cron-index gate relied on a systemd cron cgroup
+that no longer exists). The `secrets[]` list is misconfiguration protection,
+not a per-cron security boundary — if two crons must not share a secret,
+put them on separate agents. `switchroom doctor` WARNs when an agent
+declares 2+ schedule entries with divergent `secrets[]` sets.
+
+`secrets: []` (the default) contributes nothing to the union.  An agent with
+no `secrets` anywhere (and no other grant) has no broker vault access.
 
 ---
 
 ## Per-key access control (ACL)
 
-Beyond the per-cron `secrets[]` allowlist you can apply an additional per-key
+Beyond the per-agent `secrets[]` allowlist you can apply an additional per-key
 scope to restrict which agents may read a key.  Set it when storing the secret:
 
 ```sh
@@ -204,7 +216,7 @@ it just can't **add** a new one without the passphrase.
 > forgotten it, grant the key on the host instead:
 > `switchroom vault grant <agent> --keys <key> --duration 30d`.
 
-`adminOnlyKeys`, per-cron secret ACLs, agent `admin:` flags, and the approval
+`adminOnlyKeys`, per-agent secret ACLs, agent `admin:` flags, and the approval
 posture (`vault.broker.approvalAuth` / `postureMintAgents`) all **hot-reload on
 the broker side** — `switchroom apply` SIGHUPs the running `switchroom-vault-broker`
 so config edits take effect with no broker restart (the broker re-reads
