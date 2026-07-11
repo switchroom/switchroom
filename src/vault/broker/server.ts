@@ -1284,6 +1284,33 @@ export class VaultBroker {
         const grantResult = await validateGrant(this.grantsDb, req.token, req.key);
         if (grantResult.ok) {
           const grantId = grantResult.grant.id;
+          // sec #3084-F4: tokens are bearer capabilities, but when the
+          // connection ALSO carries a bind-time socket identity
+          // (`agentName` — established by socketPathToAgent, never from a
+          // wire payload), cross-check it against the grant's owning agent
+          // and reject a mismatch. This closes the case where a token
+          // leaked to another agent's container is replayed over that
+          // agent's own socket. Only enforced when an identity is present:
+          // the legitimate no-bind-identity flow (agentName === null on
+          // legacy / non-Linux / operator sockets) is unchanged — the
+          // token remains the sole auth there, exactly as before.
+          if (agentName !== null && grantResult.grant.agent_slug !== agentName) {
+            this.auditLogger.write({
+              ts: new Date().toISOString(),
+              op: "get",
+              key: req.key,
+              caller: auditCaller,
+              pid: auditPid,
+              cgroup: auditCgroup,
+              result: "denied:grant-identity-mismatch",
+              method: "grant",
+              grant_id: grantId,
+            });
+            socket.write(
+              encodeResponse(errorResponse("DENIED", "grant-identity-mismatch")),
+            );
+            return;
+          }
           const entry = this.secrets[req.key];
           if (entry === undefined) {
             this.auditLogger.write({
@@ -1299,6 +1326,31 @@ export class VaultBroker {
             });
             socket.write(
               encodeResponse(errorResponse("UNKNOWN_KEY", `Key not found: ${req.key}`)),
+            );
+            return;
+          }
+          // sec #3084-F3: enforce the per-entry scope on the token path too,
+          // keyed on the grant's OWNING agent (`grant.agent_slug`). The
+          // non-token ACL path checks `checkEntryScope` at line ~1456; the
+          // token path historically skipped it, so an entry's
+          // `scope.deny:[agent]` was silently ineffective against an
+          // outstanding token. Now a deny is honoured regardless of which
+          // path serves the read — defense-in-depth for per-agent scoping.
+          const tokenScope = checkEntryScope(entry.scope, grantResult.grant.agent_slug);
+          if (!tokenScope.allow) {
+            this.auditLogger.write({
+              ts: new Date().toISOString(),
+              op: "get",
+              key: req.key,
+              caller: auditCaller,
+              pid: auditPid,
+              cgroup: auditCgroup,
+              result: `denied:${tokenScope.reason}`,
+              method: "grant",
+              grant_id: grantId,
+            });
+            socket.write(
+              encodeResponse(errorResponse("DENIED", tokenScope.reason)),
             );
             return;
           }
