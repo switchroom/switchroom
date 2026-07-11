@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { writeRecord, readRecord, listRecords } from "../src/worktree/registry.js";
 import {
   runReaper,
+  planReaper,
   probePathInUse,
   STALE_THRESHOLD_MS,
   type ReaperDeps,
@@ -200,6 +201,74 @@ describe("worktree reaper", () => {
 
     expect(result.reaped).not.toContain("inuse01");
     expect(listRecords().map((r) => r.id)).toContain("inuse01");
+  });
+
+  // ── L1: dry-run parity — planReaper is the single decision predicate ─────
+
+  it("L1: planReaper marks a stale DIRTY worktree skip-dirty, NOT reap (dry-run parity)", () => {
+    // The pre-fix dry-run computed would-reap from heartbeat age alone, so it
+    // over-reported this record as reapable even though a real run hard-skips
+    // it. planReaper (shared by both the real run and the dry-run) must
+    // classify it as skip-dirty so the two agree.
+    const staleAge = STALE_THRESHOLD_MS + 60_000;
+    const rec = makeRecord("drydirty01", staleAge, true);
+    writeRecord(rec);
+
+    const plan = planReaper(undefined, {
+      hasUncommittedChanges: () => true,
+      probeInUse: () => "free",
+    });
+    const entry = plan.find((e) => e.record.id === "drydirty01");
+    expect(entry?.action).toBe("skip-dirty");
+    // The exact same predicate drives a real run → it is NOT reaped.
+    const result = runReaper(undefined, {
+      hasUncommittedChanges: () => true,
+      probeInUse: () => "free",
+      removeWorktree: () => {
+        throw new Error("must not remove a dirty worktree");
+      },
+    });
+    expect(result.reaped).not.toContain("drydirty01");
+  });
+
+  it("L1: planReaper marks a stale worktree with an UNAVAILABLE probe skip-probe-unavailable, not reap", () => {
+    const staleAge = STALE_THRESHOLD_MS + 60_000;
+    writeRecord(makeRecord("dryprobe01", staleAge, true));
+
+    const plan = planReaper(undefined, {
+      hasUncommittedChanges: () => false,
+      probeInUse: () => "unavailable",
+    });
+    const entry = plan.find((e) => e.record.id === "dryprobe01");
+    expect(entry?.action).toBe("skip-probe-unavailable");
+  });
+
+  it("L1: planReaper still marks a stale, clean, free worktree as reap (would-reap parity)", () => {
+    const staleAge = STALE_THRESHOLD_MS + 60_000;
+    writeRecord(makeRecord("dryreap01", staleAge, true));
+
+    const plan = planReaper(undefined, REAP_ALLOWED);
+    const entry = plan.find((e) => e.record.id === "dryreap01");
+    expect(entry?.action).toBe("reap");
+  });
+
+  // ── M2: stale-but-kept worktrees are surfaced, not silently dropped ──────
+
+  it("M2: runReaper reports a kept dirty worktree in result.skipped with remediation", () => {
+    const staleAge = STALE_THRESHOLD_MS + 60_000;
+    writeRecord(makeRecord("keptdirty01", staleAge, true));
+
+    const result = runReaper(undefined, {
+      hasUncommittedChanges: () => true,
+      probeInUse: () => "free",
+      removeWorktree: () => {},
+    });
+
+    const skip = result.skipped.find((s) => s.record.id === "keptdirty01");
+    expect(skip?.action).toBe("skip-dirty");
+    // The remediation path is spelled out in the message (M2).
+    expect(skip?.message).toContain("worktree release");
+    expect(result.reaped).not.toContain("keptdirty01");
   });
 
   it("probePathInUse never reports an unheld dir as 'in-use' (host-independent)", () => {

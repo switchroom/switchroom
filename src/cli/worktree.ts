@@ -15,7 +15,7 @@ import chalk from "chalk";
 import { claimWorktree } from "../worktree/claim.js";
 import { releaseWorktree } from "../worktree/release.js";
 import { listWorktrees } from "../worktree/list.js";
-import { runReaper } from "../worktree/reaper.js";
+import { runReaper, planReaper, reapSkipReasonText } from "../worktree/reaper.js";
 import {
   planGc,
   applyGc,
@@ -108,11 +108,18 @@ export function registerWorktreeCommand(program: Command): void {
         return;
       }
       console.log(chalk.bold(`${worktrees.length} active worktree(s):\n`));
+      // Stale = heartbeat older than the reaper's threshold (a live claim
+      // refreshes its heartbeat from the gateway watch loop, so a stale one is
+      // reap-eligible — subject to the reaper's dirty/in-use fail-safes).
+      const STALE_MS = 10 * 60 * 1000;
       for (const wt of worktrees) {
         const hbAge = Math.round(wt.heartbeatAgeSeconds / 60);
+        const isStale = wt.heartbeatAgeSeconds * 1000 > STALE_MS;
         const fresh = wt.heartbeatAgeSeconds < 120
           ? chalk.green("fresh")
-          : chalk.yellow(`${hbAge}m ago`);
+          : isStale
+            ? chalk.red(`${hbAge}m ago — STALE (reap-eligible; kept if dirty/in-use)`)
+            : chalk.yellow(`${hbAge}m ago`);
         console.log(`  ${chalk.bold(wt.id)}`);
         console.log(`    repo:    ${wt.repoName} (${wt.repo})`);
         console.log(`    branch:  ${wt.branch}`);
@@ -127,26 +134,63 @@ export function registerWorktreeCommand(program: Command): void {
 
   worktree
     .command("reap")
-    .description("Run the reaper — remove stale/orphaned worktrees")
+    .description(
+      "Run the reaper — remove stale/orphaned worktrees.\n" +
+        "A stale worktree with UNCOMMITTED changes is NEVER auto-deleted; it is\n" +
+        "reported as skipped. Clear it manually: inspect, commit/salvage, then\n" +
+        "`switchroom worktree release <id>` (or `git worktree remove <path>`).",
+    )
     .option("--dry-run", "Show what would be reaped without acting")
     .option("--json", "Output raw JSON")
     .action((opts: { dryRun?: boolean; json?: boolean }) => {
       if (opts.dryRun) {
-        // Show stale records without acting
-        const { worktrees } = listWorktrees();
-        const STALE_MS = 10 * 60 * 1000;
-        const stale = worktrees.filter(
-          w => w.heartbeatAgeSeconds * 1000 > STALE_MS,
+        // L1 fix: route the dry-run through the SAME predicate as the real
+        // reaper (planReaper) so its output matches what a real run would do —
+        // the dirty + probe guards are applied here too, not just heartbeat
+        // age (which used to over-report dirty/in-use worktrees as reapable).
+        const plan = planReaper();
+        const wouldReap = plan.filter(
+          e => e.action === "reap" || e.action === "reap-orphan",
         );
+        const wouldSkip = plan.filter(e => e.action.startsWith("skip-"));
         if (opts.json) {
-          console.log(JSON.stringify({ would_reap: stale.map(w => w.id) }));
+          console.log(
+            JSON.stringify({
+              would_reap: wouldReap.map(e => e.record.id),
+              would_skip: wouldSkip.map(e => ({
+                id: e.record.id,
+                reason: e.action,
+              })),
+            }),
+          );
+        } else if (wouldReap.length === 0 && wouldSkip.length === 0) {
+          console.log("No stale worktrees found.");
         } else {
-          if (stale.length === 0) {
-            console.log("No stale worktrees found.");
-          } else {
-            console.log(chalk.yellow(`Would reap ${stale.length} worktree(s):`));
-            for (const w of stale) {
-              console.log(`  ${w.id} — ${w.branch}`);
+          if (wouldReap.length > 0) {
+            console.log(chalk.yellow(`Would reap ${wouldReap.length} worktree(s):`));
+            for (const e of wouldReap) {
+              console.log(`  ${e.record.id} — ${e.record.branch}`);
+            }
+          }
+          if (wouldSkip.length > 0) {
+            console.log(
+              chalk.yellow(
+                `${wouldReap.length > 0 ? "\n" : ""}Would SKIP ${wouldSkip.length} stale worktree(s) (kept for safety):`,
+              ),
+            );
+            for (const e of wouldSkip) {
+              console.log(
+                `  ${e.record.id} — ${e.record.branch} — would skip (${reapSkipReasonText(e.action)})`,
+              );
+            }
+            if (wouldSkip.some(e => e.action === "skip-dirty")) {
+              console.log(
+                chalk.dim(
+                  "\n  Dirty worktrees are never auto-removed. Clear one manually:\n" +
+                    "  inspect, commit/salvage, then `switchroom worktree release <id>`\n" +
+                    "  (or `git worktree remove <path>`).",
+                ),
+              );
             }
           }
         }
@@ -162,8 +206,27 @@ export function registerWorktreeCommand(program: Command): void {
         } else {
           console.log(chalk.green(`Reaped ${result.reaped.length} worktree(s): ${result.reaped.join(", ")}`));
         }
-        for (const w of result.warnings) {
-          console.warn(chalk.yellow(w));
+        // M2: surface stale-but-kept worktrees so the never-auto-delete-dirty
+        // policy doesn't let them accumulate invisibly.
+        if (result.skipped.length > 0) {
+          console.log(
+            chalk.yellow(`\nSkipped ${result.skipped.length} stale worktree(s) (kept for safety):`),
+          );
+          for (const s of result.skipped) {
+            console.log(
+              chalk.yellow(`  ${s.record.id} — ${reapSkipReasonText(s.action)} — ${s.record.path}`),
+            );
+          }
+          const dirty = result.skipped.filter(s => s.action === "skip-dirty");
+          if (dirty.length > 0) {
+            console.log(
+              chalk.dim(
+                `\n  ${dirty.length} worktree(s) have UNCOMMITTED changes and will NOT be\n` +
+                  "  auto-removed. Inspect, commit/salvage, then\n" +
+                  "  `switchroom worktree release <id>` (or `git worktree remove <path>`).",
+              ),
+            );
+          }
         }
       }
     });

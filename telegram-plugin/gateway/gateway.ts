@@ -692,7 +692,7 @@ import {
   type SubagentWatcherHandle,
 } from '../subagent-watcher.js'
 import { listRecords as listWorktreeRecords, touchHeartbeat as touchWorktreeHeartbeat } from '../../src/worktree/registry.js'
-import { ownedWorktreeCwds, refreshOwnedWorktreeHeartbeats } from '../worktree-watch-cwds.js'
+import { makeWorktreeWatchProvider } from '../worktree-watch-cwds.js'
 import {
   startBootCard,
   resolvePersonaName,
@@ -28740,52 +28740,41 @@ void (async () => {
               // Best-effort: a registry read failure (e.g. no worktree dir
               // on an agent that never claims one) must not affect the
               // primary agentCwd watch.
-              extraWatchCwdsProvider: () => {
-                // F1/H3 fix: on the SAME rescan tick that re-derives the
-                // watched worktree cwds, advance the heartbeat of every
-                // worktree THIS agent owns. This is the production driver
-                // that keeps `touchHeartbeat` alive (it had ZERO callers, so
-                // every claim read "stale" 10 min after creation and the
-                // reaper's staleness guarantee collapsed). A claim held by a
-                // live gateway now stays fresh; when the gateway dies the
-                // ticks stop and the heartbeat ages out for the reaper.
-                // Throttled internally (≤ every 2 min per record) and fully
-                // best-effort — it never throws out of the provider.
-                refreshOwnedWorktreeHeartbeats({
-                  self: process.env.SWITCHROOM_AGENT_NAME,
-                  agentDir:
-                    process.env.SWITCHROOM_WORKTREE_IDENTITY_FALLBACK === '0'
-                      ? undefined
-                      : watcherAgentDir,
-                  listRecords: listWorktreeRecords,
-                  touchHeartbeat: touchWorktreeHeartbeat,
-                  log: (msg) =>
-                    process.stderr.write(`telegram gateway: ${msg}\n`),
-                });
-                // Fail-CLOSED ownership filter (unset identity ⇒ nothing;
-                // ownerless records excluded; registry throw ⇒ []). Extracted
-                // to telegram-plugin/worktree-watch-cwds.ts so the #1116 /
-                // Gap-2 ownership predicate is under direct unit test — see
-                // telegram-plugin/tests/worktree-watch-cwds.test.ts.
-                return ownedWorktreeCwds({
-                  self: process.env.SWITCHROOM_AGENT_NAME,
-                  listRecords: listWorktreeRecords,
-                  // Durable, non-env identity fallback (#1116 / #2893): when
-                  // SWITCHROOM_AGENT_NAME is somehow unset, derive this
-                  // agent's own identity from its own directory so worktree
-                  // ownership still resolves (env is only the fast path).
-                  // `watcherAgentDir` is guaranteed non-null in this branch
-                  // (the whole watcher is gated on it above). Kill-switch
-                  // SWITCHROOM_WORKTREE_IDENTITY_FALLBACK=0 restores the
-                  // pre-fix env-only behaviour.
-                  agentDir:
-                    process.env.SWITCHROOM_WORKTREE_IDENTITY_FALLBACK === '0'
-                      ? undefined
-                      : watcherAgentDir,
-                  log: (msg) =>
-                    process.stderr.write(`telegram gateway: ${msg}\n`),
-                });
-              },
+              // On every ~1s rescan tick the provider does BOTH:
+              //   1. advances the heartbeat of every worktree THIS agent owns
+              //      — the F1/H3 production driver that keeps `touchHeartbeat`
+              //      alive (it had ZERO callers, so every claim read "stale"
+              //      10 min after creation and the reaper's staleness
+              //      guarantee collapsed); throttled to ≤1 write / 2 min per
+              //      record, and
+              //   2. returns the fail-CLOSED set of owned worktree cwds for the
+              //      watcher to also watch (#1116 / Gap-2 ownership predicate).
+              // Extracted to telegram-plugin/worktree-watch-cwds.ts as
+              // `makeWorktreeWatchProvider` so the wiring — specifically that
+              // the provider ACTUALLY drives heartbeats, not just cwds — is
+              // under direct unit test (see the provider behaviour test in
+              // telegram-plugin/tests/worktree-watch-cwds.test.ts). Fully
+              // best-effort: it never throws out of the provider.
+              extraWatchCwdsProvider: makeWorktreeWatchProvider({
+                self: process.env.SWITCHROOM_AGENT_NAME,
+                // Durable, non-env identity fallback (#1116 / #2893): when
+                // SWITCHROOM_AGENT_NAME is somehow unset, derive this agent's
+                // own identity from its own directory so worktree ownership
+                // still resolves (env is only the fast path). `watcherAgentDir`
+                // is guaranteed non-null in this branch (the whole watcher is
+                // gated on it above). Kill-switch
+                // SWITCHROOM_WORKTREE_IDENTITY_FALLBACK=0 restores the pre-fix
+                // env-only behaviour. One `agentDir` governs BOTH the heartbeat
+                // refresh and the cwd derivation.
+                agentDir:
+                  process.env.SWITCHROOM_WORKTREE_IDENTITY_FALLBACK === '0'
+                    ? undefined
+                    : watcherAgentDir,
+                listRecords: listWorktreeRecords,
+                touchHeartbeat: touchWorktreeHeartbeat,
+                log: (msg) =>
+                  process.stderr.write(`telegram gateway: ${msg}\n`),
+              }),
               // Bug 0 fix: previously omitted, leaving the watcher unable to
               // write liveness/stall/turn_end updates to the registry DB.
               // Liveness writes are now persisted across the gateway lifetime.

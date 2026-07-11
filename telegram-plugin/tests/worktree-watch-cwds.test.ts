@@ -9,14 +9,26 @@
  * Run with:
  *   bun test telegram-plugin/tests/worktree-watch-cwds.test.ts
  */
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, rmSync, readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import {
   ownedWorktreeCwds,
   refreshOwnedWorktreeHeartbeats,
+  makeWorktreeWatchProvider,
   __resetIdentityEscalationForTests,
   type WorktreeOwnershipRecord,
   type WorktreeHeartbeatRecord,
 } from "../worktree-watch-cwds.js";
+import {
+  writeRecord,
+  readRecord,
+  listRecords as registryListRecords,
+  touchHeartbeat as registryTouchHeartbeat,
+} from "../../src/worktree/registry.js";
+import type { WorktreeRecord } from "../../src/worktree/types.js";
 
 const idPath = (p: string) => p; // identity realpath for deterministic tests
 
@@ -290,5 +302,111 @@ describe("refreshOwnedWorktreeHeartbeats", () => {
     // mine-2 still touched despite mine-1 throwing.
     expect(touched).toEqual(["mine-2"]);
     expect(n).toBe(1);
+  });
+});
+
+// ─── M1: the gateway's extraWatchCwds provider ──────────────────────────────
+//
+// The gateway wires a single closure (`makeWorktreeWatchProvider`) as the
+// subagent-watcher's extraWatchCwdsProvider. The whole point of this PR is
+// that that closure ALSO advances heartbeats on every tick — deleting the
+// refresh call would leave the cwd behaviour (and every ownership test above)
+// green while silently reintroducing the zero-caller `touchHeartbeat` bug.
+// These tests are the deterministic guard: they assert the provider returns
+// owned cwds AND advances a real registry record's heartbeatAt on the same
+// call, and that the gateway actually installs it.
+describe("makeWorktreeWatchProvider (gateway wiring)", () => {
+  const idPathLocal = (p: string) => p; // deterministic realpath
+
+  it("both returns owned cwds AND advances the claim's heartbeat (in-memory)", () => {
+    const now = 10_000_000;
+    const before = new Date(now - 60 * 60_000).toISOString(); // 1h ago (stale)
+    const store: (WorktreeOwnershipRecord & WorktreeHeartbeatRecord)[] = [
+      { id: "mine", path: "/wt/mine", ownerAgent: "klanker", heartbeatAt: before },
+      { id: "theirs", path: "/wt/theirs", ownerAgent: "reggie", heartbeatAt: before },
+    ];
+    const touched: string[] = [];
+    const provider = makeWorktreeWatchProvider({
+      self: "klanker",
+      listRecords: () => store,
+      touchHeartbeat: (id) => touched.push(id),
+      realpath: idPathLocal,
+      minRefreshIntervalMs: 0,
+      now: () => now,
+    });
+
+    const cwds = provider();
+
+    // (1) returns exactly this agent's owned cwds
+    expect(cwds).toEqual(["/wt/mine"]);
+    // (2) AND advanced the heartbeat of the owned record only — never foreign
+    expect(touched).toEqual(["mine"]);
+  });
+
+  describe("against a real temp registry", () => {
+    let tmpDir: string;
+    const origEnv = process.env.SWITCHROOM_WORKTREE_DIR;
+
+    beforeEach(() => {
+      tmpDir = mkdtempSync(join(tmpdir(), "sw-provider-test-"));
+      process.env.SWITCHROOM_WORKTREE_DIR = tmpDir;
+    });
+
+    afterEach(() => {
+      rmSync(tmpDir, { recursive: true, force: true });
+      if (origEnv === undefined) delete process.env.SWITCHROOM_WORKTREE_DIR;
+      else process.env.SWITCHROOM_WORKTREE_DIR = origEnv;
+    });
+
+    function makeRecord(overrides: Partial<WorktreeRecord> = {}): WorktreeRecord {
+      const iso = new Date().toISOString();
+      return {
+        id: "prov001",
+        repo: "/fake/repo",
+        repoName: "fake",
+        branch: "task/prov001",
+        path: "/wt/prov001",
+        createdAt: iso,
+        heartbeatAt: iso,
+        ownerAgent: "klanker",
+        ...overrides,
+      };
+    }
+
+    it("provider drives the REAL registry: returns cwd AND advances heartbeatAt on disk", async () => {
+      const past = new Date(Date.now() - 5 * 60_000).toISOString(); // 5min ago
+      writeRecord(makeRecord({ heartbeatAt: past }));
+      const before = new Date(readRecord("prov001")!.heartbeatAt).getTime();
+
+      const provider = makeWorktreeWatchProvider({
+        self: "klanker",
+        listRecords: registryListRecords,
+        touchHeartbeat: registryTouchHeartbeat,
+        realpath: idPathLocal,
+        minRefreshIntervalMs: 0, // always touch
+      });
+
+      await new Promise((r) => setTimeout(r, 5)); // ensure a strictly newer ts
+      const cwds = provider();
+
+      // (1) returns the owned cwd from the real registry
+      expect(cwds).toEqual(["/wt/prov001"]);
+      // (2) AND the on-disk heartbeat actually advanced (the zero-caller guard)
+      const after = new Date(readRecord("prov001")!.heartbeatAt).getTime();
+      expect(after).toBeGreaterThan(before);
+    });
+  });
+
+  it("gateway.ts installs makeWorktreeWatchProvider as extraWatchCwdsProvider", () => {
+    // Grep-pin (anchor MUST resolve so it can never pass vacuously — repo test
+    // convention, PR #3126): proves the gateway actually wires the extracted
+    // provider, so a behaviour test on the provider is not testing dead code.
+    const here = dirname(fileURLToPath(import.meta.url));
+    const gatewaySrc = readFileSync(
+      join(here, "..", "gateway", "gateway.ts"),
+      "utf8",
+    );
+    const anchor = "extraWatchCwdsProvider: makeWorktreeWatchProvider(";
+    expect(gatewaySrc.indexOf(anchor)).toBeGreaterThan(-1);
   });
 });

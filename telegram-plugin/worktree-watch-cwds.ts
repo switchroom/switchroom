@@ -249,3 +249,76 @@ export function refreshOwnedWorktreeHeartbeats(
   }
   return touched;
 }
+
+/** A registry record carrying everything both watch operations need. */
+export type WorktreeWatchRecord = WorktreeOwnershipRecord & WorktreeHeartbeatRecord;
+
+export interface WorktreeWatchProviderOptions {
+  /** The agent's identity — `process.env.SWITCHROOM_AGENT_NAME` (fast path). */
+  self: string | undefined;
+  /** Durable, non-env identity fallback: the agent's OWN directory. */
+  agentDir?: string | null;
+  /** Host-global registry read (`listRecords` from src/worktree/registry). */
+  listRecords: () => WorktreeWatchRecord[];
+  /** Advance one record's heartbeat (`touchHeartbeat` from the registry). */
+  touchHeartbeat: (id: string) => void;
+  /** Injectable realpath for the cwd derivation (defaults to fs.realpathSync). */
+  realpath?: (p: string) => string;
+  /** Injectable name derivation from `agentDir` (defaults to path.basename). */
+  deriveName?: (agentDir: string) => string;
+  /** Heartbeat throttle window (ms); see refreshOwnedWorktreeHeartbeats. */
+  minRefreshIntervalMs?: number;
+  /** `Date.now` override for tests. */
+  now?: () => number;
+  /** Best-effort log sink shared by both operations. */
+  log?: (msg: string) => void;
+}
+
+/**
+ * Build the `extraWatchCwdsProvider` closure the gateway installs on the
+ * subagent watcher.
+ *
+ * The provider is invoked on every ~1s rescan tick and does TWO things on that
+ * single tick:
+ *   1. advances the heartbeat of every worktree THIS agent owns
+ *      (`refreshOwnedWorktreeHeartbeats` — the production driver that keeps
+ *      `touchHeartbeat` alive; without it every claim reads "stale" 10 min
+ *      after creation and the reaper's staleness guarantee collapses), AND
+ *   2. returns the set of owned worktree cwds for the watcher to also watch
+ *      (`ownedWorktreeCwds`).
+ *
+ * It is extracted from the gateway (rather than inlined) SO THAT the wiring —
+ * specifically that the provider actually DRIVES heartbeats, not merely returns
+ * cwds — is under direct unit test. Deleting the heartbeat refresh here is
+ * caught by the provider's behaviour test (it would return cwds but stop
+ * advancing heartbeats), which the pre-extraction inline closure could not
+ * assert against.
+ *
+ * Both operations use the SAME two-tier identity (env fast path + agentDir
+ * fallback), so a single `agentDir` kill-switch on the caller governs both.
+ * Fully best-effort: neither operation throws out of the returned closure.
+ */
+export function makeWorktreeWatchProvider(
+  opts: WorktreeWatchProviderOptions,
+): () => string[] {
+  return () => {
+    refreshOwnedWorktreeHeartbeats({
+      self: opts.self,
+      agentDir: opts.agentDir,
+      listRecords: opts.listRecords,
+      touchHeartbeat: opts.touchHeartbeat,
+      minRefreshIntervalMs: opts.minRefreshIntervalMs,
+      now: opts.now,
+      deriveName: opts.deriveName,
+      log: opts.log,
+    });
+    return ownedWorktreeCwds({
+      self: opts.self,
+      agentDir: opts.agentDir,
+      listRecords: opts.listRecords,
+      realpath: opts.realpath,
+      deriveName: opts.deriveName,
+      log: opts.log,
+    });
+  };
+}
