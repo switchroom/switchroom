@@ -190,6 +190,7 @@ import {
   isFloodWaitActiveError,
 } from '../retry-api-call.js'
 import { createSendGate, sendGateEnabledFromEnv } from '../send-gate.js'
+import { createStatsLogger, createFloodWindowObserver } from '../send-gate-observability.js'
 import { classifyPhotoFile, rerouteResultSuffix } from '../photo-precheck.js'
 import { installTgPostLogger, withTgPostTags } from '../shared/bot-runtime.js'
 import {
@@ -199,6 +200,8 @@ import {
   makeFloodWaitProbe,
   makeFloodWindowRecorder,
   loadInitialFloodWindows,
+  readFloodWindows,
+  markFloodWindowAlerted,
   suppressNonEssentialSendMs,
 } from '../flood-circuit-breaker.js'
 import { buildAttachmentPath, assertInsideInbox } from '../attachment-path.js'
@@ -5443,6 +5446,55 @@ const nonEssentialApiCall = createRetryApiCall({
     )
   },
 })
+
+// #3084 PR 3/3 — observability + operator flood alerts (part3-design §6).
+// A low-frequency, change-gated stats line + flood-window open/close snapshots
+// to the gateway-supervisor log, and ONE operator alert per prolonged flood
+// window. All feature-flagged: when the send gate is OFF, `stats().enabled` is
+// false and both `tick()`s are pure no-ops (the interval is not even scheduled).
+const SEND_GATE_OBSERVE_INTERVAL_MS = 15_000
+const sendGateStatsLogger = createStatsLogger({
+  stats: () => sendGate.stats(),
+  log: (line) => process.stderr.write(line),
+  clock: { now: () => Date.now(), sleep: (ms) => new Promise((r) => setTimeout(r, ms)) },
+})
+const floodWindowObserver = createFloodWindowObserver({
+  clock: { now: () => Date.now(), sleep: (ms) => new Promise((r) => setTimeout(r, ms)) },
+  log: (line) => process.stderr.write(line),
+  stats: () => sendGate.stats(),
+  readWindows: (now) => readFloodWindows(FLOOD_WINDOWS_PATH, now),
+  markAlerted: (scopeKey, alertedAt) =>
+    markFloodWindowAlerted(FLOOD_WINDOWS_PATH, scopeKey, alertedAt, Date.now()),
+  operatorChatId: () => loadAccess().allowFrom[0], // resolved per-tick (allowFrom can change)
+  sendAlert: async (text) => {
+    const operator = loadAccess().allowFrom[0]
+    if (operator === undefined) {
+      process.stderr.write(
+        `telegram gateway: send-gate flood alert not sent — no operator chat (allowFrom empty)\n`,
+      )
+      return
+    }
+    await robustApiCall(
+      // allow-raw-bot-api: operator flood alert, routed through robustApiCall.
+      () => bot.api.sendRichMessage(operator, richMessage(text), {}),
+      { chat_id: String(operator), verb: 'send-gate-flood-alert', priorityClass: 'critical' },
+    )
+  },
+})
+if (sendGateEnabledFromEnv()) {
+  const observeTimer = setInterval(() => {
+    try {
+      sendGateStatsLogger.tick()
+    } catch {
+      /* observability must never crash the gateway */
+    }
+    void floodWindowObserver.tick().catch(() => {
+      /* best-effort — a failed observer tick must not surface */
+    })
+  }, SEND_GATE_OBSERVE_INTERVAL_MS)
+  // Don't keep the event loop alive for observability alone.
+  observeTimer.unref?.()
+}
 
 // ─── Typing indicator ─────────────────────────────────────────────────────
 // All four state maps re-keyed from `chat_id` to `chatKey(chat, thread)`
@@ -20775,6 +20827,30 @@ async function buildAgentMetadata(agentName: string): Promise<AgentMetadata> {
     auth: authSummary,
     audit: buildAgentAudit(agentName),
     live: await buildLiveProbeRows(agentName),
+    sendGate: buildSendGateStatus(),
+  }
+}
+
+/**
+ * Build the `/status` send-gate block (#3084 PR 3, part3-design §6). Returns
+ * `undefined` when the gate flag is OFF so `/status` renders exactly as it did
+ * before the gate existed. Queued / shed totals come from the live counters;
+ * open flood windows are read from the persisted sibling file (already pruned).
+ */
+function buildSendGateStatus(): AgentMetadata['sendGate'] {
+  const s = sendGate.stats()
+  if (!s.enabled) return undefined
+  const openWindows = readFloodWindows(FLOOD_WINDOWS_PATH, Date.now()).map((w) => ({
+    scopeKey: w.scopeKey,
+    untilTs: w.untilTs,
+  }))
+  return {
+    queued: s.global.queued,
+    shed: s.global.shed,
+    expired: s.global.expired,
+    failedFast: s.global.failedFast,
+    dropped: s.global.dropped,
+    openWindows,
   }
 }
 
