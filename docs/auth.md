@@ -148,6 +148,37 @@ Claude version range tested against: as of v0.7.x of switchroom
 re-pinned on every Claude version bump that touches token
 handling.
 
+## Mid-turn account swap semantics
+
+A running `claude` process picks up a broker mirror rewrite —
+token refresh OR account swap — **on its next API request, without
+a restart**. Verified against claude 2.1.205's embedded source: the
+request path calls the CLI's ensure-fresh-token routine before
+building auth headers, and that routine `stat()`s
+`<CLAUDE_CONFIG_DIR>/.credentials.json`; when `mtimeMs` differs
+from the last-seen value it clears the in-memory token caches, so
+the next read pulls the new bytes off disk. The broker's atomic
+rewrite (write + rename) always bumps mtime, so a fleet roll is
+seamless for in-flight sessions: the turn keeps going and the next
+request rides the new account.
+
+Two boundaries to keep honest:
+
+- **An already-in-flight HTTP request finishes (or fails) on the
+  old token.** The re-read is per-request, not per-byte. That is
+  exactly why the gateway's `fleet-fallback-resume` restart exists:
+  when a mid-turn 429 has already KILLED a turn, only a restart's
+  boot-resume path can replay it. Proactive broker rolls (the
+  fleet-quota probe) never restart anything — running sessions
+  don't need it (`tests/broker-roll-no-restart-invariant.test.ts`).
+- **The mechanism is a claude implementation detail**, not a
+  documented contract. It is pinned against the installed binary by
+  `tests/claude-credentials-midturn-reread.test.ts` (self-skips
+  where claude isn't installed; runs in the nightly latest-claude
+  canary). If a future release drops the mtime watch, that test
+  reds and every swap becomes restart-required — revisit failover
+  messaging before bumping the pin.
+
 ## Quota / 429 handling
 
 The broker maintains per-account quota state in
