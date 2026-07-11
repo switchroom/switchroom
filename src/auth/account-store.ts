@@ -36,11 +36,10 @@ import {
   renameSync,
   rmSync,
   statSync,
-  writeFileSync,
 } from "node:fs";
-import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { atomicWriteJsonSync } from "../util/atomic.js";
 
 const LABEL_MAX = 64;
 // Account labels accept email-friendly characters so operators can
@@ -268,8 +267,14 @@ export function writeAccountCredentials(
   home: string = homedir(),
 ): void {
   validateAccountLabel(label);
-  mkdirSync(accountDir(label, home), { recursive: true });
-  atomicWriteJson(accountCredentialsPath(label, home), enrichClaudeCreds(value));
+  // 0o700 — account dirs hold OAuth secrets and must not be world-traversable
+  // (sec F5; matches the Google/MS storage dirs). The broker runs as root, so
+  // a 0o755 dir would let any local UID traverse to the credentials inode.
+  mkdirSync(accountDir(label, home), { recursive: true, mode: 0o700 });
+  // atomicWriteJsonSync: fsync + O_NOFOLLOW|O_EXCL tempfile open (sec F2) so a
+  // pre-planted symlink at the tempfile path can't redirect the root broker's
+  // credential write through it.
+  atomicWriteJsonSync(accountCredentialsPath(label, home), enrichClaudeCreds(value));
 }
 
 /**
@@ -322,8 +327,11 @@ export function writeAccountMeta(
   home: string = homedir(),
 ): void {
   validateAccountLabel(label);
-  mkdirSync(accountDir(label, home), { recursive: true });
-  atomicWriteJson(accountMetaPath(label, home), value);
+  // 0o700 + hardened atomic write — same rationale as writeAccountCredentials
+  // (sec F2/F5). meta.json carries account identity/quota state alongside the
+  // creds and must get the same symlink-resistant, fsync'd write.
+  mkdirSync(accountDir(label, home), { recursive: true, mode: 0o700 });
+  atomicWriteJsonSync(accountMetaPath(label, home), value);
 }
 
 /** Update a single meta field, preserving the rest. Creates if absent. */
@@ -438,23 +446,10 @@ export function renameAccount(
 
 /* ── Atomic write helper ─────────────────────────────────────────────── */
 
-/**
- * Write a JSON value atomically: tempfile in the same directory + rename.
- * Same-directory rename keeps it on a single filesystem (rename(2) is
- * only atomic intra-fs). Cleans the tempfile on failure so a crash
- * mid-write doesn't leave a sibling turd.
- */
-function atomicWriteJson(destPath: string, value: unknown, mode = 0o600): void {
-  const tmp = `${destPath}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
-  try {
-    writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n", { mode });
-    renameSync(tmp, destPath);
-  } catch (err) {
-    try {
-      rmSync(tmp, { force: true });
-    } catch {
-      /* already gone */
-    }
-    throw err;
-  }
-}
+// The local `atomicWriteJson` (tempfile + rename, no fsync, `'w'` open that
+// followed symlinks and lacked O_EXCL) was replaced by the shared
+// `atomicWriteJsonSync` from `../util/atomic.js` (sec F2): it fsyncs the
+// tempfile and opens it O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW, so a pre-planted
+// symlink at the tempfile path fails the open (EEXIST/ELOOP) instead of
+// letting the root broker write a secret through it. Output is byte-identical
+// (`JSON.stringify(value, null, 2) + "\n"`, mode 0o600).

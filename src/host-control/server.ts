@@ -479,6 +479,21 @@ function defaultApprovalId(): string {
 }
 
 /**
+ * Caller-identity scope prefix for the idempotency cache key (sec
+ * host-control-F1). Two different callers must never share an idempotency
+ * bucket — otherwise caller B replaying caller A's idempotency_key (or a
+ * request_id collision) could be served A's cached mutation result. The
+ * agent-name / operator distinction is authoritative because it's derived
+ * from the daemon's own bind path (`socketPathToIdentity`), which a caller
+ * cannot influence. The scope prefix (`operator` / `agent:<slug>`) contains
+ * no space, and agent slugs contain no space, so the single-space separator
+ * makes the scoped key unambiguous across distinct callers.
+ */
+function idempotencyScope(caller: SocketIdentity): string {
+  return caller.kind === "agent" ? `agent:${caller.name}` : "operator";
+}
+
+/**
  * Map a deny `ApprovalResult` to the appropriate error string for
  * the config_propose_edit response. (#1762)
  *
@@ -964,9 +979,29 @@ export class HostdServer {
       return;
     }
 
-    const idempotencyKey = req.idempotency_key ?? req.request_id;
     const now = Date.now();
     this.evictExpiredIdempotency(now);
+
+    // sec host-control-F1: the authz gate MUST run BEFORE any idempotency
+    // short-circuit. Previously the cache was consulted first, so a cached
+    // result could be handed back before `checkGate` ever ran — and the
+    // cache key was NOT scoped by caller, so caller B replaying caller A's
+    // idempotency_key could be served A's mutation result, unaudited and
+    // unauthorized. Gating first closes both halves: an unauthorized caller
+    // is denied (and the denial is audited) before the cache is touched.
+    const denied = this.checkGate(req, caller);
+    if (denied) {
+      const resp = deniedResponse(req.request_id, denied);
+      await this.writeAudit({ caller, req, resp });
+      socket.write(encodeResponse(resp));
+      socket.end();
+      return;
+    }
+
+    // Idempotency key is scoped by caller identity (sec host-control-F1) so
+    // one caller's bucket can never collide with — or surface — another
+    // caller's cached result. Consulted only after the gate above passes.
+    const idempotencyKey = `${idempotencyScope(caller)} ${req.idempotency_key ?? req.request_id}`;
     const prior = this.idempotencyKeys.get(idempotencyKey);
     if (prior && now - prior.ts < IDEMPOTENCY_WINDOW_MS) {
       // Reuse the prior response if available. Note: only mutating
@@ -983,15 +1018,6 @@ export class HostdServer {
       }
     }
     this.idempotencyKeys.set(idempotencyKey, { request_id: req.request_id, ts: now });
-
-    const denied = this.checkGate(req, caller);
-    if (denied) {
-      const resp = deniedResponse(req.request_id, denied);
-      await this.writeAudit({ caller, req, resp });
-      socket.write(encodeResponse(resp));
-      socket.end();
-      return;
-    }
 
     // ── #1841 operator-attest 2nd factor (RFC §5.4) ──────────────────
     // Runs AFTER the admin/allowlist gate: attestation is an additional
