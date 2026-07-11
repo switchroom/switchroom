@@ -62,6 +62,7 @@ const BROAD_ONLY_TOOLS = new Set([
   "WebSearch",
   "Task",
   "Agent",
+  "Workflow",
   "TodoWrite",
   "ExitPlanMode",
 ]);

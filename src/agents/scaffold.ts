@@ -1946,6 +1946,7 @@ const ALL_BUILTIN_TOOLS = [
   "TodoWrite",
   "Task",
   "Agent",
+  "Workflow",
   "ExitPlanMode",
 ];
 
