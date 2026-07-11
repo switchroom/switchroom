@@ -6,12 +6,32 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { writeRecord, readRecord, listRecords } from "../src/worktree/registry.js";
-import { runReaper, STALE_THRESHOLD_MS } from "../src/worktree/reaper.js";
+import {
+  runReaper,
+  planReaper,
+  probePathInUse,
+  STALE_THRESHOLD_MS,
+  type ReaperDeps,
+} from "../src/worktree/reaper.js";
 import type { WorktreeRecord } from "../src/worktree/types.js";
+
+/**
+ * Deterministic default deps for the stale-reap path: the probe reports the
+ * path as free and the tree is clean, so the reaper's ONLY remaining gate is
+ * staleness. Individual fail-safe tests override one field to exercise a guard.
+ * (Without this, the reaper would shell out to the host's real fuser/lsof/git,
+ * making the outcome depend on which tools the CI box happens to have.)
+ */
+const REAP_ALLOWED: ReaperDeps = {
+  probeInUse: () => "free",
+  hasUncommittedChanges: () => false,
+  removeWorktree: () => {},
+};
 
 describe("worktree reaper", () => {
   let tmpDir: string;
@@ -74,16 +94,14 @@ describe("worktree reaper", () => {
     expect(listRecords()).toHaveLength(1);
   });
 
-  it("reaps a record with stale heartbeat (path exists, no fuser)", () => {
+  it("reaps a record with stale heartbeat (path free, tree clean)", () => {
     // Heartbeat is 11 minutes ago — over the 10-min threshold
     const staleAge = STALE_THRESHOLD_MS + 60_000;
     const rec = makeRecord("stale01", staleAge, true);
     writeRecord(rec);
 
-    // The reaper will try `git worktree remove --force` which will fail
-    // on a fake path, but it should still delete the registry record.
-    // It also tries `fuser` which will return false for our tmp dir.
-    const result = runReaper();
+    // Probe reports free + no uncommitted changes → the reaper removes it.
+    const result = runReaper(undefined, REAP_ALLOWED);
 
     expect(result.reaped).toContain("stale01");
     expect(listRecords()).toHaveLength(0);
@@ -96,7 +114,7 @@ describe("worktree reaper", () => {
     writeRecord(fresh);
     writeRecord(stale);
 
-    const result = runReaper();
+    const result = runReaper(undefined, REAP_ALLOWED);
 
     expect(result.reaped).toContain("reaped");
     expect(result.reaped).not.toContain("keepme");
@@ -121,5 +139,145 @@ describe("worktree reaper", () => {
 
     expect(result.reaped.sort()).toEqual(["orphan-a", "orphan-b", "orphan-c"]);
     expect(listRecords()).toHaveLength(0);
+  });
+
+  // ── Fail-safe: data-loss prevention (F1 / H3) ────────────────────────────
+
+  it("does NOT force-remove a stale worktree that has UNCOMMITTED changes (real git)", () => {
+    // Anchor test — uses the REAL hasUncommittedChanges + real git so it
+    // fails at runtime against the pre-fix reaper (which only warned, then
+    // force-removed anyway). The worktree path is a real git repo with an
+    // untracked file, so `git status --porcelain` reports a dirty tree.
+    const staleAge = STALE_THRESHOLD_MS + 60_000;
+    const rec = makeRecord("dirty01", staleAge, true);
+    // Turn the (already-existing) worktree dir into a git repo with a change.
+    execFileSync("git", ["-C", rec.path, "init", "-q"], { stdio: "pipe" });
+    writeFileSync(join(rec.path, "WIP.txt"), "uncommitted work\n");
+    writeRecord(rec);
+
+    // Real probe (fuser/lsof or "unavailable") — either way the dirty guard
+    // fires FIRST and hard-skips, so the record must survive untouched.
+    const result = runReaper();
+
+    expect(result.reaped).not.toContain("dirty01");
+    expect(listRecords().map((r) => r.id)).toContain("dirty01");
+    // The skip is surfaced as a warning (not a silent drop).
+    expect(result.warnings.some((w) => w.includes("UNCOMMITTED"))).toBe(true);
+  });
+
+  it("does NOT force-remove a stale worktree when the in-use probe is UNAVAILABLE (no fuser/lsof)", () => {
+    const staleAge = STALE_THRESHOLD_MS + 60_000;
+    const rec = makeRecord("noprobe01", staleAge, true);
+    writeRecord(rec);
+
+    // Simulate a host with neither fuser nor lsof installed. Tree is clean,
+    // so the probe is the only remaining gate — and "unavailable" must be
+    // treated as live (fail-safe), never reaped.
+    const result = runReaper(undefined, {
+      hasUncommittedChanges: () => false,
+      probeInUse: () => "unavailable",
+      removeWorktree: () => {
+        throw new Error("must not force-remove when probe is unavailable");
+      },
+    });
+
+    expect(result.reaped).not.toContain("noprobe01");
+    expect(listRecords().map((r) => r.id)).toContain("noprobe01");
+    expect(result.warnings.some((w) => w.includes("probe"))).toBe(true);
+  });
+
+  it("does NOT reap a stale worktree the probe reports as in-use", () => {
+    const staleAge = STALE_THRESHOLD_MS + 60_000;
+    const rec = makeRecord("inuse01", staleAge, true);
+    writeRecord(rec);
+
+    const result = runReaper(undefined, {
+      hasUncommittedChanges: () => false,
+      probeInUse: () => "in-use",
+      removeWorktree: () => {
+        throw new Error("must not force-remove a worktree that is in use");
+      },
+    });
+
+    expect(result.reaped).not.toContain("inuse01");
+    expect(listRecords().map((r) => r.id)).toContain("inuse01");
+  });
+
+  // ── L1: dry-run parity — planReaper is the single decision predicate ─────
+
+  it("L1: planReaper marks a stale DIRTY worktree skip-dirty, NOT reap (dry-run parity)", () => {
+    // The pre-fix dry-run computed would-reap from heartbeat age alone, so it
+    // over-reported this record as reapable even though a real run hard-skips
+    // it. planReaper (shared by both the real run and the dry-run) must
+    // classify it as skip-dirty so the two agree.
+    const staleAge = STALE_THRESHOLD_MS + 60_000;
+    const rec = makeRecord("drydirty01", staleAge, true);
+    writeRecord(rec);
+
+    const plan = planReaper(undefined, {
+      hasUncommittedChanges: () => true,
+      probeInUse: () => "free",
+    });
+    const entry = plan.find((e) => e.record.id === "drydirty01");
+    expect(entry?.action).toBe("skip-dirty");
+    // The exact same predicate drives a real run → it is NOT reaped.
+    const result = runReaper(undefined, {
+      hasUncommittedChanges: () => true,
+      probeInUse: () => "free",
+      removeWorktree: () => {
+        throw new Error("must not remove a dirty worktree");
+      },
+    });
+    expect(result.reaped).not.toContain("drydirty01");
+  });
+
+  it("L1: planReaper marks a stale worktree with an UNAVAILABLE probe skip-probe-unavailable, not reap", () => {
+    const staleAge = STALE_THRESHOLD_MS + 60_000;
+    writeRecord(makeRecord("dryprobe01", staleAge, true));
+
+    const plan = planReaper(undefined, {
+      hasUncommittedChanges: () => false,
+      probeInUse: () => "unavailable",
+    });
+    const entry = plan.find((e) => e.record.id === "dryprobe01");
+    expect(entry?.action).toBe("skip-probe-unavailable");
+  });
+
+  it("L1: planReaper still marks a stale, clean, free worktree as reap (would-reap parity)", () => {
+    const staleAge = STALE_THRESHOLD_MS + 60_000;
+    writeRecord(makeRecord("dryreap01", staleAge, true));
+
+    const plan = planReaper(undefined, REAP_ALLOWED);
+    const entry = plan.find((e) => e.record.id === "dryreap01");
+    expect(entry?.action).toBe("reap");
+  });
+
+  // ── M2: stale-but-kept worktrees are surfaced, not silently dropped ──────
+
+  it("M2: runReaper reports a kept dirty worktree in result.skipped with remediation", () => {
+    const staleAge = STALE_THRESHOLD_MS + 60_000;
+    writeRecord(makeRecord("keptdirty01", staleAge, true));
+
+    const result = runReaper(undefined, {
+      hasUncommittedChanges: () => true,
+      probeInUse: () => "free",
+      removeWorktree: () => {},
+    });
+
+    const skip = result.skipped.find((s) => s.record.id === "keptdirty01");
+    expect(skip?.action).toBe("skip-dirty");
+    // The remediation path is spelled out in the message (M2).
+    expect(skip?.message).toContain("worktree release");
+    expect(result.reaped).not.toContain("keptdirty01");
+  });
+
+  it("probePathInUse never reports an unheld dir as 'in-use' (host-independent)", () => {
+    // Nothing holds an empty temp dir open, so the probe must be 'free' (a
+    // probe ran and found no holder) or 'unavailable' (no probe installed) —
+    // never a false 'in-use'. This pins the ENOENT-vs-nonzero-exit
+    // distinction without depending on which tools the host has.
+    const dir = join(checkoutsDir, "probe-free");
+    mkdirSync(dir, { recursive: true });
+    expect(["free", "unavailable"]).toContain(probePathInUse(dir));
   });
 });

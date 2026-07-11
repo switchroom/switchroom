@@ -92,10 +92,31 @@ export function listRecords(): WorktreeRecord[] {
 /**
  * Update the heartbeat timestamp for a claim.
  * No-op if the record doesn't exist.
+ *
+ * Concurrency (L2): this is a read-modify-write, and it now has a production
+ * caller (the gateway's watch loop) that can run concurrently with a CLI
+ * `worktree release` (which calls `deleteRecord`). If a `deleteRecord` lands
+ * between our read and our write, a naive write would RESURRECT the just-
+ * released record as a zombie claim. To close that common window we re-verify
+ * the record file still exists immediately before writing, and skip the write
+ * if it's gone.
+ *
+ * A tiny TOCTOU window remains between the `recordExists` check and the
+ * `renameSync` inside `writeRecord`; fully closing it would require file
+ * locking, which is out of scope here. This check eliminates the realistic
+ * race (a release completing during a heartbeat refresh) at near-zero cost.
+ *
+ * `onAfterRead` is a test seam: it fires after the record is read but before
+ * the existence re-check, so a test can deterministically simulate a delete
+ * landing in the race window. Production callers never pass it.
  */
-export function touchHeartbeat(id: string): void {
+export function touchHeartbeat(id: string, onAfterRead?: () => void): void {
   const rec = readRecord(id);
   if (!rec) return;
+  onAfterRead?.();
+  // Re-verify the record still exists just before writing — a concurrent
+  // deleteRecord must not be undone by resurrecting the file below.
+  if (!recordExists(id)) return;
   writeRecord({ ...rec, heartbeatAt: new Date().toISOString() });
 }
 

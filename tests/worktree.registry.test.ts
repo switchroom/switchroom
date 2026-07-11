@@ -106,6 +106,25 @@ describe("worktree registry", () => {
     expect(() => touchHeartbeat("missing999")).not.toThrow();
   });
 
+  it("L2: does NOT resurrect a record deleted between its read and write", () => {
+    // Race window: touchHeartbeat reads the record, then a concurrent
+    // `worktree release` (deleteRecord) lands, then touchHeartbeat writes. A
+    // naive write would recreate the just-released record as a zombie claim.
+    // The onAfterRead seam simulates the delete landing in that window.
+    const rec = makeRecord({ id: "race001" });
+    writeRecord(rec);
+    expect(recordExists("race001")).toBe(true);
+
+    touchHeartbeat("race001", () => {
+      // Simulate the concurrent release firing after the read but before write.
+      deleteRecord("race001");
+    });
+
+    // The record must stay deleted — touchHeartbeat must not resurrect it.
+    expect(recordExists("race001")).toBe(false);
+    expect(readRecord("race001")).toBeNull();
+  });
+
   it("countByRepo counts correctly", () => {
     writeRecord(makeRecord({ id: "c1", repo: "/repo/a" }));
     writeRecord(makeRecord({ id: "c2", repo: "/repo/a" }));

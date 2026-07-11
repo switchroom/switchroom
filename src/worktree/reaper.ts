@@ -3,15 +3,38 @@
  *
  * Reaper logic (liveness-based, NOT age-based):
  *   - A claim is stale when heartbeatAt is older than STALE_THRESHOLD_MS
- *     AND no process holds the worktree path open (fuser check).
+ *     AND we can PROVE the worktree path is not held by any live process.
  *   - A claim is an orphan when the registry record exists but the
- *     filesystem worktree doesn't, or vice versa.
+ *     filesystem worktree doesn't (a dangling record).
  *
- * On reap:
- *   1. Run git worktree remove --force.
- *   2. Delete the registry record.
- *   3. If the worktree had uncommitted changes, emit a warning to stderr
- *      (callers can forward this to Telegram).
+ * FAIL-SAFE by construction (data-loss prevention, F1/H3):
+ *   The reaper's whole job is to remove a *dead* claim's worktree with
+ *   `git worktree remove --force`, which discards any working-tree state.
+ *   That force-remove is only ever run when EVERY one of these holds:
+ *     1. the heartbeat is stale (> STALE_THRESHOLD_MS), AND
+ *     2. the worktree has NO uncommitted changes (a hard skip — never a
+ *        mere warning: we do not destroy in-flight work), AND
+ *     3. an in-use probe can DEFINITIVELY report the path as free.
+ *   If the in-use probe is unavailable (neither `fuser` nor `lsof` is
+ *   installed) we treat the path as live and keep it — "can't prove it's
+ *   idle" must never license a force-remove. A live claim advances its own
+ *   heartbeat (see registry.touchHeartbeat, refreshed from the gateway's
+ *   watch loop), so a genuinely-abandoned claim is the only thing that
+ *   reaches the stale branch in the first place.
+ *
+ * OPERATIONAL NOTE — dead-but-dirty worktrees are KEPT, not auto-deleted.
+ *   Because fail-safe 2 hard-skips any stale worktree with uncommitted
+ *   changes, a truly-abandoned claim whose tree is dirty is never reaped
+ *   automatically — by design, so in-flight work is never destroyed. The
+ *   trade-off is that such worktrees accumulate until a human clears them.
+ *   The reaper therefore makes the skip VISIBLE: `runReaper` returns them in
+ *   `ReapResult.skipped` (and `switchroom worktree reap` / `reap --dry-run`
+ *   print them with a reason). The manual remediation for a dirty skip is:
+ *     1. inspect the worktree (`git -C <path> status`),
+ *     2. commit or salvage the work,
+ *     3. release it: `switchroom worktree release <id>`  (or, if the record
+ *        is already gone, `git worktree remove <path>`).
+ *   There is deliberately NO auto-delete of a dirty tree.
  */
 
 import { execFileSync } from "node:child_process";
@@ -22,50 +45,134 @@ import type { WorktreeRecord } from "./types.js";
 /** Heartbeat age threshold in ms. Claims older than this are stale. */
 export const STALE_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
 
+/**
+ * Result of probing whether a path is held open by a live process.
+ *   - "in-use"      — a probe positively found a holder → keep the claim.
+ *   - "free"        — a probe ran and found NO holder → safe to consider reap.
+ *   - "unavailable" — NO probe tool is installed → we cannot tell, so the
+ *                     reaper treats the path as live (fail-safe) and keeps it.
+ */
+export type PathUseState = "in-use" | "free" | "unavailable";
+
+/** Injectable dependencies for `runReaper` (defaults use the real probes). */
+export interface ReaperDeps {
+  /** Probe whether the worktree path is held open by a live process. */
+  probeInUse?: (path: string) => PathUseState;
+  /** Detect uncommitted (staged or unstaged) changes in the worktree. */
+  hasUncommittedChanges?: (repoPath: string, worktreePath: string) => boolean;
+  /** Force-remove the worktree (defaults to `git worktree remove --force`). */
+  removeWorktree?: (repoPath: string, worktreePath: string) => void;
+}
+
 export interface ReapResult {
   reaped: string[];
   warnings: string[];
+  /**
+   * Stale worktrees that were KEPT (not reaped) because a fail-safe guard
+   * fired — dirty tree, in-use, or an unavailable probe. Surfaced so the
+   * consequence of the never-auto-delete-dirty policy is visible instead of
+   * silently accumulating. (M2.)
+   */
+  skipped: ReapPlanEntry[];
 }
 
 /**
- * Check whether any process holds the worktree path open.
- *
- * Tries `fuser` (Linux/procps) first, then `lsof` (macOS/BSD). Returns
- * false if neither probe finds a holder OR if neither tool is installed.
- *
- * Note: a false negative (returns false but a process actually has files
- * open) means the reaper can fall through to heartbeat-only stale logic.
- * That's acceptable — the spec allows reaping on stale heartbeat alone
- * for hosts where process-liveness can't be probed.
+ * The decision the reaper reaches for a single record. Both `runReaper` (the
+ * real pass) and `switchroom worktree reap --dry-run` route through the SAME
+ * predicate (`planReaper`) so a dry-run reports EXACTLY what a real run would
+ * do — the dirty / probe guards are applied in both, not just the real run
+ * (L1: dry-run used to over-report by looking at heartbeat age alone).
  */
-function isPathInUse(path: string): boolean {
-  // fuser: Linux. Exits 0 when the path is in use; non-zero (or ENOENT
-  // if not installed) otherwise.
+export type ReapAction =
+  /** Registry record with no filesystem worktree → drop the dangling record. */
+  | "reap-orphan"
+  /** Stale + clean + provably free → force-remove the worktree. */
+  | "reap"
+  /** Heartbeat still fresh → live claim, untouched. */
+  | "keep-fresh"
+  /** Stale but has uncommitted changes → preserve (never auto-delete dirty). */
+  | "skip-dirty"
+  /** Stale + clean but no fuser/lsof to prove it idle → treat as live. */
+  | "skip-probe-unavailable"
+  /** Stale + clean but the probe positively found a holder → keep. */
+  | "skip-in-use";
+
+export interface ReapPlanEntry {
+  record: WorktreeRecord;
+  action: ReapAction;
+  /** Human-readable line (used for warnings and dry-run output). */
+  message: string;
+}
+
+/** Short, user-facing reason for a `skip-*` action (CLI + dry-run output). */
+export function reapSkipReasonText(action: ReapAction): string {
+  switch (action) {
+    case "skip-dirty":
+      return "uncommitted changes";
+    case "skip-probe-unavailable":
+      return "cannot verify not in use";
+    case "skip-in-use":
+      return "in use by a live process";
+    default:
+      return action;
+  }
+}
+
+/**
+ * Probe whether any process holds the worktree path open.
+ *
+ * Tries `fuser` (Linux/procps) first, then `lsof` (macOS/BSD).
+ *
+ * Crucially, this distinguishes "the probe RAN and found nothing" (→ "free")
+ * from "the probe tool is not installed" (→ "unavailable"). A missing binary
+ * surfaces as a spawn `ENOENT`; a real "path not in use" surfaces as a
+ * non-zero *exit* (no `ENOENT`). The reaper must never force-remove on the
+ * strength of an "unavailable" result — that was the F1 data-loss hole where
+ * a host without fuser/lsof reaped live worktrees.
+ */
+export function probePathInUse(path: string): PathUseState {
+  let probeRan = false;
+
+  // fuser: exits 0 when the path is in use; non-zero when not; ENOENT when
+  // the binary itself is missing.
   try {
     execFileSync("fuser", [path], { stdio: "pipe" });
-    return true;
-  } catch {
-    /* fuser missing or path not in use — fall through to lsof */
+    return "in-use";
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      // fuser ran and exited non-zero → path not in use (per fuser).
+      probeRan = true;
+    }
   }
-  // lsof: macOS / BSD. Exits 0 with PID output when in use.
+
+  // lsof: exits 0 with PID output when in use; exits 1 (non-ENOENT) when not.
   try {
     const out = execFileSync("lsof", ["-t", path], {
       stdio: ["ignore", "pipe", "ignore"],
     })
       .toString()
       .trim();
-    if (out.length > 0) return true;
-  } catch {
-    /* lsof missing or path not in use */
+    probeRan = true;
+    if (out.length > 0) return "in-use";
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      // lsof ran and found nothing (exit 1) → not in use (per lsof).
+      probeRan = true;
+    }
   }
-  return false;
+
+  return probeRan ? "free" : "unavailable";
 }
 
 /**
  * Check if a worktree has uncommitted changes.
  * Returns true if there are staged or unstaged changes.
+ *
+ * On ANY error running git (path is not a git worktree, git missing, etc.)
+ * we return `true` — "can't tell" must fail toward preservation, never toward
+ * a force-remove.
  */
-function hasUncommittedChanges(repoPath: string, worktreePath: string): boolean {
+function hasUncommittedChanges(_repoPath: string, worktreePath: string): boolean {
   try {
     const out = execFileSync(
       "git",
@@ -74,74 +181,160 @@ function hasUncommittedChanges(repoPath: string, worktreePath: string): boolean 
     ).toString();
     return out.trim().length > 0;
   } catch {
-    return false;
+    // Can't determine cleanliness → assume dirty so we never force-remove
+    // work we failed to inspect.
+    return true;
+  }
+}
+
+/** Default force-remove: `git worktree remove --force <path>` from the repo. */
+function defaultRemoveWorktree(repoPath: string, worktreePath: string): void {
+  try {
+    execFileSync("git", ["worktree", "remove", "--force", worktreePath], {
+      cwd: repoPath,
+      stdio: "pipe",
+    });
+  } catch {
+    // If git remove fails, the caller still deletes the record. The path may
+    // have been manually deleted or the repo moved.
   }
 }
 
 /**
- * Reap a single stale/orphan record.
- * Returns a warning string if there were uncommitted changes, otherwise null.
- */
-function reapRecord(record: WorktreeRecord): string | null {
-  const { id, path, repo, branch, ownerAgent } = record;
-
-  let warning: string | null = null;
-
-  if (existsSync(path)) {
-    // Check for uncommitted changes before removing
-    if (hasUncommittedChanges(repo, path)) {
-      warning =
-        `[worktree-reaper] Reaped worktree with uncommitted changes: ` +
-        `id=${id} branch=${branch} agent=${ownerAgent ?? "unknown"} path=${path}`;
-    }
-
-    try {
-      execFileSync("git", ["worktree", "remove", "--force", path], {
-        cwd: repo,
-        stdio: "pipe",
-      });
-    } catch {
-      // If git remove fails, still clean up the record.
-      // The path may have been manually deleted.
-    }
-  }
-
-  deleteRecord(id);
-  return warning;
-}
-
-/**
- * Run the reaper pass.
+ * Classify every registry record into the action the reaper would take,
+ * WITHOUT mutating anything. This is the single source of truth for the
+ * reaper's decision — `runReaper` executes the plan and the CLI dry-run
+ * merely reports it, so the two can never diverge (L1).
  *
  * @param nowMs Optional override for "now" (for testing).
+ * @param deps  Optional injectable probes (for testing / host portability).
  */
-export function runReaper(nowMs?: number): ReapResult {
+export function planReaper(nowMs?: number, deps: ReaperDeps = {}): ReapPlanEntry[] {
   const now = nowMs ?? Date.now();
-  const records = listRecords();
+  const probeInUse = deps.probeInUse ?? probePathInUse;
+  const uncommitted = deps.hasUncommittedChanges ?? hasUncommittedChanges;
 
-  const reaped: string[] = [];
-  const warnings: string[] = [];
+  const plan: ReapPlanEntry[] = [];
 
-  for (const record of records) {
+  for (const record of listRecords()) {
     const heartbeatAge = now - new Date(record.heartbeatAt).getTime();
     const worktreeExists = existsSync(record.path);
 
     // Case 1: Orphan — registry record exists but filesystem worktree doesn't.
-    // Clean up the dangling record.
+    // Nothing to force-remove; just drop the dangling record.
     if (!worktreeExists) {
-      deleteRecord(record.id);
-      reaped.push(record.id);
+      plan.push({
+        record,
+        action: "reap-orphan",
+        message: `[worktree-reaper] orphan record (no worktree on disk): id=${record.id} path=${record.path}`,
+      });
       continue;
     }
 
-    // Case 2: Stale heartbeat AND path not in use → reap.
-    if (heartbeatAge > STALE_THRESHOLD_MS && !isPathInUse(record.path)) {
-      const warning = reapRecord(record);
-      if (warning) warnings.push(warning);
-      reaped.push(record.id);
+    // Not stale yet → live claim, keep it.
+    if (heartbeatAge <= STALE_THRESHOLD_MS) {
+      plan.push({ record, action: "keep-fresh", message: "" });
       continue;
+    }
+
+    // ── Stale + worktree present: run the fail-safe gauntlet before any
+    //    `git worktree remove --force`. Only reap when ALL guards clear. ──
+
+    // Fail-safe 1: NEVER destroy uncommitted work. Hard skip (not a warning
+    // that proceeds to remove — that was the F1/H3 data-loss bug). The skip is
+    // surfaced with the manual remediation path (M2) so dirty worktrees don't
+    // silently accumulate.
+    if (uncommitted(record.repo, record.path)) {
+      plan.push({
+        record,
+        action: "skip-dirty",
+        message:
+          `[worktree-reaper] SKIPPED stale worktree with UNCOMMITTED changes ` +
+          `(not removed — preserving in-flight work): id=${record.id} ` +
+          `branch=${record.branch} agent=${record.ownerAgent ?? "unknown"} ` +
+          `path=${record.path} — remediation: inspect, commit/salvage, then ` +
+          `\`switchroom worktree release ${record.id}\` (or \`git worktree remove ${record.path}\`)`,
+      });
+      continue;
+    }
+
+    // Fail-safe 2: only reap when the path is DEFINITIVELY free. Both
+    // "in-use" and "unavailable" (no fuser/lsof to prove idleness) mean we
+    // cannot show the worktree is dead → keep it.
+    const use = probeInUse(record.path);
+    if (use === "unavailable") {
+      plan.push({
+        record,
+        action: "skip-probe-unavailable",
+        message:
+          `[worktree-reaper] SKIPPED stale worktree — in-use probe ` +
+          `unavailable (neither fuser nor lsof installed); treating as ` +
+          `live: id=${record.id} path=${record.path}`,
+      });
+      continue;
+    }
+    if (use === "in-use") {
+      plan.push({
+        record,
+        action: "skip-in-use",
+        message:
+          `[worktree-reaper] kept stale worktree held open by a live process: ` +
+          `id=${record.id} path=${record.path}`,
+      });
+      continue;
+    }
+
+    // All guards cleared: stale, clean, and provably not in use → reap.
+    plan.push({
+      record,
+      action: "reap",
+      message: `[worktree-reaper] reaping stale worktree: id=${record.id} path=${record.path}`,
+    });
+  }
+
+  return plan;
+}
+
+/**
+ * Run the reaper pass — execute the plan from `planReaper`.
+ *
+ * @param nowMs Optional override for "now" (for testing).
+ * @param deps  Optional injectable probes (for testing / host portability).
+ */
+export function runReaper(nowMs?: number, deps: ReaperDeps = {}): ReapResult {
+  const removeWorktree = deps.removeWorktree ?? defaultRemoveWorktree;
+  const plan = planReaper(nowMs, deps);
+
+  const reaped: string[] = [];
+  const warnings: string[] = [];
+  const skipped: ReapPlanEntry[] = [];
+
+  for (const entry of plan) {
+    switch (entry.action) {
+      case "reap-orphan":
+        deleteRecord(entry.record.id);
+        reaped.push(entry.record.id);
+        break;
+      case "reap":
+        removeWorktree(entry.record.repo, entry.record.path);
+        deleteRecord(entry.record.id);
+        reaped.push(entry.record.id);
+        break;
+      case "keep-fresh":
+        break;
+      case "skip-dirty":
+      case "skip-probe-unavailable":
+        // These two carry an operator-facing warning (backward-compatible with
+        // the pre-M2 behaviour); an in-use skip is expected/benign and is only
+        // reported via `skipped`, not `warnings`.
+        warnings.push(entry.message);
+        skipped.push(entry);
+        break;
+      case "skip-in-use":
+        skipped.push(entry);
+        break;
     }
   }
 
-  return { reaped, warnings };
+  return { reaped, warnings, skipped };
 }
