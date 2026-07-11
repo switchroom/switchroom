@@ -171,6 +171,7 @@ import { pickRecoveredPermissionOrigin } from './permission-card-origin.js'
 import {
   createBlockedApprovalStore,
   safeActionForRecord,
+  selectOldestHeld,
   type UndeliverableMark,
 } from './approval-hold.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
@@ -874,18 +875,13 @@ const blockedApprovalStore = createBlockedApprovalStore(
  * re-marks them if the channel is still shut.
  */
 function reconcileBlockedApprovals(): void {
-  type Pend = NonNullable<ReturnType<typeof pendingPermissions.get>>
-  let oldest: { requestId: string; pend: Pend; since: number } | null = null
-  for (const [requestId, pend] of pendingPermissions) {
-    const u = pend.undeliverable
-    if (u == null) continue
-    if (oldest == null || u.since < oldest.since) oldest = { requestId, pend, since: u.since }
-  }
+  // Selection (oldest hold wins; null ⇒ nothing held) is the pure, unit-tested
+  // `selectOldestHeld` in approval-hold.ts — keep policy out of gateway.ts.
+  const oldest = selectOldestHeld(pendingPermissions)
   if (oldest == null) {
     blockedApprovalStore.clear()
     return
   }
-  const u = oldest.pend.undeliverable!
   blockedApprovalStore.write({
     agent: AGENT_NAME,
     requestId: oldest.requestId,
@@ -894,9 +890,9 @@ function reconcileBlockedApprovals(): void {
     // interpolates the RAW tool input, and this file is world-readable.
     action: safeActionForRecord(naturalAction, oldest.pend.tool_name, oldest.pend.input_preview),
     blockedSince: oldest.pend.startedAt,
-    undeliverableSince: u.since,
-    retryableAt: u.retryableAt,
-    reason: u.reason,
+    undeliverableSince: oldest.mark.since,
+    retryableAt: oldest.mark.retryableAt,
+    reason: oldest.mark.reason,
   })
 }
 // Durable store for the four AGENT-INITIATED approval-card families
@@ -10282,11 +10278,25 @@ const ipcServer: IpcServer = createIpcServer({
         if (!isFloodWaitActiveError(e)) return
         const pend = pendingPermissions.get(requestId)
         if (pend == null) return // operator already resolved it — nothing to hold
+        // A card may already have LANDED on another target (the send fans out
+        // to several chats/topics and only THIS one hit the flood wall). The
+        // operator can see and tap the landed card, so the request is not
+        // blocked — marking it here would write a false blocked record AND
+        // make it eligible for a duplicate re-delivery. Same guard the
+        // redelivery selector applies (guard ii in selectHeldForRedelivery).
+        if (pend.cards.length > 0) return
         const now = Date.now()
         // Re-marking is idempotent and self-correcting: if the window is
         // re-extended by a fresh 429, `computeFloodWait` only ever grows
-        // `untilTs`, so a later mark carries the longer window.
-        pend.undeliverable = { since: now, retryableAt: e.untilTs, reason: 'flood_wait' }
+        // `untilTs`, so a later mark carries the longer window. `since` is
+        // "when we FIRST failed" (the UndeliverableMark contract), so a
+        // re-failure preserves the original timestamp — resetting it would
+        // churn the oldest-held-wins reconcile between records.
+        pend.undeliverable = {
+          since: pend.undeliverable?.since ?? now,
+          retryableAt: e.untilTs,
+          reason: 'flood_wait',
+        }
         // Write the shared surface SYNCHRONOUSLY, here in the failure handler —
         // not on the 60s reaper tick. The operator is locked out of Telegram;
         // the off-Telegram surface is the only way they learn an agent is

@@ -18,7 +18,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, mkdirSync, chmodSync, rmSync, statSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, chmodSync, rmSync, statSync, lstatSync, existsSync, readFileSync, writeFileSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -26,6 +26,7 @@ import {
   blockedApprovalsDir,
   isHeldUndeliverable,
   safeActionForRecord,
+  selectOldestHeld,
   BLOCKED_APPROVAL_DIR_MODE,
   BLOCKED_APPROVAL_FILE_MODE,
   type BlockedApprovalRecord,
@@ -211,6 +212,67 @@ describe('blocked-approval record — the off-Telegram surface', () => {
     expect(store.read()?.requestId).toBe('req-abc123')
   })
 
+  // The shared dir is 1777 (the /tmp model): ANY local uid can pre-create
+  // `<agent>.json` as a symlink pointing at a file the agent uid can write,
+  // redirecting our 0644 write onto an arbitrary target. The sticky bit stops
+  // us unlinking a symlink we don't own, so the store must REFUSE the location
+  // and fall back — never write through the link.
+  it('refuses to write through a planted symlink (1777-dir hardening)', () => {
+    const dir = blockedApprovalsDir(root)
+    mkdirSync(dir, { recursive: true })
+    const victim = join(root, 'victim.txt')
+    writeFileSync(victim, 'do not clobber', 'utf-8')
+    symlinkSync(victim, join(dir, 'overlord.json'))
+    const ownDir = join(root, 'agent-state')
+    mkdirSync(ownDir, { recursive: true })
+
+    const store = createBlockedApprovalStore(dir, 'overlord', ownDir)
+    store.write(REC)
+
+    // The planted target is untouched, the symlink was not followed…
+    expect(readFileSync(victim, 'utf-8')).toBe('do not clobber')
+    expect(lstatSync(join(dir, 'overlord.json')).isSymbolicLink()).toBe(true)
+    // …and the record still landed (fallback), never silently lost.
+    expect(store.path).toBe(join(ownDir, 'blocked-approval.json'))
+    expect(store.read()?.requestId).toBe('req-abc123')
+  })
+
+  it('a symlink planted at the FALLBACK path is refused too', () => {
+    const readOnlyParent = join(root, 'root-owned')
+    mkdirSync(readOnlyParent, { recursive: true })
+    chmodSync(readOnlyParent, 0o555)
+    const unwritable = join(readOnlyParent, 'blocked-approvals')
+    const ownDir = join(root, 'agent-state')
+    mkdirSync(ownDir, { recursive: true })
+    const victim = join(root, 'victim.txt')
+    writeFileSync(victim, 'do not clobber', 'utf-8')
+    symlinkSync(victim, join(ownDir, 'blocked-approval.json'))
+
+    const store = createBlockedApprovalStore(unwritable, 'overlord', ownDir)
+    // Both locations refuse — degrade quietly, never write through the link.
+    expect(() => store.write(REC)).not.toThrow()
+    expect(readFileSync(victim, 'utf-8')).toBe('do not clobber')
+  })
+
+  // A host that recovers its shared dir must not DOUBLE-REPORT: an earlier
+  // write that landed in the fallback would otherwise linger there forever
+  // (web reads both locations).
+  it('a successful primary write removes a stale fallback record', () => {
+    const dir = blockedApprovalsDir(root)
+    const ownDir = join(root, 'agent-state')
+    mkdirSync(ownDir, { recursive: true })
+    const staleFallback = join(ownDir, 'blocked-approval.json')
+    // Simulate the earlier degraded write.
+    writeFileSync(staleFallback, JSON.stringify({ ...REC, requestId: 'req-stale' }), 'utf-8')
+
+    const store = createBlockedApprovalStore(dir, 'overlord', ownDir)
+    store.write(REC)
+
+    expect(store.path).toBe(join(dir, 'overlord.json'))
+    expect(existsSync(staleFallback)).toBe(false)
+    expect(store.read()?.requestId).toBe('req-abc123')
+  })
+
   it('a write failure never throws into the gateway (best-effort surface)', () => {
     // Point the store at a path that cannot be created (a FILE, not a dir).
     const notADir = join(root, 'blocker')
@@ -309,6 +371,56 @@ describe('the undeliverable mark', () => {
 })
 
 /**
+ * The reconcile SELECTION — extracted from gateway.ts's
+ * reconcileBlockedApprovals() so its two load-bearing rules are unit-testable:
+ * oldest hold wins, and clear only when nothing at all is held.
+ */
+describe('selectOldestHeld — the reconcile selection', () => {
+  const mark = (since: number) =>
+    ({ since, retryableAt: since + 1000, reason: 'flood_wait' as const })
+
+  it('returns null only when NO entry is held (⇒ caller may clear)', () => {
+    expect(selectOldestHeld([])).toBeNull()
+    expect(
+      selectOldestHeld([
+        ['a', { undeliverable: null }],
+        ['b', {}],
+      ]),
+    ).toBeNull()
+  })
+
+  it('oldest hold wins among multiple concurrent holds', () => {
+    const sel = selectOldestHeld([
+      ['newer', { undeliverable: mark(200) }],
+      ['oldest', { undeliverable: mark(100) }],
+      ['newest', { undeliverable: mark(300) }],
+    ])
+    expect(sel?.requestId).toBe('oldest')
+    expect(sel?.mark.since).toBe(100)
+  })
+
+  it('resolving one of several holds surfaces the NEXT-oldest, not a clear', () => {
+    // The bug a naive clear() would have: one resolution blanks the file while
+    // another request is still genuinely blocked.
+    const entries: Array<[string, { undeliverable?: ReturnType<typeof mark> | null }]> = [
+      ['first', { undeliverable: null }], // just resolved
+      ['second', { undeliverable: mark(150) }], // still held
+    ]
+    const sel = selectOldestHeld(entries)
+    expect(sel).not.toBeNull()
+    expect(sel?.requestId).toBe('second')
+  })
+
+  it('skips unheld entries entirely regardless of position', () => {
+    const sel = selectOldestHeld([
+      ['unheld', {}],
+      ['held', { undeliverable: mark(500) }],
+    ])
+    expect(sel?.requestId).toBe('held')
+  })
+})
+
+/**
  * gateway.ts has top-level side effects and is NOT unit-importable (the same
  * constraint `permission-card-routing.test.ts` documents), so the WIRING is
  * pinned as source text. The logic itself is unit-tested above; these guard
@@ -342,6 +454,23 @@ describe('gateway wiring — the failure handler records instead of discarding',
     expect(body).toContain('pend.undeliverable = {')
     expect(body).toContain("reason: 'flood_wait'")
     expect(body).toContain('retryableAt: e.untilTs')
+  })
+
+  it('does NOT mark undeliverable when a card already LANDED on another target', () => {
+    // The send fans out to several chats/topics; one flood-walled leg must not
+    // write a blocked record while the operator can see a live card.
+    expect(onPermissionRequestBody()).toContain('if (pend.cards.length > 0) return')
+  })
+
+  it('a re-failure preserves the ORIGINAL since (the "first failed" contract)', () => {
+    expect(onPermissionRequestBody()).toContain('since: pend.undeliverable?.since ?? now')
+  })
+
+  it('reconcile delegates selection to the unit-tested selectOldestHeld', () => {
+    const at = GATEWAY_SRC.indexOf('function reconcileBlockedApprovals(')
+    expect(at).toBeGreaterThan(-1)
+    const fn = GATEWAY_SRC.slice(at, GATEWAY_SRC.indexOf('\n}', at))
+    expect(fn).toContain('selectOldestHeld(pendingPermissions)')
   })
 
   it('writes the shared record IN the failure handler (live in <1s, not on a 60s tick)', () => {

@@ -41,7 +41,7 @@
  * @see reference/invariants.md § no-self-escalation, § on-leash
  */
 
-import { mkdirSync, writeFileSync, readFileSync, unlinkSync, chmodSync } from 'node:fs'
+import { mkdirSync, writeFileSync, readFileSync, unlinkSync, chmodSync, lstatSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 
 /**
@@ -245,6 +245,18 @@ export function createBlockedApprovalStore(
     const parent = dirname(target)
     try {
       mkdirSync(parent, { recursive: true })
+      // Symlink-planting guard. The shared dir is 1777 (the /tmp model), so
+      // any local uid can pre-create `<agent>.json` as a symlink pointing at a
+      // file the AGENT uid can write (its own state, a config file). Writing
+      // through it would let a planter redirect our 0644 write onto an
+      // arbitrary target. lstat (never follows) and refuse: the sticky bit
+      // stops us unlinking a symlink we don't own, so the safe move is to
+      // treat this location as unusable and fall back.
+      try {
+        if (lstatSync(target).isSymbolicLink()) return false
+      } catch {
+        // ENOENT — no file yet, the normal case.
+      }
       // The `mode` args to mkdirSync/writeFileSync are MASKED by the process
       // umask (and ignored outright for an existing dir), so passing them
       // guarantees nothing. Both modes are load-bearing — the shared dir must be
@@ -272,6 +284,13 @@ export function createBlockedApprovalStore(
 
       if (tryWrite(primary, body, BLOCKED_APPROVAL_DIR_MODE)) {
         active = primary
+        // Best-effort removal of a stale FALLBACK record: an earlier write may
+        // have landed there while the shared dir was unusable. Once the shared
+        // surface works, a leftover fallback file would make a recovered host
+        // double-report the block (web reads both locations).
+        if (fallback != null) {
+          try { unlinkSync(fallback) } catch { /* absent is the normal case */ }
+        }
         return
       }
       // The shared dir refused us — almost always because it was auto-created
@@ -321,6 +340,34 @@ export function createBlockedApprovalStore(
       return null
     },
   }
+}
+
+/**
+ * Which held entry the blocked-approval surface should show — the RECONCILE
+ * selection, extracted from gateway.ts's `reconcileBlockedApprovals()` so it is
+ * unit-testable (gateway.ts has top-level side effects and cannot be imported
+ * from a test).
+ *
+ * The rules, both load-bearing:
+ *
+ *   - **Oldest hold wins.** The store holds ONE record per agent, but an agent
+ *     can hold several permissions at once (parallel tool calls). The one that
+ *     has been waiting longest (smallest `undeliverable.since`) is the record.
+ *   - **Reconcile, not clear.** Returning `null` — meaning the caller should
+ *     `clear()` — happens ONLY when no entry is held at all. Resolving one of
+ *     several holds must surface the next-oldest, never blank the file while a
+ *     real block remains.
+ */
+export function selectOldestHeld<T extends { undeliverable?: UndeliverableMark | null }>(
+  entries: Iterable<readonly [string, T]>,
+): { requestId: string; pend: T; mark: UndeliverableMark } | null {
+  let oldest: { requestId: string; pend: T; mark: UndeliverableMark } | null = null
+  for (const [requestId, pend] of entries) {
+    const u = pend.undeliverable
+    if (u == null) continue
+    if (oldest == null || u.since < oldest.mark.since) oldest = { requestId, pend, mark: u }
+  }
+  return oldest
 }
 
 /**
