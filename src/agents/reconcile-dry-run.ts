@@ -27,6 +27,7 @@ import { OverlayDocSchema, type OverlayDoc } from "../config/overlay-schema.js";
 import { ScheduleEntrySchema } from "../config/schema.js";
 import { cronUnitName } from "./cron-unit-name.js";
 import { classifyChangeKind } from "./lifecycle.js";
+import { cronMinuteSmallestGapMin } from "../scheduler/cron-gap.js";
 
 export interface DryRunOk {
   ok: true;
@@ -52,26 +53,20 @@ export type DryRunResult = DryRunOk | DryRunErr;
 const MIN_CRON_INTERVAL_SECS = 5 * 60;
 
 /**
- * Best-effort cron-interval check. We parse the simple star-slash-n minute form
- * and reject anything tighter than every-5-minutes. More elaborate
- * expressions pass through this check (we don't bring in a full cron
- * parser here); operator-approved entries via switchroom.yaml are
- * unaffected.
+ * Cron-interval floor check. Delegates to the shared minute-cadence helper
+ * (`cronMinuteSmallestGapMin`, src/scheduler/cron-gap.ts), which expands the
+ * minute field to the set of matched minutes and computes the smallest
+ * circular gap. This covers `*`, `*\/N`, single values, CSV lists, ranges
+ * (`0-4`), and step-on-range/list (`0-30/2`) — closing the earlier bypass
+ * where CSV/range forms slipped past the floor (switchroom #1783).
+ *
+ * A gap of 0 means "unknown / unparseable minute field" and passes through
+ * (we don't bring in a full cron parser); operator-approved entries via
+ * switchroom.yaml are unaffected.
  */
 export function violatesMinInterval(cron: string): boolean {
-  const parts = cron.trim().split(/\s+/);
-  if (parts.length < 5) return false;
-  const minuteField = parts[0];
-  const m = /^\*\/(\d+)$/.exec(minuteField);
-  if (m) {
-    const n = parseInt(m[1], 10);
-    if (Number.isFinite(n) && n > 0 && n * 60 < MIN_CRON_INTERVAL_SECS) {
-      return true;
-    }
-  }
-  // every-minute form: star star star star star
-  if (minuteField === "*" && parts[1] === "*") return true;
-  return false;
+  const gapMin = cronMinuteSmallestGapMin(cron);
+  return gapMin > 0 && gapMin * 60 < MIN_CRON_INTERVAL_SECS;
 }
 
 export function dryRunReconcile(input: {
