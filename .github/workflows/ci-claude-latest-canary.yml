@@ -87,7 +87,14 @@ jobs:
         # boot depends on must still exist in `@latest`'s --help. A dropped or
         # renamed flag fails here — the signal that the next bump would break
         # agent boot.
+        #
+        # Also runs tests/claude-credentials-midturn-reread.test.ts against the
+        # same installed @latest: the .credentials.json mtime-watch signature
+        # (mid-session credential pickup — docs/auth.md § "Mid-turn account
+        # swap semantics"). If @latest drops it, this canary reds BEFORE the
+        # pin bump, when failover messaging must be revisited.
         run: |
           bun install --frozen-lockfile --no-progress
-          bunx vitest run tests/claude-cli-contract.test.ts --reporter=basic
+          bunx vitest run tests/claude-cli-contract.test.ts tests/claude-credentials-midturn-reread.test.ts --reporter=basic
           echo "- flag contract: ✅ all switchroom-required flags present in @latest" >>"$GITHUB_STEP_SUMMARY"
+          echo "- mid-turn cred re-read: ✅ .credentials.json mtime-watch signature present in @latest" >>"$GITHUB_STEP_SUMMARY"

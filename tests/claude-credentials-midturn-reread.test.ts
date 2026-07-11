@@ -52,6 +52,14 @@ function resolveClaudeBinary(): string | null {
  * Stream-scan a (potentially ~250MB) binary for a `needle` that has `marker`
  * within the `windowBytes` preceding it. Chunked with overlap so matches
  * spanning a chunk boundary aren't missed. Latin1 keeps byte offsets exact.
+ *
+ * HONEST SIGNAL: this proves "the mtime-watch SIGNATURE is present in the
+ * bundle", not "the pre-request re-read mechanism is wired". A future
+ * release could keep a stat(.credentials.json)-near-mtimeMs fragment
+ * somewhere unrelated while dropping the per-request call — that would
+ * false-pass here. The behavioural proof (a real turn picking up a swapped
+ * mirror) needs a live authenticated session and belongs to UAT/canary
+ * round-trips; this scan is the cheap early-warning tripwire, nothing more.
  */
 function scanForMarkerBeforeNeedle(
   file: string,

@@ -15,6 +15,15 @@
  *
  * These tests pin the separation structurally so a refactor can't quietly
  * couple the two paths.
+ *
+ * KNOWN BLIND SPOT — the ban is lexical, not semantic. It catches direct
+ * references to the gateway restart machinery, but the broker could still
+ * reach restart semantics through another door: shelling out to
+ * `docker restart`, invoking a hostd restart verb, or writing a relaunch
+ * stamp file. Those doors don't exist in src/auth/broker today; if one is
+ * ever added deliberately, extend the forbidden list here (or write the
+ * behavioural test) rather than treating this suite as proof it can't
+ * happen.
  */
 
 import { describe, expect, it } from "vitest";
