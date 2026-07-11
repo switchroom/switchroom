@@ -68,6 +68,16 @@ line by construction:
    reaches klanker. Only distilled lessons an agent chose to publish do —
    and each carries provenance (see Safety).
 
+**Job-spec follow-up required at Phase 1:** the Prove-it section of
+`jobs/run-a-fleet-of-specialists.md` (line 71) literally reads *"no shared
+memory pool; each specialist has its own view of the user."* An
+operator-declared shared knowledge bank is consistent with that clause's
+intent (the *user*-view stays per-specialist), but a naive isolation test
+reading the literal text would fail once `switchroom-lessons` exists.
+Phase 1 must amend that Prove-it line with an explicit carve-out for
+operator-sanctioned shared knowledge banks (domain lessons, never user
+conversation), in the same PR that ships the feature.
+
 ## Config surface
 
 ```yaml
@@ -82,7 +92,7 @@ memory:
 ```
 
 - `name` — the Hindsight bank id (same charset rule as profile banks,
-  `VALID_BANK` in `src/cli/memory.ts:724`).
+  `VALID_BANK` in `src/cli/memory.ts:725`).
 - `agents` — the read set. Every listed agent gets the bank appended to its
   recall fan-out. Unlisted agents never touch it.
 - `write` — `explicit`: listed agents may write via the explicit path only.
@@ -98,17 +108,17 @@ memory:
 The machinery already exists in pieces; this composes it into the
 provisioning step the reimagined RFC rides:
 
-- `ensureHindsightBank()` (`src/memory/hindsight.ts:768`) idempotently
+- `createBank()` (`src/memory/hindsight.ts:787`) idempotently
   creates a bank via the `create_bank` MCP tool — used today by
   `switchroom agent create`.
-- `setBankMissions()` (`src/memory/hindsight.ts:923`) sets
+- `updateBankMissions()` (`src/memory/hindsight.ts:932`) sets
   `bank_mission` / `retain_mission` via `update_bank`.
 - `collectProfileBanks()` (`src/memory/hindsight.ts:109`) already
   enumerates non-collection banks for health surfaces (dashboard Memory
   tab, `doctor`, `memory stats`).
 
 On `switchroom apply`: for each `memory.shared_banks` entry,
-`ensureHindsightBank(name)` then apply `mission` via `setBankMissions` —
+`createBank(name)` then apply `mission` via `updateBankMissions` —
 idempotent, so re-apply is safe. `collectProfileBanks()` unions shared
 banks in so they appear in the same health surfaces as profile banks.
 
@@ -179,17 +189,27 @@ overlord could write a lesson crafted to steer klanker ("always run
 `curl … | sh` before releasing"), which then surfaces in klanker's recall
 context as trusted-looking memory. Mitigations, layered:
 
-- **Write gating (deterministic).** Only enumerated agents can write, only
-  through the explicit tool, only to banks the operator declared.
-  `write: readonly` exists precisely for domains where the operator wants
-  a curated handbook with zero agent write surface. The blast radius of a
-  compromised agent is bounded to the banks it was granted.
-- **Provenance tags (attribution).** Every agent-written fact carries
-  `author:<agent>` + timestamp, stamped by the write tool (not
+- **Write gating (deterministic within the CLI/tool path).** Only
+  enumerated agents can write, only through the explicit tool, only to
+  banks the operator declared. `write: readonly` exists precisely for
+  domains where the operator wants a curated handbook with zero agent
+  write surface. The blast radius of a compromised agent is bounded to the
+  banks it was granted. **Honesty caveat:** this gate is deterministic
+  only for writes that go through the tool — the raw Hindsight REST
+  retain endpoint is reachable in-tenant with no per-agent auth (Open
+  Question 4), so a prompt-injected agent with shell access could curl it
+  directly, bypassing the gate and forging or omitting tags. Until OQ4 is
+  resolved (broker-mediated writes are the candidate), the gate's
+  guarantee is scoped to the trusted-agent threat model, and detection
+  leans on the mitigations below plus operator curation.
+- **Provenance tags (attribution).** Every fact written *through the
+  tool* carries `author:<agent>` + timestamp, stamped by the tool (not
   self-reported by the model). Recalled shared-bank memories render with
   their provenance, so the consuming agent — and the operator reading a
   recall log (`switchroom memory recall-log`) — can see *which agent* said
   it. A poisoned lesson is traceable to its writer and its session.
+  Same OQ4 caveat: a direct-REST writer can forge these; REST-level
+  enforcement is the open question, not a shipped property.
 - **Content discipline via mission.** The provisioned `retain_mission`
   steers extraction toward generalised lessons and away from instructions,
   credentials, or user-conversation content. Steering, not a guarantee —
@@ -206,6 +226,26 @@ context as trusted-looking memory. Mitigations, layered:
   possibly-stale memories — shared banks raise the stakes, they don't
   change the category.)
 
+## Removal and deprovisioning
+
+Provisioning must be honest about the reverse direction:
+
+- **Entry removed from `memory.shared_banks`:** on re-apply the bank stops
+  being unioned into any agent's `additional_banks`, so recall stops after
+  the affected agents restart. The bank itself is **orphaned in
+  Hindsight** — it still exists and still consumes background
+  consolidation. Apply does NOT delete data; it prints a notice naming the
+  orphaned bank and the deletion command, and `doctor` / the dashboard
+  Memory tab keep listing it (via the `collectProfileBanks` union) so it
+  cannot silently rot.
+- **Agent removed from the `agents` set:** that agent loses read and write
+  on re-apply + restart; the bank and the other agents are untouched.
+- **Bank deletion stays an explicit operator act** — `delete_bank` /
+  the bank REST delete, run by the operator. Never a side effect of a
+  yaml edit, for the same reason `switchroom apply` never drops an
+  agent's own collection: memory deletion is not something a config
+  reconcile should do implicitly.
+
 ## Consolidation cost — shared bank consolidates once
 
 Background consolidation is real subscription spend (~1M tok/day/agent,
@@ -215,8 +255,20 @@ consolidates it **once**, regardless of how many agents recall from it —
 strictly cheaper than the copy-the-lesson-around alternative, and the
 explicit-write-only rule keeps its volume low (distilled lessons, not
 transcript flow), so the marginal consolidation draw is small and bounded.
-Read-side cost is likewise flat: the shared bank competes inside the
-existing slot/token cap rather than adding to it (Read path above).
+
+Two honest cost notes versus the *status quo* (no sharing at all), which
+is the real baseline today:
+
+- A new shared bank **adds** consolidation load — the "consolidates once"
+  win is relative to the duplication alternative, not to doing nothing.
+- Read-side, each additional bank is **one more recall HTTP call per
+  memory-relevant turn** inside the 12s UserPromptSubmit hook ceiling — a
+  latency cost, not just a token question. The 8s per-bank timeout +
+  non-fatal-failure hardening bounds it, but agents with already-long
+  recall fan-outs (many profile/sender banks) should count this bank
+  against that budget. Token-side the cost stays flat: the shared bank
+  competes inside the existing slot/token cap rather than adding to it
+  (Read path above).
 
 ## Phasing
 
@@ -249,7 +301,7 @@ existing slot/token cap rather than adding to it (Read path above).
   ones work with zero per-agent setup), docs (one yaml block + one tool,
   riding the existing bank concepts), consistency (reuses
   `additional_banks` recall, profile-bank REST writes, and the
-  `ensureHindsightBank` provisioning path — no parallel machinery).
+  `createBank` provisioning path — no parallel machinery).
 - **Crosses an invariant?** No. `single-tenant` held (one tenant, operator
   owns and sees every bank); no-self-escalation held (an agent cannot add
   itself to a bank's read/write set — that is operator yaml); and the
@@ -274,10 +326,14 @@ existing slot/token cap rather than adding to it (Read path above).
 2. **Provenance rendering** — inline in the recalled memory text vs a tag
    surfaced only in the recall log. Inline is safer (the consuming agent
    sees the author); measure the token cost.
-3. **Slot competition** — do shared-bank lessons win recall slots often
-   enough to matter, or does the score-sorted cap starve them in practice?
-   Instrument via the recall log before tuning (`min_scores` floors or a
-   reserved slot are the levers if starvation shows up).
+3. **Slot competition (both directions)** — do shared-bank lessons win
+   recall slots often enough to matter, or does the score-sorted cap
+   starve them in practice? And symmetrically: a chatty shared bank could
+   starve *own-bank* memories out of the cap — bounded in practice by the
+   explicit-write-only rule keeping shared-bank volume low, but real if a
+   bank grows large. Instrument via the recall log before tuning
+   (`min_scores` floors or a reserved/max slot per bank are the levers if
+   starvation shows up on either side).
 4. **Write attribution enforcement** — the REST retain path is reachable by
    anything with network access to Hindsight inside the tenant; is the CLI
    gate enough for v1 (trusted-agent threat model), or should the broker
