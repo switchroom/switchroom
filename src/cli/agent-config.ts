@@ -30,6 +30,7 @@ import {
   readFileSync,
 } from "node:fs";
 import { withConfigError, getConfig } from "./helpers.js";
+import { ConfigError, findConfigFile, loadConfig } from "../config/loader.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 import { resolveAgentConfig } from "../config/merge.js";
 import { checkAclByAgent } from "../vault/broker/acl.js";
@@ -421,6 +422,51 @@ export function registerAgentConfigCommands(program: Command): void {
         }
       }),
     );
+
+  // switchroom config check — full-fidelity pre-validation of a
+  // switchroom.yaml candidate. Runs the EXACT production load path
+  // (`loadConfig`): YAML parse (the `yaml` package rejects duplicate keys
+  // — the failure mode that crash-looped hostd on 2026-07-11), legacy-key
+  // coercion, zod schema, and the cross-field checks (cron topic aliases,
+  // notion databases). Agents should run this on a candidate file BEFORE
+  // proposing/writing config; hostd's degraded mode is the backstop, this
+  // is the prevention. No agent identity fence: it reads only the file
+  // passed (or the discovered host config) and emits validity + errors,
+  // never secret values.
+  config
+    .command("check")
+    .description(
+      "Validate a switchroom.yaml (YAML parse incl. duplicate keys, schema, cross-field checks) without starting anything",
+    )
+    .option(
+      "--file <path>",
+      "YAML file to validate (defaults to the discovered switchroom.yaml)",
+    )
+    .action(async (opts: { file?: string }) => {
+      let path: string;
+      try {
+        path = opts.file ?? findConfigFile();
+      } catch (err) {
+        process.stderr.write(`${(err as ConfigError).message}\n`);
+        for (const d of (err as ConfigError).details ?? []) {
+          process.stderr.write(`${d}\n`);
+        }
+        process.exit(1);
+      }
+      try {
+        loadConfig(path);
+      } catch (err) {
+        if (err instanceof ConfigError) {
+          process.stderr.write(`INVALID: ${path}\n${err.message}\n`);
+          for (const d of err.details ?? []) {
+            process.stderr.write(`${d}\n`);
+          }
+          process.exit(1);
+        }
+        throw err;
+      }
+      process.stdout.write(`OK: ${path} is a valid switchroom config\n`);
+    });
 
   // switchroom config whoami — the agent's own legible sandbox
   config

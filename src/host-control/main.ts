@@ -21,9 +21,10 @@
  */
 
 import { homedir } from "node:os";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { loadConfig } from "../config/loader.js";
+import { ConfigError, findConfigFile, loadConfig } from "../config/loader.js";
+import { waitForConfigRecovery } from "./config-degraded.js";
 import { allocateAgentUid } from "../agents/compose.js";
 import { HostdServer } from "./server.js";
 import { SocketApprovalGateway } from "./approval-gateway.js";
@@ -38,8 +39,79 @@ import {
 } from "./release-watcher-shellouts.js";
 import { appendFile } from "node:fs/promises";
 
+/**
+ * Load switchroom.yaml, surviving a ConfigError (invalid YAML — e.g.
+ * duplicate keys — schema failure, unreadable file) by entering DEGRADED
+ * mode instead of the exit-1 → docker-restart crash-loop that previously
+ * stalled fleet rollouts silently. See `config-degraded.ts` for the
+ * mechanism (retry interval + file watch, prominent marker file,
+ * best-effort operator DM, pending self-bump marker preservation).
+ */
+async function loadConfigResilient(): Promise<
+  ReturnType<typeof loadConfig>
+> {
+  try {
+    return loadConfig();
+  } catch (err) {
+    if (!(err instanceof ConfigError)) throw err;
+    // Discover the config path (for the file watcher) without letting a
+    // "no config found" error re-throw — the interval retry covers that.
+    let configPath: string | undefined;
+    try {
+      configPath = findConfigFile();
+    } catch {
+      configPath = undefined;
+    }
+    // Notification transport: we cannot read the config, so we don't know
+    // which agents exist or who is admin. Best-effort fallback: scan the
+    // agents dir for ANY live gateway IPC socket and post ONE plain
+    // operator-DM through the first (alphabetically — deterministic). The
+    // gateway fences delivery to its own operator chat, so this cannot
+    // leak outside the operator.
+    const agentsDir =
+      process.env.SWITCHROOM_AGENTS_DIR ??
+      join(homedir(), ".switchroom", "agents");
+    const findAnyGateway = (): { agent: string; sock: string } | null => {
+      try {
+        for (const name of readdirSync(agentsDir).sort()) {
+          const sock = resolve(agentsDir, name, "telegram", "gateway.sock");
+          if (existsSync(sock)) return { agent: name, sock };
+        }
+      } catch {
+        /* agents dir unreadable — marker file is the fallback signal */
+      }
+      return null;
+    };
+    const notify = (text: string): void => {
+      const gw = findAnyGateway();
+      if (!gw) {
+        process.stderr.write(
+          "hostd: config-degraded — no reachable gateway socket; relying on marker file\n",
+        );
+        return;
+      }
+      new SocketRolloutRelay({
+        resolveGatewaySocket: (n) => (n === gw.agent ? gw.sock : null),
+        log: (m) => process.stderr.write(`hostd: config-degraded relay — ${m}\n`),
+      }).postTerminal({
+        requestId: "config-degraded",
+        agentName: gw.agent,
+        text,
+      });
+    };
+    return waitForConfigRecovery({
+      initialError: err,
+      homeDir: homedir(),
+      loadFn: () => loadConfig(),
+      configPath,
+      notify,
+      log: (m) => process.stderr.write(`hostd: ${m}\n`),
+    });
+  }
+}
+
 async function main(): Promise<void> {
-  const config = loadConfig();
+  const config = await loadConfigResilient();
   if (config.host_control?.enabled !== true) {
     process.stderr.write(
       "hostd: refusing to start — host_control.enabled is not true in switchroom.yaml\n",
