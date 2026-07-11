@@ -19,22 +19,27 @@ const TEMPLATE = join(__dirname, "..", "profiles", "_base", "start.sh.hbs");
 // Extract the pure-shell _switchroom_supervise function from the
 // handlebars template (the function body contains no {{ }} tokens —
 // asserted below so this test fails loudly if that ever changes).
-function extractSupervisor(): string {
+// Extract a named 2-space-indented shell function body from the template.
+function extractFn(name: string): string {
   const src = readFileSync(TEMPLATE, "utf-8");
   const lines = src.split("\n");
-  const start = lines.findIndex((l) => l.includes("_switchroom_supervise() {"));
-  expect(start, "_switchroom_supervise() not found in start.sh.hbs").toBeGreaterThanOrEqual(0);
+  const start = lines.findIndex((l) => l.includes(`${name}() {`));
+  expect(start, `${name}() not found in start.sh.hbs`).toBeGreaterThanOrEqual(0);
   // Function ends at the first subsequent line that is exactly the
   // 2-space-indented closing brace.
   let end = -1;
   for (let i = start + 1; i < lines.length; i++) {
     if (lines[i] === "  }") { end = i; break; }
   }
-  expect(end, "closing brace of _switchroom_supervise not found").toBeGreaterThan(start);
+  expect(end, `closing brace of ${name} not found`).toBeGreaterThan(start);
   // De-indent two spaces so it's a valid top-level function.
   const fn = lines.slice(start, end + 1).map((l) => l.replace(/^ {2}/, "")).join("\n");
   expect(fn).not.toContain("{{"); // no handlebars inside the function
   return fn;
+}
+
+function extractSupervisor(): string {
+  return extractFn("_switchroom_supervise");
 }
 
 let dir: string;
@@ -45,8 +50,15 @@ beforeAll(() => {
   // Shrink the 60s cap to 4s so exponential backoff (1,2,4,4) is
   // observable in a fast test without changing the logic under test.
   const fn = extractSupervisor().replace("local _cap=60", "local _cap=4");
+  // _switchroom_supervise now backgrounds _switchroom_log_rotator (#3025).
+  // These tests exercise the RESPAWN/backoff logic, not rotation, so stub
+  // the rotator as a no-op: the real one is a `while sleep; do` loop that
+  // — backgrounded — would inherit the driver's stdout pipe and hang the
+  // test past its child's exit. Rotation itself is covered end-to-end in
+  // gateway-supervisor-log-rotation.test.ts.
+  const rotatorStub = "_switchroom_log_rotator() { :; }";
   fnPath = join(dir, "sup.fn");
-  writeFileSync(fnPath, fn);
+  writeFileSync(fnPath, rotatorStub + "\n" + fn);
 });
 
 function runBash(script: string, timeoutMs: number): string {

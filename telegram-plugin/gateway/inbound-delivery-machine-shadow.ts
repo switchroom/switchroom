@@ -27,6 +27,16 @@
  * buffer: agent=X buffered ...` etc.) is the validation that the
  * machine is bit-identical with reality.
  *
+ * Trace verbosity (#3025): the TTL `tick` event fires every ~30s and on a
+ * healthy idle agent emits a zero-signal `event=tick effects=[]
+ * global=bridge_alive_idle` line. Those no-op ticks are SUPPRESSED by
+ * default (they filled gateway-supervisor.log to 555MB on clerk). Set
+ * `SWITCHROOM_GW_TRACE=1` to restore the full firehose — every tick, poll,
+ * and event line — when debugging the delivery/poll path. The gate lives
+ * in `../shared/gw-trace-gate.ts` and also governs the `tg-post` poll
+ * heartbeats. Real events, turn-expiring ticks, and in-turn ticks always
+ * log regardless of the flag.
+ *
  * Toggle off via `SWITCHROOM_DELIVERY_MACHINE_SHADOW=0` — a kill
  * switch for the case where the shadow emits prove problematic
  * (e.g., trace volume too high). The default is ON.
@@ -39,6 +49,7 @@ import {
   initialState,
   transition,
 } from './inbound-delivery-machine.js'
+import { shouldEmitShadowTrace } from '../shared/gw-trace-gate.js'
 
 let state: State = initialState()
 const enabled = process.env.SWITCHROOM_DELIVERY_MACHINE_SHADOW !== '0'
@@ -101,11 +112,21 @@ export function shadowEmit(event: Event): readonly Effect[] {
     // low volume (one line per gateway event, not per effect). The
     // format matches gateway.ts's existing `tg-post method=...` shape
     // so log aggregation can pick it up without a new parser.
-    const effectKinds = result.effects.map((e) => e.kind).join(',')
-    const eventDetail = formatEventDetail(event)
-    process.stderr.write(
-      `gw-trace shadow event=${event.kind}${eventDetail} effects=[${effectKinds}] global=${state.global.kind} perKeySize=${state.perKey.size}\n`,
-    )
+    // #3025: the TTL `tick` event fires every ~30s. On a healthy idle
+    // agent it produces no effects and leaves the machine idle — a
+    // zero-signal heartbeat that (unrotated) grew this log to 555MB on
+    // clerk. Suppress those no-op ticks unless the operator opted into
+    // the full firehose (SWITCHROOM_GW_TRACE=1). Real events, ticks that
+    // expire a turn (non-empty effects), and in-turn ticks still log.
+    if (
+      shouldEmitShadowTrace(event.kind, result.effects.length, state.global.kind)
+    ) {
+      const effectKinds = result.effects.map((e) => e.kind).join(',')
+      const eventDetail = formatEventDetail(event)
+      process.stderr.write(
+        `gw-trace shadow event=${event.kind}${eventDetail} effects=[${effectKinds}] global=${state.global.kind} perKeySize=${state.perKey.size}\n`,
+      )
+    }
     return result.effects
   } catch (err) {
     process.stderr.write(

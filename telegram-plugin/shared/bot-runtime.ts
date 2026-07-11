@@ -31,6 +31,7 @@ import { clearStaleTelegramPollingState } from '../startup-reset.js'
 import { createRetryApiCall } from '../retry-api-call.js'
 import { makeFloodWaitRecorder } from '../flood-circuit-breaker.js'
 import { RICH_MESSAGE_MAX_CHARS } from '../format.js'
+import { shouldEmitTgPost } from './gw-trace-gate.js'
 
 // ─── tg-post tag plumbing ─────────────────────────────────────────────────
 
@@ -115,9 +116,14 @@ export function installTgPostLogger(bot: Bot): void {
     const tagSuffix = formatTgPostTags(_getTgPostTags())
     try {
       const res = await prev(method, payload, signal)
-      process.stderr.write(
-        `tg-post method=${method} chat=${chat} thread=${thread} parse_mode=${parseMode} bytes=${bytes} hash=${hash} status=ok err=- code=- desc=-${tagSuffix}\n`,
-      )
+      // #3025: suppress zero-signal per-poll heartbeats (getUpdates/getMe
+      // status=ok, one line per ~30s long-poll tick) unless the operator
+      // set SWITCHROOM_GW_TRACE. Errors and all other methods still log.
+      if (shouldEmitTgPost(method, 'ok')) {
+        process.stderr.write(
+          `tg-post method=${method} chat=${chat} thread=${thread} parse_mode=${parseMode} bytes=${bytes} hash=${hash} status=ok err=- code=- desc=-${tagSuffix}\n`,
+        )
+      }
       return res
     } catch (err) {
       const errClass = err instanceof GrammyError

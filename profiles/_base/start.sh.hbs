@@ -165,8 +165,50 @@ x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:
   # The sidecar's own structured logging is written
   # directly to its log file; this wrapper only handles process
   # lifecycle. Ampersand-backgrounded by callers below.
+  # Size-based log rotation for a supervised sidecar's logfile (#3025).
+  # The gateway sidecar appends per-poll trace lines and can run for
+  # WEEKS without the supervise loop regaining control (it only loops on
+  # child exit), so rotate-at-restart alone let gateway-supervisor.log
+  # grow to 555MB on clerk / 162MB on klanker and fill the host disk.
+  # This background checker runs independently of the child's lifecycle.
+  #
+  # copytruncate (cp + `: >`), NOT `mv`: the supervised child holds an
+  # open fd on $_logfile (its stdout/stderr is redirected there with
+  # `>> "$_logfile"`). A plain `mv` would leave the child writing to the
+  # now-renamed inode, so the live log would silently stop growing and
+  # the rotated file would keep filling. copytruncate preserves the fd —
+  # the child keeps appending to the same (now-empty) inode. Worst-case
+  # race is a few log lines written between the cp and the truncate being
+  # lost; acceptable for a debug trace log. Keeps at most ~2×cap on disk
+  # (live + one .1 generation). Cap + interval are env-overridable.
+  _switchroom_log_rotator() {
+    local _logfile="$1"
+    local _max="${SWITCHROOM_SIDECAR_LOG_MAX_BYTES:-52428800}"   # 50 MiB default
+    local _interval="${SWITCHROOM_SIDECAR_LOG_ROTATE_INTERVAL_SEC:-300}"  # 5 min
+    # A non-positive cap disables rotation entirely (operator escape hatch).
+    [ "$_max" -le 0 ] 2>/dev/null && return 0
+    while true; do
+      sleep "$_interval"
+      [ -f "$_logfile" ] || continue
+      local _size
+      _size=$(wc -c < "$_logfile" 2>/dev/null || echo 0)
+      # `wc -c < file` yields a bare integer; guard against empty/non-numeric.
+      case "$_size" in ''|*[!0-9]*) continue;; esac
+      if [ "$_size" -gt "$_max" ]; then
+        if cp "$_logfile" "$_logfile.1" 2>/dev/null; then
+          : > "$_logfile"
+          echo "[supervise] rotated $_logfile (${_size} bytes > ${_max} cap) → ${_logfile}.1" >> "$_logfile"
+        fi
+      fi
+    done
+  }
+
   _switchroom_supervise() {
     local _name="$1"; local _logfile="$2"; shift 2
+    # Start the size-based rotator for this sidecar's log (#3025). One
+    # per supervised sidecar; lives for the container lifetime alongside
+    # the respawn loop below.
+    _switchroom_log_rotator "$_logfile" &
     # Optional `--oneshot-ok` flag (must directly follow the logfile):
     # marks a sidecar that can LEGITIMATELY complete. For such a sidecar
     # a clean exit 0 means "job done" → stop supervising, no respawn.
