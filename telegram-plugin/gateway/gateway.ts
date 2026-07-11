@@ -26717,6 +26717,35 @@ void (async () => {
               // Gated to background completions: foreground sub-agents
               // need nothing here, and 'orphan' is a stale historical-at-
               // boot row, not a fresh completion the user is waiting on.
+              // Issue #3023 (card resurrection). A worker whose card was
+              // FALSELY finalised (silent-stall synthesis fired, then the
+              // JSONL resumed growing) is being revived by the watcher. Clear
+              // the worker feed's finalized gate so the replayed progress cues
+              // repaint a live card, and re-pin it. This restores the operator
+              // invariant "active work must always be visible" for the case
+              // PR #3019's in-flight gate can't fully prevent.
+              onResurrect: (agentId, _description) => {
+                try {
+                  workerActivityFeed?.resurrect(agentId)
+                } catch (err) {
+                  process.stderr.write(
+                    `telegram gateway: worker resurrect error agent=${agentId}: ${(err as Error).message}\n`,
+                  )
+                }
+                process.stderr.write(
+                  `telegram gateway: worker ${agentId} card RESURRECTED — false terminal finish reversed, worker resumed (issue #3023)\n`,
+                )
+              },
+              // Issue #3023 (bounded chain). A worker resurrected once and then
+              // falsely finalised again is NOT resurrected forever — the
+              // watcher names it lost. Surface the fact in the log; the
+              // handback (onFinish) still delivered the synthesised result, so
+              // there is nothing further to paint.
+              onWorkerLost: (agentId, _description) => {
+                process.stderr.write(
+                  `telegram gateway: worker ${agentId} NAMED AS LOST — falsely finalised twice, resurrection chain bound reached (issue #3023)\n`,
+                )
+              },
               onFinish: ({ agentId, outcome, description, resultText, toolCount, durationMs, background: entryBackground }) => {
                 // Reaction promotion: if the parent turn already ended
                 // with this (or another) worker still running, its 👍 was

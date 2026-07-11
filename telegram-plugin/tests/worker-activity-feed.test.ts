@@ -986,6 +986,43 @@ describe('createWorkerActivityFeed — resurrection guard + deferred finalize', 
     expect(feed.size).toBe(0)
   })
 
+  it('#3023: resurrect() reopens the paint path after a FALSE finish so a fresh cue repaints', async () => {
+    const bot = makeFakeBot()
+    let clock = 10_000
+    const feed = createWorkerActivityFeed({ bot, now: () => clock, minEditIntervalMs: 0 })
+    await feed.update('w1', 'chat', view({ toolCount: 1, latestSummary: 'step one' }))
+    expect(bot.sent).toHaveLength(1)
+
+    // The card is FALSELY finalized (silent-stall synthesis fired while the
+    // worker was actually still alive).
+    await feed.finish('w1', view({ state: 'done', toolCount: 1, latestSummary: 'premature done' }))
+    expect(feed.has('w1')).toBe(false)
+
+    // Without resurrect(), the finalized gate would swallow any further cue
+    // (the #3 case above). Prove that first: a plain late tick is a no-op.
+    clock = 12_000
+    await feed.update('w1', 'chat', view({ toolCount: 2, latestSummary: 'still going' }))
+    expect(bot.sent).toHaveLength(1)
+
+    // The watcher detected the false finish and resurrected the worker.
+    feed.resurrect('w1')
+
+    // Now a running cue repaints a live card — active work is visible again.
+    clock = 13_000
+    await feed.update('w1', 'chat', view({ toolCount: 3, latestSummary: 'back to work' }))
+    expect(bot.sent).toHaveLength(2) // a fresh card was painted
+    expect(feed.has('w1')).toBe(true)
+    expect(bot.sent[1].text).toContain('back to work')
+  })
+
+  it('#3023: resurrect() on a never-finalized worker is a harmless no-op', () => {
+    const bot = makeFakeBot()
+    const feed = createWorkerActivityFeed({ bot, now: () => 10_000 })
+    // No throw, nothing painted.
+    feed.resurrect('never-seen')
+    expect(bot.sent).toHaveLength(0)
+  })
+
   it('#2: a 429 on the finish edit stages pendingFinish; the heartbeat re-drives it after cooldown', async () => {
     const bot = makeFakeBot()
     let clock = 10_000
