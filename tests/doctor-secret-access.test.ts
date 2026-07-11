@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 
 import {
   runSecretAccessChecks,
+  probeOwnedRoot,
   type VaultFileStat,
   type SecretAccessDeps,
   type PreflightOutcome,
@@ -22,12 +23,16 @@ const READABLE: VaultFileStat = {
 };
 
 // Default deps: passphrase SET → exercises the (preserved) LOCAL path.
+// ownedRoots empty by default so Check B tests aren't polluted by the
+// Check A sweep (which is exercised directly against probeOwnedRoot and
+// via the dedicated Check A describe block below).
 function deps(over: Partial<SecretAccessDeps> = {}): SecretAccessDeps {
   return {
     vaultPath: "/v",
     selfUid: 1000,
     selfUser: "op",
     statVault: () => READABLE,
+    ownedRoots: [],
     passphrase: "pp",
     openVault: () => ({}),
     ...over,
@@ -44,6 +49,7 @@ function brokerDeps(
     selfUid: 1000,
     selfUser: "op",
     statVault: () => READABLE,
+    ownedRoots: [],
     passphrase: undefined,
     preflight,
     ...over,
@@ -53,47 +59,106 @@ function brokerDeps(
 type R = Awaited<ReturnType<typeof runSecretAccessChecks>>;
 const get = (r: R, name: string) => r.find((x) => x.name === name);
 
-describe("runSecretAccessChecks — Check A (operator readable)", () => {
-  it("ok when the vault file is absent (defers to Vault section)", async () => {
+const ROOT_LOCKED = (real: string): VaultFileStat => ({
+  exists: true,
+  readable: false,
+  uid: 0,
+  mode: 0o600,
+  realPath: real,
+});
+const okStat = (real: string): VaultFileStat => ({
+  exists: true,
+  readable: true,
+  uid: 1000,
+  mode: 0o600,
+  realPath: real,
+});
+const missingStat = (real: string): VaultFileStat => ({
+  exists: false,
+  readable: false,
+  uid: -1,
+  mode: 0,
+  realPath: real,
+});
+
+describe("probeOwnedRoot — generalized Check A probe", () => {
+  it("root-owned path → FAIL with a `sudo chown -R` remediation on the resolved root", () => {
+    const root = "/home/op/.switchroom/vault";
+    const targets = [root, `${root}/vault.enc`];
+    const res = probeOwnedRoot(
+      root,
+      targets,
+      (p) => (p === `${root}/vault.enc` ? ROOT_LOCKED(p) : okStat(p)),
+      1000,
+      "op",
+    );
+    expect(res?.status).toBe("fail");
+    expect(res?.name).toBe("operator readable: vault");
+    expect(res?.detail).toContain("owned by uid 0");
+    expect(res?.detail).toContain(`${root}/vault.enc`);
+    expect(res?.fix).toBe(`sudo chown -R op:op ${root}`);
+  });
+
+  it("correctly-owned path → PASS, no fix", () => {
+    const root = "/home/op/.switchroom/accounts";
+    const targets = [root, `${root}/creds.json`];
+    const res = probeOwnedRoot(root, targets, okStat, 1000, "op");
+    expect(res?.status).toBe("ok");
+    expect(res?.name).toBe("operator readable: accounts");
+    expect(res?.fix).toBeUndefined();
+    expect(res?.detail).toContain(root);
+  });
+
+  it("missing root (empty target set) → SKIP silently (null)", () => {
+    const res = probeOwnedRoot(
+      "/home/op/.switchroom/compose",
+      [],
+      () => missingStat("/x"),
+      1000,
+      "op",
+    );
+    expect(res).toBeNull();
+  });
+
+  it("resolves the fix against the walker's realpath (symlink-resolved root)", () => {
+    // walker already resolved a symlinked root to its real target
+    const linkRoot = "/home/op/.switchroom/vault-audit.log";
+    const realTarget = "/mnt/data/vault-audit.log";
+    const res = probeOwnedRoot(
+      linkRoot,
+      [realTarget],
+      () => ROOT_LOCKED(realTarget),
+      1000,
+      "op",
+    );
+    expect(res?.status).toBe("fail");
+    // label from the logical root, fix from the resolved real target
+    expect(res?.name).toBe("operator readable: vault-audit.log");
+    expect(res?.fix).toBe(`sudo chown -R op:op ${realTarget}`);
+  });
+});
+
+describe("runSecretAccessChecks — Check A sweep integration", () => {
+  it("sweeps the injected owned roots: one FAIL (root-locked) + one OK, missing skipped", async () => {
+    const vaultRoot = "/home/op/.switchroom/vault";
+    const acctRoot = "/home/op/.switchroom/accounts";
+    const composeRoot = "/home/op/.switchroom/compose";
     const r = await runSecretAccessChecks(
       cfg({}),
       deps({
-        statVault: () => ({
-          exists: false,
-          readable: false,
-          uid: -1,
-          mode: 0,
-          realPath: "/v",
-        }),
+        ownedRoots: [vaultRoot, acctRoot, composeRoot],
+        walkOwned: (root) =>
+          root === composeRoot ? [] : [root], // compose absent
+        statPath: (p) => (p === vaultRoot ? ROOT_LOCKED(p) : okStat(p)),
       }),
     );
-    const a = get(r, "vault: operator readable");
-    expect(a?.status).toBe("ok");
-    expect(a?.detail).toContain("not present");
-  });
-
-  it("FAILs with a chown fix when the file is root-locked", async () => {
-    const r = await runSecretAccessChecks(
-      cfg({}),
-      deps({
-        statVault: () => ({
-          exists: true,
-          readable: false,
-          uid: 0,
-          mode: 0o600,
-          realPath: "/home/op/.switchroom/vault/vault.enc",
-        }),
-      }),
+    expect(get(r, "operator readable: vault")?.status).toBe("fail");
+    expect(get(r, "operator readable: vault")?.fix).toBe(
+      `sudo chown -R op:op ${vaultRoot}`,
     );
-    const a = get(r, "vault: operator readable");
-    expect(a?.status).toBe("fail");
-    expect(a?.detail).toContain("uid 0");
-    expect(a?.fix).toBe("sudo chown op:op /home/op/.switchroom/vault/vault.enc");
-  });
-
-  it("ok when the operator can read it", async () => {
-    const r = await runSecretAccessChecks(cfg({}), deps());
-    expect(get(r, "vault: operator readable")?.status).toBe("ok");
+    expect(get(r, "operator readable: accounts")?.status).toBe("ok");
+    // compose absent → no result at all (silent skip)
+    expect(get(r, "operator readable: compose")).toBeUndefined();
   });
 });
 

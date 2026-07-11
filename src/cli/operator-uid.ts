@@ -92,6 +92,94 @@ export function operatorOwnedPaths(home: string): string[] {
   ];
 }
 
+/** Resolve the injectable IO shims once, applying the real-fs defaults. */
+function resolveWalkDeps(deps: OwnershipRestoreDeps): Required<
+  Pick<OwnershipRestoreDeps, "exists" | "isDir" | "isSymlink" | "realpath" | "readdir">
+> {
+  return {
+    exists: deps.exists ?? ((p) => existsSync(p)),
+    isSymlink:
+      deps.isSymlink ??
+      ((p) => {
+        try {
+          return lstatSync(p).isSymbolicLink();
+        } catch {
+          return false;
+        }
+      }),
+    isDir:
+      deps.isDir ??
+      ((p) => {
+        try {
+          return statSync(p).isDirectory();
+        } catch {
+          return false;
+        }
+      }),
+    realpath:
+      deps.realpath ??
+      ((p) => {
+        try {
+          return realpathSync(p);
+        } catch {
+          return p;
+        }
+      }),
+    readdir:
+      deps.readdir ??
+      ((p) => {
+        try {
+          return readdirSync(p);
+        } catch {
+          return [];
+        }
+      }),
+  };
+}
+
+/**
+ * Walk the operator-owned `~/.switchroom` subtree and return the real
+ * targets (symlinks resolved, directories recursed, deduped, in
+ * parent-before-child order). Missing paths are skipped silently — not
+ * every install has every artifact.
+ *
+ * This is the single source of truth for "which paths should the
+ * operator own": both `restoreOperatorOwnership` (chown-back after a
+ * root-mode apply) and the doctor's ownership probe consume it, so the
+ * sweep set and the symlink-resolution rules can't drift between the
+ * fix and the diagnostic.
+ *
+ * Symlinks resolve to their real target (the v0.7.12 `vault.enc ->
+ * vault/vault.enc` legacy link, accounts symlinks, …) so callers act on
+ * the actual file, not the link entry.
+ */
+export function walkOperatorOwnedTargets(
+  home: string,
+  deps: OwnershipRestoreDeps = {},
+  roots: string[] = operatorOwnedPaths(home),
+): string[] {
+  const { exists, isSymlink, isDir, realpath, readdir } = resolveWalkDeps(deps);
+
+  const targets: string[] = [];
+  const seen = new Set<string>();
+
+  const visit = (path: string): void => {
+    if (!exists(path)) return;
+    const target = isSymlink(path) ? realpath(path) : path;
+    if (seen.has(target)) return;
+    seen.add(target);
+    targets.push(target);
+    if (isDir(target)) {
+      for (const entry of readdir(target)) {
+        visit(join(target, entry));
+      }
+    }
+  };
+
+  for (const p of roots) visit(p);
+  return targets;
+}
+
 /**
  * Best-effort: chown the operator-owned `~/.switchroom` subtree back to
  * `operatorUid:operatorUid`. Recurses into directories. Every chown is
@@ -108,68 +196,15 @@ export function restoreOperatorOwnership(
   deps: OwnershipRestoreDeps = {},
 ): string[] {
   const chown = deps.chown ?? ((p, u, g) => chownSync(p, u, g));
-  const exists = deps.exists ?? ((p) => existsSync(p));
-  const isSymlink =
-    deps.isSymlink ??
-    ((p) => {
-      try {
-        return lstatSync(p).isSymbolicLink();
-      } catch {
-        return false;
-      }
-    });
-  const isDir =
-    deps.isDir ??
-    ((p) => {
-      try {
-        return statSync(p).isDirectory();
-      } catch {
-        return false;
-      }
-    });
-  const realpath =
-    deps.realpath ??
-    ((p) => {
-      try {
-        return realpathSync(p);
-      } catch {
-        return p;
-      }
-    });
-  const readdir =
-    deps.readdir ??
-    ((p) => {
-      try {
-        return readdirSync(p);
-      } catch {
-        return [];
-      }
-    });
 
   const chowned: string[] = [];
-  const seen = new Set<string>();
-
-  const visit = (path: string): void => {
-    if (!exists(path)) return;
-    // Resolve symlinks to the real target (the v0.7.12 vault.enc
-    // legacy link, accounts symlinks, …) so we chown the actual file,
-    // not the link entry.
-    const target = isSymlink(path) ? realpath(path) : path;
-    if (seen.has(target)) return;
-    seen.add(target);
+  for (const target of walkOperatorOwnedTargets(home, deps)) {
     try {
       chown(target, operatorUid, operatorUid);
       chowned.push(target);
     } catch {
       /* best-effort: dev/no CAP_CHOWN/raced; keep going */
     }
-    if (isDir(target)) {
-      for (const entry of readdir(target)) {
-        visit(join(target, entry));
-      }
-    }
-  };
-
-  for (const p of operatorOwnedPaths(home)) visit(p);
+  }
   return chowned;
 }

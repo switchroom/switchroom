@@ -40,6 +40,10 @@ import { join } from "node:path";
 
 import { resolveStatePath } from "../config/paths.js";
 import { resolveAgentConfig } from "../config/merge.js";
+import {
+  operatorOwnedPaths,
+  walkOperatorOwnedTargets,
+} from "./operator-uid.js";
 import { openVault, type VaultEntry } from "../vault/vault.js";
 import { checkAclByAgent, checkEntryScope } from "../vault/broker/acl.js";
 import { rpcRaw } from "../vault/broker/client.js";
@@ -70,6 +74,24 @@ export interface SecretAccessDeps {
   passphrase?: string;
   /** Probe the vault file as the operator. Default: realpath + stat + access(R_OK). */
   statVault?: (path: string) => VaultFileStat;
+  /**
+   * Probe any operator-owned path as the operator (Check A sweep).
+   * Default: realpath + stat + access(R_OK) — same shim as statVault.
+   */
+  statPath?: (path: string) => VaultFileStat;
+  /** Operator home for the ownership sweep. Default: os.homedir(). */
+  operatorHome?: string;
+  /**
+   * Top-level operator-owned roots to probe (Check A). Default:
+   * `operatorOwnedPaths(home)` — vault/, vault-auto-unlock,
+   * vault-audit.log, host-control-audit.log, accounts/, compose/.
+   */
+  ownedRoots?: string[];
+  /**
+   * Resolve one root to its real target set (symlinks resolved, dirs
+   * recursed). Default: `walkOperatorOwnedTargets(home, {}, [root])`.
+   */
+  walkOwned?: (root: string) => string[];
   /** Decrypt + load the vault. Default: real `openVault`. */
   openVault?: (passphrase: string, path: string) => Record<string, VaultEntry>;
   /** Current operator uid (default process uid). */
@@ -234,6 +256,69 @@ export async function defaultPreflight(
   };
 }
 
+/** Human label for an operator-owned root (its final path segment). */
+function ownedLabel(root: string): string {
+  const segs = root.split("/").filter(Boolean);
+  return segs[segs.length - 1] ?? root;
+}
+
+/**
+ * Check A, generalized: probe one operator-owned root (and everything
+ * under it) as the operator. A root-mode `apply`/hostd/broker write can
+ * leave any of these root-owned; the broker keeps working via
+ * CAP_DAC_READ_SEARCH, so nothing looks broken until the operator
+ * touches the artifact directly and gets EACCES.
+ *
+ *  - root absent (no targets) → `null` (skip silently — not every
+ *    install has every artifact)
+ *  - any path under it unreadable by the operator → `fail` with a
+ *    `sudo chown -R` remediation on the resolved root
+ *  - all present + readable → `ok`
+ *
+ * `targets` is the resolved sweep set from `walkOperatorOwnedTargets`
+ * (symlinks already resolved, dirs recursed), so this reuses the
+ * ownership walker's resolution instead of duplicating it.
+ */
+export function probeOwnedRoot(
+  root: string,
+  targets: string[],
+  statPath: (path: string) => VaultFileStat,
+  selfUid: number,
+  selfUser: string,
+): CheckResult | null {
+  if (targets.length === 0) return null; // root absent → skip silently
+  const rootReal = targets[0]!;
+  const name = `operator readable: ${ownedLabel(root)}`;
+
+  const bad: VaultFileStat[] = [];
+  for (const path of targets) {
+    const s = statPath(path);
+    if (!s.exists) continue; // raced delete mid-walk — skip
+    if (!s.readable) bad.push(s);
+  }
+
+  if (bad.length === 0) {
+    return { name, status: "ok", detail: `operator can read ${rootReal}` };
+  }
+
+  const first = bad[0]!;
+  const eg =
+    bad.length === 1
+      ? `${first.realPath} (mode 0${first.mode.toString(8)})`
+      : `e.g. ${first.realPath} (mode 0${first.mode.toString(8)})`;
+  return {
+    name,
+    status: "fail",
+    detail:
+      `${bad.length} path(s) under ${rootReal} are owned by uid ${first.uid} — ${eg} — ` +
+      `so the operator (uid ${selfUid} ${selfUser}) cannot read them and every ` +
+      `\`switchroom …\` that touches this artifact fails. A root-mode ` +
+      `apply/hostd/broker write left it root-owned; the broker still works ` +
+      `(CAP_DAC_READ_SEARCH), which masks this until you touch it directly.`,
+    fix: `sudo chown -R ${selfUser}:${selfUser} ${rootReal}`,
+  };
+}
+
 export async function runSecretAccessChecks(
   config: SwitchroomConfig,
   deps: SecretAccessDeps = {},
@@ -251,32 +336,31 @@ export async function runSecretAccessChecks(
     }
   }
 
-  // ---- Check A: operator can read the vault file --------------------
-  const vf = statVault(vaultPath);
-  if (!vf.exists) {
-    results.push({
-      name: "vault: operator readable",
-      status: "ok",
-      detail: `vault file not present at ${vaultPath} — see the Vault section`,
-    });
-  } else if (!vf.readable) {
-    results.push({
-      name: "vault: operator readable",
-      status: "fail",
-      detail:
-        `${vf.realPath} is owned by uid ${vf.uid} (mode 0${vf.mode.toString(8)}) — ` +
-        `the operator (uid ${selfUid} ${selfUser}) cannot read it, so every ` +
-        `\`switchroom vault …\` fails. The broker still works (CAP_DAC_READ_SEARCH), ` +
-        `which masks this until you touch the vault directly.`,
-      fix: `sudo chown ${selfUser}:${selfUser} ${vf.realPath}`,
-    });
-  } else {
-    results.push({
-      name: "vault: operator readable",
-      status: "ok",
-      detail: `operator can read ${vf.realPath}`,
-    });
+  // ---- Check A: operator can read every operator-owned artifact -----
+  // Generalized from the vault-only check: sweep the full operator-owned
+  // set (operatorOwnedPaths) so a root-mode apply/hostd/broker write that
+  // leaves ANY of them root-owned surfaces here with a chown remediation,
+  // not just vault.enc. Missing artifacts skip silently.
+  const statPath = deps.statPath ?? statVault;
+  const home = deps.operatorHome ?? homedir();
+  const ownedRoots = deps.ownedRoots ?? operatorOwnedPaths(home);
+  const walkOwned =
+    deps.walkOwned ?? ((root: string) => walkOperatorOwnedTargets(home, {}, [root]));
+  for (const root of ownedRoots) {
+    const res = probeOwnedRoot(
+      root,
+      walkOwned(root),
+      statPath,
+      selfUid,
+      selfUser,
+    );
+    if (res) results.push(res);
   }
+
+  // vf drives the vault-open fail-vs-warn branch below (a readable-but-
+  // unopenable vault is a bad passphrase; an unreadable one is an
+  // ownership problem Check A already flagged).
+  const vf = statVault(vaultPath);
 
   // ---- Check B: per-agent secret existence + ACL --------------------
   const pushAgentResult = (
