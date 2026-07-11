@@ -20,7 +20,14 @@ import { homedir } from "node:os";
  *
  * The record is written by the gateway on each blocked approval, one file per
  * agent, at `~/.switchroom/blocked-approvals/<agent>.json` (dir 0755, files
- * 0644). Two hard constraints on that contract, both learned the hard way:
+ * 0644) — and, when that shared dir is not writable by the agent's uid, at the
+ * FALLBACK `~/.switchroom/agents/<agent>/blocked-approval.json`. This reader
+ * scans BOTH. It did not when the feature shipped (#3109), which meant a
+ * fallback record was written to a file nobody ever read: the agent held, the
+ * record on disk, and the dashboard printing "No agent is blocked". Do not drop
+ * the fallback scan — see {@link FALLBACK_RECORD_NAME}.
+ *
+ * Two hard constraints on that contract, both learned the hard way:
  *
  *  1. **The web container runs as uid 1000 and cannot read the agent's own
  *     0600 state.** `~/.switchroom/agents/<agent>/telegram/*.json` is mode
@@ -73,6 +80,42 @@ export function blockedApprovalsDir(
   home: string = process.env.SWITCHROOM_HOME ?? process.env.HOME ?? homedir(),
 ): string {
   return resolve(home, ".switchroom", "blocked-approvals");
+}
+
+/**
+ * The FALLBACK record's filename, inside the agent's own state dir.
+ *
+ * `createBlockedApprovalStore` (telegram-plugin/gateway/approval-hold.ts) writes
+ * the shared record first; when the shared dir is not writable by the agent's
+ * uid (docker auto-created the bind source root-owned; a container predating the
+ * volume) it falls back to `~/.switchroom/agents/<agent>/blocked-approval.json`,
+ * which the scaffold chowns to the agent uid so the write always lands.
+ *
+ * This reader must scan BOTH, or the fallback is a record nobody reads — the
+ * agent is held, the record is on disk, and the dashboard prints "No agent is
+ * blocked". That is the reassuring lie this whole surface exists to kill, and it
+ * shipped that way in #3109: the fallback wrote a DIFFERENT filename in a
+ * DIFFERENT directory from the only one `readdirSync` looked at.
+ *
+ * It is readable. Verified live on the dev host, 2026-07-11:
+ *   - `~/.switchroom/agents/<agent>/` is 0775 (drwxrwxr-x), agent-uid owned —
+ *     traversable and listable by the web container's uid 1000.
+ *   - `docker exec switchroom-web` reads a 0644 file in that dir fine, and gets
+ *     "Permission denied" ONLY on the 0600 files (telegram/access.json). The
+ *     0600 MODE is the blocker, never the directory — and the fallback record is
+ *     written 0644 like the shared one.
+ *   - The web compose binds all of `~/.switchroom` at `/host-home/.switchroom`
+ *     with `HOME=/host-home`, so both locations resolve for this reader.
+ */
+export const FALLBACK_RECORD_NAME = "blocked-approval.json";
+
+/**
+ * Where the per-agent fallback records live: `~/.switchroom/agents`. Derived
+ * from the shared dir (its sibling) so every existing caller — and every test
+ * pointing at a tmpdir — picks the fallback scan up without changing its call.
+ */
+export function agentStateRoot(sharedDir: string): string {
+  return resolve(sharedDir, "..", "agents");
 }
 
 /** A finite number or null — a malformed timestamp must never reach the UI as
@@ -155,7 +198,24 @@ export interface BlockedApprovalsRead {
  */
 export function readBlockedApprovalsWithErrors(
   dir: string,
+  /** Per-agent fallback root. Defaults to the shared dir's `agents` sibling. */
+  agentsRoot: string = agentStateRoot(dir),
 ): BlockedApprovalsRead {
+  const shared = readSharedRecords(dir);
+  const fallback = readFallbackRecords(agentsRoot, new Set(shared.blocked.map((b) => b.agent)));
+
+  return {
+    // Longest-blocked first — the one that has been waiting on the operator
+    // the longest is the one that most needs them.
+    blocked: [...shared.blocked, ...fallback.blocked].sort(
+      (a, b) => a.blockedSince - b.blockedSince,
+    ),
+    unreadable: shared.unreadable + fallback.unreadable,
+  };
+}
+
+/** The shared, canonical surface: `<dir>/<agent>.json`. */
+function readSharedRecords(dir: string): BlockedApprovalsRead {
   let entries: string[];
   try {
     entries = readdirSync(dir);
@@ -200,12 +260,65 @@ export function readBlockedApprovalsWithErrors(
     if (record) out.push(record);
   }
 
-  return {
-    // Longest-blocked first — the one that has been waiting on the operator
-    // the longest is the one that most needs them.
-    blocked: out.sort((a, b) => a.blockedSince - b.blockedSince),
-    unreadable,
-  };
+  return { blocked: out, unreadable };
+}
+
+/**
+ * The FALLBACK surface: `<agentsRoot>/<agent>/blocked-approval.json`, written
+ * when the shared dir was not writable by the agent's uid.
+ *
+ * Skipped for any agent already carrying a shared record: the store unlinks its
+ * fallback the moment a shared write succeeds, so a leftover is stale by
+ * definition and must never double-report a block that is already surfaced.
+ *
+ * Enumeration failures here are counted honestly, on the same rule as the shared
+ * dir: ENOENT is an honest empty (no agents scaffolded on this host), anything
+ * else means we could not look and must not imply "nothing is blocked".
+ */
+function readFallbackRecords(
+  agentsRoot: string,
+  alreadySeen: ReadonlySet<string>,
+): BlockedApprovalsRead {
+  let agents: string[];
+  try {
+    agents = readdirSync(agentsRoot, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+      return { blocked: [], unreadable: 0 };
+    }
+    return { blocked: [], unreadable: 1 };
+  }
+
+  const out: BlockedApproval[] = [];
+  let unreadable = 0;
+
+  for (const agent of agents) {
+    if (alreadySeen.has(agent)) continue;
+
+    let text: string;
+    try {
+      text = readFileSync(join(agentsRoot, agent, FALLBACK_RECORD_NAME), "utf-8");
+    } catch (err) {
+      // ENOENT is the overwhelmingly normal case: this agent is not blocked, or
+      // its record landed in the shared dir like it should. Only a real read
+      // FAILURE (EACCES on a record written with the wrong mode, EIO) means an
+      // agent may be held behind a file we cannot see.
+      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") unreadable++;
+      continue;
+    }
+
+    let record: BlockedApproval | null;
+    try {
+      record = coerce(JSON.parse(text) as unknown, agent);
+    } catch {
+      continue; // malformed — we looked, there is nothing honest to render.
+    }
+    if (record) out.push(record);
+  }
+
+  return { blocked: out, unreadable };
 }
 
 /**
@@ -218,8 +331,11 @@ export function readBlockedApprovalsWithErrors(
  * an "all clear" to the operator must use {@link readBlockedApprovalsWithErrors}
  * and check `unreadable` first.
  */
-export function readBlockedApprovals(dir: string): BlockedApproval[] {
-  return readBlockedApprovalsWithErrors(dir).blocked;
+export function readBlockedApprovals(
+  dir: string,
+  agentsRoot: string = agentStateRoot(dir),
+): BlockedApproval[] {
+  return readBlockedApprovalsWithErrors(dir, agentsRoot).blocked;
 }
 
 /**
