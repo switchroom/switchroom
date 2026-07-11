@@ -70,19 +70,24 @@ type = "firecrawl"
 # call webkite_read with wait_for_selector set to the session-times
 # container. See the issue's post-merge verification notes.
 
-[[render.routes]]
-domains = ["palacecinemas.com.au", "www.palacecinemas.com.au"]
-providers = ["cloakbrowser", "cloudflare"]
-mode = "force"
-exclusive = false
-
-# Operator-extensible: add other JS-gated ticketing / booking hosts here
-# (both bare + www forms). Left minimal on purpose — forcing render on a
-# host that doesn't need it only costs latency, but inventing domains that
-# don't exist adds noise. Example shape:
+# NOTE (webkite 0.4.0 schema — switchroom #3030): RouteConfig requires a
+# SINGULAR string `provider = "<name>"`, NOT an array `providers = [...]`.
+# The old `providers = ["cloakbrowser", "cloudflare"]` field is invalid and
+# aborts parsing of the ENTIRE config file, which silently disabled all JS
+# rendering fleet-wide (`has_renderers: false`, `decision: no_renderer`).
+# Two further 0.4.0 constraints made the intended route unshippable as-is:
+#   - `cloakbrowser` is auto_spawn-only and CANNOT be named in a route
+#     (resolves to "route provider not found").
+#   - a route may name only ONE provider.
+# The Palace Cinemas force-route is therefore removed: a content-empty SPA
+# shell is classified `thin_article` and, with renderers configured above,
+# AUTO-ESCALATES to a render on its own (verified: `has_renderers: true`,
+# `provider: cloudflare`, `decision: escalate`) — so the explicit route is
+# not needed for rendering to work. If an operator later needs to pin a
+# forced route, use the singular form naming a DECLARED provider, e.g.:
 #
 # [[render.routes]]
 # domains = ["tickets.example-cinema.com.au", "www.example-cinema.com.au"]
-# providers = ["cloakbrowser", "cloudflare"]
+# provider = "cloudflare"
 # mode = "force"
 # exclusive = false
