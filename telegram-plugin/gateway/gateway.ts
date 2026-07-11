@@ -26719,9 +26719,18 @@ void (async () => {
               // boot row, not a fresh completion the user is waiting on.
               // Issue #3023 (card resurrection). A worker whose card was
               // FALSELY finalised (silent-stall synthesis fired, then the
-              // JSONL resumed growing) is being revived by the watcher. Clear
-              // the worker feed's finalized gate so the replayed progress cues
-              // repaint a live card, and re-pin it. This restores the operator
+              // JSONL resumed growing) is being revived by the watcher. This
+              // callback ONLY clears the worker feed's durable `finalized` gate
+              // (workerActivityFeed.resurrect) — it does NOT itself paint or pin
+              // anything. The actual repaint + re-pin happen DOWNSTREAM on the
+              // next replayed `running` cue: the watcher's re-registration
+              // replays `onProgress`, which calls `workerActivityFeed.update()`
+              // (now un-gated) to first-paint a FRESH `🛠 Worker` message, and
+              // its `.then(reconcileWorkerPin(agentId, wkChat, true))` pins that
+              // new message via the `wk:<agentId>` status-pin. Clearing the gate
+              // here FIRST is the ordering requirement — without it those first
+              // replayed ticks would be swallowed by the finalized gate and no
+              // new card would ever paint. Net effect restores the operator
               // invariant "active work must always be visible" for the case
               // PR #3019's in-flight gate can't fully prevent.
               onResurrect: (agentId, _description) => {

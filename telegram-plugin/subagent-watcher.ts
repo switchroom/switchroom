@@ -1886,11 +1886,19 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
 
   /**
    * Bring a falsely-finalised worker back to LIVE. Cancels any pending
-   * terminal cleanup, clears the terminated/historical suppression, and
-   * re-registers the JSONL as a fresh non-historical entry so `onProgress`,
-   * stall-detection and a genuine future handback all resume. Re-reading from
-   * cursor 0 rebuilds the worker's activity so the revived card catches up
-   * instead of showing a frozen stub.
+   * terminal cleanup and clears the terminated/historical suppression, then
+   * revives via one of two branches so `onProgress`, stall-detection and a
+   * genuine future handback all resume:
+   *
+   *   1. IN-PLACE REVIVE (registry entry still present — cleanup grace hadn't
+   *      elapsed): flip the existing entry back to `running` and reset its
+   *      stall/completion flags. The entry KEEPS its existing tail cursor and
+   *      FSWatcher, so the card repaints INCREMENTALLY from where it left off —
+   *      it does NOT re-read from cursor 0.
+   *   2. SWEPT RE-REGISTER (entry already dropped by cleanupTerminalAgent):
+   *      `registerAgent` re-registers the JSONL as a fresh non-historical
+   *      entry, re-reading from cursor 0 to rebuild the worker's activity so
+   *      the revived card catches up instead of showing a frozen stub.
    */
   function resurrectAgent(agentId: string, filePath: string): void {
     const pc = pendingCloses.get(agentId)
@@ -1910,6 +1918,19 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       existing.stallNotified = false
       existing.stalledAt = null
       existing.stallTerminalSynthesised = false
+      // Re-arm the completion notification INTENTIONALLY (issue #3023). The
+      // false synthesized finish already fired `onFinish` once, delivering a
+      // (possibly wrong / incomplete) synthesized handback to the parent.
+      // Clearing this lets a genuine future `sub_agent_turn_end` fire `onFinish`
+      // a SECOND time — and that is the desired behaviour: the corrected REAL
+      // result must reach the parent, superseding the false one. This does NOT
+      // double-deliver harmfully: the gateway's handback spool dedups only
+      // CONCURRENTLY-LIVE envelopes for the same worker (inbound-spool.ts:
+      // `s:handback:<agentId>` — `live.has(id)` guard, no permanent tombstone),
+      // so the first (synthesized) handback drains + acks as a normal turn, is
+      // removed from the live set, and the later real handback is then
+      // delivered as a fresh turn rather than being suppressed. See the
+      // "resurrected worker's real turn_end re-fires onFinish" test.
       existing.completionNotified = false
       existing.errored = false
       existing.errorDetail = undefined
@@ -1918,6 +1939,20 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       // over and a fresh stall/synthesis could fire almost immediately.
       existing.lastActivityAt = nowFn()
       knownFiles.add(filePath)
+      // KNOWN LIMITATION (issue #3023): we revive the IN-MEMORY registry entry
+      // to `running`, but the subagents DB row stays `completed`/`failed` (the
+      // stall-synthesis path wrote a terminal row via recordSubagentEnd). We do
+      // NOT flip it back: `recordSubagentResume` only reverses `stalled→running`
+      // by design ("terminal beats both stalled and running" — see its doc),
+      // and there is no terminal→running edge because the stuck-row reaper and
+      // audit consistency both lean on terminal being final. Consequence:
+      // `countRunningBackgroundSubagents` (WHERE status='running') UNDERCOUNTS a
+      // resurrected worker until its genuine `turn_end` re-terminates the entry.
+      // Impact is bounded and benign — that count only gates the deferred-👍
+      // reaction promotion (reaction-defer.ts), so at worst a 👍 promotes one
+      // resurrection-window early; it is never a delivery/correctness path. Left
+      // as a known limitation rather than punching a terminal→running hole in
+      // the schema invariant.
       return
     }
     // Entry was already swept — re-register from scratch as a live worker.
@@ -1945,6 +1980,23 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       // (The tracker itself already excludes genuine completions and boot-time
       // historical rediscoveries — they never record here — so size growth is
       // a sufficient signal; no mtime dependence needed.)
+      //
+      // BOUNDED FALSE-POSITIVE (issue #3023, accepted): ANY byte growth past
+      // the snapshot trips resurrection, including a late buffered `turn_end`
+      // flush from a genuinely-done worker. If the silent-stall synthesis fired
+      // moments before Claude Code finally flushed the worker's real
+      // `sub_agent_turn_end` line, that trailing write grows the JSONL and we
+      // resurrect a worker that is actually finished — a benign
+      // resurrect→immediate-refinish flicker that burns ONE unit of the
+      // resurrection budget (MAX_RESURRECTIONS). We accept this because (a) the
+      // flicker is self-healing: the very next poll sees the terminal line,
+      // fires a real `turn_end`, and re-finalises the card; (b) the corrected
+      // real handback still reaches the parent (see the completionNotified
+      // reset in resurrectAgent); and (c) the alternative — parsing the tail to
+      // distinguish a real turn_end flush from live resumption — is far more
+      // fragile than a bounded, harmless re-finish. The chain bound guarantees
+      // this can never loop. Covered by the "late turn_end after synthesis"
+      // resurrection test.
       if (size <= rec.sizeAtSynthesis) continue
 
       const entry = registry.get(agentId)

@@ -42,6 +42,7 @@ interface Harness {
   fileContents: Map<string, Buffer>
   jsonlPath: string
   appendActivity: () => void
+  appendTurnEnd: () => void
   presentAtBoot: (content: string) => void
 }
 
@@ -189,6 +190,12 @@ function makeHarness(opts: {
     fileContents.set(jsonlPath, Buffer.concat([cur, Buffer.from(more, 'utf-8')]))
   }
 
+  const appendTurnEnd = (): void => {
+    const cur = fileContents.get(jsonlPath) ?? Buffer.alloc(0)
+    const more = buildJSONL(subAgentTurnEnd())
+    fileContents.set(jsonlPath, Buffer.concat([cur, Buffer.from(more, 'utf-8')]))
+  }
+
   const presentAtBoot = (content: string): void => {
     fileContents.set(jsonlPath, Buffer.from(content, 'utf-8'))
   }
@@ -204,6 +211,7 @@ function makeHarness(opts: {
     fileContents,
     jsonlPath,
     appendActivity,
+    appendTurnEnd,
     presentAtBoot,
   }
 }
@@ -314,5 +322,77 @@ describe('subagent-watcher card resurrection (issue #3023)', () => {
     expect(h.resurrectCalls).toHaveLength(0)
     expect(h.lostCalls).toHaveLength(0)
     expect(h.stallTerminalCalls).toHaveLength(0)
+  })
+
+  it('(d) late trailing turn_end flush → bounded resurrect→immediate-refinish flicker (N1)', () => {
+    // Accepted false positive: the silent-stall synthesis fires, then Claude
+    // Code finally flushes the worker's REAL buffered `turn_end` line. The
+    // byte growth trips resurrection (we can't distinguish it from live
+    // resumption without fragile tail parsing), the revived entry immediately
+    // reads the terminal line and re-finishes, and the chain stays bounded —
+    // no loop, no further resurrections.
+    const agentId = 'late-flush'
+    const h = makeHarness({ agentId })
+
+    h.advance(500)
+    unmarkHistorical(h, agentId)
+
+    driveToFalseFinish(h, agentId)
+    expect(h.finishCalls).toHaveLength(1) // the synthesized false finish
+
+    // The worker was genuinely done — its buffered turn_end flushes late.
+    h.appendTurnEnd()
+    h.advance(500) // poll → growth trips the (false-positive) resurrection
+
+    expect(h.resurrectCalls).toHaveLength(1) // budget burned, by design
+    h.advance(500) // revived entry reads the terminal line → immediate re-finish
+
+    expect(h.finishCalls).toHaveLength(2) // corrected real finish delivered
+    expect(h.finishCalls[1].agentId).toBe(agentId)
+    const entry = h.watcher.getRegistry().get(agentId)
+    expect(entry?.state).toBe('done')
+
+    // Chain stays bounded: nothing further fires without new growth, and a
+    // genuine turn_end never records a new false finish, so no loop.
+    h.advance(500)
+    h.advance(500)
+    expect(h.resurrectCalls).toHaveLength(1)
+    expect(h.finishCalls).toHaveLength(2)
+    expect(h.lostCalls).toHaveLength(0)
+  })
+
+  it('(e) a resurrected worker\'s genuine turn_end re-fires onFinish — corrected result supersedes the false one (N2)', () => {
+    // Intent (documented at the completionNotified reset in resurrectAgent):
+    // the false synthesized finish already delivered a possibly-wrong handback;
+    // when the resurrected worker later REALLY completes, onFinish MUST fire a
+    // second time so the corrected real result reaches the parent. The gateway
+    // spool dedups only concurrently-live handback envelopes, so this second
+    // delivery lands as a fresh turn.
+    const agentId = 'refire-finish'
+    const h = makeHarness({ agentId })
+
+    h.advance(500)
+    unmarkHistorical(h, agentId)
+
+    driveToFalseFinish(h, agentId)
+    expect(h.finishCalls).toHaveLength(1) // synthesized (false) finish
+
+    // Worker was alive: real activity resumes → resurrection.
+    h.appendActivity()
+    h.advance(500)
+    expect(h.resurrectCalls).toHaveLength(1)
+    h.advance(500) // revived entry settles reading the resumed JSONL
+
+    // Now the worker GENUINELY completes.
+    h.appendTurnEnd()
+    h.advance(500)
+
+    expect(h.finishCalls).toHaveLength(2) // real finish fired again — intended
+    expect(h.finishCalls[1].agentId).toBe(agentId)
+    expect(h.finishCalls[1].outcome).toBe('completed')
+    // A genuine turn_end never records a false finish → no further resurrection.
+    h.appendActivity()
+    h.advance(500)
+    expect(h.resurrectCalls).toHaveLength(1)
   })
 })
