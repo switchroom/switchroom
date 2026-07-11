@@ -1517,6 +1517,45 @@ export class HostdServer {
     const assetDenied = this.applyAssetPreflight(req.request_id, started);
     if (assetDenied) return assetDenied;
 
+    // #2972 — fail fast on a bad `agents` list BEFORE spawning the child.
+    // The child rejects unknown agents (stderr, exit 2) but by then hostd
+    // has already replied "started", so the caller sees success and never
+    // gets an approval card. Validate against the SAME config view the
+    // child reads (`config.agents` keys) so there's no stale-view mismatch.
+    if (req.args.agents !== undefined) {
+      let validAgents: string[] | null = null;
+      try {
+        const cfg = loadConfig(this.opts.configPath) as {
+          agents?: Record<string, unknown>;
+        };
+        validAgents = Object.keys(cfg.agents ?? {});
+      } catch {
+        // Malformed yaml: skip validation and proceed as before — the
+        // child will fail and the MCP-side grace-window check surfaces it.
+        validAgents = null;
+      }
+      if (validAgents !== null) {
+        const requested = req.args.agents;
+        if (requested.length === 0) {
+          return deniedResponse(
+            req.request_id,
+            `E_UNKNOWN_AGENT: empty agents list — pass at least one agent, ` +
+              `or omit "agents" to roll all. Valid agents: ${validAgents.join(", ")}`,
+            Date.now() - started,
+          );
+        }
+        const unknown = requested.filter((a) => !validAgents!.includes(a));
+        if (unknown.length > 0) {
+          return deniedResponse(
+            req.request_id,
+            `E_UNKNOWN_AGENT: unknown agent(s): ${unknown.join(", ")}. ` +
+              `Valid agents: ${validAgents.join(", ")}`,
+            Date.now() - started,
+          );
+        }
+      }
+    }
+
     const entry = this.launchRollout(req.args, req.request_id, caller, started);
     return {
       v: 1,

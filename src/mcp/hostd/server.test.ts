@@ -40,6 +40,9 @@ vi.mock("node:fs", async () => {
 // Import after the mocks. server.ts reads SWITCHROOM_AGENT_NAME at
 // module-load — set it before the import.
 process.env.SWITCHROOM_AGENT_NAME = "klanker";
+// #2972 — short-circuit the rollout post-start grace delay so the
+// get_status re-check round-trips instantly in tests (0ms, not 3s).
+process.env.HOSTD_MCP_ROLLOUT_GRACE_MS = "0";
 const { TOOLS, dispatchTool, UPDATE_APPLY_SEMVER_PIN_ADVISORY } = await import("./server.js");
 
 function ok(resp: Partial<HostdResponse> = {}): HostdResponse {
@@ -303,6 +306,88 @@ describe("dispatchTool — happy path", () => {
     await dispatchTool("rollout", { pin: "v0.15.18" });
     const sent = hostdRequestMock.mock.calls[0]![1];
     expect(sent.args).not.toHaveProperty("reason");
+  });
+
+  // ── #2972 rollout early-terminal-failure surfacing ───────────────────
+  it("rollout that dies within the grace window returns error + stderr_tail (not started)", async () => {
+    // 1st RPC: hostd replies `started` (fire-and-forget spawn accepted).
+    hostdRequestMock.mockResolvedValueOnce(
+      ok({ result: "started", request_id: "mcp-rollout-abc" }),
+    );
+    // 2nd RPC: the post-start get_status finds the child already dead.
+    hostdRequestMock.mockResolvedValueOnce(
+      ok({
+        result: "error",
+        request_id: "mcp-get-status-1",
+        exit_code: 2,
+        error: "rollout child exited 2",
+        stderr_tail: "unknown agent(s): switchroom-test-harness\n",
+      }),
+    );
+    const res = await dispatchTool("rollout", {
+      pin: "v0.15.18",
+      agents: ["test-harness"],
+    });
+    expect(res.isError).toBe(true);
+    // The started JSON must NOT be what the caller sees.
+    expect(res.content[0]!.text).not.toMatch(/"result":"started"/);
+    expect(res.content[0]!.text).toMatch(/"result":"error"/);
+    // stderr_tail surfaced as its own content item.
+    const joined = res.content.map((c) => c.text).join("\n");
+    expect(joined).toMatch(/unknown agent\(s\): switchroom-test-harness/);
+    expect(joined).toMatch(/stderr_tail:/);
+    // Exactly two RPCs: the rollout, then the single get_status re-check.
+    expect(hostdRequestMock).toHaveBeenCalledTimes(2);
+    const poll = hostdRequestMock.mock.calls[1]![1];
+    expect(poll.op).toBe("get_status");
+    expect(poll.args.target_request_id).toBe("mcp-rollout-abc");
+  });
+
+  it("rollout still healthy after the grace window returns started unchanged (happy path)", async () => {
+    hostdRequestMock.mockResolvedValueOnce(
+      ok({ result: "started", request_id: "mcp-rollout-live" }),
+    );
+    // Post-start poll: still running (started) → not a terminal error.
+    hostdRequestMock.mockResolvedValueOnce(
+      ok({ result: "started", request_id: "mcp-get-status-2" }),
+    );
+    const res = await dispatchTool("rollout", {
+      pin: "v0.15.18",
+      agents: ["test-harness"],
+    });
+    expect(res.isError).toBeFalsy();
+    expect(res.content[0]!.text).toMatch(/"result":"started"/);
+    expect(res.content[0]!.text).toMatch(/mcp-rollout-live/);
+  });
+
+  it("rollout survives a wire error on the post-start poll (falls through to started)", async () => {
+    hostdRequestMock.mockResolvedValueOnce(
+      ok({ result: "started", request_id: "mcp-rollout-x" }),
+    );
+    hostdRequestMock.mockRejectedValueOnce(new Error("uds hiccup"));
+    const res = await dispatchTool("rollout", { pin: "v0.15.18" });
+    expect(res.isError).toBeFalsy();
+    expect(res.content[0]!.text).toMatch(/"result":"started"/);
+  });
+
+  it("rollout denied by hostd surfaces stderr_tail in the error envelope", async () => {
+    hostdRequestMock.mockResolvedValueOnce(
+      ok({
+        result: "denied",
+        error: "E_UNKNOWN_AGENT: unknown agent(s): switchroom-test-harness",
+        stderr_tail: "unknown agent(s): switchroom-test-harness\n",
+      }),
+    );
+    const res = await dispatchTool("rollout", {
+      pin: "v0.15.18",
+      agents: ["switchroom-test-harness"],
+    });
+    expect(res.isError).toBe(true);
+    const joined = res.content.map((c) => c.text).join("\n");
+    expect(joined).toMatch(/E_UNKNOWN_AGENT/);
+    expect(joined).toMatch(/stderr_tail:/);
+    // A denied result short-circuits BEFORE the grace poll — one RPC only.
+    expect(hostdRequestMock).toHaveBeenCalledTimes(1);
   });
 
   it("update_apply forwards reason when provided and omits it when absent", async () => {
