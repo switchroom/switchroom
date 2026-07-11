@@ -66,6 +66,47 @@ describe("render: inline palette", () => {
     const reLink = (reparsed.blocks[0] as any).children.find((c: any) => c.type === "link");
     expect(reLink.href).toBe("https://example.com/a)b");
   });
+  it("round-trips a balanced-paren href (Wikipedia disambiguation) without leaking a backslash", () => {
+    // A bare destination with BALANCED parens is legal CommonMark; the parser
+    // captures the whole URL including the inner `(...)`. Escaping only `)`
+    // (the old fix) would unbalance the parens and leak a literal backslash
+    // into the decoded href. Escaping both parens keeps it balanced.
+    const src = "[w](https://en.wikipedia.org/wiki/Foo_(disambiguation))";
+    const doc = parse(src);
+    const link = (doc.blocks[0] as any).children.find((c: any) => c.type === "link");
+    expect(link.href).toBe("https://en.wikipedia.org/wiki/Foo_(disambiguation)");
+
+    const out = render(doc);
+    const reparsed = parse(out);
+    const reLink = (reparsed.blocks[0] as any).children.find((c: any) => c.type === "link");
+    // Re-parsed href is byte-for-byte the original — no truncation, no stray `\`.
+    expect(reLink.href).toBe("https://en.wikipedia.org/wiki/Foo_(disambiguation)");
+    expect(reLink.href).not.toContain("\\");
+  });
+  it("round-trips an href with multiple balanced paren groups", () => {
+    const src = "[m](https://example.com/a(b)c(d))";
+    const doc = parse(src);
+    const link = (doc.blocks[0] as any).children.find((c: any) => c.type === "link");
+    expect(link.href).toBe("https://example.com/a(b)c(d)");
+
+    const out = render(doc);
+    const reparsed = parse(out);
+    const reLink = (reparsed.blocks[0] as any).children.find((c: any) => c.type === "link");
+    expect(reLink.href).toBe("https://example.com/a(b)c(d)");
+    expect(reLink.href).not.toContain("\\");
+  });
+  it("round-trips an href with a lone unbalanced `)` without leaking a backslash", () => {
+    // Angle-bracket destination smuggles a lone `)` past the parser.
+    const doc = parse("[x](<https://example.com/a)b>)");
+    const link = (doc.blocks[0] as any).children.find((c: any) => c.type === "link");
+    expect(link.href).toBe("https://example.com/a)b");
+
+    const out = render(doc);
+    const reparsed = parse(out);
+    const reLink = (reparsed.blocks[0] as any).children.find((c: any) => c.type === "link");
+    expect(reLink.href).toBe("https://example.com/a)b");
+    expect(reLink.href).not.toContain("\\");
+  });
   it("underline", () => {
     expect(render(parse("__hi__"))).toBe("__hi__");
   });

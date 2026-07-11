@@ -75,18 +75,19 @@ export function codeSpanSafe(s: string): string {
  * Make a URL safe to interpolate as the destination of a `[label](href)`
  * inline link.
  *
- * In GFM / Bot API 10.1 markdown a link destination written as `(...)` is
- * terminated by the first UNESCAPED `)`, so an href containing a literal `)`
- * (Wikipedia `..._(disambiguation)` URLs, tracking params, generated deep
- * links) truncates the URL there and spills its tail into the surrounding
- * prose — a broken link, not a degraded one. The destination honours C-style
- * backslash escapes, so backslash-escape `\` (first, so we never double-escape
- * a following escape) and `)` — the whole URL is preserved and micromark
- * decodes it back to the original href on round-trip. `(` needs no escape:
- * only an unescaped `)` closes the destination.
+ * In GFM / Bot API 10.1 markdown a link destination written as `(...)` is a
+ * bare destination whose parentheses must be BALANCED, or every paren must be
+ * backslash-escaped. An href containing a literal `)` (Wikipedia
+ * `..._(disambiguation)` URLs, tracking params, generated deep links) can
+ * either truncate the URL (a lone `)` closing the destination) or, if we
+ * escape only `)`, unbalance the parens and leak a literal backslash into the
+ * decoded href. The destination honours C-style backslash escapes, so escape
+ * `\` first (so we never double-escape a following escape), then BOTH `(` and
+ * `)` — the whole URL is preserved balanced and micromark decodes it back to
+ * the original href on round-trip. Bot API 10.1 lists `(`/`)` as escapable.
  */
 export function escapeLinkHref(href: string): string {
-  return href.replace(/\\/g, '\\\\').replace(/\)/g, '\\)')
+  return href.replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)')
 }
 
 /**

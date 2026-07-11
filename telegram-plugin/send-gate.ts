@@ -356,6 +356,26 @@ interface PendingEdit {
   promise: Promise<unknown>
   resolve: (v: unknown) => void
   reject: (e: unknown) => void
+  /**
+   * Effective priority of the CURRENTLY-queued edit for this message. Set when
+   * the pending edit is created and UPGRADED (never downgraded) on coalesce, so
+   * that a `critical` edit coalescing onto a non-critical driver still gets the
+   * critical fail-fast treatment. The driver reads THIS (not the driver-start
+   * opts) to decide fail-fast vs unbounded admit (F2, review 2026-07-12).
+   */
+  priorityClass: PriorityClass
+}
+
+/** Total order over priority classes: cosmetic < useful < critical. */
+const PRIORITY_RANK: Record<PriorityClass, number> = {
+  cosmetic: 0,
+  useful: 1,
+  critical: 2,
+}
+
+/** Return the HIGHER-priority of two classes (upgrade-only; never downgrades). */
+function maxPriority(a: PriorityClass, b: PriorityClass): PriorityClass {
+  return PRIORITY_RANK[b] > PRIORITY_RANK[a] ? b : a
 }
 
 interface MessageEditState {
@@ -815,7 +835,13 @@ export function createSendGate(config: SendGateConfig): SendGate {
         // re-introduce the multi-hour reply wedge the send-gate exists to
         // eliminate (F4, review 2026-07-11). Non-critical edits keep PR 1's
         // unbounded coalescing admit unchanged.
-        if ((opts.priorityClass ?? 'useful') === 'critical') {
+        //
+        // Read the CURRENT pending edit's class (`p.priorityClass`), NOT the
+        // driver-start `opts`: a `critical` edit that coalesced onto a driver
+        // started by a non-critical edit upgraded `p.priorityClass`, and MUST
+        // fail-fast here rather than ride the non-critical unbounded admit for
+        // the whole ban (F2, review 2026-07-12).
+        if (p.priorityClass === 'critical') {
           const outcome = await admitPriority(bucketsFor(opts), 'critical')
           if (outcome.result === 'failfast') {
             counters.failedFast++
@@ -898,6 +924,17 @@ export function createSendGate(config: SendGateConfig): SendGate {
     // a coalesced revert so nothing needless hits the API. All callers share the
     // single pending promise, which resolves with the coalesced send's result.
     if (state.pending) {
+      // Upgrade (never downgrade) the queued edit's effective priority. A
+      // `critical` edit coalescing onto a `useful`/`cosmetic` pending edit must
+      // ride the driver's critical fail-fast path — otherwise the critical work
+      // rides the non-critical unbounded admit and blocks for a whole flood ban
+      // (F2, review 2026-07-12). We upgrade even when the hash is unchanged (a
+      // no-op payload from a critical caller still deserves fail-fast, not an
+      // unbounded block); a lower-priority coalesce leaves the class intact.
+      state.pending.priorityClass = maxPriority(
+        state.pending.priorityClass,
+        opts.priorityClass ?? 'useful',
+      )
       if (state.pending.hash !== hash) {
         counters.coalesced++
         state.pending.hash = hash
@@ -929,6 +966,7 @@ export function createSendGate(config: SendGateConfig): SendGate {
       promise,
       resolve,
       reject,
+      priorityClass: opts.priorityClass ?? 'useful',
     }
     state.pending = pending
     if (!state.running) void drive(state, opts)
