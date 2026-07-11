@@ -28,13 +28,19 @@ function mockResponse(opts: {
 }
 
 describe("ensureTeam", () => {
-  it("POSTs team_alias to /team/new and resolves on success", async () => {
+  it("POSTs team_alias to /team/new and RETURNS the team_id from the response", async () => {
+    // /team/new's request body carries team_alias (that IS the NewTeamRequest
+    // field), but its RESPONSE (a LiteLLM_TeamTable) carries the team_id — the
+    // UUID that keys must be bound to. ensureTeam must surface that id so
+    // ensureKey can pass it as team_id on /key/generate (the pre-fix code
+    // returned void and threw the id away → keys landed unbound).
     const calls: { url: string; init: RequestInit | undefined }[] = [];
     const fetchFn: FetchFn = async (url, init) => {
       calls.push({ url: String(url), init });
       return mockResponse({ ok: true, status: 200, json: { team_id: "t1" } });
     };
-    await ensureTeam("http://127.0.0.1:4010", "sk-master", "switchroom", fetchFn);
+    const teamId = await ensureTeam("http://127.0.0.1:4010", "sk-master", "switchroom", fetchFn);
+    expect(teamId).toBe("t1");
     expect(calls).toHaveLength(1);
     expect(calls[0]!.url).toBe("http://127.0.0.1:4010/team/new");
     expect(calls[0]!.init?.method).toBe("POST");
@@ -42,6 +48,54 @@ describe("ensureTeam", () => {
     expect(body).toEqual({ team_alias: "switchroom" });
     const headers = calls[0]!.init?.headers as Record<string, string>;
     expect(headers.authorization).toBe("Bearer sk-master");
+  });
+
+  it("resolves the team_id via /team/list when the team already exists", async () => {
+    // On the idempotent already-exists path /team/new hands back an error, not
+    // the team object — so ensureTeam must resolve the id by alias via
+    // /team/list (each entry carries team_id + team_alias) so a re-apply still
+    // binds keys to the existing team.
+    const calls: { url: string; method: string }[] = [];
+    const fetchFn: FetchFn = async (url, init) => {
+      const u = String(url);
+      calls.push({ url: u, method: init?.method ?? "GET" });
+      if (u.endsWith("/team/new")) {
+        return mockResponse({
+          ok: false,
+          status: 400,
+          text: "Team alias switchroom already exists in DB",
+        });
+      }
+      if (u.endsWith("/team/list")) {
+        return mockResponse({
+          ok: true,
+          status: 200,
+          json: [
+            { team_id: "other-id", team_alias: "other" },
+            { team_id: "switchroom-uuid", team_alias: "switchroom" },
+          ],
+        });
+      }
+      return mockResponse({ ok: false, status: 404, text: "not found" });
+    };
+    const teamId = await ensureTeam("http://127.0.0.1:4010", "sk-master", "switchroom", fetchFn);
+    expect(teamId).toBe("switchroom-uuid");
+    // It fell through to /team/list after the already-exists /team/new.
+    expect(calls.map((c) => `${c.method} ${c.url.replace("http://127.0.0.1:4010", "")}`)).toEqual([
+      "POST /team/new",
+      "GET /team/list",
+    ]);
+  });
+
+  it("returns undefined (non-fatal) when the already-exists team can't be resolved", async () => {
+    // Best-effort: if /team/list is unavailable, degrade to undefined rather
+    // than failing the whole apply — the key falls back to unbound.
+    const fetchFn: FetchFn = async (url) =>
+      String(url).endsWith("/team/new")
+        ? mockResponse({ ok: false, status: 409, text: "conflict" })
+        : mockResponse({ ok: false, status: 500, text: "list unavailable" });
+    const teamId = await ensureTeam("http://h", "k", "switchroom", fetchFn);
+    expect(teamId).toBeUndefined();
   });
 
   it("strips a trailing slash from base_url", async () => {
@@ -93,7 +147,14 @@ describe("ensureTeam", () => {
 });
 
 describe("ensureKey", () => {
-  it("POSTs the key spec to /key/generate and returns the new key", async () => {
+  it("POSTs the key spec to /key/generate and binds it to the team via team_id", async () => {
+    // Regression pin for the cost-tracking bug: the key MUST carry team_id (the
+    // UUID from /team/new), NOT team_alias. LiteLLM's GenerateKeyRequest
+    // (v1.91 litellm/proxy/_types.py: GenerateRequestBase) has a `team_id`
+    // field and NO `team_alias` field, so a key generated with team_alias is
+    // never attached to the team → per-team budget/spend tracking silently
+    // doesn't apply. The prior test asserted team_alias: "switchroom", pinning
+    // exactly that unbound-key bug.
     const calls: { url: string; init: RequestInit | undefined }[] = [];
     const fetchFn: FetchFn = async (url, init) => {
       calls.push({ url: String(url), init });
@@ -104,7 +165,7 @@ describe("ensureKey", () => {
         baseUrl: "http://127.0.0.1:4010",
         masterKey: "sk-master",
         alias: "agent:clerk",
-        team: "switchroom",
+        teamId: "switchroom-team-uuid",
         models: ["claude-haiku-4-5-20251001"],
         metadata: { agent: "clerk", env: "fleet" },
       },
@@ -116,9 +177,11 @@ describe("ensureKey", () => {
     expect(body).toEqual({
       key_alias: "agent:clerk",
       models: ["claude-haiku-4-5-20251001"],
-      team_alias: "switchroom",
+      team_id: "switchroom-team-uuid",
       metadata: { agent: "clerk", env: "fleet" },
     });
+    // Explicitly assert the buggy field is gone.
+    expect(body).not.toHaveProperty("team_alias");
   });
 
   it("omits models/team/metadata when not provided", async () => {
@@ -207,7 +270,7 @@ describe("ensureKey — orphaned-alias self-heal", () => {
       calls,
     );
     const result = await ensureKey(
-      { baseUrl: "http://h", masterKey: "m", alias: "agent:clerk", team: "switchroom" },
+      { baseUrl: "http://h", masterKey: "m", alias: "agent:clerk", teamId: "t1" },
       fetchFn,
     );
     expect(result).toEqual({ key: "sk-clean" });
@@ -245,7 +308,7 @@ describe("ensureKey — orphaned-alias self-heal", () => {
     );
 
     const result = await ensureKey(
-      { baseUrl: "http://h", masterKey: "m", alias: "agent:clerk", team: "switchroom", log: (m) => logs.push(m) },
+      { baseUrl: "http://h", masterKey: "m", alias: "agent:clerk", teamId: "t1", log: (m) => logs.push(m) },
       fetchFn,
     );
 

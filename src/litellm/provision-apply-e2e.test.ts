@@ -78,6 +78,10 @@ describe("provisionLiteLLMKeys — real broker e2e (blocker-1 seam)", () => {
   let prevSock: string | undefined;
   let prevPass: string | undefined;
   let realFetch: typeof fetch;
+  // Captures the /key/generate request body so a test can assert the key was
+  // bound to the team via team_id (the cost-tracking fix), end-to-end through
+  // the real provisionLiteLLMKeys → ensureTeam → ensureKey path.
+  let keyGenBodies: Array<Record<string, unknown>>;
 
   beforeEach(async () => {
     prevNonLinux = process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
@@ -116,13 +120,15 @@ describe("provisionLiteLLMKeys — real broker e2e (blocker-1 seam)", () => {
     process.env.SWITCHROOM_VAULT_PASSPHRASE = TEST_PASSPHRASE;
 
     // Stub global fetch so ensureTeam/ensureKey never hit the network.
+    keyGenBodies = [];
     realFetch = globalThis.fetch;
-    globalThis.fetch = (async (url: string | URL | Request) => {
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
       const u = String(url);
       if (u.endsWith("/team/new")) {
         return new Response(JSON.stringify({ team_id: "t1" }), { status: 200 });
       }
       if (u.includes("/key/generate")) {
+        if (init?.body) keyGenBodies.push(JSON.parse(String(init.body)));
         return new Response(JSON.stringify({ key: "sk-virtual-clerk-xyz" }), {
           status: 200,
         });
@@ -191,6 +197,13 @@ describe("provisionLiteLLMKeys — real broker e2e (blocker-1 seam)", () => {
     expect(stored).toBe("sk-virtual-clerk-xyz");
 
     expect(out.join("")).toContain("provisioned virtual key");
+
+    // Cost-tracking fix, end-to-end: the team_id from /team/new ("t1") is
+    // threaded into the /key/generate payload so the key is BOUND to the team.
+    // The buggy path sent team_alias (ignored by LiteLLM) and never bound it.
+    expect(keyGenBodies).toHaveLength(1);
+    expect(keyGenBodies[0]!.team_id).toBe("t1");
+    expect(keyGenBodies[0]).not.toHaveProperty("team_alias");
   });
 
   it("control: a passphrase-LESS put of a new key IS denied (proves the seam)", async () => {

@@ -591,8 +591,9 @@ export async function provisionLiteLLMKeys(
         continue;
       }
 
-      // Provision: ensure team, then generate the per-agent key.
-      await ensureTeam(baseUrl, masterKey, team);
+      // Provision: ensure team (capturing its team_id so the key binds to it
+      // for per-team cost/spend tracking), then generate the per-agent key.
+      const teamId = await ensureTeam(baseUrl, masterKey, team);
       const metadata: Record<string, string> = {
         agent: name,
         env: "fleet",
@@ -608,7 +609,7 @@ export async function provisionLiteLLMKeys(
         baseUrl,
         masterKey,
         alias,
-        team,
+        teamId,
         metadata,
         // Surface the orphaned-alias self-heal steps (delete + regenerate) so the
         // operator sees the recovery instead of a silent extra round-trip.
@@ -696,12 +697,12 @@ export async function provisionLiteLLMKeys(
             }
           }
           const team = topLevel?.team ?? "switchroom";
-          await ensureTeam(baseUrl, masterKey, team);
+          const teamId = await ensureTeam(baseUrl, masterKey, team);
           const { key } = await ensureKey({
             baseUrl,
             masterKey,
             alias: "service:hindsight",
-            team,
+            teamId,
             metadata: { service: "hindsight", env: "fleet", ...(oauthAccount ? { oauth_account: oauthAccount } : {}) },
             log: (m) => ctx.writeErr(chalk.gray(`  ~ litellm/hindsight: ${m}\n`)),
           });
