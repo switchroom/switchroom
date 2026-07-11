@@ -1959,6 +1959,16 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
         }
         log?.(`subagent-watcher: in-flight deferral cap reached for ${entry.agentId} (${Math.floor(totalIdleMs / 1000)}s idle >= ${Math.floor(inflightTerminalCapMs / 1000)}s cap with ${entry.inflightToolUseIds.size} tool call(s) still unresolved) — treating as died-mid-tool, proceeding with terminal synthesis`)
       }
+      // TODO(#3023/PR #3029): the cap-reached path above is a SECOND source of
+      // possibly-false terminal synthesis (a worker mid-very-long-tool that is
+      // NOT dead gets finalised here). PR #3029 adds `recordFalseFinish(...)`
+      // to this synthesis block so a later JSONL resumption can resurrect the
+      // card. When #3029 lands, make sure the merge resolution keeps
+      // `recordFalseFinish(entry.agentId, entry.filePath, n)` covering BOTH
+      // the plain silent-stall path and this cap-reached fall-through (they
+      // share this block, so a clean merge does — verify at conflict time).
+      // Intentionally NOT wired here to keep this PR standalone (no
+      // cross-PR dependency; recordFalseFinish does not exist on this branch).
       entry.stallTerminalSynthesised = true
       entry.state = 'done'
       const postStallSec = Math.floor((n - entry.stalledAt) / 1000)
