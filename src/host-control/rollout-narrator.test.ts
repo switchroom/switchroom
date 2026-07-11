@@ -115,6 +115,80 @@ describe("LogTailRolloutNarrator", () => {
     expect(relay.edits[0]!.text).toContain("agent 2/3");
   });
 
+  it("accumulates a per-agent checklist with durations, ETA and the deferred section", async () => {
+    const relay = makeRelay(100);
+    const n = new LogTailRolloutNarrator(relay, { debounceMs: 500 });
+    const entry = makeEntry({ started_at: Date.now(), prior_pin: "v1.2.2" });
+
+    n.onPhase(entry, phase("apply"));
+    await vi.runAllTimersAsync();
+
+    // Canary takes 40s.
+    n.onPhase(entry, phase("canary-start", { agent: "test-harness", n: 1, m: 3 }));
+    await vi.advanceTimersByTimeAsync(40_000);
+    n.onPhase(entry, phase("canary-pass", { agent: "test-harness", n: 1, m: 3 }));
+    entry.rolled = ["test-harness"];
+    n.onPhase(entry, phase("agent-start", { agent: "clerk", n: 2, m: 3 }));
+    await vi.advanceTimersByTimeAsync(500);
+
+    const t = relay.edits.at(-1)!.text;
+    // Header: version → version + request id.
+    expect(t).toContain("`v1.2.2` → `v1.2.3`");
+    expect(t).toContain("req `ro-1`");
+    // Checklist: canary done with duration, clerk running, 1 collapsed pending.
+    expect(t).toContain("- ✓ `test-harness` (canary) — 40s");
+    expect(t).toContain("- ⏳ `clerk` — restarting…");
+    expect(t).toContain("- · 1 more pending");
+    // Footer: rolled count + ETA from the canary's duration (40s × 2 left).
+    expect(t).toContain("1/3 rolled");
+    expect(t).toContain("~1m 20s left (rough est.)");
+
+    // Deferral + terminal: the final edit lists what stays on the prior
+    // version and the host-side commands, plus the elapsed total.
+    n.onPhase(entry, phase("agent-done", { agent: "clerk", n: 2, m: 3 }));
+    n.onPhase(entry, phase("agent-start", { agent: "marko", n: 3, m: 3 }));
+    n.onPhase(entry, phase("agent-done", { agent: "marko", n: 3, m: 3 }));
+    n.onPhase(entry, phase("hostd-web-deferred"));
+    n.onTerminal(
+      makeEntry({
+        started_at: entry.started_at,
+        finished_at: entry.started_at + 300_000,
+        result: "completed",
+        rolled: ["test-harness", "clerk", "marko"],
+        prior_pin: "v1.2.2",
+      }),
+    );
+    await vi.runAllTimersAsync();
+    const final = relay.edits.at(-1)!.text;
+    expect(final).toContain("✅");
+    expect(final).toContain("rolled 3/3 agent(s) in 5m");
+    expect(final).toContain("- ✓ `clerk`");
+    expect(final).toContain("- ✓ `marko`");
+    expect(final).toContain("Deferred");
+    expect(final).toContain("switchroom webd install --tag v1.2.3");
+  });
+
+  it("marks the failed agent ✗ on a terminal error", async () => {
+    const relay = makeRelay(100);
+    const n = new LogTailRolloutNarrator(relay, { debounceMs: 500 });
+    const entry = makeEntry();
+    n.onPhase(entry, phase("canary-start", { agent: "test-harness", n: 1, m: 2 }));
+    await vi.runAllTimersAsync();
+    n.onTerminal(
+      makeEntry({
+        result: "error",
+        rolled: [],
+        failed_step: "restart-agent",
+        failed_agent: "test-harness",
+        got: null,
+      }),
+    );
+    await vi.runAllTimersAsync();
+    const t = relay.edits.at(-1)!.text;
+    expect(t).toContain("- ✗ `test-harness` (canary) — failed");
+    expect(t).toContain("unreachable");
+  });
+
   it("is monotonic: a stale (earlier) phase after a later one is dropped", async () => {
     const relay = makeRelay(100);
     const n = new LogTailRolloutNarrator(relay, { debounceMs: 500 });
@@ -149,7 +223,7 @@ describe("LogTailRolloutNarrator", () => {
     await vi.runAllTimersAsync();
     const finalEdit = relay.edits.at(-1)!;
     expect(finalEdit.text).toContain("✅");
-    expect(finalEdit.text).toContain("done");
+    expect(finalEdit.text).toContain("Done");
     const editCountAtFreeze = relay.edits.length;
 
     // A late phase arriving after terminal is IGNORED (frozen).

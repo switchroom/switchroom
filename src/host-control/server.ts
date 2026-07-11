@@ -3110,6 +3110,11 @@ export class HostdServer {
         target: entry.pin ?? "",
         rolled: entry.rolled,
         terminal: entry.result === "completed" ? "completed" : "error",
+        requestId: entry.request_id,
+        ...(entry.prior_pin ? { fromVersion: entry.prior_pin } : {}),
+        ...(entry.finished_at !== null
+          ? { elapsedMs: entry.finished_at - entry.started_at }
+          : {}),
         ...(entry.failed_step ? { failedStep: entry.failed_step } : {}),
         ...(entry.failed_agent ? { failedAgent: entry.failed_agent } : {}),
         ...(entry.got !== undefined ? { got: entry.got } : {}),

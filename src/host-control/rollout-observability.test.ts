@@ -10,7 +10,10 @@ import {
   latestRolloutRowForRequest,
   parseAuditLine,
 } from "./audit-reader.js";
-import { renderRolloutStatus } from "./render-rollout-status.js";
+import {
+  renderRolloutStatus,
+  formatDurationMs,
+} from "./render-rollout-status.js";
 
 /** Build one JSONL audit row (the shape hostd writes, chain fields elided —
  *  parseAuditLine ignores `_seq`/`_prev`/`_hash`). */
@@ -99,15 +102,37 @@ describe("audit-reader parses rollout phase fields", () => {
   });
 });
 
+describe("formatDurationMs", () => {
+  it("formats seconds / minutes / hours compactly", () => {
+    expect(formatDurationMs(42_000)).toBe("42s");
+    expect(formatDurationMs(190_000)).toBe("3m 10s");
+    expect(formatDurationMs(180_000)).toBe("3m");
+    expect(formatDurationMs(3_900_000)).toBe("1h 5m");
+    expect(formatDurationMs(-5)).toBe("0s");
+  });
+});
+
 describe("renderRolloutStatus", () => {
-  it("renders an in-flight applying line", () => {
+  it("renders an in-flight applying header", () => {
     const out = renderRolloutStatus({ target: "v1.2.3", phase: "apply" });
     expect(out).toContain("v1.2.3");
     expect(out).toContain("applying");
     expect(out.startsWith("⏳")).toBe(true);
   });
 
-  it("renders agent N/M progress", () => {
+  it("headers with from → to versions and the short request id", () => {
+    const out = renderRolloutStatus({
+      target: "v1.2.3",
+      fromVersion: "v1.2.2",
+      requestId: "ro-abcdef1234567890xyz",
+      phase: "apply",
+    });
+    const header = out.split("\n")[0]!;
+    expect(header).toContain("`v1.2.2` → `v1.2.3`");
+    expect(header).toContain("req `ro-abcdef1234567…`");
+  });
+
+  it("renders agent N/M progress with the rolled count footer", () => {
     const out = renderRolloutStatus({
       target: "v1.2.3",
       phase: "agent-start",
@@ -118,21 +143,79 @@ describe("renderRolloutStatus", () => {
     });
     expect(out).toContain("agent 3/8");
     expect(out).toContain("clerk");
-    expect(out).toContain("2 rolled");
+    expect(out).toContain("2/8 rolled");
   });
 
-  it("renders the ✅ terminal-completed line with the rolled list", () => {
+  it("renders the per-agent checklist (✓ done / ⏳ running / ✗ failed / · pending) with durations", () => {
+    const out = renderRolloutStatus({
+      target: "v1.2.3",
+      phase: "agent-start",
+      agent: "clerk",
+      n: 3,
+      m: 5,
+      rolled: ["test-harness", "marko"],
+      agents: [
+        { name: "test-harness", status: "done", canary: true, durationMs: 42_000 },
+        { name: "marko", status: "done", durationMs: 38_000 },
+        { name: "clerk", status: "running" },
+      ],
+    });
+    expect(out).toContain("- ✓ `test-harness` (canary) — 42s");
+    expect(out).toContain("- ✓ `marko` — 38s");
+    expect(out).toContain("- ⏳ `clerk` — restarting…");
+    // 5 total, 3 known → 2 collapsed pending.
+    expect(out).toContain("- · 2 more pending");
+    // No literal • bullets (progress-card vocabulary uses `-` lists).
+    expect(out).not.toContain("•");
+  });
+
+  it("estimates a rough ETA from the mean per-agent duration so far", () => {
+    const out = renderRolloutStatus({
+      target: "v1.2.3",
+      phase: "agent-start",
+      m: 4,
+      rolled: ["a", "b"],
+      agents: [
+        { name: "a", status: "done", durationMs: 30_000 },
+        { name: "b", status: "done", durationMs: 60_000 },
+        { name: "c", status: "running" },
+      ],
+    });
+    // mean 45s × 2 remaining = 1m 30s.
+    expect(out).toContain("~1m 30s left (rough est.)");
+  });
+
+  it("shows elapsed from startedAtMs/nowMs while in flight", () => {
+    const out = renderRolloutStatus({
+      target: "v1.2.3",
+      phase: "agent-start",
+      m: 3,
+      startedAtMs: 1_000_000,
+      nowMs: 1_105_000,
+    });
+    expect(out).toContain("elapsed 1m 45s");
+  });
+
+  it("renders the ✅ terminal summary with rolled list, elapsed total and deferred components", () => {
     const out = renderRolloutStatus({
       target: "v1.2.3",
       terminal: "completed",
       rolled: ["test-harness", "clerk"],
+      m: 2,
+      elapsedMs: 492_000,
     });
     expect(out.startsWith("✅")).toBe(true);
-    expect(out).toContain("done");
+    expect(out).toContain("Done");
+    expect(out).toContain("rolled 2/2 agent(s) in 8m 12s");
     expect(out).toContain("test-harness, clerk");
+    // Deferred host-side components with their exact update commands.
+    expect(out).toContain("Deferred");
+    expect(out).toContain("switchroom webd install --tag v1.2.3");
+    expect(out).toContain("sudo npm i -g switchroom@1.2.3");
+    expect(out).toContain("switchroom hostd install --tag v1.2.3");
   });
 
-  it("renders the ❌ terminal-error line with the failed step + agent", () => {
+  it("renders the ❌ terminal-error summary with the failed step + agent", () => {
     const out = renderRolloutStatus({
       target: "v1.2.3",
       terminal: "error",
@@ -140,6 +223,7 @@ describe("renderRolloutStatus", () => {
       failedAgent: "clerk",
       got: "1.2.2",
       rolled: ["test-harness"],
+      elapsedMs: 65_000,
     });
     expect(out.startsWith("❌")).toBe(true);
     expect(out).toContain("STOPPED");
@@ -147,6 +231,9 @@ describe("renderRolloutStatus", () => {
     expect(out).toContain("clerk");
     expect(out).toContain("1.2.2");
     expect(out).toContain("test-harness");
+    expect(out).toContain("after 1m 5s");
+    // A failed roll must NOT advertise the deferred-update commands.
+    expect(out).not.toContain("Deferred");
   });
 
   it("renders 'unreachable' when the failed agent version is null", () => {
