@@ -82,6 +82,9 @@ describe("provisionLiteLLMKeys — real broker e2e (blocker-1 seam)", () => {
   // bound to the team via team_id (the cost-tracking fix), end-to-end through
   // the real provisionLiteLLMKeys → ensureTeam → ensureKey path.
   let keyGenBodies: Array<Record<string, unknown>>;
+  // Captures /key/update bodies so the idempotent re-apply test can assert the
+  // F1 in-place team re-bind (bind-only {key, team_id}, no regeneration).
+  let keyUpdateBodies: Array<Record<string, unknown>>;
 
   beforeEach(async () => {
     prevNonLinux = process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
@@ -121,6 +124,7 @@ describe("provisionLiteLLMKeys — real broker e2e (blocker-1 seam)", () => {
 
     // Stub global fetch so ensureTeam/ensureKey never hit the network.
     keyGenBodies = [];
+    keyUpdateBodies = [];
     realFetch = globalThis.fetch;
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
       const u = String(url);
@@ -136,6 +140,15 @@ describe("provisionLiteLLMKeys — real broker e2e (blocker-1 seam)", () => {
       // Fix-2 validation probe: any stored key we might validate is "valid".
       if (u.includes("/key/info")) {
         return new Response(JSON.stringify({ key: "sk-virtual-clerk-xyz", info: {} }), {
+          status: 200,
+        });
+      }
+      // F1 re-bind: a steady-state re-apply of a valid-but-unbound key issues a
+      // bind-only /key/update {key, team_id}. The /key/info stub above reports
+      // info:{} (UNBOUND), so an idempotent re-run heals it here.
+      if (u.includes("/key/update")) {
+        if (init?.body) keyUpdateBodies.push(JSON.parse(String(init.body)));
+        return new Response(JSON.stringify({ key: "sk-virtual-clerk-xyz", team_id: "t1" }), {
           status: 200,
         });
       }
@@ -290,5 +303,13 @@ describe("provisionLiteLLMKeys — real broker e2e (blocker-1 seam)", () => {
     expect(getStringSecret(TEST_PASSPHRASE, vaultPath, "litellm/clerk/api-key")).toBe(
       "sk-virtual-clerk-xyz",
     );
+    // NOTE: the F1 steady-state re-bind (valid key → /key/update) can't be
+    // exercised through THIS harness: apply connects to the broker as a
+    // non-operator peer on the tmp socket, so getViaBrokerStructured returns
+    // `denied` for any key (peer-identity ACL, see the file-header note), and
+    // the code never reaches the `existing.kind === "ok"` steady-state branch —
+    // the second run re-provisions (upsert) instead. F1's re-bind is pinned at
+    // the unit level in apply-litellm-provision.test.ts, where the broker read
+    // is stubbable. The `/key/update` fetch stub above stays for coherence.
   });
 });

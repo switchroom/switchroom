@@ -9,9 +9,12 @@
  *
  * The operations:
  *   - ensureTeam: create the "switchroom" LiteLLM team (idempotent — an
- *     "already exists" response is treated as success). Returns the team's
- *     `team_id` (the UUID `/team/new` hands back, or resolved via `/team/list`
- *     on the already-exists path) so keys can be bound to the team.
+ *     "already exists" response is treated as success). Returns an
+ *     `EnsureTeamResult`: `{kind:"bound", teamId}` (the UUID `/team/new` hands
+ *     back, or resolved via `/team/list` on the already-exists path) so keys
+ *     can be bound to the team, or `{kind:"unbound", reason}` carrying WHY no
+ *     id could be resolved so the caller can degrade LOUDLY instead of
+ *     silently binding nothing.
  *   - ensureKey: generate a per-agent virtual key under the team. Self-heals an
  *     ORPHANED key alias: LiteLLM enforces unique key aliases (upstream
  *     issue #9730), so if a prior apply generated the alias but crashed before
@@ -19,13 +22,25 @@
  *     — every later /key/generate then hard-fails with 400 "Key with alias ...
  *     already exists". ensureKey recovers by deleting the orphan and regenerating.
  *   - validateKey: probe a stored virtual key against the proxy (GET /key/info)
- *     to detect DB drift (proxy DB reset / restore without the vault).
+ *     to detect DB drift (proxy DB reset / restore without the vault) AND report
+ *     the key's current `team_id` binding so a valid-but-unbound key can be
+ *     re-bound on a steady-state re-apply.
+ *   - bindKeyToTeam: re-bind an EXISTING key to a team in place via
+ *     POST /key/update {key, team_id} — heals keys provisioned before the
+ *     team-binding fix (or via the degraded unbound path) without deleting or
+ *     regenerating them.
  *
- * LiteLLM admin API reference (v1.91 shapes): POST {base}/team/new (returns a
- * LiteLLM_TeamTable carrying `team_id`), GET {base}/team/list (each entry
- * carries `team_id` + `team_alias`), POST {base}/key/generate (binds to a team
- * via `team_id`), GET {base}/key/info?key=..., GET {base}/key/list,
- * POST {base}/key/delete — authenticated with the master key as a Bearer token.
+ * LiteLLM admin API reference (verified against v1.91.0
+ * litellm/proxy/management_endpoints/key_management_endpoints.py + _types.py):
+ * POST {base}/team/new (returns a LiteLLM_TeamTable carrying `team_id`),
+ * GET {base}/team/list (each entry carries `team_id` + `team_alias`),
+ * POST {base}/key/generate (binds to a team via `team_id`),
+ * GET {base}/key/info?key=... (returns `{key, info}` where the binding is at
+ * `info.team_id`, null/absent ⇒ UNBOUND), GET {base}/key/list,
+ * POST {base}/key/delete, POST {base}/key/update (accepts `UpdateKeyRequest`,
+ * which inherits `team_id` from `GenerateRequestBase` via `KeyRequestBase`; the
+ * handler's `is_different_team` guard rebinds null→team and team→team) —
+ * authenticated with the master key as a Bearer token.
  */
 
 /**
@@ -140,12 +155,27 @@ function looksLikeUnknownKey(status: number, body: string): boolean {
  * returned rather than throwing — the provision still succeeds, the key just
  * falls back to unbound (the pre-fix behavior) instead of failing the apply.
  */
+/**
+ * Outcome of `ensureTeam`.
+ *   - `bound`: carries the `team_id` keys must be attached to for per-team
+ *     cost/spend tracking.
+ *   - `unbound`: no id could be resolved (a fresh `/team/new` 200 with no
+ *     parseable id, or an already-exists team whose id `/team/list` didn't
+ *     yield). Carries a human `reason` so the CALLER can log a loud, specific
+ *     warning instead of silently degrading to an unbound key (the pre-fix
+ *     behavior swallowed the reason and provisioned a green "success").
+ */
+export type EnsureTeamResult =
+  | { kind: "bound"; teamId: string }
+  | { kind: "unbound"; reason: string };
+
 export async function ensureTeam(
   baseUrl: string,
   masterKey: string,
   teamName: string,
   fetchFn: FetchFn = fetch,
-): Promise<string | undefined> {
+  log?: (msg: string) => void,
+): Promise<EnsureTeamResult> {
   const base = normalizeBase(baseUrl);
   const url = `${base}/team/new`;
   let resp: Response;
@@ -163,13 +193,28 @@ export async function ensureTeam(
   if (resp.ok) {
     // Fresh create: the response is a LiteLLM_TeamTable carrying the new
     // team_id (the UUID keys must be bound to).
-    return await readTeamId(resp);
+    const id = await readTeamId(resp);
+    if (id) return { kind: "bound", teamId: id };
+    return {
+      kind: "unbound",
+      reason:
+        `/team/new returned 200 for team '${teamName}' but the response ` +
+        `carried no usable team_id`,
+    };
   }
   const body = await safeText(resp);
   if (looksLikeAlreadyExists(resp.status, body)) {
     // Idempotent: the team already exists, so /team/new did NOT hand back the
     // id — resolve it by alias via /team/list so keys can still be bound.
-    return await resolveTeamIdByAlias(base, masterKey, teamName, fetchFn);
+    const id = await resolveTeamIdByAlias(base, masterKey, teamName, fetchFn, log);
+    if (id) return { kind: "bound", teamId: id };
+    return {
+      kind: "unbound",
+      reason:
+        `team '${teamName}' already exists but its team_id could not be ` +
+        `resolved via /team/list (list unavailable, unparseable, or no ` +
+        `entry matching the alias)`,
+    };
   }
   throw new LiteLLMProvisionError(
     `LiteLLM /team/new returned ${resp.status}`,
@@ -205,6 +250,7 @@ async function resolveTeamIdByAlias(
   masterKey: string,
   teamName: string,
   fetchFn: FetchFn,
+  log?: (msg: string) => void,
 ): Promise<string | undefined> {
   let resp: Response;
   try {
@@ -227,16 +273,34 @@ async function resolveTeamIdByAlias(
     : Array.isArray((json as { teams?: unknown } | null)?.teams)
       ? (json as { teams: unknown[] }).teams
       : [];
+  // Collect ALL ids sharing the alias. LiteLLM does NOT enforce a unique
+  // team_alias, so /team/list can legitimately carry several teams with our
+  // alias (e.g. a team recreated after a partial delete). Returning the first
+  // match is array-order — server-defined and NONDETERMINISTIC: keys could
+  // bind to a different team run-to-run, splitting cost tracking silently.
+  const matches: string[] = [];
   for (const t of teams) {
     if (t && typeof t === "object") {
       const alias = (t as { team_alias?: unknown }).team_alias;
       const id = (t as { team_id?: unknown }).team_id;
       if (alias === teamName && typeof id === "string" && id.length > 0) {
-        return id;
+        matches.push(id);
       }
     }
   }
-  return undefined;
+  if (matches.length === 0) return undefined;
+  if (matches.length === 1) return matches[0];
+  // Duplicate aliases: pick DETERMINISTICALLY (the lexicographically smallest
+  // team_id) so binding is stable across applies, and warn naming every
+  // duplicate so the operator can dedupe the team upstream.
+  const sorted = [...matches].sort();
+  log?.(
+    `WARNING: ${matches.length} LiteLLM teams share team_alias '${teamName}' ` +
+    `(team_ids: ${sorted.join(", ")}); binding keys deterministically to the ` +
+    `lexicographically smallest '${sorted[0]}'. Deduplicate the team in ` +
+    `LiteLLM to silence this and guarantee cost tracking lands on one team.`,
+  );
+  return sorted[0];
 }
 
 /** Internal outcome of a single /key/generate POST. */
@@ -476,7 +540,7 @@ export interface ValidateKeyOpts {
  *       Never triggers a destructive re-provision.
  */
 export type ValidateKeyResult =
-  | { kind: "valid" }
+  | { kind: "valid"; teamId: string | null }
   | { kind: "unknown" }
   | { kind: "unreachable"; detail: string };
 
@@ -486,6 +550,11 @@ export type ValidateKeyResult =
  * a stale vault key can be re-provisioned instead of silently 401ing every
  * agent request. Availability-safe: any ambiguous failure degrades to
  * `unreachable` (skip), never to a destructive re-provision.
+ *
+ * On `valid`, also reports the key's current team binding (`teamId`, from
+ * `info.team_id` in the /key/info response — `null` when UNBOUND) so the
+ * caller can re-bind a valid-but-unbound key on a steady-state re-apply
+ * (see `bindKeyToTeam`).
  */
 export async function validateKey(
   opts: ValidateKeyOpts,
@@ -498,12 +567,77 @@ export async function validateKey(
   } catch (err) {
     return { kind: "unreachable", detail: (err as Error).message };
   }
-  if (resp.ok) return { kind: "valid" };
+  if (resp.ok) {
+    // GET /key/info returns { key, info: {...VerificationToken row...} }
+    // (verified v1.91.0 key_management_endpoints.py info_key_fn). The key's
+    // team binding lives at info.team_id — null/absent ⇒ UNBOUND. Surface it
+    // so a valid-but-unbound key can be healed in place (F1). A missing /
+    // unparseable body degrades to `null` (unknown binding), never an error.
+    let teamId: string | null = null;
+    try {
+      const json = (await resp.json()) as { info?: { team_id?: unknown } } | null;
+      const t = json?.info?.team_id;
+      if (typeof t === "string" && t.length > 0) teamId = t;
+    } catch {
+      /* body unreadable/non-JSON — treat binding as unknown (null). */
+    }
+    return { kind: "valid", teamId };
+  }
   const body = await safeText(resp);
   if (looksLikeUnknownKey(resp.status, body)) return { kind: "unknown" };
   // Bare 401/403 (bad master key, no not-found semantic), 5xx, or any other
   // ambiguous error — do NOT re-provision; keep the stored key and warn.
   return { kind: "unreachable", detail: `HTTP ${resp.status}: ${body.slice(0, 200)}` };
+}
+
+/** Options for `bindKeyToTeam`. */
+export interface BindKeyToTeamOpts {
+  baseUrl: string;
+  masterKey: string;
+  /** The existing virtual key string to re-bind. */
+  key: string;
+  /** The team_id to bind the key under. */
+  teamId: string;
+}
+
+/** Outcome of a bind-only /key/update. */
+export type BindKeyToTeamResult =
+  | { kind: "ok" }
+  | { kind: "error"; detail: string };
+
+/**
+ * Re-bind an EXISTING virtual key to a team in place via
+ * POST /key/update {key, team_id}. Heals keys provisioned before the
+ * team-binding fix (or via the degraded unbound path) so per-team cost
+ * tracking starts aggregating — WITHOUT deleting or regenerating the key
+ * (which would churn the vault + break in-flight agents).
+ *
+ * Contract verified against LiteLLM v1.91.0
+ * (litellm/proxy/management_endpoints/key_management_endpoints.py update_key_fn
+ * + _types.py): POST /key/update accepts `UpdateKeyRequest`, which inherits the
+ * optional `team_id` field from `GenerateRequestBase` via `KeyRequestBase`; the
+ * handler's `is_different_team(data, existing_key_row)` guard rebinds a key
+ * from null→team and team→team. Best-effort + LOUD on failure: never throws —
+ * returns a structured error the caller surfaces as a warning.
+ */
+export async function bindKeyToTeam(
+  opts: BindKeyToTeamOpts,
+  fetchFn: FetchFn = fetch,
+): Promise<BindKeyToTeamResult> {
+  const url = `${normalizeBase(opts.baseUrl)}/key/update`;
+  let resp: Response;
+  try {
+    resp = await fetchFn(url, {
+      method: "POST",
+      headers: authHeaders(opts.masterKey),
+      body: JSON.stringify({ key: opts.key, team_id: opts.teamId }),
+    });
+  } catch (err) {
+    return { kind: "error", detail: (err as Error).message };
+  }
+  if (resp.ok) return { kind: "ok" };
+  const body = await safeText(resp);
+  return { kind: "error", detail: `HTTP ${resp.status}: ${body.slice(0, 200)}` };
 }
 
 /** Read a Response body as text, swallowing any read error (best-effort
