@@ -641,13 +641,14 @@ describe("Hindsight port-collision regression", () => {
   // launch through the SAME pick+preflight helpers.
   it("setup.ts routes its Hindsight launch through the pick+preflight guard", () => {
     const src = readFileSync(resolve(import.meta.dirname, "../src/cli/setup.ts"), "utf-8");
-    // Must no longer blind-launch on the default port.
-    expect(src).not.toContain("startHindsight(undefined");
+    // Must no longer blind-launch on the default port. Whitespace-tolerant:
+    // the call site may be formatted multi-line (#2578 added trailing args).
+    expect(src).not.toMatch(/startHindsight\(\s*undefined/);
     // Must use the shared guard helpers (not a parallel implementation) and
-    // hand the chosen ports to startHindsight.
+    // hand the chosen ports to startHindsight (first argument = `ports`).
     expect(src).toContain("pickHindsightPorts");
     expect(src).toContain("preflightHindsightPorts");
-    expect(src).toContain("startHindsight(ports");
+    expect(src).toMatch(/startHindsight\(\s*ports\b/);
   });
 
   it("setup's port guard selects a free port instead of binding the occupied default", async () => {
