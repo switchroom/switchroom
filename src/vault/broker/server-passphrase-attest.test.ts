@@ -80,7 +80,7 @@ describe("VaultBroker: PUT with operator-passphrase attestation (#969 P1a)", () 
 
     const grantsDb = makeInMemoryGrantsDb();
     auditEntries = [];
-    const testAuditLogger = { write: (e: AuditEntry) => { auditEntries.push(e); } };
+    const testAuditLogger = { write: (e: AuditEntry) => { auditEntries.push(e); return true; }, failOpenCount: () => 0 };
 
     broker = new VaultBroker({
       _testConfig: makeMinimalConfig(),

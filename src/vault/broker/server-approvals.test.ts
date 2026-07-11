@@ -71,7 +71,7 @@ describe("VaultBroker: approval-kernel ops", () => {
       _testSecrets: { foo: { kind: "string", value: "bar" } },
       _testConfig: makeMinimalConfig(),
       _testGrantsDb: grantsDb,
-      _testAuditLogger: { write: () => { /* swallow */ } },
+      _testAuditLogger: { write: () => true, failOpenCount: () => 0 },
     });
     await broker.start(socketPath, undefined, undefined);
   });

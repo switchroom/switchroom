@@ -44,6 +44,7 @@ import { runContextChecks } from "./doctor-context.js";
 import { runCredentialsMigrationChecks } from "./doctor-credentials-migration.js";
 import { runSecretAccessChecks } from "./doctor-secret-access.js";
 import { runInlinedSecretChecks } from "./doctor-inlined-secrets.js";
+import { runApprovalAttributionChecks } from "./doctor-approval-attribution.js";
 import { runAuditIntegrityChecks } from "./doctor-audit-integrity.js";
 import { runAgentSmokeChecks } from "./doctor-agent-smoke.js";
 import { runVaultBrokerDurabilityChecks } from "./doctor-vault-broker-durability.js";
@@ -2899,6 +2900,10 @@ export function registerDoctorCommand(program: Command): void {
           { title: "Agents", results: checkAgents(config, configPath) },
           { title: "Credentials", results: runCredentialsMigrationChecks(config) },
           { title: "Audit integrity (WS10-F4)", results: runAuditIntegrityChecks() },
+          {
+            title: "Approval attribution (WS10-F5)",
+            results: runApprovalAttributionChecks(),
+          },
           { title: "Docker (Phase 1a)", results: runDockerSection(config) },
           { title: "Auth Broker", results: runAuthBrokerChecks(config) },
           { title: "Host control (hostd)", results: runHostdChecks(config) },

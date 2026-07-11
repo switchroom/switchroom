@@ -30,6 +30,11 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { verifyAuditLog } from "../util/audit-hashchain.js";
+import {
+  failOpenStatePath,
+  readFailOpenState,
+  type FailOpenState,
+} from "../vault/broker/audit-log.js";
 
 import type { CheckStatus } from "./doctor-status.js";
 
@@ -46,6 +51,12 @@ export interface AuditIntegrityDeps {
   /** Reads a log file's text. Defaults to fs.readFileSync; a thrown
    *  ENOENT is treated as "missing". */
   readFileSync?: (p: string) => string;
+  /**
+   * Reads the vault-broker fail-open counter sidecar (sec WS10-F3 / #1420).
+   * Defaults to the real `readFailOpenState`; injectable for tests. Returns
+   * a zeroed state when the sidecar is absent/unreadable.
+   */
+  readFailOpenState?: (statePath: string) => FailOpenState;
 }
 
 interface LogTarget {
@@ -69,7 +80,33 @@ export function runAuditIntegrityChecks(
   const home = deps.homeDir ?? homedir();
   const read =
     deps.readFileSync ?? ((p: string) => fsReadFileSync(p, "utf8"));
+  const readFailOpen = deps.readFailOpenState ?? readFailOpenState;
   const results: CheckResult[] = [];
+
+  // sec WS10-F3 / #1420 — the vault-broker fail-open counter. A non-zero
+  // count means at least one secret release happened (fail-open) or was
+  // DENIED (fail-closed) while its audit append failed — a durable signal
+  // the operator must not miss. The count lives in a sidecar beside the
+  // vault-broker audit log so a failed append doesn't recursively fail to
+  // record itself.
+  const vaultAuditLog = join(home, ".switchroom", "vault-audit.log");
+  const failOpen = readFailOpen(failOpenStatePath(vaultAuditLog));
+  if (failOpen.failOpenCount > 0) {
+    const when = failOpen.lastFailureTs ? ` (last at ${failOpen.lastFailureTs})` : ``;
+    const why = failOpen.lastError ? ` — last error: ${failOpen.lastError}` : ``;
+    results.push({
+      name: "vault-broker audit fail-open counter",
+      status: "warn",
+      detail: `${failOpen.failOpenCount} audit append(s) failed${when}${why}. Each failure meant a secret release was either NOT durably audited (fail-open) or denied (fail-closed) — investigate the audit volume (mount/permissions/disk) before trusting recent access records (WS10-F3).`,
+      fix: `Check the vault-broker's audit volume is mounted, writable, and not full; review vault-broker stderr for '[vault-audit] ERROR' lines. Once healed, reset the counter by removing ${failOpenStatePath(vaultAuditLog)}.`,
+    });
+  } else {
+    results.push({
+      name: "vault-broker audit fail-open counter",
+      status: "ok",
+      detail: `no failed audit appends recorded (every secret release was durably audited)`,
+    });
+  }
 
   for (const { label, path } of rootWrittenLogs(home)) {
     let text: string;

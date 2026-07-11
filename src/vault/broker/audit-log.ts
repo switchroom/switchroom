@@ -100,7 +100,64 @@ export interface AuditEntry {
 }
 
 export interface AuditLogger {
-  write(entry: AuditEntry): void;
+  /**
+   * Append one audit row. Returns `true` iff the row was durably written
+   * to disk (open + write both succeeded). Returns `false` when the append
+   * failed — the caller (broker) uses this to decide fail-open vs
+   * fail-closed on a secret release (sec WS10-F3 / #1420). Every `false`
+   * also increments the durable fail-open counter (see failOpenCount).
+   */
+  write(entry: AuditEntry): boolean;
+  /**
+   * Current fail-open counter: the number of audit appends that FAILED
+   * over this log's lifetime (seeded from the on-disk sidecar at
+   * construction, incremented + persisted on every failed write). A
+   * non-zero value means at least one access was NOT durably audited —
+   * a WS10-F3 fail-open (or, in fail-closed mode, a denied release). The
+   * doctor audit-integrity probe surfaces this to the operator.
+   */
+  failOpenCount(): number;
+}
+
+/**
+ * Durable fail-open state persisted beside the audit log (sec WS10-F3 /
+ * #1420). Kept in a sidecar rather than inside the chained log so that a
+ * write failure (the very thing we're counting) doesn't recursively fail
+ * to record itself, and so `doctor` can read the count without replaying
+ * the whole hash chain.
+ */
+export interface FailOpenState {
+  /** Total failed audit appends over the log's lifetime. */
+  failOpenCount: number;
+  /** ISO-8601 timestamp of the most recent failure, if any. */
+  lastFailureTs?: string;
+  /** Truncated error message from the most recent failure, if any. */
+  lastError?: string;
+}
+
+/** Sidecar path for the fail-open counter: `<logPath>.failopen`. */
+export function failOpenStatePath(logPath: string): string {
+  return `${logPath}.failopen`;
+}
+
+/**
+ * Read the durable fail-open state sidecar. Returns a zeroed state when the
+ * sidecar is missing or unparseable (a corrupt/absent sidecar must never
+ * throw — doctor treats "can't read" as "no recorded failures").
+ */
+export function readFailOpenState(statePath: string): FailOpenState {
+  try {
+    const raw = fs.readFileSync(statePath, "utf8");
+    const parsed = JSON.parse(raw) as Partial<FailOpenState>;
+    const count = Number(parsed.failOpenCount);
+    return {
+      failOpenCount: Number.isFinite(count) && count > 0 ? count : 0,
+      lastFailureTs: typeof parsed.lastFailureTs === "string" ? parsed.lastFailureTs : undefined,
+      lastError: typeof parsed.lastError === "string" ? parsed.lastError : undefined,
+    };
+  } catch {
+    return { failOpenCount: 0 };
+  }
 }
 
 /** Options for createAuditLogger. */
@@ -124,6 +181,11 @@ export interface AuditLoggerOptions {
    * uses the default. Env override: `SWITCHROOM_VAULT_AUDIT_MAX_FILES`.
    */
   maxFiles?: number;
+  /**
+   * Absolute path to the durable fail-open counter sidecar (sec WS10-F3 /
+   * #1420). Defaults to `<path>.failopen`. Injectable for tests.
+   */
+  statePath?: string;
 }
 
 /**
@@ -343,8 +405,35 @@ export function createAuditLogger(opts: AuditLoggerOptions = {}): AuditLogger {
   // tamper-evidence continuity holds.
   const rotation = resolveRotation(opts);
 
+  // Durable fail-open counter (sec WS10-F3 / #1420). Seeded from the sidecar
+  // so the count survives broker restarts; incremented + persisted on every
+  // failed append. A failed sidecar persist is best-effort (never throws) —
+  // the in-memory count still advances so this process's status op is accurate.
+  const statePath = opts.statePath ?? failOpenStatePath(logPath);
+  let failOpen = readFailOpenState(statePath).failOpenCount;
+
+  const recordFailOpen = (err: Error): void => {
+    failOpen += 1;
+    const state: FailOpenState = {
+      failOpenCount: failOpen,
+      lastFailureTs: new Date().toISOString(),
+      lastError: String(err.message).slice(0, 300),
+    };
+    try {
+      // 0o600 — user-only, same posture as the audit log itself.
+      fs.writeFileSync(statePath, `${JSON.stringify(state)}\n`, { mode: 0o600 });
+    } catch (persistErr) {
+      process.stderr.write(
+        `[vault-audit] ERROR: could not persist fail-open counter ${statePath}: ${(persistErr as Error).message}\n`,
+      );
+    }
+  };
+
   return {
-    write(entry: AuditEntry): void {
+    failOpenCount(): number {
+      return failOpen;
+    },
+    write(entry: AuditEntry): boolean {
       // Size-based rotation check before the append. Best-effort:
       // stat failures leave the file untouched (grow rather than lose).
       if (rotation.maxBytes > 0) {
@@ -374,17 +463,23 @@ export function createAuditLogger(opts: AuditLoggerOptions = {}): AuditLogger {
         process.stderr.write(
           `[vault-audit] ERROR: could not open audit log ${logPath}: ${(err as Error).message}\n`,
         );
-        return;
+        // Fail-open: the row was NOT written. Record it durably so the
+        // operator (via doctor) can see releases went unaudited.
+        recordFailOpen(err as Error);
+        return false;
       }
 
+      let durable = false;
       try {
         fs.writeSync(fd, line);
         // Durable: advance the chain only now.
         chain = next;
+        durable = true;
       } catch (err) {
         process.stderr.write(
           `[vault-audit] ERROR: could not write to audit log ${logPath}: ${(err as Error).message}\n`,
         );
+        recordFailOpen(err as Error);
       } finally {
         try {
           fs.closeSync(fd);
@@ -394,6 +489,7 @@ export function createAuditLogger(opts: AuditLoggerOptions = {}): AuditLogger {
           );
         }
       }
+      return durable;
     },
   };
 }

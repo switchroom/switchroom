@@ -122,7 +122,7 @@ describe("VaultBroker: grant operations (mint_grant / list_grants / revoke_grant
     grantsDb = makeInMemoryGrantsDb();
     auditEntries = [];
 
-    const testAuditLogger = { write: (e: AuditEntry) => { auditEntries.push(e); } };
+    const testAuditLogger = { write: (e: AuditEntry) => { auditEntries.push(e); return true; }, failOpenCount: () => 0 };
 
     broker = new VaultBroker({
       _testSecrets: cloneSecrets(),
@@ -310,7 +310,7 @@ describe("VaultBroker: token-based get access (issue #225)", () => {
     grantsDb = makeInMemoryGrantsDb();
     auditEntries = [];
 
-    const testAuditLogger = { write: (e: AuditEntry) => { auditEntries.push(e); } };
+    const testAuditLogger = { write: (e: AuditEntry) => { auditEntries.push(e); return true; }, failOpenCount: () => 0 };
 
     broker = new VaultBroker({
       _testSecrets: cloneSecrets(),
@@ -436,6 +436,98 @@ describe("VaultBroker: token-based get access (issue #225)", () => {
     if (!afterResp.ok) {
       expect(afterResp.code).toBe("DENIED");
       expect(afterResp.msg).toContain("grant-revoked");
+    }
+  });
+});
+
+// ─── sec WS10-F3 / #1420: audit fail-closed mode ──────────────────────────────
+//
+// OUTCOME assertions: when the audit append for a secret release FAILS, the
+// broker must (a) still release the secret in the default fail-OPEN mode, and
+// (b) DENY the release with AUDIT_UNAVAILABLE when fail-CLOSED is enabled — so a
+// blinded audit trail can't be used to exfiltrate a secret silently.
+describe("VaultBroker: audit fail-closed release gate (sec WS10-F3 / #1420)", () => {
+  let broker: VaultBroker;
+  let socketPath: string;
+  let tmpDir: string;
+  let grantsDb: Database;
+  let prevNonLinuxFlag: string | undefined;
+  let prevFailClosedEnv: string | undefined;
+
+  // A logger whose append ALWAYS fails (write → false), simulating a broken /
+  // read-only / full audit volume. Bumps a local counter so the test can assert
+  // the release path actually consulted the return value.
+  let failedWrites: number;
+  const failingLogger = {
+    write: (_e: AuditEntry) => {
+      failedWrites += 1;
+      return false;
+    },
+    failOpenCount: () => failedWrites,
+  };
+
+  async function startBroker(failClosed: boolean): Promise<void> {
+    if (failClosed) {
+      process.env.SWITCHROOM_VAULT_AUDIT_FAIL_CLOSED = "1";
+    } else {
+      delete process.env.SWITCHROOM_VAULT_AUDIT_FAIL_CLOSED;
+    }
+    broker = new VaultBroker({
+      _testSecrets: cloneSecrets(),
+      _testConfig: makeMinimalConfig(),
+      _testGrantsDb: grantsDb,
+      _testAuditLogger: failingLogger,
+    });
+    await broker.start(socketPath, undefined, undefined);
+  }
+
+  beforeEach(() => {
+    prevNonLinuxFlag = process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
+    process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX = "1";
+    prevFailClosedEnv = process.env.SWITCHROOM_VAULT_AUDIT_FAIL_CLOSED;
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "broker-failclosed-test-"));
+    socketPath = path.join(tmpDir, "test.sock");
+    grantsDb = makeInMemoryGrantsDb();
+    failedWrites = 0;
+  });
+
+  afterEach(() => {
+    try { broker.stop(); } catch { /* not started */ }
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    if (prevNonLinuxFlag === undefined) delete process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
+    else process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX = prevNonLinuxFlag;
+    if (prevFailClosedEnv === undefined) delete process.env.SWITCHROOM_VAULT_AUDIT_FAIL_CLOSED;
+    else process.env.SWITCHROOM_VAULT_AUDIT_FAIL_CLOSED = prevFailClosedEnv;
+  });
+
+  it("fail-OPEN (default): failed audit append still releases the secret", async () => {
+    await startBroker(false);
+    const { token } = await mintGrant(grantsDb, "myagent", ["foo"], null);
+
+    const resp = await rpc(socketPath, { v: 1, op: "get", key: "foo", token });
+
+    // The audit write failed…
+    expect(failedWrites).toBeGreaterThan(0);
+    // …but the secret was released anyway (historical fail-open behaviour).
+    expect(resp.ok).toBe(true);
+    if (resp.ok && "entry" in resp) {
+      expect(resp.entry).toEqual({ kind: "string", value: "bar-value" });
+    }
+  });
+
+  it("fail-CLOSED: failed audit append DENIES the release with AUDIT_UNAVAILABLE", async () => {
+    await startBroker(true);
+    const { token } = await mintGrant(grantsDb, "myagent", ["foo"], null);
+
+    const resp = await rpc(socketPath, { v: 1, op: "get", key: "foo", token });
+
+    // The audit write failed AND the secret was withheld.
+    expect(failedWrites).toBeGreaterThan(0);
+    expect(resp.ok).toBe(false);
+    if (!resp.ok) {
+      expect(resp.code).toBe("AUDIT_UNAVAILABLE");
+      // The response must NOT leak the secret value.
+      expect(JSON.stringify(resp)).not.toContain("bar-value");
     }
   });
 });

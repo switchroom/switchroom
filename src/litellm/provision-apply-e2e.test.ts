@@ -102,7 +102,7 @@ describe("provisionLiteLLMKeys — real broker e2e (blocker-1 seam)", () => {
       _testConfig: makeConfig(tmpDir),
       // Isolated audit logger → never touches the production audit log
       // (CLAUDE.md vault-test hermeticity HARD RULE).
-      _testAuditLogger: { write: () => {} },
+      _testAuditLogger: { write: () => true, failOpenCount: () => 0 },
     });
     await broker.start(socketPath, undefined, vaultPath);
 

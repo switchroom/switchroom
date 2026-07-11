@@ -100,7 +100,7 @@ describe("VaultBroker: read-path unusable-token fall-through", () => {
       _testSecrets: cloneSecrets(),
       _testConfig: makeMinimalConfig(),
       _testGrantsDb: grantsDb,
-      _testAuditLogger: { write: (e: AuditEntry) => { auditEntries.push(e); } },
+      _testAuditLogger: { write: (e: AuditEntry) => { auditEntries.push(e); return true; }, failOpenCount: () => 0 },
     });
     await broker.start(socketPath, undefined, undefined);
   });

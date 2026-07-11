@@ -262,7 +262,18 @@ describe("VaultConfigSchema.broker", () => {
       approvalAuth: "passphrase",
       postureMintAgents: [],
       adminOnlyKeys: [],
+      auditFailClosed: false,
     });
+  });
+
+  it("defaults auditFailClosed to false (fail-open, backward compatible) and accepts true", () => {
+    // sec WS10-F3 / #1420 — the knob must default OFF so upgrading fleets
+    // keep the historical fail-open behaviour until the operator opts in.
+    expect(VaultConfigSchema.parse({}).broker.auditFailClosed).toBe(false);
+    expect(
+      VaultConfigSchema.parse({ broker: { auditFailClosed: true } }).broker
+        .auditFailClosed,
+    ).toBe(true);
   });
 
   it("defaults postureMintAgents to [] (no agent can self-mint via posture)", () => {
