@@ -29,7 +29,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, lstatSync, readlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, lstatSync, readlinkSync, chmodSync } from "node:fs";
 import { join, isAbsolute, dirname, resolve } from "node:path";
 import type { SwitchroomConfig, AgentConfig, AgentBindMount } from "../config/schema.js";
 import { isValidTimezone } from "../config/schema.js";
@@ -2441,6 +2441,15 @@ function emitAgentService(
   lines.push(`      - ${homePrefix}/.switchroom/agents/${a.name}:/state/agent`);
   lines.push(`      - ${homePrefix}/.claude/projects/${a.name}:/state/.claude`);
   lines.push(`      - ${homePrefix}/.switchroom/logs/${a.name}:/var/log/switchroom`);
+  // Blocked-approval surface (#3084 follow-up). When a permission card can't be
+  // delivered (Telegram flood ban), the gateway HOLDS the approval — it never
+  // auto-denies — and writes a world-readable record here so the operator can
+  // see, off-Telegram, that an agent is blocked and until when. This is a
+  // SHARED top-level dir (not per-agent /state/agent) because switchroom-web
+  // reads every agent's record from one place; the file is 0644 so web's
+  // uid-1000 process can actually read it (agent state files are 0600 and are
+  // not readable by web — verified on the live box).
+  lines.push(`      - ${homePrefix}/.switchroom/blocked-approvals:/state/blocked-approvals:rw`);
   lines.push(`      - ${homePrefix}/.switchroom/agents/${a.name}:${homePrefix}/.switchroom/agents/${a.name}`);
   lines.push(`      - ${homePrefix}/.claude/projects/${a.name}:${homePrefix}/.claude/projects/${a.name}`);
   // Shared read-only `skills/` bind mount (#907). Cron yaml prompts
@@ -2542,6 +2551,20 @@ function emitAgentService(
   // operator's umask sidesteps that).
   try {
     mkdirSync(`${probeHome}/.switchroom/audit/${a.name}`, { recursive: true });
+  } catch { /* best-effort */ }
+  // Same trap, shared dir (#3084 follow-up): the blocked-approval surface is
+  // ONE directory written by EVERY agent, and agents run as per-agent non-root
+  // uids (AGENT_UID_MIN = 10001). If docker auto-creates this bind source it is
+  // root:root 0755 and every agent's write EACCESes — the surface that tells
+  // the operator an agent is blocked would be silently empty.
+  //
+  // Pre-create it sticky-world-writable (1777, the /tmp model): each agent
+  // creates and owns its own 0644 <agent>.json, so no agent can modify or
+  // delete another's. mkdirSync's `mode` is masked by umask, so chmod explicitly.
+  try {
+    const blockedDir = `${probeHome}/.switchroom/blocked-approvals`;
+    mkdirSync(blockedDir, { recursive: true });
+    chmodSync(blockedDir, 0o1777);
   } catch { /* best-effort */ }
   // Phase B (switchroom #1163): pre-create the per-agent overlay
   // directory so the agent-config write tools (Phase C) have a writable
