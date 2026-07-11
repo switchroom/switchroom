@@ -159,7 +159,12 @@ export interface SendGateConfig {
   clock?: Clock
   /** Global bucket sustained rate (tokens/sec). Default 25. */
   globalPerSec?: number
-  /** Global burst capacity (headroom under Telegram's ~30/s). Default 5. */
+  /**
+   * Global burst capacity (headroom under Telegram's ~30/s). Default 4.
+   * Worst-case sliding-window admissions = capacity + rate·T, so a full 1s
+   * window admits at most `globalBurst + globalPerSec` = 4 + 25 = 29 < 30 —
+   * a real margin under the ceiling (#3092 M2 residual: burst 5 hit exactly 30).
+   */
   globalBurst?: number
   /** Per-chat sustained rate (tokens/sec). Default 1. */
   perChatPerSec?: number
@@ -332,7 +337,7 @@ export function createSendGate(config: SendGateConfig): SendGate {
   const enabled = config.enabled
   const clock = config.clock ?? systemClock
   const globalPerSec = config.globalPerSec ?? 25
-  const globalBurst = config.globalBurst ?? 5
+  const globalBurst = config.globalBurst ?? 4
   const perChatPerSec = config.perChatPerSec ?? 1
   const perChatBurst = config.perChatBurst ?? 3
   const perGroupPerMin = config.perGroupPerMin ?? 18
@@ -420,7 +425,14 @@ export function createSendGate(config: SendGateConfig): SendGate {
     } else if (scopeKey.startsWith('msg-edit:')) {
       const id = Number(scopeKey.slice('msg-edit:'.length))
       if (Number.isFinite(id)) {
-        const st = messageState(id)
+        // N2: creating a per-message edit state here must go through the same
+        // eviction accounting (maybeEvict / LRU cap) as normal state creation,
+        // so opening many per-message flood windows can't grow perMessage past
+        // the cap.
+        const now = clock.now()
+        const existing = perMessage.get(id)
+        maybeEvict(now, existing === undefined)
+        const st = existing ?? messageState(id)
         if (untilTs > st.suppressedUntilMs) st.suppressedUntilMs = untilTs
       }
     }
@@ -525,6 +537,12 @@ export function createSendGate(config: SendGateConfig): SendGate {
         // is measured from send start (matches the per-message serialization).
         state.lastSentMs = clock.now()
         try {
+          // N3 (liveness): this awaits `p.fn()` with no watchdog. A `fn` that
+          // NEVER settles would keep `state.running` true forever, making the
+          // state unevictable and hanging every coalesced caller. We rely on
+          // the fact that the only production caller is `robustApiCall`, whose
+          // own request/retry timeouts bound every send — so `p.fn()` is
+          // guaranteed to settle. No separate watchdog is needed here.
           const res = await p.fn()
           // M1: only record the payload as on-screen AFTER a successful send,
           // so a FAILED edit can be retried with the same payload (not dropped
@@ -552,14 +570,13 @@ export function createSendGate(config: SendGateConfig): SendGate {
     maybeEvict(now, existing === undefined)
     const state = existing ?? messageState(messageId)
 
-    // No-op skip: identical to the last payload we actually sent → drop.
-    if (hash === state.lastHash) {
-      counters.dropped++
-      return Promise.resolve(undefined as unknown as T)
-    }
-
-    // An edit is already queued for this message → last-write-wins: replace its
-    // payload in place rather than queuing behind it. All callers share the
+    // N1: the coalesce (last-write-wins) check runs BEFORE the no-op skip. When
+    // a distinct edit is already queued, the newest payload always replaces it —
+    // even if that payload reverts to the on-screen one (hash === lastHash).
+    // Otherwise a revert-to-on-screen edit would be dropped as a no-op while the
+    // stale queued edit still rendered, violating last-write-wins. When the
+    // driver dequeues, its own no-op re-check (`p.hash === state.lastHash`) drops
+    // a coalesced revert so nothing needless hits the API. All callers share the
     // single pending promise, which resolves with the coalesced send's result.
     if (state.pending) {
       if (state.pending.hash !== hash) {
@@ -568,6 +585,13 @@ export function createSendGate(config: SendGateConfig): SendGate {
         state.pending.fn = fn as () => Promise<unknown>
       }
       return state.pending.promise as Promise<T>
+    }
+
+    // No edit queued → a repeat of the last payload we actually sent is a plain
+    // no-op skip: drop it before the API.
+    if (hash === state.lastHash) {
+      counters.dropped++
+      return Promise.resolve(undefined as unknown as T)
     }
 
     // Otherwise create a fresh pending edit. If no driver is currently running
@@ -602,8 +626,12 @@ export function createSendGate(config: SendGateConfig): SendGate {
     }
 
     await admit(bucketsFor(opts))
+    // N4: count `sent` only AFTER a successful send, mirroring the edit path
+    // (which increments on success at drive()). A throwing send is not counted
+    // as sent — it propagates without polluting the stat.
+    const res = await fn()
     counters.sent++
-    return fn()
+    return res
   }
 
   function stats(): SendGateStats {

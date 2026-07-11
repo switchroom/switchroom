@@ -274,7 +274,7 @@ describe('send-gate: no-op edit skip', () => {
     expect(gate.stats().global.sent).toBe(1)
   })
 
-  it('drops a repeat of the on-screen payload even while another edit is queued', async () => {
+  it('last write reverting to the on-screen payload wins over a queued distinct edit (N1)', async () => {
     const clock = new FakeClock()
     const { calls, fn } = recorder(clock)
     const gate = createSendGate({ enabled: true, clock, editFloorMs: 1500 })
@@ -282,18 +282,39 @@ describe('send-gate: no-op edit skip', () => {
 
     await gate.gate(fn('A'), { messageId: msg, editPayload: 'A' }) // sends A (on screen)
     const p2 = gate.gate(fn('B'), { messageId: msg, editPayload: 'B' }) // queued within floor
-    // A repeat of the on-screen payload (A) is a no-op → dropped immediately,
-    // and must NOT clobber the genuinely-different queued edit (B).
-    const p3 = await gate.gate(fn('A2'), { messageId: msg, editPayload: 'A' })
-    expect(p3).toBeUndefined()
+    // The genuinely-LAST write reverts to the on-screen payload (A). Under
+    // last-write-wins it must REPLACE the queued distinct edit (B), not be
+    // dropped as a no-op while B still renders. The driver's own no-op re-check
+    // then drops the coalesced revert, so nothing needless hits the API and the
+    // final screen stays A — B never renders.
+    const p3 = gate.gate(fn('A2'), { messageId: msg, editPayload: 'A' })
 
     await clock.advance(1500)
-    await p2
+    await Promise.all([p2, p3])
+    expect(await p2).toBeUndefined()
+    expect(await p3).toBeUndefined()
 
-    // A ran, the no-op repeat dropped, B still sends after the floor.
-    expect(calls.map((c) => c.label)).toEqual(['A', 'B'])
-    expect(gate.stats().global.sent).toBe(2)
+    // Only A ever hit the API; B was superseded by the A-revert and dropped.
+    expect(calls.map((c) => c.label)).toEqual(['A'])
+    expect(gate.stats().global.sent).toBe(1)
     expect(gate.stats().global.dropped).toBe(1)
+    expect(gate.stats().global.coalesced).toBe(1)
+  })
+
+  it('a plain repeat with NO queued edit is dropped immediately as a no-op', async () => {
+    const clock = new FakeClock()
+    const { calls, fn } = recorder(clock)
+    const gate = createSendGate({ enabled: true, clock, editFloorMs: 1500 })
+    const msg = 12
+
+    await gate.gate(fn('A'), { messageId: msg, editPayload: 'A' })
+    await clock.advance(1500) // floor cleared, nothing queued
+
+    const r = await gate.gate(fn('A2'), { messageId: msg, editPayload: 'A' })
+    expect(r).toBeUndefined()
+    expect(calls.map((c) => c.label)).toEqual(['A'])
+    expect(gate.stats().global.dropped).toBe(1)
+    expect(gate.stats().global.sent).toBe(1)
   })
 })
 
@@ -374,6 +395,26 @@ describe('send-gate: error / rejection path (H1, M1)', () => {
   })
 })
 
+describe('send-gate: non-edit send stats (N4)', () => {
+  it('does NOT count a throwing non-edit send as sent', async () => {
+    const clock = new FakeClock()
+    const gate = createSendGate({ enabled: true, clock })
+
+    await expect(
+      gate.gate(async () => {
+        throw new Error('send failed')
+      }),
+    ).rejects.toThrow('send failed')
+
+    // The send threw → it must not pollute the `sent` counter.
+    expect(gate.stats().global.sent).toBe(0)
+
+    // A subsequent SUCCESSFUL send is counted normally.
+    await gate.gate(async () => 'ok')
+    expect(gate.stats().global.sent).toBe(1)
+  })
+})
+
 describe('send-gate: per-message serialization (M3, M4)', () => {
   it('serializes two same-tick edits: one now, one after the floor (M3)', async () => {
     const clock = new FakeClock()
@@ -436,12 +477,13 @@ describe('send-gate: bucket burst math (M2)', () => {
   it('bounds burst to capacity and holds sustained rate at the budget over windows', async () => {
     const clock = new FakeClock()
     const { calls, fn } = recorder(clock)
-    // 25/sec sustained, small burst 5 (headroom under Telegram's ~30/s).
+    // 25/sec sustained, small burst 4 (real headroom under Telegram's ~30/s:
+    // worst-case window = 4 + 25 = 29 < 30).
     const gate = createSendGate({
       enabled: true,
       clock,
       globalPerSec: 25,
-      globalBurst: 5,
+      globalBurst: 4,
       perChatPerSec: 1000,
       perChatBurst: 1000,
     })
@@ -451,7 +493,7 @@ describe('send-gate: bucket burst math (M2)', () => {
     await flush()
 
     // Burst: only `globalBurst` admitted at t=0 — NOT a full window's budget.
-    expect(calls.filter((c) => c.at === 0).length).toBe(5)
+    expect(calls.filter((c) => c.at === 0).length).toBe(4)
 
     await clock.advance(6000)
     await Promise.all(ps)
@@ -464,9 +506,11 @@ describe('send-gate: bucket burst math (M2)', () => {
       maxAny = Math.max(maxAny, inWin)
       if (t >= 1000) maxSustained = Math.max(maxSustained, inWin) // past the burst
     }
-    // Any 1s window ≤ budget + burst (never ~2x the budget); sustained windows
-    // hold to the budget (+1 for a fractional token straddling the edge).
-    expect(maxAny).toBeLessThanOrEqual(25 + 5)
+    // Any 1s window ≤ budget + burst = 29 (never ~2x the budget, and strictly
+    // UNDER Telegram's ~30/s ceiling); sustained windows hold to the budget
+    // (+1 for a fractional token straddling the edge).
+    expect(maxAny).toBeLessThanOrEqual(25 + 4)
+    expect(maxAny).toBeLessThan(30)
     expect(maxSustained).toBeLessThanOrEqual(26)
   })
 
@@ -559,6 +603,18 @@ describe('send-gate: perMessage eviction (H2)', () => {
       await gate.gate(fn('m' + i), { messageId: i, editPayload: 'p' + i })
       await clock.advance(2) // clear the tiny floor so each state is idle/evictable
     }
+    expect(gate.stats().messageStates).toBeLessThanOrEqual(3)
+  })
+
+  it('opening per-message flood windows honours the LRU cap (N2)', async () => {
+    const clock = new FakeClock()
+    const gate = createSendGate({ enabled: true, clock, maxMessageStates: 3 })
+
+    // Each openFloodWindow for a distinct msg-edit scope creates a per-message
+    // state; it must go through the same eviction accounting so the map never
+    // grows past the cap. Windows are in the past so the states stay evictable.
+    for (let i = 0; i < 10; i++) gate.openFloodWindow('msg-edit:' + i, -1)
+
     expect(gate.stats().messageStates).toBeLessThanOrEqual(3)
   })
 })
