@@ -255,6 +255,44 @@ class TestDirectiveDedup(unittest.TestCase):
     def test_empty_rule_is_not_captured(self):
         self.assertFalse(rule_already_captured("", ["Always use British spelling."]))
 
+    # --- #2912: length-aware guard for terse rules -----------------------
+
+    def test_terse_new_rule_not_swallowed_by_long_directive(self):
+        # A genuinely-new terse rule whose few significant tokens all appear
+        # inside a much longer, unrelated directive must NOT be deduped — the
+        # verifier should still re-prompt. Rule tokens {tabs, indentation} are
+        # both present in the long directive, so forward coverage is 1.0, but
+        # they are incidental overlap inside a broader rule.
+        contents = parse_active_directives_block(
+            self._block(
+                "Always use spaces not tabs for indentation and trim "
+                "trailing whitespace on every saved source file."
+            )
+        )
+        self.assertFalse(rule_already_captured("Use tabs for indentation.", contents))
+
+    def test_terse_rule_restating_equally_terse_directive_is_captured(self):
+        # Two comparably terse rules about the same thing → real duplicate.
+        contents = parse_active_directives_block(self._block("Use British spelling."))
+        self.assertTrue(rule_already_captured("Always use British spelling.", contents))
+
+    def test_long_rule_boundary_unchanged_at_0_6(self):
+        # Long rules (>= _SHORT_RULE_TOKEN_LIMIT significant tokens) keep the
+        # plain forward-coverage 0.6 behavior — the guard does not engage.
+        directive = "capital python numeric boolean spelling timezone"
+        # Rule shares 3 of its 5 significant tokens (0.6 exactly) → captured.
+        self.assertTrue(
+            rule_already_captured(
+                "capital python numeric quarterly monthly", [directive]
+            )
+        )
+        # Rule shares 2 of 5 (0.4 < 0.6) → not captured.
+        self.assertFalse(
+            rule_already_captured(
+                "capital python quarterly monthly weekly", [directive]
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
