@@ -18,8 +18,6 @@
  * PURE — no I/O, no clock except the injected `now`. Fully unit-tested.
  */
 
-import { isProbeThin } from "../quota.js";
-
 /**
  * Utilization at/above this on either window is a hard wall. Matches
  * `EXHAUSTION_PCT` in consumer-quota-sensor.ts and `classifyHealth`'s
@@ -162,6 +160,28 @@ export function snapshotWalled(s: QuotaSnapshot): boolean {
 }
 
 /**
+ * Is this snapshot a COMPLETE utilization signal — did the probe actually
+ * measure BOTH windows?
+ *
+ * `parseQuotaHeaders` (quota.ts) coalesces a MISSING window header to `0%` for
+ * back-compat while recording `*UtilPresent === false`. That coalesced `0` is a
+ * FILLER, not a measurement: it is indistinguishable, on the numeric field
+ * alone, from a genuine 0% reading. An unset `*UtilPresent` flag means the
+ * snapshot predates the flag (cached/legacy fixture) and is treated as a real
+ * probe — so completeness keys strictly on `=== false`.
+ *
+ * A PARTIAL probe (one window absent) must never be trusted to (a) rule an
+ * account eligible/servable or (b) self-heal an exhaustion mark on the window
+ * it never measured. Treating the absent window's filler `0%` as healthy
+ * durably re-serves a genuinely weekly-walled account off a probe that never
+ * saw the weekly (7d) window — the F0 inversion this guard exists to prevent.
+ * The absent window is UNKNOWN, not healthy. PURE — no I/O.
+ */
+export function snapshotComplete(s: QuotaSnapshot): boolean {
+  return s.fiveHourUtilPresent !== false && s.sevenDayUtilPresent !== false;
+}
+
+/**
  * Is this account allowed to be served past the utilization wall via Anthropic
  * overage billing? True when ALL of:
  *   1. The account is in the operator's `allow_overage_accounts` opt-in list.
@@ -238,24 +258,47 @@ export function accountEligibility(opts: {
   allowOverage?: boolean;
 }): AccountEligibility {
   const { mark, snapshot, now, allowOverage = false } = opts;
+
+  // F4b — a FRESH snapshot that POSITIVELY shows a hard wall (and is not
+  // overage-lifted) is the strongest live truth there is. It must NOT be
+  // discarded just because a mark carries a newer timestamp but has since
+  // expired: the most-recent-signal-wins branch below skips an older-than-mark
+  // snapshot, and an expired mark yields no block, so the pre-fix path ruled a
+  // genuinely-walled account `unknown` (→ servable). Block on the live wall
+  // directly. Overage-lifted walls fall through to the most-recent-signal-wins
+  // logic so a NEWER `overageStatus:"allowed"` re-probe can still serve past
+  // the wall (that is what overage exists for).
+  if (
+    snapshotFresh(snapshot, now) &&
+    snapshotWalled(snapshot) &&
+    !overageLiftsWall(snapshot, allowOverage)
+  ) {
+    return "blocked";
+  }
+
   if (snapshotFresh(snapshot, now)) {
     const markedAt = mark?.marked_at ?? 0;
     if (snapshot.capturedAt >= markedAt) {
-      // Live truth is the newer signal → it decides, mark ignored. Walled on
-      // util → blocked, UNLESS overage is active for this account (opt-in).
+      // Live truth is the newer signal → it decides, mark ignored.
       if (snapshotWalled(snapshot)) {
-        if (overageLiftsWall(snapshot, allowOverage)) {
-          // The util wall fires but overage is available — account stays eligible.
-          return "eligible";
-        }
+        // Reachable only when overage lifts the wall (the non-lifted fresh wall
+        // already returned 'blocked' above) — the account stays eligible via
+        // Anthropic overage billing.
+        if (overageLiftsWall(snapshot, allowOverage)) return "eligible";
         return "blocked";
       }
-      return "eligible";
+      // F0 — a PARTIAL probe (a window absent, coalesced to a filler 0%) is not
+      // a COMPLETE health signal: it cannot prove the unmeasured window healthy,
+      // so it must NOT rule the account eligible off a window it never saw (e.g.
+      // clearing a weekly 7d wall on a 7d-absent probe). Defer to the mark
+      // instead. A complete probe rules eligible exactly as before.
+      if (snapshotComplete(snapshot)) return "eligible";
     }
   }
-  // No usable live truth (or the mark is newer) → the mark is the only signal.
-  // Unexpired mark → blocked. No mark (or expired) and no fresh snapshot →
-  // unknown: we have ZERO positive evidence, so this is not a hard block.
+  // No usable live truth (or the mark is newer, or the fresh probe was partial)
+  // → the mark is the only signal. Unexpired mark → blocked. No mark (or
+  // expired) and no usable snapshot → unknown: ZERO positive evidence, not a
+  // hard block.
   if (mark !== undefined && mark.exhausted_until > now) return "blocked";
   return "unknown";
 }
@@ -298,12 +341,16 @@ export function snapshotShouldClearMark(
   if (!mark) return false;
   if (!snapshotFresh(snapshot, now)) return false;
   if (snapshot.capturedAt < (mark.marked_at ?? 0)) return false;
-  // #2495 folded nit B — a THIN probe (no util headers, both windows coalesced
-  // to 0) is NOT evidence of health: `snapshotClearlyHealthy` reads it as 0%/0%
-  // and would clear a real exhaustion mark off a headerless response. Refuse to
-  // self-heal a mark on a thin probe; require a probe that actually measured at
-  // least one window before clearing.
-  if (isProbeThin(snapshot)) return false;
+  // F0 (#2495 folded nit B, widened) — a probe that did not measure a window is
+  // NOT evidence that window is healthy: `parseQuotaHeaders` coalesces an absent
+  // header to a filler 0% and `snapshotClearlyHealthy` reads that as 0% < 80% →
+  // "healthy". A THIN probe (both windows absent) OR a PARTIAL probe (one window
+  // absent, e.g. the real "7d missing, 5h present" case) would therefore clear a
+  // genuine exhaustion mark on the window it never saw — durably re-serving a
+  // weekly-walled account. Require a COMPLETE probe (both windows actually
+  // measured) before self-healing a mark. (Completeness subsumes the old thin
+  // check: both-absent is also not complete.)
+  if (!snapshotComplete(snapshot)) return false;
   // out_of_credits is informational (no overage headroom), NOT a serve-block.
   // A 0%-util account with out_of_credits is healthy from a quota standpoint and
   // SHOULD self-heal a misfired mark. The 2026-06-20 guard here was the defect:
@@ -336,8 +383,16 @@ export function clampMarkExpiry(opts: {
   const { proposedUntil, now, shortMs, snapshot } = opts;
   const shortCeil = now + shortMs;
   if (proposedUntil <= shortCeil) return proposedUntil;
+  // F0 — only a probe that ACTUALLY measured the 7-day window can contradict a
+  // weekly wall. A partial probe with the 7d header absent coalesces to a filler
+  // 0% (< WALL_PCT); trusting that would clamp a legitimate gateway-parsed +7d
+  // weekly mark down to 5h off a probe that never saw the weekly window. Require
+  // the 7d window PRESENT before it may disprove the weekly wall; otherwise the
+  // caller's proposed weekly reset is trusted (the #2218 durability path).
   const liveContradictsWeeklyWall =
-    snapshotFresh(snapshot, now) && snapshot.sevenDayUtilizationPct < WALL_PCT;
+    snapshotFresh(snapshot, now) &&
+    snapshot.sevenDayUtilPresent !== false &&
+    snapshot.sevenDayUtilizationPct < WALL_PCT;
   return liveContradictsWeeklyWall ? shortCeil : proposedUntil;
 }
 
