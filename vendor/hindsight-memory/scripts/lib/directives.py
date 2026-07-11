@@ -183,6 +183,27 @@ def parse_active_directives_block(text: str) -> list:
     return contents
 
 
+# Length-aware guard for terse rules (#2912). Forward coverage alone
+# (|rule ∩ directive| / |rule|) is easy to satisfy when the rule has only a
+# couple of significant tokens: any long directive that happens to contain
+# those few words scores ~1.0 and silently swallows a genuinely-new short
+# rule, skipping a legitimate re-prompt. For such short rules we additionally
+# require REVERSE coverage — the matched directive's significant-token set must
+# also be substantially covered by the rule's — which is a Jaccard-style
+# bidirectional check. That fails precisely the "few tokens diluted inside a
+# long unrelated directive" case while still passing a terse rule that restates
+# a comparably terse directive.
+#
+# Constants chosen against the real tokenizer output:
+#   - < 4 significant tokens is "short" (1-3 tokens: the regime where a single
+#     incidental word swings forward coverage past 0.6).
+#   - reverse coverage >= 0.5 keeps near-equal-size restatements deduped
+#     (e.g. a 2-token rule vs a 4-token directive → 2/4 = 0.5) but rejects a
+#     2-token rule diluted inside a 6+-token directive (2/6 ≈ 0.33 < 0.5).
+_SHORT_RULE_TOKEN_LIMIT = 4
+_SHORT_RULE_REVERSE_COVERAGE = 0.5
+
+
 def rule_already_captured(
     rule_text: str, directive_contents: list, threshold: float = 0.6
 ) -> bool:
@@ -193,15 +214,29 @@ def rule_already_captured(
     best-matching directive. A high coverage ratio means the restated rule adds
     (almost) no new significant words over one already stored — i.e. a
     duplicate. Deterministic; no model/API call.
+
+    For terse rules (fewer than ``_SHORT_RULE_TOKEN_LIMIT`` significant tokens)
+    forward coverage is not sufficient — see the module comment above — so a
+    reverse-coverage guard is also required before declaring a match.
     """
     rule_tokens = _dedup_tokens(rule_text)
     if not rule_tokens:
         return False
+    is_short_rule = len(rule_tokens) < _SHORT_RULE_TOKEN_LIMIT
     for content in directive_contents:
         d_tokens = _dedup_tokens(content)
         if not d_tokens:
             continue
-        covered = len(rule_tokens & d_tokens) / len(rule_tokens)
-        if covered >= threshold:
-            return True
+        intersection = len(rule_tokens & d_tokens)
+        covered = intersection / len(rule_tokens)
+        if covered < threshold:
+            continue
+        if is_short_rule:
+            # Bidirectional guard: the directive must not be much larger than
+            # the rule, or those few shared tokens are incidental overlap
+            # rather than a true restatement.
+            reverse_covered = intersection / len(d_tokens)
+            if reverse_covered < _SHORT_RULE_REVERSE_COVERAGE:
+                continue
+        return True
     return False
