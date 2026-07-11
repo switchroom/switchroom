@@ -118,12 +118,27 @@ function smallestCircularGap(minutes: number[]): number {
  *
  * Returns 0 when the expression has fewer than 5 fields or the minute field
  * is unparseable / out of range ("unknown → pass through"). Otherwise the
- * smallest circular gap over the hour (single value → 60, hourly).
+ * smallest circular gap over the hour (single value → 60, hourly), except
+ * for the pure `*\/S` form which returns its nominal step S (see below).
  */
 export function cronMinuteSmallestGapMin(expr: string): number {
   const fields = expr.trim().split(/\s+/);
   if (fields.length < 5) return 0;
-  const minutes = expandMinuteField(fields[0]);
+  const minuteField = fields[0];
+
+  // Pure `*/S` keeps its long-standing NOMINAL semantics: return S, not the
+  // set-expansion circular gap. For steps that don't divide 60 (`*/7`,
+  // `*/8`, `*/14`), expansion would find one short wraparound seam per hour
+  // (e.g. `*/7` → …,56 → next hour's minute 0 = gap 4) and wrongly reject a
+  // cadence both call sites have always accepted. That single sub-S seam is
+  // not what the floor polices. Deliberate — see PR #3063 review.
+  const pureStep = minuteField.match(/^\*\/(\d+)$/);
+  if (pureStep) {
+    const s = Number(pureStep[1]);
+    return s > 0 && s <= 59 ? s : 0;
+  }
+
+  const minutes = expandMinuteField(minuteField);
   if (minutes === null) return 0;
   return smallestCircularGap(minutes);
 }

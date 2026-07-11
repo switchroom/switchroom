@@ -8,6 +8,8 @@ describe("cronMinuteSmallestGapMin (#1783)", () => {
     ["every minute `*`", "* * * * *", 1],
     ["stepped `*/5`", "*/5 * * * *", 5],
     ["stepped `*/4`", "*/4 * * * *", 4],
+    ["stepped `*/7` → nominal 7, not the 56→00 wraparound seam (4)", "*/7 * * * *", 7],
+    ["stepped `*/14` → nominal 14", "*/14 * * * *", 14],
     ["single value `15` → hourly", "15 * * * *", 60],
     ["CSV `0,1,2`", "0,1,2 * * * *", 1],
     ["CSV `0,30`", "0,30 * * * *", 30],

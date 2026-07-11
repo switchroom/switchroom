@@ -124,6 +124,7 @@ describe("scheduleAdd — security gates", () => {
     ["`0,30` (30-min)", "0,30 * * * *"],
     ["`*/5` (== floor)", "*/5 * * * *"],
     ["single minute `15` (hourly)", "15 * * * *"],
+    ["`*/7` (nominal 7 ≥ floor; wraparound seam not policed)", "*/7 * * * *"],
   ])("accepts at-or-above-floor cadence %s (#1783)", (_label, cronExpr) => {
     const r = scheduleAdd({ cronExpr, prompt: "fine", root });
     expect(r.ok).toBe(true);

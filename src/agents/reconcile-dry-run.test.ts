@@ -22,6 +22,7 @@ describe("violatesMinInterval (#1783)", () => {
     ["`0,30` (30-min)", "0,30 * * * *"],
     ["`*/5` (== floor)", "*/5 * * * *"],
     ["single minute `15` (hourly)", "15 * * * *"],
+    ["`*/7` (nominal 7 ≥ floor; wraparound seam not policed)", "*/7 * * * *"],
     ["daily `0 9 * * *`", "0 9 * * *"],
   ])("accepts at-or-above-floor cadence: %s", (_label, expr) => {
     expect(violatesMinInterval(expr)).toBe(false);
