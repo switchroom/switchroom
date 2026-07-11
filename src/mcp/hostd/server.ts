@@ -93,6 +93,8 @@ interface ToolArgs {
   // config_propose_edit args
   unified_diff?: string;
   target_path?: string;
+  // get_status per-request lookup (#2560)
+  request_id?: string;
 }
 
 /** Semver-only pin matcher for the rollout verb (#2487). Rejects `sha-…`
@@ -354,7 +356,8 @@ export const TOOLS = [
       "container restarts on the target image (~30-60s blip on this MCP " +
       "socket), then the roll resumes AUTOMATICALLY under the SAME " +
       "request_id — do NOT re-issue the rollout during the blip; poll " +
-      "get_status with the returned request_id once the socket is back. " +
+      "get_status (pass the returned request_id as its `request_id` " +
+      "argument) once the socket is back. " +
       "The web refresh stays DEFERRED on this path; the terminal warnings " +
       "name exactly what is still on the prior version (web, host operator " +
       "CLI) and the host-side commands to finish. By default downgrade pins " +
@@ -366,8 +369,8 @@ export const TOOLS = [
       "ALWAYS pass a one-line `reason` explaining why you're rolling the " +
       "fleet to this pin; it renders on the card's `why:` line so the " +
       "operator can decide in context. " +
-      "Returns `started`; poll get_status for the structured outcome " +
-      "(which agents rolled / where it stopped).",
+      "Returns `started`; poll get_status with `request_id` for the " +
+      "structured outcome (which agents rolled / where it stopped).",
     inputSchema: {
       type: "object" as const,
       required: ["pin"],
@@ -482,15 +485,36 @@ export const TOOLS = [
   {
     name: "get_status",
     description:
-      "Read the most recent terminal `update_apply` audit row " +
+      "Look up the status of a prior async fleet mutation. With " +
+      "`request_id` (the id echoed by rollout / update_apply / " +
+      "agent_restart etc.), asks the host-control daemon for that " +
+      "specific request's live status — for an in-flight `rollout` " +
+      "this is the ONLY way to see progress: the response payload " +
+      "carries the current phase, n/m counters, rolled[] agents, " +
+      "failedStep/failedAgent and pin, and it keeps working across a " +
+      "hostd self-bump/restart via the durable audit-log fallback. " +
+      "This is the tool the `rollout` description tells you to poll " +
+      "with the returned request_id. Without `request_id`, falls back " +
+      "to reading the most recent terminal `update_apply` audit row " +
       "(channel, pin, resolved_sha, install_context, result, " +
-      "exit_code, stderr_tail). Use this after issuing an " +
-      "`update_apply` to confirm what actually rolled out, or to " +
-      "report the last update on demand. Returns the parsed audit " +
-      "entry as JSON.",
+      "exit_code, stderr_tail) — use that no-arg form only to report " +
+      "the last blunt update on demand; it CANNOT see rollouts or " +
+      "in-flight work. Read-only; returns JSON.",
     inputSchema: {
       type: "object" as const,
-      properties: {},
+      properties: {
+        request_id: {
+          type: "string",
+          minLength: 1,
+          maxLength: 128,
+          description:
+            "The request_id returned by a prior mutating verb " +
+            "(e.g. `mcp-rollout-…`). When set, the daemon returns " +
+            "that request's rich per-request status (phase, n/m, " +
+            "rolled agents, outcome). Omit to read the last " +
+            "terminal update_apply audit row instead.",
+        },
+      },
       additionalProperties: false,
     },
   },
@@ -510,10 +534,14 @@ export async function dispatchTool(
   content: { type: "text"; text: string }[];
   isError?: boolean;
 }> {
-  // `get_status` reads the audit log directly — no hostd RPC, so it
-  // doesn't need SWITCHROOM_AGENT_NAME or the socket. Handle it
-  // before the wire-checks below.
-  if (name === "get_status") {
+  // No-arg `get_status` reads the audit log directly — no hostd RPC,
+  // so it doesn't need SWITCHROOM_AGENT_NAME or the socket. Handle it
+  // before the wire-checks below. WITH a `request_id` it falls through
+  // to the switch and RPCs hostd's wire-level get_status like every
+  // other verb — that path returns the rich per-request status
+  // (rollout phase / n / m / rolled[] etc., #2560) which the audit-log
+  // shortcut cannot see.
+  if (name === "get_status" && !args.request_id) {
     return getLastUpdateApplyStatus();
   }
 
@@ -682,6 +710,20 @@ export async function dispatchTool(
       };
       break;
     }
+    case "get_status": {
+      // Reached only when args.request_id is set (the no-arg form
+      // short-circuits to the audit-log read above).
+      if (typeof args.request_id !== "string" || !args.request_id) {
+        return errorText("get_status: request_id must be a non-empty string");
+      }
+      req = {
+        v: 1,
+        op: "get_status",
+        request_id: makeRequestId("mcp-get-status"),
+        args: { target_request_id: args.request_id },
+      };
+      break;
+    }
     case "config_propose_edit": {
       // Argument shape validated here before hitting the wire so the
       // disabled-path response is clearly the daemon's, not a
@@ -783,7 +825,8 @@ export function resolveAuditLogPath(): string {
 }
 
 /**
- * Dispatch handler for the `get_status` MCP tool. Reads the audit log
+ * Dispatch handler for the NO-ARG form of the `get_status` MCP tool
+ * (the `request_id` form RPCs hostd instead). Reads the audit log
  * and returns the most recent terminal `update_apply` row as JSON. No
  * hostd RPC needed — the audit log is the durable record.
  *
