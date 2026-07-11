@@ -2232,6 +2232,47 @@ export class HostdServer {
   }
 
   /**
+   * Target guard for the two docker-shell verbs (agent_logs /
+   * agent_exec). Both build the target as `switchroom-${name}` and run
+   * `docker logs`/`docker exec` on it, so `name` MUST be a CONFIGURED
+   * AGENT. Without this an admin caller (checkGate lets an admin target
+   * any name) could pass a SINGLETON service name — `vault-broker`,
+   * `approval-kernel`, `hostd`, `web` — each of which runs as root with
+   * the vault store + /etc/machine-id mounted, and read vault key
+   * material via `docker exec`/`docker logs`. There is no legitimate
+   * agent_exec/agent_logs use case for the singleton containers; the
+   * trust model assumes the target is a peer AGENT container.
+   *
+   * `this.opts.agentUids` is the daemon's configured-agent registry
+   * (name → UID), built at startup from `Object.keys(config.agents)`
+   * (see main.ts) and binding one socket per configured agent — it does
+   * NOT contain any singleton service name. Self-target still passes (a
+   * caller's own name is always in the set); a real peer agent still
+   * passes; only unconfigured names (singletons, typos) are rejected.
+   * Returns a `denied` response to short-circuit the handler, or null
+   * when the target is a configured agent.
+   */
+  private rejectUnconfiguredTarget(
+    name: string,
+    request_id: string,
+    op: string,
+    started: number,
+  ): HostdResponse | null {
+    if (Object.prototype.hasOwnProperty.call(this.opts.agentUids, name)) {
+      return null;
+    }
+    return deniedResponse(
+      request_id,
+      `${op}: "${name}" is not a configured agent. ` +
+        `${op} targets only peer agent containers (switchroom-<agent>); ` +
+        `singleton service containers (vault-broker, approval-kernel, ` +
+        `hostd, web) and unknown names are rejected. Configured agents: ` +
+        `${Object.keys(this.opts.agentUids).sort().join(", ")}.`,
+      Date.now() - started,
+    );
+  }
+
+  /**
    * `docker logs --tail <n> <container>` — synchronous read of a peer
    * container's combined stdout/stderr. The default container name in
    * the switchroom compose project is `switchroom-<agent>`; we shell
@@ -2246,6 +2287,13 @@ export class HostdServer {
     started: number,
   ): Promise<HostdResponse> {
     const tailLines = req.args.tail ?? 100;
+    const rejected = this.rejectUnconfiguredTarget(
+      req.args.name,
+      req.request_id,
+      "agent_logs",
+      started,
+    );
+    if (rejected) return rejected;
     const container = `switchroom-${req.args.name}`;
     const res = await this.runDocker([
       "logs",
@@ -2303,6 +2351,13 @@ export class HostdServer {
         Date.now() - started,
       );
     }
+    const rejected = this.rejectUnconfiguredTarget(
+      req.args.name,
+      req.request_id,
+      "agent_exec",
+      started,
+    );
+    if (rejected) return rejected;
     const container = `switchroom-${req.args.name}`;
     // No `--`. Unlike `docker run`, `docker exec` stops parsing its
     // OWN options at CONTAINER: every token after the container name
