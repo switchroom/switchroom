@@ -201,6 +201,37 @@ interface NotificationClaims {
 const NOTIFICATION_CLAIM_MAX_AGE_MS = 86_400_000;
 
 /**
+ * Record of the most recent BROKER-INITIATED fleet roll (proactive
+ * `fleetQuotaProbeTick` failover — hard-exhaustion or soft-avoid). Exposed
+ * via `list-state` as `last_fleet_roll` so gateways can announce the roll to
+ * the operator (the announcement/dedup channel is #3031 PR 3). Deliberately
+ * NOT written by the reactive `mark-exhausted` op: the gateway that 429'd
+ * already announces that swap itself, so recording it here would
+ * double-announce. Persisted as `last-fleet-roll.json` so a broker restart
+ * inside a gateway's poll interval doesn't drop the announcement.
+ */
+export interface LastFleetRoll {
+  /** Account the fleet rolled off (the exhausted/soft-avoided ex-serving). */
+  from: string;
+  /** Account the fleet rolled to. */
+  to: string;
+  /** Unix ms the roll happened (broker clock). */
+  at: number;
+  /** Unix ms the walled account's mark expires, when known. */
+  exhausted_until?: number;
+  /** Which window bound the roll decision, when known. */
+  window?: "5h" | "7d";
+  /** Utilization pct of the binding window at roll time, when known. */
+  pct?: number;
+  /**
+   * Trigger attribution (#3031 PR 2): "hard-exhaustion" = the probe saw a
+   * genuine quota wall (mark + roll, possibly promote); "soft-avoid" = a
+   * serving-preference roll off the soft-avoid tier (no mark, no promote).
+   */
+  reason?: "soft-avoid" | "hard-exhaustion";
+}
+
+/**
  * #2495 Change 2 — probe-on-open TTL. A `probe-quota` request whose cached
  * snapshot is younger than this serves the cache instead of paying for a live
  * upstream call. 45s is short enough that an opened /auth or /usage card is
@@ -428,6 +459,9 @@ export class AuthBroker {
   /** Fleet notification-dedup claims: key → unix-ms of last grant.
    *  Persisted so a broker restart inside the window stays closed. */
   private notificationClaims: NotificationClaims = {};
+  /** Most recent broker-initiated proactive fleet roll (see LastFleetRoll).
+   *  Persisted so a restart doesn't drop a pending announcement. */
+  private lastFleetRoll: LastFleetRoll | null = null;
   /** Last `expiresAt` the broker wrote per label — drives threshold-violation. */
   private lastWrittenExpiresAt = new Map<string, number | undefined>();
   /** Refresh leases held while a POST is in flight (in-process). */
@@ -1194,6 +1228,15 @@ export class AuthBroker {
    *  probe after a broker restart — the durable quota cache reseeds it). */
   private softAvoidState: Record<string, SoftAvoidState> = {};
 
+  /**
+   * Per-label memo of the last probe-tick soft-avoid roll target (PR 2 of
+   * #3031). Dedupes the fanout + audit across ticks while the preference is
+   * unchanged — NOT hysteresis (flap-safety is `isAccountSoftAvoided`'s
+   * enter/exit latch); this only stops an identical roll from re-auditing
+   * every tick. Cleared when the tier releases or the target degrades.
+   */
+  private softAvoidRolledTo: Record<string, string> = {};
+
   /** View a cached quota entry through the soft-avoid snapshot shape (reset
    *  ISO strings → unix-ms epochs the pure layer compares). */
   private softAvoidSnapshotOf(account: string): SoftAvoidSnapshot | undefined {
@@ -1215,11 +1258,11 @@ export class AuthBroker {
    * the config knob is unset (the no-behavior-change guarantee).
    * Overage-lifted accounts are never soft-avoided.
    *
-   * DELIBERATE (PR 1/4 scope): a soft-avoid tier FLIP does not proactively
-   * fan out credential mirrors to agents — agents pick up the preference on
-   * their next broker read (get-credentials / refresh-tick fanout, which
-   * already routes through accountWithFailover). Probe-tick-driven rolls +
-   * announcements are PR 2 of the #3031 plan; do not add fanout here.
+   * A soft-avoid tier FLIP still does not fan out from HERE — this stays a
+   * pure predicate. The probe-tick-driven push (PR 2 of #3031) lives in
+   * `softAvoidProbeRoll`, called from `fleetQuotaProbeTick`; the pull paths
+   * (get-credentials / refresh-tick fanout) already route through
+   * accountWithFailover. Announcements/notifications are PR 3.
    */
   private isAccountSoftAvoided(account: string): boolean {
     const pct = this.config.auth?.proactive_failover_pct;
@@ -1607,6 +1650,9 @@ export class AuthBroker {
         agents,
         consumers,
         active_overage_serving,
+        // #3031 — most recent broker-initiated proactive roll, so gateways
+        // can announce it (null until the first proactive roll).
+        last_fleet_roll: this.lastFleetRoll,
       }),
     );
   }
@@ -1822,6 +1868,12 @@ export class AuthBroker {
    * any fallback's window refills.
    */
   async fleetQuotaProbeTick(): Promise<void> {
+    // Phase 1 — probe + cache EVERY account before acting. The act phase
+    // (hard-exhaustion roll / soft-avoid serving roll) compares the probed
+    // account against its fallback candidates; acting mid-scan would rank
+    // candidates the loop simply hadn't reached yet (stale/absent snapshots)
+    // — most visibly on the boot tick, where nothing is cached at all.
+    const probed: Array<{ label: string; result: QuotaResult }> = [];
     for (const label of listAccounts(this.home)) {
       const creds = readAccountCredentials(label, this.home);
       const token = creds?.claudeAiOauth?.accessToken;
@@ -1834,18 +1886,157 @@ export class AuthBroker {
         continue;
       }
       this.cacheQuotaSnapshot(label, result);
+      probed.push({ label, result });
+    }
+    // Phase 2 — act on the fleet ACTIVE and on PINNED agent accounts.
+    for (const { label, result } of probed) {
       // Re-read active each iteration: a promote earlier in this loop moves it.
       const active = this.config.auth?.active;
-      if (label !== active) continue;
+      // PR 2 of #3031 — the probe acts on PINNED agent accounts too (the
+      // consumerQuotaProbeTick analog for `auth.override`): a pin is a
+      // PRIMARY, not a hard pin, so a pinned agent whose account walls (or
+      // enters the soft-avoid tier) fails over the same way the fleet
+      // active does. Non-active, non-pinned labels stay probe-only.
+      const isPinnedAgentAccount = this.pinnedAgentAccounts().has(label);
+      if (label !== active && !isPinnedAgentAccount) continue;
       const decision = quotaIndicatesExhaustion(result, this.isOverageAllowed(label));
-      if (!decision.exhausted) continue;
-      process.stdout.write(
-        `auth-broker: fleet-quota-probe shows ACTIVE ${label} exhausted — proactive failover\n`,
-      );
-      // Audit parity with the consumer sensor: a proactive mark leaves a
-      // durable audit record, not just a stdout line (#2845 review nit).
-      this.audit({ op: "mark-exhausted", identity: { kind: "operator" }, account: label, accountKind: "claude", ok: true });
-      await this.markExhaustedAndRoll(label, decision.until ?? undefined, { kind: "operator" });
+      if (decision.exhausted) {
+        process.stdout.write(
+          `auth-broker: fleet-quota-probe shows ${label === active ? "ACTIVE" : "PINNED"} ${label} exhausted — proactive failover\n`,
+        );
+        // Audit parity with the consumer sensor: a proactive mark leaves a
+        // durable audit record, not just a stdout line (#2845 review nit).
+        this.audit({ op: "mark-exhausted", identity: { kind: "operator" }, account: label, accountKind: "claude", ok: true, reason: "hard-exhaustion" });
+        // Pinned accounts share the exact roll core: mark + mirror-fanout to
+        // every agent whose raw effective account is `label`. The durable
+        // auto-promote inside is self-gating (`auth.active === account`), so
+        // a pinned-only wall never mutates the fleet active.
+        const { rolledTo } = await this.markExhaustedAndRoll(label, decision.until ?? undefined, { kind: "operator" });
+        // Record the broker-initiated FLEET roll so gateways can announce it
+        // (list-state `last_fleet_roll`; announcement channel is #3031 PR 3).
+        // Only when a target was actually found (an all-blocked no-roll is
+        // the fleet-all-exhausted alert's domain) and only for the fleet
+        // ACTIVE — a pinned-only roll is not a fleet roll and must not
+        // overwrite a pending fleet announcement (it stays audit-only).
+        if (rolledTo && label === active) {
+          this.recordFleetRoll(label, rolledTo, "hard-exhaustion", decision.until ?? undefined);
+        }
+        continue;
+      }
+      // PR 2 of #3031 — not hard-walled: act on the soft-avoid PREFERENCE
+      // tier with a serving-preference roll (mirror push only — no mark, no
+      // durable promote). Structurally a no-op while
+      // `auth.proactive_failover_pct` is unset.
+      this.softAvoidProbeRoll(label);
+    }
+  }
+
+  /**
+   * Write + persist the `last_fleet_roll` record for a broker-initiated
+   * proactive roll of the fleet ACTIVE (`fleetQuotaProbeTick` hard-exhaustion
+   * or soft-avoid path). Gateways read it from `list-state` and announce it
+   * to the operator with claim-notification dedup (#3031 PR 3) — this is the
+   * ONLY notification surface PR 2 touches; the roll stays silent here.
+   * Window/pct attribution comes from the snapshot the tick just cached.
+   */
+  private recordFleetRoll(
+    from: string,
+    to: string,
+    reason: "soft-avoid" | "hard-exhaustion",
+    exhaustedUntil?: number,
+  ): void {
+    const s = this.lastQuotaCache[from];
+    this.lastFleetRoll = {
+      from,
+      to,
+      at: this.now(),
+      reason,
+      ...(exhaustedUntil != null ? { exhausted_until: exhaustedUntil } : {}),
+      ...(s
+        ? {
+            window:
+              s.fiveHourUtilizationPct >= s.sevenDayUtilizationPct
+                ? ("5h" as const)
+                : ("7d" as const),
+            pct: Math.max(s.fiveHourUtilizationPct, s.sevenDayUtilizationPct),
+          }
+        : {}),
+    };
+    this.persistLastFleetRoll();
+  }
+
+  /** Every account some agent is pinned to via per-agent `auth.override`. */
+  private pinnedAgentAccounts(): Set<string> {
+    return new Set(
+      Object.values(this.config.agents ?? {})
+        .map((a) => a.auth?.override)
+        .filter((x): x is string => typeof x === "string" && x.length > 0),
+    );
+  }
+
+  /**
+   * PR 2 of #3031 — probe-tick-driven SERVING-preference roll off a
+   * soft-avoided account (`label` is the fleet active or a pinned agent's
+   * override). When the account sits in the soft-avoid tier AND a strictly
+   * better candidate exists — non-exhausted, NOT itself soft-avoided, with
+   * stored credentials (exactly the pass-1 preference `accountWithFailover`
+   * applies) — push the failover credentials NOW via the same mirror
+   * mechanism the hard-exhaustion roll uses (`fanoutFailoverTo` +
+   * `fanoutToAffectedConsumers`), instead of waiting for each agent's next
+   * credential read.
+   *
+   * Deliberately NOT the hard-exhaustion path:
+   *  - NO exhaustion mark — the account still serves, and attribution
+   *    (`callerAccount` / mark-exhausted) is untouched;
+   *  - NO durable promote of `auth.active` and NO `active-override.json`
+   *    write — the yaml-drift/override semantics are untouched, and the
+   *    preference self-reverts (via the normal refresh-tick fanout, which
+   *    routes through accountWithFailover) once the tier's exit hysteresis
+   *    releases;
+   *  - flap-safety is `isAccountSoftAvoided`'s enter/exit latch — no new
+   *    hysteresis here. `softAvoidRolledTo` only dedupes an identical
+   *    roll's fanout + audit across consecutive ticks.
+   *
+   * When every serveable candidate is soft-avoided too (no strictly better
+   * candidate), this does NOT roll — the least-utilized ranking inside
+   * `accountWithFailover` still shapes pull-path serving, but a proactive
+   * push on a utilization tie-break would ping-pong as scores drift.
+   *
+   * Notification/messaging is PR 3 — this stays silent beyond the audit
+   * record and a stdout line.
+   */
+  private softAvoidProbeRoll(label: string): void {
+    if (!this.isAccountSoftAvoided(label)) {
+      delete this.softAvoidRolledTo[label]; // tier released → memo reset
+      return;
+    }
+    const target = this.accountWithFailover(label);
+    if (!target || target === label || this.isAccountSoftAvoided(target)) {
+      // No strictly-better candidate: don't roll. Clear the memo so a later
+      // genuine improvement (a fallback dropping out of the tier) re-rolls.
+      delete this.softAvoidRolledTo[label];
+      return;
+    }
+    if (this.softAvoidRolledTo[label] === target) return; // already pushed
+    this.softAvoidRolledTo[label] = target;
+    process.stdout.write(
+      `auth-broker: fleet-quota-probe shows ${label} soft-avoided (≥ auth.proactive_failover_pct) — serving-preference roll → ${target}\n`,
+    );
+    // Same audit shape as the probe's hard-exhaustion roll; `reason`
+    // distinguishes the trigger (#3031 PR 2 deliverable).
+    this.audit({ op: "proactive-roll", identity: { kind: "operator" }, account: label, accountKind: "claude", ok: true, reason: "soft-avoid" });
+    // Same mirror mechanism as the hard-exhaustion roll: `target`'s creds
+    // onto every agent whose raw effective account (override ?? active) is
+    // `label` — fleet-active riders and pinned agents alike…
+    this.fanoutFailoverTo(label, target);
+    // …and push consumers bound to `label` (their serving path is already
+    // soft-avoid-aware; this removes the pull-loop latency).
+    this.fanoutToAffectedConsumers(label);
+    // Fleet-ACTIVE rolls ride the `last_fleet_roll` announcement channel
+    // (#3031 PR 3); a pinned-only roll stays audit-only so it can't
+    // overwrite a pending fleet announcement.
+    if (label === this.config.auth?.active) {
+      this.recordFleetRoll(label, target, "soft-avoid");
     }
   }
 
@@ -2198,6 +2389,7 @@ export class AuthBroker {
     // left over from a previously-removed account of the same name (or a
     // replace) belongs to the old credentials, not these.
     delete this.softAvoidState[label];
+    delete this.softAvoidRolledTo[label];
     // #1447 (WS1-F1): broker runs as root in production (auth-broker
     // container) and the writes above leave the dir + files root:root.
     // The operator's CLI then can't read them — chown back to the
@@ -2257,6 +2449,7 @@ export class AuthBroker {
     // Soft-avoid hysteresis is per-label in-memory state — prune it with the
     // account so a later re-add of the same label starts with a clean latch.
     delete this.softAvoidState[label];
+    delete this.softAvoidRolledTo[label];
     this.persistShaIndex();
     this.persistQuota();
     this.persistThresholdViolations();
@@ -3296,6 +3489,7 @@ export class AuthBroker {
     this.shaIndex = this.readJson<ShaIndex>("sha-index.json") ?? {};
     this.thresholdViolations = this.readJson<ThresholdViolations>("threshold-violations.json") ?? {};
     this.notificationClaims = this.readJson<NotificationClaims>("notification-claims.json") ?? {};
+    this.lastFleetRoll = this.readJson<LastFleetRoll>("last-fleet-roll.json") ?? null;
     // #2495 Change 1 — reload the durable utilization cache so a restart
     // serves last-known (age-stamped) quota, not a blank card.
     this.lastQuotaCache = this.readJson<LastQuotaCache>("last-quota.json") ?? {};
@@ -3364,6 +3558,7 @@ export class AuthBroker {
    *  a broker restart. Same atomic-write pattern as the exhaustion ledger. */
   private persistLastQuotaCache(): void { atomicWriteJsonSync(join(this.stateDir, "last-quota.json"), this.lastQuotaCache, 0o600); }
   private persistNotificationClaims(): void { atomicWriteJsonSync(join(this.stateDir, "notification-claims.json"), this.notificationClaims, 0o600); }
+  private persistLastFleetRoll(): void { if (this.lastFleetRoll) atomicWriteJsonSync(join(this.stateDir, "last-fleet-roll.json"), this.lastFleetRoll, 0o600); }
   private persistShaIndex(): void { atomicWriteJsonSync(join(this.stateDir, "sha-index.json"), this.shaIndex, 0o600); }
   private persistThresholdViolations(): void { atomicWriteJsonSync(join(this.stateDir, "threshold-violations.json"), this.thresholdViolations, 0o600); }
 
@@ -3423,6 +3618,13 @@ export class AuthBroker {
     ok: boolean;
     error?: string;
     replace?: boolean;
+    /**
+     * Trigger attribution for probe-driven failover rolls (#3031 PR 2):
+     *   "soft-avoid"       — serving-preference roll off the soft-avoid tier
+     *   "hard-exhaustion"  — the probe saw a genuine quota wall
+     * Omitted for every other op.
+     */
+    reason?: "soft-avoid" | "hard-exhaustion";
   }): void {
     const peer =
       entry.identity.kind === "operator"
@@ -3437,6 +3639,7 @@ export class AuthBroker {
       ok: entry.ok,
       error: entry.error,
       replace: entry.replace,
+      reason: entry.reason,
     });
     const auditPath = join(this.stateDir, "audit.jsonl");
     try {

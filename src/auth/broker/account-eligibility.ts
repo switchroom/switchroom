@@ -462,7 +462,18 @@ export function evaluateSoftAvoid(opts: {
   const fiveTriggered = five >= thresholds.fiveHour;
   const sevenTriggered = seven >= thresholds.sevenDay;
   if (fiveTriggered || sevenTriggered) {
-    return nextState(true, { fiveHour: fiveTriggered, sevenDay: sevenTriggered });
+    // Re-entry while already latched: UNION with the previous attribution.
+    // A window that latched earlier and hasn't released must keep requiring
+    // release — overwriting with only the currently-over-threshold window(s)
+    // would let the OTHER window's ~5h reset clear a still-hot latch
+    // (PR-1 review carry-over, #3032).
+    const prevTrig = prev?.softAvoided
+      ? (prev.triggeredBy ?? { fiveHour: true, sevenDay: true })
+      : undefined;
+    return nextState(true, {
+      fiveHour: fiveTriggered || (prevTrig?.fiveHour ?? false),
+      sevenDay: sevenTriggered || (prevTrig?.sevenDay ?? false),
+    });
   }
 
   if (prev?.softAvoided) {
