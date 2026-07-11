@@ -12,10 +12,12 @@
  * ## Threat model
  *
  * What this protects against:
- *   - **Disk theft.** The encryption key is derived from /etc/machine-id,
- *     which is per-machine and not stored on the data disk in a portable
- *     form. An attacker who steals just the disk image (or copies the home
- *     directory) cannot decrypt the auto-unlock blob on a different machine.
+ *   - **Theft of the home directory alone.** The encryption key is derived
+ *     from /etc/machine-id, which is per-machine and lives under /etc — not
+ *     inside the home directory. An attacker who copies only the home dir
+ *     (or a home-scoped file-level backup that excludes /etc) cannot decrypt
+ *     the auto-unlock blob on a different machine. NOTE: this holds only when
+ *     machine-id is left behind — see "Combined-backup exfiltration" below.
  *   - **Casual snooping by other UNIX users on the same box.** The blob
  *     lives at mode 0600 in the user's home; only the owning user (and root)
  *     can read it.
@@ -26,6 +28,13 @@
  *     ssh-agent, gnome-keyring, systemd-creds host scope).
  *   - **The user account being compromised.** Same as the vault itself —
  *     the attacker who can read your home can read the vault.
+ *   - **Combined-backup exfiltration.** Machine-binding defends only against
+ *     theft of the home directory *alone*. Any single artifact that captures
+ *     BOTH /etc/machine-id and the blob — a full-disk image, a full-system
+ *     backup, `rsync -a /` — carries the key material with it, so the blob is
+ *     decryptable off-box and reduces to passphrase-only protection. Scope
+ *     off-box backups accordingly: exclude ~/.switchroom/vault-auto-unlock or
+ *     /etc/machine-id, or treat any such backup as passphrase-protected only.
  *
  * Why machine-id and not TPM? TPM2 sealing is stronger, but it's also
  * fragile across kernel updates, firmware changes, and bare-metal moves —
