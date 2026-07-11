@@ -447,8 +447,11 @@ export function registerAgentConfigCommands(program: Command): void {
       try {
         path = opts.file ?? findConfigFile();
       } catch (err) {
-        process.stderr.write(`${(err as ConfigError).message}\n`);
-        for (const d of (err as ConfigError).details ?? []) {
+        // Same machine-parseable shape as a failed validation: an
+        // `INVALID:` first line, then message + details.
+        if (!(err instanceof ConfigError)) throw err;
+        process.stderr.write(`INVALID: switchroom.yaml not found\n${err.message}\n`);
+        for (const d of err.details ?? []) {
           process.stderr.write(`${d}\n`);
         }
         process.exit(1);

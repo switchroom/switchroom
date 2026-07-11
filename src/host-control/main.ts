@@ -24,7 +24,11 @@ import { homedir } from "node:os";
 import { existsSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { ConfigError, findConfigFile, loadConfig } from "../config/loader.js";
-import { waitForConfigRecovery } from "./config-degraded.js";
+import {
+  postOperatorNoticeViaGateways,
+  waitForConfigRecovery,
+  type GatewayCandidate,
+} from "./config-degraded.js";
 import { allocateAgentUid } from "../agents/compose.js";
 import { HostdServer } from "./server.js";
 import { SocketApprovalGateway } from "./approval-gateway.js";
@@ -64,39 +68,39 @@ async function loadConfigResilient(): Promise<
     }
     // Notification transport: we cannot read the config, so we don't know
     // which agents exist or who is admin. Best-effort fallback: scan the
-    // agents dir for ANY live gateway IPC socket and post ONE plain
-    // operator-DM through the first (alphabetically — deterministic). The
-    // gateway fences delivery to its own operator chat, so this cannot
-    // leak outside the operator.
+    // agents dir for gateway IPC socket paths (sorted — deterministic) and
+    // post ONE plain operator-DM through the FIRST that actually accepts
+    // the connection — a socket inode existing does not prove a listener
+    // (a crashed gateway leaves it behind), so candidates are tried in
+    // order until one takes the write. The gateway fences delivery to its
+    // own operator chat, so this cannot leak outside the operator.
     const agentsDir =
       process.env.SWITCHROOM_AGENTS_DIR ??
       join(homedir(), ".switchroom", "agents");
-    const findAnyGateway = (): { agent: string; sock: string } | null => {
+    const listGatewayCandidates = (): GatewayCandidate[] => {
+      const out: GatewayCandidate[] = [];
       try {
         for (const name of readdirSync(agentsDir).sort()) {
           const sock = resolve(agentsDir, name, "telegram", "gateway.sock");
-          if (existsSync(sock)) return { agent: name, sock };
+          if (existsSync(sock)) out.push({ agent: name, sock });
         }
       } catch {
         /* agents dir unreadable — marker file is the fallback signal */
       }
-      return null;
+      return out;
+    };
+    const log = (m: string): void => {
+      process.stderr.write(`hostd: ${m}\n`);
     };
     const notify = (text: string): void => {
-      const gw = findAnyGateway();
-      if (!gw) {
-        process.stderr.write(
-          "hostd: config-degraded — no reachable gateway socket; relying on marker file\n",
-        );
+      const candidates = listGatewayCandidates();
+      if (candidates.length === 0) {
+        log("config-degraded: no gateway socket paths found; relying on marker file");
         return;
       }
-      new SocketRolloutRelay({
-        resolveGatewaySocket: (n) => (n === gw.agent ? gw.sock : null),
-        log: (m) => process.stderr.write(`hostd: config-degraded relay — ${m}\n`),
-      }).postTerminal({
-        requestId: "config-degraded",
-        agentName: gw.agent,
-        text,
+      // Fire-and-forget: the recovery wait must never block on a chat send.
+      void postOperatorNoticeViaGateways(candidates, text, log).then((agent) => {
+        if (agent !== null) log(`config-degraded: operator DM relayed via ${agent}`);
       });
     };
     return waitForConfigRecovery({
@@ -105,7 +109,7 @@ async function loadConfigResilient(): Promise<
       loadFn: () => loadConfig(),
       configPath,
       notify,
-      log: (m) => process.stderr.write(`hostd: ${m}\n`),
+      log,
     });
   }
 }

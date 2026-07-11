@@ -20,9 +20,12 @@ import { ConfigError } from "../config/loader.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 import {
   CONFIG_DEGRADED_MARKER_FILENAME,
+  MAX_PRESERVED_DEGRADED_MS,
   buildDegradedMarker,
   formatDegradedNotice,
   formatRecoveredNotice,
+  postOperatorNoticeViaGateways,
+  readDegradedSince,
   shiftPendingRolloutMarker,
   waitForConfigRecovery,
 } from "./config-degraded.js";
@@ -96,9 +99,28 @@ describe("notices", () => {
     expect(text).toContain("switchroom config check");
   });
 
-  it("recovered notice mentions a preserved rollout only when there is one", () => {
-    expect(formatRecoveredNotice(120_000, true)).toContain("self-bump rollout");
-    expect(formatRecoveredNotice(120_000, false)).not.toContain("self-bump");
+  it("recovered notice states pin + marker age for a preserved rollout, and nothing when there is none", () => {
+    const preserved = formatRecoveredNotice(120_000, {
+      pin: "v9.9.9",
+      ageMs: 6 * 60_000,
+      preserved: true,
+    });
+    expect(preserved).toContain("v9.9.9");
+    expect(preserved).toContain("6m old");
+    expect(preserved).toContain("will resume now");
+    expect(formatRecoveredNotice(120_000, null)).not.toContain("self-bump");
+  });
+
+  it("recovered notice warns with pin + age when the roll was NOT preserved (cap exceeded)", () => {
+    const text = formatRecoveredNotice(5 * 3_600_000, {
+      pin: "v9.9.9",
+      ageMs: 5 * 3_600_000 + 6 * 60_000,
+      preserved: false,
+    });
+    expect(text).toContain("NOT auto-resumed");
+    expect(text).toContain("v9.9.9");
+    expect(text).toContain("preservation cap");
+    expect(text).toContain("re-run");
   });
 
   it("buildDegradedMarker captures error + details + since", () => {
@@ -109,6 +131,55 @@ describe("notices", () => {
       error: "boom",
       details: ["  d1"],
     });
+  });
+});
+
+describe("postOperatorNoticeViaGateways", () => {
+  it("skips a dead socket path and delivers via the first LIVE listener", async () => {
+    const { createServer } = await import("node:net");
+    const dir = makeHome();
+    const deadSock = join(dir, "dead.sock");
+    writeFileSync(deadSock, ""); // inode exists, nobody listening
+    const liveSock = join(dir, "live.sock");
+    const received: string[] = [];
+    const server = createServer((conn) => {
+      conn.on("data", (d) => received.push(d.toString()));
+    });
+    await new Promise<void>((r) => server.listen(liveSock, r));
+    try {
+      const via = await postOperatorNoticeViaGateways(
+        [
+          { agent: "aaa-dead", sock: deadSock },
+          { agent: "bbb-live", sock: liveSock },
+        ],
+        "hello operator",
+        () => {},
+        500,
+      );
+      expect(via).toBe("bbb-live");
+      // Give the server loop a beat to flush the data event.
+      await new Promise((r) => setTimeout(r, 50));
+      const line = JSON.parse(received.join("").trim()) as Record<string, unknown>;
+      expect(line.type).toBe("rollout_status_post");
+      expect(line.agentName).toBe("bbb-live");
+      expect(line.text).toBe("hello operator");
+    } finally {
+      server.close();
+    }
+  });
+
+  it("returns null (and never throws) when every candidate is dead", async () => {
+    const dir = makeHome();
+    const via = await postOperatorNoticeViaGateways(
+      [
+        { agent: "x", sock: join(dir, "nope.sock") },
+        { agent: "y", sock: join(dir, "also-nope.sock") },
+      ],
+      "hello",
+      () => {},
+      200,
+    );
+    expect(via).toBeNull();
   });
 });
 
@@ -156,6 +227,7 @@ describe("waitForConfigRecovery", () => {
     expect(notices[0]).toContain("DEGRADED");
     expect(notices[1]).toContain("normal service resumed");
     expect(notices[1]).toContain("self-bump rollout");
+    expect(notices[1]).toContain("v9.9.9"); // the pin, so the operator can intervene
     // The pending rollout marker is STILL FRESH at the recovered "now",
     // despite 30 simulated minutes of outage + 5 min of pre-outage age —
     // i.e. the degraded window did not count against the resume cutoff.
@@ -191,6 +263,89 @@ describe("waitForConfigRecovery", () => {
     const parsed = JSON.parse(markerContentWhileDegraded) as { error: string; details: string[] };
     expect(parsed.error).toBe("Invalid YAML in /y.yaml");
     expect(parsed.details).toEqual(["  dup key"]);
+    expect(existsSync(degradedPath)).toBe(false);
+  });
+
+  it("does NOT preserve a pending rollout past the degraded-window cap, and says so with pin + age", async () => {
+    const home = makeHome();
+    const hostdDir = join(home, ".switchroom", "hostd");
+    mkdirSync(hostdDir, { recursive: true });
+    let clock = Date.parse("2026-07-11T12:00:00.000Z");
+    const pendingPath = join(hostdDir, SELF_BUMP_MARKER_FILENAME);
+    const originalRaw = encodePendingRolloutMarker(makeMarker(clock - 5 * 60_000));
+    writeFileSync(pendingPath, originalRaw);
+
+    const notices: string[] = [];
+    let attempts = 0;
+    await waitForConfigRecovery({
+      initialError: new ConfigError("bad yaml"),
+      homeDir: home,
+      loadFn: () => {
+        attempts += 1;
+        clock += 100 * 60_000; // 3 ticks = 5h simulated outage (> 4h cap)
+        if (attempts < 3) throw new ConfigError("still broken");
+        return fakeConfig;
+      },
+      notify: (t) => notices.push(t),
+      log: () => {},
+      retryMs: 10,
+      nowFn: () => clock,
+    });
+
+    // Sanity: this outage exceeds the preservation cap.
+    expect(300 * 60_000).toBeGreaterThan(MAX_PRESERVED_DEGRADED_MS);
+    // Marker untouched — created_at NOT shifted — so the boot-resume
+    // freshness check treats it as stale and the roll does not auto-resume.
+    expect(readFileSync(pendingPath, "utf8")).toBe(originalRaw);
+    const marker = parsePendingRolloutMarker(readFileSync(pendingPath, "utf8"));
+    expect(isMarkerFresh(marker!, clock)).toBe(false);
+    // The operator is told exactly what was dropped and can intervene.
+    expect(notices[1]).toContain("NOT auto-resumed");
+    expect(notices[1]).toContain("v9.9.9");
+    expect(notices[1]).toContain("preservation cap");
+  });
+
+  it("credits degraded time from the PERSISTED epoch when hostd died while degraded", async () => {
+    const home = makeHome();
+    const hostdDir = join(home, ".switchroom", "hostd");
+    mkdirSync(hostdDir, { recursive: true });
+    let clock = Date.parse("2026-07-11T12:00:00.000Z");
+    // A previous hostd entered degraded mode 30 min ago, wrote the marker,
+    // then died (docker restart). The pending rollout marker dates from
+    // that entry — 30 min old, i.e. ALREADY past the 15-min cutoff if the
+    // new process only credited its own in-memory window.
+    const degradedPath = join(hostdDir, CONFIG_DEGRADED_MARKER_FILENAME);
+    writeFileSync(
+      degradedPath,
+      JSON.stringify({ v: 1, since: new Date(clock - 30 * 60_000).toISOString(), error: "bad yaml" }),
+    );
+    const pendingPath = join(hostdDir, SELF_BUMP_MARKER_FILENAME);
+    writeFileSync(pendingPath, encodePendingRolloutMarker(makeMarker(clock - 30 * 60_000)));
+    expect(readDegradedSince(degradedPath)).toBe(clock - 30 * 60_000);
+
+    let first = true;
+    await waitForConfigRecovery({
+      initialError: new ConfigError("bad yaml"),
+      homeDir: home,
+      loadFn: () => {
+        if (first) {
+          first = false;
+          clock += 60_000; // this process itself is degraded for only ~1 min
+          throw new ConfigError("still broken");
+        }
+        return fakeConfig;
+      },
+      notify: () => {},
+      log: () => {},
+      retryMs: 10,
+      nowFn: () => clock,
+    });
+
+    // The full 31-min window (persisted 30 min + 1 min in-process) was
+    // credited: the marker is FRESH at recovery. With only the in-memory
+    // 1-min credit it would be 30 min old — stale.
+    const preserved = parsePendingRolloutMarker(readFileSync(pendingPath, "utf8"));
+    expect(isMarkerFresh(preserved!, clock)).toBe(true);
     expect(existsSync(degradedPath)).toBe(false);
   });
 
