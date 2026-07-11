@@ -5367,12 +5367,23 @@ const swallowingApiCall = createSwallowingRetryApiCall(
  * immediately instead of sleeping out a 4-hour retry_after. The swallowing
  * wrapper logs and drops the failure.
  */
-// No `log` hook: retryApiCall's flood line reads "waiting Ns", which would be
-// a lie here — we never wait, we drop. The callsite logs the drop itself.
+// No `log` hook: retryApiCall's flood line reads "waiting Ns", which would be a
+// lie here — we never wait, we drop. And the error the caller finally sees is
+// `retryApiCall: max retries exceeded` (retry-api-call.ts replaces the original
+// on give-up), which would hide the retry_after — the single number an operator
+// needs during a flood ban. So the honest 429 line is written HERE, in the
+// onFloodWait hook, where the real retry_after is still in hand.
+const recordTypingFloodWait = makeFloodWaitRecorder(FLOOD_STATE_PATH)
 const nonEssentialApiCall = createRetryApiCall({
   maxRetries: 1,
   sleep: async () => {},
-  onFloodWait: makeFloodWaitRecorder(FLOOD_STATE_PATH),
+  onFloodWait: (retryAfterSec) => {
+    recordTypingFloodWait(retryAfterSec)
+    process.stderr.write(
+      `telegram gateway: 429 flood-wait on a NON-ESSENTIAL send (retry_after=${retryAfterSec}s) — ` +
+        `recorded to the flood breaker; the send is DROPPED, not retried (#3084)\n`,
+    )
+  },
 })
 
 // ─── Typing indicator ─────────────────────────────────────────────────────
@@ -5421,8 +5432,16 @@ type ChatAction = typeof CHAT_ACTION_WHITELIST extends Set<infer T> ? T : never
  * what decouples the typing rate from the agent's TOOL-CALL rate — the
  * regression that earned a 4.6-hour flood ban. A cold start (no ping inside
  * the floor) still fires instantly, so "typing…" lands the moment a turn
- * begins; only redundant restarts are dropped. And while a flood window is
- * open, typing — non-essential by definition — is not emitted at all.
+ * begins; only redundant restarts are dropped — and a dropped tick arms a
+ * coalesced catch-up, so the indicator never goes dark for longer than the
+ * floor. While a flood window is open, typing — non-essential by definition —
+ * is not emitted at all.
+ *
+ * (`sendChatAction` is outside `check-bot-api-wrapping`'s pattern by design —
+ * chat actions take no `message_thread_id`, so they were never in the
+ * THREAD_NOT_FOUND blast radius the guard polices. It's routed through the
+ * retry module anyway, because that is where the flood breaker's `onFloodWait`
+ * hook lives and typing is the largest 429 source there is.)
  */
 const typingEmitter = createTypingEmitter({
   chatKey: (chat_id, thread_id) => chatKey(chat_id, thread_id) as string,
@@ -5430,7 +5449,6 @@ const typingEmitter = createTypingEmitter({
   send: (chat_id, thread_id, action) => {
     const sendOpts = thread_id != null ? { message_thread_id: thread_id } : undefined
     void nonEssentialApiCall(
-      // allow-raw-bot-api: routed through nonEssentialApiCall — records a 429 to the flood breaker (#2923) and NEVER retries (a retried typing ping is what feeds a ban, #3084).
       () => bot.api.sendChatAction(chat_id, action as ChatAction, sendOpts),
       { chat_id, verb: 'sendChatAction' },
     ).then(
@@ -5448,8 +5466,12 @@ const typingEmitter = createTypingEmitter({
           typingRetryTimers.set(key, retry)
           return
         }
-        // Everything else (including a 429 — already recorded to the flood
-        // breaker by onFloodWait) is DROPPED, never retried. Logged so the
+        // A 429 already logged its retry_after (and hit the breaker) in
+        // onFloodWait above; by the time it lands here retryApiCall has
+        // replaced it with the opaque give-up error, so don't double-log a
+        // line that names neither the code nor the retry_after.
+        if (msg.includes('max retries exceeded')) return
+        // Everything else is DROPPED, never retried — but logged, so the
         // largest outbound emitter is no longer silent (#3084).
         process.stderr.write(
           `telegram gateway: sendChatAction dropped (non-essential, not retried): ${msg}\n`,
@@ -5524,6 +5546,11 @@ function startTurnTypingLoop(chat_id: string, thread_id: number | null = null): 
 
 function stopTurnTypingLoop(chat_id: string, thread_id: number | null = null): void {
   turnTypingLoop.stop(chat_id, thread_id)
+  // Canonical turn-end: cancel any catch-up the floor armed, so a tick dropped
+  // in the last seconds of the turn can't resurrect "typing…" after the reply
+  // has landed. Deliberately NOT done in `stopTypingLoop` — the tool loop stops
+  // on every tool result, which is exactly the churn the catch-up covers.
+  typingEmitter.cancelPending(chat_id, thread_id)
 }
 
 const typingWrapper = createTypingWrapper({
@@ -9844,7 +9871,12 @@ const ipcServer: IpcServer = createIpcServer({
       // hits the canonical turn-end stop, leaving a stale "typing…" until the
       // next turn. Sweep every live loop here (gated to registered-agent
       // disconnect inside flushOnAgentDisconnect).
-      stopTurnTypingLoops: () => turnTypingLoop.stopAll(),
+      stopTurnTypingLoops: () => {
+        turnTypingLoop.stopAll()
+        // Shutdown drain: also cancel every armed catch-up so no typing ping
+        // fires after the gateway has stopped.
+        typingEmitter.reset()
+      },
       // When dangling activeTurnStartedAt keys were swept (setDone raced
       // disconnect), the module-scope `currentTurn` may also point at the
       // dead bridge's turn. Null it so the next inbound starts a fresh
