@@ -74,3 +74,84 @@ export function decidePinAction(
   // re-pins the new one on the next reconcile.
   return { kind: 'unpin', messageId: prev.messageId }
 }
+
+/** Extract a lowercased human description from any thrown value, preferring
+ *  grammy's structured `.description` (the wire text Telegram returned) and
+ *  falling back to `.message` / String(). Kept dependency-free — matches on
+ *  the wire text, never on a grammy class import. */
+function errorDescription(err: unknown): string {
+  if (err != null && typeof err === 'object') {
+    const o = err as { description?: unknown; message?: unknown }
+    if (typeof o.description === 'string' && o.description.length > 0) {
+      return o.description.toLowerCase()
+    }
+    if (typeof o.message === 'string' && o.message.length > 0) {
+      return o.message.toLowerCase()
+    }
+  }
+  return String(err).toLowerCase()
+}
+
+/**
+ * True when a pin/unpin failure is the PERMANENT "the bot lacks pin rights in
+ * this chat" class — Telegram returns this as a 400 (not a 403):
+ * "not enough rights to manage pinned messages in the chat". This is the one
+ * error class that will NOT self-heal on retry: the bot is simply not an admin
+ * (or lacks the "Pin messages" right) in that supergroup, and every subsequent
+ * pin attempt in the same chat fails identically until an admin grants the
+ * right (which only takes effect after a gateway restart re-reads chat perms).
+ *
+ * Transient classes (429 flood-wait, 5xx, network HttpError) are deliberately
+ * EXCLUDED — they must keep the existing retry behaviour, never enter the
+ * negative cache. Only this permanent-rights class is cacheable.
+ *
+ * The single source of truth for the pin-rights concept: the gateway's
+ * `unhandled-rejection-policy.ts` and the various edit-error classifiers each
+ * fold `not enough rights` into a broader boolean for their own purpose; this
+ * is the one helper dedicated to the pin negative-cache decision.
+ */
+export function isPinRightsError(err: unknown): boolean {
+  return errorDescription(err).includes('not enough rights')
+}
+
+/**
+ * Per-process, per-chat negative cache for chats the bot cannot pin in.
+ *
+ * When an auto status-pin attempt fails with the permanent pin-rights 400
+ * (`isPinRightsError`), the chat is recorded here as pin-incapable so the
+ * driver skips every subsequent auto-pin attempt in that chat — no wasted API
+ * call, no repeated `status-pin pin failed` log line (issue #3024: marko logged
+ * 41 identical pin-rights rejections in 48h, one per attempt).
+ *
+ * Deliberately IN-MEMORY / per-boot only: pin rights may be granted later, and
+ * Telegram surfaces the new permission to the bot only on a fresh chat-member
+ * fetch — a gateway restart. Clearing the cache on restart is therefore the
+ * correct re-enable trigger. An explicit `pin_message` tool success in a chat
+ * also clears its entry (rights were granted mid-session).
+ *
+ * Scope: the AUTO status-pin path only. The explicit `pin_message` MCP tool
+ * never consults this cache — it always attempts and surfaces the error to the
+ * agent as a normal tool error.
+ */
+export class PinRightsCache {
+  private readonly blocked = new Set<string>()
+
+  /** True when auto-pin should be skipped for this chat (already known bad). */
+  isBlocked(chatId: string): boolean {
+    return this.blocked.has(chatId)
+  }
+
+  /** Record a chat as pin-incapable. Returns `true` only the FIRST time a chat
+   *  is added, so the caller can log the warn line exactly once per chat. */
+  block(chatId: string): boolean {
+    if (this.blocked.has(chatId)) return false
+    this.blocked.add(chatId)
+    return true
+  }
+
+  /** Forget a chat (rights re-granted, e.g. an explicit pin later succeeded).
+   *  Returns `true` if an entry was actually removed. */
+  clear(chatId: string): boolean {
+    return this.blocked.delete(chatId)
+  }
+}

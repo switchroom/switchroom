@@ -29,8 +29,8 @@
  * job spec.
  */
 
-import type { PinState, DesiredPin } from './status-pin.js'
-import { decidePinAction } from './status-pin.js'
+import type { PinState, DesiredPin, PinRightsCache } from './status-pin.js'
+import { decidePinAction, isPinRightsError } from './status-pin.js'
 
 /** Minimal subset of grammy's `bot.api` the pin driver depends on.
  *  Lets tests swap in a fake without dragging in the full Bot type. */
@@ -55,6 +55,16 @@ export interface ReconcilePinArgs {
   desired: DesiredPin
   /** Optional API-failure observer. Default: silent. */
   onError?: (phase: 'pin' | 'unpin', err: unknown) => void
+  /** Optional per-process rights-aware negative cache (issue #3024). When a
+   *  pin attempt fails with the permanent "not enough rights" 400, the chat is
+   *  recorded and all subsequent pin attempts in it are skipped (no API call,
+   *  no log). Omit to disable the cache entirely (the pre-#3024 behaviour). */
+  rightsCache?: PinRightsCache
+  /** Called EXACTLY ONCE per chat, the first time that chat is recorded as
+   *  pin-incapable. Lets the caller emit a single warn line instead of the
+   *  per-attempt `status-pin pin failed` spam. Only fires when `rightsCache`
+   *  is supplied. */
+  onPinRightsDisabled?: (chatId: string) => void
 }
 
 /**
@@ -77,10 +87,15 @@ export async function reconcilePin(
   if (action.kind === 'noop') return args.prevState
 
   if (action.kind === 'unpin') {
-    try {
-      await args.api.unpinChatMessage(args.chatId, action.messageId)
-    } catch (err) {
-      args.onError?.('unpin', err)
+    // Skip the unpin API call in a chat the bot can't manage pins in — the
+    // call would fail with the same rights 400 and spam the log. The claim is
+    // dropped either way (below), so skipping is safe.
+    if (!args.rightsCache?.isBlocked(args.chatId)) {
+      try {
+        await args.api.unpinChatMessage(args.chatId, action.messageId)
+      } catch (err) {
+        args.onError?.('unpin', err)
+      }
     }
     // Drop the claim regardless of the unpin outcome. A stuck claim would
     // leave a permanent pin on a crash / out-of-band unpin — the exact
@@ -89,14 +104,33 @@ export async function reconcilePin(
   }
 
   // action.kind === 'pin' — pin an EXISTING message, silently.
+  // Rights-aware negative cache (issue #3024): if a prior attempt in this chat
+  // already failed with the permanent "not enough rights" 400, skip silently —
+  // no API call, no log. Don't claim the message (the pin never happened), so a
+  // later reconcile after a restart (cache cleared) can retry.
+  if (args.rightsCache?.isBlocked(args.chatId)) {
+    return args.prevState
+  }
   try {
     await args.api.pinChatMessage(args.chatId, action.messageId, {
       disable_notification: true,
     })
   } catch (err) {
-    args.onError?.('pin', err)
+    // A permanent pin-rights failure enters the negative cache and logs ONCE
+    // (via onPinRightsDisabled) — every subsequent attempt in this chat is then
+    // skipped above. Transient failures (429 / 5xx / network) are NOT cached
+    // and route through onError as before, preserving retry behaviour.
+    if (args.rightsCache && isPinRightsError(err)) {
+      const firstTime = args.rightsCache.block(args.chatId)
+      if (firstTime) args.onPinRightsDisabled?.(args.chatId)
+    } else {
+      args.onError?.('pin', err)
+    }
     // Don't claim a message we failed to pin — the next reconcile retries.
     return args.prevState
   }
+  // Pin succeeded — if this chat was previously cached as pin-incapable, rights
+  // were granted since; forget it so we resume normal behaviour immediately.
+  args.rightsCache?.clear(args.chatId)
   return { messageId: action.messageId }
 }
