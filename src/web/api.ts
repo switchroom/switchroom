@@ -31,6 +31,11 @@ import {
   getHindsightStatus,
 } from "../setup/hindsight.js";
 import {
+  formatBlockedFor,
+  handleGetBlockedApprovals,
+  type BlockedApproval,
+} from "./blocked-approvals-read.js";
+import {
   defaultAuditLogPath,
   readAndFilter,
   type AuditEntry,
@@ -2243,6 +2248,12 @@ export interface SummaryDashboard {
    *  Memory tab uses. Powers the "needs attention" memory rows. null when
    *  hindsight was unreachable / the producer threw. */
   memoryHealth: MemoryHealth | null;
+  /** Agents held on an approval that could not be delivered to Telegram.
+   *  Always an array — honest empty `[]` when nothing is blocked (and while
+   *  the gateway-side record producer is not yet deployed). Powers the
+   *  Summary "needs attention" rows and the blocked count on the services
+   *  rail: a held agent must be visible WITHOUT Telegram. */
+  blockedApprovals: BlockedApproval[];
   /** Server-derived triage list — the things that genuinely need the
    *  operator's eye right now, sorted critical→warn→info and capped. Empty
    *  when nothing is wrong. Each item points at the tab to investigate. */
@@ -2262,7 +2273,7 @@ export interface AttentionItem {
   severity: "critical" | "warn" | "info";
   title: string;
   detail?: string;
-  tab: "memory" | "accounts" | "schedule" | "system" | "agents";
+  tab: "memory" | "accounts" | "schedule" | "system" | "agents" | "approvals";
 }
 
 /** Severity ordering for the triage sort — lower sorts first. */
@@ -2291,10 +2302,34 @@ export function deriveAttention(
     schedule?: ScheduleDashboard | null;
     systemHealth?: SystemHealth | null;
     agents?: AgentInfo[] | null;
+    blockedApprovals?: BlockedApproval[] | null;
   },
   now: number,
 ): AttentionItem[] {
   const items: AttentionItem[] = [];
+
+  // ── blocked approvals ────────────────────────────────────────────────
+  // An agent held on an approval that could not be delivered to Telegram.
+  // It HOLDS (never auto-approves, never auto-denies), so it will wait
+  // indefinitely — which is only safe if the operator can SEE it. This row
+  // is the Telegram-independent surface: it must show up on the default tab
+  // without anyone going looking (#3084 — overlord sat blocked 50 minutes
+  // behind a flood ban and nobody knew).
+  for (const b of parts.blockedApprovals ?? []) {
+    if (!b) continue;
+    const held = formatBlockedFor(now - b.blockedSince);
+    const what = b.action?.trim() || b.toolName || "an approval";
+    const retry =
+      typeof b.retryableAt === "number" && b.retryableAt > now
+        ? ` Retry in ${formatBlockedFor(b.retryableAt - now)}.`
+        : "";
+    items.push({
+      severity: "critical",
+      title: `${b.agent} — blocked ${held}`,
+      detail: `Waiting on approval to ${what}. Could not deliver the card (${b.reason}).${retry}`,
+      tab: "approvals",
+    });
+  }
 
   // ── memory ───────────────────────────────────────────────────────────
   const mem = parts.memoryHealth;
@@ -2435,6 +2470,12 @@ export async function handleGetSummary(
     schedule: () => Promise<SummaryPart<ScheduleDashboard>>;
     accounts: () => Promise<SummaryPart<AccountDashboardInfo[]>>;
     memoryHealth: () => Promise<SummaryPart<MemoryHealth>>;
+    /** Blocked approvals — a plain local dir read, not a cached host
+     *  round-trip, so it takes no `SummaryPart` stamp and never gates the
+     *  summary's freshness. Defaults to the real reader: the dangerous
+     *  failure here is a held agent going SILENTLY invisible, so the
+     *  default must be "wired", not "empty". Injectable for tests. */
+    blockedApprovals?: () => BlockedApproval[];
   },
   now: number = Date.now(),
 ): Promise<SummaryDashboard> {
@@ -2467,6 +2508,17 @@ export async function handleGetSummary(
     .filter((d): d is number => typeof d === "number");
   const dataAsOf = stamps.length > 0 ? Math.min(...stamps) : 0;
 
+  // Blocked approvals: a local 0644-file read that already degrades to `[]`
+  // on every failure. Wrapped anyway so it can never take the summary down —
+  // the surface that makes a held agent visible must itself be unkillable.
+  let blockedApprovals: BlockedApproval[] = [];
+  try {
+    blockedApprovals =
+      (deps.blockedApprovals ?? handleGetBlockedApprovals)() ?? [];
+  } catch {
+    blockedApprovals = [];
+  }
+
   // Server-side triage from the parts already aggregated — pure derivation,
   // no extra reads. Each null part simply contributes nothing.
   const attention = deriveAttention(
@@ -2476,6 +2528,7 @@ export async function handleGetSummary(
       schedule: schedule.value,
       systemHealth: systemHealth.value,
       agents: agents.value,
+      blockedApprovals,
     },
     now,
   );
@@ -2487,6 +2540,7 @@ export async function handleGetSummary(
     schedule: schedule.value,
     accounts: accounts.value,
     memoryHealth: memoryHealth.value,
+    blockedApprovals,
     attention,
     dataAsOf,
   };

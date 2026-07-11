@@ -1685,12 +1685,15 @@
       const safe = (p, fallback) =>
         p.then(r => r.ok ? r.json() : fallback).catch(() => fallback);
       try {
-        const [approvals, grants] = await Promise.all([
+        const [blocked, approvals, grants] = await Promise.all([
+          // Blocked approvals lead the tab — an agent held with no way to ask
+          // is the only thing here that is actively costing the operator.
+          safe(fetch(`${API}/api/blocked-approvals`, { headers: authHeaders() }), []),
           safe(fetch(`${API}/api/approvals`, { headers: authHeaders() }), null),
           safe(fetch(`${API}/api/grants`, { headers: authHeaders() }),
             { reachable: false, grants: [], error: 'Failed to fetch standing grants.' }),
         ]);
-        renderApprovals(approvals, grants);
+        renderApprovals(blocked, approvals, grants);
         clearError();
       } catch (err) {
         showError(`Failed to fetch approvals: ${err.message}`);
@@ -2063,6 +2066,11 @@
       const apprReachable = !!(appr && appr.reachable !== false);
       const apprDecisions = (appr && appr.decisions) || [];
       const activeGrants = apprDecisions.filter(x => !x.revoked_at && !(x.ttl_expires_at && x.ttl_expires_at < Date.now())).length;
+      // Agents HELD on an approval that couldn't be delivered to Telegram.
+      // Surfaced twice on purpose: as critical rows in "Needs attention"
+      // above (server-derived), and as a count here — a blocked agent must be
+      // visible on the default tab without drilling in (#3084).
+      const blockedAppr = Array.isArray(summary.blockedApprovals) ? summary.blockedApprovals : [];
       const schedEntries = (sched && Array.isArray(sched.entries)) ? sched.entries : [];
       const schedAgents = new Set(schedEntries.map(e => e.agent)).size;
       const services = [
@@ -2070,7 +2078,12 @@
         svc('hindsight', !!hs.running, hs.running ? `${escapeHtml(hs.model || '?')} · ${hs.mcpStateless ? 'stateless' : 'stateful'}` : 'not running'),
         svc('hostd', !!hd.auditLogPresent, hd.auditLogPresent ? `${(hd.recent || []).length} recent verbs` : 'no audit log'),
         svc('schedule', schedEntries.length > 0, `${schedEntries.length} crons · ${schedAgents} agents`),
-        svc('approvals', apprReachable, apprReachable ? `${activeGrants} active grants` : 'unreachable'),
+        // A blocked agent makes this service NOT ok, however reachable the
+        // kernel is — the leash is jammed and someone is waiting on Ken.
+        svc('approvals', apprReachable && blockedAppr.length === 0,
+          blockedAppr.length > 0
+            ? `<b>${blockedAppr.length} agent${blockedAppr.length === 1 ? '' : 's'} blocked</b> — ${escapeHtml(blockedAppr.map(b => b.agent).join(', '))}`
+            : apprReachable ? `${activeGrants} active grants · none blocked` : 'unreachable'),
       ].join('');
 
       el.innerHTML = `
@@ -2079,7 +2092,7 @@
         <div class="sm-attn-list">${attnHtml}</div>
         <div class="sm-band">Fleet vitals</div>
         <div class="sm-vitals">${agentsCard}${quotaCard}</div>
-        <div class="sm-band">Services <span class="n">all nominal</span></div>
+        <div class="sm-band">Services <span class="n">${blockedAppr.length > 0 ? `${blockedAppr.length} blocked on approval` : 'all nominal'}</span></div>
         <div class="sm-services">${services}</div>`;
     }
 
@@ -3137,15 +3150,84 @@
       container.innerHTML = degradedBanner + truncatedNote + posture + cards;
     }
 
-    function renderApprovals(data, grants) {
+    function renderApprovals(blocked, data, grants) {
       const container = document.getElementById('approvals');
-      // Two independent sections: the operator's REAL standing capability
-      // grants (broker grants DB — the actually-useful one), then the
-      // kernel decision ledger (honestly empty on most installs). They
-      // degrade independently — one being unreachable never blanks the
-      // other.
+      // Three independent sections, most-urgent first: agents HELD on an
+      // approval they couldn't deliver (the only live, costing thing here),
+      // then the operator's REAL standing capability grants (broker grants
+      // DB), then the kernel decision ledger (honestly empty on most
+      // installs). They degrade independently — one being unreachable never
+      // blanks the others.
       container.innerHTML =
-        renderStandingGrants(grants) + renderApprovalDecisions(data);
+        renderBlockedApprovals(blocked) +
+        renderStandingGrants(grants) +
+        renderApprovalDecisions(data);
+    }
+
+    // Humanized hold duration. Mirrors formatBlockedFor() in
+    // src/web/blocked-approvals-read.ts so the Summary row and this table
+    // read identically ("blocked 47m"). Clamps a future timestamp to 0.
+    function formatBlockedFor(ms) {
+      const t = Math.max(0, Math.floor(ms / 1000));
+      if (t < 60) return `${t}s`;
+      const m = Math.floor(t / 60);
+      if (m < 60) return `${m}m`;
+      const h = Math.floor(m / 60);
+      if (h < 24) return (m % 60 > 0) ? `${h}h ${m % 60}m` : `${h}h`;
+      const d = Math.floor(h / 24);
+      return (h % 24 > 0) ? `${d}d ${h % 24}h` : `${d}d`;
+    }
+
+    // Agents held on an approval whose card could not be delivered to
+    // Telegram (flood ban, API outage). The agent HOLDS — it never
+    // auto-approves and never auto-denies — so it waits indefinitely. This
+    // section is the whole point: a held agent has to be SEEN here, not
+    // discovered an hour later (#3084).
+    //
+    // The record is metadata only; it never carries the raw tool input, and
+    // the server hard-whitelists the fields. Empty is stated plainly rather
+    // than implying health we haven't verified.
+    function renderBlockedApprovals(blocked) {
+      const dim = (s) => `<span style="color:var(--text-dim)">${escapeHtml(s)}</span>`;
+      const rows = Array.isArray(blocked) ? blocked : [];
+      const heading = `<h3 style="margin:0 0 0.5rem;font-size:0.95rem">Blocked approvals${rows.length ? ` <span class="usage-pill primary">${rows.length}</span>` : ''}</h3>`;
+      if (rows.length === 0) {
+        return heading +
+          '<div class="loading" style="color:var(--text-dim)">No agent is blocked on an undeliverable approval.</div>';
+      }
+      const now = Date.now();
+      const body = rows.map(b => {
+        const held = formatBlockedFor(now - (Number(b.blockedSince) || now));
+        const retryCell = (typeof b.retryableAt === 'number')
+          ? (b.retryableAt > now
+              ? `in ${escapeHtml(formatBlockedFor(b.retryableAt - now))} <span style="color:var(--text-dim)">(${escapeHtml(formatTimestamp(b.retryableAt))})</span>`
+              : `${escapeHtml(formatTimestamp(b.retryableAt))} <span style="color:var(--text-dim)">(due)</span>`)
+          : dim('unknown');
+        return `
+        <tr>
+          <td><span class="status-dot inactive" style="display:inline-block;vertical-align:middle"></span> ${escapeHtml(b.agent || '—')}</td>
+          <td><b>blocked ${escapeHtml(held)}</b></td>
+          <td>${b.action ? escapeHtml(b.action) : dim('—')}</td>
+          <td><span class="chip">${escapeHtml(b.toolName || '—')}</span></td>
+          <td>${escapeHtml(b.reason || '—')}</td>
+          <td>${retryCell}</td>
+          <td title="${escapeHtml(b.requestId || '')}">${b.requestId ? escapeHtml(b.requestId) : dim('—')}</td>
+        </tr>`;
+      }).join('');
+      return heading + `
+        <div style="margin-bottom:0.6rem;font-size:0.8rem;color:var(--text-dim)">
+          These agents are waiting on you and cannot ask. The approval card could not be delivered to Telegram.
+          Nothing is auto-approved and nothing is auto-denied; each one holds until it can reach you.
+        </div>
+        <div class="accounts-table-wrap">
+          <table class="accounts-table">
+            <thead><tr>
+              <th>Agent</th><th>Held for</th><th>Waiting to</th>
+              <th>Tool</th><th>Why undelivered</th><th>Retry</th><th>Request</th>
+            </tr></thead>
+            <tbody>${body}</tbody>
+          </table>
+        </div>`;
     }
 
     // Standing capability grants from the vault-broker grants DB — what
