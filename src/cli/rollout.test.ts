@@ -329,12 +329,14 @@ describe("planRollout — hostd context (#2487)", () => {
     const kinds = steps.map((s) =>
       s.kind === "restart-agent" ? `r:${s.agent}` : s.kind,
     );
-    // apply → canary (test-harness) → persist-pin → rest → refresh-hindsight → sweep.
+    // apply → canary (test-harness) → persist-pin → rest → refresh-web →
+    // refresh-hindsight → sweep.
     expect(kinds).toEqual([
       "apply",
       "r:test-harness",
       "persist-pin",
       "r:clerk",
+      "refresh-web",
       "refresh-hindsight",
       "sweep",
     ]);
@@ -344,13 +346,40 @@ describe("planRollout — hostd context (#2487)", () => {
     expect(persistIdx).toBeGreaterThan(canaryIdx);
   });
 
-  it("DROPS the hostd/web refresh steps (deferred — would SIGKILL itself)", () => {
+  it("DROPS the hostd refresh step (deferred — would SIGKILL itself) but KEEPS refresh-web", () => {
     const kinds = planRollout(["clerk", "marko"], {
       pinToPersist: TARGET,
       hostdContext: true,
     }).map((s) => s.kind);
-    expect(kinds).not.toContain("refresh-web");
+    // hostd is this process's parent — recreating it mid-roll SIGKILLs the
+    // roll. web is a SEPARATE compose project with no parent/child relation
+    // to hostd, so it's safe to recreate in-plan; dropping it left web
+    // silently stale after every agent-driven roll.
     expect(kinds).not.toContain("refresh-hostd");
+    expect(kinds).toContain("refresh-web");
+  });
+
+  it("refresh-web lands AFTER all agent restarts and BEFORE refresh-hindsight", () => {
+    const steps = planRollout(["clerk", "marko", "test-harness"], {
+      pinToPersist: TARGET,
+      hostdContext: true,
+    });
+    const kinds = steps.map((s) => s.kind);
+    const webIdx = kinds.indexOf("refresh-web");
+    const lastRestartIdx = kinds.lastIndexOf("restart-agent");
+    expect(webIdx).toBeGreaterThan(lastRestartIdx);
+    expect(webIdx).toBeLessThan(kinds.indexOf("refresh-hindsight"));
+  });
+
+  it("skipWeb drops refresh-web on the hostd path too", () => {
+    const kinds = planRollout(["clerk"], {
+      pinToPersist: TARGET,
+      hostdContext: true,
+      skipWeb: true,
+    }).map((s) => s.kind);
+    expect(kinds).not.toContain("refresh-web");
+    // hindsight recreate is independent of --skip-web on the hostd path.
+    expect(kinds).toContain("refresh-hindsight");
   });
 
   it("RECREATES the hindsight singleton (standalone docker run — hostd can recreate it)", () => {
@@ -361,7 +390,7 @@ describe("planRollout — hostd context (#2487)", () => {
     const kinds = steps.map((s) => s.kind);
     // hindsight is a standalone `docker run` hostd owns via the docker
     // socket — it must be rolled so the memory backend isn't left a version
-    // behind (unlike refresh-web/refresh-hostd, separate compose projects).
+    // behind (unlike refresh-hostd, which stays host-side/self-bump).
     expect(kinds).toContain("refresh-hindsight");
     // ...and it lands immediately before the final sweep.
     expect(kinds.indexOf("refresh-hindsight")).toBe(kinds.indexOf("sweep") - 1);
@@ -498,6 +527,41 @@ describe("executeRollout — hostd context (#2487)", () => {
     for (const run of restartRuns) {
       expect(run).not.toContain("--pin");
     }
+  });
+
+  // Web-staleness fix: the hostd plan now includes refresh-web (web is a
+  // separate compose project with no parent/child relation to hostd, so the
+  // recreate cannot SIGKILL the in-flight roll). Assert the executor really
+  // invokes `webd install --tag <target>` on this path.
+  it("runs `webd install --tag <target>` on the hostd path (web no longer left stale)", () => {
+    const steps = planRollout(["test-harness", "clerk"], {
+      pinToPersist: TARGET,
+      hostdContext: true,
+    });
+    const { deps, runs } = harness({
+      versions: { "test-harness": "0.15.18", clerk: "0.15.18" },
+    });
+    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    expect(r.ok).toBe(true);
+    expect(runs).toContainEqual(["webd", "install", "--tag", TARGET]);
+    // ...and hostd install is NOT run (deferred — would SIGKILL itself).
+    expect(runs.some((a) => a[0] === "hostd")).toBe(false);
+  });
+
+  it("a failed web refresh on the hostd path stays NON-FATAL and names the host-side command", () => {
+    const steps = planRollout(["clerk"], {
+      pinToPersist: TARGET,
+      hostdContext: true,
+    });
+    const { deps } = harness({
+      versions: { clerk: "0.15.18" },
+      runStatus: (args) => (args[0] === "webd" ? 1 : 0),
+    });
+    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    expect(r.ok).toBe(true); // agents already rolled — stale web isn't fatal
+    const w = r.warnings.find((x) => /web refresh FAILED/.test(x));
+    expect(w).toBeTruthy();
+    expect(w).toContain(`switchroom webd install --tag ${TARGET}`);
   });
 });
 

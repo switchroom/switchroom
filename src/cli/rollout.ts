@@ -86,11 +86,16 @@ export interface RolloutPlanOpts {
    *      brick scenario #2). The canary is rolled on a one-shot `--pin`
    *      image ref via `apply`'s reading of the env-passed target; the
    *      durable pin is only written once the canary is green.
-   *   2. the web + hostd refresh steps are DROPPED entirely — an
-   *      agent-invoked rollout must not synchronously recreate its own
-   *      hostd container (it would SIGKILL the in-flight rollout, which
-   *      is hostd's own child — brick scenario #1). The executor reports
-   *      "hostd/web refresh deferred — run host-side" instead.
+   *   2. the HOSTD refresh step is DROPPED — an agent-invoked rollout
+   *      must not synchronously recreate its own hostd container (it
+   *      would SIGKILL the in-flight rollout, which is hostd's own child
+   *      — brick scenario #1). The executor reports "hostd refresh
+   *      deferred — run host-side" instead. The WEB refresh is KEPT:
+   *      switchroom-web is a separate compose project with no parent/
+   *      child relationship to hostd (it never mounts docker.sock and
+   *      nothing in the roll depends on it), so recreating it from
+   *      hostd is safe — dropping it left web silently stale on the
+   *      prior tag after every agent-driven roll.
    *
    * Gating the new ordering behind this explicit flag (not euid) keeps the
    * host-shell path's persist-first behavior a deliberate choice.
@@ -142,9 +147,9 @@ export function planRollout(
 
   if (opts.hostdContext) {
     // hostd/MCP path (#2487): persist the pin AFTER the canary confirms,
-    // and DROP the hostd/web refresh (defer to host-side). The bare
-    // `apply` reads the env-passed one-shot target, so the canary rolls
-    // on the target image WITHOUT a durable pin write first.
+    // and DROP the hostd self-refresh (defer to host-side / self-bump).
+    // The bare `apply` reads the env-passed one-shot target, so the canary
+    // rolls on the target image WITHOUT a durable pin write first.
     steps.push({ kind: "apply" });
     const [canary, ...rest] = ordered;
     if (canary !== undefined) {
@@ -162,11 +167,23 @@ export function planRollout(
       // the persist intent consistent.
       steps.push({ kind: "persist-pin", pin: opts.pinToPersist });
     }
+    // Recreate the web singleton too: switchroom-web is a SEPARATE compose
+    // project (`switchroom-web`) with no parent/child relationship to hostd
+    // (it never mounts docker.sock; hostd is not its child), so recreating
+    // it from inside hostd cannot SIGKILL this roll — unlike refresh-hostd,
+    // which stays host-side/self-bump because hostd IS this process's
+    // parent. Without this step, web silently stayed on the prior tag after
+    // every agent-driven roll (observed: fleet v0.18.10, web v0.18.9).
+    // `webd install` inside hostd is host-home-safe via SWITCHROOM_HOST_HOME
+    // (resolveWebHostHome refuses a /host-home bind source).
+    if (!opts.skipWeb) {
+      steps.push({ kind: "refresh-web" });
+    }
     // Recreate the hindsight singleton so a hostd/agent-driven roll doesn't
-    // leave the memory backend a version behind (refresh-web/refresh-hostd
-    // stay host-side — separate compose projects; hindsight is a standalone
-    // `docker run` hostd can recreate via the docker socket). The executor's
-    // refresh-hindsight case self-guards via hindsightExists().
+    // leave the memory backend a version behind (refresh-hostd stays
+    // host-side; hindsight is a standalone `docker run` hostd can recreate
+    // via the docker socket). The executor's refresh-hindsight case
+    // self-guards via hindsightExists().
     steps.push({ kind: "refresh-hindsight" });
     steps.push({ kind: "sweep" });
     return steps;
@@ -669,7 +686,13 @@ export function executeRollout(
       case "refresh-web": {
         deps.log(`ROLL_STEP refresh-web — webd install --tag ${target}`);
         const r = deps.run(["webd", "install", "--tag", target]);
-        if (r.status !== 0) warnings.push(`web refresh failed (non-fatal); agents already rolled`);
+        if (r.status !== 0) {
+          warnings.push(
+            `web refresh FAILED (non-fatal — agents already rolled) so ` +
+              `switchroom-web is still on the PRIOR version. Finish it ` +
+              `host-side: \`switchroom webd install --tag ${target}\`.`,
+          );
+        }
         break;
       }
       case "refresh-hostd": {
@@ -1003,31 +1026,41 @@ export function registerRolloutCommand(program: Command): void {
       );
       const result = executeRollout(steps, target, deps, { hostdContext: hostdCtx });
 
-      // hostd path: the hostd/web refresh was intentionally dropped from
-      // the plan (it would SIGKILL this very process). Surface that as a
-      // deferral note so the operator knows to refresh host-side.
+      // hostd path: the HOSTD refresh was intentionally dropped from the
+      // plan (it would SIGKILL this very process). The WEB refresh now runs
+      // in-plan (refresh-web — safe: separate compose project, not hostd's
+      // parent), so it is NOT in the deferred list unless --skip-web
+      // dropped it. Surface the remaining deferral so the operator knows
+      // what to finish host-side.
       if (hostdCtx) {
         // #2645 item 3 — name EXACTLY what is still on the prior version so
         // "rollout done" is never misread as "everything's on the new
         // version". hostd itself is current on this path when the roll was
         // preceded by a self-bump (the daemon tag-bumps its own compose
-        // before spawning this child); web + the host-installed operator
-        // CLI never are.
+        // before spawning this child); the host-installed operator CLI
+        // never is. switchroom-web was refreshed in-plan (or its failure/
+        // skip already produced its own actionable warning above).
         result.warnings.push(
-          `still on the PRIOR version after this roll: switchroom-web ` +
-            `(host-side: \`switchroom webd install --tag ${target}\`) and the ` +
-            `host operator CLI (\`sudo npm i -g switchroom@${normalizeVersion(target)}\`). ` +
+          `still on the PRIOR version after this roll: the host operator ` +
+            `CLI (\`sudo npm i -g switchroom@${normalizeVersion(target)}\`). ` +
             `hostd's compose was tag-bumped by the self-bump when one ran; a ` +
             `full hostd template regen (only needed when a release changes ` +
             `hostd's mounts/env) is \`switchroom hostd install --tag ${target}\` ` +
             `host-side. An agent-invoked rollout cannot recreate its own hostd ` +
-            `container mid-roll without killing itself.`,
+            `container mid-roll without killing itself.` +
+            (opts.skipWeb
+              ? ` --skip-web was set, so switchroom-web is ALSO still on the ` +
+                `prior version (host-side: \`switchroom webd install --tag ${target}\`).`
+              : ""),
         );
         // #2726 — narrate the deferral as a phase so the durable log + the
-        // narration surface show "hostd/web deferred" between the last agent
-        // and the terminal row. Only meaningful on the hostd path (the only
-        // path that defers). Emitted only when the roll got far enough to
-        // matter — i.e. it wasn't refused before executeRollout ran.
+        // narration surface show "hostd deferred" between the last agent
+        // and the terminal row. (Phase name kept as "hostd-web-deferred"
+        // for wire/audit-row compatibility; since the in-plan refresh-web
+        // landed, only hostd is actually deferred.) Only meaningful on the
+        // hostd path (the only path that defers). Emitted only when the
+        // roll got far enough to matter — i.e. it wasn't refused before
+        // executeRollout ran.
         process.stdout.write(
           encodeRolloutPhaseLine({ phase: "hostd-web-deferred", target }) + "\n",
         );

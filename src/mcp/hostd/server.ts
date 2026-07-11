@@ -102,6 +102,20 @@ interface ToolArgs {
  *  version-assertable, so it would stop the staggered roll on agent #1. */
 const ROLLOUT_SEMVER_PIN_RE = /^v\d+\.\d+\.\d+$/;
 
+/**
+ * Advisory appended to a SUCCESSFUL `update_apply` result when it was invoked
+ * with a semver tag pin — the exact fleet-version-roll case the safer
+ * `rollout` tool exists for. A soft steer, deliberately NOT a refusal: the
+ * operator may want the blunt path on purpose. Exported for the unit test.
+ */
+export const UPDATE_APPLY_SEMVER_PIN_ADVISORY =
+  "⚠️ advisory: update_apply with a semver pin is the BLUNT path — all " +
+  "containers recreate at once, with no canary, no per-agent version " +
+  "assert, and no stop-on-mismatch. For fleet version rolls prefer the " +
+  "`rollout` tool (staggered, canary-gated, version-asserted; also " +
+  "refreshes the web + hindsight singletons). This request was still " +
+  "dispatched — this is a steer, not a refusal.";
+
 export const TOOLS = [
   {
     name: "agent_restart",
@@ -290,7 +304,14 @@ export const TOOLS = [
     name: "update_apply",
     description:
       "Execute a fleet-wide update: pull images, regenerate " +
-      "scaffolds, recreate containers. Admin-only at the wire layer. " +
+      "scaffolds, recreate containers. This is the BLUNT all-at-once " +
+      "path — no canary, no per-agent version assert, no stop-on-" +
+      "mismatch. For rolling the fleet to a specific VERSION (a semver " +
+      "pin), prefer the `rollout` tool instead: staggered, canary-gated, " +
+      "version-asserted, and it also refreshes the web + hindsight " +
+      "singletons. Calling update_apply with a semver pin still works " +
+      "(the operator may want the blunt path deliberately) but the " +
+      "result includes an advisory warning. Admin-only at the wire layer. " +
       "Returns `started` once dispatched — the actual work runs " +
       "async on the host and the caller's own agent container will " +
       "be recreated as part of the cycle. This is operator-gated — every " +
@@ -358,9 +379,10 @@ export const TOOLS = [
       "request_id — do NOT re-issue the rollout during the blip; poll " +
       "get_status (pass the returned request_id as its `request_id` " +
       "argument) once the socket is back. " +
-      "The web refresh stays DEFERRED on this path; the terminal warnings " +
-      "name exactly what is still on the prior version (web, host operator " +
-      "CLI) and the host-side commands to finish. By default downgrade pins " +
+      "The web + hindsight singletons are refreshed in-plan on this path " +
+      "(only the hostd template regen + host operator CLI stay host-side; " +
+      "the terminal warnings name exactly what is still on the prior " +
+      "version and the commands to finish). By default downgrade pins " +
       "are rejected — pass `allow_downgrade: true` for the operator-approved " +
       "rollback path to a known-good earlier tag; all other safety rails " +
       "(canary order, version-assert, stop-on-mismatch) apply unchanged. " +
@@ -403,9 +425,10 @@ export const TOOLS = [
         skip_web: {
           type: "boolean",
           description:
-            "Skip the web + hostd refresh step. NB: on this (hostd) path " +
-            "the hostd/web refresh is deferred regardless; this flag is " +
-            "forwarded for parity.",
+            "Skip the web refresh step (leaves switchroom-web on the prior " +
+            "version — the terminal warning names the host-side command to " +
+            "finish). The hostd self-refresh is deferred on this path " +
+            "regardless of this flag.",
         },
         allow_downgrade: {
           type: "boolean",
@@ -564,6 +587,9 @@ export async function dispatchTool(
   }
 
   let req: HostdRequest;
+  // Optional advisory attached to a SUCCESSFUL result (soft steer — e.g.
+  // update_apply invoked with a semver pin when `rollout` is the safer path).
+  let advisory: string | undefined;
   switch (name) {
     case "agent_restart": {
       if (!args.name) return errorText("agent_restart: name is required");
@@ -657,6 +683,15 @@ export async function dispatchTool(
         return errorText(
           `update_apply: pin "${args.pin}" is invalid. Expected sha-<7-40 hex> or v<semver>.`,
         );
+      }
+      // Soft guard (not a refusal — the operator may want the blunt path
+      // deliberately): a SEMVER pin is exactly the fleet-version-roll case
+      // the safer `rollout` tool exists for. Attach an advisory to the
+      // result so the calling agent learns the steer even after the
+      // operator approves the card. sha pins have no rollout equivalent
+      // (rollout is semver-only), so they pass silently.
+      if (args.pin && ROLLOUT_SEMVER_PIN_RE.test(args.pin)) {
+        advisory = UPDATE_APPLY_SEMVER_PIN_ADVISORY;
       }
       req = {
         v: 1,
@@ -780,7 +815,11 @@ export async function dispatchTool(
   // started/completed: success path. Surface the full response as
   // JSON so the model can correlate later via request_id.
   if (resp.result === "started" || resp.result === "completed") {
-    return jsonText(resp);
+    const out = jsonText(resp);
+    if (advisory) {
+      out.content.push({ type: "text" as const, text: advisory });
+    }
+    return out;
   }
 
   // denied/error: tool-error so the model can see it failed but also

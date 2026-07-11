@@ -14,7 +14,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { renderWebComposeFile, resolveWebImageTag } from "./webd.js";
+import { renderWebComposeFile, resolveWebImageTag, resolveWebHostHome } from "./webd.js";
 
 describe("renderWebComposeFile", () => {
   it("renders a valid yaml-shaped string for the switchroom-web service", () => {
@@ -125,5 +125,32 @@ describe("resolveWebImageTag (honor release.pin like the agent fleet)", () => {
   it("falls back to 'latest' when neither --tag nor release is set", () => {
     expect(resolveWebImageTag(undefined, undefined)).toBe("latest");
     expect(resolveWebImageTag(undefined, {})).toBe("latest");
+  });
+});
+
+describe("resolveWebHostHome (SWITCHROOM_HOST_HOME preference + /host-home poison guard)", () => {
+  // Mirrors resolveHostdHostHome: when `webd install` runs INSIDE the hostd
+  // container (the rollout refresh-web step), homedir() is /host-home — an
+  // in-container mount point, never a valid host bind SOURCE. The env var is
+  // the authoritative host home; a /host-home resolution must fail loud.
+  it("prefers SWITCHROOM_HOST_HOME over homedir()", () => {
+    expect(
+      resolveWebHostHome({ SWITCHROOM_HOST_HOME: "/home/operator" }, "/host-home"),
+    ).toBe("/home/operator");
+  });
+
+  it("falls back to the provided home when the env var is unset or blank", () => {
+    expect(resolveWebHostHome({}, "/home/operator")).toBe("/home/operator");
+    expect(resolveWebHostHome({ SWITCHROOM_HOST_HOME: "  " }, "/home/operator")).toBe(
+      "/home/operator",
+    );
+  });
+
+  it("REFUSES a /host-home resolution (poison bind source) with a recovery hint", () => {
+    expect(() => resolveWebHostHome({}, "/host-home")).toThrow(/refusing to generate/);
+    expect(() =>
+      resolveWebHostHome({ SWITCHROOM_HOST_HOME: "/host-home" }, "/x"),
+    ).toThrow(/SWITCHROOM_HOST_HOME/);
+    expect(() => resolveWebHostHome({}, "/host-home/sub")).toThrow(/host bind source/);
   });
 });

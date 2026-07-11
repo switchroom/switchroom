@@ -54,7 +54,9 @@ function phaseLine(s: RolloutRenderState): string {
     case "persist-pin":
       return "persisting pin";
     case "hostd-web-deferred":
-      return "hostd/web refresh deferred (run host-side)";
+      // Legacy phase name: since the in-plan refresh-web step landed, only
+      // the hostd self-refresh is actually deferred on the agent path.
+      return "hostd refresh deferred (run host-side)";
     case "self-bump":
       return "hostd refreshing itself to the target (brief control blip)…";
     case "self-bump-done":

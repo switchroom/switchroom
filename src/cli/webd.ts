@@ -39,7 +39,7 @@
 
 import type { Command } from "commander";
 import chalk from "chalk";
-import { existsSync, mkdirSync, writeFileSync, copyFileSync } from "node:fs";
+import { chownSync, existsSync, mkdirSync, writeFileSync, copyFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -72,6 +72,39 @@ export function resolveWebImageTag(
 ): string {
   if (explicitTag) return explicitTag;
   return resolveImageTag(resolveRelease({ root: release }));
+}
+
+/**
+ * Resolve the REAL host home for the web compose bind sources.
+ *
+ * Mirrors `resolveHostdHostHome` (src/cli/hostd.ts) and the agent-fleet
+ * generator (`write-compose.ts`, #2279): prefer `SWITCHROOM_HOST_HOME` over
+ * `homedir()`. When `webd install` runs INSIDE the hostd container (the
+ * rollout refresh-web step — hostd is a separate compose project so it can
+ * safely recreate web), `homedir()` returns `/host-home`, the in-container
+ * mount point of the operator home, NOT a host filesystem path. Emitting it
+ * as a bind SOURCE would make Docker auto-create empty `/host-home/...` dirs
+ * on the host: the receiver would see no webhook secrets, no web-token, no
+ * per-agent webhook.sock — silent total breakage. The backstop refuses to
+ * ever emit a `/host-home` source — fail loud with the recovery path.
+ */
+export function resolveWebHostHome(
+  env: NodeJS.ProcessEnv = process.env,
+  home: string = homedir(),
+): string {
+  const fromEnv = env.SWITCHROOM_HOST_HOME?.trim();
+  const resolved = fromEnv && fromEnv.length > 0 ? fromEnv : home;
+  if (resolved === "/host-home" || resolved.startsWith("/host-home/")) {
+    throw new Error(
+      `switchroom webd install: refusing to generate — the host home resolved to ` +
+        `"${resolved}", the in-container mount point of the operator home (never a ` +
+        `valid host bind source). Emitting it would make Docker create empty ` +
+        `/host-home dirs on the host and break every webhook forward + secret read.\n\n` +
+        `Recovery: run \`switchroom webd install\` from the HOST shell, or set ` +
+        `SWITCHROOM_HOST_HOME to the real host home first.`,
+    );
+  }
+  return resolved;
 }
 
 /**
@@ -276,8 +309,20 @@ async function doInstall(opts: InstallOptions, program: Command): Promise<void> 
     return;
   }
 
+  // Bind-mount SOURCES must be HOST paths. Inside the hostd container
+  // (rollout's refresh-web step) homedir() is /host-home — a poison bind
+  // source (#2279 class). resolveWebHostHome prefers SWITCHROOM_HOST_HOME
+  // and refuses /host-home outright.
+  let hostHome: string;
+  try {
+    hostHome = resolveWebHostHome();
+  } catch (err) {
+    console.error(chalk.red((err as Error).message));
+    process.exit(1);
+  }
+
   const yaml = renderWebComposeFile({
-    hostHome: homedir(),
+    hostHome,
     imageTag,
     operatorUid,
   });
@@ -293,6 +338,19 @@ async function doInstall(opts: InstallOptions, program: Command): Promise<void> 
   if (bak) console.log(chalk.dim(`  Backed up existing compose to ${bak}`));
 
   writeFileSync(composePath, yaml, "utf8");
+  // Root-mode writes (hostd-driven refresh-web runs as euid 0, no sudo)
+  // would leave the compose dir/file root-owned and EACCES-lock the next
+  // host-shell `webd install` run by the operator. Chown back, best-effort
+  // (dev hosts may lack CAP_CHOWN).
+  try {
+    if (typeof process.geteuid === "function" && process.geteuid() === 0) {
+      chownSync(dir, operatorUid, operatorUid);
+      chownSync(composePath, operatorUid, operatorUid);
+      if (bak) chownSync(bak, operatorUid, operatorUid);
+    }
+  } catch {
+    /* best-effort */
+  }
   console.log(chalk.green(`  ✓ Wrote ${composePath}`));
   console.log(chalk.dim(`    running as uid ${operatorUid} (operator), network_mode: host`));
 

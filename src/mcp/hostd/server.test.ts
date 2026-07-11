@@ -40,7 +40,7 @@ vi.mock("node:fs", async () => {
 // Import after the mocks. server.ts reads SWITCHROOM_AGENT_NAME at
 // module-load — set it before the import.
 process.env.SWITCHROOM_AGENT_NAME = "klanker";
-const { TOOLS, dispatchTool } = await import("./server.js");
+const { TOOLS, dispatchTool, UPDATE_APPLY_SEMVER_PIN_ADVISORY } = await import("./server.js");
 
 function ok(resp: Partial<HostdResponse> = {}): HostdResponse {
   return {
@@ -166,6 +166,47 @@ describe("dispatchTool — happy path", () => {
     await dispatchTool("update_apply", { pin: "sha-abc1234" });
     const sent = hostdRequestMock.mock.calls[0]![1];
     expect(sent.args).toEqual({ pin: "sha-abc1234" });
+  });
+
+  // Soft steer: a SEMVER pin on update_apply is the fleet-version-roll case
+  // the safer `rollout` tool exists for. The call must still dispatch (the
+  // operator may want the blunt path deliberately) but the result carries an
+  // advisory pointing at rollout.
+  it("update_apply with a SEMVER pin still dispatches but appends the rollout advisory", async () => {
+    hostdRequestMock.mockResolvedValueOnce(ok({ result: "started" }));
+    const res = await dispatchTool("update_apply", { pin: "v0.18.10" });
+    expect(res.isError).toBeFalsy();
+    // Dispatched — NOT refused.
+    const sent = hostdRequestMock.mock.calls[0]![1];
+    expect(sent.op).toBe("update_apply");
+    expect(sent.args).toEqual({ pin: "v0.18.10" });
+    // Advisory appended as a second content item.
+    expect(res.content.length).toBe(2);
+    expect(res.content[1]!.text).toBe(UPDATE_APPLY_SEMVER_PIN_ADVISORY);
+    expect(res.content[1]!.text).toMatch(/rollout/);
+  });
+
+  it("update_apply with a sha pin gets NO advisory (rollout can't take sha pins)", async () => {
+    hostdRequestMock.mockResolvedValueOnce(ok({ result: "started" }));
+    const res = await dispatchTool("update_apply", { pin: "sha-abc1234" });
+    expect(res.isError).toBeFalsy();
+    expect(res.content.length).toBe(1);
+  });
+
+  it("update_apply without a pin gets NO advisory", async () => {
+    hostdRequestMock.mockResolvedValueOnce(ok({ result: "started" }));
+    const res = await dispatchTool("update_apply", {});
+    expect(res.isError).toBeFalsy();
+    expect(res.content.length).toBe(1);
+  });
+
+  it("the semver-pin advisory is NOT attached to a denied/error result", async () => {
+    hostdRequestMock.mockResolvedValueOnce(
+      ok({ result: "denied", error: "operator denied" } as Partial<HostdResponse>),
+    );
+    const res = await dispatchTool("update_apply", { pin: "v0.18.10" });
+    expect(res.isError).toBe(true);
+    expect(res.content.every((c) => !c.text.includes("BLUNT path"))).toBe(true);
   });
 
   it("update_apply rejects channel+pin combo without hitting the wire", async () => {
