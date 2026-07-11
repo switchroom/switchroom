@@ -38,6 +38,72 @@ export async function ask(
 }
 
 /**
+ * Prompt for a secret (e.g. a vault passphrase) WITHOUT echoing input
+ * to the terminal. Mirrors {@link ask}'s interactive/non-interactive
+ * contract: in non-interactive mode it returns `defaultValue` or throws.
+ *
+ * On a TTY it reads in raw mode so keystrokes are never rendered — the
+ * passphrase must never appear in the terminal or scrollback. This is
+ * the no-echo replacement for `ask()` on secret prompts (2026-07-11
+ * review, MEDIUM: `switchroom setup` echoed the vault passphrase in
+ * cleartext because it prompted via the echoing `ask()`).
+ *
+ * Ctrl-C rejects (aborts the prompt); backspace/delete edit the buffer.
+ */
+export async function askHidden(
+  question: string,
+  defaultValue?: string,
+): Promise<string> {
+  if (!isInteractive()) {
+    if (defaultValue !== undefined) return defaultValue;
+    throw new Error(`Non-interactive mode: no default for "${question}"`);
+  }
+
+  return new Promise<string>((resolve, reject) => {
+    const stdin = process.stdin;
+    process.stdout.write(`${question}: `);
+    stdin.setRawMode(true);
+    stdin.resume();
+    stdin.setEncoding("utf8");
+
+    let input = "";
+    const cleanup = () => {
+      stdin.setRawMode(false);
+      stdin.pause();
+      stdin.removeListener("data", onData);
+    };
+
+    const onData = (chunk: string) => {
+      // A single data event can carry several characters (fast typing or
+      // a paste that includes the terminating newline), so iterate.
+      for (const char of chunk) {
+        if (char === "\n" || char === "\r" || char === "\u0004") {
+          // Enter / EOF — accept. Emit the newline WE suppressed so the
+          // cursor moves on, but never the typed characters themselves.
+          cleanup();
+          process.stdout.write("\n");
+          resolve(input.trim() || defaultValue || "");
+          return;
+        } else if (char === "\u0003") {
+          // Ctrl-C — abort the prompt.
+          cleanup();
+          process.stdout.write("\n");
+          reject(new Error("Aborted"));
+          return;
+        } else if (char === "\u007f" || char === "\b") {
+          // Backspace / Delete.
+          if (input.length > 0) input = input.slice(0, -1);
+        } else {
+          input += char;
+        }
+      }
+    };
+
+    stdin.on("data", onData);
+  });
+}
+
+/**
  * Ask a yes/no question. Returns true for yes.
  * In non-interactive mode, returns the default.
  */
