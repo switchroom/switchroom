@@ -77,6 +77,63 @@ describe('gateway outbound secret-scrub — structural wiring', () => {
     expect(truncIdx).toBeGreaterThan(redactIdx) // mask BEFORE the slice
   })
 
+  it('ask_user: redacts question + option labels at entry, BEFORE the send', () => {
+    // F1 — ask_user sent the question + button labels unredacted. The scrub
+    // must run at the top of executeAskUser (via redactAskUserFields), before
+    // the keyboard is built and the question is sent to Telegram.
+    const start = src.indexOf('async function executeAskUser(')
+    const redactIdx = src.indexOf('redactAskUserFields(args.question, args.options', start)
+    const keyboardIdx = src.indexOf('const keyboard = new InlineKeyboard()', start)
+    const sendIdx = src.indexOf('sendRichMessage(args.chatId, richMessage(args.question)', start)
+    expect(start).toBeGreaterThan(0)
+    expect(redactIdx).toBeGreaterThan(start)
+    expect(keyboardIdx).toBeGreaterThan(redactIdx) // mask BEFORE labels become buttons
+    expect(sendIdx).toBeGreaterThan(redactIdx) // mask BEFORE the question is sent
+  })
+
+  it('send_checklist: redacts title + task text BEFORE rawSendChecklist', () => {
+    // F2 — checklist title + task strings were sent unredacted.
+    const start = src.indexOf('async function executeSendChecklist(')
+    const redactIdx = src.indexOf('redactChecklistFields(', start)
+    const sendIdx = src.indexOf('rawSendChecklist({', start)
+    expect(start).toBeGreaterThan(0)
+    expect(redactIdx).toBeGreaterThan(start)
+    expect(sendIdx).toBeGreaterThan(redactIdx) // mask BEFORE the send
+  })
+
+  it('update_checklist: redacts title + task text BEFORE rawEditMessageChecklist', () => {
+    // F2 sibling — update_checklist shares the identical leak class.
+    const start = src.indexOf('async function executeUpdateChecklist(')
+    const redactIdx = src.indexOf('redactChecklistFields(', start)
+    const editIdx = src.indexOf('rawEditMessageChecklist({', start)
+    expect(start).toBeGreaterThan(0)
+    expect(redactIdx).toBeGreaterThan(start)
+    expect(editIdx).toBeGreaterThan(redactIdx) // mask BEFORE the edit
+  })
+
+  it('pty draft-preview: redacts at the gateway boundary BEFORE the stream', () => {
+    // F3 — the PTY-tail partial (assistant reply text extracted from the TUI)
+    // forwards straight to the draft-preview stream. Mask at the top of
+    // handlePtyPartial, before it hands off to handlePtyPartialPure.
+    const start = src.indexOf('function handlePtyPartial(text: string): void {')
+    const redactIdx = src.indexOf(`redactOutboundText(text, 'pty_preview')`, start)
+    const pureIdx = src.indexOf('handlePtyPartialPure(text, state', start)
+    expect(start).toBeGreaterThan(0)
+    expect(redactIdx).toBeGreaterThan(start)
+    expect(pureIdx).toBeGreaterThan(redactIdx) // mask BEFORE the stream push
+  })
+
+  it('pty activity: redacts at the gateway boundary BEFORE the stream', () => {
+    // F3 — the (currently-unwired) PTY-activity lane is masked too so the fix
+    // is durable if it is ever re-armed.
+    const start = src.indexOf('function handlePtyActivity(text: string): void {')
+    const redactIdx = src.indexOf(`redactOutboundText(text, 'pty_activity')`, start)
+    const streamIdx = src.indexOf('handleStreamReply(', start)
+    expect(start).toBeGreaterThan(0)
+    expect(redactIdx).toBeGreaterThan(start)
+    expect(streamIdx).toBeGreaterThan(redactIdx) // mask BEFORE the stream
+  })
+
   it('does not log the secret value when a mask fires', () => {
     const idx = src.indexOf('function redactOutboundText(')
     const body = src.slice(idx, idx + 400)

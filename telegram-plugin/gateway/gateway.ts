@@ -34,6 +34,7 @@ import {
   type AskUserArgs,
   type AskUserOutcome,
 } from '../ask-user.js'
+import { redactAskUserFields, redactChecklistFields } from '../outbound-field-redact.js'
 import { parseInterruptMarker } from '../interrupt-marker.js'
 import {
   ToolFlightTracker,
@@ -11724,10 +11725,21 @@ async function executeSendChecklist(args: Record<string, unknown>): Promise<{ co
 
   assertAllowedChat(chat_id)
 
-  const sent = await rawSendChecklist({
-    chat_id,
+  // #2044 outbound secret scrub. Checklist title + task strings are
+  // agent-authored free text sent to Telegram, same class as the reply
+  // `text` path and ask_user — route both through the SAME redactor before
+  // send (via the pure, unit-tested redactChecklistFields helper) so an
+  // echoed token / DATABASE_URL is masked.
+  const { title: redactedTitle, tasks: redactedTasks } = redactChecklistFields(
     title,
     tasks,
+    (t) => redactOutboundText(t, 'send_checklist'),
+  )
+
+  const sent = await rawSendChecklist({
+    chat_id,
+    title: redactedTitle!,
+    tasks: redactedTasks!,
     ...(threadId != null ? { message_thread_id: threadId } : {}),
     ...(replyTo != null ? { reply_to_message_id: replyTo } : {}),
     ...(protectContent ? { protect_content: true } : {}),
@@ -11809,7 +11821,19 @@ async function executeUpdateChecklist(args: Record<string, unknown>): Promise<{ 
 
   assertAllowedChat(chat_id)
 
-  await rawEditMessageChecklist({ chat_id, message_id, title, tasks })
+  // #2044 outbound secret scrub. update_checklist forwards the same
+  // agent-authored title + task text to Telegram as send_checklist, so it
+  // shares the identical leak class — redact both through the reply-path
+  // redactor (via the shared redactChecklistFields helper) before the edit
+  // lands. title / tasks may be undefined here (partial patch); the helper
+  // passes undefined through untouched.
+  const { title: redactedTitle, tasks: redactedTasks } = redactChecklistFields(
+    title,
+    tasks,
+    (t) => redactOutboundText(t, 'update_checklist'),
+  )
+
+  await rawEditMessageChecklist({ chat_id, message_id, title: redactedTitle, tasks: redactedTasks })
 
   process.stderr.write(`telegram gateway: update_checklist: updated chatId=${chat_id} messageId=${message_id}\n`)
   return { content: [{ type: 'text', text: `checklist updated (id: ${message_id})` }] }
@@ -13508,6 +13532,21 @@ async function executeProgressUpdate(args: Record<string, unknown>): Promise<unk
 async function executeAskUser(rawArgs: Record<string, unknown>): Promise<unknown> {
   const args = validateAskUserArgs(rawArgs as unknown as AskUserArgs)
   assertAllowedChat(args.chatId)
+
+  // #2044 outbound secret scrub. The question text and each option/button
+  // label are agent-authored free text sent to Telegram, exactly like the
+  // reply `text` path — an agent that echoes a token or DATABASE_URL it just
+  // read into a question or a button label would transmit it unmasked. Route
+  // both through the SAME redactor as reply (via the pure, unit-tested
+  // redactAskUserFields helper), assigning back onto the validated args so
+  // every downstream consumer — the send, the timeout-edit re-render, and
+  // the tap-echo of the chosen label stored in pendingAskUser — sees the
+  // masked value.
+  const scrubbed = redactAskUserFields(args.question, args.options, (t) =>
+    redactOutboundText(t, 'ask_user'),
+  )
+  args.question = scrubbed.question
+  args.options = scrubbed.options
 
   // Resolve thread + reply-to using the same auto-thread heuristic
   // executeReply uses, so an agent that omits message_thread_id still
@@ -17590,6 +17629,17 @@ function handleSessionEvent(ev: SessionEvent): void {
 
 // ─── PTY partial handler ─────────────────────────────────────────────────
 function handlePtyPartial(text: string): void {
+  // #2044 outbound secret scrub. The PTY-tail partial is the assistant's
+  // reply text extracted from Claude Code's TUI as it renders — an agent
+  // that echoes a secret shows it here (in the live draft-preview stream)
+  // BEFORE the reply tool ever fires, and this path forwards the text
+  // straight to Telegram with no other redaction. Mask at the gateway
+  // boundary through the SAME reply-path redactor so the draft stream, its
+  // dedup key, and lastPtyPreviewByChat all compare redacted-against-
+  // redacted — the identical in-place-mutation invariant the answer stream
+  // relies on. Idempotent: replaying a buffered (already-masked) partial
+  // re-masks to itself.
+  text = redactOutboundText(text, 'pty_preview')
   // #1067: build the PtyHandlerState from a snapshot of currentTurn.
   // The pty-partial-handler module keeps its own state-shape contract
   // (currentSessionChatId / currentSessionThreadId) because it's
@@ -17624,6 +17674,13 @@ function handlePtyPartial(text: string): void {
 }
 
 function handlePtyActivity(text: string): void {
+  // #2044 outbound secret scrub. PTY-activity is agent-derived free text
+  // forwarded to Telegram via handleStreamReply — same leak class as the
+  // draft preview above. Redact through the reply-path redactor before it
+  // streams. (This handler is currently unwired in the gateway — the live
+  // PTY path is handlePtyPartial — but the mask is kept here so the fix is
+  // durable if the activity lane is ever re-armed.)
+  text = redactOutboundText(text, 'pty_activity')
   // #1067: snapshot at entry. handleStreamReply is async and runs in
   // the background via void; the closure already captures `chatId` /
   // `threadId` locals, so the supersession is correctly scoped.
