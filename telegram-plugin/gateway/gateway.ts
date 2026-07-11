@@ -17895,7 +17895,12 @@ async function handleInbound(
         redactAuthCodeMessage(bot.api as never, chat_id, msgId ?? null, line => process.stderr.write(line))
         return
       }
-      // Non-retryable — the flow is spent.
+      // Non-retryable — the flow is spent. Kill the CLI child before
+      // dropping the entry (re-review finding, PR #3100): on the attempts-
+      // exhausted path the child is still alive with a bound 127.0.0.1
+      // listener and nothing else would ever reap it. cancelLoopbackFlow is
+      // idempotent — safe on the already-exited / timed-out paths too.
+      cancelLoopbackFlow(pendingLoop)
       pendingLoopbackFlows.delete(interceptKey)
       await switchroomReply(
         ctx,

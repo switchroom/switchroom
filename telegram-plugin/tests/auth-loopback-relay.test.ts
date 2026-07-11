@@ -30,6 +30,7 @@ import {
   scrubSensitive,
   shouldConsumeLoopbackPaste,
   trackFlowExit,
+  cancelLoopbackFlow,
   MAX_PASTE_ATTEMPTS,
   type RelayChild,
   type PendingLoopbackFlow,
@@ -363,6 +364,26 @@ describe('submitLoopbackRedirect — bounded attempts', () => {
       expect(last.reason).toMatch(/ending this flow/i)
     }
     expect(flow.attempts).toBe(MAX_PASTE_ATTEMPTS)
+  })
+
+  it('attempts-exhausted child is killed by cancelLoopbackFlow (no listener leak)', async () => {
+    // The gateway's non-retryable branch calls cancelLoopbackFlow before
+    // deleting the entry — pin that the cancel actually kills a child that
+    // is still alive on the attempts-exhausted path (re-review finding).
+    const child = makeChild()
+    const flow = makePendingFlow(child)
+    const fetchImpl = (async () => {
+      throw new Error('never called')
+    }) as unknown as typeof fetch
+    let last: Awaited<ReturnType<typeof submitLoopbackRedirect>> | undefined
+    for (let i = 0; i < MAX_PASTE_ATTEMPTS; i++) {
+      last = await submitLoopbackRedirect(flow, 'garbage', { fetchImpl })
+    }
+    expect(last!.ok).toBe(false)
+    if (!last!.ok) expect(last!.retryable).toBe(false)
+    expect(child.killed).toBe(false) // still alive — the leak the gateway must close
+    cancelLoopbackFlow(flow)
+    expect(child.killed).toBe(true)
   })
 
   it('a valid paste after some rejections still succeeds', async () => {
