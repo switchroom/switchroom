@@ -553,6 +553,21 @@ describe('inline-keyboard-callbacks (#271)', () => {
       expect(siqc).toContain('[REDACTED')
     })
 
+    it('masks a secret in switch_inline_query_chosen_chat.query', () => {
+      const raw = [[{
+        text: 'Share to…',
+        callback_data: 'cc',
+        switch_inline_query_chosen_chat: { query: `key ${GITHUB_PAT}`, allow_user_chats: true },
+      }]]
+      const [[btn]] = redactAgentKeyboard(raw, redact)
+      const cc = (btn as { switch_inline_query_chosen_chat: { query: string; allow_user_chats?: boolean } })
+        .switch_inline_query_chosen_chat
+      expect(cc.query).not.toContain(GITHUB_PAT)
+      expect(cc.query).toContain('[REDACTED')
+      // sibling sub-fields are preserved
+      expect(cc.allow_user_chats).toBe(true)
+    })
+
     it('clamps a masked field that the marker pushed over the Telegram cap (reply not dropped)', () => {
       // A 60-char label (< 64 cap) whose short secret expands under the marker
       // would exceed 64 and 400-drop the whole reply; the clamp keeps it ≤ cap.

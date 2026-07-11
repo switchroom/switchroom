@@ -123,10 +123,11 @@ export function wrapAgentCallbacks(keyboard: AnyButton[][]): AnyButton[][] {
  * agent that puts a secret in any of those transmits it unmasked, and it
  * resurfaces on tap — the label is echoed back (`button_text`), re-rendered in
  * the "✅ You chose: <label>" annotation (#789), and `ack_text` is shown as the
- * toast. `switch_inline_query` / `switch_inline_query_current_chat` are also
- * agent-authored free text that Telegram pastes into a chat's input box on tap
- * (the current chat for the `_current_chat` variant — directly user-visible),
- * so they carry the same leak class. Route every one of these free-text fields
+ * toast. `switch_inline_query` / `switch_inline_query_current_chat` /
+ * `switch_inline_query_chosen_chat.query` are also agent-authored free text
+ * that Telegram pastes into a chat's input box on tap (the current chat for
+ * the `_current_chat` variant, a user-picked chat for `_chosen_chat` — both
+ * user-visible), so they carry the same leak class. Route every one of these free-text fields
  * through the SAME outbound redactor the reply `text` body uses, at the
  * outbound boundary, so every downstream resurface reads already-masked bytes.
  *
@@ -177,6 +178,20 @@ export function redactAgentKeyboard(
         (out as { switch_inline_query_current_chat?: string })
           .switch_inline_query_current_chat = clamp(
             redactFn(siqc), TELEGRAM_BUTTON_LIMITS.SWITCH_INLINE_QUERY_MAX)
+      }
+      // switch_inline_query_chosen_chat.query is the third variant: agent free
+      // text pasted into a user-picked chat's input box on tap — same leak class.
+      const cc = (out as { switch_inline_query_chosen_chat?: unknown })
+        .switch_inline_query_chosen_chat
+      if (cc != null && typeof cc === 'object' &&
+          typeof (cc as { query?: unknown }).query === 'string') {
+        (out as { switch_inline_query_chosen_chat?: Record<string, unknown> })
+          .switch_inline_query_chosen_chat = {
+            ...(cc as Record<string, unknown>),
+            query: clamp(
+              redactFn((cc as { query: string }).query),
+              TELEGRAM_BUTTON_LIMITS.SWITCH_INLINE_QUERY_MAX),
+          }
       }
       const ct = out.copy_text
       if (ct != null && typeof ct === 'object' &&
