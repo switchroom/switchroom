@@ -46,7 +46,8 @@ import { usesSwitchroomTelegramPlugin, resolveAgentConfig } from "../config/merg
 import { resolveTimezone } from "../config/timezone.js";
 import { isVaultReference, parseVaultReference } from "../vault/resolver.js";
 import YAML from "yaml";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
+import { writeConfigFileSync } from "../util/atomic.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -188,7 +189,17 @@ export function renameAgentInConfig(
   agents.delete(oldName);
   agents.set(newName, oldEntry);
 
-  writeFileSync(configPath, doc.toString(), "utf-8");
+  // Atomic (tmp + fsync + rename, bind-mount-aware) so a crash / ENOSPC
+  // mid-rename can never truncate the operator's switchroom.yaml — the
+  // prior in-place writeFileSync could leave a torn / empty config on a
+  // failed write (2026-07 review, F1). Preserve the file's existing mode.
+  let mode = 0o644;
+  try {
+    mode = statSync(configPath).mode & 0o777;
+  } catch {
+    /* default 0o644 */
+  }
+  writeConfigFileSync(configPath, doc.toString(), mode);
 }
 
 /**

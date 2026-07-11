@@ -1,6 +1,7 @@
 import type { Command } from "commander";
 import chalk from "chalk";
-import { existsSync, copyFileSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, copyFileSync, readFileSync, mkdirSync, statSync } from "node:fs";
+import { writeConfigFileSync } from "../util/atomic.js";
 import { resolve, dirname } from "node:path";
 import { loadConfig, resolveAgentsDir, resolvePath, findConfigFile, ConfigError } from "../config/loader.js";
 import type { AgentConfig, SwitchroomConfig } from "../config/schema.js";
@@ -69,6 +70,24 @@ const STEP_DONE = chalk.green("OK");
 
 function stepHeader(num: number, title: string, status: string): void {
   console.log(`\n${status} ${chalk.bold(`Step ${num}:`)} ${title}`);
+}
+
+/**
+ * Atomically persist a mutated switchroom.yaml during the setup wizard.
+ *
+ * A crash / ENOSPC mid-write must never truncate the operator's config.
+ * Uses the bind-mount-aware writeConfigFileSync (falls back to an in-place
+ * fsync'd rewrite when a single-file bind mount rejects rename(2) with
+ * EBUSY) and preserves the file's existing mode bits.
+ */
+function writeSwitchroomYaml(configPath: string, text: string): void {
+  let mode = 0o644;
+  try {
+    mode = statSync(configPath).mode & 0o777;
+  } catch {
+    /* default 0o644 */
+  }
+  writeConfigFileSync(configPath, text, mode);
 }
 
 export function registerSetupCommand(program: Command): void {
@@ -346,7 +365,7 @@ export async function writeDetectedTimezone(
     // A confidently-real host zone — persist it verbatim, visible/editable.
     const before = readFileSync(destFile, "utf-8");
     const after = setSwitchroomTimezone(before, detected);
-    if (after !== before) writeFileSync(destFile, after);
+    if (after !== before) writeSwitchroomYaml(destFile, after);
     console.log(
       chalk.green(`  Detected timezone ${detected} — wrote switchroom.timezone.`),
     );
@@ -391,7 +410,7 @@ export async function writeDetectedTimezone(
   }
   const before = readFileSync(destFile, "utf-8");
   const after = setSwitchroomTimezone(before, zone);
-  if (after !== before) writeFileSync(destFile, after);
+  if (after !== before) writeSwitchroomYaml(destFile, after);
   console.log(chalk.green(`  Wrote switchroom.timezone: ${zone}.`));
 }
 
@@ -1608,7 +1627,9 @@ export function persistApprovalAuthTelegramId(
   // the posture key under an unrelated top-level `broker:` block.
   const result = insertVaultBrokerApprovalAuth(content, "telegram-id");
   if (result.kind === "rewritten") {
-    writeFileSync(configPath, result.content, "utf-8");
+    // Atomic (tmp + rename, bind-mount-aware) so a crash / ENOSPC
+    // mid-write can never truncate the operator's canonical config.
+    writeSwitchroomYaml(configPath, result.content);
   }
   return result.kind;
 }
@@ -1663,7 +1684,9 @@ export function persistDangerousMode(
     config.agents[name].dangerous_mode = true;
   }
 
-  writeFileSync(configPath, content, "utf-8");
+  // Atomic (tmp + rename, bind-mount-aware) so a crash / ENOSPC
+  // mid-write can never truncate the operator's canonical config.
+  writeSwitchroomYaml(configPath, content);
 }
 
 async function stepDangerousMode(

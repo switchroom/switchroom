@@ -10,15 +10,30 @@
  *   (f) reconcileAllAgentDefaultMcps iterates over agent directories correctly
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import * as fs from "node:fs";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { BuiltinMcpEntry } from "../memory/scaffold-integration.js";
+
+// Mock node:fs so the M5 atomicity block can force renameSync(2) to fail
+// (simulating a crash between the tmp write and the atomic swap) while every
+// other fs call keeps its real implementation. atomicWriteFileSync (which
+// reconcile-default-mcps.ts now routes through) imports renameSync from
+// node:fs, so this mock reaches it. Mirrors src/util/atomic.test.ts.
+vi.mock("node:fs", async () => {
+  const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+  return {
+    ...actual,
+    renameSync: vi.fn().mockImplementation(actual.renameSync),
+  };
+});
+
 import {
   reconcileAgentDefaultMcps,
   reconcileAllAgentDefaultMcps,
 } from "./reconcile-default-mcps.js";
-import type { BuiltinMcpEntry } from "../memory/scaffold-integration.js";
 
 // Minimal fixture defaults — tests don't need real npx commands
 const FIXTURE_DEFAULTS: BuiltinMcpEntry[] = [
@@ -257,5 +272,78 @@ describe("reconcileAllAgentDefaultMcps", () => {
     const results = reconcileAllAgentDefaultMcps(agentsDir, {}, FIXTURE_DEFAULTS);
     expect(results).toHaveLength(1);
     expect(results[0]!.name).toBe("realagent");
+  });
+});
+
+describe("reconcileAgentDefaultMcps — atomic write (M5 crash-safety)", () => {
+  let tmpRoot: string;
+
+  beforeEach(() => {
+    tmpRoot = mkdtempSync(join(tmpdir(), "sr-reconcile-atomic-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpRoot, { recursive: true, force: true });
+    vi.clearAllMocks();
+  });
+
+  // BITE: a crash / ENOSPC after the tmp write but before the atomic swap
+  // must leave the ORIGINAL settings.json fully intact — never a torn or
+  // truncated file (which the JSON.parse read at reconcile-default-mcps.ts:~76
+  // would then fail on, silently wiping the agent's MCP servers). Pre-fix this
+  // used a bare writeFileSync (truncate-in-place, no rename), so it never
+  // touched renameSync: the mocked failure never fired, the write "succeeded",
+  // and both assertions below fail.
+  it("leaves the original settings.json intact when rename(2) fails mid-write", () => {
+    const agentDir = makeAgentDir(tmpRoot, "atomic", {
+      mcpServers: { switchroom: { command: "bun", args: ["run", "server.ts"] } },
+    });
+    const settingsPath = join(agentDir, ".claude", "settings.json");
+    const originalRaw = readFileSync(settingsPath, "utf-8");
+
+    // Simulate a hard failure (EIO — NOT one of the bind-mount fallback codes)
+    // at the atomic swap. atomicWriteFileSync must clean its tmp and rethrow,
+    // leaving the destination untouched.
+    vi.mocked(fs.renameSync).mockImplementationOnce(() => {
+      throw Object.assign(new Error("EIO: i/o error"), { code: "EIO" });
+    });
+
+    expect(() =>
+      reconcileAgentDefaultMcps(agentDir, {}, FIXTURE_DEFAULTS),
+    ).toThrow(/EIO/);
+
+    // The original file is byte-for-byte unchanged — the write was atomic.
+    expect(readFileSync(settingsPath, "utf-8")).toBe(originalRaw);
+    // No orphaned tempfile left in the .claude dir.
+    const claudeDir = join(agentDir, ".claude");
+    expect(fs.readdirSync(claudeDir).filter((f) => f.includes(".tmp-"))).toHaveLength(0);
+  });
+
+  it("round-trips: on success the new entry is present and valid JSON", () => {
+    const agentDir = makeAgentDir(tmpRoot, "roundtrip", {
+      mcpServers: { switchroom: {} },
+    });
+    const settingsPath = join(agentDir, ".claude", "settings.json");
+
+    const result = reconcileAgentDefaultMcps(agentDir, {}, FIXTURE_DEFAULTS);
+    expect(result.changed).toBe(true);
+
+    // renameSync (real impl) was used — the atomic path, not a truncate.
+    expect(vi.mocked(fs.renameSync)).toHaveBeenCalled();
+    const parsed = JSON.parse(readFileSync(settingsPath, "utf-8")) as Record<string, unknown>;
+    const servers = parsed.mcpServers as Record<string, unknown>;
+    expect(servers["playwright"]).toEqual(FIXTURE_DEFAULTS[0]!.value);
+    // Trailing newline + pretty format preserved (no format change).
+    expect(readFileSync(settingsPath, "utf-8").endsWith("\n")).toBe(true);
+  });
+
+  it("preserves the settings.json mode across the atomic swap", () => {
+    const agentDir = makeAgentDir(tmpRoot, "modekeep", { mcpServers: {} });
+    const settingsPath = join(agentDir, ".claude", "settings.json");
+    fs.chmodSync(settingsPath, 0o600);
+
+    reconcileAgentDefaultMcps(agentDir, {}, FIXTURE_DEFAULTS);
+
+    expect(fs.statSync(settingsPath).mode & 0o777).toBe(0o600);
   });
 });

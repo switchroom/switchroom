@@ -10,9 +10,10 @@
  * and add only what's absent. Idempotent — running twice produces no changes.
  */
 
-import { existsSync, readFileSync, writeFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { getBuiltinDefaultMcpEntries, type BuiltinMcpEntry } from "../memory/scaffold-integration.js";
+import { atomicWriteFileSync } from "../util/atomic.js";
 
 /**
  * Result for a single agent processed by reconcileDefaultMcps.
@@ -100,7 +101,20 @@ export function reconcileAgentDefaultMcps(
 
   if (result.added.length > 0) {
     settings.mcpServers = mcpServers;
-    writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n", "utf-8");
+    // Atomic tmp+fsync+rename so a crash/ENOSPC mid-write can never leave a
+    // torn or truncated settings.json (which the read at line ~76 would then
+    // fail to JSON.parse, silently disabling the agent's MCP servers). Preserve
+    // the existing file's inode mode across the swap — the plain writeFileSync
+    // this replaced kept the mode of the already-existing file, whereas
+    // atomicWriteFileSync creates a fresh tmp inode, so we carry the mode over
+    // explicitly (default 0o600 to match the scaffold's settings.json mode).
+    let mode = 0o600;
+    try {
+      mode = statSync(settingsPath).mode & 0o777;
+    } catch {
+      /* fall back to 0o600 */
+    }
+    atomicWriteFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n", mode);
     result.changed = true;
   }
 
