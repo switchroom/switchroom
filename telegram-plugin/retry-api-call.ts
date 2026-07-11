@@ -268,8 +268,9 @@ export function createRetryApiCall(
           `telegram gateway: flood window still open for ${retryAfterSec}s — ` +
             `not issuing the ${opts?.verb ?? 'api-call'} (would feed the ban)\n`,
         )
-        observer?.onGiveUp?.({ attempts: attempt, error: new Error(FLOOD_WAIT_ACTIVE) })
-        throw makeFloodWaitActiveError(retryAfterSec, Date.now() + remaining, null)
+        const gated = makeFloodWaitActiveError(retryAfterSec, Date.now() + remaining, null)
+        observer?.onGiveUp?.({ attempts: attempt + 1, error: gated })
+        throw gated
       }
       try {
         return await fn()
