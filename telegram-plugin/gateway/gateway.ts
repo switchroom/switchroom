@@ -597,6 +597,7 @@ import type {
   SendOutboundMessage,
   QuotaWallDetectedMessage,
   QueryPendingPermissionMessage,
+  CheckPreApprovedMessage,
   PostSkillProposalMessage,
   PermissionEvent,
   RolloutStatusPostMessage,
@@ -672,6 +673,7 @@ import {
 import { createScopedGrantStore } from './scoped-grant-store.js'
 import { grantRestartDecision, type GrantRestartDecision } from './grant-restart.js'
 import { synthesizeAllowRuleDiff, extractAddedAllowRule } from '../permission-diff.js'
+import { isDiffPreApproved } from './pre-approval-check.js'
 import {
   readClaudeJsonOverage,
   evaluateCreditState,
@@ -5786,6 +5788,23 @@ function sweepStaleMentalModelCorrelations(now = Date.now()): void {
   pendingMentalModelCorrelations.sweep(now)
 }
 
+// #2975 Stage 2 — read-only pre-approval predicate. hostd asks (over the
+// approval-gateway socket, via `check_pre_approved`) whether an EXACT
+// (agent, diff) pair is already operator-consented so it can skip the
+// config_propose_edit rate limit for that persist. The forge-resistant,
+// read-only matching lives in the pure `isDiffPreApproved` (pre-approval-
+// check.ts) so its contract — true only for a byte-exact registered pair,
+// NEVER a mutation — is unit-testable without importing this module. Here we
+// only bind it to the live correlation stores + helpers.
+function isDiffPreApprovedLive(agentName: string, unifiedDiff: string): boolean {
+  return isDiffPreApproved(agentName, unifiedDiff, {
+    alwaysAllow: pendingAlwaysAllowCorrelations,
+    mentalModel: pendingMentalModelCorrelations,
+    extractAddedAllowRule,
+    mentalModelCorrelationKey,
+  })
+}
+
 // Scoped-approval store: the 30-min window that backs the "✅ Allow" tap for
 // narrow non-destructive scopes (not a separate button — it IS what Allow
 // means for those). Operator-tapped, gateway-side ONLY (never pushed to the
@@ -10586,6 +10605,36 @@ const ipcServer: IpcServer = createIpcServer({
     } catch (err) {
       process.stderr.write(
         `telegram gateway: query_pending_permission reply failed: ${(err as Error).message}\n`,
+      )
+    }
+  },
+
+  // #2975 Stage 2 — read-only pre-approval query from hostd. Answer whether the
+  // EXACT (agent, diff) pair is already operator-consented so hostd can skip the
+  // config_propose_edit rate limit for that persist. NEVER mutates state: it
+  // only peeks the correlation maps by byte-exact match (isDiffPreApproved).
+  // Fail-closed by construction — any agent mismatch or missing correlation
+  // answers `preApproved: false`.
+  onCheckPreApproved(client: IpcClient, msg: CheckPreApprovedMessage) {
+    let preApproved = false
+    try {
+      const self = process.env.SWITCHROOM_AGENT_NAME
+      // This gateway serves exactly one agent; a query for a different agent
+      // can never be pre-approved here.
+      if (!self || msg.agentName === self) {
+        preApproved = isDiffPreApprovedLive(msg.agentName, msg.unifiedDiff)
+      }
+    } catch (err) {
+      process.stderr.write(
+        `telegram gateway: check_pre_approved errored — ${(err as Error).message} (failing closed)\n`,
+      )
+      preApproved = false
+    }
+    try {
+      client.send({ type: 'pre_approved_result', correlationId: msg.correlationId, preApproved })
+    } catch (err) {
+      process.stderr.write(
+        `telegram gateway: check_pre_approved reply failed: ${(err as Error).message}\n`,
       )
     }
   },

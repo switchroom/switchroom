@@ -26,6 +26,11 @@ interface FakeGateway {
   socketPath: string;
   /** Set by the test to control how the gateway responds to incoming requests. */
   respond: (write: (line: string) => void, requestId: string) => void;
+  /** #2975 Stage 2 — control the reply to a check_pre_approved query. */
+  respondPreApproved: (
+    write: (line: string) => void,
+    correlationId: string,
+  ) => void;
   /** All client sockets — force-destroyed by afterEach to unblock server.close. */
   clients: Socket[];
 }
@@ -43,11 +48,20 @@ function startFakeGateway(): FakeGateway {
       buf = lines.pop() ?? "";
       for (const line of lines) {
         if (!line.trim()) continue;
-        const obj = JSON.parse(line) as { type: string; requestId: string };
+        const obj = JSON.parse(line) as {
+          type: string;
+          requestId: string;
+          correlationId: string;
+        };
         if (obj.type === "request_config_approval") {
           handle.respond?.(
             (out: string) => sock.write(out + "\n"),
             obj.requestId,
+          );
+        } else if (obj.type === "check_pre_approved") {
+          handle.respondPreApproved?.(
+            (out: string) => sock.write(out + "\n"),
+            obj.correlationId,
           );
         }
       }
@@ -58,6 +72,8 @@ function startFakeGateway(): FakeGateway {
   handle.socketPath = socketPath;
   // default respond — overridden per-test
   handle.respond = () => {};
+  // default: a gateway that never answers a pre-approval query (fail-closed).
+  handle.respondPreApproved = () => {};
   // cleanup attached to the returned object via close handler
   server.on("close", () => {
     try {
@@ -224,5 +240,122 @@ describe("SocketApprovalGateway — dispatch_failure plumbing (#1762)", () => {
     expect(result.verdict).toBe("deny");
     expect(result.denySource).toBe("dispatch_failure");
     expect(result.reason).toBeDefined();
+  });
+});
+
+describe("SocketApprovalGateway.checkPreApproved — read-only bypass query (#2975 Stage 2)", () => {
+  let fake: FakeGateway;
+
+  beforeEach(() => {
+    fake = startFakeGateway();
+  });
+  afterEach(async () => {
+    for (const c of fake.clients) c.destroy();
+    await new Promise<void>((resolve) => fake.server.close(() => resolve()));
+  });
+
+  it("returns true when the gateway answers preApproved:true", async () => {
+    fake.respondPreApproved = (write, correlationId) => {
+      write(
+        JSON.stringify({
+          type: "pre_approved_result",
+          correlationId,
+          preApproved: true,
+        }),
+      );
+    };
+    const gw = new SocketApprovalGateway({
+      resolveGatewaySocket: () => fake.socketPath,
+    });
+    expect(await gw.checkPreApproved("klanker", "--- a\n+++ b\n")).toBe(true);
+  });
+
+  it("returns false when the gateway answers preApproved:false", async () => {
+    fake.respondPreApproved = (write, correlationId) => {
+      write(
+        JSON.stringify({
+          type: "pre_approved_result",
+          correlationId,
+          preApproved: false,
+        }),
+      );
+    };
+    const gw = new SocketApprovalGateway({
+      resolveGatewaySocket: () => fake.socketPath,
+    });
+    expect(await gw.checkPreApproved("klanker", "--- a\n+++ b\n")).toBe(false);
+  });
+
+  it("fails closed (false) when the gateway never answers (mixed-version / old gateway)", async () => {
+    // Default respondPreApproved is a no-op — no reply is ever sent, so the
+    // short internal timeout must resolve false. Uses real timers; the query
+    // deadline is 2s so we allow up to ~3s.
+    fake.respondPreApproved = () => {};
+    const gw = new SocketApprovalGateway({
+      resolveGatewaySocket: () => fake.socketPath,
+    });
+    expect(await gw.checkPreApproved("klanker", "--- a\n+++ b\n")).toBe(false);
+  }, 5_000);
+
+  it("fails closed (false) on an unknown/unsupported-message reply", async () => {
+    // An old gateway that doesn't know check_pre_approved might echo an error
+    // frame of a different type — treat any non-matching type as not approved.
+    fake.respondPreApproved = (write, correlationId) => {
+      write(
+        JSON.stringify({
+          type: "error",
+          correlationId,
+          reason: "unknown message type: check_pre_approved",
+        }),
+      );
+    };
+    const gw = new SocketApprovalGateway({
+      resolveGatewaySocket: () => fake.socketPath,
+    });
+    expect(await gw.checkPreApproved("klanker", "--- a\n+++ b\n")).toBe(false);
+  });
+
+  it("fails closed (false) on a garbled (non-JSON) reply", async () => {
+    fake.respondPreApproved = (write) => {
+      write("this is not json {{{");
+    };
+    const gw = new SocketApprovalGateway({
+      resolveGatewaySocket: () => fake.socketPath,
+    });
+    expect(await gw.checkPreApproved("klanker", "--- a\n+++ b\n")).toBe(false);
+  });
+
+  it("fails closed (false) when the socket closes before answering", async () => {
+    fake.respondPreApproved = () => {
+      for (const c of fake.clients) c.destroy();
+    };
+    const gw = new SocketApprovalGateway({
+      resolveGatewaySocket: () => fake.socketPath,
+    });
+    expect(await gw.checkPreApproved("klanker", "--- a\n+++ b\n")).toBe(false);
+  });
+
+  it("fails closed (false) when there is no reachable gateway socket", async () => {
+    const gw = new SocketApprovalGateway({
+      resolveGatewaySocket: () => null,
+    });
+    expect(await gw.checkPreApproved("klanker", "--- a\n+++ b\n")).toBe(false);
+  });
+
+  it("ignores a reply carrying a mismatched correlationId (fail closed)", async () => {
+    fake.respondPreApproved = (write) => {
+      write(
+        JSON.stringify({
+          type: "pre_approved_result",
+          correlationId: "some-other-id",
+          preApproved: true,
+        }),
+      );
+    };
+    const gw = new SocketApprovalGateway({
+      resolveGatewaySocket: () => fake.socketPath,
+    });
+    // Mismatched correlationId is a non-matching frame → fail closed to false.
+    expect(await gw.checkPreApproved("klanker", "--- a\n+++ b\n")).toBe(false);
   });
 });
