@@ -469,6 +469,74 @@ describe("dispatchTool — failure modes", () => {
     }
   });
 
+  // ── #2560 — get_status per-request wire lookup ─────────────────────────
+  it("get_status with request_id RPCs hostd's wire get_status (rollout visibility)", async () => {
+    const wireResp = ok({
+      result: "started",
+      request_id: "mcp-get-status-abc",
+      payload: JSON.stringify({
+        rolled: ["test-harness"],
+        phase: "agents-start",
+        n: 2,
+        m: 5,
+        agent: "clerk",
+        pin: "v0.18.10",
+      }),
+    });
+    hostdRequestMock.mockResolvedValueOnce(wireResp);
+    const res = await dispatchTool("get_status", {
+      request_id: "mcp-rollout-1750000000000-deadbeef",
+    });
+    expect(res.isError).toBeFalsy();
+    const sent = hostdRequestMock.mock.calls[0]![1];
+    expect(sent.op).toBe("get_status");
+    expect(sent.args).toEqual({
+      target_request_id: "mcp-rollout-1750000000000-deadbeef",
+    });
+    expect(sent.request_id).toMatch(/^mcp-get-status-/);
+    // The rich per-request payload is surfaced verbatim — phase/n/m intact.
+    const parsed = JSON.parse(res.content[0]!.text);
+    const payload = JSON.parse(parsed.payload);
+    expect(payload.phase).toBe("agents-start");
+    expect(payload.n).toBe(2);
+    expect(payload.m).toBe(5);
+    expect(payload.rolled).toEqual(["test-harness"]);
+  });
+
+  it("get_status with request_id surfaces a hostd denied response as isError", async () => {
+    const denied: HostdResponse = {
+      v: 1,
+      request_id: "x",
+      result: "denied",
+      exit_code: null,
+      duration_ms: 0,
+      error: 'get_status: request_id not found or not visible to caller "klanker"',
+    };
+    hostdRequestMock.mockResolvedValueOnce(denied);
+    const res = await dispatchTool("get_status", { request_id: "nope-123" });
+    expect(res.isError).toBe(true);
+    expect(res.content[0]!.text).toContain("not found or not visible");
+  });
+
+  it("get_status with request_id requires the socket (no audit-log fallback)", async () => {
+    existsSyncMock.mockReturnValueOnce(false);
+    const res = await dispatchTool("get_status", { request_id: "r-1" });
+    expect(res.isError).toBe(true);
+    expect(res.content[0]!.text).toMatch(/socket not bound/);
+    expect(hostdRequestMock).not.toHaveBeenCalled();
+  });
+
+  it("get_status inputSchema declares the optional request_id", () => {
+    const tool = TOOLS.find((t) => t.name === "get_status")!;
+    const schema = tool.inputSchema as unknown as {
+      required?: string[];
+      properties: Record<string, unknown>;
+    };
+    expect(schema.properties).toHaveProperty("request_id");
+    // Optional — the no-arg audit-log form stays backward compatible.
+    expect(schema.required ?? []).not.toContain("request_id");
+  });
+
   it("unknown tool name returns an error without wire-calling", async () => {
     const res = await dispatchTool("nope", {});
     expect(res.isError).toBe(true);
