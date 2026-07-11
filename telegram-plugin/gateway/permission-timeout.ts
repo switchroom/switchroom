@@ -151,6 +151,31 @@ export function buildTimedOutCardEdits(
 }
 
 /**
+ * Suffix appended to a card body when its turn is halted by the operator
+ * (#3020 `/stop` / bare "stop" / empty `!`). Same keyboard-strip contract as
+ * the timeout path: the halted turn's MCP permission call is being denied,
+ * so a later Approve tap must not be able to dispatch into an idle session.
+ */
+export const CANCELLED_FOOTER = '\n\n⏹ Cancelled — the turn was stopped'
+
+/**
+ * Build the (pure) list of card edits the halt path applies when the
+ * operator stops the in-flight turn: re-render each recorded card with the
+ * cancelled footer and strip the keyboard. Mirrors buildTimedOutCardEdits.
+ */
+export function buildCancelledCardEdits(
+  cardText: string,
+  cards: readonly PermissionCardRef[],
+): TimedOutCardEdit[] {
+  return cards.map(({ chatId, messageId }) => ({
+    chatId,
+    messageId,
+    text: `${cardText}${CANCELLED_FOOTER}`,
+    stripKeyboard: true,
+  }))
+}
+
+/**
  * A tap on a permission card is STALE when no pending entry exists for its
  * request_id — the reaper already auto-denied + deleted it on TTL. A stale
  * tap must NOT dispatch a verdict (the dead id is ignored by Claude Code);

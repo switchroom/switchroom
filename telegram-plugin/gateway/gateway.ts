@@ -124,6 +124,7 @@ import {
   approvalTtlMs,
   ttlForTool,
   buildTimedOutCardEdits,
+  buildCancelledCardEdits,
   STALE_TAP_NOTICE,
   type PermissionCardRef,
 } from './permission-timeout.js'
@@ -3863,9 +3864,58 @@ function waitForSafeBoundary(maxWaitMs: number): Promise<'boundary' | 'timeout'>
   })
 }
 
+// #3020 item 4 — a halted turn may be suspended INSIDE an MCP permission
+// call with a live Approve/Deny card in chat. The card's pending entry keeps
+// the buffer gate closed (`hasPendingApproval`), and a later Approve tap
+// would dispatch a verdict into an idle session. Deny each pending request
+// (unblocking the suspended call before/as the C-c lands) and edit its
+// card(s) to a cancelled state with the keyboard stripped.
+function cancelPendingPermissionsForHalt(origin: string): void {
+  if (pendingPermissions.size === 0) return
+  for (const [requestId, details] of pendingPermissions) {
+    // halted-turn-verdict: the turn this card parked is being KILLED by the
+    // operator — there is nothing to resume, so no resumeReactionAfterVerdict
+    // / postPermissionResumeMessage pairing. The card edit ("⏹ Cancelled")
+    // is the visible terminal state and the /stop reply is the operator ack.
+    dispatchPermissionVerdict({
+      type: 'permission',
+      requestId,
+      behavior: 'deny',
+      message: 'Cancelled — the operator stopped this turn. Do not retry.',
+    })
+    void stripCancelledPermissionCards(details.card_text, details.cards)
+    pendingPermissions.delete(requestId)
+    permCardStore.remove(requestId)
+    process.stderr.write(
+      `telegram gateway: halt-now cancelled pending permission origin=${origin} ` +
+      `request=${requestId} tool=${details.tool_name}\n`,
+    )
+  }
+}
+
+async function stripCancelledPermissionCards(
+  cardText: string,
+  cards: PermissionCardRef[],
+): Promise<void> {
+  for (const edit of buildCancelledCardEdits(cardText, cards)) {
+    await swallowingApiCall(
+      // allow-raw-bot-api: routed through swallowingApiCall (retry policy); message-id-targeted edit (no thread to lose). Passing {} as opts (no reply_markup) strips the stale Allow/Deny keyboard atomically with the text edit.
+      () => bot.api.editMessageText(edit.chatId, edit.messageId, richMessage(edit.text), {}),
+      { chat_id: edit.chatId, verb: 'permission_halt.strip' },
+    )
+  }
+}
+
 async function executeHaltNow(origin: string): Promise<void> {
   const agentName = process.env.SWITCHROOM_AGENT_NAME
   if (!agentName) return
+  // #3020 item 3 — snapshot the halt target at request entry. The boundary
+  // wait below can park for seconds; if the targeted turn ends naturally in
+  // that window and a NEW turn starts, firing the C-c would kill an innocent
+  // turn the requester never saw. Identity is the currentTurn object itself
+  // (registryKey included, for the log line).
+  const haltTarget = currentTurn
+  const haltTargetKey = haltTarget?.registryKey ?? null
   const access = loadAccess()
   const timing = decideInterruptTiming({
     safeBoundaryEnabled: resolveSafeBoundaryEnabled(access.interruptSafeBoundary),
@@ -3879,6 +3929,19 @@ async function executeHaltNow(origin: string): Promise<void> {
       `telegram gateway: halt-now boundary-wait origin=${origin} reason=${reason} ` +
       `waited_ms=${Date.now() - startedAt} in_flight=${toolFlightTracker.inFlightCount()}\n`,
     )
+  }
+  // #3020 item 3 — wrong-turn kill guard: if the turn changed while we
+  // waited (the target ended naturally; a new turn may already be running),
+  // no-op the C-c AND the teardown — the requester's turn already ended and
+  // the current busy/permission state belongs to someone else. This also
+  // skips the benign-but-pointless idle-session C-c when target-ended → idle.
+  if (currentTurn !== haltTarget) {
+    process.stderr.write(
+      `telegram gateway: halt-now skipped — turn changed during boundary wait ` +
+      `origin=${origin} target_key=${haltTargetKey ?? 'none'} ` +
+      `current_key=${currentTurn?.registryKey ?? 'none'}\n`,
+    )
+    return
   }
   try {
     // Same tmux-direct rationale as the `!` path: the gateway runs inside the
@@ -3901,6 +3964,10 @@ async function executeHaltNow(origin: string): Promise<void> {
   // cancelled question isn't re-presented/escalated later. Must run before the
   // teardown below (it reads `currentTurn`).
   cancelInterruptedObligation()
+  // Item 4 — deny + strip any Approve/Deny cards belonging to the halted
+  // turn so the buffer gate (`hasPendingApproval`) opens and a later tap
+  // can't dispatch into an idle session.
+  cancelPendingPermissionsForHalt(origin)
   // Deterministic busy release (step 4 above).
   const turn = currentTurn
   if (turn != null) {
@@ -3928,6 +3995,11 @@ async function executeHaltNow(origin: string): Promise<void> {
     endCurrentTurnAtomic(turn)
     releaseTurnBufferGate(key, turn)
   }
+  // #3020 item 5 — the busy release above may have opened the idle gate, and
+  // no turn_end event follows a halt to trigger the usual idle-drain hook.
+  // Kick the queued session-command drain now so a queued /model or /effort
+  // applies promptly instead of waiting for the 60s reaper.
+  if (!turnInFlightForGate()) void drainPendingSessionCommand()
 }
 
 // #549 fix — preamble suppression for the answer-stream path.
@@ -16539,8 +16611,10 @@ async function handleInboundCoalesced(
   // #3020: bare "stop" is a kill switch, same urgency as `!` — bypass the
   // coalesce window so it fires mid-turn instead of merging into a normal
   // turn (and so an earlier buffered message can't prepend itself and defeat
-  // the exact-word parse in handleInbound).
-  if (parseStopKeyword(text)) {
+  // the exact-word parse in handleInbound). Pure text only: a photo/document
+  // captioned "stop" is content for the agent (e.g. a stop sign to look at),
+  // not a halt request — attachments flow through the normal pipeline.
+  if (parseStopKeyword(text) && downloadImage == null && attachment == null) {
     return handleInbound(ctx, text, downloadImage, attachment)
   }
 
@@ -16856,7 +16930,15 @@ async function handleInbound(
   // as a normal turn. Intercepted here (never forwarded) so it fires mid-turn
   // instead of queueing behind the very turn it's trying to cancel.
   // Authorization: same allowFrom gate as any inbound (gate() above).
-  if (parseStopKeyword(text)) {
+  // Pure text only (7b): a photo/attachment captioned "stop" is content for
+  // the agent, not a halt request — it must never trip the halt-and-drop
+  // path (the caption + attachment flow through as a normal turn).
+  if (
+    parseStopKeyword(text) &&
+    downloadImage == null &&
+    attachment == null &&
+    (extraAttachments == null || extraAttachments.length === 0)
+  ) {
     const queuedLabels = pendingSessionCommand.list().map(c => `/${c.kind} ${c.targetLabel}`)
     const inFlight = turnInFlightForGate()
     process.stderr.write(
@@ -20538,6 +20620,18 @@ bot.command('agentstop', async ctx => {
 // bare "stop" keyword and the empty-`!` interrupt; shared executeHaltNow).
 bot.command('stop', async ctx => {
   if (!isAuthorizedSender(ctx)) return
+  // 7a: /stop takes NO argument. "/stop worker" is almost certainly old
+  // container-stop muscle memory (the verb that moved to /agentstop) — warn
+  // and do NOT halt, so a mis-remembered command can't kill an unrelated turn.
+  const arg = ctx.match?.trim()
+  if (arg) {
+    await switchroomReply(
+      ctx,
+      `/stop takes no argument — it cancels MY in-flight turn. ` +
+      `To stop a container, use /agentstop ${arg}. Nothing was stopped.`,
+    )
+    return
+  }
   const queuedLabels = pendingSessionCommand.list().map(c => `/${c.kind} ${c.targetLabel}`)
   const inFlight = turnInFlightForGate()
   if (!inFlight) {

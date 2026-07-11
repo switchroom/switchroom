@@ -128,8 +128,14 @@ describe('gateway secret-detect intercept — structural wiring', () => {
   })
 
   it('staging follow-up commands (stash/ignore/rename/forget) are wired', () => {
+    // Guarded property: the staging follow-up parser lives INSIDE
+    // handleInbound (so it runs on the inbound-text path, gated by the same
+    // allowFrom check). The window is a generous bound on handleInbound's
+    // pre-staging body, not a precise offset — it has grown before (#3020's
+    // stop-keyword block pushed it past the old 30k) and may grow again;
+    // bump it when new early-return branches land above the staging block.
     const handleInboundIdx = src.indexOf('async function handleInbound(')
-    const tail = src.slice(handleInboundIdx, handleInboundIdx + 30000)
+    const tail = src.slice(handleInboundIdx, handleInboundIdx + 50000)
     expect(tail).toMatch(/\(stash\|ignore\|rename\|forget\)/)
     expect(tail).toMatch(/secretStaging\.latestForChat\(chat_id\)/)
   })

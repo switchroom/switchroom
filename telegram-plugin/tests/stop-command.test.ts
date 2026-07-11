@@ -104,7 +104,7 @@ describe('gateway wiring — /stop cancels the in-flight turn (#3020)', () => {
   it('executeHaltNow honors the safe-boundary deferral then fires tmux C-c, cancels the obligation, and releases busy state', () => {
     const fnIdx = GATEWAY_SRC.indexOf('async function executeHaltNow(')
     expect(fnIdx).toBeGreaterThan(0)
-    const win = GATEWAY_SRC.slice(fnIdx, fnIdx + 3200)
+    const win = GATEWAY_SRC.slice(fnIdx, fnIdx + 5500)
     const deferIdx = win.indexOf('decideInterruptTiming({')
     expect(deferIdx).toBeGreaterThan(0)
     expect(win).toContain('resolveInterruptMaxWaitMs')
@@ -122,6 +122,46 @@ describe('gateway wiring — /stop cancels the in-flight turn (#3020)', () => {
     expect(stampIdx).toBeGreaterThan(cancelIdx)
     expect(endIdx).toBeGreaterThan(stampIdx)
     expect(releaseIdx).toBeGreaterThan(endIdx)
+  })
+
+  it('executeHaltNow guards against the wrong-turn kill race (snapshot at entry, no-op if the turn changed)', () => {
+    const fnIdx = GATEWAY_SRC.indexOf('async function executeHaltNow(')
+    const win = GATEWAY_SRC.slice(fnIdx, fnIdx + 5500)
+    // Identity snapshotted BEFORE the boundary wait…
+    const snapIdx = win.indexOf('const haltTarget = currentTurn')
+    const waitIdx = win.indexOf('await waitForSafeBoundary(')
+    expect(snapIdx).toBeGreaterThan(0)
+    expect(snapIdx).toBeLessThan(waitIdx)
+    // …and re-checked AFTER it, before the C-c: a changed turn no-ops both
+    // the SIGINT and the teardown (the requester's turn already ended).
+    const guardIdx = win.indexOf('currentTurn !== haltTarget')
+    const sigintIdx = win.indexOf('sendAgentInterrupt({ agentName })')
+    expect(guardIdx).toBeGreaterThan(waitIdx)
+    expect(guardIdx).toBeLessThan(sigintIdx)
+    const afterGuard = win.slice(guardIdx)
+    expect(afterGuard).toMatch(/\n\s*return\b/)
+  })
+
+  it('executeHaltNow cancels the halted turn\'s pending permission cards and kicks the session-command drain', () => {
+    const fnIdx = GATEWAY_SRC.indexOf('async function executeHaltNow(')
+    const win = GATEWAY_SRC.slice(fnIdx, fnIdx + 5500)
+    // Item 4: deny + strip pending Approve/Deny cards so the buffer gate
+    // opens and a later tap can't dispatch into an idle session.
+    const permCancelIdx = win.indexOf('cancelPendingPermissionsForHalt(origin)')
+    expect(permCancelIdx).toBeGreaterThan(0)
+    // Item 5: after busy release, drain a queued /model / /effort promptly
+    // instead of waiting for the 60s reaper.
+    const drainIdx = win.indexOf('if (!turnInFlightForGate()) void drainPendingSessionCommand()')
+    const releaseIdx = win.indexOf('releaseTurnBufferGate(key, turn)')
+    expect(drainIdx).toBeGreaterThan(releaseIdx)
+    // The cancel helper itself denies, strips, and forgets each card.
+    const helperIdx = GATEWAY_SRC.indexOf('function cancelPendingPermissionsForHalt(')
+    expect(helperIdx).toBeGreaterThan(0)
+    const helperWin = GATEWAY_SRC.slice(helperIdx, helperIdx + 1200)
+    expect(helperWin).toContain("behavior: 'deny'")
+    expect(helperWin).toContain('stripCancelledPermissionCards(')
+    expect(helperWin).toContain('pendingPermissions.delete(requestId)')
+    expect(helperWin).toContain('permCardStore.remove(requestId)')
   })
 
   it('the session-event ingest kicks halt-boundary waiters alongside the deferred-interrupt boundary check', () => {
@@ -149,6 +189,33 @@ describe('gateway wiring — /stop cancels the in-flight turn (#3020)', () => {
 
   it('the empty-`!` interrupt routes through the same executeHaltNow helper', () => {
     expect(GATEWAY_SRC).toContain("executeHaltNow('bang-empty')")
+  })
+
+  it('/stop with an argument warns and does NOT halt (old container-stop muscle memory)', () => {
+    const idx = GATEWAY_SRC.indexOf("bot.command('stop', async ctx => {")
+    const win = GATEWAY_SRC.slice(idx, idx + 1600)
+    const argIdx = win.indexOf('const arg = ctx.match?.trim()')
+    const haltIdx = win.indexOf("executeHaltNow('stop-command')")
+    expect(argIdx).toBeGreaterThan(0)
+    // Arg check runs BEFORE the halt and returns without cancelling.
+    expect(argIdx).toBeLessThan(haltIdx)
+    expect(win).toContain('takes no argument')
+    expect(win).toContain('/agentstop')
+    expect(win).toContain('Nothing was stopped')
+  })
+
+  it('a photo/attachment captioned "stop" never trips the halt-and-drop path', () => {
+    // Coalesce bypass: pure text only.
+    const bypassIdx = GATEWAY_SRC.indexOf(
+      'parseStopKeyword(text) && downloadImage == null && attachment == null',
+    )
+    expect(bypassIdx).toBeGreaterThan(0)
+    // handleInbound keyword block: also excludes coalesced extra attachments.
+    const kwIdx = GATEWAY_SRC.indexOf("executeHaltNow('stop-keyword')")
+    const kwWin = GATEWAY_SRC.slice(kwIdx - 2400, kwIdx)
+    expect(kwWin).toContain('downloadImage == null')
+    expect(kwWin).toContain('attachment == null')
+    expect(kwWin).toContain('extraAttachments == null || extraAttachments.length === 0')
   })
 })
 

@@ -130,12 +130,20 @@ is open, the gateway parks the interrupt (acked immediately with ⚡),
 waits for the tool to finish (`tool_result`) or the turn to end, then
 fires the SIGINT and delivers your replacement. If no tool is in flight
 the interrupt fires immediately — the deferral only kicks in at the
-unsafe moment. A bare `!` (halt-now, no replacement text) always fires
-immediately. Rapid repeated `!` while one is parked coalesce into a
-single interrupt carrying the latest body. The `max_wait_ms` cap fires
-the interrupt anyway if no boundary arrives in time. Cascades like every
-other `channels.telegram.*` knob; takes effect after `switchroom apply`
-+ agent restart.
+unsafe moment. A bare `!` (halt-now, no replacement text) honors the
+same boundary: instant when `safe_boundary` is off (the default), a
+bounded deferral (up to `max_wait_ms`, default 8s) when it's on and a
+tool call is open. The same applies to `/stop` and the bare `stop`
+keyword, which share the halt path. Rapid repeated `!` while one is
+parked coalesce into a single interrupt carrying the latest body. The
+`max_wait_ms` cap fires the interrupt anyway if no boundary arrives in
+time. Cascades like every other `channels.telegram.*` knob; takes
+effect after `switchroom apply` + agent restart.
+
+In forum (topic-mode) agents, a bare `stop` — like `!` and `/stop` —
+halts the agent's single global in-flight turn regardless of which
+topic it's sent from: there is one claude session per agent, so there
+is only ever one turn to cancel.
 
 ## Webhook ingest
 
