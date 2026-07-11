@@ -87,14 +87,33 @@ describe('send-gate: feature flag', () => {
     expect(calls.map((c) => c.label)).toEqual(['v1', 'v2'])
   })
 
-  it('sendGateEnabledFromEnv follows the SWITCHROOM_*=== "1" convention', () => {
-    expect(sendGateEnabledFromEnv({} as NodeJS.ProcessEnv)).toBe(false)
+  it('sendGateEnabledFromEnv is ON BY DEFAULT (escape hatch, not opt-in)', () => {
+    // Unset → enabled. This assertion is load-bearing: it fails if the default
+    // is ever flipped back to off.
+    expect(sendGateEnabledFromEnv({} as NodeJS.ProcessEnv)).toBe(true)
     expect(
-      sendGateEnabledFromEnv({ SWITCHROOM_TELEGRAM_SEND_GATE: '0' } as unknown as NodeJS.ProcessEnv),
-    ).toBe(false)
-    expect(
-      sendGateEnabledFromEnv({ SWITCHROOM_TELEGRAM_SEND_GATE: '1' } as unknown as NodeJS.ProcessEnv),
+      sendGateEnabledFromEnv({ SWITCHROOM_TELEGRAM_SEND_GATE: undefined } as NodeJS.ProcessEnv),
     ).toBe(true)
+  })
+
+  it('sendGateEnabledFromEnv disables only on explicit off values (safety valve)', () => {
+    for (const off of ['0', 'false', 'off', 'no', 'FALSE', 'Off', ' no ', '  0 ']) {
+      expect(
+        sendGateEnabledFromEnv({
+          SWITCHROOM_TELEGRAM_SEND_GATE: off,
+        } as unknown as NodeJS.ProcessEnv),
+      ).toBe(false)
+    }
+  })
+
+  it('sendGateEnabledFromEnv stays enabled for any other value', () => {
+    for (const on of ['1', 'true', 'on', 'yes', 'enabled', '', 'anything']) {
+      expect(
+        sendGateEnabledFromEnv({
+          SWITCHROOM_TELEGRAM_SEND_GATE: on,
+        } as unknown as NodeJS.ProcessEnv),
+      ).toBe(true)
+    }
   })
 })
 

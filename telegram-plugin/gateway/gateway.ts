@@ -5468,9 +5468,10 @@ const recordFloodWindow = makeFloodWindowRecorder(FLOOD_WINDOWS_PATH)
 // edit floor + no-op-edit skip + PRIORITY SHEDDING + DEGRADED MODE). Wrapped
 // HERE at the robustApiCall layer so every Bot API call routed through the
 // standard retry policy also transits one scheduler (no call site can bypass
-// it). Feature-flagged, default OFF: when SWITCHROOM_TELEGRAM_SEND_GATE !== '1'
-// the gate is a pure passthrough and the retry policy behaves exactly as
-// before. Composes with #3094's pre-call flood gate and #3097's non-essential
+// it). ON BY DEFAULT (escape hatch): only when SWITCHROOM_TELEGRAM_SEND_GATE is
+// explicitly set to 0/false/off/no is the gate a pure passthrough and the retry
+// policy behaves exactly as before. Composes with #3094's pre-call flood gate
+// and #3097's non-essential
 // drop policy — those decide whether a call happens at all; this paces the
 // calls that do.
 //
