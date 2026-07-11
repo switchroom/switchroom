@@ -811,9 +811,38 @@ export function alignAgentUid(
 }
 
 /**
- * Resolve a bot token value. If it's a vault reference, try to resolve it
- * via SWITCHROOM_VAULT_PASSPHRASE or fall back to TELEGRAM_BOT_TOKEN env var.
- * Returns the resolved token or undefined if unresolvable.
+ * Placeholder written to `telegram/.env` when this agent's bot token cannot
+ * be resolved at scaffold time (e.g. an as-yet-ungranted `vault:` reference).
+ * Deliberately carries NO active `TELEGRAM_BOT_TOKEN=` assignment — only the
+ * commented hint — so `isTelegramEnvPlaceholder` can tell it apart from a real
+ * operator-set token and `refreshTelegramBotTokenEnv` may safely overwrite it
+ * once a later reconcile resolves the vault grant.
+ */
+const TELEGRAM_ENV_PLACEHOLDER = `# Set your bot token: TELEGRAM_BOT_TOKEN=your-token-here\n`;
+
+/**
+ * True when a `telegram/.env` body still holds only the placeholder — i.e. it
+ * has no active (uncommented, non-empty) `TELEGRAM_BOT_TOKEN=` line. A real
+ * operator- or vault-set token has such a line and must never be clobbered.
+ */
+function isTelegramEnvPlaceholder(content: string): boolean {
+  return !/^\s*TELEGRAM_BOT_TOKEN=\S/m.test(content);
+}
+
+/**
+ * Resolve a bot token value. If it's a vault reference, resolve it ONLY via
+ * the vault (SWITCHROOM_VAULT_PASSPHRASE). Returns the resolved token, or
+ * undefined if it cannot be resolved for THIS agent.
+ *
+ * IMPORTANT — no ambient env fallback for vault references (M2, review
+ * 2026-07-11): a `vault:` bot-token that can't be resolved must NOT fall back
+ * to `$TELEGRAM_BOT_TOKEN`. On a multi-agent `apply` that ambient value is
+ * whatever the outer process exported — commonly a DIFFERENT agent's token —
+ * so falling back silently wrote agent B's bot token into agent A's
+ * `telegram/.env`. When resolution fails we return undefined; callers write
+ * the placeholder (see TELEGRAM_ENV_PLACEHOLDER) and a later reconcile picks
+ * up the real token once the vault grant lands. The vault is the sole source
+ * of truth for a vault-referenced token — never a cross-agent env var.
  */
 function resolveBotToken(rawToken: string): string | undefined {
   if (!isVaultReference(rawToken)) {
@@ -835,19 +864,45 @@ function resolveBotToken(rawToken: string): string | undefined {
       }
     } catch (err) {
       // Known "vault missing / wrong passphrase" outcomes are expected when
-      // callers haven't set one up — fall through to env-var fallback. Any
-      // other error is a real problem and should bubble up so the user sees
-      // it instead of silently using a stale token from the environment.
+      // callers haven't set one up — treat the token as unresolvable and let
+      // the caller write the placeholder. Any other error is a real problem
+      // and should bubble up so the user sees it.
       if (!(err instanceof VaultError)) throw err;
     }
   }
 
-  // Fall back to TELEGRAM_BOT_TOKEN env var
-  if (process.env.TELEGRAM_BOT_TOKEN) {
-    return process.env.TELEGRAM_BOT_TOKEN;
-  }
-
+  // Unresolvable for THIS agent. Return undefined — do NOT fall back to
+  // $TELEGRAM_BOT_TOKEN (may belong to another agent on a multi-agent apply).
   return undefined;
+}
+
+/**
+ * Refresh an agent's `telegram/.env` when it still holds the placeholder and a
+ * real bot token is now resolvable (M3, review 2026-07-11). Runs on the
+ * reconcile/apply path so a `vault:` bot-token that was ungranted at first
+ * scaffold — and therefore wrote the placeholder — is picked up once the grant
+ * lands, without a rescaffold. Deterministic and safe:
+ *
+ *   - No-op when the token still can't be resolved (a later grant re-triggers).
+ *   - No-op when the `.env` is absent (scaffold owns first creation).
+ *   - Overwrites ONLY when the current body is still the placeholder
+ *     (`isTelegramEnvPlaceholder`) — a real operator-set token is never
+ *     clobbered.
+ */
+function refreshTelegramBotTokenEnv(
+  agentDir: string,
+  resolvedBotToken: string | undefined,
+  changes: string[],
+): void {
+  if (!resolvedBotToken) return;
+  const envPath = join(agentDir, "telegram", ".env");
+  if (!existsSync(envPath)) return;
+  const current = readFileSync(envPath, "utf-8");
+  if (!isTelegramEnvPlaceholder(current)) return;
+  const next = `TELEGRAM_BOT_TOKEN=${resolvedBotToken}\n`;
+  if (next === current) return;
+  writeFileSync(envPath, next, { encoding: "utf-8", mode: 0o600 });
+  changes.push(envPath);
 }
 
 /**
@@ -4486,7 +4541,7 @@ export function scaffoldAgent(
       if (resolvedBotToken) {
         return `TELEGRAM_BOT_TOKEN=${resolvedBotToken}\n`;
       }
-      return `# Set your bot token: TELEGRAM_BOT_TOKEN=your-token-here\n`;
+      return TELEGRAM_ENV_PLACEHOLDER;
     },
     created,
     skipped,
@@ -6512,6 +6567,18 @@ export function reconcileAgent(
       }
     }
   }
+
+  // --- Refresh telegram/.env bot token once a vault grant lands (M3) ---
+  //
+  // scaffold's `.env` write is writeIfMissing, so a token that was an
+  // unresolvable `vault:` reference at first scaffold froze the placeholder
+  // forever — a later `vault set` + `apply` never picked it up. Re-resolve
+  // here and overwrite ONLY when the file is still the placeholder, so a real
+  // operator-set token is never clobbered. resolvedBotToken is keyed strictly
+  // by THIS agent's config (agentConfig.bot_token ?? telegramConfig.bot_token),
+  // so the interrupt window (vault has <new>.bot_token while agents.<old> lingers
+  // in config) can't mis-attribute another agent's token here.
+  refreshTelegramBotTokenEnv(agentDir, resolvedBotToken, changes);
 
   // --- Reconcile global skills pool symlinks ---
   //
