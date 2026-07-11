@@ -20,27 +20,37 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 
 // ─── Sidecar factory mock: record every instance keyed by sessionId ──────────
-const created = vi.hoisted(() => {
+// The instance registry lives INSIDE the factory and is re-exported as a
+// test-only handle (`__sidecarInstances`) rather than closed over from a
+// `vi.hoisted` binding: bun's vitest-compat layer implements `vi.mock`/`vi.fn`
+// but NOT `vi.hoisted`, so a hoisted-closure mock throws `vi.hoisted is not a
+// function` under `bun test` (CI's bun-test-run shard runs this whole dir).
+// Same pattern as callback-query-handlers.test.ts (#3130).
+vi.mock('../tool-label-sidecar.js', () => {
   const instances: Array<{ sessionId: string; stop: ReturnType<typeof vi.fn> }> = []
-  return { instances }
+  return {
+    __sidecarInstances: instances,
+    createToolLabelSidecar: (opts: { stateDir: string; sessionId: string }) => {
+      const inst = {
+        sessionId: opts.sessionId,
+        stop: vi.fn(),
+        getLabel: () => undefined,
+        onLabel: () => () => {},
+        poll: () => {},
+      }
+      instances.push(inst)
+      return inst
+    },
+  }
 })
 
-vi.mock('../tool-label-sidecar.js', () => ({
-  createToolLabelSidecar: (opts: { stateDir: string; sessionId: string }) => {
-    const inst = {
-      sessionId: opts.sessionId,
-      stop: vi.fn(),
-      getLabel: () => undefined,
-      onLabel: () => () => {},
-      poll: () => {},
-    }
-    created.instances.push(inst)
-    return inst
-  },
-}))
-
-// Import AFTER the mock is registered.
+// Import AFTER the mock is registered. The mocked module namespace carries the
+// test-only instance registry under both runners.
 const { startSessionTail, getProjectsDirForCwd } = await import('../session-tail.js')
+const sidecarMod = (await import('../tool-label-sidecar.js')) as unknown as {
+  __sidecarInstances: Array<{ sessionId: string; stop: ReturnType<typeof vi.fn> }>
+}
+const created = { instances: sidecarMod.__sidecarInstances }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 const tempDirs: string[] = []
