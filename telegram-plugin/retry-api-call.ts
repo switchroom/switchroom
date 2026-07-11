@@ -44,6 +44,22 @@ export interface RetryCallOpts {
    * call sites to self-document. Future: surface in retry logs / metrics.
    */
   verb?: string
+  /**
+   * Chat type of the destination (private / group / supergroup / channel).
+   * Consumed by the outbound send gate (#3084, send-gate.ts) to key the
+   * per-group bucket. Optional and additive — the retry policy ignores it.
+   */
+  chatType?: 'private' | 'group' | 'supergroup' | 'channel'
+  /**
+   * For edit calls: the target message id. Enables the send gate's
+   * per-message edit floor + last-write-wins coalescing. Retry policy ignores.
+   */
+  messageId?: number
+  /**
+   * For edit calls: the rendered payload the send gate hashes to skip no-op
+   * edits (identical → dropped) and to coalesce. Retry policy ignores it.
+   */
+  editPayload?: unknown
 }
 
 export interface RetryObserver {
