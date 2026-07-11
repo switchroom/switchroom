@@ -1727,6 +1727,37 @@ export class VaultBroker {
       if (req.token !== undefined && req.token !== "") {
         const v = await validateGrantForWrite(this.grantsDb, req.token, req.key);
         if (v.ok) {
+          const writeGrantAgentSlug = v.grant.agent_slug;
+          // sec #3084-F4 (write path): tokens are bearer capabilities, but
+          // when the connection ALSO carries a bind-time socket identity
+          // (`agentName` — established by socketPathToAgent, never from a
+          // wire payload), cross-check it against the grant's owning agent
+          // and reject a mismatch — exactly as the `get` path does at
+          // ~line 1297. This closes the write equivalent of the leaked-token
+          // replay: a write-grant token leaked to another agent's container
+          // could otherwise be replayed over that agent's own socket to
+          // overwrite/plant shared secrets, bypassing the path-as-identity
+          // ACL. Only enforced when an identity is present: the legitimate
+          // no-bind-identity flow (agentName === null on legacy / non-Linux /
+          // operator sockets) is unchanged — the token remains the sole auth
+          // there, exactly as before.
+          if (agentName !== null && writeGrantAgentSlug !== agentName) {
+            this.auditLogger.write({
+              ts: new Date().toISOString(),
+              op: "put",
+              key: req.key,
+              caller: auditCaller,
+              pid: auditPid,
+              cgroup: auditCgroup,
+              result: "denied:grant-identity-mismatch",
+              method: "grant",
+              grant_id: v.grant.id,
+            });
+            socket.write(
+              encodeResponse(errorResponse("DENIED", "grant-identity-mismatch")),
+            );
+            return;
+          }
           writeGrantId = v.grant.id;
         } else if (
           v.reason === "grant-expired" ||

@@ -288,3 +288,159 @@ describe("VaultBroker: PUT with write-grant (#969 P1b)", () => {
     expect(resp.ok).toBe(true);
   });
 });
+
+// ─── sec #3084-F4 (write path): identity-bind cross-check on PUT ──────────────
+//
+// The `get` token path cross-checks a capability token's owning agent
+// against the calling socket's bind-time identity and denies a mismatch
+// (server.ts ~line 1297; covered by server-grants.test.ts F4). The write
+// (`put`) token path historically discarded `v.grant.agent_slug`, so a
+// write-grant token leaked to another agent's container could be replayed
+// over that agent's OWN bound socket to overwrite/plant shared secrets,
+// bypassing the path-as-identity ACL. This block asserts the OUTCOME of the
+// mirrored guard:
+//   (a) a write-grant whose agent_slug != the socket bind identity is DENIED
+//       with grant-identity-mismatch (and NOT written);
+//   (b) a matching-identity write still succeeds;
+//   (c) the no-bind-identity (operator/legacy) write path is unchanged.
+describe("VaultBroker: PUT write-grant identity bind (sec #3084-F4 write path)", () => {
+  let socketPath: string;
+  let tmpDir: string;
+  let vaultPath: string;
+  let grantsDb: Database;
+  let auditEntries: AuditEntry[];
+  let prevNonLinuxFlag: string | undefined;
+  let agentsDir: string;
+  let prevAgentsDirEnv: string | undefined;
+  const PASSPHRASE = "test-pass-phrase-for-this-test-only";
+  const brokers: VaultBroker[] = [];
+
+  // Build a broker with a real on-disk vault (PUT calls saveVault) and an
+  // optional bind identity. When `agentName` is passed, the handler defaults
+  // its per-connection identity to it (server.ts _handleDataConnection), which
+  // is exactly what socketPathToAgent would establish at bind time in prod.
+  async function makeBroker(agentName?: string): Promise<string> {
+    const sp = path.join(tmpDir, `${agentName ?? "nobind"}.sock`);
+    const b = new VaultBroker({
+      _testConfig: makeMinimalConfig(),
+      _testGrantsDb: grantsDb,
+      _testAuditLogger: {
+        write: (e: AuditEntry) => { auditEntries.push(e); return true; },
+        failOpenCount: () => 0,
+      },
+      _testVaultPath: vaultPath,
+      ...(agentName !== undefined ? { _testAgentName: agentName } : {}),
+    });
+    await b.start(sp, undefined, vaultPath);
+    b.unlockFromPassphrase(PASSPHRASE);
+    brokers.push(b);
+    return sp;
+  }
+
+  beforeEach(() => {
+    prevNonLinuxFlag = process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
+    process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX = "1";
+
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "broker-write-idbind-test-"));
+    vaultPath = path.join(tmpDir, "vault.enc");
+
+    agentsDir = path.join(tmpDir, "agents");
+    prevAgentsDirEnv = process.env.SWITCHROOM_AGENTS_DIR;
+    process.env.SWITCHROOM_AGENTS_DIR = agentsDir;
+
+    createVault(PASSPHRASE, vaultPath);
+    for (const [k, entry] of Object.entries(TEST_SECRETS)) {
+      if (entry.kind === "string") {
+        setStringSecret(PASSPHRASE, vaultPath, k, entry.value);
+      }
+    }
+
+    grantsDb = makeInMemoryGrantsDb();
+    auditEntries = [];
+  });
+
+  afterEach(() => {
+    for (const b of brokers.splice(0)) { try { b.stop(); } catch { /* ignore */ } }
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    if (prevAgentsDirEnv === undefined) delete process.env.SWITCHROOM_AGENTS_DIR;
+    else process.env.SWITCHROOM_AGENTS_DIR = prevAgentsDirEnv;
+    if (prevNonLinuxFlag === undefined) delete process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
+    else process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX = prevNonLinuxFlag;
+  });
+
+  it("(a) write-grant whose agent_slug != socket bind identity is DENIED (not written)", async () => {
+    // Bind identity is "myagent"; the leaked write-grant belongs to "otheragent".
+    const socketPath = await makeBroker("myagent");
+    const { token } = await mintGrant(
+      grantsDb, "otheragent", [], null, "leaked write grant", ["existing_key"],
+    );
+
+    const resp = await rpc(socketPath, {
+      v: 1,
+      op: "put",
+      key: "existing_key",
+      entry: { kind: "string", value: "planted-by-attacker" },
+      token,
+    });
+
+    expect(resp.ok).toBe(false);
+    if (!resp.ok) {
+      expect(resp.code).toBe("DENIED");
+      expect(resp.msg).toContain("grant-identity-mismatch");
+    }
+    // Audited as an identity-mismatch denial on the put/grant method.
+    const mismatch = auditEntries.find(
+      (e) => e.op === "put" && String(e.result).includes("grant-identity-mismatch"),
+    );
+    expect(mismatch).toBeDefined();
+    expect(mismatch?.method).toBe("grant");
+    // The write must NOT have been served.
+    const served = auditEntries.find((e) => e.op === "put" && e.result === "allowed");
+    expect(served).toBeUndefined();
+  });
+
+  it("(b) write-grant whose agent_slug matches the bind identity still succeeds", async () => {
+    const socketPath = await makeBroker("myagent");
+    const { token } = await mintGrant(
+      grantsDb, "myagent", [], null, undefined, ["existing_key"],
+    );
+
+    const resp = await rpc(socketPath, {
+      v: 1,
+      op: "put",
+      key: "existing_key",
+      entry: { kind: "string", value: "rotated-by-owner" },
+      token,
+    });
+
+    expect(resp.ok).toBe(true);
+    const served = auditEntries.find(
+      (e) => e.op === "put" && e.key === "existing_key" && e.result === "allowed",
+    );
+    expect(served).toBeDefined();
+    expect(served?.method).toBe("grant");
+  });
+
+  it("(c) no-bind-identity (operator/legacy) write path is unchanged — any valid write-grant is served", async () => {
+    // agentName === null: no identity to compare, token remains sole auth.
+    const socketPath = await makeBroker();
+    const { token } = await mintGrant(
+      grantsDb, "otheragent", [], null, undefined, ["existing_key"],
+    );
+
+    const resp = await rpc(socketPath, {
+      v: 1,
+      op: "put",
+      key: "existing_key",
+      entry: { kind: "string", value: "rotated-no-bind" },
+      token,
+    });
+
+    expect(resp.ok).toBe(true);
+    // No identity-mismatch denial when there is no bind identity to compare.
+    const mismatch = auditEntries.find(
+      (e) => e.op === "put" && String(e.result).includes("grant-identity-mismatch"),
+    );
+    expect(mismatch).toBeUndefined();
+  });
+});
