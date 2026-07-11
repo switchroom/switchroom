@@ -113,6 +113,26 @@ export function makeFloodWaitRecorder(
 }
 
 /**
+ * Build the `floodWaitRemainingMs` probe for `createRetryApiCall` (#3084).
+ *
+ * Returns the remaining ms of the persisted flood window, so the retry policy
+ * can refuse to issue a call INTO a known-open long ban rather than letting
+ * every 5-6s card heartbeat fire another request at the flood counter. Reads
+ * fresh each call (the window is written by `makeFloodWaitRecorder`, possibly
+ * from another code path in the same process).
+ *
+ * Fails OPEN: `readFloodState` already returns null on a missing or corrupt
+ * marker, which yields 0 = "no window, proceed". A broken state file must
+ * never permanently silence the bot.
+ */
+export function makeFloodWaitProbe(
+  path: string,
+  now: () => number = Date.now,
+): () => number {
+  return () => floodWaitRemainingMs(readFloodState(path), now())
+}
+
+/**
  * Decide whether a NON-ESSENTIAL restart-time send (boot card, config
  * summary) should be suppressed because a flood-wait is active. Returns the
  * remaining ms when suppressed (>0), or 0 to proceed. Reads state fresh so a

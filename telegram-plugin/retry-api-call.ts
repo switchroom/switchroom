@@ -16,7 +16,8 @@
  *
  *   | Thrown error                                  | This wrapper does                          |
  *   |-----------------------------------------------|--------------------------------------------|
- *   | GrammyError 429                               | sleep retry_after seconds, retry          |
+ *   | GrammyError 429 (retry_after <= ceiling)      | sleep retry_after seconds, retry          |
+ *   | GrammyError 429 (retry_after >  ceiling)      | record window, throw `FLOOD_WAIT_ACTIVE`  |
  *   | GrammyError 400 "message is not modified"     | swallow, return undefined                 |
  *   | GrammyError 400 "message to edit not found"   | swallow, return undefined                 |
  *   | GrammyError 400 "message to delete not found" | swallow, return undefined                 |
@@ -57,6 +58,24 @@ export interface RetryObserver {
 export interface RetryApiCallConfig {
   /** Max retries before giving up. Defaults to 3. */
   maxRetries?: number
+  /**
+   * Ceiling (ms) on how long a single 429 flood-wait may be slept IN-PROCESS.
+   * A `retry_after` above this is not slept at all — the window is recorded and
+   * `FLOOD_WAIT_ACTIVE` is thrown instead (see #3084). Defaults to
+   * `DEFAULT_MAX_FLOOD_SLEEP_MS`.
+   */
+  maxFloodSleepMs?: number
+  /**
+   * Remaining ms of a KNOWN-OPEN per-bot flood window, or 0 when none.
+   *
+   * Wired to the #2923 circuit-breaker state file (see
+   * `makeFloodWaitProbe`). When the remaining window is LONGER than
+   * `maxFloodSleepMs`, `retryApiCall` short-circuits BEFORE issuing the call:
+   * the ban is per-bot-token, so nothing can succeed while it's open, and
+   * every attempt only feeds the flood counter (#3084). Fails OPEN — a
+   * missing/corrupt/throwing probe means "no window", never a silenced bot.
+   */
+  floodWaitRemainingMs?: () => number
   /** Sleep helper — injected so tests can use fake timers. */
   sleep?: (ms: number) => Promise<void>
   /** Optional observer hooks. */
@@ -105,6 +124,89 @@ export function isLocalResourceError(err: unknown): boolean {
  */
 export const LOCAL_RESOURCE_EXHAUSTED = 'LOCAL_RESOURCE_EXHAUSTED'
 
+/**
+ * Marker error thrown when Telegram's reported `retry_after` exceeds the
+ * in-process sleep ceiling (#3084) — i.e. the bot is under a LONG per-bot
+ * flood ban, not a momentary rate-limit blip.
+ *
+ * Carries `{ retryAfterSec, untilTs, original }` so a caller can render a
+ * useful degraded state ("rate-limited by Telegram until HH:MM") instead of
+ * being parked on an await for hours.
+ */
+export const FLOOD_WAIT_ACTIVE = 'FLOOD_WAIT_ACTIVE'
+
+/**
+ * Shape of the error thrown for an over-ceiling flood-wait.
+ *
+ * It deliberately carries Telegram's OWN 429 field shape (`error_code: 429`,
+ * `parameters.retry_after`) in addition to the friendlier fields. Several
+ * best-effort card surfaces duck-type their rate-limit cooldown on exactly
+ * those two fields rather than on `instanceof GrammyError`:
+ *
+ *   - `worker-activity-feed.ts` `extractRetryAfterSecs` → `noteRateLimited`
+ *   - `issues-card.ts` `extractRetryAfterSecs`
+ *   - `pending-work-progress.ts` (its catch assumes upstream retry_after backoff)
+ *
+ * All three route through `robustApiCall`, so once retryApiCall stops sleeping
+ * a long ban and starts THROWING, they see this marker instead of the raw
+ * GrammyError. Without `error_code`/`parameters` they would classify it as a
+ * generic 'transient' error, arm NO cooldown, and let their 5-6s heartbeats
+ * re-drive a fresh Bot API call into the still-open ban — thousands of requests
+ * over a 4.6h window, feeding the very flood counter #2923 exists to starve.
+ * Carrying the 429 shape makes the existing cooldown gates fire on the full
+ * window with no change to those modules.
+ *
+ * It remains a plain `Error` (NOT a `GrammyError`), so the `instanceof`-based
+ * probes — `isHtmlParseRejectError`, `isMessageTooLongError`,
+ * `isPhotoDimensionRejectError` — still correctly do not match it.
+ */
+export interface FloodWaitActiveError extends Error {
+  /** Telegram's reported retry_after, in seconds. */
+  retryAfterSec: number
+  /** Epoch ms at which the flood window is expected to expire. */
+  untilTs: number
+  /** Telegram's 429 code — see the duck-typing note above. */
+  error_code: 429
+  /** Telegram's 429 payload — see the duck-typing note above. */
+  parameters: { retry_after: number }
+  /** The originating GrammyError, or null for a pre-call short-circuit. */
+  original: unknown
+}
+
+/** Build the marker with the full Telegram-429 duck-type shape. */
+function makeFloodWaitActiveError(
+  retryAfterSec: number,
+  untilTs: number,
+  original: unknown,
+): FloodWaitActiveError {
+  return Object.assign(new Error(FLOOD_WAIT_ACTIVE), {
+    retryAfterSec,
+    untilTs,
+    error_code: 429 as const,
+    parameters: { retry_after: retryAfterSec },
+    original,
+  })
+}
+
+/** True when `err` is the `FLOOD_WAIT_ACTIVE` marker thrown by `retryApiCall`. */
+export function isFloodWaitActiveError(err: unknown): err is FloodWaitActiveError {
+  return err instanceof Error && err.message === FLOOD_WAIT_ACTIVE
+}
+
+/**
+ * Default ceiling on a single in-process flood-wait sleep: 120s.
+ *
+ * Why 120s and not 30-60s: the flood-waits this bot has historically ridden out
+ * successfully were 28s and 75s — sleeping through those is the RIGHT behaviour
+ * and must not regress, so the ceiling has to sit above 75s with headroom. Why
+ * not higher: the ban this guards against (#3084, overlord 2026-07-11) reported
+ * retry_after = 16739s (~4.6h). A 120s ceiling bounds the worst case in-process
+ * block to maxRetries × 120s (6s→6min at the default 3) instead of hours, which
+ * is short enough that a caller — and the human waiting on a reply — gets a
+ * degraded answer rather than an apparently-wedged agent.
+ */
+export const DEFAULT_MAX_FLOOD_SLEEP_MS = 120_000
+
 const DEFAULT_SLEEP = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 
 /**
@@ -120,16 +222,56 @@ export function createRetryApiCall(
   config: RetryApiCallConfig = {},
 ): <T>(fn: () => Promise<T>, opts?: RetryCallOpts) => Promise<T> {
   const maxRetries = config.maxRetries ?? 3
+  const maxFloodSleepMs = config.maxFloodSleepMs ?? DEFAULT_MAX_FLOOD_SLEEP_MS
   const sleep = config.sleep ?? DEFAULT_SLEEP
   const observer = config.observer
   const log = config.log
   const onFloodWait = config.onFloodWait
+  const floodWaitRemainingMs = config.floodWaitRemainingMs
+
+  /**
+   * Remaining ms of a known-open flood window. FAILS OPEN: any throw from the
+   * probe (unreadable state dir, corrupt JSON, clock weirdness) is treated as
+   * "no window" — a broken marker file must never permanently silence the bot.
+   */
+  function openWindowMs(): number {
+    if (!floodWaitRemainingMs) return 0
+    try {
+      const ms = floodWaitRemainingMs()
+      return Number.isFinite(ms) && ms > 0 ? ms : 0
+    } catch {
+      return 0
+    }
+  }
 
   return async function retryApiCall<T>(
     fn: () => Promise<T>,
     opts?: RetryCallOpts,
   ): Promise<T> {
     for (let attempt = 0; attempt < maxRetries; attempt++) {
+      // #3084 — do not send INTO a known-open long ban. Failing the call fast
+      // (rather than sleeping it) is only safe if the caller can't just turn
+      // around and re-drive it: the card surfaces re-attempt on a 5-6s
+      // heartbeat, which over a 4.6h ban would be thousands of requests into
+      // the open window — the exact ban-extension the #2923 breaker exists to
+      // prevent. So the policy itself refuses to issue the call while the
+      // window is open. The ban is per-bot-TOKEN: nothing can succeed during
+      // it, so short-circuiting loses no delivery that would otherwise land.
+      //
+      // Only LONG windows short-circuit (remaining > the sleep ceiling). A
+      // short window is left to the normal path — it may already have expired
+      // server-side, and today's sleep-and-retry rides it out.
+      const remaining = openWindowMs()
+      if (remaining > maxFloodSleepMs) {
+        const retryAfterSec = Math.ceil(remaining / 1000)
+        log?.(
+          `telegram gateway: flood window still open for ${retryAfterSec}s — ` +
+            `not issuing the ${opts?.verb ?? 'api-call'} (would feed the ban)\n`,
+        )
+        const gated = makeFloodWaitActiveError(retryAfterSec, Date.now() + remaining, null)
+        observer?.onGiveUp?.({ attempts: attempt + 1, error: gated })
+        throw gated
+      }
       try {
         return await fn()
       } catch (err) {
@@ -163,6 +305,23 @@ export function createRetryApiCall(
             onFloodWait?.(retryAfter)
           } catch {
             /* best-effort — never let the breaker hook break the retry path */
+          }
+          // #3084: a LONG ban must not be slept in-process. On 2026-07-11
+          // overlord got retry_after = 16739s (~4.6h); `await sleep(delayMs)`
+          // parked the send path — and every caller awaiting it — for hours.
+          // That is a wedge primitive, not a retry. Above the ceiling we've
+          // already recorded the window (the breaker above suppresses
+          // non-essential sends for its duration); now fail FAST with a
+          // distinct non-retryable marker so the caller can surface a degraded
+          // state. Under the ceiling, behaviour is unchanged: sleep and retry.
+          if (delayMs > maxFloodSleepMs) {
+            log?.(
+              `telegram gateway: 429 flood ban of ${retryAfter}s exceeds the ` +
+                `${Math.round(maxFloodSleepMs / 1000)}s in-process sleep ceiling — ` +
+                `not sleeping it; surfacing degraded state\n`,
+            )
+            observer?.onGiveUp?.({ attempts: attempt + 1, error: err })
+            throw makeFloodWaitActiveError(retryAfter, Date.now() + delayMs, err)
           }
           log?.(`telegram gateway: 429 rate limited, waiting ${retryAfter}s\n`)
           observer?.onRetry?.({ attempt, reason: 'flood_wait', delayMs })

@@ -12,6 +12,8 @@
 
 import { GrammyError, HttpError } from 'grammy'
 
+import { FLOOD_WAIT_ACTIVE } from '../retry-api-call.js'
+
 export type RejectionAction = 'shutdown' | 'log_only'
 
 export interface RejectionPolicyOptions {
@@ -64,6 +66,17 @@ export function classifyRejection(
       ? opts.isHttpError(err)
       : err instanceof HttpError
   if (isHttp) return 'log_only'
+
+  // FLOOD_WAIT_ACTIVE (#3084): retry-api-call throws this plain Error marker
+  // instead of sleeping through a multi-hour per-bot flood ban (overlord saw
+  // retry_after = 16739s ≈ 4.6h). It is the SAME condition as the GrammyError
+  // 429 handled below — just surfaced as a non-retryable marker rather than a
+  // raw grammy error — so it takes the same posture. A leaked one (a
+  // fire-and-forget send that wasn't wrapped in swallowingApiCall) must NOT
+  // crash the gateway: the bot is already rate-limited, and a crash→restart
+  // fires MORE sends into the open window and extends the ban, which is the
+  // exact amplification the #2923 circuit breaker exists to stop.
+  if (err instanceof Error && err.message === FLOOD_WAIT_ACTIVE) return 'log_only'
 
   if (!isGrammy) return 'shutdown'
 

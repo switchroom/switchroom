@@ -11,7 +11,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { startBootCard } from '../gateway/boot-card.js'
 import type { BotApiForBootCard } from '../gateway/boot-card.js'
-import { computeFloodWait, writeFloodState, floodStatePath, makeFloodWaitRecorder } from '../flood-circuit-breaker.js'
+import {
+  computeFloodWait,
+  writeFloodState,
+  floodStatePath,
+  makeFloodWaitRecorder,
+  suppressNonEssentialSendMs,
+} from '../flood-circuit-breaker.js'
 import { createRetryApiCall } from '../retry-api-call.js'
 import { errors } from './fake-bot-api.js'
 
@@ -81,9 +87,13 @@ it('POSTS normally when no flood state file exists (back-compat)', async () => {
   expect(sends).toEqual(['chat1'])
 })
 
-it('INTEGRATION: a 429 through the real retry path suppresses a later boot card', async () => {
+it('INTEGRATION: a SHORT 429 through the real retry path suppresses a later boot card', async () => {
   // Wire the two halves exactly as gateway.ts does: the retry wrapper's
   // onFloodWait recorder and the boot card BOTH point at the same file.
+  //
+  // This is the UNDER-ceiling path (#3084): retryApiCall sleeps the wait and
+  // retries, exactly as it always has. The window must still be recorded, and
+  // a restart's boot card must still be suppressed.
   const p = floodStatePath(dir)
   const now = 5_000_000
   const retry = createRetryApiCall({
@@ -91,15 +101,51 @@ it('INTEGRATION: a 429 through the real retry path suppresses a later boot card'
     onFloodWait: makeFloodWaitRecorder(p, () => now),
   })
 
-  // Drive a real GrammyError 429 through the wrapper (first call floods, then
-  // succeeds) — this is what records the window on disk.
   let n = 0
-  await retry(async () => {
-    if (n++ === 0) throw errors.floodWait(4116) // ~68 min ban
+  const out = await retry(async () => {
+    if (n++ === 0) throw errors.floodWait(75) // the historic real-world wait
     return 'ok'
   })
+  expect(out).toBe('ok') // slept and retried — call still succeeded
 
-  // Now a restart's boot card must be suppressed via the SAME file.
+  const { bot, sends } = makeBot()
+  const logs: string[] = []
+  const handle = await startBootCard('chat1', undefined, bot, mkOpts(p, now), undefined, (l) =>
+    logs.push(l),
+  )
+  expect(sends).toEqual([]) // not posted into the open ban window
+  expect(handle.messageId).toBe(-1)
+  expect(logs.join('')).toMatch(/SUPPRESSED/)
+})
+
+it('INTEGRATION: a LONG 429 that FAILS FAST still suppresses a later boot card', async () => {
+  // #3084 changed this path: a ~68min ban is over the in-process sleep ceiling,
+  // so retryApiCall no longer sleeps it — it records the window and THROWS
+  // FLOOD_WAIT_ACTIVE. The behaviour that matters to #2923 is unchanged and is
+  // what this test pins: the window is recorded BEFORE the throw, so a restart
+  // during the ban still suppresses its boot card instead of sending into the
+  // open window and extending the ban.
+  //
+  // If the recording were ever moved below the throw (or skipped on this path),
+  // `sends` would become ['chat1'] and this test goes red — which is exactly
+  // the #2923 regression it exists to catch.
+  const p = floodStatePath(dir)
+  const now = 5_000_000
+  const retry = createRetryApiCall({
+    sleep: async () => {},
+    onFloodWait: makeFloodWaitRecorder(p, () => now),
+  })
+
+  await expect(
+    retry(async () => {
+      throw errors.floodWait(4116) // ~68 min ban — over the ceiling
+    }),
+  ).rejects.toThrow('FLOOD_WAIT_ACTIVE')
+
+  // The window landed on disk despite the throw…
+  expect(suppressNonEssentialSendMs(p, now)).toBe(4116 * 1000)
+
+  // …so the boot card is still suppressed through the SAME file.
   const { bot, sends } = makeBot()
   const logs: string[] = []
   const handle = await startBootCard('chat1', undefined, bot, mkOpts(p, now), undefined, (l) =>
