@@ -3546,6 +3546,35 @@ export const HostdConfigSchema = z.object({
       "`retry_after` fix) instead of posting another operator approval " +
       "card — so a looping agent is throttled rather than spamming the chat.",
     ),
+  // ── Operator-attest 2nd factor (#1841, RFC host-control-daemon.md §5.4) ──
+  operator_attest_enabled: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Opt-in toggle for the operator-passphrase 2nd factor on hostd's " +
+      "mutating verbs (#1841, RFC host-control-daemon.md §5.4). Default " +
+      "false — attestation is ACCEPTED-and-audited whenever present, but " +
+      "no verb REQUIRES it (behaviour is byte-identical to today, so " +
+      "existing fleets and the Telegram approval-card flow are unchanged). " +
+      "When true, the verbs in `operator_attest_required_verbs` demand a " +
+      "valid operator-passphrase attestation IN ADDITION to admin: hostd " +
+      "forwards the passphrase to the vault broker over its own admin-client " +
+      "connection (`/run/switchroom/broker/hostd/sock`) and treats a broker " +
+      "DENIED as a gate failure. hostd never holds the passphrase. Leave " +
+      "this off until BOTH the gateway passphrase-forward and the " +
+      "cross-compose broker socket are deployed, or gated verbs will fail.",
+    ),
+  operator_attest_required_verbs: z
+    .array(z.string().min(1))
+    .default(["update_apply", "apply", "rollout"])
+    .describe(
+      "Which mutating hostd verbs REQUIRE a valid operator-passphrase " +
+      "attestation when `operator_attest_enabled` is true (#1841). Default " +
+      "is the RFC §5.4 fleet-mutation set (`update_apply`, `apply`, " +
+      "`rollout`). Verbs NOT in this list still accept-and-audit an " +
+      "attestation when one is supplied, but never require it. Ignored " +
+      "entirely when `operator_attest_enabled` is false.",
+    ),
 });
 
 // Cheap-cron operator config — reference/rfcs/cheap-cron-sessions.md §6.1.

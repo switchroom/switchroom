@@ -61,6 +61,25 @@ const RequestEnvelope = {
   /** Optional dedup key — daemon swallows duplicate requests within
    *  IDEMPOTENCY_WINDOW_MS. Defaults to `request_id` when omitted. */
   idempotency_key: z.string().min(1).max(128).optional(),
+  /**
+   * Optional operator-passphrase attestation (#1841, RFC
+   * host-control-daemon.md §5.4). Second factor on the mutating verbs:
+   * the gateway caches the operator passphrase after `/vault unlock`
+   * and plaintext-forwards it here when an admin agent invokes a
+   * privileged verb — the SAME plaintext-forward pattern the vault
+   * broker already uses for `vault_request_save` (broker
+   * `server.ts` PUT/list_grants passphrase path). hostd itself NEVER
+   * holds the vault passphrase: it forwards this value over its own
+   * admin-client connection to the broker and treats a broker `DENIED`
+   * as a gate failure (see `AttestVerifier` in `server.ts`).
+   *
+   * Present on the envelope so it applies uniformly to every verb;
+   * read-only verbs ignore it. `checkGate` only CONSUMES it for verbs
+   * the operator has opted into requiring attestation for
+   * (`hostd.operator_attest_*`), and it is NEVER persisted to the audit
+   * log (only the derived `method: "passphrase-attest"` tag is).
+   */
+  operator_passphrase: z.string().min(1).max(1024).optional(),
 };
 
 export const AgentRestartRequestSchema = z.object({

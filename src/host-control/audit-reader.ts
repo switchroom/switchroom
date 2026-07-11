@@ -29,6 +29,11 @@ export interface AuditEntry {
    *  hostd's spawn-completion handler. Absent on the synchronous
    *  request-path rows. */
   phase?: string;
+  /** #1841 — attestation attribution. `"passphrase-attest"` on rows where
+   *  an operator-passphrase attestation was verified (or a required
+   *  attestation was missing/rejected). Mirrors the vault broker's
+   *  `method` audit field. Never carries the passphrase itself. */
+  method?: string;
   stdout_tail?: string;
   stderr_tail?: string;
   // ─── Update-flow enrichment (PR B) ─────────────────────────────────
@@ -115,6 +120,7 @@ export function parseAuditLine(line: string): AuditEntry | null {
   };
   if (typeof o.error === "string") entry.error = o.error;
   if (typeof o.phase === "string") entry.phase = o.phase;
+  if (typeof o.method === "string") entry.method = o.method;
   if (typeof o.stdout_tail === "string") entry.stdout_tail = o.stdout_tail;
   if (typeof o.stderr_tail === "string") entry.stderr_tail = o.stderr_tail;
   if (typeof o.channel === "string") entry.channel = o.channel;

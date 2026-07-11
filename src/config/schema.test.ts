@@ -845,7 +845,28 @@ describe("HostdConfigSchema (admin-agent-config-edit RFC §3 / §4)", () => {
     expect(result.hostd).toEqual({
       config_edit_enabled: false,
       config_edit_rate_per_hour: 3,
+      // #1841 — operator-attest 2nd factor: off by default, RFC §5.4
+      // fleet-mutation verb set as the default required list.
+      operator_attest_enabled: false,
+      operator_attest_required_verbs: ["update_apply", "apply", "rollout"],
     });
+  });
+
+  it("accepts an explicit operator-attest opt-in with a custom verb list (#1841)", () => {
+    const result = SwitchroomConfigSchema.parse({
+      switchroom: { version: 1 },
+      telegram: { bot_token: "x", forum_chat_id: "1" },
+      hostd: {
+        operator_attest_enabled: true,
+        operator_attest_required_verbs: ["update_apply", "agent_exec"],
+      },
+      agents: {},
+    });
+    expect(result.hostd.operator_attest_enabled).toBe(true);
+    expect(result.hostd.operator_attest_required_verbs).toEqual([
+      "update_apply",
+      "agent_exec",
+    ]);
   });
 
   it("accepts an explicit opt-in with a tuned rate", () => {

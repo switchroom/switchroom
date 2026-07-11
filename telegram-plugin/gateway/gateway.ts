@@ -464,6 +464,7 @@ import {
   pollHostdStatus,
   hostdGetStatusOnce,
   warnLegacySpawnIfHostdDisabled,
+  withOperatorAttestation,
   _resetHostdEnabledCache,
 } from './hostd-dispatch.js'
 import { formatUpdateStatusLine } from './update-status-line.js'
@@ -21555,15 +21556,25 @@ bot.command('update', async ctx => {
   const skipImages = passthrough.includes('--skip-images')
   const rebuild = passthrough.includes('--rebuild')
   const updateRequestId = hostdRequestId('gw-update')
-  const hostdResp = await tryHostdDispatch(getMyAgentName(), {
-    v: 1,
-    op: 'update_apply',
-    request_id: updateRequestId,
-    args: {
-      ...(skipImages ? { skip_images: true } : {}),
-      ...(rebuild ? { rebuild: true } : {}),
-    },
-  })
+  // #1841 — forward the cached operator passphrase as the 2nd factor when
+  // hostd requires operator-attest on update_apply. No-op when the vault
+  // is locked / no passphrase is cached (feature-off posture unchanged).
+  const updatePassphrase = vaultPassphraseCache.get(chatId)?.passphrase
+  const hostdResp = await tryHostdDispatch(
+    getMyAgentName(),
+    withOperatorAttestation(
+      {
+        v: 1,
+        op: 'update_apply',
+        request_id: updateRequestId,
+        args: {
+          ...(skipImages ? { skip_images: true } : {}),
+          ...(rebuild ? { rebuild: true } : {}),
+        },
+      },
+      updatePassphrase,
+    ),
+  )
   if (hostdResp === 'not-configured') {
     warnLegacySpawnIfHostdDisabled('update_apply')
     spawnSwitchroomDetached(

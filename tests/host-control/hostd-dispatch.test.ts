@@ -48,6 +48,7 @@ const {
   hostdSocketPath,
   pollHostdStatus,
   warnLegacySpawnIfHostdDisabled,
+  withOperatorAttestation,
   _resetHostdEnabledCache,
   _resetDeprecationSeen,
 } = await import("../../telegram-plugin/gateway/hostd-dispatch.js");
@@ -462,5 +463,33 @@ describe("regression — issue #1305 silent /update apply", () => {
     expect(t.result).toBe("error");
     expect(t.error).toContain("image pull failed");
     expect(t.stderr_tail).toContain("manifest for");
+  });
+});
+
+describe("withOperatorAttestation — gateway passphrase-forward (#1841)", () => {
+  it("attaches the cached passphrase as operator_passphrase", () => {
+    const req = {
+      v: 1 as const,
+      op: "update_apply" as const,
+      request_id: "gw-1",
+      args: {},
+    };
+    const out = withOperatorAttestation(req, "s3cret");
+    expect(out.operator_passphrase).toBe("s3cret");
+    // Pure — original request is not mutated.
+    expect(
+      (req as { operator_passphrase?: string }).operator_passphrase,
+    ).toBeUndefined();
+  });
+
+  it("returns the request unchanged when no passphrase is cached", () => {
+    const req = {
+      v: 1 as const,
+      op: "update_apply" as const,
+      request_id: "gw-2",
+      args: {},
+    };
+    expect(withOperatorAttestation(req, undefined)).toBe(req);
+    expect(withOperatorAttestation(req, "")).toBe(req);
   });
 });
