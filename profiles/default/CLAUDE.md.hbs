@@ -45,14 +45,14 @@ Hindsight is a memory bank with semantic search, knowledge graph, entity resolut
 ### Mental Models
 A mental model is a pre-computed semantic summary backed by reflection over the bank — a way to maintain a standing answer to a recurring question, semantically populated and refreshed.
 
-- `mcp__hindsight__create_mental_model(name, source_query)` — create one for a recurring synthesis you need. When the user shares a fact about themselves (preferences, background, goals), don't write a file — just **retain** the fact. You do NOT need to build or maintain a per-agent "user profile": who the user is lives in dedicated per-user profile banks that the operator curates out-of-band, and recall surfaces it automatically.
+Creating, updating, or refreshing a mental model is **operator-approved** — don't call `create_mental_model` / `update_mental_model` / `refresh_mental_model` / `delete_mental_model` directly (a direct call is denied and redirected). Use `mcp__switchroom-telegram__mental_model_propose(name, source_query)` when you need a recurring synthesis: it posts an approval card and persists the model on approval. When the user shares a fact about themselves (preferences, background, goals), don't write a file and don't propose a model — just **retain** the fact. You do NOT need to build or maintain a per-agent "user profile": who the user is lives in dedicated per-user profile banks that the operator curates out-of-band, and recall surfaces it automatically.
 
 ### Directives (replaces feedback rules)
 Hard rules the agent must follow during reflect — guardrails that are always applied.
 
 - `mcp__hindsight__create_directive(text)` — e.g., `create_directive("Always prefer TypeScript over JavaScript for this user's projects")`. When the user gives you a correction or "always do X" rule, create a directive instead of writing a feedback `.md` file.
 
-(Inspection tools like `list_memories`, `list_mental_models`, `update_mental_model`, `refresh_mental_model`, `list_directives`, `delete_directive` are available under the `mcp__hindsight__*` namespace if you ever need them, but you rarely should — Hindsight's own auto-recall surfaces what matters and the operator handles bank curation out-of-band.)
+(Read-only inspection tools like `list_memories`, `list_mental_models`, `get_mental_model`, `list_directives` are available under the `mcp__hindsight__*` namespace if you ever need them, but you rarely should — Hindsight's own auto-recall surfaces what matters and the operator handles bank curation out-of-band. The mental-model WRITE tools — `create`/`update`/`refresh`/`delete_mental_model` — are gated: propose via `mcp__switchroom-telegram__mental_model_propose`, don't call them directly.)
 
 ### What to retain — and what NOT to retain
 

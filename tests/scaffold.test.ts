@@ -4347,6 +4347,41 @@ describe("secret-detect hook wiring", () => {
     expect(reaper!.async).toBe(true);
   });
 
+  it("wires hindsight-mental-model-pretool.mjs scoped to ^mcp__hindsight__ (#2974)", () => {
+    const agentConfig = makeAgentConfig();
+    const result = scaffoldAgent(
+      "sd-mm-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+      makeConfig("sd-mm-agent", agentConfig),
+    );
+    const settings = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+    const pre = settings.hooks.PreToolUse as Array<{
+      matcher?: string;
+      hooks: Array<{ command: string; timeout?: number }>;
+    }>;
+    const entry = pre.find((e) =>
+      e.hooks.some((h) =>
+        h.command.includes("hindsight-mental-model-pretool.mjs"),
+      ),
+    );
+    expect(entry).toBeDefined();
+    // Scoped so the stdin parse cost only lands on hindsight tools.
+    expect(entry!.matcher).toBe("^mcp__hindsight__");
+    const hook = entry!.hooks.find((h) =>
+      h.command.includes("hindsight-mental-model-pretool.mjs"),
+    )!;
+    // Bundled hook path + node invocation, wrapped via run-hook.sh.
+    expect(hook.command).toMatch(/run-hook\.sh/);
+    expect(hook.command).toContain("node ");
+    expect(hook.command).toContain("/opt/switchroom/hooks/");
+    // Explicit short timeout — a pure tool_name gate never needs long.
+    expect(hook.timeout).toBe(10);
+  });
+
   it("preserves user-declared PreToolUse hooks alongside secret-guard", () => {
     const agentConfig = makeAgentConfig({
       hooks: { PreToolUse: [{ command: "/opt/audit.sh", timeout: 5 }] },

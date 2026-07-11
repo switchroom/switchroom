@@ -43,7 +43,7 @@ Claude Code's file-based auto-memory is disabled. Use **Hindsight** MCP tools:
 - `mcp__hindsight__recall` — search past memories. Auto-fires on every message.
 - `mcp__hindsight__retain` — store important facts. Auto-retains every turn (chunked, a small ~3-turn window each time), so it's prompt and cheap.
 - `mcp__hindsight__reflect` — synthesize across memories for complex queries.
-- `mcp__hindsight__create_mental_model` — maintain semantic summaries (e.g. "codebase architecture").
+- `mcp__switchroom-telegram__mental_model_propose` — propose a mental model: a standing semantic summary refreshed over the bank (e.g. "codebase architecture"). Mental-model writes are operator-approved: this posts an approval card and persists on approval. Don't call `mcp__hindsight__create_mental_model`/`update_mental_model` directly (they're denied and redirected here).
 
 Save proactively: architecture decisions, codebase patterns, conventions, known issues, user preferences. Your session may be compacted at any time — only Hindsight memories survive.
 

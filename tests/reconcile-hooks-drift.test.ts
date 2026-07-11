@@ -142,6 +142,15 @@ describe("buildSettingsHooksBlock", () => {
       e.hooks.some(h => h.command.includes("self-improve-apply-guard-pretool.mjs")),
     );
     expect(applyGuardEntry?.matcher).toBe("^(Write|Edit|MultiEdit)$");
+
+    // #2974: the mental-model write redirect PreToolUse hook is registered
+    // and scoped to hindsight tools; it denies the four write tools and
+    // passes reads through.
+    expect(preCmds.some(c => c.includes("hindsight-mental-model-pretool.mjs"))).toBe(true);
+    const mmEntry = preHooks.find(e =>
+      e.hooks.some(h => h.command.includes("hindsight-mental-model-pretool.mjs")),
+    );
+    expect(mmEntry?.matcher).toBe("^mcp__hindsight__");
   });
 
   it("with user hooks declared merges them with switchroom-owned hooks", () => {

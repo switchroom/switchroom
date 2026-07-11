@@ -234,6 +234,16 @@ RUN chmod 0755 /opt/switchroom/hooks/notion-write-pretool.mjs
 COPY dist/cli/skill-validate-pretool.mjs /opt/switchroom/hooks/skill-validate-pretool.mjs
 RUN chmod 0755 /opt/switchroom/hooks/skill-validate-pretool.mjs
 
+# Hindsight mental-model write redirect (#2974). A PreToolUse hook scoped
+# to `^mcp__hindsight__` that DENIES the four mental-model WRITE tools with
+# an instructive message pointing at mcp__switchroom-telegram__mental_model_propose,
+# so a direct call self-corrects in the same turn instead of wedging on a
+# permission prompt. Read tools pass through. Not in the security-plugin:
+# it's a routing nudge toward the sanctioned approval path, not a
+# load-bearing safety control (the least-privilege gate in scaffold.ts is).
+COPY dist/cli/hindsight-mental-model-pretool.mjs /opt/switchroom/hooks/hindsight-mental-model-pretool.mjs
+RUN chmod 0755 /opt/switchroom/hooks/hindsight-mental-model-pretool.mjs
+
 # Agent self-improvement Stop gate (RFC reference/rfcs/agent-self-improvement.md
 # slice 1). A cheap deterministic per-turn triage; on a learning signal
 # it injects a forked review turn via the gateway socket (inject_inbound,
