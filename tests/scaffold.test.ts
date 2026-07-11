@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { scaffoldAgent, reconcileAgent, installHindsightPlugin, installSwitchroomSkills, renderFleetInvariants } from "../src/agents/scaffold.js";
+import { createVault, setStringSecret } from "../src/vault/vault.js";
 import { renderTemplate, renderProfileClaudeTemplate } from "../src/agents/profiles.js";
 import { cronScriptFilename, cronUnitName } from "../src/agents/cron-unit-name.js";
 import type { AgentConfig, SwitchroomConfig, TelegramConfig } from "../src/config/schema.js";
@@ -1105,6 +1106,183 @@ describe("scaffoldAgent", () => {
     } finally {
       if (origPassphrase !== undefined) process.env.SWITCHROOM_VAULT_PASSPHRASE = origPassphrase;
       if (origToken !== undefined) process.env.TELEGRAM_BOT_TOKEN = origToken;
+    }
+  });
+
+  // --- M2: unresolvable vault bot-token must NOT fall back to the ambient
+  //     $TELEGRAM_BOT_TOKEN, which on a multi-agent apply is another agent's
+  //     token. Prior behaviour wrote agent B's token into agent A's .env.
+  it("does NOT write ambient $TELEGRAM_BOT_TOKEN when a vault bot-token is unresolvable (M2)", () => {
+    const vaultTelegramConfig: TelegramConfig = {
+      bot_token: "vault:telegram-bot-token",
+      forum_chat_id: "-1001234567890",
+    };
+    const origPassphrase = process.env.SWITCHROOM_VAULT_PASSPHRASE;
+    const origToken = process.env.TELEGRAM_BOT_TOKEN;
+    delete process.env.SWITCHROOM_VAULT_PASSPHRASE;
+    // Simulate a multi-agent apply where the outer process exported a
+    // DIFFERENT agent's bot token into the environment.
+    const otherAgentToken = "555000:OTHER-AGENT-TOKEN";
+    process.env.TELEGRAM_BOT_TOKEN = otherAgentToken;
+    try {
+      const config = makeAgentConfig();
+      const result = scaffoldAgent("m2-agent", config, tmpDir, vaultTelegramConfig);
+      const envContent = readFileSync(join(result.agentDir, "telegram", ".env"), "utf-8");
+
+      // Never the cross-agent ambient token…
+      expect(envContent).not.toContain(otherAgentToken);
+      // …and never any active token assignment at all — just the placeholder.
+      expect(envContent).not.toMatch(/^\s*TELEGRAM_BOT_TOKEN=\S/m);
+      expect(envContent).toContain("# Set your bot token");
+    } finally {
+      if (origPassphrase !== undefined) process.env.SWITCHROOM_VAULT_PASSPHRASE = origPassphrase;
+      else delete process.env.SWITCHROOM_VAULT_PASSPHRASE;
+      if (origToken !== undefined) process.env.TELEGRAM_BOT_TOKEN = origToken;
+      else delete process.env.TELEGRAM_BOT_TOKEN;
+    }
+  });
+
+  // --- M3: a placeholder .env is refreshed to the real token once the vault
+  //     grant lands on a later reconcile (writeIfMissing froze it before).
+  it("refreshes a placeholder .env to the real token once the vault ref resolves on reconcile (M3)", () => {
+    const vaultTelegramConfig: TelegramConfig = {
+      bot_token: "vault:telegram-bot-token",
+      forum_chat_id: "-1001234567890",
+    };
+    const config = makeAgentConfig();
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: vaultTelegramConfig,
+      agents: { "m3-agent": config },
+    } as SwitchroomConfig;
+
+    const origPassphrase = process.env.SWITCHROOM_VAULT_PASSPHRASE;
+    const origVaultPath = process.env.SWITCHROOM_VAULT_PATH;
+    const origToken = process.env.TELEGRAM_BOT_TOKEN;
+    delete process.env.SWITCHROOM_VAULT_PASSPHRASE;
+    delete process.env.SWITCHROOM_VAULT_PATH;
+    delete process.env.TELEGRAM_BOT_TOKEN;
+    try {
+      // First scaffold: vault ungranted → placeholder frozen on disk.
+      const result = scaffoldAgent("m3-agent", config, tmpDir, vaultTelegramConfig, switchroomConfig);
+      const envPath = join(result.agentDir, "telegram", ".env");
+      expect(readFileSync(envPath, "utf-8")).toContain("# Set your bot token");
+      expect(readFileSync(envPath, "utf-8")).not.toMatch(/^\s*TELEGRAM_BOT_TOKEN=\S/m);
+
+      // Grant lands: the operator sets the secret in the vault.
+      const vaultPath = join(tmpDir, "vault.enc");
+      const passphrase = "test-passphrase";
+      createVault(passphrase, vaultPath);
+      const realToken = "777333:VAULT-RESOLVED-TOKEN";
+      setStringSecret(passphrase, vaultPath, "telegram-bot-token", realToken);
+      process.env.SWITCHROOM_VAULT_PATH = vaultPath;
+      process.env.SWITCHROOM_VAULT_PASSPHRASE = passphrase;
+
+      // Later reconcile picks it up.
+      reconcileAgent("m3-agent", config, tmpDir, vaultTelegramConfig, switchroomConfig);
+      const refreshed = readFileSync(envPath, "utf-8");
+      expect(refreshed).toBe(`TELEGRAM_BOT_TOKEN=${realToken}\n`);
+    } finally {
+      if (origPassphrase !== undefined) process.env.SWITCHROOM_VAULT_PASSPHRASE = origPassphrase;
+      else delete process.env.SWITCHROOM_VAULT_PASSPHRASE;
+      if (origVaultPath !== undefined) process.env.SWITCHROOM_VAULT_PATH = origVaultPath;
+      else delete process.env.SWITCHROOM_VAULT_PATH;
+      if (origToken !== undefined) process.env.TELEGRAM_BOT_TOKEN = origToken;
+      else delete process.env.TELEGRAM_BOT_TOKEN;
+    }
+  });
+
+  // --- M3 safety: a real operator-set token must never be clobbered by the
+  //     reconcile refresh, even when the vault ref now resolves to something
+  //     else.
+  it("never clobbers a real operator-set .env token on reconcile (M3)", () => {
+    const vaultTelegramConfig: TelegramConfig = {
+      bot_token: "vault:telegram-bot-token",
+      forum_chat_id: "-1001234567890",
+    };
+    const config = makeAgentConfig();
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: vaultTelegramConfig,
+      agents: { "m3-safe-agent": config },
+    } as SwitchroomConfig;
+
+    const origPassphrase = process.env.SWITCHROOM_VAULT_PASSPHRASE;
+    const origVaultPath = process.env.SWITCHROOM_VAULT_PATH;
+    const origToken = process.env.TELEGRAM_BOT_TOKEN;
+    delete process.env.SWITCHROOM_VAULT_PASSPHRASE;
+    delete process.env.SWITCHROOM_VAULT_PATH;
+    delete process.env.TELEGRAM_BOT_TOKEN;
+    try {
+      const result = scaffoldAgent("m3-safe-agent", config, tmpDir, vaultTelegramConfig, switchroomConfig);
+      const envPath = join(result.agentDir, "telegram", ".env");
+      // Operator hand-sets a real token into the placeholder .env.
+      const operatorToken = "111222:OPERATOR-SET";
+      writeFileSync(envPath, `TELEGRAM_BOT_TOKEN=${operatorToken}\n`, { mode: 0o600 });
+
+      // Vault now resolves the ref to a DIFFERENT value.
+      const vaultPath = join(tmpDir, "vault.enc");
+      const passphrase = "test-passphrase";
+      createVault(passphrase, vaultPath);
+      setStringSecret(passphrase, vaultPath, "telegram-bot-token", "999999:VAULT-DIFFERENT");
+      process.env.SWITCHROOM_VAULT_PATH = vaultPath;
+      process.env.SWITCHROOM_VAULT_PASSPHRASE = passphrase;
+
+      reconcileAgent("m3-safe-agent", config, tmpDir, vaultTelegramConfig, switchroomConfig);
+      // Operator's token is preserved — reconcile did not overwrite it.
+      expect(readFileSync(envPath, "utf-8")).toBe(`TELEGRAM_BOT_TOKEN=${operatorToken}\n`);
+    } finally {
+      if (origPassphrase !== undefined) process.env.SWITCHROOM_VAULT_PASSPHRASE = origPassphrase;
+      else delete process.env.SWITCHROOM_VAULT_PASSPHRASE;
+      if (origVaultPath !== undefined) process.env.SWITCHROOM_VAULT_PATH = origVaultPath;
+      else delete process.env.SWITCHROOM_VAULT_PATH;
+      if (origToken !== undefined) process.env.TELEGRAM_BOT_TOKEN = origToken;
+      else delete process.env.TELEGRAM_BOT_TOKEN;
+    }
+  });
+
+  it("never clobbers an `export TELEGRAM_BOT_TOKEN=` hand-edit on reconcile (M3)", () => {
+    const vaultTelegramConfig: TelegramConfig = {
+      bot_token: "vault:telegram-bot-token",
+      forum_chat_id: "-1001234567890",
+    };
+    const config = makeAgentConfig();
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: vaultTelegramConfig,
+      agents: { "m3-export-agent": config },
+    } as SwitchroomConfig;
+
+    const origPassphrase = process.env.SWITCHROOM_VAULT_PASSPHRASE;
+    const origVaultPath = process.env.SWITCHROOM_VAULT_PATH;
+    const origToken = process.env.TELEGRAM_BOT_TOKEN;
+    delete process.env.SWITCHROOM_VAULT_PASSPHRASE;
+    delete process.env.SWITCHROOM_VAULT_PATH;
+    delete process.env.TELEGRAM_BOT_TOKEN;
+    try {
+      const result = scaffoldAgent("m3-export-agent", config, tmpDir, vaultTelegramConfig, switchroomConfig);
+      const envPath = join(result.agentDir, "telegram", ".env");
+      // Operator hand-edits with shell `export` syntax.
+      const operatorLine = "export TELEGRAM_BOT_TOKEN=111222:OPERATOR-EXPORT\n";
+      writeFileSync(envPath, operatorLine, { mode: 0o600 });
+
+      const vaultPath = join(tmpDir, "vault.enc");
+      const passphrase = "test-passphrase";
+      createVault(passphrase, vaultPath);
+      setStringSecret(passphrase, vaultPath, "telegram-bot-token", "999999:VAULT-DIFFERENT");
+      process.env.SWITCHROOM_VAULT_PATH = vaultPath;
+      process.env.SWITCHROOM_VAULT_PASSPHRASE = passphrase;
+
+      reconcileAgent("m3-export-agent", config, tmpDir, vaultTelegramConfig, switchroomConfig);
+      // The `export`-prefixed real token is a real token, not the placeholder.
+      expect(readFileSync(envPath, "utf-8")).toBe(operatorLine);
+    } finally {
+      if (origPassphrase !== undefined) process.env.SWITCHROOM_VAULT_PASSPHRASE = origPassphrase;
+      else delete process.env.SWITCHROOM_VAULT_PASSPHRASE;
+      if (origVaultPath !== undefined) process.env.SWITCHROOM_VAULT_PATH = origVaultPath;
+      else delete process.env.SWITCHROOM_VAULT_PATH;
+      if (origToken !== undefined) process.env.TELEGRAM_BOT_TOKEN = origToken;
+      else delete process.env.TELEGRAM_BOT_TOKEN;
     }
   });
 
