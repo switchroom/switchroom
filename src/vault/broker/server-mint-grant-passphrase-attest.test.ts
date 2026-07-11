@@ -135,7 +135,9 @@ describe("VaultBroker: mint_grant passphrase attestation (#1012 Phase 2)", () =>
     const testAuditLogger: AuditLogger = {
       write: (e: AuditEntry) => {
         auditEntries.push(e);
+        return true;
       },
+      failOpenCount: () => 0,
     };
 
     broker = new VaultBroker({

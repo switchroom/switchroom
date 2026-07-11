@@ -427,6 +427,10 @@ export const ErrorCode = z.enum([
   "UNKNOWN_KEY",
   "BAD_REQUEST",
   "INTERNAL",
+  // sec WS10-F3 / #1420: returned when the broker is in fail-closed mode and
+  // the audit append for a secret release failed — the secret is withheld
+  // rather than released without a durable audit row.
+  "AUDIT_UNAVAILABLE",
 ]);
 export type ErrorCode = z.infer<typeof ErrorCode>;
 

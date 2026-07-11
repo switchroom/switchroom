@@ -18,6 +18,8 @@ import {
   createAuditLogger,
   callerFromPeer,
   defaultAuditLogPath,
+  failOpenStatePath,
+  readFailOpenState,
   type AuditEntry,
 } from "./audit-log.js";
 import { verifyAuditLog } from "../../util/audit-hashchain.js";
@@ -451,5 +453,69 @@ describe("defaultAuditLogPath", () => {
   it("returns a path under os.homedir()/.switchroom/", () => {
     const p = defaultAuditLogPath();
     expect(p).toBe(path.join(os.homedir(), ".switchroom", "vault-audit.log"));
+  });
+});
+
+// ─── fail-open counter (sec WS10-F3 / #1420) ──────────────────────────────────
+
+describe("createAuditLogger fail-open counter", () => {
+  const goodEntry: AuditEntry = {
+    ts: "2026-07-11T00:00:00.000Z",
+    op: "get",
+    key: "k/foo",
+    caller: "agent:test",
+    pid: 1,
+    result: "allowed",
+  };
+
+  it("write() returns true and does not bump the counter on success", () => {
+    const audit = createAuditLogger({ path: logPath });
+    expect(audit.write(goodEntry)).toBe(true);
+    expect(audit.failOpenCount()).toBe(0);
+    // No sidecar is created on the happy path.
+    expect(fs.existsSync(failOpenStatePath(logPath))).toBe(false);
+  });
+
+  it("write() returns false, bumps the counter, and persists a sidecar on append failure", () => {
+    // Make the log path a DIRECTORY so openSync("a") fails with EISDIR —
+    // a stand-in for a broken/read-only/full audit volume.
+    fs.mkdirSync(logPath);
+    const statePath = path.join(tmpDir, "vault-audit.failopen");
+    const audit = createAuditLogger({ path: logPath, statePath });
+
+    expect(audit.write(goodEntry)).toBe(false);
+    expect(audit.failOpenCount()).toBe(1);
+
+    // Second failure keeps incrementing.
+    expect(audit.write(goodEntry)).toBe(false);
+    expect(audit.failOpenCount()).toBe(2);
+
+    // The counter is durable: readable from the sidecar without the logger.
+    const state = readFailOpenState(statePath);
+    expect(state.failOpenCount).toBe(2);
+    expect(state.lastFailureTs).toBeDefined();
+    expect(state.lastError).toBeDefined();
+  });
+
+  it("seeds the in-memory counter from an existing sidecar (survives restart)", () => {
+    const statePath = path.join(tmpDir, "vault-audit.failopen");
+    fs.writeFileSync(statePath, JSON.stringify({ failOpenCount: 5 }));
+    fs.mkdirSync(logPath); // force the next append to fail too
+
+    const audit = createAuditLogger({ path: logPath, statePath });
+    // Starts at the persisted value, not 0.
+    expect(audit.failOpenCount()).toBe(5);
+    expect(audit.write(goodEntry)).toBe(false);
+    expect(audit.failOpenCount()).toBe(6);
+    expect(readFailOpenState(statePath).failOpenCount).toBe(6);
+  });
+
+  it("readFailOpenState returns a zeroed state for a missing/corrupt sidecar", () => {
+    expect(readFailOpenState(path.join(tmpDir, "nope.failopen"))).toEqual({
+      failOpenCount: 0,
+    });
+    const bad = path.join(tmpDir, "bad.failopen");
+    fs.writeFileSync(bad, "{not json");
+    expect(readFailOpenState(bad)).toEqual({ failOpenCount: 0 });
   });
 });

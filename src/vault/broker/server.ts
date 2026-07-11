@@ -223,6 +223,58 @@ export class VaultBroker {
   }
 
   /**
+   * sec WS10-F3 / #1420 — whether the broker fails CLOSED on an audit-append
+   * failure (deny the secret release) rather than the historical fail-OPEN
+   * (release anyway, only stderr-warn). Default is fail-open for backward
+   * compatibility: a broken audit volume must not brick a running fleet
+   * unless the operator has explicitly opted into the stricter posture.
+   *
+   * Resolution order (first that is set wins):
+   *   1. env `SWITCHROOM_VAULT_AUDIT_FAIL_CLOSED` ("1"/"true" → closed,
+   *      "0"/"false" → open) — mirrors the SWITCHROOM_VAULT_AUDIT_* env
+   *      override pattern used for rotation, lets an operator flip the mode
+   *      without a config edit.
+   *   2. config `vault.broker.auditFailClosed`.
+   *   3. default false (fail-open).
+   */
+  private auditFailClosedEnabled(): boolean {
+    const env = process.env.SWITCHROOM_VAULT_AUDIT_FAIL_CLOSED;
+    if (env !== undefined && env !== "") {
+      return env === "1" || env.toLowerCase() === "true";
+    }
+    return this.config?.vault?.broker?.auditFailClosed === true;
+  }
+
+  /**
+   * sec WS10-F3 / #1420 — write the terminal "allowed" audit row for a secret
+   * release and enforce the fail-closed decision. Returns `true` if the caller
+   * may proceed to hand back the secret; when it returns `false` it has ALREADY
+   * written the DENIED response onto the socket (fail-closed: the audit append
+   * failed and the operator opted into denying unaudited releases). In fail-open
+   * mode it always returns `true` (the row-write failure is still counted +
+   * stderr-warned inside the logger).
+   */
+  private auditedReleaseOk(
+    socket: net.Socket,
+    writeAudit: (entry: import("./audit-log.js").AuditEntry) => boolean,
+    entry: import("./audit-log.js").AuditEntry,
+  ): boolean {
+    const durable = writeAudit(entry);
+    if (!durable && this.auditFailClosedEnabled()) {
+      socket.write(
+        encodeResponse(
+          errorResponse(
+            "AUDIT_UNAVAILABLE",
+            "secret release denied: audit append failed and broker is in fail-closed mode (vault.broker.auditFailClosed)",
+          ),
+        ),
+      );
+      return false;
+    }
+    return true;
+  }
+
+  /**
    * Start the broker — bind both sockets, write PID file, notify systemd.
    *
    * @param socketPath   Path for the data socket. Created mode 0600.
@@ -923,8 +975,8 @@ export class VaultBroker {
     // fields under JSON.stringify, so this is purely additive on the wire.
     const writeAudit = (
       entry: import("./audit-log.js").AuditEntry,
-    ): void => {
-      this.auditLogger.write({
+    ): boolean => {
+      return this.auditLogger.write({
         ...entry,
         peer_uid: entry.peer_uid ?? auditPeerUid,
         agent_name: entry.agent_name ?? auditAgentName,
@@ -1246,17 +1298,22 @@ export class VaultBroker {
             );
             return;
           }
-          this.auditLogger.write({
-            ts: new Date().toISOString(),
-            op: "get",
-            key: req.key,
-            caller: auditCaller,
-            pid: auditPid,
-            cgroup: auditCgroup,
-            result: "allowed",
-            method: "grant",
-            grant_id: grantId,
-          });
+          // sec WS10-F3 / #1420: fail-closed guard on the release row.
+          if (
+            !this.auditedReleaseOk(socket, writeAudit, {
+              ts: new Date().toISOString(),
+              op: "get",
+              key: req.key,
+              caller: auditCaller,
+              pid: auditPid,
+              cgroup: auditCgroup,
+              result: "allowed",
+              method: "grant",
+              grant_id: grantId,
+            })
+          ) {
+            return;
+          }
           socket.write(encodeResponse(entryResponse(entry)));
           return;
         } else if (grantResult.reason === "grant-revoked") {
@@ -1428,16 +1485,21 @@ export class VaultBroker {
         return;
       }
 
-      // Successful get — log only the key name, NEVER the value
-      this.auditLogger.write({
-        ts: new Date().toISOString(),
-        op: "get",
-        key: req.key,
-        caller: auditCaller,
-        pid: auditPid,
-        cgroup: auditCgroup,
-        result: "allowed",
-      });
+      // Successful get — log only the key name, NEVER the value.
+      // sec WS10-F3 / #1420: fail-closed guard on the release row.
+      if (
+        !this.auditedReleaseOk(socket, writeAudit, {
+          ts: new Date().toISOString(),
+          op: "get",
+          key: req.key,
+          caller: auditCaller,
+          pid: auditPid,
+          cgroup: auditCgroup,
+          result: "allowed",
+        })
+      ) {
+        return;
+      }
       socket.write(encodeResponse(entryResponse(entry)));
       return;
     }

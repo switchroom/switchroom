@@ -118,7 +118,7 @@ describe("VaultBroker: PUT with write-grant (#969 P1b)", () => {
 
     grantsDb = makeInMemoryGrantsDb();
     auditEntries = [];
-    const testAuditLogger = { write: (e: AuditEntry) => { auditEntries.push(e); } };
+    const testAuditLogger = { write: (e: AuditEntry) => { auditEntries.push(e); return true; }, failOpenCount: () => 0 };
 
     broker = new VaultBroker({
       _testConfig: makeMinimalConfig(),

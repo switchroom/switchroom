@@ -3289,6 +3289,21 @@ export const VaultConfigSchema = z.object({
           "union re-mint but never ADD one. Takes effect on broker + gateway " +
           "restart (broker has no ACL hot-reload)."
         ),
+      auditFailClosed: z
+        .boolean()
+        .default(false)
+        .describe(
+          "sec WS10-F3 (#1420) — fail-CLOSED on an audit-append failure. When " +
+          "`false` (default, backward-compatible) the broker fails OPEN: if a " +
+          "vault-audit.log append fails it logs to stderr, bumps the durable " +
+          "fail-open counter, and STILL releases the secret. When `true`, a " +
+          "failed audit append DENIES the secret release with " +
+          "`AUDIT_UNAVAILABLE` — no secret leaves the broker without a durable " +
+          "audit row. The env var `SWITCHROOM_VAULT_AUDIT_FAIL_CLOSED` " +
+          "(`1`/`true` or `0`/`false`) overrides this at runtime. Either way " +
+          "the fail-open counter is surfaced by `switchroom doctor`. Takes " +
+          "effect on broker restart."
+        ),
     })
     .default({})
     .superRefine((broker, ctx) => {

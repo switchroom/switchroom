@@ -155,4 +155,32 @@ describe("runAuditIntegrityChecks", () => {
       r.find((c) => c.name.includes("vault-broker audit tamper-evidence")),
     ).toBeUndefined();
   });
+
+  // ─── fail-open counter (sec WS10-F3 / #1420) ────────────────────────────────
+
+  it("warns when the vault-broker fail-open counter is non-zero", () => {
+    const r = runAuditIntegrityChecks({
+      homeDir: HOME,
+      readFileSync: reader({ [VAULT]: chainedLog([{ ts: "t", op: "get" }]) }),
+      readFailOpenState: () => ({
+        failOpenCount: 3,
+        lastFailureTs: "2026-07-11T00:00:00.000Z",
+        lastError: "EROFS: read-only file system",
+      }),
+    });
+    const c = r.find((x) => x.name === "vault-broker audit fail-open counter");
+    expect(c?.status).toBe("warn");
+    expect(c?.detail).toMatch(/3 audit append\(s\) failed/);
+    expect(c?.detail).toContain("EROFS");
+  });
+
+  it("ok when the fail-open counter is zero (or sidecar absent)", () => {
+    const r = runAuditIntegrityChecks({
+      homeDir: HOME,
+      readFileSync: reader({ [VAULT]: chainedLog([{ ts: "t", op: "get" }]) }),
+      readFailOpenState: () => ({ failOpenCount: 0 }),
+    });
+    const c = r.find((x) => x.name === "vault-broker audit fail-open counter");
+    expect(c?.status).toBe("ok");
+  });
 });
