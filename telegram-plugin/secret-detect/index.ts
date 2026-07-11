@@ -18,10 +18,14 @@
  * a hit to `suppressed: true`. The caller decides what that means (our
  * convention: suppressed high-confidence → ambiguous, user is asked).
  *
- * Secretlint is integrated as an async supplementary source via
- * `detectSecretsAsync`. The sync `detectSecrets` keeps the fast vendored-
- * pattern path for callers on the hot path (Telegram message ingest).
- * Gitleaks TOML is loaded via `gitleaks-loader.ts`.
+ * Detection is vendored-patterns-only and synchronous: every live caller
+ * (inbound gate, outbound scrub, `redact.ts`, `pipeline.ts`) runs
+ * `detectSecrets`. There is deliberately NO Secretlint/async "safety net"
+ * layered underneath — an earlier `detectSecretsAsync` + Secretlint wrapper
+ * was never wired into any live path (test-only), so it was a false safety
+ * net and has been removed (2026-07 secret-scrub review, tp-support F1).
+ * Arming a new async scanner belongs in its own validated change, not the
+ * scrub-coverage PR. Gitleaks TOML is loaded via `gitleaks-loader.ts`.
  */
 import { ALL_PATTERNS } from './patterns.js'
 import { scanKeyValue, type RawHit } from './kv-scanner.js'
@@ -209,53 +213,3 @@ function dropOverlaps(hits: RawHit[]): RawHit[] {
 export { maskToken } from './mask.js'
 export { redactUrls } from './url-redact.js'
 export { deriveSlug } from './slug.js'
-export { detectViaSecretlint } from './secretlint-source.js'
-
-/**
- * Async detection pipeline — runs `detectSecrets` (fast vendored engine)
- * and Secretlint in parallel, then merges the results by deduping on
- * `[start, end)` byte ranges. If Secretlint and a vendored pattern both
- * match the same span, the first one wins (vendored, since it's listed
- * first in the merge array below).
- *
- * Slug collisions are re-resolved on the merged list so the overall
- * output has unique `suggested_slug` values.
- */
-export async function detectSecretsAsync(text: string): Promise<Detection[]> {
-  if (!text || text.length === 0) return []
-  const [vendored, viaSecretlint] = await Promise.all([
-    Promise.resolve(detectSecrets(text)),
-    // Lazy-import keeps the sync `detectSecrets` path free of Secretlint
-    // initialization cost; paid once on first async call.
-    import('./secretlint-source.js').then((m) => m.detectViaSecretlint(text)),
-  ])
-
-  // Merge with range-based dedupe. On an exact-range tie, prefer the
-  // higher-confidence detection (else vendored-first). This matters since
-  // the vendored generic high-entropy fallback emits `ambiguous` — without
-  // the confidence tie-break it would shadow a Secretlint `high` provider
-  // hit on the same span and silently downgrade it (mirrors the sync
-  // dedupeRaw's high-over-ambiguous rule).
-  const seen = new Map<string, Detection>()
-  const consider = (d: Detection): void => {
-    const key = `${d.start}:${d.end}`
-    const existing = seen.get(key)
-    if (!existing || (existing.confidence === 'ambiguous' && d.confidence === 'high')) {
-      seen.set(key, d)
-    }
-  }
-  for (const d of vendored) consider(d)
-  for (const d of viaSecretlint) consider(d)
-
-  // Re-derive slugs against the merged set (Secretlint and vendored each
-  // had independent `existing` sets; we coalesce here).
-  const existing = new Set<string>()
-  const out: Detection[] = Array.from(seen.values())
-    .sort((a, b) => a.start - b.start)
-    .map((d) => {
-      const slug = deriveSlug({ key_name: d.key_name, rule_id: d.rule_id }, existing)
-      existing.add(slug)
-      return { ...d, suggested_slug: slug }
-    })
-  return out
-}
