@@ -1535,22 +1535,30 @@ export class HostdServer {
         validAgents = null;
       }
       if (validAgents !== null) {
+        // #1758 structured envelope alongside the legacy `error` string.
+        // ErrorBuilder synthesises `error` as "<code>: <human>", so the
+        // legacy string stays exactly "E_UNKNOWN_AGENT: …" — the same shape
+        // string-matching decoders already parse.
+        const buildDenied = (human: string): HostdResponse =>
+          err("E_UNKNOWN_AGENT", human)
+            .fixBadInput("agents")
+            .op("rollout")
+            .caller(caller.kind)
+            .agentName(caller.kind === "agent" ? caller.name : undefined)
+            .asDenied()
+            .build(req.request_id, Date.now() - started);
         const requested = req.args.agents;
         if (requested.length === 0) {
-          return deniedResponse(
-            req.request_id,
-            `E_UNKNOWN_AGENT: empty agents list — pass at least one agent, ` +
+          return buildDenied(
+            `empty agents list — pass at least one agent, ` +
               `or omit "agents" to roll all. Valid agents: ${validAgents.join(", ")}`,
-            Date.now() - started,
           );
         }
         const unknown = requested.filter((a) => !validAgents!.includes(a));
         if (unknown.length > 0) {
-          return deniedResponse(
-            req.request_id,
-            `E_UNKNOWN_AGENT: unknown agent(s): ${unknown.join(", ")}. ` +
+          return buildDenied(
+            `unknown agent(s): ${unknown.join(", ")}. ` +
               `Valid agents: ${validAgents.join(", ")}`,
-            Date.now() - started,
           );
         }
       }

@@ -93,6 +93,12 @@ describe("handleRollout — #2972 fail-fast agent validation", () => {
     // The valid agent names are listed so the caller can self-correct.
     expect(resp.error).toMatch(/test-harness/);
     expect(resp.error).toMatch(/clerk/);
+    // #1758 structured envelope: code + fix.kind + human naming the names.
+    expect(resp.error_envelope?.code).toBe("E_UNKNOWN_AGENT");
+    expect(resp.error_envelope?.fix?.kind).toBe("bad_input");
+    expect(resp.error_envelope?.human).toMatch(/switchroom-test-harness/);
+    expect(resp.error_envelope?.human).toMatch(/clerk/);
+    expect(resp.error_envelope?.request_id).toBe("req-2972");
     // No child was spawned.
     expect(launchSpy).not.toHaveBeenCalled();
   });
@@ -108,6 +114,7 @@ describe("handleRollout — #2972 fail-fast agent validation", () => {
     expect(resp.error).toMatch(/ghost-agent/);
     // "clerk" is valid — it must not be named as unknown.
     expect(resp.error).not.toMatch(/unknown agent\(s\): [^.]*clerk/);
+    expect(resp.error_envelope?.code).toBe("E_UNKNOWN_AGENT");
     expect(launchSpy).not.toHaveBeenCalled();
   });
 
@@ -116,6 +123,8 @@ describe("handleRollout — #2972 fail-fast agent validation", () => {
     const resp = await server.handleRollout(rolloutReq([]), caller, Date.now());
     expect(resp.result).toBe("denied");
     expect(resp.error).toMatch(/E_UNKNOWN_AGENT|empty/);
+    expect(resp.error_envelope?.code).toBe("E_UNKNOWN_AGENT");
+    expect(resp.error_envelope?.fix?.kind).toBe("bad_input");
     expect(launchSpy).not.toHaveBeenCalled();
   });
 

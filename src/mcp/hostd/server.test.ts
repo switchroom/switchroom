@@ -390,6 +390,36 @@ describe("dispatchTool — happy path", () => {
     expect(hostdRequestMock).toHaveBeenCalledTimes(1);
   });
 
+  it("rollout E_UNKNOWN_AGENT denial surfaces the #1758 structured envelope content item", async () => {
+    hostdRequestMock.mockResolvedValueOnce(
+      ok({
+        result: "denied",
+        error:
+          "E_UNKNOWN_AGENT: unknown agent(s): switchroom-test-harness. Valid agents: test-harness, clerk",
+        error_envelope: {
+          v: 1,
+          code: "E_UNKNOWN_AGENT",
+          human:
+            "unknown agent(s): switchroom-test-harness. Valid agents: test-harness, clerk",
+          fix: { kind: "bad_input", field: "agents" },
+          request_id: "mcp-rollout-denied-1",
+        },
+      }),
+    );
+    const res = await dispatchTool("rollout", {
+      pin: "v0.15.18",
+      agents: ["switchroom-test-harness"],
+    });
+    expect(res.isError).toBe(true);
+    const joined = res.content.map((c) => c.text).join("\n");
+    // The envelope is surfaced as its own content item with the
+    // fix.kind discriminator hint the agent branches on.
+    expect(joined).toMatch(/Structured error — fix\.kind=bad_input/);
+    expect(joined).toMatch(/E_UNKNOWN_AGENT/);
+    expect(joined).toMatch(/Valid agents: test-harness, clerk/);
+    expect(hostdRequestMock).toHaveBeenCalledTimes(1);
+  });
+
   it("update_apply forwards reason when provided and omits it when absent", async () => {
     hostdRequestMock.mockResolvedValueOnce(ok({ result: "started" }));
     await dispatchTool("update_apply", {
