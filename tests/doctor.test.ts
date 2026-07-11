@@ -784,58 +784,7 @@ describe("checkLeakedHomeSwitchroom (#933)", () => {
   });
 });
 
-describe("checkPendingRetainsQueue (#1071)", () => {
-  let tempDir: string;
-  beforeEach(() => {
-    tempDir = resolve(tmpdir(), `switchroom-doctor-pending-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-  });
-  afterEach(() => rmSync(tempDir, { recursive: true, force: true }));
-
-  it("returns ok when directory does not exist", async () => {
-    const { checkPendingRetainsQueue } = await import("../src/cli/doctor.js");
-    const r = checkPendingRetainsQueue(tempDir);
-    expect(r.status).toBe("ok");
-    expect(r.detail).toContain("empty");
-  });
-
-  it("returns ok when directory exists but is empty", async () => {
-    mkdirSync(tempDir, { recursive: true });
-    const { checkPendingRetainsQueue } = await import("../src/cli/doctor.js");
-    const r = checkPendingRetainsQueue(tempDir);
-    expect(r.status).toBe("ok");
-  });
-
-  it("returns warn when queued entries are present (no dead)", async () => {
-    mkdirSync(tempDir, { recursive: true });
-    writeFileSync(join(tempDir, "1000000000000-aaaaaaaaaaaa.json"), "{}");
-    writeFileSync(join(tempDir, "1000000000001-bbbbbbbbbbbb.json"), "{}");
-    const { checkPendingRetainsQueue } = await import("../src/cli/doctor.js");
-    const r = checkPendingRetainsQueue(tempDir);
-    expect(r.status).toBe("warn");
-    expect(r.detail).toContain("2 queued");
-  });
-
-  it("returns fail when at least one .dead marker exists", async () => {
-    mkdirSync(tempDir, { recursive: true });
-    writeFileSync(join(tempDir, "1000000000000-aaaaaaaaaaaa.json"), "{}");
-    writeFileSync(join(tempDir, "1000000000001-cccccccccccc.json.dead"), "{}");
-    const { checkPendingRetainsQueue } = await import("../src/cli/doctor.js");
-    const r = checkPendingRetainsQueue(tempDir);
-    expect(r.status).toBe("fail");
-    expect(r.detail).toContain("1 dead");
-    expect(r.fix).toContain("retries gave up");
-  });
-
-  it("returns fail when queue reaches the cap", async () => {
-    mkdirSync(tempDir, { recursive: true });
-    // We don't actually need 1000 files — the implementation reads
-    // length >= 1000. Mock by writing 1000 stubs (cheap, ~1 ms).
-    for (let i = 0; i < 1000; i++) {
-      writeFileSync(join(tempDir, `${1000000000000 + i}-x${i}.json`), "{}");
-    }
-    const { checkPendingRetainsQueue } = await import("../src/cli/doctor.js");
-    const r = checkPendingRetainsQueue(tempDir);
-    expect(r.status).toBe("fail");
-    expect(r.detail).toContain("queue at cap");
-  });
-});
+// NOTE (#1094): the old host-scoped `checkPendingRetainsQueue(dir)` was
+// replaced by the per-agent container probe `checkPendingRetainsQueues`.
+// Its aggregation/classification is covered in
+// `src/cli/doctor-pending-retains.test.ts` with the docker-exec seam mocked.

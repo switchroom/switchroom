@@ -1306,97 +1306,196 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
     }
   }
 
-  // Pending-retains queue (#1071). When session_end's final retain
-  // fails it stashes the payload in ~/.hindsight/pending-retains/ so
-  // the next SessionStart can drain it. A non-empty queue is normal in
-  // flight, but persistent backlog (or any .dead markers) means
-  // operator attention.
-  results.push(checkPendingRetainsQueue());
+  // Pending-retains queue (#1071, scoping fix #1094). When session_end's
+  // final retain fails it stashes the payload in the agent container's
+  // $HOME/.hindsight/pending-retains/ so the next SessionStart can drain
+  // it. The queue lives INSIDE each agent container — not on the operator
+  // host — so we probe each container via `docker exec` rather than
+  // scanning the host HOME (which is always empty, giving a misleading
+  // "ok"). A non-empty queue is normal in flight, but persistent backlog
+  // (or any .dead markers) means operator attention.
+  results.push(checkPendingRetainsQueues(config));
 
   return results;
 }
 
 /**
- * Probe ``~/.hindsight/pending-retains/`` and report:
- *   ok    — directory missing or empty
- *   warn  — entries present but none marked dead (will retry on next session)
- *   fail  — at least one ``.dead`` marker (gave up after MAX_ATTEMPTS) OR
- *           queue at/over the bounded cap (chronic backlog)
- *
- * Exported for unit testing.
- * @internal
+ * The bounded queue cap — keep in sync with MAX_ENTRIES in
+ * ``vendor/hindsight-memory/scripts/lib/pending.py``. At the cap the
+ * drainer starts dropping new failures, so it escalates warn → fail.
  */
-export function checkPendingRetainsQueue(
-  dir?: string,
+const PENDING_RETAINS_MAX_ENTRIES = 1000;
+
+/**
+ * Per-agent probe result for the pending-retains queue.
+ *   - "ok"          — directory missing or empty (no failed retains)
+ *   - "backlog"     — queued ``.json`` entries, none dead (will retry)
+ *   - "dead"        — one or more ``.json.dead`` markers (retries gave
+ *                     up — permanently-failed retains an operator must
+ *                     inspect by hand)
+ *   - "unreachable" — container not running / docker unavailable
+ * @internal exported for testing
+ */
+export interface PendingRetainsProbeResult {
+  state: "ok" | "backlog" | "dead" | "unreachable";
+  /** count of queued ``*.json`` entries (excludes ``.dead``) */
+  pending: number;
+  /** count of ``*.json.dead`` markers */
+  dead: number;
+}
+
+/**
+ * Probe ONE agent container's ``$HOME/.hindsight/pending-retains/`` via
+ * ``docker exec`` and classify it. The queue is written by session_end.py
+ * running INSIDE the agent container (HOME=``/state/agent/home``), so a
+ * host-side scan of the operator's HOME is always empty and misleading
+ * (the #1094 bug this replaces). A single exec counts both ``*.json`` and
+ * ``*.json.dead`` so we pay one docker-exec round-trip per agent.
+ *
+ * @internal exported for testing
+ */
+export function probePendingRetainsQueue(
+  agentName: string,
+): PendingRetainsProbeResult {
+  // Container HOME per compose.ts (`HOME: "/state/agent/home"`). Same
+  // default relative path as lib/pending.py: $HOME/.hindsight/pending-retains.
+  const dir = "/state/agent/home/.hindsight/pending-retains";
+  // `.json$` matches queued entries but NOT `.json.dead` (which ends in
+  // `.dead`), so the two counts don't overlap. grep -c on empty input
+  // prints 0 and exits 1, so guard with the -d test and swallow status.
+  const script =
+    `P=0; D=0; ` +
+    `if [ -d '${dir}' ]; then ` +
+    `P=$(ls -1 '${dir}' 2>/dev/null | grep -c '\\.json$' || true); ` +
+    `D=$(ls -1 '${dir}' 2>/dev/null | grep -c '\\.json\\.dead$' || true); ` +
+    `fi; ` +
+    `echo "P=$P D=$D"`;
+  const r = spawnSync(
+    "docker",
+    ["exec", `switchroom-${agentName}`, "sh", "-c", script],
+    { stdio: "pipe", timeout: 3000 },
+  );
+  // docker/daemon failure, container absent (exit ≥125), or timeout
+  // (status null) → skip this agent, don't false-alarm.
+  if (r.error || r.status === null || r.status !== 0) {
+    return { state: "unreachable", pending: 0, dead: 0 };
+  }
+  const out = r.stdout.toString();
+  const pm = out.match(/P=(\d+)/);
+  const dm = out.match(/D=(\d+)/);
+  if (!pm || !dm) return { state: "unreachable", pending: 0, dead: 0 };
+  const pending = parseInt(pm[1], 10);
+  const dead = parseInt(dm[1], 10);
+  if (dead > 0) return { state: "dead", pending, dead };
+  if (pending > 0) return { state: "backlog", pending, dead };
+  return { state: "ok", pending, dead };
+}
+
+/**
+ * Aggregate the per-agent pending-retains probe into a single doctor row.
+ *
+ * Fleet-scale rationale (mirrors checkVaultBrokerSocketPairs): agents come
+ * in 5-15 per host, so one row per agent would clobber output. Group the
+ * verdict and name the specific agents that are off.
+ *
+ * Verdict precedence:
+ *   - fail  — any agent has ``.dead`` markers (permanently-failed retains)
+ *             OR any queue is at/over the bounded cap (dropping failures)
+ *   - warn  — any agent has a live backlog (drains on next SessionStart)
+ *   - skip  — every agent container is unreachable (fleet down)
+ *   - ok    — all reachable agents have an empty/missing queue
+ *
+ * Partial unreachability (some agents down mid-restart) does NOT collapse
+ * to skip — the reachable agents' verdicts still stand, and the skipped
+ * ones are named so the operator can re-run.
+ *
+ * @internal exported for testing
+ */
+export function checkPendingRetainsQueues(
+  config: SwitchroomConfig,
+  opts?: { probe?: (agentName: string) => PendingRetainsProbeResult },
 ): CheckResult {
-  // Same default as lib/pending.py: $HOME/.hindsight/pending-retains/.
-  const home = process.env.HOME ?? "";
-  const pendingDir =
-    dir
-    ?? process.env.HINDSIGHT_PENDING_DIR
-    ?? join(home, ".hindsight", "pending-retains");
-
-  if (!existsSync(pendingDir)) {
-    return {
-      name: "pending-retains queue",
-      status: "ok",
-      detail: "empty (no failed retains)",
-    };
+  const name = "pending-retains queue";
+  const agentNames = Object.keys(config.agents ?? {}).sort();
+  if (agentNames.length === 0) {
+    return { name, status: "ok", detail: "no agents configured" };
   }
+  const probe = opts?.probe ?? probePendingRetainsQueue;
+  const results = new Map<string, PendingRetainsProbeResult>();
+  for (const a of agentNames) results.set(a, probe(a));
 
-  let names: string[];
-  try {
-    names = readdirSync(pendingDir);
-  } catch (err) {
+  // All unreachable → the fleet is down (or docker is). One honest skip
+  // row, not N noise rows.
+  const allUnreachable = [...results.values()].every(
+    (r) => r.state === "unreachable",
+  );
+  if (allUnreachable) {
     return {
-      name: "pending-retains queue",
-      status: "warn",
-      detail: `unreadable: ${(err as Error).message}`,
-    };
-  }
-
-  const pending = names.filter((n) => n.endsWith(".json"));
-  const dead = names.filter((n) => n.endsWith(".json.dead"));
-
-  // Keep in sync with MAX_ENTRIES in lib/pending.py.
-  const MAX_ENTRIES = 1000;
-
-  if (dead.length > 0) {
-    return {
-      name: "pending-retains queue",
-      status: "fail",
+      name,
+      status: "skip",
       detail:
-        `${dead.length} dead entries (gave up after retries), ${pending.length} still queued`,
-      fix:
-        `Hindsight has been unreachable long enough that retries gave up. `
-        + `Inspect ~/.hindsight/pending-retains/*.json.dead, fix the upstream, `
-        + `then re-enqueue manually (rename .dead → .json) or discard.`,
+        "all agent containers unreachable — couldn't probe pending-retains queues",
+      fix: "Start the fleet (`switchroom up`) or run this on the host with docker access, then re-check.",
     };
   }
 
-  if (pending.length >= MAX_ENTRIES) {
+  const dead: string[] = [];
+  const capped: string[] = [];
+  const backlog: string[] = [];
+  const unreachable: string[] = [];
+  let okCount = 0;
+  for (const [a, r] of results) {
+    if (r.state === "dead") {
+      dead.push(
+        `${a} (${r.dead} dead${r.pending > 0 ? `, ${r.pending} queued` : ""})`,
+      );
+    } else if (r.state === "backlog") {
+      if (r.pending >= PENDING_RETAINS_MAX_ENTRIES) capped.push(`${a} (${r.pending})`);
+      else backlog.push(`${a} (${r.pending})`);
+    } else if (r.state === "unreachable") {
+      unreachable.push(a);
+    } else {
+      okCount++;
+    }
+  }
+  const skippedNote =
+    unreachable.length > 0 ? `; skipped (unreachable): ${unreachable.join(", ")}` : "";
+
+  // fail: dead markers or a capped queue.
+  if (dead.length > 0 || capped.length > 0) {
+    const parts: string[] = [];
+    if (dead.length > 0) parts.push(`dead markers: ${dead.join(", ")}`);
+    if (capped.length > 0) {
+      parts.push(`at cap of ${PENDING_RETAINS_MAX_ENTRIES} (dropping new failures): ${capped.join(", ")}`);
+    }
+    if (backlog.length > 0) parts.push(`backlog: ${backlog.join(", ")}`);
     return {
-      name: "pending-retains queue",
+      name,
       status: "fail",
-      detail: `${pending.length} entries (queue at cap of ${MAX_ENTRIES}, dropping new failures)`,
+      detail: `${parts.join("; ")}${skippedNote}`,
       fix:
-        `Chronic retain failures. Bring Hindsight up, run `
-        + `\`python3 ~/.claude/plugins/.../scripts/drain_pending.py\`, then re-check.`,
+        `Dead entries mean Hindsight was unreachable long enough that retries gave up. ` +
+        `Inspect them per agent: ` +
+        `\`docker exec switchroom-<agent> ls /state/agent/home/.hindsight/pending-retains/*.json.dead\`. ` +
+        `Fix the upstream (bank health rows above), then re-enqueue (rename .dead → .json) or discard. ` +
+        `Live backlog drains automatically on the agent's next SessionStart.`,
     };
   }
 
-  if (pending.length > 0) {
+  // warn: live backlog only.
+  if (backlog.length > 0) {
     return {
-      name: "pending-retains queue",
+      name,
       status: "warn",
-      detail: `${pending.length} queued (will retry on next SessionStart)`,
+      detail: `queued (drains on next SessionStart): ${backlog.join(", ")}${skippedNote}`,
     };
   }
 
+  // ok: everything reachable is empty.
   return {
-    name: "pending-retains queue",
+    name,
     status: "ok",
-    detail: "empty (no failed retains)",
+    detail: `${okCount}/${agentNames.length} agents: empty (no failed retains)${skippedNote}`,
   };
 }
 
