@@ -33,6 +33,7 @@ import {
   isHindsightRunning,
   isHindsightContainerExists,
   startHindsight,
+  hindsightConsumerMirrorDir,
   stopHindsight,
   ensureHindsightConsumer,
   HINDSIGHT_CONSUMER_NAME,
@@ -1101,7 +1102,13 @@ async function stepMemoryBackend(
   const spin = spinner("Starting Hindsight Docker container...");
   try {
     const litellmCfg = await resolveLiteLLMForHindsight(config);
-    startHindsight(ports, litellmCfg, undefined, config.hindsight?.llm);
+    startHindsight(
+      ports,
+      litellmCfg,
+      undefined,
+      config.hindsight?.llm,
+      hindsightConsumerMirrorDir(config),
+    );
     if (litellmCfg) {
       console.log(chalk.gray("  LiteLLM routing enabled (--network host, ANTHROPIC_BASE_URL set)."));
     }

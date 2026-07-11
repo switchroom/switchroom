@@ -1716,6 +1716,24 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   for (const c of authConsumers) {
     lines.push(`      - auth-broker-${c.name}-sock:/run/switchroom/auth-broker/${c.name}`);
   }
+  // Per-consumer creds mirror (#2578). When a consumer declares
+  // `mirror_dir`, the broker actively pushes the effective-account
+  // `.credentials.json` there the instant it detects exhaustion (see
+  // mirrorAccountToConsumer in src/auth/broker/server.ts). That only
+  // reaches the consumer if broker and consumer share a volume: mount
+  // it here at the operator-chosen `mirror_dir` path, and the consumer
+  // container (e.g. hindsight, started out-of-project) mounts the SAME
+  // named volume at its creds-read path. The volume name is canonical
+  // (unprefixed, declared below) so the cross-project consumer can
+  // reference it. Consumers WITHOUT `mirror_dir` emit nothing here —
+  // output is byte-identical to pre-#2578. The broker reads the
+  // `mirror_dir` value straight from SWITCHROOM_CONFIG, so no extra env
+  // is duplicated.
+  for (const c of authConsumers) {
+    if (c.mirror_dir) {
+      lines.push(`      - consumer-creds-${c.name}:${c.mirror_dir}`);
+    }
+  }
   // Operator socket — host-mounted bind so `switchroom auth …` from a
   // shell on the host can reach the broker. Path is the operator-
   // socket bind documented in the RFC §4.2. Only emitted when an
@@ -1795,6 +1813,30 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
     // compose project, so the prefix is invisible.
     lines.push(`  auth-broker-${c.name}-sock:`);
     lines.push(`    name: auth-broker-${c.name}-sock`);
+  }
+  // Shared creds-mirror volume (#2578) — one per consumer with a
+  // `mirror_dir`. Canonical (unprefixed) name so the cross-project
+  // consumer container can mount the same volume by name. Absent when
+  // no consumer sets `mirror_dir`, keeping legacy output byte-identical.
+  //
+  // Creation-order note (verified live, docker compose v5.1.3, 2026-07-11):
+  // if `startHindsight()`'s docker-run path executes BEFORE the next
+  // `apply` of this project, `docker run -v consumer-creds-<name>:…`
+  // auto-creates the volume WITHOUT compose labels. `docker compose up`
+  // on this project then emits a warning ("already exists but was not
+  // created by Docker Compose. Use `external: true`…") but SUCCEEDS with
+  // exit 0 and REUSES the existing volume unchanged (labels/CreatedAt
+  // untouched) — an explicit `name:` adopts a same-named pre-existing
+  // volume rather than erroring. So ordering between `memory setup` and
+  // `apply` is safe in both directions; do not re-litigate. (The
+  // hindsight compose SNIPPET is stricter — it declares the volume
+  // `external: true`, so that path does require this project, or a
+  // prior docker run, to have created the volume first.)
+  for (const c of authConsumers) {
+    if (c.mirror_dir) {
+      lines.push(`  consumer-creds-${c.name}:`);
+      lines.push(`    name: consumer-creds-${c.name}`);
+    }
   }
   // Named volume for the voice sidecar's fetch-once model weights —
   // only declared when the sidecar service is emitted (local verdict).
