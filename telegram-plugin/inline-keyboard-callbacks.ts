@@ -115,6 +115,51 @@ export function wrapAgentCallbacks(keyboard: AnyButton[][]): AnyButton[][] {
 }
 
 /**
+ * Redact agent-authored free-text on an inline keyboard BEFORE it is sent to
+ * Telegram (#3148 fast-follow secret-scrub coverage). `wrapAgentCallbacks`
+ * rewrites only `callback_data`; the visible `text` label, the `ack_text`
+ * toast, and any `copy_text.text` clipboard payload pass through VERBATIM. An
+ * agent that puts a secret in any of those transmits it unmasked, and it
+ * resurfaces on tap — the label is echoed back (`button_text`), re-rendered in
+ * the "✅ You chose: <label>" annotation (#789), and `ack_text` is shown as the
+ * toast. Route each of those three fields through the SAME outbound redactor
+ * the reply `text` body uses, at the outbound boundary, so every downstream
+ * resurface reads already-masked bytes.
+ *
+ * `callback_data` is the routing key and is NEVER touched — redacting it would
+ * break tap round-tripping. Button structure/order is preserved; the redactor
+ * (`redact()`) only replaces detected secret byte-ranges with a non-empty
+ * marker, so it never empties a label (the non-empty-text invariant holds).
+ * Returns a fresh keyboard; does not mutate the input. `redactFn` is injected
+ * so this stays pure + unit-testable and carries no gateway import cycle.
+ *
+ * Only agent-authored keyboards flow through here (the `reply` tool path);
+ * framework-internal keyboards (approval cards, vault wizard, model menus) are
+ * built separately and are NOT redacted by this function.
+ */
+export function redactAgentKeyboard(
+  keyboard: AnyButton[][],
+  redactFn: (s: string) => string,
+): AnyButton[][] {
+  return keyboard.map((row) =>
+    row.map((btn) => {
+      const out: AnyButton = { ...btn }
+      if (typeof out.text === 'string') out.text = redactFn(out.text)
+      if (typeof out.ack_text === 'string') out.ack_text = redactFn(out.ack_text)
+      const ct = out.copy_text
+      if (ct != null && typeof ct === 'object' &&
+          typeof (ct as { text?: unknown }).text === 'string') {
+        out.copy_text = {
+          ...(ct as Record<string, unknown>),
+          text: redactFn((ct as { text: string }).text),
+        }
+      }
+      return out
+    }),
+  )
+}
+
+/**
  * Extract per-button {@link AgentButtonMeta} from a raw (pre-wrap)
  * keyboard. Returns a map keyed by the raw (unprefixed) callback_data
  * string. Buttons without callback_data or without any meta fields are
