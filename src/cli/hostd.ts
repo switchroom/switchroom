@@ -387,6 +387,51 @@ services:
     networks:
       - default
 
+  # hindsight-autoheal (#2910) — the host-side restart-on-unhealthy loop the
+  # standalone \`switchroom-hindsight\` container can't do for itself. Docker's
+  # \`--restart always\` acts on process EXIT only, never on health status, and
+  # the in-container maintenance loop has no docker binary/socket — so a wedged-
+  # but-not-exited hindsight API stayed \`unhealthy\` forever and the fleet went
+  # silently amnesiac. This tiny sidecar polls the target's health and issues
+  # \`docker restart\` with a sliding-window cap + exponential backoff (guarded
+  # against restart loops), logging every decision for \`switchroom doctor\`.
+  #
+  # Least-privilege: it reuses the SAME docker-socket-proxy above (which already
+  # allowlists GET /containers inspect + POST restart for hostd) over
+  # DOCKER_HOST — no new raw-socket mount, no widened endpoint surface. It runs
+  # on the hostd image purely because that image already carries the docker CLI
+  # and the baked script; it never touches hostd's own state (no volumes).
+  hindsight-autoheal:
+    image: ghcr.io/switchroom/switchroom-hostd:${imageTag}
+    container_name: switchroom-hindsight-autoheal
+    restart: always
+    depends_on:
+      - docker-socket-proxy
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Override hostd's node CMD: run the pure-shell poll loop instead. tini
+    # still reaps + forwards SIGTERM so \`docker stop\` is clean.
+    entrypoint: ["/usr/bin/tini", "--", "sh", "/opt/switchroom/docker/hindsight-autoheal.sh"]
+    environment:
+      # All docker access flows through the proxy — same as hostd. The CLI
+      # honors DOCKER_HOST, so \`docker inspect\`/\`docker restart\` hit the
+      # allowlisted TCP endpoint, never a raw socket in this container.
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
+      # Target + guardrails (all have in-script defaults; pinned here so the
+      # operator can see and tune them without reading the script).
+      SWITCHROOM_HINDSIGHT_AUTOHEAL: "1"
+      SWITCHROOM_HINDSIGHT_AUTOHEAL_TARGET: switchroom-hindsight
+      SWITCHROOM_HINDSIGHT_AUTOHEAL_POLL_S: "30"
+      SWITCHROOM_HINDSIGHT_AUTOHEAL_MAX_RESTARTS: "3"
+      SWITCHROOM_HINDSIGHT_AUTOHEAL_WINDOW_S: "3600"
+      SWITCHROOM_HINDSIGHT_AUTOHEAL_BACKOFF_BASE_S: "30"
+      SWITCHROOM_HINDSIGHT_AUTOHEAL_COOLDOWN_S: "900"
+      PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    networks:
+      - default
+
 networks:
   default:
     name: switchroom-hostd-net

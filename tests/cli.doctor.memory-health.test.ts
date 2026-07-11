@@ -9,6 +9,7 @@ import {
   classifyHindsightHealthProbe,
   checkHindsightHealthEndpoint,
   classifyConsolidationBacklog,
+  classifyAutohealStatus,
   CONSOLIDATION_BACKLOG_WARN,
   CONSOLIDATION_BACKLOG_FAIL,
   type AdvertisedTool,
@@ -164,21 +165,93 @@ describe("classifyExtractionLogs", () => {
   });
 });
 
+describe("classifyAutohealStatus (#2910 host-side autoheal surface)", () => {
+  it("no restart events → ok", () => {
+    const r = classifyAutohealStatus("hindsight-autoheal event=started target=switchroom-hindsight");
+    expect(r.status).toBe("ok");
+    expect(r.detail).toContain("no auto-restarts");
+  });
+
+  it("disabled → ok with disabled detail", () => {
+    const r = classifyAutohealStatus("hindsight-autoheal event=disabled target=switchroom-hindsight");
+    expect(r.status).toBe("ok");
+    expect(r.detail).toContain("disabled");
+  });
+
+  it("restart(s) but no give-up → warn with the count", () => {
+    const logs = [
+      "hindsight-autoheal event=restart_issued attempt=1",
+      "hindsight-autoheal event=restart_ok attempt=1",
+      "hindsight-autoheal event=restart_issued attempt=2",
+    ].join("\n");
+    const r = classifyAutohealStatus(logs);
+    expect(r.status).toBe("warn");
+    expect(r.detail).toContain("2 time(s)");
+  });
+
+  it("give-up event → fail (loop-guarded, not restart-looping)", () => {
+    const logs = [
+      "hindsight-autoheal event=restart_issued attempt=1",
+      "hindsight-autoheal event=restart_issued attempt=2",
+      "hindsight-autoheal event=restart_issued attempt=3",
+      "hindsight-autoheal event=gave_up restarts=3 window_s=3600",
+    ].join("\n");
+    const r = classifyAutohealStatus(logs);
+    expect(r.status).toBe("fail");
+    expect(r.detail).toContain("GAVE UP after 3");
+    expect(r.detail).toContain("NOT restart-");
+  });
+});
+
 describe("checkHindsightContainerHealth (docker wrapper)", () => {
   it("silently skips when the container isn't a local docker container", () => {
     const exec = () => { throw new Error("No such container"); };
     expect(checkHindsightContainerHealth({ exec })).toEqual([]);
   });
 
-  it("classifies shm + logs when docker is available", () => {
+  it("classifies shm + logs + autoheal when docker is available", () => {
     const exec = (_cmd: string, args: string[]) => {
+      if (args.includes("inspect")) return "2147483648\n";
+      if (args.includes("switchroom-hindsight-autoheal")) return "hindsight-autoheal event=started target=switchroom-hindsight";
+      if (args.includes("logs")) return "Extract facts: 4 facts, 1 chunks from 1 contents in 12s";
+      return "";
+    };
+    const results = checkHindsightContainerHealth({ exec });
+    expect(results.map((r) => r.name)).toEqual([
+      "hindsight shm-size",
+      "hindsight extraction",
+      "hindsight autoheal",
+    ]);
+    expect(results.every((r) => r.status === "ok")).toBe(true);
+  });
+
+  it("skips the autoheal line when the sidecar container isn't present", () => {
+    const exec = (_cmd: string, args: string[]) => {
+      if (args.includes("switchroom-hindsight-autoheal")) throw new Error("No such container");
       if (args.includes("inspect")) return "2147483648\n";
       if (args.includes("logs")) return "Extract facts: 4 facts, 1 chunks from 1 contents in 12s";
       return "";
     };
     const results = checkHindsightContainerHealth({ exec });
     expect(results.map((r) => r.name)).toEqual(["hindsight shm-size", "hindsight extraction"]);
-    expect(results.every((r) => r.status === "ok")).toBe(true);
+  });
+
+  it("surfaces an autoheal give-up as a FAIL line", () => {
+    const exec = (_cmd: string, args: string[]) => {
+      if (args.includes("inspect")) return "2147483648\n";
+      if (args.includes("switchroom-hindsight-autoheal")) {
+        return [
+          "hindsight-autoheal event=restart_issued attempt=1",
+          "hindsight-autoheal event=restart_issued attempt=2",
+          "hindsight-autoheal event=restart_issued attempt=3",
+          "hindsight-autoheal event=gave_up restarts=3",
+        ].join("\n");
+      }
+      if (args.includes("logs")) return "Extract facts: 4 facts, 1 chunks from 1 contents in 12s";
+      return "";
+    };
+    const results = checkHindsightContainerHealth({ exec });
+    expect(results.find((r) => r.name === "hindsight autoheal")?.status).toBe("fail");
   });
 
   it("surfaces a broken backend (small shm + failing extraction) that MCP reachability would miss", () => {

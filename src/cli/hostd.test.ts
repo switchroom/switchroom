@@ -8,9 +8,9 @@
  */
 
 import { afterEach, beforeEach, describe, it, expect } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   DOCKER_SOCKET_PROXY_IMAGE,
   renderHostdComposeFile,
@@ -394,5 +394,71 @@ describe("resolveHostdImageTag (honor release.pin like the agent fleet)", () => 
   it("falls back to 'latest' when neither --tag nor release is set", () => {
     expect(resolveHostdImageTag(undefined, undefined)).toBe("latest");
     expect(resolveHostdImageTag(undefined, {})).toBe("latest");
+  });
+});
+
+describe("renderHostdComposeFile — hindsight-autoheal sidecar (#2910)", () => {
+  const render = () =>
+    renderHostdComposeFile({ hostHome: "/home/alice", imageTag: "v1.2.3" });
+
+  it("emits a switchroom-hindsight-autoheal service on the hostd image", () => {
+    const out = render();
+    expect(out).toContain("hindsight-autoheal:");
+    expect(out).toContain("container_name: switchroom-hindsight-autoheal");
+    expect(out).toContain("image: ghcr.io/switchroom/switchroom-hostd:v1.2.3");
+  });
+
+  it("reuses the EXISTING docker-socket-proxy — no new raw-socket mount", () => {
+    const out = render();
+    const block = out.slice(
+      out.indexOf("hindsight-autoheal:"),
+      out.indexOf("\nnetworks:\n  default:"),
+    );
+    // Talks to the daemon only through the proxy over TCP.
+    expect(block).toContain("DOCKER_HOST: tcp://docker-socket-proxy:2375");
+    expect(block).toMatch(/depends_on:[\s\S]*?- docker-socket-proxy/);
+    // It must NOT mount the raw socket — the whole least-privilege point.
+    expect(block).not.toContain("/var/run/docker.sock");
+    // Still exactly ONE raw-socket bind in the whole file (the proxy's).
+    expect(
+      out.split("\n").filter((l) => /^\s*- \/var\/run\/docker\.sock:/.test(l)).length,
+    ).toBe(1);
+  });
+
+  it("hardens the sidecar: cap_drop ALL + no-new-privileges, and no state volumes", () => {
+    const out = render();
+    const block = out.slice(
+      out.indexOf("hindsight-autoheal:"),
+      out.indexOf("\nnetworks:\n  default:"),
+    );
+    expect(block).toMatch(/cap_drop:\s*\n\s+- ALL/);
+    expect(block).toContain("no-new-privileges:true");
+    // No volumes: — it never touches hostd's ~/.switchroom state.
+    expect(block).not.toMatch(/^\s+volumes:/m);
+  });
+
+  it("runs the baked autoheal script and pins the loop-guard knobs", () => {
+    const out = render();
+    const block = out.slice(
+      out.indexOf("hindsight-autoheal:"),
+      out.indexOf("\nnetworks:\n  default:"),
+    );
+    expect(block).toContain("/opt/switchroom/docker/hindsight-autoheal.sh");
+    expect(block).toContain("SWITCHROOM_HINDSIGHT_AUTOHEAL_TARGET: switchroom-hindsight");
+    expect(block).toContain('SWITCHROOM_HINDSIGHT_AUTOHEAL_MAX_RESTARTS: "3"');
+    expect(block).toContain('SWITCHROOM_HINDSIGHT_AUTOHEAL_WINDOW_S: "3600"');
+  });
+});
+
+describe("Dockerfile.hostd bakes the autoheal script (#2910)", () => {
+  it("COPYs docker/hindsight-autoheal.sh into the image and makes it executable", () => {
+    const df = readFileSync(
+      resolve(__dirname, "..", "..", "docker", "Dockerfile.hostd"),
+      "utf-8",
+    );
+    expect(df).toMatch(
+      /COPY docker\/hindsight-autoheal\.sh \/opt\/switchroom\/docker\/hindsight-autoheal\.sh/,
+    );
+    expect(df).toMatch(/chmod 0755 \/opt\/switchroom\/docker\/hindsight-autoheal\.sh/);
   });
 });

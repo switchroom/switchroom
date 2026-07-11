@@ -100,6 +100,16 @@ COPY dist/host-control/main.js /opt/switchroom/dist/host-control/main.js
 COPY profiles/ /opt/switchroom/profiles/
 COPY vendor/hindsight-memory/ /opt/switchroom/vendor/hindsight-memory/
 
+# hindsight autoheal loop (#2910). The hostd compose adds a tiny
+# `switchroom-hindsight-autoheal` sidecar that runs THIS script on the hostd
+# image (chosen because it already carries the docker CLI + routes through the
+# docker-socket-proxy). It polls the standalone `switchroom-hindsight`
+# container's health and issues `docker restart` on `unhealthy` with a
+# sliding-window cap + exponential backoff — the host-side restart-on-unhealthy
+# mechanism the container cannot do for itself. Pure /bin/sh, no extra deps.
+COPY docker/hindsight-autoheal.sh /opt/switchroom/docker/hindsight-autoheal.sh
+RUN chmod 0755 /opt/switchroom/docker/hindsight-autoheal.sh
+
 # Tiny wrapper so `switchroom <verb>` invocations from hostd resolve
 # to the bundled CLI. Uses `bun` (not `node`) because the CLI bundle
 # imports bun-specific modules (bun:sqlite, bun:test, etc. — produced
