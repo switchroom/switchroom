@@ -845,15 +845,19 @@ describe("hostd config_propose_edit — bind-mount-safe in-place write", () => {
  * approved proposal, an operator hand-edit) was SILENTLY REVERTED, including
  * security fields like another agent's tools.allow or hostd.config_edit_enabled.
  *
- * The fix pins the base by hash at propose time and, under the apply mutex,
- * ABORTS with E_CONFIG_CHANGED (re-propose) if the live file drifted — rather
- * than clobbering the intervening change.
+ * The fix NEVER writes the propose-time whole-file post-image. Under the apply
+ * mutex it re-applies the STORED DIFF against the CURRENT live file:
+ *   - a concurrent edit to some OTHER region still applies cleanly, so BOTH
+ *     changes survive and the apply COMPLETES (a unified diff only rewrites its
+ *     own hunks — legitimate non-conflicting concurrent edits are not denied);
+ *   - only a REAL conflict — the drift overlaps this diff's hunk lines so the
+ *     patch no longer applies — ABORTS with E_CONFIG_CHANGED (re-propose),
+ *     leaving the intervening change intact.
  */
-describe("hostd config_propose_edit — apply-time drift guard (#3084)", () => {
+describe("hostd config_propose_edit — apply-time re-apply guard (#3084)", () => {
   // A gateway that simulates another writer changing the live config DURING
   // the approval window: it writes `landed` to the file just before returning
-  // `approve` (i.e. after propose-time validation pinned the base, but before
-  // the apply runs).
+  // `approve` (i.e. after propose-time validation, but before the apply runs).
   function driftingGateway(landed: string) {
     const finalizeCalls: Array<{
       outcome: "applied" | "reconcile_failed_rolled_back";
@@ -873,22 +877,12 @@ describe("hostd config_propose_edit — apply-time drift guard (#3084)", () => {
     return { gw, finalizeCalls };
   }
 
-  // A second, independently-approved proposal that granted bob a tool — a
-  // security-relevant change in a region the pending proposal's diff never
-  // touches (so a whole-file post-image write would silently wipe it).
-  const SECOND_PROPOSAL_LANDED =
-    "switchroom:\n" +
-    "  version: 1\n" +
-    "telegram:\n" +
-    '  bot_token: "x"\n' +
-    '  forum_chat_id: "1"\n' +
-    "agents:\n" +
-    "  bob:\n" +
-    "    tools:\n" +
-    "      allow:\n" +
-    "        - mcp__perplexity__search\n";
-
-  const OPERATOR_HAND_EDIT =
+  // An intervening operator hand-edit that rotated the bot token — a
+  // security-relevant change on line 4, a region GOOD_DIFF's hunk (lines 1-3)
+  // never touches, so the stored diff STILL APPLIES cleanly on top of it and
+  // the result stays schema-valid. A whole-file post-image write would silently
+  // revert the rotation; re-applying the diff preserves it.
+  const NON_CONFLICTING_EDIT_LANDED =
     "switchroom:\n" +
     "  version: 1\n" +
     "telegram:\n" +
@@ -896,8 +890,19 @@ describe("hostd config_propose_edit — apply-time drift guard (#3084)", () => {
     '  forum_chat_id: "1"\n' +
     "agents: {}\n";
 
-  it("(a) a second approved proposal landing during the window is NOT silently reverted", async () => {
-    const { gw, finalizeCalls } = driftingGateway(SECOND_PROPOSAL_LANDED);
+  // A conflicting operator hand-edit: it rewrites `  version: 1` — one of the
+  // exact context lines GOOD_DIFF's hunk depends on — so the stored diff NO
+  // LONGER APPLIES. This is the genuine-conflict path that MUST deny.
+  const CONFLICTING_HAND_EDIT =
+    "switchroom:\n" +
+    "  version: 2\n" +
+    "telegram:\n" +
+    '  bot_token: "x"\n' +
+    '  forum_chat_id: "1"\n' +
+    "agents: {}\n";
+
+  it("(a) a non-conflicting concurrent edit (other region) COMPLETES and both changes survive", async () => {
+    const { gw, finalizeCalls } = driftingGateway(NON_CONFLICTING_EDIT_LANDED);
     let reconcileInvocations = 0;
     server = makeServer({
       configEditEnabled: true,
@@ -909,10 +914,39 @@ describe("hostd config_propose_edit — apply-time drift guard (#3084)", () => {
       },
     });
     await server.start();
-    // GOOD_DIFF touches switchroom.version — validated against the ORIGINAL
-    // base. By apply time bob's grant has landed; the stale post-image would
-    // wipe it. The apply must ABORT instead.
+    // GOOD_DIFF prepends a comment at the top (lines 1-3 context). The operator's
+    // token rotation landed on line 4 during the window — a DIFFERENT region.
+    // Re-applying the stored diff against the drifted file succeeds, so the apply
+    // COMPLETES and BOTH survive. A naive whole-file post-image write would
+    // silently revert the rotation.
     const resp = await send({ unified_diff: GOOD_DIFF, request_id: "drift-a" });
+    expect(resp.result).toBe("completed");
+    expect(reconcileInvocations).toBe(1);
+    expect(finalizeCalls.length).toBe(1);
+    expect(finalizeCalls[0]!.outcome).toBe("applied");
+    // BOTH the intervening security-relevant rotation AND this proposal's own
+    // change land.
+    const live = readFile(configPath, "utf8");
+    expect(live).toContain("OPERATOR-ROTATED");
+    expect(live).toContain("# touched by apply-path test");
+  });
+
+  it("(b) a conflicting concurrent edit (same hunk lines) aborts with E_CONFIG_CHANGED", async () => {
+    const { gw, finalizeCalls } = driftingGateway(CONFLICTING_HAND_EDIT);
+    let reconcileInvocations = 0;
+    server = makeServer({
+      configEditEnabled: true,
+      configPath,
+      approvalGateway: gw,
+      runReconcile: async () => {
+        reconcileInvocations += 1;
+        return { exit_code: 0, stdout: "", stderr: "" };
+      },
+    });
+    await server.start();
+    // The hand-edit rewrote `version: 1` → `version: 2`, a line GOOD_DIFF's
+    // hunk context depends on. The stored diff no longer applies → ABORT.
+    const resp = await send({ unified_diff: GOOD_DIFF, request_id: "drift-b" });
     expect(resp.result).toBe("denied");
     expect(resp.error).toMatch(/^E_CONFIG_CHANGED/);
     expect(resp.error_envelope?.code).toBe("E_CONFIG_CHANGED");
@@ -921,34 +955,10 @@ describe("hostd config_propose_edit — apply-time drift guard (#3084)", () => {
     expect(finalizeCalls.length).toBe(1);
     expect(finalizeCalls[0]!.outcome).toBe("reconcile_failed_rolled_back");
     expect(finalizeCalls[0]!.detail).toMatch(/config changed since proposal/);
-    // The intervening security grant SURVIVES; the pending proposal's own
-    // change did NOT land.
+    // The operator's conflicting edit SURVIVES; the proposal's change did NOT
+    // land (the diff was never force-written over the drift).
     const live = readFile(configPath, "utf8");
-    expect(live).toContain("mcp__perplexity__search");
-    expect(live).not.toContain("# touched by apply-path test");
-  });
-
-  it("(b) an operator hand-edit during the window aborts rather than reverting it", async () => {
-    const { gw, finalizeCalls } = driftingGateway(OPERATOR_HAND_EDIT);
-    let reconcileInvocations = 0;
-    server = makeServer({
-      configEditEnabled: true,
-      configPath,
-      approvalGateway: gw,
-      runReconcile: async () => {
-        reconcileInvocations += 1;
-        return { exit_code: 0, stdout: "", stderr: "" };
-      },
-    });
-    await server.start();
-    const resp = await send({ unified_diff: GOOD_DIFF, request_id: "drift-b" });
-    expect(resp.result).toBe("denied");
-    expect(resp.error).toMatch(/^E_CONFIG_CHANGED/);
-    expect(reconcileInvocations).toBe(0);
-    expect(finalizeCalls[0]!.outcome).toBe("reconcile_failed_rolled_back");
-    // The operator's edit SURVIVES; the proposal's change did NOT land.
-    const live = readFile(configPath, "utf8");
-    expect(live).toContain("OPERATOR-ROTATED");
+    expect(live).toContain("version: 2");
     expect(live).not.toContain("# touched by apply-path test");
   });
 

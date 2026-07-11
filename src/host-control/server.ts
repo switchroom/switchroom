@@ -2480,28 +2480,22 @@ export class HostdServer {
     // pre-approval query below is async, so it MUST NOT sit between the dedupe
     // `get` above and this `set`, or two concurrent identicals could each post
     // a card.)
-    // #3084 security audit — pin the base the diff was validated against.
-    // config_propose_edit computes the whole-file post-image HERE, at
-    // propose-time, but the operator card can block up to 60 min before the
-    // apply runs. Any config change that lands during that window (a second
-    // approved proposal, an operator hand-edit) would be SILENTLY REVERTED if
-    // we wrote the stale post-image verbatim — including security fields like
-    // another agent's tools.allow or hostd.config_edit_enabled itself. Hash the
-    // live file NOW so the apply path (under the mutex) can detect drift and
-    // ABORT rather than clobber it.
-    let preImage: string;
-    try {
-      preImage = existsSync(configPath) ? readFileSync(configPath, "utf-8") : "";
-    } catch {
-      preImage = "";
-    }
-    const preImageSha = createHash("sha256").update(preImage).digest("hex");
+    // #3084 security audit — the propose-time whole-file post-image is NEVER
+    // written. config_propose_edit validates the diff HERE, at propose-time,
+    // but the operator card can block up to 60 min before the apply runs. Any
+    // config change that lands during that window (a second approved proposal,
+    // an operator hand-edit) would be SILENTLY REVERTED if we wrote the stale
+    // post-image verbatim — including security fields like another agent's
+    // tools.allow or hostd.config_edit_enabled itself. So the apply path
+    // (under the mutex) re-applies the STORED DIFF against the CURRENT live
+    // file: concurrent edits to OTHER regions survive (a unified diff only
+    // rewrites its own hunks), and only a REAL conflict — the drift overlaps
+    // this diff's hunks so the patch no longer applies — aborts.
     const run = this.runConfigProposeRateThenApply(
       req,
       caller,
       callerName,
       configPath,
-      preImageSha,
       started,
     );
     this.inflightConfigProposals.set(dedupeKey, run);
@@ -2525,7 +2519,6 @@ export class HostdServer {
     caller: SocketIdentity,
     callerName: string,
     configPath: string,
-    preImageSha: string,
     started: number,
   ): Promise<HostdResponse> {
     // ── Pre-approval bypass (#2975 Stage 2) ─────────────────────────
@@ -2629,7 +2622,6 @@ export class HostdServer {
       caller,
       callerName,
       configPath,
-      preImageSha,
       started,
     );
   }
@@ -2694,7 +2686,6 @@ export class HostdServer {
     caller: SocketIdentity,
     callerName: string,
     configPath: string,
-    preImageSha: string,
     started: number,
   ): Promise<HostdResponse> {
     const approvalId = (this.opts.generateApprovalId ?? defaultApprovalId)();
@@ -2780,33 +2771,32 @@ export class HostdServer {
           started,
         );
       }
-      // ── #3084 security audit — re-validate under the lock (TOCTOU) ──
-      // The post-image was computed at propose-time against the base as it
-      // was THEN. The operator card can block up to 60 min, during which
-      // another approved proposal or an operator hand-edit may have changed
-      // the live file. Writing the stale whole-file post-image verbatim would
-      // SILENTLY REVERT that change (including security fields like another
-      // agent's tools.allow or hostd.config_edit_enabled). So, under the lock:
-      //   (1) pin the base by hash — abort if the live file drifted at all;
-      //   (2) re-apply the STORED diff to the CURRENT file and write THAT,
-      //       aborting if the diff no longer applies cleanly.
+      // ── #3084 security audit — re-apply the STORED diff under the lock ──
+      // The propose-time whole-file post-image is NEVER written. The operator
+      // card can block up to 60 min, during which another approved proposal or
+      // an operator hand-edit may have changed the live file. Writing the stale
+      // whole-file post-image verbatim would SILENTLY REVERT that change
+      // (including security fields like another agent's tools.allow or
+      // hostd.config_edit_enabled). Instead, under the lock, re-run the
+      // validator — which applies the STORED diff against the CURRENT live file
+      // at `configPath` — and write THAT.
+      //
+      // A unified diff only rewrites its own hunks, so a concurrent change to
+      // some OTHER region of the file still applies cleanly and its edit
+      // survives (legitimate non-conflicting concurrent edits complete). We
+      // ABORT with E_CONFIG_CHANGED ONLY when the diff no longer applies
+      // cleanly — a REAL conflict where the drift overlaps this diff's hunks.
       // The config is left untouched on abort (no bytes written yet) — the
       // agent must re-propose against the new base.
-      const liveSha = createHash("sha256").update(snapshot).digest("hex");
-      const reverdict =
-        liveSha === preImageSha
-          ? validateConfigEdit({
-              configPath,
-              targetPath: req.args.target_path,
-              unifiedDiff: req.args.unified_diff,
-            })
-          : null;
-      if (liveSha !== preImageSha || reverdict === null || !reverdict.ok) {
+      const reverdict = validateConfigEdit({
+        configPath,
+        targetPath: req.args.target_path,
+        unifiedDiff: req.args.unified_diff,
+      });
+      if (!reverdict.ok) {
         const why =
-          liveSha !== preImageSha
-            ? "live config changed since the proposal was validated"
-            : `stored diff no longer applies against the current config` +
-              (reverdict && !reverdict.ok ? `: ${reverdict.detail}` : "");
+          `stored diff no longer applies against the current config` +
+          `: ${reverdict.detail}`;
         await approval.finalize({
           outcome: "reconcile_failed_rolled_back",
           detail: `config changed since proposal — re-propose (${why})`,

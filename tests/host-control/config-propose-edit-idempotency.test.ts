@@ -58,14 +58,22 @@ const DIFF_A =
   " telegram:\n";
 
 // A DIFFERENT clean diff (distinct content hash → must NOT dedupe with A).
+// It edits a DIFFERENT region (forum_chat_id, lines 3-6) than DIFF_A (the
+// version line, lines 1-3), so the two are genuinely NON-CONFLICTING: whichever
+// applies first, the other's stored diff STILL applies cleanly against the
+// drifted file (#3084 — the apply path re-applies the stored diff under the
+// lock, so non-conflicting concurrent edits both survive). If DIFF_B instead
+// rewrote the SAME line as DIFF_A, the second apply would correctly abort with
+// E_CONFIG_CHANGED — that conflict path is covered in config-propose-edit.test.ts.
 const DIFF_B =
   "--- a/switchroom.yaml\n" +
   "+++ b/switchroom.yaml\n" +
-  "@@ -1,3 +1,3 @@\n" +
-  " switchroom:\n" +
-  "-  version: 1\n" +
-  "+  version: 1  # touched-b\n" +
-  " telegram:\n";
+  "@@ -3,4 +3,4 @@\n" +
+  " telegram:\n" +
+  '   bot_token: "x"\n' +
+  '-  forum_chat_id: "1"\n' +
+  '+  forum_chat_id: "1"  # touched-b\n' +
+  " agents: {}\n";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -175,6 +183,12 @@ describe("config_propose_edit — idempotency (dedupe in-flight)", () => {
     expect(requests.length).toBe(2); // two separate cards
     expect(r1.result).toBe("completed");
     expect(r2.result).toBe("completed");
+    // #3084 — the two edits touch DIFFERENT regions, so re-applying each stored
+    // diff under the lock preserves the other. BOTH survive; a naive whole-file
+    // post-image write would keep only the last writer's version.
+    const live = readFileSync(configPath, "utf-8");
+    expect(live).toContain("# touched-a");
+    expect(live).toContain("# touched-b");
   });
 
   it("releases the dedupe key after resolution — a later identical proposal gets a fresh card", async () => {
