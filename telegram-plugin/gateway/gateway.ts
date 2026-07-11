@@ -478,7 +478,7 @@ import { resolveOutboundTopic as resolveOutboundTopicHelper, topicForRecipient, 
 import { readTurnUsages } from '../../src/agents/perf.js'
 import { buildContextOccupancy, writeContextOccupancySnapshot } from './context-occupancy.js'
 import { decideProactiveCompact, initialCompactState, type CompactState } from './proactive-compact.js'
-import { decideIdleClear, idleDurationToMs, DEFAULT_IDLE_CLEAR_MS } from './idle-clear.js'
+import { decideIdleClear, classifyIdleEvent, idleDurationToMs, DEFAULT_IDLE_CLEAR_MS } from './idle-clear.js'
 import { nextCompactNotify, idleCompactNotifyState, type CompactNotifyState } from './compact-notify.js'
 import {
   tryHostdDispatch,
@@ -4856,10 +4856,18 @@ function maybeProactiveCompact(): void {
 // ─── Idle auto-clear ──────────────────────────────────────────────────────
 // Wall-clock idle → /clear (idle-clear.ts). Independent of proactive-compact
 // (occupancy-driven at the turn-end gate): a fully-idle agent never ends a
-// turn, so this runs on its own interval. Any activity (inbound / turn start /
-// cron fire) resets the timer via markIdleActivity(); fires once per idle
-// period; never mid-turn (turnInFlightForGate, the same gate compaction uses).
+// turn, so this runs on its own interval. "Idle" means NOTHING HAS HAPPENED
+// since the last thing happened — inbound, cron fire, or ANY claude session
+// event (turn start, tool call, tool result, text, sub-agent event, turn end)
+// resets the timer via markIdleActivity(); a turn ending additionally stamps
+// markIdleTurnEnd(). Fires once per idle period; never mid-turn
+// (turnInFlightForGate, the same gate compaction uses).
+//
+// It is emphatically NOT "no turn has *started* recently" — that reading wiped
+// overlord's 3h of working context on 2026-07-11 for the crime of being busy.
+// See the idle-clear.ts header.
 let lastIdleActivityAt = Date.now();
+let lastIdleTurnEndAt: number | null = null;
 let idleAutoCleared = false;
 let idleClearDispatching = false;
 
@@ -4867,6 +4875,15 @@ let idleClearDispatching = false;
 function markIdleActivity(): void {
   lastIdleActivityAt = Date.now();
   idleAutoCleared = false;
+}
+
+/**
+ * Stamp "a turn just ended". The idle window is measured from
+ * max(lastActivityAt, lastTurnEndedAt), so a turn that ran LONGER than the
+ * window can't be cleared on the first tick after `turnInFlight` goes false.
+ */
+function markIdleTurnEnd(): void {
+  lastIdleTurnEndAt = Date.now();
 }
 
 /** Idle window in ms: env override → per-agent config → 3h default. 0 disables. */
@@ -4900,6 +4917,7 @@ function maybeIdleClear(): void {
   const decision = decideIdleClear(
     {
       lastActivityAt: lastIdleActivityAt,
+      lastTurnEndedAt: lastIdleTurnEndAt,
       idleClearMs,
       alreadyCleared: idleAutoCleared,
       turnInFlight: turnInFlightForGate(),
@@ -15526,6 +15544,21 @@ function handleSessionEvent(ev: SessionEvent): void {
       liveTurn.liveness.onStreamEvent(ev.kind, durationMs, Date.now())
     }
   }
+  // Idle-clear clocks (#3084 follow-up). EVERY genuine session event is
+  // activity — an agent that is thinking, calling a tool, streaming text or
+  // driving a sub-agent is NOT idle, whether or not the gateway currently has a
+  // turn open. Stamping only at turn START (the old behaviour) is what let a
+  // 3-hour working stretch be scored as zero activity and `/clear`ed the moment
+  // the window elapsed. A turn ending stamps the turn-end clock too, so a turn
+  // that outran the window is not wiped the instant `turnInFlight` goes false.
+  // This runs for the whole event stream, including every `sub_agent_*` kind —
+  // background workers keep the timer warm exactly as long as they are working.
+  {
+    const durationMs = ev.kind === 'turn_end' ? ev.durationMs : undefined
+    const signal = classifyIdleEvent(ev.kind, durationMs)
+    if (signal.activity) markIdleActivity()
+    if (signal.turnEnded) markIdleTurnEnd()
+  }
   switch (ev.kind) {
     case 'enqueue': {
       // Drain any orphaned typing-wrap entries left over from a crashed
@@ -15664,7 +15697,9 @@ function handleSessionEvent(ev: SessionEvent): void {
         // per-topic `byKey[statusKey]` entry AND the most-recent mirror. The key is
         // the SAME statusKey the ctor's façade was constructed with just above.
         setCurrentTurn(next, statusKey(ev.chatId, enqThreadIdNum))
-        markIdleActivity() // any turn start (main session) is activity — re-arm idle clear
+        // (turn start already stamped the idle clock at the top of
+        // handleSessionEvent, along with every other session event — see the
+        // idle-clear block there.)
         // Early-open the "Working…" liveness card at turn start so narration /
         // thinking emitted BEFORE the first tool surfaces within ~a second
         // instead of after the old 12 s threshold (the dead-air gap). Fires the
