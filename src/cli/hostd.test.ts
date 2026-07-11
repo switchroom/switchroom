@@ -12,6 +12,7 @@ import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  DOCKER_SOCKET_PROXY_IMAGE,
   renderHostdComposeFile,
   resolveHostdHostHome,
   resolveHostdImageTag,
@@ -56,8 +57,6 @@ describe("renderHostdComposeFile", () => {
     expect(out).not.toContain(
       "/home/alice/.switchroom/switchroom.yaml:/state/config/switchroom.yaml:ro",
     );
-    // docker.sock is a fixed host path; bind-mount is host-home-agnostic.
-    expect(out).toContain("/var/run/docker.sock:/var/run/docker.sock:rw");
     // machine-id must be mounted so resolveOperatorVaultPassphrase can
     // decrypt the auto-unlock blob and provision LiteLLM keys during rollout.
     expect(out).toContain("/etc/machine-id:/etc/machine-id:ro");
@@ -181,6 +180,117 @@ describe("renderHostdComposeFile", () => {
   it("declares its own network so the hostd project doesn't accidentally join the agent fleet's net", () => {
     const out = renderHostdComposeFile({ hostHome: "/h", imageTag: "latest" });
     expect(out).toContain("name: switchroom-hostd-net");
+  });
+});
+
+describe("renderHostdComposeFile — docker-socket-proxy sidecar (#1842 / #1400 T4)", () => {
+  const render = () =>
+    renderHostdComposeFile({ hostHome: "/home/alice", imageTag: "latest" });
+
+  it("emits a docker-socket-proxy service pinned by digest", () => {
+    const out = render();
+    expect(out).toContain("docker-socket-proxy:");
+    expect(out).toContain(`image: ${DOCKER_SOCKET_PROXY_IMAGE}`);
+    // Pinned by BOTH tag and digest — a moved tag must not swap the binary
+    // guarding the host socket.
+    expect(DOCKER_SOCKET_PROXY_IMAGE).toMatch(
+      /^ghcr\.io\/tecnativa\/docker-socket-proxy:v\d+\.\d+\.\d+@sha256:[0-9a-f]{64}$/,
+    );
+    expect(out).toContain("container_name: switchroom-hostd-docker-proxy");
+  });
+
+  it("gives the RAW socket to the proxy only, mounted :ro", () => {
+    const out = render();
+    // Exactly one raw-socket bind, and it lives on the proxy as :ro.
+    expect(out).toContain("/var/run/docker.sock:/var/run/docker.sock:ro");
+    // Count actual volume-list entries (a YAML "- /var/run/docker.sock:…"
+    // line), not prose mentions in comments.
+    expect(
+      out
+        .split("\n")
+        .filter((l) => /^\s*- \/var\/run\/docker\.sock:/.test(l)).length,
+    ).toBe(1);
+  });
+
+  it("does NOT mount the raw docker socket into hostd (rw or ro)", () => {
+    const out = render();
+    // The whole point of #1842: hostd never touches the raw socket.
+    expect(out).not.toContain("/var/run/docker.sock:/var/run/docker.sock:rw");
+    // And the single :ro mount belongs to the proxy service, above the hostd
+    // service block — assert ordering so it can't drift onto hostd.
+    const proxyIdx = out.indexOf("container_name: switchroom-hostd-docker-proxy");
+    const hostdIdx = out.indexOf("container_name: switchroom-hostd\n");
+    const sockIdx = out.indexOf("/var/run/docker.sock:/var/run/docker.sock:ro");
+    expect(proxyIdx).toBeGreaterThanOrEqual(0);
+    expect(hostdIdx).toBeGreaterThan(proxyIdx);
+    expect(sockIdx).toBeGreaterThan(proxyIdx);
+    expect(sockIdx).toBeLessThan(hostdIdx);
+  });
+
+  it("points hostd at the proxy over TCP via DOCKER_HOST", () => {
+    const out = render();
+    expect(out).toContain("DOCKER_HOST: tcp://docker-socket-proxy:2375");
+  });
+
+  it("makes hostd depend on the proxy so it's up first", () => {
+    const out = render();
+    expect(out).toMatch(/depends_on:[\s\S]*?- docker-socket-proxy/);
+  });
+
+  it("hardens the proxy: read-only rootfs, cap_drop ALL, no-new-privileges", () => {
+    const out = render();
+    // Scope assertions to the proxy service block (everything before hostd).
+    const proxyBlock = out.slice(
+      out.indexOf("docker-socket-proxy:"),
+      out.indexOf("  hostd:"),
+    );
+    expect(proxyBlock).toContain("read_only: true");
+    expect(proxyBlock).toMatch(/cap_drop:\s*\n\s+- ALL/);
+    expect(proxyBlock).toContain("no-new-privileges:true");
+    expect(proxyBlock).toContain("tmpfs:");
+  });
+
+  it("sets the endpoint allowlist to EXACTLY the flags hostd's call set needs", () => {
+    const out = render();
+    const proxyBlock = out.slice(
+      out.indexOf("docker-socket-proxy:"),
+      out.indexOf("  hostd:"),
+    );
+    // The exact allowlist determined by auditing hostd's docker call set
+    // (see PR #1842 justification table). Assert each flag AND its value.
+    const expected: Record<string, string> = {
+      CONTAINERS: "1", // docker ps/inspect/logs/stats, compose create, self-bump run
+      IMAGES: "1", // image inspect, RepoDigest resolve, compose pull
+      NETWORKS: "1", // compose up project network
+      VOLUMES: "1", // compose up per-agent named socket volumes
+      EXEC: "1", // agent_exec + liveness battery
+      INFO: "1", // compose/docker /info preflight
+      VERSION: "1", // docker compose version preflight
+      POST: "1", // master write gate (create/pull/exec-start/wait/rm/run)
+      ALLOW_START: "1", // agent start
+      ALLOW_STOP: "1", // agent stop
+      ALLOW_RESTARTS: "1", // agent restart
+      BUILD: "0", // dev-only path; kept DENIED to keep surface minimal
+    };
+    for (const [flag, val] of Object.entries(expected)) {
+      expect(proxyBlock).toMatch(
+        new RegExp(`^\\s+${flag}: "${val}"$`, "m"),
+      );
+    }
+    // Negative space: swarm/secret/system endpoints hostd never calls must
+    // NOT be enabled.
+    for (const denied of [
+      "SWARM",
+      "SERVICES",
+      "SECRETS",
+      "CONFIGS",
+      "NODES",
+      "TASKS",
+      "PLUGINS",
+      "SYSTEM",
+    ]) {
+      expect(proxyBlock).not.toContain(`${denied}: "1"`);
+    }
   });
 });
 

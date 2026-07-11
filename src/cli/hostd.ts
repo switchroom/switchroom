@@ -124,6 +124,16 @@ export function captureHostTimezone(
 const HOSTD_COMPOSE_PROJECT = "switchroom-hostd";
 
 /**
+ * Pinned image for the docker-socket-proxy sidecar (#1842 / #1400 T4).
+ * tecnativa/docker-socket-proxy is a minimal HAProxy that fronts the raw
+ * docker socket with a per-endpoint allowlist. Pinned by tag AND digest so
+ * the generated compose is supply-chain-deterministic (a moved tag can't
+ * silently swap the proxy binary that guards the host socket).
+ */
+export const DOCKER_SOCKET_PROXY_IMAGE =
+  "ghcr.io/tecnativa/docker-socket-proxy:v0.4.2@sha256:1f3a6f303320723d199d2316a3e82b2e2685d86c275d5e3deeaf182573b47476";
+
+/**
  * Render the sibling compose file. Pure-string template — the only
  * variable is the host home directory (for the bind mounts that map
  * `~/.switchroom` and `/var/run/docker.sock` into the daemon).
@@ -185,11 +195,87 @@ export function renderHostdComposeFile(opts: {
 # cannot recreate this daemon mid-RPC. See RFC C §5.1.
 
 services:
+  # docker-socket-proxy (#1842 / #1400 T4) — the ONLY container that touches
+  # the raw docker socket. A minimal HAProxy (tecnativa/docker-socket-proxy)
+  # that exposes the docker API over TCP :2375 with a per-endpoint allowlist,
+  # so hostd (and the switchroom CLI it spawns) can drive the fleet without a
+  # host-takeover-grade socket in an attacker-influenceable container. The
+  # image is pinned by digest for supply-chain determinism.
+  docker-socket-proxy:
+    image: ${DOCKER_SOCKET_PROXY_IMAGE}
+    container_name: switchroom-hostd-docker-proxy
+    restart: always
+    read_only: true
+    tmpfs:
+      # HAProxy writes its runtime state/pidfile under /run; read_only rootfs
+      # otherwise makes it crash-loop on boot.
+      - /run
+    cap_drop:
+      - ALL
+    cap_add:
+      # HAProxy master drops privileges to the haproxy user at startup.
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      # ── Endpoint allowlist — the MINIMUM that covers hostd's real call set.
+      #    Each flag is justified by an actual hostd/CLI call site (see #1842
+      #    PR body). Unset sections default to 0 (denied) in the proxy.
+      #
+      # GET /containers/* — agent_status (docker inspect/stats/ps),
+      # agent_logs (docker logs), self-bump helper create, compose
+      # container lifecycle. server.ts runDocker + getAllAgentStatuses.
+      CONTAINERS: "1"
+      # GET /images/* + POST /images/create — \`docker image inspect\`,
+      # RepoDigest resolution (server.ts:309), \`docker compose pull\`.
+      IMAGES: "1"
+      # /networks/* — \`docker compose up\` creates/inspects the fleet's
+      # project network (compose.ts networks: block).
+      NETWORKS: "1"
+      # /volumes/* — \`docker compose up\` creates/inspects the per-agent
+      # named socket volumes (compose.ts volumes: block, broker-*-sock …).
+      VOLUMES: "1"
+      # /exec/* — agent_exec + the read-only in-agent liveness battery
+      # (server.ts dockerExec, protocol.ts:252/331).
+      EXEC: "1"
+      # /info + /version — compose/docker preflight (\`docker compose version\`,
+      # daemon /info probed by compose up).
+      INFO: "1"
+      VERSION: "1"
+      # POST master gate — enables the mutating calls in the allowed sections:
+      # compose container create, \`docker compose pull\` (POST /images/create),
+      # \`docker exec\` start, \`docker wait\`, \`docker rm\`, self-bump
+      # \`docker run -d\`. Without it every write returns 403.
+      POST: "1"
+      # Fine-grained container lifecycle — \`agent start/stop/restart\`
+      # (server.ts handleAgentStart/Stop/Restart, \`docker compose
+      # start/stop/restart <service>\`).
+      ALLOW_START: "1"
+      ALLOW_STOP: "1"
+      ALLOW_RESTARTS: "1"
+      # BUILD stays DENIED — production rollout uses prebuilt GHCR images;
+      # \`docker compose up --build\` is a dev-only path (apply --build) that
+      # never runs inside hostd. Left off to keep the surface minimal.
+      BUILD: "0"
+    volumes:
+      # The one raw-socket mount in the whole hostd project. :ro is the
+      # tecnativa-recommended mount — the proxy still issues writes over the
+      # socket fd; :ro only prevents replacing the socket file itself.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - default
   hostd:
     image: ghcr.io/switchroom/switchroom-hostd:${imageTag}
     container_name: switchroom-hostd
     restart: always
     user: "0:0"
+    depends_on:
+      # hostd's very first action may be a docker call; make sure the proxy
+      # is up first. (No healthcheck condition — the proxy has no default
+      # healthcheck and restart:always covers transient restarts.)
+      - docker-socket-proxy
     # tini handles SIGTERM forwarding; node's main.ts shutdown handler
     # closes UDS listeners and exits cleanly. 15s grace matches the
     # in-process \`TimeoutStopSec\` and is enough for in-flight async
@@ -228,10 +314,34 @@ services:
       # Agents themselves still mount it ro; only hostd, the tap-gated writer,
       # gets rw. The in-place writer preserves the file's owner/mode.
       - ${hostHome}/.switchroom/switchroom.yaml:/state/config/switchroom.yaml:rw${skillsMount}
-      # docker.sock is the whole reason hostd exists — agents shouldn't
-      # have it, but hostd (auditing every shell-out via run-hook.sh's
-      # pattern) is the controlled chokepoint.
-      - /var/run/docker.sock:/var/run/docker.sock:rw
+      # NOTE: hostd NO LONGER mounts the raw /var/run/docker.sock (#1842 /
+      # #1400 T4). A full-access docker socket in the hostd container is a
+      # host-takeover primitive if hostd is ever compromised (it runs
+      # attacker-influenceable agent shell-outs). Instead the docker API is
+      # reached through the \`docker-socket-proxy\` sidecar below over TCP
+      # (DOCKER_HOST, set in the environment block), which allowlists only
+      # the endpoints hostd actually calls. hostd's own \`docker …\` shellouts
+      # AND the \`switchroom\` CLI subprocesses it spawns (\`agent restart\`,
+      # \`apply\`, rollout → \`docker compose up -d\`) inherit DOCKER_HOST via
+      # runSwitchroom's \`env: {...process.env}\`, so they all route through
+      # the proxy. The self-bump helper (self-bump.ts) is unaffected: hostd
+      # issues \`docker run -d -v /var/run/docker.sock:…\` through the proxy
+      # (a container-create call), and dockerd resolves that host bind source
+      # on the HOST — the helper still gets the real socket to \`compose up\`
+      # the recreated hostd. hostd itself never mounts the raw socket.
+      #
+      # HONEST LIMIT — blast-surface reduction, NOT a hard boundary. With
+      # CONTAINERS+POST allowed (required for compose up / self-bump), a
+      # FULLY compromised hostd can still create a container that
+      # bind-mounts /var/run/docker.sock (or /) — the same mechanism
+      # self-bump uses legitimately — and take over the host in ONE create
+      # call. What the proxy removes is the STANDING socket and the
+      # accidental / low-effort surface (no GET-me-everything socket lying
+      # in the container; every call is an allowlisted HTTP endpoint).
+      # The real boundary against a determined attacker is the operator
+      # approval-card layer (#1427); closing the residual hole would mean
+      # dropping container-create — i.e. dropping self-bump and
+      # compose-driven rollout — which is out of scope here.
       # /etc/machine-id passthrough — the vault auto-unlock blob
       # (~/.switchroom/vault-auto-unlock) is encrypted with a key derived
       # from the host machine-id. Without this mount, readAutoUnlockFile
@@ -241,6 +351,13 @@ services:
       # Same mount the vault-broker compose carries (compose.ts:1364).
       - /etc/machine-id:/etc/machine-id:ro
     environment:
+      # Route ALL docker access through the docker-socket-proxy sidecar
+      # (#1842). hostd's own \`docker …\` shellouts read this, and every
+      # \`switchroom\` CLI subprocess hostd spawns inherits it via
+      # runSwitchroom's \`env: {...process.env}\` — so \`agent restart\`,
+      # \`apply\` and rollout's \`docker compose up -d\` all talk to the proxy
+      # instead of a raw socket. Service DNS name on the hostd project net.
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
       # Hostd resolves homedir() to set the per-agent socket dir; pin
       # it inside the container to /host-home (which bind-mounts to the
       # operator's home), so the socket paths the agent fleet sees
