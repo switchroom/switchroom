@@ -291,6 +291,23 @@ if (skillHookEscape.changed) {
   console.log(`[build] ASCII-escaped ${skillHookEscape.nonAsciiCount} non-ASCII code units in dist/cli/skill-validate-pretool.mjs`);
 }
 
+// Bundle the hindsight-mental-model-pretool hook — #2974. Same pattern:
+// a self-contained .mjs the agent container runs via node from the
+// bundled-hooks path. It has no src/ imports (a pure tool_name gate), but
+// we bundle it for consistency with the other pretool hooks and so it
+// ships to /opt/switchroom/hooks/ via Dockerfile.agent.
+console.log("[build] bundling src/cli/hindsight-mental-model-pretool.ts -> dist/cli/hindsight-mental-model-pretool.mjs");
+execSync(
+  `bun build ${JSON.stringify(resolve(root, "src/cli/hindsight-mental-model-pretool.ts"))} --outfile ${JSON.stringify(resolve(outDir, "hindsight-mental-model-pretool.mjs"))} --target node`,
+  { stdio: "inherit", cwd: root }
+);
+const mmHookOutFile = resolve(outDir, "hindsight-mental-model-pretool.mjs");
+chmodSync(mmHookOutFile, 0o755);
+const mmHookEscape = escapeBundleNonAscii(mmHookOutFile);
+if (mmHookEscape.changed) {
+  console.log(`[build] ASCII-escaped ${mmHookEscape.nonAsciiCount} non-ASCII code units in dist/cli/hindsight-mental-model-pretool.mjs`);
+}
+
 // Bundle the self-improve-stop hook — RFC reference/rfcs/agent-self-improvement.md
 // slice 1. Turn-end GATE: a self-contained .mjs the agent container runs
 // via node from the bundled-hooks path. It imports the src/self-improve/*

@@ -5122,6 +5122,33 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
           ],
         },
         {
+          // #2974 — redirect direct hindsight mental-model WRITE calls to
+          // the sanctioned mcp__switchroom-telegram__mental_model_propose
+          // path. The four write tools (HINDSIGHT_MENTAL_MODEL_WRITE_TOOLS)
+          // are un-preapproved by design (#2911), so a direct call would
+          // otherwise fall through to a TUI permission prompt that wedges
+          // the turn. This hook DENIES them instantly with an instructive
+          // message so the agent self-corrects in the same turn; every
+          // read tool (get_mental_model, list_mental_models, recall, …)
+          // passes through. Matcher scoped to `^mcp__hindsight__` so the
+          // hook only spends a stdin parse on hindsight tools.
+          //
+          // DOCKER_BUNDLED_HOOKS_PATH (not DOCKER_HOOKS_PATH): bundled via
+          // scripts/build.mjs from src/cli/hindsight-mental-model-pretool.ts,
+          // mirroring skill-validate-pretool.
+          matcher: "^mcp__hindsight__",
+          hooks: [
+            {
+              type: "command",
+              command: wrap(
+                "hook:hindsight-mental-model-pretool",
+                `node "${join(DOCKER_BUNDLED_HOOKS_PATH, "hindsight-mental-model-pretool.mjs")}"`,
+              ),
+              timeout: 10,
+            },
+          ],
+        },
+        {
           // Agent self-improvement APPLY-GUARD — RFC
           // reference/rfcs/agent-self-improvement.md slice 2. The
           // DETERMINISTIC T1 gate: when a self-improve review is pending
