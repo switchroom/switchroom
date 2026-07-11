@@ -1818,6 +1818,20 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   // `mirror_dir`. Canonical (unprefixed) name so the cross-project
   // consumer container can mount the same volume by name. Absent when
   // no consumer sets `mirror_dir`, keeping legacy output byte-identical.
+  //
+  // Creation-order note (verified live, docker compose v5.1.3, 2026-07-11):
+  // if `startHindsight()`'s docker-run path executes BEFORE the next
+  // `apply` of this project, `docker run -v consumer-creds-<name>:…`
+  // auto-creates the volume WITHOUT compose labels. `docker compose up`
+  // on this project then emits a warning ("already exists but was not
+  // created by Docker Compose. Use `external: true`…") but SUCCEEDS with
+  // exit 0 and REUSES the existing volume unchanged (labels/CreatedAt
+  // untouched) — an explicit `name:` adopts a same-named pre-existing
+  // volume rather than erroring. So ordering between `memory setup` and
+  // `apply` is safe in both directions; do not re-litigate. (The
+  // hindsight compose SNIPPET is stricter — it declares the volume
+  // `external: true`, so that path does require this project, or a
+  // prior docker run, to have created the volume first.)
   for (const c of authConsumers) {
     if (c.mirror_dir) {
       lines.push(`  consumer-creds-${c.name}:`);

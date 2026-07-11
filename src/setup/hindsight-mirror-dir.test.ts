@@ -128,4 +128,36 @@ describe("generateHindsightComposeSnippet — mirror mode (#2578)", () => {
     // Volume declared external (owned by the broker's compose project).
     expect(snippet).toMatch(new RegExp(`${HINDSIGHT_CREDS_MIRROR_VOLUME}:\\n {4}external: true`));
   });
+
+  it("both branches emit structurally valid YAML (parse + shape asserts)", async () => {
+    const { parse } = await import("yaml");
+
+    // Mirror OFF — tmpfs list present under the hindsight service.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const off = parse(generateHindsightComposeSnippet()) as Record<string, any>;
+    const offSvc = off.services["switchroom-hindsight"];
+    expect(offSvc).toBeDefined();
+    expect(Array.isArray(offSvc.tmpfs)).toBe(true);
+    expect(offSvc.tmpfs[0]).toContain(HINDSIGHT_CRED_DIR);
+    expect(off.services["switchroom-hindsight-creds-init"]).toBeUndefined();
+    expect(off.volumes[HINDSIGHT_CREDS_MIRROR_VOLUME]).toBeUndefined();
+
+    // Mirror ON — no tmpfs key; shared volume mounted; init service + dep
+    // + external volume all parse into the expected structure.
+    const on = parse(
+      generateHindsightComposeSnippet(undefined, "/run/consumer-creds/hindsight"),
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ) as Record<string, any>;
+    const onSvc = on.services["switchroom-hindsight"];
+    expect(onSvc.tmpfs).toBeUndefined();
+    expect(onSvc.volumes).toContain(`${HINDSIGHT_CREDS_MIRROR_VOLUME}:${HINDSIGHT_CRED_DIR}`);
+    expect(onSvc.depends_on["switchroom-hindsight-creds-init"]).toEqual({
+      condition: "service_completed_successfully",
+    });
+    const init = on.services["switchroom-hindsight-creds-init"];
+    expect(init).toBeDefined();
+    expect(init.user).toBe("0");
+    expect(init.volumes).toContain(`${HINDSIGHT_CREDS_MIRROR_VOLUME}:${HINDSIGHT_CRED_DIR}`);
+    expect(on.volumes[HINDSIGHT_CREDS_MIRROR_VOLUME]).toMatchObject({ external: true });
+  });
 });
