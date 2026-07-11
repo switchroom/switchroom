@@ -12,7 +12,8 @@
 
 import type { Command } from "commander";
 import chalk from "chalk";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { writeConfigFileSync } from "../util/atomic.js";
 import { join } from "node:path";
 import {
   matchesRule,
@@ -507,13 +508,22 @@ async function applyYamlRemove(
   }
 }
 
-function emitDiffOrWrite(path: string, before: string, after: string, dryRun: boolean): void {
+export function emitDiffOrWrite(path: string, before: string, after: string, dryRun: boolean): void {
   if (dryRun) {
     console.log(chalk.bold(`[dry-run] would edit ${path}`));
     console.log(makeUnifiedDiff(before, after));
     return;
   }
-  writeFileSync(path, after, "utf-8");
+  // Atomic (tmp + fsync + rename, bind-mount-aware) so a crash / ENOSPC
+  // mid-write can never truncate the fleet's switchroom.yaml (2026-07 review,
+  // #3149 follow-up). Preserve the file's existing mode.
+  let mode = 0o644;
+  try {
+    mode = statSync(path).mode & 0o777;
+  } catch {
+    /* default 0o644 */
+  }
+  writeConfigFileSync(path, after, mode);
 }
 
 function makeUnifiedDiff(before: string, after: string): string {

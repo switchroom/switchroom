@@ -21,10 +21,11 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
+import { writeConfigFileSync } from "../util/atomic.js";
 
 import { findConfigFile, loadConfig, resolvePath } from "../config/loader.js";
 import { statusViaBroker, resolveBrokerSocketPath } from "../vault/broker/client.js";
@@ -89,7 +90,18 @@ export function setVaultBrokerAutoUnlock(configPath: string, value: boolean): vo
   const raw = readFileSync(configPath, "utf-8");
   const doc = YAML.parseDocument(raw);
   doc.setIn(["vault", "broker", "autoUnlock"], value);
-  writeFileSync(configPath, doc.toString(), "utf-8");
+  // Atomic tmp+fsync+rename so a crash/ENOSPC mid-write can never truncate
+  // switchroom.yaml (which would take the whole fleet's config with it).
+  // writeConfigFileSync is the bind-mount-aware variant: a single-file bind
+  // mount of switchroom.yaml rejects rename(2) with EBUSY, in which case it
+  // falls back to an in-place fsync'd rewrite. Preserve the file's mode.
+  let mode = 0o644;
+  try {
+    mode = statSync(configPath).mode & 0o777;
+  } catch {
+    /* default 0o644 */
+  }
+  writeConfigFileSync(configPath, doc.toString(), mode);
 }
 
 export interface ApplyOptions {

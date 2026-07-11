@@ -22,6 +22,7 @@ import { createHash } from "node:crypto";
 import chalk from "chalk";
 import type { AgentConfig, QuotaConfig, SwitchroomConfig, TelegramConfig } from "../config/schema.js";
 import { CRON_SCRIPT_BASENAME_RE, LEGACY_CRON_SCRIPT_BASENAME_RE } from "./cron-unit-name.js";
+import { atomicWriteFileSync } from "../util/atomic.js";
 
 // Repo root for referencing bin/ scripts in hooks
 const REPO_ROOT = resolve(import.meta.dirname, "../..");
@@ -6537,7 +6538,12 @@ export function reconcileAgent(
 
     const after = JSON.stringify(mergedSettings, null, 2) + "\n";
     if (after !== before) {
-      writeFileSync(settingsPath, after, { encoding: "utf-8", mode: 0o600 });
+      // Atomic (tmp + fsync + rename) so a crash / ENOSPC mid-write can
+      // never leave a torn / truncated settings.json that Claude Code
+      // then fails to parse — same guarantee as the M5 fix. Mode 0600
+      // preserved (settings.json is not secret-bearing but the prior
+      // write pinned it; keep it identical).
+      atomicWriteFileSync(settingsPath, after, 0o600);
       changes.push(settingsPath);
     }
   }
@@ -6747,7 +6753,11 @@ export function reconcileAgent(
       ? readFileSync(mcpJsonPath, "utf-8")
       : "";
     if (after !== before) {
-      writeFileSync(mcpJsonPath, after, { encoding: "utf-8", mode: 0o600 });
+      // Atomic (tmp + fsync + rename) so a crash / ENOSPC mid-write can
+      // never leave a torn / truncated .mcp.json that Claude Code then
+      // fails to parse — same guarantee as the M5 fix. Mode 0600
+      // preserved from the prior write.
+      atomicWriteFileSync(mcpJsonPath, after, 0o600);
       changes.push(mcpJsonPath);
     }
     // Cheap-cron Tier-1 (#2307): keep the cron .mcp.json (full set + cron-only
@@ -6993,8 +7003,10 @@ export function reconcileAgent(
 /**
  * Write a file only if it doesn't already exist.
  * Tracks what was created vs skipped for reporting.
+ *
+ * Exported for tests (M1 atomicity — see scaffold-write-atomic.test.ts).
  */
-function writeIfMissing(
+export function writeIfMissing(
   filePath: string,
   contentFn: () => string,
   created: string[],
@@ -7005,7 +7017,14 @@ function writeIfMissing(
     skipped.push(filePath);
     return;
   }
-  writeFileSync(filePath, contentFn(), mode !== undefined ? { encoding: "utf-8", mode } : "utf-8");
+  // Atomic tmp+fsync+rename: an interrupted scaffold (crash / ENOSPC / SIGKILL
+  // mid-write) must never leave a torn or truncated file behind. This matters
+  // most for settings.json — a partial write here is read back and JSON.parse'd
+  // a few dozen lines later (the MCP-merge pass), so a half-written file would
+  // throw and abort the scaffold with a corrupt agent on disk. When `mode` is
+  // omitted we pass 0o666 to mirror plain writeFileSync's default (the process
+  // umask is applied by the O_CREAT open, so the on-disk mode is unchanged).
+  atomicWriteFileSync(filePath, contentFn(), mode ?? 0o666);
   created.push(filePath);
 }
 

@@ -21,13 +21,14 @@
 
 import type { Command } from "commander";
 import chalk from "chalk";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 
 import {
   getEnabledAgentsForMicrosoftAccount,
   listMicrosoftAccounts,
   removeMicrosoftAccountEntry,
 } from "./microsoft-accounts-yaml.js";
+import { writeConfigFileSync } from "../util/atomic.js";
 import { withConfigError, getConfig, getConfigPath } from "./helpers.js";
 import {
   planMicrosoftEnable,
@@ -42,6 +43,21 @@ import { selectMicrosoftScopes } from "../microsoft/scopes.js";
 import { buildMicrosoftCredentials as buildMicrosoftCredentialsCore } from "../microsoft/credentials.js";
 import type { MicrosoftCredentialsShape } from "../auth/broker/protocol.js";
 import type { SwitchroomConfig } from "../config/schema.js";
+
+/**
+ * Atomically persist a mutated switchroom.yaml (microsoft enable/disable/
+ * remove ACL edits). Crash/ENOSPC mid-write must never truncate the fleet
+ * config. Bind-mount aware (in-place fsync'd fallback on EBUSY); preserves mode.
+ */
+function writeMicrosoftYaml(configPath: string, text: string): void {
+  let mode = 0o644;
+  try {
+    mode = statSync(configPath).mode & 0o777;
+  } catch {
+    /* default 0o644 */
+  }
+  writeConfigFileSync(configPath, text, mode);
+}
 
 export function registerAuthMicrosoftSubcommands(
   program: Command,
@@ -91,7 +107,7 @@ function registerEnable(microsoftParent: Command, program: Command): void {
         // to write only the ACL. See microsoft-enable-plan.ts.
         const { text, newlyEnabled, enabledAfter, selectorSet, selectorConflict } =
           planMicrosoftEnable(before, normalizedAccount, agents);
-        if (text !== before) writeFileSync(yamlPath, text);
+        if (text !== before) writeMicrosoftYaml(yamlPath, text);
 
         console.log();
         if (newlyEnabled.length === 0) {
@@ -176,7 +192,7 @@ function registerDisable(microsoftParent: Command, program: Command): void {
         // selector (symmetry with enable). See microsoft-enable-plan.ts.
         const { text, removed, enabledAfter, selectorCleared } =
           planMicrosoftDisable(before, normalizedAccount, agents);
-        if (text !== before) writeFileSync(yamlPath, text);
+        if (text !== before) writeMicrosoftYaml(yamlPath, text);
 
         console.log();
         if (removed.length === 0) {
@@ -569,7 +585,7 @@ function registerAccountRemove(accountParent: Command): void {
       // Prune the dormant YAML entry now that the broker creds are gone.
       // Idempotent — if the entry was already absent, returns input verbatim.
       const after = removeMicrosoftAccountEntry(before, normalizedAccount);
-      if (after !== before) writeFileSync(yamlPath, after);
+      if (after !== before) writeMicrosoftYaml(yamlPath, after);
 
       console.log();
       console.log(

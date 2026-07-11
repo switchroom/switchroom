@@ -1,7 +1,7 @@
 import { Option, type Command } from "commander";
 import chalk from "chalk";
 import { join, resolve } from "node:path";
-import { rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { rmSync, existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { getSchedulerState, formatSchedulerState } from "../agents/scheduler-state.js";
 import YAML from "yaml";
@@ -48,6 +48,27 @@ import {
 import { createAgent, completeCreation } from "../agents/create-orchestrator.js";
 import { addAgent, type AgentTopology } from "../agents/add-orchestrator.js";
 import { bringUpAgentService } from "../agents/docker-fleet.js";
+import { writeConfigFileSync } from "../util/atomic.js";
+
+/**
+ * Atomically persist a mutated switchroom.yaml document.
+ *
+ * Every `switchroom agent` subcommand that edits the fleet config (add /
+ * update-extends / remove / grant tool / dangerous-mode) routes its write
+ * through here so a crash or ENOSPC mid-write can never truncate the
+ * fleet-wide config. Uses the bind-mount-aware writeConfigFileSync (falls
+ * back to an in-place fsync'd rewrite when a single-file bind mount rejects
+ * rename(2) with EBUSY) and preserves the file's existing mode bits.
+ */
+function writeSwitchroomConfig(configPath: string, text: string): void {
+  let mode = 0o644;
+  try {
+    mode = statSync(configPath).mode & 0o777;
+  } catch {
+    /* default 0o644 */
+  }
+  writeConfigFileSync(configPath, text, mode);
+}
 
 /**
  * Summarise a reconcile batch run. Returns `null` when there is
@@ -449,7 +470,7 @@ export function writeAgentEntryToConfig(
   entry.set("topic_name", synthesizeTopicName(name));
   agents.set(name, entry);
 
-  writeFileSync(configPath, doc.toString(), "utf-8");
+  writeSwitchroomConfig(configPath, doc.toString());
 }
 
 /**
@@ -477,7 +498,7 @@ export function updateAgentExtendsInConfig(
   }
   const agentNode = agents.get(name) as YAML.YAMLMap;
   agentNode.set("extends", profile);
-  writeFileSync(configPath, doc.toString(), "utf-8");
+  writeSwitchroomConfig(configPath, doc.toString());
 }
 
 /**
@@ -494,7 +515,7 @@ export function removeAgentFromConfig(configPath: string, name: string): void {
   const agents = doc.get("agents") as YAML.YAMLMap | null;
   if (!agents || !agents.has(name)) return;
   agents.delete(name);
-  writeFileSync(configPath, doc.toString(), "utf-8");
+  writeSwitchroomConfig(configPath, doc.toString());
 }
 
 /**
@@ -1906,7 +1927,7 @@ export function registerAgentCommand(program: Command): void {
           console.log(chalk.gray(`  ${name}: ${tool} already allowed`));
         } else {
           allow.add(tool);
-          writeFileSync(configPath, doc.toString(), "utf-8");
+          writeSwitchroomConfig(configPath, doc.toString());
           console.log(chalk.green(`  ${name}: granted ${tool}`));
         }
 
@@ -1967,7 +1988,7 @@ export function registerAgentCommand(program: Command): void {
           const tools = agentNode.get("tools") as YAML.YAMLMap | null;
           if (tools && tools.has("allow")) {
             tools.set("allow", new YAML.YAMLSeq());
-            writeFileSync(configPath, doc.toString(), "utf-8");
+            writeSwitchroomConfig(configPath, doc.toString());
             console.log(chalk.yellow(`  ${name}: dangerous mode OFF (tools.allow cleared)`));
           } else {
             console.log(chalk.gray(`  ${name}: dangerous mode was already off`));
@@ -1981,7 +2002,7 @@ export function registerAgentCommand(program: Command): void {
           const allowSeq = new YAML.YAMLSeq();
           allowSeq.add("all");
           tools.set("allow", allowSeq);
-          writeFileSync(configPath, doc.toString(), "utf-8");
+          writeSwitchroomConfig(configPath, doc.toString());
           console.log(chalk.red(`  ${name}: dangerous mode ON — every built-in tool pre-approved`));
           console.log(chalk.gray(`    (tools.allow: [all] expands to Bash, Read, Write, Edit, WebFetch, ...)`));
         }

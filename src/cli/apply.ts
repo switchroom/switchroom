@@ -17,7 +17,8 @@
  */
 import { Option, type Command } from "commander";
 import chalk from "chalk";
-import { accessSync, chownSync, constants as fsConstants, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { accessSync, chownSync, constants as fsConstants, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { writeConfigFileSync } from "../util/atomic.js";
 import { mkdir } from "node:fs/promises";
 import { spawnSync as childSpawnSync } from "node:child_process";
 import readline from "node:readline";
@@ -750,7 +751,16 @@ export async function provisionLiteLLMKeys(
   // Flush batched config edits (ACL grants) once.
   if (pendingConfigEdits && configText !== null && switchroomConfigPath) {
     try {
-      writeFileSync(switchroomConfigPath, configText, "utf-8");
+      // Atomic tmp+fsync+rename so a crash/ENOSPC mid-write can never truncate
+      // switchroom.yaml when flushing the batched litellm ACL grants. Bind-mount
+      // aware (in-place fsync'd fallback on EBUSY); preserves the file's mode.
+      let cfgMode = 0o644;
+      try {
+        cfgMode = statSync(switchroomConfigPath).mode & 0o777;
+      } catch {
+        /* default 0o644 */
+      }
+      writeConfigFileSync(switchroomConfigPath, configText, cfgMode);
       writeOut(chalk.gray(`  ~ litellm: granted read-ACL on per-agent keys (updated ${switchroomConfigPath})\n`));
     } catch (err) {
       ctx.writeErr(

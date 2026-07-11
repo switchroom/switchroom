@@ -33,7 +33,7 @@
 
 import type { Command } from "commander";
 import chalk from "chalk";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 
 import {
   disableAgentsOnGoogleAccount,
@@ -44,6 +44,22 @@ import {
 import type { PutResult, GetResult } from "../vault/broker/client.js";
 import { withConfigError, getConfig, getConfigPath } from "./helpers.js";
 import type { SwitchroomConfig } from "../config/schema.js";
+import { writeConfigFileSync } from "../util/atomic.js";
+
+/**
+ * Atomically persist a mutated switchroom.yaml (google enable/disable ACL
+ * edits). Crash/ENOSPC mid-write must never truncate the fleet config.
+ * Bind-mount aware (in-place fsync'd fallback on EBUSY); preserves mode.
+ */
+function writeGoogleYaml(configPath: string, text: string): void {
+  let mode = 0o644;
+  try {
+    mode = statSync(configPath).mode & 0o777;
+  } catch {
+    /* default 0o644 */
+  }
+  writeConfigFileSync(configPath, text, mode);
+}
 
 export function registerAuthGoogleSubcommands(
   program: Command,
@@ -365,7 +381,7 @@ function registerEnable(googleParent: Command, program: Command): void {
         const after = enableAgentsOnGoogleAccount(before, normalizedAccount, agents);
         const noop = after === before;
         if (!noop) {
-          writeFileSync(yamlPath, after);
+          writeGoogleYaml(yamlPath, after);
         }
 
         const enabledAfter = getEnabledAgentsForGoogleAccount(after, normalizedAccount) ?? [];
@@ -425,7 +441,7 @@ function registerDisable(googleParent: Command, program: Command): void {
         const after = disableAgentsOnGoogleAccount(before, normalizedAccount, agents);
         const noop = after === before;
         if (!noop) {
-          writeFileSync(yamlPath, after);
+          writeGoogleYaml(yamlPath, after);
         }
 
         const enabledAfter = getEnabledAgentsForGoogleAccount(after, normalizedAccount) ?? [];

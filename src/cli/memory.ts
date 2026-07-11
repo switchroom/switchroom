@@ -27,12 +27,61 @@ import {
   type LiteLLMHindsightConfig,
 } from "../setup/hindsight.js";
 import { getViaBrokerStructured } from "../vault/broker/client.js";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { writeConfigFileSync } from "../util/atomic.js";
 import { join } from "node:path";
 import { resolveAgentsDir } from "../config/loader.js";
 import YAML from "yaml";
 import type { SwitchroomConfig } from "../config/schema.js";
 import { normalizeHindsightVersionTag } from "../setup/hindsight.js";
+
+/**
+ * Read-modify-write switchroom.yaml to set `memory.config.url` (and
+ * `provider` when absent) so agents pick up the freshly-started Hindsight
+ * endpoint. Extracted from the `memory setup` action so the persistence —
+ * and its atomicity contract — can be unit-tested without starting a
+ * container.
+ *
+ * Atomic (tmp + fsync + rename, bind-mount-aware via writeConfigFileSync)
+ * so a crash / ENOSPC mid-write can never truncate the operator's config —
+ * the prior in-place writeFileSync could leave a torn / empty switchroom.yaml
+ * (2026-07 review, F2). Preserves the file's existing mode.
+ *
+ * Returns true when the config was updated, false when `configPath` does
+ * not exist (the caller treats a missing config as a soft skip). Any I/O
+ * error propagates to the caller, which renders a manual-edit hint.
+ */
+export function persistMemoryConfigUrl(
+  configPath: string,
+  provider: string,
+  url: string,
+): boolean {
+  if (!existsSync(configPath)) return false;
+  const raw = readFileSync(configPath, "utf-8");
+  const doc = YAML.parseDocument(raw);
+  if (!doc.has("memory")) {
+    doc.set("memory", { backend: "hindsight", shared_collection: "shared", config: { provider, url } });
+  } else {
+    const memNode = doc.get("memory") as YAML.YAMLMap;
+    if (!memNode.has("config")) {
+      memNode.set("config", { provider, url });
+    } else {
+      const configNode = memNode.get("config") as YAML.YAMLMap;
+      configNode.set("url", url);
+      if (!configNode.has("provider")) {
+        configNode.set("provider", provider);
+      }
+    }
+  }
+  let mode = 0o644;
+  try {
+    mode = statSync(configPath).mode & 0o777;
+  } catch {
+    /* default 0o644 */
+  }
+  writeConfigFileSync(configPath, doc.toString(), mode);
+  return true;
+}
 
 /**
  * Decide which hindsight image tag `memory setup` should pull + run, and
@@ -580,24 +629,7 @@ export function registerMemoryCommand(program: Command): void {
       const url = `http://127.0.0.1:${ports.apiPort}/mcp/`;
       const configPath = getConfigPath(program);
       try {
-        if (existsSync(configPath)) {
-          const raw = readFileSync(configPath, "utf-8");
-          const doc = YAML.parseDocument(raw);
-          if (!doc.has("memory")) {
-            doc.set("memory", { backend: "hindsight", shared_collection: "shared", config: { provider, url } });
-          } else {
-            const memNode = doc.get("memory") as YAML.YAMLMap;
-            if (!memNode.has("config")) {
-              memNode.set("config", { provider, url });
-            } else {
-              const configNode = memNode.get("config") as YAML.YAMLMap;
-              configNode.set("url", url);
-              if (!configNode.has("provider")) {
-                configNode.set("provider", provider);
-              }
-            }
-          }
-          writeFileSync(configPath, doc.toString(), "utf-8");
+        if (persistMemoryConfigUrl(configPath, provider, url)) {
           console.log(chalk.gray(`  Updated ${configPath} with memory.config.url = ${url}`));
           console.log(
             chalk.gray(
