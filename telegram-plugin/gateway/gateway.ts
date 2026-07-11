@@ -340,6 +340,8 @@ import {
   decideTurnFlush,
   isTurnFlushSafetyEnabled,
 } from '../turn-flush-safety.js'
+// #1667 — pure decision core for the turn_end answer-delivery gate (#1664).
+import { decideTurnEndGate } from './turn-end-gate.js'
 // #1122 PR3: turn-flush-prose-recovery removed with the progress card.
 import { resolveAgentDirFromEnv } from '../agent-dir.js'
 import {
@@ -16161,6 +16163,17 @@ function handleSessionEvent(ev: SessionEvent): void {
             capturedText: turn.capturedText,
             flushEnabled: TURN_FLUSH_SAFETY_ENABLED,
           })
+      // #1667 — resolve the turn_end answer-delivery gate once, here, via the
+      // pure decision core. The three dispositions below (silent-marker,
+      // turn-flush, #1664 re-prompt) delegate to this so the gateway runs the
+      // exact code the regression test exercises. `finalAnswerDelivered` is read
+      // at its tail value: the answer-stream materialize branch above has
+      // already run (and may have set it true); the flush branch, which also
+      // sets it, is not yet entered and does not affect the gate's own outcome.
+      const turnEndDecision = decideTurnEndGate({
+        flushDecision,
+        finalAnswerDelivered: turn.finalAnswerDelivered,
+      })
       if (flushDecision.kind === 'skip' && flushDecision.reason !== 'reply-called') {
         process.stderr.write(
           `telegram gateway: turn-flush skipped — reason=${flushDecision.reason}\n`,
@@ -16199,7 +16212,7 @@ function handleSessionEvent(ev: SessionEvent): void {
       //  2. NOT send any reply message to the user.
       //  3. Unpin the progress card so no orphaned ⚙️ Working… lingers.
       //  4. Log at debug level and fall through to normal state cleanup.
-      if (flushDecision.kind === 'skip' && flushDecision.reason === 'silent-marker') {
+      if (turnEndDecision === 'silent_end') {
         // Don't try to distinguish NO_REPLY vs HEARTBEAT_OK in the log line:
         // `isSilentFlushMarker` accepts trailing punctuation (e.g. "NO_REPLY.")
         // and case variants, so a strict equality check would print the wrong
@@ -16289,7 +16302,7 @@ function handleSessionEvent(ev: SessionEvent): void {
         return
       }
 
-      if (flushDecision.kind === 'flush') {
+      if (turnEndDecision === 'flush' && flushDecision.kind === 'flush') {
         let capturedText = flushDecision.text
         // #2798 — turn-flush delivers the model's terminal prose when it
         // skipped reply/stream_reply, but historically bypassed the reply
@@ -16654,7 +16667,10 @@ function handleSessionEvent(ev: SessionEvent): void {
         // HEARTBEAT_OK silent-marker turns return earlier and never reach
         // this path. The turn-flush 'flush' branch also returns earlier
         // (and sets finalAnswerDelivered=true defensively).
-        if (turn.finalAnswerDelivered === false) {
+        // #1667 — this is the reply-called tail; `turnEndDecision === 'reprompt'`
+        // is exactly `turn.finalAnswerDelivered === false` here (silent-marker
+        // and flush both returned earlier), delegated to the pure gate core.
+        if (turnEndDecision === 'reprompt') {
           // PR #2892 (deterministic-turn-liveness RFC Phase 2) hardening:
           // wire the represent-guard-style staleness
           // check (`recordSilentTurnEnd`'s `hasOutboundDeliveredSince` dep) so
