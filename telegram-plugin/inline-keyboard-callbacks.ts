@@ -30,6 +30,7 @@
 
 import {
   validateInlineKeyboard,
+  TELEGRAM_BUTTON_LIMITS,
   type AnyButton,
   type ButtonValidationError,
 } from './telegram-button-constraints.js'
@@ -122,9 +123,12 @@ export function wrapAgentCallbacks(keyboard: AnyButton[][]): AnyButton[][] {
  * agent that puts a secret in any of those transmits it unmasked, and it
  * resurfaces on tap — the label is echoed back (`button_text`), re-rendered in
  * the "✅ You chose: <label>" annotation (#789), and `ack_text` is shown as the
- * toast. Route each of those three fields through the SAME outbound redactor
- * the reply `text` body uses, at the outbound boundary, so every downstream
- * resurface reads already-masked bytes.
+ * toast. `switch_inline_query` / `switch_inline_query_current_chat` are also
+ * agent-authored free text that Telegram pastes into a chat's input box on tap
+ * (the current chat for the `_current_chat` variant — directly user-visible),
+ * so they carry the same leak class. Route every one of these free-text fields
+ * through the SAME outbound redactor the reply `text` body uses, at the
+ * outbound boundary, so every downstream resurface reads already-masked bytes.
  *
  * `callback_data` is the routing key and is NEVER touched — redacting it would
  * break tap round-tripping. Button structure/order is preserved; the redactor
@@ -141,17 +145,47 @@ export function redactAgentKeyboard(
   keyboard: AnyButton[][],
   redactFn: (s: string) => string,
 ): AnyButton[][] {
+  // The keyboard is validated for length BEFORE redaction, but the redaction
+  // marker (`[REDACTED:...]`) can be longer than the secret it replaces, so a
+  // field that was within a Telegram cap can exceed it after masking. An
+  // over-limit button field makes sendMessage 400 → the WHOLE reply is dropped
+  // (worse than the leak we just closed), so clamp each masked free-text field
+  // to its cap. Truncating a marker is harmless — it's already non-secret.
+  const clamp = (s: string, max: number): string =>
+    s.length > max ? s.slice(0, max) : s
   return keyboard.map((row) =>
     row.map((btn) => {
       const out: AnyButton = { ...btn }
-      if (typeof out.text === 'string') out.text = redactFn(out.text)
+      if (typeof out.text === 'string') {
+        out.text = clamp(redactFn(out.text), TELEGRAM_BUTTON_LIMITS.TEXT_MAX)
+      }
+      // ack_text is a switchroom-side toast (answerCallbackQuery), not a
+      // sendMessage field, so an over-length value can't drop the reply — no
+      // clamp needed, but redact it all the same.
       if (typeof out.ack_text === 'string') out.ack_text = redactFn(out.ack_text)
+      // switch_inline_query* paste agent free text into a chat input box on tap
+      // — same leak class as the label. URL-class fields (url/web_app/login_url)
+      // are deliberately left exact: a [REDACTED] marker would corrupt a URL.
+      const siq = (out as { switch_inline_query?: unknown }).switch_inline_query
+      if (typeof siq === 'string') {
+        (out as { switch_inline_query?: string }).switch_inline_query = clamp(
+          redactFn(siq), TELEGRAM_BUTTON_LIMITS.SWITCH_INLINE_QUERY_MAX)
+      }
+      const siqc = (out as { switch_inline_query_current_chat?: unknown })
+        .switch_inline_query_current_chat
+      if (typeof siqc === 'string') {
+        (out as { switch_inline_query_current_chat?: string })
+          .switch_inline_query_current_chat = clamp(
+            redactFn(siqc), TELEGRAM_BUTTON_LIMITS.SWITCH_INLINE_QUERY_MAX)
+      }
       const ct = out.copy_text
       if (ct != null && typeof ct === 'object' &&
           typeof (ct as { text?: unknown }).text === 'string') {
         out.copy_text = {
           ...(ct as Record<string, unknown>),
-          text: redactFn((ct as { text: string }).text),
+          text: clamp(
+            redactFn((ct as { text: string }).text),
+            TELEGRAM_BUTTON_LIMITS.COPY_TEXT_MAX),
         }
       }
       return out

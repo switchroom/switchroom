@@ -534,6 +534,37 @@ describe('inline-keyboard-callbacks (#271)', () => {
       expect(seen).not.toContain('c2')
     })
 
+    it('masks a secret in switch_inline_query* (pasted into the chat input on tap)', () => {
+      const raw = [
+        [{ text: 'Share', callback_data: 's', switch_inline_query: `key ${GITHUB_PAT}` }],
+        [{
+          text: 'Fill here',
+          callback_data: 'f',
+          switch_inline_query_current_chat: `key ${GITHUB_PAT}`,
+        }],
+      ]
+      const out = redactAgentKeyboard(raw, redact)
+      const siq = (out[0]![0]! as { switch_inline_query: string }).switch_inline_query
+      const siqc = (out[1]![0]! as { switch_inline_query_current_chat: string })
+        .switch_inline_query_current_chat
+      expect(siq).not.toContain(GITHUB_PAT)
+      expect(siq).toContain('[REDACTED')
+      expect(siqc).not.toContain(GITHUB_PAT)
+      expect(siqc).toContain('[REDACTED')
+    })
+
+    it('clamps a masked field that the marker pushed over the Telegram cap (reply not dropped)', () => {
+      // A 60-char label (< 64 cap) whose short secret expands under the marker
+      // would exceed 64 and 400-drop the whole reply; the clamp keeps it ≤ cap.
+      const shortSecret = 'AKIAIOSFODNN7EXAMPLE' // 20 chars, AWS-key shaped
+      const label = `${shortSecret} ${'x'.repeat(43)}` // 64 chars total, at the cap
+      const raw = [[{ text: label, callback_data: 'x' }]]
+      const [[btn]] = redactAgentKeyboard(raw, redact)
+      const text = btn.text as string
+      expect(text.length).toBeLessThanOrEqual(64)
+      expect(text).not.toContain(shortSecret)
+    })
+
     it('preserves keyboard structure, row/column order, and does not mutate input', () => {
       const raw = [
         [{ text: 'A', callback_data: 'a' }, { text: 'B', callback_data: 'b' }],
