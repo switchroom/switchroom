@@ -521,9 +521,15 @@ export const SR_MODEL_ALIASES: Record<string, string> = {
  * session to verify, so the operator is asked to re-issue after boot.
  */
 export function isOfflineTrustedModelToken(token: string): boolean {
-  if ((MODEL_ALIASES as readonly string[]).includes(token)) return true
-  if (token in SR_MODEL_ALIASES) return true
-  return Object.values(SR_MODEL_ALIASES).includes(token)
+  // #3043 item 1: the live accept path normalizes case (isClaudeModel /
+  // expandSrAlias lowercase before matching), so a queued `/model OPUS` is
+  // accepted live — but this persist-time gate compared case-sensitively and
+  // then refused it with the over-conservative "couldn't verify" card. Lowercase
+  // once so the persist decision matches what the live path already accepted.
+  const lower = token.toLowerCase()
+  if ((MODEL_ALIASES as readonly string[]).includes(lower)) return true
+  if (lower in SR_MODEL_ALIASES) return true
+  return Object.values(SR_MODEL_ALIASES).includes(lower)
 }
 
 export function expandSrAlias(arg: string): string {
