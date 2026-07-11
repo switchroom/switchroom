@@ -542,14 +542,14 @@ describe('hasOutboundDeliveredSince', () => {
   })
 })
 
-// H3 regression: the original PRIMARY KEY (chat_id, thread_id, message_id) does
+// Review finding H5 regression: the original PRIMARY KEY (chat_id, thread_id, message_id) does
 // NOT dedupe thread-less rows because SQLite treats NULL as distinct from NULL
 // in a UNIQUE/PK index. The documented at-least-once boot replay re-records an
 // already-stored DM/non-topic message, so `INSERT OR REPLACE` appended a
 // DUPLICATE row instead of replacing — over-counting the silence / over-ping
 // detectors. The COALESCE(thread_id,'') unique index makes the upsert
 // idempotent. These tests fail (duplicate rows) without the fix.
-describe('idempotent upsert for null-thread rows (H3)', () => {
+describe('idempotent upsert for null-thread rows (H5)', () => {
   beforeEach(() => initHistory(stateDir, 30))
 
   it('re-recording the same null-thread inbound yields exactly ONE row', () => {
@@ -642,7 +642,7 @@ describe('idempotent upsert for null-thread rows (H3)', () => {
     ).run('-100', 7, now, 'topic row')
     raw.close()
 
-    // Re-open through initHistory → runs the H3 migration (dedupe + index).
+    // Re-open through initHistory → runs the H5 migration (dedupe + index).
     initHistory(stateDir, 30)
     const general = query({ chat_id: '-100', thread_id: null })
     expect(general).toHaveLength(1)

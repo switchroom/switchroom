@@ -178,7 +178,7 @@ export function initHistory(stateDir: string, retentionDays = 30): void {
     }
   }
 
-  // Migration (H3): make INSERT OR REPLACE idempotent for thread-less rows.
+  // Migration (review finding H5): make INSERT OR REPLACE idempotent for thread-less rows.
   //
   // The table's PRIMARY KEY is (chat_id, thread_id, message_id), but thread_id
   // is nullable and SQLite treats NULL as DISTINCT from NULL in a PK/UNIQUE
