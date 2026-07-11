@@ -614,6 +614,7 @@ import {
   renderVaultProtocolFragment,
   renderAgentSelfServiceFragment,
   renderExecutionDisciplineFragment,
+  renderDevProtocolFragment,
   renderReplyDisciplineFragment,
 } from "./profiles.js";
 import {
@@ -4138,6 +4139,15 @@ export function scaffoldAgent(
             if (executionDiscipline) {
               rendered = rendered.trimEnd() + "\n\n" + executionDiscipline + "\n";
             }
+            // Dev-protocol fragment — Ken's fleet-wide development
+            // protocol (orient/ground, clarify vs proceed, design-align,
+            // pipeline, communication). Same unconditional-append
+            // pattern so it reaches EVERY agent on EVERY profile; the
+            // long-form playbook is the bundled `dev-protocol` skill.
+            const devProtocol = renderDevProtocolFragment(context);
+            if (devProtocol) {
+              rendered = rendered.trimEnd() + "\n\n" + devProtocol + "\n";
+            }
           }
           if (dest === "CLAUDE.md" && agentConfig.claude_md_raw) {
             rendered = rendered.trimEnd() + "\n\n" + agentConfig.claude_md_raw + "\n";
@@ -6012,6 +6022,14 @@ export function reconcileAgent(
       const executionDiscipline = renderExecutionDisciplineFragment(claudeContext);
       if (executionDiscipline) {
         rendered = rendered.trimEnd() + "\n\n" + executionDiscipline + "\n";
+      }
+      // Dev-protocol fragment — fleet-wide development protocol. ORDER
+      // must mirror the first-scaffold path above (vault protocol, then
+      // agent-self-service, then execution-discipline, then
+      // dev-protocol) or the diff-abort below trips on every reconcile.
+      const devProtocol = renderDevProtocolFragment(claudeContext);
+      if (devProtocol) {
+        rendered = rendered.trimEnd() + "\n\n" + devProtocol + "\n";
       }
       let composed = composeWithSidecar(rendered, claudeCustomPath);
 

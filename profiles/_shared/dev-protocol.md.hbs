@@ -1,0 +1,42 @@
+## Development Protocol
+
+How development work gets done here — orient, clarify, align, ship, communicate. These are procedural rules for any substantive coding, infra, or debugging task. For the long-form playbook (design reports, adversarial review structure, re-review verdicts), load the bundled `dev-protocol` skill before starting substantive development work.
+
+### Orient — ground before you build
+
+- **Validate, don't assume.** Read the actual code, config, and system state before forming a theory. Never assert a fact you haven't checked this turn.
+- **Root-cause in real source.** Verify against the source of truth — the repo's source files, not build artifacts, caches, or generated output that may be stale.
+- **Contradicting evidence wins.** When what you find contradicts your working theory (or the task description), report the contradiction — don't force-fit the evidence to the plan.
+- **Cite your ground.** Claims about the codebase carry references: PR numbers, commit hashes, `file:line`.
+
+### Clarify vs proceed
+
+- **Infer first.** Mine the codebase, history, and prior context before asking. Most "questions" are answerable by reading.
+- **If genuinely unsure, ask ONE question at a time** — the single question that unblocks the most work — not a questionnaire.
+- **Clarify during planning; act autonomously during execution.** Once the plan is agreed, don't drip questions mid-implementation — make the reasonable call, note the assumption, keep moving.
+
+### Design-align on larger tasks
+
+For tasks that are architecturally significant, cross-cutting, or ambiguous in approach:
+
+- **Design report before implementation.** Present an evidence-grounded design (what exists today with citations, what changes, why this approach) to the user and get alignment before writing the code.
+- **Red-team your own plan.** Adversarially review the design item by item — a per-item verdict backed by evidence, not a rubber stamp.
+- **Stage delivery.** Ship as focused, single-concern PRs rather than one omnibus change.
+
+### Pipeline — how a change ships
+
+- **Branch off fresh main.** Always pull before branching.
+- **Scoped tests + lint locally; CI is the full-suite authority.** Run the tests that cover what you touched plus `npm run lint` before pushing — but the merge gate is CI green, not your local run.
+- **Adversarial review of the diff.** Every change gets reviewed as an adversary would read it: what breaks, what's untested, what's inconsistent.
+- **Fix ALL findings — including lows.** A "low" you skip is a bug you shipped. Then **re-review the fix** before calling it done.
+- **Merge only on CI green.** No exceptions, no "it's probably fine".
+- **Durable fixes over hack patches.** Fix the root cause; a workaround needs an explicit reason and a filed follow-up.
+- **Deterministic mechanisms over model-dependent behavior.** If a guarantee can be enforced by code (a check, a hook, a schema), don't leave it to prompt discipline.
+- **Tests assert outcomes, not just code paths.** A test that exercises the code but wouldn't fail on the bug is not a test.
+
+### Communicate while you work
+
+- **Consolidated messages.** One substantive update beats five fragments — batch related findings and results.
+- **Always-visible progress.** Long-running work surfaces status the user can see; never go dark mid-task.
+- **No foreground watches over 30 seconds.** Anything longer runs in the background with a notification on completion.
+- **Max 15 parallel sub-agents.** Fan out for genuinely parallel work, but cap the swarm.

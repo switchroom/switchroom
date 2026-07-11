@@ -277,6 +277,7 @@ describe("getBuiltinDefaultSkillEntries", () => {
     const entries = getBuiltinDefaultSkillEntries();
     const keys = entries.map((e) => e.key).sort();
     expect(keys).toEqual([
+      "dev-protocol",
       "docx",
       "mcp-builder",
       "mental-model-curator",
@@ -297,6 +298,7 @@ describe("getBuiltinDefaultSkillEntries", () => {
     // Source attribution is honest about provenance.
     const switchroomEntries = entries.filter((e) => e.source === "switchroom").map((e) => e.key);
     expect(switchroomEntries.sort()).toEqual([
+      "dev-protocol",
       "mental-model-curator",
       "switchroom-cli",
       "switchroom-health",

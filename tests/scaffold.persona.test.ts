@@ -145,7 +145,12 @@ describe("scaffoldAgent — persona (Phase 2)", () => {
     // future fragments, so we step back up to a comparable point.
     // Each block is load-bearing. Future bumps should justify themselves
     // similarly.
-    expect(claudeMd.length).toBeLessThan(33500); // +vault sub-agent fallback guidance (PR #1632)
+    // RAISED 33500 → 37500 for the unconditional dev-protocol fragment
+    // (~3.6KB): Ken's fleet-wide development protocol (orient/ground,
+    // clarify vs proceed, design-align, pipeline, communication) —
+    // always-loaded summary pointing at the bundled `dev-protocol`
+    // skill for the long-form playbook.
+    expect(claudeMd.length).toBeLessThan(37500);
   });
 
   it("root: true renders the root-tier host-access block + the admin surface", () => {
