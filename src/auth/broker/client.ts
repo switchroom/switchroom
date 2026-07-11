@@ -221,6 +221,13 @@ export interface ListStateData {
     exhausted_until?: number;
     window?: "5h" | "7d";
     pct?: number;
+    /**
+     * Trigger attribution (#3031 PR 2): "hard-exhaustion" = the probe saw a
+     * genuine quota wall; "soft-avoid" = a proactive serving-preference roll
+     * off an account approaching its limits (no mark, no promote). Absent on
+     * pre-PR-2 brokers (render as hard exhaustion).
+     */
+    reason?: "soft-avoid" | "hard-exhaustion";
   } | null;
 }
 

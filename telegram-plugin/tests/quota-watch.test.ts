@@ -1143,3 +1143,31 @@ describe("#3035 review fixes", () => {
     expect(d.reason).toBe("roll-announced");
   });
 });
+
+describe("buildFleetRollMessage — reason attribution (#3031 PR 2 reason field)", () => {
+  const BASE: FleetRollInfo = {
+    from: "alice@example.com",
+    to: "bob@example.com",
+    at: NOW - 60_000,
+    window: "7d",
+    pct: 96,
+  };
+
+  it("soft-avoid reads as proactive 'approaching limits', not exhaustion", () => {
+    const msg = buildFleetRollMessage({ ...BASE, reason: "soft-avoid" }, NOW);
+    expect(msg).toContain("Proactive switch");
+    expect(msg).toContain("approaching its limits");
+    expect(msg).toContain("proactive, before exhaustion");
+    expect(msg).toContain("7-day window at 96%");
+    expect(msg).toContain("Work continues uninterrupted");
+  });
+
+  it("hard-exhaustion (explicit or absent reason — pre-PR-2 broker) keeps the walled framing", () => {
+    for (const roll of [{ ...BASE, reason: "hard-exhaustion" as const }, BASE]) {
+      const msg = buildFleetRollMessage(roll, NOW);
+      expect(msg).not.toContain("Proactive switch");
+      expect(msg).not.toContain("approaching its limits");
+      expect(msg).toContain("7-day window at 96% on");
+    }
+  });
+});

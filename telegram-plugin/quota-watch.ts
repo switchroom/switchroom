@@ -189,6 +189,13 @@ export interface FleetRollInfo {
   exhausted_until?: number;
   window?: "5h" | "7d";
   pct?: number;
+  /**
+   * Trigger attribution (#3031 PR 2): "soft-avoid" = proactive
+   * serving-preference roll off an account APPROACHING its limits;
+   * "hard-exhaustion" = the probe saw a genuine quota wall. Absent on
+   * pre-PR-2 brokers — rendered as hard exhaustion.
+   */
+  reason?: "soft-avoid" | "hard-exhaustion";
 }
 
 export type FleetRollAnnounceDecision =
@@ -220,8 +227,10 @@ export function evaluateFleetRollAnnounce(args: {
 
 /**
  * Causal + reassuring announcement for a broker-initiated proactive roll.
- * Shape: "Switched fleet to <new> — <window> at <pct>% on <old>
+ * Hard exhaustion: "Switched fleet to <new> — <window> at <pct>% on <old>
  * (resets <time>). Work continues uninterrupted."
+ * Soft-avoid (#3031 PR 2 `reason`): reads as PROACTIVE — the old account is
+ * approaching its limits, not walled; no mark/reset framing.
  */
 export function buildFleetRollMessage(roll: FleetRollInfo, now: number): string {
   const winLabel =
@@ -231,13 +240,17 @@ export function buildFleetRollMessage(roll: FleetRollInfo, now: number): string 
     typeof roll.exhausted_until === "number" && roll.exhausted_until > now
       ? ` (resets ${formatRelative(new Date(roll.exhausted_until), new Date(now))})`
       : "";
+  const softAvoid = roll.reason === "soft-avoid";
+  const causeLine = softAvoid
+    ? `Proactive switch — \`${codeSpanSafe(roll.from)}\` is approaching its limits (${winLabel}${pctPart})${resetPart}, so the fleet moved early instead of hitting the wall.`
+    : `${winLabel}${pctPart} on \`${codeSpanSafe(roll.from)}\`${resetPart}.`;
   return [
     `🔁 **Switched fleet to \`${codeSpanSafe(roll.to)}\`**`,
     ``,
-    `${winLabel}${pctPart} on \`${codeSpanSafe(roll.from)}\`${resetPart}.`,
+    causeLine,
     `Work continues uninterrupted — agents and scheduled jobs now serve from \`${codeSpanSafe(roll.to)}\`.`,
     ``,
-    `_Automatic broker failover. Run /auth for fleet status; \`/auth use ${codeSpanSafe(roll.from)}\` to switch back once it refills._`,
+    `_Automatic broker failover${softAvoid ? " (proactive, before exhaustion)" : ""}. Run /auth for fleet status; \`/auth use ${codeSpanSafe(roll.from)}\` to switch back once it ${softAvoid ? "has headroom again" : "refills"}._`,
   ].join("\n");
 }
 
