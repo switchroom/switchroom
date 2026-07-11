@@ -165,8 +165,70 @@ x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:
   # The sidecar's own structured logging is written
   # directly to its log file; this wrapper only handles process
   # lifecycle. Ampersand-backgrounded by callers below.
+  # Size-based log rotation for a supervised sidecar's logfile (#3025).
+  # The gateway sidecar appends per-poll trace lines and can run for
+  # WEEKS without the supervise loop regaining control (it only loops on
+  # child exit), so rotate-at-restart alone let gateway-supervisor.log
+  # grow to 555MB on clerk / 162MB on klanker and fill the host disk.
+  # This background checker runs independently of the child's lifecycle.
+  #
+  # copytruncate (cp + `: >`), NOT `mv`: the supervised child holds an
+  # open fd on $_logfile (its stdout/stderr is redirected there with
+  # `>> "$_logfile"`). A plain `mv` would leave the child writing to the
+  # now-renamed inode, so the live log would silently stop growing and
+  # the rotated file would keep filling. copytruncate preserves the fd —
+  # the child keeps appending to the same (now-empty) inode. Worst-case
+  # race is a few log lines written between the cp and the truncate being
+  # lost; acceptable for a debug trace log. Keeps at most ~2×cap on disk
+  # (live + one .1 generation). Cap + interval are env-overridable.
+  _switchroom_log_rotator() {
+    local _logfile="$1"
+    local _max="${SWITCHROOM_SIDECAR_LOG_MAX_BYTES:-52428800}"   # 50 MiB default
+    local _interval="${SWITCHROOM_SIDECAR_LOG_ROTATE_INTERVAL_SEC:-300}"  # 5 min
+    # Validate BOTH env overrides up front; garbage falls back to the
+    # default. Unvalidated, a non-numeric interval makes `sleep` fail
+    # instantly and the `while true` loop hot-spins a CPU core for the
+    # container lifetime; a non-numeric cap makes the -gt test below
+    # error (a shell error line to stdout) every cycle forever. A zero
+    # interval would also hot-spin, so it falls back too.
+    case "$_max" in ''|*[!0-9]*) _max=52428800;; esac
+    case "$_interval" in ''|0|*[!0-9]*) _interval=300;; esac
+    # A cap of 0 disables rotation entirely (operator escape hatch).
+    # (Negative values contain '-' → non-numeric per the guard above →
+    # default cap, i.e. rotation stays on.)
+    [ "$_max" -eq 0 ] && return 0
+    while true; do
+      sleep "$_interval"
+      [ -f "$_logfile" ] || continue
+      local _size
+      _size=$(wc -c < "$_logfile" 2>/dev/null || echo 0)
+      # `wc -c < file` yields a bare integer; guard against empty/non-numeric.
+      case "$_size" in ''|*[!0-9]*) continue;; esac
+      if [ "$_size" -gt "$_max" ]; then
+        if cp "$_logfile" "$_logfile.1" 2>/dev/null; then
+          : > "$_logfile"
+          echo "[supervise] rotated $_logfile (${_size} bytes > ${_max} cap) → ${_logfile}.1" >> "$_logfile"
+        else
+          # cp failed (e.g. ENOSPC — exactly when rotation matters most).
+          # Fall back to truncate-without-backup: dropping the .1 backup
+          # beats a rotator that can never free space (#3025 review).
+          : > "$_logfile"
+          echo "[supervise] rotated $_logfile (${_size} bytes > ${_max} cap) WITHOUT backup — cp to ${_logfile}.1 failed (disk full?)" >> "$_logfile"
+        fi
+      fi
+    done
+  }
+
   _switchroom_supervise() {
     local _name="$1"; local _logfile="$2"; shift 2
+    # Start the size-based rotator for this sidecar's log (#3025). One
+    # per supervised sidecar; lives for the container lifetime alongside
+    # the respawn loop below.
+    _switchroom_log_rotator "$_logfile" &
+    # Record the rotator's pid so the oneshot-ok return path below can
+    # reap it — otherwise every completed one-shot sidecar leaks a
+    # background sleep loop for the container lifetime (#3025 review).
+    local _rotator_pid=$!
     # Optional `--oneshot-ok` flag (must directly follow the logfile):
     # marks a sidecar that can LEGITIMATELY complete. For such a sidecar
     # a clean exit 0 means "job done" → stop supervising, no respawn.
@@ -211,6 +273,9 @@ x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:
       # below — a crash always self-heals.
       if [ $_oneshot_ok -eq 1 ] && [ $_exit -eq 0 ]; then
         echo "[supervise] $_name completed cleanly (exit 0) — one-shot-ok, not respawning." >> "$_logfile"
+        # The sidecar is done — its log stops growing, so reap the
+        # rotator instead of leaking its sleep loop forever (#3025).
+        kill "$_rotator_pid" 2>/dev/null || true
         return 0
       fi
       # A run that stayed up for at least the backoff cap means the
