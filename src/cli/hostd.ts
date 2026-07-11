@@ -328,7 +328,20 @@ services:
       # issues \`docker run -d -v /var/run/docker.sock:…\` through the proxy
       # (a container-create call), and dockerd resolves that host bind source
       # on the HOST — the helper still gets the real socket to \`compose up\`
-      # the recreated hostd. No path retains a raw socket in hostd itself.
+      # the recreated hostd. hostd itself never mounts the raw socket.
+      #
+      # HONEST LIMIT — blast-surface reduction, NOT a hard boundary. With
+      # CONTAINERS+POST allowed (required for compose up / self-bump), a
+      # FULLY compromised hostd can still create a container that
+      # bind-mounts /var/run/docker.sock (or /) — the same mechanism
+      # self-bump uses legitimately — and take over the host in ONE create
+      # call. What the proxy removes is the STANDING socket and the
+      # accidental / low-effort surface (no GET-me-everything socket lying
+      # in the container; every call is an allowlisted HTTP endpoint).
+      # The real boundary against a determined attacker is the operator
+      # approval-card layer (#1427); closing the residual hole would mean
+      # dropping container-create — i.e. dropping self-bump and
+      # compose-driven rollout — which is out of scope here.
       # /etc/machine-id passthrough — the vault auto-unlock blob
       # (~/.switchroom/vault-auto-unlock) is encrypted with a key derived
       # from the host machine-id. Without this mount, readAutoUnlockFile
