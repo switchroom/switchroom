@@ -93,6 +93,27 @@ export type AgentMetadata = {
    * asked for current state, so terseness loses to completeness here.
    */
   live?: StatusProbeRow[];
+  /**
+   * Send-gate state (#3084 PR 3, part3-design §6). Present only when the gate
+   * feature flag is ON; omitted entirely when off so `/status` looks exactly
+   * as it did before the gate existed.
+   */
+  sendGate?: SendGateStatus;
+};
+
+/**
+ * `/status` view of the deterministic send gate (#3084). Queued / shed totals
+ * plus any open flood windows with their expiry. Only populated when the gate
+ * is enabled.
+ */
+export type SendGateStatus = {
+  queued: number;
+  shed: number;
+  expired: number;
+  failedFast: number;
+  dropped: number;
+  /** Currently-open flood windows (expired already pruned). */
+  openWindows: { scopeKey: string; untilTs: number }[];
 };
 
 // Markdown escaper for dynamic values interpolated into bold/plain card
@@ -228,6 +249,27 @@ export function statusPairedText(params: {
     for (const row of meta.live) {
       const dot = STATUS_DOT[row.status] ?? STATUS_DOT.fail;
       lines.push(`${dot} **${escapeHtml(row.label)}**  ${escapeHtml(row.detail)}`);
+    }
+  }
+
+  // Send-gate block (#3084 PR 3) — only when the gate flag is on, so a fleet
+  // running with the gate OFF sees the identical pre-gate /status.
+  if (meta.sendGate) {
+    const sg = meta.sendGate;
+    lines.push("");
+    lines.push("**Send gate**");
+    lines.push(
+      `queued ${sg.queued} · shed ${sg.shed} · expired ${sg.expired} · ` +
+        `fail-fast ${sg.failedFast} · dropped ${sg.dropped}`,
+    );
+    if (sg.openWindows.length > 0) {
+      const now = Date.now();
+      for (const w of sg.openWindows) {
+        const secs = Math.max(0, Math.round((w.untilTs - now) / 1000));
+        lines.push(`⏳ flood window \`${escapeHtml(w.scopeKey)}\` — clears in ${secs}s`);
+      }
+    } else {
+      lines.push("no open flood windows");
     }
   }
 

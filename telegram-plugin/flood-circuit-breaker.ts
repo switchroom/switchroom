@@ -380,6 +380,12 @@ export interface FloodWindowRecord {
   retryAfterSrc: string
   /** Epoch ms the window was (re)recorded. */
   observedAt: number
+  /**
+   * Epoch ms an operator alert was sent for THIS window (#3084 PR 3, §6). The
+   * at-most-once anchor: persisted so a restart mid-window never re-alerts.
+   * Unset until the observer alerts.
+   */
+  alertedAt?: number
 }
 
 /** Sibling file holding the scoped-window array. */
@@ -400,8 +406,17 @@ export function floodWindowsPath(stateDir: string): string {
  * conservative window — the exact opposite of `flood-wait.json`'s essential-send
  * probe, which must fail OPEN so a marker problem never gags the user's reply.
  * The asymmetry is deliberate: this file drives boot-time shedding, not the
- * user's reply, so failing safe here costs at most a few suppressed cosmetic
- * sends, while failing open resends straight into a ban (H2/M1, #3106 posture).
+ * user's reply, so failing safe here is the right call, while failing open
+ * resends straight into a ban (H2/M1, #3106 posture).
+ *
+ * Note the blast radius is NOT only cosmetic: this conservative window is
+ * `FLOOD_WINDOWS_CORRUPT_SUPPRESS_MS` (5 min), which exceeds the send gate's
+ * `criticalFailFastMs` (60s) ceiling — so while it is open a CRITICAL reply also
+ * fail-fasts with a structured `FLOOD_WAIT_ACTIVE` (a retryable error carrying
+ * `untilTs`, NOT a silent drop and NOT a hang) for up to 5 min after each boot.
+ * That only fires with the send gate flag ON and a genuinely corrupt/unreadable
+ * persisted file; the fail-fast is a real signal to the caller, so the posture
+ * is defensible — but it is fail-fast criticals, not merely suppressed cosmetics.
  */
 export const FLOOD_WINDOWS_CORRUPT_SUPPRESS_MS = 5 * 60_000
 
@@ -462,6 +477,9 @@ export function readFloodWindows(
       untilTs: rec.untilTs,
       retryAfterSrc: typeof rec.retryAfterSrc === 'string' ? rec.retryAfterSrc : 'unknown',
       observedAt: typeof rec.observedAt === 'number' ? rec.observedAt : now,
+      // Preserve the at-most-once alert anchor (#3084 PR 3) across reads so a
+      // restart mid-window does not re-alert.
+      ...(typeof rec.alertedAt === 'number' ? { alertedAt: rec.alertedAt } : {}),
     })
   }
   return out
@@ -488,7 +506,15 @@ export function writeFloodWindow(
       const prior = byScope.get(record.scopeKey)
       // Monotonic: keep the LATER expiry (never shorten an open window).
       const untilTs = prior && prior.untilTs > record.untilTs ? prior.untilTs : record.untilTs
-      byScope.set(record.scopeKey, { ...record, untilTs })
+      // Preserve a prior `alertedAt` when a window is EXTENDED (#3084 PR 3): a
+      // fresh 429 recorder call carries no alertedAt, and dropping it would
+      // re-arm the at-most-once alert for a window we already alerted on.
+      const alertedAt = record.alertedAt ?? prior?.alertedAt
+      byScope.set(record.scopeKey, {
+        ...record,
+        untilTs,
+        ...(alertedAt != null ? { alertedAt } : {}),
+      })
     }
     const arr = [...byScope.values()]
     const tmp = `${path}.tmp-${process.pid}`
@@ -510,6 +536,26 @@ export function writeFloodWindow(
   } catch {
     /* best-effort — a persistence failure must not crash the send path */
   }
+}
+
+/**
+ * Persist an `alertedAt` marker on the window for `scopeKey` (#3084 PR 3, §6).
+ *
+ * The at-most-once anchor for the operator flood alert: once written, a restart
+ * that re-reads the still-open window sees `alertedAt` set and does not re-alert.
+ * Best-effort and a no-op if the scope is no longer open (already pruned) — the
+ * window has closed, so at-most-once still holds. Reuses `writeFloodWindow`'s
+ * merge (it keeps the LATER `untilTs` and now carries `alertedAt` through).
+ */
+export function markFloodWindowAlerted(
+  path: string,
+  scopeKey: string,
+  alertedAt: number,
+  now: number,
+): void {
+  const open = readFloodWindows(path, now).find((w) => w.scopeKey === scopeKey)
+  if (!open) return
+  writeFloodWindow(path, { ...open, alertedAt }, now)
 }
 
 /**
