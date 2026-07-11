@@ -172,6 +172,9 @@ import {
   createBlockedApprovalStore,
   safeActionForRecord,
   selectOldestHeld,
+  selectHeldForRedelivery,
+  holdReasonFor,
+  heldRetryBackoffMs,
   type UndeliverableMark,
 } from './approval-hold.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
@@ -2698,6 +2701,17 @@ function turnInFlightForGate(): boolean {
   // Keeping the gate closed for as long as there is an outstanding approval
   // card prevents that race. The gate reopens when the card is tapped or times
   // out (pendingPermissions.delete in finalizeCallback / TTL sweep).
+  //
+  // #3084 follow-up — ONE case now has no timeout valve: an approval HELD
+  // because its card could not be DELIVERED (a Telegram flood ban) never
+  // expires, by design. The leash may not fabricate a verdict for an ask no
+  // human ever saw, so the entry — and therefore this gate — persists until a
+  // human answers. An agent can consequently buffer normal inbound for the
+  // duration of a channel outage. That is the intended trade: a buffered
+  // message is recoverable, a silently auto-denied approval is not. The escape
+  // hatches are unaffected — /allow, /deny and /pending are grammy command
+  // handlers and do not sit behind this gate — and the block is surfaced
+  // off-Telegram in blocked-approvals/<agent>.json.
   const hasPendingApproval = pendingPermissions.size > 0
   if (!isDeliveryCutoverEnabled()) return claudeBusyKeys.size > 0 || hasPendingApproval
   // Machine is authoritative. Run the log-only drift canary (#2794): the
@@ -5454,6 +5468,11 @@ const sendGate = createSendGate({
   onWindowOpen: (scopeKey, untilTs) => recordFloodWindow(scopeKey, untilTs),
 })
 
+// Hoisted so the held-card re-delivery sweep (#3084 follow-up) asks the SAME
+// probe `robustApiCall` does, off the same on-disk window. The sweep's check and
+// the retry policy's own pre-call short-circuit are then two independent reads
+// of one source of truth, not two notions of "is the channel open".
+const probeFloodWaitRemainingMs = makeFloodWaitProbe(FLOOD_STATE_PATH)
 const rawRobustApiCall = createRetryApiCall({
   log: (line) => process.stderr.write(line),
   onFloodWait: (retryAfterSec) => {
@@ -5474,7 +5493,7 @@ const rawRobustApiCall = createRetryApiCall({
   // FLOOD_WAIT_ACTIVE instead), and the card surfaces re-drive on a 5-6s
   // heartbeat — without this gate that turns the fix into an amplifier that
   // fires thousands of requests into the open window and extends the ban.
-  floodWaitRemainingMs: makeFloodWaitProbe(FLOOD_STATE_PATH),
+  floodWaitRemainingMs: probeFloodWaitRemainingMs,
 })
 
 const robustApiCall = <T>(
@@ -5916,7 +5935,7 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 // known-open Telegram flood window. While it is set the entry is HELD — the TTL
 // sweep skips it (never auto-deny an ask no human ever saw) and the reaper
 // re-posts the card once the window closes. Cleared on successful delivery.
-const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string; startedAt: number; card_text: string; cards: { chatId: string; messageId: number; threadId?: number | null }[]; undeliverable?: UndeliverableMark | null }>()
+const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string; startedAt: number; card_text: string; cards: { chatId: string; messageId: number; threadId?: number | null }[]; undeliverable?: UndeliverableMark | null; redeliveryFailures?: number }>()
 // PERMISSION_TTL_MS / ttlForTool / the timed-out card builder now live in
 // ./permission-timeout.ts (pure + unit-testable). hostd gated verbs get a
 // 30-min window; everything else keeps the 10-min default.
@@ -6906,9 +6925,213 @@ function restorePendingApprovalCards(): number {
   return restored
 }
 
+/**
+ * Post the Approve/Deny card for `requestId` to every permission-card target.
+ *
+ * Extracted from `onPermissionRequest` (#3084 follow-up) so it has TWO callers:
+ * the initial delivery, and the reaper's held-card re-delivery once a flood
+ * window closes. Both paths must behave identically — same routing, same
+ * thread-fallback, same landed-card bookkeeping, same hold-on-flood-wait — so
+ * there is exactly one implementation of "post this card".
+ *
+ * Everything it needs is rebuilt from the pending entry, so a re-delivery an
+ * hour later renders the same card the operator would have seen at T+0.
+ */
+function postPermissionCard(
+  requestId: string,
+  pend: NonNullable<ReturnType<typeof pendingPermissions.get>>,
+): void {
+  const text = pend.card_text
+  const showAlways =
+    resolveScopedAllowChoices(pend.tool_name, pend.input_preview) != null
+  const keyboard = buildPermissionActionRow(requestId, showAlways)
+  // Route the card to the SAME place the post-verdict resume message lands
+  // (resolvePermissionCardTargets): the ORIGINATING chat+topic when there's an
+  // active turn — so a supergroup agent's card appears IN the topic the
+  // operator asked from (marko's "CRM (Brevo)"), not the operator DM — else the
+  // configured operator DMs, thread-stripped. The old code iterated `allowFrom`
+  // unconditionally, so a supergroup card could only ever reach operator DMs
+  // (the topic chat id is never in `allowFrom`) (marko, 2026-06-03).
+  const targets = resolvePermissionCardTargets()
+
+  // ONE settle across ALL targets, not one per target (reviewer F1).
+  //
+  // The in-flight flag (guard iii) exists so the reaper can't re-post a card whose
+  // previous post hasn't settled. `resolvePermissionCardTargets()` returns N
+  // targets — it ends in `allowFrom.map(...)` — and on the RE-delivery path N>1 is
+  // the COMMON case: re-delivery after a multi-hour ban is by construction past the
+  // 30-min origin-recovery window, so it falls through to the operator-DM fan-out.
+  // Clearing the flag per-target released it the moment the FIRST target settled
+  // while others were still in flight, and the next tick re-posted to all of them —
+  // a double delivery. Settle once, when every target is done.
+  const sends = targets.map(({ chatId, threadId }) => {
+    // The rich-markdown path pairs with formatPermissionCardBody (#1790) so its
+    // bold/italic render. retryWithThreadFallback: if the topic was
+    // deleted/recreated (stale thread id → 400 "message thread not found"),
+    // re-send thread-less into the main chat so the card still ARRIVES rather
+    // than vanishing.
+    // allow-raw-bot-api: wrapped in retryWithThreadFallback (retry policy); topic-aware send
+    return retryWithThreadFallback<{ message_id: number; message_thread_id?: number }>(
+      robustApiCall,
+      (tid) =>
+        bot.api.sendRichMessage(chatId, richMessage(text), {
+          reply_markup: keyboard,
+          ...(tid != null ? { message_thread_id: tid } : {}),
+        }),
+      { threadId, chat_id: chatId, verb: 'permission_request' },
+    ).then(sent => {
+      // Record the live card's (chat, message) so the reaper can strip its inline
+      // keyboard — a stale Approve button left tappable dispatches a verdict for a
+      // dead request_id (Bug 2). The entry may already be gone (operator tapped
+      // before this resolved); guard the lookup.
+      const live = pendingPermissions.get(requestId)
+      if (live && sent && typeof sent.message_id === 'number') {
+        // #2787: record where the card ACTUALLY LANDED so the confirm sweep scopes
+        // its re-delivery suspension to the real chat/topic. `sent.message_thread_id`
+        // reflects reality in all three cases: topic success → tid, main-chat /
+        // fallback → undefined.
+        const landedThreadId = sent.message_thread_id ?? undefined
+        live.cards.push({ chatId, messageId: sent.message_id, threadId: landedThreadId })
+        // The card LANDED — the operator can see and tap it, so the block is over.
+        // Drop the hold mark and reconcile the off-Telegram surface. (PR 3 also
+        // resets `startedAt` here: the TTL measures how long the operator had to
+        // answer, and until this moment they had nothing to answer.)
+        if (live.undeliverable != null) {
+          live.undeliverable = null
+          live.redeliveryFailures = 0
+          reconcileBlockedApprovals()
+          process.stderr.write(
+            `telegram gateway: permission-card RE-DELIVERED request=${requestId} ` +
+            `tool=${live.tool_name} chat=${chatId} — the operator can answer now\n`,
+          )
+        }
+        permCardStore.add({
+          requestId,
+          chatId,
+          messageId: sent.message_id,
+          startedAt: live.startedAt,
+          toolName: live.tool_name,
+          cardText: live.card_text,
+        })
+      }
+    }).catch(e => {
+      process.stderr.write(`telegram gateway: permission_request send to ${chatId} failed: ${e}\n`)
+      const live = pendingPermissions.get(requestId)
+      if (live == null) return // operator already resolved it — nothing to hold
+
+      // A card already landed on ANOTHER target, so the ask is NOT undeliverable —
+      // the operator can see and tap it (reviewer F2). Marking it held here would be
+      // a PERMANENT wedge: `selectHeldForRedelivery` skips entries that have cards,
+      // so the mark could never be cleared, and PR 3's TTL freeze would then keep
+      // the entry alive forever with the surface stuck on "blocked".
+      if (live.cards.length > 0) return
+
+      // The card did NOT land anywhere. Before this the error was logged and
+      // dropped: the entry sat with `cards: []`, the operator saw nothing, and 60
+      // minutes later the TTL sweep AUTO-DENIED an approval no human had ever been
+      // shown. Now we hold it — but only for a TRANSIENT cause. `holdReasonFor`
+      // decides; a permanent 400 (a card that will never format) still falls through
+      // to the TTL, which PR 3 makes safe by giving the no-card timeout a
+      // missed-approvals fallback.
+      const reason = holdReasonFor(e)
+      if (reason == null) return
+
+      // Bound the RATE, never the RETRY. A held entry is re-selected every tick, so a
+      // target that keeps failing would otherwise re-send every 60s forever — the
+      // amplifier this series exists to avoid. Back off instead (1m, 2m, 4m … 30m).
+      // We never STOP retrying: a terminal give-up would strand the card even after
+      // the channel recovered, and because turnInFlightForGate() holds the inbound
+      // gate while a permission is pending, that would silently buffer the operator's
+      // messages forever. Escalate the surface, never the verdict — and never abandon
+      // the card.
+      const failures = (live.redeliveryFailures ?? 0) + 1
+      live.redeliveryFailures = failures
+      const now = Date.now()
+      // A flood-wait carries Telegram's own window end; everything else backs off.
+      const retryableAt = isFloodWaitActiveError(e) ? e.untilTs : now + heldRetryBackoffMs(failures)
+      // `since` is set ONCE — it is when the block began, not when we last retried.
+      live.undeliverable = { since: live.undeliverable?.since ?? now, retryableAt, reason }
+      // Reconcile the shared surface SYNCHRONOUSLY, here in the failure handler — not
+      // on the 60s reaper tick. The operator is locked out of Telegram; this record is
+      // the only way they learn an agent is blocked, so it must be live in under a
+      // second, not up to a minute.
+      reconcileBlockedApprovals()
+      process.stderr.write(
+        `telegram gateway: permission-card HELD (undeliverable) request=${requestId} ` +
+        `tool=${live.tool_name} reason=${reason} attempt=${failures} ` +
+        `retryable_at=${new Date(retryableAt).toISOString()}` +
+        ` — approval is held, NOT denied; re-delivering when the channel returns ` +
+        `(backoff ${Math.round(heldRetryBackoffMs(failures) / 60000)}m)\n`,
+      )
+    })
+  })
+
+  // Settle ONCE, after every target. `allSettled` never rejects, so the flag is
+  // always released — including when `targets` is empty (no active turn AND no
+  // configured operator DM), in which case `sends` is [] and this resolves at once.
+  void Promise.allSettled(sends).finally(() => {
+    heldCardsInFlight.delete(requestId)
+  })
+}
+
+/**
+ * Request ids whose re-delivery is mid-flight. Guard (iii) against
+ * double-delivery: the 60s reaper must not re-post a card whose previous
+ * re-post hasn't settled yet (a slow send would otherwise be re-issued every
+ * tick). Cleared in postPermissionCard's `.finally`.
+ */
+const heldCardsInFlight = new Set<string>()
+
+/**
+ * Re-deliver held permission cards once the flood window closes (#3084
+ * follow-up, PR 2).
+ *
+ * The whole point of holding rather than auto-denying is that the ask comes
+ * BACK. This is the half that brings it back.
+ *
+ * `selectHeldForRedelivery` owns the guards (window closed, held, no landed
+ * card, not in flight, per-tick cap). `robustApiCall`'s own pre-call probe is a
+ * further, independent short-circuit downstream — if the window re-opens
+ * between selection and send, the send refuses itself and the entry is simply
+ * re-marked with the longer window.
+ *
+ * The per-tick cap is the ban-safety property: a backlog of held cards must not
+ * BURST the instant the window closes, because that burst is the one realistic
+ * way this design could re-earn the ban it exists to survive. Deferred ids are
+ * LOGGED, never silently dropped — they go out on the next tick.
+ */
+function sweepHeldPermissionCards(): void {
+  const remaining = probeFloodWaitRemainingMs()
+  const { send, deferred } = selectHeldForRedelivery(pendingPermissions.entries(), {
+    floodRemainingMs: remaining,
+    inFlight: heldCardsInFlight,
+    now: Date.now(),
+  })
+  if (send.length === 0) return
+
+  process.stderr.write(
+    `telegram gateway: flood window closed — re-delivering ${send.length} held ` +
+    `permission card(s)` +
+    (deferred.length > 0
+      ? `; ${deferred.length} deferred to the next tick by the per-tick cap ` +
+        `(${deferred.join(', ')}) — deferred, NOT dropped`
+      : '') + '\n',
+  )
+  for (const requestId of send) {
+    const pend = pendingPermissions.get(requestId)
+    if (pend == null) continue
+    heldCardsInFlight.add(requestId)
+    postPermissionCard(requestId, pend)
+  }
+}
+
 // 60-second sweep drops anything past its documented TTL.
 const pendingStateReaper = setInterval(() => {
   const now = Date.now()
+  // #3084 follow-up — bring held cards BACK the moment the channel reopens.
+  // Runs before the TTL sweep below so a card that can be re-delivered on this
+  // tick is re-delivered, not considered for expiry.
+  sweepHeldPermissionCards()
   // OAuth-code state grouped first (pinned by secret-detect-oauth-code.test.ts).
   pendingReauthFlows.sweep(now)
   for (const [k, v] of pendingAuthAddFlows) {
@@ -10318,7 +10541,8 @@ const ipcServer: IpcServer = createIpcServer({
     // `card_text` is retained so the TTL reaper can re-edit the SAME body
     // with a "timed out" footer while stripping the keyboard atomically
     // (Bug 2 fix #1) — the reaper has no grammy ctx to read the live text.
-    pendingPermissions.set(requestId, { tool_name: toolName, description, input_preview: inputPreview, startedAt: Date.now(), card_text: text, cards: [] })
+    const pendEntry = { tool_name: toolName, description, input_preview: inputPreview, startedAt: Date.now(), card_text: text, cards: [] }
+    pendingPermissions.set(requestId, pendEntry)
     // Compact action row: ❌ Deny · ✅ Allow · 🔁 Always… — the scope of an
     // "always" grant stays hidden until the operator taps "🔁 Always…",
     // which swaps the row for a scope choice (this file / any file ⚠️). The
@@ -10326,125 +10550,15 @@ const ipcServer: IpcServer = createIpcServer({
     // rule for this tool; unknown tools get the two-button row only. "Allow"
     // itself auto-grants a 30-min window for narrow non-destructive scopes
     // (decided in the allow handler), so there is no separate time-box button.
-    const showAlways = resolveScopedAllowChoices(toolName, inputPreview) != null
-    const keyboard = buildPermissionActionRow(requestId, showAlways)
-    // Route the card to the SAME place the post-verdict resume message
-    // lands (resolvePermissionCardTargets): the ORIGINATING chat+topic when
-    // there's an active turn — so a supergroup agent's card appears IN the
-    // topic the operator asked from (marko's "CRM (Brevo)"), not the
-    // operator DM — else the configured operator DMs, thread-stripped. The
-    // old code iterated `allowFrom` unconditionally, so a supergroup card
-    // could only ever reach operator DMs (the topic chat id is never in
-    // `allowFrom`) (marko, 2026-06-03).
+    // Captured BEFORE the send: the status-reaction parking below needs the
+    // turn that raised this card, and `currentTurn` can be re-pointed by a
+    // concurrent inbound while the send is in flight.
     const activeTurn = currentTurn
-    const targets = resolvePermissionCardTargets()
-    for (const { chatId, threadId } of targets) {
-      // The rich-markdown path pairs with formatPermissionCardBody (#1790)
-      // so its bold/italic render. retryWithThreadFallback: if the topic was
-      // deleted/recreated (stale thread id → 400 "message thread not
-      // found"), re-send thread-less into the main chat so the card still
-      // ARRIVES rather than vanishing → 10-min TTL auto-deny → wedge.
-      // allow-raw-bot-api: wrapped in retryWithThreadFallback (retry policy); topic-aware send
-      void retryWithThreadFallback<{ message_id: number; message_thread_id?: number }>(
-        robustApiCall,
-        (tid) =>
-          bot.api.sendRichMessage(chatId, richMessage(text), {
-            reply_markup: keyboard,
-            ...(tid != null ? { message_thread_id: tid } : {}),
-          }),
-        { threadId, chat_id: chatId, verb: 'permission_request' },
-      ).then(sent => {
-        // Record the live card's (chat, message) so the TTL reaper can strip
-        // its inline keyboard on auto-deny — a stale Approve button left
-        // tappable dispatches a verdict for a dead request_id (Bug 2). The
-        // entry may already be gone (operator tapped before this resolved);
-        // guard the lookup.
-        const pend = pendingPermissions.get(requestId)
-        if (pend && sent && typeof sent.message_id === 'number') {
-          // #2787: record where the card ACTUALLY LANDED so the confirm sweep
-          // scopes its re-delivery suspension to the real chat/topic. When
-          // retryWithThreadFallback hit THREAD_NOT_FOUND (stale/renumbered
-          // topic) it re-sent thread-less into the main chat — the returned
-          // Message then carries no message_thread_id, so we must record the
-          // landed topic (undefined → suspend by bare chatId), NOT the stale
-          // requested `threadId`. Keying suspension on the stale topic would
-          // leave the main-chat card unsuspended (a re-deliver could clobber
-          // the live card) while needlessly suspending a topic that holds
-          // nothing. `sent.message_thread_id` reflects reality in all three
-          // cases: topic success → tid, main-chat / fallback → undefined.
-          const landedThreadId = sent.message_thread_id ?? undefined
-          pend.cards.push({ chatId, messageId: sent.message_id, threadId: landedThreadId })
-          // The card LANDED — the operator can see and tap it, so the block is
-          // over. Drop the hold mark and clear the off-Telegram surface. (PR 3
-          // also resets `startedAt` here: the TTL measures how long the operator
-          // had to answer, and until this moment they had nothing to answer.)
-          if (pend.undeliverable != null) {
-            pend.undeliverable = null
-            reconcileBlockedApprovals()
-          }
-          permCardStore.add({
-            requestId,
-            chatId,
-            messageId: sent.message_id,
-            startedAt: pend.startedAt,
-            toolName: pend.tool_name,
-            cardText: pend.card_text,
-          })
-        }
-      }).catch(e => {
-        process.stderr.write(`telegram gateway: permission_request send to ${chatId} failed: ${e}\n`)
-        // #3084 follow-up — the card did NOT land. Before this, the error was
-        // logged and dropped: the entry sat with `cards: []`, the operator saw
-        // nothing, and 60 minutes later the TTL sweep AUTO-DENIED an approval
-        // no human had ever been shown (and skipped the #2862 missed-approval
-        // re-offer, which is anchored on `cards[0]`). That is the leash
-        // deciding for the operator. Now we record the block instead.
-        //
-        // Only a FLOOD_WAIT_ACTIVE failure is a *hold*: it means the channel
-        // itself is shut (per-bot-token ban — nothing can land until `untilTs`)
-        // and the ask is deliverable later. Any other error (a 400, a malformed
-        // card) is a real failure of THIS send and keeps today's behaviour —
-        // holding on those would park the agent forever on a card that will
-        // never format correctly.
-        if (!isFloodWaitActiveError(e)) return
-        const pend = pendingPermissions.get(requestId)
-        if (pend == null) return // operator already resolved it — nothing to hold
-        // A card may already have LANDED on another target (the send fans out
-        // to several chats/topics and only THIS one hit the flood wall). The
-        // operator can see and tap the landed card, so the request is not
-        // blocked — marking it here would write a false blocked record AND
-        // make it eligible for a duplicate re-delivery. Same guard the
-        // redelivery selector applies (guard ii in selectHeldForRedelivery).
-        if (pend.cards.length > 0) return
-        const now = Date.now()
-        // Re-marking is idempotent and self-correcting: if the window is
-        // re-extended by a fresh 429, `computeFloodWait` only ever grows
-        // `untilTs`, so a later mark carries the longer window. `since` is
-        // "when we FIRST failed" (the UndeliverableMark contract), so a
-        // re-failure preserves the original timestamp — resetting it would
-        // churn the oldest-held-wins reconcile between records.
-        pend.undeliverable = {
-          since: pend.undeliverable?.since ?? now,
-          retryableAt: e.untilTs,
-          reason: 'flood_wait',
-        }
-        // Write the shared surface SYNCHRONOUSLY, here in the failure handler —
-        // not on the 60s reaper tick. The operator is locked out of Telegram;
-        // the off-Telegram surface is the only way they learn an agent is
-        // blocked, so it has to be live in under a second, not up to a minute.
-        // Metadata only: `action` is naturalAction() text. NEVER input_preview —
-        // this file is world-readable (0644) so switchroom-web can read it.
-        // Reconcile rather than write directly: several permissions can be held
-        // at once (parallel tool calls), and the surface must reflect all of
-        // them, not just the last one to fail.
-        reconcileBlockedApprovals()
-        process.stderr.write(
-          `telegram gateway: permission-card HELD (undeliverable) request=${requestId} ` +
-          `tool=${pend.tool_name} reason=flood_wait retryable_at=${new Date(e.untilTs).toISOString()} ` +
-          `— approval is held, NOT denied; will re-deliver when the window closes\n`,
-        )
-      })
-    }
+    // #3084 follow-up — the send now lives in postPermissionCard() so the
+    // reaper can RE-DRIVE it when a flood window closes. This is the first
+    // delivery attempt; if it fails against an open ban the entry is marked
+    // undeliverable and held, never auto-denied.
+    postPermissionCard(requestId, pendEntry)
     // Park the turn's status reaction on 🙏 (awaiting your tap) and
     // suspend the stall watchdog — a turn blocked on the operator is not
     // stalled, so it must not degrade to 🥱/😨 while the card sits

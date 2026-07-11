@@ -163,7 +163,7 @@ describe('gateway boot-sweep grace period', () => {
 
 describe('re-armed pending card re-holds the inbound gate (#2840)', () => {
   it('turnInFlightForGate counts pending approvals', () => {
-    const gate = slice(GATEWAY, 'function turnInFlightForGate()', 1200)
+    const gate = slice(GATEWAY, 'function turnInFlightForGate()', 2400)
     expect(gate).toMatch(/pendingPermissions\.size > 0/)
   })
   it('re-arm restores a pendingPermissions entry → gate held automatically', () => {
