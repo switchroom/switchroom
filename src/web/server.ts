@@ -57,6 +57,10 @@ import {
 } from "./api.js";
 import type { CachedResult } from "./cache.js";
 import { handleGetFleetHealth } from "./fleet-health-read.js";
+import {
+  handleGetBlockedApprovals,
+  handleGetBlockedApprovalsStatus,
+} from "./blocked-approvals-read.js";
 import { fetchAgentLogsViaHostd } from "./hostd-read-client.js";
 import { handleWebhookIngest } from "./webhook-handler.js";
 import { loadEdgeSecret } from "./webhook-edge.js";
@@ -592,6 +596,27 @@ function parseRoute(
     return { handler: "getApprovals", params: {} };
   }
 
+  // GET /api/blocked-approvals — agents HELD on an approval whose card could
+  // not be delivered to Telegram (flood ban, API outage). The agent never
+  // auto-approves and never auto-denies, so it waits indefinitely; this is
+  // the surface that makes that wait VISIBLE without Telegram (#3084).
+  // Bare ARRAY, honest empty `[]` — the Hermes Desktop adapter consumes this
+  // API and a shape surprise crashes it. Degrades to `[]` until the
+  // gateway-side record producer lands.
+  if (method === "GET" && pathname === "/api/blocked-approvals") {
+    return { handler: "getBlockedApprovals", params: {} };
+  }
+
+  // GET /api/blocked-approvals/status — out-of-band companion carrying the
+  // count of records we FAILED to read (0600, IO error). It cannot ride on
+  // the bare-array endpoint above without breaking the Hermes contract, and
+  // it must not be synthesized as a fake row in that array. Without it the
+  // page cannot tell "nothing is blocked" from "I could not look", and would
+  // print a reassuring all-clear over a held agent.
+  if (method === "GET" && pathname === "/api/blocked-approvals/status") {
+    return { handler: "getBlockedApprovalsStatus", params: {} };
+  }
+
   // GET /api/fleet-health — job-spec-anchored issue tracker (RFC
   // fleet-health.md). Reads the owner agent's health ledger, ranked
   // worst-first by priority_score. Read-only; degrades to an empty state
@@ -962,6 +987,17 @@ export function startWebServer(
           case "getApprovals":
             return (async () =>
               jsonResponse(withStamp(await cachedApprovals())))();
+
+          case "getBlockedApprovals":
+            // Local, always-available read of the blocked-approval records.
+            // Not cached, same reasoning as getFleetHealth (small local file
+            // reads) — and a held agent is exactly the thing you never want
+            // to see through a stale cache. Bare array response, no stamp
+            // wrap (see getAgents / getAccounts).
+            return jsonResponse(handleGetBlockedApprovals());
+
+          case "getBlockedApprovalsStatus":
+            return jsonResponse(handleGetBlockedApprovalsStatus());
 
           case "getFleetHealth":
             // Local, always-available read of the health ledger. Not routed
