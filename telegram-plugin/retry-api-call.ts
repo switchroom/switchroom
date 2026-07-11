@@ -371,3 +371,34 @@ export function isMessageTooLongError(err: unknown): boolean {
     d.includes('text is too long')
   )
 }
+
+/**
+ * True when Telegram rejected a `sendPhoto` / `sendMediaGroup` because the
+ * image is unusable AS A PHOTO — dimensions out of range (Telegram caps
+ * photos at width+height ≤ 10000 and aspect ratio ≤ 20), the file can't be
+ * saved as a photo, or it exceeds the photo-path size ceiling (~10MB;
+ * documents allow ~50MB). A tall phone screenshot is the canonical trigger
+ * (PHOTO_INVALID_DIMENSIONS in the #klanker 2026-07-10 incident).
+ *
+ * These 400s are deliberately NOT swallowed or retried by `retryApiCall`
+ * (only not-modified / not-found / thread-not-found are) — they surface to
+ * the caller, which recovers by re-sending the SAME file as a document
+ * (`sendDocument`) so the user still receives it. Same "caller-level
+ * fallback" shape as the THREAD_NOT_FOUND and isHtmlParseRejectError
+ * contracts above.
+ */
+export function isPhotoDimensionRejectError(err: unknown): boolean {
+  if (!(err instanceof GrammyError) || err.error_code !== 400) return false
+  const d = (err.description || '').toLowerCase()
+  return (
+    d.includes('photo_invalid_dimensions') ||
+    d.includes('photo_save_file_invalid') ||
+    d.includes('photo dimensions') ||
+    d.includes('image_process_failed') ||
+    // size-driven rejections of the photo path
+    d.includes('photo is too big') ||
+    d.includes('too big for a photo') ||
+    d.includes('image is too big') ||
+    d.includes('file is too big')
+  )
+}
