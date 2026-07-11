@@ -69,7 +69,7 @@ import {
 } from './config-snapshot.js'
 import { join } from 'path'
 import { bootCardChatKey, loadBootCardMsgId, saveBootCardMsgId } from './boot-card-msgid.js'
-import { suppressNonEssentialSendMs } from '../flood-circuit-breaker.js'
+import { nonEssentialSendSuppression } from '../flood-circuit-breaker.js'
 import { loadConfig as _loadSwitchroomConfig } from '../../src/config/loader.js'
 import { resolveAgentConfig as _resolveAgentConfig } from '../../src/config/merge.js'
 
@@ -669,11 +669,18 @@ export async function startBootCard(
   // keeps the agent mute for longer. Skip loudly (log) and return a no-op.
   if (opts.floodStatePath != null) {
     const now = (opts.nowMs ?? Date.now)()
-    const remainingMs = suppressNonEssentialSendMs(opts.floodStatePath, now)
-    if (remainingMs > 0) {
+    const s = nonEssentialSendSuppression(opts.floodStatePath, now)
+    if (s.suppress) {
+      // #3106: two reasons, and the operator must be told WHICH. A blind
+      // breaker (unreadable marker) is a bug in the deployment, not a ban.
       logger(
-        `telegram gateway: boot-card: SUPPRESSED — Telegram flood-wait active for ~${Math.round(remainingMs / 1000)}s; ` +
-          `not posting a restart card into the open ban window (issue #2923)\n`,
+        s.reason === 'blind'
+          ? `telegram gateway: boot-card: SUPPRESSED — flood-breaker is BLIND: cannot read ` +
+              `${opts.floodStatePath} (${s.error}). Cannot rule out an open Telegram ban, so the ` +
+              `restart card is held back rather than posted into one. Fix the marker's ` +
+              `ownership/mode (issue #3106)\n`
+          : `telegram gateway: boot-card: SUPPRESSED — Telegram flood-wait active for ~${Math.round(s.remainingMs / 1000)}s; ` +
+              `not posting a restart card into the open ban window (issue #2923)\n`,
       )
       return { messageId: -1, complete: () => {} }
     }
