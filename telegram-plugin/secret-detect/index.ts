@@ -11,8 +11,10 @@
  *      PEM blocks, CLI flags)
  *   3. KEY=VALUE heuristic with Shannon-entropy gate (≥ 4.0)
  *
- * Big inputs (>32 KB) are chunked into 16 KB windows with 1 KB overlap
- * (chunker.ts) for ReDoS bounding; we dedupe by byte-offset after.
+ * Big inputs (>32 KB) are chunked into 16 KB windows with 8 KB overlap
+ * (chunker.ts) for ReDoS bounding; we dedupe by byte-offset after. The
+ * overlap must exceed the largest single secret (an 8192-bit RSA PEM is
+ * ~6.5 KB) so a boundary-straddling key is never split across windows.
  *
  * Nearby test/mock/example/fixture/dummy markers (within 40 chars) demote
  * a hit to `suppressed: true`. The caller decides what that means (our
