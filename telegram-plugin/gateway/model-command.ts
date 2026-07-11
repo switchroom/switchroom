@@ -506,6 +506,26 @@ export const SR_MODEL_ALIASES: Record<string, string> = {
 }
 
 /** Expand a short alias (case-insensitive) to its full sr-* id, or return the original. */
+/**
+ * #3042 review blocker 2a: can `token` be trusted for a DURABLE, boot-applied
+ * `.session-model` persist WITHOUT a live confirmation from claude?
+ *
+ * A queued typed `/model <arg>` that is persisted at shutdown was never
+ * validated by claude's picker — and under the keep-by-default boot (#3039)
+ * a garbage-but-shape-valid token (e.g. `claude-nonexistnet-9`) would make
+ * every boot run `claude --model <garbage>` with the gateway dead. Only
+ * tokens with a switchroom-known meaning are offline-trustable: the static
+ * Claude aliases (claude resolves them itself) and the curated sr-* alias
+ * TARGETS (present in the LiteLLM config by construction). Full `claude-*` /
+ * arbitrary `sr-*` ids typed by hand are refused — they need the live
+ * session to verify, so the operator is asked to re-issue after boot.
+ */
+export function isOfflineTrustedModelToken(token: string): boolean {
+  if ((MODEL_ALIASES as readonly string[]).includes(token)) return true
+  if (token in SR_MODEL_ALIASES) return true
+  return Object.values(SR_MODEL_ALIASES).includes(token)
+}
+
 export function expandSrAlias(arg: string): string {
   return SR_MODEL_ALIASES[arg.toLowerCase()] ?? arg
 }

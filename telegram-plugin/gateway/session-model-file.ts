@@ -139,6 +139,10 @@ export function readSessionModelFile(agentDir: string): SessionModelRecord | nul
 export function clearSessionModelFile(agentDir: string): void {
   try {
     rmSync(join(agentDir, SESSION_MODEL_FILE), { force: true })
+    // #3042 item 4: also drop the kept-alert dedup sentinel so a future
+    // override of the same name re-alerts on its first kept boot.
+    rmSync(join(agentDir, '.session-model-kept-notified'), { force: true })
+    rmSync(join(agentDir, '.session-model-boot-attempts'), { force: true })
   } catch {
     /* best-effort */
   }

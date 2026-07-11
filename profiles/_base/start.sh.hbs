@@ -1141,7 +1141,7 @@ if [ -f "{{agentDir}}/.session-model" ]; then
   if [ -n "$_sm_revert" ]; then
     # Explicit fresh revert intent — the ONLY boot path that clears a valid
     # override by design (#3039). Everything else keeps.
-    rm -f "{{agentDir}}/.session-model"
+    rm -f "{{agentDir}}/.session-model" "{{agentDir}}/.session-model-kept-notified"
     _sm_why="${_sm_reason:-explicit revert intent}"
     echo "session-model: reverting to configured default '$_EFFECTIVE_MODEL' — $_sm_why (session override '$_sm_model' cleared)" >&2
     printf 'Session model override `%s` was cleared as requested (%s) — this relaunch booted the configured default `%s`. Re-issue /model %s to switch back.\n' "$_sm_model" "$_sm_why" "$_EFFECTIVE_MODEL" "$_sm_model" > "{{agentDir}}/.session-model-alert" 2>/dev/null || true
@@ -1157,14 +1157,14 @@ if [ -f "{{agentDir}}/.session-model" ]; then
   elif [ "$(printf '%s' "$_sm_model" | wc -c)" -eq 0 ] || [ "$(printf '%s' "$_sm_model" | wc -l)" -ne 0 ] || ! printf '%s' "$_sm_model" | grep -Eq '^[A-Za-z0-9][]A-Za-z0-9._[/-]{0,99}$'; then
     # Invalid carrier (#3039): fall back to the configured default AND tell
     # the operator once — never a silent stderr-only drop.
-    rm -f "{{agentDir}}/.session-model"
+    rm -f "{{agentDir}}/.session-model" "{{agentDir}}/.session-model-kept-notified"
     echo "session-model: ignoring malformed .session-model (failed shape gate) — using configured default '$_EFFECTIVE_MODEL'" >&2
     printf 'Your saved session model override could not be read (invalid or corrupt), so the agent booted on its configured default `%s`. Re-issue /model <name> if you want a different model.\n' "$_EFFECTIVE_MODEL" > "{{agentDir}}/.session-model-alert" 2>/dev/null || true
   elif [ "$_sm_cfg" != "$_EFFECTIVE_MODEL" ]; then
     # switchroom.yaml `model:` changed since the switch → the override is
     # against a default that no longer exists (it may name a retired model).
     # Invalidate + announce once (#3039 invalid-carrier fallback).
-    rm -f "{{agentDir}}/.session-model"
+    rm -f "{{agentDir}}/.session-model" "{{agentDir}}/.session-model-kept-notified"
     echo "session-model: configured default changed ('$_sm_cfg' → '$_EFFECTIVE_MODEL') — clearing session override '$_sm_model'" >&2
     printf 'The configured default model changed (`%s` → `%s`), so your session override to `%s` was cleared — the agent booted on the new configured default. Re-issue /model %s if you still want it.\n' "$_sm_cfg" "$_EFFECTIVE_MODEL" "$_sm_model" "$_sm_model" > "{{agentDir}}/.session-model-alert" 2>/dev/null || true
   else
@@ -1186,12 +1186,55 @@ if [ -f "{{agentDir}}/.session-model" ]; then
     esac
     if [ "$_EFFECTIVE_MODEL" = "$_sm_model" ]; then
       echo "session-model: keeping session override '$_sm_model' across this relaunch${_sm_reason:+ ($_sm_reason)}" >&2
-      printf 'Session model override `%s` kept across this relaunch%s. It persists across restarts and deploys; /model default clears it.\n' "$_sm_model" "${_sm_reason:+ ($_sm_reason)}" > "{{agentDir}}/.session-model-alert" 2>/dev/null || true
+      # #3042 item 4: notify the chat ONCE per kept value — a watchdog bounce
+      # loop must not storm the operator with identical "kept" alerts. The
+      # sentinel is cleared on every path that clears the override.
+      if [ "$(cat "{{agentDir}}/.session-model-kept-notified" 2>/dev/null || true)" != "$_sm_model" ]; then
+        printf 'Session model override `%s` kept across this relaunch%s. It persists across restarts and deploys; /model default clears it.\n' "$_sm_model" "${_sm_reason:+ ($_sm_reason)}" > "{{agentDir}}/.session-model-alert" 2>/dev/null || true
+        printf '%s\n' "$_sm_model" > "{{agentDir}}/.session-model-kept-notified" 2>/dev/null || true
+      fi
     fi
   fi
   unset _smf _sm_model _sm_cfg _sm_ts
 fi
 unset _sm_keep _sm_reason _sm_revert
+
+# --- Override crashloop self-heal (#3042 review blocker 2b) ---
+#
+# Under keep-by-default an invalid-but-shape-valid persisted model (a typo
+# persisted at shutdown, or a confirmed model later retired) would make every
+# boot exec `claude --model <bad>` and die with the gateway dead — recovery
+# would need a host shell. Detect the loop from inside: when an override is
+# ACTIVE, stamp a boot-attempt counter just before exec; a healthy run makes
+# the next boot arrive much later (stamp stale → counter resets), while a
+# fast crashloop re-enters here within seconds (docker backoff caps ≈1 min).
+# Three consecutive fast boots with the same override → clear the carrier,
+# boot the configured default, and alert the chat once.
+_SM_CFG_RECORDED="$(cat "{{agentDir}}/.configured-default-model" 2>/dev/null | tr -d '[:space:]' || true)"
+if [ -n "$_SM_CFG_RECORDED" ] && [ "$_EFFECTIVE_MODEL" != "$_SM_CFG_RECORDED" ] && [ -f "{{agentDir}}/.session-model" ]; then
+  _bl_now="$(date +%s)"
+  _bl_cnt=0
+  _bl_prev=0
+  if [ -f "{{agentDir}}/.session-model-boot-attempts" ]; then
+    read -r _bl_cnt _bl_prev < "{{agentDir}}/.session-model-boot-attempts" 2>/dev/null || true
+  fi
+  case "$_bl_cnt" in (''|*[!0-9]*) _bl_cnt=0;; esac
+  case "$_bl_prev" in (''|*[!0-9]*) _bl_prev=0;; esac
+  if [ $(( _bl_now - _bl_prev )) -lt 150 ]; then _bl_cnt=$(( _bl_cnt + 1 )); else _bl_cnt=1; fi
+  if [ "$_bl_cnt" -ge 3 ]; then
+    echo "session-model: override '$_EFFECTIVE_MODEL' appears to be crashlooping the session ($_bl_cnt fast boots) — clearing it, booting configured default '$_SM_CFG_RECORDED'" >&2
+    printf 'Session model override `%s` was cleared automatically: the agent failed to stay up %s boots in a row with it active (the model may be invalid or retired). Booting the configured default `%s`. Re-issue /model <name> if you want a different model.\n' "$_EFFECTIVE_MODEL" "$_bl_cnt" "$_SM_CFG_RECORDED" >> "{{agentDir}}/.session-model-alert" 2>/dev/null || true
+    rm -f "{{agentDir}}/.session-model" "{{agentDir}}/.session-model-boot-attempts" "{{agentDir}}/.session-model-kept-notified"
+    _EFFECTIVE_MODEL="$_SM_CFG_RECORDED"
+  else
+    printf '%s %s\n' "$_bl_cnt" "$_bl_now" > "{{agentDir}}/.session-model-boot-attempts" 2>/dev/null || true
+  fi
+  unset _bl_now _bl_cnt _bl_prev
+else
+  # No active override this boot — a stale counter must not bite a future one.
+  rm -f "{{agentDir}}/.session-model-boot-attempts"
+fi
+unset _SM_CFG_RECORDED
 
 # --- Session effort resolution (durable .session-effort, #3039) ---
 #

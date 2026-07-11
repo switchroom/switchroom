@@ -21,6 +21,7 @@ import {
   isSrModel,
   isClaudeModel,
   isBusyRefusalText,
+  isOfflineTrustedModelToken,
   MODEL_ALIASES,
   type ModelCommandDeps,
 } from "../gateway/model-command.js";
@@ -1339,5 +1340,23 @@ describe("isBusyRefusalText (#3039)", () => {
     expect(isBusyRefusalText("⏺ Set model to Opus 4.8")).toBe(false);
     expect(isBusyRefusalText("✅ `/effort high` — Set effort level to high")).toBe(false);
     expect(isBusyRefusalText("❌ Switch to opus failed: tmux session not found")).toBe(false);
+  });
+});
+
+
+describe("isOfflineTrustedModelToken (#3042 blocker 2a)", () => {
+  it("trusts static Claude aliases and curated sr-* alias names/targets", () => {
+    for (const a of MODEL_ALIASES) expect(isOfflineTrustedModelToken(a)).toBe(true);
+    // Curated sr-* aliases resolve by construction (present in the LiteLLM config).
+    const [alias, target] = Object.entries(SR_MODEL_ALIASES)[0];
+    expect(isOfflineTrustedModelToken(alias)).toBe(true);
+    expect(isOfflineTrustedModelToken(target)).toBe(true);
+  });
+
+  it("refuses hand-typed full ids — shape-valid garbage must never reach a boot carrier unconfirmed", () => {
+    expect(isOfflineTrustedModelToken("claude-nonexistnet-9")).toBe(false);
+    expect(isOfflineTrustedModelToken("claude-opus-4-8")).toBe(false); // real but unverifiable offline
+    expect(isOfflineTrustedModelToken("sr-made-up/model")).toBe(false);
+    expect(isOfflineTrustedModelToken("")).toBe(false);
   });
 });

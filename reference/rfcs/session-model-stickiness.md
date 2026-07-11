@@ -50,6 +50,32 @@ rows below. The new contract:
   ack card says "saved — applies as the agent boots" instead of "re-issue".
   Only an unresolvable `mdl:s:<tag>` menu selection still asks for a
   re-issue.
+- **Unconfirmed queued tokens are gated before durable persist** (#3042
+  blocker 2a): a queued typed `/model <arg>` persisted at shutdown was never
+  validated by claude, so only offline-trustable tokens (static Claude
+  aliases, curated sr-* alias targets — `isOfflineTrustedModelToken`) are
+  written to the carrier; anything else gets an honest "couldn't verify —
+  re-issue after restart" card. Belt-and-braces, start.sh self-heals a
+  crashlooping override (#3042 blocker 2b): three consecutive fast boots
+  (<150s apart, tracked in `.session-model-boot-attempts`) with an override
+  active clear the carrier, boot the configured default, and alert once —
+  this also covers a confirmed model later retired upstream.
+- **Kept-alert dedup** (#3042 item 4): the "override kept across this
+  relaunch" chat notice fires once per kept value
+  (`.session-model-kept-notified` sentinel), so a watchdog bounce loop
+  cannot storm the chat; every clearing path drops the sentinel.
+- **Version skew** (#3042 item 3): `.session-effort` boot resolution and the
+  crashloop self-heal live in the RE-SCAFFOLDED `start.sh` — until the
+  operator runs `switchroom apply` (or the agent is re-scaffolded), "applies
+  at boot" holds only for the model path on switchroom-managed bounces; a
+  persisted effort override is honored from the first boot on the new
+  scaffold.
+- **Quota-failover interaction** (#3042 item 7): keep-by-default means a
+  pinned expensive model now survives quota-exhaustion restarts indefinitely
+  — the fleet-fallback flow still switches the LIVE session, but the boot
+  carrier re-asserts the pinned model on the next relaunch until the user
+  runs `/model default`. Operators relying on exhaustion restarts to shed an
+  expensive pin must clear it explicitly.
 - **No user-visible dead-ends.** The idle drain re-enqueues on a
   turn-in-flight race or a handler busy-refusal instead of stamping the
   refusal onto the ack card; the mid-turn `/model` menu renders a static

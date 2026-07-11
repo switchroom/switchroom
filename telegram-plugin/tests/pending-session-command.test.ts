@@ -29,6 +29,8 @@ import {
   drainCapDecision,
   shutdownResolutionActions,
   resolveForRestart,
+  drainTakenCommands,
+  type DrainIo,
   ackText,
   supersededText,
   restartSupersededText,
@@ -250,5 +252,71 @@ describe('restartSupersededText', () => {
     expect(t).toContain('restarting')
     expect(t).toContain('/effort max')
     expect(t).toContain('`max`')
+  })
+})
+
+
+// ─── #3042 blocker 1: drain loss-safety across a two-command batch ───────────
+
+describe('drainTakenCommands (#3042 blocker 1: an early stop must not drop the rest of the batch)', () => {
+  function makeIo(overrides: Partial<DrainIo> = {}) {
+    const events: string[] = []
+    const io: DrainIo = {
+      restartPending: () => false,
+      turnInFlight: () => false,
+      apply: async c => { events.push(`apply:${c.kind}`); return `✅ ${c.kind} done` },
+      isBusyRefusal: t => t.includes('BUSY'),
+      resolveForRestartText: c => `persisted:${c.kind}`,
+      editCard: async (c, text) => { events.push(`edit:${c.kind}:${text}`) },
+      reEnqueue: c => { events.push(`requeue:${c.kind}`) },
+      failureText: (c, err) => `fail:${c.kind}:${(err as Error).message}`,
+      ...overrides,
+    }
+    return { io, events }
+  }
+  const batch = () => [cmd({ kind: 'model' }), cmd({ kind: 'effort', arg: 'high', targetLabel: 'high' })]
+
+  it('happy path applies and confirms both commands in order', async () => {
+    const { io, events } = makeIo()
+    await drainTakenCommands(batch(), io)
+    expect(events).toEqual(['apply:model', 'edit:model:✅ model done', 'apply:effort', 'edit:effort:✅ effort done'])
+  })
+
+  it('turn races in before the FIRST command → BOTH are re-enqueued, none applied or confirmed', async () => {
+    const { io, events } = makeIo({ turnInFlight: () => true })
+    await drainTakenCommands(batch(), io)
+    expect(events).toEqual(['requeue:model', 'requeue:effort'])
+  })
+
+  it('turn races in before the SECOND command → first applied, second re-enqueued (not lost)', async () => {
+    let calls = 0
+    const { io, events } = makeIo({ turnInFlight: () => ++calls > 1 })
+    await drainTakenCommands(batch(), io)
+    expect(events).toEqual(['apply:model', 'edit:model:✅ model done', 'requeue:effort'])
+  })
+
+  it('handler busy-refusal on the FIRST command → the refusal never reaches the ack card and BOTH are re-enqueued', async () => {
+    const { io, events } = makeIo({
+      apply: async c => (c.kind === 'model' ? 'BUSY — mid-turn' : '✅ effort done'),
+    })
+    await drainTakenCommands(batch(), io)
+    expect(events).toEqual(['requeue:model', 'requeue:effort'])
+  })
+
+  it('apply throwing on the first command does NOT stop the second (failure is per-command)', async () => {
+    const { io, events } = makeIo({
+      apply: async c => {
+        if (c.kind === 'model') throw new Error('boom')
+        return '✅ effort done'
+      },
+    })
+    await drainTakenCommands(batch(), io)
+    expect(events).toEqual(['edit:model:fail:model:boom', 'edit:effort:✅ effort done'])
+  })
+
+  it('restart pending → every command is resolved via the carriers, none applied live', async () => {
+    const { io, events } = makeIo({ restartPending: () => true })
+    await drainTakenCommands(batch(), io)
+    expect(events).toEqual(['edit:model:persisted:model', 'edit:effort:persisted:effort'])
   })
 })

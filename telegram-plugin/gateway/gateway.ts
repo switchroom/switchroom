@@ -398,6 +398,7 @@ import {
   expandSrAlias,
   isSrModel,
   isBusyRefusalText,
+  isOfflineTrustedModelToken,
   type ModelMenuDeps,
   type ModelCommandDeps,
   type ModelMenuReply,
@@ -420,7 +421,7 @@ import {
   readSessionEffortFile,
 } from './session-model-file.js'
 import { discoverModels, selectModel } from '../../src/agents/model-picker.js'
-import { resolveMainModel } from '../../src/agents/scaffold.js'
+import { resolveMainModel, SWITCHROOM_DEFAULT_THINKING_EFFORT } from '../../src/agents/scaffold.js'
 import {
   parseEffortCommand,
   handleEffortCommand,
@@ -435,6 +436,7 @@ import {
   drainCapDecision as pendingCmdDrainCapDecision,
   shutdownResolutionActions as pendingCmdShutdownResolutionActions,
   resolveForRestart as pendingCmdResolveForRestart,
+  drainTakenCommands as pendingCmdDrainTaken,
   type ShutdownResolutionAction,
   ackText as pendingCmdAckText,
   supersededText as pendingCmdSupersededText,
@@ -20734,6 +20736,15 @@ function persistQueuedCommandForRestart(action: ShutdownResolutionAction): strin
   try {
     switch (action.persist) {
       case 'model': {
+        // #3042 blocker 2a: this token was QUEUED, never confirmed by claude.
+        // Under the keep-by-default boot a garbage-but-shape-valid token
+        // persisted here would crashloop `claude --model <garbage>` with the
+        // gateway dead. Only offline-trustable tokens (static Claude aliases,
+        // curated sr-* alias targets) may be persisted unconfirmed; anything
+        // else gets the honest "couldn't verify — re-issue" card instead.
+        if (!isOfflineTrustedModelToken(action.arg)) {
+          return `↩️ Couldn’t verify \`${escapeHtmlForTg(action.cmd.targetLabel || action.arg)}\` as a known model without the live session — it was NOT saved. Re-issue \`/model ${escapeHtmlForTg(action.arg)}\` once the agent is back.`
+        }
         const configured =
           readConfiguredDefaultModel(agentDir) ?? resolveMainModel(undefined)
         writeSessionModelFile(agentDir, expandSrAlias(action.arg), configured)
@@ -20761,14 +20772,23 @@ function persistQueuedCommandForRestart(action: ShutdownResolutionAction): strin
   }
 }
 
-/** The cascade-resolved thinking_effort, for `.session-effort`'s configuredDefaultAtWrite. */
-function getConfiguredEffortForPersist(): string | null {
+/**
+ * The cascade-resolved thinking_effort, for `.session-effort`'s
+ * configuredDefaultAtWrite. #3042 item 5: on a transient `agent list`
+ * failure fall back to the scaffold default rather than null — persisting ''
+ * would trip a bogus "configured default effort changed" clear+alert at the
+ * next boot (start.sh bakes the same default when yaml is unset).
+ */
+function getConfiguredEffortForPersist(): string {
   try {
     type AgentListResp = { agents: Array<{ name: string; thinking_effort?: string | null }> }
     const data = switchroomExecJson<AgentListResp>(['agent', 'list'])
-    return data?.agents?.find(a => a.name === getMyAgentName())?.thinking_effort ?? null
+    return (
+      data?.agents?.find(a => a.name === getMyAgentName())?.thinking_effort ??
+      SWITCHROOM_DEFAULT_THINKING_EFFORT
+    )
   } catch {
-    return null
+    return SWITCHROOM_DEFAULT_THINKING_EFFORT
   }
 }
 
@@ -20791,47 +20811,24 @@ async function drainPendingSessionCommand(): Promise<void> {
   if (pendingSessionCommand.size === 0) return
   pendingCmdDraining = true
   try {
-    for (const cmd of pendingSessionCommand.takeAll()) {
-      if (pendingRestarts.size > 0) {
-        // #3039: a session relaunch is scheduled — the live session is going
-        // away, but start.sh honors the durable carriers on boot. Persist the
-        // queued (typed) choice so it still deterministically applies; only an
-        // unresolvable menu-tag selection falls back to the re-issue note.
-        const action = pendingCmdResolveForRestart(cmd, escapeHtmlForTg)
-        await editPendingCommandCard(cmd.ackChatId, cmd.ackMessageId, persistQueuedCommandForRestart(action))
-        continue
-      }
-      // #3039 race guard: the idle gate fired, but a NEW turn may have started
-      // before this async drain reached this command. Applying now would hit
-      // the handlers' internal busy refusals and stamp "not applied" onto the
-      // ack card as a false final state. Re-enqueue and let the next idle
-      // gate retry (the ack card stays at its honest "queued" text).
-      if (turnInFlightForGate()) {
-        reEnqueueUnlessSuperseded(cmd)
-        break
-      }
-      let body: string
-      try {
-        body =
-          cmd.kind === 'model'
-            ? await applyQueuedModelCommand(cmd)
-            : await applyQueuedEffortCommand(cmd)
-      } catch (err) {
-        await editPendingCommandCard(
-          cmd.ackChatId,
-          cmd.ackMessageId,
-          `❌ Couldn’t apply the queued ${cmd.kind} switch to \`${escapeHtmlForTg(cmd.targetLabel)}\`: ${escapeHtmlForTg((err as Error)?.message ?? String(err))}`,
-        )
-        continue
-      }
-      // #3039: the handler itself refused because a turn raced in — the
-      // choice is NOT applied. Re-enqueue instead of confirming the refusal.
-      if (isBusyRefusalText(body)) {
-        reEnqueueUnlessSuperseded(cmd)
-        break
-      }
-      await editPendingCommandCard(cmd.ackChatId, cmd.ackMessageId, body)
-    }
+    // Iteration + loss-safety invariants live in drainTakenCommands
+    // (pending-session-command.ts, unit-tested): a restart-pending command is
+    // persisted to the boot carriers; an early stop (turn raced in / handler
+    // busy-refusal) re-enqueues EVERY not-yet-applied taken command (#3042
+    // blocker 1) instead of dropping the rest of the batch.
+    await pendingCmdDrainTaken(pendingSessionCommand.takeAll(), {
+      restartPending: () => pendingRestarts.size > 0,
+      turnInFlight: () => turnInFlightForGate(),
+      apply: cmd =>
+        cmd.kind === 'model' ? applyQueuedModelCommand(cmd) : applyQueuedEffortCommand(cmd),
+      isBusyRefusal: isBusyRefusalText,
+      resolveForRestartText: cmd =>
+        persistQueuedCommandForRestart(pendingCmdResolveForRestart(cmd, escapeHtmlForTg)),
+      editCard: (cmd, text) => editPendingCommandCard(cmd.ackChatId, cmd.ackMessageId, text),
+      reEnqueue: reEnqueueUnlessSuperseded,
+      failureText: (cmd, err) =>
+        `❌ Couldn’t apply the queued ${cmd.kind} switch to \`${escapeHtmlForTg(cmd.targetLabel)}\`: ${escapeHtmlForTg((err as Error)?.message ?? String(err))}`,
+    })
   } finally {
     pendingCmdDraining = false
   }

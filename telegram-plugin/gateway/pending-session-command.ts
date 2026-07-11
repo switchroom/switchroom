@@ -131,6 +131,74 @@ export function createPendingSessionCommandSlots(): PendingSessionCommandSlots {
 }
 
 /**
+ * IO seams the drain iteration needs from the gateway. Extracted so the
+ * iteration ORDER + loss-safety invariants (#3042 blocker 1) are unit-testable
+ * without booting the bot.
+ */
+export interface DrainIo {
+  /** Is a session relaunch pending (the live session is going away)? */
+  restartPending: () => boolean
+  /** Is a turn in flight right now (re-checked per command)? */
+  turnInFlight: () => boolean
+  /** Apply the command via the real handler; returns the reply body. */
+  apply: (cmd: PendingSessionCommand) => Promise<string>
+  /** Does this reply body mean "refused because busy" (not applied)? */
+  isBusyRefusal: (text: string) => boolean
+  /** Resolve a command that must ride the restart carriers; returns card text. */
+  resolveForRestartText: (cmd: PendingSessionCommand) => string
+  /** Edit the command's ack card. Best-effort. */
+  editCard: (cmd: PendingSessionCommand, text: string) => Promise<void>
+  /** Re-enqueue a command the drain could not safely apply. */
+  reEnqueue: (cmd: PendingSessionCommand) => void
+  /** Render the apply-threw failure card text. */
+  failureText: (cmd: PendingSessionCommand, err: unknown) => string
+}
+
+/**
+ * Drain iteration over the commands takeAll() returned. The loss-safety
+ * invariant (#3042 blocker 1): when the loop must stop early (turn raced in,
+ * or the handler returned a busy refusal), EVERY not-yet-applied taken
+ * command — including the current one — is re-enqueued. takeAll() can hold
+ * both a model AND an effort command; breaking after re-enqueueing only the
+ * current one would silently drop the other with its ack card stuck at
+ * "queued" forever.
+ */
+export async function drainTakenCommands(
+  taken: readonly PendingSessionCommand[],
+  io: DrainIo,
+): Promise<void> {
+  for (let i = 0; i < taken.length; i++) {
+    const cmd = taken[i]
+    if (io.restartPending()) {
+      // The live session is going away — carry the choice across the bounce
+      // via the durable carriers (or the re-issue fallback).
+      await io.editCard(cmd, io.resolveForRestartText(cmd))
+      continue
+    }
+    // Race guard: a new turn may have started before the drain reached this
+    // command. Applying now would hit the handlers' busy refusals and stamp
+    // "not applied" onto the ack card as a false final state.
+    if (io.turnInFlight()) {
+      for (const rest of taken.slice(i)) io.reEnqueue(rest)
+      return
+    }
+    let body: string
+    try {
+      body = await io.apply(cmd)
+    } catch (err) {
+      await io.editCard(cmd, io.failureText(cmd, err))
+      continue
+    }
+    // The handler itself refused because a turn raced in — not applied.
+    if (io.isBusyRefusal(body)) {
+      for (const rest of taken.slice(i)) io.reEnqueue(rest)
+      return
+    }
+    await io.editCard(cmd, body)
+  }
+}
+
+/**
  * What the reaper's bounded drain-cap should do this tick.
  *
  *   - 'wait'                 — nothing queued long enough; keep waiting.

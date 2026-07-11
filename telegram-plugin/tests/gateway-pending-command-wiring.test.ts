@@ -62,17 +62,30 @@ describe('gateway: shutdown resolves queued ack cards (#3018 finding 3)', () => 
   })
 })
 
-describe('gateway: drain never confirms a busy refusal (#3039)', () => {
-  it('drainPendingSessionCommand re-checks turn-in-flight per command and re-enqueues on a busy-refusal reply', () => {
+describe('gateway: drain never confirms a busy refusal and never drops the batch (#3039, #3042 blocker 1)', () => {
+  it('drainPendingSessionCommand routes takeAll() through the unit-tested drainTakenCommands with the loss-safe IO', () => {
     const fnIdx = GATEWAY_SRC.indexOf('async function drainPendingSessionCommand(')
     expect(fnIdx).toBeGreaterThan(0)
-    const win = GATEWAY_SRC.slice(fnIdx, fnIdx + 4000)
-    expect(win).toContain('if (turnInFlightForGate())')
-    expect(win).toContain('isBusyRefusalText(body)')
-    expect(win).toContain('reEnqueueUnlessSuperseded(cmd)')
+    const win = GATEWAY_SRC.slice(fnIdx, fnIdx + 3000)
+    // Iteration + loss-safety invariants live in pending-session-command.ts
+    // (drainTakenCommands, functionally tested); the gateway only supplies IO.
+    expect(win).toContain('pendingCmdDrainTaken(pendingSessionCommand.takeAll()')
+    expect(win).toContain('turnInFlightForGate()')
+    expect(win).toContain('isBusyRefusal: isBusyRefusalText')
+    expect(win).toContain('reEnqueue: reEnqueueUnlessSuperseded')
     // The pending-restart branch persists rather than telling the user to re-issue.
     expect(win).toContain('pendingCmdResolveForRestart(cmd')
-    expect(win).toContain('persistQueuedCommandForRestart(action)')
+    expect(win).toContain('persistQueuedCommandForRestart(')
+  })
+})
+
+describe('gateway: unconfirmed queued model tokens are gated before durable persist (#3042 blocker 2a)', () => {
+  it('persistQueuedCommandForRestart refuses offline-unverifiable tokens', () => {
+    const fnIdx = GATEWAY_SRC.indexOf('function persistQueuedCommandForRestart(')
+    expect(fnIdx).toBeGreaterThan(0)
+    const win = GATEWAY_SRC.slice(fnIdx, fnIdx + 2500)
+    expect(win).toContain('isOfflineTrustedModelToken(action.arg)')
+    expect(win).toContain('NOT saved')
   })
 })
 

@@ -281,6 +281,39 @@ describe("scaffoldAgent: session-model stickiness boot resolver (start.sh)", () 
     expect(alert).toContain("configured default");
   });
 
+  // ── crashloop self-heal (#3042 blocker 2b) ───────────────────────────────
+  it("three consecutive fast boots with an override active → carrier cleared, default booted, alert once", () => {
+    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8"));
+    expect(runBlock("1")).toBe("claude-opus-4-8"); // boot 1 (cnt=1)
+    expect(runBlock("1")).toBe("claude-opus-4-8"); // boot 2 (cnt=2)
+    expect(runBlock("1")).toBe(DEFAULT_MODEL);     // boot 3 → self-heal
+    expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
+    expect(existsSync(join(agentDir, ".session-model-boot-attempts"))).toBe(false);
+    const alert = alertText();
+    expect(alert).toContain("cleared automatically");
+    expect(alert).toContain("`claude-sonnet-5`");
+    // …and the NEXT boot is a clean default boot (no stale counter).
+    expect(runBlock("1")).toBe(DEFAULT_MODEL);
+  });
+
+  it("a boot without an override clears any stale boot-attempt counter", () => {
+    writeFileSync(join(agentDir, ".session-model-boot-attempts"), "2 " + Math.floor(Date.now() / 1000) + "\n");
+    expect(runBlock("1")).toBe(DEFAULT_MODEL);
+    expect(existsSync(join(agentDir, ".session-model-boot-attempts"))).toBe(false);
+  });
+
+  // ── kept-alert dedup (#3042 item 4) ──────────────────────────────────────
+  it("the 'kept' chat alert fires once per kept value — a bounce loop can't storm the chat", () => {
+    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8"));
+    expect(runBlock("1")).toBe("claude-opus-4-8");
+    expect(alertText()).toContain("kept across this relaunch");
+    rmSync(join(agentDir, ".session-model-alert"));
+    // Second boot, same kept value → no new alert; sentinel remembers.
+    expect(runBlock("1")).toBe("claude-opus-4-8");
+    expect(existsSync(join(agentDir, ".session-model-alert"))).toBe(false);
+    expect(readFileSync(join(agentDir, ".session-model-kept-notified"), "utf-8").trim()).toBe("claude-opus-4-8");
+  });
+
   // ── session-effort resolver (#3039) ───────────────────────────────────────
   function effortJson(level: string, cfg = "low", ts = Date.now()): string {
     return `${JSON.stringify({ level, configuredDefaultAtWrite: cfg, ts })}\n`;
