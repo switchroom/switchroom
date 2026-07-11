@@ -65,6 +65,7 @@ import {
   ConfigError,
 } from "../config/loader.js";
 import { scaffoldAgent, alignAgentUid, renderFleetInvariants, toHostHomePath } from "../agents/scaffold.js";
+import { renderFleetDefaultsClaudeMd } from "../agents/fleet-defaults.js";
 import { refreshAgentConnectionHealth } from "../agents/connection-health.js";
 import type { VaultAclResult } from "./doctor-mcp-secrets.js";
 import { installUpdatePromptHook } from "./update-prompt-hook.js";
@@ -824,7 +825,9 @@ function hasVaultRefs(value: unknown): boolean {
  * vault-auto-unlock blob) are managed by `switchroom setup` / vault
  * commands.
  */
-async function ensureHostMountSources(config: SwitchroomConfig): Promise<void> {
+export async function ensureHostMountSources(
+  config: SwitchroomConfig,
+): Promise<void> {
   // Seed bind sources under the HOST home via the same fail-closed resolver the
   // compose generator uses — NOT bare homedir(). In a container without
   // SWITCHROOM_HOST_HOME this THROWS instead of seeding under the container HOME
@@ -980,10 +983,12 @@ async function ensureHostMountSources(config: SwitchroomConfig): Promise<void> {
   // checksum-restored on drift. Operator reads to know what every
   // agent is told; operator edits get reset on next apply.
   //
-  // L2 fleet defaults: empty placeholder for now. The actual lane 2
-  // content (operating principles, concision norm, tool-family
-  // catalogue) lands in epic issue #1855. `writeIfMissing` semantics
-  // — operator edits are preserved across applies.
+  // L2 fleet defaults: canonical content (operating principles,
+  // privilege/approval map, concision norm, tool-family catalogue, and
+  // the two-layer CLAUDE.md model) rendered from
+  // `renderFleetDefaultsClaudeMd()` (src/agents/fleet-defaults.ts).
+  // `writeIfMissing` semantics: seeded once, operator edits are preserved
+  // across applies. Landed in epic issue #1855.
   const fleetDir = join(home, ".switchroom", "fleet");
   await mkdir(fleetDir, { recursive: true });
   const invariantsPath = join(fleetDir, "switchroom-invariants.md");
@@ -996,22 +1001,11 @@ async function ensureHostMountSources(config: SwitchroomConfig): Promise<void> {
   }
   const fleetClaudePath = join(fleetDir, "CLAUDE.md");
   if (!existsSync(fleetClaudePath)) {
-    // L2 placeholder. Real content arrives via epic issue #1855.
-    writeFileSync(
-      fleetClaudePath,
-      [
-        "# Switchroom fleet defaults",
-        "",
-        "Operator-owned fleet brain. Every agent reads this via",
-        "`--add-dir ~/.switchroom/fleet` (Claude Code native CLAUDE.md",
-        "discovery). Additions stack across the fleet; `switchroom apply`",
-        "never clobbers your edits here.",
-        "",
-        "<!-- L2 fleet defaults content lands in switchroom #1855 -->",
-        "",
-      ].join("\n"),
-      { mode: 0o644 },
-    );
+    // writeIfMissing: seed the canonical L2 content once; never clobber an
+    // operator-customised file. Opt-in refresh arrives in #1859.
+    writeFileSync(fleetClaudePath, renderFleetDefaultsClaudeMd(), {
+      mode: 0o644,
+    });
   }
 }
 
