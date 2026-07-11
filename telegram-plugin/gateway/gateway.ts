@@ -27052,6 +27052,44 @@ void (async () => {
               // Gated to background completions: foreground sub-agents
               // need nothing here, and 'orphan' is a stale historical-at-
               // boot row, not a fresh completion the user is waiting on.
+              // Issue #3023 (card resurrection). A worker whose card was
+              // FALSELY finalised (silent-stall synthesis fired, then the
+              // JSONL resumed growing) is being revived by the watcher. This
+              // callback ONLY clears the worker feed's durable `finalized` gate
+              // (workerActivityFeed.resurrect) — it does NOT itself paint or pin
+              // anything. The actual repaint + re-pin happen DOWNSTREAM on the
+              // next replayed `running` cue: the watcher's re-registration
+              // replays `onProgress`, which calls `workerActivityFeed.update()`
+              // (now un-gated) to first-paint a FRESH `🛠 Worker` message, and
+              // its `.then(reconcileWorkerPin(agentId, wkChat, true))` pins that
+              // new message via the `wk:<agentId>` status-pin. Clearing the gate
+              // here FIRST is the ordering requirement — without it those first
+              // replayed ticks would be swallowed by the finalized gate and no
+              // new card would ever paint. Net effect restores the operator
+              // invariant "active work must always be visible" for the case
+              // PR #3019's in-flight gate can't fully prevent.
+              onResurrect: (agentId, _description) => {
+                try {
+                  workerActivityFeed?.resurrect(agentId)
+                } catch (err) {
+                  process.stderr.write(
+                    `telegram gateway: worker resurrect error agent=${agentId}: ${(err as Error).message}\n`,
+                  )
+                }
+                process.stderr.write(
+                  `telegram gateway: worker ${agentId} card RESURRECTED — false terminal finish reversed, worker resumed (issue #3023)\n`,
+                )
+              },
+              // Issue #3023 (bounded chain). A worker resurrected once and then
+              // falsely finalised again is NOT resurrected forever — the
+              // watcher names it lost. Surface the fact in the log; the
+              // handback (onFinish) still delivered the synthesised result, so
+              // there is nothing further to paint.
+              onWorkerLost: (agentId, _description) => {
+                process.stderr.write(
+                  `telegram gateway: worker ${agentId} NAMED AS LOST — falsely finalised twice, resurrection chain bound reached (issue #3023)\n`,
+                )
+              },
               onFinish: ({ agentId, outcome, description, resultText, toolCount, durationMs, background: entryBackground }) => {
                 // Reaction promotion: if the parent turn already ended
                 // with this (or another) worker still running, its 👍 was

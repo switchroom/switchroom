@@ -342,6 +342,16 @@ export interface WorkerActivityFeed {
   finish(agentId: string, view: WorkerActivityView): Promise<void>
   /** Forget a worker's state without editing (e.g. error path). */
   drop(agentId: string): void
+  /**
+   * Issue #3023 (card resurrection). Undo a finalization: clear the durable
+   * `finalized` gate (and any lingering per-handle `finished` latch) so a
+   * worker whose card was FALSELY finalized can be painted/edited again. The
+   * watcher calls this (via the gateway's `onResurrect` wiring) when a
+   * falsely-finalized worker's JSONL resumes growing. A fresh `running` cue
+   * after this repaints a live card — the operator invariant that active work
+   * stays visible. Idempotent; a no-op if the worker was never finalized.
+   */
+  resurrect(agentId: string): void
   /** Clear the heartbeat interval (gateway shutdown). Idempotent. */
   stop(): void
   /** Manually fire one heartbeat tick (test hook). */
@@ -776,6 +786,23 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       // tick can't resurrect a running card on it (same gate as `finish`).
       markFinalized(agentId)
       handles.delete(agentId)
+    },
+    resurrect(agentId) {
+      // Issue #3023: the worker's card was falsely finalized and its JSONL has
+      // resumed. Re-open the paint path: drop the durable finalized gate so a
+      // fresh `running` cue creates a new handle and first-paints a live card
+      // again, and un-latch any surviving handle (finish deleted it in the
+      // common case, but a staged pendingFinish could keep it alive). The next
+      // `update` tick from the watcher's replayed progress does the repaint.
+      const wasFinalized = finalized.delete(agentId)
+      const h = handles.get(agentId)
+      if (h != null) {
+        h.finished = false
+        h.pendingFinish = null
+      }
+      if (wasFinalized || h != null) {
+        log(`worker-feed: resurrect agent=${agentId} — cleared finalized gate; card will repaint on next running cue`)
+      }
     },
     heartbeatTick,
     stop() {
