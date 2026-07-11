@@ -220,6 +220,29 @@ describe("provisionLiteLLMKeys — stored-key validation against the proxy (DB d
     expect(out.join("")).toMatch(/was UNBOUND/);
   });
 
+  it("F1: stored key VALID but bound to a DIFFERENT team → re-bound to the config team (config wins)", async () => {
+    // Config is authoritative: an out-of-band binding to another team is
+    // re-bound back to the config-declared team, announced with the prior team.
+    getViaBrokerStructured.mockResolvedValue({
+      kind: "ok",
+      entry: { kind: "string", value: "sk-stored" },
+    });
+    validateKey.mockResolvedValue({ kind: "valid", teamId: "t2" }); // wrong team
+    ensureTeam.mockResolvedValue({ kind: "bound", teamId: "t1" });
+    bindKeyToTeam.mockResolvedValue({ kind: "ok" });
+
+    const { ctx, failures, out } = makeSinks();
+    await provisionLiteLLMKeys(makeConfig(), ["clerk"], undefined, ctx);
+
+    expect(failures).toEqual([]);
+    expect(ensureKey).not.toHaveBeenCalled();
+    expect(bindKeyToTeam).toHaveBeenCalledWith(
+      expect.objectContaining({ key: "sk-stored", teamId: "t1" }),
+    );
+    expect(out.join("")).toMatch(/re-bound existing key to team 'switchroom'/);
+    expect(out.join("")).toMatch(/was team 't2'/);
+  });
+
   it("F1: valid UNBOUND key but /key/update FAILS → LOUD warning, key kept, apply not failed", async () => {
     getViaBrokerStructured.mockResolvedValue({
       kind: "ok",

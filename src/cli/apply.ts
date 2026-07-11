@@ -588,6 +588,11 @@ export async function provisionLiteLLMKeys(
               );
             }
 
+            // Config is authoritative for team binding: a key bound out-of-band
+            // to a DIFFERENT team is re-bound back to the config-declared team
+            // on the next apply (announced in the output). One team per cost
+            // bucket is the product invariant; change the config to change the
+            // binding.
             if (desired && desired.kind === "bound" && boundTeamId !== desired.teamId) {
               const bind = await bindKeyToTeam({ baseUrl, masterKey, key: storedKey, teamId: desired.teamId });
               if (bind.kind === "ok") {
