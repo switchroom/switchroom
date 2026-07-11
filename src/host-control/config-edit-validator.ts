@@ -223,6 +223,52 @@ function validateShape(
       };
     }
   }
+  // Zero-context hunks are rejected (#3121 follow-up security review): a hunk
+  // with no context lines is anchored ONLY by its `@@` line numbers, so after
+  // benign drift during the approval window it can silently relocate into a
+  // different region of the file (e.g. another agent's block) and still pass
+  // schema validation. Requiring at least one context line per hunk is a
+  // first-line filter, not the anchoring guarantee: a hunk whose only context
+  // is a blank line still passes with a near-useless anchor. The actual
+  // relocation guarantee is the apply-time change-set pin (plus the self-scope
+  // re-gate for non-admin callers). Nothing first-party generates
+  // zero-context diffs (`git diff` defaults to 3 context lines;
+  // telegram-plugin/permission-diff.ts buildHunk uses contextN=3), so this
+  // only rejects hand-rolled `--unified=0` patches.
+  {
+    let inHunk = false;
+    let hunkHasContext = false;
+    const failZeroContext: ValidationFailure = {
+      ok: false,
+      code: "E_PATCH_INVALID_SHAPE",
+      detail:
+        "zero-context hunk not allowed; regenerate the diff with context " +
+        "lines (git diff default of 3)",
+    };
+    // Drop the artifact "" element a trailing newline leaves after split —
+    // it is not a real patch line and must not count as context.
+    const scanLines =
+      lines.length > 0 && lines[lines.length - 1] === ""
+        ? lines.slice(0, -1)
+        : lines;
+    for (const ln of scanLines) {
+      if (ln.startsWith("@@")) {
+        if (inHunk && !hunkHasContext) return failZeroContext;
+        inHunk = true;
+        hunkHasContext = false;
+      } else if (ln.startsWith("--- ") || ln.startsWith("+++ ")) {
+        if (inHunk && !hunkHasContext) return failZeroContext;
+        inHunk = false;
+      } else if (inHunk) {
+        // A ` `-prefixed line is context; a completely empty line is also
+        // treated as context (some emitters strip the single space on blank
+        // context lines, and `git apply --recount` accepts that form). `\`
+        // ("\ No newline at end of file") is metadata, `+`/`-` are edits.
+        if (ln.startsWith(" ") || ln === "") hunkHasContext = true;
+      }
+    }
+    if (inHunk && !hunkHasContext) return failZeroContext;
+  }
   return null;
 }
 
@@ -259,11 +305,15 @@ function applyPatch(
     writeFileSync(patchFile, normalizedDiff);
 
     const bin = gitBin ?? "git";
+    // NO `--unidiff-zero` (#3121 follow-up): a zero-context hunk is anchored
+    // only by its `@@` line numbers, so drift during the approval window
+    // could relocate it into a different region of the file. Stage 1 already
+    // rejects zero-context hunks with a targeted message; omitting the flag
+    // here means git apply itself also refuses them (defense in depth).
     const baseArgs = [
       "apply",
       "--whitespace=nowarn",
       "--recount",
-      "--unidiff-zero",
     ];
     const checkP1 = spawnSync(
       bin,

@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+### config_propose_edit: hunk-relocation guards at apply time (#3121 follow-up security review)
+
+Follow-up to the #3084 audit fix merged in #3121, closing the relocation
+class its adversarial review demonstrated. Note on #3121's actual semantics:
+it did NOT pin a pre-image hash — it re-applied the stored diff against the
+then-current file, allowing any non-conflicting drift through. This change
+adds the compensating checks:
+
+- **Zero-context hunks are rejected** at intake (`E_PATCH_INVALID_SHAPE`) and
+  `git apply` no longer runs with `--unidiff-zero`. A zero-context hunk is
+  anchored purely by line numbers, so drift during the (up to 60-min)
+  approval window could relocate it into a different region — e.g. another
+  agent's block — while still passing schema validation. Nothing first-party
+  generates zero-context diffs.
+- **Semantic change-set pin (all callers):** the sorted set of YAML paths the
+  operator-approved diff changed at propose time must equal the set the
+  re-applied diff changes at apply time, or the apply aborts with
+  `E_CONFIG_CHANGED` (nothing written).
+- **Self-scope gate re-runs at apply time (non-admin callers):** a non-admin
+  agent's edit must still be self-scoped against the fresh post-image under
+  the apply lock, closing the propose-time-only escalation window
+  demonstrated by the review (relocation into another agent's block).
+- **New card outcome `aborted_config_changed`:** config-changed aborts no
+  longer mislabel the approval card as "reconcile failed; rolled back" when
+  nothing was written.
+
+Operator hand-edits remain outside the apply lock (a ~ms residual race,
+accepted and now documented as such — this path is not zero-race).
+
+Mixed-version note: an old gateway paired with a new hostd rejects the new
+`aborted_config_changed` finalize (unknown message type), leaving the approved
+card stale — fail-safe, since the abort means nothing was written.
+
 ### First-class `soul:` persona fields + `shape` discriminator (#1856)
 
 `AgentSoulSchema` now types `creature`, `vibe`, `expertise`, and `emoji`

@@ -438,7 +438,7 @@ export interface RequestConfigApprovalMessage {
 export interface RequestConfigFinalizeMessage {
   type: "request_config_finalize";
   requestId: string;
-  outcome: "applied" | "reconcile_failed_rolled_back";
+  outcome: "applied" | "aborted_config_changed" | "reconcile_failed_rolled_back";
   /** Optional short diagnostic appended to the card body. */
   detail?: string;
   /**

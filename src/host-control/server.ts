@@ -2347,11 +2347,16 @@ export class HostdServer {
    *
    * Deliberately OUT of scope per operator decision (single-operator
    * single-host posture, see PR description):
-   * crash-recovery journal, Prometheus metrics, TOCTOU re-validation,
-   * literal `flock` on the config file (the in-process mutex is
-   * sufficient — hostd is the only writer), attachment fallback for
-   * very large diffs, 5s safety-delay button swap, privilege-
-   * escalation detection.
+   * crash-recovery journal, Prometheus metrics, literal `flock` on the
+   * config file (the in-process mutex serializes hostd's own applies;
+   * operator hand-edits are NOT under the lock — a ~ms residual race
+   * remains, accepted), attachment fallback for very large diffs, 5s
+   * safety-delay button swap.
+   *
+   * TOCTOU re-validation and apply-time privilege-escalation checks ARE
+   * in scope since the #3084 audit + the #3121 follow-up: the apply path
+   * re-applies the stored diff under the lock, pins the semantic change
+   * set to what was approved, and re-runs the non-admin self-scope gate.
    */
   private async handleConfigProposeEdit(
     req: Extract<HostdRequest, { op: "config_propose_edit" }>,
@@ -2402,13 +2407,20 @@ export class HostdServer {
     //       own declared-model list (a forged proposal diff smuggling in any
     //       other field is rejected here).
     // Operators and admin agents skip the check (full trust).
+    //
+    // `beforeContent` is read for ALL callers: the apply path compares the
+    // propose-time semantic change set (`proposedChangedPaths`, below) against
+    // the change set the re-applied diff produces after any approval-window
+    // drift (#3121 follow-up). Read failure degrades to "" — the change set
+    // then covers the whole file, and any real apply-time change set will
+    // mismatch, aborting fail-closed.
+    let beforeContent: string;
+    try {
+      beforeContent = readFileSync(configPath, "utf-8");
+    } catch {
+      beforeContent = "";
+    }
     if (caller.kind === "agent" && this.opts.config.agents[caller.name]?.admin !== true) {
-      let beforeContent: string;
-      try {
-        beforeContent = readFileSync(configPath, "utf-8");
-      } catch {
-        beforeContent = "";
-      }
       // A non-admin edit is admitted if it is EITHER a self-scoped tools.allow
       // widen (the "🔁 Always allow" path) OR a self-scoped append to the
       // caller's own memory.mental_models[] (the agent-proposes → human-
@@ -2438,6 +2450,17 @@ export class HostdServer {
           .build(req.request_id, Date.now() - started);
       }
     }
+    // ── Propose-time semantic change set (#3121 follow-up) ─────────
+    // What the operator approves is the RENDERED DIFF's effect against the
+    // config as it stood at propose time. The apply path re-applies the diff
+    // against the then-current file; even with context anchoring, drift during
+    // the approval window could make the same textual hunks land at different
+    // YAML paths. Pin the semantic change set now and require the apply-time
+    // re-application to produce the SAME set, or abort.
+    const proposedChangedPaths = classifyBlastRadius(
+      beforeContent,
+      verdict.postApplyContent,
+    ).changedPaths;
     // ── Approval card ───────────────────────────────────────────────
     if (!this.opts.approvalGateway) {
       // #1761: missing approval-gateway wiring is an operator/infra
@@ -2497,6 +2520,7 @@ export class HostdServer {
       callerName,
       configPath,
       started,
+      proposedChangedPaths,
     );
     this.inflightConfigProposals.set(dedupeKey, run);
     try {
@@ -2520,6 +2544,7 @@ export class HostdServer {
     callerName: string,
     configPath: string,
     started: number,
+    proposedChangedPaths: string[],
   ): Promise<HostdResponse> {
     // ── Pre-approval bypass (#2975 Stage 2) ─────────────────────────
     // Before the rate limit, ask the gateway whether this EXACT (agent, diff)
@@ -2623,6 +2648,7 @@ export class HostdServer {
       callerName,
       configPath,
       started,
+      proposedChangedPaths,
     );
   }
 
@@ -2687,6 +2713,8 @@ export class HostdServer {
     callerName: string,
     configPath: string,
     started: number,
+    /** Sorted semantic change set approved at propose time (#3121 follow-up). */
+    proposedChangedPaths: string[],
   ): Promise<HostdResponse> {
     const approvalId = (this.opts.generateApprovalId ?? defaultApprovalId)();
     const approval = await this.opts.approvalGateway!.requestApproval({
@@ -2748,8 +2776,12 @@ export class HostdServer {
     }
     // ── Apply path (mutex-serialized) ───────────────────────────────
     // Serialize concurrent config-edit applies through a single
-    // in-process promise chain. Hostd is the only writer of
-    // switchroom.yaml; no cross-process flock is needed.
+    // in-process promise chain. Hostd is the only PROGRAMMATIC writer of
+    // switchroom.yaml, so no cross-process flock is used — but operator
+    // hand-edits are NOT under this lock: a hand-edit racing the short
+    // (milliseconds) window between the snapshot read and the write below is
+    // possible, just vanishingly unlikely. This is a known, accepted residual
+    // race — do not describe this path as zero-race.
     const release = await this.acquireConfigApplyLock();
     try {
       // Snapshot the live config so we can rollback if reconcile
@@ -2784,10 +2816,12 @@ export class HostdServer {
       // A unified diff only rewrites its own hunks, so a concurrent change to
       // some OTHER region of the file still applies cleanly and its edit
       // survives (legitimate non-conflicting concurrent edits complete). We
-      // ABORT with E_CONFIG_CHANGED ONLY when the diff no longer applies
-      // cleanly — a REAL conflict where the drift overlaps this diff's hunks.
-      // The config is left untouched on abort (no bytes written yet) — the
-      // agent must re-propose against the new base.
+      // ABORT with E_CONFIG_CHANGED when the diff no longer applies cleanly,
+      // when the re-applied diff would change different YAML paths than the
+      // operator approved, or when a non-admin caller's edit is no longer
+      // self-scoped against the drifted base (checks below). The config is
+      // left untouched on abort (no bytes written yet) — the agent must
+      // re-propose against the new base.
       const reverdict = validateConfigEdit({
         configPath,
         targetPath: req.args.target_path,
@@ -2797,8 +2831,10 @@ export class HostdServer {
         const why =
           `stored diff no longer applies against the current config` +
           `: ${reverdict.detail}`;
+        // Nothing was written — "aborted_config_changed", NOT the
+        // rollback outcome (#3121 follow-up, review finding 4).
         await approval.finalize({
-          outcome: "reconcile_failed_rolled_back",
+          outcome: "aborted_config_changed",
           detail: `config changed since proposal — re-propose (${why})`,
         });
         return this.configChangedSinceProposal(why, req, caller, started);
@@ -2806,6 +2842,58 @@ export class HostdServer {
       // Fresh post-image = current live file + the stored diff (re-applied
       // under the lock), never the propose-time whole-file snapshot.
       const postApplyFresh = reverdict.postApplyContent;
+      // ── #3121 follow-up — the re-applied diff must mean what was approved ──
+      // Even a clean re-apply can land at DIFFERENT YAML paths than the
+      // operator saw at propose time (context lines are not globally unique in
+      // a config full of structurally identical agent blocks). Structurally
+      // compare the semantic change set of (current live file → fresh
+      // post-image) against the propose-time set; any divergence aborts —
+      // nothing has been written yet.
+      const applyChangedPaths = classifyBlastRadius(
+        snapshot,
+        postApplyFresh,
+      ).changedPaths;
+      const sameChangeSet =
+        applyChangedPaths.length === proposedChangedPaths.length &&
+        applyChangedPaths.every((p, i) => p === proposedChangedPaths[i]);
+      if (!sameChangeSet) {
+        const why =
+          `re-applied diff changes different config paths than approved ` +
+          `(approved: [${proposedChangedPaths.join(", ")}]; ` +
+          `would change: [${applyChangedPaths.join(", ")}])`;
+        await approval.finalize({
+          outcome: "aborted_config_changed",
+          detail: `config changed since proposal — re-propose (${why})`,
+        });
+        return this.configChangedSinceProposal(why, req, caller, started);
+      }
+      // ── #3121 follow-up — re-run the self-scope gate at APPLY time ──
+      // The propose-time admitSelfScopedNonAdminEdit call proved the edit was
+      // self-scoped against the propose-time base. After drift, the re-applied
+      // diff could produce a DIFFERENT effect (e.g. relocate into another
+      // agent's block) — so for non-admin callers the gate must hold against
+      // the fresh post-image too, or a non-admin agent escalates across the
+      // approval window. Abort (nothing written) rather than apply.
+      if (
+        caller.kind === "agent" &&
+        this.opts.config.agents[caller.name]?.admin !== true
+      ) {
+        const reAdmission = admitSelfScopedNonAdminEdit(
+          snapshot,
+          postApplyFresh,
+          caller.name,
+        );
+        if (!reAdmission.ok) {
+          const why =
+            `re-applied diff is no longer self-scoped for non-admin caller ` +
+            `"${caller.name}": ${reAdmission.detail}`;
+          await approval.finalize({
+            outcome: "aborted_config_changed",
+            detail: `config changed since proposal — re-propose (${why})`,
+          });
+          return this.configChangedSinceProposal(why, req, caller, started);
+        }
+      }
       // In-place write preserving the inode (bind-mount safe). The old
       // `<path>.tmp` → rename() swap returned EBUSY here because
       // switchroom.yaml is itself a read-only bind-mount source mounted

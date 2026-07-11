@@ -79,7 +79,7 @@ function makeServer(opts: {
 /** Build a stub ApprovalGateway with a pre-canned verdict + finalize spy. */
 function stubGateway(verdict: "approve" | "deny" | "timeout") {
   const finalizeCalls: Array<{
-    outcome: "applied" | "reconcile_failed_rolled_back";
+    outcome: "applied" | "aborted_config_changed" | "reconcile_failed_rolled_back";
     detail?: string;
   }> = [];
   const requests: ApprovalRequest[] = [];
@@ -860,7 +860,7 @@ describe("hostd config_propose_edit — apply-time re-apply guard (#3084)", () =
   // `approve` (i.e. after propose-time validation, but before the apply runs).
   function driftingGateway(landed: string) {
     const finalizeCalls: Array<{
-      outcome: "applied" | "reconcile_failed_rolled_back";
+      outcome: "applied" | "aborted_config_changed" | "reconcile_failed_rolled_back";
       detail?: string;
     }> = [];
     const gw: ApprovalGateway = {
@@ -953,7 +953,9 @@ describe("hostd config_propose_edit — apply-time re-apply guard (#3084)", () =
     // Nothing was written → reconcile never ran.
     expect(reconcileInvocations).toBe(0);
     expect(finalizeCalls.length).toBe(1);
-    expect(finalizeCalls[0]!.outcome).toBe("reconcile_failed_rolled_back");
+    // Nothing was written, so the finalize outcome is the abort outcome —
+    // NOT the rollback outcome (#3121 follow-up, review finding 4).
+    expect(finalizeCalls[0]!.outcome).toBe("aborted_config_changed");
     expect(finalizeCalls[0]!.detail).toMatch(/config changed since proposal/);
     // The operator's conflicting edit SURVIVES; the proposal's change did NOT
     // land (the diff was never force-written over the drift).
@@ -984,5 +986,191 @@ describe("hostd config_propose_edit — apply-time re-apply guard (#3084)", () =
     expect(reconcileInvocations).toBe(1);
     const live = readFile(configPath, "utf8");
     expect(live).toContain("# touched by apply-path test");
+  });
+});
+
+/**
+ * #3121 follow-up security review — hunk-relocation guards.
+ *
+ * The merged #3084 fix re-applied the stored diff at apply time, but two
+ * relocation vectors remained:
+ *   1. `--unidiff-zero` let a zero-context hunk land purely by line number —
+ *      after benign drift it could relocate into ANOTHER agent's block while
+ *      still passing schema validation (non-admin privilege escalation: the
+ *      self-scope gate only ran at PROPOSE time).
+ *   2. Even WITH context lines, structurally identical agent blocks mean the
+ *      re-applied hunk can anchor in a different agent's block after drift.
+ *
+ * Fixes under test: stage-1 rejection of zero-context hunks (no more
+ * `--unidiff-zero`), the apply-time semantic change-set pin, and the
+ * apply-time re-run of the non-admin self-scope gate. These tests FAIL on the
+ * pre-fix code (the edits landed in the other agent's block / the wrong
+ * outcome was finalized).
+ */
+describe("hostd config_propose_edit — relocation guards (#3121 follow-up)", () => {
+  // bob is the only agent at PROPOSE time, so the generic (agent-name-free)
+  // hunk context below anchors uniquely in bob's block and the self-scope
+  // gate admits the edit.
+  const SINGLE_BOB_CONFIG =
+    "switchroom:\n" +
+    "  version: 1\n" +
+    "telegram:\n" +
+    '  bot_token: "x"\n' +
+    '  forum_chat_id: "1"\n' +
+    "agents:\n" +
+    "  bob:\n" +
+    '    topic_name: "Twin"\n' +
+    "    tools:\n" +
+    "      allow:\n" +
+    "        - mcp__a__one\n";
+
+  // The drift that lands during the approval window: the operator renamed the
+  // agent bob → eve (identical body). The hunk's generic context byte-matches
+  // the renamed block, so `git apply` re-applies the stored diff CLEANLY —
+  // but the edit now lands under agents.eve.*, not the approved agents.bob.*.
+  // (Verified against real git: the re-apply succeeds; only the semantic
+  // change-set pin / self-scope re-gate stop it.)
+  const DRIFTED_BOB_RENAMED_TO_EVE =
+    "switchroom:\n" +
+    "  version: 1\n" +
+    "telegram:\n" +
+    '  bot_token: "x"\n' +
+    '  forum_chat_id: "1"\n' +
+    "agents:\n" +
+    "  eve:\n" +
+    '    topic_name: "Twin"\n' +
+    "    tools:\n" +
+    "      allow:\n" +
+    "        - mcp__a__one\n";
+
+  // Bob widens his OWN tools.allow (self-scoped at propose time). The context
+  // lines carry no agent name, so after the rename drift they anchor in
+  // eve's block instead.
+  const GENERIC_CONTEXT_SELF_DIFF =
+    "--- a/switchroom.yaml\n" +
+    "+++ b/switchroom.yaml\n" +
+    "@@ -9,3 +9,4 @@\n" +
+    "     tools:\n" +
+    "       allow:\n" +
+    "         - mcp__a__one\n" +
+    "+        - mcp__evil__tool\n";
+
+  // The same edit with NO context lines at all — anchored purely by line
+  // numbers. Must be rejected at intake now that --unidiff-zero is gone.
+  const ZERO_CONTEXT_DIFF =
+    "--- a/switchroom.yaml\n" +
+    "+++ b/switchroom.yaml\n" +
+    "@@ -11,0 +12,1 @@\n" +
+    "+        - mcp__evil__tool\n";
+
+  function driftingGatewayTo(landed: string) {
+    const finalizeCalls: Array<{
+      outcome: "applied" | "aborted_config_changed" | "reconcile_failed_rolled_back";
+      detail?: string;
+    }> = [];
+    const gw: ApprovalGateway = {
+      async requestApproval(): Promise<ApprovalResult> {
+        writeFileSync(configPath, landed);
+        return {
+          verdict: "approve",
+          finalize: async (out) => {
+            finalizeCalls.push(out);
+          },
+        };
+      },
+    };
+    return { gw, finalizeCalls };
+  }
+
+  it("rejects a zero-context hunk at propose time with E_PATCH_INVALID_SHAPE and writes nothing", async () => {
+    writeFileSync(configPath, SINGLE_BOB_CONFIG);
+    const { gw, requests } = stubGateway("approve");
+    server = makeServer({
+      configEditEnabled: true,
+      configPath,
+      approvalGateway: gw,
+      runReconcile: async () => ({ exit_code: 0, stdout: "", stderr: "" }),
+    });
+    await server.start();
+    const resp = await send({
+      unified_diff: ZERO_CONTEXT_DIFF,
+      request_id: "reloc-1",
+    });
+    expect(resp.result).toBe("error");
+    expect(resp.error).toMatch(/^E_PATCH_INVALID_SHAPE/);
+    expect(resp.error).toMatch(/zero-context/);
+    // No approval card, no write — the line-number-anchored hunk never got a
+    // chance to relocate anywhere.
+    expect(requests.length).toBe(0);
+    expect(readFile(configPath, "utf8")).toBe(SINGLE_BOB_CONFIG);
+  });
+
+  it("non-admin edit that would relocate into another agent's block after drift ABORTS (no cross-agent write)", async () => {
+    writeFileSync(configPath, SINGLE_BOB_CONFIG);
+    const { gw, finalizeCalls } = driftingGatewayTo(DRIFTED_BOB_RENAMED_TO_EVE);
+    let reconcileInvocations = 0;
+    server = makeServer({
+      configEditEnabled: true,
+      configPath,
+      approvalGateway: gw,
+      runReconcile: async () => {
+        reconcileInvocations += 1;
+        return { exit_code: 0, stdout: "", stderr: "" };
+      },
+    });
+    await server.start();
+    // Propose as NON-ADMIN bob: at propose time the hunk lands in bob's own
+    // block, so the self-scope gate admits it and the card goes out. During
+    // the window, the operator renamed bob → eve — the re-applied hunk's generic
+    // context now anchors in EVE's block. Pre-fix this WROTE the rule into
+    // agents.eve.tools.allow (cross-agent escalation). Now it must abort.
+    const resp = await send({
+      sockOwner: "bob",
+      unified_diff: GENERIC_CONTEXT_SELF_DIFF,
+      request_id: "reloc-2",
+    });
+    expect(resp.result).toBe("denied");
+    expect(resp.error).toMatch(/^E_CONFIG_CHANGED/);
+    expect(resp.error_envelope?.code).toBe("E_CONFIG_CHANGED");
+    // Nothing was written: eve's allow-list did NOT grow, the drifted config
+    // is byte-identical, and reconcile never ran.
+    const live = readFile(configPath, "utf8");
+    expect(live).toBe(DRIFTED_BOB_RENAMED_TO_EVE);
+    expect(live).not.toContain("mcp__evil__tool");
+    expect(reconcileInvocations).toBe(0);
+    expect(finalizeCalls.length).toBe(1);
+    expect(finalizeCalls[0]!.outcome).toBe("aborted_config_changed");
+  });
+
+  it("admin edit whose re-applied hunks land at DIFFERENT yaml paths after drift ABORTS with E_CONFIG_CHANGED", async () => {
+    writeFileSync(configPath, SINGLE_BOB_CONFIG);
+    const { gw, finalizeCalls } = driftingGatewayTo(DRIFTED_BOB_RENAMED_TO_EVE);
+    let reconcileInvocations = 0;
+    server = makeServer({
+      configEditEnabled: true,
+      configPath,
+      approvalGateway: gw,
+      runReconcile: async () => {
+        reconcileInvocations += 1;
+        return { exit_code: 0, stdout: "", stderr: "" };
+      },
+    });
+    await server.start();
+    // Same relocation mechanics, but the caller is the ADMIN agent — the
+    // self-scope gate never runs, so the semantic change-set pin is the guard:
+    // the operator approved a change to agents.bob.*, the re-applied diff
+    // would change agents.eve.*. Apply-time effect must match what was
+    // approved, for ALL callers.
+    const resp = await send({
+      unified_diff: GENERIC_CONTEXT_SELF_DIFF,
+      request_id: "reloc-3",
+    });
+    expect(resp.result).toBe("denied");
+    expect(resp.error).toMatch(/^E_CONFIG_CHANGED/);
+    const live = readFile(configPath, "utf8");
+    expect(live).toBe(DRIFTED_BOB_RENAMED_TO_EVE);
+    expect(live).not.toContain("mcp__evil__tool");
+    expect(reconcileInvocations).toBe(0);
+    expect(finalizeCalls[0]!.outcome).toBe("aborted_config_changed");
   });
 });
