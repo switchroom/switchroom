@@ -41,7 +41,7 @@ function isMultiAgentEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.PROGRESS_CARD_MULTI_AGENT !== '0'
 }
 import { classifyClaudeError, type OperatorEventKind } from './operator-events.js'
-import { createToolLabelSidecar, type ToolLabelSidecar } from './tool-label-sidecar.js'
+import { createToolLabelSidecar, type ToolLabelSidecar, type SidecarOptions } from './tool-label-sidecar.js'
 import { isModelSentinel } from './model-label.js'
 
 /** Match Claude Code's cli.js VX() function. */
@@ -798,6 +798,18 @@ export interface SessionTailConfig {
    * TODO(Phase 4b): wire this to the gateway's emitOperatorEvent pipeline.
    */
   onOperatorEvent?: (event: TailOperatorEvent) => void
+  /**
+   * PreToolUse sidecar factory. Defaults to the real `createToolLabelSidecar`;
+   * production never sets this. It exists as a dependency-injection seam so the
+   * M1 FD-leak reap test can drive a fake sidecar per session WITHOUT
+   * `vi.mock`-ing the shared `tool-label-sidecar` module: bun's `vi.mock` is
+   * process-global (not file-scoped like vitest), and the CI bun-test shard
+   * runs the whole `tests/` dir in ONE process, so a module-mock here would
+   * leak into the real `tool-label-sidecar.test.ts` suite and break it. This
+   * mirrors the repo's bun-safe injection precedent (`vault-write-posture`'s
+   * optional `deps` param).
+   */
+  createSidecar?: (opts: SidecarOptions) => ToolLabelSidecar
 }
 
 export interface SessionTailHandle {
@@ -894,6 +906,7 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
   // $TELEGRAM_STATE_DIR/tool-labels-<session_id>.jsonl. Each sub-agent
   // has its OWN sessionId (its jsonl filename stem), so we key by that.
   const sidecars = new Map<string, ToolLabelSidecar>()
+  const createSidecar = config.createSidecar ?? createToolLabelSidecar
   const stateDirForSidecar = process.env.TELEGRAM_STATE_DIR ?? null
   function sessionIdForFile(file: string | null): string | null {
     if (!file) return null
@@ -905,7 +918,7 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
     const existing = sidecars.get(sessionId)
     if (existing) return existing
     try {
-      const s = createToolLabelSidecar({ stateDir: stateDirForSidecar, sessionId })
+      const s = createSidecar({ stateDir: stateDirForSidecar, sessionId })
       sidecars.set(sessionId, s)
       // Real-time draft-mirror source: emit a `tool_label` event the moment
       // the hook writes a label (flush-independent), so the gateway can

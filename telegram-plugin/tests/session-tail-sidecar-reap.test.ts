@@ -15,42 +15,38 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync, utimesSync } from 'fs'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { startSessionTail, getProjectsDirForCwd } from '../session-tail.js'
+import type { SidecarOptions, ToolLabelSidecar } from '../tool-label-sidecar.js'
 
-// ─── Sidecar factory mock: record every instance keyed by sessionId ──────────
-// The instance registry lives INSIDE the factory and is re-exported as a
-// test-only handle (`__sidecarInstances`) rather than closed over from a
-// `vi.hoisted` binding: bun's vitest-compat layer implements `vi.mock`/`vi.fn`
-// but NOT `vi.hoisted`, so a hoisted-closure mock throws `vi.hoisted is not a
-// function` under `bun test` (CI's bun-test-run shard runs this whole dir).
-// Same pattern as callback-query-handlers.test.ts (#3130).
-vi.mock('../tool-label-sidecar.js', () => {
-  const instances: Array<{ sessionId: string; stop: ReturnType<typeof vi.fn> }> = []
-  return {
-    __sidecarInstances: instances,
-    createToolLabelSidecar: (opts: { stateDir: string; sessionId: string }) => {
-      const inst = {
-        sessionId: opts.sessionId,
-        stop: vi.fn(),
-        getLabel: () => undefined,
-        onLabel: () => () => {},
-        poll: () => {},
-      }
-      instances.push(inst)
-      return inst
-    },
-  }
-})
-
-// Import AFTER the mock is registered. The mocked module namespace carries the
-// test-only instance registry under both runners.
-const { startSessionTail, getProjectsDirForCwd } = await import('../session-tail.js')
-const sidecarMod = (await import('../tool-label-sidecar.js')) as unknown as {
-  __sidecarInstances: Array<{ sessionId: string; stop: ReturnType<typeof vi.fn> }>
+// ─── Sidecar factory injection: record every fake instance keyed by sessionId ─
+// We do NOT `vi.mock('../tool-label-sidecar.js')`. Under bun's vitest-compat
+// layer `vi.mock` is PROCESS-GLOBAL (not file-scoped like vitest), and CI's
+// bun-test-run shard runs this whole `tests/` dir in ONE process — so a module
+// mock here would leak into the real `tool-label-sidecar.test.ts` suite and
+// replace the module under test, failing its 7 assertions. Instead we inject a
+// fake sidecar factory through `startSessionTail`'s `createSidecar` seam (the
+// repo's bun-safe DI precedent — see `vault-write-posture.test.ts`), so the
+// shared module cache is never touched. Sibling `subagent-watcher-fd-leak.test.ts`
+// uses the same injected-fake style.
+interface FakeSidecar extends ToolLabelSidecar {
+  sessionId: string
+  stop: ReturnType<typeof vi.fn>
 }
-const created = { instances: sidecarMod.__sidecarInstances }
+const created = { instances: [] as FakeSidecar[] }
+const fakeSidecarFactory = (opts: SidecarOptions): ToolLabelSidecar => {
+  const inst: FakeSidecar = {
+    sessionId: opts.sessionId,
+    stop: vi.fn(),
+    getLabel: () => undefined,
+    onLabel: () => () => {},
+    poll: () => {},
+  }
+  created.instances.push(inst)
+  return inst
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 const tempDirs: string[] = []
@@ -90,7 +86,8 @@ const assistantText = (text: string): string =>
 const toolUseLine = (name: string, id: string): string =>
   JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', name, id, input: {} }] } }) + '\n'
 
-const findSidecar = (sessionId: string) => created.instances.find((i) => i.sessionId === sessionId)
+const findSidecar = (sessionId: string): FakeSidecar | undefined =>
+  created.instances.find((i) => i.sessionId === sessionId)
 
 describe('session-tail sidecar reap (M1) — parent session rotation', () => {
   it('stops the prior session sidecar when the active file rotates', async () => {
@@ -101,7 +98,7 @@ describe('session-tail sidecar reap (M1) — parent session rotation', () => {
     writeFileSync(first, assistantText('parent one'))
     setMtime(first, 1_000_000)
 
-    const handle = startSessionTail({ cwd, claudeHome, rescanIntervalMs: 30, onEvent: () => {} })
+    const handle = startSessionTail({ cwd, claudeHome, rescanIntervalMs: 30, onEvent: () => {}, createSidecar: fakeSidecarFactory })
     try {
       await wait(120) // initial attach → sidecar 'session-one' created
       expect(findSidecar('session-one')).toBeDefined()
@@ -150,6 +147,7 @@ describe('session-tail sidecar reap (M1) — idle sub-agent', () => {
       // not-yet-reaped state.
       subTailIdleReapMs: 1000,
       onEvent: () => {},
+      createSidecar: fakeSidecarFactory,
     })
     try {
       await wait(100) // attach parent + sub, read tool_use → sidecar created
@@ -190,6 +188,7 @@ describe('session-tail sidecar reap (L1) — reap window is floor-clamped', () =
       rescanIntervalMs: 30,
       subTailIdleReapMs: 0, // pathological: pre-clamp this instant-reaps
       onEvent: () => {},
+      createSidecar: fakeSidecarFactory,
     })
     try {
       await wait(100) // attach parent + sub → sidecar 'agent-subzero' created
@@ -239,6 +238,7 @@ describe('session-tail sidecar reap (M1) — namespace safety', () => {
       // we're isolating the rotation path, not the idle path.
       subTailIdleReapMs: 60_000,
       onEvent: () => {},
+      createSidecar: fakeSidecarFactory,
     })
     try {
       await wait(120) // attach parent + sub → both sidecars created
