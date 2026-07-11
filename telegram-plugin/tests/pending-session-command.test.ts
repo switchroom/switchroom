@@ -319,4 +319,25 @@ describe('drainTakenCommands (#3042 blocker 1: an early stop must not drop the r
     await drainTakenCommands(batch(), io)
     expect(events).toEqual(['edit:model:persisted:model', 'edit:effort:persisted:effort'])
   })
+
+  it('#3021: restart-pending is snapshotted at entry → sync loop emptying pendingRestarts mid-drain still defers the SECOND command', async () => {
+    // Reproduces the turn-end idle-gate race: the drain is void-dispatched while
+    // a synchronous pendingRestarts loop empties the map right after. The first
+    // read sees the entry; by the second command the map has been emptied. A
+    // naive per-command re-check would let the second command apply live into a
+    // session ~100ms from triggerSelfRestart and falsely confirm.
+    let restartPresent = true
+    const { io, events } = makeIo({
+      // takeAll() first read latches true; the sync loop then empties the map,
+      // so every subsequent live read returns false.
+      restartPending: () => {
+        const was = restartPresent
+        restartPresent = false // the sync loop deleted the entry after dispatch
+        return was
+      },
+    })
+    await drainTakenCommands(batch(), io)
+    // BOTH commands must ride the carriers — the second must NOT apply live.
+    expect(events).toEqual(['edit:model:persisted:model', 'edit:effort:persisted:effort'])
+  })
 })

@@ -162,14 +162,26 @@ export interface DrainIo {
  * both a model AND an effort command; breaking after re-enqueueing only the
  * current one would silently drop the other with its ack card stuck at
  * "queued" forever.
+ *
+ * Restart-pending is SNAPSHOTTED once at drain entry (#3021): the caller's
+ * `restartPending()` reads a `pendingRestarts` map that the turn-end idle gate
+ * empties in a synchronous loop dispatched right alongside this (async) drain.
+ * For the FIRST command the per-iteration read still sees the entry, but by the
+ * time an `await` yields to the second command the sync loop has emptied the
+ * map — so a naive per-command re-check would let the second command apply live
+ * into a session that is ~100ms from triggerSelfRestart and falsely confirm.
+ * Latching the entry state fixes that. We still OR in the live re-check so a
+ * restart that BECOMES pending mid-drain (a model apply can itself enqueue one)
+ * is honored for the commands that follow it.
  */
 export async function drainTakenCommands(
   taken: readonly PendingSessionCommand[],
   io: DrainIo,
 ): Promise<void> {
+  const restartPendingAtEntry = io.restartPending()
   for (let i = 0; i < taken.length; i++) {
     const cmd = taken[i]
-    if (io.restartPending()) {
+    if (restartPendingAtEntry || io.restartPending()) {
       // The live session is going away — carry the choice across the bounce
       // via the durable carriers (or the re-issue fallback).
       await io.editCard(cmd, io.resolveForRestartText(cmd))
