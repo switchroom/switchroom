@@ -23,7 +23,7 @@ import {
   TYPING_REFRESH_MS,
 } from '../typing-emitter.js'
 import { createTurnTypingLoop } from '../gateway/turn-typing-loop.js'
-import { createRetryApiCall } from '../retry-api-call.js'
+import { createRetryApiCall, isFloodWaitActiveError } from '../retry-api-call.js'
 import {
   floodStatePath,
   makeFloodWaitRecorder,
@@ -537,6 +537,25 @@ describe('typing sends record 429s to the flood breaker (#3084 / #2923)', () => 
     const fn = vi.fn().mockRejectedValue(errors.floodWait(16739))
     await expect(call(fn)).rejects.toThrow()
     expect(fn).toHaveBeenCalledTimes(1)
+  })
+
+  it('composes with #3094: a long ban surfaces FLOOD_WAIT_ACTIVE, still ONE call', async () => {
+    // #3094 bounded the in-process flood sleep: above the ceiling retryApiCall
+    // throws the FLOOD_WAIT_ACTIVE marker instead of sleeping out a multi-hour
+    // retry_after. For a typing ping that changes nothing that matters — the
+    // window is still recorded, the API is still hit exactly once, nothing is
+    // slept. The gateway's onRejected handler drops the marker, so a
+    // fire-and-forget ping can't surface it as an unhandled rejection.
+    const call = nonEssentialApiCall()
+    const fn = vi.fn().mockRejectedValue(errors.floodWait(16739))
+
+    const err = await call(fn).then(
+      () => null,
+      (e: unknown) => e,
+    )
+    expect(isFloodWaitActiveError(err)).toBe(true)
+    expect(fn).toHaveBeenCalledTimes(1)
+    expect(suppressNonEssentialSendMs(path, Date.now())).toBeGreaterThan(0)
   })
 
   it('the recorded window then suppresses further typing end-to-end', async () => {

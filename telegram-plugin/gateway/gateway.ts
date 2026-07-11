@@ -187,6 +187,7 @@ import {
   createSwallowingRetryApiCall,
   retryWithThreadFallback,
   isPhotoDimensionRejectError,
+  isFloodWaitActiveError,
 } from '../retry-api-call.js'
 import { classifyPhotoFile, rerouteResultSuffix } from '../photo-precheck.js'
 import { installTgPostLogger, withTgPostTags } from '../shared/bot-runtime.js'
@@ -5362,17 +5363,25 @@ const swallowingApiCall = createSwallowingRetryApiCall(
  * which only learns about 429s through `createRetryApiCall`'s `onFloodWait`
  * hook — was blind to 429s from the biggest source of them.
  *
- * `maxRetries: 1` + a no-op sleep gives exactly one attempt: a 429 still runs
- * `onFloodWait` (recording the window to the breaker), then the call gives up
- * immediately instead of sleeping out a 4-hour retry_after. The swallowing
- * wrapper logs and drops the failure.
+ * `maxRetries: 1` + a no-op sleep gives exactly one attempt at the API, whatever
+ * the outcome: a 429 still runs `onFloodWait` (recording the window to the
+ * breaker), and then the call ends — a SHORT ban falls out of the loop as
+ * `max retries exceeded`, a LONG one throws #3094's `FLOOD_WAIT_ACTIVE`. Either
+ * way the ping is dropped, never slept and never retried. That is the whole
+ * point: a retried non-essential send is what feeds a ban.
+ *
+ * Composes cleanly on top of #3094 (`bbe14471`): that PR bounded the in-process
+ * flood sleep and added a pre-call gate for LONG open windows. This wrapper
+ * pre-dates neither mechanism nor fights them — it sits under the emitter's own
+ * flood gate, which short-circuits earlier still (a typing ping during a ban
+ * never even reaches the retry layer). Defense in depth, in that order.
  */
 // No `log` hook: retryApiCall's flood line reads "waiting Ns", which would be a
-// lie here — we never wait, we drop. And the error the caller finally sees is
-// `retryApiCall: max retries exceeded` (retry-api-call.ts replaces the original
-// on give-up), which would hide the retry_after — the single number an operator
-// needs during a flood ban. So the honest 429 line is written HERE, in the
-// onFloodWait hook, where the real retry_after is still in hand.
+// lie here — we never wait, we drop. And the error the caller finally sees names
+// neither the code nor the retry_after (retryApiCall replaces the original on
+// give-up) — and retry_after is the single number an operator needs during a
+// ban. So the honest 429 line is written HERE, in the onFloodWait hook, where
+// the real value is still in hand.
 const recordTypingFloodWait = makeFloodWaitRecorder(FLOOD_STATE_PATH)
 const nonEssentialApiCall = createRetryApiCall({
   maxRetries: 1,
@@ -5466,11 +5475,15 @@ const typingEmitter = createTypingEmitter({
           typingRetryTimers.set(key, retry)
           return
         }
-        // A 429 already logged its retry_after (and hit the breaker) in
-        // onFloodWait above; by the time it lands here retryApiCall has
-        // replaced it with the opaque give-up error, so don't double-log a
-        // line that names neither the code nor the retry_after.
-        if (msg.includes('max retries exceeded')) return
+        // A flood-wait already logged its retry_after (and hit the breaker) in
+        // onFloodWait above. What lands here is either retryApiCall's opaque
+        // give-up error (short ban) or #3094's FLOOD_WAIT_ACTIVE marker (long
+        // ban / pre-call gate) — neither names the retry_after, so don't
+        // double-log a strictly less informative line. Both are DROPS: a
+        // typing ping is never retried, and the marker is caught here (this is
+        // an onRejected handler), so it can't surface as an unhandled rejection
+        // out of a fire-and-forget ping.
+        if (isFloodWaitActiveError(err) || msg.includes('max retries exceeded')) return
         // Everything else is DROPPED, never retried — but logged, so the
         // largest outbound emitter is no longer silent (#3084).
         process.stderr.write(
