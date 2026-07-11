@@ -268,12 +268,31 @@ export function createBlockedApprovalStore(
    *
    * This exists so the feature cannot silently no-op. If the shared bind is
    * missing (a container predating the volume), or auto-created root-owned, the
-   * record still lands somewhere the operator and switchroom-web can read —
-   * web mounts all of `~/.switchroom`, so both locations are reachable.
+   * record still lands somewhere the operator and switchroom-web can read.
+   *
+   * **Reachable by mount is not the same as readable, and neither is the same as
+   * READ.** That elision is a bug this comment used to paper over: it claimed
+   * "web mounts all of ~/.switchroom, so both locations are reachable" — true,
+   * and irrelevant, because the reader only ever scanned the shared dir. The
+   * fallback was written to a file nobody read (#3109). Two things must hold, and
+   * both are load-bearing: if either regresses, the record exists, the agent is
+   * held, and the dashboard still prints "No agent is blocked".
+   *
+   *   1. **Mode.** The record is written 0644 into the 0775 agent dir. Verified
+   *      live: `docker exec switchroom-web` reads a 0644 file under
+   *      `~/.switchroom/agents/<agent>/` fine and gets EACCES only on the 0600
+   *      files beside it. The FILE's mode locks web out, never the directory.
+   *   2. **The reader must LOOK here.** It now does —
+   *      `src/web/blocked-approvals-read.ts` scans the shared dir AND
+   *      `agents/<agent>/blocked-approval.json` (its `FALLBACK_RECORD_NAME`,
+   *      which must stay in sync with the filename below).
    */
   fallbackDir?: string,
 ): BlockedApprovalStore {
   const primary = join(dir, `${agent}.json`)
+  // Keep in sync with FALLBACK_RECORD_NAME in src/web/blocked-approvals-read.ts —
+  // the reader matches this filename exactly. Pinned by the fallback-contract
+  // tests in src/web/blocked-approvals.test.ts.
   const fallback = fallbackDir != null ? join(fallbackDir, 'blocked-approval.json') : null
 
   /** Where the last successful write landed — `read`/`clear` must agree with it. */

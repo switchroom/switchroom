@@ -621,6 +621,48 @@ describe("generateCompose", () => {
     expect(out).not.toContain("${HOME}");
   });
 
+  // ───────────────────────────────────────────────────────────────────────────
+  // The blocked-approvals surface (#3084 follow-up). When an approval card
+  // can't be delivered, the gateway HOLDS the approval — it never auto-denies —
+  // and writes a world-readable record into this SHARED dir so the operator can
+  // see the block without Telegram. Every agent gets the mount, which makes it
+  // the highest-blast-radius line in this generator: on 2026-06-23 a bind source
+  // whose root resolved to a CONTAINER path made docker auto-create root-owned
+  // dirs, the brokers crashed, and the fleet stuck in `Created`.
+  //
+  // reference/jobs/approve-what-my-agent-can-touch.md
+  // ───────────────────────────────────────────────────────────────────────────
+  it("mounts the shared blocked-approvals dir for EVERY agent, under the host-home prefix", () => {
+    const out = generateCompose({
+      config: makeConfig({ a: {}, b: {} }),
+      homeDir: "/home/op",
+    });
+
+    // Shared TOP-LEVEL dir, not per-agent state: switchroom-web reads every
+    // agent's record from one place. Writable (:rw) — the agent writes it.
+    const line = "/home/op/.switchroom/blocked-approvals:/state/blocked-approvals:rw";
+    expect(out).toContain(line);
+    // Once per agent. A record the gateway cannot write is a block the operator
+    // never sees, so a missing mount on ANY agent is a silent hole.
+    expect(out.split(line).length - 1).toBe(2);
+
+    // The bind SOURCE is the host-home prefix — never a container path. This is
+    // the 2026-06-23 outage in one assertion: a `/state/...` or `/host-home/...`
+    // source root is what took the fleet down.
+    expect(out).not.toContain("/state/agent/home/.switchroom/blocked-approvals");
+    expect(out).not.toContain("/host-home/.switchroom/blocked-approvals:");
+  });
+
+  it("cannot emit a blocked-approvals mount rooted at a container path", () => {
+    // assertPlausibleHostHome is the guard, and it fires BEFORE any line is
+    // emitted — so the dangerous mount is unrepresentable, not merely unlikely.
+    for (const bad of ["/state/agent/home", "/host-home", "/state"]) {
+      expect(() =>
+        generateCompose({ config: makeConfig({ a: {} }), homeDir: bad }),
+      ).toThrow(/host-home prefix/);
+    }
+  });
+
   it("emits skills (fleet-wide) + PER-AGENT credentials :ro mount (sec WS6-F2)", async () => {
     const { mkdtempSync, mkdirSync, rmSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");

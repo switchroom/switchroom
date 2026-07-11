@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, chmodSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -12,6 +12,10 @@ import {
   type BlockedApproval,
 } from "./blocked-approvals-read.js";
 import { deriveAttention, handleGetSummary } from "./api.js";
+// The REAL gateway-side writer. The fallback contract below is a two-module
+// contract (writer picks the path, reader has to scan it); testing either half
+// alone is how it shipped broken.
+import { createBlockedApprovalStore } from "../../telegram-plugin/gateway/approval-hold.js";
 
 /**
  * The blocked-approvals surface: an agent held on an approval it could not
@@ -24,10 +28,17 @@ import { deriveAttention, handleGetSummary } from "./api.js";
  * must not hide the records it CAN read).
  */
 describe("readBlockedApprovals (Telegram-independent view of a held agent)", () => {
+  let root: string;
   let dir: string;
 
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "sr-blocked-appr-"));
+    // Mirror the production layout: the shared dir has an `agents` SIBLING (the
+    // per-agent fallback root the reader also scans). A bare mkdtemp dir would
+    // make that sibling resolve to `<tmp>/agents` — outside the fixture, and so
+    // not hermetic.
+    root = mkdtempSync(join(tmpdir(), "sr-blocked-appr-"));
+    dir = join(root, "blocked-approvals");
+    mkdirSync(dir, { recursive: true });
   });
   afterEach(() => {
     // chmod back first — a 0000 file inside can defeat the recursive rm.
@@ -36,7 +47,7 @@ describe("readBlockedApprovals (Telegram-independent view of a held agent)", () 
     } catch {
       /* not every case writes it */
     }
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
   });
 
   const NOW = 1783756731607;
@@ -307,6 +318,157 @@ describe("readBlockedApprovals (Telegram-independent view of a held agent)", () 
   it("handleGetBlockedApprovals reads the dir it is given", () => {
     write("overlord", overlord);
     expect(handleGetBlockedApprovals(dir).map((b) => b.agent)).toEqual(["overlord"]);
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // THE FALLBACK CONTRACT (#3109 gap). The gateway's store writes the shared
+  // record when it can and falls back to the agent's OWN state dir when the
+  // shared dir isn't writable by the agent's uid. That fallback shipped writing
+  // a DIFFERENT filename in a DIFFERENT directory from the only one this reader
+  // scanned — so the record existed, the agent was held, and the dashboard said
+  // "No agent is blocked". These drive the REAL writer against the REAL reader.
+  // ───────────────────────────────────────────────────────────────────────────
+  describe("the FALLBACK record (agent's own state dir) reaches the dashboard", () => {
+    /**
+     * The production trigger, faithfully: the SHARED dir cannot be written by
+     * this uid. In prod that is docker auto-creating the bind source root-owned
+     * while the agent runs as uid 10001+. A test can't chown, and it can't just
+     * chmod the shared dir either — `tryWrite` chmods its own parent back to
+     * 1777, and in-test we OWN it, so that would succeed and no fallback fires.
+     * So make the shared dir UNCREATABLE by locking its parent (the pattern from
+     * telegram-plugin/tests/approval-hold-record.test.ts). Same `tryWrite` →
+     * false → fallback branch, no root required.
+     */
+    let locked: string; // read-only parent
+    let sharedDir: string; // the (uncreatable) shared dir under it
+    let agentsRoot: string; // its `agents` sibling — the fallback root
+
+    beforeEach(() => {
+      locked = join(root, "locked");
+      sharedDir = join(locked, "blocked-approvals");
+      agentsRoot = join(locked, "agents");
+      mkdirSync(agentsRoot, { recursive: true });
+    });
+    afterEach(() => {
+      try {
+        chmodSync(locked, 0o755);
+      } catch {
+        /* not every case locks it */
+      }
+    });
+
+    /** The real gateway store, pointed at the locked layout. */
+    function heldStore(agent: string) {
+      const ownDir = join(agentsRoot, agent);
+      mkdirSync(ownDir, { recursive: true });
+      const s = createBlockedApprovalStore(sharedDir, agent, ownDir);
+      chmodSync(locked, 0o500); // shared dir now uncreatable — fallback territory
+      return { store: s, ownDir };
+    }
+
+    /** The real gateway store, writing into the WRITABLE outer fixture. */
+    function store(agent: string) {
+      const ownDir = join(root, "agents", agent);
+      mkdirSync(ownDir, { recursive: true });
+      return { store: createBlockedApprovalStore(dir, agent, ownDir), ownDir };
+    }
+
+    const rec = (agent: string) => ({
+      agent,
+      requestId: "req-held-1",
+      toolName: "Bash",
+      action: "run shell commands",
+      blockedSince: NOW - 47 * 60_000,
+      undeliverableSince: NOW - 47 * 60_000,
+      retryableAt: NOW + 13 * 60_000,
+      reason: "flood_wait" as const,
+    });
+
+    it("is READ by the web reader when the shared dir is unwritable", () => {
+      const s = heldStore("overlord");
+      s.store.write(rec("overlord"));
+
+      // The record landed in the agent's OWN dir, not the shared one…
+      expect(s.store.path).toBe(join(s.ownDir, "blocked-approval.json"));
+      // …and the reader finds it anyway. Before this fix: [] — a held agent,
+      // a record on disk, and a dashboard saying "No agent is blocked".
+      const blocked = readBlockedApprovals(sharedDir);
+      expect(blocked.map((b) => b.agent)).toEqual(["overlord"]);
+      expect(blocked[0].requestId).toBe("req-held-1");
+      expect(blocked[0].reason).toBe("flood_wait");
+      // And it is not miscounted as a read FAILURE — the surface must say
+      // "overlord is blocked", not "I could not look".
+      expect(readBlockedApprovalsWithErrors(sharedDir).unreadable).toBe(0);
+    });
+
+    it("is written world-readable — a 0600 fallback would be invisible to web", () => {
+      // The web container is uid 1000 and the agent dir is agent-uid-owned. The
+      // dir is traversable (0775); it is the FILE's mode that decides whether
+      // web can read it. 0600 here = a silently empty dashboard.
+      const s = heldStore("overlord");
+      s.store.write(rec("overlord"));
+      expect(statSync(s.store.path).mode & 0o004).toBe(0o004);
+    });
+
+    it("does not double-report an agent that also has a shared record", () => {
+      // The store unlinks its fallback once a shared write succeeds, so a
+      // leftover fallback is stale by definition. Belt-and-braces: even if both
+      // files exist, the agent surfaces ONCE, from the canonical shared record.
+      const s = store("overlord");
+      mkdirSync(s.ownDir, { recursive: true });
+      writeFileSync(
+        join(s.ownDir, "blocked-approval.json"),
+        JSON.stringify({ ...rec("overlord"), requestId: "req-STALE" }),
+      );
+      write("overlord", { ...rec("overlord"), requestId: "req-LIVE" });
+
+      const blocked = readBlockedApprovals(dir);
+      expect(blocked).toHaveLength(1);
+      expect(blocked[0].requestId).toBe("req-LIVE");
+    });
+
+    it("clears both locations, so a resolved hold leaves nothing behind", () => {
+      const s = heldStore("overlord");
+      s.store.write(rec("overlord"));
+      expect(readBlockedApprovals(sharedDir)).toHaveLength(1);
+      s.store.clear();
+      // A stale record would keep the dashboard shouting about a block that is
+      // over — the mirror image of the invisible-block bug, equally corrosive.
+      expect(readBlockedApprovals(sharedDir)).toEqual([]);
+    });
+
+    it("ranks a fallback record alongside shared ones by hold age", () => {
+      write("clerk", { ...rec("clerk"), blockedSince: NOW - 5 * 60_000 });
+      const s = store("marko");
+      mkdirSync(s.ownDir, { recursive: true });
+      writeFileSync(
+        join(s.ownDir, "blocked-approval.json"),
+        JSON.stringify({ ...rec("marko"), blockedSince: NOW - 3 * 3600_000 }),
+      );
+      // marko (3h, fallback) has been waiting longest and must lead.
+      expect(readBlockedApprovals(dir).map((b) => b.agent)).toEqual(["marko", "clerk"]);
+    });
+
+    it("an agents dir with no held agent is an honest empty, not an 'unreadable'", () => {
+      mkdirSync(join(root, "agents", "clerk"), { recursive: true });
+      mkdirSync(join(root, "agents", "overlord"), { recursive: true });
+      expect(readBlockedApprovalsWithErrors(dir)).toEqual({ blocked: [], unreadable: 0 });
+    });
+
+    it("counts an UNREADABLE fallback record rather than implying all-clear", () => {
+      const s = store("overlord");
+      const f = join(s.ownDir, "blocked-approval.json");
+      writeFileSync(f, JSON.stringify(rec("overlord")));
+      chmodSync(f, 0o000); // the 0600-mode trap, in its extreme form
+      try {
+        const { blocked, unreadable } = readBlockedApprovalsWithErrors(dir);
+        expect(blocked).toEqual([]);
+        // "I could not look" — NEVER "nothing is blocked".
+        expect(unreadable).toBe(1);
+      } finally {
+        chmodSync(f, 0o644);
+      }
+    });
   });
 });
 
