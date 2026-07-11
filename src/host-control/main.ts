@@ -25,6 +25,7 @@ import { existsSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { ConfigError, findConfigFile, loadConfig } from "../config/loader.js";
 import {
+  clearStaleDegradedMarker,
   postOperatorNoticeViaGateways,
   waitForConfigRecovery,
   type GatewayCandidate,
@@ -55,7 +56,17 @@ async function loadConfigResilient(): Promise<
   ReturnType<typeof loadConfig>
 > {
   try {
-    return loadConfig();
+    const config = loadConfig();
+    // Healthy boot: remove any degraded marker orphaned by a hostd that
+    // died while degraded after the operator had already fixed the yaml.
+    // Left in place it would report degraded-forever to marker-keyed
+    // health checks AND poison the NEXT degrade episode's persisted-epoch
+    // credit (an ancient `since` → months-long degradedMs → preservation
+    // cap refuses a genuinely fresh pending rollout).
+    clearStaleDegradedMarker(homedir(), (m) =>
+      process.stderr.write(`hostd: ${m}\n`),
+    );
+    return config;
   } catch (err) {
     if (!(err instanceof ConfigError)) throw err;
     // Discover the config path (for the file watcher) without letting a

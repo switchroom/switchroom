@@ -21,6 +21,7 @@ import type { SwitchroomConfig } from "../config/schema.js";
 import {
   CONFIG_DEGRADED_MARKER_FILENAME,
   MAX_PRESERVED_DEGRADED_MS,
+  clearStaleDegradedMarker,
   buildDegradedMarker,
   formatDegradedNotice,
   formatRecoveredNotice,
@@ -131,6 +132,63 @@ describe("notices", () => {
       error: "boom",
       details: ["  d1"],
     });
+  });
+});
+
+describe("clearStaleDegradedMarker (healthy-boot orphan cleanup)", () => {
+  it("removes an orphaned marker so it cannot poison the NEXT degrade episode's credit", async () => {
+    const home = makeHome();
+    const hostdDir = join(home, ".switchroom", "hostd");
+    mkdirSync(hostdDir, { recursive: true });
+    const degradedPath = join(hostdDir, CONFIG_DEGRADED_MARKER_FILENAME);
+    let clock = Date.parse("2026-07-11T12:00:00.000Z");
+    // Orphan from months ago: hostd died degraded, operator fixed the yaml
+    // before it came back, healthy boots never ran the recovery path.
+    writeFileSync(
+      degradedPath,
+      JSON.stringify({
+        v: 1,
+        since: new Date(clock - 60 * 24 * 3_600_000).toISOString(), // ~2 months
+        error: "long-fixed yaml",
+      }),
+    );
+
+    // Healthy boot clears it (and logs why).
+    const logs: string[] = [];
+    expect(clearStaleDegradedMarker(home, (m) => logs.push(m))).toBe(true);
+    expect(existsSync(degradedPath)).toBe(false);
+    expect(logs.join("\n")).toContain("clearing stale degraded marker");
+    // Idempotent no-op when nothing is there.
+    expect(clearStaleDegradedMarker(home, () => {})).toBe(false);
+
+    // A LATER genuine 5-minute outage now credits only its real window:
+    // a pending rollout marker from just before that outage is preserved
+    // (without the cleanup, degradedMs would have computed as ~2 months,
+    // blowing the 4h cap and refusing preservation).
+    const pendingPath = join(hostdDir, SELF_BUMP_MARKER_FILENAME);
+    writeFileSync(pendingPath, encodePendingRolloutMarker(makeMarker(clock - 60_000)));
+    const notices: string[] = [];
+    let first = true;
+    await waitForConfigRecovery({
+      initialError: new ConfigError("new outage"),
+      homeDir: home,
+      loadFn: () => {
+        if (first) {
+          first = false;
+          clock += 5 * 60_000; // the real outage: 5 minutes
+          throw new ConfigError("still broken");
+        }
+        return fakeConfig;
+      },
+      notify: (t) => notices.push(t),
+      log: () => {},
+      retryMs: 10,
+      nowFn: () => clock,
+    });
+    const preserved = parsePendingRolloutMarker(readFileSync(pendingPath, "utf8"));
+    expect(isMarkerFresh(preserved!, clock)).toBe(true);
+    expect(notices[1]).toContain("will resume now");
+    expect(notices[1]).not.toContain("NOT auto-resumed");
   });
 });
 

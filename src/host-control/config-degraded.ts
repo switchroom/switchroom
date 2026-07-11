@@ -188,6 +188,43 @@ export function shiftPendingRolloutMarker(
   });
 }
 
+/**
+ * Clear an orphaned `config-degraded.json` on a HEALTHY boot. If hostd
+ * died while degraded and the operator fixed the yaml before it came
+ * back, the next boot loads config cleanly and never runs the recovery
+ * path — leaving the marker behind would (a) make marker-keyed health
+ * checks report degraded forever, and (b) poison a future degrade
+ * episode, whose `readDegradedSince` would inherit the ancient `since`,
+ * compute a months-long degradedMs, blow past the preservation cap, and
+ * refuse to preserve a genuinely fresh pending rollout. Returns true when
+ * a stale marker was removed. Never throws.
+ */
+export function clearStaleDegradedMarker(
+  homeDir: string,
+  log: (msg: string) => void,
+): boolean {
+  const markerPath = join(
+    homeDir,
+    ".switchroom",
+    "hostd",
+    CONFIG_DEGRADED_MARKER_FILENAME,
+  );
+  try {
+    if (!existsSync(markerPath)) return false;
+    unlinkSync(markerPath);
+    log(
+      `config-degraded: clearing stale degraded marker from a prior crash ` +
+        `(${markerPath}) — config loads cleanly on this boot`,
+    );
+    return true;
+  } catch (e) {
+    log(
+      `config-degraded: could not clear stale marker ${markerPath}: ${(e as Error).message}`,
+    );
+    return false;
+  }
+}
+
 /** A candidate gateway IPC socket for the degraded-mode operator DM. */
 export interface GatewayCandidate {
   agent: string;
