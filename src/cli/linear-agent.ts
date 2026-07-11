@@ -22,8 +22,24 @@
 
 import { Command } from "commander";
 import chalk from "chalk";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { getConfigPath, withConfigError } from "./helpers.js";
+import { writeConfigFileSync } from "../util/atomic.js";
+
+/**
+ * Write the fleet's switchroom.yaml atomically (tmp + fsync + rename,
+ * bind-mount-aware) so a crash / ENOSPC mid-write can never truncate it
+ * (2026-07 review, #3149 follow-up). Preserves the file's existing mode.
+ */
+function writeConfigAtomic(path: string, after: string): void {
+  let mode = 0o644;
+  try {
+    mode = statSync(path).mode & 0o777;
+  } catch {
+    /* default 0o644 */
+  }
+  writeConfigFileSync(path, after, mode);
+}
 import { setLinearAgent, setLinearDefaultTeam, addAgentSecret } from "./telegram-yaml.js";
 import { vaultPut, vaultPutQuiet, vaultGet } from "./telegram.js";
 import { performLinearRefresh, serializeBundle } from "../linear/oauth-refresh.js";
@@ -161,7 +177,7 @@ export function registerLinearAgentCommand(program: Command): void {
           console.log(chalk.bold(`[dry-run] would edit ${path}`));
           console.log(makeUnifiedDiff(before, after));
         } else {
-          writeFileSync(path, after, "utf-8");
+          writeConfigAtomic(path, after);
           console.log(chalk.green(`✓ Enabled linear-agent for agent '${opts.agent}'`));
           console.log(chalk.gray(`  Vault key: ${vaultKey}`));
           if (canRefresh) {
@@ -259,7 +275,7 @@ export function registerLinearAgentCommand(program: Command): void {
         } catch (err) {
           fail((err as Error).message);
         }
-        writeFileSync(path, after, "utf-8");
+        writeConfigAtomic(path, after);
         if (opts.clear) {
           console.log(chalk.green(`✓ Cleared default Linear team for '${opts.agent}' (auto-resolve).`));
         } else {
