@@ -26083,16 +26083,22 @@ function flushReactionBatch(batch: ReactionBatch): void {
     text,
     meta,
   }
-  const delivered = ipcServer.sendToAgent(agentName, inbound)
-  if (delivered) markClaudeBusyForInbound(inbound)
+  // #2094 finding 3 — route the reaction flush through the SAME #1556
+  // decideInboundDelivery gate every other synthetic inbound uses (via
+  // deliverResumeSyntheticOrBuffer), instead of a raw ipcServer.sendToAgent.
+  // A reaction that lands WHILE a turn is in flight was previously fired
+  // mid-turn — the bridge typed it into the CLI composer where it stranded
+  // by the turn-completion race (the #1556 composer wedge). Now a mid-turn
+  // reaction buffers-until-idle (the turn-complete hook + idle-drain timer
+  // flush pendingInboundBuffer the instant claude goes idle, landing cleanly
+  // as a fresh turn); an idle reaction delivers now, buffering only on a
+  // genuine bridge-offline miss — the #1150 buffer-on-failure guarantee,
+  // preserved inside the helper.
+  const delivered = deliverResumeSyntheticOrBuffer(agentName, inbound)
   process.stderr.write(
     `telegram gateway: reactions.dispatch agent=${agentName} chat=${batch.chatId} ` +
     `count=${batch.reactions.length} batched=${batch.batched} delivered=${delivered}\n`,
   )
-  // #1150: buffer-on-failure for reaction-triggered wake-ups too.
-  if (!delivered) {
-    pendingInboundBuffer.push(agentName, inbound)
-  }
 }
 
 // ─── Inbound message_reaction handler ────────────────────────────────────
