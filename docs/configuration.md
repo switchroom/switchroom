@@ -720,6 +720,8 @@ auth:
   fallback_order:               # cycle list for `auth rotate` / 429 failover
     - me@example.com
     - work
+  proactive_failover_pct: 95    # optional soft-avoid tier: prefer away from an
+                                # account nearing its quota wall (unset = off)
 ```
 
 Bootstrap and day-to-day verbs:
@@ -747,6 +749,17 @@ account from `fallback_order`, and atomically rewrites their per-agent
 `.credentials.json`. Failover propagates in seconds without per-agent
 restarts. When the exhaustion window passes the broker clears the mark
 and agents that prefer the cleared account drift back on next idle.
+
+### Proactive soft-avoid (`auth.proactive_failover_pct`)
+
+Optional. When set (e.g. `95`), an account whose fresh 7-day
+utilization reaches the pct (or 5h utilization reaches
+`min(pct + 3, 98)`) is *soft-avoided*: the broker prefers a
+fully-eligible fallback on the serving path, with hysteresis so the
+preference does not flap between probe ticks. Soft-avoid never blocks —
+if every candidate is soft-avoided the least-utilized one still serves.
+Unset means the tier is off and behavior is unchanged. Details in
+[`docs/auth.md`](auth.md).
 
 ### Broker-internal token refresh
 

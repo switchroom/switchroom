@@ -340,3 +340,156 @@ export function clampMarkExpiry(opts: {
     snapshotFresh(snapshot, now) && snapshot.sevenDayUtilizationPct < WALL_PCT;
   return liveContradictsWeeklyWall ? shortCeil : proposedUntil;
 }
+
+/* ───────────────────────── Soft-avoid tier (#3031, PR 1/4) ───────────────── */
+
+/**
+ * The 5h-window soft-avoid threshold is `pct + 3`, capped here. The 5h window
+ * refills fast, so it gets a little more headroom than the weekly window
+ * before we start preferring away — but never so close to WALL_PCT that the
+ * preference and the hard wall collapse into the same event.
+ */
+export const SOFT_AVOID_FIVE_HOUR_CAP = 98;
+
+/**
+ * Hysteresis exit margin: once soft-avoided, an account only re-earns full
+ * preference when utilization drops this many points BELOW the entry
+ * threshold (or its window resets). Stops the preference flapping when a
+ * probe oscillates around pct (e.g. 94↔96 across 10-min ticks with pct=95).
+ */
+export const SOFT_AVOID_EXIT_MARGIN = 5;
+
+/** Entry thresholds for the soft-avoid tier at a given operator pct. */
+export function softAvoidThresholds(pct: number): { sevenDay: number; fiveHour: number } {
+  return { sevenDay: pct, fiveHour: Math.min(pct + 3, SOFT_AVOID_FIVE_HOUR_CAP) };
+}
+
+/**
+ * Per-account hysteresis state the caller carries between evaluations.
+ * `fiveHourResetAt` / `sevenDayResetAt` are the window-reset epochs (unix ms)
+ * observed when the state was last written — an ADVANCED reset epoch on a
+ * newer snapshot means the window rolled, which clears the hysteresis latch.
+ */
+export interface SoftAvoidState {
+  softAvoided: boolean;
+  /**
+   * Which window(s) latched the current soft-avoid. Only a TRIGGERING
+   * window's reset (or its util dropping clear of the exit threshold) may
+   * release the latch — the 5h epoch advances every ≤5h, so letting ANY
+   * window's reset clear a 7d-driven latch would cap the 7d hysteresis at
+   * ~5h and reintroduce the flapping the latch exists to prevent.
+   * Absent (legacy state written before this field) → treated as
+   * both-triggered, the conservative/stickier direction.
+   */
+  triggeredBy?: { fiveHour: boolean; sevenDay: boolean };
+  fiveHourResetAt?: number | null;
+  sevenDayResetAt?: number | null;
+}
+
+/** The snapshot shape soft-avoid needs: utilization + optional reset epochs. */
+export interface SoftAvoidSnapshot extends QuotaSnapshot {
+  /** Unix ms of the 5h window's next reset, when the probe carried it. */
+  fiveHourResetAtMs?: number | null;
+  /** Unix ms of the 7d window's next reset, when the probe carried it. */
+  sevenDayResetAtMs?: number | null;
+}
+
+/**
+ * THE soft-avoid decision — a PREFERENCE tier between `eligible` and
+ * `blocked` (#3031). An account in this tier still serves; callers merely
+ * rank fully-eligible candidates ahead of it. It MUST NEVER be treated as a
+ * block, and it MUST NEVER affect attribution (mark-exhausted).
+ *
+ * Semantics:
+ *  - `pct` unset (config `auth.proactive_failover_pct` absent) → NEVER
+ *    soft-avoided. This is the structural no-behavior-change guarantee.
+ *  - Overage-lifted accounts (see {@link overageLiftsWall}) are NEVER
+ *    soft-avoided: the operator explicitly opted them into serving past the
+ *    wall, so pre-wall avoidance would be nonsense.
+ *  - ENTER when a fresh snapshot shows 7d ≥ pct, or 5h ≥ min(pct+3, 98).
+ *    The state records WHICH window(s) triggered ({@link SoftAvoidState}
+ *    `triggeredBy`).
+ *  - EXIT (hysteresis) only when EVERY triggering window has released:
+ *    a triggering window releases when its utilization drops below its
+ *    entry threshold minus {@link SOFT_AVOID_EXIT_MARGIN}, or when THAT
+ *    window has visibly reset (its reset epoch advanced, or the snapshot's
+ *    own reset time has passed → window refilled). A non-triggering
+ *    window's reset never releases the latch — the 5h epoch rolls every
+ *    ≤5h, which would cap a 7d-driven latch at ~5h.
+ *  - No fresh snapshot → carry the previous state unchanged (no evidence to
+ *    flip either way; a never-measured account is not soft-avoided).
+ *
+ * PURE — no I/O, no clock except the injected `now`.
+ */
+export function evaluateSoftAvoid(opts: {
+  snapshot?: SoftAvoidSnapshot;
+  now: number;
+  /** `auth.proactive_failover_pct`; undefined = feature off. */
+  pct?: number;
+  /** True when {@link overageLiftsWall} holds for this account right now. */
+  overageLifted?: boolean;
+  /** Previous hysteresis state for this account, if any. */
+  prev?: SoftAvoidState;
+}): SoftAvoidState {
+  const { snapshot, now, pct, overageLifted = false, prev } = opts;
+  if (pct === undefined) return { softAvoided: false };
+  if (overageLifted) return { softAvoided: false };
+  if (!snapshotFresh(snapshot, now)) {
+    // No usable live evidence — hold the previous verdict (latch included).
+    return prev ?? { softAvoided: false };
+  }
+  const s = snapshot as SoftAvoidSnapshot;
+  const thresholds = softAvoidThresholds(pct);
+
+  // Refill-normalize: a window whose reset time has already passed rolled
+  // after capture — its stale utilization reads as 0 (matches quota.ts's
+  // refillNormalizedUtils semantics without importing the Date-based shape).
+  const fiveRefilled = s.fiveHourResetAtMs != null && s.fiveHourResetAtMs <= now;
+  const sevenRefilled = s.sevenDayResetAtMs != null && s.sevenDayResetAtMs <= now;
+  const five = fiveRefilled ? 0 : s.fiveHourUtilizationPct;
+  const seven = sevenRefilled ? 0 : s.sevenDayUtilizationPct;
+
+  const nextState = (
+    softAvoided: boolean,
+    triggeredBy?: { fiveHour: boolean; sevenDay: boolean },
+  ): SoftAvoidState => ({
+    softAvoided,
+    ...(softAvoided && triggeredBy ? { triggeredBy } : {}),
+    fiveHourResetAt: s.fiveHourResetAtMs ?? prev?.fiveHourResetAt ?? null,
+    sevenDayResetAt: s.sevenDayResetAtMs ?? prev?.sevenDayResetAt ?? null,
+  });
+
+  const fiveTriggered = five >= thresholds.fiveHour;
+  const sevenTriggered = seven >= thresholds.sevenDay;
+  if (fiveTriggered || sevenTriggered) {
+    return nextState(true, { fiveHour: fiveTriggered, sevenDay: sevenTriggered });
+  }
+
+  if (prev?.softAvoided) {
+    // Latch is set. It clears only when EVERY window that triggered it has
+    // released: released = that window's reset epoch advanced since the
+    // state was written (or its refill boundary crossed), OR its util now
+    // sits below entry-threshold minus the exit margin. A non-triggering
+    // window's reset must NOT release the latch — the 5h epoch advances
+    // every ≤5h, which would cap a 7d-driven latch at ~5h. Legacy states
+    // without `triggeredBy` are treated as both-triggered (stickier).
+    const trig = prev.triggeredBy ?? { fiveHour: true, sevenDay: true };
+    const fiveReleased =
+      !trig.fiveHour ||
+      fiveRefilled ||
+      (prev.fiveHourResetAt != null &&
+        s.fiveHourResetAtMs != null &&
+        s.fiveHourResetAtMs > prev.fiveHourResetAt) ||
+      five < thresholds.fiveHour - SOFT_AVOID_EXIT_MARGIN;
+    const sevenReleased =
+      !trig.sevenDay ||
+      sevenRefilled ||
+      (prev.sevenDayResetAt != null &&
+        s.sevenDayResetAtMs != null &&
+        s.sevenDayResetAtMs > prev.sevenDayResetAt) ||
+      seven < thresholds.sevenDay - SOFT_AVOID_EXIT_MARGIN;
+    if (fiveReleased && sevenReleased) return nextState(false);
+    return nextState(true, trig);
+  }
+  return nextState(false);
+}

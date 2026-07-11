@@ -1170,3 +1170,53 @@ describe("auth.allow_overage_accounts config field", () => {
     ).toThrow();
   });
 });
+
+// ─── auth.proactive_failover_pct config field (#3031) ───────────────────────
+
+describe("auth.proactive_failover_pct config field", () => {
+  const minimalBase = {
+    switchroom: { version: 1 },
+    agents: {},
+    telegram: { bot_token: "123:abc", forum_chat_id: "456" },
+  };
+
+  it("accepts a valid pct and threads through to AuthConfig", () => {
+    const cfg = SwitchroomConfigSchema.parse({
+      ...minimalBase,
+      auth: { active: "alice", proactive_failover_pct: 95 },
+    });
+    expect(cfg.auth?.proactive_failover_pct).toBe(95);
+  });
+
+  it("defaults to undefined when omitted — the soft-avoid tier is off by default", () => {
+    const cfg = SwitchroomConfigSchema.parse({
+      ...minimalBase,
+      auth: { active: "alice" },
+    });
+    expect(cfg.auth?.proactive_failover_pct).toBeUndefined();
+  });
+
+  it("rejects values above 99 (must stay below the hard wall)", () => {
+    expect(() =>
+      SwitchroomConfigSchema.parse({
+        ...minimalBase,
+        auth: { active: "alice", proactive_failover_pct: 99.5 },
+      }),
+    ).toThrow();
+  });
+
+  it("rejects zero/negative and non-numeric values", () => {
+    expect(() =>
+      SwitchroomConfigSchema.parse({
+        ...minimalBase,
+        auth: { active: "alice", proactive_failover_pct: 0 },
+      }),
+    ).toThrow();
+    expect(() =>
+      SwitchroomConfigSchema.parse({
+        ...minimalBase,
+        auth: { active: "alice", proactive_failover_pct: "95" },
+      }),
+    ).toThrow();
+  });
+});
