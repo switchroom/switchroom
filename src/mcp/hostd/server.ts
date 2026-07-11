@@ -437,7 +437,7 @@ export const TOOLS = [
             "When true, the downgrade guard is relaxed so `pin` may be older " +
             "than the current release.pin. All other safety rails (canary order, " +
             "version-assert, stop-on-mismatch, persist-after-canary, " +
-            "hostd/web deferral) apply unchanged. Still gated by the operator " +
+            "hostd deferral) apply unchanged. Still gated by the operator " +
             "approval card — not pre-approved.",
         },
       },

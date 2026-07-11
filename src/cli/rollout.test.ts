@@ -124,6 +124,10 @@ function harness(opts: {
    * pre-existing web/hostd tests never trip the hindsight run.
    */
   hindsightExists?: boolean;
+  /** Injected running-web image tag for the refresh-web skew probe.
+   *  Defaults to the roll target shape being unknown (null → probe skipped
+   *  by the isVersionAssertable gate never fires a warning). */
+  webImageTag?: string | null;
 }): {
   deps: RolloutDeps;
   runs: string[][];
@@ -145,6 +149,7 @@ function harness(opts: {
     emitPhase: (p) => phases.push(p),
     persistPin: (pin) => persisted.push(pin),
     hindsightExists: () => opts.hindsightExists ?? false,
+    webImageTag: () => opts.webImageTag ?? null,
   };
   return { deps, runs, logs, persisted, phases };
 }
@@ -546,6 +551,90 @@ describe("executeRollout — hostd context (#2487)", () => {
     expect(runs).toContainEqual(["webd", "install", "--tag", TARGET]);
     // ...and hostd install is NOT run (deferred — would SIGKILL itself).
     expect(runs.some((a) => a[0] === "hostd")).toBe(false);
+  });
+
+  // Rollback rolls must FORWARD --allow-downgrade to the singleton
+  // installers: their downgrade guard otherwise guard-skips with exit 0 and
+  // web/hostd silently stay on the NEWER tag (silent staleness, inverted).
+  it("forwards --allow-downgrade to webd install on a downgrade roll (hostd path)", () => {
+    const steps = planRollout(["clerk"], { pinToPersist: TARGET, hostdContext: true });
+    const { deps, runs } = harness({
+      versions: { clerk: "0.15.18" },
+      webImageTag: TARGET,
+    });
+    const r = executeRollout(steps, TARGET, deps, {
+      hostdContext: true,
+      allowDowngrade: true,
+    });
+    expect(r.ok).toBe(true);
+    expect(runs).toContainEqual([
+      "webd",
+      "install",
+      "--tag",
+      TARGET,
+      "--allow-downgrade",
+    ]);
+  });
+
+  it("forwards --allow-downgrade to webd + hostd install on the host-shell path", () => {
+    const steps = planRollout(["clerk"], { pinToPersist: TARGET });
+    const { deps, runs } = harness({
+      versions: { clerk: "0.15.18" },
+      webImageTag: TARGET,
+    });
+    executeRollout(steps, TARGET, deps, { allowDowngrade: true });
+    expect(runs).toContainEqual(["webd", "install", "--tag", TARGET, "--allow-downgrade"]);
+    expect(runs).toContainEqual(["hostd", "install", "--tag", TARGET, "--allow-downgrade"]);
+  });
+
+  it("does NOT pass --allow-downgrade on a normal (non-rollback) roll", () => {
+    const steps = planRollout(["clerk"], { pinToPersist: TARGET, hostdContext: true });
+    const { deps, runs } = harness({
+      versions: { clerk: "0.15.18" },
+      webImageTag: TARGET,
+    });
+    executeRollout(steps, TARGET, deps, { hostdContext: true });
+    expect(runs).toContainEqual(["webd", "install", "--tag", TARGET]);
+    expect(runs.some((a) => a.includes("--allow-downgrade"))).toBe(false);
+  });
+
+  // Belt-and-braces: webd install exits 0 on a downgrade-guard skip, so the
+  // executor probes the RUNNING web tag after the install and warns loudly
+  // on any skew from the roll target.
+  it("warns LOUDLY when web is left on a different version despite exit 0 (guard.skip)", () => {
+    const steps = planRollout(["clerk"], { pinToPersist: TARGET, hostdContext: true });
+    const { deps } = harness({
+      versions: { clerk: "0.15.18" },
+      // Running web is NEWER than the roll target — the guard.skip case on
+      // a rollback where the flag wasn't honored.
+      webImageTag: "v0.15.19",
+    });
+    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    expect(r.ok).toBe(true);
+    const w = r.warnings.find((x) => /running v0\.15\.19, NOT the roll target/.test(x));
+    expect(w).toBeTruthy();
+    expect(w).toContain(`switchroom webd install --tag ${TARGET} --allow-downgrade`);
+  });
+
+  it("no skew warning when web lands on the target (or the probe is unavailable)", () => {
+    const steps = planRollout(["clerk"], { pinToPersist: TARGET, hostdContext: true });
+    const onTarget = harness({ versions: { clerk: "0.15.18" }, webImageTag: TARGET });
+    const r1 = executeRollout(steps, TARGET, onTarget.deps, { hostdContext: true });
+    expect(r1.warnings.some((w) => /NOT the roll target/.test(w))).toBe(false);
+    // Probe null (web absent/unreadable) → no false-positive warning.
+    const noProbe = harness({ versions: { clerk: "0.15.18" }, webImageTag: null });
+    const r2 = executeRollout(steps, TARGET, noProbe.deps, { hostdContext: true });
+    expect(r2.warnings.some((w) => /NOT the roll target/.test(w))).toBe(false);
+  });
+
+  it("emits a web-refresh phase so narration doesn't go silent during the recreate", () => {
+    const steps = planRollout(["clerk"], { pinToPersist: TARGET, hostdContext: true });
+    const { deps, phases } = harness({
+      versions: { clerk: "0.15.18" },
+      webImageTag: TARGET,
+    });
+    executeRollout(steps, TARGET, deps, { hostdContext: true });
+    expect(phases.some((p) => p.phase === "web-refresh" && p.target === TARGET)).toBe(true);
   });
 
   it("a failed web refresh on the hostd path stays NON-FATAL and names the host-side command", () => {
