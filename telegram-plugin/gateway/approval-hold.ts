@@ -43,6 +43,7 @@
 
 import { mkdirSync, writeFileSync, readFileSync, unlinkSync, chmodSync, lstatSync } from 'node:fs'
 import { join, dirname } from 'node:path'
+import { isFloodWaitActiveError } from '../retry-api-call.js'
 
 /**
  * File mode 0644 — WORLD-READABLE, and that is load-bearing, not incidental.
@@ -85,8 +86,45 @@ export const BLOCKED_APPROVAL_FILE_MODE = 0o644
  */
 export const BLOCKED_APPROVAL_DIR_MODE = 0o1777
 
-/** Why a card could not be delivered. Only one cause today. */
-export type UndeliverableReason = 'flood_wait'
+/**
+ * Why a card could not be delivered — and every one of these is TRANSIENT.
+ *
+ * `flood_wait` is the incident cause: a per-bot-token ban, nothing can land until
+ * `untilTs`. But it is not the only way a card goes undeliverable through no
+ * fault of the operator, and the leash rule ("never auto-deny an approval no
+ * human saw") does not care WHICH transient fault shut the channel — only
+ * whether the operator ever got a chance to answer.
+ */
+export type UndeliverableReason = 'flood_wait' | 'transient'
+
+/**
+ * How long to wait before re-trying a card held for a NON-flood transient fault.
+ * A flood-wait carries its own `untilTs`; a network blip has no such signal, so
+ * back off a minute and let the reaper's next tick try again.
+ */
+export const HELD_RETRY_BACKOFF_MS = 60_000
+
+/**
+ * Ceiling on the exponential re-delivery backoff: 30 minutes.
+ *
+ * A held card that keeps failing must not be re-sent every 60s forever — that is
+ * the request amplifier this series exists to avoid. But it must ALSO never stop
+ * being retried entirely: a terminal give-up strands the card even after the
+ * channel recovers, and because `turnInFlightForGate()` holds the inbound gate
+ * while a permission is pending, that would silently buffer the operator's normal
+ * messages forever with no signal.
+ *
+ * So the retry interval BACKS OFF (1m, 2m, 4m … capped at 30m) instead of
+ * stopping. The rate is bounded; the retry never is. A recovered channel always
+ * gets the card back within 30 minutes.
+ */
+export const HELD_RETRY_MAX_BACKOFF_MS = 30 * 60_000
+
+/** Backoff for the Nth consecutive failure: 1m, 2m, 4m … capped. */
+export function heldRetryBackoffMs(failures: number): number {
+  const n = Math.max(1, failures)
+  return Math.min(HELD_RETRY_BACKOFF_MS * 2 ** (n - 1), HELD_RETRY_MAX_BACKOFF_MS)
+}
 
 /**
  * Stamped onto the in-memory `pendingPermissions` entry when the card send
@@ -371,6 +409,57 @@ export function selectOldestHeld<T extends { undeliverable?: UndeliverableMark |
 }
 
 /**
+ * Classify a card-send failure: is this ask HELD, or does it fall through?
+ *
+ * This is the leash rule in one function, and its POLARITY is the whole point:
+ * it FAILS CLOSED. Anything we do not positively recognise as permanent is HELD.
+ *
+ * The first version of this function was an allowlist of marker strings
+ * (FLOOD_WAIT_ACTIVE / GIVE_UP_MESSAGE / LOCAL_RESOURCE_EXHAUSTED) on the
+ * premise that a network partition or a Telegram 5xx would surface as a
+ * give-up. **That premise was false, and the allowlist failed OPEN into
+ * auto-deny** — the exact breach this series exists to close, with a different
+ * first cause. Driving real errors through the real `retryApiCall`:
+ *
+ *   Telegram 502 / 500   → raw GrammyError      ← the network-retry branch is
+ *                                                 guarded by `!isGrammyErr`
+ *                                                 (retry-api-call.ts:377), so a
+ *                                                 5xx is re-thrown on attempt 0
+ *   ECONNRESET / fetch failed → raw Error       ← on the LAST attempt the
+ *                                                 backoff branch is skipped and
+ *                                                 the raw error is re-thrown
+ *                                                 (retry-api-call.ts:384-396)
+ *   short-but-persistent 429  → GIVE_UP_MESSAGE ← the only path that reaches it
+ *   long 429                  → FLOOD_WAIT_ACTIVE
+ *   ENOSPC                    → LOCAL_RESOURCE_EXHAUSTED
+ *
+ * A single routine 502 at the instant the card is posted was therefore enough to
+ * reproduce 2026-07-11 in full: no card, no mark, TTL fires, agent told the
+ * operator declined. The send is ONE-SHOT — without a mark there is no
+ * re-delivery path at all.
+ *
+ * So the default is HOLD. Only a status we KNOW is permanent — a 400 (a card
+ * that will never parse) or a 403 (the bot is blocked/removed from that chat) —
+ * falls through to the TTL, because holding on those would park the agent
+ * forever on a card that can never render. And even that is safe now: PR 3 gives
+ * the no-card timeout a missed-approvals fallback, so a permanent failure is
+ * re-offered to the operator rather than vanishing.
+ *
+ * If a future error class is unrecognised, it is HELD. A held approval is
+ * visible and recoverable; a fabricated denial is neither.
+ */
+export function holdReasonFor(err: unknown): UndeliverableReason | null {
+  if (isFloodWaitActiveError(err)) return 'flood_wait'
+  // PERMANENT — and only these. Note 429 is deliberately NOT in this list: a
+  // rate-limit is the most transient failure there is.
+  const code = (err as { error_code?: unknown } | null | undefined)?.error_code
+  if (code === 400 || code === 403) return null
+  // Everything else — 5xx, raw network errors, give-ups, local-resource
+  // exhaustion, and anything we have never seen — is transient. FAIL CLOSED.
+  return 'transient'
+}
+
+/**
  * The TTL freeze predicate (PR 3).
  *
  * An entry marked undeliverable NEVER expires. The TTL answers "how long did
@@ -398,6 +487,8 @@ export interface HeldPermissionEntry {
   undeliverable?: UndeliverableMark | null
   /** Cards that actually landed. A held entry has none — that is the point. */
   cards: unknown[]
+  /** Consecutive failed re-delivery attempts. Past the cap we stop RE-SENDING. */
+  redeliveryFailures?: number
 }
 
 export interface RedeliverySelection {
@@ -431,6 +522,8 @@ export function selectHeldForRedelivery(
   opts: {
     floodRemainingMs: number
     inFlight: ReadonlySet<string>
+    /** Now, for the per-entry backoff check. */
+    now: number
     cap?: number
   },
 ): RedeliverySelection {
@@ -448,6 +541,12 @@ export function selectHeldForRedelivery(
     if (pend.cards.length > 0) continue
     // Guard (iii) — a previous tick is still posting this one.
     if (opts.inFlight.has(requestId)) continue
+    // Guard (v) — respect the per-entry backoff. A card that keeps failing is
+    // retried on a widening interval (1m, 2m, 4m … 30m) rather than every tick:
+    // bounded RATE, unbounded RETRY. It is never abandoned, so a channel that
+    // recovers always gets the card back — and the approval is never auto-denied.
+    const dueAt = pend.undeliverable?.retryableAt ?? 0
+    if (opts.now < dueAt) continue
     // Guard (iv) — cap. Everything past it is DEFERRED, not dropped.
     if (send.length >= cap) {
       deferred.push(requestId)

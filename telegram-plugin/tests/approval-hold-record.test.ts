@@ -433,12 +433,16 @@ describe('gateway wiring — the failure handler records instead of discarding',
     'utf8',
   )
 
-  /** Body of the `onPermissionRequest` IPC handler. */
+  /**
+   * Body of `postPermissionCard` — the card emitter, and the owner of the
+   * send-failure handler. (The send was extracted out of `onPermissionRequest`
+   * so the reaper can re-drive it; the failure handler moved with it.)
+   */
   function onPermissionRequestBody(): string {
-    const start = GATEWAY_SRC.indexOf('onPermissionRequest(')
+    const start = GATEWAY_SRC.indexOf('function postPermissionCard(')
     expect(start).toBeGreaterThan(-1)
     const rest = GATEWAY_SRC.slice(start)
-    const end = rest.indexOf('onHeartbeat(')
+    const end = rest.indexOf('\nfunction ', 1)
     expect(end).toBeGreaterThan(-1)
     return rest.slice(0, end)
   }
@@ -451,19 +455,25 @@ describe('gateway wiring — the failure handler records instead of discarding',
 
   it('marks the pending entry undeliverable with the window end', () => {
     const body = onPermissionRequestBody()
-    expect(body).toContain('pend.undeliverable = {')
-    expect(body).toContain("reason: 'flood_wait'")
-    expect(body).toContain('retryableAt: e.untilTs')
+    expect(body).toMatch(/\.undeliverable = \{/)
+    expect(body).toContain('retryableAt, reason')
+    // A flood-wait carries Telegram's own window end; other transient faults
+    // (network, 5xx) have no such signal and back off instead.
+    // A flood-wait carries Telegram's own window end; every other transient
+    // fault has no such signal and backs off instead (1m, 2m, 4m … capped).
+    expect(body).toContain('isFloodWaitActiveError(e) ? e.untilTs : now + heldRetryBackoffMs(failures)')
   })
 
   it('does NOT mark undeliverable when a card already LANDED on another target', () => {
     // The send fans out to several chats/topics; one flood-walled leg must not
     // write a blocked record while the operator can see a live card.
-    expect(onPermissionRequestBody()).toContain('if (pend.cards.length > 0) return')
+    // (#3108 renamed the handler's `pend` to `live` when the send moved into
+    // postPermissionCard — the pin follows the merged code.)
+    expect(onPermissionRequestBody()).toContain('if (live.cards.length > 0) return')
   })
 
   it('a re-failure preserves the ORIGINAL since (the "first failed" contract)', () => {
-    expect(onPermissionRequestBody()).toContain('since: pend.undeliverable?.since ?? now')
+    expect(onPermissionRequestBody()).toContain('since: live.undeliverable?.since ?? now')
   })
 
   it('reconcile delegates selection to the unit-tested selectOldestHeld', () => {
@@ -510,8 +520,12 @@ describe('gateway wiring — the failure handler records instead of discarding',
     expect(body).toContain('held, NOT denied')
   })
 
-  it('does NOT hold on non-flood errors (a 400 would park the agent forever)', () => {
-    // The early-return is the whole guard: only FLOOD_WAIT_ACTIVE is a hold.
-    expect(onPermissionRequestBody()).toContain('if (!isFloodWaitActiveError(e)) return')
+  it('does NOT hold on PERMANENT errors (a 400 would park the agent forever)', () => {
+    // holdReasonFor() is the whole guard: transient causes (flood-wait, give-up,
+    // local-resource) are HELD; a permanent 400/403 returns null and falls
+    // through to the TTL, which PR 3 makes safe with a missed-approvals fallback.
+    const body = onPermissionRequestBody()
+    expect(body).toContain('const reason = holdReasonFor(e)')
+    expect(body).toContain('if (reason == null) return')
   })
 })

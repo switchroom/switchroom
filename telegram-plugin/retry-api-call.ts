@@ -158,6 +158,16 @@ export function isLocalResourceError(err: unknown): boolean {
 export const LOCAL_RESOURCE_EXHAUSTED = 'LOCAL_RESOURCE_EXHAUSTED'
 
 /**
+ * Thrown when every retry is exhausted — a network partition, a Telegram 5xx
+ * outage, or a short-but-persistent 429 (only 429s longer than the in-process
+ * sleep ceiling raise FLOOD_WAIT_ACTIVE; shorter ones are slept, retried, and
+ * end here). Exported as a constant because `approval-hold.ts:holdReasonFor`
+ * classifies on it to decide whether an undeliverable approval is HELD — a
+ * string that drifts would silently reopen the auto-deny hole.
+ */
+export const GIVE_UP_MESSAGE = 'retryApiCall: max retries exceeded'
+
+/**
  * Marker error thrown when Telegram's reported `retry_after` exceeds the
  * in-process sleep ceiling (#3084) — i.e. the bot is under a LONG per-bot
  * flood ban, not a momentary rate-limit blip.
@@ -427,7 +437,7 @@ export function createRetryApiCall(
         throw err
       }
     }
-    const giveUpErr = new Error('retryApiCall: max retries exceeded')
+    const giveUpErr = new Error(GIVE_UP_MESSAGE)
     observer?.onGiveUp?.({ attempts: maxRetries, error: giveUpErr })
     throw giveUpErr
   }

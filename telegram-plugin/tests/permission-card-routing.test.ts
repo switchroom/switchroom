@@ -46,6 +46,24 @@ function onPermissionRequestBody(): string {
   return rest.slice(0, end)
 }
 
+/**
+ * Slice the body of `postPermissionCard` — THE card emitter.
+ *
+ * The send used to be inlined in `onPermissionRequest`. The #3084 follow-up
+ * extracted it here so it has two callers (the initial delivery, and the
+ * reaper's re-delivery of a card held through a flood ban). The routing
+ * contract these tests pin is unchanged; it just lives one function over, and
+ * now BOTH delivery paths inherit it — which is the point of the extraction.
+ */
+function postPermissionCardBody(): string {
+  const start = GATEWAY_SRC.indexOf('function postPermissionCard(')
+  expect(start).toBeGreaterThan(-1)
+  const rest = GATEWAY_SRC.slice(start)
+  const end = rest.indexOf('\nfunction ', 1)
+  expect(end).toBeGreaterThan(-1)
+  return rest.slice(0, end)
+}
+
 describe('permission card routing', () => {
   it('the shared target helper exists', () => {
     expect(
@@ -53,19 +71,26 @@ describe('permission card routing', () => {
     ).toBe(true)
   })
 
-  it('the initial card emitter routes via resolvePermissionCardTargets()', () => {
-    expect(onPermissionRequestBody()).toContain('resolvePermissionCardTargets()')
+  it('the card emitter routes via resolvePermissionCardTargets()', () => {
+    expect(postPermissionCardBody()).toContain('resolvePermissionCardTargets()')
   })
 
-  it('the initial card emitter no longer iterates access.allowFrom directly (the bug shape)', () => {
+  it('the card emitter no longer iterates access.allowFrom directly (the bug shape)', () => {
     // The raw fan-out loop is what sent supergroup cards to operator DMs.
-    expect(onPermissionRequestBody()).not.toMatch(
+    expect(postPermissionCardBody()).not.toMatch(
       /for\s*\(\s*const\s+chat_id\s+of\s+access\.allowFrom\s*\)/,
     )
   })
 
   it('the card send is wrapped in retryWithThreadFallback (stale-topic → thread-less, not a silent drop)', () => {
-    expect(onPermissionRequestBody()).toContain('retryWithThreadFallback')
+    expect(postPermissionCardBody()).toContain('retryWithThreadFallback')
+  })
+
+  it('the initial permission request still delivers through that one emitter', () => {
+    // Guards the extraction itself: onPermissionRequest must not regrow its own
+    // send path and drift from the re-delivery path.
+    expect(onPermissionRequestBody()).toContain('postPermissionCard(requestId, pendEntry)')
+    expect(onPermissionRequestBody()).not.toContain('retryWithThreadFallback')
   })
 
   it('the resume message uses the SAME helper, so card + resume cannot drift', () => {
