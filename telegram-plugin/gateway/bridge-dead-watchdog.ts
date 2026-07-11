@@ -21,24 +21,35 @@
  * respawns the MCP bridge — the only recovery path that exists.
  *
  * Guard rails:
- *   - at most ONE escalation per gateway boot (a bridge that dies
- *     deterministically at startup must not restart-loop the agent);
+ *   - at most ONE escalation per gateway boot (in-memory fuse), AND at
+ *     most MAX_CONSECUTIVE_ESCALATIONS across boots (the escalation
+ *     marker carries a consecutive-fire count — see below): a bridge
+ *     that dies deterministically at startup must not restart-loop the
+ *     agent forever;
  *   - skipped while the gateway is mid-shutdown;
  *   - skipped when the claude session process is NOT alive (that is a
  *     different failure class — container boot still in progress, or
  *     claude itself down — where a bounce is either premature or
  *     futile); the timer re-arms so a slow-booting claude gets the full
  *     grace window again once it appears;
+ *   - cron-session bridges (`<agent>-cron`) and anonymous IPC clients
+ *     (recall.py one-shots, pre-handshake connects) neither satisfy nor
+ *     re-arm the watchdog — the gating lives INSIDE noteBridge* so a
+ *     gateway handler refactor can't silently reintroduce the
+ *     bounce-after-cron-fire false positive;
  *   - loud, structured escalation log line including a fresh
  *     bridge-crash.log tail (PR #3037 breadcrumbs) so the operator sees
  *     WHY from the supervisor log alone.
  *
  * Honest resume: before firing the restart, the watchdog persists an
  * escalation marker (`STATE_DIR/bridge-dead-escalation.json`). The next
- * boot's resume-inbound block reads it and appends the real cause to the
- * synthetic resume inbound, so the agent tells the user "my chat bridge
- * died and the framework restarted me" instead of implying a watchdog
- * timeout or an operator restart.
+ * boot consumes it and (a) appends the real cause to the synthetic boot
+ * resume/report inbound when work was in flight, or (b) synthesizes a
+ * minimal idle notice (buildBridgeDeadIdleNoticeInbound) when nothing
+ * was — either way the agent tells the user "my chat bridge died and the
+ * framework restarted me" instead of implying a watchdog timeout or an
+ * operator restart, and the chat is never left wondering why the
+ * container bounced.
  *
  * Pure-ish module: all IO (fs, timers, process liveness, restart) is
  * injected so the decision logic and the controller are unit-testable
@@ -46,6 +57,8 @@
  */
 
 import { readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs'
+import { isCronIdentity } from './cron-session.js'
+import type { InboundMessage } from './ipc-protocol.js'
 
 /** The distinct triggerSelfRestart reason for this escalation. Classified
  *  as intent 'keep' by intentForRestartReason (recovery bounce — session
@@ -61,8 +74,21 @@ export const DEFAULT_BRIDGE_DEAD_GRACE_MS = 90_000
 
 /** Escalation marker freshness window at next boot. A marker older than
  *  this is stale debris (the escalated restart happened long ago or never
- *  completed) — cleared without surfacing. */
+ *  completed) — cleared without surfacing, and the consecutive-escalation
+ *  streak resets with it. */
 export const ESCALATION_MARKER_MAX_AGE_MS = 10 * 60_000
+
+/** Cross-boot restart-loop damper: the once-per-boot fuse is in-memory
+ *  and a container bounce RESETS it, so a bridge that dies
+ *  deterministically at startup (corrupt plugin bundle, bad .mcp.json)
+ *  would otherwise bounce the container every grace window forever,
+ *  spamming boot cards. The escalation marker carries a consecutive-fire
+ *  `count`; a boot that consumed a marker with count >= this cap stands
+ *  the watchdog down (loud audit line, operator investigates) instead of
+ *  firing again. A successful bridge registration at any boot breaks the
+ *  streak. With the default cap of 2 the framework attempts the
+ *  self-heal twice, then stops. */
+export const MAX_CONSECUTIVE_ESCALATIONS = 2
 
 /** Crash-breadcrumb entries older than this are not "fresh" — they refer
  *  to some earlier incident and would mislead the escalation log line. */
@@ -76,35 +102,52 @@ const CRASH_LOG_TAIL_LINES = 3
 export interface BridgeDeadSnapshot {
   /** A real (named, non-cron) bridge is currently registered. */
   bridgeRegistered: boolean
+  /** A real bridge registered at some point THIS boot (breaks the
+   *  cross-boot escalation streak even if it later disconnected). */
+  bridgeEverRegistered: boolean
   /** The claude session process exists in the container. */
   sessionAlive: boolean
   /** The gateway is mid-shutdown (SIGTERM/SIGINT handler ran). */
   shuttingDown: boolean
   /** This gateway boot already fired the one allowed escalation. */
   alreadyEscalated: boolean
+  /** Consecutive escalations by PRIOR boots (from the consumed marker;
+   *  0 when no fresh marker was found). */
+  priorStreak: number
+  /** The cross-boot cap (MAX_CONSECUTIVE_ESCALATIONS unless a test
+   *  overrides). */
+  maxConsecutive: number
 }
 
 export type BridgeDeadDecision =
   | { action: 'escalate' }
   | {
       action: 'skip'
-      why: 'bridge-registered' | 'shutting-down' | 'already-escalated'
+      why: 'bridge-registered' | 'shutting-down' | 'already-escalated' | 'streak-capped'
     }
   | { action: 'retry'; why: 'session-not-alive' }
 
 /**
  * Decide what the watchdog should do when the grace window expires.
  * Precedence, highest first: a live bridge always wins; a shutdown in
- * progress must never be raced by a restart; the once-per-boot fuse is
- * checked before anything fires; a missing claude process re-arms rather
- * than escalating (bouncing a container whose claude never came up would
- * loop without fixing anything — and a container still booting deserves
- * the full grace window once claude appears).
+ * progress must never be raced by a restart; the once-per-boot fuse and
+ * the cross-boot streak cap are checked before anything fires; a missing
+ * claude process re-arms rather than escalating (bouncing a container
+ * whose claude never came up would loop without fixing anything — and a
+ * container still booting deserves the full grace window once claude
+ * appears).
  */
 export function decideBridgeDeadEscalation(s: BridgeDeadSnapshot): BridgeDeadDecision {
   if (s.bridgeRegistered) return { action: 'skip', why: 'bridge-registered' }
   if (s.shuttingDown) return { action: 'skip', why: 'shutting-down' }
   if (s.alreadyEscalated) return { action: 'skip', why: 'already-escalated' }
+  // Cross-boot damper: prior boots already escalated `priorStreak` times
+  // in a row and the bridge STILL hasn't registered this boot — the bounce
+  // is not fixing it. Stand down. (A registration this boot breaks the
+  // streak: the current outage is then a NEW incident, not the same one.)
+  if (!s.bridgeEverRegistered && s.priorStreak >= s.maxConsecutive) {
+    return { action: 'skip', why: 'streak-capped' }
+  }
   if (!s.sessionAlive) return { action: 'retry', why: 'session-not-alive' }
   return { action: 'escalate' }
 }
@@ -152,13 +195,18 @@ export function readFreshCrashLogTail(
   return fresh.map((l) => l.slice(0, 500)).join(' || ')
 }
 
-// ─── Escalation marker (honest boot-resume cause) ────────────────────────────
+// ─── Escalation marker (honest boot-resume cause + cross-boot damper) ────────
 
 export interface BridgeDeadEscalationMarker {
   /** Wall-clock ms when the escalation fired. */
   ts: number
   /** Always BRIDGE_DEAD_RESTART_REASON — kept in the file for grep-ability. */
   reason: string
+  /** Consecutive escalations INCLUDING this one (1 = first fire of a
+   *  streak). The next boot reads this as its `priorStreak` and stands
+   *  down at MAX_CONSECUTIVE_ESCALATIONS. Absent in pre-damper markers —
+   *  treated as 1. */
+  count?: number
   /** Fresh crash-breadcrumb tail at escalation time, if any. */
   crashTail?: string
 }
@@ -179,6 +227,21 @@ export function writeBridgeDeadEscalationMarker(
  * when it is fresh (< maxAgeMs); a stale or malformed marker is cleared
  * and ignored. The file is ALWAYS removed — the cause note must surface
  * on exactly the boot that follows the escalation, never a later one.
+ *
+ * Known race window (accepted, documented per review): the marker is
+ * written by gateway boot N and consumed by whichever gateway boots NEXT.
+ * Normally that is the post-container-restart gateway (the SIGTERM to
+ * PID 1 fires ~1.5s after the write and takes the whole container down).
+ * But if the escalating gateway PROCESS dies and its supervisor relaunches
+ * a new gateway inside the same container before the SIGTERM lands, that
+ * interim gateway consumes the marker instead — the cause note is then
+ * surfaced (or dropped with the interim process) one boot early, and the
+ * post-restart boot sees no marker. Consequences are bounded and safe:
+ * the honesty note may be lost for one incident (the loud supervisor-log
+ * audit line survives regardless), and the cross-boot streak damper
+ * under-counts by one (strictly MORE willing to self-heal, never a
+ * tighter loop, since the in-memory once-per-boot fuse still caps each
+ * process at one fire). Not worth a consume-side handshake.
  */
 export function consumeBridgeDeadEscalationMarker(
   path: string,
@@ -196,6 +259,10 @@ export function consumeBridgeDeadEscalationMarker(
       const age = nowMs - parsed.ts
       if (age >= 0 && age < maxAgeMs) {
         marker = { ts: parsed.ts, reason: parsed.reason }
+        marker.count =
+          typeof parsed.count === 'number' && Number.isFinite(parsed.count) && parsed.count >= 1
+            ? Math.floor(parsed.count)
+            : 1
         if (typeof parsed.crashTail === 'string') marker.crashTail = parsed.crashTail
       }
     }
@@ -210,12 +277,61 @@ export function consumeBridgeDeadEscalationMarker(
   return marker
 }
 
+// ─── Idle notice (honest cause when NO turn was in flight) ───────────────────
+
+/**
+ * Build the minimal synthetic inbound surfaced when the previous boot was
+ * a bridge-dead escalation but NO turn was interrupted (idle agent, dead
+ * bridge). Without this the cause reaches only stderr — the agent and the
+ * user never learn why the container bounced (review finding 2 on #3038).
+ * Mirrors the resume-builder shapes: meta.source is what Claude Code
+ * renders as `<channel source="…">`; meta.chat_id/message_id let the
+ * gateway's enqueue path build a currentTurn + ack the synthetic.
+ */
+export function buildBridgeDeadIdleNoticeInbound(args: {
+  /** Chat to surface the notice in (the agent's default/owner chat). */
+  chatId: string
+  /** The consumed escalation marker. */
+  marker: BridgeDeadEscalationMarker
+  /** Wall-clock ms; defaults to Date.now(). */
+  nowMs?: number
+}): InboundMessage {
+  const ts = args.nowMs ?? Date.now()
+  return {
+    type: 'inbound',
+    chatId: args.chatId,
+    messageId: ts,
+    user: 'switchroom',
+    userId: 0,
+    ts,
+    text:
+      `You just restarted. The framework itself triggered this restart: your Telegram ` +
+      `MCP bridge process had died (chat tools were unavailable — you could not send ` +
+      `replies), so the container was bounced to restore the chat surface. No work was ` +
+      `in flight when it happened. Briefly let the user know the messaging bridge died ` +
+      `and the framework restarted you to fix it — one short message, no drama. This was ` +
+      `NOT an operator-initiated restart and NOT a hang-watchdog kill; report only that ` +
+      `honest cause.`,
+    meta: {
+      source: 'bridge_dead_restart',
+      chat_id: args.chatId,
+      message_id: String(ts),
+      restart_cause: args.marker.reason,
+    },
+  }
+}
+
 // ─── Watchdog controller ─────────────────────────────────────────────────────
 
 export interface BridgeDeadWatchdogOpts {
-  /** Grace window before a missing bridge is treated as dead. */
+  /** Grace window before a missing bridge is treated as dead. Doubled
+   *  when the consumed marker shows a prior escalation streak (the retry
+   *  after a failed self-heal deserves more patience). */
   graceMs: number
-  /** Is the claude session process alive in this container? */
+  /** Is the claude session process alive in this container? Callers
+   *  should require a confident match (comm === 'claude'), NOT the
+   *  heaviest-node fallback — an orphaned node process must not flip a
+   *  retry into an escalation (review finding 4). */
   isSessionAlive: () => boolean
   /** Is the gateway mid-shutdown? */
   isShuttingDown: () => boolean
@@ -228,6 +344,11 @@ export interface BridgeDeadWatchdogOpts {
   markerPath: string
   /** Structured log sink (stderr). */
   log: (line: string) => void
+  /** Consecutive escalations by prior boots (the consumed marker's
+   *  `count`; 0 when no fresh marker). Drives the cross-boot damper. */
+  priorStreak?: number
+  /** Cross-boot cap override (tests). */
+  maxConsecutive?: number
   /** Injectable timer pair for tests. Defaults to global setTimeout with
    *  unref (the watchdog must never keep the gateway process alive). */
   setTimer?: (fn: () => void, ms: number) => unknown
@@ -241,14 +362,20 @@ export interface BridgeDeadWatchdogOpts {
 }
 
 export interface BridgeDeadWatchdog {
-  /** Arm the grace timer (gateway boot). Idempotent while armed. */
+  /** Arm the grace timer (gateway boot). Idempotent while armed. No-op
+   *  when the cross-boot streak cap is already reached (stands down with
+   *  an audit line instead). */
   arm: () => void
-  /** A real (named, non-cron) bridge registered — cancel the timer. */
-  noteBridgeRegistered: () => void
-  /** The real bridge disconnected mid-life — re-arm the grace timer so a
-   *  bridge that dies AFTER boot (and never reconnects) also escalates.
-   *  Still capped by the once-per-boot fuse. */
-  noteBridgeDisconnected: () => void
+  /** A bridge client registered. Only a REAL bridge (named, non-cron)
+   *  satisfies the watchdog — cron sessions (`<agent>-cron`) and
+   *  anonymous clients (agentName null) are ignored HERE so a gateway
+   *  handler refactor can't reorder the gating away (review finding 5). */
+  noteBridgeRegistered: (agentName: string | null | undefined) => void
+  /** A bridge client disconnected. Re-arms the grace window only for the
+   *  real bridge (same internal gating), so a bridge that dies AFTER boot
+   *  and never reconnects also escalates. Still capped by the
+   *  once-per-boot fuse. */
+  noteBridgeDisconnected: (agentName: string | null | undefined) => void
   /** Evaluate now (the timer body — exposed for tests). Returns the
    *  decision taken. */
   check: () => BridgeDeadDecision
@@ -256,6 +383,11 @@ export interface BridgeDeadWatchdog {
   stop: () => void
   /** Test/introspection: has this boot escalated already? */
   hasEscalated: () => boolean
+}
+
+/** Is this client identity the REAL main-agent bridge (named, non-cron)? */
+function isRealBridgeIdentity(agentName: string | null | undefined): boolean {
+  return agentName != null && agentName.length > 0 && !isCronIdentity(agentName)
 }
 
 export function createBridgeDeadWatchdog(opts: BridgeDeadWatchdogOpts): BridgeDeadWatchdog {
@@ -271,9 +403,12 @@ export function createBridgeDeadWatchdog(opts: BridgeDeadWatchdogOpts): BridgeDe
   const writeMarker = opts.writeMarker ?? writeBridgeDeadEscalationMarker
   const readCrashTail =
     opts.readCrashTail ?? ((p: string, t: number) => readFreshCrashLogTail(p, { nowMs: t }))
+  const priorStreak = opts.priorStreak ?? 0
+  const maxConsecutive = opts.maxConsecutive ?? MAX_CONSECUTIVE_ESCALATIONS
 
   let timer: unknown = null
   let bridgeRegistered = false
+  let bridgeEverRegistered = false
   let escalated = false
 
   const cancel = (): void => {
@@ -283,27 +418,52 @@ export function createBridgeDeadWatchdog(opts: BridgeDeadWatchdogOpts): BridgeDe
     }
   }
 
+  /** The retry after a failed self-heal gets a doubled window: if one
+   *  bounce didn't bring the bridge back inside graceMs, a second fire on
+   *  the same clock mostly races container boot noise. */
+  const effectiveGraceMs = (): number =>
+    !bridgeEverRegistered && priorStreak >= 1 ? opts.graceMs * 2 : opts.graceMs
+
   const armInternal = (): void => {
     if (escalated) return // once-per-boot fuse — never re-arm after firing
+    if (!bridgeEverRegistered && priorStreak >= maxConsecutive) {
+      // Cross-boot damper: prior boots already bounced the container
+      // `priorStreak` times in a row for this same condition and the
+      // bridge still hasn't come back — a third bounce won't either.
+      // Stand down LOUDLY: the operator must investigate (corrupt plugin
+      // bundle / bad .mcp.json / broken IPC socket path).
+      opts.log(
+        `telegram gateway: [bridge-dead-watchdog] STANDING DOWN — ${priorStreak} consecutive ` +
+          `bridge-dead escalations already restarted this container without the bridge coming ` +
+          `back (cap=${maxConsecutive}). The bridge is failing deterministically; a further ` +
+          `restart will not fix it. Investigate the bridge (plugin bundle, .mcp.json, ` +
+          `STATE_DIR/bridge-crash.log). Manual recovery: fix the cause, then restart the ` +
+          `container. SWITCHROOM_BRIDGE_DEAD_ESCALATION=0 disables this watchdog entirely.`,
+      )
+      return
+    }
     cancel()
     timer = setTimer(() => {
       timer = null
       check()
-    }, opts.graceMs)
+    }, effectiveGraceMs())
   }
 
   const check = (): BridgeDeadDecision => {
     const decision = decideBridgeDeadEscalation({
       bridgeRegistered,
+      bridgeEverRegistered,
       sessionAlive: opts.isSessionAlive(),
       shuttingDown: opts.isShuttingDown(),
       alreadyEscalated: escalated,
+      priorStreak,
+      maxConsecutive,
     })
     if (decision.action === 'retry') {
       // claude not up yet (slow container boot) — give it another full
       // grace window rather than escalating a bounce that can't help.
       opts.log(
-        `telegram gateway: [bridge-dead-watchdog] no bridge registered after ${opts.graceMs}ms ` +
+        `telegram gateway: [bridge-dead-watchdog] no bridge registered after ${effectiveGraceMs()}ms ` +
           `but claude session not found — re-arming (no escalation)`,
       )
       armInternal()
@@ -318,8 +478,8 @@ export function createBridgeDeadWatchdog(opts: BridgeDeadWatchdogOpts): BridgeDe
       return decision
     }
     // Escalate: bridge dead, session alive, not shutting down, first time
-    // this boot. Set the fuse BEFORE any side effect so a throwing sink
-    // can't produce a second fire.
+    // this boot, streak under the cap. Set the fuse BEFORE any side effect
+    // so a throwing sink can't produce a second fire.
     escalated = true
     const t = nowMs()
     const crashTail = (() => {
@@ -329,8 +489,15 @@ export function createBridgeDeadWatchdog(opts: BridgeDeadWatchdogOpts): BridgeDe
         return null
       }
     })()
+    // Streak accounting: a registration THIS boot breaks the prior streak
+    // (this escalation starts a new one at 1); otherwise it extends it.
+    const streakCount = bridgeEverRegistered ? 1 : priorStreak + 1
     try {
-      const marker: BridgeDeadEscalationMarker = { ts: t, reason: BRIDGE_DEAD_RESTART_REASON }
+      const marker: BridgeDeadEscalationMarker = {
+        ts: t,
+        reason: BRIDGE_DEAD_RESTART_REASON,
+        count: streakCount,
+      }
       if (crashTail != null) marker.crashTail = crashTail
       writeMarker(opts.markerPath, marker)
     } catch (err) {
@@ -341,8 +508,9 @@ export function createBridgeDeadWatchdog(opts: BridgeDeadWatchdogOpts): BridgeDe
     // The audit line: loud, structured, greppable — the operator's answer
     // to "why did this container bounce itself".
     opts.log(
-      `telegram gateway: [bridge-dead-watchdog] ESCALATING reason=${BRIDGE_DEAD_RESTART_REASON} — ` +
-        `no MCP bridge registered within ${opts.graceMs}ms grace window while the claude session is alive ` +
+      `telegram gateway: [bridge-dead-watchdog] ESCALATING reason=${BRIDGE_DEAD_RESTART_REASON} ` +
+        `consecutive=${streakCount}/${maxConsecutive} — ` +
+        `no MCP bridge registered within ${effectiveGraceMs()}ms grace window while the claude session is alive ` +
         `(Claude Code never respawns a dead MCP server; bouncing the container to restore the chat surface). ` +
         (crashTail != null
           ? `bridge-crash.log tail: ${crashTail}`
@@ -360,11 +528,14 @@ export function createBridgeDeadWatchdog(opts: BridgeDeadWatchdogOpts): BridgeDe
 
   return {
     arm: armInternal,
-    noteBridgeRegistered: () => {
+    noteBridgeRegistered: (agentName) => {
+      if (!isRealBridgeIdentity(agentName)) return
       bridgeRegistered = true
+      bridgeEverRegistered = true
       cancel()
     },
-    noteBridgeDisconnected: () => {
+    noteBridgeDisconnected: (agentName) => {
+      if (!isRealBridgeIdentity(agentName)) return
       bridgeRegistered = false
       armInternal()
     },

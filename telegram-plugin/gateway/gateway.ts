@@ -740,6 +740,7 @@ import {
 import {
   createBridgeDeadWatchdog,
   consumeBridgeDeadEscalationMarker,
+  buildBridgeDeadIdleNoticeInbound,
   DEFAULT_BRIDGE_DEAD_GRACE_MS,
 } from './bridge-dead-watchdog.js'
 import { findAgentProcessInContainer } from './boot-probes.js'
@@ -1535,6 +1536,10 @@ let turnsDb: ReturnType<typeof openTurnsDb> | null = null
 // Stashed here; pushed to the spool once it's constructed below. The spool's
 // turn_key-keyed dedup makes a re-stash across multiple restarts a no-op.
 let bootResumeInbound: { agent: string; msg: InboundMessage } | null = null
+// #3038 cross-boot damper: consecutive bridge-dead escalations by PRIOR
+// boots (the consumed marker's `count`; 0 when no fresh marker). Set in
+// the boot block below, consumed by the watchdog constructor further down.
+let bridgeDeadPriorStreak = 0
 try {
   // STATE_DIR is `<agentDir>/telegram` in production. openTurnsDb expects
   // the parent (agent dir) and joins `telegram/registry.db` itself.
@@ -1599,8 +1604,10 @@ try {
     join(STATE_DIR, 'bridge-dead-escalation.json'),
   )
   if (bridgeDeadMarker != null) {
+    bridgeDeadPriorStreak = bridgeDeadMarker.count ?? 1
     process.stderr.write(
       `telegram gateway: boot: prior restart was a bridge-dead escalation (reason=${bridgeDeadMarker.reason}` +
+      `, consecutive=${bridgeDeadPriorStreak}` +
       `${bridgeDeadMarker.crashTail ? `, crashTail=${bridgeDeadMarker.crashTail}` : ''})\n`,
     )
   }
@@ -1745,6 +1752,38 @@ try {
       process.stderr.write(
         `telegram gateway: boot-resume queued kind=${bootResumeKind} mode=${bootResumeMode} ` +
         `turnKey=${pending.turn_key} endedVia=${pending.ended_via ?? 'open'} chat=${pending.chat_id}\n`,
+      )
+    }
+  }
+
+  // #3038 review finding 2 — idle-case honesty. When the previous boot was
+  // a bridge-dead escalation but NO turn was interrupted (idle agent, dead
+  // bridge), the consumed marker's cause would otherwise reach stderr only:
+  // the agent and the user never learn why the container bounced. Surface
+  // it once, via the same boot-inbound channel the resume path uses, routed
+  // to the agent's default/owner chat.
+  if (bridgeDeadMarker != null && bootResumeInbound == null && selfAgent) {
+    const idleNoticeChat = (() => {
+      try {
+        return loadAccess().allowFrom[0] ?? null
+      } catch {
+        return null
+      }
+    })()
+    if (idleNoticeChat != null) {
+      bootResumeInbound = {
+        agent: selfAgent,
+        msg: buildBridgeDeadIdleNoticeInbound({
+          chatId: String(idleNoticeChat),
+          marker: bridgeDeadMarker,
+        }),
+      }
+      process.stderr.write(
+        `telegram gateway: boot: bridge-dead idle notice queued chat=${idleNoticeChat} (no turn was in flight)\n`,
+      )
+    } else {
+      process.stderr.write(
+        `telegram gateway: boot: bridge-dead idle notice skipped — no allowFrom chat to surface it in\n`,
       )
     }
   }
@@ -9147,7 +9186,12 @@ const BRIDGE_DEAD_GRACE_MS = (() => {
 })()
 const bridgeDeadWatchdog = createBridgeDeadWatchdog({
   graceMs: BRIDGE_DEAD_GRACE_MS,
-  isSessionAlive: () => findAgentProcessInContainer() != null,
+  // Require a CONFIDENT claude match (comm === 'claude'), not
+  // findAgentProcessInContainer's heaviest-node fallback: an orphaned or
+  // unrelated node process must never flip a "claude not up" retry into a
+  // container bounce (#3038 review finding 4). False negatives are safe —
+  // the watchdog then retries forever instead of escalating.
+  isSessionAlive: () => findAgentProcessInContainer()?.comm === 'claude',
   // `shuttingDown` is declared (let, module scope) further down this file;
   // the closure only runs when the grace timer fires, long after module
   // init completes, so the TDZ is never hit.
@@ -9157,6 +9201,10 @@ const bridgeDeadWatchdog = createBridgeDeadWatchdog({
   crashLogPath: join(STATE_DIR, 'bridge-crash.log'),
   markerPath: join(STATE_DIR, 'bridge-dead-escalation.json'),
   log: (line) => process.stderr.write(`${line}\n`),
+  // Cross-boot damper (#3038 review finding 1): the consumed marker's
+  // consecutive-escalation count. At the cap, arm() stands down loudly
+  // instead of restart-looping a deterministically-failing bridge.
+  priorStreak: bridgeDeadPriorStreak,
 })
 if (BRIDGE_DEAD_ESCALATION_ENABLED) {
   bridgeDeadWatchdog.arm()
@@ -9196,9 +9244,11 @@ const ipcServer: IpcServer = createIpcServer({
       : []
     // #3038 — a REAL (named, non-cron) bridge registered: stand the
     // bridge-dead watchdog down. Anonymous clients (recall.py, mcp
-    // handshakes) must NOT satisfy it — same false-positive rationale as
-    // the shadow bridgeUp gate above.
-    if (client.agentName != null) bridgeDeadWatchdog.noteBridgeRegistered()
+    // handshakes) and cron-session bridges must NOT satisfy it — the
+    // watchdog gates on the identity INTERNALLY (isRealBridgeIdentity), so
+    // this call is safe wherever it sits relative to the cron early-return
+    // above (#3038 review finding 5).
+    bridgeDeadWatchdog.noteBridgeRegistered(client.agentName)
     client.send({ type: 'status', status: 'agent_connected' })
 
     // Phase 2b PR 3a — bridgeUp cutover. The state machine's `bridgeUp`
@@ -9391,8 +9441,9 @@ const ipcServer: IpcServer = createIpcServer({
       // #3038 — the real bridge went away mid-life. Re-arm the grace
       // window: a normal claude restart re-registers within seconds and
       // stands it down; a bridge that died for good escalates once (the
-      // once-per-boot fuse inside the watchdog caps it).
-      if (BRIDGE_DEAD_ESCALATION_ENABLED) bridgeDeadWatchdog.noteBridgeDisconnected()
+      // once-per-boot fuse inside the watchdog caps it). Cron/anonymous
+      // identities are ignored inside the watchdog itself (finding 5).
+      if (BRIDGE_DEAD_ESCALATION_ENABLED) bridgeDeadWatchdog.noteBridgeDisconnected(client.agentName)
     }
 
     // Scope the flush to clients that actually registered as an agent.
