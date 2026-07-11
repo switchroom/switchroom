@@ -29,6 +29,7 @@ import {
   submitLoopbackRedirect,
   scrubSensitive,
   shouldConsumeLoopbackPaste,
+  looksLikeLoopbackCodePaste,
   trackFlowExit,
   cancelLoopbackFlow,
   MAX_PASTE_ATTEMPTS,
@@ -309,6 +310,42 @@ describe('shouldConsumeLoopbackPaste', () => {
     expect(
       shouldConsumeLoopbackPaste(`https://evil.example/?code=abc&state=${STATE}`),
     ).toBe(false)
+  })
+
+  // Fail-safe: malformed-but-code-bearing loopback pastes (security audit
+  // #3084, F2). These do NOT parse as a clean redirect, yet still carry a
+  // possibly-live OAuth `code` and MUST be consumed + redacted, not forwarded.
+  it('consumes a malformed loopback paste that still carries a code', () => {
+    // Dropped port.
+    expect(
+      shouldConsumeLoopbackPaste(`http://127.0.0.1/?code=abc&state=${STATE}`),
+    ).toBe(true)
+    // Missing `/` before the query.
+    expect(
+      shouldConsumeLoopbackPaste(`127.0.0.1:${PORT}?code=abc&state=${STATE}`),
+    ).toBe(true)
+    // Loopback URL buried in surrounding chatter.
+    expect(
+      shouldConsumeLoopbackPaste(`here it is: 127.0.0.1 code=abcdef123&state=${STATE} thanks`),
+    ).toBe(true)
+    // localhost variant, malformed.
+    expect(
+      shouldConsumeLoopbackPaste(`localhost blah code=xyz`),
+    ).toBe(true)
+  })
+})
+
+describe('looksLikeLoopbackCodePaste', () => {
+  it('is true only when BOTH a loopback host ref and a code/error param exist', () => {
+    expect(looksLikeLoopbackCodePaste(`127.0.0.1:${PORT}/?code=abc&state=${STATE}`)).toBe(true)
+    expect(looksLikeLoopbackCodePaste(`localhost/?error=access_denied`)).toBe(true)
+    // Loopback host but no code — ordinary chatter, must NOT match.
+    expect(looksLikeLoopbackCodePaste("what's listening on localhost?")).toBe(false)
+    expect(looksLikeLoopbackCodePaste('is 127.0.0.1 reachable from the container?')).toBe(false)
+    // Code but no loopback host — foreign URL, must NOT match (narrowness).
+    expect(looksLikeLoopbackCodePaste(`https://evil.example/?code=abc&state=${STATE}`)).toBe(false)
+    // Empty.
+    expect(looksLikeLoopbackCodePaste('')).toBe(false)
   })
 })
 

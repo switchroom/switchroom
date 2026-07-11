@@ -18340,9 +18340,32 @@ async function handleInbound(
       redactAuthCodeMessage(bot.api as never, chat_id, msgId ?? null, line => process.stderr.write(line))
       return
     }
-    // Stale — kill the child and drop the entry, then fall through.
+    // Stale — the intercept window has closed. Kill the child and drop the
+    // entry, then fall through to the fail-safe below. We deliberately do NOT
+    // let the paste reach the agent: the pasted `code` may still be live
+    // (security audit #3084, F3), so the fail-safe redacts it.
     cancelLoopbackFlow(pendingLoop)
     pendingLoopbackFlows.delete(interceptKey)
+  }
+
+  // Fail-safe redaction (security audit #3084, F2/F3). A message that looks
+  // like a loopback OAuth redirect/code — even one too malformed to parse
+  // cleanly, or one that arrived just after the intercept TTL closed, or one
+  // with no active flow at all — must NEVER reach the (prompt-injectable)
+  // agent session or linger unredacted in chat while carrying a possibly-live
+  // credential. shouldConsumeLoopbackPaste is narrow (requires a loopback host
+  // reference AND a code/error param), so ordinary chatter mentioning
+  // localhost flows through untouched. Redact and drop rather than forward.
+  if (shouldConsumeLoopbackPaste(text)) {
+    redactAuthCodeMessage(bot.api as never, chat_id, msgId ?? null, line => process.stderr.write(line))
+    await switchroomReply(
+      ctx,
+      '_That looked like an OAuth redirect/code, so I removed it from chat and did not forward it. ' +
+        'If a Google/Microsoft account add is in progress, re-run the add command and paste the fresh ' +
+        '`127.0.0.1` URL — the previous code may have expired._',
+      { html: true },
+    )
+    return
   }
 
   // Auth-code intercept
