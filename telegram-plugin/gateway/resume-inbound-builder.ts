@@ -140,6 +140,20 @@ export interface ResumeInboundContext {
    *  Rendered into the inbound so the resumed session knows what to
    *  re-dispatch. Omitted / empty → the inbound is unchanged. */
   subagents?: InterruptedSubagent[]
+  /** Why the framework itself triggered the restart, when it did (e.g. the
+   *  bridge-dead escalation, #3038). Surfaced verbatim in the inbound text
+   *  (`note`) and as `meta.restart_cause` (`reason`) so the resume is
+   *  HONEST about the cause — a bridge-dead bounce must not read as an
+   *  operator restart or masquerade as a watchdog timeout. Omitted → the
+   *  inbound is unchanged (the common human-restart/crash case). */
+  restartCause?: { reason: string; note: string }
+}
+
+/** Render the optional framework-restart-cause block appended to a resume /
+ *  report inbound. Empty string when no cause was recorded. */
+function renderRestartCauseBlock(cause: { note: string } | undefined): string {
+  if (!cause || cause.note.trim().length === 0) return ''
+  return `\n\nWhy this restart happened: ${cause.note.trim()}`
 }
 
 /**
@@ -223,6 +237,7 @@ export function buildResumeInterruptedInbound(ctx: ResumeInboundContext): Inboun
     started_at: String(ctx.turn.started_at),
   }
   if (ctx.turn.user_prompt_preview) meta.original_prompt = ctx.turn.user_prompt_preview
+  if (ctx.restartCause) meta.restart_cause = ctx.restartCause.reason
   return {
     type: 'inbound',
     chatId: ctx.turn.chat_id,
@@ -247,7 +262,8 @@ export function buildResumeInterruptedInbound(ctx: ResumeInboundContext): Inboun
       `actual task. Do not ask whether to resume; just resume. If even after ` +
       `reading the recent messages you genuinely can't tell what the work was, ` +
       `say so and ask.` +
-      renderInterruptedSubagentsBlock(ctx.subagents),
+      renderInterruptedSubagentsBlock(ctx.subagents) +
+      renderRestartCauseBlock(ctx.restartCause),
     meta,
   }
 }
@@ -287,6 +303,7 @@ export function buildResumeWatchdogReportInbound(
   }
   if (ctx.turn.tool_call_count != null) meta.tool_call_count = String(ctx.turn.tool_call_count)
   if (ctx.turn.user_prompt_preview) meta.original_prompt = ctx.turn.user_prompt_preview
+  if (ctx.restartCause) meta.restart_cause = ctx.restartCause.reason
   return {
     type: 'inbound',
     chatId: ctx.turn.chat_id,
@@ -309,7 +326,8 @@ export function buildResumeWatchdogReportInbound(
       `speculate about a deeper root cause you can't see.` +
       // Deferred (non-assertive) form: this is the ask-first path — the killed
       // workers are listed as facts, but re-dispatch waits on the user's call.
-      renderInterruptedSubagentsBlock(ctx.subagents, { assertive: false }),
+      renderInterruptedSubagentsBlock(ctx.subagents, { assertive: false }) +
+      renderRestartCauseBlock(ctx.restartCause),
     meta,
   }
 }
@@ -398,6 +416,7 @@ export function buildResumeDeferredReportInbound(
     started_at: String(ctx.turn.started_at),
   }
   if (ctx.turn.user_prompt_preview) meta.original_prompt = ctx.turn.user_prompt_preview
+  if (ctx.restartCause) meta.restart_cause = ctx.restartCause.reason
   const cause =
     ctx.reason === 'loop-guard'
       ? `Your previous turn was ALREADY a resume of earlier interrupted work, ` +
@@ -428,7 +447,8 @@ export function buildResumeDeferredReportInbound(
       // Deferred (non-assertive) form, same as the watchdog path: this is an
       // ask-first inbound — killed workers are named as facts, but
       // re-dispatch waits on the user's call.
-      renderInterruptedSubagentsBlock(ctx.subagents, { assertive: false }),
+      renderInterruptedSubagentsBlock(ctx.subagents, { assertive: false }) +
+      renderRestartCauseBlock(ctx.restartCause),
     meta,
   }
 }

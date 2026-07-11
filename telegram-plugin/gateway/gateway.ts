@@ -737,6 +737,12 @@ import {
   buildResumeDeferredReportInbound,
   decideBootResumeKind,
 } from './resume-inbound-builder.js'
+import {
+  createBridgeDeadWatchdog,
+  consumeBridgeDeadEscalationMarker,
+  DEFAULT_BRIDGE_DEAD_GRACE_MS,
+} from './bridge-dead-watchdog.js'
+import { findAgentProcessInContainer } from './boot-probes.js'
 import { applySubagentsSchema, getSubagentByJsonlId, resolveSubagentOriginTurnKey, listNonTerminalSubagentsForTurn } from '../registry/subagents-schema.js'
 import type { InterruptedSubagent } from './resume-inbound-builder.js'
 import { resolveWorkerFeedDispatch, type WorkerFeedDispatch } from './worker-feed-dispatch.js'
@@ -1584,6 +1590,30 @@ try {
     process.stderr.write(`telegram gateway: turn-registry initialized at ${join(agentDir, 'telegram', 'registry.db')}\n`)
   }
 
+  // #3038 — bridge-dead escalation marker. If the PREVIOUS gateway bounced
+  // this container because the MCP bridge died (see bridge-dead-watchdog.ts),
+  // it left a marker so THIS boot's resume inbound can state the real cause
+  // instead of implying an operator restart or a watchdog timeout. Consumed
+  // (always cleared) whether or not a turn was in flight.
+  const bridgeDeadMarker = consumeBridgeDeadEscalationMarker(
+    join(STATE_DIR, 'bridge-dead-escalation.json'),
+  )
+  if (bridgeDeadMarker != null) {
+    process.stderr.write(
+      `telegram gateway: boot: prior restart was a bridge-dead escalation (reason=${bridgeDeadMarker.reason}` +
+      `${bridgeDeadMarker.crashTail ? `, crashTail=${bridgeDeadMarker.crashTail}` : ''})\n`,
+    )
+  }
+  const bridgeDeadRestartCause = bridgeDeadMarker != null
+    ? {
+        reason: bridgeDeadMarker.reason,
+        note:
+          'The framework itself triggered this restart: your Telegram MCP bridge process had died ' +
+          '(chat tools were unavailable — you could not send replies), so the container was bounced ' +
+          'to restore the chat surface. This was NOT an operator-initiated restart and NOT a hang-watchdog kill.',
+      }
+    : undefined
+
   // Build the boot resume/report inbound for the LATEST turn if it was
   // interrupted. selectResumeBuilder owns the resume-vs-report policy.
   const pending = findLatestTurnIfInterrupted(turnsDb)
@@ -1657,7 +1687,11 @@ try {
     if (bootResumeKind === 'resume') {
       bootResumeInbound = {
         agent: selfAgent,
-        msg: buildResumeInterruptedInbound({ turn: pending, subagents: interruptedSubagents }),
+        msg: buildResumeInterruptedInbound({
+          turn: pending,
+          subagents: interruptedSubagents,
+          restartCause: bridgeDeadRestartCause,
+        }),
       }
     } else if (bootResumeKind === 'report') {
       // idleMs: this boot's measured marker age if it just classified this
@@ -1673,7 +1707,12 @@ try {
       if (idleMs == null) idleMs = Math.max(0, Date.now() - pending.started_at)
       bootResumeInbound = {
         agent: selfAgent,
-        msg: buildResumeWatchdogReportInbound({ turn: pending, idleMs, subagents: interruptedSubagents }),
+        msg: buildResumeWatchdogReportInbound({
+          turn: pending,
+          idleMs,
+          subagents: interruptedSubagents,
+          restartCause: bridgeDeadRestartCause,
+        }),
       }
     } else if (bootResumeKind === 'defer-loop' || bootResumeKind === 'defer-suppressed') {
       // Passive deferred-report: work was in flight but we decline to
@@ -1685,6 +1724,7 @@ try {
           turn: pending,
           reason: bootResumeKind === 'defer-loop' ? 'loop-guard' : 'clean-restart-suppressed',
           subagents: interruptedSubagents,
+          restartCause: bridgeDeadRestartCause,
         }),
       }
     }
@@ -9089,6 +9129,42 @@ async function stripStalePermissionCard(card: PersistedPermCard): Promise<void> 
   }
 }
 
+// ─── #3038 — bridge-dead watchdog ────────────────────────────────────────
+// When the gateway (re)starts, the MCP bridge inside the running claude
+// session normally re-registers on the IPC socket within seconds. If it
+// died with the previous gateway (Claude Code never respawns a dead MCP
+// server), the session stays alive but toolless/mute forever. This
+// watchdog escalates: no real bridge registered within the grace window
+// while claude is alive → bounce the container once (reason
+// 'bridge-dead-resume') so the MCP server respawns. See
+// bridge-dead-watchdog.ts for the guard rails.
+// Config: SWITCHROOM_BRIDGE_DEAD_GRACE_MS (default 90s),
+// SWITCHROOM_BRIDGE_DEAD_ESCALATION=0 disables.
+const BRIDGE_DEAD_ESCALATION_ENABLED = process.env.SWITCHROOM_BRIDGE_DEAD_ESCALATION !== '0'
+const BRIDGE_DEAD_GRACE_MS = (() => {
+  const v = Number(process.env.SWITCHROOM_BRIDGE_DEAD_GRACE_MS)
+  return Number.isFinite(v) && v > 0 ? v : DEFAULT_BRIDGE_DEAD_GRACE_MS
+})()
+const bridgeDeadWatchdog = createBridgeDeadWatchdog({
+  graceMs: BRIDGE_DEAD_GRACE_MS,
+  isSessionAlive: () => findAgentProcessInContainer() != null,
+  // `shuttingDown` is declared (let, module scope) further down this file;
+  // the closure only runs when the grace timer fires, long after module
+  // init completes, so the TDZ is never hit.
+  isShuttingDown: () => shuttingDown,
+  escalate: (reason) =>
+    triggerSelfRestart(process.env.SWITCHROOM_AGENT_NAME ?? '', reason, 1500),
+  crashLogPath: join(STATE_DIR, 'bridge-crash.log'),
+  markerPath: join(STATE_DIR, 'bridge-dead-escalation.json'),
+  log: (line) => process.stderr.write(`${line}\n`),
+})
+if (BRIDGE_DEAD_ESCALATION_ENABLED) {
+  bridgeDeadWatchdog.arm()
+  process.stderr.write(
+    `telegram gateway: [bridge-dead-watchdog] armed (grace=${BRIDGE_DEAD_GRACE_MS}ms)\n`,
+  )
+}
+
 const ipcServer: IpcServer = createIpcServer({
   socketPath: SOCKET_PATH,
 
@@ -9118,6 +9194,11 @@ const ipcServer: IpcServer = createIpcServer({
     const bridgeUpEffects = client.agentName != null
       ? shadowEmit({ kind: 'bridgeUp', at: Date.now() })
       : []
+    // #3038 — a REAL (named, non-cron) bridge registered: stand the
+    // bridge-dead watchdog down. Anonymous clients (recall.py, mcp
+    // handshakes) must NOT satisfy it — same false-positive rationale as
+    // the shadow bridgeUp gate above.
+    if (client.agentName != null) bridgeDeadWatchdog.noteBridgeRegistered()
     client.send({ type: 'status', status: 'agent_connected' })
 
     // Phase 2b PR 3a — bridgeUp cutover. The state machine's `bridgeUp`
@@ -9307,6 +9388,11 @@ const ipcServer: IpcServer = createIpcServer({
     if (client.agentName != null) {
       process.stderr.write(`telegram gateway: bridge disconnected — agent=${client.agentName}\n`)
       shadowEmit({ kind: 'bridgeDown', at: Date.now() })
+      // #3038 — the real bridge went away mid-life. Re-arm the grace
+      // window: a normal claude restart re-registers within seconds and
+      // stands it down; a bridge that died for good escalates once (the
+      // once-per-boot fuse inside the watchdog caps it).
+      if (BRIDGE_DEAD_ESCALATION_ENABLED) bridgeDeadWatchdog.noteBridgeDisconnected()
     }
 
     // Scope the flush to clients that actually registered as an agent.
@@ -26028,6 +26114,10 @@ async function shutdown(signal: string): Promise<void> {
   shuttingDown = true
   const agentName = process.env.SWITCHROOM_AGENT_NAME ?? '-'
   process.stderr.write('telegram gateway: shutting down\n')
+  // #3038 — never let a pending bridge-dead grace timer race a shutdown
+  // already in progress (its check() also skips on shuttingDown; this is
+  // the belt to that brace).
+  bridgeDeadWatchdog.stop()
 
   // Write the clean-shutdown sentinel BEFORE any drain work begins so
   // even if the drain hangs and the +5s force-exit kills us, the marker
