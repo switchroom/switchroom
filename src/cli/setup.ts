@@ -45,6 +45,7 @@ import {
 import { getViaBrokerStructured } from "../vault/broker/client.js";
 import {
   ask,
+  askHidden,
   askYesNo,
   askChoice,
   waitForAction,
@@ -53,6 +54,7 @@ import {
 } from "../setup/prompt.js";
 import { captureEvent, captureException } from "../analytics/posthog.js";
 import { insertVaultBrokerApprovalAuth } from "./setup-posture-rewrite.js";
+import type { PostureRewriteResult } from "./setup-posture-rewrite.js";
 import {
   isValidSupergroupChatId,
   setAgentSupergroupChatId,
@@ -150,7 +152,7 @@ export function registerSetupCommand(program: Command): void {
         await stepAutoUnlock(config, switchroomConfigPath, nonInteractive);
 
         // ── Step 10: Dangerous mode ─────────────────────────────
-        await stepDangerousMode(config, nonInteractive);
+        await stepDangerousMode(config, switchroomConfigPath, nonInteractive);
 
         // ── Step 11: Agent onboarding guidance ───────────────────
         await stepOnboardingGuidance(config, nonInteractive);
@@ -612,7 +614,7 @@ async function storeTokenInVault(
     console.log(chalk.gray("  Creating encrypted vault..."));
     let passphrase = process.env.SWITCHROOM_VAULT_PASSPHRASE;
     if (!passphrase) {
-      passphrase = await ask("  Vault passphrase (for encrypting secrets)");
+      passphrase = await askHidden("  Vault passphrase (for encrypting secrets)");
       if (!passphrase) throw new Error("Vault passphrase is required");
     }
     createVault(passphrase, vaultPath);
@@ -623,7 +625,7 @@ async function storeTokenInVault(
   } else {
     let passphrase = process.env.SWITCHROOM_VAULT_PASSPHRASE;
     if (!passphrase) {
-      passphrase = await ask("  Vault passphrase");
+      passphrase = await askHidden("  Vault passphrase");
     }
     if (passphrase) {
       try {
@@ -1554,35 +1556,24 @@ async function stepAutoUnlock(
   const TELEGRAM_ID_CHOICE = "telegram-id — Approve tap mints immediately, no passphrase prompt (single-factor)";
   const choice = await askChoice("  Approval posture", [PASSPHRASE_CHOICE, TELEGRAM_ID_CHOICE]);
   if (choice === TELEGRAM_ID_CHOICE) {
-    try {
-      const yamlPath = existsSync(resolve(process.cwd(), "switchroom.yaml"))
-        ? resolve(process.cwd(), "switchroom.yaml")
-        : resolve(process.cwd(), "switchroom.yml");
-      if (existsSync(yamlPath)) {
-        const content = readFileSync(yamlPath, "utf-8");
-        // Use a YAML-aware rewrite scoped to vault.broker — the previous
-        // regex matched any top-level `broker:` and could land the
-        // posture key under the wrong block.
-        const result = insertVaultBrokerApprovalAuth(content, "telegram-id");
-        if (result.kind === "rewritten") {
-          writeFileSync(yamlPath, result.content, "utf-8");
-          console.log(
-            chalk.green(`  ${STEP_DONE} Set vault.broker.approvalAuth: telegram-id in ${yamlPath}`),
-          );
-        } else if (result.kind === "already-set") {
-          console.log(chalk.gray("  approvalAuth already set — leaving it alone."));
-        } else {
-          console.log(
-            chalk.yellow(
-              "  Could not locate vault.broker block — add `approvalAuth: telegram-id` under `vault.broker:` manually.",
-            ),
-          );
-        }
-      }
-    } catch (err) {
+    // Persist to the canonical config path that stepConfigFile resolved
+    // (~/.switchroom/switchroom.yaml, or an explicit --config) — the same
+    // file every other setup step writes. The previous code resolved the
+    // path from process.cwd(), so running setup from any directory other
+    // than the config dir silently dropped this single-factor posture
+    // choice with no error (2026-07-11 review, HIGH). Fail loud if the
+    // canonical config is missing or unwritable rather than no-op.
+    const kind = persistApprovalAuthTelegramId(switchroomConfigPath);
+    if (kind === "rewritten") {
+      console.log(
+        chalk.green(`  ${STEP_DONE} Set vault.broker.approvalAuth: telegram-id in ${switchroomConfigPath}`),
+      );
+    } else if (kind === "already-set") {
+      console.log(chalk.gray("  approvalAuth already set — leaving it alone."));
+    } else {
       console.log(
         chalk.yellow(
-          `  Could not write approvalAuth: ${err instanceof Error ? err.message : String(err)}`,
+          "  Could not locate vault.broker block — add `approvalAuth: telegram-id` under `vault.broker:` manually.",
         ),
       );
     }
@@ -1593,8 +1584,91 @@ async function stepAutoUnlock(
 
 // ─── Step 9: Dangerous Mode ─────────────────────────────────────────────────
 
+/**
+ * Insert `vault.broker.approvalAuth: telegram-id` into the canonical
+ * config at `configPath`, failing loud if that file is missing/unwritable.
+ *
+ * Extracted from stepAutoUnlock so the persistence (and its fail-loud
+ * contract) can be exercised in unit tests without the interactive vault
+ * flow. Returns the underlying rewrite kind so the caller can render the
+ * right message (`not-found` is a loud manual-edit hint, not a silent
+ * no-op). A missing config throws — the operator's posture choice must
+ * never be silently discarded (2026-07-11 review, HIGH).
+ */
+export function persistApprovalAuthTelegramId(
+  configPath: string,
+): PostureRewriteResult["kind"] {
+  if (!existsSync(configPath)) {
+    throw new ConfigError(
+      `Cannot persist vault.broker.approvalAuth: config not found at ${configPath}`,
+    );
+  }
+  const content = readFileSync(configPath, "utf-8");
+  // YAML-aware rewrite scoped to vault.broker — a plain regex could land
+  // the posture key under an unrelated top-level `broker:` block.
+  const result = insertVaultBrokerApprovalAuth(content, "telegram-id");
+  if (result.kind === "rewritten") {
+    writeFileSync(configPath, result.content, "utf-8");
+  }
+  return result.kind;
+}
+
+/**
+ * Write `dangerous_mode: true` into every agent block of the canonical
+ * config at `configPath` (and mirror it into the in-memory `config`).
+ *
+ * Extracted from stepDangerousMode for the same reason: the write must
+ * target the SAME canonical config the rest of setup resolves, not
+ * process.cwd(), and must fail loud rather than no-op when that file is
+ * missing (2026-07-11 review, HIGH). Throws if `configPath` doesn't exist.
+ */
+export function persistDangerousMode(
+  config: SwitchroomConfig,
+  configPath: string,
+): void {
+  if (!existsSync(configPath)) {
+    throw new ConfigError(
+      `Cannot persist dangerous_mode: config not found at ${configPath}`,
+    );
+  }
+  let content = readFileSync(configPath, "utf-8");
+  const agentNames = Object.keys(config.agents);
+
+  for (const name of agentNames) {
+    // Add dangerous_mode to each agent block. (Prior versions also added
+    // skip_permission_prompt: true here — dropped as of the dead-settings
+    // cleanup since it's now a no-op; autoaccept handles the boot prompt.)
+    const agentPattern = new RegExp(`(^  ${name}:\\s*\\n)`, "m");
+    if (agentPattern.test(content)) {
+      // Match this agent's block up to the next 2-space top-level key OR
+      // end of input. The end-of-input arm was `\Z`, which in JS regex is
+      // a literal `Z` (JS has no `\Z` anchor) — so the LAST agent's block
+      // never matched and its dangerous_mode was silently dropped from the
+      // file (2026-07-11 review, LOW). `(?![\s\S])` is a true end-of-string
+      // assertion that works under the `m` flag.
+      const blockPattern = new RegExp(
+        `^  ${name}:[\\s\\S]*?(?=^  [a-z]|(?![\\s\\S]))`,
+        "m",
+      );
+      const blockMatch = content.match(blockPattern);
+      if (blockMatch && !blockMatch[0].includes("dangerous_mode")) {
+        content = content.replace(
+          agentPattern,
+          `$1    dangerous_mode: true\n`,
+        );
+      }
+    }
+
+    // Also update the in-memory config
+    config.agents[name].dangerous_mode = true;
+  }
+
+  writeFileSync(configPath, content, "utf-8");
+}
+
 async function stepDangerousMode(
   config: SwitchroomConfig,
+  switchroomConfigPath: string,
   nonInteractive: boolean,
 ): Promise<void> {
   stepHeader(10, "Auto-approve mode", STEP_ACTIVE);
@@ -1613,41 +1687,13 @@ async function stepDangerousMode(
   }
 
   if (enableDangerous) {
-    const configPaths = [
-      resolve(process.cwd(), "switchroom.yaml"),
-      resolve(process.cwd(), "switchroom.yml"),
-    ];
-
-    for (const configPath of configPaths) {
-      if (existsSync(configPath)) {
-        let content = readFileSync(configPath, "utf-8");
-        const agentNames = Object.keys(config.agents);
-
-        for (const name of agentNames) {
-          // Add dangerous_mode to each agent block. (Prior versions also added
-          // skip_permission_prompt: true here — dropped as of the dead-settings
-          // cleanup since it's now a no-op; autoaccept handles the boot prompt.)
-          const agentPattern = new RegExp(`(^  ${name}:\\s*\\n)`, "m");
-          if (agentPattern.test(content)) {
-            const blockPattern = new RegExp(`^  ${name}:[\\s\\S]*?(?=^  [a-z]|\\Z)`, "m");
-            const blockMatch = content.match(blockPattern);
-            if (blockMatch && !blockMatch[0].includes("dangerous_mode")) {
-              content = content.replace(
-                agentPattern,
-                `$1    dangerous_mode: true\n`,
-              );
-            }
-          }
-
-          // Also update the in-memory config
-          config.agents[name].dangerous_mode = true;
-        }
-
-        writeFileSync(configPath, content, "utf-8");
-        console.log(chalk.green(`  ${STEP_DONE} Enabled dangerous_mode for all agents in ${configPath}`));
-        break;
-      }
-    }
+    // Persist to the canonical config stepConfigFile resolved, NOT
+    // process.cwd(). Running setup outside the config dir previously
+    // wrote this choice to a stray cwd file — or nowhere — with no error
+    // (2026-07-11 review, HIGH). persistDangerousMode fails loud if the
+    // canonical config is missing/unwritable.
+    persistDangerousMode(config, switchroomConfigPath);
+    console.log(chalk.green(`  ${STEP_DONE} Enabled dangerous_mode for all agents in ${switchroomConfigPath}`));
   } else {
     console.log(chalk.gray("  Skipped. Agents will prompt for tool approval."));
     console.log(chalk.green(`  ${STEP_DONE} Skipped`));
