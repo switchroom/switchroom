@@ -261,7 +261,10 @@ describe("scaffoldAgent", () => {
     const config = makeAgentConfig({ thinking_effort: "xhigh" });
     const result = scaffoldAgent("effort-agent", config, tmpDir, telegramConfig);
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
-    expect(startSh).toContain("--effort xhigh");
+    // #3039: the configured default seeds $_EFFECTIVE_EFFORT; a durable
+    // .session-effort override may replace it at boot.
+    expect(startSh).toContain("_EFFECTIVE_EFFORT='xhigh'");
+    expect(startSh).toContain('--effort $_EFFECTIVE_EFFORT');
   });
 
   it("start.sh defaults --effort to 'low' when thinking_effort is not set in yaml", () => {
@@ -272,15 +275,15 @@ describe("scaffoldAgent", () => {
     const config = makeAgentConfig();
     const result = scaffoldAgent("no-effort-agent", config, tmpDir, telegramConfig);
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
-    expect(startSh).toContain("--effort low");
+    expect(startSh).toContain("_EFFECTIVE_EFFORT='low'");
   });
 
   it("start.sh respects an explicit thinking_effort override", () => {
     const config = makeAgentConfig({ thinking_effort: "high" });
     const result = scaffoldAgent("explicit-effort", config, tmpDir, telegramConfig);
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
-    expect(startSh).toContain("--effort high");
-    expect(startSh).not.toContain("--effort low");
+    expect(startSh).toContain("_EFFECTIVE_EFFORT='high'");
+    expect(startSh).not.toContain("_EFFECTIVE_EFFORT='low'");
   });
 
   it("start.sh defaults --model to claude-sonnet-5 when model is not set in yaml", () => {
@@ -343,7 +346,7 @@ describe("scaffoldAgent", () => {
     scaffoldAgent("effort-reconcile", config, tmpDir, telegramConfig, switchroomConfig);
     reconcileAgent("effort-reconcile", config, tmpDir, telegramConfig, switchroomConfig);
     const startSh = readFileSync(join(tmpDir, "effort-reconcile", "start.sh"), "utf-8");
-    expect(startSh).toContain("--effort medium");
+    expect(startSh).toContain("_EFFECTIVE_EFFORT='medium'");
   });
 
   it("reconcile re-renders start.sh with permission_mode flag", () => {

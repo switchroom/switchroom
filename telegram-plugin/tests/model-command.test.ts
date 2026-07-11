@@ -20,6 +20,7 @@ import {
   isValidModelArg,
   isSrModel,
   isClaudeModel,
+  isBusyRefusalText,
   MODEL_ALIASES,
   type ModelCommandDeps,
 } from "../gateway/model-command.js";
@@ -201,7 +202,7 @@ describe("handleModelCommand — set", () => {
     const reply = await handleModelCommand({ kind: "set", model: "opus" }, deps);
     expect(calls).toEqual([{ agent: "klanker", command: "/model opus" }]);
     expect(reply.text).toContain("<pre>⏺ Set model to sonnet</pre>");
-    expect(reply.text).toContain("Sticky across switchroom-managed relaunches");
+    expect(reply.text).toContain("persists across restarts, deploys, and crashes");
     expect(reply.html).toBe(true);
     // A verified confirmation records the live model so /status stays honest
     // (bug 1: the typed path never recorded the switch before).
@@ -769,12 +770,19 @@ describe("buildModelMenu", () => {
     }
   });
 
-  it("busy agent → no discovery, no keyboard, explanatory text", async () => {
+  it("busy agent → no discovery, STATIC keyboard whose taps ride the queue (#3039)", async () => {
     const { deps, calls } = makeMenuDeps({ isBusy: () => true });
     const menu = await buildModelMenu(deps);
+    // Never drives the picker mid-turn…
     expect(calls.discover).toBe(0);
-    expect(menu.keyboard).toBeUndefined();
     expect(menu.text).toContain("mid-turn");
+    // …but no dead-end either: static alias rows are offered so the operator
+    // can still lock in a choice (the tap queues at the gateway busy gate).
+    expect(menu.keyboard).toBeDefined();
+    const data = menu.keyboard!.flat().map(b => b.callback_data);
+    expect(data).toContain("mdl:alias:opus");
+    expect(data).toContain("mdl:alias:default");
+    expect(menu.text).not.toContain("Try again");
   });
 
   it("discovery failure → static v1 fallback with the reason, no keyboard", async () => {
@@ -1315,5 +1323,21 @@ describe("Fable alias callback injects /model fable", () => {
     const out = await handleModelMenuCallback(`${MODEL_CALLBACK_ALIAS}bad name`, deps);
     expect(injectCalls).toEqual([]);
     expect(out.answer).toContain("Invalid");
+  });
+});
+
+// ─── #3039: busy-refusal detection for the queued-command drain ──────────────
+
+describe("isBusyRefusalText (#3039)", () => {
+  it("matches the typed and menu busy refusals", async () => {
+    const deps = makeDeps({ isBusy: () => true }).deps;
+    const reply = await handleModelCommand({ kind: "set", model: "opus" }, deps);
+    expect(isBusyRefusalText(reply.text)).toBe(true);
+  });
+
+  it("never matches a genuine confirmation or failure", () => {
+    expect(isBusyRefusalText("⏺ Set model to Opus 4.8")).toBe(false);
+    expect(isBusyRefusalText("✅ `/effort high` — Set effort level to high")).toBe(false);
+    expect(isBusyRefusalText("❌ Switch to opus failed: tmux session not found")).toBe(false);
   });
 });

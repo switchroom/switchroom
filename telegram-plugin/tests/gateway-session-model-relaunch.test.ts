@@ -114,14 +114,14 @@ describe('gateway: intent writers on the restart verbs', () => {
     expect(clearIdx).toBeGreaterThan(markerIdx)
   })
 
-  it('/restart stamps an explicit revert intent (reason honesty) before dispatch', () => {
+  it('/restart stamps a KEEP intent before dispatch (#3039: a restart is not "clear my model")', () => {
     const idx = GATEWAY_SRC.indexOf("stampUserRestartReason('user: /restart from chat')")
     expect(idx).toBeGreaterThan(0)
     const win = GATEWAY_SRC.slice(idx, idx + 900)
-    const revertIdx = win.indexOf("writeRelaunchModelIntent(smDir, 'revert', 'user: /restart from chat')")
+    const keepIdx = win.indexOf("writeRelaunchModelIntent(smDir, 'keep', 'user: /restart from chat')")
     const dispatchIdx = win.indexOf("hostdRequestId('gw-restart')")
-    expect(revertIdx).toBeGreaterThan(0)
-    expect(dispatchIdx).toBeGreaterThan(revertIdx)
+    expect(keepIdx).toBeGreaterThan(0)
+    expect(dispatchIdx).toBeGreaterThan(keepIdx)
   })
 
   it('/new and /reset stamp keep-intent (fresh conversation, same model — contract row 7)', () => {

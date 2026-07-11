@@ -164,21 +164,87 @@ export interface PendingCommandCardEdit {
 }
 
 /**
- * Gateway-shutdown resolution for queued commands: EMPTY the slots and return
- * the ack-card edits that tell the operator their queued choice cannot apply
- * (the session is going away with the gateway) and must be re-issued after
- * boot. Without this, a SIGTERM leaves the ack card dangling at "the moment
- * this turn finishes" forever and the choice is silently lost.
+ * What the gateway should DURABLY record for a queued command that can't
+ * apply live because the session is going away (gateway shutdown or a pending
+ * session relaunch). #3039: instead of telling the operator to re-issue, the
+ * choice is persisted to the durable carriers (`.session-model` /
+ * `.session-effort`) that start.sh honors on every boot — so the queued
+ * command still deterministically applies, just via the relaunch.
+ *
+ *   - 'model'        — persist `arg` as the `.session-model` override
+ *   - 'effort'       — persist `arg` as the `.session-effort` override
+ *   - 'clear-model'  — the queued command was `/model default`: clear the carrier
+ *   - 'clear-effort' — the queued command was `/effort default`: clear the carrier
+ *   - null           — not offline-resolvable (a `mdl:s:<tag>` menu selection
+ *                      needs live picker discovery to become a token); the
+ *                      operator is asked to re-issue after boot.
  */
-export function shutdownResolutionEdits(
+export type ShutdownPersistKind = 'model' | 'effort' | 'clear-model' | 'clear-effort' | null
+
+export interface ShutdownResolutionAction {
+  cmd: PendingSessionCommand
+  persist: ShutdownPersistKind
+  /** The canonical token / allowlisted level to persist (when persist != null). */
+  arg: string
+  /** Ack-card edit when the durable write succeeds. */
+  persistedText: string
+  /** Ack-card edit when persist is null or the durable write failed. */
+  reissueText: string
+}
+
+const EFFORT_MENU_SELECT_PREFIX = 'eff:s:'
+
+function classifyShutdownPersist(cmd: PendingSessionCommand): { persist: ShutdownPersistKind; arg: string } {
+  if (cmd.kind === 'effort') {
+    const level = cmd.origin === 'menu' && cmd.arg.startsWith(EFFORT_MENU_SELECT_PREFIX)
+      ? cmd.arg.slice(EFFORT_MENU_SELECT_PREFIX.length)
+      : cmd.arg
+    if (level === 'default') return { persist: 'clear-effort', arg: level }
+    return { persist: 'effort', arg: level }
+  }
+  // model
+  if (cmd.origin === 'menu') return { persist: null, arg: cmd.arg } // mdl:s:<tag> — needs live discovery
+  if (cmd.arg === 'default') return { persist: 'clear-model', arg: cmd.arg }
+  return { persist: 'model', arg: cmd.arg }
+}
+
+function persistedText(cmd: PendingSessionCommand, escapeHtml: (s: string) => string): string {
+  const noun = KIND_NOUN[cmd.kind]
+  const isClear = cmd.arg === 'default' || cmd.targetLabel === 'default'
+  if (isClear) {
+    return `💾 The session is restarting — your ${noun} override was cleared as requested; the agent boots on the configured default.`
+  }
+  return `💾 The session is restarting — your \`${escapeHtml(cmd.targetLabel)}\` ${noun} choice is saved and applies as the agent boots.`
+}
+
+/**
+ * Empty the slots and return, per queued command, what to persist and which
+ * ack-card edit to make. The gateway performs the durable writes (this module
+ * stays fs-free and unit-testable) and edits with `persistedText` on success
+ * or `reissueText` on a null/failed persist. Shared by the SIGTERM shutdown
+ * handler AND the drain's pending-restart branch — a queued choice is never
+ * dropped with a bare "re-issue" when it can be carried across the bounce.
+ */
+export function shutdownResolutionActions(
   slots: PendingSessionCommandSlots,
   escapeHtml: (s: string) => string,
-): PendingCommandCardEdit[] {
-  return slots.takeAll().map(cmd => ({
-    chatId: cmd.ackChatId,
-    messageId: cmd.ackMessageId,
-    text: restartSupersededText(cmd, escapeHtml),
-  }))
+): ShutdownResolutionAction[] {
+  return slots.takeAll().map(cmd => resolveForRestart(cmd, escapeHtml))
+}
+
+/** Single-command form of shutdownResolutionActions (the drain's pending-restart branch). */
+export function resolveForRestart(
+  cmd: PendingSessionCommand,
+  escapeHtml: (s: string) => string,
+): ShutdownResolutionAction {
+  const { persist, arg } = classifyShutdownPersist(cmd)
+  return {
+    cmd,
+    persist,
+    arg,
+    persistedText: persistedText(cmd, escapeHtml),
+    reissueText: restartSupersededText(cmd, escapeHtml),
+  }
 }
 
 const KIND_NOUN: Record<PendingCommandKind, string> = {

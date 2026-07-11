@@ -107,7 +107,7 @@ describe("effort-command: handler", () => {
     const { deps } = makeDeps({ getConfiguredEffort: () => "medium" });
     const r = await handleEffortCommand({ kind: "show" }, deps);
     expect(r.text).toContain("medium");
-    expect(r.text).toMatch(/reverts to the configured default/);
+    expect(r.text).toMatch(/persists across restarts and deploys/);
   });
 
   it("show falls back to low when effort is unreadable", async () => {
@@ -121,7 +121,7 @@ describe("effort-command: handler", () => {
     const r = await handleEffortCommand({ kind: "set", level: "high" }, deps);
     expect(calls).toEqual([{ agent: "carrie", level: "high" }]);
     expect(r.text).toContain("Set effort level to high");
-    expect(r.text).toMatch(/reverts to the configured default/);
+    expect(r.text).toMatch(/persists across restarts and deploys/);
   });
 
   it("set notes the re-read cost when a confirmation was needed", async () => {
@@ -196,5 +196,62 @@ describe("effort-command: menu + callback", () => {
     const out = await handleEffortMenuCallback(`${EFFORT_CALLBACK_PREFIX}s:bogus`, deps);
     expect(calls).toEqual([]);
     expect(out.selectedEffort).toBeUndefined();
+  });
+});
+
+// ─── #3039: /effort default + durable-override surfaces ─────────────────────
+
+describe("effort-command: /effort default (#3039)", () => {
+  it("parses `/effort default` as an explicit clear", () => {
+    expect(parseEffortCommand("/effort default")).toEqual({ kind: "default" });
+    expect(parseEffortCommand("/effort DEFAULT")).toEqual({ kind: "default" });
+  });
+
+  it("default restores the configured level, THEN clears the durable override (order pins the wrapper undo)", async () => {
+    const events: string[] = [];
+    const { deps } = makeDeps({
+      getConfiguredEffort: () => "medium",
+      applyEffort: async (_a, level) => {
+        events.push(`apply:${level}`);
+        return applyOk(level);
+      },
+      clearSessionEffort: () => events.push("clear"),
+    });
+    const r = await handleEffortCommand({ kind: "default" }, deps);
+    expect(events).toEqual(["apply:medium", "clear"]);
+    expect(r.text).toContain("override cleared");
+    expect(r.text).toContain("`medium`");
+  });
+
+  it("default still clears the override when the live apply fails (boots on default from now on)", async () => {
+    let cleared = false;
+    const { deps } = makeDeps({
+      applyEffort: async () => applyFail("apply_unverified"),
+      clearSessionEffort: () => { cleared = true; },
+    });
+    const r = await handleEffortCommand({ kind: "default" }, deps);
+    expect(cleared).toBe(true);
+    expect(r.text).toContain("override cleared");
+    // Honest: does not claim the live session switched.
+    expect(r.text).toContain("Couldn't switch the live session right now");
+  });
+
+  it("show surfaces an active session override next to the configured default", async () => {
+    const { deps } = makeDeps({ getConfiguredEffort: () => "low", getSessionEffort: () => "xhigh" });
+    const r = await handleEffortCommand({ kind: "show" }, deps);
+    expect(r.text).toContain("session override: `xhigh`");
+  });
+
+  it("menu marks the durable override as the live level", () => {
+    const { deps } = makeDeps({ getConfiguredEffort: () => "low", getSessionEffort: () => "max" });
+    const menu = buildEffortMenu(deps);
+    const marked = menu.keyboard!.flat().find((b) => b.text.startsWith("✅"));
+    expect(marked?.text).toBe("✅ max");
+  });
+
+  it("help text advertises /effort default and the sticky contract", async () => {
+    const r = await handleEffortCommand({ kind: "help" }, makeDeps().deps);
+    expect(r.text).toContain("/effort default");
+    expect(r.text).toContain("persists across restarts and deploys");
   });
 });

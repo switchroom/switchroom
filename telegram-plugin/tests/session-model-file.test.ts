@@ -25,6 +25,10 @@ import {
   SESSION_MODEL_FILE,
   RELAUNCH_MODEL_INTENT_FILE,
   CONFIGURED_DEFAULT_MODEL_FILE,
+  parseSessionEffort,
+  writeSessionEffortFile,
+  readSessionEffortFile,
+  clearSessionEffortFile,
 } from '../gateway/session-model-file.js'
 
 let dir: string
@@ -111,8 +115,8 @@ describe('intentForRestartReason — the triggerSelfRestart per-reason table (RF
     expect(intentForRestartReason(reason)).toBe('keep')
   })
 
-  it('inline-button-restart (operator-deliberate) → revert', () => {
-    expect(intentForRestartReason('inline-button-restart')).toBe('revert')
+  it('inline-button-restart → keep (#3039: a restart is not "clear my model")', () => {
+    expect(intentForRestartReason('inline-button-restart')).toBe('keep')
   })
 
   it('unknown gateway reasons default to keep (only gateway code calls triggerSelfRestart; crashes never do)', () => {
@@ -172,5 +176,56 @@ describe('readConfiguredDefaultModel', () => {
 
   it('clearSessionModelFile is a safe no-op when absent', () => {
     expect(() => clearSessionModelFile(dir)).not.toThrow()
+  })
+})
+
+// ─── #3039: durable session-effort carrier ───────────────────────────────────
+
+describe('session-effort file helpers (#3039)', () => {
+  let dir: string
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'sr-session-effort-'))
+  })
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('round-trips a valid level with the configured default at write', () => {
+    writeSessionEffortFile(dir, 'xhigh', 'low')
+    const rec = readSessionEffortFile(dir)
+    expect(rec?.level).toBe('xhigh')
+    expect(rec?.configuredDefaultAtWrite).toBe('low')
+    expect(typeof rec?.ts).toBe('number')
+  })
+
+  it('refuses to persist a non-allowlisted level (verbatim --effort surface)', () => {
+    expect(() => writeSessionEffortFile(dir, 'mega; rm -rf /', 'low')).toThrow(/non-allowlisted/)
+    expect(readSessionEffortFile(dir)).toBeNull()
+  })
+
+  it('parseSessionEffort rejects corrupt JSON, bad shape, and bad levels', () => {
+    expect(parseSessionEffort('{broken')).toBeNull()
+    expect(parseSessionEffort('{"level":"turbo","configuredDefaultAtWrite":"low","ts":1}')).toBeNull()
+    expect(parseSessionEffort('{"level":"high","ts":1}')).toBeNull()
+    expect(parseSessionEffort('{"level":"high","configuredDefaultAtWrite":"low","ts":1}')?.level).toBe('high')
+  })
+
+  it('clearSessionEffortFile removes it; read after clear is null', () => {
+    writeSessionEffortFile(dir, 'high', '')
+    clearSessionEffortFile(dir)
+    expect(readSessionEffortFile(dir)).toBeNull()
+  })
+})
+
+describe('intentForRestartReason is keep-for-everything (#3039)', () => {
+  it('every reason keeps — restarts never clear a user model choice', () => {
+    for (const reason of [
+      'inline-button-restart',
+      'user: /restart from chat',
+      'schedule-restart-immediate',
+      'anything-else',
+    ]) {
+      expect(intentForRestartReason(reason)).toBe('keep')
+    }
   })
 })
