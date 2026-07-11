@@ -177,6 +177,7 @@ import { REPLY_TOOLS, isDraftOfReply } from '../narrative-dedup.js'
 import { toolLabel } from '../tool-labels.js'
 import { createTypingWrapper } from '../typing-wrap.js'
 import { createTurnTypingLoop } from './turn-typing-loop.js'
+import { createTypingEmitter, TYPING_REFRESH_MS } from '../typing-emitter.js'
 import { type DraftStreamHandle } from '../draft-stream.js'
 import { handlePtyPartialPure, type PtyHandlerState } from '../pty-partial-handler.js'
 import { handleStreamReply } from '../stream-reply-handler.js'
@@ -193,6 +194,7 @@ import {
   floodStatePath,
   makeFloodWaitRecorder,
   makeFloodWaitProbe,
+  suppressNonEssentialSendMs,
 } from '../flood-circuit-breaker.js'
 import { buildAttachmentPath, assertInsideInbox } from '../attachment-path.js'
 import { logStreamingEvent } from '../streaming-metrics.js'
@@ -5316,6 +5318,63 @@ const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
 // The length/newline text splitter moved to outbound-send-path.ts (#2996) as
 // `chunkText`; the sole gateway caller now goes through `computeReplyChunks`.
 
+// ─── Robust API call wrapper ──────────────────────────────────────────────
+// Extracted to telegram-plugin/retry-api-call.ts so it's unit-testable in
+// isolation; the gateway just composes the pure policy with its own logger.
+// #2923: the shared flood-wait marker. Every observed 429 retry_after window
+// is persisted here via onFloodWait, and both boot-card callsites consult the
+// SAME file to suppress a restart card while a per-bot flood ban is open (so a
+// restart doesn't post into the window and extend the ban). Falls back to a
+// no-op recorder when TELEGRAM_STATE_DIR is unset (dev/one-shot contexts).
+// STATE_DIR always resolves (env or a ~/.claude fallback), so this is live.
+// Declared ABOVE the typing indicator because the typing sends now route
+// through the same policy (#3084) — see nonEssentialApiCall below.
+const FLOOD_STATE_PATH = floodStatePath(STATE_DIR)
+const robustApiCall = createRetryApiCall({
+  log: (line) => process.stderr.write(line),
+  onFloodWait: makeFloodWaitRecorder(FLOOD_STATE_PATH),
+  // #3094: while a LONG per-bot ban is open, don't issue the call at all.
+  // retryApiCall no longer sleeps a multi-hour retry_after (it throws
+  // FLOOD_WAIT_ACTIVE instead), and the card surfaces re-drive on a 5-6s
+  // heartbeat — without this gate that turns the fix into an amplifier that
+  // fires thousands of requests into the open window and extends the ban.
+  floodWaitRemainingMs: makeFloodWaitProbe(FLOOD_STATE_PATH),
+})
+
+// Fire-and-forget wrapper for outbound surfaces that previously had
+// `.catch(() => {})` directly on `bot.api.*` calls. Resolves to undefined
+// (instead of crashing the gateway) on THREAD_NOT_FOUND, give-up, 403,
+// and any non-benign error — logs a one-liner so the failure isn't
+// completely silent. See #1075.
+const swallowingApiCall = createSwallowingRetryApiCall(
+  robustApiCall,
+  (line) => process.stderr.write(line),
+)
+
+/**
+ * The wrapper for NON-ESSENTIAL sends that must NEVER retry (#3084).
+ *
+ * A typing indicator is disposable: if it fails, the correct answer is to drop
+ * it, because a retry spends more of the per-bot flood budget the REPLIES need
+ * — retrying is what feeds a ban. But it must not be SILENT either: the typing
+ * loop was the single largest emitter (55% of outbound volume) and it called
+ * `bot.api` raw with `.catch(() => {})`, so the #2923 flood circuit breaker —
+ * which only learns about 429s through `createRetryApiCall`'s `onFloodWait`
+ * hook — was blind to 429s from the biggest source of them.
+ *
+ * `maxRetries: 1` + a no-op sleep gives exactly one attempt: a 429 still runs
+ * `onFloodWait` (recording the window to the breaker), then the call gives up
+ * immediately instead of sleeping out a 4-hour retry_after. The swallowing
+ * wrapper logs and drops the failure.
+ */
+// No `log` hook: retryApiCall's flood line reads "waiting Ns", which would be
+// a lie here — we never wait, we drop. The callsite logs the drop itself.
+const nonEssentialApiCall = createRetryApiCall({
+  maxRetries: 1,
+  sleep: async () => {},
+  onFloodWait: makeFloodWaitRecorder(FLOOD_STATE_PATH),
+})
+
 // ─── Typing indicator ─────────────────────────────────────────────────────
 // All four state maps re-keyed from `chat_id` to `chatKey(chat, thread)`
 // in PR3 of the supergroup-mode rollout. In supergroup mode one agent
@@ -5352,6 +5411,63 @@ const CHAT_ACTION_WHITELIST = new Set([
 ] as const)
 type ChatAction = typeof CHAT_ACTION_WHITELIST extends Set<infer T> ? T : never
 
+/**
+ * The ONE seam every chat action in this gateway goes through (#3084).
+ *
+ * Both typing loops (tool-use `typingIntervals` below and the turn-level
+ * `turnTypingLoop`) and the one-shot inbound pings share this emitter, so the
+ * per-chat-key floor holds ACROSS them: at most one `sendChatAction` per chat
+ * key per ~4 s window, no matter how many times a loop is restarted. That is
+ * what decouples the typing rate from the agent's TOOL-CALL rate — the
+ * regression that earned a 4.6-hour flood ban. A cold start (no ping inside
+ * the floor) still fires instantly, so "typing…" lands the moment a turn
+ * begins; only redundant restarts are dropped. And while a flood window is
+ * open, typing — non-essential by definition — is not emitted at all.
+ */
+const typingEmitter = createTypingEmitter({
+  chatKey: (chat_id, thread_id) => chatKey(chat_id, thread_id) as string,
+  isSuppressed: () => suppressNonEssentialSendMs(FLOOD_STATE_PATH, Date.now()) > 0,
+  send: (chat_id, thread_id, action) => {
+    const sendOpts = thread_id != null ? { message_thread_id: thread_id } : undefined
+    void nonEssentialApiCall(
+      // allow-raw-bot-api: routed through nonEssentialApiCall — records a 429 to the flood breaker (#2923) and NEVER retries (a retried typing ping is what feeds a ban, #3084).
+      () => bot.api.sendChatAction(chat_id, action as ChatAction, sendOpts),
+      { chat_id, verb: 'sendChatAction' },
+    ).then(
+      () => { typingBackoffMs = 0 },
+      (err) => {
+        const msg = err instanceof Error ? err.message : String(err)
+        if (msg.includes('401') || msg.includes('Unauthorized')) {
+          const key = chatKey(chat_id, thread_id) as string
+          typingBackoffMs = Math.min(Math.max(typingBackoffMs * 2 || 1000, 1000), TYPING_BACKOFF_MAX)
+          stopTypingLoop(chat_id, thread_id)
+          const retry = setTimeout(() => {
+            typingRetryTimers.delete(key)
+            startTypingLoop(chat_id, thread_id, action as ChatAction)
+          }, typingBackoffMs)
+          typingRetryTimers.set(key, retry)
+          return
+        }
+        // Everything else (including a 429 — already recorded to the flood
+        // breaker by onFloodWait) is DROPPED, never retried. Logged so the
+        // largest outbound emitter is no longer silent (#3084).
+        process.stderr.write(
+          `telegram gateway: sendChatAction dropped (non-essential, not retried): ${msg}\n`,
+        )
+      },
+    )
+  },
+})
+
+/** Fire one chat action for (chat, thread), subject to the shared floor. */
+function emitChatAction(
+  chat_id: string,
+  thread_id: number | null = null,
+  action: ChatAction = 'typing',
+): void {
+  typingEmitter.emit(chat_id, thread_id, action)
+}
+
 function startTypingLoop(
   chat_id: string,
   thread_id: number | null = null,
@@ -5359,26 +5475,15 @@ function startTypingLoop(
 ): void {
   stopTypingLoop(chat_id, thread_id)
   const key = chatKey(chat_id, thread_id) as string
-  const sendOpts = thread_id != null ? { message_thread_id: thread_id } : undefined
-  const send = () => {
-    bot.api.sendChatAction(chat_id, action, sendOpts).then(
-      () => { typingBackoffMs = 0 },
-      (err) => {
-        const msg = err instanceof Error ? err.message : String(err)
-        if (msg.includes('401') || msg.includes('Unauthorized')) {
-          typingBackoffMs = Math.min(Math.max(typingBackoffMs * 2 || 1000, 1000), TYPING_BACKOFF_MAX)
-          stopTypingLoop(chat_id, thread_id)
-          const retry = setTimeout(() => {
-            typingRetryTimers.delete(key)
-            startTypingLoop(chat_id, thread_id, action)
-          }, typingBackoffMs)
-          typingRetryTimers.set(key, retry)
-        }
-      },
-    )
-  }
+  // The immediate fire is FLOOR-GATED (it was not, and that is #3084): the
+  // tool-use wrapper restarts this loop on every tool call, so an unguarded
+  // immediate send made the ping rate equal the tool-call rate and the 4 s
+  // interval decorative. The emitter drops the restart's ping when this key
+  // already pinged inside the window, and lets it straight through on a cold
+  // start — so a turn still lights up "typing…" instantly.
+  const send = () => emitChatAction(chat_id, thread_id, action)
   send()
-  typingIntervals.set(key, setInterval(send, 4000))
+  typingIntervals.set(key, setInterval(send, TYPING_REFRESH_MS))
 }
 
 function stopTypingLoop(chat_id: string, thread_id: number | null = null): void {
@@ -5398,14 +5503,19 @@ function stopTypingLoop(chat_id: string, thread_id: number | null = null): void 
 // kill it and the chat would go dark for the rest of the turn — the exact
 // black-box gap this closes. The dedicated map (private to the factory) makes
 // the turn loop structurally immune to those stops: only the canonical turn-end
-// stop clears it. The redundant `typing` pings while a reply is mid-flight are
-// harmless — same action, and sendChatAction is cheap.
+// stop clears it.
+//
+// The interval map stays separate — but the SENDS do not (#3084). This loop and
+// `typingIntervals` target the SAME chat key, and the old comment here claimed
+// the redundant pings were "harmless — same action, and sendChatAction is
+// cheap". They are not cheap: they spend the per-bot flood budget the replies
+// need, and two independently-restarting loops on one key is exactly how the
+// rate compounded. Both loops now emit through `typingEmitter`, so the
+// per-chat-key floor is SHARED and neither loop can out-shout the other.
 const turnTypingLoop = createTurnTypingLoop({
-  sendChatAction: (chat_id, thread_id) => {
-    const sendOpts = thread_id != null ? { message_thread_id: thread_id } : undefined
-    void bot.api.sendChatAction(chat_id, 'typing', sendOpts).catch(() => {})
-  },
+  sendChatAction: (chat_id, thread_id) => emitChatAction(chat_id, thread_id, 'typing'),
   chatKey: (chat_id, thread_id) => chatKey(chat_id, thread_id) as string,
+  refreshMs: TYPING_REFRESH_MS,
 })
 
 function startTurnTypingLoop(chat_id: string, thread_id: number | null = null): void {
@@ -5421,37 +5531,6 @@ const typingWrapper = createTypingWrapper({
   stopTypingLoop,
   isSurfaceTool: isTelegramSurfaceTool,
 })
-
-// ─── Robust API call wrapper ──────────────────────────────────────────────
-// Extracted to telegram-plugin/retry-api-call.ts so it's unit-testable in
-// isolation; the gateway just composes the pure policy with its own logger.
-// #2923: the shared flood-wait marker. Every observed 429 retry_after window
-// is persisted here via onFloodWait, and both boot-card callsites consult the
-// SAME file to suppress a restart card while a per-bot flood ban is open (so a
-// restart doesn't post into the window and extend the ban). Falls back to a
-// no-op recorder when TELEGRAM_STATE_DIR is unset (dev/one-shot contexts).
-// STATE_DIR always resolves (env or a ~/.claude fallback), so this is live.
-const FLOOD_STATE_PATH = floodStatePath(STATE_DIR)
-const robustApiCall = createRetryApiCall({
-  log: (line) => process.stderr.write(line),
-  onFloodWait: makeFloodWaitRecorder(FLOOD_STATE_PATH),
-  // #3084: while a LONG per-bot ban is open, don't issue the call at all.
-  // retryApiCall no longer sleeps a multi-hour retry_after (it throws
-  // FLOOD_WAIT_ACTIVE instead), and the card surfaces re-drive on a 5-6s
-  // heartbeat — without this gate that turns the fix into an amplifier that
-  // fires thousands of requests into the open window and extends the ban.
-  floodWaitRemainingMs: makeFloodWaitProbe(FLOOD_STATE_PATH),
-})
-
-// Fire-and-forget wrapper for outbound surfaces that previously had
-// `.catch(() => {})` directly on `bot.api.*` calls. Resolves to undefined
-// (instead of crashing the gateway) on THREAD_NOT_FOUND, give-up, 403,
-// and any non-benign error — logs a one-liner so the failure isn't
-// completely silent. See #1075.
-const swallowingApiCall = createSwallowingRetryApiCall(
-  robustApiCall,
-  (line) => process.stderr.write(line),
-)
 
 /**
  * Adapter factory for `startBootCard`'s `BotApiForBootCard` interface.
@@ -17373,7 +17452,9 @@ function maybeEarlyAckReaction(ctx: Context, from: NonNullable<Context['from']>)
   // model text. No fake content — Telegram clients render this natively
   // and it auto-expires after ~5s if not refreshed (the answer-lane
   // first edit will land long before then under the new defaults).
-  void bot.api.sendChatAction(chatId, 'typing').catch(() => {})
+  // Through the shared emitter (#3084): a cold chat still lights up
+  // instantly; a chat already pinged inside the floor doesn't pay twice.
+  emitChatAction(chatId, null, 'typing')
 }
 
 /**
@@ -18158,11 +18239,8 @@ async function handleInbound(
   // Typing indicator in the ORIGINATING topic — on a supergroup-topic inbound,
   // an un-threaded sendChatAction shows "typing" in General, not the topic the
   // user is in. messageThreadId is the inbound's thread (undefined in a DM).
-  void bot.api.sendChatAction(
-    chat_id,
-    'typing',
-    messageThreadId != null ? { message_thread_id: messageThreadId } : {},
-  ).catch(() => {})
+  // Floor-gated through the shared emitter (#3084).
+  emitChatAction(chat_id, messageThreadId ?? null, 'typing')
 
   // Parse explicit prefixes first. `/steer ` / `/s ` opts IN to steering;
   // `/queue ` / `/q ` are legacy aliases that opt in to the new default (queued).

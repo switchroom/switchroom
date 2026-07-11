@@ -16,8 +16,16 @@
  * a mid-turn reply's `finally { stopTypingLoop }` would kill it and the chat
  * would go dark for the rest of the turn. A dedicated map makes the turn loop
  * structurally immune to those stops — only `stop` (the canonical turn-end)
- * clears it. The redundant `typing` pings while a reply is mid-flight are
- * harmless (same action, and `sendChatAction` is cheap).
+ * clears it.
+ *
+ * The map is separate; the SENDS are not (#3084). This file used to claim the
+ * redundant pings were "harmless — same action, and `sendChatAction` is cheap".
+ * They are not cheap: they spend the per-bot flood budget the REPLIES need, and
+ * on 2026-07-11 the two loops together earned a 4.6-hour flood ban. The gateway
+ * now injects a `sendChatAction` that routes through the SHARED typing emitter
+ * (`typing-emitter.ts`), which enforces one action per chat key per refresh
+ * window across BOTH loops. This factory keeps its lifecycle semantics —
+ * fire-on-start, refresh, stop-at-turn-end — and the floor lives in the emitter.
  *
  * Extracted into a factory so the lifecycle (fires on start, refreshes on the
  * interval, stops on turn-end, NEVER leaks a refresh interval after the turn
