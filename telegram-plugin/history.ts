@@ -178,6 +178,57 @@ export function initHistory(stateDir: string, retentionDays = 30): void {
     }
   }
 
+  // Migration (review finding H5): make INSERT OR REPLACE idempotent for thread-less rows.
+  //
+  // The table's PRIMARY KEY is (chat_id, thread_id, message_id), but thread_id
+  // is nullable and SQLite treats NULL as DISTINCT from NULL in a PK/UNIQUE
+  // index. Every DM and every non-topic group message has thread_id = NULL, so
+  // two inserts of the same (chat_id, message_id) with NULL thread do NOT
+  // conflict — `INSERT OR REPLACE` APPENDS a duplicate row instead of replacing
+  // it. On the documented at-least-once boot replay / synthesized-resume
+  // re-record, an already-stored message is duplicated, inflating
+  // get_recent_messages and the getRecentOutboundCount / hasOutboundDeliveredSince
+  // counters that feed the silence / over-ping detectors.
+  //
+  // Fix: a UNIQUE index over COALESCE(thread_id, '') gives every logical
+  // (chat, thread-or-general, message_id) key a NON-null uniqueness value, so
+  // REPLACE conflict-resolves and dedupes thread-less rows too. INSERT OR
+  // REPLACE resolves against ANY unique index, so no writer change is needed.
+  // A forum-topic row (non-null thread) and a general row (NULL thread) that
+  // share a message_id keep DISTINCT keys (the topic id vs ''), so they stay
+  // separate. Stored thread_id values remain real NULLs, so every read path
+  // (`thread_id IS NULL` / `thread_id = ?`) is unchanged.
+  const LOGICAL_KEY_INDEX = 'idx_messages_logical_key'
+  const logicalKeyIndexExists =
+    db
+      .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?`)
+      .get(LOGICAL_KEY_INDEX) != null
+  if (!logicalKeyIndexExists) {
+    // De-dupe rows an earlier (pre-fix) build already appended, keeping the
+    // NEWEST row per logical key (highest ts, then highest rowid = the last
+    // write, which is what INSERT OR REPLACE would have left). This MUST run
+    // before the UNIQUE index is created, or CREATE UNIQUE INDEX would fail on
+    // the existing duplicates. On a fresh/empty DB it is a harmless no-op.
+    db.exec(`
+      DELETE FROM messages
+      WHERE rowid NOT IN (
+        SELECT keep_rowid FROM (
+          SELECT rowid AS keep_rowid,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY chat_id, COALESCE(thread_id, ''), message_id
+                   ORDER BY ts DESC, rowid DESC
+                 ) AS rn
+          FROM messages
+        )
+        WHERE rn = 1
+      )
+    `)
+    db.exec(
+      `CREATE UNIQUE INDEX IF NOT EXISTS ${LOGICAL_KEY_INDEX} ` +
+        `ON messages (chat_id, COALESCE(thread_id, ''), message_id)`,
+    )
+  }
+
   // Readable by owner and others so the web dashboard (different uid than the
   // agent) can stream replies back to Hermes Desktop. The WAL sidecar files
   // (-shm/-wal) are also chmod'd so SQLite readonly opens succeed for uid=1000.

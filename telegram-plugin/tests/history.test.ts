@@ -542,6 +542,121 @@ describe('hasOutboundDeliveredSince', () => {
   })
 })
 
+// Review finding H5 regression: the original PRIMARY KEY (chat_id, thread_id, message_id) does
+// NOT dedupe thread-less rows because SQLite treats NULL as distinct from NULL
+// in a UNIQUE/PK index. The documented at-least-once boot replay re-records an
+// already-stored DM/non-topic message, so `INSERT OR REPLACE` appended a
+// DUPLICATE row instead of replacing — over-counting the silence / over-ping
+// detectors. The COALESCE(thread_id,'') unique index makes the upsert
+// idempotent. These tests fail (duplicate rows) without the fix.
+describe('idempotent upsert for null-thread rows (H5)', () => {
+  beforeEach(() => initHistory(stateDir, 30))
+
+  it('re-recording the same null-thread inbound yields exactly ONE row', () => {
+    const msg = {
+      chat_id: '-100',
+      thread_id: null,
+      message_id: 7,
+      user: 'alice',
+      user_id: '111',
+      ts: 1000,
+      text: 'hello',
+    }
+    // Simulate the at-least-once replay: record the same message twice.
+    recordInbound(msg)
+    recordInbound(msg)
+    const rows = query({ chat_id: '-100' })
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({ message_id: 7, role: 'user', text: 'hello' })
+    // The over-count surface the finding calls out must stay accurate.
+    expect(getRecentOutboundCount('-100', 999_999)).toBe(0)
+  })
+
+  it('re-recording the same null-thread outbound yields exactly ONE row', () => {
+    const now = Math.floor(Date.now() / 1000)
+    const send = {
+      chat_id: '-100',
+      thread_id: null,
+      message_ids: [42],
+      texts: ['the answer'],
+      ts: now,
+    }
+    recordOutbound(send)
+    recordOutbound(send)
+    const rows = query({ chat_id: '-100' })
+    expect(rows).toHaveLength(1)
+    // hasOutboundDeliveredSince / getRecentOutboundCount read this table; a
+    // duplicate here would double-count and over-ping.
+    expect(getRecentOutboundCount('-100', 60)).toBe(1)
+  })
+
+  it('a re-record REPLACES rather than appends (newest text wins)', () => {
+    recordInbound({ chat_id: '-100', thread_id: null, message_id: 7, user: 'a', user_id: '1', ts: 1000, text: 'first version' })
+    recordInbound({ chat_id: '-100', thread_id: null, message_id: 7, user: 'a', user_id: '1', ts: 1000, text: 'second version' })
+    const rows = query({ chat_id: '-100' })
+    expect(rows).toHaveLength(1)
+    expect(rows[0]?.text).toBe('second version')
+  })
+
+  it('a topic row and a general row with the SAME message_id stay DISTINCT', () => {
+    // Same chat_id + message_id, but one is in a forum topic (thread 5) and one
+    // is the general/DM row (null thread). These are different logical messages
+    // and must both survive — the COALESCE sentinel keeps them separate.
+    recordInbound({ chat_id: '-100', thread_id: 5, message_id: 9, user: 'a', user_id: '1', ts: 100, text: 'in topic 5' })
+    recordInbound({ chat_id: '-100', thread_id: null, message_id: 9, user: 'a', user_id: '1', ts: 100, text: 'in general' })
+    expect(query({ chat_id: '-100' })).toHaveLength(2)
+    expect(query({ chat_id: '-100', thread_id: 5 }).map(r => r.text)).toEqual(['in topic 5'])
+    expect(query({ chat_id: '-100', thread_id: null }).map(r => r.text)).toEqual(['in general'])
+  })
+
+  it('two distinct forum topics with the same message_id stay DISTINCT', () => {
+    recordInbound({ chat_id: '-100', thread_id: 5, message_id: 9, user: 'a', user_id: '1', ts: 100, text: 'topic5' })
+    recordInbound({ chat_id: '-100', thread_id: 6, message_id: 9, user: 'a', user_id: '1', ts: 100, text: 'topic6' })
+    expect(query({ chat_id: '-100' })).toHaveLength(2)
+    expect(query({ chat_id: '-100', thread_id: 5 }).map(r => r.text)).toEqual(['topic5'])
+    expect(query({ chat_id: '-100', thread_id: 6 }).map(r => r.text)).toEqual(['topic6'])
+  })
+
+  it('migration de-dupes pre-existing null-thread duplicates from a legacy DB', async () => {
+    // Simulate a DB written by the pre-fix build: insert duplicate null-thread
+    // rows DIRECTLY, bypassing the (now-fixed) upsert, to reproduce the exact
+    // corruption the finding describes. Then re-init to fire the migration.
+    const { Database } = await import('bun:sqlite')
+    const dbPath = join(stateDir, 'history.db')
+    const now = Math.floor(Date.now() / 1000) // recent ts so the retention sweep keeps them
+    _resetForTests()
+    const raw = new Database(dbPath)
+    // Drop the logical-key index so we're back to the legacy, dupe-permitting
+    // schema, then append two rows sharing the same (chat, null-thread, msg).
+    raw.exec('DROP INDEX IF EXISTS idx_messages_logical_key')
+    const insert = raw.prepare(
+      `INSERT INTO messages (chat_id, thread_id, message_id, role, user, user_id, ts, text, group_id)
+       VALUES (?, NULL, ?, 'user', 'a', '1', ?, ?, NULL)`,
+    )
+    insert.run('-100', 7, now, 'stale copy')
+    insert.run('-100', 7, now + 1, 'newest copy')
+    // A distinct topic row with the same message_id must survive the migration.
+    raw.prepare(
+      `INSERT INTO messages (chat_id, thread_id, message_id, role, user, user_id, ts, text, group_id)
+       VALUES (?, 5, ?, 'user', 'a', '1', ?, ?, NULL)`,
+    ).run('-100', 7, now, 'topic row')
+    raw.close()
+
+    // Re-open through initHistory → runs the H5 migration (dedupe + index).
+    initHistory(stateDir, 30)
+    const general = query({ chat_id: '-100', thread_id: null })
+    expect(general).toHaveLength(1)
+    expect(general[0]?.text).toBe('newest copy') // kept the newest (highest ts/rowid)
+    // The topic row with the same message_id is untouched.
+    expect(query({ chat_id: '-100', thread_id: 5 }).map(r => r.text)).toEqual(['topic row'])
+    expect(query({ chat_id: '-100' })).toHaveLength(2)
+
+    // And the upsert is idempotent going forward.
+    recordInbound({ chat_id: '-100', thread_id: null, message_id: 7, user: 'a', user_id: '1', ts: now + 2, text: 'replay' })
+    expect(query({ chat_id: '-100', thread_id: null })).toHaveLength(1)
+  })
+})
+
 describe('secret redaction at persistence (both directions)', () => {
   beforeEach(() => initHistory(stateDir, 30))
 
