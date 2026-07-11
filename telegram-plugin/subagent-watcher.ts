@@ -2050,6 +2050,19 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       existing.stallNotified = false
       existing.stalledAt = null
       existing.stallTerminalSynthesised = false
+      // Re-arm the deferral log gate alongside its stall siblings (#3092).
+      // Unreachable with stale state TODAY (both routes out of the deferred
+      // state to `done` — the cap-crossing and the un-stall drain — already
+      // null `deferralLoggedAt`), so this is belt-and-braces, not a live fix.
+      // Reset it here anyway: a resurrected entry must be indistinguishable
+      // from a fresh one, so a genuinely NEW stall always logs its FIRST
+      // deferral line immediately. Leaving these to a reachability argument
+      // makes the gate fragile by construction — a later reorder of the drain,
+      // or a third path to `done`, would silently suppress that first line for
+      // up to `deferralLogIntervalMs`, losing the exact signal this gate
+      // exists to preserve.
+      existing.deferralLoggedAt = null
+      existing.deferralSuppressedTicks = 0
       // Re-arm the completion notification INTENTIONALLY (issue #3023). The
       // false synthesized finish already fired `onFinish` once, delivering a
       // (possibly wrong / incomplete) synthesized handback to the parent.
