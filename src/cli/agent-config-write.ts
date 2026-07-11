@@ -70,6 +70,7 @@ import {
   summarizeScheduleReport,
 } from "../scheduler/schedule-report.js";
 import { buildEnvelope, type ErrorEnvelope } from "../host-control/protocol.js";
+import { cronMinuteSmallestGapMin } from "../scheduler/cron-gap.js";
 
 const MAX_ENTRIES_PER_AGENT = 20;
 
@@ -83,41 +84,30 @@ const MIN_CRON_INTERVAL_MIN = 5;
  * gap is below `MIN_CRON_INTERVAL_MIN`, the schedule fires too fast
  * and is refused.
  *
- * Semantics by minute-field shape:
- *   - `*`        → 1  (fires every minute)
- *   - `*\/N`     → N  (stepped cadence)
- *   - CSV list   → smallest pairwise gap between sorted values
- *                  (e.g. `0,1,2` → 1, `0,30` → 30, `0,15,30,45` → 15)
- *   - anything else (ranges, mixed) → 0 (unknown)
+ * Delegates to the shared `cronMinuteSmallestGapMin` helper
+ * (src/scheduler/cron-gap.ts), which expands the minute field to the set
+ * of matched minutes and takes the smallest **circular** gap. Coverage:
+ *   - `*`            → 1   (fires every minute)
+ *   - `*\/N`         → N   (stepped cadence)
+ *   - single value   → 60  (hourly; e.g. `15`)
+ *   - CSV list       → smallest circular pairwise gap
+ *                      (e.g. `0,1,2` → 1, `0,30` → 30, `58,59` → 1)
+ *   - range `A-B`    → 1   (e.g. `0-4` fires every minute for 5 mins)
+ *   - step-on-range  → step (e.g. `0-30/2` → 2)
+ *   - unparseable / out-of-range → 0 (unknown → pass through)
  *
- * NOTE: this is **not** the worst-case wait between fires. For CSV
- * lists clustered at the top of the hour like `0,1,2 * * * *`, the
- * worst-case wait is ~58 min (minute 2 → next hour's minute 0), but
- * the *smallest* gap is 1 — which is what the floor cares about.
- * Surfaced as `requested_interval_min` in the error envelope's
- * `quota_exceeded.current` field; receivers should read it as "the
- * tightest cadence the schedule implies", not "the user's wait time".
+ * Earlier this returned 0 for ranges and step-on-range/list forms, letting
+ * them bypass the floor (switchroom #1783); the shared helper closes that.
+ *
+ * NOTE: this is **not** the worst-case wait between fires. For CSV lists
+ * clustered at the top of the hour like `0,1,2 * * * *`, the worst-case
+ * wait is ~58 min, but the *smallest* gap is 1 — which is what the floor
+ * cares about. Surfaced as `requested_interval_min` in the error
+ * envelope's `quota_exceeded.current` field; receivers should read it as
+ * "the tightest cadence the schedule implies", not "the user's wait time".
  */
 export function extractCronSmallestGapMin(expr: string): number {
-  const fields = expr.trim().split(/\s+/);
-  if (fields.length < 5) return 0;
-  const min = fields[0];
-  if (min === "*") return 1;
-  const step = min.match(/^\*\/(\d+)$/);
-  if (step) return Number(step[1]);
-  if (min.includes(",")) {
-    const parts = min.split(",").map((s) => Number(s)).filter((n) => Number.isFinite(n));
-    if (parts.length >= 2) {
-      const sorted = [...parts].sort((a, b) => a - b);
-      let smallest = Infinity;
-      for (let i = 1; i < sorted.length; i++) {
-        const gap = sorted[i] - sorted[i - 1];
-        if (gap > 0 && gap < smallest) smallest = gap;
-      }
-      return Number.isFinite(smallest) ? smallest : 0;
-    }
-  }
-  return 0;
+  return cronMinuteSmallestGapMin(expr);
 }
 
 /**

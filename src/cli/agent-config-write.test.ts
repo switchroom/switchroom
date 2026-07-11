@@ -103,6 +103,33 @@ describe("scheduleAdd — security gates", () => {
     expect(r.exit).toBe(9);
   });
 
+  // #1783 — CSV / range / step-on-range forms previously bypassed the
+  // 5-min floor. Assert they are now rejected with E_CRON_TOO_FREQUENT.
+  it.each([
+    ["CSV clustered `0,1,2`", "0,1,2 * * * *"],
+    ["range `0-4`", "0-4 * * * *"],
+    ["step-on-range `0-30/2`", "0-30/2 * * * *"],
+    ["wraparound `58,59`", "58,59 * * * *"],
+    ["every-minute-during-hour `* 1 * * *`", "* 1 * * *"],
+  ])("rejects sub-floor cadence %s (#1783)", (_label, cronExpr) => {
+    const r = scheduleAdd({ cronExpr, prompt: "spammy", root });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe("E_CRON_TOO_FREQUENT");
+    expect(r.exit).toBe(9);
+  });
+
+  // #1783 — legal cadences at/above the floor must still be accepted.
+  it.each([
+    ["`0,30` (30-min)", "0,30 * * * *"],
+    ["`*/5` (== floor)", "*/5 * * * *"],
+    ["single minute `15` (hourly)", "15 * * * *"],
+    ["`*/7` (nominal 7 ≥ floor; wraparound seam not policed)", "*/7 * * * *"],
+  ])("accepts at-or-above-floor cadence %s (#1783)", (_label, cronExpr) => {
+    const r = scheduleAdd({ cronExpr, prompt: "fine", root });
+    expect(r.ok).toBe(true);
+  });
+
   // #1770 Phase 3 — envelope shape assertions parallel to the Phase 2
   // tests in tests/host-control/. The ScheduleErrorResult now carries
   // a `meta` side-channel that the CLI's emitError lifts into the
@@ -366,8 +393,25 @@ describe("extractCronSmallestGapMin (#1779)", () => {
   it("`*` → 1 (every minute)", () => {
     expect(extractCronSmallestGapMin("* * * * *")).toBe(1);
   });
-  it("range / unknown forms → 0", () => {
-    expect(extractCronSmallestGapMin("0-30 * * * *")).toBe(0);
+  // #1783 — range / step-on-range / single-value forms are now expanded
+  // (previously returned 0 and bypassed the floor).
+  it("range `0-4` → 1 (fires every minute for 5 mins)", () => {
+    expect(extractCronSmallestGapMin("0-4 * * * *")).toBe(1);
+  });
+  it("range `0-30` → 1", () => {
+    expect(extractCronSmallestGapMin("0-30 * * * *")).toBe(1);
+  });
+  it("step-on-range `0-30/2` → 2", () => {
+    expect(extractCronSmallestGapMin("0-30/2 * * * *")).toBe(2);
+  });
+  it("single value `15` → 60 (hourly)", () => {
+    expect(extractCronSmallestGapMin("15 * * * *")).toBe(60);
+  });
+  it("wraparound CSV `58,59` → 1 (circular gap)", () => {
+    expect(extractCronSmallestGapMin("58,59 * * * *")).toBe(1);
+  });
+  it("unparseable / out-of-range forms → 0 (unknown, pass through)", () => {
     expect(extractCronSmallestGapMin("bogus")).toBe(0);
+    expect(extractCronSmallestGapMin("75 * * * *")).toBe(0);
   });
 });
