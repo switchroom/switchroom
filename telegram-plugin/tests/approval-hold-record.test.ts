@@ -467,11 +467,13 @@ describe('gateway wiring — the failure handler records instead of discarding',
   it('does NOT mark undeliverable when a card already LANDED on another target', () => {
     // The send fans out to several chats/topics; one flood-walled leg must not
     // write a blocked record while the operator can see a live card.
-    expect(onPermissionRequestBody()).toContain('if (pend.cards.length > 0) return')
+    // (#3108 renamed the handler's `pend` to `live` when the send moved into
+    // postPermissionCard — the pin follows the merged code.)
+    expect(onPermissionRequestBody()).toContain('if (live.cards.length > 0) return')
   })
 
   it('a re-failure preserves the ORIGINAL since (the "first failed" contract)', () => {
-    expect(onPermissionRequestBody()).toContain('since: pend.undeliverable?.since ?? now')
+    expect(onPermissionRequestBody()).toContain('since: live.undeliverable?.since ?? now')
   })
 
   it('reconcile delegates selection to the unit-tested selectOldestHeld', () => {

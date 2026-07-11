@@ -38,6 +38,7 @@ import {
   createBlockedApprovalStore,
   blockedApprovalsDir,
   selectHeldForRedelivery,
+  selectOldestHeld,
   isHeldUndeliverable,
   safeActionForRecord,
   holdReasonFor,
@@ -225,22 +226,21 @@ export function createHarness(opts: { ttlFreeze?: boolean; cap?: number; targets
     return { message_id: 1000 + sends.length }
   }
 
-  /** Mirrors gateway.ts's reconcileBlockedApprovals: derive from live state. */
+  /**
+   * Mirrors gateway.ts's reconcileBlockedApprovals — and shares its SELECTION
+   * with production via `selectOldestHeld` (extracted in #3107's late fix), so
+   * the harness cannot drift from the real oldest-held-wins rule.
+   */
   function reconcile(): void {
-    let oldest: { id: string; p: Pending; since: number } | null = null
-    for (const [id, p] of pending) {
-      const u = p.undeliverable
-      if (u == null) continue
-      if (oldest == null || u.since < oldest.since) oldest = { id, p, since: u.since }
-    }
+    const oldest = selectOldestHeld(pending)
     if (oldest == null) { blockedStore.clear(); return }
-    const u = oldest.p.undeliverable!
+    const { requestId, pend: p, mark: u } = oldest
     blockedStore.write({
       agent: 'overlord',
-      requestId: oldest.id,
-      toolName: oldest.p.tool_name,
-      action: safeActionForRecord(naturalAction, oldest.p.tool_name, oldest.p.input_preview),
-      blockedSince: oldest.p.startedAt,
+      requestId,
+      toolName: p.tool_name,
+      action: safeActionForRecord(naturalAction, p.tool_name, p.input_preview),
+      blockedSince: p.startedAt,
       undeliverableSince: u.since,
       retryableAt: u.retryableAt,
       reason: u.reason,
