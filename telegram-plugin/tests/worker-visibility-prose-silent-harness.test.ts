@@ -158,6 +158,7 @@ function makeHarness() {
     stallThresholdMs: 60_000, // tight active-loop threshold
     silentSynthesisStallThresholdMs: 300_000, // widened window (also long-runner window)
     silentStallTerminalMs: 300_000, // post-stall terminal-synthesis window (unchanged)
+    inflightTerminalCapMs: 900_000, // died-mid-tool cap (15 min, compressed from the 45-min default)
     rescanMs: 500,
     now: () => currentTime,
     setInterval: sharedSetInterval,
@@ -278,10 +279,23 @@ describe('prose-silent background worker — end-to-end visibility harness (PR 2
     expect(h.stallCalls[0].agentId).toBe(h.agentId)
     expect(h.stallTerminalCalls).toHaveLength(0)
 
-    // (d) TERMINAL GATE RELEASE: 300s past the stall, the silent-stall terminal
-    // synthesis fires — onStallTerminal + onFinish — and the feed finalizes.
-    // This is the untouched, load-bearing completion path.
-    h.advance(310_000)
+    // (d) IN-FLIGHT DEFERRAL: 300s past the stall the OLD contract
+    // (#2777/#2782) synthesised terminal here. But this worker's transcript
+    // ends in a Bash tool_use with NO tool_result — it may still be inside
+    // the tool call (incident 2026-07-10: exactly this shape finalised a
+    // LIVE worker's card mid-Bash). Synthesis is now deferred while the
+    // tool call is in flight...
+    h.advance(310_000) // total idle ~672s — past silentStallTerminalMs, under the 900s cap
+    await h.flush()
+    expect(h.stallTerminalCalls).toHaveLength(0)
+    expect(h.finishCalls).toHaveLength(0)
+
+    // (e) TERMINAL GATE RELEASE AT THE CAP: ...but not forever. A worker
+    // that died mid-tool (JSONL frozen, tool_result never coming) must not
+    // wedge — past inflightTerminalCapMs of total idle the synthesis
+    // proceeds and the completion gate releases. The load-bearing release
+    // from #2777/#2782 survives, bounded instead of at the raw synth window.
+    h.advance(300_000) // total idle ~972s ≥ 900s cap
     await h.flush()
     expect(h.stallTerminalCalls).toHaveLength(1)
     expect(h.finishCalls).toHaveLength(1)

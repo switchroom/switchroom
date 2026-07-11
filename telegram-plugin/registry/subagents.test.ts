@@ -665,6 +665,73 @@ describe('reapStuckRunningRows', () => {
     expect(result.reaped).toBe(5)
     expect(result.ids.sort()).toEqual(['sa-0', 'sa-1', 'sa-2', 'sa-3', 'sa-4'])
   })
+
+  // Incident 2026-07-10: a live, actively-card-editing worker was reaped as
+  // terminal because the DB `last_activity_at` was stale (linkage never
+  // bumped it) while the in-memory file-discovery registry knew it was
+  // alive. The reaper must cross-check the live registry before reaping.
+  it('does NOT reap a row the live registry reports as an active worker', () => {
+    const db = openFreshSubagentsDbInMemory()
+    recordSubagentStart(db, {
+      id: 'sa-live',
+      background: true,
+      startedAt: 1000,
+      jsonlAgentId: 'a3c5b2d5765810114',
+    })
+    // DB liveness is stale (past ttl) — but the watcher is actively tailing
+    // this worker, so isLive returns true and the row is spared.
+    const liveIds = new Set(['a3c5b2d5765810114'])
+    const result = reapStuckRunningRows(db, {
+      ttlMs: 500,
+      now: 5000,
+      isLive: (jid) => jid != null && liveIds.has(jid),
+    })
+    expect(result.reaped).toBe(0)
+    expect(getSubagent(db, 'sa-live')!.status).toBe('running')
+  })
+
+  it('still reaps a stale row that is NOT in the live registry (genuine orphan)', () => {
+    const db = openFreshSubagentsDbInMemory()
+    recordSubagentStart(db, {
+      id: 'sa-orphan',
+      background: true,
+      startedAt: 1000,
+      jsonlAgentId: 'dead-worker',
+    })
+    // Also a live one to prove the predicate discriminates per-row.
+    recordSubagentStart(db, {
+      id: 'sa-alive',
+      background: true,
+      startedAt: 1000,
+      jsonlAgentId: 'live-worker',
+    })
+    const liveIds = new Set(['live-worker'])
+    const result = reapStuckRunningRows(db, {
+      ttlMs: 500,
+      now: 5000,
+      isLive: (jid) => jid != null && liveIds.has(jid),
+    })
+    expect(result.reaped).toBe(1)
+    expect(result.ids).toEqual(['sa-orphan'])
+    expect(getSubagent(db, 'sa-orphan')!.status).toBe('stalled')
+    expect(getSubagent(db, 'sa-alive')!.status).toBe('running')
+  })
+
+  it('reaps a stale row with NULL jsonl_agent_id (the watcher predicate never matches an unlinked row)', () => {
+    const db = openFreshSubagentsDbInMemory()
+    recordSubagentStart(db, { id: 'sa-unlinked', background: true, startedAt: 1000 })
+    // Mirror the production predicate shape: a null jsonl_agent_id can't
+    // key into the registry, so it always reports not-live and the reaper
+    // (the safety net for exactly this unlinked-orphan case) still fires.
+    const liveIds = new Set<string>()
+    const result = reapStuckRunningRows(db, {
+      ttlMs: 500,
+      now: 5000,
+      isLive: (jid) => jid != null && liveIds.has(jid),
+    })
+    expect(result.reaped).toBe(1)
+    expect(getSubagent(db, 'sa-unlinked')!.status).toBe('stalled')
+  })
 })
 
 // ---------------------------------------------------------------------------
