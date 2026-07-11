@@ -185,6 +185,22 @@ Flow (auto-detected from host environment):
 Override the auto-detection: `SWITCHROOM_MICROSOFT_OAUTH_TIER=device_code`
 or `=desktop_loopback`.
 
+**Telegram-native — no SSH, no keyboard (issue #2582).** You can add or
+re-auth a Microsoft account entirely over chat with the admin agent that
+holds the grant:
+
+```
+/auth microsoft add you@outlook.com             # add or re-auth
+/auth microsoft add you@outlook.com --replace   # re-consent
+/auth microsoft add you@outlook.com --org-mode  # tenant/org app
+```
+
+The agent runs the loopback flow in its own container, relays the
+consent URL to chat, you approve on your phone (the `127.0.0.1` redirect
+fails to load — expected), then paste the full address-bar URL
+(`?code=...&state=...`) back. The gateway validates `state` and completes
+the exchange. `/auth microsoft cancel` aborts.
+
 Per RFC §4.3, the scope set requested at consent time:
 
 ```

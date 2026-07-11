@@ -46,6 +46,17 @@ export type ParsedAuthCommand =
   | { kind: 'rotate' }
   | { kind: 'add'; label: string }
   | { kind: 'cancel' }
+  | {
+      kind: 'provider-add'
+      provider: 'google' | 'microsoft'
+      email: string
+      replace: boolean
+      /** Google `--write` (Drive write scope). */
+      write: boolean
+      /** Microsoft `--org-mode`. */
+      orgMode: boolean
+    }
+  | { kind: 'provider-cancel'; provider: 'google' | 'microsoft' }
   | { kind: 'rm-prompt'; label: string }
   | { kind: 'rm-confirmed'; label: string }
   | { kind: 'refresh'; label?: string }
@@ -147,6 +158,9 @@ export function parseAuthCommand(text: string): ParsedAuthCommand | null {
     }
     case 'cancel':
       return { kind: 'cancel' }
+    case 'google':
+    case 'microsoft':
+      return parseProviderVerb(verb, parts.slice(1))
     case 'rm': {
       const label = parts[1]
       if (!label) return { kind: 'help', reason: 'Usage: /auth rm <label> [confirm]' }
@@ -203,6 +217,69 @@ export function parseAuthCommand(text: string): ParsedAuthCommand | null {
       return { kind: 'help' }
     default:
       return { kind: 'help', reason: `Unknown verb: \`${codeSpanSafe(verb)}\`` }
+  }
+}
+
+/**
+ * Parse `/auth google …` and `/auth microsoft …` — the Telegram-native OAuth
+ * loopback relay verbs (issue #2582). Only `add <email>` and `cancel` are
+ * wired; anything else is a help-with-reason so the operator sees the shape.
+ *
+ * Flags mirror the CLI:
+ *   google:    `add <email> [--replace] [--write]`
+ *   microsoft: `add <email> [--replace] [--org-mode]`
+ */
+export function parseProviderVerb(
+  provider: 'google' | 'microsoft',
+  rest: string[],
+): ParsedAuthCommand {
+  const sub = (rest[0] ?? '').toLowerCase()
+  if (sub === 'cancel') {
+    return { kind: 'provider-cancel', provider }
+  }
+  if (sub !== 'add') {
+    const usage =
+      provider === 'google'
+        ? 'Usage: /auth google add <email> [--replace] [--write]'
+        : 'Usage: /auth microsoft add <email> [--replace] [--org-mode]'
+    return {
+      kind: 'help',
+      reason: `Unknown \`${provider}\` subcommand: \`${codeSpanSafe(sub || '(none)')}\`. ${usage}`,
+    }
+  }
+  // Split positional email from `--flag` tokens.
+  const args = rest.slice(1)
+  const flags = new Set(args.filter((a) => a.startsWith('--')).map((a) => a.toLowerCase()))
+  const positional = args.filter((a) => !a.startsWith('--'))
+  const email = positional[0]
+  if (!email) {
+    const usage =
+      provider === 'google'
+        ? 'Usage: /auth google add <email> [--replace] [--write]'
+        : 'Usage: /auth microsoft add <email> [--replace] [--org-mode]'
+    return { kind: 'help', reason: usage }
+  }
+  const emailErr = validateAuthAddLabel(email)
+  if (emailErr) return { kind: 'help', reason: emailErr }
+  // Reject unknown flags so a typo (`--replaced`) isn't silently dropped.
+  const allowed = provider === 'google'
+    ? new Set(['--replace', '--write'])
+    : new Set(['--replace', '--org-mode'])
+  for (const f of flags) {
+    if (!allowed.has(f)) {
+      return {
+        kind: 'help',
+        reason: `Unknown flag \`${codeSpanSafe(f)}\` for \`/auth ${provider} add\`.`,
+      }
+    }
+  }
+  return {
+    kind: 'provider-add',
+    provider,
+    email,
+    replace: flags.has('--replace'),
+    write: provider === 'google' && flags.has('--write'),
+    orgMode: provider === 'microsoft' && flags.has('--org-mode'),
   }
 }
 
@@ -359,8 +436,10 @@ export async function handleAuthCommand(
         `  \`/auth list\` — alias of \`/auth show\`\n` +
         `  \`/auth use <label>\` — admin: swap the fleet to <label>\n` +
         `  \`/auth rotate\` — admin: cycle to next non-exhausted fallback\n` +
-        `  \`/auth add <label>\` — admin: OAuth-add a new account from chat\n` +
-        `  \`/auth cancel\` — abort an \`/auth add\` in progress\n` +
+        `  \`/auth add <label>\` — admin: OAuth-add a new Anthropic account from chat\n` +
+        `  \`/auth google add <email>\` — admin: Telegram-native Google account add/re-auth\n` +
+        `  \`/auth microsoft add <email>\` — admin: Telegram-native Microsoft account add/re-auth\n` +
+        `  \`/auth cancel\` — abort an \`/auth add\` or provider add in progress\n` +
         `  \`/auth rm <label>\` — admin: remove an account (two-step confirm)\n` +
         `  \`/auth refresh [<label>]\` — admin: force a refresh tick\n` +
         `  \`/auth agent override <agent> <label|clear>\` — admin: per-agent account override\n` +
@@ -468,6 +547,17 @@ export async function handleAuthCommand(
     return {
       text:
         `**/auth ${parsed.kind} not routed.** Internal error — gateway should dispatch this verb directly. Report this.`,
+      html: true,
+    }
+  }
+
+  // `/auth google|microsoft add|cancel` are likewise gateway-routed (they
+  // drive the loopback-relay child-process lifecycle — see
+  // auth-loopback-relay.ts). Defensive: never reach here in production.
+  if (parsed.kind === 'provider-add' || parsed.kind === 'provider-cancel') {
+    return {
+      text:
+        `**/auth ${parsed.provider} not routed.** Internal error — gateway should dispatch this verb directly. Report this.`,
       html: true,
     }
   }
