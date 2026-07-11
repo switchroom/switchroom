@@ -189,6 +189,7 @@ import {
   isPhotoDimensionRejectError,
   isFloodWaitActiveError,
 } from '../retry-api-call.js'
+import { createSendGate, sendGateEnabledFromEnv } from '../send-gate.js'
 import { classifyPhotoFile, rerouteResultSuffix } from '../photo-precheck.js'
 import { installTgPostLogger, withTgPostTags } from '../shared/bot-runtime.js'
 import {
@@ -5331,7 +5332,7 @@ const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
 // Declared ABOVE the typing indicator because the typing sends now route
 // through the same policy (#3084) — see nonEssentialApiCall below.
 const FLOOD_STATE_PATH = floodStatePath(STATE_DIR)
-const robustApiCall = createRetryApiCall({
+const rawRobustApiCall = createRetryApiCall({
   log: (line) => process.stderr.write(line),
   onFloodWait: makeFloodWaitRecorder(FLOOD_STATE_PATH),
   // #3094: while a LONG per-bot ban is open, don't issue the call at all.
@@ -5341,6 +5342,20 @@ const robustApiCall = createRetryApiCall({
   // fires thousands of requests into the open window and extends the ban.
   floodWaitRemainingMs: makeFloodWaitProbe(FLOOD_STATE_PATH),
 })
+
+// #3084 PR 1/3 — deterministic outbound send gate (token buckets + per-message
+// edit floor + no-op-edit skip). Wrapped HERE at the robustApiCall layer so
+// every Bot API call routed through the standard retry policy also transits
+// one scheduler (no call site can bypass it). Feature-flagged, default OFF:
+// when SWITCHROOM_TELEGRAM_SEND_GATE !== '1' the gate is a pure passthrough
+// and the retry policy behaves exactly as before. Composes with #3094's
+// pre-call flood gate and #3097's non-essential drop policy — those decide
+// whether a call happens at all; this paces the calls that do.
+const sendGate = createSendGate({ enabled: sendGateEnabledFromEnv() })
+const robustApiCall = <T>(
+  fn: () => Promise<T>,
+  opts?: Parameters<typeof rawRobustApiCall<T>>[1],
+): Promise<T> => sendGate.gate(() => rawRobustApiCall(fn, opts), opts)
 
 // Fire-and-forget wrapper for outbound surfaces that previously had
 // `.catch(() => {})` directly on `bot.api.*` calls. Resolves to undefined
