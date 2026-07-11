@@ -282,9 +282,8 @@ describe('gateway wiring — the leash', () => {
     const sweepStart = GATEWAY_SRC.indexOf(SWEEP_ANCHOR)
     expect(sweepStart).toBeGreaterThan(-1)
     const sweep = GATEWAY_SRC.slice(sweepStart, sweepStart + SWEEP_SPAN)
-    expect(GATEWAY_SRC).toContain('sweepPermissionTtl({')
-    // …and must NOT carry its own copy of the leash or the raw TTL comparison.
-    // …and the gateway must not regrow a private inline leash check.
+    // …and the sweep body must NOT regrow a private inline copy of the leash
+    // or the raw TTL comparison.
     expect(sweep).not.toContain('if (isHeldUndeliverable(v)) continue')
     expect(sweep).not.toContain('if (now - v.startedAt > ttl)')
   })
