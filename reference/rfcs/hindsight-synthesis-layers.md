@@ -56,7 +56,7 @@ it argues for using capability we already pay for, within the lines.
 | 4. Chat-legible memory (sparse) | **SHIPPED** (#2858) | 📌 remembered / ✂️ forgot from deterministic tool-observation; the 🧠 consolidation-webhook side (#2872) is present in code but **dormant** — the pinned image emits no `consolidation.completed` webhook and it is OFF by default |
 | 5. Curated mental models per specialist | **SHIPPED first slice** (#2874/#2875/#2883) | declarative `memory.mental_models[]` + agent-proposes→operator-confirms `mental_model_propose` card + default-on `mental-model-curator` skill; autonomous creation still explicitly out |
 | 6a. Gate recall on trivial turns | **SHIPPED** | `recallSkipTrivial=true` + `_is_trivial_stateless()` guard |
-| 6b. Right-size retain cadence | **SHIPPED** (#2830/#2831) | chunked windowed retain at `retainEveryNTurns=1` — vendor `retain.py` patched (`select_retain_window()`) to decouple window-slicing from the `>1` throttle; savings not yet measured (#2847) |
+| 6b. Right-size retain cadence | **SHIPPED** (#2830/#2831), cadence now **3/1** (#2950) | chunked windowed retain — vendor `retain.py` patched (`select_retain_window()`) to decouple window-slicing from the `>1` throttle so it works at any `retainEveryNTurns >= 1`; live default is now `retainEveryNTurns=3`, `retainOverlapTurns=1` (#2950). Per-fire consolidation input measured **flat** at ~0.6–8k tok vs full-session's linear growth to ~141k tok — **21–38× per-fire, ≈25× cumulative** reduction on real transcripts (#2847); metered LiteLLM spend still pending (#2847) |
 
 ## Evidence (original snapshot 2026-06-18, with 2026-07-05 corrections)
 
@@ -408,9 +408,13 @@ invariant.
   stateless class.
 
 - **6b — Right-size retain cadence. — SHIPPED (#2830/#2831); rolled
-  fleet-wide in v0.17.5.** `retainEveryNTurns=1` (scaffold override; vendor
-  default is 10) means every turn triggers background consolidation (sonnet).
-  Under the previous `full-session` retain mode this was confirmed live as the
+  fleet-wide in v0.17.5; cadence made operator-configurable at default
+  `3/1` in #2950.** `retainEveryNTurns` (scaffold override; vendor default is
+  10) is now **3** with `retainOverlapTurns=1` on the live fleet — every 3rd
+  turn triggers background consolidation. (It shipped in #2830 at `1`; #2950
+  moved the default to `3/1`. Older text in this RFC citing `retainEveryNTurns=1`
+  predates #2950.) Under the previous `full-session` retain mode this was
+  confirmed live as the
   single largest *invisible* subscription draw (on the order of ~1M
   consolidation tokens/day/agent, ~100% of an agent's LLM spend) and the
   engine room of tension (1). The original RFC noted you could not simply
@@ -435,11 +439,17 @@ invariant.
      pins it, with a vendor unittest at
      `vendor/hindsight-memory/scripts/tests/test_retain_window.py`.
   3. **The short-session restart guarantee is preserved.** The
-     `jtbd-memory-survives-restart-dm` UAT breaks if short-session (≤2-turn)
-     retain stops firing — which is why scaffold keeps `retainEveryNTurns=1`.
-     Windowing does not weaken this: the chunked window always extends to the
-     end of the transcript, so the firing turn is always inside the window,
-     and every turn fires at n=1. A pre-merge adversarial review caught the
+     `jtbd-memory-survives-restart-dm` UAT breaks if short-session retain
+     stops firing. Windowing does not weaken this: the chunked window always
+     extends to the end of the transcript, so the just-completed turn (whose
+     Stop hook is firing) is always inside the window. At the current `3/1`
+     cadence, retain fires every 3rd turn (not every turn — the RFC's earlier
+     "every turn fires at n=1" wording predates #2950); the window
+     `max(retain_every_n, 1) + overlap = 4` human turns still always contains
+     the firing turn. This invariant was verified deterministically in #2847
+     by replaying the production `select_retain_window()` over every N=3 fire
+     of two real long transcripts: **54/54 fires included the just-completed
+     human turn — 0 misses.** A pre-merge adversarial review caught the
      one way this could have silently lost memory — the window must count
      **human turns only** (tool_result messages are not turns; counting them
      could push the human's fact outside the window). `select_retain_window()`
@@ -447,8 +457,17 @@ invariant.
      retain still exists as the belt-and-suspenders flush.
   Net: 6b was the biggest token lever and it has shipped — a decoupling vendor
   patch plus the chunked scaffold override, with the short-session restart
-  guarantee kept intact. The realized savings are **not yet measured**; that
-  verification is tracked in #2847.
+  guarantee kept intact. **Realized savings (measured in #2847, deterministic
+  replay of the production window selector on real transcripts):** per-fire
+  consolidation input is **flat** at ~0.6–8k tok regardless of session length,
+  vs full-session's linear growth to ~141k tok/fire on a 116-turn session —
+  **21–38× per-fire, and 25× cumulative** (3.23M → 129k tok over that session's
+  38 fires). Metered LiteLLM spend is not yet cleanly attributable (LiteLLM
+  metering and 6b both landed 2026-07-05 so there is no pre-6b baseline, and
+  consolidation re-homed from Claude sonnet onto `gpt-oss-20b` ~2026-07-08),
+  but consolidation traffic is tag-isolable (`request_tags` includes
+  `service:hindsight` + the `claude-cli` agent-SDK UA) so a settled metered
+  figure is a 24–48h accumulation away; tracked in #2847.
 
 ## Speed & token budget
 
@@ -463,18 +482,22 @@ Two latency/token surfaces matter, and they pull in opposite directions:
   added here is felt directly, but it spends *no* model tokens. Phase 6a now
   removes this cost entirely on trivial turns. (`low` is operator-raisable to
   `mid` ~5s, which adds an LLM rerank pass; switchroom does not.)
-- **Background (invisible).** Every retain triggers consolidation (sonnet, on
-  the subscription) the operator never sees; `retainEveryNTurns=1` makes that
-  per-turn. This was the largest *uncounted* subscription draw — under
-  `full-session` retain it was essentially **100% of an agent's model spend**
-  (order ~1M consolidation tokens/day/agent), and the engine room of invariant
-  tension (1). **Phase 6b (#2830, live in v0.17.5) addresses it in code:**
-  chunked windowed retain re-consolidates only the recent window per fire
-  instead of the whole growing transcript, so per-fire consolidation input
-  should be roughly flat over session length rather than growing linearly. The
-  realized savings are **not yet measured** — that verification (per-agent
-  consolidation spend via LiteLLM, flat-per-fire evidence) is tracked in
-  #2847, and this section will carry the numbers once available.
+- **Background (invisible).** Every retain triggers consolidation on the
+  subscription the operator never sees; `retainEveryNTurns=3` (post-#2950; was
+  `1`) makes that every 3rd turn. This was the largest *uncounted* subscription
+  draw — under `full-session` retain it was essentially **100% of an agent's
+  model spend** (order ~1M consolidation tokens/day/agent), and the engine room
+  of invariant tension (1). **Phase 6b (#2830, live in v0.17.5) addresses it in
+  code:** chunked windowed retain re-consolidates only the recent window per
+  fire instead of the whole growing transcript. **Measured in #2847** (production
+  window selector replayed on real transcripts): per-fire consolidation input is
+  **flat** (~0.6–8k tok) instead of growing linearly (to ~141k tok/fire on a
+  116-turn session) — **21–38× per-fire, ≈25× cumulative** reduction; the N=3
+  cadence cuts the number of fires a further 3× vs the original N=1. A metered
+  per-agent tokens/day figure via LiteLLM is still pending (no pre-6b baseline —
+  metering + 6b co-landed 2026-07-05 — and consolidation re-homed to `gpt-oss-20b`
+  ~2026-07-08; the `service:hindsight` request-tag is the clean-attribution
+  handle, ~24–48h of accumulation away). Tracked in #2847.
   Mental-model refreshes (when refresh-enabled) would add to it, but
   auto-seeding was retired so none are wired today.
 
@@ -488,7 +511,7 @@ Per-phase scorecard against the three axes (status-annotated):
 | 4. Chat-legible (sparse) | SHIPPED store/correct (#2858); update side dormant (#2872) | legible **and** sparse (material-only classifier) | negligible | minor output tokens on genuine store/correct |
 | 5. Curated mental models | SHIPPED first slice (#2874/#2875/#2883) | + faster *reflect*; operator-curated / proposed | neutral on hot path | background refresh spend only if refresh-enabled (off by default) |
 | 6a. Gate recall on trivial turns | SHIPPED | trivial turns feel instant | **win** — skips ~1–2s arm | **win** — drops ~1024 tok on trivial turns |
-| 6b. Right-size retain cadence | SHIPPED (#2830) | unchanged | unchanged | **win — shipped**; chunked window, flat-per-fire; savings unmeasured (#2847) |
+| 6b. Right-size retain cadence | SHIPPED (#2830); cadence 3/1 (#2950) | unchanged | unchanged | **win — measured** (#2847): flat per-fire (~0.6–8k tok) vs linear (→~141k); **21–38× per-fire, ≈25× cumulative**; metered spend pending |
 
 Net read: **Phases 1, 2, 4, 6a, and 6b have shipped, and 3 + 5 shipped their
 first substantive slices.** 1 and 6a moved recall from the job's *bad* column
