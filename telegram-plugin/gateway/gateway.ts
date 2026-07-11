@@ -503,6 +503,12 @@ import {
   type ActivityCardStoreFsSeam,
 } from './activity-card-store.js'
 import {
+  writeQueuedCardRecord,
+  clearQueuedCardRecord,
+  runQueuedCardBootReaper,
+  type QueuedCardStoreFsSeam,
+} from './queued-card-store.js'
+import {
   decideWorkerPinReaps,
   WORKER_PIN_TTL_MS_DEFAULT,
 } from './worker-pin-reaper.js'
@@ -3659,6 +3665,9 @@ function postQueuedStatus(chatId: string, bufferedThread: number, inFlightThread
       return
     }
     queuedStatusMsgIds.set(key, { chatId, threadId: bufferedThread, messageId })
+    // #3002: write through to the durable store so a gateway restart before the
+    // in-process reap can still delete this orphaned card on boot.
+    persistQueuedCard(key, chatId, bufferedThread, messageId)
   })()
 }
 
@@ -3695,6 +3704,9 @@ function reapQueuedStatus(chatId: string, thread: number | undefined): void {
   const entry = queuedStatusMsgIds.get(key)
   if (entry == null) return
   queuedStatusMsgIds.delete(key)
+  // #3002: drop the durable row too, scoped to this exact message id (reap-race
+  // guard) so a fresh live card under the same key keeps its own protection.
+  clearQueuedCard(key, entry.messageId)
   void swallowingApiCall(
     () => bot.api.deleteMessage(chatId, entry.messageId),
     { chat_id: chatId, verb: 'queued-status.reap', ...(entry.threadId != null ? { threadId: entry.threadId } : {}) },
@@ -3807,6 +3819,8 @@ function postBusyAck(chatId: string, threadId: number | undefined, text: string)
       return
     }
     queuedStatusMsgIds.set(key, { chatId, threadId: threadId ?? null, messageId })
+    // #3002: write through to the durable store (see postQueuedStatus).
+    persistQueuedCard(key, chatId, threadId ?? null, messageId)
   })()
 }
 
@@ -7228,6 +7242,48 @@ const activityCardStoreFs: ActivityCardStoreFsSeam = {
 }
 const activityCardPersistEnabled = !STATIC
 
+// Durable handle for the component-5 queued-status placeholder + #2995 busy-ack
+// card (#3002). Both track their sent message id only in the in-memory
+// `queuedStatusMsgIds` Map, so a restart between posting a card and its
+// promote/reap strands a permanent stale "⏳ Queued…" line. Persisted on POST,
+// cleared on in-process reap; a boot-time reaper (wired alongside
+// `activityCardBootReaper`, same startup-mutex ordering constraint) DELETES any
+// leftover card and clears the store — a "Queued" claim is always wrong after a
+// restart, so deletion is the honest terminal (reap-on-boot only, no
+// promote-across-restart). STATIC mode skips disk — same gate as the sibling
+// stores.
+const QUEUED_CARD_STORE_PATH = join(STATE_DIR, 'queued-cards-pending.json')
+const queuedCardStoreFs: QueuedCardStoreFsSeam = {
+  readFileSync: (p: string) => readFileSync(p, 'utf8'),
+  writeFileSync: (p: string, d: string) => writeFileSync(p, d),
+  renameSync: (a: string, b: string) => renameSync(a, b),
+  existsSync: (p: string) => existsSync(p),
+}
+const queuedCardPersistEnabled = !STATIC
+
+// Write-through helpers (#3002) — mirror the in-memory `queuedStatusMsgIds`
+// set/delete onto the durable store. Best-effort + gated: no-op when the store
+// isn't usable (STATIC = no durable volume). Called from postQueuedStatus /
+// postBusyAck (post) and reapQueuedStatus (delete).
+function persistQueuedCard(
+  key: string,
+  chatId: string,
+  threadId: number | null,
+  messageId: number,
+): void {
+  if (!queuedCardPersistEnabled) return
+  writeQueuedCardRecord(QUEUED_CARD_STORE_PATH, queuedCardStoreFs, {
+    key,
+    chatId,
+    threadId,
+    messageId,
+  })
+}
+function clearQueuedCard(key: string, messageId?: number): void {
+  if (!queuedCardPersistEnabled) return
+  clearQueuedCardRecord(QUEUED_CARD_STORE_PATH, queuedCardStoreFs, key, messageId)
+}
+
 // Slot-banner pin persistence (#421 crash-recovery). The slot banner is pinned
 // in the owner chat when the agent is on a non-default OAuth slot. Rather than a
 // parallel store + second boot hook, its pin is persisted in the SAME
@@ -7392,6 +7448,40 @@ async function activityCardBootReaper(): Promise<void> {
       `telegram gateway: activity-card: finalized ${finalized}/${total} ` +
         `(vanished ${vanished}/${total}), unpinned ${unpinned}/${total} ` +
         `orphaned card(s) from a prior session (at-most-once)\n`,
+    )
+  }
+}
+
+/**
+ * Boot-time reaper for orphaned queued-status / busy-ack cards (#3002). Thin
+ * gateway wrapper over the pure `runQueuedCardBootReaper` — binds the live fs
+ * seam, a robust Telegram delete, and the logger. Deletes any card persisted by
+ * a prior (crashed/restarted) session and clears the store: a "⏳ Queued…" /
+ * "On it" claim is always wrong after a restart, so deletion is the honest
+ * terminal (reap-on-boot only, no promote-across-restart).
+ *
+ * MUST run ONLY after this gateway wins the startup mutex — same shared-file
+ * ordering constraint as `activityCardBootReaper` / `statusPinBootCleanup`.
+ */
+async function queuedCardBootReaper(): Promise<void> {
+  if (!queuedCardPersistEnabled) return
+  const { deleted, total } = await runQueuedCardBootReaper({
+    path: QUEUED_CARD_STORE_PATH,
+    fs: queuedCardStoreFs,
+    deleteCard: (record) =>
+      robustApiCall(
+        () => lockedBot.api.deleteMessage(record.chatId, record.messageId),
+        {
+          chat_id: record.chatId,
+          ...(record.threadId != null ? { threadId: record.threadId } : {}),
+          verb: 'queued-card.boot-reap-delete',
+        },
+      ),
+  })
+  if (total > 0) {
+    process.stderr.write(
+      `telegram gateway: queued-card: deleted ${deleted}/${total} ` +
+        `orphaned queued/busy-ack card(s) from a prior session\n`,
     )
   }
 }
@@ -7906,6 +7996,7 @@ function ensureIssuesCard(chatId: string, threadId: number | undefined): void {
     // Fire-and-forget: cleanup is best-effort and must not block boot.
     void statusPinBootCleanup()
     void activityCardBootReaper()
+    void queuedCardBootReaper()
   } catch (err) {
     process.stderr.write(
       `telegram gateway: boot.lock_acquire_failed err=${(err as Error).message} agent=${SWITCHROOM_AGENT_NAME}\n`,
@@ -7923,6 +8014,7 @@ function ensureIssuesCard(chatId: string, threadId: number | undefined): void {
       // running orphan cleanup is consistent with the pre-mutex behaviour.
       void statusPinBootCleanup()
       void activityCardBootReaper()
+      void queuedCardBootReaper()
     } catch (writeErr) {
       process.stderr.write(`telegram gateway: writePidFile failed: ${writeErr}\n`)
     }
