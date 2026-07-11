@@ -541,7 +541,7 @@ export async function dispatchTool(
   // other verb — that path returns the rich per-request status
   // (rollout phase / n / m / rolled[] etc., #2560) which the audit-log
   // shortcut cannot see.
-  if (name === "get_status" && !args.request_id) {
+  if (name === "get_status" && args.request_id === undefined) {
     return getLastUpdateApplyStatus();
   }
 
