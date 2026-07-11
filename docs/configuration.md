@@ -29,7 +29,7 @@ Each field type has specific merge behavior when values exist at multiple layers
 | `permission_mode` | override | Permission mode for the agent's Claude session. Drives the `--permission-mode` CLI flag AND the `.claude/settings.json` `permissions.defaultMode`. **The switchroom built-in default is `acceptEdits`** — every agent auto-accepts edits with no yaml needed. Override per-agent here or fleet-wide via `defaults.permission_mode`; per-agent wins. Valid values: `acceptEdits`, `default`, `plan`, `bypassPermissions` (settings.json `defaultMode`), plus `auto`/`dontAsk` (CLI-flag only — these fall back to `acceptEdits` for `defaultMode`). See [Permission mode & auto-accept](#permission-mode--auto-accept). |
 | `extends` | — | Named profile to inherit from |
 | `tools.allow` / `tools.deny` | union | Tool permissions |
-| `soul` | per-field (**seed-time only**) | Agent persona (name, style, boundaries). Cascades per-field, but **only at first scaffold** — it seeds `workspace/SOUL.md`, which is then user-owned (see [Persona & SOUL.md ownership](#persona--soulmd-ownership)). Editing `soul:` later does **not** change an agent whose SOUL.md already exists. |
+| `soul` | per-field (**seed-time only**) | Agent persona (`name`, `style`, `creature`, `vibe`, `expertise`, `emoji`, `boundaries`, `shape`). Cascades per-field, but **only at first scaffold** — it seeds `workspace/SOUL.md`, which is then user-owned (see [Persona & SOUL.md ownership](#persona--soulmd-ownership)). Editing `soul:` later does **not** change an agent whose SOUL.md already exists. |
 | `memory` | per-field | Hindsight collection and recall settings |
 | `hooks` | per-event concat | Claude Code lifecycle hooks (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop, SessionEnd) |
 | `env` | per-key | Environment variables for start.sh |
@@ -585,6 +585,19 @@ Switchroom splits agent customization into two files with **opposite ownership**
 | `workspace/SOUL.md` (persona) | **You** | Seeded **once** — from the setup wizard's persona prompts, or the profile's `SOUL.md.hbs` + `soul:` config when skipped. After that it is a plain user file: `update`/`reconcile` **never** overwrite it. |
 
 This is deliberate. The managed (above-marker) part of `CLAUDE.md` is the operating manual — you want switchroom's updates to reach it — while the below-marker section is your own per-agent rules that survive every apply. `SOUL.md` is who the agent *is* — you want your words to stick, the way they do in OpenClaw/Hermes. The `soul:` config and profile `SOUL.md.hbs` are therefore **seed-time inputs only**; changing them later does not touch an agent whose `SOUL.md` already exists.
+
+**`soul:` fields.** All fields except `name` and `style` are optional:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `name` | string (required) | Persona name (e.g., `Coach`, `Sage`). |
+| `style` | string (required) | Communication style description. |
+| `creature` | string | Persona creature/form (e.g., `owl`, `octopus`). |
+| `vibe` | string | One-line personality vibe (e.g., `calm, precise`). |
+| `expertise` | string | Domain expertise summary rendered into the persona. |
+| `emoji` | string | Signature emoji for the persona. |
+| `boundaries` | string | Behavioral boundaries and disclaimers. |
+| `shape` | `executive-assistant` \| `developer` \| `coach` \| `generalist` | Persona-shape discriminator the per-agent `CLAUDE.md` template can branch on. Defaults to `generalist`. Cascade note: `generalist` is treated as the **neutral/unset** shape, so a per-agent soul that omits `shape` (and thus defaults to `generalist`) does **not** override an explicit profile-level `shape` — only a per-agent *non-generalist* shape overrides the profile. |
 
 **Editing the persona.** Just edit `workspace/SOUL.md` directly (it's tracked in the workspace git repo, so your edits are versioned and recoverable). `switchroom soul path <agent>` prints the path; `switchroom soul show <agent>` prints the current content.
 

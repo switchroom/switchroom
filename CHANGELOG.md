@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### First-class `soul:` persona fields + `shape` discriminator (#1856)
+
+`AgentSoulSchema` now types `creature`, `vibe`, `expertise`, and `emoji`
+as first-class optional string fields alongside `name`/`style`/`boundaries`.
+Previously these were referenced by the `SOUL.md` / `IDENTITY.md` templates
+(`{{soul.creature}}` etc.) but the schema — a plain `z.object` that strips
+unknown keys — silently dropped them at config-load time, so they never
+reached the templates. **This is therefore a bug fix as well as a typing
+change:** operator `soul:` blocks that set those fields now actually render.
+
+A new `shape` discriminator (`executive-assistant` | `developer` | `coach`
+| `generalist`, default `generalist`) lets one per-agent `CLAUDE.md`
+template branch on persona shape without forking a profile. No runtime
+behavior uses `shape` yet — the template work lands in a later issue.
+
+Cascade: `generalist` is treated as the neutral/unset shape. A per-agent
+soul that omits `shape` (defaulting to `generalist`) does not stomp an
+explicit profile/defaults-level `shape`; only a per-agent *non-generalist*
+shape overrides the profile. Unknown `shape` values fail config load loudly
+with a message naming `shape` and listing the allowed values.
+
 ### Per-agent CLAUDE.md is now a two-section file with a preserved operator area (#1857)
 
 `<agentDir>/CLAUDE.md` is split by a visible marker line:
