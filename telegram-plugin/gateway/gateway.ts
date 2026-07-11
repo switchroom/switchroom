@@ -194,8 +194,11 @@ import { classifyPhotoFile, rerouteResultSuffix } from '../photo-precheck.js'
 import { installTgPostLogger, withTgPostTags } from '../shared/bot-runtime.js'
 import {
   floodStatePath,
+  floodWindowsPath,
   makeFloodWaitRecorder,
   makeFloodWaitProbe,
+  makeFloodWindowRecorder,
+  loadInitialFloodWindows,
   suppressNonEssentialSendMs,
 } from '../flood-circuit-breaker.js'
 import { buildAttachmentPath, assertInsideInbox } from '../attachment-path.js'
@@ -5332,9 +5335,49 @@ const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
 // Declared ABOVE the typing indicator because the typing sends now route
 // through the same policy (#3084) — see nonEssentialApiCall below.
 const FLOOD_STATE_PATH = floodStatePath(STATE_DIR)
+// #3084 PR 2/3 — sibling file for SCOPED flood windows (global / chat / group /
+// msg-edit). Kept separate from the single-object flood-wait.json so #3094's
+// makeFloodWaitProbe schema is untouched (part3-design §7).
+const FLOOD_WINDOWS_PATH = floodWindowsPath(STATE_DIR)
+const recordFloodWindow = makeFloodWindowRecorder(FLOOD_WINDOWS_PATH)
+
+// #3084 PR 2/3 — deterministic outbound send gate (token buckets + per-message
+// edit floor + no-op-edit skip + PRIORITY SHEDDING + DEGRADED MODE). Wrapped
+// HERE at the robustApiCall layer so every Bot API call routed through the
+// standard retry policy also transits one scheduler (no call site can bypass
+// it). Feature-flagged, default OFF: when SWITCHROOM_TELEGRAM_SEND_GATE !== '1'
+// the gate is a pure passthrough and the retry policy behaves exactly as
+// before. Composes with #3094's pre-call flood gate and #3097's non-essential
+// drop policy — those decide whether a call happens at all; this paces the
+// calls that do.
+//
+// §7 restart-proof flood state: initialWindows are loaded from disk BEFORE the
+// gate (and thus before ANY outbound call, boot cards included), so a boot mid-
+// ban never resends into an open window. onWindowOpen write-throughs every
+// runtime-opened window to FLOOD_WINDOWS_PATH; bootRamp starts the global
+// bucket at half capacity for 10s to absorb the boot-card burst.
+const sendGate = createSendGate({
+  enabled: sendGateEnabledFromEnv(),
+  initialWindows: loadInitialFloodWindows(FLOOD_STATE_PATH, FLOOD_WINDOWS_PATH, Date.now()),
+  bootRamp: {},
+  onWindowOpen: (scopeKey, untilTs) => recordFloodWindow(scopeKey, untilTs),
+})
+
 const rawRobustApiCall = createRetryApiCall({
   log: (line) => process.stderr.write(line),
-  onFloodWait: makeFloodWaitRecorder(FLOOD_STATE_PATH),
+  onFloodWait: (retryAfterSec) => {
+    // #2923/#3094 — persist the single-object global window (probe reads this).
+    makeFloodWaitRecorder(FLOOD_STATE_PATH)(retryAfterSec)
+    // #3084 PR 2 — also open a GLOBAL send-gate window so cosmetic traffic sheds
+    // for the ban's duration even on a SHORT (slept-and-retried) 429 that never
+    // throws FLOOD_WAIT_ACTIVE. Scope-precise windows are opened by the gate's
+    // own FLOOD_WAIT_ACTIVE catch (which has the call's opts).
+    try {
+      sendGate.openFloodWindow('global', Date.now() + Math.max(0, retryAfterSec) * 1000)
+    } catch {
+      /* best-effort — never let the window hook break the retry path */
+    }
+  },
   // #3094: while a LONG per-bot ban is open, don't issue the call at all.
   // retryApiCall no longer sleeps a multi-hour retry_after (it throws
   // FLOOD_WAIT_ACTIVE instead), and the card surfaces re-drive on a 5-6s
@@ -5343,15 +5386,6 @@ const rawRobustApiCall = createRetryApiCall({
   floodWaitRemainingMs: makeFloodWaitProbe(FLOOD_STATE_PATH),
 })
 
-// #3084 PR 1/3 — deterministic outbound send gate (token buckets + per-message
-// edit floor + no-op-edit skip). Wrapped HERE at the robustApiCall layer so
-// every Bot API call routed through the standard retry policy also transits
-// one scheduler (no call site can bypass it). Feature-flagged, default OFF:
-// when SWITCHROOM_TELEGRAM_SEND_GATE !== '1' the gate is a pure passthrough
-// and the retry policy behaves exactly as before. Composes with #3094's
-// pre-call flood gate and #3097's non-essential drop policy — those decide
-// whether a call happens at all; this paces the calls that do.
-const sendGate = createSendGate({ enabled: sendGateEnabledFromEnv() })
 const robustApiCall = <T>(
   fn: () => Promise<T>,
   opts?: Parameters<typeof rawRobustApiCall<T>>[1],
@@ -5621,7 +5655,8 @@ function wrapBootCardApi(
             richMessage(text),
             sendOpts as Parameters<typeof lockedBot.api.sendRichMessage>[2],
           ),
-        opts(cid),
+        // #3084 PR 2: boot/config card CREATION is USEFUL (queue with TTL).
+        { ...opts(cid), priorityClass: 'useful' },
       )
       return sent as { message_id: number }
     },
@@ -5634,7 +5669,9 @@ function wrapBootCardApi(
             richMessage(text),
             editOpts as Parameters<typeof lockedBot.api.editMessageText>[3],
           ),
-        opts(cid),
+        // A boot-card EDIT is COSMETIC — shed under pressure; pass
+        // messageId/editPayload so the per-message floor + no-op skip engage.
+        { ...opts(cid), priorityClass: 'cosmetic', messageId: mid, editPayload: text },
       ) as Promise<unknown>,
     // Strict edit for the boot-card edit-in-place probe: distinguishes
     // "message gone" (→ 'gone', caller sends fresh) from a landed/identical
@@ -5686,7 +5723,8 @@ function wrapIssuesCardApi(
             richMessage(text),
             sendOpts as Parameters<typeof lockedBot.api.sendRichMessage>[2],
           ),
-        opts(cid),
+        // #3084 PR 2: issues-card creation is USEFUL.
+        { ...opts(cid), priorityClass: 'useful' },
       )
       return sent as { message_id: number }
     },
@@ -5699,7 +5737,8 @@ function wrapIssuesCardApi(
             richMessage(text),
             editOpts as Parameters<typeof lockedBot.api.editMessageText>[3],
           ),
-        opts(cid),
+        // An issues-card EDIT is COSMETIC.
+        { ...opts(cid), priorityClass: 'cosmetic', messageId: mid, editPayload: text },
       ) as Promise<unknown>,
     deleteMessage: (cid, mid) =>
       robustApiCall(() => lockedBot.api.deleteMessage(cid, mid), opts(cid)) as Promise<unknown>,
@@ -9049,6 +9088,13 @@ pendingProgress.startTimer({
         chat_id: ctx.chatId,
         verb: 'pending-progress-edit',
         ...(ctx.threadId != null ? { threadId: ctx.threadId } : {}),
+        // #3084 PR 2 / L1: the progress-card edit is the #1 documented ban
+        // trigger (repeated editMessageText on one message). Tag COSMETIC and
+        // pass messageId/editPayload so the gate's per-message floor + no-op
+        // skip + coalescing engage, and the edit sheds while a window is open.
+        priorityClass: 'cosmetic',
+        messageId: ctx.messageId,
+        editPayload: ctx.literalText ? ctx.newText : richMessage(ctx.newText),
       },
     )
   },
@@ -12418,13 +12464,15 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
       robustApiCall(
         // allow-raw-bot-api: injected chunk-loop adapter — sendRichMessage routed through robustApiCall; THREAD_NOT_FOUND handled by sendReplyChunks' fallback ladder
         () => lockedBot.api.sendRichMessage(chat_id, body as never, opts as never),
-        { threadId: tid, chat_id },
+        // #3084 PR 2: the final reply is CRITICAL — never shed; degraded mode
+        // fails fast (structured flood_wait) instead of blocking the MCP reply.
+        { threadId: tid, chat_id, priorityClass: 'critical' },
       ),
     sendLiteral: (opts, txt, tid) =>
       robustApiCall(
         // allow-raw-bot-api: injected chunk-loop adapter — literal format:'text' send routed through robustApiCall; THREAD_NOT_FOUND handled by sendReplyChunks
         () => lockedBot.api.sendMessage(chat_id, txt, opts as never),
-        { threadId: tid, chat_id },
+        { threadId: tid, chat_id, priorityClass: 'critical' },
       ),
     sendLiteralRaw: (opts, txt) =>
       // allow-raw-bot-api: literal last-resort fallback (plaintext parse-reject / length re-split); wrapping would re-enter the parse/length policy that just rejected the payload
@@ -12436,7 +12484,10 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
       robustApiCall(
         // allow-raw-bot-api: preview edit-in-place routed through robustApiCall; thread fallback handled by sendReplyChunks
         () => lockedBot.api.editMessageText(chat_id, mid, body as never, opts as never),
-        { threadId: tid, chat_id },
+        // Finalizing the reply into the preview message — still CRITICAL (this
+        // IS the answer). Pass messageId/editPayload so the gate's per-message
+        // floor + no-op skip engage on the edit (part3-design §4/§5, PR1 L1).
+        { threadId: tid, chat_id, priorityClass: 'critical', messageId: mid, editPayload: body },
       ),
     richMessage,
     logOutbound,
@@ -16045,6 +16096,14 @@ function handleSessionEvent(ev: SessionEvent): void {
                   chat_id: chatId,
                   verb: 'answer-stream.editMessageText',
                   ...(tid != null ? { threadId: tid } : {}),
+                  // #3084 PR 2 / L1: answer-stream edits are COSMETIC — a
+                  // dropped stream tick costs nothing (the next carries full
+                  // text). messageId/editPayload engage the per-message floor +
+                  // coalescing + no-op skip so rapid stream edits don't storm
+                  // the same message (the top ban trigger).
+                  priorityClass: 'cosmetic',
+                  messageId,
+                  editPayload: richMessage(text),
                 },
               )
             },
@@ -28072,7 +28131,8 @@ void (async () => {
                         richMessage(text),
                         sendOpts as Parameters<typeof lockedBot.api.sendRichMessage>[2],
                       ),
-                    { chat_id: cid, verb: 'worker-feed' },
+                    // #3084 PR 2: worker-feed card CREATION (handback) is USEFUL.
+                    { chat_id: cid, verb: 'worker-feed', priorityClass: 'useful' },
                   )
                   return sent as { message_id: number }
                 },
@@ -28085,7 +28145,15 @@ void (async () => {
                         richMessage(text),
                         editOpts as Parameters<typeof lockedBot.api.editMessageText>[3],
                       ),
-                    { chat_id: cid, verb: 'worker-feed' },
+                    // Worker-feed EDITs are COSMETIC — pass messageId/editPayload
+                    // so the per-message floor + coalescing + no-op skip engage.
+                    {
+                      chat_id: cid,
+                      verb: 'worker-feed',
+                      priorityClass: 'cosmetic',
+                      messageId: mid,
+                      editPayload: text,
+                    },
                   ),
               },
               log: (msg) => process.stderr.write(`telegram gateway: ${msg}\n`),
