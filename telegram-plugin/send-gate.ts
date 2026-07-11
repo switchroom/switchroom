@@ -50,11 +50,13 @@
  *
  * SAFETY / ROLLOUT
  * ----------------
- * Feature-flagged and default-OFF (`SWITCHROOM_TELEGRAM_SEND_GATE=1` to enable,
- * following the `SWITCHROOM_*=== '1'` gateway flag convention). When disabled,
- * `gate()` is a pure passthrough to the wrapped call — zero behaviour change.
- * This is PR 1 of 3; priority-class shedding + degraded mode (PR 2) and
- * observability + operator alert (PR 3) build on the counters exposed here.
+ * ON BY DEFAULT in every install — an escape hatch, not an opt-in feature.
+ * `SWITCHROOM_TELEGRAM_SEND_GATE=0` (or `false`/`off`/`no`) is the safety valve
+ * that disables it without a rebuild, following the repo's default-on kill-
+ * switch convention (`midTurnFloorEnabled`, `SWITCHROOM_RATE_LIMIT_OVERAGE=0`).
+ * When disabled, `gate()` is a pure passthrough to the wrapped call — zero
+ * behaviour change. Priority-class shedding + degraded mode and observability +
+ * operator alert build on the counters exposed here.
  *
  * DETERMINISM / TESTABILITY
  * -------------------------
@@ -1038,7 +1040,17 @@ export function createSendGate(config: SendGateConfig): SendGate {
   return { gate, openFloodWindow, stats }
 }
 
-/** Read the feature flag using the standard `SWITCHROOM_*=== '1'` convention. */
+/**
+ * The send gate is an ESCAPE HATCH, not an opt-in feature: it is ON BY DEFAULT
+ * in every install and can be disabled as a safety valve. Mirrors the repo's
+ * default-on kill-switch convention (`midTurnFloorEnabled`, `PIN_STATUS_WHILE_
+ * WORKING`, `SWITCHROOM_RATE_LIMIT_OVERAGE`): enabled unless
+ * `SWITCHROOM_TELEGRAM_SEND_GATE` is explicitly set to a falsey/off value
+ * (`0`/`false`/`off`/`no`, case-insensitive, trimmed). Unset → enabled.
+ */
 export function sendGateEnabledFromEnv(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env.SWITCHROOM_TELEGRAM_SEND_GATE === '1'
+  const v = env.SWITCHROOM_TELEGRAM_SEND_GATE
+  if (v == null) return true
+  const t = v.trim().toLowerCase()
+  return !(t === '0' || t === 'false' || t === 'off' || t === 'no')
 }
