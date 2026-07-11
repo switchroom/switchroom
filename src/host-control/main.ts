@@ -21,9 +21,15 @@
  */
 
 import { homedir } from "node:os";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { loadConfig } from "../config/loader.js";
+import { ConfigError, findConfigFile, loadConfig } from "../config/loader.js";
+import {
+  clearStaleDegradedMarker,
+  postOperatorNoticeViaGateways,
+  waitForConfigRecovery,
+  type GatewayCandidate,
+} from "./config-degraded.js";
 import { allocateAgentUid } from "../agents/compose.js";
 import { HostdServer } from "./server.js";
 import { SocketApprovalGateway } from "./approval-gateway.js";
@@ -38,8 +44,89 @@ import {
 } from "./release-watcher-shellouts.js";
 import { appendFile } from "node:fs/promises";
 
+/**
+ * Load switchroom.yaml, surviving a ConfigError (invalid YAML — e.g.
+ * duplicate keys — schema failure, unreadable file) by entering DEGRADED
+ * mode instead of the exit-1 → docker-restart crash-loop that previously
+ * stalled fleet rollouts silently. See `config-degraded.ts` for the
+ * mechanism (retry interval + file watch, prominent marker file,
+ * best-effort operator DM, pending self-bump marker preservation).
+ */
+async function loadConfigResilient(): Promise<
+  ReturnType<typeof loadConfig>
+> {
+  try {
+    const config = loadConfig();
+    // Healthy boot: remove any degraded marker orphaned by a hostd that
+    // died while degraded after the operator had already fixed the yaml.
+    // Left in place it would report degraded-forever to marker-keyed
+    // health checks AND poison the NEXT degrade episode's persisted-epoch
+    // credit (an ancient `since` → months-long degradedMs → preservation
+    // cap refuses a genuinely fresh pending rollout).
+    clearStaleDegradedMarker(homedir(), (m) =>
+      process.stderr.write(`hostd: ${m}\n`),
+    );
+    return config;
+  } catch (err) {
+    if (!(err instanceof ConfigError)) throw err;
+    // Discover the config path (for the file watcher) without letting a
+    // "no config found" error re-throw — the interval retry covers that.
+    let configPath: string | undefined;
+    try {
+      configPath = findConfigFile();
+    } catch {
+      configPath = undefined;
+    }
+    // Notification transport: we cannot read the config, so we don't know
+    // which agents exist or who is admin. Best-effort fallback: scan the
+    // agents dir for gateway IPC socket paths (sorted — deterministic) and
+    // post ONE plain operator-DM through the FIRST that actually accepts
+    // the connection — a socket inode existing does not prove a listener
+    // (a crashed gateway leaves it behind), so candidates are tried in
+    // order until one takes the write. The gateway fences delivery to its
+    // own operator chat, so this cannot leak outside the operator.
+    const agentsDir =
+      process.env.SWITCHROOM_AGENTS_DIR ??
+      join(homedir(), ".switchroom", "agents");
+    const listGatewayCandidates = (): GatewayCandidate[] => {
+      const out: GatewayCandidate[] = [];
+      try {
+        for (const name of readdirSync(agentsDir).sort()) {
+          const sock = resolve(agentsDir, name, "telegram", "gateway.sock");
+          if (existsSync(sock)) out.push({ agent: name, sock });
+        }
+      } catch {
+        /* agents dir unreadable — marker file is the fallback signal */
+      }
+      return out;
+    };
+    const log = (m: string): void => {
+      process.stderr.write(`hostd: ${m}\n`);
+    };
+    const notify = (text: string): void => {
+      const candidates = listGatewayCandidates();
+      if (candidates.length === 0) {
+        log("config-degraded: no gateway socket paths found; relying on marker file");
+        return;
+      }
+      // Fire-and-forget: the recovery wait must never block on a chat send.
+      void postOperatorNoticeViaGateways(candidates, text, log).then((agent) => {
+        if (agent !== null) log(`config-degraded: operator DM relayed via ${agent}`);
+      });
+    };
+    return waitForConfigRecovery({
+      initialError: err,
+      homeDir: homedir(),
+      loadFn: () => loadConfig(),
+      configPath,
+      notify,
+      log,
+    });
+  }
+}
+
 async function main(): Promise<void> {
-  const config = loadConfig();
+  const config = await loadConfigResilient();
   if (config.host_control?.enabled !== true) {
     process.stderr.write(
       "hostd: refusing to start — host_control.enabled is not true in switchroom.yaml\n",
