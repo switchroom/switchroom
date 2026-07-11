@@ -302,6 +302,23 @@ it, and unblock the fleet — entirely from chat:
 
 `/auth cancel` aborts an in-flight `/auth add`.
 
+**Google / Microsoft accounts add over Telegram too (issue #2582).** The
+Drive/Graph loopback OAuth flow is fully relayable — no SSH port-forward,
+no keyboard:
+
+- `/auth google add <email> [--replace] [--write]`
+- `/auth microsoft add <email> [--replace] [--org-mode]`
+
+The agent runs the loopback flow in its own container, relays the consent
+URL to chat, and you approve on your phone. The redirect to `127.0.0.1`
+fails to load — expected — so you paste the full address-bar URL
+(`?code=...&state=...`) back into chat; the gateway validates `state` and
+hands the code to the waiting listener. The pasted URL is redacted from
+history on completion. `/auth google cancel` / `/auth microsoft cancel`
+abort. Run it against the agent that should hold the grant
+(`google/client-secret` is admin-only and can't be minted to the root
+agent).
+
 ### Full surface
 
 | Chat command | Equivalent CLI verb |
@@ -309,6 +326,8 @@ it, and unblock the fleet — entirely from chat:
 | `/auth show [<agent>]` | `switchroom auth show [<agent>]` |
 | `/auth list` | `switchroom auth list` |
 | `/auth add <label>` | `switchroom auth add <label> --from-oauth` (chat-native OAuth flow) |
+| `/auth google add <email>` | `switchroom auth google account add <email>` (Telegram-native loopback relay) |
+| `/auth microsoft add <email>` | `switchroom auth microsoft account add <email>` (Telegram-native loopback relay) |
 | `/auth cancel` | (chat-only: aborts an in-flight `/auth add`) |
 | `/auth use <label>` | `switchroom auth use <label>` |
 | `/auth rotate` | `switchroom auth rotate` |

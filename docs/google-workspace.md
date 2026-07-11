@@ -140,11 +140,14 @@ If you'd rather do it by hand (the wizard automates exactly this):
    > flows are dead ends for Drive: **device-code** returns
    > `invalid_scope` for Drive scopes (Google does not allow Drive on
    > device flow), and **OOB** was retired by Google in 2022. On a
-   > **headless server** you complete the single browser step over an
+   > **headless server** you can complete the single browser step over an
    > SSH port-forward — `switchroom auth google account add` prints the
    > exact URL and `localhost` port; you `ssh -L <port>:127.0.0.1:<port>`,
-   > open the URL, approve. Same Desktop+loopback shape the
-   > `examples/personal-google-workspace-mcp/` host MCP uses.
+   > open the URL, approve. Or skip SSH entirely and run it from Telegram
+   > with `/auth google add <email>` (issue #2582) — the agent relays the
+   > consent URL to chat and you paste the redirect back. Same
+   > Desktop+loopback shape the `examples/personal-google-workspace-mcp/`
+   > host MCP uses.
 2. **Vault the secrets** so they never land in YAML:
 
    ```bash
@@ -189,6 +192,27 @@ above):
    broker (encrypted at rest — same machine-bound vault posture as the
    rest of switchroom).
 4. Account is now visible in `switchroom auth google account list`.
+
+**No SSH needed — do it from Telegram instead (issue #2582).** The
+loopback flow is fully relayable over chat, so you never need the
+keyboard or an SSH port-forward. From a chat with the admin agent that
+holds (or will hold) the grant:
+
+```
+/auth google add you@gmail.com            # add or re-auth
+/auth google add you@gmail.com --replace  # re-consent an existing account
+/auth google add you@gmail.com --write    # request Drive write scope
+```
+
+The agent runs the loopback flow **in its own container**, relays the
+consent URL to chat, you approve on your phone (the redirect to
+`127.0.0.1` fails to load — that's expected), then paste the full URL
+from your address bar (`?code=...&state=...`) back into chat. The
+gateway validates `state` and hands the code to the waiting listener.
+`/auth google cancel` aborts. Run it against the agent that should hold
+the grant — `google/client-secret` is an admin-only vault key that
+can't be minted to the root agent, so "the agent that holds the grant"
+is the right place to run it.
 
 If you have multiple Google accounts to attach, repeat with each
 account's email. Agents reference accounts by that email everywhere

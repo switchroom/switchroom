@@ -254,6 +254,12 @@ import {
   cleanScratchDir as cleanAuthAddScratchDir,
 } from './auth-add-flow.js'
 import {
+  pendingLoopbackFlows,
+  startLoopbackFlow,
+  submitLoopbackRedirect,
+  cancelLoopbackFlow,
+} from './auth-loopback-relay.js'
+import {
   initHistory, recordInbound, recordOutbound, recordEdit,
   deleteFromHistory, query as queryHistory, getLatestInboundMessageId,
   recordReaction, lookupMessageRoleAndText,
@@ -6580,6 +6586,14 @@ const pendingStateReaper = setInterval(() => {
     if (now - v.startedAt > REAUTH_INTERCEPT_TTL_MS) {
       cancelAccountAuthSession(v)
       pendingAuthAddFlows.delete(k)
+    }
+  }
+  // Loopback OAuth relay flows (issue #2582) — same TTL. Kill the waiting
+  // CLI child so an abandoned consent never lingers with a bound listener.
+  for (const [k, v] of pendingLoopbackFlows) {
+    if (now - v.startedAt > REAUTH_INTERCEPT_TTL_MS) {
+      cancelLoopbackFlow(v)
+      pendingLoopbackFlows.delete(k)
     }
   }
   for (const [k, v] of awaitingAuthCodeAt) {
@@ -17820,6 +17834,56 @@ async function handleInbound(
     pendingAuthAddFlows.delete(interceptKey)
   }
 
+  // Loopback OAuth relay paste-back intercept (issue #2582) — sibling to
+  // the /auth add intercept above. When a Google/Microsoft loopback relay is
+  // pending for this chat and the operator pastes their `127.0.0.1:<port>`
+  // redirect URL, validate `state` and hand the code to the waiting CLI
+  // listener. The LLM never sees the code (same hygiene rationale as above).
+  const pendingLoop = pendingLoopbackFlows.get(interceptKey)
+  if (pendingLoop && /(?:127\.0\.0\.1|localhost)/.test(text)) {
+    const elapsed = Date.now() - pendingLoop.startedAt
+    if (elapsed < REAUTH_INTERCEPT_TTL_MS) {
+      const result = await submitLoopbackRedirect(pendingLoop, text.trim())
+      if (result.ok) {
+        pendingLoopbackFlows.delete(interceptKey)
+        await switchroomReply(
+          ctx,
+          `✓ ${pendingLoop.provider === 'google' ? 'Google' : 'Microsoft'} account ` +
+            `\`${escapeHtmlForTg(pendingLoop.email)}\` registered with the auth-broker.`,
+          { html: true },
+        )
+        // Redact the pasted redirect (carries the OAuth code) from history.
+        redactAuthCodeMessage(bot.api as never, chat_id, msgId ?? null, line => process.stderr.write(line))
+        return
+      }
+      if (result.retryable) {
+        // Keep the flow pending so the operator can paste again.
+        await switchroomReply(
+          ctx,
+          `**Paste not accepted:** ${escapeHtmlForTg(result.reason)}\n` +
+            `Re-open the consent URL, approve, and paste the full ` +
+            `\`127.0.0.1\` URL from your address bar. \`/auth ${pendingLoop.provider} cancel\` to abort.`,
+          { html: true },
+        )
+        // Redact even a rejected paste — it may still carry a live code.
+        redactAuthCodeMessage(bot.api as never, chat_id, msgId ?? null, line => process.stderr.write(line))
+        return
+      }
+      // Non-retryable — the flow is spent.
+      pendingLoopbackFlows.delete(interceptKey)
+      await switchroomReply(
+        ctx,
+        `**/auth ${pendingLoop.provider} add failed:** ${escapeHtmlForTg(result.reason)}`,
+        { html: true },
+      )
+      redactAuthCodeMessage(bot.api as never, chat_id, msgId ?? null, line => process.stderr.write(line))
+      return
+    }
+    // Stale — kill the child and drop the entry, then fall through.
+    cancelLoopbackFlow(pendingLoop)
+    pendingLoopbackFlows.delete(interceptKey)
+  }
+
   // Auth-code intercept
   const pendingReauth = pendingReauthFlows.get(interceptKey)
   if (pendingReauth && looksLikeAuthCode(text)) {
@@ -23364,6 +23428,79 @@ bot.command("auth", async ctx => {
     return
   }
 
+  // `/auth google add|cancel` and `/auth microsoft add|cancel` — the
+  // Telegram-native OAuth loopback relay (issue #2582). Gateway-routed for the
+  // same reason as `/auth add`: they drive a child-process listener lifecycle
+  // the broker client can't model. Admin-gated identically.
+  if (parsed.kind === 'provider-add' || parsed.kind === 'provider-cancel') {
+    if (!isAuthAdmin({ isAdmin })) {
+      await switchroomReply(
+        ctx,
+        `**Not authorized.** \`/auth ${parsed.provider}\` is admin-only.\n` +
+          `Set \`admin: true\` on this agent in switchroom.yaml to unlock.`,
+        { html: true },
+      )
+      return
+    }
+    const loopKey = chatKey(chatId, ctx.message?.message_thread_id ?? null) as string
+    if (parsed.kind === 'provider-cancel') {
+      const existing = pendingLoopbackFlows.get(loopKey)
+      if (!existing) {
+        await switchroomReply(ctx, `_No pending \`/auth ${parsed.provider} add\` flow in this chat._`, { html: true })
+        return
+      }
+      cancelLoopbackFlow(existing)
+      pendingLoopbackFlows.delete(loopKey)
+      await switchroomReply(ctx, 'Cancelled.', { html: true })
+      return
+    }
+    // parsed.kind === 'provider-add'
+    if (pendingLoopbackFlows.has(loopKey)) {
+      await switchroomReply(
+        ctx,
+        `_An \`/auth ${parsed.provider} add\` flow is already in progress for this chat. ` +
+          `Finish the paste, or send \`/auth ${parsed.provider} cancel\` to abort._`,
+        { html: true },
+      )
+      return
+    }
+    try {
+      const { consentUrl, state, port, child } = await startLoopbackFlow(
+        parsed.provider,
+        parsed.email,
+        { replace: parsed.replace, write: parsed.write, orgMode: parsed.orgMode },
+      )
+      pendingLoopbackFlows.set(loopKey, {
+        provider: parsed.provider,
+        email: parsed.email,
+        state,
+        port,
+        consentUrl,
+        child,
+        startedAt: Date.now(),
+        submitting: false,
+      })
+      const providerName = parsed.provider === 'google' ? 'Google' : 'Microsoft'
+      await switchroomReply(
+        ctx,
+        `**Adding ${providerName} account** \`${escapeHtmlForTg(parsed.email)}\`\n\n` +
+          `1. Open this URL on your phone and approve:\n${consentUrl}\n\n` +
+          `2. The redirect to \`127.0.0.1\` will fail to load — that's expected.\n` +
+          `3. Copy the **full URL** from your browser's address bar (it holds ` +
+          `\`?code=...&state=...\`) and paste it back here.\n\n` +
+          `Send \`/auth ${parsed.provider} cancel\` to abort.`,
+        { html: true },
+      )
+    } catch (err) {
+      await switchroomReply(
+        ctx,
+        `**/auth ${parsed.provider} add failed:** ${escapeHtmlForTg((err as Error)?.message ?? String(err))}`,
+        { html: true },
+      )
+    }
+    return
+  }
+
   const client = await getAuthBrokerClient(currentAgent)
   if (!client) {
     await switchroomReply(ctx, "**/auth unavailable:** auth-broker client is not loaded (post-RFC-H rewire in progress?).", { html: true })
@@ -26871,6 +27008,10 @@ async function shutdown(signal: string): Promise<void> {
   // Now finish the cleanup the drain didn't touch.
   inboundCoalescer.reset()
   pendingReauthFlows.clear()
+  // Kill any in-flight loopback relay CLI children so they don't outlive the
+  // gateway with a bound 127.0.0.1 listener (issue #2582).
+  for (const [, v] of pendingLoopbackFlows) cancelLoopbackFlow(v)
+  pendingLoopbackFlows.clear()
   pendingVaultOps.clear()
   pendingPermissions.clear()
   permissionTimeoutSignatures.clear()
