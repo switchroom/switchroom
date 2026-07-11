@@ -1685,15 +1685,22 @@
       const safe = (p, fallback) =>
         p.then(r => r.ok ? r.json() : fallback).catch(() => fallback);
       try {
-        const [blocked, approvals, grants] = await Promise.all([
+        const [blocked, blockedStatus, approvals, grants] = await Promise.all([
           // Blocked approvals lead the tab — an agent held with no way to ask
           // is the only thing here that is actively costing the operator.
-          safe(fetch(`${API}/api/blocked-approvals`, { headers: authHeaders() }), []),
+          // The fallback is a `null` SENTINEL, never `[]`: a 500 / auth
+          // failure / network error must not render as "nothing is blocked".
+          // That would be a positive claim we did not verify, over an agent
+          // that may be hanging right now.
+          safe(fetch(`${API}/api/blocked-approvals`, { headers: authHeaders() }), null),
+          // Companion read: how many records we FAILED to read (0600 files).
+          // Same rule — null means we don't know, which is not "all clear".
+          safe(fetch(`${API}/api/blocked-approvals/status`, { headers: authHeaders() }), null),
           safe(fetch(`${API}/api/approvals`, { headers: authHeaders() }), null),
           safe(fetch(`${API}/api/grants`, { headers: authHeaders() }),
             { reachable: false, grants: [], error: 'Failed to fetch standing grants.' }),
         ]);
-        renderApprovals(blocked, approvals, grants);
+        renderApprovals(blocked, blockedStatus, approvals, grants);
         clearError();
       } catch (err) {
         showError(`Failed to fetch approvals: ${err.message}`);
@@ -2071,20 +2078,45 @@
       // above (server-derived), and as a count here — a blocked agent must be
       // visible on the default tab without drilling in (#3084).
       const blockedAppr = Array.isArray(summary.blockedApprovals) ? summary.blockedApprovals : [];
+      // Records that EXIST but could not be read (0600, IO error). Non-zero
+      // means an empty `blockedAppr` proves nothing, so nothing below may
+      // claim "none blocked" or "all nominal".
+      const blockedUnreadable = Number(summary.blockedApprovalsUnreadable) || 0;
       const schedEntries = (sched && Array.isArray(sched.entries)) ? sched.entries : [];
       const schedAgents = new Set(schedEntries.map(e => e.agent)).size;
-      const services = [
-        svc('auth-broker', !!b.reachable, b.reachable ? `active ${escapeHtml(b.active || '—')} · ${b.accounts ?? '?'} accts` : 'unreachable'),
-        svc('hindsight', !!hs.running, hs.running ? `${escapeHtml(hs.model || '?')} · ${hs.mcpStateless ? 'stateless' : 'stateful'}` : 'not running'),
-        svc('hostd', !!hd.auditLogPresent, hd.auditLogPresent ? `${(hd.recent || []).length} recent verbs` : 'no audit log'),
-        svc('schedule', schedEntries.length > 0, `${schedEntries.length} crons · ${schedAgents} agents`),
-        // A blocked agent makes this service NOT ok, however reachable the
-        // kernel is — the leash is jammed and someone is waiting on Ken.
-        svc('approvals', apprReachable && blockedAppr.length === 0,
-          blockedAppr.length > 0
-            ? `<b>${blockedAppr.length} agent${blockedAppr.length === 1 ? '' : 's'} blocked</b> — ${escapeHtml(blockedAppr.map(b => b.agent).join(', '))}`
-            : apprReachable ? `${activeGrants} active grants · none blocked` : 'unreachable'),
-      ].join('');
+      // Approvals is NOT ok if an agent is blocked (the leash is jammed and
+      // someone is waiting on Ken) OR if we could not read the records at all
+      // (we cannot claim "none blocked" without having looked).
+      const apprOk = apprReachable && blockedAppr.length === 0 && blockedUnreadable === 0;
+      const apprMeta = blockedUnreadable > 0
+        ? `<b>cannot read ${blockedUnreadable} blocked record(s)</b> · an agent may be held`
+        : blockedAppr.length > 0
+          ? `<b>${blockedAppr.length} agent${blockedAppr.length === 1 ? '' : 's'} blocked</b> — ${escapeHtml(blockedAppr.map(b => b.agent).join(', '))}`
+          : apprReachable ? `${activeGrants} active grants · none blocked` : 'unreachable';
+
+      // Build the rail from specs so the BAND can be derived from whether
+      // every service is actually ok. The band used to hardcode "all nominal"
+      // even with hindsight down and hostd red — the same claim-health-you-
+      // haven't-verified bug this PR exists to kill, so it dies here too
+      // rather than being carved out for one service.
+      const svcSpecs = [
+        { name: 'auth-broker', ok: !!b.reachable, meta: b.reachable ? `active ${escapeHtml(b.active || '—')} · ${b.accounts ?? '?'} accts` : 'unreachable' },
+        { name: 'hindsight', ok: !!hs.running, meta: hs.running ? `${escapeHtml(hs.model || '?')} · ${hs.mcpStateless ? 'stateless' : 'stateful'}` : 'not running' },
+        { name: 'hostd', ok: !!hd.auditLogPresent, meta: hd.auditLogPresent ? `${(hd.recent || []).length} recent verbs` : 'no audit log' },
+        { name: 'schedule', ok: schedEntries.length > 0, meta: `${schedEntries.length} crons · ${schedAgents} agents` },
+        { name: 'approvals', ok: apprOk, meta: apprMeta },
+      ];
+      const services = svcSpecs.map(s => svc(s.name, s.ok, s.meta)).join('');
+      const badSvcs = svcSpecs.filter(s => !s.ok);
+      // Blocked/unreadable approvals get named explicitly in the band — that
+      // is the one the operator has to act on right now.
+      const bandNote = blockedUnreadable > 0
+        ? `cannot read ${blockedUnreadable} blocked record(s)`
+        : blockedAppr.length > 0
+          ? `${blockedAppr.length} blocked on approval`
+          : badSvcs.length > 0
+            ? `${badSvcs.length} degraded — ${escapeHtml(badSvcs.map(s => s.name).join(', '))}`
+            : 'all nominal';
 
       el.innerHTML = `
         ${verdict}${asOf}
@@ -2092,7 +2124,7 @@
         <div class="sm-attn-list">${attnHtml}</div>
         <div class="sm-band">Fleet vitals</div>
         <div class="sm-vitals">${agentsCard}${quotaCard}</div>
-        <div class="sm-band">Services <span class="n">${blockedAppr.length > 0 ? `${blockedAppr.length} blocked on approval` : 'all nominal'}</span></div>
+        <div class="sm-band">Services <span class="n">${bandNote}</span></div>
         <div class="sm-services">${services}</div>`;
     }
 
@@ -3150,7 +3182,7 @@
       container.innerHTML = degradedBanner + truncatedNote + posture + cards;
     }
 
-    function renderApprovals(blocked, data, grants) {
+    function renderApprovals(blocked, blockedStatus, data, grants) {
       const container = document.getElementById('approvals');
       // Three independent sections, most-urgent first: agents HELD on an
       // approval they couldn't deliver (the only live, costing thing here),
@@ -3159,7 +3191,7 @@
       // installs). They degrade independently — one being unreachable never
       // blanks the others.
       container.innerHTML =
-        renderBlockedApprovals(blocked) +
+        renderBlockedApprovals(blocked, blockedStatus) +
         renderStandingGrants(grants) +
         renderApprovalDecisions(data);
     }
@@ -3187,13 +3219,45 @@
     // The record is metadata only; it never carries the raw tool input, and
     // the server hard-whitelists the fields. Empty is stated plainly rather
     // than implying health we haven't verified.
-    function renderBlockedApprovals(blocked) {
+    function renderBlockedApprovals(blocked, blockedStatus) {
       const dim = (s) => `<span style="color:var(--text-dim)">${escapeHtml(s)}</span>`;
       const rows = Array.isArray(blocked) ? blocked : [];
       const heading = `<h3 style="margin:0 0 0.5rem;font-size:0.95rem">Blocked approvals${rows.length ? ` <span class="usage-pill primary">${rows.length}</span>` : ''}</h3>`;
+
+      // Did we actually LOOK? Three distinct states, and only one of them may
+      // print an all-clear:
+      //   - fetch failed (`blocked` is the null sentinel)  → we don't know
+      //   - status says records were unreadable (0600, IO) → we don't know
+      //   - read clean and empty                           → nothing is blocked
+      // Collapsing the first two into the third is the failure this whole
+      // surface exists to prevent: a confident "all clear" that really means
+      // "I couldn't look", printed over an agent that is hanging.
+      const fetchFailed = !Array.isArray(blocked);
+      const unreadable = (blockedStatus && Number(blockedStatus.unreadable)) || 0;
+      const blind = fetchFailed || unreadable > 0;
+
+      // The warning is a BANNER, not an early return: an unreadable record
+      // must never hide the records we CAN read. Both can be true at once.
+      const warning = blind
+        ? renderProblem({
+            title: 'Could not read the blocked-approval records. An agent may be held.',
+            detail: (fetchFailed
+              ? 'The dashboard could not fetch the blocked-approval records. '
+              : `${unreadable} blocked-approval record(s) exist but could not be read (wrong file mode, or an IO error). `) +
+              'This is not an all-clear: an agent may be blocked on an approval right now and this page cannot see it.',
+            remediation: {
+              kind: 'command',
+              label: 'Records must be mode 0644. Check on the host:',
+              value: 'ls -l ~/.switchroom/blocked-approvals/',
+            },
+          })
+        : '';
+
       if (rows.length === 0) {
-        return heading +
-          '<div class="loading" style="color:var(--text-dim)">No agent is blocked on an undeliverable approval.</div>';
+        // Only an unblinded, clean read may print an all-clear.
+        return heading + warning + (blind
+          ? ''
+          : '<div class="loading" style="color:var(--text-dim)">No agent is blocked on an undeliverable approval.</div>');
       }
       const now = Date.now();
       const body = rows.map(b => {
@@ -3214,7 +3278,7 @@
           <td title="${escapeHtml(b.requestId || '')}">${b.requestId ? escapeHtml(b.requestId) : dim('—')}</td>
         </tr>`;
       }).join('');
-      return heading + `
+      return heading + warning + `
         <div style="margin-bottom:0.6rem;font-size:0.8rem;color:var(--text-dim)">
           These agents are waiting on you and cannot ask. The approval card could not be delivered to Telegram.
           Nothing is auto-approved and nothing is auto-denied; each one holds until it can reach you.

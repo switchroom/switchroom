@@ -4,12 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   readBlockedApprovals,
+  readBlockedApprovalsWithErrors,
   handleGetBlockedApprovals,
+  handleGetBlockedApprovalsStatus,
   blockedApprovalsDir,
   formatBlockedFor,
   type BlockedApproval,
 } from "./blocked-approvals-read.js";
-import { deriveAttention } from "./api.js";
+import { deriveAttention, handleGetSummary } from "./api.js";
 
 /**
  * The blocked-approvals surface: an agent held on an approval it could not
@@ -163,6 +165,110 @@ describe("readBlockedApprovals (Telegram-independent view of a held agent)", () 
     },
   );
 
+  // ── "I could not look" must never render as "nothing is blocked" ──────
+  //
+  // THE blocker this feature must not have. An unreadable record (0600 —
+  // exactly how pending-perm-cards.json is written today, and exactly how the
+  // Hermes registry.db bug happened) means an agent MAY be held right now.
+  // Reporting that as an empty list makes the page print a confident
+  // "No agent is blocked on an undeliverable approval" over a hanging agent.
+  describe("an unreadable record is never reported as an honest empty", () => {
+    it("counts a record it could not read, separately from one that isn't there", () => {
+      // EISDIR: unreadable for EVERY uid including root in CI, so this is
+      // deterministic where a chmod is not.
+      mkdirSync(join(dir, "overlord.json"));
+
+      const { blocked, unreadable } = readBlockedApprovalsWithErrors(dir);
+      expect(blocked).toEqual([]);
+      // The list is empty, but we did NOT verify that nothing is blocked.
+      expect(unreadable).toBe(1);
+    });
+
+    it("an absent dir is a TRUE empty — unreadable 0 (nothing to warn about)", () => {
+      const { blocked, unreadable } = readBlockedApprovalsWithErrors(
+        join(dir, "does-not-exist"),
+      );
+      expect(blocked).toEqual([]);
+      // ENOENT is honest emptiness, not blindness. It must NOT warn — a
+      // permanent false alarm would train the operator to ignore the surface.
+      expect(unreadable).toBe(0);
+    });
+
+    it("an empty dir is a TRUE empty — unreadable 0", () => {
+      expect(readBlockedApprovalsWithErrors(dir)).toEqual({
+        blocked: [],
+        unreadable: 0,
+      });
+    });
+
+    it("malformed JSON is a parse-miss, not blindness — we looked", () => {
+      writeFileSync(join(dir, "overlord.json"), "{ not json");
+      expect(readBlockedApprovalsWithErrors(dir).unreadable).toBe(0);
+    });
+
+    it("an unreadable record still reports the readable ones AND the blind spot", () => {
+      mkdirSync(join(dir, "clerk.json"));
+      write("overlord", overlord);
+
+      const { blocked, unreadable } = readBlockedApprovalsWithErrors(dir);
+      expect(blocked.map((b) => b.agent)).toEqual(["overlord"]);
+      expect(unreadable).toBe(1);
+    });
+
+    it.skipIf(process.getuid?.() === 0)(
+      "a real 0600 root-owned-style record counts as unreadable, not as absent",
+      () => {
+        writeFileSync(join(dir, "locked.json"), JSON.stringify(overlord));
+        chmodSync(join(dir, "locked.json"), 0o000);
+
+        const { blocked, unreadable } = readBlockedApprovalsWithErrors(dir);
+        expect(blocked).toEqual([]);
+        expect(unreadable).toBe(1);
+      },
+    );
+
+    it("the status endpoint surfaces the blind spot out-of-band", () => {
+      // It cannot ride on /api/blocked-approvals (bare array, Hermes
+      // contract) and must NOT be a synthesized fake row in that array.
+      mkdirSync(join(dir, "overlord.json"));
+      expect(handleGetBlockedApprovalsStatus(dir)).toEqual({
+        blocked: 0,
+        unreadable: 1,
+      });
+    });
+
+    it("the bare-array endpoint keeps its Hermes contract even when blind", () => {
+      mkdirSync(join(dir, "overlord.json"));
+      const arr = handleGetBlockedApprovals(dir);
+      expect(Array.isArray(arr)).toBe(true);
+      expect(arr).toEqual([]); // no fake row synthesized into the array
+    });
+
+    it("deriveAttention raises a CRITICAL row when records are unreadable", () => {
+      // The surface must not claim health. This is the assertion that goes
+      // RED if the read ever silently returns [] again.
+      const items = deriveAttention(
+        { blockedApprovals: [], blockedApprovalsUnreadable: 1 },
+        NOW,
+      );
+      expect(items).toHaveLength(1);
+      expect(items[0].severity).toBe("critical");
+      expect(items[0].title).toContain("Cannot read");
+      expect(items[0].tab).toBe("approvals");
+      expect(items[0].detail).toContain("may be held");
+    });
+
+    it("deriveAttention stays silent when the read was clean and empty", () => {
+      // No false alarm on the honest-empty path (the pre-producer state).
+      expect(
+        deriveAttention(
+          { blockedApprovals: [], blockedApprovalsUnreadable: 0 },
+          NOW,
+        ),
+      ).toEqual([]);
+    });
+  });
+
   it("ranks longest-blocked first", () => {
     write("overlord", overlord); // 47m
     write("clerk", { ...overlord, agent: "clerk", blockedSince: NOW - 5 * 60_000 }); // 5m
@@ -252,6 +358,51 @@ describe("deriveAttention — a blocked agent reaches the Summary tab", () => {
     expect(deriveAttention({ blockedApprovals: [] }, NOW)).toEqual([]);
     expect(deriveAttention({ blockedApprovals: null }, NOW)).toEqual([]);
     expect(deriveAttention({}, NOW)).toEqual([]);
+  });
+
+  it("carries the unreadable count through handleGetSummary to the Summary tab", async () => {
+    // The services rail reads `blockedApprovalsUnreadable` to decide whether
+    // it may print "all nominal". Pin that it actually arrives.
+    const nullPart = <T,>(value: T) => async () => ({ value, dataAsOf: NOW });
+    const summary = await handleGetSummary(
+      {
+        agents: nullPart(null as never),
+        systemHealth: nullPart(null as never),
+        approvals: nullPart(null as never),
+        schedule: nullPart(null as never),
+        accounts: nullPart(null as never),
+        memoryHealth: nullPart(null as never),
+        blockedApprovals: () => ({ blocked: [], unreadable: 2 }),
+      },
+      NOW,
+    );
+
+    expect(summary.blockedApprovals).toEqual([]);
+    expect(summary.blockedApprovalsUnreadable).toBe(2);
+    // and it must surface as a critical row, not as silence
+    expect(summary.attention.some((i) => i.severity === "critical")).toBe(true);
+  });
+
+  it("reports a blind spot (not an all-clear) if the whole read throws", async () => {
+    const nullPart = <T,>(value: T) => async () => ({ value, dataAsOf: NOW });
+    const summary = await handleGetSummary(
+      {
+        agents: nullPart(null as never),
+        systemHealth: nullPart(null as never),
+        approvals: nullPart(null as never),
+        schedule: nullPart(null as never),
+        accounts: nullPart(null as never),
+        memoryHealth: nullPart(null as never),
+        blockedApprovals: () => {
+          throw new Error("disk exploded");
+        },
+      },
+      NOW,
+    );
+
+    // Degrades without taking the summary down, but does NOT claim health.
+    expect(summary.blockedApprovals).toEqual([]);
+    expect(summary.blockedApprovalsUnreadable).toBe(1);
   });
 
   it("raises one row per held agent", () => {

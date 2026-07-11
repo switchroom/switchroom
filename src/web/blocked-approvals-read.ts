@@ -117,43 +117,109 @@ function coerce(raw: unknown, fallbackAgent: string): BlockedApproval | null {
 }
 
 /**
- * Read every `<agent>.json` in `dir` and return the blocked agents,
- * longest-blocked first (worst-first, same posture as the fleet-health
- * ranking). ALWAYS an array — honest empty `[]`, never null, never an
- * object wrapper (the Hermes Desktop adapter consumes this API; a shape
- * surprise crashes that client).
+ * The result of a read: the blocked agents PLUS how many records we could
+ * not read at all.
+ *
+ * `unreadable` exists because "there is nothing there" and "I failed to
+ * look" are different facts, and collapsing them is the worst bug this
+ * surface can have. An EACCES on a 0600 record means an agent may well be
+ * held right now; reporting that as an empty list makes the page print "No
+ * agent is blocked", which is a positive claim the code has NOT verified.
+ * That is the reassuring-lie failure the whole feature exists to kill, and
+ * it is a live risk: the record producer is a separate change, and the
+ * per-agent Telegram state files sitting next to these records are written
+ * 0600 TODAY (the same way the Hermes `registry.db` bug happened).
+ *
+ * So: `unreadable > 0` means the surface must say "I could not read the
+ * records; an agent may be held", never "nothing is blocked".
+ */
+export interface BlockedApprovalsRead {
+  /** The records we could read and parse, longest-blocked first. */
+  blocked: BlockedApproval[];
+  /** How many records existed but could NOT be read (EACCES on a 0600 file,
+   *  EISDIR, IO error), or 1 when the directory itself existed but could not
+   *  be enumerated. 0 means every record present was read successfully — the
+   *  only state in which an empty `blocked` honestly means "nothing is
+   *  blocked". */
+  unreadable: number;
+}
+
+/**
+ * Read every `<agent>.json` in `dir`, returning the blocked agents AND the
+ * count we failed to read. Never throws.
  *
  * Degrades per-file: one unreadable (0600) or malformed record never hides
- * the others, and no failure escapes as a throw.
+ * the others. A read FAILURE is counted in `unreadable` rather than being
+ * silently swallowed; a clean parse-miss (malformed JSON, missing required
+ * fields) is a drop, because there we DID look and there was nothing usable.
  */
-export function readBlockedApprovals(dir: string): BlockedApproval[] {
+export function readBlockedApprovalsWithErrors(
+  dir: string,
+): BlockedApprovalsRead {
   let entries: string[];
   try {
     entries = readdirSync(dir);
-  } catch {
-    // Dir absent (record producer not deployed yet) or unreadable → nothing
-    // is known to be blocked. Honest empty, not an error page.
-    return [];
+  } catch (err) {
+    // ENOENT: the dir genuinely isn't there (the record producer hasn't
+    // landed, or nothing has ever blocked). That is an honest empty.
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+      return { blocked: [], unreadable: 0 };
+    }
+    // Anything else (EACCES on the dir, EIO): the dir EXISTS and we could
+    // not look inside it. We do not know that nothing is blocked, and we
+    // must not imply it. Count it as one unreadable record.
+    return { blocked: [], unreadable: 1 };
   }
 
   const out: BlockedApproval[] = [];
+  let unreadable = 0;
+
   for (const name of entries) {
     if (!name.endsWith(".json")) continue;
+
+    // Read and parse are SEPARATE steps so the two failures stay
+    // distinguishable: a read error means we couldn't look, a parse error
+    // means we looked and found nothing usable.
+    let text: string;
+    try {
+      text = readFileSync(join(dir, name), "utf-8");
+    } catch {
+      // EACCES (record written 0600 root/agent-owned — the trap), EISDIR, IO.
+      // An agent may be held behind this file and we cannot see it. Count it.
+      unreadable++;
+      continue;
+    }
+
     let record: BlockedApproval | null;
     try {
-      const raw = JSON.parse(readFileSync(join(dir, name), "utf-8")) as unknown;
-      record = coerce(raw, name.slice(0, -".json".length));
+      record = coerce(JSON.parse(text) as unknown, name.slice(0, -".json".length));
     } catch {
-      // Malformed JSON, or EACCES on a wrongly-moded file. Skip this record;
-      // the others still render.
+      // Malformed JSON. We read it; there is nothing honest to render.
       continue;
     }
     if (record) out.push(record);
   }
 
-  // Longest-blocked first — the one that has been waiting on the operator
-  // the longest is the one that most needs them.
-  return out.sort((a, b) => a.blockedSince - b.blockedSince);
+  return {
+    // Longest-blocked first — the one that has been waiting on the operator
+    // the longest is the one that most needs them.
+    blocked: out.sort((a, b) => a.blockedSince - b.blockedSince),
+    unreadable,
+  };
+}
+
+/**
+ * The blocked agents alone, longest-blocked first. ALWAYS an array — honest
+ * empty `[]`, never null, never an object wrapper (the Hermes Desktop
+ * adapter consumes `/api/blocked-approvals`; a shape surprise crashes that
+ * client, so this endpoint's contract is a bare array and stays one).
+ *
+ * Read failures are NOT visible through this function. Anything that renders
+ * an "all clear" to the operator must use {@link readBlockedApprovalsWithErrors}
+ * and check `unreadable` first.
+ */
+export function readBlockedApprovals(dir: string): BlockedApproval[] {
+  return readBlockedApprovalsWithErrors(dir).blocked;
 }
 
 /**
@@ -183,4 +249,19 @@ export function handleGetBlockedApprovals(
   dir: string = blockedApprovalsDir(),
 ): BlockedApproval[] {
   return readBlockedApprovals(dir);
+}
+
+/**
+ * Status handler for `GET /api/blocked-approvals/status` — the out-of-band
+ * companion to the bare-array endpoint. The Approvals tab needs to know
+ * whether a read FAILED (so it can warn instead of printing "nothing is
+ * blocked"), and the bare-array contract has nowhere to carry that without
+ * breaking Hermes. So it rides here instead of being synthesized as a fake
+ * row in the array, which would defeat the field whitelist.
+ */
+export function handleGetBlockedApprovalsStatus(
+  dir: string = blockedApprovalsDir(),
+): { blocked: number; unreadable: number } {
+  const { blocked, unreadable } = readBlockedApprovalsWithErrors(dir);
+  return { blocked: blocked.length, unreadable };
 }
