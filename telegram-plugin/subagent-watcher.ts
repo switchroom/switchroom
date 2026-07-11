@@ -1779,21 +1779,39 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       maybySendStateTransition(agentId)
     }
 
-    // Set up FSWatcher
-    try {
-      tail.watcher = fs.watch(filePath, () => {
-        if (stopped) return
-        const entry = registry.get(agentId)
-        const t = tails.get(agentId)
-        if (!entry || !t) return
-        checkBootPromotionGrowth(entry, t, nowFn())
-        readSubTail(entry, t, nowFn(), (desc) => {
-          log?.(`subagent-watcher: description updated for ${agentId}: ${desc}`)
-        }, fs, log, db, parentStateDir, config.onUnstall, cleanupTerminalAgent, config.onProgress)
-        maybySendStateTransition(agentId)
-      })
-    } catch (err) {
-      log?.(`subagent-watcher: fs.watch failed for ${agentId}: ${(err as Error).message}`)
+    // Set up FSWatcher.
+    //
+    // FD-leak fix (H2): only open an inotify watch when it can do real work.
+    // A historical entry that is done-at-boot (already `scheduleTerminalCleanup`d
+    // just above) or a stale `running` entry that will never be promoted (no
+    // `bootPromotionPending`) has NO live transition left to observe —
+    // `checkStalls` skips every historical entry, so such an entry never
+    // reaches a terminal transition and `scheduleTerminalCleanup` never runs
+    // for it. Opening an `fs.watch` for one leaks its inotify FD for the whole
+    // gateway lifetime (the dozens-to-hundreds of dead prior-session
+    // `running` JSONLs a 24/7 agent accumulates). The poll loop still reads
+    // any registered running entry defensively, so dropping the watcher here
+    // costs nothing but the leaked FD. Open the watch only for a live worker
+    // or a historical one still awaiting boot-promotion growth confirmation.
+    const needsWatcher = !entry.historical || entry.bootPromotionPending != null
+    if (needsWatcher) {
+      try {
+        tail.watcher = fs.watch(filePath, () => {
+          if (stopped) return
+          const entry = registry.get(agentId)
+          const t = tails.get(agentId)
+          if (!entry || !t) return
+          checkBootPromotionGrowth(entry, t, nowFn())
+          readSubTail(entry, t, nowFn(), (desc) => {
+            log?.(`subagent-watcher: description updated for ${agentId}: ${desc}`)
+          }, fs, log, db, parentStateDir, config.onUnstall, cleanupTerminalAgent, config.onProgress)
+          maybySendStateTransition(agentId)
+        })
+      } catch (err) {
+        log?.(`subagent-watcher: fs.watch failed for ${agentId}: ${(err as Error).message}`)
+      }
+    } else {
+      log?.(`subagent-watcher: ${agentId} historical/terminal at registration — not opening an FSWatcher (no live transition to observe)`)
     }
   }
 
@@ -1855,7 +1873,17 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
     }
     if (n >= pending.deadlineAt) {
       entry.bootPromotionPending = undefined
-      log?.(`subagent-watcher: ${entry.agentId} never observed post-boot JSONL growth within the window — leaving historical/orphan (not promoting; avoids synthesising a stale 'completed' handback from a worker killed before this restart)`)
+      // FD-leak fix (H2): the boot-promotion window elapsed with no growth,
+      // so this entry is now a permanent historical/orphan that `checkStalls`
+      // skips — it will never reach terminal cleanup. Release the FSWatcher we
+      // opened purely for growth-confirmation now; the poll loop remains the
+      // fallback reader if the file ever resumes (rescan re-registers on a
+      // fresh transition).
+      if (tail.watcher) {
+        try { tail.watcher.close() } catch { /* ignore */ }
+        tail.watcher = null
+      }
+      log?.(`subagent-watcher: ${entry.agentId} never observed post-boot JSONL growth within the window — leaving historical/orphan (not promoting; avoids synthesising a stale 'completed' handback from a worker killed before this restart); released growth-confirmation FSWatcher`)
     }
   }
 
@@ -2386,8 +2414,35 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
    * We walk: <agentDir>/.claude/projects/ → each project dir → each session dir
    * → subagents/ → agent-*.jsonl
    */
+  /**
+   * FD-leak fix (H1): close and forget any directory FSWatcher whose watched
+   * directory no longer exists on disk. Every new Claude session mints a fresh
+   * `<sessionId>/subagents/` dir (and `workflows/wf_<id>` sub-dirs); when Claude
+   * Code reaps a prior session's directory, the scan loop below simply skips
+   * the vanished path (`existsSync` guard) WITHOUT closing the watcher it had
+   * opened for it — Node only frees the inotify FD on `.close()`, so each dead
+   * session leaked one dir watcher for the whole gateway lifetime. Sweeping on
+   * every rescan releases them deterministically the tick after the dir goes
+   * away, and also covers a slug that transitions to "foreign" (skipped by the
+   * allow-list filter below). Deleting the current key while iterating a Map's
+   * entries() is safe in JS.
+   */
+  function pruneVanishedDirWatchers(): void {
+    for (const [dirPath, w] of dirWatchers) {
+      if (!fs.existsSync(dirPath)) {
+        try { w.close() } catch { /* ignore */ }
+        dirWatchers.delete(dirPath)
+        log?.(`subagent-watcher: released dir watcher for vanished ${dirPath}`)
+      }
+    }
+  }
+
   function rescanSubagentDirs(): void {
     if (stopped) return
+    // Release watchers for directories reaped since the last tick BEFORE the
+    // early-returns below, so a projectsRoot that vanishes entirely still frees
+    // every child dir watcher.
+    pruneVanishedDirWatchers()
     const claudeHome = join(agentDir, '.claude')
     const projectsRoot = join(claudeHome, 'projects')
     if (!fs.existsSync(projectsRoot)) return
