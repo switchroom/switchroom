@@ -74,6 +74,28 @@ export function wireTimeoutForOp(op: HostdRequest["op"]): number {
   return WIRE_TIMEOUT_MS_BY_OP[op] ?? DEFAULT_WIRE_TIMEOUT_MS;
 }
 
+/**
+ * #2972 — grace window before the rollout tool re-checks a `started`
+ * rollout via a single get_status. A rollout child that dies immediately
+ * (e.g. `unknown agent(s): …`, exit 2) leaves hostd having already replied
+ * `started`; without this the caller sees success and never gets a card.
+ * After `started` we wait this long, then poll get_status once — if the
+ * request is already terminal with an error, we surface it (with
+ * stderr_tail) instead of the misleading `started` JSON.
+ *
+ * Overridable via `HOSTD_MCP_ROLLOUT_GRACE_MS` (tests set 0 to short-circuit
+ * the delay while keeping the get_status round-trip).
+ */
+const DEFAULT_ROLLOUT_GRACE_MS = 3_000;
+export function rolloutGraceMs(): number {
+  const raw = process.env.HOSTD_MCP_ROLLOUT_GRACE_MS;
+  if (raw !== undefined) {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+  return DEFAULT_ROLLOUT_GRACE_MS;
+}
+
 interface ToolArgs {
   name?: string;
   reason?: string;
@@ -812,6 +834,21 @@ export async function dispatchTool(
     );
   }
 
+  // #2972 — a rollout that reported `started` may already be terminally
+  // dead (child rejected the args and exited before we could observe it).
+  // Wait a short grace window, then poll get_status once; if it's terminal
+  // with an error, surface that (with stderr_tail) instead of the
+  // misleading `started`. Any other outcome (still running, wire hiccup,
+  // no such request) falls through to the normal started path — we never
+  // turn a healthy roll into a failure.
+  if (req.op === "rollout" && resp.result === "started") {
+    const terminal = await checkRolloutEarlyFailure(
+      sockPath,
+      resp.request_id,
+    );
+    if (terminal) return terminal;
+  }
+
   // started/completed: success path. Surface the full response as
   // JSON so the model can correlate later via request_id.
   if (resp.result === "started" || resp.result === "completed") {
@@ -828,6 +865,15 @@ export async function dispatchTool(
   const content: { type: "text"; text: string }[] = [
     { type: "text", text: JSON.stringify(resp) },
   ];
+  // #2972 — plumb the child's stderr tail as its own content item on
+  // every terminal denied/error envelope, so the caller sees the exact
+  // failure ("unknown agent(s): …") without re-parsing the JSON blob.
+  if (resp.stderr_tail) {
+    content.push({
+      type: "text",
+      text: `stderr_tail:\n${resp.stderr_tail}`,
+    });
+  }
   // #1758 Phase 1: when a structured error envelope is present, surface
   // it as a second content item with a leading discriminator hint so
   // the agent can branch on `fix.kind` without re-parsing the legacy
@@ -839,6 +885,58 @@ export async function dispatchTool(
       text:
         `Structured error — fix.kind=${env.fix?.kind ?? "none"}\n` +
         JSON.stringify(env, null, 2),
+    });
+  }
+  return { content, isError: true };
+}
+
+/**
+ * #2972 — after a rollout reports `started`, wait a short grace window and
+ * poll get_status ONCE. If the request is already terminal with an error,
+ * return an isError result carrying the error message AND the child's
+ * stderr_tail. Returns null in every other case (still running, no such
+ * request, wire error) so the caller falls through to the normal `started`
+ * path — a healthy roll is never converted into a failure.
+ */
+async function checkRolloutEarlyFailure(
+  sockPath: string,
+  rolloutRequestId: string,
+): Promise<{
+  content: { type: "text"; text: string }[];
+  isError: boolean;
+} | null> {
+  const graceMs = rolloutGraceMs();
+  if (graceMs > 0) {
+    await new Promise((resolve) => setTimeout(resolve, graceMs));
+  }
+  const statusReq: HostdRequest = {
+    v: 1,
+    op: "get_status",
+    request_id: makeRequestId("mcp-rollout-poststart"),
+    args: { target_request_id: rolloutRequestId },
+  };
+  let status: HostdResponse;
+  try {
+    status = await hostdRequest(
+      { socketPath: sockPath, timeoutMs: wireTimeoutForOp(statusReq.op) },
+      statusReq,
+    );
+  } catch {
+    // Wire hiccup on the follow-up poll — don't mask the roll. The caller
+    // still has the request_id from the started response to poll later.
+    return null;
+  }
+  // Only a terminal ERROR short-circuits. "completed" this fast is
+  // implausible for a real roll but is still success; "started"/other
+  // means the roll is proceeding normally → the approval card flow.
+  if (!status || status.result !== "error") return null;
+  const content: { type: "text"; text: string }[] = [
+    { type: "text", text: JSON.stringify(status) },
+  ];
+  if (status.stderr_tail) {
+    content.push({
+      type: "text",
+      text: `stderr_tail:\n${status.stderr_tail}`,
     });
   }
   return { content, isError: true };

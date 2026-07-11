@@ -1703,6 +1703,53 @@ export class HostdServer {
     const assetDenied = this.applyAssetPreflight(req.request_id, started);
     if (assetDenied) return assetDenied;
 
+    // #2972 — fail fast on a bad `agents` list BEFORE spawning the child.
+    // The child rejects unknown agents (stderr, exit 2) but by then hostd
+    // has already replied "started", so the caller sees success and never
+    // gets an approval card. Validate against the SAME config view the
+    // child reads (`config.agents` keys) so there's no stale-view mismatch.
+    if (req.args.agents !== undefined) {
+      let validAgents: string[] | null = null;
+      try {
+        const cfg = loadConfig(this.opts.configPath) as {
+          agents?: Record<string, unknown>;
+        };
+        validAgents = Object.keys(cfg.agents ?? {});
+      } catch {
+        // Malformed yaml: skip validation and proceed as before — the
+        // child will fail and the MCP-side grace-window check surfaces it.
+        validAgents = null;
+      }
+      if (validAgents !== null) {
+        // #1758 structured envelope alongside the legacy `error` string.
+        // ErrorBuilder synthesises `error` as "<code>: <human>", so the
+        // legacy string stays exactly "E_UNKNOWN_AGENT: …" — the same shape
+        // string-matching decoders already parse.
+        const buildDenied = (human: string): HostdResponse =>
+          err("E_UNKNOWN_AGENT", human)
+            .fixBadInput("agents")
+            .op("rollout")
+            .caller(caller.kind)
+            .agentName(caller.kind === "agent" ? caller.name : undefined)
+            .asDenied()
+            .build(req.request_id, Date.now() - started);
+        const requested = req.args.agents;
+        if (requested.length === 0) {
+          return buildDenied(
+            `empty agents list — pass at least one agent, ` +
+              `or omit "agents" to roll all. Valid agents: ${validAgents.join(", ")}`,
+          );
+        }
+        const unknown = requested.filter((a) => !validAgents!.includes(a));
+        if (unknown.length > 0) {
+          return buildDenied(
+            `unknown agent(s): ${unknown.join(", ")}. ` +
+              `Valid agents: ${validAgents.join(", ")}`,
+          );
+        }
+      }
+    }
+
     const entry = this.launchRollout(req.args, req.request_id, caller, started);
     return {
       v: 1,
