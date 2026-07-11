@@ -53,6 +53,22 @@ def main():
         prestart_daemon_background(config, debug_fn=_dbg)
         return
 
+    # Mode 1 (external hindsightApiUrl) reachability gate (#1094 item 1).
+    # get_api_url() returns the external URL WITHOUT probing it, so an
+    # external server that's down would otherwise slip past the guard
+    # above and let the drain run against nothing — bumping attempt
+    # counters on healthy entries until the stall guard trips. Modes 2/3
+    # already gate via _check_health inside get_api_url, so only Mode 1
+    # needs an explicit probe here. On failure, skip the drain and return
+    # (no local daemon to pre-start in Mode 1 — the external server is the
+    # operator's responsibility); queued entries stay for the next session.
+    if config.get("hindsightApiUrl") and not client.health_check(timeout=2):
+        debug_log(
+            config,
+            f"External Hindsight at {api_url} unreachable, skipping drain",
+        )
+        return
+
     # Drain any retains that session_end.py queued on failure (#1071).
     # Bounded by HINDSIGHT_DRAIN_BUDGET_S so a slow upstream can't pin
     # the SessionStart hook. The drain is best-effort — failures stay

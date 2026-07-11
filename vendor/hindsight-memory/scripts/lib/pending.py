@@ -197,22 +197,49 @@ def update_attempt(path: str, entry: dict, error: BaseException) -> bool:
 
 def mark_dead(path: str, entry: dict) -> Optional[str]:
     """Convert an entry that exceeded ``MAX_ATTEMPTS`` into a permanent
-    failure marker. Renames ``<path>`` to ``<path>.dead`` so the queue
-    no longer drains it but operators can still inspect.
+    failure marker at ``<path>.dead`` so the queue no longer drains it
+    but operators can still inspect.
 
-    Returns the marker path, or ``None`` if the rename failed.
+    Returns the marker path, or ``None`` if it failed.
+
+    Crash-window invariant (#1094 item 3): **a live ``<path>.json`` entry
+    must never carry a ``dead_at`` stamp.** The old two-step form violated
+    this — it wrote the dead_at-stamped payload back to the *live* path
+    (rename tmp -> path) and only then renamed path -> path.dead, so a
+    crash between the two renames left a live entry with ``dead_at`` set
+    that the drainer would re-enter and re-bump. Here we instead:
+
+      1. write the dead_at-stamped payload to ``<path>.tmp``
+      2. ``os.replace(tmp, dead_path)``  — the .dead marker appears in one
+         atomic step (never drained: the drainer only lists ``*.json``)
+      3. ``os.unlink(path)``            — drop the original live entry
+
+    At every crash point the invariant holds: the ``dead_at`` stamp only
+    ever lands on ``<path>.dead``. A crash after step 2 leaves both the
+    (stale, no-dead_at) live entry and the .dead marker; the next drain
+    re-marks it dead (os.replace overwrites the marker idempotently),
+    never observing a live entry with dead_at.
     """
     entry["dead_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     dead_path = path + ".dead"
+    tmp = path + ".tmp"
     try:
-        # Best-effort: write the final state first so the marker shows
-        # the death timestamp + last error.
-        tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(entry, f, ensure_ascii=False)
         os.chmod(tmp, 0o600)
-        os.rename(tmp, path)
-        os.rename(path, dead_path)
+        os.replace(tmp, dead_path)
+        # Marker is durable now; removing the original never resurrects a
+        # dead_at-stamped live entry. Best-effort — a leftover live entry
+        # is self-healing (re-marked dead on the next pass).
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
         return dead_path
     except OSError:
+        # Clean up a possibly-orphaned tmp so it doesn't linger.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
         return None

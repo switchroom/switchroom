@@ -9,15 +9,22 @@ the queue no longer drains it but the operator can still inspect via
 
 Boundaries
 ----------
-* Per-entry HTTP timeout: ``HINDSIGHT_DRAIN_TIMEOUT`` (default 5s).
+* Per-entry HTTP timeout: ``HINDSIGHT_DRAIN_TIMEOUT`` (default 5s), but
+  clamped per entry to the budget still remaining (see below) so a
+  single slow entry can never overshoot the wall-clock cap. The default
+  timeout (5s) intentionally exceeds the default budget (4s): the clamp,
+  not the raw timeout, is what bounds a slow entry.
+* Total wall-clock cap: ``HINDSIGHT_DRAIN_BUDGET_S`` (default 4s) so
+  drain never blocks SessionStart longer than the upstream hook timeout
+  permits. This is the authoritative bound; the per-entry timeout is
+  clamped down to ``max(1, remaining budget)`` before each request, so
+  even one slow upstream entry overshoots the budget by at most the
+  clamp floor (~1s), not by ``HINDSIGHT_DRAIN_TIMEOUT - budget``.
 * Stall guard: if ``STALL_THRESHOLD`` (3) consecutive entries fail with
   the same error class, we stop draining for this session — that's a
   systemic outage, not a transient flake, and continuing would only
   burn the SessionStart timeout budget. The remaining entries stay
   queued for the next session.
-* Total wall-clock cap: ``HINDSIGHT_DRAIN_BUDGET_S`` (default 4s) so
-  drain never blocks SessionStart longer than the upstream
-  hook timeout permits.
 
 Standalone usage::
 
@@ -113,13 +120,22 @@ def drain(config: dict | None = None) -> dict:
     last_error_class: str | None = None
 
     for path, entry in entries:
-        if time.monotonic() - started > budget:
+        elapsed = time.monotonic() - started
+        if elapsed > budget:
             summary["budget_exceeded"] = True
             debug_log(config, "drain_pending: total budget exceeded, stopping")
             break
 
+        # Clamp the per-entry HTTP timeout to the budget still remaining
+        # (#1094 item 2). Without this, a single slow entry using the full
+        # HINDSIGHT_DRAIN_TIMEOUT (default 5s) overshoots the total budget
+        # (default 4s). Floor at 1s so we still give a near-exhausted
+        # budget one bounded shot rather than a 0s (instant-fail) request.
+        remaining = budget - elapsed
+        effective_timeout = max(1, min(timeout, int(remaining) if remaining >= 1 else 1))
+
         try:
-            _retry_one(entry, timeout=timeout)
+            _retry_one(entry, timeout=effective_timeout)
         except Exception as e:
             err_class = type(e).__name__
             if err_class == last_error_class:
