@@ -444,3 +444,171 @@ describe("VaultBroker: PUT write-grant identity bind (sec #3084-F4 write path)",
     expect(mismatch).toBeUndefined();
   });
 });
+
+// ─── sec #3084-F2 (write path): entry-scope enforcement on write-grant ────────
+//
+// Companion to the F4 identity-bind block above (landed separately in #3129).
+// The GET token path also enforces the per-entry `scope` keyed on the grant's
+// owning agent (server.ts ~line 1339, #3084-F3). The write (`put`) token path
+// historically skipped it, so an entry's `scope.deny:[agent]` was silently
+// ineffective against an outstanding write-token — the denied agent could
+// still rotate/overwrite the value. This block asserts the OUTCOMES:
+//
+//   F2 — a write-token whose owning agent is in the target entry's `scope.deny`
+//        is REJECTED (`scope-deny`) even when the socket identity binds, and
+//        the value is NOT mutated.
+//
+// Plus an F1 read-back control that goes beyond the audit-only assertions of
+// the F4 block above: it reads the target key back over the owning agent's own
+// socket and proves the byte value is still the original after a denied
+// cross-identity replay (the F4 block asserts "no allowed audit entry"; this
+// asserts the persisted value directly). Both FAIL against the pre-fix broker.
+describe("VaultBroker: PUT write-grant entry scope (sec #3084-F2 write path)", () => {
+  let tmpDir: string;
+  let vaultPath: string;
+  let grantsDb: Database;
+  let auditEntries: AuditEntry[];
+  let prevNonLinuxFlag: string | undefined;
+  let agentsDir: string;
+  let prevAgentsDirEnv: string | undefined;
+  const brokers: VaultBroker[] = [];
+  const PASSPHRASE = "test-pass-phrase-for-identity-and-scope";
+
+  // Build a broker whose EVERY connection is treated as `agentName` (bind
+  // identity), sharing the on-disk vault + grants DB. Unlock so this.passphrase
+  // is populated for the put/saveVault path.
+  async function makeBroker(agentName: string): Promise<string> {
+    const sp = path.join(tmpDir, `${agentName}.sock`);
+    const b = new VaultBroker({
+      _testConfig: makeMinimalConfig(),
+      _testGrantsDb: grantsDb,
+      _testAuditLogger: {
+        write: (e: AuditEntry) => { auditEntries.push(e); return true; },
+        failOpenCount: () => 0,
+      },
+      _testVaultPath: vaultPath,
+      _testAgentName: agentName,
+    });
+    await b.start(sp, undefined, vaultPath);
+    b.unlockFromPassphrase(PASSPHRASE);
+    brokers.push(b);
+    return sp;
+  }
+
+  beforeEach(() => {
+    prevNonLinuxFlag = process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
+    process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX = "1";
+
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "broker-3084-write-test-"));
+    vaultPath = path.join(tmpDir, "vault.enc");
+
+    agentsDir = path.join(tmpDir, "agents");
+    prevAgentsDirEnv = process.env.SWITCHROOM_AGENTS_DIR;
+    process.env.SWITCHROOM_AGENTS_DIR = agentsDir;
+
+    // Seed disk vault: a key writable by agent A, and a scoped entry that
+    // DENIES "denyagent" (read-restriction semantics we now also honour on
+    // write).
+    createVault(PASSPHRASE, vaultPath);
+    setStringSecret(PASSPHRASE, vaultPath, "a_key", "a-original");
+    setStringSecret(
+      PASSPHRASE,
+      vaultPath,
+      "denied_key",
+      "deny-original",
+      undefined,
+      { deny: ["denyagent"] },
+    );
+
+    grantsDb = makeInMemoryGrantsDb();
+    auditEntries = [];
+  });
+
+  afterEach(() => {
+    for (const b of brokers.splice(0)) { try { b.stop(); } catch { /* ignore */ } }
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    if (prevAgentsDirEnv === undefined) delete process.env.SWITCHROOM_AGENTS_DIR;
+    else process.env.SWITCHROOM_AGENTS_DIR = prevAgentsDirEnv;
+    if (prevNonLinuxFlag === undefined) delete process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
+    else process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX = prevNonLinuxFlag;
+  });
+
+  it("F1 read-back: agent B replaying agent A's write-token over B's own socket is REJECTED and the persisted value is unchanged", async () => {
+    // Write-grant belongs to agent A; presented over agent B's socket.
+    const { token } = await mintGrant(grantsDb, "agentA", [], null, "A's write grant", ["a_key"]);
+    const bSocket = await makeBroker("agentB");
+
+    const resp = await rpc(bSocket, {
+      v: 1,
+      op: "put",
+      key: "a_key",
+      entry: { kind: "string", value: "poisoned-by-B" },
+      token,
+    });
+
+    expect(resp.ok).toBe(false);
+    if (!resp.ok) {
+      expect(resp.code).toBe("DENIED");
+      expect(resp.msg).toContain("grant-identity-mismatch");
+    }
+    // Audited as an identity-mismatch on the grant method; never committed.
+    const mismatch = auditEntries.find(
+      (e) => e.op === "put" && e.method === "grant" && String(e.result).includes("grant-identity-mismatch"),
+    );
+    expect(mismatch).toBeDefined();
+    const committed = auditEntries.find((e) => e.op === "put" && e.result === "allowed");
+    expect(committed).toBeUndefined();
+
+    // OUTCOME: the value must still be the original. Read it back over agent
+    // A's own socket with a read grant.
+    const { token: aReadToken } = await mintGrant(grantsDb, "agentA", ["a_key"], null, "A read");
+    const aSocket = await makeBroker("agentA");
+    const getResp = await rpc(aSocket, { v: 1, op: "get", key: "a_key", token: aReadToken });
+    expect(getResp.ok).toBe(true);
+    if (getResp.ok && "entry" in getResp) {
+      expect(getResp.entry).toEqual({ kind: "string", value: "a-original" });
+    }
+  });
+
+  it("F2: a write-token whose owning agent is in the entry's scope.deny is REJECTED (scope-deny) and the value is unchanged", async () => {
+    // Identity binds correctly (denyagent == denyagent) — isolates the scope
+    // check from the identity check. The entry denies denyagent.
+    const { token } = await mintGrant(grantsDb, "denyagent", [], null, "deny write grant", ["denied_key"]);
+    const socket = await makeBroker("denyagent");
+
+    const resp = await rpc(socket, {
+      v: 1,
+      op: "put",
+      key: "denied_key",
+      entry: { kind: "string", value: "overwritten-despite-deny" },
+      token,
+    });
+
+    expect(resp.ok).toBe(false);
+    if (!resp.ok) {
+      expect(resp.code).toBe("DENIED");
+      expect(resp.msg).toContain("scope-deny");
+    }
+    const denied = auditEntries.find(
+      (e) => e.op === "put" && e.method === "grant" && String(e.result).includes("scope-deny"),
+    );
+    expect(denied).toBeDefined();
+    const committed = auditEntries.find((e) => e.op === "put" && e.result === "allowed");
+    expect(committed).toBeUndefined();
+
+    // OUTCOME: value unchanged. Read back as a non-denied agent (scope only
+    // denies "denyagent") to confirm the write never landed.
+    const { token: readToken } = await mintGrant(grantsDb, "readeragent", ["denied_key"], null, "reader read");
+    const readSocket = await makeBroker("readeragent");
+    const getResp = await rpc(readSocket, { v: 1, op: "get", key: "denied_key", token: readToken });
+    expect(getResp.ok).toBe(true);
+    if (getResp.ok && "entry" in getResp) {
+      // The broker strips the scope metadata from the served entry; the
+      // value being the original proves the denied write never landed.
+      expect(getResp.entry.kind).toBe("string");
+      if (getResp.entry.kind === "string") {
+        expect(getResp.entry.value).toBe("deny-original");
+      }
+    }
+  });
+});
