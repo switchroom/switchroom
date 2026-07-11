@@ -519,6 +519,7 @@ import { shouldSuppressRepresent } from './represent-guard.js'
 import { shouldDeferEscalationForBridge } from './escalation-bridge-gate.js'
 import { createInboundSpool } from './inbound-spool.js'
 import { purgeStaleTurnsForChat } from './turn-state-purge.js'
+import { withTurnEndGateBackstop } from './turn-end-gate-backstop.js'
 import { decideInboundDelivery, reserveInboundDelivery } from './inbound-delivery-gate.js'
 import { mayDrainBufferedInbound, shouldArmNoReplyDrain } from './serialize-drain-gate.js'
 import { decideFeedReopen } from './feed-reopen-gate.js'
@@ -15935,6 +15936,24 @@ function handleSessionEvent(ev: SessionEvent): void {
           return
         }
       }
+      // #2094 finding 1 — turn_end gate-wedge backstop. Capture the turn
+      // BEFORE the body runs (the body re-reads currentTurn as `turn`, then
+      // nulls it via endCurrentTurnAtomic on every clean branch). The guarded
+      // finally in withTurnEndGateBackstop forces the canonical purge iff a
+      // throw in a pre-purge op (redactOutboundText, progressDriver?.
+      // takeOverCard, narrative dedup, answer-stream finalize, …) skipped
+      // endCurrentTurnAtomic → purgeReactionTracking, which would otherwise
+      // leave activeTurnStartedAt + claudeBusyKeys populated and wedge the
+      // #1556 inbound gate closed. No-op on the happy path (key already gone).
+      const turnEndBackstopTurn = currentTurn
+      const turnEndBackstopKey =
+        turnEndBackstopTurn != null
+          ? statusKey(turnEndBackstopTurn.sessionChatId, turnEndBackstopTurn.sessionThreadId)
+          : null
+      withTurnEndGateBackstop(
+        turnEndBackstopKey,
+        turnEndBackstopTurn,
+        () => {
       // Drain any still-pending tool dispatch typing entries — covers
       // transcript truncation or a Claude Code crash mid-tool.
       typingWrapper.drainAll()
@@ -16425,9 +16444,12 @@ function handleSessionEvent(ev: SessionEvent): void {
                 // the reaction is only finalized by the `turn_end` IPC
                 // handler — mid-turn delivery proofs (local history,
                 // stream finalize callbacks, executeReply post-send) no
-                // longer transition the emoji. This branch just purges
-                // the per-turn reaction tracking entry and returns.
-                purgeReactionTracking(statusKey(backstopChatId, backstopThreadId))
+                // longer transition the emoji. This branch just returns.
+                // #2094 cosmetic: the per-turn reaction tracking was ALREADY
+                // purged synchronously by endCurrentTurnAtomic (before this
+                // async IIFE ran). The old redundant purgeReactionTracking
+                // here re-fired on an already-cleared key WITHOUT `endingTurn`,
+                // emitting an inconsistent shadow trace. Removed.
                 return
               }
             } catch {}
@@ -16563,9 +16585,13 @@ function handleSessionEvent(ev: SessionEvent): void {
             // #1713: backstop send failed — finalize as error so the
             // turn ends cleanly with 😱 rather than leaving it open.
             if (backstopCtrl) backstopCtrl.finalize('error')
-          } finally {
-            purgeReactionTracking(statusKey(backstopChatId, backstopThreadId))
           }
+          // #2094 cosmetic: the trailing `finally { purgeReactionTracking() }`
+          // was removed. endCurrentTurnAtomic already ran the canonical purge
+          // (with the authoritative `endingTurn`) synchronously before this
+          // async IIFE started, so re-purging here only re-fired on an
+          // already-cleared key without `endingTurn` — an inconsistent shadow
+          // trace. The #2094 finding-1 backstop covers any pre-purge throw.
         })()
         return
       }
@@ -16758,6 +16784,14 @@ function handleSessionEvent(ev: SessionEvent): void {
       // #549 fix — preamble flush already happened at the TOP of this
       // turn_end handler (before turn.answerStream is nulled). See
       // comment near line 3431.
+      return
+        }, // end withTurnEndGateBackstop body (#2094 finding 1)
+        {
+          hasActiveTurn: (k) => activeTurnStartedAt.has(k),
+          purge: (k, endingTurn) => purgeReactionTracking(k, endingTurn),
+          log: (m) => process.stderr.write(m + '\n'),
+        },
+      )
       return
     }
   }
@@ -26220,16 +26254,22 @@ function flushReactionBatch(batch: ReactionBatch): void {
     text,
     meta,
   }
-  const delivered = ipcServer.sendToAgent(agentName, inbound)
-  if (delivered) markClaudeBusyForInbound(inbound)
+  // #2094 finding 3 — route the reaction flush through the SAME #1556
+  // decideInboundDelivery gate every other synthetic inbound uses (via
+  // deliverResumeSyntheticOrBuffer), instead of a raw ipcServer.sendToAgent.
+  // A reaction that lands WHILE a turn is in flight was previously fired
+  // mid-turn — the bridge typed it into the CLI composer where it stranded
+  // by the turn-completion race (the #1556 composer wedge). Now a mid-turn
+  // reaction buffers-until-idle (the turn-complete hook + idle-drain timer
+  // flush pendingInboundBuffer the instant claude goes idle, landing cleanly
+  // as a fresh turn); an idle reaction delivers now, buffering only on a
+  // genuine bridge-offline miss — the #1150 buffer-on-failure guarantee,
+  // preserved inside the helper.
+  const delivered = deliverResumeSyntheticOrBuffer(agentName, inbound)
   process.stderr.write(
     `telegram gateway: reactions.dispatch agent=${agentName} chat=${batch.chatId} ` +
     `count=${batch.reactions.length} batched=${batch.batched} delivered=${delivered}\n`,
   )
-  // #1150: buffer-on-failure for reaction-triggered wake-ups too.
-  if (!delivered) {
-    pendingInboundBuffer.push(agentName, inbound)
-  }
 }
 
 // ─── Inbound message_reaction handler ────────────────────────────────────
