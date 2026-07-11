@@ -2,6 +2,77 @@
 
 ## Unreleased
 
+## v0.18.11 — Rollouts you can watch, poll, and survive
+
+### Rich checklist rollout narration with per-agent progress (#3047)
+
+The fleet-rollout progress DM grows from a one-line edited message into
+a progress-card-style multi-line checklist — header with
+from-version → target and a short request id, phase line, a per-agent
+checklist (✓ done with restart duration / ⏳ in progress / · pending /
+✗ failed, canary called out), and a footer with rolled n/m, elapsed,
+and a rough ETA from the mean per-agent duration so far. The terminal
+summary lists the deferred host-side components, each with the exact
+command that updates it. Still an ordinary edited message (NOT pinned),
+with the same debounce, monotonic seq gate, freeze-on-terminal, and
+anti-storm cap.
+
+### hostd survives an invalid switchroom.yaml — degraded mode, not crash-loop (#3045)
+
+Live incident 2026-07-11: a duplicate-key `switchroom.yaml` exit-1
+crash-looped hostd silently and stalled a mid-self-bump rollout. hostd
+now enters a **degraded mode**: the process stays alive, retries
+`loadConfig()` every 15s and on config-file change, writes a root-owned
+marker (`~/.switchroom/hostd/config-degraded.json`), and DMs the
+operator once on entry and again on recovery via the first reachable
+agent gateway. A pending self-bump rollout marker no longer ages out
+during the outage — its clock is shifted forward by the degraded
+duration so the 15-min budget only counts time hostd could actually
+act. New `switchroom config check [--file <path>]` runs the exact
+production load path so agents can pre-validate a candidate config
+before writing it.
+
+### Web refreshes in-plan; update_apply steers to rollout (#3048)
+
+Every agent-driven roll left `switchroom-web` silently a version behind
+(observed: fleet v0.18.10, web v0.18.9). The hostd-context rollout plan
+now includes a `refresh-web` step (after the agent restarts, before
+`refresh-hindsight`; honors `--skip-web`) — safe because web is a
+separate compose project with no dependency on the in-flight roll.
+`webd install` is hardened for in-hostd use (`resolveWebHostHome()`
+prefers `SWITCHROOM_HOST_HOME`, refuses a `/host-home` bind source,
+chowns the compose dir back to the operator uid). A failed web refresh
+stays non-fatal but names the exact recovery command. And
+`update_apply` now steers version rolls toward `rollout`: a semver tag
+pin appends an advisory to the successful result.
+
+### get_status can finally poll a rollout by request_id (#3046)
+
+The MCP `get_status` tool took no arguments and only read the last
+terminal `update_apply` audit row — while the `rollout` tool's own
+description told callers to poll it with a request_id. It now accepts
+an optional `request_id` and RPCs hostd's per-request wire status
+(phase, n/m, rolled[], failedStep/failedAgent, pin), including the
+durable-log fallback that survives a hostd self-bump restart. No-arg
+behavior is unchanged; both tool descriptions rewritten to be
+consistent.
+
+### RFC: shared knowledge banks (#3049)
+
+Authors `reference/rfcs/shared-knowledge-banks.md` — operator-sanctioned
+cross-agent lesson sharing (`memory.shared_banks` in switchroom.yaml,
+explicit-only writes with provenance tags, reads riding the existing
+`additional_banks` merge with the score-sorted cap). Closes the
+dangling reference from the merged reimagined-memory RFC. Design
+document only; no runtime change.
+
+### New vector logo assets (#3052)
+
+The final brand pack lands: replaced favicon / apple-touch-icon in
+`src/web/ui/`, new `docs/assets/switchroom-logo.png`, and the hero
+image's top-left icon re-composited. Static assets only, no code
+changes.
+
 ## v0.18.10 — The fleet swaps accounts before the wall, not after
 
 ### Proactive auth failover — soft-avoid, probe rolls, honest announcements (#3031: #3032, #3036, #3035, #3034)
