@@ -57,6 +57,15 @@ export interface DisconnectFlushDeps<Ctrl extends { finalize: (reason?: 'done' |
   /** Progress driver — disposed with `preservePending: true` for sub-agent JTBDs (#393). */
   disposeProgressDriver: () => void
 
+  /** #2650: stop EVERY live turn-typing loop (the per-(chat,thread)
+   *  `setInterval` started by `turn-typing-loop.ts`). The bridge just died
+   *  mid-turn; its turn-long `typing…` loop is never stopped by the canonical
+   *  turn-end (which will never arrive), so a stale "typing…" shows to the user
+   *  until the next turn's `start()` self-heals it. Wire to
+   *  `() => turnTypingLoop.stopAll()`. Called ONLY on a registered-agent
+   *  disconnect — an anonymous one-shot never owned a turn-typing loop. */
+  stopTurnTypingLoops: () => void
+
   /** Optional: called when the registered-agent disconnect found dangling
    *  `activeTurnStartedAt` entries the controller loop did not clear (i.e.
    *  `finalize()` already ran on the canonical reply path, leaving
@@ -92,6 +101,7 @@ export function flushOnAgentDisconnect<
     activeDraftStreams,
     clearActiveReactions,
     disposeProgressDriver,
+    stopTurnTypingLoops,
     onDanglingTurnsSwept,
     log,
   } = deps
@@ -180,6 +190,15 @@ export function flushOnAgentDisconnect<
   // heartbeat continues for preserved chats so elapsed-time ticks and the
   // deferred-completion-timeout path remain active. Fix for #393.
   disposeProgressDriver()
+
+  // #2650: sweep the turn-typing loops. The bridge died mid-turn, so the
+  // canonical turn-end that would normally call `turnTypingLoop.stop` will
+  // never arrive — every live per-(chat,thread) `typing…` interval is now
+  // orphaned and would show a stale "typing…" to the user until the next
+  // turn's `start()` self-heals it. This is gated to a real registered-agent
+  // disconnect (we returned early above for anonymous clients), so an
+  // anonymous one-shot never triggers the sweep.
+  stopTurnTypingLoops()
 
   // Finalize any open draft streams so they don't hang mid-edit.
   for (const [key, stream] of activeDraftStreams.entries()) {

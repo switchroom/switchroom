@@ -64,6 +64,7 @@ function flushDeps(claudeBusyKeys: Set<string>, claudeBusyKeySince: Map<string, 
     activeDraftStreams: new Map(),
     clearActiveReactions: vi.fn(),
     disposeProgressDriver: vi.fn(),
+    stopTurnTypingLoops: vi.fn(), // #2650: required dep — turn-typing sweep on bridge death
     log: vi.fn(),
   }
 }

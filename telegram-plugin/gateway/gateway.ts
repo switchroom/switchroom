@@ -9572,6 +9572,11 @@ const ipcServer: IpcServer = createIpcServer({
         // scripts/check-plugin-references.mjs (TS2722).
         progressDriver?.dispose?.({ preservePending: true })
       },
+      // #2650: the bridge died mid-turn — its turn-long `typing…` loop never
+      // hits the canonical turn-end stop, leaving a stale "typing…" until the
+      // next turn. Sweep every live loop here (gated to registered-agent
+      // disconnect inside flushOnAgentDisconnect).
+      stopTurnTypingLoops: () => turnTypingLoop.stopAll(),
       // When dangling activeTurnStartedAt keys were swept (setDone raced
       // disconnect), the module-scope `currentTurn` may also point at the
       // dead bridge's turn. Null it so the next inbound starts a fresh
