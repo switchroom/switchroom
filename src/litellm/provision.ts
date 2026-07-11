@@ -9,7 +9,9 @@
  *
  * The operations:
  *   - ensureTeam: create the "switchroom" LiteLLM team (idempotent — an
- *     "already exists" response is treated as success).
+ *     "already exists" response is treated as success). Returns the team's
+ *     `team_id` (the UUID `/team/new` hands back, or resolved via `/team/list`
+ *     on the already-exists path) so keys can be bound to the team.
  *   - ensureKey: generate a per-agent virtual key under the team. Self-heals an
  *     ORPHANED key alias: LiteLLM enforces unique key aliases (upstream
  *     issue #9730), so if a prior apply generated the alias but crashed before
@@ -19,8 +21,10 @@
  *   - validateKey: probe a stored virtual key against the proxy (GET /key/info)
  *     to detect DB drift (proxy DB reset / restore without the vault).
  *
- * LiteLLM admin API reference (v1.91 shapes): POST {base}/team/new,
- * POST {base}/key/generate, GET {base}/key/info?key=..., GET {base}/key/list,
+ * LiteLLM admin API reference (v1.91 shapes): POST {base}/team/new (returns a
+ * LiteLLM_TeamTable carrying `team_id`), GET {base}/team/list (each entry
+ * carries `team_id` + `team_alias`), POST {base}/key/generate (binds to a team
+ * via `team_id`), GET {base}/key/info?key=..., GET {base}/key/list,
  * POST {base}/key/delete — authenticated with the master key as a Bearer token.
  */
 
@@ -59,8 +63,15 @@ export interface EnsureKeyOpts {
   alias: string;
   /** Optional model allowlist for the key. Omit ⇒ team/all models. */
   models?: string[];
-  /** Team alias the key is created under (e.g. "switchroom"). */
-  team?: string;
+  /**
+   * Team id (the UUID `/team/new` returns) the key is bound under. LiteLLM's
+   * `/key/generate` associates a key with a team via `team_id` — NOT via
+   * `team_alias`, which is not a `GenerateKeyRequest` field and is silently
+   * ignored (LiteLLM v1.91 `litellm/proxy/_types.py`: `GenerateRequestBase`
+   * carries `team_id`, no `team_alias`). Per-team spend/budget tracking only
+   * applies when `team_id` is sent — omit ⇒ the key lands UNBOUND to any team.
+   */
+  teamId?: string;
   /** Arbitrary metadata tags attached to the key. */
   metadata?: Record<string, string>;
   /**
@@ -119,16 +130,24 @@ function looksLikeUnknownKey(status: number, body: string): boolean {
 }
 
 /**
- * Create the LiteLLM team if it doesn't already exist. Idempotent: an
- * "already exists" response (or 409) is treated as success.
+ * Create the LiteLLM team if it doesn't already exist, and return its
+ * `team_id`. Idempotent: an "already exists" response (or 409) is treated as
+ * success and the id is resolved by alias via `/team/list`.
+ *
+ * The returned `team_id` is what binds generated keys to the team
+ * (`ensureKey`'s `teamId`). It is best-effort: if the id cannot be read from
+ * the create response or resolved on the already-exists path, `undefined` is
+ * returned rather than throwing — the provision still succeeds, the key just
+ * falls back to unbound (the pre-fix behavior) instead of failing the apply.
  */
 export async function ensureTeam(
   baseUrl: string,
   masterKey: string,
   teamName: string,
   fetchFn: FetchFn = fetch,
-): Promise<void> {
-  const url = `${normalizeBase(baseUrl)}/team/new`;
+): Promise<string | undefined> {
+  const base = normalizeBase(baseUrl);
+  const url = `${base}/team/new`;
   let resp: Response;
   try {
     resp = await fetchFn(url, {
@@ -141,14 +160,83 @@ export async function ensureTeam(
       `LiteLLM /team/new request failed: ${(err as Error).message}`,
     );
   }
-  if (resp.ok) return;
+  if (resp.ok) {
+    // Fresh create: the response is a LiteLLM_TeamTable carrying the new
+    // team_id (the UUID keys must be bound to).
+    return await readTeamId(resp);
+  }
   const body = await safeText(resp);
-  if (looksLikeAlreadyExists(resp.status, body)) return; // idempotent
+  if (looksLikeAlreadyExists(resp.status, body)) {
+    // Idempotent: the team already exists, so /team/new did NOT hand back the
+    // id — resolve it by alias via /team/list so keys can still be bound.
+    return await resolveTeamIdByAlias(base, masterKey, teamName, fetchFn);
+  }
   throw new LiteLLMProvisionError(
     `LiteLLM /team/new returned ${resp.status}`,
     resp.status,
     body,
   );
+}
+
+/**
+ * Best-effort: pull `team_id` out of a `/team/new` (LiteLLM_TeamTable) body. A
+ * missing / unparseable id is non-fatal — it just means the caller can't bind
+ * the key to the team (the pre-fix behavior), so we degrade rather than throw.
+ */
+async function readTeamId(resp: Response): Promise<string | undefined> {
+  let json: unknown;
+  try {
+    json = await resp.json();
+  } catch {
+    return undefined;
+  }
+  const id = (json as { team_id?: unknown } | null)?.team_id;
+  return typeof id === "string" && id.length > 0 ? id : undefined;
+}
+
+/**
+ * Resolve an existing team's `team_id` from its `team_alias` via GET
+ * /team/list (each entry is a LiteLLM_TeamTable carrying both `team_id` and
+ * `team_alias`; some versions wrap the array as `{teams:[...]}`). Best-effort:
+ * any failure returns undefined so an idempotent re-apply still succeeds.
+ */
+async function resolveTeamIdByAlias(
+  base: string,
+  masterKey: string,
+  teamName: string,
+  fetchFn: FetchFn,
+): Promise<string | undefined> {
+  let resp: Response;
+  try {
+    resp = await fetchFn(`${base}/team/list`, {
+      method: "GET",
+      headers: authHeaders(masterKey),
+    });
+  } catch {
+    return undefined;
+  }
+  if (!resp.ok) return undefined;
+  let json: unknown;
+  try {
+    json = await resp.json();
+  } catch {
+    return undefined;
+  }
+  const teams: unknown[] = Array.isArray(json)
+    ? json
+    : Array.isArray((json as { teams?: unknown } | null)?.teams)
+      ? (json as { teams: unknown[] }).teams
+      : [];
+  for (const t of teams) {
+    if (t && typeof t === "object") {
+      const alias = (t as { team_alias?: unknown }).team_alias;
+      const id = (t as { team_id?: unknown }).team_id;
+      if (alias === teamName && typeof id === "string" && id.length > 0) {
+        return id;
+      }
+    }
+  }
+  return undefined;
 }
 
 /** Internal outcome of a single /key/generate POST. */
@@ -164,7 +252,8 @@ async function generateKeyOnce(opts: EnsureKeyOpts, fetchFn: FetchFn): Promise<G
     key_alias: opts.alias,
   };
   if (opts.models && opts.models.length > 0) payload.models = opts.models;
-  if (opts.team) payload.team_alias = opts.team;
+  // Bind the key to the team via team_id — LiteLLM ignores team_alias here.
+  if (opts.teamId) payload.team_id = opts.teamId;
   if (opts.metadata && Object.keys(opts.metadata).length > 0) {
     payload.metadata = opts.metadata;
   }
