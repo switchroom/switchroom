@@ -165,6 +165,44 @@ class SessionEndPendingTest(unittest.TestCase):
         # error_class derives from the original urllib.error.URLError
         self.assertIn("URLError", entry["error_class"])
 
+    def test_retain_failure_without_payload_exits_dropped_not_queued(self):
+        # #1094 item 5: when run_retain reports failed but has NO payload
+        # to queue (failure before a payload was built), nothing lands in
+        # pending-retains — so the exit code must be EXIT_DROPPED (2),
+        # not EXIT_QUEUED (1), which would falsely claim it was queued.
+        hook_input = {
+            "session_id": "sess-1",
+            "transcript_path": self._transcript,
+            "cwd": self._home,
+            "reason": "end",
+        }
+        stdin_data = io.StringIO(json.dumps(hook_input))
+        stderr_capture = io.StringIO()
+
+        for mod_name in ("session_end", "retain", "lib.pending", "lib.daemon"):
+            sys.modules.pop(mod_name, None)
+
+        import session_end as session_end_mod  # noqa: WPS433
+
+        def fake_run_retain(hook_input, force=False):
+            return {"status": "failed", "error": RuntimeError("url unresolved"), "payload": None}
+
+        with (
+            patch("sys.stdin", stdin_data),
+            patch("sys.stderr", stderr_capture),
+            patch("retain.run_retain", side_effect=fake_run_retain),
+            patch("session_end.stop_daemon", return_value=None),
+        ):
+            exit_code = session_end_mod.main()
+
+        self.assertEqual(exit_code, session_end_mod.EXIT_DROPPED)
+        self.assertEqual(exit_code, 2)
+        # Nothing should have been written to the queue.
+        if os.path.isdir(self._pending):
+            self.assertEqual(
+                [n for n in os.listdir(self._pending) if n.endswith(".json")], []
+            )
+
     def test_retain_failure_still_runs_daemon_stop(self):
         def boom(*a, **kw):
             raise urllib.error.URLError("nope")

@@ -144,6 +144,50 @@ class PendingQueueTest(unittest.TestCase):
         # iter_entries no longer surfaces .dead files
         self.assertEqual(pending_mod.iter_entries(), [])
 
+    def test_mark_dead_never_leaves_live_entry_with_dead_at(self):
+        # Crash-window invariant (#1094 item 3): the dead_at stamp must
+        # only ever land on <path>.dead, never on the live <path>.json.
+        # The old two-step form wrote dead_at to the live path first;
+        # simulate a crash *between* the two visible transitions by
+        # stubbing the SECOND os.replace/os.rename so it raises, then
+        # assert no live .json entry carries dead_at.
+        path = pending_mod.enqueue(self._sample_payload(), RuntimeError("boom"))
+        _, entry = pending_mod.iter_entries()[0]
+
+        real_replace = os.replace
+        calls = {"n": 0}
+
+        def replace_fail_after_first(src, dst):
+            # First replace = tmp -> dead_path (the marker). Let it run.
+            # Any later mutation would be the pre-fix live-path write —
+            # there is none in the new single-transition form, but if a
+            # regression reintroduces it, blow up here.
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_replace(src, dst)
+            raise OSError("simulated crash mid-mark_dead")
+
+        with patch("os.replace", side_effect=replace_fail_after_first):
+            pending_mod.mark_dead(path, entry)
+
+        # No live .json entry may carry dead_at.
+        for _p, e in pending_mod.iter_entries():
+            self.assertNotIn(
+                "dead_at", e, "a live queue entry must never carry dead_at"
+            )
+        # The .dead marker exists and carries dead_at.
+        dead = path + ".dead"
+        self.assertTrue(os.path.isfile(dead))
+        with open(dead) as f:
+            self.assertIn("dead_at", json.load(f))
+
+    def test_mark_dead_no_tmp_left_behind(self):
+        path = pending_mod.enqueue(self._sample_payload(), RuntimeError("boom"))
+        _, entry = pending_mod.iter_entries()[0]
+        pending_mod.mark_dead(path, entry)
+        leftovers = [n for n in os.listdir(self._dir) if n.endswith(".tmp")]
+        self.assertEqual(leftovers, [])
+
     def test_count_safe_when_dir_missing(self):
         self.assertEqual(pending_mod.count(), 0)
 

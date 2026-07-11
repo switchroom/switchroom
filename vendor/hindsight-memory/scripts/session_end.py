@@ -40,7 +40,16 @@ from lib.pending import MAX_ENTRIES, count as pending_count, enqueue as pending_
 # Exit codes:
 #   0 — success (or retain skipped for benign reasons)
 #   1 — retain failed AND was queued to pending-retains (recoverable)
-#   2 — retain failed AND the queue rejected it (chronic backlog)
+#   2 — retain failed but nothing was queued — either the queue rejected
+#       it (chronic backlog) or there was no payload to queue (the
+#       failure happened before one was built). Not recoverable via the
+#       pending-retains drain, so it's semantically "dropped", not
+#       "queued".
+# Only the sign of the exit code is load-bearing downstream: Claude
+# Code's hook runner routes any non-zero SessionEnd exit to the issue
+# sink (bin/run-hook.sh / #424); nothing distinguishes 1 from 2
+# programmatically, so this is a correctness/clarity fix, not a
+# contract change.
 EXIT_OK = 0
 EXIT_QUEUED = 1
 EXIT_DROPPED = 2
@@ -98,8 +107,10 @@ def main() -> int:
                     exit_code = EXIT_QUEUED
             else:
                 # No payload to queue — the failure happened before we
-                # finished building one (e.g. URL resolution).
-                exit_code = EXIT_QUEUED
+                # finished building one (e.g. URL resolution). Nothing
+                # landed in pending-retains, so this is a drop, not a
+                # queue (#1094 item 5): EXIT_DROPPED, not EXIT_QUEUED.
+                exit_code = EXIT_DROPPED
 
     # Stop daemon if we started it. Always runs, even on retain failure,
     # so we don't leak a daemon process.

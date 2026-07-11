@@ -93,15 +93,22 @@ class HindsightClient:
                 pass
             raise RuntimeError(f"HTTP {e.code} from {url}: {body_text}") from e
 
-    def health_check(self, timeout: int = 5) -> bool:
+    def health_check(self, timeout: int = 5, retries: int = HEALTH_CHECK_RETRIES) -> bool:
         """Check if the Hindsight server is reachable.
 
-        Mirrors Openclaw's checkExternalApiHealth: retries up to 3 times
-        with 2s delay between attempts.
+        Mirrors Openclaw's checkExternalApiHealth: retries up to
+        ``retries`` times (default ``HEALTH_CHECK_RETRIES`` = 3) with
+        ``HEALTH_CHECK_DELAY`` (2s) between attempts.
+
+        Time-budgeted callers (e.g. the SessionStart drain gate,
+        #1094) should pass ``retries=1``: against a HUNG server the
+        default loop costs ~retries*timeout + (retries-1)*delay of wall
+        clock, which blows a 5s hook budget.
         """
         import time
 
-        for attempt in range(1, HEALTH_CHECK_RETRIES + 1):
+        retries = max(1, retries)
+        for attempt in range(1, retries + 1):
             try:
                 url = f"{self.api_url}/health"
                 req = urllib.request.Request(url, headers=self._headers(), method="GET")
@@ -110,7 +117,7 @@ class HindsightClient:
                         return True
             except Exception:
                 pass
-            if attempt < HEALTH_CHECK_RETRIES:
+            if attempt < retries:
                 time.sleep(HEALTH_CHECK_DELAY)
         return False
 

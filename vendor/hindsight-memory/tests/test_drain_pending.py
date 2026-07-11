@@ -162,6 +162,74 @@ class DrainPendingTest(unittest.TestCase):
         remaining = [n for n in os.listdir(self._pending) if n.endswith(".json")]
         self.assertEqual(len(remaining), 10)
 
+    def test_per_entry_timeout_clamped_to_remaining_budget(self):
+        # #1094 item 2: default HINDSIGHT_DRAIN_TIMEOUT (5) exceeds the
+        # budget (4 here), so the effective per-entry timeout must be
+        # clamped DOWN to the remaining budget — never the raw 5s.
+        self._env.stop()
+        self._env = patch.dict(
+            os.environ,
+            {
+                "HINDSIGHT_PENDING_DIR": self._pending,
+                "HINDSIGHT_DRAIN_TIMEOUT": "5",
+                "HINDSIGHT_DRAIN_BUDGET_S": "4",
+            },
+            clear=False,
+        )
+        self._env.start()
+
+        _seed_entry(self._pending)
+        import drain_pending
+
+        seen = {"timeout": None}
+
+        def capture(*a, **kw):
+            seen["timeout"] = kw.get("timeout")
+            raise urllib.error.URLError("down")
+
+        with patch("urllib.request.urlopen", side_effect=capture):
+            drain_pending.drain({})
+
+        self.assertIsNotNone(seen["timeout"])
+        # Clamped to the ~4s budget remaining, not the raw 5s timeout.
+        self.assertLessEqual(seen["timeout"], 4)
+        self.assertGreaterEqual(seen["timeout"], 1)
+
+    def test_slow_entry_cannot_overshoot_budget_beyond_clamp_floor(self):
+        # A single slow entry must not blow the wall-clock budget by
+        # HINDSIGHT_DRAIN_TIMEOUT - budget. With the clamp, overshoot is
+        # bounded by the 1s clamp floor (+ scheduling epsilon).
+        self._env.stop()
+        self._env = patch.dict(
+            os.environ,
+            {
+                "HINDSIGHT_PENDING_DIR": self._pending,
+                "HINDSIGHT_DRAIN_TIMEOUT": "5",
+                "HINDSIGHT_DRAIN_BUDGET_S": "2",
+            },
+            clear=False,
+        )
+        self._env.start()
+
+        _seed_entry(self._pending)
+        import drain_pending
+
+        def slow_then_fail(*a, **kw):
+            # Sleep exactly as long as the timeout the drainer granted —
+            # emulates a request that runs to its (clamped) timeout.
+            time.sleep(kw.get("timeout", 5))
+            raise urllib.error.URLError("timed out")
+
+        started = time.monotonic()
+        with patch("urllib.request.urlopen", side_effect=slow_then_fail):
+            drain_pending.drain({})
+        elapsed = time.monotonic() - started
+
+        # Budget is 2s; clamped timeout is min(5, ~2)=2, so ~2s of sleep.
+        # Without the clamp the entry would sleep the full 5s. Assert we
+        # stay near the budget, well under the raw 5s timeout.
+        self.assertLess(elapsed, 4.0)
+
     def test_drain_mixed_success_failure(self):
         # Three entries: server returns alternating ok/fail/ok.
         _seed_entry(self._pending, document_id="doc-a")
