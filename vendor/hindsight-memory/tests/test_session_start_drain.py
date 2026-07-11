@@ -109,6 +109,36 @@ class SessionStartDrainGateTest(unittest.TestCase):
         with open(path) as f:
             self.assertEqual(json.load(f)["attempt_count"], 1)
 
+    def test_mode1_down_probe_is_single_attempt_no_retry_sleeps(self):
+        # #3059 review finding: against a HUNG external server the
+        # default 3-retry health_check costs ~10s (3 timeouts + 2*2s
+        # sleeps) inside the 5s SessionStart hook. The gate must issue
+        # exactly ONE probe attempt and never sleep between retries.
+        _seed_entry(self._pending, attempt=1)
+
+        calls = {"urlopen": 0}
+
+        def hang_timeout(*a, **kw):
+            calls["urlopen"] += 1
+            raise TimeoutError("simulated hung server")
+
+        started = time.monotonic()
+        with (
+            patch("urllib.request.urlopen", side_effect=hang_timeout),
+            patch(
+                "time.sleep",
+                side_effect=AssertionError("gate must not sleep between retries"),
+            ),
+            patch("drain_pending.drain") as drained,
+        ):
+            self._run()
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(calls["urlopen"], 1)
+        drained.assert_not_called()
+        # No real network, no retry sleeps -> effectively instant.
+        self.assertLess(elapsed, 3.0)
+
     def test_mode1_healthy_server_runs_drain(self):
         _seed_entry(self._pending, attempt=1)
 

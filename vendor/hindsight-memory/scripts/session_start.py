@@ -62,7 +62,12 @@ def main():
     # needs an explicit probe here. On failure, skip the drain and return
     # (no local daemon to pre-start in Mode 1 — the external server is the
     # operator's responsibility); queued entries stay for the next session.
-    if config.get("hindsightApiUrl") and not client.health_check(timeout=2):
+    # Single bounded attempt (retries=1, timeout=2): the default 3-retry
+    # health_check against a HUNG (timing-out) server would cost ~10s
+    # (3*2s timeouts + 2*2s sleeps) — worse than the attempt-counter
+    # bumps this gate prevents, and over the 5s SessionStart hook budget.
+    # Worst-case probe cost here is ~2s.
+    if config.get("hindsightApiUrl") and not client.health_check(timeout=2, retries=1):
         debug_log(
             config,
             f"External Hindsight at {api_url} unreachable, skipping drain",
