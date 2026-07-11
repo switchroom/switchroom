@@ -46,6 +46,22 @@ apply post-upgrade its content is migrated below the marker and the file
 is renamed to `workspace/CLAUDE.custom.md.deprecated` (one-time, logged).
 Edit CLAUDE.md below the marker directly from now on.
 
+### Lane 2 fleet defaults content — the colleague-posture brain (#1855)
+
+`~/.switchroom/fleet/CLAUDE.md` now ships the real lane-2 fleet defaults
+instead of a placeholder. The content (rendered from the new
+`src/agents/fleet-defaults.ts` module and seeded `writeIfMissing` on
+`switchroom apply`) is the fleet-wide brain every agent inherits via
+`--add-dir ~/.switchroom/fleet`: operating principles (verify before
+claiming, ask one good question, read the real state, match the user's
+energy, scoped-proactive, never route around the leash), a universal
+privilege and approval map, the concision norm, a tool-family catalogue,
+and the two-layer CLAUDE.md model. It carries a machine-readable
+`switchroom-fleet-defaults-version` header tag for the planned doctor
+probe (#1858) and refresh verb (#1859). Operator edits are never
+clobbered. The Telegram 5-beats stay in the release-pinned L1 invariants,
+and the AI-tell ban list stays in per-agent SOUL.md.
+
 ## v0.18.11 — Rollouts you can watch, poll, and survive
 
 ### Rich checklist rollout narration with per-agent progress (#3047)
