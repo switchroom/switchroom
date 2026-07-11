@@ -187,7 +187,7 @@ import {
   retryWithThreadFallback,
   isPhotoDimensionRejectError,
 } from '../retry-api-call.js'
-import { classifyPhotoFile } from '../photo-precheck.js'
+import { classifyPhotoFile, rerouteResultSuffix } from '../photo-precheck.js'
 import { installTgPostLogger, withTgPostTags } from '../shared/bot-runtime.js'
 import { floodStatePath, makeFloodWaitRecorder } from '../flood-circuit-breaker.js'
 import { buildAttachmentPath, assertInsideInbox } from '../attachment-path.js'
@@ -12022,11 +12022,20 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // sends the offender as a document on the first attempt. Probe
   // failures keep the photo route; the reactive #3022 fallback backstops.
   const photoPrecheck = new Map<string, ReturnType<typeof classifyPhotoFile>>()
+  // #3038 polish: files that ultimately went out as documents despite a
+  // photo extension (precheck reroute or reactive fallback). Feeds two
+  // honesty surfaces: the reply tool result suffix (so the agent doesn't
+  // claim an inline image rendered) and attachment_kinds history (record
+  // what was actually sent).
+  const documentReroutes: Array<{ path: string; reason: string }> = []
+  const sentAsDocument = new Set<string>()
   for (const f of files) {
     if (!PHOTO_EXTS.has(extname(f).toLowerCase())) continue
     const cls = classifyPhotoFile(f)
     photoPrecheck.set(f, cls)
     if (cls.route === 'document') {
+      documentReroutes.push({ path: f, reason: cls.reason })
+      sentAsDocument.add(f)
       process.stderr.write(
         `telegram gateway: photo-precheck rerouting ${f} as document (${cls.reason})\n`,
       )
@@ -12040,6 +12049,12 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // user's device fires one notification for the album instead of N
   // (notification-budget protection per the issue's JTBD note). Falls
   // back to the per-file path for any non-all-photo set.
+  //
+  // #3038 known tradeoff: ONE precheck-rerouted photo in the set drops
+  // the WHOLE album to per-file sends — the user gets N notifications
+  // instead of 1. Deliberate: sendMediaGroup can't mix photo and
+  // document media, and a partial album plus a stray document is more
+  // confusing than N files. Revisit only if mixed albums become common.
   const allPhotos = files.length >= 2 && files.length <= 10
     && files.every(sendableAsPhoto)
   // #1075: thread-id-bearing file sends. Mirror the chunk-loop's
@@ -12097,7 +12112,12 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
         `falling back to per-file sendDocument\n`,
       )
       sent = []
-      for (const f of files) sent.push(await sendAsDocument(f))
+      const albumReason = 'Telegram rejected the photo album; whole album re-sent as documents'
+      for (const f of files) {
+        sent.push(await sendAsDocument(f))
+        sentAsDocument.add(f)
+        documentReroutes.push({ path: f, reason: albumReason })
+      }
     }
     if (threadId != null) {
       // If the fallback dropped the thread id, propagate that decision
@@ -12143,6 +12163,8 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
           `falling back to sendDocument\n`,
         )
         sent = await sendAsDocument(f)
+        sentAsDocument.add(f)
+        documentReroutes.push({ path: f, reason: 'Telegram rejected it as a photo; re-sent as document' })
       }
       // Mirror the threadId-clear above so the *next* file in the
       // loop skips the doomed thread without paying for another
@@ -12154,9 +12176,13 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     }
   }
 
-  const result = sentIds.length === 1
+  // #3038: surface photo→document reroutes in the tool result — the
+  // agent otherwise only "sees" success and may tell the user an inline
+  // image rendered when it went out as a file attachment.
+  const result = (sentIds.length === 1
     ? `sent (id: ${sentIds[0]})`
-    : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`
+    : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`)
+    + rerouteResultSuffix(documentReroutes)
 
   if (HISTORY_ENABLED && sentIds.length > 0) {
     try {
@@ -12166,9 +12192,14 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
       const attachKinds: (string | null)[] = []
       for (let i = 0; i < textCount; i++) { texts.push(chunks[i] ?? ''); attachKinds.push(null) }
       for (let i = 0; i < fileCount; i++) {
-        const ext = extname(files[i] ?? '').toLowerCase()
-        texts.push(`(${PHOTO_EXTS.has(ext) ? 'photo' : 'document'}: ${files[i]})`)
-        attachKinds.push(PHOTO_EXTS.has(ext) ? 'photo' : 'document')
+        const f = files[i] ?? ''
+        const ext = extname(f).toLowerCase()
+        // #3038: record what was ACTUALLY sent — a photo-extension file
+        // rerouted to sendDocument (precheck or reactive fallback) is a
+        // 'document' in history, not a 'photo' from its raw extension.
+        const kind = PHOTO_EXTS.has(ext) && !sentAsDocument.has(f) ? 'photo' : 'document'
+        texts.push(`(${kind}: ${f})`)
+        attachKinds.push(kind)
       }
       recordOutbound({ chat_id, thread_id: threadId ?? null, message_ids: sentIds, texts, attachment_kinds: attachKinds })
     } catch (err) {

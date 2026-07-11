@@ -19,6 +19,7 @@ import {
   probeImageFile,
   photoSendViolation,
   classifyPhotoFile,
+  rerouteResultSuffix,
   PHOTO_MAX_BYTES,
 } from '../photo-precheck.js'
 
@@ -142,10 +143,98 @@ describe('probeImageFile + classifyPhotoFile', () => {
     expect(classifyPhotoFile(p)).toEqual({ route: 'photo' })
   })
 
+  // #3038 item 3 — probeImageFile now does fixed-size header reads
+  // (openSync + 32 bytes; 64KB window for JPEG) instead of readFileSync.
+  // Pin correctness on the same fixture set across every format.
+  it('probes JPEG / GIF / WebP files on disk (fixed-size read path)', () => {
+    const j = join(dir, 'shot.jpg')
+    writeFileSync(j, jpegBuffer(1179, 2556))
+    expect(probeImageFile(j)).toMatchObject({ width: 1179, height: 2556 })
+
+    const g = join(dir, 'anim.gif')
+    writeFileSync(g, gifBuffer(320, 240))
+    expect(probeImageFile(g)).toMatchObject({ width: 320, height: 240 })
+
+    const w = join(dir, 'pic.webp')
+    writeFileSync(w, webpVp8xBuffer(1920, 1080))
+    expect(probeImageFile(w)).toMatchObject({ width: 1920, height: 1080 })
+  })
+
+  it('probes the 600x8717 incident image without reading the whole multi-MB file', () => {
+    // Header + 5MB of body: the probe must report full file size but
+    // still read dimensions from the fixed-size header window.
+    const p = join(dir, 'incident.png')
+    const body = Buffer.alloc(5 * 1024 * 1024)
+    writeFileSync(p, Buffer.concat([pngBuffer(600, 8717), body]))
+    const probe = probeImageFile(p)
+    expect(probe).toEqual({ width: 600, height: 8717, bytes: 33 + body.length })
+    expect(classifyPhotoFile(p).route).toBe('document')
+  })
+
+  it('finds JPEG SOFn past a large metadata segment (within the 64KB window)', () => {
+    // SOI + a 40KB APP1 (EXIF-sized) segment, then SOF0. The 32-byte
+    // sniff alone cannot see SOF0; the JPEG re-read must.
+    const segLen = 40 * 1024
+    const app1 = Buffer.alloc(2 + 2 + segLen)
+    app1[0] = 0xff; app1[1] = 0xe1
+    app1.writeUInt16BE(2 + segLen, 2)
+    const sof0 = Buffer.alloc(10)
+    sof0[0] = 0xff; sof0[1] = 0xc0
+    sof0.writeUInt16BE(8, 2)
+    sof0[4] = 8
+    sof0.writeUInt16BE(2556, 5)
+    sof0.writeUInt16BE(1179, 7)
+    const p = join(dir, 'exif.jpg')
+    writeFileSync(p, Buffer.concat([Buffer.from([0xff, 0xd8]), app1, sof0]))
+    expect(probeImageFile(p)).toMatchObject({ width: 1179, height: 2556 })
+  })
+
+  it('returns null (photo route kept) when JPEG SOFn is beyond the 64KB window', () => {
+    // Two 40KB APPn segments push SOF0 past the 64KB probe window
+    // (a single segment length is 16-bit capped at 65535).
+    const segLen = 40 * 1024
+    const app1 = Buffer.alloc(2 + 2 + segLen)
+    app1[0] = 0xff; app1[1] = 0xe1
+    app1.writeUInt16BE(2 + segLen, 2)
+    const sof0 = Buffer.alloc(10)
+    sof0[0] = 0xff; sof0[1] = 0xc0
+    sof0.writeUInt16BE(8, 2)
+    sof0[4] = 8
+    sof0.writeUInt16BE(8717, 5)
+    sof0.writeUInt16BE(600, 7)
+    const p = join(dir, 'deep-exif.jpg')
+    writeFileSync(p, Buffer.concat([Buffer.from([0xff, 0xd8]), app1, app1, sof0]))
+    expect(probeImageFile(p)).toBeNull()
+    // Probe miss → photo route → #3022 reactive fallback backstops.
+    expect(classifyPhotoFile(p)).toEqual({ route: 'photo' })
+  })
+
   it('keeps the photo route when the file is unreadable or unrecognized (reactive fallback backstops)', () => {
     expect(classifyPhotoFile(join(dir, 'missing.png'))).toEqual({ route: 'photo' })
     const junk = join(dir, 'junk.png')
     writeFileSync(junk, Buffer.from('definitely not a png'))
     expect(classifyPhotoFile(junk)).toEqual({ route: 'photo' })
+  })
+})
+
+describe('rerouteResultSuffix (#3038 — reply result tells the agent about reroutes)', () => {
+  it('returns empty string when nothing was rerouted', () => {
+    expect(rerouteResultSuffix([])).toBe('')
+  })
+
+  it('formats a single reroute with basename and reason', () => {
+    const s = rerouteResultSuffix([
+      { path: '/tmp/x/tall.png', reason: 'aspect ratio 14.5:1 (600x8717) exceeds 10:1 photo bound' },
+    ])
+    expect(s).toBe(' (1 file(s) sent as document, not inline photo: tall.png: aspect ratio 14.5:1 (600x8717) exceeds 10:1 photo bound)')
+  })
+
+  it('joins multiple reroutes and counts them', () => {
+    const s = rerouteResultSuffix([
+      { path: '/a/one.png', reason: 'r1' },
+      { path: '/b/two.jpg', reason: 'r2' },
+    ])
+    expect(s).toMatch(/^ \(2 file\(s\) sent as document/)
+    expect(s).toContain('one.png: r1; two.jpg: r2')
   })
 })
