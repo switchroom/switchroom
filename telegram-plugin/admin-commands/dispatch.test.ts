@@ -1,4 +1,7 @@
 import { describe, it, expect } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { dirname, resolve } from 'node:path'
 import {
   dispatchAdminCommand,
   parseCommandName,
@@ -41,9 +44,44 @@ describe('parseCommandName', () => {
 
 describe('ADMIN_COMMAND_NAMES', () => {
   it('contains the fleet-management admin commands', () => {
-    const required = ['agents', 'logs', 'restart', 'update', 'reconcile', 'stop', 'agentstart', 'grant', 'dangerous', 'permissions', 'vault', 'audit']
+    const required = ['agents', 'logs', 'restart', 'update', 'reconcile', 'agentstop', 'agentstart', 'grant', 'dangerous', 'permissions', 'vault', 'audit']
     for (const cmd of required) {
       expect(ADMIN_COMMAND_NAMES.has(cmd)).toBe(true)
+    }
+  })
+
+  it('replaced container-stop /stop with /agentstop (#3020 / #1394)', () => {
+    // 'stop' now cancels the in-flight turn on EVERY agent (like /interrupt),
+    // so it must NOT be admin-gated; container stop moved to 'agentstop',
+    // which MUST be admin-gated or any forum member could stop containers
+    // via non-admin agents (the #1394 hole).
+    expect(ADMIN_COMMAND_NAMES.has('stop')).toBe(false)
+    expect(ADMIN_COMMAND_NAMES.has('agentstop')).toBe(true)
+  })
+
+  it('stays in sync with the tier-2 command list in docs/architecture.md', () => {
+    // The doc's "Fleet-management commands" line is the operator-facing
+    // contract; ADMIN_COMMAND_NAMES is the enforcing set. Drift between the
+    // two either advertises an ungated verb or hides a gated one.
+    const __dirname = dirname(fileURLToPath(import.meta.url))
+    const doc = readFileSync(
+      resolve(__dirname, '..', '..', 'docs', 'architecture.md'),
+      'utf8',
+    )
+    const tier2Line = doc
+      .split('\n')
+      .find(l => l.startsWith('2. **Fleet-management commands**'))
+    expect(tier2Line, 'tier-2 line missing from docs/architecture.md').toBeTruthy()
+    const documented = new Set(
+      [...tier2Line!.matchAll(/`\/([a-z]+)(?:\s+<[^>]+>)?`/g)].map(m => m[1]!),
+    )
+    // Every documented tier-2 verb is enforced…
+    for (const cmd of documented) {
+      expect(ADMIN_COMMAND_NAMES.has(cmd), `doc lists /${cmd} but ADMIN_COMMAND_NAMES lacks it`).toBe(true)
+    }
+    // …and every enforced verb is documented.
+    for (const cmd of ADMIN_COMMAND_NAMES) {
+      expect(documented.has(cmd), `ADMIN_COMMAND_NAMES has '${cmd}' but the doc tier-2 line lacks /${cmd}`).toBe(true)
     }
   })
 
@@ -251,7 +289,7 @@ describe('classifyAdminGate', () => {
       })
     })
     it('blocks /agents, /update, /vault, /permissions', () => {
-      for (const c of ['agents', 'update', 'vault', 'permissions', 'stop', 'agentstart', 'reconcile', 'dangerous', 'memory', 'topics']) {
+      for (const c of ['agents', 'update', 'vault', 'permissions', 'agentstop', 'agentstart', 'reconcile', 'dangerous', 'memory', 'topics']) {
         const r = classifyAdminGate(`/${c}`, me)
         expect(r).toEqual({ action: 'block', reason: 'admin-required', cmd: c })
       }

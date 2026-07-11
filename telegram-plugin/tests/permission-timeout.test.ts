@@ -19,6 +19,8 @@ import {
   HOSTD_PERMISSION_TTL_MS,
   ttlForTool,
   buildTimedOutCardEdits,
+  buildCancelledCardEdits,
+  CANCELLED_FOOTER,
   isStaleTap,
   STALE_TAP_NOTICE,
   TIMED_OUT_FOOTER,
@@ -175,6 +177,30 @@ describe('buildTimedOutCardEdits (Bug 2 fix #1 — strip stale keyboard)', () =>
 
   it('returns no edits when there were no recorded cards', () => {
     expect(buildTimedOutCardEdits('body', [])).toEqual([])
+  })
+})
+
+describe('buildCancelledCardEdits (#3020 — halt cancels pending cards)', () => {
+  it('marks every recorded card for keyboard-strip and appends the cancelled footer', () => {
+    const cards = [
+      { chatId: '111', messageId: 5 },
+      { chatId: '222', messageId: 9 },
+    ]
+    const edits = buildCancelledCardEdits('🔐 **Overlord** wants to roll the fleet', cards)
+    expect(edits).toHaveLength(2)
+    for (const [i, edit] of edits.entries()) {
+      // Same contract as the timeout path: a live Approve after the halt
+      // would dispatch a verdict into an idle session.
+      expect(edit.stripKeyboard).toBe(true)
+      expect(edit.chatId).toBe(cards[i]!.chatId)
+      expect(edit.messageId).toBe(cards[i]!.messageId)
+      expect(edit.text).toContain('roll the fleet')
+      expect(edit.text.endsWith(CANCELLED_FOOTER)).toBe(true)
+    }
+  })
+
+  it('returns no edits when there were no recorded cards', () => {
+    expect(buildCancelledCardEdits('body', [])).toEqual([])
   })
 })
 

@@ -79,6 +79,18 @@ const isSilentNoCardVerdict = (idx: number): boolean =>
 const isCardFoldedResume = (idx: number): boolean =>
   LINES.slice(idx, idx + POST_WINDOW + 1).some((l) => /card-folded-resume/.test(l))
 
+// A HALTED-TURN verdict (#3020 `executeHaltNow` → `cancelPendingPermissionsForHalt`)
+// denies the pending call because the operator is KILLING the turn (/stop,
+// bare "stop", empty `!`). There is nothing to resume — the turn is about to
+// be C-c'd and its busy state torn down — so neither the glyph flip nor the
+// "got it, continuing" message applies. The card is still visibly terminal:
+// the halt path edits it to "⏹ Cancelled" with the keyboard stripped, and the
+// /stop reply acks the operator. Such callsites carry the
+// `halted-turn-verdict` sentinel within the 5 lines above the dispatch and
+// are exempt from BOTH pairings.
+const isHaltedTurnVerdict = (idx: number): boolean =>
+  LINES.slice(Math.max(0, idx - 5), idx + 1).some((l) => /halted-turn-verdict/.test(l))
+
 // How far below the dispatch the resume call is allowed to live. The
 // widest real gap today is ~9 lines (the slash-command path); 15 gives
 // refactor headroom without letting an unrelated resume "cover" a
@@ -99,6 +111,8 @@ describe('permission verdict → resume reaction wiring', () => {
     const unpaired: number[] = []
     for (const idx of dispatchCallsites) {
       if (isSilentNoCardVerdict(idx)) continue
+      // Exempt: the halt path kills the turn — nothing resumes (#3020).
+      if (isHaltedTurnVerdict(idx)) continue
       const window = LINES.slice(idx, idx + RESUME_WINDOW + 1).join('\n')
       if (!/\bresumeReactionAfterVerdict\s*\(\s*\)/.test(window)) {
         // 1-based line number for a human-readable failure.
@@ -125,6 +139,8 @@ describe('permission verdict → resume reaction wiring', () => {
     const unpaired: number[] = []
     for (const idx of dispatchCallsites) {
       if (isSilentNoCardVerdict(idx)) continue
+      // Exempt: the halt path kills the turn — nothing resumes (#3020).
+      if (isHaltedTurnVerdict(idx)) continue
       // Exempt: card-ux fix 3 folds the resume line into the card edit
       // instead of a separate message (still visibly resumes the operator).
       if (isCardFoldedResume(idx)) continue

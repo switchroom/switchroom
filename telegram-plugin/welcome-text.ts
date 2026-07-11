@@ -279,9 +279,9 @@ export function statusUnpairedText(): string {
  */
 export const switchroomHelpCommandNames = [
   // Session & approvals
-  "new", "compact", "clear", "approve", "deny", "pending", "interrupt",
+  "new", "compact", "clear", "approve", "deny", "pending", "interrupt", "stop",
   // Agents
-  "agents", "agentstart", "stop", "restart", "logs", "memory",
+  "agents", "agentstart", "agentstop", "restart", "logs", "memory",
   // Auth & config — consolidated onto the `/auth` dashboard.
   "auth", "model",
   "topics", "update", "version", "whoami",
@@ -380,11 +380,12 @@ export function switchroomHelpText(agentName: string): string {
     `\`/deny [id]\` — deny pending tool permission`,
     `\`/pending\` — list pending permission prompts`,
     `\`/interrupt [name]\` — interrupt an agent turn`,
+    `\`/stop\` — cancel my in-flight turn (bare "stop" works too)`,
     ``,
     `**Agents**`,
     `\`/agents\` — list all agents`,
     `\`/agentstart [name]\` — start an agent`,
-    `\`/stop [name]\` — stop an agent`,
+    `\`/agentstop [name]\` — stop an agent's container`,
     `\`/logs [name] [lines]\` — show agent logs`,
     `\`/memory <query>\` — search agent memory`,
     ``,

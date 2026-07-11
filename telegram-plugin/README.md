@@ -276,7 +276,8 @@ Each plugin instance is bound to one agent (via `SWITCHROOM_AGENT_NAME` set by `
 |---------|-------------|
 | `/agents` | List all agents and their status |
 | `/agentstart [name]` | Start an agent (default: this agent) |
-| `/stop [name]` | Stop an agent (default: this agent) |
+| `/agentstop [name]` | Stop an agent's container (default: this agent) |
+| `/stop` | Cancel this agent's in-flight turn (bare `stop` as a message works too) |
 | `/restart [name\|all]` | Restart an agent (default: this agent; pass `all` for every agent) |
 | `/auth` | Show auth/token status |
 | `/topics` | Show topic-to-agent mappings |

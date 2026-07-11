@@ -49,7 +49,12 @@ export const ADMIN_COMMAND_NAMES = new Set<string>([
   'agents',
   'logs',
   'restart',
-  'stop',
+  // #3020: container stop is /agentstop (pairs with /agentstart). Plain
+  // 'stop' is deliberately ABSENT — it cancels the in-flight turn on every
+  // agent (like /interrupt), so admin-gating it would break the kill switch
+  // on non-admin agents; and leaving container-stop off this list would let
+  // any forum member stop containers via non-admin agents (#1394).
+  'agentstop',
   'agentstart',
   'update',
   'reconcile',

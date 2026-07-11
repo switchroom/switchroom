@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### `/stop` + bare "stop" cancel the in-flight turn (#3020)
+
+The intuitive word now does the intuitive thing: `/stop` (and a bare
+operator message of exactly `stop`, case-insensitive, optional `.`/`!`)
+cancels the agent's running claude turn. Both routes share the empty-`!`
+interrupt's halt sequence via a new `executeHaltNow()` helper: safe-boundary
+deferral per the interrupt config (max-wait 8s default, never severing
+mid-tool-call), tmux C-c, obligation cancel (so a cancelled turn is never
+re-presented or resume-interrupted later), plus a deterministic busy-state
+release so the chat isn't gated on the reaper. The bare keyword bypasses
+inbound coalescing — it fires mid-turn instead of queueing behind the turn
+it's cancelling; "stop the build" still flows to the agent as normal speech.
+When nothing is running the reply says so honestly, and queued mid-turn
+`/model`/`/effort` commands (#3017) are named as surviving the halt. The old
+container-stop `/stop` moved to `/agentstop`, pairing with `/agentstart` —
+and the admin gate moved with it (`agentstop` is admin-gated; plain `stop`
+is not, so the kill switch works on every agent). Halting also denies and
+strips any pending Approve/Deny permission cards from the cancelled turn
+(a later tap can't dispatch into an idle session), kicks the queued
+session-command drain immediately, and guards against a wrong-turn kill
+when the target turn ends naturally during the safe-boundary wait.
+`/stop` takes no argument — `/stop <name>` warns and does nothing (old
+container-stop muscle memory), and a photo captioned "stop" is content,
+not a halt. In forum agents, `stop` halts the single global in-flight
+turn regardless of topic, same as `!`.
+
 ## v0.18.9 — The delivery state machine takes the wheel
 
 ### Inbound delivery is now machine-authoritative by default (#2794, #3012)
