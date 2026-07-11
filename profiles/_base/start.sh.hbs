@@ -185,8 +185,18 @@ x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:
     local _logfile="$1"
     local _max="${SWITCHROOM_SIDECAR_LOG_MAX_BYTES:-52428800}"   # 50 MiB default
     local _interval="${SWITCHROOM_SIDECAR_LOG_ROTATE_INTERVAL_SEC:-300}"  # 5 min
-    # A non-positive cap disables rotation entirely (operator escape hatch).
-    [ "$_max" -le 0 ] 2>/dev/null && return 0
+    # Validate BOTH env overrides up front; garbage falls back to the
+    # default. Unvalidated, a non-numeric interval makes `sleep` fail
+    # instantly and the `while true` loop hot-spins a CPU core for the
+    # container lifetime; a non-numeric cap makes the -gt test below
+    # error (a shell error line to stdout) every cycle forever. A zero
+    # interval would also hot-spin, so it falls back too.
+    case "$_max" in ''|*[!0-9]*) _max=52428800;; esac
+    case "$_interval" in ''|0|*[!0-9]*) _interval=300;; esac
+    # A cap of 0 disables rotation entirely (operator escape hatch).
+    # (Negative values contain '-' → non-numeric per the guard above →
+    # default cap, i.e. rotation stays on.)
+    [ "$_max" -eq 0 ] && return 0
     while true; do
       sleep "$_interval"
       [ -f "$_logfile" ] || continue
