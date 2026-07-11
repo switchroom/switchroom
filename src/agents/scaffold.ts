@@ -4215,9 +4215,7 @@ export function scaffoldAgent(
       // hand-edits are preserved as a backup at
       // `<filename>.before-rerender.<unix-ms>` so they can be
       // re-merged manually.
-      rerenderWithFingerprint(
-        join(agentDir, dest),
-        () => {
+      const renderManaged = () => {
           let rendered = renderTemplate(srcPath, context);
           if (dest === "CLAUDE.md") {
             // Reply-discipline rides at the TOP (prepended after the
@@ -4266,27 +4264,35 @@ export function scaffoldAgent(
           if (dest === "CLAUDE.md" && agentConfig.claude_md_raw) {
             rendered = rendered.trimEnd() + "\n\n" + agentConfig.claude_md_raw + "\n";
           }
-          if (dest === "CLAUDE.md") {
-            // Two-section composition (#1857): the `rendered` output above is
-            // the Switchroom-managed block; everything below the visible
-            // marker is operator-owned and preserved across applies. Read the
-            // existing file so the below-marker section survives verbatim (or
-            // migrates the legacy workspace/CLAUDE.custom.md sidecar). MUST use
-            // the same shared helper as the reconcile path (Phase 3) so both
-            // produce byte-identical output.
-            const claudeMdPath = join(agentDir, dest);
-            const existing = existsSync(claudeMdPath)
-              ? readFileSync(claudeMdPath, "utf-8")
-              : null;
-            const sidecarPath = join(agentDir, "workspace", "CLAUDE.custom.md");
-            rendered = composeTwoSectionClaudeMd(rendered, existing, sidecarPath);
-          }
           return rendered;
-        },
-        created,
-        skipped,
-        rewrittenWithBackup,
-      );
+      };
+      if (dest === "CLAUDE.md") {
+        // Two-section composition (#1857): the rendered output above is the
+        // Switchroom-managed block; everything below the visible marker is
+        // operator-owned and preserved across applies. Uses a marker-aware
+        // fingerprint writer: only the managed (above-marker) section is
+        // fingerprinted, so a below-marker operator edit — the normal,
+        // encouraged state — is NOT treated as drift and never triggers a
+        // .before-rerender backup. Composition goes through the same shared
+        // helper as the reconcile path (Phase 3) so both paths produce
+        // byte-identical output.
+        writeTwoSectionClaudeMdWithFingerprint(
+          join(agentDir, dest),
+          renderManaged,
+          join(agentDir, "workspace", "CLAUDE.custom.md"),
+          created,
+          skipped,
+          rewrittenWithBackup,
+        );
+      } else {
+        rerenderWithFingerprint(
+          join(agentDir, dest),
+          renderManaged,
+          created,
+          skipped,
+          rewrittenWithBackup,
+        );
+      }
     }
   }
 
@@ -6985,6 +6991,106 @@ function writeIfChanged(
  * Caveat: hashing is SHA-256 (`node:crypto`); cost is microseconds
  * per call. Fingerprint sidecar gets ~64 bytes per file. Trivial.
  */
+/**
+ * The Switchroom-managed section of a two-section CLAUDE.md: everything up to
+ * and INCLUDING the marker line. If the marker is absent (legacy pre-#1857
+ * file) the whole content counts as managed — which reproduces the old
+ * whole-file fingerprint semantics for exactly the files that predate the
+ * two-section regime.
+ */
+function claudeMdManagedSection(content: string): string {
+  const idx = content.indexOf(CLAUDE_MD_YOURS_MARKER);
+  if (idx === -1) return content;
+  return content.slice(0, idx + CLAUDE_MD_YOURS_MARKER.length);
+}
+
+/**
+ * Marker-aware fingerprint writer for the two-section `<agentDir>/CLAUDE.md`
+ * (#1857). Same clobber/backup decision tree as rerenderWithFingerprint, with
+ * one deliberate difference: the fingerprint covers ONLY the Switchroom-managed
+ * (above-marker) section, and drift is judged against the existing file's
+ * above-marker section only.
+ *
+ * Why: below-marker operator edits are a first-class, encouraged state — the
+ * composition preserves them verbatim, so they are NOT drift. Under a
+ * whole-file fingerprint every below-marker edit would mismatch the recorded
+ * hash forever, and every subsequent template change would spuriously write a
+ * `.before-rerender.<ts>` backup on every apply. Above-marker hand-edits still
+ * get the full backup + regenerate treatment; legacy files without the marker
+ * degrade to whole-file semantics (one backup on migration if hand-edited).
+ */
+function writeTwoSectionClaudeMdWithFingerprint(
+  filePath: string,
+  managedFn: () => string,
+  sidecarPath: string,
+  created: string[],
+  skipped: string[],
+  rewrittenWithBackup: string[],
+): void {
+  const prev = existsSync(filePath) ? readFileSync(filePath, "utf-8") : null;
+  const next = composeTwoSectionClaudeMd(managedFn(), prev, sidecarPath);
+  const nextManagedHash = createHash("sha256")
+    .update(claudeMdManagedSection(next), "utf-8")
+    .digest("hex");
+  const fingerprintPath = filePath + ".fingerprint";
+
+  if (prev === null) {
+    writeFileSync(filePath, next, "utf-8");
+    writeFileSync(fingerprintPath, nextManagedHash, "utf-8");
+    created.push(filePath);
+    return;
+  }
+
+  if (prev === next) {
+    // Already exactly what we'd write — refresh the fingerprint (covers
+    // fingerprint deletion and migration from the whole-file regime).
+    try {
+      writeFileSync(fingerprintPath, nextManagedHash, "utf-8");
+    } catch {
+      // best-effort
+    }
+    skipped.push(filePath);
+    return;
+  }
+
+  // Managed section drifted (or the below-marker section normalized). Decide
+  // whether the operator touched the MANAGED section since our last write.
+  const prevManagedHash = createHash("sha256")
+    .update(claudeMdManagedSection(prev), "utf-8")
+    .digest("hex");
+  const recordedFingerprint = existsSync(fingerprintPath)
+    ? readFileSync(fingerprintPath, "utf-8").trim()
+    : null;
+
+  if (recordedFingerprint === prevManagedHash) {
+    // Managed section untouched by the operator — template/config drifted
+    // upstream. Clobber the managed section cleanly; the below-marker
+    // section is preserved by the composition above. No backup.
+    writeFileSync(filePath, next, "utf-8");
+    writeFileSync(fingerprintPath, nextManagedHash, "utf-8");
+    created.push(filePath);
+    return;
+  }
+
+  // Above-marker hand-edit (fingerprint mismatch) or legacy state (no
+  // fingerprint). Back up + overwrite — same regime as rerenderWithFingerprint.
+  const backupPath = `${filePath}.before-rerender.${Date.now()}`;
+  try {
+    writeFileSync(backupPath, prev, "utf-8");
+  } catch (err) {
+    process.stderr.write(
+      `scaffold: refusing to overwrite ${filePath} — backup write failed ` +
+      `(${(err as Error).message}). Operator edits preserved.\n`,
+    );
+    skipped.push(filePath);
+    return;
+  }
+  writeFileSync(filePath, next, "utf-8");
+  writeFileSync(fingerprintPath, nextManagedHash, "utf-8");
+  rewrittenWithBackup.push(filePath);
+  created.push(filePath);
+}
+
 function rerenderWithFingerprint(
   filePath: string,
   contentFn: () => string,

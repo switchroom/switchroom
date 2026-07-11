@@ -6,6 +6,7 @@ import {
   writeFileSync,
   existsSync,
   mkdirSync,
+  readdirSync,
 } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -150,6 +151,108 @@ describe("CLAUDE.md two-section marker (#1857)", () => {
     const twice = readFileSync(claudeMd, "utf-8");
     expect(twice.split("Migrate me below the line.")).toHaveLength(2);
     expect(twice.split(CLAUDE_MD_YOURS_MARKER)).toHaveLength(2);
+  });
+
+  it("below-marker operator edit + managed change → content preserved, NO backup file (no churn)", () => {
+    const config = makeAgentConfig();
+    const r = scaffoldAgent("a", config, tmpDir, telegramConfig, makeSwitchroomConfig("a", config));
+    const claudeMd = join(r.agentDir, "CLAUDE.md");
+
+    // Operator edits BELOW the marker — the normal, encouraged state.
+    const original = readFileSync(claudeMd, "utf-8");
+    const markerIdx = original.indexOf(CLAUDE_MD_YOURS_MARKER);
+    const aboveWithMarker = original.slice(0, markerIdx + CLAUDE_MD_YOURS_MARKER.length);
+    writeFileSync(claudeMd, `${aboveWithMarker}\n\n## My rules\nBe terse.\n`, "utf-8");
+
+    // Managed content changes (simulates a template/release change) —
+    // TWICE, to prove no per-apply backup accumulation.
+    for (const raw of ["\n\n## Drift one\n", "\n\n## Drift two\n"]) {
+      const drifted = makeAgentConfig({ claude_md_raw: raw });
+      scaffoldAgent("a", drifted, tmpDir, telegramConfig, makeSwitchroomConfig("a", drifted));
+    }
+
+    const after = readFileSync(claudeMd, "utf-8");
+    expect(after).toContain("Drift two");
+    expect(after).toContain("Be terse.");
+    // No backup churn: below-marker edits are NOT drift.
+    const backups = readdirSync(r.agentDir).filter((f) =>
+      f.startsWith("CLAUDE.md.before-rerender."),
+    );
+    expect(backups).toHaveLength(0);
+  });
+
+  it("above-marker hand-edit → exactly one backup + managed section regenerated", () => {
+    const config = makeAgentConfig();
+    const r = scaffoldAgent("a", config, tmpDir, telegramConfig, makeSwitchroomConfig("a", config));
+    const claudeMd = join(r.agentDir, "CLAUDE.md");
+
+    const original = readFileSync(claudeMd, "utf-8");
+    writeFileSync(
+      claudeMd,
+      original.replace(
+        CLAUDE_MD_YOURS_MARKER,
+        `## SNUCK IN ABOVE\n\n${CLAUDE_MD_YOURS_MARKER}`,
+      ),
+      "utf-8",
+    );
+
+    scaffoldAgent("a", config, tmpDir, telegramConfig, makeSwitchroomConfig("a", config));
+    // A second run after regeneration must NOT produce another backup.
+    scaffoldAgent("a", config, tmpDir, telegramConfig, makeSwitchroomConfig("a", config));
+
+    const after = readFileSync(claudeMd, "utf-8");
+    expect(after).not.toContain("SNUCK IN ABOVE");
+    const backups = readdirSync(r.agentDir).filter((f) =>
+      f.startsWith("CLAUDE.md.before-rerender."),
+    );
+    expect(backups).toHaveLength(1);
+    expect(readFileSync(join(r.agentDir, backups[0]!), "utf-8")).toContain("SNUCK IN ABOVE");
+  });
+
+  it("legacy pre-marker file with hand-edits → exactly one backup on migration", () => {
+    const config = makeAgentConfig();
+    const r = scaffoldAgent("a", config, tmpDir, telegramConfig, makeSwitchroomConfig("a", config));
+    const claudeMd = join(r.agentDir, "CLAUDE.md");
+
+    // Simulate a pre-#1857 file: no marker, operator hand-edits, no fingerprint.
+    const pre = readFileSync(claudeMd, "utf-8");
+    const noMarker =
+      pre.slice(0, pre.indexOf(CLAUDE_MD_YOURS_MARKER)).trimEnd() +
+      "\n\n## Legacy hand edit\nKeep a copy of me.\n";
+    writeFileSync(claudeMd, noMarker, "utf-8");
+    rmSync(claudeMd + ".fingerprint");
+
+    scaffoldAgent("a", config, tmpDir, telegramConfig, makeSwitchroomConfig("a", config));
+    // Second run: no further backups.
+    scaffoldAgent("a", config, tmpDir, telegramConfig, makeSwitchroomConfig("a", config));
+
+    const backups = readdirSync(r.agentDir).filter((f) =>
+      f.startsWith("CLAUDE.md.before-rerender."),
+    );
+    expect(backups).toHaveLength(1);
+    expect(readFileSync(join(r.agentDir, backups[0]!), "utf-8")).toContain("Legacy hand edit");
+    expect(readFileSync(claudeMd, "utf-8")).toContain(CLAUDE_MD_YOURS_MARKER);
+  });
+
+  it("scaffold after reconcile-driven managed change is a no-op (fingerprint stays in sync)", () => {
+    const config = makeAgentConfig();
+    const r = scaffoldAgent("a", config, tmpDir, telegramConfig, makeSwitchroomConfig("a", config));
+    const claudeMd = join(r.agentDir, "CLAUDE.md");
+
+    // Reconcile with changed managed content (writes without a fingerprint
+    // update — Phase 3 is plain diff-write).
+    const drifted = makeAgentConfig({ claude_md_raw: "\n\n## Drift\n" });
+    reconcileAgent("a", drifted, tmpDir, telegramConfig, makeSwitchroomConfig("a", drifted));
+    const afterReconcile = readFileSync(claudeMd, "utf-8");
+
+    // Scaffold with the same config: byte-identical render → skipped, no backup.
+    const r2 = scaffoldAgent("a", drifted, tmpDir, telegramConfig, makeSwitchroomConfig("a", drifted));
+    expect(r2.skipped).toContain(claudeMd);
+    expect(readFileSync(claudeMd, "utf-8")).toBe(afterReconcile);
+    const backups = readdirSync(r.agentDir).filter((f) =>
+      f.startsWith("CLAUDE.md.before-rerender."),
+    );
+    expect(backups).toHaveLength(0);
   });
 
   it("idempotence: consecutive reconciles are a full no-op", () => {

@@ -126,8 +126,15 @@ describe("scaffoldAgent — CLAUDE.md rerender-on-template-change (#1122)", () =
     const r1 = scaffoldAgent("a", config, tmpDir, telegramConfig, makeSwitchroomConfig("a", config));
     const claudeMd = join(r1.agentDir, "CLAUDE.md");
 
-    // Operator hand-edits the file (this is what bypasses the fingerprint).
-    const handEdited = readFileSync(claudeMd, "utf-8") + "\n\n## Operator note\nKeep this.\n";
+    // Operator hand-edits the MANAGED (above-marker) section — this is what
+    // bypasses the fingerprint. (An edit BELOW the two-section marker is a
+    // first-class preserved state under #1857 and does NOT trigger a backup;
+    // see tests/scaffold.claude-md-two-section.test.ts.)
+    const MARKER = "# --- Yours (preserved across apply) ---";
+    const handEdited = readFileSync(claudeMd, "utf-8").replace(
+      MARKER,
+      `## Operator note\nKeep this.\n\n${MARKER}`,
+    );
     writeFileSync(claudeMd, handEdited, "utf-8");
 
     // Template drift triggers a rerender attempt.
