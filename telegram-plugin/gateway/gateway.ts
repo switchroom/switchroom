@@ -344,6 +344,7 @@ import {
   extractAgentButtonMeta,
   keyboardIsSingleUse,
   finalizeCallback,
+  resolveTapAnnotation,
   type AgentButtonMeta,
 } from '../inline-keyboard-callbacks.js'
 import {
@@ -1463,6 +1464,17 @@ type Access = {
     short_name?: string
     author_name?: string
   }
+  /** Auto-confirm "✅ You chose: X" annotation on inline_keyboard taps
+   *  (#789). When enabled, tapping an agent-emitted single-use button
+   *  annotates the source message body so the chat surface is
+   *  self-documenting. Off by default; only honored when parseMode is the
+   *  default 'html'. Projected from
+   *  channels.telegram.button_choice_confirmation by scaffold. */
+  button_choice_confirmation?: {
+    enabled?: boolean
+    format?: string
+    timezone?: 'gateway' | 'utc'
+  }
 }
 
 function defaultAccess(): Access {
@@ -1547,6 +1559,8 @@ function readAccessFile(): Access {
       voice_in: parsed.voice_in,
       voice_out: parsed.voice_out,
       telegraph: parsed.telegraph,
+      // #789: button-choice-confirmation config projected by scaffold.
+      button_choice_confirmation: parsed.button_choice_confirmation,
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
@@ -19879,6 +19893,17 @@ function escapeHtmlForTg(text: string): string {
   return text.replace(/([\\`*_~=\[\]|])/g, '\\$1')
 }
 
+// #789 — button-choice-confirmation ("✅ You chose: X") annotation state.
+//
+// Two once-per-process warning dedupe sets keyed by agent slug: one for the
+// parseMode gate (annotation only supports the default 'html' parse mode),
+// one for the single_use mismatch (a re-tappable keyboard can never be
+// annotated, so a confirmation request on it silently no-ops). The decision
+// + rendered text are pure functions in inline-keyboard-callbacks.ts
+// (resolveTapAnnotation) so they can be unit-tested against the exact payload.
+const buttonConfirmParseModeWarned = new Set<string>()
+const buttonConfirmSingleUseWarned = new Set<string>()
+
 // Wrap CLI/command output in a fenced code block (content is literal there).
 function preBlock(text: string): string {
   return '```\n' + text.replace(/```/g, '`​``') + '\n```'
@@ -25837,8 +25862,65 @@ bot.on('callback_query:data', async ctx => {
     // opts out via `single_use: false`. With no stashed meta (e.g.
     // gateway restarted between send and tap) the default fires too,
     // which is the desired UX.
-    const stripKeyboard = metaForMessage == null || keyboardIsSingleUse(metaForMessage)
-    if (stripKeyboard && cbMessageId != null) {
+    const singleUse = metaForMessage == null || keyboardIsSingleUse(metaForMessage)
+
+    // Source message body text — photos/stickers/etc. carry no `text`.
+    const cbMsg = ctx.callbackQuery?.message
+    const sourceText = cbMsg && 'text' in cbMsg && typeof cbMsg.text === 'string'
+      ? cbMsg.text
+      : undefined
+
+    // #789: pure decision for the "✅ You chose: X" body annotation. Per-message
+    // override (the tapped button's inline_keyboard_confirm) wins over the agent
+    // default; fires only on single-use keyboards with body text + a label and
+    // the default 'html' parse mode.
+    const annotation = resolveTapAnnotation({
+      ...(tapMeta?.inline_keyboard_confirm != null
+        ? { perMessageOverride: tapMeta.inline_keyboard_confirm }
+        : {}),
+      singleUse,
+      ...(access.button_choice_confirmation != null
+        ? { config: access.button_choice_confirmation }
+        : {}),
+      parseMode: access.parseMode ?? 'html',
+      ...(sourceText != null ? { sourceText } : {}),
+      ...(buttonText != null ? { label: buttonText } : {}),
+      escapeLabel: escapeHtmlForTg,
+    })
+
+    const warnKey = process.env.SWITCHROOM_AGENT_NAME ?? ''
+    // Round-1 minor finding: a confirmation requested on a single_use:false
+    // (re-tappable) keyboard can never fire. Warn once per agent-process.
+    if (annotation.warnSingleUseMismatch && !buttonConfirmSingleUseWarned.has(warnKey)) {
+      buttonConfirmSingleUseWarned.add(warnKey)
+      process.stderr.write(
+        `telegram gateway: button_choice_confirmation skipped — inline_keyboard_confirm requested on a single_use:false (re-tappable) keyboard; annotation only fires on single-use keyboards (#789)\n`,
+      )
+    }
+    // Parse-mode gate (Blocker 1): annotation is emitted with HTML. Warn once
+    // per agent-process when a non-html parseMode suppresses it.
+    if (annotation.warnParseMode && !buttonConfirmParseModeWarned.has(warnKey)) {
+      buttonConfirmParseModeWarned.add(warnKey)
+      process.stderr.write(
+        `telegram gateway: button_choice_confirmation skipped — agent parseMode=${access.parseMode ?? 'html'}, only 'html' supported (#789)\n`,
+      )
+    }
+
+    if (annotation.annotate && cbMessageId != null) {
+      // Single API call (Blocker 2): editMessageText accepts reply_markup, so
+      // we annotate the body AND strip the keyboard in one edit.
+      await ctx
+        .editMessageText(annotation.text as string, {
+          parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [] },
+        })
+        .catch(() => {})
+      if (metaForMessage != null) {
+        agentButtonMeta.delete(`${cbChatId}:${cbMessageId}`)
+      }
+    } else if (singleUse && cbMessageId != null) {
+      // No annotation (disabled, non-single-use, non-html parseMode, or no
+      // body text) — preserve the historical keyboard-only strip.
       await ctx.editMessageReplyMarkup({
         reply_markup: { inline_keyboard: [] },
       }).catch(() => {})

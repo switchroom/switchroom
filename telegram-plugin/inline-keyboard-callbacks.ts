@@ -60,10 +60,25 @@ export interface AgentButtonMeta {
    * removes the entire keyboard to prevent double-fire.
    */
   single_use?: boolean
+  /**
+   * Per-message override for the button-choice-confirmation annotation
+   * (#789). When true, tapping annotates the source message body with a
+   * "✅ You chose: <label> · HH:MM" line even if the agent default is off;
+   * when false, annotation is skipped even if the agent default is on.
+   * Undefined falls back to the agent's
+   * channels.telegram.button_choice_confirmation.enabled default. Only takes
+   * effect on single-use keyboards (re-tappable keyboards are never
+   * annotated).
+   */
+  inline_keyboard_confirm?: boolean
 }
 
 /** Fields the gateway adds to button objects — not valid Telegram API fields. */
-const AGENT_META_FIELDS: ReadonlyArray<keyof AgentButtonMeta> = ['ack_text', 'single_use']
+const AGENT_META_FIELDS: ReadonlyArray<keyof AgentButtonMeta> = [
+  'ack_text',
+  'single_use',
+  'inline_keyboard_confirm',
+]
 
 /**
  * Wrap every callback_data field in a 2D inline-keyboard with the
@@ -116,7 +131,14 @@ export function extractAgentButtonMeta(
       const meta: AgentButtonMeta = {}
       if (typeof btn.ack_text === 'string') meta.ack_text = btn.ack_text
       if (typeof btn.single_use === 'boolean') meta.single_use = btn.single_use
-      if (meta.ack_text != null || meta.single_use != null) {
+      if (typeof btn.inline_keyboard_confirm === 'boolean') {
+        meta.inline_keyboard_confirm = btn.inline_keyboard_confirm
+      }
+      if (
+        meta.ack_text != null ||
+        meta.single_use != null ||
+        meta.inline_keyboard_confirm != null
+      ) {
         out.set(btn.callback_data, meta)
       }
     }
@@ -147,6 +169,123 @@ export function keyboardIsSingleUse(
 export function parseAgentCallback(data: string): { raw: string } | null {
   if (!data.startsWith(AGENT_CALLBACK_PREFIX)) return null
   return { raw: data.slice(AGENT_CALLBACK_PREFIX.length) }
+}
+
+// ─── #789 button-choice-confirmation ("✅ You chose: X") ──────────────────
+//
+// When a user taps an agent-emitted single-use inline_keyboard button, the
+// gateway can annotate the source message body with a
+// "✅ You chose: <label> · HH:MM" line so the chat surface is
+// self-documenting (mirrors the ask_user finalize UX). The DECISION and the
+// rendered text are pure functions here so they can be unit-tested against
+// the exact payload the gateway ships — the gateway owns only the Telegram
+// I/O and the once-per-process warning dedupe.
+
+/** Per-agent button-choice-confirmation config (projected into access.json). */
+export interface ButtonChoiceConfirmationConfig {
+  enabled?: boolean
+  format?: string
+  timezone?: 'gateway' | 'utc'
+}
+
+/** Default annotation template. `{label}` and `{time}` are substituted. */
+export const BUTTON_CONFIRM_DEFAULT_FORMAT = '✅ You chose: {label} · {time}'
+
+/**
+ * Dedup-strip regex: matches a prior DEFAULT-shape annotation appended to the
+ * body so a retap replaces rather than duplicates it. The `s` (dotAll) flag
+ * tolerates a stray newline inside an older, un-stripped label (belt-and-braces
+ * alongside the newline-stripping applied to the label on the way in).
+ */
+export const BUTTON_CONFIRM_STRIP_RE =
+  /\n\n✅ You chose: <b>.*<\/b> · \d{2}:\d{2}$/s
+
+/**
+ * Build the confirmation line. `{label}` → the tapped button's text with
+ * newlines collapsed to spaces, trimmed to 60 chars (mirrors the toast trim),
+ * HTML-escaped via the injected house escaper and wrapped in `<b>`; `{time}` →
+ * HH:MM in the chosen timezone. `now`/`escapeLabel` are injected for
+ * deterministic tests.
+ */
+export function buildButtonConfirmation(args: {
+  template: string
+  label: string
+  timezone: 'gateway' | 'utc'
+  escapeLabel: (s: string) => string
+  now?: Date
+}): string {
+  const cleanLabel = args.label.replace(/\n/g, ' ').slice(0, 60)
+  const now = args.now ?? new Date()
+  const hh = args.timezone === 'utc'
+    ? String(now.getUTCHours()).padStart(2, '0')
+    : String(now.getHours()).padStart(2, '0')
+  const mm = args.timezone === 'utc'
+    ? String(now.getUTCMinutes()).padStart(2, '0')
+    : String(now.getMinutes()).padStart(2, '0')
+  return args.template
+    .replace('{label}', `<b>${args.escapeLabel(cleanLabel)}</b>`)
+    .replace('{time}', `${hh}:${mm}`)
+}
+
+/** Outcome of the annotate-or-strip decision for a single tap. */
+export interface TapAnnotationResult {
+  /** True → gateway should editMessageText with `text` (and strip keyboard). */
+  annotate: boolean
+  /** Annotated body text, present iff `annotate` is true. */
+  text?: string
+  /** True → gateway should emit the once-per-process parseMode warning. */
+  warnParseMode: boolean
+  /** True → gateway should emit the once-per-process single_use-mismatch warning. */
+  warnSingleUseMismatch: boolean
+}
+
+/**
+ * Pure decision for the #789 annotation. Resolves the per-message override
+ * (the tapped button's `inline_keyboard_confirm`) over the agent default,
+ * gates on single-use + presence of body text + a resolvable label + the
+ * `html` parse mode, and renders the annotated body (with any prior
+ * default-shape annotation stripped so a retap replaces it). Returns
+ * `annotate:false` for every skip path; the caller still performs the
+ * historical keyboard-only strip when the keyboard is single-use.
+ */
+export function resolveTapAnnotation(args: {
+  perMessageOverride?: boolean
+  singleUse: boolean
+  config?: ButtonChoiceConfirmationConfig
+  parseMode: 'html' | 'markdownv2' | 'text'
+  sourceText?: string
+  label?: string
+  escapeLabel: (s: string) => string
+  now?: Date
+}): TapAnnotationResult {
+  const shouldAnnotate = args.perMessageOverride ?? args.config?.enabled ?? false
+  const warnSingleUseMismatch = shouldAnnotate && !args.singleUse
+
+  const wantAnnotate =
+    shouldAnnotate &&
+    args.singleUse &&
+    args.sourceText != null &&
+    args.label != null
+  if (!wantAnnotate) {
+    return { annotate: false, warnParseMode: false, warnSingleUseMismatch }
+  }
+  if (args.parseMode !== 'html') {
+    return { annotate: false, warnParseMode: true, warnSingleUseMismatch }
+  }
+  const base = (args.sourceText as string).replace(BUTTON_CONFIRM_STRIP_RE, '')
+  const formatted = buildButtonConfirmation({
+    template: args.config?.format ?? BUTTON_CONFIRM_DEFAULT_FORMAT,
+    label: args.label as string,
+    timezone: args.config?.timezone ?? 'gateway',
+    escapeLabel: args.escapeLabel,
+    ...(args.now != null ? { now: args.now } : {}),
+  })
+  return {
+    annotate: true,
+    text: `${base}\n\n${formatted}`,
+    warnParseMode: false,
+    warnSingleUseMismatch,
+  }
 }
 
 /**

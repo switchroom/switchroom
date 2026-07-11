@@ -7360,6 +7360,13 @@ function buildAccessJson(
   if (typeof tg?.interrupt?.max_wait_ms === "number") {
     access.interruptMaxWaitMs = tg.interrupt.max_wait_ms;
   }
+  // #789: project the button-choice-confirmation config so the gateway can
+  // annotate a "✅ You chose: X" line on inline_keyboard taps without
+  // re-reading switchroom.yaml. Same #596 plumbing pattern as above — the
+  // gateway reads access.button_choice_confirmation per-tap via loadAccess().
+  if (tg?.button_choice_confirmation) {
+    access.button_choice_confirmation = tg.button_choice_confirmation;
+  }
 
   return JSON.stringify(access, null, 2) + "\n";
 }

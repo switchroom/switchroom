@@ -62,6 +62,23 @@ probe (#1858) and refresh verb (#1859). Operator edits are never
 clobbered. The Telegram 5-beats stay in the release-pinned L1 invariants,
 and the AI-tell ban list stays in per-agent SOUL.md.
 
+### Auto-confirm "✅ You chose: X" on inline_keyboard taps (#789)
+
+When a user taps an agent-emitted inline_keyboard button, the gateway can
+now annotate the source message body with a `✅ You chose: <label> · HH:MM`
+line so the chat surface is self-documenting (mirrors the existing
+`ask_user` finalize UX), instead of only silently stripping the keyboard.
+Opt-in per agent via `channels.telegram.button_choice_confirmation`
+(`enabled` default false, a `format` template with `{label}`/`{time}`
+placeholders, and `timezone: gateway|utc`), or per-message via the new
+`inline_keyboard_confirm` boolean on the `reply`/`stream_reply`
+inline_keyboard button objects. Annotation fires only on single-use
+keyboards (a re-tappable keyboard's body would diverge from its live
+state) and only when the agent's `parseMode` is the default `html` — other
+parse modes skip annotation (keyboard still stripped) and log a one-time
+warning. A retap replaces the prior confirmation line rather than
+duplicating it. Per-user timezones are out of scope for v1.
+
 ## v0.18.11 — Rollouts you can watch, poll, and survive
 
 ### Rich checklist rollout narration with per-agent progress (#3047)
