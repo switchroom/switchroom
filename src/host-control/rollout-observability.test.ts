@@ -10,7 +10,10 @@ import {
   latestRolloutRowForRequest,
   parseAuditLine,
 } from "./audit-reader.js";
-import { renderRolloutStatus } from "./render-rollout-status.js";
+import {
+  renderRolloutStatus,
+  formatDurationMs,
+} from "./render-rollout-status.js";
 
 /** Build one JSONL audit row (the shape hostd writes, chain fields elided —
  *  parseAuditLine ignores `_seq`/`_prev`/`_hash`). */
@@ -99,15 +102,37 @@ describe("audit-reader parses rollout phase fields", () => {
   });
 });
 
+describe("formatDurationMs", () => {
+  it("formats seconds / minutes / hours compactly", () => {
+    expect(formatDurationMs(42_000)).toBe("42s");
+    expect(formatDurationMs(190_000)).toBe("3m 10s");
+    expect(formatDurationMs(180_000)).toBe("3m");
+    expect(formatDurationMs(3_900_000)).toBe("1h 5m");
+    expect(formatDurationMs(-5)).toBe("0s");
+  });
+});
+
 describe("renderRolloutStatus", () => {
-  it("renders an in-flight applying line", () => {
+  it("renders an in-flight applying header", () => {
     const out = renderRolloutStatus({ target: "v1.2.3", phase: "apply" });
     expect(out).toContain("v1.2.3");
     expect(out).toContain("applying");
     expect(out.startsWith("⏳")).toBe(true);
   });
 
-  it("renders agent N/M progress", () => {
+  it("headers with from → to versions and the short request id", () => {
+    const out = renderRolloutStatus({
+      target: "v1.2.3",
+      fromVersion: "v1.2.2",
+      requestId: "ro-abcdef1234567890xyz",
+      phase: "apply",
+    });
+    const header = out.split("\n")[0]!;
+    expect(header).toContain("`v1.2.2` → `v1.2.3`");
+    expect(header).toContain("req `ro-abcdef1234567…`");
+  });
+
+  it("renders agent N/M progress with the rolled count footer", () => {
     const out = renderRolloutStatus({
       target: "v1.2.3",
       phase: "agent-start",
@@ -118,21 +143,79 @@ describe("renderRolloutStatus", () => {
     });
     expect(out).toContain("agent 3/8");
     expect(out).toContain("clerk");
-    expect(out).toContain("2 rolled");
+    expect(out).toContain("2/8 rolled");
   });
 
-  it("renders the ✅ terminal-completed line with the rolled list", () => {
+  it("renders the per-agent checklist (✓ done / ⏳ running / ✗ failed / · pending) with durations", () => {
+    const out = renderRolloutStatus({
+      target: "v1.2.3",
+      phase: "agent-start",
+      agent: "clerk",
+      n: 3,
+      m: 5,
+      rolled: ["test-harness", "marko"],
+      agents: [
+        { name: "test-harness", status: "done", canary: true, durationMs: 42_000 },
+        { name: "marko", status: "done", durationMs: 38_000 },
+        { name: "clerk", status: "running" },
+      ],
+    });
+    expect(out).toContain("- ✓ `test-harness` (canary) — 42s");
+    expect(out).toContain("- ✓ `marko` — 38s");
+    expect(out).toContain("- ⏳ `clerk` — restarting…");
+    // 5 total, 3 known → 2 collapsed pending.
+    expect(out).toContain("- · 2 more pending");
+    // No literal • bullets (progress-card vocabulary uses `-` lists).
+    expect(out).not.toContain("•");
+  });
+
+  it("estimates a rough ETA from the mean per-agent duration so far", () => {
+    const out = renderRolloutStatus({
+      target: "v1.2.3",
+      phase: "agent-start",
+      m: 4,
+      rolled: ["a", "b"],
+      agents: [
+        { name: "a", status: "done", durationMs: 30_000 },
+        { name: "b", status: "done", durationMs: 60_000 },
+        { name: "c", status: "running" },
+      ],
+    });
+    // mean 45s × 2 remaining = 1m 30s.
+    expect(out).toContain("~1m 30s left (rough est.)");
+  });
+
+  it("shows elapsed from startedAtMs/nowMs while in flight", () => {
+    const out = renderRolloutStatus({
+      target: "v1.2.3",
+      phase: "agent-start",
+      m: 3,
+      startedAtMs: 1_000_000,
+      nowMs: 1_105_000,
+    });
+    expect(out).toContain("elapsed 1m 45s");
+  });
+
+  it("renders the ✅ terminal summary with rolled list, elapsed total and deferred components", () => {
     const out = renderRolloutStatus({
       target: "v1.2.3",
       terminal: "completed",
       rolled: ["test-harness", "clerk"],
+      m: 2,
+      elapsedMs: 492_000,
     });
     expect(out.startsWith("✅")).toBe(true);
-    expect(out).toContain("done");
-    expect(out).toContain("test-harness, clerk");
+    expect(out).toContain("Done");
+    expect(out).toContain("rolled 2/2 agent(s) in 8m 12s");
+    expect(out).toContain("`test-harness`, `clerk`");
+    // Deferred host-side components with their exact update commands.
+    expect(out).toContain("Deferred");
+    expect(out).toContain("switchroom webd install --tag v1.2.3");
+    expect(out).toContain("sudo npm i -g switchroom@1.2.3");
+    expect(out).toContain("switchroom hostd install --tag v1.2.3");
   });
 
-  it("renders the ❌ terminal-error line with the failed step + agent", () => {
+  it("renders the ❌ terminal-error summary with the failed step + agent", () => {
     const out = renderRolloutStatus({
       target: "v1.2.3",
       terminal: "error",
@@ -140,6 +223,7 @@ describe("renderRolloutStatus", () => {
       failedAgent: "clerk",
       got: "1.2.2",
       rolled: ["test-harness"],
+      elapsedMs: 65_000,
     });
     expect(out.startsWith("❌")).toBe(true);
     expect(out).toContain("STOPPED");
@@ -147,6 +231,94 @@ describe("renderRolloutStatus", () => {
     expect(out).toContain("clerk");
     expect(out).toContain("1.2.2");
     expect(out).toContain("test-harness");
+    expect(out).toContain("after 1m 5s");
+    // A failed roll must NOT advertise the deferred-update commands.
+    expect(out).not.toContain("Deferred");
+  });
+
+  it("code-spans agent names everywhere (underscores must not italicize in GFM)", () => {
+    // Phase line + rolled join, in-flight.
+    const inflight = renderRolloutStatus({
+      target: "v1.2.3",
+      phase: "agent-start",
+      agent: "data_pipeline_bot",
+      n: 2,
+      m: 3,
+      rolled: ["test_harness"],
+    });
+    expect(inflight).toContain("restarting `data_pipeline_bot`");
+    // Terminal joins.
+    const done = renderRolloutStatus({
+      target: "v1.2.3",
+      terminal: "completed",
+      rolled: ["test_harness", "data_pipeline_bot"],
+    });
+    expect(done).toContain("`test_harness`, `data_pipeline_bot`");
+    const err = renderRolloutStatus({
+      target: "v1.2.3",
+      terminal: "error",
+      failedStep: "restart-agent",
+      failedAgent: "data_pipeline_bot",
+      got: null,
+      rolled: ["test_harness"],
+    });
+    expect(err).toContain("Rolled before stop: `test_harness`.");
+    // Canary phase lines.
+    const canary = renderRolloutStatus({
+      target: "v1.2.3",
+      phase: "canary-pass",
+      agent: "test_harness",
+    });
+    expect(canary).toContain("canary passed (`test_harness`)");
+    // No agent name appears outside a code span in any of the renders.
+    for (const out of [inflight, done, err, canary]) {
+      expect(out).not.toMatch(/(^|[^`])(?:test_harness|data_pipeline_bot)([^`]|$)/);
+    }
+  });
+
+  it("collapses the checklist when a big fleet would overflow the message-size ceiling", () => {
+    // Synthetic 60-agent fleet with long names — the full render would exceed
+    // Telegram's edit limit (the gateway swallows MESSAGE_TOO_LONG, silently
+    // freezing the narration), so the render must fall back to compact mode.
+    const names = Array.from(
+      { length: 60 },
+      (_, i) =>
+        `agent-with-a-rather-long-and-quite-descriptive-container-name-${String(i).padStart(2, "0")}`,
+    );
+    const agents = names.map((name, i) => ({
+      name,
+      status: (i < 58 ? "done" : i === 58 ? "running" : "pending") as
+        | "done"
+        | "running"
+        | "pending",
+      ...(i < 58 ? { durationMs: 40_000 } : {}),
+      ...(i === 0 ? { canary: true } : {}),
+    }));
+    const out = renderRolloutStatus({
+      target: "v1.2.3",
+      phase: "agent-start",
+      agent: names[58],
+      n: 59,
+      m: 60,
+      rolled: names.slice(0, 58),
+      agents,
+    });
+    expect(out.length).toBeLessThan(3900);
+    // Completed agents folded into one count line; the active agent survives.
+    expect(out).toContain("- ✓ 58 done");
+    expect(out).toContain(`- ⏳ \`${names[58]}\` — restarting…`);
+    expect(out).toContain("more pending");
+    // Terminal render for the same fleet also stays under the ceiling.
+    const done = renderRolloutStatus({
+      target: "v1.2.3",
+      terminal: "completed",
+      rolled: names,
+      m: 60,
+      elapsedMs: 2_400_000,
+      agents: agents.map((a) => ({ ...a, status: "done" as const })),
+    });
+    expect(done.length).toBeLessThan(3900);
+    expect(done).toContain("- ✓ 60 done");
   });
 
   it("renders 'unreachable' when the failed agent version is null", () => {

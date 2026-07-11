@@ -46,6 +46,7 @@ import type { StatusEntry } from "./server.js";
 import type { RolloutPhase } from "../cli/rollout.js";
 import {
   renderRolloutStatus,
+  type AgentRollProgress,
   type RolloutRenderState,
 } from "./render-rollout-status.js";
 
@@ -120,6 +121,8 @@ interface NarrationState {
   postFailed: boolean;
   /** The latest render state (rebuilt as phases arrive). */
   render: RolloutRenderState;
+  /** Per-agent checklist progress, in roll order (fed into render.agents). */
+  agents: AgentRollProgress[];
   /** Frozen once the terminal row is applied — no later edit may un-finalize. */
   frozen: boolean;
   /** Pending debounce timer for a trailing-edge edit. */
@@ -138,8 +141,61 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
 
   constructor(
     private relay: RolloutNarrationRelay,
-    private opts: { debounceMs?: number; log?: (m: string) => void } = {},
+    private opts: {
+      debounceMs?: number;
+      log?: (m: string) => void;
+      /** Clock seam for tests; defaults to Date.now. */
+      now?: () => number;
+    } = {},
   ) {}
+
+  private now(): number {
+    return this.opts.now?.() ?? Date.now();
+  }
+
+  /** Upsert an agent's checklist entry (keyed by name, roll order preserved). */
+  private static upsertAgent(
+    st: NarrationState,
+    name: string,
+    patch: Partial<AgentRollProgress>,
+  ): void {
+    const existing = st.agents.find((a) => a.name === name);
+    if (existing) Object.assign(existing, patch);
+    else st.agents.push({ name, status: "pending", ...patch });
+  }
+
+  /** Fold a phase into the per-agent checklist (✓/⏳/·/✗ + durations). */
+  private trackAgentProgress(st: NarrationState, phase: RolloutPhase): void {
+    const now = this.now();
+    switch (phase.phase) {
+      case "canary-start":
+      case "agent-start":
+        if (phase.agent) {
+          LogTailRolloutNarrator.upsertAgent(st, phase.agent, {
+            status: "running",
+            startedAtMs: now,
+            ...(phase.phase === "canary-start" ? { canary: true } : {}),
+          });
+        }
+        break;
+      case "canary-pass":
+      case "agent-done":
+      case "canary-fail": {
+        if (!phase.agent) break;
+        const a = st.agents.find((x) => x.name === phase.agent);
+        const durationMs =
+          a?.startedAtMs !== undefined ? now - a.startedAtMs : undefined;
+        LogTailRolloutNarrator.upsertAgent(st, phase.agent, {
+          status: phase.phase === "canary-fail" ? "failed" : "done",
+          ...(durationMs !== undefined ? { durationMs } : {}),
+          ...(phase.phase !== "agent-done" ? { canary: true } : {}),
+        });
+        break;
+      }
+      default:
+        break;
+    }
+  }
 
   /**
    * Monotonic sequence for a phase, so out-of-order / duplicate phases drop.
@@ -206,6 +262,9 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
       if (seq < st.lastAppliedSeq) return; // stale — drop.
       st.lastAppliedSeq = seq;
 
+      // Fold the phase into the per-agent checklist (✓/⏳/·/✗ + durations).
+      this.trackAgentProgress(st, phase);
+
       // Rebuild the render state from this phase (pull-shaped: each phase is a
       // projection of the latest durable row hostd just wrote).
       st.render = {
@@ -216,6 +275,10 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
         ...(phase.m !== undefined ? { m: phase.m } : {}),
         ...(phase.agent !== undefined ? { agent: phase.agent } : {}),
         rolled: entry.rolled,
+        agents: st.agents,
+        requestId: entry.request_id,
+        ...(entry.prior_pin ? { fromVersion: entry.prior_pin } : {}),
+        startedAtMs: entry.started_at,
       };
       this.scheduleRenderOrPost(entry.request_id);
     } catch (e) {
@@ -226,6 +289,19 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
   onTerminal(entry: StatusEntry): void {
     try {
       const st = this.ensureState(entry);
+      // Reconcile the checklist against the terminal row: the failed agent is
+      // marked ✗; any other agent still shown "running" (its -done row never
+      // arrived) is downgraded to pending unless the rolled[] list confirms it.
+      const rolled = new Set(entry.rolled ?? []);
+      for (const a of st.agents) {
+        if (entry.failed_agent && a.name === entry.failed_agent) {
+          a.status = "failed";
+        } else if (rolled.has(a.name)) {
+          a.status = "done";
+        } else if (a.status === "running") {
+          a.status = "pending";
+        }
+      }
       // Terminal wins unconditionally and FREEZES the surface.
       st.render = {
         target: entry.pin ?? st.render.target,
@@ -234,6 +310,17 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
         ...(entry.failed_step ? { failedStep: entry.failed_step } : {}),
         ...(entry.failed_agent ? { failedAgent: entry.failed_agent } : {}),
         ...(entry.got !== undefined ? { got: entry.got } : {}),
+        ...(st.agents.length > 0 ? { agents: st.agents } : {}),
+        ...(st.render.m !== undefined ? { m: st.render.m } : {}),
+        requestId: entry.request_id,
+        ...(entry.prior_pin ?? st.render.fromVersion
+          ? { fromVersion: entry.prior_pin ?? st.render.fromVersion }
+          : {}),
+        elapsedMs: (entry.finished_at ?? this.now()) - entry.started_at,
+        // The fresh terminal ping (server.ts pushRolloutTerminal) already
+        // carries the full Deferred command block; suppress it on THIS edited
+        // card so a successful roll doesn't render the 3-command list twice.
+        deferred: false,
       };
       st.frozen = true;
       // Cancel any pending debounced edit — the terminal render supersedes it —
@@ -264,6 +351,7 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
         postAttempts: 0,
         postFailed: false,
         render: { target: entry.pin ?? "" },
+        agents: [],
         frozen: false,
         timer: null,
         pendingEditAfterPost: false,
@@ -319,7 +407,7 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
     if (st.postFailed && !terminal) return false;
     st.posting = true;
     st.postAttempts += 1;
-    const text = renderRolloutStatus(st.render);
+    const text = renderRolloutStatus({ ...st.render, nowMs: this.now() });
     void this.relay
       .post({ requestId, agentName: st.agentName, text })
       .then((mid) => {
@@ -384,7 +472,7 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
       return;
     }
     // Edit in place (fire-and-forget; relay swallows failures incl. 429).
-    const text = renderRolloutStatus(st.render);
+    const text = renderRolloutStatus({ ...st.render, nowMs: this.now() });
     this.relay.edit({
       requestId,
       agentName: st.agentName,
