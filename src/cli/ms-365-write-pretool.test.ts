@@ -11,6 +11,7 @@ import { describe, expect, it } from "vitest";
 import {
   extractMs365Preview,
   GATED_MS365_WRITE_TOOLS,
+  KNOWN_SAFE_MS365_READ_TOOLS,
   isGatedMs365Tool,
 } from "./ms-365-write-pretool.js";
 
@@ -25,10 +26,12 @@ describe("isGatedMs365Tool", () => {
     expect(isGatedMs365Tool("mcp__ms-365__delete-message")).toBe(true);
   });
 
-  it("returns false for read tools (no gating overhead)", () => {
+  it("returns false for VERIFIED read tools (no gating overhead)", () => {
     expect(isGatedMs365Tool("mcp__ms-365__list-files")).toBe(false);
     expect(isGatedMs365Tool("mcp__ms-365__get-drive-item")).toBe(false);
     expect(isGatedMs365Tool("mcp__ms-365__list-events")).toBe(false);
+    expect(isGatedMs365Tool("mcp__ms-365__search-mail")).toBe(false);
+    expect(isGatedMs365Tool("mcp__ms-365__download-bytes")).toBe(false);
   });
 
   it("returns false for non-ms-365 tools (wrong prefix)", () => {
@@ -42,11 +45,40 @@ describe("isGatedMs365Tool", () => {
     expect(isGatedMs365Tool("mcp__ms-365__")).toBe(false);
   });
 
-  it("explicitly does NOT gate Mail.Send (RFC §4.3 — drafts only v1)", () => {
-    expect(isGatedMs365Tool("mcp__ms-365__send-mail")).toBe(false);
-    // Mail.Send is not in v1 scope; the agent shouldn't have access at
-    // all. If a future PR ever adds the scope, this test will need
-    // updating along with GATED_MS365_WRITE_TOOLS.
+  // ── Fail-closed inversion (review 2026-07-11, W2) ────────────────────
+  // An unrecognized MS-365 tool — a renamed or newly-added upstream write —
+  // must REQUIRE approval, not sail through. The allowlist gap defaults to
+  // "gate", never to "allow".
+  it("GATES an unrecognized ms-365 tool (renamed/new write — fail closed)", () => {
+    // A plausibly-renamed upload tool that isn't in our read allowlist.
+    expect(isGatedMs365Tool("mcp__ms-365__upload-file-content-v2")).toBe(true);
+    expect(isGatedMs365Tool("mcp__ms-365__put-file")).toBe(true);
+    expect(isGatedMs365Tool("mcp__ms-365__patch-event")).toBe(true);
+    // A brand-new write surface softeria might add tomorrow.
+    expect(isGatedMs365Tool("mcp__ms-365__move-message")).toBe(true);
+    expect(isGatedMs365Tool("mcp__ms-365__totally-unknown-tool")).toBe(true);
+  });
+
+  it("GATES Mail.Send — a write tool not on the read allowlist (fail closed)", () => {
+    // Pre-fix this was deliberately allowed through ("agent shouldn't have
+    // the scope at all"), which was exactly the fail-open hole: if the
+    // agent ever DID get send access, it bypassed approval. Fail-closed
+    // now requires a card for any unrecognized write.
+    expect(isGatedMs365Tool("mcp__ms-365__send-mail")).toBe(true);
+    expect(isGatedMs365Tool("mcp__ms-365__send-message")).toBe(true);
+  });
+});
+
+describe("KNOWN_SAFE_MS365_READ_TOOLS — read allowlist integrity", () => {
+  it("does not overlap with the gated write set", () => {
+    for (const t of KNOWN_SAFE_MS365_READ_TOOLS) {
+      expect(GATED_MS365_WRITE_TOOLS.has(t), t).toBe(false);
+    }
+  });
+
+  it("does not include any send tool (writes never belong on the read allowlist)", () => {
+    expect(KNOWN_SAFE_MS365_READ_TOOLS.has("send-mail")).toBe(false);
+    expect(KNOWN_SAFE_MS365_READ_TOOLS.has("send-message")).toBe(false);
   });
 });
 

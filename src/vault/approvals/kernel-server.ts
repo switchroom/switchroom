@@ -49,6 +49,7 @@ import {
 import {
   requestApproval,
   lookupDecision,
+  lookupDecisionByRequestId,
   consumeNonce,
   consumeAndRecord,
   revokeDecision,
@@ -395,6 +396,35 @@ function handleRequest(
       agent_unit: req.agent_unit,
       scope: req.scope,
       action: req.action,
+      current_approver_set: req.current_approver_set,
+    });
+    const decision = r.state === "granted" || r.state === "denied"
+      ? {
+          id: r.decision.id,
+          agent_unit: r.decision.agent_unit,
+          scope: r.decision.scope,
+          action: r.decision.action,
+          decision: r.decision.decision,
+          granted_at: r.decision.granted_at,
+          granted_by_user_id: r.decision.granted_by_user_id,
+          ttl_expires_at: r.decision.ttl_expires_at,
+          last_used_at: r.decision.last_used_at,
+          revoked_at: r.decision.revoked_at,
+          revoke_reason: r.decision.revoke_reason,
+        }
+      : null;
+    socket.write(encodeResponse({ ok: true, state: r.state, decision }));
+    return;
+  }
+  if (req.op === "approval_lookup_by_request") {
+    const acl = checkApprovalAclByAgent(agent, req.agent_unit);
+    if (!acl.allow) {
+      socket.write(encodeResponse(errorResponse("DENIED", acl.reason)));
+      return;
+    }
+    const r = lookupDecisionByRequestId(db, {
+      agent_unit: req.agent_unit,
+      request_id: req.request_id,
       current_approver_set: req.current_approver_set,
     });
     const decision = r.state === "granted" || r.state === "denied"

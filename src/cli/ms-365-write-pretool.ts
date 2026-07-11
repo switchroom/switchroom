@@ -30,8 +30,17 @@
  *   - Timeout / no decision → block
  *
  * Fail-open ONLY when:
- *   - Tool isn't in the gated set (unknown / non-write upstream tools)
- *   - SWITCHROOM_AGENT_NAME missing (we don't know which agent we're gating)
+ *   - Tool isn't an MS-365 tool at all (wrong `mcp__ms-365__` prefix), or
+ *     it's a VERIFIED read-only MS-365 tool (KNOWN_SAFE_MS365_READ_TOOLS).
+ *
+ * Fail-CLOSED (require approval) — deterministic, not prompt-dependent:
+ *   - Any known write tool (GATED_MS365_WRITE_TOOLS).
+ *   - Any UNRECOGNIZED `mcp__ms-365__` tool. A renamed or newly-added
+ *     softeria write tool that isn't yet in our read allowlist must NOT
+ *     sail through — an allowlist gap defaults to "require approval",
+ *     never to "allow" (review 2026-07-11, W2 fail-open finding).
+ *   - SWITCHROOM_AGENT_NAME missing → block (we can't identify the agent
+ *     to gate, so we can't prove the operator approved this write).
  */
 
 import { readFileSync } from "node:fs";
@@ -88,9 +97,61 @@ export const GATED_MS365_WRITE_TOOLS = new Set<string>([
   "delete-message",
 ]);
 
+/**
+ * VERIFIED read-only softeria tools that are safe to pass through WITHOUT
+ * an approval card. This is the fail-closed pivot: `isGatedMs365Tool`
+ * gates (requires approval) for any `mcp__ms-365__` tool that is NOT on
+ * this allowlist — so a renamed or newly-added upstream WRITE tool defaults
+ * to "require approval" rather than sailing through unrecognized.
+ *
+ * Names are sourced from softeria's read surface (docs/microsoft-workspace
+ * + RFC #1873): OneDrive reads, calendar reads, mail reads, and identity.
+ * The cost of an omission here is only an extra approval prompt on a read
+ * (annoying, safe) — never an ungated write (unsafe). When UAT (PR 5)
+ * confirms softeria's exact read-tool names, add any missing ones here.
+ */
+export const KNOWN_SAFE_MS365_READ_TOOLS = new Set<string>([
+  // OneDrive / Drive reads
+  "list-files",
+  "list-drive-items",
+  "get-drive-item",
+  "download-bytes",
+  "search-files",
+  // Calendar reads
+  "list-events",
+  "get-event",
+  "list-calendars",
+  "get-calendar",
+  // Mail reads
+  "list-messages",
+  "get-message",
+  "search-mail",
+  "list-mail-folders",
+  "get-mail-folder",
+  // Identity / account
+  "whoami",
+  "get-current-user",
+]);
+
+/**
+ * Should this tool require an operator approval card before it runs?
+ *
+ * Fail-CLOSED classification:
+ *   - Not an `mcp__ms-365__` tool → false (not our surface; another hook
+ *     or the base permission system owns it).
+ *   - A verified read-only tool (KNOWN_SAFE_MS365_READ_TOOLS) → false.
+ *   - Everything else on the `mcp__ms-365__` surface (known writes AND any
+ *     unrecognized / renamed tool) → true (gate).
+ */
 export function isGatedMs365Tool(toolName: string): boolean {
   if (!toolName.startsWith(TOOL_PREFIX)) return false;
-  return GATED_MS365_WRITE_TOOLS.has(toolName.slice(TOOL_PREFIX.length));
+  const bare = toolName.slice(TOOL_PREFIX.length);
+  // Degenerate prefix-only name — not a real tool invocation.
+  if (bare.length === 0) return false;
+  // Verified read-only tools pass through without a card.
+  if (KNOWN_SAFE_MS365_READ_TOOLS.has(bare)) return false;
+  // Known write OR unrecognized MS-365 tool → require approval (fail-closed).
+  return true;
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -308,17 +369,26 @@ async function rpcKernel(payload: Record<string, unknown>): Promise<IpcResult> {
   });
 }
 
-async function approvalLookup(
+/**
+ * Poll the verdict for the SPECIFIC request_id this hook registered.
+ *
+ * We correlate by request_id, NOT by scope: two concurrent MS-365 writes
+ * can share a scope (e.g. `ms-365:write:(new)` for two new-file uploads),
+ * and a scope-keyed lookup would let one write's approval satisfy the
+ * other's gate — a fail-open mis-attribution. `approval_lookup_by_request`
+ * resolves the nonce by request_id and returns only that request's own
+ * decision. (review 2026-07-11, W2 verdict-correlation finding.)
+ */
+async function approvalLookupByRequest(
   agentUnit: string,
-  scope: string,
+  requestId: string,
   approverSet: string[],
 ): Promise<{ state?: string } | null> {
   const res = await rpcKernel({
     v: 1,
-    op: "approval_lookup",
+    op: "approval_lookup_by_request",
     agent_unit: agentUnit,
-    scope,
-    action: "write",
+    request_id: requestId,
     current_approver_set: approverSet,
   });
   if (!res.ok) return null;
@@ -355,9 +425,11 @@ async function main(): Promise<void> {
 
   const agentName = process.env.SWITCHROOM_AGENT_NAME;
   if (!agentName) {
-    // No agent identity — can't gate. Fail open per the docstring
-    // contract (Claude Code protocol error, not our concern).
-    allow();
+    // No agent identity — we can't register/correlate an approval for a
+    // known-write path, so we can't prove the operator authorized it.
+    // Fail CLOSED (review 2026-07-11, W2). The write is already confirmed
+    // gated at this point (isGatedMs365Tool returned true above).
+    fail("SWITCHROOM_AGENT_NAME unset — cannot identify agent to gate write");
   }
 
   const accountEmail = process.env.SWITCHROOM_MICROSOFT_ACCOUNT ?? "(unknown)";
@@ -400,13 +472,15 @@ async function main(): Promise<void> {
     fail(response.reason ?? "gateway returned ok=false");
   }
 
+  const requestId = response.requestId;
   const deadline = response.expiresAtMs ?? Date.now() + HOOK_TIMEOUT_MS;
-  const scope = `ms-365:write:${preview.itemId}`;
-  // We don't know the approver_set in the hook — pass an empty list;
-  // the kernel uses the snapshot taken at register time.
+  // Correlate strictly by the request_id we just registered — not by scope
+  // (concurrent same-scope writes would otherwise cross-attribute verdicts).
+  // We don't know the approver_set in the hook — pass an empty list; the
+  // kernel uses the snapshot taken at register time.
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, KERNEL_POLL_INTERVAL_MS));
-    const lookup = await approvalLookup(agentName, scope, []);
+    const lookup = await approvalLookupByRequest(agentName, requestId, []);
     if (!lookup) continue;
     const state = lookup.state;
     if (state === "granted") allow();

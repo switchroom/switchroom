@@ -280,6 +280,90 @@ export function lookupDecision(
 
   if (!row) return { state: "no_decision" };
 
+  return evaluateDecisionRow(db, row, currentCanonical, opts, now);
+}
+
+/**
+ * Correlate a verdict to the SPECIFIC request_id the caller registered —
+ * NOT to the (agent, scope, action) triple. Two concurrent requests can
+ * share a scope (e.g. `ms-365:write:(new)` for two different new-file
+ * uploads); a scope-keyed `lookupDecision` would let one request's
+ * approval be mis-attributed to the other. This resolves the nonce by
+ * request_id, follows its `decision_id` link (set atomically at
+ * consume+record time), and evaluates only that request's own decision
+ * row. (review 2026-07-11, W2 verdict-correlation finding.)
+ *
+ * States:
+ *   - unknown request_id                       → no_decision
+ *   - nonce pending, not yet decided, unexpired → pending
+ *   - nonce pending, past its TTL               → expired
+ *   - decision recorded but revoked             → denied
+ *   - otherwise → evaluate the linked decision row (granted/denied/…)
+ */
+export function lookupDecisionByRequestId(
+  db: Database,
+  query: {
+    agent_unit: string;
+    request_id: string;
+    current_approver_set: string[];
+  },
+  opts: { max_ttl_lifetime_ms?: number } = {},
+  now: number = Date.now(),
+): LookupResult {
+  const currentCanonical = canonicalizeApproverSet(query.current_approver_set);
+
+  const nonceRow = db
+    .query<Record<string, unknown>, [string]>(
+      `SELECT * FROM approval_nonces WHERE request_id = ?`,
+    )
+    .get(query.request_id);
+  if (!nonceRow) return { state: "no_decision" };
+
+  const nonce = nonceFromRow(nonceRow);
+
+  // Cross-agent isolation (#1399 pattern): a request_id is only readable
+  // by the agent that owns it. A mismatch returns the same non-committal
+  // no_decision as an unknown id — no cross-agent existence/verdict oracle.
+  if (nonce.agent_unit !== query.agent_unit) return { state: "no_decision" };
+
+  if (nonce.decision_id === null) {
+    // No verdict recorded yet. Distinguish "still waiting" from "the
+    // prompt timed out" so the caller can fail closed promptly rather
+    // than spin to its own deadline.
+    if (nonce.expires_at < now) return { state: "expired" };
+    return { state: "pending", request_id: nonce.request_id };
+  }
+
+  const decRow = db
+    .query<Record<string, unknown>, [string]>(
+      `SELECT * FROM approval_decisions WHERE id = ?`,
+    )
+    .get(nonce.decision_id);
+  // Linked decision vanished (can't happen — decisions are never deleted,
+  // only revoked). Defensive terminal fail-closed rather than a hang.
+  if (!decRow) return { state: "expired" };
+
+  // A revoked decision is terminal-not-granted for THIS request.
+  if ((decRow.revoked_at as number | null) != null) {
+    return { state: "denied", decision: rowToDecision(decRow) };
+  }
+
+  return evaluateDecisionRow(db, decRow, currentCanonical, opts, now);
+}
+
+/**
+ * Shared decision-row evaluator: deny_perm short-circuit, TTL expiry,
+ * approver-set drift auto-revoke, single-shot deny, and §7 sliding-window
+ * TTL renewal. Factored out of `lookupDecision` so the request-id-keyed
+ * path (`lookupDecisionByRequestId`) applies the identical policy.
+ */
+function evaluateDecisionRow(
+  db: Database,
+  row: Record<string, unknown>,
+  currentCanonical: string,
+  opts: { max_ttl_lifetime_ms?: number },
+  now: number,
+): LookupResult {
   const decision = rowToDecision(row);
 
   // deny_perm short-circuits before drift / TTL — it's a permanent reject.
