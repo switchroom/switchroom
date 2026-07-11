@@ -676,7 +676,14 @@ import {
   buildQuotaClaimKey,
   QUOTA_WATCH_CLAIM_WINDOW_MS,
   isLiveCorroboration,
+  evaluateFleetRollAnnounce,
+  FLEET_ROLL_ANNOUNCE_KEY,
 } from '../quota-watch.js'
+import {
+  createModelUnavailableCardRegistry,
+  decideAnnouncementDelivery,
+  foldAnnouncementIntoCard,
+} from '../fallback-card-collapse.js'
 import { buildSnapshotsFromState, buildSnapshotsFromCachedState, zipProbeResults } from '../auth-snapshot-format.js'
 import { maskUsername } from '../demo-mask.js'
 import {
@@ -6833,6 +6840,10 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
   const modelUnavailable = resolveModelUnavailableFromOperatorEvent(event)
   let renderedText: string
   let renderedKeyboard: ReturnType<typeof renderOperatorEvent>['keyboard'] | undefined
+  // #3031 PR 3 — when the card promises an in-flight auto-failover, record
+  // each per-chat send in the collapse registry so a SUCCESSFUL swap edits
+  // the card (single evolving message) instead of sending a second one.
+  let cardPromisedFallback = false
   if (modelUnavailable) {
     // Two questions, asked synchronously to avoid the "card promises
     // an announcement that never arrives" trap:
@@ -6857,6 +6868,7 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
       autoFallbackInFlight: willActuallyFire,
     })
     renderedKeyboard = undefined
+    cardPromisedFallback = willActuallyFire
     // Trigger fleet-wide auto-fallback. Pre-fix this branch only
     // rendered the card; the fallback machinery was unreachable from
     // here. We fire-and-forget so card delivery is never blocked on
@@ -6927,11 +6939,26 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
     // very next line is what unlocks the raw bot.api call.
     // Opts now includes message_thread_id when supergroup mode is on.
     // allow-raw-bot-api: operator-event broadcast loop; topic-aware opts
-    void bot.api.sendRichMessage(chat_id, richMessage(renderedText), opts as never).catch(e => {
-      process.stderr.write(
-        `telegram gateway: operator-event send to ${chat_id} failed agent=${agent} kind=${kind}: ${e}\n`,
-      )
-    })
+    void bot.api.sendRichMessage(chat_id, richMessage(renderedText), opts as never)
+      .then((sent: { message_id: number }) => {
+        // #3031 PR 3 — remember the fallback-promising card so the swap
+        // announcement can EDIT it (collapse) instead of sending anew.
+        // Recorded only after the send resolves (we need the message_id);
+        // the collapse path degrades to a plain send when no record exists.
+        if (cardPromisedFallback) {
+          modelUnavailableCardRegistry.record(String(chat_id), {
+            messageId: sent.message_id,
+            text: renderedText,
+            atMs: Date.now(),
+            promisedFallback: true,
+          })
+        }
+      })
+      .catch(e => {
+        process.stderr.write(
+          `telegram gateway: operator-event send to ${chat_id} failed agent=${agent} kind=${kind}: ${e}\n`,
+        )
+      })
   }
 }
 
@@ -21575,6 +21602,16 @@ const fleetFallbackGate = createFleetFallbackGate({
 })
 
 /**
+ * #3031 PR 3 — per-chat registry of the most recent model-unavailable card
+ * that promised an in-flight auto-failover. On a SUCCESSFUL swap the
+ * announcement is folded into an EDIT of that card (single evolving card);
+ * on every failure / no-op outcome the notice stays a separate message
+ * (promise-honesty: the 2026-06-06→07 incident contract). See
+ * fallback-card-collapse.ts for the decision seam.
+ */
+const modelUnavailableCardRegistry = createModelUnavailableCardRegistry()
+
+/**
  * Resume-after-swap gate (auth-failover-stall fix). Owns the single-flight +
  * staleness decision for re-running the turn a mid-turn 429 killed. See
  * fleet-fallback-resume.ts. Wired into doFireFleetAutoFallback below: on a
@@ -21783,6 +21820,34 @@ async function doFireFleetAutoFallback(triggerAgent: string, untilMs?: number): 
     // not the user's answer — silence the open ping.
     const opts = { disable_notification: true }
     for (const chat_id of access.allowFrom) {
+      // #3031 PR 3 — collapse: on a SUCCESSFUL swap, fold the announcement
+      // into an EDIT of the model-unavailable card this gateway just sent to
+      // this chat (single evolving card). One-shot `take` clears the record
+      // either way. Every non-switched outcome that REACHES this loop — and
+      // any edit failure — falls through to the pre-fix separate send.
+      // Known PRE-EXISTING hole, unchanged by the collapse (#3035 review,
+      // finding 2): the all-blocked cooldown early-return above exits before
+      // this loop, so a cooldown-suppressed all-blocked REPEAT delivers
+      // neither edit nor message even when a promising card exists. The
+      // first all-blocked card of a window does arrive and answers the
+      // promise; only the repeats inside the 30-min window are silent.
+      const card = modelUnavailableCardRegistry.take(String(chat_id), Date.now())
+      if (decideAnnouncementDelivery(outcome.kind, card) === 'edit' && card) {
+        try {
+          // allow-raw-bot-api: guarded edit; failure falls through to the wrapped send below
+          await bot.api.editMessageText(
+            chat_id,
+            card.messageId,
+            richMessage(foldAnnouncementIntoCard(card.text, outcome.announcement)),
+            {},
+          )
+          continue
+        } catch (err) {
+          process.stderr.write(
+            `telegram gateway: [fleet-fallback] card edit failed chat=${chat_id} — sending announcement separately: ${(err as Error)?.message ?? err}\n`,
+          )
+        }
+      }
       void swallowingApiCall(
         // allow-raw-bot-api: wrapped in swallowingApiCall (retry policy)
         () => bot.api.sendRichMessage(chat_id, richMessage(outcome.announcement), opts),
@@ -22034,6 +22099,61 @@ async function runQuotaWatch(opts: { bootTick?: boolean } = {}): Promise<void> {
     }
   }
 
+  // #3031 PR 3 — broker-initiated proactive roll announcement. The broker's
+  // fleetQuotaProbeTick roll previously emitted stdout + audit only (zero
+  // operator Telegram visibility); it now records `last_fleet_roll` in
+  // list-state. Edge-triggered on the roll's `at` timestamp; deduped across
+  // the multi-gateway fan-in via the same broker claim-notification verb the
+  // per-account pushes use — one card per roll per chat, fleet-wide.
+  {
+    const rollPrev = watchState[FLEET_ROLL_ANNOUNCE_KEY] ?? emptyAccountState()
+    const rollDecision = evaluateFleetRollAnnounce({
+      roll: listStateData.last_fleet_roll ?? null,
+      prev: rollPrev,
+      now,
+    })
+    if (rollDecision.kind === 'notify') {
+      for (const chat_id of access.allowFrom) {
+        if (tuning.fleetDedup) {
+          const granted = await claimQuotaNotification(
+            brokerClient,
+            buildQuotaClaimKey(
+              FLEET_ROLL_ANNOUNCE_KEY,
+              String(listStateData.last_fleet_roll!.at),
+              chat_id,
+            ),
+          )
+          if (!granted) {
+            process.stderr.write(
+              `telegram gateway: quota-watch: fleet-roll claim denied chat=${chat_id} — another agent notified\n`,
+            )
+            continue
+          }
+        }
+        await swallowingApiCall(
+          () =>
+            bot.api.sendRichMessage(chat_id, richMessage(rollDecision.message), {
+              // Reassuring status notice, not the user's answer — silent.
+              disable_notification: true,
+            }),
+          { chat_id, verb: 'quota-watch.fleet-roll' },
+        )
+      }
+      // Persist immediately — mirrors the all-exhausted block's rationale:
+      // a per-account early return below must not drop the latch advance.
+      watchState = patchQuotaWatchState(watchState, FLEET_ROLL_ANNOUNCE_KEY, rollDecision.newState)
+      try {
+        saveQuotaWatchState(stateDir, watchState)
+      } catch (err) {
+        process.stderr.write(`telegram gateway: quota-watch: fleet-roll state save failed: ${err}\n`)
+      }
+      process.stderr.write(
+        `telegram gateway: quota-watch: announced broker fleet roll ` +
+          `${listStateData.last_fleet_roll!.from} → ${listStateData.last_fleet_roll!.to}\n`,
+      )
+    }
+  }
+
   // First pass: evaluate all accounts against cached state. Collect
   // labels that need a live probe (i.e. accounts with a detected transition
   // that we're about to notify about). We probe those to get fresh
@@ -22053,9 +22173,13 @@ async function runQuotaWatch(opts: { bootTick?: boolean } = {}): Promise<void> {
   let reconciledCount = 0
   let mutatedState = watchState
 
+  // #3031 PR 3 — thread the last broker roll so a 🟡 throttling push for the
+  // just-rolled-off account is latched silently (the roll card covered it).
+  const lastRoll = listStateData.last_fleet_roll ?? null
+
   for (const snap of snapshots) {
     const prev = watchState[snap.label] ?? emptyAccountState()
-    const decision = evaluateQuotaWatchAccount({ agentName, snap, prev, now, bootTick, tuning })
+    const decision = evaluateQuotaWatchAccount({ agentName, snap, prev, now, bootTick, tuning, lastRoll })
     if (decision.kind === 'reconcile') {
       mutatedState = patchQuotaWatchState(mutatedState, decision.accountLabel, decision.newAccountState)
       reconciledCount++
@@ -22150,7 +22274,7 @@ async function runQuotaWatch(opts: { bootTick?: boolean } = {}): Promise<void> {
       // staleness gate never misfires on data we JUST probed.
       const enrichedSnap = { ...snapshots[snapIndex]!, quota: freshEntry!.result.data, capturedAtMs: undefined }
       const prev = watchState[accountLabel] ?? emptyAccountState()
-      const re = evaluateQuotaWatchAccount({ agentName, snap: enrichedSnap, prev, now, bootTick, tuning })
+      const re = evaluateQuotaWatchAccount({ agentName, snap: enrichedSnap, prev, now, bootTick, tuning, lastRoll })
       // If the fresh probe still shows the same transition, use the
       // enriched message. If it no longer shows a transition (e.g. the
       // account recovered in the 100ms between listState and probe),

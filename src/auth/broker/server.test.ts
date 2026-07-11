@@ -2227,6 +2227,95 @@ describe("AuthBroker — probe-quota", () => {
       broker.stop();
     }
   });
+
+  // #3031 PR 3 — broker-roll visibility: a proactive fleetQuotaProbeTick roll
+  // records `last_fleet_roll` (exposed via list-state) so gateways can announce
+  // it; the reactive mark-exhausted path deliberately does NOT (the triggering
+  // gateway announces that swap itself).
+  it("fleetQuotaProbeTick roll records last_fleet_roll in list-state (and persists across restart)", async () => {
+    const clock = Date.UTC(2026, 6, 11, 8, 0, 0);
+    const resetAt = new Date(clock + 2 * 3600_000);
+    const h = makeHarness();
+    const mkConfig = () => makeConfig(h, {
+      active: "default",
+      fallback_order: ["default", "secondary"],
+      agents: { ziggy: {} },
+    });
+    seedAccount(h, "default", { expiresAt: 9_999_999_999_999 });
+    seedAccount(h, "secondary", { expiresAt: 9_999_999_999_999 });
+    const fetchQuota = async ({ accessToken }: { accessToken: string }) => {
+      const label = accessToken.replace(/^at-/, "");
+      return label === "default"
+        ? { ok: true as const, data: { fiveHourUtilizationPct: 100, sevenDayUtilizationPct: 40, fiveHourResetAt: resetAt, sevenDayResetAt: null, representativeClaim: null, overageStatus: null, overageDisabledReason: null } }
+        : { ok: true as const, data: { fiveHourUtilizationPct: 5, sevenDayUtilizationPct: 10, fiveHourResetAt: null, sevenDayResetAt: null, representativeClaim: null, overageStatus: null, overageDisabledReason: null } };
+    };
+    const brokerOpts = {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+      now: () => clock,
+      _testFetchQuota: fetchQuota,
+    };
+    const broker = new AuthBroker(mkConfig(), brokerOpts);
+    const client = new AuthBrokerClient({ socket: join(h.socketRoot, "ziggy", "sock") });
+    try {
+      await broker.start();
+      await broker.fleetQuotaProbeTick();
+      const roll = (await client.listState()).last_fleet_roll;
+      expect(roll).toBeTruthy();
+      expect(roll!.from).toBe("default");
+      expect(roll!.to).toBe("secondary");
+      expect(roll!.at).toBe(clock);
+      expect(roll!.window).toBe("5h");
+      expect(roll!.pct).toBeCloseTo(100, 1);
+      expect(roll!.exhausted_until).toBe(resetAt.getTime());
+    } finally {
+      await client.close();
+      broker.stop();
+    }
+    // Persisted: a fresh broker on the same stateDir still serves the roll.
+    const broker2 = new AuthBroker(mkConfig(), brokerOpts);
+    const client2 = new AuthBrokerClient({ socket: join(h.socketRoot, "ziggy", "sock") });
+    try {
+      await broker2.start();
+      const roll2 = (await client2.listState()).last_fleet_roll;
+      expect(roll2?.from).toBe("default");
+      expect(roll2?.to).toBe("secondary");
+      expect(roll2?.at).toBe(clock);
+    } finally {
+      await client2.close();
+      broker2.stop();
+    }
+  });
+
+  it("reactive mark-exhausted does NOT record last_fleet_roll (gateway announces that swap itself)", async () => {
+    const clock = Date.UTC(2026, 6, 11, 8, 0, 0);
+    const h = makeHarness();
+    const config = makeConfig(h, {
+      active: "default",
+      fallback_order: ["default", "secondary"],
+      agents: { ziggy: {} },
+    });
+    seedAccount(h, "default", { expiresAt: 9_999_999_999_999 });
+    seedAccount(h, "secondary", { expiresAt: 9_999_999_999_999 });
+    const broker = new AuthBroker(config, {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+      now: () => clock,
+      _testFetchQuota: async ({ accessToken }: { accessToken: string }) =>
+        accessToken === "at-default"
+          ? { ok: true as const, data: { fiveHourUtilizationPct: 100, sevenDayUtilizationPct: 40, fiveHourResetAt: null, sevenDayResetAt: null, representativeClaim: null, overageStatus: null, overageDisabledReason: null } }
+          : { ok: true as const, data: { fiveHourUtilizationPct: 5, sevenDayUtilizationPct: 10, fiveHourResetAt: null, sevenDayResetAt: null, representativeClaim: null, overageStatus: null, overageDisabledReason: null } },
+    });
+    const sock = join(h.socketRoot, "ziggy", "sock");
+    const client = new AuthBrokerClient({ socket: sock });
+    try {
+      await broker.start();
+      const resp = (await rpc(sock, { v: 1, id: "1", op: "mark-exhausted", until: clock + 3600_000 })) as { data: { rolledTo: string | null } };
+      expect(resp.data.rolledTo).toBe("secondary"); // the roll happened…
+      expect((await client.listState()).last_fleet_roll ?? null).toBeNull(); // …but is not broker-announced
+    } finally {
+      await client.close();
+      broker.stop();
+    }
+  });
 });
 
 describe("AuthBroker — drift detection", () => {
