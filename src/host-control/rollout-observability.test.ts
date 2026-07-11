@@ -207,7 +207,7 @@ describe("renderRolloutStatus", () => {
     expect(out.startsWith("✅")).toBe(true);
     expect(out).toContain("Done");
     expect(out).toContain("rolled 2/2 agent(s) in 8m 12s");
-    expect(out).toContain("test-harness, clerk");
+    expect(out).toContain("`test-harness`, `clerk`");
     // Deferred host-side components with their exact update commands.
     expect(out).toContain("Deferred");
     expect(out).toContain("switchroom webd install --tag v1.2.3");
@@ -234,6 +234,91 @@ describe("renderRolloutStatus", () => {
     expect(out).toContain("after 1m 5s");
     // A failed roll must NOT advertise the deferred-update commands.
     expect(out).not.toContain("Deferred");
+  });
+
+  it("code-spans agent names everywhere (underscores must not italicize in GFM)", () => {
+    // Phase line + rolled join, in-flight.
+    const inflight = renderRolloutStatus({
+      target: "v1.2.3",
+      phase: "agent-start",
+      agent: "data_pipeline_bot",
+      n: 2,
+      m: 3,
+      rolled: ["test_harness"],
+    });
+    expect(inflight).toContain("restarting `data_pipeline_bot`");
+    // Terminal joins.
+    const done = renderRolloutStatus({
+      target: "v1.2.3",
+      terminal: "completed",
+      rolled: ["test_harness", "data_pipeline_bot"],
+    });
+    expect(done).toContain("`test_harness`, `data_pipeline_bot`");
+    const err = renderRolloutStatus({
+      target: "v1.2.3",
+      terminal: "error",
+      failedStep: "restart-agent",
+      failedAgent: "data_pipeline_bot",
+      got: null,
+      rolled: ["test_harness"],
+    });
+    expect(err).toContain("Rolled before stop: `test_harness`.");
+    // Canary phase lines.
+    const canary = renderRolloutStatus({
+      target: "v1.2.3",
+      phase: "canary-pass",
+      agent: "test_harness",
+    });
+    expect(canary).toContain("canary passed (`test_harness`)");
+    // No agent name appears outside a code span in any of the renders.
+    for (const out of [inflight, done, err, canary]) {
+      expect(out).not.toMatch(/(^|[^`])(?:test_harness|data_pipeline_bot)([^`]|$)/);
+    }
+  });
+
+  it("collapses the checklist when a big fleet would overflow the message-size ceiling", () => {
+    // Synthetic 60-agent fleet with long names — the full render would exceed
+    // Telegram's edit limit (the gateway swallows MESSAGE_TOO_LONG, silently
+    // freezing the narration), so the render must fall back to compact mode.
+    const names = Array.from(
+      { length: 60 },
+      (_, i) =>
+        `agent-with-a-rather-long-and-quite-descriptive-container-name-${String(i).padStart(2, "0")}`,
+    );
+    const agents = names.map((name, i) => ({
+      name,
+      status: (i < 58 ? "done" : i === 58 ? "running" : "pending") as
+        | "done"
+        | "running"
+        | "pending",
+      ...(i < 58 ? { durationMs: 40_000 } : {}),
+      ...(i === 0 ? { canary: true } : {}),
+    }));
+    const out = renderRolloutStatus({
+      target: "v1.2.3",
+      phase: "agent-start",
+      agent: names[58],
+      n: 59,
+      m: 60,
+      rolled: names.slice(0, 58),
+      agents,
+    });
+    expect(out.length).toBeLessThan(3900);
+    // Completed agents folded into one count line; the active agent survives.
+    expect(out).toContain("- ✓ 58 done");
+    expect(out).toContain(`- ⏳ \`${names[58]}\` — restarting…`);
+    expect(out).toContain("more pending");
+    // Terminal render for the same fleet also stays under the ceiling.
+    const done = renderRolloutStatus({
+      target: "v1.2.3",
+      terminal: "completed",
+      rolled: names,
+      m: 60,
+      elapsedMs: 2_400_000,
+      agents: agents.map((a) => ({ ...a, status: "done" as const })),
+    });
+    expect(done.length).toBeLessThan(3900);
+    expect(done).toContain("- ✓ 60 done");
   });
 
   it("renders 'unreachable' when the failed agent version is null", () => {

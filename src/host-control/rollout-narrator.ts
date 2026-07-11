@@ -192,9 +192,6 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
         });
         break;
       }
-      case "hostd-web-deferred":
-        st.render.deferred = true;
-        break;
       default:
         break;
     }
@@ -320,7 +317,10 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
           ? { fromVersion: entry.prior_pin ?? st.render.fromVersion }
           : {}),
         elapsedMs: (entry.finished_at ?? this.now()) - entry.started_at,
-        ...(st.render.deferred !== undefined ? { deferred: st.render.deferred } : {}),
+        // The fresh terminal ping (server.ts pushRolloutTerminal) already
+        // carries the full Deferred command block; suppress it on THIS edited
+        // card so a successful roll doesn't render the 3-command list twice.
+        deferred: false,
       };
       st.frozen = true;
       // Cancel any pending debounced edit — the terminal render supersedes it —

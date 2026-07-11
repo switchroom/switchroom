@@ -77,15 +77,15 @@ function phaseLine(s: RolloutRenderState): string {
     case "apply":
       return "applying — regenerating compose";
     case "canary-start":
-      return `canary — restarting ${s.agent ?? "canary agent"}`;
+      return `canary — restarting ${s.agent ? `\`${s.agent}\`` : "canary agent"}`;
     case "canary-pass":
-      return `canary passed (${s.agent ?? "canary"}) — rolling the rest`;
+      return `canary passed (${s.agent ? `\`${s.agent}\`` : "canary"}) — rolling the rest`;
     case "canary-fail":
-      return `canary failed (${s.agent ?? "canary"})`;
+      return `canary failed (${s.agent ? `\`${s.agent}\`` : "canary"})`;
     case "agent-start":
-      return `agent ${s.n ?? "?"}/${s.m ?? "?"} — restarting ${s.agent ?? ""}`.trim();
+      return `agent ${s.n ?? "?"}/${s.m ?? "?"} — restarting ${s.agent ? `\`${s.agent}\`` : ""}`.trim();
     case "agent-done":
-      return `agent ${s.n ?? "?"}/${s.m ?? "?"} — ${s.agent ?? ""} done`.trim();
+      return `agent ${s.n ?? "?"}/${s.m ?? "?"} — ${s.agent ? `\`${s.agent}\`` : ""} done`.trim();
     case "persist-pin":
       return "persisting pin";
     case "hostd-web-deferred":
@@ -126,16 +126,26 @@ function headerLine(s: RolloutRenderState, icon: string): string {
   return `${icon} **Rollout** ${arrow}${req}`;
 }
 
-/** One `- <glyph> agent` checklist line per known agent, in roll order. */
-function checklistLines(s: RolloutRenderState): string[] {
+/**
+ * One `- <glyph> agent` checklist line per known agent, in roll order.
+ *
+ * `compact` is the message-size fallback (see MAX_RENDER_CHARS): completed
+ * and pending agents fold into single count lines so a large fleet can never
+ * push the render past Telegram's edit limit (an oversized edit would be
+ * swallowed by the gateway and silently freeze the narration).
+ */
+function checklistLines(s: RolloutRenderState, compact: boolean): string[] {
   const agents = s.agents ?? [];
   const lines: string[] = [];
+  let doneCount = 0;
+  let pendingNamed = 0;
   for (const a of agents) {
     const canary = a.canary ? " (canary)" : "";
     const dur = a.durationMs !== undefined ? ` — ${formatDurationMs(a.durationMs)}` : "";
     switch (a.status) {
       case "done":
-        lines.push(`- ✓ \`${a.name}\`${canary}${dur}`);
+        if (compact) doneCount += 1;
+        else lines.push(`- ✓ \`${a.name}\`${canary}${dur}`);
         break;
       case "running":
         lines.push(`- ⏳ \`${a.name}\`${canary} — restarting…`);
@@ -144,14 +154,17 @@ function checklistLines(s: RolloutRenderState): string[] {
         lines.push(`- ✗ \`${a.name}\`${canary} — failed${dur}`);
         break;
       default:
-        lines.push(`- · \`${a.name}\`${canary}`);
+        if (compact) pendingNamed += 1;
+        else lines.push(`- · \`${a.name}\`${canary}`);
     }
   }
+  if (doneCount > 0) lines.unshift(`- ✓ ${doneCount} done`);
   // Agents we haven't seen a phase for yet (names unknown until their
   // agent-start row): collapse into one pending line.
-  const remaining = s.m !== undefined ? s.m - agents.length : 0;
-  if (remaining > 0 && agents.length > 0) {
-    lines.push(`- · ${remaining} more pending`);
+  const unseen = s.m !== undefined ? Math.max(0, s.m - agents.length) : 0;
+  const pendingTotal = unseen + pendingNamed;
+  if (pendingTotal > 0 && agents.length > 0) {
+    lines.push(`- · ${pendingTotal} more pending`);
   }
   return lines;
 }
@@ -182,14 +195,26 @@ function deferredLines(target: string): string[] {
 }
 
 /**
- * Render the full status message body. When `terminal` is set, renders the
- * final ✅/❌ summary; otherwise the in-flight progress checklist. Always leads
- * with the target so the message is self-describing when scrolled back to.
+ * Defensive size ceiling for the rendered message. Telegram caps message text
+ * at 4096 chars, and the gateway's edit path deliberately swallows failures
+ * (incl. MESSAGE_TOO_LONG) — an oversized render would therefore freeze the
+ * narration silently. Past this threshold the render retries in compact mode
+ * (completed/pending agents fold into count lines, name lists become counts).
  */
-export function renderRolloutStatus(s: RolloutRenderState): string {
+const MAX_RENDER_CHARS = 3800;
+
+/** Code-span a rolled-agent name list, or a bare count in compact mode
+ *  (names may contain `_`, which italicizes in GFM outside a code span). */
+function rolledList(rolled: string[], compact: boolean): string {
+  if (rolled.length === 0) return "none";
+  if (compact) return `${rolled.length} agent(s)`;
+  return rolled.map((r) => `\`${r}\``).join(", ");
+}
+
+function renderWith(s: RolloutRenderState, compact: boolean): string {
   const rolled = s.rolled ?? [];
   const rolledCount = rolled.length;
-  const checklist = checklistLines(s);
+  const checklist = checklistLines(s, compact);
   const elapsedMs =
     s.elapsedMs ??
     (s.startedAtMs !== undefined && s.nowMs !== undefined
@@ -200,7 +225,7 @@ export function renderRolloutStatus(s: RolloutRenderState): string {
     const parts = [headerLine(s, "✅")];
     let summary = `**Done** — rolled ${rolledCount}${s.m !== undefined ? `/${s.m}` : ""} agent(s)`;
     if (elapsedMs !== undefined) summary += ` in ${formatDurationMs(elapsedMs)}`;
-    summary += `: ${rolled.join(", ") || "none"}.`;
+    summary += compact ? "." : `: ${rolledList(rolled, compact)}.`;
     parts.push(summary);
     if (checklist.length > 0) parts.push("", ...checklist);
     if (s.deferred !== false) parts.push("", ...deferredLines(s.target));
@@ -214,7 +239,7 @@ export function renderRolloutStatus(s: RolloutRenderState): string {
     const parts = [headerLine(s, "❌")];
     let summary = `**STOPPED**${where}`;
     if (elapsedMs !== undefined) summary += ` after ${formatDurationMs(elapsedMs)}`;
-    summary += `. Rolled before stop: ${rolled.join(", ") || "none"}.`;
+    summary += `. Rolled before stop: ${rolledList(rolled, compact)}.`;
     parts.push(summary);
     if (checklist.length > 0) parts.push("", ...checklist);
     return parts.join("\n");
@@ -231,4 +256,17 @@ export function renderRolloutStatus(s: RolloutRenderState): string {
   if (eta) footer.push(eta);
   if (footer.length > 0) parts.push("", footer.join(" · "));
   return parts.join("\n");
+}
+
+/**
+ * Render the full status message body. When `terminal` is set, renders the
+ * final ✅/❌ summary; otherwise the in-flight progress checklist. Always leads
+ * with the target so the message is self-describing when scrolled back to.
+ * Falls back to a compact render (folded checklist, counts instead of name
+ * lists) when the full render would exceed the message-size ceiling.
+ */
+export function renderRolloutStatus(s: RolloutRenderState): string {
+  const full = renderWith(s, /* compact */ false);
+  if (full.length <= MAX_RENDER_CHARS) return full;
+  return renderWith(s, /* compact */ true);
 }

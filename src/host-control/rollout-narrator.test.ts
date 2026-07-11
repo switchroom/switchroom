@@ -115,7 +115,7 @@ describe("LogTailRolloutNarrator", () => {
     expect(relay.edits[0]!.text).toContain("agent 2/3");
   });
 
-  it("accumulates a per-agent checklist with durations, ETA and the deferred section", async () => {
+  it("accumulates a per-agent checklist with durations and ETA; terminal edit omits the Deferred block", async () => {
     const relay = makeRelay(100);
     const n = new LogTailRolloutNarrator(relay, { debounceMs: 500 });
     const entry = makeEntry({ started_at: Date.now(), prior_pin: "v1.2.2" });
@@ -143,8 +143,10 @@ describe("LogTailRolloutNarrator", () => {
     expect(t).toContain("1/3 rolled");
     expect(t).toContain("~1m 20s left (rough est.)");
 
-    // Deferral + terminal: the final edit lists what stays on the prior
-    // version and the host-side commands, plus the elapsed total.
+    // Terminal: the final edit shows the summary + elapsed total, but NOT the
+    // Deferred command block — the fresh terminal ping (pushRolloutTerminal)
+    // carries that, and rendering it on both would duplicate the 3-command
+    // list per successful roll.
     n.onPhase(entry, phase("agent-done", { agent: "clerk", n: 2, m: 3 }));
     n.onPhase(entry, phase("agent-start", { agent: "marko", n: 3, m: 3 }));
     n.onPhase(entry, phase("agent-done", { agent: "marko", n: 3, m: 3 }));
@@ -164,8 +166,8 @@ describe("LogTailRolloutNarrator", () => {
     expect(final).toContain("rolled 3/3 agent(s) in 5m");
     expect(final).toContain("- ✓ `clerk`");
     expect(final).toContain("- ✓ `marko`");
-    expect(final).toContain("Deferred");
-    expect(final).toContain("switchroom webd install --tag v1.2.3");
+    expect(final).not.toContain("Deferred");
+    expect(final).not.toContain("switchroom webd install");
   });
 
   it("marks the failed agent ✗ on a terminal error", async () => {
