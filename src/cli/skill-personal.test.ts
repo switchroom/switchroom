@@ -244,6 +244,77 @@ describe("initPersonalAction", () => {
   });
 });
 
+describe("cross-agent identity pin (#3084 security audit)", () => {
+  // Parity with agent-config.ts (resolveTargetAgent) and
+  // agent-config-skill-write.ts (resolveAgentName): when the calling
+  // environment pins an identity via SWITCHROOM_AGENT_NAME, a
+  // caller-supplied --agent that differs must be refused across every
+  // personal-skill verb, not silently honored.
+  let root: string;
+  let orig: string | undefined;
+
+  beforeEach(() => {
+    root = tmpAgentsRoot();
+    orig = process.env.SWITCHROOM_AGENT_NAME;
+    process.env.SWITCHROOM_AGENT_NAME = AGENT;
+  });
+
+  afterEach(() => {
+    if (orig === undefined) delete process.env.SWITCHROOM_AGENT_NAME;
+    else process.env.SWITCHROOM_AGENT_NAME = orig;
+    try { rmSync(root, { recursive: true, force: true }); } catch { /**/ }
+  });
+
+  it("rejects init-personal when --agent differs from the pinned identity", () => {
+    const skillFile = join(root, "input.md");
+    writeFileSync(skillFile, validSkillMd("pinme"));
+    // Pinned to AGENT, but caller asks to write as "victim" — deny.
+    expectExitCode(() => {
+      initPersonalAction("pinme", { agent: "victim", from: skillFile, root });
+    }, 2);
+    // Nothing was written into either agent's workspace.
+    expect(existsSync(join(root, "victim", ".claude/skills/personal-pinme"))).toBe(false);
+    expect(existsSync(join(root, AGENT, ".claude/skills/personal-pinme"))).toBe(false);
+  });
+
+  it("rejects edit/remove/list/clone when --agent differs from the pinned identity", () => {
+    const skillFile = join(root, "input.md");
+    writeFileSync(skillFile, validSkillMd("pinme"));
+    expectExitCode(() => {
+      editPersonalAction("pinme", { agent: "victim", from: skillFile, root });
+    }, 2);
+    expectExitCode(() => {
+      removePersonalAction("pinme", { agent: "victim", root });
+    }, 2);
+    expectExitCode(() => {
+      listPersonalAction({ agent: "victim", root });
+    }, 2);
+    expectExitCode(() => {
+      clonePersonalAction("bundled:whatever", { agent: "victim", root });
+    }, 2);
+  });
+
+  it("proceeds when --agent matches the pinned identity", () => {
+    const skillFile = join(root, "input.md");
+    writeFileSync(skillFile, validSkillMd("matches"));
+    const out = captureStdout(() => {
+      initPersonalAction("matches", { agent: AGENT, from: skillFile, root });
+    });
+    expect(JSON.parse(out).ok).toBe(true);
+    expect(existsSync(join(root, AGENT, ".claude/skills/personal-matches/SKILL.md"))).toBe(true);
+  });
+
+  it("proceeds when --agent is omitted (falls back to the pinned identity)", () => {
+    const skillFile = join(root, "input.md");
+    writeFileSync(skillFile, validSkillMd("omitted"));
+    const out = captureStdout(() => {
+      initPersonalAction("omitted", { from: skillFile, root });
+    });
+    expect(JSON.parse(out).ok).toBe(true);
+    expect(existsSync(join(root, AGENT, ".claude/skills/personal-omitted/SKILL.md"))).toBe(true);
+  });
+});
+
 describe("editPersonalAction", () => {
   let root: string;
   beforeEach(() => { root = tmpAgentsRoot(); });

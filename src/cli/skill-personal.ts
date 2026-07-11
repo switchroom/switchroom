@@ -271,6 +271,18 @@ function resolveAgent(opts: AgentOpts): string {
   if (!SKILL_SLUG_RE.test(agent)) {
     fail(`agent name has invalid shape: ${JSON.stringify(agent)}`);
   }
+  // Cross-agent denial — parity with agent-config.ts (resolveTargetAgent)
+  // and agent-config-skill-write.ts (resolveAgentName). When the calling
+  // environment pins an identity, a caller-supplied --agent must match it;
+  // a mismatch is a cross-agent write attempt and is refused. Previously
+  // this leaned on container mount topology (agents mount only their own
+  // dir) rather than an explicit control.
+  if (fromEnv && opts.agent && opts.agent !== fromEnv) {
+    fail(
+      `cross-agent skill writes are denied: agent=${opts.agent} but ` +
+        `identity is pinned to ${fromEnv}`,
+    );
+  }
   return agent;
 }
 
