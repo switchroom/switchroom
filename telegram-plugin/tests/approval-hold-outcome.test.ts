@@ -261,14 +261,27 @@ describe('gateway wiring — the leash', () => {
     'utf8',
   )
 
+  /**
+   * One anchor + one span for the TTL sweep, shared by every pin below.
+   *
+   * They drifted apart before: one pin still anchored on the inline `for` loop the
+   * shared-sweep extraction had deleted, so it silently matched nothing. A single
+   * definition means a future move breaks every pin at once — loudly — instead of
+   * quietly disarming one of them.
+   *
+   * The span must cover the whole `onExpire` body (~4.2k chars today).
+   */
+  const SWEEP_ANCHOR = 'sweepPermissionTtl({'
+  const SWEEP_SPAN = 6000
+
   it('the TTL sweep routes through the SHARED shouldExpirePermission()', () => {
     // This pin is no longer the safety net — the behavioural tests above are, and
     // they now drive the same `shouldExpirePermission` the gateway does, so deleting
     // the leash turns them RED. This only guards the WIRING: that the sweep can't
     // regrow a private inline check that drifts from what the test exercises.
-    const sweepStart = GATEWAY_SRC.indexOf('sweepPermissionTtl({')
+    const sweepStart = GATEWAY_SRC.indexOf(SWEEP_ANCHOR)
     expect(sweepStart).toBeGreaterThan(-1)
-    const sweep = GATEWAY_SRC.slice(sweepStart, sweepStart + 3500)
+    const sweep = GATEWAY_SRC.slice(sweepStart, sweepStart + SWEEP_SPAN)
     expect(GATEWAY_SRC).toContain('sweepPermissionTtl({')
     // …and must NOT carry its own copy of the leash or the raw TTL comparison.
     // …and the gateway must not regrow a private inline leash check.
@@ -288,9 +301,27 @@ describe('gateway wiring — the leash', () => {
 
   it('nothing in the permission path auto-approves', () => {
     // Never, under any circumstance. A held approval that "times out" into an
-    // allow would be the worst possible reading of Ken's call.
-    const sweepStart = GATEWAY_SRC.indexOf('for (const [k, v] of pendingPermissions) {')
-    const sweep = GATEWAY_SRC.slice(sweepStart, sweepStart + 2500)
+    // ALLOW would be the worst possible reading of Ken's call — the other half of
+    // no-self-escalation.
+    //
+    // This pin was DEAD. It anchored on `for (const [k, v] of pendingPermissions) {`,
+    // the inline loop that the shared-sweep extraction deleted. `indexOf` returned
+    // -1, `slice(-1, 2499)` returned the EMPTY STRING, and `not.toContain` passes on
+    // "" — so the sweep could be changed to dispatch `behavior: 'allow'` and all 13
+    // tests stayed green. Exactly the failure class this file exists to prevent,
+    // inside the file that exists to prevent it.
+    //
+    // Two rules now, and they apply to every grep pin here:
+    //   1. ASSERT THE ANCHOR RESOLVES. A silent -1 is what turns a pin into a lie.
+    //   2. Assert something POSITIVE inside the window, so a window that is too
+    //      small (or empty) fails loudly instead of vacuously passing a `not`.
+    const sweepStart = GATEWAY_SRC.indexOf(SWEEP_ANCHOR)
+    expect(sweepStart).toBeGreaterThan(-1)
+    const sweep = GATEWAY_SRC.slice(sweepStart, sweepStart + SWEEP_SPAN)
+
+    // POSITIVE: proves the window actually covers the verdict dispatch.
+    expect(sweep).toContain("behavior: 'deny',")
+    // …and the sweep may only ever deny. Never allow.
     expect(sweep).not.toContain("behavior: 'allow'")
   })
 })
