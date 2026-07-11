@@ -258,6 +258,8 @@ import {
   startLoopbackFlow,
   submitLoopbackRedirect,
   cancelLoopbackFlow,
+  shouldConsumeLoopbackPaste,
+  trackFlowExit,
 } from './auth-loopback-relay.js'
 import {
   initHistory, recordInbound, recordOutbound, recordEdit,
@@ -6588,16 +6590,23 @@ const pendingStateReaper = setInterval(() => {
       pendingAuthAddFlows.delete(k)
     }
   }
+  for (const [k, v] of awaitingAuthCodeAt) {
+    if (now - v > AUTH_CODE_CONTEXT_TTL_MS) awaitingAuthCodeAt.delete(k)
+  }
   // Loopback OAuth relay flows (issue #2582) — same TTL. Kill the waiting
   // CLI child so an abandoned consent never lingers with a bound listener.
+  // Placed AFTER the OAuth-code cluster above, which secret-detect-oauth-
+  // code.test.ts pins as contiguous within the first 800 chars of the
+  // reaper (same precedent as the Microsoft connect sweep below). A flow
+  // with a submit in flight is skipped (PR #3100 review finding 3): a paste
+  // near the TTL boundary must not have its child killed mid-registration —
+  // the submit path owns cleanup once `submitting` is set.
   for (const [k, v] of pendingLoopbackFlows) {
+    if (v.submitting) continue
     if (now - v.startedAt > REAUTH_INTERCEPT_TTL_MS) {
       cancelLoopbackFlow(v)
       pendingLoopbackFlows.delete(k)
     }
-  }
-  for (const [k, v] of awaitingAuthCodeAt) {
-    if (now - v > AUTH_CODE_CONTEXT_TTL_MS) awaitingAuthCodeAt.delete(k)
   }
   // Microsoft connect flows self-expire at the device code's own expiry
   // (~15 min) — sweep past that + grace so an abandoned card doesn't pin
@@ -17839,10 +17848,27 @@ async function handleInbound(
   // pending for this chat and the operator pastes their `127.0.0.1:<port>`
   // redirect URL, validate `state` and hand the code to the waiting CLI
   // listener. The LLM never sees the code (same hygiene rationale as above).
+  // Consume-gate is deliberately narrow (PR #3100 review finding 1): only a
+  // message that actually parses as a loopback redirect — carrying a code,
+  // or a provider `error` param — is consumed and deleted. Unrelated chatter
+  // that merely mentions localhost/127.0.0.1 flows through untouched.
   const pendingLoop = pendingLoopbackFlows.get(interceptKey)
-  if (pendingLoop && /(?:127\.0\.0\.1|localhost)/.test(text)) {
+  if (pendingLoop && shouldConsumeLoopbackPaste(text)) {
     const elapsed = Date.now() - pendingLoop.startedAt
     if (elapsed < REAUTH_INTERCEPT_TTL_MS) {
+      if (pendingLoop.submitting) {
+        // A submit is already in flight (double-paste race). Don't call
+        // submitLoopbackRedirect — it would answer a non-retryable "already
+        // completed" and we'd delete the entry out from under the first
+        // submit. Benign ack; still redact (the paste carries a live code).
+        await switchroomReply(
+          ctx,
+          '_Still finishing the previous paste — one moment._',
+          { html: true },
+        )
+        redactAuthCodeMessage(bot.api as never, chat_id, msgId ?? null, line => process.stderr.write(line))
+        return
+      }
       const result = await submitLoopbackRedirect(pendingLoop, text.trim())
       if (result.ok) {
         pendingLoopbackFlows.delete(interceptKey)
@@ -23470,7 +23496,7 @@ bot.command("auth", async ctx => {
         parsed.email,
         { replace: parsed.replace, write: parsed.write, orgMode: parsed.orgMode },
       )
-      pendingLoopbackFlows.set(loopKey, {
+      const newFlow = {
         provider: parsed.provider,
         email: parsed.email,
         state,
@@ -23479,7 +23505,12 @@ bot.command("auth", async ctx => {
         child,
         startedAt: Date.now(),
         submitting: false,
-      })
+        attempts: 0,
+      }
+      // Record child exit on the flow so a pre-paste crash fails fast
+      // instead of hanging out the completion timeout (PR #3100 finding 4).
+      trackFlowExit(newFlow)
+      pendingLoopbackFlows.set(loopKey, newFlow)
       const providerName = parsed.provider === 'google' ? 'Google' : 'Microsoft'
       await switchroomReply(
         ctx,

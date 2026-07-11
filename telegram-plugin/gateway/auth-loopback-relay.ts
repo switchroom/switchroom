@@ -166,7 +166,24 @@ export interface PendingLoopbackFlow {
    * or racing the first (single-use).
    */
   submitting: boolean
+  /**
+   * Retryable-rejection counter (bad paste, wrong state, wrong port). The
+   * flow is ended after {@link MAX_PASTE_ATTEMPTS} rejections rather than
+   * waiting for the TTL — an operator repeatedly pasting the wrong thing
+   * should get a decisive stop, not a silent 10-minute window.
+   */
+  attempts: number
+  /** Set by {@link trackFlowExit} once the CLI child has exited. */
+  exited?: boolean
+  /** Exit code recorded by {@link trackFlowExit} (null = signal-killed). */
+  exitCode?: number | null
 }
+
+/**
+ * Bounded paste attempts — after this many retryable rejections the flow is
+ * ended (non-retryable) so a confused paste loop can't run to the TTL.
+ */
+export const MAX_PASTE_ATTEMPTS = 5
 
 export const pendingLoopbackFlows = new Map<string, PendingLoopbackFlow>()
 
@@ -297,6 +314,43 @@ export function parseLoopbackRedirect(input: string): ParsedRedirect {
   if (!code) return { ok: false, reason: 'missing code parameter' }
   if (!state) return { ok: false, reason: 'missing state parameter' }
   return { ok: true, host: url.hostname, port, code, state }
+}
+
+/**
+ * Decide whether an inbound chat message should be CONSUMED by the loopback
+ * paste intercept (and therefore never reach other handlers, and be deleted
+ * from history). Deliberately narrow: a message merely *mentioning*
+ * `localhost`/`127.0.0.1` ("what's listening on localhost?") must flow
+ * through untouched. We consume only when the text actually parses as a
+ * loopback redirect URL carrying a `code` — or a loopback URL carrying an
+ * `error` param (the provider-denied case, which the flow should surface).
+ */
+export function shouldConsumeLoopbackPaste(text: string): boolean {
+  const trimmed = (text ?? '').trim()
+  if (trimmed.length === 0) return false
+  const parsed = parseLoopbackRedirect(trimmed)
+  if (parsed.ok) return true
+  // parseLoopbackRedirect rejects the error-param case with a
+  // "provider returned error" reason — that IS a redirect paste and the
+  // intercept should consume it to end/inform the flow.
+  if (!parsed.ok && parsed.reason.startsWith('provider returned error')) {
+    return true
+  }
+  return false
+}
+
+/**
+ * Attach an exit tracker to a pending flow so a child that dies BEFORE the
+ * operator pastes (crash, listener error) is observable: `flow.exited` /
+ * `flow.exitCode` are set, and {@link submitLoopbackRedirect} fails fast with
+ * a clear message instead of hanging out its completion timeout waiting for
+ * an `exit` event that already fired.
+ */
+export function trackFlowExit(flow: PendingLoopbackFlow): void {
+  flow.child.on('exit', (code) => {
+    flow.exited = true
+    flow.exitCode = code
+  })
 }
 
 /* ── Flow lifecycle ───────────────────────────────────────────────────────── */
@@ -441,31 +495,52 @@ export async function submitLoopbackRedirect(
   const fetchImpl = opts.fetchImpl ?? fetch
   const completionTimeoutMs = opts.completionTimeoutMs ?? 60_000
 
-  const parsed = parseLoopbackRedirect(pastedText)
-  if (!parsed.ok) {
-    return { ok: false, reason: parsed.reason, retryable: true }
-  }
-  if (parsed.state !== flow.state) {
-    // CSRF guard — keep waiting; the operator may have pasted a stale URL.
-    return {
-      ok: false,
-      reason: 'state parameter does not match this flow (CSRF guard)',
-      retryable: true,
+  // A retryable rejection that would exceed the attempt budget becomes a
+  // non-retryable flow-ending one (bounded paste attempts — see
+  // MAX_PASTE_ATTEMPTS).
+  const rejectRetryable = (reason: string): SubmitResult => {
+    flow.attempts += 1
+    if (flow.attempts >= MAX_PASTE_ATTEMPTS) {
+      return {
+        ok: false,
+        reason:
+          `${reason} — ${MAX_PASTE_ATTEMPTS} rejected pastes; ending this flow. ` +
+          `Start over with a fresh add command.`,
+        retryable: false,
+      }
     }
+    return { ok: false, reason, retryable: true }
   }
-  if (parsed.port !== flow.port) {
-    return {
-      ok: false,
-      reason: `redirect port ${parsed.port} does not match this flow's listener`,
-      retryable: true,
-    }
-  }
+
   if (flow.submitting) {
     return {
       ok: false,
       reason: 'this flow has already been completed',
       retryable: false,
     }
+  }
+  if (flow.exited) {
+    // Child died before the paste (crash, port bind error). The listener is
+    // gone — no paste can ever succeed; fail fast instead of timing out.
+    return {
+      ok: false,
+      reason: `the CLI exited (code ${flow.exitCode ?? 'null'}) before the paste — start a new flow`,
+      retryable: false,
+    }
+  }
+
+  const parsed = parseLoopbackRedirect(pastedText)
+  if (!parsed.ok) {
+    return rejectRetryable(parsed.reason)
+  }
+  if (parsed.state !== flow.state) {
+    // CSRF guard — keep waiting; the operator may have pasted a stale URL.
+    return rejectRetryable('state parameter does not match this flow (CSRF guard)')
+  }
+  if (parsed.port !== flow.port) {
+    return rejectRetryable(
+      `redirect port ${parsed.port} does not match this flow's listener`,
+    )
   }
   // Single-use latch — set before any await so a racing second paste bounces.
   flow.submitting = true
@@ -484,6 +559,13 @@ export async function submitLoopbackRedirect(
   flow.child.stderr?.on('data', onErrChunk)
 
   const exitPromise = new Promise<number | null>((resolve) => {
+    // Guard the tiny race where the child exits between the upfront
+    // `flow.exited` check and this listener registration — an `exit` event
+    // that already fired never re-fires, which would hang us to the timeout.
+    if (flow.exited) {
+      resolve(flow.exitCode ?? null)
+      return
+    }
     flow.child.on('exit', (code) => resolve(code))
   })
 

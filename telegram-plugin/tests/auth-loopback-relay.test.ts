@@ -28,6 +28,9 @@ import {
   startLoopbackFlow,
   submitLoopbackRedirect,
   scrubSensitive,
+  shouldConsumeLoopbackPaste,
+  trackFlowExit,
+  MAX_PASTE_ATTEMPTS,
   type RelayChild,
   type PendingLoopbackFlow,
 } from '../gateway/auth-loopback-relay.js'
@@ -183,6 +186,7 @@ function makePendingFlow(child: FakeChild): PendingLoopbackFlow {
     child: child as unknown as RelayChild,
     startedAt: Date.now(),
     submitting: false,
+    attempts: 0,
   }
 }
 
@@ -272,6 +276,137 @@ describe('submitLoopbackRedirect', () => {
       expect(second.retryable).toBe(false)
       expect(second.reason).toMatch(/completed/i)
     }
+  })
+})
+
+// ─── Consume gate (PR #3100 review finding 1) ───────────────────────────────
+
+describe('shouldConsumeLoopbackPaste', () => {
+  it('does NOT consume unrelated chatter mentioning localhost', () => {
+    expect(shouldConsumeLoopbackPaste("what's listening on localhost?")).toBe(false)
+    expect(shouldConsumeLoopbackPaste('is 127.0.0.1 reachable from the container?')).toBe(false)
+    expect(shouldConsumeLoopbackPaste('curl http://localhost:3000/health please')).toBe(false)
+  })
+
+  it('consumes a valid loopback redirect carrying a code', () => {
+    expect(
+      shouldConsumeLoopbackPaste(`http://127.0.0.1:${PORT}/?code=abc&state=${STATE}`),
+    ).toBe(true)
+    // Scheme-less + whitespace variant too.
+    expect(
+      shouldConsumeLoopbackPaste(`  127.0.0.1:${PORT}/?code=abc&state=${STATE}  `),
+    ).toBe(true)
+  })
+
+  it('consumes a loopback redirect carrying a provider error param', () => {
+    expect(
+      shouldConsumeLoopbackPaste(`http://127.0.0.1:${PORT}/?error=access_denied`),
+    ).toBe(true)
+  })
+
+  it('does not consume a non-loopback URL with a code', () => {
+    expect(
+      shouldConsumeLoopbackPaste(`https://evil.example/?code=abc&state=${STATE}`),
+    ).toBe(false)
+  })
+})
+
+// ─── Pre-paste child exit (PR #3100 review finding 4) ───────────────────────
+
+describe('submitLoopbackRedirect — child exited before paste', () => {
+  it('fails fast (non-retryable) instead of hanging out the timeout', async () => {
+    const child = makeChild()
+    const flow = makePendingFlow(child)
+    trackFlowExit(flow)
+    child.emit('exit', 1) // CLI died before the operator pasted
+    const started = Date.now()
+    const res = await submitLoopbackRedirect(
+      flow,
+      `http://127.0.0.1:${PORT}/?code=abc&state=${STATE}`,
+      {
+        fetchImpl: (async () => {
+          throw new Error('listener is gone — must not be called')
+        }) as unknown as typeof fetch,
+        completionTimeoutMs: 5_000,
+      },
+    )
+    expect(res.ok).toBe(false)
+    if (!res.ok) {
+      expect(res.retryable).toBe(false)
+      expect(res.reason).toMatch(/exited/i)
+    }
+    // Fast fail, not a completion-timeout wait.
+    expect(Date.now() - started).toBeLessThan(1_000)
+  })
+})
+
+// ─── Bounded paste attempts (PR #3100 review finding 5) ─────────────────────
+
+describe('submitLoopbackRedirect — bounded attempts', () => {
+  it(`ends the flow (non-retryable) after ${MAX_PASTE_ATTEMPTS} rejected pastes`, async () => {
+    const child = makeChild()
+    const flow = makePendingFlow(child)
+    const fetchImpl = (async () => {
+      throw new Error('must never be called on rejected pastes')
+    }) as unknown as typeof fetch
+
+    for (let i = 1; i < MAX_PASTE_ATTEMPTS; i++) {
+      const r = await submitLoopbackRedirect(flow, 'garbage paste', { fetchImpl })
+      expect(r.ok).toBe(false)
+      if (!r.ok) expect(r.retryable).toBe(true)
+    }
+    // The Nth rejection ends the flow.
+    const last = await submitLoopbackRedirect(flow, 'garbage paste', { fetchImpl })
+    expect(last.ok).toBe(false)
+    if (!last.ok) {
+      expect(last.retryable).toBe(false)
+      expect(last.reason).toMatch(/ending this flow/i)
+    }
+    expect(flow.attempts).toBe(MAX_PASTE_ATTEMPTS)
+  })
+
+  it('a valid paste after some rejections still succeeds', async () => {
+    const child = makeChild()
+    const flow = makePendingFlow(child)
+    const badFetch = (async () => {
+      throw new Error('not called')
+    }) as unknown as typeof fetch
+    await submitLoopbackRedirect(flow, 'garbage', { fetchImpl: badFetch })
+    await submitLoopbackRedirect(flow, 'more garbage', { fetchImpl: badFetch })
+    const goodFetch = (async () => {
+      setTimeout(() => child.emit('exit', 0), 0)
+      return new Response('ok')
+    }) as unknown as typeof fetch
+    const res = await submitLoopbackRedirect(
+      flow,
+      `http://127.0.0.1:${PORT}/?code=abc&state=${STATE}`,
+      { fetchImpl: goodFetch, completionTimeoutMs: 1000 },
+    )
+    expect(res.ok).toBe(true)
+  })
+})
+
+// ─── In-flight submit guard (PR #3100 review finding 2, module contract) ────
+
+describe('submitLoopbackRedirect — submitting flag', () => {
+  it('a flow with submitting=true rejects non-retryably without contacting the listener', async () => {
+    const child = makeChild()
+    const flow = makePendingFlow(child)
+    flow.submitting = true // first submit in flight
+    let fetchCalls = 0
+    const res = await submitLoopbackRedirect(
+      flow,
+      `http://127.0.0.1:${PORT}/?code=abc&state=${STATE}`,
+      {
+        fetchImpl: (async () => {
+          fetchCalls++
+          return new Response('ok')
+        }) as unknown as typeof fetch,
+      },
+    )
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.retryable).toBe(false)
+    expect(fetchCalls).toBe(0)
   })
 })
 
