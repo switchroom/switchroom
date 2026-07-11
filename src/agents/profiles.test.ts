@@ -452,11 +452,13 @@ describe("execution-discipline partial — fleet-wide grounding / verify-before-
       renderExecutionDisciplineFragment,
       renderVaultProtocolFragment,
       renderAgentSelfServiceFragment,
+      renderDevProtocolFragment,
     } = await import("./profiles.js");
     const Handlebars = (await import("handlebars")).default;
 
     const groundingMarker = "Grounding — check before you assert";
     const pacingMarker = "Act in-turn";
+    const devProtocolMarker = "## Development Protocol";
 
     const composeForProfile = (profileName: string): string => {
       const profileDir = getProfilePath(profileName);
@@ -464,11 +466,13 @@ describe("execution-discipline partial — fleet-wide grounding / verify-before-
       let rendered = Handlebars.compile(readFileSync(hbsPath, "utf-8"), {
         noEscape: true,
       })({});
-      // Mirror scaffold.ts append order: vault, self-service, discipline.
+      // Mirror scaffold.ts append order: vault, self-service,
+      // discipline, dev-protocol.
       for (const frag of [
         renderVaultProtocolFragment(),
         renderAgentSelfServiceFragment(),
         renderExecutionDisciplineFragment(),
+        renderDevProtocolFragment(),
       ]) {
         if (frag) rendered = rendered.trimEnd() + "\n\n" + frag + "\n";
       }
@@ -488,6 +492,67 @@ describe("execution-discipline partial — fleet-wide grounding / verify-before-
     ] as [string, string][]) {
       expect(rendered, `${name}: grounding marker`).toContain(groundingMarker);
       expect(rendered, `${name}: pacing marker`).toContain(pacingMarker);
+      expect(rendered, `${name}: dev-protocol marker`).toContain(devProtocolMarker);
     }
+  });
+});
+
+describe("renderDevProtocolFragment", () => {
+  // Ken's fleet-wide development protocol (approved 2026-07-11) —
+  // same unconditional-append carrier as execution-discipline so it
+  // reaches EVERY agent on EVERY profile. These tests pin the five
+  // parts of the contract (orient/ground, clarify vs proceed,
+  // design-align, pipeline, communicate).
+
+  it("tells the agent to validate rather than assume and cite sources", async () => {
+    const { renderDevProtocolFragment } = await import("./profiles.js");
+    const fragment = renderDevProtocolFragment();
+    expect(fragment.toLowerCase()).toContain("validate, don't assume");
+    expect(fragment).toContain("file:line");
+  });
+
+  it("mandates one clarifying question at a time, planning-phase only", async () => {
+    const { renderDevProtocolFragment } = await import("./profiles.js");
+    const fragment = renderDevProtocolFragment();
+    expect(fragment).toContain("ONE question at a time");
+    expect(fragment.toLowerCase()).toContain("act autonomously during execution");
+  });
+
+  it("requires design alignment + adversarial red-team on larger tasks", async () => {
+    const { renderDevProtocolFragment } = await import("./profiles.js");
+    const fragment = renderDevProtocolFragment();
+    expect(fragment.toLowerCase()).toContain("design report before implementation");
+    expect(fragment.toLowerCase()).toContain("red-team");
+    expect(fragment.toLowerCase()).toContain("single-concern pr");
+  });
+
+  it("pins the pipeline: CI authority, fix all findings, merge on green", async () => {
+    const { renderDevProtocolFragment } = await import("./profiles.js");
+    const fragment = renderDevProtocolFragment();
+    expect(fragment.toLowerCase()).toContain("ci is the full-suite authority");
+    expect(fragment).toContain("Fix ALL findings");
+    expect(fragment).toContain("Merge only on CI green");
+    expect(fragment.toLowerCase()).toContain("durable fixes over hack patches");
+    expect(fragment.toLowerCase()).toContain("outcomes, not just code paths");
+  });
+
+  it("pins the communication rules: 30s watch cap and 15 sub-agent cap", async () => {
+    const { renderDevProtocolFragment } = await import("./profiles.js");
+    const fragment = renderDevProtocolFragment();
+    expect(fragment).toContain("30 seconds");
+    expect(fragment).toContain("15 parallel sub-agents");
+    expect(fragment.toLowerCase()).toContain("consolidated messages");
+  });
+
+  it("points at the bundled dev-protocol skill for the long form", async () => {
+    const { renderDevProtocolFragment } = await import("./profiles.js");
+    const fragment = renderDevProtocolFragment();
+    expect(fragment).toContain("`dev-protocol` skill");
+  });
+
+  it("is non-empty (file present and rendered)", async () => {
+    const { renderDevProtocolFragment } = await import("./profiles.js");
+    const fragment = renderDevProtocolFragment();
+    expect(fragment.length).toBeGreaterThan(500);
   });
 });

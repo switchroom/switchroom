@@ -38,6 +38,7 @@ These ship enabled on **every** Switchroom agent — both default `assistant` fl
 | `switchroom-cli` | switchroom (this repo) | Run switchroom CLI operations on existing agents (logs, restart, version, config, schedule) |
 | `switchroom-status` | switchroom (this repo) | Show running agents, uptime, fleet health |
 | `switchroom-health` | switchroom (this repo) | "Something is broken" diagnostic flow |
+| `dev-protocol` | switchroom (this repo) | Fleet development protocol playbook — orient/ground, clarify vs proceed, design-align, pipeline, communication; loaded when starting substantive development work |
 
 The Anthropic skills are vendored under `skills/<name>/` with a `VENDORED.md` recording the upstream pin commit. Resync with the snippet at the bottom of each `VENDORED.md`.
 
@@ -123,6 +124,7 @@ Current `<repo>/skills/` inventory:
 | `switchroom-cli` | bundled-default (every agent) | Logs / restart / version / config / schedule |
 | `switchroom-status` | bundled-default (every agent) | Show running agents + fleet health |
 | `switchroom-health` | bundled-default (every agent) | "Something is broken" diagnostics |
+| `dev-protocol` | bundled-default (every agent) | Fleet development protocol playbook (long-form of the CLAUDE.md "Development Protocol" fragment) |
 | `switchroom-install` | foreman-only (auto when `role: foreman`) | First-time bootstrap on a fresh machine |
 | `switchroom-manage` | foreman-only (auto when `role: foreman`) | Add/remove/reinstall/list agents (fleet-level) |
 | `switchroom-architecture` | foreman-only (auto when `role: foreman`) | Internal design context for fleet-mgmt decisions |

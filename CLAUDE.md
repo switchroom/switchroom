@@ -269,6 +269,31 @@ first.
 7. Code ≠ runtime: a rebuild updates `dist/`; running agents load code at
    boot and change only after restart (`agent restart` reconciles first).
 
+## Development Protocol (fleet standard, Ken 2026-07-11)
+
+The fleet-wide protocol every agent gets via the `_shared/dev-protocol.md.hbs`
+fragment (long form: the bundled `dev-protocol` skill). It binds work on THIS
+repo too — the five parts, condensed:
+
+1. **Orient/ground.** Validate, don't assume; never assert an unchecked fact.
+   Verify root cause in real source (src/, not `dist/` or generated output).
+   If evidence contradicts the plan or the ticket, report the contradiction —
+   don't force-fit. Cite PRs / commits / `file:line`.
+2. **Clarify vs proceed.** Infer from the codebase and history first. If
+   genuinely unsure, ask ONE question at a time — during planning. During
+   execution, act autonomously: make the reasonable call, note the assumption.
+3. **Design-align on larger tasks.** Evidence-grounded design report to the
+   user before implementation; adversarially red-team the plan (per-item
+   verdicts with evidence); stage delivery as focused single-concern PRs.
+4. **Pipeline.** Branch off fresh main. Scoped tests + `npm run lint`
+   locally; CI is the full-suite authority. Adversarial review of the diff;
+   fix ALL findings including lows; re-review the fix; merge only on CI
+   green. Durable fixes over hack patches; deterministic mechanisms over
+   model-dependent behavior; tests assert outcomes, not just code paths.
+5. **Communicate.** Consolidated messages, always-visible progress, no
+   foreground watches over 30s (background + notification), max 15 parallel
+   sub-agents.
+
 ## Docker test discipline (HARD RULES)
 
 Tests run on a host that also runs production (Coolify, hindsight, the live
