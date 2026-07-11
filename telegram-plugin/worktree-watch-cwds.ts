@@ -90,13 +90,30 @@ function defaultDeriveName(agentDir: string): string {
   return leaf;
 }
 
+/**
+ * Two-tier owner-identity resolution shared by `ownedWorktreeCwds` and
+ * `refreshOwnedWorktreeHeartbeats`:
+ *   Tier 1 — env fast path (`SWITCHROOM_AGENT_NAME`).
+ *   Tier 2 — durable fallback derived from the agent's OWN directory basename.
+ * Returns "" when neither source yields a usable identity — callers MUST treat
+ * "" as fail-closed (never guess ownership).
+ */
+export function resolveOwnerIdentity(
+  self: string | undefined,
+  agentDir: string | null | undefined,
+  deriveName?: (agentDir: string) => string,
+): string {
+  let resolved: string = self != null ? self : "";
+  if (resolved === "" && agentDir != null && agentDir !== "") {
+    const derive = deriveName ?? defaultDeriveName;
+    resolved = derive(agentDir) || "";
+  }
+  return resolved;
+}
+
 export function ownedWorktreeCwds(opts: OwnedWorktreeCwdsOptions): string[] {
   // Tier 1: env fast path. Tier 2: durable agentDir-derived fallback.
-  let resolved: string = opts.self != null ? opts.self : "";
-  if (resolved === "" && opts.agentDir != null && opts.agentDir !== "") {
-    const derive = opts.deriveName ?? defaultDeriveName;
-    resolved = derive(opts.agentDir) || "";
-  }
+  const resolved = resolveOwnerIdentity(opts.self, opts.agentDir, opts.deriveName);
 
   if (resolved === "") {
     // Both env and durable config unavailable. Keep the historical
@@ -132,4 +149,103 @@ export function ownedWorktreeCwds(opts: OwnedWorktreeCwdsOptions): string[] {
   } catch {
     return [];
   }
+}
+
+/**
+ * Default minimum interval (ms) between heartbeat writes for the same
+ * worktree record. The gateway invokes the refresh on every ~1s rescan tick;
+ * writing every tick would be needless churn. Refreshing at most every 2 min
+ * keeps every live claim's heartbeat FAR fresher than the reaper's 10-min
+ * `STALE_THRESHOLD_MS`, so a live claim never reads as stale, while a dead
+ * gateway (no ticks) lets the heartbeat age out and become reap-eligible.
+ */
+export const DEFAULT_HEARTBEAT_REFRESH_INTERVAL_MS = 2 * 60_000;
+
+/** Minimal record shape needed to refresh a worktree heartbeat. */
+export interface WorktreeHeartbeatRecord {
+  id: string;
+  ownerAgent?: string;
+  /** ISO 8601 timestamp of the record's current heartbeat (for throttling). */
+  heartbeatAt?: string;
+}
+
+export interface RefreshOwnedHeartbeatsOptions {
+  /** The agent's identity — `process.env.SWITCHROOM_AGENT_NAME` (fast path). */
+  self: string | undefined;
+  /** Durable, non-env identity fallback: the agent's OWN directory. */
+  agentDir?: string | null;
+  /** Host-global registry read (`listRecords` from src/worktree/registry). */
+  listRecords: () => WorktreeHeartbeatRecord[];
+  /** Advance one record's heartbeat (`touchHeartbeat` from the registry). */
+  touchHeartbeat: (id: string) => void;
+  /**
+   * Skip a touch while the record's heartbeat is younger than this (ms).
+   * Defaults to `DEFAULT_HEARTBEAT_REFRESH_INTERVAL_MS`. Set to 0 to always
+   * touch (used by tests).
+   */
+  minRefreshIntervalMs?: number;
+  /** `Date.now` override for tests. */
+  now?: () => number;
+  /** Injectable name derivation (defaults to `path.basename`). */
+  deriveName?: (agentDir: string) => string;
+  /** Best-effort error sink. */
+  log?: (msg: string) => void;
+}
+
+/**
+ * Refresh the heartbeat of every worktree THIS agent owns.
+ *
+ * This is the production driver that keeps `touchHeartbeat` (previously dead —
+ * F1/H3) alive: the gateway calls it on the same rescan tick that re-derives
+ * the watched worktree cwds, so a claim held by a LIVE agent has its heartbeat
+ * advanced continuously and never trips the reaper's staleness gate. When the
+ * owning gateway dies, the ticks stop, the heartbeat ages past
+ * `STALE_THRESHOLD_MS`, and the (now fail-safe) reaper can reclaim the truly
+ * abandoned claim.
+ *
+ * Fail-CLOSED, mirroring `ownedWorktreeCwds`:
+ *   - Unresolved identity ⇒ touch nothing (never guess ownership).
+ *   - Ownerless records (`ownerAgent` undefined) are NEVER matched — we must
+ *     not advance another agent's / an unattributable claim's heartbeat.
+ *   - A registry read failure ⇒ touch nothing.
+ *   - A per-record touch failure is swallowed (logged) — one bad record must
+ *     not abort the rest, and this runs on the hot watch loop.
+ *
+ * @returns the number of heartbeats actually advanced this call.
+ */
+export function refreshOwnedWorktreeHeartbeats(
+  opts: RefreshOwnedHeartbeatsOptions,
+): number {
+  const identity = resolveOwnerIdentity(opts.self, opts.agentDir, opts.deriveName);
+  if (identity === "") return 0; // fail-closed: never guess ownership
+
+  const nowMs = (opts.now ?? Date.now)();
+  const minInterval =
+    opts.minRefreshIntervalMs ?? DEFAULT_HEARTBEAT_REFRESH_INTERVAL_MS;
+
+  let records: WorktreeHeartbeatRecord[];
+  try {
+    records = opts.listRecords();
+  } catch {
+    return 0;
+  }
+
+  let touched = 0;
+  for (const r of records) {
+    if (r.ownerAgent !== identity) continue; // ownerless never matched
+    // Throttle: skip if the heartbeat is still comfortably fresh.
+    if (minInterval > 0 && r.heartbeatAt != null) {
+      const age = nowMs - new Date(r.heartbeatAt).getTime();
+      if (Number.isFinite(age) && age >= 0 && age < minInterval) continue;
+    }
+    try {
+      opts.touchHeartbeat(r.id);
+      touched++;
+    } catch (err) {
+      opts.log?.(
+        `worktree heartbeat refresh failed for ${r.id}: ${(err as Error).message}`,
+      );
+    }
+  }
+  return touched;
 }
