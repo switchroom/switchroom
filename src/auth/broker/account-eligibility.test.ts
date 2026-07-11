@@ -8,6 +8,7 @@ import {
   clampMarkExpiry,
   snapshotFresh,
   snapshotWalled,
+  snapshotComplete,
   snapshotClearlyHealthy,
   overageLiftsWall,
   OVERAGE_EXHAUSTED_REASONS,
@@ -275,7 +276,14 @@ describe("snapshotShouldClearMark — self-heal", () => {
       sevenDayUtilPresent: true,
     };
     expect(snapshotShouldClearMark(real, mark, NOW)).toBe(true);
-    // And a partial probe (5h present, 7d absent) is NOT thin → clears.
+    // F0 (was the unsafe assertion) — a PARTIAL probe (5h present healthy, 7d
+    // ABSENT) must NOT clear the mark. The absent 7d header coalesces to a
+    // filler 0% that reads "clearly healthy", but the probe never measured the
+    // weekly window — so clearing a 7-day exhaustion mark off it durably
+    // re-serves a genuinely weekly-walled account (the F0 inversion). The old
+    // assertion expected `true` ("NOT thin → clears"); that was wrong because
+    // "not thin" (≥1 window) is a weaker bar than "complete" (BOTH windows) —
+    // only a complete probe is evidence of health on the marked window.
     const partial: QuotaSnapshot = {
       fiveHourUtilizationPct: 4,
       sevenDayUtilizationPct: 0,
@@ -283,7 +291,7 @@ describe("snapshotShouldClearMark — self-heal", () => {
       fiveHourUtilPresent: true,
       sevenDayUtilPresent: false,
     };
-    expect(snapshotShouldClearMark(partial, mark, NOW)).toBe(true);
+    expect(snapshotShouldClearMark(partial, mark, NOW)).toBe(false);
   });
   it("out_of_credits at 0% util DOES clear a mark — a healthy low-util probe self-heals normally", () => {
     // THE KEY CHANGE from the 2026-06-20 guard: out_of_credits is informational.
@@ -307,6 +315,92 @@ describe("snapshotShouldClearMark — self-heal", () => {
     expect(
       snapshotShouldClearMark(snap(85, 20, 0, { reason: "out_of_credits" }), mark, NOW),
     ).toBe(false); // 85% >= 80% → not clearly healthy → no clear
+  });
+});
+
+describe("F0/F4b — partial-probe & fresh-wall eligibility safety", () => {
+  // A partial probe: 5h window present & healthy, 7d window ABSENT (the real
+  // "7d missing, 5h present" case). The absent 7d coalesces to a filler 0%.
+  const partial = (fiveHourPct: number, ageMs = 30_000): QuotaSnapshot => ({
+    fiveHourUtilizationPct: fiveHourPct,
+    sevenDayUtilizationPct: 0, // filler — 7d header was absent
+    capturedAt: NOW - ageMs,
+    fiveHourUtilPresent: true,
+    sevenDayUtilPresent: false,
+  });
+
+  it("snapshotComplete — false when either window is absent, true otherwise", () => {
+    expect(snapshotComplete(partial(4))).toBe(false);
+    expect(
+      snapshotComplete({ ...partial(4), fiveHourUtilPresent: false, sevenDayUtilPresent: false }),
+    ).toBe(false);
+    // Both present → complete; unset flags (legacy/cached) → treated as complete.
+    expect(snapshotComplete({ ...partial(4), sevenDayUtilPresent: true })).toBe(true);
+    expect(snapshotComplete(snap(4, 20, 0))).toBe(true);
+  });
+
+  it("F0 — a partial probe (7d absent) PRESERVES an existing weekly-exhaustion mark (does not self-heal)", () => {
+    // The exact F0 incident: account walled its weekly window → +7d mark. Next
+    // probe returns 5h=4% healthy but Anthropic omits the 7d header. The mark
+    // must NOT be cleared — the probe never saw the weekly window.
+    const weeklyMark: ExhaustionMark = {
+      exhausted_until: NOW + 7 * 24 * 60 * 60 * 1000,
+      marked_at: NOW - 60_000,
+    };
+    expect(snapshotShouldClearMark(partial(4), weeklyMark, NOW)).toBe(false);
+    // Sanity: the SAME probe but with 7d actually measured healthy DOES clear.
+    const complete: QuotaSnapshot = { ...partial(4), sevenDayUtilPresent: true };
+    expect(snapshotShouldClearMark(complete, weeklyMark, NOW)).toBe(true);
+  });
+
+  it("F0 — a partial probe (7d absent) does NOT re-serve a weekly-walled account", () => {
+    // With the mark preserved, eligibility must still block: the partial probe
+    // is not a complete health signal, so it cannot override the weekly mark.
+    const weeklyMark: ExhaustionMark = {
+      exhausted_until: NOW + 7 * 24 * 60 * 60 * 1000,
+      marked_at: NOW - 60_000, // OLDER than the probe: partial probe would else "win"
+    };
+    expect(accountEligibility({ mark: weeklyMark, snapshot: partial(4), now: NOW })).toBe("blocked");
+    expect(isAccountBlocked({ mark: weeklyMark, snapshot: partial(4), now: NOW })).toBe(true);
+    // No mark + partial healthy probe → not a confident 'eligible': the missing
+    // window is UNKNOWN, so the account is 'unknown' (force-probe), not served.
+    expect(accountEligibility({ snapshot: partial(4), now: NOW })).toBe("unknown");
+  });
+
+  it("F0 — a partial probe with the PRESENT window walled still blocks (positive evidence survives)", () => {
+    // Safety is symmetric: a measured wall on 5h blocks regardless of the absent
+    // 7d window — the absent window is unknown, the present one is positive.
+    expect(accountEligibility({ snapshot: partial(100), now: NOW })).toBe("blocked");
+  });
+
+  it("F0 — clampMarkExpiry does NOT clamp a +7d mark on a partial (7d-absent) probe", () => {
+    // A legit gateway-parsed weekly reset must hold: a 7d-absent probe cannot
+    // contradict the weekly wall, so the long mark is trusted (not clamped to 5h).
+    const proposed = NOW + 7 * 24 * 60 * 60 * 1000;
+    expect(
+      clampMarkExpiry({ proposedUntil: proposed, now: NOW, shortMs: FIVE_H, snapshot: partial(4) }),
+    ).toBe(proposed);
+    // Contrast: 7d present & healthy DOES clamp (unchanged behavior).
+    const complete: QuotaSnapshot = { ...partial(4), sevenDayUtilPresent: true };
+    expect(
+      clampMarkExpiry({ proposedUntil: proposed, now: NOW, shortMs: FIVE_H, snapshot: complete }),
+    ).toBe(NOW + FIVE_H);
+  });
+
+  it("F4b — a fresh over-wall snapshot is NOT discarded by an expired-but-newer mark", () => {
+    // Wall observed fresh at T1 (99.6%). A shorter mark was written at T2>T1 and
+    // has since expired. Pre-fix: snapshot older than mark → live branch skipped;
+    // expired mark → no block → 'unknown' (servable). A fresh positive wall must
+    // block regardless of the expired mark's newer timestamp.
+    const expiredNewerMark: ExhaustionMark = {
+      exhausted_until: NOW - 1_000, // expired
+      marked_at: NOW - 10_000, // NEWER than the snapshot below
+    };
+    const freshWall = snap(99.6, 27, 60_000); // capturedAt older than marked_at
+    expect(accountEligibility({ mark: expiredNewerMark, snapshot: freshWall, now: NOW })).toBe(
+      "blocked",
+    );
+    expect(isAccountBlocked({ mark: expiredNewerMark, snapshot: freshWall, now: NOW })).toBe(true);
   });
 });
 
