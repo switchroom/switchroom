@@ -180,6 +180,62 @@ export function classifyExtractionLogs(logs: string): CheckResult {
 }
 
 /**
+ * Pure: classify recent `switchroom-hindsight-autoheal` sidecar logs (#2910)
+ * into a doctor result, so `switchroom doctor` can report that the host-side
+ * autoheal loop restarted a wedged hindsight — or gave up after hitting its
+ * restart cap — instead of it hiding in `docker logs`.
+ *
+ * The sidecar emits stable structured lines (`hindsight-autoheal event=<ev>
+ * …`). We count `restart_issued` events and detect a `gave_up` event:
+ *  - `gave_up` present  → FAIL: hit the sliding-window cap; hindsight is
+ *    genuinely broken (loop-guarded, so it's NOT restart-looping — it backed
+ *    off), needs an operator.
+ *  - restarts > 0, no give-up → WARN: it healed a wedge, but a healthy
+ *    hindsight shouldn't need restarting; worth a look.
+ *  - no restarts → OK.
+ *
+ * `logs` is the sidecar's recent stdout. Never throws.
+ */
+export function classifyAutohealStatus(logs: string): CheckResult {
+  const restarts = (logs.match(/event=restart_issued\b/g) ?? []).length;
+  const gaveUp = /event=gave_up\b/.test(logs);
+  const disabled = /event=disabled\b/.test(logs);
+
+  if (disabled && restarts === 0) {
+    return {
+      name: "hindsight autoheal",
+      status: "ok",
+      detail: "disabled (SWITCHROOM_HINDSIGHT_AUTOHEAL=0)",
+    };
+  }
+  if (gaveUp) {
+    return {
+      name: "hindsight autoheal",
+      status: "fail",
+      detail:
+        `autoheal GAVE UP after ${restarts} restart(s) in its window — hindsight ` +
+        `kept coming back unhealthy, so the loop backed off (it is NOT restart-` +
+        `looping) and memory is likely down`,
+      fix:
+        "hindsight is genuinely wedged. Check `docker logs switchroom-hindsight` " +
+        "for the root cause (shm/quota/crash), fix it, then `switchroom memory " +
+        "--restart`. Autoheal resumes on its own after the cooldown.",
+    };
+  }
+  if (restarts > 0) {
+    return {
+      name: "hindsight autoheal",
+      status: "warn",
+      detail:
+        `hindsight was auto-restarted ${restarts} time(s) recently — the wedge was ` +
+        `healed, but a healthy backend shouldn't need restarting`,
+      fix: "Inspect `docker logs switchroom-hindsight` around the restart(s) for the underlying wedge.",
+    };
+  }
+  return { name: "hindsight autoheal", status: "ok", detail: "no auto-restarts" };
+}
+
+/**
  * Best-effort: inspect the local `switchroom-hindsight` container's shm + recent
  * logs. Returns [] (silently skipped) when hindsight isn't a local container —
  * a remote `memory.config.url`, no docker, or running inside an agent container.
@@ -211,6 +267,16 @@ export function checkHindsightContainerHealth(
     results.push(classifyExtractionLogs(logs));
   } catch {
     // logs unavailable — skip the extraction check rather than fail the run
+  }
+
+  // Autoheal sidecar status (#2910). Only surfaces when the sidecar exists
+  // (its logs are readable) — a fleet without hostd/autoheal skips this line
+  // rather than showing a spurious "ok".
+  try {
+    const autohealLogs = exec("docker", ["logs", "--since", "1h", "switchroom-hindsight-autoheal"]);
+    results.push(classifyAutohealStatus(autohealLogs));
+  } catch {
+    // no autoheal sidecar (no hostd project / not deployed) — nothing to report
   }
 
   return results;

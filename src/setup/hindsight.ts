@@ -878,10 +878,14 @@ export function startHindsight(
     // / `docker ps` so operators and the doctor probe can SEE the wedge.
     // NOTE: vanilla Docker does NOT auto-restart an unhealthy container —
     // `--restart always` acts on process EXIT only, never on health status.
-    // So this is visibility, not a self-heal; an unhealthy-but-not-exited
-    // API keeps running until something (operator / an autoheal sidecar)
-    // acts on the status. See PR follow-up for the restart-on-unhealthy
-    // mechanism. python3 is always present in the image; curl/wget are not.
+    // So this flag itself is VISIBILITY, not a self-heal: it marks the
+    // container `unhealthy` so operators, `switchroom doctor`, AND the
+    // host-side autoheal loop can SEE the wedge. The actual restart-on-
+    // unhealthy mechanism is the `switchroom-hindsight-autoheal` sidecar in
+    // the hostd compose (#2910, docker/hindsight-autoheal.sh): it polls this
+    // status through the docker-socket-proxy and issues `docker restart` with
+    // a sliding-window cap + backoff. python3 is always present in the image;
+    // curl/wget are not.
     "--health-cmd", litellm
       ? `python3 -c 'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen("http://localhost:${apiPort}/health",timeout=4).getcode()==200 else 1)'`
       : HINDSIGHT_HEALTHCHECK_CMD,
