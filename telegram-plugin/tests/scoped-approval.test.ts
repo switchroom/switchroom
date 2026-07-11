@@ -275,6 +275,10 @@ describe('isDestructiveBashCommand — fail-closed denylist', () => {
       // checkout that discards uncommitted working-tree changes
       'git checkout .', 'git checkout -f', 'git checkout -f main', 'git checkout --force',
       'git checkout -- file.ts', 'git checkout HEAD -- .', 'git checkout HEAD~1 -- src/x.ts',
+      // `./` and `./<path>` are common spellings of `.` — same whole-tree /
+      // subtree discard; git refnames forbid a branch starting with `./`,
+      // so gating these carries no false-positive risk.
+      'git checkout ./', 'git checkout ./src',
       // stash forms that irreversibly remove stash state
       'git stash drop', 'git stash drop stash@{2}', 'git stash clear', 'git stash pop',
     ]) {
