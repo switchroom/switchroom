@@ -41,7 +41,13 @@ import { normalizeHindsightVersionTag } from "../setup/hindsight.js";
  * Resolution order:
  *   1. An explicit `--tag latest` force-floats to `:latest` (the operator
  *      explicitly asked to un-pin) → `{ tag: undefined, reason: "explicit-latest" }`.
- *   2. Any other explicit `--tag` always wins → `{ tag, reason: "explicit" }`.
+ *   2. Any other explicit `--tag` always wins — but it MUST normalize to a
+ *      canonical `vX.Y.Z` → `{ tag: <normalized>, reason: "explicit" }`.
+ *      A non-normalizable explicit tag (sha-…, garbage) returns
+ *      `reason: "invalid"` and the caller must fail loudly: hindsightImageRef
+ *      floats anything it can't normalize to `:latest`, so silently passing
+ *      garbage through would print one tag and run another — the exact
+ *      silent-un-pin footgun #2857 exists to close.
  *   3. No `--tag`, but the fleet has a persisted `release.pin` that
  *      normalizes to `vX.Y.Z` → default to it so a manual recreate on a
  *      pinned fleet doesn't silently un-pin hindsight → `{ tag, reason: "pin" }`.
@@ -51,13 +57,18 @@ import { normalizeHindsightVersionTag } from "../setup/hindsight.js";
 export function resolveMemorySetupTag(input: {
   explicitTag?: string;
   releasePin?: string;
-}): { tag: string | undefined; reason: "explicit" | "explicit-latest" | "pin" | "latest" } {
+}): {
+  tag: string | undefined;
+  reason: "explicit" | "explicit-latest" | "pin" | "latest" | "invalid";
+} {
   const explicit = input.explicitTag?.trim();
   if (explicit) {
     if (explicit.toLowerCase() === "latest") {
       return { tag: undefined, reason: "explicit-latest" };
     }
-    return { tag: explicit, reason: "explicit" };
+    const normalized = normalizeHindsightVersionTag(explicit);
+    if (!normalized) return { tag: explicit, reason: "invalid" };
+    return { tag: normalized, reason: "explicit" };
   }
   const pin = normalizeHindsightVersionTag(input.releasePin);
   if (pin) return { tag: pin, reason: "pin" };
@@ -369,6 +380,21 @@ export function registerMemoryCommand(program: Command): void {
         releasePin,
       });
       switch (tagReason) {
+        case "invalid":
+          // Fail loudly: hindsightImageRef floats anything it can't
+          // normalize to :latest, so proceeding would print one tag and
+          // run another — a silent un-pin (#2857).
+          console.error(
+            chalk.red(
+              `\n  Invalid hindsight image tag: ${effectiveTag}\n` +
+                `  The release workflow only publishes per-version tags. Valid forms:\n` +
+                `    vX.Y.Z  (e.g. v0.17.5)\n` +
+                `    X.Y.Z   (normalized to vX.Y.Z)\n` +
+                `    latest  (explicitly float to :latest)\n`,
+            ),
+          );
+          process.exit(1);
+          break;
         case "explicit":
           console.log(chalk.gray(`  Using hindsight image tag ${effectiveTag} (explicit --tag).`));
           break;

@@ -27,11 +27,36 @@ describe("resolveMemorySetupTag", () => {
     });
   });
 
-  it("lets an explicit --tag win over the persisted pin", () => {
+  it("lets an explicit --tag win over the persisted pin (normalized to vX.Y.Z)", () => {
     expect(resolveMemorySetupTag({ explicitTag: "v0.18.0", releasePin: "v0.17.5" })).toEqual({
       tag: "v0.18.0",
       reason: "explicit",
     });
+    // A bare explicit tag is normalized to the canonical published form, so
+    // the tag we print is EXACTLY the tag hindsightImageRef will run.
+    expect(resolveMemorySetupTag({ explicitTag: "0.18.0", releasePin: "v0.17.5" })).toEqual({
+      tag: "v0.18.0",
+      reason: "explicit",
+    });
+  });
+
+  it("rejects an explicit non-normalizable tag as invalid (must fail loudly, never float)", () => {
+    // Regression for the #3088 review finding: hindsightImageRef floats
+    // anything it can't normalize to :latest, so passing sha-deadbeef
+    // through as "explicit" would print one tag and run another — a silent
+    // un-pin. The resolver must flag it so the CLI can exit non-zero.
+    expect(resolveMemorySetupTag({ explicitTag: "sha-deadbeef", releasePin: "v0.17.5" })).toEqual({
+      tag: "sha-deadbeef",
+      reason: "invalid",
+    });
+    expect(resolveMemorySetupTag({ explicitTag: "garbage" })).toEqual({
+      tag: "garbage",
+      reason: "invalid",
+    });
+    // The invalid explicit tag does NOT fall back to the pin or to :latest.
+    expect(resolveMemorySetupTag({ explicitTag: "v0.18", releasePin: "v0.17.5" }).reason).toBe(
+      "invalid",
+    );
   });
 
   it("force-floats when --tag latest is passed explicitly, even on a pinned fleet", () => {
