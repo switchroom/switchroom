@@ -440,6 +440,148 @@ describe("VaultBroker: token-based get access (issue #225)", () => {
   });
 });
 
+// ─── sec #3084: entry-scope + identity-bind on the token get path ─────────────
+//
+// F3: the capability-token `get` path historically skipped `checkEntryScope`,
+//     so an entry's `scope.deny:[agent]` was silently ineffective against an
+//     outstanding token. OUTCOME: a token whose owning agent is denied by the
+//     entry scope is now refused on the token path (was served before).
+// F4: tokens are bearer capabilities. When the connection ALSO carries a
+//     bind-time socket identity, the broker now cross-checks it against the
+//     grant's `agent_slug` and rejects a mismatch. OUTCOME: a token replayed
+//     over a DIFFERENT agent's bound socket is denied; the matching identity
+//     and the legitimate no-bind-identity flow are unchanged.
+describe("VaultBroker: token get — entry scope + identity bind (sec #3084)", () => {
+  let socketPath: string;
+  let tmpDir: string;
+  let grantsDb: Database;
+  let auditEntries: AuditEntry[];
+  let prevNonLinuxFlag: string | undefined;
+  const brokers: VaultBroker[] = [];
+
+  // Secret with a scope that DENIES "myagent" — used to exercise F3.
+  const scopedSecrets = (): Record<string, VaultEntry> => ({
+    foo: { kind: "string", value: "bar-value" },
+    denied: {
+      kind: "string",
+      value: "top-secret",
+      scope: { deny: ["myagent"] },
+    } as VaultEntry,
+  });
+
+  async function makeBroker(agentName?: string): Promise<string> {
+    const sp = path.join(tmpDir, `${agentName ?? "nobind"}.sock`);
+    const b = new VaultBroker({
+      _testSecrets: scopedSecrets(),
+      _testConfig: makeMinimalConfig(),
+      _testGrantsDb: grantsDb,
+      _testAuditLogger: {
+        write: (e: AuditEntry) => { auditEntries.push(e); return true; },
+        failOpenCount: () => 0,
+      },
+      ...(agentName !== undefined ? { _testAgentName: agentName } : {}),
+    });
+    await b.start(sp, undefined, undefined);
+    brokers.push(b);
+    return sp;
+  }
+
+  beforeEach(() => {
+    prevNonLinuxFlag = process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
+    process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX = "1";
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "broker-3084-test-"));
+    socketPath = ""; // set per-test by makeBroker
+    grantsDb = makeInMemoryGrantsDb();
+    auditEntries = [];
+  });
+
+  afterEach(() => {
+    for (const b of brokers.splice(0)) { try { b.stop(); } catch { /* ignore */ } }
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    if (prevNonLinuxFlag === undefined) delete process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
+    else process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX = prevNonLinuxFlag;
+  });
+
+  // ── F3: entry scope enforced on the token path ─────────────────────────────
+
+  it("F3: token for an entry that denies the grant's agent is refused (scope-deny)", async () => {
+    socketPath = await makeBroker(); // no bind identity
+    const { token } = await mintGrant(grantsDb, "myagent", ["denied"], null);
+
+    const resp = await rpc(socketPath, { v: 1, op: "get", key: "denied", token });
+
+    expect(resp.ok).toBe(false);
+    if (!resp.ok) {
+      expect(resp.code).toBe("DENIED");
+      expect(resp.msg).toContain("scope-deny");
+    }
+    // Audited as a scope denial on the grant method, NOT served.
+    const denyEntry = auditEntries.find(
+      (e) => e.op === "get" && e.method === "grant" && String(e.result).includes("scope-deny"),
+    );
+    expect(denyEntry).toBeDefined();
+    const served = auditEntries.find((e) => e.op === "get" && e.result === "allowed");
+    expect(served).toBeUndefined();
+  });
+
+  it("F3: token for an entry with no adverse scope is still served (control)", async () => {
+    socketPath = await makeBroker();
+    const { token } = await mintGrant(grantsDb, "myagent", ["foo"], null);
+
+    const resp = await rpc(socketPath, { v: 1, op: "get", key: "foo", token });
+    expect(resp.ok).toBe(true);
+    if (resp.ok && "entry" in resp) {
+      expect(resp.entry).toEqual({ kind: "string", value: "bar-value" });
+    }
+  });
+
+  // ── F4: identity bind cross-check ──────────────────────────────────────────
+
+  it("F4: token presented on a socket whose bind identity != grant.agent_slug is rejected", async () => {
+    // Bind identity is "myagent"; grant belongs to "otheragent".
+    socketPath = await makeBroker("myagent");
+    const { token } = await mintGrant(grantsDb, "otheragent", ["foo"], null);
+
+    const resp = await rpc(socketPath, { v: 1, op: "get", key: "foo", token });
+    expect(resp.ok).toBe(false);
+    if (!resp.ok) {
+      expect(resp.code).toBe("DENIED");
+      expect(resp.msg).toContain("grant-identity-mismatch");
+    }
+    const mismatch = auditEntries.find(
+      (e) => e.op === "get" && String(e.result).includes("grant-identity-mismatch"),
+    );
+    expect(mismatch).toBeDefined();
+  });
+
+  it("F4: token whose grant.agent_slug matches the bind identity is served", async () => {
+    socketPath = await makeBroker("myagent");
+    const { token } = await mintGrant(grantsDb, "myagent", ["foo"], null);
+
+    const resp = await rpc(socketPath, { v: 1, op: "get", key: "foo", token });
+    expect(resp.ok).toBe(true);
+    if (resp.ok && "entry" in resp) {
+      expect(resp.entry).toEqual({ kind: "string", value: "bar-value" });
+    }
+  });
+
+  it("F4: no-bind-identity connection serves any valid token as before (unchanged flow)", async () => {
+    socketPath = await makeBroker(); // agentName === null
+    const { token } = await mintGrant(grantsDb, "otheragent", ["foo"], null);
+
+    const resp = await rpc(socketPath, { v: 1, op: "get", key: "foo", token });
+    expect(resp.ok).toBe(true);
+    if (resp.ok && "entry" in resp) {
+      expect(resp.entry).toEqual({ kind: "string", value: "bar-value" });
+    }
+    // No identity-mismatch denial when there is no bind identity to compare.
+    const mismatch = auditEntries.find(
+      (e) => e.op === "get" && String(e.result).includes("grant-identity-mismatch"),
+    );
+    expect(mismatch).toBeUndefined();
+  });
+});
+
 // ─── sec WS10-F3 / #1420: audit fail-closed mode ──────────────────────────────
 //
 // OUTCOME assertions: when the audit append for a secret release FAILS, the
