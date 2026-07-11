@@ -94,7 +94,18 @@ export async function reconcilePin(
       try {
         await args.api.unpinChatMessage(args.chatId, action.messageId)
       } catch (err) {
-        args.onError?.('unpin', err)
+        // Symmetric with the pin path below: a permanent rights 400 on UNPIN
+        // (rights revoked mid-session after we pinned) also enters the
+        // negative cache and logs once via onPinRightsDisabled — otherwise
+        // every later unpin attempt would burn an API call and spam
+        // `status-pin unpin failed` per attempt, the exact class this cache
+        // exists to kill (#3073 review finding). Claim is dropped regardless.
+        if (args.rightsCache && isPinRightsError(err)) {
+          const firstTime = args.rightsCache.block(args.chatId)
+          if (firstTime) args.onPinRightsDisabled?.(args.chatId)
+        } else {
+          args.onError?.('unpin', err)
+        }
       }
     }
     // Drop the claim regardless of the unpin outcome. A stuck claim would

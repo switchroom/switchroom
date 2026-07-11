@@ -401,6 +401,40 @@ describe('reconcilePin — rights-aware negative cache (#3024)', () => {
     expect(cache.isBlocked('-1009000000004')).toBe(false)
   })
 
+  it('UNPIN rights-failure (rights revoked mid-session) blocks the chat, logs once, second unpin makes no API call', async () => {
+    const cache = new PinRightsCache()
+    const disabled: string[] = []
+    const unpinFails: string[] = []
+    let unpinCalls = 0
+    const api: PinBotApi = {
+      pinChatMessage: async () => {},
+      unpinChatMessage: async () => {
+        unpinCalls += 1
+        throw rightsErr()
+      },
+    }
+    const common = {
+      api,
+      chatId: '-1009000000007',
+      desired: { pinned: false } as const,
+      rightsCache: cache,
+      onPinRightsDisabled: (chat: string) => disabled.push(chat),
+      onError: (phase: 'pin' | 'unpin') => unpinFails.push(phase),
+    }
+
+    const first = await reconcilePin({ ...common, prevState: { messageId: 21 } })
+    expect(first).toBeNull() // claim dropped regardless (drop-on-unpin contract)
+    expect(unpinCalls).toBe(1) // it did try once
+    expect(disabled).toEqual(['-1009000000007']) // logged exactly once
+    expect(unpinFails).toEqual([]) // NOT routed through per-attempt onError
+    expect(cache.isBlocked('-1009000000007')).toBe(true)
+
+    const second = await reconcilePin({ ...common, prevState: { messageId: 22 } })
+    expect(second).toBeNull() // claim still dropped
+    expect(unpinCalls).toBe(1) // second attempt short-circuited before the API
+    expect(disabled).toEqual(['-1009000000007']) // no second log
+  })
+
   it('a blocked chat skips the UNPIN api call too (drops the claim silently)', async () => {
     const cache = new PinRightsCache()
     cache.block('-1009000000005')
