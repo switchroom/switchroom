@@ -209,14 +209,20 @@ function resolveWebToken(): string {
  * Returns true when the request carries a Tailscale identity header AND the
  * connection originates from the loopback interface (127.0.0.1 or ::1).
  *
- * Safety rule — trust only from loopback:
- *   Tailscale's `tailscale serve` daemon injects `Tailscale-User-Login` (and
- *   related headers) into requests it proxies to the local backend. These
- *   headers are authoritative ONLY when the request comes from the Tailscale
- *   daemon itself, which always connects via loopback. If we trusted the header
- *   from arbitrary remote IPs, any external caller could spoof it and bypass
- *   the bearer-token check entirely. By requiring source IP to be loopback we
- *   guarantee the header was injected by the daemon, not a remote attacker.
+ * Trust assumption — loopback is necessary, NOT sufficient:
+ *   Tailscale's `tailscale serve` daemon terminates tailnet-authenticated
+ *   traffic, injects `Tailscale-User-Login` (and related headers) into the
+ *   requests it proxies, and always connects to the local backend via
+ *   loopback. Requiring a loopback source IP therefore stops arbitrary
+ *   REMOTE callers from spoofing the header and bypassing the bearer-token
+ *   check. It does NOT prove the daemon sent the request: any process
+ *   sharing the host loopback can forge the header. This trust holds only
+ *   when nothing untrusted shares the loopback — and under the default
+ *   `networkIsolation: "host"` agent config, agent containers run
+ *   `network_mode: host` (see the host-mode comment in
+ *   src/agents/compose.ts) and DO share it, so a compromised agent could
+ *   forge the header. That is an accepted residual of the shared-host trust
+ *   model; the opt-in mitigation is `networkIsolation: strict` (#1413).
  *
  * Exported for unit-testing; not part of the public API.
  */
@@ -257,16 +263,18 @@ export function isOriginAllowed(
     return true;
   }
   // Behind `tailscale serve`: the request arrived on loopback carrying
-  // a `Tailscale-User-Login` header that only the tailscale daemon can
-  // inject (verified by isTailscaleIdentified — loopback source + the
-  // header). It is therefore NOT a hostile cross-origin web page hitting
-  // raw localhost — it came through the trusted serve proxy, whose
-  // Origin is the tailnet host. Allow it; this mirrors how checkAuth
-  // already trusts the same predicate, and makes the dashboard's own
-  // printed `tailscale serve` instructions actually work on a
-  // localhost-only bind (they previously 403'd here). A malicious page
-  // CANNOT set Tailscale-User-Login, so CSRF protection for the
-  // original threat (web page → raw 127.0.0.1) is unchanged.
+  // a `Tailscale-User-Login` header (isTailscaleIdentified checked
+  // loopback source + header presence). A malicious web page CANNOT set
+  // Tailscale-User-Login, so this is not the hostile cross-origin page
+  // the check below defends against — CSRF protection for the original
+  // threat (web page → raw 127.0.0.1) is unchanged. Allow it; this
+  // mirrors how checkAuth already trusts the same predicate, and makes
+  // the dashboard's own printed `tailscale serve` instructions actually
+  // work on a localhost-only bind (they previously 403'd here). Note the
+  // loopback check does NOT prove the serve daemon sent the request:
+  // under the default `networkIsolation: "host"` topology, agents share
+  // the host loopback and could forge the header — an accepted
+  // host-trust residual documented on isTailscaleIdentified.
   if (tailscaleIdentified) return true;
   const origin = req.headers.get("Origin");
   if (!origin) return true;
