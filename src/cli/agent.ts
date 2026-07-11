@@ -1645,7 +1645,7 @@ export function registerAgentCommand(program: Command): void {
     .option("--graceful-restart", "Wait for active turn to complete before restarting")
     .option(
       "--preserve-claude-md",
-      "Opt out of regenerating CLAUDE.md — use if you have hand-edits you don't want to migrate to CLAUDE.custom.md yet"
+      "Opt out of regenerating the Switchroom-managed section of CLAUDE.md — use if you have hand-edits above the `# --- Yours ---` marker you don't want clobbered yet (edits below the marker are always preserved)"
     )
     .option("--check", "Report drift between yaml and settings.json without writing")
     .action(

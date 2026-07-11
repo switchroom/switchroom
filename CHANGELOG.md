@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Per-agent CLAUDE.md is now a two-section file with a preserved operator area (#1857)
+
+`<agentDir>/CLAUDE.md` is split by a visible marker line:
+
+```
+# --- Yours (preserved across apply) ---
+```
+
+Everything ABOVE the marker is Switchroom-managed and regenerated on
+every `switchroom apply` / `agent reconcile`; everything BELOW is
+operator-owned and preserved verbatim across applies. A fresh agent gets
+a self-teaching placeholder below the marker. Both the first-scaffold and
+the reconcile write paths compose the file through one shared helper
+(`composeTwoSectionClaudeMd`) so they produce byte-identical output and a
+re-run with unchanged config is a full no-op. Above-marker hand-edits are
+still clobbered under the existing fingerprint/backup regime (a
+`.before-rerender.<ts>` backup is written on the first-scaffold path).
+
+The `workspace/CLAUDE.custom.md` sidecar is deprecated: on the first
+apply post-upgrade its content is migrated below the marker and the file
+is renamed to `workspace/CLAUDE.custom.md.deprecated` (one-time, logged).
+Edit CLAUDE.md below the marker directly from now on.
+
 ## v0.18.11 — Rollouts you can watch, poll, and survive
 
 ### Rich checklist rollout narration with per-agent progress (#3047)

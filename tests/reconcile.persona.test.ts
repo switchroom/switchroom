@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { scaffoldAgent, reconcileAgent } from "../src/agents/scaffold.js";
@@ -108,7 +108,7 @@ describe("reconcileAgent — persona (Phase 3)", () => {
     expect(afterReconcile).toBe(original); // Idempotent when template is the same
   });
 
-  it("appends CLAUDE.custom.md sidecar if present", () => {
+  it("migrates a legacy CLAUDE.custom.md sidecar below the marker + retires it (#1857)", () => {
     const config = makeAgentConfig({
       soul: { name: "Agent", style: "default" },
     });
@@ -117,20 +117,29 @@ describe("reconcileAgent — persona (Phase 3)", () => {
     const claudeMdPath = join(result.agentDir, "CLAUDE.md");
     const claudeCustomPath = join(result.agentDir, "workspace", "CLAUDE.custom.md");
 
-    // Add custom sidecar
+    // Simulate a pre-#1857 agent: a legacy sidecar exists and CLAUDE.md has
+    // no marker yet (strip the marker the fresh scaffold wrote).
+    const MARKER = "# --- Yours (preserved across apply) ---";
+    const fresh = readFileSync(claudeMdPath, "utf-8");
+    const noMarker = fresh.slice(0, fresh.indexOf(MARKER)).trimEnd() + "\n";
+    writeFileSync(claudeMdPath, noMarker, "utf-8");
     writeFileSync(
       claudeCustomPath,
       "## Custom Instructions\n\nThis is my personal addition.",
       "utf-8"
     );
 
-    // Reconcile should append the custom content
+    // Reconcile migrates the sidecar content below the marker.
     reconcileAgent("test-agent", config, tmpDir, telegramConfig, switchroomConfig);
 
     const claudeMd = readFileSync(claudeMdPath, "utf-8");
-    expect(claudeMd).toContain("---");
-    expect(claudeMd).toContain("## Custom Instructions");
-    expect(claudeMd).toContain("This is my personal addition");
+    expect(claudeMd).toContain(MARKER);
+    const below = claudeMd.slice(claudeMd.indexOf(MARKER) + MARKER.length);
+    expect(below).toContain("## Custom Instructions");
+    expect(below).toContain("This is my personal addition");
+    // Sidecar retired.
+    expect(existsSync(claudeCustomPath)).toBe(false);
+    expect(existsSync(claudeCustomPath + ".deprecated")).toBe(true);
   });
 
   it("preserves CLAUDE.md when --preserve-claude-md is set", () => {
@@ -164,18 +173,23 @@ describe("reconcileAgent — persona (Phase 3)", () => {
     const result = scaffoldAgent("test-agent", config, tmpDir, telegramConfig);
     const claudeMdPath = join(result.agentDir, "CLAUDE.md");
 
-    // Simulate template drift (or stray hand-edits) — bytes don't match
-    // what re-rendering the template would produce, no sidecar exists.
+    // Simulate stray hand-edits ABOVE the marker (the Switchroom-managed
+    // section) — this is the drift that must be regenerated. Content BELOW
+    // the marker is operator-owned and preserved, so drift the managed block.
+    const MARKER = "# --- Yours (preserved across apply) ---";
     const original = readFileSync(claudeMdPath, "utf-8");
-    const edited = original + "\n\n## My Custom Section\n\nUser-added content.";
+    const edited = original.replace(
+      MARKER,
+      `## My Custom Section\n\nUser-added content.\n\n${MARKER}`,
+    );
     writeFileSync(claudeMdPath, edited, "utf-8");
 
-    // Reconcile must NOT abort; it should regenerate from template.
+    // Reconcile must NOT abort; it should regenerate the managed section.
     expect(() => {
       reconcileAgent("test-agent", config, tmpDir, telegramConfig, switchroomConfig);
     }).not.toThrow();
 
-    // Drift is gone — file matches what scaffold would have written fresh.
+    // Above-marker drift is gone — managed section matches a fresh render.
     const afterReconcile = readFileSync(claudeMdPath, "utf-8");
     expect(afterReconcile).not.toContain("## My Custom Section");
   });

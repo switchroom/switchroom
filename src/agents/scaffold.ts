@@ -1403,6 +1403,103 @@ function composeWithSidecar(renderedBase: string, sidecarPath: string): string {
 }
 
 /**
+ * Visible boundary between the Switchroom-managed (scaffold-regenerated)
+ * top of `<agentDir>/CLAUDE.md` and the operator-owned bottom that survives
+ * every `switchroom apply`.
+ *
+ * STRUCTURAL PROMISE — never change this text or its semantics again.
+ * Operators edit below this line; the scaffold rewrites everything above it
+ * on every reconcile and preserves everything below it verbatim. See #1857.
+ */
+export const CLAUDE_MD_YOURS_MARKER = "# --- Yours (preserved across apply) ---";
+
+/**
+ * Placeholder written below the marker for a fresh agent that has neither an
+ * existing below-marker section nor a legacy `workspace/CLAUDE.custom.md`
+ * sidecar to migrate. Self-teaching: the first time an operator opens the
+ * file they see what's editable and why.
+ */
+const CLAUDE_MD_YOURS_PLACEHOLDER =
+  "This space is yours. Add per-agent rules, exceptions, or context the " +
+  "Switchroom template doesn't capture. Everything above the marker line is " +
+  "regenerated on every apply; this section is preserved.";
+
+/**
+ * Resolve the operator-owned "below the marker" section for a two-section
+ * `<agentDir>/CLAUDE.md`, in priority order:
+ *
+ *   (a) the existing file already contains the marker → preserve everything
+ *       after the FIRST marker occurrence verbatim (operator content survives);
+ *   (b) else a legacy `workspace/CLAUDE.custom.md` sidecar exists with content
+ *       → migrate its content below the marker AND rename the sidecar to
+ *       `.deprecated` (one-time migration, logged);
+ *   (c) else the fresh-agent placeholder paragraph.
+ *
+ * Side effect: case (b) renames the sidecar. This is deliberate and lives here
+ * so BOTH write paths (first-scaffold + reconcile) get identical migration
+ * behaviour from the single shared helper.
+ */
+function resolveClaudeMdYoursSection(
+  existingFileContent: string | null,
+  sidecarPath: string,
+): string {
+  // (a) preserve everything after the FIRST marker occurrence, verbatim.
+  if (existingFileContent) {
+    const idx = existingFileContent.indexOf(CLAUDE_MD_YOURS_MARKER);
+    if (idx !== -1) {
+      const afterMarker = existingFileContent
+        .slice(idx + CLAUDE_MD_YOURS_MARKER.length)
+        .replace(/^[\r\n]+/, ""); // drop the blank line(s) between the marker and the content
+      return afterMarker.trimEnd();
+    }
+  }
+
+  // (b) one-time sidecar migration.
+  if (existsSync(sidecarPath)) {
+    const sidecar = readFileSync(sidecarPath, "utf-8").trimEnd();
+    if (sidecar.length > 0) {
+      const deprecatedPath = sidecarPath + ".deprecated";
+      try {
+        renameSync(sidecarPath, deprecatedPath);
+        console.log(
+          chalk.green(
+            `  migrated CLAUDE.custom.md → CLAUDE.md operator section; ` +
+              `renamed sidecar to ${deprecatedPath}`,
+          ),
+        );
+      } catch {
+        /* best-effort — content still migrates below; sidecar retirement retried next run */
+      }
+      return sidecar;
+    }
+  }
+
+  // (c) fresh-agent placeholder.
+  return CLAUDE_MD_YOURS_PLACEHOLDER;
+}
+
+/**
+ * Compose the two-section `<agentDir>/CLAUDE.md`: the Switchroom-managed
+ * `managed` block (rendered template + fragments + `claude_md_raw`), a visible
+ * marker line, and the operator-owned section resolved by
+ * {@link resolveClaudeMdYoursSection}.
+ *
+ * INVARIANT: for identical inputs this is a deterministic pure function of
+ * (`managed`, `existingFileContent`, sidecar state), so the first-scaffold and
+ * reconcile paths produce byte-identical output and a re-run with unchanged
+ * config is a full no-op. The output is a fixed point: feeding it back in as
+ * `existingFileContent` re-derives the same bytes.
+ */
+export function composeTwoSectionClaudeMd(
+  managed: string,
+  existingFileContent: string | null,
+  sidecarPath: string,
+): string {
+  const yours = resolveClaudeMdYoursSection(existingFileContent, sidecarPath);
+  return `${managed.trimEnd()}\n\n${CLAUDE_MD_YOURS_MARKER}\n\n${yours.trimEnd()}\n`;
+}
+
+/**
  * Render the persona SOUL.md for an agent from its profile template +
  * `soul:` config, folding in the SOUL.custom.md sidecar if present.
  * The single source of truth for seed-time and `switchroom soul reset`
@@ -4118,9 +4215,7 @@ export function scaffoldAgent(
       // hand-edits are preserved as a backup at
       // `<filename>.before-rerender.<unix-ms>` so they can be
       // re-merged manually.
-      rerenderWithFingerprint(
-        join(agentDir, dest),
-        () => {
+      const renderManaged = () => {
           let rendered = renderTemplate(srcPath, context);
           if (dest === "CLAUDE.md") {
             // Reply-discipline rides at the TOP (prepended after the
@@ -4170,11 +4265,34 @@ export function scaffoldAgent(
             rendered = rendered.trimEnd() + "\n\n" + agentConfig.claude_md_raw + "\n";
           }
           return rendered;
-        },
-        created,
-        skipped,
-        rewrittenWithBackup,
-      );
+      };
+      if (dest === "CLAUDE.md") {
+        // Two-section composition (#1857): the rendered output above is the
+        // Switchroom-managed block; everything below the visible marker is
+        // operator-owned and preserved across applies. Uses a marker-aware
+        // fingerprint writer: only the managed (above-marker) section is
+        // fingerprinted, so a below-marker operator edit — the normal,
+        // encouraged state — is NOT treated as drift and never triggers a
+        // .before-rerender backup. Composition goes through the same shared
+        // helper as the reconcile path (Phase 3) so both paths produce
+        // byte-identical output.
+        writeTwoSectionClaudeMdWithFingerprint(
+          join(agentDir, dest),
+          renderManaged,
+          join(agentDir, "workspace", "CLAUDE.custom.md"),
+          created,
+          skipped,
+          rewrittenWithBackup,
+        );
+      } else {
+        rerenderWithFingerprint(
+          join(agentDir, dest),
+          renderManaged,
+          created,
+          skipped,
+          rewrittenWithBackup,
+        );
+      }
     }
   }
 
@@ -6006,8 +6124,11 @@ export function reconcileAgent(
   }
 
   // --- Phase 3: regenerate CLAUDE.md by default (unless --preserve-claude-md) ---
-  // CLAUDE.md is regenerated deterministically from the template. CLAUDE.custom.md
-  // sidecar (if present) is appended with a \n\n---\n\n separator.
+  // CLAUDE.md is a two-section file (#1857): the Switchroom-managed block above
+  // the visible marker is regenerated deterministically from the template on
+  // every apply; everything below the marker is operator-owned and preserved
+  // verbatim. A legacy workspace/CLAUDE.custom.md sidecar is migrated below the
+  // marker (and renamed .deprecated) on the first apply post-#1857.
   if (!options.preserveClaudeMd && !options.skipProfileTemplates) {
     const profilePath = getProfilePath(agentConfig.extends ?? DEFAULT_PROFILE);
     const claudeMdSrc = join(profilePath, "CLAUDE.md.hbs");
@@ -6087,22 +6208,27 @@ export function reconcileAgent(
       if (devProtocol) {
         rendered = rendered.trimEnd() + "\n\n" + devProtocol + "\n";
       }
-      let composed = composeWithSidecar(rendered, claudeCustomPath);
-
-      // Legacy claude_md_raw still appends after sidecar (one-shot escape hatch)
+      // claude_md_raw stays in the Switchroom-managed (above-marker) block —
+      // it is yaml-driven, scaffold-owned content, not operator hand-edits.
       if (agentConfig.claude_md_raw) {
-        composed = composed.trimEnd() + "\n\n" + agentConfig.claude_md_raw + "\n";
+        rendered = rendered.trimEnd() + "\n\n" + agentConfig.claude_md_raw + "\n";
       }
 
-      // CLAUDE.md is template-owned: every reconcile regenerates it from
-      // CLAUDE.md.hbs + workspace/CLAUDE.custom.md sidecar. Drift between
-      // on-disk and freshly-rendered bytes is almost always template
-      // churn upstream, not operator hand-edits (operators put custom
-      // content in the sidecar). The previous abort treated those cases
-      // identically and forced --preserve-claude-md on every release.
-      // Preserve mode still exists for operators who genuinely want to
-      // freeze a CLAUDE.md (`reconcile --preserve-claude-md`).
+      // Two-section composition (#1857): `rendered` is the Switchroom-managed
+      // block; everything below the visible marker is operator-owned and
+      // preserved verbatim across applies. The below-marker section is read
+      // from the EXISTING file (or migrated one-time from the legacy
+      // workspace/CLAUDE.custom.md sidecar). MUST use the same shared helper
+      // as the first-scaffold path so both produce byte-identical output —
+      // preservation reads the existing file BEFORE composing so an unchanged
+      // config re-run is a full no-op (composed === before below).
       const before = existsSync(claudeMdDest) ? readFileSync(claudeMdDest, "utf-8") : "";
+      const composed = composeTwoSectionClaudeMd(
+        rendered,
+        before.length > 0 ? before : null,
+        claudeCustomPath,
+      );
+
       if (composed !== before) {
         writeFileSync(claudeMdDest, composed, "utf-8");
         changes.push(claudeMdDest);
@@ -6865,6 +6991,106 @@ function writeIfChanged(
  * Caveat: hashing is SHA-256 (`node:crypto`); cost is microseconds
  * per call. Fingerprint sidecar gets ~64 bytes per file. Trivial.
  */
+/**
+ * The Switchroom-managed section of a two-section CLAUDE.md: everything up to
+ * and INCLUDING the marker line. If the marker is absent (legacy pre-#1857
+ * file) the whole content counts as managed — which reproduces the old
+ * whole-file fingerprint semantics for exactly the files that predate the
+ * two-section regime.
+ */
+function claudeMdManagedSection(content: string): string {
+  const idx = content.indexOf(CLAUDE_MD_YOURS_MARKER);
+  if (idx === -1) return content;
+  return content.slice(0, idx + CLAUDE_MD_YOURS_MARKER.length);
+}
+
+/**
+ * Marker-aware fingerprint writer for the two-section `<agentDir>/CLAUDE.md`
+ * (#1857). Same clobber/backup decision tree as rerenderWithFingerprint, with
+ * one deliberate difference: the fingerprint covers ONLY the Switchroom-managed
+ * (above-marker) section, and drift is judged against the existing file's
+ * above-marker section only.
+ *
+ * Why: below-marker operator edits are a first-class, encouraged state — the
+ * composition preserves them verbatim, so they are NOT drift. Under a
+ * whole-file fingerprint every below-marker edit would mismatch the recorded
+ * hash forever, and every subsequent template change would spuriously write a
+ * `.before-rerender.<ts>` backup on every apply. Above-marker hand-edits still
+ * get the full backup + regenerate treatment; legacy files without the marker
+ * degrade to whole-file semantics (one backup on migration if hand-edited).
+ */
+function writeTwoSectionClaudeMdWithFingerprint(
+  filePath: string,
+  managedFn: () => string,
+  sidecarPath: string,
+  created: string[],
+  skipped: string[],
+  rewrittenWithBackup: string[],
+): void {
+  const prev = existsSync(filePath) ? readFileSync(filePath, "utf-8") : null;
+  const next = composeTwoSectionClaudeMd(managedFn(), prev, sidecarPath);
+  const nextManagedHash = createHash("sha256")
+    .update(claudeMdManagedSection(next), "utf-8")
+    .digest("hex");
+  const fingerprintPath = filePath + ".fingerprint";
+
+  if (prev === null) {
+    writeFileSync(filePath, next, "utf-8");
+    writeFileSync(fingerprintPath, nextManagedHash, "utf-8");
+    created.push(filePath);
+    return;
+  }
+
+  if (prev === next) {
+    // Already exactly what we'd write — refresh the fingerprint (covers
+    // fingerprint deletion and migration from the whole-file regime).
+    try {
+      writeFileSync(fingerprintPath, nextManagedHash, "utf-8");
+    } catch {
+      // best-effort
+    }
+    skipped.push(filePath);
+    return;
+  }
+
+  // Managed section drifted (or the below-marker section normalized). Decide
+  // whether the operator touched the MANAGED section since our last write.
+  const prevManagedHash = createHash("sha256")
+    .update(claudeMdManagedSection(prev), "utf-8")
+    .digest("hex");
+  const recordedFingerprint = existsSync(fingerprintPath)
+    ? readFileSync(fingerprintPath, "utf-8").trim()
+    : null;
+
+  if (recordedFingerprint === prevManagedHash) {
+    // Managed section untouched by the operator — template/config drifted
+    // upstream. Clobber the managed section cleanly; the below-marker
+    // section is preserved by the composition above. No backup.
+    writeFileSync(filePath, next, "utf-8");
+    writeFileSync(fingerprintPath, nextManagedHash, "utf-8");
+    created.push(filePath);
+    return;
+  }
+
+  // Above-marker hand-edit (fingerprint mismatch) or legacy state (no
+  // fingerprint). Back up + overwrite — same regime as rerenderWithFingerprint.
+  const backupPath = `${filePath}.before-rerender.${Date.now()}`;
+  try {
+    writeFileSync(backupPath, prev, "utf-8");
+  } catch (err) {
+    process.stderr.write(
+      `scaffold: refusing to overwrite ${filePath} — backup write failed ` +
+      `(${(err as Error).message}). Operator edits preserved.\n`,
+    );
+    skipped.push(filePath);
+    return;
+  }
+  writeFileSync(filePath, next, "utf-8");
+  writeFileSync(fingerprintPath, nextManagedHash, "utf-8");
+  rewrittenWithBackup.push(filePath);
+  created.push(filePath);
+}
+
 function rerenderWithFingerprint(
   filePath: string,
   contentFn: () => string,

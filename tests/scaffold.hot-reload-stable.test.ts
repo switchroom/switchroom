@@ -257,13 +257,16 @@ describe("hot-reload stable feature", () => {
 
       const result = scaffoldAgent("test-agent", config, tmpDir, telegramConfig, switchroomConfig);
 
-      // Drop a sidecar so reconcile re-composes CLAUDE.md (and the new
-      // composed != on-disk) — that's how CLAUDE.md gets into `changes`
-      // and then through the classifier. Without a sidecar, reconcile
-      // either aborts on hand-edits or sees no-op.
+      // Force a re-composition of CLAUDE.md so it lands in `changes` and
+      // flows through the classifier. Under the #1857 two-section model, an
+      // edit below the "Yours" marker survives and edits above it are
+      // regenerated — either way the file changes. Strip the marker to
+      // simulate a legacy (pre-#1857) file: reconcile re-adds it, so the
+      // composed output != on-disk and CLAUDE.md enters `changes`.
       const claudeMdPath = join(result.agentDir, "CLAUDE.md");
-      const sidecarPath = join(result.agentDir, "workspace", "CLAUDE.custom.md");
-      writeFileSync(sidecarPath, "# Sidecar appendix\n", "utf-8");
+      const MARKER = "# --- Yours (preserved across apply) ---";
+      const fresh = readFileSync(claudeMdPath, "utf-8");
+      writeFileSync(claudeMdPath, fresh.slice(0, fresh.indexOf(MARKER)).trimEnd() + "\n", "utf-8");
 
       // Reconcile
       const reconcileResult = reconcileAgent("test-agent", config, tmpDir, telegramConfig, switchroomConfig);
