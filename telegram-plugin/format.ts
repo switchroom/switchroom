@@ -72,6 +72,24 @@ export function codeSpanSafe(s: string): string {
 }
 
 /**
+ * Make a URL safe to interpolate as the destination of a `[label](href)`
+ * inline link.
+ *
+ * In GFM / Bot API 10.1 markdown a link destination written as `(...)` is
+ * terminated by the first UNESCAPED `)`, so an href containing a literal `)`
+ * (Wikipedia `..._(disambiguation)` URLs, tracking params, generated deep
+ * links) truncates the URL there and spills its tail into the surrounding
+ * prose — a broken link, not a degraded one. The destination honours C-style
+ * backslash escapes, so backslash-escape `\` (first, so we never double-escape
+ * a following escape) and `)` — the whole URL is preserved and micromark
+ * decodes it back to the original href on round-trip. `(` needs no escape:
+ * only an unescaped `)` closes the destination.
+ */
+export function escapeLinkHref(href: string): string {
+  return href.replace(/\\/g, '\\\\').replace(/\)/g, '\\)')
+}
+
+/**
  * Repair LLM-side JSON escape bungles.
  *
  * Some MCP clients (and some LLM tool-call generators) occasionally emit a

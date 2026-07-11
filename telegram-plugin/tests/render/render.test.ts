@@ -48,6 +48,24 @@ describe("render: inline palette", () => {
       "[label](https://example.com)",
     );
   });
+  it("escapes a `)` in a link href so the URL is not truncated (F3)", () => {
+    // An angle-bracket destination is the only way to smuggle an UNBALANCED
+    // `)` into an href via the parser (a bare `)` would otherwise close the
+    // destination). CommonMark strips the angle brackets → href holds the `)`.
+    const doc = parse("[wiki](<https://example.com/a)b>)");
+    const link = (doc.blocks[0] as any).children.find((c: any) => c.type === "link");
+    expect(link.href).toBe("https://example.com/a)b"); // parser captured the full URL
+
+    const out = render(doc);
+    // The `)` is backslash-escaped so it can no longer terminate the `(...)`
+    // destination early — a valid Bot API 10.1 link, not a broken one.
+    expect(out).toContain("a\\)b");
+    // And it round-trips: re-parsing recovers the SAME href, not a truncated
+    // `https://example.com/a` with stray `b)` prose spilled after it.
+    const reparsed = parse(out);
+    const reLink = (reparsed.blocks[0] as any).children.find((c: any) => c.type === "link");
+    expect(reLink.href).toBe("https://example.com/a)b");
+  });
   it("underline", () => {
     expect(render(parse("__hi__"))).toBe("__hi__");
   });
@@ -225,6 +243,35 @@ describe("render: block palette", () => {
     const md = ["| Col |", "| --- |", "| **bold** cell |"].join("\n");
     const out = render(parse(md));
     expect(out).toContain("**bold** cell");
+  });
+  it("neutralizes a `|` inside a code span in a table cell so the row survives (F4)", () => {
+    // Source pipe inside the code span is `\|`-escaped so the INPUT is a valid
+    // GFM table; the parser folds it to a code node whose text is `a|b`.
+    const md = ["| Col |", "| --- |", "| `a\\|b` |"].join("\n");
+    const doc = parse(md);
+    const srcCell = (doc.blocks[0] as TableNode).rows[0].cells[0].children.find(
+      (c: any) => c.type === "code",
+    ) as any;
+    expect(srcCell.text).toBe("a|b"); // parser captured the literal pipe
+
+    const out = render(doc);
+    // The `|` is re-escaped inside the code span so it can't be read as a
+    // column separator and tear the row — valid Bot API 10.1 GFM output.
+    expect(out).toContain("`a\\|b`");
+    // Every rendered table line stays a structurally-valid row (`|`-delimited,
+    // balanced) — a torn row would start with `|` but not end with one.
+    for (const line of out.split("\n")) {
+      if (line.trimStart().startsWith("|")) {
+        expect(line.trimEnd().endsWith("|")).toBe(true);
+      }
+    }
+    // And it round-trips: the re-parsed table still has ONE body cell whose
+    // code text is `a|b`, not a torn row with an unterminated code span.
+    const reparsed = parse(out);
+    const reRow = (reparsed.blocks[0] as TableNode).rows[0];
+    expect(reRow.cells).toHaveLength(1);
+    const reCell = reRow.cells[0].children.find((c: any) => c.type === "code") as any;
+    expect(reCell.text).toBe("a|b");
   });
 });
 

@@ -405,6 +405,73 @@ describe('send-gate PR2: M2 critical wait re-evaluates the window each iteration
   })
 })
 
+describe('send-gate F4: a CRITICAL edit honours the fail-fast ceiling (no unbounded block)', () => {
+  it('fails fast with a structured FLOOD_WAIT_ACTIVE instead of blocking unbounded on the edit driver', async () => {
+    const clock = new FakeClock()
+    const { calls, fn } = recorder(clock)
+    const gate = createSendGate({
+      enabled: true,
+      clock,
+      criticalFailFastMs: 60_000,
+      // 10-minute ban >> the 60s ceiling. On the pre-fix edit path this window
+      // routed a `critical` card edit through the driver's UNBOUNDED admit and
+      // blocked for the whole ban; the fix must fail fast like the non-edit path.
+      initialWindows: [{ scopeKey: 'global', untilTs: 600_000 }],
+    })
+
+    let caught: unknown
+    try {
+      // messageId + editPayload → edit path; priorityClass:'critical' is the case
+      // handleEdit previously ignored (only 'cosmetic' was special-cased).
+      await gate.gate(fn('critical-edit'), {
+        messageId: 42,
+        editPayload: 'v1',
+        priorityClass: 'critical',
+      })
+    } catch (err) {
+      caught = err
+    }
+
+    // Fail fast (structured flood-wait), NOT an unbounded block that never
+    // settles — the multi-hour reply wedge the send-gate exists to eliminate.
+    expect(isFloodWaitActiveError(caught)).toBe(true)
+    const e = caught as { untilTs: number; retryAfterSec: number; error_code: number }
+    expect(e.error_code).toBe(429)
+    expect(e.untilTs).toBe(600_000)
+    expect(e.retryAfterSec).toBe(600)
+    expect(calls).toHaveLength(0) // never probed the API
+    expect(gate.stats().global.failedFast).toBe(1)
+    expect(gate.stats().global.sent).toBe(0)
+  })
+
+  it('waits out a SHORT window (<= ceiling) then sends the critical edit — mirrors the non-edit path', async () => {
+    const clock = new FakeClock()
+    const { calls, fn } = recorder(clock)
+    const gate = createSendGate({
+      enabled: true,
+      clock,
+      criticalFailFastMs: 60_000,
+      // 30s window, under the 60s ceiling → the critical edit waits it out and
+      // then sends (not shed, not failed fast).
+      initialWindows: [{ scopeKey: 'global', untilTs: 30_000 }],
+    })
+
+    const p = gate.gate(fn('critical-edit'), {
+      messageId: 7,
+      editPayload: 'v1',
+      priorityClass: 'critical',
+    })
+    await clock.advance(31_000)
+    const res = await p
+
+    expect(res).toBe('critical-edit')
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.at).toBeGreaterThanOrEqual(30_000)
+    expect(gate.stats().global.failedFast).toBe(0)
+    expect(gate.stats().global.sent).toBe(1)
+  })
+})
+
 describe('send-gate PR2: opening a window from a 429, and persistence hook', () => {
   it('opens scope windows via onWindowOpen when a non-edit send throws FLOOD_WAIT_ACTIVE', async () => {
     const clock = new FakeClock()

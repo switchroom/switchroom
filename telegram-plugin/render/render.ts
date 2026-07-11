@@ -30,7 +30,7 @@
 // equivalent entities rather than accidentally re-triggering formatting or
 // breaking out of a code span.
 
-import { escapeMarkdown, codeSpanSafe, RICH_MESSAGE_MAX_CHARS } from "../format.js";
+import { escapeMarkdown, codeSpanSafe, escapeLinkHref, RICH_MESSAGE_MAX_CHARS } from "../format.js";
 import type {
   Block,
   BlockquoteNode,
@@ -47,26 +47,44 @@ import type {
 // Inline rendering
 // ---------------------------------------------------------------------------
 
-function renderInline(node: Inline): string {
+/** Rendering context threaded through the inline walk. `inTableCell` is set
+ *  while rendering the inline content of a GFM table cell, where a literal `|`
+ *  — even inside an inline-code span — would be read as a column separator and
+ *  tear the row (F4). Plain-text `|` is already neutralised by `escapeMarkdown`
+ *  (`|` is one of its specials); the only gap is the code span, whose content
+ *  is otherwise verbatim, so we backslash-escape `|` there in the table
+ *  context. GFM strips the `\` and keeps the pipe literal inside the span. */
+interface InlineCtx {
+  inTableCell?: boolean;
+}
+
+function renderInline(node: Inline, ctx: InlineCtx = {}): string {
   switch (node.type) {
     case "plain":
       return escapeMarkdown(node.text);
     case "bold":
-      return `**${renderInlineChildren(node.children)}**`;
+      return `**${renderInlineChildren(node.children, ctx)}**`;
     case "italic":
-      return `*${renderInlineChildren(node.children)}*`;
+      return `*${renderInlineChildren(node.children, ctx)}*`;
     case "underline":
-      return `__${renderInlineChildren(node.children)}__`;
+      return `__${renderInlineChildren(node.children, ctx)}__`;
     case "strike":
-      return `~~${renderInlineChildren(node.children)}~~`;
+      return `~~${renderInlineChildren(node.children, ctx)}~~`;
     case "spoiler":
-      return `||${renderInlineChildren(node.children)}||`;
+      return `||${renderInlineChildren(node.children, ctx)}||`;
     case "highlight":
-      return `==${renderInlineChildren(node.children)}==`;
-    case "code":
-      return `\`${codeSpanSafe(node.text)}\``;
+      return `==${renderInlineChildren(node.children, ctx)}==`;
+    case "code": {
+      const safe = codeSpanSafe(node.text);
+      // In a table cell, an unescaped `|` inside the span closes the cell early
+      // and corrupts the row; `\|` survives (GFM keeps the pipe literal in the
+      // span and drops the backslash). Elsewhere the span content is verbatim.
+      return `\`${ctx.inTableCell ? safe.replace(/\|/g, "\\|") : safe}\``;
+    }
     case "link":
-      return `[${renderInlineChildren(node.children)}](${node.href})`;
+      // Escape the href so a literal `)` in the URL can't terminate the
+      // destination early and break the link (F3).
+      return `[${renderInlineChildren(node.children, ctx)}](${escapeLinkHref(node.href)})`;
     default: {
       // Exhaustiveness guard — the IR union is closed; a new variant must be
       // handled above rather than silently dropped.
@@ -76,8 +94,8 @@ function renderInline(node: Inline): string {
   }
 }
 
-function renderInlineChildren(children: Inline[]): string {
-  return children.map(renderInline).join("");
+function renderInlineChildren(children: Inline[], ctx: InlineCtx = {}): string {
+  return children.map((child) => renderInline(child, ctx)).join("");
 }
 
 // ---------------------------------------------------------------------------
@@ -154,7 +172,7 @@ function renderList(node: ListNode): string {
 /** Render a single cell's inline content for a table (no line breaks — GFM
  *  table cells can't contain them; pipes are escaped defensively). */
 function renderTableCell(cells: TableRow["cells"][number]): string {
-  return renderInlineChildren(cells.children).replace(/\n+/g, " ");
+  return renderInlineChildren(cells.children, { inTableCell: true }).replace(/\n+/g, " ");
 }
 
 function alignSeparator(align: TableNode["align"][number]): string {

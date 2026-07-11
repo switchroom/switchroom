@@ -806,7 +806,31 @@ export function createSendGate(config: SendGateConfig): SendGate {
           continue
         }
 
-        await admit(bucketsFor(opts))
+        // A `critical` edit must NEVER block unbounded (part3-design §3). Mirror
+        // the non-edit critical path in `gate`: admit via the priority-aware loop
+        // so a flood-wait ban longer than the fail-fast ceiling rejects with a
+        // structured FLOOD_WAIT_ACTIVE — and a window that EXTENDS past the
+        // ceiling while we wait out a short window converts to fail-fast too (M2,
+        // review PR #3106) — instead of the unbounded `admit` below, which would
+        // re-introduce the multi-hour reply wedge the send-gate exists to
+        // eliminate (F4, review 2026-07-11). Non-critical edits keep PR 1's
+        // unbounded coalescing admit unchanged.
+        if ((opts.priorityClass ?? 'useful') === 'critical') {
+          const outcome = await admitPriority(bucketsFor(opts), 'critical')
+          if (outcome.result === 'failfast') {
+            counters.failedFast++
+            const retryAfterSec = Math.ceil((outcome.untilTs - clock.now()) / 1000)
+            openScopedWindowsForOpts(opts, outcome.untilTs)
+            // Reject THIS edit's own promise (fail fast) and loop: a distinct
+            // newer edit that arrived during the wait owns a fresh state.pending
+            // and is handled on the next iteration.
+            p.reject(makeFloodWaitActiveError(retryAfterSec, outcome.untilTs, null))
+            continue
+          }
+          // outcome.result === 'ok' → admitPriority already consumed the buckets.
+        } else {
+          await admit(bucketsFor(opts))
+        }
         // Reserve the send-start time BEFORE awaiting the network so the floor
         // is measured from send start (matches the per-message serialization).
         state.lastSentMs = clock.now()
