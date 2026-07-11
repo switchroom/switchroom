@@ -254,15 +254,49 @@ describe('gateway wiring — the reaper re-drives held cards', () => {
 
   // The production code MUST have the same shape the harness models, or the
   // outcome tests above are testing a fiction. These pin the three fan-out fixes.
-  it('F1 — the in-flight flag clears ONCE, after Promise.allSettled over every target', () => {
+  it('F1 — the in-flight flag clears ONCE per outcome, after Promise.allSettled over every target', () => {
     const at = GATEWAY_SRC.indexOf('function postPermissionCard(')
     const fn = GATEWAY_SRC.slice(at, GATEWAY_SRC.indexOf('\n/**', at))
     expect(fn).toContain('Promise.allSettled(sends)')
-    // Exactly one release, and it is the allSettled one — not a per-target
-    // .finally inside the fan-out loop.
-    expect(fn.match(/heldCardsInFlight\.delete\(requestId\)/g)?.length).toBe(1)
+    // Exactly two releases: the allSettled settle (the async path) and the
+    // sync-throw catch (so a throw in the prologue can't leak the flag).
+    // NOT a per-target .finally inside the fan-out loop.
+    expect(fn.match(/heldCardsInFlight\.delete\(requestId\)/g)?.length).toBe(2)
     expect(fn.indexOf('Promise.allSettled(sends)'))
       .toBeLessThan(fn.indexOf('heldCardsInFlight.delete(requestId)'))
+  })
+
+  it('the flag is registered at the TOP of postPermissionCard — both callers covered', () => {
+    const at = GATEWAY_SRC.indexOf('function postPermissionCard(')
+    const fn = GATEWAY_SRC.slice(at, GATEWAY_SRC.indexOf('\n/**', at))
+    // Registered inside postPermissionCard itself, before any send fires, so the
+    // ipc INITIAL-delivery caller is guarded too — not only the sweep.
+    expect(fn).toContain('heldCardsInFlight.add(requestId)')
+    expect(fn.indexOf('heldCardsInFlight.add(requestId)'))
+      .toBeLessThan(fn.indexOf('Promise.allSettled(sends)'))
+    // …and the sweep no longer registers it at the call site.
+    const sweepAt = GATEWAY_SRC.indexOf('function sweepHeldPermissionCards(')
+    const sweep = GATEWAY_SRC.slice(sweepAt, GATEWAY_SRC.indexOf('\n// 60-second sweep', sweepAt))
+    expect(sweep).not.toContain('heldCardsInFlight.add(')
+  })
+
+  it('a SYNC throw in the sweep loop is caught — the reaper tick survives, the flag is freed', () => {
+    const sweepAt = GATEWAY_SRC.indexOf('function sweepHeldPermissionCards(')
+    const sweep = GATEWAY_SRC.slice(sweepAt, GATEWAY_SRC.indexOf('\n// 60-second sweep', sweepAt))
+    expect(sweep).toContain('try {')
+    expect(sweep).toContain('postPermissionCard(requestId, pend)')
+    expect(sweep).toContain('heldCardsInFlight.delete(requestId)')
+  })
+
+  it('the backoff counts once per ATTEMPT, not once per failing target', () => {
+    const at = GATEWAY_SRC.indexOf('function postPermissionCard(')
+    const fn = GATEWAY_SRC.slice(at, GATEWAY_SRC.indexOf('\n/**', at))
+    // The attempt number is computed ONCE, before the fan-out; every failing
+    // target stamps the same value. A per-target `(live.redeliveryFailures ?? 0) + 1`
+    // inside the catch would ratchet the 1m/2m/4m ladder N× faster.
+    expect(fn).toContain('const attemptFailures = (pend.redeliveryFailures ?? 0) + 1')
+    expect(fn).toContain('const failures = attemptFailures')
+    expect(fn).not.toContain('const failures = (live.redeliveryFailures ?? 0) + 1')
   })
 
   it('F2 — the failure handler never re-marks an entry whose card already landed', () => {
@@ -410,6 +444,93 @@ describe('N targets — the fan-out cases a single-target harness cannot see', (
     expect(h.sends.length).toBe(1)
     expect(h.pending.get('req-1')?.undeliverable ?? null).toBeNull()
     expect(h.blockedStore.read()).toBeNull()
+  })
+
+  // Review finding: only the sweep registered the in-flight flag — the ipc
+  // INITIAL-delivery call site did not. So: target A fails transiently (marks
+  // the entry held), target B is still slowly sending, a tick lands past the
+  // backoff — and, unguarded, re-posts the card while the FIRST post is still
+  // in flight. The flag now lives at the top of postPermissionCard itself.
+  it('a tick landing while the INITIAL delivery is still in flight does not duplicate', async () => {
+    const h = createHarness({ targets: TWO })
+    dirs.push(h.stateDir)
+    h.breakTarget('-100200', 'econnreset')
+    h.hangTarget('-100999')
+
+    const first = h.raise('req-1', 'Bash', '{"command":"npm test"}') // NOT awaited
+    await h.flush() // let A's failure chain mark the entry held
+
+    expect(h.pending.get('req-1')?.undeliverable?.reason).toBe('transient')
+    // The INITIAL delivery registered the flag — that is the fix under test.
+    expect(h.isInFlight('req-1')).toBe(true)
+
+    // Past the backoff, with B STILL in flight: the sweep must not re-post.
+    h.clock.advance(2 * MINUTE)
+    await h.tick()
+    await h.flush()
+    await h.tick()
+    await h.flush()
+
+    h.releaseTarget('-100999')
+    await first
+    await h.settle()
+
+    // Exactly ONE card reached B — no duplicate from the overlapping ticks.
+    expect(h.sends.filter(x => x.chatId === '-100999').length).toBe(1)
+    expect(h.isInFlight('req-1')).toBe(false)
+  })
+
+  // Review finding: a SYNC throw in postPermissionCard's prologue leaked the
+  // in-flight flag (never reaching the settle `.finally`) AND escaped the
+  // setInterval callback. The entry would then never be re-selected — a wedge.
+  it('a SYNC throw during re-delivery does not wedge the entry — the next tick retries', async () => {
+    const h = harness()
+    h.banFor(FOUR_HOURS)
+    await h.raise('req-1', 'Bash', '{"command":"npm test"}')
+    expect(h.pending.get('req-1')?.undeliverable?.reason).toBe('flood_wait')
+
+    // Window closes, but the card build throws synchronously on this tick.
+    h.clock.advance(FOUR_HOURS + MINUTE)
+    h.breakSync('req-1')
+    await h.tickSettled()
+    expect(h.sends.length).toBe(0)
+    // The flag did NOT leak — the entry is still re-selectable.
+    expect(h.isInFlight('req-1')).toBe(false)
+
+    // The very next tick re-delivers. No wedge, no operator intervention.
+    await h.tickSettled()
+    expect(h.sends.length).toBe(1)
+    expect(h.pending.get('req-1')?.undeliverable ?? null).toBeNull()
+  })
+
+  // Review finding: `redeliveryFailures` incremented once per failing TARGET per
+  // attempt, so two failing targets walked the documented 1m/2m/4m ladder twice
+  // as fast (rung 2 after one attempt, rung 4 after two…).
+  it('N failing targets count as ONE attempt — the ladder stays 1m/2m/4m', async () => {
+    const h = createHarness({ targets: TWO })
+    dirs.push(h.stateDir)
+    h.breakTarget('-100200', 'econnreset')
+    h.breakTarget('-100999', 'econnreset')
+
+    await h.raise('req-1', 'Bash', '{"command":"npm test"}')
+    await h.settle()
+
+    // BOTH targets failed in one fan-out. That is attempt 1, not attempt 2 —
+    // and the backoff is the ladder's FIRST rung: 1 minute.
+    expect(h.pending.get('req-1')!.redeliveryFailures).toBe(1)
+    expect(h.pending.get('req-1')!.undeliverable!.retryableAt - h.clock.now()).toBe(MINUTE)
+
+    // Attempt 2 (both targets fail again): rung 2 — 2 minutes, not 8.
+    h.clock.advance(MINUTE)
+    await h.tickSettled()
+    expect(h.pending.get('req-1')!.redeliveryFailures).toBe(2)
+    expect(h.pending.get('req-1')!.undeliverable!.retryableAt - h.clock.now()).toBe(2 * MINUTE)
+
+    // Attempt 3: rung 3 — 4 minutes.
+    h.clock.advance(2 * MINUTE)
+    await h.tickSettled()
+    expect(h.pending.get('req-1')!.redeliveryFailures).toBe(3)
+    expect(h.pending.get('req-1')!.undeliverable!.retryableAt - h.clock.now()).toBe(4 * MINUTE)
   })
 })
 

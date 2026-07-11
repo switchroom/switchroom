@@ -6941,6 +6941,20 @@ function postPermissionCard(
   requestId: string,
   pend: NonNullable<ReturnType<typeof pendingPermissions.get>>,
 ): void {
+  // Register the in-flight flag HERE, not at the call sites, so BOTH callers are
+  // covered. The sweep used to add it itself, but the ipcServer initial-delivery
+  // call site did not — so a reaper tick landing between window-close and a slow
+  // in-flight INITIAL send settling could post a duplicate card. One registration
+  // point, one release point (the `.finally` below / the sync-throw catch).
+  heldCardsInFlight.add(requestId)
+
+  // One increment per ATTEMPT, not per failing target. `targets` is N-wide and
+  // every failing target runs the same `.catch` — incrementing there ratcheted
+  // the backoff ladder N× faster than the documented 1m/2m/4m…30m. Compute the
+  // attempt number once, up front; every failing target stamps the SAME value.
+  const attemptFailures = (pend.redeliveryFailures ?? 0) + 1
+
+  try {
   const text = pend.card_text
   const showAlways =
     resolveScopedAllowChoices(pend.tool_name, pend.input_preview) != null
@@ -7044,7 +7058,7 @@ function postPermissionCard(
       // gate while a permission is pending, that would silently buffer the operator's
       // messages forever. Escalate the surface, never the verdict — and never abandon
       // the card.
-      const failures = (live.redeliveryFailures ?? 0) + 1
+      const failures = attemptFailures
       live.redeliveryFailures = failures
       const now = Date.now()
       // A flood-wait carries Telegram's own window end; everything else backs off.
@@ -7072,13 +7086,23 @@ function postPermissionCard(
   void Promise.allSettled(sends).finally(() => {
     heldCardsInFlight.delete(requestId)
   })
+  } catch (e) {
+    // A SYNCHRONOUS throw (resolveScopedAllowChoices / buildPermissionActionRow /
+    // resolvePermissionCardTargets) never reaches the `.finally` above — without
+    // this catch the in-flight flag would leak and the request would never be
+    // re-selected by the sweep. Release the flag, then rethrow so the caller
+    // (the sweep's own try/catch, or the ipc handler) sees the failure.
+    heldCardsInFlight.delete(requestId)
+    throw e
+  }
 }
 
 /**
- * Request ids whose re-delivery is mid-flight. Guard (iii) against
- * double-delivery: the 60s reaper must not re-post a card whose previous
- * re-post hasn't settled yet (a slow send would otherwise be re-issued every
- * tick). Cleared in postPermissionCard's `.finally`.
+ * Request ids whose card post is mid-flight — INITIAL delivery or re-delivery.
+ * Guard (iii) against double-delivery: the 60s reaper must not re-post a card
+ * whose previous post hasn't settled yet (a slow send would otherwise be
+ * re-issued every tick). Registered at the top of postPermissionCard (so both
+ * callers are covered) and cleared in its `.finally` — or its sync-throw catch.
  */
 const heldCardsInFlight = new Set<string>()
 
@@ -7120,8 +7144,22 @@ function sweepHeldPermissionCards(): void {
   for (const requestId of send) {
     const pend = pendingPermissions.get(requestId)
     if (pend == null) continue
-    heldCardsInFlight.add(requestId)
-    postPermissionCard(requestId, pend)
+    try {
+      // postPermissionCard registers the in-flight flag itself (so the ipc
+      // initial-delivery caller is covered too) and releases it once every
+      // target settles — or on a sync throw, in its own catch.
+      postPermissionCard(requestId, pend)
+    } catch (e) {
+      // A synchronous throw must not escape the setInterval callback (it would
+      // kill the whole reaper tick, TTL sweep included). postPermissionCard has
+      // already released the flag; delete again defensively so the entry is
+      // re-selectable on the next tick, and log rather than rethrow.
+      heldCardsInFlight.delete(requestId)
+      process.stderr.write(
+        `telegram gateway: held-card re-delivery for ${requestId} threw ` +
+        `synchronously: ${e} — flag released, will retry on the next tick\n`,
+      )
+    }
   }
 }
 

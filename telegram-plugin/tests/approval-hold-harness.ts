@@ -130,6 +130,8 @@ export interface Harness {
   /** Hang one target's send until `releaseTarget` — lets a tick overlap it. */
   hangTarget: (chatId: string) => void
   releaseTarget: (chatId: string) => void
+  /** Make the NEXT postPermissionCard for `requestId` throw SYNCHRONOUSLY (one-shot). */
+  breakSync: (requestId: string) => void
   /** Remaining ms of the open window, per the real probe. */
   floodRemainingMs: () => number
   /** The gateway's `postPermissionCard` — first delivery AND re-delivery. */
@@ -179,6 +181,8 @@ export function createHarness(opts: { ttlFreeze?: boolean; cap?: number; targets
   const faults = new Map<string, () => unknown>()
   /** Chats banned individually (so one target can flood while another succeeds). */
   const perChatBan = new Map<string, number>()
+  /** Requests whose NEXT postPermissionCard throws SYNCHRONOUSLY (one-shot). */
+  const syncFaults = new Set<string>()
   /** Chats whose send HANGS until released — lets a tick overlap an in-flight send. */
   const gates = new Map<string, Promise<void>>()
   const gateReleases = new Map<string, () => void>()
@@ -248,9 +252,26 @@ export function createHarness(opts: { ttlFreeze?: boolean; cap?: number; targets
   // ends in `allowFrom.map(...)`). N>1 is the COMMON case on the re-delivery
   // path, so a harness pinned at N=1 cannot see the double-delivery and
   // permanent-wedge bugs that live in the multi-target interleaving.
-  async function postPermissionCard(requestId: string): Promise<void> {
+  function postPermissionCard(requestId: string): Promise<void> {
     const pend = pending.get(requestId)
-    if (pend == null) { heldInFlight.delete(requestId); return }
+    if (pend == null) { heldInFlight.delete(requestId); return Promise.resolve() }
+
+    // Mirrors gateway.ts: the flag is registered at the TOP of postPermissionCard
+    // itself, so the initial-delivery caller is covered as well as the sweep —
+    // otherwise a tick landing while a slow INITIAL send is in flight re-posts.
+    heldInFlight.add(requestId)
+
+    try {
+    // A sync throw in the gateway's prologue (resolveScopedAllowChoices /
+    // buildPermissionActionRow / resolvePermissionCardTargets), made drivable.
+    if (syncFaults.delete(requestId)) {
+      throw new Error(`sync fault building card for ${requestId}`)
+    }
+
+    // One increment per ATTEMPT, not per failing target (mirrors gateway.ts):
+    // every failing target in the same fan-out stamps the SAME attempt number,
+    // so N failing targets don't ratchet the backoff ladder N× faster.
+    const attemptFailures = (pend.redeliveryFailures ?? 0) + 1
 
     const sends = targetChats.map(async (chatId) => {
       try {
@@ -278,7 +299,7 @@ export function createHarness(opts: { ttlFreeze?: boolean; cap?: number; targets
         if (live.cards.length > 0) return
         const reason = holdReasonFor(e)
         if (reason == null) return // permanent — falls through to the TTL
-        const failures = (live.redeliveryFailures ?? 0) + 1
+        const failures = attemptFailures
         live.redeliveryFailures = failures
         const now = clock.now()
         const retryableAt = isFloodWaitActiveError(e)
@@ -291,8 +312,13 @@ export function createHarness(opts: { ttlFreeze?: boolean; cap?: number; targets
 
     // ONE settle across ALL targets — the flag must not release while any
     // target is still in flight.
-    await Promise.allSettled(sends)
-    heldInFlight.delete(requestId)
+    return Promise.allSettled(sends).then(() => { heldInFlight.delete(requestId) })
+    } catch (e) {
+      // Mirrors gateway.ts: a sync throw never reaches the settle above, so
+      // release the flag here and rethrow to the caller (raise, or tick's catch).
+      heldInFlight.delete(requestId)
+      throw e
+    }
   }
 
   async function raise(requestId: string, toolName: string, inputPreview: string): Promise<void> {
@@ -322,8 +348,16 @@ export function createHarness(opts: { ttlFreeze?: boolean; cap?: number; targets
     // Awaiting here would make an overlapping tick impossible — and an
     // overlapping tick is precisely how a per-target in-flight clear
     // double-delivers. Tests that need the send settled `await h.settle()`.
-    for (const requestId of send) heldInFlight.add(requestId)
-    for (const id of send) { inFlightSends.push(postPermissionCard(id)) }
+    // postPermissionCard registers the in-flight flag itself; a SYNC throw is
+    // caught here (mirrors gateway's sweep) so it can't kill the tick, and the
+    // flag is deleted defensively so the entry stays re-selectable.
+    for (const id of send) {
+      try {
+        inFlightSends.push(postPermissionCard(id))
+      } catch {
+        heldInFlight.delete(id)
+      }
+    }
 
     // The TTL sweep, as gateway.ts runs it.
     for (const [k, v] of pending) {
@@ -371,6 +405,7 @@ export function createHarness(opts: { ttlFreeze?: boolean; cap?: number; targets
       gates.delete(chatId)
       gateReleases.delete(chatId)
     },
+    breakSync: (requestId: string) => { syncFaults.add(requestId) },
     floodRemainingMs: () => probe(),
     postPermissionCard,
     raise,
