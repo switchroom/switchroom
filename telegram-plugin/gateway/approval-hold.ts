@@ -460,6 +460,30 @@ export function holdReasonFor(err: unknown): UndeliverableReason | null {
 }
 
 /**
+ * THE LEASH, as one shared decision — used by `sweepPermissionTtl`, which BOTH
+ * gateway.ts and the outcome test's harness call.
+ *
+ * The harness used to keep a PRIVATE copy of this check (a `ttlFreeze` flag), so
+ * deleting the real guard left every behavioural assertion GREEN — including the
+ * flagship "no deny verdict is ever dispatched". Only a source-text grep noticed,
+ * and greps drift. A test that cannot fail is not a test, and this is the test for
+ * the `no-self-escalation` invariant.
+ *
+ * A HELD entry NEVER expires. The TTL answers one question: "how long did the
+ * operator have to answer?" For a card that never landed — flood ban, 5xx, network
+ * partition — the answer is ZERO SECONDS.
+ */
+export function shouldExpirePermission(
+  pend: { undeliverable?: UndeliverableMark | null; startedAt: number },
+  now: number,
+  ttlMs: number,
+): boolean {
+  // Never auto-deny an ask no human ever saw. Not even on a deadline.
+  if (isHeldUndeliverable(pend)) return false
+  return now - pend.startedAt > ttlMs
+}
+
+/**
  * The TTL freeze predicate (PR 3).
  *
  * An entry marked undeliverable NEVER expires. The TTL answers "how long did

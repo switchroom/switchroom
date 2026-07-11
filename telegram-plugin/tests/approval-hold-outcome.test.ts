@@ -31,6 +31,7 @@ import { describe, it, expect, afterEach } from 'vitest'
 import { rmSync, statSync, readFileSync } from 'node:fs'
 import { createHarness } from './approval-hold-harness.js'
 import { PERMISSION_TTL_DEFAULT_MS } from '../gateway/permission-timeout.js'
+import { shouldExpirePermission } from '../gateway/approval-hold.js'
 
 const MINUTE = 60_000
 const FOUR_HOURS = 4 * 60 * 60_000
@@ -40,15 +41,14 @@ afterEach(() => {
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true })
 })
 
-/** `ttlFreeze: false` reproduces origin/main — no hold, the TTL still fires. */
-function harness(opts: { ttlFreeze?: boolean } = {}) {
+function harness(opts: { targets?: string[] } = {}) {
   const h = createHarness(opts)
   dirs.push(h.stateDir)
   return h
 }
 
 /** The incident: a 4h ban is open, and the agent asks to run a command. */
-async function incident(opts: { ttlFreeze?: boolean } = {}) {
+async function incident(opts: { targets?: string[] } = {}) {
   const h = harness(opts)
   h.banFor(FOUR_HOURS)
   await h.raise('req-overlord-1', 'Bash', '{"command":"rm -rf ./build"}')
@@ -126,23 +126,25 @@ describe('an undeliverable approval is HELD, never denied', () => {
     expect(h.blockedStore.read()?.requestId).toBe('req-overlord-1')
   })
 
-  it('(c-counterfactual) WITHOUT the TTL freeze — origin/main — the same run auto-denies', async () => {
-    // This is the bug, reproduced. It is what test (c) above asserts against,
-    // and it is why the freeze is load-bearing rather than defensive. If this
-    // test ever goes green, the freeze has been removed and (c) is a lie.
-    const h = await incident({ ttlFreeze: false })
-
-    for (let elapsed = 0; elapsed <= 61 * MINUTE; elapsed += MINUTE) {
-      await h.tickSettled()
-      h.clock.advance(MINUTE)
+  it('(c-proof) the entry IS past its TTL — only the leash saves it', () => {
+    // Documents origin/main's behaviour WITHOUT re-implementing it. The pending
+    // entry is genuinely past the 60-minute TTL; the ONLY reason it survives is the
+    // held check inside `shouldExpirePermission`. Delete that check and (c) above
+    // goes RED — there is exactly one implementation, and both the gateway sweep
+    // and this harness call it.
+    const held = {
+      startedAt: 0,
+      undeliverable: { since: 0, retryableAt: 9e15, reason: 'flood_wait' as const },
     }
+    const seen = { startedAt: 0 }
+    const past = PERMISSION_TTL_DEFAULT_MS + 1
 
-    // A denial the operator never made, for a card they never saw.
-    expect(h.verdicts.length).toBe(1)
-    expect(h.verdicts[0]!.behavior).toBe('deny')
-    expect(h.pending.has('req-overlord-1')).toBe(false)
-    // …and it never landed a card, so it never sent one either.
-    expect(h.sends.length).toBe(0)
+    // A card the operator COULD see, left unanswered past the TTL → expires. That is
+    // the normal, correct timeout, and it is untouched.
+    expect(shouldExpirePermission(seen, past, PERMISSION_TTL_DEFAULT_MS)).toBe(true)
+    // The SAME clock, on a card that never landed → never expires.
+    expect(shouldExpirePermission(held, past, PERMISSION_TTL_DEFAULT_MS)).toBe(false)
+    expect(shouldExpirePermission(held, 9e15, PERMISSION_TTL_DEFAULT_MS)).toBe(false)
   })
 
   it('(d) past the ban, the card lands EXACTLY once — no loss, no duplicate', async () => {
@@ -259,16 +261,19 @@ describe('gateway wiring — the leash', () => {
     'utf8',
   )
 
-  it('the TTL sweep skips held entries entirely', () => {
-    const sweepStart = GATEWAY_SRC.indexOf('for (const [k, v] of pendingPermissions) {')
+  it('the TTL sweep routes through the SHARED shouldExpirePermission()', () => {
+    // This pin is no longer the safety net — the behavioural tests above are, and
+    // they now drive the same `shouldExpirePermission` the gateway does, so deleting
+    // the leash turns them RED. This only guards the WIRING: that the sweep can't
+    // regrow a private inline check that drifts from what the test exercises.
+    const sweepStart = GATEWAY_SRC.indexOf('sweepPermissionTtl({')
     expect(sweepStart).toBeGreaterThan(-1)
-    const sweep = GATEWAY_SRC.slice(sweepStart, sweepStart + 2500)
-    // The freeze must come BEFORE the TTL comparison, or it does nothing.
-    const freeze = sweep.indexOf('if (isHeldUndeliverable(v)) continue')
-    const ttlCheck = sweep.indexOf('if (now - v.startedAt > ttl)')
-    expect(freeze).toBeGreaterThan(-1)
-    expect(ttlCheck).toBeGreaterThan(-1)
-    expect(freeze).toBeLessThan(ttlCheck)
+    const sweep = GATEWAY_SRC.slice(sweepStart, sweepStart + 3500)
+    expect(GATEWAY_SRC).toContain('sweepPermissionTtl({')
+    // …and must NOT carry its own copy of the leash or the raw TTL comparison.
+    // …and the gateway must not regrow a private inline leash check.
+    expect(sweep).not.toContain('if (isHeldUndeliverable(v)) continue')
+    expect(sweep).not.toContain('if (now - v.startedAt > ttl)')
   })
 
   it('successful (re)delivery resets startedAt', () => {

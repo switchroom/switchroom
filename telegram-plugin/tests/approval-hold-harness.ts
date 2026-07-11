@@ -39,7 +39,6 @@ import {
   blockedApprovalsDir,
   selectHeldForRedelivery,
   selectOldestHeld,
-  isHeldUndeliverable,
   safeActionForRecord,
   holdReasonFor,
   heldRetryBackoffMs,
@@ -47,6 +46,7 @@ import {
   type BlockedApprovalStore,
 } from '../gateway/approval-hold.js'
 import { ttlForTool } from '../gateway/permission-timeout.js'
+import { sweepPermissionTtl } from '../gateway/permission-ttl-sweep.js'
 import { naturalAction } from '../permission-title.js'
 
 /** A pending permission, shaped exactly like gateway.ts's `pendingPermissions` value. */
@@ -153,10 +153,7 @@ export interface Harness {
   tap: (requestId: string, behavior: 'allow' | 'deny') => void
 }
 
-export function createHarness(opts: { ttlFreeze?: boolean; cap?: number; targets?: string[] } = {}): Harness {
-  // PR 3's TTL freeze. Defaults ON (the shipped behaviour); the outcome test
-  // flips it OFF to reproduce origin/main's auto-deny and prove the red.
-  const ttlFreeze = opts.ttlFreeze ?? true
+export function createHarness(opts: { cap?: number; targets?: string[] } = {}): Harness {
 
   const stateDir = mkdtempSync(join(tmpdir(), 'approval-hold-'))
   const floodPath = floodStatePath(stateDir)
@@ -360,18 +357,20 @@ export function createHarness(opts: { ttlFreeze?: boolean; cap?: number; targets
     }
 
     // The TTL sweep, as gateway.ts runs it.
-    for (const [k, v] of pending) {
-      // PR 3 — THE LEASH. A held entry NEVER expires: the TTL asks "how long
-      // did the operator have to answer?", and for a card that never landed the
-      // answer is zero seconds. With this guard removed we reproduce
-      // origin/main, which auto-denies an approval no human ever saw.
-      if (ttlFreeze && isHeldUndeliverable(v)) continue
-      if (now - v.startedAt > ttlForTool(v.tool_name)) {
+    // The TTL sweep — the REAL production function, not a copy. This is the whole
+    // point: the guard AND the auto-deny it gates live in ONE place that both the
+    // gateway and this harness call, so there is no private copy here that could
+    // silently compensate for a guard deleted from production.
+    sweepPermissionTtl({
+      entries: pending,
+      now,
+      ttlForTool,
+      onExpire: (k) => {
         verdicts.push({ requestId: k, behavior: 'deny', message: 'timed out' })
         pending.delete(k)
         reconcile()
-      }
-    }
+      },
+    })
   }
 
   function tap(requestId: string, behavior: 'allow' | 'deny'): void {
