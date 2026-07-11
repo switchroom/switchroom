@@ -207,6 +207,21 @@ export interface ListStateData {
    * false whenever `auth.allow_overage_accounts` is empty/unset.
    */
   active_overage_serving?: boolean;
+  /**
+   * Most recent BROKER-INITIATED proactive fleet roll (fleetQuotaProbeTick
+   * failover), so gateways can announce the switch to the operator (#3031
+   * PR 3). Absent/null on pre-roll brokers or until the first proactive
+   * roll. Reactive gateway-triggered rolls are NOT recorded here — the
+   * triggering gateway announces those itself.
+   */
+  last_fleet_roll?: {
+    from: string;
+    to: string;
+    at: number;
+    exhausted_until?: number;
+    window?: "5h" | "7d";
+    pct?: number;
+  } | null;
 }
 
 export interface SetActiveData {

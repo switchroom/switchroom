@@ -149,6 +149,93 @@ export function buildQuotaClaimKey(
   return `quota-watch:${accountLabel}:${transition}:${chatId}`;
 }
 
+// ─── Broker-initiated fleet-roll announcement (#3031 PR 3) ───────────────────
+
+/**
+ * Reserved state-map key for the last-announced broker roll. Same reserved-key
+ * trick as FLEET_ALL_EXHAUSTED_KEY: not a valid account label, so it never
+ * collides with per-account entries, and the per-account loop never sees it.
+ * `lastNotifiedAt` stores the roll's `at` timestamp (edge-trigger latch).
+ */
+export const FLEET_ROLL_ANNOUNCE_KEY = "__fleet_roll_announce__";
+
+/**
+ * Don't announce a roll older than this — a gateway booting hours after a
+ * roll would otherwise resurrect stale news (mirrors the late-recovery
+ * discipline). One hour comfortably covers the 15-min poll cadence plus
+ * boot-stagger while staying inside the roll's operational relevance.
+ */
+export const FLEET_ROLL_MAX_AGE_MS = 60 * 60_000;
+
+/**
+ * Suppress the per-account 🟡 throttling push when a roll announcement for
+ * the SAME account fired this recently — the roll card already told the
+ * operator that account walled and the fleet moved off it; a trailing
+ * "approaching limit" push for it is noise. Matches the broker claim window
+ * so the two dedup horizons agree.
+ */
+export const QUOTA_WATCH_ROLL_DEDUP_MS = QUOTA_WATCH_CLAIM_WINDOW_MS;
+
+/** Shape of `listState().last_fleet_roll` as the watch consumes it. */
+export interface FleetRollInfo {
+  from: string;
+  to: string;
+  at: number;
+  exhausted_until?: number;
+  window?: "5h" | "7d";
+  pct?: number;
+}
+
+export type FleetRollAnnounceDecision =
+  | { kind: "notify"; message: string; newState: QuotaWatchAccountState }
+  | { kind: "skip"; reason: string };
+
+/**
+ * Edge-triggered decision for the broker-roll announcement. Fires at most
+ * once per roll event (latched on the roll's `at` timestamp), never for
+ * rolls older than `maxAgeMs`, and never re-fires in steady state.
+ */
+export function evaluateFleetRollAnnounce(args: {
+  roll: FleetRollInfo | null | undefined;
+  prev: QuotaWatchAccountState;
+  now: number;
+  maxAgeMs?: number;
+}): FleetRollAnnounceDecision {
+  const { roll, prev, now } = args;
+  const maxAgeMs = args.maxAgeMs ?? FLEET_ROLL_MAX_AGE_MS;
+  if (!roll) return { kind: "skip", reason: "no-roll" };
+  if (prev.lastNotifiedAt >= roll.at) return { kind: "skip", reason: "already-announced" };
+  if (now - roll.at > maxAgeMs) return { kind: "skip", reason: "stale-roll" };
+  return {
+    kind: "notify",
+    message: buildFleetRollMessage(roll, now),
+    newState: { lastNotifiedHealth: "healthy", lastNotifiedAt: roll.at },
+  };
+}
+
+/**
+ * Causal + reassuring announcement for a broker-initiated proactive roll.
+ * Shape: "Switched fleet to <new> — <window> at <pct>% on <old>
+ * (resets <time>). Work continues uninterrupted."
+ */
+export function buildFleetRollMessage(roll: FleetRollInfo, now: number): string {
+  const winLabel =
+    roll.window === "5h" ? "5-hour window" : roll.window === "7d" ? "7-day window" : "quota window";
+  const pctPart = typeof roll.pct === "number" ? ` at ${fmtPct(roll.pct)}` : "";
+  const resetPart =
+    typeof roll.exhausted_until === "number" && roll.exhausted_until > now
+      ? ` (resets ${formatRelative(new Date(roll.exhausted_until), new Date(now))})`
+      : "";
+  return [
+    `🔁 **Switched fleet to \`${codeSpanSafe(roll.to)}\`**`,
+    ``,
+    `${winLabel}${pctPart} on \`${codeSpanSafe(roll.from)}\`${resetPart}.`,
+    `Work continues uninterrupted — agents and scheduled jobs now serve from \`${codeSpanSafe(roll.to)}\`.`,
+    ``,
+    `_Automatic broker failover. Run /auth for fleet status; \`/auth use ${codeSpanSafe(roll.from)}\` to switch back once it refills._`,
+  ].join("\n");
+}
+
 // ─── Decision logic ───────────────────────────────────────────────────────────
 
 export type QuotaWatchTransition =
@@ -177,7 +264,7 @@ export type QuotaWatchDecision =
       accountLabel: string;
       newAccountState: QuotaWatchAccountState;
       transition: QuotaWatchTransition;
-      reason: "boot-tick-recovery" | "late-recovery";
+      reason: "boot-tick-recovery" | "late-recovery" | "roll-announced";
     }
   | { kind: "skip"; accountLabel: string; reason: string };
 
@@ -257,6 +344,14 @@ export function evaluateQuotaWatchAccount(args: {
   bootTick?: boolean;
   /** Staleness / late-recovery thresholds; 0 disables each. */
   tuning?: Pick<QuotaWatchTuning, "maxStaleMs" | "lateRecoveryMs">;
+  /**
+   * Most recent broker-initiated fleet roll, if any (#3031 PR 3). A fresh
+   * roll OFF this account suppresses the 🟡 entered-throttling push — the
+   * roll announcement already told the operator this account walled, so a
+   * trailing "approaching limit" for it is redundant. Latched silently
+   * (reconcile) so edge-trigger semantics hold: no steady-state re-notify.
+   */
+  lastRoll?: Pick<FleetRollInfo, "from" | "at"> | null;
 }): QuotaWatchDecision {
   const { agentName, snap, prev, now } = args;
   const bootTick = args.bootTick ?? false;
@@ -300,6 +395,22 @@ export function evaluateQuotaWatchAccount(args: {
       lastNotifiedHealth: "throttling",
       lastNotifiedAt: now,
     };
+    // Roll-dedupe (#3031 PR 3): a fresh broker-roll announcement for this
+    // same account already covered the news — latch silently.
+    const lastRoll = args.lastRoll;
+    if (
+      lastRoll &&
+      lastRoll.from === label &&
+      now - lastRoll.at <= QUOTA_WATCH_ROLL_DEDUP_MS
+    ) {
+      return {
+        kind: "reconcile",
+        accountLabel: label,
+        newAccountState: newState,
+        transition: "entered-throttling",
+        reason: "roll-announced",
+      };
+    }
     return {
       kind: "notify",
       accountLabel: label,
@@ -536,8 +647,12 @@ export function buildThrottlingMessage(agentName: string, snap: AccountSnapshot)
     ? ""
     : `\nThis is a non-active account. Consider \`/auth use ${codeSpanSafe(snap.label)}\` to switch, or keep it as a fallback reserve.`;
 
+  // Early warning, not an incident (#3031 PR 3): say what happens NEXT so
+  // the operator knows no action is required — if utilization keeps climbing
+  // to the failover threshold, the broker rolls the fleet to another account
+  // automatically and announces the switch.
   const altNote = snap.isActive
-    ? `\nConsider \`/auth use <other-account>\` if you have a healthier account, or wait for the ${winLabel} window to refill${resetStr}.`
+    ? `\nNo action needed: if usage keeps climbing, the fleet will prefer another account once this reaches the failover threshold (you'll get a switch announcement). Or switch early with \`/auth use <other-account>\`, or wait for the ${winLabel} window to refill${resetStr}.`
     : "";
 
   return [

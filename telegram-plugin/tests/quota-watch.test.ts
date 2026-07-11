@@ -20,6 +20,11 @@ import {
   emptyAccountState,
   isLiveCorroboration,
   type CorroborationProbe,
+  evaluateFleetRollAnnounce,
+  buildFleetRollMessage,
+  FLEET_ROLL_MAX_AGE_MS,
+  QUOTA_WATCH_ROLL_DEDUP_MS,
+  type FleetRollInfo,
 } from "../quota-watch.js";
 import type { AccountSnapshot } from "../auth-snapshot-format.js";
 import type { QuotaUtilization } from "../quota-check.js";
@@ -944,5 +949,153 @@ describe("evaluateQuotaWatchAccount — total enumeration (144 cells)", () => {
       }
     }
     expect(cells).toBe(144);
+  });
+});
+
+// ── #3031 PR 3 — broker-roll announcement ────────────────────────────────────
+
+describe("evaluateFleetRollAnnounce (#3031 PR 3)", () => {
+  const ROLL: FleetRollInfo = {
+    from: "alice@example.com",
+    to: "bob@example.com",
+    at: NOW - 60_000,
+    exhausted_until: NOW + 2 * 3600_000,
+    window: "5h",
+    pct: 99.8,
+  };
+
+  it("fires once for a fresh, never-announced roll (latched on roll.at)", () => {
+    const d = evaluateFleetRollAnnounce({ roll: ROLL, prev: emptyAccountState(), now: NOW });
+    expect(d.kind).toBe("notify");
+    if (d.kind !== "notify") return;
+    expect(d.newState.lastNotifiedAt).toBe(ROLL.at);
+  });
+
+  it("skips when already announced (edge trigger — no steady-state re-notify)", () => {
+    const d1 = evaluateFleetRollAnnounce({ roll: ROLL, prev: emptyAccountState(), now: NOW });
+    expect(d1.kind).toBe("notify");
+    if (d1.kind !== "notify") return;
+    const d2 = evaluateFleetRollAnnounce({ roll: ROLL, prev: d1.newState, now: NOW + 15 * 60_000 });
+    expect(d2.kind).toBe("skip");
+    if (d2.kind !== "skip") return;
+    expect(d2.reason).toBe("already-announced");
+  });
+
+  it("re-fires for a NEW roll event (later at) after a prior announce", () => {
+    const d1 = evaluateFleetRollAnnounce({ roll: ROLL, prev: emptyAccountState(), now: NOW });
+    if (d1.kind !== "notify") throw new Error("expected notify");
+    const later: FleetRollInfo = { ...ROLL, at: NOW + 6 * 3600_000, from: "bob@example.com", to: "carol@example.com" };
+    const d2 = evaluateFleetRollAnnounce({ roll: later, prev: d1.newState, now: NOW + 6 * 3600_000 + 5_000 });
+    expect(d2.kind).toBe("notify");
+  });
+
+  it("skips a stale roll (boot long after the event resurrects no old news)", () => {
+    const d = evaluateFleetRollAnnounce({
+      roll: { ...ROLL, at: NOW - FLEET_ROLL_MAX_AGE_MS - 1 },
+      prev: emptyAccountState(),
+      now: NOW,
+    });
+    expect(d.kind).toBe("skip");
+    if (d.kind !== "skip") return;
+    expect(d.reason).toBe("stale-roll");
+  });
+
+  it("skips when the broker reports no roll (old broker / never rolled)", () => {
+    expect(evaluateFleetRollAnnounce({ roll: null, prev: emptyAccountState(), now: NOW }).kind).toBe("skip");
+    expect(evaluateFleetRollAnnounce({ roll: undefined, prev: emptyAccountState(), now: NOW }).kind).toBe("skip");
+  });
+});
+
+describe("buildFleetRollMessage (#3031 PR 3) — causal + reassuring shape", () => {
+  it("names the new account, the binding window + pct on the old account, and the reset", () => {
+    const msg = buildFleetRollMessage(
+      {
+        from: "alice@example.com",
+        to: "bob@example.com",
+        at: NOW - 60_000,
+        exhausted_until: NOW + 2 * 3600_000,
+        window: "5h",
+        pct: 99.8,
+      },
+      NOW,
+    );
+    expect(msg).toContain("Switched fleet to");
+    expect(msg).toContain("bob@example.com");
+    expect(msg).toContain("alice@example.com");
+    expect(msg).toContain("5-hour window");
+    expect(msg).toContain("100%"); // fmtPct rounds 99.8
+    expect(msg).toContain("resets");
+    expect(msg).toContain("Work continues uninterrupted");
+  });
+
+  it("degrades gracefully without window/pct/reset data", () => {
+    const msg = buildFleetRollMessage(
+      { from: "alice@example.com", to: "bob@example.com", at: NOW - 60_000 },
+      NOW,
+    );
+    expect(msg).toContain("quota window");
+    expect(msg).not.toContain("resets");
+    expect(msg).toContain("Work continues uninterrupted");
+  });
+});
+
+describe("evaluateQuotaWatchAccount — roll-announcement dedupe (#3031 PR 3)", () => {
+  it("latches entered-throttling SILENTLY when a fresh roll off the same account was announced", () => {
+    const d = evaluateQuotaWatchAccount({
+      agentName: "lawgpt",
+      snap: THROTTLING_5H,
+      prev: PREV_NEVER_NOTIFIED,
+      now: NOW,
+      lastRoll: { from: "alice@example.com", at: NOW - 60_000 },
+    });
+    expect(d.kind).toBe("reconcile");
+    if (d.kind !== "reconcile") return;
+    expect(d.reason).toBe("roll-announced");
+    expect(d.transition).toBe("entered-throttling");
+    // Latch advances — no steady-state re-notify on the next tick.
+    expect(d.newAccountState.lastNotifiedHealth).toBe("throttling");
+    const next = evaluateQuotaWatchAccount({
+      agentName: "lawgpt",
+      snap: THROTTLING_5H,
+      prev: d.newAccountState,
+      now: NOW + 15 * 60_000,
+      lastRoll: { from: "alice@example.com", at: NOW - 60_000 },
+    });
+    expect(next.kind).toBe("skip");
+  });
+
+  it("does NOT dedupe a roll for a DIFFERENT account", () => {
+    const d = evaluateQuotaWatchAccount({
+      agentName: "lawgpt",
+      snap: THROTTLING_5H,
+      prev: PREV_NEVER_NOTIFIED,
+      now: NOW,
+      lastRoll: { from: "someone-else@example.com", at: NOW - 60_000 },
+    });
+    expect(d.kind).toBe("notify");
+  });
+
+  it("does NOT dedupe a roll older than the dedup window", () => {
+    const d = evaluateQuotaWatchAccount({
+      agentName: "lawgpt",
+      snap: THROTTLING_5H,
+      prev: PREV_NEVER_NOTIFIED,
+      now: NOW,
+      lastRoll: { from: "alice@example.com", at: NOW - QUOTA_WATCH_ROLL_DEDUP_MS - 1 },
+    });
+    expect(d.kind).toBe("notify");
+  });
+
+  it("throttling message says what happens next (early warning, not incident)", () => {
+    const d = evaluateQuotaWatchAccount({
+      agentName: "lawgpt",
+      snap: makeSnap("alice@example.com", makeQuota(85, 40), /*isActive*/ true),
+      prev: PREV_NEVER_NOTIFIED,
+      now: NOW,
+    });
+    expect(d.kind).toBe("notify");
+    if (d.kind !== "notify") return;
+    expect(d.message).toContain("No action needed");
+    expect(d.message).toContain("fleet will prefer another account");
   });
 });
