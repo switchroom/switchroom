@@ -270,6 +270,29 @@ describe('isDestructiveBashCommand — fail-closed denylist', () => {
     expect(timeBoxRule('Bash', bashInput('git status `rm -rf x`'))).toBeNull()
   })
 
+  it('flags destructive git checkout / stash forms that discard work (fail-closed)', () => {
+    for (const cmd of [
+      // checkout that discards uncommitted working-tree changes
+      'git checkout .', 'git checkout -f', 'git checkout -f main', 'git checkout --force',
+      'git checkout -- file.ts', 'git checkout HEAD -- .', 'git checkout HEAD~1 -- src/x.ts',
+      // stash forms that irreversibly remove stash state
+      'git stash drop', 'git stash drop stash@{2}', 'git stash clear', 'git stash pop',
+    ]) {
+      expect(isDestructiveBashCommand(cmd), cmd).toBe(true)
+    }
+  })
+
+  it('does NOT flag safe git checkout / stash forms (no over-broadening)', () => {
+    for (const cmd of [
+      // branch switches / creation are reversible
+      'git checkout main', 'git checkout -b feature', 'git checkout feature.branch',
+      // stash inspection / non-removing forms keep the stash
+      'git stash', 'git stash list', 'git stash show', 'git stash apply',
+    ]) {
+      expect(isDestructiveBashCommand(cmd), cmd).toBe(false)
+    }
+  })
+
   it('does NOT flag ordinary safe commands', () => {
     for (const cmd of [
       'git status', 'git log --oneline -5', 'git diff', 'npm test', 'npm run build',

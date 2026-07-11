@@ -30,12 +30,13 @@ import { chainRow, seedChain, type ChainState } from "../../util/audit-hashchain
 import { safeAuditLogPath } from "./test-isolation-guard.js";
 
 /** Operations the broker can perform. (PR-6: `approval_consume_record`
- *  is an additive member of the shared broker/kernel request union, so
- *  the broker's grant-mgmt `writeAudit({ op: req.op })` callsites now
- *  see it in `req.op`'s static type even though the broker never
- *  dispatches it — including it here keeps the audit-op vocabulary a
+ *  and `approval_lookup_by_request` are additive members of the shared
+ *  broker/kernel request union, so the broker's grant-mgmt
+ *  `writeAudit({ op: req.op })` callsites now see them in `req.op`'s
+ *  static type even though the broker never dispatches them (they are
+ *  kernel-only ops) — including them here keeps the audit-op vocabulary a
  *  superset of the wire ops and satisfies tsc with no runtime change.) */
-export type AuditOp = "get" | "put" | "set" | "delete" | "list" | "unlock" | "lock" | "mint_grant" | "list_grants" | "revoke_grant" | "preflight_access" | "approval_consume_record";
+export type AuditOp = "get" | "put" | "set" | "delete" | "list" | "unlock" | "lock" | "mint_grant" | "list_grants" | "revoke_grant" | "preflight_access" | "approval_consume_record" | "approval_lookup_by_request";
 
 /**
  * One audit log entry.

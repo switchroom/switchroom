@@ -307,9 +307,15 @@ export function isDestructiveBashCommand(command: string): boolean {
   if (/\b(chmod|chown|chgrp)\b[^|;&]*(\s-(-recursive|[a-z]*r[a-z]*)\b)/.test(c)) return true;
   // redirection clobbering devices or system dirs
   if (/>\s*\/(dev|etc|boot|sys|proc)\b/.test(c)) return true;
-  // destructive git
+  // destructive git — discards or rewrites history / working-tree state.
+  //   checkout: `-f`/`--force` (force-overwrite), `git checkout .`
+  //     (path-restore of the whole tree) and `checkout … -- <path>` all
+  //     discard uncommitted work. A plain `git checkout <branch>` (branch
+  //     switch, reversible) is deliberately NOT flagged.
+  //   stash: `drop`/`clear`/`pop` remove stash state irreversibly
+  //     (`stash`/`list`/`show`/`apply` keep it and stay unflagged).
   if (/\bgit\b/.test(c) &&
-      /(push\b[^|;&]*(--force|-f\b|--force-with-lease)|push\s+[^\s]*\s+\+|reset\s+--hard|clean\s+-[a-z]*[fd]|filter-branch|reflog\s+expire|update-ref\s+-d|branch\s+-d{1,2}\b|checkout\s+--\s|restore\b)/.test(c)) return true;
+      /(push\b[^|;&]*(--force|-f\b|--force-with-lease)|push\s+[^\s]*\s+\+|reset\s+--hard|clean\s+-[a-z]*[fd]|filter-branch|reflog\s+expire|update-ref\s+-d|branch\s+-d{1,2}\b|checkout\b[^|;&]*(\s-f\b|\s--force\b|\s--(\s|$)|\s\.(\s|$))|stash\s+(drop|clear|pop)\b|restore\b)/.test(c)) return true;
   // power / process control
   if (/(^|\s|;|&&|\|\||\()(shutdown|reboot|halt|poweroff|kill|killall|pkill)\b/.test(c)) return true;
   if (/(^|\s)init\s+0\b/.test(c)) return true;

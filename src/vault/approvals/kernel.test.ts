@@ -13,6 +13,7 @@ import {
   consumeAndRecord,
   recordDecision,
   lookupDecision,
+  lookupDecisionByRequestId,
   revokeDecision,
   listDecisions,
   getNonce,
@@ -203,6 +204,137 @@ describe("approval kernel — request/consume/record/lookup", () => {
     expect(getNonce(db, r.request_id)?.consumed_at).toBeNull();
     consumeNonce(db, r.request_id);
     expect(getNonce(db, r.request_id)?.consumed_at).not.toBeNull();
+  });
+});
+
+describe("approval kernel — lookupDecisionByRequestId (verdict correlation, W2)", () => {
+  let db: Database;
+  beforeEach(() => { db = newDb(); });
+
+  const AGENT = "switchroom-klanker.service";
+  const SCOPE = "ms-365:write:(new)"; // the collision-prone shared scope
+
+  it("unknown request_id → no_decision", () => {
+    expect(
+      lookupDecisionByRequestId(db, {
+        agent_unit: AGENT,
+        request_id: "0".repeat(32),
+        current_approver_set: ["1"],
+      }).state,
+    ).toBe("no_decision");
+  });
+
+  it("registered but undecided → pending", () => {
+    const r = requestApproval(db, {
+      agent_unit: AGENT, scope: SCOPE, action: "write", approver_set: ["1"],
+    });
+    expect(
+      lookupDecisionByRequestId(db, {
+        agent_unit: AGENT, request_id: r.request_id, current_approver_set: ["1"],
+      }).state,
+    ).toBe("pending");
+  });
+
+  it("does NOT cross-attribute a same-scope concurrent request's verdict", () => {
+    // Two concurrent writes share the scope `ms-365:write:(new)`.
+    const reqA = requestApproval(db, {
+      agent_unit: AGENT, scope: SCOPE, action: "write", approver_set: ["1"],
+    });
+    const reqB = requestApproval(db, {
+      agent_unit: AGENT, scope: SCOPE, action: "write", approver_set: ["1"],
+    });
+
+    // Operator approves ONLY request A.
+    const resA = consumeAndRecord(db, {
+      request_id: reqA.request_id,
+      decision: "allow_once",
+      approver_set: ["1"],
+      granted_by_user_id: 1,
+    });
+    expect(resA.consumed).toBe(true);
+
+    // Request A's own verdict → granted.
+    expect(
+      lookupDecisionByRequestId(db, {
+        agent_unit: AGENT, request_id: reqA.request_id, current_approver_set: ["1"],
+      }).state,
+    ).toBe("granted");
+
+    // Request B must NOT inherit A's grant — it's still pending (its own
+    // card hasn't been tapped). The old scope-keyed lookup returned
+    // "granted" here, which was the fail-open mis-attribution.
+    expect(
+      lookupDecisionByRequestId(db, {
+        agent_unit: AGENT, request_id: reqB.request_id, current_approver_set: ["1"],
+      }).state,
+    ).toBe("pending");
+
+    // Contrast: the scope-keyed lookup DOES see the leaked grant — this is
+    // exactly why the hook must correlate by request_id, not scope.
+    expect(
+      lookupDecision(db, {
+        agent_unit: AGENT, scope: SCOPE, action: "write", current_approver_set: ["1"],
+      }).state,
+    ).toBe("granted");
+  });
+
+  it("independently reflects deny for the specific request", () => {
+    const reqA = requestApproval(db, {
+      agent_unit: AGENT, scope: SCOPE, action: "write", approver_set: ["1"],
+    });
+    const reqB = requestApproval(db, {
+      agent_unit: AGENT, scope: SCOPE, action: "write", approver_set: ["1"],
+    });
+    consumeAndRecord(db, {
+      request_id: reqB.request_id, decision: "deny",
+      approver_set: ["1"], granted_by_user_id: 1,
+    });
+    expect(
+      lookupDecisionByRequestId(db, {
+        agent_unit: AGENT, request_id: reqB.request_id, current_approver_set: ["1"],
+      }).state,
+    ).toBe("denied");
+    // A is untouched.
+    expect(
+      lookupDecisionByRequestId(db, {
+        agent_unit: AGENT, request_id: reqA.request_id, current_approver_set: ["1"],
+      }).state,
+    ).toBe("pending");
+  });
+
+  it("enforces cross-agent isolation — a foreign agent_unit gets no_decision", () => {
+    const r = requestApproval(db, {
+      agent_unit: AGENT, scope: SCOPE, action: "write", approver_set: ["1"],
+    });
+    consumeAndRecord(db, {
+      request_id: r.request_id, decision: "allow_once",
+      approver_set: ["1"], granted_by_user_id: 1,
+    });
+    // Same request_id, different (attacker) agent_unit → no verdict oracle.
+    expect(
+      lookupDecisionByRequestId(db, {
+        agent_unit: "switchroom-evil.service",
+        request_id: r.request_id,
+        current_approver_set: ["1"],
+      }).state,
+    ).toBe("no_decision");
+  });
+
+  it("a revoked decision is terminal-not-granted for its request", () => {
+    const r = requestApproval(db, {
+      agent_unit: AGENT, scope: SCOPE, action: "write", approver_set: ["1"],
+    });
+    const res = consumeAndRecord(db, {
+      request_id: r.request_id, decision: "allow_once",
+      approver_set: ["1"], granted_by_user_id: 1,
+    });
+    expect(res.consumed).toBe(true);
+    revokeDecision(db, (res as { decision_id: string }).decision_id, "operator", "test");
+    expect(
+      lookupDecisionByRequestId(db, {
+        agent_unit: AGENT, request_id: r.request_id, current_approver_set: ["1"],
+      }).state,
+    ).toBe("denied");
   });
 });
 

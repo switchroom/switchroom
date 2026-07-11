@@ -311,6 +311,19 @@ export const ApprovalLookupRequestSchema = z.object({
   current_approver_set: z.array(z.string()),
 });
 
+// Correlate a verdict strictly by the request_id the caller registered,
+// NOT by (agent_unit, scope, action). Concurrent requests can share a
+// scope (e.g. two `ms-365:write:(new)` uploads); scope-keyed
+// approval_lookup would mis-attribute one request's approval to another.
+// agent_unit is carried for the same per-agent ACL gate as approval_lookup.
+export const ApprovalLookupByRequestRequestSchema = z.object({
+  v: z.literal(1),
+  op: z.literal("approval_lookup_by_request"),
+  agent_unit: z.string().min(1),
+  request_id: z.string().regex(/^[0-9a-f]{32}$/),
+  current_approver_set: z.array(z.string()),
+});
+
 export const ApprovalConsumeRequestSchema = z.object({
   v: z.literal(1),
   op: z.literal("approval_consume"),
@@ -379,6 +392,7 @@ export const RequestSchema = z.discriminatedUnion("op", [
   RevokeGrantRequestSchema,
   ApprovalRequestRequestSchema,
   ApprovalLookupRequestSchema,
+  ApprovalLookupByRequestRequestSchema,
   ApprovalConsumeRequestSchema,
   ApprovalRevokeRequestSchema,
   ApprovalListRequestSchema,
@@ -398,6 +412,7 @@ export type ListGrantsRequest = z.infer<typeof ListGrantsRequestSchema>;
 export type RevokeGrantRequest = z.infer<typeof RevokeGrantRequestSchema>;
 export type ApprovalRequestRequest = z.infer<typeof ApprovalRequestRequestSchema>;
 export type ApprovalLookupRequest = z.infer<typeof ApprovalLookupRequestSchema>;
+export type ApprovalLookupByRequestRequest = z.infer<typeof ApprovalLookupByRequestRequestSchema>;
 export type ApprovalConsumeRequest = z.infer<typeof ApprovalConsumeRequestSchema>;
 export type ApprovalRevokeRequest = z.infer<typeof ApprovalRevokeRequestSchema>;
 export type ApprovalListRequest = z.infer<typeof ApprovalListRequestSchema>;
