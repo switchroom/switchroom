@@ -232,18 +232,43 @@ describe("status-pin boot cleanup is mutex-gated (structural)", () => {
     );
   });
 
-  it("every statusPinBootCleanup() call site follows the won-lock check", () => {
-    // Find each *invocation* (with parens), excluding the declaration.
+  it("every boot pin-cleanup call site follows the won-lock check", () => {
+    // #3026: boot cleanup is now invoked via the mutex-gated orchestrator
+    // runBootPinCleanupAndDmSweep(), which awaits statusPinBootCleanup()
+    // (+ the other reapers) and then runs the DM stale-pin sweep. The
+    // invariant is unchanged: cleanup must only run after the lock is won.
     const lines = gatewaySrc.split("\n");
     const lockIdx = lines.findIndex((l) => l.includes("acquireStartupLock({"));
     expect(lockIdx).toBeGreaterThan(-1);
 
+    // Every `void runBootPinCleanupAndDmSweep()` invocation must come AFTER
+    // the acquireStartupLock outcome is available (the boot block the winner
+    // — or the link()-unsupported fallback — reaches).
+    const callIdxs = lines
+      .map((l, i) => ({ l, i }))
+      .filter(
+        ({ l }) =>
+          /void runBootPinCleanupAndDmSweep\(\)/.test(l) &&
+          !l.trimStart().startsWith("//"),
+      )
+      .map(({ i }) => i);
+    expect(callIdxs.length).toBeGreaterThan(0);
+    for (const idx of callIdxs) {
+      expect(idx).toBeGreaterThan(lockIdx);
+    }
+
+    // statusPinBootCleanup() itself must only ever be invoked from INSIDE
+    // that orchestrator — never at a bare post-import call site that a
+    // losing double-boot could reach.
     const declIdx = lines.findIndex((l) =>
       /async function statusPinBootCleanup/.test(l),
     );
     expect(declIdx).toBeGreaterThan(-1);
-
-    const callIdxs = lines
+    const orchestratorIdx = lines.findIndex((l) =>
+      /async function runBootPinCleanupAndDmSweep/.test(l),
+    );
+    expect(orchestratorIdx).toBeGreaterThan(-1);
+    const invocationIdxs = lines
       .map((l, i) => ({ l, i }))
       .filter(
         ({ l, i }) =>
@@ -253,25 +278,21 @@ describe("status-pin boot cleanup is mutex-gated (structural)", () => {
           !l.includes("statusPinBootCleanup() is deliberately NOT"),
       )
       .map(({ i }) => i);
-
-    // There must be at least one real call, and every real call must come
-    // AFTER the acquireStartupLock outcome is available (i.e. inside the boot
-    // block that only the winner reaches).
-    expect(callIdxs.length).toBeGreaterThan(0);
-    for (const idx of callIdxs) {
-      expect(idx).toBeGreaterThan(lockIdx);
+    expect(invocationIdxs.length).toBeGreaterThan(0);
+    for (const idx of invocationIdxs) {
+      expect(idx).toBeGreaterThan(orchestratorIdx);
     }
   });
 
   it("the blocked (losing) boot exits before reaching cleanup", () => {
     // In the mutex block, `outcome.status === 'blocked'` must lead to
-    // process.exit(1) BEFORE any statusPinBootCleanup() call in that block —
-    // so a loser never touches the shared store.
+    // process.exit(1) BEFORE the winner's runBootPinCleanupAndDmSweep() call
+    // in that block — so a loser never touches the shared store.
     const blockedIdx = gatewaySrc.indexOf("outcome.status === 'blocked'");
     expect(blockedIdx).toBeGreaterThan(-1);
     const afterBlocked = gatewaySrc.slice(blockedIdx);
     const exitIdx = afterBlocked.indexOf("process.exit(1)");
-    const cleanupIdx = afterBlocked.indexOf("void statusPinBootCleanup()");
+    const cleanupIdx = afterBlocked.indexOf("void runBootPinCleanupAndDmSweep()");
     expect(exitIdx).toBeGreaterThan(-1);
     expect(cleanupIdx).toBeGreaterThan(-1);
     // The exit for the blocked branch appears before the winner's cleanup call.

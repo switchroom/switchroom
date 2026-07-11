@@ -470,6 +470,11 @@ import { formatUpdateStatusLine } from './update-status-line.js'
 import type { HostdRequest, HostdResponse } from '../../src/host-control/protocol.js'
 import type { AgentAudit } from '../welcome-text.js'
 import { shouldSweepChatAtBoot } from './boot-sweep-filter.js'
+import {
+  createDmPinSweeper,
+  collectDmChatIdsFromStores,
+  type DmPinSweeper,
+} from './dm-pin-sweep.js'
 import { startWebhookIngestServer } from './webhook-ingest-server.js'
 import { recordWebhookEvent } from '../../src/web/webhook-gateway-record.js'
 
@@ -496,6 +501,7 @@ import {
   type TrackedStatusPin,
 } from './status-pin-store.js'
 import {
+  loadActivityCards,
   writeActivityCardRecord,
   clearActivityCardRecord,
   runActivityCardBootReaper,
@@ -504,6 +510,7 @@ import {
   type ActivityCardStoreFsSeam,
 } from './activity-card-store.js'
 import {
+  loadQueuedCards,
   writeQueuedCardRecord,
   clearQueuedCardRecord,
   runQueuedCardBootReaper,
@@ -7843,6 +7850,85 @@ async function unpinAllStatusPins(): Promise<void> {
   }
 }
 
+// ─── DM stale-pin sweep (#3026) ─────────────────────────────────────────────
+// In a user DM the Bot API skips the boot getChat() probe (positive chat IDs
+// return `400 chat not found` until the user messages) AND getChat() exposes
+// only the NEWEST pin — DMs STACK pins and there is no list-pins method, so
+// older orphan pins are invisible to the probe-based sweep forever. The durable
+// fix: once per DM chat per boot, `unpinAllChatMessages` (safe in a DM — every
+// pin is bot-authored) then re-pin the live tracked cards. Groups keep the
+// probe path (unpin-all there would nuke human pins).
+//
+// Eligibility mirrors statusPinBootCleanup's mutex gate: set true ONLY after
+// this gateway wins the startup lock, so a losing double-boot never clears the
+// live holder's pins.
+let dmPinSweepEligible = false
+const dmPinSweeper: DmPinSweeper = createDmPinSweeper({
+  unpinAll: (chatId) =>
+    robustApiCall(() => lockedBot.api.unpinAllChatMessages(chatId), {
+      chat_id: chatId,
+      verb: 'dm-pin-sweep.unpin-all',
+    }),
+  pinSilent: (chatId, messageId) =>
+    robustApiCall(
+      () =>
+        lockedBot.api.pinChatMessage(chatId, messageId, {
+          disable_notification: true,
+        }),
+      { chat_id: chatId, verb: 'dm-pin-sweep.repin' },
+    ),
+  // Live in-memory status-pin claims for this chat (fg:/wk:/tool:/banner:) —
+  // the messages still owned by an in-flight turn/worker that must survive the
+  // unpin-all. Empty at boot (fresh process); non-empty for a first-inbound
+  // sweep landing mid-turn.
+  liveTrackedMessageIds: (chatId) => {
+    const ids: number[] = []
+    for (const [key, st] of statusPinState.entries()) {
+      if (statusPinChatIds.get(key) === chatId) ids.push(st.messageId)
+    }
+    return ids
+  },
+  eligible: () => dmPinSweepEligible,
+  log: (line) => process.stderr.write(line),
+})
+
+/**
+ * Boot-time pin cleanup + DM stale-pin sweep, sequenced under the startup
+ * mutex. Collects the DM chat IDs with a prior-session pin record BEFORE the
+ * store reapers empty the stores, runs the three existing boot reapers, marks
+ * the DM sweep eligible (this gateway now owns the shared state), then
+ * unpin-alls each recorded DM chat. Fire-and-forget from the caller — never
+ * blocks boot, never rejects unhandled.
+ */
+async function runBootPinCleanupAndDmSweep(): Promise<void> {
+  let dmChatIds: string[] = []
+  try {
+    dmChatIds = collectDmChatIdsFromStores({
+      statusPins:
+        statusPinPersistEnabled || bannerPinPersistEnabled || toolPinPersistEnabled
+          ? loadStatusPins(STATUS_PIN_STORE_PATH, statusPinStoreFs)
+          : [],
+      activityCards: activityCardPersistEnabled
+        ? loadActivityCards(ACTIVITY_CARD_STORE_PATH, activityCardStoreFs)
+        : [],
+      queuedCards: queuedCardPersistEnabled
+        ? loadQueuedCards(QUEUED_CARD_STORE_PATH, queuedCardStoreFs)
+        : [],
+    })
+  } catch (err) {
+    process.stderr.write(
+      `telegram gateway: dm-pin-sweep: store scan failed: ${(err as Error).message}\n`,
+    )
+  }
+  await statusPinBootCleanup()
+  await activityCardBootReaper()
+  await queuedCardBootReaper()
+  // This gateway now owns the shared per-agent pin state — enable the DM
+  // unpin-all path (both the boot sweep below and lazy first-inbound sweeps).
+  dmPinSweepEligible = true
+  for (const id of dmChatIds) await dmPinSweeper.sweep(id)
+}
+
 // Activity feed. The gateway streams a live "what it's doing" tool-activity
 // feed for every turn. The PreToolUse sidecar emits a `tool_label` per tool
 // call (flush-independent, so it stays real-time on fast/clustered-tool
@@ -7995,9 +8081,9 @@ function ensureIssuesCard(chatId: string, threadId: number | undefined): void {
     // pins from a prior (dead) session. Gated here (not at import time) so a
     // LOSING double-boot never unpins the live holder's legitimate pins.
     // Fire-and-forget: cleanup is best-effort and must not block boot.
-    void statusPinBootCleanup()
-    void activityCardBootReaper()
-    void queuedCardBootReaper()
+    // #3026: sequenced so the DM stale-pin sweep runs after the reapers and
+    // only once this gateway owns the shared state.
+    void runBootPinCleanupAndDmSweep()
   } catch (err) {
     process.stderr.write(
       `telegram gateway: boot.lock_acquire_failed err=${(err as Error).message} agent=${SWITCHROOM_AGENT_NAME}\n`,
@@ -8013,9 +8099,8 @@ function ensureIssuesCard(chatId: string, threadId: number | undefined): void {
       // probe + 409-retry loop is still the liveness guard on this path. A
       // successful writePidFile here means no live holder was detected, so
       // running orphan cleanup is consistent with the pre-mutex behaviour.
-      void statusPinBootCleanup()
-      void activityCardBootReaper()
-      void queuedCardBootReaper()
+      // #3026: same sequenced cleanup + DM stale-pin sweep as the mutex path.
+      void runBootPinCleanupAndDmSweep()
     } catch (writeErr) {
       process.stderr.write(`telegram gateway: writePidFile failed: ${writeErr}\n`)
     }
@@ -17170,6 +17255,16 @@ async function handleInbound(
   clearPermissionTimeoutSuppression('operator inbound')
   // #2862 — operator is back; re-offer any approvals that timed out meanwhile.
   maybePostMissedApprovalDigest('operator inbound')
+
+  // #3026 — first inbound from a DM after boot: clear any stale STACKED pins
+  // the boot getChat() probe can't see (DMs skip the probe AND getChat only
+  // exposes the newest pin). unpin-all once per DM chat per boot, then re-pin
+  // live tracked cards. once-guarded (dedups with the boot sweep); no-op for
+  // groups and until the startup mutex is won. Fire-and-forget.
+  {
+    const inboundChatId = ctx.chat?.id
+    if (inboundChatId != null) void dmPinSweeper.sweep(String(inboundChatId))
+  }
 
   // Capture wall-clock receive time for inbound_ack metric (#203).
   // Must be after gate() so early-exit paths (drop/pair) don't skew the delta.
