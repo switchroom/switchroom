@@ -317,13 +317,55 @@ export function parseLoopbackRedirect(input: string): ParsedRedirect {
 }
 
 /**
+ * A loopback host reference (`127.0.0.1` / `localhost`) anywhere in the text.
+ * Anchors the fail-safe detection to the loopback OAuth flow so a bare `code=`
+ * on some foreign host is NOT swept up (preserves the deliberate narrowness).
+ */
+const LOOPBACK_HOST_REF_RE = /(?:127\.0\.0\.1|localhost)/i
+
+/**
+ * A `code=` / token param carrying a non-empty value — the same param shapes
+ * the well-formed loopback-redirect path exchanges. Matched loosely (no strict
+ * URL structure) so a malformed paste — dropped port, missing `/`, stray
+ * surrounding text — that still carries a live OAuth `code` is caught.
+ */
+const AUTH_CODE_PARAM_RE =
+  /[?&#/]?\b(?:code|access_token|refresh_token|id_token)=[^\s&#]+/i
+
+/** A provider-denied `error=` param (the flow should surface + end). */
+const PROVIDER_ERROR_PARAM_RE = /[?&]error=[^\s&]+/i
+
+/**
+ * Fail-safe (security audit #3084, F2): does this text *look like* a loopback
+ * OAuth paste that carries a live `code` (or a provider `error`), even when it
+ * is too malformed to parse as a clean redirect URL? True only when BOTH a
+ * loopback host reference AND a code/token/error param are present — so
+ * unrelated chatter mentioning `localhost` (no `code=`) still flows through.
+ *
+ * This is intentionally broader than {@link parseLoopbackRedirect}: a paste
+ * with a dropped port or a missing `/` won't parse, yet may still hold a live
+ * credential that must be redacted rather than forwarded to the agent.
+ */
+export function looksLikeLoopbackCodePaste(text: string): boolean {
+  const trimmed = (text ?? '').trim()
+  if (trimmed.length === 0) return false
+  if (!LOOPBACK_HOST_REF_RE.test(trimmed)) return false
+  return (
+    AUTH_CODE_PARAM_RE.test(trimmed) || PROVIDER_ERROR_PARAM_RE.test(trimmed)
+  )
+}
+
+/**
  * Decide whether an inbound chat message should be CONSUMED by the loopback
  * paste intercept (and therefore never reach other handlers, and be deleted
  * from history). Deliberately narrow: a message merely *mentioning*
  * `localhost`/`127.0.0.1` ("what's listening on localhost?") must flow
- * through untouched. We consume only when the text actually parses as a
- * loopback redirect URL carrying a `code` — or a loopback URL carrying an
- * `error` param (the provider-denied case, which the flow should surface).
+ * through untouched. We consume when the text parses as a loopback redirect
+ * URL carrying a `code` — or a loopback URL carrying an `error` param (the
+ * provider-denied case, which the flow should surface) — OR, fail-safe, when
+ * it merely *looks like* a loopback code paste that is too malformed to parse
+ * cleanly but still carries a live `code` (security audit #3084, F2). A live
+ * credential must never fall through to the agent session unredacted.
  */
 export function shouldConsumeLoopbackPaste(text: string): boolean {
   const trimmed = (text ?? '').trim()
@@ -336,6 +378,8 @@ export function shouldConsumeLoopbackPaste(text: string): boolean {
   if (!parsed.ok && parsed.reason.startsWith('provider returned error')) {
     return true
   }
+  // Fail-safe: malformed-but-code-bearing loopback paste.
+  if (looksLikeLoopbackCodePaste(trimmed)) return true
   return false
 }
 
