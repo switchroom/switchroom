@@ -5531,6 +5531,65 @@ const swallowingApiCall = createSwallowingRetryApiCall(
 )
 
 /**
+ * The ONE seam every `setMessageReaction` in this gateway goes through (#3155).
+ *
+ * Reactions are cosmetic outbound traffic. Before this seam, ~13 raw
+ * `bot.api.setMessageReaction(...)` / `lockedBot.api.setMessageReaction(...)`
+ * call sites fired reactions OUTSIDE the send gate AND the flood circuit
+ * breaker, so:
+ *
+ *   (a) reaction spam was never PACED/SHED by the gate when it's on — a busy
+ *       turn's status-reaction churn added straight onto the per-bot flood
+ *       budget the REPLIES need; and
+ *   (b) a 429 from a reaction was INVISIBLE to the breaker — the flood window
+ *       is only learned through the retry module's `onFloodWait` hook, which a
+ *       raw `bot.api` call never reaches. Reactions were a residual flood
+ *       vector even with the gate ON.
+ *
+ * Routing through `robustApiCall` (= chat-lock → send-gate → retry/breaker,
+ * the SAME path every other outbound call takes) with
+ * `priorityClass: 'cosmetic'` fixes both: the gate paces/sheds reactions under
+ * pressure, and a 429 runs `onFloodWait` so the window is recorded. Callers
+ * keep their own fire-and-forget / `.catch(() => {})` / `await` semantics —
+ * this returns the promise and does NOT swallow.
+ */
+const gatedSetMessageReaction = (
+  chatId: string,
+  messageId: number,
+  reaction: ReactionTypeEmoji[],
+): Promise<unknown> =>
+  robustApiCall(() => lockedBot.api.setMessageReaction(chatId, messageId, reaction), {
+    chat_id: chatId,
+    verb: 'set-message-reaction',
+    priorityClass: 'cosmetic',
+  })
+
+/** React with a single emoji through the gate (cosmetic). Wraps {@link gatedSetMessageReaction}. */
+const sendReaction = (
+  chatId: string,
+  messageId: number,
+  emoji: ReactionTypeEmoji['emoji'],
+): Promise<unknown> => gatedSetMessageReaction(chatId, messageId, [{ type: 'emoji', emoji }])
+
+/**
+ * Bot-API surface handed to `redactAuthCodeMessage` (#488) so its 🔑 reaction
+ * routes through the send gate + flood breaker like every other reaction
+ * (#3155). The OAuth-code DELETE stays raw/best-effort exactly as before — its
+ * own `.then(onOk, onErr)` logging (the "token may still be visible" breadcrumb)
+ * must keep firing, which a swallowing wrapper would suppress.
+ */
+const redactAuthCodeApi = {
+  deleteMessage: (chatId: string, messageId: number) =>
+    // allow-raw-bot-api: auth-code redact delete stays raw/best-effort (behavior unchanged, #488); #3155 gates only the reaction.
+    bot.api.deleteMessage(chatId, messageId),
+  setMessageReaction: (
+    chatId: string,
+    messageId: number,
+    reaction: Array<{ type: 'emoji'; emoji: string }>,
+  ) => gatedSetMessageReaction(chatId, messageId, reaction as ReactionTypeEmoji[]),
+}
+
+/**
  * The wrapper for NON-ESSENTIAL sends that must NEVER retry (#3084).
  *
  * A typing indicator is disposable: if it fails, the correct answer is to drop
@@ -14660,9 +14719,11 @@ async function executeReact(args: Record<string, unknown>): Promise<unknown> {
   if (!args.message_id) throw new Error('react: message_id is required')
   if (!args.emoji) throw new Error('react: emoji is required')
   assertAllowedChat(String(args.chat_id ?? ''))
-  await lockedBot.api.setMessageReaction(String(args.chat_id ?? ''), Number(args.message_id), [
-    { type: 'emoji', emoji: args.emoji as ReactionTypeEmoji['emoji'] },
-  ])
+  await sendReaction(
+    String(args.chat_id ?? ''),
+    Number(args.message_id),
+    args.emoji as ReactionTypeEmoji['emoji'],
+  )
   return { content: [{ type: 'text', text: 'reacted' }] }
 }
 
@@ -18045,9 +18106,7 @@ function maybeEarlyAckReaction(ctx: Context, from: NonNullable<Context['from']>)
   if (activeTurnStartedAt.has(statusKey(chatId, threadId))) return
   const access = loadAccess()
   if (!access.allowFrom.includes(String(from.id))) return
-  void bot.api.setMessageReaction(chatId, msgId, [
-    { type: 'emoji', emoji: '👀' as ReactionTypeEmoji['emoji'] },
-  ]).catch(() => {})
+  void sendReaction(chatId, msgId, '👀' as ReactionTypeEmoji['emoji']).catch(() => {})
   // #2527: log the early-ack fire so operators can see how often the
   // fast pre-coalesce DM path triggers vs. the controller path.
   logStreamingEvent({ kind: 'early_ack_reaction', chatId, messageId: msgId, emoji: '👀' })
@@ -18288,9 +18347,7 @@ async function handleInbound(
     )
     if (inFlight) {
       if (msgId != null) {
-        void bot.api.setMessageReaction(chat_id, msgId, [
-          { type: 'emoji', emoji: '⚡' as ReactionTypeEmoji['emoji'] },
-        ]).catch(() => {})
+        void sendReaction(chat_id, msgId, '⚡' as ReactionTypeEmoji['emoji']).catch(() => {})
       }
       await executeHaltNow('stop-keyword')
     }
@@ -18335,9 +18392,7 @@ async function handleInbound(
       `in_flight=${toolFlightTracker.inFlightCount()}\n`,
     )
     if (msgId != null) {
-      void bot.api.setMessageReaction(chat_id, msgId, [
-        { type: 'emoji', emoji: '⚡' as ReactionTypeEmoji['emoji'] },
-      ]).catch(() => {})
+      void sendReaction(chat_id, msgId, '⚡' as ReactionTypeEmoji['emoji']).catch(() => {})
     }
     if (interrupt.emptyBody) {
       // #3020: empty `!` is a pure halt (no replacement body) — same shared
@@ -18471,9 +18526,7 @@ async function handleInbound(
     })
     if (msgId != null) {
       const emoji = behavior === 'allow' ? '✅' : '❌'
-      void bot.api.setMessageReaction(chat_id, msgId, [
-        { type: 'emoji', emoji: emoji as ReactionTypeEmoji['emoji'] },
-      ]).catch(() => {})
+      void sendReaction(chat_id, msgId, emoji as ReactionTypeEmoji['emoji']).catch(() => {})
     }
     return
   }
@@ -18529,7 +18582,7 @@ async function handleInbound(
         )
       }
       // Redact the OAuth code paste from chat history (#488).
-      redactAuthCodeMessage(bot.api as never, chat_id, msgId ?? null, line => process.stderr.write(line))
+      redactAuthCodeMessage(redactAuthCodeApi as never, chat_id, msgId ?? null, line => process.stderr.write(line))
       return
     }
     // Stale — drop the pending entry but let the message fall through
@@ -18561,7 +18614,7 @@ async function handleInbound(
           '_Still finishing the previous paste — one moment._',
           { html: true },
         )
-        redactAuthCodeMessage(bot.api as never, chat_id, msgId ?? null, line => process.stderr.write(line))
+        redactAuthCodeMessage(redactAuthCodeApi as never, chat_id, msgId ?? null, line => process.stderr.write(line))
         return
       }
       const result = await submitLoopbackRedirect(pendingLoop, text.trim())
@@ -18574,7 +18627,7 @@ async function handleInbound(
           { html: true },
         )
         // Redact the pasted redirect (carries the OAuth code) from history.
-        redactAuthCodeMessage(bot.api as never, chat_id, msgId ?? null, line => process.stderr.write(line))
+        redactAuthCodeMessage(redactAuthCodeApi as never, chat_id, msgId ?? null, line => process.stderr.write(line))
         return
       }
       if (result.retryable) {
@@ -18587,7 +18640,7 @@ async function handleInbound(
           { html: true },
         )
         // Redact even a rejected paste — it may still carry a live code.
-        redactAuthCodeMessage(bot.api as never, chat_id, msgId ?? null, line => process.stderr.write(line))
+        redactAuthCodeMessage(redactAuthCodeApi as never, chat_id, msgId ?? null, line => process.stderr.write(line))
         return
       }
       // Non-retryable — the flow is spent. Kill the CLI child before
@@ -18602,7 +18655,7 @@ async function handleInbound(
         `**/auth ${pendingLoop.provider} add failed:** ${escapeHtmlForTg(result.reason)}`,
         { html: true },
       )
-      redactAuthCodeMessage(bot.api as never, chat_id, msgId ?? null, line => process.stderr.write(line))
+      redactAuthCodeMessage(redactAuthCodeApi as never, chat_id, msgId ?? null, line => process.stderr.write(line))
       return
     }
     // Stale — the intercept window has closed. Kill the child and drop the
@@ -18622,7 +18675,7 @@ async function handleInbound(
   // reference AND a code/error param), so ordinary chatter mentioning
   // localhost flows through untouched. Redact and drop rather than forward.
   if (shouldConsumeLoopbackPaste(text)) {
-    redactAuthCodeMessage(bot.api as never, chat_id, msgId ?? null, line => process.stderr.write(line))
+    redactAuthCodeMessage(redactAuthCodeApi as never, chat_id, msgId ?? null, line => process.stderr.write(line))
     await switchroomReply(
       ctx,
       '_That looked like an OAuth redirect/code, so I removed it from chat and did not forward it. ' +
@@ -18657,7 +18710,7 @@ async function handleInbound(
       // Single-use code so a third party can't replay it after exchange,
       // but plaintext OAuth tokens in chat history are still poor
       // hygiene. The helper handles delete + 🔑 reaction silently.
-      redactAuthCodeMessage(bot.api as never, chat_id, msgId ?? null, line => process.stderr.write(line))
+      redactAuthCodeMessage(redactAuthCodeApi as never, chat_id, msgId ?? null, line => process.stderr.write(line))
       return
     }
     pendingReauthFlows.delete(interceptKey)
@@ -19120,12 +19173,12 @@ async function handleInbound(
       if (isSteering) {
         // Explicit steer: mark with 🤝 on the inbound message; leave the
         // existing StatusReactionController running for the in-flight turn.
-        void bot.api.setMessageReaction(chat_id, msgId, [{ type: 'emoji', emoji: '🤝' }]).catch(() => {})
+        void sendReaction(chat_id, msgId, '🤝').catch(() => {})
       } else if (priorTurnInFlight) {
         // Queued mid-turn message (new default): don't touch the existing
         // controller; just ack the inbound message with 👀 so the user
         // knows we received it, without disrupting the in-flight reaction.
-        void bot.api.setMessageReaction(chat_id, msgId, [{ type: 'emoji', emoji: '👀' }]).catch(() => {})
+        void sendReaction(chat_id, msgId, '👀').catch(() => {})
         // #203: time-to-ack metric — measure gateway-receive → ack-post delta.
         logStreamingEvent({ kind: 'inbound_ack', chatId: chat_id, messageId: msgId, ackDelayMs: Date.now() - inboundReceivedAt })
       } else {
@@ -19168,9 +19221,7 @@ async function handleInbound(
         // msgId here and use it as the reaction-session token in log events.
         const ctrlTurnToken = `${chat_id}:${msgId}`
         const ctrl = new StatusReactionController(async (emoji) => {
-          await bot.api.setMessageReaction(chat_id, msgId, [
-            { type: 'emoji', emoji: emoji as ReactionTypeEmoji['emoji'] },
-          ])
+          await sendReaction(chat_id, msgId, emoji as ReactionTypeEmoji['emoji'])
           // #203: every status-reaction transition is a user-visible signal.
           signalTracker.noteSignal(key, Date.now())
         }, allowedReactions, {
@@ -19253,9 +19304,7 @@ async function handleInbound(
         }
       }
     } else if (access.ackReaction) {
-      void bot.api.setMessageReaction(chat_id, msgId, [
-        { type: 'emoji', emoji: access.ackReaction as ReactionTypeEmoji['emoji'] },
-      ]).catch(() => {})
+      void sendReaction(chat_id, msgId, access.ackReaction as ReactionTypeEmoji['emoji']).catch(() => {})
       // #203: time-to-ack metric for the custom-ack-reaction path.
       logStreamingEvent({ kind: 'inbound_ack', chatId: chat_id, messageId: msgId, ackDelayMs: Date.now() - inboundReceivedAt })
     }
@@ -20598,7 +20647,7 @@ async function sweepBeforeSelfRestart(): Promise<void> {
   try {
     await sweepActiveReactions(
       agentDir,
-      (chatId, messageId) => lockedBot.api.setMessageReaction(chatId, messageId, [{ type: 'emoji', emoji: '👍' as ReactionTypeEmoji['emoji'] }]),
+      (chatId, messageId) => sendReaction(chatId, messageId, '👍' as ReactionTypeEmoji['emoji']),
       { log: (msg) => process.stderr.write(`telegram gateway: pre-restart reaction sweep — ${msg}\n`) },
     )
   } catch (err) {
@@ -26827,9 +26876,7 @@ async function handleAckOnly(
     const chat_id = String(ctx.chat!.id)
     const msgId = ctx.message?.message_id
     if (msgId != null) {
-      void bot.api.setMessageReaction(chat_id, msgId, [
-        { type: 'emoji', emoji: (opts.emoji ?? '👀') as ReactionTypeEmoji['emoji'] },
-      ]).catch(() => {})
+      void sendReaction(chat_id, msgId, (opts.emoji ?? '👀') as ReactionTypeEmoji['emoji']).catch(() => {})
     }
     const prefix = opts.warn ? 'WARN ' : ''
     process.stderr.write(`telegram gateway: ${prefix}inbound ${kind} ack-only chat_id=${chat_id} from=${ctx.from?.id ?? '?'}\n`)
@@ -26862,9 +26909,7 @@ async function handleRefusal(
     const msgId = ctx.message?.message_id
     const messageThreadId = ctx.message?.message_thread_id
     if (msgId != null) {
-      void bot.api.setMessageReaction(chat_id, msgId, [
-        { type: 'emoji', emoji: '🚫' as ReactionTypeEmoji['emoji'] },
-      ]).catch(() => {})
+      void sendReaction(chat_id, msgId, '🚫' as ReactionTypeEmoji['emoji']).catch(() => {})
     }
     // #1075: thread-id-bearing — swallow on THREAD_NOT_FOUND so a
     // deleted topic doesn't crash the refusal handler.
@@ -27923,7 +27968,7 @@ process.on('SIGINT', () => void shutdown('SIGINT'))
   if (startupAgentDir != null) {
     void sweepActiveReactions(
       startupAgentDir,
-      (chatId, messageId) => lockedBot.api.setMessageReaction(chatId, messageId, [{ type: 'emoji', emoji: '👍' as ReactionTypeEmoji['emoji'] }]),
+      (chatId, messageId) => sendReaction(chatId, messageId, '👍' as ReactionTypeEmoji['emoji']),
       { log: (msg) => process.stderr.write(`telegram gateway: startup reaction sweep — ${msg}\n`) },
     )
   }

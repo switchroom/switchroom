@@ -210,10 +210,11 @@ describe('pendingReauthFlows intercept — deleteMessage sequencing (Blocker 1)'
     const window = src.slice(interceptIdx, interceptIdx + 2000)
     // Allow the optional 4th `log` argument added in #561 (diagnostic
     // sink for redaction failures) — required is the first three args.
-    // `bot.api` may be cast (e.g. `bot.api as never`) for the local
-    // BotApi-vs-grammy-Api type mismatch cleanup in #623; `msgId` may
-    // be narrowed (`msgId ?? null`).
-    expect(window).toMatch(/redactAuthCodeMessage\(bot\.api(?:\s+as\s+\w+)?,\s*chat_id,\s*msgId(?:\s*\?\?\s*null)?(?:,\s*[^)]+)?\)/)
+    // The first arg is the injected BotApi surface: historically `bot.api`
+    // (optionally cast, #623), now the gated `redactAuthCodeApi` adapter whose
+    // reaction routes through the send gate + flood breaker (#3155). `msgId`
+    // may be narrowed (`msgId ?? null`).
+    expect(window).toMatch(/redactAuthCodeMessage\((?:bot\.api|redactAuthCodeApi)(?:\s+as\s+\w+)?,\s*chat_id,\s*msgId(?:\s*\?\?\s*null)?(?:,\s*[^)]+)?\)/)
   })
 
   it('redaction lands AFTER the success/error reply renders', () => {

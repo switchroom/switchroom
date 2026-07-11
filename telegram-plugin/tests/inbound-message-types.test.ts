@@ -206,7 +206,11 @@ describe('inbound message-type helpers: handleAckOnly + handleRefusal', () => {
     const fnStart = SRC.indexOf('async function handleAckOnly(')
     const fnSlice = SRC.slice(fnStart, fnStart + 2000)
     expect(fnSlice).toContain('gate(ctx)')
-    expect(fnSlice).toContain('setMessageReaction')
+    // #3155: the reaction now routes through the gated `sendReaction` helper
+    // (send gate + flood breaker, cosmetic) instead of a raw
+    // `bot.api.setMessageReaction`. The invariant is unchanged: it gates, THEN
+    // reacts.
+    expect(fnSlice).toContain('sendReaction(')
   })
 
   it('handleAckOnly drops non-allowlisted senders silently', () => {
