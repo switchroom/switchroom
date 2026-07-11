@@ -103,6 +103,14 @@ function shapeReply(
       accent: 'issue',
     }
   }
+  if (code === 'args_not_allowed') {
+    // #730 — a bare-verb-only command was injected with trailing args.
+    // errorMessage is already actionable ("args not permitted for /memory …").
+    return {
+      body: `${verbHtml} — ${deps.escapeHtml(msg)}`,
+      accent: 'issue',
+    }
+  }
   if (code === 'session_missing') {
     return {
       body: 'tmux session not found — agent must be running under the tmux supervisor (the default). Remove \`experimental.legacy_pty: true\` if set.',

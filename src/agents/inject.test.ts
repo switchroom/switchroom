@@ -30,8 +30,48 @@ describe("validateInjectCommand", () => {
     }
   });
 
-  it("accepts an allowed command with trailing args (verb-only check)", () => {
-    expect(validateInjectCommand("/cost some-arg")).toBe("/cost");
+  it("#730 arg-gate — rejects trailing args for a bare-verb-only command", () => {
+    // Was previously accepted (verb-only match); the arg-gate now rejects it.
+    for (const cmd of ["/cost some-arg", "/memory edit", "/clear --flag"]) {
+      const err = (() => {
+        try {
+          validateInjectCommand(cmd);
+          return null;
+        } catch (e) {
+          return e;
+        }
+      })();
+      expect(err, `${cmd} must be rejected`).toBeInstanceOf(InjectError);
+      expect((err as InjectError).code).toBe("args_not_allowed");
+      expect((err as InjectError).message).toMatch(/args not permitted/i);
+    }
+  });
+
+  it("#730 arg-gate — /model KEEPS args allowed (sanctioned set path, #2566)", () => {
+    // The dedicated /model driver injects `/model <alias|id>` WITH an arg as
+    // the sanctioned session-switch path. Gating it off would break /model.
+    expect(validateInjectCommand("/model claude-sonnet-4-6")).toBe("/model");
+    expect(validateInjectCommand("/model opus")).toBe("/model");
+  });
+
+  it("#730 arg-gate — every non-/model allowlist entry forbids args", () => {
+    for (const [verb, meta] of INJECT_COMMANDS.entries()) {
+      if (verb === "/model") {
+        expect(meta.argsAllowed, "/model must allow args").toBe(true);
+        continue;
+      }
+      expect(meta.argsAllowed, `${verb} must forbid args`).toBe(false);
+      const err = (() => {
+        try {
+          validateInjectCommand(`${verb} extra`);
+          return null;
+        } catch (e) {
+          return e;
+        }
+      })();
+      expect(err, `${verb} extra must be rejected`).toBeInstanceOf(InjectError);
+      expect((err as InjectError).code).toBe("args_not_allowed");
+    }
   });
 
   it("is case-insensitive on the verb", () => {
@@ -50,6 +90,33 @@ describe("validateInjectCommand", () => {
       })();
       expect(err).toBeInstanceOf(InjectError);
       expect((err as InjectError).code).toBe("blocked");
+    }
+  });
+
+  it("#730 — new defensive blocklist entries return code 'blocked' (not not_allowed)", () => {
+    const added = [
+      "/upgrade",
+      "/init",
+      "/mcp",
+      "/permissions",
+      "/install-github-app",
+      "/add-dir",
+      "/terminal-setup",
+      "/privacy-settings",
+      "/bug",
+    ];
+    for (const cmd of added) {
+      expect(INJECT_BLOCKED.has(cmd), `${cmd} must be blocklisted`).toBe(true);
+      const err = (() => {
+        try {
+          validateInjectCommand(cmd);
+          return null;
+        } catch (e) {
+          return e;
+        }
+      })();
+      expect(err, `${cmd} must throw`).toBeInstanceOf(InjectError);
+      expect((err as InjectError).code, `${cmd} → blocked`).toBe("blocked");
     }
   });
 
@@ -94,7 +161,22 @@ describe("INJECT_COMMANDS metadata", () => {
       expect(verb.startsWith("/")).toBe(true);
       expect(typeof meta.description).toBe("string");
       expect(typeof meta.expectsOutput).toBe("boolean");
+      expect(typeof meta.argsAllowed).toBe("boolean");
     }
+  });
+
+  it("#730 — new read-only additions are on the allowlist (bare verb accepted)", () => {
+    for (const cmd of ["/help", "/context", "/release-notes"]) {
+      expect(INJECT_COMMANDS.has(cmd), `${cmd} must be allowlisted`).toBe(true);
+      expect(validateInjectCommand(cmd)).toBe(cmd);
+    }
+  });
+
+  it("#730 — /help and /release-notes are dialog:true (Escape-dismiss), /context is inline", () => {
+    expect(INJECT_COMMANDS.get("/help")?.dialog).toBe(true);
+    expect(INJECT_COMMANDS.get("/release-notes")?.dialog).toBe(true);
+    // /context renders inline (no modal) — verified via TUI probe, v2.1.205.
+    expect(INJECT_COMMANDS.get("/context")?.dialog).toBeUndefined();
   });
 
   it("/compact carries a silentNote", () => {
