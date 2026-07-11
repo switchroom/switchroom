@@ -4937,6 +4937,18 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
       timeout: 5,
       async: false,
     });
+    // Narrate-without-execute guard (#396): re-prompt once when a reply
+    // claims a dispatch the turn never actually made (no Agent/Task call,
+    // no backgrounded Bash). Sync so it can block the stop; fail-open.
+    stopHooks.push({
+      type: "command",
+      command: wrap(
+        "hook:dispatch-claim-stop",
+        `node "${join(DOCKER_HOOKS_PATH, "dispatch-claim-stop.mjs")}"`,
+      ),
+      timeout: 5,
+      async: false,
+    });
     // Reaper for the PreToolUse tool-label sidecar files (#783).
     // Runs on every Stop; idempotent age + count rotation.
     stopHooks.push({

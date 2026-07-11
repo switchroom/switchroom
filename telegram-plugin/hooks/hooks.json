@@ -95,6 +95,15 @@
         "hooks": [
           {
             "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" node \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch-claim-stop.mjs\"",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
             "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" node \"${CLAUDE_PLUGIN_ROOT}/hooks/tool-label-stop.mjs\"",
             "timeout": 5,
             "async": true

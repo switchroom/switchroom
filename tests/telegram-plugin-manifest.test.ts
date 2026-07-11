@@ -87,6 +87,7 @@ describe("telegram-plugin manifest (#229)", () => {
     expect(all).toContain("sandbox-hint-posttool.mjs");
     expect(all).toContain("secret-scrub-stop.mjs");
     expect(all).toContain("silent-end-interrupt-stop.mjs");
+    expect(all).toContain("dispatch-claim-stop.mjs");
   });
 
   it("subagent-tracker hooks gate on Agent or Task (regex matcher)", () => {

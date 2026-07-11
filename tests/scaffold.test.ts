@@ -2635,6 +2635,12 @@ describe("scaffoldAgent with global defaults cascade", () => {
           },
           {
             type: "command",
+            command: expect.stringContaining("dispatch-claim-stop.mjs"),
+            timeout: 5,
+            async: false,
+          },
+          {
+            type: "command",
             command: expect.stringContaining("tool-label-stop.mjs"),
             timeout: 5,
             async: true,
