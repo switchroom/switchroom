@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+### LiteLLM per-agent keys bind to their team — and unbound keys self-heal on upgrade
+
+Standing invariant: all agent traffic routes through LiteLLM so per-team
+cost/token spend rolls up accurately. Provisioning silently defeated it —
+`ensureKey` sent `team_alias` on `/key/generate`, but LiteLLM binds a key to a
+team via `team_id` (v1.91.0 `GenerateRequestBase`; `team_alias` is not a
+`GenerateKeyRequest` field and is ignored), and `ensureTeam` discarded the
+`team_id`. Every per-agent key was generated UNBOUND, so team budget caps and
+spend aggregation never applied.
+
+Fix (this branch):
+
+- `ensureTeam` resolves + returns the `team_id` (from `/team/new`, or by alias
+  via `GET /team/list`), and `/key/generate` sends `team_id`.
+- **No more silent degradation (F3).** When a `team_id` can't be resolved, the
+  key is still provisioned (agents keep routing env), but apply now emits a
+  LOUD warning naming the reason and stating cost tracking will NOT aggregate —
+  instead of the old green `(team 'switchroom')` success line, which printed the
+  config *name* (always truthy) and falsely claimed a binding. The honest
+  team-clause success line prints only when the key is genuinely bound.
+- **Upgrade behavior — existing unbound keys are re-bound on the next apply
+  (F1).** The steady-state re-apply path used to skip any key that passed
+  `GET /key/info`, blind to its team binding — so every key provisioned before
+  this fix (or via the degraded path) stayed UNBOUND forever. `validateKey` now
+  also reports the key's current `team_id` (from `info.team_id`), and when a
+  valid key is unbound (or bound to a different team) apply issues a bind-only
+  `POST /key/update {key, team_id}` to re-bind it IN PLACE — no key deletion or
+  regeneration, no vault churn. Verified against LiteLLM v1.91.0
+  (`update_key_fn` / `UpdateKeyRequest`, whose `is_different_team` guard rebinds
+  null→team and team→team). If the team can't be resolved, apply stays LOUD on
+  every run for the unbound key rather than degrading silently; a failed
+  `/key/update` is surfaced as a warning naming the manual remediation, and the
+  key is never deleted/regenerated automatically.
+- **Deterministic duplicate-alias handling.** LiteLLM does not enforce unique
+  `team_alias`, so `/team/list` can return several teams sharing our alias.
+  Resolution now picks the lexicographically smallest `team_id` (stable across
+  applies) and warns naming every duplicate, instead of returning the first
+  array-order match nondeterministically.
+
+Operators upgrading: no action required — the first `switchroom apply` after
+upgrade re-binds each agent's existing key to the team and per-team cost
+tracking begins aggregating. Watch the apply output for any
+`! litellm/<agent>: ... WITHOUT team binding` / `re-bind ... FAILED` warnings,
+which name the exact manual `/key/update` remediation for the rare case the
+proxy rejects the automatic re-bind.
+
 ## v0.18.12 — Approvals hold the leash, config edits survive the window
 
 ### Undeliverable approval cards are held, never auto-denied (#3107, #3108, #3109)

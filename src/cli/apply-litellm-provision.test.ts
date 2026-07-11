@@ -31,10 +31,12 @@ vi.mock("../vault/broker/client.js", () => ({
 const ensureTeam = vi.fn();
 const ensureKey = vi.fn();
 const validateKey = vi.fn();
+const bindKeyToTeam = vi.fn();
 vi.mock("../litellm/provision.js", () => ({
   ensureTeam: (...a: unknown[]) => ensureTeam(...a),
   ensureKey: (...a: unknown[]) => ensureKey(...a),
   validateKey: (...a: unknown[]) => validateKey(...a),
+  bindKeyToTeam: (...a: unknown[]) => bindKeyToTeam(...a),
 }));
 
 function makeConfig(): SwitchroomConfig {
@@ -170,12 +172,15 @@ describe("provisionLiteLLMKeys — stored-key validation against the proxy (DB d
     else process.env.SWITCHROOM_VAULT_PASSPHRASE = prevPass;
   });
 
-  it("stored key VALID on the proxy → skip, no re-provision", async () => {
+  it("stored key VALID and ALREADY bound to the desired team → skip, no re-provision, NO re-bind", async () => {
     getViaBrokerStructured.mockResolvedValue({
       kind: "ok",
       entry: { kind: "string", value: "sk-stored" },
     });
-    validateKey.mockResolvedValue({ kind: "valid" });
+    // Key is valid AND already bound to team "t1", which is what ensureTeam
+    // resolves → nothing to do.
+    validateKey.mockResolvedValue({ kind: "valid", teamId: "t1" });
+    ensureTeam.mockResolvedValue({ kind: "bound", teamId: "t1" });
 
     const { ctx, failures, out } = makeSinks();
     await provisionLiteLLMKeys(makeConfig(), ["clerk"], undefined, ctx);
@@ -183,7 +188,72 @@ describe("provisionLiteLLMKeys — stored-key validation against the proxy (DB d
     expect(failures).toEqual([]);
     expect(ensureKey).not.toHaveBeenCalled();
     expect(putViaBroker).not.toHaveBeenCalled();
+    // F1: a correctly-bound key must NOT trigger a spurious /key/update.
+    expect(bindKeyToTeam).not.toHaveBeenCalled();
     expect(out.join("")).toMatch(/already provisioned \+ validated/);
+  });
+
+  it("F1: stored key VALID but UNBOUND → re-bound in place via /key/update (not re-provisioned)", async () => {
+    // The steady-state re-apply path used to skip a valid key blind to its team
+    // binding, so every key provisioned before the fix stayed UNBOUND forever
+    // and per-team cost tracking never aggregated. It must now re-bind.
+    getViaBrokerStructured.mockResolvedValue({
+      kind: "ok",
+      entry: { kind: "string", value: "sk-stored" },
+    });
+    validateKey.mockResolvedValue({ kind: "valid", teamId: null }); // UNBOUND
+    ensureTeam.mockResolvedValue({ kind: "bound", teamId: "t1" });
+    bindKeyToTeam.mockResolvedValue({ kind: "ok" });
+
+    const { ctx, failures, out } = makeSinks();
+    await provisionLiteLLMKeys(makeConfig(), ["clerk"], undefined, ctx);
+
+    expect(failures).toEqual([]);
+    // Re-bound in place — NO key deletion/regeneration, NO vault churn.
+    expect(ensureKey).not.toHaveBeenCalled();
+    expect(putViaBroker).not.toHaveBeenCalled();
+    // The bind-only /key/update carried the stored key + the resolved team_id.
+    expect(bindKeyToTeam).toHaveBeenCalledWith(
+      expect.objectContaining({ key: "sk-stored", teamId: "t1" }),
+    );
+    expect(out.join("")).toMatch(/re-bound existing key to team 'switchroom'/);
+    expect(out.join("")).toMatch(/was UNBOUND/);
+  });
+
+  it("F1: valid UNBOUND key but /key/update FAILS → LOUD warning, key kept, apply not failed", async () => {
+    getViaBrokerStructured.mockResolvedValue({
+      kind: "ok",
+      entry: { kind: "string", value: "sk-stored" },
+    });
+    validateKey.mockResolvedValue({ kind: "valid", teamId: null });
+    ensureTeam.mockResolvedValue({ kind: "bound", teamId: "t1" });
+    bindKeyToTeam.mockResolvedValue({ kind: "error", detail: "HTTP 500: boom" });
+
+    const { ctx, failures, errs } = makeSinks();
+    await provisionLiteLLMKeys(makeConfig(), ["clerk"], undefined, ctx);
+
+    // Best-effort: a failed re-bind never fails the apply, but it IS loud.
+    expect(failures).toEqual([]);
+    expect(errs.join("")).toMatch(/re-bind to team 'switchroom' FAILED/);
+    expect(errs.join("")).toMatch(/will NOT aggregate/);
+  });
+
+  it("F1: valid UNBOUND key + team_id unresolvable → persistent LOUD warning every apply", async () => {
+    getViaBrokerStructured.mockResolvedValue({
+      kind: "ok",
+      entry: { kind: "string", value: "sk-stored" },
+    });
+    validateKey.mockResolvedValue({ kind: "valid", teamId: null });
+    ensureTeam.mockResolvedValue({ kind: "unbound", reason: "team_id could not be resolved" });
+
+    const { ctx, failures, errs } = makeSinks();
+    await provisionLiteLLMKeys(makeConfig(), ["clerk"], undefined, ctx);
+
+    expect(failures).toEqual([]);
+    // No /key/update attempted (no team_id to bind to), but stays LOUD.
+    expect(bindKeyToTeam).not.toHaveBeenCalled();
+    expect(errs.join("")).toMatch(/UNBOUND to any team/);
+    expect(errs.join("")).toMatch(/will NOT aggregate/);
   });
 
   it("stored key UNKNOWN on the proxy (DB drift) → re-provision + rewrite vault", async () => {
@@ -224,6 +294,71 @@ describe("provisionLiteLLMKeys — stored-key validation against the proxy (DB d
     expect(putViaBroker).not.toHaveBeenCalled();
     expect(errs.join("")).toMatch(/proxy unreachable during key validation/);
     expect(errs.join("")).toMatch(/keeping the stored key unverified/);
+  });
+});
+
+describe("provisionLiteLLMKeys — F3: ensureTeam-fails degrades LOUDLY, honest success line", () => {
+  let prevPass: string | undefined;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    prevPass = process.env.SWITCHROOM_VAULT_PASSPHRASE;
+    process.env.SWITCHROOM_VAULT_PASSPHRASE = "test-passphrase";
+  });
+
+  afterEach(() => {
+    if (prevPass === undefined) delete process.env.SWITCHROOM_VAULT_PASSPHRASE;
+    else process.env.SWITCHROOM_VAULT_PASSPHRASE = prevPass;
+  });
+
+  it("new agent, ensureTeam returns unbound → key STILL provisioned, WARNING emitted, NO false '(team ...)' claim", async () => {
+    // Genuinely-new agent: no vault key yet → provisioning path.
+    getViaBrokerStructured.mockResolvedValue({ kind: "not_found" });
+    // ensureTeam cannot resolve a team_id → the key will be generated UNBOUND.
+    ensureTeam.mockResolvedValue({
+      kind: "unbound",
+      reason: "team 'switchroom' already exists but its team_id could not be resolved via /team/list",
+    });
+    ensureKey.mockResolvedValue({ key: "sk-fresh" });
+    putViaBroker.mockResolvedValue({ kind: "ok" });
+
+    const { ctx, failures, out, errs } = makeSinks();
+    await provisionLiteLLMKeys(makeConfig(), ["clerk"], undefined, ctx);
+
+    // Outcome 1: the key was STILL provisioned + written (invariant: an agent
+    // must get its routing env even when team binding degrades).
+    expect(failures).toEqual([]);
+    expect(ensureKey).toHaveBeenCalledTimes(1);
+    expect(putViaBroker).toHaveBeenCalledWith(
+      "litellm/clerk/api-key",
+      { kind: "string", value: "sk-fresh" },
+      expect.objectContaining({ passphrase: "test-passphrase" }),
+    );
+    // Outcome 2: a LOUD warning names the degradation + the reason.
+    expect(errs.join("")).toMatch(/provisioned virtual key WITHOUT team binding/);
+    expect(errs.join("")).toMatch(/will NOT aggregate/);
+    expect(errs.join("")).toMatch(/could not be resolved via \/team\/list/);
+    // Outcome 3: NO false green "(team 'switchroom')" success claim.
+    expect(out.join("")).not.toMatch(/provisioned virtual key \(team/);
+  });
+
+  it("new agent, ensureTeam BOUND → honest green success line WITH the team clause", async () => {
+    getViaBrokerStructured.mockResolvedValue({ kind: "not_found" });
+    ensureTeam.mockResolvedValue({ kind: "bound", teamId: "t1" });
+    ensureKey.mockResolvedValue({ key: "sk-fresh" });
+    putViaBroker.mockResolvedValue({ kind: "ok" });
+
+    const { ctx, failures, out, errs } = makeSinks();
+    await provisionLiteLLMKeys(makeConfig(), ["clerk"], undefined, ctx);
+
+    expect(failures).toEqual([]);
+    // The team clause is printed ONLY because the key is genuinely bound.
+    expect(out.join("")).toMatch(/provisioned virtual key \(team 'switchroom'\)/);
+    expect(errs.join("")).not.toMatch(/WITHOUT team binding/);
+    // And ensureKey received the resolved team_id (bound at generate time).
+    expect(ensureKey).toHaveBeenCalledWith(
+      expect.objectContaining({ teamId: "t1" }),
+    );
   });
 });
 

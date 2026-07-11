@@ -3,6 +3,7 @@ import {
   ensureTeam,
   ensureKey,
   validateKey,
+  bindKeyToTeam,
   LiteLLMProvisionError,
   type FetchFn,
 } from "./provision.js";
@@ -40,7 +41,7 @@ describe("ensureTeam", () => {
       return mockResponse({ ok: true, status: 200, json: { team_id: "t1" } });
     };
     const teamId = await ensureTeam("http://127.0.0.1:4010", "sk-master", "switchroom", fetchFn);
-    expect(teamId).toBe("t1");
+    expect(teamId).toEqual({ kind: "bound", teamId: "t1" });
     expect(calls).toHaveLength(1);
     expect(calls[0]!.url).toBe("http://127.0.0.1:4010/team/new");
     expect(calls[0]!.init?.method).toBe("POST");
@@ -79,7 +80,7 @@ describe("ensureTeam", () => {
       return mockResponse({ ok: false, status: 404, text: "not found" });
     };
     const teamId = await ensureTeam("http://127.0.0.1:4010", "sk-master", "switchroom", fetchFn);
-    expect(teamId).toBe("switchroom-uuid");
+    expect(teamId).toEqual({ kind: "bound", teamId: "switchroom-uuid" });
     // It fell through to /team/list after the already-exists /team/new.
     expect(calls.map((c) => `${c.method} ${c.url.replace("http://127.0.0.1:4010", "")}`)).toEqual([
       "POST /team/new",
@@ -87,15 +88,61 @@ describe("ensureTeam", () => {
     ]);
   });
 
-  it("returns undefined (non-fatal) when the already-exists team can't be resolved", async () => {
-    // Best-effort: if /team/list is unavailable, degrade to undefined rather
-    // than failing the whole apply — the key falls back to unbound.
+  it("returns unbound + a reason (non-fatal) when the already-exists team can't be resolved", async () => {
+    // Best-effort: if /team/list is unavailable, degrade to `unbound` (carrying
+    // WHY) rather than failing the whole apply — the caller then warns LOUDLY
+    // and the key falls back to unbound instead of a silent green success.
     const fetchFn: FetchFn = async (url) =>
       String(url).endsWith("/team/new")
         ? mockResponse({ ok: false, status: 409, text: "conflict" })
         : mockResponse({ ok: false, status: 500, text: "list unavailable" });
-    const teamId = await ensureTeam("http://h", "k", "switchroom", fetchFn);
-    expect(teamId).toBeUndefined();
+    const result = await ensureTeam("http://h", "k", "switchroom", fetchFn);
+    expect(result.kind).toBe("unbound");
+    expect((result as { reason: string }).reason).toMatch(/could not be resolved/);
+  });
+
+  it("returns unbound with a reason when /team/new 200s but carries no team_id", async () => {
+    // A fresh-create 200 whose body has no usable team_id must NOT masquerade as
+    // a bound team — it degrades to `unbound` so the caller warns instead of
+    // falsely claiming the key was team-bound.
+    const fetchFn: FetchFn = async () =>
+      mockResponse({ ok: true, status: 200, json: { not_a_team_id: true } });
+    const result = await ensureTeam("http://h", "k", "switchroom", fetchFn);
+    expect(result.kind).toBe("unbound");
+    expect((result as { reason: string }).reason).toMatch(/no usable team_id/);
+  });
+
+  it("duplicate team_alias: picks the lexicographically smallest team_id + WARNS (deterministic)", async () => {
+    // LiteLLM does NOT enforce a unique team_alias, so /team/list can carry
+    // several teams sharing our alias. Returning the first (array-order) match
+    // is nondeterministic — keys could bind to a different team run-to-run,
+    // splitting cost tracking. ensureTeam must pick deterministically (lex-
+    // smallest id) and warn naming every duplicate.
+    const logs: string[] = [];
+    const fetchFn: FetchFn = async (url) => {
+      const u = String(url);
+      if (u.endsWith("/team/new")) {
+        return mockResponse({ ok: false, status: 400, text: "Team alias switchroom already exists in DB" });
+      }
+      // Duplicates deliberately out of lexicographic order to prove the sort.
+      return mockResponse({
+        ok: true,
+        status: 200,
+        json: [
+          { team_id: "zzz-team", team_alias: "switchroom" },
+          { team_id: "aaa-team", team_alias: "switchroom" },
+          { team_id: "mmm-team", team_alias: "other" },
+        ],
+      });
+    };
+    const result = await ensureTeam("http://h", "k", "switchroom", fetchFn, (m) => logs.push(m));
+    // Deterministic: lexicographically smallest of {zzz-team, aaa-team}.
+    expect(result).toEqual({ kind: "bound", teamId: "aaa-team" });
+    // Loud + honest: the warning names BOTH duplicate ids.
+    const warned = logs.join("\n");
+    expect(warned).toMatch(/2 LiteLLM teams share team_alias 'switchroom'/);
+    expect(warned).toMatch(/aaa-team/);
+    expect(warned).toMatch(/zzz-team/);
   });
 
   it("strips a trailing slash from base_url", async () => {
@@ -115,9 +162,11 @@ describe("ensureTeam", () => {
         status: 400,
         text: "Team alias switchroom already exists in DB",
       });
+    // Idempotent already-exists, but no /team/list reachable here → `unbound`
+    // (non-fatal), not a throw.
     await expect(
       ensureTeam("http://h", "k", "switchroom", fetchFn),
-    ).resolves.toBeUndefined();
+    ).resolves.toMatchObject({ kind: "unbound" });
   });
 
   it("treats a 409 conflict as success (idempotent)", async () => {
@@ -125,7 +174,7 @@ describe("ensureTeam", () => {
       mockResponse({ ok: false, status: 409, text: "conflict" });
     await expect(
       ensureTeam("http://h", "k", "switchroom", fetchFn),
-    ).resolves.toBeUndefined();
+    ).resolves.toMatchObject({ kind: "unbound" });
   });
 
   it("throws LiteLLMProvisionError on a genuine non-existence error", async () => {
@@ -398,15 +447,30 @@ describe("ensureKey — orphaned-alias self-heal", () => {
 });
 
 describe("validateKey", () => {
-  it("returns valid on a 200 from /key/info", async () => {
+  it("returns valid with teamId=null on a 200 /key/info whose info carries no team_id", async () => {
     const calls: string[] = [];
     const fetchFn: FetchFn = async (url) => {
       calls.push(String(url));
       return mockResponse({ ok: true, status: 200, json: { key: "sk-x", info: {} } });
     };
     const r = await validateKey({ baseUrl: "http://h", masterKey: "m", key: "sk-x" }, fetchFn);
-    expect(r).toEqual({ kind: "valid" });
+    // An UNBOUND key → teamId null (so the caller can re-bind it).
+    expect(r).toEqual({ kind: "valid", teamId: null });
     expect(calls[0]).toContain("/key/info?key=sk-x");
+  });
+
+  it("reports the bound team_id from info.team_id on a 200 /key/info", async () => {
+    // F1: validateKey must surface the key's CURRENT team binding so the apply
+    // path can tell an unbound (or wrong-team) key from a correctly-bound one.
+    // Verified v1.91.0 shape: GET /key/info → { key, info: {...team_id...} }.
+    const fetchFn: FetchFn = async () =>
+      mockResponse({
+        ok: true,
+        status: 200,
+        json: { key: "sk-x", info: { team_id: "team-uuid-42", spend: 0 } },
+      });
+    const r = await validateKey({ baseUrl: "http://h", masterKey: "m", key: "sk-x" }, fetchFn);
+    expect(r).toEqual({ kind: "valid", teamId: "team-uuid-42" });
   });
 
   it("returns unknown on a 400 'not found' (DB drift)", async () => {
@@ -456,5 +520,58 @@ describe("validateKey", () => {
       mockResponse({ ok: false, status: 500, text: "internal server error" });
     const r = await validateKey({ baseUrl: "http://h", masterKey: "m", key: "sk-x" }, fetchFn);
     expect(r.kind).toBe("unreachable");
+  });
+});
+
+describe("bindKeyToTeam", () => {
+  it("POSTs {key, team_id} to /key/update and returns ok on 200", async () => {
+    // F1 re-bind contract (verified v1.91.0 update_key_fn / UpdateKeyRequest):
+    // a bind-only /key/update attaches an existing key to a team WITHOUT
+    // deleting/regenerating it, so per-team cost tracking starts aggregating.
+    const calls: { url: string; init: RequestInit | undefined }[] = [];
+    const fetchFn: FetchFn = async (url, init) => {
+      calls.push({ url: String(url), init });
+      return mockResponse({ ok: true, status: 200, json: { key: "sk-x", team_id: "t1" } });
+    };
+    const r = await bindKeyToTeam(
+      { baseUrl: "http://127.0.0.1:4010", masterKey: "sk-master", key: "sk-x", teamId: "t1" },
+      fetchFn,
+    );
+    expect(r).toEqual({ kind: "ok" });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toBe("http://127.0.0.1:4010/key/update");
+    expect(calls[0]!.init?.method).toBe("POST");
+    const body = JSON.parse(String(calls[0]!.init?.body));
+    // Exactly the bind-only payload — no incidental key churn.
+    expect(body).toEqual({ key: "sk-x", team_id: "t1" });
+    const headers = calls[0]!.init?.headers as Record<string, string>;
+    expect(headers.authorization).toBe("Bearer sk-master");
+  });
+
+  it("strips a trailing slash from base_url", async () => {
+    const calls: string[] = [];
+    const fetchFn: FetchFn = async (url) => {
+      calls.push(String(url));
+      return mockResponse({ ok: true, status: 200, json: {} });
+    };
+    await bindKeyToTeam({ baseUrl: "http://h/", masterKey: "m", key: "sk-x", teamId: "t1" }, fetchFn);
+    expect(calls[0]).toBe("http://h/key/update");
+  });
+
+  it("returns a structured error (never throws) on a non-200", async () => {
+    const fetchFn: FetchFn = async () =>
+      mockResponse({ ok: false, status: 403, text: "forbidden" });
+    const r = await bindKeyToTeam({ baseUrl: "http://h", masterKey: "m", key: "sk-x", teamId: "t1" }, fetchFn);
+    expect(r.kind).toBe("error");
+    expect((r as { detail: string }).detail).toMatch(/HTTP 403.*forbidden/);
+  });
+
+  it("returns a structured error (never throws) on a network failure", async () => {
+    const fetchFn: FetchFn = async () => {
+      throw new Error("ECONNREFUSED");
+    };
+    const r = await bindKeyToTeam({ baseUrl: "http://h", masterKey: "m", key: "sk-x", teamId: "t1" }, fetchFn);
+    expect(r.kind).toBe("error");
+    expect((r as { detail: string }).detail).toMatch(/ECONNREFUSED/);
   });
 });

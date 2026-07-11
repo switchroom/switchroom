@@ -296,7 +296,7 @@ export async function provisionLiteLLMKeys(
   if (optedIn.length === 0 && !needsHindsight) return; // zero-impact when the feature is off
 
   // Lazy imports — only paid for when at least one agent opts in or hindsight is wired.
-  const [{ getViaBrokerStructured, putViaBroker }, { ensureTeam, ensureKey, validateKey }, { addAgentSecret }] =
+  const [{ getViaBrokerStructured, putViaBroker }, { ensureTeam, ensureKey, validateKey, bindKeyToTeam }, { addAgentSecret }] =
     await Promise.all([
       import("../vault/broker/client.js"),
       import("../litellm/provision.js"),
@@ -560,7 +560,71 @@ export async function provisionLiteLLMKeys(
               ),
             );
           } else {
-            writeOut(chalk.gray(`  ~ litellm/${name}: key already provisioned + validated (skipped)\n`));
+            // validation.kind === "valid": the proxy recognizes the key. F1:
+            // it may still be UNBOUND (provisioned before the team-binding fix,
+            // or via the degraded unbound path) or bound to the WRONG team — so
+            // per-team cost tracking silently never aggregates for it, and the
+            // pre-fix idempotent skip left it that way FOREVER. Resolve the
+            // desired team and re-bind IN PLACE (POST /key/update) — no key
+            // deletion/regeneration. Availability-safe + LOUD on failure.
+            const boundTeamId = validation.teamId; // string | null
+            let desired: Awaited<ReturnType<typeof ensureTeam>> | null = null;
+            try {
+              desired = await ensureTeam(
+                baseUrl,
+                masterKey,
+                team,
+                undefined,
+                (m) => ctx.writeErr(chalk.yellow(`  ! litellm/${name}: ${m}\n`)),
+              );
+            } catch (err) {
+              // #2781 parity: a team-resolution error must NOT turn an
+              // already-good key into a scaffold failure — keep it, warn, move on.
+              ctx.writeErr(
+                chalk.yellow(
+                  `  ! litellm/${name}: could not resolve team '${team}' to check ` +
+                  `key binding (${(err as Error).message}) — keeping the stored key as-is.\n`,
+                ),
+              );
+            }
+
+            if (desired && desired.kind === "bound" && boundTeamId !== desired.teamId) {
+              const bind = await bindKeyToTeam({ baseUrl, masterKey, key: storedKey, teamId: desired.teamId });
+              if (bind.kind === "ok") {
+                writeOut(
+                  chalk.green(
+                    `  + litellm/${name}: re-bound existing key to team '${team}' ` +
+                    `(${boundTeamId === null ? "was UNBOUND" : `was team '${boundTeamId}'`}) ` +
+                    `— per-team cost tracking now applies\n`,
+                  ),
+                );
+              } else {
+                ctx.writeErr(
+                  chalk.yellow(
+                    `  ! litellm/${name}: key is provisioned but re-bind to team ` +
+                    `'${team}' FAILED (${bind.detail}) — per-team cost tracking will ` +
+                    `NOT aggregate for this key until re-bound. Manual: POST ` +
+                    `${baseUrl}/key/update {"key":"<key>","team_id":"${desired.teamId}"}.\n`,
+                  ),
+                );
+              }
+            } else if (desired && desired.kind === "unbound" && boundTeamId === null) {
+              // Key UNBOUND and the team_id could not be resolved → stay LOUD
+              // every apply so the degradation is never silent (F1 loud fallback).
+              ctx.writeErr(
+                chalk.yellow(
+                  `  ! litellm/${name}: key is provisioned but UNBOUND to any team, ` +
+                  `and team '${team}' could not be resolved (${desired.reason}) — ` +
+                  `per-team cost tracking will NOT aggregate for this key. Re-run ` +
+                  `once the LiteLLM team is resolvable.\n`,
+                ),
+              );
+            } else {
+              // Already bound to the desired team, OR bound to some team we
+              // couldn't re-resolve (still tracked), OR the lookup threw
+              // (warned above) — quiet, honest skip.
+              writeOut(chalk.gray(`  ~ litellm/${name}: key already provisioned + validated (skipped)\n`));
+            }
           }
         } else {
           // Can't validate (no admin key in hand, or a non-string entry) — keep
@@ -593,7 +657,14 @@ export async function provisionLiteLLMKeys(
 
       // Provision: ensure team (capturing its team_id so the key binds to it
       // for per-team cost/spend tracking), then generate the per-agent key.
-      const teamId = await ensureTeam(baseUrl, masterKey, team);
+      const teamResult = await ensureTeam(
+        baseUrl,
+        masterKey,
+        team,
+        undefined,
+        (m) => ctx.writeErr(chalk.yellow(`  ! litellm/${name}: ${m}\n`)),
+      );
+      const teamId = teamResult.kind === "bound" ? teamResult.teamId : undefined;
       const metadata: Record<string, string> = {
         agent: name,
         env: "fleet",
@@ -651,7 +722,21 @@ export async function provisionLiteLLMKeys(
         }
       }
 
-      writeOut(chalk.green(`  + litellm/${name}: provisioned virtual key (team '${team}')\n`));
+      if (teamId) {
+        writeOut(chalk.green(`  + litellm/${name}: provisioned virtual key (team '${team}')\n`));
+      } else {
+        // F3: ensureTeam could not resolve a team_id, so the key was generated
+        // UNBOUND. The pre-fix code printed a green "(team 'switchroom')" here —
+        // the config NAME string, always truthy — falsely claiming a binding.
+        // Be honest + LOUD: the key exists, but cost tracking will NOT aggregate.
+        ctx.writeErr(
+          chalk.yellow(
+            `  ! litellm/${name}: provisioned virtual key WITHOUT team binding ` +
+            `(${teamResult.kind === "unbound" ? teamResult.reason : "team_id unresolved"}) ` +
+            `— per-team cost tracking will NOT aggregate for this key.\n`,
+          ),
+        );
+      }
     } catch (err) {
       failures.push({ agent: name, message: `litellm: ${(err as Error).message}` });
     }
@@ -697,7 +782,14 @@ export async function provisionLiteLLMKeys(
             }
           }
           const team = topLevel?.team ?? "switchroom";
-          const teamId = await ensureTeam(baseUrl, masterKey, team);
+          const teamResult = await ensureTeam(
+            baseUrl,
+            masterKey,
+            team,
+            undefined,
+            (m) => ctx.writeErr(chalk.yellow(`  ! litellm/hindsight: ${m}\n`)),
+          );
+          const teamId = teamResult.kind === "bound" ? teamResult.teamId : undefined;
           const { key } = await ensureKey({
             baseUrl,
             masterKey,
@@ -712,7 +804,18 @@ export async function provisionLiteLLMKeys(
             { passphrase: passphrase! },
           );
           if (put.kind === "ok") {
-            writeOut(chalk.green(`  + litellm/hindsight: provisioned virtual key (team '${team}')\n`));
+            if (teamId) {
+              writeOut(chalk.green(`  + litellm/hindsight: provisioned virtual key (team '${team}')\n`));
+            } else {
+              // F3: honest, LOUD degradation instead of a false "(team ...)" claim.
+              ctx.writeErr(
+                chalk.yellow(
+                  `  ! litellm/hindsight: provisioned virtual key WITHOUT team binding ` +
+                  `(${teamResult.kind === "unbound" ? teamResult.reason : "team_id unresolved"}) ` +
+                  `— per-team cost tracking will NOT aggregate for this key.\n`,
+                ),
+              );
+            }
           } else {
             throw new Error(`vault write failed (${put.kind})`);
           }
