@@ -781,6 +781,13 @@ export interface SessionTailConfig {
   claudeHome?: string
   /** How often to re-scan for a new active session file (ms). Default 500. */
   rescanIntervalMs?: number
+  /**
+   * Idle window before an inactive sub-agent FSWatcher (and its PreToolUse
+   * sidecar) is reaped, in ms. Defaults to 5 minutes — well past the 99th-
+   * percentile sub-agent completion time. Exposed only so tests can drive the
+   * reap deterministically without a 5-minute wall-clock wait.
+   */
+  subTailIdleReapMs?: number
   /** Optional logger. */
   log?: (msg: string) => void
   /** Called for each parsed event. */
@@ -913,6 +920,22 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
       return null
     }
   }
+  /**
+   * M1 FD-leak fix: stop and forget the PreToolUse sidecar for a session that
+   * has ended (a rotated-away parent session, or a reaped sub-agent). Each
+   * sidecar holds its own stat-poll timer (and, on real fs, a file handle);
+   * pre-fix they were only reaped in `stop()`, so every session rotation
+   * (`/clear`, compaction → new sessionId) and every finished sub-agent leaked
+   * one for the gateway's life. Idempotent — a no-op when the key is absent.
+   */
+  function stopSidecar(sessionId: string | null): void {
+    if (!sessionId) return
+    const s = sidecars.get(sessionId)
+    if (!s) return
+    try { s.stop() } catch { /* ignore */ }
+    sidecars.delete(sessionId)
+  }
+
   function decorate(ev: SessionEvent, sessionId: string | null): SessionEvent {
     if (!sessionId) return ev
     if (ev.kind !== 'tool_use' && ev.kind !== 'sub_agent_tool_use') return ev
@@ -1024,6 +1047,19 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
       try { watcher.close() } catch { /* ignore */ }
       watcher = null
     }
+    // M1 FD-leak fix: we are rotating the PARENT tail off `currentFile`; its
+    // PreToolUse sidecar is no longer needed (its watcher just closed). Reap it
+    // so `/clear`- and compaction-driven session rotations don't accumulate one
+    // idle sidecar poll-timer per rotation. Parent session ids are the JSONL
+    // stem (`<uuid>`); sub-agent sidecars are keyed by `agent-<id>` stems and
+    // owned by their sub-tail (reaped in `reapIdleSubTails`), so this never
+    // stops a sidecar a live sub-tail still depends on. A later re-attach to
+    // this same file transparently recreates the sidecar via `ensureSidecar`.
+    const rotatedAwaySid = sessionIdForFile(currentFile)
+    const nextSid = sessionIdForFile(file)
+    if (rotatedAwaySid != null && rotatedAwaySid !== nextSid) {
+      stopSidecar(rotatedAwaySid)
+    }
     currentFile = file
     const prior = fileCursors.get(file)
     if (prior != null) {
@@ -1113,7 +1149,7 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
    * very-long task (rescanSubagents picks the file back up on the
    * next tick if it grows).
    */
-  const IDLE_FSWATCH_TTL_MS = 5 * 60 * 1000
+  const IDLE_FSWATCH_TTL_MS = config.subTailIdleReapMs ?? 5 * 60 * 1000
 
   function readSub(t: SubTail): void {
     if (stopped) return
@@ -1254,6 +1290,13 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
           try { t.watcher.close() } catch { /* ignore */ }
           t.watcher = null
         }
+        // M1 FD-leak fix: reap the sub-agent's PreToolUse sidecar alongside its
+        // file watcher. Sub-agent sidecars are keyed by the sub file's stem
+        // (`agent-<id>`), created lazily by `decorate` while reading the sub
+        // JSONL. Pre-fix `reapIdleSubTails` closed the sub-tail watcher but left
+        // the sidecar (and its poll timer) alive until `stop()`, so a long-lived
+        // agent leaked one sidecar per finished sub-agent.
+        stopSidecar(sessionIdForFile(t.file))
         subTails.delete(file)
         log?.(`session-tail: reaped idle sub ${t.agentId} (${file})`)
       }
