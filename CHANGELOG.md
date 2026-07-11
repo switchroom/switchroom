@@ -2,7 +2,99 @@
 
 ## Unreleased
 
-### `/stop` + bare "stop" cancel the in-flight turn (#3020)
+## v0.18.10 — The fleet swaps accounts before the wall, not after
+
+### Proactive auth failover — soft-avoid, probe rolls, honest announcements (#3031: #3032, #3036, #3035, #3034)
+
+The account pool no longer waits for a hard quota wall. A new
+**soft-avoid** eligibility tier sits between eligible and blocked: an
+account whose fresh 7d utilization crosses `auth.proactive_failover_pct`
+(or 5h crosses `min(pct+3, 98)`) becomes dispreferred, with per-window
+enter/exit hysteresis so the preference never flaps across probe ticks
+(#3032). The fleet quota probe now acts on that tier: when the serving
+account — fleet-active OR a pinned `auth.override` — is soft-avoided and
+a strictly better candidate exists, the broker rolls serving preference
+NOW via the same credential fanout as the hard-exhaustion path, with no
+exhaustion mark and no durable promote; the preference self-reverts via
+the exit hysteresis (#3036). Every roll reaches the operator exactly
+once: broker-initiated rolls persist a `last_fleet_roll` record that
+gateways announce through the claim-notification dedup, a successful
+reactive swap folds into an edit of the model-unavailable card instead
+of a second message, and the announcement text distinguishes a proactive
+"approaching its limits" switch from hard exhaustion (#3035). Guard
+tests pin the invariants: broker rolls structurally cannot restart
+agents (no path from `fleetQuotaProbeTick` to `triggerSelfRestart`), and
+mid-turn credential pickup is empirically verified against the installed
+claude binary — the request path re-reads `.credentials.json` on mtime
+change, so a swap lands on the next request without a restart, now
+documented in `docs/auth.md` and pinned in the nightly canary (#3034).
+With `auth.proactive_failover_pct` unset the whole tier is structurally
+off — byte-identical behavior.
+
+### The photo-crash class is dead, twice over (#3022, #3037, #3040)
+
+A single oversized image could crash the whole gateway (2026-07-11
+incident: `sendMediaGroup` 400 `PHOTO_INVALID_DIMENSIONS` surfaced as a
+tail-of-lane unhandledRejection). Three layers now stand in the way:
+the reactive layer swallows the rejection and retries the photo as a
+document (#3022); a pre-send precheck probes image headers (PNG/JPEG/
+GIF/WebP, no deps) and pre-routes anything Telegram would reject —
+including the incident's 600×8717 page capture, which was *within* the
+documented limits — so one bad photo no longer fails a whole album
+(#3037); and the reply tool now tells the agent when files were rerouted
+as documents so it never claims an inline image rendered when it didn't
+(#3040). Same incident, second defect: the agent's MCP bridge process
+died with the crashed gateway and left no trace — the bridge now handles
+`uncaughtException` and persists crash breadcrumbs to
+`bridge-crash.log` (#3037).
+
+### Bridge-dead watchdog — a toolless agent gets bounced, honestly (#3041)
+
+Claude Code never respawns a dead MCP server, so a bridge that died with
+a gateway crash left the agent alive but mute until someone restarted
+the container by hand (issue #3038, 7 minutes of manual recovery). The
+gateway now watches for it: if no real bridge registers within a grace
+window (default 90s) while the claude session is alive, it bounces the
+container with the distinct reason `bridge-dead-resume`, quoting the
+fresh crash-breadcrumb tail in the audit line. Guard rails: one
+escalation per gateway boot, a cross-boot loop damper (two consecutive
+escalations stand the watchdog down instead of bouncing a
+deterministically-failing bridge forever), and honest resume — the next
+boot names the real cause in the resume inbound instead of masquerading
+as an operator restart. Kill switch:
+`SWITCHROOM_BRIDGE_DEAD_ESCALATION=0`.
+
+### Session commands never dead-end: apply-or-queue + sticky overrides (#3018, #3042)
+
+`/model` and `/effort` now honor a single contract (issue #3039): apply
+and confirm when possible; otherwise ack, queue, deterministically apply
+when the agent is available, and confirm — never "try again later", never
+a silent keep. A mid-turn command renders a keyboard whose taps ride the
+queue; queued choices typed before a shutdown are persisted to the boot
+carriers and apply as the agent boots. The overrides are now genuinely
+sticky: the durable `.session-model` carrier is honored on EVERY boot —
+deploy, `/restart`, watchdog, crash — and `/effort` gains its own
+`.session-effort` carrier resolved into `--effort` at boot. Only an
+explicit revert, `/model default`/`/effort default`, or invalidation
+clears an override, every clearing path alerts the chat once, and a
+corrupt or crashlooping carrier self-heals (three fast boots with an
+override active clear it and boot the configured default).
+
+### Progress cards stop finalizing live workers (#3019, #3029)
+
+The 2026-07-10 incident where an actively-editing worker's card was
+finalized mid-run is fixed at both ends. Silent-stall terminal synthesis
+now tracks in-flight tool calls — a worker inside a 10-minute `Bash`
+call with zero JSONL growth is not "silent" — deferring synthesis while
+any tool call is outstanding (capped at 45 min so a died-mid-tool worker
+still terminalizes), and the stuck-running reaper cross-checks the
+watcher's live registry before reaping (#3019). And when a false finish
+does slip through, the card comes back: post-terminal JSONL growth
+resurrects the worker as a live entry with progress, stall detection,
+and handback all resumed — at most once, with a repeat named-as-lost
+instead of resurrected forever (#3029).
+
+### `/stop` + bare "stop" cancel the in-flight turn (#3028)
 
 The intuitive word now does the intuitive thing: `/stop` (and a bare
 operator message of exactly `stop`, case-insensitive, optional `.`/`!`)
@@ -27,6 +119,15 @@ when the target turn ends naturally during the safe-boundary wait.
 container-stop muscle memory), and a photo captioned "stop" is content,
 not a halt. In forum agents, `stop` halts the single global in-flight
 turn regardless of topic, same as `!`.
+
+### The fleet development protocol is now code (#3027)
+
+The five-part development protocol every agent works under — ground
+before asserting, one question at a time, design-align on larger tasks,
+the review-to-green pipeline, consolidated communication — is codified
+as a shared CLAUDE.md partial (`_shared/dev-protocol.md.hbs`) rendered
+into every profile, plus a bundled `dev-protocol` skill carrying the
+long form. One source of truth instead of per-profile drift.
 
 ## v0.18.9 — The delivery state machine takes the wheel
 
