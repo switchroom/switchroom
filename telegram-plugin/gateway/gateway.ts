@@ -173,6 +173,7 @@ import {
   safeActionForRecord,
   selectOldestHeld,
   selectHeldForRedelivery,
+  isHeldUndeliverable,
   holdReasonFor,
   heldRetryBackoffMs,
   type UndeliverableMark,
@@ -7013,10 +7014,19 @@ function postPermissionCard(
         if (live.undeliverable != null) {
           live.undeliverable = null
           live.redeliveryFailures = 0
+          // RESET THE TTL CLOCK. Load-bearing, not cosmetic. `startedAt` is when
+          // the agent asked; the TTL measures how long the operator had to
+          // answer. Until this instant they had NOTHING to answer — the card did
+          // not exist in any chat. Without the reset, a card held through a 4.6h
+          // ban lands already-expired against a 60-min TTL and the very next
+          // reaper tick auto-denies it: we would have MOVED the silent denial,
+          // not removed it.
+          live.startedAt = Date.now()
           reconcileBlockedApprovals()
           process.stderr.write(
             `telegram gateway: permission-card RE-DELIVERED request=${requestId} ` +
-            `tool=${live.tool_name} chat=${chatId} — the operator can answer now\n`,
+            `tool=${live.tool_name} chat=${chatId} — the operator can answer now; ` +
+            `TTL clock restarted (they had zero seconds while the channel was shut)\n`,
           )
         }
         permCardStore.add({
@@ -7219,6 +7229,29 @@ const pendingStateReaper = setInterval(() => {
   }
   pendingVaultOps.sweep(now)
   for (const [k, v] of pendingPermissions) {
+    // ─── THE LEASH (#3084 follow-up) ──────────────────────────────────────
+    // A HELD entry never expires. The TTL answers one question: "how long did
+    // the operator have to answer?" For a card that never landed — the send
+    // failed against a Telegram flood ban, a network partition, a 5xx — the
+    // answer is ZERO SECONDS. Running a clock the operator was never shown, and
+    // then reporting that silence to the agent as a denial, is the operator's
+    // own leash deciding for them.
+    //
+    // This is the exact 2026-07-11 overlord incident: a 4.6h ban against a
+    // 60-min TTL made the auto-deny below GUARANTEED to fire on an approval no
+    // human had ever seen. We escaped only because someone answered in tmux at
+    // ~50 minutes.
+    //
+    // Ken's call, explicit: hold, and make the block visible. Never auto-approve.
+    // Never auto-deny — not even on a deadline. The agent stays blocked; the card
+    // is re-delivered by sweepHeldPermissionCards() above once the channel
+    // reopens, and on delivery `startedAt` resets so the operator gets their full
+    // decision window starting from when they could first act.
+    //
+    // An indefinite block is BY DESIGN — /pending and tmux remain the escape
+    // hatches, and the block is surfaced off-Telegram in blocked-approvals/.
+    // reference/invariants.md § no-self-escalation, § on-leash.
+    if (isHeldUndeliverable(v)) continue
     // hostd gated fleet-mutation verbs get a longer (30-min) human-scale
     // decision window than the 10-min default (Bug 2 fix #2).
     const ttl = ttlForTool(v.tool_name)
@@ -7269,8 +7302,19 @@ const pendingStateReaper = setInterval(() => {
       // returns. Anchor to the card's own origin surface (where the operator
       // would have tapped), so the digest lands in the same topic — not a
       // fanned-out DM. Skip if the card was never posted anywhere.
+      // The `cards[0]` hole (#3084 follow-up): this used to skip silently when the
+      // card had never landed (`cards: []` → `origin === undefined`). That is
+      // exactly the undeliverable case — so the request was auto-denied AND erased
+      // from the only record that would have brought it back. The safety net had a
+      // hole shaped exactly like the accident.
+      //
+      // Held entries no longer reach this code at all (the TTL freeze above skips
+      // them), so this is belt-and-braces: ANY future path that times out a card
+      // which never landed — including a PERMANENT 400, which holdReasonFor()
+      // deliberately does not hold — still lands in the digest. Fall back to where
+      // the card WOULD have gone.
       if (MISSED_APPROVAL_REOFFER_ENABLED) {
-        const origin = v.cards[0]
+        const origin = v.cards[0] ?? resolvePermissionCardTargets()[0]
         if (origin != null) {
           missedApprovalsStore.add({
             requestId: k,
