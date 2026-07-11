@@ -36,6 +36,7 @@ function makeDeps(agentName: string | null) {
   const finalizeB = vi.fn(async () => {})
   const clearActiveReactions = vi.fn()
   const disposeProgressDriver = vi.fn()
+  const stopTurnTypingLoops = vi.fn()
   const log = vi.fn()
 
   const activeStatusReactions = new Map<string, FakeCtrl>([
@@ -72,7 +73,7 @@ function makeDeps(agentName: string | null) {
   // carry or clear it.
 
   return {
-    spies: { setDoneA, setDoneB, finalizeA, finalizeB, clearActiveReactions, disposeProgressDriver, log },
+    spies: { setDoneA, setDoneB, finalizeA, finalizeB, clearActiveReactions, disposeProgressDriver, stopTurnTypingLoops, log },
     deps: {
       agentName,
       activeStatusReactions,
@@ -83,6 +84,7 @@ function makeDeps(agentName: string | null) {
       activeDraftStreams,
       clearActiveReactions,
       disposeProgressDriver,
+      stopTurnTypingLoops,
       log,
     },
   }
@@ -121,6 +123,16 @@ describe('flushOnAgentDisconnect — anonymous clients (the regression scenario)
     expect(spies.setDoneA).toHaveBeenCalledTimes(0)
     expect(spies.setDoneB).toHaveBeenCalledTimes(0)
   })
+
+  it('#2650: does NOT sweep the turn-typing loops for anonymous disconnects', () => {
+    // An anonymous one-shot IPC client (recall.py, etc.) never owned a
+    // turn-typing loop. The sweep MUST be gated by the agentName-null
+    // early-return so a constant stream of anonymous disconnects can't
+    // kill a live agent's typing indicator.
+    const { spies, deps } = makeDeps(null)
+    flushOnAgentDisconnect(deps)
+    expect(spies.stopTurnTypingLoops).not.toHaveBeenCalled()
+  })
 })
 
 describe('flushOnAgentDisconnect — registered agent disconnects (existing behavior preserved)', () => {
@@ -142,6 +154,15 @@ describe('flushOnAgentDisconnect — registered agent disconnects (existing beha
     flushOnAgentDisconnect(deps)
     expect(spies.disposeProgressDriver).toHaveBeenCalledTimes(1)
     expect(spies.clearActiveReactions).toHaveBeenCalledTimes(1)
+  })
+
+  it('#2650: sweeps the turn-typing loops on a real agent disconnect', () => {
+    // The bridge died mid-turn — the canonical turn-end that would stop the
+    // per-(chat,thread) `typing…` interval will never arrive, so the flush
+    // must sweep every live loop or a stale "typing…" shows until next turn.
+    const { spies, deps } = makeDeps('clerk')
+    flushOnAgentDisconnect(deps)
+    expect(spies.stopTurnTypingLoops).toHaveBeenCalledTimes(1)
   })
 
   it('finalizes only non-final draft streams and clears the maps', () => {
@@ -172,6 +193,7 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
     const onDanglingTurnsSwept = vi.fn()
     const clearActiveReactions = vi.fn()
     const disposeProgressDriver = vi.fn()
+    const stopTurnTypingLoops = vi.fn()
     const log = vi.fn()
     const deps = {
       agentName: 'clerk',
@@ -185,6 +207,7 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
       activeDraftStreams: new Map<string, FakeStream>(),
       clearActiveReactions,
       disposeProgressDriver,
+      stopTurnTypingLoops,
       onDanglingTurnsSwept,
       log,
     }
@@ -243,6 +266,7 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
       activeDraftStreams: new Map<string, FakeStream>(),
       clearActiveReactions: vi.fn(),
       disposeProgressDriver: vi.fn(),
+      stopTurnTypingLoops: vi.fn(),
       onDanglingTurnsSwept,
       log: vi.fn(),
     }
@@ -278,6 +302,7 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
       activeDraftStreams: new Map<string, FakeStream>(),
       clearActiveReactions: vi.fn(),
       disposeProgressDriver: vi.fn(),
+      stopTurnTypingLoops: vi.fn(),
       onDanglingTurnsSwept,
       log,
     }
@@ -310,6 +335,7 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
       activeDraftStreams: new Map<string, FakeStream>(),
       clearActiveReactions: vi.fn(),
       disposeProgressDriver: vi.fn(),
+      stopTurnTypingLoops: vi.fn(),
     }
     // Singular form.
     flushOnAgentDisconnect({
@@ -348,6 +374,7 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
       activeDraftStreams: new Map<string, FakeStream>(),
       clearActiveReactions: vi.fn(),
       disposeProgressDriver: vi.fn(),
+      stopTurnTypingLoops: vi.fn(),
       log,
     })
     expect(log.mock.calls.some((c: unknown[]) =>
@@ -368,6 +395,7 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
       activeDraftStreams: new Map<string, FakeStream>(),
       clearActiveReactions: vi.fn(),
       disposeProgressDriver: vi.fn(),
+      stopTurnTypingLoops: vi.fn(),
       // onDanglingTurnsSwept intentionally omitted.
       log: vi.fn(),
     }
