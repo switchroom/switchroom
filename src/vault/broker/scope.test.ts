@@ -3,9 +3,8 @@
  *
  * Covers:
  *   - VaultEntryScope schema: round-trips through VaultEntry correctly
- *   - agentSlugFromPeer: extracts slug from systemd unit name
  *   - checkEntryScope: pure function behavior for all rule combinations
- *   - Broker get: scope-allow and scope-deny enforcement via _testIdentify
+ *   - Broker get: scope-allow and scope-deny enforcement via _testAgentName
  *   - Broker get: no scope = backwards compatible (all callers allowed)
  *   - Broker list: narrows visible keys by scope
  *   - Audit log: scope-deny reason recorded correctly
@@ -17,23 +16,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as fs from "node:fs";
 import { VaultBroker } from "./server.js";
-import { checkEntryScope, agentSlugFromPeer } from "./acl.js";
+import { checkEntryScope } from "./acl.js";
 import { encodeRequest, decodeResponse, type BrokerResponse } from "./protocol.js";
 import { createAuditLogger, type AuditEntry } from "./audit-log.js";
 import type { VaultEntry, VaultEntryScope } from "../vault.js";
-import type { PeerInfo } from "./peercred.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
-
-function peer(
-  systemdUnit: string | null,
-  uid = 1000,
-  pid = 1234,
-): PeerInfo {
-  return { uid, pid, exe: "/usr/bin/bash", systemdUnit };
-}
 
 async function rpc(
   socketPath: string,
@@ -155,36 +145,6 @@ describe("VaultEntryScope schema", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// agentSlugFromPeer
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("agentSlugFromPeer", () => {
-  it("returns the agent slug from a valid cron unit", () => {
-    expect(agentSlugFromPeer(peer("switchroom-clerk-cron-0.service"))).toBe("clerk");
-  });
-
-  it("returns the agent slug from a multi-hyphen agent name", () => {
-    expect(agentSlugFromPeer(peer("switchroom-my-cool-agent-cron-2.service"))).toBe("my-cool-agent");
-  });
-
-  it("returns the agent slug from schedule index > 0", () => {
-    expect(agentSlugFromPeer(peer("switchroom-lawgpt-cron-3.service"))).toBe("lawgpt");
-  });
-
-  it("returns null when systemdUnit is null", () => {
-    expect(agentSlugFromPeer(peer(null))).toBeNull();
-  });
-
-  it("returns null for a non-switchroom unit", () => {
-    expect(agentSlugFromPeer(peer("some-other.service"))).toBeNull();
-  });
-
-  it("returns null for a malformed unit name", () => {
-    expect(agentSlugFromPeer(peer("switchroom-myagent-cron-.service"))).toBeNull();
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
 // checkEntryScope — pure function unit tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -267,8 +227,9 @@ describe("checkEntryScope", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 // Broker integration tests for scope enforcement
 //
-// Uses _testIdentify + _testAuditLogger to avoid real peercred or audit log.
-// The fake peer is `switchroom-myagent-cron-0.service` → slug "myagent".
+// Uses _testAgentName + _testAuditLogger to avoid real peercred or audit log.
+// #1192: identity is the per-agent socket path, so the caller agent slug is
+// "myagent" (set via _testAgentName), NOT derived from a cron systemd unit.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Build a SwitchroomConfig that grants the fake peer access to the given keys. */
@@ -291,14 +252,6 @@ describe("VaultBroker scope enforcement via _testIdentify", () => {
   let socketPath: string;
   let auditLogPath: string;
   let prevNonLinuxFlag: string | undefined;
-
-  // Fake peer: switchroom-myagent-cron-0.service → slug "myagent"
-  const FAKE_PEER: PeerInfo = {
-    uid: process.getuid?.() ?? 1000,
-    pid: 77777,
-    exe: "/usr/bin/bash",
-    systemdUnit: "switchroom-myagent-cron-0.service",
-  };
 
   beforeEach(() => {
     prevNonLinuxFlag = process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
@@ -324,7 +277,7 @@ describe("VaultBroker scope enforcement via _testIdentify", () => {
     const broker = new VaultBroker({
       _testSecrets: JSON.parse(JSON.stringify(secrets)),
       _testConfig: makeScopeConfig(allKeys),
-      _testIdentify: () => FAKE_PEER,
+      _testAgentName: "myagent",
       _testAuditLogger: createAuditLogger({ path: auditLogPath }),
     });
     await broker.start(socketPath, undefined, undefined);

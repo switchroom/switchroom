@@ -19,7 +19,17 @@
  *
  * Both paths cross-check the resolved PID's UID against the broker's UID
  * and look up its cgroup-derived systemd unit (validated against
- * systemctl-user). The cgroup identity is what the ACL gates on.
+ * systemctl-user).
+ *
+ * NOTE (#1192): the cgroup-derived `systemdUnit` is now INFORMATIONAL only
+ * — it rides along on the audit row (`callerFromPeer` / the `cgroup` field)
+ * so forensics can correlate a caller against the host unit table. It no
+ * longer gates the ACL. Since the Phase 2a Docker migration, agent identity
+ * is the per-agent socket bind path (`socketPathToAgent`), and the ACL is
+ * `checkAclByAgent` (per-AGENT). The old per-cron-index gate that keyed on
+ * `switchroom-<agent>-cron-<i>.service` was removed with the in-container
+ * scheduler, which produces no such systemd cgroup. In a container this
+ * lookup typically yields null; that is expected and harmless.
  *
  * Security model:
  *   - Fail-closed: any parse error, missing /proc entry, or UID mismatch
@@ -182,7 +192,9 @@ export interface PeerInfo {
   pid: number;
   exe: string;
   /** Systemd unit name e.g. "switchroom-myagent-cron-3.service", or null if
-   *  the caller is not a switchroom cron unit or cgroup is unavailable. */
+   *  the caller is not a switchroom cron unit or cgroup is unavailable.
+   *  #1192: informational only — surfaced on the audit row, NOT gated by the
+   *  ACL. Typically null in the container deployment. */
   systemdUnit: string | null;
 }
 

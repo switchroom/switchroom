@@ -176,6 +176,45 @@ function collectNeeds(resolved: unknown): {
 }
 
 /**
+ * #1192 — operator honesty signal. The vault-broker ACL is per-AGENT: a key
+ * in ANY of an agent's `schedule[*].secrets[]` is readable by ALL of that
+ * agent's crons (per-cron-index gating was removed with the in-container
+ * scheduler). If an agent declares 2+ schedule entries whose `secrets[]`
+ * sets are NOT identical, the operator may believe those crons are isolated
+ * — they are not. Emit a WARN (never a fail) so the discrepancy is visible
+ * without breaking `doctor`.
+ *
+ * Returns a WARN CheckResult when the agent has 2+ schedule entries with
+ * non-empty, non-identical secrets[] sets; null otherwise.
+ */
+export function scheduleAclGranularityWarning(
+  name: string,
+  resolved: unknown,
+): CheckResult | null {
+  const schedule =
+    (resolved as { schedule?: Array<{ secrets?: string[] }> }).schedule ?? [];
+  const withSecrets = schedule.filter((e) => (e.secrets?.length ?? 0) > 0);
+  if (withSecrets.length < 2) return null;
+  const canon = (s?: string[]): string =>
+    JSON.stringify([...new Set(s ?? [])].sort());
+  const distinct = new Set(withSecrets.map((e) => canon(e.secrets)));
+  if (distinct.size < 2) return null; // all identical → no false impression
+  return {
+    name: `secret ACL granularity: ${name}`,
+    status: "warn",
+    detail:
+      `${name} declares ${withSecrets.length} schedule entries with differing ` +
+      `'secrets[]' sets. The vault-broker ACL is per-AGENT, not per-cron-entry: ` +
+      `EVERY one of ${name}'s crons can read the UNION of these keys. Per-cron-index ` +
+      `isolation is not enforced (removed with the in-container scheduler, #1192) — ` +
+      `it is misconfiguration protection, not a security boundary.`,
+    fix:
+      `If these crons must not share secrets, split them into separate agents; ` +
+      `otherwise this is expected and the warning is informational.`,
+  };
+}
+
+/**
  * The ONE per-key gap rule, shared by the local-passphrase and the
  * broker paths so they produce byte-identical verdicts. Returns a gap
  * string or null. `google:` slots are auth-broker slots — existence
@@ -321,6 +360,8 @@ export async function runSecretAccessChecks(
         config.profiles,
         config.agents[name],
       );
+      const granWarn = scheduleAclGranularityWarning(name, resolved);
+      if (granWarn) results.push(granWarn);
       const { needed, cronKeys } = collectNeeds(resolved);
       if (needed.size === 0) {
         results.push({
@@ -395,6 +436,8 @@ export async function runSecretAccessChecks(
       config.profiles,
       config.agents[name],
     );
+    const granWarn = scheduleAclGranularityWarning(name, resolved);
+    if (granWarn) results.push(granWarn);
     const { needed, cronKeys } = collectNeeds(resolved);
     if (needed.size === 0) {
       results.push({

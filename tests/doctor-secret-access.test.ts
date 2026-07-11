@@ -257,3 +257,84 @@ describe("runSecretAccessChecks — Check B broker path (no passphrase)", () => 
     expect(r.some((x) => x.status === "fail")).toBe(false);
   });
 });
+
+describe("runSecretAccessChecks — #1192 per-agent ACL granularity WARN", () => {
+  const okEntries: Record<string, VaultEntry> = {
+    "bank/token": { kind: "string", value: "v" },
+    "cal/token": { kind: "string", value: "v" },
+  };
+
+  it("WARNs (not fails) when 2+ schedule entries declare divergent secrets[] sets", async () => {
+    const config = cfg({
+      scout: {
+        schedule: [
+          { cron: "0 8 * * *", prompt: "bank", secrets: ["bank/token"] },
+          { cron: "0 9 * * 0", prompt: "cal", secrets: ["cal/token"] },
+        ],
+      },
+    });
+    const r = await runSecretAccessChecks(
+      config,
+      deps({ openVault: () => okEntries }),
+    );
+    const w = get(r, "secret ACL granularity: scout");
+    expect(w?.status).toBe("warn");
+    expect(w?.detail).toContain("per-AGENT");
+    expect(w?.detail).toContain("UNION");
+    // The warn never turns the run red on its own — key access is still ok.
+    expect(get(r, "secret access: scout")?.status).toBe("ok");
+  });
+
+  it("does NOT warn when the two entries declare IDENTICAL secrets[] sets", async () => {
+    const config = cfg({
+      scout: {
+        schedule: [
+          { cron: "0 8 * * *", prompt: "a", secrets: ["bank/token"] },
+          { cron: "0 9 * * *", prompt: "b", secrets: ["bank/token"] },
+        ],
+      },
+    });
+    const r = await runSecretAccessChecks(
+      config,
+      deps({ openVault: () => okEntries }),
+    );
+    expect(get(r, "secret ACL granularity: scout")).toBeUndefined();
+  });
+
+  it("does NOT warn for a single schedule entry", async () => {
+    const config = cfg({
+      scout: {
+        schedule: [{ cron: "0 8 * * *", prompt: "a", secrets: ["bank/token"] }],
+      },
+    });
+    const r = await runSecretAccessChecks(
+      config,
+      deps({ openVault: () => okEntries }),
+    );
+    expect(get(r, "secret ACL granularity: scout")).toBeUndefined();
+  });
+
+  it("also fires on the broker (no-passphrase) path", async () => {
+    const config = cfg({
+      scout: {
+        schedule: [
+          { cron: "0 8 * * *", prompt: "bank", secrets: ["bank/token"] },
+          { cron: "0 9 * * 0", prompt: "cal", secrets: ["cal/token"] },
+        ],
+      },
+    });
+    const r = await runSecretAccessChecks(
+      config,
+      brokerDeps(async (_a, keys) => ({
+        kind: "ok",
+        results: keys.map((key) => ({
+          key,
+          exists: true,
+          acl_ok: true,
+          scope_ok: true,
+        })),
+      })),
+    );
+    expect(get(r, "secret ACL granularity: scout")?.status).toBe("warn");
+  });
+});
