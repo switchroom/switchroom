@@ -187,6 +187,7 @@ import {
   retryWithThreadFallback,
   isPhotoDimensionRejectError,
 } from '../retry-api-call.js'
+import { classifyPhotoFile } from '../photo-precheck.js'
 import { installTgPostLogger, withTgPostTags } from '../shared/bot-runtime.js'
 import { floodStatePath, makeFloodWaitRecorder } from '../flood-circuit-breaker.js'
 import { buildAttachmentPath, assertInsideInbox } from '../attachment-path.js'
@@ -11986,13 +11987,34 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     }
   }
 
+  // #3033 layer-2 (pre-send validation): probe each photo-extension file
+  // BEFORE it hits the wire and pre-route any that Telegram's photo path
+  // would reject (extreme aspect ratio, width+height over cap, >10MB) as
+  // documents. One bad photo fails a WHOLE sendMediaGroup album with an
+  // opaque 400 — catching it here keeps the good files deliverable and
+  // sends the offender as a document on the first attempt. Probe
+  // failures keep the photo route; the reactive #3022 fallback backstops.
+  const photoPrecheck = new Map<string, ReturnType<typeof classifyPhotoFile>>()
+  for (const f of files) {
+    if (!PHOTO_EXTS.has(extname(f).toLowerCase())) continue
+    const cls = classifyPhotoFile(f)
+    photoPrecheck.set(f, cls)
+    if (cls.route === 'document') {
+      process.stderr.write(
+        `telegram gateway: photo-precheck rerouting ${f} as document (${cls.reason})\n`,
+      )
+    }
+  }
+  const sendableAsPhoto = (f: string) =>
+    PHOTO_EXTS.has(extname(f).toLowerCase()) && photoPrecheck.get(f)?.route !== 'document'
+
   // #273: when files is 2-10 photos, batch them into a single
   // sendMediaGroup album rather than N separate sendPhoto calls. The
   // user's device fires one notification for the album instead of N
   // (notification-budget protection per the issue's JTBD note). Falls
   // back to the per-file path for any non-all-photo set.
   const allPhotos = files.length >= 2 && files.length <= 10
-    && files.every((f) => PHOTO_EXTS.has(extname(f).toLowerCase()))
+    && files.every(sendableAsPhoto)
   // #1075: thread-id-bearing file sends. Mirror the chunk-loop's
   // THREAD_NOT_FOUND fallback (deleted topic → drop the thread and
   // resend on the main chat) so an attachment-bearing reply doesn't
@@ -12062,9 +12084,10 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     for (const m of sent) sentIds.push(m.message_id)
   } else {
     for (const f of files) {
-      const ext = extname(f).toLowerCase()
       const input = new InputFile(f)
-      const isPhoto = PHOTO_EXTS.has(ext)
+      // Photo-ext files that failed the pre-send probe route straight to
+      // sendDocument (see photoPrecheck above) instead of bouncing a 400.
+      const isPhoto = sendableAsPhoto(f)
       let sent: { message_id: number; message_thread_id?: number }
       try {
         sent = await retryWithThreadFallback<{ message_id: number; message_thread_id?: number }>(
