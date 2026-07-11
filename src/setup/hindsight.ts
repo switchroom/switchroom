@@ -222,6 +222,46 @@ export const HINDSIGHT_DEFAULT_MCP_STATELESS = true;
 export const HINDSIGHT_BROKER_SOCK_VOLUME = `auth-broker-${HINDSIGHT_CONSUMER_NAME}-sock`;
 
 /**
+ * Shared creds-mirror volume for the hindsight consumer (#2578).
+ *
+ * When the hindsight `auth.consumers[]` entry declares `mirror_dir`, the
+ * auth-broker pushes the effective-account `.credentials.json` there the
+ * instant it detects exhaustion (see `mirrorAccountToConsumer` in
+ * src/auth/broker/server.ts, landed in #2577). For that push to reach
+ * hindsight, broker and hindsight must share a volume: the broker mounts
+ * it at the operator-chosen `mirror_dir`, hindsight mounts the SAME named
+ * volume at its creds-read path (`/run/claude-creds`, the entrypoint's
+ * `CLAUDE_CONFIG_DIR`), REPLACING the private per-container tmpfs. This
+ * closes the up-to-30-min pull-latency gap for failover.
+ *
+ * Name is canonical (unprefixed) so it matches what `src/agents/compose.ts`
+ * declares on the switchroom compose project (`consumer-creds-<name>`) —
+ * the two projects are separate but reference the same volume by name.
+ */
+export const HINDSIGHT_CREDS_MIRROR_VOLUME = `consumer-creds-${HINDSIGHT_CONSUMER_NAME}`;
+
+/**
+ * The consumer-side creds-read path — hindsight's `CLAUDE_CONFIG_DIR`, where
+ * the entrypoint fetches `.credentials.json` and the claude subprocess reads
+ * it. In mirror mode the broker's pushed file lands here via the shared
+ * volume; otherwise it is a per-container tmpfs.
+ */
+export const HINDSIGHT_CRED_DIR = "/run/claude-creds";
+
+/**
+ * Resolve the hindsight consumer's `mirror_dir` from a loaded config, or
+ * `undefined` when unset (mirror-mode off → tmpfs, pull-only — unchanged
+ * pre-#2578 behavior). Callers pass the result to `startHindsight` /
+ * `generateHindsightComposeSnippet` to decide tmpfs-vs-shared-volume.
+ */
+export function hindsightConsumerMirrorDir(config: {
+  auth?: { consumers?: Array<{ name: string; mirror_dir?: string }> };
+}): string | undefined {
+  return config.auth?.consumers?.find((c) => c.name === HINDSIGHT_CONSUMER_NAME)
+    ?.mirror_dir;
+}
+
+/**
  * Reranker smart-defaults (v0.13.22).
  *
  * The hindsight server's cross-encoder reranker is the single biggest
@@ -696,6 +736,15 @@ export function startHindsight(
   litellm?: LiteLLMHindsightConfig,
   imageTag?: string,
   llm?: HindsightLlmConfig,
+  /**
+   * When set (the hindsight consumer's `mirror_dir`, #2578), hindsight's
+   * creds dir `/run/claude-creds` is backed by the shared named volume
+   * `consumer-creds-hindsight` instead of a private tmpfs, so the broker's
+   * push-failover writes reach it immediately. Absent ⇒ tmpfs, pull-only
+   * (unchanged pre-#2578 behavior). The value itself is the broker-side
+   * path; the consumer-side mount path is always HINDSIGHT_CRED_DIR.
+   */
+  mirrorDir?: string,
 ): void {
   const apiPort = ports?.apiPort ?? HINDSIGHT_DEFAULT_API_PORT;
   const uiPort = ports?.uiPort ?? HINDSIGHT_DEFAULT_UI_PORT;
@@ -842,18 +891,45 @@ export function startHindsight(
     // the declared consumer UID); inside this container the socket is
     // visible at /run/switchroom/auth-broker/sock.
     "-v", `${HINDSIGHT_BROKER_SOCK_VOLUME}:/run/switchroom/auth-broker`,
-    // Tmpfs for the dotfile written by the entrypoint shim. Lives in RAM
-    // only — the broker remains the single writer of OAuth state on disk.
-    // `uid=` + `gid=` are required because the image's `USER hindsight`
-    // (UID 11000, pinned in Dockerfile.hindsight) runs the entrypoint;
-    // without explicit ownership, tmpfs mounts root-owned and the
-    // entrypoint's `chmod 0700` fails EACCES → restart-loop.
-    "--tmpfs", `/run/claude-creds:rw,mode=0700,uid=${HINDSIGHT_DEFAULT_UID},gid=${HINDSIGHT_DEFAULT_UID}`,
+    // Creds dir. Two modes:
+    //  - mirror OFF (default): a private tmpfs, RAM-only, pull-only. `uid=`
+    //    + `gid=` are required because the image's `USER hindsight` (UID
+    //    11000, pinned in Dockerfile.hindsight) runs the entrypoint;
+    //    without explicit ownership tmpfs mounts root-owned and the
+    //    entrypoint's `chmod 0700` fails EACCES → restart-loop.
+    //  - mirror ON (#2578): the shared named volume the broker also mounts
+    //    at `mirror_dir`, so push-failover creds land here immediately.
+    //    Emitted below with the rest of args (needs the -v flag form).
+    ...(mirrorDir
+      ? ["-v", `${HINDSIGHT_CREDS_MIRROR_VOLUME}:${HINDSIGHT_CRED_DIR}`]
+      : ["--tmpfs", `${HINDSIGHT_CRED_DIR}:rw,mode=0700,uid=${HINDSIGHT_DEFAULT_UID},gid=${HINDSIGHT_DEFAULT_UID}`]),
     ...envArgs,
     // Pinned tag when a rollout target is threaded through; floating
     // `:latest` for the standalone `memory setup` path (imageTag undefined).
     hindsightImageRef(imageTag),
   );
+
+  // Mirror mode (#2578): a fresh named volume mounts root:root, but the
+  // entrypoint runs as UID 11000 and does `mkdir -p CRED_DIR; chmod 0700`
+  // → EACCES on a root-owned dir → crash-loop. Pre-chown the volume to the
+  // consumer UID with a throwaway root container (the hindsight image is
+  // already present locally). Idempotent + deterministic: safe to re-run
+  // on every start. No-op when mirror is off (tmpfs handles its own
+  // ownership via uid=/gid=).
+  if (mirrorDir) {
+    execFileSync(
+      "docker",
+      [
+        "run", "--rm", "--user", "0",
+        "-v", `${HINDSIGHT_CREDS_MIRROR_VOLUME}:${HINDSIGHT_CRED_DIR}`,
+        "--entrypoint", "sh",
+        hindsightImageRef(imageTag),
+        "-c",
+        `chown ${HINDSIGHT_DEFAULT_UID}:${HINDSIGHT_DEFAULT_UID} ${HINDSIGHT_CRED_DIR} && chmod 0700 ${HINDSIGHT_CRED_DIR}`,
+      ],
+      { stdio: "pipe" },
+    );
+  }
 
   execFileSync("docker", args, { stdio: "pipe" });
 }
@@ -1010,7 +1086,18 @@ export function getHindsightMcpUrl(): {
  * container chowns and binds the per-consumer socket inside it). The
  * hindsight compose project is separate; it consumes the volume.
  */
-export function generateHindsightComposeSnippet(llm?: HindsightLlmConfig): string {
+export function generateHindsightComposeSnippet(
+  llm?: HindsightLlmConfig,
+  /**
+   * The hindsight consumer's `mirror_dir` (#2578). When set, the creds dir
+   * is backed by the shared `consumer-creds-hindsight` volume (broker
+   * push-failover reaches hindsight immediately) instead of a private
+   * tmpfs, with a one-shot init service that chowns the fresh volume to the
+   * consumer UID before hindsight starts. Absent ⇒ tmpfs, pull-only —
+   * output identical to pre-#2578.
+   */
+  mirrorDir?: string,
+): string {
   const { provider: llmProvider, model: llmModel } = resolveHindsightLlm(llm);
   const perOpLlm = resolveHindsightPerOpLlm(llm);
   const environment = [
@@ -1032,11 +1119,37 @@ export function generateHindsightComposeSnippet(llm?: HindsightLlmConfig): strin
     // moved-off API port to dodge the squatted-8888 → 502 dashboard bug.
     `      - HINDSIGHT_CP_DATAPLANE_API_URL=http://localhost:8888`,
   ];
+  // Mirror mode (#2578): a one-shot init service chowns the fresh shared
+  // creds volume to the consumer UID (a named volume mounts root:root, but
+  // hindsight's entrypoint runs as UID 11000 and would EACCES on its
+  // `chmod 0700` → crash-loop). Hindsight then depends_on it completing.
+  const initService = mirrorDir
+    ? [
+        "  switchroom-hindsight-creds-init:",
+        `    image: ${HINDSIGHT_IMAGE}`,
+        "    container_name: switchroom-hindsight-creds-init",
+        "    user: \"0\"",
+        "    entrypoint: [\"sh\", \"-c\"]",
+        `    command: ["chown ${HINDSIGHT_DEFAULT_UID}:${HINDSIGHT_DEFAULT_UID} ${HINDSIGHT_CRED_DIR} && chmod 0700 ${HINDSIGHT_CRED_DIR}"]`,
+        "    volumes:",
+        `      - ${HINDSIGHT_CREDS_MIRROR_VOLUME}:${HINDSIGHT_CRED_DIR}`,
+        "    restart: \"no\"",
+      ]
+    : [];
+  const dependsOn = mirrorDir
+    ? [
+        "    depends_on:",
+        "      switchroom-hindsight-creds-init:",
+        "        condition: service_completed_successfully",
+      ]
+    : [];
   return [
     "services:",
+    ...initService,
     "  switchroom-hindsight:",
     `    image: ${HINDSIGHT_IMAGE}`,
     "    container_name: switchroom-hindsight",
+    ...dependsOn,
     "    ports:",
     // Host side 18888/19999 → container 8888/9999. The host port MUST match
     // HINDSIGHT_DEFAULT_API_PORT / the scaffolded memory.config.url or agents
@@ -1077,8 +1190,14 @@ export function generateHindsightComposeSnippet(llm?: HindsightLlmConfig): strin
     // volume is lost/corrupted. Written by the entrypoint maintenance loop.
     "      - switchroom-hindsight-backups:/backups",
     `      - ${HINDSIGHT_BROKER_SOCK_VOLUME}:/run/switchroom/auth-broker`,
-    "    tmpfs:",
-    `      - /run/claude-creds:rw,mode=0700,uid=${HINDSIGHT_DEFAULT_UID},gid=${HINDSIGHT_DEFAULT_UID}`,
+    // Creds dir: mirror ON → shared volume (broker push-failover reaches
+    // hindsight immediately); mirror OFF → private tmpfs (pull-only).
+    ...(mirrorDir
+      ? [`      - ${HINDSIGHT_CREDS_MIRROR_VOLUME}:${HINDSIGHT_CRED_DIR}`]
+      : [
+          "    tmpfs:",
+          `      - ${HINDSIGHT_CRED_DIR}:rw,mode=0700,uid=${HINDSIGHT_DEFAULT_UID},gid=${HINDSIGHT_DEFAULT_UID}`,
+        ]),
     "    restart: always",
     "",
     "volumes:",
@@ -1089,6 +1208,17 @@ export function generateHindsightComposeSnippet(llm?: HindsightLlmConfig): strin
     "    # Bound by the switchroom-auth-broker singleton in the main",
     "    # switchroom compose project. Declare an `auth.consumers[]`",
     `    # entry named "${HINDSIGHT_CONSUMER_NAME}" in switchroom.yaml.`,
+    // Shared creds-mirror volume (#2578) — external because the broker in
+    // the main switchroom compose project owns/mounts it at `mirror_dir`.
+    ...(mirrorDir
+      ? [
+          `  ${HINDSIGHT_CREDS_MIRROR_VOLUME}:`,
+          "    external: true",
+          "    # Mounted by switchroom-auth-broker at the consumer's",
+          `    # \`mirror_dir\`. Set \`mirror_dir\` on the "${HINDSIGHT_CONSUMER_NAME}"`,
+          "    # auth.consumers[] entry in switchroom.yaml + `apply`.",
+        ]
+      : []),
   ].join("\n");
 }
 
