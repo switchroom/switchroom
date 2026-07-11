@@ -16,6 +16,11 @@ import {
   wrapAgentCallbacks,
   parseAgentCallback,
   validateAndWrapAgentKeyboard,
+  extractAgentButtonMeta,
+  buildButtonConfirmation,
+  resolveTapAnnotation,
+  escapeHtmlEntities,
+  applyTapAnnotationEdit,
 } from '../inline-keyboard-callbacks.js'
 
 describe('inline-keyboard-callbacks (#271)', () => {
@@ -145,6 +150,285 @@ describe('inline-keyboard-callbacks (#271)', () => {
         expect(result.errors.length).toBeGreaterThan(0)
         expect(result.errors[0]!.field).toBe('text')
       }
+    })
+  })
+
+  // ─── #789 button-choice-confirmation ("✅ You chose: X") ────────────────
+  describe('inline_keyboard_confirm meta plumbing (#789)', () => {
+    it('captures inline_keyboard_confirm into the per-button meta map', () => {
+      const meta = extractAgentButtonMeta([
+        [{ text: 'Approve', callback_data: 'ok', inline_keyboard_confirm: true }],
+        [{ text: 'Hold', callback_data: 'hold', inline_keyboard_confirm: false }],
+      ])
+      expect(meta.get('ok')).toEqual({ inline_keyboard_confirm: true })
+      expect(meta.get('hold')).toEqual({ inline_keyboard_confirm: false })
+    })
+
+    it('strips inline_keyboard_confirm from the wrapped Telegram payload', () => {
+      const wrapped = wrapAgentCallbacks([
+        [{ text: 'Approve', callback_data: 'ok', inline_keyboard_confirm: true }],
+      ])
+      expect(wrapped[0]![0]).toEqual({ text: 'Approve', callback_data: 'agent:ok' })
+      expect('inline_keyboard_confirm' in wrapped[0]![0]!).toBe(false)
+    })
+  })
+
+  describe('buildButtonConfirmation (#789)', () => {
+    // Fixed clock: 14:05 local. Use a UTC-explicit date and read via the
+    // matching timezone accessor so the assertion is host-TZ independent.
+    const fixedUtc = new Date('2026-07-11T14:05:00Z')
+
+    it('renders the default template with a bold, escaped label + HH:MM (utc)', () => {
+      const line = buildButtonConfirmation({
+        template: '✅ You chose: {label} · {time}',
+        label: 'Approve',
+        timezone: 'utc',
+        escapeLabel: (s) => s,
+        now: fixedUtc,
+      })
+      expect(line).toBe('✅ You chose: <b>Approve</b> · 14:05')
+    })
+
+    it('collapses newlines in the label to a single line', () => {
+      const line = buildButtonConfirmation({
+        template: '✅ You chose: {label} · {time}',
+        label: 'Line one\nLine two',
+        timezone: 'utc',
+        escapeLabel: (s) => s,
+        now: fixedUtc,
+      })
+      expect(line).toBe('✅ You chose: <b>Line one Line two</b> · 14:05')
+      expect(line).not.toContain('\n')
+    })
+
+    it('trims a long label to 60 chars and applies the injected escaper', () => {
+      const line = buildButtonConfirmation({
+        template: '{label}',
+        label: 'x'.repeat(80),
+        timezone: 'utc',
+        escapeLabel: (s) => `[esc:${s.length}]`,
+        now: fixedUtc,
+      })
+      expect(line).toBe('<b>[esc:60]</b>')
+    })
+  })
+
+  describe('resolveTapAnnotation (#789)', () => {
+    const escapeLabel = (s: string) => s
+    const now = new Date('2026-07-11T09:30:00Z')
+    const base = {
+      escapeLabel,
+      now,
+      parseMode: 'html' as const,
+      singleUse: true,
+      sourceText: 'Deploy to prod?',
+      label: 'Approve',
+    }
+
+    it('annotates when the agent default is ON and the keyboard is single-use', () => {
+      const r = resolveTapAnnotation({
+        ...base,
+        config: { enabled: true, timezone: 'utc' },
+      })
+      expect(r.annotate).toBe(true)
+      expect(r.text).toBe('Deploy to prod?\n\n✅ You chose: <b>Approve</b> · 09:30')
+      expect(r.warnParseMode).toBe(false)
+      expect(r.warnSingleUseMismatch).toBe(false)
+    })
+
+    it('per-message inline_keyboard_confirm:false overrides an ON agent default', () => {
+      const r = resolveTapAnnotation({
+        ...base,
+        config: { enabled: true, timezone: 'utc' },
+        perMessageOverride: false,
+      })
+      expect(r.annotate).toBe(false)
+      expect(r.text).toBeUndefined()
+      expect(r.warnParseMode).toBe(false)
+    })
+
+    it('per-message inline_keyboard_confirm:true fires even when the default is OFF', () => {
+      const r = resolveTapAnnotation({
+        ...base,
+        config: { enabled: false, timezone: 'utc' },
+        perMessageOverride: true,
+      })
+      expect(r.annotate).toBe(true)
+      expect(r.text).toBe('Deploy to prod?\n\n✅ You chose: <b>Approve</b> · 09:30')
+    })
+
+    it('replaces (not duplicates) a prior annotation on retap', () => {
+      const priorBody = 'Deploy to prod?\n\n✅ You chose: <b>Hold</b> · 08:15'
+      const r = resolveTapAnnotation({
+        ...base,
+        sourceText: priorBody,
+        config: { enabled: true, timezone: 'utc' },
+      })
+      expect(r.annotate).toBe(true)
+      expect(r.text).toBe('Deploy to prod?\n\n✅ You chose: <b>Approve</b> · 09:30')
+      // Exactly one confirmation line survives.
+      expect((r.text!.match(/✅ You chose:/g) ?? []).length).toBe(1)
+    })
+
+    it('strips a prior annotation whose label carried a stray newline (dotAll)', () => {
+      const priorBody = 'Deploy to prod?\n\n✅ You chose: <b>Hold\nnow</b> · 08:15'
+      const r = resolveTapAnnotation({
+        ...base,
+        sourceText: priorBody,
+        config: { enabled: true, timezone: 'utc' },
+      })
+      expect(r.text).toBe('Deploy to prod?\n\n✅ You chose: <b>Approve</b> · 09:30')
+    })
+
+    it('skips annotation + flags parseMode warning on a non-html parse mode', () => {
+      const r = resolveTapAnnotation({
+        ...base,
+        parseMode: 'markdownv2',
+        config: { enabled: true, timezone: 'utc' },
+      })
+      expect(r.annotate).toBe(false)
+      expect(r.warnParseMode).toBe(true)
+    })
+
+    it('never annotates a re-tappable (single_use:false) keyboard, flags mismatch', () => {
+      const r = resolveTapAnnotation({
+        ...base,
+        singleUse: false,
+        config: { enabled: true, timezone: 'utc' },
+      })
+      expect(r.annotate).toBe(false)
+      expect(r.warnSingleUseMismatch).toBe(true)
+      // No parseMode warning — we bail on single-use before the parse gate.
+      expect(r.warnParseMode).toBe(false)
+    })
+
+    it('skips annotation when the source message has no text (caption-only)', () => {
+      const r = resolveTapAnnotation({
+        ...base,
+        sourceText: undefined,
+        config: { enabled: true, timezone: 'utc' },
+      })
+      expect(r.annotate).toBe(false)
+      expect(r.warnParseMode).toBe(false)
+    })
+  })
+
+  // ─── real HTML-entity escaping (#789 round-2 blocker) ────────────────────
+  describe('escapeHtmlEntities + real-escaper wiring (#789)', () => {
+    const now = new Date('2026-07-11T09:30:00Z')
+
+    it('escapes exactly &, <, > — and nothing else (no markdown garbling)', () => {
+      expect(escapeHtmlEntities('a & b < c > d')).toBe('a &amp; b &lt; c &gt; d')
+      // The GFM escaper would turn Do_it into Do\_it; the HTML escaper must not.
+      expect(escapeHtmlEntities('Do_it `now` *bold*')).toBe('Do_it `now` *bold*')
+      // & first: no double-escaping of produced entities.
+      expect(escapeHtmlEntities('&lt;')).toBe('&amp;lt;')
+    })
+
+    it('is the DEFAULT escaper: labels with & < > render Telegram-parseable HTML', () => {
+      const line = buildButtonConfirmation({
+        template: '✅ You chose: {label} · {time}',
+        label: 'Yes & <no>',
+        timezone: 'utc',
+        now,
+      })
+      expect(line).toBe('✅ You chose: <b>Yes &amp; &lt;no&gt;</b> · 09:30')
+    })
+
+    it('escapes the BASE source text too, not just the label', () => {
+      const r = resolveTapAnnotation({
+        parseMode: 'html',
+        singleUse: true,
+        sourceText: 'Deploy <feature/x> & friends?',
+        label: 'Approve',
+        config: { enabled: true, timezone: 'utc' },
+        now,
+      })
+      expect(r.annotate).toBe(true)
+      expect(r.text).toBe(
+        'Deploy &lt;feature/x&gt; &amp; friends?\n\n✅ You chose: <b>Approve</b> · 09:30',
+      )
+      // Only the tags WE emit remain — no raw user-supplied angle brackets.
+      expect(r.text!.replace(/<\/?b>/g, '')).not.toMatch(/[<>]/)
+    })
+
+    it('retap dedup matches the annotation as Telegram returns it (plain text, no <b> tags)', () => {
+      // Telegram's message.text is plain text — entities are separate — so a
+      // real retap sees the prior line WITHOUT tags.
+      const r = resolveTapAnnotation({
+        parseMode: 'html',
+        singleUse: true,
+        sourceText: 'Deploy to prod?\n\n✅ You chose: Hold · 08:15',
+        label: 'Approve',
+        config: { enabled: true, timezone: 'utc' },
+        now,
+      })
+      expect(r.text).toBe('Deploy to prod?\n\n✅ You chose: <b>Approve</b> · 09:30')
+      expect((r.text!.match(/✅ You chose:/g) ?? []).length).toBe(1)
+    })
+
+    it('String.replace special patterns ($&, $\') in labels are inert', () => {
+      const line = buildButtonConfirmation({
+        template: '✅ You chose: {label} · {time}',
+        label: "$& $' $` $1",
+        timezone: 'utc',
+        now,
+      })
+      expect(line).toBe("✅ You chose: <b>$&amp; $' $` $1</b> · 09:30")
+    })
+  })
+
+  // ─── keyboard-strip fallback when the annotate edit rejects (#789) ───────
+  describe('applyTapAnnotationEdit (#789)', () => {
+    it('annotates via a single editMessageText call on success', async () => {
+      const calls: string[] = []
+      const outcome = await applyTapAnnotationEdit(
+        {
+          editMessageText: async (text, other) => {
+            calls.push(`text:${text}:${other.parse_mode}`)
+            expect(other.reply_markup).toEqual({ inline_keyboard: [] })
+          },
+          editMessageReplyMarkup: async () => {
+            calls.push('markup')
+          },
+        },
+        'body\n\n✅ You chose: <b>Approve</b> · 09:30',
+      )
+      expect(outcome).toBe('annotated')
+      expect(calls).toEqual(['text:body\n\n✅ You chose: <b>Approve</b> · 09:30:HTML'])
+    })
+
+    it('strips the keyboard via editMessageReplyMarkup when the edit rejects', async () => {
+      const calls: unknown[] = []
+      const outcome = await applyTapAnnotationEdit(
+        {
+          editMessageText: async () => {
+            throw new Error('400: Bad Request: can\'t parse entities')
+          },
+          editMessageReplyMarkup: async other => {
+            calls.push(other)
+          },
+        },
+        'whatever',
+      )
+      expect(outcome).toBe('stripped-fallback')
+      // Single-use protection held: the keyboard WAS stripped.
+      expect(calls).toEqual([{ reply_markup: { inline_keyboard: [] } }])
+    })
+
+    it('reports failed (without throwing) when both edits reject', async () => {
+      const outcome = await applyTapAnnotationEdit(
+        {
+          editMessageText: async () => {
+            throw new Error('400')
+          },
+          editMessageReplyMarkup: async () => {
+            throw new Error('400')
+          },
+        },
+        'whatever',
+      )
+      expect(outcome).toBe('failed')
     })
   })
 })

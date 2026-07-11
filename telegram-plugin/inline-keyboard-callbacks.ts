@@ -60,10 +60,25 @@ export interface AgentButtonMeta {
    * removes the entire keyboard to prevent double-fire.
    */
   single_use?: boolean
+  /**
+   * Per-message override for the button-choice-confirmation annotation
+   * (#789). When true, tapping annotates the source message body with a
+   * "✅ You chose: <label> · HH:MM" line even if the agent default is off;
+   * when false, annotation is skipped even if the agent default is on.
+   * Undefined falls back to the agent's
+   * channels.telegram.button_choice_confirmation.enabled default. Only takes
+   * effect on single-use keyboards (re-tappable keyboards are never
+   * annotated).
+   */
+  inline_keyboard_confirm?: boolean
 }
 
 /** Fields the gateway adds to button objects — not valid Telegram API fields. */
-const AGENT_META_FIELDS: ReadonlyArray<keyof AgentButtonMeta> = ['ack_text', 'single_use']
+const AGENT_META_FIELDS: ReadonlyArray<keyof AgentButtonMeta> = [
+  'ack_text',
+  'single_use',
+  'inline_keyboard_confirm',
+]
 
 /**
  * Wrap every callback_data field in a 2D inline-keyboard with the
@@ -116,7 +131,14 @@ export function extractAgentButtonMeta(
       const meta: AgentButtonMeta = {}
       if (typeof btn.ack_text === 'string') meta.ack_text = btn.ack_text
       if (typeof btn.single_use === 'boolean') meta.single_use = btn.single_use
-      if (meta.ack_text != null || meta.single_use != null) {
+      if (typeof btn.inline_keyboard_confirm === 'boolean') {
+        meta.inline_keyboard_confirm = btn.inline_keyboard_confirm
+      }
+      if (
+        meta.ack_text != null ||
+        meta.single_use != null ||
+        meta.inline_keyboard_confirm != null
+      ) {
         out.set(btn.callback_data, meta)
       }
     }
@@ -147,6 +169,191 @@ export function keyboardIsSingleUse(
 export function parseAgentCallback(data: string): { raw: string } | null {
   if (!data.startsWith(AGENT_CALLBACK_PREFIX)) return null
   return { raw: data.slice(AGENT_CALLBACK_PREFIX.length) }
+}
+
+// ─── #789 button-choice-confirmation ("✅ You chose: X") ──────────────────
+//
+// When a user taps an agent-emitted single-use inline_keyboard button, the
+// gateway can annotate the source message body with a
+// "✅ You chose: <label> · HH:MM" line so the chat surface is
+// self-documenting (mirrors the ask_user finalize UX). The DECISION and the
+// rendered text are pure functions here so they can be unit-tested against
+// the exact payload the gateway ships — the gateway owns only the Telegram
+// I/O and the once-per-process warning dedupe.
+
+/** Per-agent button-choice-confirmation config (projected into access.json). */
+export interface ButtonChoiceConfirmationConfig {
+  enabled?: boolean
+  format?: string
+  timezone?: 'gateway' | 'utc'
+}
+
+/** Default annotation template. `{label}` and `{time}` are substituted. */
+export const BUTTON_CONFIRM_DEFAULT_FORMAT = '✅ You chose: {label} · {time}'
+
+/**
+ * HTML-entity escaper for the annotation payload (shipped with
+ * parse_mode: 'HTML'). Escapes exactly the three characters Telegram's HTML
+ * parser treats specially — `&`, `<`, `>` — so arbitrary button labels and
+ * source-message text can never 400 the editMessageText call. `&` is escaped
+ * first so freshly produced entities aren't double-escaped. This is NOT the
+ * GFM-markdown escaper (#2669) — that one escapes backticks/underscores and
+ * would garble text (`Do_it` → `Do\_it`) under HTML parse mode.
+ */
+export function escapeHtmlEntities(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+/**
+ * Dedup-strip regex: matches a prior DEFAULT-shape annotation appended to the
+ * body so a retap replaces rather than duplicates it. The `<b>`/`</b>` tags
+ * are optional because Telegram returns `message.text` as PLAIN text (entity
+ * markup lives in `message.entities`, not in the text) — on a real retap the
+ * prior annotation arrives without tags. The `s` (dotAll) flag tolerates a
+ * stray newline inside an older, un-stripped label (belt-and-braces alongside
+ * the newline-stripping applied to the label on the way in). NOTE: dedup only
+ * recognizes the DEFAULT annotation shape — a custom
+ * button_choice_confirmation.format that diverges from it accumulates one
+ * line per retap instead of replacing.
+ */
+export const BUTTON_CONFIRM_STRIP_RE =
+  /\n\n✅ You chose: (?:<b>)?.*(?:<\/b>)? · \d{2}:\d{2}$/s
+
+/**
+ * Build the confirmation line. `{label}` → the tapped button's text with
+ * newlines collapsed to spaces, trimmed to 60 chars (mirrors the toast trim),
+ * HTML-entity-escaped (`&`, `<`, `>`) and wrapped in `<b>`; `{time}` →
+ * HH:MM in the chosen timezone. `now`/`escapeLabel` are injectable for
+ * deterministic tests; `escapeLabel` defaults to the real
+ * {@link escapeHtmlEntities}. Substitutions use replacer FUNCTIONS so
+ * String.replace special patterns (`$&`, `$'`, …) in labels are inert.
+ */
+export function buildButtonConfirmation(args: {
+  template: string
+  label: string
+  timezone: 'gateway' | 'utc'
+  escapeLabel?: (s: string) => string
+  now?: Date
+}): string {
+  const escape = args.escapeLabel ?? escapeHtmlEntities
+  const cleanLabel = args.label.replace(/\n/g, ' ').slice(0, 60)
+  const now = args.now ?? new Date()
+  const hh = args.timezone === 'utc'
+    ? String(now.getUTCHours()).padStart(2, '0')
+    : String(now.getHours()).padStart(2, '0')
+  const mm = args.timezone === 'utc'
+    ? String(now.getUTCMinutes()).padStart(2, '0')
+    : String(now.getMinutes()).padStart(2, '0')
+  return args.template
+    .replace('{label}', () => `<b>${escape(cleanLabel)}</b>`)
+    .replace('{time}', () => `${hh}:${mm}`)
+}
+
+/** Outcome of the annotate-or-strip decision for a single tap. */
+export interface TapAnnotationResult {
+  /** True → gateway should editMessageText with `text` (and strip keyboard). */
+  annotate: boolean
+  /** Annotated body text, present iff `annotate` is true. */
+  text?: string
+  /** True → gateway should emit the once-per-process parseMode warning. */
+  warnParseMode: boolean
+  /** True → gateway should emit the once-per-process single_use-mismatch warning. */
+  warnSingleUseMismatch: boolean
+}
+
+/**
+ * Pure decision for the #789 annotation. Resolves the per-message override
+ * (the tapped button's `inline_keyboard_confirm`) over the agent default,
+ * gates on single-use + presence of body text + a resolvable label + the
+ * `html` parse mode, and renders the annotated body (with any prior
+ * default-shape annotation stripped so a retap replaces it). Returns
+ * `annotate:false` for every skip path; the caller still performs the
+ * historical keyboard-only strip when the keyboard is single-use.
+ *
+ * The base body is HTML-entity-escaped too (Telegram hands us `message.text`
+ * as plain text, so `&`/`<`/`>` in it would otherwise 400 the HTML edit).
+ * Known limitation: because the body is rebuilt from `message.text`, any
+ * entities/formatting (bold, links, …) on the original message are lost on
+ * annotation. Documented in the config schema + CHANGELOG.
+ */
+export function resolveTapAnnotation(args: {
+  perMessageOverride?: boolean
+  singleUse: boolean
+  config?: ButtonChoiceConfirmationConfig
+  parseMode: 'html' | 'markdownv2' | 'text'
+  sourceText?: string
+  label?: string
+  escapeLabel?: (s: string) => string
+  now?: Date
+}): TapAnnotationResult {
+  const shouldAnnotate = args.perMessageOverride ?? args.config?.enabled ?? false
+  const warnSingleUseMismatch = shouldAnnotate && !args.singleUse
+
+  const wantAnnotate =
+    shouldAnnotate &&
+    args.singleUse &&
+    args.sourceText != null &&
+    args.label != null
+  if (!wantAnnotate) {
+    return { annotate: false, warnParseMode: false, warnSingleUseMismatch }
+  }
+  if (args.parseMode !== 'html') {
+    return { annotate: false, warnParseMode: true, warnSingleUseMismatch }
+  }
+  const escape = args.escapeLabel ?? escapeHtmlEntities
+  // Strip a prior annotation from the RAW text first (Telegram delivers it
+  // un-tagged), then entity-escape the remainder for the HTML edit.
+  const base = escape(
+    (args.sourceText as string).replace(BUTTON_CONFIRM_STRIP_RE, ''),
+  )
+  const formatted = buildButtonConfirmation({
+    template: args.config?.format ?? BUTTON_CONFIRM_DEFAULT_FORMAT,
+    label: args.label as string,
+    timezone: args.config?.timezone ?? 'gateway',
+    escapeLabel: escape,
+    ...(args.now != null ? { now: args.now } : {}),
+  })
+  return {
+    annotate: true,
+    text: `${base}\n\n${formatted}`,
+    warnParseMode: false,
+    warnSingleUseMismatch,
+  }
+}
+
+/**
+ * Perform the annotation edit against Telegram, with a keyboard-strip
+ * fallback: if the editMessageText 400s/rejects for ANY reason (over-long
+ * body, HTML edge case, message too old, …), we still strip the inline
+ * keyboard via editMessageReplyMarkup so single-use protection holds even
+ * though the button meta has already been consumed. Extracted here (with the
+ * two Telegram calls injected) so the fallback is unit-testable.
+ *
+ * Returns 'annotated' | 'stripped-fallback' | 'failed' for observability.
+ */
+export async function applyTapAnnotationEdit(io: {
+  editMessageText: (text: string, other: {
+    parse_mode: 'HTML'
+    reply_markup: { inline_keyboard: never[] }
+  }) => Promise<unknown>
+  editMessageReplyMarkup: (other: {
+    reply_markup: { inline_keyboard: never[] }
+  }) => Promise<unknown>
+}, text: string): Promise<'annotated' | 'stripped-fallback' | 'failed'> {
+  try {
+    await io.editMessageText(text, {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [] },
+    })
+    return 'annotated'
+  } catch {
+    try {
+      await io.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } })
+      return 'stripped-fallback'
+    } catch {
+      return 'failed'
+    }
+  }
 }
 
 /**

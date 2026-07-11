@@ -1356,6 +1356,46 @@ export const TelegramChannelSchema = z
         "mid-tool-call. Off by default (fire immediately). Cascades from " +
         "defaults.channels.telegram.interrupt."
       ),
+    button_choice_confirmation: z
+      .object({
+        enabled: z
+          .boolean()
+          .default(false)
+          .describe(
+            "When true, tapping an agent-emitted inline_keyboard button annotates " +
+            "the source message body with a '✅ You chose: <label> · HH:MM' line so " +
+            "the chat surface is self-documenting. Only applies to single-use " +
+            "keyboards (re-tappable keyboards are never annotated). Requires the " +
+            "agent's parseMode to be the default 'html'. Opt-in (default false). " +
+            "Limitation: the annotated body is rebuilt from the message's plain " +
+            "text, so any formatting entities (bold, links, code, ...) on the " +
+            "original message are lost when the annotation is applied."
+          ),
+        format: z
+          .string()
+          .default("✅ You chose: {label} · {time}")
+          .describe(
+            "Template for the annotation line. `{label}` is replaced with the " +
+            "tapped button's text (newlines stripped, HTML-escaped, trimmed to 60 " +
+            "chars) and `{time}` with HH:MM in the chosen timezone. Note: retap " +
+            "dedup (replacing a prior annotation instead of appending another " +
+            "line) only recognizes the DEFAULT format shape — a custom format " +
+            "accumulates one line per retap."
+          ),
+        timezone: z
+          .enum(["gateway", "utc"])
+          .default("gateway")
+          .describe(
+            "Timezone for the {time} placeholder. 'gateway' uses the gateway " +
+            "process's local time; 'utc' uses UTC. Per-user timezones are out of " +
+            "scope for v1."
+          ),
+      })
+      .optional()
+      .describe(
+        "Auto-confirm 'You chose: X' annotation on inline_keyboard taps (#789). " +
+        "Cascades from defaults.channels.telegram.button_choice_confirmation."
+      ),
     webhook_sources: z
       .array(z.enum(["github", "generic", "linear"]))
       .optional()
