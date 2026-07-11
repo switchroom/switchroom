@@ -29,7 +29,7 @@ import { createHash } from 'crypto'
 import { AsyncLocalStorage } from 'async_hooks'
 import { clearStaleTelegramPollingState } from '../startup-reset.js'
 import { createRetryApiCall } from '../retry-api-call.js'
-import { makeFloodWaitRecorder } from '../flood-circuit-breaker.js'
+import { makeFloodWaitRecorder, makeFloodWaitProbe } from '../flood-circuit-breaker.js'
 import { RICH_MESSAGE_MAX_CHARS } from '../format.js'
 
 // ─── tg-post tag plumbing ─────────────────────────────────────────────────
@@ -156,8 +156,14 @@ export function createRobustApiCall(opts: { floodStatePath?: string } = {}) {
     // #2923: persist every observed 429 flood-wait window so a restart during
     // the ban can suppress non-essential sends (boot cards) instead of feeding
     // the per-bot flood counter and prolonging the ban.
+    // #3084: and refuse to issue a call while that window is still open —
+    // otherwise the card heartbeats re-drive a request into the ban every
+    // few seconds once the policy stops sleeping long waits.
     ...(opts.floodStatePath
-      ? { onFloodWait: makeFloodWaitRecorder(opts.floodStatePath) }
+      ? {
+          onFloodWait: makeFloodWaitRecorder(opts.floodStatePath),
+          floodWaitRemainingMs: makeFloodWaitProbe(opts.floodStatePath),
+        }
       : {}),
   })
 }

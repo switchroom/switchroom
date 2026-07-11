@@ -189,7 +189,11 @@ import {
 } from '../retry-api-call.js'
 import { classifyPhotoFile, rerouteResultSuffix } from '../photo-precheck.js'
 import { installTgPostLogger, withTgPostTags } from '../shared/bot-runtime.js'
-import { floodStatePath, makeFloodWaitRecorder } from '../flood-circuit-breaker.js'
+import {
+  floodStatePath,
+  makeFloodWaitRecorder,
+  makeFloodWaitProbe,
+} from '../flood-circuit-breaker.js'
 import { buildAttachmentPath, assertInsideInbox } from '../attachment-path.js'
 import { logStreamingEvent } from '../streaming-metrics.js'
 import * as signalTracker from '../turn-signal-tracker.js'
@@ -5423,6 +5427,12 @@ const FLOOD_STATE_PATH = floodStatePath(STATE_DIR)
 const robustApiCall = createRetryApiCall({
   log: (line) => process.stderr.write(line),
   onFloodWait: makeFloodWaitRecorder(FLOOD_STATE_PATH),
+  // #3084: while a LONG per-bot ban is open, don't issue the call at all.
+  // retryApiCall no longer sleeps a multi-hour retry_after (it throws
+  // FLOOD_WAIT_ACTIVE instead), and the card surfaces re-drive on a 5-6s
+  // heartbeat — without this gate that turns the fix into an amplifier that
+  // fires thousands of requests into the open window and extends the ban.
+  floodWaitRemainingMs: makeFloodWaitProbe(FLOOD_STATE_PATH),
 })
 
 // Fire-and-forget wrapper for outbound surfaces that previously had

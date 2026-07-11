@@ -15,6 +15,8 @@ import {
   createSwallowingRetryApiCall,
   retryWithThreadFallback,
   isHtmlParseRejectError,
+  isMessageTooLongError,
+  isPhotoDimensionRejectError,
   isLocalResourceError,
   isFloodWaitActiveError,
   LOCAL_RESOURCE_EXHAUSTED,
@@ -781,5 +783,189 @@ describe('#3084 — a long flood ban fails FAST instead of sleeping for hours', 
 
     expect(out).toBeUndefined()
     expect(lines.join('')).toContain(FLOOD_WAIT_ACTIVE)
+  })
+})
+
+describe('#3084 — the fast throw must not become a re-drive amplifier', () => {
+  const REAL_BAN_SEC = 16_739
+
+  /**
+   * EXACT duck-type predicate used by the card surfaces to arm their 429
+   * cooldown — copied verbatim from `worker-activity-feed.ts`
+   * (`extractRetryAfterSecs`) and `issues-card.ts`. They do NOT use
+   * `instanceof GrammyError`. If the marker doesn't satisfy this, they
+   * classify it 'transient', arm no cooldown, and their 5-6s heartbeats
+   * re-drive the send into the open ban.
+   */
+  function extractRetryAfterSecs(err: unknown): number | null {
+    if (err == null || typeof err !== 'object') return null
+    const e = err as { error_code?: unknown; parameters?: { retry_after?: unknown } }
+    if (e.error_code !== 429) return null
+    const ra = e.parameters?.retry_after
+    if (typeof ra === 'number' && Number.isFinite(ra) && ra > 0) return ra
+    return null
+  }
+
+  it('the marker satisfies the card surfaces\' 429 cooldown duck-type', async () => {
+    const retry = createRetryApiCall({ maxRetries: 3, sleep: async () => {} })
+    const err = await retry(async () => {
+      throw errors.floodWait(REAL_BAN_SEC)
+    }).catch((e: unknown) => e)
+
+    // worker-activity-feed / issues-card would now arm a FULL-window cooldown
+    // instead of treating this as a generic 'transient' error.
+    expect(extractRetryAfterSecs(err)).toBe(REAL_BAN_SEC)
+  })
+
+  it('the marker is still NOT a GrammyError (resend-fallback probes must not match)', async () => {
+    const retry = createRetryApiCall({ maxRetries: 3, sleep: async () => {} })
+    const err = await retry(async () => {
+      throw errors.floodWait(REAL_BAN_SEC)
+    }).catch((e: unknown) => e)
+
+    expect(err).not.toBeInstanceOf(GrammyError)
+    expect(isHtmlParseRejectError(err)).toBe(false)
+    expect(isMessageTooLongError(err)).toBe(false)
+    expect(isPhotoDimensionRejectError(err)).toBe(false)
+  })
+
+  it('a card heartbeat ticking across the whole 4.6h ban issues ONE Bot API call', async () => {
+    // The regression that must be impossible. Before the pre-call gate: the
+    // marker throws in ~1ms, the 6s heartbeat re-drives, and we fire ~2,760
+    // fresh requests into the still-open per-bot ban — feeding the exact flood
+    // counter #2923 exists to starve. Strictly worse than the original hang.
+    let now = 1_000_000
+    let state: { untilTs: number } | null = null
+    let apiCalls = 0
+
+    const retry = createRetryApiCall({
+      maxRetries: 3,
+      sleep: async () => {},
+      // The #2923 breaker: record the window...
+      onFloodWait: (sec) => {
+        state = { untilTs: now + sec * 1000 }
+      },
+      // ...and the #3084 gate: refuse to send into it.
+      floodWaitRemainingMs: () => (state ? Math.max(0, state.untilTs - now) : 0),
+    })
+
+    const HEARTBEAT_MS = 6_000
+    const ticks = Math.ceil((REAL_BAN_SEC * 1000) / HEARTBEAT_MS) // ~2,790
+    let markerThrows = 0
+
+    for (let i = 0; i < ticks; i++) {
+      // A worker-feed style heartbeat: best-effort edit, swallow failures,
+      // and (deliberately, to model the WORST case) arm no cooldown of its own.
+      await retry(async () => {
+        apiCalls++
+        throw errors.floodWait(REAL_BAN_SEC)
+      }).catch((e: unknown) => {
+        if (isFloodWaitActiveError(e)) markerThrows++
+      })
+      now += HEARTBEAT_MS
+    }
+
+    expect(ticks).toBeGreaterThan(2_700) // we really did simulate the full ban
+    expect(markerThrows).toBe(ticks) // every tick got a clean degraded state
+    // …and the Bot API was touched a HANDFUL of times, not once per tick.
+    // Without the pre-call gate this is ~2,790 requests fired into an open
+    // per-bot ban. With it: the first tick (which discovers the ban) plus the
+    // few tail ticks that run after the simulated window has elapsed and
+    // legitimately re-probe. Bounded and small is the whole contract.
+    expect(apiCalls).toBeLessThanOrEqual(5)
+    expect(apiCalls).toBeGreaterThanOrEqual(1)
+    expect(apiCalls / ticks).toBeLessThan(0.01) // <1% of ticks reach the API
+  })
+
+  it('resumes issuing calls once the window expires (the gate is not a latch)', async () => {
+    let now = 1_000_000
+    let state: { untilTs: number } | null = null
+    let apiCalls = 0
+
+    const retry = createRetryApiCall({
+      maxRetries: 3,
+      sleep: async () => {},
+      onFloodWait: (sec) => {
+        state = { untilTs: now + sec * 1000 }
+      },
+      floodWaitRemainingMs: () => (state ? Math.max(0, state.untilTs - now) : 0),
+    })
+
+    await expect(
+      retry(async () => {
+        apiCalls++
+        throw errors.floodWait(300)
+      }),
+    ).rejects.toThrow(FLOOD_WAIT_ACTIVE)
+    expect(apiCalls).toBe(1)
+
+    // Mid-window: gated, no call.
+    now += 100_000
+    await expect(retry(async () => 'ok')).rejects.toThrow(FLOOD_WAIT_ACTIVE)
+    expect(apiCalls).toBe(1)
+
+    // Window expired: the very next call goes through and succeeds.
+    now += 300_000
+    expect(
+      await retry(async () => {
+        apiCalls++
+        return 'ok'
+      }),
+    ).toBe('ok')
+    expect(apiCalls).toBe(2)
+  })
+
+  it('a SHORT open window is not short-circuited (sleep-and-retry still rides it out)', async () => {
+    // A 30s window is under the ceiling: the normal path may still succeed
+    // (the server may have cleared it), so we must NOT gate it.
+    let apiCalls = 0
+    let n = 0
+    const retry = createRetryApiCall({
+      maxRetries: 3,
+      sleep: async () => {},
+      floodWaitRemainingMs: () => 30_000,
+    })
+    const out = await retry(async () => {
+      apiCalls++
+      if (n++ === 0) throw errors.floodWait(30)
+      return 'ok'
+    })
+    expect(out).toBe('ok')
+    expect(apiCalls).toBe(2)
+  })
+
+  it('FAILS OPEN — a throwing/garbage flood probe never silences the bot', async () => {
+    const throwing = createRetryApiCall({
+      maxRetries: 3,
+      sleep: async () => {},
+      floodWaitRemainingMs: () => {
+        throw new Error('EACCES: unreadable flood-wait.json')
+      },
+    })
+    expect(await throwing(async () => 'ok')).toBe('ok')
+
+    // Garbage from a corrupt marker file must be treated as "no window".
+    // Infinity in particular would otherwise mute the bot forever.
+    for (const garbage of [NaN, -1, 0, Infinity]) {
+      const retry = createRetryApiCall({
+        maxRetries: 3,
+        sleep: async () => {},
+        floodWaitRemainingMs: () => garbage,
+      })
+      expect(await retry(async () => 'ok')).toBe('ok')
+    }
+  })
+
+  it('with no flood probe wired at all, behaviour is exactly as before', async () => {
+    let apiCalls = 0
+    let n = 0
+    const retry = createRetryApiCall({ maxRetries: 3, sleep: async () => {} })
+    const out = await retry(async () => {
+      apiCalls++
+      if (n++ === 0) throw errors.floodWait(30)
+      return 'ok'
+    })
+    expect(out).toBe('ok')
+    expect(apiCalls).toBe(2)
   })
 })
