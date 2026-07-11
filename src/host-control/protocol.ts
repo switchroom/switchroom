@@ -440,6 +440,10 @@ export const CONFIG_PROPOSE_EDIT_ERROR_CODES = [
   "E_NO_APPROVAL_GATEWAY",
   "E_APPROVAL_TIMEOUT",
   "E_RECONCILE_FAILED_ROLLED_BACK",
+  // #3084 security audit — the live config drifted between propose-time
+  // validation and the (up to 60-min-delayed) operator approval, so the apply
+  // ABORTED under the mutex rather than silently revert the intervening change.
+  "E_CONFIG_CHANGED",
 ] as const;
 export type ConfigProposeEditErrorCode =
   (typeof CONFIG_PROPOSE_EDIT_ERROR_CODES)[number];

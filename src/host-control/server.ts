@@ -2480,12 +2480,28 @@ export class HostdServer {
     // pre-approval query below is async, so it MUST NOT sit between the dedupe
     // `get` above and this `set`, or two concurrent identicals could each post
     // a card.)
+    // #3084 security audit — pin the base the diff was validated against.
+    // config_propose_edit computes the whole-file post-image HERE, at
+    // propose-time, but the operator card can block up to 60 min before the
+    // apply runs. Any config change that lands during that window (a second
+    // approved proposal, an operator hand-edit) would be SILENTLY REVERTED if
+    // we wrote the stale post-image verbatim — including security fields like
+    // another agent's tools.allow or hostd.config_edit_enabled itself. Hash the
+    // live file NOW so the apply path (under the mutex) can detect drift and
+    // ABORT rather than clobber it.
+    let preImage: string;
+    try {
+      preImage = existsSync(configPath) ? readFileSync(configPath, "utf-8") : "";
+    } catch {
+      preImage = "";
+    }
+    const preImageSha = createHash("sha256").update(preImage).digest("hex");
     const run = this.runConfigProposeRateThenApply(
       req,
       caller,
       callerName,
       configPath,
-      verdict.postApplyContent,
+      preImageSha,
       started,
     );
     this.inflightConfigProposals.set(dedupeKey, run);
@@ -2509,7 +2525,7 @@ export class HostdServer {
     caller: SocketIdentity,
     callerName: string,
     configPath: string,
-    postApply: string,
+    preImageSha: string,
     started: number,
   ): Promise<HostdResponse> {
     // ── Pre-approval bypass (#2975 Stage 2) ─────────────────────────
@@ -2613,7 +2629,7 @@ export class HostdServer {
       caller,
       callerName,
       configPath,
-      postApply,
+      preImageSha,
       started,
     );
   }
@@ -2678,7 +2694,7 @@ export class HostdServer {
     caller: SocketIdentity,
     callerName: string,
     configPath: string,
-    postApply: string,
+    preImageSha: string,
     started: number,
   ): Promise<HostdResponse> {
     const approvalId = (this.opts.generateApprovalId ?? defaultApprovalId)();
@@ -2764,12 +2780,48 @@ export class HostdServer {
           started,
         );
       }
+      // ── #3084 security audit — re-validate under the lock (TOCTOU) ──
+      // The post-image was computed at propose-time against the base as it
+      // was THEN. The operator card can block up to 60 min, during which
+      // another approved proposal or an operator hand-edit may have changed
+      // the live file. Writing the stale whole-file post-image verbatim would
+      // SILENTLY REVERT that change (including security fields like another
+      // agent's tools.allow or hostd.config_edit_enabled). So, under the lock:
+      //   (1) pin the base by hash — abort if the live file drifted at all;
+      //   (2) re-apply the STORED diff to the CURRENT file and write THAT,
+      //       aborting if the diff no longer applies cleanly.
+      // The config is left untouched on abort (no bytes written yet) — the
+      // agent must re-propose against the new base.
+      const liveSha = createHash("sha256").update(snapshot).digest("hex");
+      const reverdict =
+        liveSha === preImageSha
+          ? validateConfigEdit({
+              configPath,
+              targetPath: req.args.target_path,
+              unifiedDiff: req.args.unified_diff,
+            })
+          : null;
+      if (liveSha !== preImageSha || reverdict === null || !reverdict.ok) {
+        const why =
+          liveSha !== preImageSha
+            ? "live config changed since the proposal was validated"
+            : `stored diff no longer applies against the current config` +
+              (reverdict && !reverdict.ok ? `: ${reverdict.detail}` : "");
+        await approval.finalize({
+          outcome: "reconcile_failed_rolled_back",
+          detail: `config changed since proposal — re-propose (${why})`,
+        });
+        return this.configChangedSinceProposal(why, req, caller, started);
+      }
+      // Fresh post-image = current live file + the stored diff (re-applied
+      // under the lock), never the propose-time whole-file snapshot.
+      const postApplyFresh = reverdict.postApplyContent;
       // In-place write preserving the inode (bind-mount safe). The old
       // `<path>.tmp` → rename() swap returned EBUSY here because
       // switchroom.yaml is itself a read-only bind-mount source mounted
       // into every agent container — see writeFileInPlacePreservingInode.
       try {
-        writeFileInPlacePreservingInode(configPath, postApply);
+        writeFileInPlacePreservingInode(configPath, postApplyFresh);
       } catch (e) {
         // Write failed before any bytes were flushed, OR mid-write. We
         // hold the snapshot, so restore it in place to be safe rather
@@ -2809,7 +2861,7 @@ export class HostdServer {
         // Tell the operator which agents must restart for this edit to go
         // live (claude loads config at boot — an applied edit is inert until
         // restart). Fails safe to fleet-wide on any ambiguity.
-        const blast = classifyBlastRadius(snapshot, postApply);
+        const blast = classifyBlastRadius(snapshot, postApplyFresh);
         await approval.finalize({
           outcome: "applied",
           affectedAgents: blast.agents,
@@ -2876,6 +2928,35 @@ export class HostdServer {
    * preserving the verbatim legacy `error` string so audit-reader /
    * existing string-match decoders see no regression.
    */
+  /**
+   * #3084 security audit — the live config drifted between propose-time
+   * validation and the (up to 60-min-delayed) operator approval, so the apply
+   * ABORTS rather than clobber the intervening change. Nothing was written; the
+   * live file is intact. Surfaced as a denial (policy outcome, not infra) with
+   * a re-propose hint, since the agent CAN self-recover by re-proposing against
+   * the new base.
+   */
+  private configChangedSinceProposal(
+    why: string,
+    req: Extract<HostdRequest, { op: "config_propose_edit" }>,
+    caller: SocketIdentity,
+    started: number,
+  ): HostdResponse {
+    const legacy = `E_CONFIG_CHANGED: config changed since proposal — re-propose (${why})`;
+    const built = err(
+      "E_CONFIG_CHANGED",
+      "config changed since the proposal was validated; re-propose against the current config",
+    )
+      .why(why)
+      .fixBadInput("unified_diff")
+      .op("config_propose_edit")
+      .caller(caller.kind === "agent" ? "agent" : "operator")
+      .agentName(caller.kind === "agent" ? caller.name : undefined)
+      .asDenied()
+      .build(req.request_id, Date.now() - started);
+    return { ...built, error: legacy };
+  }
+
   private reconcileFailedRolledBack(
     detail: string,
     req: Extract<HostdRequest, { op: "config_propose_edit" }>,
