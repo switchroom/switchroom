@@ -11,6 +11,7 @@
 import { describe, it, expect } from 'bun:test'
 import { GrammyError } from 'grammy'
 import { classifyRejection } from '../gateway/unhandled-rejection-policy.js'
+import { FLOOD_WAIT_ACTIVE } from '../retry-api-call.js'
 
 // ── Real GrammyError fixtures ──────────────────────────────────────────────
 
@@ -219,5 +220,24 @@ describe('classifyRejection — duck typing via injected detector', () => {
       isGrammyError: () => false,
     })
     expect(result).toBe('shutdown')
+  })
+})
+
+describe('classifyRejection — FLOOD_WAIT_ACTIVE marker (#3084)', () => {
+  // retry-api-call throws this instead of sleeping through a multi-hour per-bot
+  // flood ban (overlord logged retry_after = 16739s on 2026-07-11). It's a plain
+  // Error, not a GrammyError, so without an explicit entry it would fall into
+  // the `!isGrammy → shutdown` branch — a crash on rate-limiting, which fires
+  // MORE sends into the open window on reboot and extends the ban.
+  it('returns "log_only" for a leaked FLOOD_WAIT_ACTIVE marker', () => {
+    const err = Object.assign(new Error(FLOOD_WAIT_ACTIVE), {
+      retryAfterSec: 16739,
+      untilTs: Date.now() + 16739 * 1000,
+    })
+    expect(classifyRejection(err)).toBe('log_only')
+  })
+
+  it('still returns "shutdown" for an unrelated plain Error', () => {
+    expect(classifyRejection(new Error('FLOOD_WAIT_ACTIVE-ish but not it'))).toBe('shutdown')
   })
 })

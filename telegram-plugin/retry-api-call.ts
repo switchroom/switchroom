@@ -16,7 +16,8 @@
  *
  *   | Thrown error                                  | This wrapper does                          |
  *   |-----------------------------------------------|--------------------------------------------|
- *   | GrammyError 429                               | sleep retry_after seconds, retry          |
+ *   | GrammyError 429 (retry_after <= ceiling)      | sleep retry_after seconds, retry          |
+ *   | GrammyError 429 (retry_after >  ceiling)      | record window, throw `FLOOD_WAIT_ACTIVE`  |
  *   | GrammyError 400 "message is not modified"     | swallow, return undefined                 |
  *   | GrammyError 400 "message to edit not found"   | swallow, return undefined                 |
  *   | GrammyError 400 "message to delete not found" | swallow, return undefined                 |
@@ -57,6 +58,13 @@ export interface RetryObserver {
 export interface RetryApiCallConfig {
   /** Max retries before giving up. Defaults to 3. */
   maxRetries?: number
+  /**
+   * Ceiling (ms) on how long a single 429 flood-wait may be slept IN-PROCESS.
+   * A `retry_after` above this is not slept at all — the window is recorded and
+   * `FLOOD_WAIT_ACTIVE` is thrown instead (see #3084). Defaults to
+   * `DEFAULT_MAX_FLOOD_SLEEP_MS`.
+   */
+  maxFloodSleepMs?: number
   /** Sleep helper — injected so tests can use fake timers. */
   sleep?: (ms: number) => Promise<void>
   /** Optional observer hooks. */
@@ -105,6 +113,46 @@ export function isLocalResourceError(err: unknown): boolean {
  */
 export const LOCAL_RESOURCE_EXHAUSTED = 'LOCAL_RESOURCE_EXHAUSTED'
 
+/**
+ * Marker error thrown when Telegram's reported `retry_after` exceeds the
+ * in-process sleep ceiling (#3084) — i.e. the bot is under a LONG per-bot
+ * flood ban, not a momentary rate-limit blip.
+ *
+ * Carries `{ retryAfterSec, untilTs, original }` so a caller can render a
+ * useful degraded state ("rate-limited by Telegram until HH:MM") instead of
+ * being parked on an await for hours.
+ */
+export const FLOOD_WAIT_ACTIVE = 'FLOOD_WAIT_ACTIVE'
+
+/** Shape of the error thrown for an over-ceiling flood-wait. */
+export interface FloodWaitActiveError extends Error {
+  /** Telegram's reported retry_after, in seconds. */
+  retryAfterSec: number
+  /** Epoch ms at which the flood window is expected to expire. */
+  untilTs: number
+  /** The originating GrammyError. */
+  original: unknown
+}
+
+/** True when `err` is the `FLOOD_WAIT_ACTIVE` marker thrown by `retryApiCall`. */
+export function isFloodWaitActiveError(err: unknown): err is FloodWaitActiveError {
+  return err instanceof Error && err.message === FLOOD_WAIT_ACTIVE
+}
+
+/**
+ * Default ceiling on a single in-process flood-wait sleep: 120s.
+ *
+ * Why 120s and not 30-60s: the flood-waits this bot has historically ridden out
+ * successfully were 28s and 75s — sleeping through those is the RIGHT behaviour
+ * and must not regress, so the ceiling has to sit above 75s with headroom. Why
+ * not higher: the ban this guards against (#3084, overlord 2026-07-11) reported
+ * retry_after = 16739s (~4.6h). A 120s ceiling bounds the worst case in-process
+ * block to maxRetries × 120s (6s→6min at the default 3) instead of hours, which
+ * is short enough that a caller — and the human waiting on a reply — gets a
+ * degraded answer rather than an apparently-wedged agent.
+ */
+export const DEFAULT_MAX_FLOOD_SLEEP_MS = 120_000
+
 const DEFAULT_SLEEP = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 
 /**
@@ -120,6 +168,7 @@ export function createRetryApiCall(
   config: RetryApiCallConfig = {},
 ): <T>(fn: () => Promise<T>, opts?: RetryCallOpts) => Promise<T> {
   const maxRetries = config.maxRetries ?? 3
+  const maxFloodSleepMs = config.maxFloodSleepMs ?? DEFAULT_MAX_FLOOD_SLEEP_MS
   const sleep = config.sleep ?? DEFAULT_SLEEP
   const observer = config.observer
   const log = config.log
@@ -163,6 +212,27 @@ export function createRetryApiCall(
             onFloodWait?.(retryAfter)
           } catch {
             /* best-effort — never let the breaker hook break the retry path */
+          }
+          // #3084: a LONG ban must not be slept in-process. On 2026-07-11
+          // overlord got retry_after = 16739s (~4.6h); `await sleep(delayMs)`
+          // parked the send path — and every caller awaiting it — for hours.
+          // That is a wedge primitive, not a retry. Above the ceiling we've
+          // already recorded the window (the breaker above suppresses
+          // non-essential sends for its duration); now fail FAST with a
+          // distinct non-retryable marker so the caller can surface a degraded
+          // state. Under the ceiling, behaviour is unchanged: sleep and retry.
+          if (delayMs > maxFloodSleepMs) {
+            log?.(
+              `telegram gateway: 429 flood ban of ${retryAfter}s exceeds the ` +
+                `${Math.round(maxFloodSleepMs / 1000)}s in-process sleep ceiling — ` +
+                `not sleeping it; surfacing degraded state\n`,
+            )
+            observer?.onGiveUp?.({ attempts: attempt + 1, error: err })
+            throw Object.assign(new Error(FLOOD_WAIT_ACTIVE), {
+              retryAfterSec: retryAfter,
+              untilTs: Date.now() + delayMs,
+              original: err,
+            }) as FloodWaitActiveError
           }
           log?.(`telegram gateway: 429 rate limited, waiting ${retryAfter}s\n`)
           observer?.onRetry?.({ attempt, reason: 'flood_wait', delayMs })

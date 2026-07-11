@@ -16,7 +16,11 @@ import {
   retryWithThreadFallback,
   isHtmlParseRejectError,
   isLocalResourceError,
+  isFloodWaitActiveError,
   LOCAL_RESOURCE_EXHAUSTED,
+  FLOOD_WAIT_ACTIVE,
+  DEFAULT_MAX_FLOOD_SLEEP_MS,
+  type FloodWaitActiveError,
   type RetryObserver,
 } from '../retry-api-call.js'
 import { errors, makeGrammyError } from './fake-bot-api.js'
@@ -569,5 +573,213 @@ describe('#2923 — LOCAL resource exhaustion is NOT retried (avoids flood ban)'
     })
     expect(out).toBe('ok')
     expect(seen).toEqual([42])
+  })
+})
+
+describe('#3084 — a long flood ban fails FAST instead of sleeping for hours', () => {
+  /**
+   * Deterministic fake clock: `sleep` never waits, it just advances a counter.
+   * Nothing here touches a real timer, so "did we try to sleep 4.6 hours?" is
+   * an assertion on the fake clock, not a stopwatch.
+   */
+  function fakeClock() {
+    let elapsedMs = 0
+    const slept: number[] = []
+    return {
+      get elapsedMs() {
+        return elapsedMs
+      },
+      slept,
+      sleep: async (ms: number) => {
+        slept.push(ms)
+        elapsedMs += ms
+      },
+    }
+  }
+
+  // The real value overlord's gateway logged on 2026-07-11.
+  const REAL_BAN_SEC = 16_739
+
+  it('does NOT sleep a 4.6-hour retry_after (clock never advances past the ceiling)', async () => {
+    const clock = fakeClock()
+    let calls = 0
+    const retry = createRetryApiCall({ maxRetries: 3, sleep: clock.sleep })
+
+    await expect(
+      retry(async () => {
+        calls++
+        throw errors.floodWait(REAL_BAN_SEC)
+      }),
+    ).rejects.toThrow(FLOOD_WAIT_ACTIVE)
+
+    expect(calls).toBe(1) // failed fast on the first 429 — no retry storm
+    expect(clock.slept).toEqual([]) // never even attempted the sleep
+    expect(clock.elapsedMs).toBe(0)
+    expect(clock.elapsedMs).toBeLessThanOrEqual(DEFAULT_MAX_FLOOD_SLEEP_MS)
+  })
+
+  it('carries retry_after / untilTs / original on the thrown marker', async () => {
+    const clock = fakeClock()
+    const before = Date.now()
+    const retry = createRetryApiCall({ maxRetries: 3, sleep: clock.sleep })
+
+    const err = await retry(async () => {
+      throw errors.floodWait(REAL_BAN_SEC)
+    }).catch((e: unknown) => e)
+
+    expect(isFloodWaitActiveError(err)).toBe(true)
+    const flood = err as FloodWaitActiveError
+    expect(flood.retryAfterSec).toBe(REAL_BAN_SEC)
+    expect(flood.untilTs).toBeGreaterThanOrEqual(before + REAL_BAN_SEC * 1000)
+    expect(flood.original).toBeInstanceOf(GrammyError)
+  })
+
+  it('STILL records the flood window via onFloodWait before throwing (#2923 breaker)', async () => {
+    const clock = fakeClock()
+    const seen: number[] = []
+    const order: string[] = []
+    const retry = createRetryApiCall({
+      maxRetries: 3,
+      sleep: clock.sleep,
+      onFloodWait: (s) => {
+        seen.push(s)
+        order.push('recorded')
+      },
+      observer: {
+        onGiveUp: () => {
+          order.push('gave_up')
+        },
+      },
+    })
+
+    await expect(
+      retry(async () => {
+        throw errors.floodWait(REAL_BAN_SEC)
+      }),
+    ).rejects.toThrow(FLOOD_WAIT_ACTIVE)
+
+    // The breaker MUST learn about the window — that is what suppresses the
+    // restart boot-card that would otherwise extend the ban.
+    expect(seen).toEqual([REAL_BAN_SEC])
+    expect(order).toEqual(['recorded', 'gave_up'])
+  })
+
+  it('a throwing onFloodWait hook still yields the marker, not the hook error', async () => {
+    const clock = fakeClock()
+    const retry = createRetryApiCall({
+      maxRetries: 3,
+      sleep: clock.sleep,
+      onFloodWait: () => {
+        throw new Error('disk full while persisting flood state')
+      },
+    })
+    await expect(
+      retry(async () => {
+        throw errors.floodWait(REAL_BAN_SEC)
+      }),
+    ).rejects.toThrow(FLOOD_WAIT_ACTIVE)
+  })
+
+  it('a SHORT retry_after under the ceiling still sleeps-and-retries and succeeds', async () => {
+    const clock = fakeClock()
+    let n = 0
+    const retry = createRetryApiCall({ maxRetries: 3, sleep: clock.sleep })
+
+    // 30s — the everyday rate-limit blip. Behaviour must be unchanged.
+    const out = await retry(async () => {
+      if (n++ === 0) throw errors.floodWait(30)
+      return 'ok'
+    })
+
+    expect(out).toBe('ok')
+    expect(n).toBe(2)
+    expect(clock.slept).toEqual([30_000])
+  })
+
+  it('the historic 28s and 75s waits are still slept through (no regression)', async () => {
+    for (const sec of [28, 75]) {
+      const clock = fakeClock()
+      let n = 0
+      const retry = createRetryApiCall({ maxRetries: 3, sleep: clock.sleep })
+      const out = await retry(async () => {
+        if (n++ === 0) throw errors.floodWait(sec)
+        return 'ok'
+      })
+      expect(out).toBe('ok')
+      expect(clock.slept).toEqual([sec * 1000])
+    }
+  })
+
+  it('sleeps exactly AT the ceiling, throws just above it', async () => {
+    const atCeiling = DEFAULT_MAX_FLOOD_SLEEP_MS / 1000
+
+    const clockAt = fakeClock()
+    let n = 0
+    const retryAt = createRetryApiCall({ maxRetries: 3, sleep: clockAt.sleep })
+    expect(
+      await retryAt(async () => {
+        if (n++ === 0) throw errors.floodWait(atCeiling)
+        return 'ok'
+      }),
+    ).toBe('ok')
+    expect(clockAt.slept).toEqual([DEFAULT_MAX_FLOOD_SLEEP_MS])
+
+    const clockOver = fakeClock()
+    const retryOver = createRetryApiCall({ maxRetries: 3, sleep: clockOver.sleep })
+    await expect(
+      retryOver(async () => {
+        throw errors.floodWait(atCeiling + 1)
+      }),
+    ).rejects.toThrow(FLOOD_WAIT_ACTIVE)
+    expect(clockOver.slept).toEqual([])
+  })
+
+  it('honours a caller-supplied maxFloodSleepMs ceiling', async () => {
+    const clock = fakeClock()
+    const retry = createRetryApiCall({
+      maxRetries: 3,
+      sleep: clock.sleep,
+      maxFloodSleepMs: 5_000,
+    })
+    // 30s would sleep under the DEFAULT ceiling; with a 5s ceiling it throws.
+    await expect(
+      retry(async () => {
+        throw errors.floodWait(30)
+      }),
+    ).rejects.toThrow(FLOOD_WAIT_ACTIVE)
+    expect(clock.slept).toEqual([])
+  })
+
+  it('maxRetries semantics unchanged for sustained SHORT floods', async () => {
+    const clock = fakeClock()
+    let calls = 0
+    const retry = createRetryApiCall({ maxRetries: 3, sleep: clock.sleep })
+
+    await expect(
+      retry(async () => {
+        calls++
+        throw errors.floodWait(10)
+      }),
+    ).rejects.toThrow('retryApiCall: max retries exceeded')
+
+    expect(calls).toBe(3)
+    expect(clock.slept).toEqual([10_000, 10_000, 10_000])
+  })
+
+  it('the swallowing wrapper absorbs the marker (no unhandled rejection)', async () => {
+    const clock = fakeClock()
+    const lines: string[] = []
+    const retry = createRetryApiCall({ maxRetries: 3, sleep: clock.sleep })
+    const swallow = createSwallowingRetryApiCall(retry, (l) => lines.push(l))
+
+    const out = await swallow(
+      async () => {
+        throw errors.floodWait(REAL_BAN_SEC)
+      },
+      { verb: 'sendMessage' },
+    )
+
+    expect(out).toBeUndefined()
+    expect(lines.join('')).toContain(FLOOD_WAIT_ACTIVE)
   })
 })
