@@ -48,6 +48,7 @@ import { setReleasePinInConfig } from "./release-yaml.js";
 import { resolveOperatorUid } from "./operator-uid.js";
 import { writeConfigFileSync } from "../util/atomic.js";
 import { validateBindSources, formatPreflightError } from "./preflight-mounts.js";
+import { normalizeHindsightVersionTag } from "../setup/hindsight.js";
 
 /**
  * Default durable-pin persister for `update --pin`: comment-preserving,
@@ -348,8 +349,10 @@ export function parseUpdateResultLine(stdout: string): {
  * `release.pin`. Only a concrete `vX.Y.Z` is returned, because the release
  * workflow publishes the hindsight image per version as `:vX.Y.Z`; a
  * `sha-…` pin (or no pin / unreadable config) yields `undefined` → floating
- * `:latest`, the standalone default. Resolved lazily at run() time so
- * build-time step inspection stays free of config I/O.
+ * `:latest`, the standalone default. A bare `X.Y.Z` pin is normalized to the
+ * canonical `vX.Y.Z` (via {@link normalizeHindsightVersionTag}) so this
+ * gates identically to {@link hindsightImageRef}. Resolved lazily at run()
+ * time so build-time step inspection stays free of config I/O.
  */
 export function resolveHindsightPinTag(opts: UpdateOptions): string | undefined {
   if (typeof opts.hindsightPinTag === "string") {
@@ -368,7 +371,7 @@ export function resolveHindsightPinTag(opts: UpdateOptions): string | undefined 
       candidate = undefined;
     }
   }
-  return candidate && /^v\d+\.\d+\.\d+$/.test(candidate) ? candidate : undefined;
+  return normalizeHindsightVersionTag(candidate);
 }
 
 /**

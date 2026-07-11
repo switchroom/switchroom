@@ -32,6 +32,37 @@ import { join } from "node:path";
 import { resolveAgentsDir } from "../config/loader.js";
 import YAML from "yaml";
 import type { SwitchroomConfig } from "../config/schema.js";
+import { normalizeHindsightVersionTag } from "../setup/hindsight.js";
+
+/**
+ * Decide which hindsight image tag `memory setup` should pull + run, and
+ * why. Pure so it can be unit-tested without touching Docker or config I/O.
+ *
+ * Resolution order:
+ *   1. An explicit `--tag latest` force-floats to `:latest` (the operator
+ *      explicitly asked to un-pin) → `{ tag: undefined, reason: "explicit-latest" }`.
+ *   2. Any other explicit `--tag` always wins → `{ tag, reason: "explicit" }`.
+ *   3. No `--tag`, but the fleet has a persisted `release.pin` that
+ *      normalizes to `vX.Y.Z` → default to it so a manual recreate on a
+ *      pinned fleet doesn't silently un-pin hindsight → `{ tag, reason: "pin" }`.
+ *   4. Otherwise float to `:latest` (the standalone default) →
+ *      `{ tag: undefined, reason: "latest" }`.
+ */
+export function resolveMemorySetupTag(input: {
+  explicitTag?: string;
+  releasePin?: string;
+}): { tag: string | undefined; reason: "explicit" | "explicit-latest" | "pin" | "latest" } {
+  const explicit = input.explicitTag?.trim();
+  if (explicit) {
+    if (explicit.toLowerCase() === "latest") {
+      return { tag: undefined, reason: "explicit-latest" };
+    }
+    return { tag: explicit, reason: "explicit" };
+  }
+  const pin = normalizeHindsightVersionTag(input.releasePin);
+  if (pin) return { tag: pin, reason: "pin" };
+  return { tag: undefined, reason: "latest" };
+}
 
 /**
  * Resolve LiteLLM routing config for the hindsight container. Returns
@@ -320,6 +351,40 @@ export function registerMemoryCommand(program: Command): void {
 
       const recreate = opts.recreate === true;
 
+      // Resolve which image tag to pull + run. Without an explicit --tag,
+      // default to the persisted release.pin when the fleet is pinned, so a
+      // manual `memory setup --recreate` on a pinned fleet doesn't silently
+      // un-pin the hindsight singleton to floating :latest. Explicit --tag
+      // always wins; `--tag latest` force-floats. Best-effort config read
+      // (mirrors resolveHindsightPinTag): fall back to :latest rather than
+      // fail the whole setup if config can't be loaded.
+      let releasePin: string | undefined;
+      try {
+        releasePin = getConfig(program).release?.pin ?? undefined;
+      } catch {
+        releasePin = undefined;
+      }
+      const { tag: effectiveTag, reason: tagReason } = resolveMemorySetupTag({
+        explicitTag: opts.tag,
+        releasePin,
+      });
+      switch (tagReason) {
+        case "explicit":
+          console.log(chalk.gray(`  Using hindsight image tag ${effectiveTag} (explicit --tag).`));
+          break;
+        case "explicit-latest":
+          console.log(chalk.gray("  Using floating hindsight image :latest (explicit --tag latest)."));
+          break;
+        case "pin":
+          console.log(
+            chalk.gray(`  Using hindsight image tag ${effectiveTag} (from persisted release.pin).`),
+          );
+          break;
+        case "latest":
+          console.log(chalk.gray("  Using floating hindsight image :latest (standalone default; no pin)."));
+          break;
+      }
+
       // --recreate rebinds the SAME host ports the running container
       // currently publishes, so memory.config.url never changes under the
       // fleet. Read them before we stop the container. (null → fall back
@@ -336,11 +401,11 @@ export function registerMemoryCommand(program: Command): void {
       if (recreate) {
         console.log(
           chalk.gray(
-            `  Pulling ${opts.tag ? `Hindsight image ${opts.tag}` : "latest Hindsight image"}...`,
+            `  Pulling ${effectiveTag ? `Hindsight image ${effectiveTag}` : "latest Hindsight image"}...`,
           ),
         );
         try {
-          pullHindsightImage(opts.tag);
+          pullHindsightImage(effectiveTag);
         } catch (err) {
           console.error(chalk.red(`\n  Failed to pull Hindsight image: ${(err as Error).message}\n`));
           process.exit(1);
@@ -472,7 +537,7 @@ export function registerMemoryCommand(program: Command): void {
         startHindsight(
           ports,
           litellmCfg,
-          opts.tag,
+          effectiveTag,
           hindsightConfig.hindsight?.llm,
           hindsightConsumerMirrorDir(hindsightConfig),
         );
