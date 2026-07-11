@@ -227,8 +227,11 @@ function validateShape(
   // with no context lines is anchored ONLY by its `@@` line numbers, so after
   // benign drift during the approval window it can silently relocate into a
   // different region of the file (e.g. another agent's block) and still pass
-  // schema validation. Requiring at least one context line per hunk anchors
-  // the hunk to byte-matched surrounding text. Nothing first-party generates
+  // schema validation. Requiring at least one context line per hunk is a
+  // first-line filter, not the anchoring guarantee: a hunk whose only context
+  // is a blank line still passes with a near-useless anchor. The actual
+  // relocation guarantee is the apply-time change-set pin (plus the self-scope
+  // re-gate for non-admin callers). Nothing first-party generates
   // zero-context diffs (`git diff` defaults to 3 context lines;
   // telegram-plugin/permission-diff.ts buildHunk uses contextN=3), so this
   // only rejects hand-rolled `--unified=0` patches.

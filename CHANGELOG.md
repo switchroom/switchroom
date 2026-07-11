@@ -31,6 +31,10 @@ adds the compensating checks:
 Operator hand-edits remain outside the apply lock (a ~ms residual race,
 accepted and now documented as such — this path is not zero-race).
 
+Mixed-version note: an old gateway paired with a new hostd rejects the new
+`aborted_config_changed` finalize (unknown message type), leaving the approved
+card stale — fail-safe, since the abort means nothing was written.
+
 ### First-class `soul:` persona fields + `shape` discriminator (#1856)
 
 `AgentSoulSchema` now types `creature`, `vibe`, `expertise`, and `emoji`
