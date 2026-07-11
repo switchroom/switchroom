@@ -15,6 +15,8 @@ import {
   readSessionModelFileRaw,
   restoreSessionModelFileRaw,
   clearSessionModelFile,
+  clearSessionModelBootAttempts,
+  SESSION_MODEL_BOOT_ATTEMPTS_FILE,
   writeRelaunchModelIntent,
   clearRelaunchModelIntent,
   readConfiguredDefaultModel,
@@ -227,5 +229,53 @@ describe('intentForRestartReason is keep-for-everything (#3039)', () => {
     ]) {
       expect(intentForRestartReason(reason)).toBe('keep')
     }
+  })
+})
+
+describe('clearSessionModelBootAttempts (#3043 item 2: bridge-register clears the crashloop counter)', () => {
+  const bootAttemptsPath = () => join(dir, SESSION_MODEL_BOOT_ATTEMPTS_FILE)
+
+  // Faithful model of start.sh.hbs "Override crashloop self-heal": each boot
+  // within 150s of the previous stamp bumps the count; a stale stamp resets to
+  // 1. Reproduced here so the accumulate-vs-reset OUTCOME is asserted, not just
+  // the delete call.
+  function simulateBootStamp(nowSec: number): number {
+    let count = 0
+    let prev = 0
+    if (existsSync(bootAttemptsPath())) {
+      const [c, p] = readFileSync(bootAttemptsPath(), 'utf8').trim().split(/\s+/)
+      count = Number(c) || 0
+      prev = Number(p) || 0
+    }
+    count = nowSec - prev < 150 ? count + 1 : 1
+    writeFileSync(bootAttemptsPath(), `${count} ${nowSec}\n`)
+    return count
+  }
+
+  it('WITHOUT a bridge register, three fast boots accumulate toward the 3-strike clear', () => {
+    // Three operator hand-bounces, each <150s apart, with no register between.
+    expect(simulateBootStamp(1000)).toBe(1)
+    expect(simulateBootStamp(1010)).toBe(2)
+    expect(simulateBootStamp(1020)).toBe(3) // start.sh would now clear a HEALTHY override — the false positive
+  })
+
+  it('a bridge register between boots resets the counter, so a healthy agent never reaches 3', () => {
+    expect(simulateBootStamp(1000)).toBe(1)
+    // Boot 1 came all the way up and the bridge registered → gateway clears it.
+    clearSessionModelBootAttempts(dir)
+    expect(existsSync(bootAttemptsPath())).toBe(false)
+
+    // Next fast boot starts fresh at 1 (no accumulation), and register clears again.
+    expect(simulateBootStamp(1010)).toBe(1)
+    clearSessionModelBootAttempts(dir)
+    expect(simulateBootStamp(1020)).toBe(1)
+    // The healthy agent's counter never climbs to the 3-strike clear.
+    const [count] = readFileSync(bootAttemptsPath(), 'utf8').trim().split(/\s+/)
+    expect(Number(count)).toBeLessThan(3)
+  })
+
+  it('is best-effort — no throw when the counter file is absent', () => {
+    expect(existsSync(bootAttemptsPath())).toBe(false)
+    expect(() => clearSessionModelBootAttempts(dir)).not.toThrow()
   })
 })

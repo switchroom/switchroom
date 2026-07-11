@@ -40,6 +40,8 @@ import { isValidModelArg } from './model-command.js'
 export const SESSION_MODEL_FILE = '.session-model'
 export const RELAUNCH_MODEL_INTENT_FILE = '.relaunch-model-intent'
 export const CONFIGURED_DEFAULT_MODEL_FILE = '.configured-default-model'
+/** Crashloop self-heal counter (start.sh stamps `<count> <epoch>` per fast boot). */
+export const SESSION_MODEL_BOOT_ATTEMPTS_FILE = '.session-model-boot-attempts'
 
 export type RelaunchModelIntent = 'keep' | 'revert'
 
@@ -142,7 +144,30 @@ export function clearSessionModelFile(agentDir: string): void {
     // #3042 item 4: also drop the kept-alert dedup sentinel so a future
     // override of the same name re-alerts on its first kept boot.
     rmSync(join(agentDir, '.session-model-kept-notified'), { force: true })
-    rmSync(join(agentDir, '.session-model-boot-attempts'), { force: true })
+    rmSync(join(agentDir, SESSION_MODEL_BOOT_ATTEMPTS_FILE), { force: true })
+  } catch {
+    /* best-effort */
+  }
+}
+
+/**
+ * #3043 item 2: clear ONLY the crashloop boot-attempts counter — a positive
+ * health signal from the gateway, not a carrier change.
+ *
+ * start.sh's self-heal (start.sh.hbs "Override crashloop self-heal") increments
+ * the counter on every boot that re-enters within 150s with the override still
+ * active, and clears a healthy override after 3 fast boots. That window can't
+ * tell a genuine crashloop from three quick OPERATOR hand-bounces of a healthy
+ * agent — both look like fast successive boots — so three deliberate restarts
+ * would spuriously wipe a working override. A boot that reaches bridge
+ * registration is proven healthy (the session came all the way up and the
+ * bridge connected), so the gateway deletes the counter there. Only boots that
+ * genuinely FAIL before the bridge registers now accumulate toward the 3-strike
+ * clear. Best-effort; absent file is fine.
+ */
+export function clearSessionModelBootAttempts(agentDir: string): void {
+  try {
+    rmSync(join(agentDir, SESSION_MODEL_BOOT_ATTEMPTS_FILE), { force: true })
   } catch {
     /* best-effort */
   }

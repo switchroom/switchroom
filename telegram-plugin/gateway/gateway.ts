@@ -408,6 +408,7 @@ import {
   readSessionModelFileRaw,
   restoreSessionModelFileRaw,
   clearSessionModelFile,
+  clearSessionModelBootAttempts,
   readConfiguredDefaultModel,
   writeRelaunchModelIntent,
   clearRelaunchModelIntent,
@@ -9256,6 +9257,16 @@ const ipcServer: IpcServer = createIpcServer({
     // this call is safe wherever it sits relative to the cron early-return
     // above (#3038 review finding 5).
     bridgeDeadWatchdog.noteBridgeRegistered(client.agentName)
+    // #3043 item 2: a REAL bridge registering is proof the boot came all the
+    // way up healthy — clear start.sh's crashloop boot-attempts counter so only
+    // boots that genuinely fail BEFORE the bridge registers accumulate toward
+    // the 3-strike override clear. Without this, three quick operator
+    // hand-bounces of a healthy agent (each <150s apart) spuriously wipe a
+    // working model override. Best-effort; no-op when the file is absent.
+    if (client.agentName != null) {
+      const smBootDir = resolveAgentDirFromEnv()
+      if (smBootDir != null) clearSessionModelBootAttempts(smBootDir)
+    }
     client.send({ type: 'status', status: 'agent_connected' })
 
     // Phase 2b PR 3a — bridgeUp cutover. The state machine's `bridgeUp`

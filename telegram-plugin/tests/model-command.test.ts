@@ -1359,4 +1359,18 @@ describe("isOfflineTrustedModelToken (#3042 blocker 2a)", () => {
     expect(isOfflineTrustedModelToken("sr-made-up/model")).toBe(false);
     expect(isOfflineTrustedModelToken("")).toBe(false);
   });
+
+  it("#3043 item 1: accepts case-variant aliases the live path already normalizes (OPUS, Sonnet)", () => {
+    // The live accept path lowercases (isClaudeModel / expandSrAlias) so a
+    // queued `/model OPUS` is accepted live — the persist gate must not then
+    // refuse it with the over-conservative "couldn't verify" card.
+    for (const a of MODEL_ALIASES) {
+      expect(isOfflineTrustedModelToken(a.toUpperCase())).toBe(true);
+    }
+    expect(isOfflineTrustedModelToken("OPUS")).toBe(true);
+    expect(isOfflineTrustedModelToken("Sonnet")).toBe(true);
+    // Curated sr-* alias, upper-cased, still resolves.
+    const [alias] = Object.entries(SR_MODEL_ALIASES)[0];
+    expect(isOfflineTrustedModelToken(alias.toUpperCase())).toBe(true);
+  });
 });
