@@ -207,67 +207,159 @@ interface Schedule {
   count: number
 }
 
+/**
+ * A VIRTUAL CLOCK + event queue — no `vi` fake timers anywhere in this file.
+ *
+ * This suite is DUAL-RUN: CI's `bun-test-run` executes the whole
+ * `telegram-plugin/tests` directory, and bun's `vi` shim has no
+ * `setSystemTime` / `useFakeTimers` (CLAUDE.md: dual-run files must avoid
+ * bun-incompatible vitest APIs). A test that throws on startup is not a weaker
+ * test, it is NOT A TEST — and this file is the entire guard for #3084, so it
+ * has to bite in BOTH runners.
+ *
+ * The emitter already takes injected `now` / `schedule` / `cancel`, so it needs
+ * no timer mocking at all. `createTurnTypingLoop` reaches for the global
+ * `setInterval`, so `withVirtualTimers` swaps the global for the queue below for
+ * the duration of one simulation and restores it after. Fully deterministic and
+ * runner-agnostic.
+ */
+interface VTimer {
+  id: number
+  at: number
+  fn: () => void
+  every: number | null
+}
+
+function createVirtualClock(start = 0) {
+  let t = start
+  let seq = 1
+  const timers = new Map<number, VTimer>()
+
+  function schedule(fn: () => void, ms: number, every: number | null = null): number {
+    const id = seq++
+    timers.set(id, { id, at: t + Math.max(0, ms), fn, every })
+    return id
+  }
+
+  return {
+    now: () => t,
+    schedule: (fn: () => void, ms: number) => schedule(fn, ms),
+    scheduleEvery: (fn: () => void, ms: number) => schedule(fn, ms, ms),
+    cancel: (h: unknown) => {
+      timers.delete(h as number)
+    },
+    /** Run every timer due at or before `target`, in (time, insertion) order. */
+    advanceTo(target: number): void {
+      for (;;) {
+        let next: VTimer | null = null
+        for (const tm of timers.values()) {
+          if (tm.at > target) continue
+          if (next === null || tm.at < next.at || (tm.at === next.at && tm.id < next.id)) {
+            next = tm
+          }
+        }
+        if (next === null) break
+        t = next.at
+        if (next.every != null) next.at = t + next.every
+        else timers.delete(next.id)
+        next.fn()
+      }
+      t = target
+    },
+    advanceBy(ms: number): void {
+      this.advanceTo(t + ms)
+    },
+    pending: () => timers.size,
+  }
+}
+
+type VirtualClock = ReturnType<typeof createVirtualClock>
+
+/** Run `body` with the GLOBAL setInterval/clearInterval bound to `clock`. */
+function withVirtualTimers<T>(clock: VirtualClock, body: () => T): T {
+  const realSetInterval = globalThis.setInterval
+  const realClearInterval = globalThis.clearInterval
+  globalThis.setInterval = ((fn: () => void, ms: number) =>
+    clock.scheduleEvery(fn, ms)) as unknown as typeof globalThis.setInterval
+  globalThis.clearInterval = ((h: unknown) =>
+    clock.cancel(h)) as unknown as typeof globalThis.clearInterval
+  try {
+    return body()
+  } finally {
+    globalThis.setInterval = realSetInterval
+    globalThis.clearInterval = realClearInterval
+  }
+}
+
 /** Run one schedule; return the emission times over the turn. */
 function simulateTurn(sch: Schedule): number[] {
-  vi.setSystemTime(0)
+  const clock = createVirtualClock(0)
   const sent: number[] = []
-  const emitter = createTypingEmitter({
-    chatKey,
-    now: () => Date.now(),
-    schedule: (fn, ms) => setTimeout(fn, ms),
-    cancel: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
-    send: () => sent.push(Date.now()),
+
+  return withVirtualTimers(clock, () => {
+    const emitter = createTypingEmitter({
+      chatKey,
+      now: clock.now,
+      schedule: clock.schedule,
+      cancel: clock.cancel,
+      send: () => sent.push(clock.now()),
+    })
+
+    // Loop A — the turn-level loop: fixed cadence for the WHOLE turn. The REAL
+    // factory, driving the REAL global setInterval (bound to the virtual clock).
+    const turnLoop = createTurnTypingLoop({
+      chatKey,
+      sendChatAction: (chatId, threadId) => {
+        emitter.emit(chatId, threadId, 'typing')
+      },
+      refreshMs: TYPING_REFRESH_MS,
+    })
+
+    // Loop B — the tool-use loop, as gateway.ts drives it: restarts (and fires
+    // immediately) per serial tool call, stops on the tool result when the
+    // ref-count hits zero.
+    let toolInterval: unknown = null
+    const startToolLoop = () => {
+      if (toolInterval != null) clearInterval(toolInterval as ReturnType<typeof setInterval>)
+      const send = () => emitter.emit('chat-1', null, 'typing')
+      send()
+      toolInterval = setInterval(send, TYPING_REFRESH_MS)
+    }
+    const stopToolLoop = () => {
+      if (toolInterval != null) clearInterval(toolInterval as ReturnType<typeof setInterval>)
+      toolInterval = null
+    }
+
+    // Build the tool start/stop timeline, then advance the clock through it.
+    const events: Array<{ at: number; fn: () => void }> = []
+    let cursor = sch.phase
+    for (let i = 0; i < sch.count && cursor < TURN_MS; i++) {
+      const start = cursor
+      const end = Math.min(start + sch.dur, TURN_MS)
+      events.push({ at: start, fn: startToolLoop })
+      events.push({ at: end, fn: stopToolLoop })
+      cursor = end + sch.gap
+    }
+    events.sort((a, b) => a.at - b.at)
+
+    turnLoop.start('chat-1', null) // turn enqueue — the cold-start ping
+    for (const ev of events) {
+      clock.advanceTo(ev.at)
+      ev.fn()
+    }
+    clock.advanceTo(TURN_MS)
+
+    turnLoop.stop('chat-1', null) // canonical turn-end
+    emitter.cancelPending('chat-1', null) // …as the gateway does
+    stopToolLoop()
+
+    // Nothing may fire after the turn ends — no zombie "typing…" on a dead turn.
+    const afterTurn = sent.length
+    clock.advanceTo(TURN_MS + 30_000)
+    expect(sent.length).toBe(afterTurn)
+
+    return sent
   })
-
-  // Loop A — the turn-level loop: fixed cadence for the WHOLE turn.
-  const turnLoop = createTurnTypingLoop({
-    chatKey,
-    sendChatAction: (chatId, threadId) => {
-      emitter.emit(chatId, threadId, 'typing')
-    },
-    refreshMs: TYPING_REFRESH_MS,
-  })
-
-  // Loop B — the tool-use loop: restarts (and fires immediately) per serial
-  // tool call, stops on the tool result when the ref-count hits zero.
-  let toolInterval: ReturnType<typeof setInterval> | null = null
-  const startToolLoop = () => {
-    if (toolInterval) clearInterval(toolInterval)
-    const send = () => emitter.emit('chat-1', null, 'typing')
-    send()
-    toolInterval = setInterval(send, TYPING_REFRESH_MS)
-  }
-  const stopToolLoop = () => {
-    if (toolInterval) clearInterval(toolInterval)
-    toolInterval = null
-  }
-
-  // Build the tool start/stop event timeline, then advance the clock through it.
-  const events: Array<{ at: number; fn: () => void }> = []
-  let cursor = sch.phase
-  for (let i = 0; i < sch.count && cursor < TURN_MS; i++) {
-    const start = cursor
-    const end = Math.min(start + sch.dur, TURN_MS)
-    events.push({ at: start, fn: startToolLoop })
-    events.push({ at: end, fn: stopToolLoop })
-    cursor = end + sch.gap
-  }
-  events.sort((a, b) => a.at - b.at)
-
-  turnLoop.start('chat-1', null) // turn enqueue — the cold-start ping
-  let t = 0
-  for (const ev of events) {
-    vi.advanceTimersByTime(ev.at - t)
-    t = ev.at
-    ev.fn()
-  }
-  vi.advanceTimersByTime(TURN_MS - t)
-
-  turnLoop.stop('chat-1', null) // canonical turn-end
-  emitter.cancelPending('chat-1', null) // …as the gateway does
-  stopToolLoop()
-  vi.clearAllTimers()
-  return sent
 }
 
 /** Longest stretch of the turn with no live "typing…", including the head. */
@@ -278,15 +370,6 @@ function maxDarkMs(sent: number[]): number {
 }
 
 describe('typing emitter — BOTH loops share one floor (#3084)', () => {
-  beforeEach(() => {
-    vi.useFakeTimers()
-    vi.setSystemTime(0)
-  })
-  afterEach(() => {
-    vi.clearAllTimers()
-    vi.useRealTimers()
-  })
-
   it('the reviewer counterexample (phase=3500 dur=3400 n=6) never goes dark', () => {
     // Before the catch-up timer this schedule left a 7000 ms gap (emissions at
     // 21000 → 28000): a tool ping eats the turn loop's tick, the tool loop then
@@ -297,9 +380,9 @@ describe('typing emitter — BOTH loops share one floor (#3084)', () => {
     expect(sent.length).toBeLessThanOrEqual(MAX_EMISSIONS_PER_TURN)
   })
 
-  it('a 120-tool-call storm over 60 s emits ≤20 actions (the ban shape)', () => {
+  it('a 120-tool-call storm over 60 s emits <=20 actions (the ban shape)', () => {
     // The incident shape: serial tool calls firing every ~500 ms into ONE DM for
-    // a whole minute. Pre-fix this emitted ~135 actions (one per tool call, the
+    // a whole minute. Pre-fix this emitted ~136 actions (one per tool call, the
     // 8,729-pings-for-203-messages ratio). The cap is absolute, so it goes red
     // the moment the floor stops holding.
     const sent = simulateTurn({ phase: 0, dur: 250, gap: 250, count: 120 })
@@ -309,7 +392,7 @@ describe('typing emitter — BOTH loops share one floor (#3084)', () => {
   })
 
   it('ADVERSARIAL sweep: no schedule floods, and no schedule goes dark', () => {
-    // Sweep the tool-call phase/duration/count space — the point is that the
+    // Sweep the tool-call phase/duration/gap/count space — the point is that the
     // bound holds across schedules, not on one hand-picked one.
     let worstDark = 0
     let worstDarkSch: Schedule | null = null
@@ -335,14 +418,17 @@ describe('typing emitter — BOTH loops share one floor (#3084)', () => {
               worstCountSch = sch
             }
             // Floor still holds under every schedule — the flood cap is intact.
-            assertFloorHeld(sent.map((at) => ({ chatId: 'chat-1', threadId: null, action: 'typing', at })))
+            assertFloorHeld(
+              sent.map((at) => ({ chatId: 'chat-1', threadId: null, action: 'typing', at })),
+            )
           }
         }
       }
     }
 
     expect(schedules).toBeGreaterThan(500)
-    // The two outcomes, both absolute:
+    // The two outcomes, both absolute — neither is expressed in terms of the
+    // constants under test, so both go red when the mechanism is removed.
     expect(
       worstDark,
       `worst dark gap ${worstDark}ms on ${JSON.stringify(worstDarkSch)}`,
@@ -356,21 +442,22 @@ describe('typing emitter — BOTH loops share one floor (#3084)', () => {
   })
 
   it('a dropped tick arms exactly ONE coalesced catch-up, and never leaks', () => {
+    const clock = createVirtualClock(0)
     const sent: Sent[] = []
     const emitter = createTypingEmitter({
       chatKey,
-      now: () => Date.now(),
-      schedule: (fn, ms) => setTimeout(fn, ms),
-      cancel: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
+      now: clock.now,
+      schedule: clock.schedule,
+      cancel: clock.cancel,
       send: (chatId, threadId, action) =>
-        sent.push({ chatId, threadId, action, at: Date.now() }),
+        sent.push({ chatId, threadId, action, at: clock.now() }),
     })
 
     emitter.emit('chat-1') // t=0, sent
-    for (let i = 0; i < 20; i++) emitter.emit('chat-1') // 20 drops, one window
+    for (let i = 0; i < 20; i++) emitter.emit('chat-1') // 20 drops, ONE window
     expect(emitter.pendingCatchUps()).toBe(1) // coalesced — never 20 timers
 
-    vi.advanceTimersByTime(TYPING_FLOOR_MS)
+    clock.advanceBy(TYPING_FLOOR_MS)
     expect(sent.map((s) => s.at)).toEqual([0, TYPING_FLOOR_MS]) // catch-up fired
     expect(emitter.pendingCatchUps()).toBe(0) // …and did not re-arm itself
 
@@ -380,21 +467,23 @@ describe('typing emitter — BOTH loops share one floor (#3084)', () => {
     expect(emitter.pendingCatchUps()).toBe(1)
     emitter.cancelPending('chat-1')
     expect(emitter.pendingCatchUps()).toBe(0)
-    vi.advanceTimersByTime(10_000)
+    clock.advanceBy(10_000)
     expect(sent).toHaveLength(2) // nothing fired after the turn ended
+    expect(clock.pending()).toBe(0) // no timer leaked
   })
 
   it('a flood window cancels the catch-up instead of deferring a ping into the ban', () => {
+    const clock = createVirtualClock(0)
     let floodOpen = false
     const sent: Sent[] = []
     const emitter = createTypingEmitter({
       chatKey,
-      now: () => Date.now(),
+      now: clock.now,
       isSuppressed: () => floodOpen,
-      schedule: (fn, ms) => setTimeout(fn, ms),
-      cancel: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
+      schedule: clock.schedule,
+      cancel: clock.cancel,
       send: (chatId, threadId, action) =>
-        sent.push({ chatId, threadId, action, at: Date.now() }),
+        sent.push({ chatId, threadId, action, at: clock.now() }),
     })
 
     emitter.emit('chat-1')
@@ -402,11 +491,11 @@ describe('typing emitter — BOTH loops share one floor (#3084)', () => {
     expect(emitter.pendingCatchUps()).toBe(1)
 
     floodOpen = true
-    vi.advanceTimersByTime(TYPING_FLOOR_MS) // catch-up fires INTO the ban…
+    clock.advanceBy(TYPING_FLOOR_MS) // catch-up fires INTO the ban…
     expect(sent).toHaveLength(1) // …and is suppressed, not sent
     expect(emitter.pendingCatchUps()).toBe(0)
 
-    vi.advanceTimersByTime(60_000)
+    clock.advanceBy(60_000)
     expect(sent).toHaveLength(1)
   })
 })
