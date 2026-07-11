@@ -173,17 +173,18 @@ export const RolloutRequestSchema = z.object({
       /** Comma-free explicit subset of agents to roll. Omit ⇒ all
        *  configured agents (canary-first ordering still applies). */
       agents: z.array(AgentNameSchema).min(1).optional(),
-      /** Skip the web + hostd refresh step. On the hostd/MCP path the
-       *  hostd/web refresh is ALWAYS deferred regardless (it would
-       *  SIGKILL the in-flight rollout — hostd's own child); this flag
-       *  is forwarded for parity but the deferral is unconditional. */
+      /** Skip the web refresh step (leaves switchroom-web on the prior
+       *  version). On the hostd/MCP path the HOSTD self-refresh is ALWAYS
+       *  deferred regardless of this flag (it would SIGKILL the in-flight
+       *  rollout — hostd's own child); the WEB refresh runs in-plan there
+       *  unless this flag skips it. */
       skip_web: z.boolean().optional(),
       /**
        * Operator-approved rollback to a known-good earlier tag (#2487 PR2).
        * When set, the downgrade guard in `switchroom rollout` is relaxed to
        * permit `--pin <oldtag>` even when that tag is older than the current
        * `release.pin`. All other safety rails (canary order, version-assert,
-       * stop-on-mismatch, persist-after-canary, hostd/web deferral) apply
+       * stop-on-mismatch, persist-after-canary, hostd deferral) apply
        * unchanged. Absent ⇒ false (downgrade rejected as before).
        */
       allow_downgrade: z.boolean().optional(),

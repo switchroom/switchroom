@@ -2,7 +2,7 @@
  * #2726 Part 2 — the log-tailed rollout NARRATION surface.
  *
  * ONE ordinary operator-DM message, edited in place through the phases
- * (`applying → canary → agent N/M → persisting pin → hostd/web deferred →
+ * (`applying → canary → agent N/M → persisting pin → web refresh → hostd deferred →
  * ✅ done`, or `❌` with the failed step/agent). NOT pinned, NOT a bespoke card —
  * in-chat narration, the `chat-is-the-single-source-of-truth` invariant's own
  * prescribed remedy (a plain message the operator can scroll to).
@@ -235,6 +235,10 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
         return 2 * (phase.n ?? 1) + 0;
       case "agent-done":
         return 2 * (phase.n ?? 1) + 1;
+      case "web-refresh":
+        // In-plan web singleton refresh — after every agent restart, before
+        // the deferral note. Anchored just below hostd-web-deferred.
+        return Number.MAX_SAFE_INTEGER - 2;
       case "hostd-web-deferred":
         return Number.MAX_SAFE_INTEGER - 1; // near the end, before terminal
       default:

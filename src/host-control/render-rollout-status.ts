@@ -88,8 +88,12 @@ function phaseLine(s: RolloutRenderState): string {
       return `agent ${s.n ?? "?"}/${s.m ?? "?"} — ${s.agent ? `\`${s.agent}\`` : ""} done`.trim();
     case "persist-pin":
       return "persisting pin";
+    case "web-refresh":
+      return "refreshing web dashboard (webd install)";
     case "hostd-web-deferred":
-      return "hostd/web refresh deferred (run host-side)";
+      // Legacy phase name: since the in-plan refresh-web step landed, only
+      // the hostd self-refresh is actually deferred on the agent path.
+      return "hostd refresh deferred (run host-side)";
     case "self-bump":
       return "hostd refreshing itself to the target (brief control blip)…";
     case "self-bump-done":

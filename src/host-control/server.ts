@@ -1481,8 +1481,9 @@ export class HostdServer {
    *   1. The spawned CLI runs with `SWITCHROOM_HOSTD_CONTEXT=1`, which
    *      flips the rollout to (a) persist the durable pin AFTER the canary
    *      confirms (not before — brick scenario #2), and (b) DROP the
-   *      hostd/web self-refresh (it would SIGKILL this very rollout, which
-   *      is hostd's own child — brick scenario #1).
+   *      hostd self-refresh (it would SIGKILL this very rollout, which
+   *      is hostd's own child — brick scenario #1). The web refresh runs
+   *      in-plan (separate compose project — safe to recreate from here).
    *   2. The outcome (`rolled[]` / `failedStep` / `failedAgent`) is
    *      preserved into STRUCTURED status fields, parsed from the child's
    *      sentinel line — NOT flattened into a stdout tail.
