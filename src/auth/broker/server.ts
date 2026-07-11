@@ -1214,6 +1214,12 @@ export class AuthBroker {
    * (`callerAccount` / mark-exhausted), and is structurally FALSE whenever
    * the config knob is unset (the no-behavior-change guarantee).
    * Overage-lifted accounts are never soft-avoided.
+   *
+   * DELIBERATE (PR 1/4 scope): a soft-avoid tier FLIP does not proactively
+   * fan out credential mirrors to agents — agents pick up the preference on
+   * their next broker read (get-credentials / refresh-tick fanout, which
+   * already routes through accountWithFailover). Probe-tick-driven rolls +
+   * announcements are PR 2 of the #3031 plan; do not add fanout here.
    */
   private isAccountSoftAvoided(account: string): boolean {
     const pct = this.config.auth?.proactive_failover_pct;
@@ -1237,12 +1243,16 @@ export class AuthBroker {
   /**
    * Tie-break score for an all-soft-avoid candidate set: the account's worst
    * fresh window utilization (lower = more headroom). Accounts with no fresh
-   * snapshot score lowest (an unmeasured account can't be soft-avoided, so it
-   * won't reach this tie-break in practice).
+   * snapshot score WORST (+Infinity): an account CAN reach this tie-break
+   * without fresh evidence — the hysteresis latch carries across a snapshot
+   * going stale (>24h) — and a latched-then-stale account must never beat a
+   * freshly-measured one (we have zero evidence it has headroom). Callers
+   * seed their fold so the first candidate still wins when every score is
+   * +Infinity (the tie-break never returns null / shrinks availability).
    */
   private softAvoidUtilScore(account: string): number {
     const s = this.lastQuotaCache[account];
-    if (!s || !snapshotFresh(s, this.now())) return -1;
+    if (!s || !snapshotFresh(s, this.now())) return Number.POSITIVE_INFINITY;
     return Math.max(s.fiveHourUtilizationPct, s.sevenDayUtilizationPct);
   }
 
@@ -1447,9 +1457,16 @@ export class AuthBroker {
     if (!exhausted && !this.isAccountSoftAvoided(account)) return account;
     // Pass 1 — first fallback candidate that is neither exhausted nor
     // soft-avoided (the preference ranking: fully-eligible beats soft-avoid).
+    // Track whether soft-avoid actually excluded anyone: if it never fired,
+    // pass 2's predicates are identical to this scan, so it can be skipped
+    // (no pointless credential re-reads — identical behavior, less I/O).
+    let softAvoidExcludedAny = false;
     for (const cand of this.config.auth?.fallback_order ?? []) {
       if (cand === account || this.isAccountExhausted(cand)) continue;
-      if (this.isAccountSoftAvoided(cand)) continue;
+      if (this.isAccountSoftAvoided(cand)) {
+        softAvoidExcludedAny = true;
+        continue;
+      }
       if (readAccountCredentials(cand, this.home)) return cand;
     }
     if (!exhausted) {
@@ -1473,9 +1490,14 @@ export class AuthBroker {
     }
     // Pass 2 — exhausted, and no fully-eligible fallback: the pre-#3031
     // behavior. A soft-avoided fallback beats retrying a hard-exhausted pin.
-    for (const cand of this.config.auth?.fallback_order ?? []) {
-      if (cand === account || this.isAccountExhausted(cand)) continue;
-      if (readAccountCredentials(cand, this.home)) return cand;
+    // Only worth scanning when pass 1 actually excluded someone for being
+    // soft-avoided — otherwise the predicates are identical and pass 1
+    // already proved no candidate has credentials.
+    if (softAvoidExcludedAny) {
+      for (const cand of this.config.auth?.fallback_order ?? []) {
+        if (cand === account || this.isAccountExhausted(cand)) continue;
+        if (readAccountCredentials(cand, this.home)) return cand;
+      }
     }
     // Last-resort: if auth.active is set, is different from the exhausted
     // account, is itself not exhausted, and has credentials, use it.
@@ -2172,6 +2194,10 @@ export class AuthBroker {
       socket.write(encodeError(id, "INTERNAL", (err as Error).message));
       return;
     }
+    // A (re-)added label starts with a fresh soft-avoid latch — any state
+    // left over from a previously-removed account of the same name (or a
+    // replace) belongs to the old credentials, not these.
+    delete this.softAvoidState[label];
     // #1447 (WS1-F1): broker runs as root in production (auth-broker
     // container) and the writes above leave the dir + files root:root.
     // The operator's CLI then can't read them — chown back to the
@@ -2228,6 +2254,9 @@ export class AuthBroker {
     delete this.thresholdViolations[label];
     this.lastWrittenExpiresAt.delete(label);
     delete this.lastQuotaCache[label];
+    // Soft-avoid hysteresis is per-label in-memory state — prune it with the
+    // account so a later re-add of the same label starts with a clean latch.
+    delete this.softAvoidState[label];
     this.persistShaIndex();
     this.persistQuota();
     this.persistThresholdViolations();
@@ -3090,7 +3119,10 @@ export class AuthBroker {
       if (this.isAccountExhausted(cand) || !accountExists(cand, this.home)) continue;
       if (!this.isAccountSoftAvoided(cand)) return cand;
       const score = this.softAvoidUtilScore(cand);
-      if (score < bestScore) {
+      // `=== null` seed: even when every candidate scores +Infinity (all
+      // latched with stale snapshots) the first one still wins — the
+      // tie-break must never return null when a serveable candidate exists.
+      if (bestSoftAvoided === null || score < bestScore) {
         bestSoftAvoided = cand;
         bestScore = score;
       }

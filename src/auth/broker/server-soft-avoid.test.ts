@@ -97,9 +97,14 @@ function makeBroker(opts: {
       consumers: opts.consumers,
     },
   } as unknown as SwitchroomConfig;
+  // The broker mkdirs its stateDir in start(); these tests exercise private
+  // selection paths without starting listeners, so create it here (the
+  // rm/re-add ops persist their indexes into it).
+  const stateDir = join(home, ".switchroom", "state", "auth-broker");
+  mkdirSync(stateDir, { recursive: true });
   const broker = new AuthBroker(config, {
     home,
-    stateDir: join(home, ".switchroom", "state", "auth-broker"),
+    stateDir,
     now: () => NOW,
     disableRefreshLoop: true,
     skipHealthyMarker: true,
@@ -325,6 +330,167 @@ describe("overage exemption", () => {
     seedSnap(b, "bob", 0, 0);
     expect(b.isAccountSoftAvoided("alice")).toBe(true);
     expect(b.accountWithFailover("alice")).toBe("bob");
+  });
+});
+
+describe("stale-snapshot latched accounts in the tie-break", () => {
+  it("a latched-then-stale account LOSES the all-soft-avoid tie-break to a fresh one", () => {
+    const { b } = makeBroker({
+      active: "alice",
+      fallbackOrder: ["alice", "bob"],
+      pct: 95,
+      accounts: ["alice", "bob"],
+    });
+    // alice latches on fresh evidence…
+    seedSnap(b, "alice", 10, 96);
+    expect(b.isAccountSoftAvoided("alice")).toBe(true);
+    // …then her snapshot goes stale (>24h) — the latch carries (no fresh
+    // evidence to flip it) but her util score must now be WORST, not best.
+    seedSnap(b, "alice", 10, 96, { capturedAt: NOW - 25 * 3_600_000 });
+    expect(b.isAccountSoftAvoided("alice")).toBe(true);
+    // bob is freshly measured and soft-avoided at 97.
+    seedSnap(b, "bob", 10, 97);
+    expect(b.isAccountSoftAvoided("bob")).toBe(true);
+    // All-soft-avoid tie-break: freshly-measured bob (97) must beat
+    // stale-latched alice (unknown headroom), in BOTH selectors.
+    expect(b.accountWithFailover("alice")).toBe("bob");
+    expect(b.nextHealthyAccount("alice", ["alice", "bob"])).toBe("bob");
+  });
+
+  it("all soft-avoided candidates stale → still never null (first candidate wins)", () => {
+    const { b } = makeBroker({
+      active: "alice",
+      fallbackOrder: ["alice", "bob"],
+      pct: 95,
+      accounts: ["alice", "bob"],
+    });
+    for (const label of ["alice", "bob"]) {
+      seedSnap(b, label, 10, 96);
+      expect(b.isAccountSoftAvoided(label)).toBe(true);
+      seedSnap(b, label, 10, 96, { capturedAt: NOW - 25 * 3_600_000 });
+    }
+    expect(b.nextHealthyAccount("alice", ["alice", "bob"])).toBe("bob");
+    expect(b.accountWithFailover("alice")).toBe("alice");
+  });
+});
+
+describe("soft-avoid state lifecycle (rm / re-add)", () => {
+  const operator = { kind: "operator" } as const;
+  const fakeSocket = () => ({ write: () => true }) as any;
+
+  it("rm-account prunes the label's soft-avoid hysteresis state", async () => {
+    const { b } = makeBroker({
+      active: "alice",
+      fallbackOrder: ["alice", "bob"],
+      pct: 95,
+      accounts: ["alice", "bob"],
+    });
+    seedSnap(b, "bob", 10, 96);
+    expect(b.isAccountSoftAvoided("bob")).toBe(true);
+    expect(b.softAvoidState["bob"]).toBeDefined();
+    await b.opRmAccount(fakeSocket(), "req-1", operator, "bob");
+    expect(b.softAvoidState["bob"]).toBeUndefined();
+  });
+
+  it("re-adding a label starts with a fresh latch (no ghost soft-avoid)", async () => {
+    const { b } = makeBroker({
+      active: "alice",
+      fallbackOrder: ["alice", "bob"],
+      pct: 95,
+      accounts: ["alice", "bob"],
+    });
+    seedSnap(b, "bob", 10, 96);
+    expect(b.isAccountSoftAvoided("bob")).toBe(true);
+    await b.opAddAccount(
+      fakeSocket(),
+      "req-2",
+      operator,
+      "bob",
+      {
+        claudeAiOauth: {
+          accessToken: "at-" + "bob2",
+          refreshToken: "rt-" + "bob2",
+          expiresAt: NOW + 24 * 60 * 60 * 1000,
+          scopes: ["user:inference"],
+          subscriptionType: "max",
+        },
+      },
+      true, // replace
+    );
+    expect(b.softAvoidState["bob"]).toBeUndefined();
+    // With the stale latch gone and no fresh over-threshold snapshot for the
+    // new credentials, the label is not soft-avoided until re-measured hot.
+    delete b.lastQuotaCache["bob"];
+    expect(b.isAccountSoftAvoided("bob")).toBe(false);
+  });
+});
+
+describe("accountWithFailover edge cases", () => {
+  it("empty-string account returns null (deliberate change from returning '')", () => {
+    const { b } = makeBroker({
+      active: "alice",
+      fallbackOrder: ["alice"],
+      accounts: ["alice"],
+    });
+    expect(b.accountWithFailover("")).toBe(null);
+    expect(b.accountWithFailover(null)).toBe(null);
+    expect(b.accountWithFailover(undefined)).toBe(null);
+  });
+});
+
+describe("live-wins interplay with exhaustion marks (most-recent-signal-wins)", () => {
+  it("unexpired mark + FRESHER 95% snapshot → eligible AND soft-avoided simultaneously", () => {
+    const { b } = makeBroker({
+      active: "alice",
+      fallbackOrder: ["alice", "bob"],
+      pct: 95,
+      accounts: ["alice", "bob"],
+    });
+    // Mark says exhausted until tomorrow, written 2h ago…
+    b.quota["alice"] = { exhausted_until: NOW + 24 * 3_600_000, marked_at: NOW - 2 * 3_600_000 };
+    // …but a FRESHER live probe (60s ago) shows 95% — below the wall.
+    seedSnap(b, "alice", 10, 95);
+    seedSnap(b, "bob", 10, 10);
+    // Live wins: not blocked (eligible to serve)…
+    expect(b.isAccountExhausted("alice")).toBe(false);
+    expect(b.accountEligibilityOf("alice")).toBe("eligible");
+    // …AND simultaneously in the soft-avoid preference tier (95 ≥ pct).
+    expect(b.isAccountSoftAvoided("alice")).toBe(true);
+    // Net effect: serveable but out-ranked by the fully-eligible fallback.
+    expect(b.accountWithFailover("alice")).toBe("bob");
+  });
+});
+
+describe("7d latch vs advancing 5h reset epoch (server-level)", () => {
+  it("holds a 7d-driven latch across a real fiveHourResetAt roll", () => {
+    const { b } = makeBroker({
+      active: "alice",
+      fallbackOrder: ["alice", "bob"],
+      pct: 95,
+      accounts: ["alice", "bob"],
+    });
+    seedSnap(b, "bob", 0, 0);
+    // Enter on 7d=96 with real ISO reset stamps on both windows.
+    seedSnap(b, "alice", 10, 96, {
+      fiveHourResetAt: new Date(NOW + 3_600_000).toISOString(),
+      sevenDayResetAt: new Date(NOW + 86_400_000).toISOString(),
+    });
+    expect(b.isAccountSoftAvoided("alice")).toBe(true);
+    // Next probe: 7d dips into the hysteresis band (93) and the 5h reset
+    // epoch ADVANCED (the 5h window rolled). The 7d-driven latch must hold.
+    seedSnap(b, "alice", 10, 93, {
+      fiveHourResetAt: new Date(NOW + 5 * 3_600_000).toISOString(),
+      sevenDayResetAt: new Date(NOW + 86_400_000).toISOString(),
+    });
+    expect(b.isAccountSoftAvoided("alice")).toBe(true);
+    expect(b.accountWithFailover("alice")).toBe("bob");
+    // Only the 7d window's own reset releases it.
+    seedSnap(b, "alice", 10, 93, {
+      fiveHourResetAt: new Date(NOW + 5 * 3_600_000).toISOString(),
+      sevenDayResetAt: new Date(NOW + 8 * 86_400_000).toISOString(),
+    });
+    expect(b.isAccountSoftAvoided("alice")).toBe(false);
+    expect(b.accountWithFailover("alice")).toBe("alice");
   });
 });
 

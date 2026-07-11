@@ -372,6 +372,16 @@ export function softAvoidThresholds(pct: number): { sevenDay: number; fiveHour: 
  */
 export interface SoftAvoidState {
   softAvoided: boolean;
+  /**
+   * Which window(s) latched the current soft-avoid. Only a TRIGGERING
+   * window's reset (or its util dropping clear of the exit threshold) may
+   * release the latch — the 5h epoch advances every ≤5h, so letting ANY
+   * window's reset clear a 7d-driven latch would cap the 7d hysteresis at
+   * ~5h and reintroduce the flapping the latch exists to prevent.
+   * Absent (legacy state written before this field) → treated as
+   * both-triggered, the conservative/stickier direction.
+   */
+  triggeredBy?: { fiveHour: boolean; sevenDay: boolean };
   fiveHourResetAt?: number | null;
   sevenDayResetAt?: number | null;
 }
@@ -397,10 +407,15 @@ export interface SoftAvoidSnapshot extends QuotaSnapshot {
  *    soft-avoided: the operator explicitly opted them into serving past the
  *    wall, so pre-wall avoidance would be nonsense.
  *  - ENTER when a fresh snapshot shows 7d ≥ pct, or 5h ≥ min(pct+3, 98).
- *  - EXIT (hysteresis) only when BOTH windows are below their entry
- *    threshold minus {@link SOFT_AVOID_EXIT_MARGIN}, or when a window whose
- *    utilization latched the state has visibly reset (reset epoch advanced,
- *    or the snapshot's own reset time has passed → window refilled).
+ *    The state records WHICH window(s) triggered ({@link SoftAvoidState}
+ *    `triggeredBy`).
+ *  - EXIT (hysteresis) only when EVERY triggering window has released:
+ *    a triggering window releases when its utilization drops below its
+ *    entry threshold minus {@link SOFT_AVOID_EXIT_MARGIN}, or when THAT
+ *    window has visibly reset (its reset epoch advanced, or the snapshot's
+ *    own reset time has passed → window refilled). A non-triggering
+ *    window's reset never releases the latch — the 5h epoch rolls every
+ *    ≤5h, which would cap a 7d-driven latch at ~5h.
  *  - No fresh snapshot → carry the previous state unchanged (no evidence to
  *    flip either way; a never-measured account is not soft-avoided).
  *
@@ -434,33 +449,47 @@ export function evaluateSoftAvoid(opts: {
   const five = fiveRefilled ? 0 : s.fiveHourUtilizationPct;
   const seven = sevenRefilled ? 0 : s.sevenDayUtilizationPct;
 
-  const nextState = (softAvoided: boolean): SoftAvoidState => ({
+  const nextState = (
+    softAvoided: boolean,
+    triggeredBy?: { fiveHour: boolean; sevenDay: boolean },
+  ): SoftAvoidState => ({
     softAvoided,
+    ...(softAvoided && triggeredBy ? { triggeredBy } : {}),
     fiveHourResetAt: s.fiveHourResetAtMs ?? prev?.fiveHourResetAt ?? null,
     sevenDayResetAt: s.sevenDayResetAtMs ?? prev?.sevenDayResetAt ?? null,
   });
 
-  const entered = seven >= thresholds.sevenDay || five >= thresholds.fiveHour;
-  if (entered) return nextState(true);
+  const fiveTriggered = five >= thresholds.fiveHour;
+  const sevenTriggered = seven >= thresholds.sevenDay;
+  if (fiveTriggered || sevenTriggered) {
+    return nextState(true, { fiveHour: fiveTriggered, sevenDay: sevenTriggered });
+  }
 
   if (prev?.softAvoided) {
-    // Latch is set. It clears on an observed window reset (epoch advanced
-    // since the state was written, or refill boundary crossed), else only
-    // when BOTH windows sit below entry-threshold minus the exit margin.
-    const resetAdvanced =
+    // Latch is set. It clears only when EVERY window that triggered it has
+    // released: released = that window's reset epoch advanced since the
+    // state was written (or its refill boundary crossed), OR its util now
+    // sits below entry-threshold minus the exit margin. A non-triggering
+    // window's reset must NOT release the latch — the 5h epoch advances
+    // every ≤5h, which would cap a 7d-driven latch at ~5h. Legacy states
+    // without `triggeredBy` are treated as both-triggered (stickier).
+    const trig = prev.triggeredBy ?? { fiveHour: true, sevenDay: true };
+    const fiveReleased =
+      !trig.fiveHour ||
+      fiveRefilled ||
       (prev.fiveHourResetAt != null &&
         s.fiveHourResetAtMs != null &&
         s.fiveHourResetAtMs > prev.fiveHourResetAt) ||
+      five < thresholds.fiveHour - SOFT_AVOID_EXIT_MARGIN;
+    const sevenReleased =
+      !trig.sevenDay ||
+      sevenRefilled ||
       (prev.sevenDayResetAt != null &&
         s.sevenDayResetAtMs != null &&
         s.sevenDayResetAtMs > prev.sevenDayResetAt) ||
-      fiveRefilled ||
-      sevenRefilled;
-    if (resetAdvanced) return nextState(false);
-    const clearlyBelow =
-      seven < thresholds.sevenDay - SOFT_AVOID_EXIT_MARGIN &&
-      five < thresholds.fiveHour - SOFT_AVOID_EXIT_MARGIN;
-    return nextState(!clearlyBelow);
+      seven < thresholds.sevenDay - SOFT_AVOID_EXIT_MARGIN;
+    if (fiveReleased && sevenReleased) return nextState(false);
+    return nextState(true, trig);
   }
   return nextState(false);
 }

@@ -138,6 +138,119 @@ describe("evaluateSoftAvoid — window reset clears the latch", () => {
     expect(after.softAvoided).toBe(false);
   });
 
+  it("a 7d-driven latch SURVIVES the 5h reset epoch advancing (7d still in the band)", () => {
+    // Regression: the 5h epoch advances every ≤5h, so if ANY window's reset
+    // cleared the latch, 7d hysteresis would be capped at ~5h → flapping.
+    const entered = evaluateSoftAvoid({
+      snapshot: snap(10, 96, {
+        fiveHourResetAtMs: NOW + 3_600_000,
+        sevenDayResetAtMs: NOW + 86_400_000,
+      }),
+      now: NOW,
+      pct: 95,
+    });
+    expect(entered.softAvoided).toBe(true);
+    expect(entered.triggeredBy).toEqual({ fiveHour: false, sevenDay: true });
+    // Next probe 4h later: 7d dipped into the hysteresis band (93), the 5h
+    // window rolled (epoch advanced) — latch must HOLD; 5h never triggered.
+    const later = NOW + 4 * 3_600_000;
+    const after = evaluateSoftAvoid({
+      snapshot: snap(10, 93, {
+        capturedAt: later - 60_000,
+        fiveHourResetAtMs: later + 3_600_000, // advanced past entry's epoch
+        sevenDayResetAtMs: NOW + 86_400_000, // unchanged
+      }),
+      now: later,
+      pct: 95,
+      prev: entered,
+    });
+    expect(after.softAvoided).toBe(true);
+    // ...and it keeps holding across further 5h rolls until the 7d window
+    // itself resets or drops clear of the band.
+    const evenLater = later + 5 * 3_600_000;
+    const still = evaluateSoftAvoid({
+      snapshot: snap(10, 94, {
+        capturedAt: evenLater - 60_000,
+        fiveHourResetAtMs: evenLater + 3_600_000,
+        sevenDayResetAtMs: NOW + 86_400_000,
+      }),
+      now: evenLater,
+      pct: 95,
+      prev: after,
+    });
+    expect(still.softAvoided).toBe(true);
+    // The 7d window's OWN reset finally releases it.
+    const released = evaluateSoftAvoid({
+      snapshot: snap(10, 93, {
+        capturedAt: evenLater - 30_000,
+        fiveHourResetAtMs: evenLater + 3_600_000,
+        sevenDayResetAtMs: NOW + 8 * 86_400_000, // 7d epoch advanced
+      }),
+      now: evenLater,
+      pct: 95,
+      prev: still,
+    });
+    expect(released.softAvoided).toBe(false);
+  });
+
+  it("a 5h-driven latch is released by the 5h window's own reset", () => {
+    const entered = evaluateSoftAvoid({
+      snapshot: snap(98, 10, {
+        fiveHourResetAtMs: NOW + 3_600_000,
+        sevenDayResetAtMs: NOW + 86_400_000,
+      }),
+      now: NOW,
+      pct: 95,
+    });
+    expect(entered.triggeredBy).toEqual({ fiveHour: true, sevenDay: false });
+    const after = evaluateSoftAvoid({
+      snapshot: snap(94, 10, {
+        // still in the 5h band (≥ 98-5=93), but the 5h epoch advanced
+        fiveHourResetAtMs: NOW + 5 * 3_600_000,
+        sevenDayResetAtMs: NOW + 86_400_000,
+      }),
+      now: NOW,
+      pct: 95,
+      prev: entered,
+    });
+    expect(after.softAvoided).toBe(false);
+  });
+
+  it("a 7d-driven latch is NOT released by the 5h window refilling (reset time passed)", () => {
+    const entered = evaluateSoftAvoid({
+      snapshot: snap(10, 96, { fiveHourResetAtMs: NOW + 3_600_000 }),
+      now: NOW,
+      pct: 95,
+    });
+    expect(entered.softAvoided).toBe(true);
+    // Two hours on: the snapshot's own 5h reset time has passed (refill),
+    // 7d still in the band — the latch holds.
+    const later = NOW + 2 * 3_600_000;
+    const after = evaluateSoftAvoid({
+      snapshot: snap(97, 93, {
+        capturedAt: NOW + 3_000_000, // captured before the 5h reset passed
+        fiveHourResetAtMs: NOW + 3_600_000,
+      }),
+      now: later,
+      pct: 95,
+      prev: entered,
+    });
+    expect(after.softAvoided).toBe(true);
+  });
+
+  it("legacy latched state without triggeredBy needs BOTH windows to release (sticky)", () => {
+    const prev: SoftAvoidState = { softAvoided: true, fiveHourResetAt: NOW + 3_600_000 };
+    // 5h epoch advanced but 7d (treated as a trigger) still in the band → holds.
+    expect(
+      evaluateSoftAvoid({
+        snapshot: snap(10, 93, { fiveHourResetAtMs: NOW + 5 * 3_600_000 }),
+        now: NOW,
+        pct: 95,
+        prev,
+      }).softAvoided,
+    ).toBe(true);
+  });
+
   it("a snapshot whose reset time has passed reads that window as refilled (0%)", () => {
     // 7d shows 96 but its reset was an hour ago → treated as 0 → no entry.
     const state = evaluateSoftAvoid({
