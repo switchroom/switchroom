@@ -155,6 +155,7 @@ import {
   computeBootSweepStripTargets,
   distinctRequestIds,
 } from './permission-rearm.js'
+import { sweepPermissionTtl } from './permission-ttl-sweep.js'
 import { createMissedApprovalsStore, type MissedApproval } from './missed-approvals-store.js'
 import {
   createAlwaysAllowPersistQueue,
@@ -173,7 +174,6 @@ import {
   safeActionForRecord,
   selectOldestHeld,
   selectHeldForRedelivery,
-  isHeldUndeliverable,
   holdReasonFor,
   heldRetryBackoffMs,
   type UndeliverableMark,
@@ -7243,34 +7243,19 @@ const pendingStateReaper = setInterval(() => {
     if (now >= v.expiresAt) pendingAuthRmFlows.delete(k)
   }
   pendingVaultOps.sweep(now)
-  for (const [k, v] of pendingPermissions) {
-    // ─── THE LEASH (#3084 follow-up) ──────────────────────────────────────
-    // A HELD entry never expires. The TTL answers one question: "how long did
-    // the operator have to answer?" For a card that never landed — the send
-    // failed against a Telegram flood ban, a network partition, a 5xx — the
-    // answer is ZERO SECONDS. Running a clock the operator was never shown, and
-    // then reporting that silence to the agent as a denial, is the operator's
-    // own leash deciding for them.
-    //
-    // This is the exact 2026-07-11 overlord incident: a 4.6h ban against a
-    // 60-min TTL made the auto-deny below GUARANTEED to fire on an approval no
-    // human had ever seen. We escaped only because someone answered in tmux at
-    // ~50 minutes.
-    //
-    // Ken's call, explicit: hold, and make the block visible. Never auto-approve.
-    // Never auto-deny — not even on a deadline. The agent stays blocked; the card
-    // is re-delivered by sweepHeldPermissionCards() above once the channel
-    // reopens, and on delivery `startedAt` resets so the operator gets their full
-    // decision window starting from when they could first act.
-    //
-    // An indefinite block is BY DESIGN — /pending and tmux remain the escape
-    // hatches, and the block is surfaced off-Telegram in blocked-approvals/.
-    // reference/invariants.md § no-self-escalation, § on-leash.
-    if (isHeldUndeliverable(v)) continue
-    // hostd gated fleet-mutation verbs get a longer (30-min) human-scale
-    // decision window than the 10-min default (Bug 2 fix #2).
-    const ttl = ttlForTool(v.tool_name)
-    if (now - v.startedAt > ttl) {
+  // THE LEASH. The sweep — the guard AND the auto-deny it gates — now lives in
+  // permission-ttl-sweep.ts, and the outcome test's harness drives that exact
+  // function. It used to be an inline loop here while the harness kept a PRIVATE
+  // copy of the guard, so deleting the real check left every behavioural assertion
+  // GREEN and only a source-text grep noticed. A test that cannot fail is not a
+  // test, and this is the test for `no-self-escalation`. One implementation, two
+  // callers: there is no longer a gateway-side line whose deletion restores the
+  // auto-deny without removing the sweep entirely.
+  sweepPermissionTtl({
+    entries: pendingPermissions,
+    now,
+    ttlForTool,
+    onExpire: (k, v, ttl) => {
       // Don't just drop it: the claude turn is suspended INSIDE the MCP
       // permission call waiting for a verdict. A silent delete left it
       // wedged forever when the operator never tapped — permanent
@@ -7349,8 +7334,8 @@ const pendingStateReaper = setInterval(() => {
       pendingPermissions.delete(k)
       permCardStore.remove(k)
       reconcileBlockedApprovals()
-    }
-  }
+    },
+  })
   // Drop no-repeat suppression entries past the safety-cap window (the primary
   // bound is the operator-activity reset; this just keeps the map from growing).
   for (const [sig, at] of permissionTimeoutSignatures) {
