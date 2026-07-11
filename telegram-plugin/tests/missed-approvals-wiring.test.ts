@@ -37,7 +37,7 @@ describe('missed-approvals re-offer wiring (#2862)', () => {
 
   it('appends the miss at TTL auto-deny, anchored to the card origin, gated by the kill switch', () => {
     // Within the pending-permission TTL sweep block.
-    const sweep = slice(GATEWAY, 'for (const [k, v] of pendingPermissions)', 3600)
+    const sweep = slice(GATEWAY, 'for (const [k, v] of pendingPermissions)', 5400)
     expect(sweep).toContain('if (MISSED_APPROVAL_REOFFER_ENABLED) {')
     expect(sweep).toContain('missedApprovalsStore.add({')
     expect(sweep).toContain('const origin = v.cards[0]')

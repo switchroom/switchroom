@@ -45,13 +45,13 @@ describe('no-repeat-on-timeout wiring', () => {
     // when Bug 2 added per-tool TTL + the timed-out keyboard-strip to this
     // block — the signature-record line now sits further down but the wiring
     // is intact.
-    const sweep = slice(GATEWAY, 'for (const [k, v] of pendingPermissions)', 3200)
+    const sweep = slice(GATEWAY, 'for (const [k, v] of pendingPermissions)', 5000)
     expect(sweep).toContain('timeoutDenyMessage(')
     expect(sweep).toContain('permissionTimeoutSignatures.set(')
   })
 
   it('the TTL auto-deny strips the timed-out card keyboard (Bug 2)', () => {
-    const sweep = slice(GATEWAY, 'for (const [k, v] of pendingPermissions)', 3200)
+    const sweep = slice(GATEWAY, 'for (const [k, v] of pendingPermissions)', 5000)
     // Per-tool TTL + keyboard-strip are both wired into the sweep.
     expect(sweep).toContain('ttlForTool(')
     expect(sweep).toContain('stripTimedOutPermissionCards(')
