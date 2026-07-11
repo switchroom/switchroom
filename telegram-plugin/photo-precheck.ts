@@ -27,7 +27,7 @@
  * WebP, the formats behind the gateway's PHOTO_EXTS set.
  */
 
-import { readFileSync, statSync } from 'node:fs'
+import { closeSync, fstatSync, openSync, readSync } from 'node:fs'
 
 export interface ImageProbe {
   width: number
@@ -112,15 +112,44 @@ export function probeImageDimensions(buf: Buffer): { width: number; height: numb
   return pngDimensions(buf) ?? jpegDimensions(buf) ?? gifDimensions(buf) ?? webpDimensions(buf)
 }
 
+/**
+ * Fixed-size header reads — never readFileSync the whole image (a 10MB
+ * screenshot would be a multi-MB sync read on the event loop for a
+ * ~30-byte probe). PNG needs 24 bytes, GIF 10, WebP (VP8X/VP8L/VP8 )
+ * tops out at offset 30 — so 32 bytes covers every fixed-offset format.
+ * JPEG is the exception: SOFn sits past variable-length APPn segments
+ * (EXIF/ICC metadata), so when the 32-byte sniff says JPEG we re-read a
+ * 64KB window. If SOFn is buried deeper than that, the probe returns
+ * null and the caller keeps the photo route (#3022 reactive backstop).
+ */
+const HEADER_PROBE_BYTES = 32
+const JPEG_PROBE_BYTES = 64 * 1024
+
 /** Probe an image file on disk. Returns null on read failure or unknown format. */
 export function probeImageFile(path: string): ImageProbe | null {
+  let fd: number | undefined
   try {
-    const bytes = statSync(path).size
-    const dims = probeImageDimensions(readFileSync(path))
+    fd = openSync(path, 'r')
+    const bytes = fstatSync(fd).size
+    const headBuf = Buffer.alloc(HEADER_PROBE_BYTES)
+    const headRead = readSync(fd, headBuf, 0, HEADER_PROBE_BYTES, 0)
+    let probe = headBuf.subarray(0, headRead)
+    if (headRead >= 2 && probe[0] === 0xff && probe[1] === 0xd8) {
+      // JPEG: extend to a 64KB window so the marker walk can skip
+      // APPn metadata segments and reach SOFn.
+      const jpegBuf = Buffer.alloc(Math.min(JPEG_PROBE_BYTES, bytes))
+      const jpegRead = readSync(fd, jpegBuf, 0, jpegBuf.length, 0)
+      probe = jpegBuf.subarray(0, jpegRead)
+    }
+    const dims = probeImageDimensions(probe)
     if (!dims || dims.width <= 0 || dims.height <= 0) return null
     return { ...dims, bytes }
   } catch {
     return null
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd) } catch { /* best-effort */ }
+    }
   }
 }
 
@@ -142,6 +171,21 @@ export function photoSendViolation(probe: ImageProbe): string | null {
     return `file size ${(bytes / (1024 * 1024)).toFixed(1)}MB exceeds ${PHOTO_MAX_BYTES / (1024 * 1024)}MB photo ceiling`
   }
   return null
+}
+
+/**
+ * Suffix for the reply tool's result text when files were rerouted from
+ * the photo path to sendDocument (precheck or reactive fallback). The
+ * agent only sees the tool result — without this it may claim an inline
+ * image rendered when it actually went out as a file attachment.
+ * Returns '' when nothing was rerouted.
+ */
+export function rerouteResultSuffix(reroutes: Array<{ path: string; reason: string }>): string {
+  if (reroutes.length === 0) return ''
+  const details = reroutes
+    .map((r) => `${r.path.split('/').pop() ?? r.path}: ${r.reason}`)
+    .join('; ')
+  return ` (${reroutes.length} file(s) sent as document, not inline photo: ${details})`
 }
 
 /**
