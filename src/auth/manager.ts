@@ -16,13 +16,11 @@ import { resolveAgentsDir } from "../config/loader.js";
 import { probeForCodePrompt } from "./pane-ready-probe.js";
 import {
   getSlotInfos,
-  listSlots,
   migrateLegacyIfNeeded,
   pickFallbackSlot,
   readActiveSlot,
   removeSlot,
   slotTokenPath,
-  suggestSlotName,
   syncLegacyFromActive,
   useSlot,
   validateSlotName,
@@ -338,21 +336,6 @@ function writeOAuthToken(
   }
 
   return tokenPath;
-}
-
-/**
- * Pick a slot name for a new `auth add` flow. Auto-generates when omitted.
- * Exported so the CLI can echo the chosen name back to the user.
- */
-export function resolveSlotForAdd(
-  agentDir: string,
-  requested: string | undefined,
-): string {
-  if (requested) {
-    validateSlotName(requested);
-    return requested;
-  }
-  return suggestSlotName(agentDir);
 }
 
 /**
@@ -1026,35 +1009,10 @@ export function cancelAuthSession(
 
 /* ── Multi-account high-level helpers (for CLI use) ──────────────────── */
 
-export function addAccountStart(
-  name: string,
-  agentDir: string,
-  requested?: string,
-): AuthSessionResult & { slot: string } {
-  // Ensure legacy layout is migrated so the current token becomes "default"
-  // before we allocate a new slot name (otherwise "default" would appear free
-  // when it actually reflects the legacy token).
-  migrateLegacyIfNeeded(agentDir);
-  const slot = resolveSlotForAdd(agentDir, requested);
-  const result = startAuthSession(name, agentDir, { force: false, slot });
-  return { ...result, slot };
-}
-
 export function listAccounts(name: string, agentDir: string): SlotInfo[] {
   migrateLegacyIfNeeded(agentDir);
   void name;
   return getSlotInfos(agentDir);
-}
-
-export function switchAccount(
-  name: string,
-  agentDir: string,
-  slot: string,
-): { slot: string } {
-  migrateLegacyIfNeeded(agentDir);
-  void name;
-  useSlot(agentDir, slot);
-  return { slot };
 }
 
 export function removeAccount(
@@ -1087,12 +1045,4 @@ export function fallbackToNextSlot(
 
 export function currentActiveSlot(agentDir: string): string | null {
   return readActiveSlot(agentDir);
-}
-
-export function ensureMigrated(agentDir: string): void {
-  migrateLegacyIfNeeded(agentDir);
-}
-
-export function listSlotNames(agentDir: string): string[] {
-  return listSlots(agentDir);
 }

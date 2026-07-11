@@ -82,16 +82,6 @@ export type AccountWindowState =
   | "walled"
   | "unprobed";
 
-/**
- * "out-of-credits" is no longer a state that blocks serving. An account with
- * `out_of_credits` at low util is healthy — `overageServeBlocking` is surfaced
- * as an informational annotation on the row, not as a separate wall state.
- * This alias exists so any code that references the old state string still
- * compiles during the transition; treat it as "healthy" semantically.
- * @deprecated — kept for backwards compat only; do not add new references.
- */
-export type LegacyOutOfCreditsState = "out-of-credits";
-
 /** Weekly utilization at/above this is treated as walled (mirrors the broker's sensor). */
 const WEEKLY_WALL_PCT = 99.5;
 
