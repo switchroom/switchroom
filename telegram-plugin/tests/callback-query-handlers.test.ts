@@ -44,12 +44,39 @@ import { InlineKeyboard } from 'grammy'
 // Mock the auth-broker client so the `auth:use:` swap path is observable
 // (spy on setActive) without a live UDS broker. Only handleAuthDashboardCallback
 // touches getAuthBrokerClient, so this is inert for every other family here.
-const brokerMock = vi.hoisted(() => ({
-  setActive: vi.fn(async () => ({ active: 'acct-b', fanned: ['a1'] })),
-}))
-vi.mock('../gateway/auth-broker-client.js', () => ({
-  getAuthBrokerClient: vi.fn(async () => ({ setActive: brokerMock.setActive })),
-}))
+//
+// The spy is created *inside* the factory and re-exported as a test-only
+// handle (`__setActiveSpy`) rather than closed over from a `vi.hoisted`
+// binding: bun's vitest-compat layer implements `vi.mock`/`vi.fn` but NOT
+// `vi.hoisted`, so a hoisted-closure mock throws `vi.hoisted is not a
+// function` under `bun test` (CI's bun-test-run shard runs this whole dir).
+// A single `setActive` instance is closed over and returned by every
+// `getAuthBrokerClient()` call, so the handler and the tests observe the
+// same spy.
+vi.mock('../gateway/auth-broker-client.js', () => {
+  const setActive = vi.fn(async () => ({ active: 'acct-b', fanned: ['a1'] }))
+  return {
+    getAuthBrokerClient: vi.fn(async () => ({ setActive })),
+  }
+})
+import { getAuthBrokerClient } from '../gateway/auth-broker-client.js'
+// The mocked getAuthBrokerClient closes over one shared `setActive` spy and
+// returns it on every call, so resolving the client here yields the SAME spy
+// the handler observes. A getter defers the read to test-run time (after the
+// mock is live under both runners); a beforeEach caches the resolved spy.
+let resolvedSetActiveSpy: ReturnType<typeof vi.fn> | undefined
+const brokerMock = {
+  get setActive(): ReturnType<typeof vi.fn> {
+    if (!resolvedSetActiveSpy) throw new Error('setActive spy not resolved yet')
+    return resolvedSetActiveSpy
+  },
+}
+beforeEach(async () => {
+  const client = (await getAuthBrokerClient('test-agent')) as {
+    setActive: ReturnType<typeof vi.fn>
+  }
+  resolvedSetActiveSpy = client.setActive
+})
 
 // ── Fakes ────────────────────────────────────────────────────────────────
 
