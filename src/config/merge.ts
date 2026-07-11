@@ -367,6 +367,24 @@ export function mergeAgentConfig(
     for (const [k, v] of Object.entries(override)) {
       if (v !== undefined) combined[k] = v;
     }
+    // shape cascade (#1856): the per-agent AgentSoulSchema defaults `shape`
+    // to "generalist", so a per-agent soul block that omits shape parses
+    // with shape:"generalist" — which would otherwise stomp an explicit
+    // profile/defaults-level shape during this field-by-field merge. We
+    // treat "generalist" as the NEUTRAL/unset shape: a profile-level
+    // explicit shape wins unless the agent selects a *different*
+    // non-generalist shape. Tradeoff (documented): an operator cannot use
+    // an explicit per-agent `shape: generalist` to override a profile shape
+    // — generalist reads as "no strong shape". Deterministic, no default
+    // sentinel guessing beyond the neutral-value convention.
+    const baseSoul = base as Record<string, unknown>;
+    const overrideSoul = override as Record<string, unknown>;
+    if (
+      baseSoul.shape !== undefined &&
+      (overrideSoul.shape === undefined || overrideSoul.shape === "generalist")
+    ) {
+      combined.shape = baseSoul.shape;
+    }
     // AgentSchema's soul requires name+style; the merged result might be
     // missing one or both if defaults supplies a partial and the agent
     // supplies nothing. That's fine for scaffold.ts which renders soul

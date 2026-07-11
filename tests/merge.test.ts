@@ -220,6 +220,30 @@ describe("mergeAgentConfig", () => {
     });
   });
 
+  it("soul shape: an explicit profile/default shape is NOT stomped by a per-agent defaulted 'generalist' (#1856)", () => {
+    const defaults: AgentDefaults = {
+      soul: { style: "warm", shape: "developer" },
+    };
+    // Simulates a per-agent soul parsed via AgentSoulSchema: shape defaults
+    // to "generalist" when the operator omits it.
+    const agent = baseAgent({
+      soul: { name: "Dev", style: "direct", shape: "generalist" },
+    });
+    const result = mergeAgentConfig(defaults, agent);
+    expect(result.soul?.shape).toBe("developer"); // profile shape survives
+  });
+
+  it("soul shape: a per-agent explicit NON-generalist shape overrides the profile shape (#1856)", () => {
+    const defaults: AgentDefaults = {
+      soul: { style: "warm", shape: "developer" },
+    };
+    const agent = baseAgent({
+      soul: { name: "EA", style: "direct", shape: "executive-assistant" },
+    });
+    const result = mergeAgentConfig(defaults, agent);
+    expect(result.soul?.shape).toBe("executive-assistant");
+  });
+
   it("shallow-merges memory field-by-field", () => {
     const defaults: AgentDefaults = {
       memory: { auto_recall: true, isolation: "default" },

@@ -23,7 +23,12 @@ describe("SwitchroomConfigSchema", () => {
           soul: {
             name: "Coach",
             style: "motivational, direct",
+            creature: "golden retriever",
+            vibe: "warm, high-energy",
+            expertise: "strength training, habit design",
+            emoji: "🏋️",
             boundaries: "not a doctor",
+            shape: "coach",
           },
           tools: {
             allow: ["calendar", "notion"],
@@ -50,6 +55,14 @@ describe("SwitchroomConfigSchema", () => {
     ]);
     expect(result.agents["health-coach"].memory?.collection).toBe("health");
     expect(result.agents["health-coach"].schedule).toHaveLength(1);
+    // #1856: first-class soul persona fields + shape round-trip.
+    expect(result.agents["health-coach"].soul?.creature).toBe("golden retriever");
+    expect(result.agents["health-coach"].soul?.vibe).toBe("warm, high-energy");
+    expect(result.agents["health-coach"].soul?.expertise).toBe(
+      "strength training, habit design",
+    );
+    expect(result.agents["health-coach"].soul?.emoji).toBe("🏋️");
+    expect(result.agents["health-coach"].soul?.shape).toBe("coach");
   });
 
   it("parses a minimal config with defaults", () => {

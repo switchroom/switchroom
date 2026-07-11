@@ -14,6 +14,7 @@ import {
   AgentDriveConfigSchema,
   AgentGoogleWorkspaceConfigSchema,
   AgentSchema,
+  AgentSoulSchema,
   DriveConfigSchema,
   GoogleWorkspaceConfigSchema,
   GoogleWorkspaceTierSchema,
@@ -1250,5 +1251,57 @@ describe("auth.proactive_failover_pct config field", () => {
         auth: { active: "alice", proactive_failover_pct: "95" },
       }),
     ).toThrow();
+  });
+});
+
+describe("AgentSoulSchema — first-class persona fields + shape (#1856)", () => {
+  it("(a) validates a full soul block with all 8 fields and round-trips values", () => {
+    const soul = {
+      name: "Sage",
+      style: "warm, concise",
+      creature: "owl",
+      vibe: "calm, precise",
+      expertise: "systems engineering",
+      emoji: "🦉",
+      boundaries: "not a doctor",
+      shape: "developer" as const,
+    };
+    const r = AgentSoulSchema.parse(soul);
+    expect(r).toEqual(soul);
+  });
+
+  it("(b) parses a soul block without shape to shape:'generalist'", () => {
+    const r = AgentSoulSchema.parse({ name: "X", style: "Y" });
+    expect(r?.shape).toBe("generalist");
+  });
+
+  it("(c) rejects an unknown shape with a message naming the field + allowed values", () => {
+    const r = AgentSoulSchema.safeParse({ name: "X", style: "Y", shape: "wizard" });
+    expect(r.success).toBe(false);
+    if (!r.success) {
+      const issue = r.error.issues.find((i) => i.path.join(".") === "shape");
+      expect(issue).toBeDefined();
+      // enum rejection lists the four allowed values
+      expect(issue?.message).toContain("executive-assistant");
+      expect(issue?.message).toContain("developer");
+      expect(issue?.message).toContain("coach");
+      expect(issue?.message).toContain("generalist");
+    }
+  });
+
+  it("(d) still validates a minimal soul (name + style only)", () => {
+    const r = AgentSoulSchema.parse({ name: "X", style: "Y" });
+    expect(r?.name).toBe("X");
+    expect(r?.style).toBe("Y");
+  });
+
+  it("(e) validates a config with no soul block at all", () => {
+    const cfg = {
+      switchroom: { version: 1 },
+      telegram: { bot_token: "123:ABC", forum_chat_id: "-100123" },
+      agents: { bare: { extends: "default", topic_name: "Bare" } },
+    };
+    const r = SwitchroomConfigSchema.parse(cfg);
+    expect(r.agents.bare.soul).toBeUndefined();
   });
 });

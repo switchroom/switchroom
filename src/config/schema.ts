@@ -287,10 +287,35 @@ export const AgentSoulSchema = z
   .object({
     name: z.string().describe("Agent persona name (e.g., 'Coach', 'Sage')"),
     style: z.string().describe("Communication style description"),
+    creature: z
+      .string()
+      .optional()
+      .describe("Persona creature/form (e.g., 'owl', 'octopus')"),
+    vibe: z
+      .string()
+      .optional()
+      .describe("One-line personality vibe (e.g., 'calm, precise')"),
+    expertise: z
+      .string()
+      .optional()
+      .describe("Domain expertise summary rendered into the persona"),
+    emoji: z
+      .string()
+      .optional()
+      .describe("Signature emoji for the persona (e.g., '🦉')"),
     boundaries: z
       .string()
       .optional()
       .describe("Behavioral boundaries and disclaimers"),
+    shape: z
+      .enum(["executive-assistant", "developer", "coach", "generalist"])
+      .default("generalist")
+      .describe(
+        "Persona-shape discriminator the per-agent CLAUDE.md template can " +
+        "branch on (e.g., 'you are an executive assistant' vs 'a senior " +
+        "engineer'). No runtime behavior yet — template work lands in a " +
+        "later issue. Cascade: override (per-agent wins over default)."
+      ),
   })
   .optional();
 
@@ -2361,7 +2386,19 @@ const profileFields = {
     .object({
       name: z.string().optional(),
       style: z.string().optional(),
+      creature: z.string().optional(),
+      vibe: z.string().optional(),
+      expertise: z.string().optional(),
+      emoji: z.string().optional(),
       boundaries: z.string().optional(),
+      // No .default() here: a profile/defaults layer fills in fields the
+      // per-agent soul omits, so `shape` stays optional. The "generalist"
+      // default lives on AgentSoulSchema (per-agent). See merge.ts soul
+      // cascade for how a defaulted per-agent "generalist" is treated as
+      // the neutral shape so it does not stomp an explicit profile shape.
+      shape: z
+        .enum(["executive-assistant", "developer", "coach", "generalist"])
+        .optional(),
     })
     .optional(),
   tools: z
