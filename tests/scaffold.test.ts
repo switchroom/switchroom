@@ -1241,6 +1241,51 @@ describe("scaffoldAgent", () => {
     }
   });
 
+  it("never clobbers an `export TELEGRAM_BOT_TOKEN=` hand-edit on reconcile (M3)", () => {
+    const vaultTelegramConfig: TelegramConfig = {
+      bot_token: "vault:telegram-bot-token",
+      forum_chat_id: "-1001234567890",
+    };
+    const config = makeAgentConfig();
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: vaultTelegramConfig,
+      agents: { "m3-export-agent": config },
+    } as SwitchroomConfig;
+
+    const origPassphrase = process.env.SWITCHROOM_VAULT_PASSPHRASE;
+    const origVaultPath = process.env.SWITCHROOM_VAULT_PATH;
+    const origToken = process.env.TELEGRAM_BOT_TOKEN;
+    delete process.env.SWITCHROOM_VAULT_PASSPHRASE;
+    delete process.env.SWITCHROOM_VAULT_PATH;
+    delete process.env.TELEGRAM_BOT_TOKEN;
+    try {
+      const result = scaffoldAgent("m3-export-agent", config, tmpDir, vaultTelegramConfig, switchroomConfig);
+      const envPath = join(result.agentDir, "telegram", ".env");
+      // Operator hand-edits with shell `export` syntax.
+      const operatorLine = "export TELEGRAM_BOT_TOKEN=111222:OPERATOR-EXPORT\n";
+      writeFileSync(envPath, operatorLine, { mode: 0o600 });
+
+      const vaultPath = join(tmpDir, "vault.enc");
+      const passphrase = "test-passphrase";
+      createVault(passphrase, vaultPath);
+      setStringSecret(passphrase, vaultPath, "telegram-bot-token", "999999:VAULT-DIFFERENT");
+      process.env.SWITCHROOM_VAULT_PATH = vaultPath;
+      process.env.SWITCHROOM_VAULT_PASSPHRASE = passphrase;
+
+      reconcileAgent("m3-export-agent", config, tmpDir, vaultTelegramConfig, switchroomConfig);
+      // The `export`-prefixed real token is a real token, not the placeholder.
+      expect(readFileSync(envPath, "utf-8")).toBe(operatorLine);
+    } finally {
+      if (origPassphrase !== undefined) process.env.SWITCHROOM_VAULT_PASSPHRASE = origPassphrase;
+      else delete process.env.SWITCHROOM_VAULT_PASSPHRASE;
+      if (origVaultPath !== undefined) process.env.SWITCHROOM_VAULT_PATH = origVaultPath;
+      else delete process.env.SWITCHROOM_VAULT_PATH;
+      if (origToken !== undefined) process.env.TELEGRAM_BOT_TOKEN = origToken;
+      else delete process.env.TELEGRAM_BOT_TOKEN;
+    }
+  });
+
   it("uses per-agent bot token when provided", () => {
     const config = makeAgentConfig({ bot_token: "999888:AGENT-SPECIFIC" });
     const result = scaffoldAgent("agent-token", config, tmpDir, telegramConfig);

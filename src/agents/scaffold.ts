@@ -824,9 +824,12 @@ const TELEGRAM_ENV_PLACEHOLDER = `# Set your bot token: TELEGRAM_BOT_TOKEN=your-
  * True when a `telegram/.env` body still holds only the placeholder — i.e. it
  * has no active (uncommented, non-empty) `TELEGRAM_BOT_TOKEN=` line. A real
  * operator- or vault-set token has such a line and must never be clobbered.
+ * The optional `export ` prefix is tolerated so a hand-edited
+ * `export TELEGRAM_BOT_TOKEN=<real>` is never mistaken for the placeholder
+ * and overwritten.
  */
 function isTelegramEnvPlaceholder(content: string): boolean {
-  return !/^\s*TELEGRAM_BOT_TOKEN=\S/m.test(content);
+  return !/^\s*(?:export\s+)?TELEGRAM_BOT_TOKEN=\S/m.test(content);
 }
 
 /**
