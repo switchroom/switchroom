@@ -1758,6 +1758,41 @@ export class VaultBroker {
             );
             return;
           }
+          // sec #3084-F2 (write-side twin of #3084-F3): enforce the per-entry
+          // scope on the write-token path too, keyed on the grant's OWNING
+          // agent (`writeGrantAgentSlug`). The get path checks this at ~1339;
+          // the write path historically skipped it, so an entry's
+          // `scope.deny:[agent]` was silently ineffective against an
+          // outstanding write-token — the denied agent could still overwrite
+          // the value. Runs after the F4 identity bind above, so it only sees
+          // writes whose grant identity already matches the socket. Only
+          // meaningful for rotations of an existing scoped entry (a
+          // not-yet-existing key has no scope to honour); new-key creation via
+          // write-grant is unaffected.
+          const existingForScope = this.secrets[req.key];
+          if (existingForScope !== undefined) {
+            const writeScope = checkEntryScope(
+              existingForScope.scope,
+              writeGrantAgentSlug,
+            );
+            if (!writeScope.allow) {
+              this.auditLogger.write({
+                ts: new Date().toISOString(),
+                op: "put",
+                key: req.key,
+                caller: auditCaller,
+                pid: auditPid,
+                cgroup: auditCgroup,
+                result: `denied:${writeScope.reason}`,
+                method: "grant",
+                grant_id: v.grant.id,
+              });
+              socket.write(
+                encodeResponse(errorResponse("DENIED", writeScope.reason)),
+              );
+              return;
+            }
+          }
           writeGrantId = v.grant.id;
         } else if (
           v.reason === "grant-expired" ||
