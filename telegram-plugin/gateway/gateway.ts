@@ -168,6 +168,12 @@ import {
   buildMissedApprovalRetryInbound,
 } from './missed-approvals-card.js'
 import { pickRecoveredPermissionOrigin } from './permission-card-origin.js'
+import {
+  createBlockedApprovalStore,
+  safeActionForRecord,
+  selectOldestHeld,
+  type UndeliverableMark,
+} from './approval-hold.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
 import { appendActivityLabel, clipNarrative, renderActivityFeedWithNested, formatStepSuffix, type SessionActivityHeader } from '../tool-activity-summary.js'
 import { formatModelLabel } from '../model-label.js'
@@ -833,6 +839,69 @@ process.on('beforeExit', () => {
 // ─── Env + state dir ──────────────────────────────────────────────────────
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const permCardStore = createPermissionCardStore(STATE_DIR)
+// #3084 follow-up — the blocked-approval surface. A SHARED top-level directory
+// (compose binds host `~/.switchroom/blocked-approvals` here), not per-agent
+// state: switchroom-web reads every agent's record from one place, and the
+// records are 0644 so its uid-1000 process can actually read them. The agent's
+// own telegram state is 0600 and is NOT web-readable.
+// If the mount is missing (a container predating the volume), the write lands
+// inside the container and the hold still works — only the off-Telegram
+// SURFACE is lost. The record is best-effort by construction; it must never be
+// able to fail the hold back into an auto-deny.
+const BLOCKED_APPROVALS_DIR =
+  process.env.SWITCHROOM_BLOCKED_APPROVALS_DIR ?? '/state/blocked-approvals'
+// The canonical "which agent am I" identity (profiles/_base/start.sh.hbs:430).
+const AGENT_NAME = process.env.SWITCHROOM_AGENT_NAME ?? 'agent'
+const blockedApprovalStore = createBlockedApprovalStore(
+  BLOCKED_APPROVALS_DIR,
+  AGENT_NAME,
+  // Fallback: the agent's OWN state dir, which the scaffold chowns to the agent
+  // uid, so a write there always succeeds. Guarantees the record can never be
+  // silently lost when the shared dir isn't writable by this agent's uid.
+  process.env.SWITCHROOM_AGENT_STATE_DIR ?? '/state/agent',
+)
+
+/**
+ * Rewrite the blocked-approval surface from the LIVE pending state.
+ *
+ * A reconcile, not a delete — deliberately. The store holds one record per
+ * agent, but an agent can hold SEVERAL permissions at once: Claude Code issues
+ * parallel tool calls, each hitting `canUseTool`, and
+ * `cancelPendingPermissionsForHalt` iterates multiple pendings. A naive
+ * `clear()` on any single resolution would delete the file while ANOTHER
+ * request was still held, blinding the operator to a real, live block.
+ *
+ * So derive the record from whatever is still held. Oldest block wins — it has
+ * been waiting longest. Nothing held → clear.
+ *
+ * Also called at BOOT. `pendingPermissions` is in-memory and empty on a fresh
+ * process, so this clears any record orphaned by a restart mid-hold — otherwise
+ * the dashboard would show a permanently blocked agent forever. Nothing can
+ * legitimately be held across a restart: the bridge re-sends unresolved requests
+ * on IPC reconnect (`bridge/permission-ledger.ts`), which re-raises them and
+ * re-marks them if the channel is still shut.
+ */
+function reconcileBlockedApprovals(): void {
+  // Selection (oldest hold wins; null ⇒ nothing held) is the pure, unit-tested
+  // `selectOldestHeld` in approval-hold.ts — keep policy out of gateway.ts.
+  const oldest = selectOldestHeld(pendingPermissions)
+  if (oldest == null) {
+    blockedApprovalStore.clear()
+    return
+  }
+  blockedApprovalStore.write({
+    agent: AGENT_NAME,
+    requestId: oldest.requestId,
+    toolName: oldest.pend.tool_name,
+    // NOT bare naturalAction(): for Bash/Glob/Grep/WebFetch/mcp__* it
+    // interpolates the RAW tool input, and this file is world-readable.
+    action: safeActionForRecord(naturalAction, oldest.pend.tool_name, oldest.pend.input_preview),
+    blockedSince: oldest.pend.startedAt,
+    undeliverableSince: oldest.mark.since,
+    retryableAt: oldest.mark.retryableAt,
+    reason: oldest.mark.reason,
+  })
+}
 // Durable store for the four AGENT-INITIATED approval-card families
 // (vault_request_access / vault_request_save / request_secret /
 // mental_model_propose). Persists card METADATA only — never any secret value
@@ -4032,6 +4101,7 @@ function cancelPendingPermissionsForHalt(origin: string): void {
     void stripCancelledPermissionCards(details.card_text, details.cards)
     pendingPermissions.delete(requestId)
     permCardStore.remove(requestId)
+    reconcileBlockedApprovals()
     process.stderr.write(
       `telegram gateway: halt-now cancelled pending permission origin=${origin} ` +
       `request=${requestId} tool=${details.tool_name}\n`,
@@ -5842,7 +5912,11 @@ const STATUS_QUERY_RE = /^\s*status\??\s*$/i
 
 // ─── Permission handling ──────────────────────────────────────────────────
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
-const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string; startedAt: number; card_text: string; cards: { chatId: string; messageId: number; threadId?: number | null }[] }>()
+// `undeliverable` (#3084 follow-up): set when the card send failed against a
+// known-open Telegram flood window. While it is set the entry is HELD — the TTL
+// sweep skips it (never auto-deny an ask no human ever saw) and the reaper
+// re-posts the card once the window closes. Cleared on successful delivery.
+const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string; startedAt: number; card_text: string; cards: { chatId: string; messageId: number; threadId?: number | null }[]; undeliverable?: UndeliverableMark | null }>()
 // PERMISSION_TTL_MS / ttlForTool / the timed-out card builder now live in
 // ./permission-timeout.ts (pure + unit-testable). hostd gated verbs get a
 // 30-min window; everything else keeps the 10-min default.
@@ -6954,6 +7028,7 @@ const pendingStateReaper = setInterval(() => {
       )
       pendingPermissions.delete(k)
       permCardStore.remove(k)
+      reconcileBlockedApprovals()
     }
   }
   // Drop no-repeat suppression entries past the safety-cap window (the primary
@@ -10299,6 +10374,14 @@ const ipcServer: IpcServer = createIpcServer({
           // cases: topic success → tid, main-chat / fallback → undefined.
           const landedThreadId = sent.message_thread_id ?? undefined
           pend.cards.push({ chatId, messageId: sent.message_id, threadId: landedThreadId })
+          // The card LANDED — the operator can see and tap it, so the block is
+          // over. Drop the hold mark and clear the off-Telegram surface. (PR 3
+          // also resets `startedAt` here: the TTL measures how long the operator
+          // had to answer, and until this moment they had nothing to answer.)
+          if (pend.undeliverable != null) {
+            pend.undeliverable = null
+            reconcileBlockedApprovals()
+          }
           permCardStore.add({
             requestId,
             chatId,
@@ -10310,6 +10393,56 @@ const ipcServer: IpcServer = createIpcServer({
         }
       }).catch(e => {
         process.stderr.write(`telegram gateway: permission_request send to ${chatId} failed: ${e}\n`)
+        // #3084 follow-up — the card did NOT land. Before this, the error was
+        // logged and dropped: the entry sat with `cards: []`, the operator saw
+        // nothing, and 60 minutes later the TTL sweep AUTO-DENIED an approval
+        // no human had ever been shown (and skipped the #2862 missed-approval
+        // re-offer, which is anchored on `cards[0]`). That is the leash
+        // deciding for the operator. Now we record the block instead.
+        //
+        // Only a FLOOD_WAIT_ACTIVE failure is a *hold*: it means the channel
+        // itself is shut (per-bot-token ban — nothing can land until `untilTs`)
+        // and the ask is deliverable later. Any other error (a 400, a malformed
+        // card) is a real failure of THIS send and keeps today's behaviour —
+        // holding on those would park the agent forever on a card that will
+        // never format correctly.
+        if (!isFloodWaitActiveError(e)) return
+        const pend = pendingPermissions.get(requestId)
+        if (pend == null) return // operator already resolved it — nothing to hold
+        // A card may already have LANDED on another target (the send fans out
+        // to several chats/topics and only THIS one hit the flood wall). The
+        // operator can see and tap the landed card, so the request is not
+        // blocked — marking it here would write a false blocked record AND
+        // make it eligible for a duplicate re-delivery. Same guard the
+        // redelivery selector applies (guard ii in selectHeldForRedelivery).
+        if (pend.cards.length > 0) return
+        const now = Date.now()
+        // Re-marking is idempotent and self-correcting: if the window is
+        // re-extended by a fresh 429, `computeFloodWait` only ever grows
+        // `untilTs`, so a later mark carries the longer window. `since` is
+        // "when we FIRST failed" (the UndeliverableMark contract), so a
+        // re-failure preserves the original timestamp — resetting it would
+        // churn the oldest-held-wins reconcile between records.
+        pend.undeliverable = {
+          since: pend.undeliverable?.since ?? now,
+          retryableAt: e.untilTs,
+          reason: 'flood_wait',
+        }
+        // Write the shared surface SYNCHRONOUSLY, here in the failure handler —
+        // not on the 60s reaper tick. The operator is locked out of Telegram;
+        // the off-Telegram surface is the only way they learn an agent is
+        // blocked, so it has to be live in under a second, not up to a minute.
+        // Metadata only: `action` is naturalAction() text. NEVER input_preview —
+        // this file is world-readable (0644) so switchroom-web can read it.
+        // Reconcile rather than write directly: several permissions can be held
+        // at once (parallel tool calls), and the surface must reflect all of
+        // them, not just the last one to fail.
+        reconcileBlockedApprovals()
+        process.stderr.write(
+          `telegram gateway: permission-card HELD (undeliverable) request=${requestId} ` +
+          `tool=${pend.tool_name} reason=flood_wait retryable_at=${new Date(e.untilTs).toISOString()} ` +
+          `— approval is held, NOT denied; will re-deliver when the window closes\n`,
+        )
       })
     }
     // Park the turn's status reaction on 🙏 (awaiting your tap) and
@@ -22474,6 +22607,7 @@ async function handlePermissionSlash(ctx: Context, behavior: 'allow' | 'deny'): 
   })
   pendingPermissions.delete(request_id)
   permCardStore.remove(request_id)
+  reconcileBlockedApprovals()
   process.stderr.write(
     `[telegram gateway] slash-${behavior} request_id=${request_id} tool=${details.tool_name} by=${senderId}\n`,
   )
@@ -25564,6 +25698,7 @@ bot.on('callback_query:data', async ctx => {
 
     pendingPermissions.delete(request_id)
     permCardStore.remove(request_id)
+    reconcileBlockedApprovals()
 
     // (2) Dispatch the in-flight permission verdict IMMEDIATELY — before
     // any host round-trip — so the turn never blocks on persistence.
@@ -25859,6 +25994,7 @@ bot.on('callback_query:data', async ctx => {
   const grantAgent = selfAgentName()
   pendingPermissions.delete(request_id)
   permCardStore.remove(request_id)
+  reconcileBlockedApprovals()
   if (timeBox && grantAgent) {
     recordScopedGrant(scopedGrants, grantAgent, timeBox.rule, Date.now(), scopedTtl)
     // Write-through so the window survives a gateway restart (#2863). Absolute
@@ -27806,6 +27942,22 @@ void (async () => {
         } catch (err) {
           process.stderr.write(
             `telegram gateway: pending approval-card restore failed: ${(err as Error).message}\n`,
+          )
+        }
+
+        // #3084 follow-up — drop a blocked-approval record orphaned by a restart
+        // mid-hold. `pendingPermissions` is in-memory and empty on a fresh
+        // process, so this reconciles the surface to "nothing held". Without it,
+        // a gateway restart during a flood ban would leave a record on disk that
+        // nothing ever clears, and the dashboard would show a permanently
+        // blocked agent. The ASK itself survives: the bridge re-sends unresolved
+        // permission requests on IPC reconnect, which re-raises them (and
+        // re-marks them held if the channel is still shut).
+        try {
+          reconcileBlockedApprovals()
+        } catch (err) {
+          process.stderr.write(
+            `telegram gateway: blocked-approval boot reconcile failed: ${(err as Error).message}\n`,
           )
         }
 

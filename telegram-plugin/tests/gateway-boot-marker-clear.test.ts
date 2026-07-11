@@ -43,7 +43,7 @@ describe('gateway boot — clear stale turn-active marker', () => {
     // window to ~5KB so we don't pick up the unrelated
     // `removeTurnActiveMarker` call in the onTurnComplete handler
     // way down at the bottom of the file.
-    const setupWindow = GATEWAY_SRC.slice(setupBlockStart, setupBlockStart + 9000)
+    const setupWindow = GATEWAY_SRC.slice(setupBlockStart, setupBlockStart + 12000)
     const clearMatches = setupWindow.match(/removeTurnActiveMarker\s*\(\s*STATE_DIR\s*\)/g) ?? []
     expect(clearMatches.length).toBe(1)
   })
@@ -53,7 +53,7 @@ describe('gateway boot — clear stale turn-active marker', () => {
     // must not prevent the gateway from coming up. Pin the try-wrapping
     // to make sure a future refactor doesn't drop it.
     const setupBlockStart = GATEWAY_SRC.indexOf('if (!didOneTimeSetup)')
-    const setupWindow = GATEWAY_SRC.slice(setupBlockStart, setupBlockStart + 9000)
+    const setupWindow = GATEWAY_SRC.slice(setupBlockStart, setupBlockStart + 12000)
     expect(setupWindow).toMatch(/try\s*\{\s*removeTurnActiveMarker\(STATE_DIR\)\s*\}\s*catch/)
   })
 
@@ -62,7 +62,7 @@ describe('gateway boot — clear stale turn-active marker', () => {
     // Clearing the marker first means the watchdog sees a clean slate
     // immediately, even if pin sweep takes 30s+ to finish.
     const setupBlockStart = GATEWAY_SRC.indexOf('if (!didOneTimeSetup)')
-    const setupWindow = GATEWAY_SRC.slice(setupBlockStart, setupBlockStart + 9000)
+    const setupWindow = GATEWAY_SRC.slice(setupBlockStart, setupBlockStart + 12000)
     const clearIdx = setupWindow.indexOf('removeTurnActiveMarker(STATE_DIR)')
     const pinSweepIdx = setupWindow.indexOf('Boot-time pin sweep')
     expect(clearIdx).toBeGreaterThan(0)
