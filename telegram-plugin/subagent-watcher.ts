@@ -156,6 +156,25 @@ export interface WorkerEntry {
    */
   inflightToolUseIds: Set<string>
   /**
+   * Wall-clock ms of the most recent EMITTED "terminal synthesis deferred"
+   * log line for this entry, or null if the entry is not currently in the
+   * deferred state (never entered it, or resumed out of it). Drives the
+   * per-worker log rate-limit (#3092): null ⇒ this is a fresh entry into the
+   * deferred state and MUST log; non-null ⇒ log only once
+   * `deferralLogIntervalMs` has elapsed. Reset to null on the un-stall path
+   * so a stall → resume → stall cycle logs its first deferral again.
+   */
+  deferralLoggedAt: number | null
+  /**
+   * Count of deferral ticks whose log line was SUPPRESSED by the rate-limit
+   * since this entry entered the deferred state (#3092). Carried into the
+   * next emitted line (and into the resume / cap-crossing transition lines)
+   * so the suppression is itself visible and the operator can see the true
+   * tick volume without reading 1,547 lines. Reset alongside
+   * `deferralLoggedAt`.
+   */
+  deferralSuppressedTicks: number
+  /**
    * True if the underlying JSONL file existed before the watcher started.
    * Historical entries are tracked for late state transitions but are
    * excluded from the active-workers card — the sub-agent process is long
@@ -330,6 +349,22 @@ export interface SubagentWatcherConfig {
    * `SWITCHROOM_SUBAGENT_INFLIGHT_TERMINAL_CAP_MS`.
    */
   inflightTerminalCapMs?: number
+  /**
+   * Rate-limit (ms) on the repeated "terminal synthesis deferred" log line
+   * for a single worker (#3092). The deferral decision is re-evaluated on
+   * every ~1s rescan tick; without this gate each re-evaluation logged,
+   * emitting ~1 line/sec for as long as the worker stayed blocked (1,547
+   * lines in 35 min on the live overlord gateway, drowning the concurrent
+   * 429 flood-ban lines of #3084).
+   *
+   * Semantics: the FIRST tick that enters the deferred state always logs;
+   * subsequent ticks log only once this many ms have passed since the last
+   * emitted line. State CHANGES are never suppressed — the cap-crossing
+   * ("proceeding with terminal synthesis") and the resume/un-stall lines
+   * fire regardless. Default 60_000 (1 min). Env override
+   * `SWITCHROOM_SUBAGENT_DEFERRAL_LOG_INTERVAL_MS`.
+   */
+  deferralLogIntervalMs?: number
   /**
    * Freshness window (ms) for promoting a running-at-boot worker file to
    * live. A file whose last write (mtime) is older than this is treated as
@@ -600,6 +635,16 @@ const DEFAULT_SILENT_STALL_TERMINAL_MS = 300_000
 // reaper TTL, so the watcher — not the reaper — still owns the terminal
 // transition for a worker that died mid-tool.
 const DEFAULT_INFLIGHT_TERMINAL_CAP_MS = 45 * 60_000
+// Minimum wall-clock gap between two "terminal synthesis deferred" log lines
+// for the SAME worker (#3092). `checkStalls` runs on the ~1s rescan tick, and
+// the deferral is re-evaluated (and, before this gate, re-logged) on every one
+// of them. A single worker legitimately blocked inside a long tool call
+// produced 1,547 near-identical lines in 35 minutes on the overlord gateway,
+// burying the concurrent Telegram 429 flood-ban lines (#3084). The DECISION is
+// re-made every tick — only the LOGGING is rate-limited: first entry into the
+// deferred state logs immediately, then at most once per this interval, and
+// every state CHANGE (resume, cap-crossing) logs unconditionally.
+const DEFAULT_DEFERRAL_LOG_INTERVAL_MS = 60_000
 
 /**
  * Tools that legitimately run for minutes with ZERO intervening JSONL
@@ -1183,6 +1228,18 @@ export function readSubTail(
               log?.(`subagent-watcher: onUnstall callback error ${entry.agentId}: ${(cbErr as Error).message}`)
             }
           }
+          // STATE CHANGE out of the deferred state (#3092) — never rate-
+          // limited. A worker that was deferring terminal synthesis behind an
+          // in-flight tool call has RESURRECTED; that transition is the
+          // payoff of the deferral and must be visible even though the
+          // intervening per-tick deferral lines were suppressed. Report the
+          // suppressed volume so the quiet window is accounted for, then
+          // re-arm so a subsequent re-stall logs its first deferral again.
+          if (entry.deferralLoggedAt != null) {
+            log?.(`subagent-watcher: in-flight deferral resolved for ${entry.agentId} (worker resumed after ${idleSecBeforeBump}s idle — deferral was correct, not a dead worker; ${entry.deferralSuppressedTicks} deferral tick(s) suppressed since the last deferral line)`)
+            entry.deferralLoggedAt = null
+            entry.deferralSuppressedTicks = 0
+          }
           log?.(`subagent-watcher: stall cleared for ${entry.agentId} (activity resumed after ${idleSecBeforeBump}s — re-arming detection)`)
         }
         if (ev.kind === 'sub_agent_model') {
@@ -1457,6 +1514,10 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
     config.inflightTerminalCapMs
     ?? parseEnvMs('SWITCHROOM_SUBAGENT_INFLIGHT_TERMINAL_CAP_MS')
     ?? DEFAULT_INFLIGHT_TERMINAL_CAP_MS
+  const deferralLogIntervalMs =
+    config.deferralLogIntervalMs
+    ?? parseEnvMs('SWITCHROOM_SUBAGENT_DEFERRAL_LOG_INTERVAL_MS')
+    ?? DEFAULT_DEFERRAL_LOG_INTERVAL_MS
   const inflightPromoteMaxAgeMs =
     config.inflightPromoteMaxAgeMs
     ?? parseEnvMs('SWITCHROOM_SUBAGENT_INFLIGHT_MAX_AGE_MS')
@@ -1603,6 +1664,8 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       stalledAt: null,
       completionNotified: false,
       stallTerminalSynthesised: false,
+      deferralLoggedAt: null,
+      deferralSuppressedTicks: 0,
       lastSummaryLine: '',
       lastResultText: '',
       lastProgressBucketIdx: null,
@@ -1987,6 +2050,19 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       existing.stallNotified = false
       existing.stalledAt = null
       existing.stallTerminalSynthesised = false
+      // Re-arm the deferral log gate alongside its stall siblings (#3092).
+      // Unreachable with stale state TODAY (both routes out of the deferred
+      // state to `done` — the cap-crossing and the un-stall drain — already
+      // null `deferralLoggedAt`), so this is belt-and-braces, not a live fix.
+      // Reset it here anyway: a resurrected entry must be indistinguishable
+      // from a fresh one, so a genuinely NEW stall always logs its FIRST
+      // deferral line immediately. Leaving these to a reachability argument
+      // makes the gate fragile by construction — a later reorder of the drain,
+      // or a third path to `done`, would silently suppress that first line for
+      // up to `deferralLogIntervalMs`, losing the exact signal this gate
+      // exists to preserve.
+      existing.deferralLoggedAt = null
+      existing.deferralSuppressedTicks = 0
       // Re-arm the completion notification INTENTIONALLY (issue #3023). The
       // false synthesized finish already fired `onFinish` once, delivering a
       // (possibly wrong / incomplete) synthesized handback to the parent.
@@ -2212,10 +2288,34 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       if (entry.inflightToolUseIds.size > 0) {
         const totalIdleMs = n - entry.lastActivityAt
         if (totalIdleMs < inflightTerminalCapMs) {
-          log?.(`subagent-watcher: silent-stall terminal synthesis deferred for ${entry.agentId} — ${entry.inflightToolUseIds.size} tool call(s) still in flight, ${Math.floor(totalIdleMs / 1000)}s idle < ${Math.floor(inflightTerminalCapMs / 1000)}s cap (long-running tool, not a dead worker)`)
+          // Log-rate gate (#3092). The deferral DECISION above is re-made on
+          // every ~1s rescan tick and is correct; only its LOGGING is gated.
+          // Emit on first entry into the deferred state, then at most once per
+          // `deferralLogIntervalMs`. Everything else is counted, not printed —
+          // the suppressed count rides the next emitted line so no volume is
+          // lost, just the 1/sec repetition (1,547 lines / 35 min on overlord,
+          // burying the concurrent #3084 flood-ban lines).
+          const lastLoggedAt = entry.deferralLoggedAt
+          const firstEntry = lastLoggedAt == null
+          if (firstEntry || n - lastLoggedAt >= deferralLogIntervalMs) {
+            const suppressed = entry.deferralSuppressedTicks
+            const suffix = firstEntry
+              ? ` — further deferral ticks for this worker are rate-limited to 1 line / ${Math.floor(deferralLogIntervalMs / 1000)}s until it resumes or crosses the cap`
+              : ` — still deferred (${suppressed} tick(s) suppressed since the last line)`
+            log?.(`subagent-watcher: silent-stall terminal synthesis deferred for ${entry.agentId} — ${entry.inflightToolUseIds.size} tool call(s) still in flight, ${Math.floor(totalIdleMs / 1000)}s idle < ${Math.floor(inflightTerminalCapMs / 1000)}s cap (long-running tool, not a dead worker)${suffix}`)
+            entry.deferralLoggedAt = n
+            entry.deferralSuppressedTicks = 0
+          } else {
+            entry.deferralSuppressedTicks++
+          }
           continue
         }
-        log?.(`subagent-watcher: in-flight deferral cap reached for ${entry.agentId} (${Math.floor(totalIdleMs / 1000)}s idle >= ${Math.floor(inflightTerminalCapMs / 1000)}s cap with ${entry.inflightToolUseIds.size} tool call(s) still unresolved) — treating as died-mid-tool, proceeding with terminal synthesis`)
+        // STATE CHANGE — never rate-limited. The deferral ends here and a
+        // terminal synthesis fires; this is the transition an operator needs.
+        const suppressedTotal = entry.deferralSuppressedTicks
+        log?.(`subagent-watcher: in-flight deferral cap reached for ${entry.agentId} (${Math.floor(totalIdleMs / 1000)}s idle >= ${Math.floor(inflightTerminalCapMs / 1000)}s cap with ${entry.inflightToolUseIds.size} tool call(s) still unresolved) — treating as died-mid-tool, proceeding with terminal synthesis (${suppressedTotal} deferral tick(s) suppressed since the last deferral line)`)
+        entry.deferralLoggedAt = null
+        entry.deferralSuppressedTicks = 0
       }
       // TODO(#3023/PR #3029): the cap-reached path above is a SECOND source of
       // possibly-false terminal synthesis (a worker mid-very-long-tool that is
