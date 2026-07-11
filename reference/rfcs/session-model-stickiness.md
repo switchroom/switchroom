@@ -8,12 +8,79 @@ status: Accepted — revised per adversarial review + operator decision (default
 
 # RFC — Session-scoped `/model` stickiness
 
-**Status:** Accepted (rev 2 — adversarial-review revision)
+**Status:** Accepted (rev 3 — #3039 keep-by-default amendment; rev 2 semantics below are superseded where §0 says so)
 **Author:** (agent-authored, operator-directed; semantics decided by the operator 2026-07)
 **Targets:** `origin/main` @ v0.18.7
 **Builds on:** #2982 (in-memory `sessionModelSource` + one-shot `.session-model-override` carrier), #2983 (live model on progress cards)
 
 ---
+
+## 0. Rev 3 amendment (#3039, operator decision 2026-07-11) — keep by default
+
+The operator requirement (verbatim intent): *"a user-set session model/effort
+override must survive agent restarts and deploys, and is cleared only on
+explicit user action; if it can't apply, ack, apply deterministically when
+possible, and confirm."* This **supersedes** the rev-2 revert-by-default
+rows below. The new contract:
+
+- **Boot default is KEEP.** `.session-model` is honored on every boot —
+  deploy, `/restart`, inline restart button, hostd/CLI restart, watchdog
+  bounce, raw `docker restart`, host reboot, crash. Rows 8, 9, 10, 12, 14,
+  15 and 20 of the §6 table now read **kept**.
+- `.relaunch-model-intent` remains, but only a **fresh explicit "revert"**
+  intent reverts at boot. Current gateway code never stamps revert
+  (`intentForRestartReason` always returns keep); the path exists for
+  compatibility and future explicit-revert flows.
+- **The 7-day staleness expiry is removed** (row 21). An override the user
+  never revoked is never silently dropped.
+- **Clearing paths** are exactly: `/model default` (live delete), a
+  configured `model:` change (invalidation, row 16 — unchanged), and a
+  corrupt file (row 19 — now also writes a `.session-model-alert` chat
+  notice instead of a stderr-only drop). Every clearing path notifies the
+  operator chat once at boot via the existing alert relay.
+- **`/effort` gains the same contract** via a sibling `.session-effort`
+  carrier (`{"level","configuredDefaultAtWrite","ts"}`, allowlist-gated
+  low|medium|high|xhigh|max): written on every positively-confirmed effort
+  apply, resolved by start.sh into `--effort`, cleared only by the new
+  `/effort default` or invalidation (with a boot alert appended to
+  `.session-model-alert`).
+- **Queued commands survive the bounce.** When the gateway shuts down (or a
+  session relaunch is already pending) with a queued mid-turn `/model` /
+  `/effort`, the typed choice is persisted to the durable carriers and the
+  ack card says "saved — applies as the agent boots" instead of "re-issue".
+  Only an unresolvable `mdl:s:<tag>` menu selection still asks for a
+  re-issue.
+- **Unconfirmed queued tokens are gated before durable persist** (#3042
+  blocker 2a): a queued typed `/model <arg>` persisted at shutdown was never
+  validated by claude, so only offline-trustable tokens (static Claude
+  aliases, curated sr-* alias targets — `isOfflineTrustedModelToken`) are
+  written to the carrier; anything else gets an honest "couldn't verify —
+  re-issue after restart" card. Belt-and-braces, start.sh self-heals a
+  crashlooping override (#3042 blocker 2b): three consecutive fast boots
+  (<150s apart, tracked in `.session-model-boot-attempts`) with an override
+  active clear the carrier, boot the configured default, and alert once —
+  this also covers a confirmed model later retired upstream.
+- **Kept-alert dedup** (#3042 item 4): the "override kept across this
+  relaunch" chat notice fires once per kept value
+  (`.session-model-kept-notified` sentinel), so a watchdog bounce loop
+  cannot storm the chat; every clearing path drops the sentinel.
+- **Version skew** (#3042 item 3): `.session-effort` boot resolution and the
+  crashloop self-heal live in the RE-SCAFFOLDED `start.sh` — until the
+  operator runs `switchroom apply` (or the agent is re-scaffolded), "applies
+  at boot" holds only for the model path on switchroom-managed bounces; a
+  persisted effort override is honored from the first boot on the new
+  scaffold.
+- **Quota-failover interaction** (#3042 item 7): keep-by-default means a
+  pinned expensive model now survives quota-exhaustion restarts indefinitely
+  — the fleet-fallback flow still switches the LIVE session, but the boot
+  carrier re-asserts the pinned model on the next relaunch until the user
+  runs `/model default`. Operators relying on exhaustion restarts to shed an
+  expensive pin must clear it explicitly.
+- **No user-visible dead-ends.** The idle drain re-enqueues on a
+  turn-in-flight race or a handler busy-refusal instead of stamping the
+  refusal onto the ack card; the mid-turn `/model` menu renders a static
+  alias/external keyboard whose taps queue, instead of "try again in a
+  moment".
 
 ## 1. Problem
 

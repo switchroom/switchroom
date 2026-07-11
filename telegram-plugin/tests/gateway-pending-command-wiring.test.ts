@@ -6,7 +6,7 @@
  * interval, enqueueSessionCommand, drainPendingSessionCommand, and the
  * shutdown() handler), so — mirroring gateway-session-model-relaunch.test.ts —
  * we assert on the source structure. The pure contract (per-kind slots,
- * drainCapDecision, shutdownResolutionEdits) is unit-tested in
+ * drainCapDecision, shutdownResolutionActions) is unit-tested in
  * pending-session-command.test.ts.
  */
 
@@ -47,15 +47,63 @@ describe('gateway: post-enqueue idle kick (#3018 finding 5)', () => {
 })
 
 describe('gateway: shutdown resolves queued ack cards (#3018 finding 3)', () => {
-  it('shutdown() empties the slots via shutdownResolutionEdits and edits each card, before the force-exit timer', () => {
+  it('shutdown() empties the slots via shutdownResolutionActions, PERSISTS each typed choice, and edits each card, before the force-exit timer', () => {
     const fnIdx = GATEWAY_SRC.indexOf('async function shutdown(signal: string)')
     expect(fnIdx).toBeGreaterThan(0)
     const win = GATEWAY_SRC.slice(fnIdx, GATEWAY_SRC.indexOf('forceExitTimer', fnIdx))
-    const resolveIdx = win.indexOf('pendingCmdShutdownResolutionEdits(pendingSessionCommand')
+    const resolveIdx = win.indexOf('pendingCmdShutdownResolutionActions(pendingSessionCommand')
     expect(resolveIdx).toBeGreaterThan(0)
+    // #3039: the queued choice is carried across the bounce via the durable
+    // carriers, not dropped with a "re-issue" note.
+    expect(win.indexOf('persistQueuedCommandForRestart(', resolveIdx)).toBeGreaterThan(resolveIdx)
     expect(win.indexOf('editPendingCommandCard(', resolveIdx)).toBeGreaterThan(resolveIdx)
     // Bounded: raced against a timeout so a wedged Telegram API can't block shutdown.
     expect(win.slice(resolveIdx)).toContain('Promise.race')
+  })
+})
+
+describe('gateway: drain never confirms a busy refusal and never drops the batch (#3039, #3042 blocker 1)', () => {
+  it('drainPendingSessionCommand routes takeAll() through the unit-tested drainTakenCommands with the loss-safe IO', () => {
+    const fnIdx = GATEWAY_SRC.indexOf('async function drainPendingSessionCommand(')
+    expect(fnIdx).toBeGreaterThan(0)
+    const win = GATEWAY_SRC.slice(fnIdx, fnIdx + 3000)
+    // Iteration + loss-safety invariants live in pending-session-command.ts
+    // (drainTakenCommands, functionally tested); the gateway only supplies IO.
+    expect(win).toContain('pendingCmdDrainTaken(pendingSessionCommand.takeAll()')
+    expect(win).toContain('turnInFlightForGate()')
+    expect(win).toContain('isBusyRefusal: isBusyRefusalText')
+    expect(win).toContain('reEnqueue: reEnqueueUnlessSuperseded')
+    // The pending-restart branch persists rather than telling the user to re-issue.
+    expect(win).toContain('pendingCmdResolveForRestart(cmd')
+    expect(win).toContain('persistQueuedCommandForRestart(')
+  })
+})
+
+describe('gateway: unconfirmed queued model tokens are gated before durable persist (#3042 blocker 2a)', () => {
+  it('persistQueuedCommandForRestart refuses offline-unverifiable tokens', () => {
+    const fnIdx = GATEWAY_SRC.indexOf('function persistQueuedCommandForRestart(')
+    expect(fnIdx).toBeGreaterThan(0)
+    const win = GATEWAY_SRC.slice(fnIdx, fnIdx + 2500)
+    expect(win).toContain('isOfflineTrustedModelToken(action.arg)')
+    expect(win).toContain('NOT saved')
+  })
+})
+
+describe('gateway: /restart keeps the session-model override (#3039)', () => {
+  it('the /restart chat command stamps keep, never revert', () => {
+    expect(GATEWAY_SRC).toContain("writeRelaunchModelIntent(smDir, 'keep', 'user: /restart from chat')")
+    expect(GATEWAY_SRC).not.toContain("writeRelaunchModelIntent(smDir, 'revert'")
+  })
+})
+
+describe('gateway: /effort persistence choke point (#3039)', () => {
+  it('buildEffortDeps persists a confirmed apply to .session-effort and wires clearSessionEffort', () => {
+    const fnIdx = GATEWAY_SRC.indexOf('function buildEffortDeps(')
+    expect(fnIdx).toBeGreaterThan(0)
+    const win = GATEWAY_SRC.slice(fnIdx, fnIdx + 2500)
+    expect(win).toContain('writeSessionEffortFile(')
+    expect(win).toContain('clearSessionEffortFile(')
+    expect(win).toContain('readSessionEffortFile(')
   })
 })
 

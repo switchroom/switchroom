@@ -131,6 +131,74 @@ export function createPendingSessionCommandSlots(): PendingSessionCommandSlots {
 }
 
 /**
+ * IO seams the drain iteration needs from the gateway. Extracted so the
+ * iteration ORDER + loss-safety invariants (#3042 blocker 1) are unit-testable
+ * without booting the bot.
+ */
+export interface DrainIo {
+  /** Is a session relaunch pending (the live session is going away)? */
+  restartPending: () => boolean
+  /** Is a turn in flight right now (re-checked per command)? */
+  turnInFlight: () => boolean
+  /** Apply the command via the real handler; returns the reply body. */
+  apply: (cmd: PendingSessionCommand) => Promise<string>
+  /** Does this reply body mean "refused because busy" (not applied)? */
+  isBusyRefusal: (text: string) => boolean
+  /** Resolve a command that must ride the restart carriers; returns card text. */
+  resolveForRestartText: (cmd: PendingSessionCommand) => string
+  /** Edit the command's ack card. Best-effort. */
+  editCard: (cmd: PendingSessionCommand, text: string) => Promise<void>
+  /** Re-enqueue a command the drain could not safely apply. */
+  reEnqueue: (cmd: PendingSessionCommand) => void
+  /** Render the apply-threw failure card text. */
+  failureText: (cmd: PendingSessionCommand, err: unknown) => string
+}
+
+/**
+ * Drain iteration over the commands takeAll() returned. The loss-safety
+ * invariant (#3042 blocker 1): when the loop must stop early (turn raced in,
+ * or the handler returned a busy refusal), EVERY not-yet-applied taken
+ * command — including the current one — is re-enqueued. takeAll() can hold
+ * both a model AND an effort command; breaking after re-enqueueing only the
+ * current one would silently drop the other with its ack card stuck at
+ * "queued" forever.
+ */
+export async function drainTakenCommands(
+  taken: readonly PendingSessionCommand[],
+  io: DrainIo,
+): Promise<void> {
+  for (let i = 0; i < taken.length; i++) {
+    const cmd = taken[i]
+    if (io.restartPending()) {
+      // The live session is going away — carry the choice across the bounce
+      // via the durable carriers (or the re-issue fallback).
+      await io.editCard(cmd, io.resolveForRestartText(cmd))
+      continue
+    }
+    // Race guard: a new turn may have started before the drain reached this
+    // command. Applying now would hit the handlers' busy refusals and stamp
+    // "not applied" onto the ack card as a false final state.
+    if (io.turnInFlight()) {
+      for (const rest of taken.slice(i)) io.reEnqueue(rest)
+      return
+    }
+    let body: string
+    try {
+      body = await io.apply(cmd)
+    } catch (err) {
+      await io.editCard(cmd, io.failureText(cmd, err))
+      continue
+    }
+    // The handler itself refused because a turn raced in — not applied.
+    if (io.isBusyRefusal(body)) {
+      for (const rest of taken.slice(i)) io.reEnqueue(rest)
+      return
+    }
+    await io.editCard(cmd, body)
+  }
+}
+
+/**
  * What the reaper's bounded drain-cap should do this tick.
  *
  *   - 'wait'                 — nothing queued long enough; keep waiting.
@@ -164,21 +232,87 @@ export interface PendingCommandCardEdit {
 }
 
 /**
- * Gateway-shutdown resolution for queued commands: EMPTY the slots and return
- * the ack-card edits that tell the operator their queued choice cannot apply
- * (the session is going away with the gateway) and must be re-issued after
- * boot. Without this, a SIGTERM leaves the ack card dangling at "the moment
- * this turn finishes" forever and the choice is silently lost.
+ * What the gateway should DURABLY record for a queued command that can't
+ * apply live because the session is going away (gateway shutdown or a pending
+ * session relaunch). #3039: instead of telling the operator to re-issue, the
+ * choice is persisted to the durable carriers (`.session-model` /
+ * `.session-effort`) that start.sh honors on every boot — so the queued
+ * command still deterministically applies, just via the relaunch.
+ *
+ *   - 'model'        — persist `arg` as the `.session-model` override
+ *   - 'effort'       — persist `arg` as the `.session-effort` override
+ *   - 'clear-model'  — the queued command was `/model default`: clear the carrier
+ *   - 'clear-effort' — the queued command was `/effort default`: clear the carrier
+ *   - null           — not offline-resolvable (a `mdl:s:<tag>` menu selection
+ *                      needs live picker discovery to become a token); the
+ *                      operator is asked to re-issue after boot.
  */
-export function shutdownResolutionEdits(
+export type ShutdownPersistKind = 'model' | 'effort' | 'clear-model' | 'clear-effort' | null
+
+export interface ShutdownResolutionAction {
+  cmd: PendingSessionCommand
+  persist: ShutdownPersistKind
+  /** The canonical token / allowlisted level to persist (when persist != null). */
+  arg: string
+  /** Ack-card edit when the durable write succeeds. */
+  persistedText: string
+  /** Ack-card edit when persist is null or the durable write failed. */
+  reissueText: string
+}
+
+const EFFORT_MENU_SELECT_PREFIX = 'eff:s:'
+
+function classifyShutdownPersist(cmd: PendingSessionCommand): { persist: ShutdownPersistKind; arg: string } {
+  if (cmd.kind === 'effort') {
+    const level = cmd.origin === 'menu' && cmd.arg.startsWith(EFFORT_MENU_SELECT_PREFIX)
+      ? cmd.arg.slice(EFFORT_MENU_SELECT_PREFIX.length)
+      : cmd.arg
+    if (level === 'default') return { persist: 'clear-effort', arg: level }
+    return { persist: 'effort', arg: level }
+  }
+  // model
+  if (cmd.origin === 'menu') return { persist: null, arg: cmd.arg } // mdl:s:<tag> — needs live discovery
+  if (cmd.arg === 'default') return { persist: 'clear-model', arg: cmd.arg }
+  return { persist: 'model', arg: cmd.arg }
+}
+
+function persistedText(cmd: PendingSessionCommand, escapeHtml: (s: string) => string): string {
+  const noun = KIND_NOUN[cmd.kind]
+  const isClear = cmd.arg === 'default' || cmd.targetLabel === 'default'
+  if (isClear) {
+    return `💾 The session is restarting — your ${noun} override was cleared as requested; the agent boots on the configured default.`
+  }
+  return `💾 The session is restarting — your \`${escapeHtml(cmd.targetLabel)}\` ${noun} choice is saved and applies as the agent boots.`
+}
+
+/**
+ * Empty the slots and return, per queued command, what to persist and which
+ * ack-card edit to make. The gateway performs the durable writes (this module
+ * stays fs-free and unit-testable) and edits with `persistedText` on success
+ * or `reissueText` on a null/failed persist. Shared by the SIGTERM shutdown
+ * handler AND the drain's pending-restart branch — a queued choice is never
+ * dropped with a bare "re-issue" when it can be carried across the bounce.
+ */
+export function shutdownResolutionActions(
   slots: PendingSessionCommandSlots,
   escapeHtml: (s: string) => string,
-): PendingCommandCardEdit[] {
-  return slots.takeAll().map(cmd => ({
-    chatId: cmd.ackChatId,
-    messageId: cmd.ackMessageId,
-    text: restartSupersededText(cmd, escapeHtml),
-  }))
+): ShutdownResolutionAction[] {
+  return slots.takeAll().map(cmd => resolveForRestart(cmd, escapeHtml))
+}
+
+/** Single-command form of shutdownResolutionActions (the drain's pending-restart branch). */
+export function resolveForRestart(
+  cmd: PendingSessionCommand,
+  escapeHtml: (s: string) => string,
+): ShutdownResolutionAction {
+  const { persist, arg } = classifyShutdownPersist(cmd)
+  return {
+    cmd,
+    persist,
+    arg,
+    persistedText: persistedText(cmd, escapeHtml),
+    reissueText: restartSupersededText(cmd, escapeHtml),
+  }
 }
 
 const KIND_NOUN: Record<PendingCommandKind, string> = {

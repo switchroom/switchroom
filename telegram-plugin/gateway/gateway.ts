@@ -397,6 +397,8 @@ import {
   srFriendlyLabel,
   expandSrAlias,
   isSrModel,
+  isBusyRefusalText,
+  isOfflineTrustedModelToken,
   type ModelMenuDeps,
   type ModelCommandDeps,
   type ModelMenuReply,
@@ -414,9 +416,12 @@ import {
   RELAUNCH_MODEL_INTENT_FILE,
   GATEWAY_SHUTDOWN_INTENT_REASON_PREFIX,
   clearStaleGatewayShutdownIntent,
+  writeSessionEffortFile,
+  clearSessionEffortFile,
+  readSessionEffortFile,
 } from './session-model-file.js'
 import { discoverModels, selectModel } from '../../src/agents/model-picker.js'
-import { resolveMainModel } from '../../src/agents/scaffold.js'
+import { resolveMainModel, SWITCHROOM_DEFAULT_THINKING_EFFORT } from '../../src/agents/scaffold.js'
 import {
   parseEffortCommand,
   handleEffortCommand,
@@ -429,10 +434,12 @@ import {
 import {
   createPendingSessionCommandSlots,
   drainCapDecision as pendingCmdDrainCapDecision,
-  shutdownResolutionEdits as pendingCmdShutdownResolutionEdits,
+  shutdownResolutionActions as pendingCmdShutdownResolutionActions,
+  resolveForRestart as pendingCmdResolveForRestart,
+  drainTakenCommands as pendingCmdDrainTaken,
+  type ShutdownResolutionAction,
   ackText as pendingCmdAckText,
   supersededText as pendingCmdSupersededText,
-  restartSupersededText as pendingCmdRestartSupersededText,
   type PendingSessionCommand,
 } from './pending-session-command.js'
 import type { EffortLevel } from './effort-command.js'
@@ -20689,8 +20696,100 @@ async function applyQueuedEffortCommand(cmd: PendingSessionCommand): Promise<str
     const outcome = await handleEffortMenuCallback(cmd.arg, deps)
     return outcome.reply.text
   }
-  const reply = await handleEffortCommand({ kind: 'set', level: cmd.arg as EffortLevel }, deps)
+  const parsed =
+    cmd.arg === 'default'
+      ? ({ kind: 'default' } as const)
+      : ({ kind: 'set', level: cmd.arg as EffortLevel } as const)
+  const reply = await handleEffortCommand(parsed, deps)
   return reply.text
+}
+
+/**
+ * Re-enqueue a command the drain took but could not safely apply (a turn
+ * raced in). If a NEWER same-kind command was enqueued while the drain was
+ * mid-flight, the newer one wins (last-write-wins invariant) and this older
+ * card is edited to superseded instead.
+ */
+function reEnqueueUnlessSuperseded(cmd: PendingSessionCommand): void {
+  const newer = pendingSessionCommand.get(cmd.kind)
+  if (newer != null) {
+    void editPendingCommandCard(
+      cmd.ackChatId,
+      cmd.ackMessageId,
+      pendingCmdSupersededText(cmd, newer, escapeHtmlForTg),
+    )
+    return
+  }
+  pendingSessionCommand.set(cmd)
+}
+
+/**
+ * #3039 — execute a shutdown/restart resolution action's durable write:
+ * carry a queued (typed) choice across the bounce via the boot carriers
+ * (`.session-model` / `.session-effort`) instead of asking for a re-issue.
+ * Returns the ack-card text to edit in (persisted vs re-issue fallback).
+ */
+function persistQueuedCommandForRestart(action: ShutdownResolutionAction): string {
+  if (action.persist == null) return action.reissueText
+  const agentDir = resolveAgentDirFromEnv()
+  if (agentDir == null) return action.reissueText
+  try {
+    switch (action.persist) {
+      case 'model': {
+        // #3042 blocker 2a: this token was QUEUED, never confirmed by claude.
+        // Under the keep-by-default boot a garbage-but-shape-valid token
+        // persisted here would crashloop `claude --model <garbage>` with the
+        // gateway dead. Only offline-trustable tokens (static Claude aliases,
+        // curated sr-* alias targets) may be persisted unconfirmed; anything
+        // else gets the honest "couldn't verify — re-issue" card instead.
+        if (!isOfflineTrustedModelToken(action.arg)) {
+          return `↩️ Couldn’t verify \`${escapeHtmlForTg(action.cmd.targetLabel || action.arg)}\` as a known model without the live session — it was NOT saved. Re-issue \`/model ${escapeHtmlForTg(action.arg)}\` once the agent is back.`
+        }
+        const configured =
+          readConfiguredDefaultModel(agentDir) ?? resolveMainModel(undefined)
+        writeSessionModelFile(agentDir, expandSrAlias(action.arg), configured)
+        // Boot default is keep (#3039), but stamp explicit keep-intent for
+        // reason-honesty in the boot notice.
+        writeRelaunchModelIntent(agentDir, 'keep', 'queued /model carried across restart')
+        break
+      }
+      case 'clear-model':
+        clearSessionModelFile(agentDir)
+        break
+      case 'effort':
+        writeSessionEffortFile(agentDir, action.arg, getConfiguredEffortForPersist())
+        break
+      case 'clear-effort':
+        clearSessionEffortFile(agentDir)
+        break
+    }
+    return action.persistedText
+  } catch (err) {
+    process.stderr.write(
+      `telegram gateway: queued-command persist-for-restart failed kind=${action.cmd.kind} arg=${action.arg}: ${(err as Error)?.message ?? String(err)}\n`,
+    )
+    return action.reissueText
+  }
+}
+
+/**
+ * The cascade-resolved thinking_effort, for `.session-effort`'s
+ * configuredDefaultAtWrite. #3042 item 5: on a transient `agent list`
+ * failure fall back to the scaffold default rather than null — persisting ''
+ * would trip a bogus "configured default effort changed" clear+alert at the
+ * next boot (start.sh bakes the same default when yaml is unset).
+ */
+function getConfiguredEffortForPersist(): string {
+  try {
+    type AgentListResp = { agents: Array<{ name: string; thinking_effort?: string | null }> }
+    const data = switchroomExecJson<AgentListResp>(['agent', 'list'])
+    return (
+      data?.agents?.find(a => a.name === getMyAgentName())?.thinking_effort ??
+      SWITCHROOM_DEFAULT_THINKING_EFFORT
+    )
+  } catch {
+    return SWITCHROOM_DEFAULT_THINKING_EFFORT
+  }
 }
 
 // Synchronous re-entrancy guard — the idle gate can fire several times per
@@ -20712,31 +20811,24 @@ async function drainPendingSessionCommand(): Promise<void> {
   if (pendingSessionCommand.size === 0) return
   pendingCmdDraining = true
   try {
-    for (const cmd of pendingSessionCommand.takeAll()) {
-      if (pendingRestarts.size > 0) {
-        await editPendingCommandCard(
-          cmd.ackChatId,
-          cmd.ackMessageId,
-          pendingCmdRestartSupersededText(cmd, escapeHtmlForTg),
-        )
-        continue
-      }
-      let body: string
-      try {
-        body =
-          cmd.kind === 'model'
-            ? await applyQueuedModelCommand(cmd)
-            : await applyQueuedEffortCommand(cmd)
-      } catch (err) {
-        await editPendingCommandCard(
-          cmd.ackChatId,
-          cmd.ackMessageId,
-          `❌ Couldn’t apply the queued ${cmd.kind} switch to \`${escapeHtmlForTg(cmd.targetLabel)}\`: ${escapeHtmlForTg((err as Error)?.message ?? String(err))}`,
-        )
-        continue
-      }
-      await editPendingCommandCard(cmd.ackChatId, cmd.ackMessageId, body)
-    }
+    // Iteration + loss-safety invariants live in drainTakenCommands
+    // (pending-session-command.ts, unit-tested): a restart-pending command is
+    // persisted to the boot carriers; an early stop (turn raced in / handler
+    // busy-refusal) re-enqueues EVERY not-yet-applied taken command (#3042
+    // blocker 1) instead of dropping the rest of the batch.
+    await pendingCmdDrainTaken(pendingSessionCommand.takeAll(), {
+      restartPending: () => pendingRestarts.size > 0,
+      turnInFlight: () => turnInFlightForGate(),
+      apply: cmd =>
+        cmd.kind === 'model' ? applyQueuedModelCommand(cmd) : applyQueuedEffortCommand(cmd),
+      isBusyRefusal: isBusyRefusalText,
+      resolveForRestartText: cmd =>
+        persistQueuedCommandForRestart(pendingCmdResolveForRestart(cmd, escapeHtmlForTg)),
+      editCard: (cmd, text) => editPendingCommandCard(cmd.ackChatId, cmd.ackMessageId, text),
+      reEnqueue: reEnqueueUnlessSuperseded,
+      failureText: (cmd, err) =>
+        `❌ Couldn’t apply the queued ${cmd.kind} switch to \`${escapeHtmlForTg(cmd.targetLabel)}\`: ${escapeHtmlForTg((err as Error)?.message ?? String(err))}`,
+    })
   } finally {
     pendingCmdDraining = false
   }
@@ -20800,12 +20892,36 @@ bot.command('model', async ctx => {
 // effort-command.ts so it's unit-testable without booting the bot.
 function buildEffortDeps(): EffortCommandDeps {
   return {
-    applyEffort: (agent, level) => applyEffort(agent, level),
+    // #3039: single persistence choke point — EVERY positively-confirmed
+    // effort apply (typed, menu tap, queued drain) durably records the level
+    // to `.session-effort`, which start.sh resolves into `--effort` on every
+    // boot. `/effort default` clears it via clearSessionEffort (the handler
+    // clears AFTER its restore-apply, so the wrapper's write is undone).
+    applyEffort: async (agent, level) => {
+      const result = await applyEffort(agent, level)
+      if (result.ok) {
+        const agentDir = resolveAgentDirFromEnv()
+        if (agentDir) {
+          try {
+            writeSessionEffortFile(agentDir, level, getConfiguredEffortForPersist())
+          } catch (err) {
+            process.stderr.write(
+              `telegram gateway: session-effort persist failed level=${level}: ${(err as Error)?.message ?? String(err)}\n`,
+            )
+          }
+        }
+      }
+      return result
+    },
     getAgentName: getMyAgentName,
-    getConfiguredEffort: () => {
-      type AgentListResp = { agents: Array<{ name: string; thinking_effort?: string | null }> }
-      const data = switchroomExecJson<AgentListResp>(['agent', 'list'])
-      return data?.agents?.find(a => a.name === getMyAgentName())?.thinking_effort ?? null
+    getConfiguredEffort: () => getConfiguredEffortForPersist(),
+    clearSessionEffort: () => {
+      const agentDir = resolveAgentDirFromEnv()
+      if (agentDir) clearSessionEffortFile(agentDir)
+    },
+    getSessionEffort: () => {
+      const agentDir = resolveAgentDirFromEnv()
+      return agentDir ? (readSessionEffortFile(agentDir)?.level ?? null) : null
     },
     escapeHtml: escapeHtmlForTg,
   }
@@ -20835,18 +20951,19 @@ bot.command('effort', async ctx => {
   // /model. `applyEffort` mid-turn silently maybe-failed ("couldn't confirm it
   // applied") before this gate existed. `currentTurn !== null` is the same
   // busy signal the model path reads via deps.isBusy().
-  if (parsed.kind === 'set' && currentTurn !== null) {
+  if ((parsed.kind === 'set' || parsed.kind === 'default') && currentTurn !== null) {
+    const requestedLevel = parsed.kind === 'set' ? parsed.level : 'default'
     const chatId = String(ctx.chat!.id)
     const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
     const sent = await ctx.replyWithRichMessage(
-      richMessage(hardenCardBreaks(pendingCmdAckText('effort', parsed.level, escapeHtmlForTg))),
+      richMessage(hardenCardBreaks(pendingCmdAckText('effort', requestedLevel, escapeHtmlForTg))),
       threadId != null ? { message_thread_id: threadId } : {},
     )
     enqueueSessionCommand({
       kind: 'effort',
       origin: 'typed',
-      arg: parsed.level,
-      targetLabel: parsed.level,
+      arg: requestedLevel,
+      targetLabel: requestedLevel,
       chatId,
       threadId,
       ackChatId: chatId,
@@ -20950,12 +21067,13 @@ bot.command('restart', async ctx => {
     // greeting card shows "Restarted  user: /restart from chat" instead
     // of whatever reason the downstream CLI would default to.
     stampUserRestartReason('user: /restart from chat')
-    // /restart is a DELIBERATE restart: the session model reverts to the
-    // configured default. Absence of intent would revert anyway (boot
-    // default) — the explicit stamp is reason-honesty for the boot notice.
+    // #3039: /restart is "bounce the session", NOT "clear my model" — the
+    // durable override survives every restart and is cleared only by
+    // `/model default`. Stamp keep for reason-honesty in the boot notice
+    // (absence of intent keeps anyway under the keep-by-default boot).
     {
       const smDir = resolveAgentDirFromEnv()
-      if (smDir) writeRelaunchModelIntent(smDir, 'revert', 'user: /restart from chat')
+      if (smDir) writeRelaunchModelIntent(smDir, 'keep', 'user: /restart from chat')
     }
     await sweepBeforeSelfRestart()
     const hostdResp = await tryHostdDispatch(getMyAgentName(), {
@@ -26236,13 +26354,19 @@ async function shutdown(signal: string): Promise<void> {
     process.stderr.write(`telegram gateway: shutdown.clean_marker_skipped signal=${signal} (crash path — banner will fire on next boot)\n`)
   }
 
-  // #3018 finding 3: resolve any queued /model|/effort ack cards. The gateway
-  // (and with it the queue) is going away — without this the ack card dangles
-  // at "the moment this turn finishes" forever and the operator's choice is
-  // silently lost. Edit each into the restart-superseded text ("re-issue once
-  // the agent is back"). Best-effort and time-bounded so a wedged Telegram
-  // API can't block shutdown.
-  const orphanedCmdEdits = pendingCmdShutdownResolutionEdits(pendingSessionCommand, escapeHtmlForTg)
+  // #3018 finding 3 + #3039: resolve any queued /model|/effort ack cards. The
+  // gateway (and with it the in-memory queue) is going away — persist each
+  // typed choice to the durable boot carriers (`.session-model` /
+  // `.session-effort`) so it still deterministically applies as the agent
+  // boots, and edit the ack card to say so. Only an unresolvable menu-tag
+  // selection falls back to a re-issue note. Best-effort and time-bounded so
+  // a wedged Telegram API can't block shutdown.
+  const orphanedCmdActions = pendingCmdShutdownResolutionActions(pendingSessionCommand, escapeHtmlForTg)
+  const orphanedCmdEdits = orphanedCmdActions.map(a => ({
+    chatId: a.cmd.ackChatId,
+    messageId: a.cmd.ackMessageId,
+    text: persistQueuedCommandForRestart(a),
+  }))
   if (orphanedCmdEdits.length > 0) {
     process.stderr.write(
       `telegram gateway: shutdown.pending_cmd_resolved count=${orphanedCmdEdits.length}\n`,

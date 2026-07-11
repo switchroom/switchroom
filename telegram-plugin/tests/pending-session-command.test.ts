@@ -14,8 +14,10 @@
  *   - size mirrors the `pendingRestarts.size` gate shape (0..2)
  *   - the reaper's drainCapDecision DEFERS while a turn is in flight — the
  *     60s cap must never force a mid-turn drain (#3018 finding 1)
- *   - shutdownResolutionEdits empties the slots and yields the ack-card edits
- *     telling the operator to re-issue after boot (#3018 finding 3)
+ *   - shutdownResolutionActions empties the slots and yields, per queued
+ *     command, the durable persist the gateway should perform so the choice
+ *     still applies across the bounce (#3039) — with a re-issue fallback only
+ *     for the unresolvable menu-tag case
  *   - the ack / superseded / restart-superseded text names the target so the
  *     operator always sees their choice was captured, replaced, or deferred —
  *     never dropped.
@@ -25,7 +27,10 @@ import { describe, it, expect } from 'vitest'
 import {
   createPendingSessionCommandSlots,
   drainCapDecision,
-  shutdownResolutionEdits,
+  shutdownResolutionActions,
+  resolveForRestart,
+  drainTakenCommands,
+  type DrainIo,
   ackText,
   supersededText,
   restartSupersededText,
@@ -167,24 +172,45 @@ describe('drainCapDecision (#3018 finding 1: the cap must never force mid-turn)'
   })
 })
 
-describe('shutdownResolutionEdits (#3018 finding 3: SIGTERM must not dangle the ack card)', () => {
-  it('empties the slots and yields one restart-superseded edit per queued command', () => {
+describe('shutdownResolutionActions (#3018 finding 3 + #3039: SIGTERM persists the queued choice)', () => {
+  it('empties the slots and yields a persist action per queued command', () => {
     const slots = createPendingSessionCommandSlots()
-    slots.set(cmd({ kind: 'model', targetLabel: 'fable', ackChatId: '100', ackMessageId: 7 }))
-    slots.set(cmd({ kind: 'effort', targetLabel: 'high', ackChatId: '100', ackMessageId: 9 }))
-    const edits = shutdownResolutionEdits(slots, ident)
-    expect(edits).toHaveLength(2)
+    slots.set(cmd({ kind: 'model', targetLabel: 'fable', arg: 'fable', ackChatId: '100', ackMessageId: 7 }))
+    slots.set(cmd({ kind: 'effort', targetLabel: 'high', arg: 'high', ackChatId: '100', ackMessageId: 9 }))
+    const actions = shutdownResolutionActions(slots, ident)
+    expect(actions).toHaveLength(2)
     expect(slots.size).toBe(0) // the queue is RESOLVED, not left behind
-    const model = edits.find(e => e.messageId === 7)!
-    expect(model.chatId).toBe('100')
-    expect(model.text).toContain('`fable`')
-    expect(model.text).toContain('re-issue')
-    const effort = edits.find(e => e.messageId === 9)!
-    expect(effort.text).toContain('/effort high')
+    const model = actions.find(a => a.cmd.ackMessageId === 7)!
+    expect(model.persist).toBe('model')
+    expect(model.arg).toBe('fable')
+    expect(model.persistedText).toContain('`fable`')
+    expect(model.persistedText).toContain('saved')
+    // The fallback (persist failed) still names the choice + how to recover.
+    expect(model.reissueText).toContain('re-issue')
+    const effort = actions.find(a => a.cmd.ackMessageId === 9)!
+    expect(effort.persist).toBe('effort')
+    expect(effort.arg).toBe('high')
   })
 
-  it('returns no edits when nothing is queued', () => {
-    expect(shutdownResolutionEdits(createPendingSessionCommandSlots(), ident)).toEqual([])
+  it('typed /model default → clear-model; typed /effort default → clear-effort', () => {
+    expect(resolveForRestart(cmd({ kind: 'model', arg: 'default', targetLabel: 'default' }), ident).persist).toBe('clear-model')
+    expect(resolveForRestart(cmd({ kind: 'effort', arg: 'default', targetLabel: 'default' }), ident).persist).toBe('clear-effort')
+  })
+
+  it('menu model selection (mdl:s:<tag>) is not offline-resolvable → persist null, re-issue fallback', () => {
+    const a = resolveForRestart(cmd({ kind: 'model', origin: 'menu', arg: 'mdl:s:abcd1234', targetLabel: 'the selected model' }), ident)
+    expect(a.persist).toBeNull()
+    expect(a.reissueText).toContain('re-issue')
+  })
+
+  it('menu effort tap (eff:s:<level>) IS resolvable → persist effort with the level', () => {
+    const a = resolveForRestart(cmd({ kind: 'effort', origin: 'menu', arg: 'eff:s:xhigh', targetLabel: 'xhigh' }), ident)
+    expect(a.persist).toBe('effort')
+    expect(a.arg).toBe('xhigh')
+  })
+
+  it('returns no actions when nothing is queued', () => {
+    expect(shutdownResolutionActions(createPendingSessionCommandSlots(), ident)).toEqual([])
   })
 })
 
@@ -226,5 +252,71 @@ describe('restartSupersededText', () => {
     expect(t).toContain('restarting')
     expect(t).toContain('/effort max')
     expect(t).toContain('`max`')
+  })
+})
+
+
+// ─── #3042 blocker 1: drain loss-safety across a two-command batch ───────────
+
+describe('drainTakenCommands (#3042 blocker 1: an early stop must not drop the rest of the batch)', () => {
+  function makeIo(overrides: Partial<DrainIo> = {}) {
+    const events: string[] = []
+    const io: DrainIo = {
+      restartPending: () => false,
+      turnInFlight: () => false,
+      apply: async c => { events.push(`apply:${c.kind}`); return `✅ ${c.kind} done` },
+      isBusyRefusal: t => t.includes('BUSY'),
+      resolveForRestartText: c => `persisted:${c.kind}`,
+      editCard: async (c, text) => { events.push(`edit:${c.kind}:${text}`) },
+      reEnqueue: c => { events.push(`requeue:${c.kind}`) },
+      failureText: (c, err) => `fail:${c.kind}:${(err as Error).message}`,
+      ...overrides,
+    }
+    return { io, events }
+  }
+  const batch = () => [cmd({ kind: 'model' }), cmd({ kind: 'effort', arg: 'high', targetLabel: 'high' })]
+
+  it('happy path applies and confirms both commands in order', async () => {
+    const { io, events } = makeIo()
+    await drainTakenCommands(batch(), io)
+    expect(events).toEqual(['apply:model', 'edit:model:✅ model done', 'apply:effort', 'edit:effort:✅ effort done'])
+  })
+
+  it('turn races in before the FIRST command → BOTH are re-enqueued, none applied or confirmed', async () => {
+    const { io, events } = makeIo({ turnInFlight: () => true })
+    await drainTakenCommands(batch(), io)
+    expect(events).toEqual(['requeue:model', 'requeue:effort'])
+  })
+
+  it('turn races in before the SECOND command → first applied, second re-enqueued (not lost)', async () => {
+    let calls = 0
+    const { io, events } = makeIo({ turnInFlight: () => ++calls > 1 })
+    await drainTakenCommands(batch(), io)
+    expect(events).toEqual(['apply:model', 'edit:model:✅ model done', 'requeue:effort'])
+  })
+
+  it('handler busy-refusal on the FIRST command → the refusal never reaches the ack card and BOTH are re-enqueued', async () => {
+    const { io, events } = makeIo({
+      apply: async c => (c.kind === 'model' ? 'BUSY — mid-turn' : '✅ effort done'),
+    })
+    await drainTakenCommands(batch(), io)
+    expect(events).toEqual(['requeue:model', 'requeue:effort'])
+  })
+
+  it('apply throwing on the first command does NOT stop the second (failure is per-command)', async () => {
+    const { io, events } = makeIo({
+      apply: async c => {
+        if (c.kind === 'model') throw new Error('boom')
+        return '✅ effort done'
+      },
+    })
+    await drainTakenCommands(batch(), io)
+    expect(events).toEqual(['edit:model:fail:model:boom', 'edit:effort:✅ effort done'])
+  })
+
+  it('restart pending → every command is resolved via the carriers, none applied live', async () => {
+    const { io, events } = makeIo({ restartPending: () => true })
+    await drainTakenCommands(batch(), io)
+    expect(events).toEqual(['edit:model:persisted:model', 'edit:effort:persisted:effort'])
   })
 })

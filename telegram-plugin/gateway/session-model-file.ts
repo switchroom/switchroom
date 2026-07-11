@@ -7,17 +7,26 @@
  *   - `.session-model` — the DURABLE session override written on every
  *     positively-confirmed `/model` switch. One-line JSON
  *     `{"model","configuredDefaultAtWrite","ts"}`. It is NOT consumed by a
- *     keep-path boot; start.sh deletes it on revert / invalidation /
- *     corruption / 7-day staleness, and the gateway deletes it on
- *     `/model default`.
+ *     keep-path boot; it survives every restart/deploy/crash and is cleared
+ *     only by explicit user action (`/model default`) or invalidation
+ *     (corruption / the configured yaml default changed) — every clearing
+ *     path notifies the operator chat via `.session-model-alert` (#3039).
  *
  *   - `.relaunch-model-intent` — the ONE-SHOT intent bit for the next boot.
  *     One-line JSON `{"intent":"keep"|"revert","reason","ts"}`, atomic
- *     write, last-writer-wins. Boot default is REVERT (operator decision:
- *     a raw `docker restart` / host reboot / crash must revert to the yaml
- *     model), so every switchroom-managed KEEP path must stamp keep-intent
- *     BEFORE the bounce. start.sh consumes it (rm -f) every boot; a stale
- *     (>10 min by the embedded ts) or corrupt intent counts as no intent.
+ *     write, last-writer-wins. Boot default is KEEP (#3039 — operator
+ *     decision 2026-07-11, superseding the earlier revert-by-default): a
+ *     raw `docker restart` / host reboot / deploy / crash keeps a valid
+ *     override. Only an explicit fresh "revert" intent reverts. start.sh
+ *     consumes the file (rm -f) every boot; a stale (>10 min by the
+ *     embedded ts) or corrupt intent counts as no intent (→ keep).
+ *
+ *   - `.session-effort` — the DURABLE effort override (#3039), same shape
+ *     and lifecycle as `.session-model` with `level` in place of `model`:
+ *     `{"level","configuredDefaultAtWrite","ts"}`. Written on every
+ *     positively-confirmed `/effort` apply, resolved by start.sh into the
+ *     relaunch's `--effort`, cleared only by `/effort default` or
+ *     invalidation (with a boot alert).
  *
  * The `model` token is always a canonical `claude --model` token (alias,
  * `claude-*` id, or `sr-*` id) — NEVER a display label like "Opus 4.8".
@@ -41,20 +50,18 @@ export interface SessionModelRecord {
 }
 
 /**
- * Restart reasons whose semantics are "revert the session model to the
- * configured default". Everything else `triggerSelfRestart` fires with is a
- * switchroom-managed relaunch (watchdog recovery, drain-cap bounce,
- * turn-complete deferred restart, fleet-fallback resume, sr-to-claude model
- * switch, grant restarts) and KEEPS the override — the whole point of the
- * stickiness contract. Enumerated in the RFC §3; default-keep here is safe
- * because only gateway code calls triggerSelfRestart, and a bounce nobody
- * stamped (crash, raw docker restart, deploy) reverts by boot default anyway.
+ * Classify a triggerSelfRestart reason into the intent the boot should honor.
+ *
+ * Since #3039 (operator contract 2026-07-11) EVERY restart reason keeps the
+ * override: a restart — user-tapped, watchdog, deploy, or crash — is not
+ * "clear my model". The override is cleared only by explicit user action
+ * (`/model default`) or invalidation at boot, both of which run their own
+ * paths. The 'revert' intent value remains recognised by start.sh (and this
+ * classifier's signature keeps it) so an older gateway's stamp still parses,
+ * but current code never emits it.
  */
-const REVERT_RESTART_REASONS: ReadonlySet<string> = new Set(['inline-button-restart'])
-
-/** Classify a triggerSelfRestart reason into the intent the boot should honor. */
-export function intentForRestartReason(reason: string): RelaunchModelIntent {
-  return REVERT_RESTART_REASONS.has(reason) ? 'revert' : 'keep'
+export function intentForRestartReason(_reason: string): RelaunchModelIntent {
+  return 'keep'
 }
 
 function atomicWrite(path: string, content: string): void {
@@ -132,6 +139,10 @@ export function readSessionModelFile(agentDir: string): SessionModelRecord | nul
 export function clearSessionModelFile(agentDir: string): void {
   try {
     rmSync(join(agentDir, SESSION_MODEL_FILE), { force: true })
+    // #3042 item 4: also drop the kept-alert dedup sentinel so a future
+    // override of the same name re-alerts on its first kept boot.
+    rmSync(join(agentDir, '.session-model-kept-notified'), { force: true })
+    rmSync(join(agentDir, '.session-model-boot-attempts'), { force: true })
   } catch {
     /* best-effort */
   }
@@ -154,8 +165,8 @@ export function restoreSessionModelFileRaw(agentDir: string, raw: string | null)
  * Stamp the one-shot relaunch intent. MUST be called synchronously BEFORE
  * the restart signal/dispatch it describes (write-before-kill invariant —
  * the next start.sh boot reads this to decide keep vs revert). Best-effort:
- * a failed write means the boot falls back to the default (revert), which
- * is the safe side.
+ * a failed write means the boot falls back to the default (keep, #3039) —
+ * the user's choice is preserved either way.
  */
 export function writeRelaunchModelIntent(
   agentDir: string,
@@ -249,5 +260,82 @@ export function readConfiguredDefaultModel(agentDir: string): string | null {
     return v.length > 0 ? v : null
   } catch {
     return null
+  }
+}
+
+// ─── Durable session-effort override (#3039) ────────────────────────────────
+//
+// The `/effort` sibling of `.session-model`. Same lifecycle: written on every
+// positively-confirmed effort apply, honored by start.sh on every boot
+// (`--effort <level>`), cleared only by `/effort default` or invalidation
+// (configured `thinking_effort:` changed / corrupt file — both alert once).
+
+export const SESSION_EFFORT_FILE = '.session-effort'
+
+/**
+ * The level allowlist, duplicated from effort-command.ts to avoid a cycle
+ * (effort-command must stay gateway-agnostic; this module already imports
+ * from model-command). Kept in sync by the cross-check regression test.
+ */
+const EFFORT_LEVEL_RE = /^(low|medium|high|xhigh|max)$/
+
+export interface SessionEffortRecord {
+  level: string
+  /** The cascade-resolved `thinking_effort` at write time ('' when unset). */
+  configuredDefaultAtWrite: string
+  ts: number
+}
+
+/** Parse `.session-effort` content. Null on corrupt JSON / bad shape / non-allowlisted level. */
+export function parseSessionEffort(text: string): SessionEffortRecord | null {
+  try {
+    const raw = JSON.parse(text) as Partial<SessionEffortRecord>
+    if (
+      typeof raw.level !== 'string' ||
+      typeof raw.configuredDefaultAtWrite !== 'string' ||
+      typeof raw.ts !== 'number' ||
+      !EFFORT_LEVEL_RE.test(raw.level)
+    ) {
+      return null
+    }
+    return { level: raw.level, configuredDefaultAtWrite: raw.configuredDefaultAtWrite, ts: raw.ts }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Write the durable effort override. Throws on a non-allowlisted level —
+ * the value is passed verbatim to `claude --effort` at the next boot.
+ */
+export function writeSessionEffortFile(
+  agentDir: string,
+  level: string,
+  configuredDefaultAtWrite: string | null,
+): void {
+  if (!EFFORT_LEVEL_RE.test(level)) {
+    throw new Error(`refusing to persist non-allowlisted effort level: ${JSON.stringify(level)}`)
+  }
+  atomicWrite(
+    join(agentDir, SESSION_EFFORT_FILE),
+    `${JSON.stringify({ level, configuredDefaultAtWrite: configuredDefaultAtWrite ?? '', ts: Date.now() })}\n`,
+  )
+}
+
+/** Parsed durable effort override, or null when absent/corrupt. */
+export function readSessionEffortFile(agentDir: string): SessionEffortRecord | null {
+  try {
+    return parseSessionEffort(readFileSync(join(agentDir, SESSION_EFFORT_FILE), 'utf8'))
+  } catch {
+    return null
+  }
+}
+
+/** Delete the durable effort override (`/effort default`). Best-effort. */
+export function clearSessionEffortFile(agentDir: string): void {
+  try {
+    rmSync(join(agentDir, SESSION_EFFORT_FILE), { force: true })
+  } catch {
+    /* best-effort */
   }
 }

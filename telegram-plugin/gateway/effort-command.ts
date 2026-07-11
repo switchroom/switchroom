@@ -47,6 +47,7 @@ export function isValidEffortArg(arg: string): boolean {
 export type ParsedEffortCommand =
   | { kind: 'show' }
   | { kind: 'set'; level: EffortLevel }
+  | { kind: 'default' }
   | { kind: 'help'; reason?: string }
 
 /**
@@ -64,6 +65,9 @@ export function parseEffortCommand(text: string): ParsedEffortCommand | null {
   }
   const arg = parts[0]
   if (arg.toLowerCase() === 'help') return { kind: 'help' }
+  // `/effort default` — explicit user action that clears the durable
+  // `.session-effort` override and restores the configured default (#3039).
+  if (arg.toLowerCase() === 'default') return { kind: 'default' }
   if (!isValidEffortArg(arg)) {
     return { kind: 'help', reason: `not a valid effort level: ${arg}` }
   }
@@ -86,6 +90,17 @@ export interface EffortCommandDeps {
    * Null when unreadable — rendered as the built-in default.
    */
   getConfiguredEffort: () => string | null
+  /**
+   * Delete the durable `.session-effort` override (#3039). Optional so
+   * gateway-agnostic tests can omit it; the gateway always wires it.
+   */
+  clearSessionEffort?: () => void
+  /**
+   * The active durable `.session-effort` override level, or null when none
+   * (#3039). Optional; used to mark the LIVE level in the menu and the show
+   * text honestly after a restart re-applied the override.
+   */
+  getSessionEffort?: () => string | null
   escapeHtml: (s: string) => string
 }
 
@@ -95,7 +110,7 @@ export interface EffortCommandReply {
 }
 
 const PERSIST_NOTE =
-  '_Session-only — reverts to the configured default on restart. To change the default, set \`thinking_effort:\` in switchroom.yaml and restart._'
+  '_Sticky — persists across restarts and deploys until \`/effort default\` clears it. To change the configured default, set \`thinking_effort:\` in switchroom.yaml._'
 
 const LEVELS_INLINE = EFFORT_LEVELS.map(l => `\`${l}\``).join(' · ')
 
@@ -106,6 +121,7 @@ function helpText(deps: EffortCommandDeps, reason?: string): EffortCommandReply 
     '**/effort** — show or switch the reasoning effort (faster→smarter)',
     '\`/effort\` — show the configured effort + a tap menu',
     `\`/effort <level>\` — switch the live session (${LEVELS_INLINE})`,
+    '\`/effort default\` — clear the override, back to the configured default',
     PERSIST_NOTE,
   )
   return { text: lines.join('\n'), html: true }
@@ -117,13 +133,41 @@ export async function handleEffortCommand(
 ): Promise<EffortCommandReply> {
   if (parsed.kind === 'help') return helpText(deps, parsed.reason)
 
+  if (parsed.kind === 'default') {
+    // Explicit clear: restore the configured default level in the live
+    // session, THEN delete the durable override (order matters — the
+    // gateway's applyEffort wrapper re-persists on a confirmed apply, so
+    // clearing last leaves no file behind).
+    const configured = deps.getConfiguredEffort()
+    const restoreLevel = configured && isValidEffortArg(configured) ? configured.toLowerCase() : 'low'
+    let restored: EffortApplyResult | null = null
+    try {
+      restored = await deps.applyEffort(deps.getAgentName(), restoreLevel)
+    } catch {
+      restored = null
+    }
+    deps.clearSessionEffort?.()
+    const cfgHtml = `\`${deps.escapeHtml(restoreLevel)}\``
+    if (restored?.ok) {
+      return {
+        text: `✅ Effort override cleared — back on the configured default ${cfgHtml}. It will also boot on ${cfgHtml} from now on.`,
+        html: true,
+      }
+    }
+    return {
+      text: `✅ Effort override cleared — the agent boots on the configured default ${cfgHtml} from now on. (Couldn't switch the live session right now; it may already be on ${cfgHtml}, or will be after the next restart.)`,
+      html: true,
+    }
+  }
+
   if (parsed.kind === 'show') {
     const configured = deps.getConfiguredEffort()
     const shown = configured && configured.length > 0 ? configured : 'low'
+    const override = deps.getSessionEffort?.() ?? null
     return {
       text: [
         `**Effort — ${deps.escapeHtml(deps.getAgentName())}**`,
-        `Configured default: \`${deps.escapeHtml(shown)}\``,
+        `Configured default: \`${deps.escapeHtml(shown)}\`${override ? ` · session override: \`${deps.escapeHtml(override)}\`` : ''}`,
         `Switch the live session: ${EFFORT_LEVELS.map(l => `\`/effort ${l}\``).join(' · ')}`,
         PERSIST_NOTE,
       ].join('\n'),
@@ -217,7 +261,7 @@ function menuKeyboard(highlight: string): EffortMenuKeyboardButton[][] {
  */
 export function buildEffortMenu(deps: EffortCommandDeps, highlight?: string): EffortMenuReply {
   const configured = deps.getConfiguredEffort() || 'low'
-  const live = highlight ?? configured
+  const live = highlight ?? deps.getSessionEffort?.() ?? configured
   return {
     text: [
       `**Effort — ${deps.escapeHtml(deps.getAgentName())}**`,

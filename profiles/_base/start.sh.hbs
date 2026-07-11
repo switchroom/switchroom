@@ -1067,21 +1067,21 @@ fi
 
 # --- Session model resolution (durable .session-model + .relaunch-model-intent) ---
 #
-# Contract: reference/rfcs/session-model-stickiness.md. A positively-
-# confirmed `/model X` switch persists as `{{agentDir}}/.session-model`
-# (one-line JSON written by the gateway). Whether THIS boot applies it is
-# decided by the one-shot `.relaunch-model-intent` file, stamped by the
-# gateway immediately before every switchroom-managed bounce:
+# Contract: reference/rfcs/session-model-stickiness.md (#3039 revision). A
+# positively-confirmed `/model X` switch persists as
+# `{{agentDir}}/.session-model` (one-line JSON written by the gateway) and is
+# honored on EVERY boot — deploy, watchdog bounce, raw `docker restart`,
+# host reboot, crash. It is cleared only by:
 #
-#   fresh (<10 min by embedded ts) "keep" intent  → apply the override
-#   anything else (revert / absent / stale / corrupt) → delete the override,
-#     boot the configured default, and (when an override was actually
-#     removed) write a `.session-model-alert` notice naming why.
+#   - explicit user action (`/model default` deletes it live; a fresh
+#     (<10 min) explicit "revert" `.relaunch-model-intent` reverts at boot)
+#   - invalidation: corrupt/malformed file, or the configured yaml `model:`
+#     changed since the switch
 #
-# Default is REVERT (operator decision 2026-07): a crash, OOM, raw
-# `docker restart`, host reboot, or deploy writes no intent and therefore
-# reverts to the yaml model. Watchdog/recovery bounces run gateway code and
-# stamp "keep" before SIGTERM, so a confirmed switch survives them.
+# Every clearing path writes `.session-model-alert`, which the gateway
+# relays to the operator chat once at boot — an override is never dropped
+# silently. Default (no intent / stale / corrupt intent) is KEEP (operator
+# decision 2026-07-11, superseding the earlier revert-by-default).
 #
 # NB {{{modelQ}}} is already shell-single-quoted by the scaffold (it renders as
 # a quoted token, e.g. 'claude-sonnet-5'), so it is assigned BARE here — never
@@ -1117,14 +1117,18 @@ fi
 # Freshness clock is the EMBEDDED ts (ms), never file mtime — same clock the
 # gateway writes with.
 _sm_reason=""
+_sm_revert=""
 if [ -f "{{agentDir}}/.relaunch-model-intent" ]; then
   _int_raw="$(cat "{{agentDir}}/.relaunch-model-intent" 2>/dev/null || true)"
   rm -f "{{agentDir}}/.relaunch-model-intent"
   _int="$(printf '%s' "$_int_raw" | sed -n 's/.*"intent"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p')"
   _int_ts="$(printf '%s' "$_int_raw" | sed -n 's/.*"ts"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p')"
   _sm_reason="$(printf '%s' "$_int_raw" | sed -n 's/.*"reason"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
-  if [ "$_int" = "keep" ] && [ -n "$_int_ts" ] && [ $(( $(date +%s) * 1000 - _int_ts )) -lt 600000 ]; then
-    _sm_keep="1"
+  # #3039: boot default is KEEP. Only a FRESH explicit "revert" intent
+  # (stamped by an explicit user/gateway revert path) clears the override.
+  # A stale or corrupt intent counts as no intent → keep.
+  if [ "$_int" = "revert" ] && [ -n "$_int_ts" ] && [ $(( $(date +%s) * 1000 - _int_ts )) -lt 600000 ]; then
+    _sm_revert="1"
   fi
   unset _int_raw _int _int_ts
 fi
@@ -1134,13 +1138,13 @@ if [ -f "{{agentDir}}/.session-model" ]; then
   _sm_model="$(printf '%s' "$_smf" | sed -n 's/.*"model"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
   _sm_cfg="$(printf '%s' "$_smf" | sed -n 's/.*"configuredDefaultAtWrite"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
   _sm_ts="$(printf '%s' "$_smf" | sed -n 's/.*"ts"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p')"
-  if [ -z "$_sm_keep" ]; then
-    # No fresh keep intent → deliberate restart, crash, external container
-    # restart, or deploy. Revert to the configured default and say so.
-    rm -f "{{agentDir}}/.session-model"
-    _sm_why="${_sm_reason:-no keep intent — crash, external container restart, or deploy}"
+  if [ -n "$_sm_revert" ]; then
+    # Explicit fresh revert intent — the ONLY boot path that clears a valid
+    # override by design (#3039). Everything else keeps.
+    rm -f "{{agentDir}}/.session-model" "{{agentDir}}/.session-model-kept-notified"
+    _sm_why="${_sm_reason:-explicit revert intent}"
     echo "session-model: reverting to configured default '$_EFFECTIVE_MODEL' — $_sm_why (session override '$_sm_model' cleared)" >&2
-    printf 'Session model override `%s` was cleared — this relaunch reverted to the configured default `%s` (%s). Re-issue /model %s to switch back.\n' "$_sm_model" "$_EFFECTIVE_MODEL" "$_sm_why" "$_sm_model" > "{{agentDir}}/.session-model-alert" 2>/dev/null || true
+    printf 'Session model override `%s` was cleared as requested (%s) — this relaunch booted the configured default `%s`. Re-issue /model %s to switch back.\n' "$_sm_model" "$_sm_why" "$_EFFECTIVE_MODEL" "$_sm_model" > "{{agentDir}}/.session-model-alert" 2>/dev/null || true
     unset _sm_why
   # Shape gate — kept BYTE-IDENTICAL with MODEL_ARG_RE in
   # telegram-plugin/gateway/model-command.ts. `/` is allowed for
@@ -1151,20 +1155,18 @@ if [ -f "{{agentDir}}/.session-model" ]; then
   # passes if ANY line matches — a multiline value must never reach
   # `claude --model` (parity with parseSessionModel's single-string check).
   elif [ "$(printf '%s' "$_sm_model" | wc -c)" -eq 0 ] || [ "$(printf '%s' "$_sm_model" | wc -l)" -ne 0 ] || ! printf '%s' "$_sm_model" | grep -Eq '^[A-Za-z0-9][]A-Za-z0-9._[/-]{0,99}$'; then
-    rm -f "{{agentDir}}/.session-model"
+    # Invalid carrier (#3039): fall back to the configured default AND tell
+    # the operator once — never a silent stderr-only drop.
+    rm -f "{{agentDir}}/.session-model" "{{agentDir}}/.session-model-kept-notified"
     echo "session-model: ignoring malformed .session-model (failed shape gate) — using configured default '$_EFFECTIVE_MODEL'" >&2
+    printf 'Your saved session model override could not be read (invalid or corrupt), so the agent booted on its configured default `%s`. Re-issue /model <name> if you want a different model.\n' "$_EFFECTIVE_MODEL" > "{{agentDir}}/.session-model-alert" 2>/dev/null || true
   elif [ "$_sm_cfg" != "$_EFFECTIVE_MODEL" ]; then
     # switchroom.yaml `model:` changed since the switch → the override is
-    # against a default that no longer exists. Invalidate + announce.
-    rm -f "{{agentDir}}/.session-model"
+    # against a default that no longer exists (it may name a retired model).
+    # Invalidate + announce once (#3039 invalid-carrier fallback).
+    rm -f "{{agentDir}}/.session-model" "{{agentDir}}/.session-model-kept-notified"
     echo "session-model: configured default changed ('$_sm_cfg' → '$_EFFECTIVE_MODEL') — clearing session override '$_sm_model'" >&2
     printf 'The configured default model changed (`%s` → `%s`), so your session override to `%s` was cleared — the agent booted on the new configured default. Re-issue /model %s if you still want it.\n' "$_sm_cfg" "$_EFFECTIVE_MODEL" "$_sm_model" "$_sm_model" > "{{agentDir}}/.session-model-alert" 2>/dev/null || true
-  elif [ -n "$_sm_ts" ] && [ $(( $(date +%s) * 1000 - _sm_ts )) -gt 604800000 ]; then
-    # 7-day staleness bound (belt-and-braces vs version-rollback resurrection
-    # and long-forgotten overrides).
-    rm -f "{{agentDir}}/.session-model"
-    echo "session-model: session override '$_sm_model' is older than 7 days — expiring it, using configured default '$_EFFECTIVE_MODEL'" >&2
-    printf 'Session model override `%s` expired (older than 7 days) — the agent booted on its configured default `%s`. Re-issue /model %s if you still want it.\n' "$_sm_model" "$_EFFECTIVE_MODEL" "$_sm_model" > "{{agentDir}}/.session-model-alert" 2>/dev/null || true
   else
     case "$_sm_model" in
       sr-*)
@@ -1183,13 +1185,93 @@ if [ -f "{{agentDir}}/.session-model" ]; then
         ;;
     esac
     if [ "$_EFFECTIVE_MODEL" = "$_sm_model" ]; then
-      echo "session-model: keeping session override '$_sm_model' across this switchroom-managed relaunch${_sm_reason:+ ($_sm_reason)}" >&2
-      printf 'Session model override `%s` kept across this relaunch%s. It reverts on /restart, agent restart, crash, or an external container restart; /model default clears it now.\n' "$_sm_model" "${_sm_reason:+ ($_sm_reason)}" > "{{agentDir}}/.session-model-alert" 2>/dev/null || true
+      echo "session-model: keeping session override '$_sm_model' across this relaunch${_sm_reason:+ ($_sm_reason)}" >&2
+      # #3042 item 4: notify the chat ONCE per kept value — a watchdog bounce
+      # loop must not storm the operator with identical "kept" alerts. The
+      # sentinel is cleared on every path that clears the override.
+      if [ "$(cat "{{agentDir}}/.session-model-kept-notified" 2>/dev/null || true)" != "$_sm_model" ]; then
+        printf 'Session model override `%s` kept across this relaunch%s. It persists across restarts and deploys; /model default clears it.\n' "$_sm_model" "${_sm_reason:+ ($_sm_reason)}" > "{{agentDir}}/.session-model-alert" 2>/dev/null || true
+        printf '%s\n' "$_sm_model" > "{{agentDir}}/.session-model-kept-notified" 2>/dev/null || true
+      fi
     fi
   fi
   unset _smf _sm_model _sm_cfg _sm_ts
 fi
-unset _sm_keep _sm_reason
+unset _sm_keep _sm_reason _sm_revert
+
+# --- Override crashloop self-heal (#3042 review blocker 2b) ---
+#
+# Under keep-by-default an invalid-but-shape-valid persisted model (a typo
+# persisted at shutdown, or a confirmed model later retired) would make every
+# boot exec `claude --model <bad>` and die with the gateway dead — recovery
+# would need a host shell. Detect the loop from inside: when an override is
+# ACTIVE, stamp a boot-attempt counter just before exec; a healthy run makes
+# the next boot arrive much later (stamp stale → counter resets), while a
+# fast crashloop re-enters here within seconds (docker backoff caps ≈1 min).
+# Three consecutive fast boots with the same override → clear the carrier,
+# boot the configured default, and alert the chat once.
+_SM_CFG_RECORDED="$(cat "{{agentDir}}/.configured-default-model" 2>/dev/null | tr -d '[:space:]' || true)"
+if [ -n "$_SM_CFG_RECORDED" ] && [ "$_EFFECTIVE_MODEL" != "$_SM_CFG_RECORDED" ] && [ -f "{{agentDir}}/.session-model" ]; then
+  _bl_now="$(date +%s)"
+  _bl_cnt=0
+  _bl_prev=0
+  if [ -f "{{agentDir}}/.session-model-boot-attempts" ]; then
+    read -r _bl_cnt _bl_prev < "{{agentDir}}/.session-model-boot-attempts" 2>/dev/null || true
+  fi
+  case "$_bl_cnt" in (''|*[!0-9]*) _bl_cnt=0;; esac
+  case "$_bl_prev" in (''|*[!0-9]*) _bl_prev=0;; esac
+  if [ $(( _bl_now - _bl_prev )) -lt 150 ]; then _bl_cnt=$(( _bl_cnt + 1 )); else _bl_cnt=1; fi
+  if [ "$_bl_cnt" -ge 3 ]; then
+    echo "session-model: override '$_EFFECTIVE_MODEL' appears to be crashlooping the session ($_bl_cnt fast boots) — clearing it, booting configured default '$_SM_CFG_RECORDED'" >&2
+    printf 'Session model override `%s` was cleared automatically: the agent failed to stay up %s boots in a row with it active (the model may be invalid or retired). Booting the configured default `%s`. Re-issue /model <name> if you want a different model.\n' "$_EFFECTIVE_MODEL" "$_bl_cnt" "$_SM_CFG_RECORDED" >> "{{agentDir}}/.session-model-alert" 2>/dev/null || true
+    rm -f "{{agentDir}}/.session-model" "{{agentDir}}/.session-model-boot-attempts" "{{agentDir}}/.session-model-kept-notified"
+    _EFFECTIVE_MODEL="$_SM_CFG_RECORDED"
+  else
+    printf '%s %s\n' "$_bl_cnt" "$_bl_now" > "{{agentDir}}/.session-model-boot-attempts" 2>/dev/null || true
+  fi
+  unset _bl_now _bl_cnt _bl_prev
+else
+  # No active override this boot — a stale counter must not bite a future one.
+  rm -f "{{agentDir}}/.session-model-boot-attempts"
+fi
+unset _SM_CFG_RECORDED
+
+# --- Session effort resolution (durable .session-effort, #3039) ---
+#
+# The `/effort` sibling of the block above. A positively-confirmed `/effort`
+# apply persists `{{agentDir}}/.session-effort` (one-line JSON
+# {"level","configuredDefaultAtWrite","ts"} written by the gateway). It is
+# honored on every boot and cleared only by `/effort default` (live delete)
+# or invalidation here (corrupt file / configured `thinking_effort:` changed)
+# — each invalidation appends to `.session-model-alert` so the gateway's
+# boot relay tells the operator once.
+_EFFECTIVE_EFFORT={{#if thinkingEffort}}'{{thinkingEffort}}'{{else}}''{{/if}}
+if [ -f "{{agentDir}}/.session-effort" ]; then
+  _sef="$(cat "{{agentDir}}/.session-effort" 2>/dev/null || true)"
+  _se_level="$(printf '%s' "$_sef" | sed -n 's/.*"level"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  _se_cfg="$(printf '%s' "$_sef" | sed -n 's/.*"configuredDefaultAtWrite"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  # Allowlist gate — kept in sync with EFFORT_LEVELS in
+  # telegram-plugin/gateway/effort-command.ts. The level is passed verbatim
+  # to `claude --effort`.
+  if [ "$(printf '%s' "$_se_level" | wc -l)" -ne 0 ] || ! printf '%s' "$_se_level" | grep -Eq '^(low|medium|high|xhigh|max)$'; then
+    rm -f "{{agentDir}}/.session-effort"
+    echo "session-effort: ignoring malformed .session-effort (failed allowlist gate) — using configured default '${_EFFECTIVE_EFFORT:-<unset>}'" >&2
+    printf 'Your saved session effort override could not be read (invalid or corrupt), so the agent booted on its configured default effort. Re-issue /effort <level> if you want a different one.\n' >> "{{agentDir}}/.session-model-alert" 2>/dev/null || true
+  elif [ "$_se_cfg" != "$_EFFECTIVE_EFFORT" ]; then
+    rm -f "{{agentDir}}/.session-effort"
+    echo "session-effort: configured thinking_effort changed ('$_se_cfg' → '${_EFFECTIVE_EFFORT:-<unset>}') — clearing session override '$_se_level'" >&2
+    printf 'The configured default effort changed (`%s` → `%s`), so your session effort override `%s` was cleared — the agent booted on the new configured default. Re-issue /effort %s if you still want it.\n' "${_se_cfg:-<unset>}" "${_EFFECTIVE_EFFORT:-<unset>}" "$_se_level" "$_se_level" >> "{{agentDir}}/.session-model-alert" 2>/dev/null || true
+  else
+    _EFFECTIVE_EFFORT="$_se_level"
+    echo "session-effort: keeping session effort override '$_se_level' across this relaunch" >&2
+  fi
+  unset _sef _se_level _se_cfg
+fi
+if [ -n "$_EFFECTIVE_EFFORT" ]; then
+  _EFFORT_ARG="--effort $_EFFECTIVE_EFFORT"
+else
+  _EFFORT_ARG=""
+fi
 
 # sr-* passthrough→router repoint — ONE post-resolution gate covering BOTH the
 # /model override path AND the configured-default path (`model: sr-*` in
@@ -1222,14 +1304,14 @@ printf '%s\n' "$_EFFECTIVE_MODEL" > "{{agentDir}}/.active-session-model" 2>/dev/
 
 {{#if useSwitchroomPlugin}}
 if [ -n "$APPEND_PROMPT" ]; then
-  exec claude $CONTINUE_FLAG --dangerously-load-development-channels server:switchroom-telegram --plugin-dir "{{securityPluginDir}}"{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}} $SR_FLEET_ARG --model "$_EFFECTIVE_MODEL"{{#if thinkingEffort}} --effort {{thinkingEffort}}{{/if}}{{#if permissionMode}} --permission-mode {{permissionMode}}{{/if}}{{#if fallbackModelQ}} --fallback-model {{{fallbackModelQ}}}{{/if}} --append-system-prompt "$APPEND_PROMPT"{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
+  exec claude $CONTINUE_FLAG --dangerously-load-development-channels server:switchroom-telegram --plugin-dir "{{securityPluginDir}}"{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}} $SR_FLEET_ARG --model "$_EFFECTIVE_MODEL" $_EFFORT_ARG{{#if permissionMode}} --permission-mode {{permissionMode}}{{/if}}{{#if fallbackModelQ}} --fallback-model {{{fallbackModelQ}}}{{/if}} --append-system-prompt "$APPEND_PROMPT"{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
 else
-  exec claude $CONTINUE_FLAG --dangerously-load-development-channels server:switchroom-telegram --plugin-dir "{{securityPluginDir}}"{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}} $SR_FLEET_ARG --model "$_EFFECTIVE_MODEL"{{#if thinkingEffort}} --effort {{thinkingEffort}}{{/if}}{{#if permissionMode}} --permission-mode {{permissionMode}}{{/if}}{{#if fallbackModelQ}} --fallback-model {{{fallbackModelQ}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
+  exec claude $CONTINUE_FLAG --dangerously-load-development-channels server:switchroom-telegram --plugin-dir "{{securityPluginDir}}"{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}} $SR_FLEET_ARG --model "$_EFFECTIVE_MODEL" $_EFFORT_ARG{{#if permissionMode}} --permission-mode {{permissionMode}}{{/if}}{{#if fallbackModelQ}} --fallback-model {{{fallbackModelQ}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
 fi
 {{else}}
 if [ -n "$APPEND_PROMPT" ]; then
-  exec claude $CONTINUE_FLAG --channels plugin:telegram@claude-plugins-official --plugin-dir "{{securityPluginDir}}"{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}} $SR_FLEET_ARG --model "$_EFFECTIVE_MODEL"{{#if thinkingEffort}} --effort {{thinkingEffort}}{{/if}}{{#if permissionMode}} --permission-mode {{permissionMode}}{{/if}}{{#if fallbackModelQ}} --fallback-model {{{fallbackModelQ}}}{{/if}} --append-system-prompt "$APPEND_PROMPT"{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
+  exec claude $CONTINUE_FLAG --channels plugin:telegram@claude-plugins-official --plugin-dir "{{securityPluginDir}}"{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}} $SR_FLEET_ARG --model "$_EFFECTIVE_MODEL" $_EFFORT_ARG{{#if permissionMode}} --permission-mode {{permissionMode}}{{/if}}{{#if fallbackModelQ}} --fallback-model {{{fallbackModelQ}}}{{/if}} --append-system-prompt "$APPEND_PROMPT"{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
 else
-  exec claude $CONTINUE_FLAG --channels plugin:telegram@claude-plugins-official --plugin-dir "{{securityPluginDir}}"{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}} $SR_FLEET_ARG --model "$_EFFECTIVE_MODEL"{{#if thinkingEffort}} --effort {{thinkingEffort}}{{/if}}{{#if permissionMode}} --permission-mode {{permissionMode}}{{/if}}{{#if fallbackModelQ}} --fallback-model {{{fallbackModelQ}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
+  exec claude $CONTINUE_FLAG --channels plugin:telegram@claude-plugins-official --plugin-dir "{{securityPluginDir}}"{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}} $SR_FLEET_ARG --model "$_EFFECTIVE_MODEL" $_EFFORT_ARG{{#if permissionMode}} --permission-mode {{permissionMode}}{{/if}}{{#if fallbackModelQ}} --fallback-model {{{fallbackModelQ}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
 fi
 {{/if}}

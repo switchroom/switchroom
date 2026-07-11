@@ -11,12 +11,13 @@ import type { AgentConfig, SwitchroomConfig, TelegramConfig } from "../src/confi
 // (reference/rfcs/session-model-stickiness.md). Successor to
 // scaffold.session-model-override.test.ts (one-shot carrier, retired).
 //
-// Contract under test, driven as sh-harness fixtures against the RENDERED
-// block: the durable `.session-model` override is applied ONLY under a fresh
-// (<10 min, embedded ts) "keep" `.relaunch-model-intent`; anything else —
-// revert intent, absent (crash / raw `docker restart` / deploy), stale, or
-// corrupt — deletes the override, boots the configured default, and writes a
-// `.session-model-alert` notice naming why.
+// Contract under test (#3039 rev 3, keep-by-default), driven as sh-harness
+// fixtures against the RENDERED block: the durable `.session-model` override
+// is applied on EVERY boot — crash, deploy, raw `docker restart`, stale or
+// corrupt intent all KEEP it. Only a FRESH (<10 min, embedded ts) explicit
+// "revert" `.relaunch-model-intent`, corruption, or a configured-default
+// change clears it — and every clearing path writes a `.session-model-alert`
+// notice the gateway relays to chat.
 
 const telegramConfig: TelegramConfig = {
   bot_token: "123456:ABC-DEF",
@@ -191,16 +192,14 @@ describe("scaffoldAgent: session-model stickiness boot resolver (start.sh)", () 
     expect(alertText()).toContain("/model default");
   });
 
-  // ── revert paths ──────────────────────────────────────────────────────────
-  it("override + NO intent (crash / raw docker restart / deploy) → reverts, deletes file, announces why", () => {
+  // ── keep-by-default paths (#3039) ────────────────────────────────────────
+  it("override + NO intent (crash / raw docker restart / deploy) → KEEPS the override and announces", () => {
     writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8"));
-    expect(runBlock("1")).toBe(DEFAULT_MODEL);
-    expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
+    expect(runBlock("1")).toBe("claude-opus-4-8");
+    expect(existsSync(join(agentDir, ".session-model"))).toBe(true);
     const alert = alertText();
-    expect(alert).toContain("`claude-opus-4-8` was cleared");
-    expect(alert).toContain("reverted to the configured default `claude-sonnet-5`");
-    expect(alert).toContain("no keep intent — crash, external container restart, or deploy");
-    expect(alert).toContain("Re-issue /model claude-opus-4-8");
+    expect(alert).toContain("`claude-opus-4-8` kept across this relaunch");
+    expect(alert).toContain("/model default");
   });
 
   it("override + revert intent → reverts and the notice carries the intent's reason", () => {
@@ -212,18 +211,18 @@ describe("scaffoldAgent: session-model stickiness boot resolver (start.sh)", () 
     expect(alertText()).toContain("user: /restart from chat");
   });
 
-  it("override + STALE keep intent (>10 min by embedded ts) → treated as no intent, reverts", () => {
+  it("override + STALE revert intent (>10 min by embedded ts) → treated as no intent, KEEPS", () => {
     writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8"));
-    writeFileSync(join(agentDir, ".relaunch-model-intent"), intentJson("keep", Date.now() - 11 * 60_000));
-    expect(runBlock("1")).toBe(DEFAULT_MODEL);
-    expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
+    writeFileSync(join(agentDir, ".relaunch-model-intent"), intentJson("revert", Date.now() - 11 * 60_000));
+    expect(runBlock("1")).toBe("claude-opus-4-8");
+    expect(existsSync(join(agentDir, ".session-model"))).toBe(true);
   });
 
-  it("override + corrupt intent → treated as no intent, reverts", () => {
+  it("override + corrupt intent → treated as no intent, KEEPS; intent consumed", () => {
     writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8"));
     writeFileSync(join(agentDir, ".relaunch-model-intent"), "not json at all\n");
-    expect(runBlock("1")).toBe(DEFAULT_MODEL);
-    expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
+    expect(runBlock("1")).toBe("claude-opus-4-8");
+    expect(existsSync(join(agentDir, ".session-model"))).toBe(true);
     expect(existsSync(join(agentDir, ".relaunch-model-intent"))).toBe(false);
   });
 
@@ -267,12 +266,90 @@ describe("scaffoldAgent: session-model stickiness boot resolver (start.sh)", () 
     expect(alert).toContain("override to `claude-opus-4-8` was cleared");
   });
 
-  it("keep + override older than 7 days → EXPIRES + announces", () => {
+  it("override older than 7 days → NO expiry (#3039: only explicit user action clears it)", () => {
     writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8", DEFAULT_MODEL, Date.now() - 8 * 24 * 3600_000));
-    writeFileSync(join(agentDir, ".relaunch-model-intent"), intentJson("keep"));
+    expect(runBlock("1")).toBe("claude-opus-4-8");
+    expect(existsSync(join(agentDir, ".session-model"))).toBe(true);
+  });
+
+  it("corrupt .session-model → falls back to default AND notifies (never a silent drop)", () => {
+    writeFileSync(join(agentDir, ".session-model"), "{broken\n");
     expect(runBlock("1")).toBe(DEFAULT_MODEL);
     expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
-    expect(alertText()).toContain("expired");
+    const alert = alertText();
+    expect(alert).toContain("could not be read");
+    expect(alert).toContain("configured default");
+  });
+
+  // ── crashloop self-heal (#3042 blocker 2b) ───────────────────────────────
+  it("three consecutive fast boots with an override active → carrier cleared, default booted, alert once", () => {
+    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8"));
+    expect(runBlock("1")).toBe("claude-opus-4-8"); // boot 1 (cnt=1)
+    expect(runBlock("1")).toBe("claude-opus-4-8"); // boot 2 (cnt=2)
+    expect(runBlock("1")).toBe(DEFAULT_MODEL);     // boot 3 → self-heal
+    expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
+    expect(existsSync(join(agentDir, ".session-model-boot-attempts"))).toBe(false);
+    const alert = alertText();
+    expect(alert).toContain("cleared automatically");
+    expect(alert).toContain("`claude-sonnet-5`");
+    // …and the NEXT boot is a clean default boot (no stale counter).
+    expect(runBlock("1")).toBe(DEFAULT_MODEL);
+  });
+
+  it("a boot without an override clears any stale boot-attempt counter", () => {
+    writeFileSync(join(agentDir, ".session-model-boot-attempts"), "2 " + Math.floor(Date.now() / 1000) + "\n");
+    expect(runBlock("1")).toBe(DEFAULT_MODEL);
+    expect(existsSync(join(agentDir, ".session-model-boot-attempts"))).toBe(false);
+  });
+
+  // ── kept-alert dedup (#3042 item 4) ──────────────────────────────────────
+  it("the 'kept' chat alert fires once per kept value — a bounce loop can't storm the chat", () => {
+    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8"));
+    expect(runBlock("1")).toBe("claude-opus-4-8");
+    expect(alertText()).toContain("kept across this relaunch");
+    rmSync(join(agentDir, ".session-model-alert"));
+    // Second boot, same kept value → no new alert; sentinel remembers.
+    expect(runBlock("1")).toBe("claude-opus-4-8");
+    expect(existsSync(join(agentDir, ".session-model-alert"))).toBe(false);
+    expect(readFileSync(join(agentDir, ".session-model-kept-notified"), "utf-8").trim()).toBe("claude-opus-4-8");
+  });
+
+  // ── session-effort resolver (#3039) ───────────────────────────────────────
+  function effortJson(level: string, cfg = "low", ts = Date.now()): string {
+    return `${JSON.stringify({ level, configuredDefaultAtWrite: cfg, ts })}\n`;
+  }
+  function runBlockEffort(): { model: string; effortArg: string } {
+    const script = `set -e\n_LITELLM_OK=1\n${block}\necho "EFFECTIVE=$_EFFECTIVE_MODEL"\necho "EFFORTARG=$_EFFORT_ARG"`;
+    const out = execFileSync("bash", ["-c", script], { encoding: "utf-8" });
+    return {
+      model: out.match(/EFFECTIVE=(.*)/)?.[1].trim() ?? "",
+      effortArg: out.match(/EFFORTARG=(.*)/)?.[1].trim() ?? "",
+    };
+  }
+
+  it("no .session-effort → --effort uses the configured default", () => {
+    expect(runBlockEffort().effortArg).toBe("--effort low");
+  });
+
+  it(".session-effort override survives the boot and is applied to --effort", () => {
+    writeFileSync(join(agentDir, ".session-effort"), effortJson("xhigh"));
+    expect(runBlockEffort().effortArg).toBe("--effort xhigh");
+    expect(existsSync(join(agentDir, ".session-effort"))).toBe(true);
+  });
+
+  it("corrupt/non-allowlisted .session-effort → falls back to configured default AND notifies", () => {
+    writeFileSync(join(agentDir, ".session-effort"), effortJson("mega; rm -rf /".replace(/;.*/, "mega")));
+    writeFileSync(join(agentDir, ".session-effort"), `${JSON.stringify({ level: "mega", configuredDefaultAtWrite: "low", ts: Date.now() })}\n`);
+    expect(runBlockEffort().effortArg).toBe("--effort low");
+    expect(existsSync(join(agentDir, ".session-effort"))).toBe(false);
+    expect(alertText()).toContain("effort override could not be read");
+  });
+
+  it("configured thinking_effort changed since the effort switch → cleared + notifies", () => {
+    writeFileSync(join(agentDir, ".session-effort"), effortJson("xhigh", "medium"));
+    expect(runBlockEffort().effortArg).toBe("--effort low");
+    expect(existsSync(join(agentDir, ".session-effort"))).toBe(false);
+    expect(alertText()).toContain("configured default effort changed");
   });
 
   // ── sr-* + LiteLLM guard (row 18) ─────────────────────────────────────────

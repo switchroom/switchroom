@@ -175,7 +175,7 @@ export interface ModelCommandReply {
 }
 
 const PERSIST_NOTE =
-  '_Sticky across switchroom-managed relaunches (\`/new\`, watchdog recovery); reverts on \`/restart\`, agent restart, crash, or external container restart. \`/model default\` clears it. To persist, set \`model:\` in switchroom.yaml._'
+  '_Sticky — persists across restarts, deploys, and crashes until \`/model default\` clears it (or the configured \`model:\` in switchroom.yaml changes, which resets it and notifies you). To change the default, set \`model:\` in switchroom.yaml._'
 
 function helpText(deps: ModelCommandDeps, reason?: string): ModelCommandReply {
   const srAliasExamples = Object.keys(SR_MODEL_ALIASES).map(a => `\`${a}\``).join(' · ')
@@ -230,7 +230,7 @@ export async function handleModelCommand(
   // and ask the operator to retry (parity with the menu callback's isBusy check).
   if (deps.isBusy()) {
     return {
-      text: '⏳ The agent is mid-turn — a model switch needs an idle session. Try again in a moment.',
+      text: '⏳ The agent is mid-turn — a model switch needs an idle session. The switch was not applied.',
       html: true,
     }
   }
@@ -506,6 +506,26 @@ export const SR_MODEL_ALIASES: Record<string, string> = {
 }
 
 /** Expand a short alias (case-insensitive) to its full sr-* id, or return the original. */
+/**
+ * #3042 review blocker 2a: can `token` be trusted for a DURABLE, boot-applied
+ * `.session-model` persist WITHOUT a live confirmation from claude?
+ *
+ * A queued typed `/model <arg>` that is persisted at shutdown was never
+ * validated by claude's picker — and under the keep-by-default boot (#3039)
+ * a garbage-but-shape-valid token (e.g. `claude-nonexistnet-9`) would make
+ * every boot run `claude --model <garbage>` with the gateway dead. Only
+ * tokens with a switchroom-known meaning are offline-trustable: the static
+ * Claude aliases (claude resolves them itself) and the curated sr-* alias
+ * TARGETS (present in the LiteLLM config by construction). Full `claude-*` /
+ * arbitrary `sr-*` ids typed by hand are refused — they need the live
+ * session to verify, so the operator is asked to re-issue after boot.
+ */
+export function isOfflineTrustedModelToken(token: string): boolean {
+  if ((MODEL_ALIASES as readonly string[]).includes(token)) return true
+  if (token in SR_MODEL_ALIASES) return true
+  return Object.values(SR_MODEL_ALIASES).includes(token)
+}
+
 export function expandSrAlias(arg: string): string {
   return SR_MODEL_ALIASES[arg.toLowerCase()] ?? arg
 }
@@ -548,10 +568,67 @@ export function modelSelectCallbackData(label: string): string {
   return `${MODEL_CALLBACK_SELECT}${labelTag(label)}`
 }
 
-function busyReply(deps: Pick<ModelMenuDeps, 'escapeHtml'>): ModelMenuReply {
+const BUSY_REFUSAL_TEXT =
+  '⏳ The agent is mid-turn — the model picker needs an idle prompt. Your tap was not applied.'
+
+/**
+ * Busy-refusal detector (#3039). The gateway's queued-command drain applies a
+ * command believing the session is idle; if a new turn started in the race
+ * window the underlying handler still refuses with one of these texts. The
+ * drain matches on this and RE-ENQUEUES the command instead of stamping the
+ * refusal onto the ack card as a false final state — so no user-visible path
+ * ever ends at "try again".
+ */
+export function isBusyRefusalText(text: string): boolean {
+  return text.includes('The agent is mid-turn')
+}
+
+/**
+ * Mid-turn `/model` menu (#3039): instead of refusing ("try again in a
+ * moment"), render a STATIC keyboard that needs no picker discovery — the
+ * alias rows + the external page. Every switch tap rides the gateway's
+ * mid-turn queue (ack → apply at idle → confirm), so opening the menu during
+ * a long turn still lets the operator lock in a choice.
+ */
+function busyStaticMenu(
+  deps: Pick<ModelMenuDeps, 'escapeHtml'> & Pick<ModelCommandDeps, 'getAgentName'>,
+  page: ModelMenuPage,
+): ModelMenuReply {
+  const externalNames = externalModelNames([])
+  if (page === 'external') {
+    return {
+      text: [
+        `**Model — ${deps.escapeHtml(deps.getAgentName())}** · 🌐 External`,
+        '_Agent is mid-turn — taps are queued and apply the moment the turn ends._',
+        'These models are **billed separately** via OpenRouter. Tap one to switch the **live session**:',
+        PERSIST_NOTE,
+      ].join('\n'),
+      html: true,
+      keyboard: externalPageKeyboard(externalNames),
+    }
+  }
+  const rows: ModelMenuKeyboardButton[][] = []
+  for (const alias of MODEL_ALIASES) {
+    if (alias === 'default') continue
+    rows.push([{
+      text: alias.charAt(0).toUpperCase() + alias.slice(1),
+      callback_data: `${MODEL_CALLBACK_ALIAS}${alias}`,
+    }])
+  }
+  rows.push([{ text: 'Default (configured)', callback_data: `${MODEL_CALLBACK_ALIAS}default` }])
+  if (externalNames.length > 0) {
+    rows.push([{ text: '🌐 External models ▸', callback_data: MODEL_CALLBACK_PAGE_EXTERNAL }])
+  }
+  rows.push([{ text: '🔄 Refresh', callback_data: MODEL_CALLBACK_REFRESH }])
   return {
-    text: '⏳ The agent is mid-turn — the model picker needs an idle prompt. Try again in a moment.',
+    text: [
+      `**Model — ${deps.escapeHtml(deps.getAgentName())}**`,
+      '_Agent is mid-turn, so the live picker can\u2019t be read right now — this is the quick list. A tap is queued and applies the moment the turn ends._',
+      'Tap a model to switch the **live session**:',
+      PERSIST_NOTE,
+    ].join('\n'),
     html: true,
+    keyboard: rows,
   }
 }
 
@@ -654,7 +731,7 @@ export async function buildModelMenu(
   deps: ModelMenuDeps & ModelCommandDeps,
   page: ModelMenuPage = 'main',
 ): Promise<ModelMenuReply> {
-  if (deps.isBusy()) return busyReply(deps)
+  if (deps.isBusy()) return busyStaticMenu(deps, page)
 
   const [discovered, quota, srNames] = await Promise.all([
     deps.discover(deps.getAgentName()),
@@ -735,6 +812,12 @@ export interface ModelCallbackOutcome {
    */
   toastOnly?: boolean
   /**
+   * True when this outcome is the mid-turn refusal (#3039). The queued-command
+   * drain re-enqueues on this instead of stamping the refusal onto the ack
+   * card as a false final state.
+   */
+  busyRefusal?: boolean
+  /**
    * On a successful session switch, the live model name now running (parsed
    * from claude's confirmation, e.g. "Fable 5"). The gateway records this as
    * the session-model override so `/status` reflects what's actually running.
@@ -799,8 +882,9 @@ export async function handleModelMenuCallback(
     if (deps.isBusy()) {
       return {
         answer: '⏳ Agent is mid-turn — tap again when it’s idle',
-        reply: busyReply(deps),
+        reply: { text: BUSY_REFUSAL_TEXT, html: true },
         toastOnly: true,
+        busyRefusal: true,
       }
     }
     let aliasResult: InjectResult
@@ -862,8 +946,9 @@ export async function handleModelMenuCallback(
     if (deps.isBusy()) {
       return {
         answer: '⏳ Agent is mid-turn — tap again when it’s idle',
-        reply: busyReply(deps),
+        reply: { text: BUSY_REFUSAL_TEXT, html: true },
         toastOnly: true,
+        busyRefusal: true,
       }
     }
     try {
@@ -896,8 +981,9 @@ export async function handleModelMenuCallback(
   if (deps.isBusy()) {
     return {
       answer: '⏳ Agent is mid-turn — tap again when it’s idle',
-      reply: busyReply(deps),
+      reply: { text: BUSY_REFUSAL_TEXT, html: true },
       toastOnly: true,
+      busyRefusal: true,
     }
   }
 
