@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, statSync, utimesSync } from "node:fs";
+import { mkdtempSync, mkdirSync, chmodSync, readdirSync, readFileSync, rmSync, writeFileSync, statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
@@ -113,6 +113,35 @@ describe("captureAgentPane", () => {
     // Header is ~100 bytes; body capped at 10MB. Allow generous header room.
     expect(size).toBeLessThan(10 * 1024 * 1024 + 1024);
     expect(size).toBeGreaterThan(10 * 1024 * 1024 - 1024);
+  });
+
+  it("writes the crash-report file with owner-only perms (0o600)", () => {
+    mockedExec.mockReturnValue(Buffer.from("secret pane content\n"));
+    const result = captureAgentPane({ agentName: "a", agentDir, reason: "r" });
+    expect("path" in result).toBe(true);
+    if (!("path" in result)) return;
+    const mode = statSync(result.path).mode & 0o777;
+    expect(mode).toBe(0o600);
+  });
+
+  it("creates the crash-reports dir with owner-only perms (0o700)", () => {
+    mockedExec.mockReturnValue(Buffer.from("x"));
+    const result = captureAgentPane({ agentName: "a", agentDir, reason: "r" });
+    expect("path" in result).toBe(true);
+    const dir = resolve(agentDir, "crash-reports");
+    const mode = statSync(dir).mode & 0o777;
+    expect(mode).toBe(0o700);
+  });
+
+  it("tightens a pre-existing loose (0o755) crash-reports dir to 0o700", () => {
+    mockedExec.mockReturnValue(Buffer.from("x"));
+    const dir = resolve(agentDir, "crash-reports");
+    mkdirSync(dir, { recursive: true, mode: 0o755 });
+    chmodSync(dir, 0o755);
+    const result = captureAgentPane({ agentName: "a", agentDir, reason: "r" });
+    expect("path" in result).toBe(true);
+    const mode = statSync(dir).mode & 0o777;
+    expect(mode).toBe(0o700);
   });
 
   it("sanitizes weird reason strings into a slug", () => {

@@ -14,7 +14,7 @@
 // removed.)
 
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 export interface CapturePaneOptions {
@@ -48,11 +48,24 @@ export function captureAgentPane(opts: CapturePaneOptions): CaptureResult {
   const outPath = resolve(outDir, `${ts}-${reasonSlug}.txt`);
 
   try {
-    mkdirSync(outDir, { recursive: true, mode: 0o755 });
+    // 0o700: crash reports contain tmux pane scrollback, which may hold
+    // secrets. Keep the directory owner-only.
+    mkdirSync(outDir, { recursive: true, mode: 0o700 });
   } catch (err) {
     const msg = `mkdir crash-reports failed: ${(err as Error).message}`;
     console.error(`[tmux-capture] ${agentName}: ${msg}`);
     return { error: msg };
+  }
+
+  // mkdirSync's mode is ignored when the dir already exists, so a
+  // pre-existing 0o755 crash-reports dir would keep its loose perms.
+  // Best-effort chmod to tighten it; non-fatal if it fails.
+  try {
+    chmodSync(outDir, 0o700);
+  } catch (err) {
+    console.error(
+      `[tmux-capture] ${agentName}: chmod crash-reports 0700 failed: ${(err as Error).message}`,
+    );
   }
 
   const args = ["-L", socket, "capture-pane", "-p"];
@@ -90,8 +103,10 @@ export function captureAgentPane(opts: CapturePaneOptions): CaptureResult {
     `\n`;
 
   try {
+    // 0o600: the report body is raw pane scrollback and may contain
+    // secrets — keep it owner-read/write only.
     writeFileSync(outPath, Buffer.concat([Buffer.from(header, "utf8"), body]), {
-      mode: 0o644,
+      mode: 0o600,
     });
   } catch (err) {
     const msg = `write crash-report failed: ${(err as Error).message}`;
