@@ -2,6 +2,65 @@
 
 ## Unreleased
 
+## v0.18.12 — Approvals hold the leash, config edits survive the window
+
+### Undeliverable approval cards are held, never auto-denied (#3107, #3108, #3109)
+
+On 2026-07-11 a 4.6-hour Telegram flood ban collided with the 60-minute
+permission TTL: a permission card fired during the ban, the send failed, the
+error was discarded, and the TTL sweep would have silently auto-denied an
+approval no human ever saw — reporting the silence back to the agent as an
+operator decline. A three-PR stack (shipped together by design) closes the
+whole class:
+
+- **#3107 — record the block.** An undeliverable card send now marks the
+  pending entry `undeliverable` and writes a world-readable record to
+  `~/.switchroom/blocked-approvals/<agent>.json` (0644, in a shared
+  sticky-world-writable dir the compose generator now pre-creates) —
+  synchronously in the failure handler, so the #3104 web surface sees the
+  block in under a second even while Telegram is dark. The record is
+  metadata-only: `safeActionForRecord()` is a fail-closed allowlist that
+  never writes raw tool input (Bash commands, Grep patterns, WebFetch URLs)
+  to a world-readable file. A boot-time reconcile clears records orphaned by
+  a restart mid-hold.
+- **#3108 — bring the card back.** The card send is extracted into a single
+  `postPermissionCard()` shared by initial delivery and the reaper's
+  `sweepHeldPermissionCards()`, which re-posts held cards once the flood
+  window closes. The hold classifier **fails closed**: anything not
+  positively recognised as permanent (a 400 that will never render, a 403
+  bot-blocked) is held — previously a routine Telegram 502 or an ECONNRESET
+  surfaced raw and fell through to the TTL auto-deny. Re-delivery is guarded
+  by a window probe, a double-delivery check, an in-flight flag covering
+  both callers, a per-tick cap of 3, and exponential backoff (1m → 30m
+  ceiling) with unbounded retry — a held card is never abandoned.
+- **#3109 — freeze the clock.** The TTL sweep skips `undeliverable` entries:
+  the TTL answers "how long did the operator have to answer?", and for a
+  card that never landed the answer is zero seconds. Successful (re)delivery
+  resets `startedAt` so a card held through a multi-hour ban doesn't land
+  already expired, and the #2862 missed-approval re-offer no longer silently
+  skips requests where no card ever landed (the `cards[0]` hole). A
+  delivered-but-unanswered card still expires normally. An indefinite block
+  is by design — `/pending` and tmux remain the escape hatches, and the
+  #3107 record makes the block visible off-Telegram. The leash decision now
+  lives in an importable unit (`approval-hold.ts` / `permission-ttl-sweep.ts`)
+  driven by both gateway and tests, with mutation evidence for every guard.
+
+### config_propose_edit re-validates the diff at apply time (#3084 security audit, #3121)
+
+`config_propose_edit` computed the whole post-image of `switchroom.yaml` at
+propose time and, on operator approval — a card that can block for up to 60
+minutes — wrote that stale snapshot verbatim under the apply mutex. Any config
+change landing during the approval window (a second approved proposal, an
+operator hand-edit) was silently reverted, including security-relevant fields
+like another agent's `tools.allow` or `hostd.config_edit_enabled` itself. Now
+the apply path re-applies the **stored diff** against the **current** live
+file under the lock and writes that result — never the propose-time snapshot —
+aborting with a new `E_CONFIG_CHANGED` denial ("config changed since proposal
+— re-propose") if the diff no longer applies cleanly; nothing is written and
+the intervening change is preserved. Rollback/blast-radius snapshot behavior
+is unchanged. (The follow-up review below tightens what "applies cleanly"
+lets through.)
+
 ### config_propose_edit: hunk-relocation guards at apply time (#3121 follow-up security review)
 
 Follow-up to the #3084 audit fix merged in #3121, closing the relocation
@@ -118,6 +177,20 @@ protection always holds. Known limitation: the annotated body is rebuilt
 from the message's plain text, so formatting entities (bold, links, code, …)
 on the original message are lost when the annotation is applied. Per-user
 timezones are out of scope for v1.
+
+### Gateway sidecar logs stop eating the disk (#3025, #3076)
+
+Two-part fix for unbounded `gateway-supervisor.log` growth (555 MB observed
+on one agent). Per-poll trace noise — the `getUpdates`/`getMe` ok-heartbeats
+and idle no-op shadow ticks — is now gated behind `SWITCHROOM_GW_TRACE`
+(default off; set it to `1` to restore the full firehose when debugging the
+delivery path). Every `status=err` line, every other API method's ok line,
+and any tick that produced real effects are still always emitted. And the
+supervisor now size-rotates the sidecar logfile via copytruncate (preserving
+the child's open fd) when it exceeds `SWITCHROOM_SIDECAR_LOG_MAX_BYTES`
+(default 50 MiB, checked every 300s; `0` disables) — keeping at most ~2× the
+cap on disk instead of relying on rotate-at-restart for a process that can
+run for weeks.
 
 ## v0.18.11 — Rollouts you can watch, poll, and survive
 
