@@ -24905,7 +24905,18 @@ bot.command('usage', async ctx => {
         // /auth snapshot does. switchroomReply routes through the rich path
         // (replyWithRichMessage), which accepts reply_markup. Build a grammy
         // InlineKeyboard so the markup type matches switchroomReply's contract.
-        const kbRows = buildSnapshotKeyboard(snapshots, { now: new Date(), demo })
+        // Defense-in-depth (mirrors the operator-private `/auth` treatment,
+        // gateway.ts ~24036): outside a private chat, strip the
+        // `auth:use:<label>` "Switch fleet" rows so the fleet-wide account-
+        // swap button is never even offered in a group/forum. The dispatch-
+        // site allowFrom gate is the load-bearing control; this just avoids
+        // dangling a privileged button in front of non-operators.
+        let kbRows = buildSnapshotKeyboard(snapshots, { now: new Date(), demo })
+        if (ctx.chat?.type !== 'private') {
+          kbRows = kbRows.filter(
+            (row) => !row.some((b) => b.callbackData?.startsWith('auth:use:')),
+          )
+        }
         const keyboard = new InlineKeyboard()
         kbRows.forEach((row, ri) => {
           if (ri > 0) keyboard.row()
@@ -25033,7 +25044,19 @@ bot.on('callback_query:data', async ctx => {
   // Auth dashboard buttons (`auth:<verb>:<agent>[:<slot>]`). Route
   // through a dedicated handler that maps each action onto the
   // existing CLI invocations plus dashboard refresh.
+  //
+  // Strict allowFrom gate like every other mutating callback family
+  // (`eff:`/`apv:`/`cfg:`/`cn:`/`mdl:`). Its absence was a vulnerability:
+  // `auth:use:<label>` drives `client.setActive(label)`, a fleet-wide
+  // OAuth account swap — on an admin forum/supergroup agent with an empty
+  // group allowFrom, any member could tap it and swap the active account.
   if (data.startsWith('auth:')) {
+    const access = loadAccess()
+    const senderId = String(ctx.from?.id ?? '')
+    if (!access.allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' })
+      return
+    }
     await handleAuthDashboardCallback(ctx)
     return
   }

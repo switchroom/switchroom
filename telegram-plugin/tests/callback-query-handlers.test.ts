@@ -41,6 +41,16 @@ import { createSweepableStore } from '../gateway/pending-state-stores.js'
 import { StagingMap } from '../secret-detect/staging.js'
 import { InlineKeyboard } from 'grammy'
 
+// Mock the auth-broker client so the `auth:use:` swap path is observable
+// (spy on setActive) without a live UDS broker. Only handleAuthDashboardCallback
+// touches getAuthBrokerClient, so this is inert for every other family here.
+const brokerMock = vi.hoisted(() => ({
+  setActive: vi.fn(async () => ({ active: 'acct-b', fanned: ['a1'] })),
+}))
+vi.mock('../gateway/auth-broker-client.js', () => ({
+  getAuthBrokerClient: vi.fn(async () => ({ setActive: brokerMock.setActive })),
+}))
+
 // ── Fakes ────────────────────────────────────────────────────────────────
 
 interface FakeCtxOpts {
@@ -567,6 +577,34 @@ describe('handleAuthDashboardCallback', () => {
       text: 'Missing account label.',
       show_alert: false,
     })
+  })
+
+  // Security gate (found in an adversarial security review): the auth: family
+  // is a mutating callback family (auth:use:<label> → broker.setActive, a
+  // fleet-wide OAuth account swap) and MUST enforce the same allowFrom gate as
+  // every sibling family. Without the gate, any tapper on an admin forum/
+  // supergroup with an empty group allowFrom could swap the active account.
+  it('rejects an auth:use swap from a sender not on allowFrom (never reaches setActive)', async () => {
+    const { deps } = makeDeps() // allowFrom = ['111','222']
+    const h = createCallbackQueryHandlers(deps)
+    brokerMock.setActive.mockClear()
+    const { ctx, raw } = makeCtx({ senderId: '999', data: 'auth:use:acct-b' })
+    await h.handleAuthDashboardCallback(ctx)
+    expect(raw.answerCallbackQuery).toHaveBeenCalledWith({ text: 'Not authorized.' })
+    // The load-bearing assertion: the swap must not fire for an unauthorized tap.
+    expect(brokerMock.setActive).not.toHaveBeenCalled()
+  })
+
+  it('lets an allowFrom sender through to the setActive swap path', async () => {
+    const { deps } = makeDeps()
+    const h = createCallbackQueryHandlers(deps)
+    brokerMock.setActive.mockClear()
+    const { ctx, raw } = makeCtx({ senderId: '111', data: 'auth:use:acct-b' })
+    await h.handleAuthDashboardCallback(ctx)
+    expect(brokerMock.setActive).toHaveBeenCalledWith('acct-b')
+    expect(raw.answerCallbackQuery).toHaveBeenCalledWith(
+      expect.objectContaining({ text: expect.stringContaining('Switched fleet → acct-b') }),
+    )
   })
 })
 

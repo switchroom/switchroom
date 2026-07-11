@@ -2534,6 +2534,18 @@ async function handleOperatorEventCallback(ctx: Context, data: string): Promise<
 // stub so any stale pinned message that fires an `auth:*` tap is
 // silently dismissed instead of crashing the gateway.
 async function handleAuthDashboardCallback(ctx: Context): Promise<void> {
+  // Strict allowFrom gate, identical to every other mutating handler in
+  // this file (handleOperatorEventCallback, the vra:/vrs:/vd:/vg: families).
+  // Its absence was a security hole: `auth:use:<label>` drives
+  // `client.setActive(label)` — a fleet-wide OAuth account swap — so an
+  // ungated handler let any tapper (e.g. a member of an admin forum/
+  // supergroup with an empty group allowFrom) swap the active account.
+  const senderId = String(ctx.from?.id ?? '')
+  const access = loadAccess()
+  if (!access.allowFrom.includes(senderId)) {
+    await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+    return
+  }
   const data = ctx.callbackQuery?.data ?? ''
   const currentAgent = getMyAgentName()
 
