@@ -112,7 +112,7 @@ import {
 import type { WebhookGatewayRecord } from '../../src/web/webhook-gateway-record.js'
 import { reconcilePin, type PinBotApi } from '../status-pin-driver.js'
 import type { PinState, DesiredPin } from '../status-pin.js'
-import { decidePinAction } from '../status-pin.js'
+import { decidePinAction, PinRightsCache } from '../status-pin.js'
 import { formatTurnLifecycle, detectStatusSurfaceDegraded } from './status-surface-log.js'
 import { parseSourceMessageId } from './source-message-id.js'
 import {
@@ -7232,6 +7232,12 @@ const statusPinChatIds = new Map<string, string>()
 // re-pin of the same key keeps the original timestamp). Feeds the TTL gate of
 // the mid-session `wk:` pin reaper (#3001); cleared alongside the state.
 const statusPinPinnedAt = new Map<string, number>()
+// Rights-aware negative cache (#3024): chats where an auto status-pin attempt
+// failed with the permanent "not enough rights to manage pinned messages" 400.
+// Per-process only — a restart clears it so a later-granted pin right re-enables
+// auto-pin. The explicit `pin_message` MCP tool deliberately does NOT consult
+// this cache (it always attempts and surfaces the error to the agent).
+const statusPinRightsCache = new PinRightsCache()
 
 // Durable snapshot of the pin claim set on the persistent per-agent volume
 // (STATE_DIR = /state/agent/telegram in prod). Closes the crash hole: the
@@ -7765,6 +7771,16 @@ async function reconcileStatusPinInner(
       chatId,
       prevState: prev,
       desired,
+      rightsCache: statusPinRightsCache,
+      onPinRightsDisabled: (chat) => {
+        // Logged ONCE per chat per process (#3024). Every subsequent auto-pin
+        // attempt in this chat is skipped silently until a restart clears the
+        // cache — replacing the 41x/48h `status-pin pin failed` spam marko saw.
+        process.stderr.write(
+          `telegram gateway: status-pin disabled for chat ${chat}: bot lacks ` +
+            `pin rights; grant 'Pin messages' admin right to re-enable after restart\n`,
+        )
+      },
       onError: (phase, err) => {
         const msg = err instanceof Error ? err.message : String(err)
         process.stderr.write(
@@ -14007,6 +14023,12 @@ async function executePinMessage(args: Record<string, unknown>): Promise<unknown
     () => lockedBot.api.pinChatMessage(pinChatId, pinMsgId),
     { chat_id: pinChatId, verb: 'pin_message' },
   )
+  // An explicit pin succeeded here, so the bot demonstrably HAS pin rights in
+  // this chat now — clear any auto-pin negative-cache entry (#3024) so the auto
+  // status-pin path resumes immediately rather than waiting for a restart. The
+  // explicit tool itself never consults the cache; a failure above still
+  // surfaces to the agent as a normal tool error (robustApiCall rethrows).
+  statusPinRightsCache.clear(pinChatId)
   // #3001: register the tool pin in the shared status-pin store under a
   // `tool:` key so it is no longer fire-and-forget. Unlike work-scoped
   // fg:/wk: rows a tool pin has no "work finished" event, so a restart does

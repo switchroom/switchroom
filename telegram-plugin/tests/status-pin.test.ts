@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { GrammyError } from 'grammy'
-import { decidePinAction } from '../status-pin.js'
+import { decidePinAction, isPinRightsError, PinRightsCache } from '../status-pin.js'
 import { reconcilePin, type PinBotApi } from '../status-pin-driver.js'
 import type { PinState } from '../status-pin.js'
 
@@ -193,6 +193,280 @@ describe('reconcilePin — pin-rights 400 must never crash (marko 2026-07-01)', 
         onError: () => {},
       })
       // Let microtasks + a macrotask flush so any leaked rejection would fire.
+      await new Promise((r) => setTimeout(r, 20))
+      expect(rejections).toEqual([])
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+  })
+})
+
+// ── #3024: rights-aware negative cache ─────────────────────────────────────
+// marko logged 41 identical `pinChatMessage` "not enough rights" rejections in
+// 48h — one per auto status-pin attempt in a group where the bot isn't a pin
+// admin. The permanent-rights class is now cached per-chat so the SECOND and
+// later attempts skip the API call entirely and stop spamming the log. Synthetic
+// chat IDs only (the real ones in the issue are operator PII).
+describe('isPinRightsError (pure classifier)', () => {
+  it('matches the permanent pin-rights 400 (grammy .description)', () => {
+    expect(
+      isPinRightsError(
+        grammyError(400, 'Bad Request: not enough rights to manage pinned messages in the chat'),
+      ),
+    ).toBe(true)
+  })
+
+  it('matches a plain Error carrying the rights text', () => {
+    expect(isPinRightsError(new Error('not enough rights to manage pinned messages'))).toBe(true)
+  })
+
+  it('does NOT match transient classes (429 flood-wait, network)', () => {
+    expect(isPinRightsError(grammyError(429, 'Too Many Requests: retry after 5'))).toBe(false)
+    expect(isPinRightsError(new Error('fetch failed'))).toBe(false)
+    expect(isPinRightsError(grammyError(400, 'Bad Request: message to edit not found'))).toBe(false)
+  })
+})
+
+describe('PinRightsCache (pure)', () => {
+  it('block() returns true only the first time a chat is added (log-once)', () => {
+    const cache = new PinRightsCache()
+    expect(cache.isBlocked('-1009000000001')).toBe(false)
+    expect(cache.block('-1009000000001')).toBe(true)
+    expect(cache.block('-1009000000001')).toBe(false)
+    expect(cache.isBlocked('-1009000000001')).toBe(true)
+  })
+
+  it('clear() forgets a chat (rights re-granted)', () => {
+    const cache = new PinRightsCache()
+    cache.block('-1009000000001')
+    expect(cache.clear('-1009000000001')).toBe(true)
+    expect(cache.isBlocked('-1009000000001')).toBe(false)
+    expect(cache.clear('-1009000000001')).toBe(false)
+  })
+})
+
+/** A fake Bot API counting pin calls, throwing a chosen error on pin. */
+function countingApi(pinError?: unknown) {
+  let pinCalls = 0
+  let unpinCalls = 0
+  const api: PinBotApi = {
+    pinChatMessage: async () => {
+      pinCalls += 1
+      if (pinError) throw pinError
+    },
+    unpinChatMessage: async () => {
+      unpinCalls += 1
+    },
+  }
+  return {
+    api,
+    get pinCalls() {
+      return pinCalls
+    },
+    get unpinCalls() {
+      return unpinCalls
+    },
+  }
+}
+
+describe('reconcilePin — rights-aware negative cache (#3024)', () => {
+  const rightsErr = () =>
+    grammyError(400, 'Bad Request: not enough rights to manage pinned messages in the chat')
+
+  it('first rights failure: attempts once, logs once, records the chat', async () => {
+    const cache = new PinRightsCache()
+    const disabled: string[] = []
+    const pinFails: string[] = []
+    const t = countingApi(rightsErr())
+
+    const next = await reconcilePin({
+      api: t.api,
+      chatId: '-1009000000001',
+      prevState: null,
+      desired: { pinned: true, messageId: 4 },
+      rightsCache: cache,
+      onPinRightsDisabled: (chat) => disabled.push(chat),
+      onError: (phase) => pinFails.push(phase),
+    })
+
+    expect(t.pinCalls).toBe(1) // it did try
+    expect(next).toBeNull() // no claim taken
+    expect(disabled).toEqual(['-1009000000001']) // logged once
+    expect(pinFails).toEqual([]) // NOT routed through the per-attempt onError
+    expect(cache.isBlocked('-1009000000001')).toBe(true)
+  })
+
+  it('second attempt in the same chat makes NO api call and logs nothing', async () => {
+    const cache = new PinRightsCache()
+    const disabled: string[] = []
+    const pinFails: string[] = []
+    const t = countingApi(rightsErr())
+
+    const common = {
+      chatId: '-1009000000001',
+      prevState: null,
+      desired: { pinned: true, messageId: 4 } as const,
+      rightsCache: cache,
+      onPinRightsDisabled: (chat: string) => disabled.push(chat),
+      onError: (phase: 'pin' | 'unpin') => pinFails.push(phase),
+    }
+
+    await reconcilePin({ api: t.api, ...common })
+    await reconcilePin({ api: t.api, ...common })
+
+    expect(t.pinCalls).toBe(1) // second attempt short-circuited before the API
+    expect(disabled).toEqual(['-1009000000001']) // still logged exactly once
+    expect(pinFails).toEqual([])
+  })
+
+  it('a DIFFERENT chat is unaffected by another chat being blocked', async () => {
+    const cache = new PinRightsCache()
+    cache.block('-1009000000001')
+    const t = countingApi() // pin succeeds here
+
+    const next = await reconcilePin({
+      api: t.api,
+      chatId: '-1009000000002',
+      prevState: null,
+      desired: { pinned: true, messageId: 7 },
+      rightsCache: cache,
+      onPinRightsDisabled: () => {
+        throw new Error('should not disable a healthy chat')
+      },
+    })
+
+    expect(t.pinCalls).toBe(1)
+    expect(next).toEqual({ messageId: 7 })
+    expect(cache.isBlocked('-1009000000002')).toBe(false)
+  })
+
+  it('a 429 (transient) does NOT enter the cache — retry behaviour preserved', async () => {
+    const cache = new PinRightsCache()
+    const disabled: string[] = []
+    const pinFails: string[] = []
+    const t = countingApi(grammyError(429, 'Too Many Requests: retry after 5'))
+
+    await reconcilePin({
+      api: t.api,
+      chatId: '-1009000000003',
+      prevState: null,
+      desired: { pinned: true, messageId: 9 },
+      rightsCache: cache,
+      onPinRightsDisabled: (chat) => disabled.push(chat),
+      onError: (phase) => pinFails.push(phase),
+    })
+
+    expect(cache.isBlocked('-1009000000003')).toBe(false) // NOT cached
+    expect(disabled).toEqual([]) // no rights-disable log
+    expect(pinFails).toEqual(['pin']) // routed through onError → normal retry path
+
+    // A follow-up attempt still hits the API (no negative cache in the way).
+    await reconcilePin({
+      api: t.api,
+      chatId: '-1009000000003',
+      prevState: null,
+      desired: { pinned: true, messageId: 9 },
+      rightsCache: cache,
+      onError: (phase) => pinFails.push(phase),
+    })
+    expect(t.pinCalls).toBe(2)
+  })
+
+  it('a later successful pin clears a previously-blocked chat', async () => {
+    const cache = new PinRightsCache()
+    cache.block('-1009000000004')
+    const t = countingApi() // succeeds
+
+    // While blocked, the pin is skipped (no claim, no API call).
+    const skipped = await reconcilePin({
+      api: t.api,
+      chatId: '-1009000000004',
+      prevState: null,
+      desired: { pinned: true, messageId: 3 },
+      rightsCache: cache,
+    })
+    expect(skipped).toBeNull()
+    expect(t.pinCalls).toBe(0)
+
+    // Simulate rights granted: unblock, then a pin succeeds and stays clear.
+    cache.clear('-1009000000004')
+    const next = await reconcilePin({
+      api: t.api,
+      chatId: '-1009000000004',
+      prevState: null,
+      desired: { pinned: true, messageId: 3 },
+      rightsCache: cache,
+    })
+    expect(next).toEqual({ messageId: 3 })
+    expect(cache.isBlocked('-1009000000004')).toBe(false)
+  })
+
+  it('UNPIN rights-failure (rights revoked mid-session) blocks the chat, logs once, second unpin makes no API call', async () => {
+    const cache = new PinRightsCache()
+    const disabled: string[] = []
+    const unpinFails: string[] = []
+    let unpinCalls = 0
+    const api: PinBotApi = {
+      pinChatMessage: async () => {},
+      unpinChatMessage: async () => {
+        unpinCalls += 1
+        throw rightsErr()
+      },
+    }
+    const common = {
+      api,
+      chatId: '-1009000000007',
+      desired: { pinned: false } as const,
+      rightsCache: cache,
+      onPinRightsDisabled: (chat: string) => disabled.push(chat),
+      onError: (phase: 'pin' | 'unpin') => unpinFails.push(phase),
+    }
+
+    const first = await reconcilePin({ ...common, prevState: { messageId: 21 } })
+    expect(first).toBeNull() // claim dropped regardless (drop-on-unpin contract)
+    expect(unpinCalls).toBe(1) // it did try once
+    expect(disabled).toEqual(['-1009000000007']) // logged exactly once
+    expect(unpinFails).toEqual([]) // NOT routed through per-attempt onError
+    expect(cache.isBlocked('-1009000000007')).toBe(true)
+
+    const second = await reconcilePin({ ...common, prevState: { messageId: 22 } })
+    expect(second).toBeNull() // claim still dropped
+    expect(unpinCalls).toBe(1) // second attempt short-circuited before the API
+    expect(disabled).toEqual(['-1009000000007']) // no second log
+  })
+
+  it('a blocked chat skips the UNPIN api call too (drops the claim silently)', async () => {
+    const cache = new PinRightsCache()
+    cache.block('-1009000000005')
+    const t = countingApi()
+
+    const next = await reconcilePin({
+      api: t.api,
+      chatId: '-1009000000005',
+      prevState: { messageId: 12 },
+      desired: { pinned: false },
+      rightsCache: cache,
+    })
+
+    expect(next).toBeNull() // claim dropped
+    expect(t.unpinCalls).toBe(0) // but no wasted API call
+  })
+
+  it('fire-and-forget with the cache leaks NO unhandledRejection', async () => {
+    const rejections: unknown[] = []
+    const onUnhandled = (err: unknown) => rejections.push(err)
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      const cache = new PinRightsCache()
+      const t = countingApi(rightsErr())
+      void reconcilePin({
+        api: t.api,
+        chatId: '-1009000000006',
+        prevState: null,
+        desired: { pinned: true, messageId: 4 },
+        rightsCache: cache,
+        onPinRightsDisabled: () => {},
+      })
       await new Promise((r) => setTimeout(r, 20))
       expect(rejections).toEqual([])
     } finally {
