@@ -20,7 +20,15 @@
  * logic is pure + injectable so it unit tests without a real clock or bot.
  */
 
-import { readFileSync, writeFileSync, mkdirSync, chmodSync, unlinkSync } from 'node:fs'
+import {
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  chmodSync,
+  unlinkSync,
+  renameSync,
+} from 'node:fs'
 import { dirname, join } from 'node:path'
 
 export interface FloodWaitState {
@@ -347,4 +355,133 @@ export function suppressNonEssentialSendMs(
     return FLOOD_BLIND_SUPPRESS_MS
   }
   return s.remainingMs
+}
+
+// ─── Restart-proof SCOPED flood windows (#3084 PR 2, part3-design §7) ────────
+//
+// The single-object `flood-wait.json` above records ONE global per-bot window
+// (all #3094's `makeFloodWaitProbe` needs). PR 2's send gate opens windows at
+// finer scopes (`global` | `chat:<id>` | `group:<id>` | `msg-edit:<id>`) and
+// must survive a restart so a container that boots mid-ban does not immediately
+// resend into the open flood — exactly the retry-storm that escalates bans.
+//
+// Rather than overload the single-object schema (which would break #3094's
+// probe), scoped windows live in a SIBLING file `flood-windows.json` — an array
+// of `{ scopeKey, untilTs, retryAfterSrc, observedAt }`. `flood-wait.json` is
+// left untouched, so the existing probe keeps working unchanged.
+
+/** One persisted scoped flood window (part3-design §7). */
+export interface FloodWindowRecord {
+  /** `global` | `chat:<id>` | `group:<id>` | `msg-edit:<id>`. */
+  scopeKey: string
+  /** Epoch ms until which the scope admits nothing. */
+  untilTs: number
+  /** Provenance of the window (`429` retry_after, `boot`, …) for diagnostics. */
+  retryAfterSrc: string
+  /** Epoch ms the window was (re)recorded. */
+  observedAt: number
+}
+
+/** Sibling file holding the scoped-window array. */
+export const FLOOD_WINDOWS_FILE = 'flood-windows.json'
+
+/** Resolve the scoped-windows file path from a telegram state dir. */
+export function floodWindowsPath(stateDir: string): string {
+  return join(stateDir, FLOOD_WINDOWS_FILE)
+}
+
+/**
+ * Read persisted scoped windows, pruning any whose `untilTs` is already in the
+ * past. Returns `[]` on absence / parse failure (fails OPEN — a corrupt file
+ * must never silence the bot).
+ */
+export function readFloodWindows(path: string, now: number): FloodWindowRecord[] {
+  try {
+    if (!existsSync(path)) return []
+    const raw = JSON.parse(readFileSync(path, 'utf-8')) as unknown
+    if (!Array.isArray(raw)) return []
+    const out: FloodWindowRecord[] = []
+    for (const r of raw) {
+      const rec = r as Partial<FloodWindowRecord>
+      if (typeof rec.scopeKey !== 'string' || typeof rec.untilTs !== 'number') continue
+      if (rec.untilTs <= now) continue // prune expired
+      out.push({
+        scopeKey: rec.scopeKey,
+        untilTs: rec.untilTs,
+        retryAfterSrc: typeof rec.retryAfterSrc === 'string' ? rec.retryAfterSrc : 'unknown',
+        observedAt: typeof rec.observedAt === 'number' ? rec.observedAt : now,
+      })
+    }
+    return out
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Write-through a single scoped window (best-effort, atomic rename). Merges
+ * with the on-disk set: EXTENDS an existing scope's window (never shortens — a
+ * restart must not shrink a ban), prunes expired scopes, and drops the scope
+ * entirely if the new window is already in the past. Atomic via temp-file +
+ * rename so a concurrent reader never sees a half-written file.
+ */
+export function writeFloodWindow(
+  path: string,
+  record: FloodWindowRecord,
+  now: number,
+): void {
+  try {
+    mkdirSync(dirname(path), { recursive: true })
+    const existing = readFloodWindows(path, now)
+    const byScope = new Map<string, FloodWindowRecord>()
+    for (const r of existing) byScope.set(r.scopeKey, r)
+    if (record.untilTs > now) {
+      const prior = byScope.get(record.scopeKey)
+      // Monotonic: keep the LATER expiry (never shorten an open window).
+      const untilTs = prior && prior.untilTs > record.untilTs ? prior.untilTs : record.untilTs
+      byScope.set(record.scopeKey, { ...record, untilTs })
+    }
+    const arr = [...byScope.values()]
+    const tmp = `${path}.tmp-${process.pid}`
+    writeFileSync(tmp, JSON.stringify(arr), { mode: 0o600 })
+    renameSync(tmp, path)
+  } catch {
+    /* best-effort — a persistence failure must not crash the send path */
+  }
+}
+
+/**
+ * Build the `onWindowOpen` callback the send gate calls whenever it opens /
+ * extends a scope window (on a 429, or at boot). Persists write-through so the
+ * window survives a restart (part3-design §7).
+ */
+export function makeFloodWindowRecorder(
+  path: string,
+  now: () => number = Date.now,
+): (scopeKey: string, untilTs: number, retryAfterSrc?: string) => void {
+  return (scopeKey: string, untilTs: number, retryAfterSrc = '429') => {
+    const t = now()
+    writeFloodWindow(path, { scopeKey, untilTs, retryAfterSrc, observedAt: t }, t)
+  }
+}
+
+/**
+ * Assemble the `initialWindows` the send gate is constructed with at boot
+ * (part3-design §7). Combines the global window from the single-object
+ * `flood-wait.json` (#3094 / #2923) with every future-dated scoped window from
+ * the sibling `flood-windows.json`, pruning expired ones. The gate applies
+ * these BEFORE any outbound call so a boot mid-ban does not resend into it.
+ */
+export function loadInitialFloodWindows(
+  floodStateFilePath: string,
+  floodWindowsFilePath: string,
+  now: number,
+): { scopeKey: string; untilTs: number }[] {
+  const out: { scopeKey: string; untilTs: number }[] = []
+  const global = readFloodState(floodStateFilePath)
+  if (global && global.untilTs > now) out.push({ scopeKey: 'global', untilTs: global.untilTs })
+  for (const w of readFloodWindows(floodWindowsFilePath, now)) {
+    out.push({ scopeKey: w.scopeKey, untilTs: w.untilTs })
+  }
+  return out
 }

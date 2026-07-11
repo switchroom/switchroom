@@ -60,6 +60,23 @@ export interface RetryCallOpts {
    * edits (identical → dropped) and to coalesce. Retry policy ignores it.
    */
   editPayload?: unknown
+  /**
+   * Priority class for the outbound send gate's shedding + degraded mode
+   * (#3084 PR 2, send-gate.ts). The retry policy itself ignores it; it only
+   * governs how the gate treats the call when it is under pressure or a flood
+   * window is open:
+   *   - `critical`  — final reply chunks, approval / vault cards, error
+   *     notices. Never shed; queued unbounded. In degraded mode a critical
+   *     send waits for a short window but fails fast (structured
+   *     `FLOOD_WAIT_ACTIVE`) when the remaining window is long.
+   *   - `useful`    — progress-card creation, worker handbacks, checklists,
+   *     boot/config cards. Queued with a TTL; dropped when stale. DEFAULT
+   *     when unset.
+   *   - `cosmetic`  — typing, reactions, all card EDITS, stream updates,
+   *     heartbeats. Shed immediately when no token is free OR any flood
+   *     window is open.
+   */
+  priorityClass?: 'critical' | 'useful' | 'cosmetic'
 }
 
 export interface RetryObserver {
@@ -189,8 +206,16 @@ export interface FloodWaitActiveError extends Error {
   original: unknown
 }
 
-/** Build the marker with the full Telegram-429 duck-type shape. */
-function makeFloodWaitActiveError(
+/**
+ * Build the marker with the full Telegram-429 duck-type shape.
+ *
+ * Exported so the outbound send gate (#3084 PR 2) can COMPOSE the same
+ * structured error for its own degraded-mode fail-fast (a critical send into a
+ * long open flood window) rather than duplicating the 429 duck-type shape. One
+ * error shape means every downstream cooldown gate + the MCP reply path treat a
+ * gate fail-fast identically to a retry-layer flood-wait.
+ */
+export function makeFloodWaitActiveError(
   retryAfterSec: number,
   untilTs: number,
   original: unknown,
