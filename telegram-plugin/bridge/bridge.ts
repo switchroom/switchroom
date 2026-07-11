@@ -31,6 +31,7 @@ import { buildEffectiveToolSchemas, LINEAR_ENV } from './tool-filter.js'
 import type { InboundMessage, PermissionEvent, StatusEvent } from '../gateway/ipc-protocol.js'
 import { matchesAllowRule } from '../permission-rule.js'
 import { createOutstandingPermissionLedger } from './permission-ledger.js'
+import { appendCrashBreadcrumb } from './crash-breadcrumb.js'
 
 installPluginLogger()
 
@@ -107,7 +108,7 @@ const TOOL_SCHEMAS = [
         quote: { type: 'boolean', description: 'Opt out of the default quote-reply behavior. Default: true. Pass false to send a bare message with no quote reference. Ignored when reply_to is explicitly set.' },
         message_thread_id: { type: 'string', description: 'Forum topic thread ID. Auto-applied from the last inbound message in the same chat if not specified.' },
         origin_turn_id: { type: 'string', description: 'In a forum supergroup, pass back the origin_turn_id attribute from the <channel> message you are answering. It pins the reply to that message\'s topic even if another topic\'s turn started meanwhile. Omit in DMs / single-topic chats.' },
-        files: { type: 'array', items: { type: 'string' }, description: 'Absolute file paths to attach. Images send as photos; other types as documents. Max 50MB each.' },
+        files: { type: 'array', items: { type: 'string' }, description: 'Absolute file paths to attach. Images send as photos; other types as documents. Max 50MB each. Telegram rejects photos with extreme dimensions (aspect ratio over ~10:1, width+height over 10000px, or over 10MB) — very tall images like full-page screenshots are auto-rerouted as documents; crop or split them first if the user should see them inline as photos.' },
         format: { type: 'string', enum: ['html', 'markdownv2', 'text'], description: "Rendering mode. 'html' (default) converts markdown to Telegram HTML." },
         disable_web_page_preview: { type: 'boolean', description: 'Disable link preview thumbnails. Default: true.' },
         protect_content: { type: 'boolean', description: 'When true, Telegram prevents the message from being forwarded or saved.' },
@@ -895,8 +896,29 @@ process.on('SIGINT', () => {
   setTimeout(() => process.exit(0), 500)
 })
 
+// #3033 — the bridge process must survive stray errors, and when it can't,
+// it must leave a diagnosable trace. Claude Code NEVER respawns a dead MCP
+// server: if this process exits, the reply tool vanishes from the session
+// (`No such tool available`) and only a full container restart recovers the
+// chat surface (2026-07-11 clerk incident — the gateway crashed, its
+// supervisor brought it back in 1s, but the bridge had died in the same
+// window and the agent was mute for 7 minutes until the operator bounced
+// the container). Claude Code also drops MCP-server stderr after startup,
+// so both handlers persist a breadcrumb to STATE_DIR/bridge-crash.log.
+const CRASH_LOG_PATH = join(STATE_DIR, 'bridge-crash.log')
+
 process.on('unhandledRejection', (err) => {
   process.stderr.write(`telegram bridge: unhandled rejection: ${err}\n`)
+  appendCrashBreadcrumb(CRASH_LOG_PATH, 'unhandledRejection', err)
+})
+
+process.on('uncaughtException', (err) => {
+  // Log-and-continue, mirroring the unhandledRejection posture. Risky in
+  // general, but the alternative is strictly worse here: process death is
+  // unrecoverable by design (see above), while the IPC client's reconnect
+  // loop can heal any gateway-connection damage on its own.
+  process.stderr.write(`telegram bridge: uncaught exception (continuing): ${(err as Error)?.stack ?? err}\n`)
+  appendCrashBreadcrumb(CRASH_LOG_PATH, 'uncaughtException', err)
 })
 
 async function main(): Promise<void> {
