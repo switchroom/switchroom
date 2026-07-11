@@ -96,6 +96,12 @@ describe("scaffold: tools.allow [all] keeps explicit additions (klanker re-ask f
 
     expect(allow).toContain("Bash");
     expect(allow).toContain("Edit");
+    // Sub-agent / orchestration built-ins are auto-allowlisted for parity —
+    // Workflow must be present alongside Task/Agent so its launches don't
+    // raise an operator approval prompt (#2464).
+    expect(allow).toContain("Task");
+    expect(allow).toContain("Agent");
+    expect(allow).toContain("Workflow");
     expect(allow).not.toContain("all");
     // acceptEdits is the switchroom built-in default (now decoupled from the
     // wildcard) — an [all] agent with no override still gets it.

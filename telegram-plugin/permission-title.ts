@@ -212,6 +212,7 @@ export function naturalAction(
     }
     case "Task":
     case "Agent":
+    case "Workflow":
       return "dispatch a sub-agent";
     case "TodoWrite":
       return "update its task list";
