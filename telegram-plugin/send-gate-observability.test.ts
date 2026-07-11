@@ -145,8 +145,13 @@ describe('createFloodWindowObserver — snapshots', () => {
       operatorChatId: () => 'op',
     })
 
-    // Open a global window.
-    windows = [{ scopeKey: 'global', untilTs: 30_000, retryAfterSrc: '429', observedAt: 0 }]
+    // First (boot) tick with no windows establishes the baseline.
+    await obs.tick()
+    expect(logs).toHaveLength(0)
+
+    // A NEW window opens on a later tick (post-boot) → OPENED snapshot.
+    clock.cur = 5_000
+    windows = [{ scopeKey: 'global', untilTs: 30_000, retryAfterSrc: '429', observedAt: 5_000 }]
     await obs.tick()
     expect(logs.some((l) => l.includes('flood window OPENED scope=global'))).toBe(true)
     expect(logs.some((l) => l.includes('shed=2'))).toBe(true)
@@ -157,6 +162,35 @@ describe('createFloodWindowObserver — snapshots', () => {
     windows = []
     await obs.tick()
     expect(logs.some((l) => l.includes('flood window CLOSED scope=global'))).toBe(true)
+  })
+
+  it('logs ONE "loaded" line for boot-loaded windows, not per-scope OPENED spam (L3)', async () => {
+    const clock = new TestClock()
+    const logs: string[] = []
+    // Three windows already on disk at boot (a real 429 opens global+chat+group).
+    const windows: FloodWindowRecord[] = [
+      { scopeKey: 'global', untilTs: 300_000, retryAfterSrc: '429', observedAt: 0 },
+      { scopeKey: 'chat:op', untilTs: 300_000, retryAfterSrc: '429', observedAt: 0 },
+      { scopeKey: 'group:g', untilTs: 300_000, retryAfterSrc: '429', observedAt: 0 },
+    ]
+    const obs = createFloodWindowObserver({
+      clock,
+      log: (l) => logs.push(l),
+      stats: () => makeStats(),
+      readWindows: () => windows,
+      markAlerted: () => {},
+      sendAlert: async () => {},
+      operatorChatId: () => 'op',
+    })
+    await obs.tick()
+    // No OPENED spam for pre-existing windows.
+    expect(logs.some((l) => l.includes('flood window OPENED'))).toBe(false)
+    // Exactly one "loaded" line naming the count and every scope.
+    const loaded = logs.filter((l) => l.includes('loaded 3 open flood window(s) at boot'))
+    expect(loaded).toHaveLength(1)
+    expect(loaded[0]).toContain('global')
+    expect(loaded[0]).toContain('chat:op')
+    expect(loaded[0]).toContain('group:g')
   })
 
   it('does not run when the gate is disabled', async () => {
@@ -184,6 +218,13 @@ describe('createFloodWindowObserver — snapshots', () => {
 })
 
 describe('createFloodWindowObserver — alerting', () => {
+  // FORWARD-LOOKING (#3111): this exercises the immediate-delivery branch with a
+  // hand-built `chat:other`-only window. In production today that state never
+  // occurs — `openScopedWindowsForOpts` opens a coincident `global` window on
+  // every 429, so the operator is always "covered" and every alert defers to
+  // close (see M1 in the #3112 review). This test guards the branch so it is
+  // correct the moment #3111 makes `onFloodWait` scope-precise; the live path
+  // today is the deferred-close test below.
   it('alerts immediately for a chat-scoped ban on a DIFFERENT chat, at most once', async () => {
     const clock = new TestClock()
     const alerts: string[] = []
@@ -258,6 +299,52 @@ describe('createFloodWindowObserver — alerting', () => {
     expect(alerts).toHaveLength(1)
     expect(alerts[0]).toContain('flood ban cleared')
     expect(alerts[0]).toContain('was banned from')
+
+    // No re-alert afterwards.
+    clock.cur = 200_000
+    await obs.tick()
+    expect(alerts).toHaveLength(1)
+  })
+
+  it('coalesces one incident (global+chat+group) into ONE cleared card listing every scope (M1)', async () => {
+    const clock = new TestClock()
+    const alerts: string[] = []
+    // A single 429 opens all three scopes with the SAME untilTs (the live
+    // recorder behavior — see #3111). They all defer (global covers the
+    // operator) and all close in the same tick.
+    let windows: FloodWindowRecord[] = [
+      { scopeKey: 'global', untilTs: 120_000, retryAfterSrc: '429', observedAt: 0 },
+      { scopeKey: 'chat:op', untilTs: 120_000, retryAfterSrc: '429', observedAt: 0 },
+      { scopeKey: 'group:g', untilTs: 120_000, retryAfterSrc: '429', observedAt: 0 },
+    ]
+    const obs = createFloodWindowObserver({
+      clock,
+      log: () => {},
+      stats: () => makeStats(),
+      readWindows: () => windows,
+      markAlerted: () => {},
+      sendAlert: async (t) => {
+        alerts.push(t)
+      },
+      operatorChatId: () => 'op',
+      alertThresholdMs: 60_000,
+    })
+
+    // Past threshold, all scopes covered by the global window → nothing during.
+    clock.cur = 61_000
+    await obs.tick()
+    expect(alerts).toHaveLength(0)
+
+    // All three close in the same tick → EXACTLY ONE cleared card, not three.
+    clock.cur = 121_000
+    windows = []
+    await obs.tick()
+    expect(alerts).toHaveLength(1)
+    expect(alerts[0]).toContain('flood ban cleared')
+    expect(alerts[0]).toContain('scopes') // plural — multiple scopes listed
+    expect(alerts[0]).toContain('global')
+    expect(alerts[0]).toContain('chat:op')
+    expect(alerts[0]).toContain('group:g')
 
     // No re-alert afterwards.
     clock.cur = 200_000

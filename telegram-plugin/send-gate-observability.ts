@@ -29,6 +29,15 @@
  *     "was banned from X to Y" alert when the window CLOSES (or as soon as the
  *     operator chat becomes reachable again).
  *
+ * STATUS OF THE IMMEDIATE PATH (today vs. after #3111)
+ * ----------------------------------------------------
+ * The immediate-delivery branch is present and unit-tested, but it does NOT
+ * fire in production yet: `openScopedWindowsForOpts` opens a coincident `global`
+ * window on every 429, so the operator chat is always "covered" while any ban is
+ * active and every alert defers to close. It becomes live once #3111 makes
+ * `onFloodWait` scope-precise. Until then the operator is alerted at window
+ * CLOSE — once per incident, all scopes coalesced into one card (M1, #3112).
+ *
  * At-most-once is anchored by the persisted `alertedAt` (survives restart). The
  * deferred close-alert is best-effort at-least-once: if the gateway is down for
  * the entire tail of the window and the record is pruned before it is seen
@@ -153,7 +162,9 @@ export interface FloodWindowObserver {
 
 /** Human-readable ISO-ish timestamp (UTC, second precision) for alert wording. */
 function fmtTs(ms: number): string {
-  return new Date(ms).toISOString().replace('.000', '').replace(/\.\d{3}/, '')
+  // Strip the milliseconds (`.\d{3}`) for second precision — this also covers
+  // the `.000` case, so no separate replace is needed.
+  return new Date(ms).toISOString().replace(/\.\d{3}/, '')
 }
 
 function fmtDur(ms: number): string {
@@ -177,10 +188,29 @@ export function createFloodWindowObserver(
   const alertThresholdMs = config.alertThresholdMs ?? 60_000
   // Full records seen on the previous tick, keyed by scope (close detection).
   let lastSeen = new Map<string, FloodWindowRecord>()
+  // First tick after boot: any window already present was loaded from disk
+  // (a ban that predates this process), NOT freshly opened — so we log a single
+  // "loaded N windows" line instead of a per-scope OPENED snapshot (L3, #3112).
+  let firstTick = true
   // Scopes whose alert could not be delivered during the window → owed on close.
   const owedOnClose = new Set<string>()
-  // Close alerts queued but not yet deliverable (operator chat still covered).
-  const pendingClose = new Map<string, FloodWindowRecord>()
+  // Close alerts owed but not yet deliverable, grouped per INCIDENT (an approx
+  // untilTs bucket). One real 429 opens several scopes (global + chat:<id> +
+  // group:<id>, all sharing one untilTs — see #3111's global over-suppression),
+  // which all close in the same tick; grouping collapses them into ONE operator
+  // "flood ban cleared" card listing every scope, instead of 2–3 near-identical
+  // cards per incident (M1, #3112).
+  // NOTE (L2, #3112): owedOnClose / pendingCloseByIncident are IN-MEMORY only —
+  // a restart during an open window drops the "owed" state and the deferred
+  // close-alert may be lost. This is the accepted at-least-once tradeoff
+  // documented in the module header; the invariant that matters (never RE-alert)
+  // is anchored on the persisted `alertedAt`, not on this state.
+  const pendingCloseByIncident = new Map<number, FloodWindowRecord[]>()
+
+  /** Bucket windows of one incident together by ~1s-rounded expiry. */
+  function incidentBucket(untilTs: number): number {
+    return Math.round(untilTs / 1000)
+  }
 
   function coversOperator(w: FloodWindowRecord, operatorChatId: string | undefined): boolean {
     if (w.scopeKey === 'global') return true
@@ -207,11 +237,21 @@ export function createFloodWindowObserver(
     )
   }
 
-  function closeAlertText(w: FloodWindowRecord): string {
+  /**
+   * ONE close-alert card for a whole incident. `recs` are the scopes of a
+   * single 429 (they share an ~untilTs bucket); we list every scope and span
+   * the interval as [earliest observedAt, latest untilTs] so the operator gets
+   * one card per incident rather than one per scope (M1, #3112).
+   */
+  function closeAlertText(recs: FloodWindowRecord[]): string {
+    const observedAt = Math.min(...recs.map((r) => r.observedAt))
+    const untilTs = Math.max(...recs.map((r) => r.untilTs))
+    const scopes = recs.map((r) => `\`${r.scopeKey}\``).join(', ')
+    const plural = recs.length > 1 ? 's' : ''
     return (
-      `⚠️ Telegram flood ban cleared (scope \`${w.scopeKey}\`). ` +
-      `The bot was banned from ${fmtTs(w.observedAt)} to ${fmtTs(w.untilTs)} UTC ` +
-      `(~${fmtDur(w.untilTs - w.observedAt)}). Some outbound messages during that ` +
+      `⚠️ Telegram flood ban cleared (scope${plural} ${scopes}). ` +
+      `The bot was banned from ${fmtTs(observedAt)} to ${fmtTs(untilTs)} UTC ` +
+      `(~${fmtDur(untilTs - observedAt)}). Some outbound messages during that ` +
       `window were suppressed.`
     )
   }
@@ -226,17 +266,31 @@ export function createFloodWindowObserver(
     for (const w of windows) current.set(w.scopeKey, w)
     const operatorReachable = !windows.some((w) => coversOperator(w, operatorChatId))
 
-    // Newly-opened scopes → snapshot.
-    for (const w of windows) {
-      if (!lastSeen.has(w.scopeKey)) {
+    if (firstTick) {
+      // Windows present on the very first tick were loaded at boot, not opened
+      // now — log ONE "loaded" line rather than a misleading OPENED snapshot per
+      // window (L3, #3112). Alerting for these still runs below (alertedAt-gated).
+      if (windows.length > 0) {
         config.log(
-          `telegram gateway: send-gate flood window OPENED scope=${w.scopeKey} ` +
-            `untilTs=${w.untilTs} src=${w.retryAfterSrc} — ${snapshotSuffix()}\n`,
+          `telegram gateway: send-gate flood observer loaded ${windows.length} ` +
+            `open flood window(s) at boot: ${windows.map((w) => w.scopeKey).join(', ')} ` +
+            `— ${snapshotSuffix()}\n`,
         )
+      }
+    } else {
+      // Newly-opened scopes → snapshot.
+      for (const w of windows) {
+        if (!lastSeen.has(w.scopeKey)) {
+          config.log(
+            `telegram gateway: send-gate flood window OPENED scope=${w.scopeKey} ` +
+              `untilTs=${w.untilTs} src=${w.retryAfterSrc} — ${snapshotSuffix()}\n`,
+          )
+        }
       }
     }
 
-    // Closed scopes → snapshot, and queue any owed close-alert.
+    // Closed scopes → snapshot, and queue any owed close-alert (grouped per
+    // incident so the operator gets ONE card listing all scopes — M1, #3112).
     for (const [scope, prev] of lastSeen) {
       if (current.has(scope)) continue
       config.log(
@@ -244,7 +298,10 @@ export function createFloodWindowObserver(
           `(was open ${fmtDur(now - prev.observedAt)}) — ${snapshotSuffix()}\n`,
       )
       if (owedOnClose.has(scope) && isAlertableScope(scope) && prev.alertedAt == null) {
-        pendingClose.set(scope, prev)
+        const bucket = incidentBucket(prev.untilTs)
+        const list = pendingCloseByIncident.get(bucket) ?? []
+        list.push(prev)
+        pendingCloseByIncident.set(bucket, list)
       }
       owedOnClose.delete(scope)
     }
@@ -255,6 +312,15 @@ export function createFloodWindowObserver(
       if (w.alertedAt != null) continue
       if (now - w.observedAt < alertThresholdMs) continue
       if (operatorReachable && !coversOperator(w, operatorChatId)) {
+        // NOTE (M1, #3112): this immediate-delivery branch is currently
+        // UNREACHABLE for recorder-produced state — `openScopedWindowsForOpts`
+        // opens a coincident `global` window on every 429, so `operatorReachable`
+        // is always false while any ban is active. It goes live once #3111 makes
+        // `onFloodWait` scope-precise. Kept + unit-tested as forward-looking.
+        // NOTE (L1, #3112): send-first, then persist `alertedAt`. A crash between
+        // the delivered card and the disk write re-alerts on restart — a benign
+        // duplicate. Deliberate: send-first guarantees an alert is never LOST,
+        // and never RE-alerting is the weaker of the two guarantees.
         try {
           await config.sendAlert(openAlertText(w, now))
           config.markAlerted(w.scopeKey, now)
@@ -268,12 +334,13 @@ export function createFloodWindowObserver(
       }
     }
 
-    // Flush deferred close alerts once the operator chat is reachable again.
-    if (operatorReachable && pendingClose.size > 0) {
-      for (const [scope, rec] of [...pendingClose]) {
+    // Flush deferred close alerts once the operator chat is reachable again —
+    // ONE card per incident, listing every scope (M1, #3112).
+    if (operatorReachable && pendingCloseByIncident.size > 0) {
+      for (const [bucket, recs] of [...pendingCloseByIncident]) {
         try {
-          await config.sendAlert(closeAlertText(rec))
-          pendingClose.delete(scope)
+          await config.sendAlert(closeAlertText(recs))
+          pendingCloseByIncident.delete(bucket)
         } catch {
           /* keep it pending; retry next tick */
         }
@@ -281,6 +348,7 @@ export function createFloodWindowObserver(
     }
 
     lastSeen = current
+    firstTick = false
   }
 
   return { tick }
