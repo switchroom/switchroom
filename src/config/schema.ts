@@ -3740,6 +3740,24 @@ export const SwitchroomConfigSchema = z.object({
           "agent (whether that agent has `admin: true` or not) is a config " +
           "error caught at schema validation.",
         ),
+      proactive_failover_pct: z
+        .number()
+        .min(1)
+        .max(99)
+        .optional()
+        .describe(
+          "Soft-avoid threshold (percent) for proactive auth failover (#3031). " +
+          "When set (e.g. 95), an account whose fresh 7-day utilization is at/" +
+          "above this value — or whose 5h utilization is at/above min(pct+3, " +
+          "98) — enters the SOFT-AVOID preference tier: the broker prefers a " +
+          "fully-eligible fallback account on the serving path, without ever " +
+          "blocking the account (the hard wall stays 99.5). Enter/exit uses " +
+          "hysteresis (exit below pct-5 or on window reset) so the preference " +
+          "does not flap between probe ticks. Accounts serving past the wall " +
+          "via `allow_overage_accounts` are never soft-avoided. UNSET (the " +
+          "default) disables the tier entirely — behavior is identical to a " +
+          "fleet without this field.",
+        ),
       allow_overage_accounts: z
         .array(z.string().min(1))
         .optional()

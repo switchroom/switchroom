@@ -77,6 +77,8 @@ auth:
     - me@example.com
     - work
     - personal
+  proactive_failover_pct: 95            # optional: soft-avoid tier threshold
+                                        # (unset = tier off, behavior unchanged)
   consumers:                            # non-agent peers (hindsight, etc.)
     - name: hindsight
       account: me@example.com
@@ -174,6 +176,32 @@ rediscoveries.
 When `exhausted_until` passes, the broker clears the mark. Agents
 that *prefer* the cleared account (it's first in their effective
 preference order) drift back on next idle.
+
+### Soft-avoid tier — proactive preference before the wall
+
+`auth.proactive_failover_pct` (optional, e.g. `95`) adds a third
+eligibility state between eligible and blocked: **soft-avoid**. An
+account is soft-avoided when a fresh quota probe shows its 7-day
+utilization at/above the pct, or its 5h utilization at/above
+`min(pct + 3, 98)`. Soft-avoid is a *preference ranking* on the
+serving/failover path only:
+
+- The broker prefers a fully-eligible fallback account over a
+  soft-avoided one (`fallback_order` walk, roll-target selection).
+- When *every* healthy candidate is soft-avoided, the broker serves the
+  least-utilized one and does **not** roll — the tier can never shrink
+  availability or produce a false "all accounts blocked".
+- The hard wall is untouched: blocked still means 99.5% utilization or
+  an unexpired exhaustion mark. Attribution (`mark-exhausted`) never
+  follows the preference, so a soft-avoid can never mismark an account.
+- Hysteresis: enter at pct, exit only below pct-5 (both windows) or
+  when the window resets — a probe oscillating 94↔96 does not flap the
+  preference.
+- Accounts serving past the wall via `allow_overage_accounts` are never
+  soft-avoided.
+
+Unset (the default) disables the tier entirely; the broker behaves
+exactly as it did before the field existed.
 
 ## Drift detection
 

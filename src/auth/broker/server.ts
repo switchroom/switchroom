@@ -54,6 +54,9 @@ import {
   clampMarkExpiry,
   overageLiftsWall,
   snapshotFresh,
+  evaluateSoftAvoid,
+  type SoftAvoidState,
+  type SoftAvoidSnapshot,
   snapshotWalled,
   WALL_PCT,
 } from "./account-eligibility.js";
@@ -1185,6 +1188,64 @@ export class AuthBroker {
     });
   }
 
+  /* ─── Soft-avoid tier (#3031, PR 1/4) ───────────────────────── */
+
+  /** Per-account soft-avoid hysteresis (in-memory; re-derived from the next
+   *  probe after a broker restart — the durable quota cache reseeds it). */
+  private softAvoidState: Record<string, SoftAvoidState> = {};
+
+  /** View a cached quota entry through the soft-avoid snapshot shape (reset
+   *  ISO strings → unix-ms epochs the pure layer compares). */
+  private softAvoidSnapshotOf(account: string): SoftAvoidSnapshot | undefined {
+    const s = this.lastQuotaCache[account];
+    if (!s) return undefined;
+    return {
+      ...s,
+      fiveHourResetAtMs: s.fiveHourResetAt ? Date.parse(s.fiveHourResetAt) : null,
+      sevenDayResetAtMs: s.sevenDayResetAt ? Date.parse(s.sevenDayResetAt) : null,
+    };
+  }
+
+  /**
+   * True when `account` is in the soft-avoid PREFERENCE tier (#3031): its
+   * fresh utilization is at/above `auth.proactive_failover_pct` (7d) or
+   * min(pct+3, 98) (5h), with enter/exit hysteresis. This is a serving-path
+   * RANKING only — it never blocks, never affects attribution
+   * (`callerAccount` / mark-exhausted), and is structurally FALSE whenever
+   * the config knob is unset (the no-behavior-change guarantee).
+   * Overage-lifted accounts are never soft-avoided.
+   */
+  private isAccountSoftAvoided(account: string): boolean {
+    const pct = this.config.auth?.proactive_failover_pct;
+    if (pct === undefined) return false; // feature off — zero state churn
+    const now = this.now();
+    const snapshot = this.softAvoidSnapshotOf(account);
+    const overageLifted =
+      !!snapshot && snapshotFresh(snapshot, now) &&
+      overageLiftsWall(snapshot, this.isOverageAllowed(account));
+    const state = evaluateSoftAvoid({
+      snapshot,
+      now,
+      pct,
+      overageLifted,
+      prev: this.softAvoidState[account],
+    });
+    this.softAvoidState[account] = state;
+    return state.softAvoided;
+  }
+
+  /**
+   * Tie-break score for an all-soft-avoid candidate set: the account's worst
+   * fresh window utilization (lower = more headroom). Accounts with no fresh
+   * snapshot score lowest (an unmeasured account can't be soft-avoided, so it
+   * won't reach this tie-break in practice).
+   */
+  private softAvoidUtilScore(account: string): number {
+    const s = this.lastQuotaCache[account];
+    if (!s || !snapshotFresh(s, this.now())) return -1;
+    return Math.max(s.fiveHourUtilizationPct, s.sevenDayUtilizationPct);
+  }
+
   /**
    * THE single audited signal that authorizes spending Anthropic overage credit.
    * True iff `account` may RIGHT NOW be served past the weekly utilization wall
@@ -1310,8 +1371,18 @@ export class AuthBroker {
     order: readonly string[],
   ): Promise<string | null> {
     // Fast path: a clearly-eligible candidate from cache needs no probe.
+    // Soft-avoid (#3031): a soft-avoided candidate does NOT take the fast
+    // path — fall through to the unknown-probe pass so a never-measured
+    // fallback with real headroom can outrank it. (With the config knob
+    // unset this extra predicate is structurally false — identical path.)
     const cached = this.nextHealthyAccount(current, order);
-    if (cached && this.accountEligibilityOf(cached) === "eligible") return cached;
+    if (
+      cached &&
+      this.accountEligibilityOf(cached) === "eligible" &&
+      !this.isAccountSoftAvoided(cached)
+    ) {
+      return cached;
+    }
 
     // No cache-eligible candidate. Force-probe the `unknown` candidates (the
     // ones with no positive evidence) so a never-probed-but-healthy secondary
@@ -1367,7 +1438,41 @@ export class AuthBroker {
    * hold, and — like the consumer path — auto-reverts once the window passes.
    */
   private accountWithFailover(account: string | null | undefined): string | null {
-    if (!account || !this.isAccountExhausted(account)) return account ?? null;
+    if (!account) return null;
+    const exhausted = this.isAccountExhausted(account);
+    // Soft-avoid (#3031): a non-exhausted account still serves, but when it
+    // sits in the soft-avoid tier we PREFER a fully-eligible fallback. With
+    // `auth.proactive_failover_pct` unset this predicate is structurally
+    // false, so the fast path below is byte-identical to the pre-#3031 code.
+    if (!exhausted && !this.isAccountSoftAvoided(account)) return account;
+    // Pass 1 — first fallback candidate that is neither exhausted nor
+    // soft-avoided (the preference ranking: fully-eligible beats soft-avoid).
+    for (const cand of this.config.auth?.fallback_order ?? []) {
+      if (cand === account || this.isAccountExhausted(cand)) continue;
+      if (this.isAccountSoftAvoided(cand)) continue;
+      if (readAccountCredentials(cand, this.home)) return cand;
+    }
+    if (!exhausted) {
+      // The account is merely soft-avoided and no fully-eligible fallback
+      // exists — every serveable candidate is soft-avoided too. Serve the
+      // least-utilized of them (most headroom) and do NOT roll anything.
+      // Never returns null: `account` itself is always a candidate, so this
+      // branch cannot reduce availability relative to pre-#3031 behavior.
+      let best = account;
+      let bestScore = this.softAvoidUtilScore(account);
+      for (const cand of this.config.auth?.fallback_order ?? []) {
+        if (cand === account || this.isAccountExhausted(cand)) continue;
+        if (!readAccountCredentials(cand, this.home)) continue;
+        const score = this.softAvoidUtilScore(cand);
+        if (score < bestScore) {
+          best = cand;
+          bestScore = score;
+        }
+      }
+      return best;
+    }
+    // Pass 2 — exhausted, and no fully-eligible fallback: the pre-#3031
+    // behavior. A soft-avoided fallback beats retrying a hard-exhausted pin.
     for (const cand of this.config.auth?.fallback_order ?? []) {
       if (cand === account || this.isAccountExhausted(cand)) continue;
       if (readAccountCredentials(cand, this.home)) return cand;
@@ -2968,15 +3073,29 @@ export class AuthBroker {
   private nextHealthyAccount(current: string, order: readonly string[]): string | null {
     const start = order.indexOf(current);
     if (start === -1) return order[0] ?? null;
+    // Soft-avoid (#3031) preference RANKING: the first non-exhausted,
+    // non-soft-avoided candidate wins; when every healthy candidate is
+    // soft-avoided, fall back to the least-utilized of them (never null when
+    // a healthy-but-soft-avoided candidate exists — the tier must not shrink
+    // availability). With `proactive_failover_pct` unset, isAccountSoftAvoided
+    // is structurally false and this is exactly the pre-#3031 selection.
+    let bestSoftAvoided: string | null = null;
+    let bestScore = Number.POSITIVE_INFINITY;
     for (let i = 1; i <= order.length; i++) {
       const cand = order[(start + i) % order.length];
       if (!cand) continue;
       // Live-authoritative: skip a candidate the live probe shows walled even
       // if its mark expired, and accept one the live probe shows healthy even
       // if a stale/bogus mark says exhausted. (The 2026-06-10 root predicate.)
-      if (!this.isAccountExhausted(cand) && accountExists(cand, this.home)) return cand;
+      if (this.isAccountExhausted(cand) || !accountExists(cand, this.home)) continue;
+      if (!this.isAccountSoftAvoided(cand)) return cand;
+      const score = this.softAvoidUtilScore(cand);
+      if (score < bestScore) {
+        bestSoftAvoided = cand;
+        bestScore = score;
+      }
     }
-    return null;
+    return bestSoftAvoided;
   }
 
   /** Compute an agent's effective account and write its mirror. */
