@@ -112,13 +112,34 @@ export const HINDSIGHT_IMAGE = `${HINDSIGHT_IMAGE_REPO}:latest`;
  * When `tag` is undefined/empty, returns the floating `:latest` image
  * ({@link HINDSIGHT_IMAGE}) — preserving the standalone `memory setup`
  * behavior. Normalizes so a bare `0.15.18` and a `v0.15.18` both resolve to
- * the `:v0.15.18` tag the workflow actually publishes.
+ * the `:v0.15.18` tag the workflow actually publishes. A non-normalizable
+ * tag (e.g. `sha-…`, garbage) also floats to `:latest` — the release
+ * workflow only publishes per-version `:vX.Y.Z` images, so there is no
+ * concrete image to pin to.
  */
 export function hindsightImageRef(tag?: string): string {
-  const t = tag?.trim();
-  if (!t) return HINDSIGHT_IMAGE;
-  const v = t.replace(/^v/, "");
-  return `${HINDSIGHT_IMAGE_REPO}:v${v}`;
+  const normalized = normalizeHindsightVersionTag(tag);
+  if (!normalized) return HINDSIGHT_IMAGE;
+  return `${HINDSIGHT_IMAGE_REPO}:${normalized}`;
+}
+
+/**
+ * Canonicalize a hindsight image version tag to the `vX.Y.Z` form the
+ * release workflow publishes (`TAG_VERSION="${GITHUB_REF#refs/tags/}"` →
+ * `:vX.Y.Z`). Accepts either an already-`v`-prefixed `vX.Y.Z` or a bare
+ * `X.Y.Z` and returns the canonical `vX.Y.Z`. Anything else — an empty /
+ * undefined value, a `sha-…` pin, or garbage — returns `undefined`, which
+ * callers treat as "no concrete version → float to `:latest`".
+ *
+ * This is the single source of truth for pin normalization, shared by
+ * {@link hindsightImageRef} and `resolveHindsightPinTag` (src/cli/update.ts)
+ * so both callsites gate identically.
+ */
+export function normalizeHindsightVersionTag(candidate?: string): string | undefined {
+  const t = candidate?.trim();
+  if (!t) return undefined;
+  const m = /^v?(\d+\.\d+\.\d+)$/.exec(t);
+  return m ? `v${m[1]}` : undefined;
 }
 
 /**

@@ -144,6 +144,18 @@ describe("planUpdate", () => {
       expect(resolveHindsightPinTag({ hindsightPinTag: "", pin: "v0.17.5" })).toBeUndefined();
       expect(resolveHindsightPinTag({ hindsightPinTag: "v0.16.11" })).toBe("v0.16.11");
     });
+
+    it("normalizes a bare X.Y.Z --pin to canonical vX.Y.Z (parity with hindsightImageRef)", () => {
+      // Regression for #2857: a release.pin stored without the leading `v`
+      // used to fall through the strict /^v\d+\.\d+\.\d+$/ gate and float to
+      // :latest, silently un-pinning hindsight while the rest of the fleet
+      // stayed on the pinned tag.
+      expect(resolveHindsightPinTag({ pin: "0.17.5" })).toBe("v0.17.5");
+      // A sha pin has no per-version image published → still floats.
+      expect(resolveHindsightPinTag({ pin: "sha-cafebabe" })).toBeUndefined();
+      // Garbage still floats.
+      expect(resolveHindsightPinTag({ pin: "not-a-version" })).toBeUndefined();
+    });
   });
 
   it("inserts regen-compose-for-release-override BEFORE pull-images when --channel is set", () => {
