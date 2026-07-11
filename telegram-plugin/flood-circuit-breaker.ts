@@ -391,31 +391,80 @@ export function floodWindowsPath(stateDir: string): string {
 }
 
 /**
- * Read persisted scoped windows, pruning any whose `untilTs` is already in the
- * past. Returns `[]` on absence / parse failure (fails OPEN — a corrupt file
- * must never silence the bot).
+ * How long a fail-SAFE conservative global window suppresses for when the
+ * scoped-windows file exists but cannot be trusted (unreadable/corrupt/junk).
+ *
+ * The scoped-windows file gates whether a booting gateway resends into an open
+ * ban. If we cannot tell what windows are open, the ONLY safe move is to assume
+ * a ban may be open and hold non-essential/coalesced traffic for a bounded
+ * conservative window — the exact opposite of `flood-wait.json`'s essential-send
+ * probe, which must fail OPEN so a marker problem never gags the user's reply.
+ * The asymmetry is deliberate: this file drives boot-time shedding, not the
+ * user's reply, so failing safe here costs at most a few suppressed cosmetic
+ * sends, while failing open resends straight into a ban (H2/M1, #3106 posture).
  */
-export function readFloodWindows(path: string, now: number): FloodWindowRecord[] {
-  try {
-    if (!existsSync(path)) return []
-    const raw = JSON.parse(readFileSync(path, 'utf-8')) as unknown
-    if (!Array.isArray(raw)) return []
-    const out: FloodWindowRecord[] = []
-    for (const r of raw) {
-      const rec = r as Partial<FloodWindowRecord>
-      if (typeof rec.scopeKey !== 'string' || typeof rec.untilTs !== 'number') continue
-      if (rec.untilTs <= now) continue // prune expired
-      out.push({
-        scopeKey: rec.scopeKey,
-        untilTs: rec.untilTs,
-        retryAfterSrc: typeof rec.retryAfterSrc === 'string' ? rec.retryAfterSrc : 'unknown',
-        observedAt: typeof rec.observedAt === 'number' ? rec.observedAt : now,
-      })
-    }
-    return out
-  } catch {
-    return []
+export const FLOOD_WINDOWS_CORRUPT_SUPPRESS_MS = 5 * 60_000
+
+/**
+ * Read persisted scoped windows, pruning any whose `untilTs` is already in the
+ * past.
+ *
+ * Fail-SAFE, not fail-open (M1/H2): a genuinely ABSENT file (ENOENT) is the
+ * only "no windows" answer. If the file exists but is unreadable (EACCES/EIO),
+ * corrupt, or not a JSON array, we CANNOT tell whether a ban is open — so we
+ * synthesize a conservative `global` window (`FLOOD_WINDOWS_CORRUPT_SUPPRESS_MS`)
+ * and log loudly, rather than booting into an open flood with no windows.
+ */
+export function readFloodWindows(
+  path: string,
+  now: number,
+  log: (line: string) => void = (l) => process.stderr.write(l),
+): FloodWindowRecord[] {
+  // ENOENT is the ONLY honest "no windows". Anything else = we can't tell.
+  if (!existsSync(path)) return []
+  const failSafe = (why: string): FloodWindowRecord[] => {
+    log(
+      `telegram gateway: flood-breaker: scoped-windows file ${path} is ${why} — ` +
+        `failing SAFE: opening a conservative ${FLOOD_WINDOWS_CORRUPT_SUPPRESS_MS}ms global ` +
+        `window rather than booting into a possible open ban with no windows (issue #3106)\n`,
+    )
+    return [
+      {
+        scopeKey: 'global',
+        untilTs: now + FLOOD_WINDOWS_CORRUPT_SUPPRESS_MS,
+        retryAfterSrc: `failsafe:${why}`,
+        observedAt: now,
+      },
+    ]
   }
+  let text: string
+  try {
+    text = readFileSync(path, 'utf-8')
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code
+    if (code === 'ENOENT' || code === 'ENOTDIR') return [] // vanished between stat and read
+    return failSafe(`unreadable (${code ?? 'error'})`)
+  }
+  let raw: unknown
+  try {
+    raw = JSON.parse(text)
+  } catch {
+    return failSafe('corrupt (invalid JSON)')
+  }
+  if (!Array.isArray(raw)) return failSafe('corrupt (not an array)')
+  const out: FloodWindowRecord[] = []
+  for (const r of raw) {
+    const rec = r as Partial<FloodWindowRecord>
+    if (typeof rec.scopeKey !== 'string' || typeof rec.untilTs !== 'number') continue
+    if (rec.untilTs <= now) continue // prune expired
+    out.push({
+      scopeKey: rec.scopeKey,
+      untilTs: rec.untilTs,
+      retryAfterSrc: typeof rec.retryAfterSrc === 'string' ? rec.retryAfterSrc : 'unknown',
+      observedAt: typeof rec.observedAt === 'number' ? rec.observedAt : now,
+    })
+  }
+  return out
 }
 
 /**
@@ -443,8 +492,21 @@ export function writeFloodWindow(
     }
     const arr = [...byScope.values()]
     const tmp = `${path}.tmp-${process.pid}`
-    writeFileSync(tmp, JSON.stringify(arr), { mode: 0o600 })
+    // 0o644, NOT 0o600 (H2, #3106): the telegram state dir is shared by
+    // processes running under DIFFERENT uids; a 0600 marker created by whoever
+    // wrote first is unreadable to every other uid, which silently defeats the
+    // restart-proof windows — a restart under a different uid boots blind and
+    // resends into the ban. Match `flood-wait.json` (FLOOD_STATE_MODE).
+    writeFileSync(tmp, JSON.stringify(arr), { mode: FLOOD_STATE_MODE })
     renameSync(tmp, path)
+    // `mode:` only applies at CREATE; chmod so a marker left 0600 by an earlier
+    // build (or a root gateway) becomes readable to the agent uid. Best-effort:
+    // if we don't own it, the read path fails SAFE rather than silently open.
+    try {
+      chmodSync(path, FLOOD_STATE_MODE)
+    } catch {
+      /* not the owner — read path fails safe */
+    }
   } catch {
     /* best-effort — a persistence failure must not crash the send path */
   }

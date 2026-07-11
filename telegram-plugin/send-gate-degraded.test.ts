@@ -117,10 +117,12 @@ describe('send-gate PR2: cosmetic shedding', () => {
     const gate = createSendGate({
       enabled: true,
       clock,
-      initialWindows: [{ scopeKey: 'msg-edit:42', untilTs: HOUR }],
+      // H1: msg-edit scope is keyed `${chat_id}:${messageId}`.
+      initialWindows: [{ scopeKey: 'msg-edit:5:42', untilTs: HOUR }],
     })
 
     const res = await gate.gate(fn('edit'), {
+      chat_id: '5',
       messageId: 42,
       editPayload: 'v1',
       priorityClass: 'cosmetic',
@@ -299,6 +301,110 @@ describe('send-gate PR2: edit call-site wiring (progress/answer-stream shape)', 
   })
 })
 
+describe('send-gate PR2: H1 cross-chat message_id isolation', () => {
+  it('two chats sharing message_id 100 do NOT collide — both send, no edit lost', async () => {
+    const clock = new FakeClock()
+    const { calls, fn } = recorder(clock)
+    const gate = createSendGate({ enabled: true, clock, editFloorMs: 1500 })
+
+    // Chat A: v1 (cold → sends now), then v2 within the floor → queued for A.
+    const pA1 = gate.gate(fn('A-v1'), { chat_id: 'A', messageId: 100, editPayload: 'A-v1' })
+    await flush()
+    const pA2 = gate.gate(fn('A-v2'), { chat_id: 'A', messageId: 100, editPayload: 'A-v2' })
+    // Chat B edits ITS OWN card, also message_id 100 — must be a SEPARATE state.
+    const pB1 = gate.gate(fn('B-v1'), { chat_id: 'B', messageId: 100, editPayload: 'B-v1' })
+
+    await clock.advance(1600)
+    await Promise.all([pA1, pA2, pB1])
+
+    // With the id-only bug, B-v1 overwrote A's pending (A-v2) → A-v2 silently
+    // dropped. Keyed by chat_id+messageId, all three survive.
+    expect(calls.map((c) => c.label).sort()).toEqual(['A-v1', 'A-v2', 'B-v1'])
+    expect(gate.stats().global.sent).toBe(3)
+    expect(gate.stats().global.dropped).toBe(0)
+  })
+
+  it('chat B cold edit is NOT floored by chat A holding the same message_id', async () => {
+    const clock = new FakeClock()
+    const { calls, fn } = recorder(clock)
+    const gate = createSendGate({ enabled: true, clock, editFloorMs: 1500 })
+
+    // A sends (starts A's floor). B's first edit to the same id must fire at
+    // t=0 — B has its own floor, not A's.
+    const pA = gate.gate(fn('A'), { chat_id: 'A', messageId: 100, editPayload: 'A' })
+    await flush()
+    const pB = gate.gate(fn('B'), { chat_id: 'B', messageId: 100, editPayload: 'B' })
+    await flush()
+    await Promise.all([pA, pB])
+
+    expect(calls.map((c) => c.label).sort()).toEqual(['A', 'B'])
+    expect(calls.every((c) => c.at === 0)).toBe(true)
+  })
+
+  it('a 429 on chat A message 100 does NOT shed chat B message 100 cosmetic edits', async () => {
+    const clock = new FakeClock()
+    const { calls, fn } = recorder(clock)
+    const gate = createSendGate({
+      enabled: true,
+      clock,
+      // Only chat A's msg-edit scope is under a flood window.
+      initialWindows: [{ scopeKey: 'msg-edit:A:100', untilTs: HOUR }],
+    })
+
+    // Chat A cosmetic edit → shed (its scope window is open).
+    const rA = await gate.gate(fn('A-edit'), {
+      chat_id: 'A',
+      messageId: 100,
+      editPayload: 'A-edit',
+      priorityClass: 'cosmetic',
+    })
+    // Chat B cosmetic edit to the SAME message_id → must NOT shed (different scope).
+    const rB = await gate.gate(fn('B-edit'), {
+      chat_id: 'B',
+      messageId: 100,
+      editPayload: 'B-edit',
+      priorityClass: 'cosmetic',
+    })
+
+    expect(rA).toBeUndefined() // A shed
+    expect(rB).toBe('B-edit') // B sent
+    expect(calls.map((c) => c.label)).toEqual(['B-edit'])
+    expect(gate.stats().global.shed).toBe(1)
+  })
+})
+
+describe('send-gate PR2: M2 critical wait re-evaluates the window each iteration', () => {
+  it('a window extended past the ceiling MID-WAIT converts a critical to fail-fast, not a hang', async () => {
+    const clock = new FakeClock()
+    const { calls, fn } = recorder(clock)
+    const gate = createSendGate({
+      enabled: true,
+      clock,
+      criticalFailFastMs: 60_000,
+      jitter: () => 0, // deterministic, no jitter sleep
+      // A SHORT 30s window (<= ceiling) → the critical waits it out.
+      initialWindows: [{ scopeKey: 'global', untilTs: 30_000 }],
+    })
+
+    // Attach the rejection handler synchronously (before advancing time) so the
+    // eventual fail-fast rejection is never an unhandled rejection.
+    const p = gate.gate(fn('critical'), { priorityClass: 'critical' }).catch((e) => e)
+    await flush()
+    // While it waits, a competing 429 EXTENDS the global window to +10min.
+    gate.openFloodWindow('global', 600_000)
+    // Walk past the ORIGINAL short window; the loop re-checks the ceiling and,
+    // seeing the extended window, fails fast instead of blocking ~10 minutes.
+    await clock.advance(31_000)
+
+    const caught = await p
+    expect(isFloodWaitActiveError(caught)).toBe(true)
+    expect((caught as { untilTs: number }).untilTs).toBe(600_000)
+    expect(calls).toHaveLength(0) // never probed the API
+    expect(gate.stats().global.failedFast).toBe(1)
+    expect(gate.stats().global.sent).toBe(0)
+  })
+})
+
 describe('send-gate PR2: opening a window from a 429, and persistence hook', () => {
   it('opens scope windows via onWindowOpen when a non-edit send throws FLOOD_WAIT_ACTIVE', async () => {
     const clock = new FakeClock()
@@ -327,7 +433,8 @@ describe('send-gate PR2: opening a window from a 429, and persistence hook', () 
     ).rejects.toBe(floodErr)
 
     const scopes = opened.map((o) => o.scopeKey).sort()
-    expect(scopes).toEqual(['chat:7', 'global', 'group:7', 'msg-edit:3'])
+    // H1: msg-edit scope carries the chat_id (msg-edit:7:3), not the bare id.
+    expect(scopes).toEqual(['chat:7', 'global', 'group:7', 'msg-edit:7:3'])
     // After the window opens, a later cosmetic on the same chat sheds.
     const shed = await gate.gate(async () => 'x', { chat_id: '7', priorityClass: 'cosmetic' })
     expect(shed).toBeUndefined()

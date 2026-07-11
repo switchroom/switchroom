@@ -95,12 +95,26 @@ export type ChatType = 'private' | 'group' | 'supergroup' | 'channel'
  *     fails fast with a structured `FLOOD_WAIT_ACTIVE` for a long one.
  *   - `useful`   — progress-card creation, worker handbacks, checklists,
  *     boot/config cards. Queued with a TTL; dropped (counted) when stale.
- *     DEFAULT when a call is untagged.
  *   - `cosmetic` — typing, reactions, all card EDITS, stream updates,
  *     heartbeats. Shed immediately (counted) when no token is free OR any
  *     flood window covering the scope is open.
+ *
+ * UNTAGGED default (L2, review PR #3106): an untagged NON-EDIT send defaults to
+ * `critical` — NON-droppable (queued unbounded, fail-fast only on a long
+ * window), NOT `useful`. Rationale: most call sites are untagged, and a `useful`
+ * default silently TTL-drops an untagged-but-important send under pressure
+ * (a resolved `undefined` a caller reads as "sent"). Conservative posture:
+ * nothing is droppable unless a call site OPTS IN by tagging `useful`/`cosmetic`.
+ * (Untagged EDITS keep coalescing — the latest payload always wins, never
+ * dropped — so their default is non-droppable already.)
  */
 export type PriorityClass = 'critical' | 'useful' | 'cosmetic'
+
+/**
+ * Priority class an UNTAGGED non-edit send is admitted as. `critical` =
+ * non-droppable (L2). See the `PriorityClass` doc above.
+ */
+export const UNTAGGED_SEND_CLASS: PriorityClass = 'critical'
 
 /**
  * Extra metadata a call site can attach so the gate can key the right buckets.
@@ -125,7 +139,8 @@ export interface SendGateOpts {
   verb?: string
   /**
    * Priority class for shedding + degraded mode (part3-design §2/§3). Untagged
-   * calls default to `useful`.
+   * NON-EDIT calls default to `critical` (non-droppable — see
+   * `UNTAGGED_SEND_CLASS`); untagged edits coalesce (also non-droppable).
    */
   priorityClass?: PriorityClass
 }
@@ -443,7 +458,13 @@ export function createSendGate(config: SendGateConfig): SendGate {
   const globalBucket = new TokenBucket(globalBurst, globalPerSec / 1000, bootStart, globalRamp)
   const perChat = new Map<string, TokenBucket>()
   const perGroup = new Map<string, TokenBucket>()
-  const perMessage = new Map<number, MessageEditState>()
+  // H1 (review PR #3106): keyed by `${chat_id}:${messageId}`, NOT messageId
+  // alone. Telegram `message_id` is per-chat, not globally unique — two chats
+  // routinely both hold a low-numbered card (id 3, 100, …). Keying on the id
+  // alone collides cross-chat: chat B's edit overwrites chat A's pending edit
+  // (A's real update silently lost), and the edit floor / msg-edit suppression
+  // window of one chat sheds an unrelated card in another.
+  const perMessage = new Map<string, MessageEditState>()
   let lastSweepMs = bootStart
 
   function chatBucket(chatId: string): TokenBucket {
@@ -464,8 +485,18 @@ export function createSendGate(config: SendGateConfig): SendGate {
     return b
   }
 
-  function messageState(messageId: number): MessageEditState {
-    let state = perMessage.get(messageId)
+  /**
+   * Per-message state key: `${chat_id}:${messageId}` (H1). A missing chat_id
+   * degrades to `:${messageId}` — still unique per call site, and edits always
+   * carry a chat_id in production. This is ALSO the `msg-edit:` scope suffix, so
+   * the boot-reloaded scoped windows and the runtime edit floor agree.
+   */
+  function messageKey(chatId: string | undefined, messageId: number): string {
+    return `${chatId ?? ''}:${messageId}`
+  }
+
+  function messageState(key: string): MessageEditState {
+    let state = perMessage.get(key)
     if (!state) {
       state = {
         lastSentMs: Number.NEGATIVE_INFINITY,
@@ -474,7 +505,7 @@ export function createSendGate(config: SendGateConfig): SendGate {
         running: false,
         suppressedUntilMs: 0,
       }
-      perMessage.set(messageId, state)
+      perMessage.set(key, state)
     }
     return state
   }
@@ -505,6 +536,14 @@ export function createSendGate(config: SendGateConfig): SendGate {
    * §7) so the window survives a restart.
    */
   function openFloodWindow(scopeKey: string, untilTs: number): void {
+    // M3 (review PR #3106): flag-OFF is a PURE no-op. The gateway wires
+    // `onFloodWait` → `openFloodWindow('global', …)` unconditionally, so without
+    // this guard a 429 would mutate in-memory suppression AND write a new
+    // `flood-windows.json` even while the feature is disabled — a real fs side
+    // effect and behaviour change before the flag is ever enabled. When
+    // disabled the gate must open no window and write no file (the separate
+    // #2923 `flood-wait.json` recorder is unaffected — it is not wired here).
+    if (!enabled) return
     applyWindow(scopeKey, untilTs, true)
   }
 
@@ -523,7 +562,11 @@ export function createSendGate(config: SendGateConfig): SendGate {
         applyWindow(`group:${opts.chat_id}`, untilTs, true)
       }
     }
-    if (opts?.messageId != null) applyWindow(`msg-edit:${opts.messageId}`, untilTs, true)
+    if (opts?.messageId != null) {
+      // H1: msg-edit scope keyed by chat_id+messageId so a 429 on one chat's
+      // card never sheds another chat's same-id card.
+      applyWindow(`msg-edit:${messageKey(opts.chat_id, opts.messageId)}`, untilTs, true)
+    }
   }
 
   /** Core window application; `persist` gates the write-through hook. */
@@ -542,16 +585,17 @@ export function createSendGate(config: SendGateConfig): SendGate {
     } else if (scopeKey.startsWith('group:')) {
       groupBucket(scopeKey.slice('group:'.length)).suppressUntil(untilTs)
     } else if (scopeKey.startsWith('msg-edit:')) {
-      const id = Number(scopeKey.slice('msg-edit:'.length))
-      if (Number.isFinite(id)) {
+      // H1: the suffix is the composite `${chat_id}:${messageId}` state key.
+      const key = scopeKey.slice('msg-edit:'.length)
+      if (key) {
         // N2: creating a per-message edit state here must go through the same
         // eviction accounting (maybeEvict / LRU cap) as normal state creation,
         // so opening many per-message flood windows can't grow perMessage past
         // the cap.
         const now = clock.now()
-        const existing = perMessage.get(id)
+        const existing = perMessage.get(key)
         maybeEvict(now, existing === undefined)
-        const st = existing ?? messageState(id)
+        const st = existing ?? messageState(key)
         if (untilTs > st.suppressedUntilMs) st.suppressedUntilMs = untilTs
       }
     }
@@ -679,20 +723,52 @@ export function createSendGate(config: SendGateConfig): SendGate {
         return { result: 'failfast', untilTs: now + remaining }
       }
       if (remaining > 0) {
-        // Degraded but short window: serialize + jitter, then wait it out.
-        await criticalSerialize(async () => {
+        // Degraded but short window: serialize + jitter, then wait it out —
+        // re-checking the ceiling EACH loop (admitCriticalLoop) so a window
+        // extended past `criticalFailFastMs` while we wait converts to fail-fast
+        // instead of blocking the reply path unbounded (M2, review PR #3106).
+        return await criticalSerialize(async () => {
           const j = Math.floor(jitter() * criticalJitterMaxMs)
           if (j > 0) await clock.sleep(j)
-          await admitLoop(buckets)
+          return await admitCriticalLoop(buckets)
         })
-        return { result: 'ok' }
       }
-      await admitLoop(buckets)
-      return { result: 'ok' }
+      return await admitCriticalLoop(buckets)
     }
     // useful (default): TTL-bounded queue.
     const admitted = await admitLoop(buckets, now + usefulTtlMs)
     return admitted ? { result: 'ok' } : { result: 'expired' }
+  }
+
+  /**
+   * Unbounded critical admission that RE-EVALUATES the covering window on every
+   * iteration (M2, review PR #3106). If a competing 429 extends the window past
+   * the fail-fast ceiling while a critical waits out a short window, this stops
+   * blocking and returns `failfast` (the caller throws a structured
+   * `FLOOD_WAIT_ACTIVE`) rather than blocking the MCP reply path for the whole
+   * extended ban — exactly the "opaque long block" part3-design §3 forbids.
+   */
+  async function admitCriticalLoop(buckets: TokenBucket[]): Promise<AdmitOutcome> {
+    let counted = false
+    for (;;) {
+      const now = clock.now()
+      let remaining = 0
+      let wait = 0
+      for (const b of buckets) {
+        remaining = Math.max(remaining, b.windowRemainingMs(now))
+        wait = Math.max(wait, b.msUntilAvailable(now))
+      }
+      if (remaining > criticalFailFastMs) return { result: 'failfast', untilTs: now + remaining }
+      if (wait <= 0) {
+        for (const b of buckets) b.consume(now)
+        return { result: 'ok' }
+      }
+      if (!counted) {
+        counters.queued++
+        counted = true
+      }
+      await clock.sleep(wait)
+    }
   }
 
   /**
@@ -767,11 +843,12 @@ export function createSendGate(config: SendGateConfig): SendGate {
 
   function handleEdit<T>(fn: () => Promise<T>, opts: SendGateOpts): Promise<T> {
     const messageId = opts.messageId as number
+    const key = messageKey(opts.chat_id, messageId)
     const hash = hashPayload(opts.editPayload)
     const now = clock.now()
-    const existing = perMessage.get(messageId)
+    const existing = perMessage.get(key)
     maybeEvict(now, existing === undefined)
-    const state = existing ?? messageState(messageId)
+    const state = existing ?? messageState(key)
 
     // Cosmetic edits (part3-design §2) shed under pressure — a flood window
     // covering the scope is open, or a bucket has no token free right now. A
@@ -843,8 +920,10 @@ export function createSendGate(config: SendGateConfig): SendGate {
       return handleEdit(fn, opts)
     }
 
-    // Priority-aware admission (part3-design §2/§3). Untagged → useful.
-    const priority = opts?.priorityClass ?? 'useful'
+    // Priority-aware admission (part3-design §2/§3). Untagged → critical
+    // (non-droppable — L2, review PR #3106); tag `useful`/`cosmetic` to opt into
+    // shedding.
+    const priority = opts?.priorityClass ?? UNTAGGED_SEND_CLASS
     const outcome = await admitPriority(bucketsFor(opts), priority)
     if (outcome.result === 'shed') {
       counters.shed++
