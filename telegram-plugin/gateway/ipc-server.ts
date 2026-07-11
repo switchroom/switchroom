@@ -7,6 +7,7 @@ import type {
   SendOutboundMessage,
   QuotaWallDetectedMessage,
   QueryPendingPermissionMessage,
+  CheckPreApprovedMessage,
   PostSkillProposalMessage,
   OperatorEventForward,
   PermissionRequestForward,
@@ -80,6 +81,15 @@ export interface IpcServerOptions {
    * feature (mixed-version safety).
    */
   onQueryPendingPermission?: (client: IpcClient, msg: QueryPendingPermissionMessage) => void;
+  /**
+   * #2975 Stage 2 — hostd's read-only pre-approval query. Handler answers from
+   * the gateway's correlation maps by EXACT diff byte-match and replies with a
+   * `pre_approved_result` event. MUST NOT mutate gateway state. Optional: when
+   * no handler is wired (older gateway build, or a fixture that doesn't need
+   * it), the server replies `preApproved: false` immediately so hostd fails
+   * closed to today's rate-limited behaviour (mixed-version safety).
+   */
+  onCheckPreApproved?: (client: IpcClient, msg: CheckPreApprovedMessage) => void;
   /**
    * #2670 one-tap self-improvement — persist a skill-improvement proposal
    * and post its Approve/Dismiss card. Handler persists the draft bundle to
@@ -352,6 +362,19 @@ export function validateClientMessage(msg: unknown): msg is ClientToGateway {
         || (m.correlationId as string).length > 64) return false;
       return true;
     }
+    case "check_pre_approved": {
+      // #2975 Stage 2 — hostd read-only pre-approval query. Wire shape only;
+      // the handler byte-matches the diff against the correlation maps and
+      // never mutates state.
+      if (typeof m.agentName !== "string"
+        || !AGENT_NAME_RE.test(m.agentName as string)) return false;
+      if (typeof m.correlationId !== "string"
+        || (m.correlationId as string).length === 0
+        || (m.correlationId as string).length > 64) return false;
+      if (typeof m.unifiedDiff !== "string"
+        || (m.unifiedDiff as string).length === 0) return false;
+      return true;
+    }
     case "request_config_approval": {
       // #1623 — hostd-initiated config-edit approval card. Wire shape
       // only; the handler module validates the diff content.
@@ -472,6 +495,7 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
     onSendOutbound,
     onQuotaWallDetected,
     onQueryPendingPermission,
+    onCheckPreApproved,
     onPostSkillProposal,
     onRequestDriveApproval,
     onRequestMs365Approval,
@@ -603,6 +627,24 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
               type: "pending_permission_status",
               correlationId: (msg as QueryPendingPermissionMessage).correlationId,
               pending: false,
+            });
+          } catch {
+            /* best effort */
+          }
+        }
+        break;
+      case "check_pre_approved":
+        if (onCheckPreApproved) {
+          onCheckPreApproved(client, msg as CheckPreApprovedMessage);
+        } else {
+          // No handler wired — fail closed to "not pre-approved" so hostd
+          // applies the ordinary rate limit (byte-identical to pre-#2975-S2
+          // behaviour; the Stage 1 retry then covers an approved persist).
+          try {
+            client.send({
+              type: "pre_approved_result",
+              correlationId: (msg as CheckPreApprovedMessage).correlationId,
+              preApproved: false,
             });
           } catch {
             /* best effort */

@@ -68,7 +68,39 @@ function denyingGateway() {
   return { gw, requests };
 }
 
-function makeServer(gw: ApprovalGateway, ratePerHour?: number) {
+// #2975 Stage 2 — a gateway that reports `checkPreApproved` true only for one
+// specific diff (the operator-consented persist), and approves that same diff's
+// requestApproval while denying everything else. Mirrors the real
+// mental-model / always-allow bypass: the pre-approved persist skips the rate
+// limit, any other proposal still posts a (here: denied) card.
+function bypassGateway(opts: { preApprovedDiff: string; approve: boolean }) {
+  const requests: ApprovalRequest[] = [];
+  const preChecks: Array<{ agent: string; diff: string }> = [];
+  const gw: ApprovalGateway = {
+    async requestApproval(req): Promise<ApprovalResult> {
+      requests.push(req);
+      if (req.unifiedDiff === opts.preApprovedDiff && opts.approve) {
+        return { verdict: "approve", finalize: async () => {} };
+      }
+      return { verdict: "deny", denySource: "operator", finalize: async () => {} };
+    },
+    async checkPreApproved(agentName, unifiedDiff): Promise<boolean> {
+      preChecks.push({ agent: agentName, diff: unifiedDiff });
+      return unifiedDiff === opts.preApprovedDiff;
+    },
+  };
+  return { gw, requests, preChecks };
+}
+
+function makeServer(
+  gw: ApprovalGateway,
+  ratePerHour?: number,
+  runReconcile?: (args: { requestId: string }) => Promise<{
+    exit_code: number;
+    stdout: string;
+    stderr: string;
+  }>,
+) {
   return new HostdServer({
     homeDir: tmp,
     agentUids: { klanker: 10001 },
@@ -84,6 +116,7 @@ function makeServer(gw: ApprovalGateway, ratePerHour?: number) {
     allowNonLinux: true,
     configPath,
     approvalGateway: gw,
+    ...(runReconcile ? { runReconcile } : {}),
   });
 }
 
@@ -197,5 +230,88 @@ describe("config_propose_edit — audit at card-post time (#config-edit-hardenin
     expect(throttled.length).toBe(1);
     expect(throttled[0]!.request_id).toBe("rlr-2");
     expect(throttled[0]!.result).toBe("denied");
+  });
+});
+
+describe("config_propose_edit — pre-approval bypass (#2975 Stage 2)", () => {
+  it("an exhausted bucket + gateway pre-approval → applies immediately, no E_RATE_LIMITED, audit pre_approved:true", async () => {
+    const preApprovedDiff = distinctDiff("preapproved");
+    const { gw, preChecks } = bypassGateway({ preApprovedDiff, approve: true });
+    server = makeServer(gw, 3, async () => ({ exit_code: 0, stdout: "", stderr: "" })); // 3/hour, reconcile ok
+    await server.start();
+
+    // Fill the bucket with three ordinary (denied) proposals.
+    await send(distinctDiff("a"), "bp-a");
+    await send(distinctDiff("b"), "bp-b");
+    await send(distinctDiff("c"), "bp-c");
+
+    // The pre-approved persist, with the bucket EXHAUSTED, still applies —
+    // it never returns E_RATE_LIMITED because checkPreApproved answered true.
+    const pre = await send(preApprovedDiff, "bp-pre");
+    expect(pre.result).toBe("completed");
+    expect(pre.error ?? "").not.toMatch(/E_RATE_LIMITED|rate limit/i);
+
+    // The gateway WAS consulted for the pre-approval decision.
+    expect(preChecks.some((c) => c.diff === preApprovedDiff && c.agent === "klanker")).toBe(true);
+
+    await new Promise<void>((r) => setTimeout(r, 30));
+    const rows = readAuditRows();
+    const preRow = rows.find(
+      (r) => r.op === "config_propose_edit" && r.phase === "requested" && r.request_id === "bp-pre",
+    );
+    expect(preRow).toBeDefined();
+    expect(preRow!.pre_approved).toBe(true);
+    // An ordinary requested row carries NO pre_approved flag.
+    const ordinaryRow = rows.find(
+      (r) => r.op === "config_propose_edit" && r.phase === "requested" && r.request_id === "bp-a",
+    );
+    expect(ordinaryRow).toBeDefined();
+    expect(ordinaryRow!.pre_approved).toBeUndefined();
+  });
+
+  it("the bypassed call does NOT consume the bucket — the agent's next unapproved proposal still hits the limit", async () => {
+    const preApprovedDiff = distinctDiff("preapproved");
+    // approve:false — keep the pre-approved diff a DENY so the config file is
+    // never mutated and the later distinct diffs keep validating cleanly. The
+    // point here is bucket accounting, not the apply.
+    const { gw } = bypassGateway({ preApprovedDiff, approve: false });
+    server = makeServer(gw, 1); // 1/hour — a single ordinary slot
+    await server.start();
+
+    // Pre-approved persist: bypasses the rate limit, must NOT spend the slot.
+    const pre = await send(preApprovedDiff, "cn-pre");
+    expect(pre.result).toBe("denied"); // operator-denied card, not rate-limited
+    expect(pre.error ?? "").not.toMatch(/E_RATE_LIMITED|rate limit/i);
+
+    // First ordinary proposal: consumes the one slot (denied at the card).
+    const n1 = await send(distinctDiff("n1"), "cn-n1");
+    expect(n1.result).toBe("denied");
+    expect(n1.error ?? "").not.toMatch(/E_RATE_LIMITED|rate limit/i);
+
+    // Second ordinary proposal: NOW the bucket is full → E_RATE_LIMITED. If the
+    // bypass had wrongly consumed the slot, n1 would already have been limited.
+    const n2 = await send(distinctDiff("n2"), "cn-n2");
+    expect(n2.result).toBe("denied");
+    expect(n2.error ?? "").toMatch(/E_RATE_LIMITED|rate limit/i);
+  });
+
+  it("fail-closed: a gateway with no checkPreApproved → identical to today (E_RATE_LIMITED with fix.retry_after)", async () => {
+    // denyingGateway has NO checkPreApproved method — the mixed-version / old
+    // gateway case. The bypass must degrade to today's exact rate-limit path.
+    const { gw } = denyingGateway();
+    server = makeServer(gw, 1); // 1/hour
+    await server.start();
+
+    await send(distinctDiff("fc-1"), "fc-1"); // consumes the slot (denied)
+    const limited = await send(distinctDiff("fc-2"), "fc-2"); // throttled
+
+    expect(limited.result).toBe("denied");
+    expect(limited.error ?? "").toMatch(/E_RATE_LIMITED|rate limit/i);
+    // Stage 1 depends on the structured retry_after fix being present.
+    const env = (limited as { error_envelope?: { code?: string; fix?: { kind?: string; retry_at?: string } } }).error_envelope;
+    expect(env?.code).toBe("E_RATE_LIMITED");
+    expect(env?.fix?.kind).toBe("retry_after");
+    expect(typeof env?.fix?.retry_at).toBe("string");
+    expect(Number.isNaN(Date.parse(env!.fix!.retry_at!))).toBe(false);
   });
 });

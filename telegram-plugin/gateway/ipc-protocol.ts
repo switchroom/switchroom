@@ -153,6 +153,22 @@ export interface PendingPermissionStatusEvent {
   requestId?: string;
 }
 
+/**
+ * #2975 Stage 2 — the gateway's answer to a hostd `check_pre_approved` query.
+ * Read-only: `preApproved: true` means the queried `(agentName, unifiedDiff)`
+ * pair byte-matches a correlation the gateway pre-registered when the operator
+ * approved a mental-model proposal (or "🔁 Always allow"), so hostd may skip
+ * the `config_propose_edit` rate limit for that persist. Sourced from the
+ * gateway's in-memory correlation maps WITHOUT mutating them (the single-use
+ * auto-resolve delete happens later on the real `request_config_approval`).
+ */
+export interface PreApprovedResultEvent {
+  type: "pre_approved_result";
+  /** Echoes the correlationId from the originating check_pre_approved query. */
+  correlationId: string;
+  preApproved: boolean;
+}
+
 export type GatewayToClient =
   | InboundMessage
   | PermissionEvent
@@ -163,7 +179,8 @@ export type GatewayToClient =
   | Ms365ApprovalPostedEvent
   | ConfigApprovalResolvedEvent
   | RolloutStatusPostedEvent
-  | PendingPermissionStatusEvent;
+  | PendingPermissionStatusEvent
+  | PreApprovedResultEvent;
 
 // === Bridge (Client) -> Gateway messages ===
 
@@ -596,6 +613,31 @@ export interface QueryPendingPermissionMessage {
   correlationId: string;
 }
 
+/**
+ * #2975 Stage 2 — hostd → gateway read-only pre-approval query. hostd asks
+ * whether this EXACT `(agentName, unifiedDiff)` pair is already operator-
+ * consented (pre-registered on the gateway when the operator approved a
+ * mental-model proposal / tapped "🔁 Always allow"), so it can skip the
+ * `config_propose_edit` per-hour rate limit for that persist.
+ *
+ * Trust model: identical to `query_pending_permission` — the socket is
+ * per-agent inside the container; `agentName` is validated server-side AND
+ * checked against the gateway's own SWITCHROOM_AGENT_NAME in the handler. This
+ * message can NEVER mutate gateway state: the handler only *reads* the
+ * correlation maps (byte-exact match), the same forge-resistance gate the
+ * auto-resolve path enforces. hostd answers `pre_approved_result`; the query
+ * is not reachable via any agent-facing hostd verb (it only ever travels
+ * hostd → gateway over the approval-gateway socket).
+ */
+export interface CheckPreApprovedMessage {
+  type: "check_pre_approved";
+  agentName: string;
+  /** Caller-generated correlation id, echoed in the reply. */
+  correlationId: string;
+  /** Full unified diff to byte-match against the pre-registered correlations. */
+  unifiedDiff: string;
+}
+
 export type ClientToGateway =
   | RegisterMessage
   | ToolCallMessage
@@ -616,4 +658,5 @@ export type ClientToGateway =
   | PostSkillProposalMessage
   | RolloutStatusPostMessage
   | RolloutStatusEditMessage
-  | QueryPendingPermissionMessage;
+  | QueryPendingPermissionMessage
+  | CheckPreApprovedMessage;

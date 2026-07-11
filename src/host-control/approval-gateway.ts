@@ -2,6 +2,7 @@
 // so HostdServer.handleConfigProposeEdit's apply path is testable.
 
 import { connect, type Socket } from "node:net";
+import { randomBytes } from "node:crypto";
 
 export type ApprovalVerdict = "approve" | "deny" | "timeout";
 
@@ -43,6 +44,27 @@ export interface ApprovalResult {
 
 export interface ApprovalGateway {
   requestApproval(req: ApprovalRequest): Promise<ApprovalResult>;
+  /**
+   * Read-only pre-approval query (#2975 Stage 2). Asks the gateway whether
+   * this EXACT `(agentName, unifiedDiff)` pair is already operator-consented —
+   * i.e. it byte-matches a correlation the gateway itself pre-registered when
+   * the operator tapped Approve on a mental-model proposal (or "🔁 Always
+   * allow"). When it does, hostd's `config_propose_edit` may skip the per-hour
+   * rate limit for this persist: it posts no card and consumes zero operator
+   * attention (issue #2975).
+   *
+   * The query MUST NOT mutate gateway state (the single-use auto-resolve delete
+   * still happens later on the real `request_config_approval`) and MUST fail
+   * CLOSED: any unreachable/unknown-message/malformed/timeout condition — e.g.
+   * an old gateway during a mixed-version roll — resolves `false`, never
+   * throws. `false` restores today's exact behaviour (rate limit applies, then
+   * Stage 1's gateway retry backstop covers an approved-but-throttled persist).
+   *
+   * Optional: a gateway wiring without this method (or a hostd built before
+   * Stage 2) is treated as "not pre-approved" by the caller — the same
+   * fail-closed default.
+   */
+  checkPreApproved?(agentName: string, unifiedDiff: string): Promise<boolean>;
 }
 
 // SocketApprovalGateway — production wiring against `<agentDir>/telegram/gateway.sock`.
@@ -53,8 +75,115 @@ export interface SocketApprovalGatewayOptions {
   log?: (msg: string) => void;
 }
 
+/**
+ * Short deadline for the read-only pre-approval query (#2975 Stage 2). hostd
+ * must never hang on this: it's an optimisation on the config-edit rate-limit
+ * path, and a slow/absent gateway must fail closed quickly so the ordinary
+ * (rate-limited) flow proceeds. The gateway answers from an in-memory map with
+ * no I/O, so a real answer arrives in <1ms; this bound only guards a dead or
+ * old-version socket.
+ */
+const PRE_APPROVED_QUERY_TIMEOUT_MS = 2000;
+
 export class SocketApprovalGateway implements ApprovalGateway {
   constructor(private opts: SocketApprovalGatewayOptions) {}
+
+  /**
+   * #2975 Stage 2 — read-only pre-approval query. Connects to the agent's
+   * gateway socket, sends a single `check_pre_approved` message, and resolves
+   * with the gateway's `pre_approved_result.preApproved` boolean. FAIL CLOSED:
+   * no socket, socket error/close, malformed/unknown reply, or timeout all
+   * resolve `false`. Never throws, never mutates gateway state.
+   */
+  async checkPreApproved(
+    agentName: string,
+    unifiedDiff: string,
+  ): Promise<boolean> {
+    const sockPath = this.opts.resolveGatewaySocket(agentName);
+    if (sockPath === null) return false;
+    const log = this.opts.log ?? (() => {});
+    // A per-query correlation id so a reply can never be confused with another
+    // in-flight message on a shared connection (we use a fresh connection, but
+    // the gateway echoes it and we verify the match defensively).
+    const correlationId = `preapp-${randomBytes(8).toString("hex")}`;
+    return await new Promise<boolean>((resolve) => {
+      let settled = false;
+      const client: Socket = connect({ path: sockPath });
+      let buffer = "";
+      const done = (result: boolean): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try {
+          client.destroy();
+        } catch {
+          /* best effort */
+        }
+        resolve(result);
+      };
+      const timer = setTimeout(() => {
+        log(
+          `checkPreApproved timed out after ${PRE_APPROVED_QUERY_TIMEOUT_MS}ms (agent=${agentName}) — failing closed`,
+        );
+        done(false);
+      }, PRE_APPROVED_QUERY_TIMEOUT_MS);
+
+      client.on("connect", () => {
+        try {
+          client.write(
+            JSON.stringify({
+              type: "check_pre_approved",
+              agentName,
+              correlationId,
+              unifiedDiff,
+            }) + "\n",
+          );
+        } catch (err) {
+          log(
+            `check_pre_approved write failed (agent=${agentName}): ${(err as Error).message} — failing closed`,
+          );
+          done(false);
+        }
+      });
+
+      client.on("data", (chunk) => {
+        buffer += chunk.toString("utf8");
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(line);
+          } catch {
+            // Unknown/garbled reply → fail closed.
+            done(false);
+            return;
+          }
+          const obj = parsed as Record<string, unknown>;
+          if (
+            obj.type === "pre_approved_result" &&
+            obj.correlationId === correlationId
+          ) {
+            done(obj.preApproved === true);
+            return;
+          }
+          // Any other message type (e.g. an old gateway echoing an
+          // unsupported-message error, or noise) → fail closed.
+          done(false);
+          return;
+        }
+      });
+
+      client.on("error", (err) => {
+        log(
+          `checkPreApproved socket error (agent=${agentName}): ${err.message} — failing closed`,
+        );
+        done(false);
+      });
+      client.on("close", () => done(false));
+    });
+  }
 
   async requestApproval(req: ApprovalRequest): Promise<ApprovalResult> {
     const sockPath = this.opts.resolveGatewaySocket(req.agentName);

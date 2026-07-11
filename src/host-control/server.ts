@@ -2240,45 +2240,118 @@ export class HostdServer {
       );
       return await pending;
     }
+    // Everything from the pre-approval query through the apply is wrapped in a
+    // single deduped promise, registered SYNCHRONOUSLY into
+    // `inflightConfigProposals` before the first `await` — so concurrent
+    // identical proposals collapse onto ONE card + ONE apply. (The
+    // pre-approval query below is async, so it MUST NOT sit between the dedupe
+    // `get` above and this `set`, or two concurrent identicals could each post
+    // a card.)
+    const run = this.runConfigProposeRateThenApply(
+      req,
+      caller,
+      callerName,
+      configPath,
+      verdict.postApplyContent,
+      started,
+    );
+    this.inflightConfigProposals.set(dedupeKey, run);
+    try {
+      return await run;
+    } finally {
+      this.inflightConfigProposals.delete(dedupeKey);
+    }
+  }
+
+  /**
+   * The pre-approval-bypass + rate-limit + audit + approval/apply stages of
+   * `config_propose_edit`, wrapped so the whole thing rides ONE deduped
+   * in-flight promise (the caller registers it synchronously). Split out from
+   * `handleConfigProposeEdit` because the pre-approval query (#2975 Stage 2) is
+   * async and must run INSIDE the deduped promise, not between the dedupe
+   * lookup and its registration.
+   */
+  private async runConfigProposeRateThenApply(
+    req: Extract<HostdRequest, { op: "config_propose_edit" }>,
+    caller: SocketIdentity,
+    callerName: string,
+    configPath: string,
+    postApply: string,
+    started: number,
+  ): Promise<HostdResponse> {
+    // ── Pre-approval bypass (#2975 Stage 2) ─────────────────────────
+    // Before the rate limit, ask the gateway whether this EXACT (agent, diff)
+    // pair is already operator-consented — i.e. it byte-matches a correlation
+    // the gateway pre-registered when the operator tapped Approve on a
+    // mental-model proposal (or "🔁 Always allow"). That persist posts NO card
+    // and consumes zero operator attention, yet was subject to the same 3/hour
+    // bucket (issue #2975 — an approved change silently lost). When (and only
+    // when) the gateway answers affirmatively, we skip BOTH the rate-limit
+    // enforcement AND its bucket count for this call.
+    //
+    // FAIL CLOSED: the query is a read-only optimisation. Any non-answer,
+    // error, unknown/unsupported-message reply, or timeout (an old gateway
+    // during a mixed-version roll) resolves `false` inside the gateway adapter
+    // — so we fall through to today's EXACT behaviour (rate limit applies; then
+    // Stage 1's gateway retry backstop covers the approved-but-throttled
+    // persist). A hostd built with this check but wired to a gateway/stub that
+    // lacks `checkPreApproved` is the same fail-closed default.
+    let preApproved = false;
+    try {
+      if (this.opts.approvalGateway!.checkPreApproved) {
+        preApproved = await this.opts.approvalGateway!.checkPreApproved(
+          callerName,
+          req.args.unified_diff,
+        );
+      }
+    } catch {
+      // Defensive: the adapter already fails closed, but never let a query
+      // fault take down the config-edit path.
+      preApproved = false;
+    }
     // ── Server-side rate limit (circuit-breaker) ────────────────────
     // A looping agent that re-fires DISTINCT diffs (any whitespace/context
-    // drift defeats the byte-exact dedup above) would otherwise post a
-    // fresh operator card every time. Throttle per-caller via the existing
+    // drift defeats the byte-exact dedup) would otherwise post a fresh operator
+    // card every time. Throttle per-caller via the existing
     // `config_edit_rate_per_hour` config field so the operator sees at most
-    // N cards/hour from any one agent. (#config-edit-hardening)
-    const rate = this.checkConfigEditRate(callerName, Date.now());
-    if (!rate.ok) {
-      const retryAtIso = new Date(rate.retryAtMs).toISOString();
-      process.stderr.write(
-        `hostd: config_propose_edit — RATE-LIMITED ${callerName} ` +
-          `(>${rate.limit}/hour); next slot ${retryAtIso}\n`,
-      );
-      // Leave a trail so the operator can retroactively see the throttle.
-      void this.appendAuditRow({
-        ts: new Date().toISOString(),
-        op: "config_propose_edit",
-        phase: "rate_limited",
-        request_id: req.request_id,
-        caller:
-          caller.kind === "agent"
-            ? { kind: "agent", name: caller.name }
-            : { kind: "operator" },
-        result: "denied",
-        exit_code: null,
-        duration_ms: Date.now() - started,
-        error: `E_RATE_LIMITED: >${rate.limit} config_propose_edit cards/hour`,
-      });
-      return err(
-        "E_RATE_LIMITED",
-        `config_propose_edit rate limit exceeded (max ${rate.limit}/hour for this agent)`,
-      )
-        .why(`next slot opens at ${retryAtIso}`)
-        .fixRetryAfter(retryAtIso)
-        .op("config_propose_edit")
-        .caller(caller.kind === "agent" ? "agent" : "operator")
-        .agentName(caller.kind === "agent" ? caller.name : undefined)
-        .asDenied()
-        .build(req.request_id, Date.now() - started);
+    // N cards/hour from any one agent. (#config-edit-hardening) A pre-approved
+    // persist skips this entirely — no enforcement AND no bucket count (we
+    // never call checkConfigEditRate, so no timestamp is recorded).
+    if (!preApproved) {
+      const rate = this.checkConfigEditRate(callerName, Date.now());
+      if (!rate.ok) {
+        const retryAtIso = new Date(rate.retryAtMs).toISOString();
+        process.stderr.write(
+          `hostd: config_propose_edit — RATE-LIMITED ${callerName} ` +
+            `(>${rate.limit}/hour); next slot ${retryAtIso}\n`,
+        );
+        // Leave a trail so the operator can retroactively see the throttle.
+        void this.appendAuditRow({
+          ts: new Date().toISOString(),
+          op: "config_propose_edit",
+          phase: "rate_limited",
+          request_id: req.request_id,
+          caller:
+            caller.kind === "agent"
+              ? { kind: "agent", name: caller.name }
+              : { kind: "operator" },
+          result: "denied",
+          exit_code: null,
+          duration_ms: Date.now() - started,
+          error: `E_RATE_LIMITED: >${rate.limit} config_propose_edit cards/hour`,
+        });
+        return err(
+          "E_RATE_LIMITED",
+          `config_propose_edit rate limit exceeded (max ${rate.limit}/hour for this agent)`,
+        )
+          .why(`next slot opens at ${retryAtIso}`)
+          .fixRetryAfter(retryAtIso)
+          .op("config_propose_edit")
+          .caller(caller.kind === "agent" ? "agent" : "operator")
+          .agentName(caller.kind === "agent" ? caller.name : undefined)
+          .asDenied()
+          .build(req.request_id, Date.now() - started);
+      }
     }
     // ── Audit at card-post time (item 5) ────────────────────────────
     // config_propose_edit otherwise writes NO audit row until the apply
@@ -2298,21 +2371,18 @@ export class HostdServer {
       result: "started",
       exit_code: null,
       duration_ms: Date.now() - started,
+      // #2975 Stage 2 — mark the persist that bypassed the rate limit because
+      // the gateway confirmed it was already operator-consented.
+      ...(preApproved ? { pre_approved: true } : {}),
     });
-    const run = this.runConfigProposeApprovalAndApply(
+    return await this.runConfigProposeApprovalAndApply(
       req,
       caller,
       callerName,
       configPath,
-      verdict.postApplyContent,
+      postApply,
       started,
     );
-    this.inflightConfigProposals.set(dedupeKey, run);
-    try {
-      return await run;
-    } finally {
-      this.inflightConfigProposals.delete(dedupeKey);
-    }
   }
 
   /** In-flight config_propose_edit proposals, keyed by caller+diff hash. */
