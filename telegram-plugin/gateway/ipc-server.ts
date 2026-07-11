@@ -398,6 +398,7 @@ export function validateClientMessage(msg: unknown): msg is ClientToGateway {
         || (m.requestId as string).length === 0
         || (m.requestId as string).length > 64) return false;
       if (m.outcome !== "applied"
+        && m.outcome !== "aborted_config_changed"
         && m.outcome !== "reconcile_failed_rolled_back") return false;
       if (m.detail !== undefined
         && (typeof m.detail !== "string"

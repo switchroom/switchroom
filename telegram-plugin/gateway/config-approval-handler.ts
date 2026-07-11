@@ -474,7 +474,12 @@ export async function handleRequestConfigFinalize(
   const body =
     msg.outcome === "applied"
       ? `✅ **Applied**${msg.detail ? `\n${escapeMarkdown(msg.detail)}` : ""}${liveNote}`
-      : `⚠️ **Reconcile failed; rolled back**${msg.detail ? `\n${escapeMarkdown(msg.detail)}` : ""}`;
+      : msg.outcome === "aborted_config_changed"
+        ? // Nothing was written: the config drifted during the approval window
+          // and the apply aborted rather than land a different effect than the
+          // operator approved (#3121 follow-up).
+          `🚫 **Not applied — config changed since proposal**${msg.detail ? `\n${escapeMarkdown(msg.detail)}` : ""}`
+        : `⚠️ **Reconcile failed; rolled back**${msg.detail ? `\n${escapeMarkdown(msg.detail)}` : ""}`;
   try {
     // Finalize is terminal — strip the keyboard so the buttons are gone.
     await deps.editCard({

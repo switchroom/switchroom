@@ -33,7 +33,7 @@ export interface ApprovalResult {
   denySource?: "operator" | "dispatch_failure";
   /** Update the approval card with the apply outcome. */
   finalize: (outcome: {
-    outcome: "applied" | "reconcile_failed_rolled_back";
+    outcome: "applied" | "aborted_config_changed" | "reconcile_failed_rolled_back";
     detail?: string;
     /** Agents that must restart for the edit to go live (empty if fleetWide). */
     affectedAgents?: string[];
@@ -205,7 +205,7 @@ export class SocketApprovalGateway implements ApprovalGateway {
       const log = this.opts.log ?? (() => {});
 
       const finalize = async (outcome: {
-        outcome: "applied" | "reconcile_failed_rolled_back";
+        outcome: "applied" | "aborted_config_changed" | "reconcile_failed_rolled_back";
         detail?: string;
         affectedAgents?: string[];
         fleetWide?: boolean;

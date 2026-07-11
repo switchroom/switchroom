@@ -176,12 +176,16 @@ describe("validateConfigEdit — deep-path header actually APPLIES (#2605 regres
   // because `git apply -p1` stripped only `a/` and looked for
   // `state/config/switchroom.yaml`, which doesn't exist in the scratch dir.
   it("applies a diff whose headers carry the full config path", () => {
+    // Context lines are required since the #3121 follow-up banned
+    // zero-context hunks (relocation guard).
     const deepPathDiff =
       "--- a/state/config/switchroom.yaml\n" +
       "+++ b/state/config/switchroom.yaml\n" +
-      "@@ -4 +4 @@\n" +
+      "@@ -3,3 +3,3 @@\n" +
+      " telegram:\n" +
       '-  bot_token: "x"\n' +
-      '+  bot_token: "y"\n';
+      '+  bot_token: "y"\n' +
+      '   forum_chat_id: "1"\n';
     const result = validateConfigEdit({
       configPath,
       targetPath: "/state/config/switchroom.yaml",
@@ -198,9 +202,11 @@ describe("validateConfigEdit — deep-path header actually APPLIES (#2605 regres
     const bareDiff =
       "--- a/switchroom.yaml\n" +
       "+++ b/switchroom.yaml\n" +
-      "@@ -4 +4 @@\n" +
+      "@@ -3,3 +3,3 @@\n" +
+      " telegram:\n" +
       '-  bot_token: "x"\n' +
-      '+  bot_token: "z"\n';
+      '+  bot_token: "z"\n' +
+      '   forum_chat_id: "1"\n';
     const result = validateConfigEdit({
       configPath,
       targetPath: "/state/config/switchroom.yaml",

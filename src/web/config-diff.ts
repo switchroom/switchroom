@@ -2,7 +2,7 @@
  * Generate a git-compatible unified diff for a switchroom.yaml edit.
  *
  * hostd's `config_propose_edit` applies the proposed patch with
- * `git apply --whitespace=nowarn --recount --unidiff-zero` (trying
+ * `git apply --whitespace=nowarn --recount` (trying
  * `-p1` then `-p0`) — see src/host-control/config-edit-validator.ts. To
  * guarantee the patch round-trips, we GENERATE it with the same tool
  * family: `git diff --no-index`. The two versions are written to
