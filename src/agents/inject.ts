@@ -54,6 +54,19 @@ export interface InjectCommandMeta {
   /** True when injecting this command opens an interactive dialog/picker
    * that must be dismissed with Escape after capture. */
   dialog?: boolean;
+  /**
+   * Whether this command may carry arguments after the bare verb.
+   *
+   * The raw inject primitive types the WHOLE string into the pane, so a
+   * bare-verb allowlist match on the first token alone let mutating
+   * setter forms slip through (`/memory edit`, `/model claude-sonnet-4-6`
+   * — the latter switches the live model). Almost every injectable command
+   * is a read-only display verb that takes no arguments, so this defaults
+   * to a hard `false`: `validateInjectCommand` rejects anything after the
+   * bare verb. Set `true` ONLY where an argument form is a sanctioned,
+   * non-destructive path (currently just `/model` — see its entry).
+   */
+  argsAllowed: boolean;
 }
 
 /**
@@ -67,10 +80,10 @@ export const INJECT_COMMANDS: ReadonlyMap<string, InjectCommandMeta> = new Map([
   // Settings/Status tab-bar dialog for /status; a hooks dialog for /hooks).
   // injectSlashCommandWith sends Escape after capturing the dialog content
   // to dismiss the modal and restore a clean ❯ prompt. (#2566)
-  ["/cost", { description: "Show session cost", expectsOutput: true, dialog: true }],
-  ["/status", { description: "Show session status", expectsOutput: true, dialog: true }],
-  ["/usage", { description: "Show plan quota", expectsOutput: true, dialog: true }],
-  ["/hooks", { description: "List configured hooks", expectsOutput: true, dialog: true }],
+  ["/cost", { description: "Show session cost", expectsOutput: true, dialog: true, argsAllowed: false }],
+  ["/status", { description: "Show session status", expectsOutput: true, dialog: true, argsAllowed: false }],
+  ["/usage", { description: "Show plan quota", expectsOutput: true, dialog: true, argsAllowed: false }],
+  ["/hooks", { description: "List configured hooks", expectsOutput: true, dialog: true, argsAllowed: false }],
   // #2566 — `/memory` is raw-injected (no dedicated driver) and on Claude
   // Code v2.1.185+ opens an interactive memory-file picker. It rides the
   // same dialog:true Escape-dismiss path: inject types `/memory` + Enter
@@ -78,7 +91,25 @@ export const INJECT_COMMANDS: ReadonlyMap<string, InjectCommandMeta> = new Map([
   // picker content, then sends Escape to CANCEL. No row is ever selected
   // (inject sends no arrow keys / no second Enter), so the dismiss is
   // side-effect-free — same safety profile as the /cost & /status dialogs.
-  ["/memory", { description: "Open memory picker", expectsOutput: true, dialog: true }],
+  ["/memory", { description: "Open memory picker", expectsOutput: true, dialog: true, argsAllowed: false }],
+  // Verified read-only additions (disposable TUI probe, claude v2.1.205,
+  // 2026-07-11).
+  // `/help` opens a tabbed help dialog ("Help · General · Commands …")
+  // with an "Esc to cancel" trailer — same dialog family as /cost, so it
+  // rides the dialog:true Escape-dismiss path. Read-only (command
+  // discovery), no arguments.
+  ["/help", { description: "Show help / command discovery", expectsOutput: true, dialog: true, argsAllowed: false }],
+  // `/context` renders the context-window usage breakdown INLINE (no modal,
+  // returns straight to the ❯ prompt) — so NO dialog flag. Read-only; the
+  // `/context all` expand form is an argument we deliberately don't allow
+  // (bare display only).
+  ["/context", { description: "Show context window usage", expectsOutput: true, argsAllowed: false }],
+  // `/release-notes` opens an interactive version PICKER ("Select a version
+  // to view its notes … Enter to confirm · Esc to cancel"), same shape as
+  // the /memory picker — dialog:true so the modal is Escape-dismissed after
+  // the version list is captured. inject never selects a row, so the
+  // dismiss is side-effect-free. Read-only, no arguments.
+  ["/release-notes", { description: "Show release-notes version list", expectsOutput: true, dialog: true, argsAllowed: false }],
   // #2566 — `/model` stays on the allowlist with NO dialog flag. It is
   // NOT raw-injected from Telegram: the dedicated driver
   // (telegram-plugin/gateway/model-command.ts) intercepts every `/model`
@@ -87,7 +118,17 @@ export const INJECT_COMMANDS: ReadonlyMap<string, InjectCommandMeta> = new Map([
   // picker. The set path depends on `/model` being allowlisted (enforced by
   // model-command.test.ts "inject allowlist contract"), so it must not move
   // to the blocklist and needs no Escape handling.
-  ["/model", { description: "Open model picker", expectsOutput: true }],
+  // argsAllowed:true — the ONLY entry that permits arguments, and it MUST.
+  // Since #2566 the dedicated Telegram driver
+  // (telegram-plugin/gateway/model-command.ts) injects `/model <alias|id>`
+  // WITH AN ARGUMENT as the sanctioned session-switch path — a direct set
+  // that opens no picker. That set is gated, busy-checked, and recorded by
+  // the driver before it ever reaches this primitive. Gating args off here
+  // (as the original #730 issue suggested) would break every typed `/model`
+  // switch; the model-command.test.ts "inject allowlist contract" pins that
+  // `/model` stays injectable, and the driver path relies on the arg form.
+  // So `/model` keeps args allowed by design.
+  ["/model", { description: "Open model picker", expectsOutput: true, argsAllowed: true }],
   // #2471 — `/effort` was previously listed here as an allowlisted inject,
   // but injecting it surfaces a blocking "Change effort level? 1. Yes /
   // 2. No" confirmation modal that an agent/headless session can't answer,
@@ -99,6 +140,7 @@ export const INJECT_COMMANDS: ReadonlyMap<string, InjectCommandMeta> = new Map([
       description: "Clear session screen",
       expectsOutput: false,
       silentNote: "context cleared — fresh slate",
+      argsAllowed: false,
     },
   ],
   [
@@ -107,6 +149,7 @@ export const INJECT_COMMANDS: ReadonlyMap<string, InjectCommandMeta> = new Map([
       description: "Compact conversation history",
       expectsOutput: false,
       silentNote: "compaction runs silently",
+      argsAllowed: false,
     },
   ],
 ]);
@@ -132,6 +175,21 @@ export const INJECT_BLOCKED: ReadonlyMap<string, InjectBlockedMeta> = new Map([
   ["/logout", { reason: "would terminate the agent's auth session" }],
   ["/exit", { reason: "would kill the agent process" }],
   ["/quit", { reason: "would kill the agent process" }],
+  // #730 — defensive blocklist expansion. None of these are read-only
+  // display verbs: each either mutates local state, opens an interactive
+  // modal an agent/headless session can't answer (wedging the pane like
+  // #2471's /effort), or performs a network/setup action. Listed here so
+  // an operator gets the specific `blocked` message + reason rather than
+  // the generic `not_allowed`.
+  ["/upgrade", { reason: "mutates the Claude Code installation" }],
+  ["/init", { reason: "generates/overwrites CLAUDE.md and runs a model turn" }],
+  ["/mcp", { reason: "opens an interactive MCP server management dialog" }],
+  ["/permissions", { reason: "opens an interactive permissions editor that mutates tool policy" }],
+  ["/install-github-app", { reason: "runs a network/OAuth install flow" }],
+  ["/add-dir", { reason: "mutates the session's working-directory set" }],
+  ["/terminal-setup", { reason: "mutates terminal keybinding configuration" }],
+  ["/privacy-settings", { reason: "opens an interactive privacy-settings dialog" }],
+  ["/bug", { reason: "submits a bug report over the network" }],
   // #2471 — `/effort` opens a blocking "Change effort level? 1. Yes / 2.
   // No" confirmation modal whenever the session has a cached conversation.
   // The RAW inject primitive types the command and walks away, leaving the
@@ -161,6 +219,7 @@ export const INJECT_BLOCKLIST: ReadonlySet<string> = new Set(INJECT_BLOCKED.keys
 export type InjectErrorCode =
   | "not_allowed"
   | "blocked"
+  | "args_not_allowed"
   | "session_missing"
   | "invalid"
   | "timeout"
@@ -251,11 +310,24 @@ export function validateInjectCommand(command: string): string {
       `${bare} is explicitly blocked from inject (${blockedMeta.reason}).`,
     );
   }
-  if (!INJECT_COMMANDS.has(bare)) {
+  const meta = INJECT_COMMANDS.get(bare);
+  if (!meta) {
     const allowed = [...INJECT_COMMANDS.keys()].sort().join(", ");
     throw new InjectError(
       "not_allowed",
       `${bare} is not in the inject allowlist. Allowed: ${allowed}`,
+    );
+  }
+  // Arg-gate (#730). The raw inject types the WHOLE string into the pane,
+  // so a bare-verb allowlist match let mutating setter forms slip through
+  // (`/memory edit`, `/model claude-sonnet-4-6`). Reject anything after the
+  // bare verb unless the command's metadata explicitly permits arguments
+  // (only `/model`, whose arg form is the sanctioned session-switch path).
+  const hasArgs = trimmed.split(/\s+/).length > 1;
+  if (hasArgs && !meta.argsAllowed) {
+    throw new InjectError(
+      "args_not_allowed",
+      `args not permitted for ${bare} — inject the bare verb only`,
     );
   }
   return bare;
