@@ -105,13 +105,20 @@ describe("_switchroom_log_rotator — #3025 size-based copytruncate", () => {
     // and appends a sentinel AFTER the rotate window. copytruncate keeps
     // that fd pointing at the (now-truncated) live inode, so the sentinel
     // must land in the live file — not vanish into an orphaned inode.
+    // Timing margins are deliberately wide (interval 1s, sentinel at
+    // t+3s, kill at t+5s): with the old t+2s sentinel a first check
+    // that slipped past ~2s under CI load rotated AFTER the sentinel
+    // was written and truncated it away — a pure-timing flake. Three
+    // full intervals of slack before the sentinel makes that slip
+    // practically impossible while keeping the test well under the
+    // 15s timeout.
     runBash(
       `exec 9>> ${JSON.stringify(log)}
        _switchroom_log_rotator ${JSON.stringify(log)} & RPID=$!
-       sleep 2
+       sleep 3
        echo "SENTINEL_AFTER_ROTATE" >&9
        exec 9>&-
-       sleep 1; kill "$RPID" 2>/dev/null; wait "$RPID" 2>/dev/null; true`,
+       sleep 2; kill "$RPID" 2>/dev/null; wait "$RPID" 2>/dev/null; true`,
       {
         SWITCHROOM_SIDECAR_LOG_MAX_BYTES: "1000",
         SWITCHROOM_SIDECAR_LOG_ROTATE_INTERVAL_SEC: "1",

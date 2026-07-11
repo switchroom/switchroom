@@ -208,6 +208,12 @@ x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:
         if cp "$_logfile" "$_logfile.1" 2>/dev/null; then
           : > "$_logfile"
           echo "[supervise] rotated $_logfile (${_size} bytes > ${_max} cap) → ${_logfile}.1" >> "$_logfile"
+        else
+          # cp failed (e.g. ENOSPC — exactly when rotation matters most).
+          # Fall back to truncate-without-backup: dropping the .1 backup
+          # beats a rotator that can never free space (#3025 review).
+          : > "$_logfile"
+          echo "[supervise] rotated $_logfile (${_size} bytes > ${_max} cap) WITHOUT backup — cp to ${_logfile}.1 failed (disk full?)" >> "$_logfile"
         fi
       fi
     done
@@ -219,6 +225,10 @@ x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:
     # per supervised sidecar; lives for the container lifetime alongside
     # the respawn loop below.
     _switchroom_log_rotator "$_logfile" &
+    # Record the rotator's pid so the oneshot-ok return path below can
+    # reap it — otherwise every completed one-shot sidecar leaks a
+    # background sleep loop for the container lifetime (#3025 review).
+    local _rotator_pid=$!
     # Optional `--oneshot-ok` flag (must directly follow the logfile):
     # marks a sidecar that can LEGITIMATELY complete. For such a sidecar
     # a clean exit 0 means "job done" → stop supervising, no respawn.
@@ -263,6 +273,9 @@ x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:
       # below — a crash always self-heals.
       if [ $_oneshot_ok -eq 1 ] && [ $_exit -eq 0 ]; then
         echo "[supervise] $_name completed cleanly (exit 0) — one-shot-ok, not respawning." >> "$_logfile"
+        # The sidecar is done — its log stops growing, so reap the
+        # rotator instead of leaking its sleep loop forever (#3025).
+        kill "$_rotator_pid" 2>/dev/null || true
         return 0
       fi
       # A run that stayed up for at least the backoff cap means the

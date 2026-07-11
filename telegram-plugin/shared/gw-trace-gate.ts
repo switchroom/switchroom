@@ -20,8 +20,8 @@
  * decision behind a single debug env flag so operators can turn the full
  * firehose back on when actually debugging the delivery/poll path.
  *
- * Flag: set `SWITCHROOM_GW_TRACE=1` (or `true`) to restore every trace
- * line unconditionally. Unset / any other value → zero-signal polling
+ * Flag: set `SWITCHROOM_GW_TRACE=1` (or `true`/`yes`/`on`, any case) to
+ * restore every trace line unconditionally. Unset / any other value → zero-signal polling
  * success + idle-tick lines are suppressed, while ALL error lines, all
  * non-poll methods (sendMessage, editMessageText, ...), and every tick or
  * event that produced a real effect or state change are still emitted.
@@ -39,7 +39,8 @@
  * flag variants must be testable via explicit arguments.
  */
 export function computeGwTraceVerbose(flag: string | undefined): boolean {
-  return flag === '1' || flag === 'true'
+  const v = (flag ?? '').trim().toLowerCase()
+  return v === '1' || v === 'true' || v === 'yes' || v === 'on'
 }
 
 /** True when the operator opted into the full gateway trace firehose. */

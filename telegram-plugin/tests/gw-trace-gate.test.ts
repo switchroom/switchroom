@@ -25,13 +25,14 @@ describe('computeGwTraceVerbose — env flag parsing', () => {
     expect(computeGwTraceVerbose(undefined)).toBe(false)
   })
 
-  it('opts IN only on "1" or "true"', () => {
-    expect(computeGwTraceVerbose('1')).toBe(true)
-    expect(computeGwTraceVerbose('true')).toBe(true)
+  it('opts IN on the truthy set, case-insensitively (1/true/yes/on)', () => {
+    for (const v of ['1', 'true', 'TRUE', 'True', 'yes', 'Yes', 'YES', 'on', 'ON', 'On', ' 1', 'true ']) {
+      expect(computeGwTraceVerbose(v)).toBe(true)
+    }
   })
 
   it('stays OFF for falsey / unrecognized values', () => {
-    for (const v of ['', '0', 'false', 'yes', 'on', 'TRUE', ' 1', 'x']) {
+    for (const v of ['', '0', 'false', 'FALSE', 'off', 'No', 'x', 'enabled']) {
       expect(computeGwTraceVerbose(v)).toBe(false)
     }
   })
