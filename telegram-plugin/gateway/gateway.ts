@@ -341,6 +341,7 @@ import {
 } from '../telegram-button-constraints.js'
 import {
   wrapAgentCallbacks,
+  redactAgentKeyboard,
   parseAgentCallback,
   extractAgentButtonMeta,
   keyboardIsSingleUse,
@@ -12561,8 +12562,18 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
         .join('; ')
       throw new Error(`inline_keyboard validation failed: ${summary}`)
     }
-    replyButtonMeta = extractAgentButtonMeta(rawKeyboard)
-    replyMarkup = { inline_keyboard: wrapAgentCallbacks(rawKeyboard) }
+    // #3148 fast-follow: mask any secret an agent put in a visible button
+    // `text` label, its `ack_text` toast, or a `copy_text.text` clipboard
+    // payload BEFORE the keyboard is sent — the same outbound scrub the reply
+    // `text` body uses. `callback_data` (the routing key) is left exact.
+    // Feeding BOTH the meta extraction and the callback wrap from the redacted
+    // copy means the stashed toast, the tap echo (`button_text`), and the
+    // "✅ You chose: <label>" annotation (#789) all read already-masked bytes.
+    const redactedKeyboard = redactAgentKeyboard(rawKeyboard, (s) =>
+      redactOutboundText(s, 'reply_inline_keyboard'),
+    )
+    replyButtonMeta = extractAgentButtonMeta(redactedKeyboard)
+    replyMarkup = { inline_keyboard: wrapAgentCallbacks(redactedKeyboard) }
   }
 
   // on-demand voice: append a single '🔊 Listen' button that synthesizes the

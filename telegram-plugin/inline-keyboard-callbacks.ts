@@ -30,6 +30,7 @@
 
 import {
   validateInlineKeyboard,
+  TELEGRAM_BUTTON_LIMITS,
   type AnyButton,
   type ButtonValidationError,
 } from './telegram-button-constraints.js'
@@ -110,6 +111,99 @@ export function wrapAgentCallbacks(keyboard: AnyButton[][]): AnyButton[][] {
       }
       cleaned.callback_data = `${AGENT_CALLBACK_PREFIX}${raw}`
       return cleaned
+    }),
+  )
+}
+
+/**
+ * Redact agent-authored free-text on an inline keyboard BEFORE it is sent to
+ * Telegram (#3148 fast-follow secret-scrub coverage). `wrapAgentCallbacks`
+ * rewrites only `callback_data`; the visible `text` label, the `ack_text`
+ * toast, and any `copy_text.text` clipboard payload pass through VERBATIM. An
+ * agent that puts a secret in any of those transmits it unmasked, and it
+ * resurfaces on tap — the label is echoed back (`button_text`), re-rendered in
+ * the "✅ You chose: <label>" annotation (#789), and `ack_text` is shown as the
+ * toast. `switch_inline_query` / `switch_inline_query_current_chat` /
+ * `switch_inline_query_chosen_chat.query` are also agent-authored free text
+ * that Telegram pastes into a chat's input box on tap (the current chat for
+ * the `_current_chat` variant, a user-picked chat for `_chosen_chat` — both
+ * user-visible), so they carry the same leak class. Route every one of these free-text fields
+ * through the SAME outbound redactor the reply `text` body uses, at the
+ * outbound boundary, so every downstream resurface reads already-masked bytes.
+ *
+ * `callback_data` is the routing key and is NEVER touched — redacting it would
+ * break tap round-tripping. Button structure/order is preserved; the redactor
+ * (`redact()`) only replaces detected secret byte-ranges with a non-empty
+ * marker, so it never empties a label (the non-empty-text invariant holds).
+ * Returns a fresh keyboard; does not mutate the input. `redactFn` is injected
+ * so this stays pure + unit-testable and carries no gateway import cycle.
+ *
+ * Only agent-authored keyboards flow through here (the `reply` tool path);
+ * framework-internal keyboards (approval cards, vault wizard, model menus) are
+ * built separately and are NOT redacted by this function.
+ */
+export function redactAgentKeyboard(
+  keyboard: AnyButton[][],
+  redactFn: (s: string) => string,
+): AnyButton[][] {
+  // The keyboard is validated for length BEFORE redaction, but the redaction
+  // marker (`[REDACTED:...]`) can be longer than the secret it replaces, so a
+  // field that was within a Telegram cap can exceed it after masking. An
+  // over-limit button field makes sendMessage 400 → the WHOLE reply is dropped
+  // (worse than the leak we just closed), so clamp each masked free-text field
+  // to its cap. Truncating a marker is harmless — it's already non-secret.
+  const clamp = (s: string, max: number): string =>
+    s.length > max ? s.slice(0, max) : s
+  return keyboard.map((row) =>
+    row.map((btn) => {
+      const out: AnyButton = { ...btn }
+      if (typeof out.text === 'string') {
+        out.text = clamp(redactFn(out.text), TELEGRAM_BUTTON_LIMITS.TEXT_MAX)
+      }
+      // ack_text is a switchroom-side toast (answerCallbackQuery), not a
+      // sendMessage field, so an over-length value can't drop the reply — no
+      // clamp needed, but redact it all the same.
+      if (typeof out.ack_text === 'string') out.ack_text = redactFn(out.ack_text)
+      // switch_inline_query* paste agent free text into a chat input box on tap
+      // — same leak class as the label. URL-class fields (url/web_app/login_url)
+      // are deliberately left exact: a [REDACTED] marker would corrupt a URL.
+      const siq = (out as { switch_inline_query?: unknown }).switch_inline_query
+      if (typeof siq === 'string') {
+        (out as { switch_inline_query?: string }).switch_inline_query = clamp(
+          redactFn(siq), TELEGRAM_BUTTON_LIMITS.SWITCH_INLINE_QUERY_MAX)
+      }
+      const siqc = (out as { switch_inline_query_current_chat?: unknown })
+        .switch_inline_query_current_chat
+      if (typeof siqc === 'string') {
+        (out as { switch_inline_query_current_chat?: string })
+          .switch_inline_query_current_chat = clamp(
+            redactFn(siqc), TELEGRAM_BUTTON_LIMITS.SWITCH_INLINE_QUERY_MAX)
+      }
+      // switch_inline_query_chosen_chat.query is the third variant: agent free
+      // text pasted into a user-picked chat's input box on tap — same leak class.
+      const cc = (out as { switch_inline_query_chosen_chat?: unknown })
+        .switch_inline_query_chosen_chat
+      if (cc != null && typeof cc === 'object' &&
+          typeof (cc as { query?: unknown }).query === 'string') {
+        (out as { switch_inline_query_chosen_chat?: Record<string, unknown> })
+          .switch_inline_query_chosen_chat = {
+            ...(cc as Record<string, unknown>),
+            query: clamp(
+              redactFn((cc as { query: string }).query),
+              TELEGRAM_BUTTON_LIMITS.SWITCH_INLINE_QUERY_MAX),
+          }
+      }
+      const ct = out.copy_text
+      if (ct != null && typeof ct === 'object' &&
+          typeof (ct as { text?: unknown }).text === 'string') {
+        out.copy_text = {
+          ...(ct as Record<string, unknown>),
+          text: clamp(
+            redactFn((ct as { text: string }).text),
+            TELEGRAM_BUTTON_LIMITS.COPY_TEXT_MAX),
+        }
+      }
+      return out
     }),
   )
 }

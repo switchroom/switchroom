@@ -14,6 +14,7 @@ import {
   AGENT_CALLBACK_PREFIX,
   AGENT_CALLBACK_DATA_MAX,
   wrapAgentCallbacks,
+  redactAgentKeyboard,
   parseAgentCallback,
   validateAndWrapAgentKeyboard,
   extractAgentButtonMeta,
@@ -22,6 +23,7 @@ import {
   escapeHtmlEntities,
   applyTapAnnotationEdit,
 } from '../inline-keyboard-callbacks.js'
+import { redact } from '../secret-detect/redact.js'
 
 describe('inline-keyboard-callbacks (#271)', () => {
   describe('AGENT_CALLBACK_DATA_MAX', () => {
@@ -429,6 +431,168 @@ describe('inline-keyboard-callbacks (#271)', () => {
         'whatever',
       )
       expect(outcome).toBe('failed')
+    })
+  })
+
+  // ─── #3148 fast-follow: agent-authored keyboard secret scrub ──────────────
+  //
+  // wrapAgentCallbacks rewrites ONLY callback_data; the visible `text` label,
+  // the `ack_text` toast, and any `copy_text.text` clipboard payload passed
+  // through VERBATIM before this fix — so a secret an agent placed in any of
+  // them transmitted to Telegram unmasked and resurfaced on tap (echo, toast,
+  // "✅ You chose" annotation). redactAgentKeyboard masks those three fields at
+  // the outbound boundary using the SAME redact() the reply body uses, while
+  // leaving the routing key (callback_data) exact.
+  describe('redactAgentKeyboard (#3148 fast-follow)', () => {
+    // Assemble the fixture at runtime so this source file never carries a
+    // contiguous token that trips push-protection / secretlint (CLAUDE.md).
+    const GITHUB_PAT = 'ghp' + '_' + '16C7e42F292c6912E7710c838347Ae178B4a'
+
+    it('masks a secret in a button `text` label in the sent payload (real redact)', () => {
+      const raw = [
+        [{ text: `Use ${GITHUB_PAT}`, callback_data: 'use_token' }],
+      ]
+      // Mirror the gateway pipeline: redact BEFORE wrap.
+      const wrapped = wrapAgentCallbacks(redactAgentKeyboard(raw, redact))
+      const btn = wrapped[0]![0]!
+      // OUTCOME: the label bytes actually shipped to Telegram carry no secret.
+      expect(btn.text as string).not.toContain(GITHUB_PAT)
+      expect(btn.text as string).toContain('[REDACTED')
+      expect((btn.text as string).length).toBeGreaterThan(0)
+      // Routing key untouched (only the agent: namespace prefix was added).
+      expect(btn.callback_data).toBe(`${AGENT_CALLBACK_PREFIX}use_token`)
+    })
+
+    it('masks a secret in `ack_text` in the extracted per-button meta (real redact)', () => {
+      const raw = [
+        [{ text: 'Deploy', callback_data: 'deploy', ack_text: `token ${GITHUB_PAT}` }],
+      ]
+      // Mirror the gateway: extract meta from the REDACTED keyboard so the
+      // stashed toast (shown via answerCallbackQuery on tap) is masked.
+      const meta = extractAgentButtonMeta(redactAgentKeyboard(raw, redact))
+      const ack = meta.get('deploy')!.ack_text!
+      expect(ack).not.toContain(GITHUB_PAT)
+      expect(ack).toContain('[REDACTED')
+    })
+
+    it('masks a secret in `copy_text.text` clipboard payload (real redact)', () => {
+      const raw = [
+        [{ text: 'Copy token', callback_data: 'copy', copy_text: { text: GITHUB_PAT } }],
+      ]
+      const [[btn]] = redactAgentKeyboard(raw, redact)
+      const ct = (btn as { copy_text: { text: string } }).copy_text.text
+      expect(ct).not.toContain(GITHUB_PAT)
+      expect(ct).toContain('[REDACTED')
+    })
+
+    it('never empties a label that is ENTIRELY a secret (non-empty invariant)', () => {
+      const raw = [[{ text: GITHUB_PAT, callback_data: 'x' }]]
+      const [[btn]] = redactAgentKeyboard(raw, redact)
+      expect((btn.text as string).length).toBeGreaterThan(0)
+      expect(btn.text as string).not.toContain(GITHUB_PAT)
+    })
+
+    it('leaves a legit (secret-free) label unchanged', () => {
+      const raw = [
+        [{ text: 'Approve PR #547', callback_data: 'approve', ack_text: 'Approved ✓' }],
+        [{ text: 'Hold', callback_data: 'hold' }],
+      ]
+      const out = redactAgentKeyboard(raw, redact)
+      expect(out[0]![0]!.text).toBe('Approve PR #547')
+      expect(out[0]![0]!.ack_text).toBe('Approved ✓')
+      expect(out[1]![0]!.text).toBe('Hold')
+    })
+
+    it('NEVER passes callback_data through the redactor (routing key stays exact)', () => {
+      // A fake redactor that mangles everything it sees; anything the routing
+      // key touched would be corrupted. Proves copy_text/url/callback_data are
+      // handled correctly by field, not blanket-scrubbed.
+      const seen: string[] = []
+      const mangle = (s: string) => {
+        seen.push(s)
+        return `X${s}X`
+      }
+      const raw = [
+        [
+          { text: 'Label', callback_data: 'route_key_do_not_touch', ack_text: 'toast' },
+          { text: 'Link', url: 'https://example.com/keep' },
+          { text: 'Clip', callback_data: 'c2', copy_text: { text: 'secret-clip' } },
+        ],
+      ]
+      const out = redactAgentKeyboard(raw, mangle)
+      // callback_data + url are byte-exact.
+      expect(out[0]![0]!.callback_data).toBe('route_key_do_not_touch')
+      expect(out[0]![1]!.url).toBe('https://example.com/keep')
+      expect(out[0]![2]!.callback_data).toBe('c2')
+      // Only free-text fields were routed through the redactor.
+      expect(out[0]![0]!.text).toBe('XLabelX')
+      expect(out[0]![0]!.ack_text).toBe('XtoastX')
+      expect((out[0]![2]! as { copy_text: { text: string } }).copy_text.text).toBe('Xsecret-clipX')
+      expect(seen).toEqual(['Label', 'toast', 'Link', 'Clip', 'secret-clip'])
+      expect(seen).not.toContain('route_key_do_not_touch')
+      expect(seen).not.toContain('https://example.com/keep')
+      expect(seen).not.toContain('c2')
+    })
+
+    it('masks a secret in switch_inline_query* (pasted into the chat input on tap)', () => {
+      const raw = [
+        [{ text: 'Share', callback_data: 's', switch_inline_query: `key ${GITHUB_PAT}` }],
+        [{
+          text: 'Fill here',
+          callback_data: 'f',
+          switch_inline_query_current_chat: `key ${GITHUB_PAT}`,
+        }],
+      ]
+      const out = redactAgentKeyboard(raw, redact)
+      const siq = (out[0]![0]! as { switch_inline_query: string }).switch_inline_query
+      const siqc = (out[1]![0]! as { switch_inline_query_current_chat: string })
+        .switch_inline_query_current_chat
+      expect(siq).not.toContain(GITHUB_PAT)
+      expect(siq).toContain('[REDACTED')
+      expect(siqc).not.toContain(GITHUB_PAT)
+      expect(siqc).toContain('[REDACTED')
+    })
+
+    it('masks a secret in switch_inline_query_chosen_chat.query', () => {
+      const raw = [[{
+        text: 'Share to…',
+        callback_data: 'cc',
+        switch_inline_query_chosen_chat: { query: `key ${GITHUB_PAT}`, allow_user_chats: true },
+      }]]
+      const [[btn]] = redactAgentKeyboard(raw, redact)
+      const cc = (btn as { switch_inline_query_chosen_chat: { query: string; allow_user_chats?: boolean } })
+        .switch_inline_query_chosen_chat
+      expect(cc.query).not.toContain(GITHUB_PAT)
+      expect(cc.query).toContain('[REDACTED')
+      // sibling sub-fields are preserved
+      expect(cc.allow_user_chats).toBe(true)
+    })
+
+    it('clamps a masked field that the marker pushed over the Telegram cap (reply not dropped)', () => {
+      // A 60-char label (< 64 cap) whose short secret expands under the marker
+      // would exceed 64 and 400-drop the whole reply; the clamp keeps it ≤ cap.
+      const shortSecret = 'AKIAIOSFODNN7EXAMPLE' // 20 chars, AWS-key shaped
+      const label = `${shortSecret} ${'x'.repeat(43)}` // 64 chars total, at the cap
+      const raw = [[{ text: label, callback_data: 'x' }]]
+      const [[btn]] = redactAgentKeyboard(raw, redact)
+      const text = btn.text as string
+      expect(text.length).toBeLessThanOrEqual(64)
+      expect(text).not.toContain(shortSecret)
+    })
+
+    it('preserves keyboard structure, row/column order, and does not mutate input', () => {
+      const raw = [
+        [{ text: 'A', callback_data: 'a' }, { text: 'B', callback_data: 'b' }],
+        [{ text: 'C', callback_data: 'c' }],
+      ]
+      const out = redactAgentKeyboard(raw, (s) => s)
+      expect(out.map((r) => r.map((b) => b.callback_data))).toEqual([
+        ['a', 'b'],
+        ['c'],
+      ])
+      // Fresh objects — input untouched.
+      expect(out[0]![0]).not.toBe(raw[0]![0])
+      expect(raw[0]![0]!.text).toBe('A')
     })
   })
 })
