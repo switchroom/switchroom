@@ -32,6 +32,7 @@ import type { InboundMessage, PermissionEvent, StatusEvent } from '../gateway/ip
 import { matchesAllowRule } from '../permission-rule.js'
 import { createOutstandingPermissionLedger } from './permission-ledger.js'
 import { appendCrashBreadcrumb } from './crash-breadcrumb.js'
+import { InboundDedup, shouldDedupInbound, dedupChatKey } from './inbound-dedup.js'
 
 installPluginLogger()
 
@@ -563,6 +564,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
     }
 
+    // #2094 finding 4 — turn-complete reset. A successful reply / stream_reply
+    // is the bridge's turn-complete proxy: the agent delivered its answer for
+    // this chat, so the per-chat inbound-dedup set can be cleared (thread-
+    // agnostic — the reply may omit message_thread_id). Bounds memory and lets
+    // a genuinely NEW turn re-use ids the sweep might legitimately resend.
+    if (inboundDedupEnabled && (tool === 'reply' || tool === 'stream_reply')) {
+      const replyChatId = args.chat_id
+      if (typeof replyChatId === 'string' && replyChatId.length > 0) {
+        inboundDedup.clearChat(replyChatId)
+      }
+    }
+
     // The gateway returns the same shape as the legacy server.ts handlers:
     // { content: [{ type: 'text', text: '...' }] }
     if (result.result && typeof result.result === 'object' && 'content' in (result.result as object)) {
@@ -709,7 +722,30 @@ mcp.setNotificationHandler(
 
 let ipc: IpcClientHandle | null = null
 
+// #2094 finding 4 — bridge-side messageId dedup. Guards against the
+// stranded-message sweep re-delivering a genuine user message that was
+// already forwarded to claude (double-executing side-effectful commands,
+// double 👀). Cleared per-chat on turn-complete (a successful reply /
+// stream_reply, below) and capped defensively. Kill switch:
+// SWITCHROOM_INBOUND_DEDUP=0.
+const inboundDedup = new InboundDedup()
+const inboundDedupEnabled = process.env.SWITCHROOM_INBOUND_DEDUP !== '0'
+
 function onInbound(msg: InboundMessage): void {
+  // Drop a re-delivered duplicate of a plain user message before it reaches
+  // the claude session. Only genuine re-deliverable messages are eligible
+  // (see shouldDedupInbound) — synthetic / button / structured-event inbounds
+  // are always forwarded.
+  if (inboundDedupEnabled && shouldDedupInbound(msg)) {
+    const chatKey = dedupChatKey(msg.chatId, msg.threadId)
+    if (inboundDedup.checkAndRecord(chatKey, msg.messageId) === 'duplicate') {
+      process.stderr.write(
+        `telegram bridge: dropping duplicate inbound messageId=${msg.messageId} ` +
+        `chat=${chatKey} (already forwarded this turn — sweep re-delivery, #2094)\n`,
+      )
+      return
+    }
+  }
   // Convert IPC InboundMessage → MCP channel notification
   mcp.notification({
     method: 'notifications/claude/channel',
