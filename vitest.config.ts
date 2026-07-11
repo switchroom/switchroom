@@ -15,12 +15,24 @@ import { defineConfig } from "vitest/config";
 // with these set legitimately for production tools won't notice — the
 // host's actual processes read the env independently from their own
 // systemd / shell context.
+//
+// SWITCHROOM_RICH_RENDER (#3014) is the same hazard: agents opt into the
+// Bot API rich renderer per-agent via their `env:` block, so `npm test`
+// run inside such a container inherits `SWITCHROOM_RICH_RENDER=1`. That
+// flips `renderOutboundChunks`' default-OFF passthrough ON, round-trips
+// markdown through mdast (`_italic_` → `*italic*`), and breaks the four
+// stream-reply / status-accent tests that pin the raw flag-OFF body —
+// green in CI (flag unset) but red in a flag-on agent container. Scrub it
+// so the default-OFF path is deterministic; the flag-ON tests
+// (render-outbound-chunks, rich-render, stream-controller-chunk-cap) set
+// it explicitly per-case and delete it in cleanup.
 for (const k of [
   "SWITCHROOM_RUNTIME",
   "SWITCHROOM_CONTAINER",
   "SWITCHROOM_AGENT_NAME",
   "SWITCHROOM_VAULT_BROKER_SOCK",
   "SWITCHROOM_KERNEL_SOCKET",
+  "SWITCHROOM_RICH_RENDER",
 ]) {
   delete process.env[k];
 }
