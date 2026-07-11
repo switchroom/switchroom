@@ -17,7 +17,10 @@ import {
   buildLoopbackAuthUrl,
   requestDeviceCode,
   OAuthTierRejected,
+  generatePkcePair,
+  exchangeAuthCode,
 } from "./oauth.js";
+import { createHash } from "node:crypto";
 
 const cfg = {
   client_id: "cid",
@@ -345,21 +348,74 @@ describe("revokeRefreshToken", () => {
   });
 });
 
+describe("PKCE (sec F1 — Google loopback parity with Microsoft)", () => {
+  it("generatePkcePair returns a verifier and its S256 challenge", () => {
+    const { verifier, challenge } = generatePkcePair();
+    // Verifier is base64url of 32 random bytes → 43 chars, unreserved set.
+    expect(verifier).toMatch(/^[A-Za-z0-9\-_]{43}$/);
+    expect(challenge).toMatch(/^[A-Za-z0-9\-_]+$/);
+    // Challenge MUST be base64url(SHA-256(verifier)).
+    const expected = createHash("sha256").update(verifier).digest("base64url");
+    expect(challenge).toBe(expected);
+  });
+
+  it("generatePkcePair is non-deterministic across calls", () => {
+    expect(generatePkcePair().verifier).not.toBe(generatePkcePair().verifier);
+  });
+
+  it("buildLoopbackAuthUrl carries code_challenge + code_challenge_method=S256", () => {
+    const url = buildLoopbackAuthUrl(cfg, "http://127.0.0.1:54321", "abc123", "chal-xyz");
+    const u = new URL(url);
+    expect(u.searchParams.get("code_challenge")).toBe("chal-xyz");
+    expect(u.searchParams.get("code_challenge_method")).toBe("S256");
+  });
+
+  it("exchangeAuthCode sends code_verifier when provided", async () => {
+    let sentBody = "";
+    const fakeFetch = mock(async (_url: string, init?: RequestInit) => {
+      sentBody = String(init?.body ?? "");
+      return new Response(
+        JSON.stringify({ access_token: "at", expires_in: 3600, token_type: "Bearer" }),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    await exchangeAuthCode(cfg, "code-1", "http://127.0.0.1:9/", "verifier-abc", fakeFetch);
+    const params = new URLSearchParams(sentBody);
+    expect(params.get("code_verifier")).toBe("verifier-abc");
+    expect(params.get("grant_type")).toBe("authorization_code");
+  });
+
+  it("exchangeAuthCode omits code_verifier when not provided (OOB path)", async () => {
+    let sentBody = "";
+    const fakeFetch = mock(async (_url: string, init?: RequestInit) => {
+      sentBody = String(init?.body ?? "");
+      return new Response(
+        JSON.stringify({ access_token: "at", expires_in: 3600, token_type: "Bearer" }),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    await exchangeAuthCode(cfg, "code-1", "urn:ietf:wg:oauth:2.0:oob", undefined, fakeFetch);
+    expect(new URLSearchParams(sentBody).has("code_verifier")).toBe(false);
+  });
+});
+
 describe("desktop-loopback flow", () => {
   it("buildLoopbackAuthUrl includes redirect_uri, state, code response_type", () => {
-    const url = buildLoopbackAuthUrl(cfg, "http://127.0.0.1:54321", "abc123");
+    const url = buildLoopbackAuthUrl(cfg, "http://127.0.0.1:54321", "abc123", "chal");
     expect(url).toContain("redirect_uri=http%3A%2F%2F127.0.0.1%3A54321");
     expect(url).toContain("state=abc123");
     expect(url).toContain("response_type=code");
     expect(url).toContain("access_type=offline");
   });
 
-  it("happy path: simulates Google redirect with valid state and exchanges code", async () => {
+  it("happy path: simulates Google redirect with valid state and exchanges code with a code_verifier", async () => {
     const fakeFetch = mock(async (_url: string, init?: RequestInit) => {
       const body = String(init?.body ?? "");
       expect(body).toContain("grant_type=authorization_code");
       expect(body).toContain("code=auth-code-xyz");
       expect(body).toContain("redirect_uri=http");
+      // sec F1: the loopback exchange MUST carry a PKCE verifier.
+      expect(new URLSearchParams(body).get("code_verifier")).toBeTruthy();
       return new Response(
         JSON.stringify({
           access_token: "at-loop",
@@ -396,6 +452,10 @@ describe("desktop-loopback flow", () => {
     expect(tok.access_token).toBe("at-loop");
     expect(tok.refresh_token).toBe("rt-loop");
     expect(capturedAuthUrl).toContain("state=");
+    // sec F1: the consent URL the browser opened MUST carry the S256 challenge.
+    const authU = new URL(capturedAuthUrl);
+    expect(authU.searchParams.get("code_challenge")).toBeTruthy();
+    expect(authU.searchParams.get("code_challenge_method")).toBe("S256");
   });
 
   it("rejects callback with mismatched state and never exchanges", async () => {

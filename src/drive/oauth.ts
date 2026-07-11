@@ -297,17 +297,25 @@ export async function exchangeOobCode(
   code: string,
   fetchImpl: typeof fetch = fetch,
 ): Promise<TokenResponse> {
-  return exchangeAuthCode(cfg, code, "urn:ietf:wg:oauth:2.0:oob", fetchImpl);
+  // OOB is a paste flow with no loopback interception surface, so it
+  // carries no PKCE verifier (pass `undefined`).
+  return exchangeAuthCode(cfg, code, "urn:ietf:wg:oauth:2.0:oob", undefined, fetchImpl);
 }
 
 /**
  * Shared authorization_code → token exchange. Used by both OOB-paste and
  * desktop-loopback flows; only the redirect_uri differs.
+ *
+ * `codeVerifier` is the PKCE verifier (sec F1). The desktop-loopback flow
+ * passes it so Google can bind the exchange to the `code_challenge` it saw
+ * on the auth URL; the OOB flow passes `undefined` (no PKCE). When set, it
+ * is sent as `code_verifier` on the token request.
  */
 export async function exchangeAuthCode(
   cfg: OAuthClientConfig,
   code: string,
   redirectUri: string,
+  codeVerifier?: string,
   fetchImpl: typeof fetch = fetch,
 ): Promise<TokenResponse> {
   const body = new URLSearchParams({
@@ -317,6 +325,9 @@ export async function exchangeAuthCode(
     grant_type: "authorization_code",
     redirect_uri: redirectUri,
   });
+  if (codeVerifier !== undefined && codeVerifier.length > 0) {
+    body.set("code_verifier", codeVerifier);
+  }
   const res = await fetchImpl("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -336,12 +347,36 @@ import * as crypto from "node:crypto";
 import { spawn } from "node:child_process";
 
 /**
- * Build the loopback consent URL targeting an ephemeral local redirect_uri.
+ * Generate a PKCE code verifier + S256 challenge pair for the OAuth code
+ * flow. RFC 7636: verifier is 43-128 chars unreserved set
+ * (`[A-Z][a-z][0-9]-._~`); challenge is base64url(SHA-256(verifier)).
+ *
+ * Mirrors `src/microsoft/oauth.ts:generatePkcePair` exactly — the two
+ * OAuth modules keep the same PKCE primitive rather than cross-importing
+ * (avoids a drive↔microsoft dep). Used by the desktop-loopback flow to
+ * close the Google-vs-Microsoft asymmetry (sec F1): the loopback redirect
+ * lands on `127.0.0.1`, so an authorization code intercepted on the
+ * loopback interface (a co-resident local process racing the callback)
+ * is useless without the verifier held only in this process's memory.
+ */
+export function generatePkcePair(): { verifier: string; challenge: string } {
+  const verifier = crypto.randomBytes(32).toString("base64url");
+  const challenge = crypto
+    .createHash("sha256")
+    .update(verifier)
+    .digest("base64url");
+  return { verifier, challenge };
+}
+
+/**
+ * Build the loopback consent URL targeting an ephemeral local redirect_uri,
+ * carrying the PKCE `code_challenge` (S256).
  */
 export function buildLoopbackAuthUrl(
   cfg: OAuthClientConfig,
   redirectUri: string,
   state: string,
+  codeChallenge: string,
 ): string {
   const u = new URL("https://accounts.google.com/o/oauth2/auth");
   u.searchParams.set("client_id", cfg.client_id);
@@ -351,6 +386,8 @@ export function buildLoopbackAuthUrl(
   u.searchParams.set("access_type", "offline");
   u.searchParams.set("prompt", "consent");
   u.searchParams.set("state", state);
+  u.searchParams.set("code_challenge", codeChallenge);
+  u.searchParams.set("code_challenge_method", "S256");
   return u.toString();
 }
 
@@ -424,6 +461,10 @@ export async function runLoopbackOAuth(
   const fetchImpl = opts.fetchImpl ?? fetch;
   const openImpl = opts.openImpl ?? openBrowser;
   const state = crypto.randomBytes(16).toString("hex");
+  // PKCE (sec F1): bind the loopback code exchange to a per-flow verifier so
+  // an intercepted authorization code on 127.0.0.1 can't be redeemed without
+  // the verifier held only in this process's memory.
+  const { verifier, challenge } = generatePkcePair();
 
   // Capture the callback via a single-shot promise.
   let server: http.Server | null = null;
@@ -518,7 +559,7 @@ export async function runLoopbackOAuth(
           return;
         }
         const redirectUri = `http://${host}:${addr.port}`;
-        const authUrl = buildLoopbackAuthUrl(cfg, redirectUri, state);
+        const authUrl = buildLoopbackAuthUrl(cfg, redirectUri, state, challenge);
         // Fire-and-forget the browser open; if it fails the user has the URL.
         openImpl(authUrl)
           .then((opened) => opts.onAuthUrl?.(authUrl, opened))
@@ -537,7 +578,7 @@ export async function runLoopbackOAuth(
     if (timer) clearTimeout(timer);
     await closeServer();
 
-    return await exchangeAuthCode(cfg, code, redirectUri, fetchImpl);
+    return await exchangeAuthCode(cfg, code, redirectUri, verifier, fetchImpl);
   } finally {
     if (timer) clearTimeout(timer);
     await closeServer();

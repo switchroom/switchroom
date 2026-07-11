@@ -84,6 +84,29 @@ describe("atomicWriteFileSync", () => {
     const p = join(dir, "nope", "deep", "x");
     expect(() => atomicWriteFileSync(p, "data")).toThrow();
   });
+
+  // Deterministic guard for the flagship symlink-safety property (#1410):
+  // the tempfile open MUST carry O_EXCL (refuse a pre-existing path) and
+  // O_NOFOLLOW (refuse a symlink at the final component). The destination-
+  // symlink test above passes even on pre-fix code because rename(2) defeats a
+  // dest symlink regardless of open flags — so it does NOT pin these flags. If
+  // someone stripped O_NOFOLLOW|O_EXCL from TMP_OPEN_FLAGS, only this test fails.
+  it("opens the tempfile with O_EXCL and O_NOFOLLOW (symlink-proof create)", () => {
+    const openSpy = vi.spyOn(fs, "openSync");
+    try {
+      atomicWriteFileSync(join(dir, "x"), "data");
+      const tmpOpen = openSpy.mock.calls.find((c) => String(c[0]).includes(".tmp-"));
+      expect(tmpOpen).toBeDefined();
+      const flags = tmpOpen![1] as number;
+      expect(flags & fs.constants.O_EXCL).toBe(fs.constants.O_EXCL);
+      // O_NOFOLLOW is Linux/macOS-only; TMP_OPEN_FLAGS uses `?? 0` where absent.
+      if (fs.constants.O_NOFOLLOW) {
+        expect(flags & fs.constants.O_NOFOLLOW).toBe(fs.constants.O_NOFOLLOW);
+      }
+    } finally {
+      openSpy.mockRestore();
+    }
+  });
 });
 
 describe("writeConfigFileSync (#2457 — EBUSY bind-mount fallback)", () => {
