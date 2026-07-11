@@ -2,7 +2,8 @@ import type { Command } from "commander";
 import chalk from "chalk";
 
 import { type CheckStatus, statusGlyph } from "./doctor-status.js";
-import { execSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
+import { Socket } from "node:net";
 import {
   accessSync,
   constants as fsConstants,
@@ -91,23 +92,45 @@ function findInNvm(bin: string): string | null {
 }
 
 /**
+ * Walk $PATH looking for an executable named `bin`. Returns the first
+ * executable match or null. Pure filesystem lookup — no shell — so a
+ * caller-supplied `bin` can never be interpreted as shell syntax.
+ *
+ * A bare name is resolved against each $PATH entry; a name that already
+ * contains a slash (absolute or relative path) is tested as-is.
+ */
+function whichOnPath(bin: string): string | null {
+  const isX = (candidate: string): boolean => {
+    try {
+      accessSync(candidate, fsConstants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  if (bin.includes("/")) {
+    return isX(bin) ? bin : null;
+  }
+
+  const pathEnv = process.env.PATH ?? "";
+  for (const dir of pathEnv.split(":")) {
+    if (!dir) continue;
+    const candidate = join(dir, bin);
+    if (isX(candidate)) return candidate;
+  }
+  return null;
+}
+
+/**
  * Check whether a binary is on PATH. Returns the resolved path or null.
  *
- * Falls back to scanning ~/.nvm/versions/node/* for nvm-installed binaries
- * since doctor runs in a non-login shell.
+ * Uses a pure $PATH walk (no shell) then falls back to scanning
+ * ~/.nvm/versions/node/* for nvm-installed binaries, since doctor runs in
+ * a non-login shell where nvm.sh has not been sourced.
  */
 function which(bin: string): string | null {
-  try {
-    const out = execSync(`command -v ${bin}`, {
-      stdio: ["ignore", "pipe", "ignore"],
-    })
-      .toString()
-      .trim();
-    if (out) return out;
-  } catch { /* not on PATH */ }
-
-  // Fallback: nvm
-  return findInNvm(bin);
+  return whichOnPath(bin) ?? findInNvm(bin);
 }
 
 function checkBinary(
@@ -129,18 +152,41 @@ function checkBinary(
 
 /**
  * Check that a TCP host:port is reachable. Returns ok/fail.
+ *
+ * Opens a raw `net.Socket` connection with a timeout — NO shell. `host`
+ * comes from `memory.config.url` in switchroom.yaml (attacker-influenceable
+ * in switchroom's threat model: agents are prompt-injectable and can mutate
+ * config), so it must never reach a shell. A hostile value like
+ * `` x`touch /tmp/pwned` `` is just handed to `socket.connect` as a literal
+ * hostname; it fails DNS resolution and returns false rather than executing.
+ *
+ * @internal exported for testing
  */
-function checkTcp(host: string, port: number): boolean {
-  try {
-    // Use bash /dev/tcp redirect — no extra deps
-    execSync(
-      `timeout 2 bash -c '</dev/tcp/${host}/${port}'`,
-      { stdio: ["ignore", "ignore", "ignore"] },
-    );
-    return true;
-  } catch {
-    return false;
-  }
+export function checkTcp(
+  host: string,
+  port: number,
+  timeoutMs = 2000,
+): Promise<boolean> {
+  return new Promise((resolvePromise) => {
+    const socket = new Socket();
+    let settled = false;
+    const done = (reachable: boolean): void => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolvePromise(reachable);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => done(true));
+    socket.once("timeout", () => done(false));
+    socket.once("error", () => done(false));
+    try {
+      socket.connect(port, host);
+    } catch {
+      // Synchronous throw (e.g. invalid port) — treat as unreachable.
+      done(false);
+    }
+  });
 }
 
 function checkDependencies(): CheckResult[] {
@@ -218,16 +264,17 @@ function readVersion(
 ): { semver: SemVer | null; raw: string; path: string } | null {
   const path = which(bin);
   if (!path) return null;
-  try {
-    const raw = execSync(`${path} --version 2>&1`, {
-      stdio: ["ignore", "pipe", "pipe"],
-    })
-      .toString()
-      .trim();
-    return { semver: parser(raw), raw, path };
-  } catch {
-    return null;
-  }
+  // Argv exec — no shell — so `path` (a filesystem lookup result) is never
+  // parsed as shell syntax. Merge stdout+stderr to catch tools that print
+  // their --version banner to stderr (the old `2>&1` behaviour).
+  const proc = spawnSync(path, ["--version"], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (proc.error || proc.status !== 0) return null;
+  const raw = (
+    (proc.stdout?.toString() ?? "") + (proc.stderr?.toString() ?? "")
+  ).trim();
+  return { semver: parser(raw), raw, path };
 }
 
 function checkPythonVersion(): CheckResult {
@@ -1214,7 +1261,7 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
   const host = match[1];
   const port = match[2] ? parseInt(match[2], 10) : 80;
 
-  if (!checkTcp(host, port)) {
+  if (!(await checkTcp(host, port))) {
     return [
       {
         name: "hindsight reachable",
