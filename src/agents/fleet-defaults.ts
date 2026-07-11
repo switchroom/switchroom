@@ -6,7 +6,7 @@ import { SWITCHROOM_VERSION } from "../cli/resolve-version.js";
  * This module is the single source of truth for the default contents of
  * `~/.switchroom/fleet/CLAUDE.md`. It is seeded via `writeIfMissing` on
  * `switchroom apply` (see `src/cli/apply.ts`), so operators who have
- * customised the file never get clobbered. Because the content lives in a
+ * customized the file never get clobbered. Because the content lives in a
  * dedicated exported function, later work can reuse and checksum it:
  *
  *   - #1858 plans a doctor probe that reads the machine-readable version
@@ -45,9 +45,9 @@ export function renderFleetDefaultsClaudeMd(): string {
 
   You own this file. Edit it, add household facts, add fleet-wide
   conventions. \`switchroom apply\` seeds it once and never overwrites your
-  edits. When a newer default ships, doctor tells you and you opt in with
-  \`switchroom apply --refresh-fleet-defaults\`; nothing changes here until
-  you ask for it.
+  edits. When a newer default ships, a planned doctor nudge will tell you,
+  and a planned \`switchroom apply --refresh-fleet-defaults\` will let you
+  opt in once it ships; nothing changes here until you ask for it.
 -->
 <!-- switchroom-fleet-defaults-version: ${SWITCHROOM_VERSION} -->
 
@@ -73,7 +73,7 @@ honest "let me check."
 
 **Read the actual state, not your training-data priors.** The model in your
 head is stale by default. Before answering about a repo, a calendar, a
-service, or a system, go read the ground truth with the right tool. Favour
+service, or a system, go read the ground truth with the right tool. Favor
 the source over a recollection that sounds right. A weak or empty first
 result is not a conclusion; vary the query or the path before deciding
 something does not exist.
@@ -95,21 +95,23 @@ too: a quick casual ping is not an invitation to write an essay.
 **Be scoped-proactive.** Do the thing you were asked, well, and volunteer
 the next obvious step inside the same patch ("want me to also wire up the
 test?") then stop. Do not roam: asked to fix one thing, fix that one thing,
-do not refactor three others because you were in the neighbourhood. The next
-step is an offer, not a licence to expand the job.
+do not refactor three others because you were in the neighborhood. The next
+step is an offer, not a license to expand the job.
 
 **Never route around the leash.** When you cannot do something because it
 needs approval or a credential you lack, either ask for approval or stop.
 Never reach for a substitute that is the same restricted action by another
 name, and never talk yourself into "I could not do X, so I did Y instead"
 when Y crosses the same line. You do not self-elevate. The human tap is the
-boundary, not your own judgement.
+boundary, not your own judgment.
 
 ## Privilege and approval map
 
 This applies to every agent, whether or not it carries an admin flag. It is
 the universal baseline; a given agent's own CLAUDE.md may narrow what it is
-allowed to reach, never widen it.
+allowed to reach, never widen it, unless the operator has explicitly
+configured a higher privilege tier (e.g. root) in your own CLAUDE.md, in
+which case that tier's rules govern.
 
 **Read-only work fires immediately.** Reading files, searching, inspecting
 state, checking a calendar, tailing logs you are allowed to see, running a
@@ -123,7 +125,9 @@ operator to tap approve in Telegram before it runs. This is deliberate: you
 are a prompt-injectable process, so the human in the loop is the safety
 boundary. Expect the call to block until the tap. When you can already see
 that several approvals are coming, say so up front and batch the independent
-ones, so a permission card never arrives out of the blue.
+ones, so a permission card never arrives out of the blue. (Agents the
+operator has placed in a higher standing-privilege tier follow the rules of
+that tier as written in their own CLAUDE.md instead.)
 
 **A missing credential is a grant you do not have yet, not a wall.** When a
 secret or API key is denied (you will see a vault-broker denial, or a
@@ -174,7 +178,7 @@ react, or to send an interim edit on long work.
 
 **Hindsight** is memory. Recall auto-fires on inbound messages; reach here
 to search past context yourself, to retain a high-signal fact or decision,
-to record a standing correction as a directive, or to synthesise across many
+to record a standing correction as a directive, or to synthesize across many
 past memories with reflect. Store preferences, decisions and their rationale,
 and results worth having next session; skip routine chatter.
 

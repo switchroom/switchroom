@@ -32,16 +32,50 @@ const AGENT = "test-harness";
 const AMBIGUOUS_PROMPT = "can you send over the report when you get a sec?";
 
 /**
- * Count clarifying questions in a reply. We count sentences that end in a
- * question mark. Rhetorical framing ("sure, which one?") counts as one
- * question; the invariant is at most one.
+ * Count clarifying questions the agent itself asks. We count sentences
+ * ending in a question mark AFTER stripping spans where a `?` is not a
+ * question the agent is asking: URLs (query strings), inline/fenced code,
+ * and quoted echoes of the user's own words. Rhetorical framing
+ * ("sure, which one?") counts as one question; the invariant is at most one.
  */
 function countQuestions(text: string): number {
-  const matches = text.match(/[^.!?\n]*\?/g);
+  const stripped = text
+    // Fenced code blocks, then inline code spans.
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`[^`\n]*`/g, " ")
+    // URLs — `?` here is a query string, not a question.
+    .replace(/\bhttps?:\/\/\S+/gi, " ")
+    .replace(/\bwww\.\S+/gi, " ")
+    // Quoted spans — the agent echoing the user ("you said 'which report?'")
+    // is not the agent asking a question.
+    .replace(/"[^"\n]*"/g, " ")
+    // Single-quoted spans must OPEN at a word boundary so apostrophes in
+    // contractions ("don't", "user's") are not misread as quote delimiters.
+    .replace(/(^|[\s([{])'[^'\n]*'/g, "$1 ")
+    .replace(/[“”][^“”\n]*[“”]/g, " ")
+    // Markdown blockquote lines are quoted material, not the agent's voice.
+    .replace(/^\s*>.*$/gm, " ");
+  const matches = stripped.match(/[^.!?\n]*\?/g);
   if (matches == null) return 0;
   // Filter out trivial fragments (a lone "?" or whitespace) that are not
   // real questions.
   return matches.filter((m) => m.replace(/[^a-z0-9]/gi, "").length >= 3).length;
+}
+
+/**
+ * `true` for bot messages that are infrastructure cards rather than a
+ * conversational reply: the boot/greeting card (always delivered with the
+ * Telegram `silent` flag — see boot-card.ts "Boot cards are ALWAYS
+ * delivered silently"), edits of earlier messages, and anything matching
+ * the known boot-card header shape (`✅ <agent> back up · <version>`).
+ */
+function isInfrastructureCard(m: {
+  text: string;
+  silent: boolean;
+  edited: boolean;
+}): boolean {
+  if (m.silent || m.edited) return true;
+  return /back up ·|^✅ /u.test(m.text.trim());
 }
 
 describe("uat: feel like a colleague — one clarifying question when ambiguous", () => {
@@ -52,10 +86,16 @@ describe("uat: feel like a colleague — one clarifying question when ambiguous"
       try {
         await sc.sendDM(AMBIGUOUS_PROMPT);
 
-        const reply = await sc.expectMessage(/\S/, {
-          from: "bot",
-          timeout: 90_000,
-        });
+        // Substantive replies only: skip the boot/greeting card and any
+        // silent interim edits so the assertion runs against the agent's
+        // actual conversational answer to the prompt.
+        const reply = await sc.expectMessage(
+          (m) => /\S/.test(m.text) && !isInfrastructureCard(m),
+          {
+            from: "bot",
+            timeout: 90_000,
+          },
+        );
 
         expect(reply.text.length).toBeGreaterThan(0);
 

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, readFile, writeFile, mkdir } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ensureHostMountSources } from "../src/cli/apply.js";
@@ -33,9 +33,10 @@ describe("L2 fleet defaults seeding", () => {
     home = await mkdtemp(join(tmpdir(), "switchroom-l2-home-"));
     process.env.SWITCHROOM_HOST_HOME = home;
   });
-  afterEach(() => {
+  afterEach(async () => {
     if (origHostHome !== undefined) process.env.SWITCHROOM_HOST_HOME = origHostHome;
     else delete process.env.SWITCHROOM_HOST_HOME;
+    await rm(home, { recursive: true, force: true });
   });
 
   it("seeds the canonical L2 content on a fresh apply", async () => {
