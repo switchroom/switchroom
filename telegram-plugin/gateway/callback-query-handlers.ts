@@ -83,6 +83,7 @@ import { getAuthBrokerClient } from './auth-broker-client.js'
 import { chatKey } from './chat-key.js'
 import { tryHostdDispatch, hostdRequestId } from './hostd-dispatch.js'
 import type { HostdRequest } from '../../src/host-control/protocol.js'
+import type { OperatorEvent } from '../operator-events.js'
 import type { InboundMessage } from './ipc-protocol.js'
 import type { SweepableCardStore } from './approval-card-stores.js'
 import type { SweepableStore } from './pending-state-stores.js'
@@ -389,6 +390,13 @@ export interface CallbackQueryHandlersDeps {
   vaultKeyRegex: RegExp
   /** MENTAL_MODEL_PROPOSE_TTL_MS (config-driven approval-card lifetime). */
   mentalModelProposeTtlMs: number
+  /**
+   * Emit an operator-visible event through the gateway's single funnel
+   * (`emitGatewayOperatorEvent`: cooldown + record + broadcast). Used by the
+   * #2975 Stage-1 backstop to loudly surface an approved mental-model persist
+   * whose rate-window retry also failed.
+   */
+  emitOperatorEvent: (event: OperatorEvent) => void
 }
 
 // Freshness throttle for the /auth dashboard ↻ refresh button — one live
@@ -435,6 +443,7 @@ export function createCallbackQueryHandlers(deps: CallbackQueryHandlersDeps) {
     getAdminOnlyKeys,
     vaultKeyRegex: VAULT_KEY_REGEX,
     mentalModelProposeTtlMs: MENTAL_MODEL_PROPOSE_TTL_MS,
+    emitOperatorEvent,
   } = deps
   const bot = deps.bot as CallbackBotApi
   const lockedBot = deps.lockedBot as CallbackBotApi
@@ -1035,7 +1044,20 @@ async function handleMentalModelProposeCallback(ctx: Context, data: string): Pro
         return { state: 'error' as const, reason: 'hostd config-edit is not configured (host_control disabled or socket absent)' }
       }
       if (resp.result === 'completed') return { state: 'applied' as const }
-      if (resp.result === 'denied') return { state: 'denied' as const, reason: resp.error ?? 'operator/host denied the edit' }
+      if (resp.result === 'denied') {
+        // #2975 Stage 1 — a rate-limit denial carries a structured
+        // `fix.retry_after` (hostd server.ts ~2270-2280). Surface it as a
+        // distinct `rate_limited` state so the resolver schedules ONE retry
+        // at the window-open time instead of dropping the approved change.
+        const env = resp.error_envelope
+        if (env?.code === 'E_RATE_LIMITED' && env.fix?.kind === 'retry_after') {
+          const retryAtMs = Date.parse(env.fix.retry_at)
+          if (!Number.isNaN(retryAtMs)) {
+            return { state: 'rate_limited' as const, reason: resp.error ?? 'config_propose_edit rate limit exceeded', retryAtMs }
+          }
+        }
+        return { state: 'denied' as const, reason: resp.error ?? 'operator/host denied the edit' }
+      }
       return { state: 'error' as const, reason: resp.error ?? `hostd returned '${resp.result}'` }
     },
     // Ensure is delegated to reconcile: config_propose_edit's apply triggers a
@@ -1045,6 +1067,52 @@ async function handleMentalModelProposeCallback(ctx: Context, data: string): Pro
     // the agent's bank id + a reachable Hindsight endpoint from the gateway).
     injectInbound: (inbound: InboundMessage) => {
       deliverResumeSyntheticOrBuffer(pending.agent, inbound)
+    },
+    // #2975 Stage 1 — schedule EXACTLY ONE re-dispatch of a rate-limited but
+    // operator-approved persist. A bare setTimeout (bounded, single-shot; the
+    // resolver never re-schedules). Stage-1 caveat: this timer lives only in
+    // gateway memory, so a gateway restart before it fires LOSES the retry —
+    // acceptable for Stage 1 (Stage 2's hostd checkPreApproved bypass removes
+    // the collision). Clamp the delay to a signed-32-bit setTimeout ceiling so
+    // a far-future window doesn't overflow into an immediate fire.
+    scheduleRetry: (delayMs: number, fn: () => void | Promise<void>) => {
+      const clamped = Math.min(Math.max(0, delayMs), 2_147_483_647)
+      setTimeout(() => {
+        void (async () => {
+          try {
+            await fn()
+          } catch (err) {
+            process.stderr.write(
+              `telegram gateway: mental_model_propose retry threw: ${(err as Error).message}\n`,
+            )
+          }
+        })()
+      }, clamped)
+    },
+    editProposalCardRateWindow: (retryAtMs: number) => {
+      if (pending.card_message_id == null) return
+      const at = new Date(retryAtMs)
+      const hh = String(at.getHours()).padStart(2, '0')
+      const mm = String(at.getMinutes()).padStart(2, '0')
+      void ctx.api
+        .editMessageText(
+          pending.chat_id,
+          pending.card_message_id,
+          richMessage(
+            `⏳ _Approved — applying **${escapeHtmlForTg(pending.agent)}**'s mental model \`${pending.spec.name}\` at ${hh}:${mm} (config-edit rate window). It isn't lost; it'll persist automatically when the window opens._`,
+          ),
+          { reply_markup: { inline_keyboard: [] }, link_preview_options: { is_disabled: true } },
+        )
+        .catch(() => {})
+    },
+    notifyPersistFailed: (reason: string) => {
+      emitOperatorEvent({
+        kind: 'mental-model-persist-failed',
+        agent: pending.agent,
+        detail: `Mental model "${pending.spec.name}" — ${reason}`,
+        suggestedActions: [],
+        firstSeenAt: new Date(),
+      })
     },
     log: (m: string) => process.stderr.write(`telegram gateway: ${m}\n`),
   }
@@ -1087,6 +1155,13 @@ async function handleMentalModelProposeCallback(ctx: Context, data: string): Pro
     } catch (err) {
       process.stderr.write(`telegram gateway: mental_model_propose approve threw: ${(err as Error).message}\n`)
       result = { outcome: 'failed' as const, reason: (err as Error).message }
+    }
+    // #2975 Stage 1 — a rate-limited persist already edited the card to the
+    // "applying at HH:MM (rate window)" state and scheduled its own retry,
+    // which will resolve the turn via its own inbound. Leave that card intact;
+    // do NOT overwrite it with a success/failure label here.
+    if (result.outcome === 'scheduled_retry') {
+      return
     }
     if (pending.card_message_id != null) {
       const label =

@@ -28,6 +28,7 @@ export type OperatorEventKind =
   | 'unknown-5xx'
   | 'config-warning'
   | 'always-allow-persist-failed'
+  | 'mental-model-persist-failed'
 
 export interface OperatorEvent {
   kind: OperatorEventKind
@@ -411,6 +412,28 @@ export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
           `⚠️ Your "Always allow" for **${agent}** didn't stick.`,
           detail ? `_${detail}_` : '',
           `It will ask again.`,
+        ]
+          .filter(Boolean)
+          .join('\n'),
+        keyboard: {
+          inline_keyboard: [
+            [{ text: '❌ Dismiss', callback_data: `op:dismiss:${encodeURIComponent(ev.agent)}` }],
+          ],
+        },
+      }
+
+    // #2975 Stage 1 — an operator-APPROVED mental-model persist hit the
+    // config_propose_edit rate limit, and the ONE scheduled retry at the
+    // window-open time ALSO failed. MUST be a NEW message (not a card edit):
+    // the proposal card was already edited to the "applying at HH:MM" state
+    // and card edits don't ping, so a silent edit here would leave the lost
+    // approval unnoticed. Ask the operator to re-propose so it isn't dropped.
+    case 'mental-model-persist-failed':
+      return {
+        text: [
+          `⚠️ **${agent}**'s approved mental model didn't save.`,
+          detail ? `_${detail}_` : '',
+          `The retry after the rate window also failed — ask the agent to re-propose it.`,
         ]
           .filter(Boolean)
           .join('\n'),
