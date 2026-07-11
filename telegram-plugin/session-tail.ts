@@ -1149,7 +1149,12 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
    * very-long task (rescanSubagents picks the file back up on the
    * next tick if it grows).
    */
-  const IDLE_FSWATCH_TTL_MS = config.subTailIdleReapMs ?? 5 * 60 * 1000
+  // Floor-clamp the reap window: a 0 / negative override would make
+  // `reapIdleSubTails` treat every live sub-tail as instantly idle
+  // (cutoff = Date.now() - 0 ≥ lastActivityAt), reaping every live
+  // sidecar on the first tick. Only tests set this today, but the clamp
+  // makes the footgun unreachable — the smallest sane window is 1s.
+  const IDLE_FSWATCH_TTL_MS = Math.max(1000, config.subTailIdleReapMs ?? 5 * 60 * 1000)
 
   function readSub(t: SubTail): void {
     if (stopped) return

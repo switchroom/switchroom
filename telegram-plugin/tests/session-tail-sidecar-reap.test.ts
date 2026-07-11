@@ -134,9 +134,11 @@ describe('session-tail sidecar reap (M1) — idle sub-agent', () => {
       cwd,
       claudeHome,
       rescanIntervalMs: 30,
-      // Reap sub-tails idle for >250ms so the test doesn't wait 5 minutes but
-      // still leaves a comfortable window to observe the not-yet-reaped state.
-      subTailIdleReapMs: 250,
+      // Reap sub-tails idle for >1000ms so the test doesn't wait 5 minutes but
+      // still respects the L1 floor clamp (Math.max(1000, …) — a smaller value
+      // is silently lifted to 1s) and leaves a window to observe the
+      // not-yet-reaped state.
+      subTailIdleReapMs: 1000,
       onEvent: () => {},
     })
     try {
@@ -146,8 +148,109 @@ describe('session-tail sidecar reap (M1) — idle sub-agent', () => {
       expect(sub!.stop).not.toHaveBeenCalled()
 
       // Let the sub-tail go idle past the reap window; a rescan tick reaps it.
-      await wait(400)
+      await wait(1300)
       expect(sub!.stop).toHaveBeenCalledTimes(1)
+    } finally {
+      handle.stop()
+    }
+  })
+})
+
+describe('session-tail sidecar reap (L1) — reap window is floor-clamped', () => {
+  it('does NOT instant-reap a live sub-tail under a zero (or negative) idle window', async () => {
+    // A `subTailIdleReapMs` of 0 (or negative) would, without the
+    // Math.max(1000, …) clamp, make `reapIdleSubTails` compute
+    // `cutoff = Date.now() - 0`, which is ALWAYS ≥ a live sub-tail's slightly-
+    // earlier `lastActivityAt` — so every live sub-agent sidecar would be
+    // reaped on the very first rescan tick. The clamp lifts the effective
+    // window to the 1s floor, so a sub-tail active moments ago survives.
+    const { claudeHome, cwd, projectsDir } = mkProjectsDir()
+    const parent = join(projectsDir, 'parent.jsonl')
+    writeFileSync(parent, assistantText('parent'))
+    setMtime(parent, Math.floor(Date.now() / 1000))
+
+    const subDir = join(projectsDir, 'parent', 'subagents')
+    mkdirSync(subDir, { recursive: true })
+    const subFile = join(subDir, 'agent-subzero.jsonl')
+    writeFileSync(subFile, toolUseLine('Bash', 'toolu_z'))
+
+    const handle = startSessionTail({
+      cwd,
+      claudeHome,
+      rescanIntervalMs: 30,
+      subTailIdleReapMs: 0, // pathological: pre-clamp this instant-reaps
+      onEvent: () => {},
+    })
+    try {
+      await wait(100) // attach parent + sub → sidecar 'agent-subzero' created
+      const sub = findSidecar('agent-subzero')
+      expect(sub).toBeDefined()
+      expect(sub!.stop).not.toHaveBeenCalled()
+
+      // Several rescan ticks pass (well under the 1s clamp floor). A live
+      // sub-tail whose activity is <1s old must NOT be reaped — so its sidecar
+      // stays alive. Pre-clamp, the first tick reaps it (sub.stop called once).
+      await wait(200)
+      expect(sub!.stop).not.toHaveBeenCalled()
+    } finally {
+      handle.stop()
+    }
+  })
+})
+
+describe('session-tail sidecar reap (M1) — namespace safety', () => {
+  it('a parent-session rotation does NOT stop a concurrently-live sub-agent sidecar', async () => {
+    // The rotation reap in attachToFile stops the sidecar keyed by the
+    // rotated-away parent's JSONL stem (a UUID). A live sub-agent's sidecar is
+    // keyed by its OWN file stem ('agent-<id>'). Because the two key namespaces
+    // never collide, rotating the parent must leave the sub-agent's sidecar
+    // untouched — otherwise a `/clear` or compaction mid-worker would silently
+    // kill the live worker's label sidecar. Reviewer verified by code-reading
+    // only; this locks it in.
+    const { claudeHome, cwd, projectsDir } = mkProjectsDir()
+    const first = join(projectsDir, 'session-one.jsonl')
+    const second = join(projectsDir, 'session-two.jsonl')
+
+    writeFileSync(first, assistantText('parent one'))
+    setMtime(first, 1_000_000)
+
+    // A live sub-agent under the CURRENT (session-one) parent. Its tool_use
+    // line makes the sub-tail create a sidecar keyed 'agent-subns'.
+    const subDir = join(projectsDir, 'session-one', 'subagents')
+    mkdirSync(subDir, { recursive: true })
+    const subFile = join(subDir, 'agent-subns.jsonl')
+    writeFileSync(subFile, toolUseLine('Bash', 'toolu_ns'))
+
+    const handle = startSessionTail({
+      cwd,
+      claudeHome,
+      rescanIntervalMs: 30,
+      // Large window so the sub-tail is never idle-reaped during the test —
+      // we're isolating the rotation path, not the idle path.
+      subTailIdleReapMs: 60_000,
+      onEvent: () => {},
+    })
+    try {
+      await wait(120) // attach parent + sub → both sidecars created
+      const parentSidecar = findSidecar('session-one')
+      const subSidecar = findSidecar('agent-subns')
+      expect(parentSidecar).toBeDefined()
+      expect(subSidecar).toBeDefined()
+      expect(parentSidecar!.stop).not.toHaveBeenCalled()
+      expect(subSidecar!.stop).not.toHaveBeenCalled()
+
+      // Parent session rotates (compaction / clear → new sessionId).
+      const nowSec = Math.floor(Date.now() / 1000)
+      writeFileSync(second, assistantText('parent two'))
+      setMtime(second, nowSec + 20)
+      setMtime(first, nowSec + 5)
+      await wait(200) // rescan flips active file to session-two
+
+      // The rotated-away PARENT sidecar is reaped …
+      expect(parentSidecar!.stop).toHaveBeenCalledTimes(1)
+      // … but the concurrently-live SUB-agent sidecar is NOT — different stem
+      // namespace, so the rotation reap never targets it.
+      expect(subSidecar!.stop).not.toHaveBeenCalled()
     } finally {
       handle.stop()
     }

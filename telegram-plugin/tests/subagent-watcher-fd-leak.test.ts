@@ -189,4 +189,87 @@ describe('subagent-watcher FD-leak (H2): no per-file watcher for stale historica
 
     h.watcher.stop()
   })
+
+  // Positive direction of the H2 gate: the open-guard is `!entry.historical ||
+  // entry.bootPromotionPending != null`, so the negative test above (no watcher
+  // for a stale boot entry) must be balanced by proof the guard does NOT
+  // over-prune a genuinely LIVE worker. A file that first appears AFTER the boot
+  // scan is non-historical (`bootScanInProgress` is already false), so it is a
+  // live worker the user is awaiting and MUST get its own per-file FSWatcher —
+  // otherwise its tool-call / turn_end transitions would be invisible until the
+  // 1s defensive poll happened to catch them. Reviewer verified this by code-
+  // reading only; this test locks it in.
+  it('opens a per-file FSWatcher for a live (post-boot, non-historical) worker JSONL', () => {
+    const projectDir = `${PROJECTS}/myproject`
+    const sessionDir = `${projectDir}/session-A`
+    const subagentsDir = `${sessionDir}/subagents`
+    const liveFile = `${subagentsDir}/agent-live01.jsonl`
+
+    const h = makeHarness({
+      dirs: {
+        [PROJECTS]: ['myproject'],
+        [projectDir]: ['session-A'],
+        [sessionDir]: ['subagents'],
+        [subagentsDir]: [], // empty at boot → nothing marked historical
+      },
+    })
+
+    // Boot scan already ran (constructor) over the empty dir; poll once so the
+    // dir watcher for the subagents dir is definitely established.
+    h.poll()
+    expect(h.fileWatchers()).toHaveLength(0) // nothing to watch yet
+
+    // A brand-new worker dispatches AFTER boot: its JSONL appears now. Because
+    // bootScanInProgress is already false, scanSubagentsDir does NOT mark it
+    // historical → it registers as a live running entry.
+    h.dirs.set(subagentsDir, ['agent-live01.jsonl'])
+    h.fileSizes.set(liveFile, 24)
+
+    h.poll()
+
+    const fileWatchersForLive = h.fileWatchers().filter((w) => w.path === liveFile)
+    expect(fileWatchersForLive).toHaveLength(1)
+    expect(fileWatchersForLive[0].closed).toBe(false)
+
+    h.watcher.stop()
+    // stop() must close the live watcher it opened (no leak on shutdown).
+    expect(fileWatchersForLive[0].closed).toBe(true)
+  })
+})
+
+describe('subagent-watcher FD-leak (H1): a still-present session dir keeps its watcher across rescans', () => {
+  it('does NOT prune the dir watcher for a directory that is still present', () => {
+    const projectDir = `${PROJECTS}/myproject`
+    const sessionDir = `${projectDir}/session-A`
+    const subagentsDir = `${sessionDir}/subagents`
+
+    const h = makeHarness({
+      dirs: {
+        [PROJECTS]: ['myproject'],
+        [projectDir]: ['session-A'],
+        [sessionDir]: ['subagents'],
+        [subagentsDir]: [], // present + empty — gets a dir watcher, stays present
+      },
+    })
+
+    h.poll()
+    const dw = h.dirWatchersFor(subagentsDir)
+    expect(dw).toHaveLength(1)
+    expect(dw[0].closed).toBe(false)
+
+    // The session dir never vanishes. Several rescan ticks pass. The complement
+    // of the H1 close-on-vanish test: pruneVanishedDirWatchers must leave a
+    // still-existing dir's watcher untouched, and the `if (!dirWatchers.has(...))`
+    // guard must NOT open a duplicate watcher for the same dir on each rescan.
+    h.poll()
+    h.poll()
+    h.poll()
+
+    expect(dw[0].close).not.toHaveBeenCalled()
+    expect(dw[0].closed).toBe(false)
+    // Exactly one dir watcher for this path across all the rescans — no churn.
+    expect(h.dirWatchersFor(subagentsDir)).toHaveLength(1)
+
+    h.watcher.stop()
+  })
 })
