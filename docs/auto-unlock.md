@@ -38,12 +38,14 @@ unlock`).
 
 **What the encrypted blob protects against:**
 
-- **Disk theft.** The encryption key is derived from your machine's
-  `/etc/machine-id`, which doesn't travel with the disk image. If
-  someone copies your home directory or grabs the disk and mounts it on
-  another machine, the auto-unlock blob is unrecoverable garbage on the
-  other box. Brute-forcing it requires guessing a 128-bit key — not a
-  threat anyone has the budget for.
+- **Theft of the home directory alone (without `/etc/machine-id`).** The
+  encryption key is derived from your machine's `/etc/machine-id`, which
+  lives under `/etc` and doesn't sit inside your home directory. If
+  someone copies only your home directory and mounts it on another
+  machine, the auto-unlock blob is unrecoverable garbage on the other
+  box. Brute-forcing it requires guessing a 128-bit key — not a threat
+  anyone has the budget for. This protection holds only when the copy
+  leaves `machine-id` behind — see "Combined-backup exfiltration" below.
 - **Other users on the same machine.** The blob lives at mode 0600 in
   your home directory. Other UNIX users on the same box can't read it.
 
@@ -58,6 +60,14 @@ unlock`).
 - **Your user account being compromised.** Same model as the vault
   itself — if an attacker reads your home directory, they can read both
   the auto-unlock blob and the vault file.
+- **Combined-backup exfiltration.** Machine-binding defends only against
+  theft of the home directory *alone*. Any single artifact that captures
+  BOTH `/etc/machine-id` and the blob — a full-disk image, a full-system
+  backup, or `rsync -a /` — carries the key material off-box, so the blob
+  is decryptable on another machine and reduces to passphrase-only
+  protection. Backup hygiene: exclude `~/.switchroom/vault-auto-unlock`
+  or `/etc/machine-id` from off-box backups, or treat any backup that
+  captures both as passphrase-protected only.
 
 ## When it breaks
 
