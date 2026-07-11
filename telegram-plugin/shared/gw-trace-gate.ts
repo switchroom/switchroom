@@ -31,10 +31,21 @@
  * single boolean check.
  */
 
+/**
+ * Pure env-flag parse — exported so tests can exercise the parsing
+ * directly. Kept separate from the module-init read because the dual
+ * vitest/bun runner boundary means module-cache tricks
+ * (`vi.resetModules()` + re-import) don't work under bun's vitest shim;
+ * flag variants must be testable via explicit arguments.
+ */
+export function computeGwTraceVerbose(flag: string | undefined): boolean {
+  return flag === '1' || flag === 'true'
+}
+
 /** True when the operator opted into the full gateway trace firehose. */
-export const gwTraceVerbose: boolean =
-  process.env.SWITCHROOM_GW_TRACE === '1' ||
-  process.env.SWITCHROOM_GW_TRACE === 'true'
+export const gwTraceVerbose: boolean = computeGwTraceVerbose(
+  process.env.SWITCHROOM_GW_TRACE,
+)
 
 /**
  * Bot API methods whose successful long-poll ticks are zero-signal:
@@ -56,8 +67,12 @@ const ZERO_SIGNAL_POLL_METHODS = new Set(['getUpdates', 'getMe'])
  *   - every other method's `ok` line (sendMessage/editMessageText/... are
  *     genuine outbound observability, #656/#657).
  */
-export function shouldEmitTgPost(method: string, status: 'ok' | 'err'): boolean {
-  if (gwTraceVerbose) return true
+export function shouldEmitTgPost(
+  method: string,
+  status: 'ok' | 'err',
+  verbose: boolean = gwTraceVerbose,
+): boolean {
+  if (verbose) return true
   if (status === 'err') return true
   return !ZERO_SIGNAL_POLL_METHODS.has(method)
 }
@@ -79,8 +94,9 @@ export function shouldEmitShadowTrace(
   eventKind: string,
   effectCount: number,
   globalKind: string,
+  verbose: boolean = gwTraceVerbose,
 ): boolean {
-  if (gwTraceVerbose) return true
+  if (verbose) return true
   if (eventKind !== 'tick') return true
   if (effectCount > 0) return true
   const idle = globalKind === 'bridge_alive_idle' || globalKind === 'bridge_dead'

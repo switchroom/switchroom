@@ -4,99 +4,101 @@
  * only when SWITCHROOM_GW_TRACE is truthy. Error lines and real
  * (non-poll / non-idle-tick) activity ALWAYS emit regardless of the flag.
  *
- * The gate reads the env flag once at module init, so each state is
- * exercised via vi.resetModules() + a fresh dynamic import with the env
- * set — mirroring how the module is loaded in the running gateway.
+ * DUAL-RUNNER NOTE (vitest + bun): this file runs under BOTH runners, and
+ * bun's vitest shim does not honor `vi.resetModules()` — a re-import
+ * returns the originally-cached module, so flag variants CANNOT be tested
+ * via env + fresh import. Instead the gate exposes pure paths: the env
+ * parse is `computeGwTraceVerbose(flag)` and both should-emit functions
+ * take an explicit `verbose` argument (defaulting to the module-init
+ * read). Tests pass verbosity explicitly.
  */
 
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { describe, it, expect } from 'vitest'
+import {
+  computeGwTraceVerbose,
+  shouldEmitTgPost,
+  shouldEmitShadowTrace,
+} from '../shared/gw-trace-gate.js'
 
-type Gate = typeof import('../shared/gw-trace-gate.js')
-
-async function loadGate(flag: string | undefined): Promise<Gate> {
-  vi.resetModules()
-  if (flag === undefined) delete process.env.SWITCHROOM_GW_TRACE
-  else process.env.SWITCHROOM_GW_TRACE = flag
-  return import('../shared/gw-trace-gate.js')
-}
-
-const savedFlag = process.env.SWITCHROOM_GW_TRACE
-
-beforeEach(() => {
-  delete process.env.SWITCHROOM_GW_TRACE
-})
-
-afterEach(() => {
-  if (savedFlag === undefined) delete process.env.SWITCHROOM_GW_TRACE
-  else process.env.SWITCHROOM_GW_TRACE = savedFlag
-})
-
-describe('shouldEmitTgPost — default (flag unset): suppress poll heartbeats', () => {
-  it('suppresses status=ok for getUpdates and getMe', async () => {
-    const gate = await loadGate(undefined)
-    expect(gate.gwTraceVerbose).toBe(false)
-    expect(gate.shouldEmitTgPost('getUpdates', 'ok')).toBe(false)
-    expect(gate.shouldEmitTgPost('getMe', 'ok')).toBe(false)
+describe('computeGwTraceVerbose — env flag parsing', () => {
+  it('is OFF when unset', () => {
+    expect(computeGwTraceVerbose(undefined)).toBe(false)
   })
 
-  it('ALWAYS emits error lines, even for the poll methods', async () => {
-    const gate = await loadGate(undefined)
-    expect(gate.shouldEmitTgPost('getUpdates', 'err')).toBe(true)
-    expect(gate.shouldEmitTgPost('getMe', 'err')).toBe(true)
+  it('opts IN only on "1" or "true"', () => {
+    expect(computeGwTraceVerbose('1')).toBe(true)
+    expect(computeGwTraceVerbose('true')).toBe(true)
   })
 
-  it('keeps status=ok for real outbound methods', async () => {
-    const gate = await loadGate(undefined)
+  it('stays OFF for falsey / unrecognized values', () => {
+    for (const v of ['', '0', 'false', 'yes', 'on', 'TRUE', ' 1', 'x']) {
+      expect(computeGwTraceVerbose(v)).toBe(false)
+    }
+  })
+})
+
+describe('shouldEmitTgPost — default (verbose=false): suppress poll heartbeats', () => {
+  it('suppresses status=ok for getUpdates and getMe', () => {
+    expect(shouldEmitTgPost('getUpdates', 'ok', false)).toBe(false)
+    expect(shouldEmitTgPost('getMe', 'ok', false)).toBe(false)
+  })
+
+  it('ALWAYS emits error lines, even for the poll methods', () => {
+    expect(shouldEmitTgPost('getUpdates', 'err', false)).toBe(true)
+    expect(shouldEmitTgPost('getMe', 'err', false)).toBe(true)
+  })
+
+  it('keeps status=ok for real outbound methods', () => {
     for (const m of ['sendMessage', 'editMessageText', 'sendChatAction', 'answerCallbackQuery']) {
-      expect(gate.shouldEmitTgPost(m, 'ok')).toBe(true)
+      expect(shouldEmitTgPost(m, 'ok', false)).toBe(true)
     }
   })
 })
 
-describe('shouldEmitShadowTrace — default (flag unset): suppress idle no-op ticks', () => {
-  it('suppresses a tick with no effects in an idle global state', async () => {
-    const gate = await loadGate(undefined)
-    expect(gate.shouldEmitShadowTrace('tick', 0, 'bridge_alive_idle')).toBe(false)
-    expect(gate.shouldEmitShadowTrace('tick', 0, 'bridge_dead')).toBe(false)
+describe('shouldEmitShadowTrace — default (verbose=false): suppress idle no-op ticks', () => {
+  it('suppresses a tick with no effects in an idle global state', () => {
+    expect(shouldEmitShadowTrace('tick', 0, 'bridge_alive_idle', false)).toBe(false)
+    expect(shouldEmitShadowTrace('tick', 0, 'bridge_dead', false)).toBe(false)
   })
 
-  it('emits a tick that produced effects (e.g. a TTL turn expiry)', async () => {
-    const gate = await loadGate(undefined)
-    expect(gate.shouldEmitShadowTrace('tick', 1, 'bridge_alive_idle')).toBe(true)
+  it('emits a tick that produced effects (e.g. a TTL turn expiry)', () => {
+    expect(shouldEmitShadowTrace('tick', 1, 'bridge_alive_idle', false)).toBe(true)
   })
 
-  it('emits a tick while a turn is in flight', async () => {
-    const gate = await loadGate(undefined)
-    expect(gate.shouldEmitShadowTrace('tick', 0, 'bridge_alive_in_turn')).toBe(true)
+  it('emits a tick while a turn is in flight', () => {
+    expect(shouldEmitShadowTrace('tick', 0, 'bridge_alive_in_turn', false)).toBe(true)
   })
 
-  it('ALWAYS emits non-tick events (real inbound/turn/bridge activity)', async () => {
-    const gate = await loadGate(undefined)
+  it('ALWAYS emits non-tick events (real inbound/turn/bridge activity)', () => {
     for (const ev of ['inbound', 'turnStart', 'turnEnd', 'bridgeUp', 'bridgeDown', 'permVerdict']) {
-      expect(gate.shouldEmitShadowTrace(ev, 0, 'bridge_alive_idle')).toBe(true)
+      expect(shouldEmitShadowTrace(ev, 0, 'bridge_alive_idle', false)).toBe(true)
     }
   })
 })
 
-describe('SWITCHROOM_GW_TRACE truthy — full firehose restored', () => {
-  for (const flag of ['1', 'true']) {
-    it(`emits every line when flag=${flag}`, async () => {
-      const gate = await loadGate(flag)
-      expect(gate.gwTraceVerbose).toBe(true)
-      // The two lines suppressed by default are now emitted.
-      expect(gate.shouldEmitTgPost('getUpdates', 'ok')).toBe(true)
-      expect(gate.shouldEmitTgPost('getMe', 'ok')).toBe(true)
-      expect(gate.shouldEmitShadowTrace('tick', 0, 'bridge_alive_idle')).toBe(true)
-      expect(gate.shouldEmitShadowTrace('tick', 0, 'bridge_dead')).toBe(true)
-    })
-  }
+describe('verbose=true — full firehose restored', () => {
+  it('emits every line, including the two suppressed-by-default families', () => {
+    expect(shouldEmitTgPost('getUpdates', 'ok', true)).toBe(true)
+    expect(shouldEmitTgPost('getMe', 'ok', true)).toBe(true)
+    expect(shouldEmitShadowTrace('tick', 0, 'bridge_alive_idle', true)).toBe(true)
+    expect(shouldEmitShadowTrace('tick', 0, 'bridge_dead', true)).toBe(true)
+  })
+})
 
-  it('leaves the gate OFF for falsey/unrecognized values', async () => {
-    for (const flag of ['0', 'false', '', 'yes', 'on']) {
-      const gate = await loadGate(flag)
-      expect(gate.gwTraceVerbose).toBe(false)
-      expect(gate.shouldEmitTgPost('getUpdates', 'ok')).toBe(false)
-      expect(gate.shouldEmitShadowTrace('tick', 0, 'bridge_alive_idle')).toBe(false)
-    }
+describe('default verbose argument wiring', () => {
+  it('the defaulted call form works and matches the module-init env read', () => {
+    // Env-agnostic assertion: the defaulted form must agree with the
+    // explicit form using the parsed CURRENT env — proving the default
+    // parameter is wired to the module-init flag, whatever its value in
+    // the test process.
+    const envVerbose = computeGwTraceVerbose(process.env.SWITCHROOM_GW_TRACE)
+    expect(shouldEmitTgPost('getUpdates', 'ok')).toBe(
+      shouldEmitTgPost('getUpdates', 'ok', envVerbose),
+    )
+    expect(shouldEmitShadowTrace('tick', 0, 'bridge_alive_idle')).toBe(
+      shouldEmitShadowTrace('tick', 0, 'bridge_alive_idle', envVerbose),
+    )
+    // Regardless of the flag, an error line always emits via the default form.
+    expect(shouldEmitTgPost('getUpdates', 'err')).toBe(true)
   })
 })
