@@ -506,6 +506,116 @@ describe("hostd server — doctor (read-only, admin-gated)", () => {
   });
 });
 
+describe("hostd server — agent_exec/agent_logs target must be a configured agent", () => {
+  // Security-review finding: handleAgentExec/handleAgentLogs build the
+  // docker target as `switchroom-${name}` and shell out to it. checkGate
+  // lets an admin caller target ANY name, so without a membership check
+  // an admin could exec/log into a SINGLETON service container
+  // (vault-broker / approval-kernel / hostd / web) — each root, with the
+  // vault store + /etc/machine-id mounted — and read vault key material.
+  // The guard rejects any name not in the configured-agent registry
+  // (this.opts.agentUids), while self-target and real peers still pass.
+
+  // A docker stub that RECORDS every invocation, so the test can assert
+  // the guard short-circuited BEFORE any `docker exec`/`docker logs` ran.
+  async function withRecordingDocker(): Promise<string> {
+    const invokedLog = join(tmp, `docker-inv-${Math.random().toString(36).slice(2)}.log`);
+    const dockerStub = join(tmp, `docker-tgt-${Math.random().toString(36).slice(2)}.sh`);
+    writeFileSync(dockerStub, `#!/bin/sh\necho "$@" >> ${invokedLog}\nexit 0\n`);
+    chmodSync(dockerStub, 0o755);
+    await server.stop();
+    server = new (await import("../../src/host-control/server.js")).HostdServer({
+      homeDir: tmp,
+      agentUids: { klanker: 10001, bob: 10002 },
+      config: { agents: { klanker: { admin: true }, bob: {} } },
+      switchroomBin: stubBin,
+      dockerBin: dockerStub,
+      auditLogPath: join(tmp, "audit.log"),
+      allowNonLinux: true,
+    });
+    await server.start();
+    // Stash the invocation-log path on the stub name so tests can read it.
+    (withRecordingDocker as unknown as { invokedLog: string }).invokedLog = invokedLog;
+    return dockerStub;
+  }
+
+  it("agent_exec: admin caller targeting the vault-broker singleton is DENIED and never shells out", async () => {
+    await withRecordingDocker();
+    const invokedLog = (withRecordingDocker as unknown as { invokedLog: string }).invokedLog;
+    // klanker IS admin — so this passes checkGate; only the new
+    // configured-agent membership guard can stop it.
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+    const resp = await hostdRequest(
+      { socketPath: sock },
+      {
+        v: 1,
+        op: "agent_exec",
+        request_id: "exec-singleton",
+        args: { name: "vault-broker", argv: ["cat", "/etc/machine-id"] },
+      },
+    );
+    expect(resp.result).toBe("denied");
+    expect(resp.error).toMatch(/not a configured agent/);
+    // Hard proof no `docker exec` ran against the singleton.
+    expect(existsSync(invokedLog)).toBe(false);
+  });
+
+  it("agent_logs: admin caller targeting the vault-broker singleton is DENIED and never shells out", async () => {
+    await withRecordingDocker();
+    const invokedLog = (withRecordingDocker as unknown as { invokedLog: string }).invokedLog;
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+    const resp = await hostdRequest(
+      { socketPath: sock },
+      {
+        v: 1,
+        op: "agent_logs",
+        request_id: "logs-singleton",
+        args: { name: "vault-broker" },
+      },
+    );
+    expect(resp.result).toBe("denied");
+    expect(resp.error).toMatch(/not a configured agent/);
+    expect(existsSync(invokedLog)).toBe(false);
+  });
+
+  it("agent_exec: self-target (bob→bob, non-admin) still passes the guard and shells out", async () => {
+    await withRecordingDocker();
+    const invokedLog = (withRecordingDocker as unknown as { invokedLog: string }).invokedLog;
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/bob/sock"))!;
+    const resp = await hostdRequest(
+      { socketPath: sock },
+      {
+        v: 1,
+        op: "agent_exec",
+        request_id: "exec-self",
+        args: { name: "bob", argv: ["cat", "/state/agent/start.sh"] },
+      },
+    );
+    expect(resp.result).toBe("completed");
+    // The guard let it through to the docker shell-out.
+    expect(existsSync(invokedLog)).toBe(true);
+    expect(readFileSync(invokedLog, "utf8")).toContain("switchroom-bob");
+  });
+
+  it("agent_logs: admin targeting a real peer agent (klanker→bob) still passes the guard and shells out", async () => {
+    await withRecordingDocker();
+    const invokedLog = (withRecordingDocker as unknown as { invokedLog: string }).invokedLog;
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+    const resp = await hostdRequest(
+      { socketPath: sock },
+      {
+        v: 1,
+        op: "agent_logs",
+        request_id: "logs-peer",
+        args: { name: "bob" },
+      },
+    );
+    expect(resp.result).toBe("completed");
+    expect(existsSync(invokedLog)).toBe(true);
+    expect(readFileSync(invokedLog, "utf8")).toContain("switchroom-bob");
+  });
+});
+
 describe("hostd server — agent_smoke (read-only in-agent battery)", () => {
   async function withDocker(stubBody: string): Promise<string> {
     const dockerStub = join(tmp, `docker-smoke-${Math.random().toString(36).slice(2)}.sh`);
