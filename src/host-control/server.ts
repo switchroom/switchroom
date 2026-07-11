@@ -95,6 +95,7 @@ import {
   type DispatchResult,
 } from "../scheduler/dispatch.js";
 import { readRecentFires } from "../agent-scheduler/replay.js";
+import { rpcRaw as brokerRpcRaw } from "../vault/broker/client.js";
 
 /** Subset of switchroom.yaml the daemon reads. */
 export interface ServerConfig {
@@ -109,8 +110,51 @@ export interface ServerConfig {
   hostd?: {
     config_edit_enabled?: boolean;
     config_edit_rate_per_hour?: number;
+    /** #1841 — master switch for the operator-passphrase 2nd factor.
+     *  Missing/false ⇒ feature inert (attestation accepted-and-audited
+     *  when present, never required — byte-identical to pre-#1841). */
+    operator_attest_enabled?: boolean;
+    /** #1841 — verbs that REQUIRE attestation when the switch is on.
+     *  Missing ⇒ RFC §5.4 default set (update_apply / apply / rollout). */
+    operator_attest_required_verbs?: string[];
   };
 }
+
+/**
+ * #1841 — operator-passphrase attestation verifier. hostd NEVER holds the
+ * vault passphrase; it forwards the plaintext to the vault broker over its
+ * own admin-client connection and treats a broker DENIED as a gate failure.
+ * Abstracted behind this interface so the gate logic is unit-testable with a
+ * stub, and the real transport (broker `list_grants` with `passphrase`, the
+ * read-only op that already implements the passphrase plaintext-forward per
+ * #1051) is injected in production.
+ */
+export interface AttestVerifier {
+  /**
+   * Verify a forwarded operator passphrase against the broker's currently
+   * unlocked passphrase. Returns `{ ok: true }` on match, `{ ok: false }`
+   * with a human reason on mismatch, broker-locked, or broker-unreachable
+   * (all fail-closed — a verb that requires attestation must not pass when
+   * the verifier cannot positively confirm the passphrase).
+   */
+  verify(passphrase: string): Promise<{ ok: true } | { ok: false; reason: string }>;
+}
+
+/** RFC §5.4 — the broker socket hostd uses for the attestation forward.
+ *  Bound cross-compose (see `src/cli/hostd.ts` + `src/agents/compose.ts`). */
+export const HOSTD_BROKER_SOCKET_PATH = "/run/switchroom/broker/hostd/sock";
+
+/** RFC §5.4 default fleet-mutation verb set that requires operator-attest
+ *  when the feature is enabled and no explicit override is configured. */
+export const DEFAULT_OPERATOR_ATTEST_VERBS: readonly string[] = [
+  "update_apply",
+  "apply",
+  "rollout",
+];
+
+/** Audit `method` tag for attested / attestation-denied rows (#1841),
+ *  mirroring the vault broker's `method: "passphrase"` attribution. */
+export const ATTEST_AUDIT_METHOD = "passphrase-attest";
 
 export interface ServerOptions {
   /** Operator HOME — daemon binds sockets under `<homeDir>/.switchroom/hostd/<agent>/sock`. */
@@ -205,6 +249,15 @@ export interface ServerOptions {
   runReconcile?: (args: {
     requestId: string;
   }) => Promise<{ exit_code: number; stdout: string; stderr: string }>;
+  /**
+   * #1841 — operator-passphrase attestation verifier. Default: a
+   * broker-backed verifier that forwards the passphrase to the vault
+   * broker at `HOSTD_BROKER_SOCKET_PATH`. Tests inject a stub. Only
+   * consulted when `config.hostd.operator_attest_enabled` is true AND the
+   * verb is in the required set — so leaving it unset never changes
+   * behaviour for the default (feature-off) posture.
+   */
+  attestVerifier?: AttestVerifier;
 }
 
 /**
@@ -940,6 +993,21 @@ export class HostdServer {
       return;
     }
 
+    // ── #1841 operator-attest 2nd factor (RFC §5.4) ──────────────────
+    // Runs AFTER the admin/allowlist gate: attestation is an additional
+    // factor, never a replacement. Inert unless the operator opted in
+    // (`hostd.operator_attest_enabled`), so the default posture — and the
+    // Telegram approval-card flow (#1427, layer 1) — is unchanged.
+    const attest = await this.checkOperatorAttest(req, caller);
+    if (attest.denied !== null) {
+      const resp = deniedResponse(req.request_id, attest.denied);
+      await this.writeAudit({ caller, req, resp, method: attest.method });
+      socket.write(encodeResponse(resp));
+      socket.end();
+      return;
+    }
+    const attestMethod = attest.method;
+
     const started = Date.now();
     let resp: HostdResponse;
     try {
@@ -1020,9 +1088,127 @@ export class HostdServer {
       // string-matching decoders.
       resp = { ...resp, error: `hostd dispatch failed: ${msg}` };
     }
-    await this.writeAudit({ caller, req, resp });
+    await this.writeAudit({ caller, req, resp, method: attestMethod });
     socket.write(encodeResponse(resp));
     socket.end();
+  }
+
+  /**
+   * #1841 — operator-passphrase attestation (RFC §5.4, layer 3).
+   *
+   * Called AFTER `checkGate` (the admin/allowlist floor) passes. Returns
+   * `{ denied: null }` to allow, or `{ denied: <reason> }` to reject. The
+   * optional `method` is threaded onto the audit row for attribution.
+   *
+   * Posture:
+   *   - Feature OFF (`operator_attest_enabled` !== true) ⇒ completely inert:
+   *     the `operator_passphrase` field is IGNORED (present or absent), so
+   *     behaviour is byte-identical to pre-#1841. Guarantees existing fleets
+   *     and the Telegram approval-card flow are unaffected.
+   *   - Operator socket caller ⇒ always allowed (already the fully-trusted
+   *     first factor; the 2nd factor is for agent callers).
+   *   - Feature ON + verb in `operator_attest_required_verbs` ⇒ a valid
+   *     operator-passphrase attestation is REQUIRED (missing ⇒ denied;
+   *     wrong/broker-unreachable ⇒ denied, fail-closed).
+   *   - Feature ON + verb NOT required ⇒ accept-and-audit: a supplied
+   *     attestation is verified (wrong ⇒ denied, fail-closed) and tagged;
+   *     an absent one is allowed unchanged.
+   *
+   * hostd never holds the passphrase — verification is delegated to the
+   * vault broker via `attestVerifier()`.
+   */
+  private async checkOperatorAttest(
+    req: HostdRequest,
+    caller: SocketIdentity,
+  ): Promise<{ denied: string | null; method?: string }> {
+    const hostdCfg = this.opts.config.hostd;
+    if (hostdCfg?.operator_attest_enabled !== true) {
+      // Feature inert — ignore any forwarded passphrase entirely.
+      return { denied: null };
+    }
+    // Operator socket already carries the strongest identity; no 2nd factor.
+    if (caller.kind === "operator") return { denied: null };
+
+    const requiredVerbs =
+      hostdCfg.operator_attest_required_verbs ?? DEFAULT_OPERATOR_ATTEST_VERBS;
+    const required = requiredVerbs.includes(req.op);
+    const passphrase = req.operator_passphrase;
+
+    if (!required) {
+      // Accept-and-audit: verify only when one is actually supplied.
+      if (passphrase === undefined) return { denied: null };
+      const v = await this.attestVerifier().verify(passphrase);
+      return v.ok
+        ? { denied: null, method: ATTEST_AUDIT_METHOD }
+        : {
+            denied: `${req.op} operator-attest failed: ${v.reason}`,
+            method: ATTEST_AUDIT_METHOD,
+          };
+    }
+
+    // Required verb — attestation is mandatory.
+    if (passphrase === undefined) {
+      return {
+        denied:
+          `${req.op} requires operator-passphrase attestation ` +
+          `(hostd.operator_attest_enabled is on and ${req.op} is in ` +
+          `operator_attest_required_verbs)`,
+        method: ATTEST_AUDIT_METHOD,
+      };
+    }
+    const v = await this.attestVerifier().verify(passphrase);
+    return v.ok
+      ? { denied: null, method: ATTEST_AUDIT_METHOD }
+      : {
+          denied: `${req.op} operator-attest failed: ${v.reason}`,
+          method: ATTEST_AUDIT_METHOD,
+        };
+  }
+
+  /** Lazily resolve the attestation verifier: the injected test seam, or
+   *  the default broker-backed forwarder. */
+  private attestVerifier(): AttestVerifier {
+    if (this.opts.attestVerifier) return this.opts.attestVerifier;
+    if (!this._defaultAttestVerifier) {
+      this._defaultAttestVerifier = {
+        verify: (passphrase: string) =>
+          this.brokerAttestVerify(passphrase),
+      };
+    }
+    return this._defaultAttestVerifier;
+  }
+  private _defaultAttestVerifier?: AttestVerifier;
+
+  /**
+   * Default verifier — forwards the passphrase to the vault broker over
+   * hostd's admin-client connection at `HOSTD_BROKER_SOCKET_PATH` using the
+   * read-only `list_grants` op (which already implements the
+   * passphrase-plaintext-forward attestation per #1051). A broker `ok`
+   * response ⇒ the passphrase matched the broker's unlocked passphrase; an
+   * error response (e.g. DENIED on mismatch, or broker locked) or an
+   * unreachable socket ⇒ fail-closed. hostd never persists the passphrase.
+   */
+  private async brokerAttestVerify(
+    passphrase: string,
+  ): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const res = await brokerRpcRaw(
+      {
+        v: 1,
+        op: "list_grants",
+        agent: "hostd",
+        passphrase,
+      },
+      { vaultBrokerSocket: HOSTD_BROKER_SOCKET_PATH, timeoutMs: 5_000 },
+    );
+    if (res.kind === "unreachable") {
+      return { ok: false, reason: `broker unreachable: ${res.msg}` };
+    }
+    const resp = res.resp as { ok?: boolean; code?: string; msg?: string };
+    if (resp.ok === true) return { ok: true };
+    return {
+      ok: false,
+      reason: `broker denied attestation (${resp.code ?? "DENIED"})`,
+    };
   }
 
   /**
@@ -3346,10 +3532,16 @@ export class HostdServer {
     caller: SocketIdentity;
     req: HostdRequest;
     resp: HostdResponse;
+    /** #1841 — attestation attribution. `"passphrase-attest"` on rows
+     *  where an operator-passphrase attestation was verified (or a
+     *  required attestation was missing/rejected). NEVER carries the
+     *  passphrase itself — only the method tag. */
+    method?: string;
   }): Promise<void> {
     await this.appendAuditRow({
       ts: new Date().toISOString(),
       op: args.req.op,
+      ...(args.method ? { method: args.method } : {}),
       caller:
         args.caller.kind === "agent"
           ? { kind: "agent", name: args.caller.name }

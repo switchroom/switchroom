@@ -126,6 +126,29 @@ export function hostdRequestId(prefix: string): string {
 }
 
 /**
+ * #1841 — attach an operator-passphrase attestation to a hostd request.
+ *
+ * Mirrors the existing gateway→broker plaintext-forward used for
+ * `vault_request_save`: after `/vault unlock` the gateway caches the
+ * operator passphrase per-chat, and forwards it on the wire when an admin
+ * agent invokes a privileged hostd verb. hostd never holds the passphrase —
+ * it re-forwards this value to the vault broker and treats a broker DENIED
+ * as a gate failure (see `AttestVerifier` in `src/host-control/server.ts`).
+ *
+ * Returns the request unchanged when no passphrase is cached (the
+ * feature-off / not-yet-unlocked posture stays byte-identical to today).
+ * Pure — returns a new object rather than mutating in place, so a caller
+ * can pass a request literal.
+ */
+export function withOperatorAttestation<T extends HostdRequest>(
+  req: T,
+  passphrase: string | undefined,
+): T {
+  if (!passphrase) return req;
+  return { ...req, operator_passphrase: passphrase };
+}
+
+/**
  * Single-shot `get_status` snapshot for `targetRequestId` (NOT a
  * poll-until-terminal — {@link pollHostdStatus} does that). Used by
  * the framework silence-fallback to render a deterministic in-flight

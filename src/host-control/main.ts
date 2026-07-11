@@ -212,6 +212,17 @@ async function main(): Promise<void> {
               ...(config.hostd.config_edit_enabled !== undefined
                 ? { config_edit_enabled: config.hostd.config_edit_enabled }
                 : {}),
+              // #1841 — operator-attest 2nd factor. Pass through so the
+              // daemon's checkOperatorAttest sees the operator's opt-in.
+              ...(config.hostd.operator_attest_enabled !== undefined
+                ? { operator_attest_enabled: config.hostd.operator_attest_enabled }
+                : {}),
+              ...(config.hostd.operator_attest_required_verbs !== undefined
+                ? {
+                    operator_attest_required_verbs:
+                      config.hostd.operator_attest_required_verbs,
+                  }
+                : {}),
             },
           }
         : {}),
