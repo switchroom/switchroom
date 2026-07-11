@@ -990,21 +990,20 @@ export const HINDSIGHT_MCP_TOOLS = [
   "mcp__hindsight__retain",
   "mcp__hindsight__sync_retain",
   "mcp__hindsight__reflect",
-  // Directives — captured autonomously (directive-capture nudge/verifier).
+  // Directives — create_directive is captured autonomously (the #2848
+  // directive-capture nudge: recall.py regex-detects correction-shaped
+  // inbound and nudges the model to persist it with create_directive).
   "mcp__hindsight__create_directive",
   "mcp__hindsight__update_bank",
-  "mcp__hindsight__delete_directive",
   "mcp__hindsight__list_directives",
   // Banks.
   "mcp__hindsight__create_bank",
   "mcp__hindsight__get_bank",
   "mcp__hindsight__get_bank_stats",
   "mcp__hindsight__list_banks",
-  "mcp__hindsight__delete_bank",
   // Memories.
   "mcp__hindsight__get_memory",
   "mcp__hindsight__list_memories",
-  "mcp__hindsight__clear_memories",
   // Documents.
   "mcp__hindsight__get_document",
   "mcp__hindsight__list_documents",
@@ -1018,6 +1017,23 @@ export const HINDSIGHT_MCP_TOOLS = [
   "mcp__hindsight__get_operation",
   "mcp__hindsight__list_operations",
   "mcp__hindsight__cancel_operation",
+  //
+  // DELIBERATELY OMITTED — least-privilege (#2911). The destructive tools
+  // below are real server tools but are NOT pre-approved: they fall through
+  // to a normal Claude Code permission prompt (→ a Telegram approval card),
+  // so an agent can't silently wipe a bank / all memories / a standing
+  // guardrail. Confirmed via a whole-repo grep that no automated flow
+  // (host TS callsites, Stop hooks, vendored scripts, or scaffolded prompts)
+  // invokes any of them — every use is user-driven, so a per-call human tap
+  // is the right gate. Do NOT re-add these without re-checking that grep:
+  //   • mcp__hindsight__delete_bank     — destroys an entire memory bank.
+  //   • mcp__hindsight__clear_memories  — wipes every memory in a bank.
+  //   • mcp__hindsight__delete_directive — removes a standing reflect guardrail.
+  //       (The autonomous directive-capture nudge only CREATES directives via
+  //        create_directive; nothing auto-deletes one.)
+  // Note: delete_document IS kept pre-approved on purpose — the scaffolded
+  // MEMORY_GUIDANCE instructs the agent to call it autonomously for user
+  // corrections and "forget that" requests (an automated-flow dependency).
 ];
 
 /**

@@ -36,11 +36,8 @@ describe("Hindsight pre-approved permission surface (Fix 1.2, #2903)", () => {
   it("pre-approves exactly this enumerated set (change = deliberate)", () => {
     expect([...HINDSIGHT_MCP_TOOLS].sort()).toEqual([
       "mcp__hindsight__cancel_operation",
-      "mcp__hindsight__clear_memories",
       "mcp__hindsight__create_bank",
       "mcp__hindsight__create_directive",
-      "mcp__hindsight__delete_bank",
-      "mcp__hindsight__delete_directive",
       "mcp__hindsight__delete_document",
       "mcp__hindsight__get_bank",
       "mcp__hindsight__get_bank_stats",
@@ -61,6 +58,25 @@ describe("Hindsight pre-approved permission surface (Fix 1.2, #2903)", () => {
       "mcp__hindsight__sync_retain",
       "mcp__hindsight__update_bank",
     ]);
+  });
+
+  it("NEVER pre-approves the destructive tools demoted to a permission prompt (#2911)", () => {
+    // Least-privilege: these fall through to a Claude Code permission prompt
+    // (→ Telegram approval card) instead of silent pre-approval. No automated
+    // flow depends on their pre-approval (verified by whole-repo grep in #2911).
+    for (const destructive of [
+      "mcp__hindsight__delete_bank",
+      "mcp__hindsight__clear_memories",
+      "mcp__hindsight__delete_directive",
+    ]) {
+      expect(
+        HINDSIGHT_MCP_TOOLS,
+        `${destructive} must NOT be pre-approved — it should require a per-call permission prompt (#2911)`,
+      ).not.toContain(destructive);
+    }
+    // delete_document STAYS pre-approved: MEMORY_GUIDANCE instructs the agent
+    // to call it autonomously for corrections / "forget that" (automated flow).
+    expect(HINDSIGHT_MCP_TOOLS).toContain("mcp__hindsight__delete_document");
   });
 
   it("NEVER pre-approves a mental-model write tool (they route through the propose card)", () => {
