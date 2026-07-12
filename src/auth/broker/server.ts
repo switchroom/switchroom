@@ -42,12 +42,23 @@ import { dirname, join, resolve } from "node:path";
 
 import { allocateAgentUid } from "../../agents/compose.js";
 import { resolveAgentsDir } from "../../config/loader.js";
-import { fetchQuota, type QuotaResult } from "../quota.js";
+import {
+  fetchQuota,
+  resolveModelTierProbeModel,
+  type QuotaResult,
+} from "../quota.js";
 import {
   quotaIndicatesExhaustion,
   resolveConsumerProbeIntervalMs,
   EXHAUSTION_PCT,
 } from "./consumer-quota-sensor.js";
+import {
+  quotaIndicatesModelTierWall,
+  quotaTierAllowed,
+  isModelTierWalled,
+  MODEL_TIER_WALL_DEFAULT_MS,
+  type ModelTierWallMark,
+} from "./model-tier-quota.js";
 import {
   isAccountBlocked as evalAccountBlocked,
   accountEligibility,
@@ -60,6 +71,7 @@ import {
   type SoftAvoidSnapshot,
   snapshotWalled,
   WALL_PCT,
+  SNAPSHOT_STALE_AGE_MS,
 } from "./account-eligibility.js";
 import type { AuthConfig, AuthConsumer, SwitchroomConfig } from "../../config/schema.js";
 import { atomicWriteFileSync, atomicWriteJsonSync } from "../../util/atomic.js";
@@ -189,6 +201,16 @@ interface QuotaEntry {
    *  counter. Pruned to THROTTLE_ESCALATION_WINDOW_MS on every hit; cleared
    *  after an escalation probe runs (corroborated or not). */
   throttle_hits?: number[];
+  /** #3176 — model-tier (7d_oi / seven_day_overage_included) wall. Unix ms
+   *  until which the account is walled on the FLAGSHIP tier only (the account
+   *  still serves opus/haiku fine, so this is NOT an `exhausted_until`
+   *  blanket mark). Set by the fleet tick's premium canary; cleared when a
+   *  fresh canary reports the tier allowed. */
+  premium_walled_until?: number;
+  /** The binding bucket claim at mark time, for operator messaging. */
+  premium_wall_bucket?: string;
+  /** Unix ms when the tier-wall mark was written (most-recent-signal-wins). */
+  premium_wall_marked_at?: number;
 }
 interface QuotaState {
   [label: string]: QuotaEntry;
@@ -259,9 +281,29 @@ export interface LastFleetRoll {
   /**
    * Trigger attribution (#3031 PR 2): "hard-exhaustion" = the probe saw a
    * genuine quota wall (mark + roll, possibly promote); "soft-avoid" = a
-   * serving-preference roll off the soft-avoid tier (no mark, no promote).
+   * serving-preference roll off the soft-avoid tier (no mark, no promote);
+   * "model-tier-wall" = the flagship-tier (7d_oi) canary saw the account
+   * walled on the premium tier (#3176).
    */
-  reason?: "soft-avoid" | "hard-exhaustion";
+  reason?: "soft-avoid" | "hard-exhaustion" | "model-tier-wall";
+  /** #3176 — the binding tier bucket, set only when reason is model-tier-wall. */
+  bucket?: string;
+}
+
+/**
+ * #3176 — the fleet-wide "every account is flagship-tier walled" alert. Set
+ * when a model-tier failover finds no premium-eligible target, so the gateway
+ * can surface an operator card naming the bucket and the earliest recovery.
+ * Persisted as `premium-tier-all-walled.json`; cleared once any account's
+ * canary reads the tier allowed again.
+ */
+export interface PremiumTierAllWalled {
+  /** The binding bucket (seven_day_overage_included). */
+  bucket: string | null;
+  /** Epoch ms of the earliest tier reset across all walled accounts, when known. */
+  earliest_reset?: number;
+  /** Unix ms the all-walled condition was recorded. */
+  at: number;
 }
 
 /**
@@ -320,6 +362,30 @@ interface LastQuotaEntry {
 
 interface LastQuotaCache {
   [label: string]: LastQuotaEntry;
+}
+
+/**
+ * #3176 — flagship-tier (`7d_oi` / `seven_day_overage_included`) canary
+ * snapshot, written after each premium-canary probe in the fleet tick. Kept
+ * separate from {@link LastQuotaEntry} (the haiku probe's 5h/7d snapshot) so
+ * the two probe models never overwrite each other's windows. Persisted to
+ * `last-tier-quota.json` and exposed via `list-state` for transparency.
+ */
+interface LastTierQuotaEntry {
+  /** Overall `anthropic-ratelimit-unified-status` (allowed/rejected). */
+  unifiedStatus: string | null;
+  /** `anthropic-ratelimit-unified-7d_oi-status` (allowed/rejected). */
+  sevenDayOiStatus: string | null;
+  /** `7d_oi` bucket utilization (0-100), when the header was present. */
+  sevenDayOiUtilizationPct: number | null;
+  /** ISO string of the tier-wall reset (7d_oi-reset / unified-reset / retry-after). */
+  sevenDayOiResetAt: string | null;
+  /** Unix ms when this canary snapshot was captured. */
+  capturedAt: number;
+}
+
+interface LastTierQuotaCache {
+  [label: string]: LastTierQuotaEntry;
 }
 
 interface ShaIndex {
@@ -386,6 +452,12 @@ function cachedSnapshotToResult(s: LastQuotaEntry): QuotaResult {
       overageDisabledReason: s.overageDisabledReason,
       fiveHourUtilPresent: s.fiveHourUtilPresent,
       sevenDayUtilPresent: s.sevenDayUtilPresent,
+      // #3176 — the haiku 5h/7d cache carries no flagship-tier signal; the
+      // canary owns those in `lastTierQuotaCache`. Null here by construction.
+      unifiedStatus: null,
+      sevenDayOiStatus: null,
+      sevenDayOiUtilizationPct: null,
+      sevenDayOiResetAt: null,
     },
   };
 }
@@ -495,6 +567,13 @@ export class AuthBroker {
   /** Most recent broker-initiated proactive fleet roll (see LastFleetRoll).
    *  Persisted so a restart doesn't drop a pending announcement. */
   private lastFleetRoll: LastFleetRoll | null = null;
+  /** #3176 — per-account flagship-tier (`7d_oi`) canary snapshot. Kept
+   *  SEPARATE from `lastQuotaCache` (which the haiku probe owns) so the two
+   *  probes never clobber each other's windows. Persisted to
+   *  `last-tier-quota.json`, reloaded on boot. */
+  private lastTierQuotaCache: LastTierQuotaCache = {};
+  /** #3176 — resolved model-tier canary probe model (env-overridable). */
+  private readonly modelTierProbeModel: string = resolveModelTierProbeModel();
   /** Last `expiresAt` the broker wrote per label — drives threshold-violation. */
   private lastWrittenExpiresAt = new Map<string, number | undefined>();
   /** Refresh leases held while a POST is in flight (in-process). */
@@ -1272,6 +1351,171 @@ export class AuthBroker {
     });
   }
 
+  /* ─── Model-tier (7d_oi / seven_day_overage_included) wall (#3176) ─── */
+
+  /** View a quota-ledger entry as a model-tier wall mark — only when it
+   *  carries one. */
+  private premiumWallMarkOf(account: string): ModelTierWallMark | undefined {
+    const q = this.quota[account];
+    if (!q || q.premium_walled_until === undefined) return undefined;
+    return {
+      premium_walled_until: q.premium_walled_until,
+      premium_wall_bucket: q.premium_wall_bucket,
+      premium_wall_marked_at: q.premium_wall_marked_at,
+    };
+  }
+
+  /**
+   * True when `account` is walled on the FLAGSHIP tier right now (#3176).
+   * Live-truth first: a fresh canary snapshot that positively read the tier
+   * `allowed` (newer than the mark) clears it; otherwise an unexpired mark
+   * governs. Consulted ONLY by the fleet-active roll/serving path — a tier
+   * wall benches flagship traffic, never opus/haiku.
+   */
+  private isAccountPremiumWalled(account: string): boolean {
+    const mark = this.premiumWallMarkOf(account);
+    const tier = this.lastTierQuotaCache[account];
+    // A canary that ran AFTER the mark and read the tier allowed is live truth.
+    const tierAllowed =
+      tier != null &&
+      tier.capturedAt >= (mark?.premium_wall_marked_at ?? 0) &&
+      this.now() - tier.capturedAt <= SNAPSHOT_STALE_AGE_MS &&
+      (tier.unifiedStatus === "allowed" || tier.sevenDayOiStatus === "allowed") &&
+      !(tier.sevenDayOiStatus === "rejected");
+    return isModelTierWalled({
+      mark,
+      now: this.now(),
+      snapshotTierAllowed: tierAllowed ? true : undefined,
+    });
+  }
+
+  /**
+   * Cache a premium-canary result and reconcile the tier-wall mark (#3176).
+   * A walled result is left to the caller (it may need to roll the fleet); a
+   * result that positively reads the tier allowed CLEARS a stale mark; an
+   * inconclusive result (failed probe / no tier headers / rotted canary id)
+   * is a no-op — it never clears a real wall.
+   */
+  private recordTierProbe(label: string, result: QuotaResult): void {
+    if (result.ok) {
+      const d = result.data;
+      this.lastTierQuotaCache[label] = {
+        unifiedStatus: d.unifiedStatus ?? null,
+        sevenDayOiStatus: d.sevenDayOiStatus ?? null,
+        sevenDayOiUtilizationPct: d.sevenDayOiUtilizationPct ?? null,
+        sevenDayOiResetAt: d.sevenDayOiResetAt?.toISOString() ?? null,
+        capturedAt: this.now(),
+      };
+      this.persistLastTierQuotaCache();
+    }
+    // Self-heal: a fresh canary that positively reads the tier allowed clears
+    // any lingering tier-wall mark so the account rejoins flagship serving.
+    const entry = this.quota[label];
+    if (quotaTierAllowed(result) && entry?.premium_walled_until !== undefined) {
+      const { premium_walled_until, premium_wall_bucket, premium_wall_marked_at, ...rest } = entry;
+      void premium_walled_until;
+      void premium_wall_bucket;
+      void premium_wall_marked_at;
+      this.quota[label] = rest;
+      this.persistQuota();
+      process.stdout.write(
+        `auth-broker: premium canary shows ${label} flagship-tier allowed — cleared model-tier wall mark\n`,
+      );
+      this.fanoutToAffectedConsumers(label);
+    }
+    // An account that can serve the flagship again lifts a fleet-wide
+    // all-walled alert.
+    if (quotaTierAllowed(result)) this.clearPremiumAllWalled();
+  }
+
+  /**
+   * First flagship-eligible failover target for `from` (#3176): the first
+   * `fallback_order` account, starting after `from`, that exists, has stored
+   * credentials, and is NEITHER exhausted NOR premium-walled. Null when every
+   * candidate is walled on the flagship tier (or exhausted) — the honest
+   * all-walled path, which the caller surfaces with the earliest reset.
+   */
+  private nextPremiumEligibleAccount(from: string): string | null {
+    const order = this.config.auth?.fallback_order ?? [];
+    const start = order.indexOf(from);
+    const ring =
+      start === -1
+        ? [...order]
+        : order.map((_, i) => order[(start + 1 + i) % order.length]);
+    for (const cand of ring) {
+      if (!cand || cand === from) continue;
+      if (this.isAccountExhausted(cand)) continue;
+      if (this.isAccountPremiumWalled(cand)) continue;
+      if (!accountExists(cand, this.home)) continue;
+      if (!readAccountCredentials(cand, this.home)) continue;
+      return cand;
+    }
+    return null;
+  }
+
+  /**
+   * The earliest flagship-tier reset across all walled accounts, for the
+   * all-walled operator card ("recovers at …"). Null when nothing is walled.
+   */
+  private earliestPremiumWallReset(): number | null {
+    let earliest: number | null = null;
+    for (const label of listAccounts(this.home)) {
+      const until = this.quota[label]?.premium_walled_until;
+      if (until != null && (earliest == null || until < earliest)) earliest = until;
+    }
+    return earliest;
+  }
+
+  /**
+   * Mark `account` walled on the flagship tier and roll the fleet off it
+   * (#3176). Unlike `markExhaustedAndRoll` this is TIER-SCOPED: it writes a
+   * `premium_walled_until` mark (not a blanket `exhausted_until`), selects a
+   * flagship-ELIGIBLE target (not merely non-exhausted), and — when `account`
+   * is the fleet active and a target exists — durably promotes the target so
+   * the fleet stops routing flagship agents onto the walled account. The
+   * canary that triggered this IS the fresh corroboration, so the promote is
+   * not gated on a 5h/7d snapshot (which a tier wall never trips).
+   */
+  private markPremiumWalledAndRoll(
+    account: string,
+    until: number | null,
+    bucket: string | null,
+  ): { rolledTo: string | null; allWalled: boolean; earliestReset: number | null } {
+    const now = this.now();
+    const premiumWalledUntil = until ?? now + MODEL_TIER_WALL_DEFAULT_MS;
+    this.quota[account] = {
+      ...this.quota[account],
+      premium_walled_until: premiumWalledUntil,
+      premium_wall_bucket: bucket ?? undefined,
+      premium_wall_marked_at: now,
+    };
+    this.persistQuota();
+    const target = this.nextPremiumEligibleAccount(account);
+    if (!target) {
+      // Every account is flagship-walled (or exhausted). Honest all-walled —
+      // do NOT roll (nowhere better to go); surface the earliest reset.
+      return { rolledTo: null, allWalled: true, earliestReset: this.earliestPremiumWallReset() };
+    }
+    this.fanoutFailoverTo(account, target);
+    this.fanoutToAffectedConsumers(account);
+    // A flagship-eligible target exists → clear any fleet-wide all-walled alert.
+    this.clearPremiumAllWalled();
+    if (this.config.auth?.active === account) {
+      this.config = {
+        ...this.config,
+        auth: { ...(this.config.auth ?? {}), active: target },
+      };
+      this.persistActiveOverride(target);
+      this.fanoutAllConsumers();
+      this.audit({ op: "auto-promote-active", identity: { kind: "operator" }, account: target, accountKind: "claude", ok: true, reason: "model-tier-wall" });
+      process.stdout.write(
+        `auth-broker: auto-promoted auth.active ${account} → ${target} ` +
+          `(${account} flagship-tier walled until ${new Date(premiumWalledUntil).toISOString()}, bucket=${bucket ?? "?"}) — persisted\n`,
+      );
+    }
+    return { rolledTo: target, allWalled: false, earliestReset: null };
+  }
+
   /* ─── Soft-avoid tier (#3031, PR 1/4) ───────────────────────── */
 
   /** Per-account soft-avoid hysteresis (in-memory; re-derived from the next
@@ -1671,6 +1915,12 @@ export class AuthBroker {
         // Cached utilization snapshot from the most recent probeQuota call.
         // null when no probe has been run since broker start.
         last_quota: lq ?? null,
+        // #3176 — flagship-tier (7d_oi) wall: live-authoritative verdict +
+        // raw mark + latest canary snapshot for the dashboard/operator card.
+        premium_walled: this.isAccountPremiumWalled(label),
+        premium_walled_until: q?.premium_walled_until,
+        premium_wall_bucket: q?.premium_wall_bucket,
+        last_tier_quota: this.lastTierQuotaCache[label] ?? null,
       };
     });
     const agents = Object.entries(this.config.agents ?? {}).map(([name, agent]) => {
@@ -1706,6 +1956,9 @@ export class AuthBroker {
         // #3031 — most recent broker-initiated proactive roll, so gateways
         // can announce it (null until the first proactive roll).
         last_fleet_roll: this.lastFleetRoll,
+        // #3176 — fleet-wide flagship-tier all-walled alert (null unless every
+        // account is walled on the 7d_oi bucket with no eligible failover).
+        premium_tier_all_walled: this.premiumTierAllWalled,
       }),
     );
   }
@@ -1927,6 +2180,15 @@ export class AuthBroker {
     // candidates the loop simply hadn't reached yet (stale/absent snapshots)
     // — most visibly on the boot tick, where nothing is cached at all.
     const probed: Array<{ label: string; result: QuotaResult }> = [];
+    // #3176 — accounts whose flagship-tier canary reported a 7d_oi wall this
+    // tick, collected in Phase 1 and acted on in Phase 2 (same probe-all-then-
+    // act discipline the exhaustion path uses).
+    const tierWalled = new Map<string, { until: number | null; bucket: string | null }>();
+    // The set the premium canary probes: the fleet active + fallback candidates
+    // + pinned agent accounts. Probing only the serving set bounds flagship
+    // spend (a 200 canary costs one flagship token; a walled canary 429s free).
+    const canarySet = this.premiumCanarySet();
+    const canaryEnabled = process.env.SWITCHROOM_DISABLE_MODEL_TIER_PROBE !== "1";
     for (const label of listAccounts(this.home)) {
       const creds = readAccountCredentials(label, this.home);
       const token = creds?.claudeAiOauth?.accessToken;
@@ -1940,7 +2202,39 @@ export class AuthBroker {
       }
       this.cacheQuotaSnapshot(label, result);
       probed.push({ label, result });
+      // #3176 — flagship-tier canary. The default haiku probe above CANNOT see
+      // the per-tier 7d_oi wall (haiku is `allowed` while flagship is
+      // `rejected`), so we issue a second 1-token request against the flagship
+      // tier and read its own response headers.
+      if (canaryEnabled && canarySet.has(label)) {
+        let tierResult: QuotaResult;
+        try {
+          tierResult = await this.fetchQuotaImpl({ accessToken: token, model: this.modelTierProbeModel });
+        } catch (err) {
+          this.logErr(`fleet-tier-probe ${label}: ${(err as Error).message}`);
+          continue;
+        }
+        this.recordTierProbe(label, tierResult);
+        const wall = quotaIndicatesModelTierWall(tierResult);
+        if (wall.walled) tierWalled.set(label, { until: wall.until, bucket: wall.bucket });
+      }
     }
+    // #3176 — pre-mark EVERY flagship-walled account before the roll phase.
+    // Without this, Phase 2 marks accounts one at a time, so the first walled
+    // account's roll would pick a second walled account that simply hadn't
+    // been marked yet (same ordering hazard the exhaustion path avoids by
+    // probing all before acting). Marking first makes
+    // `nextPremiumEligibleAccount` see the true fleet-wide state.
+    for (const [label, wall] of tierWalled) {
+      const now = this.now();
+      this.quota[label] = {
+        ...this.quota[label],
+        premium_walled_until: wall.until ?? now + MODEL_TIER_WALL_DEFAULT_MS,
+        premium_wall_bucket: wall.bucket ?? undefined,
+        premium_wall_marked_at: now,
+      };
+    }
+    if (tierWalled.size > 0) this.persistQuota();
     // Phase 2 — act on the fleet ACTIVE and on PINNED agent accounts.
     for (const { label, result } of probed) {
       // Re-read active each iteration: a promote earlier in this loop moves it.
@@ -1952,6 +2246,25 @@ export class AuthBroker {
       // active does. Non-active, non-pinned labels stay probe-only.
       const isPinnedAgentAccount = this.pinnedAgentAccounts().has(label);
       if (label !== active && !isPinnedAgentAccount) continue;
+      // #3176 — flagship-tier (7d_oi) wall acts BEFORE the 5h/7d exhaustion
+      // check: this is exactly the case the haiku probe reads healthy (the
+      // incident). A tier wall is tier-scoped (the account still serves
+      // opus/haiku), so it takes the dedicated tier roll, not mark-exhausted.
+      const tw = tierWalled.get(label);
+      if (tw) {
+        process.stdout.write(
+          `auth-broker: fleet-tier-probe shows ${label === active ? "ACTIVE" : "PINNED"} ${label} ` +
+            `flagship-tier walled (bucket=${tw.bucket ?? "?"}) — model-tier failover\n`,
+        );
+        this.audit({ op: "mark-exhausted", identity: { kind: "operator" }, account: label, accountKind: "claude", ok: true, reason: "model-tier-wall" });
+        const { rolledTo, allWalled, earliestReset } = this.markPremiumWalledAndRoll(label, tw.until, tw.bucket);
+        if (rolledTo && label === active) {
+          this.recordFleetRoll(label, rolledTo, "model-tier-wall", tw.until ?? undefined, tw.bucket);
+        } else if (allWalled && label === active) {
+          this.recordPremiumAllWalled(tw.bucket, earliestReset);
+        }
+        continue;
+      }
       const decision = quotaIndicatesExhaustion(result, this.isOverageAllowed(label));
       if (decision.exhausted) {
         process.stdout.write(
@@ -1995,8 +2308,9 @@ export class AuthBroker {
   private recordFleetRoll(
     from: string,
     to: string,
-    reason: "soft-avoid" | "hard-exhaustion",
+    reason: "soft-avoid" | "hard-exhaustion" | "model-tier-wall",
     exhaustedUntil?: number,
+    bucket?: string | null,
   ): void {
     const s = this.lastQuotaCache[from];
     this.lastFleetRoll = {
@@ -2004,8 +2318,12 @@ export class AuthBroker {
       to,
       at: this.now(),
       reason,
+      ...(bucket ? { bucket } : {}),
       ...(exhaustedUntil != null ? { exhausted_until: exhaustedUntil } : {}),
-      ...(s
+      // A model-tier wall does not bind on the 5h/7d windows — those read
+      // healthy (the whole point of the bug). Only stamp window/pct for the
+      // 5h/7d-driven rolls, where they are meaningful.
+      ...(s && reason !== "model-tier-wall"
         ? {
             window:
               s.fiveHourUtilizationPct >= s.sevenDayUtilizationPct
@@ -2016,6 +2334,54 @@ export class AuthBroker {
         : {}),
     };
     this.persistLastFleetRoll();
+  }
+
+  /* ─── Premium-tier all-walled alert (#3176) ─────────────────── */
+
+  /** Fleet-wide "every account is flagship-tier walled" state (see
+   *  {@link PremiumTierAllWalled}). Persisted so a restart doesn't drop the
+   *  operator alert. Null when at least one account can serve the flagship. */
+  private premiumTierAllWalled: PremiumTierAllWalled | null = null;
+
+  /** Record the all-flagship-walled condition for the operator card. */
+  private recordPremiumAllWalled(bucket: string | null, earliestReset: number | null): void {
+    this.premiumTierAllWalled = {
+      bucket,
+      ...(earliestReset != null ? { earliest_reset: earliestReset } : {}),
+      at: this.now(),
+    };
+    atomicWriteJsonSync(
+      join(this.stateDir, "premium-tier-all-walled.json"),
+      this.premiumTierAllWalled,
+      0o600,
+    );
+    process.stdout.write(
+      `auth-broker: ALL accounts flagship-tier walled (bucket=${bucket ?? "?"}` +
+        `${earliestReset != null ? `, earliest reset ${new Date(earliestReset).toISOString()}` : ""}) ` +
+        `— no premium-eligible failover target\n`,
+    );
+  }
+
+  /** Clear the all-walled alert once any account can serve the flagship again. */
+  private clearPremiumAllWalled(): void {
+    if (this.premiumTierAllWalled == null) return;
+    this.premiumTierAllWalled = null;
+    try { unlinkSync(join(this.stateDir, "premium-tier-all-walled.json")); } catch { /* best-effort */ }
+  }
+
+  /**
+   * The set of accounts the flagship-tier canary probes each tick: the fleet
+   * active, every `fallback_order` candidate (so a wall is seen BEFORE the
+   * fleet rolls onto it), and every pinned agent account. Bounds flagship
+   * spend to the serving set.
+   */
+  private premiumCanarySet(): Set<string> {
+    const set = new Set<string>();
+    const active = this.config.auth?.active;
+    if (active) set.add(active);
+    for (const cand of this.config.auth?.fallback_order ?? []) set.add(cand);
+    for (const acct of this.pinnedAgentAccounts()) set.add(acct);
+    return set;
   }
 
   /** Every account some agent is pinned to via per-agent `auth.override`. */
@@ -3696,6 +4062,9 @@ export class AuthBroker {
     // #2495 Change 1 — reload the durable utilization cache so a restart
     // serves last-known (age-stamped) quota, not a blank card.
     this.lastQuotaCache = this.readJson<LastQuotaCache>("last-quota.json") ?? {};
+    // #3176 — reload the durable flagship-tier canary cache + all-walled alert.
+    this.lastTierQuotaCache = this.readJson<LastTierQuotaCache>("last-tier-quota.json") ?? {};
+    this.premiumTierAllWalled = this.readJson<PremiumTierAllWalled>("premium-tier-all-walled.json") ?? null;
     this.applyActiveOverride();
   }
 
@@ -3760,6 +4129,8 @@ export class AuthBroker {
   /** #2495 Change 1 — mirror the utilization cache to disk so it survives
    *  a broker restart. Same atomic-write pattern as the exhaustion ledger. */
   private persistLastQuotaCache(): void { atomicWriteJsonSync(join(this.stateDir, "last-quota.json"), this.lastQuotaCache, 0o600); }
+  /** #3176 — mirror the flagship-tier canary cache to disk. */
+  private persistLastTierQuotaCache(): void { atomicWriteJsonSync(join(this.stateDir, "last-tier-quota.json"), this.lastTierQuotaCache, 0o600); }
   private persistNotificationClaims(): void { atomicWriteJsonSync(join(this.stateDir, "notification-claims.json"), this.notificationClaims, 0o600); }
   private persistLastFleetRoll(): void { if (this.lastFleetRoll) atomicWriteJsonSync(join(this.stateDir, "last-fleet-roll.json"), this.lastFleetRoll, 0o600); }
   private persistShaIndex(): void { atomicWriteJsonSync(join(this.stateDir, "sha-index.json"), this.shaIndex, 0o600); }
@@ -3827,9 +4198,11 @@ export class AuthBroker {
      *   "hard-exhaustion"     — the probe saw a genuine quota wall
      *   "throttle-escalation" — repeated transient 429s corroborated by a live
      *                           probe (429 throttle tier escalation guard)
+     *   "model-tier-wall"     — flagship-tier (7d_oi) canary saw the account
+     *                           walled on the premium tier (#3176)
      * Omitted for every other op.
      */
-    reason?: "soft-avoid" | "hard-exhaustion" | "throttle-escalation";
+    reason?: "soft-avoid" | "hard-exhaustion" | "throttle-escalation" | "model-tier-wall";
   }): void {
     const peer =
       entry.identity.kind === "operator"
@@ -3988,6 +4361,10 @@ export class AuthBroker {
     listeners: string[];
     /** #2495 Change 1 — durable utilization cache (in-memory view). */
     lastQuotaCache: LastQuotaCache;
+    /** #3176 — flagship-tier canary cache + all-walled alert + live active. */
+    lastTierQuotaCache: LastTierQuotaCache;
+    premiumTierAllWalled: PremiumTierAllWalled | null;
+    activeAccount: string | undefined;
   } {
     return {
       quota: { ...this.quota },
@@ -3995,6 +4372,11 @@ export class AuthBroker {
       thresholdViolations: { ...this.thresholdViolations },
       listeners: [...this.listeners.keys()],
       lastQuotaCache: structuredClone(this.lastQuotaCache),
+      lastTierQuotaCache: structuredClone(this.lastTierQuotaCache),
+      premiumTierAllWalled: this.premiumTierAllWalled
+        ? { ...this.premiumTierAllWalled }
+        : null,
+      activeAccount: this.config.auth?.active,
     };
   }
 

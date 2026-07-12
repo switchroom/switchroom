@@ -192,10 +192,14 @@ export interface FleetRollInfo {
   /**
    * Trigger attribution (#3031 PR 2): "soft-avoid" = proactive
    * serving-preference roll off an account APPROACHING its limits;
-   * "hard-exhaustion" = the probe saw a genuine quota wall. Absent on
-   * pre-PR-2 brokers — rendered as hard exhaustion.
+   * "hard-exhaustion" = the probe saw a genuine quota wall;
+   * "model-tier-wall" = the flagship-tier (7d_oi) canary saw the account
+   * walled on the premium tier (#3176). Absent on pre-PR-2 brokers —
+   * rendered as hard exhaustion.
    */
-  reason?: "soft-avoid" | "hard-exhaustion";
+  reason?: "soft-avoid" | "hard-exhaustion" | "model-tier-wall";
+  /** #3176 — the binding tier bucket, set only when reason is model-tier-wall. */
+  bucket?: string;
 }
 
 export type FleetRollAnnounceDecision =
@@ -241,9 +245,17 @@ export function buildFleetRollMessage(roll: FleetRollInfo, now: number): string 
       ? ` (resets ${formatRelative(new Date(roll.exhausted_until), new Date(now))})`
       : "";
   const softAvoid = roll.reason === "soft-avoid";
+  // #3176 — a model-tier wall binds on the flagship (premium) 7d_oi bucket, not
+  // the 5h/7d windows (which read healthy — the whole point of the bug), so it
+  // has no window/pct to cite. Name the flagship tier explicitly and reassure
+  // that opus/haiku on the walled account are unaffected (the mark is
+  // tier-scoped), rather than rendering a generic, misleading "quota window".
+  const modelTierWall = roll.reason === "model-tier-wall";
   const causeLine = softAvoid
     ? `Proactive switch — \`${codeSpanSafe(roll.from)}\` is approaching its limits (${winLabel}${pctPart})${resetPart}, so the fleet moved early instead of hitting the wall.`
-    : `${winLabel}${pctPart} on \`${codeSpanSafe(roll.from)}\`${resetPart}.`;
+    : modelTierWall
+      ? `Flagship (premium) tier weekly limit reached on \`${codeSpanSafe(roll.from)}\`${resetPart} — opus/haiku on that account are unaffected.`
+      : `${winLabel}${pctPart} on \`${codeSpanSafe(roll.from)}\`${resetPart}.`;
   return [
     `🔁 **Switched fleet to \`${codeSpanSafe(roll.to)}\`**`,
     ``,
