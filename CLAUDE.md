@@ -252,6 +252,18 @@ first.
 2. **Root-context editing:** never write into a uid-1000 checkout as uid 0 —
    root-owned files cause EACCES + git "dubious ownership" fallout for every
    later session. If it happens, `chown -R` back to the owning uid.
+   **The same rule binds scaffold/reconcile code:** any file a root-running
+   process (hostd rollout, sudo `apply`, `agent restart`'s reconcile) writes
+   into an agent home (`~/.switchroom/agents/<name>/`) MUST end up owned by
+   that agent's uid (`allocateAgentUid`) and readable by it — root:root 0600
+   agent dotfiles disable the agent's permission allowlist and storm the
+   operator with approval cards (#3168, v0.18.14 fleet incident). New write
+   sites inside `reconcileAgent` are covered by the end-of-reconcile
+   ownership sweep (`src/agents/agent-owned-tree.ts`); writers outside it
+   must chown explicitly (apply's `alignAgentUid` pattern) **and pin the
+   ownership with a regression test**. Beware especially tmp+rename atomic
+   writes — they replace the inode and silently re-own the file to the
+   writer's euid.
 3. Implement with tests; validate locally with scoped vitest/bun test +
    `npm run lint`.
 4. Conventional Commits (`feat(scope):` …). Push the branch to `origin`

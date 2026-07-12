@@ -23,6 +23,7 @@ import chalk from "chalk";
 import type { AgentConfig, QuotaConfig, SwitchroomConfig, TelegramConfig } from "../config/schema.js";
 import { CRON_SCRIPT_BASENAME_RE, LEGACY_CRON_SCRIPT_BASENAME_RE } from "./cron-unit-name.js";
 import { atomicWriteFileSync } from "../util/atomic.js";
+import { alignAgentTreeOwnershipIfRoot, findAgentUnreadablePaths } from "./agent-owned-tree.js";
 
 // Repo root for referencing bin/ scripts in hooks
 const REPO_ROOT = resolve(import.meta.dirname, "../..");
@@ -787,7 +788,13 @@ export function alignAgentUid(
   try {
     // Recursive chown via shell — node's fs.chownSync isn't recursive
     // and rolling our own walk just to fall back to sudo is wasted code.
-    execFileSync("chown", ["-R", `${uid}:${uid}`, ...paths], {
+    // `-h` (--no-dereference) is load-bearing on busybox hosts: busybox
+    // chown has no -H/-L/-P and without -h it dereferences every visited
+    // symlink, so a planted link inside the agent tree could re-own an
+    // arbitrary host file. No-op on GNU's -R traversal (defaults to -P).
+    // Same flag as agent-owned-tree.ts's chownTree — see its "Symlink
+    // safety" doc for the full rationale (#3168 review F2).
+    execFileSync("chown", ["-h", "-R", `${uid}:${uid}`, ...paths], {
       stdio: ["ignore", "ignore", "pipe"],
     });
     return { chowned: true, paths };
@@ -800,13 +807,13 @@ export function alignAgentUid(
   }
 
   try {
-    execFileSync("sudo", ["chown", "-R", `${uid}:${uid}`, ...paths], {
+    execFileSync("sudo", ["chown", "-h", "-R", `${uid}:${uid}`, ...paths], {
       stdio: "inherit",
     });
     return { chowned: true, paths };
   } catch {
     throw new Error(
-      `alignAgentUid: sudo chown failed for ${paths.join(", ")} (target uid ${uid}). Run manually: sudo chown -R ${uid}:${uid} ${paths.join(" ")}`,
+      `alignAgentUid: sudo chown failed for ${paths.join(", ")} (target uid ${uid}). Run manually: sudo chown -h -R ${uid}:${uid} ${paths.join(" ")}`,
     );
   }
 }
@@ -5817,7 +5824,57 @@ export function detectHooksDrift(
   return { drifted: true, summary };
 }
 
+/**
+ * Public reconcile entry point — reconcileAgentInner wrapped in an
+ * ownership backstop (#3168 review F1).
+ *
+ * The inner function runs the agent-tree ownership sweep on its SUCCESS
+ * path (plus the fail-loud readability assertion). But reconcile can also
+ * throw MID-RUN, after the atomic settings.json / .mcp.json rewrites have
+ * already replaced inodes on the bind mount (ENOSPC on a later write, a
+ * symlink migration error, a template render failure). Without a backstop,
+ * a root-run reconcile that dies in that window leaves root:root 0600
+ * dotfiles behind and the agent wedges with the exact #3168 permission-card
+ * storm on its next boot — silently, because the reconcile "failed cleanly".
+ *
+ * So: on ANY throw, re-run the sweep best-effort. The sweep's own failure
+ * is logged and swallowed here (never mask the original error — that one
+ * names the actual bug); the fail-loud readability assertion stays
+ * success-path only, inside the inner function.
+ */
 export function reconcileAgent(
+  name: string,
+  agentConfigRaw: AgentConfig,
+  agentsDir: string,
+  telegramConfig: TelegramConfig,
+  switchroomConfig: SwitchroomConfig,
+  switchroomConfigPath?: string,
+  options: ReconcileOptions = {},
+): ReconcileResult {
+  try {
+    return reconcileAgentInner(
+      name,
+      agentConfigRaw,
+      agentsDir,
+      telegramConfig,
+      switchroomConfig,
+      switchroomConfigPath,
+      options,
+    );
+  } catch (err) {
+    try {
+      alignAgentTreeOwnershipIfRoot(name, resolve(agentsDir, name));
+    } catch (sweepErr) {
+      console.warn(
+        `  ${chalk.yellow("⚠")} ownership backstop sweep failed for ${name} after a ` +
+          `mid-reconcile error: ${(sweepErr as Error).message}`,
+      );
+    }
+    throw err;
+  }
+}
+
+function reconcileAgentInner(
   name: string,
   agentConfigRaw: AgentConfig,
   agentsDir: string,
@@ -6906,6 +6963,39 @@ export function reconcileAgent(
     } else {
       symlinkSync("workspace/SOUL.md", agentSoulPath);
       changes.push(agentSoulPath);
+    }
+  }
+
+  // --- Ownership invariant (#3168): root-written files must land agent-owned ---
+  //
+  // The hostd rollout runs this whole function as root (`switchroom agent
+  // restart` spawned by src/cli/rollout.ts:681 — restart reconciles first).
+  // Any write above that created a NEW inode (atomicWriteFileSync's
+  // tmp+rename for settings.json / .mcp.json, first-writes, plugin recopy)
+  // landed root-owned — and root:root 0600 settings.json means the agent's
+  // claude loads NO permission allowlist and every tool call throws an
+  // operator approval card (2026-07-12 fleet-wide incident, v0.18.14 roll).
+  // Sweep the tree back to the agent UID (the reconcile twin of apply's
+  // alignAgentUid), then assert the files this reconcile touched are
+  // actually readable by the agent UID — fail loudly, never wedge silently.
+  {
+    const sweptUid = alignAgentTreeOwnershipIfRoot(name, agentDir);
+    if (sweptUid !== null) {
+      const critical = [
+        join(agentDir, ".claude", "settings.json"),
+        join(agentDir, ".mcp.json"),
+        join(agentDir, ".claude-cron", ".mcp.json"),
+        join(agentDir, "start.sh"),
+        ...changes.filter((p) => p.startsWith(agentDir + "/")),
+      ];
+      const unreadable = findAgentUnreadablePaths(critical, sweptUid);
+      if (unreadable.length > 0) {
+        throw new Error(
+          `reconcile left agent-unreadable files in ${agentDir} (agent uid ${sweptUid}): ` +
+            `${unreadable.join(", ")}. The agent cannot load these (permission-card ` +
+            `storm on next boot). This is a bug in the ownership sweep — see #3168.`,
+        );
+      }
     }
   }
 
