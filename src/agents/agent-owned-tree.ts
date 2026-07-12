@@ -104,7 +104,7 @@ export function alignAgentTreeOwnershipIfRoot(
       `reconcile wrote into ${agentDir} as root but could not restore agent ` +
         `ownership (target uid ${uid}): ${(err as Error).message}. ` +
         `The agent cannot read root-owned 0600 files (settings.json permission ` +
-        `allowlist → approval-card storm). Fix manually: chown -R ${uid}:${uid} ${agentDir}`,
+        `allowlist → approval-card storm). Fix manually: chown -h -R ${uid}:${uid} ${agentDir}`,
     );
   }
   return uid;

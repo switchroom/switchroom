@@ -137,6 +137,25 @@ describe("reconcileAgent — agent-tree ownership sweep (#3168)", () => {
     ).toThrow(/could not restore agent ownership/);
   });
 
+  it("the chown-failure remediation hint keeps the -h flag (#3168 review F3)", () => {
+    // The printed manual-fix command is operator advice that will be pasted
+    // as root over an agent-writable tree. Without -h, busybox chown
+    // dereferences a planted symlink — the exact F2 hazard, reintroduced by
+    // our own error message. Pin the flag so it can't silently regress.
+    const config = makeAgentConfig();
+    const { agentDir } = scaffoldAgent(AGENT, config, tmpDir, telegramConfig);
+
+    ownershipRuntime.geteuid = () => 0;
+    ownershipRuntime.chownTree = () => {
+      throw new Error("read-only file system");
+    };
+
+    const uid = allocateAgentUid(AGENT);
+    expect(() =>
+      reconcileAgent(AGENT, config, tmpDir, telegramConfig, switchroomConfig),
+    ).toThrow(`Fix manually: chown -h -R ${uid}:${uid} ${agentDir}`);
+  });
+
   it("fails the reconcile when the sweep leaves settings.json unreadable by the agent uid (pre-fix incident shape)", () => {
     const config = makeAgentConfig();
     const { agentDir } = scaffoldAgent(AGENT, config, tmpDir, telegramConfig);
