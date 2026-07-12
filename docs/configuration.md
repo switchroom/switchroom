@@ -58,6 +58,7 @@ Each field type has specific merge behavior when values exist at multiple layers
 | `channels.telegram.sub_agent_tick_interval_ms` | override | Progress-card: elapsed-counter tick interval (ms) while a sub-agent is running (default 10000) |
 | `channels.telegram.approval_timeout_minutes` | override | Operator approval-card lifetime (minutes) for the tool-use "Allow once" card and the vault grant decision wait. After this long with no tap, the card auto-denies as a TIMEOUT (the agent is told not to retry). Default 60. |
 | `channels.telegram.edit_budget_threshold` | override | Progress-card: card-edit budget per minute before throttled mode (default 18) |
+| `channels.telegram.send_gate.*` | override | Tunable rate limits for the deterministic outbound send gate (token buckets + per-message edit floor). Sub-keys: `enabled`, `global_per_sec` (25), `global_burst` (4), `per_chat_per_sec` (1), `per_chat_burst` (3), `per_group_per_min` (18), `per_group_burst` (2), `edit_floor_ms` (1500). Every key optional and defaults to the built-in value, so omitting the block is today's exact behaviour. Rates must be > 0 and bursts integers ≥ 1 (rejected loudly at config-load). The `SWITCHROOM_TELEGRAM_SEND_GATE=0` break-glass env var still wins on `enabled` when explicitly set. |
 | `channels.telegram.clear_status_on_completion` | override | When `true`, the live activity/status feed (the in-place "what it's doing" message) is **deleted** when the turn's final answer lands, leaving only the reply. Default `false`: the status message **stays** in the chat as a record (finalized to an all-done render) — no post-then-delete flicker. |
 | `channels.telegram.pin_status_while_working` | override | When `true` (default), the framework **silently pins** the already-rendered status message while its work is in-flight and **auto-unpins** it on completion — the per-turn activity/status message (foreground) and the `🛠 Worker` background-worker message. Keeps in-flight work in view when the conversation scrolls past it (fast turns, stacked background workers, long turns). It pins a message the chat **already owns** — no new surface is rendered — and never buzzes the device. The one sanctioned pin under `chat-is-the-single-source-of-truth`. Set `false` to disable. |
 | `channels.telegram.coalesce.window_ms` | override | Sliding-window (ms) for merging consecutive inbound messages from the same sender+topic into ONE Claude turn. A forwarded burst or a long paste that Telegram splits across several messages arrives as a single shared-context turn instead of N rapid-fire turns. Each new message resets the timer. Default `500`. Set `0` to disable coalescing (each message is its own turn). The 👀 acknowledgement still fires immediately, so perceived latency is unchanged. |
@@ -533,6 +534,51 @@ agents:
         stream_mode: checklist
         edit_budget_threshold: 12
         sub_agent_tick_interval_ms: 15000
+```
+
+## Send-Gate Rate Limits
+
+The deterministic outbound send gate (`telegram-plugin/send-gate.ts`, on by
+default since v0.18.17) is the single token-bucket scheduler every Bot API call
+transits, so the many per-surface throttles (reply chunks, stream edits, typing,
+worker-feed edits, reactions, cards) can't add up past a per-bot-token flood
+ceiling. Its rate limits are compile-time defaults; `channels.telegram.send_gate.*`
+makes them tunable per agent. **Every key is optional and defaults to the built-in
+value — omit the whole block to reproduce today's exact behaviour. Setting a knob
+is pure operator tuning; no default changes.**
+
+Rates must be `> 0` and bursts must be integers `>= 1` (a zero rate or zero-capacity
+bucket would never admit a token and wedge all sends). Out-of-range values are
+**rejected loudly at config-load** with a clear error — never silently clamped.
+
+| Field | Default | Description | When to tune |
+|---|---|---|---|
+| `enabled` | `true` | Master switch for the send gate. When `false`, `gate()` is a straight passthrough (the retry policy behaves exactly as before the gate existed). | Leave on. Turn off only to isolate a suspected gate-induced regression — prefer the env valve below for a runtime kill. |
+| `global_per_sec` | 25 | Global bucket sustained rate: Bot API calls/sec across ALL chats (headroom under Telegram's ~30/s). | Lower if a single bot fans out to many chats and you want a tighter global ceiling; raising above ~25 risks the per-token flood ban. |
+| `global_burst` | 4 | Global bucket burst capacity. Worst-case 1 s window admits `global_burst + global_per_sec` = 29 < 30. | Rarely tuned. Keep the `burst + per_sec < 30` margin in mind. |
+| `per_chat_per_sec` | 1 | Per-chat sustained rate: calls/sec to a single chat (Telegram's ~1 msg/sec/chat practical ceiling). | Fractional values allowed (e.g. `0.5` for one send every 2 s). Lower for a quieter cadence. |
+| `per_chat_burst` | 3 | Per-chat burst capacity. | Increase if legitimate rapid multi-chunk replies to one chat get paced too aggressively. |
+| `per_group_per_min` | 18 | Per-group sustained rate: calls/min to a single group/supergroup (headroom under Telegram's ~20/min group ceiling). | Lower for very chatty groups; keep under 20. |
+| `per_group_burst` | 2 | Per-group burst capacity. | Rarely tuned. |
+| `edit_floor_ms` | 1500 | Minimum ms between successive edits of the SAME `message_id` (last-write-wins coalescing enforces the floor). `0` disables the floor. | Raise to further slow card/stream edit churn; lower (or `0`) only if you understand the ~1 edit/sec/message ceiling. |
+
+**Precedence — config vs the break-glass env valve.** The `SWITCHROOM_TELEGRAM_SEND_GATE`
+env var is the operator's runtime kill-switch (`0`/`false`/`off`/`no` disables the
+gate without a config edit or rebuild). It is **distinct** from `send_gate.enabled`
+and, when **explicitly set, always wins** — on or off — regardless of config, so an
+operator disabling the gate mid-incident is never overridden by YAML. When the env
+valve is unset, `send_gate.enabled` decides; when both are unset, the gate is ON.
+The rate knobs come only from config (there was never an env override for them).
+
+```yaml
+agents:
+  worker:
+    channels:
+      telegram:
+        send_gate:
+          per_chat_per_sec: 0.5   # one send every 2 s to any single chat
+          per_chat_burst: 2
+          edit_floor_ms: 2000     # slow same-message edit churn
 ```
 
 ### Advanced env: orphaned-reply liveness window

@@ -468,16 +468,43 @@ export interface SendGate {
 
 const GROUP_TYPES = new Set<ChatType>(['group', 'supergroup'])
 
+/**
+ * Compile-time default rate limits for the send gate's token buckets and edit
+ * floor — the values `createSendGate` falls back to when a field is omitted.
+ *
+ * Exposed so the config plumbing (`channels.telegram.send_gate.*` →
+ * `SWITCHROOM_TG_SEND_GATE_*` env → `sendGateConfigFromEnv`) defaults to the
+ * SAME numbers, and so a test can PIN them: a future accidental change to any
+ * default fails that pin. Changing a value here is a real behaviour change for
+ * every install — do it deliberately, never as a drive-by edit.
+ */
+export const SEND_GATE_DEFAULTS = {
+  /** Global bucket sustained rate (tokens/sec). */
+  globalPerSec: 25,
+  /** Global burst capacity (headroom under Telegram's ~30/s). */
+  globalBurst: 4,
+  /** Per-chat sustained rate (tokens/sec). */
+  perChatPerSec: 1,
+  /** Per-chat burst capacity. */
+  perChatBurst: 3,
+  /** Per-group sustained rate (tokens/min). */
+  perGroupPerMin: 18,
+  /** Per-group burst capacity (headroom under 20/min). */
+  perGroupBurst: 2,
+  /** Minimum ms between edits of the same message_id. */
+  editFloorMs: 1500,
+} as const
+
 export function createSendGate(config: SendGateConfig): SendGate {
   const enabled = config.enabled
   const clock = config.clock ?? systemClock
-  const globalPerSec = config.globalPerSec ?? 25
-  const globalBurst = config.globalBurst ?? 4
-  const perChatPerSec = config.perChatPerSec ?? 1
-  const perChatBurst = config.perChatBurst ?? 3
-  const perGroupPerMin = config.perGroupPerMin ?? 18
-  const perGroupBurst = config.perGroupBurst ?? 2
-  const editFloorMs = config.editFloorMs ?? 1500
+  const globalPerSec = config.globalPerSec ?? SEND_GATE_DEFAULTS.globalPerSec
+  const globalBurst = config.globalBurst ?? SEND_GATE_DEFAULTS.globalBurst
+  const perChatPerSec = config.perChatPerSec ?? SEND_GATE_DEFAULTS.perChatPerSec
+  const perChatBurst = config.perChatBurst ?? SEND_GATE_DEFAULTS.perChatBurst
+  const perGroupPerMin = config.perGroupPerMin ?? SEND_GATE_DEFAULTS.perGroupPerMin
+  const perGroupBurst = config.perGroupBurst ?? SEND_GATE_DEFAULTS.perGroupBurst
+  const editFloorMs = config.editFloorMs ?? SEND_GATE_DEFAULTS.editFloorMs
   const messageStateTtlMs = config.messageStateTtlMs ?? 60_000
   const maxMessageStates = config.maxMessageStates ?? 5_000
   const usefulTtlMs = config.usefulTtlMs ?? 120_000
@@ -1081,6 +1108,101 @@ export function createSendGate(config: SendGateConfig): SendGate {
 export function sendGateEnabledFromEnv(env: NodeJS.ProcessEnv = process.env): boolean {
   const v = env.SWITCHROOM_TELEGRAM_SEND_GATE
   if (v == null) return true
+  return !isOffValue(v)
+}
+
+/** Shared parse for the default-on kill-switch grammar: `0/false/off/no`. */
+function isOffValue(v: string): boolean {
   const t = v.trim().toLowerCase()
-  return !(t === '0' || t === 'false' || t === 'off' || t === 'no')
+  return t === '0' || t === 'false' || t === 'off' || t === 'no'
+}
+
+/** Parse a strictly-positive finite number env var; blank/NaN/≤0 → undefined. */
+function parsePositiveNumber(raw: string | undefined): number | undefined {
+  if (raw == null || raw.trim() === '') return undefined
+  const n = Number(raw)
+  return Number.isFinite(n) && n > 0 ? n : undefined
+}
+
+/** Parse a positive integer env var; blank/NaN/non-int/≤0 → undefined. */
+function parsePositiveInt(raw: string | undefined): number | undefined {
+  if (raw == null || raw.trim() === '') return undefined
+  const n = Number(raw)
+  return Number.isInteger(n) && n > 0 ? n : undefined
+}
+
+/** Parse a non-negative integer env var; blank/NaN/non-int/<0 → undefined. */
+function parseNonNegativeInt(raw: string | undefined): number | undefined {
+  if (raw == null || raw.trim() === '') return undefined
+  const n = Number(raw)
+  return Number.isInteger(n) && n >= 0 ? n : undefined
+}
+
+/**
+ * The resolved rate-limit + enable slice `createSendGate` consumes, sourced
+ * from env (which the scaffold populates from `channels.telegram.send_gate.*`).
+ * Only fields the operator SET are present; an unset rate field is absent so
+ * `createSendGate` applies its `SEND_GATE_DEFAULTS` fallback (unset ⇒ today's
+ * exact behaviour).
+ */
+export type SendGateEnvConfig = Pick<SendGateConfig, 'enabled'> &
+  Partial<
+    Pick<
+      SendGateConfig,
+      | 'globalPerSec'
+      | 'globalBurst'
+      | 'perChatPerSec'
+      | 'perChatBurst'
+      | 'perGroupPerMin'
+      | 'perGroupBurst'
+      | 'editFloorMs'
+    >
+  >
+
+/**
+ * Resolve the send gate's `enabled` flag + tunable rate limits from env.
+ *
+ * ENABLED PRECEDENCE (least-surprising, documented):
+ *   1. `SWITCHROOM_TELEGRAM_SEND_GATE` — the operator break-glass valve. When
+ *      EXPLICITLY set it ALWAYS wins (unchanged kill-switch semantics), on or
+ *      off, regardless of config. An operator disabling the gate in an incident
+ *      must not be overridden by YAML.
+ *   2. `SWITCHROOM_TG_SEND_GATE_ENABLED` — from `channels.telegram.send_gate.
+ *      enabled`. Decides only when the valve above is unset.
+ *   3. Both unset ⇒ `true` (the gate is ON by default, unchanged).
+ *
+ * The rate knobs come solely from config (there was never an env override for
+ * them). Config values are validated LOUDLY at load by the Zod schema; this
+ * parse is a defensive net — a hand-set malformed env falls back to undefined
+ * so `createSendGate` uses its built-in default rather than wedging sends.
+ */
+export function sendGateConfigFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): SendGateEnvConfig {
+  const killSwitch = env.SWITCHROOM_TELEGRAM_SEND_GATE
+  let enabled: boolean
+  if (killSwitch != null && killSwitch.trim() !== '') {
+    enabled = !isOffValue(killSwitch)
+  } else {
+    const cfg = env.SWITCHROOM_TG_SEND_GATE_ENABLED
+    enabled = cfg != null && cfg.trim() !== '' ? !isOffValue(cfg) : true
+  }
+
+  const out: SendGateEnvConfig = { enabled }
+  const globalPerSec = parsePositiveNumber(env.SWITCHROOM_TG_SEND_GATE_GLOBAL_PER_SEC)
+  if (globalPerSec !== undefined) out.globalPerSec = globalPerSec
+  const globalBurst = parsePositiveInt(env.SWITCHROOM_TG_SEND_GATE_GLOBAL_BURST)
+  if (globalBurst !== undefined) out.globalBurst = globalBurst
+  const perChatPerSec = parsePositiveNumber(env.SWITCHROOM_TG_SEND_GATE_PER_CHAT_PER_SEC)
+  if (perChatPerSec !== undefined) out.perChatPerSec = perChatPerSec
+  const perChatBurst = parsePositiveInt(env.SWITCHROOM_TG_SEND_GATE_PER_CHAT_BURST)
+  if (perChatBurst !== undefined) out.perChatBurst = perChatBurst
+  const perGroupPerMin = parsePositiveNumber(env.SWITCHROOM_TG_SEND_GATE_PER_GROUP_PER_MIN)
+  if (perGroupPerMin !== undefined) out.perGroupPerMin = perGroupPerMin
+  const perGroupBurst = parsePositiveInt(env.SWITCHROOM_TG_SEND_GATE_PER_GROUP_BURST)
+  if (perGroupBurst !== undefined) out.perGroupBurst = perGroupBurst
+  const editFloorMs = parseNonNegativeInt(env.SWITCHROOM_TG_SEND_GATE_EDIT_FLOOR_MS)
+  if (editFloorMs !== undefined) out.editFloorMs = editFloorMs
+
+  return out
 }

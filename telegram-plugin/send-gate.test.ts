@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { createSendGate, sendGateEnabledFromEnv, type Clock } from './send-gate.js'
+import {
+  createSendGate,
+  sendGateEnabledFromEnv,
+  sendGateConfigFromEnv,
+  SEND_GATE_DEFAULTS,
+  type Clock,
+} from './send-gate.js'
 
 /**
  * Deterministic fake clock. `sleep()` registers a wake at `now + ms`;
@@ -114,6 +120,118 @@ describe('send-gate: feature flag', () => {
         } as unknown as NodeJS.ProcessEnv),
       ).toBe(true)
     }
+  })
+})
+
+describe('send-gate: SEND_GATE_DEFAULTS (compile-time default PIN)', () => {
+  it('pins the exact default rate limits — a drive-by change fails here', () => {
+    // Load-bearing PIN: these are the values createSendGate falls back to when a
+    // knob is unset, i.e. today's shipped behaviour. If any of these numbers
+    // changes, that is a real behaviour change and must be a deliberate,
+    // reviewed edit — not a silent drift. (#3084 send-gate config PR.)
+    expect(SEND_GATE_DEFAULTS).toEqual({
+      globalPerSec: 25,
+      globalBurst: 4,
+      perChatPerSec: 1,
+      perChatBurst: 3,
+      perGroupPerMin: 18,
+      perGroupBurst: 2,
+      editFloorMs: 1500,
+    })
+  })
+})
+
+describe('send-gate: sendGateConfigFromEnv (yaml → env → createSendGate)', () => {
+  const E = (o: Record<string, string | undefined>) => o as unknown as NodeJS.ProcessEnv
+
+  it('maps every SWITCHROOM_TG_SEND_GATE_* env to the exact createSendGate field', () => {
+    // The gateway spreads this object straight into createSendGate({...}), so
+    // asserting the returned slice IS asserting what createSendGate receives.
+    const cfg = sendGateConfigFromEnv(
+      E({
+        SWITCHROOM_TG_SEND_GATE_ENABLED: '1',
+        SWITCHROOM_TG_SEND_GATE_GLOBAL_PER_SEC: '40',
+        SWITCHROOM_TG_SEND_GATE_GLOBAL_BURST: '6',
+        SWITCHROOM_TG_SEND_GATE_PER_CHAT_PER_SEC: '2',
+        SWITCHROOM_TG_SEND_GATE_PER_CHAT_BURST: '5',
+        SWITCHROOM_TG_SEND_GATE_PER_GROUP_PER_MIN: '30',
+        SWITCHROOM_TG_SEND_GATE_PER_GROUP_BURST: '4',
+        SWITCHROOM_TG_SEND_GATE_EDIT_FLOOR_MS: '2000',
+      }),
+    )
+    expect(cfg).toEqual({
+      enabled: true,
+      globalPerSec: 40,
+      globalBurst: 6,
+      perChatPerSec: 2,
+      perChatBurst: 5,
+      perGroupPerMin: 30,
+      perGroupBurst: 4,
+      editFloorMs: 2000,
+    })
+  })
+
+  it('accepts a fractional per-sec rate (rates are not integers)', () => {
+    const cfg = sendGateConfigFromEnv(E({ SWITCHROOM_TG_SEND_GATE_PER_CHAT_PER_SEC: '0.5' }))
+    expect(cfg.perChatPerSec).toBe(0.5)
+  })
+
+  it('unset knobs are ABSENT so createSendGate applies SEND_GATE_DEFAULTS (no behaviour change)', () => {
+    const cfg = sendGateConfigFromEnv(E({}))
+    // Only enabled is present; every rate field is omitted → default fallback.
+    expect(cfg).toEqual({ enabled: true })
+    // And the gate built from it actually pours in the pinned defaults.
+    const gate = createSendGate({ ...cfg, clock: new FakeClock() })
+    // enabled default is ON (escape hatch, not opt-in).
+    expect(gate.stats().enabled).toBe(true)
+  })
+
+  it('drops malformed / wedge-inducing env values back to the default (defensive net)', () => {
+    // The LOUD rejection lives in the Zod config schema; a hand-set bad env must
+    // never wedge sends, so it falls back to undefined → compile-time default.
+    const cfg = sendGateConfigFromEnv(
+      E({
+        SWITCHROOM_TG_SEND_GATE_GLOBAL_PER_SEC: '0', // ≤0 → dropped
+        SWITCHROOM_TG_SEND_GATE_PER_CHAT_BURST: '-3', // negative → dropped
+        SWITCHROOM_TG_SEND_GATE_PER_GROUP_BURST: '2.5', // non-int → dropped
+        SWITCHROOM_TG_SEND_GATE_GLOBAL_BURST: 'nonsense', // NaN → dropped
+      }),
+    )
+    expect(cfg).toEqual({ enabled: true })
+  })
+
+  it('edit_floor_ms accepts 0 (disables the floor) but not negatives', () => {
+    expect(sendGateConfigFromEnv(E({ SWITCHROOM_TG_SEND_GATE_EDIT_FLOOR_MS: '0' })).editFloorMs).toBe(0)
+    expect(
+      sendGateConfigFromEnv(E({ SWITCHROOM_TG_SEND_GATE_EDIT_FLOOR_MS: '-1' })).editFloorMs,
+    ).toBeUndefined()
+  })
+
+  describe('enabled precedence: break-glass valve > config > default-on', () => {
+    it('config send_gate.enabled decides when the env valve is unset', () => {
+      expect(sendGateConfigFromEnv(E({ SWITCHROOM_TG_SEND_GATE_ENABLED: '0' })).enabled).toBe(false)
+      expect(sendGateConfigFromEnv(E({ SWITCHROOM_TG_SEND_GATE_ENABLED: '1' })).enabled).toBe(true)
+      expect(sendGateConfigFromEnv(E({ SWITCHROOM_TG_SEND_GATE_ENABLED: 'off' })).enabled).toBe(false)
+    })
+
+    it('the SWITCHROOM_TELEGRAM_SEND_GATE valve ALWAYS wins when explicitly set', () => {
+      // valve off beats config on
+      expect(
+        sendGateConfigFromEnv(
+          E({ SWITCHROOM_TELEGRAM_SEND_GATE: '0', SWITCHROOM_TG_SEND_GATE_ENABLED: '1' }),
+        ).enabled,
+      ).toBe(false)
+      // valve on beats config off
+      expect(
+        sendGateConfigFromEnv(
+          E({ SWITCHROOM_TELEGRAM_SEND_GATE: '1', SWITCHROOM_TG_SEND_GATE_ENABLED: '0' }),
+        ).enabled,
+      ).toBe(true)
+    })
+
+    it('both unset ⇒ enabled (ON by default, unchanged)', () => {
+      expect(sendGateConfigFromEnv(E({})).enabled).toBe(true)
+    })
   })
 })
 

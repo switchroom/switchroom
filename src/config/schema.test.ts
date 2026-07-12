@@ -58,6 +58,78 @@ describe("TelegramChannelSchema — removed rate_limit_ms knob (#3161)", () => {
   });
 });
 
+describe("TelegramChannelSchema — send_gate rate limits (#3084)", () => {
+  it("accepts a full send_gate block and preserves every knob", () => {
+    const r = TelegramChannelSchema.parse({
+      send_gate: {
+        enabled: true,
+        global_per_sec: 40,
+        global_burst: 6,
+        per_chat_per_sec: 2,
+        per_chat_burst: 5,
+        per_group_per_min: 30,
+        per_group_burst: 4,
+        edit_floor_ms: 2000,
+      },
+    });
+    expect(r?.send_gate).toEqual({
+      enabled: true,
+      global_per_sec: 40,
+      global_burst: 6,
+      per_chat_per_sec: 2,
+      per_chat_burst: 5,
+      per_group_per_min: 30,
+      per_group_burst: 4,
+      edit_floor_ms: 2000,
+    });
+  });
+
+  it("omitting send_gate leaves it undefined (built-in defaults own the unset case)", () => {
+    const r = TelegramChannelSchema.parse({ format: "html" });
+    expect(r?.send_gate).toBeUndefined();
+  });
+
+  it("accepts a fractional per-sec rate (rates need not be integers)", () => {
+    const r = TelegramChannelSchema.parse({ send_gate: { per_chat_per_sec: 0.5 } });
+    expect(r?.send_gate?.per_chat_per_sec).toBe(0.5);
+  });
+
+  it("edit_floor_ms may be 0 (disables the floor)", () => {
+    const r = TelegramChannelSchema.parse({ send_gate: { edit_floor_ms: 0 } });
+    expect(r?.send_gate?.edit_floor_ms).toBe(0);
+  });
+
+  it("rejects a zero per-chat rate LOUDLY at config-load (would wedge sends)", () => {
+    expect(() =>
+      TelegramChannelSchema.parse({ send_gate: { per_chat_per_sec: 0 } }),
+    ).toThrow();
+  });
+
+  it("rejects a negative global rate LOUDLY at config-load", () => {
+    expect(() =>
+      TelegramChannelSchema.parse({ send_gate: { global_per_sec: -5 } }),
+    ).toThrow();
+  });
+
+  it("rejects a zero burst LOUDLY (a 0-capacity bucket never admits a token)", () => {
+    expect(() =>
+      TelegramChannelSchema.parse({ send_gate: { per_group_burst: 0 } }),
+    ).toThrow();
+  });
+
+  it("rejects a non-integer burst LOUDLY", () => {
+    expect(() =>
+      TelegramChannelSchema.parse({ send_gate: { global_burst: 2.5 } }),
+    ).toThrow();
+  });
+
+  it("rejects a negative edit_floor_ms LOUDLY", () => {
+    expect(() =>
+      TelegramChannelSchema.parse({ send_gate: { edit_floor_ms: -1 } }),
+    ).toThrow();
+  });
+});
+
 describe("TelegramChannelSchema — voice_out (PR-C2)", () => {
   it("applies engine/reply_mode defaults when only enabled is set", () => {
     const r = TelegramChannelSchema.parse({ voice_out: { enabled: true } });

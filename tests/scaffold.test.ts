@@ -3552,6 +3552,56 @@ describe("scaffoldAgent with global defaults cascade", () => {
     expect(startSh).toContain("export SWITCHROOM_TG_STREAM_THROTTLE_MS='500'");
   });
 
+  it("channels.telegram.send_gate.* become SWITCHROOM_TG_SEND_GATE_* env vars", () => {
+    const agentConfig = makeAgentConfig({
+      channels: {
+        telegram: {
+          send_gate: {
+            enabled: false,
+            global_per_sec: 40,
+            global_burst: 6,
+            per_chat_per_sec: 2,
+            per_chat_burst: 5,
+            per_group_per_min: 30,
+            per_group_burst: 4,
+            edit_floor_ms: 2000,
+          },
+        },
+      },
+    });
+    const result = scaffoldAgent(
+      "send-gate-env-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+    );
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+
+    expect(startSh).toContain("export SWITCHROOM_TG_SEND_GATE_ENABLED='0'");
+    expect(startSh).toContain("export SWITCHROOM_TG_SEND_GATE_GLOBAL_PER_SEC='40'");
+    expect(startSh).toContain("export SWITCHROOM_TG_SEND_GATE_GLOBAL_BURST='6'");
+    expect(startSh).toContain("export SWITCHROOM_TG_SEND_GATE_PER_CHAT_PER_SEC='2'");
+    expect(startSh).toContain("export SWITCHROOM_TG_SEND_GATE_PER_CHAT_BURST='5'");
+    expect(startSh).toContain("export SWITCHROOM_TG_SEND_GATE_PER_GROUP_PER_MIN='30'");
+    expect(startSh).toContain("export SWITCHROOM_TG_SEND_GATE_PER_GROUP_BURST='4'");
+    expect(startSh).toContain("export SWITCHROOM_TG_SEND_GATE_EDIT_FLOOR_MS='2000'");
+  });
+
+  it("an unset send_gate emits NO send-gate env vars (built-in defaults own it)", () => {
+    const agentConfig = makeAgentConfig({
+      channels: { telegram: { format: "html" } },
+    });
+    const result = scaffoldAgent(
+      "no-send-gate-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+    );
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+
+    expect(startSh).not.toContain("SWITCHROOM_TG_SEND_GATE_");
+  });
+
   it("user env entry wins over channel-derived env default on key conflict", () => {
     const agentConfig = makeAgentConfig({
       channels: { telegram: { format: "markdownv2" } },
