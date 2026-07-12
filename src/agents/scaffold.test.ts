@@ -104,6 +104,7 @@ describe("alignAgentUid", () => {
     const [bin, args] = mockedExecFileSync.mock.calls[0];
     expect(bin).toBe("chown");
     expect(args).toEqual([
+      "-h",
       "-R",
       "10042:10042",
       "/fake/state/agent",
@@ -127,6 +128,7 @@ describe("alignAgentUid", () => {
     const [bin, args] = mockedExecFileSync.mock.calls[0];
     expect(bin).toBe("chown");
     expect(args).toEqual([
+      "-h",
       "-R",
       "10042:10042",
       "/fake/state/agent",
@@ -158,6 +160,7 @@ describe("alignAgentUid", () => {
     expect(bin2).toBe("sudo");
     expect(args2).toEqual([
       "chown",
+      "-h",
       "-R",
       "10042:10042",
       "/fake/state/agent",
@@ -178,7 +181,7 @@ describe("alignAgentUid", () => {
         writeOut: () => {},
         confirm: false,
       }),
-    ).toThrow(/sudo chown failed.*Run manually: sudo chown -R 10042:10042/);
+    ).toThrow(/sudo chown failed.*Run manually: sudo chown -h -R 10042:10042/);
     expect(mockedExecFileSync).toHaveBeenCalledTimes(2);
   });
 
@@ -230,7 +233,7 @@ describe("alignAgentUid", () => {
     expect(res.paths).toEqual([expectedLogsDir]);
     const [bin, args] = mockedExecFileSync.mock.calls[0];
     expect(bin).toBe("chown");
-    expect(args).toEqual(["-R", "10042:10042", expectedLogsDir]);
+    expect(args).toEqual(["-h", "-R", "10042:10042", expectedLogsDir]);
   });
 
   // #1831 — the audit dir must be chowned alongside state + logs.
