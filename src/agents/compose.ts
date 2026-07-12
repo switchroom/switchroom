@@ -28,7 +28,6 @@
  *     their own dir under /run/switchroom/broker.
  */
 
-import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, lstatSync, readlinkSync, chmodSync } from "node:fs";
 import { join, isAbsolute, dirname, resolve } from "node:path";
 import type { SwitchroomConfig, AgentConfig, AgentBindMount } from "../config/schema.js";
@@ -86,14 +85,17 @@ import { resolveMainModel } from "./scaffold.js";
 import { isClaudeModel } from "../../telegram-plugin/gateway/model-command.js";
 import { resolveAgentConfig } from "../config/merge.js";
 import { resolveTimezone } from "../config/timezone.js";
-import { isReservedAgentName } from "../vault/broker/peercred.js";
 import { getBundledSkillsPoolDir } from "./reconcile-default-skills.js";
 import { loadHostCapabilities } from "../setup/host-capabilities.js";
 import type { VoiceEngine } from "../setup/gpu-detect.js";
+import { AGENT_UID_MIN, AGENT_UID_MAX, allocateAgentUid } from "./agent-uid.js";
 
-/** UID range reserved for agent containers. 999 slots — practical fleet limit. */
-export const AGENT_UID_MIN = 10001;
-export const AGENT_UID_MAX = 10999;
+// UID derivation lives in agent-uid.ts (a leaf module) so scaffold.ts can
+// import it without a compose ↔ scaffold cycle (compose.ts imports
+// resolveMainModel from scaffold.ts above). Re-exported here because every
+// pre-existing consumer (brokers, kernel, apply, doctor) imports these
+// symbols from compose.js.
+export { AGENT_UID_MIN, AGENT_UID_MAX, allocateAgentUid };
 
 /** Resource defaults by profile category. RFC §"Resource limits as foot-guns". */
 export interface ResourceDefaults {
@@ -251,38 +253,6 @@ export function resolveResourceDefaults(
     }
   }
   return merged;
-}
-
-/**
- * Allocate a deterministic UID for an agent in [AGENT_UID_MIN, AGENT_UID_MAX].
- *
- * Algorithm: SHA-256 of the agent name, take the first 4 bytes as a
- * uint32, modulo the range size, plus the floor. This is collision-prone
- * by birthday-paradox at large fleets — `checkAgentUidUniqueness` in
- * doctor flags collisions and instructs the operator to rename one of
- * the colliders. With 50 agents the collision probability is ~0.12%; at
- * the canonical ~10-agent fleet it's negligible.
- *
- * Determinism: same name → same UID, always. This matters for
- * compose regeneration after an `add agent` so existing agents' UIDs
- * never shift (which would require a chown sweep over their state).
- */
-export function allocateAgentUid(name: string): number {
-  // Names reserved by other identity kinds (today: "operator", used for
-  // the host-shell broker socket) cannot be used as agent names.
-  // Refusing here at allocation rather than letting a same-named agent
-  // silently collide with the operator socket — which would forge an
-  // identity from the broker's POV.
-  if (isReservedAgentName(name)) {
-    throw new Error(
-      `agent name '${name}' is reserved by switchroom for another identity kind ` +
-      `(see vault/broker/peercred.ts:RESERVED_AGENT_NAMES). Pick a different name.`,
-    );
-  }
-  const hash = createHash("sha256").update(name).digest();
-  const u32 = hash.readUInt32BE(0);
-  const range = AGENT_UID_MAX - AGENT_UID_MIN + 1;
-  return AGENT_UID_MIN + (u32 % range);
 }
 
 /**
