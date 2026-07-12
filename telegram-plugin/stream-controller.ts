@@ -228,8 +228,9 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
   // `maybeRenderOutbound` path; a body whose markdown-escaping pushed the
   // rendered form past the cap splits into several pieces, each of which fits
   // its own wire cap and never bisects a fenced block / table row (see
-  // `renderOutboundChunks`). Flag OFF (default) and a literal `format:'text'`
-  // stream both yield a single passthrough piece — no behavioural change.
+  // `renderOutboundChunks`). Rendering disabled (SWITCHROOM_RICH_RENDER=0)
+  // and a literal `format:'text'` stream both yield a single passthrough
+  // piece — byte-for-byte the pre-renderer send path.
   const renderPieces = (text: string): { text: string; rich: boolean }[] => {
     if (literalText) return [{ text, rich: false }]
     // A `plain`-mode piece (oversized/unsafe content renderSafe declined to

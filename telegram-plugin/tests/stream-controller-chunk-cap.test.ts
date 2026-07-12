@@ -2,7 +2,8 @@
  * Wire-level regression test for the chunk-boundary cap bug
  * (fix/rich-render-chunk-boundary-cap).
  *
- * With `SWITCHROOM_RICH_RENDER` on, a near-cap body full of escapable chars
+ * With the rich renderer enabled (the default — escape hatch, not opt-in), a
+ * near-cap body full of escapable chars
  * (`_ * |`) makes `renderSafe` degrade the whole document to plain (its escaped
  * rich form exceeds RICH_MESSAGE_MAX_CHARS). BEFORE the fix, the stream
  * controller shipped that ~32k plain body through the plain `sendMessage`
@@ -13,7 +14,7 @@
  * emitted send fits its own wire cap: rich pieces <= 32768, plain pieces
  * <= 4096, and no fenced block is bisected.
  */
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import { createStreamController } from "../stream-controller.js";
 import { createFakeBotApi } from "./fake-bot-api.js";
 import { RICH_MESSAGE_MAX_CHARS } from "../format.js";
@@ -25,12 +26,7 @@ function fenceCount(s: string): number {
 }
 
 describe("stream-controller enforces the wire cap on the post-escape body", () => {
-  afterEach(() => {
-    delete process.env.SWITCHROOM_RICH_RENDER;
-  });
-
   it("REGRESSION: near-cap escapable first send never exceeds the plain wire cap", async () => {
-    process.env.SWITCHROOM_RICH_RENDER = "1";
     const bot = createFakeBotApi({ startMessageId: 1000 });
     const unit = "a_b*c|d ";
     const body = unit.repeat(Math.floor((RICH_MESSAGE_MAX_CHARS - 20) / unit.length));
@@ -62,7 +58,6 @@ describe("stream-controller enforces the wire cap on the post-escape body", () =
     // callback. The pre-fix code re-sent all (N-1) tails as brand-new messages
     // on each edit tick, so `sent.length` grew by (N-1) every update. After the
     // fix, tails are parked once and edited in place — `sent.length` is flat.
-    process.env.SWITCHROOM_RICH_RENDER = "1";
     const bot = createFakeBotApi({ startMessageId: 3000 });
     const unit = "a_b*c|d ";
     // Near-cap body that degrades to plain and splits into several pieces.
@@ -106,17 +101,22 @@ describe("stream-controller enforces the wire cap on the post-escape body", () =
     }
   }, 30000);
 
-  it("flag OFF leaves the single-send path untouched", async () => {
-    const bot = createFakeBotApi({ startMessageId: 2000 });
-    const stream = createStreamController({
-      bot: bot as unknown as Parameters<typeof createStreamController>[0]["bot"],
-      chatId: "c1",
-      throttleMs: 0,
-    });
-    await stream.update("**hi** _there_");
-    await stream.finalize();
-    expect(bot.state.sent).toHaveLength(1);
-    expect(bot.state.sent[0].rich).toBe(true);
-    expect(bot.state.sent[0].text).toBe("**hi** _there_");
+  it("kill-switch (=0) leaves the single-send path byte-for-byte untouched", async () => {
+    process.env.SWITCHROOM_RICH_RENDER = "0";
+    try {
+      const bot = createFakeBotApi({ startMessageId: 2000 });
+      const stream = createStreamController({
+        bot: bot as unknown as Parameters<typeof createStreamController>[0]["bot"],
+        chatId: "c1",
+        throttleMs: 0,
+      });
+      await stream.update("**hi** _there_");
+      await stream.finalize();
+      expect(bot.state.sent).toHaveLength(1);
+      expect(bot.state.sent[0].rich).toBe(true);
+      expect(bot.state.sent[0].text).toBe("**hi** _there_");
+    } finally {
+      delete process.env.SWITCHROOM_RICH_RENDER;
+    }
   });
 });

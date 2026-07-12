@@ -1,21 +1,24 @@
-// Flag-gated wiring for the Bot API 10.1 rich renderer (parse.ts + render.ts)
-// into the live outbound send path.
+// Wiring for the Bot API 10.1 rich renderer (parse.ts + render.ts) into the
+// live outbound send path.
 //
 // The renderer (`render/render.ts`, PR #2930) and parser (`render/parse.ts`)
 // have full unit coverage but were, until this module, wired into NOTHING —
-// no outbound message ever flowed through them. This module is the single,
-// feature-flagged bridge: the gateway's rich send path (stream-controller.ts)
-// runs the assistant's raw markdown through `parse → renderSafe` before it
-// reaches `sendRichMessage`, but ONLY when the flag is on.
+// no outbound message ever flowed through them. This module is the single
+// bridge: the gateway's rich send path (stream-controller.ts) runs the
+// assistant's raw markdown through `parse → renderSafe` before it reaches
+// `sendRichMessage`, unless the escape hatch below disables it.
 //
-// Feature flag — `SWITCHROOM_RICH_RENDER`, default OFF:
-//   Mirrors the `SWITCHROOM_VISIBLE_ANSWER_STREAM` convention
-//   (`answer-stream-flag.ts`): an env var read at runtime, default off, opted
-//   in PER AGENT via the `env:` block in `switchroom.yaml` (propagated into
-//   the container `environment:` by `src/agents/compose.ts`). When off,
-//   `maybeRenderOutbound` returns the input untouched, so the live send path
-//   is byte-for-byte unchanged — no agent's behaviour moves until an operator
-//   explicitly flips the flag for a specific agent. Accepts `1/true/on/yes`.
+// Escape hatch — `SWITCHROOM_RICH_RENDER`, default ON:
+//   ON BY DEFAULT in every install — an escape hatch, not an opt-in feature,
+//   mirroring the send gate's convention (`sendGateEnabledFromEnv` in
+//   `send-gate.ts`, default-on since #3153; also `midTurnFloorEnabled`,
+//   `SWITCHROOM_RATE_LIMIT_OVERAGE=0`). Enabled unless the var is explicitly
+//   set to a falsey/off value (`0`/`false`/`off`/`no`, case-insensitive,
+//   trimmed) — per agent via the `env:` block in `switchroom.yaml`
+//   (propagated into the container `environment:` by
+//   `src/agents/compose.ts`). When disabled, `maybeRenderOutbound` returns
+//   the input untouched, so the live send path is byte-for-byte the
+//   pre-renderer behaviour (raw transcript markdown to `sendRichMessage`).
 //
 // Why route through `renderSafe` and not bare `render`:
 //   `renderSafe` guarantees the returned body is never a rich-markdown string
@@ -38,17 +41,19 @@ import { RICH_MESSAGE_MAX_CHARS, splitMarkdownChunks } from "../format.js";
  */
 export const PLAIN_TEXT_MAX_CHARS = 4096;
 
-/** Parse the `SWITCHROOM_RICH_RENDER` flag value. Default OFF; accepts the
- *  same truthy tokens as the other switchroom env flags. Pure so the default
- *  + parsing are unit-testable. */
+/** Parse the `SWITCHROOM_RICH_RENDER` kill-switch value. Default ON; disabled
+ *  only by an explicit falsey/off token (`0`/`false`/`off`/`no`,
+ *  case-insensitive, trimmed) — the same disable vocabulary as
+ *  `sendGateEnabledFromEnv`. Unset, empty, or unrecognised values → ON. Pure
+ *  so the default + parsing are unit-testable. */
 export function parseRichRenderEnabled(raw: string | undefined): boolean {
-  if (raw == null) return false;
+  if (raw == null) return true;
   const v = raw.trim().toLowerCase();
-  return v === "1" || v === "true" || v === "on" || v === "yes";
+  return !(v === "0" || v === "false" || v === "off" || v === "no");
 }
 
 /** Is the rich renderer enabled in this process? Reads the env flag live so a
- *  test can set/unset it per-case; defaults OFF. */
+ *  test can set/unset it per-case; defaults ON (escape hatch, not opt-in). */
 export function richRenderEnabled(
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
@@ -65,13 +70,14 @@ export function renderOutbound(
 }
 
 /**
- * Flag-gated transform for the live send path.
+ * Kill-switch-gated transform for the live send path.
  *
- *   - flag OFF (default): returns the input untouched, `mode: "markdown"` —
- *     identical to the pre-existing behaviour (raw transcript markdown sent
- *     straight to `sendRichMessage`). No behavioural change for any agent.
- *   - flag ON: returns `parse → renderSafe` output. `mode: "plain"` signals
- *     the caller to send WITHOUT the rich wrapper (oversized/unsafe content).
+ *   - enabled (default): returns `parse → renderSafe` output. `mode: "plain"`
+ *     signals the caller to send WITHOUT the rich wrapper (oversized/unsafe
+ *     content).
+ *   - disabled (`SWITCHROOM_RICH_RENDER=0`): returns the input untouched,
+ *     `mode: "markdown"` — identical to the pre-renderer behaviour (raw
+ *     transcript markdown sent straight to `sendRichMessage`).
  */
 export function maybeRenderOutbound(
   text: string,
@@ -83,7 +89,7 @@ export function maybeRenderOutbound(
 }
 
 /**
- * Flag-gated, CAP-ENFORCING transform for the live send path.
+ * Kill-switch-gated, CAP-ENFORCING transform for the live send path.
  *
  * `maybeRenderOutbound` returns ONE `RenderResult` and can only ever fit a
  * body into a single wire message. But `renderSafe`'s markdown re-escaping
@@ -104,11 +110,13 @@ export function maybeRenderOutbound(
  * plain degradation would have thrown away: the smaller pieces individually
  * escape under `maxLen` and come back as `markdown`.
  *
- *   - flag OFF (default): `[{ text, mode: "markdown", degradations: [] }]` —
- *     a single passthrough piece, identical to `maybeRenderOutbound`.
- *   - flag ON, body fits: `[renderSafe(...)]` — a single piece, identical to
- *     `maybeRenderOutbound` (byte-for-byte for the common case).
- *   - flag ON, body oversize: 2+ cap-respecting pieces in send order.
+ *   - disabled (`SWITCHROOM_RICH_RENDER=0`):
+ *     `[{ text, mode: "markdown", degradations: [] }]` — a single passthrough
+ *     piece, identical to `maybeRenderOutbound`.
+ *   - enabled (default), body fits: `[renderSafe(...)]` — a single piece,
+ *     identical to `maybeRenderOutbound` (byte-for-byte for the common case).
+ *   - enabled (default), body oversize: 2+ cap-respecting pieces in send
+ *     order.
  */
 export function renderOutboundChunks(
   text: string,

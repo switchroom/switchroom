@@ -61,13 +61,14 @@ import { richRenderEnabled } from "../../render/rich-render.js";
 const AGENT = "test-harness";
 
 // The rich-render wiring (parse -> IR -> renderSafe -> sendRichMessage) is
-// gated behind `SWITCHROOM_RICH_RENDER` (default OFF). The expandable /
-// collapsible round-trip proof below only runs when BOTH the driver creds AND
-// the flag are present — the flag must be set in the gateway process under
-// test for the renderer to actually shape the outbound message, so gating the
-// scenario on the same flag keeps it honest (no false green when the wiring
-// isn't live). When the flag is off, this scenario self-skips green exactly
-// like the credential-less case.
+// ON BY DEFAULT, with `SWITCHROOM_RICH_RENDER=0` as the escape hatch. The
+// expandable / collapsible round-trip proof below only runs when the driver
+// creds are present AND the renderer hasn't been killed off — the same
+// setting must hold in the gateway process under test for the renderer to
+// actually shape the outbound message, so gating the scenario on the same
+// check keeps it honest (no false green when the wiring isn't live). When
+// the kill-switch is set, this scenario self-skips green exactly like the
+// credential-less case.
 const RICH_RENDER_ON = richRenderEnabled();
 
 // The driver session is the load-bearing credential. Absent it, spinUp()

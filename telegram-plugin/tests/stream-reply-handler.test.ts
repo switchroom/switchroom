@@ -81,7 +81,7 @@ describe('handleStreamReply', () => {
     expect(state.activeDraftStreams.size).toBe(1)
   })
 
-  it('a non-text format ships raw GFM markdown unescaped (no parse_mode)', async () => {
+  it('a non-text format ships GFM markdown unescaped (no parse_mode)', async () => {
     const state = makeState()
     const deps = makeDeps(bot)
 
@@ -94,7 +94,10 @@ describe('handleStreamReply', () => {
     await pending
 
     expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
-    expect(richSendMarkdown(bot)).toBe('**hi** _there_')
+    // The default-on rich renderer (parse -> renderSafe) normalises the
+    // italic marker (`_there_` -> `*there*`, same wire entity) but the
+    // payload stays unescaped GFM markdown — no HTML, no MarkdownV2 escaping.
+    expect(richSendMarkdown(bot)).toBe('**hi** *there*')
     // No parse_mode on rich opts.
     expect(bot.api.sendRichMessage.mock.calls[0][2]?.parse_mode).toBeUndefined()
   })

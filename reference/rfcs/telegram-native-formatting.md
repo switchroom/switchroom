@@ -250,6 +250,15 @@ Telegram entity on the live wire.
 - **No streaming assumptions.** Rollout changes only which agents render rich;
   the whole-reply/chunked send model (§2) is unchanged.
 
+**Rollout completed (2026-07-12).** After the §6a live-wire verification, the
+canary/staggered rollout above ran its course and `SWITCHROOM_RICH_RENDER`
+flipped to **ON by default** — an escape hatch, not an opt-in feature,
+following the repo's default-on kill-switch convention (same shape as the
+send gate's `SWITCHROOM_TELEGRAM_SEND_GATE`, #3153). `SWITCHROOM_RICH_RENDER=0`
+(or `false`/`off`/`no`) per agent disables it without a rebuild. The
+degrade-to-plain safety path (`renderSafe`) is unchanged and remains the
+failure fallback.
+
 ---
 
 ## 8. Out of scope

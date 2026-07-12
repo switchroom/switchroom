@@ -17,8 +17,10 @@ import { describe, it, expect } from "vitest";
 import { renderOutboundChunks, PLAIN_TEXT_MAX_CHARS } from "../../render/rich-render.js";
 import { RICH_MESSAGE_MAX_CHARS } from "../../format.js";
 
-const ON = { SWITCHROOM_RICH_RENDER: "1" } as NodeJS.ProcessEnv;
-const OFF = {} as NodeJS.ProcessEnv;
+// Rendering is ON BY DEFAULT (escape hatch, not opt-in — mirrors the send
+// gate): an empty env exercises the real default; "0" is the kill-switch.
+const ON = {} as NodeJS.ProcessEnv;
+const OFF = { SWITCHROOM_RICH_RENDER: "0" } as NodeJS.ProcessEnv;
 
 /** Count fenced-code delimiter lines (```) in a body. A piece that bisects a
  *  fenced block has an ODD count. */
@@ -27,7 +29,7 @@ function fenceCount(s: string): number {
 }
 
 describe("renderOutboundChunks", () => {
-  it("flag OFF is a single passthrough piece (byte-for-byte)", () => {
+  it("disabled (=0) is a single passthrough piece (byte-for-byte)", () => {
     const raw = "**bold** and _italic_ | a | table |";
     const pieces = renderOutboundChunks(raw, OFF);
     expect(pieces).toHaveLength(1);
@@ -35,7 +37,7 @@ describe("renderOutboundChunks", () => {
     expect(pieces[0].mode).toBe("markdown");
   });
 
-  it("flag ON, body that fits is a single piece (common case)", () => {
+  it("default (env unset), body that fits is a single piece (common case)", () => {
     const pieces = renderOutboundChunks("just some plain prose", ON);
     expect(pieces).toHaveLength(1);
     expect(pieces[0].text.length).toBeLessThanOrEqual(RICH_MESSAGE_MAX_CHARS);
