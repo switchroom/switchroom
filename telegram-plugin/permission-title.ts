@@ -20,7 +20,7 @@
 import { basename } from "node:path";
 import { escapeMarkdown } from "./card-format.js";
 import { prettyMcpServer, type ScopeOption } from "./permission-rule.js";
-import { redact } from "./secret-detect/redact.js";
+import { redact, REDACTED_MARKER } from "./secret-detect/redact.js";
 
 const COMMAND_TITLE_MAX = 48;
 const DESCRIPTION_LINE_MAX = 240;
@@ -34,6 +34,55 @@ const RESOURCE_KEYS = ["path", "endpoint", "url", "resource", "route"];
 const ARG_SUMMARY_MAX_KEYS = 4; // how many payload keys to surface on the card
 const ARG_VALUE_MAX = 40; // per-value truncation in the arg-summary line
 const ARG_SUMMARY_LINE_MAX = 180; // total cap for the arg-summary line
+
+/**
+ * Input keys that are routing / formatting / id noise, never operator-
+ * meaningful context. Stripped when synthesizing the fallback `context:`
+ * line (#3167) so it surfaces the substance (the reply text, the command,
+ * the query) and not `chat_id` / `format` / `disable_notification` chrome.
+ * `reason`/`why` are here too because their presence takes the `why:` path —
+ * they never reach the synthesizer.
+ */
+const CONTEXT_NOISE_KEYS = new Set([
+  "reason",
+  "why",
+  "chat_id",
+  "message_id",
+  "message_thread_id",
+  "thread_id",
+  "origin_turn_id",
+  "reply_to",
+  "quote",
+  "quote_text",
+  "format",
+  "parse_mode",
+  "disable_web_page_preview",
+  "disable_notification",
+  "protect_content",
+  "single_use",
+  "ack_text",
+  "inline_keyboard",
+  "file_id",
+]);
+
+/**
+ * Input keys whose VALUE is credential-shaped by name — hard-masked whole,
+ * never partially revealed (#3167 review). The token-shape detectors in
+ * `redact()` need a random-looking value to fire, so a low-entropy password
+ * or a short secret under one of these keys would otherwise slip through the
+ * synthesized `context:` line. Matching the key is the reliable signal.
+ */
+const SENSITIVE_VALUE_KEY_RE =
+  /token|secret|password|passwd|key|auth|dsn|conn|url|credential|cookie|session/i;
+
+/**
+ * Credential-bearing DSN schemes that `redactUrls()` (inside `redact()`) does
+ * NOT cover — it only handles http(s)/ws(s)/ftp. A `postgres://user:pass@host`
+ * DATABASE_URL is a real vault-key shape here, so mask the whole DSN when its
+ * authority carries a `user:pass@` credential (#3167 review).
+ */
+const NON_HTTP_DSN_RE =
+  /\b(?:postgres(?:ql)?|mysql|mariadb|redis|rediss|mongodb(?:\+srv)?|amqp|amqps):\/\/\S*@\S+/gi;
 
 /**
  * Human verb-phrases for switchroom-managed MCP tools. The raw
@@ -141,15 +190,23 @@ export function formatPermissionCardBody(opts: {
   // static schema description (#2469).
   const callerReason = callerSuppliedReason(opts.inputPreview);
   const rawWhy = (callerReason ?? "").replace(/\s+/g, " ").trim();
-  const truncatedWhy =
-    rawWhy.length > DESCRIPTION_LINE_MAX
-      ? rawWhy.slice(0, DESCRIPTION_LINE_MAX - 1) + "…"
-      : rawWhy;
-  lines.push(
-    truncatedWhy.length > 0
-      ? `why: _${escapeTgHtml(truncatedWhy)}_`
-      : `why: _not provided_`,
-  );
+  if (rawWhy.length > 0) {
+    const truncatedWhy =
+      rawWhy.length > DESCRIPTION_LINE_MAX
+        ? rawWhy.slice(0, DESCRIPTION_LINE_MAX - 1) + "…"
+        : rawWhy;
+    lines.push(`why: _${escapeTgHtml(truncatedWhy)}_`);
+  } else {
+    // No caller reason. Many tools (reply, react, edit_message, …) carry no
+    // `reason`/`why` argument at all, so a bare "why: not provided" gives the
+    // operator nothing to decide on — the post-rollout permission storm filled
+    // the chat with contentless cards (#3167). Fall back to an honest,
+    // redaction-safe `context:` line synthesized from the tool + its salient
+    // input, so the card always carries something meaningful. The distinct
+    // label keeps the agent's omission of a rationale visible (it is NOT a
+    // fabricated "why"), while still surfacing what the tool is about to do.
+    lines.push(`context: _${escapeTgHtml(synthesizeContext(opts.toolName, opts.inputPreview))}_`);
+  }
 
   // Third line (REST-wrapper MCP writes only): a redaction-safe summary of
   // the payload so the operator can see WHAT is being sent, not just the
@@ -595,6 +652,111 @@ function callerSuppliedReason(inputPreview: string | undefined): string | null {
     if (r) return r;
   }
   return null;
+}
+
+/**
+ * Honest, redaction-safe fallback for the card's rationale line when the
+ * caller supplied no `reason`/`why` (#3167). Synthesizes context from a
+ * summary of the tool's salient input fields — the reply text, the command,
+ * the search query — so the operator always has something to decide on
+ * instead of a contentless "not provided". Every value passes through
+ * `redact()`; ids / routing / formatting keys are stripped. Falls back to
+ * the natural action phrase when the input exposes nothing salient.
+ * Deterministic (no model in the loop): same input → same line. Exported
+ * for unit testing.
+ */
+export function synthesizeContext(
+  toolName: string,
+  inputPreview: string | undefined,
+): string {
+  const input = parseInput(inputPreview);
+  const summary = input ? salientInputSummary(input) : null;
+  // Prefer the salient input summary (the reply text, the query, the diff
+  // target) — the substance the title's verb-phrase does NOT already carry.
+  // When the input exposes nothing meaningful, fall back to the natural
+  // action so the line still names the tool rather than reading empty.
+  const base = summary ?? naturalAction(toolName, inputPreview);
+  // Acceptance criteria (#3167) call for "tool + summarized input +
+  // originating turn". When the call carries a forum-topic origin turn,
+  // append a compact reference so the operator can tie the card to the turn
+  // that spawned it. Kept short — it's a routing id, not prose.
+  const turnRef = input ? readString(input, "origin_turn_id") : null;
+  return turnRef ? `${base} · turn ${shortTurnRef(turnRef)}` : base;
+}
+
+/** Compact display form of an origin-turn id — the tail is the distinguishing
+ *  part; a full opaque id would swamp the line. */
+function shortTurnRef(turnId: string): string {
+  const t = turnId.trim();
+  return t.length <= 10 ? t : `…${t.slice(-8)}`;
+}
+
+/**
+ * A compact, redaction-safe summary of the operator-meaningful scalar fields
+ * of a tool input — used to build the synthesized `context:` line (#3167).
+ * Skips {@link CONTEXT_NOISE_KEYS} (ids/routing/formatting), surfaces up to
+ * {@link ARG_SUMMARY_MAX_KEYS} scalar `key: value` pairs (each redacted +
+ * truncated), and renders nested objects/arrays as the bare key name (no
+ * value dump — avoids leaking PII/secrets and oversized blobs). Returns null
+ * when nothing meaningful remains, so the caller falls back to the bare
+ * action phrase.
+ *
+ * Free-text fields (e.g. a reply `text`) surface as content — a conscious
+ * choice (#3167 review, LOW-1): the operator NEEDS to see *what* is being
+ * sent to judge the card. Exposure is bounded to {@link ARG_VALUE_MAX} chars
+ * and every value is redaction-passed via {@link redactSalientValue}, so a
+ * card can never leak more than the outbound reply already does in history
+ * (both use the same `redact()` chokepoint). We do not mask free text to a
+ * placeholder, which would gut the card's usefulness.
+ */
+function salientInputSummary(input: Record<string, unknown>): string | null {
+  const parts: string[] = [];
+  for (const [key, value] of Object.entries(input)) {
+    if (CONTEXT_NOISE_KEYS.has(key)) continue;
+    if (value == null) continue;
+    if (parts.length >= ARG_SUMMARY_MAX_KEYS) {
+      parts.push("…");
+      break;
+    }
+    if (typeof value === "object") {
+      parts.push(key); // nested object/array → key name only, never dumped
+      continue;
+    }
+    const shown = truncate(redactSalientValue(key, String(value)), ARG_VALUE_MAX);
+    if (shown.length === 0) continue;
+    parts.push(`${key}: ${shown}`);
+  }
+  if (parts.length === 0) return null;
+  const joined = parts.join(", ");
+  return joined.length > ARG_SUMMARY_LINE_MAX
+    ? joined.slice(0, ARG_SUMMARY_LINE_MAX - 1) + "…"
+    : joined;
+}
+
+/**
+ * Redact a single salient value for display on the synthesized `context:`
+ * line, given its input KEY (#3167 review). Three layers, defense-in-depth:
+ *
+ *   1. Hard-mask whole when the key is credential-shaped
+ *      ({@link SENSITIVE_VALUE_KEY_RE}) — the token-shape detectors need a
+ *      random-looking value, so a low-entropy password / short secret under a
+ *      `token`/`password`/`api_key` key would otherwise leak. The key name is
+ *      the reliable signal.
+ *   2. Mask non-http DSN credentials ({@link NON_HTTP_DSN_RE}) that
+ *      `redactUrls()` misses (postgres://user:pass@host, mysql://, redis://…).
+ *   3. Run `redact()` WITH the key restored as `key=value` context, so the
+ *      contextual detectors (`kv_entropy` / `env_key_value`) that require the
+ *      `key[:=]value` shape in one string can fire — then strip the synthetic
+ *      `key=` prefix. Redacting the BARE value (the pre-review bug) blinded
+ *      those detectors, since `redact()` deliberately excludes the
+ *      low-precision `generic_high_entropy` fallback.
+ */
+function redactSalientValue(key: string, value: string): string {
+  if (SENSITIVE_VALUE_KEY_RE.test(key)) return REDACTED_MARKER;
+  const dsnScrubbed = value.replace(NON_HTTP_DSN_RE, REDACTED_MARKER);
+  const scrubbed = redact(`${key}=${dsnScrubbed}`);
+  const prefix = `${key}=`;
+  return scrubbed.startsWith(prefix) ? scrubbed.slice(prefix.length) : scrubbed;
 }
 
 /**

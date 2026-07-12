@@ -156,25 +156,188 @@ describe('formatPermissionCardBody', () => {
     expect(body).toContain('why: _listing temp files_')
   })
 
-  test('shows "not provided" when no caller reason is present (never the description)', () => {
+  // #3167: no caller reason → an honest synthesized `context:` line built
+  // from the tool's salient input, NEVER a bare "why: not provided" and never
+  // the static schema description. The distinct `context:` label keeps the
+  // agent's omission of a rationale visible.
+  test('synthesizes a context line when no caller reason is present (never "not provided" / the description)', () => {
     const body = formatPermissionCardBody({
       toolName: 'Bash',
       inputPreview: JSON.stringify({ command: 'ls /tmp' }),
       description: 'Run a shell command on the host.',
       agentName: 'gymbro',
     })
-    expect(body).toContain('why: _not provided_')
+    expect(body).not.toContain('not provided')
     expect(body).not.toContain('Run a shell command')
+    expect(body).toContain('context: _command: ls /tmp_')
   })
 
-  test('shows "not provided" when caller reason is whitespace only', () => {
+  test('synthesizes context when the caller reason is whitespace only', () => {
     const body = formatPermissionCardBody({
       toolName: 'Bash',
       inputPreview: JSON.stringify({ command: 'ls /tmp', reason: '   \n ' }),
       description: 'Run a shell command.',
       agentName: 'gymbro',
     })
-    expect(body).toContain('why: _not provided_')
+    expect(body).not.toContain('not provided')
+    expect(body).toContain('context: _command: ls /tmp_')
+  })
+
+  // #3167 root case: the `reply` tool (and react/edit_message/…) carries NO
+  // `reason` argument, so its cards used to render a contentless
+  // "🔐 Clerk wants to reply / why: not provided". Now the reply text is
+  // synthesized onto a `context:` line so the operator has something to judge.
+  test('reply (no reason arg) synthesizes the reply text as context, not "not provided"', () => {
+    const body = formatPermissionCardBody({
+      toolName: 'mcp__switchroom-telegram__reply',
+      inputPreview: JSON.stringify({
+        chat_id: '12345',
+        text: "On it — pulling yesterday's GitHub activity now.",
+        format: 'html',
+        disable_notification: true,
+      }),
+      description: 'Reply on Telegram.',
+      agentName: 'clerk',
+    })
+    const lines = body.split('\n')
+    expect(lines[0]).toBe('🔐 **Clerk** wants to reply')
+    expect(body).not.toContain('not provided')
+    // Salient field surfaced (truncated); id/routing/formatting noise stripped.
+    expect(body).toContain('context: _text: On it — pulling')
+    expect(body).toMatch(/context: _text: On it — pulling[^_]*…_/)
+    expect(body).not.toContain('chat_id')
+    expect(body).not.toContain('disable_notification')
+    expect(body).not.toContain('format')
+  })
+
+  test('a reason ON a reply card still renders as why:, not context: (#3167)', () => {
+    const body = formatPermissionCardBody({
+      toolName: 'mcp__switchroom-telegram__reply',
+      inputPreview: JSON.stringify({
+        chat_id: '12345',
+        text: 'done',
+        reason: 'answering the operator’s status question',
+      }),
+      description: 'Reply on Telegram.',
+      agentName: 'clerk',
+    })
+    expect(body).toContain('why: _answering the operator’s status question_')
+    expect(body).not.toContain('context:')
+  })
+
+  test('synthesized context redacts secrets in the salient input (#3167)', () => {
+    const fakeToken = 'sk-ant-' + 'api03-' + 'B'.repeat(48)
+    const body = formatPermissionCardBody({
+      toolName: 'mcp__switchroom-telegram__reply',
+      inputPreview: JSON.stringify({ chat_id: '1', text: `here is the key: ${fakeToken}` }),
+      description: 'Reply on Telegram.',
+      agentName: 'clerk',
+    })
+    expect(body).toContain('context:')
+    expect(body).not.toContain(fakeToken)
+  })
+
+  test('falls back to the natural action when the input exposes nothing salient (#3167)', () => {
+    const body = formatPermissionCardBody({
+      toolName: 'ExitPlanMode',
+      inputPreview: undefined,
+      description: 'Exit plan mode.',
+      agentName: 'clerk',
+    })
+    expect(body).not.toContain('not provided')
+    expect(body).toContain('context: _exit plan mode_')
+  })
+
+  // #3167 review (HIGH/MEDIUM): the salient-value redactor must catch secrets
+  // the bare-value path missed. redact() excludes generic_high_entropy and the
+  // contextual kv detectors need a `key=value` shape — so a prefixless token
+  // under a credential-shaped key leaked verbatim. These FAIL pre-fix.
+  test('hard-masks a prefixless high-entropy value under a `token` key (#3167)', () => {
+    // No sk-/ghp-/JWT prefix — shape detection alone cannot catch it; only the
+    // key-name signal ("token") does.
+    const bare = 'Zx8Kq2Lm9Rn4Tv6Wb1Yc3Hd5Jf7Ug0Pe'
+    const body = formatPermissionCardBody({
+      toolName: 'mcp__acme__do',
+      inputPreview: JSON.stringify({ token: bare, note: 'ping' }),
+      description: 'do a thing',
+      agentName: 'clerk',
+    })
+    expect(body).not.toContain(bare)
+    // `token` value is hard-masked; the benign `note` still surfaces.
+    expect(body).toContain('token:')
+    expect(body).toContain('REDACTED')
+    expect(body).toContain('note: ping')
+  })
+
+  test('hard-masks a 40-hex secret under a `secret`-shaped key (#3167)', () => {
+    const hex = 'a3f1'.repeat(10) // 40 hex chars, no prefix
+    const body = formatPermissionCardBody({
+      toolName: 'mcp__acme__do',
+      inputPreview: JSON.stringify({ webhook_secret: hex }),
+      description: 'do a thing',
+      agentName: 'clerk',
+    })
+    expect(body).not.toContain(hex)
+    expect(body).toContain('REDACTED')
+  })
+
+  test('masks a non-http DSN credential embedded in free text (redactUrls misses it) (#3167)', () => {
+    // Under a benign key (`text`) so the hard-mask key path does NOT fire —
+    // this exercises the NON_HTTP_DSN_RE scheme coverage specifically.
+    const dsn = 'postgres://user:S3cretPass99@db.host:5432/app'
+    const body = formatPermissionCardBody({
+      toolName: 'mcp__switchroom-telegram__reply',
+      inputPreview: JSON.stringify({ chat_id: '1', text: `connect via ${dsn} then run` }),
+      description: 'Reply on Telegram.',
+      agentName: 'clerk',
+    })
+    expect(body).not.toContain('S3cretPass99')
+    expect(body).not.toContain(dsn)
+    expect(body).toContain('REDACTED')
+  })
+
+  test('hard-masks a DATABASE_URL under a url-shaped key (#3167)', () => {
+    const dsn = 'postgres://admin:hunter2pass@10.0.0.5/prod'
+    const body = formatPermissionCardBody({
+      toolName: 'mcp__acme__migrate',
+      inputPreview: JSON.stringify({ database_url: dsn }),
+      description: 'run a migration',
+      agentName: 'clerk',
+    })
+    expect(body).not.toContain('hunter2pass')
+    expect(body).not.toContain(dsn)
+    expect(body).toContain('REDACTED')
+  })
+
+  // #3167 review (LOW-2): acceptance asks for "tool + summarized input +
+  // originating turn" — surface a compact origin-turn reference when present.
+  test('appends a compact originating-turn reference when origin_turn_id is present (#3167)', () => {
+    const body = formatPermissionCardBody({
+      toolName: 'mcp__switchroom-telegram__reply',
+      inputPreview: JSON.stringify({ chat_id: '1', text: 'hi', origin_turn_id: 'turn-abcdef123456' }),
+      description: 'Reply on Telegram.',
+      agentName: 'clerk',
+    })
+    expect(body).toContain('· turn …ef123456')
+    // The raw routing id is NOT dumped as its own kv pair.
+    expect(body).not.toContain('origin_turn_id:')
+  })
+
+  // #3167 review (LOW-3): raw commands/text now reach the context line, so a
+  // markdown metachar in the value must be escaped or it can spoof/break the
+  // card's own `_italic_` / `code` formatting.
+  test('escapes markdown metachars in the synthesized context value (#3167)', () => {
+    const body = formatPermissionCardBody({
+      toolName: 'Bash',
+      inputPreview: JSON.stringify({ command: 'echo _a_ *b* `c`' }),
+      description: 'run a shell command',
+      agentName: 'clerk',
+    })
+    // The metachars are backslash-escaped so they can't open emphasis/code.
+    expect(body).toContain('\\_a\\_')
+    expect(body).toContain('\\*b\\*')
+    expect(body).toContain('\\`c\\`')
+    expect(body).not.toContain('echo _a_ *b* `c`')
   })
 
   test('drops the agent prefix when agentName is null (early-boot edge)', () => {
