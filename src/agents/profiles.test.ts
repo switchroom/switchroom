@@ -556,3 +556,44 @@ describe("renderDevProtocolFragment", () => {
     expect(fragment.length).toBeGreaterThan(500);
   });
 });
+
+describe("steer-forwarding guidance — delegation-carrying profile templates", () => {
+  // Job spec: reference/jobs/steer-or-queue-mid-flight.md. Gap: when a
+  // mid-turn user message amends work already delegated to a running
+  // background sub-agent, agents tended to hold the amendment until
+  // handback instead of steering the worker (the harness supports it —
+  // the Agent tool returns an agent id; SendMessage continues it). The
+  // job spec's never-ship list bans silent classification, so the
+  // guidance must also require saying steer-vs-queue in the reply.
+  // Pinned on BOTH templates that carry delegation guidance: default
+  // (full Sub-Agent Delegation section) and coding (short form).
+
+  const readTemplate = (profile: string): string =>
+    readFileSync(join(getProfilePath(profile), "CLAUDE.md.hbs"), "utf-8");
+
+  it("default profile: forwards mid-turn amendments to the running worker via SendMessage", () => {
+    const template = readTemplate("default");
+    expect(template).toContain("SendMessage");
+    expect(template.toLowerCase()).toContain("rather than holding it for handback");
+  });
+
+  it("default profile: requires stating steer-vs-queue in the reply, never inferred", () => {
+    const template = readTemplate("default");
+    expect(template.toLowerCase()).toContain("folded your update into the running worker");
+    expect(template.toLowerCase()).toContain("queued as a separate task");
+    expect(template.toLowerCase()).toContain("never inferred");
+  });
+
+  it("default profile: covers the too-late steer (worker done → apply in the parent)", () => {
+    const template = readTemplate("default");
+    expect(template.toLowerCase()).toContain("effectively done");
+    expect(template.toLowerCase()).toContain("apply the update yourself in the parent");
+  });
+
+  it("coding profile: carries the same steer-forwarding + visibility rule", () => {
+    const template = readTemplate("coding");
+    expect(template).toContain("SendMessage");
+    expect(template.toLowerCase()).toContain("never classify silently");
+    expect(template.toLowerCase()).toContain("effectively done");
+  });
+});
