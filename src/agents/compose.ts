@@ -347,6 +347,29 @@ export interface ComposeGeneratorOptions {
    */
   probeHomeDir?: string;
   /**
+   * Whether to pre-create the host-side per-agent directories (audit dir,
+   * blocked-approvals, schedule.d, personal-skills) that docker would
+   * otherwise auto-create as root:root — trapping the agent uid out of
+   * writing them (#3084 / #1163). These are FILESYSTEM SIDE EFFECTS, not
+   * part of the returned compose string.
+   *
+   * Defaults to `true` ONLY when the caller has explicitly supplied a home
+   * (`homeDir` or `probeHomeDir`). When neither is passed, `probeHome`
+   * silently falls back to the ambient `process.env.HOME` — the operator's
+   * REAL production state tree — and blindly `mkdirSync`-ing there is the
+   * bug in #3127: a full test-suite run created `~/.switchroom/blocked-
+   * approvals` (and chmod 1777'd it) in the operator's real `$HOME`.
+   * Reads (`existsSync`) against the ambient home are harmless; writes are
+   * not. So the pre-create is gated on the caller having told us WHERE the
+   * host home actually is. Every production caller (write-compose,
+   * docker-fleet) passes `homeDir`, so production behaviour is unchanged;
+   * pure compose-string tests that omit it get no writes.
+   *
+   * Explicit override wins over the default in both directions (a test can
+   * force it off even with a tmp homeDir; a caller can force it on).
+   */
+  precreateHostDirs?: boolean;
+  /**
    * Absolute host path to the switchroom.yaml the operator wants the
    * containerised broker / kernel / scheduler to load. Bind-mounted
    * read-only into each of those services at /state/config/switchroom.yaml,
@@ -1207,6 +1230,16 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   // conditional mount. probeHome is the container-real home. Defaults to
   // hostHomeForChecks (identical on the host). See GenerateComposeOpts.probeHomeDir.
   const probeHome = opts.probeHomeDir ?? hostHomeForChecks;
+  // Gate the host-side directory pre-create (mkdirSync side effects below) on
+  // the caller having explicitly told us where the host home is. When neither
+  // `homeDir` nor `probeHomeDir` is passed, `probeHome` falls back to the
+  // ambient `process.env.HOME` — the operator's REAL production state tree —
+  // and pre-creating dirs there corrupts a running fleet (#3127). Reads stay
+  // ambient (harmless); only writes are gated. Explicit `precreateHostDirs`
+  // overrides the default in either direction.
+  const precreateHostDirs =
+    opts.precreateHostDirs ??
+    (opts.homeDir !== undefined || opts.probeHomeDir !== undefined);
   // The config mount SOURCE must be a HOST path — docker bind-mounts it off the
   // host filesystem. `opts.switchroomConfigPath` is where the RUNNING generator
   // reads ITS config, which is the in-CONTAINER path `/state/config/
@@ -1765,6 +1798,7 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
       hostControlEnabled,
       opts.operatorUid,
       voiceEngine,
+      precreateHostDirs,
     );
   }
 
@@ -1869,6 +1903,7 @@ function emitAgentService(
   hostControlEnabled: boolean,
   operatorUid: number | undefined,
   voiceEngine: VoiceEngine,
+  precreateHostDirs: boolean,
 ): void {
   lines.push(`  agent-${a.name}:`);
   emitImageOrBuild(lines, "agent", imageTag, buildMode, buildContext);
@@ -2519,9 +2554,11 @@ function emitAgentService(
   // compose tries to bind-mount it (docker auto-creates as root, which
   // then traps the agent uid out of writing — pre-creating with the
   // operator's umask sidesteps that).
-  try {
-    mkdirSync(`${probeHome}/.switchroom/audit/${a.name}`, { recursive: true });
-  } catch { /* best-effort */ }
+  if (precreateHostDirs) {
+    try {
+      mkdirSync(`${probeHome}/.switchroom/audit/${a.name}`, { recursive: true });
+    } catch { /* best-effort */ }
+  }
   // Same trap, shared dir (#3084 follow-up): the blocked-approval surface is
   // ONE directory written by EVERY agent, and agents run as per-agent non-root
   // uids (AGENT_UID_MIN = 10001). If docker auto-creates this bind source it is
@@ -2531,20 +2568,24 @@ function emitAgentService(
   // Pre-create it sticky-world-writable (1777, the /tmp model): each agent
   // creates and owns its own 0644 <agent>.json, so no agent can modify or
   // delete another's. mkdirSync's `mode` is masked by umask, so chmod explicitly.
-  try {
-    const blockedDir = `${probeHome}/.switchroom/blocked-approvals`;
-    mkdirSync(blockedDir, { recursive: true });
-    chmodSync(blockedDir, 0o1777);
-  } catch { /* best-effort */ }
+  if (precreateHostDirs) {
+    try {
+      const blockedDir = `${probeHome}/.switchroom/blocked-approvals`;
+      mkdirSync(blockedDir, { recursive: true });
+      chmodSync(blockedDir, 0o1777);
+    } catch { /* best-effort */ }
+  }
   // Phase B (switchroom #1163): pre-create the per-agent overlay
   // directory so the agent-config write tools (Phase C) have a writable
   // landing zone. The whole ~/.switchroom/agents/<name>/ tree is already
   // bind-mounted rw at lines above (the dual-mount), so no separate
   // volume entry is needed — just the host-side dir, owned by the
   // operator umask before docker auto-creates it as root.
-  try {
-    mkdirSync(`${probeHome}/.switchroom/agents/${a.name}/schedule.d`, { recursive: true });
-  } catch { /* best-effort */ }
+  if (precreateHostDirs) {
+    try {
+      mkdirSync(`${probeHome}/.switchroom/agents/${a.name}/schedule.d`, { recursive: true });
+    } catch { /* best-effort */ }
+  }
   // Agent-config audit log (rw) — the read-only agent-config MCP broker
   // (src/mcp/agent-config/server.ts) appends one JSONL row per tool call
   // to ~/.switchroom/audit/<agent>/agent-config.jsonl. PER-AGENT mount:
@@ -2570,12 +2611,14 @@ function emitAgentService(
   // subdir under operator umask so docker doesn't auto-create as root
   // (the chown sweep in alignAgentUid will fix ownership on next apply).
   if (conditionalMountPresent(`${probeHome}/.switchroom-config`, hostHomeForChecks, probeHome)) {
-    try {
-      mkdirSync(
-        `${probeHome}/.switchroom-config/agents/${a.name}/personal-skills`,
-        { recursive: true },
-      );
-    } catch { /* best-effort */ }
+    if (precreateHostDirs) {
+      try {
+        mkdirSync(
+          `${probeHome}/.switchroom-config/agents/${a.name}/personal-skills`,
+          { recursive: true },
+        );
+      } catch { /* best-effort */ }
+    }
     lines.push(
       `      - ${homePrefix}/.switchroom-config/agents/${a.name}/personal-skills:${homePrefix}/.switchroom-config/agents/${a.name}/personal-skills:rw`,
     );

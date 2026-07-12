@@ -21,7 +21,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -3351,5 +3351,63 @@ describe("generateCompose — LiteLLM ANTHROPIC_BASE_URL model-class routing", (
     // keyConfirmed false ⇒ the whole routing block is skipped, so the proxy URL
     // never appears for this agent (no unauthenticated proxy calls).
     expect(out).not.toContain(ROOT);
+  });
+});
+
+describe("generateCompose is HOME-hermetic — no writes to the real \$HOME under test (#3127)", () => {
+  // #3127: `generateCompose` pre-creates host-side per-agent dirs (audit,
+  // blocked-approvals, schedule.d) via mkdirSync. When a caller omits both
+  // `homeDir` and `probeHomeDir`, `probeHome` silently fell back to the
+  // ambient `process.env.HOME` — the operator's REAL production state tree —
+  // so a full test-suite run created `~/.switchroom/blocked-approvals` (and
+  // chmod 1777'd it) in the operator's home (real incident 2026-05-22 class).
+  //
+  // These tests scope `$HOME` to a mkdtemp dir so they are hermetic even on
+  // the buggy code, and then assert generateCompose creates NOTHING under it
+  // when no home is supplied. Against pre-fix main the assertions FAIL (the
+  // dirs get created); with the pre-create gated on an explicit home they pass.
+  let realHome: string | undefined;
+  let scopedHome: string;
+
+  beforeEach(() => {
+    realHome = process.env.HOME;
+    scopedHome = mkdtempSync(join(tmpdir(), "compose-home-hermeticity-"));
+    process.env.HOME = scopedHome;
+  });
+
+  afterEach(() => {
+    if (realHome === undefined) delete process.env.HOME;
+    else process.env.HOME = realHome;
+    rmSync(scopedHome, { recursive: true, force: true });
+  });
+
+  it("creates no ~/.switchroom side-effect dirs when no home is supplied", () => {
+    const out = generateCompose({ config: makeConfig({ klanker: {}, bob: {} }) });
+    // The compose string is still produced normally…
+    expect(out).toContain("klanker");
+    expect(out).toContain("bob");
+    // …but nothing is written under the ambient (scoped) HOME.
+    expect(existsSync(join(scopedHome, ".switchroom"))).toBe(false);
+    expect(existsSync(join(scopedHome, ".switchroom", "blocked-approvals"))).toBe(false);
+    expect(existsSync(join(scopedHome, ".switchroom", "audit", "klanker"))).toBe(false);
+    expect(existsSync(join(scopedHome, ".switchroom", "agents", "klanker", "schedule.d"))).toBe(false);
+  });
+
+  it("explicit precreateHostDirs:false suppresses the writes even when a home IS supplied", () => {
+    const out = generateCompose({
+      config: makeConfig({ klanker: {} }),
+      homeDir: scopedHome,
+      precreateHostDirs: false,
+    });
+    expect(out).toContain("klanker");
+    expect(existsSync(join(scopedHome, ".switchroom", "blocked-approvals"))).toBe(false);
+  });
+
+  it("pre-creates the dirs in the SCOPED home (never the real \$HOME) when a home IS supplied", () => {
+    generateCompose({ config: makeConfig({ klanker: {} }), homeDir: scopedHome });
+    // The production side effects land in the scoped home, proving the writes
+    // are addressed by the injected home rather than the ambient one.
+    expect(existsSync(join(scopedHome, ".switchroom", "blocked-approvals"))).toBe(true);
+    expect(existsSync(join(scopedHome, ".switchroom", "audit", "klanker"))).toBe(true);
   });
 });
