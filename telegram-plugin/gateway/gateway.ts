@@ -29200,6 +29200,14 @@ void (async () => {
                     },
                   ),
               },
+              // #3084 follow-up: the feed's send/edit adapters transit the send
+              // gate, which SHEDS (resolves undefined) any call made during an
+              // open flood window. Give the feed the SAME on-disk window probe
+              // robustApiCall + the held-card sweep read, so a running/first-
+              // paint tick parks in cooldown instead of re-firing a shed send
+              // every ~6s for the whole ban (the worker-feed shed-contract bug:
+              // 565 `sent.message_id` crashes in one 6h ban).
+              floodWaitRemainingMs: probeFloodWaitRemainingMs,
               log: (msg) => process.stderr.write(`telegram gateway: ${msg}\n`),
             })
             subagentWatcher = startSubagentWatcher({

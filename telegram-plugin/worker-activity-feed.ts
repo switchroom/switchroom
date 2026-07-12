@@ -39,6 +39,7 @@ import {
 } from './card-format.js'
 import { STATUS_ROLLING_LINES } from './status-no-truncate.js'
 import { renderStatusCard, formatStepSuffix } from './tool-activity-summary.js'
+import { isSendGateShed } from './send-gate.js'
 
 /** Worker-activity feed is ON by default; an operator opts out with
  *  SWITCHROOM_WORKER_ACTIVITY_FEED=0. */
@@ -195,6 +196,24 @@ export interface WorkerActivityFeedOpts {
   firstPaintMinMs?: number
   /** stderr-style log sink. Defaults to noop. */
   log?: (msg: string) => void
+  /**
+   * Remaining ms of the currently-open per-bot flood window, read from the
+   * SAME persisted marker the gateway's `robustApiCall` and held-card sweep
+   * consult (`makeFloodWaitProbe(FLOOD_STATE_PATH)`). Two independent reads of
+   * one source of truth — not a second notion of "is the channel open".
+   *
+   * Why the feed needs it (#3084 follow-up): the feed's send/edit adapters run
+   * through the send gate, which SHEDS (resolves `undefined`) any call made
+   * while a flood window is open. Without this probe the heartbeat re-fires a
+   * shed send every `heartbeatTickMs` (~6s) for the WHOLE ban — thousands of
+   * gate admissions, and (pre-fix) a `sent.message_id` crash on the `undefined`
+   * every tick. With it, a running/first-paint tick that sees an open window
+   * parks the handle in cooldown for the window's remaining and makes ZERO api
+   * calls until it closes, mirroring the held-card sweep's pre-send probe.
+   * Defaults to `() => 0` (no window) so tests and non-gateway callers are
+   * unchanged.
+   */
+  floodWaitRemainingMs?: () => number
   /**
    * Heartbeat timer factory. Injectable for tests. Defaults to the real
    * `setInterval`, `.unref()`'d so it never keeps the process alive.
@@ -363,6 +382,7 @@ export interface WorkerActivityFeed {
 export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerActivityFeed {
   const log = opts.log ?? (() => {})
   const nowFn = opts.now ?? Date.now
+  const floodWaitRemainingMs = opts.floodWaitRemainingMs ?? (() => 0)
   const minEditInterval = opts.minEditIntervalMs ?? 2500
   const firstPaintMin = opts.firstPaintMinMs ?? 8000
   const heartbeatTickMs = opts.heartbeatTickMs ?? 6000
@@ -419,6 +439,22 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
     log(`worker-feed: ${label} 429 — backing off ${retryAfter}s`)
   }
 
+  /**
+   * Park a handle in cooldown for the remaining of an open flood window (if
+   * any), so the heartbeat's `nowFn() < h.cooldownUntil` guard suppresses every
+   * further send/edit until the ban closes. Returns true when a window was open
+   * (caller should abandon the current attempt). Two reads of the SAME on-disk
+   * marker `robustApiCall` gates on — never a second notion of "channel open".
+   */
+  function parkIfFloodWindowOpen(h: WorkerHandle): boolean {
+    const remaining = floodWaitRemainingMs()
+    if (remaining <= 0) return false
+    // Only extend the cooldown — never shorten one a 429 already set longer.
+    const until = nowFn() + remaining + COOLDOWN_JITTER_MS
+    if (until > h.cooldownUntil) h.cooldownUntil = until
+    return true
+  }
+
   function accumulateNarrative(h: WorkerHandle, view: WorkerActivityView): void {
     const line = view.latestSummary.trim()
     if (line.length === 0) return
@@ -453,6 +489,12 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
     h.lastView = merged
     if (h.dispatchAtMs == null) h.dispatchAtMs = nowFn() - view.elapsedMs
     if (nowFn() < h.cooldownUntil) return
+    // A flood window is open: the send gate would SHED every call made now
+    // (resolving `undefined`). Park in cooldown for the window's remaining and
+    // make ZERO api calls until it closes — the heartbeat re-drives the paint
+    // with full state on the first tick past the window. Same source of truth
+    // as robustApiCall's own pre-call probe.
+    if (parkIfFloodWindowOpen(h)) return
     const body = renderWorkerActivity(merged, liveSuffix)
 
     // First paint: hold off until the worker has run long enough to be
@@ -461,6 +503,17 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       if (view.elapsedMs < firstPaintMin) return
       try {
         const sent = await opts.bot.sendMessage(h.chatId, body, sendOptsFor(h))
+        // Shed contract (#3084): the gate resolves `undefined` for a send it
+        // shed (open flood window) or dropped as stale (`useful` TTL). That is
+        // NOT a delivered message — dereferencing `sent.message_id` here was
+        // the `undefined is not an object` crash that fired every ~6s for a
+        // whole 6h ban. Treat it as not-delivered: record no message_id, park
+        // on any open window, and let the heartbeat re-drive the paint.
+        if (sent == null || typeof sent.message_id !== 'number') {
+          parkIfFloodWindowOpen(h)
+          log(`worker-feed: first paint shed by send gate agent=${h.agentId} — not delivered`)
+          return
+        }
         h.messageId = sent.message_id
         h.lastBody = body
         h.lastEditAt = nowFn()
@@ -480,7 +533,19 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
     if (nowFn() - h.lastEditAt < minEditInterval) return
 
     try {
-      await opts.bot.editMessageText(h.chatId, h.messageId, body, sendOptsFor(h))
+      const res = await opts.bot.editMessageText(h.chatId, h.messageId, body, sendOptsFor(h))
+      // Shed honesty (#3084, mirrors #3173): a cosmetic edit the gate shed
+      // resolves the distinguishable SEND_GATE_SHED sentinel (#3110 F1 — NOT a
+      // bare `undefined`, which the gate reserves for a benign no-op drop whose
+      // payload IS already on screen). The shed payload is NOT on screen, so do
+      // not record it as `lastBody`, or the next tick's dedup would skip
+      // re-sending the very update the gate dropped. Park on any open window and
+      // let the heartbeat re-drive once it closes. A benign `undefined`/`true`
+      // falls through below and is correctly recorded as delivered.
+      if (isSendGateShed(res)) {
+        parkIfFloodWindowOpen(h)
+        return
+      }
       h.lastBody = body
       h.lastEditAt = nowFn()
       log(
@@ -534,12 +599,11 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       h.pendingFinish = null
       return
     }
-    if (nowFn() < h.cooldownUntil) {
-      // Honour the flood-wait; a terminal edit isn't worth a ban. But
-      // unlike the prior "stale but harmless" surrender, STAGE the terminal
-      // view so the heartbeat re-drives the finalize edit the instant the
-      // cooldown expires — a transport hiccup can no longer leave a
-      // finished worker's card stuck on its last running render.
+    // A flood window is open (or a prior 429 set a cooldown): honour it — a
+    // terminal edit isn't worth extending a ban. STAGE the terminal view so the
+    // heartbeat re-drives the finalize the instant the window/cooldown expires,
+    // so a finished worker's card can't get stuck on its last running render.
+    if (parkIfFloodWindowOpen(h) || nowFn() < h.cooldownUntil) {
       h.pendingFinish = view
       return
     }
@@ -549,7 +613,18 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       return
     }
     try {
-      await opts.bot.editMessageText(h.chatId, h.messageId, body, sendOptsFor(h))
+      const res = await opts.bot.editMessageText(h.chatId, h.messageId, body, sendOptsFor(h))
+      // Shed honesty (#3084): a shed terminal edit resolves the distinguishable
+      // SEND_GATE_SHED sentinel (#3110 F1 — NOT a bare `undefined`, which is the
+      // gate's benign no-op drop) — it did NOT land. Keep `pendingFinish` staged
+      // so the heartbeat re-drives it once the window closes; do NOT clear it or
+      // record `lastBody` (that would be a false finalization — card frozen on
+      // its running render while we believe it's done). Park on any open window.
+      if (isSendGateShed(res)) {
+        parkIfFloodWindowOpen(h)
+        h.pendingFinish = view
+        return
+      }
       h.lastBody = body
       h.lastEditAt = nowFn()
       h.pendingFinish = null
