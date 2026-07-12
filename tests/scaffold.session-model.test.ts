@@ -307,7 +307,7 @@ describe("scaffoldAgent: session-model consume-once boot resolver (start.sh)", (
     expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
   });
 
-  // ── session-effort resolver (#3039 — UNCHANGED by rev 4) ──────────────────
+  // ── session-effort resolver (#3186 — consume-once, session-scoped) ────────
   function effortJson(level: string, cfg = "low", ts = Date.now()): string {
     return `${JSON.stringify({ level, configuredDefaultAtWrite: cfg, ts })}\n`;
   }
@@ -320,14 +320,23 @@ describe("scaffoldAgent: session-model consume-once boot resolver (start.sh)", (
     };
   }
 
-  it("no .session-effort → --effort uses the configured default", () => {
+  it("no .session-effort → --effort uses the configured default; effective effort recorded", () => {
     expect(runBlockEffort().effortArg).toBe("--effort low");
+    // The configured-default resolution itself is untouched (#3186 constraint)
+    // and the effective launched effort is recorded for gateway re-hydration.
+    expect(readFileSync(join(agentDir, ".active-session-effort"), "utf-8").trim()).toBe("low");
   });
 
-  it(".session-effort override survives the boot and is applied to --effort (still keep-across-restarts)", () => {
+  it("effort carrier → APPLIES this boot and is CONSUMED; the next boot reverts to configured (a/b)", () => {
     writeFileSync(join(agentDir, ".session-effort"), effortJson("xhigh"));
-    expect(runBlockEffort().effortArg).toBe("--effort xhigh");
-    expect(existsSync(join(agentDir, ".session-effort"))).toBe(true);
+    expect(runBlockEffort().effortArg).toBe("--effort xhigh"); // apply-boot
+    expect(existsSync(join(agentDir, ".session-effort"))).toBe(false); // consume-once
+    expect(readFileSync(join(agentDir, ".active-session-effort"), "utf-8").trim()).toBe("xhigh");
+    // No boot alert on a clean apply — the gateway already acked the /effort.
+    expect(existsSync(join(agentDir, ".session-model-alert"))).toBe(false);
+    // Any SUBSEQUENT restart reverts to the configured default.
+    expect(runBlockEffort().effortArg).toBe("--effort low");
+    expect(readFileSync(join(agentDir, ".active-session-effort"), "utf-8").trim()).toBe("low");
   });
 
   it("corrupt/non-allowlisted .session-effort → falls back to configured default AND notifies", () => {
@@ -337,7 +346,7 @@ describe("scaffoldAgent: session-model consume-once boot resolver (start.sh)", (
     expect(alertText()).toContain("effort override could not be read");
   });
 
-  it("configured thinking_effort changed since the effort switch → cleared + notifies", () => {
+  it("configured thinking_effort changed since the effort switch → NOT applied + notifies + consumed", () => {
     writeFileSync(join(agentDir, ".session-effort"), effortJson("xhigh", "medium"));
     expect(runBlockEffort().effortArg).toBe("--effort low");
     expect(existsSync(join(agentDir, ".session-effort"))).toBe(false);
