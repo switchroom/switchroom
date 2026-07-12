@@ -200,6 +200,12 @@ export interface AccountState {
   premium_wall_bucket?: string;
   /** #3176 — latest flagship-tier canary snapshot, for the dashboard/card. */
   last_tier_quota?: LastTierQuotaSnapshot | null;
+  /**
+   * #3185 — rolling per-tier usage summary (standard 5h/7d + premium `7d_oi`),
+   * refill-normalized by the broker. Answers "how much Fable/standard headroom
+   * is left, and the recent trend". Absent on pre-#3185 brokers.
+   */
+  usage_ledger?: UsageAccountSummary | null;
 }
 
 /**
@@ -214,6 +220,16 @@ export interface LastTierQuotaSnapshot {
   sevenDayOiResetAt: string | null;
   capturedAt: number;
 }
+
+/**
+ * #3185 — rolling per-tier usage summary attached to each `AccountState`. The
+ * broker computes it (refill-normalized) from its durable usage ledger, so the
+ * dashboard / `switchroom auth usage` can answer "how much Fable is left" with
+ * no live probe. Re-exported from the ledger module's summary type so the wire
+ * shape has a single source of truth. Absent on pre-#3185 brokers.
+ */
+export type { UsageAccountSummary, UsageTierSummary } from "./usage-ledger.js";
+import type { UsageAccountSummary } from "./usage-ledger.js";
 
 export interface AgentState {
   name: string;

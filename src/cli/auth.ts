@@ -342,6 +342,62 @@ function printConsumersTable(state: ListStateData): void {
   }
 }
 
+/**
+ * #3185 — render the per-account usage ledger, foregrounding PREMIUM (flagship /
+ * Fable) headroom — the operator's "how much Fable is left on each account"
+ * question — with the standard tier alongside. Refill-normalized by the broker;
+ * `no data` when a tier hasn't been observed (e.g. premium is only probed for
+ * the serving set). Purely from the durable ledger — no live probe.
+ */
+interface UsageCell {
+  /** Plain (uncolored) text — pad on THIS, then color, so ANSI escapes never
+   *  throw the column width off. */
+  plain: string;
+  /** Apply the tier's status color to a (possibly padded) string. */
+  color: (s: string) => string;
+}
+
+function usageHeadroomCell(
+  t:
+    | {
+        headroomPct: number | null;
+        walled: boolean;
+        refilled: boolean;
+        peakUtilizationPct: number | null;
+        observations: number;
+      }
+    | null,
+): UsageCell {
+  const noColor = (s: string) => s;
+  if (t == null) return { plain: "no data", color: chalk.gray };
+  if (t.headroomPct == null) return { plain: "unknown", color: chalk.gray };
+  const left = Math.round(t.headroomPct);
+  const peak = t.peakUtilizationPct == null ? "?" : `${Math.round(t.peakUtilizationPct)}`;
+  const base = `${left}% left (peak ${peak}%, n=${t.observations})`;
+  if (t.walled) return { plain: `WALLED - ${base}`, color: chalk.red };
+  if (t.refilled) return { plain: `refilled - ${base}`, color: chalk.green };
+  if (left <= 10) return { plain: base, color: chalk.yellow };
+  return { plain: base, color: noColor };
+}
+
+function printUsageTable(state: ListStateData): void {
+  console.log(
+    chalk.bold("  ACCOUNT                           PREMIUM (Fable) HEADROOM                    STANDARD HEADROOM"),
+  );
+  const WIDTH = 44;
+  for (const a of state.accounts) {
+    const marker = a.label === state.active ? chalk.green("*") : " ";
+    const label = a.label.padEnd(32);
+    const premium = usageHeadroomCell(a.usage_ledger?.premium ?? null);
+    const standard = usageHeadroomCell(a.usage_ledger?.standard ?? null);
+    // Pad the PLAIN text to a fixed column, THEN color — ANSI escapes can never
+    // distort the width this way.
+    const premiumCol = premium.color(premium.plain.padEnd(WIDTH));
+    const standardCol = standard.color(standard.plain);
+    console.log(`  ${marker} ${label} ${premiumCol} ${standardCol}`);
+  }
+}
+
 function printAgentDetail(state: ListStateData, agent: AgentState): void {
   console.log();
   console.log(chalk.bold(`  ${agent.name}`));
@@ -655,6 +711,44 @@ export function registerAuthCommand(program: Command): void {
         }
         console.log();
         printAccountsTable(state);
+        console.log();
+      }),
+    );
+
+  // ── auth usage ────────────────────────────────────────────────────────
+  // #3185 — "how much Fable is left on each account?" answered instantly from
+  // the broker's durable per-tier usage ledger (no live probe). Premium
+  // (flagship/Fable) headroom is foregrounded; standard tier alongside.
+  auth
+    .command("usage")
+    .description("Per-account premium (Fable) + standard usage headroom, from the durable ledger")
+    .option("--json", "Output the raw per-account usage_ledger summaries as JSON")
+    .action(
+      withConfigError(async (opts: { json?: boolean }) => {
+        const state = await brokerCall((client) => client.listState());
+        if (opts.json) {
+          console.log(
+            JSON.stringify(
+              state.accounts.map((a) => ({ label: a.label, usage_ledger: a.usage_ledger ?? null })),
+              null,
+              2,
+            ),
+          );
+          return;
+        }
+        console.log();
+        printUsageTable(state);
+        console.log();
+        console.log(
+          chalk.gray(
+            "  Premium = flagship (Fable) 7d_oi tier; standard = 5h/7d. Passive: harvested from probe headers, no extra requests.",
+          ),
+        );
+        console.log(
+          chalk.gray(
+            "  'X% left' is current (refill-aware); 'peak' is the max over retained history (~48h) and may predate the latest reset.",
+          ),
+        );
         console.log();
       }),
     );

@@ -60,6 +60,15 @@ import {
   type ModelTierWallMark,
 } from "./model-tier-quota.js";
 import {
+  recordUsageSample,
+  standardSampleFromResult,
+  premiumSampleFromResult,
+  summarizeAccountUsage,
+  bestPremiumHeadroomAccount,
+  resolveUsageRingCap,
+  type UsageLedger,
+} from "./usage-ledger.js";
+import {
   isAccountBlocked as evalAccountBlocked,
   accountEligibility,
   snapshotShouldClearMark,
@@ -574,6 +583,19 @@ export class AuthBroker {
   private lastTierQuotaCache: LastTierQuotaCache = {};
   /** #3176 — resolved model-tier canary probe model (env-overridable). */
   private readonly modelTierProbeModel: string = resolveModelTierProbeModel();
+  /**
+   * #3185 — per-account, per-tier rolling usage ledger. Harvested PASSIVELY
+   * from the rate-limit headers the broker already receives each fleet tick
+   * (standard tier at `cacheQuotaSnapshot`, premium/`7d_oi` tier at
+   * `recordTierProbe`) — zero added requests. Persisted to `usage-ledger.json`,
+   * reloaded on boot, surfaced via `list-state` and consumed as a headroom
+   * PREFERENCE by the premium-failover selector.
+   */
+  private usageLedger: UsageLedger = {};
+  /** #3185 — rolling-ring cap per (account, tier); env-overridable. */
+  private readonly usageRingCap: number = resolveUsageRingCap(
+    process.env.SWITCHROOM_USAGE_LEDGER_RING_CAP,
+  );
   /** Last `expiresAt` the broker wrote per label — drives threshold-violation. */
   private lastWrittenExpiresAt = new Map<string, number | undefined>();
   /** Refresh leases held while a POST is in flight (in-process). */
@@ -1407,6 +1429,10 @@ export class AuthBroker {
         capturedAt: this.now(),
       };
       this.persistLastTierQuotaCache();
+      // #3185 — harvest a PREMIUM-tier (7d_oi) usage sample from the SAME canary
+      // headers (zero added requests). A result carrying no tier signal (rotted
+      // canary id / non-flagship response) yields null → no-op.
+      this.recordUsage(label, "premium", premiumSampleFromResult(result, this.now()));
     }
     // Self-heal: a fresh canary that positively reads the tier allowed clears
     // any lingering tier-wall mark so the account rejoins flagship serving.
@@ -1429,11 +1455,20 @@ export class AuthBroker {
   }
 
   /**
-   * First flagship-eligible failover target for `from` (#3176): the first
-   * `fallback_order` account, starting after `from`, that exists, has stored
-   * credentials, and is NEITHER exhausted NOR premium-walled. Null when every
-   * candidate is walled on the flagship tier (or exhausted) — the honest
-   * all-walled path, which the caller surfaces with the earliest reset.
+   * Flagship-eligible failover target for `from` (#3176): a `fallback_order`
+   * account, starting after `from`, that exists, has stored credentials, and is
+   * NEITHER exhausted NOR premium-walled. Null when every candidate is walled on
+   * the flagship tier (or exhausted) — the honest all-walled path, which the
+   * caller surfaces with the earliest reset.
+   *
+   * #3185 — among the ELIGIBLE candidates, prefer the one with the most premium
+   * (`7d_oi`) HEADROOM from the usage ledger, so a proactive roll lands on the
+   * account that can serve the most Fable before walling again. This is a
+   * PREFERENCE, not a gate: eligibility is still owned entirely by the #3176
+   * `premium_walled_until` marks above. When the ledger has no premium data for
+   * any candidate, `bestPremiumHeadroomAccount` returns null and we fall back to
+   * the first eligible candidate in ring order — i.e. behavior is UNCHANGED
+   * whenever the ledger is empty (pre-existing #3176 failover tests unaffected).
    */
   private nextPremiumEligibleAccount(from: string): string | null {
     const order = this.config.auth?.fallback_order ?? [];
@@ -1442,15 +1477,18 @@ export class AuthBroker {
       start === -1
         ? [...order]
         : order.map((_, i) => order[(start + 1 + i) % order.length]);
+    const eligible: string[] = [];
     for (const cand of ring) {
       if (!cand || cand === from) continue;
       if (this.isAccountExhausted(cand)) continue;
       if (this.isAccountPremiumWalled(cand)) continue;
       if (!accountExists(cand, this.home)) continue;
       if (!readAccountCredentials(cand, this.home)) continue;
-      return cand;
+      eligible.push(cand);
     }
-    return null;
+    if (eligible.length === 0) return null;
+    // Headroom-preferred pick (order-stable on ties / empty ledger).
+    return bestPremiumHeadroomAccount(this.usageLedger, eligible, this.now()) ?? eligible[0];
   }
 
   /**
@@ -1921,6 +1959,9 @@ export class AuthBroker {
         premium_walled_until: q?.premium_walled_until,
         premium_wall_bucket: q?.premium_wall_bucket,
         last_tier_quota: this.lastTierQuotaCache[label] ?? null,
+        // #3185 — rolling per-tier usage summary (refill-normalized) so the
+        // operator/dashboard can answer "how much Fable is left" instantly.
+        usage_ledger: summarizeAccountUsage(this.usageLedger, label, this.now()),
       };
     });
     const agents = Object.entries(this.config.agents ?? {}).map(([name, agent]) => {
@@ -2133,6 +2174,9 @@ export class AuthBroker {
     // #2495 Change 1 — persist the cache so a broker restart serves this
     // last-known snapshot (age-stamped via capturedAt) instead of blank.
     this.persistLastQuotaCache();
+    // #3185 — harvest a STANDARD-tier usage sample from the SAME probe headers
+    // (zero added requests). A thin probe yields null → no-op.
+    this.recordUsage(label, "standard", standardSampleFromResult(result, this.now()));
     // Self-heal: a fresh, clearly-healthy probe (both windows well under the
     // wall) that is newer than the mark CLEARS the persisted mark — so a
     // misfired/expired exhaustion can't linger on disk and survive restarts
@@ -4065,6 +4109,9 @@ export class AuthBroker {
     // #3176 — reload the durable flagship-tier canary cache + all-walled alert.
     this.lastTierQuotaCache = this.readJson<LastTierQuotaCache>("last-tier-quota.json") ?? {};
     this.premiumTierAllWalled = this.readJson<PremiumTierAllWalled>("premium-tier-all-walled.json") ?? null;
+    // #3185 — reload the durable per-(account, tier) usage ledger so a restart
+    // keeps the rolling history instead of starting the trend from scratch.
+    this.usageLedger = this.readJson<UsageLedger>("usage-ledger.json") ?? {};
     this.applyActiveOverride();
   }
 
@@ -4131,6 +4178,29 @@ export class AuthBroker {
   private persistLastQuotaCache(): void { atomicWriteJsonSync(join(this.stateDir, "last-quota.json"), this.lastQuotaCache, 0o600); }
   /** #3176 — mirror the flagship-tier canary cache to disk. */
   private persistLastTierQuotaCache(): void { atomicWriteJsonSync(join(this.stateDir, "last-tier-quota.json"), this.lastTierQuotaCache, 0o600); }
+  /** #3185 — mirror the per-(account, tier) usage ledger to disk so the rolling
+   *  history survives a broker restart. */
+  private persistUsageLedger(): void { atomicWriteJsonSync(join(this.stateDir, "usage-ledger.json"), this.usageLedger, 0o600); }
+
+  /**
+   * #3185 — append a usage sample to the rolling ledger and persist. A null
+   * sample (failed / thin / no-tier-signal probe) is a no-op and does NOT
+   * re-write the file — so a run of empty probes costs nothing. Never throws
+   * into the probe path: a ledger/persist failure is logged, never fatal.
+   */
+  private recordUsage(
+    label: string,
+    tier: "standard" | "premium",
+    sample: ReturnType<typeof standardSampleFromResult>,
+  ): void {
+    if (sample == null) return;
+    try {
+      recordUsageSample(this.usageLedger, label, tier, sample, this.usageRingCap);
+      this.persistUsageLedger();
+    } catch (err) {
+      this.logErr(`usage-ledger ${label}/${tier}: ${(err as Error).message}`);
+    }
+  }
   private persistNotificationClaims(): void { atomicWriteJsonSync(join(this.stateDir, "notification-claims.json"), this.notificationClaims, 0o600); }
   private persistLastFleetRoll(): void { if (this.lastFleetRoll) atomicWriteJsonSync(join(this.stateDir, "last-fleet-roll.json"), this.lastFleetRoll, 0o600); }
   private persistShaIndex(): void { atomicWriteJsonSync(join(this.stateDir, "sha-index.json"), this.shaIndex, 0o600); }
@@ -4364,6 +4434,8 @@ export class AuthBroker {
     /** #3176 — flagship-tier canary cache + all-walled alert + live active. */
     lastTierQuotaCache: LastTierQuotaCache;
     premiumTierAllWalled: PremiumTierAllWalled | null;
+    /** #3185 — per-(account, tier) rolling usage ledger (in-memory view). */
+    usageLedger: UsageLedger;
     activeAccount: string | undefined;
   } {
     return {
@@ -4373,6 +4445,7 @@ export class AuthBroker {
       listeners: [...this.listeners.keys()],
       lastQuotaCache: structuredClone(this.lastQuotaCache),
       lastTierQuotaCache: structuredClone(this.lastTierQuotaCache),
+      usageLedger: structuredClone(this.usageLedger),
       premiumTierAllWalled: this.premiumTierAllWalled
         ? { ...this.premiumTierAllWalled }
         : null,
