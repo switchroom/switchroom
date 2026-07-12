@@ -4,43 +4,33 @@
  * The pure `decideTierDowngrade` owns the decision the gateway consults inside
  * the `all-blocked` branch of doFireFleetAutoFallback — i.e. AFTER account-swap
  * has been tried and found no account still serving the walled premium model.
- * The deliverable outcomes it must guarantee:
+ * `planTierDowngrade` then routes that decision + the resume-gate verdict into
+ * what the gateway should DO (downgrade / suppress the give-up / fall through),
+ * and `renderTierDowngradeNotice` owns the exact user-facing wording. All three
+ * are pure so the decision, the concurrent-turn suppression (LOW-9a), and the
+ * honesty of the broadcast (no "revert to the premium model" promise) are pinned
+ * without a process restart.
  *
+ * Contract (post loop-guard reconciliation, option b — the ceremonial
+ * `.tier-downgrade-attempts` counter was REMOVED):
  *   - overload + the session is NOT on a premium model (override null, or the
  *     override resolves to the configured default) → NO downgrade ('skip'); the
  *     account-swap path already handled it or there is no lower tier to fall to.
+ *     This is also the natural loop bound: after the downgrade boot the override
+ *     is gone, so a re-entry lands on 'on-default' and never re-downgrades.
  *   - overload + a premium model walled across ALL accounts → 'downgrade' to the
- *     configured default (the carrier target), with the loop-guard counter
- *     incremented.
- *   - loop guard: a SECOND consecutive downgrade-resume failure (a fresh
- *     attempts record already at the cap) → 'exhausted' (name-the-turn-as-lost),
- *     never a re-downgrade.
- *   - a stale attempts record (older than staleMs) starts a FRESH chain so a
- *     later INDEPENDENT interruption can downgrade again.
- *
- * The counter file (`.tier-downgrade-attempts`) round-trips via the FS helpers;
- * it is DELIBERATELY a distinct name from `.session-model-boot-attempts` (which
- * start.sh rm -f's every boot), so it survives the downgrade restart.
- *
- * Pure decision → fake clock, no process restart, no real FS for the decision
- * cases; the file helpers use an isolated mkdtemp dir.
+ *     configured default.
+ *   - a resume restart already armed in this process (gate 'skip-inflight') →
+ *     'suppress': no give-up card, no re-downgrade (the armed restart resumes).
+ *   - the downgrade broadcast states resume-on-default + manual re-issue and
+ *     carries NO promise of an automatic revert to the premium model.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
-import { tmpdir } from 'node:os'
+import { describe, it, expect } from 'vitest'
 import {
   decideTierDowngrade,
-  parseTierDowngradeAttempts,
-  serializeTierDowngradeAttempts,
-  readTierDowngradeAttempts,
-  writeTierDowngradeAttempts,
-  clearTierDowngradeAttempts,
-  TIER_DOWNGRADE_ATTEMPTS_FILE,
-  DEFAULT_MAX_TIER_DOWNGRADES,
-  DEFAULT_TIER_DOWNGRADE_STALE_MS,
-  type TierDowngradeAttempts,
+  planTierDowngrade,
+  renderTierDowngradeNotice,
 } from '../tier-downgrade.js'
 
 // The gateway passes resolveMainModel; here a near-identity resolver (maps the
@@ -49,23 +39,15 @@ import {
 const resolve = (t: string): string =>
   t === '' || t === 'default' ? 'claude-sonnet-5' : t
 
-const NOW = 1_800_000_000_000
-
 describe('decideTierDowngrade — precedence + downgrade target', () => {
-  it("NO downgrade when the session is on the configured default (override null)", () => {
+  it('NO downgrade when the session is on the configured default (override null)', () => {
     // Overload + account-swap all-blocked, but nothing premium is active — the
     // account-swap path owns this and there is no lower tier. => skip.
-    const d = decideTierDowngrade({
-      sessionOverride: null,
-      configuredDefault: 'opus',
-      resolve,
-      attempts: null,
-      now: NOW,
-    })
+    const d = decideTierDowngrade({ sessionOverride: null, configuredDefault: 'opus', resolve })
     expect(d).toEqual({ action: 'skip', reason: 'on-default' })
   })
 
-  it("NO downgrade when the override resolves to the configured default (alias vs id)", () => {
+  it('NO downgrade when the override resolves to the configured default (alias vs id)', () => {
     // A premium-looking override that is actually the default in another spelling
     // must never read as a premium tier (that would loop). Same resolver both
     // sides → on-default.
@@ -73,37 +55,18 @@ describe('decideTierDowngrade — precedence + downgrade target', () => {
       sessionOverride: 'default',
       configuredDefault: 'claude-sonnet-5',
       resolve,
-      attempts: null,
-      now: NOW,
     })
     expect(d).toEqual({ action: 'skip', reason: 'on-default' })
   })
 
   it('NO downgrade (and no blind fall) when the configured default is unreadable', () => {
-    const d = decideTierDowngrade({
-      sessionOverride: 'fable',
-      configuredDefault: null,
-      resolve,
-      attempts: null,
-      now: NOW,
-    })
+    const d = decideTierDowngrade({ sessionOverride: 'fable', configuredDefault: null, resolve })
     expect(d).toEqual({ action: 'skip', reason: 'unresolved' })
   })
 
-  it('DOWNGRADES a walled premium model to the configured default + arms the counter', () => {
-    const d = decideTierDowngrade({
-      sessionOverride: 'fable',
-      configuredDefault: 'opus',
-      resolve,
-      attempts: null,
-      now: NOW,
-    })
-    expect(d).toEqual({
-      action: 'downgrade',
-      toModel: 'opus',
-      fromModel: 'fable',
-      nextAttempts: { count: 1, premiumModel: 'fable', ts: NOW },
-    })
+  it('DOWNGRADES a walled premium model to the configured default', () => {
+    const d = decideTierDowngrade({ sessionOverride: 'fable', configuredDefault: 'opus', resolve })
+    expect(d).toEqual({ action: 'downgrade', toModel: 'opus', fromModel: 'fable' })
   })
 
   it('downgrade target is GENERAL — any premium model → the agent default (not hardcoded fable→opus)', () => {
@@ -111,117 +74,68 @@ describe('decideTierDowngrade — precedence + downgrade target', () => {
       sessionOverride: 'sr-x-ai/grok-4',
       configuredDefault: 'claude-sonnet-5',
       resolve,
-      attempts: null,
-      now: NOW,
     })
-    expect(d.action).toBe('downgrade')
-    if (d.action === 'downgrade') {
-      expect(d.toModel).toBe('claude-sonnet-5')
-      expect(d.fromModel).toBe('sr-x-ai/grok-4')
-    }
+    expect(d).toEqual({ action: 'downgrade', toModel: 'claude-sonnet-5', fromModel: 'sr-x-ai/grok-4' })
   })
 })
 
-describe('decideTierDowngrade — loop guard (names the turn as lost, no loop)', () => {
-  it("SECOND consecutive downgrade-resume failure → 'exhausted', no re-downgrade", () => {
-    // The first downgrade wrote count=1. Its resume died again with the premium
-    // model still walled and active → the budget (default 1) is spent.
-    const attempts: TierDowngradeAttempts = { count: 1, premiumModel: 'fable', ts: NOW - 5_000 }
-    const d = decideTierDowngrade({
-      sessionOverride: 'fable',
-      configuredDefault: 'opus',
-      resolve,
-      attempts,
-      now: NOW,
-    })
-    expect(d).toEqual({ action: 'exhausted', premiumModel: 'fable' })
+describe('renderTierDowngradeNotice — HONEST wording (no revert-to-premium promise)', () => {
+  const notice = renderTierDowngradeNotice('fable', 'opus', 'klanker')
+
+  it('states the turn resumes on the DEFAULT to keep working', () => {
+    expect(notice).toContain('opus')
+    expect(notice.toLowerCase()).toContain('resuming on the default')
   })
 
-  it('a STALE attempts record starts a fresh chain (later independent interruption)', () => {
-    const attempts: TierDowngradeAttempts = {
-      count: DEFAULT_MAX_TIER_DOWNGRADES,
-      premiumModel: 'fable',
-      ts: NOW - DEFAULT_TIER_DOWNGRADE_STALE_MS - 1, // just past the window
-    }
-    const d = decideTierDowngrade({
-      sessionOverride: 'fable',
-      configuredDefault: 'opus',
-      resolve,
-      attempts,
-      now: NOW,
-    })
-    expect(d.action).toBe('downgrade')
-    if (d.action === 'downgrade') expect(d.nextAttempts.count).toBe(1)
+  it('tells the user to RE-ISSUE the premium /model themselves', () => {
+    expect(notice).toContain('/model fable')
+    expect(notice.toLowerCase()).toContain("won't switch back on its own")
   })
 
-  it('honours a custom maxDowngrades cap', () => {
-    const attempts: TierDowngradeAttempts = { count: 1, premiumModel: 'fable', ts: NOW }
-    const d = decideTierDowngrade({
-      sessionOverride: 'fable',
-      configuredDefault: 'opus',
-      resolve,
-      attempts,
-      now: NOW,
-      maxDowngrades: 2,
-    })
-    expect(d.action).toBe('downgrade')
-    if (d.action === 'downgrade') expect(d.nextAttempts.count).toBe(2)
+  it("carries NO promise of an automatic revert to the premium/fable model", () => {
+    // The HIGH finding: the prior wording lied ("It reverts to `fable` on the
+    // next restart"). Assert none of those false promises can creep back.
+    const lower = notice.toLowerCase()
+    expect(lower).not.toMatch(/reverts? to `?fable/)
+    expect(lower).not.toContain('reverts to `fable`')
+    expect(lower).not.toContain('on the next restart')
+    expect(lower).not.toMatch(/revert(s|ing)? to the premium/)
+    expect(lower).not.toMatch(/back to `?fable`? (on|at|after)/)
   })
 })
 
-describe('.tier-downgrade-attempts counter file', () => {
-  let dir: string
-  beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), 'switchroom-tier-downgrade-'))
-  })
-  afterEach(() => {
-    rmSync(dir, { recursive: true, force: true })
+describe('planTierDowngrade — routing (downgrade / suppress / skip)', () => {
+  const skipDecision = { action: 'skip', reason: 'on-default' } as const
+  const downgradeDecision = { action: 'downgrade', toModel: 'opus', fromModel: 'fable' } as const
+
+  it("a 'skip' decision routes to 'skip' regardless of the gate verdict", () => {
+    expect(planTierDowngrade(skipDecision, 'resume', 'ag').kind).toBe('skip')
+    expect(planTierDowngrade(skipDecision, 'skip-inflight', 'ag').kind).toBe('skip')
+    expect(planTierDowngrade(skipDecision, 'skip-stale', 'ag').kind).toBe('skip')
   })
 
-  it('is a DISTINCT filename from the retired .session-model-boot-attempts', () => {
-    // The historical loop-guard file is rm -f'd by start.sh every boot, so it
-    // cannot survive a restart — this guard must use its own name.
-    expect(TIER_DOWNGRADE_ATTEMPTS_FILE).toBe('.tier-downgrade-attempts')
-    expect(TIER_DOWNGRADE_ATTEMPTS_FILE).not.toBe('.session-model-boot-attempts')
+  it("downgrade + gate 'resume' → 'downgrade' with the honest notice", () => {
+    const plan = planTierDowngrade(downgradeDecision, 'resume', 'klanker')
+    expect(plan.kind).toBe('downgrade')
+    if (plan.kind === 'downgrade') {
+      expect(plan.toModel).toBe('opus')
+      expect(plan.fromModel).toBe('fable')
+      // The plan carries EXACTLY the honest renderer output — no revert promise.
+      expect(plan.notice).toBe(renderTierDowngradeNotice('fable', 'opus', 'klanker'))
+      expect(plan.notice.toLowerCase()).not.toContain('on the next restart')
+    }
   })
 
-  it('write → read round-trips', () => {
-    const rec: TierDowngradeAttempts = { count: 1, premiumModel: 'fable', ts: NOW }
-    writeTierDowngradeAttempts(dir, rec)
-    expect(existsSync(join(dir, TIER_DOWNGRADE_ATTEMPTS_FILE))).toBe(true)
-    expect(readTierDowngradeAttempts(dir)).toEqual(rec)
-    // one line + trailing newline, matching the session-model carrier shape.
-    const onDisk = readFileSync(join(dir, TIER_DOWNGRADE_ATTEMPTS_FILE), 'utf8')
-    expect(onDisk.endsWith('\n')).toBe(true)
-    expect(onDisk.trimEnd().split('\n')).toHaveLength(1)
+  it("LOW-9a: downgrade + gate 'skip-inflight' → 'suppress' (a resume restart is already armed, no give-up card)", () => {
+    // Two turns hit all-blocked in the same pre-restart process. Turn 1 armed a
+    // downgrade (or account-swap) restart. Turn 2 must NOT broadcast a "could
+    // not be recovered" give-up — the armed restart resumes the interrupted turn.
+    const plan = planTierDowngrade(downgradeDecision, 'skip-inflight', 'klanker')
+    expect(plan.kind).toBe('suppress')
   })
 
-  it('read of an absent file → null', () => {
-    expect(readTierDowngradeAttempts(dir)).toBeNull()
-  })
-
-  it('corrupt / bad-shape content → null (never trusted)', () => {
-    writeFileSync(join(dir, TIER_DOWNGRADE_ATTEMPTS_FILE), '{not json\n')
-    expect(readTierDowngradeAttempts(dir)).toBeNull()
-    writeFileSync(
-      join(dir, TIER_DOWNGRADE_ATTEMPTS_FILE),
-      JSON.stringify({ count: 'x', premiumModel: 'fable', ts: NOW }) + '\n',
-    )
-    expect(readTierDowngradeAttempts(dir)).toBeNull()
-    expect(parseTierDowngradeAttempts('{"count":-1,"premiumModel":"f","ts":1}')).toBeNull()
-  })
-
-  it('clear removes the file (best-effort, idempotent)', () => {
-    writeTierDowngradeAttempts(dir, { count: 1, premiumModel: 'fable', ts: NOW })
-    clearTierDowngradeAttempts(dir)
-    expect(existsSync(join(dir, TIER_DOWNGRADE_ATTEMPTS_FILE))).toBe(false)
-    // idempotent — no throw on a second clear
-    expect(() => clearTierDowngradeAttempts(dir)).not.toThrow()
-  })
-
-  it('serialize is stable field order', () => {
-    expect(serializeTierDowngradeAttempts({ count: 2, premiumModel: 'sr-glm-5', ts: 7 })).toBe(
-      '{"count":2,"premiumModel":"sr-glm-5","ts":7}\n',
-    )
+  it("downgrade + gate 'skip-stale' → 'skip' (turn too old to resume; fall through to the all-blocked card)", () => {
+    const plan = planTierDowngrade(downgradeDecision, 'skip-stale', 'klanker')
+    expect(plan.kind).toBe('skip')
   })
 })

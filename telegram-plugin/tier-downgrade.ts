@@ -19,83 +19,52 @@
  * so a premium model that is merely throttled on ONE account is recovered by
  * account-swap, never by a downgrade.
  *
- * Revert is NATIVE (do not fight it). The downgrade writes a CONSUME-ONCE
- * `.session-model` carrier for the configured default
- * (reference/rfcs/session-model-stickiness.md §0.1 rev 4): start.sh applies it
- * on the single boot that reads it, deletes it, and every SUBSEQUENT restart
- * reverts to the configured default for free. The premium /model override was
- * itself session-scoped (a live Claude switch writes no carrier), so the
- * downgrade boot naturally lands on the configured default; writing the carrier
- * makes that DETERMINISTIC even if a stray carrier is on disk.
+ * There is NO automatic return to the premium model. The `/model` override is
+ * SESSION-SCOPED and in-memory only (`recordTypedModelSwitch` writes NO carrier
+ * — reference/rfcs/session-model-stickiness.md §0.1 rev 4), so it dies on the
+ * downgrade SIGTERM. The downgrade writes a consume-once `.session-model`
+ * carrier for the CONFIGURED DEFAULT: start.sh applies+deletes it on the resume
+ * boot, and every subsequent restart boots the configured default too. The
+ * premium model is never restored on its own — the user must re-issue
+ * `/model <premium>` once it frees up. The user-facing notice
+ * (`renderTierDowngradeNotice`) says exactly that; it must NOT promise any
+ * revert to the premium tier.
  *
- * Effort is NATIVE too. A live `/effort` override records in gateway memory
- * only (no carrier), so the self-restart sheds it and the downgraded default
- * boots at the configured `thinking_effort` (the fleet `low` pin, #1978 /
+ * Effort is NATIVE. A live `/effort` override records in gateway memory only
+ * (no carrier), so the self-restart sheds it and the downgraded default boots at
+ * the configured `thinking_effort` (the fleet `low` pin, #1978 /
  * src/config/thinking-effort-risk.ts). This module writes NO effort carrier —
  * that is the whole point: the downgraded opus must resolve LOW.
  *
- * Loop guard (survives restart). The gate is bounded so a turn that dies AGAIN
- * during its own downgrade-resume is named-as-lost rather than looped forever:
- *   - The natural guard: after the downgrade boot the session is ON the
- *     configured default (override null), so a second `all-blocked` finds no
- *     premium tier and `decide()` returns `skip` — no re-downgrade.
- *   - The belt-and-suspenders guard: a restart-surviving
- *     `.tier-downgrade-attempts` counter caps consecutive downgrades per
- *     interruption chain (default 1). A record older than `staleMs` starts a
- *     fresh chain, so a later INDEPENDENT interruption can downgrade again.
+ * Loop guard — the natural on-default guard is the real bound. After the
+ * downgrade boot the session runs the configured default (the override is gone
+ * with the restart), so a second `all-blocked` finds no premium tier and
+ * `decide()` returns `skip` ('on-default') — the turn never re-downgrades. If
+ * the DEFAULT is itself walled fleet-wide on the resume boot, `decide()` still
+ * returns `skip` and the gateway falls through to its normal all-blocked card;
+ * there is no restart loop. Cross-restart pacing is additionally bounded by the
+ * broker-side persisted account exhaustion (see fleet-fallback-resume.ts).
  *
- * NB — carrier-name choice. The in-memory single-flight latch in
- * fleet-fallback-resume.ts does NOT survive the restart, and the historical
- * `.session-model-boot-attempts` filename is UNUSABLE as a boot-surviving guard
- * on current main: start.sh unconditionally `rm -f`s it every boot (retired
- * with the rev-3 crashloop self-heal, session-model-stickiness.md §0.1). So the
- * loop guard uses a DISTINCT file, `.tier-downgrade-attempts`, that start.sh
- * never touches — the durable equivalent of the premise's intent.
+ * Concurrent-turn race (single process, pre-restart): if a first turn already
+ * armed a resume restart (a downgrade OR an account-swap), a second turn that
+ * also hits `all-blocked` must NOT emit a give-up card — the armed restart will
+ * replay the latest interrupted turn. `planTierDowngrade` maps a `skip-inflight`
+ * resume-gate verdict to `suppress` for exactly this reason (no re-downgrade, no
+ * contradictory "could not be recovered" message).
  *
- * This module is pure at its core (`decideTierDowngrade`) so the decision is
- * unit-testable without a process restart; the small FS helpers for the counter
- * file live here too (they mirror session-model-file.ts's shape).
+ * This module is pure (`decideTierDowngrade` / `planTierDowngrade` /
+ * `renderTierDowngradeNotice`) so the decision, the give-up suppression, and the
+ * user-facing wording are all unit-testable without a process restart; the
+ * gateway does the FS write, the latch arm, and the restart off these verdicts.
  */
-
-import { readFileSync, writeFileSync, renameSync, rmSync } from 'node:fs'
-import { join } from 'node:path'
-
-export const TIER_DOWNGRADE_ATTEMPTS_FILE = '.tier-downgrade-attempts'
-
-/** Consecutive downgrades allowed per interruption chain. The 2nd consecutive
- *  downgrade-resume failure is named-as-lost, never attempted. */
-export const DEFAULT_MAX_TIER_DOWNGRADES = 1
-
-/** An attempts record older than this is a FRESH chain (a later independent
- *  interruption), not a continuation of a storm. Comfortably longer than a
- *  restart + boot-resume cycle so a genuine loop (which cycles in seconds) is
- *  always caught, while an unrelated overload minutes later can downgrade
- *  again. */
-export const DEFAULT_TIER_DOWNGRADE_STALE_MS = 600_000 // 10 min
-
-export interface TierDowngradeAttempts {
-  /** Number of downgrades fired in the current chain. */
-  count: number
-  /** The premium model that was walled when the chain started (observability). */
-  premiumModel: string
-  /** Wall-clock ms of the most recent downgrade in the chain. */
-  ts: number
-}
 
 export type TierDowngradeDecision =
   | {
-      /** Fire the downgrade: write a consume-once carrier for `toModel`, persist
-       *  `nextAttempts`, and self-restart to resume the dead turn. */
+      /** Fire the downgrade: write a consume-once carrier for `toModel` and
+       *  self-restart to resume the dead turn on the configured default. */
       action: 'downgrade'
       toModel: string
       fromModel: string
-      nextAttempts: TierDowngradeAttempts
-    }
-  | {
-      /** The downgrade budget is spent for this chain — name the turn as lost
-       *  (surface to the operator) and do NOT restart. */
-      action: 'exhausted'
-      premiumModel: string
     }
   | {
       /** No downgrade is warranted. `on-default`: the session is already on the
@@ -120,14 +89,6 @@ export interface TierDowngradeInput {
    *  spuriously reading as a premium tier over a `claude-opus-*`-shaped default
    *  and vice versa, as far as the resolver can. */
   resolve: (token: string) => string
-  /** The parsed `.tier-downgrade-attempts` counter, or null when absent/corrupt. */
-  attempts: TierDowngradeAttempts | null
-  /** Now, epoch ms. */
-  now: number
-  /** Override the staleness window (tests). */
-  staleMs?: number
-  /** Override the per-chain downgrade cap (tests). */
-  maxDowngrades?: number
 }
 
 /**
@@ -136,9 +97,6 @@ export interface TierDowngradeInput {
  * off this verdict.
  */
 export function decideTierDowngrade(input: TierDowngradeInput): TierDowngradeDecision {
-  const staleMs = input.staleMs ?? DEFAULT_TIER_DOWNGRADE_STALE_MS
-  const maxDowngrades = input.maxDowngrades ?? DEFAULT_MAX_TIER_DOWNGRADES
-
   const configured =
     typeof input.configuredDefault === 'string' ? input.configuredDefault.trim() : ''
   if (configured.length === 0) {
@@ -148,7 +106,9 @@ export function decideTierDowngrade(input: TierDowngradeInput): TierDowngradeDec
 
   const override = input.sessionOverride
   if (override == null || override.length === 0) {
-    // On the configured default already — no lower tier to fall to.
+    // On the configured default already — no lower tier to fall to. This is also
+    // the natural loop bound: after the downgrade boot the override is gone, so a
+    // re-entry lands here and never re-downgrades.
     return { action: 'skip', reason: 'on-default' }
   }
 
@@ -158,80 +118,81 @@ export function decideTierDowngrade(input: TierDowngradeInput): TierDowngradeDec
     return { action: 'skip', reason: 'on-default' }
   }
 
-  // A premium model is active AND walled fleet-wide. Consult the loop guard.
-  const fresh = input.attempts != null && input.now - input.attempts.ts <= staleMs
-    ? input.attempts
-    : null
-  const priorCount = fresh?.count ?? 0
-  if (priorCount >= maxDowngrades) {
-    // Already downgraded this chain and it died again → name-as-lost.
-    return { action: 'exhausted', premiumModel: override }
-  }
-
-  return {
-    action: 'downgrade',
-    toModel: configured,
-    fromModel: override,
-    nextAttempts: { count: priorCount + 1, premiumModel: override, ts: input.now },
-  }
+  // A premium model is active AND walled fleet-wide → downgrade to the default.
+  return { action: 'downgrade', toModel: configured, fromModel: override }
 }
 
-// ─── `.tier-downgrade-attempts` counter file (restart-surviving loop guard) ──
-//
-// Deliberately NOT `.session-model-boot-attempts`: start.sh `rm -f`s that name
-// every boot (retired rev-4 hygiene), so it cannot survive a restart. This file
-// is untouched by start.sh — the gateway is its only reader/writer.
+/**
+ * The user-facing broadcast for a fired downgrade. PURE + deterministic so the
+ * wording is pinned by a test.
+ *
+ * HONESTY CONTRACT (do not regress): it states the turn resumes on the DEFAULT
+ * and that the user must RE-ISSUE `/model <premium>` to get the premium tier
+ * back. It must NOT claim any automatic revert to the premium model — there is
+ * none (the override is session-scoped and dies on the downgrade restart).
+ */
+export function renderTierDowngradeNotice(
+  fromModel: string,
+  toModel: string,
+  agent: string,
+): string {
+  return (
+    `⤵️ **Downgrading model to keep going** on agent **${agent}**\n` +
+    `\`${fromModel}\` is overloaded across every account right now, so this turn is ` +
+    `resuming on the default \`${toModel}\` to keep working. ` +
+    `Re-issue \`/model ${fromModel}\` once it frees up — it won't switch back on its own.`
+  )
+}
 
-/** Parse the counter file. Null on corrupt JSON or a bad shape. */
-export function parseTierDowngradeAttempts(text: string): TierDowngradeAttempts | null {
-  try {
-    const raw = JSON.parse(text) as Partial<TierDowngradeAttempts>
-    if (
-      typeof raw.count !== 'number' ||
-      !Number.isFinite(raw.count) ||
-      raw.count < 0 ||
-      typeof raw.premiumModel !== 'string' ||
-      typeof raw.ts !== 'number' ||
-      !Number.isFinite(raw.ts)
-    ) {
-      return null
+/** The resume-gate verdict the gateway feeds `planTierDowngrade` (mirrors
+ *  `ResumeDecision` from fleet-fallback-resume.ts, peeked WITHOUT arming). */
+export type ResumeGateVerdict = 'resume' | 'skip-inflight' | 'skip-stale'
+
+export type TierDowngradePlan =
+  | {
+      /** Fire the downgrade: write the carrier, arm the latch, broadcast
+       *  `notice`, and self-restart. */
+      kind: 'downgrade'
+      toModel: string
+      fromModel: string
+      notice: string
     }
-    return { count: raw.count, premiumModel: raw.premiumModel, ts: raw.ts }
-  } catch {
-    return null
-  }
-}
+  | {
+      /** A resume restart is ALREADY armed in this process (a concurrent turn's
+       *  downgrade or account-swap) — emit NO give-up card; the armed restart
+       *  replays the interrupted turn. */
+      kind: 'suppress'
+    }
+  | {
+      /** No downgrade; caller falls through to its normal all-blocked card. */
+      kind: 'skip'
+    }
 
-export function serializeTierDowngradeAttempts(rec: TierDowngradeAttempts): string {
-  return `${JSON.stringify({ count: rec.count, premiumModel: rec.premiumModel, ts: rec.ts })}\n`
-}
-
-function atomicWrite(path: string, content: string): void {
-  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`
-  writeFileSync(tmp, content, 'utf8')
-  renameSync(tmp, path)
-}
-
-/** Read + parse the counter for `agentDir`, or null when absent/corrupt. */
-export function readTierDowngradeAttempts(agentDir: string): TierDowngradeAttempts | null {
-  try {
-    const raw = readFileSync(join(agentDir, TIER_DOWNGRADE_ATTEMPTS_FILE), 'utf8')
-    return parseTierDowngradeAttempts(raw)
-  } catch {
-    return null
-  }
-}
-
-/** Persist the counter BEFORE the downgrade restart (it must survive the boot). */
-export function writeTierDowngradeAttempts(agentDir: string, rec: TierDowngradeAttempts): void {
-  atomicWrite(join(agentDir, TIER_DOWNGRADE_ATTEMPTS_FILE), serializeTierDowngradeAttempts(rec))
-}
-
-/** Clear the counter (a fresh chain / recovery). Best-effort. */
-export function clearTierDowngradeAttempts(agentDir: string): void {
-  try {
-    rmSync(join(agentDir, TIER_DOWNGRADE_ATTEMPTS_FILE), { force: true })
-  } catch {
-    /* best-effort */
+/**
+ * Pure orchestration off the (pure) decision + the resume-gate verdict. Keeps
+ * the concurrent-turn suppression (LOW-9a) and the give-up/fall-through routing
+ * testable without a live gateway.
+ *
+ *   - decision `skip`               → `skip` (fall through to the all-blocked card)
+ *   - decision `downgrade`, gate `skip-inflight`
+ *                                   → `suppress` (a restart is already armed)
+ *   - decision `downgrade`, gate `skip-stale`
+ *                                   → `skip` (turn too old to resume; give up)
+ *   - decision `downgrade`, gate `resume`
+ *                                   → `downgrade` (carry the honest notice)
+ */
+export function planTierDowngrade(
+  decision: TierDowngradeDecision,
+  gateVerdict: ResumeGateVerdict,
+  agent: string,
+): TierDowngradePlan {
+  if (decision.action !== 'downgrade') return { kind: 'skip' }
+  if (gateVerdict === 'skip-inflight') return { kind: 'suppress' }
+  if (gateVerdict === 'skip-stale') return { kind: 'skip' }
+  return {
+    kind: 'downgrade',
+    toModel: decision.toModel,
+    fromModel: decision.fromModel,
+    notice: renderTierDowngradeNotice(decision.fromModel, decision.toModel, agent),
   }
 }

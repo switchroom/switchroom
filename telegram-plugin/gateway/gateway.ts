@@ -469,12 +469,7 @@ import {
   writeSessionEffortFile,
   clearSessionEffortFile,
 } from './session-model-file.js'
-import {
-  decideTierDowngrade,
-  readTierDowngradeAttempts,
-  writeTierDowngradeAttempts,
-  clearTierDowngradeAttempts,
-} from '../tier-downgrade.js'
+import { decideTierDowngrade, planTierDowngrade } from '../tier-downgrade.js'
 import { discoverModels, selectModel } from '../../src/agents/model-picker.js'
 import { resolveMainModel, SWITCHROOM_DEFAULT_THINKING_EFFORT } from '../../src/agents/scaffold.js'
 import {
@@ -4460,16 +4455,6 @@ function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
     ? endingTurn.replyCalled === true
     : currentTurn?.replyCalled === true
   shadowEmit({ kind: 'turnEnd', key: key as _ChatKey, at: Date.now(), outboundEmitted })
-  // Tier-downgrade recovery: a turn that ended WITH an outbound reply is a
-  // successful answer, so any in-progress model-tier downgrade chain is
-  // resolved — clear the restart-surviving `.tier-downgrade-attempts` counter
-  // so a LATER independent overload can downgrade again. (Staleness bounds it
-  // too, but clearing on success avoids wrongly benching a re-selected premium
-  // model inside the staleness window.) Best-effort; a no-op when absent.
-  if (outboundEmitted) {
-    const tdAgentDir = resolveAgentDirFromEnv()
-    if (tdAgentDir) clearTierDowngradeAttempts(tdAgentDir)
-  }
   const msgInfo = activeReactionMsgIds.get(key)
   activeStatusReactions.delete(key)
   activeReactionMsgIds.delete(key)
@@ -23586,26 +23571,36 @@ function broadcastTierNotice(markdown: string): void {
  * (distinct from the configured default), downgrade to the configured default
  * and resume the dead turn via a self-restart, rather than let the turn stall.
  *
- *   - Revert is NATIVE: the consume-once `.session-model` carrier for the
- *     configured default is applied+deleted by start.sh on the resume boot, so
- *     any later restart reverts. The premium override was session-scoped, so the
- *     boot lands on the default regardless; the carrier makes it deterministic.
+ *   - NO automatic return to the premium model. The /model override is
+ *     session-scoped and in-memory only (recordTypedModelSwitch writes no
+ *     carrier), so it dies on the downgrade SIGTERM. The consume-once
+ *     `.session-model` carrier written here targets the CONFIGURED DEFAULT:
+ *     start.sh applies+deletes it on the resume boot, and every later restart
+ *     also boots the default. The premium tier is never restored on its own —
+ *     the user must re-issue `/model <premium>`, which the notice says plainly.
  *   - Effort is NATIVE: no `.session-effort` carrier is written, so the restart
  *     sheds any live /effort override and the downgraded default boots at the
  *     configured `thinking_effort` (the fleet `low` pin, #1978).
- *   - Loop-bounded: the restart-surviving `.tier-downgrade-attempts` counter
- *     caps consecutive downgrades per interruption chain; a second consecutive
- *     downgrade-resume failure is named-as-lost (no restart). Pacing reuses the
- *     fleetFallbackResumeGate single-flight + 3h staleness.
+ *   - Loop-bounded by the NATURAL on-default guard: after the downgrade boot the
+ *     session runs the configured default (override gone), so a re-entry returns
+ *     `skip` ('on-default') and never re-downgrades — even if the default is
+ *     itself walled (then the normal all-blocked card fires, no loop). Pacing
+ *     reuses the fleetFallbackResumeGate single-flight + 3h staleness.
  *
  * Returns:
- *   'downgraded' — carrier written, restart armed; caller must NOT also emit the
- *                  all-blocked give-up card (we are recovering, not giving up).
- *   'exhausted'  — budget spent; name-as-lost already broadcast; caller returns.
- *   'skip'       — not applicable (on the configured default, unresolved default,
- *                  or paced out); caller falls through to the all-blocked card.
+ *   'downgraded'      — carrier written, latch armed, restart fired; caller must
+ *                       NOT also emit the all-blocked give-up card (we are
+ *                       recovering, not giving up).
+ *   'restart-pending' — a resume restart was ALREADY armed in this process (a
+ *                       concurrent turn's downgrade or account-swap); that
+ *                       restart replays the interrupted turn, so caller must NOT
+ *                       emit a give-up card (avoids the contradictory "could not
+ *                       be recovered" race).
+ *   'skip'            — not applicable (on the configured default, unresolved
+ *                       default, or the turn is too stale to resume); caller
+ *                       falls through to the all-blocked card.
  */
-function maybeTierDowngrade(triggerAgent: string): 'downgraded' | 'exhausted' | 'skip' {
+function maybeTierDowngrade(triggerAgent: string): 'downgraded' | 'restart-pending' | 'skip' {
   const agentDir = resolveAgentDirFromEnv()
   if (!agentDir) return 'skip'
   const configuredDefault = resolveMainModel(readConfiguredDefaultModel(agentDir) ?? undefined)
@@ -23613,65 +23608,47 @@ function maybeTierDowngrade(triggerAgent: string): 'downgraded' | 'exhausted' | 
     sessionOverride: sessionModelSource.getOverride(),
     configuredDefault,
     resolve: (t) => resolveMainModel(t),
-    attempts: readTierDowngradeAttempts(agentDir),
-    now: Date.now(),
   })
-  if (decision.action === 'skip') return 'skip'
-  if (decision.action === 'exhausted') {
-    process.stderr.write(
-      `telegram gateway: [tier-downgrade] budget spent — naming turn as lost ` +
-      `agent=${triggerAgent} premium=${decision.premiumModel}\n`,
-    )
-    broadcastTierNotice(
-      `⚠️ **Turn could not be recovered** on agent **${triggerAgent}**\n` +
-      `The premium model \`${decision.premiumModel}\` is walled fleet-wide, and a ` +
-      `downgrade to the default \`${configuredDefault}\` already failed once — ` +
-      `stopping here to avoid a restart loop. Re-send your message once a model frees.`,
-    )
-    return 'exhausted'
-  }
-  // action === 'downgrade'. Pace via the resume gate (single-flight within this
-  // process + 3h staleness), the same gate the account-swap resume path uses.
-  const verdict = fleetFallbackResumeGate.decide(newestActiveTurnStartedAtMs())
-  if (verdict !== 'resume') {
-    process.stderr.write(
-      `telegram gateway: [tier-downgrade] restart suppressed (${verdict}) agent=${triggerAgent}\n`,
-    )
+  // PEEK the resume gate WITHOUT arming (single-flight within this process + 3h
+  // staleness), the same gate the account-swap resume path uses. Peeking lets us
+  // do the fallible carrier write BEFORE committing the arm (see arm() below).
+  const gateVerdict = fleetFallbackResumeGate.peek(newestActiveTurnStartedAtMs())
+  const plan = planTierDowngrade(decision, gateVerdict, triggerAgent)
+  if (plan.kind === 'skip') {
+    if (decision.action === 'downgrade') {
+      process.stderr.write(
+        `telegram gateway: [tier-downgrade] restart suppressed (${gateVerdict}) agent=${triggerAgent}\n`,
+      )
+    }
     return 'skip'
   }
-  // Persist the loop-guard counter BEFORE the restart — it must survive the boot
-  // (start.sh never touches `.tier-downgrade-attempts`).
-  try {
-    writeTierDowngradeAttempts(agentDir, decision.nextAttempts)
-  } catch (err) {
+  if (plan.kind === 'suppress') {
+    // A resume restart is already armed (concurrent turn). Do NOT emit a give-up
+    // card — that restart will replay the latest interrupted turn.
     process.stderr.write(
-      `telegram gateway: [tier-downgrade] failed to persist attempts counter — aborting downgrade: ${(err as Error)?.message ?? err}\n`,
+      `telegram gateway: [tier-downgrade] give-up suppressed — a resume restart is already armed agent=${triggerAgent}\n`,
     )
-    return 'skip'
+    return 'restart-pending'
   }
-  // Consume-once carrier for the configured default → the resume boot runs the
-  // default, replays the dead turn there, and reverts on any later restart.
+  // plan.kind === 'downgrade'. Write the consume-once carrier for the configured
+  // default BEFORE arming the latch: a throwing write must not leave an armed
+  // latch with no pending restart (which would suppress a legitimate later
+  // account-swap resume for the single-flight window).
   try {
-    writeSessionModelFile(agentDir, decision.toModel, configuredDefault)
+    writeSessionModelFile(agentDir, plan.toModel, configuredDefault)
   } catch (err) {
-    // Never arm the restart if the carrier could not be written — a bare
-    // restart would still revert to the default, but keep the two side effects
-    // atomic in intent and surface the failure.
     process.stderr.write(
       `telegram gateway: [tier-downgrade] failed to write session-model carrier — aborting downgrade: ${(err as Error)?.message ?? err}\n`,
     )
     return 'skip'
   }
+  // Carrier is on disk — NOW commit the single-flight arm and fire the restart.
+  fleetFallbackResumeGate.arm()
   process.stderr.write(
-    `telegram gateway: [tier-downgrade] downgrading ${decision.fromModel} → ${decision.toModel} ` +
-    `and resuming via self-restart agent=${triggerAgent} (attempt ${decision.nextAttempts.count})\n`,
+    `telegram gateway: [tier-downgrade] downgrading ${plan.fromModel} → ${plan.toModel} ` +
+    `and resuming via self-restart agent=${triggerAgent}\n`,
   )
-  broadcastTierNotice(
-    `⤵️ **Downgrading model to keep going** on agent **${triggerAgent}**\n` +
-    `\`${decision.fromModel}\` is overloaded across every account, so this turn is ` +
-    `resuming on the default \`${decision.toModel}\`. It reverts to \`${decision.fromModel}\` ` +
-    `on the next restart.`,
-  )
+  broadcastTierNotice(plan.notice)
   const selfAgent = process.env.SWITCHROOM_AGENT_NAME ?? triggerAgent
   triggerSelfRestart(selfAgent, 'tier-downgrade-resume')
   return 'downgraded'
@@ -23765,18 +23742,13 @@ async function doFireFleetAutoFallback(
       // downgrade to the configured default and resume the dead turn rather than
       // stall. Only reachable here — a `switched` outcome never enters this
       // branch, so a model throttled on one account is always recovered by
-      // account-swap first, never by a downgrade. Loop-bounded by
-      // `.tier-downgrade-attempts`; effort + revert are native (see
-      // maybeTierDowngrade).
+      // account-swap first, never by a downgrade. Loop-bounded by the natural
+      // on-default guard; effort revert is native (see maybeTierDowngrade).
       const tier = maybeTierDowngrade(triggerAgent)
-      if (tier === 'downgraded') {
-        // Restart armed; the boot-resume path replays the turn on the default.
-        // Do NOT also emit the all-blocked give-up card — we are recovering.
-        return false
-      }
-      if (tier === 'exhausted') {
-        // Turn already named-as-lost to the operator; suppress the generic
-        // all-blocked card to avoid double-messaging.
+      if (tier === 'downgraded' || tier === 'restart-pending') {
+        // Either this turn armed a downgrade restart, or a concurrent turn
+        // already armed a resume restart. Do NOT emit the all-blocked give-up
+        // card — a restart is coming that replays the interrupted turn.
         return false
       }
       const verdict = evaluateAllBlockedNotice(fallbackAllBlockedNoticeState, Date.now())
