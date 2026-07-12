@@ -316,9 +316,14 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
    * draft-stream's own dedupe — the completed answer would never render.
    * The conservative reading costs nothing: a re-flush of a payload that DID
    * land is dropped by the gate's no-op skip before it reaches the API.
+   *
+   * Decides from the CLASS THE CALL WAS SENT WITH (the opts built at call
+   * time), never a re-read of `isFinal()` at result time: finalize() landing
+   * while a cosmetic edit is in flight must not reclassify that edit's shed
+   * as a benign skip.
    */
-  const editWasShed = (result: unknown): boolean =>
-    result === undefined && handleRef?.isFinal() !== true
+  const editWasShed = (result: unknown, sentOpts: RetryPolicyOpts): boolean =>
+    result === undefined && sentOpts.priorityClass === 'cosmetic'
   /** Sentinel thrown so draft-stream's flush does not record a shed edit as sent. */
   const shedError = (id: number) =>
     new Error(`draft edit shed by send gate (id=${id}); next flush carries full state`)
@@ -346,11 +351,9 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
     if (existingId != null) {
       if (tailLastText[ti] === piece.text) return // unchanged — skip the API call
       try {
-        const res = await retry(
-          () => editPiece(existingId, piece, baseOpts),
-          editGateOpts(existingId, piecePayload(piece)),
-        )
-        if (editWasShed(res)) {
+        const gateOpts = editGateOpts(existingId, piecePayload(piece))
+        const res = await retry(() => editPiece(existingId, piece, baseOpts), gateOpts)
+        if (editWasShed(res, gateOpts)) {
           // Shed by the gate (flood window / pressure) — leave tailLastText
           // stale so the next flush retries this piece with full state.
           return
@@ -362,11 +365,12 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
           warn?.(
             `stream-controller: tail-piece #${ti + 1} edit parse-entities rejected — retrying same id=${existingId} as plain text (${err instanceof Error ? err.message : String(err)})`,
           )
+          const fallbackOpts = editGateOpts(existingId, piece.text)
           const res = await retry(
             () => bot.api.editMessageText(chatId, existingId, piece.text, baseOpts),
-            editGateOpts(existingId, piece.text),
+            fallbackOpts,
           )
-          if (editWasShed(res)) return // shed — retried with full state next flush
+          if (editWasShed(res, fallbackOpts)) return // shed — retried with full state next flush
           tailLastText[ti] = piece.text
           onEdit?.(existingId, piece.text.length)
         } else {
@@ -461,14 +465,12 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
       const head = pieces[0]
       // Edit the anchor message in place with the FIRST piece.
       try {
-        const res = await retry(
-          () => editPiece(id, head, baseOpts),
-          editGateOpts(id, piecePayload(head)),
-        )
+        const gateOpts = editGateOpts(id, piecePayload(head))
+        const res = await retry(() => editPiece(id, head, baseOpts), gateOpts)
         // Shed by the gate (cosmetic under pressure / an open flood window):
         // throw so draft-stream does NOT record this text as on-screen — a
         // later flush of the same text (e.g. the finalize) must still land.
-        if (editWasShed(res)) throw shedError(id)
+        if (editWasShed(res, gateOpts)) throw shedError(id)
         // C2: report the actual head-piece length, not the full body length.
         onEdit?.(id, head.text.length)
       } catch (err) {
@@ -485,11 +487,12 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
           // contract). For a single-piece stream (common case) this is the
           // whole body; a rare oversize split edits the head piece's body.
           const fallbackBody = pieces.length === 1 ? text : head.text
+          const fallbackOpts = editGateOpts(id, fallbackBody)
           const res = await retry(
             () => bot.api.editMessageText(chatId, id, fallbackBody, baseOpts),
-            editGateOpts(id, fallbackBody),
+            fallbackOpts,
           )
-          if (editWasShed(res)) throw shedError(id)
+          if (editWasShed(res, fallbackOpts)) throw shedError(id)
           onEdit?.(id, head.text.length)
         } else {
           throw err
