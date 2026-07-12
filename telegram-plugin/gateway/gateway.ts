@@ -309,8 +309,17 @@ import {
 import { recordOperatorEvent } from '../operator-events-history.js'
 import {
   formatModelUnavailableCard,
+  isTransientUpstreamSignal,
   resolveModelUnavailableFromOperatorEvent,
+  type ModelUnavailableDetection,
 } from '../model-unavailable.js'
+import {
+  decideThrottleTier,
+  evaluateThrottleNotice,
+  renderThrottleNotice,
+  throttleRetryInPlaceMaxMs,
+  type ThrottleNoticeState,
+} from '../throttle-tier.js'
 import { runFleetAutoFallback, renderFallbackFailureNotice, evaluateFallbackFailureNotice, evaluateAllBlockedNotice, type FallbackFailureNoticeState, type FallbackAllBlockedNoticeState } from '../auto-fallback-fleet.js'
 import { startRestartWatchdog } from './restart-watchdog.js'
 import { validateStringArray } from './access-validator.js'
@@ -7659,6 +7668,54 @@ const inboundCoalescer = createInboundCoalescer<CoalescePayload>({
 function emitGatewayOperatorEvent(event: OperatorEvent): void {
   const { agent, kind } = event
 
+  // ── 429 throttle tier (operator spec: "retry in place under 5 min, else
+  // mark + failover, honest reset messaging") ────────────────────────────
+  // A terminal TRANSIENT per-account 429 — kind `rate-limited` carrying the
+  // explicit transient-negation wording — is decided BEFORE the per-kind
+  // cooldown gate: every hit must reach the broker's mark-throttled
+  // escalation counter even when the user-facing notice is cooldown-
+  // suppressed (the counter is what corroborates a wall hiding behind
+  // transient wording). Generic overloads / 529s (no negation wording) fall
+  // through to the existing calm rate-limited card unchanged.
+  let throttleEscalation: ModelUnavailableDetection | null = null
+  if (kind === 'rate-limited' && isTransientUpstreamSignal(event.detail)) {
+    const throttleDecision = decideThrottleTier({
+      detail: event.detail,
+      now: Date.now(),
+      thresholdMs: throttleRetryInPlaceMaxMs(),
+    })
+    if (throttleDecision.action === 'throttle') {
+      // Reset is near (≤ threshold) or unparseable (60s default): DO NOT
+      // fail over. Record throttled_until broker-side, post ONE lightweight
+      // notice (per-account cooldown), nudge a retry after the reset.
+      process.stderr.write(
+        `telegram gateway: throttle-tier staying-put agent=${agent} ` +
+          `until=${new Date(throttleDecision.throttledUntilMs).toISOString()} ` +
+          `parsedReset=${throttleDecision.resetParsed}\n`,
+      )
+      try {
+        recordOperatorEvent(event)
+      } catch { /* history is best-effort */ }
+      void fireThrottleTier(
+        agent,
+        throttleDecision.throttledUntilMs,
+        throttleDecision.resetParsed,
+      )
+      return
+    }
+    if (throttleDecision.action === 'failover') {
+      // Reset beyond the retry-in-place threshold: the account is benched
+      // until then anyway, so escalate to the standard mark-exhausted +
+      // fleet-failover machinery below — with the honest 'rate_limited'
+      // wording and the parsed reset as the mark expiry.
+      throttleEscalation = {
+        kind: 'rate_limited',
+        resetAt: new Date(throttleDecision.resetAtMs),
+        raw: event.detail,
+      }
+    }
+  }
+
   if (!shouldEmitOperatorEvent(agent, kind)) {
     process.stderr.write(
       `telegram gateway: operator-event suppressed (cooldown) agent=${agent} kind=${kind}\n`,
@@ -7687,7 +7744,10 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
   //     by the upstream classifier
   //   - detail string contains one of the model-unavailable text patterns
   //     (covers raw stderr that slipped past structured classification)
-  const modelUnavailable = resolveModelUnavailableFromOperatorEvent(event)
+  // Throttle-tier escalation (long-reset transient 429) takes precedence:
+  // resolveModelUnavailableFromOperatorEvent deliberately returns null for a
+  // bare rate-limited event, but this one is auto-fallback-eligible.
+  const modelUnavailable = throttleEscalation ?? resolveModelUnavailableFromOperatorEvent(event)
   let renderedText: string
   let renderedKeyboard: ReturnType<typeof renderOperatorEvent>['keyboard'] | undefined
   // #3031 PR 3 — when the card promises an in-flight auto-failover, record
@@ -7709,7 +7769,12 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
     // it just produces a self-cancelling "probed healthy / Stale event?"
     // loop on every 529. Overload is handled by Claude Code's own
     // internal retry, not by switching accounts.
-    const isAutoKind = modelUnavailable.kind === 'quota_exhausted'
+    // 'rate_limited' is the throttle-tier escalation (transient 429 whose
+    // reset exceeds the retry-in-place threshold) — same failover mechanics
+    // as a quota wall, honest wording on the card.
+    const isAutoKind =
+      modelUnavailable.kind === 'quota_exhausted' ||
+      modelUnavailable.kind === 'rate_limited'
     const willActuallyFire = isAutoKind && wouldFireFleetAutoFallback()
     process.stderr.write(
       `telegram gateway: operator-event suppressing-raw-stderr-for-model-unavailable agent=${agent} kind=${kind} detected=${modelUnavailable.kind} autoKind=${isAutoKind} willFire=${willActuallyFire}\n`,
@@ -7736,7 +7801,10 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
     // the broker re-mirrored the still-walled account onto the fleet after 5h.
     if (willActuallyFire) {
       const untilMs = resolveExhaustUntil(modelUnavailable.resetAt?.getTime())
-      void fireFleetAutoFallback(agent, untilMs)
+      // Thread the RAW parsed reset (distinct from the floor-applied untilMs)
+      // so the fallback announcement can name it even when the live probe of
+      // the old account fails — honest reset messaging on the enriched card.
+      void fireFleetAutoFallback(agent, untilMs, modelUnavailable.resetAt)
     }
   } else {
     try {
@@ -11374,7 +11442,13 @@ const ipcServer: IpcServer = createIpcServer({
         (msg.resetAt == null ? ' (reset unparsed → +7d default)' : '') +
         ' — triggering fleet auto-fallback\n',
     )
-    void fireFleetAutoFallback(msg.agentName, untilMs)
+    void fireFleetAutoFallback(
+      msg.agentName,
+      untilMs,
+      // Enriched announcement: the sidecar-parsed reset (when present) keeps
+      // the recovery line honest even when the old account's probe fails.
+      msg.resetAt != null ? new Date(msg.resetAt) : undefined,
+    )
   },
 
   // Issue #2971 — read-only wedge-watchdog probe: is there a live pending
@@ -23203,15 +23277,169 @@ function wouldFireFleetAutoFallback(): boolean {
  * so the user sees the outcome inline with the original "Model
  * unavailable" card.
  */
-async function fireFleetAutoFallback(triggerAgent: string, untilMs?: number): Promise<void> {
+async function fireFleetAutoFallback(
+  triggerAgent: string,
+  untilMs?: number,
+  parsedResetAt?: Date,
+): Promise<void> {
   return fleetFallbackGate.fire(
-    () => doFireFleetAutoFallback(triggerAgent, untilMs),
+    () => doFireFleetAutoFallback(triggerAgent, untilMs, parsedResetAt),
     (err) => {
       process.stderr.write(
         `telegram gateway: [fleet-fallback] error agent=${triggerAgent}: ${(err as Error)?.message ?? err}\n`,
       )
     },
   )
+}
+
+// ─── 429 throttle tier — side-effect wiring ─────────────────────────────────
+// Decision + notice text live in throttle-tier.ts (pure); this owns the broker
+// write, the ONE lightweight notice, and the delayed retry nudge.
+
+/** Per-account cooldown state for the throttle notice (one per account per
+ *  window — a terminal-429 burst produces exactly one message). */
+let throttleNoticeState: ThrottleNoticeState = { lastSentAtMsByAccount: {} }
+
+/** Pending retry-nudge timer. The LATEST throttle owns the nudge — a newer
+ *  hit (longer reset) replaces an armed timer instead of stacking restarts. */
+let throttleRetryTimer: NodeJS.Timeout | null = null
+
+/** Slack past throttled_until before the retry nudge fires. */
+const THROTTLE_RETRY_NUDGE_SLACK_MS = 5_000
+
+/**
+ * Throttle path (429 throttle tier): the account is transiently rate-limited
+ * with a reset near enough to wait out in place. NO failover.
+ *
+ *  1. Report the broker's non-admin `mark-throttled` verb — records
+ *     throttled_until in the quota ledger (cron preflight soft-defers on it)
+ *     WITHOUT rolling the fleet and WITHOUT touching eligibility. The broker
+ *     also runs the escalation guard there (3+ hits/10min → live probe →
+ *     mark-exhausted when corroborated).
+ *  2. Post ONE lightweight operator notice: account, that it's rate-limited
+ *     not quota-exhausted, when it resets, that the agent stays put.
+ *     Cooldown-deduped per account.
+ *  3. Nudge a retry after throttled_until via the existing resume lever
+ *     (fleetFallbackResumeGate → triggerSelfRestart → boot-resume replays the
+ *     turn the 429 killed). Same guards as the fleet-fallback resume:
+ *     single-flight + staleness; a needless restart replays nothing (the
+ *     boot-resume path only re-injects a genuinely interrupted turn).
+ *
+ * Fire-and-forget: never throws into the caller's flow.
+ */
+async function fireThrottleTier(
+  triggerAgent: string,
+  throttledUntilMs: number,
+  resetParsed: boolean,
+): Promise<void> {
+  let account: string | null = null
+  let escalated = false
+  let rolledTo: string | null = null
+  try {
+    const client = await getAuthBrokerClient(triggerAgent)
+    if (client) {
+      const r = await client.markThrottled(throttledUntilMs)
+      account = r.account
+      escalated = r.escalated
+      rolledTo = r.rolledTo ?? null
+    } else {
+      process.stderr.write(
+        `telegram gateway: [throttle-tier] broker unreachable — notice only, no ledger record agent=${triggerAgent}\n`,
+      )
+    }
+  } catch (err) {
+    process.stderr.write(
+      `telegram gateway: [throttle-tier] markThrottled failed agent=${triggerAgent}: ${(err as Error)?.message ?? err}\n`,
+    )
+  }
+
+  if (escalated) {
+    // The broker's escalation guard corroborated a genuine wall via a live
+    // probe and already ran the standard mark-exhausted + fleet roll. The
+    // roll announcement rides the existing broker-roll channel (list-state
+    // `last_fleet_roll` → quota-watch, fleet-deduped) — no duplicate send
+    // here. Nudge the dead-turn resume now: the fleet just swapped accounts.
+    process.stderr.write(
+      `telegram gateway: [throttle-tier] escalated to wall account=${account ?? '?'} ` +
+        `rolledTo=${rolledTo ?? 'none (all blocked)'}\n`,
+    )
+    if (rolledTo) {
+      const verdict = fleetFallbackResumeGate.decide(newestActiveTurnStartedAtMs())
+      if (verdict === 'resume') {
+        triggerSelfRestart(
+          process.env.SWITCHROOM_AGENT_NAME ?? triggerAgent,
+          'throttle-escalation-resume',
+        )
+      } else {
+        process.stderr.write(
+          `telegram gateway: [throttle-tier] escalation resume suppressed (${verdict})\n`,
+        )
+      }
+    }
+    return
+  }
+
+  // ONE lightweight notice, cooldown-deduped per account. When the broker was
+  // unreachable the account is unknown — key the cooldown on the agent so the
+  // degraded path still can't spam.
+  const cooldownKey = account ?? `agent:${triggerAgent}`
+  const verdict = evaluateThrottleNotice(throttleNoticeState, cooldownKey, Date.now())
+  if (verdict.send) {
+    throttleNoticeState = verdict.next
+    const access = loadAccess()
+    const html = renderThrottleNotice({
+      account,
+      agent: triggerAgent,
+      throttledUntilMs,
+      resetParsed,
+    })
+    // Status notice, not the user's answer — silence the ping (same posture
+    // as the fleet-fallback announcement).
+    const noticeOpts = { disable_notification: true }
+    for (const chat_id of access.allowFrom) {
+      void swallowingApiCall(
+        // allow-raw-bot-api: wrapped in swallowingApiCall (retry policy)
+        () => bot.api.sendRichMessage(chat_id, richMessage(html), noticeOpts),
+        { chat_id, verb: 'throttle-tier:notify' },
+      )
+    }
+  } else {
+    process.stderr.write(
+      `telegram gateway: [throttle-tier] notice suppressed (cooldown) key=${cooldownKey}\n`,
+    )
+  }
+
+  scheduleThrottleRetryNudge(triggerAgent, throttledUntilMs)
+}
+
+/**
+ * Arm (or re-arm) the post-throttle retry nudge. After throttled_until the
+ * turn the 429 killed is replayed via the SAME lever the fleet-fallback
+ * resume uses — triggerSelfRestart + boot-resume — guarded by the shared
+ * fleetFallbackResumeGate (single-flight across throttle AND fallback
+ * resumes; staleness failsafe). The gate is consulted at FIRE time, not arm
+ * time, so a fallback-driven restart inside the wait window wins and the
+ * nudge no-ops.
+ */
+function scheduleThrottleRetryNudge(triggerAgent: string, throttledUntilMs: number): void {
+  const delayMs = Math.max(throttledUntilMs - Date.now(), 0) + THROTTLE_RETRY_NUDGE_SLACK_MS
+  if (throttleRetryTimer) clearTimeout(throttleRetryTimer)
+  throttleRetryTimer = setTimeout(() => {
+    throttleRetryTimer = null
+    const verdict = fleetFallbackResumeGate.decide(newestActiveTurnStartedAtMs())
+    if (verdict === 'resume') {
+      const selfAgent = process.env.SWITCHROOM_AGENT_NAME ?? triggerAgent
+      process.stderr.write(
+        `telegram gateway: [throttle-tier] throttle cleared — resuming dead turn via self-restart agent=${selfAgent}\n`,
+      )
+      triggerSelfRestart(selfAgent, 'throttle-retry-resume')
+    } else {
+      process.stderr.write(
+        `telegram gateway: [throttle-tier] retry nudge suppressed (${verdict}) agent=${triggerAgent}\n`,
+      )
+    }
+  }, delayMs)
+  throttleRetryTimer.unref()
 }
 
 /**
@@ -23275,7 +23503,11 @@ function broadcastFleetFallbackFailure(triggerAgent: string, reason: string): vo
  *  user-visible announcement was broadcast). False on no-op /
  *  error / idempotent-skip — caller uses this to decide whether to
  *  arm the post-fire suppression window. */
-async function doFireFleetAutoFallback(triggerAgent: string, untilMs?: number): Promise<boolean> {
+async function doFireFleetAutoFallback(
+  triggerAgent: string,
+  untilMs?: number,
+  parsedResetAt?: Date,
+): Promise<boolean> {
   try {
     const client = await getAuthBrokerClient(triggerAgent)
     if (!client) {
@@ -23324,6 +23556,10 @@ async function doFireFleetAutoFallback(triggerAgent: string, untilMs?: number): 
       },
       triggerAgent,
       tz,
+      // Enriched card (429 throttle tier): the RAW reset parsed from the
+      // error prose, so the announcement names when the old account frees
+      // even when its live probe returned nothing.
+      parsedResetAt,
     })
     process.stderr.write(
       `telegram gateway: [fleet-fallback] outcome=${outcome.kind} agent=${triggerAgent}` +

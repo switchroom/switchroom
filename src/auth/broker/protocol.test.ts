@@ -24,6 +24,7 @@ describe("protocol encode/decode", () => {
       { v: 1, id: "c", op: "set-active", account: "default" },
       { v: 1, id: "d", op: "mark-exhausted", until: 123 },
       { v: 1, id: "d2", op: "mark-exhausted" },
+      { v: 1, id: "d3", op: "mark-throttled", until: 456 },
       { v: 1, id: "e", op: "refresh-account", account: "default" },
       {
         v: 1,
@@ -51,6 +52,11 @@ describe("protocol encode/decode", () => {
 
   it("rejects unknown verbs", () => {
     const bad = JSON.stringify({ v: 1, id: "x", op: "wat" });
+    expect(() => decodeRequest(bad)).toThrow();
+  });
+
+  it("rejects mark-throttled without an until (required, unlike mark-exhausted)", () => {
+    const bad = JSON.stringify({ v: 1, id: "x", op: "mark-throttled" });
     expect(() => decodeRequest(bad)).toThrow();
   });
 

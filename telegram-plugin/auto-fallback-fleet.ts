@@ -183,6 +183,12 @@ export interface FleetFallbackDeps {
   /** Operator timezone for absolute reset times in the announcement. */
   tz?: string;
   now?: Date;
+  /**
+   * The reset time PARSED from the triggering error prose (429 throttle tier
+   * enrichment) — threaded into the announcement as the recovery-line
+   * fallback when the old account's live probe carried no reset.
+   */
+  parsedResetAt?: Date;
 }
 
 /**
@@ -255,6 +261,7 @@ export async function runFleetAutoFallback(
         // card enumerates EVERY account (5h%/7d% + recovery ETA), letting the
         // user verify the fleet is truly exhausted, not just the trigger account.
         fleetSnapshots: snapshots,
+        parsedResetAt: deps.parsedResetAt ?? null,
         tz,
         now,
       }),
@@ -278,6 +285,7 @@ export async function runFleetAutoFallback(
       newLabel: rolledTo,
       newQuota,
       triggerAgent: deps.triggerAgent,
+      parsedResetAt: deps.parsedResetAt ?? null,
       tz,
       now,
     }),

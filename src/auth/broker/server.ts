@@ -16,7 +16,8 @@
  *   - NDJSON over UDS, 64 KiB frame cap, identity derived from bind path.
  *
  * Verbs (RFC H §4.3): get-credentials, list-state, set-active,
- * mark-exhausted, refresh-account, add-account, rm-account, set-override.
+ * mark-exhausted, mark-throttled, refresh-account, add-account,
+ * rm-account, set-override.
  */
 
 import * as net from "node:net";
@@ -132,6 +133,19 @@ const REFRESH_TICK_INTERVAL_MS = 60 * 1000;
  * the legacy quota-store default and Anthropic's typical 429 reset window. */
 const MARK_EXHAUSTED_DEFAULT_MS = 5 * 60 * 60 * 1000;
 
+/** Ceiling on a `mark-throttled.until` (429 throttle tier). Transient burst /
+ * RPM throttles clear in seconds-to-minutes; anything longer is the failover
+ * path's business (the gateway escalates long resets to mark-exhausted), so a
+ * bogus long throttle is clamped rather than lingering in the ledger. */
+const MARK_THROTTLED_MAX_MS = 30 * 60 * 1000;
+
+/** Escalation guard (429 throttle tier): this many transient-429 hits on the
+ * same account inside the window trigger a live quota probe; a probe that
+ * corroborates a genuine wall converts the throttle into the standard
+ * mark-exhausted + fleet roll. */
+const THROTTLE_ESCALATION_HITS = 3;
+const THROTTLE_ESCALATION_WINDOW_MS = 10 * 60 * 1000;
+
 /** Audit-log size cap before rotation (10 MB, per RFC §4.4). */
 const AUDIT_ROTATE_BYTES = 10 * 1024 * 1024;
 const AUDIT_KEEP = 5;
@@ -149,13 +163,25 @@ interface ThresholdViolations {
 }
 
 interface QuotaEntry {
-  exhausted_until: number;
+  /** Unix ms until which the account is exhausted (a real quota wall).
+   *  Optional since the 429 throttle tier: a throttle-only entry carries
+   *  `throttled_until` with no exhaustion mark. */
+  exhausted_until?: number;
   /** Unix ms when this mark was written. Lets eligibility compare the mark's
    *  recency against a live snapshot (most-recent-signal-wins). Optional for
    *  backward-compat with marks persisted before 2026-06-10 — a legacy mark
    *  with no `marked_at` is treated as older than any fresh probe, so live
    *  truth overrides it (the safe direction). */
   marked_at?: number;
+  /** 429 throttle tier — unix ms until which the account is transiently
+   *  rate-limited (`mark-throttled`). NEVER consulted by eligibility
+   *  (account-eligibility.ts keys on exhaustion marks + live snapshots
+   *  only); read by list-state consumers (cron quota-preflight soft-defer). */
+  throttled_until?: number;
+  /** Unix ms timestamps of recent `mark-throttled` hits — the escalation
+   *  counter. Pruned to THROTTLE_ESCALATION_WINDOW_MS on every hit; cleared
+   *  after an escalation probe runs (corroborated or not). */
+  throttle_hits?: number[];
 }
 interface QuotaState {
   [label: string]: QuotaEntry;
@@ -946,6 +972,9 @@ export class AuthBroker {
         case "mark-exhausted":
           await this.opMarkExhausted(socket, reqId, identity, req.until);
           break;
+        case "mark-throttled":
+          await this.opMarkThrottled(socket, reqId, identity, req.until);
+          break;
         case "refresh-account": {
           const provider: ProviderName = req.provider ?? "anthropic";
           // Phase 3b.1b: gate via registry.has() — when 3b.2 registers
@@ -1213,9 +1242,23 @@ export class AuthBroker {
     return (this.config.auth?.allow_overage_accounts ?? []).includes(account);
   }
 
+  /**
+   * View a quota-ledger entry as an eligibility `ExhaustionMark` — only when
+   * it actually carries an exhaustion mark. A throttle-only entry (429
+   * throttle tier: `throttled_until` with no `exhausted_until`) is NOT a
+   * mark: it must never gate serving or failover eligibility.
+   */
+  private exhaustionMarkOf(
+    account: string,
+  ): { exhausted_until: number; marked_at?: number } | undefined {
+    const q = this.quota[account];
+    if (!q || q.exhausted_until === undefined) return undefined;
+    return { exhausted_until: q.exhausted_until, marked_at: q.marked_at };
+  }
+
   private isAccountExhausted(account: string): boolean {
     return evalAccountBlocked({
-      mark: this.quota[account],
+      mark: this.exhaustionMarkOf(account),
       snapshot: this.lastQuotaCache[account],
       now: this.now(),
       allowOverage: this.isOverageAllowed(account),
@@ -1334,7 +1377,7 @@ export class AuthBroker {
     // last probe still blocks (a fresh refusal wins).
     return (
       accountEligibility({
-        mark: this.quota[account],
+        mark: this.exhaustionMarkOf(account),
         snapshot,
         now,
         allowOverage: true,
@@ -1354,7 +1397,7 @@ export class AuthBroker {
     const snapshot = this.lastQuotaCache[account];
     const allowOverage = this.isOverageAllowed(account);
     const verdict = accountEligibility({
-      mark: this.quota[account],
+      mark: this.exhaustionMarkOf(account),
       snapshot,
       now: this.now(),
       allowOverage,
@@ -1613,6 +1656,9 @@ export class AuthBroker {
         expiresAt: creds?.claudeAiOauth?.expiresAt,
         exhausted,
         exhausted_until: q?.exhausted_until,
+        // 429 throttle tier — raw ledger value for transparency (consumers
+        // compare against their own clock). Never feeds `exhausted`.
+        throttled_until: q?.throttled_until,
         threshold_violations: this.thresholdViolations[label] ?? 0,
         last_refreshed_at: meta?.lastRefreshedAt,
         // Cached utilization snapshot from the most recent probeQuota call.
@@ -1832,7 +1878,7 @@ export class AuthBroker {
     // misfired/expired exhaustion can't linger on disk and survive restarts
     // (the sticky-bogus-+7d-mark that outlasted recreate on 2026-06-10). A
     // genuine weekly wall (7d≥99.5%) is never "clearly healthy" → never cleared.
-    if (snapshotShouldClearMark(snapshot, this.quota[label], this.now())) {
+    if (snapshotShouldClearMark(snapshot, this.exhaustionMarkOf(label), this.now())) {
       delete this.quota[label];
       this.persistQuota();
       process.stdout.write(
@@ -2109,7 +2155,9 @@ export class AuthBroker {
       // Idempotent: skip the write/persist if already marked at/past this reset.
       const existing = this.quota[label]?.exhausted_until;
       if (existing !== undefined && existing >= exhaustedUntil) continue;
-      this.quota[label] = { exhausted_until: exhaustedUntil, marked_at: now };
+      // Spread preserves throttle-tier fields (throttled_until/throttle_hits)
+      // living beside the exhaustion mark in the same ledger entry.
+      this.quota[label] = { ...this.quota[label], exhausted_until: exhaustedUntil, marked_at: now };
       this.persistQuota();
       this.audit({ op: "mark-exhausted", identity: { kind: "operator" }, account: label, accountKind: "claude", ok: true });
       process.stdout.write(
@@ -2181,6 +2229,127 @@ export class AuthBroker {
   }
 
   /**
+   * 429 throttle tier — record a TRANSIENT per-account rate limit on the
+   * caller's bound account. Unlike `mark-exhausted` this:
+   *   - rolls NOTHING (no fanout, no promote — the fleet stays put), and
+   *   - blocks NOTHING (eligibility keys only on exhaustion marks + live
+   *     snapshots; `throttled_until` is invisible to it by construction —
+   *     see `exhaustionMarkOf`).
+   * Consumers of `list-state` (cron quota-preflight) read `throttled_until`
+   * to soft-defer scheduled fires until the throttle clears.
+   *
+   * Escalation guard: THROTTLE_ESCALATION_HITS transient 429s on the same
+   * account inside THROTTLE_ESCALATION_WINDOW_MS smell like a genuine wall
+   * hiding behind transient wording. Run ONE live quota probe; only a probe
+   * that CORROBORATES exhaustion (same overage-aware test every other trigger
+   * uses) converts the throttle into the standard mark-exhausted + fleet roll.
+   * The hit counter is cleared after any escalation probe — corroborated or
+   * not — so a persistent burst re-arms over a fresh window instead of
+   * probing on every subsequent hit.
+   */
+  private async opMarkThrottled(
+    socket: net.Socket,
+    id: string,
+    identity: Identity,
+    until: number,
+  ): Promise<void> {
+    const account = this.callerAccount(identity);
+    if (!account) {
+      this.audit({ op: "mark-throttled", identity, accountKind: "claude", ok: false, error: "no-active-account" });
+      socket.write(encodeError(id, "ACCOUNT_NOT_FOUND", "no active account configured"));
+      return;
+    }
+    const now = this.now();
+    // Clamp: a throttle is minutes, never days. Past/short values still get
+    // a floor of now+1s so the entry is observably "throttled right now".
+    const throttledUntil = Math.min(
+      Math.max(until, now + 1000),
+      now + MARK_THROTTLED_MAX_MS,
+    );
+    const entry = this.quota[account] ?? {};
+    const hits = (entry.throttle_hits ?? []).filter(
+      (t) => now - t < THROTTLE_ESCALATION_WINDOW_MS,
+    );
+    hits.push(now);
+    const escalate = hits.length >= THROTTLE_ESCALATION_HITS;
+    this.quota[account] = {
+      ...entry,
+      throttled_until: throttledUntil,
+      // Clear the counter when the escalation probe runs (below); otherwise
+      // carry the pruned window forward.
+      throttle_hits: escalate ? [] : hits,
+    };
+    this.persistQuota();
+    this.audit({ op: "mark-throttled", identity, account, accountKind: "claude", ok: true });
+    process.stdout.write(
+      `auth-broker: mark-throttled ${account} until ${new Date(throttledUntil).toISOString()} ` +
+        `(hit ${hits.length}/${THROTTLE_ESCALATION_HITS} in window)\n`,
+    );
+
+    let escalated = false;
+    let rolledTo: string | null = null;
+    if (escalate) {
+      const probe = await this.probeThrottleEscalation(account);
+      if (probe.exhausted) {
+        escalated = true;
+        process.stdout.write(
+          `auth-broker: throttle-escalation probe corroborates wall on ${account} — mark-exhausted + roll\n`,
+        );
+        this.audit({ op: "mark-exhausted", identity, account, accountKind: "claude", ok: true, reason: "throttle-escalation" });
+        // Capture the fleet active BEFORE the roll — a corroborated roll
+        // auto-promotes the target, so reading it afterwards would compare
+        // against the NEW active and never record the announcement.
+        const wasFleetActive = account === this.config.auth?.active;
+        const roll = await this.markExhaustedAndRoll(account, probe.until ?? undefined, identity);
+        rolledTo = roll.rolledTo;
+        // Broker-initiated roll with no announcing gateway (the throttle path
+        // posts only the lightweight notice) → record it on the same
+        // `last_fleet_roll` channel the proactive probe uses, so the
+        // quota-watch announcement (dedup'd fleet-wide) reaches the operator.
+        if (rolledTo && wasFleetActive) {
+          this.recordFleetRoll(account, rolledTo, "hard-exhaustion", probe.until ?? undefined);
+        }
+      } else {
+        process.stdout.write(
+          `auth-broker: throttle-escalation probe on ${account} did NOT corroborate a wall — staying throttled\n`,
+        );
+      }
+    }
+    socket.write(
+      encodeSuccess(id, {
+        account,
+        throttled_until: throttledUntil,
+        escalated,
+        rolledTo: escalated ? rolledTo : null,
+      }),
+    );
+  }
+
+  /**
+   * Live-probe `account` for the throttle escalation guard. Returns the
+   * overage-aware exhaustion decision; a failed probe (no creds, network
+   * error) is `exhausted:false` — never escalate on missing evidence.
+   * Caches a successful probe so the dashboard / eligibility see the fresh
+   * snapshot (and so markExhaustedAndRoll's corroboration gate can act on it).
+   */
+  private async probeThrottleEscalation(
+    account: string,
+  ): Promise<{ exhausted: boolean; until: number | null }> {
+    const creds = readAccountCredentials(account, this.home);
+    const token = creds?.claudeAiOauth?.accessToken;
+    if (!token) return { exhausted: false, until: null };
+    let result: QuotaResult;
+    try {
+      result = await this.fetchQuotaImpl({ accessToken: token });
+    } catch (err) {
+      this.logErr(`throttle-escalation probe ${account}: ${(err as Error).message}`);
+      return { exhausted: false, until: null };
+    }
+    this.cacheQuotaSnapshot(account, result);
+    return quotaIndicatesExhaustion(result, this.isOverageAllowed(account));
+  }
+
+  /**
    * Mark `account` exhausted, roll the fleet off it, and — when the walled
    * account was the fleet active — promote the roll target to nominal
    * `auth.active` (persisted). Shared core of the `mark-exhausted` op (the
@@ -2205,7 +2374,9 @@ export class AuthBroker {
       shortMs: MARK_EXHAUSTED_DEFAULT_MS,
       snapshot: this.lastQuotaCache[account],
     });
-    this.quota[account] = { exhausted_until: exhaustedUntil, marked_at: now };
+    // Spread preserves throttle-tier fields (throttled_until/throttle_hits)
+    // living beside the exhaustion mark in the same ledger entry.
+    this.quota[account] = { ...this.quota[account], exhausted_until: exhaustedUntil, marked_at: now };
     this.persistQuota();
     // Fan out next-fallback creds to every agent whose active account is
     // `account`. Uses the LIVE selector (Bug 1): force-probe an `unknown`
@@ -3620,11 +3791,13 @@ export class AuthBroker {
     replace?: boolean;
     /**
      * Trigger attribution for probe-driven failover rolls (#3031 PR 2):
-     *   "soft-avoid"       — serving-preference roll off the soft-avoid tier
-     *   "hard-exhaustion"  — the probe saw a genuine quota wall
+     *   "soft-avoid"          — serving-preference roll off the soft-avoid tier
+     *   "hard-exhaustion"     — the probe saw a genuine quota wall
+     *   "throttle-escalation" — repeated transient 429s corroborated by a live
+     *                           probe (429 throttle tier escalation guard)
      * Omitted for every other op.
      */
-    reason?: "soft-avoid" | "hard-exhaustion";
+    reason?: "soft-avoid" | "hard-exhaustion" | "throttle-escalation";
   }): void {
     const peer =
       entry.identity.kind === "operator"

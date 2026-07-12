@@ -118,6 +118,31 @@ describe('runFleetAutoFallback', () => {
     }
   });
 
+  it('parsedResetAt (429 throttle tier) names the recovery when the old probe carried no reset', async () => {
+    const failover = vi.fn(async () => ({ rolledTo: 'you@x', rolled: ['ken@x'] }));
+    const out = await runFleetAutoFallback({
+      state: state('ken@x', ['ken@x', 'you@x']),
+      quotas: [
+        // ken: walled, but the probe carried NO reset time — pre-fix the
+        // announcement's recovery line was silently dropped.
+        qOk({ fiveHourUtilizationPct: 100, representativeClaim: 'five_hour' }),
+        qOk({ fiveHourUtilizationPct: 8, sevenDayUtilizationPct: 20 }),
+      ],
+      failover,
+      triggerAgent: 'carrie',
+      now: NOW,
+      tz: 'UTC',
+      // Parsed from the error prose ("resets 5:50am") by the gateway.
+      parsedResetAt: new Date('2026-05-15T05:50:00Z'),
+    });
+
+    expect(out.kind).toBe('switched');
+    if (out.kind === 'switched') {
+      expect(out.announcement).toContain('recovers');
+      expect(out.announcement).toContain('in 4h 57m');
+    }
+  });
+
   it('idempotency: skips the swap WITHOUT calling failover when active probes healthy', async () => {
     const failover = vi.fn();
     const out = await runFleetAutoFallback({

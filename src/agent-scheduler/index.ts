@@ -220,6 +220,23 @@ function defaultQuotaDeferBackoffMs(attempt: number): number {
   return [60_000, 180_000, 300_000][attempt] ?? 300_000;
 }
 
+/**
+ * Delay before a deferred fire's retry. A throttle soft-defer (429 throttle
+ * tier) carries `retryAtMs` — the throttled account's clear time — so the
+ * retry is aimed just past it (2s slack, bounded to 5s..10m) instead of the
+ * blind backoff ladder; every other defer keeps the default 1/3/5m backoff.
+ * Exported for tests.
+ */
+export function resolveQuotaDeferDelayMs(
+  decision: QuotaPreflightDecision,
+  fallbackMs: number,
+  nowMs: number,
+): number {
+  if (decision.retryAtMs === undefined) return fallbackMs;
+  const target = decision.retryAtMs - nowMs + 2_000;
+  return Math.min(Math.max(target, 5_000), 10 * 60_000);
+}
+
 export function registerAgentSchedule(opts: RegisterOptions): RegisteredTask[] {
   const tasks: RegisteredTask[] = [];
   const now = opts.now ?? Date.now;
@@ -286,7 +303,7 @@ export function registerAgentSchedule(opts: RegisterOptions): RegisteredTask[] {
             handle = scheduleRetry(() => {
               pendingRetries.delete(handle);
               void attemptFire(attempt + 1);
-            }, backoff(attempt));
+            }, resolveQuotaDeferDelayMs(decision, backoff(attempt), now()));
             pendingRetries.add(handle);
           }
           return;
@@ -894,10 +911,12 @@ export async function main(): Promise<void> {
   const quotaPreflightEnabled =
     process.env.SWITCHROOM_DISABLE_CRON_QUOTA_PREFLIGHT !== "1";
   const quotaGate = quotaPreflightEnabled
-    ? async (): Promise<QuotaPreflightDecision> => {
+    ? async (agent: string): Promise<QuotaPreflightDecision> => {
         const client = new AuthBrokerClient();
         try {
-          return decideQuotaPreflight(await client.listState());
+          // `agent` scopes the 429-throttle soft-defer to the agent's own
+          // EFFECTIVE account (its override, else the fleet active).
+          return decideQuotaPreflight(await client.listState(), { agent });
         } finally {
           await client.close().catch(() => {});
         }

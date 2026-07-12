@@ -17,15 +17,17 @@
  *   - `list-state`      — fleet snapshot (accounts, agents, consumers).
  *   - `set-active`      — fleet-wide active-account swap (admin).
  *   - `mark-exhausted`  — quota event on caller's bound account.
+ *   - `mark-throttled`  — transient-429 throttle on caller's bound account
+ *                         (429 throttle tier; no roll, no ineligibility).
  *   - `refresh-account` — force a refresh tick (admin).
  *   - `add-account`     — register a new account (admin).
  *   - `rm-account`      — remove an account (admin).
  *   - `set-override`    — per-agent override (admin).
  *
- * `mark-exhausted` takes ONLY an `until` argument; the account it
- * affects is derived from path-identity. This closes the
- * fleet-wide spurious-deauth abuse path the round-1 review
- * flagged.
+ * `mark-exhausted` (and `mark-throttled`) take ONLY an `until`
+ * argument; the account they affect is derived from path-identity.
+ * This closes the fleet-wide spurious-deauth abuse path the round-1
+ * review flagged.
  *
  * **Provider field (RFC G Phase 3b.1):** Per-account verbs accept an
  * optional `provider:` field. When absent or `"anthropic"`, behavior
@@ -118,6 +120,27 @@ export const MarkExhaustedRequestSchema = z.object({
   id: z.string().min(1),
   /** Unix ms when the exhaustion clears. Defaults to now + 5h if omitted. */
   until: z.number().int().positive().optional(),
+});
+
+/**
+ * 429 throttle tier — a TRANSIENT per-account rate limit whose reset is near
+ * (retry-in-place, default ≤5 min). Records `throttled_until` in the quota
+ * ledger WITHOUT rolling the fleet and WITHOUT making the account ineligible
+ * for live sessions — eligibility (account-eligibility.ts) keys only on
+ * exhaustion marks and live snapshots. Consumers of `list-state` (cron
+ * quota-preflight) read `throttled_until` to soft-defer scheduled fires until
+ * the throttle clears.
+ *
+ * Same posture as `mark-exhausted`: non-admin, the affected account is
+ * derived from path-identity, never from the wire.
+ */
+export const MarkThrottledRequestSchema = z.object({
+  v: z.literal(PROTOCOL_VERSION),
+  op: z.literal("mark-throttled"),
+  id: z.string().min(1),
+  /** Unix ms when the throttle clears. Server-side clamped to a short
+   *  ceiling (throttles are minutes, never days). */
+  until: z.number().int().positive(),
 });
 
 export const RefreshAccountRequestSchema = z.object({
@@ -385,6 +408,7 @@ export const RequestSchema = z.discriminatedUnion("op", [
   ListStateRequestSchema,
   SetActiveRequestSchema,
   MarkExhaustedRequestSchema,
+  MarkThrottledRequestSchema,
   RefreshAccountRequestSchema,
   AddAccountRequestSchema,
   RmAccountRequestSchema,
@@ -410,6 +434,10 @@ export const AccountStateSchema = z.object({
   expiresAt: z.number().optional(),
   exhausted: z.boolean(),
   exhausted_until: z.number().optional(),
+  /** 429 throttle tier — unix ms until which the account is transiently
+   *  rate-limited (`mark-throttled`). Informational: never gates serving
+   *  or failover eligibility; cron quota-preflight soft-defers on it. */
+  throttled_until: z.number().optional(),
   threshold_violations: z.number().int().nonnegative().optional(),
   last_refreshed_at: z.number().optional(),
 });
@@ -455,6 +483,22 @@ export const MarkExhaustedDataSchema = z.object({
   // The account the fleet rolled TO (next non-exhausted in fallback_order),
   // or null when every fallback is also exhausted. Lets a non-admin caller
   // (auto-fallback) announce an accurate target without an admin set-active.
+  rolledTo: z.string().nullable().optional(),
+});
+
+export const MarkThrottledDataSchema = z.object({
+  account: z.string(),
+  /** The recorded (clamped) throttle expiry, unix ms. */
+  throttled_until: z.number(),
+  /**
+   * Escalation guard: true when this hit was the Nth transient 429 on the
+   * account inside the escalation window, the broker ran a live quota probe,
+   * and the probe CORROBORATED a genuine wall — so the broker marked the
+   * account exhausted and rolled the fleet (standard markExhaustedAndRoll).
+   */
+  escalated: z.boolean(),
+  /** Set only when `escalated` — the account the fleet rolled to (null when
+   *  every fallback was also exhausted). */
   rolledTo: z.string().nullable().optional(),
 });
 

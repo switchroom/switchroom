@@ -208,6 +208,32 @@ When `exhausted_until` passes, the broker clears the mark. Agents
 that *prefer* the cleared account (it's first in their effective
 preference order) drift back on next idle.
 
+### 429 throttle tier — short throttles stay put
+
+Not every 429 is a wall. Anthropic also emits transient per-account
+burst throttles whose wording explicitly negates the quota reading
+("not your usage limit") and usually names a reset minutes away.
+Failing the whole fleet over for a 3-minute throttle is churn, so
+those take a lighter tier:
+
+- Reset within the retry-in-place threshold (default **5 minutes**,
+  override with `SWITCHROOM_THROTTLE_RETRY_IN_PLACE_MAX_MS`): the
+  gateway calls the broker's `mark-throttled` verb — the ledger entry
+  gains `throttled_until`, nothing rolls, the account stays fully
+  eligible. One lightweight notice (per account, cooldown-deduped)
+  tells you it's a throttle, not a wall, and when it resets; the dead
+  turn is retried automatically after the reset. No parseable reset →
+  a conservative 60-second wait.
+- Reset beyond the threshold, or genuine wall wording: the normal
+  mark-exhausted + fleet failover path, unchanged.
+- Escalation guard: 3 transient 429s on the same account inside 10
+  minutes trigger one live quota probe; only a probe that corroborates
+  a real wall converts the throttle into mark-exhausted + roll.
+
+Cron fires are throttle-aware: the scheduler's quota preflight
+soft-defers a fire while the agent's effective account is throttled
+and retries just past `throttled_until`.
+
 ### Soft-avoid tier — proactive preference before the wall
 
 `auth.proactive_failover_pct` (optional, e.g. `95`) adds a third
@@ -258,6 +284,7 @@ Recovery procedure: see
 | `get-credentials`     | any agent / consumer (own account only) |
 | `list-state`          | any agent / consumer                    |
 | `mark-exhausted`      | any agent / consumer (own account only) |
+| `mark-throttled`      | any agent / consumer (own account only) |
 | `set-active`          | admin                                   |
 | `refresh-account`     | admin                                   |
 | `add-account`         | admin                                   |

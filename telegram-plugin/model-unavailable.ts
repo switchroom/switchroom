@@ -31,7 +31,20 @@ import { escapeMarkdown } from './card-format.js'
 
 // ─── Public types ────────────────────────────────────────────────────────────
 
-export type ModelUnavailableKind = 'overload' | 'quota_exhausted' | 'network'
+export type ModelUnavailableKind =
+  | 'overload'
+  | 'quota_exhausted'
+  | 'network'
+  /**
+   * 429 throttle tier — a TRANSIENT per-account 429 (explicit
+   * `transientUpstreamSignals` negation wording) whose parsed reset lies
+   * BEYOND the retry-in-place threshold, so the gateway escalates it to the
+   * standard mark-exhausted + fleet-failover machinery. Never produced by
+   * `detectModelUnavailable` (a transient-negation string classifies as
+   * `overload` there); constructed only by the gateway's throttle-tier
+   * branch so the card names the true cause instead of "quota exhausted".
+   */
+  | 'rate_limited'
 
 export interface ModelUnavailableDetection {
   kind: ModelUnavailableKind
@@ -212,7 +225,7 @@ export function detectModelUnavailable(
  * arg lets tests pin the relative-clock anchor; production callers omit
  * it to use Date.now().
  */
-function parseResetTime(text: string, parseTimeNow: Date = new Date()): Date | undefined {
+export function parseResetTime(text: string, parseTimeNow: Date = new Date()): Date | undefined {
   const lower = text.toLowerCase()
 
   // "retry after 60 seconds" / "retry-after: 60"
@@ -459,6 +472,11 @@ function formatReason(d: ModelUnavailableDetection, now: Date): string {
       return `quota exhausted${reset}`
     case 'overload':
       return `model overloaded${reset}`
+    case 'rate_limited':
+      // Throttle-tier escalation (429 with transient wording but a reset too
+      // far out to wait in place). Honest cause: the account is rate-limited,
+      // not quota-exhausted — the reset names when it frees.
+      return `account rate-limited${reset}`
     case 'network':
       return 'network unreachable'
   }
