@@ -41,6 +41,44 @@ export interface ModelUnavailableDetection {
   raw: string
 }
 
+// ─── Transient-burst signals (canonical, single source of truth) ─────────────
+
+/**
+ * Explicit markers of a TRANSIENT per-account burst / server-side throttle —
+ * a short-term RPM/burst 429 that Claude Code retries internally with backoff,
+ * NOT the 5h/7d subscription usage-limit wall. Anthropic emits these with a
+ * `rate_limit_error` whose wording explicitly NEGATES the account-quota reading
+ * ("not your usage limit" / "would exceed your account's rate limit … try again
+ * later"). Keyed on the explicit negation so a genuine wall that merely contains
+ * the word "limit" is never down-classified.
+ *
+ * Exported so `session-tail.ts` classifies a 429 by wording against THIS list
+ * rather than hand-rolling its own copy (keeps the two in sync — issue #2922).
+ */
+export const transientUpstreamSignals = [
+  'not your usage limit',
+  'not your account',
+  "not your account's",
+  'temporarily limiting requests',
+  'temporarily rate',
+  'server is temporarily',
+  'would exceed your account’s rate limit',
+  "would exceed your account's rate limit",
+]
+
+/**
+ * True when `text` carries an EXPLICIT transient-burst marker (see
+ * `transientUpstreamSignals`). Never throws on weird input. Used to keep the
+ * calm rate-limit path and the model-unavailable detector reading the same
+ * canonical signal list.
+ */
+export function isTransientUpstreamSignal(text: string): boolean {
+  if (typeof text !== 'string' || text.length === 0) return false
+  const sample = text.length > 16_384 ? text.slice(0, 16_384) : text
+  const lower = sample.toLowerCase()
+  return transientUpstreamSignals.some(s => lower.includes(s))
+}
+
 // ─── Detection ───────────────────────────────────────────────────────────────
 
 /**
@@ -77,17 +115,9 @@ export function detectModelUnavailable(
   // failover that self-cancels and leaves the turn dead. These are upstream
   // throttles Claude Code retries internally with backoff — classify them as
   // `overload` (the calm rate-limit path) BEFORE the quota substrings run, so
-  // the negation is honoured and no failover is announced.
-  const transientUpstreamSignals = [
-    'not your usage limit',
-    'not your account',
-    "not your account's",
-    'temporarily limiting requests',
-    'temporarily rate',
-    'server is temporarily',
-    'would exceed your account’s rate limit',
-    "would exceed your account's rate limit",
-  ]
+  // the negation is honoured and no failover is announced. The signal list is
+  // module-level (`transientUpstreamSignals`) so session-tail.ts classifies a
+  // 429 against the SAME canonical wording.
   if (transientUpstreamSignals.some(s => lower.includes(s))) {
     const resetAt = parseResetTime(sample)
     return resetAt !== undefined

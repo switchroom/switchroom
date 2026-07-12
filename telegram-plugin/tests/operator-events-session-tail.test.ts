@@ -9,6 +9,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { detectErrorInTranscriptLine, startSessionTail } from '../session-tail.js'
 import { resetAllCooldowns } from '../operator-events.js'
+import { resolveModelUnavailableFromOperatorEvent } from '../model-unavailable.js'
 
 // ─── detectErrorInTranscriptLine unit tests ───────────────────────────────────
 
@@ -153,6 +154,79 @@ describe('detectErrorInTranscriptLine — error detection', () => {
     // The user-facing text must survive into `detail` (the model-
     // unavailable card + the text-pattern path both rely on it).
     expect(result!.detail).toContain('hit your limit')
+  })
+
+  // Regression — the carrie incident (2026-07-12). Anthropic also emits a
+  // 429 for a TRANSIENT per-account burst / RPM throttle whose wording
+  // explicitly negates the account-quota reading ("would exceed your
+  // account's rate limit … not your usage limit"). That is a self-healing
+  // few-second throttle Claude Code retries internally — it must NOT be
+  // labeled quota-exhausted (which always shows the scary "model
+  // unavailable" card + drives failover). It must take the calm
+  // rate-limited path.
+  it('classifies a TRANSIENT burst 429 (explicit negation) as rate-limited, NOT quota-exhausted', () => {
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        model: '<synthetic>',
+        content: [
+          {
+            type: 'text',
+            text:
+              'API Error: 429 rate_limit_error This request would exceed ' +
+              "your account's rate limit. Please try again later. This is a " +
+              'short-term burst limit, not your usage limit.',
+          },
+        ],
+      },
+      error: 'rate_limit',
+      isApiErrorMessage: true,
+      apiErrorStatus: 429,
+    })
+    const result = detectErrorInTranscriptLine(line)
+    expect(result).not.toBeNull()
+    // Wording-based classification: explicit transient negation → calm path.
+    expect(result!.kind).toBe('rate-limited')
+    expect(result!.transient).toBe(true)
+    // End-to-end: the resolver must NOT produce a model-unavailable card for
+    // this kind (the calm rate-limited branch returns null on a bare burst).
+    const detection = resolveModelUnavailableFromOperatorEvent({
+      kind: result!.kind,
+      detail: result!.detail,
+    })
+    expect(detection).toBeNull()
+  })
+
+  // Guard against over-correcting: a GENUINE quota wall (no transient marker)
+  // must STILL be quota-exhausted AND still resolve to a card.
+  it('a genuine quota-wall 429 still produces the quota-exhausted card', () => {
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        model: '<synthetic>',
+        content: [
+          {
+            type: 'text',
+            text: "You've hit your limit · resets 8:50am (Australia/Melbourne)",
+          },
+        ],
+      },
+      error: 'rate_limit',
+      isApiErrorMessage: true,
+      apiErrorStatus: 429,
+    })
+    const result = detectErrorInTranscriptLine(line)
+    expect(result).not.toBeNull()
+    expect(result!.kind).toBe('quota-exhausted')
+    // The quota-exhausted branch ALWAYS returns a detection (the card).
+    const detection = resolveModelUnavailableFromOperatorEvent({
+      kind: result!.kind,
+      detail: result!.detail,
+    })
+    expect(detection).not.toBeNull()
+    expect(detection!.kind).toBe('quota_exhausted')
   })
 
   it('still returns null for a normal (non-error) assistant message', () => {

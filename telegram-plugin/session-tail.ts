@@ -41,6 +41,7 @@ function isMultiAgentEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.PROGRESS_CARD_MULTI_AGENT !== '0'
 }
 import { classifyClaudeError, type OperatorEventKind } from './operator-events.js'
+import { isTransientUpstreamSignal } from './model-unavailable.js'
 import { createToolLabelSidecar, type ToolLabelSidecar, type SidecarOptions } from './tool-label-sidecar.js'
 import { isModelSentinel } from './model-label.js'
 
@@ -668,13 +669,26 @@ export function detectErrorInTranscriptLine(
       typeof obj.apiErrorStatus === 'number' ? obj.apiErrorStatus : null
     const errStr = typeof obj.error === 'string' ? obj.error : ''
     const text = extractAssistantText(obj)
-    // A 429 in this shape is a subscription usage-limit hit (it carries
-    // a reset time) — classify it quota-exhausted so the operator event
-    // resolves to an auto-fallback-eligible kind. Other statuses fall
+    // A 429 in this shape is USUALLY a subscription usage-limit wall (it
+    // carries a reset time) — classify it quota-exhausted so the operator
+    // event resolves to an auto-fallback-eligible kind that always shows the
+    // "model unavailable" card. BUT Anthropic also emits a 429 for a TRANSIENT
+    // per-account burst / RPM throttle whose wording explicitly negates the
+    // account-quota reading ("This request would exceed your account's rate
+    // limit … not your usage limit"). That is a self-healing few-second throttle
+    // Claude Code retries internally — blanket-labeling it quota-exhausted fired
+    // a false scary card on the fleet (carrie incident, 2026-07-12). So a 429 is
+    // only quota-exhausted when it LACKS an explicit transient-burst marker;
+    // with one, classify it rate-limited so it takes the calm path (no card, no
+    // failover). Keyed on the explicit transient NEGATION (canonical list in
+    // model-unavailable.ts) — an ambiguous 429 that merely says "limit" stays
+    // quota-exhausted, biasing toward surfacing a real wall. Other statuses fall
     // through to the shared classifier.
     const kind: OperatorEventKind =
       status === 429
-        ? 'quota-exhausted'
+        ? isTransientUpstreamSignal(`${text}\n${errStr}`)
+          ? 'rate-limited'
+          : 'quota-exhausted'
         : classifyClaudeError({ type: errStr, status, message: text })
     // An `isApiErrorMessage` line is Claude surfacing the failure to the
     // user — terminal by construction (Claude writes this shape only
