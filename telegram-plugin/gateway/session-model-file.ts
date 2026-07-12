@@ -1,28 +1,26 @@
 /**
- * Durable session-model stickiness — file helpers shared by the gateway.
+ * Session-scoped `/model` carrier — file helpers shared by the gateway.
  *
- * Two files in the bind-mounted agent state dir carry the contract
- * (reference/rfcs/session-model-stickiness.md):
+ * Contract: reference/rfcs/session-model-stickiness.md §0.1 (rev 4, operator
+ * decision 2026-07-12 — SESSION-SCOPED, superseding the rev-3 keep-by-default).
+ * Files in the bind-mounted agent state dir:
  *
- *   - `.session-model` — the DURABLE session override written on every
- *     positively-confirmed `/model` switch. One-line JSON
- *     `{"model","configuredDefaultAtWrite","ts"}`. It is NOT consumed by a
- *     keep-path boot; it survives every restart/deploy/crash and is cleared
- *     only by explicit user action (`/model default`) or invalidation
- *     (corruption / the configured yaml default changed) — every clearing
- *     path notifies the operator chat via `.session-model-alert` (#3039).
+ *   - `.session-model` — a CONSUME-ONCE carrier written ONLY immediately
+ *     before a relaunch that applies the switch (the sr-* / sr→Claude paths
+ *     and a queued /model persisted at graceful shutdown). One-line JSON
+ *     `{"model","configuredDefaultAtWrite","ts"}`. start.sh applies it on the
+ *     single boot that reads it and then deletes it; every SUBSEQUENT restart
+ *     (deploy, /restart, /new, watchdog recovery, crash, raw docker restart)
+ *     finds no carrier and boots the configured default. Live Claude switches
+ *     do NOT write a carrier — they apply in-session and the explicit
+ *     `claude --model <configured>` flag reverts them on the next boot.
+ *     Cleared live by `/model default`; invalidation (corruption / the
+ *     configured yaml default changed at the apply-boot) drops it and notifies
+ *     the operator chat via `.session-model-alert`.
  *
- *   - `.relaunch-model-intent` — the ONE-SHOT intent bit for the next boot.
- *     One-line JSON `{"intent":"keep"|"revert","reason","ts"}`, atomic
- *     write, last-writer-wins. Boot default is KEEP (#3039 — operator
- *     decision 2026-07-11, superseding the earlier revert-by-default): a
- *     raw `docker restart` / host reboot / deploy / crash keeps a valid
- *     override. Only an explicit fresh "revert" intent reverts. start.sh
- *     consumes the file (rm -f) every boot; a stale (>10 min by the
- *     embedded ts) or corrupt intent counts as no intent (→ keep).
- *
- *   - `.session-effort` — the DURABLE effort override (#3039), same shape
- *     and lifecycle as `.session-model` with `level` in place of `model`:
+ *   - `.session-effort` — the DURABLE effort override (#3039), still
+ *     keep-across-restarts (NOT changed by rev 4). Same shape as
+ *     `.session-model` with `level` in place of `model`:
  *     `{"level","configuredDefaultAtWrite","ts"}`. Written on every
  *     positively-confirmed `/effort` apply, resolved by start.sh into the
  *     relaunch's `--effort`, cleared only by `/effort default` or
@@ -38,32 +36,12 @@ import { join } from 'node:path'
 import { isValidModelArg } from './model-command.js'
 
 export const SESSION_MODEL_FILE = '.session-model'
-export const RELAUNCH_MODEL_INTENT_FILE = '.relaunch-model-intent'
 export const CONFIGURED_DEFAULT_MODEL_FILE = '.configured-default-model'
-/** Crashloop self-heal counter (start.sh stamps `<count> <epoch>` per fast boot). */
-export const SESSION_MODEL_BOOT_ATTEMPTS_FILE = '.session-model-boot-attempts'
-
-export type RelaunchModelIntent = 'keep' | 'revert'
 
 export interface SessionModelRecord {
   model: string
   configuredDefaultAtWrite: string
   ts: number
-}
-
-/**
- * Classify a triggerSelfRestart reason into the intent the boot should honor.
- *
- * Since #3039 (operator contract 2026-07-11) EVERY restart reason keeps the
- * override: a restart — user-tapped, watchdog, deploy, or crash — is not
- * "clear my model". The override is cleared only by explicit user action
- * (`/model default`) or invalidation at boot, both of which run their own
- * paths. The 'revert' intent value remains recognised by start.sh (and this
- * classifier's signature keeps it) so an older gateway's stamp still parses,
- * but current code never emits it.
- */
-export function intentForRestartReason(_reason: string): RelaunchModelIntent {
-  return 'keep'
 }
 
 function atomicWrite(path: string, content: string): void {
@@ -137,37 +115,10 @@ export function readSessionModelFile(agentDir: string): SessionModelRecord | nul
   return raw == null ? null : parseSessionModel(raw)
 }
 
-/** Delete the durable override (`/model default`, rollback). Best-effort. */
+/** Delete the session-model carrier (`/model default`, rollback). Best-effort. */
 export function clearSessionModelFile(agentDir: string): void {
   try {
     rmSync(join(agentDir, SESSION_MODEL_FILE), { force: true })
-    // #3042 item 4: also drop the kept-alert dedup sentinel so a future
-    // override of the same name re-alerts on its first kept boot.
-    rmSync(join(agentDir, '.session-model-kept-notified'), { force: true })
-    rmSync(join(agentDir, SESSION_MODEL_BOOT_ATTEMPTS_FILE), { force: true })
-  } catch {
-    /* best-effort */
-  }
-}
-
-/**
- * #3043 item 2: clear ONLY the crashloop boot-attempts counter — a positive
- * health signal from the gateway, not a carrier change.
- *
- * start.sh's self-heal (start.sh.hbs "Override crashloop self-heal") increments
- * the counter on every boot that re-enters within 150s with the override still
- * active, and clears a healthy override after 3 fast boots. That window can't
- * tell a genuine crashloop from three quick OPERATOR hand-bounces of a healthy
- * agent — both look like fast successive boots — so three deliberate restarts
- * would spuriously wipe a working override. A boot that reaches bridge
- * registration is proven healthy (the session came all the way up and the
- * bridge connected), so the gateway deletes the counter there. Only boots that
- * genuinely FAIL before the bridge registers now accumulate toward the 3-strike
- * clear. Best-effort; absent file is fine.
- */
-export function clearSessionModelBootAttempts(agentDir: string): void {
-  try {
-    rmSync(join(agentDir, SESSION_MODEL_BOOT_ATTEMPTS_FILE), { force: true })
   } catch {
     /* best-effort */
   }
@@ -181,94 +132,6 @@ export function restoreSessionModelFileRaw(agentDir: string, raw: string | null)
   }
   try {
     atomicWrite(join(agentDir, SESSION_MODEL_FILE), raw)
-  } catch {
-    /* best-effort */
-  }
-}
-
-/**
- * Stamp the one-shot relaunch intent. MUST be called synchronously BEFORE
- * the restart signal/dispatch it describes (write-before-kill invariant —
- * the next start.sh boot reads this to decide keep vs revert). Best-effort:
- * a failed write means the boot falls back to the default (keep, #3039) —
- * the user's choice is preserved either way.
- */
-export function writeRelaunchModelIntent(
-  agentDir: string,
-  intent: RelaunchModelIntent,
-  reason: string,
-): void {
-  try {
-    atomicWrite(
-      join(agentDir, RELAUNCH_MODEL_INTENT_FILE),
-      `${JSON.stringify({ intent, reason, ts: Date.now() })}\n`,
-    )
-  } catch (err) {
-    process.stderr.write(
-      `telegram gateway: relaunch-model-intent write failed (boot will revert): ${(err as Error)?.message ?? String(err)}\n`,
-    )
-  }
-}
-
-/**
- * Reason prefix the gateway's SIGTERM/SIGINT shutdown handler stamps on its
- * deploy-survival keep-intent (#3017/#3018). Distinguishable on purpose:
- * a gateway-only bounce (supervisor relaunch, bare gateway-unit restart)
- * leaves that stamp UNCONSUMED on disk — start.sh only runs on a container
- * boot — and the next gateway boot uses this prefix to recognise and clear
- * the stale stamp (see clearStaleGatewayShutdownIntent).
- */
-export const GATEWAY_SHUTDOWN_INTENT_REASON_PREFIX = 'gateway-shutdown:'
-
-export interface RelaunchModelIntentRecord {
-  intent: RelaunchModelIntent
-  reason: string
-  ts: number
-}
-
-/** Parsed `.relaunch-model-intent`, or null when absent / corrupt / malformed. */
-export function readRelaunchModelIntent(agentDir: string): RelaunchModelIntentRecord | null {
-  try {
-    const raw = readFileSync(join(agentDir, RELAUNCH_MODEL_INTENT_FILE), 'utf8')
-    const parsed = JSON.parse(raw) as Partial<RelaunchModelIntentRecord>
-    if (
-      (parsed.intent !== 'keep' && parsed.intent !== 'revert') ||
-      typeof parsed.reason !== 'string' ||
-      typeof parsed.ts !== 'number'
-    ) {
-      return null
-    }
-    return { intent: parsed.intent, reason: parsed.reason, ts: parsed.ts }
-  } catch {
-    return null
-  }
-}
-
-/**
- * Boot-time cleanup for the gateway-only-bounce hole (#3018 finding 4).
- *
- * A container-level stop/deploy consumes `.relaunch-model-intent` in start.sh
- * BEFORE any gateway boots. So if a freshly-booting GATEWAY still sees an
- * intent that a gateway shutdown handler stamped (reason carries
- * GATEWAY_SHUTDOWN_INTENT_REASON_PREFIX), the preceding bounce was
- * gateway-only — the container never restarted and the stamp is stale.
- * Left in place, it could convert a genuine crash within the 10-min
- * freshness window into a "keep", breaking the crash-reverts policy.
- * Clear it. Never touches a triggerSelfRestart / user-slash stamp (those
- * use their own un-prefixed reasons and precede a container bounce).
- * Returns true when a stale stamp was cleared.
- */
-export function clearStaleGatewayShutdownIntent(agentDir: string): boolean {
-  const rec = readRelaunchModelIntent(agentDir)
-  if (rec == null || !rec.reason.startsWith(GATEWAY_SHUTDOWN_INTENT_REASON_PREFIX)) return false
-  clearRelaunchModelIntent(agentDir)
-  return true
-}
-
-/** Remove a stamped intent (rollback of a failed dispatch). Best-effort. */
-export function clearRelaunchModelIntent(agentDir: string): void {
-  try {
-    rmSync(join(agentDir, RELAUNCH_MODEL_INTENT_FILE), { force: true })
   } catch {
     /* best-effort */
   }

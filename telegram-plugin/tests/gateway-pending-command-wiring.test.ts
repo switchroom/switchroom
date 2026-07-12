@@ -89,10 +89,9 @@ describe('gateway: unconfirmed queued model tokens are gated before durable pers
   })
 })
 
-describe('gateway: /restart keeps the session-model override (#3039)', () => {
-  it('the /restart chat command stamps keep, never revert', () => {
-    expect(GATEWAY_SRC).toContain("writeRelaunchModelIntent(smDir, 'keep', 'user: /restart from chat')")
-    expect(GATEWAY_SRC).not.toContain("writeRelaunchModelIntent(smDir, 'revert'")
+describe('gateway: /restart reverts the session-model override (rev 4, session-scoped)', () => {
+  it('no restart verb stamps a relaunch-model intent (the subsystem is retired)', () => {
+    expect(GATEWAY_SRC).not.toContain('writeRelaunchModelIntent')
   })
 })
 
@@ -107,18 +106,14 @@ describe('gateway: /effort persistence choke point (#3039)', () => {
   })
 })
 
-describe('gateway: keep-intent stamp narrowing (#3018 finding 4)', () => {
-  it('the shutdown keep-intent stamp carries the gateway-shutdown reason prefix', () => {
-    expect(GATEWAY_SRC).toContain(
-      "writeRelaunchModelIntent(smDir, 'keep', `${GATEWAY_SHUTDOWN_INTENT_REASON_PREFIX} graceful ${signal} shutdown",
-    )
-  })
-
-  it('boot clears a stale gateway-shutdown-stamped intent (gateway-only bounce never runs start.sh)', () => {
-    const idx = GATEWAY_SRC.indexOf('clearStaleGatewayShutdownIntent(bootSmDir)')
+describe('gateway: graceful shutdown no longer preserves a session model (rev 4)', () => {
+  it('the shutdown handler stamps no keep-intent — a deploy reverts to config', () => {
+    const idx = GATEWAY_SRC.indexOf('async function shutdown(signal: string)')
     expect(idx).toBeGreaterThan(0)
-    // The cleanup runs at module top-level (gateway boot), BEFORE the shutdown
-    // handler could stamp a fresh one for THIS process's own exit.
-    expect(idx).toBeLessThan(GATEWAY_SRC.indexOf('async function shutdown(signal: string)'))
+    const win = GATEWAY_SRC.slice(idx, idx + 6000)
+    expect(win).not.toContain('writeRelaunchModelIntent')
+    expect(win).not.toContain('GATEWAY_SHUTDOWN_INTENT_REASON_PREFIX')
+    // The queued-command persist at shutdown still writes a consume-once carrier.
+    expect(win).toContain('persistQueuedCommandForRestart')
   })
 })
