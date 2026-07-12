@@ -108,6 +108,82 @@ export function parseModelCommand(text: string): ParsedModelCommand | null {
   return { kind: 'set', model: arg }
 }
 
+/**
+ * The busy state a typed `/model` disposition is decided against. Two
+ * independent signals are folded here (#3177): `currentTurnActive` is the
+ * gateway's per-turn atom (`currentTurn !== null`), which is NULLED at
+ * `turn_end`; `turnInFlight` is the authoritative delivery-machine +
+ * pending-approval gate (`turnInFlightForGate()`). The atom can read idle
+ * while the session is still busy (the "recovered-late" / premature-turn-end
+ * window seen in finn's 2026-07-12 log), so a switch decided on the atom ALONE
+ * takes the direct-inject path and types `/model <name>` into a still-busy
+ * pane, where claude swallows it as literal text — a silent no-op. Folding
+ * BOTH signals means a session busy by EITHER measure ack+queues instead.
+ */
+export interface ModelCommandContext {
+  /** Gateway per-turn atom is non-null (`currentTurn !== null`). */
+  currentTurnActive: boolean
+  /** Authoritative busy gate (`turnInFlightForGate()`): machine-in-turn OR a pending approval. */
+  turnInFlight: boolean
+  /** Interactive picker menu is enabled (`SWITCHROOM_MODEL_MENU !== '0'`). */
+  menuEnabled: boolean
+}
+
+/**
+ * True when the session is busy by EITHER busy signal. A typed `/model` set
+ * MUST NOT take the direct-inject path while this holds — it would type into a
+ * busy pane and be swallowed as text. See ModelCommandContext.
+ */
+export function isModelCommandBusy(ctx: Pick<ModelCommandContext, 'currentTurnActive' | 'turnInFlight'>): boolean {
+  return ctx.currentTurnActive || ctx.turnInFlight
+}
+
+/**
+ * What the gateway should do with a parsed `/model` command. Pure so the
+ * routing decision is unit-testable without booting the bot. Every parsed
+ * shape maps to exactly one visible action — there is NO branch that silently
+ * does nothing (the #3177 swallow):
+ *
+ *  - `menu`  — bare `/model` with the picker enabled → render the dashboard.
+ *  - `queue` — a `set` while busy (by EITHER signal) → ack + enqueue for
+ *              apply-on-idle. `target` is the alias-expanded token.
+ *  - `apply` — run the handler now (idle `set`, or `show`/`help` text paths).
+ */
+export type ModelCommandDisposition =
+  | { kind: 'menu' }
+  | { kind: 'queue'; target: string }
+  | { kind: 'apply'; parsed: ParsedModelCommand }
+
+export function planModelCommand(
+  parsed: ParsedModelCommand,
+  ctx: ModelCommandContext,
+): ModelCommandDisposition {
+  if (parsed.kind === 'show' && ctx.menuEnabled) return { kind: 'menu' }
+  if (parsed.kind === 'set' && isModelCommandBusy(ctx)) {
+    return { kind: 'queue', target: expandSrAlias(parsed.model) }
+  }
+  return { kind: 'apply', parsed }
+}
+
+/**
+ * The unconditional durable log line the gateway writes at `/model` entry,
+ * BEFORE any branch or reply attempt (#3177 guarantee (b)). Even if every
+ * downstream reply is shed/dropped, this line — plus the paired history row —
+ * guarantees a typed `/model` is never invisible. Kept pure + shape-stable so
+ * the format is testable and greppable (`grep 'gw /model received'`).
+ */
+export function modelCommandReceiptLine(
+  agent: string,
+  parsed: ParsedModelCommand,
+  busy: boolean,
+): string {
+  const arg =
+    parsed.kind === 'set' ? parsed.model
+      : parsed.kind === 'show' ? '(show)'
+        : '(help)'
+  return `telegram gateway: gw /model received agent=${agent} kind=${parsed.kind} arg=${arg} busy=${busy}`
+}
+
 export interface ModelCommandDeps {
   /** Inject primitive — wired to injectSlashCommand in the gateway. */
   inject: (agent: string, command: string) => Promise<InjectResult>
