@@ -192,10 +192,14 @@ export interface FleetRollInfo {
   /**
    * Trigger attribution (#3031 PR 2): "soft-avoid" = proactive
    * serving-preference roll off an account APPROACHING its limits;
-   * "hard-exhaustion" = the probe saw a genuine quota wall. Absent on
-   * pre-PR-2 brokers — rendered as hard exhaustion.
+   * "hard-exhaustion" = the probe saw a genuine quota wall;
+   * "model-tier-wall" = the flagship-tier (7d_oi) canary saw the account
+   * walled on the premium tier (#3176). Absent on pre-PR-2 brokers —
+   * rendered as hard exhaustion.
    */
-  reason?: "soft-avoid" | "hard-exhaustion";
+  reason?: "soft-avoid" | "hard-exhaustion" | "model-tier-wall";
+  /** #3176 — the binding tier bucket, set only when reason is model-tier-wall. */
+  bucket?: string;
 }
 
 export type FleetRollAnnounceDecision =

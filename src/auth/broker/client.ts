@@ -186,6 +186,33 @@ export interface AccountState {
    * without triggering a live network call.
    */
   last_quota?: LastQuotaSnapshot | null;
+  /**
+   * #3176 — flagship-tier (`7d_oi` / `seven_day_overage_included`) wall. TRUE
+   * when the account is walled on the premium tier right now (an unexpired
+   * `premium_walled_until` mark not contradicted by a fresher tier-allowed
+   * canary). Tier-scoped: the account still serves opus/haiku. Absent on
+   * pre-#3176 brokers (treat as false).
+   */
+  premium_walled?: boolean;
+  /** #3176 — raw ledger mark: unix ms until which the flagship tier is walled. */
+  premium_walled_until?: number;
+  /** #3176 — the binding bucket claim (seven_day_overage_included). */
+  premium_wall_bucket?: string;
+  /** #3176 — latest flagship-tier canary snapshot, for the dashboard/card. */
+  last_tier_quota?: LastTierQuotaSnapshot | null;
+}
+
+/**
+ * #3176 — the flagship-tier (`7d_oi`) canary snapshot exposed via `list-state`.
+ * Separate from {@link LastQuotaSnapshot} (the haiku probe's 5h/7d windows).
+ */
+export interface LastTierQuotaSnapshot {
+  unifiedStatus: string | null;
+  sevenDayOiStatus: string | null;
+  sevenDayOiUtilizationPct: number | null;
+  /** ISO 8601 string, or null. */
+  sevenDayOiResetAt: string | null;
+  capturedAt: number;
 }
 
 export interface AgentState {
@@ -235,7 +262,21 @@ export interface ListStateData {
      * off an account approaching its limits (no mark, no promote). Absent on
      * pre-PR-2 brokers (render as hard exhaustion).
      */
-    reason?: "soft-avoid" | "hard-exhaustion";
+    reason?: "soft-avoid" | "hard-exhaustion" | "model-tier-wall";
+    /** #3176 — the binding tier bucket, set only when reason is model-tier-wall. */
+    bucket?: string;
+  } | null;
+  /**
+   * #3176 — fleet-wide flagship-tier all-walled alert. Set when EVERY account
+   * is walled on the `7d_oi` bucket with no premium-eligible failover target,
+   * so the gateway can surface an operator card naming the bucket and the
+   * earliest recovery. Null/absent whenever at least one account can serve the
+   * flagship tier.
+   */
+  premium_tier_all_walled?: {
+    bucket: string | null;
+    earliest_reset?: number;
+    at: number;
   } | null;
 }
 

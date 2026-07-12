@@ -40,6 +40,43 @@ export const DEFAULT_USER_AGENT = "claude-cli/1.0.0 (external, cli)";
  */
 export const DEFAULT_PROBE_MODEL = "claude-haiku-4-5-20251001";
 
+/**
+ * Model-tier canary probe model (#3176). The `7d_oi`
+ * (`seven_day_overage_included`) quota bucket is PER-MODEL-TIER: an account
+ * can be `rejected` on the flagship (Fable) tier while `allowed` on
+ * opus/haiku (verified 2026-07-12 — same account, same moment, fable=429 /
+ * opus=200 / haiku=200). The default haiku probe therefore CANNOT observe a
+ * Fable-tier wall, so a walled account looked healthy and the fleet stormed
+ * it. This probe issues the 1-token request against the flagship tier so its
+ * OWN 429/200 response carries the tier signal.
+ *
+ * Overridable via `SWITCHROOM_MODEL_TIER_PROBE_MODEL`. Unlike the model
+ * PICKER (where a stale pinned id 4xx's the fleet — the 2026-06-13
+ * `claude-fable-5` incident), a stale id HERE is safe: a non-429 response
+ * (incl. a 4xx "model not found") is classified as "no tier wall observed",
+ * so a rotted id degrades the canary to a benign no-op, never a mismark. Keep
+ * this pointed at the current flagship id; update it here (or via env) when
+ * the flagship id changes.
+ */
+export const DEFAULT_MODEL_TIER_PROBE_MODEL = "claude-fable-5";
+
+/** Resolve the model-tier canary probe model from env, else the default. */
+export function resolveModelTierProbeModel(
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const raw = env.SWITCHROOM_MODEL_TIER_PROBE_MODEL;
+  if (typeof raw === "string" && raw.trim().length > 0) return raw.trim();
+  return DEFAULT_MODEL_TIER_PROBE_MODEL;
+}
+
+/**
+ * Anthropic's `representative-claim` value naming the model-tier weekly
+ * overage bucket. When the unified status is `rejected` and this is the
+ * binding claim, the account is walled on the flagship (Fable) tier — the
+ * `7d_oi` bucket — regardless of how healthy the 5h/7d windows read.
+ */
+export const MODEL_TIER_REPRESENTATIVE_CLAIM = "seven_day_overage_included";
+
 export type QuotaUtilization = {
   fiveHourUtilizationPct: number;
   sevenDayUtilizationPct: number;
@@ -48,6 +85,27 @@ export type QuotaUtilization = {
   representativeClaim: string | null;
   overageStatus: string | null;
   overageDisabledReason: string | null;
+  /**
+   * #3176 — model-tier (7d_oi / seven_day_overage_included) bucket signals.
+   * These come from a request issued AGAINST the flagship tier (the default
+   * haiku probe leaves them null). `unifiedStatus` is the overall
+   * allowed/rejected verdict; `sevenDayOiStatus` is the per-tier bucket
+   * status; `sevenDayOiUtilizationPct` is that bucket's utilization (0-100);
+   * `sevenDayOiResetAt` is when the tier wall lifts (from the `7d_oi-reset`
+   * header, else the overall `unified-reset`, else `retry-after`).
+   *
+   * Optional (default-null semantics) so hand-built fixtures and cached/legacy
+   * snapshots that predate the field still satisfy the type — an absent field
+   * reads as "the probe carried no tier signal", never a wall.
+   */
+  unifiedStatus?: string | null;
+  sevenDayOiStatus?: string | null;
+  sevenDayOiUtilizationPct?: number | null;
+  sevenDayOiResetAt?: Date | null;
+  /** True when the probe response actually carried a `7d_oi` bucket header —
+   *  lets consumers tell "tier bucket absent (haiku probe)" from "measured
+   *  and healthy". Absent (undefined) on legacy/cached snapshots. */
+  sevenDayOiPresent?: boolean;
   /**
    * #2494 Bug C — header-presence markers. The two utilization fields are
    * always numeric (a missing header coalesces to 0 for back-compat), so on
@@ -107,32 +165,77 @@ function parseEpochHeader(headers: Headers, name: string): Date | null {
   return new Date(n * 1000);
 }
 
-export function parseQuotaHeaders(headers: Headers): QuotaResult {
+/**
+ * #3176 — resolve the tier-bucket reset. Prefer the per-bucket `7d_oi-reset`
+ * header, fall back to the overall `unified-reset`, then to `retry-after`
+ * (seconds from now) which a 429 always carries. `now` is injectable so the
+ * retry-after anchor is testable.
+ */
+function parseTierReset(headers: Headers, now: Date): Date | null {
+  const oi = parseEpochHeader(headers, "anthropic-ratelimit-unified-7d_oi-reset");
+  if (oi != null) return oi;
+  const unified = parseEpochHeader(headers, "anthropic-ratelimit-unified-reset");
+  if (unified != null) return unified;
+  const ra = headers.get("retry-after");
+  if (ra != null) {
+    const secs = Number(ra);
+    if (Number.isFinite(secs) && secs > 0 && secs < 30 * 24 * 3600) {
+      return new Date(now.getTime() + secs * 1000);
+    }
+  }
+  return null;
+}
+
+export function parseQuotaHeaders(
+  headers: Headers,
+  now: Date = new Date(),
+): QuotaResult {
   const fiveHour = parseFloatHeader(headers, "anthropic-ratelimit-unified-5h-utilization");
   const sevenDay = parseFloatHeader(headers, "anthropic-ratelimit-unified-7d-utilization");
-  if (fiveHour == null && sevenDay == null) {
+  // #3176 — model-tier (7d_oi) bucket + overall unified verdict. Present on a
+  // request issued against the flagship tier (a 429 wall carries these even
+  // when the 5h/7d utilization headers are omitted).
+  const unifiedStatus = headers.get("anthropic-ratelimit-unified-status");
+  const sevenDayOiStatus = headers.get("anthropic-ratelimit-unified-7d_oi-status");
+  const sevenDayOiUtil = parseFloatHeader(
+    headers,
+    "anthropic-ratelimit-unified-7d_oi-utilization",
+  );
+  const representativeClaim = headers.get(
+    "anthropic-ratelimit-unified-representative-claim",
+  );
+  const hasTierSignal =
+    unifiedStatus != null || sevenDayOiStatus != null || sevenDayOiUtil != null;
+  if (fiveHour == null && sevenDay == null && !hasTierSignal) {
     return {
       ok: false,
       reason: "no unified rate-limit headers in response (API token, not OAuth?)",
     };
   }
+  const oiPresent = sevenDayOiStatus != null || sevenDayOiUtil != null;
   return {
     ok: true,
     data: {
       // #2494 Bug C — we still coalesce a missing window header to 0 so the
       // numeric fields stay non-null for back-compat, but record which
       // windows were actually present so renderers can tell a real 0% from a
-      // filled-0. (Both-absent already returned ok:false above, so at least
-      // one of these is true here.)
+      // filled-0. (All-absent already returned ok:false above, so at least
+      // one signal is present here.)
       fiveHourUtilizationPct: (fiveHour ?? 0) * 100,
       sevenDayUtilizationPct: (sevenDay ?? 0) * 100,
       fiveHourUtilPresent: fiveHour != null,
       sevenDayUtilPresent: sevenDay != null,
       fiveHourResetAt: parseEpochHeader(headers, "anthropic-ratelimit-unified-5h-reset"),
       sevenDayResetAt: parseEpochHeader(headers, "anthropic-ratelimit-unified-7d-reset"),
-      representativeClaim: headers.get("anthropic-ratelimit-unified-representative-claim"),
+      representativeClaim,
       overageStatus: headers.get("anthropic-ratelimit-unified-overage-status"),
       overageDisabledReason: headers.get("anthropic-ratelimit-unified-overage-disabled-reason"),
+      // #3176 — model-tier bucket signals.
+      unifiedStatus,
+      sevenDayOiStatus,
+      sevenDayOiUtilizationPct: sevenDayOiUtil != null ? sevenDayOiUtil * 100 : null,
+      sevenDayOiResetAt: parseTierReset(headers, now),
+      sevenDayOiPresent: oiPresent,
     },
   };
 }
