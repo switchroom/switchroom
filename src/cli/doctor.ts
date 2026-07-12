@@ -44,6 +44,7 @@ import { runMcpSecretChecks } from "./doctor-mcp-secrets.js";
 import { runContextChecks } from "./doctor-context.js";
 import { runCredentialsMigrationChecks } from "./doctor-credentials-migration.js";
 import { runSecretAccessChecks } from "./doctor-secret-access.js";
+import { runAgentDotfileOwnershipChecks } from "./doctor-agent-dotfile-ownership.js";
 import { runInlinedSecretChecks } from "./doctor-inlined-secrets.js";
 import {
   loadLiveAllowFromAccessFiles,
@@ -3047,6 +3048,10 @@ export function registerDoctorCommand(program: Command): void {
           { title: "Memory (Hindsight)", results: await checkHindsight(config) },
           { title: "Telegram", results: await checkTelegram(config) },
           { title: "Agents", results: checkAgents(config, configPath) },
+          {
+            title: "Agent dotfile ownership (#3157)",
+            results: runAgentDotfileOwnershipChecks(config),
+          },
           { title: "Credentials", results: runCredentialsMigrationChecks(config) },
           { title: "Audit integrity (WS10-F4)", results: runAuditIntegrityChecks() },
           {

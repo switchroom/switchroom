@@ -123,21 +123,35 @@ export function alignAgentTreeOwnershipIfRoot(
  * bundled-skills pool). Group-readability is deliberately ignored — agent
  * containers run with a single supplementary-group-free uid:gid, so
  * owner-or-other is the honest readability predicate.
+ *
+ * The `fs` seam is injectable so the SAME readability predicate can be
+ * reused off the reconcile hot-path — the `switchroom doctor` pre-flight
+ * (#3157 direction 2, `doctor-agent-dotfile-ownership.ts`) drives it with a
+ * synthetic stat table to assert a root:root 0600 settings.json is flagged
+ * for the agent's ACTUAL runtime uid (0 for a `root:` agent, the
+ * deterministic 10001+ uid otherwise) without needing a real chown. Defaults
+ * to node:fs so every existing caller (the reconcile assert) is unchanged.
  */
+export interface UnreadableScanFs {
+  lstatSync: (p: string) => { isSymbolicLink(): boolean };
+  statSync: (p: string) => { uid: number; mode: number; isDirectory(): boolean };
+}
+
 export function findAgentUnreadablePaths(
   candidates: string[],
   agentUid: number,
+  fs: UnreadableScanFs = { lstatSync, statSync },
 ): string[] {
   const bad: string[] = [];
   for (const p of candidates) {
     let ls;
     try {
-      ls = lstatSync(p);
+      ls = fs.lstatSync(p);
     } catch {
       continue; // deleted / never created — nothing to read
     }
     if (ls.isSymbolicLink()) continue;
-    const st = statSync(p);
+    const st = fs.statSync(p);
     if (st.uid === agentUid) continue;
     const otherReadable = st.isDirectory()
       ? (st.mode & 0o005) === 0o005 // need r+x to read through a dir
