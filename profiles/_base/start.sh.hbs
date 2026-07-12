@@ -1164,6 +1164,12 @@ _EFFECTIVE_MODEL={{{modelQ}}}
 # come from the same resolver. Overwrite, not consumed.
 printf '%s\n' "$_EFFECTIVE_MODEL" > "{{agentDir}}/.configured-default-model" 2>/dev/null || true
 
+# Rev-4 hygiene (#3184 review LOW-2): remove the files retired with the
+# keep/revert intent subsystem and the crashloop self-heal. Nothing reads them
+# anymore; without this rm they would linger in the bind-mounted state dir
+# forever after rollout. Idempotent — a cheap no-op once clean.
+rm -f "{{agentDir}}/.relaunch-model-intent" "{{agentDir}}/.session-model-boot-attempts" "{{agentDir}}/.session-model-kept-notified"
+
 # Migration shim (one release): a leftover one-shot `.session-model-override`
 # carrier from a pre-consume-once gateway means an OLD gateway wrote it
 # immediately before this very bounce — convert it to `.session-model` so the

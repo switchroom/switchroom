@@ -63,6 +63,12 @@ Mechanism — **consume-once carrier** (no intent file):
   mid-turn queue-and-apply, and explicit failures are untouched; the queued
   apply persists a consume-once carrier at shutdown so it still applies as the
   agent boots (its apply-relaunch), then reverts on the next restart.
+  **Deliberate exception (#3184 review LOW-3):** that persist runs on every
+  shutdown path INCLUDING crashes, so a mid-turn queued `/model` + crash
+  applies on the crash-recovery boot — honoring the acked pending request
+  ("a queued /model never silently vanishes") rather than the literal
+  crash-reverts reading; gated to offline-trusted tokens and bounded by
+  consume-once to that single recovery boot, after which any restart reverts.
 
 The rev-2/rev-3 §0 and §§2-6 below are the historical design record; where they
 describe keep-by-default, intent files, the crashloop counter, or the 7-day

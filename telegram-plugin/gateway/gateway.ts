@@ -21979,9 +21979,11 @@ function recordModelMenuSideEffects(
   // torn down — a graceful restart (same mechanism as /restart) is required.
   if (outcome.selectedModel && isSrToClaudeTransition(prevSessionModel, outcome.selectedModel)) {
     const agentName = getMyAgentName()
-    // Carry the requested Claude model across the restart via the SAME durable
-    // `.session-model` override a Claude → sr-* switch uses — otherwise boot
-    // launches the CONFIGURED default and the tapped model is silently dropped.
+    // Carry the requested Claude model across the restart via the SAME
+    // consume-once `.session-model` carrier a Claude → sr-* switch uses —
+    // otherwise this transition's apply-relaunch boots the CONFIGURED default
+    // and the tapped model is silently dropped. Applied on that one boot,
+    // then reverts on the next restart (rev 4).
     const agentDir = resolveAgentDirFromEnv()
     const token = outcome.selectedModelToken
     if (agentDir && token) {
@@ -25627,7 +25629,7 @@ bot.on('callback_query:data', async ctx => {
     // sr-* TARGET tap: switch TO a non-Claude (LiteLLM/OpenRouter) model.
     // Parity with the text `/model sr-*` path — claude's native picker rejects
     // unknown sr-* ids, so an in-place inject can't set them. Carry the token
-    // across a graceful restart (the durable `.session-model` override) and
+    // across a graceful restart (the consume-once `.session-model` carrier) and
     // relaunch `claude --model sr-*`. Session-only; reverts to the configured
     // default on the next restart. The sr-* → Claude direction is handled below
     // via the SELECT/alias outcome + isSrToClaudeTransition.
@@ -28048,11 +28050,21 @@ async function shutdown(signal: string): Promise<void> {
 
   // #3018 finding 3 + #3039: resolve any queued /model|/effort ack cards. The
   // gateway (and with it the in-memory queue) is going away — persist each
-  // typed choice to the durable boot carriers (`.session-model` /
-  // `.session-effort`) so it still deterministically applies as the agent
-  // boots, and edit the ack card to say so. Only an unresolvable menu-tag
-  // selection falls back to a re-issue note. Best-effort and time-bounded so
-  // a wedged Telegram API can't block shutdown.
+  // typed choice to the boot carriers (the consume-once `.session-model` /
+  // the durable `.session-effort`) so it still deterministically applies as
+  // the agent boots, and edit the ack card to say so. Only an unresolvable
+  // menu-tag selection falls back to a re-issue note. Best-effort and
+  // time-bounded so a wedged Telegram API can't block shutdown.
+  //
+  // DELIBERATE (rev 4, #3184 review LOW-3): this runs on EVERY shutdown path,
+  // including crashes (uncaughtException/unhandledRejection route here), not
+  // just the isOsSignal branch above. So a mid-turn queued /model + crash can
+  // apply on the crash-recovery boot — technically at odds with a literal
+  // "crash reverts" reading of the session-scoped contract. Intended: it
+  // preserves #3178's "a queued /model never silently vanishes" guarantee
+  // (the ack card promised the switch), it is gated to offline-trusted
+  // tokens, and the consume-once carrier bounds it to exactly that one
+  // recovery boot — the following restart reverts to config.
   const orphanedCmdActions = pendingCmdShutdownResolutionActions(pendingSessionCommand, escapeHtmlForTg)
   const orphanedCmdEdits = orphanedCmdActions.map(a => ({
     chatId: a.cmd.ackChatId,

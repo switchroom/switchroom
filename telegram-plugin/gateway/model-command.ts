@@ -910,18 +910,19 @@ export interface ModelCallbackOutcome {
   /**
    * The canonical `claude --model` token (alias or full `claude-*` id) for a
    * Claude selection, when derivable — distinct from `selectedModel` (a display
-   * name for /status). The gateway persists this to the durable
-   * `.session-model` override so the confirmed switch survives
-   * switchroom-managed relaunches (and, on an sr-* → Claude transition, its own
+   * name for /status). Session-scoped (rev 4): a live Claude selection persists
+   * NO carrier (the switch applies in-session and reverts on the next boot);
+   * the gateway uses this token ONLY on an sr-* → Claude transition, writing it
+   * to the consume-once `.session-model` carrier so that transition's own
+   * apply-relaunch boots the tapped model (then reverts on the following
    * restart). Absent when the target has no derivable token.
    */
   selectedModelToken?: string
   /**
    * True when the confirmed selection was the "Default (recommended)" row —
-   * i.e. the session is now on the configured default and any sticky
-   * `.session-model` override must be CLEARED (there is no token to persist;
-   * persisting nothing while leaving a stale override would re-apply the old
-   * model on the next keep-relaunch).
+   * i.e. the session is now on the configured default and any leftover
+   * `.session-model` carrier must be CLEARED (a stale carrier would be
+   * consumed — mis-applied — by the next boot).
    */
   clearedDefault?: boolean
   /** Short toast for answerCallbackQuery. */

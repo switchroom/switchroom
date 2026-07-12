@@ -113,21 +113,44 @@ describe("scaffoldAgent: session-model consume-once boot resolver (start.sh)", (
     return readFileSync(join(agentDir, ".session-model-alert"), "utf-8");
   }
 
-  it("renders the consume-once carrier wiring in start.sh (no intent file)", () => {
+  it("renders the consume-once carrier wiring in start.sh (no intent resolution)", () => {
     expect(block).toContain(".session-model");
     expect(block).toContain(".configured-default-model");
     expect(block).toContain(".session-model-alert");
     // Migration shim still consumes the legacy one-shot carrier.
     expect(block).toContain(".session-model-override");
-    // The retired keep/revert intent + crashloop machinery is gone.
-    expect(block).not.toContain(".relaunch-model-intent");
-    expect(block).not.toContain(".session-model-boot-attempts");
-    expect(block).not.toContain(".session-model-kept-notified");
+    // The retired keep/revert intent + crashloop machinery is no longer
+    // RESOLVED — the retired filenames appear only in the one-line hygiene
+    // `rm -f` (#3184 LOW-2), never in a read/parse/stamp.
+    expect(block).not.toContain('"intent"');
+    expect(block).not.toContain("_sm_revert");
+    expect(block).not.toMatch(/(cat|read -r|<)[^\n]*\.relaunch-model-intent/);
+    expect(block).not.toMatch(/(cat|read -r|<)[^\n]*\.session-model-boot-attempts/);
+    expect(block).not.toMatch(/(cat|read -r|<)[^\n]*\.session-model-kept-notified/);
     // modelQ is assigned BARE (already shell-quoted by the scaffold).
     expect(block).toContain("_EFFECTIVE_MODEL='claude-sonnet-5'");
     const startSh = readFileSync(join(agentDir, "start.sh"), "utf-8");
     expect(startSh).toContain('--model "$_EFFECTIVE_MODEL"');
     expect(startSh).not.toContain("--model {{{modelQ}}}");
+  });
+
+  it("cleans up the retired rev-3 files on boot (#3184 LOW-2 hygiene)", () => {
+    // Simulate a fleet rollout onto an agent dir that still carries the
+    // retired intent/crashloop/dedup files from the keep-by-default era.
+    writeFileSync(join(agentDir, ".relaunch-model-intent"), `${JSON.stringify({ intent: "keep", reason: "old", ts: Date.now() })}\n`);
+    writeFileSync(join(agentDir, ".session-model-boot-attempts"), "2 12345\n");
+    writeFileSync(join(agentDir, ".session-model-kept-notified"), "claude-opus-4-8\n");
+    expect(runBlock("1")).toBe(DEFAULT_MODEL);
+    expect(existsSync(join(agentDir, ".relaunch-model-intent"))).toBe(false);
+    expect(existsSync(join(agentDir, ".session-model-boot-attempts"))).toBe(false);
+    expect(existsSync(join(agentDir, ".session-model-kept-notified"))).toBe(false);
+    // A stale intent file has NO effect on carrier resolution: a carrier still
+    // applies + consumes regardless of any leftover intent content.
+    writeFileSync(join(agentDir, ".relaunch-model-intent"), `${JSON.stringify({ intent: "revert", reason: "old", ts: Date.now() })}\n`);
+    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8"));
+    expect(runBlock("1")).toBe("claude-opus-4-8");
+    expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
+    expect(existsSync(join(agentDir, ".relaunch-model-intent"))).toBe(false);
   });
 
   // ── MODEL_ARG_RE byte-parity against the RENDERED start.sh ────────────────
