@@ -3178,6 +3178,20 @@ export class HostdServer {
     // req.args.name is AgentNameSchema-validated at decode and passed
     // as its own argv element; docker exec stops parsing its options
     // at CONTAINER so nothing after it is read as a docker flag.
+    // #3136: mirror handleAgentExec/handleAgentLogs — reject any target
+    // that is not a configured peer agent BEFORE constructing the
+    // container name, so smoke's docker exec / inspect can't be aimed at
+    // a singleton service container (vault-broker, approval-kernel, …).
+    // Defense-in-depth: smoke runs fixed literal probes and returns
+    // exit-code-only, but the guard keeps this sink consistent with its
+    // siblings and closes the boolean-existence-probe gap.
+    const rejected = this.rejectUnconfiguredTarget(
+      req.args.name,
+      req.request_id,
+      "agent_smoke",
+      started,
+    );
+    if (rejected) return rejected;
     const container = `switchroom-${req.args.name}`;
     type Probe = { name: string; state: "ok" | "fail" | "skip"; detail: string };
     const respond = (

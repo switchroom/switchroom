@@ -716,6 +716,31 @@ describe("hostd server — agent_smoke (read-only in-agent battery)", () => {
     expect(JSON.parse(resp.stdout_tail!).container).toBe("running");
   });
 
+  it("admin caller targeting the vault-broker singleton is DENIED and never shells out (#3136)", async () => {
+    // #3136 defense-in-depth: handleAgentSmoke builds `switchroom-${name}`
+    // and shells `docker inspect` / `docker exec` at it. klanker IS admin,
+    // so checkGate lets it target ANY name; only the configured-agent
+    // membership guard (mirrored from agent_exec/agent_logs) can stop a
+    // singleton service container (vault-broker / approval-kernel / …).
+    // A recording stub proves the guard short-circuits BEFORE any docker.
+    const invokedLog = join(tmp, `smoke-inv-${Math.random().toString(36).slice(2)}.log`);
+    await withDocker(`#!/bin/sh\necho "$@" >> ${invokedLog}\nexit 0\n`);
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+    const resp = await hostdRequest(
+      { socketPath: sock },
+      {
+        v: 1,
+        op: "agent_smoke",
+        request_id: "sm-singleton",
+        args: { name: "vault-broker" },
+      },
+    );
+    expect(resp.result).toBe("denied");
+    expect(resp.error).toMatch(/not a configured agent/);
+    // Hard proof: no `docker inspect`/`docker exec` ran against the singleton.
+    expect(existsSync(invokedLog)).toBe(false);
+  });
+
   it("down container → completed, exit 0, every probe skip (never fail)", async () => {
     await withDocker(
       '#!/bin/sh\ncase "$1" in\n  inspect) echo "false"; exit 0 ;;\nesac\nexit 0\n',
