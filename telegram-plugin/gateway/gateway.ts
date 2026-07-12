@@ -468,7 +468,6 @@ import {
   readConfiguredDefaultModel,
   writeSessionEffortFile,
   clearSessionEffortFile,
-  readSessionEffortFile,
 } from './session-model-file.js'
 import { discoverModels, selectModel } from '../../src/agents/model-picker.js'
 import { resolveMainModel, SWITCHROOM_DEFAULT_THINKING_EFFORT } from '../../src/agents/scaffold.js'
@@ -22331,39 +22330,38 @@ bot.command('model', async ctx => {
 // is blocklisted for `/effort` since #2471), session-scoped — boot re-pins
 // the configured default via start.sh's `--effort`. Implementation in
 // effort-command.ts so it's unit-testable without booting the bot.
+
+// The live session-effort override, in memory only (#3186, session-scoped
+// like /model rev 4). A confirmed live apply records here — NOT to the
+// `.session-effort` carrier — so it lasts exactly until the next restart
+// (start.sh's explicit `--effort <configured>` reverts it for free). Seeded
+// at boot from `.active-session-effort` (the effort sibling of
+// `.active-session-model`) so a queued-carrier apply-boot still shows the
+// honest live level on the /effort menu.
+let sessionEffortOverride: string | null = null
+
 function buildEffortDeps(): EffortCommandDeps {
   return {
-    // #3039: single persistence choke point — EVERY positively-confirmed
-    // effort apply (typed, menu tap, queued drain) durably records the level
-    // to `.session-effort`, which start.sh resolves into `--effort` on every
-    // boot. `/effort default` clears it via clearSessionEffort (the handler
-    // clears AFTER its restore-apply, so the wrapper's write is undone).
+    // Session-scoped (#3186): a positively-confirmed live apply records the
+    // level IN MEMORY only — no durable carrier. The `.session-effort`
+    // carrier is written solely by persistQueuedCommandForRestart (a queued
+    // mid-turn /effort carried across the bounce) and is consume-once at
+    // boot. `/effort default` clears via clearSessionEffort below.
     applyEffort: async (agent, level) => {
       const result = await applyEffort(agent, level)
-      if (result.ok) {
-        const agentDir = resolveAgentDirFromEnv()
-        if (agentDir) {
-          try {
-            writeSessionEffortFile(agentDir, level, getConfiguredEffortForPersist())
-          } catch (err) {
-            process.stderr.write(
-              `telegram gateway: session-effort persist failed level=${level}: ${(err as Error)?.message ?? String(err)}\n`,
-            )
-          }
-        }
-      }
+      if (result.ok) sessionEffortOverride = level
       return result
     },
     getAgentName: getMyAgentName,
     getConfiguredEffort: () => getConfiguredEffortForPersist(),
     clearSessionEffort: () => {
+      sessionEffortOverride = null
+      // Also drop any leftover queued-command carrier so the next boot can't
+      // consume a stale level the user just cleared.
       const agentDir = resolveAgentDirFromEnv()
       if (agentDir) clearSessionEffortFile(agentDir)
     },
-    getSessionEffort: () => {
-      const agentDir = resolveAgentDirFromEnv()
-      return agentDir ? (readSessionEffortFile(agentDir)?.level ?? null) : null
-    },
+    getSessionEffort: () => sessionEffortOverride,
     escapeHtml: escapeHtmlForTg,
   }
 }
@@ -28050,21 +28048,24 @@ async function shutdown(signal: string): Promise<void> {
 
   // #3018 finding 3 + #3039: resolve any queued /model|/effort ack cards. The
   // gateway (and with it the in-memory queue) is going away — persist each
-  // typed choice to the boot carriers (the consume-once `.session-model` /
-  // the durable `.session-effort`) so it still deterministically applies as
-  // the agent boots, and edit the ack card to say so. Only an unresolvable
-  // menu-tag selection falls back to a re-issue note. Best-effort and
-  // time-bounded so a wedged Telegram API can't block shutdown.
+  // typed choice to the consume-once boot carriers (`.session-model` /
+  // `.session-effort`, #3184/#3186) so it still deterministically applies as
+  // the agent boots (that boot consumes the carrier; later restarts revert),
+  // and edit the ack card to say so. Only an unresolvable menu-tag selection
+  // falls back to a re-issue note. Best-effort and time-bounded so a wedged
+  // Telegram API can't block shutdown.
   //
-  // DELIBERATE (rev 4, #3184 review LOW-3): this runs on EVERY shutdown path,
-  // including crashes (uncaughtException/unhandledRejection route here), not
-  // just the isOsSignal branch above. So a mid-turn queued /model + crash can
-  // apply on the crash-recovery boot — technically at odds with a literal
-  // "crash reverts" reading of the session-scoped contract. Intended: it
-  // preserves #3178's "a queued /model never silently vanishes" guarantee
-  // (the ack card promised the switch), it is gated to offline-trusted
-  // tokens, and the consume-once carrier bounds it to exactly that one
-  // recovery boot — the following restart reverts to config.
+  // DELIBERATE (rev 4, #3184 review LOW-3 — applies to BOTH carriers): this
+  // runs on EVERY shutdown path, including crashes (uncaughtException/
+  // unhandledRejection route here), not just the isOsSignal branch above. So
+  // a mid-turn queued /model or /effort + crash can apply on the
+  // crash-recovery boot — technically at odds with a literal "crash reverts"
+  // reading of the session-scoped contract. Intended: it preserves #3178's
+  // "a queued command never silently vanishes" guarantee (the ack card
+  // promised the switch), the model side is gated to offline-trusted tokens
+  // (the effort side is allowlist-gated at write, so a garbage level can't
+  // even cost one crash-boot), and the consume-once carriers bound it to
+  // exactly that one recovery boot — the following restart reverts to config.
   const orphanedCmdActions = pendingCmdShutdownResolutionActions(pendingSessionCommand, escapeHtmlForTg)
   const orphanedCmdEdits = orphanedCmdActions.map(a => ({
     chatId: a.cmd.ackChatId,
@@ -28906,6 +28907,23 @@ void (async () => {
                 sessionModelSource.setOverride(
                   launched.length > 0 && launched !== configured ? launched : null,
                 )
+              } catch { /* leave override as-is on a bad read */ }
+            }
+
+            // Effort sibling (#3186): start.sh records the EFFECTIVE launched
+            // effort to `.active-session-effort` every boot. Re-hydrate the
+            // in-memory session-effort override so the /effort menu highlight
+            // stays honest after a queued-carrier apply-boot. Only an effort
+            // differing from the configured default counts as an override.
+            const activeEffortPath = join(smAgentDir, '.active-session-effort')
+            if (existsSync(activeEffortPath)) {
+              try {
+                const launchedEffort = readFileSync(activeEffortPath, 'utf8').trim()
+                const configuredEffort = getConfiguredEffortForPersist()
+                sessionEffortOverride =
+                  launchedEffort.length > 0 && launchedEffort !== configuredEffort
+                    ? launchedEffort
+                    : null
               } catch { /* leave override as-is on a bad read */ }
             }
 

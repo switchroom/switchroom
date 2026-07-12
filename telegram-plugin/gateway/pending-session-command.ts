@@ -244,15 +244,17 @@ export interface PendingCommandCardEdit {
 }
 
 /**
- * What the gateway should DURABLY record for a queued command that can't
- * apply live because the session is going away (gateway shutdown or a pending
- * session relaunch). #3039: instead of telling the operator to re-issue, the
- * choice is persisted to the durable carriers (`.session-model` /
- * `.session-effort`) that start.sh honors on every boot — so the queued
- * command still deterministically applies, just via the relaunch.
+ * What the gateway should record for a queued command that can't apply live
+ * because the session is going away (gateway shutdown or a pending session
+ * relaunch). Instead of telling the operator to re-issue, the choice is
+ * persisted to the CONSUME-ONCE boot carriers (`.session-model` /
+ * `.session-effort`, #3184/#3186): start.sh applies each on the single boot
+ * that reads it — the queued command's apply-relaunch — and then deletes it,
+ * so the queued command still deterministically applies via the relaunch and
+ * any SUBSEQUENT restart reverts to the configured default.
  *
- *   - 'model'        — persist `arg` as the `.session-model` override
- *   - 'effort'       — persist `arg` as the `.session-effort` override
+ *   - 'model'        — persist `arg` as the `.session-model` carrier
+ *   - 'effort'       — persist `arg` as the `.session-effort` carrier
  *   - 'clear-model'  — the queued command was `/model default`: clear the carrier
  *   - 'clear-effort' — the queued command was `/effort default`: clear the carrier
  *   - null           — not offline-resolvable (a `mdl:s:<tag>` menu selection

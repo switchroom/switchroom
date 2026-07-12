@@ -107,7 +107,7 @@ describe("effort-command: handler", () => {
     const { deps } = makeDeps({ getConfiguredEffort: () => "medium" });
     const r = await handleEffortCommand({ kind: "show" }, deps);
     expect(r.text).toContain("medium");
-    expect(r.text).toMatch(/persists across restarts and deploys/);
+    expect(r.text).toMatch(/lasts until the agent’s next restart/);
   });
 
   it("show falls back to low when effort is unreadable", async () => {
@@ -121,7 +121,7 @@ describe("effort-command: handler", () => {
     const r = await handleEffortCommand({ kind: "set", level: "high" }, deps);
     expect(calls).toEqual([{ agent: "carrie", level: "high" }]);
     expect(r.text).toContain("Set effort level to high");
-    expect(r.text).toMatch(/persists across restarts and deploys/);
+    expect(r.text).toMatch(/lasts until the agent’s next restart/);
   });
 
   it("set notes the re-read cost when a confirmation was needed", async () => {
@@ -249,9 +249,9 @@ describe("effort-command: /effort default (#3039)", () => {
     expect(marked?.text).toBe("✅ max");
   });
 
-  it("help text advertises /effort default and the sticky contract", async () => {
+  it("help text advertises /effort default and the session-only contract", async () => {
     const r = await handleEffortCommand({ kind: "help" }, makeDeps().deps);
     expect(r.text).toContain("/effort default");
-    expect(r.text).toContain("persists across restarts and deploys");
+    expect(r.text).toContain("lasts until the agent’s next restart");
   });
 });
