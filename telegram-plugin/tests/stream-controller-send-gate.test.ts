@@ -192,10 +192,10 @@ describe('stream-controller × send gate (#3110)', () => {
     expect(bot.api.editMessageText).toHaveBeenCalledTimes(1)
 
     await clock.advance(1500) // clear the floor — isolate the no-op skip
-    const second = createStreamController({
-      bot, chatId: '1', throttleMs: 250, retry, initialMessageId: 7777,
-    })
     const onEdit = vi.fn()
+    const second = createStreamController({
+      bot, chatId: '1', throttleMs: 250, retry, initialMessageId: 7777, onEdit,
+    })
     void second.update('**status: done**')
     await flush()
 
