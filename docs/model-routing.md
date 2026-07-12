@@ -238,9 +238,14 @@ Ranked, highest-leverage first.
   `telegram-plugin/model-unavailable.ts`; behavior documented in
   docs/auth.md § "LiteLLM-proxy-local 429s"). Every classified 429 emits a
   `rate_limit_429_classified` runtime metric so account-scoped 429s can be
-  correlated with fleet TPM. Follow-up: pick cap values from that metric and
-  enable `tpm_limit` on the per-consumer virtual keys / deployments in the
-  operator-maintained proxy config.
+  correlated with fleet TPM. The operator surface is also DONE: a
+  `litellm-local` 429 posts a calm, per-agent-debounced "fleet token limiter
+  engaged" notice (default 15-min window,
+  `channels.telegram.litellm_notice.window_ms`; docs/auth.md §
+  "LiteLLM-proxy-local 429s") instead of the generic rate-limited card, so
+  when caps are enabled their trips are legible and quiet. Follow-up: pick
+  cap values from the metric and enable `tpm_limit` on the per-consumer
+  virtual keys / deployments in the operator-maintained proxy config.
 
 ## Verification
 

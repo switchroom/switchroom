@@ -539,6 +539,26 @@ describe("scaffoldAgent", () => {
     expect("coalescingGapMs" in access).toBe(false);
   });
 
+  it("projects channels.telegram.litellm_notice.window_ms into access.litellmNoticeWindowMs", () => {
+    const config = makeAgentConfig({
+      channels: { telegram: { litellm_notice: { window_ms: 600_000 } } },
+    });
+    const result = scaffoldAgent("litellm-notice-agent", config, tmpDir, telegramConfig);
+    const access = JSON.parse(
+      readFileSync(join(result.agentDir, "telegram", "access.json"), "utf-8"),
+    );
+    expect(access.litellmNoticeWindowMs).toBe(600_000);
+  });
+
+  it("omits litellmNoticeWindowMs entirely when no litellm_notice config is set (gateway applies the 15-min default)", () => {
+    const config = makeAgentConfig();
+    const result = scaffoldAgent("litellm-notice-default", config, tmpDir, telegramConfig);
+    const access = JSON.parse(
+      readFileSync(join(result.agentDir, "telegram", "access.json"), "utf-8"),
+    );
+    expect("litellmNoticeWindowMs" in access).toBe(false);
+  });
+
   it("projects channels.telegram.interrupt into access (safe_boundary + max_wait_ms)", () => {
     const config = makeAgentConfig({
       channels: { telegram: { interrupt: { safe_boundary: true, max_wait_ms: 5000 } } },
