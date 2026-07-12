@@ -301,13 +301,28 @@ export function writePremiumRecoveryFile(
   )
 }
 
-/** Parsed premium-recovery marker, or null when absent/corrupt. */
+/**
+ * Parsed premium-recovery marker, or null when absent/corrupt. A present-but-
+ * corrupt marker (null parse of a file that exists) is SWEPT on read: neither
+ * the ping path nor `clearPremiumRecoveryOnManualSwitch` can act on a null
+ * parse, so a garbled file would otherwise linger forever. Deleting it here is
+ * best-effort hygiene — the read still returns null either way.
+ */
 export function readPremiumRecoveryFile(agentDir: string): PremiumRecoveryRecord | null {
+  let raw: string
   try {
-    return parsePremiumRecovery(readFileSync(join(agentDir, PREMIUM_RECOVERY_FILE), 'utf8'))
+    raw = readFileSync(join(agentDir, PREMIUM_RECOVERY_FILE), 'utf8')
   } catch {
+    return null // absent / unreadable — nothing on disk to sweep.
+  }
+  const parsed = parsePremiumRecovery(raw)
+  if (parsed == null) {
+    // Corrupt marker present on disk — garbage-collect it so it can't wedge the
+    // recovery path (best-effort; a failed unlink still returns null).
+    clearPremiumRecoveryFile(agentDir)
     return null
   }
+  return parsed
 }
 
 /** Delete the premium-recovery marker (consumed on ping / manual re-issue). Best-effort. */

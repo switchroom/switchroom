@@ -115,12 +115,14 @@ describe('.premium-recovery carrier — round-trip + shape gate', () => {
     rmSync(dir, { recursive: true, force: true })
   })
 
-  it('write → read round-trips model + chats', () => {
+  it('write → read round-trips model + chats (a VALID marker is NOT swept)', () => {
     writePremiumRecoveryFile(dir, 'fable', ['12345', '67890'])
     const rec = readPremiumRecoveryFile(dir)
     expect(rec?.premiumModel).toBe('fable')
     expect(rec?.chats).toEqual(['12345', '67890'])
     expect(typeof rec?.ts).toBe('number')
+    // A well-formed marker must survive a read — only corrupt files are swept.
+    expect(existsSync(join(dir, PREMIUM_RECOVERY_FILE))).toBe(true)
   })
 
   it('clear removes the marker', () => {
@@ -151,8 +153,13 @@ describe('.premium-recovery carrier — round-trip + shape gate', () => {
     expect(parsePremiumRecovery(JSON.stringify({ premiumModel: 'fable', chats: ['1'] }))).toBeNull()
   })
 
-  it('read returns null on a corrupt on-disk marker (never a half-parsed record)', () => {
+  it('read returns null on a corrupt on-disk marker AND sweeps the garbled file', () => {
     writeFileSync(join(dir, PREMIUM_RECOVERY_FILE), '{not json\n')
+    expect(existsSync(join(dir, PREMIUM_RECOVERY_FILE))).toBe(true)
     expect(readPremiumRecoveryFile(dir)).toBeNull()
+    // LOW-1: a corrupt marker is garbage-collected on read so it can't linger
+    // forever (neither the ping path nor the manual-switch clear could ever
+    // delete it — both read null first).
+    expect(existsSync(join(dir, PREMIUM_RECOVERY_FILE))).toBe(false)
   })
 })

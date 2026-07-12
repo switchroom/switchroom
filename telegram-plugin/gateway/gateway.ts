@@ -473,11 +473,8 @@ import {
   clearPremiumRecoveryFile,
 } from './session-model-file.js'
 import { runTierDowngrade } from './tier-downgrade-wiring.js'
-import {
-  decidePremiumRecovery,
-  renderPremiumRecoveryPing,
-  premiumRecoveryClaimKey,
-} from '../premium-recovery.js'
+import { runPremiumRecoveryPing } from './premium-recovery-wiring.js'
+import { decidePremiumRecovery } from '../premium-recovery.js'
 import { discoverModels, selectModel } from '../../src/agents/model-picker.js'
 import { resolveMainModel, SWITCHROOM_DEFAULT_THINKING_EFFORT } from '../../src/agents/scaffold.js'
 import {
@@ -23672,59 +23669,42 @@ async function maybePremiumRecoveryPing(
   brokerClient: NonNullable<Awaited<ReturnType<typeof getAuthBrokerClient>>>,
   accounts: ReadonlyArray<{ exhausted: boolean; premium_walled?: boolean }>,
 ): Promise<void> {
-  const agentDir = resolveAgentDirFromEnv()
-  if (!agentDir) return
-  const marker = readPremiumRecoveryFile(agentDir)
-  if (marker == null) return
-  const decision = decidePremiumRecovery({
-    hasMarker: true,
-    accounts: accounts.map((a) => ({
-      exhausted: a.exhausted,
-      premiumWalled: a.premium_walled === true,
-    })),
+  // Thin adapter: the order-sensitive never-storm glue lives in
+  // runPremiumRecoveryPing (premium-recovery-wiring.ts) behind injected deps so
+  // it is unit-testable without importing the gateway. This wires the real seams
+  // (marker FS, fleet claim, send) — behaviour is preserved exactly.
+  return runPremiumRecoveryPing({
+    getAgentDir: () => resolveAgentDirFromEnv() ?? null,
+    readMarker: (dir) => readPremiumRecoveryFile(dir),
+    clearMarker: (dir) => clearPremiumRecoveryFile(dir),
+    getAgent: () => getMyAgentName(),
+    // The pure recovery predicate, bound to THIS tick's live per-account
+    // eligibility (the broker's own verdicts; `premium_walled` may be absent).
+    decide: () =>
+      decidePremiumRecovery({
+        hasMarker: true,
+        accounts: accounts.map((a) => ({
+          exhausted: a.exhausted,
+          premiumWalled: a.premium_walled === true,
+        })),
+      }).fire,
+    // Fail-open (claimQuotaNotification returns true on any broker error) — a
+    // convenience ping degrades to at-least-once, never lost.
+    claimNotification: (key) => claimQuotaNotification(brokerClient, key),
+    fallbackChats: () => loadAccess().allowFrom.map((c) => String(c)),
+    sendToChat: (chat_id, ping, keyboard) => {
+      void swallowingApiCall(
+        // allow-raw-bot-api: wrapped in swallowingApiCall (retry policy)
+        () =>
+          bot.api.sendRichMessage(chat_id, richMessage(ping.text), {
+            disable_notification: true,
+            reply_markup: keyboard,
+          }),
+        { chat_id: String(chat_id), verb: 'premium-recovery:notify' },
+      )
+    },
+    log: (msg) => process.stderr.write(`telegram gateway: ${msg}\n`),
   })
-  if (!decision.fire) return
-  const agent = getMyAgentName()
-  // Fleet-wide dedup: a fresh gateway boot or a second tick inside the window
-  // must not re-send. Fail-open (claimQuotaNotification returns true on any
-  // broker error) — a convenience ping degrades to at-least-once, never lost.
-  const granted = await claimQuotaNotification(
-    brokerClient,
-    premiumRecoveryClaimKey(agent, marker.premiumModel),
-  )
-  if (!granted) {
-    // Another gateway already owns this recovery ping — consume our marker so
-    // it can't linger and re-attempt every tick, and bail.
-    clearPremiumRecoveryFile(agentDir)
-    return
-  }
-  // Consume the marker BEFORE sending (never-storm: at-most-once is the hard
-  // requirement for this ping; a transient send fault is covered by
-  // swallowingApiCall's retry policy).
-  clearPremiumRecoveryFile(agentDir)
-  const ping = renderPremiumRecoveryPing(marker.premiumModel)
-  const keyboard = {
-    inline_keyboard: [
-      [{ text: ping.buttonText, callback_data: `${MODEL_CALLBACK_ALIAS}${marker.premiumModel}` }],
-    ],
-  }
-  const chats = marker.chats.length > 0
-    ? marker.chats
-    : loadAccess().allowFrom.map((c) => String(c))
-  for (const chat_id of chats) {
-    void swallowingApiCall(
-      // allow-raw-bot-api: wrapped in swallowingApiCall (retry policy)
-      () =>
-        bot.api.sendRichMessage(chat_id, richMessage(ping.text), {
-          disable_notification: true,
-          reply_markup: keyboard,
-        }),
-      { chat_id: String(chat_id), verb: 'premium-recovery:notify' },
-    )
-  }
-  process.stderr.write(
-    `telegram gateway: [premium-recovery] ${marker.premiumModel} servable again — ping sent agent=${agent} chats=${chats.length}\n`,
-  )
 }
 
 /**
