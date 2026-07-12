@@ -156,25 +156,96 @@ describe('formatPermissionCardBody', () => {
     expect(body).toContain('why: _listing temp files_')
   })
 
-  test('shows "not provided" when no caller reason is present (never the description)', () => {
+  // #3167: no caller reason → an honest synthesized `context:` line built
+  // from the tool's salient input, NEVER a bare "why: not provided" and never
+  // the static schema description. The distinct `context:` label keeps the
+  // agent's omission of a rationale visible.
+  test('synthesizes a context line when no caller reason is present (never "not provided" / the description)', () => {
     const body = formatPermissionCardBody({
       toolName: 'Bash',
       inputPreview: JSON.stringify({ command: 'ls /tmp' }),
       description: 'Run a shell command on the host.',
       agentName: 'gymbro',
     })
-    expect(body).toContain('why: _not provided_')
+    expect(body).not.toContain('not provided')
     expect(body).not.toContain('Run a shell command')
+    expect(body).toContain('context: _command: ls /tmp_')
   })
 
-  test('shows "not provided" when caller reason is whitespace only', () => {
+  test('synthesizes context when the caller reason is whitespace only', () => {
     const body = formatPermissionCardBody({
       toolName: 'Bash',
       inputPreview: JSON.stringify({ command: 'ls /tmp', reason: '   \n ' }),
       description: 'Run a shell command.',
       agentName: 'gymbro',
     })
-    expect(body).toContain('why: _not provided_')
+    expect(body).not.toContain('not provided')
+    expect(body).toContain('context: _command: ls /tmp_')
+  })
+
+  // #3167 root case: the `reply` tool (and react/edit_message/…) carries NO
+  // `reason` argument, so its cards used to render a contentless
+  // "🔐 Clerk wants to reply / why: not provided". Now the reply text is
+  // synthesized onto a `context:` line so the operator has something to judge.
+  test('reply (no reason arg) synthesizes the reply text as context, not "not provided"', () => {
+    const body = formatPermissionCardBody({
+      toolName: 'mcp__switchroom-telegram__reply',
+      inputPreview: JSON.stringify({
+        chat_id: '12345',
+        text: "On it — pulling yesterday's GitHub activity now.",
+        format: 'html',
+        disable_notification: true,
+      }),
+      description: 'Reply on Telegram.',
+      agentName: 'clerk',
+    })
+    const lines = body.split('\n')
+    expect(lines[0]).toBe('🔐 **Clerk** wants to reply')
+    expect(body).not.toContain('not provided')
+    // Salient field surfaced (truncated); id/routing/formatting noise stripped.
+    expect(body).toContain('context: _text: On it — pulling')
+    expect(body).toMatch(/context: _text: On it — pulling[^_]*…_/)
+    expect(body).not.toContain('chat_id')
+    expect(body).not.toContain('disable_notification')
+    expect(body).not.toContain('format')
+  })
+
+  test('a reason ON a reply card still renders as why:, not context: (#3167)', () => {
+    const body = formatPermissionCardBody({
+      toolName: 'mcp__switchroom-telegram__reply',
+      inputPreview: JSON.stringify({
+        chat_id: '12345',
+        text: 'done',
+        reason: 'answering the operator’s status question',
+      }),
+      description: 'Reply on Telegram.',
+      agentName: 'clerk',
+    })
+    expect(body).toContain('why: _answering the operator’s status question_')
+    expect(body).not.toContain('context:')
+  })
+
+  test('synthesized context redacts secrets in the salient input (#3167)', () => {
+    const fakeToken = 'sk-ant-' + 'api03-' + 'B'.repeat(48)
+    const body = formatPermissionCardBody({
+      toolName: 'mcp__switchroom-telegram__reply',
+      inputPreview: JSON.stringify({ chat_id: '1', text: `here is the key: ${fakeToken}` }),
+      description: 'Reply on Telegram.',
+      agentName: 'clerk',
+    })
+    expect(body).toContain('context:')
+    expect(body).not.toContain(fakeToken)
+  })
+
+  test('falls back to the natural action when the input exposes nothing salient (#3167)', () => {
+    const body = formatPermissionCardBody({
+      toolName: 'ExitPlanMode',
+      inputPreview: undefined,
+      description: 'Exit plan mode.',
+      agentName: 'clerk',
+    })
+    expect(body).not.toContain('not provided')
+    expect(body).toContain('context: _exit plan mode_')
   })
 
   test('drops the agent prefix when agentName is null (early-boot edge)', () => {
