@@ -2,7 +2,136 @@
 
 ## Unreleased
 
-### LiteLLM-local 429s get an honest, debounced throttle notice
+## v0.18.16 — The send gate governs every stream edit, a flagship-tier quota wall stops storming the walled account, and typed /model always leaves a trace
+
+The through-line is flood-ban and fleet-availability hardening. The
+draft/answer stream and the worker-activity feed now both transit the
+send gate's shed contract correctly — closing the #1 documented
+`editMessageText` flood-ban trigger and a 578-crash storm that re-drove a
+card through a whole 44-minute ban. The auth broker learns to see
+Anthropic's per-model-tier (`7d_oi`) quota walls, so a flagship-walled
+account is rolled off instead of stormed by every flagship agent. A typed
+`/model` can no longer vanish mid-turn. And a LiteLLM-proxy-local 429 now
+gets one calm, debounced notice instead of a scary account-limit card.
+
+### Auth — the broker detects per-model-tier (`7d_oi`) quota walls (#3179, #3176)
+
+The broker's quota probe hit `POST /v1/messages` with haiku and recorded
+only 5h/7d utilization. Anthropic's `7d_oi`
+(`seven_day_overage_included`) bucket is **per-model-tier**: an account
+can be rejected on the flagship (Fable) tier while still allowed on
+opus/haiku. A haiku probe therefore read healthy while a flagship request
+429'd, so the broker set a Fable-walled account fleet-active and every
+flagship agent stormed it (2026-07-12 incident: account read
+5h=1%/7d=58% while 100% walled on `7d_oi` with a ~2.8h retry-after
+invisible to us; 86-request 429 storm over ~5 min).
+
+- **Full unified signal capture** (`quota.ts`): `parseQuotaHeaders` now
+  captures `unified-status` and `7d_oi` status/utilization/reset, widens
+  the ok-gate so a 429 carrying only tier headers still parses, and
+  resolves the tier reset from `7d_oi-reset` / `unified-reset` /
+  `retry-after`.
+- **New pure classifier** (`model-tier-quota.ts`):
+  `quotaIndicatesModelTierWall` classifies a `7d_oi` rejection (or a
+  `seven_day_overage_included` representative claim, or `>=`wall `7d_oi`
+  utilization) as an account-model-tier wall — NOT transient, NOT
+  proxy-local. `quotaTierAllowed` / `isModelTierWalled` decide clearing
+  and eligibility.
+- **Flagship canary + tier-scoped mark** (`server.ts`): the fleet tick
+  fires a 1-token flagship canary against the serving set. A walled
+  canary records a tier-scoped `premium_walled_until` mark (never a
+  blanket `exhausted_until` — the account still serves opus/haiku), rolls
+  the fleet off the account, and durably promotes a flagship-eligible
+  target. All accounts walled → no roll, persisted all-walled alert with
+  the earliest reset. A later canary reading the tier allowed self-heals
+  the mark. Kill-switch `SWITCHROOM_DISABLE_MODEL_TIER_PROBE=1`; probe
+  model overridable via `SWITCHROOM_MODEL_TIER_PROBE_MODEL` and degrades
+  safely on a rotted id (a non-429 is "no wall observed", never a
+  mismark).
+- **Review follow-ups:** the model-tier-wall roll now carries its binding
+  bucket end-to-end (`recordFleetRoll`), and `buildFleetRollMessage`
+  names the flagship tier and reassures that opus/haiku on the walled
+  account are unaffected instead of falling through to a generic
+  "quota window" notice. Tests pin the exact 2026-07-12 header shapes, a
+  false-wall boundary, tier-scoping, all-walled, and self-heal — all
+  sabotage-verified.
+
+### Telegram — draft-stream edits transit the send gate's per-message edit floor (#3173, #3110)
+
+stream-controller's edit calls passed only `{ threadId, chat_id }` to
+`robustApiCall`, so the send gate treated them as ordinary sends and its
+per-message edit floor (`>=1.5s`), last-write-wins coalescing, no-op skip
+and cosmetic shedding never governed the draft/answer stream — the #1
+documented flood-ban trigger (rapid same-message `editMessageText`; a ~6h
+ban 2026-07-12).
+
+- All four edit call sites (anchor edit, anchor plain parse-fallback,
+  tail edit, tail plain parse-fallback) now thread
+  `messageId`/`editPayload`/`priorityClass` through. Intermediate draft
+  edits are `cosmetic` (shed under pressure or an open flood window; the
+  next flush carries full state); the finalize flush is `critical` —
+  never shed, fails fast (`FLOOD_WAIT_ACTIVE`) on a long window.
+- **`finalize(text)` carries the final snapshot as a critical edit:** a
+  `done=true` flush routes the completed answer through `finalize()`
+  (final already set) instead of `update()`, so the edit that renders the
+  finished answer is classified critical and is never shed as a draft.
+- **Distinguishable `SEND_GATE_SHED` sentinel (review F1–F5):** the gate's
+  two shed paths now resolve an exported `SEND_GATE_SHED` symbol instead
+  of overloading `undefined` (which also means benign no-op drop and a
+  swallowed `message is not modified` 400). stream-controller keys shed
+  detection off `isSendGateShed()` exactly; a shed snapshot is preserved
+  in `shedText` and re-flushed on the next critical finalize so
+  argument-less cleanup (disconnect-flush, turn-end, PTY previews) never
+  loses content. Sabotage-verified: re-overloading `undefined` → 13
+  failures.
+
+### Telegram — worker-feed honours the send-gate shed contract (#3175, #3174)
+
+The worker-activity feed's send/edit adapters transit
+`robustApiCall = sendGate.gate(...)`, which SHEDS a call — resolving
+without hitting the API — during an open flood window or on a cosmetic
+edit with no free token. The first-paint path dereferenced
+`sent.message_id` on that shed result, throwing a `TypeError` that set no
+cooldown, so the heartbeat re-drove the paint on the fixed 6s cadence for
+the WHOLE ban: 578 `undefined is not an object` crashes in one ~44-min
+flood window on overlord (2026-07-12, 05:24:58 → 06:08:25).
+
+- A shed/undefined result is treated as NOT-delivered: no `message_id`
+  deref, no `lastBody` record on a shed cosmetic edit, no `pendingFinish`
+  clear on a shed terminal edit (which would falsely finalize and freeze
+  the card on its last running render).
+- **Zero API calls while a flood window is open:** a new
+  `floodWaitRemainingMs` probe reads the same on-disk marker as
+  `robustApiCall`; a tick that sees an open window parks the handle in
+  cooldown for the remaining window and makes no calls until it closes.
+- **Keyed off `SEND_GATE_SHED`, not `undefined`:** after #3173 a shed
+  cosmetic edit resolves the sentinel, so both cosmetic-edit shed checks
+  (`doUpdate` + `doFinish`) key off `isSendGateShed` — a benign
+  `undefined` correctly falls through as delivered. Sabotage-verified:
+  all four new tests fail without the fix.
+
+### Telegram — typed `/model` always leaves a durable trace and acks mid-turn (#3178, #3177)
+
+A typed `/model opus` sent while an agent is finishing a turn could
+vanish completely — no effect, no reply, no ack, no log line, no history
+row — violating the "P8 `/model` must always work and stick" invariant
+(live incident: finn, v0.18.15, 2026-07-12; a "phantom-idle" window where
+the turn had declared `turn_end` but claude was still mid-work).
+
+- **Durable receipt first:** the handler writes a greppable receipt log
+  line and a history row BEFORE any branch or reply attempt, so a
+  swallowed switch is never invisible (command handlers bypass the
+  `bot.on(message)` `recordInbound`, so `/model` never appeared in
+  history at all).
+- **Busy gate reads both signals:** disposition routes through the new
+  pure `planModelCommand`, folding `currentTurn !== null` with the
+  authoritative `turnInFlightForGate()` (delivery-machine +
+  pending-approval) so a session busy by EITHER measure ack+queues
+  instead of silently injecting `/model opus` as literal text into a
+  still-busy pane. Pure helpers unit-tested; sabotage-verified that
+  reverting the busy-union re-introduces the swallow.
+
+### Telegram — LiteLLM-local 429s get an honest, debounced throttle notice (#3172)
 
 When an agent trips the LiteLLM proxy's OWN `tpm_limit`/`rpm_limit` cap
 (a `litellm-local` classified 429 — the classifier shipped in v0.18.15
