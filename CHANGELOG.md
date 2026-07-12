@@ -2,6 +2,93 @@
 
 ## Unreleased
 
+## v0.18.14 — The 429 throttle tier: short rate limits ride out in place, long ones fail over, and the operator hears the honest difference
+
+The headline: a transient per-account 429 is no longer a coin-flip between
+a scary quota card and a silent stall. If the parsed reset is short the
+agent **stays on its account and retries itself after the limit lifts**;
+if it's long the account is marked throttled and the fleet fails over —
+with honest, account-attributed messaging either way. Plus rich render
+goes default-ON (completing the escape-hatch-over-feature-flag policy),
+forwarded messages carry server-stamped provenance, a deterministic gate
+stops foreground turn-hogs, and a dead config knob is removed.
+
+### The 429 throttle tier — retry in place under 5 min, else failover (#3160)
+
+Builds on #3155's transient-vs-wall classification: a terminal transient
+429 (the `rate_limit_error` whose wording explicitly says it's *not your
+usage limit*) previously posted a generic 🚦 card with no account
+attribution, no broker state, and no retry — cron fires walked straight
+back into the same 429, and the operator couldn't tell a 3-minute
+throttle from a quota wall.
+
+- **Reset ≤ 5 min (`SWITCHROOM_THROTTLE_RETRY_IN_PLACE_MAX_MS`): stay
+  put.** The broker's new non-admin `mark-throttled` verb records
+  `throttled_until` in the quota ledger — no roll, no eligibility change —
+  and a retry nudge re-engages the turn just after the reset via the
+  existing single-flight boot-resume gate (no new session-injection
+  mechanism, no restart loop on a 429 storm).
+- **Reset > 5 min: escalate to standard failover.** The existing
+  mark-exhausted + fleet-roll machinery runs with the parsed reset as the
+  mark expiry and an honest card reason — `account rate-limited (resets
+  …)`, a new `rate_limited` detection kind distinct from quota-exhausted.
+- **Honest operator messaging.** ONE lightweight fleet-deduped notice
+  (per-account 10-min cooldown, jittered — no herd) names the account,
+  says *rate-limited, not quota-exhausted*, and gives the parsed reset
+  ("resets in 3m"); no parseable reset throttles for ~60s and says so.
+  The failover announcement's recovery line now survives a failed live
+  probe via the prose-parsed reset.
+- **Server-side 429/529 excluded.** A transient upstream error ("not your
+  usage limit") never marks the account — only genuine per-account
+  signals touch the ledger.
+- **Escalation guard.** 3+ transient 429s on one account within 10 min
+  trigger ONE live quota probe; only a probe that corroborates a real
+  wall converts into mark-exhausted + fleet roll (audit reason
+  `throttle-escalation`).
+- **Cron quota-preflight** soft-defers while the agent's effective
+  account is throttled, aiming the scheduler retry just past
+  `throttled_until` instead of the blind backoff ladder.
+
+### Telegram surface — rich render default-ON, forwarded-message provenance, dead knob removed
+
+- **#3163 — rich render is on by default.** `SWITCHROOM_RICH_RENDER`
+  flips from opt-in to an escape hatch (`=0`/`false`/`off`/`no` disables;
+  unset or junk stays ON), copying the send gate's #3153 shape exactly
+  and completing the escape-hatch-over-feature-flag policy. The
+  `renderSafe` degrade-to-plain failure path is unchanged.
+- **#3162 — forwarded-message origin metadata.** Forwarding a message to
+  an agent now surfaces Telegram's **server-stamped** `forward_origin` as
+  trusted channel-tag attributes (`forwarded_from`, `forwarded_from_type`,
+  `forwarded_from_id`, `forwarded_date`) — attrs-only, never injected into
+  the attacker-influenceable body. `hidden_user` origins are explicitly
+  marked as self-reported with no verifiable id; multi-origin coalesced
+  bursts follow the numbered-sibling convention; the origin persists on
+  SQLite history rows via the additive migration loop.
+- **#3164 — remove the dead `channels.telegram.rate_limit_ms` knob**
+  (closes #3161). Documented, schema-defined, and scaffold-exported — but
+  read by nothing; the send gate (default-ON since #3153) is the real
+  outbound throttle. Stale YAML keys still parse: the schema strips
+  unknown keys rather than rejecting, pinned by a regression test.
+
+### Turn discipline — deterministic foreground-hog gate, steer-forwarding protocol
+
+- **#3159 — foreground turn-hog PreToolUse gate for Bash.** A
+  deterministic deny on effectively-unbounded foreground commands —
+  `tail -f`, `watch`, `sleep >30s` (bare, compound, or in a loop),
+  `gh pr checks --watch`, `gh run watch`, `docker|kubectl logs -f`,
+  `journalctl -f` — with an instructive message: re-run with
+  `run_in_background: true` or use a bounded alternative. Quote/heredoc-
+  aware and conservative (false negatives acceptable, false positives
+  not: `git log --follow`, `npm test`, shell-backgrounded segments all
+  pass); fails open on protocol errors; default-ON kill-switch
+  `SWITCHROOM_FOREGROUND_HOG_GATE=0`.
+- **#3158 — steer-forwarding guidance for running sub-agents.** The
+  default and coding profiles' Sub-Agent Delegation protocol now says:
+  a mid-turn amendment to delegated work is forwarded to the running
+  worker NOW (`SendMessage`), a new independent task is queued, and
+  either way the reply states which happened — never silently held until
+  handback (`steer-or-queue-mid-flight` job spec).
+
 ## v0.18.13 — The outbound send gate defaults on (no more self-inflicted flood bans), a transient-throttle failover fix, and the #3084 security-audit sweep
 
 The headline: the Telegram outbound throttle that keeps an agent from
