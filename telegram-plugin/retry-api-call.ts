@@ -121,8 +121,14 @@ export interface RetryApiCallConfig {
    * a container restart during an active ban can suppress non-essential
    * sends (boot cards) instead of feeding the same per-bot-token flood
    * counter and prolonging the ban. Best-effort; a throw here is swallowed.
+   *
+   * The call's `opts` are passed through (#3111) so the hook can open a
+   * SCOPE-PRECISE send-gate window: this fires even for a SHORT slept-and-retried
+   * 429 that never throws `FLOOD_WAIT_ACTIVE`, so without the opts the gateway
+   * could only open a blanket `global` window for those. Existing callers that
+   * ignore the second argument are unaffected.
    */
-  onFloodWait?: (retryAfterSec: number) => void
+  onFloodWait?: (retryAfterSec: number, opts?: RetryCallOpts) => void
 }
 
 /**
@@ -353,7 +359,7 @@ export function createRetryApiCall(
           // Persist the flood window so a restart during the ban can suppress
           // non-essential sends instead of extending it (#2923 circuit breaker).
           try {
-            onFloodWait?.(retryAfter)
+            onFloodWait?.(retryAfter, opts)
           } catch {
             /* best-effort — never let the breaker hook break the retry path */
           }

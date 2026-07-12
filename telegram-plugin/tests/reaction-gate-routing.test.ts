@@ -130,7 +130,12 @@ describe('#3155 reactions route through the send gate (cosmetic)', () => {
     // The reaction actually reached the API (was admitted, not shed)...
     expect(setMessageReaction).toHaveBeenCalled()
     // ...and its 429 was recorded by the breaker — the whole gap this closes.
-    expect(onFloodWait).toHaveBeenCalledWith(7)
+    // #3111: the retry policy now also passes the call's opts so the gateway can
+    // open a scope-precise window (a reaction 429 implies only that chat).
+    expect(onFloodWait).toHaveBeenCalledWith(
+      7,
+      expect.objectContaining({ chat_id: 'chatA', priorityClass: 'cosmetic' }),
+    )
   })
 })
 

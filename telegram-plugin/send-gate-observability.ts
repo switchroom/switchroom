@@ -29,14 +29,15 @@
  *     "was banned from X to Y" alert when the window CLOSES (or as soon as the
  *     operator chat becomes reachable again).
  *
- * STATUS OF THE IMMEDIATE PATH (today vs. after #3111)
- * ----------------------------------------------------
- * The immediate-delivery branch is present and unit-tested, but it does NOT
- * fire in production yet: `openScopedWindowsForOpts` opens a coincident `global`
- * window on every 429, so the operator chat is always "covered" while any ban is
- * active and every alert defers to close. It becomes live once #3111 makes
- * `onFloodWait` scope-precise. Until then the operator is alerted at window
- * CLOSE — once per incident, all scopes coalesced into one card (M1, #3112).
+ * STATUS OF THE IMMEDIATE PATH (live since #3111)
+ * -----------------------------------------------
+ * The immediate-delivery branch is present, unit-tested, AND now fires in
+ * production: as of #3111 a chat-scoped 429 opens ONLY that chat's window (no
+ * coincident `global`), so when a ban covers `chat:<other>` while the operator's
+ * own chat is clear, the alert is delivered IMMEDIATELY rather than deferred to
+ * close. A genuinely global 429 still opens `global`, so the operator chat is
+ * "covered" and the alert defers to close — once per incident, all scopes
+ * coalesced into one card (M1, #3112).
  *
  * At-most-once is anchored by the persisted `alertedAt` (survives restart). The
  * deferred close-alert is best-effort at-least-once: if the gateway is down for
@@ -312,11 +313,12 @@ export function createFloodWindowObserver(
       if (w.alertedAt != null) continue
       if (now - w.observedAt < alertThresholdMs) continue
       if (operatorReachable && !coversOperator(w, operatorChatId)) {
-        // NOTE (M1, #3112): this immediate-delivery branch is currently
-        // UNREACHABLE for recorder-produced state — `openScopedWindowsForOpts`
-        // opens a coincident `global` window on every 429, so `operatorReachable`
-        // is always false while any ban is active. It goes live once #3111 makes
-        // `onFloodWait` scope-precise. Kept + unit-tested as forward-looking.
+        // NOTE (M1, #3112 / #3111): this immediate-delivery branch is now LIVE
+        // for recorder-produced state. Since #3111 a chat-scoped 429 opens only
+        // that chat's window (no coincident `global`), so when a ban covers a
+        // chat OTHER than the operator's, `operatorReachable` is true and the
+        // alert is delivered here rather than deferred to close. A genuinely
+        // global 429 still opens `global`, keeping the operator "covered".
         // NOTE (L1, #3112): send-first, then persist `alertedAt`. A crash between
         // the delivered card and the disk write re-alerts on restart — a benign
         // duplicate. Deliberate: send-first guarantees an alert is never LOST,

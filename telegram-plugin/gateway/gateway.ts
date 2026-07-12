@@ -5495,15 +5495,20 @@ const sendGate = createSendGate({
 const probeFloodWaitRemainingMs = makeFloodWaitProbe(FLOOD_STATE_PATH)
 const rawRobustApiCall = createRetryApiCall({
   log: (line) => process.stderr.write(line),
-  onFloodWait: (retryAfterSec) => {
+  onFloodWait: (retryAfterSec, opts) => {
     // #2923/#3094 — persist the single-object global window (probe reads this).
     makeFloodWaitRecorder(FLOOD_STATE_PATH)(retryAfterSec)
-    // #3084 PR 2 — also open a GLOBAL send-gate window so cosmetic traffic sheds
-    // for the ban's duration even on a SHORT (slept-and-retried) 429 that never
-    // throws FLOOD_WAIT_ACTIVE. Scope-precise windows are opened by the gate's
-    // own FLOOD_WAIT_ACTIVE catch (which has the call's opts).
+    // #3084 PR 2 / #3111 — also open SCOPE-PRECISE send-gate window(s) so cosmetic
+    // traffic sheds for the ban's duration even on a SHORT (slept-and-retried)
+    // 429 that never throws FLOOD_WAIT_ACTIVE. The retry policy now passes the
+    // call's `opts` (#3111) so this opens the FINEST scope the 429 implies —
+    // `chat:`/`group:`/`msg-edit:` for a chat-bound call, `global` only when the
+    // call carries no chat scope (genuinely global) — instead of a blanket
+    // `global` window that would suppress unrelated chats. This mirrors the
+    // gate's own FLOOD_WAIT_ACTIVE catch, which uses the same scope-precise
+    // opener for LONG bans.
     try {
-      sendGate.openFloodWindow('global', Date.now() + Math.max(0, retryAfterSec) * 1000)
+      sendGate.openScopedFloodWindows(opts, Date.now() + Math.max(0, retryAfterSec) * 1000)
     } catch {
       /* best-effort — never let the window hook break the retry path */
     }
