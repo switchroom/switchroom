@@ -401,10 +401,23 @@ describe("createBrokerClient — token rejected (grant-expired / grant-revoked)"
     try {
       const client = createBrokerClient(slug, { socket: socketPath });
 
-      const keys = await client.list();
-      // Falls through to the no-token ACL-filtered list — empty in this
-      // harness (config.agents = {}), never a thrown error.
-      expect(Array.isArray(keys)).toBe(true);
+      // Expired token falls through to the standing no-token path and must
+      // NOT throw (only grant-revoked hard-denies). Awaiting here proves the
+      // no-throw contract — a VaultTokenRejectedError would fail the test.
+      const expiredKeys = await client.list();
+
+      // #1496 invariant, asserted directly: an expired (unusable) token must
+      // be no MORE restrictive than presenting no token at all. So an
+      // expired-token list must resolve to EXACTLY the same value a bare
+      // no-token list from this same caller resolves to. In this harness the
+      // caller has no per-agent socket identity, so on Linux the standing-ACL
+      // fall-through denies (#1192) and client.list() collapses that to null;
+      // on non-Linux it is the empty ACL-filtered array. Comparing to the
+      // no-token result asserts the real semantic outcome without baking in a
+      // platform-specific shape (the old `Array.isArray` check wrongly assumed
+      // the fall-through always returns an array — issue #3102).
+      const noTokenKeys = await createBrokerClient({ socket: socketPath }).list();
+      expect(expiredKeys).toEqual(noTokenKeys);
     } finally {
       try { fs.rmSync(path.dirname(tokenPath), { recursive: true, force: true }); } catch { /* ignore */ }
     }
