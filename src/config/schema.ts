@@ -1142,6 +1142,95 @@ export const TelegramChannelSchema = z
         "Increase if your gateway frequently bumps the Telegram edit-rate ceiling " +
         "with many parallel sub-agents; decrease for a more conservative buffer."
       ),
+    send_gate: z
+      .object({
+        enabled: z
+          .boolean()
+          .optional()
+          .describe(
+            "Master switch for the deterministic outbound send gate " +
+            "(telegram-plugin/send-gate.ts) — the token-bucket scheduler every " +
+            "Bot API call transits so per-surface throttles can't add up past a " +
+            "flood ceiling. ON by default. Precedence: the operator break-glass " +
+            "env var SWITCHROOM_TELEGRAM_SEND_GATE (0/false/off/no) ALWAYS wins " +
+            "when explicitly set; this key only decides when that env var is " +
+            "unset. Omit to keep the gate on."
+          ),
+        global_per_sec: z
+          .number()
+          .positive()
+          .optional()
+          .describe(
+            "Global bucket sustained rate (Bot API calls/sec across ALL chats). " +
+            "Default 25 (headroom under Telegram's ~30/s). Must be > 0 — a zero " +
+            "or negative rate would wedge all outbound sends. Omit to keep 25."
+          ),
+        global_burst: z
+          .number()
+          .int()
+          .positive()
+          .describe(
+            "Global bucket burst capacity. Default 4; worst-case 1s window " +
+            "admits global_burst + global_per_sec = 29 < 30, a real margin under " +
+            "the ceiling. Must be an integer >= 1 (a 0 capacity never admits a " +
+            "token and wedges sends). Omit to keep 4."
+          )
+          .optional(),
+        per_chat_per_sec: z
+          .number()
+          .positive()
+          .optional()
+          .describe(
+            "Per-chat sustained rate (calls/sec to a single chat). Default 1. " +
+            "Must be > 0 (zero/negative wedges that chat). Omit to keep 1."
+          ),
+        per_chat_burst: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe(
+            "Per-chat burst capacity. Default 3. Must be an integer >= 1 " +
+            "(0 wedges the chat's bucket). Omit to keep 3."
+          ),
+        per_group_per_min: z
+          .number()
+          .positive()
+          .optional()
+          .describe(
+            "Per-group sustained rate (calls/min to a single group/supergroup). " +
+            "Default 18 (headroom under Telegram's ~20/min group ceiling). Must " +
+            "be > 0. Omit to keep 18."
+          ),
+        per_group_burst: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe(
+            "Per-group burst capacity. Default 2. Must be an integer >= 1 " +
+            "(0 wedges the group's bucket). Omit to keep 2."
+          ),
+        edit_floor_ms: z
+          .number()
+          .int()
+          .nonnegative()
+          .optional()
+          .describe(
+            "Minimum ms between successive edits of the SAME message_id " +
+            "(last-write-wins coalescing enforces this floor). Default 1500 " +
+            "(Telegram's ~1 edit/sec/message practical ceiling). 0 disables the " +
+            "floor. Must be an integer >= 0. Omit to keep 1500."
+          ),
+      })
+      .optional()
+      .describe(
+        "Tunable rate limits for the deterministic outbound send gate " +
+        "(telegram-plugin/send-gate.ts). Every key is optional and defaults to " +
+        "the send gate's built-in value, so omitting the whole block reproduces " +
+        "today's exact behaviour — this is pure operator tuning, no default is " +
+        "changed. Cascades from defaults.channels.telegram.send_gate."
+      ),
     // progress_card block removed in #1122 PR3 (the pinned progress card
     // was replaced by conversational pacing + silence-poke). Existing
     // YAML files with a stale progress_card key will be silently

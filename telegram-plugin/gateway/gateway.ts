@@ -207,7 +207,7 @@ import {
   isPhotoDimensionRejectError,
   isFloodWaitActiveError,
 } from '../retry-api-call.js'
-import { createSendGate, sendGateEnabledFromEnv } from '../send-gate.js'
+import { createSendGate, sendGateConfigFromEnv } from '../send-gate.js'
 import { createStatsLogger, createFloodWindowObserver } from '../send-gate-observability.js'
 import { classifyPhotoFile, rerouteResultSuffix } from '../photo-precheck.js'
 import { installTgPostLogger, withTgPostTags } from '../shared/bot-runtime.js'
@@ -5468,8 +5468,14 @@ const recordFloodWindow = makeFloodWindowRecorder(FLOOD_WINDOWS_PATH)
 // ban never resends into an open window. onWindowOpen write-throughs every
 // runtime-opened window to FLOOD_WINDOWS_PATH; bootRamp starts the global
 // bucket at half capacity for 10s to absorb the boot-card burst.
+// Resolve enabled + the tunable rate limits (channels.telegram.send_gate.* →
+// SWITCHROOM_TG_SEND_GATE_* env) ONCE at boot. Unset knobs are absent, so
+// createSendGate applies SEND_GATE_DEFAULTS — omitting config = today's exact
+// behaviour. The SWITCHROOM_TELEGRAM_SEND_GATE break-glass valve still wins on
+// `enabled` when explicitly set (see sendGateConfigFromEnv precedence).
+const sendGateConfig = sendGateConfigFromEnv()
 const sendGate = createSendGate({
-  enabled: sendGateEnabledFromEnv(),
+  ...sendGateConfig,
   initialWindows: loadInitialFloodWindows(FLOOD_STATE_PATH, FLOOD_WINDOWS_PATH, Date.now()),
   bootRamp: {},
   onWindowOpen: (scopeKey, untilTs) => recordFloodWindow(scopeKey, untilTs),
@@ -5654,7 +5660,7 @@ const floodWindowObserver = createFloodWindowObserver({
     )
   },
 })
-if (sendGateEnabledFromEnv()) {
+if (sendGateConfig.enabled) {
   const observeTimer = setInterval(() => {
     try {
       sendGateStatsLogger.tick()

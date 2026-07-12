@@ -1957,6 +1957,41 @@ function channelsToEnv(agent: AgentConfig): Record<string, string> {
   if (tg.edit_budget_threshold !== undefined) {
     out.SWITCHROOM_TG_EDIT_BUDGET_THRESHOLD = String(tg.edit_budget_threshold);
   }
+  // Deterministic send-gate rate limits (channels.telegram.send_gate.*).
+  // Each knob is emitted only when explicitly set so the send gate's built-in
+  // compile-time default (send-gate.ts SEND_GATE_DEFAULTS) owns the unset case
+  // — omitting the whole block reproduces today's exact behaviour. The gateway
+  // resolves these via sendGateConfigFromEnv(). NOTE: `enabled` here is DISTINCT
+  // from the operator break-glass valve SWITCHROOM_TELEGRAM_SEND_GATE, which is
+  // never written by scaffold and always wins when explicitly set (see
+  // sendGateConfigFromEnv precedence).
+  const sg = tg.send_gate;
+  if (sg) {
+    if (sg.enabled !== undefined) {
+      out.SWITCHROOM_TG_SEND_GATE_ENABLED = sg.enabled ? "1" : "0";
+    }
+    if (sg.global_per_sec !== undefined) {
+      out.SWITCHROOM_TG_SEND_GATE_GLOBAL_PER_SEC = String(sg.global_per_sec);
+    }
+    if (sg.global_burst !== undefined) {
+      out.SWITCHROOM_TG_SEND_GATE_GLOBAL_BURST = String(sg.global_burst);
+    }
+    if (sg.per_chat_per_sec !== undefined) {
+      out.SWITCHROOM_TG_SEND_GATE_PER_CHAT_PER_SEC = String(sg.per_chat_per_sec);
+    }
+    if (sg.per_chat_burst !== undefined) {
+      out.SWITCHROOM_TG_SEND_GATE_PER_CHAT_BURST = String(sg.per_chat_burst);
+    }
+    if (sg.per_group_per_min !== undefined) {
+      out.SWITCHROOM_TG_SEND_GATE_PER_GROUP_PER_MIN = String(sg.per_group_per_min);
+    }
+    if (sg.per_group_burst !== undefined) {
+      out.SWITCHROOM_TG_SEND_GATE_PER_GROUP_BURST = String(sg.per_group_burst);
+    }
+    if (sg.edit_floor_ms !== undefined) {
+      out.SWITCHROOM_TG_SEND_GATE_EDIT_FLOOR_MS = String(sg.edit_floor_ms);
+    }
+  }
   // Whether to DELETE the activity/status feed when the final answer lands.
   // Default (unset) = keep it as a record; only emit the env when explicitly
   // set so the gateway's default-off parse owns the unset case.
