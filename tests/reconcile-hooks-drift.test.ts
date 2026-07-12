@@ -151,6 +151,16 @@ describe("buildSettingsHooksBlock", () => {
       e.hooks.some(h => h.command.includes("hindsight-mental-model-pretool.mjs")),
     );
     expect(mmEntry?.matcher).toBe("^mcp__hindsight__");
+
+    // Foreground turn-hog gate: registered and scoped to Bash; it denies
+    // effectively-unbounded foreground shapes (tail -f, watch, sleep > 30s,
+    // sleep-loops, gh --watch, log followers) with an instructive
+    // "re-run with run_in_background: true" message.
+    expect(preCmds.some(c => c.includes("foreground-hog-pretool.mjs"))).toBe(true);
+    const fgHogEntry = preHooks.find(e =>
+      e.hooks.some(h => h.command.includes("foreground-hog-pretool.mjs")),
+    );
+    expect(fgHogEntry?.matcher).toBe("^Bash$");
   });
 
   it("with user hooks declared merges them with switchroom-owned hooks", () => {

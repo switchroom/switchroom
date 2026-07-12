@@ -244,6 +244,17 @@ RUN chmod 0755 /opt/switchroom/hooks/skill-validate-pretool.mjs
 COPY dist/cli/hindsight-mental-model-pretool.mjs /opt/switchroom/hooks/hindsight-mental-model-pretool.mjs
 RUN chmod 0755 /opt/switchroom/hooks/hindsight-mental-model-pretool.mjs
 
+# Foreground turn-hog gate. A PreToolUse hook scoped to `^Bash$` that DENIES
+# effectively-unbounded FOREGROUND command shapes (tail -f, watch, sleep > 30s,
+# sleep-loops, gh --watch, docker/kubectl/journalctl followers) with an
+# instructive "re-run with run_in_background: true" message, so the turn is
+# never wedged behind an open-ended command. Backgrounded calls
+# (run_in_background: true) always pass. Not in the security-plugin: it's
+# turn-hygiene (responsiveness), not a load-bearing safety control. Kill
+# switch SWITCHROOM_FOREGROUND_HOG_GATE=0.
+COPY dist/cli/foreground-hog-pretool.mjs /opt/switchroom/hooks/foreground-hog-pretool.mjs
+RUN chmod 0755 /opt/switchroom/hooks/foreground-hog-pretool.mjs
+
 # Agent self-improvement Stop gate (RFC reference/rfcs/agent-self-improvement.md
 # slice 1). A cheap deterministic per-turn triage; on a learning signal
 # it injects a forked review turn via the gateway socket (inject_inbound,

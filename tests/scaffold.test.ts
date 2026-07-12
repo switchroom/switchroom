@@ -4566,6 +4566,39 @@ describe("secret-detect hook wiring", () => {
     expect(hook.timeout).toBe(10);
   });
 
+  it("wires foreground-hog-pretool.mjs scoped to ^Bash$", () => {
+    const agentConfig = makeAgentConfig();
+    const result = scaffoldAgent(
+      "sd-fghog-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+      makeConfig("sd-fghog-agent", agentConfig),
+    );
+    const settings = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+    const pre = settings.hooks.PreToolUse as Array<{
+      matcher?: string;
+      hooks: Array<{ command: string; timeout?: number }>;
+    }>;
+    const entry = pre.find((e) =>
+      e.hooks.some((h) => h.command.includes("foreground-hog-pretool.mjs")),
+    );
+    expect(entry).toBeDefined();
+    // Scoped so the stdin parse cost only lands on Bash calls.
+    expect(entry!.matcher).toBe("^Bash$");
+    const hook = entry!.hooks.find((h) =>
+      h.command.includes("foreground-hog-pretool.mjs"),
+    )!;
+    // Bundled hook path + node invocation, wrapped via run-hook.sh.
+    expect(hook.command).toMatch(/run-hook\.sh/);
+    expect(hook.command).toContain("node ");
+    expect(hook.command).toContain("/opt/switchroom/hooks/");
+    // Explicit short timeout — a pure tool_input gate never needs long.
+    expect(hook.timeout).toBe(10);
+  });
+
   it("preserves user-declared PreToolUse hooks alongside secret-guard", () => {
     const agentConfig = makeAgentConfig({
       hooks: { PreToolUse: [{ command: "/opt/audit.sh", timeout: 5 }] },

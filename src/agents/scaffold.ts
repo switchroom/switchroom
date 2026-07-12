@@ -5342,6 +5342,36 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
           ],
         },
         {
+          // Foreground turn-hog gate — deterministic safety net in the
+          // #3150 family (fail-closed deny on known-bad shapes, not a
+          // heuristic classifier). A foreground Bash call holds the whole
+          // session until it returns; this hook DENIES effectively-
+          // unbounded foreground shapes (tail -f/--follow, watch,
+          // sleep > 30s, sleep-in-a-loop, gh pr checks --watch / gh run
+          // watch, docker/kubectl logs -f, journalctl -f) with an
+          // instructive message: re-run with run_in_background: true or
+          // use a bounded alternative. run_in_background: true always
+          // passes; conservative by design so real build/test runs are
+          // never blocked. Default ON; kill switch
+          // SWITCHROOM_FOREGROUND_HOG_GATE=0 (send-gate convention).
+          // Matcher scoped to Bash so the stdin parse only lands there.
+          //
+          // DOCKER_BUNDLED_HOOKS_PATH: bundled via scripts/build.mjs from
+          // src/cli/foreground-hog-pretool.ts, mirroring
+          // hindsight-mental-model-pretool.
+          matcher: "^Bash$",
+          hooks: [
+            {
+              type: "command",
+              command: wrap(
+                "hook:foreground-hog-pretool",
+                `node "${join(DOCKER_BUNDLED_HOOKS_PATH, "foreground-hog-pretool.mjs")}"`,
+              ),
+              timeout: 10,
+            },
+          ],
+        },
+        {
           // Agent self-improvement APPLY-GUARD — RFC
           // reference/rfcs/agent-self-improvement.md slice 2. The
           // DETERMINISTIC T1 gate: when a self-improve review is pending
