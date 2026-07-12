@@ -2,6 +2,92 @@
 
 ## Unreleased
 
+## v0.18.17 — The broker keeps a per-tier usage ledger, and /model + /effort overrides become session-scoped
+
+The broker now remembers how much flagship (Fable) headroom every
+account has — a durable per-(account, tier) usage ledger harvested
+passively from the probes it already makes, powering both a smarter
+failover target choice and an instant `switchroom auth usage` answer for
+the operator. And the override lifecycle gets simpler and safer: a
+`/model` or `/effort` override lasts only for the current session and
+reverts to the configured `switchroom.yaml` default on any restart —
+consume-once carriers replace the keep/revert intent machinery.
+
+> Note: **v0.18.16 was never tagged or published** — its section below
+> is history only, and its contents ship for the first time in v0.18.17.
+
+### Auth — per-account, per-model-tier usage ledger (#3187, closes #3185)
+
+The broker already probes every account each fleet tick and reads
+Anthropic's unified rate-limit headers (standard 5h/7d off the haiku
+probe, premium `7d_oi` off the #3176 flagship canary) but kept only the
+LATEST snapshot per account — no history, no per-tier usage query. This
+adds a durable, rolling per-(account, tier) ledger, harvested passively
+at the existing capture points — zero added requests.
+
+- **`usage-ledger.ts` (new, pure):** per-tier sample extraction from
+  probe headers, a bounded rolling ring with a monotonic observation
+  count, refill-aware summaries (a passed reset reads as refilled → full
+  headroom, no extra probe), and a deterministic, order-stable
+  `bestPremiumHeadroomAccount` selector.
+- **`server.ts`:** `usage-ledger.json` persists across restarts; a
+  standard sample appends at `cacheQuotaSnapshot` and a premium sample
+  at `recordTierProbe`; list-state surfaces a refill-normalized
+  `usage_ledger` summary per account; and `nextPremiumEligibleAccount`
+  now prefers the eligible fallback with the most premium headroom
+  (ring-order-stable when the ledger has no data).
+- **`switchroom auth usage` (CLI):** renders per-account premium (Fable)
+  + standard headroom, peak and observation count from the ledger — the
+  operator's instant "how much Fable is left" answer, no live probe.
+- Tie-break is known-data-wins (documented): an unobserved account
+  carries zero information, and guessing it full could land flagship
+  traffic on an effectively-walled account (the #3176 429-storm class).
+  Tokens aren't carried by the headers, so the ledger records
+  utilization/reset/status; per-request token accounting is a documented
+  follow-up.
+
+### Telegram — session-scope `/model` overrides (consume-once, revert on restart) (#3184, fixes #3183)
+
+A `/model` override now lasts only for the current session and reverts
+to the configured `switchroom.yaml` `model:` on any restart, per
+operator decision 2026-07-12 (#3183) — reversing the rev-3
+keep-by-default contract (#3039).
+
+- **`.session-model` becomes a consume-once carrier:** start.sh applies
+  it on the single boot that reads it and then deletes it, so the
+  model-apply relaunch picks it up and every subsequent restart (deploy,
+  `/restart`, `/new`, watchdog recovery, crash, raw docker restart)
+  boots the configured default. The carrier is written ONLY immediately
+  before a relaunch that applies it; live Claude switches apply
+  in-session via the native picker and write NO carrier.
+- **Retires the moot machinery:** the `.relaunch-model-intent`
+  keep/revert subsystem and the `.session-model-boot-attempts` crashloop
+  self-heal (a consume-once carrier can crash at most one boot before it
+  is gone). start.sh cleans the retired trio on first boot after
+  rollout.
+- `/model default` still clears live; invalidation (corrupt carrier /
+  changed default / LiteLLM-down at the apply-boot) drops it and alerts
+  the operator. #3178's ack/trace/queue guarantees are preserved.
+
+### Telegram — session-scope `/effort` overrides (consume-once, revert on restart) (#3189, fixes #3186)
+
+Mirrors #3184's `/model` semantics for `/effort`, resolving the #3183
+open question:
+
+- A live `/effort <level>` still applies immediately but records
+  IN MEMORY only — no durable carrier — so start.sh's explicit
+  `--effort <configured>` reverts it on the next boot.
+- **`.session-effort` remains solely as the queued-command shutdown
+  carrier** (a mid-turn `/effort` carried across the bounce) and becomes
+  consume-once, with the same crash-recovery exception as `/model`.
+- start.sh records the effective launched effort to
+  `.active-session-effort`; the gateway re-hydrates the in-memory
+  override at boot so the `/effort` menu highlight stays honest after a
+  queued-carrier apply-boot.
+- The CONFIGURED default resolution is untouched (#3186 constraint): the
+  fleet `thinking_effort: low` pin (#1978) resolves exactly as before.
+  Ack/menu/help copy now says the override lasts until the next restart.
+
 ## v0.18.16 — The send gate governs every stream edit, a flagship-tier quota wall stops storming the walled account, and typed /model always leaves a trace
 
 The through-line is flood-ban and fleet-availability hardening. The
