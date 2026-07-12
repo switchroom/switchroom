@@ -576,6 +576,27 @@ describe('#2923 — LOCAL resource exhaustion is NOT retried (avoids flood ban)'
     expect(out).toBe('ok')
     expect(seen).toEqual([42])
   })
+
+  it('passes the call opts to onFloodWait so the gateway can open a scope-precise window (#3111)', async () => {
+    const seen: { sec: number; chat_id?: string; chatType?: string }[] = []
+    const sleep = vi.fn(async () => {})
+    let n = 0
+    const retry = createRetryApiCall({
+      maxRetries: 3,
+      sleep,
+      onFloodWait: (sec, opts) => seen.push({ sec, chat_id: opts?.chat_id, chatType: opts?.chatType }),
+    })
+    const out = await retry(
+      async () => {
+        if (n++ === 0) throw errors.floodWait(7)
+        return 'ok'
+      },
+      { chat_id: '42', chatType: 'supergroup' },
+    )
+    expect(out).toBe('ok')
+    // The hook received the same chat scope the send carried — not a bare number.
+    expect(seen).toEqual([{ sec: 7, chat_id: '42', chatType: 'supergroup' }])
+  })
 })
 
 describe('#3084 — a long flood ban fails FAST instead of sleeping for hours', () => {

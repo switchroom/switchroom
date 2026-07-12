@@ -304,6 +304,21 @@ export interface SendGateConfig {
    * `initialWindows` applied at construction (those already came from disk).
    */
   onWindowOpen?: (scopeKey: string, untilTs: number) => void
+  /**
+   * Conservative flood-scope posture (#3111). When `false` (the DEFAULT), a 429
+   * on a call bound to a specific chat opens ONLY that chat's (and, for groups,
+   * that group's) flood window — NOT a blanket `global` window — so a genuinely
+   * chat-scoped 429 (e.g. a per-group 20/min limit) cannot fail-fast CRITICAL
+   * sends to every other chat. `global` is opened only when the 429 carries no
+   * finer scope (no `chat_id`), i.e. the evidence is genuinely global.
+   *
+   * When `true`, the pre-#3111 posture is restored: EVERY 429 additionally opens
+   * the `global` window. Telegram 429s are per-bot-token, so a flood often IS
+   * global; an operator who prefers to over-suppress rather than risk a missed
+   * global ban can opt back in via
+   * `SWITCHROOM_TG_SEND_GATE_CONSERVATIVE_GLOBAL=1`.
+   */
+  conservativeGlobalFloodScope?: boolean
 }
 
 /**
@@ -462,6 +477,15 @@ export interface SendGate {
    * by PR 2 on a 429 and at boot from the persisted `flood-wait.json`.
    */
   openFloodWindow(scopeKey: string, untilTs: number): void
+  /**
+   * Open the SCOPE-PRECISE flood windows a 429 on a call with these `opts`
+   * implies (#3111). Used by the gateway's `onFloodWait` hook, which sees a
+   * SHORT slept-and-retried 429 the gate's own `FLOOD_WAIT_ACTIVE` catch never
+   * observes. Opens `global` only when `opts` carries no `chat_id` (genuinely
+   * global evidence) or the conservative posture is on — so a chat-scoped 429
+   * does not suppress unrelated chats. A pure no-op when the gate is disabled.
+   */
+  openScopedFloodWindows(opts: SendGateOpts | undefined, untilTs: number): void
   /** Snapshot of counters + current bucket fill. */
   stats(): SendGateStats
 }
@@ -512,6 +536,7 @@ export function createSendGate(config: SendGateConfig): SendGate {
   const criticalJitterMaxMs = config.criticalJitterMaxMs ?? 250
   const jitter = config.jitter ?? Math.random
   const onWindowOpen = config.onWindowOpen
+  const conservativeGlobalFloodScope = config.conservativeGlobalFloodScope ?? false
 
   const counters: BucketCounters = {
     sent: 0,
@@ -624,18 +649,35 @@ export function createSendGate(config: SendGateConfig): SendGate {
   }
 
   /**
-   * Open all scope windows implied by a call's `opts` at `untilTs` — global,
-   * plus per-chat / per-group / per-message where keyed. Called when a wrapped
-   * send surfaces a `FLOOD_WAIT_ACTIVE` (a real 429 or a pre-call
-   * short-circuit) so the ban is remembered at the finest scope we know
-   * (part3-design §7). Global is always opened as the conservative floor.
+   * Open the flood windows a 429 on this call implies at `untilTs`, at the
+   * FINEST scope the evidence supports (#3111). Called when a wrapped send
+   * surfaces a `FLOOD_WAIT_ACTIVE` (a real 429 or a pre-call short-circuit), and
+   * by the gateway's `onFloodWait` hook for a SHORT slept-and-retried 429 (via
+   * the public `openScopedFloodWindows`), so the ban is remembered at the finest
+   * scope we know (part3-design §7).
+   *
+   * SCOPE PRECISION (#3111): a call bound to a specific `chat_id` opens ONLY that
+   * chat's (and, for groups, that group's) window — NOT a blanket `global`
+   * window that would suppress unrelated chats. `global` is opened only when the
+   * call carries NO finer scope (no `chat_id`) — i.e. the evidence is genuinely
+   * global — OR when `conservativeGlobalFloodScope` restores the pre-#3111
+   * always-open-global posture. Telegram 429s are per-bot-token so a flood is
+   * OFTEN global, but a genuinely chat-scoped 429 (e.g. a per-group 20/min
+   * limit) must not fail-fast CRITICAL sends to every other chat. The
+   * per-message (`msg-edit:`) window is additive whenever a `messageId` is
+   * present. Monotonic/idempotent: `applyWindow` only ever extends.
    */
   function openScopedWindowsForOpts(opts: SendGateOpts | undefined, untilTs: number): void {
-    applyWindow('global', untilTs, true)
-    if (opts?.chat_id) {
-      applyWindow(`chat:${opts.chat_id}`, untilTs, true)
-      if (opts.chatType && GROUP_TYPES.has(opts.chatType)) {
-        applyWindow(`group:${opts.chat_id}`, untilTs, true)
+    const hasChatScope = opts?.chat_id != null && opts.chat_id !== ''
+    // Open `global` only when the 429 has no finer scope (genuinely global), or
+    // when the operator opted into the conservative always-global posture.
+    if (!hasChatScope || conservativeGlobalFloodScope) {
+      applyWindow('global', untilTs, true)
+    }
+    if (hasChatScope) {
+      applyWindow(`chat:${opts!.chat_id}`, untilTs, true)
+      if (opts!.chatType && GROUP_TYPES.has(opts!.chatType)) {
+        applyWindow(`group:${opts!.chat_id}`, untilTs, true)
       }
     }
     if (opts?.messageId != null) {
@@ -1094,7 +1136,18 @@ export function createSendGate(config: SendGateConfig): SendGate {
     }
   }
 
-  return { gate, openFloodWindow, stats }
+  /**
+   * Public, scope-precise window opener for the gateway's `onFloodWait` hook
+   * (#3111). Flag-OFF is a pure no-op (mirrors `openFloodWindow`'s M3 guard) so
+   * a 429 never mutates suppression or writes `flood-windows.json` while the gate
+   * is disabled.
+   */
+  function openScopedFloodWindows(opts: SendGateOpts | undefined, untilTs: number): void {
+    if (!enabled) return
+    openScopedWindowsForOpts(opts, untilTs)
+  }
+
+  return { gate, openFloodWindow, openScopedFloodWindows, stats }
 }
 
 /**
@@ -1139,6 +1192,19 @@ function parseNonNegativeInt(raw: string | undefined): number | undefined {
 }
 
 /**
+ * Parse a boolean env flag using the repo's on/off grammar
+ * (`1/true/on/yes` → true, `0/false/off/no` → false). Blank or unrecognised →
+ * undefined so the caller keeps its built-in default (#3111).
+ */
+function parseBoolFlag(raw: string | undefined): boolean | undefined {
+  if (raw == null || raw.trim() === '') return undefined
+  const t = raw.trim().toLowerCase()
+  if (t === '1' || t === 'true' || t === 'on' || t === 'yes') return true
+  if (isOffValue(t)) return false
+  return undefined
+}
+
+/**
  * The resolved rate-limit + enable slice `createSendGate` consumes, sourced
  * from env (which the scaffold populates from `channels.telegram.send_gate.*`).
  * Only fields the operator SET are present; an unset rate field is absent so
@@ -1156,6 +1222,7 @@ export type SendGateEnvConfig = Pick<SendGateConfig, 'enabled'> &
       | 'perGroupPerMin'
       | 'perGroupBurst'
       | 'editFloorMs'
+      | 'conservativeGlobalFloodScope'
     >
   >
 
@@ -1203,6 +1270,10 @@ export function sendGateConfigFromEnv(
   if (perGroupBurst !== undefined) out.perGroupBurst = perGroupBurst
   const editFloorMs = parseNonNegativeInt(env.SWITCHROOM_TG_SEND_GATE_EDIT_FLOOR_MS)
   if (editFloorMs !== undefined) out.editFloorMs = editFloorMs
+  // #3111 break-glass: restore the pre-#3111 always-open-global flood posture.
+  // Unset ⇒ scope-precise default (global opened only on genuinely global 429s).
+  const conservativeGlobal = parseBoolFlag(env.SWITCHROOM_TG_SEND_GATE_CONSERVATIVE_GLOBAL)
+  if (conservativeGlobal !== undefined) out.conservativeGlobalFloodScope = conservativeGlobal
 
   return out
 }

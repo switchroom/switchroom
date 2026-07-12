@@ -103,9 +103,10 @@ describe('#3084 scoped flood-window persistence', () => {
       ),
     ).rejects.toBe(floodErr)
 
-    // The window is on disk.
+    // The window is on disk. #3111: a chat-bound 429 persists ONLY the chat
+    // scope — no coincident `global` window that would suppress unrelated chats.
     const persisted = readFloodWindows(winPath, 0)
-    expect(persisted.map((w) => w.scopeKey).sort()).toEqual(['chat:7', 'global'])
+    expect(persisted.map((w) => w.scopeKey).sort()).toEqual(['chat:7'])
 
     // Gate 2 (simulated restart): built BEFORE any outbound call from the
     // persisted windows. A cosmetic send on chat:7 must still shed.

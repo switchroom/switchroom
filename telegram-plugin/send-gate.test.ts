@@ -207,6 +207,30 @@ describe('send-gate: sendGateConfigFromEnv (yaml → env → createSendGate)', (
     ).toBeUndefined()
   })
 
+  it('maps the #3111 conservative-global flood-scope break-glass flag', () => {
+    // Unset ⇒ absent (scope-precise default; createSendGate falls back to false).
+    expect(
+      sendGateConfigFromEnv(E({})).conservativeGlobalFloodScope,
+    ).toBeUndefined()
+    // On-values ⇒ true (restore pre-#3111 always-open-global posture).
+    for (const on of ['1', 'true', 'on', 'yes']) {
+      expect(
+        sendGateConfigFromEnv(E({ SWITCHROOM_TG_SEND_GATE_CONSERVATIVE_GLOBAL: on }))
+          .conservativeGlobalFloodScope,
+      ).toBe(true)
+    }
+    // Off-values ⇒ explicit false.
+    expect(
+      sendGateConfigFromEnv(E({ SWITCHROOM_TG_SEND_GATE_CONSERVATIVE_GLOBAL: '0' }))
+        .conservativeGlobalFloodScope,
+    ).toBe(false)
+    // Unrecognised ⇒ absent (defensive net).
+    expect(
+      sendGateConfigFromEnv(E({ SWITCHROOM_TG_SEND_GATE_CONSERVATIVE_GLOBAL: 'nonsense' }))
+        .conservativeGlobalFloodScope,
+    ).toBeUndefined()
+  })
+
   describe('enabled precedence: break-glass valve > config > default-on', () => {
     it('config send_gate.enabled decides when the env valve is unset', () => {
       expect(sendGateConfigFromEnv(E({ SWITCHROOM_TG_SEND_GATE_ENABLED: '0' })).enabled).toBe(false)

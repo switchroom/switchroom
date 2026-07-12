@@ -566,11 +566,162 @@ describe('send-gate PR2: opening a window from a 429, and persistence hook', () 
     ).rejects.toBe(floodErr)
 
     const scopes = opened.map((o) => o.scopeKey).sort()
+    // #3111: a chat-bound 429 opens ONLY the chat/group/msg-edit scopes — NOT a
+    // coincident `global` window (which would suppress unrelated chats).
     // H1: msg-edit scope carries the chat_id (msg-edit:7:3), not the bare id.
-    expect(scopes).toEqual(['chat:7', 'global', 'group:7', 'msg-edit:7:3'])
+    expect(scopes).toEqual(['chat:7', 'group:7', 'msg-edit:7:3'])
     // After the window opens, a later cosmetic on the same chat sheds.
     const shed = await gate.gate(async () => 'x', { chat_id: '7', priorityClass: 'cosmetic' })
     expect(shed).toBe(SEND_GATE_SHED)
     expect(gate.stats().global.shed).toBe(1)
+  })
+})
+
+describe('send-gate #3111: scope-precise flood windows', () => {
+  // A structured FLOOD_WAIT_ACTIVE the wrapped `fn` throws to simulate a 429
+  // whose remaining window (`untilTs`) exceeds the fail-fast ceiling.
+  function floodErrUntil(untilTs: number) {
+    const sec = Math.ceil(untilTs / 1000)
+    return Object.assign(new Error('FLOOD_WAIT_ACTIVE'), {
+      retryAfterSec: sec,
+      untilTs,
+      error_code: 429 as const,
+      parameters: { retry_after: sec },
+      original: null,
+    })
+  }
+
+  it('a chat:A 429 suppresses only chat:A — an unrelated chat:B critical still sends', async () => {
+    const clock = new FakeClock()
+    const opened: string[] = []
+    const gate = createSendGate({
+      enabled: true,
+      clock,
+      criticalFailFastMs: 60_000,
+      onWindowOpen: (scopeKey) => opened.push(scopeKey),
+    })
+
+    // A LONG (10-min) 429 on chat:A opens the flood window via the gate's catch.
+    const floodErr = floodErrUntil(600_000)
+    await expect(
+      gate.gate(
+        async () => {
+          throw floodErr
+        },
+        { chat_id: 'A', priorityClass: 'critical' },
+      ),
+    ).rejects.toBe(floodErr)
+
+    // Only chat:A was suppressed — pre-#3111 this ALSO opened `global`.
+    expect(opened.sort()).toEqual(['chat:A'])
+    // The 429 came from `fn`, not a fail-fast admission.
+    expect(gate.stats().global.failedFast).toBe(0)
+
+    // An unrelated chat:B critical is NOT fail-fasted — it sends. Pre-#3111 the
+    // coincident global window would have fail-fasted this critical too.
+    const bResult = await gate.gate(async () => 'B-sent', {
+      chat_id: 'B',
+      priorityClass: 'critical',
+    })
+    expect(bResult).toBe('B-sent')
+    expect(gate.stats().global.failedFast).toBe(0)
+    expect(gate.stats().global.sent).toBe(1)
+
+    // A chat:A critical IS fail-fasted — its window exceeds the ceiling.
+    let caught: unknown
+    await gate
+      .gate(async () => 'A-sent', { chat_id: 'A', priorityClass: 'critical' })
+      .catch((e) => {
+        caught = e
+      })
+    expect(isFloodWaitActiveError(caught)).toBe(true)
+    expect(gate.stats().global.failedFast).toBe(1)
+    // chat:B's critical really was the only additional send.
+    expect(gate.stats().global.sent).toBe(1)
+  })
+
+  it('a global 429 (no chat scope) still opens the global window and suppresses everywhere', async () => {
+    const clock = new FakeClock()
+    const opened: string[] = []
+    const gate = createSendGate({
+      enabled: true,
+      clock,
+      onWindowOpen: (scopeKey) => opened.push(scopeKey),
+    })
+
+    // A 429 on a call with NO chat_id → the evidence IS global.
+    const floodErr = floodErrUntil(HOUR)
+    await expect(
+      gate.gate(
+        async () => {
+          throw floodErr
+        },
+        { priorityClass: 'critical' },
+      ),
+    ).rejects.toBe(floodErr)
+
+    expect(opened).toEqual(['global'])
+    // An unrelated chat's cosmetic sheds — global covers every scope.
+    const shed = await gate.gate(async () => 'x', { chat_id: 'Z', priorityClass: 'cosmetic' })
+    expect(shed).toBe(SEND_GATE_SHED)
+    expect(gate.stats().global.shed).toBe(1)
+  })
+
+  it('conservativeGlobalFloodScope restores the pre-#3111 always-open-global posture', async () => {
+    const clock = new FakeClock()
+    const opened: string[] = []
+    const gate = createSendGate({
+      enabled: true,
+      clock,
+      conservativeGlobalFloodScope: true,
+      onWindowOpen: (scopeKey) => opened.push(scopeKey),
+    })
+
+    const floodErr = floodErrUntil(HOUR)
+    await expect(
+      gate.gate(
+        async () => {
+          throw floodErr
+        },
+        { chat_id: 'A', priorityClass: 'critical' },
+      ),
+    ).rejects.toBe(floodErr)
+
+    // Conservative posture: a chat-bound 429 ALSO opens the global window.
+    expect(opened.sort()).toEqual(['chat:A', 'global'])
+  })
+
+  it('openScopedFloodWindows (the gateway onFloodWait seam) opens scope-precise windows', async () => {
+    const clock = new FakeClock()
+    const opened: string[] = []
+    const gate = createSendGate({
+      enabled: true,
+      clock,
+      onWindowOpen: (scopeKey) => opened.push(scopeKey),
+    })
+
+    // Simulates the gateway's onFloodWait hook for a SHORT slept-and-retried 429
+    // on a supergroup chat — the gate's own FLOOD_WAIT_ACTIVE catch never fires
+    // for those, so this seam must carry the scope precision.
+    gate.openScopedFloodWindows({ chat_id: '9', chatType: 'supergroup' }, HOUR)
+    expect(opened.sort()).toEqual(['chat:9', 'group:9'])
+
+    // A no-chat-scope 429 opens global.
+    opened.length = 0
+    gate.openScopedFloodWindows(undefined, HOUR)
+    expect(opened).toEqual(['global'])
+  })
+
+  it('openScopedFloodWindows is a pure no-op when the gate is disabled', async () => {
+    const clock = new FakeClock()
+    const opened: string[] = []
+    const gate = createSendGate({
+      enabled: false,
+      clock,
+      onWindowOpen: (scopeKey) => opened.push(scopeKey),
+    })
+    gate.openScopedFloodWindows({ chat_id: 'A' }, HOUR)
+    gate.openScopedFloodWindows(undefined, HOUR)
+    expect(opened).toEqual([])
   })
 })
