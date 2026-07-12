@@ -69,7 +69,7 @@ describe('stream-reply single-mode reuse (#2669)', () => {
     expect(bot.api.editMessageText).toHaveBeenCalled()
   })
 
-  it('the rich path ships raw GFM markdown unescaped via sendRichMessage', async () => {
+  it('the rich path ships GFM markdown unescaped via sendRichMessage', async () => {
     const state = makeState()
     const deps = makeDeps(bot)
 
@@ -77,8 +77,10 @@ describe('stream-reply single-mode reuse (#2669)', () => {
 
     expect(bot.state.sent).toHaveLength(1)
     expect(bot.state.sent[0].rich).toBe(true)
-    // Raw markdown is the wire payload — no HTML, no MarkdownV2 escaping.
-    expect(bot.state.sent[0].text).toBe('**bold** and _italic_')
+    // GFM markdown is the wire payload — no HTML, no MarkdownV2 escaping.
+    // The default-on rich renderer normalises the italic marker
+    // (`_italic_` -> `*italic*`, same wire entity).
+    expect(bot.state.sent[0].text).toBe('**bold** and *italic*')
     expect(bot.state.sent[0].parse_mode).toBeUndefined()
   })
 

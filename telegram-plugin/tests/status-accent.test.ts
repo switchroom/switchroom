@@ -91,8 +91,10 @@ describe('handleStreamReply accent integration', () => {
     await pending
 
     const sent = sentMarkdown(bot)
-    expect(sent).toMatch(/^🔵 _In progress…_\n\n/)
-    expect(sent).toBe('🔵 _In progress…_\n\nStill working...')
+    // The default-on rich renderer normalises the italic marker
+    // (`_In progress…_` -> `*In progress…*`, same wire entity).
+    expect(sent).toMatch(/^🔵 \*In progress…\*\n\n/)
+    expect(sent).toBe('🔵 *In progress…*\n\nStill working...')
   })
 
   it("accent='done' prepends the checkmark markdown header before the body", async () => {
@@ -176,6 +178,6 @@ describe('handleStreamReply accent integration', () => {
     await microtaskFlush()
     await p2
 
-    expect(editedMarkdown(bot)).toBe('🔵 _In progress…_\n\nPart one Part two')
+    expect(editedMarkdown(bot)).toBe('🔵 *In progress…*\n\nPart one Part two')
   })
 })
