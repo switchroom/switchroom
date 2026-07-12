@@ -2,6 +2,9 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mkdtempSync, statSync, rmSync, existsSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+// bun-only (this file is vitest-excluded and runs under `bun test`): used to
+// build an OLD-schema DB file for the additive-migration test.
+import { Database } from 'bun:sqlite'
 import {
   initHistory,
   recordInbound,
@@ -713,5 +716,134 @@ describe('secret redaction at persistence (both directions)', () => {
       text: 'hello, how are you?',
     })
     expect(query({ chat_id: '-100' })[0]!.text).toBe('hello, how are you?')
+  })
+})
+
+describe('forwarded-message origin columns', () => {
+  it('round-trips forwarded_* fields on an inbound row', () => {
+    initHistory(stateDir, 30)
+    recordInbound({
+      chat_id: '-100',
+      thread_id: null,
+      message_id: 7,
+      user: 'alice',
+      user_id: '111',
+      ts: 1000,
+      text: 'fwd: look at this',
+      forwarded_from: 'Release Notes (@relnotes)',
+      forwarded_from_type: 'channel',
+      forwarded_from_id: '-100400500',
+      forwarded_date: '2026-06-15T13:46:40.000Z',
+      forwarded_message_id: 555,
+    })
+    const row = query({ chat_id: '-100' })[0]!
+    expect(row).toMatchObject({
+      forwarded_from: 'Release Notes (@relnotes)',
+      forwarded_from_type: 'channel',
+      forwarded_from_id: '-100400500',
+      forwarded_date: '2026-06-15T13:46:40.000Z',
+      forwarded_message_id: 555,
+    })
+  })
+
+  it('non-forwarded inbound stores NULL origin fields', () => {
+    initHistory(stateDir, 30)
+    recordInbound({
+      chat_id: '-100',
+      thread_id: null,
+      message_id: 8,
+      user: 'alice',
+      user_id: '111',
+      ts: 1000,
+      text: 'plain message',
+    })
+    const row = query({ chat_id: '-100' })[0]!
+    expect(row.forwarded_from).toBeNull()
+    expect(row.forwarded_from_type).toBeNull()
+    expect(row.forwarded_from_id).toBeNull()
+    expect(row.forwarded_date).toBeNull()
+    expect(row.forwarded_message_id).toBeNull()
+  })
+
+  it('migrates additively: pre-existing DB without the columns gains them and round-trips', () => {
+    // Build an OLD-schema DB file the way a pre-forward-origin build would
+    // have left it: messages table without any forwarded_* columns, one row
+    // already stored.
+    const dbPath = join(stateDir, 'history.db')
+    const old = new Database(dbPath, { create: true })
+    old.exec(`
+      CREATE TABLE IF NOT EXISTS messages (
+        chat_id        TEXT    NOT NULL,
+        thread_id      INTEGER,
+        message_id     INTEGER NOT NULL,
+        role           TEXT    NOT NULL,
+        user           TEXT,
+        user_id        TEXT,
+        ts             INTEGER NOT NULL,
+        text           TEXT    NOT NULL,
+        attachment_kind TEXT,
+        group_id       INTEGER,
+        reply_to_message_id INTEGER,
+        reply_to_text  TEXT,
+        PRIMARY KEY (chat_id, thread_id, message_id)
+      )
+    `)
+    // Recent ts — initHistory's retention sweep deletes rows older than the
+    // cutoff, and this test is about migration, not retention.
+    const now = Math.floor(Date.now() / 1000)
+    old.exec(
+      `INSERT INTO messages (chat_id, thread_id, message_id, role, user, user_id, ts, text) ` +
+      `VALUES ('-100', NULL, 1, 'user', 'alice', '111', ${now - 60}, 'pre-migration row')`,
+    )
+    old.close()
+
+    // Re-open through the real init path — the additive ALTER TABLE loop
+    // must add the forwarded_* columns without touching existing rows.
+    initHistory(stateDir, 30)
+
+    const oldRow = query({ chat_id: '-100' })[0]!
+    expect(oldRow.text).toBe('pre-migration row')
+    expect(oldRow.forwarded_from).toBeNull()
+
+    recordInbound({
+      chat_id: '-100',
+      thread_id: null,
+      message_id: 2,
+      user: 'alice',
+      user_id: '111',
+      ts: now,
+      text: 'forwarded after migration',
+      forwarded_from: 'Ada Lovelace (@adalove)',
+      forwarded_from_type: 'user',
+      forwarded_from_id: '42',
+      forwarded_date: '2026-06-15T13:46:40.000Z',
+    })
+    const rows = query({ chat_id: '-100' })
+    expect(rows).toHaveLength(2)
+    const fwd = rows.find((r) => r.message_id === 2)!
+    expect(fwd.forwarded_from).toBe('Ada Lovelace (@adalove)')
+    expect(fwd.forwarded_from_type).toBe('user')
+    expect(fwd.forwarded_from_id).toBe('42')
+    expect(fwd.forwarded_date).toBe('2026-06-15T13:46:40.000Z')
+    expect(fwd.forwarded_message_id).toBeNull()
+  })
+
+  it('hostile origin name is stored raw but secret-redacted (backstop)', () => {
+    initHistory(stateDir, 30)
+    // Raw XML metacharacters are EXPECTED here — escaping belongs to the
+    // channel-meta lane, the history buffer stores what the user saw.
+    recordInbound({
+      chat_id: '-100',
+      thread_id: null,
+      message_id: 9,
+      user: 'alice',
+      user_id: '111',
+      ts: 1000,
+      text: 'fwd',
+      forwarded_from: '<b>"Bob"&\'friends\'</b>',
+      forwarded_from_type: 'user',
+      forwarded_from_id: '42',
+    })
+    expect(query({ chat_id: '-100' })[0]!.forwarded_from).toBe('<b>"Bob"&\'friends\'</b>')
   })
 })

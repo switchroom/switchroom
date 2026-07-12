@@ -108,6 +108,23 @@ export interface RecordedMessage {
    * Only emoji reactions are tracked — custom emoji are ignored for v1.
    */
   user_reaction: string | null
+  /**
+   * Set when the inbound user message was FORWARDED: the server-stamped
+   * `forward_origin` of the original message (Bot API 7.0+), so
+   * get_recent_messages can surface who originally sent the content the
+   * agent saw at delivery time. `forwarded_from` is the raw (truncated,
+   * unescaped) human-readable name/title; `forwarded_from_type` is
+   * user|hidden_user|chat|channel (hidden_user = self-reported display
+   * name, no verifiable id); `forwarded_from_id` is the numeric id when
+   * the origin shape exposes one; `forwarded_date` is the original
+   * message's ISO timestamp; `forwarded_message_id` is the message id
+   * inside the origin channel (channel origins only).
+   */
+  forwarded_from: string | null
+  forwarded_from_type: string | null
+  forwarded_from_id: string | null
+  forwarded_date: string | null
+  forwarded_message_id: number | null
 }
 
 export interface QueryOptions {
@@ -166,10 +183,20 @@ export function initHistory(stateDir: string, retentionDays = 30): void {
     CREATE INDEX IF NOT EXISTS idx_messages_recent
       ON messages (chat_id, thread_id, ts DESC)
   `)
-  // Migration: add reply_to columns to existing DBs that pre-date issue #119.
-  // SQLite has no IF NOT EXISTS for ALTER TABLE ADD COLUMN, so we tolerate
-  // "duplicate column name" errors and re-throw anything else.
-  for (const column of ["reply_to_message_id INTEGER", "reply_to_text TEXT", "user_reaction TEXT"]) {
+  // Migration: add reply_to columns to existing DBs that pre-date issue #119,
+  // and the forwarded_* origin columns (forward_origin metadata) to DBs that
+  // pre-date them. SQLite has no IF NOT EXISTS for ALTER TABLE ADD COLUMN, so
+  // we tolerate "duplicate column name" errors and re-throw anything else.
+  for (const column of [
+    "reply_to_message_id INTEGER",
+    "reply_to_text TEXT",
+    "user_reaction TEXT",
+    "forwarded_from TEXT",
+    "forwarded_from_type TEXT",
+    "forwarded_from_id TEXT",
+    "forwarded_date TEXT",
+    "forwarded_message_id INTEGER",
+  ]) {
     try {
       db.exec(`ALTER TABLE messages ADD COLUMN ${column}`)
     } catch (err) {
@@ -349,6 +376,19 @@ interface RecordInboundArgs {
    */
   reply_to_message_id?: number | null | undefined
   reply_to_text?: string | null | undefined
+  /**
+   * If the message was forwarded, the server-stamped origin metadata
+   * (Bot API 7.0 `forward_origin`). Populated from
+   * `ctx.message.forward_origin` in the gateway handler. `forwarded_from`
+   * is the RAW (truncated, unescaped) name — the XML-escaped form goes to
+   * the channel meta only. `forwarded_date` is the origin message's ISO
+   * timestamp; `forwarded_message_id` is set for channel origins only.
+   */
+  forwarded_from?: string | null | undefined
+  forwarded_from_type?: string | null | undefined
+  forwarded_from_id?: string | null | undefined
+  forwarded_date?: string | null | undefined
+  forwarded_message_id?: number | null | undefined
 }
 
 /**
@@ -364,8 +404,8 @@ export function recordInbound(args: RecordInboundArgs): void {
   if (args.message_id == null) return
   const stmt = requireDb().prepare(`
     INSERT OR REPLACE INTO messages
-      (chat_id, thread_id, message_id, role, user, user_id, ts, text, attachment_kind, group_id, reply_to_message_id, reply_to_text)
-    VALUES (?, ?, ?, 'user', ?, ?, ?, ?, ?, NULL, ?, ?)
+      (chat_id, thread_id, message_id, role, user, user_id, ts, text, attachment_kind, group_id, reply_to_message_id, reply_to_text, forwarded_from, forwarded_from_type, forwarded_from_id, forwarded_date, forwarded_message_id)
+    VALUES (?, ?, ?, 'user', ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)
   `)
   // Defense-in-depth: never persist a detected secret to the message store.
   // The inbound gate (server.ts handleInbound) already deletes + vaults a
@@ -382,6 +422,13 @@ export function recordInbound(args: RecordInboundArgs): void {
     args.attachment_kind ?? null,
     args.reply_to_message_id ?? null,
     args.reply_to_text != null ? redact(args.reply_to_text) : (args.reply_to_text ?? null),
+    // Origin names/titles are user-controlled display strings; run them
+    // through the same secret-redaction backstop as message text.
+    args.forwarded_from != null ? redact(args.forwarded_from) : null,
+    args.forwarded_from_type ?? null,
+    args.forwarded_from_id ?? null,
+    args.forwarded_date ?? null,
+    args.forwarded_message_id ?? null,
   )
 }
 
