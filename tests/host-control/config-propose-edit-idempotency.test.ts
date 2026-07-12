@@ -221,12 +221,24 @@ describe("property — re-fired identical proposals: exactly-once apply, always 
   const verdicts: ApprovalVerdict[] = ["approve", "deny", "timeout"];
   const ITERATIONS = 60;
 
-  it(`holds invariants across ${ITERATIONS} fuzzed schedules`, async () => {
+  it(
+    `holds invariants across ${ITERATIONS} fuzzed schedules`,
+    async () => {
     const rand = lcg(0xc0ffee);
     for (let i = 0; i < ITERATIONS; i++) {
       const verdict = verdicts[Math.floor(rand() * verdicts.length)]!;
       const burst = 2 + Math.floor(rand() * 3); // 2..4 identical re-fires
-      const holdMs = Math.floor(rand() * 60); // 0..59ms tap latency
+      // Simulated operator tap latency. The card only needs to stay open
+      // longer than the burst's sub-ms arrival spread to exercise the
+      // in-flight dedupe overlap — the ABSOLUTE magnitude is irrelevant to
+      // every invariant here, so a wide 0..59ms range was pure sequential
+      // wall-clock cost (~1.9s of setTimeout sleeps summed over 60 schedules,
+      // the dominant term that pushed this loop past the 5s default under CI
+      // fork contention — #3170). Both regimes stay anchored deterministically
+      // by the sibling tests (the dedupe-collapse test pins overlap; the
+      // key-release test pins the sequential/non-overlap path), so shrinking
+      // the range keeps full coverage while cutting the sleep budget ~3x.
+      const holdMs = Math.floor(rand() * 20); // 0..19ms tap latency
       const arrivalJitter = Math.floor(rand() * 12); // stagger re-fires
 
       // Fresh server + file per schedule.
@@ -277,5 +289,15 @@ describe("property — re-fired identical proposals: exactly-once apply, always 
 
       await server.stop();
     }
-  });
+  },
+    // Explicit generous budget (default is 5s). After the holdMs shrink this
+    // loop runs in ~2s locally, but its irreducible floor is 60×(2..4) REAL
+    // `git apply` subprocess spawns (propose-time validation + the under-lock
+    // re-apply) whose wall time is legitimately load-dependent — under CI
+    // shards (`VITEST_MAX_FORKS: 2`, co-scheduled suites contending for CPU +
+    // process spawns) it can stretch several-fold. 30s is ~15x the local
+    // runtime: it leaves ample headroom for shard contention yet still trips
+    // on a genuine hang/deadlock (the failure this suite guards against). #3170
+    30_000,
+  );
 });
