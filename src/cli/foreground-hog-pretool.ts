@@ -48,6 +48,12 @@
  * Fail-OPEN on any stdin parse error / unknown shape: a turn-hygiene gate
  * must never be the reason a legitimate tool call fails. The only non-allow
  * outcome is the explicit deterministic block on a matched shape.
+ *
+ * Quote/heredoc discipline: before any matching, quoted spans and heredoc
+ * bodies are blanked (see blankQuotedAndHeredocs) so string DATA — commit
+ * messages, PR bodies, files being written — can never be mistaken for
+ * commands. When the blanking pass can't parse confidently (unterminated
+ * quote, weird heredoc) the whole command ALLOWS, same fail-open rule.
  */
 
 import { readFileSync } from "node:fs";
@@ -65,10 +71,130 @@ function gateEnabledFromEnv(env: NodeJS.ProcessEnv = process.env): boolean {
 }
 
 /**
+ * Blank quoted spans and heredoc bodies to SPACES (length-preserving)
+ * before any segmentation or shape matching, so string DATA can never be
+ * mistaken for commands: separators inside quotes must not create phantom
+ * segments (`git commit -m "retry; sleep 60"`), heredoc bodies are file
+ * CONTENT being written, not commands being run (`cat > x.sh <<'EOF' ...`),
+ * and quoted prose must not trip the loop/gh matchers.
+ *
+ * Returns null when the command can't be parsed confidently — unterminated
+ * quote (including a prose apostrophe), unterminated heredoc, or an
+ * un-parseable heredoc tag. The caller ALLOWS on null: false negatives are
+ * acceptable, false positives are not.
+ *
+ * Handled: '…' (no escapes), "…" (backslash escapes), backslash escapes in
+ * normal state (`\;` is not a separator, `\'` does not open a quote),
+ * `<<TAG` / `<<'TAG'` / `<<"TAG"` / `<<-TAG` heredocs (bodies blanked
+ * through the terminator line; multiple heredocs on one line queue in
+ * order), `<<<` here-strings (skipped — a single word, no body). NOT a
+ * shell parser: `$(…)` and backtick substitution stay unparsed, as before.
+ */
+function blankQuotedAndHeredocs(src: string): string | null {
+  const out = src.split("");
+  const n = src.length;
+  const pending: Array<{ tag: string; stripTabs: boolean }> = [];
+  let i = 0;
+  while (i < n) {
+    const ch = src[i];
+    if (ch === "\\") {
+      // Escape in normal state: neutralize both chars so an escaped
+      // separator/quote is never treated as structure.
+      out[i] = " ";
+      if (i + 1 < n) out[i + 1] = " ";
+      i += 2;
+      continue;
+    }
+    if (ch === "'") {
+      let j = i + 1;
+      while (j < n && src[j] !== "'") j++;
+      if (j >= n) return null; // unterminated (or a prose apostrophe)
+      for (let k = i; k <= j; k++) out[k] = " ";
+      i = j + 1;
+      continue;
+    }
+    if (ch === '"') {
+      let j = i + 1;
+      while (j < n && src[j] !== '"') {
+        j += src[j] === "\\" ? 2 : 1;
+      }
+      if (j >= n) return null; // unterminated
+      for (let k = i; k <= j && k < n; k++) out[k] = " ";
+      i = j + 1;
+      continue;
+    }
+    if (ch === "<" && src[i + 1] === "<") {
+      if (src[i + 2] === "<") {
+        i += 3; // here-string: a single word follows, no body to blank
+        continue;
+      }
+      let j = i + 2;
+      let stripTabs = false;
+      if (src[j] === "-") {
+        stripTabs = true;
+        j++;
+      }
+      while (j < n && (src[j] === " " || src[j] === "\t")) j++;
+      let quote = "";
+      if (src[j] === "'" || src[j] === '"') {
+        quote = src[j]!;
+        j++;
+      }
+      let tag = "";
+      while (j < n && /[A-Za-z0-9_]/.test(src[j]!)) {
+        tag += src[j];
+        j++;
+      }
+      if (quote) {
+        if (src[j] !== quote) return null; // weird opener → fail open
+        j++;
+      }
+      if (!tag) return null; // `<<$(…)` and friends → fail open
+      pending.push({ tag, stripTabs });
+      i = j;
+      continue;
+    }
+    if (ch === "\n" && pending.length > 0) {
+      // Heredoc bodies start after this newline; blank each queued body
+      // through (but not including) its terminator line, in order. The
+      // terminator line itself survives as a harmless bare token.
+      let j = i + 1;
+      while (pending.length > 0) {
+        const { tag, stripTabs } = pending.shift()!;
+        let found = false;
+        while (j <= n) {
+          let eol = src.indexOf("\n", j);
+          if (eol === -1) eol = n;
+          const line = src.slice(j, eol);
+          const cmp = stripTabs ? line.replace(/^\t+/, "") : line;
+          if (cmp === tag) {
+            found = true;
+            j = eol + 1;
+            break;
+          }
+          for (let k = j; k < eol; k++) out[k] = " ";
+          if (eol === n) {
+            j = n + 1;
+            break;
+          }
+          j = eol + 1;
+        }
+        if (!found) return null; // unterminated heredoc → fail open
+      }
+      i = j;
+      continue;
+    }
+    i++;
+  }
+  return out.join("");
+}
+
+/**
  * Sleep-in-a-loop across the WHOLE command: a `sleep` between `do` and
  * `done` of a while/until/for loop is a poll loop regardless of the
  * per-tick duration. Ordered match keeps it conservative (`... done &&
- * sleep 5` does not trip it — no `done` after the sleep).
+ * sleep 5` does not trip it — no `done` after the sleep). Runs on the
+ * BLANKED command, so quoted prose / quoted script literals never match.
  */
 const LOOP_SLEEP =
   /\b(?:while|until|for)\b[\s\S]*?\bdo\b[\s\S]*?\bsleep\b[\s\S]*?\bdone\b/;
@@ -162,10 +288,13 @@ function matchSegment(segment: string): string | null {
   }
 
   if (cmd === "gh") {
-    const joined = args.join(" ");
-    if (/\bpr\s+checks\b/.test(joined) && args.includes("--watch"))
+    // Only UNQUOTED positional tokens name the gh verb — flag values
+    // (`--body "run watch locally"`) are data, already blanked upstream,
+    // and flag tokens themselves (`-R`, `--body=x`) are never positional.
+    const positionals = args.filter((a) => !a.startsWith("-"));
+    if (positionals[0] === "pr" && positionals[1] === "checks" && args.includes("--watch"))
       return "gh pr checks --watch";
-    if (/\brun\s+watch\b/.test(joined)) return "gh run watch";
+    if (positionals[0] === "run" && positionals[1] === "watch") return "gh run watch";
   }
 
   if (cmd === "docker" && args[0] === "logs" && hasFollowFlag(args.slice(1), false))
@@ -179,10 +308,14 @@ function matchSegment(segment: string): string | null {
   return null;
 }
 
-/** The full detector. Returns the matched pattern label or null. */
+/** The full detector. Returns the matched pattern label or null. Every
+ *  matcher sees only the BLANKED command — quoted data and heredoc bodies
+ *  can never be mistaken for commands; an un-blankable command allows. */
 function detectForegroundHog(command: string): string | null {
-  if (LOOP_SLEEP.test(command)) return "sleep in a while/until/for loop";
-  for (const segment of foregroundSegments(command)) {
+  const blanked = blankQuotedAndHeredocs(command);
+  if (blanked === null) return null; // can't parse confidently → fail open
+  if (LOOP_SLEEP.test(blanked)) return "sleep in a while/until/for loop";
+  for (const segment of foregroundSegments(blanked)) {
     const hit = matchSegment(segment);
     if (hit) return hit;
   }

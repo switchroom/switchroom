@@ -180,6 +180,77 @@ describe("foreground-hog-pretool hook", () => {
     }
   });
 
+  // ── Quote/heredoc blindness regressions (PR #3159 review, FP-1..FP-4) ──
+  // String DATA — commit messages, PR bodies, files being written — must
+  // never be mistaken for commands. Each case below was a confirmed false
+  // positive before the blanking pre-pass.
+
+  it("FP-1: separators inside quoted strings never create phantom segments", () => {
+    if (!bunOk) return;
+    expectAllow('git commit -m "retry logic; sleep 60 between attempts"');
+    expectAllow('echo "step one; watch the dashboard"');
+    expectAllow("echo 'first; tail -f is what we avoid; second'");
+    // Multi-line quoted commit body whose lines start with gated words.
+    expectAllow(
+      'git commit -m "fix poller\n\nwatch the dashboard after deploy\nsleep 60 between retries"',
+    );
+    expectAllow('git commit -am "feat: add watch mode; sleep 300 default" && git push');
+  });
+
+  it("FP-2: heredoc bodies are file content, not commands", () => {
+    if (!bunOk) return;
+    expectAllow("cat > /tmp/wait.sh <<'EOF'\nsleep 300\necho done\nEOF");
+    expectAllow("cat > /tmp/wait.sh <<EOF\nsleep 300\necho done\nEOF");
+    expectAllow(
+      "cat > /tmp/monitor.sh <<'EOF'\nwhile true; do\n  check_health\n  sleep 60\ndone\nEOF",
+    );
+    expectAllow("cat <<-EOF > /tmp/x.sh\n\ttail -f /var/log/syslog\n\tEOF");
+    // Command AFTER the heredoc terminator is still live (and harmless here).
+    expectAllow("cat > x.sh <<'EOF'\nsleep 300\nEOF\necho written");
+  });
+
+  it("FP-3: LOOP_SLEEP never matches quoted prose or quoted script literals", () => {
+    if (!bunOk) return;
+    expectAllow(
+      'git commit -m "while the queue is empty we do a short sleep until work is done"',
+    );
+    expectAllow("printf 'while true; do sleep 5; done\\n' > poll.sh");
+    expectAllow('echo "while x; do sleep 99; done" >> notes.md');
+  });
+
+  it("FP-4: gh matcher ignores flag values and quoted data", () => {
+    if (!bunOk) return;
+    expectAllow('gh pr comment 3159 --body "then run watch locally to verify"');
+    expectAllow('gh pr create --title "run watch fix" --body "adds gh run watch docs"');
+    expectAllow('gh issue create --title "sleep 300 hangs" --body "repro: tail -f x"');
+  });
+
+  it("fails open (ALLOW) when quoting can't be parsed confidently", () => {
+    if (!bunOk) return;
+    // Prose apostrophe = unterminated single quote → allow, even alongside
+    // a would-be hog (false negatives are acceptable, false positives not).
+    expectAllow("echo don't wait && sleep 300");
+    expectAllow('echo "unterminated sleep 300');
+    expectAllow("cat > x.sh <<'EOF'\nsleep 300\n"); // heredoc never terminated
+  });
+
+  it("still DENIES true positives around quotes and heredocs", () => {
+    if (!bunOk) return;
+    // A quoted arg does not launder the live command around it.
+    expectDeny("watch -n 5 'kubectl get pods'", "watch");
+    expectDeny('sleep 300 && git commit -m "waited"', "sleep 300");
+    // A live hog after a properly terminated heredoc still denies.
+    expectDeny(
+      "cat > x.sh <<'EOF'\necho hi\nEOF\ntail -f /var/log/syslog",
+      "tail -f/--follow",
+    );
+    // gh watch verbs still deny with flags after the positionals. (A
+    // value-taking global flag BEFORE the verb — `gh --repo o/r run watch`
+    // — is a known, accepted false negative of the positional matcher.)
+    expectDeny("gh pr checks 3141 --watch", "gh pr checks --watch");
+    expectDeny("gh run watch 123456 --exit-status", "gh run watch");
+  });
+
   it("ALLOWS non-Bash tools untouched", () => {
     if (!bunOk) return;
     for (const tool of ["Read", "Write", "Task", "mcp__switchroom-telegram__reply"]) {
