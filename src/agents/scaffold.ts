@@ -7557,6 +7557,14 @@ function buildAccessJson(
   if (typeof tg?.coalesce?.max_attachments === "number") {
     access.coalesceMaxAttachments = tg.coalesce.max_attachments;
   }
+  // Cooldown window for the litellm-local 429 notice (the debounced "fleet
+  // token limiter engaged" message). Projected into the camelCase access
+  // field the gateway reads per-event (parseLitellmNoticeWindowMs guards
+  // invalid values with the 15-min default). Cascades from
+  // defaults.channels.telegram.litellm_notice.window_ms.
+  if (typeof tg?.litellm_notice?.window_ms === "number") {
+    access.litellmNoticeWindowMs = tg.litellm_notice.window_ms;
+  }
   // Deferred-interrupt safe-boundary (Problem B). Default-off: when unset the
   // gateway fires a `!` interrupt synchronously (historical behaviour). When
   // true, a `!` that lands mid-tool-call waits for the in-flight tool to

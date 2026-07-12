@@ -279,6 +279,23 @@ wrapping a forwarded upstream error): **account-scoped wins** — LiteLLM
 never emits Anthropic's account wording itself, so its presence means
 the account throttle genuinely fired upstream.
 
+The user-facing surface for a `litellm-local` 429 is a dedicated calm
+notice — "🚦 Fleet token limiter engaged" — instead of the generic
+rate-limited card (which reads like an Anthropic problem). The copy
+names the fleet limiter (LiteLLM `tpm_limit`/`rpm_limit`), says
+explicitly it is NOT an Anthropic account limit, and that the turn
+retries with no action needed. It is debounced per agent: one notice,
+then further litellm-local 429s are counted silently for a cooldown
+window (default 15 min, tunable via
+`channels.telegram.litellm_notice.window_ms` in switchroom.yaml); the
+first notice after the window expires says "throttled N more times
+since the last notice". A notice only ever fires on an actual throttle
+event — a quiet agent posts nothing. State machine + copy:
+`telegram-plugin/litellm-local-notice.ts`; wiring:
+`telegram-plugin/gateway/litellm-local-notice-wiring.ts`. Each SENT
+notice also emits a `litellm_local_429_notice` runtime metric carrying
+the absorbed count.
+
 Each classified event emits one `rate_limit_429_classified` runtime
 metric (PostHog + `runtime-metrics.jsonl`, see docs/posthog.md)
 carrying the classification, the action taken (throttle / failover /

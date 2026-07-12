@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### LiteLLM-local 429s get an honest, debounced throttle notice
+
+When an agent trips the LiteLLM proxy's OWN `tpm_limit`/`rpm_limit` cap
+(a `litellm-local` classified 429 — the classifier shipped in v0.18.15
+/ #3166), the operator surface was still the generic "🚦 Rate limited"
+card, which reads like an Anthropic account problem. Now that
+classification posts ONE calm notice naming the fleet token limiter —
+explicitly NOT an Anthropic account limit, the turn retries, no action
+needed — then debounces per agent: further litellm-local 429s inside a
+cooldown window (default 15 min, tunable via
+`channels.telegram.litellm_notice.window_ms`) are counted silently, and
+the first notice after the window says "throttled N more times since
+the last notice". A quiet agent posts nothing (evaluate-on-event, no
+timers). Classification, failover, and quota-ledger behavior are
+untouched; each sent notice emits a `litellm_local_429_notice` runtime
+metric carrying the absorbed count.
+
 ## v0.18.15 — Rollouts stop storming the operator, and a proxy-local 429 no longer fails over the fleet
 
 The headline: the two sharp edges the v0.18.14 rollout exposed are fixed
