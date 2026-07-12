@@ -56,9 +56,18 @@ Mechanism — **consume-once carrier** (no intent file):
 - **sr-* + LiteLLM-down at the apply-boot:** the carrier cannot apply and
   consume-once forbids retaining it for a later relaunch, so start.sh boots the
   configured default and alerts the operator to re-issue once the proxy is back.
-- **`/effort` is unchanged** — `.session-effort` remains keep-across-restarts
-  (rev 3). Whether `/effort` should also become session-scoped is deferred to
-  the operator (#3183 open question).
+- **`/effort` is session-scoped too** (#3186, operator decision 2026-07-12,
+  resolving the #3183 open question). A live `/effort <level>` applies
+  in-session via the applyEffort driver and records in gateway memory only —
+  no carrier — so start.sh's explicit `--effort <configured>` reverts it on
+  the next boot. `.session-effort` remains solely as the queued-command
+  shutdown carrier and is consume-once at boot, with the same LOW-3-style
+  crash-recovery exception as `/model`. start.sh records the effective
+  launched effort to `.active-session-effort` (sibling of
+  `.active-session-model`) so the gateway re-hydrates the menu's live level
+  after a queued-apply boot. The CONFIGURED `thinking_effort` resolution is
+  untouched — the fleet `low` pin (#1978, `thinking-effort-risk.ts`; see
+  Appendix A) resolves exactly as before.
 - **#3178 preserved.** Instant ack, the durable receipt log + history row, the
   mid-turn queue-and-apply, and explicit failures are untouched; the queued
   apply persists a consume-once carrier at shutdown so it still applies as the

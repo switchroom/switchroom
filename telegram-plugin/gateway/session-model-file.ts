@@ -18,13 +18,14 @@
  *     configured yaml default changed at the apply-boot) drops it and notifies
  *     the operator chat via `.session-model-alert`.
  *
- *   - `.session-effort` — the DURABLE effort override (#3039), still
- *     keep-across-restarts (NOT changed by rev 4). Same shape as
- *     `.session-model` with `level` in place of `model`:
- *     `{"level","configuredDefaultAtWrite","ts"}`. Written on every
- *     positively-confirmed `/effort` apply, resolved by start.sh into the
- *     relaunch's `--effort`, cleared only by `/effort default` or
- *     invalidation (with a boot alert).
+ *   - `.session-effort` — the CONSUME-ONCE effort carrier (#3186, session-
+ *     scoped like `.session-model`). Same shape with `level` in place of
+ *     `model`: `{"level","configuredDefaultAtWrite","ts"}`. Written ONLY by
+ *     the queued-command shutdown persist (a mid-turn `/effort` carried
+ *     across the bounce); start.sh resolves it into the apply-boot's
+ *     `--effort` and deletes it, so any subsequent restart reverts to the
+ *     configured `thinking_effort`. Live `/effort` applies record in memory
+ *     only. Cleared live by `/effort default`; invalidation alerts at boot.
  *
  * The `model` token is always a canonical `claude --model` token (alias,
  * `claude-*` id, or `sr-*` id) — NEVER a display label like "Opus 4.8".
@@ -82,8 +83,8 @@ export function parseSessionModel(text: string): SessionModelRecord | null {
 }
 
 /**
- * Write the durable session override. Throws on a non-canonical token —
- * callers must pass a `claude --model` token, never a display label
+ * Write the consume-once session-model carrier. Throws on a non-canonical
+ * token — callers must pass a `claude --model` token, never a display label
  * (regression guard for the "Opus 4.5 persisted" class).
  */
 export function writeSessionModelFile(
@@ -151,12 +152,13 @@ export function readConfiguredDefaultModel(agentDir: string): string | null {
   }
 }
 
-// ─── Durable session-effort override (#3039) ────────────────────────────────
+// ─── Consume-once session-effort carrier (#3186) ────────────────────────────
 //
-// The `/effort` sibling of `.session-model`. Same lifecycle: written on every
-// positively-confirmed effort apply, honored by start.sh on every boot
-// (`--effort <level>`), cleared only by `/effort default` or invalidation
-// (configured `thinking_effort:` changed / corrupt file — both alert once).
+// The `/effort` sibling of `.session-model`, session-scoped. Written ONLY by
+// the queued-command shutdown persist (a mid-turn /effort carried across the
+// bounce); start.sh applies it on the single boot that reads it (`--effort
+// <level>`) and deletes it. Cleared live by `/effort default`; invalidation
+// (configured `thinking_effort:` changed / corrupt file) alerts once at boot.
 
 export const SESSION_EFFORT_FILE = '.session-effort'
 
@@ -193,8 +195,9 @@ export function parseSessionEffort(text: string): SessionEffortRecord | null {
 }
 
 /**
- * Write the durable effort override. Throws on a non-allowlisted level —
- * the value is passed verbatim to `claude --effort` at the next boot.
+ * Write the consume-once effort carrier. Throws on a non-allowlisted level —
+ * the value is passed verbatim to `claude --effort` at the next boot (the
+ * apply-boot, which consumes the file).
  */
 export function writeSessionEffortFile(
   agentDir: string,
@@ -210,7 +213,7 @@ export function writeSessionEffortFile(
   )
 }
 
-/** Parsed durable effort override, or null when absent/corrupt. */
+/** Parsed effort carrier, or null when absent/corrupt. */
 export function readSessionEffortFile(agentDir: string): SessionEffortRecord | null {
   try {
     return parseSessionEffort(readFileSync(join(agentDir, SESSION_EFFORT_FILE), 'utf8'))
@@ -219,7 +222,7 @@ export function readSessionEffortFile(agentDir: string): SessionEffortRecord | n
   }
 }
 
-/** Delete the durable effort override (`/effort default`). Best-effort. */
+/** Delete the effort carrier (`/effort default`, leftover hygiene). Best-effort. */
 export function clearSessionEffortFile(agentDir: string): void {
   try {
     rmSync(join(agentDir, SESSION_EFFORT_FILE), { force: true })

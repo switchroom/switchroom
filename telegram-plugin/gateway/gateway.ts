@@ -468,7 +468,6 @@ import {
   readConfiguredDefaultModel,
   writeSessionEffortFile,
   clearSessionEffortFile,
-  readSessionEffortFile,
 } from './session-model-file.js'
 import { discoverModels, selectModel } from '../../src/agents/model-picker.js'
 import { resolveMainModel, SWITCHROOM_DEFAULT_THINKING_EFFORT } from '../../src/agents/scaffold.js'
@@ -22331,39 +22330,38 @@ bot.command('model', async ctx => {
 // is blocklisted for `/effort` since #2471), session-scoped — boot re-pins
 // the configured default via start.sh's `--effort`. Implementation in
 // effort-command.ts so it's unit-testable without booting the bot.
+
+// The live session-effort override, in memory only (#3186, session-scoped
+// like /model rev 4). A confirmed live apply records here — NOT to the
+// `.session-effort` carrier — so it lasts exactly until the next restart
+// (start.sh's explicit `--effort <configured>` reverts it for free). Seeded
+// at boot from `.active-session-effort` (the effort sibling of
+// `.active-session-model`) so a queued-carrier apply-boot still shows the
+// honest live level on the /effort menu.
+let sessionEffortOverride: string | null = null
+
 function buildEffortDeps(): EffortCommandDeps {
   return {
-    // #3039: single persistence choke point — EVERY positively-confirmed
-    // effort apply (typed, menu tap, queued drain) durably records the level
-    // to `.session-effort`, which start.sh resolves into `--effort` on every
-    // boot. `/effort default` clears it via clearSessionEffort (the handler
-    // clears AFTER its restore-apply, so the wrapper's write is undone).
+    // Session-scoped (#3186): a positively-confirmed live apply records the
+    // level IN MEMORY only — no durable carrier. The `.session-effort`
+    // carrier is written solely by persistQueuedCommandForRestart (a queued
+    // mid-turn /effort carried across the bounce) and is consume-once at
+    // boot. `/effort default` clears via clearSessionEffort below.
     applyEffort: async (agent, level) => {
       const result = await applyEffort(agent, level)
-      if (result.ok) {
-        const agentDir = resolveAgentDirFromEnv()
-        if (agentDir) {
-          try {
-            writeSessionEffortFile(agentDir, level, getConfiguredEffortForPersist())
-          } catch (err) {
-            process.stderr.write(
-              `telegram gateway: session-effort persist failed level=${level}: ${(err as Error)?.message ?? String(err)}\n`,
-            )
-          }
-        }
-      }
+      if (result.ok) sessionEffortOverride = level
       return result
     },
     getAgentName: getMyAgentName,
     getConfiguredEffort: () => getConfiguredEffortForPersist(),
     clearSessionEffort: () => {
+      sessionEffortOverride = null
+      // Also drop any leftover queued-command carrier so the next boot can't
+      // consume a stale level the user just cleared.
       const agentDir = resolveAgentDirFromEnv()
       if (agentDir) clearSessionEffortFile(agentDir)
     },
-    getSessionEffort: () => {
-      const agentDir = resolveAgentDirFromEnv()
-      return agentDir ? (readSessionEffortFile(agentDir)?.level ?? null) : null
-    },
+    getSessionEffort: () => sessionEffortOverride,
     escapeHtml: escapeHtmlForTg,
   }
 }
@@ -28906,6 +28904,23 @@ void (async () => {
                 sessionModelSource.setOverride(
                   launched.length > 0 && launched !== configured ? launched : null,
                 )
+              } catch { /* leave override as-is on a bad read */ }
+            }
+
+            // Effort sibling (#3186): start.sh records the EFFECTIVE launched
+            // effort to `.active-session-effort` every boot. Re-hydrate the
+            // in-memory session-effort override so the /effort menu highlight
+            // stays honest after a queued-carrier apply-boot. Only an effort
+            // differing from the configured default counts as an override.
+            const activeEffortPath = join(smAgentDir, '.active-session-effort')
+            if (existsSync(activeEffortPath)) {
+              try {
+                const launchedEffort = readFileSync(activeEffortPath, 'utf8').trim()
+                const configuredEffort = getConfiguredEffortForPersist()
+                sessionEffortOverride =
+                  launchedEffort.length > 0 && launchedEffort !== configuredEffort
+                    ? launchedEffort
+                    : null
               } catch { /* leave override as-is on a bad read */ }
             }
 

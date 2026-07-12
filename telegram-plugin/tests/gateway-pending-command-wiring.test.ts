@@ -95,14 +95,33 @@ describe('gateway: /restart reverts the session-model override (rev 4, session-s
   })
 })
 
-describe('gateway: /effort persistence choke point (#3039)', () => {
-  it('buildEffortDeps persists a confirmed apply to .session-effort and wires clearSessionEffort', () => {
+describe('gateway: /effort is session-scoped (#3186)', () => {
+  it('buildEffortDeps records a confirmed live apply IN MEMORY only — no durable carrier write', () => {
     const fnIdx = GATEWAY_SRC.indexOf('function buildEffortDeps(')
     expect(fnIdx).toBeGreaterThan(0)
     const win = GATEWAY_SRC.slice(fnIdx, fnIdx + 2500)
-    expect(win).toContain('writeSessionEffortFile(')
+    expect(win).not.toContain('writeSessionEffortFile(')
+    expect(win).toContain('sessionEffortOverride = level')
+    // /effort default clears the in-memory level AND any leftover carrier.
+    expect(win).toContain('sessionEffortOverride = null')
     expect(win).toContain('clearSessionEffortFile(')
-    expect(win).toContain('readSessionEffortFile(')
+  })
+
+  it('the queued-command shutdown persist is the ONLY .session-effort writer', () => {
+    const writes = [...GATEWAY_SRC.matchAll(/writeSessionEffortFile\(/g)]
+    expect(writes.length).toBe(1)
+    const fnIdx = GATEWAY_SRC.indexOf('function persistQueuedCommandForRestart(')
+    expect(fnIdx).toBeGreaterThan(0)
+    expect(writes[0].index).toBeGreaterThan(fnIdx)
+    expect(writes[0].index).toBeLessThan(fnIdx + 3000)
+  })
+
+  it('boot re-hydrates the in-memory effort override from .active-session-effort', () => {
+    const idx = GATEWAY_SRC.indexOf("join(smAgentDir, '.active-session-effort')")
+    expect(idx).toBeGreaterThan(0)
+    const win = GATEWAY_SRC.slice(idx, idx + 800)
+    expect(win).toContain('getConfiguredEffortForPersist()')
+    expect(win).toContain('sessionEffortOverride =')
   })
 })
 

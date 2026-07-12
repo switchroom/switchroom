@@ -65,8 +65,9 @@ export function parseEffortCommand(text: string): ParsedEffortCommand | null {
   }
   const arg = parts[0]
   if (arg.toLowerCase() === 'help') return { kind: 'help' }
-  // `/effort default` — explicit user action that clears the durable
-  // `.session-effort` override and restores the configured default (#3039).
+  // `/effort default` — explicit user action that clears the session
+  // override (in-memory + any leftover queued-command carrier) and restores
+  // the configured default (#3186, session-scoped).
   if (arg.toLowerCase() === 'default') return { kind: 'default' }
   if (!isValidEffortArg(arg)) {
     return { kind: 'help', reason: `not a valid effort level: ${arg}` }
@@ -91,14 +92,15 @@ export interface EffortCommandDeps {
    */
   getConfiguredEffort: () => string | null
   /**
-   * Delete the durable `.session-effort` override (#3039). Optional so
+   * Clear the session effort override (#3186: the in-memory live level plus
+   * any leftover queued-command `.session-effort` carrier). Optional so
    * gateway-agnostic tests can omit it; the gateway always wires it.
    */
   clearSessionEffort?: () => void
   /**
-   * The active durable `.session-effort` override level, or null when none
-   * (#3039). Optional; used to mark the LIVE level in the menu and the show
-   * text honestly after a restart re-applied the override.
+   * The active session effort override level, or null when none (#3186:
+   * in-memory, session-scoped — reverts on restart). Optional; used to mark
+   * the LIVE level in the menu and the show text honestly.
    */
   getSessionEffort?: () => string | null
   escapeHtml: (s: string) => string
@@ -110,7 +112,7 @@ export interface EffortCommandReply {
 }
 
 const PERSIST_NOTE =
-  '_Sticky — persists across restarts and deploys until \`/effort default\` clears it. To change the configured default, set \`thinking_effort:\` in switchroom.yaml._'
+  '_Session-only — this override lasts until the agent’s next restart, then reverts to the configured \`thinking_effort:\`. \`/effort default\` clears it now. To change the default permanently, set \`thinking_effort:\` in switchroom.yaml._'
 
 const LEVELS_INLINE = EFFORT_LEVELS.map(l => `\`${l}\``).join(' · ')
 

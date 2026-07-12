@@ -94,9 +94,9 @@ describe('readConfiguredDefaultModel', () => {
   })
 })
 
-// ─── #3039: durable session-effort carrier ───────────────────────────────────
+// ─── #3186: consume-once session-effort carrier (queued-command boot apply) ──
 
-describe('session-effort file helpers (#3039)', () => {
+describe('session-effort file helpers (#3186)', () => {
   let dir: string
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'sr-session-effort-'))
