@@ -1336,3 +1336,197 @@ describe('narrative dedup — non-adjacent repeats collapse (A,B,A)', () => {
     expect(last.text).toContain('step-repeat')
   })
 })
+
+// ─── send-gate shed contract (#3174) ────────────────────────────────────────
+//
+// The feed's send/edit adapters transit the deterministic send gate
+// (telegram-plugin/send-gate.ts, #3084), wired at the robustApiCall layer. The
+// gate SHEDS a call — resolves `undefined` WITHOUT hitting the API — when a
+// flood window is open (or a `useful` send exceeds its queue TTL, or a cosmetic
+// edit finds no free token). Before this fix the first-paint path dereferenced
+// `sent.message_id` on that `undefined`, throwing every heartbeat tick (~6s) for
+// the whole ban — 578 `undefined is not an object (evaluating 'sent.message_id')`
+// crashes in one 6h flood ban on 2026-07-12. These tests pin the shed contract:
+// (a) an open flood window parks the handle and makes ZERO api calls; (b) an
+// undefined send is treated as NOT-delivered (no crash, no phantom message id);
+// (c)/(d) an undefined edit is not recorded as on-screen (shed honesty, mirroring
+// PR #3173) so the update re-sends once the gate clears.
+
+interface GateBot extends BotApiForWorkerFeed {
+  /** Times sendMessage was INVOKED (attempts), delivered or shed. */
+  sendCalls: number
+  /** Times editMessageText was INVOKED (attempts), delivered or shed. */
+  editCalls: number
+  /** DELIVERED sends (gate admitted). */
+  sent: Array<{ text: string }>
+  /** DELIVERED edits (gate admitted). */
+  edits: Array<{ messageId: number; text: string }>
+  /** One-shot: shed the next send (resolve undefined) even with the window closed. */
+  shedNextSend: boolean
+  /** One-shot: shed the next edit (resolve undefined) even with the window closed. */
+  shedNextEdit: boolean
+}
+
+/**
+ * A bot adapter that models the send gate: it SHEDS (resolves undefined,
+ * without recording a delivery) whenever the injected flood probe reports an
+ * open window, or a one-shot `shedNext*` flag is set (the race where the window
+ * opens between the feed's probe read and the send). A successful edit resolves
+ * a non-undefined sentinel (`{}` — grammy returns `true`/`Message`; only the
+ * gate's shed resolves `undefined`).
+ */
+function makeGateBot(floodRemaining: () => number): GateBot {
+  let nextId = 1000
+  const gb: GateBot = {
+    sendCalls: 0,
+    editCalls: 0,
+    sent: [],
+    edits: [],
+    shedNextSend: false,
+    shedNextEdit: false,
+    sendMessage: async (_chatId, text) => {
+      gb.sendCalls++
+      if (floodRemaining() > 0 || gb.shedNextSend) {
+        gb.shedNextSend = false
+        return undefined as unknown as { message_id: number }
+      }
+      gb.sent.push({ text })
+      return { message_id: nextId++ }
+    },
+    editMessageText: async (_chatId, messageId, text) => {
+      gb.editCalls++
+      if (floodRemaining() > 0 || gb.shedNextEdit) {
+        gb.shedNextEdit = false
+        return undefined
+      }
+      gb.edits.push({ messageId, text })
+      return {}
+    },
+  }
+  return gb
+}
+
+describe('worker-feed send-gate shed contract', () => {
+  it('makes ZERO api calls while a flood window is open, then paints full state after it closes', async () => {
+    let clock = 0
+    const untilTs = 6 * 60 * 60 * 1000 // a 6h ban, as observed 2026-07-12
+    const probe = () => Math.max(0, untilTs - clock)
+    const bot = makeGateBot(probe)
+    const feed = createWorkerActivityFeed({
+      bot,
+      now: () => clock,
+      firstPaintMinMs: 0,
+      floodWaitRemainingMs: probe,
+    })
+
+    // Drive the heartbeat cadence hammering the feed for the whole ban.
+    for (let i = 0; i < 30; i++) {
+      clock += 6000
+      await feed.update('w1', 'chat', view({ elapsedMs: clock }))
+    }
+    // Parked on the window — never even called the API (the whole point).
+    expect(bot.sendCalls).toBe(0)
+    expect(bot.sent).toHaveLength(0)
+    expect(feed.has('w1')).toBe(false)
+
+    // Window closes: the next tick paints full state exactly once.
+    clock = untilTs + 1000
+    await feed.update('w1', 'chat', view({ elapsedMs: clock }))
+    expect(bot.sendCalls).toBe(1)
+    expect(bot.sent).toHaveLength(1)
+    expect(bot.sent[0].text).toContain('🛠 **Worker**')
+    expect(feed.has('w1')).toBe(true)
+  })
+
+  it('treats an undefined send result as not-delivered — no crash, no phantom message id', async () => {
+    let clock = 10_000
+    const logs: string[] = []
+    const bot = makeGateBot(() => 0) // probe reads clear …
+    bot.shedNextSend = true // … but the gate sheds this send (race)
+    const feed = createWorkerActivityFeed({
+      bot,
+      now: () => clock,
+      firstPaintMinMs: 0,
+      floodWaitRemainingMs: () => 0,
+      log: (m) => logs.push(m),
+    })
+
+    await feed.update('w1', 'chat', view())
+    expect(bot.sendCalls).toBe(1) // it attempted the send
+    expect(bot.sent).toHaveLength(0) // but nothing was delivered
+    expect(feed.messageIdOf('w1')).toBeNull() // and no phantom message id recorded
+    expect(feed.has('w1')).toBe(false)
+    // Regression pin: the old code dereferenced `undefined.message_id` and logged
+    // it as a hard "send failed"; the shed is now a recognized, clean skip.
+    expect(logs.some((l) => l.startsWith('worker-feed: send failed'))).toBe(false)
+    expect(logs.some((l) => l.includes('shed by send gate'))).toBe(true)
+
+    // The next paint (gate no longer shedding) lands cleanly.
+    clock = 20_000
+    await feed.update('w1', 'chat', view())
+    expect(bot.sent).toHaveLength(1)
+    expect(feed.has('w1')).toBe(true)
+  })
+
+  it('does not record a shed cosmetic edit as on-screen — the update re-sends after the gate clears', async () => {
+    let clock = 10_000
+    const bot = makeGateBot(() => 0)
+    const feed = createWorkerActivityFeed({
+      bot,
+      now: () => clock,
+      firstPaintMinMs: 0,
+      minEditIntervalMs: 0,
+      floodWaitRemainingMs: () => 0,
+    })
+
+    await feed.update('w1', 'chat', view({ toolCount: 1 }))
+    expect(bot.sent).toHaveLength(1)
+
+    // Gate sheds the edit (undefined) — it is NOT on screen.
+    clock = 20_000
+    bot.shedNextEdit = true
+    await feed.update('w1', 'chat', view({ toolCount: 2 }))
+    expect(bot.editCalls).toBe(1)
+    expect(bot.edits).toHaveLength(0)
+
+    // Shed honesty: the SAME update re-sends once the gate clears — the shed
+    // payload was never recorded as `lastBody`, so it is not dropped as a dup.
+    clock = 30_000
+    await feed.update('w1', 'chat', view({ toolCount: 2 }))
+    expect(bot.edits).toHaveLength(1)
+    expect(bot.edits[0].text).toContain('2 tools')
+  })
+
+  it('does not falsely finalize on a shed terminal edit — re-drives the finalize once the gate clears', async () => {
+    let clock = 10_000
+    const bot = makeGateBot(() => 0)
+    const feed = createWorkerActivityFeed({
+      bot,
+      now: () => clock,
+      firstPaintMinMs: 0,
+      minEditIntervalMs: 0,
+      floodWaitRemainingMs: () => 0,
+    })
+
+    await feed.update('w1', 'chat', view({ toolCount: 1 }))
+    expect(bot.sent).toHaveLength(1)
+
+    // Gate sheds the terminal edit (undefined).
+    clock = 20_000
+    bot.shedNextEdit = true
+    await feed.finish('w1', view({ state: 'done', toolCount: 5 }))
+    expect(bot.editCalls).toBe(1)
+    expect(bot.edits).toHaveLength(0)
+    // NOT finalized: the handle survives (pendingFinish staged) rather than
+    // being torn down with the card frozen on its last running render.
+    expect(feed.has('w1')).toBe(true)
+
+    // Re-drive with the gate clear: the terminal recap lands and the handle
+    // finalizes.
+    clock = 30_000
+    await feed.finish('w1', view({ state: 'done', toolCount: 5 }))
+    expect(bot.edits).toHaveLength(1)
+    expect(bot.edits[0].text).toContain('_done · 5 tools')
+    expect(feed.has('w1')).toBe(false)
+  })
+})
