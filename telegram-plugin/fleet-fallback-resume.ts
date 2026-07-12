@@ -81,12 +81,24 @@ export interface FleetFallbackResumeGate {
   /**
    * Decide whether to resume the dead turn after a successful swap. Call ONLY
    * when the swap outcome was `'switched'`. Records the arm time on a 'resume'
-   * verdict so a follow-on swap within `singleFlightMs` is suppressed.
+   * verdict so a follow-on swap within `singleFlightMs` is suppressed. Equivalent
+   * to `peek()` followed by `arm()` on a 'resume' verdict.
    *
    * @param failedTurnStartedAtMs epoch-ms the failed turn began, or null when
    *        unknown (then the staleness guard is deferred to the boot path).
    */
   decide(failedTurnStartedAtMs: number | null): ResumeDecision;
+  /**
+   * Evaluate the resume verdict WITHOUT arming the single-flight latch. Use when
+   * the caller must perform fallible work (e.g. write a consume-once carrier)
+   * BEFORE committing to a restart: peek → do the writes → `arm()` only on
+   * success, so a throwing write can never leave an armed latch with no pending
+   * restart (which would suppress a legitimate later resume for `singleFlightMs`).
+   */
+  peek(failedTurnStartedAtMs: number | null): ResumeDecision;
+  /** Commit the single-flight arm (records "now" as the arm time). Pair with a
+   *  prior `peek()` that returned 'resume'. */
+  arm(): void;
   /** Test seam — reset to fresh state. Production code should not call this. */
   reset(): void;
   /** Test/debug — current internal state. */
@@ -105,7 +117,7 @@ export function createFleetFallbackResumeGate(
   // -Infinity = never resumed. A concrete value arms the single-flight window.
   let lastResumedAtMs = Number.NEGATIVE_INFINITY;
 
-  function decide(failedTurnStartedAtMs: number | null): ResumeDecision {
+  function peek(failedTurnStartedAtMs: number | null): ResumeDecision {
     const now = nowFn();
     // Guard 2 — single-flight. A second swap within the window does not
     // re-arm; the in-flight restart owns the resume.
@@ -115,12 +127,23 @@ export function createFleetFallbackResumeGate(
     if (failedTurnStartedAtMs != null && now - failedTurnStartedAtMs > maxAgeMs) {
       return 'skip-stale';
     }
-    lastResumedAtMs = now;
     return 'resume';
+  }
+
+  function arm(): void {
+    lastResumedAtMs = nowFn();
+  }
+
+  function decide(failedTurnStartedAtMs: number | null): ResumeDecision {
+    const verdict = peek(failedTurnStartedAtMs);
+    if (verdict === 'resume') arm();
+    return verdict;
   }
 
   return {
     decide,
+    peek,
+    arm,
     reset() {
       lastResumedAtMs = Number.NEGATIVE_INFINITY;
     },

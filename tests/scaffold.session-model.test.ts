@@ -352,6 +352,36 @@ describe("scaffoldAgent: session-model consume-once boot resolver (start.sh)", (
     expect(existsSync(join(agentDir, ".session-effort"))).toBe(false);
     expect(alertText()).toContain("configured default effort changed");
   });
+
+  // ── MODEL-TIER downgrade failover — start.sh outcomes ─────────────────────
+  // The gateway's downgrade writes a consume-once `.session-model` carrier whose
+  // model IS the configured default (see maybeTierDowngrade). These assert the
+  // two native guarantees the downgrade relies on at the boot layer: revert is
+  // free (consume-once) and the downgraded default resolves the CONFIGURED
+  // (low) effort because the downgrade writes NO `.session-effort` carrier.
+  it("tier-downgrade carrier (model == configured default) → applies the default, consumes, reverts on next restart", () => {
+    // The gateway writes {model: <configured default>, configuredDefaultAtWrite:
+    // <same>} immediately before the resume restart.
+    writeFileSync(join(agentDir, ".session-model"), sessionModelJson(DEFAULT_MODEL, DEFAULT_MODEL));
+    expect(runBlock("1")).toBe(DEFAULT_MODEL); // resume boot runs the default
+    expect(existsSync(join(agentDir, ".session-model"))).toBe(false); // consume-once
+    expect(existsSync(join(agentDir, ".session-model-alert"))).toBe(false); // silent apply
+    // Native revert: every subsequent restart is already the default (the
+    // premium override was session-scoped and never wrote a surviving carrier).
+    expect(runBlock("1")).toBe(DEFAULT_MODEL);
+  });
+
+  it("tier-downgrade boot sheds a prior live /effort → downgraded default resolves configured (low) effort", () => {
+    // A live `/effort high` records in gateway memory only (NO `.session-effort`
+    // carrier, rev 4), so the downgrade self-restart sheds it: the boot has no
+    // effort carrier and the downgraded default lands at the configured low pin
+    // (#1978). Model carrier present (the downgrade); effort carrier absent.
+    writeFileSync(join(agentDir, ".session-model"), sessionModelJson(DEFAULT_MODEL, DEFAULT_MODEL));
+    expect(existsSync(join(agentDir, ".session-effort"))).toBe(false);
+    const { model, effortArg } = runBlockEffort();
+    expect(model).toBe(DEFAULT_MODEL);
+    expect(effortArg).toBe("--effort low");
+  });
 });
 
 // ── configured-default sr-* (persistent, NO override) — carried over ─────────

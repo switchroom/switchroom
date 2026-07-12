@@ -122,6 +122,45 @@ describe('createFleetFallbackResumeGate — staleness guard', () => {
   })
 })
 
+describe('createFleetFallbackResumeGate — peek / arm seams (tier-downgrade LOW-3 + LOW-9a)', () => {
+  it('peek() evaluates the verdict WITHOUT arming the single-flight latch', () => {
+    const clk = fakeClock()
+    const gate = createFleetFallbackResumeGate({ nowFn: clk.now })
+    // Peeking 'resume' must not record an arm time — a following peek/decide is
+    // still 'resume'. This is what lets the gateway do a fallible carrier write
+    // between the peek and the arm without leaving a phantom armed latch (LOW-3).
+    expect(gate.peek(clk.now())).toBe('resume')
+    expect(gate.inspect().lastResumedAtMs).toBe(Number.NEGATIVE_INFINITY)
+    expect(gate.peek(clk.now())).toBe('resume')
+    // The real restart never fires (write threw) → nothing armed → a genuine
+    // later swap still resumes.
+    expect(gate.decide(clk.now())).toBe('resume')
+  })
+
+  it('arm() commits the single-flight window so a later peek reports skip-inflight (LOW-9a)', () => {
+    const clk = fakeClock()
+    const gate = createFleetFallbackResumeGate({ nowFn: clk.now, singleFlightMs: 60_000 })
+    // Turn 1: peek 'resume' → do the write → arm.
+    expect(gate.peek(clk.now())).toBe('resume')
+    gate.arm()
+    // Turn 2 (concurrent, same process, 1s later): a resume restart is already
+    // armed, so peek reports skip-inflight → the gateway suppresses the give-up.
+    clk.advance(1_000)
+    expect(gate.peek(clk.now())).toBe('skip-inflight')
+  })
+
+  it('peek(skip-inflight/skip-stale) never arms; only arm() records the window', () => {
+    const clk = fakeClock()
+    const gate = createFleetFallbackResumeGate({ nowFn: clk.now })
+    // A stale peek must not arm (mirrors decide()'s stale behaviour).
+    expect(gate.peek(clk.now() - (DEFAULT_RESUME_MAX_AGE_MS + 1))).toBe('skip-stale')
+    expect(gate.inspect().lastResumedAtMs).toBe(Number.NEGATIVE_INFINITY)
+    // decide() remains equivalent to peek+arm-on-resume.
+    expect(gate.decide(clk.now())).toBe('resume')
+    expect(gate.peek(clk.now())).toBe('skip-inflight')
+  })
+})
+
 describe('createFleetFallbackResumeGate — reset / inspect seams', () => {
   it('reset() clears the single-flight arm', () => {
     const clk = fakeClock()
