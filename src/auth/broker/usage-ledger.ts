@@ -267,6 +267,12 @@ function summarizeTier(
     rawUtil == null ? null : refilled ? 0 : rawUtil;
   const headroomPct =
     currentUtilizationPct == null ? null : Math.max(0, 100 - currentUtilizationPct);
+  // DELIBERATELY refill-AGNOSTIC (unlike currentUtilizationPct above): the peak
+  // is a trend statistic over the retained ring (~48h at the default cadence),
+  // so it can read e.g. 99% for up to the ring's span AFTER a weekly refill.
+  // That is honest history ("how hard was this account driven recently"), not
+  // current state — renderers must label it "peak", and it is NEVER used in
+  // selection or headroom (PR #3187 review, note 2).
   const utilSamples = tl.samples
     .map((s) => s.utilizationPct)
     .filter((u): u is number => u != null);
@@ -325,6 +331,18 @@ export function premiumHeadroomPct(
  * Deterministic + order-stable: ties (equal headroom, incl. the empty-ledger
  * case where all are unknown) resolve to the earliest candidate in the input
  * order, so behavior is unchanged whenever the ledger carries no data. PURE.
+ *
+ * KNOWN-DATA-WINS (deliberate — PR #3187 review, note 1): a candidate with
+ * KNOWN-low headroom beats an UNOBSERVED one. An unobserved eligible account
+ * carries zero information — the premium canary only covers the serving set,
+ * so "no ledger data" can mean near-wall-but-never-canaried just as easily as
+ * fresh; #3176 walls are only marked for accounts that have been canaried (or
+ * 429'd). A known-low account is POSITIVELY verified serviceable right now:
+ * worst case is a sooner honest re-roll (eligibility already excludes walled
+ * targets). Preferring the unknown instead could land the whole fleet's
+ * flagship traffic on an effectively-walled account and reproduce the 429
+ * storm #3176 exists to prevent. Self-correcting: a promoted account joins the
+ * canary set, so its ledger entry appears within one fleet tick.
  */
 export function bestPremiumHeadroomAccount(
   ledger: UsageLedger,
@@ -335,6 +353,7 @@ export function bestPremiumHeadroomAccount(
   let bestHeadroom = -Infinity;
   for (const cand of candidates) {
     const h = premiumHeadroomPct(ledger, cand, now);
+    // Unobserved → skipped, never guessed-as-full (known-data-wins; see above).
     if (h == null) continue;
     // Strictly-greater keeps the FIRST candidate on ties → order-stable.
     if (h > bestHeadroom) {

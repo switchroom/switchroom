@@ -744,6 +744,11 @@ export function registerAuthCommand(program: Command): void {
             "  Premium = flagship (Fable) 7d_oi tier; standard = 5h/7d. Passive: harvested from probe headers, no extra requests.",
           ),
         );
+        console.log(
+          chalk.gray(
+            "  'X% left' is current (refill-aware); 'peak' is the max over retained history (~48h) and may predate the latest reset.",
+          ),
+        );
         console.log();
       }),
     );
