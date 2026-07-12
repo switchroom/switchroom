@@ -263,10 +263,11 @@ Every terminal 429 is therefore classified three ways
   ("would exceed your account's rate limit"). Takes the throttle tier
   above (broker `mark-throttled` / failover).
 - **litellm-local** — wording only LiteLLM's limiters emit
-  ("Deployment over user-defined ratelimit", "Rate limit exceeded for
-  api_key: …", "No deployments available for selected model" — the
-  canonical list, with source provenance, is
-  `litellmProxyLocal429Signals` in
+  ("Deployment over user-defined ratelimit", "No deployments available
+  for selected model", or the v3 limiter's descriptor-agnostic pair
+  "Rate limit exceeded for …" + "Limit type: …" — the canonical
+  matcher, with per-signal source provenance, is
+  `isLitellmProxyLocal429` / `litellmProxyLocal429Signals` in
   `telegram-plugin/model-unavailable.ts`). Takes the calm rate-limited
   path: **no broker mark, no failover, no throttle tier**. Marking the
   account for a proxy-local cap would bench a healthy subscription.

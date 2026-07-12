@@ -115,27 +115,43 @@ export function isTransientUpstreamSignal(text: string): boolean {
  *  - "model rate limit exceeded. tpm/rpm limit" — the `message` field of the
  *    same enforcement RateLimitError: "Model rate limit exceeded. TPM
  *    limit={n}, current usage={n}" (model_rate_limit_check.py).
- *  - "deployment over defined rpm/tpm limit" — the usage-based-routing-v2
+ *  - "deployment over defined rpm limit" — the usage-based-routing-v2
  *    strategy wording "Deployment over defined rpm limit={n}. current
- *    usage={n}" (litellm/router_strategy/lowest_tpm_rpm_v2.py; the tpm
- *    variant appears in earlier releases — keep both).
+ *    usage={n}" (litellm/router_strategy/lowest_tpm_rpm_v2.py). There is NO
+ *    tpm sibling in any known release — v2 TPM exhaustion surfaces as the
+ *    `no_deployments_available` wording below (the deployment is filtered
+ *    from the candidate set rather than erroring in the increment path).
  *  - "no deployments available for selected model" —
  *    `RouterErrors.no_deployments_available`, the RouterRateLimitError
  *    message when every deployment for the model group is cooling down:
  *    "No deployments available for selected model, Try again in {n}
  *    seconds…" (litellm/types/router.py).
- *  - "rate limit exceeded for <descriptor>" — the proxy-side key/user/team
- *    limiter (parallel_request_limiter_v3.py `_handle_rate_limit_error`):
- *    "Rate limit exceeded for api_key: {hash}. Limit type: tokens. Current
- *    limit: {n}, Remaining: {n}. Limit resets at: {ts}". Descriptor keys in
- *    source: api_key / user / team / end_user / model_per_key. This is the
- *    shape a `tpm_limit` on the per-agent virtual keys (src/litellm/
- *    provision.ts) trips.
- *  - "litellm rate limit handler" / "max parallel request limit reached" —
- *    the v1 parallel-request limiter detail "LiteLLM Rate Limit Handler for
- *    rate limit type = {t}. Max parallel request limit reached. current
- *    rpm: {n}, rpm limit: {n}…" (litellm/proxy/hooks/
- *    parallel_request_limiter.py + CommonProxyErrors).
+ *  - "litellm rate limit handler" — the v1 parallel-request limiter's
+ *    ProxyRateLimitError detail prefix: "LiteLLM Rate Limit Handler for
+ *    rate limit type = {t}. Crossed TPM / RPM / Max Parallel Request
+ *    Limit. current rpm: {n}, rpm limit: {n}…"
+ *    (litellm/proxy/hooks/parallel_request_limiter.py).
+ *  - "crossed tpm / rpm" — `CommonProxyErrors
+ *    .max_parallel_request_limit_reached.value` = "Crossed TPM / RPM / Max
+ *    Parallel Request Limit" (litellm/proxy/_types.py), interpolated into
+ *    BOTH v1 detail shapes, so it also covers the zero-limit branch's
+ *    "Max parallel request limit reached {additional_details}" message.
+ *  - "max parallel request limit reached" — the standalone prefix
+ *    `raise_rate_limit_error` builds when a key's limit is set to 0
+ *    (parallel_request_limiter.py `error_message`).
+ *
+ * The proxy-side per-key/team/user limiter (parallel_request_limiter_v3.py
+ * `_handle_rate_limit_error`) is matched by CO-OCCURRENCE instead of a
+ * per-descriptor entry — see `isLitellmProxyLocal429`. Its detail shape:
+ * "Rate limit exceeded for {descriptor}: {value}. Limit type: {t}. Current
+ * limit: {n}, Remaining: {n}. Limit resets at: {ts}". Descriptor keys in
+ * source are numerous and growing (api_key / user / team / team_member /
+ * organization / end_user / agent / agent_session / model_per_key /
+ * model_per_team / model_per_organization / model_per_project / tag_per_key
+ * / mcp_per_key / mcp_per_team as of 2026-07), so enumerating them is a
+ * treadmill: the pair "rate limit exceeded for " + "limit type:" appears in
+ * every v3 body and in no Anthropic error. This is the shape a `tpm_limit`
+ * on the per-agent virtual keys (src/litellm/provision.ts) trips.
  *
  * Deliberately EXCLUDED: the bare exception-mapping prefix
  * "litellm.RateLimitError:". LiteLLM wraps FORWARDED upstream 429s with the
@@ -149,20 +165,25 @@ export const litellmProxyLocal429Signals = [
   'model rate limit exceeded. tpm limit',
   'model rate limit exceeded. rpm limit',
   'deployment over defined rpm limit',
-  'deployment over defined tpm limit',
   'no deployments available for selected model',
-  'rate limit exceeded for api_key',
-  'rate limit exceeded for user',
-  'rate limit exceeded for team',
-  'rate limit exceeded for end_user',
-  'rate limit exceeded for model_per_key',
   'litellm rate limit handler',
+  'crossed tpm / rpm',
   'max parallel request limit reached',
 ]
 
 /**
- * True when `text` carries an EXPLICIT LiteLLM-proxy-local rate-limit marker
- * (see `litellmProxyLocal429Signals`). Never throws on weird input. Pure
+ * The v3 proxy-limiter co-occurrence pair (see the provenance comment on
+ * `litellmProxyLocal429Signals`): both substrings appear in every
+ * parallel_request_limiter_v3 429 body regardless of descriptor key, and
+ * never in an Anthropic error. Exported so tests can pin the rule.
+ */
+export const litellmV3LimiterSignalPair = ['rate limit exceeded for ', 'limit type:'] as const
+
+/**
+ * True when `text` carries an EXPLICIT LiteLLM-proxy-local rate-limit marker:
+ * one of `litellmProxyLocal429Signals`, OR the v3 limiter co-occurrence pair
+ * (`litellmV3LimiterSignalPair` — descriptor-agnostic, so new v3 descriptor
+ * keys are covered without a list update). Never throws on weird input. Pure
  * wording detection only — precedence against account-scoped wording is
  * owned by `classify429Detail` (throttle-tier.ts).
  */
@@ -170,7 +191,8 @@ export function isLitellmProxyLocal429(text: string): boolean {
   if (typeof text !== 'string' || text.length === 0) return false
   const sample = text.length > 16_384 ? text.slice(0, 16_384) : text
   const lower = sample.toLowerCase()
-  return litellmProxyLocal429Signals.some(s => lower.includes(s))
+  if (litellmProxyLocal429Signals.some(s => lower.includes(s))) return true
+  return litellmV3LimiterSignalPair.every(s => lower.includes(s))
 }
 
 /**
@@ -185,6 +207,17 @@ export function isLitellmProxyLocal429(text: string): boolean {
  *   - "Limit type: tokens. Current limit: 8000 … Limit resets at:
  *      2026-07-12 08:05:00 UTC"               (parallel_request_limiter_v3)
  *   - "Try again in 27.5 seconds"             (RouterRateLimitError cooldown)
+ *
+ * CAVEAT — the v3 "Limit resets at" timestamp is NOT reliably UTC despite
+ * the literal: litellm formats it with a naive `datetime.fromtimestamp(...)
+ * .strftime("%Y-%m-%d %H:%M:%S UTC")` (parallel_request_limiter_v3.py
+ * `_handle_rate_limit_error`), i.e. proxy-LOCAL wall-clock time with a
+ * hard-coded "UTC" suffix. We parse it as UTC (nothing better is possible
+ * from the body alone), so `resetAtMs` — and the metric fields derived from
+ * it — can be skewed by the proxy host's UTC offset when the proxy doesn't
+ * run on UTC. Treat v3-derived resets as approximate; don't chase phantom
+ * clock drift from these metrics. The rate-limit windows are ≤1 minute
+ * anyway, so the absolute timestamp is informational.
  */
 export function parseLitellmLimitDetail(
   text: string,
@@ -310,8 +343,9 @@ export function detectModelUnavailable(
   // "limit", which a negation-blind quota match could seize on). Runs after
   // step 0 deliberately: account-affirming wording, when present, can only
   // have originated upstream (LiteLLM never emits it) and wins — see the
-  // tie-break note on `classify429Detail` (throttle-tier.ts).
-  if (litellmProxyLocal429Signals.some(s => lower.includes(s))) {
+  // tie-break note on `classify429Detail` (throttle-tier.ts). Uses the full
+  // matcher (list + v3 co-occurrence pair) so every descriptor is covered.
+  if (isLitellmProxyLocal429(sample)) {
     const resetAt = parseResetTime(sample)
     return resetAt !== undefined
       ? { kind: 'overload', resetAt, raw: stderr }

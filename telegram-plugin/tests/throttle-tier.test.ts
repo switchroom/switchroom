@@ -149,6 +149,12 @@ const LITELLM_KEY_LIMIT =
 const LITELLM_ROUTER_COOLDOWN =
   'No deployments available for selected model, Try again in 27.5 seconds. ' +
   "Passed model=claude-fable-5. pre-call-checks=False, cooldown_list=['abc123def']"
+// v3 limiter, descriptor NOT in the enumerated signal list — matched by the
+// litellmV3LimiterSignalPair co-occurrence rule (model-unavailable.ts).
+const LITELLM_TEAM_MODEL_LIMIT =
+  'Rate limit exceeded for model_per_team: team-1a2b3c:claude-fable-5. ' +
+  'Limit type: tokens. Current limit: 50000, Remaining: 0. ' +
+  'Limit resets at: 2026-07-12 08:05:00 UTC'
 
 describe('decideThrottleTier — LiteLLM-proxy-local 429s never enter the tier', () => {
   // OUTCOME pin: `none` is what keeps a proxy-local cap trip off the
@@ -159,6 +165,7 @@ describe('decideThrottleTier — LiteLLM-proxy-local 429s never enter the tier',
     ['deployment tpm cap', LITELLM_TPM_CAP],
     ['virtual-key tpm_limit', LITELLM_KEY_LIMIT],
     ['router cooldown', LITELLM_ROUTER_COOLDOWN],
+    ['team model cap (non-enumerated v3 descriptor)', LITELLM_TEAM_MODEL_LIMIT],
   ])('%s → none (calm path owns it)', (_name, detail) => {
     expect(decideThrottleTier({ detail, now: NOW, thresholdMs: THRESHOLD })).toEqual({
       action: 'none',
@@ -171,6 +178,9 @@ describe('classify429Detail — three-way origin classification', () => {
     expect(classify429Detail(LITELLM_TPM_CAP)).toBe('litellm-local')
     expect(classify429Detail(LITELLM_KEY_LIMIT)).toBe('litellm-local')
     expect(classify429Detail(LITELLM_ROUTER_COOLDOWN)).toBe('litellm-local')
+    // Non-enumerated v3 descriptor — the co-occurrence pair, not a list
+    // entry, carries this one.
+    expect(classify429Detail(LITELLM_TEAM_MODEL_LIMIT)).toBe('litellm-local')
   })
 
   it('classifies Anthropic account-affirming wording as account-scoped', () => {
@@ -239,6 +249,23 @@ describe('build429ClassifiedMetric — instrumentation payload', () => {
       limit: 8000,
       current_usage: 8241,
     })
+  })
+
+  it('litellm-local NON-enumerated v3 descriptor (model_per_team) → full metric payload', () => {
+    // Finding-pin: a team-level model cap must produce the metric (it used
+    // to miss every signal → quota-exhausted → no metric at all).
+    const m = build429ClassifiedMetric({
+      agent: 'carrie',
+      detail: LITELLM_TEAM_MODEL_LIMIT,
+      classification: 'litellm-local',
+      action: 'calm',
+      now: NOW,
+    })
+    expect(m.kind).toBe('rate_limit_429_classified')
+    expect(m.classification).toBe('litellm-local')
+    expect(m.limit_type).toBe('tokens')
+    expect(m.limit).toBe(50_000)
+    expect(m.reset_at_ms).toBe(Date.UTC(2026, 6, 12, 8, 5, 0))
   })
 
   it('litellm-local v3 key limit → tokens limit type + parsed "Limit resets at" UTC reset', () => {

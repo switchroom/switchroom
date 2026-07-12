@@ -216,6 +216,14 @@ describe('detectErrorInTranscriptLine — error detection', () => {
       // Router cooldown (RouterRateLimitError).
       'API Error: 429 No deployments available for selected model, ' +
         'Try again in 27.5 seconds. Passed model=claude-fable-5.',
+      // Team-level model cap — a v3 descriptor OUTSIDE the enumerated signal
+      // list, covered only by the co-occurrence pair
+      // (litellmV3LimiterSignalPair). Pre-fix this missed every signal →
+      // quota-exhausted → scary card + failover.
+      'API Error: 429 Rate limit exceeded for model_per_team: ' +
+        'team-1a2b3c:claude-fable-5. Limit type: tokens. ' +
+        'Current limit: 50000, Remaining: 0. ' +
+        'Limit resets at: 2026-07-12 08:05:00 UTC',
     ]
     for (const text of litellmBodies) {
       const line = JSON.stringify({

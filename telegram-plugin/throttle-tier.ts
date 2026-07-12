@@ -103,6 +103,15 @@ export type RateLimit429Classification =
  * purely proxy-local 429 (limiter fired BEFORE any upstream call) cannot
  * contain Anthropic's account wording.
  *
+ * BOUND: operator events forwarded over IPC carry `detail` truncated to
+ * 1000 chars (bridge.ts `sendOperatorEvent`'s `.slice(0, 1000)`;
+ * `OPERATOR_EVENT_DETAIL_MAX` in gateway/ipc-server.ts), so on that path the
+ * tie-break sees only the first 1000 chars of the body. In practice both
+ * wordings sit well inside that window (real Anthropic and LiteLLM bodies
+ * are <400 chars), and a truncated-away account marker would merely
+ * downgrade account-scoped → litellm-local/generic-transient — the calm
+ * path, never a wrong account mark.
+ *
  * Never throws on weird input (both matchers are total).
  */
 export function classify429Detail(text: string): RateLimit429Classification {

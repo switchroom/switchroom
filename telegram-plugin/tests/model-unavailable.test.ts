@@ -36,10 +36,29 @@ const LITELLM_ROUTER_COOLDOWN_BODY =
 const LITELLM_V3_KEY_LIMIT_BODY =
   'Rate limit exceeded for api_key: hashed-key-1a2b3c. Limit type: tokens. ' +
   'Current limit: 8000, Remaining: 0. Limit resets at: 2026-07-12 08:05:00 UTC'
+// v1 shape A — the ProxyRateLimitError detail (parallel_request_limiter.py
+// ~line 124; the interpolated CommonProxyErrors.max_parallel_request_limit_
+// reached.value is "Crossed TPM / RPM / Max Parallel Request Limit").
 const LITELLM_V1_PARALLEL_BODY =
-  'LiteLLM Rate Limit Handler for rate limit type = key. Max parallel request limit ' +
-  'reached. current rpm: 61, rpm limit: 60, current tpm: 100, tpm limit: 8000, ' +
+  'LiteLLM Rate Limit Handler for rate limit type = requests. ' +
+  'Crossed TPM / RPM / Max Parallel Request Limit. ' +
+  'current rpm: 61, rpm limit: 60, current tpm: 100, tpm limit: 8000, ' +
   'current max_parallel_requests: 1, max_parallel_requests: 10'
+// v1 shape B — raise_rate_limit_error's zero-limit branch: the standalone
+// "Max parallel request limit reached" prefix + additional_details
+// (parallel_request_limiter.py ~lines 88 + 183).
+const LITELLM_V1_ZERO_LIMIT_BODY =
+  'Max parallel request limit reached Crossed TPM / RPM / Max Parallel ' +
+  'Request Limit. Hit limit for tokens. Current limits: ' +
+  'max_parallel_requests: 10, tpm_limit: 0, rpm_limit: 60'
+// v3 limiter with a descriptor OUTSIDE any enumerated list — covered by the
+// litellmV3LimiterSignalPair co-occurrence rule (v3 descriptor keys also
+// include organization / team_member / model_per_team / agent / tag_per_key
+// / mcp_per_key and keep growing, so enumeration is a treadmill).
+const LITELLM_V3_TEAM_MODEL_BODY =
+  'Rate limit exceeded for model_per_team: team-1a2b3c:claude-fable-5. ' +
+  'Limit type: tokens. Current limit: 50000, Remaining: 0. ' +
+  'Limit resets at: 2026-07-12 08:05:00 UTC'
 
 // ─── detectModelUnavailable ──────────────────────────────────────────────────
 
@@ -151,7 +170,9 @@ describe('detectModelUnavailable — LiteLLM-proxy-LOCAL 429s (never quota)', ()
     ['usage-based-routing v2 rpm wording', LITELLM_V2_STRATEGY_BODY],
     ['router cooldown (RouterRateLimitError)', LITELLM_ROUTER_COOLDOWN_BODY],
     ['virtual-key tpm_limit (parallel_request_limiter_v3)', LITELLM_V3_KEY_LIMIT_BODY],
-    ['v1 parallel-request limiter', LITELLM_V1_PARALLEL_BODY],
+    ['team model cap — non-enumerated v3 descriptor (co-occurrence rule)', LITELLM_V3_TEAM_MODEL_BODY],
+    ['v1 parallel-request limiter (Rate Limit Handler detail)', LITELLM_V1_PARALLEL_BODY],
+    ['v1 zero-limit branch (Max parallel request limit reached prefix)', LITELLM_V1_ZERO_LIMIT_BODY],
   ])('classifies %s as overload, NOT quota_exhausted', (_name, body) => {
     const d = detectModelUnavailable(body)
     expect(d?.kind).toBe('overload')
@@ -182,9 +203,29 @@ describe('isLitellmProxyLocal429 — signal matching', () => {
       LITELLM_ROUTER_COOLDOWN_BODY,
       LITELLM_V3_KEY_LIMIT_BODY,
       LITELLM_V1_PARALLEL_BODY,
+      LITELLM_V1_ZERO_LIMIT_BODY,
     ]) {
       expect(isLitellmProxyLocal429(body)).toBe(true)
     }
+  })
+
+  it('matches ANY v3 descriptor via the co-occurrence pair, not an enumerated list', () => {
+    // model_per_team is not in litellmProxyLocal429Signals — only the
+    // "rate limit exceeded for " + "limit type:" pair catches it. Same for
+    // any descriptor litellm adds later.
+    expect(isLitellmProxyLocal429(LITELLM_V3_TEAM_MODEL_BODY)).toBe(true)
+    expect(
+      isLitellmProxyLocal429(
+        'Rate limit exceeded for organization: org-1a2b3c. Limit type: requests. ' +
+          'Current limit: 100, Remaining: 0. Limit resets at: 2026-07-12 08:05:00 UTC',
+      ),
+    ).toBe(true)
+    // HALF the pair is not enough — "rate limit exceeded for" prose without
+    // the v3 "Limit type:" field must not classify proxy-local.
+    expect(
+      isLitellmProxyLocal429('Rate limit exceeded for this account, try later'),
+    ).toBe(false)
+    expect(isLitellmProxyLocal429('Limit type: tokens')).toBe(false)
   })
 
   it('does NOT match Anthropic account/wall/server wordings', () => {

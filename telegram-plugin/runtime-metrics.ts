@@ -173,7 +173,11 @@ export type RuntimeMetricEvent =
    * Anthropic throttled the account (throttle tier ran), `litellm-local` =
    * the LiteLLM proxy's own tpm/rpm/router limiter tripped (calm path, no
    * account attribution), `generic-transient` = other server-side 429/529
-   * wording. `action` is what the gateway did (throttle / failover / calm).
+   * wording. `action` is what the gateway DECIDED (throttle / failover /
+   * calm), emitted PRE-execution: the actual failover fire is dedup-gated
+   * downstream (fleetFallbackGate), so N long-reset 429s inside one dedup
+   * window emit N `action: 'failover'` metrics for ONE real roll — count
+   * decisions here, count rolls via the broker/fallback announcements.
    * Correlating `account-scoped` fires against fleet token throughput is
    * the operator's evidence base for setting LiteLLM `tpm_limit` caps; the
    * `litellm-local` count then shows those caps actually absorbing load.
