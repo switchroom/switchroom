@@ -94,6 +94,13 @@ import {
   buildExtraAttachmentMeta,
   resolveCoalesceMaxAttachments,
 } from './coalesce-attachments.js'
+import {
+  parseForwardOrigin,
+  dedupeForwardOrigins,
+  buildForwardOriginMeta,
+  forwardOriginDateIso,
+  type ForwardOriginInfo,
+} from './forward-origin.js'
 import { StatusReactionController } from '../status-reactions.js'
 import { DeferredDoneReactions } from '../reaction-defer.js'
 import { createWorkerActivityFeed, isWorkerActivityFeedEnabled } from '../worker-activity-feed.js'
@@ -7587,6 +7594,14 @@ type CoalescePayload = {
   attachment?: AttachmentMeta
   // Set only by `merge`: the 2nd..Nth attachments folded into this turn.
   extraAttachments?: CoalesceAttachment[]
+  // Forwarded-message origin of THIS entry (parsed at enqueue time from
+  // message.forward_origin). merged.ctx is the LAST entry's ctx, so a
+  // coalesced burst would otherwise lose the earlier entries' origins —
+  // each entry carries its own.
+  forwardOrigin?: ForwardOriginInfo
+  // Set only by `merge`: the distinct origins of the whole burst, arrival
+  // order, deduped (a single-origin album collapses to one entry).
+  forwardOrigins?: ForwardOriginInfo[]
 }
 
 // Count of attachment-bearing entries currently buffered per coalesce key.
@@ -7619,6 +7634,11 @@ const inboundCoalescer = createInboundCoalescer<CoalescePayload>({
       (e) => e.downloadImage != null || e.attachment != null,
       coalesceMaxAttachments(),
     )
+    // Distinct forwarded-message origins across the burst, arrival order.
+    // A forwarded album (one origin, N parts) collapses to a single entry
+    // so the attrs are emitted once; a burst forwarded from two different
+    // senders keeps both (numbered forwarded_from_2 siblings downstream).
+    const forwardOrigins = dedupeForwardOrigins(entries.map((e) => e.forwardOrigin))
     return {
       // Drop empty texts (e.g. caption-less album parts) so the join doesn't
       // emit blank lines between attachments.
@@ -7629,6 +7649,7 @@ const inboundCoalescer = createInboundCoalescer<CoalescePayload>({
       extraAttachments: extras.length > 0
         ? extras.map((e) => ({ downloadImage: e.downloadImage, attachment: e.attachment }))
         : undefined,
+      forwardOrigins: forwardOrigins.length > 0 ? forwardOrigins : undefined,
     }
   },
   onFlush: (key, merged) => {
@@ -7639,6 +7660,7 @@ const inboundCoalescer = createInboundCoalescer<CoalescePayload>({
       merged.downloadImage,
       merged.attachment,
       merged.extraAttachments,
+      merged.forwardOrigins,
     )
   },
 })
@@ -18070,7 +18092,15 @@ async function handleInboundCoalesced(
     ctx.message?.message_thread_id,
     String(from.id),
   )
-  const result = inboundCoalescer.enqueue(key, { text, ctx, downloadImage, attachment })
+  const result = inboundCoalescer.enqueue(key, {
+    text,
+    ctx,
+    downloadImage,
+    attachment,
+    // Parsed HERE (not in merge) because merge only sees the last ctx —
+    // each buffered entry keeps its own forwarded-message origin.
+    forwardOrigin: parseForwardOrigin(ctx.message?.forward_origin),
+  })
   // Coalescing disabled (window <= 0): flush immediately, preserving any
   // media this message carried.
   if (result.bypass) return handleInbound(ctx, text, downloadImage, attachment)
@@ -18149,6 +18179,11 @@ async function handleInbound(
   // resolved (photos downloaded) and surfaced as numbered meta fields
   // (image_path_2, attachment_file_id_2, …) alongside the primary.
   extraAttachments?: CoalesceAttachment[],
+  // Forwarded-message origins for a coalesced burst (deduped, arrival
+  // order — see the coalescer's merge). Left undefined by the direct /
+  // bypass call sites; handleInbound then parses THIS ctx's
+  // forward_origin itself, so single-message forwards work on every path.
+  coalescedForwardOrigins?: ForwardOriginInfo[],
 ): Promise<void> {
   markIdleActivity() // any inbound resets the idle auto-clear timer + re-arms
   const isTopicMessage = ctx.message?.is_topic_message ?? false
@@ -19367,6 +19402,19 @@ async function handleInbound(
     : undefined
   const replyToTextEscaped = formatReplyToText(replyToTextRaw, REPLY_TO_TEXT_MAX)
 
+  // Forwarded-message origin context. `forward_origin` is stamped by
+  // Telegram's servers (Bot API 7.0+) — the forwarding user cannot forge
+  // it via the message body, so it rides the trusted attrs lane and is
+  // NEVER folded into the body text. Coalesced bursts pass their deduped
+  // per-entry origins; direct/bypass paths parse this ctx's own origin.
+  // Same raw-vs-escaped split as reply_to_text: `forwardOrigins` carries
+  // raw (truncated) names for SQLite, `buildForwardOriginMeta` escapes at
+  // the channel-meta boundary.
+  const forwardOrigins = coalescedForwardOrigins
+    ?? dedupeForwardOrigins([parseForwardOrigin(ctx.message?.forward_origin)])
+  const forwardOriginMeta = buildForwardOriginMeta(forwardOrigins)
+  const primaryForwardOrigin = forwardOrigins[0]
+
   if (HISTORY_ENABLED) {
     try {
       recordInbound({
@@ -19380,6 +19428,11 @@ async function handleInbound(
         attachment_kind: attachment?.kind,
         reply_to_message_id: replyToMessageId ?? null,
         reply_to_text: replyToText ?? null,
+        forwarded_from: primaryForwardOrigin?.name ?? null,
+        forwarded_from_type: primaryForwardOrigin?.type ?? null,
+        forwarded_from_id: primaryForwardOrigin?.id != null ? String(primaryForwardOrigin.id) : null,
+        forwarded_date: forwardOriginDateIso(primaryForwardOrigin),
+        forwarded_message_id: primaryForwardOrigin?.messageId ?? null,
       })
     } catch (err) {
       process.stderr.write(`telegram gateway: history recordInbound failed: ${err}\n`)
@@ -19485,6 +19538,11 @@ async function handleInbound(
       // Use the XML-escaped form for the meta — the raw form is in the
       // SQLite buffer for verbatim retrieval via get_recent_messages.
       ...(replyToTextEscaped != null && replyToTextEscaped.length > 0 ? { reply_to_text: replyToTextEscaped } : {}),
+      // Forwarded-message origin (server-stamped, attrs-only — see above).
+      // forwarded_from / forwarded_from_type / forwarded_from_id /
+      // forwarded_date, plus numbered _2.. siblings for a multi-origin
+      // burst. Names are XML-escaped inside buildForwardOriginMeta.
+      ...forwardOriginMeta,
       // queued="true" when mid-turn with no steer prefix (new default), or
       // with explicit /queue or /q prefix (legacy alias).
       ...((isQueuedMidTurn || isQueuedPrefix) ? { queued: 'true' } : {}),

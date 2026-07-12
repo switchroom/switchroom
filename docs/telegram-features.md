@@ -108,6 +108,41 @@ the agent then sees the primary attachment in the usual `image_path` /
 the cap spill into the next turn. Each attachment is downloaded before
 the turn starts, so a high cap on a slow link delays turn start.
 
+## Forwarded-message origin
+
+Forward a message to an agent and it sees who originally sent it — not
+just the body text. Telegram stamps `forward_origin` server-side
+(Bot API 7.0+), so the sender can't fake provenance by typing; the
+gateway surfaces it as `<channel>` tag attributes only, never merged
+into the (sender-controlled) body:
+
+- `forwarded_from` — the original sender's human-readable name or
+  chat/channel title, plus `(@username)` when public. Names are
+  attacker-controlled display strings: truncated to 100 chars and
+  XML-escaped before they reach the tag.
+- `forwarded_from_type` — `user`, `hidden_user`, `chat`, or `channel`.
+  `hidden_user` means the original sender enabled forward privacy: the
+  name is self-reported with no verifiable id — agents are told not to
+  treat it as an authenticated identity.
+- `forwarded_from_id` — the numeric user/chat id when the origin shape
+  exposes one (supplementary; absent for `hidden_user`).
+- `forwarded_date` — ISO timestamp of the original message.
+
+A multi-part forward from one origin (an album) emits the attributes
+once; a coalesced burst forwarded from several different origins gets
+numbered siblings (`forwarded_from_2`, `forwarded_from_type_2`, …),
+the same convention as `image_path_2`. A coalesced burst can also mix
+a forward with the sender's own typed commentary inside the same
+window — the attributes describe the burst as a whole, not each line
+of the body. The origin also lands on the inbound row in the SQLite
+history buffer, so `get_recent_messages` can recover it after a
+restart; for a multi-origin burst only the primary (first) origin is
+persisted there — origins 2+ appear only in the delivered tag.
+
+Deliberately not built (v1): no id→agent-name resolution against the
+fleet config, no origin lookup when the user replies to an old forward,
+and no changes to outbound `forward_message`.
+
 ## Interrupt timing — safe-boundary `!`
 
 A `!`-prefix message interrupts the agent: it SIGINTs the in-flight turn
