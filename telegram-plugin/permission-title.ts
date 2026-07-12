@@ -20,7 +20,7 @@
 import { basename } from "node:path";
 import { escapeMarkdown } from "./card-format.js";
 import { prettyMcpServer, type ScopeOption } from "./permission-rule.js";
-import { redact } from "./secret-detect/redact.js";
+import { redact, REDACTED_MARKER } from "./secret-detect/redact.js";
 
 const COMMAND_TITLE_MAX = 48;
 const DESCRIPTION_LINE_MAX = 240;
@@ -64,6 +64,25 @@ const CONTEXT_NOISE_KEYS = new Set([
   "inline_keyboard",
   "file_id",
 ]);
+
+/**
+ * Input keys whose VALUE is credential-shaped by name — hard-masked whole,
+ * never partially revealed (#3167 review). The token-shape detectors in
+ * `redact()` need a random-looking value to fire, so a low-entropy password
+ * or a short secret under one of these keys would otherwise slip through the
+ * synthesized `context:` line. Matching the key is the reliable signal.
+ */
+const SENSITIVE_VALUE_KEY_RE =
+  /token|secret|password|passwd|key|auth|dsn|conn|url|credential|cookie|session/i;
+
+/**
+ * Credential-bearing DSN schemes that `redactUrls()` (inside `redact()`) does
+ * NOT cover — it only handles http(s)/ws(s)/ftp. A `postgres://user:pass@host`
+ * DATABASE_URL is a real vault-key shape here, so mask the whole DSN when its
+ * authority carries a `user:pass@` credential (#3167 review).
+ */
+const NON_HTTP_DSN_RE =
+  /\b(?:postgres(?:ql)?|mysql|mariadb|redis|rediss|mongodb(?:\+srv)?|amqp|amqps):\/\/\S*@\S+/gi;
 
 /**
  * Human verb-phrases for switchroom-managed MCP tools. The raw
@@ -656,7 +675,20 @@ export function synthesizeContext(
   // target) — the substance the title's verb-phrase does NOT already carry.
   // When the input exposes nothing meaningful, fall back to the natural
   // action so the line still names the tool rather than reading empty.
-  return summary ?? naturalAction(toolName, inputPreview);
+  const base = summary ?? naturalAction(toolName, inputPreview);
+  // Acceptance criteria (#3167) call for "tool + summarized input +
+  // originating turn". When the call carries a forum-topic origin turn,
+  // append a compact reference so the operator can tie the card to the turn
+  // that spawned it. Kept short — it's a routing id, not prose.
+  const turnRef = input ? readString(input, "origin_turn_id") : null;
+  return turnRef ? `${base} · turn ${shortTurnRef(turnRef)}` : base;
+}
+
+/** Compact display form of an origin-turn id — the tail is the distinguishing
+ *  part; a full opaque id would swamp the line. */
+function shortTurnRef(turnId: string): string {
+  const t = turnId.trim();
+  return t.length <= 10 ? t : `…${t.slice(-8)}`;
 }
 
 /**
@@ -668,6 +700,14 @@ export function synthesizeContext(
  * value dump — avoids leaking PII/secrets and oversized blobs). Returns null
  * when nothing meaningful remains, so the caller falls back to the bare
  * action phrase.
+ *
+ * Free-text fields (e.g. a reply `text`) surface as content — a conscious
+ * choice (#3167 review, LOW-1): the operator NEEDS to see *what* is being
+ * sent to judge the card. Exposure is bounded to {@link ARG_VALUE_MAX} chars
+ * and every value is redaction-passed via {@link redactSalientValue}, so a
+ * card can never leak more than the outbound reply already does in history
+ * (both use the same `redact()` chokepoint). We do not mask free text to a
+ * placeholder, which would gut the card's usefulness.
  */
 function salientInputSummary(input: Record<string, unknown>): string | null {
   const parts: string[] = [];
@@ -682,7 +722,7 @@ function salientInputSummary(input: Record<string, unknown>): string | null {
       parts.push(key); // nested object/array → key name only, never dumped
       continue;
     }
-    const shown = truncate(redact(String(value)), ARG_VALUE_MAX);
+    const shown = truncate(redactSalientValue(key, String(value)), ARG_VALUE_MAX);
     if (shown.length === 0) continue;
     parts.push(`${key}: ${shown}`);
   }
@@ -691,6 +731,32 @@ function salientInputSummary(input: Record<string, unknown>): string | null {
   return joined.length > ARG_SUMMARY_LINE_MAX
     ? joined.slice(0, ARG_SUMMARY_LINE_MAX - 1) + "…"
     : joined;
+}
+
+/**
+ * Redact a single salient value for display on the synthesized `context:`
+ * line, given its input KEY (#3167 review). Three layers, defense-in-depth:
+ *
+ *   1. Hard-mask whole when the key is credential-shaped
+ *      ({@link SENSITIVE_VALUE_KEY_RE}) — the token-shape detectors need a
+ *      random-looking value, so a low-entropy password / short secret under a
+ *      `token`/`password`/`api_key` key would otherwise leak. The key name is
+ *      the reliable signal.
+ *   2. Mask non-http DSN credentials ({@link NON_HTTP_DSN_RE}) that
+ *      `redactUrls()` misses (postgres://user:pass@host, mysql://, redis://…).
+ *   3. Run `redact()` WITH the key restored as `key=value` context, so the
+ *      contextual detectors (`kv_entropy` / `env_key_value`) that require the
+ *      `key[:=]value` shape in one string can fire — then strip the synthetic
+ *      `key=` prefix. Redacting the BARE value (the pre-review bug) blinded
+ *      those detectors, since `redact()` deliberately excludes the
+ *      low-precision `generic_high_entropy` fallback.
+ */
+function redactSalientValue(key: string, value: string): string {
+  if (SENSITIVE_VALUE_KEY_RE.test(key)) return REDACTED_MARKER;
+  const dsnScrubbed = value.replace(NON_HTTP_DSN_RE, REDACTED_MARKER);
+  const scrubbed = redact(`${key}=${dsnScrubbed}`);
+  const prefix = `${key}=`;
+  return scrubbed.startsWith(prefix) ? scrubbed.slice(prefix.length) : scrubbed;
 }
 
 /**
