@@ -10353,6 +10353,13 @@ const bridgeDeadWatchdog = createBridgeDeadWatchdog({
   // consecutive-escalation count. At the cap, arm() stands down loudly
   // instead of restart-looping a deterministically-failing bridge.
   priorStreak: bridgeDeadPriorStreak,
+  // #3086 — only THIS gateway's own primary bridge (registering under
+  // $SWITCHROOM_AGENT_NAME) drives the watchdog. A secondary/relay client
+  // (e.g. `overlord-relay`) registering a different name into this socket
+  // is named + non-cron but must NOT mark the (still-alive) primary bridge
+  // dead when it disconnects. Empty string ⟹ fall back to the pre-#3086
+  // "any named non-cron client" test inside the watchdog.
+  selfAgentName: process.env.SWITCHROOM_AGENT_NAME ?? '',
 })
 if (BRIDGE_DEAD_ESCALATION_ENABLED) {
   bridgeDeadWatchdog.arm()
@@ -10392,10 +10399,11 @@ const ipcServer: IpcServer = createIpcServer({
       : []
     // #3038 — a REAL (named, non-cron) bridge registered: stand the
     // bridge-dead watchdog down. Anonymous clients (recall.py, mcp
-    // handshakes) and cron-session bridges must NOT satisfy it — the
-    // watchdog gates on the identity INTERNALLY (isRealBridgeIdentity), so
-    // this call is safe wherever it sits relative to the cron early-return
-    // above (#3038 review finding 5).
+    // handshakes), cron-session bridges, and secondary/relay clients
+    // registering a name other than this gateway's own agent (#3086) must
+    // NOT satisfy it — the watchdog gates on the identity INTERNALLY
+    // (isRealBridgeIdentity vs selfAgentName), so this call is safe wherever
+    // it sits relative to the cron early-return above (#3038 review finding 5).
     bridgeDeadWatchdog.noteBridgeRegistered(client.agentName)
     client.send({ type: 'status', status: 'agent_connected' })
 
@@ -10589,8 +10597,10 @@ const ipcServer: IpcServer = createIpcServer({
       // #3038 — the real bridge went away mid-life. Re-arm the grace
       // window: a normal claude restart re-registers within seconds and
       // stands it down; a bridge that died for good escalates once (the
-      // once-per-boot fuse inside the watchdog caps it). Cron/anonymous
-      // identities are ignored inside the watchdog itself (finding 5).
+      // once-per-boot fuse inside the watchdog caps it). Cron/anonymous and
+      // secondary/relay identities (a name other than this gateway's own
+      // agent, #3086) are ignored inside the watchdog itself (finding 5) —
+      // so a transient relay disconnect never bounces a healthy container.
       if (BRIDGE_DEAD_ESCALATION_ENABLED) bridgeDeadWatchdog.noteBridgeDisconnected(client.agentName)
     }
 

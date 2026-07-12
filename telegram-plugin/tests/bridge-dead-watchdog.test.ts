@@ -99,6 +99,9 @@ function makeWatchdog(overrides: Partial<BridgeDeadWatchdogOpts> = {}) {
   const state = { sessionAlive: true, shuttingDown: false, escalateResult: true }
   const wd = createBridgeDeadWatchdog({
     graceMs: 90_000,
+    // The gateway serves AGENT — only AGENT's own bridge drives the
+    // watchdog (#3086). Overridable per-test.
+    selfAgentName: AGENT,
     isSessionAlive: () => state.sessionAlive,
     isShuttingDown: () => state.shuttingDown,
     escalate: (reason) => {
@@ -383,6 +386,64 @@ describe('cron / anonymous identity gating', () => {
     expect(harness.liveCount()).toBe(0)
     wd.noteBridgeDisconnected(null) // recall.py one-shot closing
     expect(harness.liveCount()).toBe(0) // did not re-arm
+  })
+})
+
+// ─── #3086: secondary/relay identity gating ──────────────────────────────────
+//
+// Repro of the klanker incident: a short-lived `overlord-relay` IPC client
+// registers and disconnects against klanker's gateway socket while klanker's
+// OWN bridge is registered and actively replying. Pre-fix, isRealBridgeIdentity
+// treated the relay (named, non-cron) as the real bridge, so its disconnect
+// flipped bridgeRegistered=false, re-armed the grace window, and 90s later the
+// watchdog SIGTERM'd a healthy container — killing the in-flight claude session.
+describe('#3086 secondary/relay identity gating', () => {
+  const RELAY = 'overlord-relay' // a DIFFERENT agent name than AGENT
+
+  it('a relay disconnecting while the primary bridge is alive does NOT re-arm or escalate', () => {
+    const { wd, harness, escalations } = makeWatchdog() // selfAgentName === AGENT
+    wd.arm()
+    wd.noteBridgeRegistered(AGENT) // klanker's own bridge — healthy
+    expect(harness.liveCount()).toBe(0) // grace timer stood down
+    // The relay connects then disconnects (flood-ban workaround churn).
+    wd.noteBridgeRegistered(RELAY)
+    wd.noteBridgeDisconnected(RELAY)
+    // Must NOT re-arm: the primary bridge never went away.
+    expect(harness.liveCount()).toBe(0)
+    expect(escalations).toEqual([])
+    expect(wd.hasEscalated()).toBe(false)
+  })
+
+  it('a relay register does NOT satisfy the watchdog (only the primary bridge does)', () => {
+    const { wd, harness, escalations } = makeWatchdog()
+    wd.arm()
+    wd.noteBridgeRegistered(RELAY) // relay is not THIS gateway's bridge
+    expect(harness.liveCount()).toBe(1) // still armed — primary still missing
+    harness.fireLatest()
+    // Primary bridge genuinely absent → the real failure still escalates.
+    expect(escalations).toEqual([BRIDGE_DEAD_RESTART_REASON])
+  })
+
+  it('a genuine PRIMARY bridge death still escalates (fix does not over-suppress)', () => {
+    const { wd, harness, escalations } = makeWatchdog()
+    wd.arm()
+    wd.noteBridgeRegistered(AGENT) // primary registers
+    expect(harness.liveCount()).toBe(0)
+    wd.noteBridgeDisconnected(AGENT) // primary dies for good, never reconnects
+    expect(harness.liveCount()).toBe(1) // re-armed
+    harness.fireLatest()
+    expect(escalations).toEqual([BRIDGE_DEAD_RESTART_REASON])
+  })
+
+  it('fallback: with no selfAgentName, any named non-cron client still counts (pre-#3086)', () => {
+    const { wd, harness, escalations } = makeWatchdog({ selfAgentName: '' })
+    wd.arm()
+    wd.noteBridgeRegistered(RELAY) // no identity to match against → treated as real
+    expect(harness.liveCount()).toBe(0) // satisfied the watchdog
+    wd.noteBridgeDisconnected(RELAY)
+    expect(harness.liveCount()).toBe(1) // re-armed
+    harness.fireLatest()
+    expect(escalations).toEqual([BRIDGE_DEAD_RESTART_REASON])
   })
 })
 
