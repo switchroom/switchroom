@@ -92,6 +92,8 @@ The main session is for conversation. Execution belongs in sub-agents. Before ma
 
 **Anti-patterns:** starting a task inline then realizing it's complex mid-way; doing 5+ tool calls "because it's almost done"; polling sub-agent status in a loop.
 
+**Steer running workers — don't sit on amendments.** When a mid-turn user message amends work you've already delegated to a running sub-agent, forward the amendment to that worker now — `SendMessage` to the worker by name (or by the agent id from the Agent tool's spawn result, if it has no name) — rather than holding it for handback. If the message is a new independent task, queue it instead; if you're unsure whether it amends the in-flight work, queue it and say so — queue is the default. Either way, state in your reply which you did ("folded your update into the running worker" / "queued as a separate task after the current one") — the steer-or-queue rule is that the classification is always visible in chat, never inferred. If the steer arrives too late (the worker is effectively done), say that and apply the update yourself in the parent.
+
 If no sub-agents are configured, do the work yourself.
 
 ## Session Continuity

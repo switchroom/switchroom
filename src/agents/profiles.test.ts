@@ -556,3 +556,76 @@ describe("renderDevProtocolFragment", () => {
     expect(fragment.length).toBeGreaterThan(500);
   });
 });
+
+describe("steer-forwarding guidance — delegation-carrying profile templates", () => {
+  // Job spec: reference/jobs/steer-or-queue-mid-flight.md. Gap: when a
+  // mid-turn user message amends work already delegated to a running
+  // background sub-agent, agents tended to hold the amendment until
+  // handback instead of steering the worker (the harness supports it —
+  // SendMessage continues a spawned agent by name, or by the agent id
+  // from the Agent tool's spawn result). The job spec's never-ship list
+  // bans silent classification, so the guidance must also require saying
+  // steer-vs-queue in the reply; and because the spec's default for an
+  // unmarked follow-up is QUEUE, the guidance must carry the ambiguity
+  // tiebreak ("queue it and say so") rather than biasing toward steer.
+  // Pinned on BOTH templates that carry delegation guidance: default
+  // (full Sub-Agent Delegation section) and coding (short form) — on the
+  // raw .hbs AND on the rendered output (same Handlebars compose path as
+  // the scaffold), so a future conditional wrapper that stops the
+  // paragraph rendering is caught too.
+
+  const readTemplate = (profile: string): string =>
+    readFileSync(join(getProfilePath(profile), "CLAUDE.md.hbs"), "utf-8");
+
+  const renderTemplate = async (profile: string): Promise<string> => {
+    const Handlebars = (await import("handlebars")).default;
+    return Handlebars.compile(readTemplate(profile), { noEscape: true })({});
+  };
+
+  it("default profile: forwards mid-turn amendments to the running worker via SendMessage", () => {
+    const template = readTemplate("default");
+    expect(template).toContain("SendMessage");
+    expect(template.toLowerCase()).toContain("rather than holding it for handback");
+  });
+
+  it("default profile: carries the ambiguity tiebreak — unsure means queue, said out loud", () => {
+    const template = readTemplate("default");
+    expect(template.toLowerCase()).toContain("queue it and say so");
+    expect(template.toLowerCase()).toContain("queue is the default");
+  });
+
+  it("default profile: requires stating steer-vs-queue in the reply, never inferred", () => {
+    const template = readTemplate("default");
+    expect(template.toLowerCase()).toContain("folded your update into the running worker");
+    expect(template.toLowerCase()).toContain("queued as a separate task");
+    expect(template.toLowerCase()).toContain("never inferred");
+  });
+
+  it("default profile: covers the too-late steer (worker done → apply in the parent)", () => {
+    const template = readTemplate("default");
+    expect(template.toLowerCase()).toContain("effectively done");
+    expect(template.toLowerCase()).toContain("apply the update yourself in the parent");
+  });
+
+  it("coding profile: carries the same steer-forwarding + visibility rule", () => {
+    const template = readTemplate("coding");
+    expect(template).toContain("SendMessage");
+    expect(template.toLowerCase()).toContain("never classify silently");
+    expect(template.toLowerCase()).toContain("effectively done");
+  });
+
+  it("coding profile: carries the ambiguity tiebreak — unsure means queue, said out loud", () => {
+    const template = readTemplate("coding");
+    expect(template.toLowerCase()).toContain("queue it and say so");
+    expect(template.toLowerCase()).toContain("queue is the default");
+  });
+
+  it("both profiles: the steer guidance survives Handlebars rendering (not lost to a conditional)", async () => {
+    for (const profile of ["default", "coding"]) {
+      const rendered = (await renderTemplate(profile)).toLowerCase();
+      expect(rendered, `${profile}: steer handle`).toContain("sendmessage");
+      expect(rendered, `${profile}: ambiguity tiebreak`).toContain("queue it and say so");
+      expect(rendered, `${profile}: too-late steer`).toContain("effectively done");
+    }
+  });
+});
