@@ -251,7 +251,7 @@ export interface ModelCommandReply {
 }
 
 const PERSIST_NOTE =
-  '_Sticky — persists across restarts, deploys, and crashes until \`/model default\` clears it (or the configured \`model:\` in switchroom.yaml changes, which resets it and notifies you). To change the default, set \`model:\` in switchroom.yaml._'
+  '_Session-only — this override lasts until the agent’s next restart, then reverts to the configured \`model:\`. \`/model default\` clears it now. To change the default permanently, set \`model:\` in switchroom.yaml._'
 
 function helpText(deps: ModelCommandDeps, reason?: string): ModelCommandReply {
   const srAliasExamples = Object.keys(SR_MODEL_ALIASES).map(a => `\`${a}\``).join(' · ')
@@ -583,18 +583,19 @@ export const SR_MODEL_ALIASES: Record<string, string> = {
 
 /** Expand a short alias (case-insensitive) to its full sr-* id, or return the original. */
 /**
- * #3042 review blocker 2a: can `token` be trusted for a DURABLE, boot-applied
- * `.session-model` persist WITHOUT a live confirmation from claude?
+ * #3042 review blocker 2a: can `token` be trusted for a boot-applied
+ * `.session-model` carrier persist WITHOUT a live confirmation from claude?
  *
  * A queued typed `/model <arg>` that is persisted at shutdown was never
- * validated by claude's picker — and under the keep-by-default boot (#3039)
- * a garbage-but-shape-valid token (e.g. `claude-nonexistnet-9`) would make
- * every boot run `claude --model <garbage>` with the gateway dead. Only
- * tokens with a switchroom-known meaning are offline-trustable: the static
- * Claude aliases (claude resolves them itself) and the curated sr-* alias
- * TARGETS (present in the LiteLLM config by construction). Full `claude-*` /
- * arbitrary `sr-*` ids typed by hand are refused — they need the live
- * session to verify, so the operator is asked to re-issue after boot.
+ * validated by claude's picker. Under the consume-once carrier (rev 4) a
+ * garbage-but-shape-valid token (e.g. `claude-nonexistnet-9`) can crash at
+ * most ONE boot before the carrier is gone and the agent reverts — but we
+ * still avoid even that crash-boot. Only tokens with a switchroom-known
+ * meaning are offline-trustable: the static Claude aliases (claude resolves
+ * them itself) and the curated sr-* alias TARGETS (present in the LiteLLM
+ * config by construction). Full `claude-*` / arbitrary `sr-*` ids typed by
+ * hand are refused — they need the live session to verify, so the operator is
+ * asked to re-issue after boot.
  */
 export function isOfflineTrustedModelToken(token: string): boolean {
   // #3043 item 1: the live accept path normalizes case (isClaudeModel /
@@ -909,18 +910,19 @@ export interface ModelCallbackOutcome {
   /**
    * The canonical `claude --model` token (alias or full `claude-*` id) for a
    * Claude selection, when derivable — distinct from `selectedModel` (a display
-   * name for /status). The gateway persists this to the durable
-   * `.session-model` override so the confirmed switch survives
-   * switchroom-managed relaunches (and, on an sr-* → Claude transition, its own
+   * name for /status). Session-scoped (rev 4): a live Claude selection persists
+   * NO carrier (the switch applies in-session and reverts on the next boot);
+   * the gateway uses this token ONLY on an sr-* → Claude transition, writing it
+   * to the consume-once `.session-model` carrier so that transition's own
+   * apply-relaunch boots the tapped model (then reverts on the following
    * restart). Absent when the target has no derivable token.
    */
   selectedModelToken?: string
   /**
    * True when the confirmed selection was the "Default (recommended)" row —
-   * i.e. the session is now on the configured default and any sticky
-   * `.session-model` override must be CLEARED (there is no token to persist;
-   * persisting nothing while leaving a stale override would re-apply the old
-   * model on the next keep-relaunch).
+   * i.e. the session is now on the configured default and any leftover
+   * `.session-model` carrier must be CLEARED (a stale carrier would be
+   * consumed — mis-applied — by the next boot).
    */
   clearedDefault?: boolean
   /** Short toast for answerCallbackQuery. */

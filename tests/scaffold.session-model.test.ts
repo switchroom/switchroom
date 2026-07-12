@@ -7,17 +7,17 @@ import { scaffoldAgent } from "../src/agents/scaffold.js";
 import { isValidModelArg } from "../telegram-plugin/gateway/model-command.js";
 import type { AgentConfig, SwitchroomConfig, TelegramConfig } from "../src/config/schema.js";
 
-// Session-scoped /model stickiness — the rendered start.sh boot resolver
-// (reference/rfcs/session-model-stickiness.md). Successor to
-// scaffold.session-model-override.test.ts (one-shot carrier, retired).
+// Session-scoped /model — the rendered start.sh boot resolver
+// (reference/rfcs/session-model-stickiness.md §0.1, rev 4). Driven as
+// sh-harness fixtures against the RENDERED block.
 //
-// Contract under test (#3039 rev 3, keep-by-default), driven as sh-harness
-// fixtures against the RENDERED block: the durable `.session-model` override
-// is applied on EVERY boot — crash, deploy, raw `docker restart`, stale or
-// corrupt intent all KEEP it. Only a FRESH (<10 min, embedded ts) explicit
-// "revert" `.relaunch-model-intent`, corruption, or a configured-default
-// change clears it — and every clearing path writes a `.session-model-alert`
-// notice the gateway relays to chat.
+// Contract under test (CONSUME-ONCE): a `.session-model` carrier is applied on
+// the single boot that reads it and then DELETED, so the model-apply relaunch
+// picks it up and EVERY subsequent restart reverts to the configured default.
+// There is no `.relaunch-model-intent`, no crashloop counter, and no
+// kept-notified sentinel. Invalidation (corrupt / configured-default changed /
+// sr-*+LiteLLM-down) drops the carrier and writes a `.session-model-alert` the
+// gateway relays.
 
 const telegramConfig: TelegramConfig = {
   bot_token: "123456:ABC-DEF",
@@ -60,17 +60,12 @@ function extractBlock(startSh: string): string {
   return startSh.slice(start, end);
 }
 
-/** One-line durable override JSON, same shape the gateway writes. */
+/** One-line carrier JSON, same shape the gateway writes. */
 function sessionModelJson(model: string, cfg = DEFAULT_MODEL, ts = Date.now()): string {
   return `${JSON.stringify({ model, configuredDefaultAtWrite: cfg, ts })}\n`;
 }
 
-/** One-line intent JSON, same shape the gateway writes. */
-function intentJson(intent: string, ts = Date.now(), reason = "test"): string {
-  return `${JSON.stringify({ intent, reason, ts })}\n`;
-}
-
-describe("scaffoldAgent: session-model stickiness boot resolver (start.sh)", () => {
+describe("scaffoldAgent: session-model consume-once boot resolver (start.sh)", () => {
   let tmpDir: string;
   let agentDir: string;
   let block: string;
@@ -118,13 +113,20 @@ describe("scaffoldAgent: session-model stickiness boot resolver (start.sh)", () 
     return readFileSync(join(agentDir, ".session-model-alert"), "utf-8");
   }
 
-  it("renders the durable-override + intent wiring in start.sh", () => {
+  it("renders the consume-once carrier wiring in start.sh (no intent resolution)", () => {
     expect(block).toContain(".session-model");
-    expect(block).toContain(".relaunch-model-intent");
     expect(block).toContain(".configured-default-model");
     expect(block).toContain(".session-model-alert");
     // Migration shim still consumes the legacy one-shot carrier.
     expect(block).toContain(".session-model-override");
+    // The retired keep/revert intent + crashloop machinery is no longer
+    // RESOLVED — the retired filenames appear only in the one-line hygiene
+    // `rm -f` (#3184 LOW-2), never in a read/parse/stamp.
+    expect(block).not.toContain('"intent"');
+    expect(block).not.toContain("_sm_revert");
+    expect(block).not.toMatch(/(cat|read -r|<)[^\n]*\.relaunch-model-intent/);
+    expect(block).not.toMatch(/(cat|read -r|<)[^\n]*\.session-model-boot-attempts/);
+    expect(block).not.toMatch(/(cat|read -r|<)[^\n]*\.session-model-kept-notified/);
     // modelQ is assigned BARE (already shell-quoted by the scaffold).
     expect(block).toContain("_EFFECTIVE_MODEL='claude-sonnet-5'");
     const startSh = readFileSync(join(agentDir, "start.sh"), "utf-8");
@@ -132,18 +134,31 @@ describe("scaffoldAgent: session-model stickiness boot resolver (start.sh)", () 
     expect(startSh).not.toContain("--model {{{modelQ}}}");
   });
 
+  it("cleans up the retired rev-3 files on boot (#3184 LOW-2 hygiene)", () => {
+    // Simulate a fleet rollout onto an agent dir that still carries the
+    // retired intent/crashloop/dedup files from the keep-by-default era.
+    writeFileSync(join(agentDir, ".relaunch-model-intent"), `${JSON.stringify({ intent: "keep", reason: "old", ts: Date.now() })}\n`);
+    writeFileSync(join(agentDir, ".session-model-boot-attempts"), "2 12345\n");
+    writeFileSync(join(agentDir, ".session-model-kept-notified"), "claude-opus-4-8\n");
+    expect(runBlock("1")).toBe(DEFAULT_MODEL);
+    expect(existsSync(join(agentDir, ".relaunch-model-intent"))).toBe(false);
+    expect(existsSync(join(agentDir, ".session-model-boot-attempts"))).toBe(false);
+    expect(existsSync(join(agentDir, ".session-model-kept-notified"))).toBe(false);
+    // A stale intent file has NO effect on carrier resolution: a carrier still
+    // applies + consumes regardless of any leftover intent content.
+    writeFileSync(join(agentDir, ".relaunch-model-intent"), `${JSON.stringify({ intent: "revert", reason: "old", ts: Date.now() })}\n`);
+    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8"));
+    expect(runBlock("1")).toBe("claude-opus-4-8");
+    expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
+    expect(existsSync(join(agentDir, ".relaunch-model-intent"))).toBe(false);
+  });
+
   // ── MODEL_ARG_RE byte-parity against the RENDERED start.sh ────────────────
-  // The sh shape gate and the gateway's MODEL_ARG_RE must accept/reject the
-  // same tokens, or a gateway-persisted override could be dropped (or worse,
-  // an sh-accepted string the gateway never validated could launch). Extract
-  // the grep -Eq pattern from the RENDERED script and drive BOTH gates over
-  // one fixture list.
   it("shape gate is byte-parity with MODEL_ARG_RE (rendered start.sh vs gateway)", () => {
     const startSh = readFileSync(join(agentDir, "start.sh"), "utf-8");
     const patterns = [...startSh.matchAll(/grep -Eq '([^']+)'/g)].map((m) => m[1]);
     const shapePatterns = patterns.filter((p) => p.includes("{0,99}"));
-    expect(shapePatterns.length).toBeGreaterThanOrEqual(2); // durable gate + migration gate
-    // All rendered shape gates are the same bytes.
+    expect(shapePatterns.length).toBeGreaterThanOrEqual(2); // carrier gate + migration gate
     for (const p of shapePatterns) expect(p).toBe(shapePatterns[0]);
     const shPattern = shapePatterns[0];
     const fixtures: Array<[string, boolean]> = [
@@ -170,109 +185,33 @@ describe("scaffoldAgent: session-model stickiness boot resolver (start.sh)", () 
     }
   });
 
-  it("no override, no intent → boots default, records .configured-default-model + .active-session-model", () => {
+  it("no carrier → boots default, records .configured-default-model + no alert", () => {
     expect(runBlock("1")).toBe(DEFAULT_MODEL);
     expect(readFileSync(join(agentDir, ".configured-default-model"), "utf-8").trim()).toBe(DEFAULT_MODEL);
-    expect(readFileSync(join(agentDir, ".active-session-model"), "utf-8").trim()).toBe(DEFAULT_MODEL);
     expect(existsSync(join(agentDir, ".session-model-alert"))).toBe(false);
   });
 
-  // ── keep path (row 11: watchdog / recovery bounce) ────────────────────────
-  it("override + fresh keep intent → applies the override, RETAINS the file, consumes the intent, announces", () => {
-    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8"));
-    writeFileSync(join(agentDir, ".relaunch-model-intent"), intentJson("keep", Date.now(), "schedule-restart-immediate"));
-    expect(runBlock("1")).toBe("claude-opus-4-8");
-    // Durable: NOT consumed on a keep boot.
-    expect(existsSync(join(agentDir, ".session-model"))).toBe(true);
-    // Intent is one-shot.
-    expect(existsSync(join(agentDir, ".relaunch-model-intent"))).toBe(false);
-    // Rendered notice: an involuntary bounce never SILENTLY continues on a
-    // non-default model.
-    expect(alertText()).toContain("`claude-opus-4-8` kept across this relaunch");
-    expect(alertText()).toContain("/model default");
-  });
-
-  // ── keep-by-default paths (#3039) ────────────────────────────────────────
-  it("override + NO intent (crash / raw docker restart / deploy) → KEEPS the override and announces", () => {
+  // ── requirement (a): the apply-relaunch picks up the carrier ─────────────
+  it("valid carrier → APPLIES the override this boot and CONSUMES the carrier (no boot alert)", () => {
     writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8"));
     expect(runBlock("1")).toBe("claude-opus-4-8");
-    expect(existsSync(join(agentDir, ".session-model"))).toBe(true);
-    const alert = alertText();
-    expect(alert).toContain("`claude-opus-4-8` kept across this relaunch");
-    expect(alert).toContain("/model default");
-  });
-
-  it("override + revert intent → reverts and the notice carries the intent's reason", () => {
-    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("sr-glm-5"));
-    writeFileSync(join(agentDir, ".relaunch-model-intent"), intentJson("revert", Date.now(), "user: /restart from chat"));
-    expect(runBlock("1")).toBe(DEFAULT_MODEL);
+    // Consume-once: the carrier is deleted on the apply boot.
     expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
-    expect(existsSync(join(agentDir, ".relaunch-model-intent"))).toBe(false);
-    expect(alertText()).toContain("user: /restart from chat");
+    // The gateway already acked the /model in chat — no boot alert on apply.
+    expect(existsSync(join(agentDir, ".session-model-alert"))).toBe(false);
   });
 
-  it("override + STALE revert intent (>10 min by embedded ts) → treated as no intent, KEEPS", () => {
+  // ── requirement (b): the next restart reverts to the configured default ──
+  it("SUBSEQUENT restart (carrier already consumed) → reverts to the configured default", () => {
     writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8"));
-    writeFileSync(join(agentDir, ".relaunch-model-intent"), intentJson("revert", Date.now() - 11 * 60_000));
-    expect(runBlock("1")).toBe("claude-opus-4-8");
-    expect(existsSync(join(agentDir, ".session-model"))).toBe(true);
-  });
-
-  it("override + corrupt intent → treated as no intent, KEEPS; intent consumed", () => {
-    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8"));
-    writeFileSync(join(agentDir, ".relaunch-model-intent"), "not json at all\n");
-    expect(runBlock("1")).toBe("claude-opus-4-8");
-    expect(existsSync(join(agentDir, ".session-model"))).toBe(true);
-    expect(existsSync(join(agentDir, ".relaunch-model-intent"))).toBe(false);
-  });
-
-  // ── keep-gated hygiene branches ──────────────────────────────────────────
-  it("keep + corrupt .session-model → deletes it, boots default", () => {
-    writeFileSync(join(agentDir, ".session-model"), "{broken\n");
-    writeFileSync(join(agentDir, ".relaunch-model-intent"), intentJson("keep"));
-    expect(runBlock("1")).toBe(DEFAULT_MODEL);
+    expect(runBlock("1")).toBe("claude-opus-4-8"); // apply-relaunch
+    expect(runBlock("1")).toBe(DEFAULT_MODEL); // any later restart
+    expect(runBlock("1")).toBe(DEFAULT_MODEL); // and every one after
     expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
   });
 
-  it("keep + shape-gate-failing model → deletes it, boots default (injection surface closed)", () => {
-    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("bad name; rm -rf /"));
-    writeFileSync(join(agentDir, ".relaunch-model-intent"), intentJson("keep"));
-    expect(runBlock("1")).toBe(DEFAULT_MODEL);
-    expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
-  });
-
-  it("keep + MULTILINE .session-model (two model fields on two lines) → rejected, boots default", () => {
-    // The sed extraction emits one match per matching LINE and `grep -Eq`
-    // passes if ANY line matches — without the newline check a multiline
-    // value (each line individually shape-valid) would reach `claude
-    // --model`. Parity with parseSessionModel's single-string strictness.
-    writeFileSync(
-      join(agentDir, ".session-model"),
-      `${sessionModelJson("sr-glm-5")}${sessionModelJson("sr-evil-2")}`,
-    );
-    writeFileSync(join(agentDir, ".relaunch-model-intent"), intentJson("keep"));
-    expect(runBlock("1")).toBe(DEFAULT_MODEL);
-    expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
-  });
-
-  it("keep + configuredDefaultAtWrite mismatch (yaml model changed) → INVALIDATES + announces", () => {
-    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8", "claude-old-model"));
-    writeFileSync(join(agentDir, ".relaunch-model-intent"), intentJson("keep"));
-    expect(runBlock("1")).toBe(DEFAULT_MODEL);
-    expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
-    const alert = alertText();
-    expect(alert).toContain("configured default model changed");
-    expect(alert).toContain("`claude-old-model` → `claude-sonnet-5`");
-    expect(alert).toContain("override to `claude-opus-4-8` was cleared");
-  });
-
-  it("override older than 7 days → NO expiry (#3039: only explicit user action clears it)", () => {
-    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8", DEFAULT_MODEL, Date.now() - 8 * 24 * 3600_000));
-    expect(runBlock("1")).toBe("claude-opus-4-8");
-    expect(existsSync(join(agentDir, ".session-model"))).toBe(true);
-  });
-
-  it("corrupt .session-model → falls back to default AND notifies (never a silent drop)", () => {
+  // ── invalidation branches (all consume + alert) ──────────────────────────
+  it("corrupt .session-model → deletes it, boots default, notifies (never a silent drop)", () => {
     writeFileSync(join(agentDir, ".session-model"), "{broken\n");
     expect(runBlock("1")).toBe(DEFAULT_MODEL);
     expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
@@ -281,40 +220,94 @@ describe("scaffoldAgent: session-model stickiness boot resolver (start.sh)", () 
     expect(alert).toContain("configured default");
   });
 
-  // ── crashloop self-heal (#3042 blocker 2b) ───────────────────────────────
-  it("three consecutive fast boots with an override active → carrier cleared, default booted, alert once", () => {
-    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8"));
-    expect(runBlock("1")).toBe("claude-opus-4-8"); // boot 1 (cnt=1)
-    expect(runBlock("1")).toBe("claude-opus-4-8"); // boot 2 (cnt=2)
-    expect(runBlock("1")).toBe(DEFAULT_MODEL);     // boot 3 → self-heal
+  it("shape-gate-failing model → deletes it, boots default (injection surface closed)", () => {
+    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("bad name; rm -rf /"));
+    expect(runBlock("1")).toBe(DEFAULT_MODEL);
     expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
-    expect(existsSync(join(agentDir, ".session-model-boot-attempts"))).toBe(false);
+  });
+
+  it("MULTILINE .session-model (two model fields on two lines) → rejected, boots default", () => {
+    writeFileSync(
+      join(agentDir, ".session-model"),
+      `${sessionModelJson("sr-glm-5")}${sessionModelJson("sr-evil-2")}`,
+    );
+    expect(runBlock("1")).toBe(DEFAULT_MODEL);
+    expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
+  });
+
+  it("configuredDefaultAtWrite mismatch (yaml model changed) → NOT applied + announces + consumed", () => {
+    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8", "claude-old-model"));
+    expect(runBlock("1")).toBe(DEFAULT_MODEL);
+    expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
     const alert = alertText();
-    expect(alert).toContain("cleared automatically");
-    expect(alert).toContain("`claude-sonnet-5`");
-    // …and the NEXT boot is a clean default boot (no stale counter).
-    expect(runBlock("1")).toBe(DEFAULT_MODEL);
+    expect(alert).toContain("configured default model changed");
+    expect(alert).toContain("`claude-old-model` → `claude-sonnet-5`");
+    expect(alert).toContain("override to `claude-opus-4-8` was not applied");
   });
 
-  it("a boot without an override clears any stale boot-attempt counter", () => {
-    writeFileSync(join(agentDir, ".session-model-boot-attempts"), "2 " + Math.floor(Date.now() / 1000) + "\n");
-    expect(runBlock("1")).toBe(DEFAULT_MODEL);
-    expect(existsSync(join(agentDir, ".session-model-boot-attempts"))).toBe(false);
+  // ── sr-* + LiteLLM guard ─────────────────────────────────────────────────
+  it("sr-* carrier + LiteLLM DOWN → boots default, CONSUMES the carrier, tells the operator to re-issue", () => {
+    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("sr-glm-5"));
+    expect(runBlock("")).toBe(DEFAULT_MODEL);
+    // Consume-once forbids retaining it for a later relaunch.
+    expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
+    const alert = alertText();
+    expect(alert).toContain("sr-glm-5");
+    expect(alert).toContain("LiteLLM");
+    expect(alert).toContain("Re-issue /model");
   });
 
-  // ── kept-alert dedup (#3042 item 4) ──────────────────────────────────────
-  it("the 'kept' chat alert fires once per kept value — a bounce loop can't storm the chat", () => {
+  it("Claude carrier does NOT require LiteLLM (applies with proxy down, consumed)", () => {
     writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8"));
-    expect(runBlock("1")).toBe("claude-opus-4-8");
-    expect(alertText()).toContain("kept across this relaunch");
-    rmSync(join(agentDir, ".session-model-alert"));
-    // Second boot, same kept value → no new alert; sentinel remembers.
-    expect(runBlock("1")).toBe("claude-opus-4-8");
-    expect(existsSync(join(agentDir, ".session-model-alert"))).toBe(false);
-    expect(readFileSync(join(agentDir, ".session-model-kept-notified"), "utf-8").trim()).toBe("claude-opus-4-8");
+    expect(runBlock("")).toBe("claude-opus-4-8");
+    expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
   });
 
-  // ── session-effort resolver (#3039) ───────────────────────────────────────
+  it("sr-* carrier + LiteLLM up → applies once + repoints ANTHROPIC_BASE_URL + consumed", () => {
+    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("sr-glm-5"));
+    const { effective, baseUrl } = runBlockRouting("1");
+    expect(effective).toBe("sr-glm-5");
+    expect(baseUrl).toBe(ROUTER_ROOT);
+    expect(baseUrl.endsWith("/anthropic")).toBe(false);
+    expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
+  });
+
+  it("no carrier (Claude default) → KEEPS the /anthropic passthrough (guards the Opus SSE fix)", () => {
+    const { effective, baseUrl } = runBlockRouting("1");
+    expect(effective).toBe(DEFAULT_MODEL);
+    expect(baseUrl).toBe(PASSTHROUGH);
+  });
+
+  it("claude-* carrier → KEEPS the /anthropic passthrough (only sr-* repoints)", () => {
+    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8"));
+    const { effective, baseUrl } = runBlockRouting("1");
+    expect(effective).toBe("claude-opus-4-8");
+    expect(baseUrl).toBe(PASSTHROUGH);
+  });
+
+  // ── migration from the one-shot carrier ──────────────────────────────────
+  it("legacy .session-model-override carrier → converted, applied + consumed THIS boot", () => {
+    writeFileSync(join(agentDir, ".session-model-override"), "sr-glm-5\n");
+    expect(runBlock("1")).toBe("sr-glm-5");
+    expect(existsSync(join(agentDir, ".session-model-override"))).toBe(false);
+    // Consume-once: the converted carrier is also gone after the apply boot.
+    expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
+  });
+
+  it("legacy carrier WINS over an existing .session-model (newer intent)", () => {
+    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8"));
+    writeFileSync(join(agentDir, ".session-model-override"), "sr-glm-5\n");
+    expect(runBlock("1")).toBe("sr-glm-5");
+  });
+
+  it("malformed legacy carrier → ignored (no conversion), reverts to default", () => {
+    writeFileSync(join(agentDir, ".session-model-override"), "bad name; rm -rf /\n");
+    expect(runBlock("1")).toBe(DEFAULT_MODEL);
+    expect(existsSync(join(agentDir, ".session-model-override"))).toBe(false);
+    expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
+  });
+
+  // ── session-effort resolver (#3039 — UNCHANGED by rev 4) ──────────────────
   function effortJson(level: string, cfg = "low", ts = Date.now()): string {
     return `${JSON.stringify({ level, configuredDefaultAtWrite: cfg, ts })}\n`;
   }
@@ -331,14 +324,13 @@ describe("scaffoldAgent: session-model stickiness boot resolver (start.sh)", () 
     expect(runBlockEffort().effortArg).toBe("--effort low");
   });
 
-  it(".session-effort override survives the boot and is applied to --effort", () => {
+  it(".session-effort override survives the boot and is applied to --effort (still keep-across-restarts)", () => {
     writeFileSync(join(agentDir, ".session-effort"), effortJson("xhigh"));
     expect(runBlockEffort().effortArg).toBe("--effort xhigh");
     expect(existsSync(join(agentDir, ".session-effort"))).toBe(true);
   });
 
   it("corrupt/non-allowlisted .session-effort → falls back to configured default AND notifies", () => {
-    writeFileSync(join(agentDir, ".session-effort"), effortJson("mega; rm -rf /".replace(/;.*/, "mega")));
     writeFileSync(join(agentDir, ".session-effort"), `${JSON.stringify({ level: "mega", configuredDefaultAtWrite: "low", ts: Date.now() })}\n`);
     expect(runBlockEffort().effortArg).toBe("--effort low");
     expect(existsSync(join(agentDir, ".session-effort"))).toBe(false);
@@ -350,75 +342,6 @@ describe("scaffoldAgent: session-model stickiness boot resolver (start.sh)", () 
     expect(runBlockEffort().effortArg).toBe("--effort low");
     expect(existsSync(join(agentDir, ".session-effort"))).toBe(false);
     expect(alertText()).toContain("configured default effort changed");
-  });
-
-  // ── sr-* + LiteLLM guard (row 18) ─────────────────────────────────────────
-  it("keep + sr-* override + LiteLLM DOWN → boots default, RETAINS the file, announces retention", () => {
-    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("sr-glm-5"));
-    writeFileSync(join(agentDir, ".relaunch-model-intent"), intentJson("keep"));
-    expect(runBlock("")).toBe(DEFAULT_MODEL);
-    // Retained — re-applies on the next keep relaunch (NOT the one-shot drop
-    // semantics of the retired carrier).
-    expect(existsSync(join(agentDir, ".session-model"))).toBe(true);
-    const alert = alertText();
-    expect(alert).toContain("sr-glm-5");
-    expect(alert).toContain("retained");
-    expect(alert).toContain("LiteLLM");
-  });
-
-  it("keep + Claude override does NOT require LiteLLM (applies with proxy down)", () => {
-    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8"));
-    writeFileSync(join(agentDir, ".relaunch-model-intent"), intentJson("keep"));
-    expect(runBlock("")).toBe("claude-opus-4-8");
-  });
-
-  // ── migration from the one-shot carrier (RFC §7) ──────────────────────────
-  it("legacy .session-model-override carrier → converted to .session-model and applied THIS boot", () => {
-    writeFileSync(join(agentDir, ".session-model-override"), "sr-glm-5\n");
-    expect(runBlock("1")).toBe("sr-glm-5");
-    expect(existsSync(join(agentDir, ".session-model-override"))).toBe(false);
-    const converted = JSON.parse(readFileSync(join(agentDir, ".session-model"), "utf-8"));
-    expect(converted.model).toBe("sr-glm-5");
-    expect(converted.configuredDefaultAtWrite).toBe(DEFAULT_MODEL);
-  });
-
-  it("legacy carrier WINS over an existing .session-model (newer intent)", () => {
-    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8"));
-    writeFileSync(join(agentDir, ".session-model-override"), "sr-glm-5\n");
-    expect(runBlock("1")).toBe("sr-glm-5");
-    const converted = JSON.parse(readFileSync(join(agentDir, ".session-model"), "utf-8"));
-    expect(converted.model).toBe("sr-glm-5");
-  });
-
-  it("malformed legacy carrier → ignored (no conversion), reverts as no-intent", () => {
-    writeFileSync(join(agentDir, ".session-model-override"), "bad name; rm -rf /\n");
-    expect(runBlock("1")).toBe(DEFAULT_MODEL);
-    expect(existsSync(join(agentDir, ".session-model-override"))).toBe(false);
-    expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
-  });
-
-  // ── sr-* passthrough→router repoint (carried over from the carrier suite) ──
-  it("keep + sr-* override + LiteLLM up → repoints ANTHROPIC_BASE_URL onto the router root", () => {
-    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("sr-glm-5"));
-    writeFileSync(join(agentDir, ".relaunch-model-intent"), intentJson("keep"));
-    const { effective, baseUrl } = runBlockRouting("1");
-    expect(effective).toBe("sr-glm-5");
-    expect(baseUrl).toBe(ROUTER_ROOT);
-    expect(baseUrl.endsWith("/anthropic")).toBe(false);
-  });
-
-  it("no override (Claude default) → KEEPS the /anthropic passthrough (guards the Opus SSE fix)", () => {
-    const { effective, baseUrl } = runBlockRouting("1");
-    expect(effective).toBe(DEFAULT_MODEL);
-    expect(baseUrl).toBe(PASSTHROUGH);
-  });
-
-  it("keep + claude-* override → KEEPS the /anthropic passthrough (only sr-* repoints)", () => {
-    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8"));
-    writeFileSync(join(agentDir, ".relaunch-model-intent"), intentJson("keep"));
-    const { effective, baseUrl } = runBlockRouting("1");
-    expect(effective).toBe("claude-opus-4-8");
-    expect(baseUrl).toBe(PASSTHROUGH);
   });
 });
 

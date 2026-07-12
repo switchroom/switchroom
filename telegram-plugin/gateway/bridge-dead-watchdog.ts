@@ -60,10 +60,9 @@ import { readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs'
 import { isCronIdentity } from './cron-session.js'
 import type { InboundMessage } from './ipc-protocol.js'
 
-/** The distinct triggerSelfRestart reason for this escalation. Classified
- *  as intent 'keep' by intentForRestartReason (recovery bounce — session
- *  model stickiness preserved), like every other switchroom-managed
- *  relaunch. */
+/** The distinct triggerSelfRestart reason for this escalation. Like every
+ *  other switchroom-managed relaunch it reverts any session `/model` override
+ *  to the configured default (session-scoped, rev 4). */
 export const BRIDGE_DEAD_RESTART_REASON = 'bridge-dead-resume'
 
 /** Default grace window before a missing bridge is treated as dead.

@@ -206,7 +206,7 @@ describe("handleModelCommand — set", () => {
     const reply = await handleModelCommand({ kind: "set", model: "opus" }, deps);
     expect(calls).toEqual([{ agent: "klanker", command: "/model opus" }]);
     expect(reply.text).toContain("<pre>⏺ Set model to sonnet</pre>");
-    expect(reply.text).toContain("persists across restarts, deploys, and crashes");
+    expect(reply.text).toContain("lasts until the agent’s next restart");
     expect(reply.html).toBe(true);
     // A verified confirmation records the live model so /status stays honest
     // (bug 1: the typed path never recorded the switch before).

@@ -8,10 +8,71 @@ status: Accepted — revised per adversarial review + operator decision (default
 
 # RFC — Session-scoped `/model` stickiness
 
-**Status:** Accepted (rev 3 — #3039 keep-by-default amendment; rev 2 semantics below are superseded where §0 says so)
+**Status:** Accepted (rev 4 — session-scoped consume-once, #3183; rev 3 keep-by-default and rev 2 revert-by-default are superseded where §0.1 says so)
 **Author:** (agent-authored, operator-directed; semantics decided by the operator 2026-07)
 **Targets:** `origin/main` @ v0.18.7
-**Builds on:** #2982 (in-memory `sessionModelSource` + one-shot `.session-model-override` carrier), #2983 (live model on progress cards)
+**Builds on:** #2982 (in-memory `sessionModelSource` + one-shot `.session-model-override` carrier), #2983 (live model on progress cards), #3178 (durable /model ack/trace/queue)
+
+---
+
+## 0.1 Rev 4 amendment (#3183, operator decision 2026-07-12) — session-scoped, consume-once
+
+The operator requirement (verbatim): *"/model overrides should only last until
+that agent is restarted; on restart the agent should default back to switchroom
+config."* This **supersedes** the rev-3 §0 keep-by-default contract (and the
+rev-2 revert-by-default rows). A `/model` override is now **session-scoped**:
+it lives for the current session and any restart drops it back to the
+`switchroom.yaml` `model:`.
+
+Mechanism — **consume-once carrier** (no intent file):
+
+- **Live Claude switches write NO carrier.** A typed `/model <claude>` or a
+  Claude menu tap applies in-session via claude's native picker; the explicit
+  `claude --model <configured>` flag start.sh always execs reverts it on the
+  next boot for free. `sessionModelSource.setOverride` still records it live so
+  `/status` and progress cards stay truthful for the running session.
+- **Relaunch-requiring switches write a consume-once `.session-model`.** The
+  sr-* and sr→Claude paths (`scheduleModelRelaunch` / the menu sr→Claude
+  transition) and a queued /model persisted at graceful shutdown write the
+  carrier **immediately before the relaunch that applies it**. start.sh applies
+  the carrier on the single boot that reads it and then **deletes it**. That
+  deletion is the marker that distinguishes the model-apply relaunch from any
+  later restart.
+- **Every SUBSEQUENT restart reverts** — deploy, `/restart`, `/new`/`/reset`,
+  inline restart button, hostd/CLI restart, watchdog recovery, crash, raw
+  `docker restart`, host reboot. The carrier was consumed on the apply-boot, so
+  these boots find no carrier and launch the configured default.
+- **The `.relaunch-model-intent` keep/revert subsystem is retired** (writers,
+  readers, `intentForRestartReason`, `clearStaleGatewayShutdownIntent`,
+  `GATEWAY_SHUTDOWN_INTENT_REASON_PREFIX`) and so is the **crashloop self-heal
+  counter** (`.session-model-boot-attempts`): a consume-once carrier can crash
+  at most one boot before it is gone, so no self-heal is needed.
+- **Clearing / invalidation.** `/model default` deletes the carrier and clears
+  the in-memory override live. start.sh drops (without applying) a corrupt
+  carrier or one whose `configuredDefaultAtWrite` no longer matches the current
+  configured default, and writes a `.session-model-alert` the gateway relays.
+  The normal apply-boot is silent — the gateway already acked the `/model` in
+  chat. The 7-day staleness bound is moot (a carrier never survives one boot).
+- **sr-* + LiteLLM-down at the apply-boot:** the carrier cannot apply and
+  consume-once forbids retaining it for a later relaunch, so start.sh boots the
+  configured default and alerts the operator to re-issue once the proxy is back.
+- **`/effort` is unchanged** — `.session-effort` remains keep-across-restarts
+  (rev 3). Whether `/effort` should also become session-scoped is deferred to
+  the operator (#3183 open question).
+- **#3178 preserved.** Instant ack, the durable receipt log + history row, the
+  mid-turn queue-and-apply, and explicit failures are untouched; the queued
+  apply persists a consume-once carrier at shutdown so it still applies as the
+  agent boots (its apply-relaunch), then reverts on the next restart.
+  **Deliberate exception (#3184 review LOW-3):** that persist runs on every
+  shutdown path INCLUDING crashes, so a mid-turn queued `/model` + crash
+  applies on the crash-recovery boot — honoring the acked pending request
+  ("a queued /model never silently vanishes") rather than the literal
+  crash-reverts reading; gated to offline-trusted tokens and bounded by
+  consume-once to that single recovery boot, after which any restart reverts.
+
+The rev-2/rev-3 §0 and §§2-6 below are the historical design record; where they
+describe keep-by-default, intent files, the crashloop counter, or the 7-day
+expiry they are **superseded by this §0.1**.
 
 ---
 
