@@ -229,6 +229,18 @@ Ranked, highest-leverage first.
   down-shifts when it empties. Complements G2 (proxy-down hard-fail) — this is
   the *account-out-of-funds* failure mode, equally undegraded and additionally
   unmonitored.
+- **G7 — LiteLLM `tpm_limit`/`rpm_limit` caps are not yet enabled on the
+  fleet.** The classification prerequisite is DONE: a 429 raised by the
+  proxy's own limiters is recognized as `litellm-local` (distinct from an
+  Anthropic account 429) and takes the calm path — no quota-ledger mark, no
+  failover (`classify429Detail` in `telegram-plugin/throttle-tier.ts`;
+  signal provenance in `litellmProxyLocal429Signals`,
+  `telegram-plugin/model-unavailable.ts`; behavior documented in
+  docs/auth.md § "LiteLLM-proxy-local 429s"). Every classified 429 emits a
+  `rate_limit_429_classified` runtime metric so account-scoped 429s can be
+  correlated with fleet TPM. Follow-up: pick cap values from that metric and
+  enable `tpm_limit` on the per-consumer virtual keys / deployments in the
+  operator-maintained proxy config.
 
 ## Verification
 

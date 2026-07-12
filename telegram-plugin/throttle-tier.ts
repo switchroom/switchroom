@@ -33,7 +33,12 @@
 
 import { escapeMarkdown } from './card-format.js'
 import { formatResetRelative } from './quota-check.js'
-import { parseResetTime } from './model-unavailable.js'
+import {
+  isLitellmProxyLocal429,
+  parseLitellmLimitDetail,
+  parseResetTime,
+} from './model-unavailable.js'
+import type { RuntimeMetricEvent } from './runtime-metrics.js'
 
 // ─── Account-scoped throttle wording ─────────────────────────────────────────
 
@@ -63,6 +68,98 @@ export function isAccountScopedThrottle(text: string): boolean {
   const sample = text.length > 16_384 ? text.slice(0, 16_384) : text
   const lower = sample.toLowerCase()
   return accountScopedThrottleSignals.some((s) => lower.includes(s))
+}
+
+// ─── Three-way 429 classification ────────────────────────────────────────────
+
+/**
+ * Where a terminal 429-family failure originated:
+ *   - `account-scoped`   — Anthropic throttled THIS account ("would exceed
+ *     your account's rate limit"). Eligible for the throttle tier below
+ *     (broker mark-throttled / failover).
+ *   - `litellm-local`    — the LiteLLM proxy's OWN limiter tripped
+ *     (`tpm_limit`/`rpm_limit` cap, router cooldown — see
+ *     `litellmProxyLocal429Signals` in model-unavailable.ts). The request
+ *     never reached Anthropic; account state must not be touched.
+ *   - `generic-transient` — everything else in the rate-limit family
+ *     (server-side 429/529 wording, bare `rate_limit_error`). Calm path.
+ */
+export type RateLimit429Classification =
+  | 'account-scoped'
+  | 'litellm-local'
+  | 'generic-transient'
+
+/**
+ * Classify a terminal `rate-limited` operator event's detail text.
+ *
+ * TIE-BREAK (both wordings present): account-scoped wins, and only on its
+ * EXPLICIT wording. Rationale: LiteLLM never emits the account-affirming
+ * strings itself, so when they co-occur with LiteLLM wording the detail is a
+ * genuine upstream Anthropic account 429 that traversed (and was wrapped by)
+ * the proxy — e.g. the pass-through's "litellm.RateLimitError: …would exceed
+ * your account's rate limit…" exception mapping. Classifying that as
+ * proxy-local would drop the broker throttle mark and walk every retry
+ * straight back into the same account throttle. The reverse risk is nil: a
+ * purely proxy-local 429 (limiter fired BEFORE any upstream call) cannot
+ * contain Anthropic's account wording.
+ *
+ * BOUND: operator events forwarded over IPC carry `detail` truncated to
+ * 1000 chars (bridge.ts `sendOperatorEvent`'s `.slice(0, 1000)`;
+ * `OPERATOR_EVENT_DETAIL_MAX` in gateway/ipc-server.ts), so on that path the
+ * tie-break sees only the first 1000 chars of the body. In practice both
+ * wordings sit well inside that window (real Anthropic and LiteLLM bodies
+ * are <400 chars), and a truncated-away account marker would merely
+ * downgrade account-scoped → litellm-local/generic-transient — the calm
+ * path, never a wrong account mark.
+ *
+ * Never throws on weird input (both matchers are total).
+ */
+export function classify429Detail(text: string): RateLimit429Classification {
+  if (isAccountScopedThrottle(text)) return 'account-scoped'
+  if (isLitellmProxyLocal429(text)) return 'litellm-local'
+  return 'generic-transient'
+}
+
+/**
+ * Build the `rate_limit_429_classified` runtime metric for one terminal
+ * rate-limited operator event — the instrumentation that lets an operator
+ * correlate Anthropic ACCOUNT 429s with fleet TPM (the prerequisite for
+ * enabling LiteLLM `tpm_limit` caps; see docs/auth.md § LiteLLM-proxy-local
+ * 429s). Pure builder so the payload shape is unit-testable; the gateway
+ * emits the result via emitRuntimeMetric (PostHog + JSONL dual sink).
+ *
+ * `action` is what the gateway decided for this event:
+ *   - `throttle` / `failover` — the account-scoped throttle tier's decision
+ *   - `calm` — the existing calm rate-limited path (litellm-local and
+ *     generic-transient always land here; no broker mark, no failover)
+ *
+ * Reset detail is best-effort: the Anthropic-shaped `parseResetTime` first,
+ * then LiteLLM's own shapes ("Limit resets at: … UTC" / "Try again in Ns")
+ * via `parseLitellmLimitDetail`. Limit fields parse only from LiteLLM
+ * wording (Anthropic bodies carry no numeric limit).
+ */
+export function build429ClassifiedMetric(opts: {
+  agent: string
+  detail: string
+  classification: RateLimit429Classification
+  action: 'throttle' | 'failover' | 'calm'
+  now: number
+}): Extract<RuntimeMetricEvent, { kind: 'rate_limit_429_classified' }> {
+  const detail = typeof opts.detail === 'string' ? opts.detail : ''
+  const litellm = parseLitellmLimitDetail(detail, new Date(opts.now))
+  const anthropicResetMs = parseResetTime(detail, new Date(opts.now))?.getTime() ?? null
+  const resetAtMs = anthropicResetMs ?? litellm.resetAtMs
+  return {
+    kind: 'rate_limit_429_classified',
+    agent: opts.agent,
+    classification: opts.classification,
+    action: opts.action,
+    reset_at_ms: resetAtMs,
+    reset_in_ms: resetAtMs != null ? Math.max(0, resetAtMs - opts.now) : null,
+    limit_type: litellm.limitType,
+    limit: litellm.limit,
+    current_usage: litellm.currentUsage,
+  }
 }
 
 /**

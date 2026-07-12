@@ -198,6 +198,61 @@ describe('detectErrorInTranscriptLine — error detection', () => {
     expect(detection).toBeNull()
   })
 
+  // A 429 whose body carries LiteLLM-proxy-LOCAL limiter wording is the
+  // proxy's own tpm_limit/rpm_limit cap tripping BEFORE the request reached
+  // Anthropic. Nothing about the account is exhausted — it must take the
+  // calm rate-limited path (no model-unavailable card, no mark-exhausted,
+  // no fleet failover). Prerequisite for enabling litellm tpm caps on the
+  // fleet: without this, every cap trip would bench a healthy account.
+  it('classifies a LiteLLM-proxy-local 429 as rate-limited, NOT quota-exhausted', () => {
+    const litellmBodies = [
+      // Deployment tpm cap (model_rate_limit_check.py body, verbatim shape).
+      'API Error: 429 Deployment over user-defined ratelimit. tpm limit=8000. ' +
+        'current usage=8241. id=abc123def, model_group=claude-fable-5',
+      // Virtual-key tpm_limit (parallel_request_limiter_v3.py).
+      'API Error: 429 Rate limit exceeded for api_key: hashed-key-1a2b3c. ' +
+        'Limit type: tokens. Current limit: 8000, Remaining: 0. ' +
+        'Limit resets at: 2026-07-12 08:05:00 UTC',
+      // Router cooldown (RouterRateLimitError).
+      'API Error: 429 No deployments available for selected model, ' +
+        'Try again in 27.5 seconds. Passed model=claude-fable-5.',
+      // Team-level model cap — a v3 descriptor OUTSIDE the enumerated signal
+      // list, covered only by the co-occurrence pair
+      // (litellmV3LimiterSignalPair). Pre-fix this missed every signal →
+      // quota-exhausted → scary card + failover.
+      'API Error: 429 Rate limit exceeded for model_per_team: ' +
+        'team-1a2b3c:claude-fable-5. Limit type: tokens. ' +
+        'Current limit: 50000, Remaining: 0. ' +
+        'Limit resets at: 2026-07-12 08:05:00 UTC',
+    ]
+    for (const text of litellmBodies) {
+      const line = JSON.stringify({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          model: '<synthetic>',
+          content: [{ type: 'text', text }],
+        },
+        error: 'rate_limit',
+        isApiErrorMessage: true,
+        apiErrorStatus: 429,
+      })
+      const result = detectErrorInTranscriptLine(line)
+      expect(result).not.toBeNull()
+      expect(result!.kind).toBe('rate-limited')
+      expect(result!.transient).toBe(true)
+      // End-to-end: the resolver must NOT produce a model-unavailable card —
+      // null is what keeps the calm 🚦 card and blocks the auto-fallback
+      // branch in emitGatewayOperatorEvent.
+      expect(
+        resolveModelUnavailableFromOperatorEvent({
+          kind: result!.kind,
+          detail: result!.detail,
+        }),
+      ).toBeNull()
+    }
+  })
+
   // Guard against over-correcting: a GENUINE quota wall (no transient marker)
   // must STILL be quota-exhausted AND still resolve to a card.
   it('a genuine quota-wall 429 still produces the quota-exhausted card', () => {

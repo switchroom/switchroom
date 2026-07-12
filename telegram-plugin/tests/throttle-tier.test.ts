@@ -12,6 +12,8 @@
 
 import { describe, it, expect } from 'vitest'
 import {
+  build429ClassifiedMetric,
+  classify429Detail,
   decideThrottleTier,
   evaluateThrottleNotice,
   isAccountScopedThrottle,
@@ -133,6 +135,180 @@ describe('decideThrottleTier — decision matrix', () => {
       thresholdMs: 5 * 60_000,
     })
     expect(beyond.action).toBe('failover')
+  })
+})
+
+// Verbatim LiteLLM proxy-local 429 shapes (provenance on
+// `litellmProxyLocal429Signals`, model-unavailable.ts).
+const LITELLM_TPM_CAP =
+  'Deployment over user-defined ratelimit. tpm limit=8000. current usage=8241. ' +
+  'id=abc123def, model_group=claude-fable-5'
+const LITELLM_KEY_LIMIT =
+  'Rate limit exceeded for api_key: hashed-key-1a2b3c. Limit type: tokens. ' +
+  'Current limit: 8000, Remaining: 0. Limit resets at: 2026-07-12 08:05:00 UTC'
+const LITELLM_ROUTER_COOLDOWN =
+  'No deployments available for selected model, Try again in 27.5 seconds. ' +
+  "Passed model=claude-fable-5. pre-call-checks=False, cooldown_list=['abc123def']"
+// v3 limiter, descriptor NOT in the enumerated signal list — matched by the
+// litellmV3LimiterSignalPair co-occurrence rule (model-unavailable.ts).
+const LITELLM_TEAM_MODEL_LIMIT =
+  'Rate limit exceeded for model_per_team: team-1a2b3c:claude-fable-5. ' +
+  'Limit type: tokens. Current limit: 50000, Remaining: 0. ' +
+  'Limit resets at: 2026-07-12 08:05:00 UTC'
+
+describe('decideThrottleTier — LiteLLM-proxy-local 429s never enter the tier', () => {
+  // OUTCOME pin: `none` is what keeps a proxy-local cap trip off the
+  // account-scoped machinery — no broker mark-throttled, no throttle-tier
+  // runner fire, no failover escalation. The gateway additionally gates on
+  // classify429Detail, but the decision module must agree.
+  it.each([
+    ['deployment tpm cap', LITELLM_TPM_CAP],
+    ['virtual-key tpm_limit', LITELLM_KEY_LIMIT],
+    ['router cooldown', LITELLM_ROUTER_COOLDOWN],
+    ['team model cap (non-enumerated v3 descriptor)', LITELLM_TEAM_MODEL_LIMIT],
+  ])('%s → none (calm path owns it)', (_name, detail) => {
+    expect(decideThrottleTier({ detail, now: NOW, thresholdMs: THRESHOLD })).toEqual({
+      action: 'none',
+    })
+  })
+})
+
+describe('classify429Detail — three-way origin classification', () => {
+  it('classifies LiteLLM limiter wordings as litellm-local', () => {
+    expect(classify429Detail(LITELLM_TPM_CAP)).toBe('litellm-local')
+    expect(classify429Detail(LITELLM_KEY_LIMIT)).toBe('litellm-local')
+    expect(classify429Detail(LITELLM_ROUTER_COOLDOWN)).toBe('litellm-local')
+    // Non-enumerated v3 descriptor — the co-occurrence pair, not a list
+    // entry, carries this one.
+    expect(classify429Detail(LITELLM_TEAM_MODEL_LIMIT)).toBe('litellm-local')
+  })
+
+  it('classifies Anthropic account-affirming wording as account-scoped', () => {
+    expect(classify429Detail(TRANSIENT('resets in 3m'))).toBe('account-scoped')
+    expect(
+      classify429Detail('would exceed your account’s rate limit'),
+    ).toBe('account-scoped')
+  })
+
+  it('classifies server-side / bare rate-limit wording as generic-transient', () => {
+    expect(
+      classify429Detail('Server is temporarily limiting requests (not your usage limit)'),
+    ).toBe('generic-transient')
+    expect(classify429Detail('overloaded_error 529')).toBe('generic-transient')
+    expect(classify429Detail('rate_limit_error: try again later')).toBe('generic-transient')
+  })
+
+  it('TIE-BREAK: account-affirming wording wins over LiteLLM wording when both appear', () => {
+    // The pass-through shape: LiteLLM wraps a FORWARDED upstream Anthropic
+    // account 429 (exception mapping / limiter prose in the same body).
+    // LiteLLM never emits the account wording itself, so its presence means
+    // Anthropic really throttled the account — the broker throttle mark and
+    // the throttle tier must still run.
+    const mixed =
+      `litellm.RateLimitError: ${LITELLM_TPM_CAP} — upstream said: ` +
+      "This request would exceed your account's rate limit. Please try again later."
+    expect(classify429Detail(mixed)).toBe('account-scoped')
+    // And the tier decision still engages (not 'none').
+    expect(
+      decideThrottleTier({ detail: mixed, now: NOW, thresholdMs: THRESHOLD }).action,
+    ).not.toBe('none')
+  })
+
+  it('a bare litellm.RateLimitError wrapper WITHOUT limiter wording stays generic-transient', () => {
+    // The exception-mapping prefix alone is not proxy-local evidence.
+    expect(
+      classify429Detail('litellm.RateLimitError: RateLimitError: 429 try again later'),
+    ).toBe('generic-transient')
+  })
+
+  it('never throws on weird input', () => {
+    expect(classify429Detail('')).toBe('generic-transient')
+    expect(classify429Detail(undefined as unknown as string)).toBe('generic-transient')
+    expect(classify429Detail(9000 as unknown as string)).toBe('generic-transient')
+    expect(classify429Detail('A'.repeat(200_000))).toBe('generic-transient')
+  })
+})
+
+describe('build429ClassifiedMetric — instrumentation payload', () => {
+  it('litellm-local deployment cap → limit fields + calm action', () => {
+    const m = build429ClassifiedMetric({
+      agent: 'carrie',
+      detail: LITELLM_TPM_CAP,
+      classification: 'litellm-local',
+      action: 'calm',
+      now: NOW,
+    })
+    expect(m).toEqual({
+      kind: 'rate_limit_429_classified',
+      agent: 'carrie',
+      classification: 'litellm-local',
+      action: 'calm',
+      reset_at_ms: null,
+      reset_in_ms: null,
+      limit_type: 'tpm',
+      limit: 8000,
+      current_usage: 8241,
+    })
+  })
+
+  it('litellm-local NON-enumerated v3 descriptor (model_per_team) → full metric payload', () => {
+    // Finding-pin: a team-level model cap must produce the metric (it used
+    // to miss every signal → quota-exhausted → no metric at all).
+    const m = build429ClassifiedMetric({
+      agent: 'carrie',
+      detail: LITELLM_TEAM_MODEL_LIMIT,
+      classification: 'litellm-local',
+      action: 'calm',
+      now: NOW,
+    })
+    expect(m.kind).toBe('rate_limit_429_classified')
+    expect(m.classification).toBe('litellm-local')
+    expect(m.limit_type).toBe('tokens')
+    expect(m.limit).toBe(50_000)
+    expect(m.reset_at_ms).toBe(Date.UTC(2026, 6, 12, 8, 5, 0))
+  })
+
+  it('litellm-local v3 key limit → tokens limit type + parsed "Limit resets at" UTC reset', () => {
+    const m = build429ClassifiedMetric({
+      agent: 'carrie',
+      detail: LITELLM_KEY_LIMIT,
+      classification: 'litellm-local',
+      action: 'calm',
+      now: NOW,
+    })
+    expect(m.limit_type).toBe('tokens')
+    expect(m.limit).toBe(8000)
+    expect(m.reset_at_ms).toBe(Date.UTC(2026, 6, 12, 8, 5, 0))
+    expect(m.reset_in_ms).toBe(Date.UTC(2026, 6, 12, 8, 5, 0) - NOW)
+  })
+
+  it('account-scoped 429 → Anthropic-parsed reset, no limit fields', () => {
+    const m = build429ClassifiedMetric({
+      agent: 'carrie',
+      detail: TRANSIENT('resets in 3m'),
+      classification: 'account-scoped',
+      action: 'throttle',
+      now: NOW,
+    })
+    expect(m.classification).toBe('account-scoped')
+    expect(m.action).toBe('throttle')
+    expect(m.reset_at_ms).toBe(NOW + 3 * 60_000)
+    expect(m.reset_in_ms).toBe(3 * 60_000)
+    expect(m.limit_type).toBeNull()
+    expect(m.limit).toBeNull()
+    expect(m.current_usage).toBeNull()
+  })
+
+  it('never throws on weird detail; nulls out unparseable resets', () => {
+    const m = build429ClassifiedMetric({
+      agent: 'carrie',
+      detail: undefined as unknown as string,
+      classification: 'generic-transient',
+      action: 'calm',
+      now: NOW,
+    })
+    expect(m.reset_at_ms).toBeNull()
+    expect(m.reset_in_ms).toBeNull()
   })
 })
 

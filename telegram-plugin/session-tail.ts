@@ -41,7 +41,7 @@ function isMultiAgentEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.PROGRESS_CARD_MULTI_AGENT !== '0'
 }
 import { classifyClaudeError, type OperatorEventKind } from './operator-events.js'
-import { isTransientUpstreamSignal } from './model-unavailable.js'
+import { isLitellmProxyLocal429, isTransientUpstreamSignal } from './model-unavailable.js'
 import { createToolLabelSidecar, type ToolLabelSidecar, type SidecarOptions } from './tool-label-sidecar.js'
 import { isModelSentinel } from './model-label.js'
 
@@ -684,9 +684,21 @@ export function detectErrorInTranscriptLine(
     // model-unavailable.ts) — an ambiguous 429 that merely says "limit" stays
     // quota-exhausted, biasing toward surfacing a real wall. Other statuses fall
     // through to the shared classifier.
+    //
+    // A 429 carrying LiteLLM-proxy-LOCAL limiter wording ("Deployment over
+    // user-defined ratelimit", "Rate limit exceeded for api_key: …" — the
+    // canonical `litellmProxyLocal429Signals` list) is the proxy's own
+    // `tpm_limit`/`rpm_limit` cap tripping BEFORE the request reached
+    // Anthropic. Nothing about the account is exhausted — blanket-labeling it
+    // quota-exhausted would fire the model-unavailable card + mark-exhausted +
+    // fleet failover for a purely proxy-local condition. It is rate-limited
+    // (calm path). Precedence when BOTH wordings appear is owned by
+    // `classify429Detail` gateway-side; here both branches yield the same
+    // 'rate-limited' kind, so order is immaterial.
     const kind: OperatorEventKind =
       status === 429
-        ? isTransientUpstreamSignal(`${text}\n${errStr}`)
+        ? isTransientUpstreamSignal(`${text}\n${errStr}`) ||
+          isLitellmProxyLocal429(`${text}\n${errStr}`)
           ? 'rate-limited'
           : 'quota-exhausted'
         : classifyClaudeError({ type: errStr, status, message: text })

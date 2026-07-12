@@ -248,6 +248,47 @@ Cron fires are throttle-aware: the scheduler's quota preflight
 soft-defers a fire while the agent's effective account is throttled
 and retries just past `throttled_until`.
 
+### LiteLLM-proxy-local 429s — never account state
+
+When an agent routes through the LiteLLM gateway (docs/model-routing.md),
+a 429 can also originate from the proxy's OWN rate limiters — a
+`tpm_limit`/`rpm_limit` cap on a deployment or virtual key, or the
+router cooling every deployment down. That request never reached
+Anthropic, so the condition says nothing about the account.
+
+Every terminal 429 is therefore classified three ways
+(`classify429Detail`, `telegram-plugin/throttle-tier.ts`):
+
+- **account-scoped** — Anthropic's explicit account-affirming wording
+  ("would exceed your account's rate limit"). Takes the throttle tier
+  above (broker `mark-throttled` / failover).
+- **litellm-local** — wording only LiteLLM's limiters emit
+  ("Deployment over user-defined ratelimit", "No deployments available
+  for selected model", or the v3 limiter's descriptor-agnostic pair
+  "Rate limit exceeded for …" + "Limit type: …" — the canonical
+  matcher, with per-signal source provenance, is
+  `isLitellmProxyLocal429` / `litellmProxyLocal429Signals` in
+  `telegram-plugin/model-unavailable.ts`). Takes the calm rate-limited
+  path: **no broker mark, no failover, no throttle tier**. Marking the
+  account for a proxy-local cap would bench a healthy subscription.
+- **generic-transient** — everything else in the rate-limit family
+  (server-side 429/529 wording). Calm path, unchanged.
+
+Tie-break when both wordings appear in one body (the pass-through
+wrapping a forwarded upstream error): **account-scoped wins** — LiteLLM
+never emits Anthropic's account wording itself, so its presence means
+the account throttle genuinely fired upstream.
+
+Each classified event emits one `rate_limit_429_classified` runtime
+metric (PostHog + `runtime-metrics.jsonl`, see docs/posthog.md)
+carrying the classification, the action taken (throttle / failover /
+calm), and any parseable limit/reset detail — fired before the notice
+cooldown so every hit is counted. Correlating `account-scoped` fires
+against fleet token throughput is the evidence base for the follow-up
+this classifier unblocks: enabling LiteLLM `tpm_limit` caps on the
+fleet, where caps absorb bursts proxy-side (`litellm-local` fires,
+calm) instead of burning Anthropic account throttles.
+
 ### Soft-avoid tier — proactive preference before the wall
 
 `auth.proactive_failover_pct` (optional, e.g. `95`) adds a third
