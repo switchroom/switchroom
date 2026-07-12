@@ -2,7 +2,129 @@
 
 ## Unreleased
 
-### LiteLLM per-agent keys bind to their team — and unbound keys self-heal on upgrade
+## v0.18.13 — The outbound send gate defaults on (no more self-inflicted flood bans), a transient-throttle failover fix, and the #3084 security-audit sweep
+
+The headline: the Telegram outbound throttle that keeps an agent from
+flood-banning itself off Telegram is now **on by default**, a transient
+per-account 429 no longer masquerades as a quota wall (no false failover
+card), and the 2026-07-11 `#3084` security audit lands as a broad
+fail-closed sweep across the vault, auth, hostd, approval gates, and the
+outbound secret scrub. Plus a batch of reliability fixes and the LiteLLM
+per-team cost-tracking binding.
+
+### The Telegram send gate is on by default — flood bans stop before they start (#3153, #3154, #3147, #3155)
+
+The send gate (`telegram-plugin/send-gate.ts`) is the one global
+token-bucket scheduler every Bot API call transits at the `robustApiCall`
+layer — the only thing that composes all the per-surface throttles into a
+global/per-chat ceiling. It shipped **default-OFF** (opt-in via `=1`) as a
+staged rollout, which meant no outbound throttle actually ran in
+production. On 2026-07-11 `klanker` was flood-banned (429 `retry_after` in
+hours) precisely because the per-surface throttles summed with no global
+cap and tripped a per-bot-token flood ban — the exact failure the gate
+exists to prevent.
+
+- **#3153 — flip the default.** `sendGateEnabledFromEnv` now returns true
+  unless explicitly disabled, mirroring the repo's other default-on
+  kill-switches. `SWITCHROOM_TELEGRAM_SEND_GATE=0` (also `false`/`off`/`no`,
+  case-insensitive) is the escape hatch; anything else — including unset — is
+  ON. A throttle you have to opt into is not a throttle; it's an escape hatch
+  you opt out of. Throttle rates, buckets, priority classes, and shedding are
+  unchanged.
+- **#3147 — clear the runway.** The latent send-gate and rich-render defects
+  that justified keeping the gate off were fixed before the flag flipped, so
+  the default-on gate is safe.
+- **#3154 — close the reaction bypass.** `setMessageReaction` was one of the
+  few Bot API calls not routed through the gate; it now transits the send gate
+  and the flood breaker like every other outbound call, so a burst of
+  reactions can no longer sneak past the global cap.
+- **#3155 — stop the false failover card.** A transient per-account burst 429
+  (Anthropic `rate_limit_error`, "would exceed your account's rate limit …
+  not your usage limit" — a few-second RPM throttle Claude Code retries
+  internally) was blanket-classified as `quota-exhausted`, which always posts a
+  scary "model unavailable / quota exhausted" card and drives fleet failover.
+  The 429 is now classified by error wording: an explicit transient-negation
+  marker down-classifies to `rate-limited` (the calm path — no card, no
+  auto-fallback), while a genuine wall ("You've hit your limit · resets…",
+  `out_of_credits`) stays `quota-exhausted` and still cards + fails over. An
+  ambiguous 429 biases toward surfacing a real wall. (The `carrie` incident,
+  2026-07-12.)
+
+### #3084 security-audit sweep — fail-closed gates, scoped grants, tightened secret scrub
+
+The 2026-07-11 security audit lands as a set of single-concern hardening
+PRs. The through-line: safety controls must be deterministic and fail
+**closed**, grants must be scoped to their caller and entry, and no secret
+reaches an outbound surface unscrubbed.
+
+- **#3129 — vault write-grant caller-identity cross-check.** The write-grant
+  path now verifies the caller identity, closing a cross-caller grant path.
+- **#3134 — vault entry-scope on write-grant rotation (F2).** Rotating an
+  existing key through a write grant now enforces the grant's entry scope
+  rather than allowing rotation of any key.
+- **#3130 — gate the `auth:` callback family behind `allowFrom`.** The
+  account-swap callback family was reachable outside the `allowFrom` allowlist,
+  a fleet account-swap bypass; it's now gated like the rest.
+- **#3133 — scope hostd `agent_exec`/`agent_logs` to configured agents.** Both
+  verbs were reachable against singleton containers / unconfigured targets;
+  they're now restricted to configured agents.
+- **#3132 — `switchroom doctor` TCP check drops shell interpolation
+  (config→RCE).** The doctor connectivity probe shelled out with interpolated
+  config values (a config-to-RCE path); it now uses a `net.Socket` TCP check
+  with no shell.
+- **#3131 — correct the web Tailscale header-trust comment (docs).** The
+  header-trust comment misdescribed the default host-net topology; corrected so
+  operators don't over-trust a forwarded header.
+- **#3150 — close fail-open holes in the MS-365 + scoped-approval gates.** The
+  MS-365 write gate failed open on tool-name drift (a renamed/new write tool
+  bypassed approval) and is inverted to a read allowlist that fails closed;
+  the verdict poll now correlates by `requestId` not scope; a missing agent
+  identity fails closed; and the destructive-git detector (`git checkout .`,
+  `-f`, `git stash drop|clear|pop`) is tightened and tested.
+- **#3151 — harden auth OAuth + credential-store writes; scope the
+  host-control idempotency cache.** Google loopback OAuth gains PKCE (S256,
+  matching Microsoft); Anthropic credential/meta writes route through the
+  shared fsync + `O_EXCL|O_NOFOLLOW` atomic writer and account dirs are `0700`;
+  the hostd idempotency short-circuit now runs after the gate and is scoped by
+  caller identity.
+- **#3148 — close outbound secret-scrub coverage gaps.** The `ask_user`,
+  checklist, PTY, and chunker outbound paths bypassed the secret scrub; all
+  four now run through it.
+- **#3152 — redact agent-authored `inline_keyboard` labels + `ack_text` on
+  outbound replies.** Agent-authored button labels and ack text are now
+  scrubbed like other outbound body text.
+
+### Reliability and correctness
+
+- **#3139 — close session/sub-agent FSWatchers to stop an FD leak.** Watchers
+  opened per session/sub-agent were never closed at runtime, leaking file
+  descriptors on long-lived agents.
+- **#3135 — worktree heartbeat + fail-safe reaper.** A live worktree could be
+  deleted by the reaper; a refreshed heartbeat plus a fail-safe reaper prevent
+  reaping a worktree that's still in use.
+- **#3138 — treat absent 7d utilization as unknown, preserve the exhaustion
+  mark.** Missing 7d utilization data was read as zero; it's now treated as
+  unknown, and an existing exhaustion mark is preserved rather than cleared.
+- **#3137 — make the history upsert idempotent for null-thread rows.** A
+  null `message_thread_id` broke the upsert's conflict target, causing
+  duplicate/failed rows; the upsert is now idempotent for null-thread rows.
+- **#3149 — atomic writes for `switchroom.yaml` and scaffold state.** Config
+  and scaffold-state writes are now atomic (temp + rename), so a crash
+  mid-write can't leave a truncated config.
+- **#3145 — correct scaffold bot-token resolution + placeholder refresh.**
+  Scaffold resolved the bot token from a stale source and left placeholders in
+  place; both are fixed.
+- **#3146 — write operator choices to the canonical config.** Setup wrote
+  operator posture / `dangerous_mode` choices to a non-canonical location, a
+  silent no-op on the live config; they now persist to canonical config (with a
+  no-echo passphrase prompt).
+- **#3125 — read the fallback blocked-approval record; pin the compose
+  mount.** The web surface now reads the `#3107` fallback blocked-approval
+  record, and the compose mount for the shared record dir is pinned.
+- **#3126 — revive the dead "never auto-approve" test pin.** A regression pin
+  that had silently stopped exercising its invariant is restored.
+
+### LiteLLM per-agent keys bind to their team — and unbound keys self-heal on upgrade (#3140, #3144)
 
 Standing invariant: all agent traffic routes through LiteLLM so per-team
 cost/token spend rolls up accurately. Provisioning silently defeated it —
