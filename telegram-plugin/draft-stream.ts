@@ -116,8 +116,17 @@ export interface DraftStreamHandle {
    * Mark the stream as final. Flushes any pending text and rejects all
    * future update() calls. Returns a promise that resolves once the final
    * edit has landed (or the initial send if no edits ever fired).
+   *
+   * When `finalText` is provided, it becomes the pending snapshot for the
+   * final flush (superseding any older pending draft — last-write-wins).
+   * Callers that know a text is the LAST one (e.g. `stream_reply`
+   * `done=true`) MUST pass it here instead of `update(text)` +
+   * `finalize()`: the flush then runs with the stream already final, so
+   * the transport layer (stream-controller) classifies the edit that
+   * renders the completed answer as `critical` for the send gate — never
+   * shed as a cosmetic draft under flood pressure (#3110).
    */
-  finalize(): Promise<void>
+  finalize(finalText?: string): Promise<void>
 
   /** Returns the captured Telegram message_id, or null if nothing has sent yet. */
   getMessageId(): number | null
@@ -327,9 +336,14 @@ export function createDraftStream(
       return waitPromise
     },
 
-    async finalize(): Promise<void> {
+    async finalize(finalText?: string): Promise<void> {
       if (final) return
       final = true
+      // A caller-supplied final snapshot supersedes any pending draft
+      // (last-write-wins) and is flushed below with `final` already set,
+      // so the transport classifies this edit as the answer's final
+      // render, not a sheddable draft (#3110).
+      if (finalText != null && !stopped) pendingText = finalText
       // Drain any pending updates
       if (scheduledTimer != null) {
         clearTimeout(scheduledTimer)

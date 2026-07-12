@@ -207,6 +207,50 @@ describe('handleStreamReply', () => {
     expect(state.activeDraftStreams.size).toBe(0)
   })
 
+  it('done=true routes the final text through finalize(text) — the answer edit is CRITICAL for the send gate, drafts cosmetic (#3110)', async () => {
+    const state = makeState()
+    // Spy retry: pins exactly what reaches robustApiCall (= the send gate).
+    const seen: Array<Record<string, unknown> | undefined> = []
+    const retry = (<T,>(fn: () => Promise<T>, opts?: unknown) => {
+      seen.push(opts as Record<string, unknown> | undefined)
+      return fn()
+    }) as StreamReplyDeps['retry']
+    const deps = makeDeps(bot, { retry })
+
+    // Turn start → anchor send.
+    let pending = handleStreamReply({ chat_id: '1', text: 'thinking…' }, state, deps)
+    await microtaskFlush()
+    await pending
+
+    // Intermediate snapshot → a sheddable (cosmetic) draft edit.
+    pending = handleStreamReply({ chat_id: '1', text: 'half the answer' }, state, deps)
+    await microtaskFlush()
+    vi.advanceTimersByTime(600) // release the local throttle
+    await microtaskFlush()
+    await pending
+
+    // done=true → the completed answer flushes via finalize(text): the edit
+    // runs with the stream already final and is tagged critical — never shed
+    // as a draft under flood pressure.
+    pending = handleStreamReply(
+      { chat_id: '1', text: 'the full answer', done: true },
+      state,
+      deps,
+    )
+    await microtaskFlush()
+    const result = await pending
+
+    expect(result.status).toBe('finalized')
+    expect(richEditMarkdown(bot, 1)).toBe('the full answer')
+    expect(seen[0]).toEqual({ threadId: undefined, chat_id: '1' }) // anchor send: untagged
+    expect(seen[1]).toMatchObject({ messageId: 500, priorityClass: 'cosmetic' })
+    expect(seen[2]).toMatchObject({
+      messageId: 500,
+      priorityClass: 'critical',
+      editPayload: { markdown: 'the full answer' },
+    })
+  })
+
   it('done=true on a named lane does NOT fire terminal 👍', async () => {
     const state = makeState()
     const deps = makeDeps(bot)

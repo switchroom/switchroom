@@ -516,10 +516,20 @@ export async function handleStreamReply(
     state.activeDraftStreams.set(sKey, stream)
   }
 
-  await stream.update(effectiveText)
+  if (!done) {
+    // Intermediate snapshot — an ordinary throttled draft update.
+    await stream.update(effectiveText)
+  }
 
   if (done) {
-    await stream.finalize()
+    // #3110: route the FINAL text through finalize(text) so the flush that
+    // renders the completed answer runs with the stream already final —
+    // stream-controller then classifies that edit `critical` for the send
+    // gate (never shed; fails fast with a structured FLOOD_WAIT_ACTIVE on a
+    // long flood window) while intermediate draft edits stay `cosmetic`
+    // (sheddable). The previous update()-then-finalize() pair flushed the
+    // final text inside update(), i.e. as an ordinary sheddable draft edit.
+    await stream.finalize(effectiveText)
     state.activeDraftStreams.delete(sKey)
     // #1713: stream_reply done=true is a NON-EVENT for the status
     // reaction. The reaction reflects current turn activity, not

@@ -137,6 +137,49 @@ describe('createDraftStream', () => {
     expect(stream.isFinal()).toBe(true)
   })
 
+  it('finalize(finalText) flushes the supplied snapshot with the stream already final (#3110)', async () => {
+    const m = makeMock()
+    // Capture what isFinal() reads AT EDIT TIME — the transport layer
+    // (stream-controller) classifies the send-gate priority from exactly
+    // this signal, so the final snapshot MUST flush with final=true.
+    const finalAtEdit: boolean[] = []
+    const stream = createDraftStream(
+      m.send,
+      async (id, text) => {
+        finalAtEdit.push(stream.isFinal())
+        await m.edit(id, text)
+      },
+      { throttleMs: 1000 },
+    )
+
+    void stream.update('initial')
+    await microtaskFlush()
+    expect(m.sendCalls.length).toBe(1)
+
+    // A stale draft is pending; finalize(text) supersedes it (last-write-wins).
+    void stream.update('stale draft')
+    await microtaskFlush()
+    await stream.finalize('the completed answer')
+
+    expect(m.editCalls.length).toBe(1)
+    expect(m.editCalls[0].text).toBe('the completed answer')
+    expect(finalAtEdit).toEqual([true])
+    expect(stream.isFinal()).toBe(true)
+  })
+
+  it('finalize(finalText) still dedupes against text that actually landed', async () => {
+    const m = makeMock()
+    const stream = createDraftStream(m.send, m.edit, { throttleMs: 1000 })
+
+    void stream.update('the answer')
+    await microtaskFlush()
+    expect(m.sendCalls.length).toBe(1)
+
+    // Same text again as the final snapshot → already on screen, no edit.
+    await stream.finalize('the answer')
+    expect(m.editCalls.length).toBe(0)
+  })
+
   it('updates after finalize are silently dropped', async () => {
     const m = makeMock()
     const stream = createDraftStream(m.send, m.edit, { throttleMs: 1000 })
