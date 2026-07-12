@@ -16,6 +16,9 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import {
   parseModelCommand,
+  planModelCommand,
+  isModelCommandBusy,
+  modelCommandReceiptLine,
   handleModelCommand,
   isValidModelArg,
   isSrModel,
@@ -1372,5 +1375,85 @@ describe("isOfflineTrustedModelToken (#3042 blocker 2a)", () => {
     // Curated sr-* alias, upper-cased, still resolves.
     const [alias] = Object.entries(SR_MODEL_ALIASES)[0];
     expect(isOfflineTrustedModelToken(alias.toUpperCase())).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #3177 — a typed /model must NEVER be swallowed without trace when sent
+// mid-turn. The routing decision folds BOTH busy signals, and every parsed
+// shape maps to a visible action (menu / queue / apply — never "do nothing").
+// ---------------------------------------------------------------------------
+describe("#3177 typed /model never silently swallowed mid-turn", () => {
+  describe("isModelCommandBusy folds both busy signals", () => {
+    it("is busy when the turn atom is set", () => {
+      expect(isModelCommandBusy({ currentTurnActive: true, turnInFlight: false })).toBe(true);
+    });
+
+    it("is busy when only the authoritative delivery-machine/approval gate is set", () => {
+      // THE SWALLOW REGRESSION: the pre-fix handler gated on `currentTurn !==
+      // null` ALONE. A session busy by the delivery-machine / pending-approval
+      // gate while the turn atom is cleared (the recovered-late / premature-
+      // turn-end window) read as idle, so the switch injected into a busy pane
+      // and was swallowed as literal text. Folding turnInFlight closes it.
+      expect(isModelCommandBusy({ currentTurnActive: false, turnInFlight: true })).toBe(true);
+    });
+
+    it("is idle only when BOTH signals are clear", () => {
+      expect(isModelCommandBusy({ currentTurnActive: false, turnInFlight: false })).toBe(false);
+    });
+  });
+
+  describe("planModelCommand routes every shape to a visible action", () => {
+    const busyByAtom = { currentTurnActive: true, turnInFlight: false, menuEnabled: true };
+    const busyByGate = { currentTurnActive: false, turnInFlight: true, menuEnabled: true };
+    const idle = { currentTurnActive: false, turnInFlight: false, menuEnabled: true };
+
+    it("QUEUES a set while busy by the turn atom (ack, not silent inject)", () => {
+      const d = planModelCommand({ kind: "set", model: "opus" }, busyByAtom);
+      expect(d).toEqual({ kind: "queue", target: "opus" });
+    });
+
+    it("QUEUES a set while busy by the delivery-machine/approval gate ONLY — the swallow case", () => {
+      // Sabotage-verify: revert the fix (gate on currentTurnActive alone) and
+      // this flips to { kind: 'apply' } → the direct-inject swallow returns.
+      const d = planModelCommand({ kind: "set", model: "opus" }, busyByGate);
+      expect(d).toEqual({ kind: "queue", target: "opus" });
+    });
+
+    it("expands sr-* aliases into the queued target token", () => {
+      const d = planModelCommand({ kind: "set", model: "flash" }, busyByAtom);
+      expect(d).toEqual({ kind: "queue", target: "sr-gemini-2.5-flash" });
+    });
+
+    it("APPLIES a set immediately when idle by both signals", () => {
+      const d = planModelCommand({ kind: "set", model: "opus" }, idle);
+      expect(d).toEqual({ kind: "apply", parsed: { kind: "set", model: "opus" } });
+    });
+
+    it("renders the MENU for bare /model when the picker is enabled (even mid-turn)", () => {
+      expect(planModelCommand({ kind: "show" }, busyByGate)).toEqual({ kind: "menu" });
+    });
+
+    it("APPLIES the text show path when the picker is disabled", () => {
+      const d = planModelCommand({ kind: "show" }, { ...idle, menuEnabled: false });
+      expect(d).toEqual({ kind: "apply", parsed: { kind: "show" } });
+    });
+
+    it("APPLIES help so a bad arg still gets an explicit reply", () => {
+      const parsed = { kind: "help", reason: "not a valid model name: !!" } as const;
+      expect(planModelCommand(parsed, busyByGate)).toEqual({ kind: "apply", parsed });
+    });
+  });
+
+  describe("modelCommandReceiptLine — the durable, greppable entry trace", () => {
+    it("stamps agent, kind, arg, and busy for a typed set", () => {
+      const line = modelCommandReceiptLine("finn", { kind: "set", model: "opus" }, true);
+      expect(line).toBe("telegram gateway: gw /model received agent=finn kind=set arg=opus busy=true");
+    });
+
+    it("marks the show + help forms with placeholder args", () => {
+      expect(modelCommandReceiptLine("finn", { kind: "show" }, false)).toContain("kind=show arg=(show)");
+      expect(modelCommandReceiptLine("finn", { kind: "help" }, false)).toContain("kind=help arg=(help)");
+    });
   });
 });

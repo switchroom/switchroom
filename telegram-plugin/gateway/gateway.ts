@@ -438,6 +438,8 @@ import { injectSlashCommand as injectSlashCommandImpl } from '../../src/agents/i
 import { handleInjectCommand, type InjectDeps } from './inject-handler.js'
 import {
   parseModelCommand,
+  planModelCommand,
+  modelCommandReceiptLine,
   handleModelCommand,
   buildModelMenu,
   handleModelMenuCallback,
@@ -22329,17 +22331,50 @@ bot.command('model', async ctx => {
   const parsed = parseModelCommand(text) ?? { kind: 'show' as const }
   const chatId = String(ctx.chat!.id)
   const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
+  // #3177 — durable receipt FIRST. A typed /model must NEVER be invisible: even
+  // if every downstream reply is shed/dropped, or the session is in a
+  // phantom-idle window (turn atom cleared while claude is still busy), the
+  // command leaves a greppable log line + a history row before any branch. This
+  // is the fix for the finn 2026-07-12 zero-trace swallow (no log, no reply, no
+  // ack, no deferred apply). `busyNow` folds BOTH busy signals (turn atom AND
+  // the authoritative delivery-machine/approval gate).
+  const busyNow = currentTurn !== null || turnInFlightForGate()
+  process.stderr.write(modelCommandReceiptLine(getMyAgentName(), parsed, busyNow) + '\n')
+  if (HISTORY_ENABLED && ctx.message?.message_id != null) {
+    try {
+      recordInbound({
+        chat_id: chatId,
+        thread_id: threadId ?? null,
+        message_id: ctx.message.message_id,
+        user: ctx.from?.username ?? (ctx.from?.id != null ? String(ctx.from.id) : null),
+        user_id: ctx.from?.id != null ? String(ctx.from.id) : null,
+        ts: ctx.message.date ?? Math.floor(Date.now() / 1000),
+        text,
+      })
+    } catch (err) {
+      process.stderr.write(`telegram gateway: /model recordInbound failed: ${(err as Error)?.message ?? String(err)}\n`)
+    }
+  }
   const deps = buildModelDeps({ chatId, threadId })
-  if (parsed.kind === 'show' && process.env.SWITCHROOM_MODEL_MENU !== '0') {
+  // Route on a pure disposition (#3177) that folds BOTH busy signals so a
+  // session busy by EITHER measure ack+queues instead of silently injecting
+  // into a busy pane. Every branch below produces a visible action.
+  const disposition = planModelCommand(parsed, {
+    currentTurnActive: currentTurn !== null,
+    turnInFlight: turnInFlightForGate(),
+    menuEnabled: process.env.SWITCHROOM_MODEL_MENU !== '0',
+  })
+  if (disposition.kind === 'menu') {
     const menu = await buildModelMenu(deps)
     await switchroomReply(ctx, menu.text, { html: true, reply_markup: modelMenuReplyMarkup(menu) })
     return
   }
-  // Mid-turn: instead of dead-ending ("Try again in a moment"), ACK + QUEUE +
-  // apply-on-idle + confirm (#3017). The typed set path either injects into
-  // claude's input box or triggers a carrier restart — both unsafe mid-turn.
-  if (parsed.kind === 'set' && deps.isBusy()) {
-    const target = expandSrAlias(parsed.model)
+  // Mid-turn (by either busy signal): instead of dead-ending ("Try again in a
+  // moment") or silently injecting into a busy pane, ACK + QUEUE + apply-on-idle
+  // + confirm (#3017/#3177). The typed set path either injects into claude's
+  // input box or triggers a carrier restart — both unsafe while busy.
+  if (disposition.kind === 'queue') {
+    const target = disposition.target
     const sent = await ctx.replyWithRichMessage(
       richMessage(hardenCardBreaks(pendingCmdAckText('model', target, escapeHtmlForTg))),
       threadId != null ? { message_thread_id: threadId } : {},
