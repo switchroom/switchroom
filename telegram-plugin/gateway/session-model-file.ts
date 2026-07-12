@@ -230,3 +230,91 @@ export function clearSessionEffortFile(agentDir: string): void {
     /* best-effort */
   }
 }
+
+// ─── Consume-once premium-recovery marker (tier-downgrade companion) ─────────
+//
+// A DURABLE marker the tier-downgrade writes when it walls a premium `/model`
+// selection fleet-wide. It records the DROPPED premium token + the chats to
+// notify, and survives the downgrade self-restart (start.sh never touches this
+// name — unlike `.session-model`, which is consumed at boot). The gateway's
+// `runQuotaWatch` tick reads it, and when the broker's `list-state` shows the
+// premium tier servable again (deterministic per-account eligibility), fires
+// EXACTLY ONE "available again" ping with a one-tap switch-back button, then
+// clears the marker (at-most-once). Also cleared the instant the user re-issues
+// `/model <premium>` manually (no stale ping). Shape-gated like the carriers
+// above — the model token passes the same MODEL_ARG_RE gate.
+
+export const PREMIUM_RECOVERY_FILE = '.premium-recovery'
+
+export interface PremiumRecoveryRecord {
+  /** The dropped premium `/model` token (e.g. `fable`) to offer switching back to. */
+  premiumModel: string
+  /** Telegram chat ids to ping on recovery (the downgrade notice's allowFrom). */
+  chats: string[]
+  ts: number
+}
+
+/**
+ * Parse `.premium-recovery` content. Null on corrupt JSON, a missing/wrong-typed
+ * field, a model token that fails the MODEL_ARG_RE shape gate, or a `chats`
+ * array that is not a non-empty list of non-empty strings.
+ */
+export function parsePremiumRecovery(text: string): PremiumRecoveryRecord | null {
+  try {
+    const raw = JSON.parse(text) as Partial<PremiumRecoveryRecord>
+    if (
+      typeof raw.premiumModel !== 'string' ||
+      !isValidModelArg(raw.premiumModel) ||
+      typeof raw.ts !== 'number' ||
+      !Array.isArray(raw.chats) ||
+      raw.chats.length === 0 ||
+      !raw.chats.every((c) => typeof c === 'string' && c.length > 0)
+    ) {
+      return null
+    }
+    return { premiumModel: raw.premiumModel, chats: raw.chats, ts: raw.ts }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Write the premium-recovery marker. Throws on a non-canonical token (parity
+ * with the carriers) or an empty chat list — a marker with nowhere to ping is a
+ * bug, not a silent no-op.
+ */
+export function writePremiumRecoveryFile(
+  agentDir: string,
+  premiumModel: string,
+  chats: string[],
+): void {
+  if (!isValidModelArg(premiumModel)) {
+    throw new Error(`refusing to persist non-canonical premium-recovery token: ${JSON.stringify(premiumModel)}`)
+  }
+  const clean = chats.filter((c) => typeof c === 'string' && c.length > 0)
+  if (clean.length === 0) {
+    throw new Error('refusing to persist premium-recovery marker with no chats to notify')
+  }
+  atomicWrite(
+    join(agentDir, PREMIUM_RECOVERY_FILE),
+    `${JSON.stringify({ premiumModel, chats: clean, ts: Date.now() })}\n`,
+  )
+}
+
+/** Parsed premium-recovery marker, or null when absent/corrupt. */
+export function readPremiumRecoveryFile(agentDir: string): PremiumRecoveryRecord | null {
+  try {
+    return parsePremiumRecovery(readFileSync(join(agentDir, PREMIUM_RECOVERY_FILE), 'utf8'))
+  } catch {
+    return null
+  }
+}
+
+/** Delete the premium-recovery marker (consumed on ping / manual re-issue). Best-effort. */
+export function clearPremiumRecoveryFile(agentDir: string): void {
+  try {
+    rmSync(join(agentDir, PREMIUM_RECOVERY_FILE), { force: true })
+  } catch {
+    /* best-effort */
+  }
+}

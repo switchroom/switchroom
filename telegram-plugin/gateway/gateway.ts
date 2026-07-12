@@ -468,8 +468,16 @@ import {
   readConfiguredDefaultModel,
   writeSessionEffortFile,
   clearSessionEffortFile,
+  writePremiumRecoveryFile,
+  readPremiumRecoveryFile,
+  clearPremiumRecoveryFile,
 } from './session-model-file.js'
-import { decideTierDowngrade, planTierDowngrade } from '../tier-downgrade.js'
+import { runTierDowngrade } from './tier-downgrade-wiring.js'
+import {
+  decidePremiumRecovery,
+  renderPremiumRecoveryPing,
+  premiumRecoveryClaimKey,
+} from '../premium-recovery.js'
 import { discoverModels, selectModel } from '../../src/agents/model-picker.js'
 import { resolveMainModel, SWITCHROOM_DEFAULT_THINKING_EFFORT } from '../../src/agents/scaffold.js'
 import {
@@ -21940,6 +21948,10 @@ function recordTypedModelSwitch(
   }
   if (!reply.selectedModel) return ''
   sessionModelSource.setOverride(reply.selectedModel)
+  // A manual /model apply to the dropped premium clears any pending recovery
+  // marker so the "available again" ping can't still fire after the user has
+  // already switched back themselves.
+  clearPremiumRecoveryOnManualSwitch(reply.selectedModel)
   return ''
 }
 
@@ -21968,6 +21980,11 @@ function recordModelMenuSideEffects(
   // (recommended)" selection clears any leftover carrier.
   if (outcome.selectedModel) {
     sessionModelSource.setOverride(outcome.selectedModel)
+    // Clear a pending premium-recovery marker when the tap re-selects the
+    // dropped premium (menu OR the recovery ping's own switch-back button):
+    // no stale "available again" ping once we're back on it. Idempotent — the
+    // ping-send path already consumed the marker, so this is a no-op there.
+    clearPremiumRecoveryOnManualSwitch(outcome.selectedModel)
   }
   if (outcome.clearedDefault) {
     const smDir = resolveAgentDirFromEnv()
@@ -23601,57 +23618,134 @@ function broadcastTierNotice(markdown: string): void {
  *                       falls through to the all-blocked card.
  */
 function maybeTierDowngrade(triggerAgent: string): 'downgraded' | 'restart-pending' | 'skip' {
-  const agentDir = resolveAgentDirFromEnv()
-  if (!agentDir) return 'skip'
-  const configuredDefault = resolveMainModel(readConfiguredDefaultModel(agentDir) ?? undefined)
-  const decision = decideTierDowngrade({
-    sessionOverride: sessionModelSource.getOverride(),
-    configuredDefault,
+  // Thin adapter: the order-sensitive glue lives in runTierDowngrade
+  // (tier-downgrade-wiring.ts) behind injected deps so it is unit-testable
+  // without importing the gateway. This wires the real seams.
+  return runTierDowngrade(triggerAgent, {
+    getAgentDir: () => resolveAgentDirFromEnv() ?? null,
+    getConfiguredDefault: () => {
+      const dir = resolveAgentDirFromEnv()
+      if (!dir) return null
+      return resolveMainModel(readConfiguredDefaultModel(dir) ?? undefined)
+    },
+    getSessionOverride: () => sessionModelSource.getOverride(),
     resolve: (t) => resolveMainModel(t),
+    // PEEK the resume gate WITHOUT arming (single-flight within this process +
+    // 3h staleness), the same gate the account-swap resume path uses.
+    peekResumeGate: () => fleetFallbackResumeGate.peek(newestActiveTurnStartedAtMs()),
+    writeCarrier: (dir, toModel, cfg) => writeSessionModelFile(dir, toModel, cfg),
+    armResumeGate: () => fleetFallbackResumeGate.arm(),
+    // Records the DROPPED premium token + the notice's allowFrom chats; start.sh
+    // never consumes `.premium-recovery`, so it survives the self-restart.
+    writeRecoveryMarker: (dir, premiumModel) => {
+      const chats = loadAccess().allowFrom.map((c) => String(c))
+      if (chats.length > 0) writePremiumRecoveryFile(dir, premiumModel, chats)
+    },
+    broadcastNotice: (md) => broadcastTierNotice(md),
+    selfRestart: (agent) => triggerSelfRestart(agent, 'tier-downgrade-resume'),
+    selfAgent: (t) => process.env.SWITCHROOM_AGENT_NAME ?? t,
+    log: (msg) => process.stderr.write(`telegram gateway: ${msg}\n`),
   })
-  // PEEK the resume gate WITHOUT arming (single-flight within this process + 3h
-  // staleness), the same gate the account-swap resume path uses. Peeking lets us
-  // do the fallible carrier write BEFORE committing the arm (see arm() below).
-  const gateVerdict = fleetFallbackResumeGate.peek(newestActiveTurnStartedAtMs())
-  const plan = planTierDowngrade(decision, gateVerdict, triggerAgent)
-  if (plan.kind === 'skip') {
-    if (decision.action === 'downgrade') {
-      process.stderr.write(
-        `telegram gateway: [tier-downgrade] restart suppressed (${gateVerdict}) agent=${triggerAgent}\n`,
-      )
-    }
-    return 'skip'
-  }
-  if (plan.kind === 'suppress') {
-    // A resume restart is already armed (concurrent turn). Do NOT emit a give-up
-    // card — that restart will replay the latest interrupted turn.
-    process.stderr.write(
-      `telegram gateway: [tier-downgrade] give-up suppressed — a resume restart is already armed agent=${triggerAgent}\n`,
-    )
-    return 'restart-pending'
-  }
-  // plan.kind === 'downgrade'. Write the consume-once carrier for the configured
-  // default BEFORE arming the latch: a throwing write must not leave an armed
-  // latch with no pending restart (which would suppress a legitimate later
-  // account-swap resume for the single-flight window).
-  try {
-    writeSessionModelFile(agentDir, plan.toModel, configuredDefault)
-  } catch (err) {
-    process.stderr.write(
-      `telegram gateway: [tier-downgrade] failed to write session-model carrier — aborting downgrade: ${(err as Error)?.message ?? err}\n`,
-    )
-    return 'skip'
-  }
-  // Carrier is on disk — NOW commit the single-flight arm and fire the restart.
-  fleetFallbackResumeGate.arm()
-  process.stderr.write(
-    `telegram gateway: [tier-downgrade] downgrading ${plan.fromModel} → ${plan.toModel} ` +
-    `and resuming via self-restart agent=${triggerAgent}\n`,
+}
+
+/**
+ * "Premium model recovered" ping (tier-downgrade companion). Consulted from the
+ * gateway's existing `runQuotaWatch` tick (every 15 min, on the cheap
+ * `list-state` IPC read it already does — NO new poller, NO broker change).
+ * When a `.premium-recovery` marker is pending (a downgrade dropped a premium
+ * `/model` selection fleet-wide) AND the broker's live-authoritative per-account
+ * eligibility shows the premium tier servable again — at least one account
+ * neither `exhausted` nor `premium_walled` — fire EXACTLY ONE ping to the
+ * recorded chats with a one-tap "switch back" button, then consume the marker.
+ *
+ * DETERMINISTIC: `exhausted` / `premium_walled` are the broker's own verdicts
+ * (`isAccountExhausted` / `isAccountPremiumWalled` → `isModelTierWalled`, a pure
+ * timestamp compare). No model judgement, no clock of our own.
+ *
+ * AT-MOST-ONCE: a fleet-wide `claim-notification` gates against a bounce or a
+ * concurrent tick, and the marker is cleared BEFORE the send (never-storm). The
+ * button routes through the SAME session-scoped `/model` apply path as the
+ * model menu (`mdl:alias:<premium>` → handleModelMenuCallback +
+ * recordModelMenuSideEffects) — it does not bypass it.
+ */
+async function maybePremiumRecoveryPing(
+  brokerClient: NonNullable<Awaited<ReturnType<typeof getAuthBrokerClient>>>,
+  accounts: ReadonlyArray<{ exhausted: boolean; premium_walled?: boolean }>,
+): Promise<void> {
+  const agentDir = resolveAgentDirFromEnv()
+  if (!agentDir) return
+  const marker = readPremiumRecoveryFile(agentDir)
+  if (marker == null) return
+  const decision = decidePremiumRecovery({
+    hasMarker: true,
+    accounts: accounts.map((a) => ({
+      exhausted: a.exhausted,
+      premiumWalled: a.premium_walled === true,
+    })),
+  })
+  if (!decision.fire) return
+  const agent = getMyAgentName()
+  // Fleet-wide dedup: a fresh gateway boot or a second tick inside the window
+  // must not re-send. Fail-open (claimQuotaNotification returns true on any
+  // broker error) — a convenience ping degrades to at-least-once, never lost.
+  const granted = await claimQuotaNotification(
+    brokerClient,
+    premiumRecoveryClaimKey(agent, marker.premiumModel),
   )
-  broadcastTierNotice(plan.notice)
-  const selfAgent = process.env.SWITCHROOM_AGENT_NAME ?? triggerAgent
-  triggerSelfRestart(selfAgent, 'tier-downgrade-resume')
-  return 'downgraded'
+  if (!granted) {
+    // Another gateway already owns this recovery ping — consume our marker so
+    // it can't linger and re-attempt every tick, and bail.
+    clearPremiumRecoveryFile(agentDir)
+    return
+  }
+  // Consume the marker BEFORE sending (never-storm: at-most-once is the hard
+  // requirement for this ping; a transient send fault is covered by
+  // swallowingApiCall's retry policy).
+  clearPremiumRecoveryFile(agentDir)
+  const ping = renderPremiumRecoveryPing(marker.premiumModel)
+  const keyboard = {
+    inline_keyboard: [
+      [{ text: ping.buttonText, callback_data: `${MODEL_CALLBACK_ALIAS}${marker.premiumModel}` }],
+    ],
+  }
+  const chats = marker.chats.length > 0
+    ? marker.chats
+    : loadAccess().allowFrom.map((c) => String(c))
+  for (const chat_id of chats) {
+    void swallowingApiCall(
+      // allow-raw-bot-api: wrapped in swallowingApiCall (retry policy)
+      () =>
+        bot.api.sendRichMessage(chat_id, richMessage(ping.text), {
+          disable_notification: true,
+          reply_markup: keyboard,
+        }),
+      { chat_id: String(chat_id), verb: 'premium-recovery:notify' },
+    )
+  }
+  process.stderr.write(
+    `telegram gateway: [premium-recovery] ${marker.premiumModel} servable again — ping sent agent=${agent} chats=${chats.length}\n`,
+  )
+}
+
+/**
+ * Clear a pending premium-recovery marker when the user MANUALLY re-selects the
+ * dropped premium model before the recovery ping fires — no stale "available
+ * again" ping after they've already switched back. Called from every `/model`
+ * apply chokepoint (typed + menu/callback). Matches on the canonicalized token
+ * so an alias vs resolved-id spelling of the same model still clears it.
+ */
+function clearPremiumRecoveryOnManualSwitch(appliedToken: string | null | undefined): void {
+  if (appliedToken == null || appliedToken.length === 0) return
+  const agentDir = resolveAgentDirFromEnv()
+  if (!agentDir) return
+  const marker = readPremiumRecoveryFile(agentDir)
+  if (marker == null) return
+  if (resolveMainModel(appliedToken) === resolveMainModel(marker.premiumModel)) {
+    clearPremiumRecoveryFile(agentDir)
+    process.stderr.write(
+      `telegram gateway: [premium-recovery] marker cleared — user manually re-issued /model ${marker.premiumModel}\n`,
+    )
+  }
 }
 
 /** Returns true iff the dispatcher actually performed a swap (and the
@@ -23982,6 +24076,16 @@ async function runQuotaWatch(opts: { bootTick?: boolean } = {}): Promise<void> {
   if (!listStateData.accounts || listStateData.accounts.length === 0) {
     return // No accounts — nothing to watch.
   }
+
+  // Premium-model recovery ping (tier-downgrade companion). Reuses THIS tick's
+  // list-state read (no extra IPC): if a downgrade left a `.premium-recovery`
+  // marker and the broker now shows the premium tier servable again, ping once
+  // with a one-tap switch-back button. At-most-once + fleet-claim-deduped.
+  await maybePremiumRecoveryPing(brokerClient, listStateData.accounts).catch((err) => {
+    process.stderr.write(
+      `telegram gateway: [premium-recovery] ping check failed (non-fatal): ${(err as Error)?.message ?? err}\n`,
+    )
+  })
 
   // Build AccountSnapshot[] from cached broker state only — no live probe.
   // Accounts with null last_quota produce quota=null snapshots; classifyHealth
