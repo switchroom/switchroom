@@ -326,6 +326,8 @@ import {
   throttleRetryInPlaceMaxMs,
 } from '../throttle-tier.js'
 import { createThrottleTierRunner } from './throttle-tier-wiring.js'
+import { parseLitellmNoticeWindowMs } from '../litellm-local-notice.js'
+import { createLitellmLocalNoticeRunner } from './litellm-local-notice-wiring.js'
 import { runFleetAutoFallback, renderFallbackFailureNotice, evaluateFallbackFailureNotice, evaluateAllBlockedNotice, type FallbackFailureNoticeState, type FallbackAllBlockedNoticeState } from '../auto-fallback-fleet.js'
 import { startRestartWatchdog } from './restart-watchdog.js'
 import { validateStringArray } from './access-validator.js'
@@ -1410,6 +1412,11 @@ type Access = {
   parseMode?: 'html' | 'markdownv2' | 'text'
   disableLinkPreview?: boolean
   coalescingGapMs?: number
+  /** Cooldown window (ms) for the litellm-local 429 notice — the debounced
+   *  "fleet token limiter engaged" message (litellm-local-notice.ts). Default
+   *  15 min when unset/invalid (parseLitellmNoticeWindowMs). Projected from
+   *  channels.telegram.litellm_notice.window_ms by scaffold. */
+  litellmNoticeWindowMs?: number
   /** A2: max media attachments folded into one coalesced turn. Default 10
    *  (a full Telegram album / forwarded burst arrives as one turn). Set 1 to
    *  restore single-attachment behaviour. Projected from
@@ -1564,6 +1571,7 @@ function readAccessFile(): Access {
       parseMode: parsed.parseMode,
       disableLinkPreview: parsed.disableLinkPreview,
       coalescingGapMs: parsed.coalescingGapMs,
+      litellmNoticeWindowMs: parsed.litellmNoticeWindowMs,
       coalesceMaxAttachments: parsed.coalesceMaxAttachments,
       interruptSafeBoundary: parsed.interruptSafeBoundary,
       interruptMaxWaitMs: parsed.interruptMaxWaitMs,
@@ -7735,6 +7743,18 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
         `telegram gateway: 429 classified litellm-proxy-local agent=${agent} — ` +
           `calm path, no account attribution, no failover\n`,
       )
+      // The dedicated debounced notice REPLACES the generic "🚦 Rate limited"
+      // card for this classification only: one calm message naming the fleet
+      // token limiter (LiteLLM tpm_limit/rpm_limit) instead of a card that
+      // reads like an Anthropic account problem. Classification, quota-ledger,
+      // and failover behavior are untouched (nothing fired above on this
+      // branch). Record into history first so /status still sees the event
+      // even when the notice itself is cooldown-suppressed.
+      try {
+        recordOperatorEvent(event)
+      } catch { /* history is best-effort */ }
+      litellmLocalNoticeRunner.onRateLimited('litellm-local', agent)
+      return
     }
   }
   if (rateLimit429Classification === 'account-scoped') {
@@ -23456,6 +23476,29 @@ const throttleTierRunner = createThrottleTierRunner({
   restartNow: (agentName, reason) => {
     triggerSelfRestart(agentName, reason)
   },
+  log: (m) => process.stderr.write(`telegram gateway: ${m}\n`),
+})
+
+// ─── litellm-local 429 notice — side-effect wiring ──────────────────────────
+// State machine + text + config parsing live in litellm-local-notice.ts
+// (pure); the sequencing (classification guard → per-agent cooldown →
+// broadcast + metric) lives in litellm-local-notice-wiring.ts so it is
+// unit-testable with injected deps. This block only binds the real gateway
+// dependencies. Deliberately NO broker surface: the litellm-local calm
+// path's invariant is that account state is never touched.
+const litellmLocalNoticeRunner = createLitellmLocalNoticeRunner({
+  listNoticeChats: () => loadAccess().allowFrom,
+  sendNotice: (chat_id, markdown) => {
+    // Status notice, not the user's answer — silence the ping (same posture
+    // as the throttle-tier / fleet-fallback announcements).
+    void swallowingApiCall(
+      // allow-raw-bot-api: wrapped in swallowingApiCall (retry policy)
+      () => bot.api.sendRichMessage(chat_id, richMessage(markdown), { disable_notification: true }),
+      { chat_id: String(chat_id), verb: 'litellm-local-notice:notify' },
+    )
+  },
+  windowMs: () => parseLitellmNoticeWindowMs(loadAccess().litellmNoticeWindowMs),
+  emitMetric: (event) => emitRuntimeMetric(event),
   log: (m) => process.stderr.write(`telegram gateway: ${m}\n`),
 })
 

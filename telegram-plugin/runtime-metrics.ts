@@ -195,6 +195,22 @@ export type RuntimeMetricEvent =
       limit: number | null
       current_usage: number | null
     }
+  /**
+   * A litellm-local throttle NOTICE actually posted (litellm-local-notice.ts
+   * — the debounced "fleet token limiter engaged" message). Distinct from
+   * `rate_limit_429_classified`, which fires on EVERY classified 429: this
+   * fires once per sent notice, and `suppressed_count` is how many
+   * litellm-local 429s the cooldown window silently absorbed since the
+   * previous notice (0 on the first) — the debounce's effectiveness in one
+   * number. `window_ms` is the resolved cooldown window (default 15 min;
+   * channels.telegram.litellm_notice.window_ms).
+   */
+  | {
+      kind: 'litellm_local_429_notice'
+      agent: string
+      suppressed_count: number
+      window_ms: number
+    }
 
 /**
  * The JSONL sink lives under the runtime state dir so it's per-agent

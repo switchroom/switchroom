@@ -1322,6 +1322,31 @@ export const TelegramChannelSchema = z
         "into a single turn so a forwarded album or split paste doesn't fan out " +
         "into N separate turns. Cascades from defaults.channels.telegram.coalesce."
       ),
+    litellm_notice: z
+      .object({
+        window_ms: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe(
+            "Per-agent cooldown window (ms) for the litellm-local 429 notice. " +
+            "When the agent trips the LiteLLM proxy's OWN tpm_limit/rpm_limit " +
+            "cap (a `litellm-local` classified 429 — see docs/auth.md § " +
+            "LiteLLM-proxy-local 429s), the gateway posts ONE calm notice " +
+            "naming the fleet token limiter, then counts further hits silently " +
+            "for this long; the first notice after the window expires says " +
+            "how many were absorbed. Default 900000 (15 min). Invalid values " +
+            "fall back to the default."
+          ),
+      })
+      .optional()
+      .describe(
+        "Debounce tuning for the litellm-local throttle notice — the calm " +
+        "'fleet token limiter engaged' message posted when the LiteLLM " +
+        "proxy's own rate cap trips (never an Anthropic account limit). " +
+        "Cascades from defaults.channels.telegram.litellm_notice."
+      ),
     interrupt: z
       .object({
         safe_boundary: z
