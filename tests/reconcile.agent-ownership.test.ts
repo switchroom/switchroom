@@ -158,6 +158,53 @@ describe("reconcileAgent — agent-tree ownership sweep (#3168)", () => {
     ).toThrow(new RegExp(join(agentDir, ".claude", "settings.json").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   });
 
+  it("restores ownership even when reconcile throws AFTER the atomic rewrites (#3168 review F1)", () => {
+    const config = makeAgentConfig();
+    const { agentDir } = scaffoldAgent(AGENT, config, tmpDir, telegramConfig);
+
+    // Force a deterministic throw at a point AFTER the settings.json (and
+    // .mcp.json) atomic rewrites: the workspace re-seed block calls
+    // mkdirSync(<agentDir>/workspace, { recursive: true }), which throws
+    // EEXIST/ENOTDIR when a regular FILE occupies that path. This models
+    // any post-write failure (ENOSPC, symlink migration error) that
+    // pre-backstop left root:root 0600 dotfiles behind with no sweep.
+    rmSync(join(agentDir, "workspace"), { recursive: true, force: true });
+    writeFileSync(join(agentDir, "workspace"), "not a directory");
+
+    const calls: Array<{ uid: number; gid: number; rootDir: string }> = [];
+    ownershipRuntime.geteuid = () => 0;
+    ownershipRuntime.chownTree = (uid, gid, rootDir) => {
+      calls.push({ uid, gid, rootDir });
+    };
+
+    // The original error must surface (not be masked by the backstop)…
+    expect(() =>
+      reconcileAgent(AGENT, config, tmpDir, telegramConfig, switchroomConfig),
+    ).toThrow(/EEXIST|ENOTDIR|file already exists|not a directory/i);
+
+    // …and the ownership sweep must still have run on the error path.
+    const uid = allocateAgentUid(AGENT);
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls[calls.length - 1]).toEqual({ uid, gid: uid, rootDir: agentDir });
+  });
+
+  it("a failing backstop sweep never masks the original mid-reconcile error", () => {
+    const config = makeAgentConfig();
+    const { agentDir } = scaffoldAgent(AGENT, config, tmpDir, telegramConfig);
+    rmSync(join(agentDir, "workspace"), { recursive: true, force: true });
+    writeFileSync(join(agentDir, "workspace"), "not a directory");
+
+    ownershipRuntime.geteuid = () => 0;
+    ownershipRuntime.chownTree = () => {
+      throw new Error("chown exploded too");
+    };
+
+    // The mkdir failure — the actual bug — must win over the sweep failure.
+    expect(() =>
+      reconcileAgent(AGENT, config, tmpDir, telegramConfig, switchroomConfig),
+    ).toThrow(/EEXIST|ENOTDIR|file already exists|not a directory/i);
+  });
+
   // Real-outcome pin: only executable where the test process actually has
   // CAP_CHOWN. On the CI vitest runner (non-root) this self-skips; the
   // recorder-based tests above cover the wiring there.
@@ -181,6 +228,24 @@ describe("reconcileAgent — agent-tree ownership sweep (#3168)", () => {
       // The whole tree is swept, not just the two incident files.
       expect(statSync(join(agentDir, "start.sh")).uid).toBe(uid);
       expect(statSync(join(agentDir, ".claude")).uid).toBe(uid);
+    },
+  );
+
+  it.runIf(process.getuid?.() === 0)(
+    "root reconcile that throws mid-run still leaves settings.json agent-owned on disk (#3168 review F1)",
+    () => {
+      const config = makeAgentConfig();
+      const { agentDir } = scaffoldAgent(AGENT, config, tmpDir, telegramConfig);
+      rmSync(join(agentDir, "workspace"), { recursive: true, force: true });
+      writeFileSync(join(agentDir, "workspace"), "not a directory");
+
+      expect(() =>
+        reconcileAgent(AGENT, config, tmpDir, telegramConfig, switchroomConfig),
+      ).toThrow(/EEXIST|ENOTDIR|file already exists|not a directory/i);
+
+      const uid = allocateAgentUid(AGENT);
+      expect(statSync(join(agentDir, ".claude", "settings.json")).uid).toBe(uid);
+      expect(statSync(join(agentDir, ".mcp.json")).uid).toBe(uid);
     },
   );
 });

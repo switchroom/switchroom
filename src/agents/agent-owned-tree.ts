@@ -45,10 +45,15 @@
  *
  * ## Symlink safety
  *
- * The sweep shells `chown -R` exactly like `alignAgentUid` does. GNU/busybox
- * `chown -R` does not traverse symlinks (default -P), so symlinks into the
- * shared bundled-skills pool (`~/.switchroom/skills/`) never re-own pool
- * files — the same battle-tested semantics apply has used fleet-wide.
+ * The sweep shells `chown -h -R` (`--no-dereference`). `-R` alone is NOT
+ * enough: GNU chown's -R defaults to -P (never traverse, lchown each
+ * visited symlink), but busybox chown has no -H/-L/-P at all and without
+ * `-h` it DEREFERENCES every visited entry — so on a busybox host a
+ * planted symlink (e.g. `workspace/x -> /etc/shadow`) would get chowned
+ * as root on the next rollout. `-h` is supported by both GNU and busybox
+ * and is a behavioral no-op on GNU's -R traversal (symlinks were lchowned
+ * anyway; regular files are unaffected). `alignAgentUid` (scaffold.ts),
+ * the apply-path sweep this mirrors, passes the same flag.
  */
 
 import { execFileSync } from "node:child_process";
@@ -62,9 +67,12 @@ import { allocateAgentUid } from "./agent-uid.js";
  */
 export const ownershipRuntime = {
   geteuid: (): number | undefined => process.geteuid?.(),
-  /** Recursive chown. Throws on failure (stderr captured in the error). */
+  /**
+   * Recursive chown. Throws on failure (stderr captured in the error).
+   * `-h` is load-bearing on busybox hosts — see "Symlink safety" above.
+   */
   chownTree: (uid: number, gid: number, rootDir: string): void => {
-    execFileSync("chown", ["-R", `${uid}:${gid}`, rootDir], {
+    execFileSync("chown", ["-h", "-R", `${uid}:${gid}`, rootDir], {
       stdio: ["ignore", "ignore", "pipe"],
     });
   },
