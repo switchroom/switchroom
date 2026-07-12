@@ -12,7 +12,7 @@
 
 import { GrammyError, HttpError } from 'grammy'
 
-import { FLOOD_WAIT_ACTIVE } from '../retry-api-call.js'
+import { FLOOD_WAIT_ACTIVE, LOCAL_RESOURCE_EXHAUSTED } from '../retry-api-call.js'
 
 export type RejectionAction = 'shutdown' | 'log_only'
 
@@ -77,6 +77,19 @@ export function classifyRejection(
   // fires MORE sends into the open window and extends the ban, which is the
   // exact amplification the #2923 circuit breaker exists to stop.
   if (err instanceof Error && err.message === FLOOD_WAIT_ACTIVE) return 'log_only'
+
+  // LOCAL_RESOURCE_EXHAUSTED (#3099, sibling of FLOOD_WAIT_ACTIVE above):
+  // retry-api-call throws this plain Error marker when a send fails on a LOCAL
+  // disk/memory exhaustion (ENOSPC/EDQUOT/EIO/ENOMEM) rather than retrying it
+  // (#2923) — retrying a local-resource failure in a tight loop is what tripped
+  // the per-bot flood ban in the first place. A leaked one (a fire-and-forget
+  // send that wasn't wrapped in swallowingApiCall) must NOT crash the gateway:
+  // the box is ALREADY out of disk/memory, and a crash→restart drives a fresh
+  // round of boot-time sends and staging writes at a resource that is already
+  // exhausted — the exact amplification the #2923 marker exists to avoid. The
+  // degraded-state marker already carries this signal; a crash loop is the
+  // wrong way to surface a full disk. Same log_only posture as its sibling.
+  if (err instanceof Error && err.message === LOCAL_RESOURCE_EXHAUSTED) return 'log_only'
 
   if (!isGrammy) return 'shutdown'
 

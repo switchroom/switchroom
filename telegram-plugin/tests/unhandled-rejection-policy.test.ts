@@ -11,7 +11,7 @@
 import { describe, it, expect } from 'bun:test'
 import { GrammyError } from 'grammy'
 import { classifyRejection } from '../gateway/unhandled-rejection-policy.js'
-import { FLOOD_WAIT_ACTIVE } from '../retry-api-call.js'
+import { FLOOD_WAIT_ACTIVE, LOCAL_RESOURCE_EXHAUSTED } from '../retry-api-call.js'
 
 // ── Real GrammyError fixtures ──────────────────────────────────────────────
 
@@ -239,5 +239,31 @@ describe('classifyRejection — FLOOD_WAIT_ACTIVE marker (#3084)', () => {
 
   it('still returns "shutdown" for an unrelated plain Error', () => {
     expect(classifyRejection(new Error('FLOOD_WAIT_ACTIVE-ish but not it'))).toBe('shutdown')
+  })
+})
+
+describe('classifyRejection — LOCAL_RESOURCE_EXHAUSTED marker (#3099)', () => {
+  // retry-api-call throws this plain Error marker (retry-api-call.ts:344) when a
+  // send fails on LOCAL disk/memory exhaustion (ENOSPC/EDQUOT/EIO/ENOMEM) rather
+  // than retrying it (#2923). Like its sibling FLOOD_WAIT_ACTIVE it is a plain
+  // Error, not a GrammyError, so without an explicit entry it fell into the
+  // `!isGrammy → shutdown` branch — crashing the gateway when the box is ALREADY
+  // out of disk, which drives a fresh round of boot-time sends/staging writes at
+  // an exhausted resource (the amplification the #2923 marker exists to avoid).
+  it('returns "log_only" for a leaked LOCAL_RESOURCE_EXHAUSTED marker', () => {
+    // Mirror the real throw shape from retry-api-call.ts:344 —
+    // `Object.assign(new Error(LOCAL_RESOURCE_EXHAUSTED), { original: err })`.
+    const err = Object.assign(new Error(LOCAL_RESOURCE_EXHAUSTED), {
+      original: Object.assign(new Error('ENOSPC: no space left on device'), {
+        code: 'ENOSPC',
+      }),
+    })
+    expect(classifyRejection(err)).toBe('log_only')
+  })
+
+  it('still returns "shutdown" for an unrelated plain Error', () => {
+    expect(
+      classifyRejection(new Error('LOCAL_RESOURCE_EXHAUSTED-ish but not it')),
+    ).toBe('shutdown')
   })
 })
