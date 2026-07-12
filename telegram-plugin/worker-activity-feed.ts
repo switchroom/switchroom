@@ -39,6 +39,7 @@ import {
 } from './card-format.js'
 import { STATUS_ROLLING_LINES } from './status-no-truncate.js'
 import { renderStatusCard, formatStepSuffix } from './tool-activity-summary.js'
+import { isSendGateShed } from './send-gate.js'
 
 /** Worker-activity feed is ON by default; an operator opts out with
  *  SWITCHROOM_WORKER_ACTIVITY_FEED=0. */
@@ -534,11 +535,14 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
     try {
       const res = await opts.bot.editMessageText(h.chatId, h.messageId, body, sendOptsFor(h))
       // Shed honesty (#3084, mirrors #3173): a cosmetic edit the gate shed
-      // resolves `undefined` — the payload is NOT on screen. Do not record it
-      // as `lastBody`, or the next tick's dedup would skip re-sending the very
-      // update the gate dropped. Park on any open window and let the heartbeat
-      // re-drive once it closes.
-      if (res === undefined) {
+      // resolves the distinguishable SEND_GATE_SHED sentinel (#3110 F1 — NOT a
+      // bare `undefined`, which the gate reserves for a benign no-op drop whose
+      // payload IS already on screen). The shed payload is NOT on screen, so do
+      // not record it as `lastBody`, or the next tick's dedup would skip
+      // re-sending the very update the gate dropped. Park on any open window and
+      // let the heartbeat re-drive once it closes. A benign `undefined`/`true`
+      // falls through below and is correctly recorded as delivered.
+      if (isSendGateShed(res)) {
         parkIfFloodWindowOpen(h)
         return
       }
@@ -610,12 +614,13 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
     }
     try {
       const res = await opts.bot.editMessageText(h.chatId, h.messageId, body, sendOptsFor(h))
-      // Shed honesty (#3084): a shed terminal edit resolves `undefined` — it did
-      // NOT land. Keep `pendingFinish` staged so the heartbeat re-drives it once
-      // the window closes; do NOT clear it or record `lastBody` (that would be a
-      // false finalization — card frozen on its running render while we believe
-      // it's done). Park on any open window.
-      if (res === undefined) {
+      // Shed honesty (#3084): a shed terminal edit resolves the distinguishable
+      // SEND_GATE_SHED sentinel (#3110 F1 — NOT a bare `undefined`, which is the
+      // gate's benign no-op drop) — it did NOT land. Keep `pendingFinish` staged
+      // so the heartbeat re-drives it once the window closes; do NOT clear it or
+      // record `lastBody` (that would be a false finalization — card frozen on
+      // its running render while we believe it's done). Park on any open window.
+      if (isSendGateShed(res)) {
         parkIfFloodWindowOpen(h)
         h.pendingFinish = view
         return

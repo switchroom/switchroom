@@ -7,6 +7,7 @@ import {
   type BotApiForWorkerFeed,
 } from '../worker-activity-feed.js'
 import { STATUS_ROLLING_LINES, STATUS_LINE_MAX } from '../status-no-truncate.js'
+import { SEND_GATE_SHED } from '../send-gate.js'
 
 describe('isWorkerActivityFeedEnabled (default ON)', () => {
   it('defaults to true when the env var is unset', () => {
@@ -1361,19 +1362,31 @@ interface GateBot extends BotApiForWorkerFeed {
   sent: Array<{ text: string }>
   /** DELIVERED edits (gate admitted). */
   edits: Array<{ messageId: number; text: string }>
-  /** One-shot: shed the next send (resolve undefined) even with the window closed. */
+  /**
+   * One-shot: shed the next send even with the window closed. Faithful to the
+   * gate: a worker-feed SEND is `useful` (never `cosmetic`), so a gate that
+   * can't admit it resolves `undefined` (queue-TTL `expired`) — NEVER the
+   * cosmetic-only SEND_GATE_SHED sentinel. The feed's send-shed detection is
+   * structural (`typeof sent.message_id !== 'number'`), catching either.
+   */
   shedNextSend: boolean
-  /** One-shot: shed the next edit (resolve undefined) even with the window closed. */
+  /**
+   * One-shot: shed the next EDIT even with the window closed. Faithful to the
+   * gate: worker-feed edits are `cosmetic`, so a gate shed resolves the
+   * distinguishable SEND_GATE_SHED sentinel (#3110 F1) — NOT `undefined` (which
+   * the gate reserves for a benign no-op drop whose payload IS on screen).
+   */
   shedNextEdit: boolean
 }
 
 /**
- * A bot adapter that models the send gate: it SHEDS (resolves undefined,
- * without recording a delivery) whenever the injected flood probe reports an
- * open window, or a one-shot `shedNext*` flag is set (the race where the window
- * opens between the feed's probe read and the send). A successful edit resolves
- * a non-undefined sentinel (`{}` — grammy returns `true`/`Message`; only the
- * gate's shed resolves `undefined`).
+ * A bot adapter that models the send gate: it SHEDS (without recording a
+ * delivery) whenever the injected flood probe reports an open window, or a
+ * one-shot `shedNext*` flag is set (the race where the window opens between the
+ * feed's probe read and the send). Faithful to the post-#3110 contract: a shed
+ * EDIT resolves the SEND_GATE_SHED sentinel (cosmetic shed), a shed SEND
+ * resolves `undefined` (`useful` queue-TTL expiry). A DELIVERED edit resolves a
+ * non-shed value (`{}` — grammy returns `true`/`Message`).
  */
 function makeGateBot(floodRemaining: () => number): GateBot {
   let nextId = 1000
@@ -1397,7 +1410,7 @@ function makeGateBot(floodRemaining: () => number): GateBot {
       gb.editCalls++
       if (floodRemaining() > 0 || gb.shedNextEdit) {
         gb.shedNextEdit = false
-        return undefined
+        return SEND_GATE_SHED as unknown as undefined
       }
       gb.edits.push({ messageId, text })
       return {}
