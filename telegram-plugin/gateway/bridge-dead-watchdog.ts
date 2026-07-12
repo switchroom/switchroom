@@ -32,11 +32,15 @@
  *     claude itself down — where a bounce is either premature or
  *     futile); the timer re-arms so a slow-booting claude gets the full
  *     grace window again once it appears;
- *   - cron-session bridges (`<agent>-cron`) and anonymous IPC clients
- *     (recall.py one-shots, pre-handshake connects) neither satisfy nor
- *     re-arm the watchdog — the gating lives INSIDE noteBridge* so a
- *     gateway handler refactor can't silently reintroduce the
- *     bounce-after-cron-fire false positive;
+ *   - cron-session bridges (`<agent>-cron`), anonymous IPC clients
+ *     (recall.py one-shots, pre-handshake connects), AND secondary/relay
+ *     clients that register a DIFFERENT agent name than this gateway serves
+ *     (e.g. an `overlord-relay` connecting into another agent's gateway
+ *     socket — #3086) neither satisfy nor re-arm the watchdog: only the
+ *     gateway's OWN primary bridge (agentName === $SWITCHROOM_AGENT_NAME)
+ *     counts. The gating lives INSIDE noteBridge* so a gateway handler
+ *     refactor can't silently reintroduce the bounce-after-cron-fire or the
+ *     bounce-after-relay-disconnect false positive;
  *   - loud, structured escalation log line including a fresh
  *     bridge-crash.log tail (PR #3037 breadcrumbs) so the operator sees
  *     WHY from the supervisor log alone.
@@ -352,6 +356,16 @@ export interface BridgeDeadWatchdogOpts {
    *  unref (the watchdog must never keep the gateway process alive). */
   setTimer?: (fn: () => void, ms: number) => unknown
   clearTimer?: (handle: unknown) => void
+  /** The agent identity THIS gateway serves ($SWITCHROOM_AGENT_NAME).
+   *  Only a bridge client registering under this exact name is the
+   *  primary bridge whose presence/absence drives the watchdog. Secondary
+   *  or relay clients (a different named identity connecting into this
+   *  gateway's socket — e.g. `overlord-relay`, #3086) are ignored on both
+   *  the register and disconnect paths. When unset/empty (a misconfigured
+   *  gateway with no agent name), the watchdog falls back to the pre-#3086
+   *  test — any named non-cron client counts — so a genuine bridge death is
+   *  still caught rather than silently un-guarded. */
+  selfAgentName?: string
   /** Injectable clock (marker ts + crash-log freshness). */
   nowMs?: () => number
   /** Injectable marker writer (tests avoid real fs). */
@@ -365,15 +379,18 @@ export interface BridgeDeadWatchdog {
    *  when the cross-boot streak cap is already reached (stands down with
    *  an audit line instead). */
   arm: () => void
-  /** A bridge client registered. Only a REAL bridge (named, non-cron)
-   *  satisfies the watchdog — cron sessions (`<agent>-cron`) and
-   *  anonymous clients (agentName null) are ignored HERE so a gateway
-   *  handler refactor can't reorder the gating away (review finding 5). */
+  /** A bridge client registered. Only THIS gateway's OWN primary bridge
+   *  (agentName === selfAgentName, named, non-cron) satisfies the watchdog
+   *  — cron sessions (`<agent>-cron`), anonymous clients (agentName null),
+   *  and secondary/relay clients registering a different name (#3086) are
+   *  ignored HERE so a gateway handler refactor can't reorder the gating
+   *  away (review finding 5). */
   noteBridgeRegistered: (agentName: string | null | undefined) => void
-  /** A bridge client disconnected. Re-arms the grace window only for the
-   *  real bridge (same internal gating), so a bridge that dies AFTER boot
-   *  and never reconnects also escalates. Still capped by the
-   *  once-per-boot fuse. */
+  /** A bridge client disconnected. Re-arms the grace window only for THIS
+   *  gateway's own primary bridge (same internal gating), so a bridge that
+   *  dies AFTER boot and never reconnects also escalates — while a
+   *  transient relay/secondary client's disconnect (#3086) is a no-op.
+   *  Still capped by the once-per-boot fuse. */
   noteBridgeDisconnected: (agentName: string | null | undefined) => void
   /** Evaluate now (the timer body — exposed for tests). Returns the
    *  decision taken. */
@@ -384,9 +401,34 @@ export interface BridgeDeadWatchdog {
   hasEscalated: () => boolean
 }
 
-/** Is this client identity the REAL main-agent bridge (named, non-cron)? */
-function isRealBridgeIdentity(agentName: string | null | undefined): boolean {
-  return agentName != null && agentName.length > 0 && !isCronIdentity(agentName)
+/**
+ * Is this client identity THIS gateway's OWN primary main-agent bridge?
+ *
+ * A named, non-cron client whose name matches the gateway's own agent
+ * identity (`selfAgentName` = $SWITCHROOM_AGENT_NAME). A switchroom gateway
+ * serves exactly one agent, and its real bridge registers under exactly that
+ * name (see bridge/bridge.ts — `agentName: AGENT_NAME`). Secondary or relay
+ * clients (e.g. an `overlord-relay` that connects into another agent's
+ * gateway socket, #3086) register a DIFFERENT name; they are named and
+ * non-cron but are NOT this gateway's primary bridge, so their register /
+ * disconnect must neither satisfy nor re-arm the watchdog — otherwise a
+ * transient relay disconnect marks the (still-alive) primary bridge dead and
+ * bounces a healthy container.
+ *
+ * When `selfAgentName` is unset/empty (misconfigured gateway) we cannot
+ * identity-match, so fall back to the pre-#3086 test — any named non-cron
+ * client counts — keeping the watchdog protective rather than un-guarded.
+ */
+function isRealBridgeIdentity(
+  agentName: string | null | undefined,
+  selfAgentName: string | null | undefined,
+): boolean {
+  if (agentName == null || agentName.length === 0) return false
+  if (isCronIdentity(agentName)) return false
+  if (selfAgentName != null && selfAgentName.length > 0) {
+    return agentName === selfAgentName
+  }
+  return true
 }
 
 export function createBridgeDeadWatchdog(opts: BridgeDeadWatchdogOpts): BridgeDeadWatchdog {
@@ -404,6 +446,7 @@ export function createBridgeDeadWatchdog(opts: BridgeDeadWatchdogOpts): BridgeDe
     opts.readCrashTail ?? ((p: string, t: number) => readFreshCrashLogTail(p, { nowMs: t }))
   const priorStreak = opts.priorStreak ?? 0
   const maxConsecutive = opts.maxConsecutive ?? MAX_CONSECUTIVE_ESCALATIONS
+  const selfAgentName = opts.selfAgentName
 
   let timer: unknown = null
   let bridgeRegistered = false
@@ -528,13 +571,13 @@ export function createBridgeDeadWatchdog(opts: BridgeDeadWatchdogOpts): BridgeDe
   return {
     arm: armInternal,
     noteBridgeRegistered: (agentName) => {
-      if (!isRealBridgeIdentity(agentName)) return
+      if (!isRealBridgeIdentity(agentName, selfAgentName)) return
       bridgeRegistered = true
       bridgeEverRegistered = true
       cancel()
     },
     noteBridgeDisconnected: (agentName) => {
-      if (!isRealBridgeIdentity(agentName)) return
+      if (!isRealBridgeIdentity(agentName, selfAgentName)) return
       bridgeRegistered = false
       armInternal()
     },
