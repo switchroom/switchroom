@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { createSendGate, type Clock } from './send-gate.js'
+import { createSendGate, SEND_GATE_SHED, type Clock } from './send-gate.js'
 import { isFloodWaitActiveError } from './retry-api-call.js'
 
 /**
@@ -73,8 +73,10 @@ describe('send-gate PR2: cosmetic shedding', () => {
 
     const res = await gate.gate(fn('cosmetic'), { priorityClass: 'cosmetic' })
 
-    // Shed resolves undefined; fn never ran; the shed counter moved.
-    expect(res).toBeUndefined()
+    // Shed resolves the distinguishable sentinel (#3110 F1 — never a bare
+    // undefined, which is reserved for benign no-op drops); fn never ran;
+    // the shed counter moved.
+    expect(res).toBe(SEND_GATE_SHED)
     expect(calls).toHaveLength(0)
     expect(gate.stats().global.shed).toBe(1)
     expect(gate.stats().global.sent).toBe(0)
@@ -95,7 +97,7 @@ describe('send-gate PR2: cosmetic shedding', () => {
     const shed = await gate.gate(fn('b'), { chat_id: '5', priorityClass: 'cosmetic' })
 
     expect(calls.map((c) => c.label)).toEqual(['a'])
-    expect(shed).toBeUndefined()
+    expect(shed).toBe(SEND_GATE_SHED)
     expect(gate.stats().global.shed).toBe(1)
   })
 
@@ -128,7 +130,7 @@ describe('send-gate PR2: cosmetic shedding', () => {
       priorityClass: 'cosmetic',
     })
 
-    expect(res).toBeUndefined()
+    expect(res).toBe(SEND_GATE_SHED)
     expect(calls).toHaveLength(0)
     expect(gate.stats().global.shed).toBe(1)
   })
@@ -366,7 +368,7 @@ describe('send-gate PR2: H1 cross-chat message_id isolation', () => {
       priorityClass: 'cosmetic',
     })
 
-    expect(rA).toBeUndefined() // A shed
+    expect(rA).toBe(SEND_GATE_SHED) // A shed
     expect(rB).toBe('B-edit') // B sent
     expect(calls.map((c) => c.label)).toEqual(['B-edit'])
     expect(gate.stats().global.shed).toBe(1)
@@ -568,7 +570,7 @@ describe('send-gate PR2: opening a window from a 429, and persistence hook', () 
     expect(scopes).toEqual(['chat:7', 'global', 'group:7', 'msg-edit:7:3'])
     // After the window opens, a later cosmetic on the same chat sheds.
     const shed = await gate.gate(async () => 'x', { chat_id: '7', priorityClass: 'cosmetic' })
-    expect(shed).toBeUndefined()
+    expect(shed).toBe(SEND_GATE_SHED)
     expect(gate.stats().global.shed).toBe(1)
   })
 })
