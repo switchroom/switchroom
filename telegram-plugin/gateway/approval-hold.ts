@@ -516,6 +516,55 @@ export function isHeldUndeliverable(
   return pend.undeliverable != null
 }
 
+/** The fields the on-delivery reset reads and mutates. */
+export interface DeliveredPermissionEntry {
+  undeliverable?: UndeliverableMark | null
+  redeliveryFailures?: number
+  /** When the operator's decision window began — the TTL is measured from here. */
+  startedAt: number
+}
+
+/**
+ * A HELD card just LANDED — the operator can finally see and tap it. Clear the
+ * hold marks and RESTART the TTL clock, as ONE shared decision used by BOTH
+ * gateway.ts and the outcome test's harness.
+ *
+ * WHY THIS IS SHARED CODE AND NOT AN INLINE BLOCK (#3128):
+ *
+ * The harness used to carry a PRIVATE copy of this reset (its own
+ * `live.startedAt = clock.now()`), so the behavioural test that proves the
+ * operator gets a FULL window after re-delivery drove the double, not the real
+ * gateway. Deleting `startedAt = Date.now()` from gateway.ts would have left that
+ * test GREEN — only a source-text grep noticed, and greps drift. Same placebo-pin
+ * class as the leash (#3123) and the never-auto-approve pin (#3126). Now the reset
+ * lives here, in one importable place, and both callers drive it: delete
+ * `entry.startedAt = now` below and the `(d2)` outcome test goes RED, because there
+ * is only one implementation to delete.
+ *
+ * RESET THE TTL CLOCK is load-bearing, not cosmetic. `startedAt` is when the
+ * agent asked; the TTL measures how long the operator had to answer. Until the
+ * card lands they have NOTHING to answer — it did not exist in any chat. Without
+ * the reset, a card held through a 4.6h ban lands already-expired against a 60-min
+ * TTL and the very next reaper tick auto-denies it: the silent denial would be
+ * MOVED, not removed.
+ *
+ * Returns true when this was a HELD-card recovery — the caller should reconcile
+ * the off-Telegram surface and log the re-delivery. Returns false for a normal
+ * first delivery (the entry was never held), where there is nothing to reset.
+ *
+ * @see reference/invariants.md § no-self-escalation, § on-leash
+ */
+export function applyDeliveredHoldReset(
+  entry: DeliveredPermissionEntry,
+  now: number,
+): boolean {
+  if (entry.undeliverable == null) return false
+  entry.undeliverable = null
+  entry.redeliveryFailures = 0
+  entry.startedAt = now
+  return true
+}
+
 /**
  * Per-tick re-delivery cap (PR 2).
  *

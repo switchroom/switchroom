@@ -184,6 +184,7 @@ import {
   selectHeldForRedelivery,
   holdReasonFor,
   heldRetryBackoffMs,
+  applyDeliveredHoldReset,
   type UndeliverableMark,
 } from './approval-hold.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
@@ -7085,20 +7086,13 @@ function postPermissionCard(
         const landedThreadId = sent.message_thread_id ?? undefined
         live.cards.push({ chatId, messageId: sent.message_id, threadId: landedThreadId })
         // The card LANDED — the operator can see and tap it, so the block is over.
-        // Drop the hold mark and reconcile the off-Telegram surface. (PR 3 also
-        // resets `startedAt` here: the TTL measures how long the operator had to
-        // answer, and until this moment they had nothing to answer.)
-        if (live.undeliverable != null) {
-          live.undeliverable = null
-          live.redeliveryFailures = 0
-          // RESET THE TTL CLOCK. Load-bearing, not cosmetic. `startedAt` is when
-          // the agent asked; the TTL measures how long the operator had to
-          // answer. Until this instant they had NOTHING to answer — the card did
-          // not exist in any chat. Without the reset, a card held through a 4.6h
-          // ban lands already-expired against a 60-min TTL and the very next
-          // reaper tick auto-denies it: we would have MOVED the silent denial,
-          // not removed it.
-          live.startedAt = Date.now()
+        // Drop the hold mark, reset the TTL clock, and reconcile the off-Telegram
+        // surface — as ONE shared decision (`applyDeliveredHoldReset`, #3128) that
+        // the outcome test's harness ALSO drives, so deleting the `startedAt` reset
+        // turns the behavioural `(d2)` test red instead of only a fragile grep.
+        // PR 3: the reset is load-bearing — the TTL measures how long the operator
+        // had to answer, and until this moment they had nothing to answer.
+        if (applyDeliveredHoldReset(live, Date.now())) {
           reconcileBlockedApprovals()
           process.stderr.write(
             `telegram gateway: permission-card RE-DELIVERED request=${requestId} ` +
