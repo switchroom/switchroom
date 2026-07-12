@@ -19,10 +19,14 @@
  * entire server.ts top-level initialization.
  */
 
-import { createDraftStream, type DraftStreamHandle } from './draft-stream.js'
+import {
+  createDraftStream,
+  makeDraftEditShedError,
+  type DraftStreamHandle,
+} from './draft-stream.js'
 import { richMessage, isParseEntitiesError } from './rich-send.js'
 import { renderOutboundChunks } from './render/rich-render.js'
-import type { SendGateOpts } from './send-gate.js'
+import { isSendGateShed, type SendGateOpts } from './send-gate.js'
 
 /**
  * Minimal bot.api surface the controller needs. Real callers pass grammy's
@@ -283,14 +287,27 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
   // path's preview-finalize convention (gateway.ts editPreview): never shed,
   // waits out a short window, fails fast with a structured FLOOD_WAIT_ACTIVE
   // on a long one. SENDS stay untagged (the gate admits untagged non-edit
-  // sends as `critical`) — a shed send would resolve `undefined` and break
-  // message-id capture, and the anchor/tail sends ARE the answer surface.
+  // sends as `critical`) — a shed send would resolve the gate's shed
+  // sentinel instead of `{ message_id }` and break message-id capture, and
+  // the anchor/tail sends ARE the answer surface.
   //
   // `handleRef.isFinal()` is true from the moment finalize() is entered
   // (draft-stream sets `final` before its last flush), so the closures below
   // classify exactly the finalize flush — and anything after it — as
   // critical. The ref is assigned right after createDraftStream returns,
   // before any closure can run (closures only fire from update/finalize).
+  //
+  // KNOWN MISSED BENEFIT (review F5, deliberate): the gate's last-write-wins
+  // coalescing never engages for THIS surface, because draft-stream
+  // serializes its flushes — it awaits each edit before issuing the next, so
+  // at most one edit per message is ever inside the gate. Consequence: a
+  // stale draft sleeping on the gate's floor still lands (one API call the
+  // coalescer would have replaced) before the newer snapshot, and a finalize
+  // issued mid-floor can trail by up to ~2x editFloorMs (floor wait for the
+  // stale draft, then floor wait for the final). Correctness is unaffected —
+  // the latest state always lands, floor-paced — and the gate coalescing
+  // remains live protection for CONCURRENT writers to one message (e.g. a
+  // re-attached #626 controller racing its predecessor).
   let handleRef: DraftStreamHandle | null = null
   const editGateOpts = (id: number, payload: unknown): RetryPolicyOpts => ({
     threadId,
@@ -304,29 +321,16 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
   // fallback of the same text never hashes equal to its rich form.
   const piecePayload = (piece: { text: string; rich: boolean }): unknown =>
     piece.rich ? richMessage(piece.text) : piece.text
-  /**
-   * True when a gated edit did NOT land on screen: the gate SHED it as
-   * cosmetic (resolves `undefined` by contract — "the next send carries full
-   * state"). A critical (finalize) edit is never shed, so an `undefined`
-   * there is a benign skip (gate no-op drop / robustApiCall's swallowed
-   * "message is not modified") — the text is already on screen. Treating a
-   * cosmetic `undefined` as not-landed keeps draft-stream's `lastSentText`
-   * honest: without this, a shed draft would be recorded as delivered and a
-   * later flush of the SAME text (e.g. the finalize) would be skipped by
-   * draft-stream's own dedupe — the completed answer would never render.
-   * The conservative reading costs nothing: a re-flush of a payload that DID
-   * land is dropped by the gate's no-op skip before it reaches the API.
-   *
-   * Decides from the CLASS THE CALL WAS SENT WITH (the opts built at call
-   * time), never a re-read of `isFinal()` at result time: finalize() landing
-   * while a cosmetic edit is in flight must not reclassify that edit's shed
-   * as a benign skip.
-   */
-  const editWasShed = (result: unknown, sentOpts: RetryPolicyOpts): boolean =>
-    result === undefined && sentOpts.priorityClass === 'cosmetic'
-  /** Sentinel thrown so draft-stream's flush does not record a shed edit as sent. */
-  const shedError = (id: number) =>
-    new Error(`draft edit shed by send gate (id=${id}); next flush carries full state`)
+  // Shed detection (#3110 review F1): keyed EXACTLY off the gate's
+  // SEND_GATE_SHED sentinel — never off `undefined`, which is overloaded
+  // (gate no-op drop; robustApiCall's swallowed benign 400s like "message is
+  // not modified"). Those benign cases mean the payload is ALREADY on screen
+  // and are treated as delivered, exactly as before this wiring existed. A
+  // true shed means the edit did NOT land: draft-stream must not record the
+  // snapshot as on-screen (its dedupe would skip a later flush of the same
+  // text — the completed answer would never render), so the edit closure
+  // throws the marker error draft-stream recognizes and recovers from
+  // (`makeDraftEditShedError` → snapshot preserved for finalize, review F2).
 
   // Overflow-tail bookkeeping, shared across the send + edit closures for the
   // whole stream lifetime. A body large enough to split into several
@@ -346,18 +350,25 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
   // text) thereafter. A non-parse failure is logged as a partial-delivery
   // warning and swallowed so the remaining tail pieces still get a chance to
   // land — never a silent drop, never an abort of pieces K..N (concern C1).
-  const upsertTail = async (ti: number, piece: { text: string; rich: boolean }): Promise<void> => {
+  //
+  // Returns TRUE when this piece's edit was SHED by the send gate (did not
+  // land): the caller must then report the whole flush as shed so
+  // draft-stream does not record the full body as delivered while a tail is
+  // stale (review F3). The piece's own tailLastText stays stale too, so the
+  // recovery flush re-attempts exactly the shed piece.
+  const upsertTail = async (
+    ti: number,
+    piece: { text: string; rich: boolean },
+  ): Promise<boolean> => {
     const existingId = tailIds[ti]
     if (existingId != null) {
-      if (tailLastText[ti] === piece.text) return // unchanged — skip the API call
+      if (tailLastText[ti] === piece.text) return false // unchanged — skip the API call
       try {
-        const gateOpts = editGateOpts(existingId, piecePayload(piece))
-        const res = await retry(() => editPiece(existingId, piece, baseOpts), gateOpts)
-        if (editWasShed(res, gateOpts)) {
-          // Shed by the gate (flood window / pressure) — leave tailLastText
-          // stale so the next flush retries this piece with full state.
-          return
-        }
+        const res = await retry(
+          () => editPiece(existingId, piece, baseOpts),
+          editGateOpts(existingId, piecePayload(piece)),
+        )
+        if (isSendGateShed(res)) return true // shed — stale; retried by the recovery flush
         tailLastText[ti] = piece.text
         onEdit?.(existingId, piece.text.length)
       } catch (err) {
@@ -365,12 +376,11 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
           warn?.(
             `stream-controller: tail-piece #${ti + 1} edit parse-entities rejected — retrying same id=${existingId} as plain text (${err instanceof Error ? err.message : String(err)})`,
           )
-          const fallbackOpts = editGateOpts(existingId, piece.text)
           const res = await retry(
             () => bot.api.editMessageText(chatId, existingId, piece.text, baseOpts),
-            fallbackOpts,
+            editGateOpts(existingId, piece.text),
           )
-          if (editWasShed(res, fallbackOpts)) return // shed — retried with full state next flush
+          if (isSendGateShed(res)) return true // shed — stale; retried by the recovery flush
           tailLastText[ti] = piece.text
           onEdit?.(existingId, piece.text.length)
         } else {
@@ -381,7 +391,7 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
           )
         }
       }
-      return
+      return false
     }
     // First emission of this tail piece → a fresh follow-up message.
     try {
@@ -409,6 +419,9 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
         )
       }
     }
+    // First-emission SENDS are untagged (critical) — the gate never sheds
+    // them, so this path can only land or fail (handled above).
+    return false
   }
 
   const handle = createDraftStream(
@@ -463,16 +476,26 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
     async (id, text) => {
       const pieces = renderPieces(text)
       const head = pieces[0]
+      // Whether any piece of THIS flush was shed by the gate (did not land).
+      // Decided at the very end — AFTER the tail loop — so a benign anchor
+      // outcome (or even a shed anchor) never starves the tail pieces of
+      // their own upsert attempt (review F1: an anchor whose payload stopped
+      // changing resolves benignly every flush while only the tail grows).
+      let anchorShed = false
       // Edit the anchor message in place with the FIRST piece.
       try {
-        const gateOpts = editGateOpts(id, piecePayload(head))
-        const res = await retry(() => editPiece(id, head, baseOpts), gateOpts)
-        // Shed by the gate (cosmetic under pressure / an open flood window):
-        // throw so draft-stream does NOT record this text as on-screen — a
-        // later flush of the same text (e.g. the finalize) must still land.
-        if (editWasShed(res, gateOpts)) throw shedError(id)
-        // C2: report the actual head-piece length, not the full body length.
-        onEdit?.(id, head.text.length)
+        const res = await retry(() => editPiece(id, head, baseOpts), editGateOpts(id, piecePayload(head)))
+        if (isSendGateShed(res)) {
+          // Shed by the gate (cosmetic under pressure / an open flood
+          // window) — did NOT land. Benign `undefined` resolutions (gate
+          // no-op drop, robustApiCall's swallowed "message is not modified")
+          // deliberately do NOT take this branch: the payload is already on
+          // screen and the flush proceeds as delivered.
+          anchorShed = true
+        } else {
+          // C2: report the actual head-piece length, not the full body length.
+          onEdit?.(id, head.text.length)
+        }
       } catch (err) {
         if (!literalText && head.rich && isParseEntitiesError(err)) {
           // Edit rejected because the markdown couldn't be parsed — DO NOT
@@ -487,13 +510,12 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
           // contract). For a single-piece stream (common case) this is the
           // whole body; a rare oversize split edits the head piece's body.
           const fallbackBody = pieces.length === 1 ? text : head.text
-          const fallbackOpts = editGateOpts(id, fallbackBody)
           const res = await retry(
             () => bot.api.editMessageText(chatId, id, fallbackBody, baseOpts),
-            fallbackOpts,
+            editGateOpts(id, fallbackBody),
           )
-          if (editWasShed(res, fallbackOpts)) throw shedError(id)
-          onEdit?.(id, head.text.length)
+          if (isSendGateShed(res)) anchorShed = true
+          else onEdit?.(id, head.text.length)
         } else {
           throw err
         }
@@ -503,10 +525,20 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
       // that only just came into existence) — we never re-send tails already
       // emitted on a prior flush. This is the fix for the duplicate-flood
       // blocker: the previous code re-sent pieces[1..n] as brand-new messages
-      // on each throttled edit tick.
+      // on each throttled edit tick. Runs BEFORE the shed decision below so a
+      // shed (or benign) anchor never starves the tails (review F1).
+      let anyTailShed = false
       for (let pi = 1; pi < pieces.length; pi++) {
-        await upsertTail(pi - 1, pieces[pi])
+        if (await upsertTail(pi - 1, pieces[pi])) anyTailShed = true
       }
+      // Review F3: ANY shed piece — anchor or tail — means this flush did not
+      // fully land. Throw the marker error so draft-stream does not record
+      // the body as delivered (its dedupe would freeze the shed piece
+      // forever) and instead preserves the snapshot for the finalize
+      // re-flush. Pieces that DID land are unaffected on that re-flush: the
+      // gate's no-op skip drops their identical payloads before the API, and
+      // landed tails short-circuit on tailLastText.
+      if (anchorShed || anyTailShed) throw makeDraftEditShedError(id)
     },
     {
       ...(throttleMs != null ? { throttleMs } : {}),

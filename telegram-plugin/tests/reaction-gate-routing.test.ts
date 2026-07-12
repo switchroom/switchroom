@@ -29,7 +29,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { createSendGate, type Clock } from '../send-gate.js'
+import { createSendGate, SEND_GATE_SHED, type Clock } from '../send-gate.js'
 import { createRetryApiCall } from '../retry-api-call.js'
 import { errors } from './fake-bot-api.js'
 
@@ -95,7 +95,7 @@ describe('#3155 reactions route through the send gate (cosmetic)', () => {
     // resolves undefined (fire-and-forget callers .catch nothing), and the gate
     // counts the shed.
     expect(setMessageReaction).not.toHaveBeenCalled()
-    expect(result).toBeUndefined()
+    expect(result).toBe(SEND_GATE_SHED) // shed sentinel (#3110 F1)
     expect(sendGate.stats().global.shed).toBe(1)
   })
 

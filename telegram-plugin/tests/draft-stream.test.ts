@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { createDraftStream } from '../draft-stream.js'
+import { createDraftStream, makeDraftEditShedError } from '../draft-stream.js'
 
 interface MockTelegram {
   send: (text: string) => Promise<number>
@@ -165,6 +165,72 @@ describe('createDraftStream', () => {
     expect(m.editCalls[0].text).toBe('the completed answer')
     expect(finalAtEdit).toEqual([true])
     expect(stream.isFinal()).toBe(true)
+  })
+
+  it('a shed flush preserves the snapshot; argument-less finalize() re-delivers it (#3110 F2)', async () => {
+    const m = makeMock()
+    let shedNext = true
+    const stream = createDraftStream(
+      m.send,
+      async (id, text) => {
+        if (shedNext) {
+          shedNext = false
+          throw makeDraftEditShedError(id)
+        }
+        await m.edit(id, text)
+      },
+      { throttleMs: 1000 },
+    )
+
+    void stream.update('v1')
+    await microtaskFlush()
+    expect(m.sendCalls.length).toBe(1)
+
+    void stream.update('v2 — shed by the gate')
+    vi.advanceTimersByTime(1000)
+    await microtaskFlush()
+    // The edit was shed: nothing landed, and the snapshot must NOT be
+    // recorded as sent.
+    expect(m.editCalls.length).toBe(0)
+
+    // The gateway's cleanup paths finalize with NO argument — the shed
+    // snapshot must be re-flushed as the stream's final state, not lost.
+    await stream.finalize()
+    expect(m.editCalls.length).toBe(1)
+    expect(m.editCalls[0].text).toBe('v2 — shed by the gate')
+  })
+
+  it('a newer landed flush supersedes an earlier shed snapshot (no stale resurrect)', async () => {
+    const m = makeMock()
+    let shedNext = true
+    const stream = createDraftStream(
+      m.send,
+      async (id, text) => {
+        if (shedNext) {
+          shedNext = false
+          throw makeDraftEditShedError(id)
+        }
+        await m.edit(id, text)
+      },
+      { throttleMs: 1000 },
+    )
+
+    void stream.update('v1')
+    await microtaskFlush()
+    void stream.update('v2 — shed')
+    vi.advanceTimersByTime(1000)
+    await microtaskFlush()
+    expect(m.editCalls.length).toBe(0)
+
+    // A NEWER snapshot lands normally — the shed one is now stale.
+    void stream.update('v3 — landed')
+    vi.advanceTimersByTime(1000)
+    await microtaskFlush()
+    expect(m.editCalls.map((c) => c.text)).toEqual(['v3 — landed'])
+
+    // finalize() must NOT resurrect the superseded shed snapshot.
+    await stream.finalize()
+    expect(m.editCalls.map((c) => c.text)).toEqual(['v3 — landed'])
   })
 
   it('finalize(finalText) still dedupes against text that actually landed', async () => {

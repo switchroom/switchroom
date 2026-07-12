@@ -26,6 +26,40 @@
 
 const TELEGRAM_MAX_CHARS = 32768
 
+/**
+ * Error a transport layer (stream-controller.ts) throws from its edit
+ * callback when the send gate SHED the edit — it did NOT land, and the
+ * stream must not record the snapshot as on-screen (#3110). Marked with a
+ * property (not a message pattern) so the classification is exact.
+ *
+ * `flush()` recognizes this and PRESERVES the snapshot in `shedText` so a
+ * later `finalize()` — including the argument-less finalize the gateway's
+ * cleanup paths use — re-flushes it as the stream's final state instead of
+ * silently losing the content (review F2). It deliberately does NOT restore
+ * `pendingText`: `flushLoop` drains while `pendingText != null`, and a
+ * restore there would busy-spin the loop against an open flood window.
+ */
+export interface DraftEditShedError extends Error {
+  draftEditShed: true
+}
+
+/** Build the marker error a transport throws for a gate-shed edit. */
+export function makeDraftEditShedError(messageId: number | null): DraftEditShedError {
+  return Object.assign(
+    new Error(
+      `draft edit shed by send gate (id=${messageId ?? 'unknown'}); snapshot preserved for re-flush`,
+    ),
+    { draftEditShed: true as const },
+  )
+}
+
+/** True when `err` is the shed marker thrown by a stream transport. */
+export function isDraftEditShedError(err: unknown): err is DraftEditShedError {
+  return (
+    err instanceof Error && (err as Partial<DraftEditShedError>).draftEditShed === true
+  )
+}
+
 // Throttle defaults for the in-place engine.
 //   DM chats: 400 ms — slightly more responsive than groups while staying
 //     well under Telegram's practical ~1 edit/sec/message ceiling. This
@@ -172,6 +206,14 @@ export function createDraftStream(
   let messageId: number | null = config.initialMessageId ?? null
   let pendingText: string | null = null
   let lastSentText: string | null = null
+  /**
+   * Snapshot of the newest text the transport reported as SHED (thrown
+   * `DraftEditShedError`) — content that never landed. Cleared on any
+   * successful flush (a newer snapshot superseded it) and consumed by
+   * `finalize()` so the stream's last state is re-delivered once the
+   * pressure clears instead of being lost (review F2).
+   */
+  let shedText: string | null = null
   let lastSentAt = 0
   let inFlight: Promise<void> | null = null
   // Observability — per-stream fire counters for the stream-end trace.
@@ -225,11 +267,21 @@ export function createDraftStream(
       await sendViaMessage(textToSend)
       lastSentText = textToSend
       lastSentAt = Date.now()
+      shedText = null // a newer snapshot landed — drop any older shed one
     } catch (err) {
       const msg = (err as Error).message ?? String(err)
-      if (/\bmessage is not modified\b/i.test(msg)) {
+      if (isDraftEditShedError(err)) {
+        // #3110 review F2: the send gate shed this edit — it did NOT land.
+        // Preserve the snapshot for finalize()'s re-flush (as the stream's
+        // final state, sent critical) instead of silently losing it. Do NOT
+        // restore pendingText: flushLoop drains while pendingText != null
+        // and would busy-spin against an open flood window.
+        shedText = textToSend
+        log?.(`stream → shed by send gate (id: ${messageId}); snapshot preserved for re-flush`)
+      } else if (/\bmessage is not modified\b/i.test(msg)) {
         lastSentText = textToSend
         lastSentAt = Date.now()
+        shedText = null // on-screen text == this snapshot; nothing to recover
         log?.(`stream → not modified (id: ${messageId})`)
       } else if (
         /\bmessage to edit not found\b/i.test(msg)
@@ -352,6 +404,15 @@ export function createDraftStream(
       if (inFlight) {
         await inFlight
       }
+      // #3110 review F2: if the newest snapshot was SHED by the send gate
+      // (never landed) and nothing newer is pending, re-flush it as the
+      // stream's final state. Checked AFTER awaiting inFlight so a flush
+      // that sheds mid-finalize is recovered too. A provided finalText and
+      // any pending draft both outrank the shed snapshot (they are newer).
+      if (pendingText == null && shedText != null && !stopped) {
+        pendingText = shedText
+      }
+      shedText = null
       if (pendingText != null && !stopped) {
         await flush()
       }

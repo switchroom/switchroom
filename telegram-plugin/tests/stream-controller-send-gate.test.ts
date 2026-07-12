@@ -34,6 +34,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { createStreamController, type RetryPolicy } from '../stream-controller.js'
 import { createSendGate, type Clock, type SendGateConfig } from '../send-gate.js'
 import { isFloodWaitActiveError } from '../retry-api-call.js'
+import { renderOutboundChunks } from '../render/rich-render.js'
 import { createMockBot, installBotResetHook } from './bot-api.harness.js'
 
 /** Deterministic fake clock — same contract as send-gate.test.ts's. */
@@ -180,7 +181,7 @@ describe('stream-controller × send gate (#3110)', () => {
     expect(editTimes.get(idB)).toEqual([0, 1500])
   })
 
-  it('gate no-op skip: a second surface repeating the on-screen payload never reaches the API', async () => {
+  it('gate no-op skip: a repeated payload is dropped BENIGNLY — no API call, treated as delivered (F4)', async () => {
     const { clock, gate, retry } = makeGatedRetry({ editFloorMs: 1500 })
     // Two controllers re-attached to the SAME anchor message (the #626
     // initialMessageId path — e.g. a stream re-created after a restart).
@@ -193,17 +194,31 @@ describe('stream-controller × send gate (#3110)', () => {
 
     await clock.advance(1500) // clear the floor — isolate the no-op skip
     const onEdit = vi.fn()
+    const logs: string[] = []
     const second = createStreamController({
       bot, chatId: '1', throttleMs: 250, retry, initialMessageId: 7777, onEdit,
+      log: (m) => logs.push(m),
     })
     void second.update('**status: done**')
     await flush()
 
     // Identical rendered payload for the same chat+message → dropped by the
-    // gate before the API.
+    // gate before the API…
     expect(bot.api.editMessageText).toHaveBeenCalledTimes(1)
     expect(gate.stats().global.dropped).toBe(1)
-    expect(onEdit).not.toHaveBeenCalled()
+    // …and the drop is BENIGN (the payload IS on screen): the controller
+    // reports it as delivered — onEdit fires, no shed marker, no failure log
+    // (F4: pre-sentinel this test passed via the wrong mechanism — the
+    // drop's `undefined` was misread as a shed and onEdit stayed silent).
+    expect(onEdit).toHaveBeenCalledTimes(1)
+    expect(logs.filter((m) => m.includes('shed') || m.includes('edit failed'))).toEqual([])
+
+    // Because the drop was recorded as delivered, a THIRD identical update
+    // dedupes inside draft-stream itself — it never even reaches the gate.
+    void second.update('**status: done**')
+    await tick() // release the local throttle so the dedupe check runs
+    expect(gate.stats().global.dropped).toBe(1) // unchanged — gate never consulted
+    expect(bot.api.editMessageText).toHaveBeenCalledTimes(1)
   })
 
   it('open flood window: draft edits shed with ZERO API calls; full state lands after it closes', async () => {
@@ -373,5 +388,134 @@ describe('stream-controller × send gate (#3110)', () => {
       editPayload: 'draft *broken',
       priorityClass: 'cosmetic',
     })
+  })
+
+  /**
+   * The reviewer's F1 production-faithful probe: a multi-piece body (the
+   * escaped-markdown expansion splits it across several wire-cap pieces)
+   * where only the TAIL grows across flushes. The anchor piece stops
+   * changing, so on a perfectly healthy chat its edit resolves `undefined`
+   * every flush — first via robustApiCall's swallowed "message is not
+   * modified" 400, then via the gate's no-op drop. Pre-sentinel, that
+   * `undefined` was misread as a shed and thrown BEFORE the tail loop: no
+   * tail edit ever landed (screen frozen at "tail v1") and a false "shed"
+   * line hit stderr every flush.
+   */
+  it('multi-piece body: a benign anchor outcome never starves the tail edits (F1)', async () => {
+    const { clock, gate, retry } = makeGatedRetry({
+      editFloorMs: 1500,
+      // Generous buckets: this test isolates the benign-undefined path, not
+      // token pressure.
+      globalPerSec: 1000, globalBurst: 100, perChatPerSec: 1000, perChatBurst: 100,
+    })
+    const base = ('a_b_c_d_e ').repeat(3000)
+    const b1 = `${base}tail v1`
+    const b2 = `${base}tail v2`
+    const b3 = `${base}tail v3`
+    // Sanity-pin the repro geometry: several pieces, prefix-stable chunking,
+    // only the LAST piece changes as the tail grows.
+    const p1 = renderOutboundChunks(b1)
+    const p2 = renderOutboundChunks(b2)
+    expect(p1.length).toBeGreaterThan(1)
+    expect(p2.length).toBe(p1.length)
+    for (let i = 0; i < p1.length - 1; i++) expect(p2[i].text).toBe(p1[i].text)
+    expect(p2[p1.length - 1].text).not.toBe(p1[p1.length - 1].text)
+
+    // Faithful edit mock: repeating a message's current text 400s with
+    // "message is not modified", which the production retry policy swallows
+    // to `undefined` — simulate the post-swallow result directly.
+    const currentText = new Map<number, string>()
+    bot.api.sendMessage.mockImplementation(async (_c, text) => {
+      const id = bot.nextMessageId++
+      currentText.set(id, text)
+      return { message_id: id }
+    })
+    bot.api.editMessageText.mockImplementation(async (_c, id, text) => {
+      const body = typeof text === 'object' && text != null ? text.markdown : text
+      if (currentText.get(id) === body) return undefined // swallowed not-modified
+      currentText.set(id, body)
+      return true as const
+    })
+
+    const logs: string[] = []
+    const stream = createStreamController({
+      bot, chatId: '1', throttleMs: 250, retry,
+      log: (m) => logs.push(m), warn: (m) => logs.push(m),
+    })
+
+    void stream.update(b1)
+    await flush()
+    const anchorId = stream.getMessageId() as number
+    const lastTailId = anchorId + p1.length - 1
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(p1.length)
+    expect(currentText.get(lastTailId)).toContain('tail v1')
+
+    // Flush 2: anchor unchanged → its edit resolves undefined via the
+    // not-modified swallow. The tail edit MUST still land.
+    void stream.update(b2)
+    await tick()
+    expect(currentText.get(lastTailId)).toContain('tail v2')
+
+    // Flush 3: anchor unchanged again → this time the GATE no-op-drops it
+    // (its hash is recorded from flush 2). The tail edit MUST still land.
+    await clock.advance(1600) // clear the tail message's own edit floor
+    void stream.update(b3)
+    await tick()
+    expect(currentText.get(lastTailId)).toContain('tail v3')
+    expect(gate.stats().global.dropped).toBeGreaterThanOrEqual(1)
+
+    // The whole run was healthy: no shed marker, no failure lines.
+    expect(logs.filter((m) => m.includes('shed') || m.includes('FAILED') || m.includes('edit failed'))).toEqual([])
+
+    // And the flushes were recorded as delivered: an identical finalize
+    // dedupes inside draft-stream — zero further API calls.
+    const editCalls = bot.api.editMessageText.mock.calls.length
+    await stream.finalize(b3)
+    expect(bot.api.editMessageText.mock.calls.length).toBe(editCalls)
+  })
+
+  it('a shed TAIL is not recorded as delivered: argument-less finalize() re-flushes and lands it (F2+F3)', async () => {
+    const { clock, gate, retry } = makeGatedRetry({
+      editFloorMs: 1500,
+      globalPerSec: 1000, globalBurst: 100, perChatPerSec: 1000, perChatBurst: 100,
+    })
+    const base = ('a_b_c_d_e ').repeat(3000)
+    const b1 = `${base}tail v1`
+    const b2 = `${base}tail v2 — the completed answer`
+    const pieceCount = renderOutboundChunks(b1).length
+    expect(pieceCount).toBeGreaterThan(1)
+
+    const logs: string[] = []
+    const stream = createStreamController({
+      bot, chatId: '1', throttleMs: 250, retry, log: (m) => logs.push(m),
+    })
+    void stream.update(b1)
+    await flush()
+    const anchorId = stream.getMessageId() as number
+    const lastTailId = anchorId + pieceCount - 1
+
+    // Flood window scoped to the LAST tail message only (H1 msg-edit scope):
+    // its edit sheds; the anchor and other pieces are unaffected.
+    gate.openFloodWindow(`msg-edit:1:${lastTailId}`, clock.now() + 30_000)
+
+    void stream.update(b2)
+    await tick()
+    // The changed piece is the suppressed tail → shed, zero edits landed on
+    // it; the flush is reported shed and the snapshot preserved (F2), NOT
+    // recorded as delivered (F3).
+    const tailEdits = () =>
+      bot.api.editMessageText.mock.calls.filter(([, id]) => id === lastTailId)
+    expect(tailEdits()).toHaveLength(0)
+    expect(gate.stats().global.shed).toBe(1)
+    expect(logs.some((m) => m.includes('shed by send gate'))).toBe(true)
+
+    // Window closes; the gateway-style ARGUMENT-LESS finalize (the
+    // disconnect-flush / turn-end cleanup path) must re-deliver the shed
+    // snapshot — pre-F2 the content was silently lost here.
+    await clock.advance(31_000)
+    await stream.finalize()
+    expect(tailEdits()).toHaveLength(1)
+    const [, , tailBody] = tailEdits()[0]
+    expect(String(tailBody)).toContain('tail v2')
   })
 })
