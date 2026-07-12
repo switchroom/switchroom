@@ -1170,4 +1170,25 @@ describe("buildFleetRollMessage — reason attribution (#3031 PR 2 reason field)
       expect(msg).toContain("7-day window at 96% on");
     }
   });
+
+  it("model-tier-wall (#3176) names the flagship tier and reassures opus/haiku are unaffected — not a generic quota window", () => {
+    // A tier wall binds on the 7d_oi bucket; window/pct are absent (5h/7d read
+    // healthy). exhausted_until carries the tier reset.
+    const roll: FleetRollInfo = {
+      from: "alice@example.com",
+      to: "bob@example.com",
+      at: NOW - 60_000,
+      reason: "model-tier-wall",
+      bucket: "seven_day_overage_included",
+      exhausted_until: NOW + 2.8 * 60 * 60 * 1000,
+    };
+    const msg = buildFleetRollMessage(roll, NOW);
+    expect(msg).toContain("Flagship (premium) tier weekly limit reached");
+    expect(msg).toContain("opus/haiku on that account are unaffected");
+    // Must NOT mislead as a generic 5h/7d window roll.
+    expect(msg).not.toContain("quota window");
+    expect(msg).not.toContain("Proactive switch");
+    // The tier reset is surfaced.
+    expect(msg).toContain("resets");
+  });
 });

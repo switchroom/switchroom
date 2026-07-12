@@ -128,6 +128,37 @@ describe("#3176 quotaIndicatesModelTierWall", () => {
   it("a FAILED probe is never a wall (transient error must not bench a tier)", () => {
     expect(quotaIndicatesModelTierWall({ ok: false, reason: "network" }).walled).toBe(false);
   });
+
+  it("a transient rejection bound on a NON-7d_oi claim is NOT a tier wall (false-wall guard)", () => {
+    // A 429 whose overall verdict is `rejected` but whose binding claim is a
+    // burst/5h throttle — NOT `seven_day_overage_included` — with NO 7d_oi
+    // bucket verdict must never mark the flagship tier walled: the account is
+    // momentarily throttled, not on a weekly tier wall, and benching it for
+    // hours would be a false wall. Only a loosened classifier (e.g. "any
+    // rejected") would trip here — this locks the boundary.
+    const res: QuotaResult = {
+      ok: true,
+      data: {
+        fiveHourUtilizationPct: 100,
+        sevenDayUtilizationPct: 60,
+        fiveHourResetAt: null,
+        sevenDayResetAt: null,
+        representativeClaim: "five_hour",
+        overageStatus: null,
+        overageDisabledReason: null,
+        unifiedStatus: "rejected",
+        sevenDayOiStatus: null,
+        sevenDayOiUtilizationPct: null,
+        sevenDayOiResetAt: null,
+        sevenDayOiPresent: false,
+      },
+    };
+    expect(quotaIndicatesModelTierWall(res).walled).toBe(false);
+    // …and such a probe is not a clear "tier allowed" signal for self-heal
+    // either — the overall verdict is rejected and the 7d_oi bucket gave no
+    // verdict, so a real mark is left untouched (inconclusive, not cleared).
+    expect(quotaTierAllowed(res)).toBe(false);
+  });
 });
 
 describe("#3176 quotaTierAllowed", () => {

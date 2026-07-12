@@ -2259,7 +2259,7 @@ export class AuthBroker {
         this.audit({ op: "mark-exhausted", identity: { kind: "operator" }, account: label, accountKind: "claude", ok: true, reason: "model-tier-wall" });
         const { rolledTo, allWalled, earliestReset } = this.markPremiumWalledAndRoll(label, tw.until, tw.bucket);
         if (rolledTo && label === active) {
-          this.recordFleetRoll(label, rolledTo, "model-tier-wall", tw.until ?? undefined);
+          this.recordFleetRoll(label, rolledTo, "model-tier-wall", tw.until ?? undefined, tw.bucket);
         } else if (allWalled && label === active) {
           this.recordPremiumAllWalled(tw.bucket, earliestReset);
         }
