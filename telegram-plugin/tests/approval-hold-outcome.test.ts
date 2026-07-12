@@ -289,8 +289,16 @@ describe('gateway wiring — the leash', () => {
     expect(sweep).not.toContain('if (now - v.startedAt > ttl)')
   })
 
-  it('successful (re)delivery resets startedAt', () => {
-    expect(GATEWAY_SRC).toContain('live.startedAt = Date.now()')
+  it('successful (re)delivery resets startedAt through the SHARED reset (#3128)', () => {
+    // This pin is no longer the safety net for the reset — the behavioural `(d2)`
+    // test above is, and it now drives the same `applyDeliveredHoldReset` the
+    // gateway does, so deleting `startedAt = now` from that one shared function
+    // turns `(d2)` RED. This only guards the WIRING: that the gateway routes
+    // delivery through the shared reset and can't regrow a private inline copy
+    // that drifts from what the harness exercises.
+    expect(GATEWAY_SRC).toContain('applyDeliveredHoldReset(live, Date.now())')
+    // …and must NOT carry its own inline copy of the reset.
+    expect(GATEWAY_SRC).not.toContain('live.startedAt = Date.now()')
   })
 
   it('the missed-approvals re-offer no longer drops a card that never landed', () => {

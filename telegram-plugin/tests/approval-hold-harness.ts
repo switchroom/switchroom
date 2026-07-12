@@ -42,6 +42,7 @@ import {
   safeActionForRecord,
   holdReasonFor,
   heldRetryBackoffMs,
+  applyDeliveredHoldReset,
   type UndeliverableMark,
   type BlockedApprovalStore,
 } from '../gateway/approval-hold.js'
@@ -280,12 +281,11 @@ export function createHarness(opts: { cap?: number; targets?: string[] } = {}): 
         const live = pending.get(requestId)
         if (live && sent) {
           live.cards.push({ chatId, messageId: sent.message_id })
-          if (live.undeliverable != null) {
-            live.undeliverable = null
-            live.redeliveryFailures = 0
-            // PR 3: the operator's decision window starts NOW — until this
-            // moment they had nothing to answer.
-            live.startedAt = clock.now()
+          // Drive the SAME reset the gateway drives (#3128) — no private copy.
+          // Deleting `startedAt = now` from `applyDeliveredHoldReset` turns the
+          // `(d2)` full-window outcome test RED, because there is one shared
+          // implementation, not a mirror the harness silently compensates with.
+          if (applyDeliveredHoldReset(live, clock.now())) {
             reconcile()
           }
         }
