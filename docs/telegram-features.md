@@ -131,9 +131,13 @@ into the (sender-controlled) body:
 A multi-part forward from one origin (an album) emits the attributes
 once; a coalesced burst forwarded from several different origins gets
 numbered siblings (`forwarded_from_2`, `forwarded_from_type_2`, …),
-the same convention as `image_path_2`. The origin also lands on the
-inbound row in the SQLite history buffer, so `get_recent_messages`
-can recover it after a restart.
+the same convention as `image_path_2`. A coalesced burst can also mix
+a forward with the sender's own typed commentary inside the same
+window — the attributes describe the burst as a whole, not each line
+of the body. The origin also lands on the inbound row in the SQLite
+history buffer, so `get_recent_messages` can recover it after a
+restart; for a multi-origin burst only the primary (first) origin is
+persisted there — origins 2+ appear only in the delivered tag.
 
 Deliberately not built (v1): no id→agent-name resolution against the
 fleet config, no origin lookup when the user replies to an old forward,

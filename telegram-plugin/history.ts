@@ -118,7 +118,9 @@ export interface RecordedMessage {
    * name, no verifiable id); `forwarded_from_id` is the numeric id when
    * the origin shape exposes one; `forwarded_date` is the original
    * message's ISO timestamp; `forwarded_message_id` is the message id
-   * inside the origin channel (channel origins only).
+   * inside the origin channel (channel origins only). For a multi-origin
+   * coalesced burst only the PRIMARY (first) origin is persisted here —
+   * origins 2+ exist only in the delivered channel tag's numbered attrs.
    */
   forwarded_from: string | null
   forwarded_from_type: string | null

@@ -828,7 +828,7 @@ describe('forwarded-message origin columns', () => {
     expect(fwd.forwarded_message_id).toBeNull()
   })
 
-  it('hostile origin name is stored raw but secret-redacted (backstop)', () => {
+  it('hostile origin name is stored raw (XML metachars belong to the meta lane)', () => {
     initHistory(stateDir, 30)
     // Raw XML metacharacters are EXPECTED here — escaping belongs to the
     // channel-meta lane, the history buffer stores what the user saw.
@@ -845,5 +845,30 @@ describe('forwarded-message origin columns', () => {
       forwarded_from_id: '42',
     })
     expect(query({ chat_id: '-100' })[0]!.forwarded_from).toBe('<b>"Bob"&\'friends\'</b>')
+  })
+
+  it('masks a secret-shaped origin name before it is stored (redaction backstop)', () => {
+    initHistory(stateDir, 30)
+    // Built by concatenation so the source never holds a contiguous
+    // secret-shaped literal (repo Push Protection / no-pii lint). Same
+    // pattern as the text/reply_to_text redaction tests above — a display
+    // name is user-controlled text and rides the same redact() backstop.
+    const GH_PAT = `ghp_${'F6g7H8i9J0'.repeat(3)}` // ghp_<30 base62>
+    recordInbound({
+      chat_id: '-100',
+      thread_id: null,
+      message_id: 10,
+      user: 'alice',
+      user_id: '111',
+      ts: 1000,
+      text: 'fwd',
+      forwarded_from: `Bob ${GH_PAT}`,
+      forwarded_from_type: 'user',
+      forwarded_from_id: '42',
+    })
+    const stored = query({ chat_id: '-100' })[0]!.forwarded_from as string
+    expect(stored).not.toContain(GH_PAT)
+    expect(stored).toContain('[REDACTED')
+    expect(stored).toContain('Bob') // surrounding name preserved
   })
 })
