@@ -45,6 +45,19 @@ describe("TelegramChannelSchema — supergroup smart defaults", () => {
   });
 });
 
+describe("TelegramChannelSchema — removed rate_limit_ms knob (#3161)", () => {
+  it("a stale rate_limit_ms key is accepted-and-ignored, never a validation failure", () => {
+    // The knob was removed (documented + scaffold-exported but read by
+    // nothing; the send gate is the real throttle). Existing YAML that
+    // still sets it must keep parsing — Zod's default strip mode drops
+    // the unknown key, same pattern as the progress_card removal
+    // (#1122 PR3).
+    const r = TelegramChannelSchema.parse({ format: "html", rate_limit_ms: 500 });
+    expect(r?.format).toBe("html");
+    expect((r as Record<string, unknown> | undefined)?.rate_limit_ms).toBeUndefined();
+  });
+});
+
 describe("TelegramChannelSchema — voice_out (PR-C2)", () => {
   it("applies engine/reply_mode defaults when only enabled is set", () => {
     const r = TelegramChannelSchema.parse({ voice_out: { enabled: true } });

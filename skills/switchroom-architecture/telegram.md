@@ -81,7 +81,6 @@ agents:
 | Var | Source | Purpose |
 |-----|--------|---------|
 | `SWITCHROOM_TG_FORMAT` | `channels.telegram.format` | Default reply format |
-| `SWITCHROOM_TG_RATE_LIMIT_MS` | `channels.telegram.rate_limit_ms` | Min delay between outgoing messages |
 | `TELEGRAM_STATE_DIR` | Auto-set by scaffold | Path to `telegram/` dir |
 | `SWITCHROOM_AGENT_NAME` | Auto-set by scaffold | Agent name (used for self-restart detection) |
 | `SWITCHROOM_CONFIG` | Auto-set by scaffold | Path to switchroom.yaml |

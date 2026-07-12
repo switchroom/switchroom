@@ -52,7 +52,6 @@ Each field type has specific merge behavior when values exist at multiple layers
 | `session.idle_clear_after` | override | Auto-run `/clear` (wipe working context) after this much idle. Default `3h` (on by default); `0s` disables. Long-term memory stays in Hindsight. |
 | `channels.telegram.plugin` | override | `switchroom` (default, enhanced) or `official` |
 | `channels.telegram.format` | override | Reply format (`html`, `markdownv2`, `text`) |
-| `channels.telegram.rate_limit_ms` | override | Min delay between outgoing messages |
 | `channels.telegram.orphan_promotion_ms` | override | Progress-card: ms before an unmatched spawn is promoted to a running row (default 5000) |
 | `channels.telegram.cold_sub_agent_threshold_ms` | override | Progress-card: ms of JSONL silence before a sub-agent is synthesised as finished (default 30000) |
 | `channels.telegram.deferred_completion_timeout_ms` | override | Progress-card: force-close timeout (ms) after parent `turn_end` while sub-agents are still running (default 180000) |

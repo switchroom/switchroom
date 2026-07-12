@@ -1906,7 +1906,7 @@ export function installSwitchroomSkills(
 
 /**
  * Translate per-channel YAML fields into env vars the telegram-plugin
- * will read at startup. Today: SWITCHROOM_TG_FORMAT, SWITCHROOM_TG_RATE_LIMIT_MS,
+ * will read at startup. Today: SWITCHROOM_TG_FORMAT,
  * SWITCHROOM_TG_STREAM_MODE, and the progress-card threshold knobs.
  *
  * Returns an object that can be merged into the user env. User-declared
@@ -1919,9 +1919,9 @@ function channelsToEnv(agent: AgentConfig): Record<string, string> {
   const tg = agent.channels?.telegram;
   if (!tg) return out;
   if (tg.format !== undefined) out.SWITCHROOM_TG_FORMAT = tg.format;
-  if (tg.rate_limit_ms !== undefined) {
-    out.SWITCHROOM_TG_RATE_LIMIT_MS = String(tg.rate_limit_ms);
-  }
+  // SWITCHROOM_TG_RATE_LIMIT_MS removed in #3161 — nothing in
+  // telegram-plugin ever read it; the send gate (on by default since
+  // #3153) is the real outbound throttle.
   if (tg.stream_mode !== undefined) {
     out.SWITCHROOM_TG_STREAM_MODE = tg.stream_mode;
   }

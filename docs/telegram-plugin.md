@@ -226,7 +226,6 @@ The switchroom fork reads additional env vars from `start.sh`:
 | Env var | Source | Purpose |
 |---------|--------|---------|
 | `SWITCHROOM_TG_FORMAT` | `channels.telegram.format` | Default reply format (`html`, `markdownv2`, `text`) |
-| `SWITCHROOM_TG_RATE_LIMIT_MS` | `channels.telegram.rate_limit_ms` | Min delay between outgoing messages |
 | `SWITCHROOM_TG_STREAM_MODE` | `channels.telegram.stream_mode` | `checklist` (default) or `pty`. See "Streaming modes" above |
 | `TELEGRAM_STATE_DIR` | Auto-set by scaffold | Path to `telegram/` dir (history.db, access.json) |
 | `SWITCHROOM_AGENT_NAME` | Auto-set by scaffold | Agent name for self-restart detection |

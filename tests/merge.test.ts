@@ -623,16 +623,16 @@ describe("mergeAgentConfig channels block", () => {
 
   it("per-field merges channels.telegram with agent winning", () => {
     const defaults: AgentDefaults = {
-      channels: { telegram: { plugin: "switchroom", format: "html", rate_limit_ms: 1000 } },
+      channels: { telegram: { plugin: "switchroom", format: "html", stream_throttle_ms: 1000 } },
     };
     const agent = baseAgent({
       channels: { telegram: { format: "markdownv2" } },
     });
     const result = mergeAgentConfig(defaults, agent);
-    // plugin and rate_limit flow from defaults; format is overridden
+    // plugin and stream_throttle flow from defaults; format is overridden
     expect(result.channels?.telegram?.plugin).toBe("switchroom");
     expect(result.channels?.telegram?.format).toBe("markdownv2");
-    expect(result.channels?.telegram?.rate_limit_ms).toBe(1000);
+    expect(result.channels?.telegram?.stream_throttle_ms).toBe(1000);
   });
 
   it("leaves channels undefined when neither side sets it", () => {
