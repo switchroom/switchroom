@@ -33,7 +33,37 @@
 
 import { escapeMarkdown } from './card-format.js'
 import { formatResetRelative } from './quota-check.js'
-import { isTransientUpstreamSignal, parseResetTime } from './model-unavailable.js'
+import { parseResetTime } from './model-unavailable.js'
+
+// ─── Account-scoped throttle wording ─────────────────────────────────────────
+
+/**
+ * ACCOUNT-AFFIRMING subset of `transientUpstreamSignals` (model-unavailable.ts).
+ * The throttle tier takes ACCOUNT-level actions — broker `mark-throttled`,
+ * per-account notice, retry nudge — so it must key on wording that affirms the
+ * account's OWN rate limit ("would exceed your account's rate limit",
+ * "not your account…"), NOT the server-side phrasings ("Server is temporarily
+ * limiting requests (not your usage limit)", 529 overload wording). A
+ * server-wide condition recorded as an account throttle would bench the wrong
+ * thing and restart-nudge an agent straight back into the same server-side
+ * wall. Server-side transients keep the existing calm rate-limited path
+ * (Claude Code's internal retry) untouched.
+ */
+export const accountScopedThrottleSignals = [
+  "would exceed your account's rate limit",
+  'would exceed your account’s rate limit',
+  // Covers both "not your account" and "not your account's" (substring).
+  'not your account',
+]
+
+/** True when `text` carries an EXPLICIT account-affirming throttle marker.
+ *  Never throws on weird input. */
+export function isAccountScopedThrottle(text: string): boolean {
+  if (typeof text !== 'string' || text.length === 0) return false
+  const sample = text.length > 16_384 ? text.slice(0, 16_384) : text
+  const lower = sample.toLowerCase()
+  return accountScopedThrottleSignals.some((s) => lower.includes(s))
+}
 
 /**
  * Default retry-in-place ceiling: a transient 429 whose reset is within this
@@ -81,7 +111,10 @@ export function decideThrottleTier(opts: {
   thresholdMs: number
 }): ThrottleTierDecision {
   const { detail, now, thresholdMs } = opts
-  if (!isTransientUpstreamSignal(detail)) return { action: 'none' }
+  // Account-affirming wording ONLY — the wider transient list includes
+  // server-side phrasings (529 / "server is temporarily limiting requests")
+  // for which an account-scoped throttle would be the wrong action.
+  if (!isAccountScopedThrottle(detail)) return { action: 'none' }
   const resetAt = parseResetTime(detail, new Date(now))
   const resetAtMs = resetAt?.getTime()
   if (resetAtMs == null || !Number.isFinite(resetAtMs) || resetAtMs <= now) {
@@ -165,4 +198,29 @@ export function renderThrottleNotice(opts: {
     `_Staying on ${acct}; no failover needed. The turn retries automatically after the reset._`,
   ]
   return lines.join('\n')
+}
+
+/**
+ * Notice for the broker's ESCALATION outcome: repeated transient 429s on one
+ * account were corroborated by a live probe as a genuine wall, so the broker
+ * ran the standard mark-exhausted + roll. The gateway that raised the
+ * mark-throttled announces it (the reactive-path doctrine — same reason the
+ * plain mark-exhausted path announces gateway-side rather than via
+ * `last_fleet_roll`), which also covers PINNED (non-fleet-active) accounts.
+ */
+export function renderThrottleEscalationNotice(opts: {
+  account: string | null
+  agent: string
+  /** The account the fleet/agents rolled to; null = every fallback blocked. */
+  rolledTo: string | null
+}): string {
+  const acct = opts.account ? `\`${escapeMarkdown(opts.account)}\`` : 'the active account'
+  const head =
+    `⛔️ **Rate limit was actually a wall** — repeated 429s on ${acct} ` +
+    `(trigger: **${escapeMarkdown(opts.agent)}**) were corroborated by a live quota probe.`
+  const tail = opts.rolledTo
+    ? `Marked exhausted and rolled to \`${escapeMarkdown(opts.rolledTo)}\`.`
+    : `Marked exhausted — no fallback account had quota (all blocked). ` +
+      `Use \`/auth add <label>\` to attach another subscription.`
+  return `${head}\n${tail}`
 }

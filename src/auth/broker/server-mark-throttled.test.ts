@@ -13,8 +13,12 @@
  *  - the escalation guard: 3 hits inside the window trigger ONE live probe;
  *    a probe that corroborates a wall converts to the standard
  *    mark-exhausted + fleet roll (mirror fanout, durable promote, audit
- *    reason "throttle-escalation", `last_fleet_roll` recorded); a healthy
- *    probe leaves the account merely throttled and re-arms the counter;
+ *    reason "throttle-escalation") — announced by the RAISING gateway from
+ *    the response, NOT via `last_fleet_roll` (reactive-path doctrine, which
+ *    also covers pinned-account rolls); a healthy probe leaves the account
+ *    merely throttled and re-arms the counter;
+ *  - the re-mark dedup: a mark within 5s of the previous hit refreshes the
+ *    expiry but adds NO hit and can trigger NO probe (probe-flood bound);
  *  - a later mark-exhausted PRESERVES the throttle fields in the entry.
  */
 
@@ -30,6 +34,8 @@ import { writeAccountCredentials } from "../account-store.js";
 import type { QuotaResult } from "../quota.js";
 
 const NOW = 1_800_000_000_000;
+/** Comfortably past the 5s re-mark dedup, well inside the 10-min window. */
+const HIT_SPACING_MS = 30_000;
 const AGENT: Identity = { kind: "agent", name: "ziggy", admin: false };
 
 interface Harness {
@@ -91,7 +97,7 @@ function quotaFor(table: QuotaTable, accessToken: string): QuotaResult {
 function makeBroker(opts: {
   accounts: string[];
   quotas: QuotaTable;
-}): { broker: AuthBroker; b: any; h: Harness } {
+}): { broker: AuthBroker; b: any; h: Harness; clock: { set(ms: number): void } } {
   const tmp = mkdtempSync(join(tmpdir(), "auth-broker-mark-throttled-"));
   const home = join(tmp, "home");
   const agentsDir = join(home, ".switchroom", "agents");
@@ -108,15 +114,16 @@ function makeBroker(opts: {
     agents: { ziggy: {} },
     auth: { active: "alice", fallback_order: ["alice", "bob"] },
   } as unknown as SwitchroomConfig;
+  let nowMs = NOW;
   const broker = new AuthBroker(config, {
     home,
     stateDir,
-    now: () => NOW,
+    now: () => nowMs,
     disableRefreshLoop: true,
     skipHealthyMarker: true,
     _testFetchQuota: async ({ accessToken }) => quotaFor(opts.quotas, accessToken),
   });
-  return { broker, b: broker as any, h };
+  return { broker, b: broker as any, h, clock: { set: (ms) => { nowMs = ms; } } };
 }
 
 /** Drive an op handler with a captured fake socket; parse the one response. */
@@ -218,20 +225,57 @@ describe("mark-throttled — ledger round-trip, no roll, no ineligibility", () =
   });
 });
 
+describe("mark-throttled — re-mark dedup (probe-flood bound)", () => {
+  it("a re-mark within 5s refreshes the expiry but adds NO escalation hit", async () => {
+    const { b } = makeBroker({
+      accounts: ["alice", "bob"],
+      quotas: { alice: { fiveHour: 10, sevenDay: 100 }, bob: { fiveHour: 5, sevenDay: 10 } },
+    });
+    const r1 = await markThrottled(b, NOW + 60_000, "1");
+    expect(r1.data.throttled_until).toBe(NOW + 60_000);
+    // Simultaneous second agent marks a slightly later reset.
+    const r2 = await markThrottled(b, NOW + 90_000, "2");
+    expect(r2.data.escalated).toBe(false);
+    // Expiry keeps the LATER value; hit count stays 1.
+    expect(r2.data.throttled_until).toBe(NOW + 90_000);
+    expect(b.quota["alice"].throttle_hits).toEqual([NOW]);
+  });
+
+  it("a simultaneous 3-agent burst counts once and cannot trigger the probe", async () => {
+    let probes = 0;
+    const { b } = makeBroker({
+      accounts: ["alice", "bob"],
+      quotas: { alice: { fiveHour: 10, sevenDay: 100 }, bob: { fiveHour: 5, sevenDay: 10 } },
+    });
+    (b as any).fetchQuotaImpl = async () => {
+      probes += 1;
+      return { ok: false as const, reason: "should not be probed" };
+    };
+    await markThrottled(b, NOW + 60_000, "1");
+    await markThrottled(b, NOW + 60_000, "2");
+    const r3 = await markThrottled(b, NOW + 60_000, "3");
+    expect(r3.data.escalated).toBe(false);
+    expect(probes).toBe(0);
+    expect(b.quota["alice"].throttle_hits).toEqual([NOW]);
+  });
+});
+
 describe("mark-throttled — escalation guard (3 hits / 10 min)", () => {
   it("escalates to mark-exhausted + fleet roll when the live probe corroborates a wall", async () => {
-    const { b, h } = makeBroker({
+    const { b, h, clock } = makeBroker({
       accounts: ["alice", "bob"],
       // alice is genuinely weekly-walled — the probe corroborates.
       quotas: { alice: { fiveHour: 10, sevenDay: 100 }, bob: { fiveHour: 5, sevenDay: 10 } },
     });
     const r1 = await markThrottled(b, NOW + 60_000, "1");
+    clock.set(NOW + HIT_SPACING_MS);
     const r2 = await markThrottled(b, NOW + 60_000, "2");
     expect(r1.data.escalated).toBe(false);
     expect(r2.data.escalated).toBe(false);
     expect(mirrorToken(h, "ziggy")).toBe(null); // still no roll after 2 hits
 
-    const r3 = await markThrottled(b, NOW + 60_000, "3");
+    clock.set(NOW + 2 * HIT_SPACING_MS);
+    const r3 = await markThrottled(b, NOW + 60_000 + 2 * HIT_SPACING_MS, "3");
     expect(r3.data.escalated).toBe(true);
     expect(r3.data.rolledTo).toBe("bob");
 
@@ -242,52 +286,58 @@ describe("mark-throttled — escalation guard (3 hits / 10 min)", () => {
     expect(b.config.auth?.active).toBe("bob");
     expect(b.isAccountExhausted("alice")).toBe(true);
 
-    // Escalation is attributed in the audit, and the broker-initiated roll
-    // rides the last_fleet_roll announcement channel.
+    // Escalation is attributed in the audit.
     expect(
       auditRows(h).some(
         (r) => r.op === "mark-exhausted" && r.reason === "throttle-escalation",
       ),
     ).toBe(true);
-    expect(b.lastFleetRoll).toMatchObject({ from: "alice", to: "bob" });
+
+    // Reactive-path doctrine: NO last_fleet_roll record — the RAISING gateway
+    // announces from this op's response ({escalated, rolledTo}), which also
+    // covers pinned (non-fleet-active) rolls the fleet channel would skip.
+    expect(b.lastFleetRoll).toBe(null);
 
     // Counter cleared after the escalation probe.
     expect(b.quota["alice"].throttle_hits).toEqual([]);
   });
 
   it("does NOT escalate when the live probe shows the account healthy — counter re-arms", async () => {
-    const { b, h } = makeBroker({
+    const { b, h, clock } = makeBroker({
       accounts: ["alice", "bob"],
       quotas: { alice: { fiveHour: 40, sevenDay: 30 }, bob: { fiveHour: 5, sevenDay: 10 } },
     });
     await markThrottled(b, NOW + 60_000, "1");
+    clock.set(NOW + HIT_SPACING_MS);
     await markThrottled(b, NOW + 60_000, "2");
-    const r3 = await markThrottled(b, NOW + 60_000, "3");
+    clock.set(NOW + 2 * HIT_SPACING_MS);
+    const until3 = NOW + 60_000 + 2 * HIT_SPACING_MS;
+    const r3 = await markThrottled(b, until3, "3");
     expect(r3.data.escalated).toBe(false);
     expect(r3.data.rolledTo).toBe(null);
 
     // Still merely throttled: no mark, no roll, counter cleared (one probe
     // per burst, not one per subsequent hit).
     expect(b.quota["alice"].exhausted_until).toBeUndefined();
-    expect(b.quota["alice"].throttled_until).toBe(NOW + 60_000);
+    expect(b.quota["alice"].throttled_until).toBe(until3);
     expect(b.quota["alice"].throttle_hits).toEqual([]);
     expect(mirrorToken(h, "ziggy")).toBe(null);
     expect(auditRows(h).some((r) => r.op === "mark-exhausted")).toBe(false);
   });
 
   it("hits OUTSIDE the 10-min window do not count toward escalation", async () => {
-    const { broker, b } = makeBroker({
+    const { b, clock } = makeBroker({
       accounts: ["alice", "bob"],
       quotas: { alice: { fiveHour: 10, sevenDay: 100 }, bob: { fiveHour: 5, sevenDay: 10 } },
     });
-    // Two old hits, aged past the window.
-    let clock = NOW;
-    (broker as any).now = () => clock;
-    await markThrottled(b, clock + 60_000, "1");
-    await markThrottled(b, clock + 60_000, "2");
-    clock = NOW + 11 * 60_000; // both prior hits now outside the window
-    const r3 = await markThrottled(b, clock + 60_000, "3");
+    // Two old hits, spaced past the dedup, then aged past the window.
+    await markThrottled(b, NOW + 60_000, "1");
+    clock.set(NOW + HIT_SPACING_MS);
+    await markThrottled(b, NOW + 60_000, "2");
+    const late = NOW + 12 * 60_000; // both prior hits now outside the window
+    clock.set(late);
+    const r3 = await markThrottled(b, late + 60_000, "3");
     expect(r3.data.escalated).toBe(false);
-    expect(b.quota["alice"].throttle_hits).toEqual([clock]);
+    expect(b.quota["alice"].throttle_hits).toEqual([late]);
   });
 });

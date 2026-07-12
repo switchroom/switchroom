@@ -14,6 +14,8 @@ import { describe, it, expect } from 'vitest'
 import {
   decideThrottleTier,
   evaluateThrottleNotice,
+  isAccountScopedThrottle,
+  renderThrottleEscalationNotice,
   renderThrottleNotice,
   throttleRetryInPlaceMaxMs,
   THROTTLE_DEFAULT_WAIT_MS,
@@ -105,6 +107,19 @@ describe('decideThrottleTier — decision matrix', () => {
     expect(d).toEqual({ action: 'none' })
   })
 
+  it('SERVER-side transient wording (529 shape) → none — never account-throttled', () => {
+    // This carries the transient NEGATION ("not your usage limit") but does
+    // NOT affirm the account's own rate limit — it is a server-wide
+    // condition; an account-scoped throttle + restart nudge would be the
+    // wrong action. It stays on the existing calm rate-limited path.
+    const d = decideThrottleTier({
+      detail: 'Server is temporarily limiting requests (not your usage limit). retry after 60 seconds',
+      now: NOW,
+      thresholdMs: THRESHOLD,
+    })
+    expect(d).toEqual({ action: 'none' })
+  })
+
   it('honours a custom threshold (boundary: exactly at threshold stays in place)', () => {
     const atThreshold = decideThrottleTier({
       detail: TRANSIENT('retry after 300 seconds'),
@@ -118,6 +133,21 @@ describe('decideThrottleTier — decision matrix', () => {
       thresholdMs: 5 * 60_000,
     })
     expect(beyond.action).toBe('failover')
+  })
+})
+
+describe('isAccountScopedThrottle — the tier gate', () => {
+  it("matches account-affirming wording (both apostrophe variants + 'not your account')", () => {
+    expect(isAccountScopedThrottle("would exceed your account's rate limit")).toBe(true)
+    expect(isAccountScopedThrottle('would exceed your account’s rate limit')).toBe(true)
+    expect(isAccountScopedThrottle("this is not your account's limit")).toBe(true)
+  })
+
+  it('rejects server-side transient / 529 wordings and walls', () => {
+    expect(isAccountScopedThrottle('Server is temporarily limiting requests (not your usage limit)')).toBe(false)
+    expect(isAccountScopedThrottle('temporarily rate limited, overloaded_error 529')).toBe(false)
+    expect(isAccountScopedThrottle("You've hit your limit · resets 8:50am")).toBe(false)
+    expect(isAccountScopedThrottle('')).toBe(false)
   })
 })
 
@@ -196,6 +226,30 @@ describe('renderThrottleNotice — honest reset messaging', () => {
     })
     expect(text).toContain('the active account')
     expect(text).toContain('retrying in ~60s')
+  })
+})
+
+describe('renderThrottleEscalationNotice — corroborated-wall announcement', () => {
+  it('names the account, the trigger agent, and the roll target', () => {
+    const text = renderThrottleEscalationNotice({
+      account: 'alice',
+      agent: 'carrie',
+      rolledTo: 'bob',
+    })
+    expect(text).toContain('alice')
+    expect(text).toContain('carrie')
+    expect(text).toContain('bob')
+    expect(text).toContain('actually a wall')
+  })
+
+  it('renders the all-blocked variant when no fallback had quota', () => {
+    const text = renderThrottleEscalationNotice({
+      account: 'alice',
+      agent: 'carrie',
+      rolledTo: null,
+    })
+    expect(text).toContain('all blocked')
+    expect(text).toContain('/auth add')
   })
 })
 

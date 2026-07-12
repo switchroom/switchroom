@@ -146,6 +146,13 @@ const MARK_THROTTLED_MAX_MS = 30 * 60 * 1000;
 const THROTTLE_ESCALATION_HITS = 3;
 const THROTTLE_ESCALATION_WINDOW_MS = 10 * 60 * 1000;
 
+/** Re-mark dedup (429 throttle tier): a mark landing within this interval of
+ * the account's previous hit only refreshes `throttled_until` (keeping the
+ * later expiry) — it adds no escalation hit and can trigger no probe. Bounds
+ * the probe-flood when many agents sharing one account 429 simultaneously
+ * (one burst counts as one hit). */
+const MARK_THROTTLED_MIN_INTERVAL_MS = 5 * 1000;
+
 /** Audit-log size cap before rotation (10 MB, per RFC §4.4). */
 const AUDIT_ROTATE_BYTES = 10 * 1024 * 1024;
 const AUDIT_KEEP = 5;
@@ -2245,7 +2252,16 @@ export class AuthBroker {
    * uses) converts the throttle into the standard mark-exhausted + fleet roll.
    * The hit counter is cleared after any escalation probe — corroborated or
    * not — so a persistent burst re-arms over a fresh window instead of
-   * probing on every subsequent hit.
+   * probing on every subsequent hit. Marks within
+   * MARK_THROTTLED_MIN_INTERVAL_MS of the previous hit only refresh
+   * `throttled_until` (no hit, no probe) — a simultaneous multi-agent burst
+   * counts once and cannot flood probes.
+   *
+   * Announcement doctrine: an escalated roll is NOT recorded in
+   * `last_fleet_roll` — this is a REACTIVE path (see the LastFleetRoll
+   * docstring), so the RAISING gateway announces from this op's response
+   * (`escalated` + `rolledTo`), which also covers rolls of PINNED
+   * (non-fleet-active) override accounts that the fleet channel would skip.
    */
   private async opMarkThrottled(
     socket: net.Socket,
@@ -2267,9 +2283,32 @@ export class AuthBroker {
       now + MARK_THROTTLED_MAX_MS,
     );
     const entry = this.quota[account] ?? {};
-    const hits = (entry.throttle_hits ?? []).filter(
-      (t) => now - t < THROTTLE_ESCALATION_WINDOW_MS,
-    );
+    const priorHits = entry.throttle_hits ?? [];
+    const lastHit = priorHits.length > 0 ? priorHits[priorHits.length - 1] : undefined;
+
+    // Re-mark dedup: a burst of near-simultaneous marks (N agents sharing the
+    // throttled account) refreshes the expiry but counts as ONE hit and can
+    // trigger no probe — the probe-flood bound.
+    if (lastHit !== undefined && now - lastHit < MARK_THROTTLED_MIN_INTERVAL_MS) {
+      const refreshed = Math.max(entry.throttled_until ?? 0, throttledUntil);
+      this.quota[account] = { ...entry, throttled_until: refreshed };
+      this.persistQuota();
+      this.audit({ op: "mark-throttled", identity, account, accountKind: "claude", ok: true });
+      process.stdout.write(
+        `auth-broker: mark-throttled ${account} deduped (re-mark within ${MARK_THROTTLED_MIN_INTERVAL_MS / 1000}s) — expiry refreshed, no new hit\n`,
+      );
+      socket.write(
+        encodeSuccess(id, {
+          account,
+          throttled_until: refreshed,
+          escalated: false,
+          rolledTo: null,
+        }),
+      );
+      return;
+    }
+
+    const hits = priorHits.filter((t) => now - t < THROTTLE_ESCALATION_WINDOW_MS);
     hits.push(now);
     const escalate = hits.length >= THROTTLE_ESCALATION_HITS;
     this.quota[account] = {
@@ -2296,19 +2335,12 @@ export class AuthBroker {
           `auth-broker: throttle-escalation probe corroborates wall on ${account} — mark-exhausted + roll\n`,
         );
         this.audit({ op: "mark-exhausted", identity, account, accountKind: "claude", ok: true, reason: "throttle-escalation" });
-        // Capture the fleet active BEFORE the roll — a corroborated roll
-        // auto-promotes the target, so reading it afterwards would compare
-        // against the NEW active and never record the announcement.
-        const wasFleetActive = account === this.config.auth?.active;
         const roll = await this.markExhaustedAndRoll(account, probe.until ?? undefined, identity);
         rolledTo = roll.rolledTo;
-        // Broker-initiated roll with no announcing gateway (the throttle path
-        // posts only the lightweight notice) → record it on the same
-        // `last_fleet_roll` channel the proactive probe uses, so the
-        // quota-watch announcement (dedup'd fleet-wide) reaches the operator.
-        if (rolledTo && wasFleetActive) {
-          this.recordFleetRoll(account, rolledTo, "hard-exhaustion", probe.until ?? undefined);
-        }
+        // Deliberately NO recordFleetRoll here — reactive-path doctrine (see
+        // op docstring): the raising gateway announces from this response,
+        // covering pinned-account rolls the fleet channel would skip and
+        // avoiding a double announcement for fleet-active rolls.
       } else {
         process.stdout.write(
           `auth-broker: throttle-escalation probe on ${account} did NOT corroborate a wall — staying throttled\n`,

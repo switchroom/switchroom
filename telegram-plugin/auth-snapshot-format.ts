@@ -713,6 +713,13 @@ export interface FallbackAnnouncementInput {
    * present — it is the fresher, server-authoritative signal.
    */
   parsedResetAt?: Date | null;
+  /**
+   * 429 throttle tier escalation — the trigger was a long-reset transient
+   * RATE LIMIT, not a quota wall. Names the headline honestly ("rate limit
+   * on X" instead of a utilization-derived "5-hour limit on X", which would
+   * be wrong: a rate-limited account's utilization is typically LOW).
+   */
+  cause?: 'rate-limit';
   tz?: string;
   now?: Date;
 }
@@ -737,7 +744,12 @@ export function renderFallbackAnnouncement(input: FallbackAnnouncementInput): st
   const lines: string[] = [];
 
   const limitWord = input.oldQuota ? limitWordFor(input.oldQuota) : 'quota';
-  const headerLimit = limitWord === 'quota' ? 'quota cap' : `${limitWord} limit`;
+  const headerLimit =
+    input.cause === 'rate-limit'
+      ? 'rate limit'
+      : limitWord === 'quota'
+        ? 'quota cap'
+        : `${limitWord} limit`;
 
   if (!input.newLabel) {
     // All-blocked path — no swap occurred. Tell user what's broken and, so they
