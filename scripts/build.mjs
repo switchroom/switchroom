@@ -308,6 +308,24 @@ if (mmHookEscape.changed) {
   console.log(`[build] ASCII-escaped ${mmHookEscape.nonAsciiCount} non-ASCII code units in dist/cli/hindsight-mental-model-pretool.mjs`);
 }
 
+// Bundle the foreground-hog-pretool hook — deterministic gate that denies
+// effectively-unbounded FOREGROUND Bash shapes (tail -f, watch, long sleeps,
+// sleep-loops, gh --watch, docker/kubectl/journalctl followers) with an
+// instructive "re-run with run_in_background: true" message. Same pattern
+// as hindsight-mental-model-pretool: no src/ imports (a pure tool_input
+// gate), bundled for consistency so it ships to /opt/switchroom/hooks/.
+console.log("[build] bundling src/cli/foreground-hog-pretool.ts -> dist/cli/foreground-hog-pretool.mjs");
+execSync(
+  `bun build ${JSON.stringify(resolve(root, "src/cli/foreground-hog-pretool.ts"))} --outfile ${JSON.stringify(resolve(outDir, "foreground-hog-pretool.mjs"))} --target node`,
+  { stdio: "inherit", cwd: root }
+);
+const fgHogHookOutFile = resolve(outDir, "foreground-hog-pretool.mjs");
+chmodSync(fgHogHookOutFile, 0o755);
+const fgHogHookEscape = escapeBundleNonAscii(fgHogHookOutFile);
+if (fgHogHookEscape.changed) {
+  console.log(`[build] ASCII-escaped ${fgHogHookEscape.nonAsciiCount} non-ASCII code units in dist/cli/foreground-hog-pretool.mjs`);
+}
+
 // Bundle the self-improve-stop hook — RFC reference/rfcs/agent-self-improvement.md
 // slice 1. Turn-end GATE: a self-contained .mjs the agent container runs
 // via node from the bundled-hooks path. It imports the src/self-improve/*
