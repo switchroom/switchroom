@@ -183,6 +183,26 @@ export interface FleetFallbackDeps {
   /** Operator timezone for absolute reset times in the announcement. */
   tz?: string;
   now?: Date;
+  /**
+   * The reset time PARSED from the triggering error prose (429 throttle tier
+   * enrichment) — threaded into the announcement as the recovery-line
+   * fallback when the old account's live probe carried no reset.
+   */
+  parsedResetAt?: Date;
+  /**
+   * 429 throttle tier escalation: the trigger is a TERMINAL transient 429
+   * whose parsed reset lies beyond the retry-in-place threshold. Its wording
+   * explicitly NEGATES the usage-limit reading, so the old account's
+   * UTILIZATION probe typically classifies healthy — the healthy-idempotency
+   * guard would self-cancel the swap ("probed healthy / Stale event?"),
+   * silently dropping the spec's ">threshold → mark + fail over" leg. When
+   * set, the terminal parsed-reset signal is trusted over the utilization
+   * probe: the guard is bypassed and the swap proceeds (the broker mark
+   * honors the caller-passed `until` — the parsed reset). Staleness safety
+   * holds upstream: the flag is only set for a terminal error line the
+   * session-tail just read, never for replayed/late events.
+   */
+  rateLimitTrigger?: boolean;
 }
 
 /**
@@ -217,8 +237,12 @@ export async function runFleetAutoFallback(
   // normalization uses the same clock as the rest of the decision (a default
   // `new Date()` would diverge from `deps.now` and could mis-zero a window
   // whose reset is still future relative to the event's clock).
+  // 429 throttle tier: a rate-limit trigger's wording NEGATES the usage-limit
+  // reading, so healthy utilization is the EXPECTED state, not evidence of a
+  // stale event — the guard must not self-cancel that swap (see
+  // FleetFallbackDeps.rateLimitTrigger).
   const oldHealth = classifyHealth(oldSnap, now);
-  if (oldHealth === 'healthy') {
+  if (oldHealth === 'healthy' && !deps.rateLimitTrigger) {
     return {
       kind: 'no-eligible-target',
       oldLabel: oldSnap.label,
@@ -255,6 +279,8 @@ export async function runFleetAutoFallback(
         // card enumerates EVERY account (5h%/7d% + recovery ETA), letting the
         // user verify the fleet is truly exhausted, not just the trigger account.
         fleetSnapshots: snapshots,
+        parsedResetAt: deps.parsedResetAt ?? null,
+        cause: deps.rateLimitTrigger ? 'rate-limit' : undefined,
         tz,
         now,
       }),
@@ -278,6 +304,8 @@ export async function runFleetAutoFallback(
       newLabel: rolledTo,
       newQuota,
       triggerAgent: deps.triggerAgent,
+      parsedResetAt: deps.parsedResetAt ?? null,
+      cause: deps.rateLimitTrigger ? 'rate-limit' : undefined,
       tz,
       now,
     }),

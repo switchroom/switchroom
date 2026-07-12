@@ -10,15 +10,24 @@
  * residual risk is the brief total-wall window.
  *
  * This decides whether to DEFER a fire rather than throw it at a wall. It
- * defers ONLY when EVERY account is exhausted (dispatching is definitely
- * futile). When at least one account is healthy it does NOT defer: the fleet
- * serves the agent a healthy account via failover, and we never hold a
- * dispatch on a maybe — holding risks nothing, but we keep the gate narrow and
- * reliable. A single lag-window run may still be lost in the partial case;
- * recurring crons recover on their next occurrence, and the operator has no
- * hard deadlines (by design decision).
+ * defers in two cases:
  *
- * PURE — no I/O. Fail-open is the caller's job (broker unreachable → dispatch).
+ *   1. EVERY account is exhausted (dispatching is definitely futile). When at
+ *      least one account is healthy it does NOT defer on this rule: the fleet
+ *      serves the agent a healthy account via failover.
+ *   2. 429 throttle tier — the agent's EFFECTIVE account (its override, else
+ *      the fleet active) carries a future `throttled_until`. A throttled
+ *      account is NOT rolled off (that's the whole point of the tier), so the
+ *      fire would 429 against the same account; soft-defer until the throttle
+ *      clears. `retryAtMs` carries the clear time so the caller can align the
+ *      retry with it instead of blind backoff.
+ *
+ * A single lag-window run may still be lost in the partial case; recurring
+ * crons recover on their next occurrence, and the operator has no hard
+ * deadlines (by design decision).
+ *
+ * PURE — no I/O, no clock except the injected `now`. Fail-open is the
+ * caller's job (broker unreachable → dispatch).
  */
 
 import type { ListStateData } from "../auth/broker/client.js";
@@ -26,20 +35,51 @@ import type { ListStateData } from "../auth/broker/client.js";
 export interface QuotaPreflightDecision {
   defer: boolean;
   reason: string;
+  /** When set (throttle soft-defer), the unix ms at/after which a retry is
+   *  expected to succeed — the throttled account's `throttled_until`. The
+   *  caller aligns the retry timer with it (bounded) instead of the default
+   *  backoff ladder. */
+  retryAtMs?: number;
 }
 
-export function decideQuotaPreflight(state: ListStateData): QuotaPreflightDecision {
+export function decideQuotaPreflight(
+  state: ListStateData,
+  opts: { agent?: string; now?: number } = {},
+): QuotaPreflightDecision {
+  const now = opts.now ?? Date.now();
   const accounts = state.accounts ?? [];
   if (accounts.length === 0) {
     // No accounts to reason about — never block a fire on this.
     return { defer: false, reason: "no accounts in broker state" };
   }
   const healthy = accounts.filter((a) => !a.exhausted);
-  if (healthy.length > 0) {
+  if (healthy.length === 0) {
+    return { defer: true, reason: `all ${accounts.length} account(s) exhausted` };
+  }
+  // 429 throttle tier — soft-defer while the agent's effective account is
+  // transiently rate-limited. The throttle deliberately does NOT roll the
+  // fleet, so "some other account is healthy" doesn't help: this agent's
+  // next turn still runs on the throttled account.
+  const effectiveLabel =
+    (opts.agent !== undefined
+      ? (state.agents ?? []).find((a) => a.name === opts.agent)?.account
+      : undefined) ?? state.active;
+  const effective = accounts.find((a) => a.label === effectiveLabel);
+  if (
+    effective !== undefined &&
+    !effective.exhausted &&
+    effective.throttled_until !== undefined &&
+    effective.throttled_until > now
+  ) {
+    const inS = Math.ceil((effective.throttled_until - now) / 1000);
     return {
-      defer: false,
-      reason: `${healthy.length}/${accounts.length} account(s) healthy`,
+      defer: true,
+      reason: `account '${effective.label}' rate-throttled (clears in ${inS}s)`,
+      retryAtMs: effective.throttled_until,
     };
   }
-  return { defer: true, reason: `all ${accounts.length} account(s) exhausted` };
+  return {
+    defer: false,
+    reason: `${healthy.length}/${accounts.length} account(s) healthy`,
+  };
 }

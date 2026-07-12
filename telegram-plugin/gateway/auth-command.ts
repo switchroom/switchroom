@@ -301,6 +301,20 @@ export interface AuthBrokerClient {
    * identity — so auto-fallback works from any agent.
    */
   markExhausted(until?: number): Promise<{ account: string; rolled: string[]; rolledTo?: string | null }>
+  /**
+   * 429 throttle tier (broker `mark-throttled`). Records a transient
+   * per-account rate limit on the CALLER's own account — `throttled_until`
+   * in the quota ledger — WITHOUT rolling the fleet and WITHOUT touching
+   * eligibility. `escalated` is true when the broker's escalation guard
+   * (repeated hits corroborated by a live probe) converted it into the
+   * standard mark-exhausted + roll; `rolledTo` names the roll target then.
+   */
+  markThrottled(until: number): Promise<{
+    account: string
+    throttled_until: number
+    escalated: boolean
+    rolledTo?: string | null
+  }>
   rmAccount(label: string): Promise<{ label: string }>
   refreshAccount(label: string): Promise<{ account: string; expiresAt?: number }>
   setOverride(

@@ -169,6 +169,14 @@ export interface AccountState {
   expiresAt?: number;
   exhausted: boolean;
   exhausted_until?: number;
+  /**
+   * 429 throttle tier — unix ms until which the account is transiently
+   * rate-limited (recorded by `mark-throttled`). Informational only: it never
+   * gates serving or failover eligibility. Cron quota-preflight soft-defers a
+   * fire while the agent's effective account carries a future value here.
+   * Absent on pre-throttle-tier brokers.
+   */
+  throttled_until?: number;
   threshold_violations?: number;
   last_refreshed_at?: number;
   /**
@@ -284,6 +292,18 @@ export interface MarkExhaustedData {
   /** The account the fleet rolled TO (next non-exhausted in fallback_order),
    *  or null when every fallback is also exhausted. Added so a non-admin
    *  caller can announce an accurate swap target without an admin set-active. */
+  rolledTo?: string | null;
+}
+
+export interface MarkThrottledData {
+  account: string;
+  /** The recorded (server-clamped) throttle expiry, unix ms. */
+  throttled_until: number;
+  /** True when the escalation guard fired: repeated transient 429s were
+   *  corroborated by a live probe as a genuine wall, so the broker marked
+   *  the account exhausted and rolled the fleet. */
+  escalated: boolean;
+  /** Set only when `escalated` — the roll target (null = all blocked). */
   rolledTo?: string | null;
 }
 
@@ -529,6 +549,24 @@ export class AuthBrokerClient {
       : { v: PROTOCOL_VERSION, id: randomUUID(), op: "mark-exhausted" };
     const data = await this.send(req);
     return data as MarkExhaustedData;
+  }
+
+  /**
+   * 429 throttle tier — record a transient per-account rate limit on the
+   * caller's bound account (`throttled_until` in the quota ledger). Never
+   * rolls the fleet and never blocks eligibility; the broker's escalation
+   * guard may corroborate repeated hits into a real mark-exhausted (see
+   * `MarkThrottledData.escalated`). Non-admin, same posture as
+   * `markExhausted`.
+   */
+  async markThrottled(until: number): Promise<MarkThrottledData> {
+    const data = await this.send({
+      v: PROTOCOL_VERSION,
+      id: randomUUID(),
+      op: "mark-throttled",
+      until,
+    });
+    return data as MarkThrottledData;
   }
 
   /**

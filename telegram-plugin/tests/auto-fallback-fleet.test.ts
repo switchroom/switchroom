@@ -118,6 +118,78 @@ describe('runFleetAutoFallback', () => {
     }
   });
 
+  it('parsedResetAt (429 throttle tier) names the recovery when the old probe carried no reset', async () => {
+    const failover = vi.fn(async () => ({ rolledTo: 'you@x', rolled: ['ken@x'] }));
+    const out = await runFleetAutoFallback({
+      state: state('ken@x', ['ken@x', 'you@x']),
+      quotas: [
+        // ken: walled, but the probe carried NO reset time — pre-fix the
+        // announcement's recovery line was silently dropped.
+        qOk({ fiveHourUtilizationPct: 100, representativeClaim: 'five_hour' }),
+        qOk({ fiveHourUtilizationPct: 8, sevenDayUtilizationPct: 20 }),
+      ],
+      failover,
+      triggerAgent: 'carrie',
+      now: NOW,
+      tz: 'UTC',
+      // Parsed from the error prose ("resets 5:50am") by the gateway.
+      parsedResetAt: new Date('2026-05-15T05:50:00Z'),
+    });
+
+    expect(out.kind).toBe('switched');
+    if (out.kind === 'switched') {
+      expect(out.announcement).toContain('recovers');
+      expect(out.announcement).toContain('in 4h 57m');
+    }
+  });
+
+  it('rateLimitTrigger: swaps even when the old account probes HEALTHY (the >threshold leg must execute)', async () => {
+    // A terminal transient 429 NEGATES the usage-limit reading, so healthy
+    // utilization is the EXPECTED state for the rate-limited account. The
+    // healthy-idempotency guard must not self-cancel this swap into a
+    // "probed healthy / Stale event?" no-op.
+    const failover = vi.fn(async () => ({ rolledTo: 'you@x', rolled: ['ken@x'] }));
+    const out = await runFleetAutoFallback({
+      state: state('ken@x', ['ken@x', 'you@x']),
+      quotas: [
+        qOk({ fiveHourUtilizationPct: 12, sevenDayUtilizationPct: 30 }), // healthy!
+        qOk({ fiveHourUtilizationPct: 8, sevenDayUtilizationPct: 20 }),
+      ],
+      failover,
+      triggerAgent: 'carrie',
+      now: NOW,
+      tz: 'UTC',
+      parsedResetAt: new Date('2026-05-15T02:53:00Z'),
+      rateLimitTrigger: true,
+    });
+
+    expect(out.kind).toBe('switched');
+    expect(failover).toHaveBeenCalledTimes(1);
+    if (out.kind === 'switched') {
+      // Honest headline: a rate limit, not a utilization-derived window cap.
+      expect(out.announcement).toContain('rate limit on ken@x');
+      expect(out.announcement).not.toContain('5-hour limit');
+      // Recovery line carries the parsed reset (no window was maxed).
+      expect(out.announcement).toContain('recovers');
+      expect(out.announcement).toContain('in 2h');
+    }
+  });
+
+  it('rateLimitTrigger stays subject to the broker outcome (all-blocked passes through)', async () => {
+    const failover = vi.fn(async () => ({ rolledTo: null, rolled: [] }));
+    const out = await runFleetAutoFallback({
+      state: state('ken@x', ['ken@x']),
+      quotas: [qOk({ fiveHourUtilizationPct: 12, sevenDayUtilizationPct: 30 })],
+      failover,
+      triggerAgent: 'carrie',
+      now: NOW,
+      tz: 'UTC',
+      rateLimitTrigger: true,
+    });
+    expect(out.kind).toBe('all-blocked');
+    expect(failover).toHaveBeenCalledTimes(1);
+  });
+
   it('idempotency: skips the swap WITHOUT calling failover when active probes healthy', async () => {
     const failover = vi.fn();
     const out = await runFleetAutoFallback({

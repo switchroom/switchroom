@@ -704,6 +704,22 @@ export interface FallbackAnnouncementInput {
    * shows the target's headroom and is unchanged.
    */
   fleetSnapshots?: AccountSnapshot[];
+  /**
+   * 429 throttle tier enrichment — the reset time PARSED from the error
+   * prose ("resets 8:50am (TZ)" / "retry after 60s") that triggered the
+   * fallback. Fallback for the recovery line when the old account's probe
+   * carried no reset (probe failed / thin headers), so the announcement
+   * still names when the account frees. A probe-derived reset wins when
+   * present — it is the fresher, server-authoritative signal.
+   */
+  parsedResetAt?: Date | null;
+  /**
+   * 429 throttle tier escalation — the trigger was a long-reset transient
+   * RATE LIMIT, not a quota wall. Names the headline honestly ("rate limit
+   * on X" instead of a utilization-derived "5-hour limit on X", which would
+   * be wrong: a rate-limited account's utilization is typically LOW).
+   */
+  cause?: 'rate-limit';
   tz?: string;
   now?: Date;
 }
@@ -728,7 +744,12 @@ export function renderFallbackAnnouncement(input: FallbackAnnouncementInput): st
   const lines: string[] = [];
 
   const limitWord = input.oldQuota ? limitWordFor(input.oldQuota) : 'quota';
-  const headerLimit = limitWord === 'quota' ? 'quota cap' : `${limitWord} limit`;
+  const headerLimit =
+    input.cause === 'rate-limit'
+      ? 'rate limit'
+      : limitWord === 'quota'
+        ? 'quota cap'
+        : `${limitWord} limit`;
 
   if (!input.newLabel) {
     // All-blocked path — no swap occurred. Tell user what's broken and, so they
@@ -765,9 +786,14 @@ export function renderFallbackAnnouncement(input: FallbackAnnouncementInput): st
             `${formatAbsolute(earliest.at, tz)} (in ${formatRelative(earliest.at, now)})`,
         );
       }
-    } else if (input.oldQuota) {
+    } else {
       // Back-compat: no fleet snapshot supplied → old single-account shape.
-      const recovery = recoveryAtFor(input.oldQuota);
+      // Probe-derived reset first; the prose-parsed reset (429 throttle tier
+      // enrichment) covers the probe-failed case.
+      const recovery =
+        (input.oldQuota ? recoveryAtFor(input.oldQuota) : null) ??
+        input.parsedResetAt ??
+        null;
       if (recovery) {
         lines.push(
           `${escapeMarkdown(input.oldLabel)} recovers ${formatAbsolute(recovery, tz)} ` +
@@ -794,8 +820,14 @@ export function renderFallbackAnnouncement(input: FallbackAnnouncementInput): st
   lines.push(`Triggered by: agent **${escapeMarkdown(input.triggerAgent)}**`);
   lines.push('');
 
-  if (input.oldQuota) {
-    const recovery = recoveryAtFor(input.oldQuota);
+  {
+    // Probe-derived reset first; the prose-parsed reset (429 throttle tier
+    // enrichment) keeps the recovery line honest when the old account's
+    // probe failed at the moment of the wall.
+    const recovery =
+      (input.oldQuota ? recoveryAtFor(input.oldQuota) : null) ??
+      input.parsedResetAt ??
+      null;
     if (recovery) {
       lines.push(
         `\`${codeSpanSafe(input.oldLabel)}\` recovers ` +

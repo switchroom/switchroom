@@ -20,6 +20,7 @@ import {
   registerAgentSchedule,
   resolveChannelTarget,
   resolveEntryThreadId,
+  resolveQuotaDeferDelayMs,
   type CronLib,
 } from "./index.js";
 
@@ -466,5 +467,69 @@ describe("registerAgentSchedule — quota preflight", () => {
     expect(r.pending).toHaveLength(1);
     tasks[0]!.task.stop();
     expect(r.pending[0]!.cancelled).toBe(true);
+  });
+
+  it("aims the retry at a throttle soft-defer's retryAtMs (429 throttle tier)", async () => {
+    const cron = fakeCron();
+    const sink = new InMemoryAuditSink();
+    const dispatcher = captureDispatcher({ delivered: true });
+    const NOW = 1_700_000_000_000;
+    const delays: number[] = [];
+    registerAgentSchedule({
+      entries: oneEntry, channel: chan, sink, cronLib: cron, dispatcher,
+      now: () => NOW,
+      quotaGate: async () => ({
+        defer: true,
+        reason: "account 'alice' rate-throttled (clears in 90s)",
+        retryAtMs: NOW + 90_000,
+      }),
+      scheduleRetry: (fn, ms) => {
+        delays.push(ms);
+        return { cancel: () => {} };
+      },
+    });
+
+    await cron.fire(0);
+
+    expect(dispatcher.calls).toHaveLength(0);
+    expect(sink.fires[0]!.exitCode).toBe(-2);
+    expect(sink.fires[0]!.outputSummary).toContain("rate-throttled");
+    // Aimed just past the throttle clear (90s + 2s slack), NOT the 60s ladder.
+    expect(delays).toEqual([92_000]);
+  });
+});
+
+describe("resolveQuotaDeferDelayMs — throttle-aimed retry delay", () => {
+  const NOW = 1_700_000_000_000;
+
+  it("keeps the backoff ladder when no retryAtMs is present (all-blocked defer)", () => {
+    expect(resolveQuotaDeferDelayMs({ defer: true, reason: "all" }, 60_000, NOW)).toBe(60_000);
+  });
+
+  it("aims 2s past retryAtMs", () => {
+    expect(
+      resolveQuotaDeferDelayMs(
+        { defer: true, reason: "throttled", retryAtMs: NOW + 90_000 },
+        60_000,
+        NOW,
+      ),
+    ).toBe(92_000);
+  });
+
+  it("bounds the aim: never sooner than 5s, never later than 10m", () => {
+    expect(
+      resolveQuotaDeferDelayMs(
+        { defer: true, reason: "throttled", retryAtMs: NOW - 1 },
+        60_000,
+        NOW,
+      ),
+    ).toBe(5_000);
+    expect(
+      resolveQuotaDeferDelayMs(
+        { defer: true, reason: "throttled", retryAtMs: NOW + 60 * 60_000 },
+        60_000,
+        NOW,
+      ),
+    ).toBe(10 * 60_000);
   });
 });

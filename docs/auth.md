@@ -208,6 +208,46 @@ When `exhausted_until` passes, the broker clears the mark. Agents
 that *prefer* the cleared account (it's first in their effective
 preference order) drift back on next idle.
 
+### 429 throttle tier — short throttles stay put
+
+Not every 429 is a wall. Anthropic also emits transient burst
+throttles whose wording affirms the ACCOUNT's own rate limit ("would
+exceed your account's rate limit") and usually names a reset minutes
+away. Failing the whole fleet over for a 3-minute throttle is churn,
+so those take a lighter tier. Server-side transient wordings ("Server
+is temporarily limiting requests", 529 overload) are deliberately
+excluded — they stay on the calm rate-limited path, since an
+account-scoped mark would bench the wrong thing for a server-wide
+condition.
+
+- Reset within the retry-in-place threshold (default **5 minutes**,
+  override with `SWITCHROOM_THROTTLE_RETRY_IN_PLACE_MAX_MS`): the
+  gateway calls the broker's `mark-throttled` verb — the ledger entry
+  gains `throttled_until`, nothing rolls, the account stays fully
+  eligible. One lightweight notice (per account, cooldown-deduped
+  locally AND fleet-wide via the broker's claim verb) tells you it's a
+  throttle, not a wall, and when it resets; the dead turn is retried
+  automatically after the reset (jittered so agents sharing the
+  account don't stampede, and never while a newer live turn is
+  running). No parseable reset → a conservative 60-second wait.
+- Reset beyond the threshold: the same mark-exhausted + fleet
+  failover mechanics as a wall, with the parsed reset as the mark
+  expiry and an honest "rate limit" headline. The rate-limit trigger
+  is trusted over the utilization probe here — a rate-limited account
+  typically probes healthy, which must not self-cancel the swap.
+- Genuine wall wording: the normal quota-exhausted path, unchanged.
+- Escalation guard: 3 transient 429s on the same account inside 10
+  minutes trigger one live quota probe; only a probe that corroborates
+  a real wall converts the throttle into mark-exhausted + roll. The
+  raising gateway announces that roll (covers pinned accounts too).
+  Re-marks within 5 seconds of the previous hit only refresh
+  `throttled_until` — they add no escalation hit and can trigger no
+  probe, so a simultaneous multi-agent burst counts once.
+
+Cron fires are throttle-aware: the scheduler's quota preflight
+soft-defers a fire while the agent's effective account is throttled
+and retries just past `throttled_until`.
+
 ### Soft-avoid tier — proactive preference before the wall
 
 `auth.proactive_failover_pct` (optional, e.g. `95`) adds a third
@@ -258,6 +298,7 @@ Recovery procedure: see
 | `get-credentials`     | any agent / consumer (own account only) |
 | `list-state`          | any agent / consumer                    |
 | `mark-exhausted`      | any agent / consumer (own account only) |
+| `mark-throttled`      | any agent / consumer (own account only) |
 | `set-active`          | admin                                   |
 | `refresh-account`     | admin                                   |
 | `add-account`         | admin                                   |

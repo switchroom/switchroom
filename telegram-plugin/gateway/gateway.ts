@@ -317,7 +317,14 @@ import { recordOperatorEvent } from '../operator-events-history.js'
 import {
   formatModelUnavailableCard,
   resolveModelUnavailableFromOperatorEvent,
+  type ModelUnavailableDetection,
 } from '../model-unavailable.js'
+import {
+  decideThrottleTier,
+  isAccountScopedThrottle,
+  throttleRetryInPlaceMaxMs,
+} from '../throttle-tier.js'
+import { createThrottleTierRunner } from './throttle-tier-wiring.js'
 import { runFleetAutoFallback, renderFallbackFailureNotice, evaluateFallbackFailureNotice, evaluateAllBlockedNotice, type FallbackFailureNoticeState, type FallbackAllBlockedNoticeState } from '../auto-fallback-fleet.js'
 import { startRestartWatchdog } from './restart-watchdog.js'
 import { validateStringArray } from './access-validator.js'
@@ -7681,6 +7688,72 @@ const inboundCoalescer = createInboundCoalescer<CoalescePayload>({
 function emitGatewayOperatorEvent(event: OperatorEvent): void {
   const { agent, kind } = event
 
+  // ── 429 throttle tier (operator spec: "retry in place under 5 min, else
+  // mark + failover, honest reset messaging") ────────────────────────────
+  // A terminal TRANSIENT ACCOUNT-scoped 429 — kind `rate-limited` carrying
+  // wording that affirms the account's own rate limit ("would exceed your
+  // account's rate limit") — is decided BEFORE the per-kind cooldown gate:
+  // every hit must reach the broker's mark-throttled escalation counter, and
+  // the >threshold failover ACTION must fire, even when the user-facing card
+  // is cooldown-suppressed (a calm 529 card two minutes earlier arms that
+  // cooldown). Server-side transients (529 / "server is temporarily…") fall
+  // through to the existing calm rate-limited card unchanged — an
+  // account-scoped throttle would be the wrong action for a server-wide
+  // condition.
+  let throttleEscalation: ModelUnavailableDetection | null = null
+  let escalationFired = false
+  if (kind === 'rate-limited' && isAccountScopedThrottle(event.detail)) {
+    const throttleDecision = decideThrottleTier({
+      detail: event.detail,
+      now: Date.now(),
+      thresholdMs: throttleRetryInPlaceMaxMs(),
+    })
+    if (throttleDecision.action === 'throttle') {
+      // Reset is near (≤ threshold) or unparseable (60s default): DO NOT
+      // fail over. Record throttled_until broker-side, post ONE lightweight
+      // notice (per-account + fleet-wide dedup), nudge a retry after the
+      // reset. The runner owns the sequencing (throttle-tier-wiring.ts).
+      process.stderr.write(
+        `telegram gateway: throttle-tier staying-put agent=${agent} ` +
+          `until=${new Date(throttleDecision.throttledUntilMs).toISOString()} ` +
+          `parsedReset=${throttleDecision.resetParsed}\n`,
+      )
+      try {
+        recordOperatorEvent(event)
+      } catch { /* history is best-effort */ }
+      void throttleTierRunner.fire(
+        agent,
+        throttleDecision.throttledUntilMs,
+        throttleDecision.resetParsed,
+      )
+      return
+    }
+    if (throttleDecision.action === 'failover') {
+      // Reset beyond the retry-in-place threshold: the account is benched
+      // until then anyway, so escalate to the standard mark-exhausted +
+      // fleet-failover machinery — honest 'rate_limited' wording, parsed
+      // reset as the mark expiry. The ACTION fires HERE, before the
+      // per-kind card cooldown below can swallow it (the fleetFallbackGate
+      // provides the action-level dedup); only the card stays
+      // cooldown-bounded. The 'rate-limit' trigger tells the dispatcher to
+      // trust this terminal parsed-reset signal over the utilization probe
+      // (a transient 429 negates the usage-limit reading, so utilization
+      // typically looks healthy — the idempotency guard would self-cancel
+      // the swap).
+      const resetAt = new Date(throttleDecision.resetAtMs)
+      throttleEscalation = { kind: 'rate_limited', resetAt, raw: event.detail }
+      if (wouldFireFleetAutoFallback()) {
+        escalationFired = true
+        void fireFleetAutoFallback(
+          agent,
+          resolveExhaustUntil(resetAt.getTime()),
+          resetAt,
+          'rate-limit',
+        )
+      }
+    }
+  }
+
   if (!shouldEmitOperatorEvent(agent, kind)) {
     process.stderr.write(
       `telegram gateway: operator-event suppressed (cooldown) agent=${agent} kind=${kind}\n`,
@@ -7709,7 +7782,10 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
   //     by the upstream classifier
   //   - detail string contains one of the model-unavailable text patterns
   //     (covers raw stderr that slipped past structured classification)
-  const modelUnavailable = resolveModelUnavailableFromOperatorEvent(event)
+  // Throttle-tier escalation (long-reset transient 429) takes precedence:
+  // resolveModelUnavailableFromOperatorEvent deliberately returns null for a
+  // bare rate-limited event, but this one is auto-fallback-eligible.
+  const modelUnavailable = throttleEscalation ?? resolveModelUnavailableFromOperatorEvent(event)
   let renderedText: string
   let renderedKeyboard: ReturnType<typeof renderOperatorEvent>['keyboard'] | undefined
   // #3031 PR 3 — when the card promises an in-flight auto-failover, record
@@ -7731,8 +7807,18 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
     // it just produces a self-cancelling "probed healthy / Stale event?"
     // loop on every 529. Overload is handled by Claude Code's own
     // internal retry, not by switching accounts.
-    const isAutoKind = modelUnavailable.kind === 'quota_exhausted'
-    const willActuallyFire = isAutoKind && wouldFireFleetAutoFallback()
+    // 'rate_limited' is the throttle-tier escalation (transient 429 whose
+    // reset exceeds the retry-in-place threshold) — same failover mechanics
+    // as a quota wall, honest wording on the card. Its fire already happened
+    // ABOVE the cooldown gate (escalationFired) so the action can't be
+    // swallowed by the per-kind card cooldown; the card here only reports it.
+    const isAutoKind =
+      modelUnavailable.kind === 'quota_exhausted' ||
+      modelUnavailable.kind === 'rate_limited'
+    const willActuallyFire =
+      throttleEscalation != null
+        ? escalationFired
+        : isAutoKind && wouldFireFleetAutoFallback()
     process.stderr.write(
       `telegram gateway: operator-event suppressing-raw-stderr-for-model-unavailable agent=${agent} kind=${kind} detected=${modelUnavailable.kind} autoKind=${isAutoKind} willFire=${willActuallyFire}\n`,
     )
@@ -7756,9 +7842,14 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
     // Pre-fix this called fireFleetAutoFallback(agent) with no until, so a
     // weekly wall that surfaced as a 429 got markExhausted's ~5h default and
     // the broker re-mirrored the still-walled account onto the fleet after 5h.
-    if (willActuallyFire) {
+    // Throttle-tier escalations (throttleEscalation != null) already fired
+    // above the cooldown gate — don't double-fire here.
+    if (willActuallyFire && throttleEscalation == null) {
       const untilMs = resolveExhaustUntil(modelUnavailable.resetAt?.getTime())
-      void fireFleetAutoFallback(agent, untilMs)
+      // Thread the RAW parsed reset (distinct from the floor-applied untilMs)
+      // so the fallback announcement can name it even when the live probe of
+      // the old account fails — honest reset messaging on the enriched card.
+      void fireFleetAutoFallback(agent, untilMs, modelUnavailable.resetAt)
     }
   } else {
     try {
@@ -11396,7 +11487,13 @@ const ipcServer: IpcServer = createIpcServer({
         (msg.resetAt == null ? ' (reset unparsed → +7d default)' : '') +
         ' — triggering fleet auto-fallback\n',
     )
-    void fireFleetAutoFallback(msg.agentName, untilMs)
+    void fireFleetAutoFallback(
+      msg.agentName,
+      untilMs,
+      // Enriched announcement: the sidecar-parsed reset (when present) keeps
+      // the recovery line honest even when the old account's probe fails.
+      msg.resetAt != null ? new Date(msg.resetAt) : undefined,
+    )
   },
 
   // Issue #2971 — read-only wedge-watchdog probe: is there a live pending
@@ -23261,9 +23358,14 @@ function wouldFireFleetAutoFallback(): boolean {
  * so the user sees the outcome inline with the original "Model
  * unavailable" card.
  */
-async function fireFleetAutoFallback(triggerAgent: string, untilMs?: number): Promise<void> {
+async function fireFleetAutoFallback(
+  triggerAgent: string,
+  untilMs?: number,
+  parsedResetAt?: Date,
+  trigger?: 'rate-limit',
+): Promise<void> {
   return fleetFallbackGate.fire(
-    () => doFireFleetAutoFallback(triggerAgent, untilMs),
+    () => doFireFleetAutoFallback(triggerAgent, untilMs, parsedResetAt, trigger),
     (err) => {
       process.stderr.write(
         `telegram gateway: [fleet-fallback] error agent=${triggerAgent}: ${(err as Error)?.message ?? err}\n`,
@@ -23271,6 +23373,45 @@ async function fireFleetAutoFallback(triggerAgent: string, untilMs?: number): Pr
     },
   )
 }
+
+// ─── 429 throttle tier — side-effect wiring ─────────────────────────────────
+// Decision + notice text live in throttle-tier.ts (pure); the SEQUENCING
+// (broker mark → fleet-deduped notice → jittered retry nudge with the
+// live-turn safety guards) lives in throttle-tier-wiring.ts so it is
+// unit-testable with injected deps. This block only binds the real gateway
+// dependencies.
+const throttleTierRunner = createThrottleTierRunner({
+  agentName: process.env.SWITCHROOM_AGENT_NAME ?? '',
+  getBrokerClient: () =>
+    getAuthBrokerClient(process.env.SWITCHROOM_AGENT_NAME ?? ''),
+  listNoticeChats: () => loadAccess().allowFrom,
+  sendNotice: (chat_id, markdown) => {
+    // Status notice, not the user's answer — silence the ping (same posture
+    // as the fleet-fallback announcement).
+    void swallowingApiCall(
+      // allow-raw-bot-api: wrapped in swallowingApiCall (retry policy)
+      () => bot.api.sendRichMessage(chat_id, richMessage(markdown), { disable_notification: true }),
+      { chat_id: String(chat_id), verb: 'throttle-tier:notify' },
+    )
+  },
+  resumeDecide: (ts) => fleetFallbackResumeGate.decide(ts),
+  newestActiveTurnStartedAtMs,
+  turnInFlight: () => turnInFlightForGate(),
+  deferRestartToTurnComplete: (agentName, reason) => {
+    // Same lever the schedule_restart IPC uses: the restart drains at the
+    // turn-complete gate (never SIGTERM-now under a live turn). Note the
+    // pending-restart drain cap (PENDING_RESTART_DRAIN_CAP_MS) still bounds
+    // a never-idling session — deliberate, matching scheduled restarts.
+    process.stderr.write(
+      `telegram gateway: [throttle-tier] restart deferred to turn-complete agent=${agentName} reason=${reason}\n`,
+    )
+    pendingRestarts.set(agentName, Date.now())
+  },
+  restartNow: (agentName, reason) => {
+    triggerSelfRestart(agentName, reason)
+  },
+  log: (m) => process.stderr.write(`telegram gateway: ${m}\n`),
+})
 
 /**
  * Broadcast a fleet-fallback FAILURE notice to every authorized chat.
@@ -23333,7 +23474,12 @@ function broadcastFleetFallbackFailure(triggerAgent: string, reason: string): vo
  *  user-visible announcement was broadcast). False on no-op /
  *  error / idempotent-skip — caller uses this to decide whether to
  *  arm the post-fire suppression window. */
-async function doFireFleetAutoFallback(triggerAgent: string, untilMs?: number): Promise<boolean> {
+async function doFireFleetAutoFallback(
+  triggerAgent: string,
+  untilMs?: number,
+  parsedResetAt?: Date,
+  trigger?: 'rate-limit',
+): Promise<boolean> {
   try {
     const client = await getAuthBrokerClient(triggerAgent)
     if (!client) {
@@ -23382,6 +23528,16 @@ async function doFireFleetAutoFallback(triggerAgent: string, untilMs?: number): 
       },
       triggerAgent,
       tz,
+      // Enriched card (429 throttle tier): the RAW reset parsed from the
+      // error prose, so the announcement names when the old account frees
+      // even when its live probe returned nothing.
+      parsedResetAt,
+      // Throttle-tier escalation: a terminal transient 429 with a long
+      // parsed reset NEGATES the usage-limit reading, so the old account's
+      // utilization probe typically classifies healthy — the idempotency
+      // guard would self-cancel the swap ("probed healthy / Stale event?").
+      // Trust the terminal parsed-reset signal over the utilization probe.
+      rateLimitTrigger: trigger === 'rate-limit',
     })
     process.stderr.write(
       `telegram gateway: [fleet-fallback] outcome=${outcome.kind} agent=${triggerAgent}` +
