@@ -3516,9 +3516,9 @@ describe("scaffoldAgent with global defaults cascade", () => {
     expect(startSh).toContain('--plugin-dir "/opt/switchroom/security-plugin"');
   });
 
-  it("channels.telegram.format and rate_limit_ms become env vars in start.sh", () => {
+  it("channels.telegram.format and stream_throttle_ms become env vars in start.sh", () => {
     const agentConfig = makeAgentConfig({
-      channels: { telegram: { format: "markdownv2", rate_limit_ms: 500 } },
+      channels: { telegram: { format: "markdownv2", stream_throttle_ms: 500 } },
     });
     const result = scaffoldAgent(
       "chan-env-agent",
@@ -3529,7 +3529,7 @@ describe("scaffoldAgent with global defaults cascade", () => {
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
 
     expect(startSh).toContain("export SWITCHROOM_TG_FORMAT='markdownv2'");
-    expect(startSh).toContain("export SWITCHROOM_TG_RATE_LIMIT_MS='500'");
+    expect(startSh).toContain("export SWITCHROOM_TG_STREAM_THROTTLE_MS='500'");
   });
 
   it("user env entry wins over channel-derived env default on key conflict", () => {

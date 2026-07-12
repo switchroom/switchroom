@@ -927,11 +927,9 @@ export const SessionContinuitySchema = z
  *    plugin (basic send/receive only).
  *  - format: default reply format for the channel. Passed to the
  *    plugin via env var. "html" (default) auto-converts markdown.
- *  - rate_limit_ms: minimum delay between outgoing messages.
  *
- * format and rate_limit_ms are pass-through — the plugin reads them
- * from env vars at startup but may not act on every field yet. We
- * define them in the schema so users can start setting them now.
+ * format is pass-through — the plugin reads it from an env var at
+ * startup.
  */
 
 /**
@@ -990,10 +988,13 @@ export const TelegramChannelSchema = z
       .enum(["html", "markdownv2", "text"])
       .optional()
       .describe("Default reply format passed to the plugin"),
-    rate_limit_ms: z
-      .number()
-      .optional()
-      .describe("Minimum delay between outgoing messages in ms"),
+    // rate_limit_ms removed in #3161 — it was documented and scaffold-
+    // exported (SWITCHROOM_TG_RATE_LIMIT_MS) but read by NOTHING; the
+    // send gate (telegram-plugin/send-gate.ts, on by default since
+    // #3153) is the real outbound throttle. Existing YAML files with a
+    // stale rate_limit_ms key are silently ignored by Zod's default
+    // strip mode — intentional, same pattern as the progress_card
+    // removal (#1122 PR3): operators don't need to clean their YAML.
     stream_mode: z
       .enum(["pty", "checklist"])
       .optional()
