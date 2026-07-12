@@ -84,7 +84,11 @@ export function createMockBot(startMessageId = 500): MockBot {
   const api: MockBotApi = {
     sendMessage: vi.fn(async () => ({ message_id: state.nextMessageId++ })),
     sendRichMessage: vi.fn(async () => ({ message_id: state.nextMessageId++ })),
-    editMessageText: vi.fn(async () => undefined),
+    // Faithful to grammy: editMessageText resolves `Message | true`, NEVER
+    // undefined. An `undefined` from the production retry stack means the
+    // send gate shed/skipped the call (#3110) — stream-controller treats it
+    // as not-landed — so the mock default must not be undefined.
+    editMessageText: vi.fn(async () => true as const),
     deleteMessage: vi.fn(async () => true as const),
     setMessageReaction: vi.fn(async () => true as const),
     editMessageReplyMarkup: vi.fn(async () => undefined),
@@ -122,7 +126,8 @@ export function installBotResetHook(bot: MockBot): void {
     bot.api.sendRichMessage.mockImplementation(async () => ({
       message_id: bot.nextMessageId++,
     }))
-    bot.api.editMessageText.mockImplementation(async () => undefined)
+    // Faithful to grammy: `Message | true`, never undefined (see above).
+    bot.api.editMessageText.mockImplementation(async () => true as const)
     bot.api.deleteMessage.mockImplementation(async () => true as const)
     bot.api.setMessageReaction.mockImplementation(async () => true as const)
     bot.api.editMessageReplyMarkup.mockImplementation(async () => undefined)

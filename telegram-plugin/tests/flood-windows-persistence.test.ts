@@ -14,7 +14,7 @@ import {
   FLOOD_STATE_MODE,
   FLOOD_WINDOWS_CORRUPT_SUPPRESS_MS,
 } from '../flood-circuit-breaker.js'
-import { createSendGate, type Clock } from '../send-gate.js'
+import { createSendGate, SEND_GATE_SHED, type Clock } from '../send-gate.js'
 
 /**
  * #3084 PR 2 — restart-proof SCOPED flood windows (part3-design §7). Verifies
@@ -119,7 +119,7 @@ describe('#3084 scoped flood-window persistence', () => {
       chat_id: '7',
       priorityClass: 'cosmetic',
     })
-    expect(res).toBeUndefined()
+    expect(res).toBe(SEND_GATE_SHED) // shed sentinel (#3110 F1)
     expect(gate2.stats().global.shed).toBe(1)
 
     // And a critical into the still-long window fails fast — restart did not

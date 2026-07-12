@@ -119,6 +119,32 @@ export type PriorityClass = 'critical' | 'useful' | 'cosmetic'
 export const UNTAGGED_SEND_CLASS: PriorityClass = 'critical'
 
 /**
+ * Distinguishable resolution value for a SHED call (#3110 review F1).
+ *
+ * `undefined` was overloaded three ways at the robustApiCall seam: a gate
+ * SHED (cosmetic call dropped under pressure — did NOT land), a gate no-op
+ * drop (identical payload already on screen — benign), and the retry
+ * policy's swallowed benign 400s ("message is not modified" — also benign).
+ * A caller that needs to know "did my edit land?" (the draft stream's
+ * shed-honesty handling in stream-controller.ts) could not tell these
+ * apart, and treating every `undefined` as a shed froze multi-piece
+ * streams on perfectly healthy chats.
+ *
+ * A shed now resolves THIS sentinel instead. `Symbol.for` keys it in the
+ * global symbol registry so duplicated module instances (server + gateway
+ * builds) agree on identity. The no-op drop and coalesced-revert drop keep
+ * resolving `undefined` — for those the payload IS on screen. Callers that
+ * ignore the result (reactions, typing, fire-and-forget card edits) are
+ * unaffected either way.
+ */
+export const SEND_GATE_SHED: unique symbol = Symbol.for('switchroom.send-gate.shed')
+
+/** True when a gate result is the {@link SEND_GATE_SHED} sentinel. */
+export function isSendGateShed(value: unknown): value is typeof SEND_GATE_SHED {
+  return value === SEND_GATE_SHED
+}
+
+/**
  * Extra metadata a call site can attach so the gate can key the right buckets.
  * All fields optional — a call with none still passes the global bucket. These
  * mirror (a superset of) `RetryCallOpts` so the gate can wrap `robustApiCall`
@@ -159,8 +185,9 @@ export interface BucketCounters {
   dropped: number
   /**
    * Cosmetic calls shed under pressure — no token free OR a flood window open
-   * (part3-design §2). A shed resolves as `undefined`; the next send carries
-   * full state.
+   * (part3-design §2). A shed resolves the SEND_GATE_SHED sentinel (F1 —
+   * distinguishable from a benign no-op drop's `undefined`); the next send
+   * carries full state.
    */
   shed: number
   /** Useful calls dropped because they exceeded their queue TTL (part3-design §2). */
@@ -913,7 +940,9 @@ export function createSendGate(config: SendGateConfig): SendGate {
       const msgWait = state.suppressedUntilMs > now ? state.suppressedUntilMs - now : 0
       if (wait > 0 || msgWait > 0) {
         counters.shed++
-        return Promise.resolve(undefined as unknown as T)
+        // Distinguishable from the no-op drop below (undefined): a shed did
+        // NOT land, and edit-driving callers must be able to tell (F1).
+        return Promise.resolve(SEND_GATE_SHED as unknown as T)
       }
     }
 
@@ -991,7 +1020,8 @@ export function createSendGate(config: SendGateConfig): SendGate {
     const outcome = await admitPriority(bucketsFor(opts), priority)
     if (outcome.result === 'shed') {
       counters.shed++
-      return undefined as unknown as T
+      // See SEND_GATE_SHED: distinguishable "did not land" resolution (F1).
+      return SEND_GATE_SHED as unknown as T
     }
     if (outcome.result === 'expired') {
       counters.expired++
