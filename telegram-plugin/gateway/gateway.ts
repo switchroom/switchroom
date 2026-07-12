@@ -327,7 +327,7 @@ import {
 } from '../throttle-tier.js'
 import { createThrottleTierRunner } from './throttle-tier-wiring.js'
 import { parseLitellmNoticeWindowMs } from '../litellm-local-notice.js'
-import { createLitellmLocalNoticeRunner } from './litellm-local-notice-wiring.js'
+import { createLitellmLocalNoticeRunner, decideRateLimitedSurface } from './litellm-local-notice-wiring.js'
 import { runFleetAutoFallback, renderFallbackFailureNotice, evaluateFallbackFailureNotice, evaluateAllBlockedNotice, type FallbackFailureNoticeState, type FallbackAllBlockedNoticeState } from '../auto-fallback-fleet.js'
 import { startRestartWatchdog } from './restart-watchdog.js'
 import { validateStringArray } from './access-validator.js'
@@ -7721,11 +7721,14 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
   // account-scoped 429s with fleet TPM even when the card is suppressed.
   let throttleEscalation: ModelUnavailableDetection | null = null
   let escalationFired = false
+  // True when decideRateLimitedSurface already consulted (and armed) the
+  // shared per-kind card cooldown for this event — the gate below must not
+  // re-consult it, or the arm from the first consult would self-suppress.
+  let rateLimitedCooldownConsulted = false
   const rateLimit429Classification =
     kind === 'rate-limited' ? classify429Detail(event.detail) : null
   if (rateLimit429Classification != null && rateLimit429Classification !== 'account-scoped') {
-    // litellm-local / generic-transient: the existing calm rate-limited
-    // path (fall through to renderOperatorEvent below). NO broker
+    // litellm-local / generic-transient: the calm path. NO broker
     // mark-throttled, NO throttle-tier runner, NO failover — for a
     // proxy-local cap trip those would bench an account that was never
     // touched.
@@ -7738,7 +7741,18 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
         now: Date.now(),
       }),
     )
-    if (rateLimit429Classification === 'litellm-local') {
+    // Surface decision — extracted (decideRateLimitedSurface,
+    // litellm-local-notice-wiring.ts) so the ordering contract with the
+    // shared per-kind card cooldown is pinnable by tests: litellm-local
+    // resolves BEFORE the gate (never arms `${agent}:rate-limited`, never
+    // suppressed by a cooldown a recent 529/generic card armed);
+    // generic-transient consults the gate exactly once HERE.
+    const surface = decideRateLimitedSurface({
+      classification: rateLimit429Classification,
+      agent,
+      shouldEmitCard: (a) => shouldEmitOperatorEvent(a, 'rate-limited'),
+    })
+    if (surface === 'litellm-local-notice') {
       process.stderr.write(
         `telegram gateway: 429 classified litellm-proxy-local agent=${agent} — ` +
           `calm path, no account attribution, no failover\n`,
@@ -7748,14 +7762,28 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
       // token limiter (LiteLLM tpm_limit/rpm_limit) instead of a card that
       // reads like an Anthropic account problem. Classification, quota-ledger,
       // and failover behavior are untouched (nothing fired above on this
-      // branch). Record into history first so /status still sees the event
-      // even when the notice itself is cooldown-suppressed.
-      try {
-        recordOperatorEvent(event)
-      } catch { /* history is best-effort */ }
-      litellmLocalNoticeRunner.onRateLimited('litellm-local', agent)
+      // branch). Record into history ONLY when a notice actually posted — a
+      // suppressed low-stakes proxy throttle must not overwrite a more
+      // important most-recent event (e.g. credentials-expired) in the
+      // /status enrichment (operator-events-history keeps the most recent
+      // event per agent).
+      const outcome = litellmLocalNoticeRunner.onRateLimited('litellm-local', agent)
+      if (outcome === 'sent') {
+        try {
+          recordOperatorEvent(event)
+        } catch { /* history is best-effort */ }
+      }
       return
     }
+    if (surface === 'cooldown-suppressed') {
+      process.stderr.write(
+        `telegram gateway: operator-event suppressed (cooldown) agent=${agent} kind=${kind}\n`,
+      )
+      return
+    }
+    // 'generic-card' — the gate passed (and armed) above; fall through to
+    // the existing calm rate-limited card without re-consulting it.
+    rateLimitedCooldownConsulted = true
   }
   if (rateLimit429Classification === 'account-scoped') {
     const throttleDecision = decideThrottleTier({
@@ -7820,7 +7848,7 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
     }
   }
 
-  if (!shouldEmitOperatorEvent(agent, kind)) {
+  if (!rateLimitedCooldownConsulted && !shouldEmitOperatorEvent(agent, kind)) {
     process.stderr.write(
       `telegram gateway: operator-event suppressed (cooldown) agent=${agent} kind=${kind}\n`,
     )
@@ -23489,11 +23517,28 @@ const throttleTierRunner = createThrottleTierRunner({
 const litellmLocalNoticeRunner = createLitellmLocalNoticeRunner({
   listNoticeChats: () => loadAccess().allowFrom,
   sendNotice: (chat_id, markdown) => {
+    // Topic routing — this notice REPLACES the generic operator-event card
+    // for the litellm-local classification, so it must land where that card
+    // would have: supergroup-mode agents route system notifications into the
+    // alerts/admin alias topic ('compact-watchdog' kind, same resolution as
+    // the emitGatewayOperatorEvent broadcast loop), while DM recipients get
+    // a thread-less send (topicForRecipient guards the #2096 "message
+    // thread not found" misrouting class).
+    const noticeTopic = resolveAgentOutboundTopic({ kind: 'compact-watchdog' })
+    const noticeSupergroup = resolveAgentSupergroupChatId()
+    const noticeThread = topicForRecipient({
+      recipientChatId: chat_id,
+      resolvedTopic: noticeTopic,
+      supergroupChatId: noticeSupergroup,
+    })
     // Status notice, not the user's answer — silence the ping (same posture
     // as the throttle-tier / fleet-fallback announcements).
     void swallowingApiCall(
       // allow-raw-bot-api: wrapped in swallowingApiCall (retry policy)
-      () => bot.api.sendRichMessage(chat_id, richMessage(markdown), { disable_notification: true }),
+      () => bot.api.sendRichMessage(chat_id, richMessage(markdown), {
+        disable_notification: true,
+        ...(noticeThread != null ? { message_thread_id: noticeThread } : {}),
+      }),
       { chat_id: String(chat_id), verb: 'litellm-local-notice:notify' },
     )
   },

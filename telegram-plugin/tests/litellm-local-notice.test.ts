@@ -14,14 +14,18 @@
  *   - copy names the fleet limiter (LiteLLM tpm_limit/rpm_limit), explicitly
  *     NOT an Anthropic account limit, turn retries, no action needed
  *   - window is operator-tunable with a validated 15-min default
+ *   - the window is armed / the metric emitted / "posted" logged only when a
+ *     send was actually ISSUED (empty allowFrom or all-throwing sends retry)
+ *   - the ordering contract with the shared per-kind card cooldown
+ *     (decideRateLimitedSurface at the REAL shouldEmitOperatorEvent seam):
+ *     litellm-local neither arms nor is suppressed by `${agent}:rate-limited`
  *
  * No real Date.now in the pure module — `now` is a parameter throughout
  * (same injected-clock convention as throttle-tier.test.ts).
  */
 
-import { describe, it, expect } from 'vitest'
+import { beforeEach, describe, it, expect } from 'vitest'
 import {
-  buildLitellmLocalNoticeMetric,
   evaluateLitellmLocalNotice,
   initialLitellmLocalNoticeState,
   isLitellmLocalNoticeEligible,
@@ -30,8 +34,12 @@ import {
   renderLitellmLocalNotice,
   type LitellmLocalNoticeState,
 } from '../litellm-local-notice.js'
-import { createLitellmLocalNoticeRunner } from '../gateway/litellm-local-notice-wiring.js'
+import {
+  createLitellmLocalNoticeRunner,
+  decideRateLimitedSurface,
+} from '../gateway/litellm-local-notice-wiring.js'
 import { classify429Detail } from '../throttle-tier.js'
+import { resetAllCooldowns, shouldEmitOperatorEvent } from '../operator-events.js'
 
 const NOW = Date.UTC(2026, 6, 12, 8, 0, 0) // 2026-07-12T08:00:00Z
 const WINDOW = LITELLM_LOCAL_NOTICE_WINDOW_MS_DEFAULT
@@ -167,21 +175,6 @@ describe('renderLitellmLocalNotice — copy contract', () => {
   })
 })
 
-// ─── Metric builder ──────────────────────────────────────────────────────────
-
-describe('buildLitellmLocalNoticeMetric', () => {
-  it('builds the litellm_local_429_notice payload shape', () => {
-    expect(
-      buildLitellmLocalNoticeMetric({ agent: 'clerk', suppressedCount: 7, windowMs: WINDOW }),
-    ).toEqual({
-      kind: 'litellm_local_429_notice',
-      agent: 'clerk',
-      suppressed_count: 7,
-      window_ms: WINDOW,
-    })
-  })
-})
-
 // ─── Classification guard ────────────────────────────────────────────────────
 
 describe('isLitellmLocalNoticeEligible — only litellm-local qualifies', () => {
@@ -200,6 +193,70 @@ describe('isLitellmLocalNoticeEligible — only litellm-local qualifies', () => 
   })
 })
 
+// ─── Surface decision — the shared card-cooldown seam ────────────────────────
+
+describe('decideRateLimitedSurface — ordering contract with shouldEmitOperatorEvent', () => {
+  // These run against the REAL shared cooldown gate (operator-events.ts), so
+  // they pin the gateway behavior change: litellm-local resolves before the
+  // gate — it neither ARMS `${agent}:rate-limited` nor is SUPPRESSED by it.
+  beforeEach(() => {
+    resetAllCooldowns()
+  })
+
+  const realGate = (a: string) => shouldEmitOperatorEvent(a, 'rate-limited')
+
+  it('litellm-local does NOT arm the shared rate-limited cooldown', () => {
+    expect(
+      decideRateLimitedSurface({
+        classification: 'litellm-local',
+        agent: 'seam-a',
+        shouldEmitCard: realGate,
+      }),
+    ).toBe('litellm-local-notice')
+    // If litellm-local had consulted (and armed) the gate, this immediate
+    // generic-transient would read 'cooldown-suppressed'. It must get its card.
+    expect(
+      decideRateLimitedSurface({
+        classification: 'generic-transient',
+        agent: 'seam-a',
+        shouldEmitCard: realGate,
+      }),
+    ).toBe('generic-card')
+  })
+
+  it('litellm-local is NOT suppressed by a cooldown a recent generic/529 card armed', () => {
+    // A generic transient (e.g. a 529 card) arms the shared cooldown…
+    expect(shouldEmitOperatorEvent('seam-b', 'rate-limited')).toBe(true)
+    expect(shouldEmitOperatorEvent('seam-b', 'rate-limited')).toBe(false) // armed
+    // …but the litellm-local notice still resolves (its own debounce governs).
+    expect(
+      decideRateLimitedSurface({
+        classification: 'litellm-local',
+        agent: 'seam-b',
+        shouldEmitCard: realGate,
+      }),
+    ).toBe('litellm-local-notice')
+  })
+
+  it('generic-transient consults (and arms) the gate exactly once per decide', () => {
+    expect(
+      decideRateLimitedSurface({
+        classification: 'generic-transient',
+        agent: 'seam-c',
+        shouldEmitCard: realGate,
+      }),
+    ).toBe('generic-card')
+    // The first decide armed the gate — a burst sibling is suppressed.
+    expect(
+      decideRateLimitedSurface({
+        classification: 'generic-transient',
+        agent: 'seam-c',
+        shouldEmitCard: realGate,
+      }),
+    ).toBe('cooldown-suppressed')
+  })
+})
+
 // ─── Wiring runner ───────────────────────────────────────────────────────────
 
 interface Harness {
@@ -209,6 +266,7 @@ interface Harness {
   logs: string[]
   clock: { now: number }
   window: { ms: number }
+  chats: Array<string | number>
 }
 
 function makeHarness(opts?: { chats?: Array<string | number> }): Harness {
@@ -217,66 +275,66 @@ function makeHarness(opts?: { chats?: Array<string | number> }): Harness {
   const logs: string[] = []
   const clock = { now: NOW }
   const window = { ms: WINDOW }
+  const chats: Array<string | number> = opts?.chats ?? ['111', '222']
   const runner = createLitellmLocalNoticeRunner({
-    listNoticeChats: () => opts?.chats ?? ['111', '222'],
+    listNoticeChats: () => chats,
     sendNotice: (chatId, markdown) => sends.push({ chatId, markdown }),
     windowMs: () => window.ms,
     emitMetric: (ev) => metrics.push(ev),
     log: (m) => logs.push(m),
     now: () => clock.now,
   })
-  return { runner, sends, metrics, logs, clock, window }
+  return { runner, sends, metrics, logs, clock, window, chats }
 }
 
 describe('createLitellmLocalNoticeRunner — side-effect sequencing', () => {
-  it('first litellm-local 429 broadcasts one notice to every authorized chat + one metric', () => {
+  it('first litellm-local 429 broadcasts one notice to every authorized chat + one metric, outcome sent', () => {
     const h = makeHarness()
-    h.runner.onRateLimited('litellm-local', 'clerk')
+    expect(h.runner.onRateLimited('litellm-local', 'clerk')).toBe('sent')
     expect(h.sends.map((s) => s.chatId)).toEqual(['111', '222'])
     expect(h.sends[0].markdown).toContain('Fleet token limiter')
+    // Full metric object — also pins buildLitellmLocalNoticeMetric's shape.
     expect(h.metrics).toEqual([
       { kind: 'litellm_local_429_notice', agent: 'clerk', suppressed_count: 0, window_ms: WINDOW },
     ])
   })
 
-  it('suppresses inside the window (no send, no metric), then reports the count after expiry', () => {
+  it('suppresses inside the window; elapsed time alone never sends; the next event reports the count', () => {
     const h = makeHarness()
-    h.runner.onRateLimited('litellm-local', 'clerk')
+    expect(h.runner.onRateLimited('litellm-local', 'clerk')).toBe('sent')
     h.clock.now = NOW + 60_000
-    h.runner.onRateLimited('litellm-local', 'clerk')
+    expect(h.runner.onRateLimited('litellm-local', 'clerk')).toBe('suppressed')
     h.clock.now = NOW + 120_000
-    h.runner.onRateLimited('litellm-local', 'clerk')
-    // Two suppressed events: still just the first broadcast.
+    expect(h.runner.onRateLimited('litellm-local', 'clerk')).toBe('suppressed')
+    // Two suppressed events: still just the first broadcast, one metric.
     expect(h.sends).toHaveLength(2) // 2 chats × 1 notice
     expect(h.metrics).toHaveLength(1)
     expect(h.logs.some((l) => l.includes('suppressed (cooldown)'))).toBe(true)
-    // Past the window: one new notice carrying "2 more times".
-    h.clock.now = NOW + WINDOW
-    h.runner.onRateLimited('litellm-local', 'clerk')
+    // A quiet stretch — the window expires, then MULTIPLE further windows
+    // pass with zero throttle events. Notices are evaluate-on-event: nothing
+    // may send or emit on elapsed time alone.
+    h.clock.now = NOW + 10 * WINDOW
+    expect(h.sends).toHaveLength(2)
+    expect(h.metrics).toHaveLength(1)
+    // The next ACTUAL event (long past expiry) posts, carrying the count of
+    // the two silently absorbed throttles.
+    expect(h.runner.onRateLimited('litellm-local', 'clerk')).toBe('sent')
     expect(h.sends).toHaveLength(4)
     expect(h.sends[2].markdown).toContain('Throttled 2 more times since the last notice.')
     expect(h.metrics[1]).toMatchObject({ suppressed_count: 2 })
   })
 
-  it('never fires for non-litellm-local classifications', () => {
+  it('never fires for non-litellm-local classifications (outcome skipped, state untouched)', () => {
     const h = makeHarness()
-    h.runner.onRateLimited('account-scoped', 'clerk')
-    h.runner.onRateLimited('generic-transient', 'clerk')
+    expect(h.runner.onRateLimited('account-scoped', 'clerk')).toBe('skipped')
+    expect(h.runner.onRateLimited('generic-transient', 'clerk')).toBe('skipped')
     expect(h.sends).toHaveLength(0)
     expect(h.metrics).toHaveLength(0)
     // Non-eligible events must not perturb the debounce state either: the
     // next real litellm-local 429 is still a FIRST notice.
-    h.runner.onRateLimited('litellm-local', 'clerk')
+    expect(h.runner.onRateLimited('litellm-local', 'clerk')).toBe('sent')
     expect(h.sends).toHaveLength(2)
     expect(h.sends[0].markdown).not.toContain('since the last notice')
-  })
-
-  it('a quiet agent posts nothing (notices are evaluate-on-event, no timers)', () => {
-    const h = makeHarness()
-    // Time passes with zero throttle events — nothing is ever sent.
-    h.clock.now = NOW + 10 * WINDOW
-    expect(h.sends).toHaveLength(0)
-    expect(h.metrics).toHaveLength(0)
   })
 
   it('re-reads the tunable window per event (operator retune takes effect live)', () => {
@@ -289,7 +347,24 @@ describe('createLitellmLocalNoticeRunner — side-effect sequencing', () => {
     expect(h.metrics[1]).toMatchObject({ window_ms: 5 * 60_000 })
   })
 
-  it('a throwing send never breaks the caller and later events still work', () => {
+  it('empty allowFrom: no metric, no "posted" log, window NOT armed — a later event with chats sends', () => {
+    const h = makeHarness({ chats: [] })
+    expect(h.runner.onRateLimited('litellm-local', 'clerk')).toBe('skipped')
+    expect(h.sends).toHaveLength(0)
+    expect(h.metrics).toHaveLength(0)
+    expect(h.logs.some((l) => l.includes('posted'))).toBe(false)
+    expect(h.logs.some((l) => l.includes('no sends issued'))).toBe(true)
+    // A chat becomes authorized — the very next event delivers even though
+    // it is INSIDE what would have been the window (the window was never
+    // armed for a notice nobody could hear).
+    h.chats.push('111')
+    h.clock.now = NOW + 1_000
+    expect(h.runner.onRateLimited('litellm-local', 'clerk')).toBe('sent')
+    expect(h.sends).toHaveLength(1)
+    expect(h.metrics).toHaveLength(1)
+  })
+
+  it('all-throwing sends: outcome skipped, window not armed, and the caller never sees a throw', () => {
     const sends: string[] = []
     const logs: string[] = []
     const clock = { now: NOW }
@@ -301,15 +376,42 @@ describe('createLitellmLocalNoticeRunner — side-effect sequencing', () => {
         sends.push(markdown)
       },
       windowMs: () => WINDOW,
-      emitMetric: () => {},
+      emitMetric: () => {
+        if (shouldThrow) {
+          throw new Error('metric sink must not be reached when nothing was issued')
+        }
+      },
       log: (m) => logs.push(m),
       now: () => clock.now,
     })
     expect(() => runner.onRateLimited('litellm-local', 'clerk')).not.toThrow()
-    expect(logs.some((l) => l.includes('error') && l.includes('boom'))).toBe(true)
+    expect(runner.inspect().state.lastSentAtMsByAgent['clerk']).toBeUndefined()
+    expect(logs.some((l) => l.includes('send failed') && l.includes('boom'))).toBe(true)
+    expect(logs.some((l) => l.includes('no sends issued'))).toBe(true)
+    // Window was NOT armed by the failed attempt: the immediate next event
+    // (well inside 15 min) retries and delivers.
     shouldThrow = false
-    clock.now = NOW + WINDOW
-    runner.onRateLimited('litellm-local', 'clerk')
+    clock.now = NOW + 1_000
+    expect(runner.onRateLimited('litellm-local', 'clerk')).toBe('sent')
     expect(sends).toHaveLength(1)
+  })
+
+  it('a throwing log sink cannot void the never-throws contract', () => {
+    const runner = createLitellmLocalNoticeRunner({
+      listNoticeChats: () => {
+        throw new Error('chats exploded')
+      },
+      sendNotice: () => {},
+      windowMs: () => WINDOW,
+      emitMetric: () => {},
+      log: () => {
+        throw new Error('stderr sink died')
+      },
+      now: () => NOW,
+    })
+    // listNoticeChats throws → outer catch → deps.log throws too → still no
+    // throw escapes to the operator-event path.
+    expect(() => runner.onRateLimited('litellm-local', 'clerk')).not.toThrow()
+    expect(runner.onRateLimited('litellm-local', 'clerk')).toBe('skipped')
   })
 })
