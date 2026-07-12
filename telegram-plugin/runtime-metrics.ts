@@ -164,6 +164,33 @@ export type RuntimeMetricEvent =
       agent: string
       prompt_key: string
     }
+  /**
+   * Every terminal rate-limit-family operator event (429 burst / 529
+   * overload), classified by origin BEFORE the gateway acts on it — fires
+   * even when the user-facing card is cooldown-suppressed, so the count is
+   * honest. `classification` says where the limit lives (see
+   * `RateLimit429Classification` in throttle-tier.ts): `account-scoped` =
+   * Anthropic throttled the account (throttle tier ran), `litellm-local` =
+   * the LiteLLM proxy's own tpm/rpm/router limiter tripped (calm path, no
+   * account attribution), `generic-transient` = other server-side 429/529
+   * wording. `action` is what the gateway did (throttle / failover / calm).
+   * Correlating `account-scoped` fires against fleet token throughput is
+   * the operator's evidence base for setting LiteLLM `tpm_limit` caps; the
+   * `litellm-local` count then shows those caps actually absorbing load.
+   * Limit/reset fields are best-effort parses of the error body (null when
+   * absent).
+   */
+  | {
+      kind: 'rate_limit_429_classified'
+      agent: string
+      classification: 'account-scoped' | 'litellm-local' | 'generic-transient'
+      action: 'throttle' | 'failover' | 'calm'
+      reset_at_ms: number | null
+      reset_in_ms: number | null
+      limit_type: string | null
+      limit: number | null
+      current_usage: number | null
+    }
 
 /**
  * The JSONL sink lives under the runtime state dir so it's per-agent

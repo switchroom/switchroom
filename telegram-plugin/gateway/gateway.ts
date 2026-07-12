@@ -320,8 +320,9 @@ import {
   type ModelUnavailableDetection,
 } from '../model-unavailable.js'
 import {
+  build429ClassifiedMetric,
+  classify429Detail,
   decideThrottleTier,
-  isAccountScopedThrottle,
   throttleRetryInPlaceMaxMs,
 } from '../throttle-tier.js'
 import { createThrottleTierRunner } from './throttle-tier-wiring.js'
@@ -7700,14 +7701,59 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
   // through to the existing calm rate-limited card unchanged — an
   // account-scoped throttle would be the wrong action for a server-wide
   // condition.
+  //
+  // Classification is three-way (classify429Detail, throttle-tier.ts):
+  // only `account-scoped` may enter the throttle tier. `litellm-local` —
+  // the LiteLLM proxy's OWN tpm/rpm/router limiter tripping before the
+  // request reached Anthropic — takes the calm path with NO broker mark and
+  // NO failover: the condition is proxy-local and says nothing about the
+  // account. Every rate-limited event ALSO emits one
+  // `rate_limit_429_classified` runtime metric (PostHog + JSONL), fired
+  // here — before the cooldown gate — so operators can correlate
+  // account-scoped 429s with fleet TPM even when the card is suppressed.
   let throttleEscalation: ModelUnavailableDetection | null = null
   let escalationFired = false
-  if (kind === 'rate-limited' && isAccountScopedThrottle(event.detail)) {
+  const rateLimit429Classification =
+    kind === 'rate-limited' ? classify429Detail(event.detail) : null
+  if (rateLimit429Classification != null && rateLimit429Classification !== 'account-scoped') {
+    // litellm-local / generic-transient: the existing calm rate-limited
+    // path (fall through to renderOperatorEvent below). NO broker
+    // mark-throttled, NO throttle-tier runner, NO failover — for a
+    // proxy-local cap trip those would bench an account that was never
+    // touched.
+    emitRuntimeMetric(
+      build429ClassifiedMetric({
+        agent,
+        detail: event.detail,
+        classification: rateLimit429Classification,
+        action: 'calm',
+        now: Date.now(),
+      }),
+    )
+    if (rateLimit429Classification === 'litellm-local') {
+      process.stderr.write(
+        `telegram gateway: 429 classified litellm-proxy-local agent=${agent} — ` +
+          `calm path, no account attribution, no failover\n`,
+      )
+    }
+  }
+  if (rateLimit429Classification === 'account-scoped') {
     const throttleDecision = decideThrottleTier({
       detail: event.detail,
       now: Date.now(),
       thresholdMs: throttleRetryInPlaceMaxMs(),
     })
+    emitRuntimeMetric(
+      build429ClassifiedMetric({
+        agent,
+        detail: event.detail,
+        classification: 'account-scoped',
+        // decideThrottleTier can't return 'none' for account-scoped wording;
+        // map the two live actions onto the metric's vocabulary.
+        action: throttleDecision.action === 'failover' ? 'failover' : 'throttle',
+        now: Date.now(),
+      }),
+    )
     if (throttleDecision.action === 'throttle') {
       // Reset is near (≤ threshold) or unparseable (60s default): DO NOT
       // fail over. Record throttled_until broker-side, post ONE lightweight

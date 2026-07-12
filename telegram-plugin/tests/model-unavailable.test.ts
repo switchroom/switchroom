@@ -14,9 +14,32 @@ import { describe, it, expect } from 'vitest'
 import {
   detectModelUnavailable,
   formatModelUnavailableCard,
+  isLitellmProxyLocal429,
+  parseLitellmLimitDetail,
   resolveModelUnavailableFromOperatorEvent,
   type ModelUnavailableDetection,
 } from '../model-unavailable.js'
+
+// Real LiteLLM proxy-local 429 bodies, verbatim shapes from BerriAI/litellm
+// source (see the provenance comment on `litellmProxyLocal429Signals`).
+const LITELLM_DEPLOYMENT_CAP_BODY =
+  'Deployment over user-defined ratelimit. tpm limit=8000. current usage=8241. ' +
+  'id=abc123def, model_group=claude-fable-5'
+const LITELLM_DEPLOYMENT_CAP_MESSAGE =
+  'litellm.RateLimitError: Model rate limit exceeded. TPM limit=8000, current usage=8241'
+const LITELLM_V2_STRATEGY_BODY =
+  "Deployment over defined rpm limit=60. current usage=61. id=abc123def, " +
+  "model_group=claude-fable-5. Get the model info by calling 'router.get_model_info(id)"
+const LITELLM_ROUTER_COOLDOWN_BODY =
+  'No deployments available for selected model, Try again in 27.5 seconds. ' +
+  "Passed model=claude-fable-5. pre-call-checks=False, cooldown_list=['abc123def']"
+const LITELLM_V3_KEY_LIMIT_BODY =
+  'Rate limit exceeded for api_key: hashed-key-1a2b3c. Limit type: tokens. ' +
+  'Current limit: 8000, Remaining: 0. Limit resets at: 2026-07-12 08:05:00 UTC'
+const LITELLM_V1_PARALLEL_BODY =
+  'LiteLLM Rate Limit Handler for rate limit type = key. Max parallel request limit ' +
+  'reached. current rpm: 61, rpm limit: 60, current tpm: 100, tpm limit: 8000, ' +
+  'current max_parallel_requests: 1, max_parallel_requests: 10'
 
 // ─── detectModelUnavailable ──────────────────────────────────────────────────
 
@@ -114,6 +137,129 @@ describe('detectModelUnavailable — transient upstream 429 vs account quota (#2
     expect(detectModelUnavailable('Reached usage limit for the 5h window')?.kind).toBe(
       'quota_exhausted',
     )
+  })
+})
+
+describe('detectModelUnavailable — LiteLLM-proxy-LOCAL 429s (never quota)', () => {
+  // A 429 raised by LiteLLM's OWN limiter never reached Anthropic — it must
+  // classify to the calm retryable kind, never quota_exhausted (which drives
+  // the scary card + mark-exhausted + fleet failover for an account that was
+  // never touched). Bodies are verbatim LiteLLM source shapes.
+  it.each([
+    ['deployment tpm cap (model_rate_limit_check body)', LITELLM_DEPLOYMENT_CAP_BODY],
+    ['deployment tpm cap (RateLimitError message)', LITELLM_DEPLOYMENT_CAP_MESSAGE],
+    ['usage-based-routing v2 rpm wording', LITELLM_V2_STRATEGY_BODY],
+    ['router cooldown (RouterRateLimitError)', LITELLM_ROUTER_COOLDOWN_BODY],
+    ['virtual-key tpm_limit (parallel_request_limiter_v3)', LITELLM_V3_KEY_LIMIT_BODY],
+    ['v1 parallel-request limiter', LITELLM_V1_PARALLEL_BODY],
+  ])('classifies %s as overload, NOT quota_exhausted', (_name, body) => {
+    const d = detectModelUnavailable(body)
+    expect(d?.kind).toBe('overload')
+  })
+
+  it('a rate-limited operator event with a LiteLLM-local body resolves to NO model-unavailable card', () => {
+    // End-to-end seam the gateway uses: resolveModelUnavailableFromOperatorEvent
+    // returning null is what keeps the calm 🚦 card AND blocks the
+    // auto-fallback branch (fallback only fires when a detection resolves).
+    for (const body of [
+      LITELLM_DEPLOYMENT_CAP_BODY,
+      LITELLM_V3_KEY_LIMIT_BODY,
+      LITELLM_ROUTER_COOLDOWN_BODY,
+    ]) {
+      expect(
+        resolveModelUnavailableFromOperatorEvent({ kind: 'rate-limited', detail: body }),
+      ).toBeNull()
+    }
+  })
+})
+
+describe('isLitellmProxyLocal429 — signal matching', () => {
+  it('matches every canonical LiteLLM limiter wording', () => {
+    for (const body of [
+      LITELLM_DEPLOYMENT_CAP_BODY,
+      LITELLM_DEPLOYMENT_CAP_MESSAGE,
+      LITELLM_V2_STRATEGY_BODY,
+      LITELLM_ROUTER_COOLDOWN_BODY,
+      LITELLM_V3_KEY_LIMIT_BODY,
+      LITELLM_V1_PARALLEL_BODY,
+    ]) {
+      expect(isLitellmProxyLocal429(body)).toBe(true)
+    }
+  })
+
+  it('does NOT match Anthropic account/wall/server wordings', () => {
+    expect(
+      isLitellmProxyLocal429(
+        "This request would exceed your account's rate limit. Please try again later.",
+      ),
+    ).toBe(false)
+    expect(
+      isLitellmProxyLocal429('Server is temporarily limiting requests (not your usage limit)'),
+    ).toBe(false)
+    expect(isLitellmProxyLocal429("You've hit your limit · resets 8:50am")).toBe(false)
+  })
+
+  it('does NOT match the bare litellm.RateLimitError exception-mapping prefix', () => {
+    // The pass-through wraps FORWARDED upstream 429s with the same prefix —
+    // it is not evidence the limit was proxy-local.
+    expect(
+      isLitellmProxyLocal429(
+        "litellm.RateLimitError: RateLimitError: This request would exceed your account's rate limit.",
+      ),
+    ).toBe(false)
+  })
+
+  it('never throws on weird input', () => {
+    expect(isLitellmProxyLocal429('')).toBe(false)
+    expect(isLitellmProxyLocal429(undefined as unknown as string)).toBe(false)
+    expect(isLitellmProxyLocal429(42 as unknown as string)).toBe(false)
+    // Slice guard: signal past the 16KB sample is not scanned.
+    expect(isLitellmProxyLocal429('A'.repeat(100_000) + LITELLM_DEPLOYMENT_CAP_BODY)).toBe(false)
+  })
+})
+
+describe('parseLitellmLimitDetail — instrumentation extraction', () => {
+  const NOW = new Date(Date.UTC(2026, 6, 12, 8, 0, 0))
+
+  it('extracts tpm limit + current usage from the deployment-cap body', () => {
+    const d = parseLitellmLimitDetail(LITELLM_DEPLOYMENT_CAP_BODY, NOW)
+    expect(d.limitType).toBe('tpm')
+    expect(d.limit).toBe(8000)
+    expect(d.currentUsage).toBe(8241)
+    expect(d.resetAtMs).toBeNull()
+  })
+
+  it('extracts rpm limit from the v2 strategy body', () => {
+    const d = parseLitellmLimitDetail(LITELLM_V2_STRATEGY_BODY, NOW)
+    expect(d.limitType).toBe('rpm')
+    expect(d.limit).toBe(60)
+    expect(d.currentUsage).toBe(61)
+  })
+
+  it('extracts the v3 limiter limit type, limit, and "Limit resets at" UTC timestamp', () => {
+    const d = parseLitellmLimitDetail(LITELLM_V3_KEY_LIMIT_BODY, NOW)
+    expect(d.limitType).toBe('tokens')
+    expect(d.limit).toBe(8000)
+    expect(d.resetAtMs).toBe(Date.UTC(2026, 6, 12, 8, 5, 0))
+  })
+
+  it('extracts the router-cooldown "Try again in N seconds" relative reset', () => {
+    const d = parseLitellmLimitDetail(LITELLM_ROUTER_COOLDOWN_BODY, NOW)
+    expect(d.resetAtMs).toBe(NOW.getTime() + 27_500)
+  })
+
+  it('extracts the v1 limiter colon-form rpm limit', () => {
+    const d = parseLitellmLimitDetail(LITELLM_V1_PARALLEL_BODY, NOW)
+    expect(d.limitType).toBe('rpm')
+    expect(d.limit).toBe(60)
+  })
+
+  it('returns all-null on non-LiteLLM prose and never throws on weird input', () => {
+    const empty = { limitType: null, limit: null, currentUsage: null, resetAtMs: null }
+    expect(parseLitellmLimitDetail('Please try again later.', NOW)).toEqual(empty)
+    expect(parseLitellmLimitDetail('', NOW)).toEqual(empty)
+    expect(parseLitellmLimitDetail(undefined as unknown as string, NOW)).toEqual(empty)
+    expect(parseLitellmLimitDetail({} as unknown as string, NOW)).toEqual(empty)
   })
 })
 

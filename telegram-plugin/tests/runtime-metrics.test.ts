@@ -91,6 +91,30 @@ describe('runtime-metrics — JSONL sink', () => {
     expect(typeof parsed.ts).toBe('number')
   })
 
+  it('rate_limit_429_classified carries classification + action + limit/reset detail', () => {
+    emitRuntimeMetric({
+      kind: 'rate_limit_429_classified',
+      agent: 'carrie',
+      classification: 'litellm-local',
+      action: 'calm',
+      reset_at_ms: 1_783_850_700_000,
+      reset_in_ms: 300_000,
+      limit_type: 'tpm',
+      limit: 8000,
+      current_usage: 8241,
+    })
+    const parsed = JSON.parse(readFileSync(metricsPath, 'utf-8').trim())
+    expect(parsed.kind).toBe('rate_limit_429_classified')
+    expect(parsed.agent).toBe('carrie')
+    expect(parsed.classification).toBe('litellm-local')
+    expect(parsed.action).toBe('calm')
+    expect(parsed.reset_in_ms).toBe(300_000)
+    expect(parsed.limit_type).toBe('tpm')
+    expect(parsed.limit).toBe(8000)
+    expect(parsed.current_usage).toBe(8241)
+    expect(typeof parsed.ts).toBe('number')
+  })
+
   it('appends — does not overwrite — across calls', () => {
     for (let i = 0; i < 5; i++) {
       emitRuntimeMetric({
