@@ -2,6 +2,73 @@
 
 ## Unreleased
 
+## v0.18.15 — Rollouts stop storming the operator, and a proxy-local 429 no longer fails over the fleet
+
+The headline: the two sharp edges the v0.18.14 rollout exposed are fixed
+at the root. A hostd rollout no longer leaves agent dotfiles root-owned
+(the permission-card storm that wedged all 12 fleet agents on the
+v0.18.13 → v0.18.14 roll), and a 429 raised by the LiteLLM proxy's own
+rate limiters — which never reached Anthropic and says nothing about the
+account — no longer masquerades as quota exhaustion and triggers a
+pointless fleet failover.
+
+### Scaffold ownership — agent dotfiles no longer land root-owned on rollout (#3169, fixes #3168)
+
+Every hostd rollout runs `agent restart --wait --force` as root; restart
+reconciles first, and reconcile rewrites `.claude/settings.json` and
+`.mcp.json` via tmp+rename atomic writes. The rename replaces the inode,
+silently re-owning the file to root, mode 0600 — unreadable by the
+agent's container uid. Claude Code then loads NO permission allowlist and
+every tool call throws an operator approval card (2026-07-12 incident:
+all 12 agents wedged simultaneously, on every update). The apply path was
+always protected by `alignAgentUid`'s chown sweep; the reconcile path had
+no ownership alignment at all.
+
+- **Deterministic end-of-reconcile ownership sweep**
+  (`src/agents/agent-owned-tree.ts`): whenever `reconcileAgent` runs as
+  root, `chown -h -R <uid>:<uid>` over the agent tree, plus a post-sweep
+  readability assertion that fails the reconcile loudly if any touched
+  file is left unreadable by the agent uid. Future root-owned write sites
+  inside reconcile are covered automatically; a broken sweep fails the
+  rollout instead of silently storming the operator.
+- **Error-path backstop (review F1):** a mid-reconcile throw after the
+  atomic rewrites still runs the sweep best-effort — the pre-fix incident
+  shape can no longer be left on disk by a failed reconcile, and the
+  original error is never masked.
+- **Busybox symlink hardening (review F2+F3):** all chown shell-outs
+  (sweep, `alignAgentUid` plain + sudo, and the printed remediation hint)
+  pass `-h` — busybox `chown -R` without it dereferences symlinks, so a
+  planted `workspace/x -> /etc/shadow` would have been re-owned as root.
+- **Same-class audit:** the atomically-rewritten `.mcp.json` was equally
+  poisoned; first-writes of subagent `.md` files, the resume-mode marker,
+  `.claude-cron/.mcp.json`, and the hindsight plugin recopy landed
+  root-owned. All covered by the tree sweep. Regression tests pin the
+  real on-disk uid outcomes, the error-path sweep, and the chown argv.
+
+### Auth — LiteLLM-proxy-local 429s classified distinct from account 429s, plus 429/TPM instrumentation (#3166)
+
+A 429 from the proxy's OWN limiters (tpm/rpm deployment or virtual-key
+caps, router cooldown) previously classified quota-exhausted in
+session-tail — firing the model-unavailable card, mark-exhausted, and a
+fleet failover for a purely proxy-local condition.
+
+- **Three-way classifier** (`classify429Detail`): account-scoped /
+  litellm-local / generic-transient, with wording signals grounded in
+  litellm source (per-key provenance, v1/v2/v3 shapes, descriptor-
+  agnostic v3 co-occurrence pair). Tie-break: explicit Anthropic account
+  wording wins — LiteLLM never emits it, so co-occurrence means a genuine
+  upstream account throttle traversed the proxy.
+- **Calm path for non-account 429s:** only account-scoped enters the
+  throttle tier; litellm-local and generic-transient take the calm path —
+  no broker mark-throttled, no throttle-tier runner, no failover.
+  Session-tail classifies a litellm-local 429 as rate-limited (calm), not
+  quota-exhausted.
+- **Instrumentation:** a `rate_limit_429_classified` runtime metric
+  (PostHog + JSONL) on every terminal rate-limit-family event, carrying
+  classification, decided action, and parsed limit/reset detail — the
+  evidence base for the follow-up of enabling litellm tpm caps. This
+  release enables NO caps itself: classifier + instrumentation only.
+
 ## v0.18.14 — The 429 throttle tier: short rate limits ride out in place, long ones fail over, and the operator hears the honest difference
 
 The headline: a transient per-account 429 is no longer a coin-flip between
