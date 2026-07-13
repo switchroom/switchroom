@@ -376,9 +376,26 @@ export interface CapturedProseSettlementEffects {
   clearState: () => void
   /**
    * Arm the deterministic Stop-hook re-prompt (recordUndeliveredTurnEnd) so
-   * the answer is recoverable — the send-failure safety net.
+   * the answer is recoverable — the send-failure safety net. Returns the
+   * `{ exhausted }` verdict from `recordUndeliveredTurnEnd`: `true` when the
+   * re-prompt budget was ALREADY spent (retryCount >= SILENT_END_MAX_RETRIES)
+   * on the attempt that failed, so the re-prompt can no longer recover the
+   * answer and the caller must deliver a user-facing fallback instead (#3228
+   * exhaustion-boundary gap).
    */
-  recordUndelivered: () => void
+  recordUndelivered: () => { exhausted: boolean }
+}
+
+/**
+ * Result of `settleCapturedProseDelivery`. `exhausted` is meaningful only on
+ * the `failed` outcome — `true` means the Stop-hook re-prompt net is spent, so
+ * the caller must fire the user-facing fallback (a plain-text retry of the
+ * captured prose, then the generic apology) so the turn never goes silent.
+ * Always `false` for `sent` / `skipped-dedup` (the answer is already with the
+ * user; no fallback).
+ */
+export interface CapturedProseSettlementResult {
+  exhausted: boolean
 }
 
 /**
@@ -399,18 +416,26 @@ export interface CapturedProseSettlementEffects {
  *     NOT a real net — without recordUndelivered a thrown send permanently
  *     loses the answer, strictly worse than the pre-bridge behaviour.
  *
+ *     The `{ exhausted }` verdict from `recordUndelivered` is threaded back out
+ *     to the caller (#3228 exhaustion-boundary gap): when the failed send
+ *     happened on the attempt where the re-prompt budget was ALREADY spent,
+ *     `recordUndeliveredTurnEnd` clears the state and reports `exhausted:true` —
+ *     the Stop-hook re-prompt can no longer recover the answer, so the caller
+ *     MUST deliver a user-facing fallback (mirroring the non-captured
+ *     exhausted path) or the user gets NEITHER the answer NOR the apology.
+ *
  * Pure — no IO, no module state; the caller injects the effects.
  */
 export function settleCapturedProseDelivery(
   outcome: CapturedProseSendOutcome,
   effects: CapturedProseSettlementEffects,
-): void {
+): CapturedProseSettlementResult {
   if (outcome === 'failed') {
-    effects.recordUndelivered()
-    return
+    return { exhausted: effects.recordUndelivered().exhausted }
   }
   effects.closeObligation()
   effects.clearState()
+  return { exhausted: false }
 }
 
 /**

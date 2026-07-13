@@ -847,12 +847,12 @@ describe('decideCapturedProseDelivery — per-turn nonce (turnId) guard (#3228 F
 // ── Finding 1 (#3228): captured-prose send-failure arms the recovery net ─────
 
 describe('settleCapturedProseDelivery — send-failure posture (#3228 Finding 1)', () => {
-  function spies() {
+  function spies(exhausted = false) {
     const calls = { close: 0, clear: 0, undelivered: 0 }
     const effects = {
       closeObligation: () => { calls.close++ },
       clearState: () => { calls.clear++ },
-      recordUndelivered: () => { calls.undelivered++ },
+      recordUndelivered: () => { calls.undelivered++; return { exhausted } },
     }
     return { calls, effects }
   }
@@ -864,41 +864,83 @@ describe('settleCapturedProseDelivery — send-failure posture (#3228 Finding 1)
     // catch that merely `return`ed (no recordUndelivered) would leave calls
     // all-zero here → the answer is permanently lost.
     const { calls, effects } = spies()
-    settleCapturedProseDelivery('failed', effects)
+    const r = settleCapturedProseDelivery('failed', effects)
     expect(calls.undelivered).toBe(1)
     expect(calls.close).toBe(0)
     expect(calls.clear).toBe(0)
+    expect(r.exhausted).toBe(false)
   })
 
-  it("outcome 'sent' → closes obligation + clears state; does NOT re-arm the re-prompt", () => {
+  it("outcome 'failed' with budget SPENT → threads exhausted:true out so the caller can fire the fallback (#3228 exhaustion-boundary)", () => {
+    // The exhaustion-boundary gap: recordUndeliveredTurnEnd took its exhausted
+    // branch (cleared state, returned exhausted:true). The settlement MUST
+    // surface that so the gateway delivers the plain-text/apology fallback —
+    // the obligation was already closed by the interim-ack teardown, so the
+    // re-prompt is gone AND the represent is gone. Pre-fix the return type was
+    // void, so this signal could not exist and the fallback never fired.
+    const { calls, effects } = spies(true)
+    const r = settleCapturedProseDelivery('failed', effects)
+    expect(calls.undelivered).toBe(1)
+    expect(r.exhausted).toBe(true)
+  })
+
+  it("outcome 'sent' → closes obligation + clears state; does NOT re-arm the re-prompt; exhausted:false", () => {
     const { calls, effects } = spies()
-    settleCapturedProseDelivery('sent', effects)
+    const r = settleCapturedProseDelivery('sent', effects)
     expect(calls.close).toBe(1)
     expect(calls.clear).toBe(1)
     expect(calls.undelivered).toBe(0)
+    expect(r.exhausted).toBe(false)
   })
 
-  it("outcome 'skipped-dedup' → closes obligation + clears state (answer already went out)", () => {
+  it("outcome 'skipped-dedup' → closes obligation + clears state (answer already went out); exhausted:false", () => {
     const { calls, effects } = spies()
-    settleCapturedProseDelivery('skipped-dedup', effects)
+    const r = settleCapturedProseDelivery('skipped-dedup', effects)
     expect(calls.close).toBe(1)
     expect(calls.clear).toBe(1)
     expect(calls.undelivered).toBe(0)
+    expect(r.exhausted).toBe(false)
   })
 
-  it('end-to-end failure net: a failed captured-prose send leaves an undelivered-turn record armed', () => {
+  it('end-to-end failure net (budget remaining): a failed send leaves an undelivered-turn record armed, exhausted:false', () => {
     // Simulate the gateway's `failed` settlement wiring against the REAL
     // recordUndeliveredTurnEnd effect. The interim-ack teardown already closed
     // the obligation; only the silent-end state can recover the turn now.
     expect(readSilentEndState()).toBeNull()
-    settleCapturedProseDelivery('failed', {
+    const r = settleCapturedProseDelivery('failed', {
       closeObligation: () => { throw new Error('must not be called on failure') },
       clearState: () => { throw new Error('must not be called on failure') },
       recordUndelivered: () =>
-        void recordUndeliveredTurnEnd({ chatId: 'c', threadId: null, turnKey: 'c:_' }),
+        recordUndeliveredTurnEnd({ chatId: 'c', threadId: null, turnKey: 'c:_' }),
     })
     // The recovery net is armed: the Stop hook will find this and re-prompt.
     expect(readSilentEndState()).toMatchObject({ turnKey: 'c:_' })
+    expect(r.exhausted).toBe(false)
+  })
+
+  it('end-to-end exhaustion boundary: a failed send AT the retry cap returns exhausted:true and clears state (the gateway must then fire the fallback)', () => {
+    // On-disk record already at the cap (the Stop hook blocked twice; the
+    // re-prompted turn's captured-prose send is now THROWING). The REAL
+    // recordUndeliveredTurnEnd takes its exhausted branch: clears state,
+    // returns exhausted:true. Pin that the settlement surfaces it — this is the
+    // signal the gateway uses to fire the plain-text/apology fallback so the
+    // user is never left with neither the answer nor the apology.
+    const path = join(stateDir, 'silent-end-pending.json')
+    mkdirSync(stateDir, { recursive: true })
+    writeFileSync(path, JSON.stringify({
+      chatId: 'c', threadId: null, turnKey: 'c:_',
+      retryCount: SILENT_END_MAX_RETRIES, timestamp: Date.now(),
+    }))
+    const r = settleCapturedProseDelivery('failed', {
+      closeObligation: () => { throw new Error('must not be called on failure') },
+      clearState: () => { throw new Error('must not be called on failure') },
+      recordUndelivered: () =>
+        recordUndeliveredTurnEnd({ chatId: 'c', threadId: null, turnKey: 'c:_' }),
+    })
+    expect(r.exhausted).toBe(true)
+    // recordUndeliveredTurnEnd's exhausted branch cleared the state — the
+    // Stop-hook re-prompt can no longer recover, so the caller owns delivery.
+    expect(readSilentEndState()).toBeNull()
   })
 })
 

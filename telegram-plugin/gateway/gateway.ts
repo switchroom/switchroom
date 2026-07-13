@@ -10125,12 +10125,23 @@ let lastBgWorkDeferLogMs = 0
  * what make captured-prose and the represent mutually exclusive for the
  * common case; the content dedup is a second, best-effort layer.
  *
- * Failure posture (Finding 1, #3228): if the send throws, the catch below arms
- * the deterministic Stop-hook re-prompt via recordUndeliveredTurnEnd (the
- * shared teardown may have already closed the obligation when replyCalled was
- * true, so "leaving the obligation open" is NOT a sufficient net on its own).
- * We do not clear the silent-end state, so any still-open obligation represent
- * also stays armed. Worst case == pre-bridge behaviour.
+ * Failure posture (Finding 1 + exhaustion-boundary gap, #3228): if the send
+ * throws, the catch below arms the deterministic Stop-hook re-prompt via
+ * recordUndeliveredTurnEnd (the shared teardown may have already closed the
+ * obligation when replyCalled was true, so "leaving the obligation open" is NOT
+ * a sufficient net on its own). Two sub-cases, honored via the `{exhausted}`
+ * verdict threaded out of settleCapturedProseDelivery:
+ *  - budget REMAINING (`exhausted:false`) → the silent-end state is (re)written
+ *    and the Stop-hook re-prompt will recover the answer; nothing else to do.
+ *  - budget SPENT (`exhausted:true`) → recordUndeliveredTurnEnd has CLEARED the
+ *    state (the re-prompt can no longer fire), and the obligation was already
+ *    closed by the interim-ack teardown, so the user would get NEITHER the
+ *    answer NOR the apology. We therefore deliver a user-facing fallback: first
+ *    retry the captured prose as PLAIN TEXT (a non-rich send often survives the
+ *    markdown/parse error a rich send rejected — the user gets the real
+ *    answer), and only if THAT also fails post the generic silentEndFallbackText
+ *    apology. This mirrors the non-captured exhausted path (silent-end.ts /
+ *    gateway turn_end #1161) so the captured path is never worse than main.
  */
 async function deliverCapturedProse(args: {
   chatId: string
@@ -10139,8 +10150,10 @@ async function deliverCapturedProse(args: {
   registryKey: string | null
   originTurnId: string
   text: string
+  /** Turn elapsed for the honest "(waited Ns)" apology clause; optional. */
+  turnDurationMs?: number
 }): Promise<void> {
-  const { chatId, threadId, statusKeyStr, registryKey, originTurnId, text } = args
+  const { chatId, threadId, statusKeyStr, registryKey, originTurnId, text, turnDurationMs } = args
   const now = Date.now()
   // #3228 Finding 1 — the three settlement points (sent / skipped-dedup /
   // failed) all funnel through the pure `settleCapturedProseDelivery` core so
@@ -10221,7 +10234,7 @@ async function deliverCapturedProse(args: {
   //                          user, so represent + exhausted fallback must not fire)
   //   failed               → arm the Stop-hook re-prompt net (recordUndelivered),
   //                          do NOT close/clear.
-  settleCapturedProseDelivery(outcome, {
+  const settlement = settleCapturedProseDelivery(outcome, {
     closeObligation: () => {
       if (OBLIGATION_LEDGER_ENABLED) {
         try { obligationLedger.close(originTurnId) } catch {}
@@ -10236,7 +10249,7 @@ async function deliverCapturedProse(args: {
                 hasOutboundDeliveredSince(cid, sinceMs, tid, 1),
             }
           : undefined
-        recordUndeliveredTurnEnd(
+        return recordUndeliveredTurnEnd(
           { chatId, threadId: threadId ?? null, turnKey: statusKeyStr },
           silentEndDeps,
         )
@@ -10246,9 +10259,83 @@ async function deliverCapturedProse(args: {
             (netErr as Error).message
           } (chat=${chatId} origin=${originTurnId})\n`,
         )
+        // Could not even record the undelivered turn — do NOT claim exhaustion
+        // (firing a fallback we can't justify). Fail safe: leave recovery to
+        // the obligation represent / next Stop hook.
+        return { exhausted: false }
       }
     },
   })
+
+  // Exhaustion-boundary gap (#3228): the send FAILED on the attempt where the
+  // Stop-hook re-prompt budget was already spent, so recordUndeliveredTurnEnd
+  // cleared the state and the re-prompt can no longer recover the answer — and
+  // the obligation was already closed by the interim-ack teardown. Without this
+  // the user gets NEITHER the answer NOR the apology. Deliver a user-facing
+  // fallback, preferring the REAL answer as plain text (a non-rich send often
+  // survives the markdown/parse error the rich send threw on) before the
+  // generic apology.
+  if (outcome === 'failed' && settlement.exhausted) {
+    process.stderr.write(
+      `telegram gateway: WARN captured-prose exhausted-boundary fallback — rich send ` +
+        `failed with the re-prompt budget already spent; attempting a plain-text ` +
+        `delivery of the recovered answer before the generic apology ` +
+        `(chat=${chatId} origin=${originTurnId})\n`,
+    )
+    const plain = redactOutboundText(text, 'captured_prose')
+    const plainChunks = splitMarkdownChunks(plain, RICH_MESSAGE_MAX_CHARS)
+    try {
+      let liveThreadId: number | undefined = threadId
+      for (const c of plainChunks) {
+        // Plain sendMessage — NO parse_mode / rich rendering — so a markdown
+        // construct that made sendRichMessage 400 is sent verbatim instead.
+        const sent = await retryWithThreadFallback(
+          robustApiCall,
+          (tid) =>
+            bot.api.sendMessage(
+              chatId,
+              c,
+              tid != null ? { message_thread_id: tid } : {},
+            ),
+          { threadId: liveThreadId, chat_id: chatId, verb: 'captured-prose-plain-fallback.sendMessage' },
+        )
+        if (liveThreadId != null && (sent as { message_thread_id?: number }).message_thread_id == null) {
+          liveThreadId = undefined
+        }
+      }
+      // The real answer reached the user via plain text — record it so a late
+      // reply-tool retry with the same content is deduped at its send site.
+      outboundDedup.record(chatId, threadId, text, Date.now(), registryKey)
+      process.stderr.write(
+        `telegram gateway: captured-prose recovered via plain-text fallback ` +
+          `(chat=${chatId} origin=${originTurnId})\n`,
+      )
+    } catch (plainErr) {
+      // Plain text ALSO failed — post the generic apology so the turn is never
+      // silent (mirrors the non-captured exhausted path, gateway turn_end #1161).
+      process.stderr.write(
+        `telegram gateway: captured-prose plain-text fallback ALSO failed: ${
+          (plainErr as Error).message
+        } — posting the generic silent-end apology (chat=${chatId} origin=${originTurnId})\n`,
+      )
+      void retryWithThreadFallback(
+        robustApiCall,
+        (tid) =>
+          bot.api.sendMessage(
+            chatId,
+            silentEndFallbackText(turnDurationMs),
+            tid != null ? { message_thread_id: tid } : {},
+          ),
+        { threadId, chat_id: chatId, verb: 'captured-prose-apology-fallback.sendMessage' },
+      ).catch((err) => {
+        process.stderr.write(
+          `telegram gateway: captured-prose apology fallback send failed: ${
+            err instanceof Error ? err.message : String(err)
+          }\n`,
+        )
+      })
+    }
+  }
 }
 
 function obligationSweep(): void {
@@ -18293,6 +18380,9 @@ function handleSessionEvent(ev: SessionEvent): void {
               registryKey: turn.registryKey ?? null,
               originTurnId: turn.turnId,
               text: proseDecision.text,
+              // For the honest "(waited Ns)" clause if the exhaustion-boundary
+              // apology fallback fires (#3228).
+              turnDurationMs,
             })
           } else {
           // PR #2892 (deterministic-turn-liveness RFC Phase 2) hardening:
