@@ -119,7 +119,12 @@ export type SessionEvent =
   // gate keys on it.
   | { kind: 'text'; text: string; blockIndex: number; lastInMessage: boolean }
   | { kind: 'tool_result'; toolUseId: string; toolName: string | null; isError?: boolean; errorText?: string }
-  | { kind: 'turn_end'; durationMs: number }
+  // `reason` is set ONLY by an internal gateway-synthesized turn_end (never by
+  // the JSONL projection). `answer-ready-quiescence` (PR A) marks the positive
+  // deterministic quiescence-flush signal, which — unlike the orphaned-reply
+  // backstop's bare `durationMs:-1` — deliberately bypasses the recently-
+  // streaming suppression guard (quiescence IS the "streaming settled" signal).
+  | { kind: 'turn_end'; durationMs: number; reason?: 'answer-ready-quiescence' }
   // Multi-agent: sub-agent-scoped events. agentId is the sub-agent JSONL
   // filename stem (e.g. "aac6f1…"). Routed through the same ingest path
   // as parent events; the reducer fans them out to per-sub-agent state.
