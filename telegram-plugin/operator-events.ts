@@ -13,6 +13,7 @@
  */
 
 import { escapeMarkdown } from './format.js'
+import { stripRawErrorBytes } from './raw-error-scrub.js'
 
 // ─── Taxonomy ────────────────────────────────────────────────────────────────
 
@@ -216,7 +217,12 @@ export interface RenderResult {
  */
 export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
   const agent = escapeMarkdown(ev.agent)
-  const detail = escapeMarkdown(ev.detail)
+  // #llm-error-surfacing: NEVER let a raw API-error byte-blob (`· b'{…}'`,
+  // trailing `{"type":"error"…}` JSON, `API Error:` prefix) reach a user. A
+  // clean human detail passes through unchanged; only smuggled raw bytes are
+  // stripped. This is the belt-and-braces scrub for every card kind — the
+  // rate-limited card in particular used to relay the raw synthetic-error text.
+  const detail = escapeMarkdown(stripRawErrorBytes(ev.detail))
 
   switch (ev.kind) {
     case 'credentials-expired':

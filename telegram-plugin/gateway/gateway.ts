@@ -316,6 +316,11 @@ import {
 } from '../operator-events.js'
 import { recordOperatorEvent } from '../operator-events-history.js'
 import {
+  parseLlmError,
+  renderLlmError,
+  decideErrorSurface,
+} from '../llm-error-present.js'
+import {
   formatModelUnavailableCard,
   resolveModelUnavailableFromOperatorEvent,
   type ModelUnavailableDetection,
@@ -7924,6 +7929,28 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
       // the old account fails — honest reset messaging on the enriched card.
       void fireFleetAutoFallback(agent, untilMs, modelUnavailable.resetAt)
     }
+  } else if (kind === 'rate-limited' || kind === 'unknown-5xx') {
+    // #llm-error-surfacing — surface #2 (the "🚦 Rate limited" operator card).
+    // The transient rate-limit / overload family used to render the raw
+    // synthetic-error `detail` (bytes and all) via renderOperatorEvent. Route
+    // it through the humanized card instead: JSON-stripped coreText + reset in
+    // LOCAL time. The ErrorPresenceGate is the cross-surface dedup authority —
+    // the reply/done-card surfaces are already suppressed at the transcript
+    // source (session-tail), so the operator card is the sole renderer and
+    // wins the claim; a redundant burst within the collapse window is
+    // suppressed here in addition to the existing 5-min per-kind cooldown.
+    const parsed = parseLlmError(event.detail)
+    const now = Date.now()
+    if (decideErrorSurface(parsed, agent, { claim: true, now }) === 'suppress') {
+      process.stderr.write(
+        `telegram gateway: operator-event collapsed (error-presence-gate) agent=${agent} kind=${kind}\n`,
+      )
+      return
+    }
+    const tz = process.env.SWITCHROOM_TIMEZONE ?? process.env.TZ ?? 'UTC'
+    const r = renderLlmError(parsed, agent, tz, new Date(now))
+    renderedText = r.text
+    renderedKeyboard = r.keyboard
   } else {
     try {
       const r = renderOperatorEvent(event)
