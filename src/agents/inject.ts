@@ -223,7 +223,8 @@ export type InjectErrorCode =
   | "session_missing"
   | "invalid"
   | "timeout"
-  | "tmux_failed";
+  | "tmux_failed"
+  | "precondition_failed";
 
 export class InjectError extends Error {
   code: InjectErrorCode;
@@ -249,6 +250,19 @@ export interface InjectOpts {
   settleMs?: number;
   /** Hard upper bound on total wait (ms). Default 5000ms. */
   timeoutMs?: number;
+  /**
+   * Opt-in write-time guard (#3116). Re-evaluated INSIDE the pane lock,
+   * IMMEDIATELY BEFORE the send-keys write — i.e. after the check-to-send
+   * gap that a plain caller cannot guard. If provided and it returns
+   * `false`, the send is aborted with `outcome:'skipped'` /
+   * `errorCode:'precondition_failed'` and NO keys are sent.
+   *
+   * The idle-clear caller passes a predicate that re-runs the FULL idle
+   * decision against the live clocks, so an inbound/activity that landed in
+   * the gap suppresses the `/clear` instead of clobbering the session.
+   * Callers that omit it get identical behaviour to before (never checked).
+   */
+  precondition?: () => boolean;
 }
 
 /**
@@ -258,11 +272,14 @@ export interface InjectOpts {
  *    expected (e.g. `/clear`) or suspicious (`/cost` with no output).
  *  - `failed` — validation rejected, session missing, or send-keys
  *    threw. `errorCode` and `errorMessage` carry the reason.
+ *  - `skipped` — an opt-in write-time `precondition` returned false, so
+ *    the send was aborted before any keys were sent (#3116). No pane
+ *    mutation happened; `errorCode` is `precondition_failed`.
  *
  * Classification is derived from runtime capture, not from
  * `expectsOutput` — that field is a UX hint only.
  */
-export type InjectOutcome = "ok" | "ok_no_output" | "failed";
+export type InjectOutcome = "ok" | "ok_no_output" | "failed" | "skipped";
 
 export type InjectDiagnostic =
   | "anchor_missing"
@@ -593,6 +610,7 @@ export async function injectSlashCommand(
       command: command.trim(),
       settleMs,
       timeoutMs,
+      precondition: opts.precondition,
     }),
   );
 }
@@ -614,9 +632,10 @@ export async function injectSlashCommandWith(
     command: string;
     settleMs: number;
     timeoutMs: number;
+    precondition?: () => boolean;
   },
 ): Promise<InjectResult> {
-  const { socket, session, command, settleMs, timeoutMs } = args;
+  const { socket, session, command, settleMs, timeoutMs, precondition } = args;
 
   // Re-validate so the seam itself enforces the contract. The bare
   // verb is what we'll surface in `result.command` / lookup metadata.
@@ -651,6 +670,26 @@ export async function injectSlashCommandWith(
         `tmux session "${session}" on socket "${socket}" not found. ` +
         `Is the agent running under the tmux supervisor (the default)? ` +
         `If experimental.legacy_pty=true is set, inject is unsupported.`,
+    };
+  }
+
+  // #3116 — write-time precondition. Re-evaluated HERE, inside the pane lock
+  // and as late as possible before the send, to close the check-to-send gap
+  // the caller cannot guard from outside. The idle-clear caller re-runs the
+  // full idle decision; if an inbound/activity landed in the gap the session
+  // is no longer idle and we abort WITHOUT sending any keys — the pane is left
+  // untouched. Runs before `capture` so a false precondition does no tmux I/O.
+  if (precondition && !precondition()) {
+    return {
+      outcome: "skipped",
+      output: "",
+      truncated: false,
+      command: bareVerb,
+      meta,
+      errorCode: "precondition_failed",
+      errorMessage:
+        "inject precondition returned false at write time; send aborted " +
+        "(no keys sent).",
     };
   }
 

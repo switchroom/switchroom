@@ -22,6 +22,7 @@ import {
   validateInjectCommand,
   type TmuxRunner,
 } from "./inject.js";
+import { decideIdleClear } from "../../telegram-plugin/gateway/idle-clear.js";
 
 describe("validateInjectCommand", () => {
   it("accepts every command in the allowlist", () => {
@@ -917,5 +918,114 @@ describe("#2566 — /model and /memory allowlist treatment", () => {
     expect(sent[1]).toEqual(["send-keys", "Enter"]);
     expect(sent[sent.length - 1]).toEqual(["send-keys", "Escape"]);
     expect(result.outcome).toBe("ok");
+  });
+});
+
+// ─── #3116 — write-time precondition (idle-clear check-to-send race) ─────────
+//
+// The idle-clear path decides "idle" then fires `/clear` into the tmux pane.
+// Between that decision and the send-keys write there is a gap: an inbound can
+// arrive and the session is no longer idle, but the buffered `/clear` still
+// clobbers it (inject.ts FUTURE-GAP). The fix is an opt-in `precondition`
+// re-evaluated INSIDE the pane lock, immediately before send-keys. These tests
+// assert the OUTCOME — no keys are sent when the precondition fails — and are
+// written so they FAIL against pre-fix main (which has no precondition and
+// always sends).
+describe("injectSlashCommandWith — #3116 write-time precondition", () => {
+  it("precondition true → send-keys fires (behaviour unchanged)", async () => {
+    const before = "$ \n";
+    const after = "$ \n"; // /clear leaves fresh prompt → ok_no_output
+    const sent: string[][] = [];
+    const runner: TmuxRunner = {
+      hasSession: () => true,
+      capture: () => before === after ? before : after,
+      send: (_s, _n, args) => sent.push(args),
+    };
+    const r = await injectSlashCommandWith(runner, {
+      socket: "switchroom-x",
+      session: "x",
+      command: "/clear",
+      settleMs: 20,
+      timeoutMs: 60,
+      precondition: () => true,
+    });
+    expect(sent).toContainEqual(["send-keys", "-l", "/clear"]);
+    expect(sent).toContainEqual(["send-keys", "Enter"]);
+    expect(r.outcome).not.toBe("skipped");
+  });
+
+  it("precondition false → NO keys sent, outcome=skipped, pane untouched", async () => {
+    const sent: string[][] = [];
+    let captured = 0;
+    const runner: TmuxRunner = {
+      hasSession: () => true,
+      capture: () => { captured += 1; return "$ \n"; },
+      send: (_s, _n, args) => sent.push(args),
+    };
+    const r = await injectSlashCommandWith(runner, {
+      socket: "switchroom-x",
+      session: "x",
+      command: "/clear",
+      settleMs: 20,
+      timeoutMs: 60,
+      precondition: () => false,
+    });
+    // The load-bearing assertion: send-keys was NEVER called, so the buffered
+    // /clear cannot clobber a no-longer-idle session. On pre-fix main there is
+    // no precondition param, the send always fires, and this fails.
+    expect(sent).toEqual([]);
+    expect(captured).toBe(0); // aborted before any tmux I/O
+    expect(r.outcome).toBe("skipped");
+    expect(r.errorCode).toBe("precondition_failed");
+    expect(r.command).toBe("/clear");
+  });
+
+  // End-to-end race semantics driven through the REAL idle decider
+  // (decideIdleClear), the same function maybeIdleClear's precondition re-runs
+  // at write time. An inbound (markIdleActivity) that lands in the check→send
+  // gap must SUPPRESS the /clear.
+  it("inbound in the check→send gap suppresses /clear (via real decideIdleClear)", async () => {
+    let now = 1_000_000;
+    const idleClearMs = 10_000;
+    // Idle clocks, mutated to simulate an inbound arriving in the gap.
+    const state = {
+      lastActivityAt: now - idleClearMs - 1, // idle at decision time
+      lastTurnEndedAt: null as number | null,
+    };
+    // Gate decision (as maybeIdleClear does before dispatch): idle → clear.
+    const gateDecision = decideIdleClear(
+      { ...state, idleClearMs, alreadyCleared: false, turnInFlight: false },
+      now,
+    );
+    expect(gateDecision.clear).toBe(true);
+
+    const sent: string[][] = [];
+    const runner: TmuxRunner = {
+      hasSession: () => true,
+      capture: () => "$ \n",
+      send: (_s, _n, args) => sent.push(args),
+    };
+
+    // The write-time precondition re-runs the FULL decision on the LIVE clocks.
+    const stillIdleAtWrite = (): boolean => {
+      // Simulate: an inbound landed in the gap right before the write.
+      state.lastActivityAt = now;
+      return decideIdleClear(
+        { ...state, idleClearMs, alreadyCleared: false, turnInFlight: false },
+        now,
+      ).clear;
+    };
+
+    const r = await injectSlashCommandWith(runner, {
+      socket: "switchroom-x",
+      session: "x",
+      command: "/clear",
+      settleMs: 20,
+      timeoutMs: 60,
+      precondition: stillIdleAtWrite,
+    });
+
+    expect(sent).toEqual([]); // /clear suppressed — session preserved
+    expect(r.outcome).toBe("skipped");
   });
 });

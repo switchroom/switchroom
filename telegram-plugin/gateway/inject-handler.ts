@@ -86,6 +86,17 @@ function shapeReply(
     return { body: verbHtml, accent: 'done' }
   }
 
+  // outcome === 'skipped' (#3116): an opt-in write-time precondition aborted
+  // the send before any keys were sent. No inject-map caller opts in today, so
+  // this is unreachable via this surface — but handle it explicitly so a future
+  // precondition caller gets an honest "skipped" ack instead of a failure card.
+  if (result.outcome === 'skipped') {
+    return {
+      body: `${verbHtml} — skipped (precondition not met at send time)`,
+      accent: 'issue',
+    }
+  }
+
   // outcome === 'failed'
   const code = result.errorCode ?? 'tmux_failed'
   const msg = result.errorMessage ?? 'unknown error'
