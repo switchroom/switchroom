@@ -211,6 +211,20 @@ describe('normalizePunctuation', () => {
     )
   })
 
+  test('does NOT rewrite a dash inside a `<scheme:…>` autolink (#finding-2 sibling)', () => {
+    // An en-dash in an angle-bracket autolink URL must survive verbatim.
+    expect(normalizePunctuation('<https://x.com/foo–bar>')).toBe('<https://x.com/foo–bar>')
+    // An em-dash in an autolink must NOT become `, `.
+    expect(normalizePunctuation('<https://x.com/foo—bar>')).toBe('<https://x.com/foo—bar>')
+    // Autolink mid-prose: the surrounding prose still normalizes, the URL does not.
+    expect(normalizePunctuation('see <https://x.com/a–b> now — go')).toBe(
+      'see <https://x.com/a–b> now, go',
+    )
+    // Arbitrary `<…>` prose (no scheme) is NOT treated as an autolink: a dash
+    // inside it still normalizes like ordinary text.
+    expect(normalizePunctuation('<not—a—url>')).toBe('<not, a, url>')
+  })
+
   test('idempotent', () => {
     const once = normalizePunctuation('a — b\n• c\nd—e\n1–2')
     expect(normalizePunctuation(once)).toBe(once)

@@ -534,12 +534,26 @@ export function normalizePunctuation(text: string): string {
     linkMasks.push(href)
     return `${open}${LINK_MASK_PH}${idx}\x00${close}`
   })
+  // Also protect GFM ANGLE-BRACKET AUTOLINK destinations `<scheme:…>` for the
+  // same reason (`<https://x/foo–bar>` → the en-dash would be rewritten to `-`,
+  // corrupting the URL). Only the URI inside the brackets is masked; the `<`/`>`
+  // are untouched. Conservative — requires a scheme-like `xxx:` prefix and no
+  // whitespace/`>` in the body (loosely mirrors the GFM absolute-URI autolink
+  // rule), so arbitrary `<…>` prose is never masked.
+  const maskedAutolinks = maskedLinks.replace(
+    /(<)([a-zA-Z][a-zA-Z0-9+.-]*:[^>\s]*)(>)/g,
+    (_m, lt: string, uri: string, gt: string) => {
+      const idx = linkMasks.length
+      linkMasks.push(uri)
+      return `${lt}${LINK_MASK_PH}${idx}\x00${gt}`
+    },
+  )
   const escNonce = nonce.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   const linkRestoreRe = new RegExp(`\x00RML${escNonce}_(\\d+)\x00`, 'g')
   const restoreLinks = (s: string): string =>
     s.replace(linkRestoreRe, (_m, idx: string) => linkMasks[Number(idx)] ?? _m)
 
-  let out = maskedLinks
+  let out = maskedAutolinks
     // 1. Space-flanked em/en dash. Numeric range keeps a hyphen. The right
     //    flank is a LOOKAHEAD (captured, not consumed) so consecutive spaced
     //    dashes ("a — b — c") all normalize in one pass — a consumed \S would
