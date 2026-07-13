@@ -366,6 +366,83 @@ describe('coalesced worker feed — lifecycle transitions', () => {
   })
 })
 
+describe('coalesced worker feed — GROUP-level pin lifecycle (#3207 review)', () => {
+  interface PinCall {
+    feedKey: string
+    chatId: string
+    messageId: number | null
+  }
+  function pinHarness() {
+    const pins: PinCall[] = []
+    const { bot } = directBot()
+    let clock = 0
+    const feed = createWorkerActivityFeed({
+      bot,
+      now: () => clock,
+      minEditIntervalMs: 0,
+      firstPaintMinMs: 0,
+      setInterval: () => 0,
+      clearInterval: () => {},
+      reconcilePin: ({ feedKey, chatId, messageId }) => pins.push({ feedKey, chatId, messageId }),
+    })
+    return { feed, pins, setClock: (t: number) => (clock = t) }
+  }
+  const done = (desc: string, elapsedMs: number): WorkerActivityView => ({
+    description: desc,
+    lastTool: null,
+    toolCount: 3,
+    latestSummary: `${desc} result`,
+    elapsedMs,
+    state: 'done',
+  })
+
+  it('a mid-group sibling finish does NOT unpin the shared message while a worker still runs', async () => {
+    const { feed, pins, setClock } = pinHarness()
+    setClock(1000)
+    await feed.update('a', 'chat', view('task A', 'a-doing', 1000))
+    await feed.update('b', 'chat', view('task B', 'b-doing', 1000))
+
+    // The group's shared message is pinned (messageId non-null).
+    const pinnedAfterPaint = pins.filter((p) => p.messageId != null)
+    expect(pinnedAfterPaint.length).toBeGreaterThan(0)
+    const sharedMsgId = pinnedAfterPaint[pinnedAfterPaint.length - 1].messageId
+    expect(feed.messageIdOf('a')).toBe(sharedMsgId)
+    expect(feed.messageIdOf('b')).toBe(sharedMsgId)
+
+    // A finishes while B still runs — the pin MUST stay (B needs the message).
+    setClock(2000)
+    await feed.finish('a', done('task A', 2000))
+
+    // Every reconcilePin emitted through A's finish keeps the message pinned —
+    // there is NO unpin (messageId === null) while B is live. This is the exact
+    // regression the review flagged: a per-worker unpin here strands B unpinned.
+    const last = pins[pins.length - 1]
+    expect(last.messageId).toBe(sharedMsgId)
+    expect(pins.some((p) => p.messageId === null)).toBe(false)
+    // The feed still vouches for the group (reaper exemption stays live).
+    const feedKey = last.feedKey
+    expect(feed.hasRunningInFeed(feedKey)).toBe(true)
+  })
+
+  it('unpins the shared message only when the LAST worker finishes (group empties)', async () => {
+    const { feed, pins, setClock } = pinHarness()
+    setClock(1000)
+    await feed.update('a', 'chat', view('task A', 'a-doing', 1000))
+    await feed.update('b', 'chat', view('task B', 'b-doing', 1000))
+    setClock(2000)
+    await feed.finish('a', done('task A', 2000))
+    expect(pins.some((p) => p.messageId === null)).toBe(false) // B still runs
+
+    // Now the last worker finishes → the group empties → unpin fires.
+    setClock(3000)
+    await feed.finish('b', done('task B', 3000))
+    const last = pins[pins.length - 1]
+    expect(last.messageId).toBeNull()
+    const feedKey = last.feedKey
+    expect(feed.hasRunningInFeed(feedKey)).toBe(false) // reaper may now reap it
+  })
+})
+
 describe('renderCombinedWorkerFeed (pure)', () => {
   const row = (i: number, step: string) => ({
     description: `task number ${i}`,

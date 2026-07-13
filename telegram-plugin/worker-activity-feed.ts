@@ -257,6 +257,24 @@ export interface WorkerActivityFeedOpts {
    * `channels.telegram.worker_feed.max_rows` via the config cascade.
    */
   maxRows?: number
+  /**
+   * Group-level status-pin reconcile hook (#3207 review). Because workers now
+   * COALESCE into one shared message, the pin MUST follow the GROUP lifecycle,
+   * not a single worker's: pin the shared message when a group's first worker
+   * paints, and unpin ONLY when the group empties (its LAST worker finishes / is
+   * dropped). The feed alone knows group membership + running-count, so it owns
+   * the pin. `messageId: null` means "unpin this group". A per-worker unpin would
+   * physically unpin a message a SIBLING still needs, and the survivor's next
+   * pin request NO-OPs (its claim still names that id) — so it would run
+   * unpinned for the rest of its life (the shared-message NOOP trap). Best-
+   * effort; defaults to a noop for tests / non-gateway callers.
+   */
+  reconcilePin?: (args: {
+    feedKey: string
+    chatId: string
+    threadId?: number
+    messageId: number | null
+  }) => void
 }
 
 /**
@@ -398,6 +416,10 @@ export interface WorkerActivityFeed {
    *  re-post). Lets the gateway pin the EXISTING `🛠 Worker` message. Note:
    *  siblings sharing the chat/thread return the SAME id (one message). */
   messageIdOf(agentId: string): number | null
+  /** True while the feed group `feedKey` (`${chatId} ${threadId ?? ''}`) still
+   *  tracks live work — used by the gateway's `wk:group:` pin reaper to exempt
+   *  a live group's pin from the stale-TTL sweep (#3207). */
+  hasRunningInFeed(feedKey: string): boolean
   /** Push a running-state cue. Returns the serialized op for tests. */
   update(
     agentId: string,
@@ -439,6 +461,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
   const firstPaintMin = opts.firstPaintMinMs ?? 8000
   const heartbeatTickMs = opts.heartbeatTickMs ?? 6000
   const maxRows = Math.max(1, Math.floor(opts.maxRows ?? 8))
+  const reconcilePinFn = opts.reconcilePin ?? (() => {})
   const setIntervalFn =
     opts.setInterval ??
     ((cb: () => void, ms: number): unknown => {
@@ -607,6 +630,18 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
   }
 
   /**
+   * Reconcile the GROUP-level status pin (#3207 review). Pin the shared message
+   * while the group has a posted message AND at least one tracked worker;
+   * unpin the instant the group empties. Because it is keyed by the whole group
+   * (not a single worker), a per-worker finish never unpins a message a sibling
+   * still needs — the survivors keep the pin until the LAST worker is done.
+   */
+  function syncPin(g: FeedGroup): void {
+    const messageId = g.messageId != null && g.workers.size > 0 ? g.messageId : null
+    reconcilePinFn({ feedKey: g.feedKey, chatId: g.chatId, threadId: g.threadId, messageId })
+  }
+
+  /**
    * Drive the group's shared message to the current combined body. Handles
    * first-paint gating, the proactive throttle (bypassed by `force`), the
    * dedup/no-op skip, the send-gate SHED contract, and 429/flood cooldown.
@@ -625,6 +660,9 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
     const settleTerminal = (): void => {
       g.pendingFinalize = null
       if (opts2.finishingAgentId != null) removeWorker(g, opts2.finishingAgentId)
+      // Group-level pin follows membership: unpin once this drops the last
+      // worker; a NOOP-pin (siblings remain) keeps the shared message pinned.
+      syncPin(g)
     }
     if (now < g.cooldownUntil) {
       if (isTerminal && opts2.terminalRecap != null) g.pendingFinalize = opts2.terminalRecap
@@ -670,6 +708,8 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
         g.messageId = sent.message_id
         g.lastBody = body
         g.lastEditAt = now
+        // Group's first (or re-established) message is up → pin it for the group.
+        syncPin(g)
         log(
           `worker-feed: paint feed=${g.feedKey} chat=${g.chatId} ` +
             `thread=${g.threadId ?? '-'} msgId=${g.messageId} workers=${g.workers.size} bytes=${body.length}`,
@@ -733,7 +773,10 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
         // are still live. On a terminal finalize, also drop the finished row.
         g.messageId = null
         g.lastBody = null
+        // The pinned message no longer exists → release the group pin claim
+        // (settleTerminal already re-syncs on the terminal path).
         if (isTerminal) settleTerminal()
+        else syncPin(g)
         return
       }
       // 'transient' — leave the message intact; the heartbeat re-attempts.
@@ -800,6 +843,10 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
     },
     messageIdOf(agentId) {
       return groupOfAgent(agentId)?.messageId ?? null
+    },
+    hasRunningInFeed(feedKey) {
+      const g = groups.get(feedKey)
+      return g != null && g.workers.size > 0
     },
     get size() {
       let n = 0
@@ -881,8 +928,11 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
           if (others.length > 0) {
             // Siblings still live → drop this row from the combined body and
             // re-render the running set. The result reaches the user via the
-            // separate handback, never folded into this cosmetic edit.
+            // separate handback, never folded into this cosmetic edit. The
+            // group pin STAYS (siblings still need the shared message) — a
+            // per-worker unpin here was the #3207 review blocker.
             removeWorker(group, agentId)
+            syncPin(group)
             return doRender(group, { force: true })
           }
           // Last live worker → finalize the shared message to its terminal recap.
@@ -902,6 +952,9 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       if (g == null) return
       const hadMessage = g.messageId != null
       removeWorker(g, agentId)
+      // Group pin follows membership: unpin if this emptied the group, else
+      // keep it (siblings still need the shared message).
+      if (hadMessage) syncPin(g)
       // Re-render so the dropped worker disappears from a combined body. Skip
       // when the group is gone (removeWorker deleted it) or never painted.
       if (hadMessage && groups.has(g.feedKey) && runningRows(g).length > 0) {
