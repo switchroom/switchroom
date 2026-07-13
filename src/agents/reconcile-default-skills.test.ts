@@ -267,6 +267,51 @@ describe("reconcileAgentDefaultSkills — legacy-prefix migration (#1164)", () =
     expect(result.added).toContain("skill-a");
     expect(readlinkSync(join(skillsDir, "skill-a"))).toBe(join(poolDir, "skill-a"));
   });
+
+  it("repoints a symlink whose target was the retired bun-global switchroom-ai/skills path (carrie RCA)", () => {
+    const agentDir = makeAgentDir(tmpRoot, "ag1");
+    const skillsDir = join(agentDir, ".claude", "skills");
+    mkdirSync(skillsDir, { recursive: true });
+    // Exact retired legacy shape that left carrie with 7 dangling links:
+    // .../node_modules/switchroom-ai/skills/<key> (NOT .../switchroom/skills/).
+    // Dangling on purpose — lstat only needs to see a symlink.
+    symlinkSync(
+      "/home/agent/.bun/install/global/node_modules/switchroom-ai/skills/skill-a",
+      join(skillsDir, "skill-a"),
+    );
+
+    const result = reconcileAgentDefaultSkills(
+      agentDir,
+      {},
+      [{ key: "skill-a", optOutKey: "skill-a", source: "anthropic" }],
+      poolDir,
+    );
+    // Owned-stale: link is deleted and recreated pointing into the current pool.
+    expect(result.added).toContain("skill-a");
+    expect(result.conflicts).not.toContain("skill-a");
+    expect(readlinkSync(join(skillsDir, "skill-a"))).toBe(join(poolDir, "skill-a"));
+  });
+
+  it("leaves a genuinely foreign switchroom-ai-like path alone (no over-match)", () => {
+    const agentDir = makeAgentDir(tmpRoot, "ag1");
+    const skillsDir = join(agentDir, ".claude", "skills");
+    mkdirSync(skillsDir, { recursive: true });
+    // Operator-custom location — resembles nothing switchroom owns; must be
+    // preserved as a conflict, proving the legacy matcher isn't a blanket match.
+    const foreignTarget = join(tmpRoot, "custom", "skills", "skill-a");
+    mkdirSync(foreignTarget, { recursive: true });
+    symlinkSync(foreignTarget, join(skillsDir, "skill-a"));
+
+    const result = reconcileAgentDefaultSkills(
+      agentDir,
+      {},
+      [{ key: "skill-a", optOutKey: "skill-a", source: "anthropic" }],
+      poolDir,
+    );
+    expect(result.conflicts).toContain("skill-a");
+    expect(result.added).not.toContain("skill-a");
+    expect(readlinkSync(join(skillsDir, "skill-a"))).toBe(foreignTarget);
+  });
 });
 
 describe("getBuiltinDefaultSkillEntries", () => {
