@@ -22,9 +22,9 @@ import {
   ErrorPresenceGate,
   errorPresenceGate,
   ERROR_COLLAPSE_WINDOW_MS,
-  isRawLlmErrorText,
   type LlmErrorRetryState,
 } from '../llm-error-present.js'
+import { truncateDetailPreservingRequestId } from '../raw-error-scrub.js'
 import { projectTranscriptLine, detectErrorInTranscriptLine } from '../session-tail.js'
 import { renderOperatorEvent, type OperatorEvent } from '../operator-events.js'
 
@@ -132,7 +132,6 @@ describe('parseLlmError — classification table', () => {
     expect(p.model).toBe('claude-opus-4-8')
     expect(p.requestId).toBe('req_abc123')
     assertNoRawBytes(p.coreText)
-    if (p.reason) assertNoRawBytes(p.reason)
   })
 })
 
@@ -211,8 +210,15 @@ describe('ErrorPresenceGate — dedup key semantics', () => {
 })
 
 // ─── auto-retry silence ──────────────────────────────────────────────────────
+//
+// UNIT test of the module's own auto-retry-silence CONTRACT: given a retryState
+// with attempt<max, a transient error is suppressed. This is NOT exercised by
+// the production gateway wiring (it calls `parseLlmError(detail)` without a
+// retryState, and session-tail already drops in-flight transients upstream — see
+// the note in decideErrorSurface). These cases pin the module guarantee for any
+// caller that DOES thread retryState; they do not imply the gateway does.
 
-describe('decideErrorSurface — auto-retry silence', () => {
+describe('decideErrorSurface — auto-retry silence (module contract, retryState-driven)', () => {
   beforeEach(() => errorPresenceGate.reset())
 
   it('a transient 529 mid-retry (attempt<max) is silenced on all surfaces', () => {
@@ -290,13 +296,14 @@ describe('golden fan-out — one 429 line → exactly one JSON-free user message
     expect(projected.some((e) => e.kind === 'text')).toBe(false)
 
     // Surface #2 (operator card): the SAME line is independently classified and
-    // rendered as the ONE humanized card.
+    // rendered as the ONE humanized card. This mirrors the production gateway
+    // call exactly — `parseLlmError(detail)` with NO retryState (session-tail
+    // has already dropped any in-flight transient before forwarding, so the
+    // event that reaches the gateway is terminal by construction).
     const detected = detectErrorInTranscriptLine(line)
     expect(detected).not.toBeNull()
-    const parsed = parseLlmError(detected!.detail, {
-      retryAttempt: detected!.terminal ? 5 : 1,
-      maxRetries: 5,
-    })
+    expect(detected!.terminal).toBe(true)
+    const parsed = parseLlmError(detected!.detail)
     if (decideErrorSurface(parsed, 'gymbro', { claim: true }) === 'render') {
       userMessages.push(renderLlmError(parsed, 'gymbro', 'Australia/Melbourne').text)
     }
@@ -331,11 +338,43 @@ describe('renderOperatorEvent — never relays raw error bytes', () => {
   })
 })
 
-// ─── isRawLlmErrorText passthrough guard ─────────────────────────────────────
+// ─── request_id survives the 1000-char bridge truncation (MEDIUM) ─────────────
 
-describe('isRawLlmErrorText', () => {
-  it('flags raw error lines and passes clean prose', () => {
-    expect(isRawLlmErrorText(`chatter · ${RAW_BYTES}`)).toBe(true)
-    expect(isRawLlmErrorText('here is my normal answer about errors in general')).toBe(false)
+describe('truncateDetailPreservingRequestId — exact dedup key survives truncation', () => {
+  beforeEach(() => errorPresenceGate.reset())
+
+  // A realistic long Anthropic rate-limit body whose request_id sits PAST char
+  // 1000 (the bridge's OPERATOR_EVENT_DETAIL_MAX). `filler` pads the human part.
+  function longRateLimitLine(requestId: string): string {
+    const filler = 'Server is temporarily limiting requests (not your usage limit). '.repeat(30)
+    return `${filler} b'{"type":"error","error":{"type":"rate_limit_error","message":"rate limited"},"request_id":"${requestId}"}'`
+  }
+
+  it('preserves the request_id that a naive slice(0,1000) would drop', () => {
+    const line = longRateLimitLine('req_deadbeef01')
+    expect(line.length).toBeGreaterThan(1000)
+    // A naive slice loses the trailing id...
+    expect(extractRequestId(line.slice(0, 1000))).toBeUndefined()
+    // ...but the preserving truncation keeps it, within budget.
+    const truncated = truncateDetailPreservingRequestId(line, 1000)
+    expect(truncated.length).toBeLessThanOrEqual(1000)
+    expect(extractRequestId(truncated)).toBe('req_deadbeef01')
+  })
+
+  it('two DISTINCT request_ids past char 1000 render TWO messages (exact key still fires)', () => {
+    const now = 9_000_000
+    const messages: string[] = []
+    for (const rid of ['req_aaaaaaaa', 'req_bbbbbbbb']) {
+      // Simulate the bridge hop: truncate-preserving, THEN parse gateway-side.
+      const detail = truncateDetailPreservingRequestId(longRateLimitLine(rid), 1000)
+      const parsed = parseLlmError(detail)
+      expect(parsed.requestId).toBe(rid) // exact key preserved, not coarse fallback
+      if (decideErrorSurface(parsed, 'gymbro', { claim: true, now }) === 'render') {
+        messages.push(renderLlmError(parsed, 'gymbro', 'UTC', new Date(now)).text)
+      }
+    }
+    // Pre-fix (id truncated away) both fall to the SAME `${kind}:${agent}:${bucket}`
+    // key and collapse to ONE. With the id preserved, the exact keys differ → TWO.
+    expect(messages).toHaveLength(2)
   })
 })

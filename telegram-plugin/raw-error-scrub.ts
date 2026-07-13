@@ -33,3 +33,41 @@ export function stripRawErrorBytes(raw: string): string {
   s = s.replace(/\s+/g, ' ').replace(/[·:\-\s]+$/g, '').replace(/^[·:\-\s]+/g, '').trim()
   return s
 }
+
+/**
+ * Pull an Anthropic `request_id` out of a raw error string, or undefined. The
+ * id lives in the trailing byte-blob (`…,"request_id":"req_abc"}'`) and can sit
+ * far into a long body — see `truncateDetailPreservingRequestId`. Total.
+ */
+export function extractRequestId(raw: string): string | undefined {
+  if (typeof raw !== 'string' || raw.length === 0) return undefined
+  const m =
+    raw.match(/["']request[_-]?id["']\s*:\s*["']([A-Za-z0-9._-]+)["']/i) ??
+    raw.match(/\brequest[_-]?id[=:]\s*([A-Za-z0-9._-]+)/i)
+  return m ? m[1] : undefined
+}
+
+/**
+ * Truncate an error `detail` to `max` chars WITHOUT losing the `request_id`.
+ *
+ * Why this exists: the bridge forwards operator-event detail truncated to 1000
+ * chars (OPERATOR_EVENT_DETAIL_MAX), but the Anthropic `request_id` lives in the
+ * trailing byte-blob, which can sit PAST char 1000. A naive `slice(0, 1000)`
+ * drops it, so the cross-surface dedup gate silently degrades from the reliable
+ * `rid:` EXACT key to the coarse `${kind}:${agent}:${bucket}` key — collapsing
+ * two genuinely-distinct same-kind errors within 60s into one card.
+ *
+ * Fix: extract the id from the FULL body first; if the plain head would drop it,
+ * append `request_id=<id>` in the freed tail budget (`extractRequestId` matches
+ * that form), keeping the result ≤ `max`. Total — never throws.
+ */
+export function truncateDetailPreservingRequestId(detail: string, max: number): string {
+  if (typeof detail !== 'string') return ''
+  if (detail.length <= max) return detail
+  const rid = extractRequestId(detail)
+  const head = detail.slice(0, max)
+  if (rid == null || head.includes(rid)) return head
+  const suffix = ` request_id=${rid}`
+  const headBudget = Math.max(0, max - suffix.length)
+  return `${detail.slice(0, headBudget)}${suffix}`
+}

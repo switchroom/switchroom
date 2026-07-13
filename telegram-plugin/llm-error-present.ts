@@ -35,11 +35,10 @@ import {
 import { classify429Detail } from './throttle-tier.js'
 import { classifyClaudeError } from './operator-events.js'
 import type { InlineKeyboardMarkup } from './operator-events.js'
-import { looksLikeRawApiError } from './pty-partial-handler.js'
-import { stripRawErrorBytes } from './raw-error-scrub.js'
+import { stripRawErrorBytes, extractRequestId } from './raw-error-scrub.js'
 import { fmtLocalClock, tzAbbrev } from './shared/local-time.js'
 
-export { stripRawErrorBytes } from './raw-error-scrub.js'
+export { stripRawErrorBytes, extractRequestId } from './raw-error-scrub.js'
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -48,7 +47,6 @@ export type LlmErrorKind =
   | 'overload_529'
   | 'quota_wall'
   | 'auth'
-  | 'model_unavailable'
   | 'transient'
   | 'unknown'
 
@@ -58,8 +56,6 @@ export interface ParsedLlmError {
   kind: LlmErrorKind
   /** Human, JSON-STRIPPED one-liner built from a per-kind template. Never raw. */
   coreText: string
-  /** Optional extra human context (also JSON-stripped). */
-  reason?: string
   /** Parsed reset instant, when the source carried one. */
   resetAt?: Date
   /** Parsed retry-after window in ms, when the source carried one. */
@@ -81,16 +77,7 @@ export interface LlmErrorRetryState {
   maxRetries: number | null
 }
 
-// ─── request_id extraction ───────────────────────────────────────────────────
-
-/** Pull an Anthropic `request_id` out of a raw string, or undefined. */
-export function extractRequestId(raw: string): string | undefined {
-  if (typeof raw !== 'string' || raw.length === 0) return undefined
-  const m =
-    raw.match(/["']request[_-]?id["']\s*:\s*["']([A-Za-z0-9._-]+)["']/i) ??
-    raw.match(/\brequest[_-]?id[=:]\s*([A-Za-z0-9._-]+)/i)
-  return m ? m[1] : undefined
-}
+// ─── model extraction ────────────────────────────────────────────────────────
 
 /** Pull a resolved model id (`claude-…`, `sr-…`) out of a raw string, or undefined. */
 function extractModel(raw: string): string | undefined {
@@ -148,13 +135,9 @@ export function parseLlmError(
     }
   }
 
-  const reasonRaw = stripRawErrorBytes(text)
-  const reason = reasonRaw.length > 0 && reasonRaw.length <= 200 ? reasonRaw : undefined
-
   return {
     kind,
     coreText: buildCoreText(kind, source),
-    ...(reason != null ? { reason } : {}),
     ...(resetAt != null ? { resetAt } : {}),
     ...(retryAfterMs != null ? { retryAfterMs } : {}),
     ...(model != null ? { model } : {}),
@@ -230,8 +213,6 @@ function buildCoreText(kind: LlmErrorKind, source: LlmErrorSource): string {
       return 'Usage limit reached on this Claude subscription.'
     case 'auth':
       return 'Claude login needs re-authentication.'
-    case 'model_unavailable':
-      return 'The model is temporarily unavailable.'
     case 'transient':
       return source === 'network'
         ? "Couldn't reach Anthropic (network) — retrying automatically."
@@ -334,8 +315,6 @@ function kindEmoji(kind: LlmErrorKind): string {
       return '⚠️'
     case 'auth':
       return '🔑'
-    case 'model_unavailable':
-      return '🚧'
     case 'transient':
       return '🌐'
     case 'unknown':
@@ -439,7 +418,14 @@ export function decideErrorSurface(
   }
 
   // Auto-retry silence: a transient error still being retried internally is
-  // NOT surfaced on ANY surface until it goes terminal.
+  // NOT surfaced on ANY surface until it goes terminal. NOTE: in the current
+  // production wiring the operator surface reaches here only AFTER session-tail
+  // (readNew → `errEvent.terminal || !errEvent.transient`) has already dropped
+  // in-flight transients, and the gateway calls `parseLlmError(detail)` with no
+  // retryState (the raw retry annotations don't survive the IPC hop) — so a
+  // production `parsed.autoRetrying` is always false here. This branch is the
+  // module's own guarantee for ANY caller that DOES pass retryState (unit-tested
+  // as such); prod silence is owned upstream at session-tail, not re-derived here.
   if (parsed.autoRetrying && !parsed.terminal) return 'suppress'
 
   const key = gate.keyFor(parsed, agent, now)
@@ -447,13 +433,4 @@ export function decideErrorSurface(
     return gate.claim(key, now) ? 'render' : 'suppress'
   }
   return gate.isClaimed(key, now) ? 'suppress' : 'render'
-}
-
-/**
- * True when `text` is a raw LLM-error line that a non-card surface (reply /
- * done-card recap) must NOT relay as the turn's answer. Thin re-export of the
- * `looksLikeRawApiError` anchors so the reply/recap paths share ONE detector.
- */
-export function isRawLlmErrorText(text: string): boolean {
-  return looksLikeRawApiError(text)
 }
