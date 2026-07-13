@@ -6752,10 +6752,19 @@ function isAutoFallbackCooldownActive(_agentName: string, now: number): boolean 
 
 async function editCardExpired(chatId: string, messageId: number | undefined, body: string): Promise<void> {
   if (messageId == null) return
-  await lockedBot.api
-    // allow-raw-bot-api: message-id-targeted edit (no thread to lose); best-effort card-expiry strip from the reaper (no grammy ctx). Dropping reply_markup strips the stale keyboard atomically with the text edit.
-    .editMessageText(chatId, messageId, richMessage(body), { reply_markup: { inline_keyboard: [] } })
-    .catch(() => {})
+  // #3084 bypass audit: this best-effort card-expiry strip (reaper + lazy
+  // sweeps, no grammy ctx) previously fired a RAW `lockedBot.api.editMessageText`
+  // OUTSIDE the send gate — a residual flood vector (a 429 here never reached
+  // `onFloodWait`, so the breaker stayed blind). Routed through `robustApiCall`
+  // (chat-lock → send-gate → retry/breaker) as a `cosmetic` edit carrying
+  // messageId+editPayload so it paces/sheds under pressure and its 429 records
+  // the flood window. Dropping reply_markup strips the stale keyboard atomically
+  // with the text edit; message-id-targeted so no thread to lose.
+  const text = richMessage(body)
+  await robustApiCall(
+    () => lockedBot.api.editMessageText(chatId, messageId, text, { reply_markup: { inline_keyboard: [] } }),
+    { chat_id: chatId, verb: 'card-expired.strip', priorityClass: 'cosmetic', messageId, editPayload: body },
+  ).catch(() => {})
 }
 
 function recordMissedApproval(opts: {
@@ -8619,6 +8628,17 @@ async function runMidSessionCardReaper(): Promise<void> {
       const reaps = decideWorkerPinReaps({
         pins: candidates,
         statusOf: (agentId) => {
+          // #3207: coalesced feed pins are GROUP-level (`wk:group:<feedKey>`),
+          // so `workerAgentIdOfPinKey` yields `group:<feedKey>`, not a real
+          // jsonl agent id. Vouch for these off the live feed instead of the
+          // registry: a group the feed still tracks is 'running' (exempt from
+          // the TTL); a lingering group pin the feed no longer knows about is a
+          // missed unpin → 'terminal' (reap now). The feed's own group-empty
+          // unpin is the primary path; this is the missed-unpin backstop.
+          if (agentId.startsWith('group:')) {
+            const feedKey = agentId.slice('group:'.length)
+            return workerActivityFeed?.hasRunningInFeed(feedKey) ? 'running' : 'terminal'
+          }
           if (turnsDb == null) return 'unknown'
           try {
             const row = getSubagentByJsonlId(turnsDb, agentId)
@@ -8777,34 +8797,14 @@ async function reconcileStatusPinInner(
   }
 }
 
-/**
- * Background-worker desired-pin, driven off the live `🛠 Worker` message.
- * Reads the worker feed's current message_id (the EXISTING message — we pin
- * what the feed already rendered, never a new send) and reconciles a silent
- * pin while it's running / an unpin on completion. No-op until the feed has
- * actually painted a message for this worker (trivial sub-second workers stay
- * silent and are never pinned). Keyed `wk:<agentId>`.
- */
-function reconcileWorkerPin(
-  agentId: string,
-  chatId: string | null,
-  running: boolean,
-): void {
-  if (!PIN_STATUS_WHILE_WORKING) return
-  const key = `wk:${agentId}`
-  if (!running) {
-    // Unpin: recover the chat we pinned in (caller may not have it at
-    // completion). No-op when nothing was pinned for this worker.
-    const unpinChat = chatId ?? statusPinChatIds.get(key)
-    if (unpinChat == null) return
-    void reconcileStatusPin(key, unpinChat, { pinned: false })
-    return
-  }
-  if (chatId == null) return
-  const messageId = workerActivityFeed?.messageIdOf(agentId) ?? null
-  if (messageId == null) return // no message painted yet — nothing to pin
-  void reconcileStatusPin(key, chatId, { pinned: true, messageId })
-}
+// #3207: the per-worker `reconcileWorkerPin(agentId, …)` (keyed `wk:<agentId>`)
+// was removed. Now that background workers COALESCE into one shared message per
+// chat/thread, the pin is driven at the GROUP level by the feed itself
+// (`reconcilePin` → `wk:group:<feedKey>`, wired at createWorkerActivityFeed):
+// it pins when the group's first worker paints and unpins only when the group
+// empties. A per-worker unpin used to physically unpin a message a sibling
+// still needed, after which the survivor's re-pin NO-OP'd (its claim still
+// named that id) — leaving live work unpinned (review blocker).
 
 /** Unpin every owned status pin — used by the pre-restart sweep so a
  *  crash / interrupt never leaves a permanent pin behind. Best-effort;
@@ -29352,6 +29352,12 @@ void (async () => {
             // supersedes the coarse 5-min bucket relay below to avoid
             // double-surfacing the same progress beat.
             const workerFeedEnabled = isWorkerActivityFeedEnabled(process.env.SWITCHROOM_WORKER_ACTIVITY_FEED)
+            // Combined-feed row cap (channels.telegram.worker_feed.max_rows).
+            // Unset / non-positive → the feed's built-in default (8).
+            const workerFeedMaxRows = (() => {
+              const raw = Number(process.env.SWITCHROOM_TG_WORKER_FEED_MAX_ROWS)
+              return Number.isInteger(raw) && raw > 0 ? raw : undefined
+            })()
             // Model A — foreground sub-agent nesting in the parent's live
             // activity draft. ON by default; this edits the SAME activity-
             // summary message the tool_label feed already owns (not the
@@ -29409,6 +29415,32 @@ void (async () => {
               // every ~6s for the whole ban (the worker-feed shed-contract bug:
               // 565 `sent.message_id` crashes in one 6h ban).
               floodWaitRemainingMs: probeFloodWaitRemainingMs,
+              // #3084 follow-up: 2+ background workers in one chat/thread coalesce
+              // into ONE combined feed message. `maxRows` caps the visible rows
+              // (compact `+M more working…` spill) so the body stays under the
+              // rich-message wire ceiling (STATUS_CARD_CHAR_BUDGET). Sourced from
+              // channels.telegram.worker_feed.max_rows via the config cascade
+              // (scaffold emits SWITCHROOM_TG_WORKER_FEED_MAX_ROWS); unset → 8.
+              maxRows: workerFeedMaxRows,
+              // #3207 review: GROUP-level status pin. Workers now coalesce into
+              // ONE shared message, so the pin must follow the GROUP lifecycle,
+              // not a single worker's — otherwise a sibling's finish unpins a
+              // message the survivors still need and the survivor's re-pin NOOPs
+              // (its claim still names that id), leaving live work unpinned. The
+              // feed drives this: pin `wk:group:<feedKey>` when the group first
+              // paints, unpin only when the group empties (messageId === null).
+              reconcilePin: ({ feedKey, chatId, messageId }) => {
+                if (!PIN_STATUS_WHILE_WORKING) return
+                const key = `wk:group:${feedKey}`
+                if (messageId != null) {
+                  void reconcileStatusPin(key, chatId, { pinned: true, messageId })
+                } else {
+                  const unpinChat = chatId || statusPinChatIds.get(key)
+                  if (unpinChat != null && unpinChat.length > 0) {
+                    void reconcileStatusPin(key, unpinChat, { pinned: false })
+                  }
+                }
+              },
               log: (msg) => process.stderr.write(`telegram gateway: ${msg}\n`),
             })
             subagentWatcher = startSubagentWatcher({
@@ -29525,9 +29557,9 @@ void (async () => {
               // anything. The actual repaint + re-pin happen DOWNSTREAM on the
               // next replayed `running` cue: the watcher's re-registration
               // replays `onProgress`, which calls `workerActivityFeed.update()`
-              // (now un-gated) to first-paint a FRESH `🛠 Worker` message, and
-              // its `.then(reconcileWorkerPin(agentId, wkChat, true))` pins that
-              // new message via the `wk:<agentId>` status-pin. Clearing the gate
+              // (now un-gated) to first-paint a FRESH message, and the feed's
+              // own `reconcilePin` (#3207) re-pins that message at the GROUP
+              // level (`wk:group:<feedKey>`). Clearing the gate
               // here FIRST is the ordering requirement — without it those first
               // replayed ticks would be swallowed by the finalized gate and no
               // new card would ever paint. Net effect restores the operator
@@ -29633,7 +29665,7 @@ void (async () => {
                       // card keeps the model tag even with no live entry.
                       model: dispatch.feedModel ?? undefined,
                     })
-                    reconcileWorkerPin(agentId, null, false)
+                    // #3207: group-level pin dropped by the feed on group-empty.
                   }
                   return
                 }
@@ -29711,8 +29743,9 @@ void (async () => {
                       state: outcome === 'failed' ? 'failed' : 'done',
                       model: dispatch.feedModel ?? undefined,
                     })
-                    // Status-pin: worker done — drop its pin.
-                    reconcileWorkerPin(agentId, null, false)
+                    // #3207: the group-level pin is dropped by the feed itself
+                    // when this group's LAST worker finishes (reconcilePin →
+                    // `wk:group:<feedKey>`); no per-worker unpin here.
                   }
                   return
                 }
@@ -29731,8 +29764,8 @@ void (async () => {
                     state: outcome === 'failed' ? 'failed' : 'done',
                     model: dispatch.feedModel ?? undefined,
                   })
-                  // Status-pin: worker done — drop its pin.
-                  reconcileWorkerPin(agentId, null, false)
+                  // #3207: the group-level pin is dropped by the feed itself
+                  // when this group's LAST worker finishes; no per-worker unpin.
                 }
 
                 const handbackOrigin = resolveSubagentOriginChat(agentId)
@@ -29899,7 +29932,10 @@ void (async () => {
                         model: feedModel,
                       },
                       wk.threadId,
-                    )?.then(() => reconcileWorkerPin(agentId, wkChat, true))
+                    )
+                  // #3207: the feed pins the group's shared message itself when
+                  // it first paints (reconcilePin → `wk:group:<feedKey>`); no
+                  // per-worker pin chained here.
                     return
                   }
                   if (surface !== 'nest') return // 'skip' — orphan-status off
@@ -30041,7 +30077,10 @@ void (async () => {
                       model: feedModel,
                     },
                     wk.threadId,
-                  )?.then(() => reconcileWorkerPin(agentId, wkChat, true))
+                  )
+                  // #3207: the feed pins the group's shared message itself when
+                  // it first paints (reconcilePin → `wk:group:<feedKey>`); no
+                  // per-worker pin chained here.
                   return
                 }
 

@@ -1231,6 +1231,29 @@ export const TelegramChannelSchema = z
         "today's exact behaviour — this is pure operator tuning, no default is " +
         "changed. Cascades from defaults.channels.telegram.send_gate."
       ),
+    worker_feed: z
+      .object({
+        max_rows: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe(
+            "Max live-worker rows rendered in the COMBINED worker-activity feed " +
+            "(2+ background workers in one chat/thread coalesce into ONE message; " +
+            "telegram-plugin/worker-activity-feed.ts) before a compact " +
+            "'+M more working…' spill line — keeps the coalesced body compact and " +
+            "legible (and under the rich-message wire ceiling). Default 8. A " +
+            "single-worker chat renders the full 🛠 Worker card and ignores this. " +
+            "Must be an integer >= 1. Omit to keep 8."
+          ),
+      })
+      .optional()
+      .describe(
+        "Tuning for the coalesced worker-activity feed " +
+        "(telegram-plugin/worker-activity-feed.ts). Cascades from " +
+        "defaults.channels.telegram.worker_feed."
+      ),
     // progress_card block removed in #1122 PR3 (the pinned progress card
     // was replaced by conversational pacing + silence-poke). Existing
     // YAML files with a stale progress_card key will be silently

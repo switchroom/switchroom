@@ -130,6 +130,30 @@ describe("TelegramChannelSchema — send_gate rate limits (#3084)", () => {
   });
 });
 
+describe("TelegramChannelSchema — worker_feed.max_rows (coalesced feed)", () => {
+  it("accepts a positive integer max_rows", () => {
+    const r = TelegramChannelSchema.parse({ worker_feed: { max_rows: 10 } });
+    expect(r?.worker_feed).toEqual({ max_rows: 10 });
+  });
+
+  it("omitting worker_feed leaves it undefined (built-in default of 8 owns the unset case)", () => {
+    const r = TelegramChannelSchema.parse({ format: "html" });
+    expect(r?.worker_feed).toBeUndefined();
+  });
+
+  it("rejects a zero max_rows LOUDLY (a 0-row feed would render no live workers)", () => {
+    expect(() =>
+      TelegramChannelSchema.parse({ worker_feed: { max_rows: 0 } }),
+    ).toThrow();
+  });
+
+  it("rejects a non-integer max_rows LOUDLY", () => {
+    expect(() =>
+      TelegramChannelSchema.parse({ worker_feed: { max_rows: 8.5 } }),
+    ).toThrow();
+  });
+});
+
 describe("TelegramChannelSchema — voice_out (PR-C2)", () => {
   it("applies engine/reply_mode defaults when only enabled is set", () => {
     const r = TelegramChannelSchema.parse({ voice_out: { enabled: true } });
