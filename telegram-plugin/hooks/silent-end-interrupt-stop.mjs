@@ -173,6 +173,19 @@ function main() {
       nextState.threadId = decision.threadId
     }
   }
+  // Option A transcript-prose bridge: when the scan isolated a substantive
+  // final answer the model wrote as plain text but never sent through the
+  // reply tool, persist it so the gateway's turn-end path can deliver it
+  // directly on the first silent-end (instead of relying on this hook's
+  // re-prompt / the obligation represent to eventually recover it). The
+  // gateway reads this field back out of the same state file. Explicitly
+  // clear a stale carryover value from a prior turn's spread `...state` when
+  // THIS turn has no deliverable prose, so an old answer is never re-sent.
+  if (typeof decision.pendingText === 'string' && decision.pendingText.length > 0) {
+    nextState.pendingText = decision.pendingText
+  } else {
+    delete nextState.pendingText
+  }
   try {
     writeFileSync(statePath, JSON.stringify(nextState), 'utf8')
   } catch (err) {

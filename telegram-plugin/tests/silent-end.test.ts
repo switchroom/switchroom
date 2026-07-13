@@ -9,10 +9,13 @@ import {
   readSilentEndState,
   recordSilentTurnEnd,
   recordUndeliveredTurnEnd,
+  decideCapturedProseDelivery,
+  CAPTURED_PROSE_MIN_CHARS,
   SILENT_END_MAX_RETRIES,
   SILENT_END_STALE_RECORD_MAX_AGE_MS,
 } from '../silent-end.js'
 import { isFinalAnswerReply } from '../final-answer-detect.js'
+import { OutboundDedupCache } from '../recent-outbound-dedup.js'
 
 let stateDir: string
 const ORIG_ENV = process.env.TELEGRAM_STATE_DIR
@@ -682,5 +685,104 @@ describe('silent-end-interrupt-stop hook — integration (#1775: transcript-scan
   it('fails open on empty stdin', () => {
     const r = runHook({}) // serialised as `{}` — but the hook also tolerates empty
     expect(r.exit).toBe(0)
+  })
+
+  // ── Option A transcript-prose bridge (#3227) — end-to-end scan → hook →
+  //    state → gateway decision. Proves the gateway would deliver the model's
+  //    real answer directly on the FIRST silent-end.
+  describe('captured-prose delivery bridge (#3227)', () => {
+    const ANSWER = 'That was actually your FY25 NOA, not Bloomfield. ' + 'A'.repeat(2200)
+
+    it('FIRST silent-end with a genuine plain-text answer → hook persists pendingText and decide → deliver', () => {
+      // A turn that ended with a substantive answer written as plain text
+      // (never sent via the reply tool). The Stop hook scans, blocks, and now
+      // persists the answer prose into silent-end-pending.json.
+      const transcript = writeTranscript([
+        ENQUEUE,
+        replyToolUse('on it — checking now', { disable_notification: true }),
+        { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: {} }] } },
+        { type: 'assistant', message: { content: [{ type: 'text', text: ANSWER }] } },
+      ])
+      const r = runHook({ session_id: 's', transcript_path: transcript, hook_event_name: 'Stop' })
+      expect(r.exit).toBe(0)
+      expect(JSON.parse(r.stdout.trim()).decision).toBe('block')
+
+      // The bridge: the hook wrote the answer prose into the state file...
+      const state = readSilentEndState()!
+      expect(state.pendingText).toBe(ANSWER)
+      expect(state.turnKey).toBe('c:_')
+
+      // ...and the gateway's pure decision core reads it back and decides to
+      // deliver directly on this FIRST silent-end (retryCount just went to 1).
+      const decision = decideCapturedProseDelivery({ turnKey: 'c:_' })
+      expect(decision.deliver).toBe(true)
+      expect(decision.text).toBe(ANSWER)
+      expect(decision.reason).toBe('captured-prose')
+      // FIRST silent-end: this is the retry-budget's first block, not exhaustion.
+      expect(state.retryCount).toBe(1)
+    })
+
+    it('a turn that DID call a final reply → no state, no pendingText, decide → no synthetic send', () => {
+      const transcript = writeTranscript([
+        ENQUEUE,
+        replyToolUse('here is the answer, notification-bearing', { disable_notification: false }),
+      ])
+      const r = runHook({ session_id: 's', transcript_path: transcript, hook_event_name: 'Stop' })
+      expect(r.stdout.trim()).toBe('')
+      expect(readSilentEndState()).toBeNull()
+      const decision = decideCapturedProseDelivery({ turnKey: 'c:_' })
+      expect(decision.deliver).toBe(false)
+      expect(decision.reason).toBe('no-state')
+    })
+
+    it('a genuinely empty turn (no substantive prose) → hook blocks WITHOUT pendingText → decide falls through', () => {
+      // Short closer under the substance floor: not a dropped answer. The hook
+      // still blocks (re-prompt), but writes NO pendingText, so the gateway
+      // takes the existing recordUndeliveredTurnEnd / represent path unchanged.
+      const transcript = writeTranscript([
+        ENQUEUE,
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'ok done' }] } },
+      ])
+      const r = runHook({ session_id: 's', transcript_path: transcript, hook_event_name: 'Stop' })
+      expect(JSON.parse(r.stdout.trim()).decision).toBe('block')
+      const state = readSilentEndState()!
+      expect(state.pendingText).toBeUndefined()
+      const decision = decideCapturedProseDelivery({ turnKey: 'c:_' })
+      expect(decision.deliver).toBe(false)
+      expect(decision.reason).toBe('no-substantive-prose')
+    })
+
+    it('a stale pendingText for a DIFFERENT turn is never delivered (turnKey guard)', () => {
+      const path = join(stateDir, 'silent-end-pending.json')
+      mkdirSync(stateDir, { recursive: true })
+      writeFileSync(path, JSON.stringify({
+        chatId: 'c', threadId: null, turnKey: 'OTHER:_',
+        retryCount: 1, timestamp: Date.now(), pendingText: ANSWER,
+      }))
+      const decision = decideCapturedProseDelivery({ turnKey: 'c:_' })
+      expect(decision.deliver).toBe(false)
+      expect(decision.reason).toBe('turnkey-mismatch')
+    })
+
+    it('double-send guard: once the captured prose is recorded in the dedup cache, a late reply-tool retry is suppressed', () => {
+      // The gateway records what it delivered in the #546 dedup cache. This is
+      // the airtight guard: the re-prompted model's reply (same answer) hits
+      // the same cache at its send site and is dropped — the represent + the
+      // captured-prose delivery are mutually exclusive by construction.
+      const dedup = new OutboundDedupCache()
+      const t0 = 1_000_000
+      // Gateway captured-prose delivery records the answer.
+      dedup.record('c', undefined, ANSWER, t0, 'reg-1')
+      // Model re-prompt then calls reply with the same answer moments later.
+      const hit = dedup.check('c', undefined, ANSWER, t0 + 5_000, 'reg-1')
+      expect(hit).not.toBeNull()
+      // A genuinely different later answer is NOT suppressed.
+      const miss = dedup.check('c', undefined, 'a completely different answer ' + 'X'.repeat(50), t0 + 5_000, 'reg-1')
+      expect(miss).toBeNull()
+    })
+
+    it('CAPTURED_PROSE_MIN_CHARS matches the scan/final-answer substance floor', () => {
+      expect(CAPTURED_PROSE_MIN_CHARS).toBe(200)
+    })
   })
 })

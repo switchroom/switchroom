@@ -236,7 +236,7 @@ import { decideSilentReplyAnchor } from '../silent-reply-anchor.js'
 import { classifyInbound } from '../inbound-classifier.js'
 import * as silencePoke from '../silence-poke.js'
 import * as pendingProgress from '../pending-work-progress.js'
-import { writeSilentEndState, clearSilentEndState, recordUndeliveredTurnEnd, silentEndFallbackText, type SilentEndDeps } from '../silent-end.js'
+import { writeSilentEndState, clearSilentEndState, recordUndeliveredTurnEnd, silentEndFallbackText, decideCapturedProseDelivery, CAPTURED_PROSE_MIN_CHARS, type SilentEndDeps } from '../silent-end.js'
 import { isFinalAnswerReply, isSubstantiveFinalReply, FINAL_ANSWER_MIN_CHARS } from '../final-answer-detect.js'
 import { deriveTurnRole, decideTerminalReason, parsePostAnswerLivenessMs, evaluatePostAnswerLiveness, type LoopRole } from '../turn-liveness-floor.js'
 import { createAnswerStream, type AnswerStreamHandle } from '../answer-stream.js'
@@ -9271,6 +9271,17 @@ const SILENCE_FLOOR_MS = parsePositiveMsEnv('SWITCHROOM_SILENCE_FLOOR_MS', 45_00
 // #2527 — role-aware terminal reaction honesty (the "thumbs-up false done"
 // fix). Default ON; SWITCHROOM_TG_TERMINAL_HONESTY=0 reverts to always-👍.
 const LIVENESS_TERMINAL_HONESTY = process.env.SWITCHROOM_TG_TERMINAL_HONESTY !== '0'
+// Option A transcript-prose delivery bridge. When a user turn ends without a
+// final answer, the Stop hook scans transcript_path and — if it isolated a
+// substantive answer the model wrote as plain text but never sent through the
+// reply tool — persists it in silent-end-pending.json as `pendingText`. On the
+// FIRST silent-end the gateway reads it back and delivers it directly via the
+// normal send path, instead of relying on the (unreliable) Stop-hook re-prompt
+// or waiting ~2-5 min for the obligation represent to recover it. Default ON;
+// SWITCHROOM_TG_CAPTURED_PROSE_DELIVERY=0 reverts to the pre-bridge behaviour
+// (re-prompt + represent only).
+const CAPTURED_PROSE_DELIVERY_ENABLED =
+  process.env.SWITCHROOM_TG_CAPTURED_PROSE_DELIVERY !== '0'
 // SILENCE_DEFER_INFLIGHT_TOOLS: previously an opt-in (=1). The new
 // isLegitimatelyWorking callback supersedes this — defer is now the DEFAULT
 // when the callback is wired. The legacy flag is kept so `=0` still lets
@@ -10083,6 +10094,106 @@ function agentHasInFlightBackgroundWork(now: number): boolean {
 // Throttle for the background-work defer diagnostic (the 5s sweep would otherwise
 // log every tick across a multi-minute research window).
 let lastBgWorkDeferLogMs = 0
+/**
+ * Option A transcript-prose delivery. Deliver the model's real final answer —
+ * isolated by the Stop hook's transcript scan and persisted as `pendingText`
+ * — directly via the normal send path on the first silent-end, then settle the
+ * bookkeeping so neither the obligation represent nor the exhausted fallback
+ * re-fires for the same answer.
+ *
+ * Double-send guard (airtight by construction):
+ *  - Before sending, `outboundDedup.check` is consulted. If this exact answer
+ *    already went out (a prior turn_end delivered it, or the re-prompted
+ *    model's own reply landed), we SKIP the send and only settle bookkeeping.
+ *  - After a successful send, `outboundDedup.record` is written so a late
+ *    reply-tool retry with the same content is suppressed at its send site
+ *    (executeReply / executeStreamReply already consult the same cache).
+ *  - The obligation is CLOSED and the silent-end state CLEARED, so
+ *    obligationSweep's "outbound delivered since open" guard and the represent
+ *    never re-fire. The captured-prose delivery and the represent are mutually
+ *    exclusive.
+ *
+ * Failure posture: if the send throws, we do NOT close the obligation or clear
+ * the silent-end state — the existing Stop-hook re-prompt and obligation
+ * represent safety nets stay armed to recover the answer. Worst case ==
+ * pre-bridge behaviour.
+ */
+async function deliverCapturedProse(args: {
+  chatId: string
+  threadId: number | undefined
+  statusKeyStr: string
+  registryKey: string | null
+  originTurnId: string
+  text: string
+}): Promise<void> {
+  const { chatId, threadId, statusKeyStr, registryKey, originTurnId, text } = args
+  const now = Date.now()
+  const already = outboundDedup.check(chatId, threadId, text, now, registryKey)
+  if (already == null) {
+    let out = normalizeParagraphBreaks(repairEscapedWhitespace(text))
+    out = redactOutboundText(out, 'captured_prose')
+    const chunks = splitMarkdownChunks(out, RICH_MESSAGE_MAX_CHARS)
+    const sentIds: number[] = []
+    try {
+      let liveThreadId: number | undefined = threadId
+      for (const c of chunks) {
+        const sent = await retryWithThreadFallback(
+          robustApiCall,
+          (tid) => {
+            // Built as a variable (not an inline literal) so excess-property
+            // checks don't reject `link_preview_options` on sendRichMessage's
+            // narrow Other<> type — mirrors the turn-flush send site.
+            const opts = {
+              link_preview_options: { is_disabled: true },
+              ...(tid != null ? { message_thread_id: tid } : {}),
+            }
+            return bot.api.sendRichMessage(chatId, richMessage(c), opts)
+          },
+          { threadId: liveThreadId, chat_id: chatId, verb: 'captured-prose.sendMessage' },
+        )
+        if (liveThreadId != null && (sent as { message_thread_id?: number }).message_thread_id == null) {
+          liveThreadId = undefined
+        }
+        sentIds.push(sent.message_id)
+      }
+      if (HISTORY_ENABLED && sentIds.length > 0) {
+        try {
+          recordOutbound({
+            chat_id: chatId,
+            thread_id: threadId ?? null,
+            message_ids: sentIds,
+            texts: chunks,
+          })
+        } catch {}
+      }
+      // Record what we just sent so a late reply / stream_reply retry with the
+      // same content is deduped at its send site (the #546 dedup cache).
+      outboundDedup.record(chatId, threadId, text, now, registryKey)
+      process.stderr.write(
+        `telegram gateway: captured-prose delivery — sent ${out.length} chars recovered from ` +
+          `transcript scan (chat=${chatId} origin=${originTurnId})\n`,
+      )
+    } catch (err) {
+      process.stderr.write(
+        `telegram gateway: captured-prose delivery failed: ${(err as Error).message} — ` +
+          `leaving obligation open + silent-end state intact for the represent/re-prompt safety nets\n`,
+      )
+      return
+    }
+  } else {
+    process.stderr.write(
+      `telegram gateway: captured-prose delivery skipped — this answer already went out ` +
+        `(dedup age=${already.ageMs}ms chat=${chatId} origin=${originTurnId}); settling bookkeeping\n`,
+    )
+  }
+  // Delivered now (or already delivered by another path): settle bookkeeping so
+  // neither the obligation represent nor the exhausted fallback re-fires.
+  if (OBLIGATION_LEDGER_ENABLED) {
+    try { obligationLedger.close(originTurnId) } catch {}
+  }
+  clearSilentEndState(statusKeyStr)
+}
+
 function obligationSweep(): void {
   if (!OBLIGATION_LEDGER_ENABLED) return
   if (!obligationLedger.hasOpen()) return
@@ -18071,6 +18182,45 @@ function handleSessionEvent(ev: SessionEvent): void {
         // is exactly `turn.finalAnswerDelivered === false` here (silent-marker
         // and flush both returned earlier), delegated to the pure gate core.
         if (turnEndDecision === 'reprompt') {
+          // Option A transcript-prose bridge (#3227). Before falling through to
+          // the re-prompt / represent safety nets, check whether the Stop hook
+          // already isolated this turn's real answer from the transcript and
+          // persisted it in silent-end-pending.json (`pendingText`). That file
+          // lands BEFORE this turn_end handler runs (the hook fires upstream of
+          // the gateway's own state write — see silent-end-interrupt-stop.mjs).
+          // If a substantive answer is waiting, deliver it directly via the
+          // normal send path NOW, instead of leaning on the (unreliable)
+          // Stop-hook re-prompt or waiting ~2-5 min for the obligation
+          // represent. The delivery closes the obligation + records dedup, so
+          // the represent and a late reply-tool retry are both suppressed —
+          // captured-prose delivery and represent are mutually exclusive.
+          const proseDecision = CAPTURED_PROSE_DELIVERY_ENABLED
+            ? decideCapturedProseDelivery({ turnKey: tKey, minChars: CAPTURED_PROSE_MIN_CHARS })
+            : { deliver: false as const, reason: 'no-state' as const }
+          if (proseDecision.deliver && proseDecision.text != null) {
+            // Deliver the recovered answer directly. This runs async and owns
+            // its own bookkeeping — on success it closes the obligation +
+            // records dedup + clears the silent-end state; on send failure it
+            // leaves them intact so the re-prompt / represent nets still fire.
+            // We DELIBERATELY skip recordUndeliveredTurnEnd here: re-arming the
+            // Stop-hook re-prompt for an answer that just went out is exactly
+            // what this bridge exists to avoid. `turn.finalAnswerDelivered`
+            // stays false so the shared turn-end teardown below leaves the
+            // obligation OPEN (noteTurnEnded) until deliverCapturedProse
+            // confirms the send — the send-failure safety net.
+            process.stderr.write(
+              `telegram gateway: captured-prose delivery engaged on first silent-end ` +
+                `chat=${chatId} turnKey=${tKey} (#3227)\n`,
+            )
+            void deliverCapturedProse({
+              chatId,
+              threadId,
+              statusKeyStr: tKey,
+              registryKey: turn.registryKey ?? null,
+              originTurnId: turn.turnId,
+              text: proseDecision.text,
+            })
+          } else {
           // PR #2892 (deterministic-turn-liveness RFC Phase 2) hardening:
           // wire the represent-guard-style staleness
           // check (`recordSilentTurnEnd`'s `hasOutboundDeliveredSince` dep) so
@@ -18116,6 +18266,7 @@ function handleSessionEvent(ev: SessionEvent): void {
               )
             })
           }
+          } // end else (no captured-prose to deliver)
         }
         signalTracker.clear(tKey)
         silencePoke.endTurn(tKey)

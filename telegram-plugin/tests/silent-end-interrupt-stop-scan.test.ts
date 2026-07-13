@@ -137,6 +137,62 @@ describe('scanTurnForFinalReply — final-reply detection', () => {
     expect(r.reason).toBe('no-final-reply')
   })
 
+  it('Option A: block result carries pendingText = the undelivered answer prose (#3227)', () => {
+    // The transcript-prose bridge: a turn that ends with a substantive answer
+    // written as plain text (no reply tool) must surface that prose so the
+    // gateway can deliver it directly on the first silent-end.
+    const answer = 'That was actually your FY25 NOA, not Bloomfield. ' + 'A'.repeat(2200)
+    const text = jsonl(
+      ENQUEUE,
+      assistantToolUse('mcp__switchroom-telegram__reply', {
+        text: "On it — checking…",
+        disable_notification: true,
+      }),
+      assistantToolUse('Bash', { command: 'ls' }),
+      assistantText(answer),
+    )
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('block')
+    expect(r.reason).toBe('no-final-reply')
+    expect(r.pendingText).toBe(answer)
+  })
+
+  it('Option A: zero-outbound turn with a long plain-text answer → pendingText set', () => {
+    const answer = 'Here is the whole answer the model forgot to send. ' + 'Z'.repeat(400)
+    const text = jsonl(ENQUEUE, assistantText(answer))
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('block')
+    expect(r.reason).toBe('no-final-reply')
+    expect(r.pendingText).toBe(answer)
+  })
+
+  it('Option A: trailing-text-after-reply block carries only the trailing prose (#3227)', () => {
+    const trailing = 'The real verdict the model wrote but never re-sent. ' + 'T'.repeat(400)
+    const text = jsonl(
+      ENQUEUE,
+      assistantText('some narration before the delivered answer'),
+      assistantToolUse('mcp__switchroom-telegram__reply', {
+        text: 'delivered answer, notification-bearing',
+        disable_notification: false,
+      }),
+      assistantText(trailing),
+    )
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('block')
+    expect(r.reason).toBe('trailing-text-after-reply')
+    // Only the prose AFTER the last delivery event — not the pre-reply narration.
+    expect(r.pendingText).toBe(trailing)
+  })
+
+  it('Option A: a SHORT trailing/only fragment does NOT set pendingText (substance floor)', () => {
+    // A genuinely empty-ish turn: a short plain-text closer under the 200-char
+    // floor must not be re-delivered as if it were the answer.
+    const text = jsonl(ENQUEUE, assistantText('ok done, let me know if you need anything else'))
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('block')
+    expect(r.pendingText).toBeUndefined()
+  })
+
   it('notification-bearing reply → allow', () => {
     const text = jsonl(
       ENQUEUE,

@@ -42,6 +42,17 @@ export interface SilentEndState {
   retryCount: number
   /** Wall-clock ms of last write. */
   timestamp: number
+  /**
+   * Option A transcript-prose bridge. The substantive final-answer prose the
+   * model wrote as plain transcript text but never sent through the reply
+   * tool, as isolated by the Stop hook's transcript scan
+   * (`scanTurnForFinalReply` → `pendingText`). Present only on a hook-written
+   * state file for a turn that ended silently WITH deliverable prose; the
+   * gateway's own `writeSilentEndState` never sets it. The gateway reads it
+   * back to deliver the answer directly on the first silent-end. Optional —
+   * absent for the zero-prose (genuinely empty) silent-end.
+   */
+  pendingText?: string
 }
 
 export interface SilentEndDeps {
@@ -254,6 +265,60 @@ export function clearSilentEndState(turnKey: string, deps?: SilentEndDeps): void
   } catch {
     // best-effort
   }
+}
+
+/**
+ * Minimum length (chars, trimmed) of captured prose the gateway will deliver
+ * directly on a silent-end. Mirrors `FINAL_ANSWER_MIN_CHARS` in
+ * `hooks/silent-end-scan.mjs` and `isFinalAnswerReply`'s 200-char substantive
+ * backstop — the same bar used to recognise a real answer. A shorter trailing
+ * fragment is not a dropped answer and must not be re-materialised.
+ */
+export const CAPTURED_PROSE_MIN_CHARS = 200
+
+/**
+ * Result of the captured-prose delivery decision (Option A transcript-prose
+ * bridge). Pure, side-effect-free — the gateway consumes `deliver`/`text` and
+ * owns the actual send + dedup + obligation-close bookkeeping.
+ */
+export interface CapturedProseDecision {
+  /** True → the gateway should deliver `text` directly on this silent-end. */
+  deliver: boolean
+  /** The prose to deliver; present iff `deliver === true`. */
+  text?: string
+  /** Machine-readable reason (for logs / tests). */
+  reason:
+    | 'captured-prose'
+    | 'no-state'
+    | 'turnkey-mismatch'
+    | 'no-substantive-prose'
+}
+
+/**
+ * Decide whether the current silent-end turn has a substantive undelivered
+ * final answer that the gateway should deliver directly (Option A).
+ *
+ * Reads the same `silent-end-pending.json` the Stop hook wrote. Delivers ONLY
+ * when (a) the record belongs to THIS turn (`turnKey` match — never a stale
+ * carryover from a prior turn), and (b) the persisted `pendingText` clears the
+ * substance floor. Otherwise returns `deliver:false` and the caller falls
+ * through to the existing re-prompt / represent safety nets unchanged.
+ *
+ * Extracted as a pure core (mirrors `decideTurnFlush` / `decideTurnEndGate`)
+ * so the gateway runs the exact code the regression tests exercise —
+ * `gateway.ts` is not importable in tests.
+ */
+export function decideCapturedProseDelivery(
+  args: { turnKey: string; minChars?: number },
+  deps?: SilentEndDeps,
+): CapturedProseDecision {
+  const minChars = args.minChars ?? CAPTURED_PROSE_MIN_CHARS
+  const state = readSilentEndState(deps)
+  if (state == null) return { deliver: false, reason: 'no-state' }
+  if (state.turnKey !== args.turnKey) return { deliver: false, reason: 'turnkey-mismatch' }
+  const text = typeof state.pendingText === 'string' ? state.pendingText : ''
+  if (text.trim().length < minChars) return { deliver: false, reason: 'no-substantive-prose' }
+  return { deliver: true, text, reason: 'captured-prose' }
 }
 
 /**
