@@ -1070,8 +1070,15 @@ function backOffTableRow(text: string, cut: number): number {
  * matched over the full `text`; if the chosen `cut` lands STRICTLY inside a
  * matched span, retreat to that span's start so the whole span moves to the
  * next chunk (mirrors backOffOpenFence / backOffTableRow). Cutting inside a
- * span would strand an unclosed `**` / `` ` `` / `_` / `](` delimiter, which
- * Telegram parse-rejects to plaintext or mis-renders across the boundary.
+ * span would strand an unclosed `***`/`**`/`*` / `` ` `` / `___`/`__`/`_` /
+ * `](` delimiter, which Telegram parse-rejects to plaintext or mis-renders
+ * across the boundary.
+ *
+ * The TRIPLE-marker patterns (`***bold-italic***` / `___…___`) come FIRST so
+ * their whole span wins the earliest-start back-off in backOffOpenInline: the
+ * double-marker pattern would otherwise match the inner `**…**` of a `***…***`
+ * span and retreat only past that, stranding the lone outer `*` (odd asterisk
+ * count → the italic is lost).
  *
  * The `_italic_` pattern is boundary-guarded so snake_case identifiers
  * (`foo_bar_baz`) don't read as emphasis; a stray match there is harmless
@@ -1079,6 +1086,8 @@ function backOffTableRow(text: string, cut: number): number {
  */
 const INLINE_SPAN_PATTERNS: readonly RegExp[] = [
   /`[^`\n]+`/g, // inline code
+  /\*\*\*[^*\n]+\*\*\*/g, // bold-italic (triple) — before the bold pattern
+  /___[^_\n]+___/g, // bold-italic underscore (triple)
   /\*\*[^*\n]+\*\*/g, // bold
   /__[^_\n]+__/g, // underline
   /(?<![\w*])_[^_\n]+_(?![\w*])/g, // italic (snake_case-guarded)

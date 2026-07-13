@@ -270,6 +270,34 @@ describe('splitMarkdownChunks', () => {
     }
   })
 
+  test('a `***bold-italic***` / `___…___` span straddling the cap keeps SINGLE-marker balance', () => {
+    // Regression for the triple-marker case: without the `***…***` pattern, the
+    // bold pattern matches only the inner `**…**`, so a cut inside `***x***`
+    // strands the lone outer `*` (odd asterisk count → the italic is lost). A
+    // `**`-PAIR balance check misses that, so assert SINGLE-`*` / SINGLE-`_`
+    // balance in every chunk.
+    const filler = 'x'.repeat(30)
+    const body =
+      `${filler} ***bold italic here*** ` +
+      `${filler} ___under bold here___ ${filler}`
+    for (const cap of [40, 50, 60, 70]) {
+      const chunks = splitMarkdownChunks(body, cap)
+      for (const c of chunks) {
+        // SINGLE-marker balance: an even count of `*` and of `_` in every chunk
+        // (a stranded lone `*`/`_` from a bisected triple span makes it odd).
+        expect((c.match(/\*/g) ?? []).length % 2).toBe(0)
+        expect((c.match(/_/g) ?? []).length % 2).toBe(0)
+      }
+      // Each triple span survives intact in exactly one chunk.
+      const rejoined = chunks.join('\n')
+      expect(rejoined).toContain('***bold italic here***')
+      expect(rejoined).toContain('___under bold here___')
+      // Nothing dropped.
+      const words = (s: string): string[] => s.split(/\s+/).filter((w) => w.length > 0)
+      expect(words(chunks.join(' '))).toEqual(words(body))
+    }
+  })
+
   test('a boundary with NO spacer is unaffected (legacy ^\\n+ behaviour preserved)', () => {
     const text = Array.from({ length: 10 }, (_, i) => `plain line ${i}`).join('\n\n')
     const chunks = splitMarkdownChunks(text, 40)
