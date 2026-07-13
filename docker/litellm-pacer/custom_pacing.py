@@ -49,6 +49,7 @@ the proxy's sys.path). See PLAN.md for exact compose + apply steps.
 
 import asyncio
 import os
+import random
 import time
 import uuid
 from typing import Any, Optional
@@ -71,6 +72,33 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
+# The gateway nulls a silent turn at SILENCE_FALLBACK_MS (default 300000ms /
+# 300s). A pacer hold that approached that would look like a hang, so the hard
+# cap is clamped strictly below it with margin. Named so the invariant is one
+# obvious constant, not a magic number buried in an expression.
+_PACE_WATCHDOG_SAFE_CEILING_S = 280.0
+
+
+def _clamp_hard_max_wait(
+    hard: float, max_wait: float, watchdog_ceiling: float = _PACE_WATCHDOG_SAFE_CEILING_S
+) -> float:
+    """Runtime-enforce the absolute-cap invariants regardless of env overrides,
+    so a deploy-time misconfig can't silently defeat them:
+      * never BELOW the burst-smoothing ceiling (a hard cap under MAX_WAIT_S
+        would shorten a normal, benign wait), and
+      * never AT/ABOVE the gateway silence watchdog (a hold that long looks
+        like a hang to the watchdog).
+    Deterministic control, not a test-only assertion."""
+    return min(max(hard, max_wait), watchdog_ceiling)
+
+
+def _clamp_hold_ceiling(ceiling: float, max_cooldown: float) -> float:
+    """A cooldown-hold can never usefully queue longer than the cooldown itself
+    can be parked (MAX_COOLDOWN_S), so clamp the hold ceiling down to it
+    regardless of env override."""
+    return min(ceiling, max_cooldown)
+
+
 class _Cfg:
     # Max simultaneous upstream Anthropic requests across the whole fleet.
     MAX_CONCURRENCY = _int_env("PACE_MAX_CONCURRENCY", 8)
@@ -89,6 +117,40 @@ class _Cfg:
     # Poll interval + jitter while waiting for a slot / rate window.
     POLL_MIN_S = _float_env("PACE_POLL_MIN_S", 0.10)
     POLL_MAX_S = _float_env("PACE_POLL_MAX_S", 0.40)
+
+    # --- Layer 1: cooldown-hold + hard-wait backstop (throughput safety) ------
+    # ABSOLUTE backstop on ANY wait in the pacer, in EITHER regime. Checked on
+    # every iteration of the wait loop (see async_pre_call_hook) so a bug in the
+    # cooldown-hold logic can never wedge a request meaningfully past it — the
+    # true worst case is HARD_MAX_WAIT_S + at most one backoff interval + the
+    # admit-check latency (~a second), not a hard ceiling to the millisecond.
+    # ACTIVE BY DEFAULT: it only ever SHORTENS a pathological wait, and with the
+    # default 45 (> MAX_WAIT_S's 12/20) it never fires during normal burst-
+    # smoothing, so it is behaviour-neutral. Clamped at load into
+    # [MAX_WAIT_S, _PACE_WATCHDOG_SAFE_CEILING_S] so an env misconfig can't put
+    # it below the smoothing ceiling or above the silence watchdog.
+    HARD_MAX_WAIT_S = _clamp_hard_max_wait(
+        _float_env("PACE_HARD_MAX_WAIT_S", 45.0), MAX_WAIT_S
+    )
+    # Gate for the cooldown-HOLD regime. OFF by default => behaviour is identical
+    # to pre-L1 (fail open at MAX_WAIT_S even during a signalled cooldown). Set
+    # PACE_COOLDOWN_HOLD=true at rollout to hold the line through a cooldown.
+    COOLDOWN_HOLD = os.getenv("PACE_COOLDOWN_HOLD", "false").lower() == "true"
+    # Ceiling on how long the cooldown-HOLD regime will queue a request while a
+    # fleet cooldown is active. Clamped at load to <= MAX_COOLDOWN_S (a hold can
+    # never usefully outlast the cooldown that can be parked) regardless of env
+    # override. Only consulted when COOLDOWN_HOLD is on, and always dominated by
+    # HARD_MAX_WAIT_S.
+    COOLDOWN_HOLD_CEILING_S = _clamp_hold_ceiling(
+        _float_env("PACE_COOLDOWN_HOLD_CEILING_S", 60.0), MAX_COOLDOWN_S
+    )
+    # Extra jitter window (seconds) added to the backoff WHILE HOLDING during a
+    # cooldown, so that when the cooldown elapses the queued fleet re-admits
+    # spread across this window instead of stampeding the same 1s and instantly
+    # re-tripping the 429 that set the cooldown. Only applied in the hold regime
+    # (which is off by default), so it is behaviour-neutral until hold is on.
+    RELEASE_JITTER_S = _float_env("PACE_RELEASE_JITTER_S", 1.0)
+
     # Master on/off. Set PACE_ENABLED=false to make the hook a pure no-op
     # without touching config wiring.
     ENABLED = os.getenv("PACE_ENABLED", "true").lower() != "false"
@@ -180,6 +242,20 @@ class FleetPacer(CustomLogger):
         except Exception:
             return 0.0
 
+    def _backoff_sleep_s(self, holding: bool) -> float:
+        """Jittered backoff between admit attempts. The base poll jitter already
+        de-synchronizes the fleet during ordinary polling. In the cooldown-HOLD
+        regime we add an extra bounded release-jitter term (RELEASE_JITTER_S) so
+        that when the cooldown elapses the queued requests re-admit spread across
+        that window instead of stampeding the same 1s window and immediately
+        re-tripping the 429 that set the cooldown (thundering-herd guard). Only
+        widened while holding; the burst-smoothing regime keeps the original
+        POLL_MIN..POLL_MAX behaviour."""
+        base = random.uniform(_Cfg.POLL_MIN_S, _Cfg.POLL_MAX_S)
+        if holding and _Cfg.RELEASE_JITTER_S > 0:
+            base += random.uniform(0.0, _Cfg.RELEASE_JITTER_S)
+        return base
+
     async def _try_admit(self, r, pace_id: str) -> bool:
         """One ATOMIC admission attempt via Lua. Returns True if a
         concurrency slot + rate window was granted (and the request
@@ -235,25 +311,60 @@ class FleetPacer(CustomLogger):
             return data  # fail open
 
         pace_id = uuid.uuid4().hex
-        deadline = time.time() + _Cfg.MAX_WAIT_S
+        # Loop deadline math uses a MONOTONIC clock so a backward wall-clock/NTP
+        # step can never extend a hold. (Redis cooldown_until stays wall-clock —
+        # see _cooldown_remaining — and is never compared against these values.)
+        start = time.monotonic()
+        # ABSOLUTE backstop: computed once, checked FIRST on every iteration
+        # below. It bounds the wait to HARD_MAX_WAIT_S plus at most one more
+        # backoff interval and the final admit-check latency (the loop can only
+        # notice the deadline between attempts) — the load-bearing safety bound,
+        # not a to-the-millisecond ceiling.
+        hard_deadline = start + _Cfg.HARD_MAX_WAIT_S
         admitted = False
         try:
             while True:
                 if await self._try_admit(r, pace_id):
                     admitted = True
                     break
-                if time.time() >= deadline:
-                    # Fail open: never reject, just proceed after the ceiling.
+                now = time.monotonic()
+                # (1) ABSOLUTE BACKSTOP — checked FIRST, on every iteration, so a
+                # bug in the cooldown-hold branch below can't wedge a request
+                # more than ~one backoff interval past HARD_MAX_WAIT_S. Do NOT
+                # move this inside a conditional or below the regime logic.
+                if now >= hard_deadline:
                     verbose_proxy_logger.warning(
-                        "custom_pacing: wait ceiling %.1fs hit, admitting unpaced (fail open)",
-                        _Cfg.MAX_WAIT_S,
+                        "custom_pacing: HARD wait cap %.1fs hit, admitting unpaced (fail open)",
+                        _Cfg.HARD_MAX_WAIT_S,
                     )
                     break
-                # Bounded jittered backoff; jitter de-synchronizes the fleet
-                # so releases don't thunder.
-                import random
-
-                await asyncio.sleep(random.uniform(_Cfg.POLL_MIN_S, _Cfg.POLL_MAX_S))
+                # (2) Pick this iteration's regime ceiling:
+                #   * burst-smoothing (no active cooldown): the short MAX_WAIT_S
+                #     ceiling then benign fail-open — leaking here is fine.
+                #   * cooldown-HOLD (a fleet cooldown is in the future: Anthropic
+                #     has SIGNALLED a throttle): do NOT fail open at MAX_WAIT_S;
+                #     keep holding until the cooldown elapses, bounded by
+                #     COOLDOWN_HOLD_CEILING_S (and, above, by the hard cap).
+                # The hold regime is gated OFF by default, so with default config
+                # this reduces exactly to the pre-L1 MAX_WAIT_S ceiling.
+                ceiling = _Cfg.MAX_WAIT_S
+                holding = False
+                if _Cfg.COOLDOWN_HOLD:
+                    remaining = await self._cooldown_remaining(r)
+                    if remaining > 0:
+                        holding = True
+                        ceiling = _Cfg.COOLDOWN_HOLD_CEILING_S
+                if now - start >= ceiling:
+                    # Fail open: never reject, just proceed after the ceiling.
+                    verbose_proxy_logger.warning(
+                        "custom_pacing: %s wait ceiling %.1fs hit, admitting unpaced (fail open)",
+                        "cooldown-hold" if holding else "burst",
+                        ceiling,
+                    )
+                    break
+                # (3) Bounded jittered backoff; jitter de-synchronizes the fleet
+                # so releases don't thunder (extra release jitter while holding).
+                await asyncio.sleep(self._backoff_sleep_s(holding))
         except Exception as e:
             verbose_proxy_logger.debug("custom_pacing: pre_call error (fail open): %s", e)
 

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import random
 import sys
 import time
 import types
@@ -91,6 +92,7 @@ class FakeRedis:
         self.eval_result = eval_result
         self.eval_raises = eval_raises
         self.set_calls: list = []
+        self.eval_calls = 0
 
     async def ping(self):
         return True
@@ -104,6 +106,7 @@ class FakeRedis:
         return True
 
     async def eval(self, *args, **kwargs):
+        self.eval_calls += 1
         if self.eval_raises is not None:
             raise self.eval_raises
         return self.eval_result
@@ -185,9 +188,17 @@ class CodeDefaultTests(unittest.TestCase):
             if isinstance(node, ast.Assign):
                 for t in node.targets:
                     if isinstance(t, ast.Name) and t.id == arg_name:
-                        call = node.value
-                        if isinstance(call, ast.Call) and len(call.args) >= 2:
-                            return ast.literal_eval(call.args[1])
+                        # Walk the whole RHS so we still find the inner
+                        # _int_env/_float_env default even when it is wrapped in a
+                        # clamp call (e.g. _clamp_hard_max_wait(_float_env(...))).
+                        for sub in ast.walk(node.value):
+                            if (
+                                isinstance(sub, ast.Call)
+                                and isinstance(sub.func, ast.Name)
+                                and sub.func.id == func_name
+                                and len(sub.args) >= 2
+                            ):
+                                return ast.literal_eval(sub.args[1])
         raise AssertionError(f"{arg_name} default not found")
 
     def test_code_defaults_unchanged(self):
@@ -197,6 +208,109 @@ class CodeDefaultTests(unittest.TestCase):
         self.assertEqual(self._default_of("_float_env", "MAX_WAIT_S"), 20.0)
         self.assertEqual(self._default_of("_float_env", "MAX_COOLDOWN_S"), 60.0)
         self.assertEqual(self._default_of("_int_env", "LEASE_TTL_S"), 300)
+
+    def test_l1_knob_defaults(self):
+        # The absolute hard cap ships ACTIVE (45s), but with 45 > MAX_WAIT_S it
+        # never fires in normal burst-smoothing => behaviour-neutral by default.
+        self.assertEqual(self._default_of("_float_env", "HARD_MAX_WAIT_S"), 45.0)
+        self.assertEqual(self._default_of("_float_env", "COOLDOWN_HOLD_CEILING_S"), 60.0)
+        self.assertEqual(self._default_of("_float_env", "RELEASE_JITTER_S"), 1.0)
+        # Hard cap must be >= MAX_WAIT_S so it can only ever shorten a pathological
+        # wait, never a normal one (the neutrality invariant).
+        self.assertGreaterEqual(
+            self._default_of("_float_env", "HARD_MAX_WAIT_S"),
+            self._default_of("_float_env", "MAX_WAIT_S"),
+        )
+        # The hold-ceiling stays within MAX_COOLDOWN_S (design constraint).
+        self.assertLessEqual(
+            self._default_of("_float_env", "COOLDOWN_HOLD_CEILING_S"),
+            self._default_of("_float_env", "MAX_COOLDOWN_S"),
+        )
+
+    def test_cooldown_hold_gate_defaults_off(self):
+        # The load-bearing neutrality guard: the cooldown-HOLD regime MUST default
+        # OFF so merging + redeploy is behaviour-neutral until we set the env at
+        # rollout. Read straight from source so a runner env can't mask a change.
+        src = os.path.join(os.path.dirname(__file__), "custom_pacing.py")
+        with open(src, "r", encoding="utf-8") as fh:
+            source = fh.read()
+        self.assertIn('os.getenv("PACE_COOLDOWN_HOLD", "false")', source)
+
+
+# --- Runtime config clamps (deterministic controls) --------------------------
+class ConfigClampTests(unittest.TestCase):
+    """The two guard invariants are enforced at config LOAD by runtime clamps in
+    _Cfg, not merely asserted in tests — so a deploy-time env misconfig can't
+    silently defeat them. These drive REAL env overrides + module reload and
+    assert the RESOLVED _Cfg values, so each would fail if its clamp were removed.
+    """
+
+    _ENV = (
+        "PACE_MAX_WAIT_S",
+        "PACE_HARD_MAX_WAIT_S",
+        "PACE_MAX_COOLDOWN_S",
+        "PACE_COOLDOWN_HOLD_CEILING_S",
+    )
+
+    def _reload_with(self, **env):
+        for k in self._ENV:
+            os.environ.pop(k, None)
+        for k, v in env.items():
+            os.environ[k] = str(v)
+        importlib.reload(custom_pacing)
+        return custom_pacing._Cfg
+
+    def tearDown(self):
+        # Restore clean code defaults for every downstream test.
+        for k in self._ENV:
+            os.environ.pop(k, None)
+        importlib.reload(custom_pacing)
+
+    def test_hard_cap_raised_to_max_wait_on_misconfig(self):
+        # Misconfig: hard cap set BELOW the burst-smoothing ceiling. The clamp
+        # raises it so the hard cap can never shorten a normal, benign wait.
+        cfg = self._reload_with(PACE_MAX_WAIT_S=30, PACE_HARD_MAX_WAIT_S=10)
+        self.assertGreaterEqual(cfg.HARD_MAX_WAIT_S, cfg.MAX_WAIT_S)
+        self.assertEqual(cfg.HARD_MAX_WAIT_S, 30.0)
+
+    def test_hard_cap_capped_below_watchdog_on_misconfig(self):
+        # Misconfig: hard cap set ABOVE the 300s silence watchdog. The clamp caps
+        # it under the watchdog so a hold can never look like a hang.
+        cfg = self._reload_with(PACE_HARD_MAX_WAIT_S=400)
+        self.assertLessEqual(
+            cfg.HARD_MAX_WAIT_S, custom_pacing._PACE_WATCHDOG_SAFE_CEILING_S
+        )
+        self.assertEqual(cfg.HARD_MAX_WAIT_S, 280.0)
+        self.assertLess(cfg.HARD_MAX_WAIT_S, 300.0)
+
+    def test_hold_ceiling_capped_to_max_cooldown_on_misconfig(self):
+        # Misconfig: hold ceiling set ABOVE the max cooldown that can be parked.
+        # The clamp lowers it to MAX_COOLDOWN_S.
+        cfg = self._reload_with(
+            PACE_COOLDOWN_HOLD_CEILING_S=120, PACE_MAX_COOLDOWN_S=60
+        )
+        self.assertLessEqual(cfg.COOLDOWN_HOLD_CEILING_S, cfg.MAX_COOLDOWN_S)
+        self.assertEqual(cfg.COOLDOWN_HOLD_CEILING_S, 60.0)
+
+    def test_sane_config_passes_through_unclamped(self):
+        # A valid operating point is untouched by the clamps (no false positives).
+        cfg = self._reload_with(
+            PACE_MAX_WAIT_S=12,
+            PACE_HARD_MAX_WAIT_S=45,
+            PACE_MAX_COOLDOWN_S=60,
+            PACE_COOLDOWN_HOLD_CEILING_S=60,
+        )
+        self.assertEqual(cfg.HARD_MAX_WAIT_S, 45.0)
+        self.assertEqual(cfg.COOLDOWN_HOLD_CEILING_S, 60.0)
+
+    def test_clamp_helpers_are_pure(self):
+        # Direct unit coverage of the clamp functions (deterministic; fails if the
+        # min/max bounds are dropped).
+        self.assertEqual(custom_pacing._clamp_hard_max_wait(10, 30, 280), 30)
+        self.assertEqual(custom_pacing._clamp_hard_max_wait(400, 20, 280), 280)
+        self.assertEqual(custom_pacing._clamp_hard_max_wait(45, 20, 280), 45)
+        self.assertEqual(custom_pacing._clamp_hold_ceiling(120, 60), 60)
+        self.assertEqual(custom_pacing._clamp_hold_ceiling(30, 60), 30)
 
 
 # --- Admission + fail-open ----------------------------------------------------
@@ -305,6 +419,179 @@ class FailureHookCooldownTests(unittest.IsolatedAsyncioTestCase):
         await pacer.async_post_call_failure_hook({}, exc, None)
         parked = float(r.store[custom_pacing._COOLDOWN_KEY])
         self.assertEqual(parked, long_until)  # unchanged — never shortened
+
+
+# --- Layer 1: cooldown-hold + hard-wait backstop wait-loop behaviour ---------
+# These are the load-bearing behavioural tests for the two-regime wait ceiling
+# (custom_pacing.py async_pre_call_hook). They drive the real hook with a fake
+# Redis that NEVER admits (eval_result=0) and a cooldown parked far in the
+# future, then assert the wait terminates in the right regime and — above all —
+# that the absolute hard cap can never be exceeded.
+_CFG_KNOBS = (
+    "ENABLED",
+    "MAX_WAIT_S",
+    "HARD_MAX_WAIT_S",
+    "COOLDOWN_HOLD",
+    "COOLDOWN_HOLD_CEILING_S",
+    "RELEASE_JITTER_S",
+    "POLL_MIN_S",
+    "POLL_MAX_S",
+)
+
+
+class _CfgPatchMixin:
+    """Snapshot + restore the _Cfg class attributes each test mutates, so the
+    live/import-time config is never leaked between tests."""
+
+    def setUp(self):
+        super().setUp()
+        self._saved_cfg = {k: getattr(custom_pacing._Cfg, k) for k in _CFG_KNOBS}
+        # Sane, fast baseline; individual tests override what they exercise.
+        custom_pacing._Cfg.ENABLED = True
+        custom_pacing._Cfg.POLL_MIN_S = 0.02
+        custom_pacing._Cfg.POLL_MAX_S = 0.04
+        custom_pacing._Cfg.RELEASE_JITTER_S = 0.05
+
+    def tearDown(self):
+        for k, v in self._saved_cfg.items():
+            setattr(custom_pacing._Cfg, k, v)
+        super().tearDown()
+
+    def _denying_redis_with_future_cooldown(self):
+        r = FakeRedis(eval_result=0)  # _try_admit -> always "wait"
+        r.store[custom_pacing._COOLDOWN_KEY] = str(time.time() + 999)
+        return r
+
+    async def _run_hook(self, pacer, r):
+        pacer._redis = r  # bypass _get_redis (no real redis import)
+        return await pacer.async_pre_call_hook(None, None, {}, "pass_through_endpoint")
+
+
+class HardCapInvariantTests(_CfgPatchMixin, unittest.IsolatedAsyncioTestCase):
+    async def test_hard_cap_dominates_cooldown_hold(self):
+        """LOAD-BEARING: with cooldown-HOLD enabled and a cooldown parked far in
+        the future (so the hold branch is fully engaged), the wait MUST fail open
+        within HARD_MAX_WAIT_S and NEVER hold to the (much larger) hold ceiling.
+        Verified across MANY iterations. If someone bypasses the hard-cap check
+        in the hold branch, the loop runs to COOLDOWN_HOLD_CEILING_S instead and
+        elapsed blows past the assertion -> this test fails."""
+        custom_pacing._Cfg.COOLDOWN_HOLD = True
+        custom_pacing._Cfg.HARD_MAX_WAIT_S = 0.5
+        custom_pacing._Cfg.COOLDOWN_HOLD_CEILING_S = 3.0  # >> hard cap on purpose
+        custom_pacing._Cfg.MAX_WAIT_S = 0.3
+
+        pacer = custom_pacing.FleetPacer()
+        r = self._denying_redis_with_future_cooldown()
+        t0 = time.time()
+        await self._run_hook(pacer, r)
+        elapsed = time.time() - t0
+
+        # Bounded by the hard cap (with slack for one final backoff), and clearly
+        # BELOW the 3.0s hold ceiling — proving the hard cap, not the ceiling,
+        # stopped the wait.
+        self.assertLessEqual(elapsed, custom_pacing._Cfg.HARD_MAX_WAIT_S + 0.4)
+        self.assertLess(elapsed, custom_pacing._Cfg.COOLDOWN_HOLD_CEILING_S)
+        # It actually held (didn't leak at MAX_WAIT_S) and looped many times, so
+        # the cap is enforced on EVERY iteration, not just once.
+        self.assertGreaterEqual(elapsed, custom_pacing._Cfg.MAX_WAIT_S)
+        self.assertGreaterEqual(r.eval_calls, 3)
+
+    async def test_hard_cap_enforced_every_iteration_probe(self):
+        """Explicitly assert the cap is re-checked each loop: shrink the hard cap
+        below MAX_WAIT_S and confirm the wait ends at the hard cap even though the
+        (burst) regime ceiling is larger — only possible if the hard-cap check
+        runs first, every iteration."""
+        custom_pacing._Cfg.COOLDOWN_HOLD = False
+        custom_pacing._Cfg.HARD_MAX_WAIT_S = 0.3
+        custom_pacing._Cfg.MAX_WAIT_S = 5.0  # regime ceiling >> hard cap
+
+        pacer = custom_pacing.FleetPacer()
+        r = FakeRedis(eval_result=0)
+        t0 = time.time()
+        await self._run_hook(pacer, r)
+        elapsed = time.time() - t0
+        self.assertLessEqual(elapsed, custom_pacing._Cfg.HARD_MAX_WAIT_S + 0.4)
+        self.assertLess(elapsed, custom_pacing._Cfg.MAX_WAIT_S)
+        self.assertGreaterEqual(r.eval_calls, 2)
+
+
+class CooldownHoldRegimeTests(_CfgPatchMixin, unittest.IsolatedAsyncioTestCase):
+    async def test_hold_queues_past_burst_ceiling_when_enabled(self):
+        """With cooldown-HOLD ON and a signalled cooldown active, the wait must
+        HOLD past the short MAX_WAIT_S burst ceiling (not leak at 12s), bounded by
+        COOLDOWN_HOLD_CEILING_S."""
+        custom_pacing._Cfg.COOLDOWN_HOLD = True
+        custom_pacing._Cfg.MAX_WAIT_S = 0.3
+        custom_pacing._Cfg.COOLDOWN_HOLD_CEILING_S = 1.0
+        custom_pacing._Cfg.HARD_MAX_WAIT_S = 5.0
+
+        pacer = custom_pacing.FleetPacer()
+        r = self._denying_redis_with_future_cooldown()
+        t0 = time.time()
+        data = await self._run_hook(pacer, r)
+        elapsed = time.time() - t0
+
+        # Held well past the 0.3s burst ceiling ...
+        self.assertGreater(elapsed, custom_pacing._Cfg.MAX_WAIT_S + 0.2)
+        # ... but bounded by the hold ceiling (and the hard cap).
+        self.assertLessEqual(elapsed, custom_pacing._Cfg.COOLDOWN_HOLD_CEILING_S + 0.4)
+        self.assertLess(elapsed, custom_pacing._Cfg.HARD_MAX_WAIT_S)
+        # Fail-open contract preserved: the request still proceeds (data back).
+        self.assertIsInstance(data, dict)
+
+    async def test_default_off_leaks_at_burst_ceiling_regression(self):
+        """REGRESSION GUARD: with cooldown-HOLD at its default (OFF), behaviour is
+        unchanged from today — even during an active cooldown the wait fails open
+        at the short MAX_WAIT_S burst ceiling, exactly as pre-L1."""
+        custom_pacing._Cfg.COOLDOWN_HOLD = False
+        custom_pacing._Cfg.MAX_WAIT_S = 0.3
+        custom_pacing._Cfg.COOLDOWN_HOLD_CEILING_S = 60.0
+        custom_pacing._Cfg.HARD_MAX_WAIT_S = 45.0
+
+        pacer = custom_pacing.FleetPacer()
+        r = self._denying_redis_with_future_cooldown()
+        t0 = time.time()
+        await self._run_hook(pacer, r)
+        elapsed = time.time() - t0
+
+        # Leaks at the burst ceiling, NOT the hold ceiling — i.e. hold is off.
+        self.assertLessEqual(elapsed, custom_pacing._Cfg.MAX_WAIT_S + 0.3)
+
+
+class ReleaseJitterTests(_CfgPatchMixin, unittest.TestCase):
+    def test_release_jitter_spreads_admissions(self):
+        """Thundering-herd guard: while HOLDING, the backoff adds a bounded
+        release-jitter term so queued requests re-admit spread across a window
+        instead of stampeding one instant. The burst-smoothing regime keeps the
+        original POLL_MIN..POLL_MAX behaviour unchanged."""
+        custom_pacing._Cfg.POLL_MIN_S = 0.10
+        custom_pacing._Cfg.POLL_MAX_S = 0.40
+        custom_pacing._Cfg.RELEASE_JITTER_S = 1.0
+        pacer = custom_pacing.FleetPacer()
+
+        random.seed(20260713)
+        holding = [pacer._backoff_sleep_s(True) for _ in range(300)]
+        burst = [pacer._backoff_sleep_s(False) for _ in range(300)]
+
+        # Burst regime unchanged: strictly within the poll window.
+        self.assertTrue(all(0.10 <= x <= 0.40 for x in burst))
+        # Hold regime: release jitter pushes some waits beyond the poll ceiling
+        # and spreads them across a wide window (no synchronized re-admit).
+        self.assertGreater(max(holding), 0.40)
+        self.assertGreater(max(holding) - min(holding), 0.40)
+        # Not a stampede: the released attempts land on many distinct delays.
+        self.assertGreater(len({round(x, 4) for x in holding}), 200)
+
+    def test_release_jitter_zero_is_pure_poll(self):
+        """RELEASE_JITTER_S=0 disables the extra term: holding backoff collapses
+        back to the plain poll window (escape hatch / neutrality)."""
+        custom_pacing._Cfg.POLL_MIN_S = 0.10
+        custom_pacing._Cfg.POLL_MAX_S = 0.40
+        custom_pacing._Cfg.RELEASE_JITTER_S = 0.0
+        pacer = custom_pacing.FleetPacer()
+        random.seed(7)
+        holding = [pacer._backoff_sleep_s(True) for _ in range(200)]
+        self.assertTrue(all(0.10 <= x <= 0.40 for x in holding))
 
 
 if __name__ == "__main__":
