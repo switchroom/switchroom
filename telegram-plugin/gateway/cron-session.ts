@@ -36,6 +36,38 @@ export function baseAgent(name: string): string {
 }
 
 /**
+ * True iff an inject_inbound fire is a scheduled cron fire — Tier-1 cheap-cron
+ * (`meta.session='cron'`, routed to the derived `<agent>-cron` bridge) OR a
+ * Tier-2 full-session cron (`meta.source='cron'`, lands on the main bridge).
+ *
+ * #3114 — such a fire must NOT stamp the MAIN session's idle-clear clock at
+ * inject time. Before #3113, `onInjectInbound` stamped unconditionally so a
+ * "working scheduled agent isn't wiped after 3h of no inbound". That is now
+ * redundant AND harmful: a cron cadence shorter than `idle_clear_after`
+ * re-arms the timer on every fire and keeps idle-clear permanently suppressed
+ * for that agent. After #3113 a cron fire that does REAL work already stamps
+ * the main clock through `handleSessionEvent` on every genuine session event,
+ * so the blanket inject-time stamp buys nothing for main-bridge fires — and a
+ * cheap-cron fire (whose session events are dropped for the cron identity in
+ * `onSessionEvent`) correctly stops warming the main clock once it is gone.
+ *
+ * Only cron fires are gated: other synthetic-source injects (reaction, vault
+ * grant, resume) reflect genuine operator/session presence and still stamp.
+ *
+ * DOCUMENTED RESIDUAL (#3114, operator-approved): a Tier-2 cron pinned to the
+ * MAIN session (`context:'agent'`) that replies NO_REPLY still runs a real
+ * turn on the main bridge, which emits session events → stamps via
+ * `handleSessionEvent`. So "a NO_REPLY poll isn't presence" is fully closed
+ * only for cheap/derived-bridge crons; an expensive main-session poll still
+ * warms the clock because the model genuinely ran. This predicate governs only
+ * the inject-time stamp, not the session-event stamp — closing the main-
+ * session-poll case would need a separate weaker clock, out of scope here.
+ */
+export function isCronInjectFire(meta: Record<string, string> | undefined): boolean {
+  return meta?.source === "cron" || meta?.session === "cron";
+}
+
+/**
  * Resolve the IPC routing target for an inject_inbound. When the fire
  * carries `meta.session='cron'` it goes to the derived cron bridge; every
  * other fire (and all of today's callers) goes to the agent unchanged.
