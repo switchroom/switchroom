@@ -582,6 +582,16 @@ export interface CombinedWorkerRow {
   toolCount: number
   /** The worker's latest step line (raw prose or friendly tool label). */
   currentStep: string
+  /**
+   * The worker's accumulated narrative history (oldest→newest, raw/unescaped),
+   * already deduped + rolling-window capped upstream (STATUS_ROLLING_LINES).
+   * When present + non-empty, the combined feed paints the worker's last-K
+   * lines as a `✓`/`→` step trail (prior steps struck, newest in-progress) —
+   * the same idiom as the single-worker card — with K set by the adaptive
+   * per-worker line budget. Absent/empty → falls back to the single
+   * `currentStep` line (back-compat for direct callers).
+   */
+  historyLines?: string[]
   /** Live model id (raw, e.g. `claude-opus-4-8`); omitted when unknown. */
   model?: string
 }
@@ -594,15 +604,51 @@ export interface CombinedWorkerFeedOpts {
 }
 
 /**
+ * Total per-worker BODY line budget for the combined feed — the sum, across all
+ * visible workers, of (one header line + that worker's history lines). The top
+ * `🛠 Workers · N running` line and the `+M more working…` spill are OUTSIDE
+ * this budget (fixed chrome). 13 is chosen so the card stays a compact glance,
+ * not a wall: at 2 workers it yields the full 5-line history each (2·1 header +
+ * 2·5 history = 12 ≤ 13), and it degrades to a single history line each by ~6
+ * workers — matching the pre-adaptive one-line-per-worker floor while never
+ * letting a 2–3 worker fan-out lose its narrative trail.
+ */
+const MAX_COMBINED_BODY_LINES = 13
+/** Each visible worker costs one header line before any history. */
+const PER_WORKER_HEADER_COST = 1
+
+/**
+ * Deterministic per-worker history depth for `w` visible workers:
+ *   clamp( floor( (BUDGET − headerCost·w) / w ), 1, STATUS_ROLLING_LINES )
+ * So 2 workers → 5 lines each, 3 → 3, 4 → 2, ≥6 → 1 (today's single-line floor
+ * is the graceful-degradation floor, never below it). Pure function of the
+ * visible worker count — no model input, consistent with deterministic controls.
+ */
+export function combinedHistoryDepth(w: number): number {
+  if (w <= 0) return 1
+  const raw = Math.floor((MAX_COMBINED_BODY_LINES - PER_WORKER_HEADER_COST * w) / w)
+  return Math.max(1, Math.min(STATUS_ROLLING_LINES, raw))
+}
+
+/**
  * Render N≥1 live workers into ONE combined feed body (ready Telegram
  * markdown; callers send verbatim — do NOT re-escape). Layout:
  *
  *   🛠 **Workers** · _N running_
  *   **{desc1}** _· {elapsed} · {n} tools_
- *   → _{step1}_
+ *   ~~_✓ {earlier step}_~~
+ *   **→ {newest step}**
  *   **{desc2}** _· {elapsed} · {n} tools_
- *   → _{step2}_
+ *   **→ {newest step}**
  *   _+M more working…_
+ *
+ * ADAPTIVE DENSITY: each visible worker renders its last-K narrative lines as a
+ * `✓`/`→` trail (prior steps struck, newest bold in-progress) — the single-
+ * worker card's idiom — where K = `combinedHistoryDepth(visibleCount)` splits a
+ * fixed body-line budget across the running workers. So 2 workers each show
+ * their full recent history and a 6-way fan-out degrades to one line each, the
+ * card staying bounded regardless of fan-out. When a worker has no history yet
+ * it falls back to a single `→ starting…`/currentStep line.
  *
  * Pure. Rows are rendered in the order supplied (the manager passes them
  * dispatch-order, oldest first). `maxRows` caps the visible rows; the hidden
@@ -618,29 +664,43 @@ export function renderCombinedWorkerFeed(
   if (rows.length === 0) return null
   const maxRows = Math.max(1, Math.floor(opts.maxRows))
 
-  const rowLines = (r: CombinedWorkerRow): [string, string] => {
+  const rowHeader = (r: CombinedWorkerRow): string => {
     const desc = escapeMarkdown(
       truncate(stripMarkdown(r.description).replace(/\s+/g, ' ').trim() || 'background task', COMBINED_ROW_DESC_MAX),
     )
     const toolWord = r.toolCount === 1 ? 'tool' : 'tools'
     const modelLabel = formatModelLabel(r.model)
     const modelPart = modelLabel != null ? ` · ${escapeMarkdown(modelLabel)}` : ''
-    const header = `**${desc}** _· ${formatFeedElapsed(r.elapsedMs)} · ${r.toolCount} ${toolWord}${modelPart}_`
-    const stepClean = stripMarkdown(r.currentStep).replace(/\s+/g, ' ').trim()
-    const step =
-      stepClean.length > 0
-        ? `→ _${escapeMarkdown(truncate(stepClean, STATUS_LINE_MAX))}_`
-        : `→ _starting…_`
-    return [header, step]
+    return `**${desc}** _· ${formatFeedElapsed(r.elapsedMs)} · ${r.toolCount} ${toolWord}${modelPart}_`
+  }
+
+  // Raw (unescaped) history for a worker, oldest→newest, empty lines stripped.
+  // Falls back to the single currentStep when no history was supplied.
+  const rowHistory = (r: CombinedWorkerRow): string[] => {
+    const src = r.historyLines != null && r.historyLines.length > 0 ? r.historyLines : [r.currentStep]
+    return src.filter((s) => s != null && stripMarkdown(s).replace(/\s+/g, ' ').trim().length > 0)
   }
 
   const compose = (visibleCount: number): string => {
     const shown = rows.slice(0, visibleCount)
     const hidden = rows.length - shown.length
+    // Adaptive depth: split the fixed body-line budget across the VISIBLE
+    // workers so the card stays bounded regardless of fan-out.
+    const depth = combinedHistoryDepth(shown.length)
     const out: string[] = [`🛠 **Workers** · _${rows.length} running_`]
     for (const r of shown) {
-      const [h, s] = rowLines(r)
-      out.push(h, s)
+      out.push(rowHeader(r))
+      const hist = rowHistory(r)
+      if (hist.length === 0) {
+        out.push('→ _starting…_')
+        continue
+      }
+      // Paint the last-K history lines with the SAME `✓`/`→` idiom as the
+      // single-worker card: escape each raw line through the shared per-line
+      // pipeline (escapeStepLine), then renderStepFeed strikes the prior steps
+      // and bolds the newest in-progress step.
+      const esc = hist.slice(-depth).map(escapeStepLine)
+      renderStepFeed(out, esc, false)
     }
     if (hidden > 0) out.push(`_+${hidden} more working…_`)
     return stackCardLines(out)

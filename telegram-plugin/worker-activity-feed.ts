@@ -616,6 +616,11 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
         elapsedMs: elapsedFor(r),
         toolCount: v.toolCount,
         currentStep,
+        // Full per-worker rolling history (oldest→newest) so the combined feed
+        // can paint an adaptive-depth ✓/→ trail, not just the latest line. The
+        // renderer clamps depth to the shared body-line budget; when a worker
+        // has no narrative yet this is empty and it falls back to currentStep.
+        historyLines: r.narrative.length > 0 ? [...r.narrative] : undefined,
         model: v.model,
       }
     })
