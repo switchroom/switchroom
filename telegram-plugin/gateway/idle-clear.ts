@@ -99,6 +99,64 @@ export function decideIdleClear(
   return { clear: true };
 }
 
+/** Default TTL for the background-work idle suppressor (#3117): 30 min. */
+export const DEFAULT_IDLE_BG_SUPPRESS_TTL_MS = 30 * 60 * 1000;
+
+export interface BackgroundSuppressionInput {
+  /** Is detached background work (subagent / bg bash) in flight right now? */
+  backgroundInFlight: boolean;
+  /**
+   * Epoch ms when suppression started (the first evaluation that observed
+   * background work in flight), or null if not currently suppressing.
+   */
+  suppressingSince: number | null;
+  now: number;
+  /** Bound on how long a background flag may suppress the clear. */
+  ttlMs: number;
+}
+
+export interface BackgroundSuppressionDecision {
+  /** Suppress the idle clear this evaluation? */
+  suppress: boolean;
+  /** New `suppressingSince` to carry to the next evaluation. */
+  suppressingSince: number | null;
+}
+
+/**
+ * TTL-bounded background-work suppressor (#3117).
+ *
+ * #3113 already stamps the activity clock on every `sub_agent_*` event, so a
+ * background worker that is EMITTING keeps the idle window warm on its own. The
+ * residual hole: a worker that is alive but SILENT for a full window (one long
+ * tool call, no events) could be `/clear`ed out from under itself. This gates
+ * the clear while background work is in flight — but only for `ttlMs` after
+ * suppression first engaged, so a stuck pending flag (worker actually dead, flag
+ * never cleared) cannot disable idle-clear permanently. Bounded and
+ * self-healing, exactly the trade #3117 asks for.
+ *
+ * Pure: the gateway owns the `suppressingSince` cell and passes it back in.
+ *   - no background work  → not suppressing, clock reset to null.
+ *   - background in flight, first seen → start the clock, suppress.
+ *   - background in flight, within TTL → keep suppressing.
+ *   - background in flight, past TTL → STOP suppressing (self-heal); the clock
+ *     is retained so it stays expired until the work drains and re-arms it.
+ */
+export function decideBackgroundSuppression(
+  input: BackgroundSuppressionInput,
+): BackgroundSuppressionDecision {
+  const { backgroundInFlight, suppressingSince, now, ttlMs } = input;
+  if (!backgroundInFlight) {
+    return { suppress: false, suppressingSince: null };
+  }
+  const since = suppressingSince ?? now;
+  if (now - since >= ttlMs) {
+    // Past the bound — self-heal. Keep `since` so we don't re-arm a fresh TTL
+    // on the next tick while the same stuck flag is still set.
+    return { suppress: false, suppressingSince: since };
+  }
+  return { suppress: true, suppressingSince: since };
+}
+
 /** What a claude session-stream event means for the idle clocks. */
 export interface IdleEventSignal {
   /** Genuine agent activity → stamp `lastActivityAt` (and re-arm). */

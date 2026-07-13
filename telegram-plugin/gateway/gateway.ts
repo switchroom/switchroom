@@ -519,7 +519,7 @@ import { resolveOutboundTopic as resolveOutboundTopicHelper, topicForRecipient, 
 import { readTurnUsages } from '../../src/agents/perf.js'
 import { buildContextOccupancy, writeContextOccupancySnapshot } from './context-occupancy.js'
 import { decideProactiveCompact, initialCompactState, type CompactState } from './proactive-compact.js'
-import { decideIdleClear, classifyIdleEvent, idleDurationToMs, DEFAULT_IDLE_CLEAR_MS } from './idle-clear.js'
+import { decideIdleClear, classifyIdleEvent, idleDurationToMs, DEFAULT_IDLE_CLEAR_MS, decideBackgroundSuppression, DEFAULT_IDLE_BG_SUPPRESS_TTL_MS } from './idle-clear.js'
 import { nextCompactNotify, idleCompactNotifyState, type CompactNotifyState } from './compact-notify.js'
 import {
   tryHostdDispatch,
@@ -5022,11 +5022,30 @@ let lastIdleActivityAt = Date.now();
 let lastIdleTurnEndAt: number | null = null;
 let idleAutoCleared = false;
 let idleClearDispatching = false;
+// #3117 — TTL-bounded background-work suppressor. Epoch ms when the idle clear
+// first observed detached background work in flight (subagent / bg bash) while
+// otherwise clearable, or null when not suppressing. Bounds how long a stuck
+// pending flag may hold the clear off (see decideBackgroundSuppression).
+let idleBgSuppressSince: number | null = null;
+
+/** Idle background-suppressor TTL: env override → 30m default. */
+function resolveIdleBgSuppressTtlMs(): number {
+  const env = process.env.SWITCHROOM_IDLE_BG_SUPPRESS_TTL_MS;
+  if (env != null && env !== '') {
+    const n = Number(env);
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+  return DEFAULT_IDLE_BG_SUPPRESS_TTL_MS;
+}
 
 /** Reset the idle timer + re-arm auto-clear. Call on ANY activity. */
 function markIdleActivity(): void {
   lastIdleActivityAt = Date.now();
   idleAutoCleared = false;
+  // Fresh activity re-arms the whole gate — drop any background-suppression
+  // clock so a later silent worker gets a fresh TTL rather than inheriting a
+  // stale (possibly already-expired) `since`.
+  idleBgSuppressSince = null;
 }
 
 /**
@@ -5066,6 +5085,7 @@ function maybeIdleClear(): void {
   const agentName = process.env.SWITCHROOM_AGENT_NAME;
   if (!agentName) return;
   const idleClearMs = resolveIdleClearMs();
+  const now = Date.now();
   const decision = decideIdleClear(
     {
       lastActivityAt: lastIdleActivityAt,
@@ -5074,9 +5094,30 @@ function maybeIdleClear(): void {
       alreadyCleared: idleAutoCleared,
       turnInFlight: turnInFlightForGate(),
     },
-    Date.now(),
+    now,
   );
-  if (!decision.clear) return;
+  if (!decision.clear) {
+    // Not at the would-be-clear point (window not elapsed, mid-turn, or already
+    // cleared). The background suppressor only measures grace PAST that point,
+    // so reset its clock here — a fresh silent worker gets a full TTL once the
+    // window actually elapses.
+    idleBgSuppressSince = null;
+    return;
+  }
+  // #3117 — TTL-bounded background-work suppressor. The idle window has elapsed
+  // and we WOULD clear. #3113 keeps the window warm via activity events for a
+  // worker that is EMITTING; this covers the residual hole — a background worker
+  // alive but SILENT for a full window. Hold the clear while background work is
+  // in flight, but only for a TTL bound measured from this would-be-clear point,
+  // so a stuck pending flag cannot disable idle-clear forever (self-heals).
+  const bg = decideBackgroundSuppression({
+    backgroundInFlight: pendingProgress.anyPendingAsyncDispatch(),
+    suppressingSince: idleBgSuppressSince,
+    now,
+    ttlMs: resolveIdleBgSuppressTtlMs(),
+  });
+  idleBgSuppressSince = bg.suppressingSince;
+  if (bg.suppress) return;
   // Fire once per idle period — set BEFORE the await so the next tick can't
   // double-dispatch. markIdleActivity() re-arms on the next real activity.
   idleAutoCleared = true;

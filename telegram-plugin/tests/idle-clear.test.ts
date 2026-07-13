@@ -25,6 +25,8 @@ import {
   classifyIdleEvent,
   idleDurationToMs,
   DEFAULT_IDLE_CLEAR_MS,
+  decideBackgroundSuppression,
+  DEFAULT_IDLE_BG_SUPPRESS_TTL_MS,
   type IdleClearState,
 } from '../gateway/idle-clear.js'
 
@@ -270,6 +272,137 @@ describe('decideIdleClear (pure gate)', () => {
     const reArmed = state({ lastActivityAt: now, alreadyCleared: false })
     expect(decideIdleClear(reArmed, now + 3 * H - 1).clear).toBe(false) // not yet
     expect(decideIdleClear(reArmed, now + 3 * H).clear).toBe(true) // again, one window later
+  })
+})
+
+describe('decideBackgroundSuppression (#3117 — TTL-bounded suppressor)', () => {
+  const TTL = 30 * M
+
+  it('no background work → not suppressing, clock reset', () => {
+    const d = decideBackgroundSuppression({
+      backgroundInFlight: false,
+      suppressingSince: 5 * H,
+      now: 6 * H,
+      ttlMs: TTL,
+    })
+    expect(d).toEqual({ suppress: false, suppressingSince: null })
+  })
+
+  it('first observation of in-flight work → start the clock and suppress', () => {
+    const now = 100 * H
+    const d = decideBackgroundSuppression({
+      backgroundInFlight: true,
+      suppressingSince: null,
+      now,
+      ttlMs: TTL,
+    })
+    expect(d).toEqual({ suppress: true, suppressingSince: now })
+  })
+
+  it('in-flight and within TTL → keeps suppressing from the original since', () => {
+    const since = 100 * H
+    const d = decideBackgroundSuppression({
+      backgroundInFlight: true,
+      suppressingSince: since,
+      now: since + TTL - 1,
+      ttlMs: TTL,
+    })
+    expect(d).toEqual({ suppress: true, suppressingSince: since })
+  })
+
+  it('in-flight but past TTL → STOPS suppressing (self-heals), retains since', () => {
+    const since = 100 * H
+    const d = decideBackgroundSuppression({
+      backgroundInFlight: true,
+      suppressingSince: since,
+      now: since + TTL,
+      ttlMs: TTL,
+    })
+    expect(d).toEqual({ suppress: false, suppressingSince: since })
+  })
+
+  it('default TTL is 30m', () => {
+    expect(DEFAULT_IDLE_BG_SUPPRESS_TTL_MS).toBe(30 * M)
+  })
+})
+
+describe('idle-clear + background suppressor — end-to-end outcomes (#3117)', () => {
+  const TTL = 30 * M
+  // Mirror the gateway's maybeIdleClear loop EXACTLY: run the base decider
+  // first; if it would NOT clear, reset the suppression clock and stop; if it
+  // WOULD clear, apply the TTL-bounded background suppressor (whose clock is
+  // measured from this would-be-clear point).
+  function run(opts: {
+    idleClearMs: number
+    ttlMs: number
+    /** returns whether background work is in flight at time `now` */
+    bgInFlight: (now: number) => boolean
+    lastActivityAt: number
+    from: number
+    to: number
+  }): number[] {
+    let since: number | null = null
+    let alreadyCleared = false
+    const clears: number[] = []
+    for (let now = opts.from; now <= opts.to; now += TICK) {
+      const { clear: wouldClear } = decideIdleClear(
+        {
+          lastActivityAt: opts.lastActivityAt,
+          lastTurnEndedAt: null,
+          idleClearMs: opts.idleClearMs,
+          alreadyCleared,
+          turnInFlight: false,
+        },
+        now,
+      )
+      if (!wouldClear) {
+        since = null
+        continue
+      }
+      const bg = decideBackgroundSuppression({
+        backgroundInFlight: opts.bgInFlight(now),
+        suppressingSince: since,
+        now,
+        ttlMs: opts.ttlMs,
+      })
+      since = bg.suppressingSince
+      if (bg.suppress) continue
+      alreadyCleared = true
+      clears.push(now)
+    }
+    return clears
+  }
+
+  it('a silent background worker in flight past the window (within TTL) is NOT cleared', () => {
+    const T = 100 * H
+    // Worker in flight the whole time, emits nothing. Idle window 3h.
+    const clears = run({
+      idleClearMs: 3 * H,
+      ttlMs: TTL,
+      bgInFlight: () => true,
+      lastActivityAt: T,
+      from: T,
+      // window elapses at T+3h; suppression starts then and holds for TTL.
+      to: T + 3 * H + TTL - TICK,
+    })
+    expect(clears).toEqual([])
+  })
+
+  it('a background flag stuck past window+TTL → clear STILL eventually fires (not disabled forever)', () => {
+    const T = 100 * H
+    const clears = run({
+      idleClearMs: 3 * H,
+      ttlMs: TTL,
+      bgInFlight: () => true, // stuck flag: never clears
+      lastActivityAt: T,
+      from: T,
+      to: T + 3 * H + TTL + 5 * TICK,
+    })
+    // Suppression engages when the window elapses (~T+3h) and self-heals TTL
+    // later, so the clear fires once, near T + 3h + TTL.
+    expect(clears).toHaveLength(1)
+    expect(clears[0]).toBeGreaterThanOrEqual(T + 3 * H + TTL)
+    expect(clears[0]).toBeLessThan(T + 3 * H + TTL + 2 * TICK)
   })
 })
 

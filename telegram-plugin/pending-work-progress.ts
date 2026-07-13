@@ -297,6 +297,22 @@ export function hasPendingAsyncDispatch(key: string): boolean {
 }
 
 /**
+ * True when ANY chat key currently has detached background work in flight
+ * (Agent / Task / Bash run_in_background:true dispatched, turn not yet ended
+ * with a cleared pending flag). Keyless variant of {@link hasPendingAsyncDispatch}
+ * for the idle-clear gate (#3117): the gateway runs a single claude session, so
+ * the idle auto-clear must not fire while a background worker is alive but
+ * silent for a full idle window — but only up to a TTL bound, enforced by the
+ * caller (a stuck pending flag must not disable idle-clear forever).
+ */
+export function anyPendingAsyncDispatch(): boolean {
+  for (const s of stateByKey.values()) {
+    if (s.pending === true) return true
+  }
+  return false
+}
+
+/**
  * Clear pending-progress for a chat — reasons:
  *   'inbound'   — user sent a new message, they're re-engaged
  *   'handback'  — switchroom injected a subagent_handback channel turn

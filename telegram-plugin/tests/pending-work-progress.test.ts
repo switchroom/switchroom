@@ -16,7 +16,9 @@ import {
   __resetAllForTests,
   __setDepsForTests,
   __tickForTests,
+  anyPendingAsyncDispatch,
   clearPending,
+  hasPendingAsyncDispatch,
   noteAsyncDispatch,
   noteOutbound,
   noteTurnEnd,
@@ -670,5 +672,40 @@ describe('pending-work-progress', () => {
     } finally {
       process.stderr.write = origStderr
     }
+  })
+})
+
+// #3117 — keyless variant used by the idle-clear background suppressor.
+describe('anyPendingAsyncDispatch (#3117)', () => {
+  beforeEach(() => {
+    __resetAllForTests()
+  })
+
+  it('false when nothing is pending', () => {
+    expect(anyPendingAsyncDispatch()).toBe(false)
+  })
+
+  it('true while ANY key has a detached background dispatch in flight', () => {
+    startTurn(KEY)
+    noteAsyncDispatch(KEY)
+    expect(hasPendingAsyncDispatch(KEY)).toBe(true)
+    expect(anyPendingAsyncDispatch()).toBe(true)
+  })
+
+  it('detects background work under a key other than the queried one', () => {
+    const OTHER = '99999:_'
+    startTurn(OTHER)
+    noteAsyncDispatch(OTHER)
+    // hasPendingAsyncDispatch(KEY) is false, but the keyless scan sees OTHER.
+    expect(hasPendingAsyncDispatch(KEY)).toBe(false)
+    expect(anyPendingAsyncDispatch()).toBe(true)
+  })
+
+  it('false again once the pending flag is cleared', () => {
+    startTurn(KEY)
+    noteAsyncDispatch(KEY)
+    expect(anyPendingAsyncDispatch()).toBe(true)
+    clearPending(KEY, 'manual')
+    expect(anyPendingAsyncDispatch()).toBe(false)
   })
 })
