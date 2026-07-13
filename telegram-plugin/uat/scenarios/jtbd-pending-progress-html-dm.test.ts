@@ -40,8 +40,14 @@ const PROMPT =
   `the bash, send that one HTML reply, end your turn. When it finishes ` +
   `much later, reply with the single word "done".`;
 
+// Production emits `\n\n_still working (Nm) · message me anytime, I'll keep
+// you posted_` (italic markdown, no em-dash — pending-work-progress.ts).
+// mtcute's Message.text returns parsed plain prose (italic → entity,
+// underscores stripped) → `\n\nstill working (Nm) · …`. The em-dash form is
+// legacy/pre-#2669; accept both. Mirrors the production matcher in
+// pending-work-progress.ts.
 const SUFFIX_RE =
-  /\n\n— still working \(\d+m\)( · message me anytime, I'll keep you posted)?$/;
+  /\n\n(?:— )?still working \(\d+m\)( · message me anytime, I'll keep you posted)?$/;
 
 describe("uat: pending-progress edit preserves HTML formatting (#1698 regression gate)", () => {
   it(
@@ -68,7 +74,17 @@ describe("uat: pending-progress edit preserves HTML formatting (#1698 regression
                 `${msg.edited ? "EDIT" : "FRESH"} msg=${msg.messageId} ` +
                 `${JSON.stringify(msg.text.slice(0, 120))}`,
             );
-            if (!msg.edited && anchorMsgId == null) {
+            // Anchor on THIS scenario's own reply, not the first fresh bot
+            // message. Background workers dispatched by earlier scenarios can
+            // bleed into this shared bot DM chat (see harness tearDown reap);
+            // `fromBot` matches any of them. The unique "Worker dispatched"
+            // HTML reply is this scenario's — latch only on it, then inspect
+            // edits on that id alone.
+            if (
+              !msg.edited &&
+              anchorMsgId == null &&
+              msg.text.includes("Worker dispatched")
+            ) {
               anchorMsgId = msg.messageId;
               continue;
             }

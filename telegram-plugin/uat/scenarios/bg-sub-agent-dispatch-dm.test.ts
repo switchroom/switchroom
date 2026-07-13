@@ -89,7 +89,14 @@ const BG_DISPATCH_PROMPT =
   `brief reply saying you've kicked off the background worker so I can ` +
   `watch the progress feed.`;
 
-const WORKER_RUNNING_RE = /running\s*·/i;
+// In-flight signal. The single-worker running header shows NO literal
+// "running" — it renders `<elapsed> · <n> tools` (tool-activity-summary.ts
+// renderActivityHeader, running branch); the multi-worker combined header
+// shows `N running`. Match BOTH shapes. Paired with the `not.toMatch(
+// WORKER_DONE_RE)` exclusion on the next line and the empty/`starting…`
+// skeleton case, this still goes red on the real bug (a skeleton painting
+// only `🛠 Worker · <name>` with no live metric line).
+const WORKER_RUNNING_RE = /\brunning\b|·\s*\d+\s+tools?\b/i;
 const WORKER_DONE_RE = /finished\s*·\s*(completed|failed)/i;
 
 describe("uat: background sub-agent visibility (#709/#776/#782/#788)", () => {
