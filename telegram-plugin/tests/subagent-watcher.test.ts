@@ -584,9 +584,10 @@ describe('startSubagentWatcher', () => {
       const jsonlPath = join(subagentsDir, 'agent-deadbeef.jsonl')
       const h = startWatcherSync({
         agentDir,
-        onProgress: ({ progressLine, latestSummary }) => {
+        onProgress: ({ progressLine, latestSummary, skeleton }) => {
           // Narrative ticks carry NO progressLine (tool ticks do); record them.
-          if (progressLine == null) narrativeCues.push(latestSummary)
+          // Skeleton liveness cues (#3231) are not narrative — exclude them.
+          if (!skeleton && progressLine == null) narrativeCues.push(latestSummary)
         },
       })
       writeFileSync(jsonlPath, buildJSONL(subAgentUserMsg('Find the repo path')))
@@ -614,8 +615,8 @@ describe('startSubagentWatcher', () => {
       const jsonlPath = join(subagentsDir, 'agent-deadbeef.jsonl')
       const h = startWatcherSync({
         agentDir,
-        onProgress: ({ progressLine, latestSummary }) => {
-          if (progressLine == null) narrativeCues.push(latestSummary)
+        onProgress: ({ progressLine, latestSummary, skeleton }) => {
+          if (!skeleton && progressLine == null) narrativeCues.push(latestSummary)
         },
       })
       writeFileSync(jsonlPath, buildJSONL(subAgentUserMsg('Find the repo')))
@@ -647,8 +648,8 @@ describe('startSubagentWatcher', () => {
       const jsonlPath = join(subagentsDir, 'agent-deadbeef.jsonl')
       const h = startWatcherSync({
         agentDir,
-        onProgress: ({ progressLine, latestSummary }) => {
-          allCues.push({ progressLine, latestSummary })
+        onProgress: ({ progressLine, latestSummary, skeleton }) => {
+          if (!skeleton) allCues.push({ progressLine, latestSummary })
         },
       })
       writeFileSync(jsonlPath, buildJSONL(subAgentUserMsg('Find the repo')))
@@ -698,8 +699,8 @@ describe('startSubagentWatcher', () => {
       const jsonlPath = join(subagentsDir, 'agent-deadbeef.jsonl')
       const h = startWatcherSync({
         agentDir,
-        onProgress: ({ progressLine, latestSummary }) => {
-          if (progressLine == null) narrativeCues.push(latestSummary)
+        onProgress: ({ progressLine, latestSummary, skeleton }) => {
+          if (!skeleton && progressLine == null) narrativeCues.push(latestSummary)
         },
       })
       writeFileSync(jsonlPath, buildJSONL(subAgentUserMsg('Do the task')))
@@ -728,8 +729,8 @@ describe('startSubagentWatcher', () => {
       const jsonlPath = join(subagentsDir, 'agent-deadbeef.jsonl')
       const h = startWatcherSync({
         agentDir,
-        onProgress: ({ progressLine, latestSummary }) => {
-          if (progressLine == null) narrativeCues.push(latestSummary)
+        onProgress: ({ progressLine, latestSummary, skeleton }) => {
+          if (!skeleton && progressLine == null) narrativeCues.push(latestSummary)
         },
       })
       writeFileSync(jsonlPath, buildJSONL(subAgentUserMsg('Summarise the diff')))
@@ -761,8 +762,8 @@ describe('startSubagentWatcher', () => {
       const jsonlPath = join(subagentsDir, 'agent-deadbeef.jsonl')
       const h = startWatcherSync({
         agentDir,
-        onProgress: ({ progressLine, latestSummary }) => {
-          if (progressLine == null) narrativeCues.push(latestSummary)
+        onProgress: ({ progressLine, latestSummary, skeleton }) => {
+          if (!skeleton && progressLine == null) narrativeCues.push(latestSummary)
         },
       })
       writeFileSync(jsonlPath, buildJSONL(subAgentUserMsg('Summarise the diff')))
