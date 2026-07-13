@@ -4,7 +4,7 @@ import {
   type BotApiForWorkerFeed,
   type WorkerActivityView,
 } from '../worker-activity-feed.js'
-import { renderCombinedWorkerFeed } from '../tool-activity-summary.js'
+import { renderCombinedWorkerFeed, combinedHistoryDepth } from '../tool-activity-summary.js'
 import { STATUS_CARD_CHAR_BUDGET } from '../status-no-truncate.js'
 import { createSendGate, isSendGateShed, type Clock } from '../send-gate.js'
 
@@ -488,5 +488,74 @@ describe('renderCombinedWorkerFeed (pure)', () => {
 
   it('returns null for an empty worker set', () => {
     expect(renderCombinedWorkerFeed([], { maxRows: 8 })).toBeNull()
+  })
+
+  // ── Adaptive density: per-worker rolling history within a line budget ──────
+  const rowH = (i: number, history: string[]) => ({
+    description: `task number ${i}`,
+    elapsedMs: 12_000 + i * 1000,
+    toolCount: i,
+    currentStep: history[history.length - 1] ?? '',
+    historyLines: history,
+  })
+
+  // A history line rendered as a PRIOR (done) step in the single-worker idiom.
+  const struck = (s: string) => `~~_✓ ${s}_~~`
+  // A history line rendered as the NEWEST in-progress step.
+  const current = (s: string) => `**→ ${s}**`
+
+  it('with 2 workers paints each worker MULTIPLE history lines with the ✓/→ strikethrough idiom', () => {
+    const body = renderCombinedWorkerFeed(
+      [
+        rowH(1, ['a first', 'a second', 'a third']),
+        rowH(2, ['b first', 'b second', 'b third']),
+      ],
+      { maxRows: 8 },
+    )!
+    // Prior steps struck-through, newest bold — same idiom as the single card.
+    expect(body).toContain(struck('a first'))
+    expect(body).toContain(struck('a second'))
+    expect(body).toContain(current('a third'))
+    expect(body).toContain(struck('b first'))
+    expect(body).toContain(struck('b second'))
+    expect(body).toContain(current('b third'))
+    // This is the regression assertion: the OLD single-line-only render would
+    // have shown only 'a third'/'b third' as `→ _step_`, never the earlier
+    // struck lines. Prove the trail is restored.
+    expect(body).toContain('a first')
+    expect(body).toContain('b first')
+  })
+
+  it('degrades to ONE history line per worker at a large fan-out and stays within the body budget', () => {
+    const rows = Array.from({ length: 6 }, (_, i) =>
+      rowH(i, [`w${i} oldest`, `w${i} middle`, `w${i} newest`]),
+    )
+    const body = renderCombinedWorkerFeed(rows, { maxRows: 8 })!
+    // Only the newest step of each worker survives — the earlier lines are
+    // dropped by the per-worker depth clamp (floor((13-6)/6)=1).
+    for (let i = 0; i < 6; i++) {
+      expect(body).toContain(current(`w${i} newest`))
+      expect(body).not.toContain(`w${i} oldest`)
+      expect(body).not.toContain(`w${i} middle`)
+    }
+    // Total body lines (worker headers + history) stay within the budget: 6
+    // header lines + 6 history lines = 12 ≤ MAX_COMBINED_BODY_LINES (13). Count
+    // only the per-worker body lines (exclude the top count line + any spill).
+    const bodyLines = body
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0)
+    const headerAndHistory = bodyLines.filter(
+      (l) => !l.startsWith('🛠') && !l.includes('more working'),
+    )
+    expect(headerAndHistory.length).toBeLessThanOrEqual(13)
+  })
+
+  it('exposes the deterministic depth formula (2→5, 3→3, 4→2, 6→1)', () => {
+    expect(combinedHistoryDepth(2)).toBe(5)
+    expect(combinedHistoryDepth(3)).toBe(3)
+    expect(combinedHistoryDepth(4)).toBe(2)
+    expect(combinedHistoryDepth(6)).toBe(1)
+    expect(combinedHistoryDepth(8)).toBe(1)
   })
 })
