@@ -555,6 +555,105 @@ describe("renderDevProtocolFragment", () => {
     const fragment = renderDevProtocolFragment();
     expect(fragment.length).toBeGreaterThan(500);
   });
+
+  it("cross-references the Sub-Agent Delegation section rather than licensing inline work", async () => {
+    const { renderDevProtocolFragment } = await import("./profiles.js");
+    const fragment = renderDevProtocolFragment();
+    // Regression #3231: the dev-protocol must state it governs HOW
+    // delegated work is done, not authorize doing it inline.
+    expect(fragment).toContain("not a license to do it inline");
+    expect(fragment).toContain("Sub-Agent Delegation");
+  });
+});
+
+describe("delegation recency (regression #3231)", () => {
+  // The strong delegation signal ("when in doubt, delegate") lives mid-file
+  // in the profile body, while the execution-discipline ("Act in-turn") and
+  // dev-protocol ("read the code, run the tests, keep moving") fragments are
+  // appended at the tail. In a long prompt the tail inline-execution voice
+  // won on recency and overrode the mid-file delegation rule, so agents did
+  // execution inline instead of dispatching a worker. The fix restores tail
+  // position for the delegation golden rule via an unconditional-append
+  // fragment. These tests pin that structural fix so a future reorder can't
+  // silently regress it.
+
+  const composeClaudeMd = async (profileName: string): Promise<string> => {
+    const {
+      renderVaultProtocolFragment,
+      renderAgentSelfServiceFragment,
+      renderExecutionDisciplineFragment,
+      renderDevProtocolFragment,
+      renderDelegationGoldenRuleFragment,
+    } = await import("./profiles.js");
+    const Handlebars = (await import("handlebars")).default;
+    const hbsPath = join(getProfilePath(profileName), "CLAUDE.md.hbs");
+    let rendered = Handlebars.compile(readFileSync(hbsPath, "utf-8"), {
+      noEscape: true,
+    })({});
+    // Mirror scaffold.ts append order EXACTLY: vault, self-service,
+    // execution-discipline, dev-protocol, delegation-golden-rule.
+    for (const frag of [
+      renderVaultProtocolFragment(),
+      renderAgentSelfServiceFragment(),
+      renderExecutionDisciplineFragment(),
+      renderDevProtocolFragment(),
+      renderDelegationGoldenRuleFragment(),
+    ]) {
+      if (frag) rendered = rendered.trimEnd() + "\n\n" + frag + "\n";
+    }
+    return rendered;
+  };
+
+  // The tail fragment's unique heading — NOT present anywhere in the
+  // pre-fix compose, so on the pre-fix ordering indexOf returns -1 and the
+  // "after Act in-turn" assertion below fails (red-on-regression).
+  const tailDelegationMarker = "## Delegation — the last word";
+  const actInTurnMarker = "**Act in-turn.**";
+
+  it("appends the delegation golden-rule fragment AFTER the Act-in-turn marker on every profile", async () => {
+    for (const profile of ["default", "coding", "executive-assistant", "health-coach"]) {
+      const claude = await composeClaudeMd(profile);
+      const actInTurnIdx = claude.indexOf(actInTurnMarker);
+      const tailDelegationIdx = claude.indexOf(tailDelegationMarker);
+
+      expect(actInTurnIdx, `${profile}: Act-in-turn marker present`).toBeGreaterThan(-1);
+      expect(tailDelegationIdx, `${profile}: tail delegation fragment present`).toBeGreaterThan(-1);
+      // The load-bearing assertion: the delegation golden rule must win on
+      // recency by sitting AFTER the inline-execution "Act in-turn" signal.
+      // On the pre-fix ordering (no tail fragment) tailDelegationIdx is -1
+      // and this fails.
+      expect(
+        tailDelegationIdx,
+        `${profile}: delegation golden rule must appear AFTER Act-in-turn (recency)`,
+      ).toBeGreaterThan(actInTurnIdx);
+    }
+  });
+
+  it("the Act-in-turn fragment cross-references delegation so it composes rather than overrides", async () => {
+    const { renderExecutionDisciplineFragment } = await import("./profiles.js");
+    const fragment = renderExecutionDisciplineFragment();
+    expect(fragment).toContain("Sub-Agent Delegation");
+    expect(fragment.toLowerCase()).toContain("does not override");
+    // The concrete composition: for execution-class work the in-turn act
+    // IS dispatching the sub-agent.
+    expect(fragment.toLowerCase()).toContain("dispatching the sub-agent");
+  });
+
+  describe("renderDelegationGoldenRuleFragment", () => {
+    it("restates the golden rule and its recency intent", async () => {
+      const { renderDelegationGoldenRuleFragment } = await import("./profiles.js");
+      const fragment = renderDelegationGoldenRuleFragment();
+      expect(fragment.toLowerCase()).toContain("when in doubt, delegate");
+      expect(fragment).toContain("tail reminder");
+      expect(fragment).toContain("@worker");
+      expect(fragment.length).toBeGreaterThan(300);
+    });
+
+    it("is non-empty (file present and rendered)", async () => {
+      const { renderDelegationGoldenRuleFragment } = await import("./profiles.js");
+      expect(renderDelegationGoldenRuleFragment().length).toBeGreaterThan(0);
+    });
+  });
 });
 
 describe("steer-forwarding guidance — delegation-carrying profile templates", () => {

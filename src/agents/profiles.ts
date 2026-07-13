@@ -281,6 +281,40 @@ export function renderDevProtocolFragment(
 }
 
 /**
+ * Render the delegation golden-rule fragment standalone for unconditional
+ * append to every agent's CLAUDE.md. Same unconditional-carrier pattern as
+ * {@link renderDevProtocolFragment}, but this one is deliberately appended
+ * LAST — after execution-discipline and dev-protocol — so the "prefer
+ * delegating execution to a sub-agent" signal regains tail-of-prompt
+ * recency.
+ *
+ * Root cause it closes (regression #3231): the strong delegation guidance
+ * ("Golden rule: when in doubt, delegate") lives mid-file in the profile
+ * body, while the execution-discipline ("Act in-turn — do it this turn")
+ * and dev-protocol ("read the code, run the tests, keep moving") fragments
+ * were appended at the tail. In a long prompt the tail-end inline-execution
+ * voice won on recency and overrode the mid-file delegation rule, so agents
+ * started doing execution inline instead of dispatching a worker. Restoring
+ * tail position for a one-block restatement of the golden rule — and
+ * cross-referencing it from the two competing fragments — makes the
+ * delegation preference deterministic rather than recency-dependent.
+ *
+ * Returns the rendered Markdown, or an empty string if the fragment
+ * file is missing (e.g. partial install).
+ */
+export function renderDelegationGoldenRuleFragment(
+  context: Record<string, unknown> = {},
+  /** Override the profiles root; used by tests. */
+  profilesRoot: string = PROFILES_ROOT,
+): string {
+  const fragPath = join(resolve(profilesRoot, "_shared"), "delegation-golden-rule.md.hbs");
+  if (!existsSync(fragPath)) return "";
+  const source = readFileSync(fragPath, "utf-8");
+  const template = Handlebars.compile(source, { noEscape: true });
+  return template(context).trimEnd();
+}
+
+/**
  * Render the reply-discipline fragment standalone for unconditional
  * PREPEND (near the top) of every agent's CLAUDE.md. Same
  * unconditional-carrier pattern as {@link renderVaultProtocolFragment}
