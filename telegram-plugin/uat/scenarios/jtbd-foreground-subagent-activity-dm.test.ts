@@ -60,7 +60,9 @@ describe("uat: foreground sub-agent live activity nesting (#2032)", () => {
   it(
     "surfaces nested foreground activity in the feed AFTER the ack-first reply",
     async () => {
-      const sc = await spinUp({ agent: "test-harness" });
+      // reapOnTearDown: reap any leftover sub-agent activity so it cannot
+      // bleed worker-feed edits into the next scenario's shared-chat window.
+      const sc = await spinUp({ agent: "test-harness", reapOnTearDown: true });
       try {
         await sc.sendDM(FG_DISPATCH_PROMPT);
 

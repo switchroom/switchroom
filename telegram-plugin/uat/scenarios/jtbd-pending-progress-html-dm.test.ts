@@ -53,7 +53,9 @@ describe("uat: pending-progress edit preserves HTML formatting (#1698 regression
   it(
     "first pending-progress edit reads back WITHOUT literal HTML tags",
     async () => {
-      const sc = await spinUp({ agent: "test-harness" });
+      // reapOnTearDown: the background sleep 90 (and any leftover workers)
+      // must not bleed into the next scenario's shared-chat observation.
+      const sc = await spinUp({ agent: "test-harness", reapOnTearDown: true });
       try {
         const startedAt = Date.now();
         await sc.sendDM(PROMPT);

@@ -97,13 +97,23 @@ const BG_DISPATCH_PROMPT =
 // skeleton case, this still goes red on the real bug (a skeleton painting
 // only `🛠 Worker · <name>` with no live metric line).
 const WORKER_RUNNING_RE = /\brunning\b|·\s*\d+\s+tools?\b/i;
-const WORKER_DONE_RE = /finished\s*·\s*(completed|failed)/i;
+// Terminal recap. The done/failed/incomplete header renders the STATE WORD
+// followed by `· <n> tools · <elapsed>` (tool-activity-summary.ts:199) —
+// e.g. `done · 20 tools · 5m38s`. It never emits the literal "finished ·
+// completed". Match the terminal state word anchored to the metric line so
+// a running header (`<elapsed> · <n> tools`, no leading state word) and a
+// bare skeleton still fail this — line 124 keeps using it as the in-flight
+// exclusion, line 172 as the terminal gate.
+const WORKER_DONE_RE = /\b(done|failed|incomplete)\s*·\s*\d+\s+tools?\b/i;
 
 describe("uat: background sub-agent visibility (#709/#776/#782/#788)", () => {
   it(
     "worker-feed appears with running status then flips to finished once the sub-agent completes",
     async () => {
-      const sc = await spinUp({ agent: "test-harness" });
+      // reapOnTearDown: this scenario's 10-step background worker outlives
+      // its it() and bleeds worker-feed edits into later scenarios on the
+      // shared bot DM chat — reap it on teardown for cross-scenario isolation.
+      const sc = await spinUp({ agent: "test-harness", reapOnTearDown: true });
       try {
         await sc.sendDM(BG_DISPATCH_PROMPT);
 

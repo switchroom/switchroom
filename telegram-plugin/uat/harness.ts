@@ -19,6 +19,7 @@
  * and would substantially re-invent the agent lifecycle.
  */
 
+import { execSync } from "node:child_process";
 import { Driver } from "./driver.js";
 import {
   expectMessage,
@@ -58,9 +59,55 @@ export interface SpinUpOptions {
    * settle on top of inner poll deadlines.
    */
   settleMs?: number;
+  /**
+   * Reap the agent's in-flight background workers in `tearDown` (durable
+   * cross-scenario isolation). Set by scenarios that dispatch long-lived
+   * background sub-agents (Agent tool `run_in_background`) or async
+   * background bash: those workers keep editing the SHARED bot DM chat
+   * long after the scenario's `it()` returns, bleeding into the next
+   * scenario's observation window on the sequential (`maxForks:1`) UAT
+   * run and starving the shared agent's turn budget. A marker-safe agent
+   * restart in `tearDown` kills every leftover worker so the next
+   * scenario starts from a clean agent. Best-effort: if NOPASSWD sudo /
+   * the CLI isn't on the runner it no-ops (the pre-existing shared-agent
+   * behaviour) rather than failing the scenario. Default false — only the
+   * worker-spawning scenarios opt in, so the blast radius stays scoped and
+   * non-worker scenarios keep the light disconnect-only tearDown.
+   */
+  reapOnTearDown?: boolean;
 }
 
 export const DEFAULT_SETTLE_MS = 8_000;
+
+/** True iff NOPASSWD sudo is usable on this runner (uat-host has it; CI doesn't). */
+function canShellSudo(): boolean {
+  try {
+    execSync("sudo -n true", { stdio: "ignore", timeout: 2_000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Marker-safe restart of the test-harness agent to reap every leftover
+ * background worker before the next scenario runs. Mirrors the proven
+ * restart in `jtbd-always-on-after-restart-dm.test.ts` (restart blocks
+ * ~30s as the gateway bridge reattaches, so execSync returning implies the
+ * agent is back up). Best-effort — swallows all errors so a reap failure
+ * never turns into a scenario failure.
+ */
+function reapAgentWorkers(name: string): void {
+  if (!canShellSudo()) return;
+  try {
+    execSync(
+      `sudo -n env PATH=$PATH HOME=$HOME switchroom agent restart ${name} --force`,
+      { stdio: ["ignore", "pipe", "pipe"], timeout: 90_000 },
+    );
+  } catch {
+    /* best-effort — degrade to the shared-agent behaviour, never fail here */
+  }
+}
 
 export interface Scenario {
   /** mtcute driver, already connected. */
@@ -139,7 +186,6 @@ function resolveConfig(opts: SpinUpOptions): ResolvedConfig {
 
 export async function spinUp(opts: SpinUpOptions): Promise<Scenario> {
   const cfg = resolveConfig(opts);
-  void opts.agent; // currently informational; #866 v2 will use it for state-dir scoping
 
   const driver = new Driver({
     apiId: cfg.apiId,
@@ -196,6 +242,13 @@ export async function spinUp(opts: SpinUpOptions): Promise<Scenario> {
       await driver.disconnect().catch(() => {
         /* idempotent — log-and-move-on; the persistent agent is unaffected */
       });
+      // Durable cross-scenario isolation: reap this scenario's leftover
+      // background workers so they cannot bleed into the next scenario's
+      // observation window on the shared bot DM chat. Opt-in — only
+      // worker-spawning scenarios set `reapOnTearDown`. Best-effort.
+      if (opts.reapOnTearDown) {
+        reapAgentWorkers(opts.agent);
+      }
     },
   };
 
