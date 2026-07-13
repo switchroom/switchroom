@@ -225,8 +225,13 @@ jobs:
     # full pool exceeds a 35-min job budget on the single runner.)
     # Dispatch-only like uat-gate-run above: manual dispatch = operator opt-in,
     # regardless of the UAT_GATE_ENABLED var (off since 2026-07-04).
+    # A TARGETED-scenario dispatch (`scenario` input set) is an operator asking
+    # for one specific behavioural path, NOT the 50-min probabilistic pool — so
+    # skip the fuzz job in that case (protects the single runner + subscription
+    # quota). A plain dispatch (no scenario) still runs the full pool.
     if: >-
-      github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && inputs.scenario == '')
     runs-on: [self-hosted, uat-host]
     timeout-minutes: 50
     env:
