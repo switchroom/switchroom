@@ -134,6 +134,32 @@ describe('gateway outbound secret-scrub — structural wiring', () => {
     expect(streamIdx).toBeGreaterThan(redactIdx) // mask BEFORE the stream
   })
 
+  it('operator_event: scrubs event.detail at the top of emitGatewayOperatorEvent, BEFORE render/send', () => {
+    // #llm-error-surfacing FIX 2 — operator-event cards are sent via a raw
+    // bot.api.sendRichMessage that BYPASSES the normal outbound chokepoint, so a
+    // secret in an error `detail` (credentials-expired / credit-exhausted /
+    // unknown-4xx) could reach the card verbatim. The detail is redacted ONCE at
+    // the top of the function, through the shared redactOutboundText, and MUST
+    // run before the renderers escapeMarkdown it (redacting the already-escaped
+    // text lets url-query-param secrets slip past url-redact) and before the
+    // send. This is the sole regression guard for that wiring line — deleting it
+    // must turn this red.
+    const start = src.indexOf('function emitGatewayOperatorEvent(')
+    const redactIdx = src.indexOf(
+      `event = { ...event, detail: redactOutboundText(event.detail, 'operator_event') }`,
+      start,
+    )
+    // The two render surfaces + the wire send this must precede.
+    const renderOpIdx = src.indexOf('renderOperatorEvent(event)', start)
+    const renderLlmIdx = src.indexOf('renderLlmErrorSafe(parsed', start)
+    const sendIdx = src.indexOf('bot.api.sendRichMessage(chat_id, richMessage(renderedText)', start)
+    expect(start).toBeGreaterThan(0)
+    expect(redactIdx).toBeGreaterThan(start)
+    expect(renderOpIdx).toBeGreaterThan(redactIdx) // mask BEFORE the escapeMarkdown render
+    expect(renderLlmIdx).toBeGreaterThan(redactIdx) // mask BEFORE the humanized render
+    expect(sendIdx).toBeGreaterThan(redactIdx) // mask BEFORE the card hits the wire
+  })
+
   it('does not log the secret value when a mask fires', () => {
     const idx = src.indexOf('function redactOutboundText(')
     const body = src.slice(idx, idx + 400)
