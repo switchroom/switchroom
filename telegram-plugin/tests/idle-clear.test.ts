@@ -60,6 +60,18 @@ function state(p: Partial<IdleClearState>): IdleClearState {
  * regression in the real gateway code (e.g. deleting the per-event stamp) left
  * every test green. Now a deleted stamp call fails a test, because the test
  * drives the same object the gateway drives.
+ *
+ * DELIBERATE STRUCTURAL LIMIT: `tick()` re-implements the gateway's ONE-LINE
+ * orchestration around the tracker — the `decide → markClearFired` sequence
+ * (maybeIdleClear, gateway.ts) and, in the #3114 block below, the
+ * `!isCronInjectFire(meta)` stamp gate (onInjectInbound, gateway.ts). #3115
+ * moved all the STATE and idle LOGIC into the importable `IdleTracker`, so those
+ * are now driven directly; but gateway.ts is ~30k lines with import-time side
+ * effects and cannot be imported, so the thin glue that wires the tracker into
+ * the gateway is still asserted by re-implementing that glue here. A divergence
+ * between the real gateway one-liner and this harness would NOT be caught — a
+ * known, documented boundary, not an oversight. The residual glue is one line
+ * per callsite; everything of substance is the real object.
  */
 class TrackerHarness {
   readonly tracker: IdleTracker
@@ -256,6 +268,46 @@ describe('IdleTracker wiring (#3115) — the real object, not a mirror', () => {
     t.noteEvent('turn_end', T + 2 * M, -1)
     expect(t.activityAt).toBe(T + M) // unchanged — not real activity
     expect(t.turnEndedAt).toBe(T + 2 * M) // but the turn-end clock advanced
+  })
+
+  it('the re-entrancy guard (isDispatching) makes an overlapping tick a no-op until endDispatch', () => {
+    // maybeIdleClear early-returns while a /clear inject is in flight
+    // (gateway.ts: `if (idleTracker.isDispatching) return`). Model that gate
+    // against the REAL tracker: begin a dispatch, then a tick that arrives
+    // before the async inject settles must NOT fire a second clear, and normal
+    // behaviour must resume once the dispatch ends.
+    const T = 100 * H
+    const t = new IdleTracker(T)
+    const inputs = { idleClearMs: 3 * H, turnInFlight: false }
+
+    // The window has elapsed → first tick clears and opens a dispatch.
+    expect(t.isDispatching).toBe(false)
+    expect(t.decide(T + 3 * H, inputs).clear).toBe(true)
+    t.markClearFired()
+    t.beginDispatch()
+    expect(t.isDispatching).toBe(true)
+
+    // A second tick arrives mid-dispatch. The gateway's guard short-circuits
+    // BEFORE decide(), so no second clear fires. Assert both the guard signal
+    // and that a bypassing decide() would still be latched off anyway.
+    let secondClearFired = false
+    if (!t.isDispatching) {
+      // (unreached while dispatching — this is the gateway's guarded path)
+      const { clear } = t.decide(T + 4 * H, inputs)
+      if (clear) secondClearFired = true
+    }
+    expect(secondClearFired).toBe(false) // guard held: no double-dispatch
+    // Even if the guard were bypassed, the fire-once latch blocks a re-clear.
+    expect(t.decide(T + 4 * H, inputs).clear).toBe(false)
+
+    // Dispatch settles. The guard reopens; still latched (no activity yet).
+    t.endDispatch()
+    expect(t.isDispatching).toBe(false)
+    expect(t.decide(T + 5 * H, inputs).clear).toBe(false) // alreadyCleared
+
+    // Fresh activity re-arms → normal behaviour resumes, one window later.
+    t.noteInbound(T + 6 * H)
+    expect(t.decide(T + 9 * H, inputs).clear).toBe(true)
   })
 
   it('the fire-once latch survives across ticks and re-arms only on activity', () => {
