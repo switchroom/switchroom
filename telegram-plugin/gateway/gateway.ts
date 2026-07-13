@@ -5073,6 +5073,14 @@ function maybeIdleClear(): void {
       idleClearMs,
       alreadyCleared: idleAutoCleared,
       turnInFlight: turnInFlightForGate(),
+      // #3117 — TTL-bounded background-work suppressor. A detached sub-agent
+      // (Agent/Task dispatched, main turn ended before it returned) is invisible
+      // to turnInFlightForGate(); consult the pending-dispatch flag directly so a
+      // silent long-running worker isn't /clear'ed out from under its handback.
+      // The TTL keeps a leaked flag from disabling idle-clear forever.
+      backgroundWorkInFlight: pendingProgress.anyPendingAsyncDispatchWithin(
+        pendingProgress.BACKGROUND_WORK_SUPPRESS_TTL_MS,
+      ),
     },
     Date.now(),
   );
@@ -5107,6 +5115,13 @@ function maybeIdleClear(): void {
         // re-eval must judge idleness on the live clocks only, so force false.
         alreadyCleared: false,
         turnInFlight: turnInFlightForGate(),
+        // #3117 — re-sample the background-work suppressor at write time too, so
+        // a sub-agent dispatched in the check-to-send gap (or still fresh within
+        // its TTL) suppresses the buffered /clear. This composes with #3116's
+        // write-time re-eval automatically — same decider, live inputs.
+        backgroundWorkInFlight: pendingProgress.anyPendingAsyncDispatchWithin(
+          pendingProgress.BACKGROUND_WORK_SUPPRESS_TTL_MS,
+        ),
       },
       Date.now(),
     ).clear;

@@ -19,7 +19,7 @@
  * `vitest.config.ts`.)
  */
 
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import {
   decideIdleClear,
   classifyIdleEvent,
@@ -27,6 +27,7 @@ import {
   DEFAULT_IDLE_CLEAR_MS,
   type IdleClearState,
 } from '../gateway/idle-clear.js'
+import * as pendingProgress from '../pending-work-progress.js'
 
 const H = 3_600_000
 const M = 60_000
@@ -270,6 +271,104 @@ describe('decideIdleClear (pure gate)', () => {
     const reArmed = state({ lastActivityAt: now, alreadyCleared: false })
     expect(decideIdleClear(reArmed, now + 3 * H - 1).clear).toBe(false) // not yet
     expect(decideIdleClear(reArmed, now + 3 * H).clear).toBe(true) // again, one window later
+  })
+})
+
+describe('decideIdleClear: #3117 background-work suppressor', () => {
+  it('suppresses the clear while a background sub-agent is in flight, even past the window', () => {
+    // Window elapsed (10h >> 3h), main-turn gate open (turnInFlight:false), and
+    // the activity clock is cold — yet a detached worker is in flight. On main
+    // (no backgroundWorkInFlight branch) this would clear; the fix must not.
+    const s = state({ lastActivityAt: 0, backgroundWorkInFlight: true })
+    expect(decideIdleClear(s, 10 * H).clear).toBe(false)
+  })
+
+  it('allows the clear once background work is no longer in flight (TTL lapsed or dispatch cleared)', () => {
+    const s = state({ lastActivityAt: 0, backgroundWorkInFlight: false })
+    expect(decideIdleClear(s, 10 * H).clear).toBe(true)
+  })
+
+  it('undefined background flag preserves pre-#3117 behaviour (treated as false)', () => {
+    const s = state({ lastActivityAt: 0 })
+    delete (s as { backgroundWorkInFlight?: boolean }).backgroundWorkInFlight
+    expect(decideIdleClear(s, 10 * H).clear).toBe(true)
+  })
+})
+
+describe('#3117 end-to-end: pending dispatch TTL gates idle-clear', () => {
+  // Drives the REAL pending-work-progress state (the source of
+  // backgroundWorkInFlight) against decideIdleClear with an injected clock, so
+  // the wiring — noteAsyncDispatch stamps, the TTL expires, the flag clears —
+  // is exercised as an outcome, not mirrored.
+  let clock = 0
+  const KEY = 'chat-1:'
+
+  beforeEach(() => {
+    pendingProgress.__resetAllForTests()
+    clock = 100 * H
+    // Install a clock override without starting the real timer.
+    pendingProgress.__setDepsForTests({
+      editMessage: async () => {},
+      nowMs: () => clock,
+    })
+  })
+  afterEach(() => {
+    pendingProgress.__setDepsForTests(null)
+    pendingProgress.__resetAllForTests()
+  })
+
+  function decideNow(now: number): boolean {
+    return decideIdleClear(
+      {
+        lastActivityAt: 0, // cold activity clock — window long elapsed
+        lastTurnEndedAt: null,
+        idleClearMs: 3 * H,
+        alreadyCleared: false,
+        turnInFlight: false,
+        backgroundWorkInFlight: pendingProgress.anyPendingAsyncDispatchWithin(
+          pendingProgress.BACKGROUND_WORK_SUPPRESS_TTL_MS,
+        ),
+      },
+      now,
+    ).clear
+  }
+
+  it('a pending dispatch inside the TTL suppresses the clear; past the TTL it self-heals', () => {
+    // No dispatch yet → idle-clear fires (control).
+    expect(decideNow(clock)).toBe(true)
+
+    // Background worker dispatched. Now within the TTL: suppressed.
+    pendingProgress.noteAsyncDispatch(KEY)
+    expect(pendingProgress.hasPendingAsyncDispatch(KEY)).toBe(true)
+    expect(decideNow(clock)).toBe(false)
+
+    // Still within TTL (just under 30m) → still suppressed.
+    clock += pendingProgress.BACKGROUND_WORK_SUPPRESS_TTL_MS - 1
+    expect(decideNow(clock)).toBe(false)
+
+    // TTL lapses (stuck/leaked flag) → suppression drops, idle-clear self-heals.
+    clock += 2
+    expect(pendingProgress.hasPendingAsyncDispatch(KEY)).toBe(true) // flag still set
+    expect(decideNow(clock)).toBe(true)
+  })
+
+  it('a dispatch that clears (worker returned) re-allows the clear before the TTL', () => {
+    pendingProgress.noteAsyncDispatch(KEY)
+    expect(decideNow(clock)).toBe(false)
+    // Worker handback / user inbound clears the pending flag well before TTL.
+    clock += 5 * M
+    pendingProgress.clearPending(KEY, 'handback')
+    expect(decideNow(clock)).toBe(true)
+  })
+
+  it('a fresh dispatch re-arms the TTL (freshest legitimate work wins)', () => {
+    pendingProgress.noteAsyncDispatch(KEY)
+    // Advance to just before expiry, then a new dispatch re-stamps.
+    clock += pendingProgress.BACKGROUND_WORK_SUPPRESS_TTL_MS - 1
+    pendingProgress.noteAsyncDispatch(KEY)
+    // Now advance past what WOULD have been the first dispatch's expiry.
+    clock += 2
+    expect(decideNow(clock)).toBe(false) // re-armed → still suppressed
   })
 })
 
