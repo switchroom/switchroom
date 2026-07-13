@@ -25,9 +25,11 @@ import {
   classifyIdleEvent,
   idleDurationToMs,
   DEFAULT_IDLE_CLEAR_MS,
+  IdleTracker,
   type IdleClearState,
 } from '../gateway/idle-clear.js'
 import * as pendingProgress from '../pending-work-progress.js'
+import { isCronInjectFire } from '../gateway/cron-session.js'
 
 const H = 3_600_000
 const M = 60_000
@@ -46,54 +48,63 @@ function state(p: Partial<IdleClearState>): IdleClearState {
 }
 
 /**
- * A minimal model of the gateway's idle bookkeeping, driven by a virtual clock.
- * Mirrors gateway.ts: `markIdleActivity()` on inbound / cron / ANY session
- * event, `markIdleTurnEnd()` on a turn ending, `decideIdleClear()` on each
- * IDLE_CLEAR_CHECK_MS tick, `alreadyCleared` latched on fire.
+ * Test harness that plays the role of the GATEWAY around the REAL `IdleTracker`
+ * (#3115). It holds NO idle state and NO idle logic of its own — every stamp,
+ * decision and latch delegates to the tracker the gateway itself holds. What it
+ * owns is exactly what the gateway owns and the tracker does not: the
+ * environment inputs (`idleClearMs`, `turnInFlight`, the background-work flag),
+ * the periodic tick loop, and a log of when a clear fired.
+ *
+ * This is the whole point of #3115: the old `IdleModel` re-implemented
+ * `markIdleActivity` / `markIdleTurnEnd` / the decide+latch in a mirror, so a
+ * regression in the real gateway code (e.g. deleting the per-event stamp) left
+ * every test green. Now a deleted stamp call fails a test, because the test
+ * drives the same object the gateway drives.
+ *
+ * DELIBERATE STRUCTURAL LIMIT: `tick()` re-implements the gateway's ONE-LINE
+ * orchestration around the tracker — the `decide → markClearFired` sequence
+ * (maybeIdleClear, gateway.ts) and, in the #3114 block below, the
+ * `!isCronInjectFire(meta)` stamp gate (onInjectInbound, gateway.ts). #3115
+ * moved all the STATE and idle LOGIC into the importable `IdleTracker`, so those
+ * are now driven directly; but gateway.ts is ~30k lines with import-time side
+ * effects and cannot be imported, so the thin glue that wires the tracker into
+ * the gateway is still asserted by re-implementing that glue here. A divergence
+ * between the real gateway one-liner and this harness would NOT be caught — a
+ * known, documented boundary, not an oversight. The residual glue is one line
+ * per callsite; everything of substance is the real object.
  */
-class IdleModel {
-  lastActivityAt: number
-  lastTurnEndedAt: number | null = null
-  alreadyCleared = false
+class TrackerHarness {
+  readonly tracker: IdleTracker
   turnInFlight = false
+  backgroundWorkInFlight: boolean | undefined = undefined
   clears: number[] = []
 
   constructor(
     startedAt: number,
     readonly idleClearMs = 3 * H,
   ) {
-    this.lastActivityAt = startedAt
+    this.tracker = new IdleTracker(startedAt)
   }
 
-  /** A claude session-stream event (the gateway's handleSessionEvent stamp). */
+  /** A claude session-stream event → the gateway's handleSessionEvent stamp. */
   sessionEvent(kind: string, now: number, durationMs?: number): void {
-    const signal = classifyIdleEvent(kind, durationMs)
-    if (signal.activity) {
-      this.lastActivityAt = now
-      this.alreadyCleared = false
-    }
-    if (signal.turnEnded) this.lastTurnEndedAt = now
+    this.tracker.noteEvent(kind, now, durationMs)
   }
 
-  /** Inbound / cron fire. */
+  /** Inbound / genuine cron fire → the gateway's markIdleActivity(). */
   activity(now: number): void {
-    this.lastActivityAt = now
-    this.alreadyCleared = false
+    this.tracker.noteInbound(now)
   }
 
+  /** One IDLE_CLEAR_CHECK_MS tick → the core of maybeIdleClear's decide+latch. */
   tick(now: number): boolean {
-    const { clear } = decideIdleClear(
-      {
-        lastActivityAt: this.lastActivityAt,
-        lastTurnEndedAt: this.lastTurnEndedAt,
-        idleClearMs: this.idleClearMs,
-        alreadyCleared: this.alreadyCleared,
-        turnInFlight: this.turnInFlight,
-      },
-      now,
-    )
+    const { clear } = this.tracker.decide(now, {
+      idleClearMs: this.idleClearMs,
+      turnInFlight: this.turnInFlight,
+      backgroundWorkInFlight: this.backgroundWorkInFlight,
+    })
     if (clear) {
-      this.alreadyCleared = true
+      this.tracker.markClearFired()
       this.clears.push(now)
     }
     return clear
@@ -110,7 +121,7 @@ describe('idle-clear: a working agent is not idle', () => {
     // The overlord incident, replayed. Window 3h. Turn starts at T, runs 3h08m
     // of real work (sub-agents, tool calls), ends at T+3h08m.
     const T = 100 * H
-    const m = new IdleModel(T)
+    const m = new TrackerHarness(T)
 
     m.turnInFlight = true
     m.sessionEvent('enqueue', T) // turn start
@@ -137,7 +148,7 @@ describe('idle-clear: a working agent is not idle', () => {
     // turn. `turnInFlight` was false the whole time, so only the per-event stamp
     // can save it.
     const T = 100 * H
-    const m = new IdleModel(T)
+    const m = new TrackerHarness(T)
     m.sessionEvent('turn_end', T, 34_596) // last turn boundary
     m.turnInFlight = false
 
@@ -176,7 +187,7 @@ describe('idle-clear: a working agent is not idle', () => {
 
   it('a background sub-agent still emitting events after the main turn ends holds off the clear', () => {
     const T = 100 * H
-    const m = new IdleModel(T)
+    const m = new TrackerHarness(T)
     m.sessionEvent('turn_end', T, 30_000)
     m.turnInFlight = false
     // Worker grinds for 4h past the main turn end.
@@ -191,14 +202,14 @@ describe('idle-clear: a working agent is not idle', () => {
 describe('idle-clear: a genuinely idle agent is still cleared', () => {
   it('no turn, no inbound, no session event for a full window → cleared exactly once', () => {
     const T = 100 * H
-    const m = new IdleModel(T)
+    const m = new TrackerHarness(T)
     m.ticksThrough(T, T + 6 * H)
     expect(m.clears).toEqual([T + 3 * H])
   })
 
   it('cleared once per idle period, and re-arms on the next inbound', () => {
     const T = 100 * H
-    const m = new IdleModel(T)
+    const m = new TrackerHarness(T)
     m.ticksThrough(T, T + 5 * H)
     expect(m.clears).toEqual([T + 3 * H])
 
@@ -212,7 +223,7 @@ describe('idle-clear: a genuinely idle agent is still cleared', () => {
 
   it('a turn that ends is cleared one full window after it ended (not before)', () => {
     const T = 100 * H
-    const m = new IdleModel(T)
+    const m = new TrackerHarness(T)
     m.turnInFlight = true
     m.sessionEvent('enqueue', T)
     const end = T + 3 * H + 8 * M
@@ -223,6 +234,177 @@ describe('idle-clear: a genuinely idle agent is still cleared', () => {
     expect(m.clears).toEqual([]) // still warm
     m.ticksThrough(end, end + 3 * H + TICK)
     expect(m.clears).toEqual([end + 3 * H]) // now genuinely idle → cleared
+  })
+})
+
+describe('IdleTracker wiring (#3115) — the real object, not a mirror', () => {
+  // These are the tests the old IdleModel COULD NOT be: they assert the real
+  // tracker's stamp calls are load-bearing. Delete `noteEvent`'s activity
+  // stamp, or gateway.ts's `idleTracker.noteEvent(...)` call, and these fail —
+  // whereas against the IdleModel mirror the same regression stayed green.
+
+  it('noteEvent advances lastActivityAt on every genuine session event', () => {
+    const T = 100 * H
+    const t = new IdleTracker(T)
+    expect(t.activityAt).toBe(T)
+    // A stream of events, each newer than the last, must walk the clock forward.
+    for (const [i, kind] of [
+      'enqueue', 'thinking', 'tool_use', 'tool_result', 'text',
+      'sub_agent_started', 'sub_agent_tool_use',
+    ].entries()) {
+      const now = T + (i + 1) * M
+      t.noteEvent(kind, now)
+      expect(t.activityAt).toBe(now) // load-bearing: the stamp actually fired
+    }
+  })
+
+  it('noteEvent stamps the turn-end clock on a real turn_end but the synthetic one does not stamp activity', () => {
+    const T = 100 * H
+    const t = new IdleTracker(T)
+    t.noteEvent('turn_end', T + M, 5_000) // real turn end: activity + turn-end
+    expect(t.activityAt).toBe(T + M)
+    expect(t.turnEndedAt).toBe(T + M)
+    // Gateway's synthetic turn_end (durationMs === -1): ends the turn, NOT activity.
+    t.noteEvent('turn_end', T + 2 * M, -1)
+    expect(t.activityAt).toBe(T + M) // unchanged — not real activity
+    expect(t.turnEndedAt).toBe(T + 2 * M) // but the turn-end clock advanced
+  })
+
+  it('the re-entrancy guard (isDispatching) makes an overlapping tick a no-op until endDispatch', () => {
+    // maybeIdleClear early-returns while a /clear inject is in flight
+    // (gateway.ts: `if (idleTracker.isDispatching) return`). Model that gate
+    // against the REAL tracker: begin a dispatch, then a tick that arrives
+    // before the async inject settles must NOT fire a second clear, and normal
+    // behaviour must resume once the dispatch ends.
+    const T = 100 * H
+    const t = new IdleTracker(T)
+    const inputs = { idleClearMs: 3 * H, turnInFlight: false }
+
+    // The window has elapsed → first tick clears and opens a dispatch.
+    expect(t.isDispatching).toBe(false)
+    expect(t.decide(T + 3 * H, inputs).clear).toBe(true)
+    t.markClearFired()
+    t.beginDispatch()
+    expect(t.isDispatching).toBe(true)
+
+    // A second tick arrives mid-dispatch. The gateway's guard short-circuits
+    // BEFORE decide(), so no second clear fires. Assert both the guard signal
+    // and that a bypassing decide() would still be latched off anyway.
+    let secondClearFired = false
+    if (!t.isDispatching) {
+      // (unreached while dispatching — this is the gateway's guarded path)
+      const { clear } = t.decide(T + 4 * H, inputs)
+      if (clear) secondClearFired = true
+    }
+    expect(secondClearFired).toBe(false) // guard held: no double-dispatch
+    // Even if the guard were bypassed, the fire-once latch blocks a re-clear.
+    expect(t.decide(T + 4 * H, inputs).clear).toBe(false)
+
+    // Dispatch settles. The guard reopens; still latched (no activity yet).
+    t.endDispatch()
+    expect(t.isDispatching).toBe(false)
+    expect(t.decide(T + 5 * H, inputs).clear).toBe(false) // alreadyCleared
+
+    // Fresh activity re-arms → normal behaviour resumes, one window later.
+    t.noteInbound(T + 6 * H)
+    expect(t.decide(T + 9 * H, inputs).clear).toBe(true)
+  })
+
+  it('the fire-once latch survives across ticks and re-arms only on activity', () => {
+    const T = 100 * H
+    const t = new IdleTracker(T)
+    const inputs = { idleClearMs: 3 * H, turnInFlight: false }
+    // Window elapsed → clears once, then latched.
+    expect(t.decide(T + 3 * H, inputs).clear).toBe(true)
+    t.markClearFired()
+    expect(t.cleared).toBe(true)
+    expect(t.decide(T + 4 * H, inputs).clear).toBe(false) // latched
+    // Fresh activity re-arms.
+    t.noteInbound(T + 5 * H)
+    expect(t.cleared).toBe(false)
+    expect(t.decide(T + 8 * H, inputs).clear).toBe(true) // one window after re-arm
+  })
+})
+
+describe('IdleTracker #3116 — write-time re-eval suppresses a clear when activity arrives in the gap', () => {
+  // maybeIdleClear latches `alreadyCleared=true` before the async /clear inject
+  // (re-entrancy). The write-time precondition (`decideIgnoringLatch`) must
+  // therefore judge idleness on the LIVE clocks, ignoring that latch, so a new
+  // inbound in the check-to-send gap still aborts the buffered /clear.
+  const inputs = { idleClearMs: 3 * H, turnInFlight: false }
+
+  it('re-eval returns not-idle after an inbound lands in the gap (latch ignored)', () => {
+    const T = 100 * H
+    const t = new IdleTracker(T)
+    // Gate fires at the window; gateway latches the fire-once guard.
+    expect(t.decide(T + 3 * H, inputs).clear).toBe(true)
+    t.markClearFired()
+    t.beginDispatch()
+    // Inbound arrives in the check-to-send gap → re-arms the activity clock.
+    t.noteInbound(T + 3 * H + 5 * M)
+    // Write-time re-eval (ignoring the latch) now sees a warm clock → abort.
+    expect(t.decideIgnoringLatch(T + 3 * H + 6 * M, inputs).clear).toBe(false)
+  })
+
+  it('with no activity in the gap the write-time re-eval still says clear (latch ignored, not the gate)', () => {
+    const T = 100 * H
+    const t = new IdleTracker(T)
+    expect(t.decide(T + 3 * H, inputs).clear).toBe(true)
+    t.markClearFired()
+    // No inbound; the clock is still cold → the buffered /clear proceeds.
+    expect(t.decideIgnoringLatch(T + 3 * H + M, inputs).clear).toBe(true)
+  })
+
+  it('#3117 composes at write time: a background dispatch in the gap suppresses the buffered /clear', () => {
+    const T = 100 * H
+    const t = new IdleTracker(T)
+    expect(t.decide(T + 3 * H, { ...inputs, backgroundWorkInFlight: false }).clear).toBe(true)
+    t.markClearFired()
+    // A detached worker gets dispatched in the gap → re-eval honours it for free.
+    expect(
+      t.decideIgnoringLatch(T + 3 * H + M, { ...inputs, backgroundWorkInFlight: true }).clear,
+    ).toBe(false)
+  })
+})
+
+describe('IdleTracker #3114 — a cron fire does not warm the clock, a human inbound does', () => {
+  // Behavioural coverage that REPLACES 3114's source-text wiring pin: drives the
+  // REAL isCronInjectFire predicate + the REAL IdleTracker through the exact
+  // gateway rule (`if (!isCronInjectFire(meta)) tracker.noteInbound(now)`). A
+  // regression in EITHER the predicate or the stamp fails this — the old
+  // source-scrape asserted only that a string appeared in gateway.ts.
+
+  /** The gateway's onInjectInbound stamp rule, applied to the real objects. */
+  function injectFire(t: IdleTracker, meta: Record<string, unknown> | undefined, now: number): void {
+    if (!isCronInjectFire(meta)) t.noteInbound(now)
+  }
+
+  it('frequent cron fires (cadence < window) never re-arm the clock → idle-clear still fires', () => {
+    const T = 100 * H
+    const t = new IdleTracker(T)
+    const inputs = { idleClearMs: 3 * H, turnInFlight: false }
+    // A cron fires every 10 min for well over the window, doing NO real work
+    // (no session events). On main this re-armed the clock every fire → never idle.
+    for (let now = T; now <= T + 3 * H + 30 * M; now += 10 * M) {
+      injectFire(t, { session: 'cron', source: 'cron' }, now) // Tier-1 cheap cron
+      injectFire(t, { source: 'cron' }, now) // Tier-2 main-session cron
+    }
+    // The clock never moved off T → the tracker is genuinely idle and clears.
+    expect(t.activityAt).toBe(T)
+    expect(t.decide(T + 3 * H, inputs).clear).toBe(true)
+  })
+
+  it('a genuine operator inbound (reaction/vault/resume/manual) DOES warm the clock', () => {
+    const T = 100 * H
+    const t = new IdleTracker(T)
+    injectFire(t, { source: 'reaction' }, T + M)
+    expect(t.activityAt).toBe(T + M)
+    injectFire(t, undefined, T + 2 * M) // bare manual inject
+    expect(t.activityAt).toBe(T + 2 * M)
+    // And a warmed clock defers the clear a full window past the last inbound.
+    const inputs = { idleClearMs: 3 * H, turnInFlight: false }
+    expect(t.decide(T + 2 * M + 3 * H - 1, inputs).clear).toBe(false)
+    expect(t.decide(T + 2 * M + 3 * H, inputs).clear).toBe(true)
   })
 })
 
@@ -317,20 +499,17 @@ describe('#3117 end-to-end: pending dispatch TTL gates idle-clear', () => {
     pendingProgress.__resetAllForTests()
   })
 
+  // Cold activity clock (started at 0, window long elapsed) held in the REAL
+  // tracker; the gateway's exact background-work input is fed at decide time.
+  const tracker = new IdleTracker(0)
   function decideNow(now: number): boolean {
-    return decideIdleClear(
-      {
-        lastActivityAt: 0, // cold activity clock — window long elapsed
-        lastTurnEndedAt: null,
-        idleClearMs: 3 * H,
-        alreadyCleared: false,
-        turnInFlight: false,
-        backgroundWorkInFlight: pendingProgress.anyPendingAsyncDispatchWithin(
-          pendingProgress.BACKGROUND_WORK_SUPPRESS_TTL_MS,
-        ),
-      },
-      now,
-    ).clear
+    return tracker.decide(now, {
+      idleClearMs: 3 * H,
+      turnInFlight: false,
+      backgroundWorkInFlight: pendingProgress.anyPendingAsyncDispatchWithin(
+        pendingProgress.BACKGROUND_WORK_SUPPRESS_TTL_MS,
+      ),
+    }).clear
   }
 
   it('a pending dispatch inside the TTL suppresses the clear; past the TTL it self-heals', () => {

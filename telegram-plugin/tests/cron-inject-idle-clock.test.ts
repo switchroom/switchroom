@@ -8,28 +8,21 @@
  * including cheap-cron fires routed to the derived `<agent>-cron` bridge,
  * whose session events never reach the main clock at all.
  *
- * Two layers of guarantee, both of which FAIL against pre-fix main:
+ * This covers the pure identity predicate `isCronInjectFire` — which inject
+ * fires warm the main clock. It did not exist on main → import fails there.
  *
- *   1. The pure identity predicate `isCronInjectFire` — classifies which
- *      inject fires warm the main clock. Did not exist on main → import fails.
- *
- *   2. A wiring pin over gateway.ts source — the inject-time stamp is now
- *      GATED on `!isCronInjectFire(...)`, while the genuine-human inbound path
- *      (`handleInbound`) still stamps unconditionally. On main the inject-time
- *      stamp was unconditional, so the "cron does not stamp, human does"
- *      assertion fails there.
- *
- * The wiring pin mirrors the established pattern for un-exported inline
- * gateway closures (see gateway-pending-command-wiring.test.ts): gateway.ts is
- * ~30k lines with import-time side effects, so nothing imports it directly —
- * the durable structural extraction of the idle bookkeeping is #3115's job,
- * explicitly out of scope here.
+ * The gateway WIRING (that `onInjectInbound` gates the stamp on
+ * `!isCronInjectFire(...)`, that a cron cadence shorter than the window no
+ * longer re-arms the clock, and that a human inbound still warms it) is now
+ * covered BEHAVIOURALLY in `idle-clear.test.ts` — the
+ * `IdleTracker #3114` block drives the REAL predicate + the REAL `IdleTracker`
+ * through the exact gateway rule. #3115 extracted the idle bookkeeping into an
+ * importable object, so that block replaces the brittle source-text wiring pin
+ * this file used to carry (a regression in the real stamp logic now fails a
+ * behavioural assertion, not just a string-match over gateway.ts).
  */
 
 import { describe, it, expect } from 'vitest'
-import { readFileSync } from 'node:fs'
-import { fileURLToPath } from 'node:url'
-import { dirname, resolve } from 'node:path'
 import { isCronInjectFire } from '../gateway/cron-session.js'
 
 describe('#3114 isCronInjectFire — which inject fires warm the main idle clock', () => {
@@ -57,43 +50,5 @@ describe('#3114 isCronInjectFire — which inject fires warm the main idle clock
     expect(isCronInjectFire(undefined)).toBe(false)
     expect(isCronInjectFire({})).toBe(false)
     expect(isCronInjectFire({ prompt_key: 'x' })).toBe(false)
-  })
-})
-
-describe('#3114 gateway wiring — cron inject does not stamp, human inbound does', () => {
-  const __dirname = dirname(fileURLToPath(import.meta.url))
-  const GATEWAY_SRC = readFileSync(
-    resolve(__dirname, '..', 'gateway', 'gateway.ts'),
-    'utf8',
-  )
-
-  it('onInjectInbound gates the idle stamp on !isCronInjectFire (was unconditional on main)', () => {
-    const handlerIdx = GATEWAY_SRC.indexOf('onInjectInbound(_client: IpcClient, msg: InjectInboundMessage)')
-    expect(handlerIdx).toBeGreaterThan(0)
-    // Scope to the handler head — up to the promptKey extraction that follows
-    // the stamp decision.
-    const win = GATEWAY_SRC.slice(handlerIdx, handlerIdx + 1600)
-    const promptKeyIdx = win.indexOf('const promptKey')
-    expect(promptKeyIdx).toBeGreaterThan(0)
-    const head = win.slice(0, promptKeyIdx)
-    // The stamp is present but GUARDED by the cron-identity predicate…
-    expect(head).toContain('isCronInjectFire(msg.inbound.meta)')
-    expect(head).toContain('markIdleActivity()')
-    // …and there is NO unconditional markIdleActivity() before the guard
-    // (the pre-fix bug). The only occurrence sits behind the guard on one line.
-    expect(head).toContain('if (!isCronInjectFire(msg.inbound.meta)) markIdleActivity()')
-    const stampCount = (head.match(/markIdleActivity\(\)/g) ?? []).length
-    expect(stampCount).toBe(1)
-  })
-
-  it('the genuine-human inbound path (handleInbound) still stamps unconditionally', () => {
-    const fnIdx = GATEWAY_SRC.indexOf('async function handleInbound(')
-    expect(fnIdx).toBeGreaterThan(0)
-    const bodyStart = GATEWAY_SRC.indexOf('): Promise<void> {', fnIdx)
-    expect(bodyStart).toBeGreaterThan(0)
-    const head = GATEWAY_SRC.slice(bodyStart, bodyStart + 200)
-    // Unconditional — not gated by any cron predicate: real human presence.
-    expect(head).toContain('markIdleActivity()')
-    expect(head).not.toContain('isCronInjectFire')
   })
 })

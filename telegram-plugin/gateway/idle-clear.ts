@@ -156,6 +156,154 @@ export function classifyIdleEvent(
 }
 
 /**
+ * Inputs the gateway feeds into a decision that live OUTSIDE the idle clocks:
+ * the resolved window, the main-turn gate, and the TTL-bounded background-work
+ * suppressor. Kept separate from `IdleClearState` (the clock state the tracker
+ * owns) so the tracker's decide surface is exactly "here is the world right
+ * now" and the tracker supplies its own clocks + latch.
+ */
+export interface IdleDecisionInputs {
+  /** Resolved idle window in ms (env → per-agent config → 3h default). <=0 disables. */
+  idleClearMs: number;
+  /** A turn is in flight (the same gate proactive-compact uses). Never clear mid-turn. */
+  turnInFlight: boolean;
+  /**
+   * A detached background sub-agent is in flight AND within its suppression TTL
+   * (#3117). Optional; undefined ⇒ false (pre-#3117 behaviour). The caller bounds
+   * this by a TTL so a leaked pending flag can't disable idle-clear forever.
+   */
+  backgroundWorkInFlight?: boolean;
+}
+
+/**
+ * The gateway's idle bookkeeping as ONE stateful object (#3115).
+ *
+ * Before #3115 this lived as four bare module-level `let`s in gateway.ts
+ * (`lastIdleActivityAt`, `lastIdleTurnEndAt`, `idleAutoCleared`,
+ * `idleClearDispatching`) plus the inline `markIdleActivity` / `markIdleTurnEnd`
+ * / `maybeIdleClear` stamp+decide logic scattered across `handleSessionEvent`,
+ * `onInjectInbound`, and `handleInbound`. Nothing imported gateway.ts (~30k
+ * lines, import-time side effects), so the WIRING — that every session event
+ * actually stamps the clocks — was untestable and the test mirrored the logic
+ * in a local `IdleModel` instead of exercising it. Deleting the real stamp
+ * block left every test green while re-introducing the #3113 "productive work
+ * gets wiped" bug.
+ *
+ * Extracting the state here makes the real object importable and drivable: a
+ * deleted stamp call now fails a test because the test holds the SAME object
+ * the gateway holds. The gateway keeps ownership of its environment concerns
+ * (resolving the window, `turnInFlightForGate()`, the pending-dispatch probe)
+ * and feeds them in via `IdleDecisionInputs`; the tracker owns only the clocks
+ * and the fire-once / re-entrancy latches.
+ *
+ * The clock is injected per-call (`now`) exactly like the pure `decideIdleClear`
+ * / `classifyIdleEvent` it delegates to — the gateway passes `Date.now()`, the
+ * tests pass a deterministic virtual clock.
+ */
+export class IdleTracker {
+  /** Epoch ms of the last activity (inbound, cron fire, or any genuine session event). */
+  private lastActivityAt: number;
+  /** Epoch ms a turn last ended (null = none this process). */
+  private lastTurnEndedAt: number | null = null;
+  /** Already auto-cleared since the last activity? Fire-once-per-idle-period latch. */
+  private alreadyCleared = false;
+  /** A /clear dispatch is in flight — re-entrancy guard so a tick can't double-fire. */
+  private dispatching = false;
+
+  constructor(startedAt: number) {
+    this.lastActivityAt = startedAt;
+  }
+
+  /** Epoch ms of the last activity — for wiring assertions (was `lastIdleActivityAt`). */
+  get activityAt(): number {
+    return this.lastActivityAt;
+  }
+  /** Epoch ms a turn last ended, or null — for wiring assertions. */
+  get turnEndedAt(): number | null {
+    return this.lastTurnEndedAt;
+  }
+  /** The fire-once latch — true once cleared this idle period, until re-armed. */
+  get cleared(): boolean {
+    return this.alreadyCleared;
+  }
+  /** A /clear dispatch is currently in flight. */
+  get isDispatching(): boolean {
+    return this.dispatching;
+  }
+
+  /**
+   * Reset the idle timer + re-arm auto-clear. Call on ANY activity — inbound,
+   * a genuine cron fire, or (via `noteEvent`) any claude session-stream event.
+   * Was the gateway's `markIdleActivity()`.
+   */
+  noteInbound(now: number): void {
+    this.lastActivityAt = now;
+    this.alreadyCleared = false;
+  }
+
+  /**
+   * Feed a claude session-stream event through the classifier and stamp the
+   * clocks. Genuine activity re-arms the auto-clear; a turn ending additionally
+   * stamps the turn-end clock. Was the gateway's inline
+   * `classifyIdleEvent` + `markIdleActivity`/`markIdleTurnEnd` block in
+   * `handleSessionEvent` — the load-bearing wiring #3115 makes testable.
+   */
+  noteEvent(kind: string, now: number, durationMs?: number): void {
+    const signal = classifyIdleEvent(kind, durationMs);
+    if (signal.activity) this.noteInbound(now);
+    if (signal.turnEnded) this.lastTurnEndedAt = now;
+  }
+
+  /** Snapshot the tracker's clocks into an `IdleClearState` for a decision. */
+  private stateFor(inputs: IdleDecisionInputs, alreadyCleared: boolean): IdleClearState {
+    return {
+      lastActivityAt: this.lastActivityAt,
+      lastTurnEndedAt: this.lastTurnEndedAt,
+      idleClearMs: inputs.idleClearMs,
+      alreadyCleared,
+      turnInFlight: inputs.turnInFlight,
+      backgroundWorkInFlight: inputs.backgroundWorkInFlight,
+    };
+  }
+
+  /**
+   * Decide whether to auto-clear right now, honouring the fire-once latch.
+   * Delegates to the pure `decideIdleClear` against the live clocks + inputs.
+   */
+  decide(now: number, inputs: IdleDecisionInputs): IdleClearDecision {
+    return decideIdleClear(this.stateFor(inputs, this.alreadyCleared), now);
+  }
+
+  /**
+   * Re-evaluate idleness at /clear WRITE time (#3116 precondition), IGNORING the
+   * fire-once latch. `maybeIdleClear` latches `alreadyCleared=true` before the
+   * async inject for re-entrancy, so the write-time re-eval must judge idleness
+   * on the live clocks + turn/background gates only — any activity that arrived
+   * in the check-to-send gap must still suppress the buffered /clear.
+   */
+  decideIgnoringLatch(now: number, inputs: IdleDecisionInputs): IdleClearDecision {
+    return decideIdleClear(this.stateFor(inputs, false), now);
+  }
+
+  /** Latch the fire-once guard: a /clear has been decided for this idle period. */
+  markClearFired(): void {
+    this.alreadyCleared = true;
+  }
+  /** Re-arm after a suppressed dispatch so the next idle period can clear again. */
+  reArm(): void {
+    this.alreadyCleared = false;
+  }
+  /** Mark a /clear dispatch as begun (re-entrancy latch). */
+  beginDispatch(): void {
+    this.dispatching = true;
+  }
+  /** Mark a /clear dispatch as finished (re-entrancy latch released). */
+  endDispatch(): void {
+    this.dispatching = false;
+  }
+}
+
+/**
  * Parse a `^\d+[smh]$` duration (the SessionSchema format, e.g. "3h", "30m",
  * "7200s") to ms. Returns null on a malformed string so the caller can fall
  * back to the default. Kept local (vs importing the web module's parser) to
