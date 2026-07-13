@@ -1221,10 +1221,15 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
           sendResponse(ctx, rpcErr(id, -32603, msg));
           break;
         }
+        // #3116: `skipped` means an opt-in write-time precondition aborted the
+        // send — no keys were sent, so do NOT claim it was "sent". No hermes
+        // caller opts in today (unreachable), but report honestly if one does.
         const output =
           injectResult.outcome === "ok"
             ? injectResult.output ?? ""
-            : `*(${fullCommand} sent)*`;
+            : injectResult.outcome === "skipped"
+              ? `*(${fullCommand} skipped — precondition not met)*`
+              : `*(${fullCommand} sent)*`;
         sendResponse(ctx, rpcOk(id, { ok: true, output }));
         break;
       }

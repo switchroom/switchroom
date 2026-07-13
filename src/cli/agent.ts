@@ -1622,6 +1622,16 @@ export function registerAgentCommand(program: Command): void {
             }
             return;
           }
+          // outcome === 'skipped' (#3116): an opt-in write-time precondition
+          // aborted the send before any keys were sent. No CLI caller opts in
+          // today, so this is unreachable here — but report it honestly (not as
+          // a failure) so a future precondition caller isn't mislabeled.
+          if (result.outcome === "skipped") {
+            console.log(
+              chalk.yellow(`↷ ${result.command} — skipped (precondition not met at send time)`),
+            );
+            return;
+          }
           // outcome === 'failed'
           const code = result.errorCode ?? "tmux_failed";
           const msg = result.errorMessage ?? "unknown error";
