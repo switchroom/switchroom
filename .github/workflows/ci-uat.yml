@@ -59,6 +59,16 @@ on:
   # pass burns quota that competes with the live fleet. The thorough fuzz pool is
   # now workflow_dispatch-ONLY (run it deliberately during a UAT pass).
   workflow_dispatch:
+    inputs:
+      scenario:
+        description: >-
+          Optional: a single extra UAT scenario name (vitest substring match) to
+          run in uat-gate-run AFTER the 3 fixed gate round-trips. Lets an operator
+          dispatch a targeted scenario (e.g. bg-sub-agent-dispatch-dm) on demand
+          without editing the workflow. Leave blank to run only the gate trio.
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -172,6 +182,15 @@ jobs:
         # Phase 1 parse-level suite.
         working-directory: telegram-plugin
         run: bun run test:uat jtbd-rich-formatting-render-dm
+      - name: Targeted scenario — operator-dispatched (vitest substring)
+        if: steps.secrets.outputs.ok == 'true' && inputs.scenario != ''
+        # workflow_dispatch-only extra: run a single named scenario after the
+        # fixed gate trio so an operator can validate a specific behavioural path
+        # (e.g. a bg-sub-agent / card-skeleton fix) on the live harness without a
+        # workflow edit. Same setup + env + self-skip behaviour as the gate steps
+        # above; `inputs.scenario` is empty on push/PR so this no-ops there.
+        working-directory: telegram-plugin
+        run: bun run test:uat ${{ inputs.scenario }}
 
   # ─── Sentinel ─────────────────────────────────────────────────────
   # Branch-protection-required context. ALWAYS runs (ubuntu-latest, no
