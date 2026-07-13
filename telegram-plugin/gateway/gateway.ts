@@ -88,6 +88,7 @@ import {
   type TelegraphAccount,
 } from '../telegraph.js'
 import { OutboundDedupCache } from '../recent-outbound-dedup.js'
+import { FlushedTurnSupersedeRegistry } from '../flushed-turn-supersede.js'
 import { createInboundCoalescer, inboundCoalesceKey } from './inbound-coalesce.js'
 import {
   splitCoalescedAttachments,
@@ -2220,6 +2221,14 @@ const deferredDoneReactions = new DeferredDoneReactions<StatusReactionController
 // path threw `outboundDedup is not defined` at runtime, blocking ALL outbound
 // from the agent. Restore the module-level singleton here.
 const outboundDedup = new OutboundDedupCache()
+// 2026-07 duplicate-reply fix — turnId-keyed supersede. When a turn-flush
+// (answer-ready quiescence OR the turn-end backstop) posts the model's terminal
+// text and the model's REAL `reply` for the SAME turn lands later, the reply
+// SUPERSEDES the flushed message (delete + canonical resend) instead of shipping
+// a second message. Keyed on the per-turn `turnId` nonce, NOT on text — so it
+// catches the containment case the exact-text `outboundDedup` misses (a
+// `narration\n\nanswer` flush never equals the clean `answer`-only reply).
+const flushedTurnSupersede = new FlushedTurnSupersedeRegistry()
 /**
  * Per-chat cache of `available_reactions` from `getChat`. Populated lazily —
  * the FIRST message in a chat creates a controller without the filter (null
@@ -12902,6 +12911,39 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     }
   }
 
+  // 2026-07 duplicate-reply fix — turnId-keyed supersede (consumption side).
+  // If an earlier turn-flush (answer-ready quiescence OR the turn-end backstop)
+  // already posted THIS turn's terminal text and the model's REAL `reply` for
+  // the same turn is landing now (it was still composing the tool call when the
+  // flush fired, or claude-code replayed the tool_call after a bridge
+  // reconnect), delete the flushed message(s) so the canonical reply below
+  // delivers exactly one clean message instead of a second one. Keyed on the
+  // per-turn `turnId` nonce, so it fires even when the flushed narration+answer
+  // blob differs from the clean answer-only reply — the containment case the
+  // exact-text `outboundDedup` above structurally cannot catch. A reply for a
+  // DIFFERENT newer live turn never supersedes (decideSupersede → different-turn),
+  // so a fresh turn's answer is never clobbered.
+  {
+    const replyThreadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
+    const decision = flushedTurnSupersede.take(
+      chat_id,
+      replyThreadId,
+      { liveTurnId: turn?.turnId ?? null, now: Date.now() },
+    )
+    if (decision.supersede) {
+      process.stderr.write(
+        `telegram gateway: reply: superseding flushed turn message(s) ` +
+        `chatId=${chat_id} ids=${JSON.stringify(decision.deleteMessageIds)}\n`,
+      )
+      for (const id of decision.deleteMessageIds) {
+        await swallowingApiCall(
+          () => lockedBot.api.deleteMessage(chat_id, id),
+          { chat_id, verb: 'reply.supersedeFlushed' },
+        )
+      }
+    }
+  }
+
   const files = (args.files as string[] | undefined) ?? []
   const quoteOptIn = args.quote !== false
   let reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
@@ -18264,6 +18306,22 @@ function handleSessionEvent(ev: SessionEvent): void {
               Date.now(),
               currentTurn?.registryKey ?? null,
             )
+            // 2026-07 duplicate-reply fix — record the flushed message id(s)
+            // keyed on THIS turn's `turnId` nonce so a late `reply` for the same
+            // turn supersedes them (delete + canonical resend) instead of
+            // shipping a duplicate. `turn` is the ending turn atom captured at
+            // the top of this branch (endCurrentTurnAtomic nulled currentTurn,
+            // but the captured `turn` still carries the honest turnId). Covers
+            // BOTH flush paths — answer-ready quiescence and the turn-end
+            // backstop both funnel through this single IIFE.
+            if (sentIds.length > 0) {
+              flushedTurnSupersede.record(
+                backstopChatId,
+                backstopThreadId,
+                { turnId: turn.turnId, messageIds: sentIds, text: capturedText },
+                Date.now(),
+              )
+            }
             // #1713: route the backstop terminal through finalize() —
             // single terminal path keeps the controller contract clean.
             if (backstopCtrl) backstopCtrl.finalize('done')

@@ -128,6 +128,49 @@ export function endsWithSilentMarker(text: string | undefined): boolean {
   return isSilentFlushMarker(lines[lines.length - 1])
 }
 
+/**
+ * Substantive-answer floor (chars, trimmed). Mirrors
+ * `final-answer-detect.ts` `FINAL_ANSWER_MIN_CHARS` and
+ * `hooks/silent-end-scan.mjs` — the same bar the codebase uses everywhere to
+ * recognise "this text block is a real answer, not a short narration/closer".
+ */
+export const FLUSH_SUBSTANTIVE_MIN_CHARS = 200
+
+/**
+ * Pick the text a turn-flush should actually DELIVER from the captured
+ * assistant blocks.
+ *
+ * The duplicate-reply bug (2026-07) had the answer-ready flush fire while the
+ * model was still composing its `reply` tool call: `capturedText` at that
+ * moment holds intent-narration blocks ("Let me check X", "I'll now …") FOLLOWED
+ * by the composed answer block. Flushing `capturedText.join('\n\n')` dumped the
+ * whole narration+answer blob into chat — which then never matched the clean
+ * answer-only `reply` on the outbound dedup (containment, not equality), so the
+ * user got a narration-laden duplicate.
+ *
+ * This mirrors `silent-end-scan.mjs`'s Finding-2 rule (#3228): a real dropped
+ * answer is a SINGLE substantive block, so deliver only the LAST block that
+ * clears the substantive floor — the narration blocks before it are dropped.
+ * When NO block clears the floor (a genuinely short whole-turn answer, e.g. two
+ * short paragraphs), fall back to the paragraph-joined text so we never drop a
+ * short legitimate answer — the narration-dump risk there is negligible (short
+ * blocks) and this preserves the legacy short-turn behaviour.
+ *
+ * `blocks` are already trimmed/non-empty candidates (silent markers removed by
+ * the caller's guards). Returns the chosen delivery text.
+ */
+export function selectFlushDeliveryText(blocks: string[]): string {
+  const candidates = blocks
+    .map(b => b.trim())
+    .filter(b => b.length > 0)
+  if (candidates.length === 0) return ''
+  const lastSubstantive = [...candidates]
+    .reverse()
+    .find(b => b.length >= FLUSH_SUBSTANTIVE_MIN_CHARS)
+  if (lastSubstantive != null) return lastSubstantive
+  return candidates.join('\n\n')
+}
+
 export type FlushDecision =
   | { kind: 'flush'; text: string }
   | { kind: 'skip'; reason: FlushSkipReason }
@@ -219,7 +262,11 @@ export function decideTurnFlush(input: FlushDecisionInput): FlushDecision {
   // sentinel — treat the whole turn as intentionally silent rather than
   // flush the prose with the sentinel glued on.
   if (endsWithSilentMarker(joined)) return { kind: 'skip', reason: 'silent-marker' }
-  return { kind: 'flush', text: joined }
+  // Deliver only the substantive answer block, never the whole narration+answer
+  // blob (see `selectFlushDeliveryText`). The silent-marker / empty guards above
+  // still run on the full `joined` string so a partly-silent turn is classified
+  // correctly; only the DELIVERED text is narrowed to the answer.
+  return { kind: 'flush', text: selectFlushDeliveryText(input.capturedText) }
 }
 
 /**

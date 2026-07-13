@@ -21,6 +21,8 @@ import {
   isCompositeSilentNoise,
   endsWithSilentMarker,
   isTurnFlushSafetyEnabled,
+  selectFlushDeliveryText,
+  FLUSH_SUBSTANTIVE_MIN_CHARS,
 } from '../turn-flush-safety.js'
 // Rich-message send-path primitives (Bot API 10.1, #2669/#2692). The #2798
 // regression suite below reconstructs the exact gateway turn-flush render
@@ -568,6 +570,51 @@ describe('isTurnFlushSafetyEnabled', () => {
     for (const v of ['1', 'true', 'on', 'yes', 'anything']) {
       expect(isTurnFlushSafetyEnabled({ SWITCHROOM_TG_TURN_FLUSH_SAFETY: v }))
         .toBe(true)
+    }
+  })
+})
+
+describe('selectFlushDeliveryText — deliver the answer block, not the narration+answer blob', () => {
+  const answer = 'A'.repeat(FLUSH_SUBSTANTIVE_MIN_CHARS + 20)
+
+  it('delivers ONLY the last substantive block when narration precedes the answer', () => {
+    // The duplicate-reply root cause: the flush fired while the model was still
+    // composing its reply, so capturedText held intent-narration blocks THEN
+    // the composed answer. Pre-fix the flush dumped the whole blob; post-fix it
+    // delivers only the answer. This test FAILS on the pre-fix `join('\n\n')`.
+    const blocks = ["Let me check that.", "I'll look it up now.", answer]
+    const out = selectFlushDeliveryText(blocks)
+    expect(out).toBe(answer)
+    expect(out).not.toContain('Let me check')
+    expect(out).not.toContain("I'll look it up")
+  })
+
+  it('picks the LAST substantive block when several clear the floor', () => {
+    const first = 'B'.repeat(FLUSH_SUBSTANTIVE_MIN_CHARS + 5)
+    const last = 'C'.repeat(FLUSH_SUBSTANTIVE_MIN_CHARS + 5)
+    expect(selectFlushDeliveryText([first, 'tiny narration', last])).toBe(last)
+  })
+
+  it('falls back to the paragraph-joined text when NO block clears the floor (short legit answer preserved)', () => {
+    const blocks = ['First short paragraph.', 'Second short paragraph.']
+    expect(selectFlushDeliveryText(blocks)).toBe('First short paragraph.\n\nSecond short paragraph.')
+  })
+
+  it('trims and drops empty blocks', () => {
+    expect(selectFlushDeliveryText(['  ', '', '  hi  '])).toBe('hi')
+    expect(selectFlushDeliveryText([])).toBe('')
+  })
+
+  it('decideTurnFlush delivers the narrowed answer, not the whole blob', () => {
+    const decision = decideTurnFlush({
+      chatId: 'chat1',
+      replyCalled: false,
+      capturedText: ['Let me check.', 'Now composing.', answer],
+    })
+    expect(decision.kind).toBe('flush')
+    if (decision.kind === 'flush') {
+      expect(decision.text).toBe(answer)
+      expect(decision.text).not.toContain('Let me check')
     }
   })
 })
