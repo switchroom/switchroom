@@ -7,7 +7,7 @@
  * The `input` is the raw text as a model/card surface would author it — the
  * regression test runs it through the SAME outbound transform pipeline the
  * gateway uses (repairEscapedWhitespace -> normalizeParagraphBreaks ->
- * addParagraphSpacers -> splitMarkdownChunks) and then asserts:
+ * splitMarkdownChunks) and then asserts:
  *
  *   (a) every emitted chunk is parse-accept valid (no rich-path 400), and
  *   (b) the concatenated output parses into `expect` (entity structure).

@@ -348,7 +348,7 @@ const REPLY_TO_TEXT_MAX = 200
 // #1161 silent-end fallback text now lives in ../silent-end.ts
 // (`silentEndFallbackText`, imported above) so the transport-boundary
 // tests exercise the real string — see PR #2892.
-import { splitMarkdownChunks, repairEscapedWhitespace, normalizeParagraphBreaks, addParagraphSpacers, normalizePunctuation, stripExcessBold, escapeMarkdown, hardenCardBreaks, RICH_MESSAGE_MAX_CHARS } from '../format.js'
+import { splitMarkdownChunks, repairEscapedWhitespace, normalizeParagraphBreaks, normalizePunctuation, stripExcessBold, escapeMarkdown, hardenCardBreaks, RICH_MESSAGE_MAX_CHARS } from '../format.js'
 import { richMessage } from '../rich-send.js'
 import { scrubVoice } from '../text-voice-scrub.js'
 import {
@@ -14999,9 +14999,11 @@ async function executeEditMessage(args: Record<string, unknown>): Promise<unknow
   // secret into a live bubble or the history row. Mask before scrub/send.
   editRawText = redactOutboundText(editRawText, 'edit_message')
   // Fleet-wide consistent formatting (same order as the reply path: redact
-  // first so secrets are matched literally, then normalize, then spacers on
-  // the rich path only).
-  if (!editLiteralText) editRawText = addParagraphSpacers(stripExcessBold(normalizePunctuation(editRawText)))
+  // first so secrets are matched literally, then normalize). No paragraph
+  // spacer pass — the NBSP spacer was removed in the #2669 follow-up because it
+  // double-gapped every paragraph; the rich renderer already shows `\n\n` as
+  // one blank line.
+  if (!editLiteralText) editRawText = stripExcessBold(normalizePunctuation(editRawText))
   // Voice scrub (#1683): same em-dash scrub as the reply path. Edits
   // are how silent-anchor and progress-update mutate already-sent
   // bubbles, so without this an edit can re-introduce dashes the
@@ -17437,9 +17439,9 @@ function handleSessionEvent(ev: SessionEvent): void {
         // breaks into GFM hard breaks so the Bot API 10.1 rich path doesn't
         // collapse them (lists/tables/code left untouched). Runs BEFORE the
         // redact/scrub below, exactly as reply orders it (repair → normalize →
-        // redact → scrub), so masking sees the repaired text. The matching
-        // addParagraphSpacers pass runs on the send side just before
-        // splitMarkdownChunks (see below).
+        // redact → scrub), so masking sees the repaired text. Paragraph gaps
+        // are the plain `\n\n` normalizeParagraphBreaks guarantees — no spacer
+        // pass runs on the send side any more (removed in the #2669 follow-up).
         capturedText = normalizeParagraphBreaks(repairEscapedWhitespace(capturedText))
         // Component 3 — origin-thread backstop. `chatId`/`threadId` are
         // captured from the turn atom (turn.sessionChatId/sessionThreadId)
@@ -17583,13 +17585,12 @@ function handleSessionEvent(ev: SessionEvent): void {
             link_preview_options: { is_disabled: true },
           }
           const limit = RICH_MESSAGE_MAX_CHARS
-          // #2798 / #2692 — inject visible blank-line spacers into prose `\n\n`
-          // gaps before splitting, exactly as executeReply does. The rich GFM
-          // renderer collapses a bare `\n\n` gap TIGHT, so without this the
-          // paragraph boundaries from the '\n\n' block join (turn-flush-safety
-          // .ts) would still render jammed together. Mirrors reply's
-          // `addParagraphSpacers(text)` on the non-literal path.
-          const renderedText = addParagraphSpacers(capturedText)
+          // The `\n\n` block joins from turn-flush-safety.ts render as normal
+          // single blank lines under the Bot API 10.1 rich GFM path, so no
+          // spacer pass runs before splitting (the NBSP spacer was removed in
+          // the #2669 follow-up — it double-gapped every paragraph). Mirrors
+          // executeReply, which now also sends the normalized text as-is.
+          const renderedText = capturedText
           const htmlChunks = splitMarkdownChunks(renderedText, limit)
           const sentIds: number[] = []
           try {

@@ -4,7 +4,6 @@ import {
   normalizeParagraphBreaks,
   normalizePunctuation,
   stripExcessBold,
-  addParagraphSpacers,
   splitMarkdownChunks,
   hardSliceToCap,
   RICH_MESSAGE_MAX_CHARS,
@@ -55,8 +54,10 @@ function referenceNormalize(rawText: string): { text: string; voiceReplaced: num
   return { text, voiceReplaced }
 }
 
-function referenceEffectiveText(text: string, literalText: boolean): string {
-  return literalText ? text : addParagraphSpacers(text)
+function referenceEffectiveText(text: string, _literalText: boolean): string {
+  // The NBSP paragraph-spacer pass was removed in the #2669 follow-up; both
+  // paths now pass the normalized text through unchanged.
+  return text
 }
 
 function referenceChunks(
