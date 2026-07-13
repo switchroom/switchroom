@@ -480,14 +480,167 @@ export function hardenCardBreaks(text: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Paragraph spacing note (#2669 follow-up): the NBSP paragraph-spacer
-// (PARAGRAPH_SPACER / addParagraphSpacers) was REMOVED. Its premise — that the
-// Bot API 10.1 rich (GFM) renderer collapses a `\n\n` gap TIGHT — is false for
-// the live renderer, which shows a `\n\n` gap as a normal single blank line.
-// The old U+00A0 spacer therefore injected a spurious SECOND blank line
-// (`\n\n \n\n`) between every paragraph fleet-wide. Paragraph spacing now
-// relies on the plain `\n\n` that normalizeParagraphBreaks already guarantees
-// at block boundaries — one correct single blank line, no spacer pass.
+// Paragraph spacers — restore a VISIBLE blank line between prose paragraphs
+// ---------------------------------------------------------------------------
+
+/**
+ * The non-collapsible spacer paragraph injected between two prose paragraphs.
+ *
+ * Telegram's Bot API 10.1 rich-message renderer (the GFM/CommonMark engine
+ * behind `sendRichMessage` / `editMessageText({ markdown })`, and the in-repo
+ * IR renderer in `render/` that feeds it) renders a `\n\n` paragraph break
+ * TIGHT — the two paragraphs sit on adjacent lines with no visible empty line
+ * between them (live-confirmed: an outbound message with real `\n\n` gaps
+ * renders jammed; only list/table BLOCK boundaries produce a visible gap). The
+ * legacy markdown→HTML path (removed in #2669) sent `\n\n` literally with
+ * `parse_mode:"HTML"`, where two newlines render as a real blank line. That
+ * regression is the operator-confirmed "paragraphs jammed together" symptom
+ * (#2692).
+ *
+ * CommonMark discards blank lines made of ASCII whitespace, but a line whose
+ * only content is a NON-breaking space (U+00A0) is a genuine, non-empty
+ * paragraph — it renders as a visible empty line. So `A\n\n \n\nB` renders as
+ * three paragraphs: A, a blank-looking line, then B — the visible gap the HTML
+ * path used to produce. This survives the in-repo IR renderer's re-parse /
+ * re-render (verified: a U+00A0-only line round-trips intact, while an
+ * ASCII-space-only line is collapsed to a tight `\n\n`), so it reaches the wire
+ * whether `SWITCHROOM_RICH_RENDER` is on (default) or off.
+ */
+export const PARAGRAPH_SPACER = ' '
+
+/**
+ * Insert a visible blank-line spacer into each genuine `\n\n` paragraph gap so
+ * the rich GFM renderer shows a real empty line between paragraphs (matching
+ * the pre-#2669 HTML behaviour). See PARAGRAPH_SPACER for why a U+00A0 line is
+ * the reliable trick.
+ *
+ * Uniform-block-spacing contract: a spacer is inserted into EVERY `\n\n` gap
+ * that separates two DISTINCT blocks — prose→prose, paragraph→list,
+ * list→paragraph, heading→anything, blockquote/table/fence boundaries — so a
+ * mixed message renders with one identical visible blank line between blocks.
+ * The one exception is a gap INSIDE a block of the same structural kind (two
+ * items of a loose list, consecutive table rows/quotes/fences): those stay
+ * tight so the block's contiguity survives. Interiors joined by a single `\n`
+ * are never gaps at all and are untouched by construction.
+ *
+ * Runs on code-masked text (so a blank line inside a fenced block is never
+ * touched).
+ *
+ * IDEMPOTENT & DOUBLE-GAP-PROOF (the #3208 regression this restores fixes):
+ * each inter-block gap — whatever it originally holds (a bare `\n\n`, a
+ * pre-existing U+00A0 spacer `\n\n \n\n`, a stray extra blank line `\n\n\n`, an
+ * ASCII-space-only line) — is CANONICALISED to exactly one form: `\n\n`
+ * (tight) or `\n\n${PARAGRAPH_SPACER}\n\n` (spaced). It therefore inserts
+ * EXACTLY ONE spacer per spaced gap and can never stack a second, and running
+ * the pass twice yields the same output as running it once. #3208 removed the
+ * whole mechanism to kill a double-gap; the correct fix was to make the gap
+ * canonical (this), not to delete the spacer and reintroduce the jammed-
+ * paragraph symptom fleet-wide.
+ *
+ * Intended to run in the outbound send path AFTER normalizeParagraphBreaks
+ * (which has already collapsed 3+ newline runs to `\n\n` and guaranteed
+ * block-boundary blank lines) — but the canonicalisation above means it is
+ * safe on un-normalized text too (e.g. the edit path).
+ */
+export function addParagraphSpacers(text: string): string {
+  if (!text.includes('\n\n')) return text
+
+  const nonce = Math.random().toString(36).slice(2)
+  const { masked, restore, placeholder } = maskCodeRegions(text, nonce)
+
+  if (!masked.includes('\n\n')) return restore(masked)
+
+  const SP = PARAGRAPH_SPACER
+
+  // ASCII-only trim (preserve U+00A0): `String.prototype.trim()` strips U+00A0,
+  // so a spacer line would read as "blank"; trimming ASCII whitespace only
+  // keeps the spacer line recognisable as content.
+  const asciiTrim = (line: string): string =>
+    line.replace(/^[ \t\r\f\v]+|[ \t\r\f\v]+$/g, '')
+
+  // "Blank-ish" = a line that renders as an empty paragraph: ASCII-whitespace-
+  // only, OR a line whose only non-ASCII-whitespace content is the U+00A0
+  // spacer. Coalescing BOTH kinds into one gap is what makes the pass
+  // idempotent and double-gap-proof — a pre-existing spacer or extra blank line
+  // is absorbed into the gap and re-emitted canonically, never stacked.
+  const isBlankish = (line: string): boolean => {
+    const t = asciiTrim(line)
+    return t === '' || t === SP
+  }
+
+  // Classify the block kind of a facing content line so the spacer decision can
+  // be made per BLOCK TRANSITION (#uniform-block-spacing). A spacer is inserted
+  // at every gap between two DIFFERENT block kinds and between two prose
+  // paragraphs, but NEVER inside a single block's interior (two items of the
+  // same loose list, two rows of a table, consecutive quotes/fences/dividers).
+  type BlockKind = 'list' | 'table' | 'quote' | 'heading' | 'fence' | 'divider' | 'prose'
+  const blockKind = (line: string): BlockKind => {
+    if (isFenceOpenLine(line, placeholder)) return 'fence'
+    if (isListItemLine(line)) return 'list'
+    if (isTableRowLine(line) || isTableDelimiterLine(line)) return 'table'
+    if (isBlockquoteLine(line)) return 'quote'
+    if (isHeadingLine(line)) return 'heading'
+    if (/^(-{3,}|\*{3,}|_{3,})\s*$/.test(line.trimStart())) return 'divider'
+    return 'prose'
+  }
+
+  // Same-kind structural pairs whose gap is a block INTERIOR — no spacer there.
+  const SAME_KIND_TIGHT: ReadonlySet<BlockKind> = new Set([
+    'list',
+    'table',
+    'quote',
+    'fence',
+    'divider',
+  ])
+
+  const shouldSpaceGap = (above: string, below: string): boolean => {
+    const a = blockKind(above)
+    const b = blockKind(below)
+    if (a === b && SAME_KIND_TIGHT.has(a)) return false
+    // Everything else is a genuine block transition (incl. prose→prose,
+    // heading→anything, list↔paragraph, table/quote boundaries) — space it.
+    return true
+  }
+
+  // Tokenize into CONTENT runs (consecutive non-blank-ish lines, joined by a
+  // single `\n` — soft breaks stay inside a content block) and GAP runs
+  // (consecutive blank-ish lines). Tokens strictly alternate by construction.
+  type Tok = { kind: 'content' | 'gap'; lines: string[] }
+  const toks: Tok[] = []
+  for (const line of masked.split('\n')) {
+    const kind = isBlankish(line) ? 'gap' : 'content'
+    const last = toks[toks.length - 1]
+    if (last && last.kind === kind) last.lines.push(line)
+    else toks.push({ kind, lines: [line] })
+  }
+
+  // Rebuild. A CONTENT token re-emits its lines verbatim. An INTER-content GAP
+  // (a gap flanked by content on BOTH sides) is re-emitted in canonical form —
+  // one blank line (`''` → `\n\n`) for a tight gap, or `['', SP, '']`
+  // (→ `\n\n${SP}\n\n`) for a spaced gap — discarding whatever it held. A
+  // leading/trailing gap (no content on one side, only possible before the
+  // first / after the last content block) is preserved verbatim.
+  const out: string[] = []
+  for (let i = 0; i < toks.length; i++) {
+    const tok = toks[i]
+    if (tok.kind === 'content') {
+      out.push(...tok.lines)
+      continue
+    }
+    const prev = toks[i - 1]
+    const next = toks[i + 1]
+    if (prev?.kind === 'content' && next?.kind === 'content') {
+      const above = prev.lines[prev.lines.length - 1]
+      const below = next.lines[0]
+      if (shouldSpaceGap(above, below)) out.push('', SP, '')
+      else out.push('')
+    } else {
+      out.push(...tok.lines)
+    }
+  }
+
+  return restore(out.join('\n'))
+}
 
 // ---------------------------------------------------------------------------
 // Punctuation / bullet normalization — fleet-wide consistent typography
@@ -1006,26 +1159,32 @@ export function splitMarkdownChunks(text: string, maxLen = RICH_MESSAGE_MAX_CHAR
 }
 
 /**
- * Strip stray blank lines off a chunk boundary so a cut that lands in a `\n\n`
- * paragraph gap never leaves a continuation chunk that OPENS with a bare blank
- * line, nor a prior chunk that ENDS with one.
+ * Strip stray paragraph-spacer / blank lines off a chunk boundary so a cut that
+ * lands inside an injected spacer gap (`\n\n${PARAGRAPH_SPACER}\n\n`, see
+ * addParagraphSpacers) never leaves a continuation chunk that OPENS with a bare
+ * U+00A0 spacer line, nor a prior chunk that ENDS with one.
  *
- * (Pre-#2669-follow-up this also peeled the NBSP paragraph spacer that
- * addParagraphSpacers injected into every gap. That spacer pass was removed —
- * gaps are now plain `\n\n` — so this reduces to the original behaviour: strip
- * a run of ASCII-whitespace-only blank lines off the boundary.) Idempotent: a
- * chunk already trimmed has nothing left to strip.
+ * A "boundary blank run" is any sequence of newlines and spacer-only lines (a
+ * line whose only content is the U+00A0 spacer, optionally surrounded by ASCII
+ * spaces/tabs) in ANY interleaving — `\n \n`, ` \n\n`, `\n\n \n`, etc. The
+ * legacy behaviour (strip leading ASCII `\n+` only) is a strict subset, so a
+ * boundary with NO spacer is unaffected. Idempotent: a chunk already trimmed
+ * has nothing left to strip.
  *
  *  - `'leading'`  → strip the run from the START (the continuation chunk).
  *  - `'trailing'` → strip the run from the END (the just-emitted prior chunk).
  */
 function stripBoundarySpacers(chunk: string, side: 'leading' | 'trailing'): string {
-  // A boundary blank run is one-or-more lines that render empty (ASCII
-  // whitespace only). Peel it off the requested side.
+  // One blank-or-spacer line: optional ASCII ws, optional one U+00A0, optional
+  // ASCII ws — i.e. a line that renders empty. A run of these (joined by \n,
+  // with leading/trailing \n) is what we peel off the boundary.
+  const sp = PARAGRAPH_SPACER
   if (side === 'leading') {
-    return chunk.replace(/^(?:[ \t]*\n)+/, '')
+    // Leading: one-or-more newlines, optionally with spacer-only lines mixed in.
+    return chunk.replace(new RegExp(`^(?:[ \\t]*${sp}?[ \\t]*\\n+)+`), '')
   }
-  return chunk.replace(/(?:\n[ \t]*)+$/, '')
+  // Trailing: a newline run, optionally with spacer-only lines, at the very end.
+  return chunk.replace(new RegExp(`(?:\\n+[ \\t]*${sp}?[ \\t]*)+$`), '')
 }
 
 /**

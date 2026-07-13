@@ -19,6 +19,8 @@ import {
   repairEscapedWhitespace,
   escapeMarkdown,
   splitMarkdownChunks,
+  addParagraphSpacers,
+  PARAGRAPH_SPACER,
   RICH_MESSAGE_MAX_CHARS,
 } from '../format.js'
 
@@ -185,54 +187,65 @@ describe('splitMarkdownChunks', () => {
   })
 
   // -------------------------------------------------------------------------
-  // Chunk-boundary blank-line hygiene. Paragraph gaps are now plain `\n\n`
-  // (the NBSP spacer was removed in the #2669 follow-up). When a cut lands in
-  // a gap, the boundary must not leave a chunk that opens or ends with a bare
-  // blank line, and no visible content may be dropped.
+  // Chunk-boundary spacer hygiene. addParagraphSpacers injects a
+  // `\n\n${PARAGRAPH_SPACER}\n\n` gap between prose paragraphs. When a cut
+  // lands inside that gap, the boundary must not leave a chunk that opens or
+  // ends with a bare U+00A0 spacer line (a stray blank bubble line).
   // -------------------------------------------------------------------------
 
-  test('no chunk starts or ends with a bare blank line at a `\\n\\n` gap cut', () => {
+  test('no chunk starts or ends with a bare U+00A0 spacer line (reviewer repro)', () => {
+    // The exact reviewer repro: a spacer gap straddling a small cap.
     const A = 'Alpha sentence one'
     const B = 'Bravo sentence two'
-    const text = `${A}.\n\n${B}.`
-    const chunks = splitMarkdownChunks(text, 33)
+    const spaced = addParagraphSpacers(`${A}.\n\n${B}.`)
+    const chunks = splitMarkdownChunks(spaced, 33)
     expect(chunks.length).toBeGreaterThan(1)
-    const blankOnly = /^[ \t]*$/
+    const spacerOnly = new RegExp(`^[ \\t]*${PARAGRAPH_SPACER}[ \\t]*$`)
     for (const c of chunks) {
       const lines = c.split('\n')
-      expect(blankOnly.test(lines[0])).toBe(false)
-      expect(blankOnly.test(lines[lines.length - 1])).toBe(false)
+      expect(spacerOnly.test(lines[0])).toBe(false)
+      expect(spacerOnly.test(lines[lines.length - 1])).toBe(false)
     }
   })
 
   test('visible paragraph content survives the boundary (no text dropped)', () => {
     const A = 'Alpha sentence one'
     const B = 'Bravo sentence two'
-    const text = `${A}.\n\n${B}.`
-    const chunks = splitMarkdownChunks(text, 33)
+    const spaced = addParagraphSpacers(`${A}.\n\n${B}.`)
+    const chunks = splitMarkdownChunks(spaced, 33)
     const rejoined = chunks.join('\n')
     expect(rejoined).toContain(`${A}.`)
     expect(rejoined).toContain(`${B}.`)
   })
 
-  test('blank-line-boundary strip is robust across several gaps and small caps', () => {
+  test('spacer-boundary strip is robust across several gaps and small caps', () => {
     const paras = Array.from({ length: 6 }, (_, i) => `Paragraph ${i} body text here.`)
-    const text = paras.join('\n\n')
-    const blankOnly = /^[ \t]*$/
+    const spaced = addParagraphSpacers(paras.join('\n\n'))
+    const spacerOnly = new RegExp(`^[ \\t]*${PARAGRAPH_SPACER}[ \\t]*$`)
     for (const cap of [20, 31, 40, 64]) {
-      const chunks = splitMarkdownChunks(text, cap)
+      const chunks = splitMarkdownChunks(spaced, cap)
       for (const c of chunks) {
         const lines = c.split('\n')
-        expect(blankOnly.test(lines[0])).toBe(false)
-        expect(blankOnly.test(lines[lines.length - 1])).toBe(false)
+        expect(spacerOnly.test(lines[0])).toBe(false)
+        expect(spacerOnly.test(lines[lines.length - 1])).toBe(false)
       }
-      // No visible word is dropped: concatenating the chunks' non-blank tokens
-      // reproduces the original word sequence. (Word-level, not line-level,
-      // because a small cap may split mid-word — the chunker's normal
-      // space-boundary behaviour.)
-      const words = (s: string): string[] => s.split(/\s+/).filter((w) => w.length > 0)
+      // No visible word is dropped: concatenating the chunks' non-blank,
+      // non-spacer tokens reproduces the original word sequence. (Word-level,
+      // not line-level, because a small cap may split mid-word — that's the
+      // chunker's normal space-boundary behaviour, orthogonal to spacers.)
+      const words = (s: string): string[] =>
+        s.split(/\s+/).filter((w) => w.length > 0 && w !== PARAGRAPH_SPACER)
       expect(words(chunks.join(' '))).toEqual(words(paras.join(' ')))
     }
+  })
+
+  test('a boundary with NO spacer is unaffected (legacy ^\\n+ behaviour preserved)', () => {
+    const text = Array.from({ length: 10 }, (_, i) => `plain line ${i}`).join('\n\n')
+    const chunks = splitMarkdownChunks(text, 40)
+    // No spacer was ever present, so no chunk gains/loses anything beyond the
+    // normal leading-newline strip; content is preserved.
+    const rejoined = chunks.join('\n').replace(/\n+/g, '\n')
+    expect(rejoined).toBe(text.replace(/\n+/g, '\n'))
   })
 
   // -------------------------------------------------------------------------

@@ -31,7 +31,9 @@ import {
   normalizeParagraphBreaks,
   normalizePunctuation,
   stripExcessBold,
+  addParagraphSpacers,
   splitMarkdownChunks,
+  PARAGRAPH_SPACER,
   RICH_MESSAGE_MAX_CHARS,
 } from '../format.js'
 
@@ -128,9 +130,7 @@ describe('decideTurnFlush — prose+trailing-sentinel is suppressed, not leaked 
 // the real gateway turn-flush render pipeline (post-#2669 rich-markdown path):
 //   decideTurnFlush -> join('\n\n')
 //   -> repairEscapedWhitespace -> normalizeParagraphBreaks
-//   -> splitMarkdownChunks -> sendRichMessage
-// (no paragraph-spacer pass — the NBSP spacer was removed in the #2669
-//  follow-up; gaps are plain `\n\n`, one visible blank line)
+//   -> addParagraphSpacers -> splitMarkdownChunks -> sendRichMessage
 // so it pins the end-to-end fix, not just the pure decision. The corpus is a
 // REAL captured-transcript shape (three separate content[i].text blocks, one
 // stored UNTRIMMED with a trailing '\n' exactly as session-tail.ts pushes
@@ -156,7 +156,8 @@ describe('#2798 turn-flush block separation — real multi-block transcript shap
     const d = decideTurnFlush({ chatId: '12345', replyCalled: false, capturedText: blocks })
     expect(d.kind).toBe('flush')
     const joined = (d as { kind: 'flush'; text: string }).text
-    return normalizeParagraphBreaks(repairEscapedWhitespace(joined))
+    const normalized = normalizeParagraphBreaks(repairEscapedWhitespace(joined))
+    return addParagraphSpacers(normalized)
   }
 
   it('separates whole blocks with a visible paragraph gap, not a wall-of-text', () => {
@@ -166,29 +167,32 @@ describe('#2798 turn-flush block separation — real multi-block transcript shap
     expect(out).toContain('The `auth` handler looks correct')
     expect(out).toContain('Want me to open a PR')
     // The wall-of-text failure mode glues two blocks one '\n' apart. Assert the
-    // boundary carries a real paragraph break (plain `\n\n`, one blank line —
-    // no NBSP spacer), and NOT a single-newline join.
-    expect(out).toContain('flagged.\n\nThe `auth`')
+    // boundary carries a real paragraph break with the injected visible spacer
+    // line (#2692 rich-path spacer), and NOT a single-newline join.
+    expect(out).toContain(`\n\n${PARAGRAPH_SPACER}\n\n`)
     expect(out).not.toContain('flagged.\nThe `auth`')
-    // No U+00A0 anywhere.
-    expect(out).not.toContain(String.fromCharCode(0xa0))
+    // A spacer sits specifically between block 1 and block 2.
+    const b1 = out.indexOf('flagged.')
+    const b2 = out.indexOf('The `auth` handler')
+    expect(out.slice(b1, b2)).toContain(PARAGRAPH_SPACER)
   })
 
   it('collapses the untrimmed-trailing-newline stack — no 3+ newline run reaches the wire', () => {
     const out = renderLikeTurnFlush(realBlocks)
     // Block 2's trailing '\n' + the '\n\n' join = 3 newlines; normalize
-    // collapses 3+ runs to '\n\n', so no doubled/stacked blank run survives.
+    // collapses 3+ runs to '\n\n' and addParagraphSpacers wedges exactly one
+    // spacer, so no doubled/stacked blank run survives.
     expect(out).not.toMatch(/\n{3,}/)
-    // One blank-line gap per block transition: 3 blocks → 2 gaps.
-    const gapCount = (out.match(/\n\n/g) ?? []).length
-    expect(gapCount).toBe(2)
+    // One spacer per block transition: 3 blocks → 2 gaps → 2 spacers.
+    const spacerCount = out.split(PARAGRAPH_SPACER).length - 1
+    expect(spacerCount).toBe(2)
   })
 
   it('the whole separated answer stays in one rich chunk here (well under 32768)', () => {
     const out = renderLikeTurnFlush(realBlocks)
     const chunks = splitMarkdownChunks(out, RICH_MESSAGE_MAX_CHARS)
     expect(chunks.length).toBe(1)
-    expect(chunks[0]).toContain('\n\n')
+    expect(chunks[0]).toContain(PARAGRAPH_SPACER)
   })
 
   it('still SUPPRESSES a real transcript that deliberately terminates with a bare NO_REPLY (#2053 guard intact)', () => {
@@ -224,9 +228,9 @@ describe('#2798 turn-flush block separation — real multi-block transcript shap
 // runs (gateway executeReply):
 //   repairEscapedWhitespace -> normalizeParagraphBreaks -> redactOutboundText
 //   -> stripExcessBold(normalizePunctuation) -> scrubVoice
-// (no send-side paragraph-spacer pass — removed in the #2669 follow-up).
+//   -> addParagraphSpacers (send side)
 // The original #2798 change gave turn-flush the paragraph steps + redact +
-// scrub but OMITTED `stripExcessBold(normalizePunctuation(...))`.
+// scrub + spacers but OMITTED `stripExcessBold(normalizePunctuation(...))`.
 // This suite reconstructs the deterministic format chain of BOTH paths (the
 // runtime-only redact + voice-scrub steps are literally the same calls on both
 // paths and are out of scope here) and pins that turn-flush now matches reply
@@ -308,7 +312,7 @@ describe('#2798 turn-flush punctuation/bold parity with reply', () => {
   function formatChain(text: string): string {
     let t = normalizeParagraphBreaks(repairEscapedWhitespace(text))
     t = stripExcessBold(normalizePunctuation(t))
-    return t
+    return addParagraphSpacers(t)
   }
 
   const input =
