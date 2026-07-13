@@ -16521,6 +16521,13 @@ function handleSessionEvent(ev: SessionEvent): void {
           clearTimeout(prior.orphanedReplyTimeoutId)
           prior.orphanedReplyTimeoutId = null
         }
+        // Same bounded-leak class (early-paint 250ms setTimeout): the prior
+        // turn may have armed its narrative gate's early-paint timer before
+        // being superseded. Left untorn, ~250ms later it fires showNarrativeStep
+        // on the dead turn and can paint a stale narration card below the new
+        // turn's surface. Teardown is guard-safe and idempotent (no-op when never
+        // armed / already fired / already disarmed by the prior turn's turn_end).
+        prior?.narrativeGate?.teardown()
         // #1067: swap the entire turn atom in one assignment. Every
         // handler captures `const turn = currentTurn` at entry, so a
         // captured-then-awaited read can't reattribute to the new turn.
