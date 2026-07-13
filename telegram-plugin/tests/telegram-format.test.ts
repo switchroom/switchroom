@@ -19,8 +19,6 @@ import {
   repairEscapedWhitespace,
   escapeMarkdown,
   splitMarkdownChunks,
-  addParagraphSpacers,
-  PARAGRAPH_SPACER,
   RICH_MESSAGE_MAX_CHARS,
 } from '../format.js'
 
@@ -187,59 +185,88 @@ describe('splitMarkdownChunks', () => {
   })
 
   // -------------------------------------------------------------------------
-  // Chunk-boundary spacer hygiene. addParagraphSpacers injects a
-  // `\n\n${PARAGRAPH_SPACER}\n\n` gap between prose paragraphs. When a cut
-  // lands inside that gap, the boundary must not leave a chunk that opens or
-  // ends with a bare U+00A0 spacer line (a stray blank bubble line).
+  // Chunk-boundary blank-line hygiene. Paragraph gaps are now plain `\n\n`
+  // (the NBSP spacer was removed in the #2669 follow-up). When a cut lands in
+  // a gap, the boundary must not leave a chunk that opens or ends with a bare
+  // blank line, and no visible content may be dropped.
   // -------------------------------------------------------------------------
 
-  test('no chunk starts or ends with a bare U+00A0 spacer line (reviewer repro)', () => {
-    // The exact reviewer repro: a spacer gap straddling a small cap.
+  test('no chunk starts or ends with a bare blank line at a `\\n\\n` gap cut', () => {
     const A = 'Alpha sentence one'
     const B = 'Bravo sentence two'
-    const spaced = addParagraphSpacers(`${A}.\n\n${B}.`)
-    const chunks = splitMarkdownChunks(spaced, 33)
+    const text = `${A}.\n\n${B}.`
+    const chunks = splitMarkdownChunks(text, 33)
     expect(chunks.length).toBeGreaterThan(1)
-    const spacerOnly = new RegExp(`^[ \\t]*${PARAGRAPH_SPACER}[ \\t]*$`)
+    const blankOnly = /^[ \t]*$/
     for (const c of chunks) {
       const lines = c.split('\n')
-      expect(spacerOnly.test(lines[0])).toBe(false)
-      expect(spacerOnly.test(lines[lines.length - 1])).toBe(false)
+      expect(blankOnly.test(lines[0])).toBe(false)
+      expect(blankOnly.test(lines[lines.length - 1])).toBe(false)
     }
   })
 
   test('visible paragraph content survives the boundary (no text dropped)', () => {
     const A = 'Alpha sentence one'
     const B = 'Bravo sentence two'
-    const spaced = addParagraphSpacers(`${A}.\n\n${B}.`)
-    const chunks = splitMarkdownChunks(spaced, 33)
+    const text = `${A}.\n\n${B}.`
+    const chunks = splitMarkdownChunks(text, 33)
     const rejoined = chunks.join('\n')
     expect(rejoined).toContain(`${A}.`)
     expect(rejoined).toContain(`${B}.`)
   })
 
-  test('spacer-boundary strip is robust across several gaps and small caps', () => {
+  test('blank-line-boundary strip is robust across several gaps and small caps', () => {
     const paras = Array.from({ length: 6 }, (_, i) => `Paragraph ${i} body text here.`)
-    const spaced = addParagraphSpacers(paras.join('\n\n'))
-    const spacerOnly = new RegExp(`^[ \\t]*${PARAGRAPH_SPACER}[ \\t]*$`)
+    const text = paras.join('\n\n')
+    const blankOnly = /^[ \t]*$/
     for (const cap of [20, 31, 40, 64]) {
-      const chunks = splitMarkdownChunks(spaced, cap)
+      const chunks = splitMarkdownChunks(text, cap)
       for (const c of chunks) {
         const lines = c.split('\n')
-        expect(spacerOnly.test(lines[0])).toBe(false)
-        expect(spacerOnly.test(lines[lines.length - 1])).toBe(false)
+        expect(blankOnly.test(lines[0])).toBe(false)
+        expect(blankOnly.test(lines[lines.length - 1])).toBe(false)
       }
-      // No visible word is dropped: concatenating the chunks' non-blank,
-      // non-spacer tokens reproduces the original word sequence. (Word-level,
-      // not line-level, because a small cap may split mid-word — that's the
-      // chunker's normal space-boundary behaviour, orthogonal to spacers.)
-      const words = (s: string): string[] =>
-        s.split(/\s+/).filter((w) => w.length > 0 && w !== PARAGRAPH_SPACER)
-      // Join chunks with a space — each chunk is a separate Telegram message,
-      // so inter-chunk whitespace is irrelevant; what matters is no word is
-      // lost or fused. (A small cap may end a chunk mid-sentence at a space
-      // boundary, e.g. "...here." | "Paragraph 1...", which is normal.)
+      // No visible word is dropped: concatenating the chunks' non-blank tokens
+      // reproduces the original word sequence. (Word-level, not line-level,
+      // because a small cap may split mid-word — the chunker's normal
+      // space-boundary behaviour.)
+      const words = (s: string): string[] => s.split(/\s+/).filter((w) => w.length > 0)
       expect(words(chunks.join(' '))).toEqual(words(paras.join(' ')))
+    }
+  })
+
+  // -------------------------------------------------------------------------
+  // Entity-aware chunking (#finding-3): a cut must never bisect an inline
+  // span (`**bold**`, `` `code` ``, `_italic_`, `[label](href)`), which would
+  // strand an unclosed delimiter in the emitted chunk.
+  // -------------------------------------------------------------------------
+
+  test('a bold/code/link span straddling the cap is not bisected (balanced delimiters)', () => {
+    // Build a body where each inline span sits right around a small cap so the
+    // naive space/newline cut would land inside it. Every span is shorter than
+    // the smallest cap tried (the longest is the 34-char link), so a straddling
+    // span can always be kept whole — the entity-aware back-off must do so.
+    const filler = 'x'.repeat(30)
+    const body =
+      `${filler} **bold span here** ` +
+      `${filler} \`code span here\` ` +
+      `${filler} [label here](https://ex.com/a-b-c) ` +
+      `${filler} _italic span here_ ${filler}`
+    for (const cap of [40, 50, 60, 70, 80]) {
+      const chunks = splitMarkdownChunks(body, cap)
+      for (const c of chunks) {
+        // Balanced `**` and single-backtick delimiters in every chunk.
+        expect((c.match(/\*\*/g) ?? []).length % 2).toBe(0)
+        expect((c.match(/`/g) ?? []).length % 2).toBe(0)
+        // No chunk ends mid-link (an open `](` with no closing `)`), and no
+        // chunk starts with an orphan link tail.
+        const opens = (c.match(/\]\(/g) ?? []).length
+        const closesAfterOpen = (c.match(/\]\([^)\n]*\)/g) ?? []).length
+        expect(opens).toBe(closesAfterOpen)
+      }
+      // Nothing is dropped.
+      const words = (s: string): string[] => s.split(/\s+/).filter((w) => w.length > 0)
+      expect(words(chunks.join(' '))).toEqual(words(body))
     }
   })
 

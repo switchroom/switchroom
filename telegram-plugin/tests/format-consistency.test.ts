@@ -1,26 +1,24 @@
 /**
  * Tests for the fleet-wide consistent-formatting bundle:
  *
- *   1. addParagraphSpacers extension — a visible U+00A0 spacer line at EVERY
- *      block transition (paragraph→list, list→paragraph, heading→anything,
- *      blockquote/table boundaries), never inside a list/table interior.
+ *   1. paragraph gap spacing — a plain `\n\n` (one blank line) at EVERY block
+ *      transition (paragraph→list, list→paragraph, heading→anything,
+ *      blockquote/table boundaries), never a double blank line and never an
+ *      NBSP spacer (the old spacer pass was removed in the #2669 follow-up).
  *   2. normalizePunctuation — em/en dashes → comma/hyphen, leading `•`/`·`
- *      list markers → `- `, on code-masked text, idempotent.
+ *      list markers → `- `, on code-masked text, idempotent; link hrefs are
+ *      protected from dash rewriting.
  *   3. stripExcessBold — over-bold tripwire: >30% bold or fully-bolded
  *      paragraphs/lists lose their bold markers; short messages exempt.
  */
 import { describe, test, expect } from 'vitest'
 import {
-  addParagraphSpacers,
   normalizeParagraphBreaks,
   normalizePunctuation,
   stripExcessBold,
   splitMarkdownChunks,
   hardenCardBreaks,
-  PARAGRAPH_SPACER,
 } from '../format.js'
-
-const SP = PARAGRAPH_SPACER // U+00A0
 
 describe('hardenCardBreaks — deterministic card line-break hardener', () => {
   test('promotes lone field breaks to GFM hard breaks (the blob fix)', () => {
@@ -100,74 +98,60 @@ describe('hardenCardBreaks — deterministic card line-break hardener', () => {
   })
 })
 
-describe('addParagraphSpacers — uniform block spacing', () => {
-  test('still spaces prose→prose (existing behaviour)', () => {
-    const out = addParagraphSpacers('Alpha.\n\nBravo.')
-    expect(out).toBe(`Alpha.\n\n${SP}\n\nBravo.`)
+describe('paragraph gap spacing — plain single blank line, no NBSP', () => {
+  const NBSP = String.fromCharCode(0xa0)
+
+  test('prose→prose gap is one blank line, no NBSP', () => {
+    const out = normalizeParagraphBreaks('Alpha.\n\nBravo.')
+    expect(out).toBe('Alpha.\n\nBravo.')
+    expect(out).not.toContain(NBSP)
   })
 
-  test('spaces paragraph→list transition', () => {
-    const out = addParagraphSpacers('Intro.\n\n- one\n- two')
-    expect(out).toBe(`Intro.\n\n${SP}\n\n- one\n- two`)
+  test('paragraph→list transition is a single `\\n\\n` boundary', () => {
+    expect(normalizeParagraphBreaks('Intro.\n\n- one\n- two')).toBe('Intro.\n\n- one\n- two')
   })
 
-  test('spaces list→paragraph transition', () => {
-    const out = addParagraphSpacers('- one\n- two\n\nOutro.')
-    expect(out).toBe(`- one\n- two\n\n${SP}\n\nOutro.`)
+  test('list→paragraph transition is a single `\\n\\n` boundary', () => {
+    expect(normalizeParagraphBreaks('- one\n- two\n\nOutro.')).toBe('- one\n- two\n\nOutro.')
   })
 
-  test('spaces heading→anything', () => {
-    expect(addParagraphSpacers('# Title\n\nBody.')).toBe(`# Title\n\n${SP}\n\nBody.`)
-    expect(addParagraphSpacers('# Title\n\n- a\n- b')).toBe(`# Title\n\n${SP}\n\n- a\n- b`)
+  test('heading→anything is a single `\\n\\n` boundary', () => {
+    expect(normalizeParagraphBreaks('# Title\n\nBody.')).toBe('# Title\n\nBody.')
+    expect(normalizeParagraphBreaks('# Title\n\n- a\n- b')).toBe('# Title\n\n- a\n- b')
   })
 
-  test('spaces blockquote and table boundaries', () => {
-    expect(addParagraphSpacers('> quoted\n\nProse.')).toBe(`> quoted\n\n${SP}\n\nProse.`)
+  test('blockquote and table boundaries are single `\\n\\n`', () => {
+    expect(normalizeParagraphBreaks('> quoted\n\nProse.')).toBe('> quoted\n\nProse.')
     const table = '| a | b |\n| --- | --- |\n| 1 | 2 |'
-    expect(addParagraphSpacers(`Prose.\n\n${table}`)).toBe(`Prose.\n\n${SP}\n\n${table}`)
-    expect(addParagraphSpacers(`${table}\n\nProse.`)).toBe(`${table}\n\n${SP}\n\nProse.`)
-  })
-
-  test('does NOT space between items of the same loose list', () => {
-    const input = '- one\n\n- two\n\n- three'
-    expect(addParagraphSpacers(input)).toBe(input)
-  })
-
-  test('does NOT space inside a tight list or table interior (single \\n)', () => {
-    const list = 'Intro.\n\n- a\n- b\n- c'
-    expect(addParagraphSpacers(list)).toBe(`Intro.\n\n${SP}\n\n- a\n- b\n- c`)
-    const table = '| a |\n| --- |\n| 1 |\n| 2 |'
-    expect(addParagraphSpacers(table)).toBe(table)
-  })
-
-  test('idempotent across every transition kind', () => {
-    const input = '# H\n\nProse one.\n\n- a\n- b\n\nProse two.\n\n> quote'
-    const once = addParagraphSpacers(input)
-    expect(addParagraphSpacers(once)).toBe(once)
+    expect(normalizeParagraphBreaks(`Prose.\n\n${table}`)).toBe(`Prose.\n\n${table}`)
+    expect(normalizeParagraphBreaks(`${table}\n\nProse.`)).toBe(`${table}\n\nProse.`)
   })
 
   test('never touches code fences', () => {
     const input = '```\nA\n\nB\n```\n\n```\nC\n```'
-    expect(addParagraphSpacers(input)).toBe(input)
+    expect(normalizeParagraphBreaks(input)).toBe(input)
   })
 
-  test('full pipeline: mixed prose+list+heading message gets uniform gaps', () => {
-    const raw = 'Summary line.\n- item one\n- item two\nClosing prose.'
-    const out = addParagraphSpacers(normalizeParagraphBreaks(raw))
-    // Every block transition carries exactly one visible spacer line.
-    expect(out).toBe(
-      `Summary line.\n\n${SP}\n\n- item one\n- item two\n\n${SP}\n\nClosing prose.`,
-    )
+  test('full pipeline: mixed prose+list message gets single-blank-line gaps, no NBSP, no double gap', () => {
+    const raw = 'Summary line.\n\n- item one\n- item two\n\nClosing prose.'
+    const out = normalizeParagraphBreaks(raw)
+    expect(out).toBe('Summary line.\n\n- item one\n- item two\n\nClosing prose.')
+    expect(out).not.toContain(NBSP)
+    expect(out).not.toMatch(/\n\n\n/)
   })
 
-  test('chunk-boundary interaction: a cut in a spacer gap strips the spacer', () => {
+  test('chunk-boundary interaction: a cut in a `\\n\\n` gap leaves clean chunks (no stray blank lines)', () => {
     const a = 'A'.repeat(60)
     const b = 'B'.repeat(60)
-    const text = `${a}\n\n${SP}\n\n${b}`
+    const text = `${a}\n\n${b}`
     const chunks = splitMarkdownChunks(text, 80)
     expect(chunks.length).toBe(2)
     expect(chunks[0]).toBe(a)
     expect(chunks[1]).toBe(b)
+    // Neither chunk opens or ends with a stray blank line.
+    for (const c of chunks) {
+      expect(c).toBe(c.replace(/^\n+|\n+$/g, ''))
+    }
   })
 })
 
@@ -208,6 +192,23 @@ describe('normalizePunctuation', () => {
   test('never touches code spans or fences', () => {
     const input = 'run `a — b` now\n\n```\nx — y\n• bullet\n```'
     expect(normalizePunctuation(input)).toBe(input)
+  })
+
+  test('does NOT rewrite a dash inside a markdown link href (#finding-2)', () => {
+    // An en-dash in a URL path must survive verbatim — rewriting it to `-`
+    // silently points at a different URL.
+    expect(normalizePunctuation('[a](https://x.com/foo–bar)')).toBe(
+      '[a](https://x.com/foo–bar)',
+    )
+    // An em-dash in a URL must NOT become `, ` — the injected space would
+    // TERMINATE the markdown link and leak the trailing text as prose.
+    expect(normalizePunctuation('[a](https://x.com/foo—bar)')).toBe(
+      '[a](https://x.com/foo—bar)',
+    )
+    // The visible LABEL still normalizes (dashes in label text are prose).
+    expect(normalizePunctuation('[foo—bar](https://x.com/path)')).toBe(
+      '[foo, bar](https://x.com/path)',
+    )
   })
 
   test('idempotent', () => {

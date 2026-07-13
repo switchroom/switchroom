@@ -197,9 +197,10 @@ export function decideTurnFlush(input: FlushDecisionInput): FlushDecision {
   // lone `\n` collapses adjacent blocks into one run — on the Bot API 10.1
   // rich-markdown path (#2669) a single newline is a soft break, so the blocks
   // render as an undifferentiated wall-of-text. `\n\n` is the GFM paragraph
-  // separator; the gateway send path then wedges visible spacers into those
-  // gaps via addParagraphSpacers (mirroring the reply path, #2692) so the
-  // paragraphs render with real separation.
+  // separator; the Bot API 10.1 rich renderer shows it as one visible blank
+  // line, so the paragraphs render with real separation on their own (the
+  // former NBSP spacer pass was removed in the #2669 follow-up — it added a
+  // spurious second blank line).
   //
   // The silent-marker guards below are unaffected by this change:
   // isSilentFlushMarker length-guards the whole joined string; the composite /
