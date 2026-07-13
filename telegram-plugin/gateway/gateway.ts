@@ -399,6 +399,11 @@ import {
   decideTurnFlush,
   isTurnFlushSafetyEnabled,
 } from '../turn-flush-safety.js'
+// PR A — deterministic answer-ready quiescence flush (late-delivery fix).
+import {
+  AnswerReadyFlushController,
+  resolveAnswerReadyFlushMs,
+} from '../answer-ready-flush.js'
 // #1667 — pure decision core for the turn_end answer-delivery gate (#1664).
 import { decideTurnEndGate } from './turn-end-gate.js'
 // #1122 PR3: turn-flush-prose-recovery removed with the progress card.
@@ -3115,6 +3120,14 @@ type CurrentTurn = {
   silentAnchorText: string
   capturedText: string[]
   orphanedReplyTimeoutId: ReturnType<typeof setTimeout> | null
+  // PR A — answer-ready quiescence flush timer. Armed in `case 'text'` once the
+  // turn has a genuine composed terminal answer and is quiescent; fires a
+  // positive `answer-ready-quiescence` synthetic turn_end after the ~1 s
+  // debounce so the answer is delivered deterministically instead of waiting on
+  // the unreliable turn_duration signal or the ~150 s orphaned-reply backstop.
+  // Cleared on any tool activity, on `endCurrentTurnAtomic`, and re-armed on
+  // each subsequent text chunk (the debounce).
+  answerReadyFlushTimeoutId: ReturnType<typeof setTimeout> | null
   // Per-turn liveness tracker for the orphaned-reply backstop. Owns
   // `lastStreamEventAt` (stamped on ANY genuine stream event so a model
   // reasoning pause keeps the turn "recently streaming" and re-arms the fuse
@@ -4798,6 +4811,11 @@ function endCurrentTurnAtomic(
   // longer matches — the same early-return semantics as the old `!== turn` guard.
   const key = statusKey(turn.sessionChatId, turn.sessionThreadId)
   if (!turnLiveForItsTopic(turn)) return null
+  // PR A — the turn is ending (this is the ONE place every turn-end path funnels
+  // through, incl. the answer-ready flush's own synthetic turn_end). Clear the
+  // quiescence timer so a real turn_end that lands first cancels a pending flush,
+  // guaranteeing exactly-once delivery.
+  clearAnswerReadyFlushTimeout(turn)
   endCurrentTurnForKey(turn, key) // currentTurnByKey.delete(key) + mirror clear
   // Status-surface observability: one line at every turn CLEAR (with how far
   // the turn got), plus a DEGRADED warning when the turn did tool work but the
@@ -8156,6 +8174,10 @@ const STREAM_THROTTLE_MS_OVERRIDE: number | undefined = (() => {
   return Number.isFinite(n) && n >= 0 ? n : undefined
 })()
 const TURN_FLUSH_SAFETY_ENABLED = isTurnFlushSafetyEnabled()
+
+// PR A — answer-ready quiescence flush debounce (ms). 0 = kill-switch (never
+// arm). Resolved once at boot; env-tunable via SWITCHROOM_ANSWER_READY_FLUSH_MS.
+const ANSWER_READY_FLUSH_MS = resolveAnswerReadyFlushMs(process.env)
 
 // When SET, the answer-lane stream (telegram-plugin/answer-stream.ts) renders
 // the model's transcript text as a USER-VISIBLE edit-in-place message. Default
@@ -15345,6 +15367,68 @@ function resetOrphanedReplyTimeout(): void {
   }
 }
 
+/**
+ * PR A — DETERMINISTIC answer-ready quiescence flush controller.
+ *
+ * The orchestration (arm / debounce / rollover-guard / fire-time re-verify /
+ * disarm) lives in the extracted, unit-tested `AnswerReadyFlushController`
+ * (answer-ready-flush.ts) — the gateway only supplies the thin deps below and
+ * calls `.reset()` / `.clear(turn)`. Behaviour:
+ *
+ * - `reset()` (from `case 'text'`): (re)arm iff the turn has a genuine composed
+ *   terminal answer (the SAME `decideTurnFlush` classifier the turn-flush branch
+ *   uses) AND is quiescent. Each text chunk re-arms → the debounce.
+ * - `clear(turn)` (from tool activity + `endCurrentTurnAtomic`): the DISARM.
+ * - on fire: re-pin `currentTurn === turn`, re-verify quiescence, then dispatch
+ *   a positive `answer-ready-quiescence` synthetic turn_end that routes through
+ *   the IDENTICAL turn-flush send path (endCurrentTurnAtomic → send-gated IIFE →
+ *   honest PR-B record). Replaces the ~150 s dead wait with ~1 s, in code.
+ *
+ * Exactly-once: the synthetic turn_end's `endCurrentTurnAtomic` nulls the atom,
+ * so a later REAL turn_end (or the orphaned backstop) short-circuits at its
+ * `turn != null` guard; `endCurrentTurnAtomic` also calls `.clear(turn)` so a
+ * real turn_end that lands FIRST cancels a pending flush. `outboundDedup` is the
+ * second layer.
+ *
+ * The `answer-ready-quiescence` reason bypasses the `durationMs===-1`
+ * recently-streaming SUPPRESSION guard (the terminal answer text itself stamps
+ * recentlyStreaming): quiescence IS the positive "streaming has settled" signal,
+ * the opposite of the hung-turn backstop that guard protects.
+ */
+const answerReadyFlush = new AnswerReadyFlushController<CurrentTurn>({
+  getCurrentTurn: () => currentTurn,
+  getArmInput: (turn) => ({
+    flush: {
+      chatId: turn.sessionChatId,
+      replyCalled: turn.replyCalled,
+      capturedText: turn.capturedText,
+      flushEnabled: TURN_FLUSH_SAFETY_ENABLED,
+    },
+    inFlightToolCount: toolFlightTracker.inFlightCount(),
+    hasPendingAsyncDispatch: pendingProgress.hasPendingAsyncDispatch(
+      statusKey(turn.sessionChatId, turn.sessionThreadId),
+    ),
+    flushWindowMs: ANSWER_READY_FLUSH_MS,
+  }),
+  getTimerHandle: (turn) => turn.answerReadyFlushTimeoutId,
+  setTimerHandle: (turn, handle) => {
+    turn.answerReadyFlushTimeoutId = handle
+  },
+  onFlush: () =>
+    handleSessionEvent({ kind: 'turn_end', durationMs: -1, reason: 'answer-ready-quiescence' }),
+  log: (msg) => process.stderr.write(`telegram gateway: ${msg}\n`),
+})
+
+/** PR A — disarm the answer-ready flush timer for a turn (thin adapter). */
+function clearAnswerReadyFlushTimeout(turn: CurrentTurn | null): void {
+  answerReadyFlush.clear(turn)
+}
+
+/** PR A — (re)arm the answer-ready flush timer for the current turn (debounce). */
+function resetAnswerReadyFlushTimeout(): void {
+  answerReadyFlush.reset()
+}
+
 function closeActivityLane(chatId: string, threadId: number | undefined): void {
   const key = chatKeyWithSuffix(chatId, threadId, 'activity')
   const stream = activeDraftStreams.get(key)
@@ -16378,6 +16462,7 @@ function handleSessionEvent(ev: SessionEvent): void {
           silentAnchorText: '',
           capturedText: [],
           orphanedReplyTimeoutId: null,
+          answerReadyFlushTimeoutId: null,
           // Fresh liveness tracker: lastStreamEventAt seeded to the turn start
           // so a turn that never streams still trips the fuse after windowMs.
           liveness: new LivenessTracker(startedAt),
@@ -16576,6 +16661,11 @@ function handleSessionEvent(ev: SessionEvent): void {
     case 'tool_use': {
       const turn = currentTurn
       if (turn == null) return
+      // PR A — the model resumed work (surface or otherwise). Cancel any pending
+      // answer-ready quiescence flush: the turn is no longer quiescent. (Fire-time
+      // re-verification would also catch this, but disarming here avoids a wasted
+      // wakeup and matches the design's disarm-on-tool requirement.)
+      clearAnswerReadyFlushTimeout(turn)
       // Narrative-dedup gate step 2 (JSONL-text-narrative primitive): a
       // narrative block was pending; this tool_use is the lookahead event
       // that decides it. reply/stream_reply with near-identical text ⇒
@@ -16662,6 +16752,11 @@ function handleSessionEvent(ev: SessionEvent): void {
       // where the JSONL tool_use rows arrive too late.
       const turn = currentTurn
       if (turn == null) return
+      // PR A — a tool_label (real-time, ~250 ms) means the model is producing
+      // work right now: cancel any pending answer-ready quiescence flush (the
+      // turn is not quiescent). Fires ahead of the JSONL tool_use, so it disarms
+      // the timer at the earliest deterministic point.
+      clearAnswerReadyFlushTimeout(turn)
       // SECONDARY FIX: an active tool_label means the model is producing work
       // right now — re-arm the orphaned-reply fuse so a multi-phase tool turn
       // (write → compile → test → fix) that regularly emits labels doesn't let
@@ -16984,6 +17079,11 @@ function handleSessionEvent(ev: SessionEvent): void {
         preambleSuppressor.onText(ev.text)
       }
       resetOrphanedReplyTimeout()
+      // PR A — (re)arm the deterministic answer-ready quiescence flush. Each
+      // text chunk debounces the timer; it fires only after ~1 s of no new
+      // stream events, delivering a composed toolless answer without waiting on
+      // the unreliable turn_duration signal or the ~150 s orphaned backstop.
+      resetAnswerReadyFlushTimeout()
 
       if (isContextExhaustionText(ev.text) && turn != null) {
         const chatId = turn.sessionChatId
@@ -17073,7 +17173,14 @@ function handleSessionEvent(ev: SessionEvent): void {
       // check to the full isLegitimatelyWorking predicate so detached background
       // work and human-wait tools (ask_user) are also protected.
       // INVARIANT: a REAL turn_end (durationMs >= 0) is NEVER suppressed.
-      if (ev.durationMs === -1) {
+      // PR A carve-out: the answer-ready quiescence flush also uses
+      // `durationMs:-1`, but it is a POSITIVE "streaming has settled" signal
+      // fired only after ~1 s of no stream events AND no in-flight tool — the
+      // exact opposite of a hung turn. It must NOT be suppressed by
+      // recentlyStreaming (the terminal answer text itself stamps that window,
+      // which is the whole bug). Its own arm/fire predicate already re-verified
+      // quiescence, so let it through to deliver.
+      if (ev.durationMs === -1 && ev.reason !== 'answer-ready-quiescence') {
         const turn = currentTurn
         const key = turn != null ? statusKey(turn.sessionChatId, turn.sessionThreadId) : ''
         // Widened to also suppress while the turn is RECENTLY STREAMING — a
