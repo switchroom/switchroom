@@ -539,6 +539,26 @@ export interface SubagentWatcherConfig {
     background: boolean | undefined
   }) => void
   /**
+   * Fires EXACTLY when a sub-agent is swept out of the watcher's registry by
+   * `cleanupTerminalAgent` — the single, authoritative "this agent is terminal
+   * and being forgotten" signal that EVERY terminal path funnels through
+   * (real `turn_end`, silent-stall synthesis, failed, boot done-at-boot orphan,
+   * AND the JSONL-vanished path — where Claude Code reaped the parent session's
+   * `subagents/` dir, `onFileVanished` → `cleanupTerminalAgent` runs DIRECTLY,
+   * bypassing `onFinish`).
+   *
+   * Why this exists (worker-feed ghost leak): the live worker-activity feed
+   * removes a worker's row ONLY from the gateway's `onFinish` handler. The
+   * JSONL-vanished and boot-orphan terminal paths never fire `onFinish`, so a
+   * worker that was live in the feed leaks there forever — the shared card never
+   * empties, so it never collapses/unpins and heartbeat-edits indefinitely
+   * while buried up-chat. Wiring feed removal to THIS callback (the same sweep
+   * the watcher already performs) makes cleanup and feed-remove impossible to
+   * diverge. Best-effort; idempotent on the feed side (a no-op once the worker
+   * was already removed by `onFinish`).
+   */
+  onTerminalCleanup?: (agentId: string) => void
+  /**
    * #1720: fires on every `sub_agent_text` event for a running
    * sub-agent. The gateway decides whether to materialise a
    * `subagent_progress` envelope via `decideSubagentProgress` (pure,
@@ -2012,6 +2032,18 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
     }
     terminatedAgentIds.add(agentId)
     log?.(`subagent-watcher: cleaned up terminal agent ${agentId}`)
+    // Authoritative terminal sweep → notify the worker-activity feed so its row
+    // for this agent is removed even on the paths that never fire `onFinish`
+    // (JSONL vanished, boot done-at-boot orphan). Without this the feed row
+    // leaks and the shared card goes immortal/unpinned (worker-feed ghost leak).
+    // Best-effort: a callback throw must never wedge the watcher's cleanup.
+    if (config.onTerminalCleanup) {
+      try {
+        config.onTerminalCleanup(agentId)
+      } catch (cbErr) {
+        log?.(`subagent-watcher: onTerminalCleanup callback error ${agentId}: ${(cbErr as Error).message}`)
+      }
+    }
   }
 
   // ─── Card resurrection (issue #3023) ─────────────────────────────────────

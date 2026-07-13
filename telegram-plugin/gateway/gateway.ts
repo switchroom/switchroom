@@ -29865,6 +29865,23 @@ void (async () => {
                   `telegram gateway: worker ${agentId} NAMED AS LOST — falsely finalised twice, resurrection chain bound reached (issue #3023)\n`,
                 )
               },
+              // Worker-feed ghost-leak fix: the watcher's AUTHORITATIVE terminal
+              // sweep (`cleanupTerminalAgent`) fires for EVERY terminal agent,
+              // including the JSONL-vanished and boot-orphan paths that never
+              // reach `onFinish`. Wire feed removal here so cleanup and feed-
+              // remove can't diverge: `terminate` is idempotent (a no-op once
+              // `onFinish` already removed the row) and, when this was the last
+              // live worker, collapses the shared card to its terminal summary
+              // and unpins it — closing the immortal/unpinned/buried-card leak.
+              onTerminalCleanup: (agentId) => {
+                try {
+                  void workerActivityFeed?.terminate(agentId)
+                } catch (err) {
+                  process.stderr.write(
+                    `telegram gateway: worker terminal-cleanup feed removal error agent=${agentId}: ${(err as Error).message}\n`,
+                  )
+                }
+              },
               onFinish: ({ agentId, outcome, description, resultText, toolCount, durationMs, background: entryBackground }) => {
                 // Reaction promotion: if the parent turn already ended
                 // with this (or another) worker still running, its 👍 was
