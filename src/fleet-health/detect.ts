@@ -35,7 +35,12 @@ export interface TurnRecord {
 export type TurnSignal =
   | "killed-incomplete-turn"
   | "hang-long-stalled"
-  | "silent-no-op-candidate";
+  | "silent-no-op-candidate"
+  // A turn-flush/backstop send that failed or only partially delivered
+  // (turns.jsonl status `send_failed`, new in gateway PR B). Distinct from
+  // `killed-incomplete-turn` (process killed mid-run): here the run finished
+  // but the answer never fully reached the user (e.g. flood-dropped).
+  | "send-failed-delivery";
 
 /** The L0 failure-mode signals emitted from precise gateway log signatures. */
 export type GatewaySignal =
@@ -118,7 +123,18 @@ export function detectTurnFindings(agent: string, turns: TurnRecord[]): Finding[
     const synthetic = tid.includes("synthetic-"); // gateway-injected, not a real job
     const ts = isoFromTs(t.ts);
 
-    if (st !== "complete" && st !== "no_reply") {
+    // send_failed (gateway PR B): the run finished but the answer did not fully
+    // reach the user. Its own signal — NOT the process-killed catch-all below
+    // (which would corrupt `killed-incomplete-turn`'s "killed mid-run" meaning).
+    if (st === "send_failed") {
+      findings.push({
+        signal: "send-failed-delivery",
+        agent,
+        turn_id: tid,
+        log_pointer: `turns.jsonl:${tid} status=send_failed`,
+        ts,
+      });
+    } else if (st !== "complete" && st !== "no_reply") {
       findings.push({
         signal: "killed-incomplete-turn",
         agent,
@@ -233,7 +249,8 @@ export function scanAgent(
       (f) =>
         f.signal === "killed-incomplete-turn" ||
         f.signal === "hang-long-stalled" ||
-        f.signal === "silent-no-op-candidate",
+        f.signal === "silent-no-op-candidate" ||
+        f.signal === "send-failed-delivery",
     ) ||
     gw_hits["duplicate-delivery-represent"] > 0 ||
     gw_hits["reply-delivery-failure"] > 0;
