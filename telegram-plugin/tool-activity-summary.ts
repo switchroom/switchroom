@@ -170,8 +170,10 @@ export function clipNarrative(s: string): string {
  * `description` — italicised task description (optional)
  * `elapsedMs`   — wall-clock elapsed, rendered via `formatFeedElapsed`
  * `toolCount`   — labeled tool calls this turn
- * `state`       — 'running' | 'done' | 'failed' (controls the status line wording;
- *                 'failed' renders `failed · …` so a failed worker never reads as done)
+ * `state`       — 'running' | 'done' | 'failed' | 'incomplete' (controls the
+ *                 status line wording; 'failed'/'incomplete' render
+ *                 `failed · …` / `incomplete · …` so a failed or reaped worker
+ *                 never reads as done)
  *
  * Returns a two-element array of ready Telegram HTML lines (no trailing newline).
  */
@@ -181,7 +183,7 @@ export function renderActivityHeader(
   description: string,
   elapsedMs: number,
   toolCount: number,
-  state: 'running' | 'done' | 'failed',
+  state: 'running' | 'done' | 'failed' | 'incomplete',
   model?: string,
 ): [string, string] {
   const toolWord = toolCount === 1 ? 'tool' : 'tools'
@@ -283,7 +285,7 @@ export interface StatusCardHeader {
   description?: string
   elapsedMs: number
   toolCount: number
-  state: 'running' | 'done' | 'failed'
+  state: 'running' | 'done' | 'failed' | 'incomplete'
   /** Live model id (raw, e.g. `claude-opus-4-8`) — rendered as a short friendly
    *  tag on the metrics line via `formatModelLabel`. Omitted when unknown. */
   model?: string

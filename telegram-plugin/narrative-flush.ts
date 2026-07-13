@@ -41,6 +41,26 @@
 
 import { REPLY_TOOLS, isDraftOfReply } from './narrative-dedup.js'
 
+/**
+ * Time-box for the parked-narrative early-paint (the kernel's home for the
+ * constant so BOTH callers share ONE source of truth):
+ *   - the main-agent gateway path drives the kernel with a real `setTimeout`
+ *     scheduler (`makeNarrativeGate`, gateway.ts);
+ *   - the worker / sub-agent watcher drives the SAME kernel with a POLL-driven
+ *     scheduler (stamp `deadline = nowFn()+flushMs`; flush on the next poll
+ *     tick once `nowFn() >= deadline`) — see `subagent-watcher.ts`.
+ * If a parked opening narration gets no lookahead event (tool_use / next text /
+ * turn_end) within this window — the "narrate, then think before the first
+ * tool" gap — it is painted EARLY instead of waiting for the first tool. Chosen
+ * so a normal draft-then-send `reply` (emitted right after the text block)
+ * resolves the block FIRST; correctness does NOT depend on that race — a
+ * timer-painted block that later proves to be the reply is deterministically
+ * retracted (main path) or is structurally harmless (worker path: the reply is
+ * a Telegram-surface tool that never renders on the card). Named const so a
+ * test can pin it.
+ */
+export const PENDING_NARRATIVE_FLUSH_MS = 250
+
 /** Side effects the kernel drives. The caller owns rendering + retraction. */
 export interface NarrativeFlushEffects {
   /** Paint a narrative block as a transient liveness step (SHOW). */

@@ -69,7 +69,20 @@ export function isWorkerActivityFeedEnabled(envVal: string | undefined): boolean
   return envVal !== '0'
 }
 
-export type WorkerActivityState = 'running' | 'done' | 'failed'
+/**
+ * Terminal states a worker card can render.
+ *   - 'running'    — live.
+ *   - 'done'       — clean finish WITH a result (✅).
+ *   - 'failed'     — clean finish reporting a failure / crash observed in the
+ *                    transcript (⚠️).
+ *   - 'incomplete' — force-reaped / vanished / crashed WITHOUT any clean finish
+ *                    (the TTL sweep or the watcher's authoritative
+ *                    `onTerminalCleanup` synthesised the terminal because
+ *                    neither `onFinish` nor a turn_end ever delivered a result).
+ *                    Renders `incomplete · …` so a reaped worker NEVER reads as
+ *                    "done" — the truthful "ended without result" terminal.
+ */
+export type WorkerActivityState = 'running' | 'done' | 'failed' | 'incomplete'
 
 /** The render-relevant snapshot of a worker at one instant. */
 export interface WorkerActivityView {
@@ -141,7 +154,7 @@ const DESC_MAX = 80
  */
 export function renderWorkerActivity(v: WorkerActivityView, liveSuffix = ''): string {
   const desc = truncate(stripMarkdown(v.description).trim() || 'background task', DESC_MAX)
-  const finished = v.state === 'done' || v.state === 'failed'
+  const finished = v.state === 'done' || v.state === 'failed' || v.state === 'incomplete'
 
   // Raw narrative steps (unstripped/unescaped) — the unified renderer runs the
   // full per-line pipeline (stripMarkdown → collapse ws → clip → escape).
@@ -843,7 +856,11 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
    */
   function finalizeWorker(group: FeedGroup, agentId: string, row: WorkerRow, view: WorkerActivityView): Promise<void> {
     row.finished = true
-    row.state = view.state === 'failed' ? 'failed' : 'done'
+    // Preserve the truthful terminal state through to the row (done / failed /
+    // incomplete) — never collapse a reaped 'incomplete' into 'done'. view.state
+    // is always terminal on this path (finalize is only reached for a finishing
+    // worker), so threading it verbatim is correct.
+    row.state = view.state
     markFinalized(agentId)
     group.chain = group.chain
       .then(() => {
@@ -869,9 +886,16 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
   /**
    * Force a worker terminal without an external result view (authoritative
    * `onTerminalCleanup` sweep or the TTL backstop). Synthesises the recap from
-   * the row's own last-known state — state `done`, NO fabricated result text
-   * (the real result, if any, reaches the user via the separate handback).
-   * Idempotent: a no-op once the worker was already removed (onFinish first).
+   * the row's own last-known state — state `incomplete` (NOT `done`), NO
+   * fabricated result text (the real result, if any, reaches the user via the
+   * separate handback). Reaching here means NO clean finish arrived: a clean
+   * `onFinish` removes the row FIRST (this call is then a no-op), and an
+   * errored worker goes through `onFinish(outcome:'failed')` → `finish` — so a
+   * row still present at terminate time genuinely ended WITHOUT a result. It
+   * must therefore render `incomplete · …`, never "done" (a crash/vanish read
+   * as "done" was the residual this fixes). Idempotent: a no-op once the worker
+   * was already removed (onFinish first). Depth-generic: operates on the
+   * generic worker row by agentId, identical at every nesting level.
    */
   function terminateWorker(agentId: string): Promise<void> {
     const g = groupOfAgent(agentId)
@@ -893,10 +917,10 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       toolCount: lv?.toolCount ?? 0,
       // No fabricated result paragraph — an authoritative sweep can't know what
       // the worker returned; the terminal card shows the header struck-through
-      // done, and the handback (if it ran) carries the actual result.
+      // as `incomplete`, and the handback (if it ran) carries the actual result.
       latestSummary: '',
       elapsedMs: liveElapsed(row, nowFn()),
-      state: 'done',
+      state: 'incomplete',
       model: lv?.model,
     }
     return finalizeWorker(g, agentId, row, view)
