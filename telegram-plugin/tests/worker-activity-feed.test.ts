@@ -1513,7 +1513,7 @@ describe('worker-feed send-gate shed contract', () => {
     expect(bot.edits[0].text).toContain('2 tools')
   })
 
-  it('does not falsely finalize on a shed terminal edit — re-drives the finalize once the gate clears', async () => {
+  it('a shed terminal edit drops the finished row immediately but stages the recap for a heartbeat re-drive (#3207)', async () => {
     let clock = 10_000
     const bot = makeGateBot(() => 0)
     const feed = createWorkerActivityFeed({
@@ -1522,25 +1522,30 @@ describe('worker-feed send-gate shed contract', () => {
       firstPaintMinMs: 0,
       minEditIntervalMs: 0,
       floodWaitRemainingMs: () => 0,
+      setInterval: () => 1,
+      clearInterval: () => {},
     })
 
     await feed.update('w1', 'chat', view({ toolCount: 1 }))
     expect(bot.sent).toHaveLength(1)
 
-    // Gate sheds the terminal edit (undefined).
+    // Gate sheds the terminal edit (SEND_GATE_SHED sentinel).
     clock = 20_000
     bot.shedNextEdit = true
     await feed.finish('w1', view({ state: 'done', toolCount: 5 }))
     expect(bot.editCalls).toBe(1)
     expect(bot.edits).toHaveLength(0)
-    // NOT finalized: the handle survives (pendingFinish staged) rather than
-    // being torn down with the card frozen on its last running render.
-    expect(feed.has('w1')).toBe(true)
+    // #3207: the finished row is dropped RIGHT AWAY — it is NOT kept alive to
+    // leak the group/pin when the terminal edit fails. The recap is staged for
+    // the heartbeat re-drive instead (a second finish() would be a no-op: the
+    // agent is already finalized + removed).
+    expect(feed.has('w1')).toBe(false)
+    expect(feed.size).toBe(0)
 
-    // Re-drive with the gate clear: the terminal recap lands and the handle
-    // finalizes.
+    // A heartbeat with the gate clear re-drives the staged recap → it lands.
     clock = 30_000
-    await feed.finish('w1', view({ state: 'done', toolCount: 5 }))
+    feed.heartbeatTick()
+    await new Promise((r) => setTimeout(r, 0))
     expect(bot.edits).toHaveLength(1)
     expect(bot.edits[0].text).toContain('_done · 5 tools')
     expect(feed.has('w1')).toBe(false)

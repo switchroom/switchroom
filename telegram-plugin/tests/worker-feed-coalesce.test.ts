@@ -443,6 +443,202 @@ describe('coalesced worker feed — GROUP-level pin lifecycle (#3207 review)', (
   })
 })
 
+// ─── #3207 leaked-finished-row fix ────────────────────────────────────────────
+//
+// Root cause of the "progress card never unpins; later workers append to a
+// stale pinned message" incident (a card observed pinned + edited for 2h12m):
+// a finished worker row whose terminal edit hit a 429/flood window was left in
+// `g.workers`, so the group never emptied → never deleted → never unpinned, and
+// a later worker inherited the stale message. These outcome tests pin the fix:
+// group emptiness / deletion / unpin are decoupled from terminal-edit success,
+// the finalize staging is per-agent (no single-slot overwrite), and a later
+// worker never reuses a terminated group's message.
+
+describe('coalesced worker feed — leaked finished-row fix (#3207)', () => {
+  interface PinCall {
+    feedKey: string
+    chatId: string
+    messageId: number | null
+  }
+  function leakHarness(opts: { failEdits?: () => unknown } = {}) {
+    const pins: PinCall[] = []
+    const sent: { chatId: string; text: string; messageId: number }[] = []
+    const edits: { messageId: number; text: string }[] = []
+    let seq = 700
+    let clock = 0
+    const bot: BotApiForWorkerFeed = {
+      sendMessage: async (chatId, text) => {
+        const messageId = seq++
+        sent.push({ chatId, text, messageId })
+        return { message_id: messageId }
+      },
+      editMessageText: async (_chatId, messageId, text) => {
+        const err = opts.failEdits?.()
+        if (err != null) throw err
+        edits.push({ messageId, text })
+        return true
+      },
+    }
+    const feed = createWorkerActivityFeed({
+      bot,
+      now: () => clock,
+      minEditIntervalMs: 0,
+      firstPaintMinMs: 0,
+      heartbeatTickMs: 6000,
+      setInterval: () => 0,
+      clearInterval: () => {},
+      reconcilePin: ({ feedKey, chatId, messageId }) => pins.push({ feedKey, chatId, messageId }),
+    })
+    return { feed, pins, sent, edits, setClock: (t: number) => (clock = t) }
+  }
+  const done = (desc: string, elapsedMs: number): WorkerActivityView => ({
+    description: desc,
+    lastTool: null,
+    toolCount: 3,
+    latestSummary: `${desc} result`,
+    elapsedMs,
+    state: 'done',
+  })
+  const drain = () => new Promise((r) => setTimeout(r, 0))
+
+  it('drops the finished row + requests unpin even when the last terminal edit floods (429)', async () => {
+    let flooding = true
+    const { feed, pins, sent, edits, setClock } = leakHarness({
+      failEdits: () => (flooding ? { error_code: 429, parameters: { retry_after: 2 } } : null),
+    })
+    setClock(1000)
+    await feed.update('w1', 'chat', view('task 1', 'doing', 1000))
+    expect(sent).toHaveLength(1)
+    const feedKey = pins[pins.length - 1].feedKey
+
+    // The LAST worker finishes but the terminal recap edit 429s.
+    setClock(2000)
+    await feed.finish('w1', done('task 1', 2000))
+    await drain()
+
+    // Outcome: the finished row is gone and the pin is RELEASED immediately —
+    // neither is blocked by the failed terminal edit.
+    expect(feed.has('w1')).toBe(false)
+    expect(feed.size).toBe(0)
+    // Pin-reaper backstop: no running rows remain → the group is not "running".
+    expect(feed.hasRunningInFeed(feedKey)).toBe(false)
+    expect(pins[pins.length - 1].messageId).toBeNull()
+    // The terminal recap has NOT landed yet (still flooding) — proves the unpin
+    // did not wait on it.
+    expect(edits.some((e) => e.text.includes('_done ·'))).toBe(false)
+
+    // Flood clears; a heartbeat past the cooldown re-drives the staged recap.
+    flooding = false
+    setClock(5000)
+    feed.heartbeatTick()
+    await drain()
+    expect(edits.some((e) => e.text.includes('_done ·'))).toBe(true)
+
+    // The group is fully reaped: a later worker in the SAME chat paints a FRESH
+    // message — it does NOT reuse/edit the terminated group's message id.
+    setClock(6000)
+    await feed.update('w2', 'chat', view('task 2', 'doing2', 6000))
+    await drain()
+    expect(sent).toHaveLength(2)
+    expect(feed.messageIdOf('w2')).toBe(sent[1].messageId)
+    expect(feed.messageIdOf('w2')).not.toBe(sent[0].messageId)
+  })
+
+  it('TWO workers finishing in the same flood window are BOTH reaped (no single-slot overwrite)', async () => {
+    let flooding = true
+    const { feed, pins, sent, edits, setClock } = leakHarness({
+      failEdits: () => (flooding ? { error_code: 429, parameters: { retry_after: 2 } } : null),
+    })
+    setClock(1000)
+    await feed.update('a', 'chat', view('task A', 'a-doing', 1000))
+    await feed.update('b', 'chat', view('task B', 'b-doing', 1000))
+    expect(feed.size).toBe(2)
+    const feedKey = pins[pins.length - 1].feedKey
+
+    // Both finish before either finalize chain drains, so both latch terminal in
+    // the SAME cooldown window. The old single `pendingFinalize` slot dropped all
+    // but one → the other row leaked forever. The per-agent map keeps both.
+    setClock(2000)
+    const f1 = feed.finish('a', done('task A', 2000))
+    const f2 = feed.finish('b', done('task B', 2000))
+    await Promise.all([f1, f2])
+    await drain()
+
+    // NEITHER finished row leaks — the group is empty and unpinned.
+    expect(feed.size).toBe(0)
+    expect(feed.hasRunningInFeed(feedKey)).toBe(false)
+    expect(pins[pins.length - 1].messageId).toBeNull()
+
+    // Flood clears; one heartbeat drains ALL staged recaps and reaps the group.
+    flooding = false
+    setClock(5000)
+    feed.heartbeatTick()
+    await drain()
+
+    // BOTH staged terminal recaps must actually repaint — not just one. This is
+    // the contract the per-agent `pendingFinalize` map exists to hold: a single-
+    // slot `pendingFinalize` would have let worker B's stage overwrite worker A's,
+    // so only ONE recap edit would land and this assertion would FAIL. The
+    // decoupled row-removal (fix 1) alone would pass size===0 + unpin above WITHOUT
+    // repainting either recap, so those assertions do not pin this contract — these
+    // do. Each recap carries its own worker's description ('task A' / 'task B').
+    const doneEdits = edits.filter((e) => e.text.includes('_done ·'))
+    expect(doneEdits.some((e) => e.text.includes('task A'))).toBe(true)
+    expect(doneEdits.some((e) => e.text.includes('task B'))).toBe(true)
+
+    // The group is gone: a later worker paints a FRESH message, never editing a
+    // terminated sibling's message.
+    setClock(6000)
+    await feed.update('c', 'chat', view('task C', 'c-doing', 6000))
+    await drain()
+    const firstMsgId = sent[0].messageId
+    expect(feed.messageIdOf('c')).toBe(sent[sent.length - 1].messageId)
+    expect(feed.messageIdOf('c')).not.toBe(firstMsgId)
+  })
+
+  it('a later worker after all prior workers finished does NOT reuse the prior message id', async () => {
+    const { feed, sent, setClock } = leakHarness()
+    setClock(1000)
+    await feed.update('w1', 'chat', view('task 1', 'doing', 1000))
+    setClock(2000)
+    await feed.finish('w1', done('task 1', 2000))
+    await drain()
+    expect(feed.size).toBe(0)
+
+    // A brand-new worker in the same chat gets its OWN fresh message.
+    setClock(3000)
+    await feed.update('w2', 'chat', view('task 2', 'doing2', 3000))
+    await drain()
+    expect(sent).toHaveLength(2)
+    expect(feed.messageIdOf('w2')).toBe(sent[1].messageId)
+    expect(feed.messageIdOf('w2')).not.toBe(sent[0].messageId)
+  })
+
+  it('hasRunningInFeed is false once only finished rows remain (pin-reaper backstop fires)', async () => {
+    // A sibling keeps the group running; when the LAST running worker finishes,
+    // no running row remains → hasRunningInFeed flips to false so the gateway's
+    // wk:group: reaper is free to unpin (finished rows never count as running).
+    const { feed, pins, setClock } = leakHarness()
+    setClock(1000)
+    await feed.update('a', 'chat', view('task A', 'a-doing', 1000))
+    await feed.update('b', 'chat', view('task B', 'b-doing', 1000))
+    const feedKey = pins[pins.length - 1].feedKey
+    expect(feed.hasRunningInFeed(feedKey)).toBe(true)
+
+    setClock(2000)
+    await feed.finish('a', done('task A', 2000))
+    await drain()
+    // One still runs → still counts.
+    expect(feed.hasRunningInFeed(feedKey)).toBe(true)
+
+    setClock(3000)
+    await feed.finish('b', done('task B', 3000))
+    await drain()
+    // Only finished work remains → NOT running.
+    expect(feed.hasRunningInFeed(feedKey)).toBe(false)
+  })
+})
+
 describe('renderCombinedWorkerFeed (pure)', () => {
   const row = (i: number, step: string) => ({
     description: `task number ${i}`,

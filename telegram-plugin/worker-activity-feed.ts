@@ -390,12 +390,29 @@ interface FeedGroup {
   /** Live workers in this group, keyed by agentId (insertion ≈ dispatch order). */
   workers: Map<string, WorkerRow>
   /**
-   * A terminal render (the last worker's recap) staged because a 429 cooldown /
-   * flood window blocked the edit. The heartbeat re-drives it once the cooldown
-   * expires so a finished feed can't get stuck on its last running render.
-   * Null when no finalize is pending.
+   * Terminal renders (per finishing worker's recap) staged because a 429
+   * cooldown / flood window blocked the edit. Keyed by agentId so a SECOND
+   * worker finishing in the same window can't overwrite the first's staged
+   * recap (the single-slot bug: two near-simultaneous last-worker finishes
+   * leaked the earlier finished row forever). The heartbeat drains EVERY entry
+   * once the cooldown expires so a finished feed can't get stuck on its last
+   * running render. Empty when no finalize is pending.
+   *
+   * Note: the finishing row is dropped from `workers` immediately at finalize
+   * time (decoupled from edit success — #3207 leaked-finished-row fix), so a
+   * staged entry here is purely the best-effort terminal REPAINT; group
+   * emptiness / deletion / unpin never wait on it.
    */
-  pendingFinalize: WorkerActivityView | null
+  pendingFinalize: Map<string, WorkerActivityView>
+  /**
+   * True once this group's shared message last rendered a TERMINAL recap (a
+   * finished worker's done/failed/incomplete card), and no live worker has
+   * repainted since. A later worker joining the group must NOT edit that
+   * terminal message — it forces a fresh first-paint (new message) instead, so
+   * a new dispatch never appends to a stale "done" card. Reset to false on any
+   * fresh first-paint.
+   */
+  terminalPainted: boolean
 }
 
 const COOLDOWN_JITTER_MS = 500
@@ -693,7 +710,24 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
   function removeWorker(g: FeedGroup, agentId: string): void {
     g.workers.delete(agentId)
     agentIndex.delete(agentId)
-    if (g.workers.size === 0) groups.delete(g.feedKey)
+    maybeDeleteGroup(g)
+  }
+
+  /**
+   * Delete an empty group. A group is gone only when it has NO tracked workers
+   * AND no staged terminal repaints pending — the latter keeps the group object
+   * reachable for the heartbeat re-drive after a flood/429 deferred the recap,
+   * without keeping it "alive" for the pin (syncPin / hasRunningInFeed count
+   * only live workers, so an emptied-but-pending group is already unpinned).
+   */
+  function maybeDeleteGroup(g: FeedGroup): void {
+    if (g.workers.size === 0 && g.pendingFinalize.size === 0) groups.delete(g.feedKey)
+  }
+
+  /** Live (not-yet-finished) workers still tracked in a group. */
+  function hasLiveWorker(g: FeedGroup): boolean {
+    for (const w of g.workers.values()) if (!w.finished) return true
+    return false
   }
 
   /**
@@ -704,7 +738,10 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
    * still needs — the survivors keep the pin until the LAST worker is done.
    */
   function syncPin(g: FeedGroup): void {
-    const messageId = g.messageId != null && g.workers.size > 0 ? g.messageId : null
+    // Pin follows LIVE membership, not row count: a finished-but-not-yet-swept
+    // row (or a staged terminal repaint) must NOT keep the pin. Unpin the
+    // instant the last running worker is gone.
+    const messageId = g.messageId != null && hasLiveWorker(g) ? g.messageId : null
     reconcilePinFn({ feedKey: g.feedKey, chatId: g.chatId, threadId: g.threadId, messageId })
   }
 
@@ -721,45 +758,78 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
   ): Promise<void> {
     const now = nowFn()
     const isTerminal = opts2.terminalRecap != null
-    // Terminal edit RESOLVED (landed / not-modified / gone): clear the staged
-    // re-drive unconditionally so a heartbeat re-drive can never loop, and drop
-    // the finished row when its id is known (the last-worker finalize path).
-    const settleTerminal = (): void => {
-      g.pendingFinalize = null
-      if (opts2.finishingAgentId != null) removeWorker(g, opts2.finishingAgentId)
-      // Group-level pin follows membership: unpin once this drops the last
-      // worker; a NOOP-pin (siblings remain) keeps the shared message pinned.
+    const finishingAgentId = opts2.finishingAgentId
+
+    // Stage the terminal recap for the heartbeat re-drive, keyed by the
+    // FINISHING agent so a second worker finishing in the same cooldown/flood
+    // window can't overwrite an earlier staged recap (#3207: the single-slot
+    // overwrite that orphaned finished rows). Best-effort repaint only — the
+    // row is dropped and the pin released independently, below.
+    const stageRecap = (): void => {
+      if (isTerminal && finishingAgentId != null && opts2.terminalRecap != null) {
+        g.pendingFinalize.set(finishingAgentId, opts2.terminalRecap)
+      }
+    }
+    // Terminal repaint no longer pending (landed / not-modified / gone / never
+    // had a message): stop re-driving it and reap the group if now fully empty.
+    const clearStaged = (): void => {
+      if (finishingAgentId != null) g.pendingFinalize.delete(finishingAgentId)
+      maybeDeleteGroup(g)
       syncPin(g)
     }
+
+    // #3207 leaked-finished-row fix — decouple row removal + unpin from the
+    // terminal edit's SUCCESS. The instant a worker finalizes we drop its row
+    // and release the group pin; a 429 / flood / transport failure on the
+    // cosmetic recap edit must NEVER keep the group, its message, or its pin
+    // alive. The recap is staged (above) purely as a best-effort repaint.
+    if (isTerminal) {
+      stageRecap()
+      if (finishingAgentId != null && g.workers.has(finishingAgentId)) {
+        removeWorker(g, finishingAgentId)
+      }
+      // Only latch terminalPainted when NO live worker remains at paint time.
+      // Race: this finalize was the last live worker when the chain latched, but
+      // a fresh worker B may have called update() and joined g.workers before
+      // this body runs — in which case renderGroupBody paints B's RUNNING card,
+      // not a terminal recap. Setting the flag true unconditionally would
+      // mislabel that running paint as terminal (a spurious group-reuse fresh-
+      // paint on B's next update). Reflect reality: the group only went terminal
+      // if it's actually empty of live workers.
+      g.terminalPainted = !hasLiveWorker(g)
+      syncPin(g)
+    }
+
     if (now < g.cooldownUntil) {
-      if (isTerminal && opts2.terminalRecap != null) g.pendingFinalize = opts2.terminalRecap
+      // Row already dropped + unpinned above; the recap stays staged so the
+      // heartbeat re-drives the repaint once the cooldown expires.
       return
     }
     // A flood window is open: the gate would SHED every call. Park in cooldown
     // and make ZERO api calls until it closes; the heartbeat re-drives.
     if (parkIfFloodWindowOpen(g)) {
-      if (isTerminal && opts2.terminalRecap != null) g.pendingFinalize = opts2.terminalRecap
       return
     }
 
     const body = renderGroupBody(g, now, opts2.terminalRecap ?? null, opts2.heartbeat ?? false)
     if (body == null) {
-      // Nothing to show. On a terminal finalize with no message ever posted,
-      // just drop the finished row (the handback carries the result).
-      if (isTerminal) settleTerminal()
+      // Nothing to show. On a terminal finalize the row is already dropped;
+      // clear the staged repaint (the handback carries the result).
+      if (isTerminal) clearStaged()
       return
     }
 
     // First paint: hold until some worker in the group has run long enough.
     if (g.messageId == null) {
-      const maxElapsed = Math.max(0, ...runningRows(g).map((r) => liveElapsed(r, now)))
       // A terminal recap for a group that never painted → nothing to finalize;
       // never first-paint a terminal card (trivial workers stay silent, the
       // handback carries the result — matches the pre-coalesce doFinish guard).
+      // The finished row is already dropped; just clear the staged repaint.
       if (isTerminal) {
-        settleTerminal()
+        clearStaged()
         return
       }
+      const maxElapsed = Math.max(0, ...runningRows(g).map((r) => liveElapsed(r, now)))
       if (maxElapsed < firstPaintMin) return
       try {
         const sent = await opts.bot.sendMessage(g.chatId, body, sendOptsFor(g))
@@ -775,6 +845,8 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
         g.messageId = sent.message_id
         g.lastBody = body
         g.lastEditAt = now
+        // A fresh message is a live running paint, never a terminal recap.
+        g.terminalPainted = false
         // Group's first (or re-established) message is up → pin it for the group.
         syncPin(g)
         log(
@@ -790,7 +862,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
 
     // Dedup + proactive throttle (finish/terminal edits force through).
     if (body === g.lastBody) {
-      if (isTerminal) settleTerminal()
+      if (isTerminal) clearStaged()
       return
     }
     if (!opts2.force && now - g.lastEditAt < minEditInterval) return
@@ -803,7 +875,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       // The shed payload is NOT on screen, so do not record it as `lastBody`.
       if (isSendGateShed(res)) {
         parkIfFloodWindowOpen(g)
-        if (isTerminal && opts2.terminalRecap != null) g.pendingFinalize = opts2.terminalRecap
+        // Recap stays staged (above); row already dropped + unpinned.
         return
       }
       g.lastBody = body
@@ -811,7 +883,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       if (isTerminal) {
         log(
           `worker-feed: finish feed=${g.feedKey} chat=${g.chatId} thread=${g.threadId ?? '-'} ` +
-            `msgId=${g.messageId} agent=${opts2.finishingAgentId ?? '-'} ` +
+            `msgId=${g.messageId} agent=${finishingAgentId ?? '-'} ` +
             `state=${opts2.terminalRecap?.state ?? 'done'} bytes=${body.length}`,
         )
       } else {
@@ -820,34 +892,34 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
             `thread=${g.threadId ?? '-'} msgId=${g.messageId} workers=${g.workers.size} bytes=${body.length}`,
         )
       }
-      if (isTerminal) settleTerminal()
+      if (isTerminal) clearStaged()
     } catch (err) {
       const outcome = classifyEditError(err)
       if (outcome === 'rate_limited') {
         noteRateLimited(g, err, isTerminal ? 'finish' : 'edit')
-        if (isTerminal && opts2.terminalRecap != null) g.pendingFinalize = opts2.terminalRecap
+        // Recap stays staged; the heartbeat re-drives after the cooldown.
         return
       }
       if (outcome === 'not_modified') {
         g.lastBody = body
         g.lastEditAt = now
-        if (isTerminal) settleTerminal()
+        if (isTerminal) clearStaged()
         return
       }
       if (outcome === 'gone') {
         // Message/chat gone or edit window closed — no card to update. Drop the
         // stale message id; a fresh first-paint re-establishes one if workers
-        // are still live. On a terminal finalize, also drop the finished row.
+        // are still live. On a terminal finalize, clear the staged repaint.
         g.messageId = null
         g.lastBody = null
         // The pinned message no longer exists → release the group pin claim
-        // (settleTerminal already re-syncs on the terminal path).
-        if (isTerminal) settleTerminal()
+        // (clearStaged already re-syncs on the terminal path).
+        if (isTerminal) clearStaged()
         else syncPin(g)
         return
       }
       // 'transient' — leave the message intact; the heartbeat re-attempts.
-      if (isTerminal && opts2.terminalRecap != null) g.pendingFinalize = opts2.terminalRecap
+      // Recap stays staged for the terminal path.
       log(`worker-feed: edit transient error feed=${g.feedKey}: ${(err as Error).message}`)
     }
   }
@@ -945,12 +1017,26 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
     // mutates the group's worker map), then terminate each through its chain so
     // the render/unpin happens under the normal cooldown/flood guards.
     const staleAgentIds: string[] = []
+    const staleFinished: Array<{ g: FeedGroup; agentId: string }> = []
     for (const g of groups.values()) {
       for (const row of g.workers.values()) {
-        if (!row.finished && now - row.lastUpdateAt >= staleWorkerTtlMs) {
-          staleAgentIds.push(row.agentId)
+        if (now - row.lastUpdateAt >= staleWorkerTtlMs) {
+          if (row.finished) staleFinished.push({ g, agentId: row.agentId })
+          else staleAgentIds.push(row.agentId)
         }
       }
+    }
+    // GC any FINISHED row still lingering past the TTL (#3207: finished rows
+    // were exempt from the sweep — `if (!row.finished …)` — so a stuck finished
+    // row could keep a group, its message, and its pin alive forever). The
+    // normal finalize path drops the row immediately now, but reap directly
+    // here as a durable backstop: `terminate()` no-ops on a finished row, so
+    // remove it and release the pin without routing through it.
+    for (const { g, agentId } of staleFinished) {
+      log(`worker-feed: TTL GC finished row agent=${agentId} feed=${g.feedKey} — reaping leaked finished row`)
+      g.pendingFinalize.delete(agentId)
+      removeWorker(g, agentId)
+      syncPin(g)
     }
     for (const agentId of staleAgentIds) {
       log(`worker-feed: TTL reap agent=${agentId} — no update in ${Math.floor((now - (groupOfAgent(agentId)?.workers.get(agentId)?.lastUpdateAt ?? now)) / 1000)}s (>= ${Math.floor(staleWorkerTtlMs / 1000)}s); force-terminating leaked row`)
@@ -960,15 +1046,19 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       // Deferred-finalize re-drive: a terminal edit that hit a cooldown/flood
       // window was staged on `pendingFinalize`. Re-drive it once the cooldown
       // expires so a finished feed can't get stuck on its last running render.
-      if (g.pendingFinalize != null && now >= g.cooldownUntil) {
-        const recap = g.pendingFinalize
-        // The finishing agent is whatever finished row remains (state terminal).
-        const finishingAgentId = [...g.workers.values()].find((w) => w.finished)?.agentId
-        g.chain = g.chain
-          .then(() => doRender(g, { force: true, terminalRecap: recap, finishingAgentId }))
-          .catch((err) => {
-            log(`worker-feed: heartbeat finalize re-drive error feed=${g.feedKey}: ${(err as Error).message}`)
-          })
+      if (g.pendingFinalize.size > 0 && now >= g.cooldownUntil) {
+        // Drain EVERY staged terminal recap, keyed by its finishing agent
+        // (#3207: the single `pendingFinalize` slot dropped all but one when
+        // multiple workers finished inside the same cooldown/flood window, so
+        // the earlier finished rows leaked). Each re-drive removes its own
+        // staged entry on success and reaps the group once fully empty.
+        for (const [agentId, recap] of [...g.pendingFinalize]) {
+          g.chain = g.chain
+            .then(() => doRender(g, { force: true, terminalRecap: recap, finishingAgentId: agentId }))
+            .catch((err) => {
+              log(`worker-feed: heartbeat finalize re-drive error feed=${g.feedKey}: ${(err as Error).message}`)
+            })
+        }
         continue
       }
 
@@ -1013,7 +1103,11 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
     },
     hasRunningInFeed(feedKey) {
       const g = groups.get(feedKey)
-      return g != null && g.workers.size > 0
+      // Count only RUNNING (not-yet-finished) rows (#3207): a finished row
+      // lingering pre-sweep — or a group kept alive solely for a staged
+      // terminal repaint — is NOT running, so the gateway's `wk:group:` pin
+      // reaper must be free to unpin it.
+      return g != null && hasLiveWorker(g)
     },
     get size() {
       let n = 0
@@ -1043,9 +1137,25 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
           cooldownUntil: 0,
           chain: Promise.resolve(),
           workers: new Map(),
-          pendingFinalize: null,
+          pendingFinalize: new Map(),
+          terminalPainted: false,
         }
         groups.set(feedKey, g)
+      }
+      // Group-reuse-after-terminal (#3207): a later worker landing in a group
+      // whose shared message last rendered a TERMINAL recap (its prior workers
+      // all finished, but the group lingered — e.g. a staged repaint, or a
+      // finished row not yet swept) must NOT inherit that message id and edit
+      // the "done" card. Force a fresh first-paint (new message) so the new
+      // dispatch never appends to a stale terminal card. Only triggers when no
+      // live worker remains AND the group last went terminal.
+      if (!g.workers.has(agentId) && g.terminalPainted && !hasLiveWorker(g)) {
+        g.messageId = null
+        g.lastBody = null
+        g.pendingFinalize.clear()
+        g.terminalPainted = false
+        // The stale terminal message is no longer this group's pinned surface.
+        syncPin(g)
       }
       let row = g.workers.get(agentId)
       if (row == null) {
