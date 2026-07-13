@@ -519,7 +519,7 @@ import { resolveOutboundTopic as resolveOutboundTopicHelper, topicForRecipient, 
 import { readTurnUsages } from '../../src/agents/perf.js'
 import { buildContextOccupancy, writeContextOccupancySnapshot } from './context-occupancy.js'
 import { decideProactiveCompact, initialCompactState, type CompactState } from './proactive-compact.js'
-import { decideIdleClear, classifyIdleEvent, idleDurationToMs, DEFAULT_IDLE_CLEAR_MS } from './idle-clear.js'
+import { IdleTracker, idleDurationToMs, DEFAULT_IDLE_CLEAR_MS } from './idle-clear.js'
 import { nextCompactNotify, idleCompactNotifyState, type CompactNotifyState } from './compact-notify.js'
 import {
   tryHostdDispatch,
@@ -5011,31 +5011,25 @@ function maybeProactiveCompact(): void {
 // turn, so this runs on its own interval. "Idle" means NOTHING HAS HAPPENED
 // since the last thing happened — inbound, cron fire, or ANY claude session
 // event (turn start, tool call, tool result, text, sub-agent event, turn end)
-// resets the timer via markIdleActivity(); a turn ending additionally stamps
-// markIdleTurnEnd(). Fires once per idle period; never mid-turn
+// resets the timer via idleTracker.noteInbound/noteEvent; a turn ending
+// additionally stamps the turn-end clock. Fires once per idle period; never mid-turn
 // (turnInFlightForGate, the same gate compaction uses).
 //
 // It is emphatically NOT "no turn has *started* recently" — that reading wiped
 // overlord's 3h of working context on 2026-07-11 for the crime of being busy.
 // See the idle-clear.ts header.
-let lastIdleActivityAt = Date.now();
-let lastIdleTurnEndAt: number | null = null;
-let idleAutoCleared = false;
-let idleClearDispatching = false;
+// #3115 — idle bookkeeping is ONE stateful object the gateway holds, not four
+// bare `let`s + scattered inline stamp/decide logic. The tracker owns the
+// clocks (lastActivity / lastTurnEnd) and the fire-once + re-entrancy latches;
+// the gateway feeds it environment inputs (window, turn gate, background-work
+// suppressor) at decision time. Extracting it makes the wiring importable and
+// testable — a deleted stamp call now fails a test instead of silently
+// re-introducing the #3113 "productive work gets wiped" bug. See idle-clear.ts.
+const idleTracker = new IdleTracker(Date.now());
 
 /** Reset the idle timer + re-arm auto-clear. Call on ANY activity. */
 function markIdleActivity(): void {
-  lastIdleActivityAt = Date.now();
-  idleAutoCleared = false;
-}
-
-/**
- * Stamp "a turn just ended". The idle window is measured from
- * max(lastActivityAt, lastTurnEndedAt), so a turn that ran LONGER than the
- * window can't be cleared on the first tick after `turnInFlight` goes false.
- */
-function markIdleTurnEnd(): void {
-  lastIdleTurnEndAt = Date.now();
+  idleTracker.noteInbound(Date.now());
 }
 
 /** Idle window in ms: env override → per-agent config → 3h default. 0 disables. */
@@ -5062,33 +5056,27 @@ function resolveIdleClearMs(): number {
 
 /** Evaluate idle auto-clear (runs on IDLE_CLEAR_CHECK_MS interval). */
 function maybeIdleClear(): void {
-  if (idleClearDispatching) return;
+  if (idleTracker.isDispatching) return;
   const agentName = process.env.SWITCHROOM_AGENT_NAME;
   if (!agentName) return;
   const idleClearMs = resolveIdleClearMs();
-  const decision = decideIdleClear(
-    {
-      lastActivityAt: lastIdleActivityAt,
-      lastTurnEndedAt: lastIdleTurnEndAt,
-      idleClearMs,
-      alreadyCleared: idleAutoCleared,
-      turnInFlight: turnInFlightForGate(),
-      // #3117 — TTL-bounded background-work suppressor. A detached sub-agent
-      // (Agent/Task dispatched, main turn ended before it returned) is invisible
-      // to turnInFlightForGate(); consult the pending-dispatch flag directly so a
-      // silent long-running worker isn't /clear'ed out from under its handback.
-      // The TTL keeps a leaked flag from disabling idle-clear forever.
-      backgroundWorkInFlight: pendingProgress.anyPendingAsyncDispatchWithin(
-        pendingProgress.BACKGROUND_WORK_SUPPRESS_TTL_MS,
-      ),
-    },
-    Date.now(),
-  );
+  const decision = idleTracker.decide(Date.now(), {
+    idleClearMs,
+    turnInFlight: turnInFlightForGate(),
+    // #3117 — TTL-bounded background-work suppressor. A detached sub-agent
+    // (Agent/Task dispatched, main turn ended before it returned) is invisible
+    // to turnInFlightForGate(); consult the pending-dispatch flag directly so a
+    // silent long-running worker isn't /clear'ed out from under its handback.
+    // The TTL keeps a leaked flag from disabling idle-clear forever.
+    backgroundWorkInFlight: pendingProgress.anyPendingAsyncDispatchWithin(
+      pendingProgress.BACKGROUND_WORK_SUPPRESS_TTL_MS,
+    ),
+  });
   if (!decision.clear) return;
   // Fire once per idle period — set BEFORE the await so the next tick can't
   // double-dispatch. markIdleActivity() re-arms on the next real activity.
-  idleAutoCleared = true;
-  idleClearDispatching = true;
+  idleTracker.markClearFired();
+  idleTracker.beginDispatch();
   process.stderr.write(
     `telegram gateway: idle auto-/clear for ${agentName} ` +
       `(idle >= ${Math.round(idleClearMs / 60_000)}m)\n`,
@@ -5101,36 +5089,31 @@ function maybeIdleClear(): void {
   // immediately before send-keys, and RE-RUNS THE FULL idle decision against
   // the live clocks + turnInFlightForGate() — not a bespoke "activity
   // unchanged" check — so any new activity in the gap suppresses the /clear
-  // (and so a future background-work input to decideIdleClear is honoured at
+  // (and so a future background-work input to the idle decision is honoured at
   // write time for free). Residual: an inbound landing AFTER send-keys but
   // before claude submits the buffered /clear is still clobbered — full
   // closure needs buffer-cancel (tracked as a follow-up issue).
+  // alreadyCleared is latched true above for re-entrancy; decideIgnoringLatch
+  // judges idleness on the live clocks + turn/background gates only, so any
+  // activity that arrived in the check-to-send gap still suppresses the /clear.
+  // #3117 — the background-work suppressor is re-sampled at write time too, so a
+  // sub-agent dispatched in the gap (or still fresh within its TTL) suppresses
+  // the buffered /clear. This composes with #3116's write-time re-eval
+  // automatically — same tracker/decider, live inputs.
   const stillIdleAtWrite = (): boolean =>
-    decideIdleClear(
-      {
-        lastActivityAt: lastIdleActivityAt,
-        lastTurnEndedAt: lastIdleTurnEndAt,
-        idleClearMs: resolveIdleClearMs(),
-        // alreadyCleared is latched true above for re-entrancy; the write-time
-        // re-eval must judge idleness on the live clocks only, so force false.
-        alreadyCleared: false,
-        turnInFlight: turnInFlightForGate(),
-        // #3117 — re-sample the background-work suppressor at write time too, so
-        // a sub-agent dispatched in the check-to-send gap (or still fresh within
-        // its TTL) suppresses the buffered /clear. This composes with #3116's
-        // write-time re-eval automatically — same decider, live inputs.
-        backgroundWorkInFlight: pendingProgress.anyPendingAsyncDispatchWithin(
-          pendingProgress.BACKGROUND_WORK_SUPPRESS_TTL_MS,
-        ),
-      },
-      Date.now(),
-    ).clear;
+    idleTracker.decideIgnoringLatch(Date.now(), {
+      idleClearMs: resolveIdleClearMs(),
+      turnInFlight: turnInFlightForGate(),
+      backgroundWorkInFlight: pendingProgress.anyPendingAsyncDispatchWithin(
+        pendingProgress.BACKGROUND_WORK_SUPPRESS_TTL_MS,
+      ),
+    }).clear;
   void injectSlashCommandImpl(agentName, '/clear', { precondition: stillIdleAtWrite })
     .then((result) => {
       if (result.outcome === 'skipped') {
         // Activity arrived in the check-to-send gap; re-arm so the next idle
         // period can clear again rather than staying latched.
-        idleAutoCleared = false;
+        idleTracker.reArm();
         process.stderr.write(
           `telegram gateway: idle /clear suppressed for ${agentName} ` +
             `(activity in check-to-send gap)\n`,
@@ -5143,7 +5126,7 @@ function maybeIdleClear(): void {
           `${agentName}: ${err instanceof Error ? err.message : String(err)}\n`,
       );
     })
-    .finally(() => { idleClearDispatching = false; });
+    .finally(() => { idleTracker.endDispatch(); });
 }
 
 /**
@@ -16411,9 +16394,7 @@ function handleSessionEvent(ev: SessionEvent): void {
   // background workers keep the timer warm exactly as long as they are working.
   {
     const durationMs = ev.kind === 'turn_end' ? ev.durationMs : undefined
-    const signal = classifyIdleEvent(ev.kind, durationMs)
-    if (signal.activity) markIdleActivity()
-    if (signal.turnEnded) markIdleTurnEnd()
+    idleTracker.noteEvent(ev.kind, Date.now(), durationMs)
   }
   switch (ev.kind) {
     case 'enqueue': {
