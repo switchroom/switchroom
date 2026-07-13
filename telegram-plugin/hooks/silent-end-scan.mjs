@@ -123,14 +123,25 @@ export function isFinalAnswerReply({ text, disableNotification, done }) {
  * @returns {{ chatId: string | null, threadId: number | null }}
  */
 function parseChannelEnvelope(content) {
-  if (typeof content !== 'string') return { chatId: null, threadId: null, source: null }
+  if (typeof content !== 'string') {
+    return { chatId: null, threadId: null, messageId: null, source: null }
+  }
   const chatMatch = content.match(/chat_id="([^"]+)"/)
   const threadMatch = content.match(/message_thread_id="([^"]+)"/)
+  // LEFT-ANCHOR the message_id match on an attribute boundary (start-of-string
+  // or a whitespace/quote before the name) so it matches ONLY the real
+  // `message_id` attribute — never a same-suffix sibling like
+  // `target_message_id`, `reply_to_message_id`, or `original_message_id`.
+  // Byte-identical to session-tail.ts `parseChannelMeta`'s `grab('message_id')`
+  // so the turnId the hook derives here matches the gateway's `deriveTurnId`
+  // exactly (Finding 3, #3228).
+  const msgMatch = content.match(/(?:^|[\s"'])message_id="([^"]+)"/)
   const sourceMatch = content.match(/<channel[^>]*\bsource="([^"]+)"/)
   const threadRaw = threadMatch ? Number(threadMatch[1]) : NaN
   return {
     chatId: chatMatch ? chatMatch[1] : null,
     threadId: Number.isFinite(threadRaw) && threadRaw !== 0 ? threadRaw : null,
+    messageId: msgMatch ? msgMatch[1] : null,
     source: sourceMatch ? sourceMatch[1] : null,
   }
 }
@@ -149,19 +160,54 @@ function buildTurnKey(chatId, threadId) {
 }
 
 /**
+ * Build the per-turn nonce the gateway stamps as `CurrentTurn.turnId`
+ * (`gateway.ts deriveTurnId` → `${chatKey(chatId, threadId)}#${messageId}`).
+ * Unlike `buildTurnKey` (the STABLE `chatId:threadId` statusKey, shared by
+ * every turn on the same chat/thread), this is unique per inbound message —
+ * so a stale captured-prose record from a PRIOR turn on the same chat can
+ * never be misdelivered on a LATER turn (Finding 3, #3228). Returns null when
+ * the enqueue envelope carries no usable message_id (synthetic inbounds); the
+ * gateway then falls back to the turnKey-only match, unchanged.
+ *
+ * @param {string | null} chatId
+ * @param {number | null} threadId
+ * @param {string | null} messageId
+ * @returns {string | null}
+ */
+function buildTurnId(chatId, threadId, messageId) {
+  if (chatId == null) return null
+  if (messageId == null || messageId === '' || String(messageId) === '0') return null
+  return `${buildTurnKey(chatId, threadId)}#${messageId}`
+}
+
+/**
  * Build the `{ decided: 'block', ... }` result shape, populating
  * `turnKey`/`chatId`/`threadId` from the enqueue envelope when
  * available. Shared by both block branches below.
  *
  * @param {ReturnType<typeof parseChannelEnvelope>} envelope
  * @param {string} reason
+ * @param {string} [pendingText] The substantive undelivered final-answer
+ *   prose the model wrote as plain transcript text but never sent through a
+ *   reply tool (Option A transcript-prose bridge). Only populated when it
+ *   clears the substance floor, so the gateway never re-delivers a short
+ *   trailing pleasantry. Omitted entirely otherwise.
  */
-function buildBlockResult(envelope, reason) {
+function buildBlockResult(envelope, reason, pendingText) {
   const block = { decided: 'block', reason }
   if (envelope.chatId) {
     block.chatId = envelope.chatId
     block.threadId = envelope.threadId
     block.turnKey = buildTurnKey(envelope.chatId, envelope.threadId)
+    // Per-turn nonce (Finding 3, #3228). Populated only when the enqueue
+    // envelope carried a real message_id — the gateway requires it to match
+    // this turn's `turnId` before delivering `pendingText`, so a stale record
+    // carried over from a prior turn on the same chat/thread is rejected.
+    const turnId = buildTurnId(envelope.chatId, envelope.threadId, envelope.messageId)
+    if (turnId != null) block.turnId = turnId
+  }
+  if (typeof pendingText === 'string' && pendingText.length > 0) {
+    block.pendingText = pendingText
   }
   return block
 }
@@ -190,6 +236,15 @@ function buildBlockResult(envelope, reason) {
  *                                     the gateway's later write reads back
  *                                     the hook's state.
  *   { decided: 'unknown', reason }  — couldn't locate turn-start; caller fail-open
+ *
+ * On a 'block' decision the result MAY carry `pendingText`: the substantive
+ * final-answer prose the model wrote as plain transcript text after the last
+ * delivery event (or the whole turn's prose when nothing was ever delivered),
+ * joined and trimmed. This is the Option A transcript-prose bridge — the
+ * gateway reads it back out of the state file and delivers it directly on the
+ * first silent-end instead of waiting for the model re-prompt / obligation
+ * represent to eventually recover it. Only surfaced when it clears the same
+ * FINAL_ANSWER_MIN_CHARS substance floor the block decision uses.
  *
  * Turn-start anchor: the most recent `queue-operation`/`enqueue` line
  * (the inbound message the gateway pushed onto the session). For
@@ -232,7 +287,7 @@ function buildBlockResult(envelope, reason) {
  * false-positive that burned retry budget on healthy turns.
  *
  * @param {string} jsonl
- * @returns {{ decided: 'allow' | 'block' | 'unknown', reason: string, turnKey?: string, chatId?: string, threadId?: number | null }}
+ * @returns {{ decided: 'allow' | 'block' | 'unknown', reason: string, turnKey?: string, turnId?: string, chatId?: string, threadId?: number | null, pendingText?: string }}
  */
 export function scanTurnForFinalReply(jsonl) {
   const lines = jsonl.split('\n')
@@ -294,7 +349,16 @@ export function scanTurnForFinalReply(jsonl) {
           // the same bar `isFinalAnswerReply` uses to recognise a real
           // answer — counts as "undelivered content the user was waiting
           // on". #2956 review finding.
-          blocks.push({ kind: 'text', chars: String(c.text ?? '').trim().length })
+          //
+          // Carry the trimmed text itself too (Option A transcript-prose
+          // bridge): when this turn ends up blocked, the joined undelivered
+          // text becomes `pendingText` so the gateway can deliver the model's
+          // real answer directly. Trimmed per-block; joined below.
+          blocks.push({
+            kind: 'text',
+            chars: String(c.text ?? '').trim().length,
+            text: String(c.text ?? '').trim(),
+          })
         }
         continue
       }
@@ -339,9 +403,35 @@ export function scanTurnForFinalReply(jsonl) {
       lastAllowReason = blocks[i].reason
     }
   }
-  const sawUndeliveredTextAfterAllow = blocks
-    .slice(lastAllowBlockIdx + 1)
+  const undeliveredSlice = blocks.slice(lastAllowBlockIdx + 1)
+  const sawUndeliveredTextAfterAllow = undeliveredSlice
     .some((b) => b.kind === 'text' && (b.chars ?? 0) >= FINAL_ANSWER_MIN_CHARS)
+
+  // Option A transcript-prose bridge: isolate the undelivered final-answer
+  // prose so the gateway can deliver it directly.
+  //
+  // Finding 2 (#3228): a real dropped answer is a SINGLE substantive block —
+  // NOT concatenated inter-tool narration ("Let me check…", "Still querying…")
+  // that only crosses the floor once joined. The old code joined ALL post-
+  // delivery text blocks and surfaced the join whenever the COMBINED length
+  // hit the floor, so a run of short narration masqueraded as a final answer
+  // (and in the zero-delivery case that join was every text block in the
+  // turn). Instead, deliver only the LAST block that CLEARS the substance
+  // floor ON ITS OWN. This mirrors the block decision itself
+  // (`sawUndeliveredTextAfterAllow`, which requires a single ≥floor block) and
+  // handles the "big answer then short closer" shape by delivering the answer,
+  // not the closer. When no single block clears the floor, `pendingText` stays
+  // undefined and the gateway falls through to the re-prompt / represent nets.
+  const substantiveBlocks = undeliveredSlice.filter(
+    (b) =>
+      b.kind === 'text' &&
+      typeof b.text === 'string' &&
+      (b.chars ?? 0) >= FINAL_ANSWER_MIN_CHARS,
+  )
+  const pendingText =
+    substantiveBlocks.length > 0
+      ? substantiveBlocks[substantiveBlocks.length - 1].text
+      : undefined
 
   if (lastAllowBlockIdx === -1) {
     // No qualifying delivery/silence event anywhere in the turn.
@@ -354,7 +444,7 @@ export function scanTurnForFinalReply(jsonl) {
     if (envelope.source === 'cron') {
       return { decided: 'allow', reason: 'cron-source' }
     }
-    return buildBlockResult(envelope, 'no-final-reply')
+    return buildBlockResult(envelope, 'no-final-reply', pendingText)
   }
 
   if (sawUndeliveredTextAfterAllow) {
@@ -363,7 +453,7 @@ export function scanTurnForFinalReply(jsonl) {
     // sent through a delivery tool. This is the "at least once" bug:
     // an early ack (or any qualifying reply) must not amnesty
     // everything written afterward.
-    return buildBlockResult(envelope, 'trailing-text-after-reply')
+    return buildBlockResult(envelope, 'trailing-text-after-reply', pendingText)
   }
 
   return { decided: 'allow', reason: lastAllowReason }

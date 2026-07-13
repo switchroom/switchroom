@@ -137,6 +137,62 @@ describe('scanTurnForFinalReply — final-reply detection', () => {
     expect(r.reason).toBe('no-final-reply')
   })
 
+  it('Option A: block result carries pendingText = the undelivered answer prose (#3227)', () => {
+    // The transcript-prose bridge: a turn that ends with a substantive answer
+    // written as plain text (no reply tool) must surface that prose so the
+    // gateway can deliver it directly on the first silent-end.
+    const answer = 'That was actually your FY25 NOA, not Bloomfield. ' + 'A'.repeat(2200)
+    const text = jsonl(
+      ENQUEUE,
+      assistantToolUse('mcp__switchroom-telegram__reply', {
+        text: "On it — checking…",
+        disable_notification: true,
+      }),
+      assistantToolUse('Bash', { command: 'ls' }),
+      assistantText(answer),
+    )
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('block')
+    expect(r.reason).toBe('no-final-reply')
+    expect(r.pendingText).toBe(answer)
+  })
+
+  it('Option A: zero-outbound turn with a long plain-text answer → pendingText set', () => {
+    const answer = 'Here is the whole answer the model forgot to send. ' + 'Z'.repeat(400)
+    const text = jsonl(ENQUEUE, assistantText(answer))
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('block')
+    expect(r.reason).toBe('no-final-reply')
+    expect(r.pendingText).toBe(answer)
+  })
+
+  it('Option A: trailing-text-after-reply block carries only the trailing prose (#3227)', () => {
+    const trailing = 'The real verdict the model wrote but never re-sent. ' + 'T'.repeat(400)
+    const text = jsonl(
+      ENQUEUE,
+      assistantText('some narration before the delivered answer'),
+      assistantToolUse('mcp__switchroom-telegram__reply', {
+        text: 'delivered answer, notification-bearing',
+        disable_notification: false,
+      }),
+      assistantText(trailing),
+    )
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('block')
+    expect(r.reason).toBe('trailing-text-after-reply')
+    // Only the prose AFTER the last delivery event — not the pre-reply narration.
+    expect(r.pendingText).toBe(trailing)
+  })
+
+  it('Option A: a SHORT trailing/only fragment does NOT set pendingText (substance floor)', () => {
+    // A genuinely empty-ish turn: a short plain-text closer under the 200-char
+    // floor must not be re-delivered as if it were the answer.
+    const text = jsonl(ENQUEUE, assistantText('ok done, let me know if you need anything else'))
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('block')
+    expect(r.pendingText).toBeUndefined()
+  })
+
   it('notification-bearing reply → allow', () => {
     const text = jsonl(
       ENQUEUE,
@@ -319,6 +375,144 @@ it('early qualifying reply + trailing SUBSTANTIVE undelivered text (≥ floor) �
     const r = scanTurnForFinalReply(text)
     expect(r.decided).toBe('block')
     expect(r.reason).toBe('trailing-text-after-reply')
+  })
+})
+
+// ── Finding 2 (#3228): concatenated inter-tool narration must NOT masquerade
+//    as a final answer via the joined-prose floor ───────────────────────────
+
+describe('scanTurnForFinalReply — pendingText is a single substantive block, not joined narration (#3228 Finding 2)', () => {
+  // Each narration block is well under FINAL_ANSWER_MIN_CHARS (200) on its own.
+  // Pre-fix the scan JOINED every post-delivery text block and surfaced the
+  // join whenever the COMBINED length hit the floor — so a run of short
+  // "Let me check…" / "Still querying…" narration crossed 200 and was delivered
+  // as if it were the answer. Post-fix only a single block that clears the floor
+  // ON ITS OWN becomes pendingText.
+  const NARRATION_A = 'Let me check the first data source now — pulling the records and scanning for the relevant rows.' // ~95
+  const NARRATION_B = 'Still querying; the second source is slower than expected, so hang tight while it finishes loading.' // ~98
+  const NARRATION_C = 'Almost there, cross-referencing the last set of figures against the ledger before I summarise it.' // ~96
+
+  it('zero-delivery turn of only short narration blocks → block WITHOUT pendingText (fails on the old joined-floor code)', () => {
+    // Combined length of the three blocks is ≥ 200, so the OLD code would join
+    // them and set pendingText (masquerade). The NEW code sets nothing because
+    // no single block clears the floor.
+    expect((NARRATION_A + '\n\n' + NARRATION_B + '\n\n' + NARRATION_C).length)
+      .toBeGreaterThanOrEqual(200)
+    const text = jsonl(
+      ENQUEUE,
+      assistantText(NARRATION_A),
+      assistantToolUse('Bash', { command: 'ls' }),
+      assistantText(NARRATION_B),
+      assistantToolUse('Read', { file_path: '/tmp/x' }),
+      assistantText(NARRATION_C),
+    )
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('block')
+    expect(r.reason).toBe('no-final-reply')
+    // The masquerade must NOT happen — no answer to deliver, take the re-prompt.
+    expect(r.pendingText).toBeUndefined()
+  })
+
+  it('trailing narration after a delivered reply, all sub-floor → block only if a real ≥floor block exists; here → allow, no pendingText', () => {
+    // Each trailing block is sub-floor, so `sawUndeliveredTextAfterAllow` is
+    // false → allow. (The old joined-floor logic never affected the block
+    // decision here, only pendingText; this pins the two stay consistent.)
+    const text = jsonl(
+      ENQUEUE,
+      assistantToolUse('mcp__switchroom-telegram__reply', { text: 'ok', disable_notification: false }),
+      assistantText(NARRATION_A),
+      assistantText(NARRATION_B),
+    )
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('allow')
+    expect(r.pendingText).toBeUndefined()
+  })
+
+  it('a genuine ≥floor answer followed by a SHORT closer → pendingText is the answer, not the closer', () => {
+    // "big answer then short closer" — the LAST substantive (≥floor) block is
+    // the answer; the trailing short closer must not displace it.
+    const answer = 'Here is the real answer you were waiting for: ' + 'A'.repeat(300)
+    const text = jsonl(
+      ENQUEUE,
+      assistantText(answer),
+      assistantText('Let me know if you need anything else.'),
+    )
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('block')
+    expect(r.pendingText).toBe(answer)
+  })
+
+  it('substance-floor boundary: a single trailing block at 199/200/201 chars', () => {
+    const at = (n: number) => {
+      const text = jsonl(ENQUEUE, assistantText('X'.repeat(n)))
+      return scanTurnForFinalReply(text)
+    }
+    // 199 → under floor, no pendingText (block still fires for the zero-delivery
+    // turn, but there is nothing substantive to deliver).
+    expect(at(199).pendingText).toBeUndefined()
+    // 200 → exactly the floor, delivered.
+    expect(at(200).pendingText).toBe('X'.repeat(200))
+    // 201 → over floor, delivered.
+    expect(at(201).pendingText).toBe('X'.repeat(201))
+  })
+})
+
+// ── Finding 3 (#3228): the block result carries a per-turn nonce (turnId) ────
+
+describe('scanTurnForFinalReply — per-turn nonce in block result (#3228 Finding 3)', () => {
+  it('block carries turnId = ${chatKey}#${messageId} derived from the enqueue envelope', () => {
+    const enq = JSON.stringify({
+      type: 'queue-operation',
+      operation: 'enqueue',
+      content: '<channel source="switchroom-telegram" chat_id="abc" message_thread_id="42" message_id="9">hi</channel>',
+    })
+    const text = jsonl(
+      enq,
+      assistantToolUse('mcp__switchroom-telegram__reply', { text: 'ack', disable_notification: true }),
+    )
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('block')
+    expect(r.turnKey).toBe('abc:42')
+    // Matches gateway deriveTurnId: `${chatKey(chatId, threadId)}#${messageId}`.
+    expect(r.turnId).toBe('abc:42#9')
+  })
+
+  it("DM (no thread) still derives the turnId with the '_' sentinel", () => {
+    // ENQUEUE has chat_id="111" message_id="42", no thread.
+    const text = jsonl(
+      ENQUEUE,
+      assistantToolUse('mcp__switchroom-telegram__reply', { text: 'ack', disable_notification: true }),
+    )
+    const r = scanTurnForFinalReply(text)
+    expect(r.turnKey).toBe('111:_')
+    expect(r.turnId).toBe('111:_#42')
+  })
+
+  it('no derivable message_id → turnId omitted (gateway falls back to turnKey match)', () => {
+    const enq = JSON.stringify({
+      type: 'queue-operation',
+      operation: 'enqueue',
+      content: '<channel source="subagent_handback" chat_id="c7">work is done</channel>',
+    })
+    const text = jsonl(enq, assistantText('a plain-text answer never sent ' + 'Q'.repeat(300)))
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('block')
+    expect(r.turnKey).toBe('c7:_')
+    expect(r.turnId).toBeUndefined()
+  })
+
+  it('a same-suffix sibling attribute (target_message_id) does NOT leak into turnId', () => {
+    // Left-anchored match: `target_message_id` must not be mistaken for the
+    // real `message_id`. Envelope carries the sibling FIRST to prove ordering
+    // does not confuse the parser.
+    const enq = JSON.stringify({
+      type: 'queue-operation',
+      operation: 'enqueue',
+      content: '<channel source="reaction" target_message_id="777" chat_id="c" message_id="5">x</channel>',
+    })
+    const text = jsonl(enq, assistantToolUse('mcp__switchroom-telegram__reply', { text: 'ack', disable_notification: true }))
+    const r = scanTurnForFinalReply(text)
+    expect(r.turnId).toBe('c:_#5')
   })
 })
 

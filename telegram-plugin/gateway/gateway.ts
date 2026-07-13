@@ -237,7 +237,7 @@ import { decideSilentReplyAnchor } from '../silent-reply-anchor.js'
 import { classifyInbound } from '../inbound-classifier.js'
 import * as silencePoke from '../silence-poke.js'
 import * as pendingProgress from '../pending-work-progress.js'
-import { writeSilentEndState, clearSilentEndState, recordUndeliveredTurnEnd, silentEndFallbackText, type SilentEndDeps } from '../silent-end.js'
+import { writeSilentEndState, clearSilentEndState, recordUndeliveredTurnEnd, silentEndFallbackText, decideCapturedProseDelivery, settleCapturedProseDelivery, CAPTURED_PROSE_MIN_CHARS, type SilentEndDeps, type CapturedProseSendOutcome } from '../silent-end.js'
 import { isFinalAnswerReply, isSubstantiveFinalReply, FINAL_ANSWER_MIN_CHARS } from '../final-answer-detect.js'
 import { deriveTurnRole, decideTerminalReason, parsePostAnswerLivenessMs, evaluatePostAnswerLiveness, type LoopRole } from '../turn-liveness-floor.js'
 import { createAnswerStream, type AnswerStreamHandle } from '../answer-stream.js'
@@ -9279,6 +9279,17 @@ const SILENCE_FLOOR_MS = parsePositiveMsEnv('SWITCHROOM_SILENCE_FLOOR_MS', 45_00
 // #2527 — role-aware terminal reaction honesty (the "thumbs-up false done"
 // fix). Default ON; SWITCHROOM_TG_TERMINAL_HONESTY=0 reverts to always-👍.
 const LIVENESS_TERMINAL_HONESTY = process.env.SWITCHROOM_TG_TERMINAL_HONESTY !== '0'
+// Option A transcript-prose delivery bridge. When a user turn ends without a
+// final answer, the Stop hook scans transcript_path and — if it isolated a
+// substantive answer the model wrote as plain text but never sent through the
+// reply tool — persists it in silent-end-pending.json as `pendingText`. On the
+// FIRST silent-end the gateway reads it back and delivers it directly via the
+// normal send path, instead of relying on the (unreliable) Stop-hook re-prompt
+// or waiting ~2-5 min for the obligation represent to recover it. Default ON;
+// SWITCHROOM_TG_CAPTURED_PROSE_DELIVERY=0 reverts to the pre-bridge behaviour
+// (re-prompt + represent only).
+const CAPTURED_PROSE_DELIVERY_ENABLED =
+  process.env.SWITCHROOM_TG_CAPTURED_PROSE_DELIVERY !== '0'
 // SILENCE_DEFER_INFLIGHT_TOOLS: previously an opt-in (=1). The new
 // isLegitimatelyWorking callback supersedes this — defer is now the DEFAULT
 // when the callback is wired. The legacy flag is kept so `=0` still lets
@@ -10091,6 +10102,250 @@ function agentHasInFlightBackgroundWork(now: number): boolean {
 // Throttle for the background-work defer diagnostic (the 5s sweep would otherwise
 // log every tick across a multi-minute research window).
 let lastBgWorkDeferLogMs = 0
+/**
+ * Option A transcript-prose delivery. Deliver the model's real final answer —
+ * isolated by the Stop hook's transcript scan and persisted as `pendingText`
+ * — directly via the normal send path on the first silent-end, then settle the
+ * bookkeeping so neither the obligation represent nor the exhausted fallback
+ * re-fires for the same answer.
+ *
+ * Double-send guard — content + turnKey dedup, NOT unconditional (Finding 4,
+ * #3228: the earlier "airtight by construction" claim overstated it):
+ *  - Before sending, `outboundDedup.check` is consulted. If the EXACT same
+ *    content already went out under the SAME `registryKey` (a prior turn_end
+ *    delivered it, or the re-prompted model's own reply landed), we SKIP the
+ *    send and only settle bookkeeping.
+ *  - After a successful send, `outboundDedup.record` is written so a late
+ *    reply-tool retry with the same content is suppressed at its send site
+ *    (executeReply / executeStreamReply already consult the same cache).
+ *  - The obligation is CLOSED and the silent-end state CLEARED, so
+ *    obligationSweep's "outbound delivered since open" guard and the represent
+ *    never re-fire for this origin.
+ *
+ * Divergence boundary (honest scope): the dedup key is
+ * `(chat, thread, normalized-content, registryKey)`. It suppresses the common
+ * double-send — the SAME answer re-sent within the TTL under the same
+ * registryKey. It does NOT catch a re-present that lands under a DIFFERENT
+ * registryKey with REWORDED content (different hash AND different key → the
+ * cross-turn carve-out in recent-outbound-dedup.ts:150-156 treats two non-null
+ * differing turnKeys as a miss): that is a genuinely different outbound and is
+ * out of scope for content-hash dedup. The obligation close + state clear are
+ * what make captured-prose and the represent mutually exclusive for the
+ * common case; the content dedup is a second, best-effort layer.
+ *
+ * Failure posture (Finding 1 + exhaustion-boundary gap, #3228): if the send
+ * throws, the catch below arms the deterministic Stop-hook re-prompt via
+ * recordUndeliveredTurnEnd (the shared teardown may have already closed the
+ * obligation when replyCalled was true, so "leaving the obligation open" is NOT
+ * a sufficient net on its own). Two sub-cases, honored via the `{exhausted}`
+ * verdict threaded out of settleCapturedProseDelivery:
+ *  - budget REMAINING (`exhausted:false`) → the silent-end state is (re)written
+ *    and the Stop-hook re-prompt will recover the answer; nothing else to do.
+ *  - budget SPENT (`exhausted:true`) → recordUndeliveredTurnEnd has CLEARED the
+ *    state (the re-prompt can no longer fire), and the obligation was already
+ *    closed by the interim-ack teardown, so the user would get NEITHER the
+ *    answer NOR the apology. We therefore deliver a user-facing fallback: first
+ *    retry the captured prose as PLAIN TEXT (a non-rich send often survives the
+ *    markdown/parse error a rich send rejected — the user gets the real
+ *    answer), and only if THAT also fails post the generic silentEndFallbackText
+ *    apology. This mirrors the non-captured exhausted path (silent-end.ts /
+ *    gateway turn_end #1161) so the captured path is never worse than main.
+ */
+async function deliverCapturedProse(args: {
+  chatId: string
+  threadId: number | undefined
+  statusKeyStr: string
+  registryKey: string | null
+  originTurnId: string
+  text: string
+  /** Turn elapsed for the honest "(waited Ns)" apology clause; optional. */
+  turnDurationMs?: number
+}): Promise<void> {
+  const { chatId, threadId, statusKeyStr, registryKey, originTurnId, text, turnDurationMs } = args
+  const now = Date.now()
+  // #3228 Finding 1 — the three settlement points (sent / skipped-dedup /
+  // failed) all funnel through the pure `settleCapturedProseDelivery` core so
+  // the failure posture is deterministic and unit-tested. `outcome` is set on
+  // each branch and applied ONCE at the bottom.
+  let outcome: CapturedProseSendOutcome
+  const already = outboundDedup.check(chatId, threadId, text, now, registryKey)
+  if (already == null) {
+    let out = normalizeParagraphBreaks(repairEscapedWhitespace(text))
+    out = redactOutboundText(out, 'captured_prose')
+    const chunks = splitMarkdownChunks(out, RICH_MESSAGE_MAX_CHARS)
+    const sentIds: number[] = []
+    try {
+      let liveThreadId: number | undefined = threadId
+      for (const c of chunks) {
+        const sent = await retryWithThreadFallback(
+          robustApiCall,
+          (tid) => {
+            // Built as a variable (not an inline literal) so excess-property
+            // checks don't reject `link_preview_options` on sendRichMessage's
+            // narrow Other<> type — mirrors the turn-flush send site.
+            const opts = {
+              link_preview_options: { is_disabled: true },
+              ...(tid != null ? { message_thread_id: tid } : {}),
+            }
+            return bot.api.sendRichMessage(chatId, richMessage(c), opts)
+          },
+          { threadId: liveThreadId, chat_id: chatId, verb: 'captured-prose.sendMessage' },
+        )
+        if (liveThreadId != null && (sent as { message_thread_id?: number }).message_thread_id == null) {
+          liveThreadId = undefined
+        }
+        sentIds.push(sent.message_id)
+      }
+      if (HISTORY_ENABLED && sentIds.length > 0) {
+        try {
+          recordOutbound({
+            chat_id: chatId,
+            thread_id: threadId ?? null,
+            message_ids: sentIds,
+            texts: chunks,
+          })
+        } catch {}
+      }
+      // Record what we just sent so a late reply / stream_reply retry with the
+      // same content is deduped at its send site (the #546 dedup cache).
+      outboundDedup.record(chatId, threadId, text, now, registryKey)
+      process.stderr.write(
+        `telegram gateway: captured-prose delivery — sent ${out.length} chars recovered from ` +
+          `transcript scan (chat=${chatId} origin=${originTurnId})\n`,
+      )
+      outcome = 'sent'
+    } catch (err) {
+      // #3228 Finding 1 — the send threw, so the answer did NOT reach the user.
+      // The `failed` outcome routes to `settleCapturedProseDelivery`'s recovery
+      // path (recordUndelivered), NOT the close/clear path. This is load-bearing:
+      // the shared turn-end teardown (endCurrentTurnAtomic →
+      // decideObligationTurnEnd) already closes the obligation whenever
+      // `replyCalled === true` — exactly the interim-ack case that routes here —
+      // so "leaving the obligation open" is not a real net. Arming the Stop-hook
+      // re-prompt makes the failed send recoverable instead of silently lost.
+      process.stderr.write(
+        `telegram gateway: captured-prose delivery failed: ${(err as Error).message} — ` +
+          `arming the silent-end re-prompt net (recordUndeliveredTurnEnd) so the ` +
+          `answer is recoverable (chat=${chatId} origin=${originTurnId})\n`,
+      )
+      outcome = 'failed'
+    }
+  } else {
+    process.stderr.write(
+      `telegram gateway: captured-prose delivery skipped — this answer already went out ` +
+        `(dedup age=${already.ageMs}ms chat=${chatId} origin=${originTurnId}); settling bookkeeping\n`,
+    )
+    outcome = 'skipped-dedup'
+  }
+  // Apply the settlement bookkeeping through the pure core (#3228 Finding 1):
+  //   sent / skipped-dedup → close obligation + clear state (answer is with the
+  //                          user, so represent + exhausted fallback must not fire)
+  //   failed               → arm the Stop-hook re-prompt net (recordUndelivered),
+  //                          do NOT close/clear.
+  const settlement = settleCapturedProseDelivery(outcome, {
+    closeObligation: () => {
+      if (OBLIGATION_LEDGER_ENABLED) {
+        try { obligationLedger.close(originTurnId) } catch {}
+      }
+    },
+    clearState: () => clearSilentEndState(statusKeyStr),
+    recordUndelivered: () => {
+      try {
+        const silentEndDeps: SilentEndDeps | undefined = HISTORY_ENABLED
+          ? {
+              hasOutboundDeliveredSince: (cid, sinceMs, tid) =>
+                hasOutboundDeliveredSince(cid, sinceMs, tid, 1),
+            }
+          : undefined
+        return recordUndeliveredTurnEnd(
+          { chatId, threadId: threadId ?? null, turnKey: statusKeyStr },
+          silentEndDeps,
+        )
+      } catch (netErr) {
+        process.stderr.write(
+          `telegram gateway: captured-prose recovery-net arm failed: ${
+            (netErr as Error).message
+          } (chat=${chatId} origin=${originTurnId})\n`,
+        )
+        // Could not even record the undelivered turn — do NOT claim exhaustion
+        // (firing a fallback we can't justify). Fail safe: leave recovery to
+        // the obligation represent / next Stop hook.
+        return { exhausted: false }
+      }
+    },
+  })
+
+  // Exhaustion-boundary gap (#3228): the send FAILED on the attempt where the
+  // Stop-hook re-prompt budget was already spent, so recordUndeliveredTurnEnd
+  // cleared the state and the re-prompt can no longer recover the answer — and
+  // the obligation was already closed by the interim-ack teardown. Without this
+  // the user gets NEITHER the answer NOR the apology. Deliver a user-facing
+  // fallback, preferring the REAL answer as plain text (a non-rich send often
+  // survives the markdown/parse error the rich send threw on) before the
+  // generic apology.
+  if (outcome === 'failed' && settlement.exhausted) {
+    process.stderr.write(
+      `telegram gateway: WARN captured-prose exhausted-boundary fallback — rich send ` +
+        `failed with the re-prompt budget already spent; attempting a plain-text ` +
+        `delivery of the recovered answer before the generic apology ` +
+        `(chat=${chatId} origin=${originTurnId})\n`,
+    )
+    const plain = redactOutboundText(text, 'captured_prose')
+    const plainChunks = splitMarkdownChunks(plain, RICH_MESSAGE_MAX_CHARS)
+    try {
+      let liveThreadId: number | undefined = threadId
+      for (const c of plainChunks) {
+        // Plain sendMessage — NO parse_mode / rich rendering — so a markdown
+        // construct that made sendRichMessage 400 is sent verbatim instead.
+        const sent = await retryWithThreadFallback(
+          robustApiCall,
+          (tid) =>
+            bot.api.sendMessage(
+              chatId,
+              c,
+              tid != null ? { message_thread_id: tid } : {},
+            ),
+          { threadId: liveThreadId, chat_id: chatId, verb: 'captured-prose-plain-fallback.sendMessage' },
+        )
+        if (liveThreadId != null && (sent as { message_thread_id?: number }).message_thread_id == null) {
+          liveThreadId = undefined
+        }
+      }
+      // The real answer reached the user via plain text — record it so a late
+      // reply-tool retry with the same content is deduped at its send site.
+      outboundDedup.record(chatId, threadId, text, Date.now(), registryKey)
+      process.stderr.write(
+        `telegram gateway: captured-prose recovered via plain-text fallback ` +
+          `(chat=${chatId} origin=${originTurnId})\n`,
+      )
+    } catch (plainErr) {
+      // Plain text ALSO failed — post the generic apology so the turn is never
+      // silent (mirrors the non-captured exhausted path, gateway turn_end #1161).
+      process.stderr.write(
+        `telegram gateway: captured-prose plain-text fallback ALSO failed: ${
+          (plainErr as Error).message
+        } — posting the generic silent-end apology (chat=${chatId} origin=${originTurnId})\n`,
+      )
+      void retryWithThreadFallback(
+        robustApiCall,
+        (tid) =>
+          bot.api.sendMessage(
+            chatId,
+            silentEndFallbackText(turnDurationMs),
+            tid != null ? { message_thread_id: tid } : {},
+          ),
+        { threadId, chat_id: chatId, verb: 'captured-prose-apology-fallback.sendMessage' },
+      ).catch((err) => {
+        process.stderr.write(
+          `telegram gateway: captured-prose apology fallback send failed: ${
+            err instanceof Error ? err.message : String(err)
+          }\n`,
+        )
+      })
+    }
+  }
+}
+
 function obligationSweep(): void {
   if (!OBLIGATION_LEDGER_ENABLED) return
   if (!obligationLedger.hasOpen()) return
@@ -18156,6 +18411,65 @@ function handleSessionEvent(ev: SessionEvent): void {
         // is exactly `turn.finalAnswerDelivered === false` here (silent-marker
         // and flush both returned earlier), delegated to the pure gate core.
         if (turnEndDecision === 'reprompt') {
+          // Option A transcript-prose bridge (#3227). Before falling through to
+          // the re-prompt / represent safety nets, check whether the Stop hook
+          // already isolated this turn's real answer from the transcript and
+          // persisted it in silent-end-pending.json (`pendingText`). That file
+          // lands BEFORE this turn_end handler runs (the hook fires upstream of
+          // the gateway's own state write — see silent-end-interrupt-stop.mjs).
+          // If a substantive answer is waiting, deliver it directly via the
+          // normal send path NOW, instead of leaning on the (unreliable)
+          // Stop-hook re-prompt or waiting ~2-5 min for the obligation
+          // represent. The delivery closes the obligation + records dedup, so
+          // the represent and a late reply-tool retry are both suppressed —
+          // captured-prose delivery and represent are mutually exclusive.
+          const proseDecision = CAPTURED_PROSE_DELIVERY_ENABLED
+            ? decideCapturedProseDelivery({
+                turnKey: tKey,
+                // Per-turn nonce (#3228 Finding 3) — the persisted record must
+                // belong to THIS turn, not a stale carryover from a prior turn
+                // on the same chat/thread (tKey is not per-turn unique).
+                turnId: turn.turnId,
+                minChars: CAPTURED_PROSE_MIN_CHARS,
+              })
+            : { deliver: false as const, reason: 'no-state' as const }
+          if (proseDecision.deliver && proseDecision.text != null) {
+            // Deliver the recovered answer directly. This runs async and owns
+            // its own bookkeeping — on success it closes the obligation +
+            // records dedup + clears the silent-end state; on send FAILURE it
+            // arms the recovery net itself (see below) instead of leaving the
+            // answer lost.
+            //
+            // We DELIBERATELY skip recordUndeliveredTurnEnd on the HAPPY path
+            // here: re-arming the Stop-hook re-prompt for an answer that just
+            // went out is exactly what this bridge exists to avoid.
+            //
+            // #3228 Finding 1 — the send-failure net can NOT rely on the shared
+            // turn-end teardown "leaving the obligation open". That teardown
+            // (endCurrentTurnAtomic → decideObligationTurnEnd) closes the
+            // obligation whenever `replyCalled === true`, which is EXACTLY the
+            // interim-ack case that reaches this branch. So a thrown send would
+            // otherwise leave the answer permanently lost (obligation already
+            // closed by teardown, recordUndeliveredTurnEnd skipped). The real
+            // net lives INSIDE deliverCapturedProse's catch: it calls
+            // recordUndeliveredTurnEnd, arming the deterministic Stop-hook
+            // re-prompt (parity with the non-captured path below).
+            process.stderr.write(
+              `telegram gateway: captured-prose delivery engaged on first silent-end ` +
+                `chat=${chatId} turnKey=${tKey} (#3227)\n`,
+            )
+            void deliverCapturedProse({
+              chatId,
+              threadId,
+              statusKeyStr: tKey,
+              registryKey: turn.registryKey ?? null,
+              originTurnId: turn.turnId,
+              text: proseDecision.text,
+              // For the honest "(waited Ns)" clause if the exhaustion-boundary
+              // apology fallback fires (#3228).
+              turnDurationMs,
+            })
+          } else {
           // PR #2892 (deterministic-turn-liveness RFC Phase 2) hardening:
           // wire the represent-guard-style staleness
           // check (`recordSilentTurnEnd`'s `hasOutboundDeliveredSince` dep) so
@@ -18201,6 +18515,7 @@ function handleSessionEvent(ev: SessionEvent): void {
               )
             })
           }
+          } // end else (no captured-prose to deliver)
         }
         signalTracker.clear(tKey)
         silencePoke.endTurn(tKey)

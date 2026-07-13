@@ -172,6 +172,29 @@ function main() {
     if (decision.threadId != null) {
       nextState.threadId = decision.threadId
     }
+    // Per-turn nonce (Finding 3, #3228). The gateway requires this to match
+    // the live turn's `turnId` before delivering `pendingText`, so a stale
+    // record left over from a prior turn on the same chat/thread can never
+    // deliver a previous turn's answer on a later one. Explicitly drop a
+    // carried-over `turnId` from the spread `...state` when THIS turn has no
+    // derivable nonce, so an old value never lingers.
+    if (decision.turnId) nextState.turnId = decision.turnId
+    else delete nextState.turnId
+  } else {
+    delete nextState.turnId
+  }
+  // Option A transcript-prose bridge: when the scan isolated a substantive
+  // final answer the model wrote as plain text but never sent through the
+  // reply tool, persist it so the gateway's turn-end path can deliver it
+  // directly on the first silent-end (instead of relying on this hook's
+  // re-prompt / the obligation represent to eventually recover it). The
+  // gateway reads this field back out of the same state file. Explicitly
+  // clear a stale carryover value from a prior turn's spread `...state` when
+  // THIS turn has no deliverable prose, so an old answer is never re-sent.
+  if (typeof decision.pendingText === 'string' && decision.pendingText.length > 0) {
+    nextState.pendingText = decision.pendingText
+  } else {
+    delete nextState.pendingText
   }
   try {
     writeFileSync(statePath, JSON.stringify(nextState), 'utf8')
