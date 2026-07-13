@@ -34,7 +34,6 @@ import {
 } from './model-unavailable.js'
 import { classify429Detail } from './throttle-tier.js'
 import { classifyClaudeError } from './operator-events.js'
-import type { InlineKeyboardMarkup } from './operator-events.js'
 import { stripRawErrorBytes, extractRequestId } from './raw-error-scrub.js'
 import { fmtLocalClock, tzAbbrev } from './shared/local-time.js'
 
@@ -226,7 +225,6 @@ function buildCoreText(kind: LlmErrorKind, source: LlmErrorSource): string {
 
 export interface RenderedLlmError {
   text: string
-  keyboard?: InlineKeyboardMarkup
 }
 
 /**
@@ -257,9 +255,49 @@ function formatRelativeTail(deltaMs: number): string {
 }
 
 /**
- * Render ONE clean card for a parsed LLM error. Action buttons for the
- * actionable kinds (auth → Reauth, quota_wall → Wait/switch). `agent` is used
- * in the callback_data (URL-encoded) and the headline; `tz` localizes the reset.
+ * A short local-tz clock+abbrev for a reset instant (`4:52pm AEST`), or '' when
+ * there is no finite reset to name. Used to embed the reset in the recommendation
+ * line. Shares the same tz-formatting primitives as {@link formatResetLocal}, so
+ * an invalid IANA tz throws here too (guarded by {@link renderLlmErrorSafe}).
+ */
+function formatResetClock(resetAt: Date | undefined, tz: string): string {
+  if (resetAt == null) return ''
+  const ms = resetAt.getTime()
+  if (!Number.isFinite(ms)) return ''
+  return `${fmtLocalClock(ms, tz)} ${tzAbbrev(ms, tz)}`
+}
+
+/**
+ * The plain-text "what to DO" line for the actionable error classes. Replaces
+ * the former dead action buttons (auth → Reauth, quota_wall → Wait): those
+ * inline_keyboard callbacks were only ever exercised in tests — the gateway
+ * wiring routes renderLlmError solely for the transient rate_limit/overload_529
+ * kinds, so the auth/quota buttons were unreachable in production (Ken, CPO,
+ * 2026-07: drop the buttons, recommend in text). Transient kinds return undefined
+ * — their coreText already says "retrying automatically", no operator action.
+ */
+function buildRecommendation(parsed: ParsedLlmError, tz: string): string | undefined {
+  switch (parsed.kind) {
+    case 'auth':
+      return '→ Re-authenticate this account to continue.'
+    case 'quota_wall': {
+      const reset = formatResetClock(parsed.resetAt, tz)
+      return reset
+        ? `→ Switch to another account, or wait for the quota to reset at ${reset}.`
+        : '→ Switch to another account, or wait for the quota to reset.'
+    }
+    default:
+      return undefined
+  }
+}
+
+/**
+ * Render ONE clean card for a parsed LLM error. No action buttons — the
+ * actionable kinds (auth, quota_wall) carry a plain-text recommendation line
+ * instead (see {@link buildRecommendation}). `agent` is the headline label; `tz`
+ * localizes the reset. Throws if `tz` is an invalid IANA zone AND a reset is
+ * present (Intl.DateTimeFormat rejects the zone at construction) — call
+ * {@link renderLlmErrorSafe} from any crash-sensitive surface.
  */
 export function renderLlmError(
   parsed: ParsedLlmError,
@@ -276,32 +314,32 @@ export function renderLlmError(
 
   if (parsed.model) lines.push(`_model: ${escapeAgent(parsed.model)}_`)
 
-  const text = lines.join('\n')
+  const recommendation = buildRecommendation(parsed, tz)
+  if (recommendation) lines.push(recommendation)
 
-  switch (parsed.kind) {
-    case 'auth':
-      return {
-        text,
-        keyboard: {
-          inline_keyboard: [
-            [
-              { text: '🔐 Reauth now', callback_data: `op:reauth:${encodeURIComponent(agent)}` },
-              { text: '❌ Dismiss', callback_data: `op:dismiss:${encodeURIComponent(agent)}` },
-            ],
-          ],
-        },
-      }
-    case 'quota_wall':
-      return {
-        text,
-        keyboard: {
-          inline_keyboard: [
-            [{ text: '⏳ Wait', callback_data: `op:dismiss:${encodeURIComponent(agent)}` }],
-          ],
-        },
-      }
-    default:
-      return { text }
+  return { text: lines.join('\n') }
+}
+
+/**
+ * Crash-guarded wrapper around {@link renderLlmError}. An invalid IANA timezone
+ * makes Intl.DateTimeFormat throw a RangeError at construction time — the
+ * local-time.ts "never throws" contract does NOT cover construction-time zone
+ * validation, so a bad `SWITCHROOM_TIMEZONE`/`TZ` would otherwise crash the
+ * operator-event turn. On ANY formatting failure, degrade to a minimal, tz-free
+ * safe line built only from the JSON-stripped coreText + agent. Total — never
+ * throws.
+ */
+export function renderLlmErrorSafe(
+  parsed: ParsedLlmError,
+  agent: string,
+  tz: string,
+  now: Date = new Date(),
+): RenderedLlmError {
+  try {
+    return renderLlmError(parsed, agent, tz, now)
+  } catch {
+    const safeAgent = escapeAgent(agent)
+    return { text: `${kindEmoji(parsed.kind)} ${parsed.coreText} (**${safeAgent}**)` }
   }
 }
 
