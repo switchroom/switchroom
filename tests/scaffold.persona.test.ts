@@ -150,7 +150,32 @@ describe("scaffoldAgent — persona (Phase 2)", () => {
     // clarify vs proceed, design-align, pipeline, communication) —
     // always-loaded summary pointing at the bundled `dev-protocol`
     // skill for the long-form playbook.
-    expect(claudeMd.length).toBeLessThan(37500);
+    // RAISED 37500 → 40000 for the unconditional delegation-golden-rule
+    // tail fragment (#3231 / PR #3232, ~1.2KB): restores tail-of-prompt
+    // recency for the "when in doubt, delegate" signal. At the prior 37500
+    // ceiling the WORST-CASE stack (root-tier + default profile) sat at
+    // ~37464B — effectively zero headroom — so this load-bearing fragment
+    // tipped that stack to ~38.7KB and breached the ceiling. Bumped to
+    // 40000 to restore ~1.3KB of real headroom for the worst case (see the
+    // worst-case ceiling test below, which is what surfaces this).
+    expect(claudeMd.length).toBeLessThan(40000);
+  });
+
+  it("worst-case stack (root-tier + default profile) stays under the byte ceiling", () => {
+    // L2 (review PR #3232): the slim-CLAUDE.md ceiling test above exercises a
+    // SMALL profile (health-coach, ~23.5KB), leaving real headroom against the
+    // ceiling untested. The actual worst case is a root-tier agent on the
+    // DEFAULT profile (~38.7KB — the full admin surface PLUS the root-tier
+    // host-access block on top of the largest profile body), which sits closest
+    // to the ceiling. Guard headroom where it actually matters: a future
+    // fragment that overflows the ceiling for the worst-case stack must fail
+    // here even though the health-coach test would still pass. This test is
+    // what surfaced that PR #3232's delegation fragment breached the old 37500
+    // ceiling for this stack (37464 → 38658), prompting the bump to 40000.
+    const config = makeAgentConfig({ root: true } as Partial<AgentConfig>);
+    const result = scaffoldAgent("overlord", config, tmpDir, telegramConfig);
+    const claudeMd = readFileSync(join(result.agentDir, "CLAUDE.md"), "utf-8");
+    expect(claudeMd.length).toBeLessThan(40000);
   });
 
   it("root: true renders the root-tier host-access block + the admin surface", () => {

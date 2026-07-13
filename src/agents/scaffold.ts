@@ -617,6 +617,7 @@ import {
   renderAgentSelfServiceFragment,
   renderExecutionDisciplineFragment,
   renderDevProtocolFragment,
+  renderDelegationGoldenRuleFragment,
   renderReplyDisciplineFragment,
 } from "./profiles.js";
 import {
@@ -4367,6 +4368,18 @@ export function scaffoldAgent(
             if (devProtocol) {
               rendered = rendered.trimEnd() + "\n\n" + devProtocol + "\n";
             }
+            // Delegation golden-rule fragment — appended LAST (after
+            // execution-discipline and dev-protocol) on purpose so the
+            // "prefer delegating execution to a sub-agent" signal regains
+            // tail-of-prompt recency and can't be overridden by the
+            // inline-execution voice of the two fragments above (#3231).
+            // Same unconditional-append pattern; ORDER (…, dev-protocol,
+            // then delegation-golden-rule) must mirror the reconcile path
+            // below or the diff-abort trips on every reconcile.
+            const delegationGoldenRule = renderDelegationGoldenRuleFragment(context);
+            if (delegationGoldenRule) {
+              rendered = rendered.trimEnd() + "\n\n" + delegationGoldenRule + "\n";
+            }
           }
           if (dest === "CLAUDE.md" && agentConfig.claude_md_raw) {
             rendered = rendered.trimEnd() + "\n\n" + agentConfig.claude_md_raw + "\n";
@@ -6394,6 +6407,16 @@ function reconcileAgentInner(
       const devProtocol = renderDevProtocolFragment(claudeContext);
       if (devProtocol) {
         rendered = rendered.trimEnd() + "\n\n" + devProtocol + "\n";
+      }
+      // Delegation golden-rule fragment — appended LAST (after
+      // execution-discipline and dev-protocol) so the "prefer delegating
+      // execution to a sub-agent" signal regains tail-of-prompt recency
+      // (#3231). ORDER must mirror the first-scaffold path above (…,
+      // dev-protocol, then delegation-golden-rule) or the diff-abort below
+      // trips on every reconcile.
+      const delegationGoldenRule = renderDelegationGoldenRuleFragment(claudeContext);
+      if (delegationGoldenRule) {
+        rendered = rendered.trimEnd() + "\n\n" + delegationGoldenRule + "\n";
       }
       // claude_md_raw stays in the Switchroom-managed (above-marker) block —
       // it is yaml-driven, scaffold-owned content, not operator hand-edits.
