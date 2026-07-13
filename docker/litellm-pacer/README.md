@@ -81,16 +81,22 @@ regimes, plus one absolute backstop:
   `PACE_COOLDOWN_HOLD_CEILING_S`. **Gated OFF by default** so merge + redeploy is
   behaviour-neutral until the env is set at rollout.
 - **Absolute backstop**: `PACE_HARD_MAX_WAIT_S` caps *any* wait in *either*
-  regime, enforced on every iteration of the wait loop, so a bug in the hold
-  logic can never wedge a request longer than this. **Active by default** — it
-  only ever shortens a pathological wait (default 45 > `MAX_WAIT_S`, so it never
-  fires during normal burst-smoothing).
+  regime, checked on every iteration of the wait loop, so a bug in the hold
+  logic can't wedge a request meaningfully past it. The true worst-case wait is
+  `PACE_HARD_MAX_WAIT_S` + at most one backoff interval + the final admit-check
+  latency (≈46s for the default 45s), since the loop only notices the deadline
+  between admit attempts — not a to-the-millisecond ceiling. **Active by
+  default** — it only ever shortens a pathological wait (default 45 >
+  `MAX_WAIT_S`, so it never fires during normal burst-smoothing). The value is
+  also clamped at config load into `[PACE_MAX_WAIT_S, 280]` (280 < the 300s
+  gateway silence watchdog), so an env misconfig can't drop it below the
+  smoothing ceiling or push it into hang-looks-like territory.
 
 | Knob                          | Code default | Active by default? | Rollout value | Meaning |
 |-------------------------------|:------------:|:------------------:|:-------------:|---------|
-| `PACE_HARD_MAX_WAIT_S`        |      45      | yes (only shortens) |      45       | Absolute cap on any pacer wait, every regime, every iteration. Keep `< 300` (gateway silence watchdog) and `>= PACE_MAX_WAIT_S`. |
+| `PACE_HARD_MAX_WAIT_S`        |      45      | yes (only shortens) |      45       | Absolute cap on any pacer wait, every regime, checked every iteration. Clamped at load into `[PACE_MAX_WAIT_S, 280]` (280 < the 300s gateway silence watchdog), so an out-of-range env value is corrected automatically. |
 | `PACE_COOLDOWN_HOLD`          |    `false`   |  no (gate)          |    `true`     | Enables the cooldown-HOLD regime. Off = pre-L1 behaviour (fail open at `MAX_WAIT_S` even during a cooldown). |
-| `PACE_COOLDOWN_HOLD_CEILING_S`|      60      |  only when hold on  |      60       | Max hold duration during an active cooldown. Keep `<= PACE_MAX_COOLDOWN_S`. |
+| `PACE_COOLDOWN_HOLD_CEILING_S`|      60      |  only when hold on  |      60       | Max hold duration during an active cooldown. Clamped at load to `<= PACE_MAX_COOLDOWN_S`. |
 | `PACE_RELEASE_JITTER_S`       |      1.0     |  only when holding  |     1.0       | Extra jitter window added to the backoff while holding, so held requests re-admit spread across this window when the cooldown elapses (thundering-herd guard) instead of stampeding one 1s window and re-tripping the 429. |
 
 **Rollout env** (set alongside the existing live overrides in the deployed
@@ -105,7 +111,7 @@ separate from this repo change):
 ```
 
 Until `PACE_COOLDOWN_HOLD=true` is set, the only active change vs. today is the
-45s absolute cap, which can only ever shorten a pathological (>45s) wait.
+absolute cap, which can only ever shorten a pathological (roughly >45s) wait.
 
 ## Sync / redeploy step
 

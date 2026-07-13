@@ -188,9 +188,17 @@ class CodeDefaultTests(unittest.TestCase):
             if isinstance(node, ast.Assign):
                 for t in node.targets:
                     if isinstance(t, ast.Name) and t.id == arg_name:
-                        call = node.value
-                        if isinstance(call, ast.Call) and len(call.args) >= 2:
-                            return ast.literal_eval(call.args[1])
+                        # Walk the whole RHS so we still find the inner
+                        # _int_env/_float_env default even when it is wrapped in a
+                        # clamp call (e.g. _clamp_hard_max_wait(_float_env(...))).
+                        for sub in ast.walk(node.value):
+                            if (
+                                isinstance(sub, ast.Call)
+                                and isinstance(sub.func, ast.Name)
+                                and sub.func.id == func_name
+                                and len(sub.args) >= 2
+                            ):
+                                return ast.literal_eval(sub.args[1])
         raise AssertionError(f"{arg_name} default not found")
 
     def test_code_defaults_unchanged(self):
@@ -227,6 +235,82 @@ class CodeDefaultTests(unittest.TestCase):
         with open(src, "r", encoding="utf-8") as fh:
             source = fh.read()
         self.assertIn('os.getenv("PACE_COOLDOWN_HOLD", "false")', source)
+
+
+# --- Runtime config clamps (deterministic controls) --------------------------
+class ConfigClampTests(unittest.TestCase):
+    """The two guard invariants are enforced at config LOAD by runtime clamps in
+    _Cfg, not merely asserted in tests — so a deploy-time env misconfig can't
+    silently defeat them. These drive REAL env overrides + module reload and
+    assert the RESOLVED _Cfg values, so each would fail if its clamp were removed.
+    """
+
+    _ENV = (
+        "PACE_MAX_WAIT_S",
+        "PACE_HARD_MAX_WAIT_S",
+        "PACE_MAX_COOLDOWN_S",
+        "PACE_COOLDOWN_HOLD_CEILING_S",
+    )
+
+    def _reload_with(self, **env):
+        for k in self._ENV:
+            os.environ.pop(k, None)
+        for k, v in env.items():
+            os.environ[k] = str(v)
+        importlib.reload(custom_pacing)
+        return custom_pacing._Cfg
+
+    def tearDown(self):
+        # Restore clean code defaults for every downstream test.
+        for k in self._ENV:
+            os.environ.pop(k, None)
+        importlib.reload(custom_pacing)
+
+    def test_hard_cap_raised_to_max_wait_on_misconfig(self):
+        # Misconfig: hard cap set BELOW the burst-smoothing ceiling. The clamp
+        # raises it so the hard cap can never shorten a normal, benign wait.
+        cfg = self._reload_with(PACE_MAX_WAIT_S=30, PACE_HARD_MAX_WAIT_S=10)
+        self.assertGreaterEqual(cfg.HARD_MAX_WAIT_S, cfg.MAX_WAIT_S)
+        self.assertEqual(cfg.HARD_MAX_WAIT_S, 30.0)
+
+    def test_hard_cap_capped_below_watchdog_on_misconfig(self):
+        # Misconfig: hard cap set ABOVE the 300s silence watchdog. The clamp caps
+        # it under the watchdog so a hold can never look like a hang.
+        cfg = self._reload_with(PACE_HARD_MAX_WAIT_S=400)
+        self.assertLessEqual(
+            cfg.HARD_MAX_WAIT_S, custom_pacing._PACE_WATCHDOG_SAFE_CEILING_S
+        )
+        self.assertEqual(cfg.HARD_MAX_WAIT_S, 280.0)
+        self.assertLess(cfg.HARD_MAX_WAIT_S, 300.0)
+
+    def test_hold_ceiling_capped_to_max_cooldown_on_misconfig(self):
+        # Misconfig: hold ceiling set ABOVE the max cooldown that can be parked.
+        # The clamp lowers it to MAX_COOLDOWN_S.
+        cfg = self._reload_with(
+            PACE_COOLDOWN_HOLD_CEILING_S=120, PACE_MAX_COOLDOWN_S=60
+        )
+        self.assertLessEqual(cfg.COOLDOWN_HOLD_CEILING_S, cfg.MAX_COOLDOWN_S)
+        self.assertEqual(cfg.COOLDOWN_HOLD_CEILING_S, 60.0)
+
+    def test_sane_config_passes_through_unclamped(self):
+        # A valid operating point is untouched by the clamps (no false positives).
+        cfg = self._reload_with(
+            PACE_MAX_WAIT_S=12,
+            PACE_HARD_MAX_WAIT_S=45,
+            PACE_MAX_COOLDOWN_S=60,
+            PACE_COOLDOWN_HOLD_CEILING_S=60,
+        )
+        self.assertEqual(cfg.HARD_MAX_WAIT_S, 45.0)
+        self.assertEqual(cfg.COOLDOWN_HOLD_CEILING_S, 60.0)
+
+    def test_clamp_helpers_are_pure(self):
+        # Direct unit coverage of the clamp functions (deterministic; fails if the
+        # min/max bounds are dropped).
+        self.assertEqual(custom_pacing._clamp_hard_max_wait(10, 30, 280), 30)
+        self.assertEqual(custom_pacing._clamp_hard_max_wait(400, 20, 280), 280)
+        self.assertEqual(custom_pacing._clamp_hard_max_wait(45, 20, 280), 45)
+        self.assertEqual(custom_pacing._clamp_hold_ceiling(120, 60), 60)
+        self.assertEqual(custom_pacing._clamp_hold_ceiling(30, 60), 30)
 
 
 # --- Admission + fail-open ----------------------------------------------------

@@ -72,6 +72,33 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
+# The gateway nulls a silent turn at SILENCE_FALLBACK_MS (default 300000ms /
+# 300s). A pacer hold that approached that would look like a hang, so the hard
+# cap is clamped strictly below it with margin. Named so the invariant is one
+# obvious constant, not a magic number buried in an expression.
+_PACE_WATCHDOG_SAFE_CEILING_S = 280.0
+
+
+def _clamp_hard_max_wait(
+    hard: float, max_wait: float, watchdog_ceiling: float = _PACE_WATCHDOG_SAFE_CEILING_S
+) -> float:
+    """Runtime-enforce the absolute-cap invariants regardless of env overrides,
+    so a deploy-time misconfig can't silently defeat them:
+      * never BELOW the burst-smoothing ceiling (a hard cap under MAX_WAIT_S
+        would shorten a normal, benign wait), and
+      * never AT/ABOVE the gateway silence watchdog (a hold that long looks
+        like a hang to the watchdog).
+    Deterministic control, not a test-only assertion."""
+    return min(max(hard, max_wait), watchdog_ceiling)
+
+
+def _clamp_hold_ceiling(ceiling: float, max_cooldown: float) -> float:
+    """A cooldown-hold can never usefully queue longer than the cooldown itself
+    can be parked (MAX_COOLDOWN_S), so clamp the hold ceiling down to it
+    regardless of env override."""
+    return min(ceiling, max_cooldown)
+
+
 class _Cfg:
     # Max simultaneous upstream Anthropic requests across the whole fleet.
     MAX_CONCURRENCY = _int_env("PACE_MAX_CONCURRENCY", 8)
@@ -92,23 +119,31 @@ class _Cfg:
     POLL_MAX_S = _float_env("PACE_POLL_MAX_S", 0.40)
 
     # --- Layer 1: cooldown-hold + hard-wait backstop (throughput safety) ------
-    # ABSOLUTE backstop on ANY wait in the pacer, in EITHER regime. Enforced on
+    # ABSOLUTE backstop on ANY wait in the pacer, in EITHER regime. Checked on
     # every iteration of the wait loop (see async_pre_call_hook) so a bug in the
-    # cooldown-hold logic can never wedge a request longer than this. Must stay
-    # strictly below the gateway's 300s silence watchdog and below claude's own
-    # retry budget. ACTIVE BY DEFAULT: it only ever SHORTENS a pathological wait,
-    # and with the default 45 (> MAX_WAIT_S's 12/20) it never fires during normal
-    # burst-smoothing, so turning it on is behaviour-neutral. Keep >= MAX_WAIT_S.
-    HARD_MAX_WAIT_S = _float_env("PACE_HARD_MAX_WAIT_S", 45.0)
+    # cooldown-hold logic can never wedge a request meaningfully past it — the
+    # true worst case is HARD_MAX_WAIT_S + at most one backoff interval + the
+    # admit-check latency (~a second), not a hard ceiling to the millisecond.
+    # ACTIVE BY DEFAULT: it only ever SHORTENS a pathological wait, and with the
+    # default 45 (> MAX_WAIT_S's 12/20) it never fires during normal burst-
+    # smoothing, so it is behaviour-neutral. Clamped at load into
+    # [MAX_WAIT_S, _PACE_WATCHDOG_SAFE_CEILING_S] so an env misconfig can't put
+    # it below the smoothing ceiling or above the silence watchdog.
+    HARD_MAX_WAIT_S = _clamp_hard_max_wait(
+        _float_env("PACE_HARD_MAX_WAIT_S", 45.0), MAX_WAIT_S
+    )
     # Gate for the cooldown-HOLD regime. OFF by default => behaviour is identical
     # to pre-L1 (fail open at MAX_WAIT_S even during a signalled cooldown). Set
     # PACE_COOLDOWN_HOLD=true at rollout to hold the line through a cooldown.
     COOLDOWN_HOLD = os.getenv("PACE_COOLDOWN_HOLD", "false").lower() == "true"
     # Ceiling on how long the cooldown-HOLD regime will queue a request while a
-    # fleet cooldown is active. Naturally bounded by MAX_COOLDOWN_S too; keep
-    # <= MAX_COOLDOWN_S. Only consulted when COOLDOWN_HOLD is on, and always
-    # dominated by HARD_MAX_WAIT_S.
-    COOLDOWN_HOLD_CEILING_S = _float_env("PACE_COOLDOWN_HOLD_CEILING_S", 60.0)
+    # fleet cooldown is active. Clamped at load to <= MAX_COOLDOWN_S (a hold can
+    # never usefully outlast the cooldown that can be parked) regardless of env
+    # override. Only consulted when COOLDOWN_HOLD is on, and always dominated by
+    # HARD_MAX_WAIT_S.
+    COOLDOWN_HOLD_CEILING_S = _clamp_hold_ceiling(
+        _float_env("PACE_COOLDOWN_HOLD_CEILING_S", 60.0), MAX_COOLDOWN_S
+    )
     # Extra jitter window (seconds) added to the backoff WHILE HOLDING during a
     # cooldown, so that when the cooldown elapses the queued fleet re-admits
     # spread across this window instead of stampeding the same 1s and instantly
@@ -276,10 +311,15 @@ class FleetPacer(CustomLogger):
             return data  # fail open
 
         pace_id = uuid.uuid4().hex
-        start = time.time()
-        # ABSOLUTE backstop: no wait in EITHER regime may exceed this. Computed
-        # once, checked first on every iteration below — unbypassable by the
-        # regime logic. This is the load-bearing safety invariant.
+        # Loop deadline math uses a MONOTONIC clock so a backward wall-clock/NTP
+        # step can never extend a hold. (Redis cooldown_until stays wall-clock —
+        # see _cooldown_remaining — and is never compared against these values.)
+        start = time.monotonic()
+        # ABSOLUTE backstop: computed once, checked FIRST on every iteration
+        # below. It bounds the wait to HARD_MAX_WAIT_S plus at most one more
+        # backoff interval and the final admit-check latency (the loop can only
+        # notice the deadline between attempts) — the load-bearing safety bound,
+        # not a to-the-millisecond ceiling.
         hard_deadline = start + _Cfg.HARD_MAX_WAIT_S
         admitted = False
         try:
@@ -287,11 +327,11 @@ class FleetPacer(CustomLogger):
                 if await self._try_admit(r, pace_id):
                     admitted = True
                     break
-                now = time.time()
-                # (1) ABSOLUTE BACKSTOP — enforced FIRST, on every iteration, so
-                # a bug in the cooldown-hold branch below can never wedge a
-                # request past HARD_MAX_WAIT_S. Do NOT move this inside a
-                # conditional or below the regime logic.
+                now = time.monotonic()
+                # (1) ABSOLUTE BACKSTOP — checked FIRST, on every iteration, so a
+                # bug in the cooldown-hold branch below can't wedge a request
+                # more than ~one backoff interval past HARD_MAX_WAIT_S. Do NOT
+                # move this inside a conditional or below the regime logic.
                 if now >= hard_deadline:
                     verbose_proxy_logger.warning(
                         "custom_pacing: HARD wait cap %.1fs hit, admitting unpaced (fail open)",
