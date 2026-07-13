@@ -349,7 +349,7 @@ const REPLY_TO_TEXT_MAX = 200
 // #1161 silent-end fallback text now lives in ../silent-end.ts
 // (`silentEndFallbackText`, imported above) so the transport-boundary
 // tests exercise the real string — see PR #2892.
-import { splitMarkdownChunks, repairEscapedWhitespace, normalizeParagraphBreaks, normalizePunctuation, stripExcessBold, escapeMarkdown, hardenCardBreaks, RICH_MESSAGE_MAX_CHARS } from '../format.js'
+import { splitMarkdownChunks, repairEscapedWhitespace, normalizeParagraphBreaks, addParagraphSpacers, normalizePunctuation, stripExcessBold, escapeMarkdown, hardenCardBreaks, RICH_MESSAGE_MAX_CHARS } from '../format.js'
 import { richMessage } from '../rich-send.js'
 import { scrubVoice } from '../text-voice-scrub.js'
 import {
@@ -15131,11 +15131,10 @@ async function executeEditMessage(args: Record<string, unknown>): Promise<unknow
   // secret into a live bubble or the history row. Mask before scrub/send.
   editRawText = redactOutboundText(editRawText, 'edit_message')
   // Fleet-wide consistent formatting (same order as the reply path: redact
-  // first so secrets are matched literally, then normalize). No paragraph
-  // spacer pass — the NBSP spacer was removed in the #2669 follow-up because it
-  // double-gapped every paragraph; the rich renderer already shows `\n\n` as
-  // one blank line.
-  if (!editLiteralText) editRawText = stripExcessBold(normalizePunctuation(editRawText))
+  // first so secrets are matched literally, then normalize, then spacers on
+  // the rich path only — the rich GFM renderer renders `\n\n` tight, so the
+  // idempotent U+00A0 spacer restores a visible gap without double-spacing).
+  if (!editLiteralText) editRawText = addParagraphSpacers(stripExcessBold(normalizePunctuation(editRawText)))
   // Voice scrub (#1683): same em-dash scrub as the reply path. Edits
   // are how silent-anchor and progress-update mutate already-sent
   // bubbles, so without this an edit can re-introduce dashes the
@@ -17916,12 +17915,14 @@ function handleSessionEvent(ev: SessionEvent): void {
           // real outcome (throw OR partial multi-chunk → send_failed).
           let sendThrew = false
           try {
-            // The `\n\n` block joins from turn-flush-safety.ts render as normal
-            // single blank lines under the Bot API 10.1 rich GFM path, so no
-            // spacer pass runs before splitting (the NBSP spacer was removed in
-            // the #2669 follow-up — it double-gapped every paragraph). Mirrors
-            // executeReply, which now also sends the normalized text as-is.
-            const renderedText = capturedText
+            // #2798 / #2692 — inject visible blank-line spacers into prose `\n\n`
+            // gaps before splitting, exactly as executeReply does. The rich GFM
+            // renderer collapses a bare `\n\n` gap TIGHT, so without this the
+            // paragraph boundaries from the '\n\n' block join (turn-flush-safety
+            // .ts) would still render jammed together. Mirrors reply's
+            // `addParagraphSpacers(text)` on the non-literal path (idempotent —
+            // exactly one U+00A0 spacer per gap, never doubled).
+            const renderedText = addParagraphSpacers(capturedText)
             htmlChunks = splitMarkdownChunks(renderedText, limit)
             // #654 deterministic double-message fix. If the progress
             // card is on screen (60s timer fired before turn_end), edit

@@ -120,12 +120,13 @@ describe('handleStreamReply', () => {
     expect(bot.api.sendMessage.mock.calls[0][2]?.parse_mode).toBeUndefined()
   })
 
-  it('rich path sends the multi-paragraph `\\n\\n` gap byte-exact (no NBSP spacer)', async () => {
-    // The NBSP paragraph-spacer pass was removed in the #2669 follow-up — the
-    // rich renderer shows a plain `\n\n` gap as one blank line, so the handler
-    // passes the text through unchanged.
+  it('applies addParagraphSpacers on the rich path (multi-paragraph gap spaced)', async () => {
     const state = makeState()
-    const deps = makeDeps(bot)
+    // Spacer dep replaces every `\n\n` gap with a visible marker so we can
+    // assert the rich path ran it (mirrors the real gateway wiring).
+    const deps = makeDeps(bot, {
+      addParagraphSpacers: (t) => t.replace(/\n\n/g, '\n\nSPACER\n\n'),
+    })
 
     const pending = handleStreamReply(
       { chat_id: '1', text: 'Para one.\n\nPara two.', done: true },
@@ -136,13 +137,14 @@ describe('handleStreamReply', () => {
     await pending
 
     expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
-    expect(richSendMarkdown(bot)).toBe('Para one.\n\nPara two.')
-    expect(richSendMarkdown(bot)).not.toContain(String.fromCharCode(0xa0))
+    expect(richSendMarkdown(bot)).toBe('Para one.\n\nSPACER\n\nPara two.')
   })
 
-  it('literal format=text path is byte-exact too', async () => {
+  it('does NOT apply addParagraphSpacers on the literal format=text path', async () => {
     const state = makeState()
-    const deps = makeDeps(bot)
+    const deps = makeDeps(bot, {
+      addParagraphSpacers: (t) => t.replace(/\n\n/g, '\n\nSPACER\n\n'),
+    })
 
     const pending = handleStreamReply(
       { chat_id: '1', text: 'Para one.\n\nPara two.', format: 'text', done: true },
@@ -153,6 +155,7 @@ describe('handleStreamReply', () => {
     await pending
 
     expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    // Literal path is byte-exact — no spacer injected.
     expect(bot.api.sendMessage.mock.calls[0][1]).toBe('Para one.\n\nPara two.')
   })
 
