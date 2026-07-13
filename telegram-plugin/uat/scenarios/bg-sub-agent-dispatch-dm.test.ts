@@ -72,20 +72,27 @@ import { WORKER_FEED_RE } from "../assertions.js";
 // makes good delegation judgments. Naming the tool + the arg lets the
 // scenario be deterministic.
 //
-// Time profile: ~60s of bg work, paced with ten short steps so the
-// worker emits multiple tool_use + narrative events the subagent-watcher
-// can surface as fresh edits. We need the Background phase to last long
-// enough to clear the 8s first-paint threshold and take a snapshot.
+// Time profile: paced with FIVE short steps so the worker emits multiple
+// tool_use + narrative events the subagent-watcher can surface as fresh
+// edits, while BOUNDING the worker's wall-clock duration. Each step is a
+// model round-trip (narrate + two separate Bash calls), so under real fleet
+// LLM latency a step costs ~30s regardless of the 2s sleep — ten steps ran
+// ~5min in practice, which both blew the terminal-recap budget and left the
+// worker editing the shared chat long after this scenario (bleeding into the
+// next). Five steps bounds the worst case to ~210s (5 × ~30s + 60s stall
+// terminal) — still long enough to clear the 8s first-paint threshold and
+// snapshot mid-flight, but short enough to fit the 18-min CI job cap and to
+// finish within this scenario's own window (no cross-scenario bleed).
 const BG_DISPATCH_PROMPT =
   `Use the Agent tool with subagent_type "general-purpose" and ` +
   `run_in_background: true to dispatch a worker with this exact task: ` +
-  `"Do ten steps, ONE AT A TIME, k = 1 through 10. Before each step ` +
+  `"Do five steps, ONE AT A TIME, k = 1 through 5. Before each step ` +
   `write a brief one-sentence narration of what you are about to do, ` +
   `then run \`sleep 2\` via the Bash tool, then run \`echo step-k\` via ` +
   `the Bash tool (substitute the real number for k). Run every sleep and ` +
   `every echo as its OWN separate Bash call — never batch or chain them ` +
   `with && — and narrate before each so progress surfaces incrementally. ` +
-  `Do not stop early; complete all ten steps." After dispatching, send a ` +
+  `Do not stop early; complete all five steps." After dispatching, send a ` +
   `brief reply saying you've kicked off the background worker so I can ` +
   `watch the progress feed.`;
 
@@ -169,16 +176,13 @@ describe("uat: background sub-agent visibility (#709/#776/#782/#788)", () => {
         // last JSONL activity), because background Claude Code workers don't
         // always emit a sub_agent_turn_end event.
         //
-        // Budget: the 10-step worker runs each sleep+echo+narration as its own
-        // round-trip, so under real fleet LLM latency it takes ~5min wall
-        // (observed 4m59s), then the stall-terminal fires ~60s later. The old
-        // 180s budget assumed a ~2min worker and abandoned the still-running
-        // worker at the deadline — which BOTH failed this assertion AND left
-        // the worker editing the shared chat, bleeding into later scenarios.
-        // Wait long enough for the real worker to complete so we observe a
-        // genuine terminal recap (a feed that never terminates still fails).
+        // Budget: with the worker bounded to five steps (~150s wall under
+        // fleet latency) plus the stall-terminal firing ~60s after the last
+        // JSONL activity, the terminal recap lands by ~210s. 270s covers that
+        // with margin while keeping the whole scenario inside the 18-min CI
+        // job cap. A feed that never terminates still fails this assertion.
         let doneText: string | null = null;
-        const deadline = Date.now() + 420_000;
+        const deadline = Date.now() + 270_000;
         while (Date.now() < deadline) {
           const m = await sc.driver.getMessage(sc.botUserId, feed.messageId);
           if (m != null && WORKER_DONE_RE.test(m.text)) {
@@ -195,9 +199,9 @@ describe("uat: background sub-agent visibility (#709/#776/#782/#788)", () => {
         await sc.tearDown();
       }
     },
-    // Outer per-test budget: sum of inner deadlines (45 + 75 + 16 + 420 =
-    // 556s) + spinUp settle (~12s) + quiesce-before-start (bg runs first so
+    // Outer per-test budget: sum of inner deadlines (45 + 75 + 16 + 270 =
+    // 406s) + spinUp settle (~12s) + quiesce-before-start (bg runs first so
     // the chat is normally already quiet; capped at QUIESCE_MAX_MS) + slack.
-    720_000,
+    510_000,
   );
 });
