@@ -655,6 +655,21 @@ const DEFAULT_SILENT_STALL_TERMINAL_MS = 300_000
 // reaper TTL, so the watcher — not the reaper — still owns the terminal
 // transition for a worker that died mid-tool.
 const DEFAULT_INFLIGHT_TERMINAL_CAP_MS = 45 * 60_000
+/**
+ * Resolve the effective in-flight terminal-synthesis cap — the maximum wall-
+ * clock a genuinely-live worker can go with ZERO JSONL writes before the
+ * watcher declares it terminal (a worker mid-very-long `Bash`). This is the
+ * SAME resolution `startSubagentWatcher` uses internally (explicit config →
+ * `SWITCHROOM_SUBAGENT_INFLIGHT_TERMINAL_CAP_MS` env → default), exported so
+ * downstream liveness surfaces (the worker-activity feed's backstop TTL) can
+ * DERIVE their bound from it in code rather than hardcoding an assumption about
+ * its value. Keeps the "TTL must exceed the watcher's terminal-transition
+ * latency" invariant code-enforced: if an operator raises the cap via env, any
+ * derived TTL moves with it instead of falsely reaping a still-live worker.
+ */
+export function resolveInflightTerminalCapMs(configVal?: number): number {
+  return configVal ?? parseEnvMs('SWITCHROOM_SUBAGENT_INFLIGHT_TERMINAL_CAP_MS') ?? DEFAULT_INFLIGHT_TERMINAL_CAP_MS
+}
 // Minimum wall-clock gap between two "terminal synthesis deferred" log lines
 // for the SAME worker (#3092). `checkStalls` runs on the ~1s rescan tick, and
 // the deferral is re-evaluated (and, before this gate, re-logged) on every one
@@ -1530,10 +1545,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
     config.silentStallTerminalMs
     ?? parseEnvMs('SWITCHROOM_SUBAGENT_STALL_TERMINAL_MS')
     ?? DEFAULT_SILENT_STALL_TERMINAL_MS
-  const inflightTerminalCapMs =
-    config.inflightTerminalCapMs
-    ?? parseEnvMs('SWITCHROOM_SUBAGENT_INFLIGHT_TERMINAL_CAP_MS')
-    ?? DEFAULT_INFLIGHT_TERMINAL_CAP_MS
+  const inflightTerminalCapMs = resolveInflightTerminalCapMs(config.inflightTerminalCapMs)
   const deferralLogIntervalMs =
     config.deferralLogIntervalMs
     ?? parseEnvMs('SWITCHROOM_SUBAGENT_DEFERRAL_LOG_INTERVAL_MS')

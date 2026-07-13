@@ -265,14 +265,17 @@ export interface WorkerActivityFeedOpts {
    * durable guard against an immortal card if BOTH terminal signals are missed
    * (the gateway's `onFinish` AND the watcher's `onTerminalCleanup` sweep).
    *
-   * Default 50 min. Chosen deliberately ABOVE the subagent-watcher's maximum
-   * terminal-transition latency: the watcher owns the terminal transition up to
-   * its 45-min in-flight tool cap (a worker mid-very-long `Bash` legitimately
-   * emits nothing for up to that long before the watcher declares it terminal).
-   * A shorter bound would falsely reap a genuinely-live-but-quiet worker's card.
-   * At 50 min, any row still present is a definitive leak — the watcher would
-   * already have swept a live worker — so this only ever bites a truly ghosted
-   * slot, never a working one. Tests inject a small value.
+   * The gateway DERIVES this in code from the watcher's effective in-flight
+   * terminal cap (`resolveInflightTerminalCapMs()` — the same env/default the
+   * watcher resolves) plus a margin, so the invariant "never reap a row the
+   * watcher still considers live" holds even if an operator raises the cap via
+   * `SWITCHROOM_SUBAGENT_INFLIGHT_TERMINAL_CAP_MS`. A worker mid-very-long tool
+   * can go silent up to the cap before the watcher declares it terminal, so any
+   * row still present past cap + margin is a definitive leak — the watcher would
+   * already have swept a live worker.
+   *
+   * Fallback default (this module, for direct / non-gateway callers) 50 min.
+   * Tests inject a small value.
    */
   staleWorkerTtlMs?: number
   /**

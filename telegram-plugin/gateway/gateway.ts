@@ -723,6 +723,7 @@ import { redact } from '../secret-detect/redact.js'
 import { classifyAdminGate } from '../admin-commands/index.js'
 import {
   startSubagentWatcher,
+  resolveInflightTerminalCapMs,
   type SubagentWatcherHandle,
 } from '../subagent-watcher.js'
 import { listRecords as listWorktreeRecords, touchHeartbeat as touchWorktreeHeartbeat } from '../../src/worktree/registry.js'
@@ -2025,6 +2026,14 @@ function resolveSubagentOriginChat(
  * hits the fallback). A gateway restart clears it.
  */
 const WORKER_FEED_FALLBACK_LOG_CAP = 256
+/**
+ * Margin added to the watcher's in-flight terminal cap to form the worker-feed
+ * backstop TTL (`staleWorkerTtlMs`). The feed reaps a row only once it has been
+ * silent for cap + this margin — comfortably past the watcher's own terminal-
+ * transition latency, so the backstop can only ever bite a genuinely ghosted
+ * slot, never a live-but-quiet worker. 5 min.
+ */
+const WORKER_FEED_STALE_TTL_MARGIN_MS = 5 * 60_000
 const workerFeedOwnerDmFallbackLogged = new Set<string>()
 
 /**
@@ -29700,6 +29709,18 @@ void (async () => {
               // channels.telegram.worker_feed.max_rows via the config cascade
               // (scaffold emits SWITCHROOM_TG_WORKER_FEED_MAX_ROWS); unset → 8.
               maxRows: workerFeedMaxRows,
+              // Backstop TTL for the feed's stale-row reaper, DERIVED in code
+              // from the watcher's effective in-flight terminal cap (same env /
+              // default the watcher itself resolves) plus a margin — NOT a
+              // hardcoded assumption about that cap's value. This keeps the
+              // invariant "the feed must never reap a row the watcher still
+              // considers live" enforced even if an operator raises the cap via
+              // SWITCHROOM_SUBAGENT_INFLIGHT_TERMINAL_CAP_MS: a worker mid-very-
+              // long tool can go silent up to the cap before the watcher
+              // declares it terminal, so the feed waits cap + margin before
+              // force-collapsing a row the terminal signals somehow never
+              // removed.
+              staleWorkerTtlMs: resolveInflightTerminalCapMs() + WORKER_FEED_STALE_TTL_MARGIN_MS,
               // #3207 review: GROUP-level status pin. Workers now coalesce into
               // ONE shared message, so the pin must follow the GROUP lifecycle,
               // not a single worker's — otherwise a sibling's finish unpins a
