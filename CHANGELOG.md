@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+## v0.18.21 — Agents delegate execution to workers again, and sub-agent cards paint the moment they register
+
+Two focused reliability fixes. First, agents go back to dispatching
+`@worker`/sub-agents for execution instead of quietly doing the work
+inline in the foreground session, so chat stays responsive while real
+work runs in the background. Second, a background sub-agent's progress
+card now paints as soon as the agent registers, rather than waiting on
+the first burst of transcript output — so you see a card immediately
+even when the worker's opening tool call blocks for a while.
+
+### Agents — delegation recency restored so execution goes to sub-agents (#3232)
+
+The strong "when in doubt, delegate" guidance lives mid-file in the
+agent profile, while the competing `Execution Bias` and `Development
+Protocol` fragments are appended at the very tail of `CLAUDE.md` — and
+in a long prompt the tail-end "act in-turn / do it this turn" voice won
+on recency and overrode the delegation rule, so agents executed inline
+and blocked the conversational session. The tail fragments are now
+qualified to *compose* with delegation instead of overriding it: for an
+execution-class task, acting in-turn **means dispatching the
+sub-agent**, and the dev protocol governs how delegated work is done,
+not a license to do it inline. A dedicated golden-rule block reinforces
+it at the tail so recency now works *for* delegation.
+
+### Sub-agent cards — skeleton painted on registration, independent of transcript growth (#3231, #3233)
+
+A background sub-agent's progress card was driven **only** by
+growth-triggered cues from its transcript (JSONL): the watcher
+early-returns on a no-growth poll before firing any cue. So when a
+worker registered but its first tool call blocked — and its spawning
+turn had already ended — there was neither a live parent turn to nest
+into nor a feed row to paint, and the card could lag registration by
+minutes (observed ~205s in a live incident). The card skeleton now
+paints on registration, decoupled from JSONL growth, so it appears
+promptly and fills in as output arrives.
+
 ## v0.18.18 — The worker feed coalesces to one live message, LLM errors read as plain English, and a reliability + test-integrity sweep
 
 The background-worker activity feed stops storming the send gate: all
