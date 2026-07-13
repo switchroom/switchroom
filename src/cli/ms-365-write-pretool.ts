@@ -117,7 +117,6 @@ export const GATED_MS365_WRITE_TOOLS = new Set<string>([
   // ── Mail writes ──
   "send-mail",
   "send",
-  "create-draft-email",
   "update-mail-message",
   "delete-mail-message",
   "move-mail-message",
@@ -191,6 +190,13 @@ export const KNOWN_SAFE_MS365_READ_TOOLS = new Set<string>([
   "list-mail-rules",
   "get-mail-tips",
   "get-mailbox-settings",
+  // Deliberate policy exception (operator-approved 2026-07-13): creating a
+  // mail DRAFT is no-card. A draft is unsent, reviewable, and deletable —
+  // reversible by nature — so frictionless drafting is the low-friction
+  // default while SENDING stays gated. This is NOT an oversight: only the
+  // send/reply/forward-SEND tools carry irreversible external effect and
+  // remain in GATED_MS365_WRITE_TOOLS.
+  "create-draft-email",
   // ── OneDrive reads (present on agents that enable the drive surface) ──
   "get-drive-item",
   "get-drive-root-item",
@@ -199,13 +205,14 @@ export const KNOWN_SAFE_MS365_READ_TOOLS = new Set<string>([
   "list-folder-files",
   "search-onedrive-files",
   "get-drive-delta",
-  // ── Identity / session (control-plane; no card) ──
+  // ── Identity / session — READ-ONLY ops only (no card) ──
+  // Reviewer finding F1: ops that MUTATE auth/account state (logout,
+  // select-account, remove-account) are NOT read-safe — they fall through
+  // to the fail-closed gate and require a card. Only genuinely read-only
+  // identity ops belong here.
   "login",
-  "logout",
   "verify-login",
   "list-accounts",
-  "select-account",
-  "remove-account",
 ]);
 
 /**

@@ -42,7 +42,6 @@ describe("isGatedMs365Tool — real softeria write names (Bug 1: gate)", () => {
     expect(isGatedMs365Tool("mcp__ms-365__update-mail-message")).toBe(true);
     expect(isGatedMs365Tool("mcp__ms-365__delete-mail-message")).toBe(true);
     expect(isGatedMs365Tool("mcp__ms-365__move-mail-message")).toBe(true);
-    expect(isGatedMs365Tool("mcp__ms-365__create-draft-email")).toBe(true);
     expect(isGatedMs365Tool("mcp__ms-365__reply-mail-message")).toBe(true);
   });
 
@@ -74,9 +73,32 @@ describe("isGatedMs365Tool — real softeria read names (Bug 1: pass through)", 
     expect(isGatedMs365Tool("mcp__ms-365__get-mailbox-settings")).toBe(false);
   });
 
-  it("passes real OneDrive reads + identity control-plane through", () => {
+  it("passes real OneDrive reads + read-only identity ops through", () => {
     expect(isGatedMs365Tool("mcp__ms-365__get-drive-item")).toBe(false);
     expect(isGatedMs365Tool("mcp__ms-365__download-bytes")).toBe(false);
+    expect(isGatedMs365Tool("mcp__ms-365__login")).toBe(false);
+    expect(isGatedMs365Tool("mcp__ms-365__verify-login")).toBe(false);
+    expect(isGatedMs365Tool("mcp__ms-365__list-accounts")).toBe(false);
+  });
+
+  it("passes create-draft-email through (policy: frictionless drafting)", () => {
+    // Operator-approved exception: a draft is unsent/reviewable/deletable.
+    expect(isGatedMs365Tool("mcp__ms-365__create-draft-email")).toBe(false);
+  });
+});
+
+describe("isGatedMs365Tool — mutating identity ops must be gated (F1)", () => {
+  // Reviewer MEDIUM finding F1: identity ops that CHANGE auth/account state
+  // (log out, switch account, remove account) are not read-safe — they must
+  // require a card. Only the read-only identity ops stay no-card.
+  it("GATES mutating identity ops", () => {
+    expect(isGatedMs365Tool("mcp__ms-365__logout")).toBe(true);
+    expect(isGatedMs365Tool("mcp__ms-365__select-account")).toBe(true);
+    expect(isGatedMs365Tool("mcp__ms-365__remove-account")).toBe(true);
+  });
+
+  it("keeps read-only identity ops no-card", () => {
+    expect(isGatedMs365Tool("mcp__ms-365__login")).toBe(false);
     expect(isGatedMs365Tool("mcp__ms-365__verify-login")).toBe(false);
     expect(isGatedMs365Tool("mcp__ms-365__list-accounts")).toBe(false);
   });
