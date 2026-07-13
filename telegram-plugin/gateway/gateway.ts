@@ -317,7 +317,7 @@ import {
 import { recordOperatorEvent } from '../operator-events-history.js'
 import {
   parseLlmError,
-  renderLlmError,
+  renderLlmErrorSafe,
   decideErrorSurface,
 } from '../llm-error-present.js'
 import {
@@ -7690,6 +7690,21 @@ const inboundCoalescer = createInboundCoalescer<CoalescePayload>({
 function emitGatewayOperatorEvent(event: OperatorEvent): void {
   const { agent, kind } = event
 
+  // #llm-error-surfacing FIX 2 (secret leak): the operator-event cards are sent
+  // via a raw bot.api.sendRichMessage that BYPASSES the normal outbound redact
+  // chokepoint (normalizeOutboundBody → redact, outbound-send-path.ts). The only
+  // scrub the renderers apply is stripRawErrorBytes — a JSON-SHAPE scrub, NOT a
+  // secret scrubber — so a bearer token / `sk-…` key / url-embedded credential
+  // smuggled in an error `detail` would reach the operator card verbatim on the
+  // credentials-expired / credit-exhausted / unknown-4xx paths. Redact the detail
+  // ONCE here, up front, through the SAME redact() the reply path uses — and
+  // crucially BEFORE renderOperatorEvent runs escapeMarkdown on it (redacting the
+  // already-escaped text would let url-query-param secrets slip past url-redact,
+  // exactly the order the outbound pipeline documents: redact before markdown).
+  // Doing it at the top also scrubs the recorded operator-event history and the
+  // 429 metrics — defense in depth, no secret survives in ANY downstream sink.
+  event = { ...event, detail: redactOutboundText(event.detail, 'operator_event') }
+
   // ── 429 throttle tier (operator spec: "retry in place under 5 min, else
   // mark + failover, honest reset messaging") ────────────────────────────
   // A terminal TRANSIENT ACCOUNT-scoped 429 — kind `rate-limited` carrying
@@ -7957,9 +7972,16 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
       return
     }
     const tz = process.env.SWITCHROOM_TIMEZONE ?? process.env.TZ ?? 'UTC'
-    const r = renderLlmError(parsed, agent, tz, new Date(now))
+    // #llm-error-surfacing FIX 3 (crash guard): renderLlmErrorSafe wraps the
+    // tz-formatting render — an invalid IANA `SWITCHROOM_TIMEZONE`/`TZ` throws a
+    // RangeError out of Intl.DateTimeFormat (local-time.ts's "never throws" claim
+    // does NOT hold for construction-time zone validation). Pre-fix this branch
+    // had no guard, so a bad tz crashed the whole operator-event turn; now it
+    // degrades to a minimal tz-free line. There are no action buttons on this
+    // card (FIX 1) — the humanized text carries any recommendation inline.
+    const r = renderLlmErrorSafe(parsed, agent, tz, new Date(now))
     renderedText = r.text
-    renderedKeyboard = r.keyboard
+    renderedKeyboard = undefined
   } else {
     try {
       const r = renderOperatorEvent(event)

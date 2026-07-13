@@ -14,6 +14,7 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import {
   parseLlmError,
   renderLlmError,
+  renderLlmErrorSafe,
   stripRawErrorBytes,
   extractRequestId,
   formatResetLocal,
@@ -27,6 +28,7 @@ import {
 import { truncateDetailPreservingRequestId } from '../raw-error-scrub.js'
 import { projectTranscriptLine, detectErrorInTranscriptLine } from '../session-tail.js'
 import { renderOperatorEvent, type OperatorEvent } from '../operator-events.js'
+import { redact } from '../secret-detect/redact.js'
 
 // A raw byte-blob every surface must scrub.
 const RAW_BYTES = `b'{"type":"error","error":{"type":"rate_limit_error","message":"rate limit"},"request_id":"req_abc123"}'`
@@ -161,16 +163,115 @@ describe('renderLlmError / formatResetLocal — local-time rendering', () => {
     expect(text).toContain('AEST')
   })
 
-  it('auth + quota_wall cards carry action buttons', () => {
+  // FIX 1 (Ken, CPO, 2026-07): the dead auth/quota action buttons are GONE —
+  // renderLlmError never returns an inline_keyboard; the actionable classes
+  // carry a plain-text recommendation line instead.
+  it('auth card recommends re-authentication in text, with NO action buttons', () => {
     const auth = renderLlmError(parseLlmError('authentication_error: token expired'), 'a', tz, now)
-    expect(auth.keyboard?.inline_keyboard.flat().some((b) => b.callback_data?.includes('reauth'))).toBe(true)
-    const quota = renderLlmError(
-      parseLlmError("You've hit your limit · resets 5pm"),
-      'a',
-      tz,
-      now,
-    )
-    expect(quota.keyboard?.inline_keyboard.flat().length).toBeGreaterThan(0)
+    expect((auth as { keyboard?: unknown }).keyboard).toBeUndefined()
+    expect(auth.text.toLowerCase()).toContain('re-authenticate')
+  })
+
+  it('quota_wall card recommends switch/wait in text (naming the reset), NO buttons', () => {
+    const quota = renderLlmError(parseLlmError("You've hit your limit · resets 5pm"), 'a', tz, now)
+    expect((quota as { keyboard?: unknown }).keyboard).toBeUndefined()
+    const lower = quota.text.toLowerCase()
+    expect(lower).toContain('switch to another account')
+    expect(lower).toContain('wait for the quota to reset')
+    // The reset instant is named in the recommendation line.
+    expect(quota.text).toContain('AEST')
+  })
+
+  it('transient (rate_limit) card has neither buttons nor an action recommendation', () => {
+    const rl = renderLlmError(parseLlmError('rate_limit_error: slow down'), 'a', tz, now)
+    expect((rl as { keyboard?: unknown }).keyboard).toBeUndefined()
+    expect(rl.text.toLowerCase()).not.toContain('re-authenticate')
+    expect(rl.text).not.toContain('→')
+  })
+
+  // FIX 3 (crash guard): an invalid IANA timezone throws a RangeError out of the
+  // raw renderer (local-time.ts's "never throws" claim is false for tz
+  // construction). renderLlmErrorSafe MUST swallow it and degrade — asserting the
+  // OUTCOME (no throw + a usable message), not just that the branch ran.
+  it('renderLlmError DOES throw on an invalid tz with a reset present (documents the hazard)', () => {
+    const parsed = parseLlmError("You've hit your limit · resets 5pm")
+    expect(parsed.resetAt).toBeDefined()
+    expect(() => renderLlmError(parsed, 'gymbro', 'Not/AZone', now)).toThrow()
+  })
+
+  it('renderLlmErrorSafe does NOT throw on an invalid tz and returns a usable line', () => {
+    const parsed = parseLlmError("You've hit your limit · resets 5pm")
+    let out: { text: string } | undefined
+    expect(() => {
+      out = renderLlmErrorSafe(parsed, 'gymbro', 'Not/AZone', now)
+    }).not.toThrow()
+    expect(out?.text).toContain('gymbro')
+    assertNoRawBytes(out!.text)
+  })
+})
+
+// ─── FIX 2: operator-card text is scrubbed by the REAL redactor ───────────────
+//
+// The gateway sends operator-event cards via a raw bot.api call that bypasses
+// the normal outbound redact chokepoint; it now routes the rendered text through
+// the same redact() the reply path uses. These tests assert the OUTCOME: a
+// synthetic bearer token / sk- key / url-embedded credential planted in an error
+// detail does NOT survive into the redacted card text. stripRawErrorBytes alone
+// (a JSON-shape scrub) does NOT catch these — redact() is required.
+describe('operator-card secret redaction (FIX 2)', () => {
+  const now = new Date('2026-07-13T06:14:00Z')
+  // Runtime-assembled so no contiguous Anthropic-token literal lands in source
+  // (check-no-pii-secrets discipline). Resolves to a real sk-ant-shaped key that
+  // redact()'s anthropic_api_key pattern masks.
+  const BEARER = ['sk', 'ant', 'api03-ABCDEF1234567890abcdefGHIJKLMN'].join('-')
+  const URL_SECRET = 'https://user:hunter2pass@api.anthropic.com/v1/x?api_key=abc123secretval456'
+
+  const mkEvent = (kind: OperatorEvent['kind'], detail: string): OperatorEvent => ({
+    agent: 'gymbro',
+    kind,
+    detail,
+    suggestedActions: [],
+    firstSeenAt: now,
+  })
+
+  // Mirrors emitGatewayOperatorEvent's transform: redact the DETAIL first (via
+  // the real redact()), THEN render — so the scrub happens BEFORE the renderer's
+  // escapeMarkdown, exactly as production now does. Redacting the already-escaped
+  // final text would let url-query-param secrets (`api_key=…`) slip past.
+  const renderCardAsSent = (ev: OperatorEvent): string =>
+    renderOperatorEvent({ ...ev, detail: redact(ev.detail) }).text
+
+  it('stripRawErrorBytes alone LEAKS a bearer/api-key (proves redact is needed)', () => {
+    // Guard test: the shape-scrub inside the renderer is JSON-shape-only. If this
+    // ever stops leaking, the shape-scrub grew secret awareness.
+    expect(stripRawErrorBytes(`auth failed: Bearer ${BEARER}`)).toContain(BEARER)
+  })
+
+  it('pre-fix render (no redact) LEAKS the bearer; the production transform scrubs it', () => {
+    const ev = mkEvent('credentials-expired', `token rejected: Bearer ${BEARER}`)
+    // Renderer alone (pre-fix path): secret survives.
+    expect(renderOperatorEvent(ev).text).toContain(BEARER)
+    // Production transform (redact detail → render): secret is gone.
+    expect(renderCardAsSent(ev)).not.toContain(BEARER)
+  })
+
+  it('masks a url-embedded credential in a credit-exhausted card', () => {
+    const ev = mkEvent('credit-exhausted', `billing check: ${URL_SECRET}`)
+    const sent = renderCardAsSent(ev)
+    expect(sent).not.toContain('hunter2pass')
+    expect(sent).not.toContain('abc123secretval456')
+  })
+
+  it('masks a bearer key in an unknown-4xx card', () => {
+    const ev = mkEvent('unknown-4xx', `API Error: 400 · x-api-key ${BEARER}`)
+    expect(renderCardAsSent(ev)).not.toContain(BEARER)
+  })
+
+  it('the humanized (renderLlmError) card never relays raw detail — no secret to leak', () => {
+    // The humanized card's coreText is a per-kind TEMPLATE, never the raw detail,
+    // so a secret in the detail cannot reach it even before redaction.
+    const parsed = parseLlmError(`rate_limit_error · Bearer ${BEARER}`)
+    expect(renderLlmError(parsed, 'gymbro', 'Australia/Melbourne', now).text).not.toContain(BEARER)
   })
 })
 
