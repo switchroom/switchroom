@@ -67,6 +67,20 @@ export interface IdleClearState {
   alreadyCleared: boolean;
   /** A turn is in flight — never clear mid-turn. */
   turnInFlight: boolean;
+  /**
+   * A background sub-agent (Agent/Task dispatched, turn ended before it
+   * returned) is still in flight AND within its suppression TTL (#3117). The
+   * main-turn gate (`turnInFlight`) is blind to detached background work: a
+   * worker that is alive-but-silent for a full idle window (one long tool call,
+   * no stream events to re-stamp the activity clock) would otherwise be cleared,
+   * destroying the context its handback needs. Suppress the clear while this is
+   * true. It is TTL-bounded by the caller so a leaked/never-cleared pending flag
+   * cannot disable idle-clear forever — past the TTL the caller passes false and
+   * self-healing resumes. Optional/undefined ⇒ treated as false (no background
+   * work), which preserves the pre-#3117 behaviour for callers that don't wire
+   * it (e.g. the pure-decider unit tests that exercise only the wall clock).
+   */
+  backgroundWorkInFlight?: boolean;
 }
 
 export interface IdleClearDecision {
@@ -91,6 +105,14 @@ export function decideIdleClear(
 ): IdleClearDecision {
   if (state.idleClearMs <= 0) return { clear: false }; // disabled
   if (state.turnInFlight) return { clear: false }; // never mid-turn
+  // #3117 — a detached background sub-agent within its suppression TTL keeps the
+  // session alive even when the main-turn gate is open and the activity clock
+  // has gone cold (a silent long-running worker emits no stream events). The
+  // caller (gateway) bounds this by a TTL so a stuck pending flag can't disable
+  // idle-clear forever; here we simply honour it. Because #3116's write-time
+  // re-eval re-runs this whole function against the live state, this suppression
+  // is enforced at BOTH decision time and /clear write time for free.
+  if (state.backgroundWorkInFlight) return { clear: false };
   if (state.alreadyCleared) return { clear: false }; // once per idle period
   // Measured from the LAST thing that happened — activity or a turn ending —
   // never from a turn's start. A turn that ran longer than the window ends with

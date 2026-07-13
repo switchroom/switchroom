@@ -64,6 +64,19 @@
 export const EDIT_INTERVAL_MS = 60_000
 export const POLL_INTERVAL_MS = 5_000
 export const MAX_LIFETIME_MS = 30 * 60_000
+/**
+ * TTL bounding how long an in-flight background dispatch (Agent/Task) suppresses
+ * the idle auto-/clear gate (#3117). Deliberately tied to `MAX_LIFETIME_MS` (the
+ * cross-turn ambient budget cap): the two express the same "how long do we
+ * believe a background worker is still legitimately running" budget, so keeping
+ * them equal means the idle-suppression window and the ambient-liveness window
+ * agree by construction. A SHORTER idle TTL would risk clobbering a legitimate
+ * ~25-min worker mid-flight; a LONGER one would weaken the self-healing bound
+ * (a leaked `pending=true` that never clears would disable idle-clear for
+ * longer). 30 min is the deliberate midpoint the design settled on. The gate
+ * suppresses only while `dispatch age < this`; past it the suppression lapses so
+ * a stuck flag can never disable idle-clear permanently. */
+export const BACKGROUND_WORK_SUPPRESS_TTL_MS = MAX_LIFETIME_MS
 /** Rich-message wire cap is 32768 (#2669); budget headroom for the
  *  suffix and any escape expansion. If the anchor text plus suffix
  *  would exceed this, we skip the edit (the user still sees the
@@ -142,6 +155,13 @@ interface State {
   /** True after a `tool_use(Agent|Task)` was observed for this key in
    *  the current turn. Cleared on next turn start. */
   pending: boolean
+  /** Epoch ms when `pending` was last set true (#3117). null when not
+   *  pending. Load-bearing for the idle-clear suppression TTL: without a
+   *  timestamp the gate cannot bound how long an in-flight background dispatch
+   *  holds off idle-clear, so a leaked `pending=true` would disable idle-clear
+   *  forever. Re-stamped on each `noteAsyncDispatch` (a fresh dispatch re-arms
+   *  the TTL) and cleared whenever `pending` goes false. */
+  dispatchedAt: number | null
   /** The captured anchor — last outbound reply message_id for this
    *  key. */
   anchorMessageId: number | null
@@ -179,6 +199,7 @@ function ensure(key: string): State {
   if (!s) {
     s = {
       pending: false,
+      dispatchedAt: null,
       anchorMessageId: null,
       anchorOriginalText: '',
       anchorLiteralText: false,
@@ -217,6 +238,7 @@ export function startTurn(key: string): void {
   // Only the per-turn fields reset. activatedAt/lastEditAt belong to
   // the prior turn's pending-progress and are cleared separately.
   s.pending = false
+  s.dispatchedAt = null
   s.anchorMessageId = null
   s.anchorOriginalText = ''
   s.anchorLiteralText = false
@@ -229,7 +251,13 @@ export function startTurn(key: string): void {
  */
 export function noteAsyncDispatch(key: string): void {
   if (!enabled()) return
-  ensure(key).pending = true
+  const s = ensure(key)
+  s.pending = true
+  // Stamp (and re-stamp) the dispatch epoch so the idle-clear suppression TTL
+  // (#3117) can bound how long this holds off /clear. Re-stamping on each
+  // dispatch means a fresh Agent/Task within the same wait re-arms the TTL —
+  // freshest legitimate work wins.
+  s.dispatchedAt = nowMs()
 }
 
 /**
@@ -294,6 +322,41 @@ export function noteTurnEnd(key: string): void {
  */
 export function hasPendingAsyncDispatch(key: string): boolean {
   return stateByKey.get(key)?.pending === true
+}
+
+/**
+ * Age in ms since the current pending async dispatch was stamped for `key`
+ * (#3117), or null if there is no pending dispatch (or, defensively, no
+ * timestamp — a pre-stamp entry from a rolling upgrade). Uses the same clock
+ * override as the rest of the module so tests drive it deterministically.
+ */
+export function asyncDispatchAgeMs(key: string): number | null {
+  const s = stateByKey.get(key)
+  if (s == null || s.pending !== true || s.dispatchedAt == null) return null
+  return nowMs() - s.dispatchedAt
+}
+
+/**
+ * True iff ANY chat key currently has a pending async dispatch whose age is
+ * within `ttlMs` (#3117). The idle auto-/clear gate is agent-wide (not scoped
+ * to a single chat key), so it consults this aggregate: while a background
+ * sub-agent is in flight AND fresh, suppress the clear; once every pending
+ * dispatch has aged past the TTL (a leaked/stuck flag), the suppression lapses
+ * and idle-clear self-heals. A non-positive `ttlMs` disables suppression.
+ */
+export function anyPendingAsyncDispatchWithin(ttlMs: number): boolean {
+  if (ttlMs <= 0) return false
+  const now = nowMs()
+  for (const s of stateByKey.values()) {
+    if (
+      s.pending === true &&
+      s.dispatchedAt != null &&
+      now - s.dispatchedAt < ttlMs
+    ) {
+      return true
+    }
+  }
+  return false
 }
 
 /**
