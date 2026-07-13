@@ -2,6 +2,115 @@
 
 ## Unreleased
 
+## v0.18.18 — The worker feed coalesces to one live message, LLM errors read as plain English, and a reliability + test-integrity sweep
+
+The background-worker activity feed stops storming the send gate: all
+workers dispatched to the same chat now share ONE edit-in-place message
+instead of one card each, so the feed stays live under the deterministic
+edit ceiling instead of starving itself into a flood ban. Anthropic
+errors surface once, in plain English, instead of fanning raw
+`b'{"type":"error",…}'` JSON out to three separate render surfaces. And a
+broad sweep lands underneath: scope-precise flood suppression, a gateway
+that survives a leaked local-exhaustion marker, a watchdog that no longer
+kills a healthy session over a relay disconnect, honest approval-card
+context, and four test-integrity fixes that make the pins actually catch
+the bugs they claim to.
+
+### Telegram — worker activity feed coalesced into one live message per chat (#3207)
+
+N background workers dispatched to the same chat/thread used to own N
+edit-in-place cards, each drawing from the single 1/sec per-chat send-gate
+bucket (#3084) — so ~(N-1)/N of every second's edits SHED and each card
+refreshed only once every N seconds, a bot-wide liveness collapse (and a
+real flood-ban risk). The feed now renders all same-chat workers into one
+shared message, so the whole feed refreshes within the edit ceiling
+instead of starving.
+
+### Telegram — humanized, deduped LLM error surfacing (#3209)
+
+A single Anthropic error JSONL line used to fan out to three independent
+render surfaces (the turn-end "done" card, the operator "🚦 Rate limited"
+event, and more), each printing the raw
+`b'{"type":"error",…}'` `detail` string verbatim. Errors now surface once,
+in plain English, with no raw-JSON passthrough.
+
+### Telegram — premium-model tier-downgrade failover when walled fleet-wide (#3191)
+
+Adds a second, lower-priority recovery tier to fleet-fallback: when a
+selected premium model (e.g. `/model fable`) is overloaded/throttled
+mid-turn (529 / 429 / `overloaded_error` / 503) **and** account-level
+failover finds no other account still serving that model, the agent
+downgrades to its configured default model and resumes instead of
+stalling the live turn. Account-swap failover (same model, different
+account) is unchanged; this tier only fires once account-swap is
+exhausted.
+
+### Telegram — configurable send-gate rate limits (#3192)
+
+The deterministic outbound send gate (on by default since v0.18.17)
+exposed its per-chat / per-group / global token-bucket limits only as
+compile-time constants. They're now tunable via
+`channels.telegram.send_gate.*` in `switchroom.yaml`. Pure plumbing +
+schema — no default value changed, runtime logic untouched.
+
+### Flood / send-gate scoping
+
+- **Scope-precise `onFloodWait` (#3203, fixes #3111):** a single-chat or
+  single-message 429 no longer opens the `global` suppression window and
+  sheds cosmetic traffic across every chat. The flood window now tracks
+  the offending scope only, so a genuinely chat-scoped 429 stops
+  suppressing unrelated chats.
+
+### Reliability fixes
+
+- **Gateway survives a leaked `LOCAL_RESOURCE_EXHAUSTED` marker (#3193,
+  fixes #3099):** the deliberately non-retryable local disk/memory
+  exhaustion marker had no `classifyRejection` entry and fell through to a
+  full gateway shutdown; it's now `log_only`, like its `FLOOD_WAIT_ACTIVE`
+  sibling.
+- **Bridge-dead-watchdog scoped to the gateway's own primary bridge
+  (#3201, fixes #3086):** a short-lived secondary/relay client (e.g. an
+  `overlord-relay`) disconnecting no longer marks the still-alive primary
+  bridge dead and SIGTERMs a healthy session 90s later.
+- **Honest approval-card context when the caller supplies no reason
+  (#3196, fixes #3167):** cards for tools with no `reason` field (`reply`,
+  `react`, `edit_message`) now synthesize meaningful context instead of a
+  contentless `why: not provided`.
+- **Configured-agent target guard on `handleAgentSmoke` (#3199, fixes
+  #3136):** the smoke handler now enforces the same membership guard as
+  `handleAgentExec` / `handleAgentLogs`.
+- **`switchroom doctor` pre-flight for agent-unreadable dotfiles (#3202,
+  fixes #3157 direction 2):** doctor now flags root-owned per-agent
+  `.claude/settings.json` / `.claude.json` (the core writer fix landed in
+  #3169).
+- **Linear dedup by exact capture marker, not fuzzy search (#3206):**
+  `linear_create_issue` no longer trusts a relevance-ranked full-text hit
+  — a novel dedup key that merely shared tokens with an unrelated issue
+  wrongly short-circuited to "Already filed" and created nothing.
+
+### Operator surface
+
+- **Local-time operator event timestamps (#3205):** flood-window and other
+  operator-facing alerts print local time instead of raw UTC ISO.
+
+### Test & CI integrity
+
+- **On-delivery `startedAt` reset shared, not mirrored (#3200, fixes
+  #3128):** the approval-hold harness now drives production's reset code
+  instead of a private copy that would stay green even if the real reset
+  were deleted.
+- **compose.ts no longer `mkdirSync`s into the real `$HOME` during tests
+  (#3197, fixes #3127).**
+- **Corrected expired-token `list()` test assertion (#3194, fixes #3102).**
+- **De-flaked the `config_propose_edit` idempotency fuzz loop (#3195, fixes
+  #3170).**
+
+### Infra
+
+- **Fleet LiteLLM pacer vendored into the repo with tests + CI (#3204):**
+  `custom_pacing.py` previously lived only as a bind-mounted file on the
+  Coolify host — off review, off CI. It's now source-controlled with tests.
+
 ## v0.18.17 — The broker keeps a per-tier usage ledger, and /model + /effort overrides become session-scoped
 
 The broker now remembers how much flagship (Fable) headroom every

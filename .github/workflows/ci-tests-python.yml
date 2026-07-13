@@ -43,6 +43,7 @@ jobs:
             relevant:
               - 'vendor/hindsight-memory/scripts/**'
               - 'docker/voice-sidecar/**'
+              - 'docker/litellm-pacer/**'
               - '.github/workflows/ci-tests-python.yml'
 
   unittest:
@@ -62,4 +63,11 @@ jobs:
       # kokoro lazily, so no ONNX runtime / model is needed here.
       - name: Run voice-sidecar unittests
         working-directory: docker/voice-sidecar
+        run: python3 -m unittest discover -s . -p 'test_*.py'
+
+      # Fleet LLM pacer's pure-logic tests (admit / cooldown / fail-open /
+      # Retry-After). The test stubs the top-level `litellm` imports via
+      # sys.modules, so no litellm / redis pip install is needed here.
+      - name: Run litellm-pacer unittests
+        working-directory: docker/litellm-pacer
         run: python3 -m unittest discover -s . -p 'test_*.py'

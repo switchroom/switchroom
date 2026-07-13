@@ -557,6 +557,105 @@ export function renderActivityFeedWithNested(
   })
 }
 
+// ─── Combined multi-worker feed (coalesced one-message-per-chat) ────────────
+//
+// When 2+ background workers are live in the SAME chat/thread, they render into
+// ONE shared message rather than one message each — so their edits form a
+// single per-message edit stream under the send gate's 1/sec per-chat ceiling
+// instead of N streams that contend and shed (#3084 per-chat bucket). Each
+// worker is a compact two-line row (header + live → step); the body is capped
+// at `maxRows` with a `+M more working…` spill so it stays compact/legible and
+// under the rich-message wire ceiling (STATUS_CARD_CHAR_BUDGET). A single-worker
+// chat still renders through
+// `renderStatusCard` (the 🛠 Worker card) — this primitive owns the N≥2 case.
+
+/** Dispatch-time task description cap for a combined-feed worker row. */
+const COMBINED_ROW_DESC_MAX = 72
+
+/** One live worker's render-relevant snapshot for the combined feed. */
+export interface CombinedWorkerRow {
+  /** Dispatch-time task description (raw, unescaped). */
+  description: string
+  /** Wall-clock since dispatch, ms — climbs on every heartbeat re-render. */
+  elapsedMs: number
+  /** Tool calls observed so far. */
+  toolCount: number
+  /** The worker's latest step line (raw prose or friendly tool label). */
+  currentStep: string
+  /** Live model id (raw, e.g. `claude-opus-4-8`); omitted when unknown. */
+  model?: string
+}
+
+export interface CombinedWorkerFeedOpts {
+  /** Max worker rows rendered before the `+M more working…` spill line.
+   *  The overflow is ordered oldest-hidden-first (the newest/most-recently
+   *  active workers stay visible). */
+  maxRows: number
+}
+
+/**
+ * Render N≥1 live workers into ONE combined feed body (ready Telegram
+ * markdown; callers send verbatim — do NOT re-escape). Layout:
+ *
+ *   🛠 **Workers** · _N running_
+ *   **{desc1}** _· {elapsed} · {n} tools_
+ *   → _{step1}_
+ *   **{desc2}** _· {elapsed} · {n} tools_
+ *   → _{step2}_
+ *   _+M more working…_
+ *
+ * Pure. Rows are rendered in the order supplied (the manager passes them
+ * dispatch-order, oldest first). `maxRows` caps the visible rows; the hidden
+ * remainder collapses to a single `+M more working…` line. A total-budget
+ * backstop drops the OLDEST visible rows one at a time (growing the spill)
+ * until the body fits STATUS_CARD_CHAR_BUDGET, so a burst of long descriptions
+ * can never overflow the wire limit. Returns null only when `rows` is empty.
+ */
+export function renderCombinedWorkerFeed(
+  rows: CombinedWorkerRow[],
+  opts: CombinedWorkerFeedOpts,
+): string | null {
+  if (rows.length === 0) return null
+  const maxRows = Math.max(1, Math.floor(opts.maxRows))
+
+  const rowLines = (r: CombinedWorkerRow): [string, string] => {
+    const desc = escapeMarkdown(
+      truncate(stripMarkdown(r.description).replace(/\s+/g, ' ').trim() || 'background task', COMBINED_ROW_DESC_MAX),
+    )
+    const toolWord = r.toolCount === 1 ? 'tool' : 'tools'
+    const modelLabel = formatModelLabel(r.model)
+    const modelPart = modelLabel != null ? ` · ${escapeMarkdown(modelLabel)}` : ''
+    const header = `**${desc}** _· ${formatFeedElapsed(r.elapsedMs)} · ${r.toolCount} ${toolWord}${modelPart}_`
+    const stepClean = stripMarkdown(r.currentStep).replace(/\s+/g, ' ').trim()
+    const step =
+      stepClean.length > 0
+        ? `→ _${escapeMarkdown(truncate(stepClean, STATUS_LINE_MAX))}_`
+        : `→ _starting…_`
+    return [header, step]
+  }
+
+  const compose = (visibleCount: number): string => {
+    const shown = rows.slice(0, visibleCount)
+    const hidden = rows.length - shown.length
+    const out: string[] = [`🛠 **Workers** · _${rows.length} running_`]
+    for (const r of shown) {
+      const [h, s] = rowLines(r)
+      out.push(h, s)
+    }
+    if (hidden > 0) out.push(`_+${hidden} more working…_`)
+    return stackCardLines(out)
+  }
+
+  // Cap to maxRows first, then shrink further only if the char budget demands.
+  let visible = Math.min(rows.length, maxRows)
+  let body = compose(visible)
+  while (body.length > STATUS_CARD_CHAR_BUDGET && visible > 1) {
+    visible -= 1
+    body = compose(visible)
+  }
+  return body
+}
+
 /**
  * Like appendActivityLine, but for a pre-computed label (from the
  * real-time PreToolUse sidecar / `tool_label` event) — the hook already

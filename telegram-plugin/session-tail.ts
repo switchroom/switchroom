@@ -333,6 +333,22 @@ export function projectTranscriptLine(line: string): SessionEvent[] {
     const message = obj.message as Record<string, unknown> | undefined
     const content = message?.content as Array<Record<string, unknown>> | undefined
     if (!Array.isArray(content)) return []
+    // #llm-error-surfacing — DETERMINISTIC TERMINAL SOURCE. Claude Code writes a
+    // usage-limit / API error as a SYNTHETIC ASSISTANT MESSAGE
+    // (`isApiErrorMessage: true`) whose `content[].text` is the raw error string
+    // ("You've hit your limit · resets … b'{\"type\":\"error\"…}'"). That text
+    // used to fan out to the reply/answer passthrough AND the turn-end "done"
+    // card as if it were the model's answer. It is NOT an answer — it is an
+    // error the operator-event pipeline (detectErrorInTranscriptLine →
+    // humanized card) owns. Suppress the text/thinking events here at the ONE
+    // authoritative source so neither downstream surface can relay the raw
+    // bytes; the humanized card is rendered independently from the same line.
+    if (obj.isApiErrorMessage === true) {
+      const mainModel = message?.model
+      return typeof mainModel === 'string' && !isModelSentinel(mainModel)
+        ? [{ kind: 'model', model: mainModel }]
+        : []
+    }
     const events: SessionEvent[] = []
     // Live model capture: `message.model` is the exact resolved model that
     // served THIS assistant API call. Emit it FIRST (before the content events)

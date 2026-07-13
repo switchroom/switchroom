@@ -1,0 +1,343 @@
+"""
+custom_pacing.py — fleet-wide LLM request pacer for LiteLLM's Anthropic
+passthrough path.
+
+Ken's standing rule (2026-07-12): "never storm, always pace." When the
+switchroom auth-broker flips the whole fleet onto a new Anthropic OAuth
+account, every agent's in-flight + queued turn hits that account at once.
+A cold / low-burst-ceiling account 429s ("This request would exceed your
+account's rate limit") even when the 5h quota is at ~1% — its per-minute
+BURST ceiling is below fleet burst demand. This module smooths that burst.
+
+Mechanism (deterministic, version-independent, config-only-impossible under
+LiteLLM v3's per-key reject-based limiter):
+
+  * Runs as a LiteLLM CustomLogger callback. Its async_pre_call_hook is
+    invoked on the /anthropic passthrough path (call_type ==
+    "pass_through_endpoint") — verified against litellm v1.91
+    proxy/utils.py::pre_call_hook + pass_through_endpoints.py:845.
+  * Bounded global CONCURRENCY: at most PACE_MAX_CONCURRENCY upstream
+    requests in flight across all 8 proxy workers, coordinated in Redis
+    via a self-healing sorted-set lease (missed releases age out after
+    PACE_LEASE_TTL_S — no leaked permanent slots).
+  * Bounded global RATE: rolling 60s cap (PACE_MAX_RPM) + rolling 1s burst
+    smoother (PACE_MAX_RPS).
+  * ADAPTIVE 429 cooldown: async_post_call_failure_hook watches for upstream
+    429s carrying Retry-After and parks a fleet-wide `pace:cooldown_until`
+    in Redis. While cooling, pre_call paces harder — honoring Anthropic's
+    own retry-after signal instead of hammering.
+  * QUEUES, does not reject: over-limit requests AWAIT (bounded jittered
+    sleep up to PACE_MAX_WAIT_S) rather than 429. If the wait ceiling is
+    hit the request FAILS OPEN (proceeds) — the pacer can never make the
+    fleet worse than no pacer at all.
+
+Everything FAILS OPEN: any Redis / logic error is swallowed and the request
+proceeds. A bug in this hot-path module degrades to today's behavior, never
+to a fleet outage.
+
+All knobs are env-overridable (see _cfg) so tuning needs no code change and
+no image rebuild — only a container restart to re-read env, OR set them live
+via the same Redis keys.
+
+Wire-up (litellm-config.yaml):
+    litellm_settings:
+      callbacks: ["custom_pacing.pacer_instance"]
+
+Deploy: bind-mount this file to /app/custom_pacing.py (the config dir is on
+the proxy's sys.path). See PLAN.md for exact compose + apply steps.
+"""
+
+import asyncio
+import os
+import time
+import uuid
+from typing import Any, Optional
+
+from litellm._logging import verbose_proxy_logger
+from litellm.integrations.custom_logger import CustomLogger
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+
+class _Cfg:
+    # Max simultaneous upstream Anthropic requests across the whole fleet.
+    MAX_CONCURRENCY = _int_env("PACE_MAX_CONCURRENCY", 8)
+    # Rolling 60s request ceiling (fleet-wide).
+    MAX_RPM = _int_env("PACE_MAX_RPM", 60)
+    # Rolling 1s burst smoother (fleet-wide).
+    MAX_RPS = _int_env("PACE_MAX_RPS", 4)
+    # Hard ceiling on how long a single request will wait in the pacer
+    # before failing open and proceeding regardless.
+    MAX_WAIT_S = _float_env("PACE_MAX_WAIT_S", 20.0)
+    # A concurrency lease auto-expires after this many seconds so a missed
+    # release (crash / streaming edge) cannot permanently consume a slot.
+    LEASE_TTL_S = _int_env("PACE_LEASE_TTL_S", 300)
+    # Cap on how long a Retry-After-driven cooldown can park the fleet.
+    MAX_COOLDOWN_S = _float_env("PACE_MAX_COOLDOWN_S", 60.0)
+    # Poll interval + jitter while waiting for a slot / rate window.
+    POLL_MIN_S = _float_env("PACE_POLL_MIN_S", 0.10)
+    POLL_MAX_S = _float_env("PACE_POLL_MAX_S", 0.40)
+    # Master on/off. Set PACE_ENABLED=false to make the hook a pure no-op
+    # without touching config wiring.
+    ENABLED = os.getenv("PACE_ENABLED", "true").lower() != "false"
+    # Only pace these call types. Passthrough is what agents use.
+    CALL_TYPES = {"pass_through_endpoint"}
+
+    REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+    REDIS_PORT = _int_env("REDIS_PORT", 6379)
+    REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
+    KEY_PREFIX = os.getenv("PACE_KEY_PREFIX", "litellm_pace")
+
+
+_INFLIGHT_KEY = f"{_Cfg.KEY_PREFIX}:inflight"      # ZSET member=pace_id score=deadline
+_RECENT_KEY = f"{_Cfg.KEY_PREFIX}:recent"          # ZSET member=uuid score=ts (rolling window)
+_COOLDOWN_KEY = f"{_Cfg.KEY_PREFIX}:cooldown_until"  # STRING epoch seconds
+
+# Atomic admission. Redis runs a script to completion single-threaded, so the
+# trim -> count -> conditional-add sequence is race-free across all 8 proxy
+# workers (a plain check-then-act leaks the cap under exactly the burst we
+# defend against). Returns 1 = admitted (lease taken), 0 = must wait.
+_ADMIT_LUA = """
+local inflight = KEYS[1]
+local recent = KEYS[2]
+local cd = KEYS[3]
+local now = tonumber(ARGV[1])
+local maxc = tonumber(ARGV[2])
+local maxrpm = tonumber(ARGV[3])
+local maxrps = tonumber(ARGV[4])
+local lease = tonumber(ARGV[5])
+local pid = ARGV[6]
+local ruid = ARGV[7]
+local until_ = redis.call('GET', cd)
+if until_ and tonumber(until_) > now then return 0 end
+redis.call('ZREMRANGEBYSCORE', inflight, '-inf', now)
+if redis.call('ZCARD', inflight) >= maxc then return 0 end
+redis.call('ZREMRANGEBYSCORE', recent, '-inf', now - 60)
+if redis.call('ZCARD', recent) >= maxrpm then return 0 end
+if tonumber(redis.call('ZCOUNT', recent, now - 1, '+inf')) >= maxrps then return 0 end
+redis.call('ZADD', inflight, now + lease, pid)
+redis.call('EXPIRE', inflight, lease + 60)
+redis.call('ZADD', recent, now, ruid)
+redis.call('EXPIRE', recent, 120)
+return 1
+"""
+
+
+class FleetPacer(CustomLogger):
+    def __init__(self) -> None:
+        super().__init__()
+        self._redis = None
+        self._redis_init_failed = False
+
+    # ----- redis -------------------------------------------------------
+    async def _get_redis(self):
+        if self._redis is not None:
+            return self._redis
+        if self._redis_init_failed:
+            return None
+        try:
+            import redis.asyncio as aioredis  # type: ignore
+
+            self._redis = aioredis.Redis(
+                host=_Cfg.REDIS_HOST,
+                port=_Cfg.REDIS_PORT,
+                password=_Cfg.REDIS_PASSWORD,
+                socket_connect_timeout=1.0,
+                socket_timeout=1.0,
+                decode_responses=True,
+            )
+            # Cheap liveness probe; if it fails we fail open forever after.
+            await self._redis.ping()
+            return self._redis
+        except Exception as e:  # pragma: no cover - defensive
+            verbose_proxy_logger.warning(
+                "custom_pacing: redis unavailable, pacer fails OPEN (no pacing): %s", e
+            )
+            self._redis_init_failed = True
+            self._redis = None
+            return None
+
+    # ----- helpers -----------------------------------------------------
+    async def _cooldown_remaining(self, r) -> float:
+        try:
+            raw = await r.get(_COOLDOWN_KEY)
+            if not raw:
+                return 0.0
+            remaining = float(raw) - time.time()
+            return max(0.0, min(remaining, _Cfg.MAX_COOLDOWN_S))
+        except Exception:
+            return 0.0
+
+    async def _try_admit(self, r, pace_id: str) -> bool:
+        """One ATOMIC admission attempt via Lua. Returns True if a
+        concurrency slot + rate window was granted (and the request
+        recorded). Never raises — on any Redis error it fails OPEN
+        (returns True) so the pacer can never wedge the fleet."""
+        now = time.time()
+        try:
+            result = await r.eval(
+                _ADMIT_LUA,
+                3,
+                _INFLIGHT_KEY,
+                _RECENT_KEY,
+                _COOLDOWN_KEY,
+                repr(now),
+                str(_Cfg.MAX_CONCURRENCY),
+                str(_Cfg.MAX_RPM),
+                str(_Cfg.MAX_RPS),
+                str(_Cfg.LEASE_TTL_S),
+                pace_id,
+                uuid.uuid4().hex,
+            )
+            return int(result) == 1
+        except Exception as e:
+            verbose_proxy_logger.debug("custom_pacing: admit check error (fail open): %s", e)
+            # On redis error, fail open by claiming admission.
+            return True
+
+    async def _release(self, pace_id: Optional[str]) -> None:
+        if not pace_id:
+            return
+        r = await self._get_redis()
+        if r is None:
+            return
+        try:
+            await r.zrem(_INFLIGHT_KEY, pace_id)
+        except Exception:
+            pass
+
+    # ----- LiteLLM hooks ----------------------------------------------
+    async def async_pre_call_hook(
+        self,
+        user_api_key_dict: Any,
+        cache: Any,
+        data: dict,
+        call_type: str,
+    ):
+        # Fast bail: disabled, wrong call type, or bad payload -> no-op.
+        if not _Cfg.ENABLED or call_type not in _Cfg.CALL_TYPES or not isinstance(data, dict):
+            return data
+
+        r = await self._get_redis()
+        if r is None:
+            return data  # fail open
+
+        pace_id = uuid.uuid4().hex
+        deadline = time.time() + _Cfg.MAX_WAIT_S
+        admitted = False
+        try:
+            while True:
+                if await self._try_admit(r, pace_id):
+                    admitted = True
+                    break
+                if time.time() >= deadline:
+                    # Fail open: never reject, just proceed after the ceiling.
+                    verbose_proxy_logger.warning(
+                        "custom_pacing: wait ceiling %.1fs hit, admitting unpaced (fail open)",
+                        _Cfg.MAX_WAIT_S,
+                    )
+                    break
+                # Bounded jittered backoff; jitter de-synchronizes the fleet
+                # so releases don't thunder.
+                import random
+
+                await asyncio.sleep(random.uniform(_Cfg.POLL_MIN_S, _Cfg.POLL_MAX_S))
+        except Exception as e:
+            verbose_proxy_logger.debug("custom_pacing: pre_call error (fail open): %s", e)
+
+        # Stash id so post hooks can release the concurrency lease. Even if
+        # this is lost, the lease self-heals via LEASE_TTL_S.
+        if admitted:
+            try:
+                meta = data.setdefault("metadata", {})
+                if isinstance(meta, dict):
+                    meta["_pace_id"] = pace_id
+            except Exception:
+                pass
+        return data
+
+    def _extract_pace_id(self, data: Any) -> Optional[str]:
+        try:
+            if isinstance(data, dict):
+                meta = data.get("metadata")
+                if isinstance(meta, dict):
+                    return meta.get("_pace_id")
+        except Exception:
+            pass
+        return None
+
+    async def async_post_call_success_hook(self, data, user_api_key_dict, response):
+        await self._release(self._extract_pace_id(data))
+        return response
+
+    async def async_post_call_failure_hook(
+        self, request_data, original_exception, user_api_key_dict, traceback_str: Optional[str] = None
+    ):
+        # Release the slot first.
+        await self._release(self._extract_pace_id(request_data))
+
+        # Adaptive cooldown on upstream 429: park the fleet for Retry-After.
+        try:
+            status = getattr(original_exception, "status_code", None) or getattr(
+                original_exception, "code", None
+            )
+            msg = str(getattr(original_exception, "message", "") or original_exception)
+            is_429 = str(status) == "429" or "rate_limit_error" in msg or "would exceed your account" in msg
+            if not is_429:
+                return
+            retry_after = self._parse_retry_after(original_exception)
+            cooldown = retry_after if retry_after and retry_after > 0 else 5.0
+            cooldown = min(cooldown, _Cfg.MAX_COOLDOWN_S)
+            r = await self._get_redis()
+            if r is None:
+                return
+            until = time.time() + cooldown
+            # Only extend, never shorten, an existing cooldown.
+            existing = await r.get(_COOLDOWN_KEY)
+            if not existing or float(existing) < until:
+                await r.set(_COOLDOWN_KEY, str(until), ex=int(_Cfg.MAX_COOLDOWN_S) + 5)
+                verbose_proxy_logger.warning(
+                    "custom_pacing: upstream 429 -> fleet cooldown %.1fs (honoring retry-after)",
+                    cooldown,
+                )
+        except Exception as e:
+            verbose_proxy_logger.debug("custom_pacing: failure hook error: %s", e)
+
+    @staticmethod
+    def _parse_retry_after(exc: Any) -> Optional[float]:
+        # Try common shapes: exc.headers['retry-after'], exc.response.headers,
+        # or a numeric in the message. Best-effort, never raises.
+        try:
+            for attr in ("headers",):
+                h = getattr(exc, attr, None)
+                if h and hasattr(h, "get"):
+                    v = h.get("retry-after") or h.get("Retry-After")
+                    if v is not None:
+                        return float(v)
+            resp = getattr(exc, "response", None)
+            if resp is not None:
+                h = getattr(resp, "headers", None)
+                if h and hasattr(h, "get"):
+                    v = h.get("retry-after") or h.get("Retry-After")
+                    if v is not None:
+                        return float(v)
+        except Exception:
+            pass
+        return None
+
+
+# LiteLLM loads the callback by importing this module and resolving the
+# dotted path "custom_pacing.pacer_instance" to this singleton.
+pacer_instance = FleetPacer()

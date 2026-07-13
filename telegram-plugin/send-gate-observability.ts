@@ -54,6 +54,7 @@
 
 import type { Clock, SendGateStats } from './send-gate.js'
 import type { FloodWindowRecord } from './flood-circuit-breaker.js'
+import { fmtLocalClock, fmtLocalDate, localDay, tzAbbrev } from './shared/local-time.js'
 
 /** One-line, human-scannable summary of the gate counters + global fill. */
 export function formatStatsLine(stats: SendGateStats): string {
@@ -175,59 +176,11 @@ export interface FloodWindowObserver {
 // AEST" reads at a glance where a raw `2026-07-12T23:39:24Z UTC` does not. The
 // machine-facing snapshot LOG lines (config.log → gateway-supervisor.log) keep
 // their epoch/ISO wording; only the chat/card text is localized.
-
-/** Lowercased wall-clock time in `tz`, e.g. `9:39am`. */
-function fmtLocalClock(ms: number, tz: string): string {
-  return new Intl.DateTimeFormat('en-US', {
-    timeZone: tz,
-    hour: 'numeric',
-    minute: '2-digit',
-    hour12: true,
-  })
-    .format(new Date(ms))
-    .replace(/\s([AP])M$/, (_m, p: string) => `${p.toLowerCase()}m`)
-}
-
-/** Compact local date, e.g. `12 Jul` — used only to disambiguate day-spanning windows. */
-function fmtLocalDate(ms: number, tz: string): string {
-  return new Intl.DateTimeFormat('en-GB', {
-    timeZone: tz,
-    day: 'numeric',
-    month: 'short',
-  }).format(new Date(ms))
-}
-
-/** Calendar day (`YYYY-MM-DD`) in `tz`, for a timezone-correct "same day?" test. */
-function localDay(ms: number, tz: string): string {
-  return new Intl.DateTimeFormat('en-CA', {
-    timeZone: tz,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).format(new Date(ms))
-}
-
-/**
- * Short tz abbreviation for `tz` at `ms`, e.g. `AEST`, `EDT`, `BST`. ICU only
- * surfaces the common alpha abbreviation for a locale whose region matches the
- * zone, so we try a small locale list and take the first genuine abbreviation;
- * zones with no common abbreviation (e.g. Asia/Kolkata) fall back to the offset
- * form (`GMT+5:30`), and `UTC` stays `UTC`.
- */
-function tzAbbrev(ms: number, tz: string): string {
-  const at = new Date(ms)
-  for (const loc of ['en-US', 'en-AU', 'en-GB']) {
-    const v = new Intl.DateTimeFormat(loc, { timeZone: tz, timeZoneName: 'short' })
-      .formatToParts(at)
-      .find((p) => p.type === 'timeZoneName')?.value
-    if (v && !/^(?:GMT|UTC)/i.test(v)) return v
-  }
-  return (
-    new Intl.DateTimeFormat('en-US', { timeZone: tz, timeZoneName: 'short' })
-      .formatToParts(at)
-      .find((p) => p.type === 'timeZoneName')?.value ?? tz
-  )
-}
+//
+// The four wall-clock primitives (fmtLocalClock / fmtLocalDate / localDay /
+// tzAbbrev) now live in shared/local-time.ts so the humanized LLM-error card
+// renders timestamps through the SAME source of truth. The two composers below
+// (fmtLocalStamp / fmtLocalRange) stay here — they are this module's own wording.
 
 /**
  * A single operator-facing local timestamp with tz suffix, e.g. `9:46am AEST`.

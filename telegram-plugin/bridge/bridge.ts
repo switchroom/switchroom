@@ -21,6 +21,7 @@ import { homedir } from 'os'
 
 import { installPluginLogger } from '../plugin-logger.js'
 import { startSessionTail, type SessionEvent, type SessionTailHandle } from '../session-tail.js'
+import { truncateDetailPreservingRequestId } from '../raw-error-scrub.js'
 import {
   startPtyTail,
   V1ToolActivityExtractor,
@@ -851,7 +852,12 @@ if (sessionTailEnabled) {
             type: 'operator_event',
             kind: ev.kind,
             agent: AGENT_NAME,
-            detail: ev.detail.slice(0, 1000),
+            // Preserve the Anthropic request_id through the 1000-char cap: it
+            // sits in the trailing byte-blob (often past char 1000), and it is
+            // the reliable EXACT key for the cross-surface dedup gate. A naive
+            // slice would drop it → the gate degrades to the coarse per-kind key
+            // and wrongly collapses two distinct same-kind errors within 60s.
+            detail: truncateDetailPreservingRequestId(ev.detail, 1000),
             chatId: '',
           })
         } catch (err) {
