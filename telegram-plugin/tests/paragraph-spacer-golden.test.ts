@@ -35,7 +35,7 @@ import {
   normalizeParagraphBreaks,
   PARAGRAPH_SPACER,
 } from '../format.js'
-import { renderOutbound } from '../render/rich-render.js'
+import { renderOutbound, renderOutboundChunks } from '../render/rich-render.js'
 
 const SP = PARAGRAPH_SPACER // U+00A0
 
@@ -77,13 +77,38 @@ describe('paragraph spacer — golden outbound byte string', () => {
     expect(eff).toBe(GOLDEN)
   })
 
-  test('the golden survives the live IR renderer byte-for-byte (reaches the wire)', () => {
+  test('the golden survives the single-piece IR renderer byte-for-byte', () => {
     // The renderer (default-on) re-parses and re-renders; a U+00A0-only line is
     // a genuine paragraph that round-trips intact, so the visible gap reaches
     // Telegram. (An ASCII-space-only line, by contrast, would be collapsed.)
+    // This is the sub-cap single-piece case (`renderOutbound`); the live-path
+    // assertion below proves the same through the ACTUAL send transform.
     const wire = renderOutbound(GOLDEN).text
     expect(wire).toBe(GOLDEN)
   })
+
+  test('the golden reaches the wire through the LIVE send path (renderOutboundChunks) byte-for-byte', () => {
+    // The live send path (stream-controller.ts) uses `renderOutboundChunks`, not
+    // the single-piece `renderOutbound`. For a sub-cap body it returns exactly
+    // one `markdown` piece; the joined piece text must preserve the U+00A0
+    // spacer byte-for-byte, so the visible paragraph gaps reach Telegram on the
+    // real path — not merely in the single-piece renderer. This is the load-
+    // bearing anchor against a third flip of the paragraph-spacing behaviour.
+    const pieces = renderOutboundChunks(GOLDEN)
+    expect(pieces).toHaveLength(1) // sub-cap → single deliverable piece
+    expect(pieces[0].mode).toBe('markdown')
+    const joined = pieces.map((p) => p.text).join('')
+    expect(joined).toBe(GOLDEN)
+    // The U+00A0 spacer is present and never doubled at any boundary.
+    expect(joined).toContain(`\n\n${SP}\n\n`)
+    expect(joined).not.toContain(`${SP}\n\n${SP}`)
+  })
+
+  // Multi-chunk boundary safety (a body that exceeds the cap and splits, with no
+  // spacer stranded or duplicated at a chunk boundary) is covered by
+  // telegram-format.test.ts → 'no chunk starts or ends with a bare U+00A0
+  // spacer line (reviewer repro)' and 'spacer-boundary strip is robust across
+  // several gaps and small caps'. Not duplicated here.
 })
 
 describe('paragraph spacer — idempotency guard', () => {
