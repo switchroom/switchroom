@@ -46,7 +46,8 @@ import { homedir } from 'os'
 import { projectSubagentLine, sanitizeCwdToProjectName, detectErrorInTranscriptLine } from './session-tail.js'
 import { sanitiseToolArg } from './fleet-state.js'
 import { clipNarrative, describeToolUse } from './tool-activity-summary.js'
-import { REPLY_TOOLS, isDraftOfReply } from './narrative-dedup.js'
+import { REPLY_TOOLS } from './narrative-dedup.js'
+import { NarrativeFlushController, PENDING_NARRATIVE_FLUSH_MS } from './narrative-flush.js'
 import { truncate } from './card-format.js'
 import { bumpSubagentActivity, recordSubagentStall, recordSubagentResume, recordSubagentEnd, reapStuckRunningRows, countRunningBackgroundSubagents, recordNestedSubagentDispatch, recordSubagentModel } from './registry/subagents-schema.js'
 import { touchTurnActiveMarker } from './gateway/turn-active-marker.js'
@@ -72,6 +73,38 @@ export interface SubagentLivenessDb {
 }
 
 export type WorkerState = 'running' | 'done' | 'failed'
+
+/**
+ * Per-entry narrative gate: the SAME `NarrativeFlushController` kernel the
+ * main-agent gateway path uses, driven by a POLL-driven scheduler instead of a
+ * real `setTimeout`. Constructed lazily on the first `sub_agent_text` block.
+ *
+ * Time-box parity with the main path (Residual A): the kernel's injected
+ * scheduler stamps `deadline = nowFn()+PENDING_NARRATIVE_FLUSH_MS` when a block
+ * is parked; `tick(now)` — called at the top of every `readSubTail` (which runs
+ * every ~1s poll for a running entry, regardless of file growth) — fires the
+ * parked block EARLY once `now >= deadline`, WITHOUT waiting for the worker's
+ * first tool. So a worker's opening narration surfaces ~the next poll tick
+ * after the flush window rather than gating on its first jsonl tool event.
+ *
+ * Depth-generic: one gate per `WorkerEntry`, and every sub-agent / worker /
+ * nested sub-worker at any depth is a `WorkerEntry` — so the early-paint
+ * applies uniformly at every nesting level.
+ */
+export interface WorkerNarrativeGate {
+  /** Fire the early-paint if a parked block's flush window has elapsed.
+   *  Also refreshes the injected clock to this poll's `now`, so a separate
+   *  clock-refresh entrypoint is unnecessary. */
+  tick(now: number): void
+  /** Gate step 1: park a new `sub_agent_text` block (SHOW any prior pending). */
+  stage(text: string): void
+  /** Gate step 2: a tool_use lookahead. Returns whether a narrative cue fired. */
+  resolveOnTool(toolName: string | null, input: Record<string, unknown> | undefined): boolean
+  /** Gate step 3: turn_end lookahead. Returns whether a narrative cue fired. */
+  resolveAtTurnEnd(lastReplyText: string): boolean
+  /** Cancel the timer + drop pending state (resurrection / teardown). */
+  reset(): void
+}
 
 export interface WorkerEntry {
   /** Sub-agent JSONL file stem, e.g. "a75d4757a81e7b1f8". */
@@ -197,15 +230,18 @@ export interface WorkerEntry {
    *  worker left no narrative result of its own. */
   errorDetail?: string
   /**
-   * Narrative-dedup gate state (JSONL-text-narrative primitive). A
-   * `sub_agent_text` block is held here for ONE lookahead step so the next
-   * `sub_agent_tool_use` / `sub_agent_turn_end` can decide draft-then-send
-   * (SUPPRESS — it duplicates the worker's reply) vs working-narration (SHOW
-   * — fire `onProgress({latestSummary})`). Null when nothing is pending. The
-   * pure decision lives in narrative-dedup.ts; this slot is the per-entry
-   * cursor. Mirrors the gateway's `turn.pendingNarrative`.
+   * Narrative-dedup + early-paint gate (JSONL-text-narrative primitive). A
+   * `sub_agent_text` block is parked in the kernel for ONE lookahead step so
+   * the next `sub_agent_tool_use` / `sub_agent_turn_end` can decide
+   * draft-then-send (SUPPRESS — it duplicates the worker's reply) vs
+   * working-narration (SHOW — fire `onProgress({latestSummary})`), AND
+   * time-boxed so an opening narration paints EARLY if no lookahead arrives
+   * within `PENDING_NARRATIVE_FLUSH_MS`. Reuses the SAME
+   * `NarrativeFlushController` kernel as the main-agent gateway path
+   * (`makeNarrativeGate`), driven by a poll scheduler. Constructed lazily on
+   * the first `sub_agent_text`; null before then. Reset on resurrection.
    */
-  pendingNarrative?: { text: string } | null
+  narrativeGate?: WorkerNarrativeGate | null
   /**
    * NIT 3 (sub-agent turn_end symmetry). Most-recently-seen
    * reply/stream_reply `input.text` for this sub-agent — the actual answer a
@@ -1055,6 +1091,13 @@ export function readSubTail(
   }) => void,
 ): void {
   try {
+    // Early-paint tick (Residual A): fire a parked opening narration whose
+    // flush window has elapsed, WITHOUT waiting for a tool. Runs BEFORE the
+    // `size === cursor` no-growth early-return below, so it fires on a quiet
+    // poll (the "narrate, then think" gap) — the whole point of the time-box.
+    // This function is the per-poll defensive read for every running entry, so
+    // the deadline is observed within one poll tick of PENDING_NARRATIVE_FLUSH_MS.
+    if (entry.narrativeGate != null) entry.narrativeGate.tick(now)
     const stat = fs.statSync(entry.filePath)
     if (stat.size < tail.cursor) {
       tail.cursor = 0
@@ -1161,70 +1204,142 @@ export function readSubTail(
         if (errInfo.detail) entry.errorDetail = errInfo.detail.slice(0, SUBAGENT_RESULT_TEXT_MAX)
       }
       const events = projectSubagentLine(line, entry.agentId, startState)
-      // Narrative-dedup gate (JSONL-text-narrative primitive) — fire the
-      // narrative progress cue for a SHOWN sub_agent_text block. Identical
-      // shape to the inline #1720 onProgress below; factored out so the gate
-      // (stage-on-text, resolve-on-tool/turn_end) can replay a previously
-      // pending block exactly once. `latestSummary` carries the worker's
-      // narrative result (entry.lastResultText), never tool labels.
-      const fireNarrativeProgress = (): boolean => {
-        if (onProgress == null || entry.state !== 'running' || entry.historical) return false
-        try {
-          onProgress({
-            agentId: entry.agentId,
-            description: entry.description,
-            latestSummary: entry.lastResultText,
-            elapsedMs: now - entry.dispatchedAt,
-            prevBucketIdx: entry.lastProgressBucketIdx,
-            setBucketIdx: (b: number) => {
-              entry.lastProgressBucketIdx = b
+      // Narrative gate (JSONL-text-narrative primitive) — the SAME
+      // `NarrativeFlushController` kernel the main-agent gateway path uses,
+      // driven here by a POLL-driven scheduler so a worker's opening narration
+      // paints EARLY (~the next poll after PENDING_NARRATIVE_FLUSH_MS) instead
+      // of gating on its first tool. `show` fires the narrative onProgress cue
+      // for a SHOWN block (`latestSummary` = entry.lastResultText, never tool
+      // labels — matching the historical wire shape); the kernel owns the
+      // SHOW/SUPPRESS/early-paint/retract decisions (dedup lives in
+      // narrative-dedup.ts, timer + retract in narrative-flush.ts).
+      const buildNarrativeGate = (): WorkerNarrativeGate => {
+        // Injected clock the kernel's scheduler reads. Refreshed each poll via
+        // tick(now) so `deadline = nowRef.value + flushMs` uses the CURRENT
+        // poll's `now` even though the kernel persists across polls.
+        const nowRef = { value: now }
+        // Whether the LAST kernel effect painted a narrative cue — read back by
+        // resolveOnTool/resolveAtTurnEnd for the tool-label clobber guard.
+        let cueFired = false
+        const fireCue = (): boolean => {
+          if (onProgress == null || entry.state !== 'running' || entry.historical) return false
+          try {
+            onProgress({
+              agentId: entry.agentId,
+              description: entry.description,
+              latestSummary: entry.lastResultText,
+              elapsedMs: nowRef.value - entry.dispatchedAt,
+              prevBucketIdx: entry.lastProgressBucketIdx,
+              setBucketIdx: (b: number) => {
+                entry.lastProgressBucketIdx = b
+              },
+              lastTool: entry.lastTool,
+              toolCount: entry.toolCount,
+              model: entry.currentModel,
+            })
+            return true
+          } catch (cbErr) {
+            log?.(`subagent-watcher: onProgress callback error ${entry.agentId}: ${(cbErr as Error).message}`)
+            return false
+          }
+        }
+        // Poll-driven scheduler: `arm` stamps a deadline off the injected clock;
+        // the watcher's `tick` fires it once the poll clock reaches it — the
+        // deterministic, clock-injected equivalent of the gateway's setTimeout.
+        const scheduler = {
+          armedFn: null as (() => void) | null,
+          deadline: 0,
+        }
+        const controller = new NarrativeFlushController(
+          {
+            show: () => {
+              cueFired = fireCue()
             },
-            lastTool: entry.lastTool,
-            toolCount: entry.toolCount,
-            model: entry.currentModel,
-          })
-          return true
-        } catch (cbErr) {
-          log?.(`subagent-watcher: onProgress callback error ${entry.agentId}: ${(cbErr as Error).message}`)
-          return false
+            // Retract on the worker path is a documented near-no-op: unlike the
+            // gateway (which splices a persisted narration mirror), the worker
+            // card is replace-on-write and the worker's reply is a
+            // Telegram-surface tool that `describeToolUse` never renders — so a
+            // timer-painted block can never be DOUBLE-printed as both a card
+            // step and the reply (the gateway's catastrophe is structurally
+            // impossible here). The transient trail line self-heals via the
+            // rolling window; the worker's true result rides
+            // lastResultText/onFinish regardless of the gate. See DESIGN.md
+            // "COVERAGE LIMIT" for the narrow >250ms-gap draft edge.
+            retractShown: () => {
+              log?.(
+                `subagent-watcher: narrative early-paint retract (no-op on replace-on-write worker card) ${entry.agentId}`,
+              )
+            },
+          },
+          {
+            arm: (fn, ms) => {
+              scheduler.armedFn = fn
+              scheduler.deadline = nowRef.value + ms
+            },
+            disarm: () => {
+              scheduler.armedFn = null
+            },
+          },
+          PENDING_NARRATIVE_FLUSH_MS,
+        )
+        return {
+          tick: (n) => {
+            nowRef.value = n
+            if (scheduler.armedFn != null && n >= scheduler.deadline) {
+              const fn = scheduler.armedFn
+              scheduler.armedFn = null
+              fn() // → onTimerFire → show → fireCue (EARLY paint, no tool needed)
+            }
+          },
+          // stage/resolve run synchronously within a readSubTail call whose
+          // clock was already refreshed onto nowRef by the top-of-function
+          // `tick(now)` (or by buildNarrativeGate on the first block), so they
+          // must NOT re-stamp nowRef with a captured (stale) `now`.
+          stage: (text) => {
+            controller.stage(text)
+          },
+          resolveOnTool: (toolName, input) => {
+            cueFired = false
+            // NIT 3 (turn_end symmetry) lives inside the kernel: it compares the
+            // pending block against a REPLY_TOOL's input.text (tool path) and,
+            // at turn_end, against the delivered reply text passed by
+            // resolveAtTurnEnd. Here we only forward the tool lookahead.
+            controller.resolveOnTool(toolName ?? '', input)
+            return cueFired
+          },
+          resolveAtTurnEnd: (lastReplyText) => {
+            cueFired = false
+            controller.flushAtTurnEnd(lastReplyText)
+            return cueFired
+          },
+          reset: () => {
+            controller.teardown()
+            scheduler.armedFn = null
+          },
         }
       }
       // Resolve a pending sub-agent narrative against a lookahead event.
-      // SUPPRESS only when the pending block drafts a reply/stream_reply
-      // tool's text; otherwise SHOW (fire the cue). See narrative-dedup.ts §2b.
-      //
-      // Two lookahead shapes:
-      //   - sub_agent_tool_use: `toolName`/`toolInput` are the tool — suppress
-      //     a draft of THIS tool's reply text.
-      //   - sub_agent_turn_end: `toolName` is null. NIT 3 (turn_end symmetry):
-      //     a FOREGROUND sub-agent that called stream_reply/reply as its final
-      //     tool then emitted a trailing text block would, under the old
-      //     unconditional SHOW, surface a draft of the delivered answer. So at
-      //     turn_end we apply the SAME conservative dedup as main-agent step 3:
-      //     compare the trailing block against the worker's last reply text
-      //     (`entry.lastReplyText`) and suppress a draft. Background workers
-      //     never set lastReplyText, so their trailing narration still SHOWs.
-      // Returns true iff a narrative onProgress cue actually fired this
-      // call — callers use this to skip a redundant/clobbering tool-label
-      // onProgress cue for the SAME tick (see #1042 below: without this,
-      // the tool-description onProgress unconditionally fires right after
-      // and its replace-on-write onProgress always wins, so the narration
-      // shown here is never actually visible on the pinned card).
+      // SUPPRESS only when the pending block drafts a reply/stream_reply tool's
+      // text; otherwise SHOW (fire the cue). Two lookahead shapes:
+      //   - sub_agent_tool_use: forward the tool — the kernel suppresses a draft
+      //     of THIS tool's reply text (REPLY_TOOLS only).
+      //   - sub_agent_turn_end: `toolName` is null → resolveAtTurnEnd with
+      //     entry.lastReplyText, so a FOREGROUND sub-agent's trailing draft of
+      //     its delivered answer is suppressed (background workers never set
+      //     lastReplyText, so their trailing narration still SHOWs).
+      // Returns true iff a narrative onProgress cue actually fired — callers use
+      // this to skip a redundant/clobbering tool-label onProgress cue for the
+      // SAME tick (the tool-description onProgress's replace-on-write always
+      // wins, so firing both back-to-back hides the narration).
       const resolvePendingSubNarrative = (
         toolName: string | null,
         toolInput: Record<string, unknown> | undefined,
       ): boolean => {
-        if (entry.pendingNarrative == null) return false
-        const pending = entry.pendingNarrative
-        entry.pendingNarrative = null
-        if (toolName != null && REPLY_TOOLS.has(toolName)) {
-          const replyText = typeof toolInput?.text === 'string' ? (toolInput.text as string) : ''
-          if (isDraftOfReply(pending.text, replyText)) return false // draft of the reply → SUPPRESS
-        } else if (toolName == null && entry.lastReplyText != null && entry.lastReplyText.length > 0) {
-          // turn_end path: suppress a trailing draft of the delivered answer.
-          if (isDraftOfReply(pending.text, entry.lastReplyText)) return false
+        if (entry.narrativeGate == null) return false
+        if (toolName == null) {
+          return entry.narrativeGate.resolveAtTurnEnd(entry.lastReplyText ?? '')
         }
-        return fireNarrativeProgress()
+        return entry.narrativeGate.resolveOnTool(toolName, toolInput)
       }
       for (const ev of events) {
         const idleSecBeforeBump = Math.round((now - entry.lastActivityAt) / 1000)
@@ -1431,18 +1546,18 @@ export function readSubTail(
           // args or file content — consistent with the watcher's
           // "descriptions only" privacy posture.
           entry.lastResultText = ev.text.trim().slice(0, SUBAGENT_RESULT_TEXT_MAX)
-          // #1720 + JSONL-text-narrative gate step 1: stage this block for
-          // one lookahead step instead of firing the progress cue
-          // immediately. A previously-pending block had nothing reply-shaped
-          // after it (pure narration) → flush it as SHOWN now; then stage
-          // THIS block. Its eventual SHOW/SUPPRESS is decided by the next
-          // sub_agent_tool_use / sub_agent_turn_end. `lastResultText` /
-          // `lastSummaryLine` above already updated unconditionally — the
-          // handback payload is independent of the progress-cue decision.
-          if (entry.pendingNarrative != null) {
-            fireNarrativeProgress() // prior pending was pure narration → SHOW
-          }
-          entry.pendingNarrative = { text: ev.text }
+          // #1720 + JSONL-text-narrative gate step 1: stage this block for one
+          // lookahead step (AND arm the early-paint timer) instead of firing
+          // the progress cue immediately. The kernel's `stage` SHOWs any prior
+          // pending block (it had nothing reply-shaped after it → pure
+          // narration) then parks THIS one; its eventual SHOW/SUPPRESS is
+          // decided by the next sub_agent_tool_use / sub_agent_turn_end, or by
+          // the early-paint timer if neither arrives within the flush window.
+          // `lastResultText` / `lastSummaryLine` above already updated
+          // unconditionally — the handback payload is independent of the
+          // progress-cue decision. Gate is built lazily on the first block.
+          if (entry.narrativeGate == null) entry.narrativeGate = buildNarrativeGate()
+          entry.narrativeGate.stage(ev.text)
         } else if (ev.kind === 'sub_agent_tool_result') {
           // The tool call completed — clear it from the in-flight set so
           // the terminal-synthesis gate re-opens. Idempotent: a result
@@ -1894,7 +2009,11 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       // worker's card reaches real activity instead of a frozen stub.
       entry.toolCount = 0
       entry.lastTool = null
-      entry.pendingNarrative = null
+      // Cancel any armed early-paint timer + drop pending state before the
+      // from-scratch replay so a stale parked block can't fire against the
+      // rebuilt cursor. Rebuilt lazily on the first replayed sub_agent_text.
+      entry.narrativeGate?.reset()
+      entry.narrativeGate = null
       tail.cursor = 0
       tail.pendingPartial = ''
       tail.hasEmittedStart = false

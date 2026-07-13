@@ -193,7 +193,7 @@ import { formatModelLabel } from '../model-label.js'
 import { createSessionModelSource } from './session-model-source.js'
 import { runSilentTurnHeartbeatTick } from '../feed-heartbeat-climb.js'
 import { REPLY_TOOLS } from '../narrative-dedup.js'
-import { NarrativeFlushController } from '../narrative-flush.js'
+import { NarrativeFlushController, PENDING_NARRATIVE_FLUSH_MS } from '../narrative-flush.js'
 import { toolLabel } from '../tool-labels.js'
 import { createTypingWrapper } from '../typing-wrap.js'
 import { createTurnTypingLoop } from './turn-typing-loop.js'
@@ -15799,18 +15799,13 @@ function composeTurnActivity(turn: CurrentTurn, final = false, liveSuffix = ''):
   return renderActivityFeedWithNested(turn.mirrorLines, childLines, final, liveSuffix, stepCount, header)
 }
 
-/**
- * Time-box for the parked-narrative early-paint (see `narrative-flush.ts`).
- * If a parked opening narration gets no lookahead event (tool_use / next text /
- * turn_end) within this window — the "narrate, then think before the first tool"
- * case that produced the visible gap — the flush timer paints it via the SAME
- * `showNarrativeStep` path a lookahead would. Chosen so a normal draft-then-send
- * `reply` (emitted right after the text block) lands FIRST and cancels the timer;
- * but correctness does NOT depend on that race — a timer-painted block that later
- * proves to be the reply is deterministically retracted (see the RETRACT effect
- * wired into the controller below). Named const so a test can pin it.
- */
-const PENDING_NARRATIVE_FLUSH_MS = 250
+// PENDING_NARRATIVE_FLUSH_MS is now defined in and imported from
+// `narrative-flush.ts` (the kernel's home) so the main-agent gateway path and
+// the worker/sub-agent watcher share ONE source of truth for the time-box.
+// The main path paints a parked block via the SAME `showNarrativeStep` path a
+// lookahead would, and a timer-painted block that later proves to be the reply
+// is deterministically retracted (the RETRACT effect wired into the controller
+// below).
 
 /**
  * Retract a narration step the flush timer painted EARLY that turned out to draft
