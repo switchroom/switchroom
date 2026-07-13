@@ -67,6 +67,20 @@ describe("detectTurnFindings", () => {
     expect(f.map((x) => x.signal)).not.toContain("killed-incomplete-turn");
   });
 
+  it("flags send_failed as its own signal, NOT the killed catch-all (Fix 2)", () => {
+    // gateway PR B writes status=send_failed when a turn-flush answer failed to
+    // reach the user. It must surface as `send-failed-delivery` (a delivery
+    // failure), not be miscategorised as `killed-incomplete-turn` (killed
+    // mid-run) — which would corrupt that signal's meaning.
+    const turns = parseTurns(turn(15, { status: "send_failed", tools: 0 }));
+    const signals = detectTurnFindings("alpha", turns).map((x) => x.signal);
+    expect(signals).toContain("send-failed-delivery");
+    expect(signals).not.toContain("killed-incomplete-turn");
+    // and a send_failed turn with tools:0 must NOT be a silent-no-op (it is an
+    // honest delivery failure, not a benign complete-zero-tools turn).
+    expect(signals).not.toContain("silent-no-op-candidate");
+  });
+
   it("flags a hang only when long AND stalled (few tools)", () => {
     const stalled = parseTurns(turn(13, { duration_ms: HANG_MS + 1, tools: 1 }));
     const productive = parseTurns(turn(14, { duration_ms: HANG_MS + 1, tools: 9 }));

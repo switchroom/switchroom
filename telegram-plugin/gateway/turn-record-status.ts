@@ -70,6 +70,65 @@ export function backstopSendOutcome(args: {
   chunkCount: number
 }): DeliveryOutcome {
   if (args.threw) return 'failed'
+  // Defense (Fix 5): a "send" that split into zero chunks delivered nothing —
+  // do NOT let sentCount(0) < chunkCount(0) === false slip through to
+  // 'delivered'/'complete' (which would trip the silent-no-op-candidate
+  // detector on a tools:0 turn). Nothing sent → failed.
+  if (args.chunkCount === 0) return 'failed'
   if (args.sentCount < args.chunkCount) return 'failed'
   return 'delivered'
+}
+
+/**
+ * Stamp a turn's `deliveryOutcome` from a resolved backstop send. This is the
+ * exact accounting the turn-flush IIFE's `finally` performs — factored here so
+ * the gateway and the tests run the SAME mapping (a real send that throws or
+ * partially delivers must produce `send_failed`, never `complete`). Mutates and
+ * returns the resolved outcome.
+ */
+export function finalizeBackstopSend(
+  turn: { deliveryOutcome?: DeliveryOutcome },
+  send: { threw: boolean; sentCount: number; chunkCount: number },
+): DeliveryOutcome {
+  const outcome = backstopSendOutcome(send)
+  turn.deliveryOutcome = outcome
+  return outcome
+}
+
+/** The parsed shape of one turns.jsonl row. */
+export interface TurnRecordRow {
+  ts: number
+  agent: string
+  duration_ms: number
+  tools: number
+  status: TurnStatus
+  turn_id: string
+}
+
+/**
+ * Build the turns.jsonl row for a turn. The single source of truth for the
+ * `status` field — `emitTurnRecord` serializes exactly this, so a test that
+ * asserts on `buildTurnRecord(...).status` is asserting the value the gateway
+ * actually writes (proving `emitTurnRecord` derives status from the resolved
+ * `deliveryOutcome` via `computeTurnStatus`, not the speculative flag).
+ */
+export function buildTurnRecord(
+  turn: {
+    agent: string
+    startedAt: number
+    toolCallCount: number
+    turnId: string
+    finalAnswerDelivered: boolean
+    deliveryOutcome?: DeliveryOutcome
+  },
+  endedAt: number,
+): TurnRecordRow {
+  return {
+    ts: Math.floor(endedAt / 1000),
+    agent: turn.agent,
+    duration_ms: turn.startedAt > 0 ? endedAt - turn.startedAt : 0,
+    tools: turn.toolCallCount ?? 0,
+    status: computeTurnStatus(turn),
+    turn_id: turn.turnId,
+  }
 }

@@ -78,6 +78,15 @@ export const SIGNAL_MAP: Record<L0Signal, SignalMapping> = {
     job_spec: "steer-or-queue-mid-flight",
     signature: "killed:incomplete-turn",
   },
+  "send-failed-delivery": {
+    // A backstop send that failed/partially delivered — the user asked and the
+    // agent answered, but the answer never fully landed. That is a delivery
+    // failure of the talk-to-agents contract, akin to reply-delivery-failure.
+    failure_mode: "success-theater",
+    severity: 3,
+    job_spec: "talk-to-agents-from-anywhere",
+    signature: "send-failed:turn-flush-backstop",
+  },
   "represent-escalation": {
     failure_mode: "drift",
     severity: 1,
