@@ -9,6 +9,8 @@ import {
   renderProfileClaudeTemplate,
   renderVaultProtocolFragment,
 } from "./profiles.js";
+import { scaffoldAgent } from "./scaffold.js";
+import type { AgentConfig, TelegramConfig } from "../config/schema.js";
 
 describe("getProfilePath", () => {
   it("resolves a real profile that exists on disk", () => {
@@ -626,6 +628,49 @@ describe("delegation recency (regression #3231)", () => {
         tailDelegationIdx,
         `${profile}: delegation golden rule must appear AFTER Act-in-turn (recency)`,
       ).toBeGreaterThan(actInTurnIdx);
+    }
+  });
+
+  // L1 (review PR #3232): the composeClaudeMd helper above reconstructs its
+  // OWN append-order array, so a reorder INSIDE scaffold.ts (e.g. moving the
+  // delegation append before execution-discipline) would NOT be caught by the
+  // helper-based test — contradicting its "a future reorder can't silently
+  // regress it" claim. This test exercises the REAL production compose path
+  // (scaffoldAgent → writeTwoSectionClaudeMdWithFingerprint) and asserts the
+  // tail-recency ordering in the byte-for-byte output every agent actually
+  // ships with. It is red-on-regression if scaffold.ts reorders the appends.
+  it("real scaffolded CLAUDE.md places the delegation tail AFTER Act-in-turn on every profile", () => {
+    const telegramConfig: TelegramConfig = {
+      bot_token: "123456:ABC-DEF",
+      forum_chat_id: "-1001234567890",
+    };
+    const profiles = ["default", "coding", "executive-assistant", "health-coach"];
+    for (const profile of profiles) {
+      const tmp = mkdtempSync(join(tmpdir(), "switchroom-scaffold-recency-"));
+      try {
+        const config = {
+          extends: profile,
+          topic_name: "Recency Test",
+          schedule: [],
+        } as unknown as AgentConfig;
+        const result = scaffoldAgent(`recency-${profile}`, config, tmp, telegramConfig);
+        const claude = readFileSync(join(result.agentDir, "CLAUDE.md"), "utf-8");
+
+        const actInTurnIdx = claude.indexOf(actInTurnMarker);
+        const tailDelegationIdx = claude.indexOf(tailDelegationMarker);
+
+        expect(actInTurnIdx, `${profile}: Act-in-turn marker present in production output`).toBeGreaterThan(-1);
+        expect(tailDelegationIdx, `${profile}: tail delegation fragment present in production output`).toBeGreaterThan(-1);
+        // Load-bearing: in the REAL scaffolded file the delegation golden rule
+        // must sit AFTER Act-in-turn. If scaffold.ts's append order regresses,
+        // this fails even though the helper-based test above would not.
+        expect(
+          tailDelegationIdx,
+          `${profile}: production CLAUDE.md must place delegation golden rule AFTER Act-in-turn (recency)`,
+        ).toBeGreaterThan(actInTurnIdx);
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
     }
   });
 
