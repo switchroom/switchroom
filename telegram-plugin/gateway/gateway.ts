@@ -192,7 +192,8 @@ import { appendActivityLabel, clipNarrative, renderActivityFeedWithNested, forma
 import { formatModelLabel } from '../model-label.js'
 import { createSessionModelSource } from './session-model-source.js'
 import { runSilentTurnHeartbeatTick } from '../feed-heartbeat-climb.js'
-import { REPLY_TOOLS, isDraftOfReply } from '../narrative-dedup.js'
+import { REPLY_TOOLS } from '../narrative-dedup.js'
+import { NarrativeFlushController } from '../narrative-flush.js'
 import { toolLabel } from '../tool-labels.js'
 import { createTypingWrapper } from '../typing-wrap.js'
 import { createTurnTypingLoop } from './turn-typing-loop.js'
@@ -3249,17 +3250,19 @@ type CurrentTurn = {
   // (via `renderActivityFeed`) as a capped chronological list into the
   // in-place edited activity message and clears on reply. Reset per turn.
   mirrorLines: string[]
-  // Narrative-dedup gate state (JSONL-text-narrative primitive). A `text`
-  // block is held here for ONE lookahead step so the next event (a tool_use
-  // or turn_end) can decide draft-then-send (SUPPRESS, it duplicates the
-  // reply) vs working-narration (SHOW it as a transient mirrorLines step).
-  // Null when nothing is pending. The pure decision lives in
-  // narrative-dedup.ts; this slot is the per-turn cursor. Reset per turn.
-  // Invariant `chat-is-the-single-source-of-truth`: a SHOWN narrative is
-  // rendered through the SAME appendActivityLabel→renderStepFeed path as a
-  // tool step — a transient, clipped, rolling-window line replaced by the
-  // next event, never a persisted parallel mirror.
-  pendingNarrative: { text: string } | null
+  // Narrative-dedup gate state (JSONL-text-narrative primitive). A `text` block
+  // is parked for ONE lookahead step so the next event (a tool_use or turn_end)
+  // can decide draft-then-send (SUPPRESS, it duplicates the reply) vs
+  // working-narration (SHOW it as a transient mirrorLines step). The pure park /
+  // timer / retract state machine lives in `narrative-flush.ts`; this controller
+  // is the per-turn instance, wired with the SHOW effect (`showNarrativeStep`),
+  // the RETRACT effect (splice the timer-painted line out of `mirrorLines`), and
+  // a real `unref`'d `setTimeout` scheduler for the ~`PENDING_NARRATIVE_FLUSH_MS`
+  // early paint. Reset per turn. Invariant `chat-is-the-single-source-of-truth`:
+  // a SHOWN narrative renders through the SAME appendActivityLabel→renderStepFeed
+  // path as a tool step — transient, clipped, rolling-window, never a persisted
+  // parallel mirror.
+  narrativeGate: NarrativeFlushController
   // Most-recently-seen reply/stream_reply `input.text` for this turn — the
   // ACTUAL delivered answer surface. Set wherever a REPLY_TOOL tool_use is
   // handled in the reducer. `flushPendingNarrativeAtTurnEnd` compares a
@@ -4889,6 +4892,11 @@ function endCurrentTurnAtomic(
     clearTimeout(turn.noReplyDrainTimer)
     turn.noReplyDrainTimer = null
   }
+  // Teardown the narrative gate's early-paint timer so it can neither leak past
+  // the turn nor fire against a torn-down turn. (Idempotent — no-op when never
+  // armed / already fired. `flushPendingNarrativeAtTurnEnd` on the turn_end event
+  // normally disarms it first; this is the belt-and-braces teardown net.)
+  turn.narrativeGate?.teardown()
   // Pass `turn` so purgeReactionTracking sees the authoritative
   // replyCalled flag even though we just nulled module-scope
   // currentTurn. Without this, the shadow trace's outboundEmitted
@@ -15538,6 +15546,80 @@ function composeTurnActivity(turn: CurrentTurn, final = false, liveSuffix = ''):
 }
 
 /**
+ * Time-box for the parked-narrative early-paint (see `narrative-flush.ts`).
+ * If a parked opening narration gets no lookahead event (tool_use / next text /
+ * turn_end) within this window — the "narrate, then think before the first tool"
+ * case that produced the visible gap — the flush timer paints it via the SAME
+ * `showNarrativeStep` path a lookahead would. Chosen so a normal draft-then-send
+ * `reply` (emitted right after the text block) lands FIRST and cancels the timer;
+ * but correctness does NOT depend on that race — a timer-painted block that later
+ * proves to be the reply is deterministically retracted (see the RETRACT effect
+ * wired into the controller below). Named const so a test can pin it.
+ */
+const PENDING_NARRATIVE_FLUSH_MS = 250
+
+/**
+ * Retract a narration step the flush timer painted EARLY that turned out to draft
+ * the outgoing reply — the effect half of the anti-double-print guarantee's timer
+ * path. Splice the line out of `mirrorLines` and re-render, so neither the live
+ * nor the finalized card surfaces the answer as a narration step. The splice runs
+ * synchronously BEFORE the reply's `clearActivitySummary` finalize reads
+ * `mirrorLines`, so the persisted card is clean regardless of the re-render.
+ */
+function retractNarrativeLine(turn: CurrentTurn, text: string): void {
+  const clipped = clipNarrative(text)
+  const idx = turn.mirrorLines.lastIndexOf(clipped)
+  if (idx === -1) return // rolled out of the window already — nothing to retract
+  turn.mirrorLines.splice(idx, 1)
+  // Live re-render without the retracted line (the finalize path reads the same
+  // spliced array; this only matters for the interim-ack case where finalize
+  // isn't called on this reply). Guarded on a non-null render so an emptied feed
+  // doesn't blank the card.
+  const rerender = composeTurnActivity(turn)
+  if (rerender == null) return
+  turn.activityPendingRender = rerender
+  const ea = emissionAuthorityFor(turn)
+  cardDrainGate(turn, ea, () => {
+    if (ea.mayDrain(turn)) {
+      ea.openOrEditCard('narrative', () => {
+        turn.activityInFlight = drainActivitySummary(turn, 'narrative')
+      })
+    }
+  })
+}
+
+/**
+ * Build a per-turn narrative gate: the pure park/timer/retract state machine
+ * (`narrative-flush.ts`) wired to THIS turn's SHOW effect (`showNarrativeStep`),
+ * RETRACT effect (`retractNarrativeLine`), and a real `unref`'d `setTimeout`
+ * scheduler. The scheduler captures the turn's own timer handle so a turn swap
+ * can't mis-target it — mirrors the `noReplyDrainTimer` discipline.
+ */
+function makeNarrativeGate(turn: CurrentTurn): NarrativeFlushController {
+  let handle: ReturnType<typeof setTimeout> | null = null
+  return new NarrativeFlushController(
+    {
+      show: (text) => showNarrativeStep(turn, text),
+      retractShown: (text) => retractNarrativeLine(turn, text),
+    },
+    {
+      arm: (fn, ms) => {
+        if (handle != null) clearTimeout(handle)
+        handle = setTimeout(fn, ms)
+        handle.unref?.()
+      },
+      disarm: () => {
+        if (handle != null) {
+          clearTimeout(handle)
+          handle = null
+        }
+      },
+    },
+    PENDING_NARRATIVE_FLUSH_MS,
+  )
+}
+
+/**
  * Render a SHOWN narrative text block as a transient liveness step — the
  * same path a tool label takes (appendActivityLabel → renderStepFeed), so
  * the narrative line is rolling-window-clipped and replaced by the next
@@ -15582,27 +15664,20 @@ function resolvePendingNarrativeOnTool(
   toolName: string,
   input: Record<string, unknown> | undefined,
 ): void {
-  const pending = turn.pendingNarrative
-  if (pending == null) return
-  turn.pendingNarrative = null
-  if (REPLY_TOOLS.has(toolName)) {
-    const replyText = typeof input?.text === 'string' ? (input.text as string) : ''
-    if (isDraftOfReply(pending.text, replyText)) return // draft of the answer → SUPPRESS
-  }
-  showNarrativeStep(turn, pending.text) // working preamble / post-action narration → SHOW
+  // Delegate to the pure park/timer/retract kernel: it cancels the early-paint
+  // timer, retracts a timer-painted block that THIS reply drafts (anti-double-
+  // print), then SHOWs / SUPPRESSes the parked block. See narrative-flush.ts §2.
+  turn.narrativeGate.resolveOnTool(toolName, input)
 }
 
 /**
  * Narrative-dedup gate, step 1 (reducer-side): a new narrative block
  * arrived. A previously-pending block had nothing reply-shaped immediately
  * after it (pure narration) → flush it as SHOWN, then stage the new one for
- * one lookahead step. See narrative-dedup.ts §2b.
+ * one lookahead step AND arm the time-boxed early paint. See narrative-flush.ts.
  */
 function stagePendingNarrative(turn: CurrentTurn, text: string): void {
-  if (turn.pendingNarrative != null) {
-    showNarrativeStep(turn, turn.pendingNarrative.text)
-  }
-  turn.pendingNarrative = { text }
+  turn.narrativeGate.stage(text)
 }
 
 /**
@@ -15610,14 +15685,11 @@ function stagePendingNarrative(turn: CurrentTurn, text: string): void {
  * trailing narrative block and nothing after it. SUPPRESS only when the turn
  * already delivered its answer via reply/stream_reply and the trailing text
  * is a draft of that answer; otherwise SHOW (genuine trailing narration like
- * "Done — all green."). See narrative-dedup.ts §2b.
+ * "Done — all green."). Also cancels the early-paint timer and retracts a
+ * timer-painted draft of the delivered answer. See narrative-flush.ts §3.
  */
 function flushPendingNarrativeAtTurnEnd(turn: CurrentTurn, lastReplyText: string): void {
-  const pending = turn.pendingNarrative
-  if (pending == null) return
-  turn.pendingNarrative = null
-  if (lastReplyText.length > 0 && isDraftOfReply(pending.text, lastReplyText)) return // trailing duplicate of the answer
-  showNarrativeStep(turn, pending.text)
+  turn.narrativeGate.flushAtTurnEnd(lastReplyText)
 }
 
 /**
@@ -16449,6 +16521,13 @@ function handleSessionEvent(ev: SessionEvent): void {
           clearTimeout(prior.orphanedReplyTimeoutId)
           prior.orphanedReplyTimeoutId = null
         }
+        // Same bounded-leak class (early-paint 250ms setTimeout): the prior
+        // turn may have armed its narrative gate's early-paint timer before
+        // being superseded. Left untorn, ~250ms later it fires showNarrativeStep
+        // on the dead turn and can paint a stale narration card below the new
+        // turn's surface. Teardown is guard-safe and idempotent (no-op when never
+        // armed / already fired / already disarmed by the prior turn's turn_end).
+        prior?.narrativeGate?.teardown()
         // #1067: swap the entire turn atom in one assignment. Every
         // handler captures `const turn = currentTurn` at entry, so a
         // captured-then-awaited read can't reattribute to the new turn.
@@ -16526,7 +16605,10 @@ function handleSessionEvent(ev: SessionEvent): void {
           activityEverOpened: false,
           activityDrainFailures: 0,
           mirrorLines: [],
-          pendingNarrative: null,
+          // Assigned immediately after this literal via makeNarrativeGate(next) —
+          // the controller's SHOW/RETRACT effects close over the turn object, which
+          // can't reference itself inside its own initializer.
+          narrativeGate: undefined as unknown as NarrativeFlushController,
           lastReplyText: '',
           foregroundSubAgents: new Map(),
           answerStream: null,
@@ -16539,6 +16621,9 @@ function handleSessionEvent(ev: SessionEvent): void {
             statusKey(ev.chatId, enqThreadIdNum),
           ),
         }
+        // Wire the per-turn narrative gate now that `next` exists (its SHOW/RETRACT
+        // effects close over the turn). Born with this turn, torn down at turn end.
+        next.narrativeGate = makeNarrativeGate(next)
         // PR-4e — route the turn-SET through the keyed accessor: flag-OFF assigns
         // the singleton (byte-identical to `currentTurn = next`); flag-ON sets the
         // per-topic `byKey[statusKey]` entry AND the most-recent mirror. The key is
@@ -17294,8 +17379,8 @@ function handleSessionEvent(ev: SessionEvent): void {
       // delivered reply text and SUPPRESS the duplicate; otherwise SHOW
       // genuine trailing narration ("Done — all green."). Must run BEFORE
       // clearActivitySummary so a SHOWN line lands in the feed's final
-      // render. Always clears turn.pendingNarrative so it can't leak across
-      // turns.
+      // render. Always clears the gate's parked block (and disarms its
+      // early-paint timer) so nothing can leak across turns.
       //
       // NIT 2 (reply-proxy precision): use `turn.lastReplyText` (the
       // most-recent reply/stream_reply input.text) rather than
