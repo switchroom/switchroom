@@ -71,30 +71,81 @@ const KERNEL_SOCKET =
 const TOOL_PREFIX = "mcp__ms-365__";
 
 /**
- * Gated softeria write tools — RFC §8.
+ * Gated softeria write tools — AUTHORITATIVE names.
  *
- * **OneDrive writes** — upload-file-content (≤4MB inline),
- * create-upload-session (>4MB chunked).
+ * Names are the ground-truth softeria `mcp__ms-365__*` tool names,
+ * harvested from real invocations across the fleet's agent transcripts
+ * (88 distinct names observed) and reconciled in the MS-365 approval
+ * design review (2026-07-13). They replace the earlier conjectured names
+ * (`create-event`/`update-event`/`update-message`/…) which never existed
+ * upstream — softeria names calendar/mail writes as `*-calendar-event`
+ * and `*-mail-message`.
  *
- * **Calendar writes** — create-event, update-event, delete-event.
+ * This set is primarily documentation + an explicit-gate assertion:
+ * `isGatedMs365Tool` fail-closes ANY unrecognized `mcp__ms-365__` tool to
+ * "require approval" regardless, so a name missing here is still gated.
+ * Its load-bearing job is (a) to keep writes and reads from ever
+ * overlapping and (b) to make `send-mail` / `send` explicitly gate-and-
+ * allow (post a card the operator can approve) rather than riding the
+ * fail-closed path implicitly.
  *
- * **Mail edits** — update-message, delete-message. Mail.Send is NOT in
- * v1 scope (drafts only); the gated set doesn't include send tools to
- * defend against scope creep.
- *
- * Tool-name conjecture: softeria's MCP server publishes tool names as
- * `<verb>-<surface>` (e.g. `upload-file-content`). Claude Code
- * namespaces them as `mcp__<server-key>__<tool-name>`. The exact
- * tool-name list is verified at UAT time in PR 5.
+ * Fleet config currently enables `mail|calendar` only, but the OneDrive
+ * writes are included so the classification stays correct on any agent
+ * that enables the drive surface.
  */
 export const GATED_MS365_WRITE_TOOLS = new Set<string>([
+  // ── Calendar writes ──
+  "create-calendar",
+  "update-calendar",
+  "delete-calendar",
+  "create-calendar-event",
+  "create-specific-calendar-event",
+  "update-calendar-event",
+  "update-specific-calendar-event",
+  "delete-calendar-event",
+  "delete-specific-calendar-event",
+  "accept-calendar-event",
+  "decline-calendar-event",
+  "tentatively-accept-calendar-event",
+  "cancel-calendar-event",
+  "forward-calendar-event",
+  "dismiss-calendar-event-reminder",
+  "snooze-calendar-event-reminder",
+  "create-my-calendar-permission",
+  "update-my-calendar-permission",
+  "delete-my-calendar-permission",
+  // ── Mail writes ──
+  "send-mail",
+  "send",
+  "create-draft-email",
+  "update-mail-message",
+  "delete-mail-message",
+  "move-mail-message",
+  "copy-mail-message",
+  "reply-mail-message",
+  "reply-all-mail-message",
+  "forward-mail-message",
+  "create-mail-attachment-upload-session",
+  "add-mail-attachment",
+  "delete-mail-attachment",
+  "create-mail-folder",
+  "create-mail-child-folder",
+  "update-mail-folder",
+  "delete-mail-folder",
+  "create-mail-rule",
+  "update-mail-rule",
+  "delete-mail-rule",
+  "update-mailbox-settings",
+  // ── OneDrive writes (only reachable on agents that enable the drive surface) ──
   "upload-file-content",
   "create-upload-session",
-  "create-event",
-  "update-event",
-  "delete-event",
-  "update-message",
-  "delete-message",
+  "create-onedrive-folder",
+  "delete-onedrive-file",
+  "move-rename-onedrive-item",
+  "copy-drive-item",
+  "share-drive-item",
+  "create-drive-item-share-link",
+  "delete-drive-item-permission",
 ]);
 
 /**
@@ -104,33 +155,57 @@ export const GATED_MS365_WRITE_TOOLS = new Set<string>([
  * this allowlist — so a renamed or newly-added upstream WRITE tool defaults
  * to "require approval" rather than sailing through unrecognized.
  *
- * Names are sourced from softeria's read surface (docs/microsoft-workspace
- * + RFC #1873): OneDrive reads, calendar reads, mail reads, and identity.
+ * Names are the AUTHORITATIVE softeria read surface (design review
+ * 2026-07-13): calendar reads, mail reads, OneDrive reads, and the
+ * identity/session control-plane. They replace the earlier conjectured
+ * names (`list-files`/`list-events`/`get-message`/`whoami`/… — none of
+ * which exist upstream), which caused every REAL read (`get-calendar-view`,
+ * `list-mail-messages`, `get-mail-message`, …) to be misclassified as an
+ * unrecognized write and posted an approval card (Bug 1).
+ *
  * The cost of an omission here is only an extra approval prompt on a read
- * (annoying, safe) — never an ungated write (unsafe). When UAT (PR 5)
- * confirms softeria's exact read-tool names, add any missing ones here.
+ * (annoying, safe) — never an ungated write (unsafe).
  */
 export const KNOWN_SAFE_MS365_READ_TOOLS = new Set<string>([
-  // OneDrive / Drive reads
-  "list-files",
-  "list-drive-items",
-  "get-drive-item",
-  "download-bytes",
-  "search-files",
-  // Calendar reads
-  "list-events",
-  "get-event",
+  // ── Calendar reads ──
   "list-calendars",
-  "get-calendar",
-  // Mail reads
-  "list-messages",
-  "get-message",
-  "search-mail",
+  "get-calendar-view",
+  "get-specific-calendar-view",
+  "list-calendar-events",
+  "list-specific-calendar-events",
+  "get-calendar-event",
+  "get-specific-calendar-event",
+  "list-calendar-event-instances",
+  "list-calendar-events-delta",
+  "list-calendar-view-delta",
+  "list-my-calendar-permissions",
+  // ── Mail reads ──
+  "list-mail-messages",
+  "get-mail-message",
+  "get-mail-message-mime",
   "list-mail-folders",
-  "get-mail-folder",
-  // Identity / account
-  "whoami",
-  "get-current-user",
+  "list-mail-child-folders",
+  "list-mail-folder-messages",
+  "list-mail-folder-messages-delta",
+  "list-mail-attachments",
+  "list-mail-rules",
+  "get-mail-tips",
+  "get-mailbox-settings",
+  // ── OneDrive reads (present on agents that enable the drive surface) ──
+  "get-drive-item",
+  "get-drive-root-item",
+  "download-bytes",
+  "list-drives",
+  "list-folder-files",
+  "search-onedrive-files",
+  "get-drive-delta",
+  // ── Identity / session (control-plane; no card) ──
+  "login",
+  "logout",
+  "verify-login",
+  "list-accounts",
+  "select-account",
+  "remove-account",
 ]);
 
 /**
@@ -152,6 +227,47 @@ export function isGatedMs365Tool(toolName: string): boolean {
   if (KNOWN_SAFE_MS365_READ_TOOLS.has(bare)) return false;
   // Known write OR unrecognized MS-365 tool → require approval (fail-closed).
   return true;
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Operator allowFrom discovery
+// ────────────────────────────────────────────────────────────────────────
+
+/**
+ * Read the operator allowFrom set from `access.json` inside the agent
+ * container. Mirrors `drive-write-pretool.ts:loadAllowFrom()` — the WORKING
+ * Drive path — verbatim in mechanism.
+ *
+ * This is the fix for Bug 2: the verdict lookup previously passed `[]` as the
+ * `current_approver_set`, which the kernel's `evaluateDecisionRow` drift check
+ * compared against the decision row's canonical set (`[tapper_uid]`). `[] ≠
+ * [tapper_uid]` → drift branch → `drift_revoked`, so EVERY operator Approve
+ * was silently reverted to a deny. Passing the real operator set (which, in
+ * the single-operator DM case, canonicalizes identically to `[tapper_uid]`)
+ * makes the grant stick — exactly as it does for Drive.
+ *
+ * `access.json` lives at `<TELEGRAM_STATE_DIR>/access.json` inside the agent
+ * container. The homedir fallback only kicks in for host-side invocations
+ * (tests, debug tools). If no operator is paired the list is empty — the poll
+ * then can't match the `[tapper_uid]` record and fails closed (safe).
+ */
+export function loadAllowFrom(): string[] {
+  const stateDir =
+    process.env.TELEGRAM_STATE_DIR ??
+    join(homedir(), ".claude", "channels", "telegram");
+  const accessPath = join(stateDir, "access.json");
+  try {
+    const raw = readFileSync(accessPath, "utf8");
+    const j = JSON.parse(raw) as { allowFrom?: unknown };
+    if (Array.isArray(j.allowFrom)) {
+      return (j.allowFrom as unknown[]).filter(
+        (s): s is string => typeof s === "string",
+      );
+    }
+  } catch {
+    /* not paired or no access file */
+  }
+  return [];
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -476,11 +592,15 @@ async function main(): Promise<void> {
   const deadline = response.expiresAtMs ?? Date.now() + HOOK_TIMEOUT_MS;
   // Correlate strictly by the request_id we just registered — not by scope
   // (concurrent same-scope writes would otherwise cross-attribute verdicts).
-  // We don't know the approver_set in the hook — pass an empty list; the
-  // kernel uses the snapshot taken at register time.
+  // Pass the REAL operator allowFrom set (Bug 2 fix): the kernel's
+  // evaluateDecisionRow drift check compares this against the decision row's
+  // canonical set. Passing `[]` (the old bug) always drifted → drift_revoked,
+  // so no Approve ever stuck. Mirror the working Drive pretool and pass the
+  // loaded allowFrom.
+  const approverSet = loadAllowFrom();
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, KERNEL_POLL_INTERVAL_MS));
-    const lookup = await approvalLookupByRequest(agentName, requestId, []);
+    const lookup = await approvalLookupByRequest(agentName, requestId, approverSet);
     if (!lookup) continue;
     const state = lookup.state;
     if (state === "granted") allow();
