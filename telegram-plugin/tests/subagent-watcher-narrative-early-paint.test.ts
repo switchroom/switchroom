@@ -39,7 +39,7 @@ function subAgentToolUse(name: string, id: string) {
   return { type: 'assistant', message: { content: [{ type: 'tool_use', name, id, input: {} }] } }
 }
 
-interface Cue { progressLine?: string; latestSummary: string }
+interface Cue { progressLine?: string; latestSummary: string; skeleton?: boolean }
 
 describe('worker/sub-agent opening-narration early paint (Residual A)', () => {
   let tmpRoot = ''
@@ -64,8 +64,8 @@ describe('worker/sub-agent opening-narration early paint (Residual A)', () => {
     const watcher = startSubagentWatcher({
       agentDir,
       onFinish: () => {},
-      onProgress: ({ agentId, progressLine, latestSummary }) => {
-        cues.push({ agentId, progressLine, latestSummary })
+      onProgress: ({ agentId, progressLine, latestSummary, skeleton }) => {
+        cues.push({ agentId, progressLine, latestSummary, skeleton })
       },
       stallThresholdMs: 600_000,
       silentSynthesisStallThresholdMs: 600_000,
@@ -91,8 +91,10 @@ describe('worker/sub-agent opening-narration early paint (Residual A)', () => {
   }
 
   function narrativeCues(cues: Cue[]): string[] {
-    // Narrative cues carry NO progressLine; tool-label cues do.
-    return cues.filter((c) => c.progressLine == null).map((c) => c.latestSummary)
+    // Narrative cues carry NO progressLine; tool-label cues do. Skeleton
+    // liveness cues (#3231) also carry no progressLine but an empty summary —
+    // exclude them here so this counts only real narrative content.
+    return cues.filter((c) => !c.skeleton && c.progressLine == null).map((c) => c.latestSummary)
   }
 
   it('paints a parked opening narration after the flush window with NO tool event', () => {

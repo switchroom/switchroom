@@ -277,6 +277,12 @@ export function applySubagentsSchema(db: SqliteDatabase): void {
   // column is guaranteed to exist (either created with the table or added by
   // the migration above).
   db.exec('CREATE INDEX IF NOT EXISTS subagents_jsonl_id ON subagents(jsonl_agent_id)')
+  // Same deferred-index rationale as jsonl_agent_id above: parent_agent_id is
+  // added by the ALTER migration for pre-existing tables, so its index must be
+  // created here (after the column is guaranteed to exist), not in the base SQL.
+  // Backs the per-poll child-existence probe in subagent-watcher.ts
+  // (`SELECT 1 FROM subagents WHERE parent_agent_id = ? LIMIT 1`).
+  db.exec('CREATE INDEX IF NOT EXISTS subagents_parent_agent ON subagents(parent_agent_id)')
 }
 
 // ---------------------------------------------------------------------------

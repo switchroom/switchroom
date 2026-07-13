@@ -264,6 +264,36 @@ describe('decideSubagentProgress', () => {
     if (!d.deliver) expect(d.reason).toBe('foreground')
   })
 
+  // #3233 — worker-feed-DISABLED legacy path: a contentless skeleton liveness
+  // cue must NOT be relayed as a synthesized "still working" inbound (that
+  // would be a blank card). It degrades to a no-op, deterministically, BEFORE
+  // bucketing so it can never advance the bucket tracker.
+  it('skeleton liveness cue is dropped (no blank card) even when every other gate would pass', () => {
+    // Same input that DELIVERS in the happy-path test above (bucket 1, chat
+    // resolves) — only `skeleton` flips it off. Empty summary mirrors the real
+    // skeleton cue.
+    const d = decideSubagentProgress(baseInput({ skeleton: true, latestSummary: '' }))
+    expect(d.deliver).toBe(false)
+    if (!d.deliver) expect(d.reason).toBe('skeleton-liveness')
+  })
+
+  it('skeleton suppression fires before bucketing — a background skeleton at bucket>=1 never delivers', () => {
+    // ≤1 relay per interval is trivially satisfied: skeleton cues deliver ZERO
+    // inbounds regardless of how many no-growth polls fire within a bucket.
+    for (const elapsedMs of [7 * 60 * 1000, 8 * 60 * 1000, 9 * 60 * 1000]) {
+      const d = decideSubagentProgress(baseInput({ skeleton: true, latestSummary: '', elapsedMs }))
+      expect(d.deliver, `elapsedMs=${elapsedMs}`).toBe(false)
+    }
+  })
+
+  it('a NON-skeleton cue with identical inputs still delivers (guard is skeleton-scoped, not summary-scoped)', () => {
+    // Red-on-regression companion: proves the drop keys on `skeleton`, not on
+    // the empty summary — a real tool-only cue (empty prose summary) still
+    // delivers, so the guard cannot silently swallow genuine progress.
+    const d = decideSubagentProgress(baseInput({ skeleton: false, latestSummary: '' }))
+    expect(d.deliver).toBe(true)
+  })
+
   it('falls back to owner chat when fleet chat is empty', () => {
     const d = decideSubagentProgress(baseInput({ fleetChatId: '' }))
     expect(d.deliver).toBe(true)

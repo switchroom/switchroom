@@ -267,6 +267,26 @@ describe('nested (depth-2+) worker — end-to-end visibility harness', () => {
     expect(lastChild.text).not.toContain('starting…')
     expect(lastChild.text).toContain('index.ts')
 
+    // #3233 — DELIBERATE orchestrator-suppression behaviour. The depth-1
+    // 'depth-1 orchestrator' parent ran ZERO tools of its own: it only
+    // DISPATCHED the nested child. The skeleton first-paint cue (#3231) fires
+    // on every no-growth poll, so a naive implementation gives that pure
+    // orchestrator its OWN persistent "starting…" worker-feed row — redundant
+    // clutter, because the child's row already carries the liveness. The
+    // watcher suppresses the skeleton cue for any entry that has dispatched a
+    // child (parent_agent_id linkage), so the orchestrator NEVER earns a
+    // "starting…" row while its child provides the live signal. This is NOT a
+    // "0 own tools" rule (that would re-break the 205s-blackout incident this
+    // PR fixes — a leaf that blocks on its FIRST tool also has 0 completed
+    // tools and MUST still paint); it keys strictly on the parent/child link.
+    const allFeed = [...h.bot.sent, ...h.bot.edits]
+    const orchestratorStartingRows = allFeed.filter(
+      (m) => m.text.includes('depth-1 orchestrator') && m.text.includes('starting…'),
+    )
+    expect(orchestratorStartingRows.length).toBe(0)
+    // …while the child (a genuine leaf) DID surface real, live tool activity.
+    expect(childMsgs.some((m) => m.text.includes('index.ts'))).toBe(true)
+
     // More tool activity → climbing tool count, still live.
     h.appendWorker('child01', toolUse('t2', 'Bash', { command: 'ls -la /repo' }))
     h.advance(1000)

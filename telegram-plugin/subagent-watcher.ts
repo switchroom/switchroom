@@ -628,6 +628,12 @@ export interface SubagentWatcherConfig {
      *  assistant line — the gateway then falls back to the registry's
      *  dispatch-time model. */
     model?: string
+    /** True for a growth-INDEPENDENT skeleton liveness cue (#3231): fired on a
+     *  no-growth poll for a running entry so the card can first-paint / stay
+     *  alive without waiting for JSONL growth. Carries the entry's real state
+     *  but an EMPTY `latestSummary`/`progressLine` — never fabricated content.
+     *  Consumers that count real narrative/tool cues must exclude it. */
+    skeleton?: boolean
   }) => void
   /** `Date.now` override for tests. */
   now?: () => number
@@ -1088,6 +1094,9 @@ export function readSubTail(
     progressLine?: string
     /** Live model this worker is running (see SubagentWatcherConfig.onProgress). */
     model?: string
+    /** Growth-independent skeleton liveness cue (#3231). See the identically
+     *  named field on SubagentWatcherConfig.onProgress. */
+    skeleton?: boolean
   }) => void,
 ): void {
   try {
@@ -1103,7 +1112,83 @@ export function readSubTail(
       tail.cursor = 0
       tail.pendingPartial = ''
     }
-    if (stat.size === tail.cursor) return
+    if (stat.size === tail.cursor) {
+      // First-paint independence (#3231): the worker card is otherwise driven
+      // ONLY by growth-triggered progress cues below, so a running worker whose
+      // JSONL is not currently growing surfaces NOTHING. That is the ~90-205s
+      // invisible-card bug observed live (a57fbf, 2026-07-13): an async
+      // foreground sub-agent did two Bash calls, then its first tool BLOCKED for
+      // ~99s (no JSONL growth → no cue), and — because its spawning turn had
+      // already ended — no nest and no worker-feed row existed to paint. Its
+      // card did not appear until 205s after registration, on the next growth
+      // event that happened to be classified to the feed. Fire a growth-INDEPENDENT
+      // skeleton liveness cue on every no-growth poll for a live entry so the
+      // gateway can paint (and keep alive) the card from registration onward,
+      // uniformly across ALL spawn origins/nesting levels. The cue carries the
+      // entry's REAL current state (lastTool/toolCount/model) but an EMPTY step
+      // line — no fabricated content: it is inert on the foreground-nest path
+      // (empty child → no-op, the parent's own card owns the live turn) and
+      // creates/refreshes the orphan/background worker-feed row (→ "starting…",
+      // whose first paint the feed's own firstPaintMin + heartbeat then owns).
+      if (onProgress != null && entry.state === 'running' && !entry.historical) {
+        // Child-aware suppression (#3233): the skeleton cue exists to paint a
+        // LEAF worker whose card would otherwise be invisible (the 205s
+        // blackout). A pure-ORCHESTRATOR parent — one that has dispatched a
+        // descendant of its own — must NOT earn a redundant "starting…"
+        // liveness row: the child surfaces its own live row in the same worker
+        // feed, so an extra skeleton row for the parent is pure feed clutter
+        // (fails the no-noise / never-storm bar). The discriminator is
+        // deliberately NOT "0 own tools" — a leaf that registers and BLOCKS on
+        // its very first tool has 0 completed tools and MUST still paint.
+        // Instead, suppress when THIS entry has EVER dispatched a child (any
+        // child registry row keyed by parent_agent_id = this entry's jsonl
+        // agentId; recordNestedSubagentDispatch stamps it). "Ever", not "a
+        // currently-running child": the skeleton cue is only the NO-GROWTH
+        // fallback, so suppressing it for an orchestrator never hides real
+        // work — if the parent does its own tools, those fire real growth
+        // cues and paint the row; if it only orchestrates, its children carry
+        // the liveness. Using "currently running" instead would re-paint a
+        // spurious orchestrator "starting…" the moment its child finished. A
+        // genuine leaf has no child row at all, so it keeps firing the
+        // skeleton cue and paints promptly — the 205s-blackout class is intact.
+        let hasChild = false
+        if (db != null) {
+          try {
+            const kid = db
+              .prepare(
+                'SELECT 1 FROM subagents WHERE parent_agent_id = ? LIMIT 1',
+              )
+              .get(entry.agentId)
+            hasChild = kid != null
+          } catch (kidErr) {
+            // Best-effort: an absent/failed linkage read is treated as "leaf"
+            // so we never suppress a genuine blackout paint on a DB hiccup.
+            log?.(`subagent-watcher: skeleton child-check error ${entry.agentId}: ${(kidErr as Error).message}`)
+          }
+        }
+        if (!hasChild) {
+          try {
+            onProgress({
+              agentId: entry.agentId,
+              description: entry.description,
+              latestSummary: '',
+              elapsedMs: now - entry.dispatchedAt,
+              prevBucketIdx: entry.lastProgressBucketIdx,
+              setBucketIdx: (b: number) => {
+                entry.lastProgressBucketIdx = b
+              },
+              lastTool: entry.lastTool,
+              toolCount: entry.toolCount,
+              model: entry.currentModel,
+              skeleton: true,
+            })
+          } catch (cbErr) {
+            log?.(`subagent-watcher: onProgress (skeleton) callback error ${entry.agentId}: ${(cbErr as Error).message}`)
+          }
+        }
+      }
+      return
+    }
 
     const buf = Buffer.alloc(stat.size - tail.cursor)
     const fd = fs.openSync(entry.filePath, 'r')

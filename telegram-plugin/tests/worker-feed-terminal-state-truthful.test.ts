@@ -87,6 +87,46 @@ describe('worker terminal state is truthful for reaped workers (Residual B)', ()
     expect(last).not.toContain('incomplete')
   })
 
+  // #3233 terminal-window race: the skeleton first-paint cue fires on EVERY
+  // no-growth poll, so one can land on a row that `finish()` just finalized
+  // (watcher poll cadence ≈ seconds). The `finalized` latch must absorb it —
+  // a late skeleton `update()` must NOT resurrect a fresh `running` card on an
+  // already-done worker. This exercises that path with a skeleton-shaped cue
+  // (empty step line, running state) arriving after finish.
+  it('a late skeleton update() after finish() is absorbed by the finalized latch (no resurrection)', async () => {
+    let clock = 1000
+    const { feed, edits } = makeFeed(() => clock)
+    await feed.update('w', 'chat', runningView('background job', 'doing work', 1000))
+    await drain()
+    clock = 2000
+    await feed.finish('w', {
+      description: 'background job',
+      lastTool: null,
+      toolCount: 5,
+      latestSummary: 'the delivered result paragraph',
+      elapsedMs: 2000,
+      state: 'done',
+    })
+    await drain()
+    const editsAfterFinish = edits.length
+    // Late skeleton cue (empty latestSummary, running state) — the shape the
+    // watcher emits on a no-growth poll — lands AFTER finalization.
+    clock = 2500
+    await feed.update('w', 'chat', {
+      description: 'background job',
+      lastTool: null,
+      toolCount: 5,
+      latestSummary: '',
+      elapsedMs: 2500,
+      state: 'running',
+    })
+    await drain()
+    // No further edit, no resurrection: the terminal card stays `done`.
+    expect(edits.length).toBe(editsAfterFinish)
+    expect(edits[edits.length - 1].text).toContain('done')
+    expect(feed.has('w')).toBe(false)
+  })
+
   it('renderWorkerActivity renders the `incomplete` state as a finished card without a fabricated result', () => {
     const card = renderWorkerActivity({
       description: 'background job',
