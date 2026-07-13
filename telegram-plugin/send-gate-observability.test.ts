@@ -352,6 +352,146 @@ describe('createFloodWindowObserver — alerting', () => {
     expect(alerts).toHaveLength(1)
   })
 
+  // The operator-facing alert timestamps must render in the CONFIGURED local
+  // timezone, not UTC. The live incident that prompted this: a "flood ban
+  // cleared" card printed `2026-07-12T23:39:24Z to 2026-07-12T23:46:40Z UTC`,
+  // which is 9:39am–9:46am AEST in the fleet's configured zone. These assert
+  // the local rendering and would FAIL on the old `.toISOString()` output.
+  const OBSERVED = Date.parse('2026-07-12T23:39:24Z') // 2026-07-13 09:39 AEST
+  const UNTIL = Date.parse('2026-07-12T23:46:40Z') // 2026-07-13 09:46 AEST
+
+  it('renders the CLEARED card timestamps in the configured local tz (AEST), not UTC', async () => {
+    const clock = new TestClock()
+    const alerts: string[] = []
+    let windows: FloodWindowRecord[] = [
+      { scopeKey: 'global', untilTs: UNTIL, retryAfterSrc: '429', observedAt: OBSERVED },
+    ]
+    const obs = createFloodWindowObserver({
+      clock,
+      log: () => {},
+      stats: () => makeStats(),
+      readWindows: () => windows,
+      markAlerted: () => {},
+      sendAlert: async (t) => {
+        alerts.push(t)
+      },
+      operatorChatId: () => 'op',
+      alertThresholdMs: 60_000,
+      tz: 'Australia/Melbourne',
+    })
+
+    // Past threshold but global → operator unreachable → defer to close.
+    clock.cur = OBSERVED + 61_000
+    await obs.tick()
+    expect(alerts).toHaveLength(0)
+
+    // Window closes → deferred cleared card fires, in LOCAL time.
+    clock.cur = UNTIL + 1_000
+    windows = []
+    await obs.tick()
+    expect(alerts).toHaveLength(1)
+    expect(alerts[0]).toContain('flood ban cleared')
+    // Local-tz rendering: 9:39am to 9:46am AEST.
+    expect(alerts[0]).toContain('was banned from 9:39am to 9:46am AEST')
+    // And explicitly NOT the old UTC ISO output.
+    expect(alerts[0]).not.toContain('2026-07-12T23:39:24Z')
+    expect(alerts[0]).not.toContain('UTC')
+  })
+
+  it('renders the ACTIVE card clear-time in the configured local tz (AEST), not UTC', async () => {
+    const clock = new TestClock()
+    const alerts: string[] = []
+    let windows: FloodWindowRecord[] = [
+      // A far-future untilTs so the window stays open; a non-operator chat so
+      // the immediate-delivery branch fires (openAlertText).
+      { scopeKey: 'chat:other', untilTs: UNTIL, retryAfterSrc: '429', observedAt: OBSERVED },
+    ]
+    const obs = createFloodWindowObserver({
+      clock,
+      log: () => {},
+      stats: () => makeStats(),
+      readWindows: () => windows,
+      markAlerted: (scope, at) => {
+        windows = windows.map((w) => (w.scopeKey === scope ? { ...w, alertedAt: at } : w))
+      },
+      sendAlert: async (t) => {
+        alerts.push(t)
+      },
+      operatorChatId: () => 'op',
+      alertThresholdMs: 60_000,
+      tz: 'Australia/Melbourne',
+    })
+
+    clock.cur = OBSERVED + 61_000
+    await obs.tick()
+    expect(alerts).toHaveLength(1)
+    expect(alerts[0]).toContain('flood ban active')
+    // "expected to clear at 9:46am AEST" — local wall-clock, not UTC ISO.
+    expect(alerts[0]).toContain('expected to clear at 9:46am AEST')
+    expect(alerts[0]).not.toContain('2026-07-12T23:46:40Z')
+    expect(alerts[0]).not.toContain('UTC')
+  })
+
+  it('defaults to UTC wording when no tz is configured (backward compat)', async () => {
+    const clock = new TestClock()
+    const alerts: string[] = []
+    let windows: FloodWindowRecord[] = [
+      { scopeKey: 'global', untilTs: UNTIL, retryAfterSrc: '429', observedAt: OBSERVED },
+    ]
+    const obs = createFloodWindowObserver({
+      clock,
+      log: () => {},
+      stats: () => makeStats(),
+      readWindows: () => windows,
+      markAlerted: () => {},
+      sendAlert: async (t) => {
+        alerts.push(t)
+      },
+      operatorChatId: () => 'op',
+      alertThresholdMs: 60_000,
+      // no tz → UTC
+    })
+    clock.cur = OBSERVED + 61_000
+    await obs.tick()
+    clock.cur = UNTIL + 1_000
+    windows = []
+    await obs.tick()
+    expect(alerts).toHaveLength(1)
+    // UTC fallback: 11:39pm to 11:46pm UTC on 2026-07-12.
+    expect(alerts[0]).toContain('11:39pm to 11:46pm UTC')
+  })
+
+  it('spans the local date when a window crosses local midnight', async () => {
+    const clock = new TestClock()
+    const alerts: string[] = []
+    // 2026-07-13T13:55:00Z .. 2026-07-13T14:05:00Z = 11:55pm 13 Jul .. 12:05am 14 Jul AEST.
+    const obsStart = Date.parse('2026-07-13T13:55:00Z')
+    const obsEnd = Date.parse('2026-07-13T14:05:00Z')
+    let windows: FloodWindowRecord[] = [
+      { scopeKey: 'global', untilTs: obsEnd, retryAfterSrc: '429', observedAt: obsStart },
+    ]
+    const obs = createFloodWindowObserver({
+      clock,
+      log: () => {},
+      stats: () => makeStats(),
+      readWindows: () => windows,
+      markAlerted: () => {},
+      sendAlert: async (t) => {
+        alerts.push(t)
+      },
+      operatorChatId: () => 'op',
+      alertThresholdMs: 60_000,
+      tz: 'Australia/Melbourne',
+    })
+    clock.cur = obsStart + 61_000
+    await obs.tick()
+    clock.cur = obsEnd + 1_000
+    windows = []
+    await obs.tick()
+    expect(alerts).toHaveLength(1)
+    expect(alerts[0]).toContain('13 Jul 11:55pm to 14 Jul 12:05am AEST')
+  })
+
   it('does not alert for msg-edit (cosmetic) scopes', async () => {
     const clock = new TestClock()
     const alerts: string[] = []

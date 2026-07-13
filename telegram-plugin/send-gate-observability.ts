@@ -154,6 +154,14 @@ export interface FloodWindowObserverConfig {
   operatorChatId?: () => string | undefined
   /** Ms a window must be open before it earns an alert. Default 60_000. */
   alertThresholdMs?: number
+  /**
+   * IANA timezone (e.g. `Australia/Melbourne`) for rendering the operator-facing
+   * alert timestamps in local wall-clock time instead of UTC. The gateway sources
+   * this from `SWITCHROOM_TIMEZONE ?? TZ` (the same env the config cascade bakes
+   * into every agent service — see `src/config/timezone.ts`). Defaults to `'UTC'`
+   * so a missing tz degrades to the previous behaviour rather than throwing.
+   */
+  tz?: string
 }
 
 export interface FloodWindowObserver {
@@ -161,11 +169,92 @@ export interface FloodWindowObserver {
   tick(): Promise<void>
 }
 
-/** Human-readable ISO-ish timestamp (UTC, second precision) for alert wording. */
-function fmtTs(ms: number): string {
-  // Strip the milliseconds (`.\d{3}`) for second precision — this also covers
-  // the `.000` case, so no separate replace is needed.
-  return new Date(ms).toISOString().replace(/\.\d{3}/, '')
+// ─── Operator-facing local-time formatting ──────────────────────────────────
+// Operator alerts (openAlertText / closeAlertText) render timestamps in the
+// operator's CONFIGURED timezone, not UTC — a "was banned from 9:39am to 9:46am
+// AEST" reads at a glance where a raw `2026-07-12T23:39:24Z UTC` does not. The
+// machine-facing snapshot LOG lines (config.log → gateway-supervisor.log) keep
+// their epoch/ISO wording; only the chat/card text is localized.
+
+/** Lowercased wall-clock time in `tz`, e.g. `9:39am`. */
+function fmtLocalClock(ms: number, tz: string): string {
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: tz,
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  })
+    .format(new Date(ms))
+    .replace(/\s([AP])M$/, (_m, p: string) => `${p.toLowerCase()}m`)
+}
+
+/** Compact local date, e.g. `12 Jul` — used only to disambiguate day-spanning windows. */
+function fmtLocalDate(ms: number, tz: string): string {
+  return new Intl.DateTimeFormat('en-GB', {
+    timeZone: tz,
+    day: 'numeric',
+    month: 'short',
+  }).format(new Date(ms))
+}
+
+/** Calendar day (`YYYY-MM-DD`) in `tz`, for a timezone-correct "same day?" test. */
+function localDay(ms: number, tz: string): string {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date(ms))
+}
+
+/**
+ * Short tz abbreviation for `tz` at `ms`, e.g. `AEST`, `EDT`, `BST`. ICU only
+ * surfaces the common alpha abbreviation for a locale whose region matches the
+ * zone, so we try a small locale list and take the first genuine abbreviation;
+ * zones with no common abbreviation (e.g. Asia/Kolkata) fall back to the offset
+ * form (`GMT+5:30`), and `UTC` stays `UTC`.
+ */
+function tzAbbrev(ms: number, tz: string): string {
+  const at = new Date(ms)
+  for (const loc of ['en-US', 'en-AU', 'en-GB']) {
+    const v = new Intl.DateTimeFormat(loc, { timeZone: tz, timeZoneName: 'short' })
+      .formatToParts(at)
+      .find((p) => p.type === 'timeZoneName')?.value
+    if (v && !/^(?:GMT|UTC)/i.test(v)) return v
+  }
+  return (
+    new Intl.DateTimeFormat('en-US', { timeZone: tz, timeZoneName: 'short' })
+      .formatToParts(at)
+      .find((p) => p.type === 'timeZoneName')?.value ?? tz
+  )
+}
+
+/**
+ * A single operator-facing local timestamp with tz suffix, e.g. `9:46am AEST`.
+ * When `refMs` is on a different local calendar day (or omitted), the date is
+ * prepended (`12 Jul 11:52pm AEST`) so a day-spanning window is unambiguous.
+ */
+function fmtLocalStamp(ms: number, tz: string, refMs?: number): string {
+  const clock = fmtLocalClock(ms, tz)
+  const sameDay = refMs != null && localDay(ms, tz) === localDay(refMs, tz)
+  const body = sameDay ? clock : `${fmtLocalDate(ms, tz)} ${clock}`
+  return `${body} ${tzAbbrev(ms, tz)}`
+}
+
+/**
+ * A local time RANGE with a single tz suffix, e.g. `9:39am to 9:46am AEST`.
+ * Same-local-day windows drop the redundant start date; day-spanning windows
+ * carry the date on each end (`12 Jul 11:59pm to 13 Jul 12:04am AEST`).
+ */
+function fmtLocalRange(startMs: number, endMs: number, tz: string): string {
+  const sameDay = localDay(startMs, tz) === localDay(endMs, tz)
+  if (sameDay) {
+    return `${fmtLocalClock(startMs, tz)} to ${fmtLocalClock(endMs, tz)} ${tzAbbrev(endMs, tz)}`
+  }
+  return (
+    `${fmtLocalDate(startMs, tz)} ${fmtLocalClock(startMs, tz)} to ` +
+    `${fmtLocalDate(endMs, tz)} ${fmtLocalClock(endMs, tz)} ${tzAbbrev(endMs, tz)}`
+  )
 }
 
 function fmtDur(ms: number): string {
@@ -187,6 +276,7 @@ export function createFloodWindowObserver(
   config: FloodWindowObserverConfig,
 ): FloodWindowObserver {
   const alertThresholdMs = config.alertThresholdMs ?? 60_000
+  const tz = config.tz ?? 'UTC'
   // Full records seen on the previous tick, keyed by scope (close detection).
   let lastSeen = new Map<string, FloodWindowRecord>()
   // First tick after boot: any window already present was loaded from disk
@@ -233,7 +323,7 @@ export function createFloodWindowObserver(
     const openFor = fmtDur(now - w.observedAt)
     return (
       `⚠️ Telegram flood ban active (scope \`${w.scopeKey}\`). ` +
-      `Open for ${openFor}, expected to clear at ${fmtTs(w.untilTs)} UTC. ` +
+      `Open for ${openFor}, expected to clear at ${fmtLocalStamp(w.untilTs, tz, now)}. ` +
       `Outbound to that scope is being suppressed.`
     )
   }
@@ -251,7 +341,7 @@ export function createFloodWindowObserver(
     const plural = recs.length > 1 ? 's' : ''
     return (
       `⚠️ Telegram flood ban cleared (scope${plural} ${scopes}). ` +
-      `The bot was banned from ${fmtTs(observedAt)} to ${fmtTs(untilTs)} UTC ` +
+      `The bot was banned from ${fmtLocalRange(observedAt, untilTs, tz)} ` +
       `(~${fmtDur(untilTs - observedAt)}). Some outbound messages during that ` +
       `window were suppressed.`
     )

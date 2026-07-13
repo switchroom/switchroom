@@ -5652,6 +5652,9 @@ const sendGateStatsLogger = createStatsLogger({
 const floodWindowObserver = createFloodWindowObserver({
   clock: { now: () => Date.now(), sleep: (ms) => new Promise((r) => setTimeout(r, ms)) },
   log: (line) => process.stderr.write(line),
+  // Render the operator-facing flood alerts in the configured local timezone
+  // (same env the config cascade bakes into every agent — see timezone.ts).
+  tz: process.env.SWITCHROOM_TIMEZONE ?? process.env.TZ ?? 'UTC',
   stats: () => sendGate.stats(),
   readWindows: (now) => readFloodWindows(FLOOD_WINDOWS_PATH, now),
   markAlerted: (scopeKey, alertedAt) =>
