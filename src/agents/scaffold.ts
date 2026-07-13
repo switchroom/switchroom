@@ -1992,6 +1992,13 @@ function channelsToEnv(agent: AgentConfig): Record<string, string> {
       out.SWITCHROOM_TG_SEND_GATE_EDIT_FLOOR_MS = String(sg.edit_floor_ms);
     }
   }
+  // Coalesced worker-activity feed tuning (channels.telegram.worker_feed.*).
+  // Only emitted when explicitly set so the feed's built-in default (8) owns
+  // the unset case — omitting the block reproduces today's behaviour.
+  const wf = (tg as { worker_feed?: { max_rows?: number } } | undefined)?.worker_feed;
+  if (wf?.max_rows !== undefined) {
+    out.SWITCHROOM_TG_WORKER_FEED_MAX_ROWS = String(wf.max_rows);
+  }
   // Whether to DELETE the activity/status feed when the final answer lands.
   // Default (unset) = keep it as a record; only emit the env when explicitly
   // set so the gateway's default-off parse owns the unset case.

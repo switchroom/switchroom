@@ -533,17 +533,20 @@ describe('createWorkerActivityFeed — log sink', () => {
     const edit = logs.find((l) => l.startsWith('worker-feed: edit'))
     const finish = logs.find((l) => l.startsWith('worker-feed: finish'))
 
+    // The feed message is per-(chat,thread) now (workers coalesce), so the
+    // paint/edit lines are feed-scoped; the terminal `finish` line still names
+    // the finishing worker + its state.
     expect(paint).toBeDefined()
-    expect(paint).toContain('agent=w-research')
     expect(paint).toContain('chat=chat-9')
     expect(paint).toContain('thread=7')
     expect(paint).toMatch(/msgId=\d+/)
     expect(paint).toMatch(/bytes=\d+/)
 
     expect(edit).toBeDefined()
-    expect(edit).toContain('agent=w-research')
+    expect(edit).toContain('chat=chat-9')
 
     expect(finish).toBeDefined()
+    expect(finish).toContain('agent=w-research')
     expect(finish).toContain('state=done')
   })
 

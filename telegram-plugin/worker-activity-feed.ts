@@ -13,17 +13,34 @@
  * that grows/edits as work happens — indistinguishable from "the agent
  * is typing live", not a status widget.
  *
- * Pure render (`renderWorkerActivity`) + an injected bot API
- * (`BotApiForWorkerFeed`), mirroring `issues-card.ts` so the gateway
- * reuses the same wiring. The manager (`createWorkerActivityFeed`) owns
- * one edit-in-place message per worker, keyed by jsonl agent id, with:
+ * COALESCED (#3084 follow-up): all live workers dispatched to the SAME
+ * chat/thread render into ONE shared message (a {@link FeedGroup}), not one
+ * message each. With N workers, N separate messages each coalesce their own
+ * edit stream but ALL draw from the send gate's 1/sec per-chat bucket — so
+ * ~N-1 of every second's edits SHED and every card refreshes only ~once per N
+ * seconds (liveness collapse). One combined message = ONE per-message edit
+ * stream: it coalesces (last-write-wins) and never contends with siblings, so
+ * every worker's row refreshes together within the ~1.5s edit floor. A single-
+ * worker chat still renders the full 🛠 Worker card (identical to before); a
+ * 2+ worker chat renders `renderCombinedWorkerFeed`.
+ *
+ * Pure render (`renderWorkerActivity` / `renderCombinedWorkerFeed`) + an
+ * injected bot API (`BotApiForWorkerFeed`). The manager
+ * (`createWorkerActivityFeed`) owns one edit-in-place message per (chat,thread)
+ * with:
  *   - a first-paint delay so trivial sub-second workers never post a
  *     message (their result still lands via the handback reply),
  *   - a proactive min-edit-interval throttle (worker jsonl ticks ~1/s;
  *     Telegram rate-limits edits) plus body-dedup,
- *   - per-worker serialization so two rapid ticks can't double-send,
+ *   - per-message serialization so two rapid ticks can't double-send,
  *   - 429 cooldown + message_id drift resilience (re-post on stale edit),
- *   - a forced terminal edit on `finish` regardless of throttle.
+ *   - a forced terminal edit on the LAST worker's `finish`.
+ *
+ * The completed-worker RESULT is NOT folded into this cosmetic feed — it
+ * reaches the user as its own `useful` handback reply (gateway onFinish). The
+ * feed shows only *live* work; a finished worker's row is dropped from the
+ * combined body (or, when it is the last worker, the message finalizes to its
+ * terminal recap).
  *
  * The feed is gated to BACKGROUND workers and is ON by default; set
  * `SWITCHROOM_WORKER_ACTIVITY_FEED=0` to disable it — see the gateway
@@ -38,7 +55,12 @@ import {
   truncate,
 } from './card-format.js'
 import { STATUS_ROLLING_LINES } from './status-no-truncate.js'
-import { renderStatusCard, formatStepSuffix } from './tool-activity-summary.js'
+import {
+  renderStatusCard,
+  formatStepSuffix,
+  renderCombinedWorkerFeed,
+  type CombinedWorkerRow,
+} from './tool-activity-summary.js'
 import { isSendGateShed } from './send-gate.js'
 
 /** Worker-activity feed is ON by default; an operator opts out with
@@ -208,7 +230,7 @@ export interface WorkerActivityFeedOpts {
    * shed send every `heartbeatTickMs` (~6s) for the WHOLE ban — thousands of
    * gate admissions, and (pre-fix) a `sent.message_id` crash on the `undefined`
    * every tick. With it, a running/first-paint tick that sees an open window
-   * parks the handle in cooldown for the window's remaining and makes ZERO api
+   * parks the group in cooldown for the window's remaining and makes ZERO api
    * calls until it closes, mirroring the held-card sweep's pre-send probe.
    * Defaults to `() => 0` (no window) so tests and non-gateway callers are
    * unchanged.
@@ -222,67 +244,90 @@ export interface WorkerActivityFeedOpts {
   /** Heartbeat timer disposer. Injectable for tests. Defaults to `clearInterval`. */
   clearInterval?: (handle: unknown) => void
   /**
-   * Heartbeat tick cadence in ms. On each tick a stale, running worker is
-   * re-rendered with a climbing `· Ns` suffix so a worker that emits no new
-   * narrative still visibly advances. Default 6000ms.
+   * Heartbeat tick cadence in ms. On each tick a stale, running feed is
+   * re-rendered with climbing elapsed so a worker that emits no new narrative
+   * still visibly advances. Default 6000ms.
    */
   heartbeatTickMs?: number
+  /**
+   * Max worker rows rendered in a COMBINED feed (2+ workers in one chat/thread)
+   * before the `+M more working…` spill line. Keeps the coalesced body compact
+   * and legible (and under the rich-message wire ceiling). Default 8. A single-
+   * worker chat renders the full 🛠 Worker card and ignores this. Sourced from
+   * `channels.telegram.worker_feed.max_rows` via the config cascade.
+   */
+  maxRows?: number
 }
 
-interface WorkerHandle {
+/**
+ * One live worker's per-row state inside a chat/thread feed group. The row
+ * carries everything the render needs for THIS worker; the shared message
+ * (id, cooldown, chain) lives on the enclosing {@link FeedGroup}.
+ */
+interface WorkerRow {
   /** jsonl agent id — carried so success/failure log lines can name the worker. */
   agentId: string
+  /**
+   * Accumulated narrative lines (oldest→newest), deduped within the whole
+   * rolling window. Rolling-window capped to STATUS_ROLLING_LINES. Grows the
+   * live render so the feed reads like the main agent's answer.
+   */
+  narrative: string[]
+  /** Last view for this worker (drives the heartbeat re-render + combined row). */
+  lastView: WorkerActivityView | null
+  /** Latest state observed for this worker; excluded from the running set once
+   *  terminal (its result reaches the user via the separate handback reply). */
+  state: WorkerActivityState
+  /**
+   * Latched in `finish` before the terminal edit. A late watcher `onProgress`
+   * tick that arrives after `finish()` queued its chain must NOT resurrect the
+   * row and paint a fresh `running` state on an already-finalized worker.
+   */
+  finished: boolean
+  /**
+   * Wall-clock ms the worker was dispatched, derived from `now - view.elapsedMs`
+   * on the first update. The heartbeat computes a live elapsed from this so the
+   * elapsed climbs even when no fresh view arrives, and it fixes the worker's
+   * stable sort order within the combined feed.
+   */
+  dispatchAtMs: number | null
+  /**
+   * Wall-clock ms the CURRENT step started — stamped whenever a NEW narrative
+   * line lands (the `→` line changes). The heartbeat's step suffix shows the
+   * step's OWN elapsed from this anchor (single-worker card only), and only
+   * once past STEP_TIMER_MIN_MS.
+   */
+  stepStartedAtMs: number | null
+}
+
+/**
+ * One shared feed message per (chatId, threadId). ALL live workers dispatched
+ * to the same chat/thread render into this one message — so their edits form a
+ * single per-message edit stream under the send gate's 1/sec per-chat ceiling
+ * (last-write-wins coalescing + no-op skip) instead of N contending streams
+ * that shed (#3084). A single-worker group renders the full 🛠 Worker card;
+ * a 2+ worker group renders the combined `renderCombinedWorkerFeed` body.
+ */
+interface FeedGroup {
+  /** Stable key `${chatId} ${threadId ?? ''}`. */
+  feedKey: string
   chatId: string
   threadId?: number
   messageId: number | null
   lastBody: string | null
   lastEditAt: number
   cooldownUntil: number
-  /**
-   * Accumulated narrative lines (oldest→newest), deduped against the
-   * immediately-preceding line. Rolling-window capped to STATUS_ROLLING_LINES.
-   * Grows the live render so the feed reads like the main agent's answer.
-   */
-  narrative: string[]
-  /** Per-worker serialization chain so ticks can't interleave sends. */
+  /** Single serialization chain for the shared message — ticks can't interleave sends. */
   chain: Promise<void>
-  /** Last view rendered into the message (drives the heartbeat re-render). */
-  lastView: WorkerActivityView | null
+  /** Live workers in this group, keyed by agentId (insertion ≈ dispatch order). */
+  workers: Map<string, WorkerRow>
   /**
-   * A terminal (`finish`) view whose edit could not land yet — most often
-   * because a 429 cooldown was in effect when `doFinish` ran. The heartbeat
-   * re-drives `doFinish` with this view once the cooldown expires so a
-   * transport hiccup can't leave the card stuck on its last running render
-   * ("worker done, card says running"). Cleared on a successful terminal
-   * edit, on a permanent failure (message gone), or when the handle is
-   * deleted. Null when no finalize is pending.
+   * A terminal render (the last worker's recap) staged because a 429 cooldown /
+   * flood window blocked the edit. The heartbeat re-drives it once the cooldown
+   * expires so a finished feed can't get stuck on its last running render.
+   * Null when no finalize is pending.
    */
-  pendingFinish: WorkerActivityView | null
-  /**
-   * Latched in `doFinish` before the terminal edit. A late watcher
-   * `onProgress` tick that arrives after `finish()` queued its chain (but
-   * before the `.finally(handles.delete)` microtask drains) must NOT
-   * resurrect the handle and paint a fresh `running` message on an
-   * already-finalized worker. The heartbeat's orphan-paint guard
-   * (`if (!handles.has(h.agentId)) continue`) only covers the heartbeat
-   * tick — this flag covers the `update` entry point. Set synchronously
-   * inside `doFinish` (runs on the chain), checked synchronously in
-   * `update` before handle creation.
-   */
-  finished: boolean
-  /**
-   * Wall-clock ms the worker was dispatched, derived from `now - view.elapsedMs`
-   * on the first update. The heartbeat computes a live elapsed from this so the
-   * `· Ns` suffix climbs even when no fresh view arrives.
-   */
-  dispatchAtMs: number | null
-  /**
-   * Wall-clock ms the CURRENT step started — stamped whenever a NEW narrative
-   * line lands (the `→` line changes). The heartbeat's step suffix shows the
-   * step's OWN elapsed from this anchor (not the worker total, which the
-   * header already carries), and only once past STEP_TIMER_MIN_MS.
-   */
-  stepStartedAtMs: number | null
+  pendingFinalize: WorkerActivityView | null
 }
 
 const COOLDOWN_JITTER_MS = 500
@@ -307,7 +352,7 @@ function extractRetryAfterSecs(err: unknown): number | null {
  *   'rate_limited' — 429 with retry_after. Back off; the heartbeat re-drives
  *     the edit after cooldown (running renders + deferred terminal edits).
  *   'gone'         — message/chat deleted or edit window expired. Nothing to
- *     update; drop the handle silently (no warning — there is no card).
+ *     update; drop the message silently (no warning — there is no card).
  *   'transient'    — anything else (network blip, 5xx). Retry on the next
  *     heartbeat tick; don't spam stderr.
  */
@@ -338,17 +383,20 @@ function classifyEditError(err: unknown): EditOutcome {
 }
 
 /**
- * Manager owning one live message per background worker. Keyed by jsonl
- * agent id. The gateway calls `update` on each watcher activity cue and
- * `finish` on terminal; `drop` discards a worker's state without a final
- * edit (error / supersession paths).
+ * Manager owning one live message per (chat,thread) into which all live
+ * workers there coalesce. Public methods stay keyed by jsonl agent id (the
+ * gateway wiring is unchanged): the manager resolves the enclosing feed group
+ * internally. The gateway calls `update` on each watcher activity cue and
+ * `finish` on terminal; `drop` discards a worker's state without a final edit
+ * (error / supersession paths).
  */
 export interface WorkerActivityFeed {
-  /** True if a message is currently posted for this worker. */
+  /** True if a message is currently posted for this worker's feed group. */
   has(agentId: string): boolean
-  /** The Telegram message_id currently posted for this worker, or null if
-   *  none is posted (never painted, or dropped after a stale-edit re-post).
-   *  Lets the gateway pin the EXISTING `🛠 Worker` message (status-pin). */
+  /** The Telegram message_id currently posted for this worker's feed group, or
+   *  null if none is posted (never painted, or dropped after a stale-edit
+   *  re-post). Lets the gateway pin the EXISTING `🛠 Worker` message. Note:
+   *  siblings sharing the chat/thread return the SAME id (one message). */
   messageIdOf(agentId: string): number | null
   /** Push a running-state cue. Returns the serialized op for tests. */
   update(
@@ -357,13 +405,17 @@ export interface WorkerActivityFeed {
     view: WorkerActivityView,
     threadId?: number,
   ): Promise<void>
-  /** Force the terminal recap edit. No-op if no message was ever posted. */
+  /** Finalize a worker: drop its row from the combined feed (its result reaches
+   *  the user via the separate handback), or — when it is the last live worker
+   *  in the group — force the terminal recap edit. No-op if the worker was
+   *  never tracked. */
   finish(agentId: string, view: WorkerActivityView): Promise<void>
-  /** Forget a worker's state without editing (e.g. error path). */
+  /** Forget a worker's state without a recap edit (e.g. error path); re-renders
+   *  the group so the dropped worker disappears from the combined body. */
   drop(agentId: string): void
   /**
    * Issue #3023 (card resurrection). Undo a finalization: clear the durable
-   * `finalized` gate (and any lingering per-handle `finished` latch) so a
+   * `finalized` gate (and any lingering per-row `finished` latch) so a
    * worker whose card was FALSELY finalized can be painted/edited again. The
    * watcher calls this (via the gateway's `onResurrect` wiring) when a
    * falsely-finalized worker's JSONL resumes growing. A fresh `running` cue
@@ -375,7 +427,7 @@ export interface WorkerActivityFeed {
   stop(): void
   /** Manually fire one heartbeat tick (test hook). */
   heartbeatTick(): void
-  /** Number of tracked workers (test/inspection hook). */
+  /** Number of tracked workers across all feed groups (test/inspection hook). */
   readonly size: number
 }
 
@@ -386,6 +438,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
   const minEditInterval = opts.minEditIntervalMs ?? 2500
   const firstPaintMin = opts.firstPaintMinMs ?? 8000
   const heartbeatTickMs = opts.heartbeatTickMs ?? 6000
+  const maxRows = Math.max(1, Math.floor(opts.maxRows ?? 8))
   const setIntervalFn =
     opts.setInterval ??
     ((cb: () => void, ms: number): unknown => {
@@ -395,17 +448,21 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       return t
     })
   const clearIntervalFn = opts.clearInterval ?? ((handle: unknown) => clearInterval(handle as ReturnType<typeof setInterval>))
-  const handles = new Map<string, WorkerHandle>()
+
+  /** Feed groups keyed by `${chatId} ${threadId ?? ''}`. */
+  const groups = new Map<string, FeedGroup>()
+  /** Reverse index agentId → feedKey, so the agentId-keyed public API resolves
+   *  its group in O(1). Cleared when a worker's row is removed. */
+  const agentIndex = new Map<string, string>()
+
   /**
-   * Agent ids that have been finalized (`doFinish` latched). Survives handle
+   * Agent ids that have been finalized (`finish` latched). Survives row/group
    * deletion so a LATE watcher `onProgress` tick — which can arrive after
-   * `finish()`'s chain has fully settled and the handle was deleted — cannot
-   * resurrect a fresh handle and paint a running card on a worker that is
-   * already done. The per-handle `finished` flag only covers the narrow
-   * window between latch and delete; this set is the durable gate. A late
-   * tick arrives within seconds of finish (watcher poll cadence), so the set
-   * only needs to cover recent finalizations — capped at FINALIZED_CAP and
-   * trimmed FIFO to stay bounded across a long gateway lifetime.
+   * `finish()`'s chain has fully settled — cannot resurrect a fresh row and
+   * paint a running card on a worker that is already done. A late tick arrives
+   * within seconds of finish (watcher poll cadence), so the set only needs to
+   * cover recent finalizations — capped at FINALIZED_CAP and trimmed FIFO to
+   * stay bounded across a long gateway lifetime.
    */
   const finalized = new Set<string>()
   const FINALIZED_CAP = 256
@@ -413,469 +470,466 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
     if (finalized.has(agentId)) return
     finalized.add(agentId)
     if (finalized.size > FINALIZED_CAP) {
-      // Map-free FIFO trim: Set iterates in insertion order; drop the oldest.
       const oldest = finalized.values().next().value
       if (oldest != null) finalized.delete(oldest)
     }
   }
   let heartbeatTimer: unknown = null
 
-  function sendOptsFor(h: WorkerHandle): Record<string, unknown> {
+  function feedKeyOf(chatId: string, threadId?: number): string {
+    return `${chatId} ${threadId ?? ''}`
+  }
+  function groupOfAgent(agentId: string): FeedGroup | undefined {
+    const key = agentIndex.get(agentId)
+    return key != null ? groups.get(key) : undefined
+  }
+
+  function sendOptsFor(g: FeedGroup): Record<string, unknown> {
     return {
       disable_web_page_preview: true,
-      // Sub-agent progress card is a status surface, never the user's
-      // answer — silence the open ping. (editMessageText ignores
-      // disable_notification, so this is a no-op on the in-place edits
-      // that share these opts.)
+      // Sub-agent progress feed is a status surface, never the user's answer —
+      // silence the open ping. (editMessageText ignores disable_notification,
+      // so this is a no-op on the in-place edits that share these opts.)
       disable_notification: true,
-      ...(h.threadId != null ? { message_thread_id: h.threadId } : {}),
+      ...(g.threadId != null ? { message_thread_id: g.threadId } : {}),
     }
   }
 
-  function noteRateLimited(h: WorkerHandle, err: unknown, label: string): void {
+  function noteRateLimited(g: FeedGroup, err: unknown, label: string): void {
     const retryAfter = extractRetryAfterSecs(err)
     if (retryAfter == null) return
-    h.cooldownUntil = nowFn() + retryAfter * 1000 + COOLDOWN_JITTER_MS
+    g.cooldownUntil = nowFn() + retryAfter * 1000 + COOLDOWN_JITTER_MS
     log(`worker-feed: ${label} 429 — backing off ${retryAfter}s`)
   }
 
   /**
-   * Park a handle in cooldown for the remaining of an open flood window (if
-   * any), so the heartbeat's `nowFn() < h.cooldownUntil` guard suppresses every
+   * Park a group in cooldown for the remaining of an open flood window (if
+   * any), so the heartbeat's `nowFn() < g.cooldownUntil` guard suppresses every
    * further send/edit until the ban closes. Returns true when a window was open
    * (caller should abandon the current attempt). Two reads of the SAME on-disk
    * marker `robustApiCall` gates on — never a second notion of "channel open".
    */
-  function parkIfFloodWindowOpen(h: WorkerHandle): boolean {
+  function parkIfFloodWindowOpen(g: FeedGroup): boolean {
     const remaining = floodWaitRemainingMs()
     if (remaining <= 0) return false
-    // Only extend the cooldown — never shorten one a 429 already set longer.
     const until = nowFn() + remaining + COOLDOWN_JITTER_MS
-    if (until > h.cooldownUntil) h.cooldownUntil = until
+    if (until > g.cooldownUntil) g.cooldownUntil = until
     return true
   }
 
-  function accumulateNarrative(h: WorkerHandle, view: WorkerActivityView): void {
+  function accumulateNarrative(row: WorkerRow, view: WorkerActivityView): void {
     const line = view.latestSummary.trim()
     if (line.length === 0) return
-    // Dedup within the whole rolling window, not just the immediately-
-    // preceding line. The watcher re-emits the same narrative across ticks
-    // while a tool runs (adjacent repeats), AND one logical step can surface
-    // twice non-adjacently — e.g. a "Look for X" preamble followed later by
-    // the Task tool whose describeToolUse label is the same "Look for X"
-    // description, interleaved with another step (the A,B,A duplication the
-    // operator observed on live cards). A legitimate later re-visit of the
-    // same step re-appears once the earlier copy scrolls out of the window.
-    if (h.narrative.includes(line)) return
-    h.narrative.push(line)
-    // The `→` current-step line just CHANGED — reset the per-step timer so the
-    // heartbeat's `· Ns` suffix measures THIS step, not the whole worker run.
-    h.stepStartedAtMs = nowFn()
-    // Rolling window — keep only the last STATUS_ROLLING_LINES in memory. The
-    // render shows exactly those lines (clipped per-line by the unified pipeline);
-    // fitCardToBudget is the wire-limit backstop.
-    if (h.narrative.length > STATUS_ROLLING_LINES) {
-      h.narrative.splice(0, h.narrative.length - STATUS_ROLLING_LINES)
+    // Dedup within the whole rolling window (the watcher re-emits the same
+    // narrative across ticks, and a preamble + its tool label can repeat
+    // non-adjacently — the A,B,A duplication observed on live cards).
+    if (row.narrative.includes(line)) return
+    row.narrative.push(line)
+    // The `→` current-step line just CHANGED — reset the per-step timer.
+    row.stepStartedAtMs = nowFn()
+    if (row.narrative.length > STATUS_ROLLING_LINES) {
+      row.narrative.splice(0, row.narrative.length - STATUS_ROLLING_LINES)
     }
   }
 
-  async function doUpdate(h: WorkerHandle, view: WorkerActivityView, liveSuffix = ''): Promise<void> {
-    // Accumulate before any gate so a throttled/cooled-down tick still grows
-    // the narrative — the line surfaces on the next edit that does fire.
-    accumulateNarrative(h, view)
-    // Stamp the dispatch wall-clock once so the heartbeat can climb a live
-    // elapsed even between fresh views. lastView feeds the heartbeat re-render.
-    const merged: WorkerActivityView = { ...view, narrativeLines: [...h.narrative] }
-    h.lastView = merged
-    if (h.dispatchAtMs == null) h.dispatchAtMs = nowFn() - view.elapsedMs
-    if (nowFn() < h.cooldownUntil) return
-    // A flood window is open: the send gate would SHED every call made now
-    // (resolving `undefined`). Park in cooldown for the window's remaining and
-    // make ZERO api calls until it closes — the heartbeat re-drives the paint
-    // with full state on the first tick past the window. Same source of truth
-    // as robustApiCall's own pre-call probe.
-    if (parkIfFloodWindowOpen(h)) return
-    const body = renderWorkerActivity(merged, liveSuffix)
+  /** Live wall-clock elapsed for a worker (climbs between fresh views). */
+  function liveElapsed(row: WorkerRow, now: number): number {
+    const base = row.dispatchAtMs != null ? now - row.dispatchAtMs : row.lastView?.elapsedMs ?? 0
+    return Math.max(base, row.lastView?.elapsedMs ?? 0)
+  }
 
-    // First paint: hold off until the worker has run long enough to be
-    // worth a message; trivial workers stay silent (handback covers them).
-    if (h.messageId == null) {
-      if (view.elapsedMs < firstPaintMin) return
+  /** The running rows of a group, dispatch-ordered (oldest first, stable). */
+  function runningRows(g: FeedGroup): WorkerRow[] {
+    return [...g.workers.values()]
+      .filter((w) => w.state === 'running' && w.lastView != null)
+      .sort((a, b) => (a.dispatchAtMs ?? 0) - (b.dispatchAtMs ?? 0))
+  }
+
+  /**
+   * Render a group's shared message body at `now`.
+   *   - `terminalRecap` set + zero running → the last worker's terminal recap
+   *     (single 🛠 Worker card, done/failed).
+   *   - exactly one running → the full 🛠 Worker card (single-worker parity).
+   *   - 2+ running → the combined `renderCombinedWorkerFeed` body.
+   *   - zero running, no recap → null (nothing to show).
+   * `heartbeat` toggles the single-worker climbing `· Ns` step suffix.
+   */
+  function renderGroupBody(
+    g: FeedGroup,
+    now: number,
+    terminalRecap: WorkerActivityView | null,
+    heartbeat: boolean,
+  ): string | null {
+    const running = runningRows(g)
+    if (running.length === 0) {
+      if (terminalRecap == null) return null
+      return renderWorkerActivity(terminalRecap)
+    }
+    // On a normal update/finish the header shows the worker's LAST-REPORTED
+    // elapsed (byte-stable for the dedup / no-op skip). Only the heartbeat —
+    // which fires when no fresh view arrived — climbs a live wall-clock elapsed
+    // so a silent worker still visibly advances.
+    const elapsedFor = (r: WorkerRow): number =>
+      heartbeat ? liveElapsed(r, now) : r.lastView?.elapsedMs ?? liveElapsed(r, now)
+    if (running.length === 1) {
+      const r = running[0]
+      const view: WorkerActivityView = {
+        ...(r.lastView as WorkerActivityView),
+        elapsedMs: elapsedFor(r),
+        narrativeLines: [...r.narrative],
+      }
+      let liveSuffix = ''
+      if (heartbeat) {
+        const stepElapsed = r.stepStartedAtMs != null ? now - r.stepStartedAtMs : liveElapsed(r, now)
+        liveSuffix = formatStepSuffix(stepElapsed)
+      }
+      return renderWorkerActivity(view, liveSuffix)
+    }
+    const rows: CombinedWorkerRow[] = running.map((r) => {
+      const v = r.lastView as WorkerActivityView
+      const currentStep = r.narrative.length > 0 ? r.narrative[r.narrative.length - 1] : v.latestSummary
+      return {
+        description: v.description,
+        elapsedMs: elapsedFor(r),
+        toolCount: v.toolCount,
+        currentStep,
+        model: v.model,
+      }
+    })
+    return renderCombinedWorkerFeed(rows, { maxRows })
+  }
+
+  /** Remove a worker's row + index entry; delete the group if it is now empty. */
+  function removeWorker(g: FeedGroup, agentId: string): void {
+    g.workers.delete(agentId)
+    agentIndex.delete(agentId)
+    if (g.workers.size === 0) groups.delete(g.feedKey)
+  }
+
+  /**
+   * Drive the group's shared message to the current combined body. Handles
+   * first-paint gating, the proactive throttle (bypassed by `force`), the
+   * dedup/no-op skip, the send-gate SHED contract, and 429/flood cooldown.
+   * `terminalRecap` (set on the last worker's finish) renders + finalizes the
+   * message, then removes the finished row.
+   */
+  async function doRender(
+    g: FeedGroup,
+    opts2: { force?: boolean; heartbeat?: boolean; terminalRecap?: WorkerActivityView; finishingAgentId?: string } = {},
+  ): Promise<void> {
+    const now = nowFn()
+    const isTerminal = opts2.terminalRecap != null
+    if (now < g.cooldownUntil) {
+      if (isTerminal && opts2.terminalRecap != null) g.pendingFinalize = opts2.terminalRecap
+      return
+    }
+    // A flood window is open: the gate would SHED every call. Park in cooldown
+    // and make ZERO api calls until it closes; the heartbeat re-drives.
+    if (parkIfFloodWindowOpen(g)) {
+      if (isTerminal && opts2.terminalRecap != null) g.pendingFinalize = opts2.terminalRecap
+      return
+    }
+
+    const body = renderGroupBody(g, now, opts2.terminalRecap ?? null, opts2.heartbeat ?? false)
+    if (body == null) {
+      // Nothing to show. On a terminal finalize with no message ever posted,
+      // just drop the finished row (the handback carries the result).
+      if (isTerminal && opts2.finishingAgentId != null) {
+        g.pendingFinalize = null
+        removeWorker(g, opts2.finishingAgentId)
+      }
+      return
+    }
+
+    // First paint: hold until some worker in the group has run long enough.
+    if (g.messageId == null) {
+      const maxElapsed = Math.max(0, ...runningRows(g).map((r) => liveElapsed(r, now)))
+      // A terminal recap for a group that never painted → nothing to finalize.
+      if (isTerminal && opts2.finishingAgentId != null) {
+        g.pendingFinalize = null
+        removeWorker(g, opts2.finishingAgentId)
+        return
+      }
+      if (maxElapsed < firstPaintMin) return
       try {
-        const sent = await opts.bot.sendMessage(h.chatId, body, sendOptsFor(h))
-        // Shed contract (#3084): the gate resolves `undefined` for a send it
-        // shed (open flood window) or dropped as stale (`useful` TTL). That is
-        // NOT a delivered message — dereferencing `sent.message_id` here was
-        // the `undefined is not an object` crash that fired every ~6s for a
-        // whole 6h ban. Treat it as not-delivered: record no message_id, park
-        // on any open window, and let the heartbeat re-drive the paint.
+        const sent = await opts.bot.sendMessage(g.chatId, body, sendOptsFor(g))
+        // Shed contract (#3084): the gate resolves `undefined`/non-object for a
+        // shed send (open flood window) or dropped-stale `useful` TTL. That is
+        // NOT a delivered message — record no id, park on any window, let the
+        // heartbeat re-drive.
         if (sent == null || typeof sent.message_id !== 'number') {
-          parkIfFloodWindowOpen(h)
-          log(`worker-feed: first paint shed by send gate agent=${h.agentId} — not delivered`)
+          parkIfFloodWindowOpen(g)
+          log(`worker-feed: first paint shed by send gate feed=${g.feedKey} — not delivered`)
           return
         }
-        h.messageId = sent.message_id
-        h.lastBody = body
-        h.lastEditAt = nowFn()
+        g.messageId = sent.message_id
+        g.lastBody = body
+        g.lastEditAt = now
         log(
-          `worker-feed: paint agent=${h.agentId} chat=${h.chatId} ` +
-            `thread=${h.threadId ?? '-'} msgId=${h.messageId} bytes=${body.length}`,
+          `worker-feed: paint feed=${g.feedKey} chat=${g.chatId} ` +
+            `thread=${g.threadId ?? '-'} msgId=${g.messageId} workers=${g.workers.size} bytes=${body.length}`,
         )
       } catch (err) {
-        noteRateLimited(h, err, 'send')
+        noteRateLimited(g, err, 'send')
         log(`worker-feed: send failed: ${(err as Error).message}`)
       }
       return
     }
 
-    // Dedup + proactive throttle.
-    if (body === h.lastBody) return
-    if (nowFn() - h.lastEditAt < minEditInterval) return
+    // Dedup + proactive throttle (finish/terminal edits force through).
+    if (body === g.lastBody) {
+      if (isTerminal && opts2.finishingAgentId != null) {
+        g.pendingFinalize = null
+        removeWorker(g, opts2.finishingAgentId)
+      }
+      return
+    }
+    if (!opts2.force && now - g.lastEditAt < minEditInterval) return
 
     try {
-      const res = await opts.bot.editMessageText(h.chatId, h.messageId, body, sendOptsFor(h))
-      // Shed honesty (#3084, mirrors #3173): a cosmetic edit the gate shed
-      // resolves the distinguishable SEND_GATE_SHED sentinel (#3110 F1 — NOT a
-      // bare `undefined`, which the gate reserves for a benign no-op drop whose
-      // payload IS already on screen). The shed payload is NOT on screen, so do
-      // not record it as `lastBody`, or the next tick's dedup would skip
-      // re-sending the very update the gate dropped. Park on any open window and
-      // let the heartbeat re-drive once it closes. A benign `undefined`/`true`
-      // falls through below and is correctly recorded as delivered.
+      const res = await opts.bot.editMessageText(g.chatId, g.messageId, body, sendOptsFor(g))
+      // Shed honesty (#3084): a cosmetic edit the gate shed resolves the
+      // distinguishable SEND_GATE_SHED sentinel (NOT a bare `undefined`, which
+      // the gate reserves for a benign no-op drop whose payload IS on screen).
+      // The shed payload is NOT on screen, so do not record it as `lastBody`.
       if (isSendGateShed(res)) {
-        parkIfFloodWindowOpen(h)
+        parkIfFloodWindowOpen(g)
+        if (isTerminal && opts2.terminalRecap != null) g.pendingFinalize = opts2.terminalRecap
         return
       }
-      h.lastBody = body
-      h.lastEditAt = nowFn()
-      log(
-        `worker-feed: edit agent=${h.agentId} chat=${h.chatId} ` +
-          `thread=${h.threadId ?? '-'} msgId=${h.messageId} bytes=${body.length}`,
-      )
+      g.lastBody = body
+      g.lastEditAt = now
+      if (isTerminal) {
+        log(
+          `worker-feed: finish feed=${g.feedKey} chat=${g.chatId} thread=${g.threadId ?? '-'} ` +
+            `msgId=${g.messageId} agent=${opts2.finishingAgentId ?? '-'} ` +
+            `state=${opts2.terminalRecap?.state ?? 'done'} bytes=${body.length}`,
+        )
+      } else {
+        log(
+          `worker-feed: edit feed=${g.feedKey} chat=${g.chatId} ` +
+            `thread=${g.threadId ?? '-'} msgId=${g.messageId} workers=${g.workers.size} bytes=${body.length}`,
+        )
+      }
+      if (isTerminal && opts2.finishingAgentId != null) {
+        g.pendingFinalize = null
+        removeWorker(g, opts2.finishingAgentId)
+      }
     } catch (err) {
       const outcome = classifyEditError(err)
       if (outcome === 'rate_limited') {
-        noteRateLimited(h, err, 'edit')
+        noteRateLimited(g, err, isTerminal ? 'finish' : 'edit')
+        if (isTerminal && opts2.terminalRecap != null) g.pendingFinalize = opts2.terminalRecap
         return
       }
       if (outcome === 'not_modified') {
-        // Card already shows this body — record it as landed and move on.
-        h.lastBody = body
-        h.lastEditAt = nowFn()
+        g.lastBody = body
+        g.lastEditAt = now
+        if (isTerminal && opts2.finishingAgentId != null) {
+          g.pendingFinalize = null
+          removeWorker(g, opts2.finishingAgentId)
+        }
         return
       }
       if (outcome === 'gone') {
-        // Message/chat deleted or edit window closed — there is no card to
-        // update. Drop the handle silently; a fresh first-paint on the next
-        // running tick re-establishes one if the worker is still active. No
-        // warning: "no card" is not a liveness-logic error.
-        h.messageId = null
-        h.lastBody = null
+        // Message/chat gone or edit window closed — no card to update. Drop the
+        // stale message id; a fresh first-paint re-establishes one if workers
+        // are still live. On a terminal finalize, also drop the finished row.
+        g.messageId = null
+        g.lastBody = null
+        if (isTerminal && opts2.finishingAgentId != null) {
+          g.pendingFinalize = null
+          removeWorker(g, opts2.finishingAgentId)
+        }
         return
       }
-      // 'transient' — network blip / 5xx. Leave the handle intact; the
-      // heartbeat re-attempts on its next tick. Log at debug, not stderr-warn:
-      // a transport hiccup on a best-effort card is not "shit code", it's a
-      // retryable blip the framework rides out deterministically.
-      log(`worker-feed: edit transient error agent=${h.agentId}: ${(err as Error).message}`)
-    }
-  }
-
-  async function doFinish(h: WorkerHandle, view: WorkerActivityView): Promise<void> {
-    // Latch FIRST, before any early return. A `running`-cue tick arriving
-    // after `finish()` queued this chain (but before its `.finally(delete)`
-    // drains) would otherwise resurrect a handle via `update()` and paint a
-    // fresh running message on a finalized worker. Setting this synchronously
-    // on the chain — ahead of the cooldown/no-message guards — makes the
-    // gate in `update()` authoritative regardless of which guard path runs.
-    // The durable `finalized` set survives the subsequent handle deletion so
-    // a tick arriving AFTER the full settle still can't resurrect.
-    h.finished = true
-    markFinalized(h.agentId)
-    // No message ever posted → nothing to finalize. The worker's result
-    // reaches the user via the handback reply; a bare "done" recap with
-    // no preceding activity would be noise.
-    if (h.messageId == null) {
-      h.pendingFinish = null
-      return
-    }
-    // A flood window is open (or a prior 429 set a cooldown): honour it — a
-    // terminal edit isn't worth extending a ban. STAGE the terminal view so the
-    // heartbeat re-drives the finalize the instant the window/cooldown expires,
-    // so a finished worker's card can't get stuck on its last running render.
-    if (parkIfFloodWindowOpen(h) || nowFn() < h.cooldownUntil) {
-      h.pendingFinish = view
-      return
-    }
-    const body = renderWorkerActivity({ ...view, narrativeLines: h.narrative })
-    if (body === h.lastBody) {
-      h.pendingFinish = null
-      return
-    }
-    try {
-      const res = await opts.bot.editMessageText(h.chatId, h.messageId, body, sendOptsFor(h))
-      // Shed honesty (#3084): a shed terminal edit resolves the distinguishable
-      // SEND_GATE_SHED sentinel (#3110 F1 — NOT a bare `undefined`, which is the
-      // gate's benign no-op drop) — it did NOT land. Keep `pendingFinish` staged
-      // so the heartbeat re-drives it once the window closes; do NOT clear it or
-      // record `lastBody` (that would be a false finalization — card frozen on
-      // its running render while we believe it's done). Park on any open window.
-      if (isSendGateShed(res)) {
-        parkIfFloodWindowOpen(h)
-        h.pendingFinish = view
-        return
-      }
-      h.lastBody = body
-      h.lastEditAt = nowFn()
-      h.pendingFinish = null
-      log(
-        `worker-feed: finish agent=${h.agentId} chat=${h.chatId} ` +
-          `thread=${h.threadId ?? '-'} msgId=${h.messageId} state=${view.state} bytes=${body.length}`,
-      )
-    } catch (err) {
-      const outcome = classifyEditError(err)
-      if (outcome === 'rate_limited') {
-        noteRateLimited(h, err, 'finish')
-        // Re-stage for the heartbeat to re-drive after cooldown.
-        h.pendingFinish = view
-        return
-      }
-      if (outcome === 'not_modified') {
-        // Card already shows the finalized body — terminal edit succeeded.
-        h.lastBody = body
-        h.lastEditAt = nowFn()
-        h.pendingFinish = null
-        return
-      }
-      if (outcome === 'gone') {
-        // Message/chat gone — no card to finalize. Drop silently; the
-        // handback reply carries the result regardless.
-        h.pendingFinish = null
-        return
-      }
-      // 'transient' — re-stage for a heartbeat retry; log at debug.
-      h.pendingFinish = view
-      log(`worker-feed: finish transient error agent=${h.agentId}: ${(err as Error).message}`)
-    }
-  }
-
-  /**
-   * Heartbeat — keeps a running worker's message alive AND performs the
-   * FIRST paint for a prose-silent worker whose only tick arrived before
-   * `firstPaintMin`.
-   *
-   * Why the first-paint branch exists: a background worker that dives
-   * straight into quiet work (e.g. a long `Bash` / `npm test`) emits a
-   * single `sub_agent_tool_use` event when the command is invoked, then no
-   * further JSONL lines for the whole run. That one tick drives `update`
-   * once — but if it lands before `firstPaintMin` the paint is held, and
-   * with no subsequent tick nothing ever re-drives it, so the worker shows
-   * NOTHING for its entire run (the "I can't see the worker" gap). The
-   * heartbeat closes it: once such a handle is past `firstPaintMin`, drive a
-   * paint here through the same chain → doUpdate path. After first paint the
-   * suffix-only maintenance branch keeps it advancing.
-   *
-   * For handles that already have a posted message, this is the original
-   * option-(a), suffix-only re-render (never editMessageText directly). Skips:
-   *   - handles inside a 429 cooldown,
-   *   - handles with no `lastView` (no update ever arrived) or non-running,
-   *   - for the maintenance branch: handles edited within minEditInterval
-   *     (no stampede) or whose current step isn't yet stale.
-   * The `· Ns` liveSuffix is applied ONLY when the worker's current step is
-   * stale (now - lastEditAt >= heartbeatTickMs) so a normally-ticking worker is
-   * untouched and its body stays byte-stable for the dedup.
-   */
-  function heartbeatTick(): void {
-    const now = nowFn()
-    for (const h of handles.values()) {
-      // Orphan-paint guard: `finish()` deletes the handle in a `.finally` that
-      // may not have drained if a tick fires in the same synchronous stretch.
-      // Skip any handle no longer in the map so the first-paint branch below
-      // can never send a fresh `running` message on an already-finished worker
-      // (which would orphan a card that never finalizes). Restores the
-      // structural safety the pre-first-paint `messageId == null` skip gave.
-      if (!handles.has(h.agentId)) continue
-
-      // Deferred-finalize re-drive: a terminal edit that hit a 429 cooldown
-      // (or a transient error) was staged on `pendingFinish` by `doFinish`.
-      // Re-drive it once the cooldown has expired so a finished worker's card
-      // can't get stuck on its last running render. This is the deterministic
-      // backstop that replaces the old "stale but harmless" surrender — the
-      // framework owns ALIVE-and-done, wall-clock driven, no model in the loop.
-      // (The handle is still in the map because `finish()`'s `.finally(delete)`
-      // is chained AFTER `doFinish` and won't drain while a re-drive keeps the
-      // chain busy; once the terminal edit lands, `pendingFinish` is cleared
-      // and the `.finally` runs on the next chain settle.)
-      if (h.pendingFinish != null && now >= h.cooldownUntil) {
-        const view = h.pendingFinish
-        h.chain = h.chain
-          .then(() => doFinish(h, view))
-          .catch((err) => {
-            log(`worker-feed: heartbeat finalize re-drive error ${h.agentId}: ${(err as Error).message}`)
-          })
-          .finally(() => {
-            // Mirror `finish()`'s teardown: once the re-driven `doFinish`
-            // clears `pendingFinish` (terminal edit landed OR permanently
-            // failed), drop the handle. If it re-staged (another 429), the
-            // handle survives for the next heartbeat tick to retry.
-            if (handles.get(h.agentId)?.pendingFinish == null) {
-              handles.delete(h.agentId)
-            }
-          })
-        continue
-      }
-
-      if (h.lastView == null) continue
-      if (h.lastView.state !== 'running') continue
-      if (now < h.cooldownUntil) continue
-
-      const liveElapsed = h.dispatchAtMs != null ? now - h.dispatchAtMs : h.lastView.elapsedMs
-
-      // First-paint path: a prose-silent worker's single early tick was held
-      // (elapsed < firstPaintMin) and no further tick re-drove it. Once it is
-      // past firstPaintMin, drive the paint. doUpdate's send branch re-checks
-      // firstPaintMin against the refreshed elapsed, so this is exact.
-      if (h.messageId == null) {
-        if (liveElapsed < firstPaintMin) continue
-        const view = { ...h.lastView, elapsedMs: Math.max(h.lastView.elapsedMs, liveElapsed) }
-        h.chain = h.chain
-          .then(() => doUpdate(h, view))
-          .catch((err) => {
-            log(`worker-feed: heartbeat first-paint chain error ${h.agentId}: ${(err as Error).message}`)
-          })
-        continue
-      }
-
-      if (now - h.lastEditAt < minEditInterval) continue
-      const stale = now - h.lastEditAt >= heartbeatTickMs
-      if (!stale) continue
-      // Per-step suffix: the CURRENT step's own elapsed (since the `→` line
-      // last changed), never the worker total — the header already shows the
-      // total, and repeating it on the step line was the Ken-observed dupe.
-      // Under STEP_TIMER_MIN_MS formatStepSuffix returns '' (no timer yet);
-      // the header elapsed still climbs via the refreshed view below.
-      const stepElapsed = h.stepStartedAtMs != null ? now - h.stepStartedAtMs : liveElapsed
-      const liveSuffix = formatStepSuffix(stepElapsed)
-      // Re-render THROUGH the chain + doUpdate path — never editMessageText directly.
-      //
-      // CLOCK-ANCHOR PARITY: refresh the view's elapsedMs to the same `now`
-      // anchor the step suffix uses. The header renders
-      // `view.elapsedMs`; passing the stale lastView froze the header at the
-      // last watcher event while the `· Ns` suffix kept ticking, so the
-      // current step's timer could read MORE than the card's master elapsed
-      // (Ken-observed defect). Both numbers now derive from one anchor
-      // (dispatchAtMs) at one `now`, so header elapsed >= step suffix always.
-      const view = { ...h.lastView, elapsedMs: Math.max(h.lastView.elapsedMs, liveElapsed) }
-      h.chain = h.chain
-        .then(() => doUpdate(h, view, liveSuffix))
-        .catch((err) => {
-          log(`worker-feed: heartbeat chain error ${h.agentId}: ${(err as Error).message}`)
-        })
+      // 'transient' — leave the message intact; the heartbeat re-attempts.
+      if (isTerminal && opts2.terminalRecap != null) g.pendingFinalize = opts2.terminalRecap
+      log(`worker-feed: edit transient error feed=${g.feedKey}: ${(err as Error).message}`)
     }
   }
 
   // Arm the heartbeat once at construction. The real timer is `.unref()`'d so
   // it never keeps the process alive; tests inject setInterval/clearInterval.
+  function heartbeatTick(): void {
+    const now = nowFn()
+    for (const g of [...groups.values()]) {
+      // Deferred-finalize re-drive: a terminal edit that hit a cooldown/flood
+      // window was staged on `pendingFinalize`. Re-drive it once the cooldown
+      // expires so a finished feed can't get stuck on its last running render.
+      if (g.pendingFinalize != null && now >= g.cooldownUntil) {
+        const recap = g.pendingFinalize
+        // The finishing agent is whatever finished row remains (state terminal).
+        const finishingAgentId = [...g.workers.values()].find((w) => w.finished)?.agentId
+        g.chain = g.chain
+          .then(() => doRender(g, { force: true, terminalRecap: recap, finishingAgentId }))
+          .catch((err) => {
+            log(`worker-feed: heartbeat finalize re-drive error feed=${g.feedKey}: ${(err as Error).message}`)
+          })
+        continue
+      }
+
+      if (now < g.cooldownUntil) continue
+      const running = runningRows(g)
+      if (running.length === 0) continue
+
+      // First-paint path: no message yet and some worker has now crossed
+      // firstPaintMin (a prose-silent worker's single early tick was held).
+      if (g.messageId == null) {
+        const maxElapsed = Math.max(0, ...running.map((r) => liveElapsed(r, now)))
+        if (maxElapsed < firstPaintMin) continue
+        g.chain = g.chain
+          .then(() => doRender(g, {}))
+          .catch((err) => {
+            log(`worker-feed: heartbeat first-paint chain error feed=${g.feedKey}: ${(err as Error).message}`)
+          })
+        continue
+      }
+
+      if (now - g.lastEditAt < minEditInterval) continue
+      const stale = now - g.lastEditAt >= heartbeatTickMs
+      if (!stale) continue
+      // Re-render THROUGH the chain → doRender path with climbing elapsed.
+      g.chain = g.chain
+        .then(() => doRender(g, { heartbeat: true }))
+        .catch((err) => {
+          log(`worker-feed: heartbeat chain error feed=${g.feedKey}: ${(err as Error).message}`)
+        })
+    }
+  }
+
   heartbeatTimer = setIntervalFn(heartbeatTick, heartbeatTickMs)
 
   return {
     has(agentId) {
-      return handles.get(agentId)?.messageId != null
+      const g = groupOfAgent(agentId)
+      return g != null && g.messageId != null && g.workers.has(agentId)
     },
     messageIdOf(agentId) {
-      return handles.get(agentId)?.messageId ?? null
+      return groupOfAgent(agentId)?.messageId ?? null
     },
     get size() {
-      return handles.size
+      let n = 0
+      for (const g of groups.values()) n += g.workers.size
+      return n
     },
     update(agentId, chatId, view, threadId) {
-      // No chat to post to (owner DM unconfigured) — don't create a
-      // handle that would retry a failing send('') every tick.
+      // No chat to post to (owner DM unconfigured) — don't create state that
+      // would retry a failing send('') every tick.
       if (chatId.length === 0) return Promise.resolve()
-      // Resurrection guard: a worker that has already been finalized
-      // (`doFinish` latched `finalized`) must not get a fresh running cue.
-      // A late watcher `onProgress` tick can arrive after `finish()`'s chain
-      // has fully settled and the handle was deleted — without this durable
-      // gate the tick would create a brand-new handle and paint a fresh
-      // `running` message on an already-done worker (the card lies). The
-      // heartbeat's orphan-paint guard covers the heartbeat tick only; the
-      // per-handle `finished` flag covers the pre-delete window; this set
-      // covers the post-delete window.
+      // Resurrection guard: a worker already finalized must not get a fresh
+      // running cue (a late watcher tick would repaint a done worker as live).
       if (finalized.has(agentId)) return Promise.resolve()
-      const existing = handles.get(agentId)
-      if (existing?.finished === true) return Promise.resolve()
-      let h = existing
-      if (h == null) {
-        h = {
-          agentId,
+      const existingRow = groupOfAgent(agentId)?.workers.get(agentId)
+      if (existingRow?.finished === true) return Promise.resolve()
+
+      const feedKey = feedKeyOf(chatId, threadId)
+      let g = groups.get(feedKey)
+      if (g == null) {
+        g = {
+          feedKey,
           chatId,
           threadId,
           messageId: null,
           lastBody: null,
           lastEditAt: 0,
           cooldownUntil: 0,
-          narrative: [],
           chain: Promise.resolve(),
+          workers: new Map(),
+          pendingFinalize: null,
+        }
+        groups.set(feedKey, g)
+      }
+      let row = g.workers.get(agentId)
+      if (row == null) {
+        row = {
+          agentId,
+          narrative: [],
           lastView: null,
+          state: 'running',
+          finished: false,
           dispatchAtMs: null,
           stepStartedAtMs: null,
-          finished: false,
-          pendingFinish: null,
         }
-        handles.set(agentId, h)
+        g.workers.set(agentId, row)
+        agentIndex.set(agentId, feedKey)
       }
-      const handle = h
-      handle.chain = handle.chain.then(() => doUpdate(handle, view)).catch((err) => {
+      // Accumulate before the gate so a throttled tick still grows the
+      // narrative — it surfaces on the next edit that does fire.
+      accumulateNarrative(row, view)
+      row.state = 'running'
+      row.lastView = { ...view, narrativeLines: [...row.narrative] }
+      if (row.dispatchAtMs == null) row.dispatchAtMs = nowFn() - view.elapsedMs
+
+      const group = g
+      group.chain = group.chain.then(() => doRender(group)).catch((err) => {
         log(`worker-feed: update chain error ${agentId}: ${(err as Error).message}`)
       })
-      return handle.chain
+      return group.chain
     },
     finish(agentId, view) {
-      const h = handles.get(agentId)
-      if (h == null) return Promise.resolve()
-      h.chain = h.chain
-        .then(() => doFinish(h, view))
+      const g = groupOfAgent(agentId)
+      const row = g?.workers.get(agentId)
+      if (g == null || row == null) {
+        // Never tracked (trivial worker) — mark finalized so a late tick can't
+        // resurrect, and let the handback carry the result.
+        markFinalized(agentId)
+        return Promise.resolve()
+      }
+      // Latch synchronously so a late `running` cue on the chain can't resurrect.
+      row.finished = true
+      row.state = view.state === 'failed' ? 'failed' : 'done'
+      markFinalized(agentId)
+
+      const group = g
+      group.chain = group.chain
+        .then(() => {
+          const others = runningRows(group).filter((w) => w.agentId !== agentId)
+          if (others.length > 0) {
+            // Siblings still live → drop this row from the combined body and
+            // re-render the running set. The result reaches the user via the
+            // separate handback, never folded into this cosmetic edit.
+            removeWorker(group, agentId)
+            return doRender(group, { force: true })
+          }
+          // Last live worker → finalize the shared message to its terminal recap.
+          const recap: WorkerActivityView = { ...view, narrativeLines: [...row.narrative] }
+          return doRender(group, { force: true, terminalRecap: recap, finishingAgentId: agentId })
+        })
         .catch((err) => {
           log(`worker-feed: finish chain error ${agentId}: ${(err as Error).message}`)
         })
-        .finally(() => {
-          // Only tear down the handle once the terminal edit has actually
-          // landed (or permanently failed). If `doFinish` staged the edit on
-          // `pendingFinish` (a 429 cooldown / transient error was in effect),
-          // the handle must survive so the heartbeat can re-drive the
-          // finalize after cooldown. The heartbeat's re-drive chain ends by
-          // re-entering `doFinish`, which clears `pendingFinish` on success
-          // or permanent-failure — so this `.finally` deletes on the NEXT
-          // chain settle once there is nothing left to finalize. Without this
-          // guard, the `.finally` would delete the handle (and its staged
-          // pendingFinish) immediately after the first staged doFinish,
-          // stranding the card on its last running render.
-          if (handles.get(agentId)?.pendingFinish == null) {
-            handles.delete(agentId)
-          }
-        })
-      return h.chain
+      return group.chain
     },
     drop(agentId) {
-      // A dropped worker is also done — mark finalized so a late watcher
-      // tick can't resurrect a running card on it (same gate as `finish`).
+      // A dropped worker is also done — mark finalized so a late tick can't
+      // resurrect a running card on it (same gate as `finish`).
       markFinalized(agentId)
-      handles.delete(agentId)
+      const g = groupOfAgent(agentId)
+      if (g == null) return
+      const hadMessage = g.messageId != null
+      removeWorker(g, agentId)
+      // Re-render so the dropped worker disappears from a combined body. Skip
+      // when the group is gone (removeWorker deleted it) or never painted.
+      if (hadMessage && groups.has(g.feedKey) && runningRows(g).length > 0) {
+        g.chain = g.chain
+          .then(() => doRender(g, { force: true }))
+          .catch((err) => {
+            log(`worker-feed: drop re-render error ${agentId}: ${(err as Error).message}`)
+          })
+      }
     },
     resurrect(agentId) {
       // Issue #3023: the worker's card was falsely finalized and its JSONL has
-      // resumed. Re-open the paint path: drop the durable finalized gate so a
-      // fresh `running` cue creates a new handle and first-paints a live card
-      // again, and un-latch any surviving handle (finish deleted it in the
-      // common case, but a staged pendingFinish could keep it alive). The next
-      // `update` tick from the watcher's replayed progress does the repaint.
+      // resumed. Re-open the paint path: drop the durable finalized gate + any
+      // surviving per-row latch so a fresh `running` cue repaints a live card.
       const wasFinalized = finalized.delete(agentId)
-      const h = handles.get(agentId)
-      if (h != null) {
-        h.finished = false
-        h.pendingFinish = null
+      const row = groupOfAgent(agentId)?.workers.get(agentId)
+      if (row != null) {
+        row.finished = false
+        row.state = 'running'
       }
-      if (wasFinalized || h != null) {
+      if (wasFinalized || row != null) {
         log(`worker-feed: resurrect agent=${agentId} — cleared finalized gate; card will repaint on next running cue`)
       }
     },

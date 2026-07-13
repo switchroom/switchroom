@@ -6747,10 +6747,19 @@ function isAutoFallbackCooldownActive(_agentName: string, now: number): boolean 
 
 async function editCardExpired(chatId: string, messageId: number | undefined, body: string): Promise<void> {
   if (messageId == null) return
-  await lockedBot.api
-    // allow-raw-bot-api: message-id-targeted edit (no thread to lose); best-effort card-expiry strip from the reaper (no grammy ctx). Dropping reply_markup strips the stale keyboard atomically with the text edit.
-    .editMessageText(chatId, messageId, richMessage(body), { reply_markup: { inline_keyboard: [] } })
-    .catch(() => {})
+  // #3084 bypass audit: this best-effort card-expiry strip (reaper + lazy
+  // sweeps, no grammy ctx) previously fired a RAW `lockedBot.api.editMessageText`
+  // OUTSIDE the send gate — a residual flood vector (a 429 here never reached
+  // `onFloodWait`, so the breaker stayed blind). Routed through `robustApiCall`
+  // (chat-lock → send-gate → retry/breaker) as a `cosmetic` edit carrying
+  // messageId+editPayload so it paces/sheds under pressure and its 429 records
+  // the flood window. Dropping reply_markup strips the stale keyboard atomically
+  // with the text edit; message-id-targeted so no thread to lose.
+  const text = richMessage(body)
+  await robustApiCall(
+    () => lockedBot.api.editMessageText(chatId, messageId, text, { reply_markup: { inline_keyboard: [] } }),
+    { chat_id: chatId, verb: 'card-expired.strip', priorityClass: 'cosmetic', messageId, editPayload: body },
+  ).catch(() => {})
 }
 
 function recordMissedApproval(opts: {
@@ -29325,6 +29334,12 @@ void (async () => {
             // supersedes the coarse 5-min bucket relay below to avoid
             // double-surfacing the same progress beat.
             const workerFeedEnabled = isWorkerActivityFeedEnabled(process.env.SWITCHROOM_WORKER_ACTIVITY_FEED)
+            // Combined-feed row cap (channels.telegram.worker_feed.max_rows).
+            // Unset / non-positive → the feed's built-in default (8).
+            const workerFeedMaxRows = (() => {
+              const raw = Number(process.env.SWITCHROOM_TG_WORKER_FEED_MAX_ROWS)
+              return Number.isInteger(raw) && raw > 0 ? raw : undefined
+            })()
             // Model A — foreground sub-agent nesting in the parent's live
             // activity draft. ON by default; this edits the SAME activity-
             // summary message the tool_label feed already owns (not the
@@ -29382,6 +29397,13 @@ void (async () => {
               // every ~6s for the whole ban (the worker-feed shed-contract bug:
               // 565 `sent.message_id` crashes in one 6h ban).
               floodWaitRemainingMs: probeFloodWaitRemainingMs,
+              // #3084 follow-up: 2+ background workers in one chat/thread coalesce
+              // into ONE combined feed message. `maxRows` caps the visible rows
+              // (compact `+M more working…` spill) so the body stays under the
+              // rich-message wire ceiling (STATUS_CARD_CHAR_BUDGET). Sourced from
+              // channels.telegram.worker_feed.max_rows via the config cascade
+              // (scaffold emits SWITCHROOM_TG_WORKER_FEED_MAX_ROWS); unset → 8.
+              maxRows: workerFeedMaxRows,
               log: (msg) => process.stderr.write(`telegram gateway: ${msg}\n`),
             })
             subagentWatcher = startSubagentWatcher({
