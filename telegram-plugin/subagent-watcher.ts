@@ -1131,23 +1131,60 @@ export function readSubTail(
       // creates/refreshes the orphan/background worker-feed row (→ "starting…",
       // whose first paint the feed's own firstPaintMin + heartbeat then owns).
       if (onProgress != null && entry.state === 'running' && !entry.historical) {
-        try {
-          onProgress({
-            agentId: entry.agentId,
-            description: entry.description,
-            latestSummary: '',
-            elapsedMs: now - entry.dispatchedAt,
-            prevBucketIdx: entry.lastProgressBucketIdx,
-            setBucketIdx: (b: number) => {
-              entry.lastProgressBucketIdx = b
-            },
-            lastTool: entry.lastTool,
-            toolCount: entry.toolCount,
-            model: entry.currentModel,
-            skeleton: true,
-          })
-        } catch (cbErr) {
-          log?.(`subagent-watcher: onProgress (skeleton) callback error ${entry.agentId}: ${(cbErr as Error).message}`)
+        // Child-aware suppression (#3233): the skeleton cue exists to paint a
+        // LEAF worker whose card would otherwise be invisible (the 205s
+        // blackout). A pure-ORCHESTRATOR parent — one that has dispatched a
+        // descendant of its own — must NOT earn a redundant "starting…"
+        // liveness row: the child surfaces its own live row in the same worker
+        // feed, so an extra skeleton row for the parent is pure feed clutter
+        // (fails the no-noise / never-storm bar). The discriminator is
+        // deliberately NOT "0 own tools" — a leaf that registers and BLOCKS on
+        // its very first tool has 0 completed tools and MUST still paint.
+        // Instead, suppress when THIS entry has EVER dispatched a child (any
+        // child registry row keyed by parent_agent_id = this entry's jsonl
+        // agentId; recordNestedSubagentDispatch stamps it). "Ever", not "a
+        // currently-running child": the skeleton cue is only the NO-GROWTH
+        // fallback, so suppressing it for an orchestrator never hides real
+        // work — if the parent does its own tools, those fire real growth
+        // cues and paint the row; if it only orchestrates, its children carry
+        // the liveness. Using "currently running" instead would re-paint a
+        // spurious orchestrator "starting…" the moment its child finished. A
+        // genuine leaf has no child row at all, so it keeps firing the
+        // skeleton cue and paints promptly — the 205s-blackout class is intact.
+        let hasChild = false
+        if (db != null) {
+          try {
+            const kid = db
+              .prepare(
+                'SELECT 1 FROM subagents WHERE parent_agent_id = ? LIMIT 1',
+              )
+              .get(entry.agentId)
+            hasChild = kid != null
+          } catch (kidErr) {
+            // Best-effort: an absent/failed linkage read is treated as "leaf"
+            // so we never suppress a genuine blackout paint on a DB hiccup.
+            log?.(`subagent-watcher: skeleton child-check error ${entry.agentId}: ${(kidErr as Error).message}`)
+          }
+        }
+        if (!hasChild) {
+          try {
+            onProgress({
+              agentId: entry.agentId,
+              description: entry.description,
+              latestSummary: '',
+              elapsedMs: now - entry.dispatchedAt,
+              prevBucketIdx: entry.lastProgressBucketIdx,
+              setBucketIdx: (b: number) => {
+                entry.lastProgressBucketIdx = b
+              },
+              lastTool: entry.lastTool,
+              toolCount: entry.toolCount,
+              model: entry.currentModel,
+              skeleton: true,
+            })
+          } catch (cbErr) {
+            log?.(`subagent-watcher: onProgress (skeleton) callback error ${entry.agentId}: ${(cbErr as Error).message}`)
+          }
         }
       }
       return

@@ -30542,7 +30542,7 @@ void (async () => {
               // suppresses stale-after-restart delivery (a 4-h-old
               // "still working (5m)" would be a lie). Sweep on handback
               // lives in the `onFinish` block just above.
-              onProgress: ({ agentId, description, latestSummary, elapsedMs, prevBucketIdx, setBucketIdx, lastTool, toolCount, progressLine, model }) => {
+              onProgress: ({ agentId, description, latestSummary, elapsedMs, prevBucketIdx, setBucketIdx, lastTool, toolCount, progressLine, model, skeleton }) => {
                 let fleetChatId = ''
                 try {
                   const fleets = progressDriver?.peekAllFleets() ?? []
@@ -30632,6 +30632,15 @@ void (async () => {
                     return
                   }
                   if (surface !== 'nest') return // 'skip' — orphan-status off
+                  // #3233: a skeleton liveness cue carries NO step content by
+                  // construction (empty latestSummary/progressLine) — it exists
+                  // ONLY to create/keep-alive the orphan worker-feed row handled
+                  // just above. Branch EXPLICITLY on the `skeleton` discriminator
+                  // rather than inferring "no content" from an empty step line:
+                  // a skeleton cue must never nest into the parent's live turn
+                  // card (there is nothing to render, and the parent's own card
+                  // already owns the turn). Deterministic, controls-in-code.
+                  if (skeleton) return
                   const turn = currentTurn
                   if (turn == null) return // defensive: 'nest' implies a live turn
                   // Render regardless of `replyCalled` — a foreground Task
@@ -30777,8 +30786,17 @@ void (async () => {
                   return
                 }
 
+                // #3233: with the worker feed DISABLED, the legacy bucket relay
+                // below injects a synthesized "still working" inbound turn. A
+                // skeleton liveness cue carries an EMPTY latestSummary, so
+                // letting it reach the relay would queue a blank/contentless
+                // progress card. The `skeleton` discriminator is threaded into
+                // the pure decision (gate 1b → 'skeleton-liveness'), which drops
+                // it deterministically (controls-in-code, unit-tested) rather
+                // than an opaque inline return here.
                 const progressOrigin = resolveSubagentOriginChat(agentId)
                 const decision = decideSubagentProgress({
+                  skeleton: skeleton === true,
                   disableEnvValue: process.env.SWITCHROOM_DISABLE_SUBAGENT_PROGRESS,
                   isBackground,
                   // Prefer the conversation the Task was dispatched from over

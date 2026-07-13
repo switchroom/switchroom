@@ -176,12 +176,20 @@ export interface SubagentProgressDecisionInput {
    *  passes it in; the decision returns the new bucket idx on
    *  `deliver: true` so the caller can update its tracker. */
   lastBucketIdx: number | null
+  /** #3233: true for a growth-independent SKELETON liveness cue (empty
+   *  `latestSummary`, no step content). It exists ONLY to first-paint /
+   *  keep-alive the in-message worker-feed row; the legacy bucket relay would
+   *  turn it into a synthesized "still working" inbound with no content — a
+   *  blank card. Suppressed deterministically here so the worker-feed-DISABLED
+   *  path degrades to a no-op rather than a blank envelope. */
+  skeleton?: boolean
   /** Deterministic clock for tests. */
   nowMs?: number
 }
 
 export type SubagentProgressSkipReason =
   | 'env-disabled'
+  | 'skeleton-liveness'
   | 'foreground'
   | 'no-chat'
   | 'bucket-already-fired'
@@ -199,6 +207,8 @@ export type SubagentProgressDecision =
  *
  * Gates, in order:
  *   1. kill-switch — `SWITCHROOM_DISABLE_SUBAGENT_PROGRESS=1` disables.
+ *   1b. skeleton-liveness (#3233) — a contentless skeleton cue is never
+ *       relayed as a synthesized inbound (worker-feed row only).
  *   2. foreground — foreground sub-agents stream natively.
  *   3. no-chat    — nowhere to deliver.
  *   4. missing-jsonl-id — the dedup key. Without it we'd lose
@@ -232,6 +242,13 @@ export function decideSubagentProgress(
 ): SubagentProgressDecision {
   if (isEnvFlagOn(input.disableEnvValue)) {
     return { deliver: false, reason: 'env-disabled' }
+  }
+  // #3233: a skeleton liveness cue carries no step content — never relay it as
+  // a synthesized progress inbound (that would be a blank card). Its whole job
+  // is the in-message worker-feed row; when that surface is off, degrade to a
+  // no-op. Checked before bucketing so it can never advance the bucket tracker.
+  if (input.skeleton === true) {
+    return { deliver: false, reason: 'skeleton-liveness' }
   }
   if (!input.isBackground) {
     return { deliver: false, reason: 'foreground' }
