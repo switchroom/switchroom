@@ -53,9 +53,10 @@ describe("uat: pending-progress edit preserves HTML formatting (#1698 regression
   it(
     "first pending-progress edit reads back WITHOUT literal HTML tags",
     async () => {
-      // reapOnTearDown: the background sleep 90 (and any leftover workers)
-      // must not bleed into the next scenario's shared-chat observation.
-      const sc = await spinUp({ agent: "test-harness", reapOnTearDown: true });
+      // quiesceBeforeStart: wait for a prior scenario's background worker to
+      // finish editing the shared chat before sending — otherwise the agent
+      // is saturated and this turn's pending-progress edit never fires.
+      const sc = await spinUp({ agent: "test-harness", quiesceBeforeStart: true });
       try {
         const startedAt = Date.now();
         await sc.sendDM(PROMPT);
@@ -138,6 +139,10 @@ describe("uat: pending-progress edit preserves HTML formatting (#1698 regression
         await sc.tearDown();
       }
     },
-    OVERALL_DEADLINE_MS + 30_000,
+    // Outer budget = worst-case quiesce-before-start (QUIESCE_MAX_MS ~360s,
+    // normally ~15s once a prior worker is done) + the 240s observation
+    // window + slack. Quiesce runs inside spinUp, before the observation
+    // window starts, so it must be covered by the it() ceiling.
+    360_000 + OVERALL_DEADLINE_MS + 30_000,
   );
 });

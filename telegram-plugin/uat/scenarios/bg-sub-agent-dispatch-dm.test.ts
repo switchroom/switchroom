@@ -110,10 +110,10 @@ describe("uat: background sub-agent visibility (#709/#776/#782/#788)", () => {
   it(
     "worker-feed appears with running status then flips to finished once the sub-agent completes",
     async () => {
-      // reapOnTearDown: this scenario's 10-step background worker outlives
-      // its it() and bleeds worker-feed edits into later scenarios on the
-      // shared bot DM chat — reap it on teardown for cross-scenario isolation.
-      const sc = await spinUp({ agent: "test-harness", reapOnTearDown: true });
+      // quiesceBeforeStart: wait for the shared bot DM chat to be idle (a
+      // prior scenario's background worker finished) before sending, so this
+      // scenario runs against an unsaturated agent.
+      const sc = await spinUp({ agent: "test-harness", quiesceBeforeStart: true });
       try {
         await sc.sendDM(BG_DISPATCH_PROMPT);
 
@@ -163,14 +163,22 @@ describe("uat: background sub-agent visibility (#709/#776/#782/#788)", () => {
         expect(afterDeltaMsg, "feed message disappeared mid-flight (AC-1 regression)").not.toBeNull();
         expect(afterDeltaMsg!.text).not.toBe(beforeDelta);
 
-        // AC-2 closing half: bg terminates → body flips to "finished ·
-        // completed". The terminal edit is triggered by the subagent-watcher's
-        // stall detection (60s after the last JSONL activity), because
-        // background Claude Code workers don't always emit a sub_agent_turn_end
-        // event. Budget: worker steps (~60s) + stall window (60s) + slack.
-        // From first-paint to terminal is typically 140-165s.
+        // AC-2 closing half: bg terminates → body flips to the terminal
+        // state header ("done · N tools · <elapsed>"). The terminal edit is
+        // triggered by the subagent-watcher's stall detection (60s after the
+        // last JSONL activity), because background Claude Code workers don't
+        // always emit a sub_agent_turn_end event.
+        //
+        // Budget: the 10-step worker runs each sleep+echo+narration as its own
+        // round-trip, so under real fleet LLM latency it takes ~5min wall
+        // (observed 4m59s), then the stall-terminal fires ~60s later. The old
+        // 180s budget assumed a ~2min worker and abandoned the still-running
+        // worker at the deadline — which BOTH failed this assertion AND left
+        // the worker editing the shared chat, bleeding into later scenarios.
+        // Wait long enough for the real worker to complete so we observe a
+        // genuine terminal recap (a feed that never terminates still fails).
         let doneText: string | null = null;
-        const deadline = Date.now() + 180_000;
+        const deadline = Date.now() + 420_000;
         while (Date.now() < deadline) {
           const m = await sc.driver.getMessage(sc.botUserId, feed.messageId);
           if (m != null && WORKER_DONE_RE.test(m.text)) {
@@ -187,8 +195,9 @@ describe("uat: background sub-agent visibility (#709/#776/#782/#788)", () => {
         await sc.tearDown();
       }
     },
-    // Outer per-test budget: sum of inner deadlines (45 + 75 + 16 + 180 =
-    // 316s) + spinUp settle (~12s) + slack.
-    360_000,
+    // Outer per-test budget: sum of inner deadlines (45 + 75 + 16 + 420 =
+    // 556s) + spinUp settle (~12s) + quiesce-before-start (bg runs first so
+    // the chat is normally already quiet; capped at QUIESCE_MAX_MS) + slack.
+    720_000,
   );
 });

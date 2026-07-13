@@ -60,9 +60,9 @@ describe("uat: foreground sub-agent live activity nesting (#2032)", () => {
   it(
     "surfaces nested foreground activity in the feed AFTER the ack-first reply",
     async () => {
-      // reapOnTearDown: reap any leftover sub-agent activity so it cannot
-      // bleed worker-feed edits into the next scenario's shared-chat window.
-      const sc = await spinUp({ agent: "test-harness", reapOnTearDown: true });
+      // quiesceBeforeStart: wait for a prior scenario's background worker to
+      // finish editing the shared chat before sending, for clean isolation.
+      const sc = await spinUp({ agent: "test-harness", quiesceBeforeStart: true });
       try {
         await sc.sendDM(FG_DISPATCH_PROMPT);
 
@@ -118,6 +118,10 @@ describe("uat: foreground sub-agent live activity nesting (#2032)", () => {
         await sc.tearDown();
       }
     },
-    300_000,
+    // Outer budget = worst-case quiesce-before-start (QUIESCE_MAX_MS ~360s,
+    // normally ~15s) + the ~270s inner observation deadlines + slack. Quiesce
+    // runs inside spinUp before the observation window, so the it() ceiling
+    // must cover it.
+    360_000 + 300_000,
   );
 });

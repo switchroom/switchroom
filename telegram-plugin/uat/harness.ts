@@ -19,7 +19,6 @@
  * and would substantially re-invent the agent lifecycle.
  */
 
-import { execSync } from "node:child_process";
 import { Driver } from "./driver.js";
 import {
   expectMessage,
@@ -60,52 +59,57 @@ export interface SpinUpOptions {
    */
   settleMs?: number;
   /**
-   * Reap the agent's in-flight background workers in `tearDown` (durable
-   * cross-scenario isolation). Set by scenarios that dispatch long-lived
-   * background sub-agents (Agent tool `run_in_background`) or async
-   * background bash: those workers keep editing the SHARED bot DM chat
-   * long after the scenario's `it()` returns, bleeding into the next
-   * scenario's observation window on the sequential (`maxForks:1`) UAT
-   * run and starving the shared agent's turn budget. A marker-safe agent
-   * restart in `tearDown` kills every leftover worker so the next
-   * scenario starts from a clean agent. Best-effort: if NOPASSWD sudo /
-   * the CLI isn't on the runner it no-ops (the pre-existing shared-agent
-   * behaviour) rather than failing the scenario. Default false — only the
-   * worker-spawning scenarios opt in, so the blast radius stays scoped and
-   * non-worker scenarios keep the light disconnect-only tearDown.
+   * Cross-scenario isolation: BEFORE this scenario sends its first inbound,
+   * wait until the SHARED bot DM chat has gone quiet — no new bot message or
+   * edit for {@link QUIESCE_QUIET_WINDOW_MS} — so a prior scenario's still-
+   * running background worker (Agent tool `run_in_background` / async bash)
+   * has finished editing the chat and released the single shared agent's
+   * turn budget. Without this, a leftover worker keeps live-editing the
+   * shared chat into the next scenario's observation window, latches a
+   * foreign anchor and starves the agent so the next scenario's own
+   * turn/pending-progress edit never fires. The UAT runner has NO sudo /
+   * docker / CLI, so an agent restart cannot be issued from here — this
+   * driver-only quiesce is the runner-feasible isolation mechanism. Bounded
+   * by {@link QUIESCE_MAX_MS}: if the chat never settles it proceeds anyway
+   * (degrading to the pre-existing shared-chat behaviour, never hanging the
+   * suite). Default false — only worker-spawning scenarios opt in.
    */
-  reapOnTearDown?: boolean;
+  quiesceBeforeStart?: boolean;
 }
 
 export const DEFAULT_SETTLE_MS = 8_000;
 
-/** True iff NOPASSWD sudo is usable on this runner (uat-host has it; CI doesn't). */
-function canShellSudo(): boolean {
-  try {
-    execSync("sudo -n true", { stdio: "ignore", timeout: 2_000 });
-    return true;
-  } catch {
-    return false;
-  }
-}
+/** A quiet window with no bot message/edit that declares the shared chat idle. */
+const QUIESCE_QUIET_WINDOW_MS = 15_000;
+/** Hard cap on the quiesce wait — a slow prior worker can run ~5min; then proceed anyway. */
+const QUIESCE_MAX_MS = 360_000;
 
 /**
- * Marker-safe restart of the test-harness agent to reap every leftover
- * background worker before the next scenario runs. Mirrors the proven
- * restart in `jtbd-always-on-after-restart-dm.test.ts` (restart blocks
- * ~30s as the gateway bridge reattaches, so execSync returning implies the
- * agent is back up). Best-effort — swallows all errors so a reap failure
- * never turns into a scenario failure.
+ * Block until the shared bot DM chat has produced no bot message or edit for
+ * {@link QUIESCE_QUIET_WINDOW_MS}, or {@link QUIESCE_MAX_MS} elapses. Reuses
+ * `expectMessage` (which observes fresh sends AND edits): each iteration
+ * waits one quiet-window for ANY bot activity — a returned message means the
+ * chat is still active (a prior worker editing), a timeout means the window
+ * passed silently → the chat is idle and the next scenario can start clean.
+ * Driver-only, so it works on the privilege-less UAT runner.
  */
-function reapAgentWorkers(name: string): void {
-  if (!canShellSudo()) return;
-  try {
-    execSync(
-      `sudo -n env PATH=$PATH HOME=$HOME switchroom agent restart ${name} --force`,
-      { stdio: ["ignore", "pipe", "pipe"], timeout: 90_000 },
-    );
-  } catch {
-    /* best-effort — degrade to the shared-agent behaviour, never fail here */
+async function quiesceChat(
+  driver: Driver,
+  botUserId: number,
+  driverUserId: number,
+): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < QUIESCE_MAX_MS) {
+    try {
+      await expectMessage(driver, botUserId, () => true, {
+        timeout: QUIESCE_QUIET_WINDOW_MS,
+        senderFilter: { notUserId: driverUserId },
+      });
+      // Bot activity within the window → prior worker still editing; keep waiting.
+    } catch {
+      // No activity for a full quiet window → the shared chat is idle.
+      return;
+    }
   }
 }
 
@@ -218,6 +222,15 @@ export async function spinUp(opts: SpinUpOptions): Promise<Scenario> {
     await new Promise((resolve) => setTimeout(resolve, settleMs));
   }
 
+  // Cross-scenario isolation: for worker-spawning scenarios, wait until the
+  // shared bot DM chat is idle (a prior scenario's background worker has
+  // finished editing) before returning, so this scenario sends into an
+  // unsaturated agent. Driver-only — the UAT runner has no sudo/docker/CLI to
+  // restart the agent, so this is the runner-feasible reap.
+  if (opts.quiesceBeforeStart) {
+    await quiesceChat(driver, botUserId, driverUserId);
+  }
+
   const scenario: Scenario = {
     driver,
     botUserId,
@@ -242,13 +255,6 @@ export async function spinUp(opts: SpinUpOptions): Promise<Scenario> {
       await driver.disconnect().catch(() => {
         /* idempotent — log-and-move-on; the persistent agent is unaffected */
       });
-      // Durable cross-scenario isolation: reap this scenario's leftover
-      // background workers so they cannot bleed into the next scenario's
-      // observation window on the shared bot DM chat. Opt-in — only
-      // worker-spawning scenarios set `reapOnTearDown`. Best-effort.
-      if (opts.reapOnTearDown) {
-        reapAgentWorkers(opts.agent);
-      }
     },
   };
 
