@@ -550,7 +550,7 @@ import { handleRequestDriveApproval } from './drive-write-approval.js'
 import { handleRequestMs365Approval } from './ms365-write-approval.js'
 import { buildDiffPreviewCard } from './diff-preview-card.js'
 import { createPendingInboundBuffer, redeliverBufferedInbound, idleDrainTick } from './pending-inbound-buffer.js'
-import { isCronIdentity, deliverInjectWithFallback } from './cron-session.js'
+import { isCronIdentity, isCronInjectFire, deliverInjectWithFallback } from './cron-session.js'
 import {
   ObligationLedger,
   buildObligationRepresentInbound,
@@ -11562,10 +11562,18 @@ const ipcServer: IpcServer = createIpcServer({
   },
 
   onInjectInbound(_client: IpcClient, msg: InjectInboundMessage) {
-    // Cron fires (incl. cheap-cron, whose session events are dropped before
-    // currentTurn is set) are real activity — re-arm idle auto-clear so a
-    // working scheduled agent isn't wiped after 3h of "no inbound".
-    markIdleActivity()
+    // #3114 — do NOT unconditionally stamp the MAIN idle clock here. A cron
+    // fire (Tier-1 cheap-cron routed to `<agent>-cron`, or a Tier-2 main-
+    // session cron) whose cadence is shorter than `idle_clear_after` would
+    // otherwise re-arm the timer on every fire and suppress idle-clear
+    // permanently. After #3113 a cron that does real work already stamps the
+    // main clock via handleSessionEvent, so the blanket fire-time stamp is
+    // redundant for main-bridge fires and wrong for cheap-cron (whose session
+    // events are dropped for the cron identity). Only non-cron injects
+    // (reaction, vault grant, resume — genuine operator/session presence) stamp
+    // at inject time. See isCronInjectFire for the documented main-session-poll
+    // residual (a Tier-2 NO_REPLY poll still warms the clock via its real turn).
+    if (!isCronInjectFire(msg.inbound.meta)) markIdleActivity()
     const promptKey = typeof msg.inbound.meta?.prompt_key === 'string'
       ? msg.inbound.meta.prompt_key
       : 'unknown'
