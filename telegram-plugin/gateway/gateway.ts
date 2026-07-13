@@ -5085,10 +5085,43 @@ function maybeIdleClear(): void {
     `telegram gateway: idle auto-/clear for ${agentName} ` +
       `(idle >= ${Math.round(idleClearMs / 60_000)}m)\n`,
   );
-  // Accepted check-to-send race (same as maybeProactiveCompact): a new inbound
-  // could arrive between the gate check and the tmux send; /clear then lands in
-  // claude's prompt buffer and runs at the next idle prompt (inject.ts FUTURE-GAP).
-  void injectSlashCommandImpl(agentName, '/clear')
+  // #3116 — write-time precondition closes (most of) the check-to-send race.
+  // A new inbound could arrive between the gate decision above and the tmux
+  // send; without a guard /clear lands in claude's prompt buffer and runs at
+  // the next idle prompt (inject.ts FUTURE-GAP), clobbering that inbound's
+  // session. The precondition below is re-evaluated INSIDE the pane lock,
+  // immediately before send-keys, and RE-RUNS THE FULL idle decision against
+  // the live clocks + turnInFlightForGate() — not a bespoke "activity
+  // unchanged" check — so any new activity in the gap suppresses the /clear
+  // (and so a future background-work input to decideIdleClear is honoured at
+  // write time for free). Residual: an inbound landing AFTER send-keys but
+  // before claude submits the buffered /clear is still clobbered — full
+  // closure needs buffer-cancel (tracked as a follow-up issue).
+  const stillIdleAtWrite = (): boolean =>
+    decideIdleClear(
+      {
+        lastActivityAt: lastIdleActivityAt,
+        lastTurnEndedAt: lastIdleTurnEndAt,
+        idleClearMs: resolveIdleClearMs(),
+        // alreadyCleared is latched true above for re-entrancy; the write-time
+        // re-eval must judge idleness on the live clocks only, so force false.
+        alreadyCleared: false,
+        turnInFlight: turnInFlightForGate(),
+      },
+      Date.now(),
+    ).clear;
+  void injectSlashCommandImpl(agentName, '/clear', { precondition: stillIdleAtWrite })
+    .then((result) => {
+      if (result.outcome === 'skipped') {
+        // Activity arrived in the check-to-send gap; re-arm so the next idle
+        // period can clear again rather than staying latched.
+        idleAutoCleared = false;
+        process.stderr.write(
+          `telegram gateway: idle /clear suppressed for ${agentName} ` +
+            `(activity in check-to-send gap)\n`,
+        );
+      }
+    })
     .catch((err: unknown) => {
       process.stderr.write(
         `telegram gateway: idle /clear inject failed for ` +
