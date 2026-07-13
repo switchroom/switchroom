@@ -401,7 +401,7 @@ import {
 } from '../turn-flush-safety.js'
 // PR A — deterministic answer-ready quiescence flush (late-delivery fix).
 import {
-  shouldArmAnswerReadyFlush,
+  AnswerReadyFlushController,
   resolveAnswerReadyFlushMs,
 } from '../answer-ready-flush.js'
 // #1667 — pure decision core for the turn_end answer-delivery gate (#1664).
@@ -15368,43 +15368,36 @@ function resetOrphanedReplyTimeout(): void {
 }
 
 /**
- * PR A — clear the answer-ready quiescence flush timer for a turn. Called from
- * every disarm point (tool activity, reply, `endCurrentTurnAtomic`) so a resumed
- * turn or an already-delivered answer never fires a stale flush.
- */
-function clearAnswerReadyFlushTimeout(turn: CurrentTurn | null): void {
-  if (turn?.answerReadyFlushTimeoutId != null) {
-    clearTimeout(turn.answerReadyFlushTimeoutId)
-    turn.answerReadyFlushTimeoutId = null
-  }
-}
-
-/**
- * PR A — DETERMINISTIC answer-ready quiescence flush.
+ * PR A — DETERMINISTIC answer-ready quiescence flush controller.
  *
- * (Re)arm a short per-turn timer whenever the current turn has a genuine
- * composed terminal answer (the SAME `decideTurnFlush` classifier the turn-flush
- * branch uses) AND is quiescent (no in-flight surface tool, no pending async
- * dispatch). Each new `text` chunk re-arms it (the debounce), so the timer only
- * fires after ~1 s of NO new stream events and NO tool activity — i.e. once the
- * answer has settled. On fire it re-verifies the SAME predicate and, if still
- * quiescent, dispatches a positive `answer-ready-quiescence` synthetic turn_end
- * that routes through the identical turn-flush send path (endCurrentTurnAtomic
- * → send-gated IIFE → honest PR-B record). This replaces the ~150 s dead wait
- * with ~1 s, deterministically and in code.
+ * The orchestration (arm / debounce / rollover-guard / fire-time re-verify /
+ * disarm) lives in the extracted, unit-tested `AnswerReadyFlushController`
+ * (answer-ready-flush.ts) — the gateway only supplies the thin deps below and
+ * calls `.reset()` / `.clear(turn)`. Behaviour:
  *
- * Exactly-once: the synthetic turn_end's `endCurrentTurnAtomic` nulls the turn
- * atom, so a later REAL turn_end (or the orphaned backstop) short-circuits at
- * its `turn != null` guard; `outboundDedup` is the second layer. The fire
- * callback also re-pins `currentTurn === turn` (rollover guard) and clears its
- * own id before dispatch.
+ * - `reset()` (from `case 'text'`): (re)arm iff the turn has a genuine composed
+ *   terminal answer (the SAME `decideTurnFlush` classifier the turn-flush branch
+ *   uses) AND is quiescent. Each text chunk re-arms → the debounce.
+ * - `clear(turn)` (from tool activity + `endCurrentTurnAtomic`): the DISARM.
+ * - on fire: re-pin `currentTurn === turn`, re-verify quiescence, then dispatch
+ *   a positive `answer-ready-quiescence` synthetic turn_end that routes through
+ *   the IDENTICAL turn-flush send path (endCurrentTurnAtomic → send-gated IIFE →
+ *   honest PR-B record). Replaces the ~150 s dead wait with ~1 s, in code.
+ *
+ * Exactly-once: the synthetic turn_end's `endCurrentTurnAtomic` nulls the atom,
+ * so a later REAL turn_end (or the orphaned backstop) short-circuits at its
+ * `turn != null` guard; `endCurrentTurnAtomic` also calls `.clear(turn)` so a
+ * real turn_end that lands FIRST cancels a pending flush. `outboundDedup` is the
+ * second layer.
+ *
+ * The `answer-ready-quiescence` reason bypasses the `durationMs===-1`
+ * recently-streaming SUPPRESSION guard (the terminal answer text itself stamps
+ * recentlyStreaming): quiescence IS the positive "streaming has settled" signal,
+ * the opposite of the hung-turn backstop that guard protects.
  */
-function resetAnswerReadyFlushTimeout(): void {
-  const turn = currentTurn
-  clearAnswerReadyFlushTimeout(turn)
-  if (turn == null) return
-  const key = statusKey(turn.sessionChatId, turn.sessionThreadId)
-  const armInput = {
+const answerReadyFlush = new AnswerReadyFlushController<CurrentTurn>({
+  getCurrentTurn: () => currentTurn,
+  getArmInput: (turn) => ({
     flush: {
       chatId: turn.sessionChatId,
       replyCalled: turn.replyCalled,
@@ -15412,46 +15405,28 @@ function resetAnswerReadyFlushTimeout(): void {
       flushEnabled: TURN_FLUSH_SAFETY_ENABLED,
     },
     inFlightToolCount: toolFlightTracker.inFlightCount(),
-    hasPendingAsyncDispatch: pendingProgress.hasPendingAsyncDispatch(key),
+    hasPendingAsyncDispatch: pendingProgress.hasPendingAsyncDispatch(
+      statusKey(turn.sessionChatId, turn.sessionThreadId),
+    ),
     flushWindowMs: ANSWER_READY_FLUSH_MS,
-  }
-  if (!shouldArmAnswerReadyFlush(armInput)) return
-  turn.answerReadyFlushTimeoutId = setTimeout(() => {
-    // Rollover guard (mirrors the orphaned-reply timer): re-read currentTurn so
-    // a superseded turn's timer never fires against a fresh atom.
-    const t = currentTurn
-    if (t == null || t !== turn) return
-    t.answerReadyFlushTimeoutId = null
-    // Re-verify quiescence at FIRE time: a tool that started, or a reply that
-    // landed, since the arm deterministically cancels the flush here even if the
-    // explicit disarm was missed.
-    const fireKey = statusKey(t.sessionChatId, t.sessionThreadId)
-    const stillQuiescent = shouldArmAnswerReadyFlush({
-      flush: {
-        chatId: t.sessionChatId,
-        replyCalled: t.replyCalled,
-        capturedText: t.capturedText,
-        flushEnabled: TURN_FLUSH_SAFETY_ENABLED,
-      },
-      inFlightToolCount: toolFlightTracker.inFlightCount(),
-      hasPendingAsyncDispatch: pendingProgress.hasPendingAsyncDispatch(fireKey),
-      flushWindowMs: ANSWER_READY_FLUSH_MS,
-    })
-    if (!stillQuiescent) return
-    process.stderr.write(
-      `telegram gateway: answer-ready quiescence flush (${ANSWER_READY_FLUSH_MS}ms) —` +
-      ` delivering composed terminal answer` +
-      ` (in_flight=${toolFlightTracker.inFlightCount()},` +
-      ` bg_work=${pendingProgress.hasPendingAsyncDispatch(fireKey)})\n`,
-    )
-    // Route through the identical turn-flush path. A positive
-    // `answer-ready-quiescence` reason bypasses the `durationMs===-1`
-    // recently-streaming SUPPRESSION guard (which would otherwise defer this —
-    // the terminal answer text itself stamps recentlyStreaming): quiescence IS
-    // the positive "streaming has settled" signal, the opposite of the hung-turn
-    // backstop that guard protects.
-    handleSessionEvent({ kind: 'turn_end', durationMs: -1, reason: 'answer-ready-quiescence' })
-  }, ANSWER_READY_FLUSH_MS)
+  }),
+  getTimerHandle: (turn) => turn.answerReadyFlushTimeoutId,
+  setTimerHandle: (turn, handle) => {
+    turn.answerReadyFlushTimeoutId = handle
+  },
+  onFlush: () =>
+    handleSessionEvent({ kind: 'turn_end', durationMs: -1, reason: 'answer-ready-quiescence' }),
+  log: (msg) => process.stderr.write(`telegram gateway: ${msg}\n`),
+})
+
+/** PR A — disarm the answer-ready flush timer for a turn (thin adapter). */
+function clearAnswerReadyFlushTimeout(turn: CurrentTurn | null): void {
+  answerReadyFlush.clear(turn)
+}
+
+/** PR A — (re)arm the answer-ready flush timer for the current turn (debounce). */
+function resetAnswerReadyFlushTimeout(): void {
+  answerReadyFlush.reset()
 }
 
 function closeActivityLane(chatId: string, threadId: number | undefined): void {

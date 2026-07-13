@@ -6,14 +6,24 @@
  * orphaned-reply backstop, which the answer text itself keeps re-arming across
  * a ~150 s window. PR A adds a DETERMINISTIC ~1 s quiescence flush.
  *
- * These tests exercise the REAL seam (`shouldArmAnswerReadyFlush`, which calls
- * the REAL `decideTurnFlush` classifier + a REAL `ToolFlightTracker`) and a
- * fake-timer harness that models the gateway's arm/fire/disarm orchestration
- * (`resetAnswerReadyFlushTimeout`) using that same predicate — mirroring how
- * `orphaned-reply-rearm.test.ts` tests the inline orphaned timer via the real
- * `LivenessTracker`. The oracle asserts OUTCOMES: the flush fires at the ~1 s
- * debounce (not ~150 s), it re-arms per text chunk, and after it fires a later
- * turn_end delivers NOTHING more (exactly-once).
+ * Two layers of coverage:
+ *   1. The pure predicate `shouldArmAnswerReadyFlush` (which calls the REAL
+ *      `decideTurnFlush` classifier + a REAL `ToolFlightTracker`).
+ *   2. An INTEGRATION harness that drives the REAL orchestration —
+ *      `AnswerReadyFlushController` (the exact arm / debounce / rollover-guard /
+ *      fire-time-re-verify / disarm code the gateway runs, extracted so it is
+ *      testable, mirroring how `turn-end-gate-backstop.test.ts` drives the real
+ *      `withTurnEndGateBackstop`). The harness supplies a faithful gateway world
+ *      (a mutable `currentTurn`, a real `ToolFlightTracker`, and an
+ *      `endCurrentTurnAtomic` that — like the real one — disarms via
+ *      `controller.clear(turn)` and NULLS the atom) plus a send-sink that models
+ *      `handleSessionEvent({turn_end})` short-circuiting on a null atom.
+ *
+ * The oracle asserts OUTCOMES on real code: the flush fires at the ~1 s debounce
+ * (not ~150 s), re-arms per text chunk, and delivers EXACTLY ONCE across both
+ * turn_end race orderings. It is designed to go RED if the controller's
+ * rollover guard, fire-time re-verify, or disarm were removed (see the
+ * red-when-removed proofs in the handback).
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
@@ -21,7 +31,9 @@ import {
   shouldArmAnswerReadyFlush,
   resolveAnswerReadyFlushMs,
   ANSWER_READY_FLUSH_MS,
+  AnswerReadyFlushController,
   type AnswerReadyArmInput,
+  type FlushTimerHandle,
 } from '../answer-ready-flush.js'
 import { ToolFlightTracker } from '../gateway/interrupt-defer.js'
 
@@ -132,75 +144,82 @@ describe('resolveAnswerReadyFlushMs', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Timer harness — models the gateway's resetAnswerReadyFlushTimeout +
-// exactly-once teardown, driven by the REAL predicate. Asserts OUTCOMES.
+// Integration harness — drives the REAL AnswerReadyFlushController. Only the
+// gateway world (currentTurn storage, the send sink, endCurrentTurnAtomic) is
+// modeled; the arm / debounce / rollover-guard / fire-time-re-verify / disarm
+// is the controller's REAL code. Mirrors turn-end-gate-backstop.test.ts driving
+// the real withTurnEndGateBackstop.
 // ---------------------------------------------------------------------------
 
+interface FakeTurn {
+  capturedText: string[]
+  replyCalled: boolean
+  answerReadyFlushTimeoutId: FlushTimerHandle | null
+}
+
 /**
- * Faithful in-test model of the gateway seam. Everything load-bearing (the
- * arm/fire DECISION) delegates to the real `shouldArmAnswerReadyFlush`; the
- * orchestration (per-turn timer id, rollover guard, atom-null teardown) is the
- * same 5 lines the gateway runs. `sends` counts delivered flushes; `dispatch`
- * models `handleSessionEvent({turn_end})` → `endCurrentTurnAtomic` nulling the
- * atom, which is exactly what makes delivery exactly-once.
+ * A faithful gateway world around the REAL controller. `sends` / `records`
+ * count what actually reached the user / turns.jsonl. `endCurrentTurnAtomic`
+ * mirrors the real one: it DISARMS via `controller.clear(turn)` and NULLS the
+ * atom. `dispatchTurnEnd` mirrors `handleSessionEvent({turn_end})`: it
+ * short-circuits when the atom is already gone (the exactly-once guarantee),
+ * else delivers once and runs `endCurrentTurnAtomic`.
  */
-class FlushHarness {
-  turn: { capturedText: string[]; replyCalled: boolean; timerId: ReturnType<typeof setTimeout> | null } | null
+class GatewayWorld {
+  currentTurn: FakeTurn | null
   flight = new ToolFlightTracker()
   pendingAsync = false
   sends = 0
+  records = 0
   window = WINDOW
+  readonly controller: AnswerReadyFlushController<FakeTurn>
 
   constructor() {
-    this.turn = { capturedText: [], replyCalled: false, timerId: null }
+    this.currentTurn = { capturedText: [], replyCalled: false, answerReadyFlushTimeoutId: null }
+    this.controller = new AnswerReadyFlushController<FakeTurn>({
+      getCurrentTurn: () => this.currentTurn,
+      getArmInput: (turn) => ({
+        flush: { chatId: CHAT, replyCalled: turn.replyCalled, capturedText: turn.capturedText, flushEnabled: true },
+        inFlightToolCount: this.flight.inFlightCount(),
+        hasPendingAsyncDispatch: this.pendingAsync,
+        flushWindowMs: this.window,
+      }),
+      getTimerHandle: (turn) => turn.answerReadyFlushTimeoutId,
+      setTimerHandle: (turn, handle) => {
+        turn.answerReadyFlushTimeoutId = handle
+      },
+      // The controller's single delivery action routes into the world's
+      // turn_end dispatch — exactly as the gateway's onFlush dispatches a
+      // synthetic turn_end into handleSessionEvent.
+      onFlush: () => this.dispatchTurnEnd(),
+    })
   }
 
-  private armInputFor(t: NonNullable<FlushHarness['turn']>): AnswerReadyArmInput {
-    return {
-      flush: { chatId: CHAT, replyCalled: t.replyCalled, capturedText: t.capturedText, flushEnabled: true },
-      inFlightToolCount: this.flight.inFlightCount(),
-      hasPendingAsyncDispatch: this.pendingAsync,
-      flushWindowMs: this.window,
-    }
+  /** = endCurrentTurnAtomic: DISARM (real controller.clear) + NULL the atom. */
+  private endCurrentTurnAtomic(turn: FakeTurn): void {
+    this.controller.clear(turn) // ← the load-bearing disarm (gateway.ts:~4818)
+    this.records++
+    this.currentTurn = null // ← the load-bearing atom-null (#1067)
   }
 
-  /** = endCurrentTurnAtomic: clear the timer for a turn. */
-  clear(t: FlushHarness['turn']): void {
-    if (t?.timerId != null) {
-      clearTimeout(t.timerId)
-      t.timerId = null
-    }
-  }
-
-  /** = the synthetic turn_end dispatch. Short-circuits when the atom is gone
-   *  (currentTurn === null), the mechanism that guarantees exactly-once. On the
-   *  first live dispatch it delivers and tears the atom down (atom-null). */
+  /** = handleSessionEvent({turn_end}). A null atom short-circuits (no second
+   *  send); otherwise deliver once and tear the turn down. */
   dispatchTurnEnd(): void {
-    if (this.turn == null) return // atom already torn down → no second send
-    this.clear(this.turn)
+    const turn = this.currentTurn
+    if (turn == null) return // atom already gone → exactly-once
     this.sends++
-    this.turn = null // endCurrentTurnAtomic: null the atom
+    this.endCurrentTurnAtomic(turn)
   }
 
-  /** = resetAnswerReadyFlushTimeout, called from `case 'text'`. */
+  /** = case 'text': push the chunk, then (re)arm via the REAL controller. */
   onText(chunk: string): void {
-    const turn = this.turn
-    this.clear(turn) // clear-before-rearm (debounce)
-    if (turn == null) return
-    turn.capturedText.push(chunk)
-    if (!shouldArmAnswerReadyFlush(this.armInputFor(turn))) return
-    turn.timerId = setTimeout(() => {
-      const t = this.turn
-      if (t == null || t !== turn) return // rollover guard
-      t.timerId = null
-      if (!shouldArmAnswerReadyFlush(this.armInputFor(t))) return // fire-time re-verify
-      this.dispatchTurnEnd()
-    }, this.window)
+    if (this.currentTurn != null) this.currentTurn.capturedText.push(chunk)
+    this.controller.reset()
   }
 
-  /** = case 'tool_use' / 'tool_label': disarm on tool activity. */
+  /** = case 'tool_use' / 'tool_label': disarm (real controller.clear) then track. */
   onToolUse(id: string): void {
-    if (this.turn != null) this.clear(this.turn)
+    this.controller.clear(this.currentTurn)
     this.flight.onEvent({ kind: 'tool_use', toolUseId: id })
   }
 
@@ -209,96 +228,116 @@ class FlushHarness {
   }
 }
 
-describe('answer-ready quiescence flush — timer outcomes', () => {
+describe('answer-ready quiescence flush — real controller integration', () => {
   beforeEach(() => vi.useFakeTimers())
   afterEach(() => vi.useRealTimers())
 
   it('flushes the composed answer at the ~1 s debounce, NOT at the ~150 s backstop', () => {
-    const h = new FlushHarness()
-    h.onText('The composed final answer.')
+    const w = new GatewayWorld()
+    w.onText('The composed final answer.')
     // Nothing before the debounce elapses.
     vi.advanceTimersByTime(WINDOW - 1)
-    expect(h.sends).toBe(0)
+    expect(w.sends).toBe(0)
     // Fires deterministically at the debounce.
     vi.advanceTimersByTime(1)
-    expect(h.sends).toBe(1)
+    expect(w.sends).toBe(1)
+    expect(w.records).toBe(1) // exactly one turns.jsonl record
     // And it did NOT wait for the multi-minute backstop.
     expect(vi.getTimerCount()).toBe(0)
     vi.advanceTimersByTime(BACKSTOP_MS)
-    expect(h.sends).toBe(1) // still exactly one — proves it beat ~150 s
+    expect(w.sends).toBe(1) // still exactly one — proves it beat ~150 s
   })
 
   it('each text chunk re-arms the debounce (only fires 1 s after the LAST chunk)', () => {
-    const h = new FlushHarness()
-    h.onText('Part one. ')
+    const w = new GatewayWorld()
+    w.onText('Part one. ')
     vi.advanceTimersByTime(500)
-    expect(h.sends).toBe(0)
-    h.onText('Part two — the rest of the answer.') // re-arms
+    expect(w.sends).toBe(0)
+    w.onText('Part two — the rest of the answer.') // re-arms
     vi.advanceTimersByTime(999)
-    expect(h.sends).toBe(0) // debounce reset by the 2nd chunk
+    expect(w.sends).toBe(0) // debounce reset by the 2nd chunk
     vi.advanceTimersByTime(1)
-    expect(h.sends).toBe(1)
+    expect(w.sends).toBe(1)
   })
 
-  it('EXACTLY-ONCE: a later turn_end after a quiescence flush sends nothing more', () => {
-    const h = new FlushHarness()
-    h.onText('Answer text.')
+  it('EXACTLY-ONCE (a): quiescence flush, THEN a real turn_end → still one send', () => {
+    const w = new GatewayWorld()
+    w.onText('Answer text.')
     vi.advanceTimersByTime(WINDOW)
-    expect(h.sends).toBe(1) // quiescence flushed + nulled the atom
-    // The real turn_end finally lands — it must short-circuit (atom gone).
-    h.dispatchTurnEnd()
-    expect(h.sends).toBe(1)
+    expect(w.sends).toBe(1) // quiescence flushed + nulled the atom
+    // The real turn_end finally lands — it must short-circuit on the null atom.
+    // (Goes red if the atom-null in endCurrentTurnAtomic were removed.)
+    w.dispatchTurnEnd()
+    expect(w.sends).toBe(1)
+    expect(w.records).toBe(1)
   })
 
-  it('EXACTLY-ONCE: a real turn_end BEFORE the debounce disarms the pending flush', () => {
-    const h = new FlushHarness()
-    h.onText('Answer text.')
+  it('EXACTLY-ONCE (b): a real turn_end BEFORE the debounce disarms the pending flush', () => {
+    const w = new GatewayWorld()
+    w.onText('Answer text.')
     vi.advanceTimersByTime(WINDOW - 100)
-    // turn_end arrives first → delivers once and clears the pending timer.
-    h.dispatchTurnEnd()
-    expect(h.sends).toBe(1)
-    expect(vi.getTimerCount()).toBe(0) // pending quiescence timer was cleared
+    // turn_end arrives first → delivers once and (via controller.clear in
+    // endCurrentTurnAtomic) cancels the pending flush timer.
+    // (Goes red if controller.clear no longer cleared the timer.)
+    w.dispatchTurnEnd()
+    expect(w.sends).toBe(1)
+    expect(vi.getTimerCount()).toBe(0) // the pending quiescence timer was cleared
     vi.advanceTimersByTime(BACKSTOP_MS)
-    expect(h.sends).toBe(1) // the stale timer never fired a second send
+    expect(w.sends).toBe(1) // the stale timer never fired a second send
+    expect(w.records).toBe(1)
   })
 
   it('does NOT flush while a tool call is in flight (only on genuine quiescence)', () => {
-    const h = new FlushHarness()
-    h.onText('Interim thought before a tool.')
+    const w = new GatewayWorld()
+    w.onText('Interim thought before a tool.')
     // A tool starts within the window → disarm.
     vi.advanceTimersByTime(400)
-    h.onToolUse('bash_1')
+    w.onToolUse('bash_1')
     vi.advanceTimersByTime(BACKSTOP_MS)
-    expect(h.sends).toBe(0) // never fired while (and after) the tool was open
+    expect(w.sends).toBe(0) // never fired while (and after) the tool was open
     expect(vi.getTimerCount()).toBe(0)
   })
 
   it('re-arms and flushes once the tool completes and new answer text settles', () => {
-    const h = new FlushHarness()
-    h.onText('Working on it.')
-    h.onToolUse('bash_1') // disarm
+    const w = new GatewayWorld()
+    w.onText('Working on it.')
+    w.onToolUse('bash_1') // disarm
     vi.advanceTimersByTime(2000)
-    expect(h.sends).toBe(0)
-    h.onToolResult('bash_1') // tool done → quiescent again
-    h.onText(' Here is the final composed answer.') // new text re-arms
+    expect(w.sends).toBe(0)
+    w.onToolResult('bash_1') // tool done → quiescent again
+    w.onText(' Here is the final composed answer.') // new text re-arms
     vi.advanceTimersByTime(WINDOW)
-    expect(h.sends).toBe(1)
+    expect(w.sends).toBe(1)
   })
 
-  it('a fire-time tool in flight cancels the flush even if disarm was missed', () => {
-    const h = new FlushHarness()
-    h.onText('Answer text.')
-    // Simulate a missed explicit disarm: a tool becomes in-flight directly.
-    h.flight.onEvent({ kind: 'tool_use', toolUseId: 'sneaky' })
+  it('fire-time re-verify: a tool in flight at expiry cancels the flush even if disarm was missed', () => {
+    const w = new GatewayWorld()
+    w.onText('Answer text.')
+    // Simulate a missed explicit disarm: a tool becomes in-flight directly,
+    // WITHOUT going through onToolUse (which would clear the timer).
+    w.flight.onEvent({ kind: 'tool_use', toolUseId: 'sneaky' })
     vi.advanceTimersByTime(WINDOW)
-    expect(h.sends).toBe(0) // fire-time re-verification saw inFlight > 0 → no send
+    // (Goes red if the controller's fire-time re-verification were removed.)
+    expect(w.sends).toBe(0)
+  })
+
+  it('rollover guard: a superseded turn does not fire against a fresh atom', () => {
+    const w = new GatewayWorld()
+    const armed = w.currentTurn!
+    w.onText('Answer for turn A.') // arms A's timer
+    // A new turn swaps in before the debounce (turn rollover).
+    w.currentTurn = { capturedText: ['Turn B is still working'], replyCalled: false, answerReadyFlushTimeoutId: null }
+    expect(w.currentTurn).not.toBe(armed)
+    vi.advanceTimersByTime(WINDOW)
+    // (Goes red if the controller's rollover guard `live !== armedTurn` were removed.)
+    expect(w.sends).toBe(0)
   })
 
   it('a NO_REPLY turn never arms, so it flushes nothing (records no_reply upstream)', () => {
-    const h = new FlushHarness()
-    h.onText('NO_REPLY')
+    const w = new GatewayWorld()
+    w.onText('NO_REPLY')
     vi.advanceTimersByTime(BACKSTOP_MS)
-    expect(h.sends).toBe(0)
+    expect(w.sends).toBe(0)
     expect(vi.getTimerCount()).toBe(0)
   })
 })
