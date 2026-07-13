@@ -619,6 +619,13 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
   ): Promise<void> {
     const now = nowFn()
     const isTerminal = opts2.terminalRecap != null
+    // Terminal edit RESOLVED (landed / not-modified / gone): clear the staged
+    // re-drive unconditionally so a heartbeat re-drive can never loop, and drop
+    // the finished row when its id is known (the last-worker finalize path).
+    const settleTerminal = (): void => {
+      g.pendingFinalize = null
+      if (opts2.finishingAgentId != null) removeWorker(g, opts2.finishingAgentId)
+    }
     if (now < g.cooldownUntil) {
       if (isTerminal && opts2.terminalRecap != null) g.pendingFinalize = opts2.terminalRecap
       return
@@ -634,20 +641,18 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
     if (body == null) {
       // Nothing to show. On a terminal finalize with no message ever posted,
       // just drop the finished row (the handback carries the result).
-      if (isTerminal && opts2.finishingAgentId != null) {
-        g.pendingFinalize = null
-        removeWorker(g, opts2.finishingAgentId)
-      }
+      if (isTerminal) settleTerminal()
       return
     }
 
     // First paint: hold until some worker in the group has run long enough.
     if (g.messageId == null) {
       const maxElapsed = Math.max(0, ...runningRows(g).map((r) => liveElapsed(r, now)))
-      // A terminal recap for a group that never painted → nothing to finalize.
-      if (isTerminal && opts2.finishingAgentId != null) {
-        g.pendingFinalize = null
-        removeWorker(g, opts2.finishingAgentId)
+      // A terminal recap for a group that never painted → nothing to finalize;
+      // never first-paint a terminal card (trivial workers stay silent, the
+      // handback carries the result — matches the pre-coalesce doFinish guard).
+      if (isTerminal) {
+        settleTerminal()
         return
       }
       if (maxElapsed < firstPaintMin) return
@@ -678,10 +683,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
 
     // Dedup + proactive throttle (finish/terminal edits force through).
     if (body === g.lastBody) {
-      if (isTerminal && opts2.finishingAgentId != null) {
-        g.pendingFinalize = null
-        removeWorker(g, opts2.finishingAgentId)
-      }
+      if (isTerminal) settleTerminal()
       return
     }
     if (!opts2.force && now - g.lastEditAt < minEditInterval) return
@@ -711,10 +713,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
             `thread=${g.threadId ?? '-'} msgId=${g.messageId} workers=${g.workers.size} bytes=${body.length}`,
         )
       }
-      if (isTerminal && opts2.finishingAgentId != null) {
-        g.pendingFinalize = null
-        removeWorker(g, opts2.finishingAgentId)
-      }
+      if (isTerminal) settleTerminal()
     } catch (err) {
       const outcome = classifyEditError(err)
       if (outcome === 'rate_limited') {
@@ -725,10 +724,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       if (outcome === 'not_modified') {
         g.lastBody = body
         g.lastEditAt = now
-        if (isTerminal && opts2.finishingAgentId != null) {
-          g.pendingFinalize = null
-          removeWorker(g, opts2.finishingAgentId)
-        }
+        if (isTerminal) settleTerminal()
         return
       }
       if (outcome === 'gone') {
@@ -737,10 +733,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
         // are still live. On a terminal finalize, also drop the finished row.
         g.messageId = null
         g.lastBody = null
-        if (isTerminal && opts2.finishingAgentId != null) {
-          g.pendingFinalize = null
-          removeWorker(g, opts2.finishingAgentId)
-        }
+        if (isTerminal) settleTerminal()
         return
       }
       // 'transient' — leave the message intact; the heartbeat re-attempts.
