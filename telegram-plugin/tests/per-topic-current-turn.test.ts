@@ -60,8 +60,11 @@ describe('PR-4e source-read oracle — the wiring the per-topic map depends on',
   })
 
   it('endCurrentTurnAtomic closes the leak AT ORIGIN — keyed liveness guard + keyed delete', () => {
+    // Anchor on the `function ` prefix only — the signature is multi-line
+    // (gained an `opts?` param + `number | null` return in the send-honesty
+    // work), and `function ` disambiguates the definition from its call sites.
     const body = gatewaySrc
-      .split('function endCurrentTurnAtomic(turn: CurrentTurn): void {')[1]
+      .split('function endCurrentTurnAtomic(')[1]
       ?.split('\n}')[0] ?? ''
     expect(body.length).toBeGreaterThan(50)
     // Guard is the keyed liveness check (NOT a bare singleton ===).
