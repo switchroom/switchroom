@@ -21,6 +21,8 @@ import {
   isCompositeSilentNoise,
   endsWithSilentMarker,
   isTurnFlushSafetyEnabled,
+  selectFlushDeliveryText,
+  FLUSH_SUBSTANTIVE_MIN_CHARS,
 } from '../turn-flush-safety.js'
 // Rich-message send-path primitives (Bot API 10.1, #2669/#2692). The #2798
 // regression suite below reconstructs the exact gateway turn-flush render
@@ -568,6 +570,75 @@ describe('isTurnFlushSafetyEnabled', () => {
     for (const v of ['1', 'true', 'on', 'yes', 'anything']) {
       expect(isTurnFlushSafetyEnabled({ SWITCHROOM_TG_TURN_FLUSH_SAFETY: v }))
         .toBe(true)
+    }
+  })
+})
+
+describe('selectFlushDeliveryText — deliver the terminal answer, strip only narration', () => {
+  const answer = 'A'.repeat(FLUSH_SUBSTANTIVE_MIN_CHARS + 20)
+
+  it('delivers ONLY the terminal answer when narration precedes the answer', () => {
+    // The duplicate-reply root cause: the flush fired while the model was still
+    // composing its reply, so capturedText held intent-narration blocks THEN
+    // the composed answer. Pre-fix the flush dumped the whole blob; post-fix it
+    // delivers only the answer. This test FAILS on the pre-fix `join('\n\n')`.
+    const blocks = ["Let me check that.", "I'll look it up now.", answer]
+    const out = selectFlushDeliveryText(blocks)
+    expect(out).toBe(answer)
+    expect(out).not.toContain('Let me check')
+    expect(out).not.toContain("I'll look it up")
+  })
+
+  // MEDIUM finding (adversarial review): a LONG (>=200) narration block FOLLOWED
+  // by a SHORT (<200) real answer. The pre-fix `find last block >= 200` returned
+  // the narration and DROPPED the short real answer. The terminal block is the
+  // answer regardless of length. FAILS on the pre-fix threshold scan.
+  it('delivers a SHORT real answer that follows a LONG (>=200) narration block', () => {
+    const verboseNarration =
+      'Let me pull the numbers together before I answer — ' +
+      'X'.repeat(FLUSH_SUBSTANTIVE_MIN_CHARS)
+    const realAnswer = 'Revenue was 4.2M, up 12% year over year.' // < 200 chars
+    expect(verboseNarration.length).toBeGreaterThanOrEqual(FLUSH_SUBSTANTIVE_MIN_CHARS)
+    expect(realAnswer.length).toBeLessThan(FLUSH_SUBSTANTIVE_MIN_CHARS)
+    const out = selectFlushDeliveryText([verboseNarration, realAnswer])
+    expect(out).toBe(realAnswer)
+    expect(out).not.toContain('Let me pull the numbers')
+  })
+
+  it('keeps the FULL joined text when an earlier block is real content, never truncating to the last paragraph', () => {
+    // Two substantive blocks, neither an intent-narration opener: this is a
+    // genuine multi-paragraph answer written as several blocks. Delivering only
+    // the last paragraph would drop real content — keep the whole thing.
+    const first = 'B'.repeat(FLUSH_SUBSTANTIVE_MIN_CHARS + 5)
+    const last = 'C'.repeat(FLUSH_SUBSTANTIVE_MIN_CHARS + 5)
+    expect(selectFlushDeliveryText([first, last])).toBe(`${first}\n\n${last}`)
+  })
+
+  it('keeps short two-paragraph answers joined (short legit answer preserved)', () => {
+    const blocks = ['First short paragraph.', 'Second short paragraph.']
+    expect(selectFlushDeliveryText(blocks)).toBe('First short paragraph.\n\nSecond short paragraph.')
+  })
+
+  it('a single block is delivered verbatim regardless of length', () => {
+    expect(selectFlushDeliveryText(['short answer'])).toBe('short answer')
+    expect(selectFlushDeliveryText([answer])).toBe(answer)
+  })
+
+  it('trims and drops empty blocks', () => {
+    expect(selectFlushDeliveryText(['  ', '', '  hi  '])).toBe('hi')
+    expect(selectFlushDeliveryText([])).toBe('')
+  })
+
+  it('decideTurnFlush delivers the narrowed answer, not the whole blob', () => {
+    const decision = decideTurnFlush({
+      chatId: 'chat1',
+      replyCalled: false,
+      capturedText: ['Let me check.', 'Now let me compose the reply.', answer],
+    })
+    expect(decision.kind).toBe('flush')
+    if (decision.kind === 'flush') {
+      expect(decision.text).toBe(answer)
+      expect(decision.text).not.toContain('Let me check')
     }
   })
 })
