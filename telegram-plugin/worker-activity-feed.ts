@@ -788,7 +788,15 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       if (finishingAgentId != null && g.workers.has(finishingAgentId)) {
         removeWorker(g, finishingAgentId)
       }
-      g.terminalPainted = true
+      // Only latch terminalPainted when NO live worker remains at paint time.
+      // Race: this finalize was the last live worker when the chain latched, but
+      // a fresh worker B may have called update() and joined g.workers before
+      // this body runs — in which case renderGroupBody paints B's RUNNING card,
+      // not a terminal recap. Setting the flag true unconditionally would
+      // mislabel that running paint as terminal (a spurious group-reuse fresh-
+      // paint on B's next update). Reflect reality: the group only went terminal
+      // if it's actually empty of live workers.
+      g.terminalPainted = !hasLiveWorker(g)
       syncPin(g)
     }
 

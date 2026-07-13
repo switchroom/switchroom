@@ -546,7 +546,7 @@ describe('coalesced worker feed — leaked finished-row fix (#3207)', () => {
 
   it('TWO workers finishing in the same flood window are BOTH reaped (no single-slot overwrite)', async () => {
     let flooding = true
-    const { feed, pins, sent, setClock } = leakHarness({
+    const { feed, pins, sent, edits, setClock } = leakHarness({
       failEdits: () => (flooding ? { error_code: 429, parameters: { retry_after: 2 } } : null),
     })
     setClock(1000)
@@ -574,6 +574,17 @@ describe('coalesced worker feed — leaked finished-row fix (#3207)', () => {
     setClock(5000)
     feed.heartbeatTick()
     await drain()
+
+    // BOTH staged terminal recaps must actually repaint — not just one. This is
+    // the contract the per-agent `pendingFinalize` map exists to hold: a single-
+    // slot `pendingFinalize` would have let worker B's stage overwrite worker A's,
+    // so only ONE recap edit would land and this assertion would FAIL. The
+    // decoupled row-removal (fix 1) alone would pass size===0 + unpin above WITHOUT
+    // repainting either recap, so those assertions do not pin this contract — these
+    // do. Each recap carries its own worker's description ('task A' / 'task B').
+    const doneEdits = edits.filter((e) => e.text.includes('_done ·'))
+    expect(doneEdits.some((e) => e.text.includes('task A'))).toBe(true)
+    expect(doneEdits.some((e) => e.text.includes('task B'))).toBe(true)
 
     // The group is gone: a later worker paints a FRESH message, never editing a
     // terminated sibling's message.
