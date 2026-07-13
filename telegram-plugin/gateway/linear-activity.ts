@@ -297,11 +297,20 @@ export async function emitLinearAgentActivity(
   return { content: [{ type: 'text', text: `Linear ${type} emitted on session ${sessionId}` }] }
 }
 
+/** The exact HTML-comment carrying a capture's dedup key. Both the embed
+ *  (captureDedupMarker) and the dedup lookup match on this precise string, so a
+ *  re-capture is confirmed by exact-key equality, not fuzzy search relevance.
+ *  The trailing ` -->` and leading `: ` anchor the key so `abc` never matches
+ *  `abcd`. */
+export function captureDedupComment(dedupKey: string): string {
+  return `<!-- switchroom-capture: ${dedupKey} -->`
+}
+
 /** Hidden marker appended to a captured issue's description so a re-capture of
  *  the same Telegram message can be detected (dedup backstop; the gateway-side
  *  seen-set is the primary, race-free guard). */
 export function captureDedupMarker(dedupKey: string): string {
-  return `\n\n<!-- switchroom-capture: ${dedupKey} -->`
+  return `\n\n${captureDedupComment(dedupKey)}`
 }
 
 /**
@@ -390,19 +399,26 @@ export async function createLinearIssue(
   }
 
   // Dedup backstop: search for a prior capture of the same Telegram message.
+  // `searchIssues` is a relevance-ranked full-text search, so its top hit for a
+  // key can be an unrelated issue that merely shares tokens. We therefore only
+  // treat a result as a dedup match when its description carries the EXACT
+  // capture marker for this key, never the raw top hit.
   if (dedupKey) {
+    const marker = captureDedupComment(dedupKey)
     const search = await gql(
-      'query($term: String!) { searchIssues(term: $term) { nodes { id url title } } }',
+      'query($term: String!) { searchIssues(term: $term, first: 25) { nodes { id url title description } } }',
       { term: dedupKey },
     )
     if (search.ok) {
-      const hit = (search.data?.searchIssues?.nodes ?? [])[0] as { url?: string } | undefined
+      const nodes = (search.data?.searchIssues?.nodes ?? []) as Array<{ url?: string; description?: string }>
+      const hit = nodes.find((n) => typeof n.description === 'string' && n.description.includes(marker))
       if (hit?.url) {
         log(`telegram gateway: linear_create_issue: dedup hit key=${dedupKey} agent=${agent}\n`)
         return { content: [{ type: 'text', text: `Already filed: ${hit.url}` }] }
       }
     }
-    // a failed search is non-fatal — fall through to create (gateway seen-set is primary).
+    // a failed search or no exact-marker match is non-fatal — fall through to
+    // create (gateway seen-set is the primary, race-free guard).
   }
 
   // Resolve the team.

@@ -155,9 +155,14 @@ describe('createLinearIssue — behaviour (#2312)', () => {
     expect(r.content[0].text).toMatch(/default_team_id/)
   })
 
-  it('short-circuits to "Already filed" on a dedup hit', async () => {
+  it('short-circuits to "Already filed" only on an EXACT marker match, skipping unrelated top hits', async () => {
     const { fetchImpl, calls } = routingFetch({
-      searchIssues: () => ({ searchIssues: { nodes: [{ id: 'old', url: 'https://linear.app/acme/issue/ENG-7', title: 'prior' }] } }),
+      searchIssues: () => ({ searchIssues: { nodes: [
+        // relevance-ranked top hit that merely shares tokens — must be ignored.
+        { id: 'noise', url: 'https://linear.app/acme/issue/ENG-99', title: 'unrelated', description: 'no capture marker here' },
+        // the real prior capture, carrying the exact marker for this key.
+        { id: 'old', url: 'https://linear.app/acme/issue/ENG-7', title: 'prior', description: `Y${captureDedupMarker('chat:99')}` },
+      ] } }),
       teams: oneTeam,
       issueCreate: issueOk,
     })
@@ -165,10 +170,33 @@ describe('createLinearIssue — behaviour (#2312)', () => {
       { title: 'X', body: 'Y', dedup_key: 'chat:99' },
       { resolveToken: okToken('t'), fetchImpl, log: () => {} },
     )
+    // matched the marker-bearing node, not the higher-ranked noise node.
     expect(r.content[0].text).toBe('Already filed: https://linear.app/acme/issue/ENG-7')
     // only the search ran — no team resolve, no create.
     expect(calls).toHaveLength(1)
     expect(calls[0].query).toMatch(/searchIssues/)
+  })
+
+  it('does NOT dedup when the search returns only unrelated hits (fuzzy false-positive regression)', async () => {
+    // Regression for the searchIssues fuzzy-match bug: a novel dedup_key
+    // returned an unrelated relevance-ranked hit and wrongly suppressed
+    // creation. No node carries this key's marker, so the tool must create.
+    const { fetchImpl, calls } = routingFetch({
+      searchIssues: () => ({ searchIssues: { nodes: [
+        { id: 'x', url: 'https://linear.app/acme/issue/ENG-56', title: 'ProductOS Job Spec', description: 'shares tokens, but no capture marker' },
+      ] } }),
+      teams: oneTeam,
+      issueCreate: issueOk,
+    })
+    const r = await createLinearIssue(
+      { title: 'Series QA tracker', body: 'Y', dedup_key: 'productos-qa-2026-07-13' },
+      { resolveToken: okToken('t'), fetchImpl, log: () => {} },
+    )
+    expect(r.content[0].text).toMatch(/Filed:/)
+    // fell through past the search to team resolve + create, embedding the marker.
+    const create = calls.find((c) => c.query.includes('issueCreate'))!
+    expect(create).toBeTruthy()
+    expect((create.variables.input as Record<string, unknown>).description).toContain(captureDedupMarker('productos-qa-2026-07-13'))
   })
 
   it('falls through to create when the dedup search misses, and embeds the marker', async () => {
