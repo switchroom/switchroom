@@ -27,7 +27,6 @@ import {
   normalizeParagraphBreaks,
   normalizePunctuation,
   stripExcessBold,
-  addParagraphSpacers,
   splitMarkdownChunks,
   hardSliceToCap,
   RICH_MESSAGE_MAX_CHARS,
@@ -88,13 +87,16 @@ export function normalizeOutboundBody(
 }
 
 /**
- * Effective-text spacing (#2669 rich-message regression fix). The rich GFM
- * renderer collapses `\n\n` gaps tight, so prose paragraphs render jammed.
- * Inject a visible blank-line spacer on the rich path only; the literal
- * (`format:'text'`) path stays byte-exact. Pure.
+ * Effective-text stage. Historically this injected an NBSP paragraph spacer on
+ * the rich path (#2669) to force a visible gap; that pass was removed in the
+ * #2669 follow-up because the live Bot API 10.1 GFM renderer already renders a
+ * `\n\n` gap as one normal blank line — the spacer was double-gapping every
+ * paragraph. Both paths now pass the text through byte-identically; the stage
+ * is retained as the named pipeline seam (and the literal/rich distinction is
+ * kept for callers) so a future rich-only transform has a home. Pure.
  */
-export function computeEffectiveText(text: string, literalText: boolean): string {
-  return literalText ? text : addParagraphSpacers(text)
+export function computeEffectiveText(text: string, _literalText: boolean): string {
+  return text
 }
 
 /**

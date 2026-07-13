@@ -17,9 +17,10 @@
  *       fixture intended (bold/italic/code/pre/link at the right inner text).
  *
  * The pipeline mirrors `telegram-plugin/gateway/gateway.ts`:
- *   repairEscapedWhitespace -> normalizeParagraphBreaks -> addParagraphSpacers
- *   -> splitMarkdownChunks. (Card-surface fixtures also apply `normalizeDashes`
- *   first — that is where F1's voice scrub lives.)
+ *   repairEscapedWhitespace -> normalizeParagraphBreaks -> splitMarkdownChunks.
+ *   (No paragraph-spacer pass — the NBSP spacer was removed in the #2669
+ *   follow-up; gaps are plain `\n\n`. Card-surface fixtures also apply
+ *   `normalizeDashes` first — that is where F1's voice scrub lives.)
  *
  * This suite is TEST-ONLY. It changes no production formatting behaviour. If a
  * fixture ever fails signal (a), it means the formatter emits markdown Telegram
@@ -30,7 +31,6 @@ import { describe, test, expect } from 'vitest'
 import {
   repairEscapedWhitespace,
   normalizeParagraphBreaks,
-  addParagraphSpacers,
   splitMarkdownChunks,
   RICH_MESSAGE_MAX_CHARS,
 } from '../format.js'
@@ -57,8 +57,7 @@ function transform(input: string, opts: { cardSurfaceScrub?: boolean; cap?: numb
 } {
   let text = input
   if (opts.cardSurfaceScrub) text = normalizeDashes(text)
-  text = normalizeParagraphBreaks(repairEscapedWhitespace(text))
-  const body = addParagraphSpacers(text)
+  const body = normalizeParagraphBreaks(repairEscapedWhitespace(text))
   const chunks = splitMarkdownChunks(body, opts.cap ?? RICH_MESSAGE_MAX_CHARS)
   return { chunks, body }
 }
