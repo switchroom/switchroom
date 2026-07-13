@@ -183,7 +183,7 @@ jobs:
         working-directory: telegram-plugin
         run: bun run test:uat jtbd-rich-formatting-render-dm
       - name: Targeted scenario — operator-dispatched (vitest substring)
-        if: steps.secrets.outputs.ok == 'true' && inputs.scenario != ''
+        if: always() && steps.secrets.outputs.ok == 'true' && inputs.scenario != ''
         # workflow_dispatch-only extra: run a single named scenario after the
         # fixed gate trio so an operator can validate a specific behavioural path
         # (e.g. a bg-sub-agent / card-skeleton fix) on the live harness without a
