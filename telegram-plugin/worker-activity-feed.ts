@@ -182,8 +182,15 @@ export function renderWorkerActivity(v: WorkerActivityView, liveSuffix = ''): st
 
   // Terminal: latestSummary carries the worker's final result text (gateway
   // onFinish), distinct from the running narrative steps. Pass it as `result`.
+  //
+  // Truthful-no-result invariant (deterministic control, not caller-discipline):
+  // an `incomplete` worker produced NO result, so it must NEVER render a result
+  // block regardless of whatever `latestSummary` happens to carry. The current
+  // call site (terminateWorker) always sets latestSummary:'' for incomplete, but
+  // enforce the invariant HERE so any future/direct caller can't fabricate a
+  // `⚠️`-prefixed result paragraph out of stray summary text.
   let result: { emoji: string; text: string } | undefined
-  if (finished) {
+  if (finished && v.state !== 'incomplete') {
     const text = cleanWorkerResultParagraph(v.latestSummary)
     if (text.length > 0) result = { emoji: v.state === 'done' ? '✅' : '⚠️', text }
   }

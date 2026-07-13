@@ -101,4 +101,25 @@ describe('worker terminal state is truthful for reaped workers (Residual B)', ()
     // No fabricated result paragraph (latestSummary empty) → no ✅ result block.
     expect(card).not.toContain('✅')
   })
+
+  it('renderWorkerActivity NEVER renders a result/⚠️ block for `incomplete`, even with a non-empty latestSummary (deterministic guard, not caller-discipline)', () => {
+    // Latent-trap regression guard: the live call site (terminateWorker) always
+    // passes latestSummary:'' for a reaped worker, but a future/direct caller
+    // could pass stray text. The truthful-no-result invariant must be enforced
+    // in the renderer — an `incomplete` worker produced no result, so it must
+    // never fabricate a ⚠️-prefixed result paragraph regardless of the summary.
+    const card = renderWorkerActivity({
+      description: 'background job',
+      lastTool: null,
+      toolCount: 3,
+      latestSummary: 'this looks like a real result but the worker never finished',
+      elapsedMs: 4000,
+      state: 'incomplete',
+    })
+    expect(card).toContain('incomplete')
+    // The renderer maps a non-`done` finished result to the ⚠️ emoji; the guard
+    // must suppress that block entirely for `incomplete`.
+    expect(card).not.toContain('⚠️')
+    expect(card).not.toContain('this looks like a real result')
+  })
 })

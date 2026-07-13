@@ -92,9 +92,9 @@ export type WorkerState = 'running' | 'done' | 'failed'
  * applies uniformly at every nesting level.
  */
 export interface WorkerNarrativeGate {
-  /** Refresh the injected clock to this poll's `now`. */
-  setNow(now: number): void
-  /** Fire the early-paint if a parked block's flush window has elapsed. */
+  /** Fire the early-paint if a parked block's flush window has elapsed.
+   *  Also refreshes the injected clock to this poll's `now`, so a separate
+   *  clock-refresh entrypoint is unnecessary. */
   tick(now: number): void
   /** Gate step 1: park a new `sub_agent_text` block (SHOW any prior pending). */
   stage(text: string): void
@@ -1215,7 +1215,7 @@ export function readSubTail(
       // narrative-dedup.ts, timer + retract in narrative-flush.ts).
       const buildNarrativeGate = (): WorkerNarrativeGate => {
         // Injected clock the kernel's scheduler reads. Refreshed each poll via
-        // setNow/tick so `deadline = nowRef.value + flushMs` uses the CURRENT
+        // tick(now) so `deadline = nowRef.value + flushMs` uses the CURRENT
         // poll's `now` even though the kernel persists across polls.
         const nowRef = { value: now }
         // Whether the LAST kernel effect painted a narrative cue — read back by
@@ -1283,9 +1283,6 @@ export function readSubTail(
           PENDING_NARRATIVE_FLUSH_MS,
         )
         return {
-          setNow: (n) => {
-            nowRef.value = n
-          },
           tick: (n) => {
             nowRef.value = n
             if (scheduler.armedFn != null && n >= scheduler.deadline) {
