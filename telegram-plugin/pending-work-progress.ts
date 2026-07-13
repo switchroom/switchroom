@@ -160,7 +160,8 @@ interface State {
    *  timestamp the gate cannot bound how long an in-flight background dispatch
    *  holds off idle-clear, so a leaked `pending=true` would disable idle-clear
    *  forever. Re-stamped on each `noteAsyncDispatch` (a fresh dispatch re-arms
-   *  the TTL) and cleared whenever `pending` goes false. */
+   *  the TTL) and cleared when `pending` is set false (`startTurn`); a full
+   *  `clearPending` drops the whole entry, which is equivalent. */
   dispatchedAt: number | null
   /** The captured anchor — last outbound reply message_id for this
    *  key. */
