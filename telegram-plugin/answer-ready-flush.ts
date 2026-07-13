@@ -85,3 +85,103 @@ export function shouldArmAnswerReadyFlush(input: AnswerReadyArmInput): boolean {
   if (input.hasPendingAsyncDispatch) return false
   return decideTurnFlush(input.flush).kind === 'flush'
 }
+
+/** Opaque timer handle. Real code passes Node's `setTimeout` return; tests can
+ *  inject fake-timer handles. */
+export type FlushTimerHandle = ReturnType<typeof setTimeout>
+
+/**
+ * Injectable dependencies for {@link AnswerReadyFlushController}. Everything the
+ * orchestration needs from the gateway is threaded through here so the REAL
+ * arm / debounce / rollover-guard / fire-time-re-verify / disarm logic is
+ * unit-testable without importing the 30k-line gateway module (which has a
+ * top-level startup IIFE and cannot be imported). `Turn` is the gateway's
+ * `CurrentTurn`; the controller only touches it through these accessors.
+ */
+export interface AnswerReadyFlushDeps<Turn> {
+  /** The live turn atom (gateway `currentTurn`). Read at arm time and re-read at
+   *  fire time so a superseded turn's timer never fires against a fresh atom. */
+  getCurrentTurn(): Turn | null
+  /** Resolve the `shouldArmAnswerReadyFlush` inputs for a turn (chat/reply/
+   *  captured-text + live tool-flight + pending-async + the window). */
+  getArmInput(turn: Turn): AnswerReadyArmInput
+  /** Read / write the per-turn timer handle (stored on the `CurrentTurn`). */
+  getTimerHandle(turn: Turn): FlushTimerHandle | null
+  setTimerHandle(turn: Turn, handle: FlushTimerHandle | null): void
+  /**
+   * Deliver the composed answer — dispatch the positive `answer-ready-quiescence`
+   * synthetic turn_end that routes through the EXISTING turn-flush send path
+   * (endCurrentTurnAtomic → send-gated IIFE → PR-B honest record). The controller
+   * calls this AT MOST ONCE per turn (guarded by the rollover + timer-cleared
+   * checks). endCurrentTurnAtomic then nulls the atom, so a later real turn_end
+   * short-circuits — the exactly-once guarantee.
+   */
+  onFlush(turn: Turn): void
+  /** Injectable timer primitives (default to the globals). */
+  setTimeoutFn?: (fn: () => void, ms: number) => FlushTimerHandle
+  clearTimeoutFn?: (handle: FlushTimerHandle) => void
+  log?: (msg: string) => void
+}
+
+/**
+ * The deterministic answer-ready quiescence flush orchestration, extracted from
+ * the gateway so it is testable as a unit (mirrors `withTurnEndGateBackstop`).
+ *
+ * - `reset()` — called from `case 'text'`: clear any pending timer, then (re)arm
+ *   iff the turn currently classifies as a genuine flushable answer AND is
+ *   quiescent. Each text chunk re-arms → the debounce.
+ * - `clear(turn)` — the DISARM: called on any tool activity and from
+ *   `endCurrentTurnAtomic`. A real turn_end that lands first cancels a pending
+ *   flush (exactly-once), and a resumed turn (tool started) cancels a stale one.
+ *
+ * On fire the controller re-pins `getCurrentTurn() === turn` (rollover guard),
+ * clears the handle, RE-VERIFIES quiescence (a tool that started / a reply that
+ * landed since the arm cancels the flush deterministically), then dispatches
+ * exactly one `onFlush`.
+ */
+export class AnswerReadyFlushController<Turn> {
+  constructor(private readonly deps: AnswerReadyFlushDeps<Turn>) {}
+
+  private get setTimeoutFn(): (fn: () => void, ms: number) => FlushTimerHandle {
+    return this.deps.setTimeoutFn ?? ((fn, ms) => setTimeout(fn, ms))
+  }
+
+  private get clearTimeoutFn(): (handle: FlushTimerHandle) => void {
+    return this.deps.clearTimeoutFn ?? ((h) => clearTimeout(h))
+  }
+
+  /** Disarm the flush timer for a turn (idempotent). */
+  clear(turn: Turn | null): void {
+    if (turn == null) return
+    const handle = this.deps.getTimerHandle(turn)
+    if (handle != null) {
+      this.clearTimeoutFn(handle)
+      this.deps.setTimerHandle(turn, null)
+    }
+  }
+
+  /** (Re)arm the flush timer for the current turn — the debounce. */
+  reset(): void {
+    const turn = this.deps.getCurrentTurn()
+    this.clear(turn)
+    if (turn == null) return
+    const armInput = this.deps.getArmInput(turn)
+    if (!shouldArmAnswerReadyFlush(armInput)) return
+    const handle = this.setTimeoutFn(() => this.onExpiry(turn), armInput.flushWindowMs)
+    this.deps.setTimerHandle(turn, handle)
+  }
+
+  /** Timer-expiry callback. Re-pins the turn, re-verifies quiescence, fires once. */
+  private onExpiry(armedTurn: Turn): void {
+    const live = this.deps.getCurrentTurn()
+    // Rollover guard: a superseded turn's timer must not fire against a fresh atom.
+    if (live == null || live !== armedTurn) return
+    this.deps.setTimerHandle(live, null)
+    // Fire-time re-verification: a tool that started (or a reply that landed)
+    // since the arm deterministically cancels the flush even if the explicit
+    // disarm was somehow missed.
+    if (!shouldArmAnswerReadyFlush(this.deps.getArmInput(live))) return
+    this.deps.log?.('answer-ready quiescence flush — delivering composed terminal answer')
+    this.deps.onFlush(live)
+  }
+}
