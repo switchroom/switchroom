@@ -370,13 +370,15 @@ describe('the drain sites route through the façade with producers preserved ver
 
   it('every routed drain site guards the single-flight via ea.mayDrain(turn), not a bare activityInFlight read', () => {
     const mayDrainGuards = [...gatewaySrc.matchAll(/if \(ea\.mayDrain\(turn\)\)/g)]
-    // narrative + 2 liveness + tool + 2 sub-agent + 1 post-answer bg-liveness
-    // (Fix 2) = 7. The Phase-1 0-label climb (deterministic-turn-liveness.md)
-    // consults the SAME guard, but its `if (deps.mayDrain())` lives in the
-    // extracted tick body (feed-heartbeat-climb.ts) with `() => ea.mayDrain(turn)`
-    // injected at the gateway call site — pinned by
-    // feed-heartbeat-liveness-open.test.ts + silent-turn-climb-transport.test.ts.
-    expect(mayDrainGuards).toHaveLength(7)
+    // narrative SHOW + narrative RETRACT (timer-flush early-paint retract,
+    // narrative-flush.ts) + 2 liveness + tool + 2 sub-agent + 1 post-answer
+    // bg-liveness (Fix 2) = 8. The Phase-1 0-label climb
+    // (deterministic-turn-liveness.md) consults the SAME guard, but its
+    // `if (deps.mayDrain())` lives in the extracted tick body
+    // (feed-heartbeat-climb.ts) with `() => ea.mayDrain(turn)` injected at the
+    // gateway call site — pinned by feed-heartbeat-liveness-open.test.ts +
+    // silent-turn-climb-transport.test.ts.
+    expect(mayDrainGuards).toHaveLength(8)
     expect(gatewaySrc).toMatch(/mayDrain:\s*\(\)\s*=>\s*ea\.mayDrain\(turn\)/)
   })
 })
@@ -498,11 +500,12 @@ describe('mayDrainCardNow — PR-4d card-drain gate (pure read; gateway holds th
   })
 
   it('the card-drain sites each route their guarded block through cardDrainGate (single-flight gate stays byte-identical)', () => {
-    // Option A: the 7 `if (ea.mayDrain(turn))` guards + drainActivitySummary
+    // Option A: the 8 `if (ea.mayDrain(turn))` guards + drainActivitySummary
     // thunks stay byte-identical, wrapped by the centralized helper.
-    // 6 original + 1 new post-answer background-agent liveness drain (Fix 2).
+    // 6 original + 1 post-answer background-agent liveness drain (Fix 2) + 1
+    // narrative-retract drain (timer-flush early-paint retract, narrative-flush.ts).
     const wraps = [...gatewaySrc.matchAll(/cardDrainGate\(turn, ea, \(\) => \{/g)]
-    expect(wraps).toHaveLength(7)
+    expect(wraps).toHaveLength(8)
     // The Phase-1 0-label climb (deterministic-turn-liveness.md) routes through
     // the SAME helper via an injected thunk — its call lives in the extracted
     // tick body (feed-heartbeat-climb.ts), wired at the gateway call site as
