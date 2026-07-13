@@ -16,13 +16,22 @@
  * never equals the clean `answer`-only reply, so the containment case slipped
  * through (216 occurrences in older logs via the turn-end backstop alone).
  *
- * This registry closes the class DETERMINISTICALLY, keyed on the turn IDENTITY
+ * This registry SUBSTANTIALLY REDUCES the class, keyed on the turn IDENTITY
  * (the per-turn `turnId` nonce) rather than on text. When a flush sends, it
  * records `{ turnId, messageIds }` for the chat/thread. When a `reply` for the
  * SAME turn later lands, the gateway SUPERSEDES the flushed message(s) — deletes
  * them and lets the canonical reply send path deliver exactly one clean message
  * (delete+resend; the caller may also edit-in-place). A reply for a DIFFERENT
- * (newer) live turn never supersedes — that turn owns its own message.
+ * (newer) turn never supersedes — that turn owns its own message.
+ *
+ * NOT fully deterministic — a residual race remains. The flush→reply direction
+ * this registry covers, plus the controller's fire-time recount for the
+ * reply→flush direction, close the COMMON ~10 s replay-gap case; but if a reply
+ * and a flush interleave so the reply's `take()` runs BEFORE the flush's
+ * `record()` (a much smaller window), `take` finds no record and the duplicate
+ * can still slip through. We deliberately trade that residual window for the
+ * safety guarantee that we NEVER delete a message we cannot positively attribute
+ * to the reply's own turn (identity-only supersede — see `decideSupersede`).
  *
  * Pure module: no I/O, no globals, no clock reads beyond the caller-supplied
  * `now`. Fully unit-testable; the gateway wires the actual delete/send.
@@ -69,17 +78,21 @@ export interface SupersedeDecision {
 /**
  * Decide whether a landing reply supersedes a recorded flush.
  *
- * Supersede IFF the record is present, fresh (within TTL), AND belongs to the
- * reply's turn: either no live turn is pinned (`liveTurnId == null` — the
- * flushed turn already ended and its reply is a late replay, the common
- * duplicate case) OR the live turn IS the flushed turn (`liveTurnId ===
- * record.turnId`). A reply arriving while a DIFFERENT newer turn is live
- * (`liveTurnId !== record.turnId`) is that new turn's own answer and must send
- * fresh — never clobber it.
+ * Supersede IFF the record is present, fresh (within TTL), AND positively
+ * attributable to the reply's turn by IDENTITY:
+ *   - a turnId-bearing record is superseded ONLY by a reply whose resolved
+ *     `liveTurnId` equals `record.turnId`;
+ *   - a null-turnId record (a synthetic/no-nonce flush) is superseded ONLY by a
+ *     reply that ALSO has no resolvable turn (`liveTurnId == null`).
  *
- * When the record's `turnId` is null (a synthetic/no-nonce flush) it can only be
- * superseded by a null-live-turn reply — a conservative fallback that never
- * clobbers a live turn.
+ * Crucially, a reply with `liveTurnId == null` does NOT supersede a
+ * turnId-bearing record: we never delete a message we cannot positively
+ * attribute to the reply's own turn. (The earlier revision superseded ANY
+ * record on a null live turn, which — combined with a single overwriting lane
+ * slot — could late-delete a DIFFERENT turn's legitimate message. The gateway
+ * now resolves a last-known turnId for the reply before calling in, so the
+ * common late-replay case still matches by identity rather than relying on the
+ * promiscuous null branch.)
  */
 export function decideSupersede(
   record: FlushedTurnRecord | undefined,
@@ -91,20 +104,35 @@ export function decideSupersede(
     return { supersede: false, deleteMessageIds: [], reason: 'expired' }
   }
   const sameTurn =
-    args.liveTurnId == null ||
-    (record.turnId != null && record.turnId === args.liveTurnId)
+    record.turnId != null
+      ? record.turnId === args.liveTurnId
+      : args.liveTurnId == null
   if (!sameTurn) {
     return { supersede: false, deleteMessageIds: [], reason: 'different-turn' }
   }
   return { supersede: true, deleteMessageIds: [...record.messageIds], reason: 'supersede' }
 }
 
+/** Sentinel key for records whose flush carried no turnId nonce. */
+const NULL_TURN_KEY = '<<null-turn>>'
+
+function turnKey(turnId: string | null): string {
+  return turnId == null ? NULL_TURN_KEY : turnId
+}
+
 /**
- * In-memory registry of recently-flushed turns, keyed by `chatId|threadId`.
- * Bounded by TTL eviction on every access; chat count per gateway is small.
+ * In-memory registry of recently-flushed turns, keyed by `chatId|threadId` and
+ * then by the flush's `turnId` nonce WITHIN that lane. Holding a per-turnId map
+ * (rather than a single overwriting slot) is what makes the identity guarantee
+ * airtight: two turns can each flush a message on the same lane, and each turn's
+ * later reply supersedes ONLY its own flushed message — turn B's reply can never
+ * reach turn A's record, and a late turn-A reply can never reach turn B's.
+ *
+ * Bounded by TTL eviction (swept on every `record`); chat count per gateway is
+ * small and a lane holds at most a handful of concurrent-turn records.
  */
 export class FlushedTurnSupersedeRegistry {
-  private readonly entries = new Map<string, FlushedTurnRecord>()
+  private readonly entries = new Map<string, Map<string, FlushedTurnRecord>>()
   private readonly ttlMs: number
 
   constructor(opts: { ttlMs?: number } = {}) {
@@ -112,9 +140,9 @@ export class FlushedTurnSupersedeRegistry {
   }
 
   /** Record a flush's posted message(s) so a later same-turn reply supersedes
-   *  them. A fresh record for a chat/thread replaces any prior one (the newest
-   *  flush is the only one whose message is still on screen for that lane). No
-   *  record is kept when the flush posted zero messages. */
+   *  them, keyed on the flush's `turnId` within the chat/thread lane. No record
+   *  is kept when the flush posted zero messages. Sweeps expired records first
+   *  (lightweight active GC — LOW-2) so orphan records never accumulate. */
   record(
     chatId: string,
     threadId: number | undefined,
@@ -122,7 +150,14 @@ export class FlushedTurnSupersedeRegistry {
     now: number,
   ): void {
     if (rec.messageIds.length === 0) return
-    this.entries.set(makeKey(chatId, threadId), {
+    this.sweep(now)
+    const lane = makeKey(chatId, threadId)
+    let laneMap = this.entries.get(lane)
+    if (laneMap == null) {
+      laneMap = new Map<string, FlushedTurnRecord>()
+      this.entries.set(lane, laneMap)
+    }
+    laneMap.set(turnKey(rec.turnId), {
       turnId: rec.turnId,
       messageIds: [...rec.messageIds],
       text: rec.text,
@@ -130,32 +165,37 @@ export class FlushedTurnSupersedeRegistry {
     })
   }
 
-  /** Decide supersede for a landing reply WITHOUT consuming the record. */
+  /** Decide supersede for a landing reply WITHOUT consuming the record. Selects
+   *  the record whose turnId matches the reply's resolved `liveTurnId` (or the
+   *  null-turnId record when `liveTurnId == null`). */
   peek(
     chatId: string,
     threadId: number | undefined,
     args: { liveTurnId: string | null; now: number },
   ): SupersedeDecision {
-    const key = makeKey(chatId, threadId)
-    const rec = this.entries.get(key)
+    const rec = this.entries.get(makeKey(chatId, threadId))?.get(turnKey(args.liveTurnId))
     return decideSupersede(rec, { liveTurnId: args.liveTurnId, now: args.now, ttlMs: this.ttlMs })
   }
 
-  /** Decide supersede AND, on a supersede, consume the record (so a second
-   *  replay of the same reply doesn't try to delete the same — now gone —
+  /** Decide supersede AND, on a supersede, consume the matched record (so a
+   *  second replay of the same reply doesn't try to delete the same — now gone —
    *  messages again). Returns the same decision `peek` would. */
   take(
     chatId: string,
     threadId: number | undefined,
     args: { liveTurnId: string | null; now: number },
   ): SupersedeDecision {
-    const key = makeKey(chatId, threadId)
+    const lane = makeKey(chatId, threadId)
     const decision = this.peek(chatId, threadId, args)
-    if (decision.supersede) this.entries.delete(key)
+    if (decision.supersede) {
+      const laneMap = this.entries.get(lane)
+      laneMap?.delete(turnKey(args.liveTurnId))
+      if (laneMap != null && laneMap.size === 0) this.entries.delete(lane)
+    }
     return decision
   }
 
-  /** Drop the record for a chat/thread (e.g. after the flushed message was
+  /** Drop all records for a chat/thread (e.g. after the flushed message was
    *  deleted through another path). Idempotent. */
   forget(chatId: string, threadId: number | undefined): void {
     this.entries.delete(makeKey(chatId, threadId))
@@ -166,13 +206,21 @@ export class FlushedTurnSupersedeRegistry {
     this.entries.clear()
   }
 
-  /** Test-only: live entry count after TTL eviction. */
-  size(now: number): number {
-    let total = 0
-    for (const [key, rec] of this.entries) {
-      if (now - rec.ts > this.ttlMs) this.entries.delete(key)
-      else total++
+  /** Evict every record past its TTL and prune emptied lanes. */
+  private sweep(now: number): void {
+    for (const [lane, laneMap] of this.entries) {
+      for (const [tk, rec] of laneMap) {
+        if (now - rec.ts > this.ttlMs) laneMap.delete(tk)
+      }
+      if (laneMap.size === 0) this.entries.delete(lane)
     }
+  }
+
+  /** Test-only: live record count after TTL eviction. */
+  size(now: number): number {
+    this.sweep(now)
+    let total = 0
+    for (const laneMap of this.entries.values()) total += laneMap.size
     return total
   }
 }

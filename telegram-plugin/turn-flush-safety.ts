@@ -148,13 +148,17 @@ export const FLUSH_SUBSTANTIVE_MIN_CHARS = 200
  * answer-only `reply` on the outbound dedup (containment, not equality), so the
  * user got a narration-laden duplicate.
  *
- * This mirrors `silent-end-scan.mjs`'s Finding-2 rule (#3228): a real dropped
- * answer is a SINGLE substantive block, so deliver only the LAST block that
- * clears the substantive floor — the narration blocks before it are dropped.
- * When NO block clears the floor (a genuinely short whole-turn answer, e.g. two
- * short paragraphs), fall back to the paragraph-joined text so we never drop a
- * short legitimate answer — the narration-dump risk there is negligible (short
- * blocks) and this preserves the legacy short-turn behaviour.
+ * The answer is the TERMINAL block — the last thing the model wrote is what it
+ * settled on, REGARDLESS of length. A real dropped answer is often short
+ * (a one-line confirmation, a two-sentence reply), so gating delivery on the
+ * 200-char substantive floor was wrong: with blocks
+ * `[verboseNarration(250), realAnswer(150)]` a reversed length scan returns the
+ * 250-char narration and DROPS the 150-char real answer. Instead we take the
+ * last non-empty block as the answer and strip only the EARLIER blocks — and
+ * only when they look like intent-narration (short, or the classic "Let me…" /
+ * "I'll…" openers). If the earlier blocks are themselves substantial (a genuine
+ * multi-paragraph answer written as several blocks) we keep the whole thing
+ * joined, so we never truncate a real long answer down to its last paragraph.
  *
  * `blocks` are already trimmed/non-empty candidates (silent markers removed by
  * the caller's guards). Returns the chosen delivery text.
@@ -164,11 +168,33 @@ export function selectFlushDeliveryText(blocks: string[]): string {
     .map(b => b.trim())
     .filter(b => b.length > 0)
   if (candidates.length === 0) return ''
-  const lastSubstantive = [...candidates]
-    .reverse()
-    .find(b => b.length >= FLUSH_SUBSTANTIVE_MIN_CHARS)
-  if (lastSubstantive != null) return lastSubstantive
-  return candidates.join('\n\n')
+  if (candidates.length === 1) return candidates[0]
+  const answer = candidates[candidates.length - 1]
+  const preceding = candidates.slice(0, -1)
+  // Deliver only the terminal answer when every earlier block is
+  // intent-narration (a short block, or a "Let me…/I'll…/I'm going to…" opener).
+  // Otherwise the earlier blocks carry real content — keep the full joined text
+  // so a legitimate multi-block answer is never truncated to its last paragraph.
+  const allNarration = preceding.every(isNarrationBlock)
+  return allNarration ? answer : candidates.join('\n\n')
+}
+
+/**
+ * Narration heuristic: a block that opens with a first-person "about to do X"
+ * phrase the model emits BEFORE composing its real answer ("Let me check…",
+ * "I'll look it up…", "Now let me…"). Deliberately NOT length-based — the
+ * narration that shadowed the real answer in the observed bug was a LONG
+ * (≥200-char) "Let me pull the numbers…" block, and short blocks are frequently
+ * legitimate multi-paragraph answer content — so gating on length either drops a
+ * short real answer or keeps a long narration. When earlier blocks don't match
+ * this opener we keep the full joined text (never drop content we can't
+ * confidently attribute to narration).
+ */
+const NARRATION_OPENER =
+  /^(let me\b|lemme\b|i'?ll\b|i will\b|i am going to\b|i'?m going to\b|i'?m about to\b|going to\b|first,?\s+(?:let me|i'?ll|i will)\b|now,?\s+(?:let me|i'?ll|i will)\b|next,?\s+(?:let me|i'?ll|i will)\b|let'?s\b)/i
+
+function isNarrationBlock(block: string): boolean {
+  return NARRATION_OPENER.test(block.trimStart())
 }
 
 export type FlushDecision =

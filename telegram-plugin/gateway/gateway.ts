@@ -12925,10 +12925,21 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // so a fresh turn's answer is never clobbered.
   {
     const replyThreadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
+    // Resolve the turnId this reply belongs to by IDENTITY, not just the live
+    // `currentTurn`. A late reply lands with `currentTurn == null` (silence poke
+    // cleared it — Bug D) or with a transiently-cleared currentTurn while its own
+    // turn is really still the owner (LOW-1); in both cases the turn is still
+    // resolvable from the `origin_turn_id` nonce the model echoes back (Tier 2 —
+    // the same last-known-turn resolver the chat-routing / obligation code uses).
+    // Passing this resolved turnId means supersede matches the flushed record by
+    // identity instead of falling back to a null-liveTurnId branch that would
+    // otherwise be free to delete a DIFFERENT turn's legitimate message.
+    const resolvedTurnId =
+      turn?.turnId ?? findTurnByOriginId(args.origin_turn_id as string | undefined)?.turnId ?? null
     const decision = flushedTurnSupersede.take(
       chat_id,
       replyThreadId,
-      { liveTurnId: turn?.turnId ?? null, now: Date.now() },
+      { liveTurnId: resolvedTurnId, now: Date.now() },
     )
     if (decision.supersede) {
       process.stderr.write(
