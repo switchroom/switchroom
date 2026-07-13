@@ -609,6 +609,11 @@ import { resolveChatIdFallback } from './chat-id-fallback.js'
 import { decideObligationTurnEnd } from './obligation-turn-end.js'
 import { maybeRotate } from './turns-jsonl-rotate.js'
 import {
+  computeTurnStatus,
+  backstopSendOutcome,
+  type DeliveryOutcome,
+} from './turn-record-status.js'
+import {
   createDeliveryQueue,
   trackDelivery,
   ackDelivery,
@@ -3039,6 +3044,16 @@ type CurrentTurn = {
   // even though `replyCalled` is true — the #1664 case where the real answer
   // ended up as plain transcript text rendered into an ephemeral draft.
   finalAnswerDelivered: boolean
+  // PR B (send-honesty). The REAL fate of a backstop (turn-flush) send,
+  // stamped only AFTER the async send resolves inside the IIFE — success →
+  // 'delivered', throw/partial → 'failed', reply-tool-already-sent
+  // short-circuit → 'suppressed'. `emitTurnRecord` derives the recorded
+  // status from THIS (via `computeTurnStatus`) rather than the speculative
+  // `finalAnswerDelivered` flag, so a flood-dropped answer is logged
+  // `send_failed` instead of a false `complete`. Undefined on the synchronous
+  // turn-end paths (reply-tool tail, silent-marker, genuine no-reply), where
+  // the legacy `finalAnswerDelivered` reading still applies unchanged.
+  deliveryOutcome?: DeliveryOutcome
   // Feed-reopen-after-ack refinement — whether the reply that set
   // `finalAnswerDelivered` was a *substantive* final answer (stream
   // `done`, or ≥200 chars) as opposed to a short pinging interim ACK.
@@ -4743,7 +4758,7 @@ function emitTurnRecord(turn: CurrentTurn, endedAt: number): void {
         agent: process.env.SWITCHROOM_AGENT_NAME ?? 'unknown',
         duration_ms: turn.startedAt > 0 ? endedAt - turn.startedAt : 0,
         tools: turn.toolCallCount ?? 0,
-        status: turn.finalAnswerDelivered ? 'complete' : 'no_reply',
+        status: computeTurnStatus(turn),
         turn_id: turn.turnId,
       }) + '\n'
     const turnsPath = '/state/agent/turns.jsonl'
@@ -4765,7 +4780,10 @@ function emitTurnRecord(turn: CurrentTurn, endedAt: number): void {
   }
 }
 
-function endCurrentTurnAtomic(turn: CurrentTurn): void {
+function endCurrentTurnAtomic(
+  turn: CurrentTurn,
+  opts?: { deferRecord?: boolean },
+): number | null {
   // PR-4e — keyed liveness + keyed clear (leak-close-at-origin). Flag-OFF: the
   // guard is `currentTurn === turn` and the clear nulls the singleton, verbatim.
   // Flag-ON: the guard becomes `byKey.get(turn'sKey) === turn` (so a flip to
@@ -4774,7 +4792,7 @@ function endCurrentTurnAtomic(turn: CurrentTurn): void {
   // `turn`. `endCurrentTurnForKey` returns false (no delete) when the entry no
   // longer matches — the same early-return semantics as the old `!== turn` guard.
   const key = statusKey(turn.sessionChatId, turn.sessionThreadId)
-  if (!turnLiveForItsTopic(turn)) return
+  if (!turnLiveForItsTopic(turn)) return null
   endCurrentTurnForKey(turn, key) // currentTurnByKey.delete(key) + mirror clear
   // Status-surface observability: one line at every turn CLEAR (with how far
   // the turn got), plus a DEGRADED warning when the turn did tool work but the
@@ -4783,7 +4801,15 @@ function endCurrentTurnAtomic(turn: CurrentTurn): void {
   process.stderr.write(
     `telegram gateway: ${formatTurnLifecycle('clear', 'turn_end', turn, turnEndedAt)}\n`,
   )
-  emitTurnRecord(turn, turnEndedAt)
+  // PR B — the turn-flush backstop defers the record write to its async send
+  // IIFE (passing `{ deferRecord: true }`) so the recorded `status` reflects the
+  // REAL send outcome (`turn.deliveryOutcome`) rather than the speculative
+  // `finalAnswerDelivered` flag set before the send ran. All synchronous
+  // turn-end paths still emit here, unchanged. `turnEndedAt` is returned so the
+  // deferred caller stamps the same ended-at (stable `duration_ms`).
+  if (opts?.deferRecord !== true) {
+    emitTurnRecord(turn, turnEndedAt)
+  }
   const degraded = detectStatusSurfaceDegraded(turn)
   if (degraded != null) {
     process.stderr.write(
@@ -4846,6 +4872,7 @@ function endCurrentTurnAtomic(turn: CurrentTurn): void {
   // wedging forever. No-op when this turn delivered, when nothing is
   // buffered, or when the serialize feature is off.
   armNoReplyDrainTimer(turn)
+  return turnEndedAt
 }
 
 /**
@@ -17553,7 +17580,15 @@ function handleSessionEvent(ev: SessionEvent): void {
         // sendMessage await for this turn will see currentTurn == null
         // and bail; a new enqueue will swap in a fresh atom. The
         // `backstop*` locals above hold everything the IIFE needs.
-        endCurrentTurnAtomic(turn)
+        //
+        // PR B — defer the turns.jsonl record write to the send IIFE below so
+        // the recorded `status` reflects the REAL send outcome, not the
+        // speculative `finalAnswerDelivered=true` set just above. Everything
+        // else in endCurrentTurnAtomic (atom null, gate release, obligation
+        // bookkeeping, purge) still runs synchronously here for the #1067 /
+        // #1556 wedge-safety reasons. `backstopTurnEndedAt` is null iff the
+        // atom was already torn down elsewhere (no record to emit).
+        const backstopTurnEndedAt = endCurrentTurnAtomic(turn, { deferRecord: true })
         // #549 fix — turn-flush takes ownership of the captured-text
         // backup; reset the preamble buffer (its content is already in
         // the captured `capturedText`, which turn-flush is about to send).
@@ -17593,6 +17628,15 @@ function handleSessionEvent(ev: SessionEvent): void {
                 // async IIFE ran). The old redundant purgeReactionTracking
                 // here re-fired on an already-cleared key WITHOUT `endingTurn`,
                 // emitting an inconsistent shadow trace. Removed.
+                //
+                // PR B — the reply tool already delivered this turn's answer, so
+                // the flush was legitimately suppressed. Emit the deferred record
+                // as 'suppressed' (→ `complete`, since the reply path set
+                // finalAnswerDelivered). Not a failure.
+                if (backstopTurnEndedAt != null) {
+                  turn.deliveryOutcome = 'suppressed'
+                  emitTurnRecord(turn, backstopTurnEndedAt)
+                }
                 return
               }
             } catch {}
@@ -17615,6 +17659,9 @@ function handleSessionEvent(ev: SessionEvent): void {
           const renderedText = capturedText
           const htmlChunks = splitMarkdownChunks(renderedText, limit)
           const sentIds: number[] = []
+          // PR B — track whether the send threw so the deferred record reflects
+          // the real outcome (throw OR partial multi-chunk → send_failed).
+          let sendThrew = false
           try {
             // #654 deterministic double-message fix. If the progress
             // card is on screen (60s timer fired before turn_end), edit
@@ -17723,10 +17770,25 @@ function handleSessionEvent(ev: SessionEvent): void {
               unpinProgressCardForChat?.(backstopChatId, backstopThreadId)
             }
           } catch (err) {
+            sendThrew = true
             process.stderr.write(`telegram gateway: turn-flush send failed: ${(err as Error).message}\n`)
             // #1713: backstop send failed — finalize as error so the
             // turn ends cleanly with 😱 rather than leaving it open.
             if (backstopCtrl) backstopCtrl.finalize('error')
+          }
+          // PR B — the send has now RESOLVED; stamp the real delivery outcome and
+          // emit the deferred turns.jsonl record from it. A throw or a partial
+          // multi-chunk delivery (sentIds < htmlChunks) → 'failed' → status
+          // `send_failed`; a full delivery → 'delivered' → `complete`. This
+          // replaces the false `complete` the old synchronous write produced for
+          // a flood-dropped / errored answer the user never received.
+          if (backstopTurnEndedAt != null) {
+            turn.deliveryOutcome = backstopSendOutcome({
+              threw: sendThrew,
+              sentCount: sentIds.length,
+              chunkCount: htmlChunks.length,
+            })
+            emitTurnRecord(turn, backstopTurnEndedAt)
           }
           // #2094 cosmetic: the trailing `finally { purgeReactionTracking() }`
           // was removed. endCurrentTurnAtomic already ran the canonical purge
