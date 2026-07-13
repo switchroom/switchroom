@@ -559,3 +559,151 @@ describe('renderCombinedWorkerFeed (pure)', () => {
     expect(combinedHistoryDepth(8)).toBe(1)
   })
 })
+
+/**
+ * Worker-feed ghost-leak (immortal/unpinned/buried card) — outcome tests.
+ *
+ * Root cause: the feed removed a worker's row ONLY from the gateway's
+ * `onFinish` handler. Terminal paths that never fire `onFinish` (the watcher's
+ * JSONL-vanished `onFileVanished` → `cleanupTerminalAgent`, and boot done-at-
+ * boot orphans) left the row in the feed forever — the shared card never
+ * emptied, so it never collapsed/unpinned and heartbeat-edited indefinitely
+ * while buried up-chat. The fix wires feed removal to the watcher's
+ * authoritative terminal sweep (`terminate`, driven by `onTerminalCleanup`)
+ * PLUS a backstop TTL sweep. These assert the OUTCOMES, not the code paths.
+ */
+function ghostHarness(opts: { staleWorkerTtlMs?: number; now: () => number }) {
+  const edits: { messageId: number; text: string }[] = []
+  const sends: { text: string }[] = []
+  const pins: { messageId: number | null }[] = []
+  let seq = 500
+  const bot: BotApiForWorkerFeed = {
+    sendMessage: async (_chatId, text) => {
+      sends.push({ text })
+      return { message_id: seq++ }
+    },
+    editMessageText: async (_chatId, messageId, text) => {
+      edits.push({ messageId, text })
+      return true
+    },
+  }
+  const feed = createWorkerActivityFeed({
+    bot,
+    now: opts.now,
+    minEditIntervalMs: 0,
+    heartbeatTickMs: 1000,
+    firstPaintMinMs: 0,
+    setInterval: () => 0,
+    clearInterval: () => {},
+    staleWorkerTtlMs: opts.staleWorkerTtlMs,
+    reconcilePin: ({ messageId }) => pins.push({ messageId }),
+  })
+  return { feed, edits, sends, pins }
+}
+async function drain(): Promise<void> {
+  for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r))
+}
+
+describe('worker-feed ghost-leak — deterministic terminal removal + backstop', () => {
+  it('finish() on the LAST worker removes its row, collapses to the terminal summary, and UNPINS', async () => {
+    let t = 0
+    const { feed, sends, edits, pins } = ghostHarness({ now: () => t })
+    await feed.update('a', 'chat', view('task a', 'reading files', 0))
+    await drain()
+    expect(sends.length).toBe(1)
+    expect(feed.size).toBe(1)
+    // Painting the group pins the shared message.
+    expect(pins.at(-1)?.messageId).not.toBeNull()
+
+    t = 5000
+    await feed.finish('a', {
+      description: 'task a',
+      lastTool: null,
+      toolCount: 3,
+      latestSummary: 'all done',
+      elapsedMs: 5000,
+      state: 'done',
+    })
+    await drain()
+    // Row gone → the active set empties.
+    expect(feed.size).toBe(0)
+    // Collapsed to a terminal summary (a distinct edit landed, showing 'done').
+    expect(edits.length).toBeGreaterThan(0)
+    expect(edits.at(-1)?.text).toContain('done')
+    // And UNPINNED (group empty → reconcilePin messageId null).
+    expect(pins.at(-1)?.messageId).toBeNull()
+  })
+
+  it('terminate() (authoritative onTerminalCleanup sweep) reaps a worker whose onFinish NEVER fired — collapses + unpins', async () => {
+    let t = 0
+    const { feed, edits, pins } = ghostHarness({ now: () => t })
+    await feed.update('b', 'chat', view('task b', 'running a command', 0))
+    await drain()
+    expect(feed.size).toBe(1)
+    expect(pins.at(-1)?.messageId).not.toBeNull()
+
+    // Simulate the watcher's JSONL-vanished sweep: cleanupTerminalAgent → this,
+    // with NO onFinish ever delivered.
+    t = 3000
+    await feed.terminate('b')
+    await drain()
+    expect(feed.size).toBe(0)
+    expect(pins.at(-1)?.messageId).toBeNull()
+    // The card stopped editing: no further heartbeat edits after termination.
+    const after = edits.length
+    t = 20000
+    feed.heartbeatTick()
+    await drain()
+    expect(edits.length).toBe(after)
+  })
+
+  it('backstop TTL sweep force-reaps a leaked slot (terminal signal never delivered), then the card collapses + unpins', async () => {
+    let t = 0
+    const { feed, edits, pins } = ghostHarness({ staleWorkerTtlMs: 1000, now: () => t })
+    await feed.update('c', 'chat', view('task c', 'thinking', 0))
+    await drain()
+    expect(feed.size).toBe(1)
+
+    // No finish, no terminate — the worker is a pure leak. Advance past the TTL.
+    t = 2500
+    feed.heartbeatTick()
+    await drain()
+    expect(feed.size).toBe(0)
+    expect(pins.at(-1)?.messageId).toBeNull()
+
+    // Immortality closed: subsequent heartbeats produce no further edits.
+    const after = edits.length
+    t = 10000
+    feed.heartbeatTick()
+    await drain()
+    expect(edits.length).toBe(after)
+  })
+
+  it('a still-live worker (fresh update within the TTL) is NOT reaped by the backstop sweep', async () => {
+    let t = 0
+    const { feed } = ghostHarness({ staleWorkerTtlMs: 1000, now: () => t })
+    await feed.update('d', 'chat', view('task d', 's0', 0))
+    await drain()
+    // A fresh cue just before the sweep keeps it live.
+    t = 900
+    await feed.update('d', 'chat', view('task d', 's1', 900))
+    await drain()
+    t = 1500
+    feed.heartbeatTick()
+    await drain()
+    // Still tracked — the sweep only reaps rows silent PAST the TTL.
+    expect(feed.size).toBe(1)
+  })
+
+  it('no-op re-render is skipped (byte-identical body → no redundant edit)', async () => {
+    let t = 0
+    const { feed, edits } = ghostHarness({ now: () => t })
+    await feed.update('e', 'chat', view('task e', 'same step', 0))
+    await drain()
+    const afterPaint = edits.length // first paint is a send, not an edit
+    // Identical view (same elapsed → byte-identical rendered body): dedup skips.
+    await feed.update('e', 'chat', view('task e', 'same step', 0))
+    await drain()
+    expect(edits.length).toBe(afterPaint)
+  })
+})

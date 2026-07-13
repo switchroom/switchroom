@@ -258,6 +258,27 @@ export interface WorkerActivityFeedOpts {
    */
   maxRows?: number
   /**
+   * Backstop TTL (ms): a worker row that has received no `update()` cue for
+   * longer than this AND is not already finished is force-terminated by the
+   * heartbeat sweep — its row is removed, and when it was the last live worker
+   * the shared card collapses to its terminal summary and unpins. This is the
+   * durable guard against an immortal card if BOTH terminal signals are missed
+   * (the gateway's `onFinish` AND the watcher's `onTerminalCleanup` sweep).
+   *
+   * The gateway DERIVES this in code from the watcher's effective in-flight
+   * terminal cap (`resolveInflightTerminalCapMs()` — the same env/default the
+   * watcher resolves) plus a margin, so the invariant "never reap a row the
+   * watcher still considers live" holds even if an operator raises the cap via
+   * `SWITCHROOM_SUBAGENT_INFLIGHT_TERMINAL_CAP_MS`. A worker mid-very-long tool
+   * can go silent up to the cap before the watcher declares it terminal, so any
+   * row still present past cap + margin is a definitive leak — the watcher would
+   * already have swept a live worker.
+   *
+   * Fallback default (this module, for direct / non-gateway callers) 50 min.
+   * Tests inject a small value.
+   */
+  staleWorkerTtlMs?: number
+  /**
    * Group-level status-pin reconcile hook (#3207 review). Because workers now
    * COALESCE into one shared message, the pin MUST follow the GROUP lifecycle,
    * not a single worker's: pin the shared message when a group's first worker
@@ -309,6 +330,15 @@ interface WorkerRow {
    * stable sort order within the combined feed.
    */
   dispatchAtMs: number | null
+  /**
+   * Wall-clock ms of the most recent `update()` cue for this worker (its last
+   * observed liveness). The heartbeat's backstop TTL sweep force-terminates a
+   * row whose `lastUpdateAt` is older than `staleWorkerTtlMs` — the durable
+   * guard that no card can go immortal even if every terminal signal (onFinish
+   * AND the onTerminalCleanup sweep) is somehow missed. Stamped on row creation
+   * and on every `update()`.
+   */
+  lastUpdateAt: number
   /**
    * Wall-clock ms the CURRENT step started — stamped whenever a NEW narrative
    * line lands (the `→` line changes). The heartbeat's step suffix shows the
@@ -432,6 +462,17 @@ export interface WorkerActivityFeed {
    *  in the group — force the terminal recap edit. No-op if the worker was
    *  never tracked. */
   finish(agentId: string, view: WorkerActivityView): Promise<void>
+  /**
+   * Force a worker terminal from an AUTHORITATIVE watcher sweep
+   * (`onTerminalCleanup`) or the backstop TTL, WITHOUT an external result view:
+   * the terminal recap is synthesised from the worker's own last-known row
+   * state (state → `done`, no fabricated result text — the real result reaches
+   * the user via the separate handback, if one ran). When it was the last live
+   * worker the shared card collapses to its terminal summary and unpins; with
+   * siblings, its row is dropped and the combined body re-renders. Idempotent —
+   * a no-op if the worker was already removed (e.g. `onFinish` fired first).
+   */
+  terminate(agentId: string): Promise<void>
   /** Forget a worker's state without a recap edit (e.g. error path); re-renders
    *  the group so the dropped worker disappears from the combined body. */
   drop(agentId: string): void
@@ -461,6 +502,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
   const firstPaintMin = opts.firstPaintMinMs ?? 8000
   const heartbeatTickMs = opts.heartbeatTickMs ?? 6000
   const maxRows = Math.max(1, Math.floor(opts.maxRows ?? 8))
+  const staleWorkerTtlMs = Math.max(1, Math.floor(opts.staleWorkerTtlMs ?? 50 * 60_000))
   const reconcilePinFn = opts.reconcilePin ?? (() => {})
   const setIntervalFn =
     opts.setInterval ??
@@ -790,10 +832,99 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
     }
   }
 
+  /**
+   * Shared terminal-finalize path for a worker whose row is still tracked.
+   * Latches the row terminal synchronously (so a late `running` cue on the
+   * chain can't resurrect it), then on the chain either drops the row + re-
+   * renders the surviving siblings, or — when it was the last live worker —
+   * finalizes the shared message to its terminal recap. Used by `finish` (with
+   * the gateway's onFinish view) AND by `terminate` (authoritative watcher
+   * sweep / TTL backstop, view synthesised from the row's own last state).
+   */
+  function finalizeWorker(group: FeedGroup, agentId: string, row: WorkerRow, view: WorkerActivityView): Promise<void> {
+    row.finished = true
+    row.state = view.state === 'failed' ? 'failed' : 'done'
+    markFinalized(agentId)
+    group.chain = group.chain
+      .then(() => {
+        const others = runningRows(group).filter((w) => w.agentId !== agentId)
+        if (others.length > 0) {
+          // Siblings still live → drop this row from the combined body and re-
+          // render the running set. The group pin STAYS (siblings still need
+          // the shared message).
+          removeWorker(group, agentId)
+          syncPin(group)
+          return doRender(group, { force: true })
+        }
+        // Last live worker → finalize the shared message to its terminal recap.
+        const recap: WorkerActivityView = { ...view, narrativeLines: [...row.narrative] }
+        return doRender(group, { force: true, terminalRecap: recap, finishingAgentId: agentId })
+      })
+      .catch((err) => {
+        log(`worker-feed: finalize chain error ${agentId}: ${(err as Error).message}`)
+      })
+    return group.chain
+  }
+
+  /**
+   * Force a worker terminal without an external result view (authoritative
+   * `onTerminalCleanup` sweep or the TTL backstop). Synthesises the recap from
+   * the row's own last-known state — state `done`, NO fabricated result text
+   * (the real result, if any, reaches the user via the separate handback).
+   * Idempotent: a no-op once the worker was already removed (onFinish first).
+   */
+  function terminateWorker(agentId: string): Promise<void> {
+    const g = groupOfAgent(agentId)
+    const row = g?.workers.get(agentId)
+    if (g == null || row == null) {
+      // Already gone (onFinish removed it) — latch finalized so a late cue can't
+      // resurrect, and no-op.
+      markFinalized(agentId)
+      return Promise.resolve()
+    }
+    if (row.finished) {
+      // Terminal already latched; the chain will settle removal. No-op.
+      return g.chain
+    }
+    const lv = row.lastView
+    const view: WorkerActivityView = {
+      description: lv?.description ?? 'background task',
+      lastTool: null,
+      toolCount: lv?.toolCount ?? 0,
+      // No fabricated result paragraph — an authoritative sweep can't know what
+      // the worker returned; the terminal card shows the header struck-through
+      // done, and the handback (if it ran) carries the actual result.
+      latestSummary: '',
+      elapsedMs: liveElapsed(row, nowFn()),
+      state: 'done',
+      model: lv?.model,
+    }
+    return finalizeWorker(g, agentId, row, view)
+  }
+
   // Arm the heartbeat once at construction. The real timer is `.unref()`'d so
   // it never keeps the process alive; tests inject setInterval/clearInterval.
   function heartbeatTick(): void {
     const now = nowFn()
+    // Backstop TTL sweep: force-terminate any worker row that has gone silent
+    // past `staleWorkerTtlMs` (no `update()` cue AND not already finished). This
+    // is the durable guard against an immortal card if BOTH terminal signals
+    // are missed — the gateway's `onFinish` AND the watcher's authoritative
+    // `onTerminalCleanup` sweep. Collect the stale agent ids first (terminate
+    // mutates the group's worker map), then terminate each through its chain so
+    // the render/unpin happens under the normal cooldown/flood guards.
+    const staleAgentIds: string[] = []
+    for (const g of groups.values()) {
+      for (const row of g.workers.values()) {
+        if (!row.finished && now - row.lastUpdateAt >= staleWorkerTtlMs) {
+          staleAgentIds.push(row.agentId)
+        }
+      }
+    }
+    for (const agentId of staleAgentIds) {
+      log(`worker-feed: TTL reap agent=${agentId} — no update in ${Math.floor((now - (groupOfAgent(agentId)?.workers.get(agentId)?.lastUpdateAt ?? now)) / 1000)}s (>= ${Math.floor(staleWorkerTtlMs / 1000)}s); force-terminating leaked row`)
+      void terminateWorker(agentId)
+    }
     for (const g of [...groups.values()]) {
       // Deferred-finalize re-drive: a terminal edit that hit a cooldown/flood
       // window was staged on `pendingFinalize`. Re-drive it once the cooldown
@@ -893,12 +1024,16 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
           lastView: null,
           state: 'running',
           finished: false,
+          lastUpdateAt: nowFn(),
           dispatchAtMs: null,
           stepStartedAtMs: null,
         }
         g.workers.set(agentId, row)
         agentIndex.set(agentId, feedKey)
       }
+      // Stamp liveness for the backstop TTL sweep (this is the worker's most
+      // recent observed activity cue).
+      row.lastUpdateAt = nowFn()
       // Accumulate before the gate so a throttled tick still grows the
       // narrative — it surfaces on the next edit that does fire.
       accumulateNarrative(row, view)
@@ -921,33 +1056,13 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
         markFinalized(agentId)
         return Promise.resolve()
       }
-      // Latch synchronously so a late `running` cue on the chain can't resurrect.
-      row.finished = true
-      row.state = view.state === 'failed' ? 'failed' : 'done'
-      markFinalized(agentId)
-
-      const group = g
-      group.chain = group.chain
-        .then(() => {
-          const others = runningRows(group).filter((w) => w.agentId !== agentId)
-          if (others.length > 0) {
-            // Siblings still live → drop this row from the combined body and
-            // re-render the running set. The result reaches the user via the
-            // separate handback, never folded into this cosmetic edit. The
-            // group pin STAYS (siblings still need the shared message) — a
-            // per-worker unpin here was the #3207 review blocker.
-            removeWorker(group, agentId)
-            syncPin(group)
-            return doRender(group, { force: true })
-          }
-          // Last live worker → finalize the shared message to its terminal recap.
-          const recap: WorkerActivityView = { ...view, narrativeLines: [...row.narrative] }
-          return doRender(group, { force: true, terminalRecap: recap, finishingAgentId: agentId })
-        })
-        .catch((err) => {
-          log(`worker-feed: finish chain error ${agentId}: ${(err as Error).message}`)
-        })
-      return group.chain
+      // Latch + finalize via the shared path (drop-with-siblings / terminal
+      // recap on the last worker). Synchronous latch inside finalizeWorker
+      // stops a late `running` cue on the chain from resurrecting the row.
+      return finalizeWorker(g, agentId, row, view)
+    },
+    terminate(agentId) {
+      return terminateWorker(agentId)
     },
     drop(agentId) {
       // A dropped worker is also done — mark finalized so a late tick can't
