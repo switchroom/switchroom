@@ -10,6 +10,7 @@ import {
   recordSilentTurnEnd,
   recordUndeliveredTurnEnd,
   decideCapturedProseDelivery,
+  settleCapturedProseDelivery,
   CAPTURED_PROSE_MIN_CHARS,
   SILENT_END_MAX_RETRIES,
   SILENT_END_STALE_RECORD_MAX_AGE_MS,
@@ -784,5 +785,156 @@ describe('silent-end-interrupt-stop hook — integration (#1775: transcript-scan
     it('CAPTURED_PROSE_MIN_CHARS matches the scan/final-answer substance floor', () => {
       expect(CAPTURED_PROSE_MIN_CHARS).toBe(200)
     })
+  })
+})
+
+// ── Finding 3 (#3228): per-turn nonce guards decideCapturedProseDelivery ─────
+
+describe('decideCapturedProseDelivery — per-turn nonce (turnId) guard (#3228 Finding 3)', () => {
+  const ANSWER = 'A recovered final answer written as plain text. ' + 'A'.repeat(300)
+  const statePath = () => join(stateDir, 'silent-end-pending.json')
+  function writeState(partial: Record<string, unknown>) {
+    mkdirSync(stateDir, { recursive: true })
+    writeFileSync(statePath(), JSON.stringify({
+      chatId: 'c', threadId: null, turnKey: 'c:_', retryCount: 1, timestamp: Date.now(),
+      pendingText: ANSWER, ...partial,
+    }))
+  }
+
+  it('turnKey matches AND turnId matches → deliver', () => {
+    writeState({ turnId: 'c:_#100' })
+    const d = decideCapturedProseDelivery({ turnKey: 'c:_', turnId: 'c:_#100' })
+    expect(d.deliver).toBe(true)
+    expect(d.text).toBe(ANSWER)
+    expect(d.reason).toBe('captured-prose')
+  })
+
+  it('STALE record: same chat turnKey but a DIFFERENT turnId → NOT delivered (the carryover the finding describes)', () => {
+    // Turn A wrote pendingText+turnId=A. Turn B (same chat → same turnKey)
+    // ends in reprompt with its OWN turnId=B. The stale answer must not deliver.
+    writeState({ turnId: 'c:_#AAA' }) // turn A's record survived (hook overwrite bypassed)
+    const d = decideCapturedProseDelivery({ turnKey: 'c:_', turnId: 'c:_#BBB' })
+    expect(d.deliver).toBe(false)
+    expect(d.reason).toBe('turnid-mismatch')
+  })
+
+  it('record has NO turnId (synthetic inbound) → falls back to turnKey match, delivers', () => {
+    writeState({}) // no turnId field
+    const d = decideCapturedProseDelivery({ turnKey: 'c:_', turnId: 'c:_#123' })
+    expect(d.deliver).toBe(true)
+    expect(d.reason).toBe('captured-prose')
+  })
+
+  it('caller passes no turnId → falls back to turnKey match, delivers (never suppress on doubt)', () => {
+    writeState({ turnId: 'c:_#100' })
+    const d = decideCapturedProseDelivery({ turnKey: 'c:_' })
+    expect(d.deliver).toBe(true)
+    expect(d.reason).toBe('captured-prose')
+  })
+
+  it('substance-floor boundary at 199/200/201 (min-chars gate is unchanged by the nonce)', () => {
+    const check = (n: number) => {
+      writeState({ turnId: 'c:_#100', pendingText: 'X'.repeat(n) })
+      return decideCapturedProseDelivery({ turnKey: 'c:_', turnId: 'c:_#100' })
+    }
+    expect(check(199).deliver).toBe(false)
+    expect(check(199).reason).toBe('no-substantive-prose')
+    expect(check(200).deliver).toBe(true)
+    expect(check(201).deliver).toBe(true)
+  })
+})
+
+// ── Finding 1 (#3228): captured-prose send-failure arms the recovery net ─────
+
+describe('settleCapturedProseDelivery — send-failure posture (#3228 Finding 1)', () => {
+  function spies() {
+    const calls = { close: 0, clear: 0, undelivered: 0 }
+    const effects = {
+      closeObligation: () => { calls.close++ },
+      clearState: () => { calls.clear++ },
+      recordUndelivered: () => { calls.undelivered++ },
+    }
+    return { calls, effects }
+  }
+
+  it("outcome 'failed' → arms the Stop-hook re-prompt net; does NOT close obligation or clear state", () => {
+    // THIS is the regression fix: in the interim-ack case the shared teardown
+    // has already closed the obligation (replyCalled=true), so "leave it open"
+    // is a myth — the net MUST be recordUndelivered. A pre-fix deliverCapturedProse
+    // catch that merely `return`ed (no recordUndelivered) would leave calls
+    // all-zero here → the answer is permanently lost.
+    const { calls, effects } = spies()
+    settleCapturedProseDelivery('failed', effects)
+    expect(calls.undelivered).toBe(1)
+    expect(calls.close).toBe(0)
+    expect(calls.clear).toBe(0)
+  })
+
+  it("outcome 'sent' → closes obligation + clears state; does NOT re-arm the re-prompt", () => {
+    const { calls, effects } = spies()
+    settleCapturedProseDelivery('sent', effects)
+    expect(calls.close).toBe(1)
+    expect(calls.clear).toBe(1)
+    expect(calls.undelivered).toBe(0)
+  })
+
+  it("outcome 'skipped-dedup' → closes obligation + clears state (answer already went out)", () => {
+    const { calls, effects } = spies()
+    settleCapturedProseDelivery('skipped-dedup', effects)
+    expect(calls.close).toBe(1)
+    expect(calls.clear).toBe(1)
+    expect(calls.undelivered).toBe(0)
+  })
+
+  it('end-to-end failure net: a failed captured-prose send leaves an undelivered-turn record armed', () => {
+    // Simulate the gateway's `failed` settlement wiring against the REAL
+    // recordUndeliveredTurnEnd effect. The interim-ack teardown already closed
+    // the obligation; only the silent-end state can recover the turn now.
+    expect(readSilentEndState()).toBeNull()
+    settleCapturedProseDelivery('failed', {
+      closeObligation: () => { throw new Error('must not be called on failure') },
+      clearState: () => { throw new Error('must not be called on failure') },
+      recordUndelivered: () =>
+        void recordUndeliveredTurnEnd({ chatId: 'c', threadId: null, turnKey: 'c:_' }),
+    })
+    // The recovery net is armed: the Stop hook will find this and re-prompt.
+    expect(readSilentEndState()).toMatchObject({ turnKey: 'c:_' })
+  })
+})
+
+// ── Finding 4/5 (#3228): honest documentation of the dedup divergence boundary ─
+
+describe('recent-outbound-dedup — divergent-content double-send boundary (#3228 Finding 4/5)', () => {
+  it('divergent reply text vs captured prose under a different registryKey → NOT deduped (a real double-send vector)', () => {
+    // Documents the boundary the "airtight by construction" claim overstated:
+    // captured-prose records content C under registryKey K1. A re-present that
+    // lands REWORDED content C' under a DIFFERENT registryKey K2 has both a
+    // different hash AND a different turnKey — the cross-turn carve-out treats
+    // it as a miss, so it is NOT suppressed. Content-hash dedup cannot catch a
+    // divergent-content re-send; the obligation close + state clear are what
+    // make them mutually exclusive for the common case.
+    const dedup = new OutboundDedupCache()
+    const t0 = 1_000_000
+    const proseAnswer = 'The answer is 42, computed from the ledger. ' + 'A'.repeat(60)
+    dedup.record('c', undefined, proseAnswer, t0, 'reg-1')
+
+    // Same content, same key → suppressed (the common double-send).
+    expect(dedup.check('c', undefined, proseAnswer, t0 + 1_000, 'reg-1')).not.toBeNull()
+
+    // Reworded content under a different registryKey → NOT suppressed.
+    const reworded = 'To answer your question: it is 42 (per the ledger). ' + 'B'.repeat(60)
+    expect(dedup.check('c', undefined, reworded, t0 + 1_000, 'reg-2')).toBeNull()
+  })
+
+  it('identical content under two DIFFERENT non-null turnKeys → miss (cross-turn carve-out, documented boundary)', () => {
+    const dedup = new OutboundDedupCache()
+    const t0 = 2_000_000
+    const content = 'Identical answer text delivered in two separate turns. ' + 'C'.repeat(60)
+    dedup.record('c', undefined, content, t0, 'turnA')
+    // A later, genuinely different turn re-sending the SAME text is NOT a #546
+    // within-turn retry → not suppressed.
+    expect(dedup.check('c', undefined, content, t0 + 1_000, 'turnB')).toBeNull()
+    // But the SAME turnKey (a true within-turn retry) IS suppressed.
+    expect(dedup.check('c', undefined, content, t0 + 1_000, 'turnA')).not.toBeNull()
   })
 })

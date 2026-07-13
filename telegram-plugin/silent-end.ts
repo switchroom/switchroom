@@ -38,6 +38,19 @@ export interface SilentEndState {
   threadId: number | null
   /** Stable identifier for the in-flight turn (statusKey shape). */
   turnKey: string
+  /**
+   * Per-turn nonce — `deriveTurnId`'s `${chatKey}#${messageId}` shape (#3228).
+   * Unlike `turnKey` (the STABLE `chatId:threadId` statusKey, identical across
+   * every turn on the same chat/thread), this is unique per inbound message.
+   * The Stop hook stamps it from the enqueue envelope's `message_id`; the
+   * gateway's `decideCapturedProseDelivery` requires it to match the LIVE
+   * turn's `turnId` before delivering `pendingText`, so a stale captured-prose
+   * record from a PRIOR turn on the same chat can never be misdelivered on a
+   * later turn (Finding 3). Optional — absent when no message_id was derivable
+   * (synthetic inbounds), in which case delivery falls back to the turnKey
+   * match alone.
+   */
+  turnId?: string
   /** Incremented each time the Stop hook blocks for this turn. */
   retryCount: number
   /** Wall-clock ms of last write. */
@@ -291,6 +304,7 @@ export interface CapturedProseDecision {
     | 'captured-prose'
     | 'no-state'
     | 'turnkey-mismatch'
+    | 'turnid-mismatch'
     | 'no-substantive-prose'
 }
 
@@ -299,26 +313,104 @@ export interface CapturedProseDecision {
  * final answer that the gateway should deliver directly (Option A).
  *
  * Reads the same `silent-end-pending.json` the Stop hook wrote. Delivers ONLY
- * when (a) the record belongs to THIS turn (`turnKey` match — never a stale
- * carryover from a prior turn), and (b) the persisted `pendingText` clears the
- * substance floor. Otherwise returns `deliver:false` and the caller falls
- * through to the existing re-prompt / represent safety nets unchanged.
+ * when (a) the record belongs to THIS turn — BOTH the stable `turnKey` AND, when
+ * present, the per-turn `turnId` nonce must match (#3228 Finding 3: `turnKey`
+ * alone is `chatId:threadId` and identical across turns on the same chat, so it
+ * cannot by itself prove the record is this turn's rather than a stale
+ * carryover) — and (b) the persisted `pendingText` clears the substance floor.
+ * Otherwise returns `deliver:false` and the caller falls through to the existing
+ * re-prompt / represent safety nets unchanged.
+ *
+ * turnId matching is enforced ONLY when BOTH sides carry one. A record written
+ * without a nonce (synthetic inbound with no message_id) or a caller that has
+ * no live turnId falls back to the turnKey match alone — never suppress
+ * delivery on doubt, and never break the pre-nonce path.
  *
  * Extracted as a pure core (mirrors `decideTurnFlush` / `decideTurnEndGate`)
  * so the gateway runs the exact code the regression tests exercise —
  * `gateway.ts` is not importable in tests.
  */
 export function decideCapturedProseDelivery(
-  args: { turnKey: string; minChars?: number },
+  args: { turnKey: string; turnId?: string | null; minChars?: number },
   deps?: SilentEndDeps,
 ): CapturedProseDecision {
   const minChars = args.minChars ?? CAPTURED_PROSE_MIN_CHARS
   const state = readSilentEndState(deps)
   if (state == null) return { deliver: false, reason: 'no-state' }
   if (state.turnKey !== args.turnKey) return { deliver: false, reason: 'turnkey-mismatch' }
+  // Per-turn nonce guard (#3228 Finding 3). When the on-disk record was stamped
+  // with a `turnId` AND the caller passes the live turn's `turnId`, they MUST
+  // match — otherwise the record belongs to a different turn on the same chat.
+  if (
+    typeof state.turnId === 'string' &&
+    state.turnId !== '' &&
+    args.turnId != null &&
+    args.turnId !== '' &&
+    state.turnId !== args.turnId
+  ) {
+    return { deliver: false, reason: 'turnid-mismatch' }
+  }
   const text = typeof state.pendingText === 'string' ? state.pendingText : ''
   if (text.trim().length < minChars) return { deliver: false, reason: 'no-substantive-prose' }
   return { deliver: true, text, reason: 'captured-prose' }
+}
+
+/**
+ * Outcome of a captured-prose send attempt (Option A transcript-prose bridge).
+ *   - `sent`         — the answer was delivered fresh this call.
+ *   - `skipped-dedup`— the exact answer already went out (dedup hit); nothing
+ *                      new was sent, but the answer IS with the user.
+ *   - `failed`       — the send threw; the answer did NOT reach the user.
+ */
+export type CapturedProseSendOutcome = 'sent' | 'skipped-dedup' | 'failed'
+
+/**
+ * The bookkeeping effects the gateway applies after a captured-prose send
+ * attempt, injected so the settlement decision is a pure, testable core
+ * (`gateway.ts` itself is not importable in tests).
+ */
+export interface CapturedProseSettlementEffects {
+  /** Close the ending turn's delivery obligation. */
+  closeObligation: () => void
+  /** Clear the silent-end state file for this turn. */
+  clearState: () => void
+  /**
+   * Arm the deterministic Stop-hook re-prompt (recordUndeliveredTurnEnd) so
+   * the answer is recoverable — the send-failure safety net.
+   */
+  recordUndelivered: () => void
+}
+
+/**
+ * Apply the correct bookkeeping after a captured-prose send attempt (#3228
+ * Finding 1). This is the deterministic core the gateway's
+ * `deliverCapturedProse` routes ALL three of its settlement points through.
+ *
+ *   - `sent` / `skipped-dedup` → the answer is with the user, so CLOSE the
+ *     obligation and CLEAR the silent-end state; the represent and the
+ *     exhausted fallback must not re-fire for the same answer.
+ *
+ *   - `failed` → the send threw, so the answer is NOT with the user. We must
+ *     NOT close the obligation or clear the state; instead we ARM the Stop-hook
+ *     re-prompt net (`recordUndelivered`). This is the regression fix: the
+ *     shared turn-end teardown (`decideObligationTurnEnd`) already CLOSES the
+ *     obligation whenever `replyCalled === true` (the interim-ack case that
+ *     reaches captured-prose delivery), so "just leave the obligation open" is
+ *     NOT a real net — without recordUndelivered a thrown send permanently
+ *     loses the answer, strictly worse than the pre-bridge behaviour.
+ *
+ * Pure — no IO, no module state; the caller injects the effects.
+ */
+export function settleCapturedProseDelivery(
+  outcome: CapturedProseSendOutcome,
+  effects: CapturedProseSettlementEffects,
+): void {
+  if (outcome === 'failed') {
+    effects.recordUndelivered()
+    return
+  }
+  effects.closeObligation()
+  effects.clearState()
 }
 
 /**

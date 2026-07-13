@@ -123,14 +123,25 @@ export function isFinalAnswerReply({ text, disableNotification, done }) {
  * @returns {{ chatId: string | null, threadId: number | null }}
  */
 function parseChannelEnvelope(content) {
-  if (typeof content !== 'string') return { chatId: null, threadId: null, source: null }
+  if (typeof content !== 'string') {
+    return { chatId: null, threadId: null, messageId: null, source: null }
+  }
   const chatMatch = content.match(/chat_id="([^"]+)"/)
   const threadMatch = content.match(/message_thread_id="([^"]+)"/)
+  // LEFT-ANCHOR the message_id match on an attribute boundary (start-of-string
+  // or a whitespace/quote before the name) so it matches ONLY the real
+  // `message_id` attribute — never a same-suffix sibling like
+  // `target_message_id`, `reply_to_message_id`, or `original_message_id`.
+  // Byte-identical to session-tail.ts `parseChannelMeta`'s `grab('message_id')`
+  // so the turnId the hook derives here matches the gateway's `deriveTurnId`
+  // exactly (Finding 3, #3228).
+  const msgMatch = content.match(/(?:^|[\s"'])message_id="([^"]+)"/)
   const sourceMatch = content.match(/<channel[^>]*\bsource="([^"]+)"/)
   const threadRaw = threadMatch ? Number(threadMatch[1]) : NaN
   return {
     chatId: chatMatch ? chatMatch[1] : null,
     threadId: Number.isFinite(threadRaw) && threadRaw !== 0 ? threadRaw : null,
+    messageId: msgMatch ? msgMatch[1] : null,
     source: sourceMatch ? sourceMatch[1] : null,
   }
 }
@@ -146,6 +157,27 @@ function parseChannelEnvelope(content) {
  */
 function buildTurnKey(chatId, threadId) {
   return `${chatId}:${threadId == null || threadId === 0 ? '_' : threadId}`
+}
+
+/**
+ * Build the per-turn nonce the gateway stamps as `CurrentTurn.turnId`
+ * (`gateway.ts deriveTurnId` → `${chatKey(chatId, threadId)}#${messageId}`).
+ * Unlike `buildTurnKey` (the STABLE `chatId:threadId` statusKey, shared by
+ * every turn on the same chat/thread), this is unique per inbound message —
+ * so a stale captured-prose record from a PRIOR turn on the same chat can
+ * never be misdelivered on a LATER turn (Finding 3, #3228). Returns null when
+ * the enqueue envelope carries no usable message_id (synthetic inbounds); the
+ * gateway then falls back to the turnKey-only match, unchanged.
+ *
+ * @param {string | null} chatId
+ * @param {number | null} threadId
+ * @param {string | null} messageId
+ * @returns {string | null}
+ */
+function buildTurnId(chatId, threadId, messageId) {
+  if (chatId == null) return null
+  if (messageId == null || messageId === '' || String(messageId) === '0') return null
+  return `${buildTurnKey(chatId, threadId)}#${messageId}`
 }
 
 /**
@@ -167,6 +199,12 @@ function buildBlockResult(envelope, reason, pendingText) {
     block.chatId = envelope.chatId
     block.threadId = envelope.threadId
     block.turnKey = buildTurnKey(envelope.chatId, envelope.threadId)
+    // Per-turn nonce (Finding 3, #3228). Populated only when the enqueue
+    // envelope carried a real message_id — the gateway requires it to match
+    // this turn's `turnId` before delivering `pendingText`, so a stale record
+    // carried over from a prior turn on the same chat/thread is rejected.
+    const turnId = buildTurnId(envelope.chatId, envelope.threadId, envelope.messageId)
+    if (turnId != null) block.turnId = turnId
   }
   if (typeof pendingText === 'string' && pendingText.length > 0) {
     block.pendingText = pendingText
@@ -249,7 +287,7 @@ function buildBlockResult(envelope, reason, pendingText) {
  * false-positive that burned retry budget on healthy turns.
  *
  * @param {string} jsonl
- * @returns {{ decided: 'allow' | 'block' | 'unknown', reason: string, turnKey?: string, chatId?: string, threadId?: number | null, pendingText?: string }}
+ * @returns {{ decided: 'allow' | 'block' | 'unknown', reason: string, turnKey?: string, turnId?: string, chatId?: string, threadId?: number | null, pendingText?: string }}
  */
 export function scanTurnForFinalReply(jsonl) {
   const lines = jsonl.split('\n')
@@ -369,19 +407,31 @@ export function scanTurnForFinalReply(jsonl) {
   const sawUndeliveredTextAfterAllow = undeliveredSlice
     .some((b) => b.kind === 'text' && (b.chars ?? 0) >= FINAL_ANSWER_MIN_CHARS)
 
-  // Option A transcript-prose bridge: assemble the undelivered final-answer
-  // prose (all plain-text blocks after the last delivery event — or every
-  // text block when nothing was ever delivered) so the gateway can deliver it
-  // directly. Only surfaced when the COMBINED prose clears the same substance
-  // floor the block decision uses, so a short trailing pleasantry is never
-  // re-delivered (mirrors the per-block substance floor above).
-  const undeliveredProse = undeliveredSlice
-    .filter((b) => b.kind === 'text' && typeof b.text === 'string' && b.text.length > 0)
-    .map((b) => b.text)
-    .join('\n\n')
-    .trim()
+  // Option A transcript-prose bridge: isolate the undelivered final-answer
+  // prose so the gateway can deliver it directly.
+  //
+  // Finding 2 (#3228): a real dropped answer is a SINGLE substantive block —
+  // NOT concatenated inter-tool narration ("Let me check…", "Still querying…")
+  // that only crosses the floor once joined. The old code joined ALL post-
+  // delivery text blocks and surfaced the join whenever the COMBINED length
+  // hit the floor, so a run of short narration masqueraded as a final answer
+  // (and in the zero-delivery case that join was every text block in the
+  // turn). Instead, deliver only the LAST block that CLEARS the substance
+  // floor ON ITS OWN. This mirrors the block decision itself
+  // (`sawUndeliveredTextAfterAllow`, which requires a single ≥floor block) and
+  // handles the "big answer then short closer" shape by delivering the answer,
+  // not the closer. When no single block clears the floor, `pendingText` stays
+  // undefined and the gateway falls through to the re-prompt / represent nets.
+  const substantiveBlocks = undeliveredSlice.filter(
+    (b) =>
+      b.kind === 'text' &&
+      typeof b.text === 'string' &&
+      (b.chars ?? 0) >= FINAL_ANSWER_MIN_CHARS,
+  )
   const pendingText =
-    undeliveredProse.length >= FINAL_ANSWER_MIN_CHARS ? undeliveredProse : undefined
+    substantiveBlocks.length > 0
+      ? substantiveBlocks[substantiveBlocks.length - 1].text
+      : undefined
 
   if (lastAllowBlockIdx === -1) {
     // No qualifying delivery/silence event anywhere in the turn.
