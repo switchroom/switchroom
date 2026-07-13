@@ -103,4 +103,3 @@ describe("uat-adv: main-agent liveness card model-freshness (attacks live-model 
     210_000,
   );
 });
-</content>

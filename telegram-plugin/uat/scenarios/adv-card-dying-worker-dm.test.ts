@@ -78,4 +78,3 @@ describe("uat-adv: sub-agent card paints for a near-instant worker (attacks #323
     300_000,
   );
 });
-</content>

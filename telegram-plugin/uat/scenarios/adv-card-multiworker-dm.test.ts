@@ -82,4 +82,3 @@ describe("uat-adv: combined multi-worker header (attacks #3231 surface)", () => 
     240_000,
   );
 });
-</content>

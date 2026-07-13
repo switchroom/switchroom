@@ -61,4 +61,3 @@ describe("uat-adv: over-delegation guard on a conversational turn (attacks #3232
     180_000,
   );
 });
-</content>

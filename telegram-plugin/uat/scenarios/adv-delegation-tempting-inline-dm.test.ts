@@ -100,4 +100,3 @@ describe("uat-adv: delegation recency under inline temptation (attacks #3232)", 
     460_000,
   );
 });
-</content>

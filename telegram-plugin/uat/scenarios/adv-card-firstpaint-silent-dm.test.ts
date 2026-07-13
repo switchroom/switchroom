@@ -151,4 +151,3 @@ describe("uat-adv: sub-agent card first-paint + lifecycle (attacks #3231)", () =
     480_000,
   );
 });
-</content>
