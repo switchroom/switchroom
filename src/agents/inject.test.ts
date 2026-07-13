@@ -919,3 +919,98 @@ describe("#2566 — /model and /memory allowlist treatment", () => {
     expect(result.outcome).toBe("ok");
   });
 });
+
+// ─── #3116 — check-to-send race guard (precondition re-eval at write) ──────
+describe("injectSlashCommandWith — precondition (#3116)", () => {
+  it("precondition false → command is NEVER typed into the pane (outcome=skipped)", async () => {
+    // The race: idle-clear decided /clear, but an inbound arrived before the
+    // tmux write. The precondition re-reads the idle gate at write time and
+    // returns false, so nothing is sent.
+    const sent: string[][] = [];
+    const runner = makeFake({
+      hasSession: true,
+      captures: ["before\n"],
+      onSend: (args) => sent.push(args),
+    });
+
+    const r = await injectSlashCommandWith(runner, {
+      socket: "switchroom-x",
+      session: "x",
+      command: "/clear",
+      settleMs: 50,
+      timeoutMs: 100,
+      precondition: () => false,
+    });
+
+    // The load-bearing assertion — no keys were ever sent into the pane.
+    // On current main (no precondition param) the write always fires and
+    // `sent` would contain the send-keys calls → this FAILS, proving the bug.
+    expect(sent).toEqual([]);
+    expect(r.outcome).toBe("skipped");
+    expect(r.errorCode).toBe("precondition_failed");
+    expect(r.command).toBe("/clear");
+  });
+
+  it("precondition true → command IS sent (still-idle at write time)", async () => {
+    const sent: string[][] = [];
+    const runner = makeFake({
+      hasSession: true,
+      captures: ["before\n", "before\n"],
+      onSend: (args) => sent.push(args),
+    });
+
+    const r = await injectSlashCommandWith(runner, {
+      socket: "switchroom-x",
+      session: "x",
+      command: "/clear",
+      settleMs: 20,
+      timeoutMs: 60,
+      precondition: () => true,
+    });
+
+    expect(sent[0]).toEqual(["send-keys", "-l", "/clear"]);
+    expect(sent[1]).toEqual(["send-keys", "Enter"]);
+    // /clear renders no output → ok_no_output, but it WAS dispatched.
+    expect(r.outcome).toBe("ok_no_output");
+  });
+
+  it("no precondition → unchanged behaviour (always sends)", async () => {
+    const sent: string[][] = [];
+    const runner = makeFake({
+      hasSession: true,
+      captures: ["before\n", "before\n"],
+      onSend: (args) => sent.push(args),
+    });
+
+    await injectSlashCommandWith(runner, {
+      socket: "switchroom-x",
+      session: "x",
+      command: "/clear",
+      settleMs: 20,
+      timeoutMs: 60,
+    });
+
+    expect(sent[0]).toEqual(["send-keys", "-l", "/clear"]);
+  });
+
+  it("precondition is evaluated BEFORE has-session pane capture, once", async () => {
+    // The precondition must gate the write, and must not be re-invoked per poll.
+    let calls = 0;
+    const runner = makeFake({
+      hasSession: true,
+      captures: ["before\n", "before\n"],
+    });
+    await injectSlashCommandWith(runner, {
+      socket: "switchroom-x",
+      session: "x",
+      command: "/clear",
+      settleMs: 20,
+      timeoutMs: 60,
+      precondition: () => {
+        calls += 1;
+        return true;
+      },
+    });
+    expect(calls).toBe(1);
+  });
+});

@@ -5085,10 +5085,20 @@ function maybeIdleClear(): void {
     `telegram gateway: idle auto-/clear for ${agentName} ` +
       `(idle >= ${Math.round(idleClearMs / 60_000)}m)\n`,
   );
-  // Accepted check-to-send race (same as maybeProactiveCompact): a new inbound
-  // could arrive between the gate check and the tmux send; /clear then lands in
-  // claude's prompt buffer and runs at the next idle prompt (inject.ts FUTURE-GAP).
-  void injectSlashCommandImpl(agentName, '/clear')
+  // #3116 — close the check-to-send race. A new inbound can arrive between
+  // this gate check and the tmux send; without a guard, `/clear` lands in
+  // claude's prompt buffer and runs at the NEXT idle prompt against a session
+  // that is no longer idle, destroying live context (overlord, 2026-07-11).
+  // `injectSlashCommandImpl` re-evaluates this precondition IMMEDIATELY before
+  // the tmux write and skips the send if the session is no longer idle. An
+  // inbound in the gap calls markIdleActivity() (bumps lastIdleActivityAt and
+  // resets idleAutoCleared), so `stillIdle` reads false and the gate re-arms.
+  const stillIdle = (): boolean => {
+    if (turnInFlightForGate()) return false;
+    const evAt = Math.max(lastIdleActivityAt, lastIdleTurnEndAt ?? 0);
+    return Date.now() - evAt >= idleClearMs;
+  };
+  void injectSlashCommandImpl(agentName, '/clear', { precondition: stillIdle })
     .catch((err: unknown) => {
       process.stderr.write(
         `telegram gateway: idle /clear inject failed for ` +
