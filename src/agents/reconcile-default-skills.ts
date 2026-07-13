@@ -75,12 +75,15 @@ export function getBundledSkillsPoolDir(): string {
  * under a previous resolver — and therefore safe to delete and
  * recreate? Matches the current pool dir AND legacy prefixes (any
  * path containing `/switchroom/skills/` — dev-checkout or packaged —
- * plus the `/opt/skills/` baked-image path used by pre-fix containers).
+ * the `/opt/skills/` baked-image path used by pre-fix containers, plus
+ * the retired bun-global install path `.../node_modules/switchroom-ai/
+ * skills/` (RCA: carrie's 7 permanently-dangling links, #1164)).
  */
 function isOwnedStaleLink(target: string, poolDir: string): boolean {
   if (target.startsWith(poolDir)) return true;
   if (target.includes("/switchroom/skills/")) return true;
   if (target.startsWith("/opt/skills/")) return true;
+  if (target.includes("/switchroom-ai/skills/")) return true;
   return false;
 }
 
