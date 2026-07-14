@@ -101,6 +101,10 @@ describe("runScan (I/O) — defensive over a synthetic fleet tree", () => {
           turn_id: `${CHAT}:_#1`,
           status: "complete",
           tools: 0,
+          // Real gateway rows always carry `ts`; the silent-no-op guard now
+          // requires it (detect.ts). ~2026-07-02, matching the gw log line and
+          // the scenario clock (below the fixed floor — see silentNoopFloorTs:0).
+          ts: 1_783_032_000,
         }) + "\n",
       );
       writeFileSync(
@@ -119,6 +123,12 @@ describe("runScan (I/O) — defensive over a synthetic fleet tree", () => {
         ownerAgent: "klanker",
         log: (m) => warnings.push(m),
         now: new Date("2026-07-03T00:00:00Z"),
+        // Neutralize the silent-no-op floor for this fixture: the fixture turn
+        // carries no `ts` and the scenario clock (2026-07-03) predates the
+        // fixed floor, so without this override the silent-no-op finding is
+        // dropped. Mirrors how detect.test.ts neutralizes the floor for
+        // sub-floor fixtures. (prod CLI keeps the real floor — see fleet-health.ts)
+        silentNoopFloorTs: 0,
       });
       expect(res.agentsSkipped).toContain("ghost");
       // clerk contributed a silent no-op + a duplicate delivery
