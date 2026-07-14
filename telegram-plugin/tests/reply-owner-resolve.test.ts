@@ -35,7 +35,7 @@ import {
   decideAnswerLatchSuppression,
   type ReplyOwnerCandidates,
 } from '../reply-owner-resolve.js'
-import { FlushedTurnSupersedeRegistry } from '../flushed-turn-supersede.js'
+import { FlushedTurnSupersedeRegistry, DEFAULT_SUPERSEDE_TTL_MS } from '../flushed-turn-supersede.js'
 
 const NONE: ReplyOwnerCandidates = {
   liveTurnId: null,
@@ -185,5 +185,95 @@ describe('decideAnswerLatchSuppression — race backstop (Part 2)', () => {
         ownerAnswerDelivered: false,
       }),
     ).toBe(false)
+  })
+})
+
+describe('F1 — flush send failure must NOT suppress the late reply (zero-message guard)', () => {
+  // The flush arms `answerDelivered` synchronously at FIRE time, BEFORE the async
+  // send. If the send then throws and NOTHING was delivered, the supersede record
+  // is never written (gated on sentIds>0), so Part 1 cannot fire. Leaving the
+  // latch armed would make a genuine late reply suppress itself → the user gets
+  // ZERO messages. The gateway's send-failure catch resets `answerDelivered =
+  // false`; these assert the resulting coordination outcome at the pure core.
+  const lateSubstantiveReply = (ownerAnswerDelivered: boolean) =>
+    decideAnswerLatchSuppression({
+      superseded: false,
+      replySubstantive: true,
+      isLateReply: true,
+      ownerAnswerDelivered,
+    })
+
+  it('WITHOUT the catch-reset (latch still armed) the late reply is suppressed ' +
+    '— the zero-message bug', () => {
+    // Models the buggy state: flush armed the latch, send failed, latch left true.
+    expect(lateSubstantiveReply(true)).toBe(true)
+  })
+
+  it('WITH the catch-reset (answerDelivered=false) the late reply DELIVERS', () => {
+    // Models the fixed state: catch reset the latch, so the genuine late reply
+    // is not suppressed and the user still receives the answer.
+    expect(lateSubstantiveReply(false)).toBe(false)
+  })
+})
+
+describe('F2 — recency-bound the destructive latest-ended supersede tier', () => {
+  const CHAT = '515151'
+  const base: ReplyOwnerCandidates = {
+    liveTurnId: null,
+    originTurnId: null,
+    quotedTurnId: null,
+    latestEndedTurnId: null,
+  }
+
+  it('accepts a latest-ended turn that ended within the supersede TTL', () => {
+    expect(
+      resolveReplyOwnerTurnId({
+        ...base,
+        latestEndedTurnId: 'turn-T',
+        latestEndedAgeMs: DEFAULT_SUPERSEDE_TTL_MS - 1,
+        latestEndedTtlMs: DEFAULT_SUPERSEDE_TTL_MS,
+      }),
+    ).toBe('turn-T')
+  })
+
+  it('REJECTS a STALE latest-ended turn (ended past the supersede TTL) so it ' +
+    'cannot inherit deletion authority — resolver returns null', () => {
+    expect(
+      resolveReplyOwnerTurnId({
+        ...base,
+        latestEndedTurnId: 'turn-STALE',
+        latestEndedAgeMs: DEFAULT_SUPERSEDE_TTL_MS + 5_000,
+        latestEndedTtlMs: DEFAULT_SUPERSEDE_TTL_MS,
+      }),
+    ).toBeNull()
+  })
+
+  it('end-to-end: a stale latest-ended turn does NOT delete a live flush ' +
+    "record it doesn't own", () => {
+    const reg = new FlushedTurnSupersedeRegistry()
+    const now = 1_000_000
+    // A fresh flush record for the newer turn T2 (its owner, well within TTL).
+    reg.record(CHAT, undefined, { turnId: 'turn-T2', messageIds: [9001], text: 'A2' }, now)
+    // A late reply whose only recoverable owner is a STALE turn (ended long ago).
+    // Without the recency bound the resolver would hand back the stale turn id
+    // and a take() keyed on it could mis-target; with the bound it resolves null,
+    // so no deletion authority is granted and T2's record survives untouched.
+    const ownerId = resolveReplyOwnerTurnId({
+      ...base,
+      latestEndedTurnId: 'turn-STALE',
+      latestEndedAgeMs: DEFAULT_SUPERSEDE_TTL_MS + 5_000,
+      latestEndedTtlMs: DEFAULT_SUPERSEDE_TTL_MS,
+    })
+    expect(ownerId).toBeNull()
+    const decision = reg.take(CHAT, undefined, { liveTurnId: ownerId, now: now + 10 })
+    expect(decision.supersede).toBe(false)
+    // T2's record is intact (a null owner never reaches its turnId-keyed lane).
+    expect(reg.peek(CHAT, undefined, { liveTurnId: 'turn-T2', now: now + 10 }).supersede).toBe(true)
+  })
+
+  it('unbounded when no age is supplied (back-compat: pre-F2 precedence intact)', () => {
+    expect(
+      resolveReplyOwnerTurnId({ ...base, latestEndedTurnId: 'turn-T' }),
+    ).toBe('turn-T')
   })
 })

@@ -59,6 +59,29 @@ export interface ReplyOwnerCandidates {
   /** `findLatestEndedTurnForChat(chat_id)` — the chat's most-recently-ended
    *  turn. The deterministic late-reply fallback (the DM path's recovery). */
   latestEndedTurnId: string | null
+  /** Age (ms) of the latest-ended turn — `now - turn.endedAt`. The latest-ended
+   *  tier carries DESTRUCTIVE authority (it drives supersede deletion), so it is
+   *  honoured ONLY when the turn ended within `latestEndedTtlMs` (the supersede
+   *  TTL). Without the bound, a late reply belonging to an OLDER turn could
+   *  resolve its owner to a NEWER turn now sitting at the registry tail and
+   *  delete THAT turn's legit answer. Undefined/null ⇒ unbounded (back-compat:
+   *  callers that don't supply an age keep the pre-F2 behaviour). */
+  latestEndedAgeMs?: number | null
+  /** The supersede TTL bound applied to `latestEndedAgeMs`. Undefined ⇒
+   *  unbounded. */
+  latestEndedTtlMs?: number
+}
+
+/**
+ * Whether the latest-ended candidate is fresh enough to carry supersede
+ * (deletion) authority. A missing age or TTL means unbounded (back-compat).
+ */
+function latestEndedAccepted(candidates: ReplyOwnerCandidates): boolean {
+  if (candidates.latestEndedTurnId == null) return false
+  const age = candidates.latestEndedAgeMs
+  const ttl = candidates.latestEndedTtlMs
+  if (age == null || ttl == null) return true
+  return age <= ttl
 }
 
 /**
@@ -79,7 +102,7 @@ export function resolveReplyOwnerTurnId(candidates: ReplyOwnerCandidates): strin
     candidates.liveTurnId ??
     candidates.originTurnId ??
     candidates.quotedTurnId ??
-    candidates.latestEndedTurnId ??
+    (latestEndedAccepted(candidates) ? candidates.latestEndedTurnId : null) ??
     null
   )
 }

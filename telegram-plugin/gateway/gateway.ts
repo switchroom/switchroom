@@ -88,7 +88,7 @@ import {
   type TelegraphAccount,
 } from '../telegraph.js'
 import { OutboundDedupCache } from '../recent-outbound-dedup.js'
-import { FlushedTurnSupersedeRegistry } from '../flushed-turn-supersede.js'
+import { FlushedTurnSupersedeRegistry, DEFAULT_SUPERSEDE_TTL_MS } from '../flushed-turn-supersede.js'
 import { createInboundCoalescer, inboundCoalesceKey } from './inbound-coalesce.js'
 import {
   splitCoalescedAttachments,
@@ -3143,6 +3143,15 @@ type CurrentTurn = {
   // 1's supersede cannot reach. Scoped to the substantive floor so an interim
   // sub-floor ack NEITHER sets nor trips it. Reset false at turn start.
   answerDelivered: boolean
+  // 2026-07 double-reply-on-DM fix (F2 — recency bound). Wall-clock ms the turn
+  // ENDED (stamped once by `endCurrentTurnAtomic`), or null while still live.
+  // The `findLatestEndedTurnForChat` supersede tier carries DESTRUCTIVE
+  // authority (it drives message deletion), so `resolveReplyOwnerTurn` only
+  // honours a latest-ended turn whose `endedAt` is within the supersede TTL —
+  // otherwise a late reply belonging to an OLDER turn could resolve its owner to
+  // a NEWER turn sitting at the registry tail and delete that newer turn's legit
+  // answer. Unbounded routing use of `findLatestEndedTurnForChat` is unaffected.
+  endedAt: number | null
   // #1675 (over-ping safety net): wall-clock ms of the first reply
   // this turn that landed with `disable_notification: false` (a real
   // device ping). The conversational-pacing contract
@@ -3678,11 +3687,20 @@ function resolveReplyOwnerTurn(
   for (const t of [latestEnded, quoted, origin, liveTurn]) {
     if (t != null) byId.set(t.turnId, t)
   }
+  // F2 — bound the DESTRUCTIVE latest-ended tier to the supersede TTL so a stale
+  // latest-ended turn can't inherit deletion authority over a newer turn's flush
+  // record. `endedAt` is null only for a turn still resolvable but not yet ended
+  // (not a supersede risk); leave the age unset then (unbounded) rather than
+  // fabricate one.
+  const latestEndedAgeMs =
+    latestEnded?.endedAt != null ? Date.now() - latestEnded.endedAt : null
   const winnerId = resolveReplyOwnerTurnId({
     liveTurnId: liveTurn?.turnId ?? null,
     originTurnId: origin?.turnId ?? null,
     quotedTurnId: quoted?.turnId ?? null,
     latestEndedTurnId: latestEnded?.turnId ?? null,
+    latestEndedAgeMs,
+    latestEndedTtlMs: DEFAULT_SUPERSEDE_TTL_MS,
   })
   return winnerId != null ? (byId.get(winnerId) ?? null) : null
 }
@@ -4921,6 +4939,12 @@ function endCurrentTurnAtomic(
   // the turn got), plus a DEGRADED warning when the turn did tool work but the
   // live feed never opened because its sends failed (the resume-400 signature).
   const turnEndedAt = Date.now()
+  // 2026-07 double-reply-on-DM fix (F2) — stamp the turn's end time so the
+  // `findLatestEndedTurnForChat` supersede tier can be recency-bounded to the
+  // supersede TTL (a stale latest-ended turn must not inherit deletion
+  // authority over a newer turn's flush record). Set once; idempotent on the
+  // deferRecord flush path (which calls this synchronously before its send).
+  turn.endedAt = turnEndedAt
   process.stderr.write(
     `telegram gateway: ${formatTurnLifecycle('clear', 'turn_end', turn, turnEndedAt)}\n`,
   )
@@ -17006,6 +17030,8 @@ function handleSessionEvent(ev: SessionEvent): void {
           // 2026-07 double-reply-on-DM fix (Part 2) — answer-delivered race
           // latch, reset at turn start alongside the other answer flags.
           answerDelivered: false,
+          // 2026-07 double-reply-on-DM fix (F2) — stamped at turn end.
+          endedAt: null,
           firstPingAt: null,
           // Notification ownership (R8 / PR-2): no slot claimed yet, so the
           // "claimer was substantive" flag starts false. Set atomically with
@@ -18492,6 +18518,22 @@ function handleSessionEvent(ev: SessionEvent): void {
           } catch (err) {
             sendThrew = true
             process.stderr.write(`telegram gateway: turn-flush send failed: ${(err as Error).message}\n`)
+            // 2026-07 double-reply-on-DM fix (F1) — the flush armed
+            // `answerDelivered` synchronously at FIRE time, but the send just
+            // FAILED. When nothing was delivered the supersede record was NOT
+            // written (gated on `sentIds.length > 0` above), so Part 1 can never
+            // fire for this turn — leaving the latch armed would make a genuine
+            // late reply suppress itself and the user would get ZERO messages
+            // (silent answer loss; on main that path still delivers the reply).
+            // Reset the latch so the late reply is NOT suppressed. On a PARTIAL
+            // send (sentIds > 0) the record WAS written, so Part 1's supersede
+            // deletes the partial message A and the reply delivers cleanly —
+            // resetting here is harmless in that case too.
+            // FOLLOW-UP (coordinator to file an issue): a reply suppressed
+            // synchronously DURING the in-flight send that then fails is not
+            // fully closable with a boolean latch — a residual micro-window the
+            // supersede+latch pair cannot eliminate. Not addressed in this PR.
+            turn.answerDelivered = false
             // #1713: backstop send failed — finalize as error so the
             // turn ends cleanly with 😱 rather than leaving it open.
             if (backstopCtrl) backstopCtrl.finalize('error')
