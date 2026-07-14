@@ -30202,7 +30202,7 @@ void (async () => {
               // to the `lastUpdateAt` reset that lets an immortal-but-updating
               // row dodge `staleWorkerTtlMs` forever (Carrie 5h zombie pin).
               // Derived from the same terminal cap so it tracks operator
-              // overrides; 8× → 6h at the 45-min default.
+              // overrides; 4× → ~3h at the 45-min default.
               absoluteRowLifetimeCapMs: resolveInflightTerminalCapMs() * WORKER_FEED_ABSOLUTE_ROW_LIFETIME_CAP_MULTIPLE,
               // #3207 review: GROUP-level status pin. Workers now coalesce into
               // ONE shared message, so the pin must follow the GROUP lifecycle,
