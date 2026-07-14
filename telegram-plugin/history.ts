@@ -740,6 +740,81 @@ export function hasOutboundDeliveredSince(
   }
 }
 
+/**
+ * DURABLE text-identity delivery oracle for crash-survival redelivery.
+ *
+ * Returns true iff a substantive outbound (`role='assistant'`) row whose text
+ * matches `text` has been delivered to `chatId` (and optionally `threadId`).
+ * Unlike `hasOutboundDeliveredSince`, this keys on the ANSWER TEXT itself, not
+ * a chat+time window — so an interim `progress_update` ("on it…") or a streamed
+ * partial chunk sent earlier in the same turn does NOT false-positive as "the
+ * final answer was delivered" (the exact MISS bug that would otherwise suppress
+ * a genuinely-undelivered final answer and re-open the permanent-silence hole).
+ *
+ * Matching is on the NORMALIZED first chunk (see `normalizeDeliveryText`): a
+ * multi-chunk answer's chunk-1 is compared against delivered rows so a crash
+ * after chunk-1 is detected as delivered (avoids double-sending chunk-1). Both
+ * sides are normalized identically. Empty/whitespace text never matches.
+ *
+ * Durable (reads committed SQLite), survives restart — unlike the in-memory
+ * `outboundDedup` ring, whose window is destroyed by the crash.
+ *
+ * Falls back to false (safe: never suppresses a needed redelivery) if history
+ * is not initialised or the query fails — the `answer_redelivered_at` marker is
+ * the second guard against a double-send in that degraded case.
+ */
+export function hasOutboundWithText(
+  chatId: string,
+  text: string,
+  threadId?: number | null,
+): boolean {
+  const needle = normalizeDeliveryText(text)
+  if (needle.length === 0) return false
+  try {
+    // Compare on the normalized prefix so trailing-whitespace / spacer
+    // differences between the rendered outbound and the re-projected answer do
+    // not defeat the match. We fetch candidate assistant rows and normalize in
+    // JS (SQLite lacks the same normalize) — bounded by chat/thread scope.
+    const params: unknown[] = [chatId]
+    let sql = "SELECT text FROM messages WHERE chat_id = ? AND role = 'assistant'"
+    if (threadId !== undefined) {
+      if (threadId === null) {
+        sql += ' AND thread_id IS NULL'
+      } else {
+        sql += ' AND thread_id = ?'
+        params.push(threadId)
+      }
+    }
+    // Newest first: a redelivery candidate's match is almost always recent.
+    sql += ' ORDER BY ts DESC LIMIT 500'
+    const rows = requireDb()
+      .prepare(sql)
+      .all(...(params as [unknown, ...unknown[]])) as { text: string | null }[]
+    for (const r of rows) {
+      const hay = normalizeDeliveryText(r.text ?? '')
+      if (hay.length === 0) continue
+      // Match when the delivered row starts with the projected first chunk (or
+      // vice-versa) — a chunk-1 row satisfies a multi-chunk projected answer.
+      if (hay === needle || hay.startsWith(needle) || needle.startsWith(hay)) {
+        return true
+      }
+    }
+    return false
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Normalize outbound text for durable text-identity delivery matching. Collapses
+ * all whitespace runs to single spaces and trims — so paragraph-spacer / render
+ * differences between a stored outbound and a re-projected transcript answer do
+ * not defeat an otherwise-identical match. Pure; shared by the redelivery path.
+ */
+export function normalizeDeliveryText(text: string): string {
+  return text.replace(/\s+/g, ' ').trim()
+}
+
 export function query(opts: QueryOptions): RecordedMessage[] {
   const limit = Math.min(MAX_LIMIT, Math.max(1, opts.limit ?? DEFAULT_LIMIT))
   const params: unknown[] = [opts.chat_id]

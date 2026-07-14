@@ -303,6 +303,59 @@ export function assistantLineCarriesAnswerSurface(
   return false
 }
 
+export interface TrailingAnswer {
+  /** Concatenated trailing assistant text of the last turn (after the last
+   *  tool_use / turn boundary). Empty when there is none to redeliver. */
+  text: string
+  /** True iff the last content-bearing event of the transcript was text — i.e.
+   *  the turn ended on an answer, not a dangling tool_use (mid-stream). Bounds
+   *  the preamble-vs-final ambiguity for crash-survival redelivery. */
+  trailingIsText: boolean
+}
+
+/**
+ * Re-project the TRAILING assistant answer of the last turn from a claude
+ * session transcript's full text. Pure — reuses the same `projectTranscriptLine`
+ * kernel the live tail uses, so it inherits the `isApiErrorMessage` suppression
+ * (a usage-limit error line is NEVER resurfaced as an answer) and the empty-block
+ * drop. Used by crash-survival redelivery to recover the finished-but-never-sent
+ * answer from disk after a pre-flush crash.
+ *
+ * Semantics: walk the event stream in order; the "answer buffer" accumulates
+ * `text` events and is RESET by any `tool_use` (the answer-so-far was a preamble
+ * to a tool call) or by an `enqueue` (a new inbound turn boundary). What remains
+ * at end-of-file is the trailing answer of the last turn. `trailingIsText` is
+ * true only when the final content-bearing event was that text (not a tool_use),
+ * so a turn killed mid-tool never redelivers a stale preamble as an answer.
+ */
+export function projectTrailingAnswerFromTranscript(transcriptText: string): TrailingAnswer {
+  const buf: string[] = []
+  let lastMeaningful: 'text' | 'tool_use' | null = null
+  for (const rawLine of transcriptText.split('\n')) {
+    const line = rawLine.trim()
+    if (!line) continue
+    for (const ev of projectTranscriptLine(line)) {
+      if (ev.kind === 'enqueue') {
+        // New inbound turn — any prior turn's trailing text is not this turn's.
+        buf.length = 0
+        lastMeaningful = null
+      } else if (ev.kind === 'tool_use') {
+        buf.length = 0
+        lastMeaningful = 'tool_use'
+      } else if (ev.kind === 'text') {
+        const t = (ev as { text?: string }).text ?? ''
+        if (t.trim().length > 0) {
+          buf.push(t)
+          lastMeaningful = 'text'
+        }
+      }
+      // thinking / model / dequeue / tool_result etc. do not affect the answer.
+    }
+  }
+  const text = buf.join('').trim()
+  return { text, trailingIsText: lastMeaningful === 'text' && text.length > 0 }
+}
+
 /**
  * Project a single transcript line into a SessionEvent (or null if it's
  * uninteresting noise). Caller is responsible for the JSON parse — if a

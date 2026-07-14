@@ -833,6 +833,7 @@ import {
   findRecentTurnsForChat,
   getTurnByKey,
   markTurnResumed,
+  stampTurnSessionId,
   reapStaleOpenTurns,
 } from '../registry/turns-schema.js'
 import {
@@ -2977,6 +2978,10 @@ const PENDING_CMD_DRAIN_CAP_MS = 60_000
 // forwarded by the bridge on every session_event — we read occupancy from
 // exactly that file (never an independent findActiveSessionFile re-scan).
 let lastSessionActiveFile: string | null = null
+// Crash-survival redelivery (#session-id pin): the last turn_key whose
+// `session_id` we durably stamped, so the hot session-event path stamps once
+// per turn instead of issuing a guarded UPDATE on every event.
+let lastSessionStampedTurnKey: string | null = null
 // Anti-spam state machine lives in ./proactive-compact (pure, unit
 // tested). `compactDispatching` is a synchronous re-entrancy guard for
 // the async tmux send — purgeReactionTracking can run several times per
@@ -11211,6 +11216,29 @@ const ipcServer: IpcServer = createIpcServer({
     // Track the session-tail's attached file for the proactive-
     // compaction occupancy read (see maybeProactiveCompact).
     if (msg.activeFile) lastSessionActiveFile = msg.activeFile
+    // Crash-survival redelivery: durably pin the claude session id onto the
+    // current turn's row the first time we see a session event for it, WHILE
+    // the turn is live (so a later crash preserves it). Boot redelivery then
+    // resolves the EXACT `<sessionId>.jsonl` for the interrupted turn rather
+    // than a most-recent-mtime heuristic that a fresh boot session shadows.
+    // First-write-wins in SQL (`session_id IS NULL`); the in-memory guard just
+    // avoids a redundant UPDATE on every event of the same turn.
+    if (turnsDb != null && msg.activeFile != null) {
+      const stampKey = currentTurn?.registryKey ?? null
+      if (stampKey != null && stampKey !== lastSessionStampedTurnKey) {
+        const sessionId = basename(msg.activeFile).replace(/\.jsonl$/, '')
+        if (sessionId) {
+          try {
+            stampTurnSessionId(turnsDb, stampKey, sessionId)
+            lastSessionStampedTurnKey = stampKey
+          } catch (err) {
+            process.stderr.write(
+              `telegram gateway: stampTurnSessionId failed turnKey=${stampKey}: ${(err as Error).message}\n`,
+            )
+          }
+        }
+      }
+    }
     const ev = msg.event as unknown as SessionEvent
     // #1122/#1126: session events used to be ingested into the pinned progress
     // card here (`progressDriver.ingest`). The card is retired and the driver
