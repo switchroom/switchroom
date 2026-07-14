@@ -617,6 +617,113 @@ describe("injectSlashCommandWith — outcomes", () => {
   });
 });
 
+// ─── #3241 poll-until-signal capture ───────────────────────────────────────
+
+/**
+ * A runner whose capture() walks a scripted list of pane snapshots (one per
+ * poll), holding on the last entry once exhausted — so a test can model the
+ * async banner rendering BEFORE claude's confirmation line lands.
+ */
+function makeScriptedRunner(snapshots: string[]): TmuxRunner & { sent: string[][] } {
+  let i = 0;
+  const sent: string[][] = [];
+  return {
+    hasSession: () => true,
+    capture: () => {
+      const v = snapshots[Math.min(i, snapshots.length - 1)] ?? "";
+      i += 1;
+      return v;
+    },
+    send: (_s, _n, args) => sent.push(args),
+    sent,
+  };
+}
+
+describe("injectSlashCommandWith — #3241 poll-until-signal", () => {
+  const BEFORE = "❯ \n";
+  const ECHO = "❯ /model fable";
+  const BANNER = "⠋ extending Claude Fable 5 access…";
+  const CONFIRM = "⎿  Set model to Fable 5 for this session";
+  const ERRLINE = "⎿  Model 'claude-bogus-99' not found";
+  const successPattern = /^\s*[⏺●•>⎿-]?\s*(?:Set model to|Switched to|Kept model as)\b/i;
+  const errorPattern =
+    /^\s*[⏺●•>⎿-]?\s*(?:Error:\s*)?(?:Model(?:\s+'[^']+')?\s+not found|Invalid model|Unknown model|No such model)\b/i;
+
+  it("captures the confirmation that lands on poll N+2 AFTER a banner on poll N (not the banner)", async () => {
+    // before → (banner) → (banner) → (banner+confirmation). A fixed settle break
+    // on the first change would have captured the banner; poll-until-signal waits
+    // for the success line.
+    const runner = makeScriptedRunner([
+      BEFORE,
+      `${ECHO}\n${BANNER}\n`,
+      `${ECHO}\n${BANNER}\n`,
+      `${ECHO}\n${BANNER}\n${CONFIRM}\n`,
+    ]);
+    const r = await injectSlashCommandWith(runner, {
+      socket: "s", session: "x", command: "/model fable",
+      settleMs: 50, timeoutMs: 2000, successPattern, errorPattern,
+    });
+    expect(r.outcome).toBe("ok");
+    expect(r.output).toContain("Set model to Fable 5");
+  });
+
+  it("breaks early on a scraped error line (outcome carries the error, not a banner)", async () => {
+    const runner = makeScriptedRunner([
+      BEFORE,
+      `${ECHO}\n${BANNER}\n`,
+      `${ECHO}\n${ERRLINE}\n`,
+      `${ECHO}\n${ERRLINE}\n`,
+    ]);
+    const r = await injectSlashCommandWith(runner, {
+      socket: "s", session: "x", command: "/model claude-bogus-99",
+      settleMs: 50, timeoutMs: 2000, successPattern, errorPattern,
+    });
+    expect(r.outcome).toBe("ok");
+    expect(r.output).toContain("not found");
+  });
+
+  it("WITHOUT a successPattern the legacy settle break captures the banner (the bug this fixes)", async () => {
+    // Same script, no pattern → legacy path breaks at settleMs on the first
+    // change and captures the banner, never reaching the confirmation. This
+    // pins the behavioural difference the opt-in param introduces.
+    const runner = makeScriptedRunner([
+      BEFORE,
+      `${ECHO}\n${BANNER}\n`,
+      `${ECHO}\n${BANNER}\n`,
+      `${ECHO}\n${BANNER}\n${CONFIRM}\n`,
+    ]);
+    const r = await injectSlashCommandWith(runner, {
+      socket: "s", session: "x", command: "/model fable",
+      settleMs: 20, timeoutMs: 2000,
+    });
+    expect(r.output).toContain("extending Claude Fable 5 access");
+    expect(r.output).not.toContain("Set model to Fable 5");
+  });
+
+  it("settleBeforeSendMs waits for a still pane before typing (symptom 2 clean-prompt guard)", async () => {
+    // Pane is animating (distinct captures) then settles; keys must be sent only
+    // after two equal captures. We assert the send happened (not skipped) and the
+    // confirmation is still captured afterwards.
+    const runner = makeScriptedRunner([
+      "animating-1\n",
+      "animating-2\n",
+      "❯ \n",       // settle loop: consecutive equal idle frames → break
+      "❯ \n",
+      "❯ \n",       // `before` capture (idle) + first signal poll
+      "❯ \n",
+      `${ECHO}\n${CONFIRM}\n`, // confirmation lands after send
+    ]);
+    const r = await injectSlashCommandWith(runner, {
+      socket: "s", session: "x", command: "/model fable",
+      settleMs: 50, timeoutMs: 2000, successPattern, errorPattern,
+      settleBeforeSendMs: 500,
+    });
+    expect(runner.sent).toContainEqual(["send-keys", "-l", "/model fable"]);
+    expect(runner.sent).toContainEqual(["send-keys", "Enter"]);
+    expect(r.output).toContain("Set model to Fable 5");
+  });
+});
+
 describe("injectSlashCommand (default runner — validation only)", () => {
   it("rejects blocked commands before touching tmux", async () => {
     await expect(injectSlashCommand("any", "/login")).rejects.toMatchObject({

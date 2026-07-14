@@ -200,6 +200,57 @@ describe("handleModelCommand — show / help never inject (picker-wedge guard)",
   });
 });
 
+describe("handleModelCommand — set — #3241 poll-until-signal wiring", () => {
+  it("forwards successPattern + errorPattern + settleBeforeSendMs to the inject primitive", async () => {
+    const seen: Array<{ command: string; opts: unknown }> = [];
+    const { deps } = makeDeps({
+      inject: async (_agent, command, opts) => {
+        seen.push({ command, opts });
+        return okResult("⏺ Set model to Sonnet 5 for this session");
+      },
+    });
+    await handleModelCommand({ kind: "set", model: "sonnet" }, deps);
+    expect(seen).toHaveLength(1);
+    const opts = seen[0].opts as {
+      successPattern?: RegExp;
+      errorPattern?: RegExp;
+      settleBeforeSendMs?: number;
+    };
+    // A success pattern that matches claude's confirmation line, an error pattern
+    // that matches the "not found" line, and a clean-prompt pre-send wait.
+    expect(opts.successPattern?.test("⏺ Set model to Sonnet 5")).toBe(true);
+    expect(opts.errorPattern?.test("⎿  Model 'x' not found")).toBe(true);
+    expect(typeof opts.settleBeforeSendMs).toBe("number");
+    expect(opts.settleBeforeSendMs).toBeGreaterThan(0);
+  });
+
+  it("confirmation that lands after a banner → records the live model for /status", async () => {
+    // The inject primitive (poll-until-signal) is responsible for returning the
+    // confirmation and not the banner; here the handler receives that confirmation
+    // and must record it as the session override.
+    const { deps } = makeDeps({
+      inject: async () =>
+        okResult("⠋ extending Claude Fable 5 access…\n⎿  Set model to Fable 5 for this session"),
+    });
+    const reply = await handleModelCommand({ kind: "set", model: "fable" }, deps);
+    expect(reply.selectedModel).toBe("Fable 5");
+    expect(reply.optimistic).toBeUndefined();
+    expect(reply.text).toContain("Set model to Fable 5");
+    // The banner is scrollback and must not leak as prose above the confirmation.
+    expect(reply.text).not.toContain("extending Claude Fable 5 access");
+  });
+
+  it("scraped error line → failure verdict AND no override recorded (retract)", async () => {
+    const { deps } = makeDeps({
+      inject: async () => okResult("⎿  Model 'claude-bogus-99' not found"),
+    });
+    const reply = await handleModelCommand({ kind: "set", model: "claude-bogus-99" }, deps);
+    expect(reply.text).toContain("did not take");
+    expect(reply.selectedModel).toBeUndefined();
+    expect(reply.optimistic).toBeUndefined();
+  });
+});
+
 describe("handleModelCommand — set", () => {
   it("injects exactly `/model <name>` once and relays a genuine confirmation + persistence note", async () => {
     const { deps, calls } = makeDeps();
@@ -228,13 +279,17 @@ describe("handleModelCommand — set", () => {
     expect(reply.text).not.toContain("summary you asked for");
     expect(reply.text).not.toContain("rollback plan");
     expect(reply.text).not.toContain("<pre>");
-    // No confirmation line was captured, so the switch is UNVERIFIED — report it
-    // honestly (never a false "switched") and record NO session override.
+    // #3241 part B — poll-until-signal already waited the full window, so a
+    // missing confirmation line with NO scraped error is a SILENT switch, not a
+    // failure. Record the requested model optimistically so /status is right,
+    // and say so honestly (no false "switched (session)", no scrollback leak).
     expect(reply.text).toContain("/model fable");
-    expect(reply.text).toContain("couldn't confirm the switch");
+    expect(reply.text).toContain("Recorded");
+    expect(reply.text).toContain("couldn't read claude");
     expect(reply.text).toContain("/status");
     expect(reply.text).not.toContain("switched (session)");
-    expect(reply.selectedModel).toBeUndefined();
+    expect(reply.selectedModel).toBe("fable");
+    expect(reply.optimistic).toBe(true);
     expect(reply.html).toBe(true);
   });
 
@@ -260,15 +315,17 @@ describe("handleModelCommand — set", () => {
     const { deps } = makeDeps({ inject: async () => okResult(prose) });
     const reply = await handleModelCommand({ kind: "set", model: "fable" }, deps);
     // The anchored regex rejects all three lines, so nothing leaks and there is
-    // no <pre> block. With no confirmation captured, the switch is UNVERIFIED —
-    // report it honestly, never a false "switched".
+    // no <pre> block. No confirmation AND no scraped error → #3241 optimistic
+    // record: the switch is reported as sent + recorded, never a false
+    // "switched", and no scrollback prose leaks.
     expect(reply.text).not.toContain("<pre>");
     expect(reply.text).not.toContain("switched the deploy");
     expect(reply.text).not.toContain("set model behaviour");
     expect(reply.text).not.toContain("kept model changes");
-    expect(reply.text).toContain("couldn't confirm the switch");
+    expect(reply.text).toContain("Recorded");
     expect(reply.text).not.toContain("switched (session)");
-    expect(reply.selectedModel).toBeUndefined();
+    expect(reply.selectedModel).toBe("fable");
+    expect(reply.optimistic).toBe(true);
     expect(reply.html).toBe(true);
   });
 
@@ -290,7 +347,13 @@ describe("handleModelCommand — set", () => {
       }),
     });
     const reply = await handleModelCommand({ kind: "set", model: "sonnet" }, deps);
-    expect(reply.text).toContain("no response captured");
+    // #3241 part B — an empty capture can't carry an error line, so the send is
+    // treated as a silent switch and the requested model is recorded
+    // optimistically (was: "no response captured", recorded nothing).
+    expect(reply.text).toContain("Recorded");
+    expect(reply.text).toContain("/status");
+    expect(reply.selectedModel).toBe("sonnet");
+    expect(reply.optimistic).toBe(true);
   });
 
   it("session_missing failure surfaces the tmux-supervisor hint", async () => {
@@ -475,9 +538,12 @@ describe("handleModelCommand — busy gate + honest unverified reporting", () =>
     const reply = await handleModelCommand({ kind: "set", model: "opus" }, deps);
     expect(reply.text).not.toContain("did not take");
     expect(reply.text).not.toContain("model not found");
-    // No confirmation either → honest unverified message, nothing recorded.
-    expect(reply.text).toContain("couldn't confirm the switch");
-    expect(reply.selectedModel).toBeUndefined();
+    // No LINE-ANCHORED error and no confirmation → #3241 optimistic record: the
+    // mid-sentence "model not found" prose does NOT flip the switch to a failure,
+    // and the requested model is recorded (was: "couldn't confirm", nothing).
+    expect(reply.text).toContain("Recorded");
+    expect(reply.selectedModel).toBe("opus");
+    expect(reply.optimistic).toBe(true);
   });
 
   it("recognises claude v2.1.205's real arg-form confirmation (⎿ glyph + 'and saved as your default')", async () => {

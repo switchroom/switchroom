@@ -24,7 +24,7 @@
  * unit-testable without booting the bot.
  */
 
-import type { InjectResult } from '../../src/agents/inject.js'
+import type { InjectResult, InjectOpts } from '../../src/agents/inject.js'
 import {
   labelTag,
   type DiscoverResult,
@@ -185,8 +185,17 @@ export function modelCommandReceiptLine(
 }
 
 export interface ModelCommandDeps {
-  /** Inject primitive — wired to injectSlashCommand in the gateway. */
-  inject: (agent: string, command: string) => Promise<InjectResult>
+  /**
+   * Inject primitive — wired to injectSlashCommand in the gateway. The optional
+   * third argument forwards the #3241 poll-until-signal opts (successPattern /
+   * errorPattern / settleBeforeSendMs); the set path passes them so the `/model`
+   * confirmation scrape is deterministic instead of racing a fixed window.
+   */
+  inject: (
+    agent: string,
+    command: string,
+    opts?: Pick<InjectOpts, 'successPattern' | 'errorPattern' | 'settleBeforeSendMs'>,
+  ) => Promise<InjectResult>
   /**
    * True while the agent is mid-turn. A typed `/model <name>` switch drives
    * claude's session (either an inject into the input box, or a carrier-backed
@@ -248,6 +257,17 @@ export interface ModelCommandReply {
    * lies to `/status`.
    */
   selectedModel?: string
+  /**
+   * True when `selectedModel` was recorded OPTIMISTICALLY (#3241 part B): the
+   * inject SEND succeeded and NO explicit error line was scraped, but claude's
+   * confirmation line was not read either. Poll-until-signal already waited the
+   * full window, so a missing line means a silent switch (or a confirmation
+   * that scrolled off) — NOT a failure — and we record the requested model so
+   * `/status` is right. The switch is retracted (no `selectedModel`) only when
+   * an error line IS scraped. Purely a wording hint; the gateway records
+   * `selectedModel` the same way whether confirmed or optimistic.
+   */
+  optimistic?: boolean
 }
 
 const PERSIST_NOTE =
@@ -379,7 +399,18 @@ export async function handleModelCommand(
   const verbHtml = `\`/model ${deps.escapeHtml(model)}\``
   let result: InjectResult
   try {
-    result = await deps.inject(deps.getAgentName(), `/model ${model}`)
+    // #3241 part A — poll-until-signal. Hand the inject primitive the exact
+    // confirmation / error line shapes so its capture loop keeps polling until
+    // claude's "Set model to …" (or an error) actually lands, instead of
+    // breaking at a fixed settle window on the first pane change (which the
+    // async access banner tripped, capturing the banner and missing the
+    // confirmation). settleBeforeSendMs waits for a clean prompt so the keys
+    // aren't typed into a still-animating pane (symptom 2's silent no-op).
+    result = await deps.inject(deps.getAgentName(), `/model ${model}`, {
+      successPattern: MODEL_SWITCH_CONFIRMATION_PREFIX,
+      errorPattern: MODEL_SWITCH_ERROR_RE,
+      settleBeforeSendMs: 1500,
+    })
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     return {
@@ -388,21 +419,25 @@ export async function handleModelCommand(
     }
   }
 
-  if (result.outcome === 'ok') {
-    // claude's `/model <name>` either prints a "Set model to X" acknowledgement
-    // or switches SILENTLY (no line). `result.output` on the silent path is just
-    // whatever pane scrollback sat below the command echo (the agent's previous
-    // prose answer) — NOT a confirmation. We MUST NOT claim success on that
-    // scrollback, and we must never dump it back as a code block (screenshot-
+  if (result.outcome === 'ok' || result.outcome === 'ok_no_output') {
+    // claude's `/model <name>` prints a "Set model to X" acknowledgement, an
+    // error line ("Model not found"), a "Kept model as X" no-op, or (rarely)
+    // switches with the confirmation scrolled off. `result.output` on a silent
+    // path is just pane scrollback (the agent's previous prose) — NEVER a
+    // confirmation, and it must not be dumped back as a code block (screenshot-
     // confirmed leak on klanker, v0.16.47).
     //
-    // Honest reporting: (1) if claude printed an error ("Model not found" /
-    // "Invalid model"), the switch FAILED — say so. (2) if an anchored
-    // confirmation line is present, the switch is verified — relay it and record
-    // the live model for /status. (3) otherwise we cannot positively verify the
-    // switch (silent success or nothing) — say "sent, but couldn't confirm" and
-    // record NOTHING, so /status is never lied to.
-    const errLine = modelSwitchErrorLine(result.output)
+    // Honest reporting (#3241 part B inverts the old "record nothing unless
+    // confirmed" to "record optimistically, retract only on a scraped error"):
+    //   (1) error line scraped → switch FAILED. Report it; record NOTHING
+    //       (the retract — /status keeps the prior model).
+    //   (2) "Kept model as X" → genuine no-op; report it, record NOTHING.
+    //   (3) confirmation line present → verified switch; relay it and record
+    //       the live model for /status.
+    //   (4) no line either way → poll-until-signal already waited the full
+    //       window, so this is a SILENT success, not a failure. Record the
+    //       requested model OPTIMISTICALLY so /status is right, and say so.
+    const errLine = result.outcome === 'ok' ? modelSwitchErrorLine(result.output) : null
     if (errLine) {
       return {
         text: [
@@ -413,8 +448,20 @@ export async function handleModelCommand(
         html: true,
       }
     }
-    const confirmation = modelSwitchConfirmationLine(result.output)
+    const confirmation = result.outcome === 'ok' ? modelSwitchConfirmationLine(result.output) : null
     if (confirmation) {
+      if (isKeptModelConfirmation(confirmation)) {
+        // "Kept model as X" — nothing changed. Relay it, record no override.
+        return {
+          text: [
+            `${verbHtml}`,
+            deps.preBlock(confirmation),
+            ...(result.truncated ? ['_truncated_'] : []),
+            PERSIST_NOTE,
+          ].join('\n'),
+          html: true,
+        }
+      }
       const confirmed = sessionModelFromConfirmation(confirmation) ?? model
       return {
         text: [
@@ -424,27 +471,18 @@ export async function handleModelCommand(
           PERSIST_NOTE,
         ].join('\n'),
         html: true,
-        // Only record when the confirmation carries a real switch (Set/Switched);
-        // a "Kept model as" line means no change — don't overwrite the override.
-        ...(isKeptModelConfirmation(confirmation) ? {} : { selectedModel: confirmed }),
+        selectedModel: confirmed,
       }
     }
+    // No confirmation and no error — optimistic record (#3241 part B).
     return {
       text: [
-        `${verbHtml} — sent, but couldn't confirm the switch — check \`/status\`.`,
+        `${verbHtml} — sent. Recorded \`${deps.escapeHtml(model)}\` as the live model, but couldn't read claude's confirmation line — check \`/status\`.`,
         PERSIST_NOTE,
       ].join('\n'),
       html: true,
-    }
-  }
-
-  if (result.outcome === 'ok_no_output') {
-    return {
-      text: [
-        `${verbHtml} — sent, but no response captured. The agent may be mid-turn; check \`/inject /status\` to confirm the active model.`,
-        PERSIST_NOTE,
-      ].join('\n'),
-      html: true,
+      selectedModel: model,
+      optimistic: true,
     }
   }
 
@@ -973,7 +1011,14 @@ export async function handleModelMenuCallback(
     }
     let aliasResult: InjectResult
     try {
-      aliasResult = await deps.inject(deps.getAgentName(), `/model ${alias}`)
+      // #3241 part A — same poll-until-signal + clean-prompt opts as the typed
+      // set path so the alias (e.g. Fable) confirmation scrape is deterministic
+      // and immune to the async access banner.
+      aliasResult = await deps.inject(deps.getAgentName(), `/model ${alias}`, {
+        successPattern: MODEL_SWITCH_CONFIRMATION_PREFIX,
+        errorPattern: MODEL_SWITCH_ERROR_RE,
+        settleBeforeSendMs: 1500,
+      })
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       return {
