@@ -19,6 +19,18 @@ function assistantToolUse(name: string): string {
 function enqueue(text: string): string {
   return JSON.stringify({ type: 'queue-operation', operation: 'enqueue', content: text })
 }
+/** A real inbound user message line (string content) — a turn separator the
+ *  projection kernel emits NO event for, unlike an `enqueue`. */
+function userMessage(text: string): string {
+  return JSON.stringify({ type: 'user', message: { role: 'user', content: text } })
+}
+/** A tool_result carrier user line — NOT a turn boundary. */
+function toolResult(toolUseId: string): string {
+  return JSON.stringify({
+    type: 'user',
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: toolUseId, content: 'ok' }] },
+  })
+}
 
 describe('projectTrailingAnswerFromTranscript', () => {
   it('recovers the trailing answer text after the last tool_use', () => {
@@ -68,6 +80,34 @@ describe('projectTrailingAnswerFromTranscript', () => {
     const r = projectTrailingAnswerFromTranscript(transcript)
     expect(r.text).toBe('')
     expect(r.trailingIsText).toBe(false)
+  })
+
+  // diff-review defect #2 — a real claude .jsonl separates turns with a plain
+  // `type:"user"` message line the kernel ignores, NOT always an interleaved
+  // enqueue queue-operation. Two turns with no intervening tool_use must not
+  // concatenate; only the LAST turn's trailing text is projected.
+  it('breaks turns on a plain user-message separator (no enqueue, no tool_use)', () => {
+    const transcript = [
+      userMessage('first question'),
+      assistantText('First answer.'),
+      userMessage('second question'),
+      assistantText('Second answer.'),
+    ].join('\n')
+    const r = projectTrailingAnswerFromTranscript(transcript)
+    expect(r.text).toBe('Second answer.')
+    expect(r.trailingIsText).toBe(true)
+  })
+
+  it('does NOT treat a tool_result user line as a turn boundary (answer still accretes)', () => {
+    const transcript = [
+      userMessage('do the thing'),
+      assistantToolUse('Bash'),
+      toolResult('toolu_x'),
+      assistantText('All done — the thing is done.'),
+    ].join('\n')
+    const r = projectTrailingAnswerFromTranscript(transcript)
+    expect(r.text).toBe('All done — the thing is done.')
+    expect(r.trailingIsText).toBe(true)
   })
 
   it('concatenates multiple trailing text blocks of the final answer', () => {
