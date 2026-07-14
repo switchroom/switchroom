@@ -14,6 +14,8 @@ import {
   getRecentOutboundCount,
   getLatestInboundMessageId,
   hasOutboundDeliveredSince,
+  hasOutboundWithText,
+  normalizeDeliveryText,
   _resetForTests,
 } from '../history.js'
 
@@ -870,5 +872,94 @@ describe('forwarded-message origin columns', () => {
     expect(stored).not.toContain(GH_PAT)
     expect(stored).toContain('[REDACTED')
     expect(stored).toContain('Bob') // surrounding name preserved
+  })
+})
+
+// ---------------------------------------------------------------------------
+// hasOutboundWithText — durable text-identity delivery oracle (crash-survival
+// redelivery). Keys on the ANSWER TEXT, not a chat+time window, so an interim
+// progress_update earlier in the same turn does NOT false-positive "delivered".
+// ---------------------------------------------------------------------------
+
+describe('hasOutboundWithText (durable text-identity oracle)', () => {
+  it('does NOT match an interim progress message against the (undelivered) final answer', () => {
+    initHistory(stateDir, 30)
+    // The turn sent only an interim progress_update; the real final answer was
+    // lost in the crash and never recorded. The time-windowed oracle would say
+    // "delivered" off the progress row — the text-identity oracle must not.
+    recordOutbound({
+      chat_id: '1', thread_id: null, message_ids: [10],
+      texts: ['on it — pulling yesterday’s GitHub activity'], ts: 200,
+    })
+    const finalAnswer = 'The deploy finished — all three services are green.'
+    expect(hasOutboundWithText('1', finalAnswer, null)).toBe(false)
+    // sanity: the coarse time-window oracle DOES false-positive here (this is
+    // exactly why we cannot use it as the redelivery gate).
+    expect(hasOutboundDeliveredSince('1', 100 * 1000, null, 1)).toBe(true)
+  })
+
+  it('matches when the final answer text was actually delivered', () => {
+    initHistory(stateDir, 30)
+    const finalAnswer = 'The deploy finished — all three services are green.'
+    recordOutbound({ chat_id: '1', thread_id: null, message_ids: [11], texts: [finalAnswer], ts: 300 })
+    expect(hasOutboundWithText('1', finalAnswer, null)).toBe(true)
+  })
+
+  it('matches a delivered chunk-1 against a longer projected answer (multi-chunk, no double-send)', () => {
+    initHistory(stateDir, 30)
+    const chunk1 = 'Part one of a long answer that was split across chunks.'
+    recordOutbound({ chat_id: '1', thread_id: null, message_ids: [12], texts: [chunk1], ts: 300 })
+    // The re-projected full answer starts with chunk-1 → treated as delivered.
+    expect(hasOutboundWithText('1', chunk1 + ' Part two continues here.', null)).toBe(true)
+  })
+
+  it('ignores whitespace/spacer differences via normalization', () => {
+    initHistory(stateDir, 30)
+    recordOutbound({ chat_id: '1', thread_id: null, message_ids: [13], texts: ['hello   world'], ts: 300 })
+    expect(hasOutboundWithText('1', 'hello world', null)).toBe(true)
+    expect(normalizeDeliveryText('hello   world')).toBe('hello world')
+  })
+
+  it('empty/whitespace text never matches', () => {
+    initHistory(stateDir, 30)
+    recordOutbound({ chat_id: '1', thread_id: null, message_ids: [14], texts: ['real'], ts: 300 })
+    expect(hasOutboundWithText('1', '   ', null)).toBe(false)
+  })
+
+  it('scopes by chat (a different chat does not satisfy the match)', () => {
+    initHistory(stateDir, 30)
+    recordOutbound({ chat_id: '1', thread_id: null, message_ids: [15], texts: ['scoped answer'], ts: 300 })
+    expect(hasOutboundWithText('2', 'scoped answer', null)).toBe(false)
+    expect(hasOutboundWithText('1', 'scoped answer', null)).toBe(true)
+  })
+
+  // diff-review defect #1 — a SHORT final answer must not false-positive-match an
+  // unrelated earlier row via the bidirectional-prefix rule (that would suppress a
+  // genuine redelivery = permanent silence). Short texts require full equality.
+  it('does NOT suppress a short answer that merely shares a prefix with an unrelated row', () => {
+    initHistory(stateDir, 30)
+    // An earlier turn delivered a longer line that starts with the short answer.
+    recordOutbound({ chat_id: '1', thread_id: null, message_ids: [20], texts: ['Done, deploying now.'], ts: 300 })
+    // The interrupted turn's real final answer was the short "Done." — never sent.
+    expect(hasOutboundWithText('1', 'Done.', null)).toBe(false)
+  })
+
+  it('still suppresses a short answer that was genuinely delivered (exact match)', () => {
+    initHistory(stateDir, 30)
+    recordOutbound({ chat_id: '1', thread_id: null, message_ids: [21], texts: ['Done.'], ts: 300 })
+    expect(hasOutboundWithText('1', 'Done.', null)).toBe(true)
+  })
+
+  // sinceMs scope: only rows delivered at/after the interrupted turn's started_at
+  // count, so an unrelated PRIOR turn's identical text can never suppress.
+  it('scopes by sinceMs (a prior-turn row before the floor does not match)', () => {
+    initHistory(stateDir, 30)
+    // Prior turn delivered this exact text at ts=200s.
+    recordOutbound({ chat_id: '1', thread_id: null, message_ids: [22], texts: ['repeated answer'], ts: 200 })
+    // Interrupted turn started at 250s (250_000 ms) — the prior row is out of scope.
+    expect(hasOutboundWithText('1', 'repeated answer', null, 250_000)).toBe(false)
+    // A row delivered within the turn window (ts=300s) does match.
+    recordOutbound({ chat_id: '1', thread_id: null, message_ids: [23], texts: ['repeated answer'], ts: 300 })
+    expect(hasOutboundWithText('1', 'repeated answer', null, 250_000)).toBe(true)
   })
 })

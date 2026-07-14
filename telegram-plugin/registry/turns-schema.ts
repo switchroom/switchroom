@@ -120,6 +120,26 @@ export interface Turn {
    * Null for turns that were never resumed.
    */
   resumed_at: number | null
+  /**
+   * The claude session id (the `<sessionId>.jsonl` transcript stem) that
+   * produced this turn's assistant output, stamped DURING the turn as soon as
+   * the first session event is observed (see `stampTurnSessionId`). Crash-
+   * survival redelivery uses this to resolve the EXACT transcript file for an
+   * interrupted turn, instead of `findActiveSessionFile`'s most-recent-mtime
+   * heuristic — which can shadow the new boot session's own transcript. Null
+   * until the turn produces its first session event (or for pre-migration rows).
+   */
+  session_id: string | null
+  /**
+   * Ms epoch at which the interrupted turn's captured-but-undelivered final
+   * answer was re-sent to the user at boot (crash-survival redelivery). This is
+   * the at-most-once ledger for redelivery — first-write-wins via
+   * `WHERE answer_redelivered_at IS NULL` (see `markAnswerRedelivered`). Kept on
+   * a SEPARATE marker from `resumed_at` because the two concerns have different
+   * correctness contracts (resume = at-most-once side-effect replay; redelivery
+   * = at-most-once answer send) and a turn can be both. Null until redelivered.
+   */
+  answer_redelivered_at: number | null
   created_at: number
   updated_at: number
 }
@@ -190,6 +210,15 @@ const PHASE3_MIGRATIONS = [
   `ALTER TABLE turns ADD COLUMN resumed_at INTEGER`,
 ]
 
+// Columns added for crash-survival redelivery. `session_id` pins the exact
+// transcript file for an interrupted turn (so redelivery never resolves the
+// wrong session via a most-recent-file heuristic); `answer_redelivered_at` is
+// the at-most-once redelivery ledger (stamped synchronously with the re-send).
+const PHASE4_MIGRATIONS = [
+  `ALTER TABLE turns ADD COLUMN session_id TEXT`,
+  `ALTER TABLE turns ADD COLUMN answer_redelivered_at INTEGER`,
+]
+
 function applySchema(db: SqliteDatabase): void {
   db.exec('PRAGMA journal_mode = WAL')
   db.exec('PRAGMA synchronous = NORMAL')
@@ -206,7 +235,7 @@ function applySchema(db: SqliteDatabase): void {
   // Run migrations. SQLite doesn't support "ADD COLUMN IF NOT EXISTS", so
   // we swallow the "duplicate column" error to stay idempotent on
   // pre-existing registry.db files.
-  for (const sql of [...PHASE1_MIGRATIONS, ...PHASE2_MIGRATIONS, ...PHASE3_MIGRATIONS]) {
+  for (const sql of [...PHASE1_MIGRATIONS, ...PHASE2_MIGRATIONS, ...PHASE3_MIGRATIONS, ...PHASE4_MIGRATIONS]) {
     try {
       db.exec(sql)
     } catch (err) {
@@ -283,6 +312,8 @@ interface RawTurnRow {
   tool_call_count: number | null
   interrupt_reason: string | null
   resumed_at: number | null
+  session_id: string | null
+  answer_redelivered_at: number | null
   created_at: number
   updated_at: number
 }
@@ -304,6 +335,8 @@ function mapRow(row: RawTurnRow): Turn {
     tool_call_count: row.tool_call_count,
     interrupt_reason: row.interrupt_reason,
     resumed_at: row.resumed_at,
+    session_id: row.session_id ?? null,
+    answer_redelivered_at: row.answer_redelivered_at ?? null,
     created_at: row.created_at,
     updated_at: row.updated_at,
   }
@@ -689,6 +722,61 @@ export function markTurnResumed(
     SET resumed_at = ?,
         updated_at = ?
     WHERE turn_key = ? AND resumed_at IS NULL
+  `).run(now, now, turnKey)
+}
+
+/**
+ * Stamp the claude `session_id` (the `<sessionId>.jsonl` transcript stem) on a
+ * turn the FIRST time it is observed, DURING the turn. First-write-wins via
+ * `WHERE session_id IS NULL` so the hot session-event path can call this on
+ * every event cheaply and idempotently. This must run while the turn is live
+ * (before any crash) so crash-survival redelivery can resolve the exact
+ * transcript file for an interrupted turn — never the most-recent-mtime file,
+ * which a fresh boot session would shadow. No-ops if `turnKey` is not found.
+ */
+export function stampTurnSessionId(
+  db: SqliteDatabase,
+  turnKey: string,
+  sessionId: string,
+  now: number = Date.now(),
+): void {
+  if (!sessionId) return
+  db.prepare(`
+    UPDATE turns
+    SET session_id = ?,
+        updated_at = ?
+    WHERE turn_key = ? AND session_id IS NULL
+  `).run(sessionId, now, turnKey)
+}
+
+/**
+ * Stamp `answer_redelivered_at` on an interrupted turn at the moment its
+ * captured-but-undelivered final answer has been re-sent at boot (crash-
+ * survival redelivery). This is the at-most-once ledger for redelivery: once
+ * stamped, the redelivery decision skips the turn on any later restart.
+ *
+ * Ordering: the caller stamps SYNCHRONOUSLY with the send (immediately after
+ * the send resolves), the same discipline as `markTurnResumed`. A residual
+ * race remains — the window between the Telegram send completing and this row
+ * (plus the send's own `role='assistant'` history row) becoming durable. A
+ * crash landing in that window could re-send on the next boot; the durable
+ * text-identity delivery oracle (matching the projected answer text against
+ * delivered `messages` rows) is what CATCHES that duplicate, so redelivery is
+ * at-most-once modulo detection, never a silent double-send of a fresh answer.
+ *
+ * Idempotent and first-write-wins (`WHERE answer_redelivered_at IS NULL`).
+ * No-ops if `turnKey` is not found.
+ */
+export function markAnswerRedelivered(
+  db: SqliteDatabase,
+  turnKey: string,
+  now: number = Date.now(),
+): void {
+  db.prepare(`
+    UPDATE turns
+    SET answer_redelivered_at = ?,
+        updated_at            = ?
+    WHERE turn_key = ? AND answer_redelivered_at IS NULL
   `).run(now, now, turnKey)
 }
 

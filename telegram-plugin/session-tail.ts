@@ -303,6 +303,108 @@ export function assistantLineCarriesAnswerSurface(
   return false
 }
 
+export interface TrailingAnswer {
+  /** Concatenated trailing assistant text of the last turn (after the last
+   *  tool_use / turn boundary). Empty when there is none to redeliver. */
+  text: string
+  /** True iff the last content-bearing event of the transcript was text — i.e.
+   *  the turn ended on an answer, not a dangling tool_use (mid-stream). Bounds
+   *  the preamble-vs-final ambiguity for crash-survival redelivery. */
+  trailingIsText: boolean
+}
+
+/**
+ * Re-project the TRAILING assistant answer of the last turn from a claude
+ * session transcript's full text. Pure — reuses the same `projectTranscriptLine`
+ * kernel the live tail uses, so it inherits the `isApiErrorMessage` suppression
+ * (a usage-limit error line is NEVER resurfaced as an answer) and the empty-block
+ * drop. Used by crash-survival redelivery to recover the finished-but-never-sent
+ * answer from disk after a pre-flush crash.
+ *
+ * Semantics: walk the event stream in order; the "answer buffer" accumulates
+ * `text` events and is RESET by any `tool_use` (the answer-so-far was a preamble
+ * to a tool call) or by a turn boundary. What remains at end-of-file is the
+ * trailing answer of the last turn. `trailingIsText` is true only when the final
+ * content-bearing event was that text (not a tool_use), so a turn killed mid-tool
+ * never redelivers a stale preamble as an answer.
+ *
+ * TURN BOUNDARY (diff-review defect #2). A boundary is BOTH an `enqueue`
+ * queue-operation AND a real `type:"user"` message line. The kernel
+ * (`projectTranscriptLine`) emits nothing for a plain user text line — it only
+ * projects `tool_result` blocks out of `type:"user"` — so relying on `enqueue`
+ * alone would let two turns separated by a plain user line (no intervening
+ * tool_use) CONCATENATE. `isRealUserTurnBoundary` detects that separator
+ * directly so only the LAST turn's trailing text is projected.
+ */
+export function projectTrailingAnswerFromTranscript(transcriptText: string): TrailingAnswer {
+  const buf: string[] = []
+  let lastMeaningful: 'text' | 'tool_use' | null = null
+  for (const rawLine of transcriptText.split('\n')) {
+    const line = rawLine.trim()
+    if (!line) continue
+    if (isRealUserTurnBoundary(line)) {
+      // A real user message opens a new turn — discard any prior turn's tail.
+      buf.length = 0
+      lastMeaningful = null
+      continue
+    }
+    for (const ev of projectTranscriptLine(line)) {
+      if (ev.kind === 'enqueue') {
+        // New inbound turn — any prior turn's trailing text is not this turn's.
+        buf.length = 0
+        lastMeaningful = null
+      } else if (ev.kind === 'tool_use') {
+        buf.length = 0
+        lastMeaningful = 'tool_use'
+      } else if (ev.kind === 'text') {
+        const t = (ev as { text?: string }).text ?? ''
+        if (t.trim().length > 0) {
+          buf.push(t)
+          lastMeaningful = 'text'
+        }
+      }
+      // thinking / model / dequeue / tool_result etc. do not affect the answer.
+    }
+  }
+  const text = buf.join('').trim()
+  return { text, trailingIsText: lastMeaningful === 'text' && text.length > 0 }
+}
+
+/**
+ * Detect a real inbound-user turn separator in a claude session JSONL.
+ *
+ * A `type:"user"` line is EITHER a genuine user message (its `message.content`
+ * is a string, or an array carrying a `{type:"text"}` block) OR a tool_result
+ * carrier (`message.content` is an array of `{type:"tool_result"}` blocks only).
+ * Only the former opens a new turn. The main projection kernel emits NO event
+ * for a genuine user text line (it projects tool_result blocks only), so the
+ * trailing-answer projector needs this to break turns that are separated by a
+ * plain user line rather than an interleaved `enqueue` queue-operation. Pure.
+ */
+export function isRealUserTurnBoundary(line: string): boolean {
+  let obj: Record<string, unknown>
+  try {
+    obj = JSON.parse(line)
+  } catch {
+    return false
+  }
+  if (obj.type !== 'user') return false
+  const message = obj.message as Record<string, unknown> | undefined
+  const content = message?.content
+  if (typeof content === 'string') return content.trim().length > 0
+  if (Array.isArray(content)) {
+    // A genuine user message carries a text block; a tool_result carrier does
+    // not. Presence of any text block ⇒ real user turn.
+    for (const c of content) {
+      if (typeof c === 'object' && c != null && (c as Record<string, unknown>).type === 'text') {
+        const t = String((c as Record<string, unknown>).text ?? '')
+        if (t.trim().length > 0) return true
+      }
+    }
+  }
+  return false
+}
+
 /**
  * Project a single transcript line into a SessionEvent (or null if it's
  * uninteresting noise). Caller is responsible for the JSON parse — if a

@@ -20,6 +20,8 @@ import {
   markOrphanedWithTimeoutClassification,
   findLatestTurnIfInterrupted,
   markTurnResumed,
+  markAnswerRedelivered,
+  stampTurnSessionId,
   getTurnByKey,
 } from '../registry/turns-schema.js'
 
@@ -571,6 +573,55 @@ describe('markTurnResumed', () => {
   it('no-ops for an unknown turn_key', () => {
     const db = openTurnsDbInMemory()
     expect(() => markTurnResumed(db, 'nope:1')).not.toThrow()
+    db.close()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// stampTurnSessionId + markAnswerRedelivered — crash-survival redelivery
+// ---------------------------------------------------------------------------
+
+describe('stampTurnSessionId', () => {
+  it('pins the session id on the turn (first-write-wins) and defaults null', () => {
+    const db = openTurnsDbInMemory()
+    recordTurnStart(db, { turnKey: 'sx:1', chatId: 'sx' })
+    expect(getTurnByKey(db, 'sx:1')!.session_id).toBeNull()
+    stampTurnSessionId(db, 'sx:1', 'sess-abc')
+    expect(getTurnByKey(db, 'sx:1')!.session_id).toBe('sess-abc')
+    // first-write-wins: a later different session id does not overwrite
+    stampTurnSessionId(db, 'sx:1', 'sess-def')
+    expect(getTurnByKey(db, 'sx:1')!.session_id).toBe('sess-abc')
+    db.close()
+  })
+
+  it('ignores an empty session id and no-ops on unknown key', () => {
+    const db = openTurnsDbInMemory()
+    recordTurnStart(db, { turnKey: 'sx:2', chatId: 'sx' })
+    stampTurnSessionId(db, 'sx:2', '')
+    expect(getTurnByKey(db, 'sx:2')!.session_id).toBeNull()
+    expect(() => stampTurnSessionId(db, 'nope', 'x')).not.toThrow()
+    db.close()
+  })
+})
+
+describe('markAnswerRedelivered', () => {
+  it('stamps answer_redelivered_at (first-write-wins) on a SEPARATE marker from resumed_at', () => {
+    const db = openTurnsDbInMemory()
+    recordTurnStart(db, { turnKey: 'rd:1', chatId: 'rd' })
+    recordTurnEnd(db, { turnKey: 'rd:1', endedVia: 'restart' })
+    expect(getTurnByKey(db, 'rd:1')!.answer_redelivered_at).toBeNull()
+    markAnswerRedelivered(db, 'rd:1', 1_700_000_000_000)
+    expect(getTurnByKey(db, 'rd:1')!.answer_redelivered_at).toBe(1_700_000_000_000)
+    // does not touch resumed_at — the two ledgers are independent
+    expect(getTurnByKey(db, 'rd:1')!.resumed_at).toBeNull()
+    markAnswerRedelivered(db, 'rd:1', 1_800_000_000_000)
+    expect(getTurnByKey(db, 'rd:1')!.answer_redelivered_at).toBe(1_700_000_000_000)
+    db.close()
+  })
+
+  it('no-ops for an unknown turn_key', () => {
+    const db = openTurnsDbInMemory()
+    expect(() => markAnswerRedelivered(db, 'nope:1')).not.toThrow()
     db.close()
   })
 })

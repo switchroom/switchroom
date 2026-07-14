@@ -740,6 +740,124 @@ export function hasOutboundDeliveredSince(
   }
 }
 
+/**
+ * DURABLE text-identity delivery oracle for crash-survival redelivery.
+ *
+ * Returns true iff a substantive outbound (`role='assistant'`) row whose text
+ * matches `text` has been delivered to `chatId` (and optionally `threadId`).
+ * Unlike `hasOutboundDeliveredSince`, this keys on the ANSWER TEXT itself, not
+ * a chat+time window — so an interim `progress_update` ("on it…") or a streamed
+ * partial chunk sent earlier in the same turn does NOT false-positive as "the
+ * final answer was delivered" (the exact MISS bug that would otherwise suppress
+ * a genuinely-undelivered final answer and re-open the permanent-silence hole).
+ *
+ * Matching is on the NORMALIZED first chunk (see `normalizeDeliveryText`): a
+ * multi-chunk answer's chunk-1 is compared against delivered rows so a crash
+ * after chunk-1 is detected as delivered (avoids double-sending chunk-1). Both
+ * sides are normalized identically. Empty/whitespace text never matches.
+ *
+ * Durable (reads committed SQLite), survives restart — unlike the in-memory
+ * `outboundDedup` ring, whose window is destroyed by the crash.
+ *
+ * SCOPING (crash-redelivery diff-review defect #1). Two guards keep a match from
+ * being over-broad and suppressing a genuine redelivery (a MISS = permanent
+ * silence):
+ *   1. `sinceMs` — when provided (the interrupted turn's `started_at`), only
+ *      rows delivered AT/AFTER that instant are considered, so an UNRELATED
+ *      earlier turn's message can never satisfy the match. This is the primary
+ *      scope: a redelivery candidate only cares whether THIS turn's own answer
+ *      already went out.
+ *   2. Short-text exactness — the bidirectional-prefix rule (which lets a
+ *      delivered multi-chunk chunk-1 satisfy a longer projected answer) is only
+ *      applied when the shorter side is at least `MIN_PREFIX_MATCH_CHARS`. For a
+ *      SHORT final answer (e.g. "Done.") a prefix match against a longer row
+ *      ("Done, deploying now.") would false-positive; short texts therefore
+ *      require full normalized EQUALITY. Real answer chunks are far longer than
+ *      the floor, so multi-chunk detection is unaffected.
+ *
+ * Falls back to false (safe: never suppresses a needed redelivery) if history
+ * is not initialised or the query fails — the `answer_redelivered_at` marker is
+ * the second guard against a double-send in that degraded case.
+ */
+export function hasOutboundWithText(
+  chatId: string,
+  text: string,
+  threadId?: number | null,
+  sinceMs?: number,
+): boolean {
+  const needle = normalizeDeliveryText(text)
+  if (needle.length === 0) return false
+  try {
+    // Compare on the normalized prefix so trailing-whitespace / spacer
+    // differences between the rendered outbound and the re-projected answer do
+    // not defeat the match. We fetch candidate assistant rows and normalize in
+    // JS (SQLite lacks the same normalize) — bounded by chat/thread scope.
+    const params: unknown[] = [chatId]
+    let sql = "SELECT text FROM messages WHERE chat_id = ? AND role = 'assistant'"
+    if (threadId !== undefined) {
+      if (threadId === null) {
+        sql += ' AND thread_id IS NULL'
+      } else {
+        sql += ' AND thread_id = ?'
+        params.push(threadId)
+      }
+    }
+    if (sinceMs != null && Number.isFinite(sinceMs)) {
+      // history `ts` is unix SECONDS (recordOutbound); started_at is wall-clock
+      // ms. Scope out any prior turn's rows so an unrelated earlier message can
+      // never satisfy the match.
+      sql += ' AND ts >= ?'
+      params.push(Math.floor(sinceMs / 1000))
+    }
+    // Newest first: a redelivery candidate's match is almost always recent.
+    sql += ' ORDER BY ts DESC LIMIT 500'
+    const rows = requireDb()
+      .prepare(sql)
+      .all(...(params as [unknown, ...unknown[]])) as { text: string | null }[]
+    for (const r of rows) {
+      const hay = normalizeDeliveryText(r.text ?? '')
+      if (hay.length === 0) continue
+      if (deliveryTextMatch(hay, needle)) return true
+    }
+    return false
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Normalize outbound text for durable text-identity delivery matching. Collapses
+ * all whitespace runs to single spaces and trims — so paragraph-spacer / render
+ * differences between a stored outbound and a re-projected transcript answer do
+ * not defeat an otherwise-identical match. Pure; shared by the redelivery path.
+ */
+export function normalizeDeliveryText(text: string): string {
+  return text.replace(/\s+/g, ' ').trim()
+}
+
+/**
+ * Minimum length (of the SHORTER side) at which the bidirectional-prefix rule is
+ * allowed. Below this, a delivery match requires full normalized equality — so a
+ * short final answer can't be falsely suppressed by an unrelated longer row that
+ * merely shares a prefix. Real answer chunks (chunk-1 of a multi-chunk send) are
+ * far longer than this floor, so multi-chunk detection is unaffected.
+ */
+export const MIN_PREFIX_MATCH_CHARS = 40
+
+/**
+ * Text-identity match for the delivery oracle. Exact normalized equality always
+ * matches. The bidirectional-prefix relaxation (which lets a delivered chunk-1
+ * satisfy a longer projected answer, and vice-versa) applies ONLY when the
+ * shorter side is at least `MIN_PREFIX_MATCH_CHARS` — otherwise a short answer
+ * would false-positive against any longer row sharing its prefix. Pure.
+ */
+export function deliveryTextMatch(hay: string, needle: string): boolean {
+  if (hay === needle) return true
+  const shorter = Math.min(hay.length, needle.length)
+  if (shorter < MIN_PREFIX_MATCH_CHARS) return false
+  return hay.startsWith(needle) || needle.startsWith(hay)
+}
+
 export function query(opts: QueryOptions): RecordedMessage[] {
   const limit = Math.min(MAX_LIMIT, Math.max(1, opts.limit ?? DEFAULT_LIMIT))
   const params: unknown[] = [opts.chat_id]

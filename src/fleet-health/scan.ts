@@ -43,6 +43,9 @@ export interface ScanOptions {
   now?: Date;
   windowDays?: number;
   log?: (msg: string) => void;
+  /** Override the silent-no-op windowing floor (unix seconds). Defaults to
+   *  `SILENT_NOOP_FLOOR_TS`. Exposed for tests / future re-baselining. */
+  silentNoopFloorTs?: number;
 }
 
 export interface ScanResult {
@@ -123,7 +126,9 @@ export function runScan(opts: ScanOptions = {}): ScanResult {
       continue;
     }
     try {
-      const res = scanAgent(agent, turnsText, gwText);
+      const res = scanAgent(agent, turnsText, gwText, {
+        silentNoopFloorTs: opts.silentNoopFloorTs,
+      });
       perAgent.push(res);
       findings.push(...res.findings);
       scanned++;
