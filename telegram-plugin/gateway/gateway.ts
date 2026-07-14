@@ -243,7 +243,11 @@ import { isFinalAnswerReply, isSubstantiveFinalReply, FINAL_ANSWER_MIN_CHARS } f
 import { deriveTurnRole, decideTerminalReason, parsePostAnswerLivenessMs, evaluatePostAnswerLiveness, type LoopRole } from '../turn-liveness-floor.js'
 import { createAnswerStream, type AnswerStreamHandle } from '../answer-stream.js'
 import { parseVisibleAnswerStreamEnabled, resolveAnswerLaneConfig } from '../answer-stream-flag.js'
-import { type SessionEvent } from '../session-tail.js'
+import {
+  type SessionEvent,
+  projectTrailingAnswerFromTranscript,
+  getProjectsDirForCwd,
+} from '../session-tail.js'
 import {
   shouldSuppressToolActivity,
 } from '../pty-tail.js'
@@ -303,6 +307,7 @@ import {
   checkpointWal as checkpointHistoryWal,
   pruneMessagesOlderThanDays,
   hasOutboundDeliveredSince,
+  hasOutboundWithText,
 } from '../history.js'
 import {
   runRegistryReaper,
@@ -352,6 +357,7 @@ const REPLY_TO_TEXT_MAX = 200
 // tests exercise the real string — see PR #2892.
 import { splitMarkdownChunks, repairEscapedWhitespace, normalizeParagraphBreaks, addParagraphSpacers, normalizePunctuation, stripExcessBold, escapeMarkdown, hardenCardBreaks, RICH_MESSAGE_MAX_CHARS } from '../format.js'
 import { richMessage } from '../rich-send.js'
+import { decideRedeliver } from './redelivery-decision.js'
 import { scrubVoice } from '../text-voice-scrub.js'
 import {
   normalizeOutboundBody,
@@ -833,8 +839,10 @@ import {
   findRecentTurnsForChat,
   getTurnByKey,
   markTurnResumed,
+  markAnswerRedelivered,
   stampTurnSessionId,
   reapStaleOpenTurns,
+  type Turn,
 } from '../registry/turns-schema.js'
 import {
   buildResumeInterruptedInbound,
@@ -1695,6 +1703,13 @@ let turnsDb: ReturnType<typeof openTurnsDb> | null = null
 // Stashed here; pushed to the spool once it's constructed below. The spool's
 // turn_key-keyed dedup makes a re-stash across multiple restarts a no-op.
 let bootResumeInbound: { agent: string; msg: InboundMessage } | null = null
+// Crash-survival redelivery candidate, captured during the boot-resume block
+// (module init, BEFORE the Telegram client connects) and consumed by
+// `maybeRedeliverUndeliveredAnswer` in the one-time-setup block AFTER
+// `bot.api.getMe()` succeeds — so the framed recovered-answer send is sequenced
+// after the client is ready, never fired mid module-init. `null` when there is
+// no interrupted turn to consider.
+let pendingRedelivery: { turn: Turn; maxAgeMs: number } | null = null
 // #3038 cross-boot damper: consecutive bridge-dead escalations by PRIOR
 // boots (the consumed marker's `count`; 0 when no fresh marker). Set in
 // the boot block below, consumed by the watchdog constructor further down.
@@ -1817,6 +1832,25 @@ try {
       const v = Number(process.env.SWITCHROOM_RESUME_MAX_AGE_MS)
       return Number.isFinite(v) && v > 0 ? v : 10_800_000 // 3h
     })()
+
+    // Crash-survival redelivery (deterministic, zero-token): capture THIS
+    // interrupted turn as a redelivery candidate. The actual re-project + framed
+    // send happens later, AFTER the Telegram client connects (see
+    // `maybeRedeliverUndeliveredAnswer`, fired from the one-time-setup block).
+    // Gated on the same `pending` as the resume synthetic but a SEPARATE concern:
+    // resume re-runs the model on unfinished work; redelivery just re-sends the
+    // finished answer the model already produced and the crash swallowed. Only a
+    // turn with a durably-stamped `session_id` (pinned live via the session-event
+    // path) is eligible — without it we cannot resolve the EXACT transcript, and
+    // a most-recent-mtime heuristic could shadow a fresh boot session's file.
+    if (pending.session_id) {
+      pendingRedelivery = { turn: pending, maxAgeMs: RESUME_MAX_AGE_MS }
+    } else {
+      process.stderr.write(
+        `telegram gateway: crash-redelivery skipped — interrupted turnKey=${pending.turn_key} has no ` +
+        `pinned session_id (pre-feature turn or no session event seen); cannot resolve exact transcript\n`,
+      )
+    }
 
     // Decide the inbound kind (pure — see decideBootResumeKind). Precedence:
     //   1. loop-guard  → 'defer-loop'       (never a second resume of a resume)
@@ -10460,6 +10494,150 @@ async function deliverCapturedProse(args: {
         )
       })
     }
+  }
+}
+
+/**
+ * Crash-survival redelivery — the LIVE boot send (deterministic, zero model
+ * tokens). Consumes the `pendingRedelivery` candidate captured during module
+ * init and, if the interrupted turn's finished answer never reached the user,
+ * re-projects it from the durable transcript and sends it FRAMED as a recovered
+ * draft.
+ *
+ * ── Ordering guarantee (why this is NOT called during module init) ───────────
+ * The Telegram raw send (`bot.api.sendRichMessage`) requires a CONNECTED client.
+ * The boot-resume block that computes `pendingRedelivery` runs at module top,
+ * BEFORE `bot.api.getMe()` and the grammy runner start — sending there would
+ * fire against an unconnected client (or block the connect). So the candidate is
+ * only STASHED at module init; this function is invoked exactly once from the
+ * `didOneTimeSetup` block AFTER `getMe()` resolves — i.e. after the client is
+ * connected and ready. This sequencing is a code-path guarantee, not prompt
+ * discipline: the call site is unreachable until the poll loop has authenticated.
+ *
+ * ── Invariants honored ──────────────────────────────────────────────────────
+ * - at-most-once per interruption: the durable text-identity oracle
+ *   (`hasOutboundWithText`, scoped to this turn's `started_at`) skips when the
+ *   answer already went out, and `markAnswerRedelivered` is stamped SYNCHRONOUSLY
+ *   after the send resolves (first-write-wins). The send also writes its own
+ *   `role='assistant'` history row, so a re-restart before the marker commits is
+ *   still caught by the oracle (residual send→row race documented on the marker).
+ * - RESUME_MAX_AGE_MS (3h) staleness, empty-text, trailing-not-text, and
+ *   already-delivered/already-redelivered are all enforced by `decideRedeliver`.
+ * - isApiErrorMessage lines are suppressed at the projector (never resurfaced).
+ * - only trailing TEXT after the last tool_use is redelivered (mid-tool preamble
+ *   is refused by `trailingIsText`).
+ */
+async function maybeRedeliverUndeliveredAnswer(): Promise<void> {
+  const candidate = pendingRedelivery
+  pendingRedelivery = null // consume once, regardless of outcome
+  if (candidate == null || turnsDb == null) return
+  const { turn, maxAgeMs } = candidate
+  const sessionId = turn.session_id
+  if (!sessionId) return
+
+  // Resolve the EXACT transcript from the pinned session id (never a
+  // most-recent-mtime scan, which a fresh boot session's file could shadow).
+  let transcriptText: string
+  try {
+    const projectsDir = getProjectsDirForCwd()
+    const path = join(projectsDir, `${sessionId}.jsonl`)
+    if (!existsSync(path)) {
+      process.stderr.write(
+        `telegram gateway: crash-redelivery — transcript not found for turnKey=${turn.turn_key} ` +
+        `session=${sessionId} (${path}); skipping\n`,
+      )
+      return
+    }
+    transcriptText = readFileSync(path, 'utf8')
+  } catch (err) {
+    process.stderr.write(
+      `telegram gateway: crash-redelivery — transcript read failed turnKey=${turn.turn_key}: ${(err as Error).message}\n`,
+    )
+    return
+  }
+
+  const projected = projectTrailingAnswerFromTranscript(transcriptText)
+  const threadIdNum =
+    turn.thread_id != null && turn.thread_id !== '' ? Number(turn.thread_id) : undefined
+  const threadIdForOracle: number | null = threadIdNum != null && Number.isFinite(threadIdNum) ? threadIdNum : null
+
+  const decision = decideRedeliver({
+    capturedText: projected.text,
+    trailingIsText: projected.trailingIsText,
+    // Durable text-identity oracle, scoped to THIS turn's window (`started_at`)
+    // so an unrelated earlier turn's message can never false-positive-suppress.
+    hasDeliveredText: HISTORY_ENABLED
+      ? hasOutboundWithText(turn.chat_id, projected.text, threadIdForOracle, turn.started_at)
+      : false,
+    alreadyRedelivered: turn.answer_redelivered_at != null,
+    ageMs: Math.max(0, Date.now() - turn.started_at),
+    maxAgeMs,
+  })
+
+  if (!decision.redeliver || decision.framedText == null) {
+    process.stderr.write(
+      `telegram gateway: crash-redelivery skipped turnKey=${turn.turn_key} reason=${decision.skipReason ?? 'unknown'}\n`,
+    )
+    return
+  }
+
+  const chatId = turn.chat_id
+  const out = redactOutboundText(decision.framedText, 'crash_redelivery')
+  const chunks = splitMarkdownChunks(out, RICH_MESSAGE_MAX_CHARS)
+  const sentIds: number[] = []
+  try {
+    let liveThreadId: number | undefined = threadIdNum != null && Number.isFinite(threadIdNum) ? threadIdNum : undefined
+    for (const c of chunks) {
+      const sent = await retryWithThreadFallback(
+        robustApiCall,
+        (tid) => {
+          // Built as a variable (not an inline literal) so excess-property
+          // checks don't reject `link_preview_options` on sendRichMessage's
+          // narrow Other<> type — mirrors the captured-prose / turn-flush sites.
+          const opts = {
+            link_preview_options: { is_disabled: true },
+            ...(tid != null ? { message_thread_id: tid } : {}),
+          }
+          return bot.api.sendRichMessage(chatId, richMessage(c), opts)
+        },
+        { threadId: liveThreadId, chat_id: chatId, verb: 'crash-redelivery.sendMessage' },
+      )
+      if (liveThreadId != null && (sent as { message_thread_id?: number }).message_thread_id == null) {
+        liveThreadId = undefined
+      }
+      sentIds.push(sent.message_id)
+    }
+    // Record the send as a real assistant delivery so the durable oracle catches
+    // a duplicate if we crash before the marker commits (self-idempotent).
+    if (HISTORY_ENABLED && sentIds.length > 0) {
+      try {
+        recordOutbound({
+          chat_id: chatId,
+          thread_id: threadIdForOracle,
+          message_ids: sentIds,
+          texts: chunks,
+        })
+      } catch {}
+    }
+    // Stamp the at-most-once marker SYNCHRONOUSLY after the send resolves.
+    try {
+      markAnswerRedelivered(turnsDb, turn.turn_key)
+    } catch (err) {
+      process.stderr.write(
+        `telegram gateway: crash-redelivery markAnswerRedelivered failed turnKey=${turn.turn_key}: ${(err as Error).message}\n`,
+      )
+    }
+    process.stderr.write(
+      `telegram gateway: crash-redelivery — delivered recovered answer (${out.length} chars, ` +
+      `${chunks.length} chunk(s)) for turnKey=${turn.turn_key} chat=${chatId}\n`,
+    )
+  } catch (err) {
+    // Send failed — leave the marker UNSTAMPED so a later restart retries rather
+    // than silently dropping the recovered answer.
+    process.stderr.write(
+      `telegram gateway: crash-redelivery send failed turnKey=${turn.turn_key}: ${(err as Error).message} ` +
+      `— left un-stamped for a later retry\n`,
+    )
   }
 }
 
@@ -29868,6 +30046,19 @@ void (async () => {
             `telegram gateway: blocked-approval boot reconcile failed: ${(err as Error).message}\n`,
           )
         }
+
+        // Crash-survival redelivery — LIVE boot send. Now that `bot.api.getMe()`
+        // has resolved (the Telegram client is connected and authenticated), it
+        // is safe to fire the framed recovered-answer send for an interrupted
+        // turn whose finished answer the crash swallowed. Fire-and-forget: it is
+        // self-contained, must not block the rest of one-time setup, and is a
+        // no-op when there is no eligible candidate. See
+        // `maybeRedeliverUndeliveredAnswer` for the ordering guarantee + invariants.
+        void maybeRedeliverUndeliveredAnswer().catch((err) => {
+          process.stderr.write(
+            `telegram gateway: crash-redelivery boot send errored: ${(err as Error).message}\n`,
+          )
+        })
 
         // Boot-time pin sweep
         try {
