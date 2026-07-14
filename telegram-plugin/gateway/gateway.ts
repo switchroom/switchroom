@@ -400,7 +400,12 @@ import {
 import {
   decideTurnFlush,
   isTurnFlushSafetyEnabled,
+  FLUSH_SUBSTANTIVE_MIN_CHARS,
 } from '../turn-flush-safety.js'
+import {
+  resolveReplyOwnerTurnId,
+  decideAnswerLatchSuppression,
+} from '../reply-owner-resolve.js'
 // PR A — deterministic answer-ready quiescence flush (late-delivery fix).
 import {
   AnswerReadyFlushController,
@@ -3126,6 +3131,18 @@ type CurrentTurn = {
   // false ONLY at turn start, mirroring `activityEverOpened`'s sticky-true
   // contract.
   finalAnswerEverDelivered: boolean
+  // 2026-07 double-reply-on-DM fix (Part 2 — race backstop). Set true
+  // SYNCHRONOUSLY at turn-flush FIRE time (before the ~500 ms async send and
+  // before `flushedTurnSupersede.record`) when the flush delivers a SUBSTANTIVE
+  // (≥`FLUSH_SUBSTANTIVE_MIN_CHARS`) terminal answer, and also set when a
+  // substantive `reply` sends. It persists on the ended turn in
+  // `recentTurnsById`, so a LATE reply landing in the flush's post-fire
+  // pre-record race window (where `flushedTurnSupersede` finds no record to
+  // delete yet) resolves this turn via the unified owner resolver, sees the
+  // latch already set, and suppresses itself — closing the residual window Part
+  // 1's supersede cannot reach. Scoped to the substantive floor so an interim
+  // sub-floor ack NEITHER sets nor trips it. Reset false at turn start.
+  answerDelivered: boolean
   // #1675 (over-ping safety net): wall-clock ms of the first reply
   // this turn that landed with `disable_notification: false` (a real
   // device ping). The conversational-pacing contract
@@ -3628,6 +3645,46 @@ function findLatestEndedTurnForChat(chatId: string): CurrentTurn | null {
     if (t.sessionChatId === chatId) latest = t
   }
   return latest
+}
+
+/**
+ * 2026-07 double-reply-on-DM fix (Part 1). Resolve the turn that OWNS a landing
+ * reply using the SAME full chain the thread-router uses, so the supersede
+ * resolver can never again diverge from routing (the exact bug: supersede
+ * omitted the quoted-message and latest-ended recoveries, so a DM late reply —
+ * no live turn, no `origin_turn_id` — resolved to a null owner and its flush
+ * message was never superseded → duplicate).
+ *
+ * Precedence (first non-null wins), delegated to the pure
+ * `resolveReplyOwnerTurnId` so the exact precedence is unit-tested:
+ *   1. the live `currentTurn` passed in (null once the flush nulled the atom);
+ *   2. `findTurnByOriginId(origin_turn_id)` — the model echo;
+ *   3. `findTurnByQuotedMessageId(chat_id, reply_to)` — framework-owned quote;
+ *   4. `findLatestEndedTurnForChat(chat_id)` — the chat's last-ended turn.
+ * Returns the CurrentTurn for the winning id (so callers can read its
+ * `answerDelivered` latch), or null when every lookup missed.
+ */
+function resolveReplyOwnerTurn(
+  liveTurn: CurrentTurn | null,
+  chatId: string,
+  args: Record<string, unknown>,
+): CurrentTurn | null {
+  const origin = findTurnByOriginId(args.origin_turn_id as string | undefined)
+  const quoted = findTurnByQuotedMessageId(chatId, args.reply_to)
+  const latestEnded = findLatestEndedTurnForChat(chatId)
+  const byId = new Map<string, CurrentTurn>()
+  // Populate lowest-precedence first so a higher tier's turn wins the id slot
+  // when two lookups resolve the same turn (they carry the same turnId anyway).
+  for (const t of [latestEnded, quoted, origin, liveTurn]) {
+    if (t != null) byId.set(t.turnId, t)
+  }
+  const winnerId = resolveReplyOwnerTurnId({
+    liveTurnId: liveTurn?.turnId ?? null,
+    originTurnId: origin?.turnId ?? null,
+    quotedTurnId: quoted?.turnId ?? null,
+    latestEndedTurnId: latestEnded?.turnId ?? null,
+  })
+  return winnerId != null ? (byId.get(winnerId) ?? null) : null
 }
 
 /**
@@ -12947,17 +13004,21 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // so a fresh turn's answer is never clobbered.
   {
     const replyThreadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
-    // Resolve the turnId this reply belongs to by IDENTITY, not just the live
-    // `currentTurn`. A late reply lands with `currentTurn == null` (silence poke
-    // cleared it — Bug D) or with a transiently-cleared currentTurn while its own
-    // turn is really still the owner (LOW-1); in both cases the turn is still
-    // resolvable from the `origin_turn_id` nonce the model echoes back (Tier 2 —
-    // the same last-known-turn resolver the chat-routing / obligation code uses).
-    // Passing this resolved turnId means supersede matches the flushed record by
-    // identity instead of falling back to a null-liveTurnId branch that would
-    // otherwise be free to delete a DIFFERENT turn's legitimate message.
-    const resolvedTurnId =
-      turn?.turnId ?? findTurnByOriginId(args.origin_turn_id as string | undefined)?.turnId ?? null
+    // 2026-07 double-reply-on-DM fix (Part 1) — resolve the turn this reply
+    // belongs to by IDENTITY, via the SAME full chain the thread-router uses
+    // (`resolveReplyOwnerTurn`): live `currentTurn`, then the model-echoed
+    // `origin_turn_id`, then the framework-owned quoted message id, then the
+    // chat's most-recently-ended turn. The prior chain stopped at
+    // `currentTurn ?? findTurnByOriginId`, so a DM late reply — `currentTurn`
+    // nulled by the flush's synthetic turn_end AND no `origin_turn_id` (a
+    // supergroup-only field) — resolved to a null owner. `decideSupersede`
+    // deliberately never lets a null live turn supersede a turnId-bearing flush
+    // record, so message A survived AND the reply shipped message B (the exact
+    // double-send). The quoted / latest-ended recoveries are precisely what the
+    // router already did for the same reply, so unifying here makes the two
+    // resolvers agree and the late-reply supersede fires by identity.
+    const ownerTurn = resolveReplyOwnerTurn(turn, chat_id, args)
+    const resolvedTurnId = ownerTurn?.turnId ?? null
     const decision = flushedTurnSupersede.take(
       chat_id,
       replyThreadId,
@@ -12973,6 +13034,46 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
           () => lockedBot.api.deleteMessage(chat_id, id),
           { chat_id, verb: 'reply.supersedeFlushed' },
         )
+      }
+    } else {
+      // 2026-07 double-reply-on-DM fix (Part 2) — answer-delivered race latch.
+      // Supersede found no record. Either there was no flush (normal reply), or
+      // the flush FIRED but has not yet recorded its message ids (the residual
+      // pre-record race Part 1's supersede cannot reach). The flush sets
+      // `answerDelivered = true` synchronously at fire time (before its async
+      // send AND before `record`), and it persists on the ended turn — so when
+      // this LATE, substantive reply resolves its owner turn and sees the latch
+      // already set, the flush's message A is already on its way out and this
+      // reply would ship a duplicate. Suppress it. Scoped to the substantive
+      // ≥`FLUSH_SUBSTANTIVE_MIN_CHARS` floor and the late-reply case so an
+      // interim sub-floor ack, a chunked multi-part answer, or a legitimate
+      // second in-turn substantive reply (live `currentTurn`) is never
+      // suppressed. `isSubstantiveFinalReply` reduces to the ≥200-char test on
+      // the `reply` path (no `done`); pass the model's original notification
+      // intent to mirror the #2533 decoupling call shape.
+      const replySubstantive = isSubstantiveFinalReply({
+        text: rawText,
+        disableNotification: args.disable_notification === true,
+      })
+      const suppressByLatch = decideAnswerLatchSuppression({
+        superseded: false,
+        replySubstantive,
+        isLateReply: turn == null,
+        ownerAnswerDelivered: ownerTurn?.answerDelivered ?? false,
+      })
+      if (suppressByLatch) {
+        process.stderr.write(
+          `telegram gateway: reply: suppressed by answer-delivered latch ` +
+          `(flush already delivered this turn's answer) chatId=${chat_id} ` +
+          `ownerTurnId=${JSON.stringify(resolvedTurnId)}\n`,
+        )
+        return { content: [{ type: 'text', text: 'sent (deduped — answer already delivered via turn-flush)' }] }
+      }
+      // A substantive answer is going out via this reply — set the latch on its
+      // owner turn so a later bridge-replayed / reworded duplicate of the same
+      // answer is caught by the branch above.
+      if (replySubstantive && ownerTurn != null) {
+        ownerTurn.answerDelivered = true
       }
     }
   }
@@ -16902,6 +17003,9 @@ function handleSessionEvent(ev: SessionEvent): void {
           finalAnswerSubstantive: false,
           // Sticky latch — reset ONLY here (turn start), never by reopen.
           finalAnswerEverDelivered: false,
+          // 2026-07 double-reply-on-DM fix (Part 2) — answer-delivered race
+          // latch, reset at turn start alongside the other answer flags.
+          answerDelivered: false,
           firstPingAt: null,
           // Notification ownership (R8 / PR-2): no slot claimed yet, so the
           // "claimer was substantive" flag starts false. Set atomically with
@@ -18135,6 +18239,20 @@ function handleSessionEvent(ev: SessionEvent): void {
         // the silent-end re-prompt. (Belt-and-braces, like the set above —
         // this branch returns before any further tool_label can arrive.)
         turn.finalAnswerSubstantive = true
+        // 2026-07 double-reply-on-DM fix (Part 2) — arm the answer-delivered
+        // race latch NOW, synchronously, BEFORE the ~500 ms async send below and
+        // BEFORE `flushedTurnSupersede.record`. A late reply that lands in the
+        // post-fire pre-record window resolves this turn (via the unified owner
+        // resolver, reading the atom preserved in `recentTurnsById`) and
+        // suppresses itself against this latch — closing the residual race Part
+        // 1's supersede cannot reach. Scoped to a SUBSTANTIVE terminal answer
+        // (the same ≥`FLUSH_SUBSTANTIVE_MIN_CHARS` floor the codebase uses to
+        // recognise a real answer) so a short flush never latches against a
+        // legitimate substantive reply. `capturedText` here is the selected,
+        // normalized flush delivery text.
+        if (capturedText.trim().length >= FLUSH_SUBSTANTIVE_MIN_CHARS) {
+          turn.answerDelivered = true
+        }
 
         // #654 deterministic double-message fix. Hand off the pinned
         // progress card BEFORE state reset so the driver doesn't keep
