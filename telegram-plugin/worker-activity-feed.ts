@@ -566,6 +566,22 @@ export interface WorkerActivityFeed {
    * stays visible. Idempotent; a no-op if the worker was never finalized.
    */
   resurrect(agentId: string): void
+  /**
+   * Boot / reconnect purge — reconcile the ENTIRE feed to empty and release
+   * EVERY group's pin, unconditionally.
+   *
+   * Why this is a hard invariant, not a TTL: every tracked worker row is a live
+   * sub-agent that was a CHILD PROCESS of the gateway. It cannot outlive a
+   * gateway restart, and it cannot survive a bridge reconnect that reconstructs
+   * the feed either — so any row still present when the feed is (re)initialised
+   * is definitionally dead. Left alone, the OLD feed instance's `wk:group:` pins
+   * are orphaned: the replacement feed is empty and never knew those groups, so
+   * it never unpins them (the reconnect-orphaned-pin leak — no full-boot pin
+   * sweep runs on a bare reconnect). This finalizes+removes every row and drives
+   * `reconcilePin(messageId: null)` for every group so the coalesced card is
+   * unpinned at once. Idempotent; a no-op on an already-empty feed.
+   */
+  purgeAllOnBoot(): void
   /** Clear the heartbeat interval (gateway shutdown). Idempotent. */
   stop(): void
   /** Manually fire one heartbeat tick (test hook). */
@@ -1310,6 +1326,27 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       if (wasFinalized || row != null) {
         log(`worker-feed: resurrect agent=${agentId} — cleared finalized gate; card will repaint on next running cue`)
       }
+    },
+    purgeAllOnBoot(): void {
+      for (const g of [...groups.values()]) {
+        // Release the group pin unconditionally: the shared card is orphaned
+        // after a restart/reconnect (its workers are dead child processes), so
+        // it must be unpinned regardless of `hasLiveWorker` — NOT gated like
+        // `syncPin`, which would keep the pin for a row we are about to drop.
+        if (g.messageId != null) {
+          reconcilePinFn({ feedKey: g.feedKey, chatId: g.chatId, threadId: g.threadId, messageId: null })
+        }
+        for (const agentId of [...g.workers.keys()]) {
+          // Latch finalized so a late/inflight cue on the OLD chain can't
+          // resurrect a row on a feed we are tearing down.
+          markFinalized(agentId)
+          agentIndex.delete(agentId)
+        }
+        g.workers.clear()
+        g.pendingFinalize.clear()
+        groups.delete(g.feedKey)
+      }
+      log('worker-feed: purgeAllOnBoot — reconciled feed to empty and released all group pins')
     },
     heartbeatTick,
     stop() {

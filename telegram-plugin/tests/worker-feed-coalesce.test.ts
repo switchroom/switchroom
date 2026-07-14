@@ -958,6 +958,55 @@ describe('worker-feed ghost-leak — deterministic terminal removal + backstop',
     expect(pins.at(-1)?.messageId).toBeNull()
   })
 
+  // ── Boot/reconnect purge (Ken's key ask) ───────────────────────────────────
+  // Every tracked row is a dead child sub-agent after a restart/reconnect. On a
+  // bare bridge reconnect the OLD feed's `wk:group:` pins are orphaned — the new
+  // empty feed never knew those groups, so it can never unpin them, and no full-
+  // boot pin sweep runs. `purgeAllOnBoot()` must reconcile the feed to empty AND
+  // release the pin unconditionally.
+  it('purgeAllOnBoot empties a restored running row + pinned card and UNPINS', async () => {
+    let t = 0
+    const { feed, pins } = ghostHarness({ now: () => t })
+    // A running worker with a live pinned card (the "restored at startup" state).
+    await feed.update('p', 'chat', view('task p', 'working', 0))
+    await drain()
+    expect(feed.size).toBe(1)
+    expect(pins.at(-1)?.messageId).not.toBeNull()
+
+    feed.purgeAllOnBoot()
+
+    // Feed reconciled to empty AND the coalesced card unpinned (messageId null).
+    expect(feed.size).toBe(0)
+    expect(pins.at(-1)?.messageId).toBeNull()
+
+    // A late cue on the torn-down feed must NOT resurrect a row (finalized gate).
+    t = 100
+    await feed.update('p', 'chat', view('task p', 'zombie tick', 100))
+    await drain()
+    expect(feed.size).toBe(0)
+  })
+
+  it('purgeAllOnBoot unpins EVERY group (multiple chats) and is a no-op when already empty', async () => {
+    let t = 0
+    const { feed, pins } = ghostHarness({ now: () => t })
+    await feed.update('g1', 'chatA', view('a', 's', 0))
+    await feed.update('g2', 'chatB', view('b', 's', 0))
+    await drain()
+    expect(feed.size).toBe(2)
+
+    const pinsBefore = pins.length
+    feed.purgeAllOnBoot()
+    expect(feed.size).toBe(0)
+    // Both groups emitted a final unpin (messageId null).
+    const unpinsAfter = pins.slice(pinsBefore).filter((p) => p.messageId === null)
+    expect(unpinsAfter.length).toBe(2)
+
+    // Idempotent: a second purge on an empty feed emits no further pin calls.
+    const afterFirst = pins.length
+    feed.purgeAllOnBoot()
+    expect(pins.length).toBe(afterFirst)
+  })
+
   it('no-op re-render is skipped (byte-identical body → no redundant edit)', async () => {
     let t = 0
     const { feed, edits } = ghostHarness({ now: () => t })
