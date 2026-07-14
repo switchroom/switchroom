@@ -768,7 +768,7 @@ describe('renderCombinedWorkerFeed (pure)', () => {
  * authoritative terminal sweep (`terminate`, driven by `onTerminalCleanup`)
  * PLUS a backstop TTL sweep. These assert the OUTCOMES, not the code paths.
  */
-function ghostHarness(opts: { staleWorkerTtlMs?: number; now: () => number }) {
+function ghostHarness(opts: { staleWorkerTtlMs?: number; absoluteRowLifetimeCapMs?: number; now: () => number }) {
   const edits: { messageId: number; text: string }[] = []
   const sends: { text: string }[] = []
   const pins: { messageId: number | null }[] = []
@@ -792,6 +792,7 @@ function ghostHarness(opts: { staleWorkerTtlMs?: number; now: () => number }) {
     setInterval: () => 0,
     clearInterval: () => {},
     staleWorkerTtlMs: opts.staleWorkerTtlMs,
+    absoluteRowLifetimeCapMs: opts.absoluteRowLifetimeCapMs,
     reconcilePin: ({ messageId }) => pins.push({ messageId }),
   })
   return { feed, edits, sends, pins }
@@ -889,6 +890,72 @@ describe('worker-feed ghost-leak — deterministic terminal removal + backstop',
     await drain()
     // Still tracked — the sweep only reaps rows silent PAST the TTL.
     expect(feed.size).toBe(1)
+  })
+
+  // ── ABSOLUTE row-lifetime cap (Carrie 5h zombie pin, v0.18.23) ──────────────
+  // The silence-keyed `staleWorkerTtlMs` backstop is defeated by a leaked row
+  // that never finishes AND keeps receiving `update()` cues every heartbeat:
+  // each cue resets `lastUpdateAt`, so the silence sweep can NEVER match and the
+  // pinned card lives forever (observed: 5h, re-edited 3000+ times). The
+  // absolute cap is anchored to the row's IMMUTABLE creation time, so it reaps
+  // the row regardless of how recently it updated.
+  it('ABSOLUTE cap reaps an immortal-but-UPDATING row that resets lastUpdateAt every tick, then unpins', async () => {
+    let t = 0
+    // Silence TTL huge (would never fire); absolute cap small. The row keeps
+    // updating just under the silence TTL each step, so ONLY the absolute cap
+    // (immune to the lastUpdateAt reset) can catch it.
+    const { feed, edits, pins } = ghostHarness({
+      staleWorkerTtlMs: 1_000_000,
+      absoluteRowLifetimeCapMs: 5000,
+      now: () => t,
+    })
+    await feed.update('z', 'chat', view('zombie task', 's0', 0))
+    await drain()
+    expect(feed.size).toBe(1)
+    expect(pins.at(-1)?.messageId).not.toBeNull()
+
+    // Drive continuous updates past the absolute cap — each resets lastUpdateAt,
+    // so the silence sweep stays defeated (exactly the Carrie failure mode).
+    for (let step = 1; step <= 8; step++) {
+      t = step * 1000
+      await feed.update('z', 'chat', view('zombie task', `s${step}`, t))
+      await drain()
+      feed.heartbeatTick()
+      await drain()
+    }
+    // The absolute cap (5s) has been crossed while the row kept updating →
+    // reaped despite the fresh cues, and the shared card UNPINNED.
+    expect(feed.size).toBe(0)
+    expect(pins.at(-1)?.messageId).toBeNull()
+
+    // Immortality closed for good: the finalized gate blocks a late cue from
+    // resurrecting the row, and further heartbeats produce no edits.
+    await feed.update('z', 'chat', view('zombie task', 's-late', t))
+    await drain()
+    expect(feed.size).toBe(0)
+    const after = edits.length
+    t += 10000
+    feed.heartbeatTick()
+    await drain()
+    expect(edits.length).toBe(after)
+  })
+
+  it('ABSOLUTE cap reaps a row past the cap even when the silence TTL would never fire', async () => {
+    let t = 0
+    const { feed, pins } = ghostHarness({
+      staleWorkerTtlMs: 1_000_000,
+      absoluteRowLifetimeCapMs: 5000,
+      now: () => t,
+    })
+    await feed.update('f', 'chat', view('task f', 's0', 0))
+    await drain()
+    expect(pins.at(-1)?.messageId).not.toBeNull()
+    // Past the absolute cap with no update at all — the age anchor alone reaps.
+    t = 6000
+    feed.heartbeatTick()
+    await drain()
+    expect(feed.size).toBe(0)
+    expect(pins.at(-1)?.messageId).toBeNull()
   })
 
   it('no-op re-render is skipped (byte-identical body → no redundant edit)', async () => {
