@@ -5,6 +5,7 @@ import {
   detectTurnFindings,
   detectGatewayFindings,
   HANG_MS,
+  SILENT_NOOP_FLOOR_TS,
 } from "./detect.js";
 
 /**
@@ -37,7 +38,28 @@ describe("parseTurns", () => {
 
 describe("detectTurnFindings", () => {
   it("flags a silent no-op (complete, zero tools, real turn)", () => {
+    // Fixture base ts (1_782_600_000 ≈ 2026-06-27) is BELOW the default
+    // SILENT_NOOP_FLOOR_TS (2026-07-13), so pass floor:0 to assert the detector
+    // LOGIC independent of the calendar window.
     const turns = parseTurns(turn(10, { tools: 0 }));
+    const f = detectTurnFindings("alpha", turns, { silentNoopFloorTs: 0 });
+    expect(f.map((x) => x.signal)).toContain("silent-no-op-candidate");
+  });
+
+  it("windows OUT a silent no-op whose ts is below the floor (Fix 2)", () => {
+    // Same complete/zero-tool turn, but under the default floor its 2026-06-27
+    // ts is pre-fix backlog → it must NOT be flagged.
+    const turns = parseTurns(turn(10, { tools: 0 }));
+    const f = detectTurnFindings("alpha", turns);
+    expect(f.map((x) => x.signal)).not.toContain("silent-no-op-candidate");
+  });
+
+  it("flags a silent no-op whose ts is AT/ABOVE the default floor (Fix 2)", () => {
+    // A post-fix turn (ts at the 2026-07-13 floor) is still a real signal — the
+    // windowing must not swallow go-forward silent no-ops.
+    const turns = parseTurns(
+      turn(10, { tools: 0, ts: SILENT_NOOP_FLOOR_TS + 100 }),
+    );
     const f = detectTurnFindings("alpha", turns);
     expect(f.map((x) => x.signal)).toContain("silent-no-op-candidate");
   });

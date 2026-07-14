@@ -20,6 +20,29 @@ export const HANG_MS = 360_000;
  *  tool calls is deep work. Load-bearing. */
 export const HANG_MAXTOOLS = 2;
 
+/**
+ * Silent-no-op windowing floor (unix SECONDS) = 2026-07-13T00:00:00Z, the
+ * fast-path ship epoch. The silent-no-op detector was over-counting a stale
+ * pre-fix backlog (2026-07-02..07-06). We window the `silent-no-op-candidate`
+ * finding — and ONLY that finding — to turns whose `ts` is at/after this floor,
+ * so the ledger reflects current reality instead of pre-fix inflation.
+ *
+ * FIXED epoch, not a rolling window: a rolling window would hide a genuine
+ * ongoing rate. This is param-injected into the detectors (never read from
+ * `Date.now()` internally) to keep the module a pure function over its inputs.
+ *
+ * Verify: `date -u -d @1783900800` → Mon Jul 13 00:00:00 UTC 2026.
+ */
+export const SILENT_NOOP_FLOOR_TS = 1_783_900_800;
+
+/** Options threaded into the turn detectors. Pure inputs only — no clock. */
+export interface DetectOptions {
+  /** Unix-seconds floor for the silent-no-op finding. Turns with `ts` below
+   *  this are NOT flagged as silent-no-ops. Defaults to `SILENT_NOOP_FLOOR_TS`.
+   *  Tests pass `0` to assert detector LOGIC independent of the calendar. */
+  silentNoopFloorTs?: number;
+}
+
 /** One row of `turns.jsonl` — the structured per-turn oracle. */
 export interface TurnRecord {
   ts?: number;
@@ -113,8 +136,13 @@ function isoFromTs(ts: number | undefined): string | null {
  * Run the turns.jsonl detectors over one agent's parsed turns. Pure — returns
  * the flagged findings. Mirrors the reference detector's three turn checks.
  */
-export function detectTurnFindings(agent: string, turns: TurnRecord[]): Finding[] {
+export function detectTurnFindings(
+  agent: string,
+  turns: TurnRecord[],
+  opts: DetectOptions = {},
+): Finding[] {
   const findings: Finding[] = [];
+  const silentNoopFloorTs = opts.silentNoopFloorTs ?? SILENT_NOOP_FLOOR_TS;
   for (const t of turns) {
     const tid = t.turn_id ?? "?";
     const st = t.status;
@@ -153,8 +181,17 @@ export function detectTurnFindings(agent: string, turns: TurnRecord[]): Finding[
         ts,
       });
     }
-    // silent no-op: completed, zero tools, real (non-synthetic).
-    if (st === "complete" && tl === 0 && !synthetic) {
+    // silent no-op: completed, zero tools, real (non-synthetic). Windowed to
+    // turns at/after the fixed floor so stale pre-fix backlog stops scoring.
+    // Rows lacking a `ts` are dropped from this finding (real gateway rows
+    // always carry `ts` — turn-record-status.ts writes it unconditionally).
+    if (
+      st === "complete" &&
+      tl === 0 &&
+      !synthetic &&
+      t.ts != null &&
+      t.ts >= silentNoopFloorTs
+    ) {
       findings.push({
         signal: "silent-no-op-candidate",
         agent,
@@ -230,6 +267,7 @@ export function scanAgent(
   agent: string,
   turnsText: string,
   gatewayText: string,
+  opts: DetectOptions = {},
 ): AgentScanResult {
   const turns = parseTurns(turnsText);
   const status_mix: Record<string, number> = {};
@@ -237,7 +275,7 @@ export function scanAgent(
     const st = t.status ?? "unknown";
     status_mix[st] = (status_mix[st] ?? 0) + 1;
   }
-  const turnFindings = detectTurnFindings(agent, turns);
+  const turnFindings = detectTurnFindings(agent, turns, opts);
   const { findings: gwFindings, gw_hits } = detectGatewayFindings(
     agent,
     gatewayText,
