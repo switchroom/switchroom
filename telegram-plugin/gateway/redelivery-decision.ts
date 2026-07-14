@@ -69,6 +69,49 @@ export interface RedeliverDecision {
 }
 
 /**
+ * Whether to CAPTURE an interrupted turn as a redelivery candidate at boot.
+ * This is the mutual-exclusion gate against the resume synthetic — decided
+ * BEFORE any transcript projection, purely from the boot-resume outcome.
+ */
+export interface RedeliverCaptureInput {
+  /**
+   * True iff the boot-resume path will RE-RUN this turn's work in a fresh
+   * session (bootResumeKind === 'resume'). A resumed turn emits a fresh answer
+   * that supersedes any recovered draft, so redelivering as well is a
+   * double-send. Every non-resume outcome (watchdog report, defer-suppressed,
+   * defer-loop, none) does NOT auto-re-answer, so redelivery is the correct and
+   * only recovery send there.
+   */
+  willBeResumed: boolean
+  /**
+   * True iff the interrupted turn has a durably-pinned `session_id`. Without it
+   * we cannot resolve the exact transcript to re-project, so we cannot redeliver.
+   */
+  hasSessionId: boolean
+}
+
+export type RedeliverCaptureSkip = 'will-be-resumed' | 'no-session-id'
+
+export interface RedeliverCaptureDecision {
+  capture: boolean
+  /** Present iff `capture` is false — why we declined to stage redelivery. */
+  skipReason?: RedeliverCaptureSkip
+}
+
+/**
+ * Decide whether to stage an interrupted turn for crash-survival redelivery.
+ * Pure: the mutual-exclusion rule with resume lives here so it is testable
+ * without booting a gateway. `will-be-resumed` takes precedence over the
+ * session-id check because a to-be-resumed turn must never redeliver even if it
+ * has a session_id — the fresh re-answer is the send.
+ */
+export function decideRedeliverCapture(input: RedeliverCaptureInput): RedeliverCaptureDecision {
+  if (input.willBeResumed) return { capture: false, skipReason: 'will-be-resumed' }
+  if (!input.hasSessionId) return { capture: false, skipReason: 'no-session-id' }
+  return { capture: true }
+}
+
+/**
  * Frame a captured draft for redelivery — a short recovered-draft preamble
  * above the model's own words. Pure; exported for the boot wiring + tests.
  */

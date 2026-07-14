@@ -357,7 +357,7 @@ const REPLY_TO_TEXT_MAX = 200
 // tests exercise the real string — see PR #2892.
 import { splitMarkdownChunks, repairEscapedWhitespace, normalizeParagraphBreaks, addParagraphSpacers, normalizePunctuation, stripExcessBold, escapeMarkdown, hardenCardBreaks, RICH_MESSAGE_MAX_CHARS } from '../format.js'
 import { richMessage } from '../rich-send.js'
-import { decideRedeliver } from './redelivery-decision.js'
+import { decideRedeliver, decideRedeliverCapture } from './redelivery-decision.js'
 import { scrubVoice } from '../text-voice-scrub.js'
 import {
   normalizeOutboundBody,
@@ -1833,25 +1833,6 @@ try {
       return Number.isFinite(v) && v > 0 ? v : 10_800_000 // 3h
     })()
 
-    // Crash-survival redelivery (deterministic, zero-token): capture THIS
-    // interrupted turn as a redelivery candidate. The actual re-project + framed
-    // send happens later, AFTER the Telegram client connects (see
-    // `maybeRedeliverUndeliveredAnswer`, fired from the one-time-setup block).
-    // Gated on the same `pending` as the resume synthetic but a SEPARATE concern:
-    // resume re-runs the model on unfinished work; redelivery just re-sends the
-    // finished answer the model already produced and the crash swallowed. Only a
-    // turn with a durably-stamped `session_id` (pinned live via the session-event
-    // path) is eligible — without it we cannot resolve the EXACT transcript, and
-    // a most-recent-mtime heuristic could shadow a fresh boot session's file.
-    if (pending.session_id) {
-      pendingRedelivery = { turn: pending, maxAgeMs: RESUME_MAX_AGE_MS }
-    } else {
-      process.stderr.write(
-        `telegram gateway: crash-redelivery skipped — interrupted turnKey=${pending.turn_key} has no ` +
-        `pinned session_id (pre-feature turn or no session event seen); cannot resolve exact transcript\n`,
-      )
-    }
-
     // Decide the inbound kind (pure — see decideBootResumeKind). Precedence:
     //   1. loop-guard  → 'defer-loop'       (never a second resume of a resume)
     //   2. suppressed  → 'defer-suppressed' (boot_resume: never; notice, not silence)
@@ -1862,6 +1843,50 @@ try {
       ageMs: Math.max(0, Date.now() - pending.started_at),
       maxAgeMs: RESUME_MAX_AGE_MS,
     })
+
+    // Crash-survival redelivery (deterministic, zero-token): capture THIS
+    // interrupted turn as a redelivery candidate. The actual re-project + framed
+    // send happens later, AFTER the Telegram client connects (see
+    // `maybeRedeliverUndeliveredAnswer`, fired from the one-time-setup block).
+    // Gated on the same `pending` as the resume synthetic but a SEPARATE concern:
+    // resume re-runs the model on unfinished work; redelivery just re-sends the
+    // finished answer the model already produced and the crash swallowed.
+    //
+    // MUTUAL EXCLUSION with resume (double-send guard): redelivery is captured
+    // ONLY when this turn will NOT be re-run by the resume path — i.e.
+    // `bootResumeKind !== 'resume'`. When the kind IS 'resume', the model re-runs
+    // the interrupted work and emits a FRESH answer that supersedes the recovered
+    // draft; redelivering as well would send the same answer twice (once framed
+    // "Recovered from an interrupted turn:", once fresh). The other kinds do NOT
+    // auto-re-answer, so redelivery is the correct (and only) send there:
+    //   - 'report'          (watchdog-timeout): synthetic only ASKS retry — no auto re-answer
+    //   - 'defer-suppressed' (boot_resume: never): no synthetic re-run at all
+    //   - 'defer-loop'       (resume-of-a-resume guard): no re-run
+    //   - 'none'             (nothing queued): redelivery is the sole recovery
+    // This gate is deterministic in code, not prompt-dependent.
+    //
+    // Eligibility floor: only a turn with a durably-stamped `session_id` (pinned
+    // live via the session-event path) qualifies — without it we cannot resolve
+    // the EXACT transcript, and a most-recent-mtime heuristic could shadow a
+    // fresh boot session's file. The mutual-exclusion-with-resume rule and this
+    // floor live together in the pure `decideRedeliverCapture` predicate.
+    const redeliverCapture = decideRedeliverCapture({
+      willBeResumed: bootResumeKind === 'resume',
+      hasSessionId: Boolean(pending.session_id),
+    })
+    if (redeliverCapture.capture) {
+      pendingRedelivery = { turn: pending, maxAgeMs: RESUME_MAX_AGE_MS }
+    } else if (redeliverCapture.skipReason === 'will-be-resumed') {
+      process.stderr.write(
+        `telegram gateway: crash-redelivery suppressed — interrupted turnKey=${pending.turn_key} will be ` +
+        `RESUMED (bootResumeKind=resume); the fresh re-answer supersedes the recovered draft (no double-send)\n`,
+      )
+    } else {
+      process.stderr.write(
+        `telegram gateway: crash-redelivery skipped — interrupted turnKey=${pending.turn_key} has no ` +
+        `pinned session_id (pre-feature turn or no session event seen); cannot resolve exact transcript\n`,
+      )
+    }
 
     // Sub-agents that were still in flight (running / stalled — non-terminal)
     // when the turn was killed. Read HERE, at module top, BEFORE the
