@@ -932,4 +932,34 @@ describe('hasOutboundWithText (durable text-identity oracle)', () => {
     expect(hasOutboundWithText('2', 'scoped answer', null)).toBe(false)
     expect(hasOutboundWithText('1', 'scoped answer', null)).toBe(true)
   })
+
+  // diff-review defect #1 — a SHORT final answer must not false-positive-match an
+  // unrelated earlier row via the bidirectional-prefix rule (that would suppress a
+  // genuine redelivery = permanent silence). Short texts require full equality.
+  it('does NOT suppress a short answer that merely shares a prefix with an unrelated row', () => {
+    initHistory(stateDir, 30)
+    // An earlier turn delivered a longer line that starts with the short answer.
+    recordOutbound({ chat_id: '1', thread_id: null, message_ids: [20], texts: ['Done, deploying now.'], ts: 300 })
+    // The interrupted turn's real final answer was the short "Done." — never sent.
+    expect(hasOutboundWithText('1', 'Done.', null)).toBe(false)
+  })
+
+  it('still suppresses a short answer that was genuinely delivered (exact match)', () => {
+    initHistory(stateDir, 30)
+    recordOutbound({ chat_id: '1', thread_id: null, message_ids: [21], texts: ['Done.'], ts: 300 })
+    expect(hasOutboundWithText('1', 'Done.', null)).toBe(true)
+  })
+
+  // sinceMs scope: only rows delivered at/after the interrupted turn's started_at
+  // count, so an unrelated PRIOR turn's identical text can never suppress.
+  it('scopes by sinceMs (a prior-turn row before the floor does not match)', () => {
+    initHistory(stateDir, 30)
+    // Prior turn delivered this exact text at ts=200s.
+    recordOutbound({ chat_id: '1', thread_id: null, message_ids: [22], texts: ['repeated answer'], ts: 200 })
+    // Interrupted turn started at 250s (250_000 ms) — the prior row is out of scope.
+    expect(hasOutboundWithText('1', 'repeated answer', null, 250_000)).toBe(false)
+    // A row delivered within the turn window (ts=300s) does match.
+    recordOutbound({ chat_id: '1', thread_id: null, message_ids: [23], texts: ['repeated answer'], ts: 300 })
+    expect(hasOutboundWithText('1', 'repeated answer', null, 250_000)).toBe(true)
+  })
 })

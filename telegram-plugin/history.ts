@@ -759,6 +759,22 @@ export function hasOutboundDeliveredSince(
  * Durable (reads committed SQLite), survives restart — unlike the in-memory
  * `outboundDedup` ring, whose window is destroyed by the crash.
  *
+ * SCOPING (crash-redelivery diff-review defect #1). Two guards keep a match from
+ * being over-broad and suppressing a genuine redelivery (a MISS = permanent
+ * silence):
+ *   1. `sinceMs` — when provided (the interrupted turn's `started_at`), only
+ *      rows delivered AT/AFTER that instant are considered, so an UNRELATED
+ *      earlier turn's message can never satisfy the match. This is the primary
+ *      scope: a redelivery candidate only cares whether THIS turn's own answer
+ *      already went out.
+ *   2. Short-text exactness — the bidirectional-prefix rule (which lets a
+ *      delivered multi-chunk chunk-1 satisfy a longer projected answer) is only
+ *      applied when the shorter side is at least `MIN_PREFIX_MATCH_CHARS`. For a
+ *      SHORT final answer (e.g. "Done.") a prefix match against a longer row
+ *      ("Done, deploying now.") would false-positive; short texts therefore
+ *      require full normalized EQUALITY. Real answer chunks are far longer than
+ *      the floor, so multi-chunk detection is unaffected.
+ *
  * Falls back to false (safe: never suppresses a needed redelivery) if history
  * is not initialised or the query fails — the `answer_redelivered_at` marker is
  * the second guard against a double-send in that degraded case.
@@ -767,6 +783,7 @@ export function hasOutboundWithText(
   chatId: string,
   text: string,
   threadId?: number | null,
+  sinceMs?: number,
 ): boolean {
   const needle = normalizeDeliveryText(text)
   if (needle.length === 0) return false
@@ -785,6 +802,13 @@ export function hasOutboundWithText(
         params.push(threadId)
       }
     }
+    if (sinceMs != null && Number.isFinite(sinceMs)) {
+      // history `ts` is unix SECONDS (recordOutbound); started_at is wall-clock
+      // ms. Scope out any prior turn's rows so an unrelated earlier message can
+      // never satisfy the match.
+      sql += ' AND ts >= ?'
+      params.push(Math.floor(sinceMs / 1000))
+    }
     // Newest first: a redelivery candidate's match is almost always recent.
     sql += ' ORDER BY ts DESC LIMIT 500'
     const rows = requireDb()
@@ -793,11 +817,7 @@ export function hasOutboundWithText(
     for (const r of rows) {
       const hay = normalizeDeliveryText(r.text ?? '')
       if (hay.length === 0) continue
-      // Match when the delivered row starts with the projected first chunk (or
-      // vice-versa) — a chunk-1 row satisfies a multi-chunk projected answer.
-      if (hay === needle || hay.startsWith(needle) || needle.startsWith(hay)) {
-        return true
-      }
+      if (deliveryTextMatch(hay, needle)) return true
     }
     return false
   } catch {
@@ -813,6 +833,29 @@ export function hasOutboundWithText(
  */
 export function normalizeDeliveryText(text: string): string {
   return text.replace(/\s+/g, ' ').trim()
+}
+
+/**
+ * Minimum length (of the SHORTER side) at which the bidirectional-prefix rule is
+ * allowed. Below this, a delivery match requires full normalized equality — so a
+ * short final answer can't be falsely suppressed by an unrelated longer row that
+ * merely shares a prefix. Real answer chunks (chunk-1 of a multi-chunk send) are
+ * far longer than this floor, so multi-chunk detection is unaffected.
+ */
+export const MIN_PREFIX_MATCH_CHARS = 40
+
+/**
+ * Text-identity match for the delivery oracle. Exact normalized equality always
+ * matches. The bidirectional-prefix relaxation (which lets a delivered chunk-1
+ * satisfy a longer projected answer, and vice-versa) applies ONLY when the
+ * shorter side is at least `MIN_PREFIX_MATCH_CHARS` — otherwise a short answer
+ * would false-positive against any longer row sharing its prefix. Pure.
+ */
+export function deliveryTextMatch(hay: string, needle: string): boolean {
+  if (hay === needle) return true
+  const shorter = Math.min(hay.length, needle.length)
+  if (shorter < MIN_PREFIX_MATCH_CHARS) return false
+  return hay.startsWith(needle) || needle.startsWith(hay)
 }
 
 export function query(opts: QueryOptions): RecordedMessage[] {
