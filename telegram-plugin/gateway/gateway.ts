@@ -2036,6 +2036,28 @@ const WORKER_FEED_FALLBACK_LOG_CAP = 256
  * slot, never a live-but-quiet worker. 5 min.
  */
 const WORKER_FEED_STALE_TTL_MARGIN_MS = 5 * 60_000
+/**
+ * Multiple of the watcher's in-flight terminal cap used to derive the worker-
+ * feed ABSOLUTE row-lifetime cap (`absoluteRowLifetimeCapMs`). Unlike the
+ * silence-keyed `staleWorkerTtlMs` backstop, the absolute cap is anchored to a
+ * row's immutable creation time, so it reaps an immortal card even when the row
+ * keeps receiving `update()` cues that reset `lastUpdateAt` every heartbeat
+ * (the Carrie 5h zombie-pin leak, re-edited 3000+ times, that the silence sweep
+ * could never match). At the 45-min default cap this yields a 3-hour absolute
+ * ceiling — comfortably above any legitimate single worker's lifetime, so it
+ * can only ever bite a genuine leak, while bounding a ghost card well UNDER the
+ * ~5h symptom Ken hit (the initial 8x/6h was too loose). Derived from the same
+ * base as `staleWorkerTtlMs` — the watcher's effective in-flight terminal cap
+ * (`resolveInflightTerminalCapMs()`: the `SWITCHROOM_SUBAGENT_INFLIGHT_TERMINAL_
+ * CAP_MS` env override, else the 45-min default) — never a bare magic number, so
+ * it tracks the env-level terminal-cap override in lockstep with the silence
+ * backstop. (Both this and `staleWorkerTtlMs` call `resolveInflightTerminalCapMs()`
+ * with NO arg, matching the watcher's OWN effective value here: the gateway does
+ * not pass a config-file `inflightTerminalCapMs` to `startSubagentWatcher`, so
+ * there is no config-file override to thread through — env + default is the
+ * complete override surface on this path.)
+ */
+const WORKER_FEED_ABSOLUTE_ROW_LIFETIME_CAP_MULTIPLE = 4
 const workerFeedOwnerDmFallbackLogged = new Set<string>()
 
 /**
@@ -30102,7 +30124,16 @@ void (async () => {
             // or the turn ended while it kept running — extended autonomous
             // work) is surfaced via the worker feed instead of vanishing.
             const orphanStatusEnabled = isOrphanSubagentStatusEnabled(process.env.SWITCHROOM_ORPHAN_SUBAGENT_STATUS)
-            workerActivityFeed?.stop()
+            // Boot/reconnect purge (Ken, PR #3239 review): every row in the
+            // OUTGOING feed is a dead child sub-agent, and its `wk:group:` pins
+            // would otherwise be orphaned — the replacement feed is empty and
+            // never knew those groups, so it can never unpin them, and no full-
+            // boot pin sweep runs on a bare bridge reconnect. Reconcile the old
+            // feed to empty and release all its group pins BEFORE stopping it.
+            if (workerActivityFeed != null) {
+              workerActivityFeed.purgeAllOnBoot()
+              workerActivityFeed.stop()
+            }
             workerActivityFeed = createWorkerActivityFeed({
               // #2669: worker-feed body is raw GFM markdown — send via rich.
               bot: {
@@ -30167,6 +30198,12 @@ void (async () => {
               // force-collapsing a row the terminal signals somehow never
               // removed.
               staleWorkerTtlMs: resolveInflightTerminalCapMs() + WORKER_FEED_STALE_TTL_MARGIN_MS,
+              // ABSOLUTE row-lifetime cap — anchored to a row's creation, immune
+              // to the `lastUpdateAt` reset that lets an immortal-but-updating
+              // row dodge `staleWorkerTtlMs` forever (Carrie 5h zombie pin).
+              // Derived from the same terminal cap so it tracks operator
+              // overrides; 4× → ~3h at the 45-min default.
+              absoluteRowLifetimeCapMs: resolveInflightTerminalCapMs() * WORKER_FEED_ABSOLUTE_ROW_LIFETIME_CAP_MULTIPLE,
               // #3207 review: GROUP-level status pin. Workers now coalesce into
               // ONE shared message, so the pin must follow the GROUP lifecycle,
               // not a single worker's — otherwise a sibling's finish unpins a

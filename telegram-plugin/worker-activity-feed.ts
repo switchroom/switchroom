@@ -299,6 +299,36 @@ export interface WorkerActivityFeedOpts {
    */
   staleWorkerTtlMs?: number
   /**
+   * ABSOLUTE row-lifetime cap (ms), measured from a row's creation — NOT from
+   * its last `update()`. The heartbeat force-terminates (and, when it was the
+   * last live worker, unpins) ANY row this old, whether or not it is marked
+   * finished and no matter how recently it updated.
+   *
+   * Why this exists AND is distinct from `staleWorkerTtlMs` (Carrie 5h zombie
+   * pin, v0.18.23): the `staleWorkerTtlMs` backstop is keyed off `lastUpdateAt`,
+   * so it only bites a row that goes SILENT. A leaked row that never transitions
+   * to finished AND keeps receiving `update()` cues every heartbeat (~6s) resets
+   * `lastUpdateAt` on every tick, so the silence sweep can NEVER match — the row
+   * (and its group pin) lives forever. This cap is immune to that reset: it is
+   * anchored to `createdAtMs` (immutable), so an immortal-but-updating row is
+   * still reaped past an absolute age. The primary fix (the watcher's
+   * `onTerminalCleanup` → `terminate` wiring) drives the clean path; this is the
+   * deterministic last-resort guarantee that no card can outlive the cap even if
+   * that signal is missed or the row is spuriously re-driven.
+   *
+   * The gateway DERIVES this from the watcher's effective in-flight terminal cap
+   * (`resolveInflightTerminalCapMs()`) times a multiple, matching the
+   * `staleWorkerTtlMs` derivation pattern (never a bare magic number). It is set
+   * comfortably above any legitimate single worker's lifetime so it can only
+   * bite a genuine leak; if a real long worker ever hit it, its cosmetic feed
+   * card collapses to `incomplete` and unpins — its actual result still reaches
+   * the user via the separate handback reply.
+   *
+   * Fallback default (this module, for direct / non-gateway callers) 6 h.
+   * Tests inject a small value.
+   */
+  absoluteRowLifetimeCapMs?: number
+  /**
    * Group-level status-pin reconcile hook (#3207 review). Because workers now
    * COALESCE into one shared message, the pin MUST follow the GROUP lifecycle,
    * not a single worker's: pin the shared message when a group's first worker
@@ -359,6 +389,19 @@ interface WorkerRow {
    * and on every `update()`.
    */
   lastUpdateAt: number
+  /**
+   * Wall-clock ms this row was first CREATED (its first `update()` cue).
+   * IMMUTABLE after creation — unlike `lastUpdateAt`, it is NEVER re-stamped by
+   * later updates. The heartbeat's ABSOLUTE row-lifetime cap force-terminates a
+   * row whose `createdAtMs` is older than `absoluteRowLifetimeCapMs` regardless
+   * of how recently it updated. This closes the immortal-card leak the
+   * `lastUpdateAt` backstop cannot: a row that keeps receiving `update()` cues
+   * (a zombie whose watcher entry re-registers, or any spurious re-drive) resets
+   * `lastUpdateAt` every tick, so the silence-TTL sweep NEVER fires — but the
+   * absolute cap is immune to that reset (Carrie 5h zombie pin, re-edited 3000+
+   * times, only cleared by the restart-time dm-pin-sweep).
+   */
+  createdAtMs: number
   /**
    * Wall-clock ms the CURRENT step started — stamped whenever a NEW narrative
    * line lands (the `→` line changes). The heartbeat's step suffix shows the
@@ -523,6 +566,22 @@ export interface WorkerActivityFeed {
    * stays visible. Idempotent; a no-op if the worker was never finalized.
    */
   resurrect(agentId: string): void
+  /**
+   * Boot / reconnect purge — reconcile the ENTIRE feed to empty and release
+   * EVERY group's pin, unconditionally.
+   *
+   * Why this is a hard invariant, not a TTL: every tracked worker row is a live
+   * sub-agent that was a CHILD PROCESS of the gateway. It cannot outlive a
+   * gateway restart, and it cannot survive a bridge reconnect that reconstructs
+   * the feed either — so any row still present when the feed is (re)initialised
+   * is definitionally dead. Left alone, the OLD feed instance's `wk:group:` pins
+   * are orphaned: the replacement feed is empty and never knew those groups, so
+   * it never unpins them (the reconnect-orphaned-pin leak — no full-boot pin
+   * sweep runs on a bare reconnect). This finalizes+removes every row and drives
+   * `reconcilePin(messageId: null)` for every group so the coalesced card is
+   * unpinned at once. Idempotent; a no-op on an already-empty feed.
+   */
+  purgeAllOnBoot(): void
   /** Clear the heartbeat interval (gateway shutdown). Idempotent. */
   stop(): void
   /** Manually fire one heartbeat tick (test hook). */
@@ -540,6 +599,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
   const heartbeatTickMs = opts.heartbeatTickMs ?? 6000
   const maxRows = Math.max(1, Math.floor(opts.maxRows ?? 8))
   const staleWorkerTtlMs = Math.max(1, Math.floor(opts.staleWorkerTtlMs ?? 50 * 60_000))
+  const absoluteRowLifetimeCapMs = Math.max(1, Math.floor(opts.absoluteRowLifetimeCapMs ?? 6 * 60 * 60_000))
   const reconcilePinFn = opts.reconcilePin ?? (() => {})
   const setIntervalFn =
     opts.setInterval ??
@@ -1016,14 +1076,29 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
     // `onTerminalCleanup` sweep. Collect the stale agent ids first (terminate
     // mutates the group's worker map), then terminate each through its chain so
     // the render/unpin happens under the normal cooldown/flood guards.
-    const staleAgentIds: string[] = []
-    const staleFinished: Array<{ g: FeedGroup; agentId: string }> = []
+    //
+    // TWO independent triggers, OR'd per row:
+    //   1. SILENCE TTL (`staleWorkerTtlMs`, keyed off `lastUpdateAt`) — a row
+    //      that stopped receiving cues.
+    //   2. ABSOLUTE row-lifetime cap (`absoluteRowLifetimeCapMs`, keyed off the
+    //      IMMUTABLE `createdAtMs`) — a row past an absolute age NO MATTER how
+    //      recently it updated. This is the durable guard against the immortal-
+    //      but-updating card the silence sweep can never catch: a leaked row
+    //      that keeps getting `update()` cues every heartbeat resets
+    //      `lastUpdateAt` forever, so only an age anchor immune to that reset can
+    //      reap it (Carrie 5h zombie pin, re-edited 3000+ times).
+    const staleAgentIds: Array<{ agentId: string; reason: 'silence' | 'absolute' }> = []
+    const staleFinished: Array<{ g: FeedGroup; agentId: string; reason: 'silence' | 'absolute' }> = []
     for (const g of groups.values()) {
       for (const row of g.workers.values()) {
-        if (now - row.lastUpdateAt >= staleWorkerTtlMs) {
-          if (row.finished) staleFinished.push({ g, agentId: row.agentId })
-          else staleAgentIds.push(row.agentId)
-        }
+        const silent = now - row.lastUpdateAt >= staleWorkerTtlMs
+        const tooOld = now - row.createdAtMs >= absoluteRowLifetimeCapMs
+        if (!silent && !tooOld) continue
+        // Attribute the reap to the absolute cap only when silence alone would
+        // NOT have fired — so the log names the trigger that actually caught it.
+        const reason: 'silence' | 'absolute' = silent ? 'silence' : 'absolute'
+        if (row.finished) staleFinished.push({ g, agentId: row.agentId, reason })
+        else staleAgentIds.push({ agentId: row.agentId, reason })
       }
     }
     // GC any FINISHED row still lingering past the TTL (#3207: finished rows
@@ -1032,14 +1107,25 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
     // normal finalize path drops the row immediately now, but reap directly
     // here as a durable backstop: `terminate()` no-ops on a finished row, so
     // remove it and release the pin without routing through it.
-    for (const { g, agentId } of staleFinished) {
-      log(`worker-feed: TTL GC finished row agent=${agentId} feed=${g.feedKey} — reaping leaked finished row`)
+    for (const { g, agentId, reason } of staleFinished) {
+      if (reason === 'absolute') {
+        const age = Math.floor((now - (g.workers.get(agentId)?.createdAtMs ?? now)) / 1000)
+        log(`worker-feed: ABSOLUTE cap GC finished row agent=${agentId} feed=${g.feedKey} — age ${age}s (>= ${Math.floor(absoluteRowLifetimeCapMs / 1000)}s); reaping immortal finished row`)
+      } else {
+        log(`worker-feed: TTL GC finished row agent=${agentId} feed=${g.feedKey} — reaping leaked finished row`)
+      }
       g.pendingFinalize.delete(agentId)
       removeWorker(g, agentId)
       syncPin(g)
     }
-    for (const agentId of staleAgentIds) {
-      log(`worker-feed: TTL reap agent=${agentId} — no update in ${Math.floor((now - (groupOfAgent(agentId)?.workers.get(agentId)?.lastUpdateAt ?? now)) / 1000)}s (>= ${Math.floor(staleWorkerTtlMs / 1000)}s); force-terminating leaked row`)
+    for (const { agentId, reason } of staleAgentIds) {
+      const row = groupOfAgent(agentId)?.workers.get(agentId)
+      if (reason === 'absolute') {
+        const age = Math.floor((now - (row?.createdAtMs ?? now)) / 1000)
+        log(`worker-feed: ABSOLUTE cap reap agent=${agentId} — row age ${age}s (>= ${Math.floor(absoluteRowLifetimeCapMs / 1000)}s); force-terminating immortal row (survives lastUpdateAt reset)`)
+      } else {
+        log(`worker-feed: TTL reap agent=${agentId} — no update in ${Math.floor((now - (row?.lastUpdateAt ?? now)) / 1000)}s (>= ${Math.floor(staleWorkerTtlMs / 1000)}s); force-terminating leaked row`)
+      }
       void terminateWorker(agentId)
     }
     for (const g of [...groups.values()]) {
@@ -1166,6 +1252,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
           state: 'running',
           finished: false,
           lastUpdateAt: nowFn(),
+          createdAtMs: nowFn(),
           dispatchAtMs: null,
           stepStartedAtMs: null,
         }
@@ -1239,6 +1326,27 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       if (wasFinalized || row != null) {
         log(`worker-feed: resurrect agent=${agentId} — cleared finalized gate; card will repaint on next running cue`)
       }
+    },
+    purgeAllOnBoot(): void {
+      for (const g of [...groups.values()]) {
+        // Release the group pin unconditionally: the shared card is orphaned
+        // after a restart/reconnect (its workers are dead child processes), so
+        // it must be unpinned regardless of `hasLiveWorker` — NOT gated like
+        // `syncPin`, which would keep the pin for a row we are about to drop.
+        if (g.messageId != null) {
+          reconcilePinFn({ feedKey: g.feedKey, chatId: g.chatId, threadId: g.threadId, messageId: null })
+        }
+        for (const agentId of [...g.workers.keys()]) {
+          // Latch finalized so a late/inflight cue on the OLD chain can't
+          // resurrect a row on a feed we are tearing down.
+          markFinalized(agentId)
+          agentIndex.delete(agentId)
+        }
+        g.workers.clear()
+        g.pendingFinalize.clear()
+        groups.delete(g.feedKey)
+      }
+      log('worker-feed: purgeAllOnBoot — reconciled feed to empty and released all group pins')
     },
     heartbeatTick,
     stop() {

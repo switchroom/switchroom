@@ -768,7 +768,7 @@ describe('renderCombinedWorkerFeed (pure)', () => {
  * authoritative terminal sweep (`terminate`, driven by `onTerminalCleanup`)
  * PLUS a backstop TTL sweep. These assert the OUTCOMES, not the code paths.
  */
-function ghostHarness(opts: { staleWorkerTtlMs?: number; now: () => number }) {
+function ghostHarness(opts: { staleWorkerTtlMs?: number; absoluteRowLifetimeCapMs?: number; now: () => number }) {
   const edits: { messageId: number; text: string }[] = []
   const sends: { text: string }[] = []
   const pins: { messageId: number | null }[] = []
@@ -792,6 +792,7 @@ function ghostHarness(opts: { staleWorkerTtlMs?: number; now: () => number }) {
     setInterval: () => 0,
     clearInterval: () => {},
     staleWorkerTtlMs: opts.staleWorkerTtlMs,
+    absoluteRowLifetimeCapMs: opts.absoluteRowLifetimeCapMs,
     reconcilePin: ({ messageId }) => pins.push({ messageId }),
   })
   return { feed, edits, sends, pins }
@@ -889,6 +890,121 @@ describe('worker-feed ghost-leak — deterministic terminal removal + backstop',
     await drain()
     // Still tracked — the sweep only reaps rows silent PAST the TTL.
     expect(feed.size).toBe(1)
+  })
+
+  // ── ABSOLUTE row-lifetime cap (Carrie 5h zombie pin, v0.18.23) ──────────────
+  // The silence-keyed `staleWorkerTtlMs` backstop is defeated by a leaked row
+  // that never finishes AND keeps receiving `update()` cues every heartbeat:
+  // each cue resets `lastUpdateAt`, so the silence sweep can NEVER match and the
+  // pinned card lives forever (observed: 5h, re-edited 3000+ times). The
+  // absolute cap is anchored to the row's IMMUTABLE creation time, so it reaps
+  // the row regardless of how recently it updated.
+  it('ABSOLUTE cap reaps an immortal-but-UPDATING row that resets lastUpdateAt every tick, then unpins', async () => {
+    let t = 0
+    // Silence TTL huge (would never fire); absolute cap small. The row keeps
+    // updating just under the silence TTL each step, so ONLY the absolute cap
+    // (immune to the lastUpdateAt reset) can catch it.
+    const { feed, edits, pins } = ghostHarness({
+      staleWorkerTtlMs: 1_000_000,
+      absoluteRowLifetimeCapMs: 5000,
+      now: () => t,
+    })
+    await feed.update('z', 'chat', view('zombie task', 's0', 0))
+    await drain()
+    expect(feed.size).toBe(1)
+    expect(pins.at(-1)?.messageId).not.toBeNull()
+
+    // Drive continuous updates past the absolute cap — each resets lastUpdateAt,
+    // so the silence sweep stays defeated (exactly the Carrie failure mode).
+    for (let step = 1; step <= 8; step++) {
+      t = step * 1000
+      await feed.update('z', 'chat', view('zombie task', `s${step}`, t))
+      await drain()
+      feed.heartbeatTick()
+      await drain()
+    }
+    // The absolute cap (5s) has been crossed while the row kept updating →
+    // reaped despite the fresh cues, and the shared card UNPINNED.
+    expect(feed.size).toBe(0)
+    expect(pins.at(-1)?.messageId).toBeNull()
+
+    // Immortality closed for good: the finalized gate blocks a late cue from
+    // resurrecting the row, and further heartbeats produce no edits.
+    await feed.update('z', 'chat', view('zombie task', 's-late', t))
+    await drain()
+    expect(feed.size).toBe(0)
+    const after = edits.length
+    t += 10000
+    feed.heartbeatTick()
+    await drain()
+    expect(edits.length).toBe(after)
+  })
+
+  it('ABSOLUTE cap reaps a row past the cap even when the silence TTL would never fire', async () => {
+    let t = 0
+    const { feed, pins } = ghostHarness({
+      staleWorkerTtlMs: 1_000_000,
+      absoluteRowLifetimeCapMs: 5000,
+      now: () => t,
+    })
+    await feed.update('f', 'chat', view('task f', 's0', 0))
+    await drain()
+    expect(pins.at(-1)?.messageId).not.toBeNull()
+    // Past the absolute cap with no update at all — the age anchor alone reaps.
+    t = 6000
+    feed.heartbeatTick()
+    await drain()
+    expect(feed.size).toBe(0)
+    expect(pins.at(-1)?.messageId).toBeNull()
+  })
+
+  // ── Boot/reconnect purge (Ken's key ask) ───────────────────────────────────
+  // Every tracked row is a dead child sub-agent after a restart/reconnect. On a
+  // bare bridge reconnect the OLD feed's `wk:group:` pins are orphaned — the new
+  // empty feed never knew those groups, so it can never unpin them, and no full-
+  // boot pin sweep runs. `purgeAllOnBoot()` must reconcile the feed to empty AND
+  // release the pin unconditionally.
+  it('purgeAllOnBoot empties a restored running row + pinned card and UNPINS', async () => {
+    let t = 0
+    const { feed, pins } = ghostHarness({ now: () => t })
+    // A running worker with a live pinned card (the "restored at startup" state).
+    await feed.update('p', 'chat', view('task p', 'working', 0))
+    await drain()
+    expect(feed.size).toBe(1)
+    expect(pins.at(-1)?.messageId).not.toBeNull()
+
+    feed.purgeAllOnBoot()
+
+    // Feed reconciled to empty AND the coalesced card unpinned (messageId null).
+    expect(feed.size).toBe(0)
+    expect(pins.at(-1)?.messageId).toBeNull()
+
+    // A late cue on the torn-down feed must NOT resurrect a row (finalized gate).
+    t = 100
+    await feed.update('p', 'chat', view('task p', 'zombie tick', 100))
+    await drain()
+    expect(feed.size).toBe(0)
+  })
+
+  it('purgeAllOnBoot unpins EVERY group (multiple chats) and is a no-op when already empty', async () => {
+    let t = 0
+    const { feed, pins } = ghostHarness({ now: () => t })
+    await feed.update('g1', 'chatA', view('a', 's', 0))
+    await feed.update('g2', 'chatB', view('b', 's', 0))
+    await drain()
+    expect(feed.size).toBe(2)
+
+    const pinsBefore = pins.length
+    feed.purgeAllOnBoot()
+    expect(feed.size).toBe(0)
+    // Both groups emitted a final unpin (messageId null).
+    const unpinsAfter = pins.slice(pinsBefore).filter((p) => p.messageId === null)
+    expect(unpinsAfter.length).toBe(2)
+
+    // Idempotent: a second purge on an empty feed emits no further pin calls.
+    const afterFirst = pins.length
+    feed.purgeAllOnBoot()
+    expect(pins.length).toBe(afterFirst)
   })
 
   it('no-op re-render is skipped (byte-identical body → no redundant edit)', async () => {
