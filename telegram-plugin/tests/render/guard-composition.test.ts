@@ -17,12 +17,12 @@ function copyText(s: string): string {
 // creating or destroying a signal for another — the interference question.
 describe("guardAccidentalFormatting composition (#3252)", () => {
   it("neutralises a message that trips emphasis + dollar + tilde at once", () => {
-    // `file_name` (intra-word `_`), `~$5M … ~$10M` (digit-adjacent tildes AND a
-    // two-dollar currency span) — three guards fire on one body.
-    const src = "the file_name budget trims ~$5M, down from ~$10M last year";
+    // `file_name_here` (2 intra-word `_` → can pair), `~$5M … ~$10M`
+    // (digit-adjacent tildes AND a two-dollar currency span) — three guards fire.
+    const src = "the file_name_here budget trims ~$5M, down from ~$10M last year";
     const out = guardAccidentalFormatting(src);
-    // Emphasis: the intra-word underscore is escaped (no `_…_` pair).
-    expect(out).toContain("file\\_name");
+    // Emphasis: the intra-word underscores are escaped (no `_…_` pair).
+    expect(out).toContain("file\\_name\\_here");
     // Dollar: no unescaped `$` remains to open a math span.
     expect(out).not.toMatch(/(?<!\\)\$/);
     // Tilde: BOTH approximation tildes escaped so no `~…~` strikethrough forms.
@@ -50,10 +50,10 @@ describe("guardAccidentalFormatting composition (#3252)", () => {
   });
 
   it("leaves a 4-digit-year accidental ordered-list alone except the dot", () => {
-    const src = "2026. was the year the file_name convention changed";
+    const src = "2026. was the year the file_name_here convention changed";
     const out = guardAccidentalFormatting(src);
     expect(out).toContain("2026\\. was");
-    expect(out).toContain("file\\_name");
+    expect(out).toContain("file\\_name\\_here");
   });
 
   it("never touches DELIBERATE formatting: bold, italic, strike, code, blockquote", () => {
@@ -73,11 +73,59 @@ describe("guardAccidentalFormatting composition (#3252)", () => {
   });
 
   it("is idempotent: composing already-composed text is a strict no-op", () => {
-    const src = "file_name ~$5M and ~$10M with x==y and a==b, >2x, 2026. done";
+    const src = "file_name_here ~$5M and ~$10M with x==y and a==b, >2x, 2026. done";
     const once = guardAccidentalFormatting(src);
     expect(guardAccidentalFormatting(once)).toBe(once);
     // No doubled backslashes anywhere.
     expect(once).not.toMatch(/\\\\/);
+  });
+
+  it("passes a markdown link with a `_`/`~`/`==`-laden URL through UNMODIFIED (finding 1)", () => {
+    const src = "see [docs](https://x.io/a_b_c?p==1&q~2) and [more](https://y.io/foo_bar)";
+    // Every trigger char in the URL is structural → the whole body is verbatim.
+    expect(guardAccidentalFormatting(src)).toBe(src);
+  });
+
+  it("passes a bare autolinked URL through UNMODIFIED (finding 1)", () => {
+    const src = "read https://en.wikipedia.org/wiki/Foo_Bar_Baz today";
+    expect(guardAccidentalFormatting(src)).toBe(src);
+  });
+
+  it("guards the link LABEL but protects the destination (finding 1)", () => {
+    const out = guardAccidentalFormatting("[a_b_c](https://x.io/p_q_r) spent $5 and $9");
+    // Label prose escaped; URL verbatim; prose dollars still escaped.
+    expect(out).toContain("[a\\_b\\_c]");
+    expect(out).toContain("(https://x.io/p_q_r)");
+    expect(out).not.toMatch(/(?<!\\)\$/);
+  });
+
+  it("passes a GFM table with empty cells through UNMODIFIED (finding 3)", () => {
+    // A real table (has a delimiter row) — its structural pipes/empty cells and
+    // any `_`/`$` inside cells must survive. `|a||b|` = a real empty cell.
+    const src = ["| A | B | C |", "| --- | --- | --- |", "|a||b||c|", "| x_y | $5 | ~3 |"].join("\n");
+    expect(guardAccidentalFormatting(src)).toBe(src);
+  });
+
+  it("STILL guards a genuine accidental `a||b` in prose (not a table)", () => {
+    // Two word-flanked `||` in PROSE (no delimiter row) → armed spoiler guard.
+    const out = guardAccidentalFormatting("logic is a||b and c||d here");
+    expect(out).toContain("a\\|\\|b");
+    expect(out).toContain("c\\|\\|d");
+  });
+
+  // FINDING 2 (documented non-issue): switchroom's IR renderer emits code
+  // blocks ONLY as backtick FENCES (render.ts renderCodeBlock), never as
+  // 4-space-indented CommonMark code. So renderer output reaching richMessage()
+  // never contains an indented code block. The emphasis/inline-pairs/dollar
+  // guards therefore do NOT special-case a 4-space indent (only line-start does,
+  // for its own blockquote/list heuristics). This test PINS that current
+  // behaviour: a 4-space-indented prose line is treated as ordinary prose and
+  // its currency `$` is guarded like any other. (If a future change ever routes
+  // raw indented code blocks to the wire, revisit — see guards-integration-note.)
+  it("treats a 4-space-indented line as prose (finding 2 — renderer emits fences, not indented code)", () => {
+    const out = guardAccidentalFormatting("    spend was $5 and $10 total");
+    expect(out).toContain("\\$5");
+    expect(out).toContain("\\$10");
   });
 
   it("richMessage() applies the composed guard on the wire body exactly once", () => {

@@ -127,6 +127,36 @@ describe("guardAccidentalInlinePairs — neutralises ACCIDENTAL pairs", () => {
   });
 });
 
+describe("guardAccidentalInlinePairs — link / autolink awareness (finding 1)", () => {
+  it("leaves `==` inside a markdown link destination UNMODIFIED", () => {
+    const s = "see [a](https://x.io?p==1) and [b](https://y.io?q==2)";
+    expect(guardAccidentalInlinePairs(s)).toBe(s);
+  });
+
+  it("leaves `~` (digit-adjacent) inside link destinations UNMODIFIED", () => {
+    const s = "see [a](https://x.io/~5x) and [b](https://y.io/~10y)";
+    expect(guardAccidentalInlinePairs(s)).toBe(s);
+  });
+
+  it("leaves `==` inside a bare autolinked URL UNMODIFIED", () => {
+    const s = "open https://x.io/path?a==1&b==2 in a browser";
+    expect(guardAccidentalInlinePairs(s)).toBe(s);
+  });
+});
+
+describe("guardAccidentalInlinePairs — table awareness (finding 3)", () => {
+  it("leaves a real table's empty cells (`|a||b|`) UNMODIFIED", () => {
+    const s = ["| A | B | C |", "| --- | --- | --- |", "|a||b||c|"].join("\n");
+    expect(guardAccidentalInlinePairs(s)).toBe(s);
+  });
+
+  it("STILL guards a genuine accidental `a||b` in prose (no delimiter row)", () => {
+    const out = guardAccidentalInlinePairs("eval a||b and c||d in code");
+    expect(out).toContain("a\\|\\|b");
+    expect(out).toContain("c\\|\\|d");
+  });
+});
+
 describe("guardAccidentalInlinePairs — idempotency", () => {
   it("guarding already-guarded tilde text is a strict no-op", () => {
     const once = guardAccidentalInlinePairs("trims to ~10 units, down from ~20 last week");

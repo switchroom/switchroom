@@ -92,7 +92,11 @@
 //      shape (left/right-flanking behaviour).
 // Send real prose through a live agent and confirm literal glyphs before merge.
 
-import { splitCodeSegments } from './code-segments.js'
+// `splitProtectedSegments` skips code spans/fences AND markdown link
+// destinations / autolinks / GFM table rows verbatim — so a `~`/`==`/`||` that
+// is STRUCTURAL (in a URL query like `?a==1`, or a table's empty cell `|a||b|`)
+// is never escaped. See code-segments.ts.
+import { splitProtectedSegments } from './code-segments.js'
 
 /** Digit-adjacent tilde: `~` directly before an optional `$`/`.` and a digit
  *  (`~10`, `~$5`, `~.5`). The `(?<!\\)` keeps it idempotent — an already-escaped
@@ -133,7 +137,7 @@ export function guardAccidentalInlinePairs(text: string): string {
   // Fast bail: none of the guarded trigger chars are present.
   if (!/[~=|]/.test(text)) return text
 
-  const segments = splitCodeSegments(text)
+  const segments = splitProtectedSegments(text)
 
   // Arm each construct independently, counting only PROSE (never code). A single
   // occurrence can never form a pair, so the threshold is 2.

@@ -141,3 +141,22 @@ describe("reply-path integration (#3252 F1/F2)", () => {
     expect(wire.markdown).not.toContain("\\$2500");
   });
 });
+
+describe("guardDollarMath — link / table awareness (findings 1 & 3)", () => {
+  it("does NOT escape a `$` inside a markdown link destination", () => {
+    // Two dollars + a digit-adjacent one would normally arm the guard, but both
+    // live in URL query strings → structural → left verbatim.
+    const s = "buy [x](https://x.io?price=$5) or [y](https://y.io?price=$9)";
+    expect(guardDollarMath(s)).toBe(s);
+  });
+
+  it("does NOT escape `$` inside a real table's cells", () => {
+    const s = ["| Item | Cost |", "| --- | --- |", "| a | $5 |", "| b | $9 |"].join("\n");
+    expect(guardDollarMath(s)).toBe(s);
+  });
+
+  it("STILL escapes two currency dollars in ordinary prose", () => {
+    const out = guardDollarMath("spend was $5 today and $9 tomorrow");
+    expect(out).not.toMatch(/(?<!\\)\$/);
+  });
+});

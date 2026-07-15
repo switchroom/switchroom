@@ -70,9 +70,13 @@
 // Vitest CANNOT cover server-side rendering; a real intra-word `_`/`*` message
 // through a live agent must confirm it renders literal (not `\_`, not italic).
 
-// Code-span/fence splitting is shared across all #3252 guards — one source of
-// truth in render/code-segments.ts (previously duplicated here).
-import { splitCodeSegments } from "./code-segments.js";
+// Segment splitting (code spans / fences AND markdown link destinations /
+// autolinks / table rows) is shared across all #3252 guards — one source of
+// truth in render/code-segments.ts. Routing through `splitProtectedSegments`
+// (not the code-only `splitCodeSegments`) is what makes this guard link-aware:
+// an intra-word `_`/`*` inside a URL path (`.../a_b_c`) is STRUCTURAL, not
+// prose, and must never be escaped (the link would break). See code-segments.ts.
+import { splitProtectedSegments } from "./code-segments.js";
 
 /** An intra-word underscore: a single `_` with an ASCII alphanumeric on BOTH
  *  immediate sides (`file_name`, `v2_final`). Intended `_italic_` never
@@ -87,43 +91,68 @@ const INTRA_WORD_UNDERSCORE = /(?<=[A-Za-z0-9])_(?=[A-Za-z0-9])/g;
  *  neighbour is `*` (not alnum). Idempotent for the same reason as above. */
 const INTRA_WORD_ASTERISK = /(?<=[A-Za-z0-9])\*(?=[A-Za-z0-9])/g;
 
+/** Every unescaped `_` / `*` in prose (the pair-threshold input). An emphasis
+ *  span needs a MATCHING pair of the same delimiter, so a delimiter can only
+ *  mis-render when 2+ of it exist. The `(?<!\\)` keeps the count idempotent. */
+const ANY_UNDERSCORE = /(?<!\\)_/g;
+const ANY_ASTERISK = /(?<!\\)\*/g;
+
 /**
  * Neutralise accidental inline emphasis produced by intra-word `_` / `*`.
  *
- * Operates on the FINAL rendered rich-markdown string (post-`render`). A no-op
- * unless the prose (non-code) content contains at least one intra-word `_` or
- * `*` (an ASCII alphanumeric on both immediate sides). When present, each such
- * delimiter is backslash-escaped so it can never pair into an emphasis span.
+ * Operates on the FINAL rendered rich-markdown string (post-`render`).
+ *
+ * ── Threshold: 2+ of the delimiter (finding 4) ────────────────────────────
+ * A `_` (or `*`) escape only fires when the prose holds an intra-word
+ * occurrence of that delimiter AND 2+ TOTAL of it. Emphasis is a PAIRED
+ * construct — a single `_` (or `*`) in the whole message can never form a span,
+ * so escaping a lone intra-word delimiter is pure churn that only widens the
+ * false-positive surface (a stray `\` if Telegram ever failed to consume it),
+ * with zero correctness gain. Requiring 2+ matches the dollar / inline-pairs
+ * "a lone delimiter can't pair" doctrine. This is strictly SAFE: any real
+ * mis-render needs 2+ delimiters, and when 2+ exist (e.g. `file_name_here`, or
+ * an intra-word `file_name` sitting alongside an intended `_italic_` elsewhere —
+ * three underscores that Telegram could mis-pair) the intra-word delimiter IS
+ * escaped, so no accidental span survives. Only the provably-inert lone-`_`
+ * (`file_name` as the ONLY underscore in the message) is now left byte-identical.
  *
  * Intended `**bold**`, `*italic*` and `_italic_` are LEFT UNTOUCHED by
  * construction (their delimiters are boundary-flanked, never intra-word).
- * Code spans / fenced blocks are never touched. Idempotent and deterministic.
+ * Code spans / fenced blocks, link destinations and autolinks are never touched
+ * (via `splitProtectedSegments`). Idempotent and deterministic.
  */
 export function guardAccidentalEmphasis(text: string): string {
   if (!text.includes("_") && !text.includes("*")) return text;
-  const segments = splitCodeSegments(text);
+  const segments = splitProtectedSegments(text);
 
-  // NO-OP guard: only rewrite when a real intra-word signal exists in prose.
-  let hasSignal = false;
+  // NO-OP guard: only rewrite when a real intra-word signal exists in prose AND
+  // 2+ of that delimiter exist (so a pair — hence a mis-render — is possible).
+  let hasIntraUnderscore = false;
+  let hasIntraAsterisk = false;
+  let underscoreCount = 0;
+  let asteriskCount = 0;
   for (const seg of segments) {
     if (seg.code) continue;
-    if (INTRA_WORD_UNDERSCORE.test(seg.text) || INTRA_WORD_ASTERISK.test(seg.text)) {
-      hasSignal = true;
-      break;
-    }
+    if (INTRA_WORD_UNDERSCORE.test(seg.text)) hasIntraUnderscore = true;
+    if (INTRA_WORD_ASTERISK.test(seg.text)) hasIntraAsterisk = true;
+    underscoreCount += seg.text.match(ANY_UNDERSCORE)?.length ?? 0;
+    asteriskCount += seg.text.match(ANY_ASTERISK)?.length ?? 0;
   }
   // Reset lastIndex — the /g regexes above are stateful across .test() calls.
   INTRA_WORD_UNDERSCORE.lastIndex = 0;
   INTRA_WORD_ASTERISK.lastIndex = 0;
-  if (!hasSignal) return text;
+
+  const armUnderscore = hasIntraUnderscore && underscoreCount >= 2;
+  const armAsterisk = hasIntraAsterisk && asteriskCount >= 2;
+  if (!armUnderscore && !armAsterisk) return text;
 
   return segments
-    .map((seg) =>
-      seg.code
-        ? seg.text
-        : seg.text
-            .replace(INTRA_WORD_UNDERSCORE, "\\_")
-            .replace(INTRA_WORD_ASTERISK, "\\*"),
-    )
+    .map((seg) => {
+      if (seg.code) return seg.text;
+      let out = seg.text;
+      if (armUnderscore) out = out.replace(INTRA_WORD_UNDERSCORE, "\\_");
+      if (armAsterisk) out = out.replace(INTRA_WORD_ASTERISK, "\\*");
+      return out;
+    })
     .join("");
 }

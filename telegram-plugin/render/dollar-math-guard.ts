@@ -74,8 +74,8 @@
 // The code-span/fence splitter now lives in ONE shared module so every #3252
 // guard reuses the same CommonMark-correct implementation. Re-exported here for
 // backwards compatibility with any importer that reached for it via this file.
-import { splitCodeSegments, type Segment } from "./code-segments.js";
-export { splitCodeSegments, type Segment };
+import { splitCodeSegments, splitProtectedSegments, type Segment } from "./code-segments.js";
+export { splitCodeSegments, splitProtectedSegments, type Segment };
 
 /** Counts every `$` in a segment (the total-dollar threshold input). */
 const ANY_DOLLAR = /\$/g;
@@ -104,7 +104,9 @@ const UNESCAPED_DOLLAR = /(?<!\\)\$/g;
  */
 export function guardDollarMath(text: string): string {
   if (!text.includes("$")) return text;
-  const segments = splitCodeSegments(text);
+  // Link-aware: a `$` inside a URL/table (rare but possible) is structural and
+  // must not be escaped. splitProtectedSegments skips code/links/autolinks/tables.
+  const segments = splitProtectedSegments(text);
 
   let total = 0;
   let hasCurrencySignal = false;

@@ -25,14 +25,14 @@ describe("guardAccidentalEmphasis (#3252) — accidental emphasis IS neutralised
     expect(copyText(out)).toBe("compute a*b*c for the product");
   });
 
-  it("escapes a digit-flanked `2*3` multiplication", () => {
-    const out = guardAccidentalEmphasis("the area is 2*3 units");
-    expect(out).toContain("2\\*3");
+  it("escapes digit-flanked `2*3*4` multiplication (2+ asterisks can pair)", () => {
+    const out = guardAccidentalEmphasis("the area is 2*3*4 units");
+    expect(out).toContain("2\\*3\\*4");
   });
 
-  it("escapes a mixed digit/letter intra-word underscore `v2_final`", () => {
-    const out = guardAccidentalEmphasis("ship v2_final today");
-    expect(out).toContain("v2\\_final");
+  it("escapes a mixed digit/letter intra-word underscore run `v2_final_rc`", () => {
+    const out = guardAccidentalEmphasis("ship v2_final_rc today");
+    expect(out).toContain("v2\\_final\\_rc");
   });
 
   it("adds no math-italic glyphs", () => {
@@ -94,6 +94,73 @@ describe("guardAccidentalEmphasis (#3252) — intended emphasis is LEFT UNTOUCHE
   });
 });
 
+describe("guardAccidentalEmphasis (#3252) — pair threshold (finding 4)", () => {
+  // A single delimiter in the whole message can NEVER form an emphasis pair, so
+  // a lone intra-word `_`/`*` is provably inert and is left byte-identical.
+  it("leaves a LONE intra-word underscore `file_name` verbatim (can't pair)", () => {
+    const s = "the var is file_name in scope";
+    expect(guardAccidentalEmphasis(s)).toBe(s);
+  });
+
+  it("leaves a LONE intra-word asterisk `2*3` verbatim (can't pair)", () => {
+    const s = "the area is 2*3 units";
+    expect(guardAccidentalEmphasis(s)).toBe(s);
+  });
+
+  it("STILL escapes a lone intra-word `_` when a later `_italic_` gives it a pair", () => {
+    // Three underscores total (one intra-word + an intended `_italic_`); Telegram
+    // could mis-pair them, so the intra-word `_` MUST be escaped even though it is
+    // the only intra-word one. Threshold 2 (total count) catches this correctly.
+    const out = guardAccidentalEmphasis("the file_name and _italic_ here");
+    expect(out).toContain("file\\_name");
+    // The intended italic delimiters (boundary-flanked) are left untouched.
+    expect(out).toContain("_italic_");
+  });
+});
+
+describe("guardAccidentalEmphasis (#3252) — link / autolink awareness (finding 1)", () => {
+  it("does NOT escape intra-word `_` inside a markdown link destination", () => {
+    const s = "see [docs](https://x.io/a_b_c_d) for more";
+    // URL underscores are structural → passed through UNMODIFIED.
+    expect(guardAccidentalEmphasis(s)).toBe(s);
+  });
+
+  it("does NOT escape `_` inside a bare autolinked URL", () => {
+    const s = "read https://x.io/foo_bar_baz now";
+    expect(guardAccidentalEmphasis(s)).toBe(s);
+  });
+
+  it("STILL guards the link LABEL prose while protecting the URL", () => {
+    const out = guardAccidentalEmphasis("[file_name_here](https://x.io/a_b_c)");
+    // Label (rendered prose) is escaped; the `(url)` destination is verbatim.
+    expect(out).toContain("[file\\_name\\_here]");
+    expect(out).toContain("(https://x.io/a_b_c)");
+  });
+
+  it("protects a link destination WITH a title", () => {
+    const s = 'see [docs](https://x.io/a_b_c "the_title") now';
+    expect(guardAccidentalEmphasis(s)).toBe(s);
+  });
+});
+
+describe("guardAccidentalEmphasis (#3252) — trailing-alnum emphasis closer (finding 5)", () => {
+  // `*cat*s` / `_cat_s`: the closing delimiter is intra-word (t*s / t_s). Under
+  // strict CommonMark it cannot close emphasis, but Telegram may be more liberal
+  // (UAT-gated). Documented current behaviour: the intra-word closer is escaped
+  // (2 asterisks/underscores total → armed). Copy-round-trips to the original.
+  it("escapes the intra-word closer of `*cat*s`", () => {
+    const out = guardAccidentalEmphasis("a *cat*s tail");
+    expect(out).toContain("*cat\\*s");
+    expect(copyText(out)).toBe("a *cat*s tail");
+  });
+
+  it("escapes the intra-word closer of `_cat_s`", () => {
+    const out = guardAccidentalEmphasis("a _cat_s tail");
+    expect(out).toContain("_cat\\_s");
+    expect(copyText(out)).toBe("a _cat_s tail");
+  });
+});
+
 describe("guardAccidentalEmphasis (#3252) — code-span awareness", () => {
   it("never touches intra-word `_`/`*` inside a code span", () => {
     const s = "the identifier `file_name_here` and math `a*b*c` are code";
@@ -101,8 +168,10 @@ describe("guardAccidentalEmphasis (#3252) — code-span awareness", () => {
   });
 
   it("escapes prose but leaves an adjacent code span verbatim", () => {
-    const out = guardAccidentalEmphasis("prose file_name but code `file_name`");
-    expect(out).toContain("file\\_name but code `file_name`");
+    // Two intra-word underscores in prose (`file_name_here`) → armed; the code
+    // span's `file_name` is verbatim and does NOT count toward the threshold.
+    const out = guardAccidentalEmphasis("prose file_name_here but code `file_name`");
+    expect(out).toContain("file\\_name\\_here but code `file_name`");
   });
 
   it("never touches intra-word delimiters inside a fenced code block", () => {

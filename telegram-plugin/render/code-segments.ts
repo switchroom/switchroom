@@ -59,3 +59,152 @@ export function splitCodeSegments(text: string): Segment[] {
   if (plainStart < text.length) out.push({ code: false, text: text.slice(plainStart) });
   return out;
 }
+
+// ---------------------------------------------------------------------------
+// Link / autolink / table protection (#3252 — link-aware guards)
+// ---------------------------------------------------------------------------
+//
+// The four accidental-formatting guards must NOT escape inside content where
+// the trigger chars (`_ * ~ = | $`) are STRUCTURAL rather than prose:
+//   • markdown link destinations — the `(url)` (and `(url "title")`) target of
+//     a `[label](url)` link. Underscores / tildes / `==` in a URL path or query
+//     are part of the address; a backslash there can 404 the link. The link
+//     LABEL (`[...]`) is rendered prose and stays guarded.
+//   • bare autolinked URLs — `http(s)://…` and `www.…` runs Telegram auto-links.
+//   • GFM table rows — a table's structural pipes / empty cells (`|a||b|`) must
+//     survive; escaping inside a real table row corrupts the table.
+// Everything else is prose and stays fully guarded. This is the sibling of the
+// code-span skip: a PROTECTED segment (`code: true`) is emitted verbatim.
+//
+// Deterministic and linear-time: one left-to-right char scan per prose chunk
+// plus one line pre-pass for tables; no backtracking regexes.
+
+/** A GFM table delimiter row: only pipes / colons / dashes / spaces, with at
+ *  least one dash AND at least one pipe (a bare `---` is a thematic break, not a
+ *  table). This is what distinguishes a real table from prose that merely starts
+ *  with `|`. */
+function isTableDelimiterRow(line: string): boolean {
+  const t = line.trim();
+  return t.length > 0 && /^[\s|:-]+$/.test(t) && t.includes("-") && t.includes("|");
+}
+
+/** A candidate table line: after optional leading spaces it begins with `|`. */
+function isTableCandidateLine(line: string): boolean {
+  return /^\s*\|/.test(line);
+}
+
+/** Find the [start, end) char ranges (relative to `text`) of GFM table blocks —
+ *  maximal runs of 2+ consecutive `|`-leading lines that contain a delimiter
+ *  row. Each returned range spans whole lines INCLUDING their trailing newline,
+ *  so a table becomes ONE protected segment. A lone `|a||b|` line with no
+ *  delimiter row is NOT a real table → not protected → still guarded. */
+function findTableRanges(text: string): Array<[number, number]> {
+  const ranges: Array<[number, number]> = [];
+  const lines = text.split("\n");
+  let offset = 0;
+  let runStart = -1;
+  let runEnd = -1;
+  let runHasDelim = false;
+  let runLineCount = 0;
+  const flush = () => {
+    if (runStart !== -1 && runLineCount >= 2 && runHasDelim) {
+      ranges.push([runStart, runEnd]);
+    }
+    runStart = -1;
+    runEnd = -1;
+    runHasDelim = false;
+    runLineCount = 0;
+  };
+  for (let k = 0; k < lines.length; k++) {
+    const line = lines[k];
+    // char length of this line including its trailing newline (except the last).
+    const lineLen = line.length + (k < lines.length - 1 ? 1 : 0);
+    if (isTableCandidateLine(line)) {
+      if (runStart === -1) runStart = offset;
+      runEnd = offset + lineLen;
+      runLineCount += 1;
+      if (isTableDelimiterRow(line)) runHasDelim = true;
+    } else {
+      flush();
+    }
+    offset += lineLen;
+  }
+  flush();
+  return ranges;
+}
+
+/** Protect links / autolinks / table rows within a single PROSE chunk, returning
+ *  alternating prose / protected segments. */
+function splitProseProtected(text: string): Segment[] {
+  const out: Segment[] = [];
+  const tables = findTableRanges(text);
+  let tIdx = 0;
+  let i = 0;
+  let plainStart = 0;
+  const pushProtected = (from: number, to: number) => {
+    if (plainStart < from) out.push({ code: false, text: text.slice(plainStart, from) });
+    out.push({ code: true, text: text.slice(from, to) });
+    plainStart = to;
+  };
+  while (i < text.length) {
+    // Advance the table pointer past any range we've already scanned past.
+    while (tIdx < tables.length && tables[tIdx][1] <= i) tIdx++;
+    // 1. Table block — protect whole lines verbatim.
+    if (tIdx < tables.length && tables[tIdx][0] === i) {
+      const [, end] = tables[tIdx];
+      pushProtected(i, end);
+      i = end;
+      continue;
+    }
+    const ch = text[i];
+    // 2. Markdown link destination: `[label](dest)` — protect only `(dest)`.
+    if (ch === "[") {
+      const close = text.indexOf("]", i + 1);
+      if (close !== -1 && text[close + 1] === "(") {
+        const destClose = text.indexOf(")", close + 2);
+        if (destClose !== -1) {
+          // Protect the `(dest)` span; the `[label]` before it stays prose.
+          pushProtected(close + 1, destClose + 1);
+          i = destClose + 1;
+          continue;
+        }
+      }
+      i++;
+      continue;
+    }
+    // 3. Bare autolink: `http(s)://…` or `www.…`, left-flanked by a boundary.
+    if (
+      (ch === "h" || ch === "w") &&
+      (i === 0 || !/[A-Za-z0-9]/.test(text[i - 1]))
+    ) {
+      const m = /^(?:https?:\/\/|www\.)[^\s<>()\[\]]+/.exec(text.slice(i));
+      if (m) {
+        const end = i + m[0].length;
+        pushProtected(i, end);
+        i = end;
+        continue;
+      }
+    }
+    i++;
+  }
+  if (plainStart < text.length) out.push({ code: false, text: text.slice(plainStart) });
+  return out;
+}
+
+/** Split rendered markdown into prose / protected segments where a PROTECTED
+ *  (`code: true`) segment is any content a guard must emit verbatim: code spans,
+ *  fenced code blocks, markdown link destinations, bare autolinks, and GFM
+ *  table rows. This is the link/table-aware superset of `splitCodeSegments` that
+ *  all four #3252 guards route through. Prose segments (`code: false`) remain
+ *  guardable (including a link's `[label]` text). Deterministic, linear-time. */
+export function splitProtectedSegments(text: string): Segment[] {
+  const out: Segment[] = [];
+  for (const seg of splitCodeSegments(text)) {
+    if (seg.code) {
+      out.push(seg);
+      continue;
+    }
+    for (const sub of splitProseProtected(seg.text)) out.push(sub);
+  }
+  return out;
+}

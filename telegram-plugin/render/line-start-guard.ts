@@ -76,9 +76,10 @@
 // to CommonMark + the `escapeMarkdown` chars Telegram demonstrably strips.
 // Both need a live round-trip before merge. See guard-linestart-note.md.
 
-// Code-span/fence splitting is shared across all #3252 guards — one source of
-// truth in render/code-segments.ts (previously duplicated here).
-import { splitCodeSegments } from "./code-segments.js";
+// Segment splitting is shared across all #3252 guards — one source of truth in
+// render/code-segments.ts. `splitProtectedSegments` skips code spans/fences AND
+// link destinations / autolinks / GFM table rows verbatim.
+import { splitProtectedSegments } from "./code-segments.js";
 
 /** Line-start `>` glued directly to a digit or `=` — the "greater than"
  *  comparison-operator prose that Telegram wrongly quotes. NOT matched when a
@@ -136,7 +137,7 @@ export function guardAccidentalBlockConstructs(text: string): string {
   // Cheap short-circuit: no `>` and no plausible 4+ digit list marker => no-op.
   if (!text.includes(">") && !/\d{4,}[.)]/.test(text)) return text;
 
-  const segments = splitCodeSegments(text);
+  const segments = splitProtectedSegments(text);
   let out = "";
   // True at text start and immediately after any emitted `\n`.
   let atLineStart = true;
