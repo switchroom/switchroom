@@ -95,6 +95,12 @@ DEFAULTS = {
     "retainContext": "claude-code",
     "retainTags": [],
     "retainMetadata": {},
+    # Switchroom #3244 — boot reconciliation of un-committed transcript tails.
+    # On by default; the load-bearing recovery for work an abrupt session death
+    # (SIGKILL/OOM/watchdog) skipped. Disable per-agent via
+    # HINDSIGHT_RECONCILE_ON_START=false. reconcile_tail.py also honours the
+    # HINDSIGHT_RECONCILE_{LOOKBACK_H,MAX_TURNS,BUDGET_S} bounds (read directly).
+    "reconcileOnStart": True,
     "recallAdditionalBanks": [],
     # Connection
     "hindsightApiUrl": None,
@@ -134,6 +140,8 @@ ENV_OVERRIDES = {
     "HINDSIGHT_AUTO_RECALL": ("autoRecall", bool),
     "HINDSIGHT_AUTO_RETAIN": ("autoRetain", bool),
     "HINDSIGHT_RETAIN_MODE": ("retainMode", str),
+    # Switchroom #3244 — boot reconciliation on/off (default on).
+    "HINDSIGHT_RECONCILE_ON_START": ("reconcileOnStart", bool),
     "HINDSIGHT_RECALL_BUDGET": ("recallBudget", str),
     "HINDSIGHT_RECALL_MAX_TOKENS": ("recallMaxTokens", int),
     # Switchroom-local: count cap. Set by start.sh from

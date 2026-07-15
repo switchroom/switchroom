@@ -173,12 +173,22 @@ class HindsightClient:
         metadata: Optional[dict] = None,
         tags: Optional[list] = None,
         timeout: int = 15,
+        async_processing: bool = True,
     ) -> dict:
         """Retain content into a bank's memory.
 
-        Posts with async=true so the server processes in the background.
-        The context field helps Hindsight cluster memories by provenance
-        (e.g. "claude-code" vs manual retains).
+        By default posts with ``async=true`` so the server processes extraction
+        in the background (a 200 is an ack-of-receipt, not proof of durable
+        persistence). The context field helps Hindsight cluster memories by
+        provenance (e.g. "claude-code" vs manual retains).
+
+        ``async_processing=False`` (switchroom #3244 §1.1) posts ``async=false``
+        so the 200 is returned only after the daemon has durably committed the
+        item — commit-before-ack. Durability paths whose success advances the
+        retain watermark (the Stop-hook durability retain and boot
+        reconciliation) MUST use this so a bare async 200 can never falsely mark
+        unpersisted work as committed. (Merge precondition: the daemon honours
+        ``async=false`` as commit-before-ack — verified by the §1.1 probe.)
         """
         path = f"/v1/default/banks/{urllib.parse.quote(bank_id, safe='')}/memories"
         item = {
@@ -192,7 +202,7 @@ class HindsightClient:
             item["tags"] = tags
         body = {
             "items": [item],
-            "async": True,
+            "async": bool(async_processing),
         }
         return self._request("POST", path, body, timeout=timeout)
 

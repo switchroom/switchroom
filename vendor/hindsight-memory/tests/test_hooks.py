@@ -801,7 +801,13 @@ class TestRetainHook:
         # Should not raise
         _run_hook("retain", hook_input, monkeypatch, tmp_path, urlopen_side_effect=raise_error)
 
-    def test_retain_posts_async_true(self, monkeypatch, tmp_path):
+    def test_retain_durability_post_is_commit_before_ack(self, monkeypatch, tmp_path):
+        # Switchroom #3244 §1.1: the Stop-hook durability retain now POSTs with
+        # ``async=false`` (commit-before-ack) so the 200 proves durable
+        # persistence before the watermark advances — a bare async-200
+        # (ack-of-receipt) must never mark unpersisted work committed. This
+        # replaces the former ``async: true`` assertion (the deliberate
+        # behaviour change; other, non-watermark callers still default async).
         messages = [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "world"}]
         transcript = make_transcript_file(tmp_path, messages)
         hook_input = make_hook_input(transcript_path=transcript)
@@ -815,7 +821,7 @@ class TestRetainHook:
         _run_hook("retain", hook_input, monkeypatch, tmp_path, urlopen_side_effect=capture)
 
         if "body" in captured:
-            assert captured["body"].get("async") is True
+            assert captured["body"].get("async") is False
 
     def test_retain_includes_context_label(self, monkeypatch, tmp_path):
         messages = [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "world"}]

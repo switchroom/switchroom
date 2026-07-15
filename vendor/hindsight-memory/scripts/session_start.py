@@ -88,6 +88,20 @@ def main():
         # this up via run-hook.sh — see exit-code path in __main__.
         debug_log(config, f"drain_pending unexpected error (ignored): {e}")
 
+    # Boot reconciliation (switchroom #3244): AFTER the drain, diff the durable
+    # per-session watermark against the on-disk transcript tail and recover any
+    # un-committed human turns an abrupt session death (SIGKILL / OOM /
+    # watchdog) skipped — the drain only replays what SessionEnd managed to
+    # enqueue, which an abrupt kill never runs. This is the load-bearing
+    # guarantee; it is naturally cheap (skips sessions with no gap) and bounded
+    # (lookback / turn-cap / wall-clock budget, each enqueuing its remainder).
+    try:
+        from reconcile_tail import reconcile as reconcile_tail
+
+        reconcile_tail(config, hook_input=hook_input)
+    except Exception as e:
+        debug_log(config, f"reconcile_tail unexpected error (ignored): {e}")
+
 
 if __name__ == "__main__":
     try:
