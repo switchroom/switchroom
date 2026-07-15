@@ -32,7 +32,7 @@ import { join } from "node:path";
 // Agent-executable surfaces — the places code actually runs inside an agent
 // HOME (where the trap bites). NOT docs/prose (CHANGELOG, src comments), which
 // legitimately describe the historical `npx playwright` behaviour.
-const ROOTS = ["skills", "bin", "commands", "telegram-plugin/gateway"];
+const ROOTS = ["skills", "bin", "commands", "telegram-plugin/gateway", "telegram-plugin/hooks"];
 const EXT = /\.(sh|py|mjs|cjs|js|ts|md)$/;
 const SKIP_DIRS = new Set(["node_modules", "dist", ".git"]);
 
