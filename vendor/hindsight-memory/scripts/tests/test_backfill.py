@@ -16,6 +16,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -103,14 +104,15 @@ class BackfillTestBase(unittest.TestCase):
             "HINDSIGHT_BACKFILL_PROGRESS": os.path.join(self.home, ".hindsight", "backfill-progress.json"),
             "HINDSIGHT_BACKFILL_LOCK": os.path.join(self.home, ".hindsight", "backfill.lock"),
             "HINDSIGHT_AGENTS_DIR": self.agents_root,
-            "HINDSIGHT_BACKFILL_DELAY_MS": "0",  # tests inject their own delay
+            "HINDSIGHT_BACKFILL_DELAY_MS": "0",   # tests inject their own delay
+            "HINDSIGHT_BACKFILL_MIN_IDLE_S": "0",  # freshly-written fixtures aren't "active"
         }, clear=False)
         self.env.start()
         for k in list(os.environ):
             if k.startswith("HINDSIGHT_") and k not in (
                 "HINDSIGHT_PENDING_DIR", "HINDSIGHT_RETAINED_DIR", "HINDSIGHT_INFLIGHT_LOCK",
                 "HINDSIGHT_BACKFILL_PROGRESS", "HINDSIGHT_BACKFILL_LOCK", "HINDSIGHT_AGENTS_DIR",
-                "HINDSIGHT_BACKFILL_DELAY_MS",
+                "HINDSIGHT_BACKFILL_DELAY_MS", "HINDSIGHT_BACKFILL_MIN_IDLE_S",
             ):
                 os.environ.pop(k, None)
 
@@ -283,6 +285,77 @@ class TestBackfill(BackfillTestBase):
         report = bf.Backfill(self._config(), commit=True, delay_ms=0).run(agent_filter={"clerk"})
         self.assertIn("clerk", report["agents"])
         self.assertNotIn("scout", report["agents"])
+
+    # -- F3: the total-loss GATE is load-bearing (live doc, no watermark) -----
+    def test_total_loss_gate_prevents_live_vs_backfill_duplication(self):
+        # A session the LIVE path retained (a sliding-window doc in the bank) but
+        # whose watermark IS present. Backfill must NOT re-post it — the ids do
+        # NOT converge with the live path's, so a re-post would DUPLICATE the
+        # turns under different ids the daemon can't upsert away. The guard here
+        # is the classification gate, not id-convergence.
+        path = self._transcript("clerk", "sess-live", 5)
+        # Seed a live-path doc under a DIFFERENT (sliding-window-shaped) id.
+        live_id = "sess-live-r-live-sliding-window"
+        self.daemon.docs[live_id] = {"content": "live user turn 3\nlive user turn 4", "metadata": {}}
+        # The live path also wrote a watermark (the normal, healthy case).
+        watermark.commit("sess-live", "sess-live-a4", live_id,
+                         transcript_path=path, ordered_uuids=["sess-live-u4"])
+        before = len(self.daemon.docs)
+
+        report = bf.Backfill(self._config(), commit=True, delay_ms=0).run()
+
+        # Gate held: classified partial (watermark present) → skipped, zero posts,
+        # no second doc for the same turns.
+        self.assertEqual(report["rollup"]["sessions_partial_skipped"], 1)
+        self.assertEqual(self.daemon.posts, [])
+        self.assertEqual(len(self.daemon.docs), before)
+
+        # Prove the gate is load-bearing: with the watermark REMOVED (the F3
+        # watermark-write-failure shape) the same session WOULD be reclassified
+        # total-loss and re-posted, creating additional docs beyond the live one.
+        os.remove(os.path.join(os.environ["HINDSIGHT_RETAINED_DIR"], "sess-live.json"))
+        bf.Backfill(self._config(), commit=True, delay_ms=0,
+                    progress=bf.Progress(os.path.join(self.home, ".hindsight", "prog2.json"))).run()
+        self.assertGreater(len(self.daemon.docs), before)  # gate removed ⇒ duplication
+
+    # -- F1: a dynamic-bank agent is refused, never written to a guessed bank -
+    def test_dynamic_bank_agent_refused(self):
+        self._transcript("clerk", "sess-dyn", 3)
+        cfg = self._config()
+        cfg["dynamicBankId"] = True
+        cfg["dynamicBankGranularity"] = ["agent", "project"]
+
+        report = bf.Backfill(cfg, commit=True, delay_ms=0).run(agent_filter={"clerk"})
+
+        self.assertTrue(report["agents"]["clerk"]["dynamic_bank_skipped"])
+        self.assertEqual(report["rollup"]["dynamic_bank_agents_skipped"], 1)
+        # Nothing written to any guessed bank.
+        self.assertEqual(self.daemon.posts, [])
+        self.assertEqual(report["rollup"]["posts_ok"], 0)
+
+    # -- F2: resuming with a different --slice-turns is refused --------------
+    def test_slice_turns_mismatch_refused_on_resume(self):
+        self._transcript("clerk", "sess-st", 3)
+        # First commit run pins slice_turns=40.
+        bf.Backfill(self._config(), commit=True, delay_ms=0, slice_turns=40).run()
+        # A resume with a different slice size must refuse (would orphan run-1's
+        # slices as duplicates under new ids).
+        with self.assertRaises(ValueError):
+            bf.Backfill(self._config(), commit=True, delay_ms=0, slice_turns=10).run()
+
+    # -- F3: an active / recently-written session is skipped -----------------
+    def test_active_session_skipped(self):
+        path = self._transcript("clerk", "sess-hot", 3)
+        # Fresh mtime (now) with a 1h idle threshold → classified active.
+        report = bf.Backfill(self._config(), commit=True, delay_ms=0, min_idle_s=3600).run()
+        self.assertEqual(report["rollup"]["sessions_active_skipped"], 1)
+        self.assertEqual(report["rollup"]["sessions_total_loss"], 0)
+        self.assertEqual(self.daemon.posts, [])
+        # Backdate the transcript → now idle → recovered.
+        old = time.time() - 7200
+        os.utime(path, (old, old))
+        report2 = bf.Backfill(self._config(), commit=True, delay_ms=0, min_idle_s=3600).run()
+        self.assertEqual(report2["rollup"]["sessions_total_loss"], 1)
 
 
 if __name__ == "__main__":

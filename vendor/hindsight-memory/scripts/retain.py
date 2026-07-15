@@ -156,10 +156,20 @@ def slice_document_id(session_id: str, messages_slice: list, transcript_text: st
     ``{session_id}-r{start_uuid}-{end_uuid}`` from the FULL first/last transcript
     entry uuids of the retained slice — NOT truncated (32+32 bits birthday-
     collide across months of history and a collision is *silent loss*, not a
-    dup). Because the id is a pure function of *which turns* are retained, the
-    live Stop-hook path, boot reconciliation, and the PR2 backfill all compute
-    the IDENTICAL id for the same slice ⇒ they upsert on the daemon's
-    document_id key instead of double-storing. No wall clock, no randomness.
+    dup). The id is a pure function of *which turns* (which start/end uuids) are
+    retained, so any two writes of the **identical** slice — the live Stop-hook
+    path re-firing the same window, or boot reconciliation re-posting it —
+    compute the same id and upsert on the daemon's document_id key instead of
+    double-storing. No wall clock, no randomness.
+
+    CAUTION — this convergence is only for the *same slice boundaries*. The live
+    path slices a *sliding* ``retainEveryNTurns``+overlap window (see
+    ``select_retain_window``) while the PR2 backfill slices *non-overlapping*
+    fixed-size chunks; they do NOT produce the same boundaries for the same
+    turns, so their ids do NOT converge and the daemon cannot upsert one against
+    the other. The backfill stays duplicate-free via its total-loss gate (it
+    only re-posts sessions the live path wrote nothing for), NOT via id-identity
+    with the live path — do not conflate the two.
 
     Fallback (legacy/flat transcripts with no per-entry uuid): a sha256 of the
     formatted transcript content — still purely deterministic and convergent

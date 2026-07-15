@@ -17,15 +17,23 @@ over ALL history for ALL agents, paced, resumable, with a dry-run."
 Guarantees, all resting on daemon contracts CONFIRMED against hindsight
 v0.18.24 (daemon-contract-20260715.md):
 
-* **Dedup by deterministic document_id + daemon UPSERT.** Every slice is posted
-  under ``{session_id}-r{start_uuid}-{end_uuid}`` — a pure function of *which
-  turns* it holds. The daemon UPSERTs on ``(id, bank_id)``
-  (``ops_postgresql.py:63-69`` ``ON CONFLICT DO UPDATE``; full-replace of
-  derived memories, ``fact_storage.py:334-360``) and short-circuits an
-  identical re-post on ``content_hash``. So re-deriving ids across history — and
-  colliding with anything the live path already wrote for the SAME slice —
-  upserts to ONE document, never a duplicate. No separate existence query
-  needed for the total-loss case.
+* **Dedup by deterministic document_id + daemon UPSERT — ACROSS BACKFILL
+  RE-RUNS.** Every slice is posted under ``{session_id}-r{start_uuid}-{end_uuid}``
+  — a pure function of *which turns* it holds. The daemon UPSERTs on
+  ``(id, bank_id)`` (``ops_postgresql.py:63-69`` ``ON CONFLICT DO UPDATE``;
+  full-replace of derived memories, ``fact_storage.py:334-360``) and
+  short-circuits an identical re-post on ``content_hash``. So two backfill runs
+  over the same transcript **with the same ``slice_turns``** compute identical
+  ids and upsert to ONE document. NOTE — these ids do **NOT** converge with the
+  live/boot path's ids: the live path slices a *sliding* ``retainEveryNTurns``+
+  overlap window (``retain.py:130-136``) while the backfill slices *non-
+  overlapping* ``slice_turns`` (default 40) chunks, so the boundary uuids differ
+  and the daemon CANNOT upsert one against the other. The backfill is kept
+  duplicate-free **not** by id-convergence with the live path but by the
+  **total-loss gate** (§ classification below — it only ever re-posts sessions
+  the live path wrote *nothing* for) plus advancing the watermark after commit.
+  Do NOT remove the total-loss gate believing upsert will dedup live-vs-backfill
+  — it will not.
 * **Never-storm pacing (HARD).** Strictly serial — one ``client.retain()`` in
   flight at a time, fleet-wide, via PR1's shared ``retain-inflight.lock``
   (acquired blocking around every POST) plus a backfill-only ``backfill.lock``
@@ -45,17 +53,30 @@ v0.18.24 (daemon-contract-20260715.md):
   completed sessions are skipped, an in-progress session re-does its current
   slices (safe upsert), no duplicates.
 
-Classification (design Part 2 dedup redesign):
+Classification & guards (design Part 2 dedup redesign + PR3248 review F1/F3):
 
-* **No live watermark for the session** ⇒ true-total-loss (the clerk case) —
-  post it in full.
+* **Dynamic-bank agent** ⇒ **REFUSED (warn + skip, no writes).** Its bank is
+  composed from ``project``/``channel``/``user`` (bank.py), none recoverable
+  from a transcript scan, so backfilling would write to the WRONG bank. Only
+  static-bank agents are eligible (F1).
+* **Active / recently-written session** (transcript mtime within
+  ``--min-idle-s``, default 1h) ⇒ **SKIPPED.** An in-flight session may have no
+  watermark yet; re-posting non-overlapping slices while the live path writes
+  sliding-window slices would duplicate the same turns under different ids the
+  daemon can't upsert away (F3).
+* **No live watermark, idle session** ⇒ true-total-loss (the clerk case) —
+  post it in full. RESIDUAL (F3, narrow): a *closed* session whose live retain
+  landed but whose best-effort watermark WRITE failed has a bank doc and no
+  watermark; it is indistinguishable from total-loss without a per-document
+  existence query (which the vendored client lacks) and would be re-posted. The
+  ``--min-idle-s`` gate does not close this; it is a rare, documented residual.
 * **Has a live watermark** ⇒ partially retained by the live path, whose slice
-  boundaries may differ from the backfill's, so an id-collision is not
-  guaranteed. The vendored client exposes no per-document existence query, so
-  the conservative default is to **SKIP and report for manual review** rather
-  than risk a partial-overlap duplicate. (Total-loss recovery is the backfill's
-  real job; partial sessions are already served by the live path + boot
-  reconcile.)
+  boundaries differ from the backfill's, so an id-collision is not guaranteed.
+  The vendored client exposes no per-document existence query, so the
+  conservative default is to **SKIP and report for manual review** rather than
+  risk a partial-overlap duplicate. Consequence: a permanently-closed partial
+  session's lost TAIL is not recovered by backfill (only the live path + boot
+  reconcile cover it) — surfaced in the report, not silently dropped.
 """
 
 from __future__ import annotations
@@ -111,6 +132,29 @@ def _cooldown_s() -> float:
         return 120.0
 
 
+def _min_idle_s(override: Optional[int] = None) -> float:
+    """A session whose transcript was modified more recently than this is treated
+    as ACTIVE / in-flight and is NEVER backfilled (F3): an active session may have
+    no watermark yet, so classifying it total-loss and re-posting non-overlapping
+    slices would duplicate turns the live path is concurrently writing. Default
+    1h; override with ``--min-idle-s`` / ``HINDSIGHT_BACKFILL_MIN_IDLE_S``."""
+    if override is not None:
+        return max(0, override)
+    try:
+        return max(0.0, float(os.environ.get("HINDSIGHT_BACKFILL_MIN_IDLE_S", "3600")))
+    except ValueError:
+        return 3600.0
+
+
+def _is_dynamic_bank(config: dict) -> bool:
+    """True when the loaded config resolves banks dynamically (per project /
+    channel / user). A transcript scan cannot reliably reconstruct such a bank
+    (F1): ``cwd`` is unknown at backfill time so ``project`` → ``unknown`` and
+    ``channel``/``user`` fall back to the operator's env — the recovered memory
+    would land in the WRONG bank. Such agents are refused (warn + skip)."""
+    return bool(config.get("dynamicBankId", False))
+
+
 _STALL_THRESHOLD = 3          # consecutive failures → circuit-breaker cooldown
 _BACKOFF_CAP_S = 60.0         # exponential backoff ceiling
 
@@ -146,9 +190,43 @@ class Progress:
         self._data: dict = {}
         self._load()
 
+    # Reserved (non-session) key holding id-affecting run params. Cannot collide
+    # with an "<agent>/<session>" key.
+    PARAMS_KEY = "__backfill_params__"
+
     @staticmethod
     def _key(agent: str, session: str) -> str:
         return f"{agent}/{session}"
+
+    def recorded_slice_turns(self) -> Optional[int]:
+        entry = self._data.get(self.PARAMS_KEY)
+        if isinstance(entry, dict):
+            val = entry.get("slice_turns")
+            return int(val) if isinstance(val, int) else None
+        return None
+
+    def ensure_slice_turns(self, slice_turns: int) -> None:
+        """Persist the run's ``slice_turns`` on first commit, and REFUSE to
+        resume with a different value (F2).
+
+        A different ``slice_turns`` re-slices at new boundaries → new
+        ``document_id``s → the already-committed run-1 slices orphan as
+        duplicates (the daemon can't upsert them away). Raises ``ValueError`` on
+        mismatch so the caller aborts before writing anything new.
+        """
+        recorded = self.recorded_slice_turns()
+        if recorded is None:
+            self._data[self.PARAMS_KEY] = {"slice_turns": int(slice_turns)}
+            self._flush()
+            return
+        if recorded != int(slice_turns):
+            raise ValueError(
+                f"backfill-progress.json was written with slice_turns={recorded}, "
+                f"but this run requested slice_turns={slice_turns}. Resuming with a "
+                f"different slice size would orphan the already-committed slices as "
+                f"duplicates. Re-run with --slice-turns {recorded}, or start a fresh "
+                f"backfill (new --backfill-progress path / clear the progress file)."
+            )
 
     def _load(self) -> None:
         try:
@@ -257,6 +335,7 @@ class Backfill:
         slice_turns: Optional[int] = None,
         max_per_min: Optional[int] = None,
         agents_root: Optional[str] = None,
+        min_idle_s: Optional[int] = None,
         client: Optional[HindsightClient] = None,
         progress: Optional[Progress] = None,
     ):
@@ -266,6 +345,8 @@ class Backfill:
         self.slice_turns = _slice_turns(slice_turns)
         self.max_per_min = max_per_min
         self.agents_root = agents_root or agents_dir()
+        self.min_idle_s = _min_idle_s(min_idle_s)
+        self.dynamic_bank = _is_dynamic_bank(config)
         self.client = client
         self.progress = progress or Progress()
         self._api_url = None
@@ -378,9 +459,12 @@ class Backfill:
 
     def _agent_report(self, agent: str) -> dict:
         return self.report["agents"].setdefault(agent, {
+            "bank_id": None,
+            "dynamic_bank_skipped": False,
             "sessions_scanned": 0,
             "sessions_total_loss": 0,
             "sessions_partial_skipped": 0,
+            "sessions_active_skipped": 0,
             "sessions_already_done": 0,
             "turns_recovered": 0,
             "slices": 0,
@@ -390,6 +474,10 @@ class Backfill:
         })
 
     def run(self, agent_filter: Optional[set] = None) -> dict:
+        # F2: on a commit run, pin the id-affecting slice_turns; refuse to resume
+        # a progress file written with a different value (raises ValueError).
+        if self.commit:
+            self.progress.ensure_slice_turns(self.slice_turns)
         for agent in self._list_agents(agent_filter):
             self._backfill_agent(agent)
         self._finalize_report()
@@ -397,6 +485,21 @@ class Backfill:
 
     def _backfill_agent(self, agent: str) -> None:
         ar = self._agent_report(agent)
+
+        # F1: a dynamic-bank agent's bank cannot be reconstructed from a
+        # transcript scan (cwd/channel/user are unknown at backfill time), so we
+        # REFUSE it entirely rather than write recovered memory to a guessed
+        # WRONG bank. Warn loudly, count, and skip — never post.
+        if self.dynamic_bank:
+            ar["dynamic_bank_skipped"] = True
+            debug_log(self.config,
+                      f"backfill: REFUSING dynamic-bank agent {agent} — bank cannot be "
+                      f"reliably reconstructed from a transcript scan; skipping.")
+            print(f"[Hindsight] backfill: WARNING — {agent} is dynamic-bank; refusing to "
+                  f"guess its bank. Skipped (no writes).", file=sys.stderr)
+            return
+
+        now = time.time()
         for path in self._agent_transcripts(agent):
             session = _session_id_from_path(path)
             ar["sessions_scanned"] += 1
@@ -404,6 +507,19 @@ class Backfill:
             # Resumability: an already-completed session is skipped cheaply.
             if self.progress.is_done(agent, session):
                 ar["sessions_already_done"] += 1
+                continue
+
+            # F3: never touch an ACTIVE / recently-written session — it may have
+            # no watermark yet, and re-posting non-overlapping slices while the
+            # live path writes sliding-window slices duplicates the turns.
+            try:
+                idle = now - os.path.getmtime(path)
+            except OSError:
+                continue
+            if idle < self.min_idle_s:
+                ar["sessions_active_skipped"] += 1
+                ar["sessions"].append({"session": session, "class": "active",
+                                       "action": "skipped_recent", "idle_s": round(idle, 1)})
                 continue
 
             messages = read_transcript(path)
@@ -427,6 +543,8 @@ class Backfill:
                 continue
 
             bank_id = _resolve_bank_id(agent, session, self.config)
+            if ar["bank_id"] is None:
+                ar["bank_id"] = bank_id
             built_slices = []
             n_turns = 0
             for sl in slices:
@@ -447,6 +565,7 @@ class Backfill:
             ar["turns_recovered"] += n_turns
             ar["sessions"].append({
                 "session": session, "class": "total_loss",
+                "bank_id": bank_id,
                 "slices": len(built_slices), "turns": n_turns,
                 "document_ids": [b["document_id"] for b in built_slices],
             })
@@ -484,20 +603,26 @@ class Backfill:
     def _finalize_report(self) -> None:
         roll = {
             "agents": len(self.report["agents"]),
+            "dynamic_bank_agents_skipped": 0,
             "sessions_scanned": 0,
             "sessions_total_loss": 0,
             "sessions_partial_skipped": 0,
+            "sessions_active_skipped": 0,
             "sessions_already_done": 0,
             "turns_recovered": 0,
             "slices": 0,
             "posts_ok": 0,
             "posts_failed": 0,
+            "slice_turns": self.slice_turns,
             "committed": self.commit,
         }
         for ar in self.report["agents"].values():
+            if ar.get("dynamic_bank_skipped"):
+                roll["dynamic_bank_agents_skipped"] += 1
             for k in (
                 "sessions_scanned", "sessions_total_loss", "sessions_partial_skipped",
-                "sessions_already_done", "turns_recovered", "slices", "posts_ok", "posts_failed",
+                "sessions_active_skipped", "sessions_already_done", "turns_recovered",
+                "slices", "posts_ok", "posts_failed",
             ):
                 roll[k] += ar[k]
         self.report["rollup"] = roll
@@ -512,10 +637,14 @@ def format_report(report: dict) -> str:
     lines = [f"[Hindsight] backfill report — {mode}", ""]
     for agent in sorted(report.get("agents", {})):
         ar = report["agents"][agent]
+        if ar.get("dynamic_bank_skipped"):
+            lines.append(f"  {agent}: DYNAMIC-BANK — REFUSED (bank not reconstructable, no writes)")
+            continue
         lines.append(
-            f"  {agent}: scanned={ar['sessions_scanned']} "
+            f"  {agent} [bank={ar.get('bank_id')}]: scanned={ar['sessions_scanned']} "
             f"total_loss={ar['sessions_total_loss']} "
             f"partial_skipped={ar['sessions_partial_skipped']} "
+            f"active_skipped={ar['sessions_active_skipped']} "
             f"already_done={ar['sessions_already_done']} "
             f"turns={ar['turns_recovered']} slices={ar['slices']} "
             f"posts_ok={ar['posts_ok']} posts_failed={ar['posts_failed']}"
@@ -523,10 +652,12 @@ def format_report(report: dict) -> str:
     lines.append("")
     lines.append(
         f"  ROLLUP: agents={roll.get('agents', 0)} "
+        f"dynamic_bank_refused={roll.get('dynamic_bank_agents_skipped', 0)} "
         f"total_loss_sessions={roll.get('sessions_total_loss', 0)} "
         f"partial_skipped={roll.get('sessions_partial_skipped', 0)} "
+        f"active_skipped={roll.get('sessions_active_skipped', 0)} "
         f"turns_would_recover={roll.get('turns_recovered', 0)} "
-        f"slices={roll.get('slices', 0)} "
+        f"slices={roll.get('slices', 0)} slice_turns={roll.get('slice_turns')} "
         f"posts_ok={roll.get('posts_ok', 0)} posts_failed={roll.get('posts_failed', 0)}"
     )
     if not roll.get("committed"):
@@ -573,8 +704,20 @@ def main(argv=None) -> int:
     parser.add_argument("--delay-ms", type=int, default=None, help="Inter-POST delay (default 1500).")
     parser.add_argument("--slice-turns", type=int, default=None, help="Human turns per document slice (default 40).")
     parser.add_argument("--max-per-min", type=int, default=None, help="Optional hard POST rate cap.")
+    parser.add_argument("--min-idle-s", type=int, default=None,
+                        help="Skip sessions whose transcript was modified within this many seconds "
+                             "(treated as active/in-flight). Default 3600.")
     parser.add_argument("--json", action="store_true", help="Emit the machine-readable report as JSON.")
     args = parser.parse_args(argv)
+
+    # F1/F3 footgun guard: a blanket --commit across the whole fleet can write to
+    # a wrong (dynamic) bank or double-post an active session. Require an explicit
+    # per-agent opt-in for any write; dry-run may still scan the whole fleet.
+    if args.commit and not args.agents:
+        print("[Hindsight] backfill: --commit requires an explicit --agent <name> "
+              "(fleet-wide commit is refused; dry-run the fleet first, then commit per agent).",
+              file=sys.stderr)
+        return 2
 
     config = load_config()
 
@@ -592,9 +735,15 @@ def main(argv=None) -> int:
             slice_turns=args.slice_turns,
             max_per_min=args.max_per_min,
             agents_root=args.agents_dir,
+            min_idle_s=args.min_idle_s,
         )
         agent_filter = set(args.agents) if args.agents else None
-        report = bf.run(agent_filter)
+        try:
+            report = bf.run(agent_filter)
+        except ValueError as e:
+            # F2: slice_turns mismatch on resume — refuse before writing.
+            print(f"[Hindsight] backfill: {e}", file=sys.stderr)
+            return 2
     finally:
         if mutex is not None:
             try:
