@@ -17,6 +17,7 @@ Exit codes:
   0 — always (graceful degradation on any error)
 """
 
+import hashlib
 import json
 import os
 import sys
@@ -24,6 +25,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from lib import watermark
 from lib.bank import derive_bank_id, ensure_bank_mission
 from lib.client import HindsightClient
 from lib.config import debug_log, load_config
@@ -32,6 +34,7 @@ from lib.content import (
     slice_last_turns_by_user_boundary,
 )
 from lib.daemon import get_api_url
+from lib.pacing import inflight_lock
 from lib.state import increment_turn_count, track_retention
 
 
@@ -41,7 +44,14 @@ def read_transcript(transcript_path: str) -> list:
     Claude Code transcript format nests messages:
       {type: "user", message: {role: "user", content: "..."}, uuid: "...", ...}
     Also supports flat format for testing:
-      {role: "user", content: "..."}
+      {role: "user", content: "...", uuid: "..."}
+
+    The per-entry ``uuid`` Claude Code stamps on every ``.jsonl`` line is
+    surfaced onto the returned message dict (switchroom #3244) so the
+    deterministic content-derived ``document_id`` and the durable retain
+    watermark can key on it. The uuid is stable across compaction and unique
+    per entry. Adding the key is inert for downstream formatting
+    (``lib/content`` reads only ``role``/``content``).
     """
     if not transcript_path or not os.path.isfile(transcript_path):
         return []
@@ -58,6 +68,12 @@ def read_transcript(transcript_path: str) -> list:
                     if entry.get("type") in ("user", "assistant"):
                         msg = entry.get("message", {})
                         if isinstance(msg, dict) and msg.get("role"):
+                            # Surface the transcript-entry uuid (nested format
+                            # carries it on the OUTER entry, not the message).
+                            uid = entry.get("uuid")
+                            if uid is not None and "uuid" not in msg:
+                                msg = dict(msg)
+                                msg["uuid"] = uid
                             messages.append(msg)
                     # Flat format (testing / future compatibility)
                     elif "role" in entry and "content" in entry:
@@ -121,6 +137,164 @@ def select_retain_window(
     # Full session: vendor full-session mode, OR a forced (SessionEnd) chunked
     # sweep. Retain all messages, always as a full window.
     return list(all_messages), True
+
+
+def _ordered_uuids(all_messages: list) -> list:
+    """Transcript-order list of entry uuids (skips entries without one)."""
+    out = []
+    for m in all_messages:
+        if isinstance(m, dict):
+            uid = m.get("uuid")
+            if uid:
+                out.append(uid)
+    return out
+
+
+def slice_document_id(session_id: str, messages_slice: list, transcript_text: str) -> str:
+    """Deterministic, content-derived retain ``document_id`` (switchroom #3244 §1).
+
+    ``{session_id}-r{start_uuid}-{end_uuid}`` from the FULL first/last transcript
+    entry uuids of the retained slice — NOT truncated (32+32 bits birthday-
+    collide across months of history and a collision is *silent loss*, not a
+    dup). Because the id is a pure function of *which turns* are retained, the
+    live Stop-hook path, boot reconciliation, and the PR2 backfill all compute
+    the IDENTICAL id for the same slice ⇒ they upsert on the daemon's
+    document_id key instead of double-storing. No wall clock, no randomness.
+
+    Fallback (legacy/flat transcripts with no per-entry uuid): a sha256 of the
+    formatted transcript content — still purely deterministic and convergent
+    across paths for identical content.
+    """
+    start = messages_slice[0].get("uuid") if messages_slice else None
+    end = messages_slice[-1].get("uuid") if messages_slice else None
+    if start and end:
+        return f"{session_id}-r{start}-{end}"
+    digest = hashlib.sha256((transcript_text or "").encode("utf-8")).hexdigest()[:32]
+    return f"{session_id}-r{digest}"
+
+
+def build_retain_payload(
+    config: dict,
+    session_id: str,
+    messages_to_retain: list,
+    all_messages: list,
+    *,
+    bank_id: str,
+    api_url,
+    api_token,
+    retain_full_window: bool = True,
+    document_id=None,
+) -> dict | None:
+    """Pure transcript → retain payload + deterministic id (switchroom #3244 §1.4).
+
+    NETWORK-FREE and MISSION-WRITE-FREE by contract: it formats the slice,
+    computes the deterministic content-derived ``document_id`` (unless one is
+    supplied, e.g. the full-session compaction-tracked id), and assembles the
+    exact kwargs ``client.retain()`` / the pending-retains drainer expect. It
+    issues NO HTTP and never touches ``ensure_bank_mission`` — so the boot
+    reconciler and the PR2 dry-run can import it and stay genuinely write-free.
+
+    Returns ``{payload, document_id, message_count, last_uuid, ordered_uuids,
+    transcript}`` or ``None`` when the slice formats to nothing.
+    """
+    retain_roles = config.get("retainRoles", ["user", "assistant"])
+    include_tool_calls = config.get("retainToolCalls", True)
+    transcript, message_count = prepare_retention_transcript(
+        messages_to_retain, retain_roles, retain_full_window, include_tool_calls=include_tool_calls
+    )
+    if not transcript:
+        return None
+
+    if document_id is None:
+        document_id = slice_document_id(session_id, messages_to_retain, transcript)
+
+    template_vars = {
+        "session_id": session_id,
+        "bank_id": bank_id,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "user_id": os.environ.get("HINDSIGHT_USER_ID", ""),
+    }
+
+    def _resolve_template(value: str) -> str:
+        for k, v in template_vars.items():
+            value = value.replace(f"{{{k}}}", v)
+        return value
+
+    raw_tags = config.get("retainTags", [])
+    if raw_tags:
+        tags = []
+        for original in raw_tags:
+            resolved = _resolve_template(original)
+            if ":" in resolved and resolved.split(":", 1)[1] == "":
+                continue
+            tags.append(resolved)
+        if not tags:
+            tags = None
+    else:
+        tags = None
+
+    metadata = {
+        "retained_at": template_vars["timestamp"],
+        "message_count": str(message_count),
+        "session_id": session_id,
+    }
+    for k, v in config.get("retainMetadata", {}).items():
+        metadata[k] = _resolve_template(str(v))
+
+    # Topic tagging (switchroom PR6a) — best-effort, never fails a build.
+    try:
+        from lib.gateway_ipc import extract_topic_from_prompt
+
+        topic_chat_id = None
+        topic_thread_id = None
+        for m in reversed(messages_to_retain):
+            if not isinstance(m, dict) or m.get("role") != "user":
+                continue
+            content = m.get("content")
+            text = content if isinstance(content, str) else (
+                next((p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"), "")
+                if isinstance(content, list) else ""
+            )
+            c_id, t_id = extract_topic_from_prompt(text)
+            if c_id is not None:
+                topic_chat_id, topic_thread_id = c_id, t_id
+                break
+        if topic_chat_id is not None:
+            metadata["chat_id"] = topic_chat_id
+            if topic_thread_id is not None:
+                metadata["thread_id"] = topic_thread_id
+                aliases_json = os.environ.get("HINDSIGHT_TOPIC_ALIASES_JSON", "")
+                if aliases_json:
+                    try:
+                        aliases = json.loads(aliases_json)
+                        if isinstance(aliases, dict):
+                            inverse = {str(v): k for k, v in aliases.items()}
+                            alias = inverse.get(str(topic_thread_id))
+                            if alias:
+                                metadata["topic_alias"] = alias
+                    except (json.JSONDecodeError, ValueError, TypeError):
+                        pass
+    except Exception:
+        pass
+
+    payload = {
+        "api_url": api_url,
+        "api_token": api_token,
+        "bank_id": bank_id,
+        "content": transcript,
+        "document_id": document_id,
+        "context": config.get("retainContext", "claude-code"),
+        "metadata": metadata,
+        "tags": tags,
+    }
+    return {
+        "payload": payload,
+        "document_id": document_id,
+        "message_count": message_count,
+        "last_uuid": messages_to_retain[-1].get("uuid") if messages_to_retain else None,
+        "ordered_uuids": _ordered_uuids(all_messages),
+        "transcript": transcript,
+    }
 
 
 def run_retain(hook_input: dict, force: bool = False) -> dict:
@@ -211,17 +385,6 @@ def run_retain(hook_input: dict, force: bool = False) -> dict:
     else:
         debug_log(config, f"Full session retain: {len(all_messages)} messages")
 
-    # Format transcript
-    retain_roles = config.get("retainRoles", ["user", "assistant"])
-    include_tool_calls = config.get("retainToolCalls", True)
-    transcript, message_count = prepare_retention_transcript(
-        messages_to_retain, retain_roles, retain_full_window, include_tool_calls=include_tool_calls
-    )
-
-    if not transcript:
-        debug_log(config, "Empty transcript after formatting, skipping retain")
-        return {"status": "skipped", "reason": "empty transcript after formatting"}
-
     # Resolve API URL
     def _dbg(*a):
         debug_log(config, *a)
@@ -250,15 +413,18 @@ def run_retain(hook_input: dict, force: bool = False) -> dict:
     bank_id = derive_bank_id(hook_input, config)
     ensure_bank_mission(client, bank_id, config, debug_fn=_dbg)
 
-    # Document ID strategy:
-    # - Chunked mode: each chunk gets a timestamped document_id.
-    # - Full-session mode: uses session_id as base, but tracks message count
-    #   to detect compaction.  When Claude Code compacts the conversation the
-    #   transcript shrinks — if we kept the same document_id we'd overwrite the
-    #   pre-compaction document with a shorter one, losing context.  Instead we
-    #   increment a chunk counter so the old document is preserved.
+    # Document ID strategy (switchroom #3244 §1 — single deterministic namespace):
+    # - Chunked mode at retainEveryNTurns>1 (the deployed default): a
+    #   *content-derived* id computed from the slice's first/last transcript
+    #   uuids (``document_id=None`` lets build_retain_payload compute it). This
+    #   REPLACES the former wall-clock ``{session_id}-{time.time()*1000}`` id so
+    #   the live path, boot reconciliation, and the PR2 backfill all mint the
+    #   SAME id for the same turns ⇒ upsert, not duplicate.
+    # - Full-session mode / n==1: unchanged — a stable ``session_id`` base with
+    #   a compaction chunk counter so a shrinking transcript doesn't overwrite
+    #   the pre-compaction document with a shorter one.
     if retain_mode == "chunked" and retain_every_n > 1:
-        document_id = f"{session_id}-{int(time.time() * 1000)}"
+        document_id = None  # build_retain_payload computes the content-derived id
     else:
         chunk_index, compacted = track_retention(session_id, len(all_messages))
         if compacted:
@@ -270,135 +436,80 @@ def run_retain(hook_input: dict, force: bool = False) -> dict:
         # chunk 0 → plain session_id (backwards compatible with existing docs)
         document_id = session_id if chunk_index == 0 else f"{session_id}-c{chunk_index}"
 
-    # Resolve template variables in tags and metadata.
-    # Supported variables: {session_id}, {bank_id}, {timestamp}, {user_id}
-    template_vars = {
-        "session_id": session_id,
-        "bank_id": bank_id,
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "user_id": os.environ.get("HINDSIGHT_USER_ID", ""),
-    }
-
-    def _resolve_template(value: str) -> str:
-        for k, v in template_vars.items():
-            value = value.replace(f"{{{k}}}", v)
-        return value
-
-    # Tags from config with template resolution.
-    # Drop tags whose resolved form ends in an empty namespace part (e.g. "user:"
-    # when HINDSIGHT_USER_ID is unset). Tags without ':' are preserved as-is.
-    raw_tags = config.get("retainTags", [])
-    if raw_tags:
-        tags = []
-        for original in raw_tags:
-            resolved = _resolve_template(original)
-            if ":" in resolved and resolved.split(":", 1)[1] == "":
-                debug_log(config, f"Dropping tag '{original}' -> '{resolved}' (empty content after ':')")
-                continue
-            tags.append(resolved)
-        if not tags:
-            tags = None
-    else:
-        tags = None
-
-    # Metadata: merge built-in defaults with user-configured extras
-    metadata = {
-        "retained_at": template_vars["timestamp"],
-        "message_count": str(message_count),
-        "session_id": session_id,
-    }
-    for k, v in config.get("retainMetadata", {}).items():
-        metadata[k] = _resolve_template(str(v))
-
-    # Switchroom PR6a — topic tagging for supergroup-mode agents.
-    # Scan the messages we're retaining for the latest `<channel
-    # chat_id=... message_thread_id=...>` envelope and stamp the
-    # tuple into metadata. Downstream (recall.py) uses this to log
-    # active-vs-source topic for binding-failure analysis and to
-    # support hard-filter mode when an operator opts in.
-    #
-    # No-op for fleet-shared / DM topology where every inbound from
-    # this agent carries the same chat_id (or no chat envelope at all
-    # for interactive / cron-only sessions) — the metadata is added
-    # but doesn't change behaviour.
-    try:
-        from lib.gateway_ipc import extract_topic_from_prompt
-        topic_chat_id = None
-        topic_thread_id = None
-        # Walk in reverse — most recent user message is the authoritative
-        # "active topic" at retain time.
-        for m in reversed(messages_to_retain):
-            if not isinstance(m, dict) or m.get("role") != "user":
-                continue
-            content = m.get("content")
-            text = content if isinstance(content, str) else (
-                # Claude Code list-content shape: [{type:"text", text:"..."}, ...]
-                next((p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"), "")
-                if isinstance(content, list) else ""
-            )
-            c_id, t_id = extract_topic_from_prompt(text)
-            if c_id is not None:
-                topic_chat_id, topic_thread_id = c_id, t_id
-                break
-        if topic_chat_id is not None:
-            metadata["chat_id"] = topic_chat_id
-            if topic_thread_id is not None:
-                metadata["thread_id"] = topic_thread_id
-                # Resolve alias from operator-injected env map.
-                aliases_json = os.environ.get("HINDSIGHT_TOPIC_ALIASES_JSON", "")
-                if aliases_json:
-                    try:
-                        aliases = json.loads(aliases_json)
-                        # aliases is {alias_name: thread_id_int_or_str}; build
-                        # the inverse lookup once.
-                        if isinstance(aliases, dict):
-                            inverse = {str(v): k for k, v in aliases.items()}
-                            alias = inverse.get(str(topic_thread_id))
-                            if alias:
-                                metadata["topic_alias"] = alias
-                    except (json.JSONDecodeError, ValueError, TypeError):
-                        pass  # malformed env is non-fatal
-    except Exception as e:
-        # Topic tagging is best-effort — never fail a retain over it.
-        debug_log(config, f"Topic tagging skipped: {e}")
-
-    debug_log(
-        config, f"Retaining to bank '{bank_id}', doc '{document_id}', {message_count} messages, {len(transcript)} chars"
+    # Build the payload via the shared, network-free seam (§1.4). This carries
+    # the deterministic id, connection info, formatted transcript, tags and
+    # metadata — sufficient to retry from a different process (drain_pending).
+    built = build_retain_payload(
+        config,
+        session_id,
+        messages_to_retain,
+        all_messages,
+        bank_id=bank_id,
+        api_url=api_url,
+        api_token=api_token,
+        retain_full_window=retain_full_window,
+        document_id=document_id,
     )
-    if tags:
-        debug_log(config, f"Tags: {tags}")
+    if built is None:
+        debug_log(config, "Empty transcript after formatting, skipping retain")
+        return {"status": "skipped", "reason": "empty transcript after formatting"}
 
-    # Build the full payload up-front so we can hand it to the pending-
-    # retains queue verbatim if the POST fails. The payload mirrors the
-    # client.retain() kwargs plus connection info (api_url, api_token)
-    # so the drainer can reconstruct the call from a different process.
-    payload = {
-        "api_url": api_url,
-        "api_token": api_token,
-        "bank_id": bank_id,
-        "content": transcript,
-        "document_id": document_id,
-        "context": config.get("retainContext", "claude-code"),
-        "metadata": metadata,
-        "tags": tags,
-    }
+    payload = built["payload"]
+    document_id = built["document_id"]
+    debug_log(
+        config,
+        f"Retaining to bank '{bank_id}', doc '{document_id}', {built['message_count']} messages",
+    )
 
-    # POST to Hindsight retain API
+    # POST to Hindsight retain API under the shared fleet pacing lock (§1.5) so
+    # at most one durability POST is in flight for this agent. The live Stop
+    # path acquires it NON-BLOCKING (turn latency must not regress): if a boot
+    # reconcile / backfill holds it, we do NOT wait — we return the failure
+    # payload so main() enqueues it and the next boot drain delivers it. A
+    # forced SessionEnd sweep waits (blocking) since it is the final flush.
+    with inflight_lock(blocking=force) as acquired:
+        if not acquired:
+            debug_log(config, "retain-inflight lock busy; deferring retain to pending-retains")
+            return {
+                "status": "failed",
+                "error": RuntimeError("retain-inflight lock busy; deferring to pending-retains"),
+                "payload": payload,
+            }
+        try:
+            # async_processing=False (§1.1): commit-before-ack so the 200 proves
+            # durable persistence before we advance the watermark. A bare async
+            # 200 (ack-of-receipt) must never mark unpersisted work committed.
+            response = client.retain(
+                bank_id=bank_id,
+                content=payload["content"],
+                document_id=document_id,
+                context=payload["context"],
+                metadata=payload["metadata"],
+                tags=payload["tags"],
+                timeout=15,
+                async_processing=False,
+            )
+        except Exception as e:
+            print(f"[Hindsight] Retain failed: {e}", file=sys.stderr)
+            return {"status": "failed", "error": e, "payload": payload}
+
+    debug_log(config, f"Retain response: {json.dumps(response)[:200]}")
+
+    # Advance the durable watermark ONLY after confirmed persistence (§1.1).
+    # Best-effort: a watermark write failure must never fail a landed retain —
+    # worst case the boot reconciler re-upserts the same slice idempotently.
     try:
-        response = client.retain(
-            bank_id=bank_id,
-            content=transcript,
-            document_id=document_id,
-            context=payload["context"],
-            metadata=metadata,
-            tags=tags,
-            timeout=15,
+        watermark.commit(
+            session_id,
+            built["last_uuid"],
+            document_id,
+            transcript_path=transcript_path,
+            ordered_uuids=built["ordered_uuids"],
         )
-        debug_log(config, f"Retain response: {json.dumps(response)[:200]}")
-        return {"status": "ok", "response": response}
-    except Exception as e:
-        print(f"[Hindsight] Retain failed: {e}", file=sys.stderr)
-        return {"status": "failed", "error": e, "payload": payload}
+    except Exception as e:  # pragma: no cover - defensive
+        debug_log(config, f"watermark commit skipped: {e}")
+
+    return {"status": "ok", "response": response}
 
 
 def main():
@@ -407,7 +518,42 @@ def main():
     except (json.JSONDecodeError, EOFError):
         print("[Hindsight] Failed to read hook input", file=sys.stderr)
         return
-    run_retain(hook_input, force=False)
+
+    # Close hole A2 (switchroom #3244): the Stop entrypoint used to discard
+    # run_retain's return value, so a failed per-turn retain (daemon busy /
+    # unreachable / lock-deferred) was silently dropped — never queued, never
+    # surfaced. Mirror session_end.py: on a failed retain WITH a payload,
+    # durably enqueue it to pending-retains so the next SessionStart drain
+    # replays it. The deterministic content-derived document_id (§1) means a
+    # queued entry and a later boot-reconcile entry for the same window collide
+    # on id ⇒ upsert, not duplicate — so no id rewrite is needed here.
+    #
+    # We keep exit 0: retain.py is registered as an async Stop hook (hooks.json)
+    # whose exit code Claude Code discards. Durability comes from the enqueue,
+    # not the exit code.
+    result = run_retain(hook_input, force=False) or {}
+    if result.get("status") == "failed" and result.get("payload"):
+        try:
+            from lib.pending import MAX_ENTRIES, count as pending_count, enqueue as pending_enqueue
+
+            err = result.get("error") or RuntimeError("stop retain failed")
+            queued = pending_enqueue(result["payload"], err)
+            if queued is None:
+                print(
+                    f"[Hindsight] pending-retains queue full ({MAX_ENTRIES} entries); "
+                    f"dropping this Stop retain. Operator: drain manually, then run "
+                    f"`switchroom doctor`.",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"[Hindsight] Stop retain failed: queued to pending-retains "
+                    f"(error: {type(err).__name__}: {err}, pending={pending_count()}). "
+                    f"Will retry on next SessionStart.",
+                    file=sys.stderr,
+                )
+        except Exception as e:  # pragma: no cover - defensive
+            print(f"[Hindsight] Stop retain enqueue failed: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":

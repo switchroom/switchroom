@@ -72,7 +72,18 @@ def _budget_seconds() -> float:
 
 
 def _retry_one(entry: dict, timeout: int) -> None:
-    """POST a single queued retain. Raises on failure."""
+    """POST a single queued retain. Raises on failure.
+
+    Posts ``async_processing=False`` (commit-before-ack, switchroom #3244 §1.1):
+    the drain is a DURABILITY path — it deletes the pending entry on a 200, so
+    the 200 must prove durable persistence, not merely ack-of-receipt. A bare
+    async 200 followed by a dropped extraction would delete the queue entry
+    while the content never lands, and (for boot-reconcile remainders whose
+    watermark already advanced) there is no reconcile backstop — silent loss
+    (the #3244 bug). All drained entries — Stop-hook A2 failures, SessionEnd
+    failures, and reconcile-remainder deferrals — are durability retries, so
+    sync is correct for every one.
+    """
     client = HindsightClient(entry["api_url"], entry.get("api_token"))
     client.retain(
         bank_id=entry["bank_id"],
@@ -82,6 +93,7 @@ def _retry_one(entry: dict, timeout: int) -> None:
         metadata=entry.get("metadata") or {},
         tags=entry.get("tags"),
         timeout=timeout,
+        async_processing=False,
     )
 
 
