@@ -113,6 +113,13 @@ describe("Dockerfile.agent Playwright provisioning", () => {
     expect(dockerfile).toMatch(/ARG\s+PLAYWRIGHT_VERSION=\d+\.\d+\.\d+\s*$/m);
   });
 
+  it("pins PLAYWRIGHT_VERSION to the current baked version (1.61.1, chromium ~1228)", () => {
+    // Lock the exact bumped value so a stray/partial revert is caught. Bump
+    // this string in lockstep with the ARG (and re-verify JS==Python share
+    // one chromium revision) on the next Playwright upgrade.
+    expect(dockerfile).toMatch(/ARG\s+PLAYWRIGHT_VERSION=1\.61\.1\s*$/m);
+  });
+
   it("installs the JS binding at the pinned version", () => {
     expect(dockerfile).toMatch(
       /npm\s+install\s+-g\s+playwright@\$\{PLAYWRIGHT_VERSION\}/,

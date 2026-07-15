@@ -91,9 +91,12 @@ COPY --from=ghcr.io/astral-sh/uv:0.7.13 /uv /uvx /usr/local/bin/
 # `--with-deps chromium` installs the apt packages chromium needs at
 # runtime (libnss3, libatk1.0-0, libcups2 etc.) at build time as root,
 # baked into the image layer — the non-root agent never runs apt.
-# Firefox / Webkit can be added per-agent via `npx playwright install
-# <browser>` without re-baking; chromium is the default because most
-# skills use it.
+# Firefox / Webkit can be added per-agent via the baked global binary —
+# `playwright install <browser>` (NOT bare `npx playwright`, which from an
+# agent home with no local install fetches playwright@latest and demands an
+# unbaked chromium revision → "Executable doesn't exist" — see
+# scripts/check-no-unpinned-npx-playwright.mjs) — without re-baking; chromium
+# is the default because most skills use it.
 #
 # Browser binaries land at $PLAYWRIGHT_BROWSERS_PATH (image layer,
 # OS-independent) instead of $HOME/.cache/.
@@ -101,10 +104,14 @@ COPY --from=ghcr.io/astral-sh/uv:0.7.13 /uv /uvx /usr/local/bin/
 # Placed here — well above the `COPY dist/**` block — so a typical
 # src-only PR rebuilds 3-4 small COPY layers instead of triggering
 # this ~150MB layer (which would also pay ~20s of `playwright install`).
-ARG PLAYWRIGHT_VERSION=1.60.0
+ARG PLAYWRIGHT_VERSION=1.61.1
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright/browsers
 
-# JS binding + chromium browser + system libs.
+# JS binding + chromium browser + system libs. The `npx playwright` here is
+# safe (and NOT the unpinned-npx trap): the pinned global was just installed
+# on the line above, so npx resolves that baked binary rather than fetching
+# playwright@latest. The trap is a bare `npx playwright` from an agent HOME
+# with no local install — guarded by scripts/check-no-unpinned-npx-playwright.mjs.
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
     npm install -g playwright@${PLAYWRIGHT_VERSION} \
  && npx playwright install --with-deps chromium
