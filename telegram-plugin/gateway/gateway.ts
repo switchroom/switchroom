@@ -3322,6 +3322,20 @@ type CurrentTurn = {
   // sync_retain are suppressed at the hook (computeLabel returns null) and
   // never arrive as tool_label events — excluded automatically.
   labeledToolCount: number
+  // Running total of the PARENT agent's OWN token usage this turn, summed from
+  // the main-tier session-tail `usage` events (input + output + cache_read +
+  // cache_creation per assistant message, via sumUsageTokens). Rendered on the
+  // 🤖 turn-activity card's metrics line (`… · N tok · model`). This is the
+  // parent alone — sub-agent tokens are NOT folded in here (they report on
+  // their own worker-feed rows; summing them would double-count). 0 until the
+  // turn's first assistant line carries a usage block.
+  totalTokens: number
+  // Dedup guard for `totalTokens`: Claude Code persists one logical assistant
+  // message as MULTIPLE JSONL lines sharing one `message.id`, each stamped with
+  // the SAME `usage` block. We fold a given `message.id` exactly once (same
+  // idempotency as the sub-agent watcher's `seenUsageMessageIds`). A null/absent
+  // messageId is un-dedupable and always counted.
+  seenUsageMessageIds: Set<string>
   // Tool-activity summary — mirrors Claude Code's native chat-UI
   // rendering ("Ran 5 commands, read a file"). Counters are
   // incremented in `case 'tool_use'`; `activityMessageId` holds the
@@ -16246,6 +16260,9 @@ function composeTurnActivity(turn: CurrentTurn, final = false, liveSuffix = ''):
     toolCount: turn.labeledToolCount,
     state: final ? 'done' : 'running',
     model: turn.currentModel,
+    // The parent's OWN running token total → `· N tok` on the metrics line.
+    // 0 → tokenSegment omits it (clean, same as the worker feed).
+    totalTokens: turn.totalTokens,
   }
   return renderActivityFeedWithNested(turn.mirrorLines, childLines, final, liveSuffix, stepCount, header)
 }
@@ -17303,6 +17320,8 @@ function handleSessionEvent(ev: SessionEvent): void {
           lastAssistantDone: false,
           toolCallCount: 0,
           labeledToolCount: 0,
+          totalTokens: 0,
+          seenUsageMessageIds: new Set<string>(),
           activityMessageId: null,
           activityInFlight: null,
           activityPendingRender: null,
@@ -17482,6 +17501,22 @@ function handleSessionEvent(ev: SessionEvent): void {
         turn.currentModel = ev.model
       }
       sessionModelSource.noteTranscriptModel(ev.model)
+      return
+    }
+    case 'usage': {
+      // Fold the parent agent's OWN per-message token usage into the turn's
+      // running total, deduped by message.id (one logical assistant message can
+      // land as several JSONL lines sharing one id + usage block). Rendered on
+      // the 🤖 turn-activity card's metrics line. Sub-agent tokens are NOT
+      // folded here — they surface on their own worker-feed rows; summing them
+      // would double-count. A null messageId is un-dedupable → always counted.
+      const turn = currentTurn
+      if (turn == null) return
+      if (ev.messageId != null) {
+        if (turn.seenUsageMessageIds.has(ev.messageId)) return
+        turn.seenUsageMessageIds.add(ev.messageId)
+      }
+      turn.totalTokens += ev.totalTokens
       return
     }
     case 'thinking': {

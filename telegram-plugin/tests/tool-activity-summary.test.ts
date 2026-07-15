@@ -928,6 +928,39 @@ describe("renderActivityFeed — header param (main-session card fix)", () => {
     expect(nested).toContain("· opus 4.8_");
   });
 
+  it("threads the parent's OWN totalTokens through the flat and nested turn-card paths", () => {
+    const header: SessionActivityHeader = {
+      label: "Agent",
+      elapsedMs: 120_000,
+      toolCount: 14,
+      state: "running",
+      model: "claude-opus-4-8",
+      totalTokens: 12_400,
+    };
+    // Flat path (no foreground sub-agent).
+    const flat = renderActivityFeed(["Searching memory"], false, "", undefined, header)!;
+    expect(flat).toContain("_2m00s · 14 tools · 12.4k tok · opus 4.8_");
+    // Nested path (with a child line) carries the same token segment.
+    const nested = renderActivityFeedWithNested(["Reading"], ["nested step"], false, "", undefined, header)!;
+    expect(nested).toContain("· 12.4k tok ·");
+  });
+
+  it("omits the token segment on the turn card when totalTokens is 0 / undefined", () => {
+    const zero: SessionActivityHeader = {
+      label: "Agent",
+      elapsedMs: 15_000,
+      toolCount: 7,
+      state: "running",
+      totalTokens: 0,
+    };
+    const outZero = renderActivityFeed(["Searching memory"], false, "", undefined, zero)!;
+    expect(outZero).toContain("_15s · 7 tools_");
+    expect(outZero).not.toContain("tok");
+    // undefined behaves identically.
+    const undef: SessionActivityHeader = { label: "Agent", elapsedMs: 15_000, toolCount: 7, state: "running" };
+    expect(renderActivityFeed(["Searching memory"], false, "", undefined, undef)).toBe(outZero);
+  });
+
   it("prepends the done header when final=true", () => {
     const header: SessionActivityHeader = {
       label: "Agent",
