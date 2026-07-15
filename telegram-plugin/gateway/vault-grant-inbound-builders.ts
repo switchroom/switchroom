@@ -149,21 +149,62 @@ export function buildVaultGrantDeniedInbound(opts: {
  * @param key           Vault key (rendered inline-code).
  * @param days          Grant TTL in whole days.
  * @param grantId       Broker-returned grant id.
+ * @param reasonEscaped Optional original request reason the agent gave,
+ *                      already run through `escapeHtmlForTg` (it is
+ *                      agent-supplied free text). Rendered as a trailing
+ *                      italic clause for audit visibility. Omitted when
+ *                      absent/empty so no dangling "Reason:" label shows.
+ *                      Placed BEFORE the footer so the auth-mode note
+ *                      stays last.
  * @param footer        Optional trailing footer (e.g. the telegram-id
  *                      auth-mode note). Empty string when absent.
  */
+/** Max characters of agent-supplied reason rendered on the grant card.
+ *  Keeps the edited card well under Telegram's 4096-char editMessageText
+ *  limit — the edit is fire-and-forget (`.catch(() => {})`), so an
+ *  over-long reason would silently fail the edit and leave the pending
+ *  approve/deny buttons showing even though the grant already succeeded. */
+export const MAX_GRANT_REASON_CHARS = 300
+
+/**
+ * Normalize an agent-supplied grant reason for single-line rendering
+ * inside the GFM italic clause `_Reason: …_`:
+ *   - collapse ALL whitespace runs to a single space (a newline breaks
+ *     the `_…_` emphasis — the opening `_` renders literal),
+ *   - trim, so a whitespace-only reason cleanly no-ops (returns ''),
+ *   - cap length with a trailing ellipsis so the card edit can't blow
+ *     past Telegram's message-length limit.
+ *
+ * Returns UNescaped text — the caller MUST HTML-escape the result before
+ * rendering (it is agent-supplied free text). Returns '' for
+ * empty/whitespace-only/undefined input so the caller can skip the clause.
+ */
+export function normalizeGrantReason(raw: string | undefined | null): string {
+  if (raw == null) return ''
+  const collapsed = raw.replace(/\s+/g, ' ').trim()
+  if (collapsed.length === 0) return ''
+  return collapsed.length > MAX_GRANT_REASON_CHARS
+    ? collapsed.slice(0, MAX_GRANT_REASON_CHARS - 1) + '…'
+    : collapsed
+}
+
 export function buildVaultGrantApprovedCardText(opts: {
   agentEscaped: string
   scope: 'read' | 'write'
   key: string
   days: number
   grantId: string
+  reasonEscaped?: string
   footer?: string
 }): string {
+  const reasonClause =
+    opts.reasonEscaped != null && opts.reasonEscaped.length > 0
+      ? ` _Reason: ${opts.reasonEscaped}_`
+      : ''
   return (
     `✅ Granted **${opts.agentEscaped}** ${opts.scope} access to ` +
     `\`${opts.key}\` for ${opts.days}d. ` +
-    `(grant \`${opts.grantId}\`)` + (opts.footer ?? '')
+    `(grant \`${opts.grantId}\`)` + reasonClause + (opts.footer ?? '')
   )
 }
 

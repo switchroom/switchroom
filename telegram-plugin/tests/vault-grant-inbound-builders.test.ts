@@ -16,6 +16,8 @@ import { describe, it, expect } from 'vitest'
 import {
   buildVaultGrantApprovedInbound,
   buildVaultGrantApprovedCardText,
+  normalizeGrantReason,
+  MAX_GRANT_REASON_CHARS,
   buildVaultGrantDeniedInbound,
   buildVaultSaveCompletedInbound,
   buildVaultSaveFailedInbound,
@@ -85,12 +87,135 @@ describe('buildVaultGrantApprovedCardText — the [object Object] regression gua
     expect(noFooter.endsWith('(grant `vg_a1b2c3`)')).toBe(true)
   })
 
+  it('renders the reason as a trailing italic clause when provided, before the footer', () => {
+    const text = buildVaultGrantApprovedCardText({
+      ...BASE,
+      reasonEscaped: 'deploy the staging build',
+      footer: '\n_Approver verified by Telegram identity._',
+    })
+    expect(text).toContain('_Reason: deploy the staging build_')
+    // reason clause sits BEFORE the footer (auth-mode note stays last)
+    expect(text.indexOf('_Reason:')).toBeLessThan(text.indexOf('_Approver verified'))
+    // still one clean string
+    const rich = richMessage(text)
+    expect(rich.markdown).toBe(text)
+    expect(rich.markdown).not.toContain('[object Object]')
+  })
+
+  it('omits the reason clause when reason is undefined or empty — no dangling "Reason:" label', () => {
+    const none = buildVaultGrantApprovedCardText(BASE)
+    expect(none).not.toContain('Reason:')
+    expect(none.endsWith('(grant `vg_a1b2c3`)')).toBe(true)
+
+    const empty = buildVaultGrantApprovedCardText({ ...BASE, reasonEscaped: '' })
+    expect(empty).not.toContain('Reason:')
+    expect(empty.endsWith('(grant `vg_a1b2c3`)')).toBe(true)
+  })
+
+  it('reason clause + reason-less both stay clean when combined with a footer', () => {
+    const footer = '\n_Approver verified by Telegram identity._'
+    const withReason = buildVaultGrantApprovedCardText({ ...BASE, reasonEscaped: 'x', footer })
+    expect(withReason.endsWith(footer)).toBe(true)
+    const noReason = buildVaultGrantApprovedCardText({ ...BASE, footer })
+    expect(noReason.endsWith(footer)).toBe(true)
+    expect(noReason).not.toContain('Reason:')
+  })
+
+  it('carries an already-escaped reason verbatim — HTML-special chars stay escaped, no corruption', () => {
+    // The callsite escapes agent-supplied free text with escapeHtmlForTg
+    // BEFORE passing it (same contract as agentEscaped). Simulate that:
+    // `<b> & "co" *_` → escaped form. The builder must not re-corrupt it,
+    // and the single-richMessage wrap must still hold.
+    const escaped = '&lt;b&gt; &amp; drop &amp;&amp; run *_'
+    const text = buildVaultGrantApprovedCardText({ ...BASE, reasonEscaped: escaped })
+    expect(text).toContain(`_Reason: ${escaped}_`)
+    // No raw unescaped angle brackets leaked into the card text.
+    expect(text).not.toContain('<b>')
+    const rich = richMessage(text)
+    expect(rich.markdown).toBe(text)
+    expect(rich.markdown).not.toContain('[object Object]')
+  })
+
   it('DOCUMENTS the original bug: bare-string + richMessage() coerces to [object Object]', () => {
     // Demonstrates why the fix matters — if a future edit reintroduces the
     // "concatenate a string onto the richMessage object" pattern, the result
     // contains the literal "[object Object]". The helper above avoids it.
     const buggy = '✅ Granted access. ' + (richMessage('(grant `vg_x`)') as unknown as string)
     expect(buggy).toContain('[object Object]')
+  })
+})
+
+describe('normalizeGrantReason — single-line, trimmed, length-capped', () => {
+  it('returns "" for undefined, null, empty, or whitespace-only input (clean no-op)', () => {
+    expect(normalizeGrantReason(undefined)).toBe('')
+    expect(normalizeGrantReason(null)).toBe('')
+    expect(normalizeGrantReason('')).toBe('')
+    expect(normalizeGrantReason('   ')).toBe('')
+    expect(normalizeGrantReason('\n\t  \n')).toBe('')
+  })
+
+  it('collapses newlines and whitespace runs to a single space (protects the _…_ emphasis)', () => {
+    expect(normalizeGrantReason('deploy\nthe   staging\tbuild')).toBe('deploy the staging build')
+    // no newline survives to break the italic clause
+    expect(normalizeGrantReason('a\nb')).not.toContain('\n')
+  })
+
+  it('trims leading/trailing whitespace', () => {
+    expect(normalizeGrantReason('  clone the repo  ')).toBe('clone the repo')
+  })
+
+  it('caps over-long input with a trailing ellipsis, at MAX_GRANT_REASON_CHARS', () => {
+    const long = 'x'.repeat(MAX_GRANT_REASON_CHARS + 50)
+    const out = normalizeGrantReason(long)
+    expect(out.length).toBe(MAX_GRANT_REASON_CHARS)
+    expect(out.endsWith('…')).toBe(true)
+    expect(out.slice(0, -1)).toBe('x'.repeat(MAX_GRANT_REASON_CHARS - 1))
+  })
+
+  it('leaves an at-limit reason untouched (no spurious ellipsis)', () => {
+    const exact = 'y'.repeat(MAX_GRANT_REASON_CHARS)
+    const out = normalizeGrantReason(exact)
+    expect(out).toBe(exact)
+    expect(out.endsWith('…')).toBe(false)
+  })
+
+  it('feeds cleanly through the card builder: whitespace-only → no clause, newline → single-line clause', () => {
+    // whitespace-only normalizes to '' → builder omits the clause
+    const wsCard = buildVaultGrantApprovedCardText({
+      agentEscaped: 'gymbro',
+      scope: 'read',
+      key: 'k',
+      days: 30,
+      grantId: 'vg_x',
+      reasonEscaped: normalizeGrantReason('   ') || undefined,
+    })
+    expect(wsCard).not.toContain('Reason:')
+
+    // newline reason renders as a single-line italic clause, no broken emphasis
+    const nlCard = buildVaultGrantApprovedCardText({
+      agentEscaped: 'gymbro',
+      scope: 'read',
+      key: 'k',
+      days: 30,
+      grantId: 'vg_x',
+      reasonEscaped: normalizeGrantReason('line one\nline two') || undefined,
+    })
+    expect(nlCard).toContain('_Reason: line one line two_')
+    expect(nlCard).not.toContain('\nline two')
+  })
+
+  it('over-long reason renders truncated with ellipsis inside the clause', () => {
+    const reason = normalizeGrantReason('z'.repeat(MAX_GRANT_REASON_CHARS + 100)) || undefined
+    const card = buildVaultGrantApprovedCardText({
+      agentEscaped: 'gymbro',
+      scope: 'read',
+      key: 'k',
+      days: 30,
+      grantId: 'vg_x',
+      reasonEscaped: reason,
+    })
+    expect(card).toContain('…_')
+    expect(card).toContain(`_Reason: ${'z'.repeat(MAX_GRANT_REASON_CHARS - 1)}…_`)
   })
 })
 

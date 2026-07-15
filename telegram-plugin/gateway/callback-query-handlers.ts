@@ -52,6 +52,7 @@ import {
 import {
   buildVaultGrantApprovedInbound,
   buildVaultGrantApprovedCardText,
+  normalizeGrantReason,
   buildVaultGrantDeniedInbound,
   buildVaultSaveCompletedInbound,
   buildVaultSaveFailedInbound,
@@ -786,6 +787,10 @@ async function performVaultAccessApproval(
   pendingCardStore.remove(stageId)
   if (pending.card_message_id != null) {
     const days = Math.round(pending.ttl_seconds / 86400)
+    // Normalize + cap the agent-supplied reason to a single line BEFORE
+    // escaping, so the value passed into the card builder is already
+    // safe to render inside the `_Reason: …_` italic clause.
+    const reasonNormalized = normalizeGrantReason(pending.reason)
     const footer =
       getVaultApprovalAuthMode() === 'telegram-id'
         ? `\n_Approver verified by Telegram identity — broker auto-unlocked at startup._`
@@ -801,6 +806,8 @@ async function performVaultAccessApproval(
             key: pending.key,
             days,
             grantId: id,
+            reasonEscaped:
+              reasonNormalized.length > 0 ? escapeHtmlForTg(reasonNormalized) : undefined,
             footer,
           }),
         ),
