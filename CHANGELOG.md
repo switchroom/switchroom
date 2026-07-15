@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+## v0.18.26 — Agent replies stop mis-rendering currency and prose as Telegram formatting
+
+The headline is a deterministic outbound guard so agent replies are no
+longer accidentally typeset by Telegram's server-side GFM parser. The
+trigger was two dollar amounts in a message rendering as TeX math
+(#3252); the fix generalises to the whole class of accidental-formatting
+bugs — currency, intra-word emphasis, line-start block constructs, and
+inline-pair constructs — while leaving formatting the agent actually
+intended (real bold, lists, headings, quotes, tables, links) untouched.
+Also a Playwright bump.
+
+### Outbound accidental-formatting guards at the richMessage seam (#3252 — #3255)
+
+Since switchroom began sending raw GFM markdown that Telegram parses
+server-side (Bot API 10.1), any prose that happens to look like markup
+gets typeset. Two dollar amounts (`~$0.5M ... ~$150k`) formed a `$…$`
+inline-math span and rendered as slanted TeX; the renderer never escaped
+`$`. Rather than fix only the dollar case, the outbound path now runs a
+composed, code/link/table-aware guard at the single `richMessage()` wire
+seam — the one choke-point every `{markdown}` send funnels through — so
+the reply path, cards, and streaming previews are all covered exactly
+once:
+
+- **Currency** — `$`-before-digit escaped when 2+ currency tokens are
+  present (the original #3252 case).
+- **Intra-word emphasis** — a lone `_`/`*` between alphanumerics
+  (`file_name_here`, `a*b*c`) no longer italicises mid-sentence.
+- **Line-start block constructs** — accidental blockquote (`>2x`) and
+  4+digit ordered-list (`2026.`) openings are neutralised; genuinely
+  ambiguous cases (`- 5 degrees` bullets, `# heading`-style lines) are
+  deliberately left alone so intended lists and headings still render.
+- **Inline pairs** — digit-adjacent `~` and word-flanked `==`/`||` no
+  longer strike through, highlight, or spoiler innocent prose.
+
+Every guard is a no-op unless a real signal is present, is idempotent,
+and routes around code spans/fences, markdown link destinations, bare
+autolinks, and GFM table rows — so intended formatting and clickable
+links are never corrupted. The escape mechanism (CommonMark backslash,
+the same defuser the existing escape set relies on) was confirmed
+end-to-end against a live Telegram client.
+
+### Playwright 1.60.0 → 1.61.0 + unpinned-npx guard (#3257)
+
+Routine browser-automation bump, plus a guard against the unpinned-`npx`
+trap in the Docker build.
+
 ## v0.18.21 — Agents delegate execution to workers again, and sub-agent cards paint the moment they register
 
 Two focused reliability fixes. First, agents go back to dispatching
