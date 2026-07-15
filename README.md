@@ -99,11 +99,15 @@ Full new-user walkthrough, zero to first Telegram message in ~15 minutes, plus t
 
 **Stock CLI, real OAuth.** Each agent runs the unmodified `claude` binary, authenticated with Anthropic through the same OAuth flow you use on the desktop app. No API key. No Agent SDK. No harness. No patched CLI. No proxied inference. This is a hard constraint, not a preference: running the native CLI on the subscription is what keeps switchroom inside Anthropic's third-party policy. One bill, the one you already pay. See the [Compliance Attestation](docs/compliance-attestation.md) for the full analysis.
 
+<p align="center"><img src="docs/diagrams/auth-broker.png" width="700" alt="Auth broker: your agents ride your existing Claude subscription over one OAuth login, the broker fans the credential out to every agent and fails over when one is spent, no API keys and no second bill"></p>
+
 **Least privilege, and you hold the keys.** This is the core opinion. An agent never holds the vault passphrase and never sees a secret it was not given. Secrets live in an AES-256-GCM vault. Each agent reaches the vault broker over its own socket whose identity is the bind path, so a compromised agent cannot pose as another. An agent can read a key only if you listed it for that agent's task: that is the standing, least-privilege ACL. Anything beyond that is just-in-time. The agent asks, you get an inline Telegram Approve/Deny card showing exactly what and why, and only your tap mints a scoped, expiring grant. The agent cannot self-elevate.
 
-<p align="center"><img src="docs/diagrams/approval-grant-flow.svg" width="700" alt="Approval grant flow: agent requests a key it does not have, broker stages a pending grant, you tap Allow on the Telegram card, broker mints a scoped TTL grant, the read proceeds"></p>
+<p align="center"><img src="docs/diagrams/approval-grant-flow.png" width="700" alt="Approval grant flow: agent requests a key it does not have, broker stages a pending grant, you tap Allow on the Telegram card, broker mints a scoped TTL grant, the read proceeds"></p>
 
 **The approval kernel gates risky actions too.** A separate kernel daemon handles action approvals on the same model: an agent that wants to write to a Google Doc requests it, ends its turn, and waits. You see the diff and tap Allow or Deny. Nothing destructive happens on the agent's say-so alone. TTL'd decisions expire, and every grant and denial is logged.
+
+<p align="center"><img src="docs/diagrams/approval-broker.png" width="700" alt="Approval broker: most agents act first, switchroom asks first, before any risky move the broker pauses the agent and hands the decision to you, so you hold the leash"></p>
 
 ### How agents collaborate on files
 
@@ -113,7 +117,7 @@ Switchroom's position: agents should collaborate with you on real documents, not
 
 Always available is not enough on its own. Things still die. The product has to handle that or the illusion breaks.
 
-<p align="center"><img src="docs/diagrams/wake-audit-lifecycle.svg" width="700" alt="Wake-audit lifecycle: kill, crash-pane snapshot, auto-restart, agent boots with SWITCHROOM_PENDING_TURN, acks with three options"></p>
+<p align="center"><img src="docs/diagrams/wake-audit-lifecycle.png" width="700" alt="Wake-audit lifecycle: kill, crash-pane snapshot, auto-restart, agent boots with SWITCHROOM_PENDING_TURN, acks with three options"></p>
 
 - **Auto-restart.** Agent containers run with `restart: unless-stopped` and only start once the auth-broker's healthcheck passes. The vault broker, approval kernel, and auth broker each have their own healthchecks, so a wedged dependency is caught instead of silently breaking agents.
 - **Resume protocol.** When an agent reboots mid-turn it boots with `SWITCHROOM_PENDING_TURN` plus the original chat ids. Its first action is to acknowledge the gap and ask how to proceed: start over, summarise and continue, or drop it.

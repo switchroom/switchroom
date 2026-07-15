@@ -1,6 +1,16 @@
 # approval-grant-flow — diagram spec
 
 Status: current
+
+**One idea (comprehension-first):** An agent can't touch anything sensitive
+until you tap Allow.
+
+**Source of truth = `approval-grant-flow.html`** (Method A, HTML/CSS → 2x PNG;
+see DESIGN.md Part 2). The `.html` is authored and diffable; regenerate the
+raster with `docs/diagrams/scripts/render.sh docs/diagrams/approval-grant-flow.html 1200x760`
+which writes `approval-grant-flow.png` at 2x (2400×1520). This diagram is the
+reference implementation of the DESIGN.md guide. (The legacy `.svg`/`.jpg`
+remain for now; the README image swap to the new PNG lands in a follow-up PR.)
 (Corrected 2026-05-19: the prior spec/SVG overstated the model with
 "Every gated tool call" and a synchronous "claude REPL paused" node.
 The kernel does NOT gate every tool call generically. It is a decision
@@ -41,11 +51,13 @@ Footer:   (none)
 - 1 → 2 · "① agent → kernel: register request (scope, get request_id + expires_at)" · primary-flow (brass ①)
 - 2 → 3 · "② kernel → phone: push Approve/Deny card with what + why" · primary-flow (cord ②)
 - 3 → 2 · "③ phone → kernel: you tap Allow (or Deny)" · primary-flow (cord ③)
-- 2 → 1 · "④ agent polls request_id → proceeds on allow; clean recoverable refusal on deny" · primary-flow (teal ④)
+- 2 → 1 · "④ agent polls request_id → proceeds on allow; clean recoverable refusal on deny" · primary-flow (brass-done ④)
 
 ## Style notes
 
-Inherits v3. The Drive write path (`drive-write-approval.spec.md`)
+Inherits v3. Success/done role = solid brass fill with a charcoal glyph (the
+"brass-filled check") — the retired off-brand teal is gone; red (cord) is
+reserved for the pause beat only. The Drive write path (`drive-write-approval.spec.md`)
 reuses this exact kernel + the `apv:<request_id>:once` callback — keep
 both diagrams visually consistent (same kernel card treatment, same
 ①②③④ step-numbering colors). The vault-broker grant path

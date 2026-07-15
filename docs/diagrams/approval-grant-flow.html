@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+  :root{
+    --paper:#FAF7EF; --bone-2:#EDE7D7;
+    --ink-900:#0E1013; --ink-700:#23282F; --ink-400:#5A6069; --ink-300:#8A8F98;
+    --brass:#E8B657; --brass-deep:#B8873A; --brass-tint:rgba(232,182,87,.16); --cord:#C8302C;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;}
+  html,body{background:var(--paper);
+    font-family:'Inter',system-ui,-apple-system,'Segoe UI',sans-serif;
+    color:var(--ink-700);-webkit-font-smoothing:antialiased;}
+  .stage{width:1200px;height:760px;position:relative;padding:48px 52px;}
+  .mono{font-family:'JetBrains Mono',ui-monospace,'SF Mono',Menlo,monospace;}
+
+  .kicker{font-size:12px;font-weight:700;letter-spacing:3px;color:var(--brass-deep);}
+  h1{font-size:27px;font-weight:800;color:var(--ink-900);margin-top:9px;letter-spacing:-.4px;line-height:1.18;}
+  h1 .hl{color:var(--cord);}
+  .sub{font-size:14.5px;font-weight:500;color:var(--ink-400);margin-top:8px;max-width:760px;}
+
+  /* four-beat story row */
+  .flow{position:absolute;left:52px;right:52px;top:212px;height:322px;display:flex;align-items:stretch;gap:0;}
+  .beat{position:relative;flex:1;}
+  .beat.phone{flex:1.45;}
+  .card{background:#fff;border:1.5px solid var(--bone-2);border-radius:14px;
+    box-shadow:0 6px 10px rgba(20,23,28,.14);height:100%;padding:24px 18px;position:relative;
+    display:flex;flex-direction:column;justify-content:center;}
+  .card.dark{background:var(--ink-900);border-color:#2a2f37;color:#EFEFEA;}
+  .r1{transform:rotate(-1.2deg);} .r2{transform:rotate(.8deg);} .r3{transform:rotate(-.6deg);}
+
+  .num{position:absolute;top:-15px;left:16px;width:30px;height:30px;border-radius:50%;
+    display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;
+    color:var(--paper);z-index:3;box-shadow:0 2px 5px rgba(20,23,28,.2);}
+  .n-brass{background:var(--brass);} .n-cord{background:var(--cord);}
+  /* done role: solid brass fill with charcoal glyph — completion by weight, not a new hue */
+  .n-done{background:var(--brass);color:var(--ink-900);}
+
+  .icon{width:34px;height:34px;border-radius:9px;display:flex;align-items:center;justify-content:center;margin-bottom:12px;}
+  .icon svg{width:20px;height:20px;stroke-width:1.6;fill:none;stroke-linecap:round;stroke-linejoin:round;}
+
+  .ct{font-size:15.5px;font-weight:700;color:var(--ink-900);line-height:1.25;}
+  .card.dark .ct{color:#F6F5EF;}
+  .cs{font-size:12.5px;font-weight:500;color:var(--ink-400);margin-top:7px;line-height:1.4;}
+  .card.dark .cs{color:#A7ADB5;}
+
+  /* connector arrows between beats */
+  .arrow{width:44px;flex:0 0 44px;display:flex;align-items:center;justify-content:center;align-self:center;z-index:4;}
+  .arrow svg{width:44px;height:26px;overflow:visible;}
+
+  /* phone */
+  .phone-frame{background:var(--ink-900);border-radius:22px;padding:9px;height:100%;
+    box-shadow:0 8px 14px rgba(20,23,28,.22);}
+  .phone-screen{background:#0f1216;border-radius:15px;height:100%;padding:12px 12px 14px;display:flex;flex-direction:column;}
+  .tg-top{display:flex;align-items:center;gap:7px;margin-bottom:9px;}
+  .tg-dot{width:20px;height:20px;border-radius:50%;background:var(--brass);display:flex;align-items:center;justify-content:center;}
+  .tg-dot svg{width:12px;height:12px;stroke:var(--ink-900);stroke-width:2.2;fill:none;}
+  .tg-name{font-size:11.5px;font-weight:700;color:#E9E8E2;}
+  .tg-time{font-size:10px;color:#6b7178;margin-left:auto;}
+  .bubble{background:#1b2027;border-radius:12px;border-top-left-radius:4px;padding:11px 12px;}
+  .bub-req{font-size:13px;font-weight:700;color:#F6F5EF;line-height:1.3;}
+  .bub-what{font-size:12px;color:#cdd2d8;margin-top:8px;line-height:1.45;}
+  .bub-what b{color:#fff;}
+  .bub-why{font-size:11px;color:#8a9099;margin-top:6px;font-style:italic;}
+  .btns{display:flex;gap:8px;margin-top:11px;}
+  .btn{flex:1;text-align:center;padding:9px 0;border-radius:9px;font-size:12.5px;font-weight:700;}
+  .btn-allow{background:var(--brass);color:var(--ink-900);box-shadow:0 0 0 2px rgba(232,182,87,.4);}
+  .btn-deny{background:#262c34;color:#c9ced4;}
+  .chips{display:flex;gap:6px;margin-top:11px;flex-wrap:wrap;}
+  .chip{font-size:10px;font-weight:600;padding:4px 8px;border-radius:20px;background:#20262e;color:#aab0b8;}
+  .chip.sel{background:rgba(232,182,87,.16);color:var(--brass);box-shadow:inset 0 0 0 1px rgba(232,182,87,.55);}
+
+  /* bottom reassurance strip */
+  .strip{position:absolute;left:52px;right:52px;bottom:56px;background:#fff;border:1.5px solid var(--bone-2);
+    border-radius:14px;padding:16px 22px;display:flex;align-items:center;gap:20px;box-shadow:0 6px 10px rgba(20,23,28,.1);}
+  .strip .sicon{width:30px;height:30px;flex:0 0 30px;border-radius:8px;background:rgba(232,182,87,.14);
+    display:flex;align-items:center;justify-content:center;}
+  .strip .sicon svg{width:18px;height:18px;stroke:var(--brass-deep);stroke-width:1.7;fill:none;stroke-linecap:round;stroke-linejoin:round;}
+  .strip b{color:var(--ink-900);font-weight:700;}
+  .strip .stext{font-size:13.5px;font-weight:500;color:var(--ink-700);line-height:1.4;}
+  .strip .stag{margin-left:auto;font-size:11px;color:var(--ink-300);text-align:right;line-height:1.5;flex:0 0 auto;}
+
+  /* corner accent dots */
+  .dot{position:absolute;border-radius:50%;}
+</style>
+</head>
+<body>
+<div class="stage">
+  <!-- corner accent dots -->
+  <div class="dot" style="left:80px;top:80px;width:8px;height:8px;background:var(--brass);opacity:.55;"></div>
+  <div class="dot" style="right:80px;top:80px;width:8px;height:8px;background:var(--brass);opacity:.55;"></div>
+  <div class="dot" style="left:80px;bottom:80px;width:8px;height:8px;background:var(--brass);opacity:.55;"></div>
+  <div class="dot" style="right:80px;bottom:80px;width:8px;height:8px;background:var(--brass);opacity:.55;"></div>
+  <div class="dot" style="left:140px;top:140px;width:6px;height:6px;background:var(--cord);opacity:.5;"></div>
+  <div class="dot" style="right:140px;top:140px;width:6px;height:6px;background:var(--cord);opacity:.5;"></div>
+
+  <div class="kicker">HOW APPROVALS WORK</div>
+  <h1>An agent can't touch anything sensitive <span class="hl">until you tap Allow.</span></h1>
+  <p class="sub">Every risky action pauses and waits for you. Say yes once and the grant is scoped and expiring, so a one-off yes never quietly becomes forever.</p>
+
+  <div class="flow">
+
+    <!-- 1: agent wants something -->
+    <div class="beat">
+      <div class="num n-brass">1</div>
+      <div class="card dark r1">
+        <div class="icon" style="background:rgba(232,182,87,.16);">
+          <svg viewBox="0 0 24 24" stroke="#E8B657"><rect x="4" y="7" width="16" height="12" rx="3"/><circle cx="9" cy="13" r="1.3" fill="#E8B657" stroke="none"/><circle cx="15" cy="13" r="1.3" fill="#E8B657" stroke="none"/><path d="M12 7V3M8 19v2M16 19v2"/></svg>
+        </div>
+        <div class="ct">The agent wants to do something sensitive</div>
+        <div class="cs">Edit a file, use a saved key, run a command. It stops itself and asks first.</div>
+      </div>
+    </div>
+
+    <div class="arrow"><svg viewBox="0 0 44 26"><path d="M2 13H36" stroke="#E8B657" stroke-width="2.5" fill="none" stroke-linecap="round"/><path d="M32 6l9 7-9 7" stroke="#E8B657" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+
+    <!-- 2: switchroom pauses -->
+    <div class="beat">
+      <div class="num n-cord">2</div>
+      <div class="card r2">
+        <div class="icon" style="background:rgba(200,48,44,.1);">
+          <svg viewBox="0 0 24 24" stroke="#C8302C"><rect x="7" y="5" width="3.5" height="14" rx="1.2"/><rect x="14" y="5" width="3.5" height="14" rx="1.2"/></svg>
+        </div>
+        <div class="ct">Switchroom pauses it and asks you</div>
+        <div class="cs">Nothing happens yet. It sends a card to your phone with what and why.</div>
+      </div>
+    </div>
+
+    <div class="arrow"><svg viewBox="0 0 44 26"><path d="M2 13H36" stroke="#C8302C" stroke-width="2.5" fill="none" stroke-linecap="round"/><path d="M32 6l9 7-9 7" stroke="#C8302C" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+
+    <!-- 3: your phone (emotional centre) -->
+    <div class="beat phone">
+      <div class="num n-cord" style="left:auto;right:20px;background:var(--brass);">3</div>
+      <div class="phone-frame r3">
+        <div class="phone-screen">
+          <div class="tg-top">
+            <div class="tg-dot"><svg viewBox="0 0 24 24"><path d="M4 12l5 5L20 6"/></svg></div>
+            <div class="tg-name">Switchroom</div>
+            <div class="tg-time">now</div>
+          </div>
+          <div class="bubble">
+            <div class="bub-req">@worker wants to edit a file</div>
+            <div class="bub-what mono"><b>deploy/config.yaml</b><br>replicas: 2 &rarr; 4</div>
+            <div class="bub-why">Why: scaling up before the launch</div>
+            <div class="btns">
+              <div class="btn btn-allow">Allow</div>
+              <div class="btn btn-deny">Deny</div>
+            </div>
+            <div class="chips">
+              <div class="chip sel">This call</div>
+              <div class="chip">Allow 15m</div>
+              <div class="chip">Always</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="arrow"><svg viewBox="0 0 44 26"><path d="M2 13H36" stroke="#E8B657" stroke-width="2.5" fill="none" stroke-linecap="round"/><path d="M32 6l9 7-9 7" stroke="#E8B657" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+
+    <!-- 4: outcome -->
+    <div class="beat">
+      <div class="num n-done">4</div>
+      <div class="card r1" style="border-color:rgba(232,182,87,.55);">
+        <div class="icon" style="background:var(--brass);">
+          <svg viewBox="0 0 24 24" stroke="#0E1013" stroke-width="2.4"><path d="M4 12.5l5 5L20 6.5"/></svg>
+        </div>
+        <div class="ct">You tap Allow, it proceeds</div>
+        <div class="cs">The agent picks up the yes and continues. Tap Deny and it backs off cleanly.</div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- reassurance strip -->
+  <div class="strip">
+    <div class="sicon"><svg viewBox="0 0 24 24"><path d="M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"/><path d="M9 12l2 2 4-4"/></svg></div>
+    <div class="stext"><b>Your yes is scoped and expiring.</b> Each grant covers one action for a set time, then lapses. The agent can never approve its own request, and every decision is recorded.</div>
+    <div class="stag">Scoped to (agent, action)<br>Time-limited &middot; Audited</div>
+  </div>
+</div>
+</body>
+</html>
