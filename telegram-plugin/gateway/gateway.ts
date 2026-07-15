@@ -2862,25 +2862,32 @@ function turnInFlightForGate(): boolean {
   // handlers and do not sit behind this gate — and the block is surfaced
   // off-Telegram in blocked-approvals/<agent>.json.
   const hasPendingApproval = pendingPermissions.size > 0
-  return turnInFlightMachineOnly() || hasPendingApproval
-}
-
-/**
- * The machine-in-turn portion of the gate WITHOUT the `pendingPermissions`
- * hold — "claude is actively producing a turn right now", ignoring an
- * outstanding approval card. `/model` & `/effort` read THIS (plus a
- * TTL-bounded approval check) so a wedged / undeliverable approval that "never
- * expires by design" (#3084) can't hold their switch queued forever on an idle
- * session (#3262). `turnInFlightForGate()` = this OR a pending approval.
- */
-function turnInFlightMachineOnly(): boolean {
-  if (!isDeliveryCutoverEnabled()) return claudeBusyKeys.size > 0
+  if (!isDeliveryCutoverEnabled()) return claudeBusyKeys.size > 0 || hasPendingApproval
   // Machine is authoritative. Run the log-only drift canary (#2794): the
   // imperative `claudeBusyKeys` shadow is still live in parallel, so a
   // dangerous over-hold divergence (machine holds the gate while the
   // imperative view is idle) is surfaced without changing behaviour. The
   // benign orphan-dangle direction — the wedge the machine self-heals — is
   // NOT flagged. `probeGateParity` returns the machine value unchanged.
+  return probeGateParity(isMachineInTurn(), claudeBusyKeys.size) || hasPendingApproval
+}
+
+/**
+ * The machine-in-turn portion of the gate WITHOUT the `pendingPermissions`
+ * hold — "claude is actively producing a turn right now", ignoring an
+ * outstanding approval card.
+ *
+ * This is a SEPARATE reader, NOT a refactor of `turnInFlightForGate()`. The
+ * shared gate stays strict and UNCONDITIONALLY true whenever a permission card
+ * is outstanding (the #2841 inbound-hold contract — a source-inspection test
+ * pins its exact body). Only the `/model` & `/effort` busy decision reads THIS
+ * machine-only leg (plus a TTL-bounded approval check) so a wedged /
+ * undeliverable approval that "never expires by design" (#3084) can't hold
+ * their switch queued forever on an idle session (#3262). The two-branch logic
+ * is duplicated deliberately to keep the shared gate's body untouched.
+ */
+function turnInFlightMachineOnly(): boolean {
+  if (!isDeliveryCutoverEnabled()) return claudeBusyKeys.size > 0
   return probeGateParity(isMachineInTurn(), claudeBusyKeys.size)
 }
 
