@@ -19,10 +19,42 @@
 
 import { GrammyError } from 'grammy'
 import { guardDollarMath } from './render/dollar-math-guard.js'
+import { guardAccidentalEmphasis } from './render/emphasis-guard.js'
+import { guardAccidentalBlockConstructs } from './render/line-start-guard.js'
+import { guardAccidentalInlinePairs } from './render/inline-pairs-guard.js'
 
 /** The `InputRichMessage` shape grammy 1.44 accepts on send AND edit. */
 export interface InputRichMessageMarkdown {
   markdown: string
+}
+
+/**
+ * Neutralise ALL accidental Telegram markdown typesetting in one composed pass
+ * (#3252). Each sub-guard targets a DISJOINT set of trigger characters, skips
+ * code spans / fenced blocks verbatim (shared `splitCodeSegments`), is a strict
+ * no-op absent a real signal, and is idempotent — so the composition is itself
+ * idempotent and safe to apply once per send.
+ *
+ * ── Ordering (deliberate, not arbitrary) ──────────────────────────────────
+ * `guardDollarMath` runs LAST. It backslash-escapes `$` → `\$`, and the
+ * inline-pairs guard's approximation-tilde signal is `~(?=\$?\.?\d)` — a `~`
+ * glued to a `$digit`. If the dollar guard ran first, a body like
+ * `~$5M and ~$10M` would become `~\$5M …`, and the interposed `\` would hide
+ * the digit-adjacent tildes from `guardAccidentalInlinePairs`, leaving the
+ * accidental `~…~` strikethrough pair un-neutralised (a false negative /
+ * residual bug). Running inline-pairs FIRST escapes the tildes (`\~$5M`), then
+ * the dollar guard escapes the `$` — both spans are killed. Every other pair of
+ * guards is disjoint in the characters it inspects AND the characters it
+ * inserts (`\_ \* \> \. \~ \=\= \|\|` vs `\$`), so no other insertion can
+ * create or destroy a signal for a sibling. Verified by composition tests.
+ */
+export function guardAccidentalFormatting(markdown: string): string {
+  let out = markdown
+  out = guardAccidentalEmphasis(out)
+  out = guardAccidentalBlockConstructs(out)
+  out = guardAccidentalInlinePairs(out)
+  out = guardDollarMath(out)
+  return out
 }
 
 /**
@@ -31,15 +63,16 @@ export interface InputRichMessageMarkdown {
  * This is the ONE adapter every `{ markdown }` wire send funnels through
  * (`sendRichMessage` / `editMessageText({ markdown })`) — the reply-tool final
  * answer, draft-stream previews, cards, approvals, banners. It is therefore the
- * single deterministic seam for `guardDollarMath` (#3252, F1): applying the
- * currency `$…$`-math neutraliser here guards EVERY markdown-parsed outbound
- * exactly once, without touching `plain`-mode degradations (which bypass this
- * wrapper and go straight to `sendMessage`, where no markdown parsing happens).
- * The guard is a strict no-op for any body without 2+ digit-adjacent dollars
- * and is idempotent, so callers that already ran it stay byte-identical.
+ * single deterministic seam for the #3252 accidental-formatting guards (F1):
+ * applying `guardAccidentalFormatting` here guards EVERY markdown-parsed
+ * outbound exactly once, without touching `plain`-mode degradations (which
+ * bypass this wrapper and go straight to `sendMessage`, where no markdown
+ * parsing happens). The composed guard is a strict no-op for any body without
+ * an accidental-formatting signal and is idempotent, so callers that already
+ * ran it (or the streaming path that renders then re-wraps) stay byte-identical.
  */
 export function richMessage(markdown: string): InputRichMessageMarkdown {
-  return { markdown: guardDollarMath(markdown) }
+  return { markdown: guardAccidentalFormatting(markdown) }
 }
 
 /**

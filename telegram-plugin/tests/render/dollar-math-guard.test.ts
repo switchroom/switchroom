@@ -9,9 +9,12 @@ import { RICH_MESSAGE_MAX_CHARS } from "../../format.js";
 const MATH_GLYPH = /[\u{1D400}-\u{1D7FF}]/u;
 
 /** Strip zero-width chars + defusing backslashes so we can assert the amount
- *  the reader copies is byte-identical to the original ASCII currency token. */
+ *  the reader copies is byte-identical to the original ASCII currency token.
+ *  The wire body now flows through the composed richMessage guard, so besides
+ *  the dollar defuser (`\$`) it may also carry the inline-pairs defuser (`\~`)
+ *  for approximation tildes (`~$0.5M`) — strip both so the round-trip holds. */
 function copyText(s: string): string {
-  return s.replace(/[​⁠﻿]/g, "").replace(/\\\$/g, "$");
+  return s.replace(/[​⁠﻿]/g, "").replace(/\\([$~])/g, "$1");
 }
 
 describe("guardDollarMath (#3252)", () => {
