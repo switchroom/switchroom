@@ -120,8 +120,9 @@ export type SessionEvent =
   | { kind: 'text'; text: string; blockIndex: number; lastInMessage: boolean }
   // Per-assistant-message token usage for the MAIN agent, extracted from
   // `message.usage` on each `type:"assistant"` transcript line. `totalTokens`
-  // is the summed delta for THIS message (input + output + cache_read +
-  // cache_creation, via sumUsageTokens). `messageId` is `message.id` —
+  // is the NEW-work delta for THIS message (input + output + cache_creation,
+  // via sumUsageTokens; cache_read is deliberately excluded — replayed cached
+  // context, not new work). `messageId` is `message.id` —
   // REQUIRED for dedup: Claude Code persists one logical assistant message as
   // MULTIPLE JSONL lines sharing one `message.id`, each stamped with the SAME
   // `usage` block, so the accumulator must count a given `messageId` only once
@@ -146,8 +147,9 @@ export type SessionEvent =
   | { kind: 'sub_agent_model'; agentId: string; model: string }
   // Per-assistant-message token usage for a SUB-AGENT, extracted from
   // `message.usage` on each `type:"assistant"` transcript line. `totalTokens`
-  // is the summed delta for THIS message (input + output + cache_read +
-  // cache_creation). `messageId` is `message.id` — REQUIRED for dedup: Claude
+  // is the NEW-work delta for THIS message (input + output + cache_creation;
+  // cache_read is deliberately excluded — replayed cached context, not new
+  // work). `messageId` is `message.id` — REQUIRED for dedup: Claude
   // Code ≥2.1.x persists one logical assistant message as MULTIPLE JSONL lines
   // sharing one `message.id`, each stamped with the SAME `usage` block, so the
   // watcher must count a given `messageId` only once (naive summing across
@@ -304,16 +306,21 @@ export function projectAssistantTextBlocks(
  * terminal rides the following content line, which also carries `end_turn`.
  */
 /**
- * Sum the total token delta carried by a single assistant message's `usage`
- * object: `input_tokens + output_tokens + cache_read_input_tokens +
- * cache_creation_input_tokens`. Every field is guarded with `?? 0` — Claude
- * Code omits fields that are zero/absent on some messages. A non-object (or
- * missing) usage returns 0 so the caller can skip a no-usage line.
+ * Sum the NEW token work carried by a single assistant message's `usage`
+ * object: `input_tokens + output_tokens + cache_creation_input_tokens`. Every
+ * field is guarded with `?? 0` — Claude Code omits fields that are zero/absent
+ * on some messages. A non-object (or missing) usage returns 0 so the caller
+ * can skip a no-usage line.
  *
- * These four fields ARE the whole per-message token cost (the nested
- * `iterations` / `cache_creation` breakdowns are subsets already reflected in
- * the top-level fields — never add them, that double-counts). Verified against
- * live worker jsonl.
+ * `cache_read_input_tokens` is DELIBERATELY EXCLUDED. On a prompt-cached turn
+ * it is replayed context (billed at ~10% and doing no new work), and it
+ * dominates the raw total — including it made the displayed number 2-5x bigger
+ * than the actual work done this turn and misread as a cost/effort figure. The
+ * three fields kept here represent new tokens processed this turn: fresh input,
+ * generated output, and newly-written cache. The nested `iterations` /
+ * `cache_creation` breakdowns are subsets already reflected in the top-level
+ * fields — never add them, that double-counts. Verified against live worker
+ * jsonl.
  */
 export function sumUsageTokens(usage: unknown): number {
   if (usage == null || typeof usage !== 'object') return 0
@@ -322,7 +329,6 @@ export function sumUsageTokens(usage: unknown): number {
   return (
     n(u.input_tokens) +
     n(u.output_tokens) +
-    n(u.cache_read_input_tokens) +
     n(u.cache_creation_input_tokens)
   )
 }
