@@ -115,6 +115,11 @@ export interface SessionActivityHeader {
    * `formatModelLabel` (model-label.ts).
    */
   model?: string
+  /** Running total tokens for THIS turn (the parent agent's OWN per-message
+   *  usage, summed + deduped upstream) — rendered as `· {N} tok` on the metrics
+   *  line via `tokenSegment`. Omitted (0/undefined) → no token segment, same
+   *  clean-omit behavior as the worker feed. */
+  totalTokens?: number
 }
 
 /**
@@ -537,6 +542,7 @@ export function renderActivityFeed(
           toolCount: header.toolCount,
           state: header.state,
           model: header.model,
+          totalTokens: header.totalTokens,
         }
       : undefined,
     steps: lines,
@@ -589,6 +595,7 @@ export function renderActivityFeedWithNested(
           toolCount: header.toolCount,
           state: header.state,
           model: header.model,
+          totalTokens: header.totalTokens,
         }
       : undefined,
     steps: lines,

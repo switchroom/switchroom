@@ -420,6 +420,49 @@ describe('projectTranscriptLine', () => {
     })
     expect(projectTranscriptLine(line)).toEqual([{ kind: 'thinking' }])
   })
+
+  it('emits a main-tier usage event with the summed per-message token delta + message.id', () => {
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: {
+        id: 'msg_main_1',
+        model: 'claude-opus-4-8',
+        usage: {
+          input_tokens: 100,
+          output_tokens: 50,
+          cache_read_input_tokens: 1000,
+          cache_creation_input_tokens: 200,
+        },
+        content: [{ type: 'tool_use', id: 'toolu_a', name: 'Read', input: { file_path: '/a' } }],
+      },
+    })
+    const usage = projectTranscriptLine(line).find((e) => e.kind === 'usage')
+    expect(usage).toEqual({ kind: 'usage', messageId: 'msg_main_1', totalTokens: 1350 })
+  })
+
+  it('emits no main-tier usage event when the assistant line carries no usage', () => {
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: {
+        id: 'msg_main_2',
+        model: 'claude-opus-4-8',
+        content: [{ type: 'tool_use', id: 'toolu_a', name: 'Read', input: { file_path: '/a' } }],
+      },
+    })
+    expect(projectTranscriptLine(line).some((e) => e.kind === 'usage')).toBe(false)
+  })
+
+  it('carries a null messageId on the main-tier usage event when message.id is absent', () => {
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: {
+        usage: { input_tokens: 5, output_tokens: 5 },
+        content: [{ type: 'text', text: 'working' }],
+      },
+    })
+    const usage = projectTranscriptLine(line).find((e) => e.kind === 'usage')
+    expect(usage).toEqual({ kind: 'usage', messageId: null, totalTokens: 10 })
+  })
 })
 
 // ─── Bug 1 regression: per-file cursor state survives re-attachment ────

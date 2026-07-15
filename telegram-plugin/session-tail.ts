@@ -118,6 +118,16 @@ export type SessionEvent =
   // and reserved for a future staging-skip optimization; do not assume the
   // gate keys on it.
   | { kind: 'text'; text: string; blockIndex: number; lastInMessage: boolean }
+  // Per-assistant-message token usage for the MAIN agent, extracted from
+  // `message.usage` on each `type:"assistant"` transcript line. `totalTokens`
+  // is the summed delta for THIS message (input + output + cache_read +
+  // cache_creation, via sumUsageTokens). `messageId` is `message.id` —
+  // REQUIRED for dedup: Claude Code persists one logical assistant message as
+  // MULTIPLE JSONL lines sharing one `message.id`, each stamped with the SAME
+  // `usage` block, so the accumulator must count a given `messageId` only once
+  // (naive summing across lines over-counts). Null messageId → un-dedupable,
+  // counted as-is. Mirrors `sub_agent_usage` but for the parent's OWN tokens.
+  | { kind: 'usage'; messageId: string | null; totalTokens: number }
   | { kind: 'tool_result'; toolUseId: string; toolName: string | null; isError?: boolean; errorText?: string }
   // `reason` is set ONLY by an internal gateway-synthesized turn_end (never by
   // the JSONL projection). `answer-ready-quiescence` (PR A) marks the positive
@@ -499,6 +509,23 @@ export function projectTranscriptLine(line: string): SessionEvent[] {
     const mainModel = message?.model
     if (typeof mainModel === 'string' && !isModelSentinel(mainModel)) {
       events.push({ kind: 'model', model: mainModel })
+    }
+    // Per-message token usage (MAIN tier): surface the summed delta so the
+    // gateway can accumulate the parent's OWN running total for the turn card's
+    // metrics line. `messageId` (message.id) rides along so the accumulator
+    // dedups the multi-line split-message shape (one logical message → many
+    // JSONL lines, one shared `usage`). Emitted only when a usage object with a
+    // non-zero total exists — a no-usage line contributes nothing and is
+    // skipped. Mirrors the sub-agent emit below; this counts the parent alone
+    // (sub-agents report their own tokens on their worker-feed rows).
+    const mainUsageTotal = sumUsageTokens(message?.usage)
+    if (mainUsageTotal > 0) {
+      const mainMsgId = message?.id
+      events.push({
+        kind: 'usage',
+        messageId: typeof mainMsgId === 'string' ? mainMsgId : null,
+        totalTokens: mainUsageTotal,
+      })
     }
     // Text→narrative projection comes from the ONE shared kernel
     // (projectAssistantTextBlocks): it owns the empty-drop + blockIndex +
