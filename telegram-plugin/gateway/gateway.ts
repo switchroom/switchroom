@@ -30816,7 +30816,7 @@ void (async () => {
                   )
                 }
               },
-              onFinish: ({ agentId, outcome, description, resultText, toolCount, durationMs, background: entryBackground }) => {
+              onFinish: ({ agentId, outcome, description, resultText, toolCount, totalTokens, durationMs, background: entryBackground }) => {
                 // Reaction promotion: if the parent turn already ended
                 // with this (or another) worker still running, its 👍 was
                 // deferred (held on ✍️/⚡). Now that a worker finished,
@@ -30886,6 +30886,7 @@ void (async () => {
                       description: dispatch.feedDescription,
                       lastTool: null,
                       toolCount,
+                      totalTokens,
                       latestSummary: resultText,
                       elapsedMs: durationMs,
                       state: outcome === 'failed' ? 'failed' : 'done',
@@ -30967,6 +30968,7 @@ void (async () => {
                       description: dispatch.feedDescription,
                       lastTool: null,
                       toolCount,
+                      totalTokens,
                       latestSummary: resultText,
                       elapsedMs: durationMs,
                       state: outcome === 'failed' ? 'failed' : 'done',
@@ -30988,6 +30990,7 @@ void (async () => {
                     description: dispatch.feedDescription,
                     lastTool: null,
                     toolCount,
+                    totalTokens,
                     latestSummary: resultText,
                     elapsedMs: durationMs,
                     state: outcome === 'failed' ? 'failed' : 'done',
@@ -31078,7 +31081,7 @@ void (async () => {
               // suppresses stale-after-restart delivery (a 4-h-old
               // "still working (5m)" would be a lie). Sweep on handback
               // lives in the `onFinish` block just above.
-              onProgress: ({ agentId, description, latestSummary, elapsedMs, prevBucketIdx, setBucketIdx, lastTool, toolCount, progressLine, model, skeleton }) => {
+              onProgress: ({ agentId, description, latestSummary, elapsedMs, prevBucketIdx, setBucketIdx, lastTool, toolCount, totalTokens, progressLine, model, skeleton }) => {
                 let fleetChatId = ''
                 try {
                   const fleets = progressDriver?.peekAllFleets() ?? []
@@ -31159,6 +31162,7 @@ void (async () => {
                         elapsedMs,
                         state: 'running',
                         model: feedModel,
+                        totalTokens,
                       },
                       wk.threadId,
                     )
@@ -31313,6 +31317,7 @@ void (async () => {
                       elapsedMs,
                       state: 'running',
                       model: feedModel,
+                      totalTokens,
                     },
                     wk.threadId,
                   )

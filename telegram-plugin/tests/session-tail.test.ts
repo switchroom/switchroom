@@ -6,11 +6,50 @@ import {
   projectTranscriptLine,
   projectSubagentLine,
   projectAssistantTextBlocks,
+  sumUsageTokens,
   sanitizeCwdToProjectName,
   getProjectsDirForCwd,
   startSessionTail,
   type SessionEvent,
 } from '../session-tail.js'
+
+describe('sumUsageTokens', () => {
+  it('sums input + output + cache_read + cache_creation', () => {
+    expect(
+      sumUsageTokens({
+        input_tokens: 100,
+        output_tokens: 50,
+        cache_read_input_tokens: 1000,
+        cache_creation_input_tokens: 200,
+      }),
+    ).toBe(1350)
+  })
+
+  it('guards missing fields with 0', () => {
+    expect(sumUsageTokens({ output_tokens: 42 })).toBe(42)
+    expect(sumUsageTokens({})).toBe(0)
+  })
+
+  it('ignores the nested iterations / cache_creation breakdown (no double count)', () => {
+    expect(
+      sumUsageTokens({
+        input_tokens: 2,
+        output_tokens: 3,
+        cache_read_input_tokens: 4,
+        cache_creation_input_tokens: 5,
+        cache_creation: { ephemeral_1h_input_tokens: 5, ephemeral_5m_input_tokens: 0 },
+        iterations: [{ input_tokens: 2, output_tokens: 3 }],
+      }),
+    ).toBe(14)
+  })
+
+  it('returns 0 for null / non-object / non-numeric fields', () => {
+    expect(sumUsageTokens(null)).toBe(0)
+    expect(sumUsageTokens(undefined)).toBe(0)
+    expect(sumUsageTokens('nope')).toBe(0)
+    expect(sumUsageTokens({ input_tokens: 'x', output_tokens: null })).toBe(0)
+  })
+})
 
 describe('sanitizeCwdToProjectName', () => {
   it('replaces non-alphanumeric chars with hyphens', () => {
@@ -552,6 +591,55 @@ describe('projectSubagentLine', () => {
     const events = projectSubagentLine(line, 'X', st)
     expect(events.some((e) => e.kind === 'sub_agent_model')).toBe(false)
     expect(events[0].kind).toBe('sub_agent_tool_use')
+  })
+
+  it('emits sub_agent_usage with the summed per-message token delta + message.id', () => {
+    const st = { hasEmittedStart: true }
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: {
+        id: 'msg_1',
+        model: 'claude-opus-4-8',
+        usage: {
+          input_tokens: 100,
+          output_tokens: 50,
+          cache_read_input_tokens: 1000,
+          cache_creation_input_tokens: 200,
+        },
+        content: [{ type: 'tool_use', id: 'toolu_a', name: 'Read', input: { file_path: '/a' } }],
+      },
+    })
+    const events = projectSubagentLine(line, 'X', st)
+    const usage = events.find((e) => e.kind === 'sub_agent_usage')
+    expect(usage).toEqual({ kind: 'sub_agent_usage', agentId: 'X', messageId: 'msg_1', totalTokens: 1350 })
+  })
+
+  it('emits no sub_agent_usage when the assistant line carries no usage', () => {
+    const st = { hasEmittedStart: true }
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: {
+        id: 'msg_2',
+        model: 'claude-opus-4-8',
+        content: [{ type: 'tool_use', id: 'toolu_a', name: 'Read', input: { file_path: '/a' } }],
+      },
+    })
+    const events = projectSubagentLine(line, 'X', st)
+    expect(events.some((e) => e.kind === 'sub_agent_usage')).toBe(false)
+  })
+
+  it('carries a null messageId when message.id is absent', () => {
+    const st = { hasEmittedStart: true }
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: {
+        usage: { input_tokens: 5, output_tokens: 5 },
+        content: [{ type: 'text', text: 'working' }],
+      },
+    })
+    const events = projectSubagentLine(line, 'X', st)
+    const usage = events.find((e) => e.kind === 'sub_agent_usage')
+    expect(usage).toEqual({ kind: 'sub_agent_usage', agentId: 'X', messageId: null, totalTokens: 10 })
   })
 
   it('emits sub_agent_tool_use for regular tools; nested Agent fires ONLY nested_spawn', () => {

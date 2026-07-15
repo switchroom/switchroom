@@ -550,6 +550,55 @@ describe('startSubagentWatcher', () => {
       expect(modelled?.model).toBe('claude-opus-4-8')
     })
 
+    it('accumulates total tokens across assistant messages, deduped by message.id', () => {
+      const progress: Array<{ totalTokens: number }> = []
+      const agentDir = join(tmpRoot, 'agent')
+      const subagentsDir = join(agentDir, '.claude', 'projects', 'p1', 'session-abc', 'subagents')
+      mkdirSync(subagentsDir, { recursive: true })
+      const jsonlPath = join(subagentsDir, 'agent-deadbeef.jsonl')
+
+      const h = startWatcherSync({
+        agentDir,
+        onProgress: ({ totalTokens }) => { progress.push({ totalTokens }) },
+      })
+      writeFileSync(jsonlPath, buildJSONL(subAgentUserMsg('Research the competitors')))
+      h.poll()
+
+      // Message 1 persisted as TWO JSONL lines sharing one message.id + the
+      // SAME usage block (the ≥2.1.x split-message shape). Must count ONCE.
+      const usage1 = {
+        input_tokens: 100,
+        output_tokens: 50,
+        cache_read_input_tokens: 1000,
+        cache_creation_input_tokens: 200,
+      }
+      appendFileSync(jsonlPath, buildJSONL({
+        type: 'assistant',
+        message: { id: 'msg_1', model: 'claude-opus-4-8', usage: usage1, content: [{ type: 'text', text: 'thinking about it' }] },
+      }))
+      appendFileSync(jsonlPath, buildJSONL({
+        type: 'assistant',
+        message: { id: 'msg_1', model: 'claude-opus-4-8', usage: usage1, content: [{ type: 'tool_use', name: 'Read', id: 'r1', input: { file_path: '/x/a.ts' } }] },
+      }))
+      h.poll()
+
+      // A DISTINCT message adds on top; a line with NO usage contributes nothing.
+      appendFileSync(jsonlPath, buildJSONL({
+        type: 'assistant',
+        message: { id: 'msg_2', model: 'claude-opus-4-8', usage: { input_tokens: 2, output_tokens: 40 }, content: [{ type: 'tool_use', name: 'Bash', id: 'r2', input: {} }] },
+      }))
+      appendFileSync(jsonlPath, buildJSONL({
+        type: 'assistant',
+        message: { id: 'msg_3', model: 'claude-opus-4-8', content: [{ type: 'tool_use', name: 'Edit', id: 'r3', input: {} }] },
+      }))
+      h.poll()
+
+      // msg_1 (1350, counted once despite two lines) + msg_2 (42) = 1392.
+      expect(h.watcher.getRegistry().get('deadbeef')?.totalTokens).toBe(1392)
+      const last = progress[progress.length - 1]
+      expect(last.totalTokens).toBe(1392)
+    })
+
     it('ignores a synthetic model sentinel, keeping the last real model', () => {
       const agentDir = join(tmpRoot, 'agent')
       const subagentsDir = join(agentDir, '.claude', 'projects', 'p1', 'session-abc', 'subagents')

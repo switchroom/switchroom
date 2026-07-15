@@ -7,7 +7,9 @@ import {
   renderActivityFeed,
   renderActivityFeedWithNested,
   renderActivityHeader,
+  renderCombinedWorkerFeed,
   formatFeedElapsed,
+  formatTokenCount,
   formatStepSuffix,
   STEP_TIMER_MIN_MS,
   type SessionActivityHeader,
@@ -744,6 +746,71 @@ describe("renderActivityHeader — two-line header builder", () => {
     expect(h2none).toBe("_15s · 7 tools_");
     const [, h2synth] = renderActivityHeader("🤖", "Agent", "", 15_000, 7, "running", "<synthetic>");
     expect(h2synth).toBe("_15s · 7 tools_");
+  });
+
+  it("inserts the token segment between tool count and model (running)", () => {
+    const [, h2] = renderActivityHeader("🛠", "Worker", "run tests", 120_000, 14, "running", "claude-opus-4-8", 12_400);
+    expect(h2).toBe("_2m00s · 14 tools · 12.4k tok · opus 4.8_");
+  });
+
+  it("inserts the token segment before elapsed on the done line", () => {
+    const [, h2] = renderActivityHeader("🛠", "Worker", "run tests", 65_000, 3, "done", undefined, 940);
+    expect(h2).toBe("_done · 3 tools · 940 tok · 1m05s_");
+  });
+
+  it("omits the token segment when total is 0 / undefined (both variants consistent)", () => {
+    const [, running] = renderActivityHeader("🛠", "Worker", "", 15_000, 7, "running", undefined, 0);
+    expect(running).toBe("_15s · 7 tools_");
+    const [, undef] = renderActivityHeader("🛠", "Worker", "", 15_000, 7, "running");
+    expect(undef).toBe("_15s · 7 tools_");
+    const [, doneZero] = renderActivityHeader("🛠", "Worker", "", 65_000, 3, "done", undefined, 0);
+    expect(doneZero).toBe("_done · 3 tools · 1m05s_");
+  });
+
+  it("renders tokens and model together, in order", () => {
+    const [, h2] = renderActivityHeader("🛠", "Worker", "", 10_000, 2, "running", "sr-glm-5", 1_200_000);
+    expect(h2).toBe("_10s · 2 tools · 1.2M tok · sr-glm-5_");
+  });
+});
+
+describe("formatTokenCount — compact token formatter", () => {
+  it("renders sub-1000 as a raw integer", () => {
+    expect(formatTokenCount(0)).toBe("0");
+    expect(formatTokenCount(1)).toBe("1");
+    expect(formatTokenCount(999)).toBe("999");
+  });
+
+  it("renders >=1000 as one-decimal k at the boundary", () => {
+    expect(formatTokenCount(1000)).toBe("1.0k");
+    expect(formatTokenCount(12_400)).toBe("12.4k");
+    expect(formatTokenCount(999_499)).toBe("999.5k");
+  });
+
+  it("renders >=1e6 as one-decimal M at the boundary", () => {
+    expect(formatTokenCount(1_000_000)).toBe("1.0M");
+    expect(formatTokenCount(1_200_000)).toBe("1.2M");
+  });
+
+  it("clamps negatives / non-finite to 0", () => {
+    expect(formatTokenCount(-5)).toBe("0");
+    expect(formatTokenCount(Number.NaN)).toBe("0");
+    expect(formatTokenCount(Number.POSITIVE_INFINITY)).toBe("0");
+  });
+});
+
+describe("renderCombinedWorkerFeed — token segment on the row header", () => {
+  it("shows `· N tok` per worker row and omits it at 0", () => {
+    const body = renderCombinedWorkerFeed(
+      [
+        { description: "alpha", elapsedMs: 15_000, toolCount: 3, currentStep: "Reading a.ts", totalTokens: 12_400 },
+        { description: "beta", elapsedMs: 20_000, toolCount: 5, currentStep: "Running tests", totalTokens: 0 },
+      ],
+      { maxRows: 5 },
+    );
+    expect(body).not.toBeNull();
+    expect(body!).toContain("**alpha** _· 15s · 3 tools · 12.4k tok_");
+    expect(body!).toContain("**beta** _· 20s · 5 tools_");
+    expect(body!).not.toContain("beta** _· 20s · 5 tools · 0 tok");
   });
 });
 

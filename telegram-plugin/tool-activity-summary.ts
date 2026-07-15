@@ -185,19 +185,49 @@ export function renderActivityHeader(
   toolCount: number,
   state: 'running' | 'done' | 'failed' | 'incomplete',
   model?: string,
+  totalTokens?: number,
 ): [string, string] {
   const toolWord = toolCount === 1 ? 'tool' : 'tools'
   const elapsed = formatFeedElapsed(elapsedMs)
   const descPart = description.length > 0 ? ` · _${escapeMarkdown(description)}_` : ''
   const line1 = `${emoji} **${escapeMarkdown(label)}**${descPart}`
+  // Running total tokens: joins the dot-separated metrics between the tool
+  // count and the model tag. Omitted (empty) when the total is 0/unknown.
+  const tokPart = tokenSegment(totalTokens)
   // Subtle live-model tag: joins the existing dot-separated metrics (never a new
   // line). formatModelLabel returns null for absent/sentinel values → no suffix.
   const modelLabel = formatModelLabel(model)
   const modelPart = modelLabel != null ? ` · ${escapeMarkdown(modelLabel)}` : ''
   const line2 = state === 'running'
-    ? `_${elapsed} · ${toolCount} ${toolWord}${modelPart}_`
-    : `_${state} · ${toolCount} ${toolWord} · ${elapsed}${modelPart}_`
+    ? `_${elapsed} · ${toolCount} ${toolWord}${tokPart}${modelPart}_`
+    : `_${state} · ${toolCount} ${toolWord}${tokPart} · ${elapsed}${modelPart}_`
   return [line1, line2]
+}
+
+/**
+ * Compact token-count formatter for the activity card's metrics line:
+ *   <1000        → raw          ("940")
+ *   ≥1000, <1e6  → one-decimal k ("12.4k", "1.0k")
+ *   ≥1e6         → one-decimal M ("1.2M")
+ * Negative / non-finite inputs clamp to "0". The caller appends " tok".
+ */
+export function formatTokenCount(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return '0'
+  if (n < 1000) return String(Math.floor(n))
+  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}k`
+  return `${(n / 1_000_000).toFixed(1)}M`
+}
+
+/**
+ * The ` · {N} tok` metrics segment, or '' when there are no tokens to show.
+ * A 0 / undefined total (a worker that emitted no usage — e.g. a non-Claude
+ * transcript) OMITS the segment entirely so the line stays clean; the same
+ * predicate is used by BOTH render variants (single-worker header + combined
+ * row) so they never diverge.
+ */
+function tokenSegment(totalTokens: number | undefined): string {
+  if (totalTokens == null || totalTokens <= 0) return ''
+  return ` · ${formatTokenCount(totalTokens)} tok`
 }
 
 /** Format elapsed milliseconds for display in the activity header (e.g. "12s", "2m05s"). */
@@ -289,6 +319,9 @@ export interface StatusCardHeader {
   /** Live model id (raw, e.g. `claude-opus-4-8`) — rendered as a short friendly
    *  tag on the metrics line via `formatModelLabel`. Omitted when unknown. */
   model?: string
+  /** Running total tokens for the worker/turn — rendered as `· {N} tok` on the
+   *  metrics line. Omitted (0/undefined) → no token segment. */
+  totalTokens?: number
 }
 
 /** Inputs to the unified status-card renderer. */
@@ -341,6 +374,7 @@ export function renderStatusCard(opts: StatusCardOpts): string | null {
         // 'failed', so only the worker card is affected.
         header.state,
         header.model,
+        header.totalTokens,
       )
     : []
 
@@ -596,6 +630,9 @@ export interface CombinedWorkerRow {
   historyLines?: string[]
   /** Live model id (raw, e.g. `claude-opus-4-8`); omitted when unknown. */
   model?: string
+  /** Running total tokens for this worker — rendered as `· {N} tok` on the row
+   *  header. Omitted (0/undefined) → no token segment. */
+  totalTokens?: number
 }
 
 export interface CombinedWorkerFeedOpts {
@@ -671,9 +708,10 @@ export function renderCombinedWorkerFeed(
       truncate(stripMarkdown(r.description).replace(/\s+/g, ' ').trim() || 'background task', COMBINED_ROW_DESC_MAX),
     )
     const toolWord = r.toolCount === 1 ? 'tool' : 'tools'
+    const tokPart = tokenSegment(r.totalTokens)
     const modelLabel = formatModelLabel(r.model)
     const modelPart = modelLabel != null ? ` · ${escapeMarkdown(modelLabel)}` : ''
-    return `**${desc}** _· ${formatFeedElapsed(r.elapsedMs)} · ${r.toolCount} ${toolWord}${modelPart}_`
+    return `**${desc}** _· ${formatFeedElapsed(r.elapsedMs)} · ${r.toolCount} ${toolWord}${tokPart}${modelPart}_`
   }
 
   // Raw (unescaped) history for a worker, oldest→newest, empty lines stripped.
