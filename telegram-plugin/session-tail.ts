@@ -134,6 +134,16 @@ export type SessionEvent =
   // `model` kind (sentinel-filtered, emitted first) but agent-scoped so the
   // watcher can track it per WorkerEntry and thread it onto the worker card.
   | { kind: 'sub_agent_model'; agentId: string; model: string }
+  // Per-assistant-message token usage for a SUB-AGENT, extracted from
+  // `message.usage` on each `type:"assistant"` transcript line. `totalTokens`
+  // is the summed delta for THIS message (input + output + cache_read +
+  // cache_creation). `messageId` is `message.id` — REQUIRED for dedup: Claude
+  // Code ≥2.1.x persists one logical assistant message as MULTIPLE JSONL lines
+  // sharing one `message.id`, each stamped with the SAME `usage` block, so the
+  // watcher must count a given `messageId` only once (naive summing across
+  // lines 2-3x over-counts; verified against live worker jsonl — 131 usage
+  // lines / 59 unique ids). Null messageId → un-dedupable, counted as-is.
+  | { kind: 'sub_agent_usage'; agentId: string; messageId: string | null; totalTokens: number }
   | { kind: 'sub_agent_tool_use'; agentId: string; toolUseId: string | null; toolName: string; input?: Record<string, unknown>; precomputedLabel?: string }
   // Same shared contract as the main-agent `text` kind — see its doc above
   // (including the `lastInMessage` projection-artifact note). The wire-kind
@@ -283,6 +293,30 @@ export function projectAssistantTextBlocks(
  * projectSubagentLine). A thinking-only or empty line returns false; the real
  * terminal rides the following content line, which also carries `end_turn`.
  */
+/**
+ * Sum the total token delta carried by a single assistant message's `usage`
+ * object: `input_tokens + output_tokens + cache_read_input_tokens +
+ * cache_creation_input_tokens`. Every field is guarded with `?? 0` — Claude
+ * Code omits fields that are zero/absent on some messages. A non-object (or
+ * missing) usage returns 0 so the caller can skip a no-usage line.
+ *
+ * These four fields ARE the whole per-message token cost (the nested
+ * `iterations` / `cache_creation` breakdowns are subsets already reflected in
+ * the top-level fields — never add them, that double-counts). Verified against
+ * live worker jsonl.
+ */
+export function sumUsageTokens(usage: unknown): number {
+  if (usage == null || typeof usage !== 'object') return 0
+  const u = usage as Record<string, unknown>
+  const n = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
+  return (
+    n(u.input_tokens) +
+    n(u.output_tokens) +
+    n(u.cache_read_input_tokens) +
+    n(u.cache_creation_input_tokens)
+  )
+}
+
 export function assistantLineCarriesAnswerSurface(
   content: Array<Record<string, unknown>> | undefined,
 ): boolean {
@@ -619,6 +653,22 @@ export function projectSubagentLine(
     const subModel = message?.model
     if (typeof subModel === 'string' && !isModelSentinel(subModel)) {
       events.push({ kind: 'sub_agent_model', agentId, model: subModel })
+    }
+    // Per-message token usage: surface the summed delta so the watcher can
+    // accumulate a running total for the worker-activity card's metrics line.
+    // `messageId` (message.id) rides along so the watcher dedups the multi-line
+    // split-message shape (one logical message → many JSONL lines, one shared
+    // `usage`). Emitted only when a usage object with a non-zero total exists —
+    // a no-usage line contributes nothing and is skipped here.
+    const subUsageTotal = sumUsageTokens(message?.usage)
+    if (subUsageTotal > 0) {
+      const subMsgId = message?.id
+      events.push({
+        kind: 'sub_agent_usage',
+        agentId,
+        messageId: typeof subMsgId === 'string' ? subMsgId : null,
+        totalTokens: subUsageTotal,
+      })
     }
     // Text→narrative projection comes from the SAME shared kernel as the
     // main agent (projectAssistantTextBlocks): one source for the empty-drop

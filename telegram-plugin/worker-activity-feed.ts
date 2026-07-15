@@ -92,6 +92,13 @@ export interface WorkerActivityView {
   lastTool: { name: string; sanitisedArg: string } | null
   /** Number of tool calls observed so far. */
   toolCount: number
+  /**
+   * Running TOTAL tokens across the worker's assistant messages so far
+   * (input + output + cache_read + cache_creation, deduped by message.id in the
+   * watcher). Rendered as `· {N} tok` on the card's metrics line. Omitted /
+   * 0 → no token segment (a worker that emitted no usage).
+   */
+  totalTokens?: number
   /** The worker's latest narrative line, if any (already capped upstream). */
   latestSummary: string
   /**
@@ -178,6 +185,7 @@ export function renderWorkerActivity(v: WorkerActivityView, liveSuffix = ''): st
     toolCount: v.toolCount,
     state: v.state,
     model: v.model,
+    totalTokens: v.totalTokens,
   }
 
   // Terminal: latestSummary carries the worker's final result text (gateway
@@ -798,6 +806,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
         description: v.description,
         elapsedMs: elapsedFor(r),
         toolCount: v.toolCount,
+        totalTokens: v.totalTokens,
         currentStep,
         // Full per-worker rolling history (oldest→newest) so the combined feed
         // can paint an adaptive-depth ✓/→ trail, not just the latest line. The
@@ -1112,6 +1121,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       description: lv?.description ?? 'background task',
       lastTool: null,
       toolCount: lv?.toolCount ?? 0,
+      totalTokens: lv?.totalTokens,
       // No fabricated result paragraph — an authoritative sweep can't know what
       // the worker returned; the terminal card shows the header struck-through
       // as `incomplete`, and the handback (if it ran) carries the actual result.

@@ -125,6 +125,18 @@ export interface WorkerEntry {
   lastActivityAt: number
   /** Number of tool calls seen so far. */
   toolCount: number
+  /**
+   * Running TOTAL tokens across every assistant message the worker has emitted
+   * (input + output + cache_read + cache_creation, summed via sumUsageTokens).
+   * Accumulated from `sub_agent_usage` events, deduped by `seenUsageMessageIds`
+   * so the multi-line split-message shape (one logical message persisted as
+   * several JSONL lines sharing one `message.id` + identical `usage`) counts
+   * once. Rendered on the worker card's metrics line. 0 for a worker that never
+   * emitted a usage block (e.g. a non-Claude/litellm transcript).
+   */
+  totalTokens: number
+  /** message.id set already folded into `totalTokens` (usage dedup). */
+  seenUsageMessageIds: Set<string>
   /** True once a stall notification has been sent (suppresses repeat). */
   stallNotified: boolean
   /**
@@ -557,6 +569,9 @@ export interface SubagentWatcherConfig {
     state: WorkerState
     outcome: 'completed' | 'failed' | 'orphan'
     toolCount: number
+    /** Final running TOTAL tokens across the worker's whole life
+     *  (`WorkerEntry.totalTokens`). For the terminal worker-feed card. */
+    totalTokens: number
     durationMs: number
     /** Dispatch-time task description, for the handback envelope. */
     description: string
@@ -615,6 +630,10 @@ export interface SubagentWatcherConfig {
     lastTool: { name: string; sanitisedArg: string } | null
     /** Tool-use count observed so far. */
     toolCount: number
+    /** Running TOTAL tokens across the worker's assistant messages so far
+     *  (`WorkerEntry.totalTokens`). Threaded onto the worker/nested card's
+     *  metrics line. 0 for a worker that has emitted no usage yet / ever. */
+    totalTokens: number
     /** Friendly display line for THIS tick. Set on `sub_agent_tool_use`
      *  events to a `describeToolUse` label ("Reading X", "Running a
      *  command") so a foreground sub-agent that runs tools without
@@ -1089,6 +1108,8 @@ export function readSubTail(
     lastTool: { name: string; sanitisedArg: string } | null
     /** Tool-use count observed so far. */
     toolCount: number
+    /** Running total tokens so far (see SubagentWatcherConfig.onProgress). */
+    totalTokens: number
     /** Friendly display line for THIS tick (set on tool ticks; see the
      *  SubagentWatcherConfig.onProgress doc). */
     progressLine?: string
@@ -1179,6 +1200,7 @@ export function readSubTail(
               },
               lastTool: entry.lastTool,
               toolCount: entry.toolCount,
+              totalTokens: entry.totalTokens,
               model: entry.currentModel,
               skeleton: true,
             })
@@ -1320,6 +1342,7 @@ export function readSubTail(
               },
               lastTool: entry.lastTool,
               toolCount: entry.toolCount,
+              totalTokens: entry.totalTokens,
               model: entry.currentModel,
             })
             return true
@@ -1502,6 +1525,22 @@ export function readSubTail(
           }
           continue
         }
+        if (ev.kind === 'sub_agent_usage') {
+          // Accumulate the worker's running total tokens, deduped by
+          // message.id: the ≥2.1.x split-message shape stamps the SAME `usage`
+          // block on every JSONL line of one logical assistant message, so
+          // counting each line would 2-3x over-count. A null messageId is
+          // un-dedupable (older/edge shapes) — count it as-is (its usage is
+          // real). No card render here; the total rides the next onProgress
+          // tick's payload like the model does.
+          if (ev.messageId == null) {
+            entry.totalTokens += ev.totalTokens
+          } else if (!entry.seenUsageMessageIds.has(ev.messageId)) {
+            entry.seenUsageMessageIds.add(ev.messageId)
+            entry.totalTokens += ev.totalTokens
+          }
+          continue
+        }
         if (ev.kind === 'sub_agent_tool_use') {
           // Narrative-dedup gate step 2: a sub_agent_text block was pending;
           // this tool is the lookahead that decides it (SHOW unless it drafts
@@ -1567,6 +1606,7 @@ export function readSubTail(
                   },
                   lastTool: entry.lastTool,
                   toolCount: entry.toolCount,
+                  totalTokens: entry.totalTokens,
                   progressLine: toolLine,
                   model: entry.currentModel,
                 })
@@ -1892,6 +1932,8 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       dispatchedAt: n,
       lastActivityAt: n,
       toolCount: 0,
+      totalTokens: 0,
+      seenUsageMessageIds: new Set<string>(),
       stallNotified: false,
       stalledAt: null,
       completionNotified: false,
@@ -2157,6 +2199,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
             // registerAgent's short-circuit + Gap 1 promotion).
             outcome: entry.errored ? 'failed' : entry.historical ? 'orphan' : 'completed',
             toolCount: entry.toolCount,
+            totalTokens: entry.totalTokens,
             durationMs: nowFn() - entry.dispatchedAt,
             description: entry.description,
             // For a failure, fall back to the error detail when the worker
@@ -2184,6 +2227,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
             state: entry.state,
             outcome: 'failed',
             toolCount: entry.toolCount,
+            totalTokens: entry.totalTokens,
             durationMs: nowFn() - entry.dispatchedAt,
             description: entry.description,
             resultText: entry.lastResultText,
