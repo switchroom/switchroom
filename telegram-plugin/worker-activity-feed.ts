@@ -329,6 +329,29 @@ export interface WorkerActivityFeedOpts {
    */
   absoluteRowLifetimeCapMs?: number
   /**
+   * ABSOLUTE reused-group-MESSAGE lifetime cap (ms), measured from the moment
+   * the shared message was posted (`messageCreatedAtMs`), NOT from a worker
+   * row's age. When workers overlap continuously the group is NEVER reset to a
+   * fresh message (the only messageId reset is the group-reuse-after-terminal
+   * branch, gated on `!hasLiveWorker`), so ONE message can live for hours. If
+   * that message loses its pin out-of-band (a raw unpin somewhere else, or
+   * Telegram pin-stacking burying it), the steady-state edit path re-pins via
+   * `syncPin`; but a STALE in-memory pin claim (the claim still names this id, so
+   * `decidePinAction` no-ops on equal id) can only be cleared by rotating to a
+   * NEW message id. This cap force-rotates the shared message past an absolute
+   * age WHILE live workers remain, so the pin surface is periodically re-
+   * established through the first-paint `syncPin` path — the deterministic
+   * defense-in-depth that bounds how long a buried card can stay invisible
+   * (invisible-worker-cards incident, 2026-07-15; mirrors the immutable-anchor
+   * absolute-cap pattern of `absoluteRowLifetimeCapMs` / #3239's row cap).
+   *
+   * Conservative by design: set well above a normal edit cadence so a healthy
+   * pinned card is not needlessly churned. Rotation costs ONE unpin (old claim)
+   * + ONE pin (fresh message) per cap interval — never a burst. Fallback default
+   * (this module) 60 min; tests inject a small value.
+   */
+  groupMessageLifetimeCapMs?: number
+  /**
    * Group-level status-pin reconcile hook (#3207 review). Because workers now
    * COALESCE into one shared message, the pin MUST follow the GROUP lifecycle,
    * not a single worker's: pin the shared message when a group's first worker
@@ -425,6 +448,15 @@ interface FeedGroup {
   chatId: string
   threadId?: number
   messageId: number | null
+  /**
+   * Wall-clock ms the CURRENT shared message was posted (first paint / re-paint).
+   * IMMUTABLE for the lifetime of a given `messageId`: stamped when a message id
+   * is assigned and NEVER re-stamped by later edits, so the group-message
+   * lifetime cap (`groupMessageLifetimeCapMs`) measures the reused message's true
+   * absolute age and cannot be reset by a continuous edit stream. Reset to 0
+   * whenever `messageId` goes null (rotation / stale-message drop).
+   */
+  messageCreatedAtMs: number
   lastBody: string | null
   lastEditAt: number
   cooldownUntil: number
@@ -600,6 +632,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
   const maxRows = Math.max(1, Math.floor(opts.maxRows ?? 8))
   const staleWorkerTtlMs = Math.max(1, Math.floor(opts.staleWorkerTtlMs ?? 50 * 60_000))
   const absoluteRowLifetimeCapMs = Math.max(1, Math.floor(opts.absoluteRowLifetimeCapMs ?? 6 * 60 * 60_000))
+  const groupMessageLifetimeCapMs = Math.max(1, Math.floor(opts.groupMessageLifetimeCapMs ?? 60 * 60_000))
   const reconcilePinFn = opts.reconcilePin ?? (() => {})
   const setIntervalFn =
     opts.setInterval ??
@@ -903,6 +936,9 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
           return
         }
         g.messageId = sent.message_id
+        // Stamp the reused-message birth time (immutable for this id) so the
+        // group-message lifetime cap measures the message's true absolute age.
+        g.messageCreatedAtMs = now
         g.lastBody = body
         g.lastEditAt = now
         // A fresh message is a live running paint, never a terminal recap.
@@ -951,6 +987,16 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
           `worker-feed: edit feed=${g.feedKey} chat=${g.chatId} ` +
             `thread=${g.threadId ?? '-'} msgId=${g.messageId} workers=${g.workers.size} bytes=${body.length}`,
         )
+        // Re-assert the group pin on the steady-state edit path (invisible-
+        // worker-cards fix). `syncPin` was previously called ONLY at lifecycle
+        // edges (first-paint / terminal / GC), so once a long-lived reused
+        // message lost its pin out-of-band it was edited live forever but never
+        // re-pinned → scroll-buried. This closes that gap deterministically. It
+        // is a NO-OP when the pin is already correct: `decidePinAction` returns
+        // `noop` on equal claim id (status-pin.ts), so this makes ZERO Telegram
+        // calls on the common path and cannot create a pin storm — when the
+        // claim was dropped (variant 1) it re-pins the current message.
+        syncPin(g)
       }
       if (isTerminal) clearStaged()
     } catch (err) {
@@ -971,6 +1017,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
         // stale message id; a fresh first-paint re-establishes one if workers
         // are still live. On a terminal finalize, clear the staged repaint.
         g.messageId = null
+        g.messageCreatedAtMs = 0
         g.lastBody = null
         // The pinned message no longer exists → release the group pin claim
         // (clearStaged already re-syncs on the terminal path).
@@ -1152,6 +1199,31 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       const running = runningRows(g)
       if (running.length === 0) continue
 
+      // ABSOLUTE group-message lifetime cap (invisible-worker-cards fix, defense
+      // in depth). While workers overlap continuously the shared message is
+      // never reset, so one message can live for hours; if its pin was lost
+      // out-of-band and the in-memory claim went STALE (claim still names this
+      // id → `decidePinAction` no-ops on equal id), `syncPin` alone can never
+      // re-pin it. Force-rotate to a fresh message past an absolute age WHILE
+      // live workers remain: drop the id (unpinning the stale claim via
+      // `syncPin`, which clears it to null), then fall through to the first-
+      // paint path, whose `syncPin` re-pins the NEW message from a null claim.
+      // Costs exactly one unpin + one pin per cap interval — never a burst.
+      if (g.messageId != null && now - g.messageCreatedAtMs >= groupMessageLifetimeCapMs) {
+        const age = Math.floor((now - g.messageCreatedAtMs) / 1000)
+        log(
+          `worker-feed: group-message lifetime cap rotate feed=${g.feedKey} ` +
+            `msgId=${g.messageId} — age ${age}s (>= ${Math.floor(groupMessageLifetimeCapMs / 1000)}s); ` +
+            `rotating to a fresh message to re-establish the pin surface`,
+        )
+        g.messageId = null
+        g.messageCreatedAtMs = 0
+        g.lastBody = null
+        // Clear the (possibly stale) pin claim for the retired message; the
+        // fresh first-paint below re-pins the new one from a null claim.
+        syncPin(g)
+      }
+
       // First-paint path: no message yet and some worker has now crossed
       // firstPaintMin (a prose-silent worker's single early tick was held).
       if (g.messageId == null) {
@@ -1218,6 +1290,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
           chatId,
           threadId,
           messageId: null,
+          messageCreatedAtMs: 0,
           lastBody: null,
           lastEditAt: 0,
           cooldownUntil: 0,
@@ -1237,6 +1310,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       // live worker remains AND the group last went terminal.
       if (!g.workers.has(agentId) && g.terminalPainted && !hasLiveWorker(g)) {
         g.messageId = null
+        g.messageCreatedAtMs = 0
         g.lastBody = null
         g.pendingFinalize.clear()
         g.terminalPainted = false
