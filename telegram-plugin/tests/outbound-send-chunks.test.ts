@@ -302,3 +302,60 @@ describe('sendReplyChunks — preview edit-in-place', () => {
     expect(calls.filter((c) => c.kind === 'sendRich')).toHaveLength(0)
   })
 })
+
+// Reply-flicker fix: the flushed-turn supersede edits the flushed message A in
+// place instead of delete+resend, by re-pointing `previewMessageId` at A's id.
+// These drive that exact execution lane through the fake bot to assert the
+// user-visible OUTCOME (one message survives, no flicker) rather than the path.
+describe('sendReplyChunks — flushed-turn supersede edit-in-place', () => {
+  it('a single-message text reply superseding a flushed message EDITS A in place — no delete', async () => {
+    // Gateway sets previewMessageId to the flushed message id when
+    // decideSupersedeCorrection returns edit-in-place (single chunk, no files/preview).
+    const { deps, calls, deleted } = makeFake()
+    const flushedId = 700
+    const state = baseState({ chunks: ['the real answer'], previewMessageId: flushedId })
+    const res = await sendReplyChunks(deps, state)
+    // A is edited in place with the canonical reply body — NOT deleted.
+    expect(calls).toHaveLength(1)
+    expect(calls[0].kind).toBe('editPreview')
+    expect(calls[0].messageId).toBe(flushedId)
+    expect(calls[0].body).toEqual({ rich: 'the real answer' })
+    expect(deleted).toEqual([])
+    expect(calls.some((c) => c.kind === 'sendRich')).toBe(false)
+    // Exactly ONE message survives, and it is the (edited) flushed message.
+    expect(state.sentIds).toEqual([flushedId])
+    expect(res.previewMessageId).toBeNull()
+  })
+
+  it('anti-duplicate: an edit-in-place supersede never leaves BOTH the flush and a fresh reply visible', async () => {
+    const { deps, calls, deleted } = makeFake()
+    const state = baseState({ chunks: ['answer'], previewMessageId: 710 })
+    await sendReplyChunks(deps, state)
+    // No fresh send happened alongside the edit, and nothing was deleted — the
+    // single surviving message is the flushed one, now carrying the reply.
+    const fresh = calls.filter((c) => c.kind === 'sendRich' || c.kind === 'sendLiteral')
+    expect(fresh).toHaveLength(0)
+    expect(deleted).toEqual([])
+    expect(state.sentIds).toEqual([710])
+  })
+
+  it('edit returns a 400 → falls back to delete+resend, exactly one clean message survives', async () => {
+    // Message too old / uneditable / gone: editPreview throws, the lane deletes
+    // A and sends the canonical reply fresh — never both, never neither.
+    const { deps, calls, deleted } = makeFake({
+      failNext: { editPreview: [grammy400("message can't be edited", 'editMessageText')] },
+    })
+    const flushedId = 720
+    const state = baseState({ chunks: ['the real answer'], previewMessageId: flushedId })
+    const res = await sendReplyChunks(deps, state)
+    // Fallback: stale flush deleted, canonical reply sent fresh.
+    expect(deleted).toEqual([flushedId])
+    const fresh = calls.filter((c) => c.kind === 'sendRich')
+    expect(fresh).toHaveLength(1)
+    expect(fresh[0].body).toEqual({ rich: 'the real answer' })
+    // Exactly one surviving message (the fresh send), and it is NOT the flushed id.
+    expect(state.sentIds).toHaveLength(1)
+    expect(state.sentIds[0]).not.toBe(flushedId)
+    expect(res.previewMessageId).toBeNull()
+  })
+})

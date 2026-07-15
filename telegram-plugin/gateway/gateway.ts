@@ -88,7 +88,7 @@ import {
   type TelegraphAccount,
 } from '../telegraph.js'
 import { OutboundDedupCache } from '../recent-outbound-dedup.js'
-import { FlushedTurnSupersedeRegistry, DEFAULT_SUPERSEDE_TTL_MS } from '../flushed-turn-supersede.js'
+import { FlushedTurnSupersedeRegistry, DEFAULT_SUPERSEDE_TTL_MS, decideSupersedeCorrection } from '../flushed-turn-supersede.js'
 import { createInboundCoalescer, inboundCoalesceKey } from './inbound-coalesce.js'
 import {
   splitCoalescedAttachments,
@@ -13373,6 +13373,15 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // exact-text `outboundDedup` above structurally cannot catch. A reply for a
   // DIFFERENT newer live turn never supersedes (decideSupersede → different-turn),
   // so a fresh turn's answer is never clobbered.
+  //
+  // Reply-flicker fix: rather than delete the flushed message(s) HERE (which
+  // makes the user see delete+replace when the canonical reply sends fresh
+  // below), we DEFER the correction to the send site. Once chunk count / files /
+  // preview are known, `decideSupersedeCorrection` picks edit-in-place (edit the
+  // single flushed message into the canonical reply — no flicker, no re-ping)
+  // when the reply fits one plain-text message, and falls back to the legacy
+  // delete+resend otherwise. `supersedeFlushIds` carries the ids forward.
+  let supersedeFlushIds: number[] = []
   {
     const replyThreadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
     // 2026-07 double-reply-on-DM fix (Part 1) — resolve the turn this reply
@@ -13400,12 +13409,9 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
         `telegram gateway: reply: superseding flushed turn message(s) ` +
         `chatId=${chat_id} ids=${JSON.stringify(decision.deleteMessageIds)}\n`,
       )
-      for (const id of decision.deleteMessageIds) {
-        await swallowingApiCall(
-          () => lockedBot.api.deleteMessage(chat_id, id),
-          { chat_id, verb: 'reply.supersedeFlushed' },
-        )
-      }
+      // Deferred: the correction (edit-in-place vs delete+resend) is decided at
+      // the send site once chunk count / files / preview are known.
+      supersedeFlushIds = decision.deleteMessageIds
     } else {
       // 2026-07 double-reply-on-DM fix (Part 2) — answer-delivered race latch.
       // Supersede found no record. Either there was no flush (normal reply), or
@@ -13939,6 +13945,41 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     }
   }
 
+  // Reply-flicker fix — apply the deferred flushed-turn correction now that
+  // chunk count / files / preview are all resolved. `edit-in-place` reuses the
+  // single-message edit lane below (`previewMessageId`): it edits the flushed
+  // message A into the canonical reply B with the SAME rich rendering a fresh
+  // reply uses, and `sendReplyChunks` falls back to delete+resend on any edit
+  // 400 (message too old / uneditable / gone) — so exactly one message with the
+  // canonical content always survives. We also forgo the quote (an edit can't
+  // carry a reply_parameters quote) by clearing `reply_to`, so the quote-delete
+  // guard just below does NOT delete our edit target. `delete-resend` keeps the
+  // legacy behaviour (delete the flushed message(s), then send fresh below).
+  if (supersedeFlushIds.length > 0) {
+    const correction = decideSupersedeCorrection({
+      flushMessageIds: supersedeFlushIds,
+      chunkCount: chunks.length,
+      hasFiles: files.length > 0,
+      suppressText,
+      hasOpenPreview: previewMessageId != null,
+    })
+    if (correction.mode === 'edit-in-place') {
+      previewMessageId = correction.editMessageId
+      reply_to = undefined
+      process.stderr.write(
+        `telegram gateway: reply: superseding flushed message via edit-in-place ` +
+        `chatId=${chat_id} id=${correction.editMessageId}\n`,
+      )
+    } else {
+      for (const id of correction.deleteMessageIds) {
+        await swallowingApiCall(
+          () => lockedBot.api.deleteMessage(chat_id, id),
+          { chat_id, verb: 'reply.supersedeFlushed' },
+        )
+      }
+    }
+  }
+
   if (previewMessageId != null && reply_to != null && replyMode !== 'off') {
     await deleteStalePreview(previewMessageId)
     previewMessageId = null
@@ -13955,7 +13996,12 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   let silentAnchorEditDone = false
   {
     const turn = currentTurn
-    if (turn != null && chunks.length === 1) {
+    // Skip the silent-anchor merge when a flushed-turn supersede is active: an
+    // edit-in-place correction has re-pointed `previewMessageId` at the flushed
+    // message (the chunk loop below edits it), and merging into a prior silent
+    // anchor instead would orphan the flushed message A (leaving BOTH A and the
+    // anchor visible — the exact duplicate this supersede exists to prevent).
+    if (turn != null && chunks.length === 1 && supersedeFlushIds.length === 0) {
       const decision = decideSilentReplyAnchor({
         effectivelySilent: disableNotification,
         anchorMessageId: turn.silentAnchorMessageId,

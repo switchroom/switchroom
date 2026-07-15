@@ -20,6 +20,7 @@
 import { describe, it, expect } from 'vitest'
 import {
   decideSupersede,
+  decideSupersedeCorrection,
   FlushedTurnSupersedeRegistry,
   DEFAULT_SUPERSEDE_TTL_MS,
   type FlushedTurnRecord,
@@ -31,6 +32,65 @@ const rec = (over: Partial<FlushedTurnRecord> = {}): FlushedTurnRecord => ({
   text: 'narration\n\nthe real answer',
   ts: 1_000_000,
   ...over,
+})
+
+describe('decideSupersedeCorrection — edit-in-place vs delete+resend', () => {
+  const base = {
+    flushMessageIds: [500],
+    chunkCount: 1,
+    hasFiles: false,
+    suppressText: false,
+    hasOpenPreview: false,
+  }
+
+  it('edits in place when the flush posted ONE message and the reply fits one plain-text message', () => {
+    const c = decideSupersedeCorrection(base)
+    expect(c.mode).toBe('edit-in-place')
+    // edit target is the single flushed message; nothing is deleted (A becomes B).
+    expect(c).toMatchObject({ mode: 'edit-in-place', editMessageId: 500, deleteMessageIds: [] })
+  })
+
+  it('literal (format:text) single-message replies still edit in place (text is text)', () => {
+    // literalText is not an input to the decision — a literal reply is still a
+    // text message the edit lane renders identically.
+    const c = decideSupersedeCorrection({ ...base })
+    expect(c.mode).toBe('edit-in-place')
+  })
+
+  it('falls back to delete+resend for a MULTI-PART reply (edit can only carry one message)', () => {
+    const c = decideSupersedeCorrection({ ...base, chunkCount: 3 })
+    expect(c).toEqual({ mode: 'delete-resend', deleteMessageIds: [500] })
+  })
+
+  it('falls back to delete+resend when the flush posted MORE THAN ONE message', () => {
+    const c = decideSupersedeCorrection({ ...base, flushMessageIds: [500, 501] })
+    expect(c).toEqual({ mode: 'delete-resend', deleteMessageIds: [500, 501] })
+  })
+
+  it('falls back to delete+resend for a file/album reply (not a plain-text edit)', () => {
+    const c = decideSupersedeCorrection({ ...base, hasFiles: true })
+    expect(c.mode).toBe('delete-resend')
+  })
+
+  it('falls back to delete+resend for a voice-only reply (no text body to edit into)', () => {
+    const c = decideSupersedeCorrection({ ...base, suppressText: true })
+    expect(c.mode).toBe('delete-resend')
+  })
+
+  it('falls back to delete+resend when a draft-stream preview already owns the edit lane', () => {
+    const c = decideSupersedeCorrection({ ...base, hasOpenPreview: true })
+    expect(c.mode).toBe('delete-resend')
+  })
+
+  it('anti-duplicate invariant: every correction resolves to exactly one surviving message', () => {
+    // edit-in-place → A becomes B (1 message, 0 deletes); delete-resend → all
+    // flushed ids deleted then B sent fresh (1 message). Neither leaves A+B both
+    // visible, and neither loses the reply.
+    const editing = decideSupersedeCorrection(base)
+    expect(editing.mode === 'edit-in-place' && editing.deleteMessageIds.length).toBe(0)
+    const resending = decideSupersedeCorrection({ ...base, chunkCount: 2 })
+    expect(resending.deleteMessageIds).toEqual([500])
+  })
 })
 
 describe('decideSupersede — the duplicate-reply decision core', () => {
