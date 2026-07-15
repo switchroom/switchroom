@@ -94,8 +94,9 @@ export interface WorkerActivityView {
   toolCount: number
   /**
    * Running TOTAL tokens across the worker's assistant messages so far
-   * (input + output + cache_read + cache_creation, deduped by message.id in the
-   * watcher). Rendered as `· {N} tok` on the card's metrics line. Omitted /
+   * (input + output + cache_creation, deduped by message.id in the watcher;
+   * cache_read is excluded — replayed cached context, not new work). Rendered
+   * as `· {N} tok` on the card's metrics line. Omitted /
    * 0 → no token segment (a worker that emitted no usage).
    */
   totalTokens?: number

@@ -14,7 +14,7 @@ import {
 } from '../session-tail.js'
 
 describe('sumUsageTokens', () => {
-  it('sums input + output + cache_read + cache_creation', () => {
+  it('sums input + output + cache_creation (cache_read excluded)', () => {
     expect(
       sumUsageTokens({
         input_tokens: 100,
@@ -22,7 +22,21 @@ describe('sumUsageTokens', () => {
         cache_read_input_tokens: 1000,
         cache_creation_input_tokens: 200,
       }),
-    ).toBe(1350)
+    ).toBe(350)
+  })
+
+  it('excludes a large cache_read_input_tokens from the total', () => {
+    // Locks in the deliberate exclusion: replayed cached context must not
+    // inflate the "new work this turn" figure. A future regression that
+    // re-adds cache_read makes this fail.
+    expect(
+      sumUsageTokens({
+        input_tokens: 100,
+        output_tokens: 50,
+        cache_read_input_tokens: 999_999,
+        cache_creation_input_tokens: 200,
+      }),
+    ).toBe(350)
   })
 
   it('guards missing fields with 0', () => {
@@ -40,7 +54,7 @@ describe('sumUsageTokens', () => {
         cache_creation: { ephemeral_1h_input_tokens: 5, ephemeral_5m_input_tokens: 0 },
         iterations: [{ input_tokens: 2, output_tokens: 3 }],
       }),
-    ).toBe(14)
+    ).toBe(10)
   })
 
   it('returns 0 for null / non-object / non-numeric fields', () => {
@@ -437,7 +451,7 @@ describe('projectTranscriptLine', () => {
       },
     })
     const usage = projectTranscriptLine(line).find((e) => e.kind === 'usage')
-    expect(usage).toEqual({ kind: 'usage', messageId: 'msg_main_1', totalTokens: 1350 })
+    expect(usage).toEqual({ kind: 'usage', messageId: 'msg_main_1', totalTokens: 350 })
   })
 
   it('emits no main-tier usage event when the assistant line carries no usage', () => {
@@ -654,7 +668,7 @@ describe('projectSubagentLine', () => {
     })
     const events = projectSubagentLine(line, 'X', st)
     const usage = events.find((e) => e.kind === 'sub_agent_usage')
-    expect(usage).toEqual({ kind: 'sub_agent_usage', agentId: 'X', messageId: 'msg_1', totalTokens: 1350 })
+    expect(usage).toEqual({ kind: 'sub_agent_usage', agentId: 'X', messageId: 'msg_1', totalTokens: 350 })
   })
 
   it('emits no sub_agent_usage when the assistant line carries no usage', () => {

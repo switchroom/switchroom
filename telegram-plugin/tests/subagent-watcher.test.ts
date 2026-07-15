@@ -593,10 +593,11 @@ describe('startSubagentWatcher', () => {
       }))
       h.poll()
 
-      // msg_1 (1350, counted once despite two lines) + msg_2 (42) = 1392.
-      expect(h.watcher.getRegistry().get('deadbeef')?.totalTokens).toBe(1392)
+      // msg_1 (350, counted once despite two lines; cache_read excluded)
+      // + msg_2 (42) = 392.
+      expect(h.watcher.getRegistry().get('deadbeef')?.totalTokens).toBe(392)
       const last = progress[progress.length - 1]
-      expect(last.totalTokens).toBe(1392)
+      expect(last.totalTokens).toBe(392)
     })
 
     it('ignores a synthetic model sentinel, keeping the last real model', () => {

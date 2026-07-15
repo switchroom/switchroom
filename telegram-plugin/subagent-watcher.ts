@@ -127,7 +127,8 @@ export interface WorkerEntry {
   toolCount: number
   /**
    * Running TOTAL tokens across every assistant message the worker has emitted
-   * (input + output + cache_read + cache_creation, summed via sumUsageTokens).
+   * (input + output + cache_creation, summed via sumUsageTokens; cache_read is
+   * excluded — replayed cached context, not new work).
    * Accumulated from `sub_agent_usage` events, deduped by `seenUsageMessageIds`
    * so the multi-line split-message shape (one logical message persisted as
    * several JSONL lines sharing one `message.id` + identical `usage`) counts

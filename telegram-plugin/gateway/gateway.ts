@@ -3323,8 +3323,9 @@ type CurrentTurn = {
   // never arrive as tool_label events — excluded automatically.
   labeledToolCount: number
   // Running total of the PARENT agent's OWN token usage this turn, summed from
-  // the main-tier session-tail `usage` events (input + output + cache_read +
-  // cache_creation per assistant message, via sumUsageTokens). Rendered on the
+  // the main-tier session-tail `usage` events (input + output + cache_creation
+  // per assistant message, via sumUsageTokens; cache_read is excluded —
+  // replayed cached context, not new work). Rendered on the
   // 🤖 turn-activity card's metrics line (`… · N tok · model`). This is the
   // parent alone — sub-agent tokens are NOT folded in here (they report on
   // their own worker-feed rows; summing them would double-count). 0 until the
