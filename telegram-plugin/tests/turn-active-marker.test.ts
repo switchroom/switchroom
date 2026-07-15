@@ -15,6 +15,7 @@ import {
   removeTurnActiveMarker,
   sweepStaleTurnActiveMarker,
   readTurnActiveMarkerAgeMs,
+  effectiveTurnAgeMs,
   TURN_ACTIVE_HARD_TTL_MS,
   TURN_ACTIVE_IDLE_SWEEP_MS,
 } from '../gateway/turn-active-marker.js'
@@ -37,6 +38,23 @@ describe('turn-active-marker (#412)', () => {
     expect(TURN_ACTIVE_HARD_TTL_MS).toBe(10 * 60_000)
     expect(TURN_ACTIVE_IDLE_SWEEP_MS).toBe(60_000)
     expect(TURN_ACTIVE_HARD_TTL_MS).toBeGreaterThan(TURN_ACTIVE_IDLE_SWEEP_MS)
+  })
+
+  it('effectiveTurnAgeMs prefers the marker age when present (#3262)', () => {
+    // Marker present (touched on tool_use) → its age wins over the fixed
+    // turn.startedAt, so a legitimately LONG turn that keeps touching the
+    // marker reads fresh and is never mis-swept as a phantom.
+    const now = 1_000_000
+    expect(effectiveTurnAgeMs(5_000, now - 9_999_999, now)).toBe(5_000)
+  })
+
+  it('effectiveTurnAgeMs falls back to now - startedAt when the marker is absent (#3262)', () => {
+    // Marker already swept (null age) → fall back to the turn-start timestamp,
+    // so a dangling atom whose marker was reaped still reports a large age and
+    // is recognised as stale by the /model & /effort cross-check.
+    const now = 1_000_000
+    const startedAt = now - 42_000
+    expect(effectiveTurnAgeMs(null, startedAt, now)).toBe(42_000)
   })
 
   it('writeTurnActiveMarker creates a JSON file with the expected payload', () => {

@@ -803,6 +803,7 @@ import {
   removeTurnActiveMarker,
   sweepStaleTurnActiveMarker,
   readTurnActiveMarkerAgeMs,
+  effectiveTurnAgeMs,
   TURN_ACTIVE_MARKER_FILE,
   TURN_ACTIVE_HARD_TTL_MS,
   TURN_ACTIVE_IDLE_SWEEP_MS,
@@ -2862,32 +2863,34 @@ function turnInFlightForGate(): boolean {
   // handlers and do not sit behind this gate — and the block is surfaced
   // off-Telegram in blocked-approvals/<agent>.json.
   const hasPendingApproval = pendingPermissions.size > 0
-  if (!isDeliveryCutoverEnabled()) return claudeBusyKeys.size > 0 || hasPendingApproval
+  // The shared inbound gate stays STRICT: unconditionally busy whenever an
+  // approval card is outstanding (#2841 — a new inbound in that window would
+  // displace the approval context and orphan the pending MCP call). Only the
+  // machine-in-turn leg is factored out (`turnInFlightMachineOnly`); the
+  // `|| hasPendingApproval` composition here is what preserves the contract.
+  return turnInFlightMachineOnly() || hasPendingApproval
+}
+
+/**
+ * The machine-in-turn portion of the gate WITHOUT the `pendingPermissions`
+ * hold — "claude is actively producing a turn right now", ignoring an
+ * outstanding approval card. `turnInFlightForGate()` = this OR a pending
+ * approval, so the shared inbound-hold contract (#2841) is unchanged.
+ *
+ * Factored out so the `/model` & `/effort` busy decision can read THIS
+ * machine-only leg (plus a TTL-bounded approval check in
+ * `resolveModelEffortBusy`) — a wedged / undeliverable approval that "never
+ * expires by design" (#3084) must not hold their switch queued forever on an
+ * idle session (#3262), even though it correctly holds the general inbound gate.
+ */
+function turnInFlightMachineOnly(): boolean {
+  if (!isDeliveryCutoverEnabled()) return claudeBusyKeys.size > 0
   // Machine is authoritative. Run the log-only drift canary (#2794): the
   // imperative `claudeBusyKeys` shadow is still live in parallel, so a
   // dangerous over-hold divergence (machine holds the gate while the
   // imperative view is idle) is surfaced without changing behaviour. The
   // benign orphan-dangle direction — the wedge the machine self-heals — is
   // NOT flagged. `probeGateParity` returns the machine value unchanged.
-  return probeGateParity(isMachineInTurn(), claudeBusyKeys.size) || hasPendingApproval
-}
-
-/**
- * The machine-in-turn portion of the gate WITHOUT the `pendingPermissions`
- * hold — "claude is actively producing a turn right now", ignoring an
- * outstanding approval card.
- *
- * This is a SEPARATE reader, NOT a refactor of `turnInFlightForGate()`. The
- * shared gate stays strict and UNCONDITIONALLY true whenever a permission card
- * is outstanding (the #2841 inbound-hold contract — a source-inspection test
- * pins its exact body). Only the `/model` & `/effort` busy decision reads THIS
- * machine-only leg (plus a TTL-bounded approval check) so a wedged /
- * undeliverable approval that "never expires by design" (#3084) can't hold
- * their switch queued forever on an idle session (#3262). The two-branch logic
- * is duplicated deliberately to keep the shared gate's body untouched.
- */
-function turnInFlightMachineOnly(): boolean {
-  if (!isDeliveryCutoverEnabled()) return claudeBusyKeys.size > 0
   return probeGateParity(isMachineInTurn(), claudeBusyKeys.size)
 }
 
@@ -2901,8 +2904,7 @@ function turnInFlightMachineOnly(): boolean {
  */
 function liveTurnAgeMs(now: number): number | null {
   if (currentTurn === null) return null
-  const markerAge = readTurnActiveMarkerAgeMs(STATE_DIR, now)
-  return markerAge ?? (now - currentTurn.startedAt)
+  return effectiveTurnAgeMs(readTurnActiveMarkerAgeMs(STATE_DIR, now), currentTurn.startedAt, now)
 }
 
 /** Age (ms) of the OLDEST outstanding pending approval, or null when none. */

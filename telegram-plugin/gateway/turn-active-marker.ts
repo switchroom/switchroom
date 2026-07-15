@@ -214,3 +214,20 @@ export function readTurnActiveMarkerAgeMs(stateDir: string, now?: number): numbe
     return null; // ENOENT / unstattable → not working
   }
 }
+
+/**
+ * Effective age (ms) of a live turn for the phantom-turn cross-check (#3262):
+ * prefer the turn-active liveness marker's mtime age (touched on every
+ * tool_use / sub-agent activity, so a genuinely long turn keeps it small),
+ * falling back to `now - turnStartedAt` when the marker is absent (e.g. already
+ * swept away). Pure so the fallback branch is unit-testable with an injected
+ * clock. `markerAgeMs` is the result of `readTurnActiveMarkerAgeMs` (null when
+ * the marker is gone).
+ */
+export function effectiveTurnAgeMs(
+  markerAgeMs: number | null,
+  turnStartedAt: number,
+  now: number,
+): number {
+  return markerAgeMs ?? now - turnStartedAt;
+}
