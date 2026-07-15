@@ -152,7 +152,9 @@ export interface PickerOpts {
   sessionName?: string;
   /** Per-step settle wait (ms). Default 600. */
   stepMs?: number;
-  /** Hard ceiling on the whole operation (ms). Default 10000. */
+  /** Hard ceiling on the whole operation (ms). Default 12000 (#3241 — raised
+   *  from 10000 to leave room for one dismiss-and-retry when an async access
+   *  banner pushes the picker footer out of the first render window). */
   timeoutMs?: number;
   /** Test seam — injected runner + sleep + logger. */
   _runner?: TmuxRunner;
@@ -193,7 +195,7 @@ function makeIo(agentName: string, opts: PickerOpts): Io {
     socket: opts.socketName ?? `switchroom-${agentName}`,
     session: opts.sessionName ?? agentName,
     stepMs: opts.stepMs ?? 600,
-    timeoutMs: opts.timeoutMs ?? 10_000,
+    timeoutMs: opts.timeoutMs ?? 12_000,
     sleep: opts._sleep ?? realSleep,
     log: opts._log ?? ((line) => process.stderr.write(`${line}\n`)),
     startedAt: Date.now(),
@@ -229,20 +231,69 @@ function sendKey(io: Io, key: string): void {
   io.runner.send(io.socket, io.session, ["send-keys", key]);
 }
 
-/** Open the picker and poll until it parses with a rendered footer. */
-async function openPicker(io: Io): Promise<ParsedModelPicker | null> {
+/**
+ * Open the picker and poll until it parses with a rendered footer. Bounded by
+ * `deadlineMs` (absolute epoch ms) when supplied — used by
+ * {@link openPickerWithRetry} to reserve budget for a second attempt — else by
+ * the overall operation timeout.
+ */
+async function openPicker(io: Io, deadlineMs?: number): Promise<ParsedModelPicker | null> {
   sendLiteral(io, "/model");
   sendKey(io, "Enter");
   // Poll for the fully-rendered modal (footer visible). The picker
   // typically renders in well under a second; the loop is bounded by
-  // the overall timeout.
+  // the per-attempt deadline (if any) and the overall timeout.
   for (;;) {
     await io.sleep(io.stepMs);
     const pane = io.runner.capture(io.socket, io.session) ?? "";
     const parsed = parseModelPicker(pane);
     if (parsed?.footerSeen) return parsed;
-    if (expired(io)) return parsed; // best parse we got (may be null)
+    if ((deadlineMs != null && Date.now() >= deadlineMs) || expired(io)) {
+      return parsed; // best parse we got (may be null)
+    }
   }
+}
+
+/**
+ * Open the picker, and if the first render doesn't produce a footer-complete
+ * modal, dismiss any half-rendered interstitial with Escape and retry ONCE
+ * (#3241 symptom 3). Anthropic's async "extending Claude … access" banner can
+ * render inside the `/model` region and push the "Esc to cancel" footer out of
+ * the initial poll window; the retry re-opens against a settled pane. Bounded
+ * by the same overall timeout — the retry is skipped once the budget is spent.
+ */
+async function openPickerWithRetry(io: Io): Promise<ParsedModelPicker | null> {
+  // Reserve budget for a second attempt: the first open gets HALF the remaining
+  // time (floored at a couple of poll steps) so a dismiss-and-retry has room.
+  const remaining = io.timeoutMs - (Date.now() - io.startedAt);
+  const firstDeadline = Date.now() + Math.max(io.stepMs * 2, Math.floor(remaining / 2));
+  const parsed = await openPicker(io, firstDeadline);
+  if (parsed?.footerSeen) return parsed;
+  if (expired(io)) return parsed;
+  // A non-picker interstitial (async access banner / transient render) is sitting
+  // where the picker should be. Esc it and re-open once against the settled pane
+  // before giving up to the caller's static fallback. dismissPicker is Esc +
+  // verify; its return is advisory here.
+  //
+  // #3242 review LOW 3 — ASSUMPTION: dismissPicker's Escape actually returned the
+  // pane to a clean prompt. If BOTH Esc rounds failed (a genuinely stuck modal —
+  // the /rate-limit-options wedge class), the re-open below types `/model` + Enter
+  // into a still-open picker, where the keystrokes act as its filter and Enter
+  // could select an arbitrary row. We accept this residual risk rather than add a
+  // second hard guard because it is caught downstream and never silently wrong:
+  //   - if the re-open still can't parse a footer-complete modal, the caller
+  //     returns ok:false ("picker did not render") and falls back to the static
+  //     list — no wrong selection is surfaced;
+  //   - the caller's own `dismissOrWarn` runs in its finally and LOUDLY logs a
+  //     may-still-be-open pane for wedge forensics (+ dismissFailed:true).
+  // The stuck-modal wedge is pre-existing (any open-picker driver that sends
+  // `/model` + Enter faces it); this one-shot retry only reaches the second open
+  // AFTER two Esc rounds already ran, so it does not meaningfully widen the
+  // window. A stuck modal is the rare exception, surfaced (dismissFailed + log)
+  // not swallowed.
+  await dismissPicker(io);
+  if (expired(io)) return parsed;
+  return openPicker(io);
 }
 
 /**
@@ -292,7 +343,7 @@ export async function discoverModels(
     let parsed: ParsedModelPicker | null = null;
     let dismissed = true;
     try {
-      parsed = await openPicker(io);
+      parsed = await openPickerWithRetry(io);
     } finally {
       dismissed = await dismissOrWarn(io, "discover");
     }
@@ -329,7 +380,7 @@ export async function selectModel(
     io.startedAt = Date.now(); // budget starts when the lock is held
     let selected = false;
     try {
-      const parsed = await openPicker(io);
+      const parsed = await openPickerWithRetry(io);
       if (!parsed || !parsed.footerSeen) {
         return { ok: false, reason: "picker did not render — agent may be mid-turn" };
       }

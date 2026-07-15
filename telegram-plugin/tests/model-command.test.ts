@@ -200,6 +200,91 @@ describe("handleModelCommand — show / help never inject (picker-wedge guard)",
   });
 });
 
+describe("handleModelCommand — set — #3241 poll-until-signal wiring", () => {
+  it("forwards successPattern + errorPattern + settleBeforeSendMs to the inject primitive", async () => {
+    const seen: Array<{ command: string; opts: unknown }> = [];
+    const { deps } = makeDeps({
+      inject: async (_agent, command, opts) => {
+        seen.push({ command, opts });
+        return okResult("⏺ Set model to Sonnet 5 for this session");
+      },
+    });
+    await handleModelCommand({ kind: "set", model: "sonnet" }, deps);
+    expect(seen).toHaveLength(1);
+    const opts = seen[0].opts as {
+      successPattern?: RegExp;
+      errorPattern?: RegExp;
+      settleBeforeSendMs?: number;
+    };
+    // A success pattern that matches claude's confirmation line, an error pattern
+    // that matches the "not found" line, and a clean-prompt pre-send wait.
+    expect(opts.successPattern?.test("⏺ Set model to Sonnet 5")).toBe(true);
+    expect(opts.errorPattern?.test("⎿  Model 'x' not found")).toBe(true);
+    expect(typeof opts.settleBeforeSendMs).toBe("number");
+    expect(opts.settleBeforeSendMs).toBeGreaterThan(0);
+  });
+
+  it("confirmation that lands after a banner → records the live model for /status", async () => {
+    // The inject primitive (poll-until-signal) is responsible for returning the
+    // confirmation and not the banner; here the handler receives that confirmation
+    // and must record it as the session override.
+    const { deps } = makeDeps({
+      inject: async () =>
+        okResult("⠋ extending Claude Fable 5 access…\n⎿  Set model to Fable 5 for this session"),
+    });
+    const reply = await handleModelCommand({ kind: "set", model: "fable" }, deps);
+    expect(reply.selectedModel).toBe("Fable 5");
+    expect(reply.optimistic).toBeUndefined();
+    expect(reply.text).toContain("Set model to Fable 5");
+    // The banner is scrollback and must not leak as prose above the confirmation.
+    expect(reply.text).not.toContain("extending Claude Fable 5 access");
+  });
+
+  it("scraped error line → failure verdict AND no override recorded (retract)", async () => {
+    const { deps } = makeDeps({
+      inject: async () => okResult("⎿  Model 'claude-bogus-99' not found"),
+    });
+    const reply = await handleModelCommand({ kind: "set", model: "claude-bogus-99" }, deps);
+    expect(reply.text).toContain("did not take");
+    expect(reply.selectedModel).toBeUndefined();
+    expect(reply.optimistic).toBeUndefined();
+  });
+
+  // #3242 review MEDIUM 1 — an access/entitlement denial must NOT be recorded
+  // optimistically. Each of these lines matches neither the confirmation prefix
+  // nor the OLD bad-id error regex, so before the widen they slipped into the
+  // optimistic branch and falsely recorded the switch.
+  for (const denial of [
+    "⎿  Fable is not available on your plan",
+    "⎿  access denied",
+    "⎿  Fable requires a Pro subscription",
+    "⎿  This model is not enabled for your account",
+    "⎿  No access to Fable on this tier",
+    "⎿  Fable 5 is currently unavailable",
+  ]) {
+    it(`access-denial line → failure verdict AND no override (retract): ${JSON.stringify(denial)}`, async () => {
+      const { deps } = makeDeps({ inject: async () => okResult(denial) });
+      const reply = await handleModelCommand({ kind: "set", model: "fable" }, deps);
+      expect(reply.text).toContain("did not take");
+      expect(reply.selectedModel).toBeUndefined();
+      expect(reply.optimistic).toBeUndefined();
+    });
+  }
+
+  it("a genuine confirmation is NEVER flipped to a failure by the widened denial regex", async () => {
+    // Confirmation-first ordering: even if scrollback in the same region says
+    // something "unavailable", a real "Set model to …" line wins.
+    const mixed = [
+      "the metrics endpoint was unavailable earlier",
+      "⎿  Set model to Fable 5 for this session",
+    ].join("\n");
+    const { deps } = makeDeps({ inject: async () => okResult(mixed) });
+    const reply = await handleModelCommand({ kind: "set", model: "fable" }, deps);
+    expect(reply.text).not.toContain("did not take");
+    expect(reply.selectedModel).toBe("Fable 5");
+  });
+});
+
 describe("handleModelCommand — set", () => {
   it("injects exactly `/model <name>` once and relays a genuine confirmation + persistence note", async () => {
     const { deps, calls } = makeDeps();
@@ -228,13 +313,17 @@ describe("handleModelCommand — set", () => {
     expect(reply.text).not.toContain("summary you asked for");
     expect(reply.text).not.toContain("rollback plan");
     expect(reply.text).not.toContain("<pre>");
-    // No confirmation line was captured, so the switch is UNVERIFIED — report it
-    // honestly (never a false "switched") and record NO session override.
+    // #3241 part B — poll-until-signal already waited the full window, so a
+    // missing confirmation line with NO scraped error is a SILENT switch, not a
+    // failure. Record the requested model optimistically so /status is right,
+    // and say so honestly (no false "switched (session)", no scrollback leak).
     expect(reply.text).toContain("/model fable");
-    expect(reply.text).toContain("couldn't confirm the switch");
+    expect(reply.text).toContain("couldn't read a confirmation");
     expect(reply.text).toContain("/status");
+    expect(reply.text).not.toContain("Recorded");
     expect(reply.text).not.toContain("switched (session)");
-    expect(reply.selectedModel).toBeUndefined();
+    expect(reply.selectedModel).toBe("Fable");
+    expect(reply.optimistic).toBe(true);
     expect(reply.html).toBe(true);
   });
 
@@ -260,15 +349,17 @@ describe("handleModelCommand — set", () => {
     const { deps } = makeDeps({ inject: async () => okResult(prose) });
     const reply = await handleModelCommand({ kind: "set", model: "fable" }, deps);
     // The anchored regex rejects all three lines, so nothing leaks and there is
-    // no <pre> block. With no confirmation captured, the switch is UNVERIFIED —
-    // report it honestly, never a false "switched".
+    // no <pre> block. No confirmation AND no scraped error → #3241 optimistic
+    // record: the switch is reported as sent + recorded, never a false
+    // "switched", and no scrollback prose leaks.
     expect(reply.text).not.toContain("<pre>");
     expect(reply.text).not.toContain("switched the deploy");
     expect(reply.text).not.toContain("set model behaviour");
     expect(reply.text).not.toContain("kept model changes");
-    expect(reply.text).toContain("couldn't confirm the switch");
+    expect(reply.text).toContain("couldn't read a confirmation");
     expect(reply.text).not.toContain("switched (session)");
-    expect(reply.selectedModel).toBeUndefined();
+    expect(reply.selectedModel).toBe("Fable");
+    expect(reply.optimistic).toBe(true);
     expect(reply.html).toBe(true);
   });
 
@@ -290,7 +381,13 @@ describe("handleModelCommand — set", () => {
       }),
     });
     const reply = await handleModelCommand({ kind: "set", model: "sonnet" }, deps);
-    expect(reply.text).toContain("no response captured");
+    // #3241 part B — an empty capture can't carry an error line, so the send is
+    // treated as a silent switch and the requested model is recorded
+    // optimistically (was: "no response captured", recorded nothing).
+    expect(reply.text).toContain("couldn't read a confirmation");
+    expect(reply.text).toContain("/status");
+    expect(reply.selectedModel).toBe("Sonnet");
+    expect(reply.optimistic).toBe(true);
   });
 
   it("session_missing failure surfaces the tmux-supervisor hint", async () => {
@@ -475,9 +572,12 @@ describe("handleModelCommand — busy gate + honest unverified reporting", () =>
     const reply = await handleModelCommand({ kind: "set", model: "opus" }, deps);
     expect(reply.text).not.toContain("did not take");
     expect(reply.text).not.toContain("model not found");
-    // No confirmation either → honest unverified message, nothing recorded.
-    expect(reply.text).toContain("couldn't confirm the switch");
-    expect(reply.selectedModel).toBeUndefined();
+    // No LINE-ANCHORED error and no confirmation → #3241 optimistic record: the
+    // mid-sentence "model not found" prose does NOT flip the switch to a failure,
+    // and the requested model is recorded (was: "couldn't confirm", nothing).
+    expect(reply.text).toContain("couldn't read a confirmation");
+    expect(reply.selectedModel).toBe("Opus");
+    expect(reply.optimistic).toBe(true);
   });
 
   it("recognises claude v2.1.205's real arg-form confirmation (⎿ glyph + 'and saved as your default')", async () => {
@@ -713,6 +813,7 @@ import {
   EXTRA_CLAUDE_ALIASES,
   externalModelNames,
   isSrToClaudeTransition,
+  optimisticModelRecordLabel,
   type ModelMenuDeps,
 } from "../gateway/model-command.js";
 import { labelTag } from "../../src/agents/model-picker.js";
@@ -906,6 +1007,62 @@ describe("handleModelMenuCallback", () => {
     const out = await handleModelMenuCallback(modelSelectCallbackData("Sonnet"), deps);
     expect(out.selectedModel).toBe("Sonnet");
     expect(out.selectedModelToken).toBe("sonnet");
+  });
+});
+
+// #3242 review MEDIUM 2 — the alias BUTTON (mdl:alias:<alias>, e.g. the Fable
+// button) must be symmetric with the typed set path: record-on-send / retract-
+// on-scraped-error, handling BOTH ok and ok_no_output. Before the fix a silent
+// successful button-switch (ok_no_output, or ok with no confirmation line) fell
+// through to "Switch failed" and dropped the override.
+describe("handleModelMenuCallback — alias button symmetry (#3242 MEDIUM 2)", () => {
+  it("ok_no_output (silent switch via the button) → optimistic record, not a failure", async () => {
+    const { deps } = makeMenuDeps({
+      inject: async () => ({
+        outcome: "ok_no_output" as const,
+        output: "",
+        truncated: false,
+        command: "/model",
+        meta: { description: "Open model picker", expectsOutput: true },
+      }),
+    });
+    const out = await handleModelMenuCallback(`${MODEL_CALLBACK_ALIAS}fable`, deps);
+    expect(out.selectedModel).toBe("Fable"); // normalized display form
+    expect(out.selectedModelToken).toBe("fable");
+    // Provisional copy (#3242 FIX 2): doesn't assert the switch succeeded, points
+    // at /status, and never reads as a failure.
+    expect(out.reply.text).not.toContain("failed");
+    expect(out.reply.text).toContain("/status");
+    expect(out.reply.text).toContain("/model fable");
+  });
+
+  it("ok with no confirmation line (banner-only) → optimistic record", async () => {
+    const { deps } = makeMenuDeps({
+      inject: async () => okResult("⠋ extending Claude Fable 5 access…"),
+    });
+    const out = await handleModelMenuCallback(`${MODEL_CALLBACK_ALIAS}fable`, deps);
+    expect(out.selectedModel).toBe("Fable");
+    expect(out.selectedModelToken).toBe("fable");
+    // The banner must not leak as the confirmation.
+    expect(out.reply.text).not.toContain("extending Claude Fable 5 access");
+  });
+
+  it("scraped access-denial line via the button → failure, no override (retract)", async () => {
+    const { deps } = makeMenuDeps({
+      inject: async () => okResult("⎿  Fable is not available on your plan"),
+    });
+    const out = await handleModelMenuCallback(`${MODEL_CALLBACK_ALIAS}fable`, deps);
+    expect(out.selectedModel).toBeUndefined();
+    expect(out.reply.text).toContain("did not take");
+  });
+
+  it("genuine confirmation via the button still records the display name", async () => {
+    const { deps } = makeMenuDeps({
+      inject: async () => okResult("⎿  Set model to Fable 5 for this session"),
+    });
+    const out = await handleModelMenuCallback(`${MODEL_CALLBACK_ALIAS}fable`, deps);
+    expect(out.selectedModel).toBe("Fable 5");
+    expect(out.selectedModelToken).toBe("fable");
   });
 });
 
@@ -1168,6 +1325,26 @@ describe("isSrToClaudeTransition", () => {
 
   it("false when prev is sr-* but next is also sr-* (sr-* → sr-*)", () => {
     expect(isSrToClaudeTransition("sr-gemini-2.5-pro", "sr-deepseek-r1")).toBe(false);
+  });
+
+  // #3242 review FIX 1 — optimisticModelRecordLabel must NOT de-prefix an sr-*
+  // token: the stored selectedModel doubles as the sr-*→Claude sentinel that
+  // isSrToClaudeTransition (prevModel.startsWith('sr-')) reads. De-prefixing to
+  // a friendly label ("kimi k2") would silently kill the graceful restart that
+  // tears down LiteLLM routing on a subsequent Claude switch.
+  it("optimisticModelRecordLabel keeps sr-* tokens verbatim so the sentinel survives", () => {
+    const recorded = optimisticModelRecordLabel("sr-kimi-k2");
+    expect(recorded).toBe("sr-kimi-k2"); // NOT "kimi k2"
+    // The recorded value still trips the sr→Claude transition on a later switch.
+    expect(isSrToClaudeTransition(recorded, "opus")).toBe(true);
+    // Regression guard: the de-prefixed form would NOT — that was the bug.
+    expect(isSrToClaudeTransition("kimi k2", "opus")).toBe(false);
+  });
+
+  it("optimisticModelRecordLabel Title-cases a bare Claude alias, leaves full ids as-is", () => {
+    expect(optimisticModelRecordLabel("fable")).toBe("Fable");
+    expect(optimisticModelRecordLabel("opus")).toBe("Opus");
+    expect(optimisticModelRecordLabel("claude-opus-4-8")).toBe("claude-opus-4-8");
   });
 
   it("false when switching to sr-* from Claude (Claude → sr-*)", () => {

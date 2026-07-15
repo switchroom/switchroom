@@ -263,6 +263,29 @@ export interface InjectOpts {
    * Callers that omit it get identical behaviour to before (never checked).
    */
   precondition?: () => boolean;
+  /**
+   * Opt-in poll-until-signal capture (#3241). When EITHER `successPattern` or
+   * `errorPattern` is supplied the capture loop switches from the fixed
+   * settle-window heuristic to a deterministic wait: it keeps polling the
+   * NEW (diffed) pane region until a line matches `errorPattern` (stop early,
+   * a scraped failure) or `successPattern` (stop early, confirmation landed),
+   * or `timeoutMs` elapses. This makes the `/model` confirmation scrape immune
+   * to Anthropic's async multi-line access banners that render inside the
+   * `/model` region AFTER the pane first changes — the old loop broke at
+   * `settleMs` on that first change and captured the banner, missing the
+   * later "Set model to …" line. When NEITHER is supplied the loop is
+   * byte-identical to the pre-#3241 behaviour (gated strictly on these params).
+   */
+  successPattern?: RegExp;
+  errorPattern?: RegExp;
+  /**
+   * Opt-in clean-prompt precondition (#3241, symptom 2). When > 0, poll the
+   * pane BEFORE typing and wait until two consecutive captures match (the pane
+   * stopped animating) or this bound elapses. Guards against keys landing in a
+   * still-rendering pane, where claude swallows them and no-ops ("Kept model as
+   * …"). Omitted / 0 → no pre-send wait (unchanged for every other caller).
+   */
+  settleBeforeSendMs?: number;
 }
 
 /**
@@ -597,7 +620,11 @@ export async function injectSlashCommand(
   const socket = opts.socketName ?? defaultSocketName(agentName);
   const session = opts.sessionName ?? agentName;
   const settleMs = opts.settleMs ?? 2000;
-  const timeoutMs = opts.timeoutMs ?? 5000;
+  // Poll-until-signal callers get a raised default ceiling (#3241): the async
+  // access banner can push claude's confirmation line a few hundred ms past the
+  // old 5s window. Non-signal callers keep the historical 5s default.
+  const signalMode = !!(opts.successPattern || opts.errorPattern);
+  const timeoutMs = opts.timeoutMs ?? (signalMode ? 8000 : 5000);
 
   // Serialize against every other drive on this pane (other injects,
   // the /model picker driver) — see src/agents/pane-lock.ts. An
@@ -611,6 +638,9 @@ export async function injectSlashCommand(
       settleMs,
       timeoutMs,
       precondition: opts.precondition,
+      successPattern: opts.successPattern,
+      errorPattern: opts.errorPattern,
+      settleBeforeSendMs: opts.settleBeforeSendMs,
     }),
   );
 }
@@ -633,9 +663,22 @@ export async function injectSlashCommandWith(
     settleMs: number;
     timeoutMs: number;
     precondition?: () => boolean;
+    successPattern?: RegExp;
+    errorPattern?: RegExp;
+    settleBeforeSendMs?: number;
   },
 ): Promise<InjectResult> {
-  const { socket, session, command, settleMs, timeoutMs, precondition } = args;
+  const {
+    socket,
+    session,
+    command,
+    settleMs,
+    timeoutMs,
+    precondition,
+    successPattern,
+    errorPattern,
+    settleBeforeSendMs,
+  } = args;
 
   // Re-validate so the seam itself enforces the contract. The bare
   // verb is what we'll surface in `result.command` / lookup metadata.
@@ -693,6 +736,21 @@ export async function injectSlashCommandWith(
     };
   }
 
+  // #3241 symptom 2 — opt-in clean-prompt precondition. Wait for the pane to
+  // stop animating before typing so the first keystroke doesn't land in a
+  // still-rendering pane (which claude swallows → silent "Kept model as …"
+  // no-op). Poll until two consecutive captures match or the bound elapses.
+  if (settleBeforeSendMs && settleBeforeSendMs > 0) {
+    const settleStart = Date.now();
+    let prevSettle = runner.capture(socket, session) ?? "";
+    while (Date.now() - settleStart < settleBeforeSendMs) {
+      await sleep(POLL_INTERVAL_MS);
+      const cur = runner.capture(socket, session) ?? "";
+      if (cur === prevSettle) break;
+      prevSettle = cur;
+    }
+  }
+
   const before = runner.capture(socket, session) ?? "";
 
   // Two-step send-keys: literal command body (so `/` survives without
@@ -720,9 +778,27 @@ export async function injectSlashCommandWith(
   const start = Date.now();
   let last = before;
   let stableSince: number | null = null;
+  const signalMode = !!(successPattern || errorPattern);
   while (Date.now() - start < timeoutMs) {
     await sleep(POLL_INTERVAL_MS);
     const cur = runner.capture(socket, session) ?? "";
+    if (signalMode) {
+      // #3241 poll-until-signal: ignore the settle heuristic entirely and keep
+      // polling until the NEW (diffed) region carries a success/error line, or
+      // the hard timeout fires. This survives async banners that render inside
+      // the region AFTER the first pane change (the old settle break captured
+      // the banner and missed the later confirmation line).
+      last = cur;
+      if (cur !== before) {
+        const { output: region } = diffPane(before, cur, command);
+        const regionLines = region.split("\n").map((l) => l.trim());
+        // Error wins over success when both somehow match — an explicit failure
+        // line must never be reported as a switch.
+        if (errorPattern && regionLines.some((l) => errorPattern.test(l))) break;
+        if (successPattern && regionLines.some((l) => successPattern.test(l))) break;
+      }
+      continue;
+    }
     if (cur === last && cur !== before) {
       if (stableSince === null) {
         stableSince = Date.now();

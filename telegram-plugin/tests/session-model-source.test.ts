@@ -56,6 +56,17 @@ describe('createSessionModelSource — freshest observation wins', () => {
     expect(s.resolve()).toEqual({ model: 'claude-opus-4-8', source: 'transcript' })
   })
 
+  it('#3241 optimistic override: a silently-switched model recorded without a confirmation still wins /status', () => {
+    // Part B — the typed set path records the REQUESTED model optimistically when
+    // the confirmation line was missed. That override, being the freshest write,
+    // must reclaim /status from the stale transcript line just like a confirmed
+    // switch (symptom 4: "/status shows old model" after an in-place typed switch).
+    const s = createSessionModelSource()
+    s.noteTranscriptModel('claude-opus-4-8') // old model's last assistant line
+    s.setOverride('fable') // optimistic record of the requested model (no confirmation read)
+    expect(s.resolve()).toEqual({ model: 'fable', source: 'override' })
+  })
+
   it('getOverride reports the override independent of freshness', () => {
     const s = createSessionModelSource()
     s.setOverride('sr-glm-5')

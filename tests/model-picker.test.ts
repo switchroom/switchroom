@@ -193,6 +193,39 @@ describe("discoverModels", () => {
   });
 });
 
+describe("#3241 interstitial dismiss-and-retry", () => {
+  // An async access banner (no "Select model" header, no footer) renders where
+  // the picker should be on the first open; openPickerWithRetry must Esc it and
+  // re-open once, then discover succeeds.
+  const INTERSTITIAL = ["❯ /model", "", "⠋ extending Claude Fable 5 access…"].join("\n");
+
+  it("discover Esc-and-retries past a first-render banner, then parses the picker", async () => {
+    let opens = 0;
+    const sends: string[][] = [];
+    const runner: TmuxRunner = {
+      // Until the SECOND `/model` open, the pane shows only the banner; after it,
+      // the real picker renders.
+      capture: () => (opens >= 2 ? PICKER : INTERSTITIAL),
+      send: (_s, _t, args) => {
+        sends.push(args);
+        if (args[1] === "-l" && args[2] === "/model") opens++;
+      },
+      hasSession: () => true,
+    };
+    const res = await discoverModels("agentx", { ...fastOpts, _runner: runner, timeoutMs: 60 });
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.options.map((o) => o.label)).toEqual([
+        "Default (recommended)", "Sonnet", "Haiku",
+      ]);
+    }
+    // Two `/model` opens (initial + one retry) and at least one Escape between them.
+    expect(opens).toBe(2);
+    expect(sentKeys(sends).filter((k) => k === "/model").length).toBe(2);
+    expect(sentKeys(sends)).toContain("Escape");
+  });
+});
+
 describe("selectModel", () => {
   it("navigates cursor→target, verifies the label, presses s — no Escape", async () => {
     // open → PICKER (cursor 2) → after Down: cursor 3 → verify → s → confirmation
