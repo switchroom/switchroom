@@ -1,6 +1,16 @@
 # approval-grant-flow — diagram spec
 
 Status: current
+
+**One idea (comprehension-first):** An agent can't touch anything sensitive
+until you tap Allow.
+
+**Source of truth = `approval-grant-flow.html`** (Method A, HTML/CSS → 2x PNG;
+see DESIGN.md Part 2). The `.html` is authored and diffable; regenerate the
+raster with `docs/diagrams/scripts/render.sh docs/diagrams/approval-grant-flow.html 1200x760`
+which writes `approval-grant-flow.png` at 2x (2400×1520). This diagram is the
+reference implementation of the DESIGN.md guide. (The legacy `.svg`/`.jpg`
+remain for now; the README image swap to the new PNG lands in a follow-up PR.)
 (Corrected 2026-05-19: the prior spec/SVG overstated the model with
 "Every gated tool call" and a synchronous "claude REPL paused" node.
 The kernel does NOT gate every tool call generically. It is a decision
