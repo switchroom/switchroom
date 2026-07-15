@@ -67,6 +67,13 @@ export function renderOutbound(
   maxLen: number = RICH_MESSAGE_MAX_CHARS,
 ): RenderResult {
   return renderSafe(parse(text), text, maxLen);
+  // #3252 note: the `$…$` currency-math neutraliser (`guardDollarMath`) is NOT
+  // applied here. It lives at the single wire seam — `richMessage()` in
+  // rich-send.ts — through which EVERY `{ markdown }` send funnels (the
+  // reply-tool final answer, the draft-stream previews this renderer feeds,
+  // cards, approvals). Applying it there guards every markdown-parsed outbound
+  // exactly once (F1), and `plain`-mode degradations correctly bypass it. See
+  // dollar-math-guard.ts for the rationale.
 }
 
 /**
