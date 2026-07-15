@@ -2,7 +2,7 @@
 (switchroom #3244 follow-up, ``backfill_transcripts.py --from-logs``).
 
 This is the "narrow the candidate set with the durable turn-lifecycle log, then
-let SLICE-LEVEL bank membership be the real safety gate" half of the recovery
+let SESSION-LEVEL bank membership be the real safety gate" half of the recovery
 tool. It never writes anything and issues no HTTP; it only reads the per-agent
 Telegram turns registry (``registry.db``, opened READ-ONLY) and the on-disk
 ``.jsonl`` transcripts, and resolves each agent's TRUE bank from

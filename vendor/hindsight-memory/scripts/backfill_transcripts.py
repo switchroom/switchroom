@@ -670,47 +670,64 @@ class Backfill:
             "candidate_sessions": 0,
             "ambiguous_turns": 0,
             "unmatched_turns": 0,
-            "sessions_fully_present": 0,
+            "sessions_has_documents": 0,
+            "sessions_total_loss": 0,
             "sessions_membership_error": 0,
             "sessions_active_skipped": 0,
             "sessions_already_done": 0,
             "sessions_restored": 0,
-            "slices_total": 0,
-            "slices_present": 0,
-            "slices_missing": 0,
+            "slices_restored": 0,
             "turns_recovered": 0,
             "posts_ok": 0,
             "posts_failed": 0,
             "sessions": [],
         })
 
-    def _session_present_ids(self, bank_id: str, session_id: str):
-        """Slice-level membership (must-fix #2). Returns the SET of document ids
-        the bank already holds for ``session_id`` (server-side ``q=`` filtered),
-        or ``None`` on any query error — the caller fails CLOSED on ``None``
-        (treat the whole session as present ⇒ skip) so a transient daemon error
-        can never cause a duplicate restore.
+    def _session_membership(self, bank_id: str, session_id: str) -> str:
+        """SESSION-LEVEL, id-scheme-AGNOSTIC membership (BLOCKER-1 fix).
+
+        Returns ``"present"`` when the bank holds ANY document belonging to the
+        session, ``"absent"`` when it holds NONE (true total loss), or
+        ``"error"`` on any query failure (caller fails CLOSED — treats it as
+        present ⇒ skip, never restores on uncertainty).
+
+        We deliberately do NOT compare against the tool's ``-r{uuid}`` slice ids:
+        the deployed production banks are keyed with the LEGACY
+        ``{session_id}-{epoch_ms}`` scheme (``retain.py``'s not-yet-live
+        ``slice_document_id`` at line ~430 is the replacement), so an exact slice
+        id set would never match a legacy doc → every slice looks "missing" →
+        every intact session gets duplicated. Presence is decided by the id
+        PREFIX ``{session_id}`` which BOTH schemes share (``{session_id}-...``
+        legacy/new, or the bare ``{session_id}`` chunk-0 id). Restore fires ONLY
+        for a session with ZERO documents — so partial-within-a-populated-session
+        recovery is OUT OF SCOPE on legacy banks (we cannot tell WHICH turns a
+        legacy epoch-ms id covers) and can only be added once the ``-r{uuid}``
+        scheme is deployed and banks are re-keyed.
 
         The GET is paced through the shared inflight lock so must-fix #1's broad
         candidate set can never create a read storm (should-fix 4b)."""
         client = self._ensure_client()
         if client is None:
-            return None
+            return "error"
         self._pace_before_post()
         try:
             with inflight_lock(blocking=True) as acquired:
                 if not acquired:  # pragma: no cover - blocking acquire fails open
-                    return None
+                    return "error"
                 ids = client.list_session_document_ids(bank_id, session_id)
         except Exception as e:
             debug_log(self.config, f"backfill(from-logs): membership query failed "
                                    f"for {session_id}: {e} — failing closed (skip)")
-            return None
+            return "error"
         finally:
             # A membership GET counts toward pacing state just like a POST.
             self._posted_count += 1
             self._post_times.append(time.monotonic())
-        return ids
+        prefix = f"{session_id}-"
+        for did in ids:
+            if isinstance(did, str) and (did == session_id or did.startswith(prefix)):
+                return "present"
+        return "absent"
 
     def _backfill_agent_from_logs(self, agent: str) -> None:
         ar = self._logs_agent_report(agent)
@@ -774,13 +791,31 @@ class Backfill:
                                        "action": "skipped_recent", "idle_s": round(idle, 1)})
                 continue
 
+            # SESSION-LEVEL, scheme-agnostic membership (BLOCKER-1 fix): restore
+            # ONLY a session the bank has ZERO documents for (true total loss).
+            # A session with ANY doc (legacy epoch-ms OR new -r{uuid} scheme) is
+            # PRESENT ⇒ skipped — we cannot safely fill a partial tail on a
+            # legacy-keyed bank without duplicating the intact head. Fail CLOSED
+            # (error ⇒ treated present ⇒ skip).
+            membership = self._session_membership(bank_id, session)
+            if membership == "error":
+                ar["sessions_membership_error"] += 1
+                ar["sessions"].append({"session": session, "class": "membership_error",
+                                       "join": info["join"], "action": "skipped_fail_closed"})
+                continue
+            if membership == "present":
+                ar["sessions_has_documents"] += 1
+                ar["sessions"].append({"session": session, "class": "has_documents",
+                                       "join": info["join"], "action": "skip_has_documents"})
+                continue
+
+            # membership == "absent" → true total loss → restore the whole session.
             messages = read_transcript(path)
             if not messages:
                 continue
             slices = chunk_by_human_turns(messages, self.slice_turns)
             if not slices:
                 continue
-
             built_slices = []
             for sl in slices:
                 built = build_retain_payload(
@@ -794,61 +829,42 @@ class Backfill:
                 continue
 
             total = len(built_slices)
-
-            # Slice-level membership (must-fix #2): restore ONLY the slices whose
-            # deterministic ids are ABSENT from the bank. Fail CLOSED on error.
-            present_ids = self._session_present_ids(bank_id, session)
-            if present_ids is None:
-                ar["sessions_membership_error"] += 1
-                ar["sessions"].append({"session": session, "class": "membership_error",
-                                       "action": "skipped_fail_closed", "join": info["join"]})
-                continue
-
-            missing = [(b, sl) for (b, sl) in built_slices if b["document_id"] not in present_ids]
-            present_count = total - len(missing)
-            missing_turns = sum(len(_human_turn_indices(sl)) for _, sl in missing)
-
-            ar["slices_total"] += total
-            ar["slices_present"] += present_count
-            ar["slices_missing"] += len(missing)
+            n_turns = sum(len(_human_turn_indices(sl)) for _, sl in built_slices)
+            ar["sessions_total_loss"] += 1
 
             session_entry = {
-                "session": session, "class": "recover" if missing else "fully_present",
+                "session": session, "class": "total_loss",
                 "join": info["join"], "bank_id": bank_id,
-                "slices_total": total, "slices_present": present_count,
-                "slices_missing": len(missing), "turns": missing_turns,
-                "document_ids_missing": [b["document_id"] for b, _ in missing],
+                "slices": total, "turns": n_turns,
+                "document_ids": [b["document_id"] for b, _ in built_slices],
                 "action": None,
             }
-
-            if not missing:
-                ar["sessions_fully_present"] += 1
-                session_entry["action"] = "skip_fully_present"
-                ar["sessions"].append(session_entry)
-                continue
-
-            ar["turns_recovered"] += missing_turns
 
             if not self.commit:
                 # Dry-run: build-only, ZERO writes. Report the gap it WOULD fill.
                 session_entry["action"] = "would_restore"
+                ar["turns_recovered"] += n_turns
+                ar["slices_restored"] += total
                 ar["sessions"].append(session_entry)
                 continue
 
             all_ok = True
-            for built, _ in missing:
+            last_built = None
+            for built, _ in built_slices:
                 if self._post_slice(bank_id, built):
                     ar["posts_ok"] += 1
+                    ar["slices_restored"] += 1
+                    last_built = built
                 else:
                     ar["posts_failed"] += 1
                     all_ok = False
 
-            if all_ok:
+            if all_ok and last_built is not None:
                 ar["sessions_restored"] += 1
+                ar["turns_recovered"] += n_turns
                 session_entry["action"] = "restored"
-                # If the whole session is now covered, advance the live watermark
-                # so the agent's own boot reconcile sees the tail as committed.
-                last_built = built_slices[-1][0]
+                # Advance the live watermark so the agent's own boot reconcile
+                # sees the tail as committed.
                 try:
                     watermark.commit(
                         session, last_built["last_uuid"], last_built["document_id"],
@@ -856,8 +872,7 @@ class Backfill:
                     )
                 except Exception:  # pragma: no cover - defensive
                     pass
-                self.progress.record(agent, session, "done",
-                                     slices_missing=len(missing), turns=missing_turns)
+                self.progress.record(agent, session, "done", slices=total, turns=n_turns)
             else:
                 session_entry["action"] = "restore_failed"
                 self.progress.record(agent, session, "failed")
@@ -872,14 +887,13 @@ class Backfill:
             "candidate_sessions": 0,
             "ambiguous_turns": 0,
             "unmatched_turns": 0,
-            "sessions_fully_present": 0,
+            "sessions_has_documents": 0,
+            "sessions_total_loss": 0,
             "sessions_membership_error": 0,
             "sessions_active_skipped": 0,
             "sessions_already_done": 0,
             "sessions_restored": 0,
-            "slices_total": 0,
-            "slices_present": 0,
-            "slices_missing": 0,
+            "slices_restored": 0,
             "turns_recovered": 0,
             "posts_ok": 0,
             "posts_failed": 0,
@@ -891,10 +905,10 @@ class Backfill:
                 roll["banks_refused"] += 1
             for k in (
                 "candidate_turns", "candidate_sessions", "ambiguous_turns",
-                "unmatched_turns", "sessions_fully_present", "sessions_membership_error",
-                "sessions_active_skipped", "sessions_already_done", "sessions_restored",
-                "slices_total", "slices_present", "slices_missing", "turns_recovered",
-                "posts_ok", "posts_failed",
+                "unmatched_turns", "sessions_has_documents", "sessions_total_loss",
+                "sessions_membership_error", "sessions_active_skipped",
+                "sessions_already_done", "sessions_restored", "slices_restored",
+                "turns_recovered", "posts_ok", "posts_failed",
             ):
                 roll[k] += ar.get(k, 0)
         self.report["rollup"] = roll
@@ -943,21 +957,22 @@ def format_report_from_logs(report: dict) -> str:
             f"  {agent} [bank={ar.get('bank_id')}]: "
             f"cand_turns={ar['candidate_turns']} cand_sessions={ar['candidate_sessions']} "
             f"ambiguous={ar['ambiguous_turns']} unmatched={ar['unmatched_turns']} "
-            f"fully_present={ar['sessions_fully_present']} "
+            f"has_documents={ar['sessions_has_documents']} "
+            f"total_loss={ar['sessions_total_loss']} "
             f"membership_err={ar['sessions_membership_error']} "
             f"active_skip={ar['sessions_active_skipped']} "
             f"already_done={ar['sessions_already_done']} "
             f"restored={ar['sessions_restored']} "
-            f"slices(total/present/missing)={ar['slices_total']}/{ar['slices_present']}/{ar['slices_missing']} "
+            f"slices_restored={ar['slices_restored']} "
             f"turns={ar['turns_recovered']} "
             f"posts_ok={ar['posts_ok']} posts_failed={ar['posts_failed']}"
         )
         for s in ar.get("sessions", []):
-            if s.get("class") in ("recover", "membership_error", "ambiguous"):
+            if s.get("class") in ("total_loss", "membership_error", "ambiguous"):
                 lines.append(
                     f"      - {s.get('session', s.get('turn_key'))} [{s.get('class')}] "
                     f"join={s.get('join', '-')} "
-                    f"slices={s.get('slices_missing', '-')}/{s.get('slices_total', '-')} "
+                    f"slices={s.get('slices', '-')} "
                     f"action={s.get('action')} {s.get('detail', '')}".rstrip()
                 )
     lines.append("")
@@ -966,15 +981,19 @@ def format_report_from_logs(report: dict) -> str:
         f"banks_refused={roll.get('banks_refused', 0)} "
         f"candidate_sessions={roll.get('candidate_sessions', 0)} "
         f"ambiguous={roll.get('ambiguous_turns', 0)} "
-        f"fully_present={roll.get('sessions_fully_present', 0)} "
+        f"has_documents(skipped)={roll.get('sessions_has_documents', 0)} "
+        f"total_loss={roll.get('sessions_total_loss', 0)} "
         f"membership_err={roll.get('sessions_membership_error', 0)} "
         f"restored={roll.get('sessions_restored', 0)} "
-        f"slices_missing={roll.get('slices_missing', 0)} "
+        f"slices_restored={roll.get('slices_restored', 0)} "
         f"turns_would_recover={roll.get('turns_recovered', 0)} "
         f"posts_ok={roll.get('posts_ok', 0)} posts_failed={roll.get('posts_failed', 0)}"
     )
+    lines.append("  NOTE: recovers only ZERO-document (total-loss) sessions. "
+                 "Partial-tail recovery within a populated session is OUT OF SCOPE "
+                 "on legacy epoch-ms banks (needs the -r{uuid} id scheme deployed).")
     if not roll.get("committed"):
-        est_posts = roll.get("slices_missing", 0)
+        est_posts = roll.get("slices_restored", 0)
         delay_ms = _delay_ms()
         est_secs = est_posts * (delay_ms / 1000.0)
         lines.append(
@@ -1064,8 +1083,10 @@ def main(argv=None) -> int:
                              "(treated as active/in-flight). Default 3600.")
     parser.add_argument("--from-logs", action="store_true", dest="from_logs",
                         help="Log-driven recovery mode: narrow candidate sessions via the per-agent "
-                             "turns registry, then restore ONLY the exact slices genuinely absent from "
-                             "the agent's true bank (slice-level membership). Recovers partial-tail losses.")
+                             "turns registry, then restore ONLY sessions the agent's true bank has ZERO "
+                             "documents for (session-level, scheme-agnostic total-loss gate). "
+                             "Partial-tail recovery within a populated session is OUT OF SCOPE on legacy "
+                             "epoch-ms banks (needs the -r{uuid} id scheme deployed).")
     parser.add_argument("--switchroom-yaml", default=None,
                         help="Path to switchroom.yaml for true-bank resolution (--from-logs). "
                              "Default: sibling of the agents dir.")

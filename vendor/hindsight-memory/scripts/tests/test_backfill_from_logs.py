@@ -211,22 +211,13 @@ class FromLogsTestBase(unittest.TestCase):
         _write_registry(p, rows, with_session_id=with_session_id)
         return p
 
-    def _seed_present_slices(self, agent, session, path, bank_id, which):
-        """Pre-seed the bank with the deterministic docs for the given slice
-        indices (0-based, slice_turns=1 ⇒ one slice per human turn)."""
-        from retain import read_transcript
-        msgs = read_transcript(path)
-        slices = bf.chunk_by_human_turns(msgs, 1)
-        ids = []
-        for i, sl in enumerate(slices):
-            built = bf.build_retain_payload(
-                self._config(), session, sl, msgs, bank_id=bank_id,
-                api_url="http://fake", api_token=None,
-            )
-            if i in which:
-                self.daemon.docs[built["document_id"]] = {"content": "PRESENT", "bank_id": bank_id}
-            ids.append(built["document_id"])
-        return ids
+    def _seed_legacy_doc(self, session, bank_id, epoch_ms=1783796975304):
+        """Seed a doc under the LEGACY ``{session_id}-{epoch_ms}`` scheme — the
+        one production banks actually use (NOT the -r{uuid} scheme the tool
+        computes). Session-level membership must see this as PRESENT."""
+        did = f"{session}-{epoch_ms}"
+        self.daemon.docs[did] = {"content": "LEGACY-PRESENT", "bank_id": bank_id}
+        return did
 
     def _run(self, agent, commit=True, **kw):
         return bf.Backfill(
@@ -238,15 +229,19 @@ class FromLogsTestBase(unittest.TestCase):
 
 
 class TestFromLogs(FromLogsTestBase):
-    # --- must-fix #2: partial loss → only the missing TAIL slices restored ---
-    def test_partial_loss_restores_only_missing_tail(self):
+    # --- BLOCKER-1: a session with LEGACY epoch-ms docs is PRESENT → zero
+    #     restore. This FAILS on the pre-fix slice-level exact-id code (which
+    #     computes -r{uuid} ids, never matches the legacy id, and re-posts every
+    #     slice → duplicates the intact session). ------------------------------
+    def test_legacy_scheme_docs_present_zero_restore(self):
         self._write_yaml({"clerk": None})  # bank = name "clerk"
         self._write_settings("clerk", "clerk")
         base = 1_700_000_000_000
-        path, (first, last) = self._transcript("clerk", "sess-partial", 5, base)
-        # Early slices 0..2 already retained by the live path; tail 3,4 lost.
-        all_ids = self._seed_present_slices("clerk", "sess-partial", path, "clerk", which={0, 1, 2})
-        present_before = set(self.daemon.docs)
+        path, (first, last) = self._transcript("clerk", "sess-legacy", 5, base)
+        # The live path retained this session under the LEGACY {session}-{ms}
+        # scheme — the only scheme deployed banks hold today.
+        legacy_id = self._seed_legacy_doc("sess-legacy", "clerk")
+        before = set(self.daemon.docs)
         self._registry("clerk", [{
             "turn_key": "123:_:t1", "chat_id": "123", "started_at": str(first + 500),
             "ended_at": str(last), "ended_via": "sigterm",
@@ -255,45 +250,23 @@ class TestFromLogs(FromLogsTestBase):
         report = self._run("clerk")
         ar = report["agents"]["clerk"]
 
-        self.assertEqual(ar["slices_total"], 5)
-        self.assertEqual(ar["slices_present"], 3)
-        self.assertEqual(ar["slices_missing"], 2)
-        self.assertEqual(ar["sessions_restored"], 1)
-        # ONLY the two tail slices were posted (session-level membership would
-        # have skipped the whole session and restored nothing).
-        self.assertEqual(len(self.daemon.posts), 2)
-        posted_ids = {p[0] for p in self.daemon.posts}
-        self.assertEqual(posted_ids, {all_ids[3], all_ids[4]})
-        # commit-before-ack on every restore.
-        self.assertTrue(all(async_flag is False for _, async_flag in self.daemon.posts))
-        # The pre-seeded present docs were NOT re-posted.
-        self.assertTrue(present_before.issubset(set(self.daemon.docs)))
-
-    # --- fully-present session → zero restores ------------------------------
-    def test_fully_present_session_zero_restore(self):
-        self._write_yaml({"clerk": None})
-        self._write_settings("clerk", "clerk")
-        base = 1_700_000_000_000
-        path, (first, last) = self._transcript("clerk", "sess-full", 3, base)
-        self._seed_present_slices("clerk", "sess-full", path, "clerk", which={0, 1, 2})
-        self._registry("clerk", [{
-            "turn_key": "123:_:t", "chat_id": "123", "started_at": str(first + 100),
-            "ended_at": str(last), "ended_via": "restart",
-        }])
-
-        report = self._run("clerk")
-        ar = report["agents"]["clerk"]
-        self.assertEqual(ar["sessions_fully_present"], 1)
-        self.assertEqual(ar["slices_missing"], 0)
+        # Behavioural gate first: NOT a single POST — the legacy-keyed session
+        # is never duplicated. On the pre-fix slice-level code this is 5 posts.
         self.assertEqual(self.daemon.posts, [])
+        self.assertEqual(set(self.daemon.docs), before)
+        self.assertIn(legacy_id, self.daemon.docs)
+        self.assertEqual(ar["sessions_has_documents"], 1)
+        self.assertEqual(ar["sessions_total_loss"], 0)
+        self.assertEqual(ar["sessions_restored"], 0)
 
-    # --- must-fix #1: a genuinely-missing `restart` session IS restored ------
+    # --- must-fix #1: a genuinely-empty (total-loss) `restart` session IS
+    #     restored (proves broad classifier + total-loss gate). ---------------
     def test_missing_restart_session_restored(self):
         self._write_yaml({"clerk": None})
         self._write_settings("clerk", "clerk")
         base = 1_700_000_000_000
         path, (first, last) = self._transcript("clerk", "sess-restart", 3, base)
-        # Nothing seeded → total loss. ended_via='restart' with NULL in-flight
+        # Empty bank → total loss. ended_via='restart' with NULL in-flight
         # columns (the dead-predicate shape) must still be recovered.
         self._registry("clerk", [{
             "turn_key": "123:_:t", "chat_id": "123", "started_at": str(first + 100),
@@ -303,8 +276,35 @@ class TestFromLogs(FromLogsTestBase):
 
         report = self._run("clerk")
         ar = report["agents"]["clerk"]
+        self.assertEqual(ar["sessions_total_loss"], 1)
         self.assertEqual(ar["sessions_restored"], 1)
-        self.assertEqual(ar["slices_missing"], 3)
+        self.assertEqual(ar["slices_restored"], 3)
+        self.assertEqual(len(self.daemon.posts), 3)
+        self.assertTrue(all(async_flag is False for _, async_flag in self.daemon.posts))
+
+    # --- mixed scheme fleet: legacy-present session skipped, empty session
+    #     restored — one run, no cross-contamination. --------------------------
+    def test_mixed_present_and_total_loss(self):
+        self._write_yaml({"clerk": None})
+        self._write_settings("clerk", "clerk")
+        base = 1_700_000_000_000
+        pa, (fa, la) = self._transcript("clerk", "sess-has", 3, base)
+        self._seed_legacy_doc("sess-has", "clerk")
+        base_b = base + 10_000_000
+        pb, (fb, lb) = self._transcript("clerk", "sess-empty", 3, base_b)
+        self._registry("clerk", [
+            {"turn_key": "123:_:a", "chat_id": "123", "started_at": str(fa + 100),
+             "ended_at": str(la), "ended_via": "sigterm"},
+            {"turn_key": "123:_:b", "chat_id": "123", "started_at": str(fb + 100),
+             "ended_at": str(lb), "ended_via": "restart"},
+        ])
+
+        report = self._run("clerk")
+        ar = report["agents"]["clerk"]
+        self.assertEqual(ar["sessions_has_documents"], 1)
+        self.assertEqual(ar["sessions_restored"], 1)
+        # Only the empty session's slices were posted.
+        self.assertTrue(all("sess-empty" in did for did, _ in self.daemon.posts))
         self.assertEqual(len(self.daemon.posts), 3)
 
     # --- must-fix #3: span containment picks the right transcript -----------
@@ -413,7 +413,8 @@ class TestFromLogs(FromLogsTestBase):
         report = self._run("clerk", commit=False)
         ar = report["agents"]["clerk"]
         # Reports the gap it WOULD fill ...
-        self.assertEqual(ar["slices_missing"], 4)
+        self.assertEqual(ar["sessions_total_loss"], 1)
+        self.assertEqual(ar["slices_restored"], 4)
         self.assertEqual(ar["turns_recovered"], 4)
         # ... but nothing was written.
         self.assertEqual(self.daemon.posts, [])

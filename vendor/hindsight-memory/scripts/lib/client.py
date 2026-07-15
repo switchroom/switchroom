@@ -215,17 +215,20 @@ class HindsightClient:
         timeout: int = 10,
     ) -> set:
         """Return the set of document ids in ``bank_id`` whose id contains
-        ``session_id`` (switchroom #3244 log-driven recovery, slice-level
+        ``session_id`` (switchroom #3244 log-driven recovery, session-level
         membership).
 
         Uses the daemon's server-side ``q=`` filter — a case-insensitive
         substring match on the document id (``GET .../documents?q=...``,
         ``http.py:api_list_documents``). Every per-turn transcript retain the
         live path OR this backfill ever wrote for a session carries the session
-        id as an id prefix (``{session_id}-...``), so this ONE server-side query
-        (paged, bounded by ``max_pages``) returns exactly this session's docs
-        without a per-slice GET storm. The caller then computes the session's
-        deterministic slice ids and restores ONLY the ids ABSENT from this set.
+        id as an id prefix — BOTH the legacy ``{session_id}-{epoch_ms}`` scheme
+        (what production banks hold today) and the new ``{session_id}-r{uuid}``
+        scheme — so this ONE server-side query (paged, bounded by ``max_pages``)
+        returns exactly this session's docs without a per-slice GET storm. The
+        caller tests the returned ids for the ``{session_id}`` PREFIX (scheme-
+        agnostic) to decide presence: ANY doc ⇒ present ⇒ skip; ZERO ⇒
+        total-loss ⇒ restore.
 
         Raises on any HTTP/transport error so the caller can fail CLOSED (treat
         the session as PRESENT ⇒ skip) and never risk a duplicate restore.
