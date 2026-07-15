@@ -38,6 +38,24 @@ import { join } from "node:path";
 
 export const TURN_ACTIVE_MARKER_FILE = "turn-active.json";
 
+/**
+ * Absolute ceiling (ms) beyond which a turn-active signal cannot reflect a
+ * real in-flight turn. This is the marker sweep's `hardTtlMs` (`gateway.ts`
+ * `sweepStaleTurnActiveMarker` callsite). Exported so the `/model` & `/effort`
+ * busy-gate cross-checks the in-memory turn atom and the pending-approval hold
+ * against the SAME ceiling it sweeps the marker file at (#3262) — instead of
+ * the atom leaking past it and reading as a phantom "active turn" on an idle
+ * session.
+ */
+export const TURN_ACTIVE_HARD_TTL_MS = 10 * 60_000;
+
+/**
+ * Idle-sweep threshold (ms): the marker is swept this soon when the caller
+ * asserts no turn is in flight. Exported alongside the hard TTL so both
+ * bounds have a single source of truth.
+ */
+export const TURN_ACTIVE_IDLE_SWEEP_MS = 60_000;
+
 export interface TurnActiveMarker {
   turnKey: string;
   chatId: string;
@@ -195,4 +213,21 @@ export function readTurnActiveMarkerAgeMs(stateDir: string, now?: number): numbe
   } catch {
     return null; // ENOENT / unstattable → not working
   }
+}
+
+/**
+ * Effective age (ms) of a live turn for the phantom-turn cross-check (#3262):
+ * prefer the turn-active liveness marker's mtime age (touched on every
+ * tool_use / sub-agent activity, so a genuinely long turn keeps it small),
+ * falling back to `now - turnStartedAt` when the marker is absent (e.g. already
+ * swept away). Pure so the fallback branch is unit-testable with an injected
+ * clock. `markerAgeMs` is the result of `readTurnActiveMarkerAgeMs` (null when
+ * the marker is gone).
+ */
+export function effectiveTurnAgeMs(
+  markerAgeMs: number | null,
+  turnStartedAt: number,
+  now: number,
+): number {
+  return markerAgeMs ?? now - turnStartedAt;
 }

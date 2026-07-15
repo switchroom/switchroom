@@ -21,6 +21,7 @@ import {
   EFFORT_CALLBACK_PREFIX,
   type EffortCommandDeps,
 } from "../gateway/effort-command.js";
+import { resolveStaleAwareBusy } from "../gateway/model-command.js";
 import type { EffortApplyResult } from "../../src/agents/effort-picker.js";
 
 function applyOk(level: string, confirmed = false): EffortApplyResult {
@@ -253,5 +254,51 @@ describe("effort-command: /effort default (#3039)", () => {
     const r = await handleEffortCommand({ kind: "help" }, makeDeps().deps);
     expect(r.text).toContain("/effort default");
     expect(r.text).toContain("lasts until the agent’s next restart");
+  });
+
+  // #3262 parity with /model: the gateway gates the effort apply-vs-queue on
+  // `resolveModelEffortBusy().currentTurnActive` (the turn-atom leg — /effort
+  // does not consult the delivery-machine/approval gate). These pin the SAME
+  // stale-aware decision the gateway feeds that gate: a dangling atom older than
+  // the hard TTL reads idle → APPLY; a fresh atom reads busy → QUEUE.
+  describe("phantom 'active turn' apply-vs-queue (#3262)", () => {
+    const HARD_TTL = 10 * 60_000;
+    // The gateway's effort queue predicate, reduced to the signal it reads.
+    const effortWouldQueue = (currentTurnActive: boolean): boolean => currentTurnActive;
+
+    it("APPLIES a set when the turn atom is DANGLING (older than the hard TTL)", () => {
+      const r = resolveStaleAwareBusy({
+        currentTurnActive: true,
+        turnAgeMs: HARD_TTL + 1,
+        machineInTurn: false,
+        oldestPendingApprovalAgeMs: null,
+        hardTtlMs: HARD_TTL,
+      });
+      expect(r.clearStaleTurn).toBe(true);
+      expect(effortWouldQueue(r.currentTurnActive)).toBe(false); // → applies now
+    });
+
+    it("QUEUES a set when the turn is FRESH (marker within the TTL) — no regression", () => {
+      const r = resolveStaleAwareBusy({
+        currentTurnActive: true,
+        turnAgeMs: 5_000,
+        machineInTurn: false,
+        oldestPendingApprovalAgeMs: null,
+        hardTtlMs: HARD_TTL,
+      });
+      expect(r.clearStaleTurn).toBe(false);
+      expect(effortWouldQueue(r.currentTurnActive)).toBe(true); // → queues
+    });
+
+    it("APPLIES when there is no turn atom at all", () => {
+      const r = resolveStaleAwareBusy({
+        currentTurnActive: false,
+        turnAgeMs: null,
+        machineInTurn: false,
+        oldestPendingApprovalAgeMs: null,
+        hardTtlMs: HARD_TTL,
+      });
+      expect(effortWouldQueue(r.currentTurnActive)).toBe(false);
+    });
   });
 });

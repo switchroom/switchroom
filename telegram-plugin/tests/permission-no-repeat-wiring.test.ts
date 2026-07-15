@@ -90,20 +90,27 @@ describe('inbound gate holds while approval card is outstanding (#2841)', () => 
   // even after releaseTurnBufferGate has cleared claudeBusyKeys/machine on the
   // first interim reply. Without this, a new inbound delivered in that window
   // displaces the approval context and orphans the pending MCP call.
-  it('turnInFlightForGate includes pendingPermissions.size > 0 on the legacy path', () => {
-    // span 2600: the function gained a ~1100-char note (#3084 follow-up) documenting
-    // the one case with no timeout valve — a HELD approval.
-    const fn = slice(GATEWAY, 'function turnInFlightForGate()', 2600)
-    // Both paths (legacy claudeBusyKeys + machine-authoritative) must include the check.
-    expect(fn).toMatch(/claudeBusyKeys\.size\s*>\s*0\s*\|\|\s*hasPendingApproval/)
+  it('turnInFlightForGate STILL composes the pending-approval hold (#2841 contract)', () => {
+    // #3262 factored the machine-in-turn leg into turnInFlightMachineOnly(), but
+    // the shared inbound gate must remain UNCONDITIONALLY busy while an approval
+    // card is outstanding. That contract now lives in the composition here.
+    // span 2800: the function carries a ~1100-char #2841/#3084 note before the
+    // composition line.
+    const fn = slice(GATEWAY, 'function turnInFlightForGate()', 2800)
+    expect(fn).toMatch(/return\s+turnInFlightMachineOnly\(\)\s*\|\|\s*hasPendingApproval/)
+    expect(fn).toMatch(/hasPendingApproval\s*=\s*pendingPermissions\.size\s*>\s*0/)
   })
 
-  it('turnInFlightForGate includes pendingPermissions.size > 0 on the machine path', () => {
-    const fn = slice(GATEWAY, 'function turnInFlightForGate()', 2700)
-    // probeGateParity(...) || hasPendingApproval — the inner arg contains its own
-    // parens (isMachineInTurn()), so match the two tokens independently.
+  it('turnInFlightMachineOnly carries BOTH busy paths (legacy claudeBusyKeys + machine)', () => {
+    // #3262: the machine-in-turn signal moved here (read by the /model & /effort
+    // resolver without the approval hold). Both the legacy claudeBusyKeys path
+    // and the machine-authoritative probeGateParity path must be present — a
+    // dropped branch would silently change the busy read.
+    const fn = slice(GATEWAY, 'function turnInFlightMachineOnly()', 1400)
+    expect(fn).toMatch(/claudeBusyKeys\.size\s*>\s*0/)
     expect(fn).toContain('probeGateParity(')
-    expect(fn).toMatch(/probeGateParity[\s\S]+?\|\|\s*hasPendingApproval/)
+    // NOT gated by the approval hold — that stays in turnInFlightForGate.
+    expect(fn).not.toContain('hasPendingApproval')
   })
 
   it('hasPendingApproval reads pendingPermissions.size', () => {

@@ -139,6 +139,74 @@ export function isModelCommandBusy(ctx: Pick<ModelCommandContext, 'currentTurnAc
 }
 
 /**
+ * Raw busy signals for a `/model` or `/effort` command, PLUS the ages needed
+ * to tell a live signal from a stale/dangling one (#3262). Pure + clock-free
+ * (ages are passed in) so the apply-vs-queue outcome is unit-testable with the
+ * same clock-injection pattern as the marker-sweep tests.
+ */
+export interface StaleAwareBusyInput {
+  /** The in-memory turn atom is non-null (`currentTurn !== null`). */
+  currentTurnActive: boolean
+  /**
+   * Age (ms) of the live turn: the turn-active liveness marker's mtime age
+   * (touched on every tool_use / sub-agent activity), falling back to
+   * `now - turn.startedAt` when the marker is absent. Null ONLY when there is
+   * no live turn (`currentTurnActive` false). A large age on a non-null atom
+   * means the `turn_end` that should have cleared it never fired — a phantom.
+   */
+  turnAgeMs: number | null
+  /**
+   * Machine-in-turn signal WITHOUT the pending-approval hold — the authoritative
+   * "claude is actively producing a turn" gate (`turnInFlightForGate()` minus
+   * its `pendingPermissions` leg).
+   */
+  machineInTurn: boolean
+  /**
+   * Age (ms) of the OLDEST outstanding pending approval, or null when there are
+   * none. A wedged / undeliverable approval "never expires by design" (#3084)
+   * and would otherwise hold the gate closed forever on an idle session.
+   */
+  oldestPendingApprovalAgeMs: number | null
+  /** Hard TTL ceiling (ms) — reuse `TURN_ACTIVE_HARD_TTL_MS`, do not invent one. */
+  hardTtlMs: number
+}
+
+export interface StaleAwareBusy {
+  /** The turn atom, with a stale (older-than-TTL) atom discounted to idle. */
+  currentTurnActive: boolean
+  /** The gate: machine-in-turn OR a pending approval still within the TTL. */
+  turnInFlight: boolean
+  /**
+   * True when the atom was judged STALE (non-null but older than the hard TTL).
+   * The gateway caller clears the dangling atom when this is set so the phantom
+   * doesn't re-block the next command either.
+   */
+  clearStaleTurn: boolean
+}
+
+/**
+ * Fold the raw busy signals into an apply-vs-queue decision that treats a turn
+ * atom OR a pending approval older than the hard TTL as STALE — a dangling atom
+ * / wedged approval, not a live turn (#3262). A genuinely fresh turn (recent
+ * marker) and a recent pending approval still read busy, preserving the
+ * #3017/#3039 apply-or-queue contract; only a stale signal is discounted.
+ */
+export function resolveStaleAwareBusy(input: StaleAwareBusyInput): StaleAwareBusy {
+  const turnStale =
+    input.currentTurnActive &&
+    input.turnAgeMs !== null &&
+    input.turnAgeMs > input.hardTtlMs
+  const approvalLive =
+    input.oldestPendingApprovalAgeMs !== null &&
+    input.oldestPendingApprovalAgeMs <= input.hardTtlMs
+  return {
+    currentTurnActive: input.currentTurnActive && !turnStale,
+    turnInFlight: input.machineInTurn || approvalLive,
+    clearStaleTurn: turnStale,
+  }
+}
+
+/**
  * What the gateway should do with a parsed `/model` command. Pure so the
  * routing decision is unit-testable without booting the bot. Every parsed
  * shape maps to exactly one visible action — there is NO branch that silently
