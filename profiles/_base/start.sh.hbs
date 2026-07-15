@@ -144,6 +144,14 @@ if [ "$SWITCHROOM_RUNTIME" = "docker" ] && [ -z "$SWITCHROOM_DOCKER_TMUX_INNER" 
 x-litellm-customer-id: $SWITCHROOM_AGENT_NAME
 x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:-default}"
       export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+      # Offer Fable 5 in /model. The CLI's Fable gate only offers Fable when the
+      # firstParty ANTHROPIC_BASE_URL host is api.anthropic.com OR this env is
+      # set; agents route through litellm (non-Anthropic host), so without this
+      # /model fable silently no-ops. Value claude-fable-5 is ONLY valid via the
+      # litellm proxy (maps fable->anthropic/claude-fable-5); it is a RETIRED
+      # codename against direct Anthropic, so it must NEVER be set on the
+      # fail-open (direct OAuth) path below.
+      export ANTHROPIC_DEFAULT_FABLE_MODEL=claude-fable-5
     else
       # Missing-key fail-open: gateway talks direct OAuth, unproxied.
       unset ANTHROPIC_BASE_URL ANTHROPIC_SMALL_FAST_MODEL SWITCHROOM_LITELLM SWITCHROOM_LITELLM_BASE
@@ -1116,6 +1124,14 @@ x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:
     # models configured in the proxy appear in the /model picker and can be
     # selected via --model. Without this, the CLI only knows its bundled list.
     export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+    # Offer Fable 5 in /model. The CLI's Fable gate only offers Fable when the
+    # firstParty ANTHROPIC_BASE_URL host is api.anthropic.com OR this env is set;
+    # agents route through litellm (non-Anthropic host), so without this
+    # /model fable silently no-ops. Value claude-fable-5 is ONLY valid via the
+    # litellm proxy (maps fable->anthropic/claude-fable-5); it is a RETIRED
+    # codename against direct Anthropic, so it must NEVER be set on the fail-open
+    # (direct OAuth) path below.
+    export ANTHROPIC_DEFAULT_FABLE_MODEL=claude-fable-5
     if [ -n "$sr_ll_ok" ]; then
       # Probe succeeded: proxy is live, so honor any sr-* session model override
       # below. On unreachable, _LITELLM_OK stays empty so the override is dropped
