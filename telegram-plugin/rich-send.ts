@@ -18,15 +18,28 @@
  */
 
 import { GrammyError } from 'grammy'
+import { guardDollarMath } from './render/dollar-math-guard.js'
 
 /** The `InputRichMessage` shape grammy 1.44 accepts on send AND edit. */
 export interface InputRichMessageMarkdown {
   markdown: string
 }
 
-/** Wrap raw GFM markdown into the rich-message input object. */
+/**
+ * Wrap raw GFM markdown into the rich-message input object.
+ *
+ * This is the ONE adapter every `{ markdown }` wire send funnels through
+ * (`sendRichMessage` / `editMessageText({ markdown })`) — the reply-tool final
+ * answer, draft-stream previews, cards, approvals, banners. It is therefore the
+ * single deterministic seam for `guardDollarMath` (#3252, F1): applying the
+ * currency `$…$`-math neutraliser here guards EVERY markdown-parsed outbound
+ * exactly once, without touching `plain`-mode degradations (which bypass this
+ * wrapper and go straight to `sendMessage`, where no markdown parsing happens).
+ * The guard is a strict no-op for any body without 2+ digit-adjacent dollars
+ * and is idempotent, so callers that already ran it stay byte-identical.
+ */
 export function richMessage(markdown: string): InputRichMessageMarkdown {
-  return { markdown }
+  return { markdown: guardDollarMath(markdown) }
 }
 
 /**

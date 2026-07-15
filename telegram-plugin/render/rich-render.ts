@@ -29,7 +29,6 @@
 import { parse } from "./parse.js";
 import { renderSafe, type RenderResult } from "./render.js";
 import { RICH_MESSAGE_MAX_CHARS, splitMarkdownChunks } from "../format.js";
-import { guardDollarMath } from "./dollar-math-guard.js";
 
 /**
  * The legacy plain-text `sendMessage` / `editMessageText` wire cap (4096
@@ -67,16 +66,14 @@ export function renderOutbound(
   text: string,
   maxLen: number = RICH_MESSAGE_MAX_CHARS,
 ): RenderResult {
-  const result = renderSafe(parse(text), text, maxLen);
-  // #3252: only the rich-markdown wire path is parsed by Telegram's GFM math
-  // engine, so the `$…$` neutraliser applies to `markdown` mode only. A
-  // `plain` degradation is sent through the plain `sendMessage` endpoint (no
-  // markdown parsing → no math), so it is left byte-for-byte untouched.
-  if (result.mode === "markdown") {
-    const guarded = guardDollarMath(result.text);
-    if (guarded !== result.text) return { ...result, text: guarded };
-  }
-  return result;
+  return renderSafe(parse(text), text, maxLen);
+  // #3252 note: the `$…$` currency-math neutraliser (`guardDollarMath`) is NOT
+  // applied here. It lives at the single wire seam — `richMessage()` in
+  // rich-send.ts — through which EVERY `{ markdown }` send funnels (the
+  // reply-tool final answer, the draft-stream previews this renderer feeds,
+  // cards, approvals). Applying it there guards every markdown-parsed outbound
+  // exactly once (F1), and `plain`-mode degradations correctly bypass it. See
+  // dollar-math-guard.ts for the rationale.
 }
 
 /**

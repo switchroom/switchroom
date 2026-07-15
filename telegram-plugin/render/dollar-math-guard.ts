@@ -18,10 +18,30 @@
 //
 // ── Fix ──────────────────────────────────────────────────────────────────
 // Deterministically break the `$…$` pairing on the wire by backslash-escaping
-// each `$` that immediately precedes a digit (`$` → `\$`), but ONLY when the
-// message contains 2+ such `$digit` tokens (a lone `$5` prose price can never
-// form a span, so it is left byte-for-byte untouched), and NEVER inside a code
-// span / fenced code block (whose content is verbatim and must not change).
+// EVERY prose `$` (`$` → `\$`) once the message looks like it carries currency
+// — i.e. the prose (non-code) content holds 2+ total `$` AND at least one of
+// them sits next to a digit (`$50`, `$.50`, or a trailing `50$`). A lone `$`
+// (single total, or no digit-adjacent `$` anywhere) can never form a currency
+// math span the way #3252 describes, so it is left byte-for-byte untouched.
+// Code spans / fenced code blocks are NEVER touched (verbatim). Escaping every
+// prose `$` (not just the `$digit` ones) is what closes the F3 false-negatives:
+// `"$50 or 50$"`, `"$10 … from $ yesterday"`, and `"$.50 and $5"` all still form
+// a `$…$` pair if only the leading-`$digit` token is escaped — so we escape the
+// lot once the currency signal + 2-dollar threshold are met.
+//
+// Idempotent (F5): the escape uses a negative-lookbehind (`(?<!\\)\$`) so an
+// already-escaped `\$` is never doubled to `\\$`. Running the guard twice (e.g.
+// the streaming path renders then this wrapper re-wraps) is a strict no-op the
+// second time.
+//
+// ── Where this runs (F1) ───────────────────────────────────────────────────
+// This guard is invoked from `richMessage()` (rich-send.ts) — the ONE adapter
+// every `{ markdown }` wire send funnels through (the `reply`-tool final answer
+// via computeReplyChunks/sendReplyChunks, the draft-stream previews, cards,
+// approvals, banners). That is the single deterministic seam that covers every
+// markdown-parsed outbound exactly once. `plain`-mode degradations bypass
+// `richMessage` (they go straight to `sendMessage`, no markdown parsing → no
+// math), so they are correctly left untouched.
 //
 // Why `\$` and not a zero-width joiner (U+2060):
 //   - It reuses the EXACT mechanism switchroom already relies on for every
@@ -37,12 +57,19 @@
 //   - Fully deterministic (pure string transform), and a strict no-op for any
 //     message with fewer than two `$digit` tokens.
 //
-// Tradeoff: relies on Telegram's rich parser honouring CommonMark backslash
-// escapes of `$`. This is the same guarantee the existing escaped set already
-// depends on in production, so the residual risk is nil; in the impossible
-// case Telegram neither supported math NOR consumed the backslash, `\$` would
-// render literally — but that would already have broken every other escaped
-// char, so it is not a real regression surface.
+// Tradeoff (UNVERIFIED — see F4): this relies on Telegram's server-side rich
+// GFM parser (a) recognising `$` as an escapable ASCII punctuation char and
+// (b) CONSUMING the backslash so the reader sees a literal `$` and copy-paste
+// yields `$0.5-0.9M` (no stray `\`). This is asserted by analogy to the
+// `` ~ = | * _ `` chars that `escapeMarkdown` (format.ts) already backslash-
+// escapes and that Telegram demonstrably strips — BUT note `escapeMarkdown`
+// pointedly does NOT include `$` in its escape set, so we have no in-repo
+// evidence that `\$` specifically round-trips. Vitest CANNOT cover this (it is
+// server-side Telegram behaviour). If Telegram does NOT consume the backslash,
+// guarded replies would show a visible `\$0.5-0.9M` — arguably worse than the
+// math bug. **This is the one residual risk requiring human UAT before merge:**
+// send a real two-dollar-amount message through a live agent and confirm it
+// renders as a literal `$` (not `\$`, not math-italic). See the PR's UAT note.
 
 /** A contiguous slice of rendered markdown, tagged as code (verbatim, never
  *  transformed) or prose (eligible for the dollar guard). */
@@ -98,33 +125,48 @@ function splitCodeSegments(text: string): Segment[] {
   return out;
 }
 
-/** Matches a `$` immediately followed by an ASCII digit — the currency/math
- *  span opener. Lookahead keeps the digit out of the match so it is not
- *  consumed by the replace. */
-const DOLLAR_DIGIT = /\$(?=\d)/g;
+/** Counts every `$` in a segment (the total-dollar threshold input). */
+const ANY_DOLLAR = /\$/g;
+
+/** The "this is currency, not a stray symbol" signal: a `$` sitting next to a
+ *  digit on either side — `$50` / `$.50` (leading) or `50$` (trailing), the
+ *  latter covering European / trailing-symbol conventions. One such token in
+ *  the prose is enough to arm the guard (combined with the 2+ total threshold).
+ *  Non-global: used only as a boolean `.test`. */
+const CURRENCY_SIGNAL = /\$\.?\d|\d\s?\$/;
+
+/** Every prose `$` that is NOT already backslash-escaped. The negative
+ *  lookbehind makes the escape idempotent (F5): a pre-existing `\$` is left
+ *  alone, so running the guard twice never produces `\\$`. Global for replace. */
+const UNESCAPED_DOLLAR = /(?<!\\)\$/g;
 
 /**
  * Neutralise accidental `$…$` inline-math typesetting of currency amounts.
  *
  * Operates on the FINAL rendered rich-markdown string (post-`render`). A no-op
- * unless the prose (non-code) content holds 2+ `$digit` tokens; when it does,
- * every prose `$` that precedes a digit is backslash-escaped so the pair can
- * no longer open a math span. Code spans / fenced blocks are never touched.
- * Pure and deterministic.
+ * unless the prose (non-code) content holds 2+ total `$` AND at least one of
+ * them is digit-adjacent (a currency signal). When armed, EVERY unescaped prose
+ * `$` is backslash-escaped so no two `$` can pair into a math span — this is
+ * what closes the F3 trailing-`$` / `$.50` false-negatives. Code spans / fenced
+ * blocks are never touched. Idempotent (F5) and deterministic.
  */
 export function guardDollarMath(text: string): string {
   if (!text.includes("$")) return text;
   const segments = splitCodeSegments(text);
 
-  let count = 0;
+  let total = 0;
+  let hasCurrencySignal = false;
   for (const seg of segments) {
     if (seg.code) continue;
-    count += seg.text.match(DOLLAR_DIGIT)?.length ?? 0;
-    if (count >= 2) break;
+    total += seg.text.match(ANY_DOLLAR)?.length ?? 0;
+    if (!hasCurrencySignal && CURRENCY_SIGNAL.test(seg.text)) hasCurrencySignal = true;
   }
-  if (count < 2) return text;
+  // Fewer than two dollars can never form a pair; without a digit-adjacent `$`
+  // the two dollars are (e.g.) `$foo`/`$bar` shell-var prose, which we leave
+  // alone to avoid escaping legitimate lone symbols (F3: no false positives).
+  if (total < 2 || !hasCurrencySignal) return text;
 
   return segments
-    .map((seg) => (seg.code ? seg.text : seg.text.replace(DOLLAR_DIGIT, () => "\\$")))
+    .map((seg) => (seg.code ? seg.text : seg.text.replace(UNESCAPED_DOLLAR, () => "\\$")))
     .join("");
 }
