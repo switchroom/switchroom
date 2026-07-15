@@ -85,6 +85,55 @@ describe('buildVaultGrantApprovedCardText — the [object Object] regression gua
     expect(noFooter.endsWith('(grant `vg_a1b2c3`)')).toBe(true)
   })
 
+  it('renders the reason as a trailing italic clause when provided, before the footer', () => {
+    const text = buildVaultGrantApprovedCardText({
+      ...BASE,
+      reasonEscaped: 'deploy the staging build',
+      footer: '\n_Approver verified by Telegram identity._',
+    })
+    expect(text).toContain('_Reason: deploy the staging build_')
+    // reason clause sits BEFORE the footer (auth-mode note stays last)
+    expect(text.indexOf('_Reason:')).toBeLessThan(text.indexOf('_Approver verified'))
+    // still one clean string
+    const rich = richMessage(text)
+    expect(rich.markdown).toBe(text)
+    expect(rich.markdown).not.toContain('[object Object]')
+  })
+
+  it('omits the reason clause when reason is undefined or empty — no dangling "Reason:" label', () => {
+    const none = buildVaultGrantApprovedCardText(BASE)
+    expect(none).not.toContain('Reason:')
+    expect(none.endsWith('(grant `vg_a1b2c3`)')).toBe(true)
+
+    const empty = buildVaultGrantApprovedCardText({ ...BASE, reasonEscaped: '' })
+    expect(empty).not.toContain('Reason:')
+    expect(empty.endsWith('(grant `vg_a1b2c3`)')).toBe(true)
+  })
+
+  it('reason clause + reason-less both stay clean when combined with a footer', () => {
+    const footer = '\n_Approver verified by Telegram identity._'
+    const withReason = buildVaultGrantApprovedCardText({ ...BASE, reasonEscaped: 'x', footer })
+    expect(withReason.endsWith(footer)).toBe(true)
+    const noReason = buildVaultGrantApprovedCardText({ ...BASE, footer })
+    expect(noReason.endsWith(footer)).toBe(true)
+    expect(noReason).not.toContain('Reason:')
+  })
+
+  it('carries an already-escaped reason verbatim — HTML-special chars stay escaped, no corruption', () => {
+    // The callsite escapes agent-supplied free text with escapeHtmlForTg
+    // BEFORE passing it (same contract as agentEscaped). Simulate that:
+    // `<b> & "co" *_` → escaped form. The builder must not re-corrupt it,
+    // and the single-richMessage wrap must still hold.
+    const escaped = '&lt;b&gt; &amp; drop &amp;&amp; run *_'
+    const text = buildVaultGrantApprovedCardText({ ...BASE, reasonEscaped: escaped })
+    expect(text).toContain(`_Reason: ${escaped}_`)
+    // No raw unescaped angle brackets leaked into the card text.
+    expect(text).not.toContain('<b>')
+    const rich = richMessage(text)
+    expect(rich.markdown).toBe(text)
+    expect(rich.markdown).not.toContain('[object Object]')
+  })
+
   it('DOCUMENTS the original bug: bare-string + richMessage() coerces to [object Object]', () => {
     // Demonstrates why the fix matters — if a future edit reintroduces the
     // "concatenate a string onto the richMessage object" pattern, the result

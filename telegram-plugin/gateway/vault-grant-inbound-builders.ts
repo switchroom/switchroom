@@ -149,6 +149,13 @@ export function buildVaultGrantDeniedInbound(opts: {
  * @param key           Vault key (rendered inline-code).
  * @param days          Grant TTL in whole days.
  * @param grantId       Broker-returned grant id.
+ * @param reasonEscaped Optional original request reason the agent gave,
+ *                      already run through `escapeHtmlForTg` (it is
+ *                      agent-supplied free text). Rendered as a trailing
+ *                      italic clause for audit visibility. Omitted when
+ *                      absent/empty so no dangling "Reason:" label shows.
+ *                      Placed BEFORE the footer so the auth-mode note
+ *                      stays last.
  * @param footer        Optional trailing footer (e.g. the telegram-id
  *                      auth-mode note). Empty string when absent.
  */
@@ -158,12 +165,17 @@ export function buildVaultGrantApprovedCardText(opts: {
   key: string
   days: number
   grantId: string
+  reasonEscaped?: string
   footer?: string
 }): string {
+  const reasonClause =
+    opts.reasonEscaped != null && opts.reasonEscaped.length > 0
+      ? ` _Reason: ${opts.reasonEscaped}_`
+      : ''
   return (
     `✅ Granted **${opts.agentEscaped}** ${opts.scope} access to ` +
     `\`${opts.key}\` for ${opts.days}d. ` +
-    `(grant \`${opts.grantId}\`)` + (opts.footer ?? '')
+    `(grant \`${opts.grantId}\`)` + reasonClause + (opts.footer ?? '')
   )
 }
 

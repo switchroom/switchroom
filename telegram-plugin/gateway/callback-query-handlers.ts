@@ -801,6 +801,10 @@ async function performVaultAccessApproval(
             key: pending.key,
             days,
             grantId: id,
+            reasonEscaped:
+              pending.reason != null && pending.reason.length > 0
+                ? escapeHtmlForTg(pending.reason)
+                : undefined,
             footer,
           }),
         ),
