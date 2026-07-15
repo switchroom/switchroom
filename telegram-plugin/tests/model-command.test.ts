@@ -17,6 +17,7 @@ import { describe, it, expect, beforeAll } from "vitest";
 import {
   parseModelCommand,
   planModelCommand,
+  resolveStaleAwareBusy,
   isModelCommandBusy,
   modelCommandReceiptLine,
   handleModelCommand,
@@ -1619,6 +1620,117 @@ describe("#3177 typed /model never silently swallowed mid-turn", () => {
     it("APPLIES help so a bad arg still gets an explicit reply", () => {
       const parsed = { kind: "help", reason: "not a valid model name: !!" } as const;
       expect(planModelCommand(parsed, busyByGate)).toEqual({ kind: "apply", parsed });
+    });
+  });
+
+  describe("resolveStaleAwareBusy — phantom 'active turn' fix (#3262)", () => {
+    const HARD_TTL = 10 * 60_000;
+
+    it("APPLIES a set when the turn atom is DANGLING (older than the hard TTL)", () => {
+      // A currentTurn atom whose turn_end never fired: non-null but its
+      // liveness marker is far older than the ceiling. Discounted to idle,
+      // and flagged for the gateway to clear.
+      const r = resolveStaleAwareBusy({
+        currentTurnActive: true,
+        turnAgeMs: HARD_TTL + 1,
+        machineInTurn: false,
+        oldestPendingApprovalAgeMs: null,
+        hardTtlMs: HARD_TTL,
+      });
+      expect(r.currentTurnActive).toBe(false);
+      expect(r.turnInFlight).toBe(false);
+      expect(r.clearStaleTurn).toBe(true);
+      // Routing sees "idle" → applies, not queues.
+      const d = planModelCommand(
+        { kind: "set", model: "opus" },
+        { currentTurnActive: r.currentTurnActive, turnInFlight: r.turnInFlight, menuEnabled: true },
+      );
+      expect(d).toEqual({ kind: "apply", parsed: { kind: "set", model: "opus" } });
+    });
+
+    it("QUEUES a set when the turn is FRESH (marker within the TTL) — no regression", () => {
+      const r = resolveStaleAwareBusy({
+        currentTurnActive: true,
+        turnAgeMs: 5_000,
+        machineInTurn: false,
+        oldestPendingApprovalAgeMs: null,
+        hardTtlMs: HARD_TTL,
+      });
+      expect(r.currentTurnActive).toBe(true);
+      expect(r.clearStaleTurn).toBe(false);
+      const d = planModelCommand(
+        { kind: "set", model: "opus" },
+        { currentTurnActive: r.currentTurnActive, turnInFlight: r.turnInFlight, menuEnabled: true },
+      );
+      expect(d).toEqual({ kind: "queue", target: "opus" });
+    });
+
+    it("APPLIES when only a WEDGED approval (older than the TTL) holds the gate on an idle session", () => {
+      const r = resolveStaleAwareBusy({
+        currentTurnActive: false,
+        turnAgeMs: null,
+        machineInTurn: false,
+        oldestPendingApprovalAgeMs: HARD_TTL + 1,
+        hardTtlMs: HARD_TTL,
+      });
+      expect(r.turnInFlight).toBe(false);
+      expect(r.currentTurnActive).toBe(false);
+      const d = planModelCommand(
+        { kind: "set", model: "opus" },
+        { currentTurnActive: r.currentTurnActive, turnInFlight: r.turnInFlight, menuEnabled: true },
+      );
+      expect(d).toEqual({ kind: "apply", parsed: { kind: "set", model: "opus" } });
+    });
+
+    it("QUEUES when a RECENT pending approval holds the gate — a real block is preserved", () => {
+      const r = resolveStaleAwareBusy({
+        currentTurnActive: false,
+        turnAgeMs: null,
+        machineInTurn: false,
+        oldestPendingApprovalAgeMs: 3_000,
+        hardTtlMs: HARD_TTL,
+      });
+      expect(r.turnInFlight).toBe(true);
+      const d = planModelCommand(
+        { kind: "set", model: "opus" },
+        { currentTurnActive: r.currentTurnActive, turnInFlight: r.turnInFlight, menuEnabled: true },
+      );
+      expect(d).toEqual({ kind: "queue", target: "opus" });
+    });
+
+    it("QUEUES when the machine is genuinely in-turn regardless of atom age", () => {
+      const r = resolveStaleAwareBusy({
+        currentTurnActive: false,
+        turnAgeMs: null,
+        machineInTurn: true,
+        oldestPendingApprovalAgeMs: null,
+        hardTtlMs: HARD_TTL,
+      });
+      expect(r.turnInFlight).toBe(true);
+      expect(r.clearStaleTurn).toBe(false);
+    });
+
+    it("does NOT clear or discount when there is no turn atom", () => {
+      const r = resolveStaleAwareBusy({
+        currentTurnActive: false,
+        turnAgeMs: null,
+        machineInTurn: false,
+        oldestPendingApprovalAgeMs: null,
+        hardTtlMs: HARD_TTL,
+      });
+      expect(r).toEqual({ currentTurnActive: false, turnInFlight: false, clearStaleTurn: false });
+    });
+
+    it("keeps a non-null atom busy when its age is exactly at the ceiling (strict >)", () => {
+      const r = resolveStaleAwareBusy({
+        currentTurnActive: true,
+        turnAgeMs: HARD_TTL,
+        machineInTurn: false,
+        oldestPendingApprovalAgeMs: null,
+        hardTtlMs: HARD_TTL,
+      });
+      expect(r.currentTurnActive).toBe(true);
+      expect(r.clearStaleTurn).toBe(false);
     });
   });
 

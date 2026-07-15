@@ -15,6 +15,8 @@ import {
   removeTurnActiveMarker,
   sweepStaleTurnActiveMarker,
   readTurnActiveMarkerAgeMs,
+  TURN_ACTIVE_HARD_TTL_MS,
+  TURN_ACTIVE_IDLE_SWEEP_MS,
 } from '../gateway/turn-active-marker.js'
 
 describe('turn-active-marker (#412)', () => {
@@ -26,6 +28,15 @@ describe('turn-active-marker (#412)', () => {
 
   afterEach(() => {
     rmSync(tmp, { recursive: true, force: true })
+  })
+
+  it('exports the sweep TTL bounds as shared constants (#3262 single source of truth)', () => {
+    // The /model & /effort phantom-turn cross-check reuses these SAME bounds —
+    // guarding against a drift where the atom ceiling and the marker ceiling
+    // diverge into two different magic numbers.
+    expect(TURN_ACTIVE_HARD_TTL_MS).toBe(10 * 60_000)
+    expect(TURN_ACTIVE_IDLE_SWEEP_MS).toBe(60_000)
+    expect(TURN_ACTIVE_HARD_TTL_MS).toBeGreaterThan(TURN_ACTIVE_IDLE_SWEEP_MS)
   })
 
   it('writeTurnActiveMarker creates a JSON file with the expected payload', () => {

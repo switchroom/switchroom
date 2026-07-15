@@ -463,6 +463,7 @@ import { handleInjectCommand, type InjectDeps } from './inject-handler.js'
 import {
   parseModelCommand,
   planModelCommand,
+  resolveStaleAwareBusy,
   modelCommandReceiptLine,
   handleModelCommand,
   buildModelMenu,
@@ -803,6 +804,8 @@ import {
   sweepStaleTurnActiveMarker,
   readTurnActiveMarkerAgeMs,
   TURN_ACTIVE_MARKER_FILE,
+  TURN_ACTIVE_HARD_TTL_MS,
+  TURN_ACTIVE_IDLE_SWEEP_MS,
 } from './turn-active-marker.js'
 import {
   VERSION,
@@ -2859,14 +2862,83 @@ function turnInFlightForGate(): boolean {
   // handlers and do not sit behind this gate — and the block is surfaced
   // off-Telegram in blocked-approvals/<agent>.json.
   const hasPendingApproval = pendingPermissions.size > 0
-  if (!isDeliveryCutoverEnabled()) return claudeBusyKeys.size > 0 || hasPendingApproval
+  return turnInFlightMachineOnly() || hasPendingApproval
+}
+
+/**
+ * The machine-in-turn portion of the gate WITHOUT the `pendingPermissions`
+ * hold — "claude is actively producing a turn right now", ignoring an
+ * outstanding approval card. `/model` & `/effort` read THIS (plus a
+ * TTL-bounded approval check) so a wedged / undeliverable approval that "never
+ * expires by design" (#3084) can't hold their switch queued forever on an idle
+ * session (#3262). `turnInFlightForGate()` = this OR a pending approval.
+ */
+function turnInFlightMachineOnly(): boolean {
+  if (!isDeliveryCutoverEnabled()) return claudeBusyKeys.size > 0
   // Machine is authoritative. Run the log-only drift canary (#2794): the
   // imperative `claudeBusyKeys` shadow is still live in parallel, so a
   // dangerous over-hold divergence (machine holds the gate while the
   // imperative view is idle) is surfaced without changing behaviour. The
   // benign orphan-dangle direction — the wedge the machine self-heals — is
   // NOT flagged. `probeGateParity` returns the machine value unchanged.
-  return probeGateParity(isMachineInTurn(), claudeBusyKeys.size) || hasPendingApproval
+  return probeGateParity(isMachineInTurn(), claudeBusyKeys.size)
+}
+
+/**
+ * Age (ms) of the live turn for the phantom-turn cross-check (#3262): the
+ * turn-active liveness marker's mtime age (touched on every foreground
+ * tool_use AND on sub-agent JSONL growth, so a genuinely long turn keeps it
+ * small), falling back to `now - turn.startedAt` when the marker is absent
+ * (e.g. already swept). Null when no turn atom is set. A large age on a
+ * non-null atom is the dangling-atom signal.
+ */
+function liveTurnAgeMs(now: number): number | null {
+  if (currentTurn === null) return null
+  const markerAge = readTurnActiveMarkerAgeMs(STATE_DIR, now)
+  return markerAge ?? (now - currentTurn.startedAt)
+}
+
+/** Age (ms) of the OLDEST outstanding pending approval, or null when none. */
+function oldestPendingApprovalAgeMs(now: number): number | null {
+  let oldest: number | null = null
+  for (const p of pendingPermissions.values()) {
+    const age = now - p.startedAt
+    if (oldest === null || age > oldest) oldest = age
+  }
+  return oldest
+}
+
+/**
+ * Resolve the apply-vs-queue busy signals for a `/model` or `/effort` command,
+ * sweeping a stale (dangling) turn atom and discounting a wedged (undeliverable)
+ * approval hold — both bounded by the SAME `TURN_ACTIVE_HARD_TTL_MS` ceiling the
+ * marker sweep uses (#3262). A genuinely in-flight turn (fresh marker) and a
+ * recent pending approval still read busy, so the #3017/#3039 apply-or-queue
+ * contract and #3177/#3180 are preserved. Clears the dangling atom as a side
+ * effect so the phantom can't re-block the next command.
+ */
+function resolveModelEffortBusy(now = Date.now()): { currentTurnActive: boolean; turnInFlight: boolean } {
+  const turnAgeMs = liveTurnAgeMs(now)
+  const resolved = resolveStaleAwareBusy({
+    currentTurnActive: currentTurn !== null,
+    turnAgeMs,
+    machineInTurn: turnInFlightMachineOnly(),
+    oldestPendingApprovalAgeMs: oldestPendingApprovalAgeMs(now),
+    hardTtlMs: TURN_ACTIVE_HARD_TTL_MS,
+  })
+  if (resolved.clearStaleTurn && currentTurn !== null) {
+    const ageSec = Math.round((turnAgeMs ?? 0) / 1000)
+    process.stderr.write(
+      `telegram gateway: [phantomturn] cleared stale currentTurn atom age=${ageSec}s ` +
+      `ttl=${Math.round(TURN_ACTIVE_HARD_TTL_MS / 1000)}s for /model|/effort busy-check agent=${getMyAgentName()}\n`,
+    )
+    // Single-tenant / sequential-CLI invariant: the singleton `currentTurn` IS
+    // the only live turn, and a stale atom is a ghost (its `turn_end` never
+    // fired) — clearing every entry is equivalent to clearing it, matching the
+    // bridge-died "every entry is a ghost" semantics.
+    clearAllCurrentTurns()
+  }
+  return { currentTurnActive: resolved.currentTurnActive, turnInFlight: resolved.turnInFlight }
 }
 
 /**
@@ -7767,8 +7839,8 @@ const pendingStateReaper = setInterval(() => {
   try {
     sweepStaleTurnActiveMarker(STATE_DIR, {
       turnInFlight: currentTurn?.registryKey != null,
-      idleSweepMs: 60_000,
-      hardTtlMs: 10 * 60_000,
+      idleSweepMs: TURN_ACTIVE_IDLE_SWEEP_MS,
+      hardTtlMs: TURN_ACTIVE_HARD_TTL_MS,
       now,
       onRemove: ({ ageMs, reason, payload }) => {
         const agent = getMyAgentName()
@@ -23515,8 +23587,13 @@ bot.command('model', async ctx => {
   // command leaves a greppable log line + a history row before any branch. This
   // is the fix for the finn 2026-07-12 zero-trace swallow (no log, no reply, no
   // ack, no deferred apply). `busyNow` folds BOTH busy signals (turn atom AND
-  // the authoritative delivery-machine/approval gate).
-  const busyNow = currentTurn !== null || turnInFlightForGate()
+  // the authoritative delivery-machine/approval gate) — but a STALE atom or a
+  // wedged approval older than the hard TTL is discounted as idle (#3262), so a
+  // phantom "active turn" on an idle session no longer blocks the switch. Resolve
+  // once (it may clear a dangling atom) and reuse for both the receipt log and
+  // the routing disposition.
+  const modelBusy = resolveModelEffortBusy()
+  const busyNow = modelBusy.currentTurnActive || modelBusy.turnInFlight
   process.stderr.write(modelCommandReceiptLine(getMyAgentName(), parsed, busyNow) + '\n')
   if (HISTORY_ENABLED && ctx.message?.message_id != null) {
     try {
@@ -23538,8 +23615,8 @@ bot.command('model', async ctx => {
   // session busy by EITHER measure ack+queues instead of silently injecting
   // into a busy pane. Every branch below produces a visible action.
   const disposition = planModelCommand(parsed, {
-    currentTurnActive: currentTurn !== null,
-    turnInFlight: turnInFlightForGate(),
+    currentTurnActive: modelBusy.currentTurnActive,
+    turnInFlight: modelBusy.turnInFlight,
     menuEnabled: process.env.SWITCHROOM_MODEL_MENU !== '0',
   })
   if (disposition.kind === 'menu') {
@@ -23650,9 +23727,12 @@ bot.command('effort', async ctx => {
   }
   // Mid-turn: ACK + QUEUE + apply-on-idle + confirm (#3017) — parity with
   // /model. `applyEffort` mid-turn silently maybe-failed ("couldn't confirm it
-  // applied") before this gate existed. `currentTurn !== null` is the same
-  // busy signal the model path reads via deps.isBusy().
-  if ((parsed.kind === 'set' || parsed.kind === 'default') && currentTurn !== null) {
+  // applied") before this gate existed. Use the SAME stale-aware busy resolver
+  // as /model (#3262) so a dangling turn atom older than the hard TTL is
+  // discounted as idle and the switch applies instead of queuing forever on an
+  // idle session.
+  const effortBusy = resolveModelEffortBusy()
+  if ((parsed.kind === 'set' || parsed.kind === 'default') && effortBusy.currentTurnActive) {
     const requestedLevel = parsed.kind === 'set' ? parsed.level : 'default'
     const chatId = String(ctx.chat!.id)
     const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
