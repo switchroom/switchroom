@@ -250,14 +250,21 @@ class TestForwardFix(DurabilityTestBase):
         self.assertIsNotNone(watermark.load(session))
         self.assertIn("user turn 2", self.daemon.content_blob())
 
-    # -- Test 10: a bound (200-turn cap) ENQUEUES the remainder -----------------
+    # -- Test 10: a bound (200-turn cap) ENQUEUES the remainder, no silent loss -
     def test_turn_cap_enqueues_remainder_never_truncates(self):
+        # Regression for F1/F2 (reviewer reproduced silent loss): the older
+        # remainder is delivered by the drain, which the daemon may 200-then-drop
+        # on an async post; if the watermark had advanced past the remainder,
+        # that drop would be permanent loss with no reconcile backstop. This test
+        # sets drop_async=True on the drain path — it must still land durably
+        # (drain now posts commit-before-ack) AND the watermark must NOT have
+        # jumped past the un-confirmed remainder after the capped reconcile.
         session = "sessE"
         tpath = os.path.join(self.transcripts, f"{session}.jsonl")
         _write_transcript(tpath, 6, session_prefix=session)
         hook = {"session_id": session, "transcript_path": tpath, "cwd": "/x"}
 
-        # Cap the boot reconcile at 2 human turns; the other 4 must be enqueued,
+        # Cap the boot reconcile at 2 human turns; the other 4 must be deferred,
         # not dropped.
         with mock.patch.dict(os.environ, {"HINDSIGHT_RECONCILE_MAX_TURNS": "2"}):
             reconcile_tail.reconcile(self._config(), hook_input=hook)
@@ -266,10 +273,17 @@ class TestForwardFix(DurabilityTestBase):
         blob = self.daemon.content_blob()
         self.assertIn("user turn 5", blob)
         self.assertIn("user turn 4", blob)
-        # ... and the older remainder is ENQUEUED (not lost).
+        # ... the older remainder is ENQUEUED (not lost) ...
         self.assertEqual(len(self._pending_entries()), 1)
+        # ... and the watermark did NOT advance past the un-confirmed remainder
+        # (F2): it must not sit at the transcript end. With no prior watermark
+        # and a split, no watermark is written at all.
+        wm = watermark.load(session)
+        self.assertTrue(wm is None or wm["last_uuid"] != f"{session}-a5")
 
-        # A subsequent boot drains the remainder → older turns land too.
+        # An adversarial daemon that DROPS async extractions (the #3244 hazard):
+        # the drain must still persist the remainder durably (commit-before-ack).
+        self.daemon.drop_async = True
         from drain_pending import drain
         drain(self._config())
         blob2 = self.daemon.content_blob()

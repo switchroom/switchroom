@@ -212,17 +212,30 @@ def reconcile(config: dict | None = None, hook_input: dict | None = None) -> dic
             continue
 
         # Turn-cap split: process the most-recent MAX_TURNS human turns inline;
-        # enqueue the older remainder (never truncate).
+        # defer the OLDER remainder (never truncate).
         recent = slice_last_turns_by_user_boundary(tail, max_turns)
-        if len(recent) < len(tail):
+        did_split = len(recent) < len(tail)
+        if did_split and _human_turns(tail[: len(tail) - len(recent)]) > 0:
             older = tail[: len(tail) - len(recent)]
-            if _human_turns(older) > 0 and _enqueue_slice(
-                config, session_id, path, messages, older, bank_id, api_url, api_token
-            ):
+            if _enqueue_slice(config, session_id, path, messages, older, bank_id, api_url, api_token):
                 summary["enqueued"] += 1
 
+        # CRITICAL (switchroom #3244 F1/F2): when we split, the older remainder
+        # (which precedes `recent` in the transcript) is only DEFERRED — either
+        # enqueued for a later sync drain, or, if the enqueue failed, not stored
+        # at all. Either way it is NOT yet confirmed-persisted. The watermark is
+        # a single "last contiguously-committed entry" pointer, so advancing it
+        # to `recent`'s end (the transcript tail) would jump PAST the unconfirmed
+        # older remainder — and `_tail_after` would then never re-derive it,
+        # silently losing it if the drain drops (async) or the enqueue failed.
+        # So on a split we do NOT advance the watermark: the recent slice is
+        # upserted for immediate recall, but the anchor stays put and the next
+        # boot re-derives (and idempotently re-upserts) the whole tail until it
+        # fits the budget and is confirmed end-to-end. Redundant work in the
+        # rare >MAX_TURNS-loss case; never loss.
         posted = _post_inline(
-            config, client, session_id, path, messages, recent, bank_id, api_url, api_token
+            config, client, session_id, path, messages, recent, bank_id, api_url, api_token,
+            advance_watermark=not did_split,
         )
         if posted == "ok":
             summary["reconciled"] += 1
@@ -235,11 +248,18 @@ def reconcile(config: dict | None = None, hook_input: dict | None = None) -> dic
 
 
 def _post_inline(
-    config, client, session_id, path, all_messages, slice_messages, bank_id, api_url, api_token
+    config, client, session_id, path, all_messages, slice_messages, bank_id, api_url, api_token,
+    advance_watermark: bool = True,
 ) -> str:
     """POST one gap slice inline, advancing the watermark on confirmed persistence.
 
     Returns "ok", "enqueued" (POST failed / lock busy → deferred), or "skip".
+
+    ``advance_watermark=False`` (turn-cap split, #3244 F1/F2): the slice is
+    upserted for immediate recall but the watermark is NOT moved, because an
+    unconfirmed older remainder precedes this slice — advancing would jump past
+    it and risk silent loss. The next boot re-derives and idempotently
+    re-upserts.
     """
     built = build_retain_payload(
         config,
@@ -276,6 +296,9 @@ def _post_inline(
             debug_log(config, f"reconcile_tail: inline POST failed, enqueuing: {e}")
             pending_enqueue(payload, e)
             return "enqueued"
+
+    if not advance_watermark:
+        return "ok"
 
     try:
         watermark.commit(
