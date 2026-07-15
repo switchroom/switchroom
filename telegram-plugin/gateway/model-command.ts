@@ -479,11 +479,16 @@ export async function handleModelCommand(
         html: true,
       }
     }
-    // No confirmation and no error — optimistic record (#3241 part B).
+    // No confirmation and no error — optimistic record (#3241 part B). The
+    // Telegram copy stays PROVISIONAL (#3242 review FIX 2): we couldn't read a
+    // confirmation, and if the CLI denied the switch with wording our error
+    // regex misses, an affirmative "recorded X" would be a lie that never
+    // self-corrects. `/status` DOES self-heal (the override is reclaimed by the
+    // next transcript line), so point the user there rather than assert success.
     const optimisticLabel = optimisticModelRecordLabel(model)
     return {
       text: [
-        `${verbHtml} — sent. Recorded \`${deps.escapeHtml(optimisticLabel)}\` as the live model, but couldn't read claude's confirmation line — check \`/status\`.`,
+        `${verbHtml} — sent, but couldn't read a confirmation line. \`/status\` will show the live model once it's confirmed.`,
         PERSIST_NOTE,
       ].join('\n'),
       html: true,
@@ -666,13 +671,20 @@ export function srFriendlyLabel(srName: string): string {
  * The confirmed path records the display name claude printed (e.g. "Fable 5" via
  * `sessionModelFromConfirmation`); the optimistic path only has the requested
  * arg. Without a confirmation we can't know the version suffix, so we normalize
- * the token to the same DISPLAY style (a friendly label, not a raw token) so
- * `/status` reads consistently regardless of which path fired: sr-* → its
- * friendly label, a bare Claude alias → Title-case ("fable" → "Fable"), and a
- * full `claude-*` id or anything else is left as-is (already canonical).
+ * a bare Claude alias to the same DISPLAY style — Title-case ("fable" → "Fable")
+ * — and leave a full `claude-*` id as-is (already canonical).
+ *
+ * #3242 review FIX 1 (MEDIUM) — sr-* tokens are returned UNCHANGED (with the
+ * `sr-` prefix). The stored `selectedModel` doubles as the sr-*→Claude sentinel:
+ * `gateway.ts` `isSrToClaudeTransition` checks `prevModel?.startsWith('sr-')` to
+ * decide whether a later Claude switch needs the graceful restart that tears
+ * down LiteLLM routing. De-prefixing here (as the earlier LOW-4 pass did via
+ * `srFriendlyLabel`) would silently break that restart. So this helper never
+ * de-prefixes: the caller normalizes only the DISPLAY text separately (see
+ * `srFriendlyLabel`), never the stored token.
  */
 export function optimisticModelRecordLabel(token: string): string {
-  if (isSrModel(token)) return srFriendlyLabel(token)
+  if (isSrModel(token)) return token
   const lower = token.toLowerCase()
   if ((MODEL_ALIASES as readonly string[]).includes(lower)) {
     return lower.charAt(0).toUpperCase() + lower.slice(1)
@@ -1088,13 +1100,14 @@ export async function handleModelMenuCallback(
         }
       }
       // Silent success (no confirmation, no error) → optimistic record, same as
-      // the typed path.
+      // the typed path. PROVISIONAL copy (#3242 review FIX 2): don't assert the
+      // switch succeeded — we couldn't read a confirmation, and /status self-heals.
       const optimisticLabel = optimisticModelRecordLabel(alias)
       return {
-        answer: `Switched to ${optimisticLabel} (session)`,
+        answer: `Sent /model ${alias} — check /status`,
         reply: await menuWithBannerStatic(
           deps,
-          `✅ Switched to **${deps.escapeHtml(optimisticLabel)}** (session) — couldn’t read a confirmation line; check \`/status\`.`,
+          `Sent \`/model ${deps.escapeHtml(alias)}\` — couldn’t read a confirmation line. \`/status\` will show the live model once it’s confirmed.`,
         ),
         selectedModel: optimisticLabel,
         selectedModelToken: alias,

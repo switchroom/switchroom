@@ -318,9 +318,9 @@ describe("handleModelCommand — set", () => {
     // failure. Record the requested model optimistically so /status is right,
     // and say so honestly (no false "switched (session)", no scrollback leak).
     expect(reply.text).toContain("/model fable");
-    expect(reply.text).toContain("Recorded");
-    expect(reply.text).toContain("couldn't read claude");
+    expect(reply.text).toContain("couldn't read a confirmation");
     expect(reply.text).toContain("/status");
+    expect(reply.text).not.toContain("Recorded");
     expect(reply.text).not.toContain("switched (session)");
     expect(reply.selectedModel).toBe("Fable");
     expect(reply.optimistic).toBe(true);
@@ -356,7 +356,7 @@ describe("handleModelCommand — set", () => {
     expect(reply.text).not.toContain("switched the deploy");
     expect(reply.text).not.toContain("set model behaviour");
     expect(reply.text).not.toContain("kept model changes");
-    expect(reply.text).toContain("Recorded");
+    expect(reply.text).toContain("couldn't read a confirmation");
     expect(reply.text).not.toContain("switched (session)");
     expect(reply.selectedModel).toBe("Fable");
     expect(reply.optimistic).toBe(true);
@@ -384,7 +384,7 @@ describe("handleModelCommand — set", () => {
     // #3241 part B — an empty capture can't carry an error line, so the send is
     // treated as a silent switch and the requested model is recorded
     // optimistically (was: "no response captured", recorded nothing).
-    expect(reply.text).toContain("Recorded");
+    expect(reply.text).toContain("couldn't read a confirmation");
     expect(reply.text).toContain("/status");
     expect(reply.selectedModel).toBe("Sonnet");
     expect(reply.optimistic).toBe(true);
@@ -575,7 +575,7 @@ describe("handleModelCommand — busy gate + honest unverified reporting", () =>
     // No LINE-ANCHORED error and no confirmation → #3241 optimistic record: the
     // mid-sentence "model not found" prose does NOT flip the switch to a failure,
     // and the requested model is recorded (was: "couldn't confirm", nothing).
-    expect(reply.text).toContain("Recorded");
+    expect(reply.text).toContain("couldn't read a confirmation");
     expect(reply.selectedModel).toBe("Opus");
     expect(reply.optimistic).toBe(true);
   });
@@ -813,6 +813,7 @@ import {
   EXTRA_CLAUDE_ALIASES,
   externalModelNames,
   isSrToClaudeTransition,
+  optimisticModelRecordLabel,
   type ModelMenuDeps,
 } from "../gateway/model-command.js";
 import { labelTag } from "../../src/agents/model-picker.js";
@@ -1028,8 +1029,11 @@ describe("handleModelMenuCallback — alias button symmetry (#3242 MEDIUM 2)", (
     const out = await handleModelMenuCallback(`${MODEL_CALLBACK_ALIAS}fable`, deps);
     expect(out.selectedModel).toBe("Fable"); // normalized display form
     expect(out.selectedModelToken).toBe("fable");
+    // Provisional copy (#3242 FIX 2): doesn't assert the switch succeeded, points
+    // at /status, and never reads as a failure.
     expect(out.reply.text).not.toContain("failed");
-    expect(out.reply.text).toContain("Fable");
+    expect(out.reply.text).toContain("/status");
+    expect(out.reply.text).toContain("/model fable");
   });
 
   it("ok with no confirmation line (banner-only) → optimistic record", async () => {
@@ -1321,6 +1325,26 @@ describe("isSrToClaudeTransition", () => {
 
   it("false when prev is sr-* but next is also sr-* (sr-* → sr-*)", () => {
     expect(isSrToClaudeTransition("sr-gemini-2.5-pro", "sr-deepseek-r1")).toBe(false);
+  });
+
+  // #3242 review FIX 1 — optimisticModelRecordLabel must NOT de-prefix an sr-*
+  // token: the stored selectedModel doubles as the sr-*→Claude sentinel that
+  // isSrToClaudeTransition (prevModel.startsWith('sr-')) reads. De-prefixing to
+  // a friendly label ("kimi k2") would silently kill the graceful restart that
+  // tears down LiteLLM routing on a subsequent Claude switch.
+  it("optimisticModelRecordLabel keeps sr-* tokens verbatim so the sentinel survives", () => {
+    const recorded = optimisticModelRecordLabel("sr-kimi-k2");
+    expect(recorded).toBe("sr-kimi-k2"); // NOT "kimi k2"
+    // The recorded value still trips the sr→Claude transition on a later switch.
+    expect(isSrToClaudeTransition(recorded, "opus")).toBe(true);
+    // Regression guard: the de-prefixed form would NOT — that was the bug.
+    expect(isSrToClaudeTransition("kimi k2", "opus")).toBe(false);
+  });
+
+  it("optimisticModelRecordLabel Title-cases a bare Claude alias, leaves full ids as-is", () => {
+    expect(optimisticModelRecordLabel("fable")).toBe("Fable");
+    expect(optimisticModelRecordLabel("opus")).toBe("Opus");
+    expect(optimisticModelRecordLabel("claude-opus-4-8")).toBe("claude-opus-4-8");
   });
 
   it("false when switching to sr-* from Claude (Claude → sr-*)", () => {
