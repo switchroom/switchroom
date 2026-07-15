@@ -29,6 +29,7 @@
 import { parse } from "./parse.js";
 import { renderSafe, type RenderResult } from "./render.js";
 import { RICH_MESSAGE_MAX_CHARS, splitMarkdownChunks } from "../format.js";
+import { guardDollarMath } from "./dollar-math-guard.js";
 
 /**
  * The legacy plain-text `sendMessage` / `editMessageText` wire cap (4096
@@ -66,7 +67,16 @@ export function renderOutbound(
   text: string,
   maxLen: number = RICH_MESSAGE_MAX_CHARS,
 ): RenderResult {
-  return renderSafe(parse(text), text, maxLen);
+  const result = renderSafe(parse(text), text, maxLen);
+  // #3252: only the rich-markdown wire path is parsed by Telegram's GFM math
+  // engine, so the `$…$` neutraliser applies to `markdown` mode only. A
+  // `plain` degradation is sent through the plain `sendMessage` endpoint (no
+  // markdown parsing → no math), so it is left byte-for-byte untouched.
+  if (result.mode === "markdown") {
+    const guarded = guardDollarMath(result.text);
+    if (guarded !== result.text) return { ...result, text: guarded };
+  }
+  return result;
 }
 
 /**
