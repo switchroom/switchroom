@@ -2123,6 +2123,18 @@ const WORKER_FEED_STALE_TTL_MARGIN_MS = 5 * 60_000
  * complete override surface on this path.)
  */
 const WORKER_FEED_ABSOLUTE_ROW_LIFETIME_CAP_MULTIPLE = 4
+/**
+ * ABSOLUTE reused-group-MESSAGE lifetime cap (invisible-worker-cards fix,
+ * 2026-07-15). Bounds how long the shared worker-feed message is reused before
+ * it is force-rotated to a fresh message, re-establishing the pin surface so a
+ * card whose pin was lost out-of-band (and whose in-memory claim went stale)
+ * cannot stay scroll-buried indefinitely. Conservative default 60 min; env
+ * `SWITCHROOM_WORKER_FEED_GROUP_MESSAGE_LIFETIME_CAP_MS` overrides for tuning.
+ */
+const WORKER_FEED_GROUP_MESSAGE_LIFETIME_CAP_MS = (() => {
+  const v = Number(process.env.SWITCHROOM_WORKER_FEED_GROUP_MESSAGE_LIFETIME_CAP_MS)
+  return Number.isFinite(v) && v > 0 ? v : 60 * 60_000
+})()
 const workerFeedOwnerDmFallbackLogged = new Set<string>()
 
 /**
@@ -9022,6 +9034,14 @@ async function reconcileStatusPinInner(
 ): Promise<void> {
   if (!PIN_STATUS_WHILE_WORKING) return
   if (chatId.length === 0) return
+  // NOTE (invisible-worker-cards review, intentionally left): this reconcile is
+  // NOT serialized per pinKey — it snapshots `prev` then awaits. Two edits that
+  // fire `syncPin` in the same microtask window after a dropped claim can both
+  // read `prev=null` and both issue a `pinChatMessage` for the SAME id. That is
+  // benign and self-healing: re-pinning an already-pinned id is idempotent on
+  // Telegram, and the first reconcile to set the claim makes every subsequent
+  // edit a no-op — it converges in one round, never a storm. A per-key mutex
+  // would remove the duplicate pin but adds lock complexity for zero UX gain.
   const prev = statusPinState.get(pinKey) ?? null
 
   const runReconcile = () =>
@@ -30608,6 +30628,12 @@ void (async () => {
               // Derived from the same terminal cap so it tracks operator
               // overrides; 4× → ~3h at the 45-min default.
               absoluteRowLifetimeCapMs: resolveInflightTerminalCapMs() * WORKER_FEED_ABSOLUTE_ROW_LIFETIME_CAP_MULTIPLE,
+              // ABSOLUTE reused-group-MESSAGE lifetime cap (invisible-worker-
+              // cards fix): force-rotate the shared message past this age while
+              // workers overlap continuously, so a card that lost its pin
+              // out-of-band re-establishes the pin surface via the first-paint
+              // path instead of living buried on one immortal message.
+              groupMessageLifetimeCapMs: WORKER_FEED_GROUP_MESSAGE_LIFETIME_CAP_MS,
               // #3207 review: GROUP-level status pin. Workers now coalesce into
               // ONE shared message, so the pin must follow the GROUP lifecycle,
               // not a single worker's — otherwise a sibling's finish unpins a
