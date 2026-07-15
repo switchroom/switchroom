@@ -428,26 +428,20 @@ export async function handleModelCommand(
     // confirmed leak on klanker, v0.16.47).
     //
     // Honest reporting (#3241 part B inverts the old "record nothing unless
-    // confirmed" to "record optimistically, retract only on a scraped error"):
-    //   (1) error line scraped → switch FAILED. Report it; record NOTHING
-    //       (the retract — /status keeps the prior model).
-    //   (2) "Kept model as X" → genuine no-op; report it, record NOTHING.
-    //   (3) confirmation line present → verified switch; relay it and record
-    //       the live model for /status.
+    // confirmed" to "record optimistically, retract only on a scraped error").
+    // Order matters (#3242 review MEDIUM 1): check the CONFIRMATION line FIRST —
+    // a genuine switch always prints one, so it can never be flipped to a failure
+    // by a stray availability/denial word (the widened MODEL_SWITCH_ERROR_RE) in
+    // the same region. Then:
+    //   (1) "Kept model as X" → genuine no-op; report it, record NOTHING.
+    //   (2) other confirmation → verified switch; relay it, record the display
+    //       name for /status.
+    //   (3) error/denial line scraped (bad id OR access denial) → switch FAILED.
+    //       Report it; record NOTHING (the retract — /status keeps the prior model).
     //   (4) no line either way → poll-until-signal already waited the full
     //       window, so this is a SILENT success, not a failure. Record the
-    //       requested model OPTIMISTICALLY so /status is right, and say so.
-    const errLine = result.outcome === 'ok' ? modelSwitchErrorLine(result.output) : null
-    if (errLine) {
-      return {
-        text: [
-          `❌ ${verbHtml} — the switch did not take:`,
-          deps.preBlock(errLine),
-          'Check \`/model\` for valid model names.',
-        ].join('\n'),
-        html: true,
-      }
-    }
+    //       requested model OPTIMISTICALLY (normalized to display form) so
+    //       /status is right, and say so.
     const confirmation = result.outcome === 'ok' ? modelSwitchConfirmationLine(result.output) : null
     if (confirmation) {
       if (isKeptModelConfirmation(confirmation)) {
@@ -474,14 +468,26 @@ export async function handleModelCommand(
         selectedModel: confirmed,
       }
     }
+    const errLine = result.outcome === 'ok' ? modelSwitchErrorLine(result.output) : null
+    if (errLine) {
+      return {
+        text: [
+          `❌ ${verbHtml} — the switch did not take:`,
+          deps.preBlock(errLine),
+          'Check \`/model\` for a valid, available model.',
+        ].join('\n'),
+        html: true,
+      }
+    }
     // No confirmation and no error — optimistic record (#3241 part B).
+    const optimisticLabel = optimisticModelRecordLabel(model)
     return {
       text: [
-        `${verbHtml} — sent. Recorded \`${deps.escapeHtml(model)}\` as the live model, but couldn't read claude's confirmation line — check \`/status\`.`,
+        `${verbHtml} — sent. Recorded \`${deps.escapeHtml(optimisticLabel)}\` as the live model, but couldn't read claude's confirmation line — check \`/status\`.`,
         PERSIST_NOTE,
       ].join('\n'),
       html: true,
-      selectedModel: model,
+      selectedModel: optimisticLabel,
       optimistic: true,
     }
   }
@@ -653,6 +659,25 @@ export function expandSrAlias(arg: string): string {
 
 export function srFriendlyLabel(srName: string): string {
   return SR_MODEL_LABELS[srName] ?? srName.replace(/^sr-/, '').replace(/-/g, ' ')
+}
+
+/**
+ * #3242 review LOW 4 — display normalization for the OPTIMISTIC `/status` record.
+ * The confirmed path records the display name claude printed (e.g. "Fable 5" via
+ * `sessionModelFromConfirmation`); the optimistic path only has the requested
+ * arg. Without a confirmation we can't know the version suffix, so we normalize
+ * the token to the same DISPLAY style (a friendly label, not a raw token) so
+ * `/status` reads consistently regardless of which path fired: sr-* → its
+ * friendly label, a bare Claude alias → Title-case ("fable" → "Fable"), and a
+ * full `claude-*` id or anything else is left as-is (already canonical).
+ */
+export function optimisticModelRecordLabel(token: string): string {
+  if (isSrModel(token)) return srFriendlyLabel(token)
+  const lower = token.toLowerCase()
+  if ((MODEL_ALIASES as readonly string[]).includes(lower)) {
+    return lower.charAt(0).toUpperCase() + lower.slice(1)
+  }
+  return token
 }
 
 /**
@@ -1026,20 +1051,53 @@ export async function handleModelMenuCallback(
         reply: await menuWithBanner(deps, `❌ Switch to **${deps.escapeHtml(alias)}** failed: ${deps.escapeHtml(msg)}`),
       }
     }
-    if (aliasResult.outcome === 'ok') {
-      // Anchored confirmation only — a loose /set model|switched/ match false-
-      // positives on ordinary scrollback prose ("I switched the deploy…").
-      const confirmation =
-        modelSwitchConfirmationLine(aliasResult.output) ?? `Switched to ${alias} (session)`
-      // "Kept model as X" means no change — don't overwrite the override.
-      const kept = isKeptModelConfirmation(confirmation)
+    // #3242 review MEDIUM 2 — the alias BUTTON (the primary Fable UI, the exact
+    // async-banner scenario) must be symmetric with the typed set path: handle
+    // BOTH `ok` and `ok_no_output` with record-on-send / retract-on-scraped-error.
+    // Previously `ok_no_output` fell through to "Switch failed — agent may be
+    // mid-turn" and dropped the override, so a silent successful button-switch
+    // was reported as a failure while the identical typed command recorded.
+    if (aliasResult.outcome === 'ok' || aliasResult.outcome === 'ok_no_output') {
+      // Confirmation first (a genuine switch always prints one) so a stray
+      // availability/denial word can't flip it to a failure.
+      const confirmation = aliasResult.outcome === 'ok'
+        ? modelSwitchConfirmationLine(aliasResult.output)
+        : null
+      if (confirmation) {
+        // "Kept model as X" means no change — don't overwrite the override.
+        const kept = isKeptModelConfirmation(confirmation)
+        return {
+          answer: confirmation,
+          reply: await menuWithBannerStatic(deps, `✅ ${deps.escapeHtml(confirmation)}`),
+          ...(kept ? {} : {
+            selectedModel: sessionModelFromConfirmation(confirmation) ?? optimisticModelRecordLabel(alias),
+            selectedModelToken: alias,
+          }),
+        }
+      }
+      // Scraped error/denial (bad id OR access denial) → genuine failure, record
+      // nothing (retract).
+      const aliasErr = aliasResult.outcome === 'ok' ? modelSwitchErrorLine(aliasResult.output) : null
+      if (aliasErr) {
+        return {
+          answer: 'Switch failed',
+          reply: await menuWithBanner(
+            deps,
+            `❌ Switch to **${deps.escapeHtml(alias)}** did not take: ${deps.escapeHtml(aliasErr)}`,
+          ),
+        }
+      }
+      // Silent success (no confirmation, no error) → optimistic record, same as
+      // the typed path.
+      const optimisticLabel = optimisticModelRecordLabel(alias)
       return {
-        answer: confirmation,
-        reply: await menuWithBannerStatic(deps, `✅ ${deps.escapeHtml(confirmation)}`),
-        ...(kept ? {} : {
-          selectedModel: sessionModelFromConfirmation(confirmation) ?? alias,
-          selectedModelToken: alias,
-        }),
+        answer: `Switched to ${optimisticLabel} (session)`,
+        reply: await menuWithBannerStatic(
+          deps,
+          `✅ Switched to **${deps.escapeHtml(optimisticLabel)}** (session) — couldn’t read a confirmation line; check \`/status\`.`,
+        ),
+        selectedModel: optimisticLabel,
+        selectedModelToken: alias,
       }
     }
     return {
@@ -1230,9 +1288,25 @@ export function modelSwitchConfirmationLine(output: string): string | null {
  * 2026-07-10): `/model claude-bogus-99` prints
  * `⎿  Model 'claude-bogus-99' not found` — glyph prefix `⎿`, quoted model
  * name between "Model" and "not found". Both shapes are covered.
+ *
+ * #3242 review MEDIUM 1 — ACCESS/ENTITLEMENT DENIAL. A bad-id shape is not the
+ * only failure: `/model fable` on a plan that lacks it prints an availability /
+ * access-denial line ("Fable is not available on your plan", "access denied",
+ * "requires a subscription", "not enabled for your account", "no access to …").
+ * Those match neither the bad-id shapes nor the confirmation prefix, so the poll
+ * loop would expire and the optimistic branch would falsely record the switch —
+ * exactly the Fable-entitlement case this PR is about. The second alternation
+ * group covers those phrasings. It allows up to four leading words (a model
+ * name + a linking adverb etc.) BEFORE the denial phrase — unlike the bad-id
+ * branches, which keep
+ * their original tight line-start anchoring so ordinary scrollback that merely
+ * says "model not found" mid-sentence still can't false-fail a silent switch.
+ * The handler checks the confirmation line FIRST (below), so a genuine switch —
+ * which always prints a confirmation — is never flipped to a failure by a stray
+ * availability word in the same region.
  */
 const MODEL_SWITCH_ERROR_RE =
-  /^\s*[⏺●•>⎿-]?\s*(?:Error:\s*)?(?:Model(?:\s+'[^']+')?\s+not found|Invalid model|Unknown model|No such model)\b/i
+  /^\s*[⏺●•>⎿-]?\s*(?:Error:\s*)?(?:Model(?:\s+'[^']+')?\s+not found|Invalid model|Unknown model|No such model|(?:[\w'’.\-]+\s+){0,4}(?:(?:is |are )?(?:not available|unavailable|not enabled|not supported)|access denied|requires\b[^\n]{0,40}\b(?:subscription|plan)|no access)\b)/i
 
 /** The single capture line that reads as a claude model-switch error, or null. */
 export function modelSwitchErrorLine(output: string): string | null {

@@ -249,6 +249,40 @@ describe("handleModelCommand — set — #3241 poll-until-signal wiring", () => 
     expect(reply.selectedModel).toBeUndefined();
     expect(reply.optimistic).toBeUndefined();
   });
+
+  // #3242 review MEDIUM 1 — an access/entitlement denial must NOT be recorded
+  // optimistically. Each of these lines matches neither the confirmation prefix
+  // nor the OLD bad-id error regex, so before the widen they slipped into the
+  // optimistic branch and falsely recorded the switch.
+  for (const denial of [
+    "⎿  Fable is not available on your plan",
+    "⎿  access denied",
+    "⎿  Fable requires a Pro subscription",
+    "⎿  This model is not enabled for your account",
+    "⎿  No access to Fable on this tier",
+    "⎿  Fable 5 is currently unavailable",
+  ]) {
+    it(`access-denial line → failure verdict AND no override (retract): ${JSON.stringify(denial)}`, async () => {
+      const { deps } = makeDeps({ inject: async () => okResult(denial) });
+      const reply = await handleModelCommand({ kind: "set", model: "fable" }, deps);
+      expect(reply.text).toContain("did not take");
+      expect(reply.selectedModel).toBeUndefined();
+      expect(reply.optimistic).toBeUndefined();
+    });
+  }
+
+  it("a genuine confirmation is NEVER flipped to a failure by the widened denial regex", async () => {
+    // Confirmation-first ordering: even if scrollback in the same region says
+    // something "unavailable", a real "Set model to …" line wins.
+    const mixed = [
+      "the metrics endpoint was unavailable earlier",
+      "⎿  Set model to Fable 5 for this session",
+    ].join("\n");
+    const { deps } = makeDeps({ inject: async () => okResult(mixed) });
+    const reply = await handleModelCommand({ kind: "set", model: "fable" }, deps);
+    expect(reply.text).not.toContain("did not take");
+    expect(reply.selectedModel).toBe("Fable 5");
+  });
 });
 
 describe("handleModelCommand — set", () => {
@@ -288,7 +322,7 @@ describe("handleModelCommand — set", () => {
     expect(reply.text).toContain("couldn't read claude");
     expect(reply.text).toContain("/status");
     expect(reply.text).not.toContain("switched (session)");
-    expect(reply.selectedModel).toBe("fable");
+    expect(reply.selectedModel).toBe("Fable");
     expect(reply.optimistic).toBe(true);
     expect(reply.html).toBe(true);
   });
@@ -324,7 +358,7 @@ describe("handleModelCommand — set", () => {
     expect(reply.text).not.toContain("kept model changes");
     expect(reply.text).toContain("Recorded");
     expect(reply.text).not.toContain("switched (session)");
-    expect(reply.selectedModel).toBe("fable");
+    expect(reply.selectedModel).toBe("Fable");
     expect(reply.optimistic).toBe(true);
     expect(reply.html).toBe(true);
   });
@@ -352,7 +386,7 @@ describe("handleModelCommand — set", () => {
     // optimistically (was: "no response captured", recorded nothing).
     expect(reply.text).toContain("Recorded");
     expect(reply.text).toContain("/status");
-    expect(reply.selectedModel).toBe("sonnet");
+    expect(reply.selectedModel).toBe("Sonnet");
     expect(reply.optimistic).toBe(true);
   });
 
@@ -542,7 +576,7 @@ describe("handleModelCommand — busy gate + honest unverified reporting", () =>
     // mid-sentence "model not found" prose does NOT flip the switch to a failure,
     // and the requested model is recorded (was: "couldn't confirm", nothing).
     expect(reply.text).toContain("Recorded");
-    expect(reply.selectedModel).toBe("opus");
+    expect(reply.selectedModel).toBe("Opus");
     expect(reply.optimistic).toBe(true);
   });
 
@@ -972,6 +1006,59 @@ describe("handleModelMenuCallback", () => {
     const out = await handleModelMenuCallback(modelSelectCallbackData("Sonnet"), deps);
     expect(out.selectedModel).toBe("Sonnet");
     expect(out.selectedModelToken).toBe("sonnet");
+  });
+});
+
+// #3242 review MEDIUM 2 — the alias BUTTON (mdl:alias:<alias>, e.g. the Fable
+// button) must be symmetric with the typed set path: record-on-send / retract-
+// on-scraped-error, handling BOTH ok and ok_no_output. Before the fix a silent
+// successful button-switch (ok_no_output, or ok with no confirmation line) fell
+// through to "Switch failed" and dropped the override.
+describe("handleModelMenuCallback — alias button symmetry (#3242 MEDIUM 2)", () => {
+  it("ok_no_output (silent switch via the button) → optimistic record, not a failure", async () => {
+    const { deps } = makeMenuDeps({
+      inject: async () => ({
+        outcome: "ok_no_output" as const,
+        output: "",
+        truncated: false,
+        command: "/model",
+        meta: { description: "Open model picker", expectsOutput: true },
+      }),
+    });
+    const out = await handleModelMenuCallback(`${MODEL_CALLBACK_ALIAS}fable`, deps);
+    expect(out.selectedModel).toBe("Fable"); // normalized display form
+    expect(out.selectedModelToken).toBe("fable");
+    expect(out.reply.text).not.toContain("failed");
+    expect(out.reply.text).toContain("Fable");
+  });
+
+  it("ok with no confirmation line (banner-only) → optimistic record", async () => {
+    const { deps } = makeMenuDeps({
+      inject: async () => okResult("⠋ extending Claude Fable 5 access…"),
+    });
+    const out = await handleModelMenuCallback(`${MODEL_CALLBACK_ALIAS}fable`, deps);
+    expect(out.selectedModel).toBe("Fable");
+    expect(out.selectedModelToken).toBe("fable");
+    // The banner must not leak as the confirmation.
+    expect(out.reply.text).not.toContain("extending Claude Fable 5 access");
+  });
+
+  it("scraped access-denial line via the button → failure, no override (retract)", async () => {
+    const { deps } = makeMenuDeps({
+      inject: async () => okResult("⎿  Fable is not available on your plan"),
+    });
+    const out = await handleModelMenuCallback(`${MODEL_CALLBACK_ALIAS}fable`, deps);
+    expect(out.selectedModel).toBeUndefined();
+    expect(out.reply.text).toContain("did not take");
+  });
+
+  it("genuine confirmation via the button still records the display name", async () => {
+    const { deps } = makeMenuDeps({
+      inject: async () => okResult("⎿  Set model to Fable 5 for this session"),
+    });
+    const out = await handleModelMenuCallback(`${MODEL_CALLBACK_ALIAS}fable`, deps);
+    expect(out.selectedModel).toBe("Fable 5");
+    expect(out.selectedModelToken).toBe("fable");
   });
 });
 

@@ -274,6 +274,23 @@ async function openPickerWithRetry(io: Io): Promise<ParsedModelPicker | null> {
   // where the picker should be. Esc it and re-open once against the settled pane
   // before giving up to the caller's static fallback. dismissPicker is Esc +
   // verify; its return is advisory here.
+  //
+  // #3242 review LOW 3 — ASSUMPTION: dismissPicker's Escape actually returned the
+  // pane to a clean prompt. If BOTH Esc rounds failed (a genuinely stuck modal —
+  // the /rate-limit-options wedge class), the re-open below types `/model` + Enter
+  // into a still-open picker, where the keystrokes act as its filter and Enter
+  // could select an arbitrary row. We accept this residual risk rather than add a
+  // second hard guard because it is caught downstream and never silently wrong:
+  //   - if the re-open still can't parse a footer-complete modal, the caller
+  //     returns ok:false ("picker did not render") and falls back to the static
+  //     list — no wrong selection is surfaced;
+  //   - the caller's own `dismissOrWarn` runs in its finally and LOUDLY logs a
+  //     may-still-be-open pane for wedge forensics (+ dismissFailed:true).
+  // The stuck-modal wedge is pre-existing (any open-picker driver that sends
+  // `/model` + Enter faces it); this one-shot retry only reaches the second open
+  // AFTER two Esc rounds already ran, so it does not meaningfully widen the
+  // window. A stuck modal is the rare exception, surfaced (dismissFailed + log)
+  // not swallowed.
   await dismissPicker(io);
   if (expired(io)) return parsed;
   return openPicker(io);
