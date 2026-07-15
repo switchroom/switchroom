@@ -77,14 +77,18 @@ operators jump to **Operating**; contributors and reviewers use
 |---|---|
 | [diagrams/DESIGN.md](diagrams/DESIGN.md) | Unified diagram design system (v3) + source-of-truth/regeneration model. |
 | [diagrams/deterministic-status-anatomy.spec.md](diagrams/deterministic-status-anatomy.spec.md) | Regeneration spec for the deterministic-status anatomy diagram (supersedes the retired pinned progress-card). |
+| [diagrams/approval-broker.spec.md](diagrams/approval-broker.spec.md) | Regeneration spec for the approval-broker concept diagram (plain-language "you hold the leash" sibling of approval-grant-flow). |
 | [diagrams/approval-grant-flow.spec.md](diagrams/approval-grant-flow.spec.md) | Regeneration spec for the approval-grant-flow diagram. |
+| [diagrams/auth-broker.spec.md](diagrams/auth-broker.spec.md) | Regeneration spec for the auth-broker concept diagram (newcomer-facing "rides your Claude subscription" companion to auth-broker-credential-plane). |
 | [diagrams/wake-audit-lifecycle.spec.md](diagrams/wake-audit-lifecycle.spec.md) | Regeneration spec for the wake-audit-lifecycle diagram. |
 | [diagrams/auth-broker-credential-plane.spec.md](diagrams/auth-broker-credential-plane.spec.md) | Regeneration spec for the auth-broker-credential-plane diagram. |
 | [diagrams/drive-write-approval.spec.md](diagrams/drive-write-approval.spec.md) | Regeneration spec for the drive-write-approval diagram. |
 | [diagrams/runtime-topology.spec.md](diagrams/runtime-topology.spec.md) | Regeneration spec for the runtime-topology diagram. |
 
-Each spec has a matching `<name>.svg` (the authored artifact); the
-original three also have an optional `<name>.jpg` raster export.
+Each spec has a matching authored source artifact — a `<name>.html`
+(the HTML/CSS → 2x PNG pipeline, see `diagrams/DESIGN.md` Part 2) or a
+legacy `<name>.svg` — with the raster export (`<name>.png` at 2x, or a
+legacy `<name>.jpg`) always derived from that source, never authored directly.
 
 ## Archived (point-in-time snapshots — not current guidance)
 

@@ -45,7 +45,7 @@ can't touch anything sensitive until you tap Allow."
 - **One clear direction.** Left-to-right or top-down, never a scatter. The eye
   should start in one corner and finish in the opposite one.
 - **Numbered beats.** Break the idea into 3–5 steps and number them (the brass
-  → cord → teal callout roles carry the sequence). A reader should be able to
+  → cord → brass-done callout roles carry the sequence). A reader should be able to
   read only the numbers and titles and still get the story.
 - **A concrete, relatable example beats an abstract placeholder.** Show a real
   action — `deploy/config.yaml · replicas: 2 → 4` — not `<action>` or
@@ -171,7 +171,10 @@ the visual layer, and the `.spec.md` remains authoritative.
 - Number font: Inter 700 13px, fill `#FAF7EF`
 - Roles (strict):
   - **Brass** `#E8B657` fill = sequence step / numeric label
-  - **Teal** `#4A9B8E` fill = success / grant / done
+  - **Brass-filled done** = solid brass fill with a **charcoal** glyph/number
+    (`#0E1013`) = success / grant / done. Completion is signalled by weight and
+    fill, not a separate hue. (This replaced the retired off-brand teal — brand
+    forbids teal/green; only the cord is ever red.)
   - **Cord** `#C8302C` fill = pause / wait / warning
 
 ## Connecting lines
@@ -195,7 +198,8 @@ the visual layer, and the `.spec.md` remains authoritative.
 `--ink-900 #0E1013`, `--ink-700 #23282F`, `--ink-400 #5A6069`,
 `--ink-300 #8A8F98`, `--ink-200 #B8BCC3`,
 `--brass #E8B657`, `--brass-deep #B8873A`,
-`--cord #C8302C`, `--teal #4A9B8E`. No gradients. No invented hues.
+`--cord #C8302C`. No gradients. No invented hues. **No teal, no green** — the
+success/done role is the brass-filled treatment above, not a distinct hue.
 
 ## Source-of-truth & regeneration model
 
