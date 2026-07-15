@@ -104,7 +104,11 @@ COPY --from=ghcr.io/astral-sh/uv:0.7.13 /uv /uvx /usr/local/bin/
 # Placed here — well above the `COPY dist/**` block — so a typical
 # src-only PR rebuilds 3-4 small COPY layers instead of triggering
 # this ~150MB layer (which would also pay ~20s of `playwright install`).
-ARG PLAYWRIGHT_VERSION=1.61.1
+# NOTE: must be a version published on BOTH npm and PyPI (the two bindings
+# share it). npm may lead PyPI by a patch (e.g. npm had 1.61.1 while PyPI's
+# newest was 1.61.0) — pick the newest that exists on both, or the pip
+# install fails "No matching distribution".
+ARG PLAYWRIGHT_VERSION=1.61.0
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright/browsers
 
 # JS binding + chromium browser + system libs. The `npx playwright` here is

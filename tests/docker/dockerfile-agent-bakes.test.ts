@@ -113,11 +113,14 @@ describe("Dockerfile.agent Playwright provisioning", () => {
     expect(dockerfile).toMatch(/ARG\s+PLAYWRIGHT_VERSION=\d+\.\d+\.\d+\s*$/m);
   });
 
-  it("pins PLAYWRIGHT_VERSION to the current baked version (1.61.1, chromium ~1228)", () => {
+  it("pins PLAYWRIGHT_VERSION to the current baked version (1.61.0, chromium 1228)", () => {
     // Lock the exact bumped value so a stray/partial revert is caught. Bump
     // this string in lockstep with the ARG (and re-verify JS==Python share
-    // one chromium revision) on the next Playwright upgrade.
-    expect(dockerfile).toMatch(/ARG\s+PLAYWRIGHT_VERSION=1\.61\.1\s*$/m);
+    // one chromium revision) on the next Playwright upgrade. NB the pin must
+    // exist on BOTH npm and PyPI — npm can lead PyPI by a patch (npm had
+    // 1.61.1 while PyPI topped out at 1.61.0), and the Python `pip install`
+    // fails if the version isn't on PyPI.
+    expect(dockerfile).toMatch(/ARG\s+PLAYWRIGHT_VERSION=1\.61\.0\s*$/m);
   });
 
   it("installs the JS binding at the pinned version", () => {
