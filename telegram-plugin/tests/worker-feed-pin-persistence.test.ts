@@ -249,5 +249,58 @@ describe('worker-feed pin persistence — group-message lifetime cap rotation', 
     expect(pin.unpinCalls).toContain(msgA)
     expect(pin.pinCalls).toContain(msgB)
     expect(pin.state.get(pin.key())?.messageId).toBe(msgB)
+
+    // FIX 1: the retired message was collapsed to the honest "moved" note with
+    // exactly ONE edit (not left frozen showing live rows, not re-edited per tick).
+    const supersedeEdits = bot.edits.filter(
+      (e) => e.messageId === msgA && e.text.includes('Live progress moved to a fresh card'),
+    )
+    expect(supersedeEdits).toHaveLength(1)
+  })
+
+  it('rotation preserves ALL live overlapping worker rows on the fresh message (none dropped/double-counted)', async () => {
+    const bot = makeFakeBot()
+    const pin = makePinHarness()
+    let clock = 0
+    const feed = createWorkerActivityFeed({
+      bot,
+      now: () => clock,
+      firstPaintMinMs: 0,
+      minEditIntervalMs: 0,
+      heartbeatTickMs: 6000,
+      groupMessageLifetimeCapMs: 30_000,
+      reconcilePin: pin.reconcilePinFn,
+    })
+
+    // Two workers overlap in the SAME chat → one combined group message.
+    clock = 1000
+    await feed.update('w1', 'chat', view({ description: 'alpha task', elapsedMs: 1000 }))
+    await flush()
+    clock = 1100
+    await feed.update('w2', 'chat', view({ description: 'beta task', elapsedMs: 1100 }))
+    await flush()
+    const msgA = bot.sent[0].messageId
+    // Both workers share the one message.
+    expect(feed.messageIdOf('w1')).toBe(msgA)
+    expect(feed.messageIdOf('w2')).toBe(msgA)
+
+    // Advance past the cap with BOTH still live, then tick to rotate.
+    clock = 40_000
+    await feed.update('w1', 'chat', view({ description: 'alpha task', elapsedMs: 40_000, toolCount: 3 }))
+    await flush()
+    feed.heartbeatTick()
+    await flush()
+
+    // A fresh message was posted and BOTH live workers moved to it — no row
+    // dropped, no worker orphaned on the retired card.
+    expect(bot.sent).toHaveLength(2)
+    const fresh = bot.sent[1]
+    expect(fresh.messageId).not.toBe(msgA)
+    expect(feed.messageIdOf('w1')).toBe(fresh.messageId)
+    expect(feed.messageIdOf('w2')).toBe(fresh.messageId)
+    // The fresh combined body renders BOTH workers' rows.
+    expect(fresh.text).toContain('alpha task')
+    expect(fresh.text).toContain('beta task')
+    expect(feed.size).toBe(2)
   })
 })

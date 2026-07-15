@@ -9034,6 +9034,14 @@ async function reconcileStatusPinInner(
 ): Promise<void> {
   if (!PIN_STATUS_WHILE_WORKING) return
   if (chatId.length === 0) return
+  // NOTE (invisible-worker-cards review, intentionally left): this reconcile is
+  // NOT serialized per pinKey — it snapshots `prev` then awaits. Two edits that
+  // fire `syncPin` in the same microtask window after a dropped claim can both
+  // read `prev=null` and both issue a `pinChatMessage` for the SAME id. That is
+  // benign and self-healing: re-pinning an already-pinned id is idempotent on
+  // Telegram, and the first reconcile to set the claim makes every subsequent
+  // edit a no-op — it converges in one round, never a storm. A per-key mutex
+  // would remove the duplicate pin but adds lock complexity for zero UX gain.
   const prev = statusPinState.get(pinKey) ?? null
 
   const runReconcile = () =>

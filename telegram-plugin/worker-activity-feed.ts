@@ -492,6 +492,17 @@ interface FeedGroup {
 
 const COOLDOWN_JITTER_MS = 500
 
+/**
+ * Static body the retired shared message is finalized to when the group-message
+ * lifetime cap rotates to a fresh card (invisible-worker-cards review, FIX 1).
+ * Without this the abandoned message stays frozen showing live-styled worker
+ * rows and reads like a stuck worker. A single best-effort edit collapses it to
+ * an honest "moved" note — issued once per rotation (≥ cap interval), never per
+ * tick, so it adds no edit churn / pin storm. Plain voice, no em dash.
+ */
+const WORKER_CARD_SUPERSEDED_BODY =
+  '🛠 **Worker** · _continued_\n\n_Live progress moved to a fresh card to stay pinned._'
+
 function extractRetryAfterSecs(err: unknown): number | null {
   if (err == null || typeof err !== 'object') return null
   const e = err as { error_code?: unknown; parameters?: { retry_after?: unknown } }
@@ -1211,9 +1222,10 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       // Costs exactly one unpin + one pin per cap interval — never a burst.
       if (g.messageId != null && now - g.messageCreatedAtMs >= groupMessageLifetimeCapMs) {
         const age = Math.floor((now - g.messageCreatedAtMs) / 1000)
+        const retiredId = g.messageId
         log(
           `worker-feed: group-message lifetime cap rotate feed=${g.feedKey} ` +
-            `msgId=${g.messageId} — age ${age}s (>= ${Math.floor(groupMessageLifetimeCapMs / 1000)}s); ` +
+            `msgId=${retiredId} — age ${age}s (>= ${Math.floor(groupMessageLifetimeCapMs / 1000)}s); ` +
             `rotating to a fresh message to re-establish the pin surface`,
         )
         g.messageId = null
@@ -1222,6 +1234,13 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
         // Clear the (possibly stale) pin claim for the retired message; the
         // fresh first-paint below re-pins the new one from a null claim.
         syncPin(g)
+        // FIX 1: collapse the retired message to an honest "moved" note so it
+        // doesn't sit frozen showing live-styled rows (mistakable for a stuck
+        // worker). ONE best-effort edit per rotation (≥ cap interval), fired
+        // off-chain and swallowing errors — never per-tick, never a burst.
+        void opts.bot
+          .editMessageText(g.chatId, retiredId, WORKER_CARD_SUPERSEDED_BODY, sendOptsFor(g))
+          .catch(() => {})
       }
 
       // First-paint path: no message yet and some worker has now crossed
