@@ -791,6 +791,15 @@ describe("formatTokenCount — compact token formatter", () => {
     expect(formatTokenCount(1_200_000)).toBe("1.2M");
   });
 
+  it("promotes the k→M rounding boundary (never renders 1000.0k)", () => {
+    // 999_949 rounds down to 999.9k; from 999_950 the 1-decimal k rounds to
+    // 1000.0 which must roll into the M branch as 1.0M.
+    expect(formatTokenCount(999_949)).toBe("999.9k");
+    expect(formatTokenCount(999_950)).toBe("1.0M");
+    expect(formatTokenCount(999_999)).toBe("1.0M");
+    expect(formatTokenCount(1_000_000)).toBe("1.0M");
+  });
+
   it("clamps negatives / non-finite to 0", () => {
     expect(formatTokenCount(-5)).toBe("0");
     expect(formatTokenCount(Number.NaN)).toBe("0");

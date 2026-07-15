@@ -214,7 +214,13 @@ export function renderActivityHeader(
 export function formatTokenCount(n: number): string {
   if (!Number.isFinite(n) || n <= 0) return '0'
   if (n < 1000) return String(Math.floor(n))
-  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}k`
+  if (n < 1_000_000) {
+    // Round to the displayed 1-decimal k FIRST: inputs in [999_950, 999_999]
+    // round to "1000.0k", which must promote into the M branch rather than
+    // render a nonsense "1000.0k". Fall through when the rounded k reaches 1000.
+    const k = Number((n / 1000).toFixed(1))
+    if (k < 1000) return `${k.toFixed(1)}k`
+  }
   return `${(n / 1_000_000).toFixed(1)}M`
 }
 
