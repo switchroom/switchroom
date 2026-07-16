@@ -16,6 +16,7 @@ import {
   hasOutboundDeliveredSince,
   hasOutboundWithText,
   normalizeDeliveryText,
+  verifyHistoryWritable,
   _resetForTests,
 } from '../history.js'
 
@@ -961,5 +962,92 @@ describe('hasOutboundWithText (durable text-identity oracle)', () => {
     // A row delivered within the turn window (ts=300s) does match.
     recordOutbound({ chat_id: '1', thread_id: null, message_ids: [23], texts: ['repeated answer'], ts: 300 })
     expect(hasOutboundWithText('1', 'repeated answer', null, 250_000)).toBe(true)
+  })
+})
+
+// ── 2026-07-16 incident hardening: writer durability across restart + surfacing
+//    swallowed insert failures. Root cause: turn-flush deliveries (18944/18958)
+//    reached Telegram but were absent from history.db, blinding
+//    getRecentOutboundCount / hasOutboundDeliveredSince. The gateway had already
+//    logged "history capture enabled" on both restarts, so DB-open success was
+//    NOT proof the row-insert path worked. These tests pin the durable fix.
+describe('history writer durability (2026-07-16 incident)', () => {
+  it('verifyHistoryWritable proves the INSERT path works on a live DB', () => {
+    initHistory(stateDir, 30)
+    const res = verifyHistoryWritable()
+    expect(res.ok).toBe(true)
+    // The self-check must leave NO sentinel residue behind.
+    expect(getRecentOutboundCount('__history_selfcheck__', 86_400)).toBe(0)
+  })
+
+  it('verifyHistoryWritable reports not-ok before init (no silent success)', () => {
+    // No initHistory() this test — the writer is uninitialised.
+    const res = verifyHistoryWritable()
+    expect(res.ok).toBe(false)
+    expect(res.error).toMatch(/initHistory/)
+  })
+
+  // The core recovery contract: recording must survive a shutdown + reinit
+  // (a gateway restart, which nulls the module singleton and re-opens the same
+  // file). Rows written before AND after the boundary must all be queryable.
+  it('recording continues across a simulated restart (reinit of the same DB)', () => {
+    const nowSec = Math.floor(Date.now() / 1000)
+    initHistory(stateDir, 30)
+    recordOutbound({ chat_id: '9', thread_id: null, message_ids: [100], texts: ['before restart'], ts: nowSec - 60 })
+    // Simulate a gateway restart: close + forget the singleton, then reinit
+    // against the SAME stateDir (fresh process, db=null → re-open).
+    _resetForTests()
+    initHistory(stateDir, 30)
+    // Boot self-check must still pass against the existing, populated file.
+    expect(verifyHistoryWritable().ok).toBe(true)
+    recordOutbound({ chat_id: '9', thread_id: null, message_ids: [101], texts: ['after restart'], ts: nowSec })
+    const rows = query({ chat_id: '9' })
+    expect(rows.map((r) => r.message_id)).toEqual([100, 101])
+    // The backstop suppression counter (the surface blinded by the incident)
+    // must see BOTH the pre- and post-restart outbounds.
+    expect(getRecentOutboundCount('9', 10_000_000_000)).toBe(2)
+  })
+
+  // The exact incident shape: a malformed send result yields an invalid
+  // message_id. OLD behaviour: the NOT NULL PRIMARY KEY throws inside the tx and
+  // the caller's `catch {}` swallows it — the row is lost AND invisible. NEW
+  // behaviour: the invalid chunk is filtered + logged, valid chunks still land,
+  // and no throw escapes to be swallowed.
+  it('drops an invalid message_id chunk loudly but records the valid ones (no silent total loss)', () => {
+    initHistory(stateDir, 30)
+    const errs: string[] = []
+    const orig = process.stderr.write.bind(process.stderr)
+    // @ts-expect-error narrow test shim over the write overloads
+    process.stderr.write = (chunk: string) => { errs.push(String(chunk)); return true }
+    try {
+      recordOutbound({
+        chat_id: '9',
+        thread_id: null,
+        // chunk 0 is a malformed (undefined) id; chunk 1 is real.
+        message_ids: [undefined as unknown as number, 200],
+        texts: ['lost chunk', 'kept chunk'],
+        ts: 3000,
+      })
+    } finally {
+      process.stderr.write = orig
+    }
+    // The valid chunk is recorded (delivery accounting is NOT silently zeroed).
+    const rows = query({ chat_id: '9' })
+    expect(rows.map((r) => r.message_id)).toEqual([200])
+    // The drop was surfaced loudly, not swallowed.
+    expect(errs.join('')).toMatch(/invalid message_id/)
+  })
+
+  it('recordOutbound with an all-invalid id set no-ops without throwing', () => {
+    initHistory(stateDir, 30)
+    expect(() =>
+      recordOutbound({
+        chat_id: '9',
+        thread_id: null,
+        message_ids: [NaN, null as unknown as number],
+        texts: ['a', 'b'],
+      }),
+    ).not.toThrow()
+    expect(getRecentOutboundCount('9', 10_000_000_000)).toBe(0)
   })
 })

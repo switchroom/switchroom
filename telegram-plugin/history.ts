@@ -143,6 +143,40 @@ let db: SqliteDatabase | null = null
 let dbPath: string | null = null
 
 /**
+ * Loud, unconditional failure logging for the history writer.
+ *
+ * Recording bugs are silent by construction: every gateway call site wraps
+ * `recordOutbound` / `recordInbound` in a `try { … } catch {}` (or a catch that
+ * logs a caller-shaped message), and several of those catches are EMPTY. When a
+ * write throws or drops a row, the caller's empty catch hides it — the exact
+ * failure mode behind the 2026-07-16 incident (turn-flush deliveries 18944 /
+ * 18958 delivered to Telegram but absent from history.db, blinding
+ * `getRecentOutboundCount` / `hasOutboundDeliveredSince`). We therefore log HERE,
+ * inside the writer, BEFORE any throw — so even a caller's `catch {}` cannot
+ * suppress the diagnostic. Deterministic surfacing, not prompt discipline.
+ */
+function warnHistory(msg: string): void {
+  try {
+    process.stderr.write(`telegram history: ${msg}\n`)
+  } catch {
+    /* stderr write must never itself break the record path */
+  }
+}
+
+/**
+ * A Telegram message_id is a positive 32-bit-ish integer. A null / undefined /
+ * NaN / non-integer id can only arrive from a malformed send result (e.g. an
+ * API wrapper that resolved without a real message object). Inserting it either
+ * violates the NOT NULL PRIMARY KEY (throws → swallowed by an empty caller
+ * catch) or silently corrupts the key space. We filter such ids out and log
+ * loudly instead — a delivered-but-unrecorded row is a durability defect the
+ * operator must see, not a silent drop.
+ */
+function isValidMessageId(id: unknown): id is number {
+  return typeof id === 'number' && Number.isInteger(id) && id > 0
+}
+
+/**
  * Open (or create) the history DB and run migrations + retention sweep.
  * Idempotent — safe to call once at server startup.
  *
@@ -270,6 +304,72 @@ export function initHistory(stateDir: string, retentionDays = 30): void {
   if (retentionDays > 0) {
     const cutoff = Math.floor(Date.now() / 1000) - retentionDays * 86400
     db.prepare('DELETE FROM messages WHERE ts < ?').run(cutoff)
+  }
+
+  // Boot-time writer self-check (2026-07-16 incident hardening). "history
+  // capture enabled" was logged at every boot — including the 02:17 and 04:58
+  // restarts around the incident — yet a whole class of deliveries never
+  // reached the DB. A successful `new Database(...)` + schema DDL does NOT prove
+  // the row-insert path is functional (a read-only mount, a full disk, an
+  // orphaned inode after an in-place dir replace, or a corrupt page all pass DDL
+  // but fail INSERT). So we prove it with a real INSERT + SELECT + DELETE
+  // round-trip on a sentinel row, and log LOUDLY if it fails. This turns a
+  // silent, hours-later-discovered writer outage into a deterministic boot
+  // signal the operator can see immediately.
+  const check = verifyHistoryWritable()
+  if (!check.ok) {
+    warnHistory(
+      `WRITER SELF-CHECK FAILED at boot (path=${path}): ${check.error ?? 'unknown'} — ` +
+        `history recording is NOT durable; get_recent_messages recovery and the ` +
+        `reply-backstop already-replied suppression will be blind. Investigate the ` +
+        `DB path/mount/permissions before trusting delivery accounting.`,
+    )
+  }
+}
+
+/**
+ * Prove the history writer's INSERT path actually works, not just that the DB
+ * opened and the schema DDL ran. Performs a real INSERT + SELECT + DELETE of a
+ * sentinel row keyed on a reserved chat_id that no live chat can collide with,
+ * and cleans it up unconditionally. Returns `{ ok:false, error }` (never throws)
+ * so the boot path and an operator self-check tool can both call it safely.
+ *
+ * This is the deterministic mechanism the 2026-07-16 incident lacked: a
+ * writer that opens fine but cannot persist rows (read-only mount, full disk,
+ * orphaned inode, corruption) is caught HERE at boot instead of being inferred
+ * hours later from missing rows.
+ *
+ * No-op safe: returns `{ ok:false }` with an explanatory error if
+ * `initHistory` was never called.
+ */
+export function verifyHistoryWritable(): { ok: boolean; error?: string } {
+  if (db == null) return { ok: false, error: 'initHistory() not called' }
+  const SENTINEL_CHAT = '__history_selfcheck__'
+  const sentinelId = Date.now()
+  try {
+    // Clear any stale sentinel from a prior crashed self-check first.
+    db.prepare('DELETE FROM messages WHERE chat_id = ?').run(SENTINEL_CHAT)
+    db.prepare(
+      `INSERT OR REPLACE INTO messages
+         (chat_id, thread_id, message_id, role, ts, text)
+       VALUES (?, NULL, ?, 'assistant', ?, ?)`,
+    ).run(SENTINEL_CHAT, sentinelId, Math.floor(Date.now() / 1000), 'selfcheck')
+    const row = db
+      .prepare('SELECT text FROM messages WHERE chat_id = ? AND message_id = ?')
+      .get(SENTINEL_CHAT, sentinelId) as { text?: string } | undefined
+    if (row?.text !== 'selfcheck') {
+      return { ok: false, error: 'sentinel row not read back after insert' }
+    }
+    return { ok: true }
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) }
+  } finally {
+    // Never leave the sentinel behind, even if the SELECT/assert path threw.
+    try {
+      db.prepare('DELETE FROM messages WHERE chat_id = ?').run(SENTINEL_CHAT)
+    } catch {
+      /* best-effort cleanup */
+    }
   }
 }
 
@@ -404,6 +504,13 @@ interface RecordInboundArgs {
  */
 export function recordInbound(args: RecordInboundArgs): void {
   if (args.message_id == null) return
+  if (!isValidMessageId(args.message_id)) {
+    warnHistory(
+      `recordInbound: dropping row with invalid message_id=${String(args.message_id)} ` +
+        `(chat=${args.chat_id}) — a delivered inbound will be absent from history`,
+    )
+    return
+  }
   const stmt = requireDb().prepare(`
     INSERT OR REPLACE INTO messages
       (chat_id, thread_id, message_id, role, user, user_id, ts, text, attachment_kind, group_id, reply_to_message_id, reply_to_text, forwarded_from, forwarded_from_type, forwarded_from_id, forwarded_date, forwarded_message_id)
@@ -453,7 +560,35 @@ interface RecordOutboundArgs {
 export function recordOutbound(args: RecordOutboundArgs): void {
   if (args.message_ids.length === 0) return
   const ts = args.ts ?? Math.floor(Date.now() / 1000)
-  const groupId = args.message_ids[0]!
+  // Filter out invalid ids (null/undefined/NaN/non-positive) BEFORE the insert.
+  // A malformed send result (an API wrapper that resolved without a real message
+  // object) would otherwise inject a NULL/NaN message_id: the NOT NULL PRIMARY
+  // KEY throws, and the caller's `catch {}` swallows it — the delivered reply is
+  // then absent from history AND the failure is invisible. This was the shape of
+  // the 2026-07-16 turn-flush loss (18944/18958 delivered, never recorded). We
+  // log loudly and record only the valid rows instead of losing them silently.
+  const validRows: Array<{ id: number; text: string; attachKind: string | null }> = []
+  for (let i = 0; i < args.message_ids.length; i++) {
+    const id = args.message_ids[i]
+    if (!isValidMessageId(id)) {
+      warnHistory(
+        `recordOutbound: dropping chunk ${i} with invalid message_id=${String(id)} ` +
+          `(chat=${args.chat_id}) — a delivered outbound will be absent from history, ` +
+          `blinding the reply-backstop already-replied suppression`,
+      )
+      continue
+    }
+    validRows.push({
+      id,
+      // Outbound redaction: the agent→user direction has no other secret scrub,
+      // so this is the chokepoint that keeps an agent-echoed secret out of the
+      // message store. Masks the secret bytes in place; surrounding text kept.
+      text: redact(args.texts[i] ?? ''),
+      attachKind: args.attachment_kinds?.[i] ?? null,
+    })
+  }
+  if (validRows.length === 0) return
+  const groupId = validRows[0]!.id
   const stmt = requireDb().prepare(`
     INSERT OR REPLACE INTO messages
       (chat_id, thread_id, message_id, role, user, user_id, ts, text, attachment_kind, group_id)
@@ -463,30 +598,25 @@ export function recordOutbound(args: RecordOutboundArgs): void {
   // writes if the process dies mid-loop. The transaction signature is
   // typed as variadic-unknown for genericity; cast the typed callback
   // through the wider shape.
-  const tx = requireDb().transaction(((rows: Array<[number, string, string | null]>) => {
-    for (const [msgId, text, attachKind] of rows) {
-      stmt.run(
-        args.chat_id,
-        args.thread_id ?? null,
-        msgId,
-        ts,
-        text,
-        attachKind,
-        groupId,
-      )
+  const tx = requireDb().transaction(((rows: Array<{ id: number; text: string; attachKind: string | null }>) => {
+    for (const r of rows) {
+      stmt.run(args.chat_id, args.thread_id ?? null, r.id, ts, r.text, r.attachKind, groupId)
     }
   }) as (...args: unknown[]) => unknown)
-  // Outbound redaction: the agent→user direction has no other secret
-  // scrub, so this is the chokepoint that keeps an agent-echoed secret out
-  // of the message store (e.g. an agent quoting a token it read from a file
-  // or a not-yet-vaulted value). Masks the secret bytes in place; the
-  // surrounding reply text is preserved.
-  const rows: Array<[number, string, string | null]> = args.message_ids.map((id, i) => [
-    id,
-    redact(args.texts[i] ?? ''),
-    args.attachment_kinds?.[i] ?? null,
-  ])
-  tx(rows)
+  // Surface a write failure LOUDLY before rethrowing. Callers wrap this in a
+  // `catch {}` / caller-shaped catch; without this log an insert failure (disk
+  // full, read-only mount, lock exhaustion) would be completely invisible —
+  // exactly the diagnostic gap the 2026-07-16 incident exposed. Rethrow so the
+  // caller's existing control flow is unchanged.
+  try {
+    tx(validRows)
+  } catch (err) {
+    warnHistory(
+      `recordOutbound: INSERT failed (chat=${args.chat_id} ids=[${validRows.map((r) => r.id).join(',')}]): ` +
+        `${err instanceof Error ? err.message : String(err)} — this outbound will be absent from history`,
+    )
+    throw err
+  }
 }
 
 interface RecordEditArgs {
