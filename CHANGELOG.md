@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+## v0.18.27 — Steadier Telegram cards and more reliable model switching
+
+This release smooths the Telegram surface — no more dead air on
+sub-agent handback, no more flickering replies, and no more elapsed-clock
+edit churn provoking flood bans — and makes `/model` / `/effort` reliable
+even when a session is wedged. Plus a fresh on-brand README, and Fable 5
+offered in `/model`.
+
+### Features
+
+- **Fable 5 in `/model`** (#3260) — offered as a model choice behind the
+  litellm provider gate.
+- **Handback dead-air closed** (#3269) — the gap between a sub-agent
+  finishing and the reply landing now shows a "reading results" card plus
+  a typing indicator, so the chat never goes silent during handback.
+
+### Fixes
+
+- **`/model` & `/effort` no longer wedge** (#3263) — a stale turn atom or
+  a wedged approval on an otherwise idle session no longer blocks a
+  model-switch or effort change.
+- **No more flood bans from the worker card** (#3271) — the elapsed-clock
+  no-op edit churn (an edit every 3s) is gone, and a per-message edit
+  budget send-gate keeps Telegram from rate-limiting the card.
+- **Reply flicker gone** (#3266) — on a turn-flush supersede the reply is
+  edited in place instead of deleted and resent.
+- **ms-365 calendar approvals** (#3272) — the calendar approval card now
+  resolves its context correctly and guards against a grant lapsing
+  mid-batch.
+
+### Docs
+
+- **On-brand README** (#3261) — new hero, concept diagrams, and a brand
+  asset library.
+
 ## v0.18.26 — Agent replies stop mis-rendering currency and prose as Telegram formatting
 
 The headline is a deterministic outbound guard so agent replies are no
