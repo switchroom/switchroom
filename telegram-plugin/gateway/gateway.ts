@@ -198,6 +198,11 @@ import { NarrativeFlushController, PENDING_NARRATIVE_FLUSH_MS } from '../narrati
 import { toolLabel } from '../tool-labels.js'
 import { createTypingWrapper } from '../typing-wrap.js'
 import { createTurnTypingLoop } from './turn-typing-loop.js'
+import {
+  createHandbackPreturnSignal,
+  type PreTurnCardRecord,
+} from './handback-preturn-signal.js'
+import { deriveTurnId } from './derive-turn-id.js'
 import { createTypingEmitter, TYPING_REFRESH_MS } from '../typing-emitter.js'
 import { type DraftStreamHandle } from '../draft-stream.js'
 import { handlePtyPartialPure, type PtyHandlerState } from '../pty-partial-handler.js'
@@ -3755,25 +3760,10 @@ function findTurnByQuotedMessageId(chatId: string, replyTo: unknown): CurrentTur
   if (turn == null || turn.sessionChatId !== chatId) return null
   return turn
 }
-/**
- * Component 3 — derive the stable per-turn identity from the chat, thread,
- * and originating message id. Stamped into the inbound meta at build time
- * (`origin_turn_id`) AND reconstructed at enqueue time from the same three
- * values, so the id stamped on the message the model reads matches the id
- * on the turn the gateway started for it. Using the message id (not the
- * not-yet-known startedAt) is what lets the two sites agree. Returns null
- * when there is no message id (synthetic / cron / handback turns have no
- * originating inbound — they never need origin routing, the live turn IS
- * the origin).
- */
-function deriveTurnId(
-  chatId: string,
-  threadId: number | null | undefined,
-  messageId: string | number | null | undefined,
-): string | null {
-  if (messageId == null || messageId === '' || String(messageId) === '0') return null
-  return `${chatKey(chatId, threadId ?? null)}#${messageId}`
-}
+// Component 3 — the stable per-turn identity. Extracted to `derive-turn-id.ts`
+// (#3268) so the enqueue seam and the handback round-trip test share ONE
+// function. Re-exported into scope under the original name so every existing
+// callsite is unchanged.
 
 /**
  * Component 3 — resolve the turn that OWNS a reply by its `origin_turn_id`
@@ -8964,11 +8954,20 @@ async function runMidSessionCardReaper(): Promise<void> {
       const { finalized, vanished, total } = await runActivityCardMidSessionReaper({
         path: ACTIVITY_CARD_STORE_PATH,
         fs: activityCardStoreFs,
+        // A synthetic pre-turn record's key is never a live topic key, so it is
+        // correctly seen as ownerless here (the seam's own age-based self-reap is
+        // the fast path; this is the crash / long-lived backstop).
         isLive: (record) => topicKeys.has(record.turnKey),
         ttlMs: MID_SESSION_CARD_REAPER_TTL_MS,
         now,
-        finalizeCard: (record) =>
-          robustApiCall(
+        finalizeCard: (record) => {
+          // Reap hook (design lever 4): a never-adopted pre-turn card being
+          // finalized here must also stop its forever-running typing loop and
+          // drop the seam's in-memory entry.
+          if (handbackPreturnSignal.isPreTurnRecord(record.turnKey)) {
+            handbackPreturnSignal.handleReaped(record.turnKey)
+          }
+          return robustApiCall(
             () =>
               lockedBot.api.editMessageText(
                 record.chatId,
@@ -8981,7 +8980,8 @@ async function runMidSessionCardReaper(): Promise<void> {
               ...(record.threadId != null ? { threadId: record.threadId } : {}),
               verb: 'activity-card.mid-session-reap-finalize',
             },
-          ),
+          )
+        },
         // #3001: route through reconcileStatusPin when the pin is a live
         // in-memory claim, so the claim AND the durable status-pins.json row
         // clear together (the raw-API unpin left both behind — the boot sweep
@@ -10083,6 +10083,15 @@ _deliveryMachineTick.unref?.()
 // synthetic-source/empty, which never produce an `enqueue` and would otherwise
 // re-deliver forever.
 function trackRedeliveredInbound(merged: InboundMessage): void {
+  // Dead-air pre-turn signal: this is the shared CONFIRMED-release chokepoint
+  // (buffer drain, idle-drain tick, bridge re-register). A released
+  // subagent-handback gets a `typing…` + pre-turn card the imminent turn
+  // adopts; a no-op for every non-handback inbound (guarded inside the seam).
+  // Emitted BEFORE the delivery-confirm early-return so it fires regardless of
+  // that feature flag. Design lever 1: emit at release, do NOT gate on
+  // turn-in-flight (the common case is a worker finishing while the parent is
+  // mid-turn on another topic).
+  if (HANDBACK_PRETURN_ENABLED) handbackPreturnSignal.noteHandbackRelease(merged)
   if (!DELIVERY_CONFIRM_ENABLED) return
   // The boot-resume synthetic ('resume_interrupted') is the ONE synthetic we DO
   // enrol: a restart can drop it into a not-ready session exactly like a user
@@ -17138,6 +17147,90 @@ function clearActivitySummary(turn: CurrentTurn, finalHtmlOverride?: string | nu
   })
 }
 
+// ─── Sub-agent handback dead-air pre-turn signal ─────────────────────────────
+// Closes the gap between a background sub-agent's handback being RELEASED for
+// delivery (the buffer drain) and the parent turn that consumes it minting +
+// rendering its first tool/narration. On release we emit a `typing…` loop + a
+// "reading the worker's results…" card; the imminent turn ADOPTS that exact
+// card (by inbound identity) so it's one continuous card lifecycle finalized by
+// the turn's normal `clearActivitySummary`, never a second card. See
+// handback-preturn-signal.ts for the design + the red-team holes each lever
+// closes. Kill switch: SWITCHROOM_HANDBACK_PRETURN=0.
+const HANDBACK_PRETURN_ENABLED = !STATIC && process.env.SWITCHROOM_HANDBACK_PRETURN !== '0'
+const HANDBACK_PRETURN_HTML = '🤝 Reading the worker’s results…'
+const HANDBACK_PRETURN_ORPHAN_HTML =
+  '🤝 A background worker finished, but the handback never started — it may need a nudge.'
+
+async function openHandbackPreTurnCard(
+  chatId: string,
+  threadId: number | null,
+): Promise<number | null> {
+  if (STATIC) return null
+  try {
+    const sent = await robustApiCall(
+      // allow-raw-bot-api: sendRichMessage routed through robustApiCall (not in the THREAD_NOT_FOUND blast pattern)
+      () =>
+        bot.api.sendRichMessage(chatId, richMessage(HANDBACK_PRETURN_HTML), {
+          ...(threadId != null ? { message_thread_id: threadId } : {}),
+          disable_notification: true,
+        }),
+      {
+        chat_id: chatId,
+        ...(threadId != null ? { threadId } : {}),
+        verb: 'handback-preturn.send',
+      },
+    )
+    return sent?.message_id ?? null
+  } catch (err) {
+    process.stderr.write(
+      `telegram gateway: handback pre-turn card send failed: ${(err as Error).message}\n`,
+    )
+    return null
+  }
+}
+
+function finalizeHandbackPreTurnCard(record: PreTurnCardRecord): Promise<void> {
+  return robustApiCall(
+    () =>
+      bot.api.editMessageText(
+        record.chatId,
+        record.activityMessageId,
+        richMessage(HANDBACK_PRETURN_ORPHAN_HTML),
+        {},
+      ),
+    {
+      chat_id: record.chatId,
+      ...(record.threadId != null ? { threadId: record.threadId } : {}),
+      verb: 'handback-preturn.orphan-finalize',
+    },
+  )
+    .then(() => undefined)
+    .catch(() => undefined)
+}
+
+const handbackPreturnSignal = createHandbackPreturnSignal({
+  chatKey: (chatId, threadId) => chatKey(chatId, threadId) as string,
+  deriveTurnId: (chatId, threadId, messageId) => deriveTurnId(chatId, threadId, messageId),
+  startTypingLoop: (chatId, threadId) => startTurnTypingLoop(chatId, threadId),
+  stopTypingLoop: (chatId, threadId) => stopTurnTypingLoop(chatId, threadId),
+  openCard: openHandbackPreTurnCard,
+  finalizeCard: finalizeHandbackPreTurnCard,
+  writeCardRecord: (record) => {
+    if (!activityCardPersistEnabled) return
+    writeActivityCardRecord(ACTIVITY_CARD_STORE_PATH, activityCardStoreFs, record)
+  },
+  clearCardRecord: (turnKey, activityMessageId) => {
+    if (!activityCardPersistEnabled) return
+    clearActivityCardRecord(ACTIVITY_CARD_STORE_PATH, activityCardStoreFs, turnKey, activityMessageId)
+  },
+  // Lever 5: never paint a pre-turn card beneath a turn that already delivered
+  // its answer / ended by the time the debounce fires.
+  isTurnSettled: (key) => {
+    const live = currentTurnMap.get(key)
+    return live != null && (live.finalAnswerDelivered || live.endedAt != null)
+  },
+})
+
 /**
  * #2849 hindsight Phase 4 — sparse chat-legible memory.
  *
@@ -17491,6 +17584,27 @@ function handleSessionEvent(ev: SessionEvent): void {
         // Wire the per-turn narrative gate now that `next` exists (its SHOW/RETRACT
         // effects close over the turn). Born with this turn, torn down at turn end.
         next.narrativeGate = makeNarrativeGate(next)
+        // Dead-air pre-turn signal — ADOPT by inbound identity (design lever 2).
+        // If a subagent-handback pre-turn signal was emitted for THIS exact turn
+        // (matched on `turnId`, not the bare topic key, so a racing user inbound
+        // can't mis-adopt), consume it. A card-bearing adoption seeds
+        // `activityMessageId` + `activityEverOpened` so `renderActivityFeed`
+        // EDITS the existing card instead of opening a second one, and so the
+        // turn's own end-of-turn `clearActivitySummary` finalizes it (lever 3).
+        // The handback turn also gets the turn-long typing loop it never had —
+        // whether or not a card was painted (the debounce may not have fired) —
+        // stopped by the canonical turn-end (`purgeReactionTracking →
+        // stopTurnTypingLoop`).
+        if (HANDBACK_PRETURN_ENABLED) {
+          const handbackAdoption = handbackPreturnSignal.tryAdopt(turnId)
+          if (handbackAdoption != null) {
+            if (handbackAdoption.activityMessageId != null) {
+              next.activityMessageId = handbackAdoption.activityMessageId
+              next.activityEverOpened = true
+            }
+            startTurnTypingLoop(ev.chatId, enqThreadIdNum ?? null)
+          }
+        }
         // PR-4e — route the turn-SET through the keyed accessor: flag-OFF assigns
         // the singleton (byte-identical to `currentTurn = next`); flag-ON sets the
         // per-topic `byKey[statusKey]` entry AND the most-recent mirror. The key is
