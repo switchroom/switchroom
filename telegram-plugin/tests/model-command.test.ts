@@ -30,6 +30,7 @@ import {
   isOfflineTrustedModelToken,
   classifyModelSwitchConfirmation,
   parseModelSwitchTarget,
+  modelFamilyToken,
   MODEL_ALIASES,
   type ModelCommandDeps,
 } from "../gateway/model-command.js";
@@ -609,5 +610,54 @@ describe("classifyModelSwitchConfirmation", () => {
       configured: "opus",
     });
     expect(out).toEqual({ kind: "not-applied", target: "fable", revertedTo: "opus" });
+  });
+
+  // LOW-1: an ALIAS target must family-match its RESOLVED full-id revert, so a
+  // `/model sonnet` on a `claude-sonnet-5`-default agent (start.sh wrote the full
+  // id to .active-session-model on a config-changed / proxy-down revert path) is
+  // NOT falsely reported as "sonnet didn't apply". This is the exact case the
+  // reviewer flagged; a naive string compare returns not-applied here.
+  it("family-matches an alias target to its resolved full-id default (sonnet ≡ claude-sonnet-5)", () => {
+    const out = classifyModelSwitchConfirmation({
+      reason: "user: /model sonnet (session-only relaunch)",
+      launched: "claude-sonnet-5",
+      configured: "claude-sonnet-5",
+    });
+    expect(out).toEqual({ kind: "default", launched: "claude-sonnet-5" });
+  });
+
+  it("still flags a genuinely different-family switch that reverted to the full-id default", () => {
+    // /model opus reverting to a claude-sonnet-5 default is a REAL failed switch.
+    const out = classifyModelSwitchConfirmation({
+      reason: "user: /model opus (session-only relaunch)",
+      launched: "claude-sonnet-5",
+      configured: "claude-sonnet-5",
+    });
+    expect(out).toEqual({ kind: "not-applied", target: "opus", revertedTo: "claude-sonnet-5" });
+  });
+
+  it("family-matches a full-id target to the aliased default (claude-opus-4-8 ≡ opus)", () => {
+    const out = classifyModelSwitchConfirmation({
+      reason: "user: /model claude-opus-4-8 (session-only relaunch)",
+      launched: "opus",
+      configured: "opus",
+    });
+    expect(out).toEqual({ kind: "default", launched: "opus" });
+  });
+});
+
+describe("modelFamilyToken", () => {
+  it("reduces a claude full id to its family, dropping version + date", () => {
+    expect(modelFamilyToken("claude-sonnet-5")).toBe("sonnet");
+    expect(modelFamilyToken("claude-opus-4-8")).toBe("opus");
+    expect(modelFamilyToken("claude-haiku-4-5-20251001")).toBe("haiku");
+  });
+  it("passes a bare alias through, lowercased", () => {
+    expect(modelFamilyToken("Sonnet")).toBe("sonnet");
+    expect(modelFamilyToken("fable")).toBe("fable");
+  });
+  it("keeps sr-* routing ids verbatim (no claude- prefix)", () => {
+    expect(modelFamilyToken("sr-glm-5")).toBe("sr-glm-5");
+    expect(modelFamilyToken("sr-gemini-2.5-flash")).toBe("sr-gemini-2.5-flash");
   });
 });

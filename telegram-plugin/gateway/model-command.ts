@@ -127,6 +127,37 @@ export function parseModelSwitchTarget(reason: string): string | null {
 }
 
 /**
+ * Reduce a model token to a comparable FAMILY key so an alias and its resolved
+ * full id compare equal (`sonnet` ≡ `claude-sonnet-5` ≡ `claude-sonnet-5-<date>`).
+ *
+ * This is the normalization the silent-revert classifier needs: `target` from
+ * the clean-shutdown reason is the RAW user token (an alias like `sonnet`),
+ * while `.active-session-model` / the configured default may be the RESOLVED
+ * full id start.sh wrote on a revert-with-alert path (config-default-changed at
+ * start.sh.hbs:1228, proxy-down at :1234). A naive string compare would flag
+ * `/model sonnet` on a `claude-sonnet-5`-default agent as "didn't apply" even
+ * though sonnet IS the default.
+ *
+ * NB `resolveMainModel` (scaffold.ts:1358) is NOT sufficient here — it only
+ * remaps the `default` alias / unset to the switchroom default; it passes
+ * `sonnet`/`opus`/etc. through unchanged. The alias↔full-id equivalence is a
+ * FAMILY reduction (same rule model-label.ts uses one-way), done here:
+ *   - `claude-<family>-…` → `<family>`  (e.g. `claude-sonnet-5` → `sonnet`)
+ *   - a bare alias / any other token     → itself, lowercased (`sonnet`, `sr-glm-5`)
+ * sr-* ids never carry a `claude-` prefix, so they stay verbatim — correct,
+ * since the reason token and `.active-session-model` both hold the same
+ * already-expanded sr-* id and compare equal directly.
+ */
+export function modelFamilyToken(token: string): string {
+  const t = token.trim().toLowerCase()
+  if (t.startsWith('claude-')) {
+    const family = t.slice('claude-'.length).split('-').filter((p) => p.length > 0)[0]
+    return family ?? t
+  }
+  return t
+}
+
+/**
  * Classify a `/model` apply-boot outcome from the post-boot signals. Pure so the
  * confirmation-card decision is unit-testable without booting the gateway. The
  * `not-applied` branch is the fix for the silent-revert bug: a non-default switch
@@ -144,10 +175,13 @@ export function classifyModelSwitchConfirmation(input: {
   // NON-default switch that silently reverted to the configured default.
   const target = parseModelSwitchTarget(reason)
   const revertedTo = launched.length > 0 ? launched : configured
+  // Family-normalize both sides so an alias target (`sonnet`) matches its
+  // resolved full-id revert (`claude-sonnet-5`) — otherwise a `/model sonnet`
+  // that reverted to the sonnet default would emit a WRONG "didn't apply" card.
   if (
     target != null &&
     target.toLowerCase() !== 'default' &&
-    target.toLowerCase() !== revertedTo.toLowerCase()
+    modelFamilyToken(target) !== modelFamilyToken(revertedTo)
   ) {
     return { kind: 'not-applied', target, revertedTo }
   }
