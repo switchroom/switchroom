@@ -31,9 +31,20 @@ import {
   formatBindMountResult,
   probeBrokerUnlocked,
   probeKernelDbDurability,
+  probeGrantsWalDivergence,
+  probeOrphanVaultTokens,
   type BindMountStatResult,
   type BrokerStatResult,
+  type BrokerFileStat,
 } from "./doctor-vault-broker-durability.js";
+import { GRANTS_DB_CONTAINER_PATH } from "../vault/grants-db-path.js";
+import type { SwitchroomConfig } from "../config/schema.js";
+
+function fakeConfig(agents: string[]): SwitchroomConfig {
+  const map: Record<string, unknown> = {};
+  for (const a of agents) map[a] = {};
+  return { agents: map } as unknown as SwitchroomConfig;
+}
 
 describe("probeBindMountInode — inode-equality bind-mount probe", () => {
   it("returns ok when host and broker inodes + sizes match", () => {
@@ -276,5 +287,100 @@ describe("probeKernelDbDurability — approval-kernel approvals bind mount", () 
     });
     expect(r.name).toContain("approval-kernel");
     expect(r.name).toContain("allow_always");
+  });
+});
+
+describe("probeGrantsWalDivergence — WAL checkpoint state (#3289)", () => {
+  const main = GRANTS_DB_CONTAINER_PATH;
+  const wal = `${main}-wal`;
+
+  it("skips when the broker container is unreachable", () => {
+    const r = probeGrantsWalDivergence(() => ({ kind: "unreachable" }));
+    expect(r.status).toBe("skip");
+  });
+
+  it("ok when there is no grants DB yet (empty fleet)", () => {
+    const r = probeGrantsWalDivergence((p) =>
+      p === main ? { kind: "missing" } : { kind: "missing" },
+    );
+    expect(r.status).toBe("ok");
+    expect(r.detail).toContain("no grants DB");
+  });
+
+  it("ok when the -wal sidecar is absent (fully checkpointed)", () => {
+    const r = probeGrantsWalDivergence((p) =>
+      p === main
+        ? { kind: "ok", mtime: 1000, size: 4096 }
+        : { kind: "missing" },
+    );
+    expect(r.status).toBe("ok");
+    expect(r.detail).toContain("no -wal sidecar");
+  });
+
+  it("ok when the -wal is present but truncated to 0 bytes", () => {
+    const r = probeGrantsWalDivergence((p) =>
+      p === main
+        ? { kind: "ok", mtime: 1000, size: 4096 }
+        : { kind: "ok", mtime: 1200, size: 0 },
+    );
+    expect(r.status).toBe("ok");
+    expect(r.detail).toContain("truncated");
+  });
+
+  it("warns when a NON-empty -wal is newer than the main DB (un-checkpointed grants)", () => {
+    const r = probeGrantsWalDivergence((p) =>
+      p === main
+        ? { kind: "ok", mtime: 1000, size: 4096 }
+        : { kind: "ok", mtime: 2000, size: 32768 },
+    );
+    expect(r.status).toBe("warn");
+    expect(r.detail).toContain("un-checkpointed");
+    expect(r.fix).toBeTruthy();
+  });
+
+  it("ok when a non-empty -wal is NOT newer than main", () => {
+    const r = probeGrantsWalDivergence((p): BrokerFileStat =>
+      p === wal
+        ? { kind: "ok", mtime: 500, size: 32768 }
+        : { kind: "ok", mtime: 1000, size: 4096 },
+    );
+    expect(r.status).toBe("ok");
+  });
+});
+
+describe("probeOrphanVaultTokens — #1737 / #3289 orphan-token detector", () => {
+  it("ok when no agent holds a vault-token", () => {
+    const r = probeOrphanVaultTokens(fakeConfig(["a", "b"]), {
+      readTokenId: () => null,
+    });
+    expect(r.status).toBe("ok");
+    expect(r.detail).toContain("nothing to orphan-check");
+  });
+
+  it("ok when every token references a live grant row", () => {
+    const r = probeOrphanVaultTokens(fakeConfig(["a", "b"]), {
+      readTokenId: (agent) => `vg_${agent}id`,
+      grantIdExists: () => true,
+    });
+    expect(r.status).toBe("ok");
+    expect(r.detail).toContain("all reference a live grant");
+  });
+
+  it("FAILS when a token references a grant id absent from the DB", () => {
+    const r = probeOrphanVaultTokens(fakeConfig(["clerk"]), {
+      readTokenId: () => "vg_5e1991",
+      grantIdExists: (id) => id !== "vg_5e1991",
+    });
+    expect(r.status).toBe("fail");
+    expect(r.detail).toContain("clerk=vg_5e1991");
+    expect(r.detail).toContain("DENIES");
+  });
+
+  it("skips when the grants DB can't be read on the host", () => {
+    const r = probeOrphanVaultTokens(fakeConfig(["a"]), {
+      readTokenId: () => "vg_x",
+      grantIdExists: () => null,
+    });
+    expect(r.status).toBe("skip");
   });
 });

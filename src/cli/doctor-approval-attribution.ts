@@ -41,6 +41,7 @@ import { readFileSync as fsReadFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { canonicalizeApproverSet } from "../vault/approvals/canonical.js";
+import { GRANTS_DB_CONTAINER_PATH } from "../vault/grants-db-path.js";
 
 import type { CheckStatus } from "./doctor-status.js";
 
@@ -196,17 +197,16 @@ function parseSqlite3Lines(stdout: string, sep: string): DecisionRow[] {
  * Default loader: read approval_decisions out of vault-grants.db.
  *
  * Primary path — HOST-SIDE bun:sqlite read of the canonical
- * `~/.switchroom/vault-grants.db` (grants-db.ts DEFAULT_GRANTS_DB_PATH):
- * doctor runs on the host, and the broker container merely bind-mounts that
- * same file to `/root/.switchroom/vault-grants.db` (compose.ts — the
- * `${homePrefix}/.switchroom/vault-grants.db:/root/.switchroom/vault-grants.db`
- * mount), so the host file IS the authoritative DB and needs neither docker
- * nor a sqlite3 binary. The built CLI runs under bun (scripts/build.mjs
- * rewrites the shebang to bun precisely because of `bun:sqlite`), so the
- * dynamic import resolves; under vitest/node the `typeof Bun` guard skips it.
+ * `~/.switchroom/vault-broker/vault-grants.db` (grants-db-path.ts
+ * `getGrantsDbPath()`): doctor runs on the host, and the broker container
+ * bind-mounts that directory to `/root/.switchroom/vault-broker` (compose.ts),
+ * so the host file IS the authoritative DB and needs neither docker nor a
+ * sqlite3 binary. The built CLI runs under bun (scripts/build.mjs rewrites the
+ * shebang to bun precisely because of `bun:sqlite`), so the dynamic import
+ * resolves; under vitest/node the `typeof Bun` guard skips it.
  *
  * Fallback — `docker exec switchroom-vault-broker sqlite3` against the
- * IN-CONTAINER path `/root/.switchroom/vault-grants.db`. Best-effort only:
+ * IN-CONTAINER path `GRANTS_DB_CONTAINER_PATH`. Best-effort only:
  * requires sqlite3 in the broker image, and the container name assumes the
  * default compose project prefix ("switchroom-"); a custom prefix makes this
  * fallback miss and the check degrades to `skip`.
@@ -218,10 +218,9 @@ async function defaultLoadDecisions(): Promise<DecisionRow[] | null> {
   // Path 1: direct host-file read via bun:sqlite (readonly).
   try {
     if (typeof Bun !== "undefined") {
-      const os = await import("node:os");
-      const path = await import("node:path");
       const fs = await import("node:fs");
-      const dbPath = path.join(os.homedir(), ".switchroom", "vault-grants.db");
+      const { getGrantsDbPath } = await import("../vault/grants-db-path.js");
+      const dbPath = getGrantsDbPath();
       if (fs.existsSync(dbPath)) {
         const { Database } = await import("bun:sqlite");
         const db = new Database(dbPath, { readonly: true });
@@ -266,7 +265,7 @@ async function defaultLoadDecisions(): Promise<DecisionRow[] | null> {
         "sqlite3",
         "-separator",
         SEP,
-        "/root/.switchroom/vault-grants.db",
+        GRANTS_DB_CONTAINER_PATH,
         DECISIONS_SQL,
       ],
       { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 10_000 },

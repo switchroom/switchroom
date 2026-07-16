@@ -27,8 +27,8 @@
  * Hard rules:
  *   - NEVER copies `~/.switchroom/vault-auto-unlock` (machine-bound; if
  *     leaked, gives the passphrase — and is useless off-host anyway).
- *   - NEVER copies `vault-grants.db` (per-agent grant tokens; different
- *     threat model).
+ *   - NEVER copies the grants DB (`vault-broker/vault-grants.db`; per-agent
+ *     grant tokens; different threat model).
  *   - REFUSES to write backups into a directory that already contains an
  *     `auto-unlock`-shaped sibling — defense-in-depth against an operator
  *     one day pointing `--to ~/.switchroom/` and bulk-syncing the

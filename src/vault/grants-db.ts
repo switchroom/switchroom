@@ -1,26 +1,55 @@
 /**
  * vault/grants-db.ts — open the vault-grants SQLite database.
  *
- * DB path: ~/.switchroom/vault-grants.db (mode 0600, beside vault.enc).
+ * DB path: ~/.switchroom/vault-broker/vault-grants.db (mode 0600).
  * Runs the schema migration on every open (idempotent).
+ *
+ * WHY A DEDICATED DIRECTORY (not the bare `~/.switchroom/vault-grants.db`):
+ * the DB runs in WAL mode, which writes `-wal`/`-shm` sidecars BESIDE the main
+ * file. The broker bind-mounts this DB in; if only the single main file is
+ * mounted, the sidecars land in the container's ephemeral overlayfs, so
+ * committed grants sit in the container-local WAL until a rare checkpoint and
+ * are LOST on container recreate (the v0.13.31 grant-wipe incident, #1737).
+ * Mounting the whole directory keeps the main file AND its sidecars on the
+ * host fs together, so grants survive recreate regardless of checkpoint state.
+ * All readers/writers resolve the path from `getGrantsDbPath()` — never a
+ * duplicated literal.
  *
  * This module is kept separate from grants.ts so callers can inject any
  * Database handle in tests (in-memory), while production always uses this
  * canonical path.
  */
 
-import * as os from "node:os";
 import * as path from "node:path";
 import * as fs from "node:fs";
 import { Database } from "bun:sqlite";
 import { migrateGrantsSchema } from "./grants.js";
 import { migrateApprovalSchema } from "./approvals/schema.js";
+import {
+  GRANTS_DB_DIRNAME,
+  GRANTS_DB_FILENAME,
+  GRANTS_DB_CONTAINER_DIR,
+  GRANTS_DB_CONTAINER_PATH,
+  getGrantsDbDir,
+  getGrantsDbPath,
+  getLegacyGrantsDbPath,
+  migrateLegacyGrantsDbLocation,
+} from "./grants-db-path.js";
 
-export const DEFAULT_GRANTS_DB_PATH = path.join(
-  os.homedir(),
-  ".switchroom",
-  "vault-grants.db",
-);
+// Re-export the pure path + migration helpers so existing `grants-db.js`
+// importers keep working without needing to know about the split.
+export {
+  GRANTS_DB_DIRNAME,
+  GRANTS_DB_FILENAME,
+  GRANTS_DB_CONTAINER_DIR,
+  GRANTS_DB_CONTAINER_PATH,
+  getGrantsDbDir,
+  getGrantsDbPath,
+  getLegacyGrantsDbPath,
+  migrateLegacyGrantsDbLocation,
+};
+
+export const DEFAULT_GRANTS_DB_PATH = getGrantsDbPath();
 
 /**
  * WAL sidecar suffixes that must be quarantined alongside the main DB file.
@@ -167,6 +196,12 @@ export function openGrantsDb(
 ): Database {
   const dir = path.dirname(dbPath);
   fs.mkdirSync(dir, { recursive: true });
+
+  // Boot-time relocation: if a legacy `~/.switchroom/vault-grants.db` still
+  // sits at the old single-file location and nothing has been written to the
+  // new path yet, move it into the dedicated directory before opening. Safe
+  // no-op on greenfield and on already-migrated deployments.
+  migrateLegacyGrantsDbLocation(dbPath);
 
   try {
     return opener(dbPath);

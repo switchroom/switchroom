@@ -1115,31 +1115,39 @@ describe("generateCompose", () => {
     );
   });
 
-  it("broker bind-mounts the host vault-grants.db onto /root/.switchroom/vault-grants.db (#1737 wedge)", () => {
-    // fails when: the broker writes the capability-grants SQLite to a
-    // container-local path that evaporates on recreate. Token files on
-    // disk (~/.switchroom/agents/<agent>/.vault-token) persist via the
-    // per-agent bind mounts and reference grant IDs that no longer
-    // exist in the fresh broker DB — every `switchroom vault get` from
-    // inside an agent container returns
-    // `VAULT-BROKER-DENIED [DENIED]: key 'X' not in ACL for agent 'Y'`
-    // because the #1496 fall-through routes the unusable token to the
-    // standing schedule.secrets ACL, which usually denies (the whole
-    // reason a grant was minted in the first place).
+  it("broker bind-mounts the host vault-broker DIRECTORY onto /root/.switchroom/vault-broker (#1737 / #3289 WAL durability)", () => {
+    // fails when: the broker writes the capability-grants SQLite (and its
+    // WAL sidecars) to a container-local path that evaporates on recreate.
+    // Token files on disk (~/.switchroom/agents/<agent>/.vault-token) persist
+    // via the per-agent bind mounts and reference grant IDs that no longer
+    // exist in the fresh broker DB — every `switchroom vault get` from inside
+    // an agent container returns `VAULT-BROKER-DENIED [DENIED]: key 'X' not in
+    // ACL for agent 'Y'` because the #1496 fall-through routes the unusable
+    // token to the standing schedule.secrets ACL, which usually denies (the
+    // whole reason a grant was minted in the first place).
     //
-    // Surfaced 2026-05-24 when clerk's vg_5e1991 grant for
-    // `ha/access-token` disappeared after the v0.13.31 broker recreate.
-    // The doctor probe doesn't catch it — doctor only inspects path-
-    // as-identity ACL, not grant-based access.
+    // #3289: the mount is now the whole `vault-broker` DIRECTORY (not the bare
+    // `vault-grants.db` file) so the WAL `-wal`/`-shm` sidecars persist on the
+    // host fs alongside the main DB. Mounting only the single file left the
+    // sidecars in the container's ephemeral overlayfs, so committed grants sat
+    // in the container-local WAL until a rare checkpoint and were lost on
+    // recreate.
+    //
+    // Surfaced 2026-05-24 when clerk's vg_5e1991 grant for `ha/access-token`
+    // disappeared after the v0.13.31 broker recreate.
     //
     // Mount is RW (not :ro) because the broker writes new rows on every
-    // mint_grant call; `ensureHostMountSources()` in apply.ts pre-
-    // creates the source file mode 0600 (secrets material) so docker
-    // doesn't auto-create a directory at the mount path.
+    // mint_grant call; `ensureHostMountSources()` in apply.ts pre-creates the
+    // source DIRECTORY mode 0700 (secrets material) so docker doesn't
+    // auto-create a root-owned path at the mount source.
     const out = generateCompose({ config: makeConfig({ a: {} }) });
     const block = /vault-broker:[\s\S]*?(?=\n  [a-z])/.exec(out)?.[0] ?? "";
     expect(block).toMatch(
-      /-\s+\$\{HOME\}\/\.switchroom\/vault-grants\.db:\/root\/\.switchroom\/vault-grants\.db(?!:ro)/,
+      /-\s+\$\{HOME\}\/\.switchroom\/vault-broker:\/root\/\.switchroom\/vault-broker(?!:ro)/,
+    );
+    // And the OLD single-file mount must be gone (regression guard for #3289).
+    expect(block).not.toMatch(
+      /vault-grants\.db:\/root\/\.switchroom\/vault-grants\.db/,
     );
   });
 

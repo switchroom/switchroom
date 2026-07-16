@@ -45,12 +45,19 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, statSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { createRequire } from "node:module";
 
 import type { SwitchroomConfig } from "../config/schema.js";
 import type { CheckResult } from "./doctor.js";
+import {
+  GRANTS_DB_CONTAINER_DIR,
+  GRANTS_DB_CONTAINER_PATH,
+  getGrantsDbDir,
+  getGrantsDbPath,
+} from "../vault/grants-db-path.js";
 
 /**
  * Result of a single `docker exec`-based stat probe: host inode/size
@@ -332,6 +339,9 @@ export function runVaultBrokerDurabilityChecks(
     inodeProbe?: typeof probeBindMountInode;
     statusProbe?: Parameters<typeof probeBrokerUnlocked>[0];
     kernelStatBroker?: (p: string) => BrokerStatResult;
+    walStatBroker?: (p: string) => BrokerFileStat;
+    grantIdExists?: (id: string) => boolean | null;
+    readTokenId?: (agent: string, home: string) => string | null;
   },
 ): CheckResult[] {
   const home = homedir();
@@ -351,14 +361,17 @@ export function runVaultBrokerDurabilityChecks(
       ),
     ),
     formatBindMountResult(
-      "vault-broker: vault-grants.db bind mount (#1737)",
-      join(home, ".switchroom", "vault-grants.db"),
-      "/root/.switchroom/vault-grants.db",
-      probe(
-        join(home, ".switchroom", "vault-grants.db"),
-        "/root/.switchroom/vault-grants.db",
-      ),
+      "vault-broker: vault-grants dir bind mount (#1737 / #3289)",
+      getGrantsDbDir(home),
+      GRANTS_DB_CONTAINER_DIR,
+      probe(getGrantsDbDir(home), GRANTS_DB_CONTAINER_DIR),
     ),
+    probeGrantsWalDivergence(opts?.walStatBroker),
+    probeOrphanVaultTokens(_config, {
+      home,
+      grantIdExists: opts?.grantIdExists,
+      readTokenId: opts?.readTokenId,
+    }),
     formatBindMountResult(
       "vault-broker: vault-audit.log bind mount (#1025)",
       join(home, ".switchroom", "vault-audit.log"),
@@ -475,6 +488,207 @@ function defaultKernelStatBroker(p: string): BrokerStatResult {
     };
   }
   return { kind: "ok-with-stat", ino: inoStr, size };
+}
+
+/**
+ * Broker-side stat of a single file: mtime (epoch seconds) + size, or a
+ * failure shape. Used by the WAL-divergence probe.
+ */
+export type BrokerFileStat =
+  | { kind: "ok"; mtime: number; size: number }
+  | { kind: "missing" }
+  | { kind: "unreachable" }
+  | { kind: "failed"; msg: string };
+
+function defaultWalStatBroker(p: string): BrokerFileStat {
+  // `docker exec switchroom-vault-broker stat -c '%Y %s' <path>` →
+  // "<mtime-epoch> <size>". Exit 1 = path missing; ≥125 = unreachable.
+  try {
+    const stdout = execFileSync(
+      "docker",
+      ["exec", "switchroom-vault-broker", "stat", "-c", "%Y %s", p],
+      { stdio: ["ignore", "pipe", "pipe"], timeout: 3000, encoding: "utf8" },
+    );
+    const [mStr, sStr] = stdout.trim().split(/\s+/);
+    const mtime = Number(mStr);
+    const size = Number(sStr);
+    if (!Number.isFinite(mtime) || !Number.isFinite(size)) {
+      return { kind: "failed", msg: `unparseable stat output: ${stdout.trim()}` };
+    }
+    return { kind: "ok", mtime, size };
+  } catch (err: unknown) {
+    const e = err as { status?: number; stderr?: string; message?: string };
+    if (typeof e.status !== "number") return { kind: "unreachable" };
+    if (e.status >= 125) return { kind: "unreachable" };
+    // exit 1 from `stat` on a non-existent path
+    return { kind: "missing" };
+  }
+}
+
+/**
+ * Flag WAL divergence inside the broker container: a `-wal` sidecar that is
+ * non-empty AND newer than the main DB file means committed grants are sitting
+ * in the write-ahead log that has not been checkpointed back into the main
+ * file. Post-#3289 the whole grants directory is persisted so this is no
+ * longer a data-loss condition on its own, but a persistently non-empty WAL
+ * means the checkpoint-after-every-mutation defense (grants.ts) is not firing
+ * — worth surfacing, and it is the exact signal the host-side readers (doctor,
+ * migration) depend on the main file being current for.
+ *
+ * @internal exported for testing
+ */
+export function probeGrantsWalDivergence(
+  statBroker: (p: string) => BrokerFileStat = defaultWalStatBroker,
+): CheckResult {
+  const name = "vault-broker: grants WAL checkpointed (#3289)";
+  const main = statBroker(GRANTS_DB_CONTAINER_PATH);
+  if (main.kind === "unreachable") {
+    return { name, status: "skip", detail: "vault-broker container unreachable" };
+  }
+  if (main.kind === "missing") {
+    // No DB yet (empty fleet) — nothing to diverge.
+    return { name, status: "ok", detail: "no grants DB yet — nothing to checkpoint" };
+  }
+  if (main.kind === "failed") {
+    return { name, status: "warn", detail: `broker stat failed: ${main.msg}` };
+  }
+  const wal = statBroker(`${GRANTS_DB_CONTAINER_PATH}-wal`);
+  if (wal.kind === "missing") {
+    return { name, status: "ok", detail: "no -wal sidecar — grants DB fully checkpointed" };
+  }
+  if (wal.kind === "unreachable") {
+    return { name, status: "skip", detail: "vault-broker container unreachable" };
+  }
+  if (wal.kind === "failed") {
+    return { name, status: "warn", detail: `broker -wal stat failed: ${wal.msg}` };
+  }
+  if (wal.size === 0) {
+    return { name, status: "ok", detail: "-wal is truncated (0 bytes) — checkpointed" };
+  }
+  if (wal.mtime > main.mtime) {
+    return {
+      name,
+      status: "warn",
+      detail:
+        `-wal (${wal.size} bytes, mtime ${wal.mtime}) is newer than the main DB ` +
+        `(mtime ${main.mtime}) — un-checkpointed grant writes are sitting in the ` +
+        `write-ahead log. The grants directory is bind-mounted so these persist ` +
+        `across container recreate, but the checkpoint-after-mutation defense ` +
+        `(grants.ts) appears not to be firing.`,
+      fix:
+        "Verify the broker is running the #3289 build (checkpoint after every " +
+        "mint/revoke). A one-off `PRAGMA wal_checkpoint(TRUNCATE)` clears the backlog.",
+    };
+  }
+  return { name, status: "ok", detail: `-wal present (${wal.size} bytes) but not newer than main DB` };
+}
+
+/**
+ * Flag any agent `.vault-token` on disk whose grant id has NO matching row in
+ * the grants DB — the exact #1737 / #3289 orphan-token symptom that appears
+ * after a broker recreate wipes grants written to an ephemeral (unmounted or
+ * un-checkpointed) DB. The token still authenticates format-wise but every
+ * `vault get` DENIES because the grant it references is gone.
+ *
+ * @internal exported for testing
+ */
+export function probeOrphanVaultTokens(
+  config: SwitchroomConfig,
+  opts?: {
+    home?: string;
+    readTokenId?: (agent: string, home: string) => string | null;
+    grantIdExists?: (id: string) => boolean | null;
+  },
+): CheckResult {
+  const name = "vault-broker: no orphan .vault-token grants (#1737 / #3289)";
+  const home = opts?.home ?? homedir();
+  const agents = Object.keys(config.agents ?? {});
+  const readTokenId = opts?.readTokenId ?? defaultReadTokenId;
+  const grantIdExists = opts?.grantIdExists ?? defaultGrantIdExists;
+
+  const tokens: { agent: string; id: string }[] = [];
+  for (const agent of agents) {
+    const id = readTokenId(agent, home);
+    if (id) tokens.push({ agent, id });
+  }
+  if (tokens.length === 0) {
+    return { name, status: "ok", detail: "no agent holds a vault-token — nothing to orphan-check" };
+  }
+
+  const orphans: { agent: string; id: string }[] = [];
+  for (const t of tokens) {
+    const exists = grantIdExists(t.id);
+    if (exists === null) {
+      return {
+        name,
+        status: "skip",
+        detail: "grants DB not readable on host — orphan-token check skipped",
+      };
+    }
+    if (!exists) orphans.push(t);
+  }
+
+  if (orphans.length === 0) {
+    return {
+      name,
+      status: "ok",
+      detail: `${tokens.length} vault-token(s) all reference a live grant row`,
+    };
+  }
+  return {
+    name,
+    status: "fail",
+    detail:
+      `${orphans.length} agent vault-token(s) reference a grant id absent from the ` +
+      `grants DB: ${orphans.map((o) => `${o.agent}=${o.id}`).join(", ")}. ` +
+      `This is the classic broker-recreate grant-wipe: every \`vault get\` from ` +
+      `these agents DENIES because the grant no longer exists.`,
+    fix:
+      "Re-mint the grants (`switchroom vault grant <agent> --keys …`). If this " +
+      "recurs after a broker recreate, the grants directory bind mount is broken " +
+      "— see the `vault-grants dir bind mount` probe above.",
+  };
+}
+
+function defaultReadTokenId(agent: string, home: string): string | null {
+  const tokenPath = join(home, ".switchroom", "agents", agent, ".vault-token");
+  try {
+    const raw = readFileSync(tokenPath, "utf8").trim();
+    if (!raw) return null;
+    // Token format: `vg_<id>.<secret>` — the grant id is everything before the
+    // first dot (it includes the `vg_` prefix, matching the DB row id).
+    const dot = raw.indexOf(".");
+    const id = dot === -1 ? raw : raw.slice(0, dot);
+    return id.startsWith("vg_") ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Host-side readonly lookup of a grant id in the grants DB. Returns null when
+ * the DB can't be read (no Bun runtime under vitest, missing file) so the
+ * caller degrades to `skip` rather than a false `fail`.
+ */
+function defaultGrantIdExists(id: string): boolean | null {
+  try {
+    if (typeof (globalThis as { Bun?: unknown }).Bun === "undefined") return null;
+    const dbPath = getGrantsDbPath();
+    if (!existsSync(dbPath)) return null;
+    const req = createRequire(import.meta.url);
+    const { Database } = req("bun:sqlite") as typeof import("bun:sqlite");
+    const db = new Database(dbPath, { readonly: true });
+    try {
+      const row = db
+        .query("SELECT 1 AS ok FROM vault_grants WHERE id = ? AND revoked_at IS NULL")
+        .get(id);
+      return !!row;
+    } finally {
+      db.close();
+    }
+  } catch {
+    return null;
+  }
 }
 
 function probeAutoUnlockBlob(home: string): CheckResult {

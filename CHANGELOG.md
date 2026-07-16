@@ -10,6 +10,20 @@
   `agent logs` now defaults to the last 50 lines (cap 1000) instead of
   dumping the entire log, and `-f` starts from a 50-line backlog before
   streaming.
+- **Vault grants survive broker container recreate** (#3289) — the
+  capability-grants SQLite DB is now mounted into the vault-broker as a
+  dedicated `~/.switchroom/vault-broker/` DIRECTORY instead of a single
+  file, so the WAL `-wal`/`-shm` sidecars persist on the host fs alongside
+  the main DB. Previously the sidecars landed in the container's ephemeral
+  overlayfs and committed grants sat in the container-local WAL until a rare
+  checkpoint — a broker recreate discarded them (the v0.13.31 grant-wipe
+  class). Belt-and-braces: every mint/revoke now runs `PRAGMA
+  wal_checkpoint(TRUNCATE)` so the main file is always current for host-side
+  readers, and `switchroom apply` / broker boot idempotently relocates any
+  legacy `~/.switchroom/vault-grants.db` (plus its sidecars) into the new
+  directory. Two new doctor probes flag a persistently un-checkpointed WAL
+  inside the broker and any agent `.vault-token` referencing a grant id
+  absent from the DB (the orphan-token symptom).
 
 ## v0.18.27 — Steadier Telegram cards and more reliable model switching
 
