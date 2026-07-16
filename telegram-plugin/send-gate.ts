@@ -265,21 +265,30 @@ export interface SendGateConfig {
   /** Minimum ms between edits of the same message_id. Default 1500. */
   editFloorMs?: number
   /**
-   * Long-horizon per-message edit budget (rolling window). BACKSTOP for the
-   * sustained same-message edit flood: the 1.5s `editFloorMs` spacing floor
-   * bounds burst rate but NOT a steady sub-1/s stream — a card re-edited every
-   * ~3s for a whole worker run sails through the floor yet accumulates into
-   * Telegram's hidden per-message sustained-edit flood counter (finn incident:
-   * 26,460 clock-only worker-card edits → ~88min 429 ban). This caps a SINGLE
-   * message to at most `perMessageEditMaxPerWindow` edits per
+   * Long-horizon per-message edit budget (rolling window). DEFENSE-IN-DEPTH
+   * backstop for a runaway same-message edit stream (finn incident: sustained
+   * worker-card clock-only edits → ~88min 429 ban). It caps a SINGLE message to
+   * at most `perMessageEditMaxPerWindow` cosmetic edits per
    * `perMessageEditWindowMs`; beyond that the driver DEFERS the next edit until
    * the window slides, and newer edits coalesce (last-write-wins) onto the
-   * pending slot in the meantime — so a runaway stream is paced + collapsed
-   * rather than sustained. Scoped strictly to `cosmetic`-class edits of the
-   * SAME `${chat_id}:${messageId}` (worker-feed, typing, reactions); `useful` /
-   * `critical` edits and all non-edit sends are untouched, and distinct
-   * messages each get their own budget. Default: 12 edits / 60_000ms (1 per 5s
-   * sustained — well above legitimate substantive update cadence). Set
+   * pending slot in the meantime — so a runaway is paced + collapsed rather than
+   * sustained.
+   *
+   * IMPORTANT — this is a coarse rate ceiling, NOT the primary fix. The gate
+   * cannot tell a SUBSTANTIVE cosmetic edit (a new worker step) from an
+   * elapsed-clock cosmetic edit; both carry a changed payload. So the primary
+   * cure for the clock-churn flood is at the source (`worker-activity-feed.ts`
+   * suppresses elapsed-only edits via a substance signature), and THIS backstop
+   * must sit ABOVE legitimate substantive cadence so it never throttles real
+   * updates. The worker feed's own min-edit interval is 2500ms (≤24 edits/min);
+   * the default here — 150 edits / 300_000ms ⟹ a 30 edits/min sustained ceiling
+   * — sits above that, so a normal (even continuously-updating) card never
+   * binds, while a stream that sustains faster than the feed's throttle for
+   * minutes (e.g. a future regression re-introducing per-tick churn, or a
+   * lowered floor) is paced back to 30/min. Scoped strictly to `cosmetic`-class
+   * edits of the SAME `${chat_id}:${messageId}` (worker-feed, typing,
+   * reactions); `useful` / `critical` edits and all non-edit sends are
+   * untouched, and distinct messages each get their own budget. Set
    * `perMessageEditMaxPerWindow: 0` to disable the backstop.
    */
   perMessageEditWindowMs?: number
@@ -554,9 +563,14 @@ export const SEND_GATE_DEFAULTS = {
   /** Minimum ms between edits of the same message_id. */
   editFloorMs: 1500,
   /** Long-horizon per-message edit budget: rolling window length (ms). */
-  perMessageEditWindowMs: 60_000,
-  /** Long-horizon per-message edit budget: max cosmetic edits per window. */
-  perMessageEditMaxPerWindow: 12,
+  perMessageEditWindowMs: 300_000,
+  /**
+   * Long-horizon per-message edit budget: max cosmetic edits per window.
+   * 150 / 300s ⟹ a 30 edits/min sustained ceiling — above the worker feed's
+   * own 24/min cadence so legitimate substantive updates never bind (see the
+   * SendGateConfig field doc).
+   */
+  perMessageEditMaxPerWindow: 150,
 } as const
 
 export function createSendGate(config: SendGateConfig): SendGate {

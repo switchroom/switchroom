@@ -137,8 +137,8 @@ describe('send-gate: SEND_GATE_DEFAULTS (compile-time default PIN)', () => {
       perGroupPerMin: 18,
       perGroupBurst: 2,
       editFloorMs: 1500,
-      perMessageEditWindowMs: 60_000,
-      perMessageEditMaxPerWindow: 12,
+      perMessageEditWindowMs: 300_000,
+      perMessageEditMaxPerWindow: 150,
     })
   })
 })
