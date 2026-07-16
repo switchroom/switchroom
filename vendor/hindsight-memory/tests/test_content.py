@@ -585,10 +585,31 @@ class TestPrepareRetentionTranscript:
 
 
 class TestFormatCurrentTime:
-    def test_includes_utc_suffix(self):
-        # The "UTC" suffix prevents client LLMs from misreading the
-        # timestamp as local time.
-        assert format_current_time().endswith(" UTC")
+    # switchroom #tz-fix: recall's "Current time - …" line now renders the
+    # agent's LOCAL wall clock in am/pm, NOT UTC — it was the strongest of
+    # several competing UTC "now" strings the model saw each turn.
+    def test_local_am_pm_shape(self, monkeypatch):
+        # A real IANA zone → am/pm form with the zone abbreviation, no "UTC".
+        monkeypatch.setenv("SWITCHROOM_TIMEZONE", "Australia/Melbourne")
+        monkeypatch.delenv("TZ", raising=False)
+        out = format_current_time()
+        # e.g. "2026-07-16 04:09 PM AEST" / "… AEDT" (DST) — abbrev is 3-5 alpha.
+        assert re.fullmatch(
+            r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} (?:AM|PM) [A-Za-z]{2,5}", out
+        ), out
 
-    def test_format_shape(self):
-        assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC", format_current_time())
+    def test_never_emits_utc_current_time(self, monkeypatch):
+        # The whole point of the fix: no UTC "current time" for a real zone.
+        monkeypatch.setenv("SWITCHROOM_TIMEZONE", "Australia/Melbourne")
+        monkeypatch.delenv("TZ", raising=False)
+        out = format_current_time()
+        assert "UTC" not in out
+        assert not out.endswith("Z")
+
+    def test_am_pm_when_no_zone_configured(self, monkeypatch):
+        # No SWITCHROOM_TIMEZONE / TZ → still am/pm shape (process-local clock),
+        # never the old "%Y-%m-%d %H:%M UTC" 24h form.
+        monkeypatch.delenv("SWITCHROOM_TIMEZONE", raising=False)
+        monkeypatch.delenv("TZ", raising=False)
+        out = format_current_time()
+        assert re.match(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} (?:AM|PM)", out), out

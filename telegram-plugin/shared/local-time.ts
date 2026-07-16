@@ -67,3 +67,53 @@ export function tzAbbrev(ms: number, tz: string): string {
       .find((p) => p.type === 'timeZoneName')?.value ?? tz
   )
 }
+
+/**
+ * Resolve the agent's configured timezone from the process environment, the
+ * SAME cascade `bin/timezone-hook.sh` and the config resolver use:
+ * `SWITCHROOM_TIMEZONE` → `TZ` → `UTC`. Centralised so the inbound-tag,
+ * forwarded_date, and recent-buffer callsites can't drift.
+ */
+export function resolveEnvTimezone(env: NodeJS.ProcessEnv = process.env): string {
+  return env.SWITCHROOM_TIMEZONE ?? env.TZ ?? 'UTC'
+}
+
+/**
+ * Full model-facing local wall-clock stamp, e.g.
+ * `Thursday 2026-07-16 04:09 PM AEST`.
+ *
+ * The deterministic replacement for the UTC ISO strings the model used to see
+ * on inbound channel tags (`ts="…Z"`), `forwarded_date`, and the
+ * `get_recent_messages` buffer. am/pm form in the agent's CONFIGURED timezone,
+ * with NO "UTC" / trailing-Z — so the LLM can never read one of these as UTC
+ * "now" and reason an offset wrong.
+ *
+ * Format mirrors `bin/timezone-hook.sh`'s `%A %Y-%m-%d %I:%M %p %Z` so the
+ * inbound-tag time and the UserPromptSubmit local-time hint read identically.
+ *
+ * Pure / total: an invalid IANA `tz` (misconfigured agent) degrades to the
+ * same am/pm shape rendered in UTC rather than throwing out of the inbound
+ * path — a bad zone must never crash a turn.
+ */
+export function fmtLocalStamp(ms: number, tz: string): string {
+  try {
+    const at = new Date(ms)
+    const weekday = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz,
+      weekday: 'long',
+    }).format(at)
+    // localDay (en-CA) yields YYYY-MM-DD and throws first on a bad zone.
+    const date = localDay(ms, tz)
+    const time = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz,
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: true,
+    }).format(at) // "04:09 PM"
+    return `${weekday} ${date} ${time} ${tzAbbrev(ms, tz)}`
+  } catch {
+    // Invalid IANA zone — degrade to am/pm in UTC rather than crash the turn.
+    if (tz !== 'UTC') return fmtLocalStamp(ms, 'UTC')
+    return new Date(ms).toISOString()
+  }
+}

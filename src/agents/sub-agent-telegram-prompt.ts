@@ -18,6 +18,44 @@
  */
 
 /**
+ * Deterministic local-time guidance injected into every dispatched sub-agent's
+ * prompt.
+ *
+ * The `bin/timezone-hook.sh` UserPromptSubmit hook that gives the MAIN session
+ * its per-turn local-time hint does NOT fire for Task-tool sub-agents — so a
+ * worker / researcher / reviewer otherwise has no local-time anchor at all.
+ *
+ * IMPORTANT — why a resolved zone + directive, NOT a baked wall-clock:
+ * this block lands in the sub-agent's `.md` definition, which is written ONCE
+ * at scaffold/reconcile time (see scaffold.ts), not per dispatch. A literal
+ * timestamp here would freeze at apply time and read hours/days stale on every
+ * later dispatch — worse than no hint. Instead we pin the agent's resolved IANA
+ * timezone and tell the sub-agent the container clock is ALREADY local — so
+ * `date` / `Date.now()` yield correct local time and the sub-agent must never
+ * treat UTC as "now". Deterministic (enforced by the TZ env compose.ts bakes
+ * in) and never stale.
+ *
+ * `tz` is the agent's RESOLVED IANA zone (via `resolveTimezone(config, agent)`
+ * — the same cascade the runtime uses). It must be passed explicitly: this
+ * runs at apply time on the HOST, whose `process.env.TZ` is the host zone, NOT
+ * necessarily the per-agent configured zone — so reading the ambient env here
+ * would bake the wrong zone into a fleet with per-agent timezones.
+ */
+export function buildSubAgentLocalTimeLine(tz: string): string {
+  return `\n\n## Local time\n\nThis agent's configured timezone is **${tz}**, and the container clock is ALREADY set to it (the \`TZ\` env is wired at apply time). So the system clock is local time, not UTC: \`date\` in a shell and \`Date.now()\` in code both yield correct **local** time in \`${tz}\`. When you report or reason about the current time, "how long ago" something was, or scheduling, treat the local wall clock as "now" — never assume or emit UTC. If you need a fresh timestamp, read it live (e.g. run \`date '+%A %Y-%m-%d %I:%M %p %Z'\`) rather than guessing.\n`;
+}
+
+/**
+ * Append the deterministic local-time guidance to a sub-agent prompt body.
+ * Always applied (unlike the Telegram progress guidance, which is gated on a
+ * chat surface) — every sub-agent, Telegram-rooted or not, needs a local-time
+ * anchor. `tz` is the agent's resolved IANA timezone (see above).
+ */
+export function applySubAgentLocalTimeGuidance(body: string, tz: string): string {
+  return body + buildSubAgentLocalTimeLine(tz);
+}
+
+/**
  * Returns true when the agent is wired up with a Telegram channel and
  * we have at least one chat to address. Used as the precondition for
  * appending Telegram progress guidance to a sub-agent prompt.

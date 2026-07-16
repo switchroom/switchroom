@@ -19,6 +19,8 @@
  * authenticated identity.
  */
 
+import { fmtLocalStamp, resolveEnvTimezone } from '../shared/local-time.js'
+
 import type { MessageOrigin } from 'grammy/types'
 import { escapeXmlAttribute } from '../steering.js'
 
@@ -222,7 +224,13 @@ export function buildForwardOriginMeta(
     out[`forwarded_from_type${suffix}`] = o.type
     if (o.id != null) out[`forwarded_from_id${suffix}`] = String(o.id)
     if (o.date != null) {
-      out[`forwarded_date${suffix}`] = new Date(o.date * 1000).toISOString()
+      // Model-facing channel attribute — render the agent's LOCAL am/pm
+      // wall-clock (NOT UTC ISO) so it never competes with the local-time
+      // hint. The machine/storage copy stays ISO via `forwardOriginDateIso`.
+      out[`forwarded_date${suffix}`] = fmtLocalStamp(
+        o.date * 1000,
+        resolveEnvTimezone(),
+      )
     }
   })
   return out

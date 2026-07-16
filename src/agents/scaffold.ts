@@ -631,7 +631,7 @@ import { shouldEmitGdriveMcp } from "../config/google-workspace-acl.js";
 import { shouldEmitMs365Mcp } from "../config/microsoft-workspace-acl.js";
 import { shouldEmitNotionMcp } from "../config/notion-workspace-acl.js";
 import { reconcileAgentDefaultSkills } from "./reconcile-default-skills.js";
-import { applyTelegramProgressGuidance } from "./sub-agent-telegram-prompt.js";
+import { applyTelegramProgressGuidance, applySubAgentLocalTimeGuidance } from "./sub-agent-telegram-prompt.js";
 import type { McpServerConfig } from "../memory/hindsight.js";
 import { createBank, updateBankMissions, ensureDeclaredMentalModels, DEFAULT_RETAIN_MISSION, resolveBankMissionExtras, isHindsightEnabled } from "../memory/hindsight.js";
 import { loadTopicState } from "../telegram/state.js";
@@ -4700,10 +4700,16 @@ export function scaffoldAgent(
       // a switchroom-scaffolded agent (which always has a Telegram surface).
       // The actual gate is `defaultChatId` — when there's no userId we skip
       // the addendum cleanly inside `applyTelegramProgressGuidance`.
-      const body = applyTelegramProgressGuidance(rawBody, {
-        telegramEnabled: true,
-        defaultChatId: userId,
-      });
+      const body = applySubAgentLocalTimeGuidance(
+        applyTelegramProgressGuidance(rawBody, {
+          telegramEnabled: true,
+          defaultChatId: userId,
+        }),
+        // switchroomConfig is optional on scaffoldAgent; resolveTimezone reads
+        // agentConfig.timezone first, then config.switchroom?.timezone (safely
+        // optional-chained), so an empty stand-in is sound when it's absent.
+        resolveTimezone(switchroomConfig ?? ({} as SwitchroomConfig), agentConfig),
+      );
       const content = `---\n${fmLines}\n---\n\n${body}\n`;
       writeFileSyncIfChanged(mdPath, content);
     }
@@ -6656,10 +6662,13 @@ function reconcileAgentInner(
           })
           .join("\n");
         const rawBody = saDef.prompt ?? `You are the ${saName} sub-agent.`;
-        const body = applyTelegramProgressGuidance(rawBody, {
-          telegramEnabled: true,
-          defaultChatId: greetingUserId,
-        });
+        const body = applySubAgentLocalTimeGuidance(
+          applyTelegramProgressGuidance(rawBody, {
+            telegramEnabled: true,
+            defaultChatId: greetingUserId,
+          }),
+          resolveTimezone(switchroomConfig, agentConfig),
+        );
         const content = `---\n${fmLines}\n---\n\n${body}\n`;
         const before = existsSync(mdPath) ? readFileSync(mdPath, "utf-8") : "";
         if (content !== before) {

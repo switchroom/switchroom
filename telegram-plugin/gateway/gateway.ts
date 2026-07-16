@@ -102,6 +102,7 @@ import {
   forwardOriginDateIso,
   type ForwardOriginInfo,
 } from './forward-origin.js'
+import { fmtLocalStamp, resolveEnvTimezone } from '../shared/local-time.js'
 import { StatusReactionController } from '../status-reactions.js'
 import { DeferredDoneReactions } from '../reaction-defer.js'
 import { createWorkerActivityFeed, isWorkerActivityFeedEnabled } from '../worker-activity-feed.js'
@@ -16219,7 +16220,10 @@ async function executeGetRecentMessages(args: Record<string, unknown>): Promise<
   const summary = rows
     .map(r => {
       const who = r.role === 'user' ? r.user ?? 'user' : 'assistant'
-      const time = new Date(r.ts * 1000).toISOString()
+      // Local am/pm wall-clock (NOT UTC ISO) — this buffer is read straight
+      // into the model's context via get_recent_messages, so every timestamp
+      // it shows must be local to avoid competing with the local-time hint.
+      const time = fmtLocalStamp(r.ts * 1000, resolveEnvTimezone())
       const attach = r.attachment_kind ? ` [${r.attachment_kind}]` : ''
       // Match server.ts get_recent_messages format exactly — both code paths
       // serve the same MCP tool, so the agent's parsing must not depend on
@@ -21215,7 +21219,11 @@ async function handleInbound(
       ...(msgId != null ? { message_id: String(msgId) } : {}),
       user: displayUser,
       user_id: String(from.id),
-      ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+      // Model-facing `ts="…"` on the inbound <channel> tag. Rendered as the
+      // agent's LOCAL am/pm wall-clock (NOT UTC ISO) so the model never reads
+      // a competing UTC "now" — the numeric epoch survives on InboundMessage.ts
+      // (above) and in the SQLite history for any machine consumer.
+      ts: fmtLocalStamp((ctx.message?.date ?? 0) * 1000, resolveEnvTimezone()),
       ...(messageThreadId != null ? { message_thread_id: String(messageThreadId) } : {}),
       // Component 3 — origin turn id. The model is told to pass this back
       // as origin_turn_id on the reply so the answer routes to the topic

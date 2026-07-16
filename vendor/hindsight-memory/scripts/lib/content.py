@@ -8,8 +8,14 @@ truncateRecallQuery, sliceLastTurnsByUserBoundary, prepareRetentionTranscript,
 formatMemories.
 """
 
+import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime
+
+try:  # Python 3.9+; present in every switchroom agent image.
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover - defensive only
+    ZoneInfo = None  # type: ignore[assignment,misc]
 
 # ---------------------------------------------------------------------------
 # Memory tag stripping (anti-feedback-loop)
@@ -254,16 +260,44 @@ def format_memories(results: list) -> str:
     return "\n\n".join(lines)
 
 
-def format_current_time() -> str:
-    """Format current UTC time for recall context.
+def _resolve_agent_timezone() -> str:
+    """Resolve the agent's configured IANA timezone.
 
-    The "UTC" suffix is explicit so client LLMs do not misread the
-    value as local time when reasoning about wall-clock context.
+    Mirrors the switchroom cascade used by ``bin/timezone-hook.sh`` and
+    ``src/config/timezone.ts``: ``SWITCHROOM_TIMEZONE`` → ``TZ`` → ``UTC``.
+    This recall hook runs as a plugin subprocess INSIDE the agent container,
+    so it inherits both env vars (compose.ts bakes them onto the container).
+    """
+    return os.environ.get("SWITCHROOM_TIMEZONE") or os.environ.get("TZ") or "UTC"
+
+
+def format_current_time() -> str:
+    """Format the current time in the agent's LOCAL timezone for recall context.
+
+    Switchroom #tz-fix: previously this emitted ``"%Y-%m-%d %H:%M UTC"``, the
+    STRONGEST of several competing UTC "current time" strings the model saw
+    each turn — it fought the single correct local-time hint and made agents
+    intermittently report UTC / wrong-offset times. We now render the agent's
+    LOCAL wall clock in am/pm form (e.g. ``2026-07-16 04:09 PM AEST``) so the
+    recall block never injects a UTC "now". Deterministic — the timezone comes
+    from the container env, not model discipline.
 
     Port of: formatCurrentTimeForRecall() in index.js
     """
-    now = datetime.now(timezone.utc)
-    return now.strftime("%Y-%m-%d %H:%M UTC")
+    tz_name = _resolve_agent_timezone()
+    now = None
+    if ZoneInfo is not None:
+        try:
+            now = datetime.now(ZoneInfo(tz_name))
+        except Exception:  # unknown/invalid zone — degrade, don't crash recall.
+            now = None
+    if now is None:
+        # No zoneinfo or bad zone: fall back to the process-local clock, which
+        # already honours the container's TZ env via libc. am/pm form, no "UTC".
+        now = datetime.now().astimezone()
+    # "%Y-%m-%d %I:%M %p %Z" → e.g. "2026-07-16 04:09 PM AEST" (mirrors the
+    # %I:%M %p %Z tail of bin/timezone-hook.sh's format).
+    return now.strftime("%Y-%m-%d %I:%M %p %Z")
 
 
 # ---------------------------------------------------------------------------
