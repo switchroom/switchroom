@@ -31,14 +31,23 @@
  * never crash the hook or wrongly block a legitimate first write.
  */
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { randomBytes } from "node:crypto";
 
 /** How long an abort suppresses the rest of a batch. */
 export const BATCH_COOLDOWN_MS = 90 * 1000;
 /** Entries older than this are pruned on every read/write. */
 export const BATCH_LEDGER_RETENTION_MS = 10 * 60 * 1000;
+/**
+ * Max gap between two consecutive ops for them to count as the SAME batch.
+ * A batch is a run of writes issued close together (the incident's four
+ * `update-calendar-event` calls were seconds apart). Applied writes separated
+ * by more than this — e.g. an unrelated edit minutes earlier — are a DIFFERENT
+ * batch and must not inflate the current batch's applied count (Finding 1).
+ */
+export const BATCH_WINDOW_MS = 2 * 60 * 1000;
 
 export type BatchOutcome = "applied" | "aborted";
 
@@ -50,6 +59,13 @@ export interface BatchEntry {
   /** Item/event id the op targeted. */
   itemId: string;
   outcome: BatchOutcome;
+  /**
+   * For `aborted` entries only: how many writes had already applied in THIS
+   * batch at abort time. Captured at write time (batch-scoped, see
+   * `countCurrentBatchApplied`) so admission doesn't have to recount against a
+   * window that may include unrelated writes.
+   */
+  appliedInBatch?: number;
 }
 
 export interface BatchLedger {
@@ -91,14 +107,32 @@ export function readLedger(now: number, path?: string): BatchLedger {
     const raw = readFileSync(p, "utf8");
     const parsed = JSON.parse(raw) as { entries?: unknown };
     const entries = Array.isArray(parsed.entries)
-      ? (parsed.entries as BatchEntry[]).filter(
-          (e): e is BatchEntry =>
-            !!e &&
-            typeof e === "object" &&
-            typeof (e as BatchEntry).ts === "number" &&
-            ((e as BatchEntry).outcome === "applied" ||
-              (e as BatchEntry).outcome === "aborted"),
-        )
+      ? (parsed.entries as BatchEntry[])
+          .filter(
+            (e): e is BatchEntry =>
+              !!e &&
+              typeof e === "object" &&
+              typeof (e as BatchEntry).ts === "number" &&
+              ((e as BatchEntry).outcome === "applied" ||
+                (e as BatchEntry).outcome === "aborted"),
+          )
+          .map((e) => {
+            // Keep only the fields we trust; preserve the batch-scoped count on
+            // aborts so admission can reflect "N of THIS batch" verbatim.
+            const out: BatchEntry = {
+              ts: e.ts,
+              tool: typeof e.tool === "string" ? e.tool : "",
+              itemId: typeof e.itemId === "string" ? e.itemId : "",
+              outcome: e.outcome,
+            };
+            if (
+              e.outcome === "aborted" &&
+              typeof e.appliedInBatch === "number"
+            ) {
+              out.appliedInBatch = e.appliedInBatch;
+            }
+            return out;
+          })
       : [];
     return { entries: pruneLedger(entries, now) };
   } catch {
@@ -107,9 +141,46 @@ export function readLedger(now: number, path?: string): BatchLedger {
 }
 
 /**
- * Append an outcome and persist. Fail-soft: a write failure is swallowed (the
- * ledger is an advisory safety net, not a correctness gate for the single op).
- * Returns the in-memory ledger regardless so callers can reason about it.
+ * Count the writes that have applied in the CURRENT batch as of `asOf`. Pure.
+ *
+ * A batch is the maximal run of `applied` entries ending at the most recent
+ * applied entry, where consecutive entries are ≤ `batchWindowMs` apart AND the
+ * most recent applied entry is itself ≤ `batchWindowMs` before `asOf`. Applied
+ * writes that fall outside that window (an unrelated edit minutes earlier)
+ * belong to a DIFFERENT, already-cold batch and are NOT counted — so a lone
+ * later timeout does not inherit their count (Finding 1).
+ *
+ * Returns 0 when there is no active batch (empty, or the last applied write is
+ * already colder than the window) — i.e. "nothing applied in THIS batch".
+ */
+export function countCurrentBatchApplied(
+  entries: BatchEntry[],
+  asOf: number,
+  batchWindowMs = BATCH_WINDOW_MS,
+): number {
+  const applied = entries
+    .filter((e) => e.outcome === "applied")
+    .sort((a, b) => a.ts - b.ts);
+  if (applied.length === 0) return 0;
+  const last = applied[applied.length - 1];
+  if (asOf - last.ts > batchWindowMs) return 0; // batch already cold
+  let count = 1;
+  for (let i = applied.length - 1; i > 0; i--) {
+    if (applied[i].ts - applied[i - 1].ts <= batchWindowMs) count++;
+    else break;
+  }
+  return count;
+}
+
+/**
+ * Append an outcome and persist ATOMICALLY. Fail-soft: a write failure is
+ * swallowed (the ledger is an advisory safety net, not a correctness gate for
+ * the single op). Returns the in-memory ledger regardless.
+ *
+ * Concurrency (Finding 3): the per-op hook processes can race, so the write is
+ * temp-file + atomic `rename` — a concurrent reader sees either the old or the
+ * new complete file, never a torn half-write, and the fail-soft empty-ledger
+ * recovery on `readLedger` still covers any residual corruption.
  */
 export function recordOutcome(
   now: number,
@@ -120,7 +191,9 @@ export function recordOutcome(
   const ledger = readLedger(now, p);
   ledger.entries.push({ ...entry, ts: now });
   try {
-    writeFileSync(p, JSON.stringify(ledger), "utf8");
+    const tmp = `${p}.tmp.${process.pid}.${randomBytes(4).toString("hex")}`;
+    writeFileSync(tmp, JSON.stringify(ledger), "utf8");
+    renameSync(tmp, p);
   } catch {
     /* advisory — never block on a ledger write failure */
   }
@@ -130,7 +203,7 @@ export function recordOutcome(
 export interface BatchAdmission {
   /** Whether this op may proceed to post a card / apply. */
   admit: boolean;
-  /** Count of writes already applied in the current (aborted) batch window. */
+  /** Count of writes already applied in the current (aborted) batch. */
   appliedInBatch: number;
   /** Unix-ms of the abort that is suppressing this op, when admit=false. */
   abortedAt?: number;
@@ -140,10 +213,10 @@ export interface BatchAdmission {
  * Decide whether a new op may start, given the current ledger. Pure.
  *
  * Refuse UP FRONT when the batch was aborted within `cooldownMs`: the grant
- * lapsed (or was denied) for an earlier op, so the remaining identical ops
- * must not keep half-applying. `appliedInBatch` counts the `applied` entries
- * that precede the most recent abort within the retention window — i.e. "N of
- * the batch already landed".
+ * lapsed for an earlier op, so the remaining identical ops must not keep
+ * half-applying. `appliedInBatch` is read from the abort entry itself (the
+ * batch-scoped count captured at abort time), so it reflects "N of THIS batch
+ * already landed" — never an unrelated earlier write (Finding 1).
  */
 export function evaluateBatchAdmission(args: {
   entries: BatchEntry[];
@@ -153,19 +226,22 @@ export function evaluateBatchAdmission(args: {
   const { entries, now } = args;
   const cooldownMs = args.cooldownMs ?? BATCH_COOLDOWN_MS;
 
-  let lastAbortTs: number | undefined;
+  let lastAbort: BatchEntry | undefined;
   for (const e of entries) {
-    if (e.outcome === "aborted" && (lastAbortTs === undefined || e.ts > lastAbortTs)) {
-      lastAbortTs = e.ts;
+    if (e.outcome === "aborted" && (lastAbort === undefined || e.ts > lastAbort.ts)) {
+      lastAbort = e;
     }
   }
-  if (lastAbortTs === undefined || now - lastAbortTs > cooldownMs) {
+  if (lastAbort === undefined || now - lastAbort.ts > cooldownMs) {
     return { admit: true, appliedInBatch: 0 };
   }
-  const appliedInBatch = entries.filter(
-    (e) => e.outcome === "applied" && e.ts <= lastAbortTs!,
-  ).length;
-  return { admit: false, appliedInBatch, abortedAt: lastAbortTs };
+  // Prefer the count captured at abort time; fall back to a batch-scoped
+  // recount anchored at the abort instant for older/hand-written entries.
+  const appliedInBatch =
+    typeof lastAbort.appliedInBatch === "number"
+      ? lastAbort.appliedInBatch
+      : countCurrentBatchApplied(entries, lastAbort.ts);
+  return { admit: false, appliedInBatch, abortedAt: lastAbort.ts };
 }
 
 /**

@@ -59,6 +59,7 @@ import {
   readLedger,
   recordOutcome,
   evaluateBatchAdmission,
+  countCurrentBatchApplied,
   buildBatchAbortReason,
 } from "../ms365/batch-ledger.js";
 
@@ -419,7 +420,12 @@ function locationField(v: unknown): string | undefined {
 }
 
 function shorten(s: string, n = 120): string {
-  return s.length <= n ? s : s.slice(0, n - 1) + "…";
+  // Collapse control whitespace so Graph-sourced values (subject/location/body)
+  // can't smuggle newlines into the plain-text card as fake labelled lines
+  // (#3267 review Finding 2). Defence in depth — the card renderer's truncate()
+  // sanitises again at render time.
+  const oneLine = s.replace(/[\r\n\t]+/g, " ").trim();
+  return oneLine.length <= n ? oneLine : oneLine.slice(0, n - 1) + "…";
 }
 
 /**
@@ -876,17 +882,20 @@ async function main(): Promise<void> {
     }
     if (state === "expired" || state === "drift_revoked") {
       // Grant lapsed (TTL elapsed / approver drift) — NOT an intentional deny.
-      // If earlier ops in this batch already applied, this is the mid-batch
+      // If earlier ops in THIS batch already applied, this is the mid-batch
       // partial-application case (#3267 Problem 2): mark the batch aborted so
       // the REMAINING identical ops are refused up front, and give the agent a
       // distinct "N of the batch applied — stop and reconcile" signal. A lone
-      // lapse with nothing applied is just a timeout — don't suppress.
+      // lapse with nothing applied in this batch (or only unrelated earlier
+      // writes) is just a timeout — don't suppress.
       const t = Date.now();
-      const applied = readLedger(t).entries.filter(
-        (e) => e.outcome === "applied" && e.ts <= t,
-      ).length;
+      const applied = countCurrentBatchApplied(readLedger(t).entries, t);
       if (applied > 0) {
-        recordOutcome(t, { ...ledgerEntry, outcome: "aborted" });
+        recordOutcome(t, {
+          ...ledgerEntry,
+          outcome: "aborted",
+          appliedInBatch: applied,
+        });
         fail(buildBatchAbortReason(applied));
       }
       fail(`operator ${state}`);

@@ -193,6 +193,35 @@ describe("buildMs365CardText", () => {
     const text = buildMs365CardText(base);
     expect(text).toContain("Weak attestation (RFC §8 v1)");
   });
+
+  // ── #3267 review Finding 2: line-spoofing defence ────────────────────────
+  it("collapses newlines in a Graph-sourced subject so it can't inject fake card lines", () => {
+    const text = buildMs365CardText({
+      ...base,
+      itemDisplayName: "Team sync\nAccount: attacker@x\nWhen: (spoofed)",
+      accountEmail: "real@example.com",
+    });
+    // The whole malicious subject lands on ONE line, prefixed by the real
+    // Item: label — no injected Account:/When: lines.
+    const itemLine = text.split("\n").find((l) => l.startsWith("Item:"));
+    expect(itemLine).toContain("Team sync Account: attacker@x When: (spoofed)");
+    // The genuine account is the only Account: line.
+    const accountLines = text
+      .split("\n")
+      .filter((l) => l.replace(/\s+$/, "").startsWith("Account:"));
+    expect(accountLines).toHaveLength(1);
+    expect(accountLines[0]).toContain("real@example.com");
+  });
+
+  it("collapses newlines/tabs inside change before/after values", () => {
+    const text = buildMs365CardText({
+      ...base,
+      changes: [{ field: "location", before: "Room A", after: "Room B\nAccount: evil" }],
+    });
+    const changeLine = text.split("\n").find((l) => l.includes("location:"));
+    expect(changeLine).toContain("Room B Account: evil");
+    expect(text.split("\n").filter((l) => l.replace(/\s+$/, "").startsWith("Account:"))).toHaveLength(1);
+  });
 });
 
 describe("validateMs365Preview — #3267 diff fields", () => {

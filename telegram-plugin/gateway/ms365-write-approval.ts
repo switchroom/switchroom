@@ -251,8 +251,15 @@ export function buildMs365CardText(p: Ms365WritePreview): string {
 }
 
 function truncate(s: string, n: number): string {
-  if (s.length <= n) return s;
-  return s.slice(0, n - 1) + "…";
+  // Collapse control whitespace (newline / carriage-return / tab) to a single
+  // space FIRST — every field on this card is single-line, and this card is a
+  // security decision surface. A Graph-sourced value like an event subject of
+  // `Team sync\nAccount: attacker@x` would otherwise inject a fake-looking
+  // labelled line onto the card (#3267 review Finding 2). Length-truncation
+  // alone does not defend against this.
+  const oneLine = s.replace(/[\r\n\t]+/g, " ");
+  if (oneLine.length <= n) return oneLine;
+  return oneLine.slice(0, n - 1) + "…";
 }
 
 function humanBytes(bytes: number): string {
