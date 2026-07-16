@@ -1,20 +1,18 @@
 /**
  * Outcome regression for the forwarded-message history row (#3300 / #3162).
  *
- * The 2026-07-16 incident surfaced that history.db had NEVER recorded a
- * `forwarded_from` row despite #3162 landing — because forwarded messages
- * whose content matched no registered `message:*` filter were silently
- * dropped by grammy before the pipeline (and thus before `recordInbound`)
- * ever ran. The catch-all fix (#3300) routes every inbound message through
- * `handleInboundCoalesced` → `handleInbound`, which parses the trusted
- * server-stamped `forward_origin` and persists it via `recordInbound`.
+ * SCOPE (honest): this suite pins the PERSISTENCE leg of the end-to-end
+ * chain — `parseForwardOrigin` (#3162) feeding `recordInbound` against the
+ * real bun:sqlite history store. The ROUTING leg (an update reaching the
+ * pipeline at all — the layer where the 2026-07-16 silent drop happened) is
+ * pinned by `catch-all-unhandled-message.test.ts`, which drives the real
+ * production catch-all module on a real grammy composer. Together the two
+ * suites cover the chain; this one alone also passes on pre-#3300 code
+ * because #3162's persistence was always correct — it was simply never
+ * reached for the dropped message.
  *
- * This test pins the OUTCOME of that path against the real history store:
- * a forwarded message, parsed through the same `parseForwardOrigin` the
- * gateway uses and recorded via the same `recordInbound`, yields a history
- * row with `forwarded_from` populated.
- *
- * Runs under bun (history.ts uses bun:sqlite).
+ * Runs under bun (history.ts uses bun:sqlite; gateway.ts itself is a
+ * side-effecting module that cannot be imported into a test).
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test'

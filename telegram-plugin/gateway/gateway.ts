@@ -102,6 +102,10 @@ import {
   forwardOriginDateIso,
   type ForwardOriginInfo,
 } from './forward-origin.js'
+import {
+  installUpdateTap,
+  installUnhandledMessageCatchAll,
+} from './unhandled-message.js'
 import { fmtLocalStamp, resolveEnvTimezone, renderLogTimestampsLocal } from '../shared/local-time.js'
 import { StatusReactionController } from '../status-reactions.js'
 import { DeferredDoneReactions } from '../reaction-defer.js'
@@ -1292,43 +1296,13 @@ const AGENT_ADMIN = process.env.SWITCHROOM_AGENT_ADMIN === 'true'
 const bot = new Bot(TOKEN)
 installTgPostLogger(bot)
 
-// Top-level `message` envelope fields — logged separately as identity/routing
-// metadata, so they're excluded when we surface the CONTENT keys of a message
-// (the fields that determine which `bot.on('message:*')` handler should run).
-const MESSAGE_ENVELOPE_KEYS = new Set<string>([
-  'message_id', 'message_thread_id', 'date', 'chat', 'from', 'sender_chat',
-  'forward_origin', 'reply_to_message', 'external_reply', 'quote',
-  'reply_to_story', 'edit_date', 'media_group_id', 'author_signature',
-  'is_topic_message', 'is_automatic_forward', 'via_bot', 'sender_boost_count',
-  'business_connection_id', 'effect_id', 'has_protected_content',
-  'is_from_offline', 'link_preview_options', 'show_caption_above_media',
-  'entities', 'caption_entities',
-])
-
 // ─── Diagnostic update tap (#3300) ────────────────────────────────────────
 // One compact line per received update, logged BEFORE any specific handler
 // runs, so a drop at the grammy-routing layer is always diagnosable from the
-// logs. This is a pass-through middleware (`bot.use` → always calls next()),
-// so it never consumes an update or alters routing. For `message` updates it
-// also surfaces the CONTENT keys (envelope fields filtered out) — the signal
-// that tells you which `message:*` handler was expected to match.
-bot.use(async (ctx, next) => {
-  try {
-    const upd = ctx.update
-    const updateType = Object.keys(upd).find(k => k !== 'update_id') ?? 'unknown'
-    let detail = ''
-    if (ctx.message) {
-      const keys = Object.keys(ctx.message).filter(k => !MESSAGE_ENVELOPE_KEYS.has(k))
-      detail = ` content=[${keys.join(',')}]`
-    }
-    process.stderr.write(
-      `telegram gateway: rx update_id=${upd.update_id} type=${updateType}${detail}\n`,
-    )
-  } catch {
-    // The diagnostic tap must never break the inbound pipeline.
-  }
-  await next()
-})
+// logs. Pass-through middleware — never consumes an update or alters routing.
+// Rate-limited inside installUpdateTap (per-minute cap + suppression summary
+// line so even a flood is never invisible).
+installUpdateTap(bot, line => process.stderr.write(line))
 
 // ─── getUpdates heartbeat ─────────────────────────────────────────────────
 // Tracks the last time getUpdates completed (success OR error). Used by
@@ -29383,40 +29357,22 @@ bot.on('message:pinned_message', async ctx => {
 // update and this catch-all never sees it (specific handler always wins; no
 // "already handled" guard is needed, the ordering is the guarantee). When NO
 // specific `message:*` filter matches, grammy ^1.44 would otherwise SILENTLY
-// drop the update — no log, no ack, no history row. That silent drop was the
-// root cause of the 2026-07-16 dropped-forward incident (a forwarded text
-// whose shape matched none of the registered content filters vanished with
-// zero trace). This handler closes that hole: every inbound `message` reaches
-// the normal pipeline, so nothing is dropped at the routing layer ever again.
+// drop the update — no log, no ack, no history row (the zero-observability
+// failure class behind the 2026-07-16 dropped-message incident: message_id
+// 19090 allocated in the DM with no gateway trace at all). This handler
+// closes the class: every inbound `message` is either delivered as a turn or
+// explicitly logged (known-noise service messages → log-only, no turn — see
+// SERVICE_NOISE_KEYS), so nothing is silently dropped at this layer again.
 //
 // Access gating is NOT re-implemented here — routing through
 // handleInboundCoalesced (the exact path `message:text` uses) applies the
 // same gate()/allowFrom checks, and parseForwardOrigin runs inside it so
 // forwarded-message provenance is preserved.
-bot.on('message', async ctx => {
-  try {
-    const msg = ctx.message
-    const contentKeys = msg
-      ? Object.keys(msg).filter(k => !MESSAGE_ENVELOPE_KEYS.has(k))
-      : []
-    // Log KEYS + ids only — never the payload bodies (privacy).
-    process.stderr.write(
-      `telegram gateway: catch-all inbound (no specific handler) ` +
-        `update_id=${ctx.update.update_id} chat_id=${ctx.chat?.id ?? '?'} ` +
-        `message_id=${msg?.message_id ?? '?'} content_keys=[${contentKeys.join(',')}]\n`,
-    )
-    // Best-effort text so the agent still receives and can respond: prefer any
-    // real text/caption, else a placeholder naming the content type.
-    const contentType = contentKeys[0] ?? 'unknown'
-    const text =
-      msg?.text ?? msg?.caption ?? `(unhandled message content: ${contentType})`
-    await handleInboundCoalesced(ctx, text, undefined)
-  } catch (err) {
-    process.stderr.write(
-      `telegram gateway: catch-all handler error: ${(err as Error).message}\n`,
-    )
-  }
-})
+installUnhandledMessageCatchAll(
+  bot,
+  (ctx, text) => handleInboundCoalesced(ctx, text, undefined),
+  line => process.stderr.write(line),
+)
 
 // ─── Reaction-trigger runtime state (#1074) ──────────────────────────────
 //
