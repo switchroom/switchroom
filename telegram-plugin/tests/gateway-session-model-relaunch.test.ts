@@ -149,13 +149,25 @@ describe('gateway boot: session-model re-hydration + confirmation + alert relay'
   it('sends ONE switch-confirmation from the ACTUAL launched model, keyed on the /model reason (F1/N4)', () => {
     const idx = GATEWAY_SRC.indexOf('const isApplyBoot = launched.length > 0')
     expect(idx).toBeGreaterThan(0)
-    const win = GATEWAY_SRC.slice(idx, idx + 3400)
+    const win = GATEWAY_SRC.slice(idx, idx + 4200)
     // Keyed on the deterministic /model switch reason, so it also fires on a
     // launched===configured apply-boot (/model default) — N4. Never optimistic.
     expect(win).toContain('if (modelSwitchReason != null && modelSwitchMarkerChat)')
     expect(win).toContain('✅ Now running')
     // N4: the launched===configured branch still confirms.
     expect(win).toContain('(the configured default)')
+  })
+
+  it('warns instead of a green ✅ when a non-default switch silently reverted to the default (silent-revert fix)', () => {
+    const idx = GATEWAY_SRC.indexOf('const isApplyBoot = launched.length > 0')
+    const win = GATEWAY_SRC.slice(idx, idx + 4200)
+    // The confirmation card is derived from the pure classifier, not an inline
+    // isApplyBoot ternary — so a reverted non-default switch yields the ⚠️ card.
+    expect(win).toContain('classifyModelSwitchConfirmation({')
+    expect(win).toContain("confirmation.kind === 'applied'")
+    expect(win).toContain("confirmation.kind === 'not-applied'")
+    expect(win).toContain("⚠️ Your switch to")
+    expect(win).toContain("didn't apply")
   })
 
   it('N4/reason: the /model switch reason is captured from the clean-shutdown marker', () => {

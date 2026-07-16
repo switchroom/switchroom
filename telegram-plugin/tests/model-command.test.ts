@@ -28,6 +28,8 @@ import {
   isClaudeModel,
   isBusyRefusalText,
   isOfflineTrustedModelToken,
+  classifyModelSwitchConfirmation,
+  parseModelSwitchTarget,
   MODEL_ALIASES,
   type ModelCommandDeps,
 } from "../gateway/model-command.js";
@@ -526,5 +528,86 @@ describe("#3177 — routing decision helpers", () => {
     expect(line).toContain("gw /model received");
     expect(line).toContain("agent=klanker");
     expect(line).toContain("arg=opus");
+  });
+});
+
+describe("parseModelSwitchTarget", () => {
+  it("extracts the target from a menu relaunch reason", () => {
+    expect(
+      parseModelSwitchTarget("user: /model fable (session-only relaunch, menu)"),
+    ).toBe("fable");
+  });
+  it("extracts the target from a typed relaunch reason", () => {
+    expect(
+      parseModelSwitchTarget("user: /model sr-gemini-2.5-flash (session-only relaunch)"),
+    ).toBe("sr-gemini-2.5-flash");
+  });
+  it("extracts the default sentinel from a revert reason", () => {
+    expect(parseModelSwitchTarget("user: /model default (revert relaunch)")).toBe("default");
+  });
+  it("returns null for a non-/model reason", () => {
+    expect(parseModelSwitchTarget("cli: restart")).toBeNull();
+  });
+});
+
+describe("classifyModelSwitchConfirmation", () => {
+  // The regression this fix closes: a /model fable apply-boot that reverted to
+  // the configured default (opus) must be reported as NOT-applied (⚠️), not as a
+  // green "✅ Now running opus (the configured default)". Under the OLD inline
+  // logic (isApplyBoot ? applied : green-default) this exact case produced the
+  // misleading green card — this asserts the corrected outcome.
+  it("flags a non-default switch that reverted to the configured default as not-applied", () => {
+    const out = classifyModelSwitchConfirmation({
+      reason: "user: /model fable (session-only relaunch, menu)",
+      launched: "opus",
+      configured: "opus",
+    });
+    expect(out).toEqual({ kind: "not-applied", target: "fable", revertedTo: "opus" });
+  });
+
+  it("reports an applied switch when the launched model differs from the default", () => {
+    const out = classifyModelSwitchConfirmation({
+      reason: "user: /model fable (session-only relaunch, menu)",
+      launched: "fable",
+      configured: "opus",
+    });
+    expect(out).toEqual({ kind: "applied", launched: "fable" });
+  });
+
+  it("reports the default (green) for an intended /model default revert", () => {
+    const out = classifyModelSwitchConfirmation({
+      reason: "user: /model default (revert relaunch)",
+      launched: "opus",
+      configured: "opus",
+    });
+    expect(out).toEqual({ kind: "default", launched: "opus" });
+  });
+
+  it("reports the default (green) when the operator asked for the configured model itself", () => {
+    // /model opus while configured=opus is a SUCCESS, not a silent revert.
+    const out = classifyModelSwitchConfirmation({
+      reason: "user: /model opus (session-only relaunch)",
+      launched: "opus",
+      configured: "opus",
+    });
+    expect(out).toEqual({ kind: "default", launched: "opus" });
+  });
+
+  it("is case-insensitive on the target-vs-launched comparison", () => {
+    const out = classifyModelSwitchConfirmation({
+      reason: "user: /model OPUS (session-only relaunch)",
+      launched: "opus",
+      configured: "opus",
+    });
+    expect(out).toEqual({ kind: "default", launched: "opus" });
+  });
+
+  it("treats an empty launched value (unreadable .active-session-model) as a revert to the default", () => {
+    const out = classifyModelSwitchConfirmation({
+      reason: "user: /model fable (session-only relaunch, menu)",
+      launched: "",
+      configured: "opus",
+    });
+    expect(out).toEqual({ kind: "not-applied", target: "fable", revertedTo: "opus" });
   });
 });

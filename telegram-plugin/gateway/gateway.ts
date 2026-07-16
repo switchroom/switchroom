@@ -472,6 +472,7 @@ import {
   resolveStaleAwareBusy,
   modelCommandReceiptLine,
   handleModelCommand,
+  classifyModelSwitchConfirmation,
   buildModelMenu,
   handleModelMenuCallback,
   isValidModelArg,
@@ -30737,9 +30738,23 @@ void (async () => {
                 // this is the single card the operator sees for the switch.
                 if (modelSwitchReason != null && modelSwitchMarkerChat) {
                   const chat = modelSwitchMarkerChat
-                  const body = isApplyBoot
-                    ? `✅ Now running \`${launched}\` — session-only, reverts to the configured model on the next restart. Fresh session; memory and the handoff briefing carry the context.`
-                    : `✅ Now running \`${launched || configured}\` (the configured default) — fresh session; memory and the handoff briefing carry the context.`
+                  // Derive the confirmation from the DETERMINISTIC post-boot
+                  // signals. A non-default switch that reverted to the configured
+                  // default (a wedged/consumed apply-boot — the silent-revert bug)
+                  // must WARN, not print a misleading green "✅ Now running
+                  // <default>" card. `applied` / `default` keep the honest green
+                  // card (N4: the default/revert case still confirms).
+                  const confirmation = classifyModelSwitchConfirmation({
+                    reason: modelSwitchReason,
+                    launched,
+                    configured,
+                  })
+                  const body =
+                    confirmation.kind === 'applied'
+                      ? `✅ Now running \`${confirmation.launched}\` — session-only, reverts to the configured model on the next restart. Fresh session; memory and the handoff briefing carry the context.`
+                      : confirmation.kind === 'not-applied'
+                        ? `⚠️ Your switch to \`${confirmation.target}\` didn't apply — the agent reverted to \`${confirmation.revertedTo}\` (the apply-boot didn't complete). Re-issue /model ${confirmation.target} to try again.`
+                        : `✅ Now running \`${confirmation.launched}\` (the configured default) — fresh session; memory and the handoff briefing carry the context.`
                   // allow-raw-bot-api: one-shot boot confirmation, same shape as the session-model alert relay below
                   void lockedBot.api
                     .sendMessage(chat.chatId, body, {
