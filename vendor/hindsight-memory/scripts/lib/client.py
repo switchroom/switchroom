@@ -206,6 +206,53 @@ class HindsightClient:
         }
         return self._request("POST", path, body, timeout=timeout)
 
+    def list_session_document_ids(
+        self,
+        bank_id: str,
+        session_id: str,
+        page: int = 200,
+        max_pages: int = 50,
+        timeout: int = 10,
+    ) -> set:
+        """Return the set of document ids in ``bank_id`` whose id contains
+        ``session_id`` (switchroom #3244 log-driven recovery, session-level
+        membership).
+
+        Uses the daemon's server-side ``q=`` filter — a case-insensitive
+        substring match on the document id (``GET .../documents?q=...``,
+        ``http.py:api_list_documents``). Every per-turn transcript retain the
+        live path OR this backfill ever wrote for a session carries the session
+        id as an id prefix — BOTH the legacy ``{session_id}-{epoch_ms}`` scheme
+        (what production banks hold today) and the new ``{session_id}-r{uuid}``
+        scheme — so this ONE server-side query (paged, bounded by ``max_pages``)
+        returns exactly this session's docs without a per-slice GET storm. The
+        caller tests the returned ids for the ``{session_id}`` PREFIX (scheme-
+        agnostic) to decide presence: ANY doc ⇒ present ⇒ skip; ZERO ⇒
+        total-loss ⇒ restore.
+
+        Raises on any HTTP/transport error so the caller can fail CLOSED (treat
+        the session as PRESENT ⇒ skip) and never risk a duplicate restore.
+        """
+        found: set = set()
+        offset = 0
+        q = urllib.parse.quote(session_id, safe="")
+        bank = urllib.parse.quote(bank_id, safe="")
+        for _ in range(max(1, max_pages)):
+            path = (
+                f"/v1/default/banks/{bank}/documents"
+                f"?q={q}&limit={int(page)}&offset={int(offset)}"
+            )
+            resp = self._request("GET", path, timeout=timeout)
+            items = resp.get("items") or []
+            for it in items:
+                did = it.get("id") if isinstance(it, dict) else None
+                if did:
+                    found.add(did)
+            if len(items) < page:
+                break
+            offset += page
+        return found
+
     def list_directives(
         self,
         bank_id: str,
