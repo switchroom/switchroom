@@ -134,9 +134,19 @@ const LEADING_ISO_Z = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)(\s|$)/
 
 /**
  * DISPLAY-ONLY: rewrite a leading UTC ISO-8601-Z timestamp on each line of
- * `text` into the operator's LOCAL am/pm wall clock via {@link fmtLocalStamp},
+ * `text` into the caller's LOCAL am/pm wall clock via {@link fmtLocalStamp},
  * so `/logs` output reads `Thursday 2026-07-16 02:09 PM AEST …` instead of a
  * raw `…T04:09:00Z`. Applied at send time; never mutates stored logs.
+ *
+ * The leading stamp comes from `docker logs --timestamps` (requested by the
+ * /logs path via `switchroom agent logs --timestamps`) — docker's stamp is
+ * ALWAYS UTC ISO-Z, which is what makes this conversion deterministic. App-
+ * emitted stamps inside the line body (e.g. Python's `%H:%M:%S,mmm`) are
+ * deliberately NOT converted: post-#3275 containers run with local TZ baked,
+ * so those are already local wall clock — re-shifting them as UTC would be
+ * wrong. The `tz` passed by /logs is the GATEWAY/operator zone
+ * (`resolveEnvTimezone` of the gateway process), not the target agent's
+ * zone — intended, since /logs is an operator-facing surface.
  *
  * Pure / total — matches ONLY a well-formed leading ISO-Z stamp and preserves
  * every other line (and any line whose timestamp doesn't parse) verbatim, so a

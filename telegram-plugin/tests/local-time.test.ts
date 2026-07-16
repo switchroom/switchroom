@@ -112,4 +112,24 @@ describe('renderLogTimestampsLocal', () => {
   it('returns empty input unchanged', () => {
     expect(renderLogTimestampsLocal('', 'Australia/Melbourne')).toBe('')
   })
+
+  // End-to-end shape check against REAL `docker logs --timestamps` output —
+  // the /logs path requests --timestamps precisely so this prefix exists.
+  // (Captured verbatim from a live container; nanosecond precision.)
+  it('converts a verbatim docker --timestamps line (the real /logs input shape)', () => {
+    const real = '2026-07-16T20:17:58.433481596Z gateway-supervisor: heartbeat ok'
+    const out = renderLogTimestampsLocal(real, 'Australia/Melbourne')
+    // 20:17:58Z on 16 Jul → AEST (UTC+10) → 06:17 AM on 17 Jul local.
+    expect(out).toBe('Friday 2026-07-17 06:17 AM AEST gateway-supervisor: heartbeat ok')
+    expect(out).not.toContain('Z ')
+    expect(out).not.toContain('UTC')
+  })
+
+  it('does NOT touch an app-emitted local-zone stamp (no double shift)', () => {
+    // Post-#3275 containers run with local TZ baked, so Python-style
+    // `%H:%M:%S,mmm` stamps are already local wall clock — converting them
+    // as UTC would be wrong. They must pass through verbatim.
+    const appLine = '2026-07-16 20:14:14,725 - INFO - scheduler tick'
+    expect(renderLogTimestampsLocal(appLine, 'Australia/Melbourne')).toBe(appLine)
+  })
 })

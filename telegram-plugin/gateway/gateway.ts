@@ -26987,14 +26987,19 @@ bot.command('logs', async ctx => {
   const lines = linesArg ? parseInt(linesArg, 10) : 20
   const lineCount = isNaN(lines) || lines < 1 ? 20 : Math.min(lines, 200)
   // PR5 — heavy-output → admin alias in supergroup mode (CPO #4).
-  // #tz-fix audit (MEDIUM gap 2): docker log lines carry a leading UTC ISO-Z
-  // timestamp. Render it in the operator's local am/pm at DISPLAY time so
-  // `/logs` doesn't surface UTC (competing with the local-time hint). Stored
-  // logs are untouched — this transform runs only on the text sent to chat.
+  // #tz-fix audit (MEDIUM gap 2): `--timestamps` makes docker prefix every
+  // line with its own UTC ISO-8601-Z stamp — the only deterministic per-line
+  // timestamp (raw app lines often carry no stamp, or a local-zone one that
+  // must NOT be re-shifted). We then render that stamp in local am/pm at
+  // DISPLAY time so `/logs` doesn't surface UTC (competing with the
+  // local-time hint). The zone is the GATEWAY/operator zone
+  // (resolveEnvTimezone of this process), not the target agent's zone —
+  // intended: /logs is an operator surface. Stored logs are untouched —
+  // the transform runs only on the text sent to chat.
   const tz = resolveEnvTimezone()
   await runSwitchroomCommand(
     ctx,
-    ['agent', 'logs', name, '--lines', String(lineCount)],
+    ['agent', 'logs', name, '--lines', String(lineCount), '--timestamps'],
     `logs ${name}`,
     'heavy',
     (raw) => renderLogTimestampsLocal(raw, tz),
