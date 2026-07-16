@@ -1652,8 +1652,12 @@ export function registerAgentCommand(program: Command): void {
     .command("logs <name>")
     .description("Show agent logs")
     .option("-f, --follow", "Follow log output")
+    .option(
+      "-n, --lines <count>",
+      "Number of trailing log lines to show (default 50, capped at 1000)",
+    )
     .action(
-      withConfigError(async (name: string, opts: { follow?: boolean }) => {
+      withConfigError(async (name: string, opts: { follow?: boolean; lines?: string }) => {
         const config = getConfig(program);
 
         if (!config.agents[name]) {
@@ -1661,7 +1665,18 @@ export function registerAgentCommand(program: Command): void {
           process.exit(1);
         }
 
-        getAgentLogs(name, opts.follow ?? false);
+        // Resolve --lines: default 50, floor 1, cap 1000. A non-numeric /
+        // out-of-range value falls back to the default rather than erroring —
+        // the Telegram /logs UX passes this through verbatim.
+        let tail = 50;
+        if (opts.lines !== undefined) {
+          const parsed = Number.parseInt(opts.lines, 10);
+          if (Number.isFinite(parsed) && parsed >= 1) {
+            tail = Math.min(parsed, 1000);
+          }
+        }
+
+        getAgentLogs(name, opts.follow ?? false, tail);
       })
     );
 

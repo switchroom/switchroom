@@ -752,9 +752,15 @@ export function attachAgent(name: string, tmuxSupervisor = true): void {
   }
 }
 
-export function getAgentLogs(name: string, follow: boolean): void {
+export function getAgentLogs(name: string, follow: boolean, tail?: number): void {
   const args = ["logs"];
   if (follow) args.push("-f");
+  // `--tail N` bounds a non-follow dump to the last N lines (default: whole
+  // log). The Telegram /logs [name] [lines] UX relies on this bound so a
+  // heavy dump doesn't blow past the reply size limit.
+  if (tail !== undefined && Number.isFinite(tail) && tail >= 1) {
+    args.push("--tail", String(Math.floor(tail)));
+  }
   args.push(containerName(name));
 
   const child = spawn("docker", args, { stdio: "inherit" });
