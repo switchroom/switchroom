@@ -629,6 +629,27 @@ describe('selectFlushDeliveryText — deliver the terminal answer, strip only na
     expect(selectFlushDeliveryText([])).toBe('')
   })
 
+  // #3276 guard 8 — the NARRATION_OPENER regex alone misses progress narration
+  // that does NOT open with "Let me…/I'll…" but trails off into an ellipsis or
+  // colon ("Checking now…"). Pre-fix, `isNarrationBlock` returned false for it,
+  // so the whole `narration\n\nanswer` blob was delivered. FAILS pre-fix.
+  it('strips a non-opener progress narration ("Checking now…") that precedes the answer', () => {
+    const out = selectFlushDeliveryText(['Checking now…', 'The build is green.'])
+    expect(out).toBe('The build is green.')
+    expect(out).not.toContain('Checking now')
+  })
+
+  it('strips a colon-terminated progress narration ("Pulling the numbers:")', () => {
+    const out = selectFlushDeliveryText(['Pulling the numbers:', 'Revenue was 4.2M.'])
+    expect(out).toBe('Revenue was 4.2M.')
+  })
+
+  it('still delivers a SHORT terminal answer after progress narration (no min-char re-gate)', () => {
+    // "yes, done" is well under FLUSH_SUBSTANTIVE_MIN_CHARS and MUST still deliver.
+    const out = selectFlushDeliveryText(['Looking into that...', 'yes, done'])
+    expect(out).toBe('yes, done')
+  })
+
   it('decideTurnFlush delivers the narrowed answer, not the whole blob', () => {
     const decision = decideTurnFlush({
       chatId: 'chat1',
