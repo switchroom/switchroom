@@ -243,6 +243,105 @@ describe("migrateLegacyGrantsDbLocation — #3289 WAL-durability relocation", ()
     expect(fs.existsSync(legacyPath)).toBe(false);
     expect(fs.existsSync(newPath)).toBe(true);
   });
+
+  it("aborts with the legacy pair INTACT when a -wal sidecar move fails (M1)", () => {
+    const home = tmpDir;
+    const legacyPath = getLegacyGrantsDbPath(getGrantsDbPath(home));
+    const newPath = getGrantsDbPath(home);
+
+    fs.mkdirSync(path.dirname(legacyPath), { recursive: true });
+    fs.writeFileSync(legacyPath, "main-bytes");
+    fs.writeFileSync(`${legacyPath}-wal`, "wal-bytes");
+    fs.writeFileSync(`${legacyPath}-shm`, "shm-bytes");
+
+    // Force the -shm move to fail AFTER the -wal already moved, so the
+    // rollback path is exercised too.
+    const failingRename = (from: string, to: string) => {
+      if (from.endsWith("-shm") && to.startsWith(path.dirname(newPath))) {
+        throw Object.assign(new Error("EXDEV: cross-device link"), {
+          code: "EXDEV",
+        });
+      }
+      fs.renameSync(from, to);
+    };
+
+    expect(() =>
+      migrateLegacyGrantsDbLocation(newPath, { rename: failingRename }),
+    ).toThrow(/failed to move WAL sidecar/);
+
+    // The legacy main + BOTH sidecars must still be intact (the -wal that
+    // moved first was rolled back), and nothing landed at the new main path.
+    expect(fs.readFileSync(legacyPath, "utf8")).toBe("main-bytes");
+    expect(fs.readFileSync(`${legacyPath}-wal`, "utf8")).toBe("wal-bytes");
+    expect(fs.readFileSync(`${legacyPath}-shm`, "utf8")).toBe("shm-bytes");
+    expect(fs.existsSync(newPath)).toBe(false);
+    expect(fs.existsSync(`${newPath}-wal`)).toBe(false);
+
+    // And a plain retry (no failure injection) completes the migration —
+    // committed WAL bytes travel with the main file.
+    const res = migrateLegacyGrantsDbLocation(newPath);
+    expect(res.migrated).toBe(true);
+    expect(fs.readFileSync(`${newPath}-wal`, "utf8")).toBe("wal-bytes");
+  });
+
+  it("treats losing the main-rename race to a concurrent migrator as already-migrated (L1)", () => {
+    const home = tmpDir;
+    const legacyPath = getLegacyGrantsDbPath(getGrantsDbPath(home));
+    const newPath = getGrantsDbPath(home);
+
+    fs.mkdirSync(path.dirname(legacyPath), { recursive: true });
+    fs.writeFileSync(legacyPath, "main-bytes");
+
+    // Simulate the TOCTOU: between the existsSync gates and the main rename,
+    // a concurrent migrator (broker boot) moves the file itself. Our rename
+    // then throws ENOENT — but the new path exists and the legacy is gone.
+    const racingRename = (from: string, to: string) => {
+      if (from === legacyPath) {
+        fs.renameSync(legacyPath, newPath); // the "other" migrator wins
+        throw Object.assign(new Error("ENOENT: no such file or directory"), {
+          code: "ENOENT",
+        });
+      }
+      fs.renameSync(from, to);
+    };
+
+    const res = migrateLegacyGrantsDbLocation(newPath, {
+      rename: racingRename,
+    });
+    expect(res.migrated).toBe(false);
+    expect(fs.existsSync(newPath)).toBe(true);
+    expect(fs.readFileSync(newPath, "utf8")).toBe("main-bytes");
+    expect(fs.existsSync(legacyPath)).toBe(false);
+  });
+
+  it("rethrows a GENUINE main-rename failure and rolls the sidecars back (L1 guard is not a blanket swallow)", () => {
+    const home = tmpDir;
+    const legacyPath = getLegacyGrantsDbPath(getGrantsDbPath(home));
+    const newPath = getGrantsDbPath(home);
+
+    fs.mkdirSync(path.dirname(legacyPath), { recursive: true });
+    fs.writeFileSync(legacyPath, "main-bytes");
+    fs.writeFileSync(`${legacyPath}-wal`, "wal-bytes");
+
+    const failingMainRename = (from: string, to: string) => {
+      if (from === legacyPath) {
+        throw Object.assign(new Error("EACCES: permission denied"), {
+          code: "EACCES",
+        });
+      }
+      fs.renameSync(from, to);
+    };
+
+    expect(() =>
+      migrateLegacyGrantsDbLocation(newPath, { rename: failingMainRename }),
+    ).toThrow(/EACCES/);
+
+    // Sidecar rolled back beside the untouched legacy main.
+    expect(fs.readFileSync(legacyPath, "utf8")).toBe("main-bytes");
+    expect(fs.readFileSync(`${legacyPath}-wal`, "utf8")).toBe("wal-bytes");
+    expect(fs.existsSync(newPath)).toBe(false);
+    expect(fs.existsSync(`${newPath}-wal`)).toBe(false);
+  });
 });
 
 describe("grants durability — survives simulated container recreate", () => {

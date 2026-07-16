@@ -327,15 +327,34 @@ describe("probeGrantsWalDivergence — WAL checkpoint state (#3289)", () => {
     expect(r.detail).toContain("truncated");
   });
 
-  it("warns when a NON-empty -wal is newer than the main DB (un-checkpointed grants)", () => {
-    const r = probeGrantsWalDivergence((p) =>
-      p === main
-        ? { kind: "ok", mtime: 1000, size: 4096 }
-        : { kind: "ok", mtime: 2000, size: 32768 },
+  it("warns when a NON-empty -wal is newer than the main DB AND stale (un-checkpointed grants)", () => {
+    // Divergence has persisted well past the settle window (now = wal mtime
+    // + 1 hour) — the checkpoint-after-mutation defense isn't firing.
+    const r = probeGrantsWalDivergence(
+      (p) =>
+        p === main
+          ? { kind: "ok", mtime: 1000, size: 4096 }
+          : { kind: "ok", mtime: 2000, size: 32768 },
+      { nowEpochSecs: 2000 + 3600 },
     );
     expect(r.status).toBe("warn");
     expect(r.detail).toContain("un-checkpointed");
     expect(r.fix).toBeTruthy();
+  });
+
+  it("does NOT warn on a FRESH divergence (busy checkpoint under read contention — N1)", () => {
+    // A healthy broker: PRAGMA wal_checkpoint(TRUNCATE) returned SQLITE_BUSY
+    // (as a row, not an error) because a reader held the DB, so the -wal is
+    // momentarily newer than main. Within the settle window this is ok.
+    const r = probeGrantsWalDivergence(
+      (p) =>
+        p === main
+          ? { kind: "ok", mtime: 1000, size: 4096 }
+          : { kind: "ok", mtime: 2000, size: 32768 },
+      { nowEpochSecs: 2000 + 10 },
+    );
+    expect(r.status).toBe("ok");
+    expect(r.detail).toContain("settle window");
   });
 
   it("ok when a non-empty -wal is NOT newer than main", () => {

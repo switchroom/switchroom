@@ -1046,6 +1046,16 @@ export async function ensureHostMountSources(
   // capability grant — the orphaned `.vault-token` files on disk then fail
   // every `vault get` from inside agent containers. Surfaced 2026-05-24 after
   // the v0.13.31 rollout; WAL-sidecar durability hardened in #3289.
+  //
+  // UPGRADE-WINDOW CAVEAT: while a PRE-fix broker is still running, it holds
+  // the legacy DB open via the old single-file mount. A grant minted between
+  // this migration and the broker's recreate (`docker compose up`, which the
+  // operator/updater runs after apply) lands in a fresh container-local
+  // legacy -wal the new broker never replays and may need re-minting. This
+  // window is unavoidable without stopping the broker before apply; apply
+  // therefore runs the migration as late as it can — inside the mount-source
+  // preparation immediately preceding the compose handoff. The broker's own
+  // boot re-runs the same idempotent migration as a second chance.
   const grantsDbDir = getGrantsDbDir(home);
   mkdirSync(grantsDbDir, { recursive: true, mode: 0o700 });
   migrateLegacyGrantsDbLocation(getGrantsDbPath(home));

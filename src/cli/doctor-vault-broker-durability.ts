@@ -535,11 +535,24 @@ function defaultWalStatBroker(p: string): BrokerFileStat {
  * — worth surfacing, and it is the exact signal the host-side readers (doctor,
  * migration) depend on the main file being current for.
  *
+ * FALSE-POSITIVE GUARD: `PRAGMA wal_checkpoint(TRUNCATE)` legitimately leaves
+ * the WAL non-empty when a concurrent reader holds the DB busy (SQLITE_BUSY is
+ * reported as a result ROW, not an error) — a healthy broker under normal read
+ * contention would trip a naive newer-than-main check. So the probe only warns
+ * when the divergent WAL is also STALE: its mtime is older than
+ * `staleThresholdSecs` (default 300s). A fresh divergence means writes are
+ * in-flight or a busy checkpoint just deferred — the next mutation's
+ * checkpoint clears it; only a divergence that has persisted implies the
+ * defense isn't firing.
+ *
  * @internal exported for testing
  */
 export function probeGrantsWalDivergence(
   statBroker: (p: string) => BrokerFileStat = defaultWalStatBroker,
+  opts?: { nowEpochSecs?: number; staleThresholdSecs?: number },
 ): CheckResult {
+  const now = opts?.nowEpochSecs ?? Math.floor(Date.now() / 1000);
+  const staleThreshold = opts?.staleThresholdSecs ?? 300;
   const name = "vault-broker: grants WAL checkpointed (#3289)";
   const main = statBroker(GRANTS_DB_CONTAINER_PATH);
   if (main.kind === "unreachable") {
@@ -566,15 +579,29 @@ export function probeGrantsWalDivergence(
     return { name, status: "ok", detail: "-wal is truncated (0 bytes) — checkpointed" };
   }
   if (wal.mtime > main.mtime) {
+    const ageSecs = now - wal.mtime;
+    if (ageSecs < staleThreshold) {
+      // Fresh divergence — writes in flight or a busy checkpoint just
+      // deferred; a healthy broker under read contention looks like this.
+      return {
+        name,
+        status: "ok",
+        detail:
+          `-wal (${wal.size} bytes) is newer than the main DB but only ` +
+          `${Math.max(ageSecs, 0)}s old — within the ${staleThreshold}s ` +
+          `settle window (busy checkpoints are normal under read contention)`,
+      };
+    }
     return {
       name,
       status: "warn",
       detail:
         `-wal (${wal.size} bytes, mtime ${wal.mtime}) is newer than the main DB ` +
-        `(mtime ${main.mtime}) — un-checkpointed grant writes are sitting in the ` +
-        `write-ahead log. The grants directory is bind-mounted so these persist ` +
-        `across container recreate, but the checkpoint-after-mutation defense ` +
-        `(grants.ts) appears not to be firing.`,
+        `(mtime ${main.mtime}) and has been divergent for ${ageSecs}s — ` +
+        `un-checkpointed grant writes are sitting in the write-ahead log. The ` +
+        `grants directory is bind-mounted so these persist across container ` +
+        `recreate, but the checkpoint-after-mutation defense (grants.ts) ` +
+        `appears not to be firing.`,
       fix:
         "Verify the broker is running the #3289 build (checkpoint after every " +
         "mint/revoke). A one-off `PRAGMA wal_checkpoint(TRUNCATE)` clears the backlog.",
