@@ -4,6 +4,21 @@
 
 ### Fixes
 
+- **Inbound Telegram messages are never silently dropped at the routing
+  layer** (#3300) — the gateway registered only content-specific handlers
+  (`bot.on('message:text')`, `:photo`, … `:paid_media`); grammy ^1.44 routes
+  these as filtering middleware and SILENTLY ignores any `message` update
+  matching none of them (no log, no ack, no history row). A forwarded brief
+  whose content matched no registered filter vanished with zero trace — the
+  root cause of the 2026-07-16 dropped-forward incident and why history.db had
+  never recorded a `forwarded_from` row despite #3162. Fix: a terminal
+  `bot.on('message', …)` catch-all registered LAST (grammy leaf handlers never
+  call `next()`, so a specific match still wins and the catch-all only fires
+  for otherwise-unhandled messages) routes every inbound through the normal
+  pipeline with best-effort text (`text ?? caption ?? "(unhandled message
+  content: <type>)"`), preserving access gating and forward-origin metadata.
+  A lightweight diagnostic tap now logs every received update's type + content
+  keys (never payload bodies) so a drop at this layer is always diagnosable.
 - **Telegram `/logs` works again** (#3283) — the gateway passed `--lines`
   to `switchroom agent logs`, which didn't accept the flag; it now exists
   (`-n, --lines <count>`). Behavior change for direct CLI users:

@@ -171,6 +171,9 @@ export default defineConfig({
       // history-reaper.test.ts uses bun:sqlite + bun:test (#1073) —
       // excluded here, run via test:bun.
       "**/telegram-plugin/tests/history-reaper.test.ts",
+      // catch-all-forwarded-history.test.ts uses bun:sqlite (history) +
+      // bun:test (#3300) — excluded here, run via test:bun.
+      "**/telegram-plugin/tests/catch-all-forwarded-history.test.ts",
       // sandbox-hint-posttool.test.ts uses bun:test — run via test:bun.
       "**/telegram-plugin/tests/sandbox-hint-posttool.test.ts",
       // tts-normalize.test.ts (#2760 Phase 1) imports bun:test — run via test:bun.
