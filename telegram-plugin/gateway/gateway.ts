@@ -496,6 +496,7 @@ import {
   readSessionModelFileRaw,
   restoreSessionModelFileRaw,
   clearSessionModelFile,
+  consumeSessionModelCarrierOnHealthyBoot,
   readConfiguredDefaultModel,
   writeSessionEffortFile,
   clearSessionEffortFile,
@@ -9679,6 +9680,18 @@ function ensureIssuesCard(chatId: string, threadId: number | undefined): void {
     process.stderr.write(
       `telegram gateway: wrote PID file ${GATEWAY_PID_PATH} pid=${process.pid} startedAt=${GATEWAY_STARTED_AT_MS}\n`,
     )
+    // #3284 — this boot ACQUIRED the boot lock, so it is the surviving healthy
+    // session. Consume the session-model carrier now (delete the carrier + the
+    // bounded-retry attempt counter). start.sh no longer deletes the carrier
+    // before apply: an apply-boot that wedged before reaching this point leaves
+    // the carrier in place so the retry boot RE-APPLIES the intended model
+    // instead of silently reverting to the configured default (the marko/klanker
+    // boot.lock_stale_recovered_boot_mismatch revert). Best-effort, gated on
+    // lock ownership so a LOSING double-boot never clears the winner's carrier.
+    {
+      const carrierAgentDir = resolveAgentDirFromEnv()
+      if (carrierAgentDir != null) consumeSessionModelCarrierOnHealthyBoot(carrierAgentDir)
+    }
     // We WON the startup mutex — this gateway is the sole live owner of the
     // shared per-agent status-pin store, so it's now safe to clean up orphaned
     // pins from a prior (dead) session. Gated here (not at import time) so a
@@ -9702,6 +9715,13 @@ function ensureIssuesCard(chatId: string, threadId: number | undefined): void {
       // probe + 409-retry loop is still the liveness guard on this path. A
       // successful writePidFile here means no live holder was detected, so
       // running orphan cleanup is consistent with the pre-mutex behaviour.
+      // #3284: same healthy-boot carrier consume as the mutex-acquired path —
+      // a successful writePidFile means no live holder was detected, so this is
+      // the surviving session.
+      {
+        const carrierAgentDir = resolveAgentDirFromEnv()
+        if (carrierAgentDir != null) consumeSessionModelCarrierOnHealthyBoot(carrierAgentDir)
+      }
       // #3026: same sequenced cleanup + DM stale-pin sweep as the mutex path.
       void runBootPinCleanupAndDmSweep()
     } catch (writeErr) {

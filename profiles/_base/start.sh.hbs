@@ -1182,10 +1182,17 @@ _EFFECTIVE_MODEL={{{modelQ}}}
 printf '%s\n' "$_EFFECTIVE_MODEL" > "{{agentDir}}/.configured-default-model" 2>/dev/null || true
 
 # Rev-4 hygiene (#3184 review LOW-2): remove the files retired with the
-# keep/revert intent subsystem and the crashloop self-heal. Nothing reads them
-# anymore; without this rm they would linger in the bind-mounted state dir
-# forever after rollout. Idempotent — a cheap no-op once clean.
-rm -f "{{agentDir}}/.relaunch-model-intent" "{{agentDir}}/.session-model-boot-attempts" "{{agentDir}}/.session-model-kept-notified"
+# keep/revert intent subsystem. Nothing reads them anymore; without this rm they
+# would linger in the bind-mounted state dir forever after rollout. Idempotent —
+# a cheap no-op once clean.
+rm -f "{{agentDir}}/.relaunch-model-intent" "{{agentDir}}/.session-model-kept-notified"
+# `.session-model-boot-attempts` is REVIVED as LIVE state (#3284 bounded-retry
+# counter, see the resolution block below): the gateway clears it on a healthy
+# boot, and start.sh gives up + reverts once it exceeds the attempt bound. It is
+# meaningless without a carrier to belong to, so sweep it as stale ONLY when no
+# `.session-model` carrier is present (rollout leftover / completed apply / a
+# prior giveup that didn't get to delete it).
+[ -f "{{agentDir}}/.session-model" ] || rm -f "{{agentDir}}/.session-model-boot-attempts"
 
 # Migration shim (one release): a leftover one-shot `.session-model-override`
 # carrier from a pre-consume-once gateway means an OLD gateway wrote it
@@ -1207,11 +1214,34 @@ if [ -f "{{agentDir}}/.session-model" ]; then
   _smf="$(cat "{{agentDir}}/.session-model" 2>/dev/null || true)"
   _sm_model="$(printf '%s' "$_smf" | sed -n 's/.*"model"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
   _sm_cfg="$(printf '%s' "$_smf" | sed -n 's/.*"configuredDefaultAtWrite"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
-  # CONSUME-ONCE: delete the carrier now, before any apply/exec. The carrier
-  # governs exactly this one boot; a bad token can therefore crash at most one
-  # boot (the next boot has no carrier and reverts), so no crashloop self-heal
-  # is needed. Every branch below has already removed the file.
-  rm -f "{{agentDir}}/.session-model"
+  # BOUNDED-RETRY CONSUME (#3284) — the carrier is NO LONGER deleted here before
+  # the apply/exec. It used to be (pure consume-once), but a boot that reads the
+  # carrier may WEDGE before its gateway acquires the boot lock (the
+  # boot.lock_stale_recovered_boot_mismatch race, e.g. a proxy-only `fable`
+  # apply-boot) and never become the surviving healthy session. Deleting before
+  # apply handed the requested model to that loser: the retry boot found no
+  # carrier and silently reverted to the configured default. Instead:
+  #
+  #   - the GATEWAY deletes the carrier + the attempt counter once it ACQUIRES
+  #     the boot lock (boot.lock_acquired in gateway.ts — the healthy-boot signal
+  #     a wedged boot cannot fake), so a GOOD token survives a transient wedge
+  #     and RE-APPLIES on the retry boot instead of reverting;
+  #   - a persisted attempt counter (`.session-model-boot-attempts`) BOUNDS the
+  #     retries: a token that never reaches a healthy gateway (a genuinely BAD
+  #     token that crashes claude before lock-acquire) is given up after
+  #     _SM_MAX_ATTEMPTS boots — deleted, reverted, and alerted — so a bad token
+  #     can NEVER produce an unbounded wedge→retry→wedge crashloop. The original
+  #     "a bad token crashes at most one boot then reverts" guarantee becomes "at
+  #     most _SM_MAX_ATTEMPTS boots then reverts", still a hard finite bound.
+  #
+  # Every INVALIDATION / GIVEUP branch below deletes BOTH the carrier and the
+  # counter; only the APPLY branch keeps the carrier (for the gateway to clear)
+  # and persists the incremented counter. The delete-before-apply that used to
+  # sit here is GONE by design.
+  _SM_MAX_ATTEMPTS=3
+  _sm_attempts="$(cat "{{agentDir}}/.session-model-boot-attempts" 2>/dev/null | tr -dc '0-9' || true)"
+  [ -z "$_sm_attempts" ] && _sm_attempts=0
+  _sm_attempts=$(( _sm_attempts + 1 ))
   # Shape gate — kept BYTE-IDENTICAL with MODEL_ARG_RE in
   # telegram-plugin/gateway/model-command.ts. `/` is allowed for
   # OpenRouter-style `sr-vendor/model` ids; it is not a shell metachar inside
@@ -1222,33 +1252,56 @@ if [ -f "{{agentDir}}/.session-model" ]; then
   # `claude --model` (parity with parseSessionModel's single-string check).
   if [ "$(printf '%s' "$_sm_model" | wc -c)" -eq 0 ] || [ "$(printf '%s' "$_sm_model" | wc -l)" -ne 0 ] || ! printf '%s' "$_sm_model" | grep -Eq '^[A-Za-z0-9][]A-Za-z0-9._[/-]{0,99}$'; then
     # Invalid carrier: fall back to the configured default AND tell the
-    # operator once — never a silent stderr-only drop.
+    # operator once — never a silent stderr-only drop. Terminal → drop the
+    # carrier + counter (a corrupt token is never worth retrying).
+    rm -f "{{agentDir}}/.session-model" "{{agentDir}}/.session-model-boot-attempts"
     echo "session-model: ignoring malformed .session-model (failed shape gate) — using configured default '$_EFFECTIVE_MODEL'" >&2
     printf 'Your saved session model override could not be read (invalid or corrupt), so the agent booted on its configured default `%s`. Re-issue /model <name> if you want a different model.\n' "$_EFFECTIVE_MODEL" > "{{agentDir}}/.session-model-alert" 2>/dev/null || true
   elif [ "$_sm_cfg" != "$_EFFECTIVE_MODEL" ]; then
     # switchroom.yaml `model:` changed between the switch and this apply-boot →
     # the carrier is against a default that no longer exists. Invalidate +
-    # announce once.
+    # announce once. Terminal → drop the carrier + counter.
+    rm -f "{{agentDir}}/.session-model" "{{agentDir}}/.session-model-boot-attempts"
     echo "session-model: configured default changed ('$_sm_cfg' → '$_EFFECTIVE_MODEL') — dropping session override '$_sm_model'" >&2
     printf 'The configured default model changed (`%s` → `%s`), so your session override to `%s` was not applied — the agent booted on the new configured default. Re-issue /model %s if you still want it.\n' "$_sm_cfg" "$_EFFECTIVE_MODEL" "$_sm_model" "$_sm_model" > "{{agentDir}}/.session-model-alert" 2>/dev/null || true
   elif { [ "${_sm_model#sr-}" != "$_sm_model" ] || [ "$_sm_model" = fable ] || [ "$_sm_model" = claude-fable-5 ]; } && [ -z "$_LITELLM_OK" ]; then
     # Proxy-only override + LiteLLM unreachable at the apply-boot: booting the
     # override would 4xx (sr-* against Anthropic; `fable`/`claude-fable-5` is a
     # retired codename direct-to-Anthropic and ONLY resolves via the LiteLLM
-    # router — see the repoint case below). Consume-once means we can't retain it
-    # for a later relaunch, so boot the configured default and tell the operator
-    # to re-issue once the proxy is back. (Rev 5: Fable is now reachable via the
-    # carrier relaunch — the old live-inject path never launched it — so it needs
-    # the same down-guard as sr-*.)
+    # router — see the repoint case below). The litellm probe already waited out
+    # its full 120s window before we got here, so "still unreachable" is a real
+    # down-state, not the transient boot-lock wedge the bounded-retry counter
+    # covers — drop the carrier + counter (terminal) and tell the operator to
+    # re-issue once the proxy is back, rather than looping against a dead proxy.
+    # (Rev 5: Fable is now reachable via the carrier relaunch — the old
+    # live-inject path never launched it — so it needs the same down-guard as sr-*.)
+    rm -f "{{agentDir}}/.session-model" "{{agentDir}}/.session-model-boot-attempts"
     echo "session-model: LiteLLM proxy unreachable at boot — NOT applying proxy-only override '$_sm_model'; booting configured default '$_EFFECTIVE_MODEL' (re-issue /model when the proxy is back)" >&2
     printf 'LiteLLM proxy was unreachable at boot, so the session model override `%s` was not applied — the agent booted on its configured default `%s`. Re-issue /model %s once the proxy is reachable.\n' "$_sm_model" "$_EFFECTIVE_MODEL" "$_sm_model" > "{{agentDir}}/.session-model-alert" 2>/dev/null || true
+  elif [ "$_sm_attempts" -gt "$_SM_MAX_ATTEMPTS" ]; then
+    # CRASHLOOP BOUND (#3284). This carrier has now been read on more than
+    # _SM_MAX_ATTEMPTS boots WITHOUT the gateway ever reaching boot.lock_acquired
+    # to clear it — i.e. every apply-boot wedged/crashed before a healthy
+    # gateway. That is the signature of a genuinely bad token (one that will
+    # never boot), NOT the transient boot-lock race we retry for. Give up:
+    # drop the carrier + counter, revert to the configured default, and alert.
+    # This is the hard finite bound that guarantees no unbounded crashloop.
+    rm -f "{{agentDir}}/.session-model" "{{agentDir}}/.session-model-boot-attempts"
+    echo "session-model: override '$_sm_model' did not reach a healthy boot after $_SM_MAX_ATTEMPTS attempts — reverting to configured default '$_EFFECTIVE_MODEL'" >&2
+    printf 'Your session model override `%s` could not boot successfully after %s attempts, so the agent reverted to its configured default `%s`. Re-issue /model %s to try again.\n' "$_sm_model" "$_SM_MAX_ATTEMPTS" "$_EFFECTIVE_MODEL" "$_sm_model" > "{{agentDir}}/.session-model-alert" 2>/dev/null || true
   else
-    # Apply the carrier for THIS session. No boot alert — the gateway already
-    # acked the /model switch in chat, and the override reverts on next restart.
+    # Apply the carrier for THIS session and KEEP it: the gateway deletes the
+    # carrier + counter once it acquires the boot lock (healthy boot), so a
+    # transient wedge before that RE-APPLIES on the retry boot instead of
+    # reverting. Persist the incremented attempt counter so the crashloop bound
+    # above can fire if this token keeps wedging. No boot alert — the gateway
+    # already acked the /model switch in chat, and the override reverts on the
+    # next restart (once the gateway has cleared the carrier).
+    printf '%s\n' "$_sm_attempts" > "{{agentDir}}/.session-model-boot-attempts" 2>/dev/null || true
     _EFFECTIVE_MODEL="$_sm_model"
-    echo "session-model: applying session override '$_sm_model' this boot (consume-once — reverts on next restart)" >&2
+    echo "session-model: applying session override '$_sm_model' this boot (attempt $_sm_attempts/$_SM_MAX_ATTEMPTS — cleared by the gateway on a healthy boot, reverts on next restart)" >&2
   fi
-  unset _smf _sm_model _sm_cfg
+  unset _smf _sm_model _sm_cfg _sm_attempts _SM_MAX_ATTEMPTS
 fi
 
 # --- Session effort resolution (consume-once .session-effort carrier, #3186) ---

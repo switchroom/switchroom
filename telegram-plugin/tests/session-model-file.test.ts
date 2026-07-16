@@ -17,8 +17,10 @@ import {
   readSessionModelFileRaw,
   restoreSessionModelFileRaw,
   clearSessionModelFile,
+  consumeSessionModelCarrierOnHealthyBoot,
   readConfiguredDefaultModel,
   SESSION_MODEL_FILE,
+  SESSION_MODEL_BOOT_ATTEMPTS_FILE,
   CONFIGURED_DEFAULT_MODEL_FILE,
   parseSessionEffort,
   writeSessionEffortFile,
@@ -77,6 +79,27 @@ describe('rollback snapshot (scheduleModelRelaunch dispatch failure)', () => {
     writeSessionModelFile(dir, 'sr-glm-5', 'claude-sonnet-5')
     restoreSessionModelFileRaw(dir, snapshot)
     expect(existsSync(join(dir, SESSION_MODEL_FILE))).toBe(false)
+  })
+})
+
+describe('consumeSessionModelCarrierOnHealthyBoot (#3284 healthy-boot consume)', () => {
+  it('deletes BOTH the carrier and the bounded-retry attempt counter', () => {
+    writeFileSync(join(dir, SESSION_MODEL_FILE), 'whatever\n')
+    writeFileSync(join(dir, SESSION_MODEL_BOOT_ATTEMPTS_FILE), '2\n')
+    consumeSessionModelCarrierOnHealthyBoot(dir)
+    expect(existsSync(join(dir, SESSION_MODEL_FILE))).toBe(false)
+    expect(existsSync(join(dir, SESSION_MODEL_BOOT_ATTEMPTS_FILE))).toBe(false)
+  })
+
+  it('is idempotent / best-effort when neither file exists (no throw)', () => {
+    expect(() => consumeSessionModelCarrierOnHealthyBoot(dir)).not.toThrow()
+    expect(existsSync(join(dir, SESSION_MODEL_FILE))).toBe(false)
+  })
+
+  it('clears the counter even when the carrier is already gone (wedge that lost its carrier mid-race)', () => {
+    writeFileSync(join(dir, SESSION_MODEL_BOOT_ATTEMPTS_FILE), '1\n')
+    consumeSessionModelCarrierOnHealthyBoot(dir)
+    expect(existsSync(join(dir, SESSION_MODEL_BOOT_ATTEMPTS_FILE))).toBe(false)
   })
 })
 

@@ -11,13 +11,19 @@ import type { AgentConfig, SwitchroomConfig, TelegramConfig } from "../src/confi
 // (reference/rfcs/session-model-stickiness.md §0.1, rev 4). Driven as
 // sh-harness fixtures against the RENDERED block.
 //
-// Contract under test (CONSUME-ONCE): a `.session-model` carrier is applied on
-// the single boot that reads it and then DELETED, so the model-apply relaunch
-// picks it up and EVERY subsequent restart reverts to the configured default.
-// There is no `.relaunch-model-intent`, no crashloop counter, and no
-// kept-notified sentinel. Invalidation (corrupt / configured-default changed /
-// sr-*+LiteLLM-down) drops the carrier and writes a `.session-model-alert` the
-// gateway relays.
+// Contract under test (BOUNDED-RETRY CONSUME, #3284): a `.session-model`
+// carrier is APPLIED on the boot that reads it but NOT deleted by start.sh —
+// the GATEWAY deletes it (+ the `.session-model-boot-attempts` counter) once it
+// acquires the boot lock (boot.lock_acquired, the healthy-boot signal). So a
+// boot that WEDGES before a healthy gateway leaves the carrier in place and the
+// retry boot RE-APPLIES the intended model instead of silently reverting (the
+// marko/klanker fable→opus revert). A persisted attempt counter BOUNDS the
+// retries: a token that never reaches a healthy gateway is given up after
+// _SM_MAX_ATTEMPTS boots (revert + alert), so a bad token can never crashloop.
+// There is no `.relaunch-model-intent` and no kept-notified sentinel.
+// Invalidation (corrupt / configured-default changed / sr-*+LiteLLM-down /
+// attempts-exceeded) drops the carrier + counter and writes a
+// `.session-model-alert` the gateway relays.
 
 const telegramConfig: TelegramConfig = {
   bot_token: "123456:ABC-DEF",
@@ -113,20 +119,41 @@ describe("scaffoldAgent: session-model consume-once boot resolver (start.sh)", (
     return readFileSync(join(agentDir, ".session-model-alert"), "utf-8");
   }
 
+  // #3284: start.sh no longer consumes the carrier on apply — the GATEWAY does,
+  // once it acquires the boot lock (boot.lock_acquired). These helpers simulate
+  // that healthy-boot consume and inspect the bounded-retry attempt counter so
+  // the sh-harness can model both a healthy boot and a wedge (no consume).
+  function healthyBootConsume(): void {
+    rmSync(join(agentDir, ".session-model"), { force: true });
+    rmSync(join(agentDir, ".session-model-boot-attempts"), { force: true });
+  }
+  function carrierExists(): boolean {
+    return existsSync(join(agentDir, ".session-model"));
+  }
+  function attemptCount(): string {
+    return existsSync(join(agentDir, ".session-model-boot-attempts"))
+      ? readFileSync(join(agentDir, ".session-model-boot-attempts"), "utf-8").trim()
+      : "";
+  }
+
   it("renders the consume-once carrier wiring in start.sh (no intent resolution)", () => {
     expect(block).toContain(".session-model");
     expect(block).toContain(".configured-default-model");
     expect(block).toContain(".session-model-alert");
     // Migration shim still consumes the legacy one-shot carrier.
     expect(block).toContain(".session-model-override");
-    // The retired keep/revert intent + crashloop machinery is no longer
-    // RESOLVED — the retired filenames appear only in the one-line hygiene
+    // The retired keep/revert intent + kept-notified machinery is no longer
+    // RESOLVED — those retired filenames appear only in the one-line hygiene
     // `rm -f` (#3184 LOW-2), never in a read/parse/stamp.
     expect(block).not.toContain('"intent"');
     expect(block).not.toContain("_sm_revert");
     expect(block).not.toMatch(/(cat|read -r|<)[^\n]*\.relaunch-model-intent/);
-    expect(block).not.toMatch(/(cat|read -r|<)[^\n]*\.session-model-boot-attempts/);
     expect(block).not.toMatch(/(cat|read -r|<)[^\n]*\.session-model-kept-notified/);
+    // #3284: `.session-model-boot-attempts` is REVIVED as the live bounded-retry
+    // counter — the block now READS it (cat|tr) and PERSISTS it, and the gateway
+    // clears it on a healthy boot.
+    expect(block).toMatch(/cat[^\n]*\.session-model-boot-attempts/);
+    expect(block).toContain("_SM_MAX_ATTEMPTS");
     // modelQ is assigned BARE (already shell-quoted by the scaffold).
     expect(block).toContain("_EFFECTIVE_MODEL='claude-sonnet-5'");
     const startSh = readFileSync(join(agentDir, "start.sh"), "utf-8");
@@ -145,11 +172,13 @@ describe("scaffoldAgent: session-model consume-once boot resolver (start.sh)", (
     expect(existsSync(join(agentDir, ".session-model-boot-attempts"))).toBe(false);
     expect(existsSync(join(agentDir, ".session-model-kept-notified"))).toBe(false);
     // A stale intent file has NO effect on carrier resolution: a carrier still
-    // applies + consumes regardless of any leftover intent content.
+    // applies regardless of any leftover intent content. (#3284: the carrier is
+    // now consumed by the gateway on a healthy boot, not by start.sh, so it
+    // survives the apply boot; the retired intent file is still swept.)
     writeFileSync(join(agentDir, ".relaunch-model-intent"), `${JSON.stringify({ intent: "revert", reason: "old", ts: Date.now() })}\n`);
     writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8"));
     expect(runBlock("1")).toBe("claude-opus-4-8");
-    expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
+    expect(carrierExists()).toBe(true); // kept for the gateway to consume
     expect(existsSync(join(agentDir, ".relaunch-model-intent"))).toBe(false);
   });
 
@@ -192,22 +221,75 @@ describe("scaffoldAgent: session-model consume-once boot resolver (start.sh)", (
   });
 
   // ── requirement (a): the apply-relaunch picks up the carrier ─────────────
-  it("valid carrier → APPLIES the override this boot and CONSUMES the carrier (no boot alert)", () => {
+  it("valid carrier → APPLIES the override this boot and KEEPS the carrier for the gateway (no boot alert)", () => {
     writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8"));
     expect(runBlock("1")).toBe("claude-opus-4-8");
-    // Consume-once: the carrier is deleted on the apply boot.
-    expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
+    // #3284: start.sh no longer consumes — it applies and leaves the carrier +
+    // an attempt counter for the gateway to clear on a healthy boot.
+    expect(carrierExists()).toBe(true);
+    expect(attemptCount()).toBe("1");
     // The gateway already acked the /model in chat — no boot alert on apply.
     expect(existsSync(join(agentDir, ".session-model-alert"))).toBe(false);
   });
 
-  // ── requirement (b): the next restart reverts to the configured default ──
-  it("SUBSEQUENT restart (carrier already consumed) → reverts to the configured default", () => {
+  // ── requirement (b): after the gateway consumes, the next restart reverts ──
+  it("SUBSEQUENT restart (after the gateway's healthy-boot consume) → reverts to the configured default", () => {
     writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8"));
     expect(runBlock("1")).toBe("claude-opus-4-8"); // apply-relaunch
+    healthyBootConsume(); // the gateway acquired the boot lock and cleared the carrier
     expect(runBlock("1")).toBe(DEFAULT_MODEL); // any later restart
     expect(runBlock("1")).toBe(DEFAULT_MODEL); // and every one after
-    expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
+    expect(carrierExists()).toBe(false);
+    expect(attemptCount()).toBe(""); // counter swept once the carrier is gone
+  });
+
+  // ── #3284 requirement (a): a GOOD token survives a boot-lock wedge ───────
+  // A boot that reads the carrier but WEDGES before its gateway acquires the
+  // boot lock (boot.lock_stale_recovered_boot_mismatch) never calls
+  // healthyBootConsume(); the carrier + counter survive, so the retry boot
+  // RE-APPLIES the intended model instead of silently reverting. This is the
+  // marko/klanker `fable → opus` revert the pre-fix start.sh produced.
+  it("good token + wedge before healthy boot → RE-APPLIES on the retry boot (no silent revert)", () => {
+    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("fable"));
+    // Apply-boot 1 wedges (proxy up so `fable` is applied; gateway never reaches
+    // boot.lock_acquired, so NO healthyBootConsume()).
+    expect(runBlockRouting("1").effective).toBe("fable");
+    expect(carrierExists()).toBe(true);
+    expect(attemptCount()).toBe("1");
+    // Retry boot re-applies `fable` — the pre-fix behavior reverted to default
+    // here because the carrier had already been consumed by the wedged boot.
+    expect(runBlockRouting("1").effective).toBe("fable");
+    expect(attemptCount()).toBe("2");
+    // Now the gateway finally acquires the lock and consumes the carrier.
+    healthyBootConsume();
+    expect(runBlock("1")).toBe(DEFAULT_MODEL); // next ordinary restart reverts
+  });
+
+  // ── #3284 CRASHLOOP BOUND: a BAD token gives up after N attempts ─────────
+  // A token that NEVER reaches a healthy gateway (claude crashes before
+  // boot.lock_acquire on every boot, so healthyBootConsume() is never called)
+  // must not wedge→retry→wedge forever. After _SM_MAX_ATTEMPTS (3) apply boots
+  // the carrier is dropped, the default is booted, and the operator is alerted.
+  it("bad token that keeps wedging → gives up after the bounded attempts, reverts + alerts (no crashloop)", () => {
+    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8"));
+    // Attempts 1..3 apply the override and KEEP the carrier (each boot wedges).
+    expect(runBlock("1")).toBe("claude-opus-4-8");
+    expect(attemptCount()).toBe("1");
+    expect(runBlock("1")).toBe("claude-opus-4-8");
+    expect(attemptCount()).toBe("2");
+    expect(runBlock("1")).toBe("claude-opus-4-8");
+    expect(attemptCount()).toBe("3");
+    // Attempt 4 exceeds the bound → give up: revert to default, drop the
+    // carrier + counter, and alert. This is the hard crashloop bound.
+    expect(runBlock("1")).toBe(DEFAULT_MODEL);
+    expect(carrierExists()).toBe(false);
+    expect(attemptCount()).toBe("");
+    const alert = alertText();
+    expect(alert).toContain("claude-opus-4-8");
+    expect(alert).toContain("after 3 attempts");
+    expect(alert).toContain("reverted");
+    // And it STAYS reverted — no resurrection, no loop.
+    expect(runBlock("1")).toBe(DEFAULT_MODEL);
   });
 
   // ── invalidation branches (all consume + alert) ──────────────────────────
@@ -257,19 +339,19 @@ describe("scaffoldAgent: session-model consume-once boot resolver (start.sh)", (
     expect(alert).toContain("Re-issue /model");
   });
 
-  it("Claude carrier does NOT require LiteLLM (applies with proxy down, consumed)", () => {
+  it("Claude carrier does NOT require LiteLLM (applies with proxy down, carrier kept for the gateway)", () => {
     writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8"));
     expect(runBlock("")).toBe("claude-opus-4-8");
-    expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
+    expect(carrierExists()).toBe(true); // #3284: kept for the gateway's healthy-boot consume
   });
 
-  it("sr-* carrier + LiteLLM up → applies once + repoints ANTHROPIC_BASE_URL + consumed", () => {
+  it("sr-* carrier + LiteLLM up → applies once + repoints ANTHROPIC_BASE_URL + carrier kept for the gateway", () => {
     writeFileSync(join(agentDir, ".session-model"), sessionModelJson("sr-glm-5"));
     const { effective, baseUrl } = runBlockRouting("1");
     expect(effective).toBe("sr-glm-5");
     expect(baseUrl).toBe(ROUTER_ROOT);
     expect(baseUrl.endsWith("/anthropic")).toBe(false);
-    expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
+    expect(carrierExists()).toBe(true);
   });
 
   it("no carrier (Claude default) → KEEPS the /anthropic passthrough (guards the Opus SSE fix)", () => {
@@ -295,7 +377,7 @@ describe("scaffoldAgent: session-model consume-once boot resolver (start.sh)", (
     expect(effective).toBe("fable");
     expect(baseUrl).toBe(ROUTER_ROOT);
     expect(baseUrl.endsWith("/anthropic")).toBe(false);
-    expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
+    expect(carrierExists()).toBe(true); // #3284: kept for the gateway's healthy-boot consume
   });
 
   it("claude-fable-5 carrier + LiteLLM up → also repoints to the router root", () => {
@@ -317,12 +399,14 @@ describe("scaffoldAgent: session-model consume-once boot resolver (start.sh)", (
   });
 
   // ── migration from the one-shot carrier ──────────────────────────────────
-  it("legacy .session-model-override carrier → converted, applied + consumed THIS boot", () => {
+  it("legacy .session-model-override carrier → converted + applied THIS boot (carrier kept for the gateway)", () => {
     writeFileSync(join(agentDir, ".session-model-override"), "sr-glm-5\n");
     expect(runBlock("1")).toBe("sr-glm-5");
     expect(existsSync(join(agentDir, ".session-model-override"))).toBe(false);
-    // Consume-once: the converted carrier is also gone after the apply boot.
-    expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
+    // #3284: the converted carrier is APPLIED then kept for the gateway's
+    // healthy-boot consume (not deleted by start.sh).
+    expect(carrierExists()).toBe(true);
+    expect(attemptCount()).toBe("1");
   });
 
   it("legacy carrier WINS over an existing .session-model (newer intent)", () => {
@@ -390,13 +474,14 @@ describe("scaffoldAgent: session-model consume-once boot resolver (start.sh)", (
   // two native guarantees the downgrade relies on at the boot layer: revert is
   // free (consume-once) and the downgraded default resolves the CONFIGURED
   // (low) effort because the downgrade writes NO `.session-effort` carrier.
-  it("tier-downgrade carrier (model == configured default) → applies the default, consumes, reverts on next restart", () => {
+  it("tier-downgrade carrier (model == configured default) → applies the default, gateway consumes, reverts on next restart", () => {
     // The gateway writes {model: <configured default>, configuredDefaultAtWrite:
     // <same>} immediately before the resume restart.
     writeFileSync(join(agentDir, ".session-model"), sessionModelJson(DEFAULT_MODEL, DEFAULT_MODEL));
     expect(runBlock("1")).toBe(DEFAULT_MODEL); // resume boot runs the default
-    expect(existsSync(join(agentDir, ".session-model"))).toBe(false); // consume-once
+    expect(carrierExists()).toBe(true); // #3284: kept for the gateway's healthy-boot consume
     expect(existsSync(join(agentDir, ".session-model-alert"))).toBe(false); // silent apply
+    healthyBootConsume(); // gateway acquired the boot lock and cleared the carrier
     // Native revert: every subsequent restart is already the default (the
     // premium override was session-scoped and never wrote a surviving carrier).
     expect(runBlock("1")).toBe(DEFAULT_MODEL);
