@@ -30,6 +30,7 @@
 import {
   detectModelUnavailable,
   isLitellmProxyLocal429,
+  isLitellmProxyAuthMisconfig,
   parseResetTime,
 } from './model-unavailable.js'
 import { classify429Detail } from './throttle-tier.js'
@@ -46,6 +47,7 @@ export type LlmErrorKind =
   | 'overload_529'
   | 'quota_wall'
   | 'auth'
+  | 'infra_misconfig'
   | 'transient'
   | 'unknown'
 
@@ -150,8 +152,22 @@ export function parseLlmError(
 function classifyKindAndSource(text: string): { kind: LlmErrorKind; source: LlmErrorSource } {
   const lower = text.toLowerCase()
 
+  // 0. LiteLLM-proxy AUTH misconfig — checked BEFORE the auth branch. The
+  //    proxy's internal fallback re-dispatched WITHOUT the OAuth header onto a
+  //    keyless deployment, so Anthropic 401'd it ("x-api-key header is
+  //    required"). This is an OPERATOR-only infra fault, NOT an end-user login
+  //    wall — never the user-facing 'auth' kind (which renders a re-auth card a
+  //    non-operator user cannot act on). Source is the local proxy, not
+  //    Anthropic. See isLitellmProxyAuthMisconfig for provenance.
+  if (isLitellmProxyAuthMisconfig(text)) {
+    return { kind: 'infra_misconfig', source: 'litellm-local' }
+  }
+
   // 1. Auth — always terminal, always actionable.
   const claudeKind = classifyClaudeError({ message: text, type: text })
+  if (claudeKind === 'proxy-misconfig') {
+    return { kind: 'infra_misconfig', source: 'litellm-local' }
+  }
   if (claudeKind === 'credentials-expired' || claudeKind === 'credentials-invalid') {
     return { kind: 'auth', source: 'anthropic' }
   }
@@ -212,6 +228,8 @@ function buildCoreText(kind: LlmErrorKind, source: LlmErrorSource): string {
       return 'Usage limit reached on this Claude subscription.'
     case 'auth':
       return 'Claude login needs re-authentication.'
+    case 'infra_misconfig':
+      return 'Local model-gateway auth misconfig (proxy fallback dropped the OAuth header).'
     case 'transient':
       return source === 'network'
         ? "Couldn't reach Anthropic (network) — retrying automatically."
@@ -280,6 +298,10 @@ function buildRecommendation(parsed: ParsedLlmError, tz: string): string | undef
   switch (parsed.kind) {
     case 'auth':
       return '→ Re-authenticate this account to continue.'
+    case 'infra_misconfig':
+      // Operator-facing — NO re-auth wording (the login is fine). Points at the
+      // real remedy: the local LiteLLM proxy fallback config.
+      return '→ Fix the LiteLLM proxy fallback config (deployment missing OAuth passthrough).'
     case 'quota_wall': {
       const reset = formatResetClock(parsed.resetAt, tz)
       return reset
@@ -353,6 +375,8 @@ function kindEmoji(kind: LlmErrorKind): string {
       return '⚠️'
     case 'auth':
       return '🔑'
+    case 'infra_misconfig':
+      return '🛠️'
     case 'transient':
       return '🌐'
     case 'unknown':

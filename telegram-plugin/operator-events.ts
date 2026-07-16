@@ -14,12 +14,14 @@
 
 import { escapeMarkdown } from './format.js'
 import { stripRawErrorBytes } from './raw-error-scrub.js'
+import { isLitellmProxyAuthMisconfig } from './model-unavailable.js'
 
 // ─── Taxonomy ────────────────────────────────────────────────────────────────
 
 export type OperatorEventKind =
   | 'credentials-expired'
   | 'credentials-invalid'
+  | 'proxy-misconfig'
   | 'credit-exhausted'
   | 'quota-exhausted'
   | 'rate-limited'
@@ -91,6 +93,20 @@ function classifyInner(raw: unknown): OperatorEventKind {
 
   // Anthropic SDK: error_code field (newer SDK shape)
   const sdkCode = extractString(obj, 'error_code') ?? ''
+
+  // LiteLLM-proxy AUTH misconfig — checked BEFORE the generic
+  // authentication_error branch. The proxy's internal fallback chain
+  // re-dispatches without the client's OAuth Authorization header onto a
+  // keyless deployment, so Anthropic returns a 401 authentication_error
+  // ("x-api-key header is required"). That is a HOST-side infra misconfig for
+  // the operator to fix — NOT an end-user login wall. Mapping it to
+  // credentials-invalid mis-fired a "🔑 re-authenticate" card at non-operator
+  // users who cannot re-auth anything (incident 2026-07-16). Route it to the
+  // operator-only infra kind instead. Scanned across type/code/message so the
+  // marker is caught wherever the proxy stamps it.
+  if (isLitellmProxyAuthMisconfig(`${errorType}\n${errorCode}\n${sdkCode}\n${message}`)) {
+    return 'proxy-misconfig'
+  }
 
   // Map known Anthropic error types/codes first.
   // Source: https://docs.anthropic.com/en/api/errors
@@ -259,6 +275,27 @@ export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
               { text: '🔐 Reauth now', callback_data: `op:reauth:${encodeURIComponent(ev.agent)}` },
               { text: '❌ Dismiss', callback_data: `op:dismiss:${encodeURIComponent(ev.agent)}` },
             ],
+          ],
+        },
+      }
+
+    // Operator-only infra fault. Deliberately NO "Reauth" button and NO
+    // login language: the OAuth credential is fine — the local LiteLLM proxy
+    // re-dispatched an internal fallback without forwarding the OAuth header
+    // onto a keyless deployment, so Anthropic 401'd it. The fix is in the
+    // proxy fallback config (host-side), not a re-auth. Dismiss-only.
+    case 'proxy-misconfig':
+      return {
+        text: [
+          `🛠️ **Model-gateway auth misconfig** for **${agent}**.`,
+          detail ? `_${detail}_` : '',
+          `The local LiteLLM proxy re-dispatched a fallback without forwarding the OAuth header (keyless deployment → Anthropic 401). Fix the proxy fallback config — this is NOT a login problem.`,
+        ]
+          .filter(Boolean)
+          .join('\n'),
+        keyboard: {
+          inline_keyboard: [
+            [{ text: '❌ Dismiss', callback_data: `op:dismiss:${encodeURIComponent(ev.agent)}` }],
           ],
         },
       }
@@ -485,6 +522,82 @@ export function clearOperatorEventCooldown(agent: string, kind: OperatorEventKin
 /** Reset ALL cooldowns (for testing). */
 export function resetAllCooldowns(): void {
   cooldownMap.clear()
+}
+
+// ─── Audience routing (Ken's deterministic error-surfacing policy) ────────────
+
+/**
+ * Kinds that are OPERATOR-ACTIONABLE and NOT user-actionable: a credential /
+ * infra fault whose remedy (re-auth, switch account slot, fix the proxy
+ * fallback config) only the operator can perform. Per Ken's standing policy
+ * (2026-07): raw or misleading auth/infra errors must not reach non-operator
+ * end users — they cannot act on them and the diagnosis is often wrong for
+ * them (e.g. a proxy misconfig rendered as "your login expired"). These route
+ * to the operator surface ONLY; a non-operator user gets at most a brief
+ * plain-language "couldn't complete, it's on our side" notice.
+ *
+ * NOTE: `quota-exhausted` / `rate-limited` are deliberately EXCLUDED — they
+ * carry their own auto-fallback UX + card-collapse machinery and are handled
+ * upstream; this set is scoped to the credential/infra fault classes.
+ */
+export const OPERATOR_ACTIONABLE_KINDS: ReadonlySet<OperatorEventKind> = new Set<OperatorEventKind>([
+  'credentials-expired',
+  'credentials-invalid',
+  'credit-exhausted',
+  'proxy-misconfig',
+])
+
+export function isOperatorActionableKind(kind: OperatorEventKind): boolean {
+  return OPERATOR_ACTIONABLE_KINDS.has(kind)
+}
+
+export interface OperatorEventAudience {
+  /** Chats that receive the full operator card (with any action buttons). */
+  operatorChats: string[]
+  /** Non-operator chats that receive only the plain-language failure notice. */
+  userNoticeChats: string[]
+}
+
+/**
+ * Split an operator-event's allowlist audience per Ken's routing policy.
+ *
+ * - Non-operator-actionable kinds (transient rate-limit, 5xx, crash, config
+ *   warning, …) keep their existing broadcast: every allowlist chat is an
+ *   `operatorChat`. Behavior unchanged.
+ * - Operator-actionable kinds (see {@link OPERATOR_ACTIONABLE_KINDS}) go to the
+ *   OPERATOR chat only. `operatorChatId` is the operator (in switchroom the
+ *   allowlist HEAD — `allowFrom[0]`); it stays an `operatorChat` even in a DM
+ *   agent where the operator is their own user (so the operator NEVER has an
+ *   error hidden from their own DM). Every other allowlist chat becomes a
+ *   `userNoticeChat`.
+ *
+ * Pure — no IPC, no bot. `allowFrom` order is preserved.
+ */
+export function decideOperatorEventAudience(
+  kind: OperatorEventKind,
+  allowFrom: readonly string[],
+  operatorChatId: string | undefined,
+): OperatorEventAudience {
+  if (!isOperatorActionableKind(kind)) {
+    return { operatorChats: [...allowFrom], userNoticeChats: [] }
+  }
+  const operator =
+    operatorChatId != null && allowFrom.includes(operatorChatId)
+      ? operatorChatId
+      : allowFrom[0]
+  const operatorChats = operator != null ? [operator] : []
+  const userNoticeChats = allowFrom.filter((c) => c !== operator)
+  return { operatorChats, userNoticeChats }
+}
+
+/**
+ * The ONE brief, plain-language failure notice a non-operator user gets when a
+ * turn genuinely can't be served because of an operator-actionable fault.
+ * Deliberately carries NO diagnosis, NO agent internals, NO re-auth / config
+ * instructions, and NO raw error text — just an honest "it's on our side".
+ */
+export function renderUserFacingFailureNotice(): string {
+  return "⚠️ Sorry — I couldn't complete that just now. It's a problem on our side, not anything you did. Please try again shortly."
 }
 
 // ─── Markdown escape (#2669) ──────────────────────────────────────────────────

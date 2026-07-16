@@ -22,6 +22,24 @@
   do NOT become agent turns. A rate-limited diagnostic tap logs every
   received update's type + content keys (never payload bodies) so any drop at
   this layer is diagnosable from logs.
+- **LiteLLM proxy-fallback 401 no longer mis-fires a "re-authenticate" card at
+  end users** — LiteLLM's internal model-fallback chain re-dispatches a failed
+  primary WITHOUT forwarding the client's OAuth `Authorization` header; the
+  keyless (passthrough) fallback deployment therefore draws a 401
+  `authentication_error` "x-api-key header is required" from Anthropic. The
+  gateway classifier mapped ANY `authentication_error` → `credentials-invalid`
+  → an always-rendered "🔑 Claude login needs re-authentication" card that was
+  broadcast to EVERY allowlist chat — wrong audience (a non-operator user can't
+  re-auth) and wrong diagnosis (the login is fine; the proxy fallback config is
+  not). New `isLitellmProxyAuthMisconfig()` (mirroring the `isLitellmProxyLocal429`
+  precedent) detects the keyless-401 shape and both classifiers now route it to
+  an operator-only infra fault (`proxy-misconfig` / `infra_misconfig`, source
+  `litellm-local`) instead of `auth`. Per Ken's deterministic error-surfacing
+  policy, operator-actionable faults (credential / credit / proxy-misconfig) are
+  now delivered to the OPERATOR chat ONLY; other allowlist users get, at most, a
+  brief diagnosis-free "couldn't complete — it's on our side" notice. The
+  operator (allowlist head, including their own DM in a DM agent) always keeps
+  the full card. LiteLLM config itself is fixed separately on the host.
 - **Telegram `/logs` works again** (#3283) — the gateway passed `--lines`
   to `switchroom agent logs`, which didn't accept the flag; it now exists
   (`-n, --lines <count>`). Behavior change for direct CLI users:

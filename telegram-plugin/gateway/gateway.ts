@@ -328,6 +328,8 @@ import { autoClassifyMidTurnInbound } from './auto-classify-mid-turn.js'
 import {
   renderOperatorEvent,
   shouldEmitOperatorEvent,
+  decideOperatorEventAudience,
+  renderUserFacingFailureNotice,
   type OperatorEvent,
   type OperatorEventKind,
 } from '../operator-events.js'
@@ -8558,7 +8560,24 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
     `telegram gateway: operator-event posting agent=${agent} kind=${kind} to ${access.allowFrom.length} chat(s)` +
       (opEventTopic != null ? ` topic=${opEventTopic}` : '') + '\n',
   )
-  for (const chat_id of access.allowFrom) {
+  // Ken's deterministic error-surfacing policy: an OPERATOR-ACTIONABLE fault
+  // (credentials / credit / proxy-misconfig) must not reach non-operator users
+  // as a raw or misleading card they can't act on. Split the audience — the
+  // operator (allowlist head) gets the full card; every other allowlist chat
+  // gets, at most, a brief plain-language "it's on our side" notice. Non-
+  // actionable kinds keep their existing broadcast (all chats are operatorChats).
+  const { operatorChats, userNoticeChats } = decideOperatorEventAudience(
+    kind,
+    access.allowFrom,
+    access.allowFrom[0],
+  )
+  if (userNoticeChats.length > 0) {
+    process.stderr.write(
+      `telegram gateway: operator-event operator-only routing agent=${agent} kind=${kind} operatorChats=${operatorChats.length} userNoticeChats=${userNoticeChats.length}\n`,
+    )
+  }
+
+  for (const chat_id of operatorChats) {
     // The resolved topic is valid ONLY in the agent's supergroup — attaching
     // it to an operator DM recipient yields 400 "message thread not found" and
     // the event silently fails to deliver (the marko #2096 class). Guard it:
@@ -8594,6 +8613,27 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
           `telegram gateway: operator-event send to ${chat_id} failed agent=${agent} kind=${kind}: ${e}\n`,
         )
       })
+  }
+
+  // Non-operator users: only the plain-language failure notice, and ONLY for
+  // an operator-actionable fault that genuinely ends the turn (userNoticeChats
+  // is empty for every non-actionable kind — see decideOperatorEventAudience).
+  // No diagnosis, no re-auth instructions, no raw error text.
+  if (userNoticeChats.length > 0) {
+    const userNoticeText = renderUserFacingFailureNotice()
+    for (const chat_id of userNoticeChats) {
+      const opEventThread = topicForRecipient({ recipientChatId: chat_id, resolvedTopic: opEventTopic, supergroupChatId: opEventSupergroup })
+      const opts = {
+        ...(opEventThread != null ? { message_thread_id: opEventThread } : {}),
+      }
+      // allow-raw-bot-api: operator-event user-notice loop; topic-aware opts
+      void bot.api.sendRichMessage(chat_id, richMessage(userNoticeText), opts as never)
+        .catch(e => {
+          process.stderr.write(
+            `telegram gateway: operator-event user-notice send to ${chat_id} failed agent=${agent} kind=${kind}: ${e}\n`,
+          )
+        })
+    }
   }
 }
 

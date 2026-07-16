@@ -196,6 +196,53 @@ export function isLitellmProxyLocal429(text: string): boolean {
 }
 
 /**
+ * True when `text` is a LiteLLM-proxy-LOCAL AUTH misconfiguration — the
+ * proxy-fallback keyless-401 class, NOT a genuine end-user credential wall.
+ *
+ * PROVENANCE (incident, 2026-07-16). LiteLLM's internal model-fallback chain
+ * (`gpt-oss-20b -> [gpt-oss-20b-openrouter, claude-sonnet-5]`) re-dispatches a
+ * failed primary WITHOUT forwarding the client's OAuth `Authorization` header.
+ * The `claude-sonnet-5` deployment is deliberately keyless (passthrough auth —
+ * it expects the forwarded OAuth), so Anthropic rejects the header-less
+ * fallback with a 401 `authentication_error` whose message is
+ * "x-api-key header is required". Switchroom agents authenticate the unmodified
+ * `claude` CLI with an OAuth Bearer token and NEVER an `x-api-key`, so that
+ * demand can only originate from the proxy dropping the header on a keyless
+ * fallback deployment — a host-side infra misconfig for the OPERATOR to fix,
+ * never a login problem an end user (or even the operator's OAuth) can act on.
+ *
+ * Misclassifying it (as `classifyClaudeError` did → `credentials-invalid` →
+ * a "🔑 re-authenticate" card) is doubly wrong: wrong AUDIENCE (a non-operator
+ * user like Lisa cannot re-auth anything) and wrong DIAGNOSIS (the login is
+ * fine; the proxy fallback config is not). Detecting it here lets both
+ * classifiers route it to the operator-only infra surface instead.
+ *
+ * Detection (deterministic wording, mirrors `isLitellmProxyLocal429`):
+ *   - the definitive "x-api-key header is required" marker (impossible for our
+ *     OAuth flow — only the keyless-proxy path emits it), OR
+ *   - an `authentication_error` CO-OCCURRING with LiteLLM-proxy / fallback
+ *     provenance markers (the proxy wraps the upstream 401 as it re-dispatches).
+ * Never throws on weird input.
+ */
+export function isLitellmProxyAuthMisconfig(text: string): boolean {
+  if (typeof text !== 'string' || text.length === 0) return false
+  const sample = text.length > 16_384 ? text.slice(0, 16_384) : text
+  const lower = sample.toLowerCase()
+  // Definitive marker — see provenance above.
+  if (lower.includes('x-api-key header is required')) return true
+  // Structural co-occurrence: an authentication_error wrapped by the local
+  // proxy's fallback re-dispatch. Keyed tightly so a genuine Anthropic OAuth
+  // expiry (which never mentions the proxy or an x-api-key) is NOT down-classified.
+  const isAuthErr =
+    lower.includes('authentication_error') || lower.includes('authenticationerror')
+  if (!isAuthErr) return false
+  return (
+    (lower.includes('litellm') || lower.includes('proxy')) &&
+    (lower.includes('fallback') || lower.includes('x-api-key') || lower.includes('api_key'))
+  )
+}
+
+/**
  * Best-effort extraction of the limit detail LiteLLM embeds in its
  * proxy-local 429 bodies, for instrumentation (the `rate_limit_429_classified`
  * runtime metric). All fields null when nothing parseable is found — never
