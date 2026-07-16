@@ -641,7 +641,7 @@ import {
 } from './turn-record-status.js'
 import {
   BackstopDeliveryLedger,
-  backstopReceiptIds,
+  runBackstopDelivery,
 } from './backstop-delivery.js'
 import {
   createDeliveryQueue,
@@ -2348,6 +2348,14 @@ const flushedTurnSupersede = new FlushedTurnSupersedeRegistry()
 // arbiter of backstop-vs-reply; the chunk ledger lets a retry after a partial
 // send resume at the first unsent chunk instead of re-sending chunk 0.
 const backstopDeliveryLedger = new BackstopDeliveryLedger()
+// #3276 finding-1 — bounded in-turn retries for the backstop send before it
+// gives up and records `send_failed` (leaving the obligation open for the
+// liveness floor). Resumes mid-chunk each attempt, so chunk 0 is never
+// re-sent. Env-tunable for ops; default 3.
+const BACKSTOP_DELIVERY_MAX_ATTEMPTS = (() => {
+  const raw = Number(process.env.SWITCHROOM_BACKSTOP_DELIVERY_MAX_ATTEMPTS)
+  return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : 3
+})()
 
 /**
  * #3276 — the ONE delivery primitive the turn-flush backstop uses to put a
@@ -2374,7 +2382,8 @@ async function deliverAnswer(args: {
   threadId: number | undefined
   text: string
   turnId: string
-}): Promise<{ sentIds: number[]; chunkCount: number; threw: boolean }> {
+  cardMessageId: number | null
+}): Promise<{ sentIds: number[]; chunkCount: number; delivered: boolean; exhausted: boolean }> {
   const { chatId, turnId } = args
   // Inject visible blank-line spacers into `\n\n` gaps, then split — exactly as
   // executeReply does on the non-literal path (idempotent, one U+00A0 per gap).
@@ -2417,50 +2426,65 @@ async function deliverAnswer(args: {
     stderr: (s: string) => { process.stderr.write(s) },
   }
 
-  let threw = false
+  // Send ONE chunk via the shared `sendReplyChunks` core. `liveThreadId`
+  // threads the THREAD_NOT_FOUND fallback decision across chunks. Returns the
+  // landed message id(s) (a length-resplit chunk may land >1); throws on an
+  // unrecoverable send failure so the retry orchestrator can resume.
   let liveThreadId = args.threadId
-  try {
-    for (let i = 0; i < chunks.length; i++) {
-      // Guard 6 resume — never re-send a chunk that already landed for this turn.
-      if (backstopDeliveryLedger.hasChunk(turnId, i)) continue
-      backstopDeliveryLedger.markPending(turnId, i)
-      const chunkIds: number[] = []
-      const res = await sendReplyChunks(deps, {
-        chatId,
-        chunks: [chunks[i]],
-        literalText: false,
-        suppressText: false,
-        threadId: liveThreadId,
-        previewMessageId: null,
-        sentIds: chunkIds,
-        buildSendOpts: (_i, _isLast, tid) => ({
-          ...(tid != null ? { message_thread_id: tid } : {}),
-          link_preview_options: { is_disabled: true },
-        }),
-        buildPreviewEditOpts: () => ({}),
-      })
-      liveThreadId = res.threadId
-      backstopDeliveryLedger.recordChunk(turnId, i, chunkIds)
-    }
-  } catch (err) {
-    threw = true
-    process.stderr.write(
-      `telegram gateway: deliverAnswer send failed: ${(err as Error).message}\n`,
-    )
+  const sendChunk = async (_chunkIndex: number, text: string): Promise<number[]> => {
+    const chunkIds: number[] = []
+    const res = await sendReplyChunks(deps, {
+      chatId,
+      chunks: [text],
+      literalText: false,
+      suppressText: false,
+      threadId: liveThreadId,
+      previewMessageId: null,
+      sentIds: chunkIds,
+      buildSendOpts: (_i, _isLast, tid) => ({
+        ...(tid != null ? { message_thread_id: tid } : {}),
+        link_preview_options: { is_disabled: true },
+      }),
+      buildPreviewEditOpts: () => ({}),
+    })
+    liveThreadId = res.threadId
+    return chunkIds
   }
 
-  const sentIds = backstopDeliveryLedger.sentIds(turnId)
-  if (HISTORY_ENABLED && sentIds.length > 0) {
-    try {
-      recordOutbound({
-        chat_id: chatId,
-        thread_id: args.threadId ?? null,
-        message_ids: sentIds,
-        texts: chunks.slice(0, sentIds.length),
-      })
-    } catch { /* best-effort */ }
+  // Bounded in-turn retry (finding-1 fix): resumes at the first unsent chunk on
+  // each attempt via the ledger, so chunk 0 is delivered exactly once even
+  // across retries. `delivered`/`exhausted` tell the caller whether the answer
+  // actually reached the chat — the caller leaves the delivery obligation OPEN
+  // on terminal failure so the liveness floor re-presents it.
+  const result = await runBackstopDelivery(
+    backstopDeliveryLedger,
+    turnId,
+    chunks,
+    args.cardMessageId,
+    {
+      sendChunk,
+      recordOutbound: HISTORY_ENABLED
+        ? (messageIds, texts) => {
+            try {
+              recordOutbound({
+                chat_id: chatId,
+                thread_id: args.threadId ?? null,
+                message_ids: messageIds,
+                texts,
+              })
+            } catch { /* best-effort */ }
+          }
+        : undefined,
+      stderr: (s: string) => { process.stderr.write(s) },
+    },
+    BACKSTOP_DELIVERY_MAX_ATTEMPTS,
+  )
+  return {
+    sentIds: result.sentIds,
+    chunkCount: result.chunkCount,
+    delivered: result.delivered,
+    exhausted: result.exhausted,
   }
-  return { sentIds, chunkCount: chunks.length, threw }
 }
 
 /**
@@ -5206,7 +5230,7 @@ function emitTurnRecord(turn: CurrentTurn, endedAt: number): void {
 
 function endCurrentTurnAtomic(
   turn: CurrentTurn,
-  opts?: { deferRecord?: boolean },
+  opts?: { deferRecord?: boolean; deferObligationClose?: boolean },
 ): number | null {
   // PR-4e — keyed liveness + keyed clear (leak-close-at-origin). Flag-OFF: the
   // guard is `currentTurn === turn` and the clear nulls the singleton, verbatim.
@@ -5275,7 +5299,13 @@ function endCurrentTurnAtomic(
   // obligations are designed to catch ends via silence_fallback, NOT turn_end.
   // At turn_end with replyCalled=true the model explicitly signalled completion
   // AND replied, so the obligation is satisfied regardless of finalAnswerDelivered.
-  if (OBLIGATION_LEDGER_ENABLED) {
+  // #3276 finding 1 — the turn-flush backstop passes `deferObligationClose` so
+  // the obligation disposition reflects the REAL send outcome (resolved in its
+  // async finally after the bounded retry), NOT the speculative fire-time
+  // `finalAnswerDelivered=true`. Closing here would satisfy the obligation
+  // before the send is known to have landed, re-introducing the silent-drop on
+  // terminal failure. Every synchronous turn-end path is unchanged.
+  if (OBLIGATION_LEDGER_ENABLED && opts?.deferObligationClose !== true) {
     if (decideObligationTurnEnd(turn.finalAnswerDelivered, turn.replyCalled) === 'close') {
       obligationLedger.close(turn.turnId)
     } else {
@@ -18991,10 +19021,18 @@ function handleSessionEvent(ev: SessionEvent): void {
         // done") is a genuine answer this backstop is about to deliver, so a
         // late reply carrying the same short answer MUST supersede/suppress
         // rather than post a duplicate — the real-id supersede recorded below
-        // corrects it in place. The per-turn LEDGER latch (guard 5) is the
-        // deterministic arbiter of backstop-vs-reply and the double-fire guard;
-        // `claim` returning false means this turn already fired a backstop and
-        // this fire is a no-op. Both set SYNCHRONOUSLY here, before any `await`.
+        // corrects it in place.
+        //
+        // TWO distinct arbiters set synchronously here, before any `await`:
+        //   (a) `turn.answerDelivered` — the backstop-vs-LATE-REPLY signal the
+        //       reply path already reads (`decideAnswerLatchSuppression` +
+        //       `flushedTurnSupersede`), exactly as on `main`.
+        //   (b) `backstopDeliveryLedger.claim` — the backstop-vs-BACKSTOP
+        //       double-fire latch: `claim` returning false means this turn
+        //       already fired a backstop (answer-ready quiescence, then the
+        //       turn-end backstop), so this fire is a no-op. It does NOT
+        //       arbitrate the late reply (that is (a)); it is redundant-but-
+        //       cheap with the `currentTurn == null` bail below.
         turn.answerDelivered = true
         const backstopLatchClaimed = backstopDeliveryLedger.claim(turn.turnId)
 
@@ -19028,7 +19066,7 @@ function handleSessionEvent(ev: SessionEvent): void {
         // bookkeeping, purge) still runs synchronously here for the #1067 /
         // #1556 wedge-safety reasons. `backstopTurnEndedAt` is null iff the
         // atom was already torn down elsewhere (no record to emit).
-        const backstopTurnEndedAt = endCurrentTurnAtomic(turn, { deferRecord: true })
+        const backstopTurnEndedAt = endCurrentTurnAtomic(turn, { deferRecord: true, deferObligationClose: true })
         // #549 fix — turn-flush takes ownership of the captured-text
         // backup; reset the preamble buffer (its content is already in
         // the captured `capturedText`, which turn-flush is about to send).
@@ -19075,6 +19113,13 @@ function handleSessionEvent(ev: SessionEvent): void {
                 // finalAnswerDelivered). Not a failure.
                 if (backstopTurnEndedAt != null) {
                   turn.deliveryOutcome = 'suppressed'
+                  // #3276 finding 1 — obligation close was DEFERRED out of
+                  // endCurrentTurnAtomic. The reply tool already delivered this
+                  // turn's answer (recentCount>0), so resolve it as satisfied
+                  // here (idempotent with the reply path's own close). Without
+                  // this the deferred obligation would linger OPEN and spuriously
+                  // re-present a turn that WAS answered.
+                  if (OBLIGATION_LEDGER_ENABLED) obligationLedger.close(turn.turnId)
                   emitTurnRecord(turn, backstopTurnEndedAt)
                 }
                 return
@@ -19099,26 +19144,33 @@ function handleSessionEvent(ev: SessionEvent): void {
           )
           // PR B (Fix 1) — send accounting declared OUTSIDE the try so the
           // single-record `finally` below reads it on EVERY in-process exit.
+          // `delivered` is the RECEIPT-gated truth (>=1 fresh non-card id AND
+          // all chunks landed), computed by the retry orchestrator — NOT a
+          // blanket outer-catch flag, so a throw in the post-delivery
+          // bookkeeping below (dedup / supersede record) can never demote a
+          // genuinely delivered turn to `send_failed` (finding 4).
           let sentIds: number[] = []
           let chunkCount = 0
-          let sendThrew = false
+          let delivered = false
           try {
             // #3276 — the ONE delivery primitive. deliverAnswer routes through
             // `sendReplyChunks` (the same send core executeReply uses) and posts
             // a FRESH chat message; it NEVER edits the progress card, so a
             // "delivery" can never be a card mutation the marker-sweep GC's
-            // ~60-90s later. It returns the REAL fresh chat message ids. The
-            // per-chunk ledger inside makes a retry after a partial send resume
-            // at the first unsent chunk (guard 6).
+            // ~60-90s later. It returns the REAL fresh chat message ids and
+            // retries mid-chunk (bounded) before giving up — the per-chunk
+            // ledger resumes at the first unsent chunk, never re-sending chunk 0
+            // (guard 6).
             const delivery = await deliverAnswer({
               chatId: backstopChatId,
               threadId: backstopThreadId,
               text: capturedText,
               turnId: turn.turnId,
+              cardMessageId: backstopCardMessageId,
             })
             sentIds = delivery.sentIds
             chunkCount = delivery.chunkCount
-            sendThrew = delivery.threw
+            delivered = delivery.delivered
 
             // #546 dedup: record what turn-flush just sent so a late-arriving
             // reply / stream_reply with the same content gets suppressed.
@@ -19147,9 +19199,10 @@ function handleSessionEvent(ev: SessionEvent): void {
             // ⚙️ Working… lingers. The card carries NO answer text, so a
             // card-collapse failure and a fresh-send failure can never leave
             // BOTH an answer-card AND an answer-bubble visible.
-            if (sendThrew || !backstopReceiptIds(sentIds, backstopCardMessageId).length) {
-              // Nothing durable delivered — finalize the reaction as error and
-              // reset the latch so a genuine late reply is NOT suppressed.
+            if (!delivered) {
+              // Retries exhausted with nothing durable delivered — finalize the
+              // reaction as error and reset the latch so a genuine late reply is
+              // NOT suppressed.
               if (backstopCtrl) backstopCtrl.finalize('error')
               backstopDeliveryLedger.release(turn.turnId)
               turn.answerDelivered = false
@@ -19169,31 +19222,49 @@ function handleSessionEvent(ev: SessionEvent): void {
               unpinProgressCardForChat?.(backstopChatId, backstopThreadId)
             }
           } catch (err) {
-            sendThrew = true
-            process.stderr.write(`telegram gateway: turn-flush send failed: ${(err as Error).message}\n`)
-            // Nothing (or only a partial) delivered — reset the latch so a
-            // genuine late reply is NOT suppressed into silence.
-            if (!backstopReceiptIds(sentIds, backstopCardMessageId).length) {
+            // Only reachable via a throw in the post-delivery bookkeeping (the
+            // delivery itself is retry-wrapped inside deliverAnswer and never
+            // throws out). `delivered` already reflects the receipt-gated truth;
+            // do NOT flip it here (finding 4). If nothing landed, reset the
+            // latch so a genuine late reply is not suppressed.
+            process.stderr.write(`telegram gateway: turn-flush post-delivery bookkeeping failed: ${(err as Error).message}\n`)
+            if (!delivered) {
               turn.answerDelivered = false
               backstopDeliveryLedger.release(turn.turnId)
+              if (backstopCtrl) backstopCtrl.finalize('error')
             }
-            if (backstopCtrl) backstopCtrl.finalize('error')
           } finally {
-            // #3276 guard 7 + PR B single-record guarantee. The recorded status
-            // is derived from the RECEIPT gate: a turn is `complete` IFF at
-            // least one FRESH, non-card chat id landed (and all chunks did).
-            // A throw, a partial delivery, or a card-only "success" → `failed`
-            // → `send_failed` — never a false `complete`. Exactly one row is
-            // written on every in-process exit of the send block.
+            // #3276 guard 7 + finding 1 — honest record AND honest recovery.
+            // Status is derived from the RECEIPT gate: `complete` IFF a fresh
+            // non-card id landed for every chunk; otherwise `send_failed`.
+            //
+            // The delivery-obligation close was DEFERRED out of
+            // endCurrentTurnAtomic (deferObligationClose) so it reflects the
+            // REAL send outcome here, not the speculative fire-time flag:
+            //   delivered  → close the obligation (answered).
+            //   NOT deliv. → leave it OPEN + noteTurnEnded, so the ~150s
+            //                liveness floor re-presents the answer instead of
+            //                the old silent `send_failed` drop.
             if (backstopTurnEndedAt != null) {
               finalizeBackstopSendGated(turn, {
-                threw: sendThrew,
+                threw: !delivered,
                 sentIds,
                 chunkCount,
                 cardMessageId: backstopCardMessageId,
               })
+              if (OBLIGATION_LEDGER_ENABLED) {
+                if (delivered) {
+                  obligationLedger.close(turn.turnId)
+                } else {
+                  // Terminal fail — do NOT mark the obligation satisfied.
+                  turn.finalAnswerDelivered = false
+                  obligationLedger.noteTurnEnded(turn.turnId, Date.now())
+                }
+              }
               emitTurnRecord(turn, backstopTurnEndedAt)
             }
+            // GC the ledger only now — after success OR retry exhaustion — so a
+            // resume could always read prior progress up to this point.
             backstopDeliveryLedger.clear(turn.turnId)
           }
           // #2094 cosmetic: the trailing `finally { purgeReactionTracking() }`

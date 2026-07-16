@@ -650,6 +650,19 @@ describe('selectFlushDeliveryText — deliver the terminal answer, strip only na
     expect(out).toBe('yes, done')
   })
 
+  // #3276 finding 7 — the narration heuristic only ever strips PRECEDING blocks;
+  // the terminal answer block is always preserved. A colon-terminated line that
+  // IS the whole answer (e.g. a lead-in the model never continued) must NOT be
+  // dropped, whether it stands alone or is the terminal block after narration.
+  it('never drops a colon-terminated line that IS the whole answer (single block)', () => {
+    expect(selectFlushDeliveryText(['Here are the results:'])).toBe('Here are the results:')
+  })
+
+  it('keeps a colon-terminated TERMINAL block (it is the answer, not narration)', () => {
+    const out = selectFlushDeliveryText(['Checking now…', 'Here are the results:'])
+    expect(out).toBe('Here are the results:')
+  })
+
   it('decideTurnFlush delivers the narrowed answer, not the whole blob', () => {
     const decision = decideTurnFlush({
       chatId: 'chat1',

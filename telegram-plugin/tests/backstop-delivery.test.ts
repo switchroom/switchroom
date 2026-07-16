@@ -1,9 +1,10 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import {
   BackstopDeliveryLedger,
   backstopReceiptIds,
   backstopDelivered,
+  runBackstopDelivery,
 } from '../gateway/backstop-delivery.js'
 import {
   backstopSendOutcomeGated,
@@ -19,12 +20,10 @@ import {
  * These assert the deterministic OUTCOMES the fix guarantees:
  *  - a delivered answer is a FRESH non-card chat id (guard 7),
  *  - `complete` IFF such an id exists; card-only "success" ⇒ `send_failed`,
- *  - a per-turn latch arbitrates backstop-vs-reply exactly once (guard 5),
- *  - a partial send + retry never re-sends chunk 0 (guard 6).
- *
- * Each is red on today's card-coupled backstop: it would report the card id as
- * the delivered id (fails the "id ≠ card" assertions) and derive `complete`
- * from a raw chunk count (fails the card-only ⇒ `send_failed` assertion).
+ *  - a per-turn backstop double-fire latch (guard 5),
+ *  - a bounded retry resumes mid-chunk and never re-sends chunk 0 (guard 6),
+ *  - terminal failure reports `delivered:false` so the caller leaves the
+ *    delivery obligation OPEN (finding 1).
  */
 
 describe('guard 7 — receipt gate: a delivered answer is a FRESH non-card chat id', () => {
@@ -100,21 +99,20 @@ describe('status honesty — complete IFF a real non-card id exists', () => {
   })
 })
 
-describe('guard 5 — once-per-turn delivery latch arbitrates backstop-vs-reply', () => {
+describe('guard 5 — once-per-turn backstop double-fire latch', () => {
   it('claim returns true exactly once per turnId', () => {
     const ledger = new BackstopDeliveryLedger()
     expect(ledger.claim('#18925')).toBe(true)
     expect(ledger.claim('#18925')).toBe(false)
-    expect(ledger.isLatched('#18925')).toBe(true)
     // A different turn is independent.
     expect(ledger.claim('#18929')).toBe(true)
   })
 
-  it('release re-opens the latch so a genuine late reply is not suppressed', () => {
+  it('release re-opens the latch after a terminal failure', () => {
     const ledger = new BackstopDeliveryLedger()
     ledger.claim('#t')
     ledger.release('#t')
-    expect(ledger.isLatched('#t')).toBe(false)
+    expect(ledger.claim('#t')).toBe(true)
   })
 })
 
@@ -123,23 +121,19 @@ describe('guard 6 — per-chunk idempotency ledger: retry never re-sends chunk 0
     const ledger = new BackstopDeliveryLedger()
     const turnId = '#partial'
     const chunkCount = 3
-    // First attempt: chunk 0 and 1 land, chunk 2 throws before acking.
     ledger.markPending(turnId, 0)
     ledger.recordChunk(turnId, 0, [1001])
     ledger.markPending(turnId, 1)
     ledger.recordChunk(turnId, 1, [1002])
     ledger.markPending(turnId, 2) // in-flight, never acked
 
-    // Retry: chunk 0 and 1 are already delivered → resume set is [2] only.
     expect(ledger.hasChunk(turnId, 0)).toBe(true)
     expect(ledger.hasChunk(turnId, 1)).toBe(true)
     expect(ledger.hasChunk(turnId, 2)).toBe(false)
     expect(ledger.unsentIndices(turnId, chunkCount)).toEqual([2])
 
-    // Complete the retry.
     ledger.recordChunk(turnId, 2, [1003])
     expect(ledger.sentIds(turnId)).toEqual([1001, 1002, 1003])
-    // Chunk 0 was never re-sent — its id is unchanged.
     expect(ledger.sentIds(turnId)[0]).toBe(1001)
   })
 
@@ -149,5 +143,108 @@ describe('guard 6 — per-chunk idempotency ledger: retry never re-sends chunk 0
     ledger.recordChunk('#o', 0, [1])
     ledger.recordChunk('#o', 1, [2])
     expect(ledger.sentIds('#o')).toEqual([1, 2, 3])
+  })
+
+  it('entries() zip a resplit chunk (2 ids for 1 input chunk) in order', () => {
+    const ledger = new BackstopDeliveryLedger()
+    ledger.recordChunk('#z', 0, [10])
+    ledger.recordChunk('#z', 1, [11, 12]) // chunk 1 length-resplit into 2 sends
+    expect(ledger.entries('#z')).toEqual([
+      { index: 0, messageIds: [10] },
+      { index: 1, messageIds: [11, 12] },
+    ])
+  })
+})
+
+/**
+ * Integration oracles over `runBackstopDelivery` — the exact orchestration that
+ * replaced the card-coupled send. It drives the real retry/ledger/receipt code
+ * with an injected `sendChunk`, asserting on what reaches `recordOutbound` and
+ * on the `delivered`/`exhausted` decision the gateway feeds to the obligation
+ * ledger + turn record.
+ */
+describe('runBackstopDelivery — integration oracle over the delivery wiring', () => {
+  it('records a FRESH non-card id in history; delivered=true (#3276 primary)', async () => {
+    const ledger = new BackstopDeliveryLedger()
+    const cardId = 18944
+    const recorded: Array<{ ids: number[]; texts: string[] }> = []
+    const sendChunk = vi.fn(async (i: number) => [18950 + i]) // fresh chat ids
+    const res = await runBackstopDelivery(
+      ledger,
+      '#18925',
+      ['the answer'],
+      cardId,
+      { sendChunk, recordOutbound: (ids, texts) => recorded.push({ ids, texts }) },
+    )
+    expect(res.delivered).toBe(true)
+    expect(res.exhausted).toBe(false)
+    expect(recorded).toHaveLength(1)
+    // A real fresh chat id landed in history whose id ≠ the progress-card id.
+    expect(recorded[0].ids).toEqual([18950])
+    expect(recorded[0].ids).not.toContain(cardId)
+    expect(backstopReceiptIds(recorded[0].ids, cardId)).toEqual([18950])
+  })
+
+  it('card-only "delivery" can never happen — the receipt gate excludes the card id', async () => {
+    const ledger = new BackstopDeliveryLedger()
+    const cardId = 18944
+    // Even if a buggy send echoed the card id, the receipt gate drops it.
+    const sendChunk = vi.fn(async () => [cardId])
+    const res = await runBackstopDelivery(ledger, '#c', ['x'], cardId, { sendChunk })
+    expect(res.delivered).toBe(false)
+    expect(res.exhausted).toBe(true)
+  })
+
+  it('retry resumes mid-chunk — chunk 0 is NOT re-sent on attempt 2 (guard 6, finding 1)', async () => {
+    const ledger = new BackstopDeliveryLedger()
+    const calls: number[] = []
+    let failedOnce = false
+    const sendChunk = vi.fn(async (i: number) => {
+      calls.push(i)
+      if (i === 2 && !failedOnce) {
+        failedOnce = true
+        throw new Error('FLOOD_WAIT_ACTIVE')
+      }
+      return [700 + i]
+    })
+    const res = await runBackstopDelivery(ledger, '#resume', ['c0', 'c1', 'c2'], null, { sendChunk }, 3)
+
+    expect(res.delivered).toBe(true)
+    expect(res.sentIds).toEqual([700, 701, 702])
+    // chunk 0 and 1 sent exactly once; chunk 2 attempted twice (fail, then ok).
+    expect(calls.filter(i => i === 0)).toHaveLength(1) // <-- chunk 0 never re-sent
+    expect(calls.filter(i => i === 1)).toHaveLength(1)
+    expect(calls.filter(i => i === 2)).toHaveLength(2)
+    expect(res.attempts).toBe(2)
+  })
+
+  it('terminal failure ⇒ delivered=false / exhausted=true after maxAttempts (obligation left open)', async () => {
+    const ledger = new BackstopDeliveryLedger()
+    const sendChunk = vi.fn(async () => { throw new Error('FLOOD_WAIT_ACTIVE') })
+    const res = await runBackstopDelivery(ledger, '#dead', ['only chunk'], null, { sendChunk }, 3)
+    expect(res.delivered).toBe(false)
+    expect(res.exhausted).toBe(true)
+    expect(res.attempts).toBe(3) // exhausted the bounded retry
+    expect(res.sentIds).toEqual([]) // nothing landed
+    // This is the exact input the gateway uses: delivered=false ⇒ it records
+    // send_failed AND leaves the obligation OPEN (noteTurnEnded, not close).
+    expect(backstopSendOutcomeGated({
+      threw: !res.delivered, sentIds: res.sentIds, chunkCount: res.chunkCount, cardMessageId: null,
+    })).toBe('failed')
+  })
+
+  it('recordOutbound texts are ALIGNED to sent ids even when a chunk resplits (finding 5)', async () => {
+    const ledger = new BackstopDeliveryLedger()
+    const recorded: Array<{ ids: number[]; texts: string[] }> = []
+    // chunk 1 lands TWO ids (a length-resplit); a naive chunks.slice zip would
+    // misalign. entries()-based zip repeats the source text per landed id.
+    const sendChunk = vi.fn(async (i: number) => (i === 1 ? [11, 12] : [10]))
+    await runBackstopDelivery(
+      ledger, '#zip', ['A', 'B'], null,
+      { sendChunk, recordOutbound: (ids, texts) => recorded.push({ ids, texts }) },
+    )
+    expect(recorded[0].ids).toEqual([10, 11, 12])
+    expect(recorded[0].texts).toEqual(['A', 'B', 'B'])
+    expect(recorded[0].ids).toHaveLength(recorded[0].texts.length)
   })
 })
