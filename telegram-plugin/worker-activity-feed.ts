@@ -393,6 +393,21 @@ export interface WorkerActivityFeedOpts {
     threadId?: number
     messageId: number | null
   }) => void
+  /**
+   * TEST-ONLY (never set in production). Invoked once at construction with a
+   * narrow control that repoints the internal `agentId → feedKey` index WITHOUT
+   * moving the worker's row. Its sole purpose is to reproduce the
+   * `agentIndex`/`workers` DESYNC that the migration-eviction root-cause fix now
+   * prevents any public API sequence from producing — so the heartbeat sweep's
+   * force-evict backstop (the branch that removes a leaked row when
+   * `groupOfAgent(agentId)` no longer resolves to the group physically holding
+   * it) can be covered by a deterministic test. A no-op when unset.
+   */
+  exposeTestControls?: (controls: {
+    /** Set the internal index entry for `agentId` to `feedKey` (or delete it
+     *  when `feedKey` is null) without touching any group's `workers` map. */
+    repointAgentIndex: (agentId: string, feedKey: string | null) => void
+  }) => void
 }
 
 /**
@@ -1403,6 +1418,15 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
   }
 
   heartbeatTimer = setIntervalFn(heartbeatTick, heartbeatTickMs)
+
+  // TEST-ONLY: hand out the narrow index-repoint control (see opts doc). Never
+  // provided in production wiring, so this is a no-op there.
+  opts.exposeTestControls?.({
+    repointAgentIndex: (agentId, feedKey) => {
+      if (feedKey == null) agentIndex.delete(agentId)
+      else agentIndex.set(agentId, feedKey)
+    },
+  })
 
   return {
     has(agentId) {

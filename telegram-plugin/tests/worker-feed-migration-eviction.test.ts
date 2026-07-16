@@ -27,9 +27,12 @@ function view(desc: string, elapsedMs: number): WorkerActivityView {
   return { description: desc, lastTool: null, toolCount: 1, latestSummary: 'step', elapsedMs, state: 'running' }
 }
 
+type IndexControl = { repointAgentIndex: (agentId: string, feedKey: string | null) => void }
+
 function makeFeed(nowRef: { t: number }) {
   const pins: { messageId: number | null }[] = []
   let seq = 900
+  let control: IndexControl | null = null
   const bot: BotApiForWorkerFeed = {
     sendMessage: async () => ({ message_id: seq++ }),
     editMessageText: async () => true,
@@ -44,8 +47,11 @@ function makeFeed(nowRef: { t: number }) {
     setInterval: () => 0,
     clearInterval: () => {},
     reconcilePin: ({ messageId }) => pins.push({ messageId }),
+    exposeTestControls: (c) => {
+      control = c
+    },
   })
-  return { feed, pins }
+  return { feed, pins, control: () => control as IndexControl }
 }
 
 async function drain(): Promise<void> {
@@ -89,6 +95,41 @@ describe('worker-feed migration eviction + churn-free sweep (FIX 2)', () => {
     expect(feed.size).toBe(0)
 
     // Idempotency: further ticks must not resurrect / re-reap a churning row.
+    for (let i = 0; i < 3; i++) {
+      nowRef.t += 3_000_001
+      feed.heartbeatTick()
+      await drain()
+    }
+    expect(feed.size).toBe(0)
+  })
+
+  it('TTL sweep FORCE-EVICTS a leaked row whose agentIndex has desynced from its group', async () => {
+    // Reproduce the exact desync the migration-eviction fix now prevents any
+    // public sequence from producing: a live row physically in group A while
+    // the agentIndex points somewhere else, so `groupOfAgent(agentId) !== g`.
+    // This drives the heartbeat sweep's FORCE-EVICT branch specifically — the
+    // one that removes the orphan directly from the group it lives in instead
+    // of no-op'ing through `terminateWorker` (which would churn forever).
+    const nowRef = { t: 3_000_000 }
+    const { feed, control } = makeFeed(nowRef)
+
+    await feed.update('agent-1', '-100', view('task', 0))
+    await drain()
+    expect(feed.size).toBe(1)
+
+    // Corrupt the index so it no longer resolves to the group holding the row.
+    // `terminateWorker('agent-1')` would now look up a non-existent group and
+    // no-op — the leak the force-evict branch exists to catch.
+    control().repointAgentIndex('agent-1', 'bogus-feed-key')
+
+    // Past the silence TTL: the sweep must force-evict the row from its real
+    // group, NOT rely on terminateWorker.
+    nowRef.t += 3_000_001
+    feed.heartbeatTick()
+    await drain()
+    expect(feed.size).toBe(0)
+
+    // And it stays gone — no churning row re-reaped every tick.
     for (let i = 0; i < 3; i++) {
       nowRef.t += 3_000_001
       feed.heartbeatTick()
