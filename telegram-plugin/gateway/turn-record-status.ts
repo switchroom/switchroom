@@ -86,6 +86,13 @@ export function backstopSendOutcome(args: {
   // #3276: count ONLY real, positive message-id receipts. A card edit / stub /
   // non-message "ok" contributes no positive id, so it can never reach the
   // chunkCount floor and can never be recorded delivered.
+  //
+  // F3 — the compare is `>=`, NOT `===`, ON PURPOSE. sendReplyChunks can push
+  // MORE receipts than `chunkCount` when a single oversize chunk is re-split
+  // into several wire pieces (each a real delivered message with its own id).
+  // Every-chunk-delivered still holds (validReceipts >= chunkCount), so this is
+  // correct — do NOT tighten to `===`, which would misclassify a legitimately
+  // re-split delivery as `failed`.
   const validReceipts = args.receiptIds.filter(
     (id) => typeof id === 'number' && Number.isInteger(id) && id > 0,
   ).length
@@ -107,6 +114,36 @@ export function finalizeBackstopSend(
   const outcome = backstopSendOutcome(send)
   turn.deliveryOutcome = outcome
   return outcome
+}
+
+/**
+ * #3276 F1 — the turn-flush suppression oracle, pure and testable.
+ *
+ * The turn-flush backstop must fire whenever NO real message reached the user.
+ * It may only be SUPPRESSED on positive evidence a reply already DELIVERED —
+ * never on mere reply-tool invocation. The gateway historically keyed
+ * suppression on `turn.replyCalled`, which latches on tool INVOCATION, so a
+ * reply that was invoked but whose send hard-failed (and was not retried)
+ * suppressed the backstop and LOST the answer — a delivery path `main` handled
+ * (its `getRecentOutboundCount==0` oracle let the flush fire).
+ *
+ * Suppress iff:
+ *  - `replyDelivered` — a delivery-PROVEN in-turn latch
+ *    (`turn.finalAnswerEverDelivered`, set only by executeReply AFTER a real
+ *    send resolves; never by the flush branch's speculative flag), OR
+ *  - `recentOutboundCount > 0` — a best-effort history.db corroborator (0 when
+ *    history.db is stale/blind, per the issue's secondary finding).
+ *
+ * When BOTH are false — including "reply tool invoked but delivered nothing" —
+ * suppression is DENIED and the flush fires, saving the answer.
+ */
+export function decideFlushSuppression(args: {
+  replyDelivered: boolean
+  recentOutboundCount: number
+}): { suppress: boolean; reason: 'reply-delivered' | 'history-corroborated' | 'none' } {
+  if (args.replyDelivered) return { suppress: true, reason: 'reply-delivered' }
+  if (args.recentOutboundCount > 0) return { suppress: true, reason: 'history-corroborated' }
+  return { suppress: false, reason: 'none' }
 }
 
 /** The parsed shape of one turns.jsonl row. */

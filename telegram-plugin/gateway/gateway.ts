@@ -637,6 +637,7 @@ import { maybeRotate } from './turns-jsonl-rotate.js'
 import {
   buildTurnRecord,
   finalizeBackstopSend,
+  decideFlushSuppression,
   type DeliveryOutcome,
 } from './turn-record-status.js'
 import {
@@ -18922,17 +18923,24 @@ function handleSessionEvent(ev: SessionEvent): void {
 
         void (async () => {
           await new Promise<void>(resolve => setTimeout(resolve, 500))
-          // #3276 SUPPRESSION-ORACLE FIX. The primary "did a reply already
-          // land?" signal is the IN-TURN `turn.replyCalled` flag — flipped
-          // synchronously the moment the reply tool is invoked (gateway
-          // reply-tool observer), so a reply that lands in this post-fire
-          // window is caught even when history.db is stale. The issue found
-          // the old sole check `getRecentOutboundCount` was blinded by a
-          // history.db that stopped recording (always returned 0), defeating
-          // suppression. We now check the in-memory latch FIRST and keep the
-          // history.db count only as a secondary/best-effort corroborator.
-          const replyLatched = turn.replyCalled === true
-          if (HISTORY_ENABLED || replyLatched) {
+          // #3276 SUPPRESSION-ORACLE FIX (F1-hardened). Suppress the flush
+          // ONLY on positive evidence a real message reached the user —
+          // NEVER on mere reply-tool INVOCATION. `turn.replyCalled` latches
+          // when the reply tool is *called* (gateway.ts:~17879), not when its
+          // send succeeds; keying suppression on it silently dropped the
+          // answer when the reply tool was invoked but its send hard-failed
+          // and the model didn't retry — a NEW lost-answer path (on main the
+          // `getRecentOutboundCount==0` oracle would have let the flush save
+          // it). The delivery-PROVEN signal is `turn.finalAnswerEverDelivered`,
+          // set ONLY by executeReply after a real substantive send resolves
+          // (gateway.ts:14005/14171/14674) and NEVER by this flush branch — so
+          // it can't be self-satisfied by the flush's own speculative
+          // `finalAnswerDelivered=true` set above. history.db count is a
+          // best-effort corroborator (blinded when history.db is stale, per
+          // the issue). Guarantee: the flush fires whenever no real message
+          // reached the user, regardless of whether the reply tool was called.
+          const replyDelivered = turn.finalAnswerEverDelivered === true
+          if (HISTORY_ENABLED || replyDelivered) {
             try {
               let recentCount = 0
               if (HISTORY_ENABLED) {
@@ -18941,9 +18949,13 @@ function handleSessionEvent(ev: SessionEvent): void {
                   recentCount = getRecentOutboundCount(backstopChatId, 2)
                 } catch {}
               }
-              if (replyLatched || recentCount > 0) {
-                const why = replyLatched
-                  ? `reply tool invoked in-turn (replyCalled=true)${recentCount > 0 ? `; history corroborates ${recentCount}` : ''}`
+              const suppression = decideFlushSuppression({
+                replyDelivered,
+                recentOutboundCount: recentCount,
+              })
+              if (suppression.suppress) {
+                const why = suppression.reason === 'reply-delivered'
+                  ? `reply delivered in-turn (finalAnswerEverDelivered=true)${recentCount > 0 ? `; history corroborates ${recentCount}` : ''}`
                   : `reply tool sent ${recentCount} message(s) within 2s`
                 process.stderr.write(`telegram gateway: turn-flush suppressed — ${why}\n`)
                 // Do NOT finalize the status reaction here. As of #1713
@@ -18974,10 +18986,6 @@ function handleSessionEvent(ev: SessionEvent): void {
             `telegram gateway: turn-flush firing — ${capturedText.length} chars without reply tool ` +
             `(chat=${backstopChatId} cardMsgId=${backstopCardMessageId ?? 'none'})\n`,
           )
-          const sendOpts = {
-            ...(backstopThreadId != null ? { message_thread_id: backstopThreadId } : {}),
-            link_preview_options: { is_disabled: true },
-          }
           const limit = RICH_MESSAGE_MAX_CHARS
           // PR B (Fix 1) — send accounting is declared OUTSIDE the try so the
           // single-record `finally` below can read it, and ALL setup (the chunk
@@ -19011,9 +19019,8 @@ function handleSessionEvent(ev: SessionEvent): void {
             // still let a receipt-less `sendRichMessage` "ok" masquerade as
             // delivery. sendReplyChunks carries the same THREAD_NOT_FOUND /
             // oversize re-split / parse-reject fallback ladder, so no delivery
-            // robustness is lost. Note: `sendOpts` (built above) is superseded
-            // by the per-chunk `buildSendOpts` here; kept for the log line.
-            void sendOpts
+            // robustness is lost. Per-chunk options are built by
+            // `buildSendOpts` below (link-preview disabled + live thread id).
             const backstopChunkSendDeps: ReplyChunkSendDeps = {
               sendRich: (opts, body, tid) =>
                 robustApiCall(
@@ -19052,7 +19059,10 @@ function handleSessionEvent(ev: SessionEvent): void {
               },
               stderr: (s: string) => { process.stderr.write(s) },
             }
-            const sendResult = await sendReplyChunks(backstopChunkSendDeps, {
+            // sentIds is mutated in place by sendReplyChunks; its return value
+            // (post-fallback threadId / consumed preview id) is unused here —
+            // the flush has no preview and no later file sends to thread.
+            await sendReplyChunks(backstopChunkSendDeps, {
               chatId: backstopChatId,
               chunks: htmlChunks,
               literalText: false,
@@ -19066,7 +19076,6 @@ function handleSessionEvent(ev: SessionEvent): void {
               }),
               buildPreviewEditOpts: () => ({}),
             })
-            void sendResult
             // #3276 — emit the same independent delivery receipt the reply
             // primitive logs (`reply: finalized … messageIds=[…]`), tagged
             // via=turn-flush, so a flushed answer is auditable as a real chat

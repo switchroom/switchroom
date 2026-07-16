@@ -4,6 +4,7 @@ import {
   computeTurnStatus,
   backstopSendOutcome,
   finalizeBackstopSend,
+  decideFlushSuppression,
   buildTurnRecord,
   type DeliveryOutcome,
 } from '../gateway/turn-record-status.js'
@@ -77,6 +78,51 @@ describe('backstopSendOutcome — resolve outcome from what happened on the wire
     expect(backstopSendOutcome({ threw: false, receiptIds: [18950], chunkCount: 1 })).toBe(
       'delivered',
     )
+  })
+})
+
+/**
+ * #3276 F1 — the flush-suppression oracle. The backstop must fire whenever no
+ * real message reached the user, and may only be suppressed on DELIVERY-proven
+ * evidence — never on mere reply-tool invocation. These assert the OUTCOME (fire
+ * vs suppress), the exact decision the gateway IIFE drives via this seam.
+ */
+describe('decideFlushSuppression — suppress only on proven delivery', () => {
+  it('reply DELIVERED in-turn (finalAnswerEverDelivered) → suppress', () => {
+    expect(decideFlushSuppression({ replyDelivered: true, recentOutboundCount: 0 })).toEqual({
+      suppress: true,
+      reason: 'reply-delivered',
+    })
+  })
+
+  it('no in-turn delivery but history corroborates an outbound → suppress', () => {
+    expect(decideFlushSuppression({ replyDelivered: false, recentOutboundCount: 1 })).toEqual({
+      suppress: true,
+      reason: 'history-corroborated',
+    })
+  })
+
+  it('genuine no-reply turn (no delivery, history blind) → FIRE the flush', () => {
+    expect(decideFlushSuppression({ replyDelivered: false, recentOutboundCount: 0 })).toEqual({
+      suppress: false,
+      reason: 'none',
+    })
+  })
+
+  /**
+   * F1 REGRESSION — the reply tool was INVOKED but its send hard-failed, so
+   * nothing was delivered (`replyDelivered=false`) and history recorded no
+   * outbound (`recentOutboundCount=0`, incl. the issue's stale-history.db case).
+   * The flush MUST STILL FIRE so the answer is not lost. The pre-fix oracle keyed
+   * on `turn.replyCalled` (invocation) and would have SUPPRESSED here — this
+   * asserts the decision keys on DELIVERY, not invocation, so it fails on that
+   * old behavior.
+   */
+  it('#3276 F1 — reply invoked but delivered ZERO real messages → flush STILL fires', () => {
+    const decision = decideFlushSuppression({ replyDelivered: false, recentOutboundCount: 0 })
+    expect(decision.suppress).toBe(false)
+    // The answer is NOT lost: the backstop is allowed to deliver it.
+    expect(decision.reason).toBe('none')
   })
 })
 
