@@ -8,8 +8,12 @@ real bank) and asserts OUTCOMES.
 Covers the three design red-team must-fixes:
   1. BROAD candidate classifier — a genuinely-missing ``restart`` session is
      restored (would be dropped by the dead in-flight predicate).
-  2. SLICE-LEVEL membership — a partial-loss session restores ONLY the missing
-     tail slices (would fail if membership were session-level).
+  2. SESSION-LEVEL, scheme-agnostic membership — restore fires ONLY for a
+     session with ZERO documents in the bank; a session with ANY document
+     present is treated as ``present`` and skipped. Partial-within-a-populated-
+     session recovery is out of scope (a legacy epoch-ms id can't be mapped to
+     the turns it covers), so membership is decided at the session, not slice,
+     level (BLOCKER-1 fix superseded the earlier slice-level design).
   3. Event-span CONTAINMENT join — picks the right transcript where a naive
      mtime-window would miss; ambiguous → refused, not guessed.
 Plus: fail-closed on membership error, wrong/refused bank → zero writes,
