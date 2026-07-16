@@ -30,10 +30,15 @@ import {
   FORWARDED_FROM_NAME_MAX,
   type ForwardOriginInfo,
 } from '../gateway/forward-origin.js'
+import { fmtLocalStamp, resolveEnvTimezone } from '../shared/local-time.js'
 
 // Synthetic fixtures only — no real Telegram ids/names (check-no-pii-secrets).
 const DATE = 1750000000 // unix seconds
-const DATE_ISO = new Date(DATE * 1000).toISOString()
+// switchroom #tz-fix: forwarded_date is now the agent's LOCAL am/pm wall clock
+// (NOT UTC ISO), so it can't compete with the local-time hint. Compute the
+// expected value through the SAME helper production uses, so the assertion is
+// deterministic under whatever TZ the runner env carries.
+const DATE_LOCAL = fmtLocalStamp(DATE * 1000, resolveEnvTimezone())
 
 function userOrigin(overrides: Partial<{
   first_name: string
@@ -204,7 +209,7 @@ describe('buildForwardOriginMeta — channel-tag attrs', () => {
       forwarded_from: 'Ada Lovelace (@adalove)',
       forwarded_from_type: 'user',
       forwarded_from_id: '42',
-      forwarded_date: DATE_ISO,
+      forwarded_date: DATE_LOCAL,
     })
   })
 
@@ -245,6 +250,28 @@ describe('buildForwardOriginMeta — channel-tag attrs', () => {
   it('no origins → empty record (no attrs on a normal message)', () => {
     expect(buildForwardOriginMeta([])).toEqual({})
   })
+
+  // switchroom #tz-fix (deterministic outcome): under a real configured zone
+  // the forwarded_date the MODEL sees is LOCAL am/pm with NO "UTC" / trailing-Z.
+  it('renders forwarded_date as LOCAL am/pm — never a UTC ISO string', () => {
+    const prevTz = process.env.SWITCHROOM_TIMEZONE
+    const prevTZ = process.env.TZ
+    process.env.SWITCHROOM_TIMEZONE = 'Australia/Melbourne'
+    delete process.env.TZ
+    try {
+      const meta = buildForwardOriginMeta([{ name: 'Ada', type: 'user', id: 42, date: DATE }])
+      const d = meta.forwarded_date!
+      // e.g. "Sunday 2025-06-15 08:26 PM AEST" — weekday, ISO date, am/pm, abbrev.
+      expect(d).toMatch(/ (?:AM|PM) [A-Za-z]{2,5}$/)
+      expect(d).not.toContain('UTC')
+      expect(d.endsWith('Z')).toBe(false)
+    } finally {
+      if (prevTz === undefined) delete process.env.SWITCHROOM_TIMEZONE
+      else process.env.SWITCHROOM_TIMEZONE = prevTz
+      if (prevTZ === undefined) delete process.env.TZ
+      else process.env.TZ = prevTZ
+    }
+  })
 })
 
 describe('coalesced bursts — dedupe + numbered siblings', () => {
@@ -264,7 +291,7 @@ describe('coalesced bursts — dedupe + numbered siblings', () => {
     expect(meta.forwarded_from).toBe('Alice Q (@aliceq)')
     expect(meta.forwarded_from_2).toBeUndefined()
     // First occurrence wins — the emitted date is the first part's.
-    expect(meta.forwarded_date).toBe(DATE_ISO)
+    expect(meta.forwarded_date).toBe(DATE_LOCAL)
   })
 
   it('multi-origin burst: first origin bare, second gets _2 keys in order', () => {

@@ -150,7 +150,14 @@ $DAILY_CONTENT"
 fi
 
 # ── Assemble briefing ───────────────────────────────────────────────────────────
-TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date +"%Y-%m-%d %H:%M:%S UTC")
+# Restart timestamp — model-facing: it lands in the resume-turn system prompt
+# via --append-system-prompt ("You just restarted at …"). Render the agent's
+# LOCAL am/pm wall clock, NOT UTC, so the restart turn never sees a competing
+# UTC "now" (the whole point of the deterministic-local-time work). Same
+# SWITCHROOM_TIMEZONE → TZ → UTC cascade and `%A %Y-%m-%d %I:%M %p %Z` am/pm
+# format the UserPromptSubmit local-time hook (bin/timezone-hook.sh) uses.
+_TZ_VAL="${SWITCHROOM_TIMEZONE:-${TZ:-UTC}}"
+TIMESTAMP=$(TZ="$_TZ_VAL" date '+%A %Y-%m-%d %I:%M %p %Z' 2>/dev/null || date '+%A %Y-%m-%d %I:%M %p %Z')
 
 # Determine restart reason if available
 RESTART_REASON="unknown"

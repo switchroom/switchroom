@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
   applyTelegramProgressGuidance,
+  applySubAgentLocalTimeGuidance,
+  buildSubAgentLocalTimeLine,
   buildTelegramProgressGuidance,
   shouldAppendTelegramProgressGuidance,
 } from './sub-agent-telegram-prompt.js'
@@ -112,5 +114,35 @@ describe('applyTelegramProgressGuidance', () => {
       defaultChatId: '1',
     })
     expect(out.slice(0, body.length)).toBe(body)
+  })
+})
+
+// switchroom #tz-fix: sub-agents get no UserPromptSubmit local-time hook, so
+// their .md carries a deterministic local-time anchor. We inject the RESOLVED
+// timezone + directive (never a frozen wall-clock — the .md is written once at
+// scaffold time, so a baked timestamp would read stale on every later dispatch).
+describe('buildSubAgentLocalTimeLine', () => {
+  it('pins the passed resolved timezone and says the clock is already local', () => {
+    const out = buildSubAgentLocalTimeLine('Australia/Melbourne')
+    expect(out).toContain('Australia/Melbourne')
+    expect(out.toLowerCase()).toContain('local')
+    // Directs the sub-agent AWAY from UTC as "now".
+    expect(out).toContain('never assume or emit UTC')
+  })
+
+  it('does NOT bake a concrete wall-clock timestamp (the .md is static; would go stale)', () => {
+    const out = buildSubAgentLocalTimeLine('Australia/Melbourne')
+    // No baked ISO date / no baked "HH:MM AM/PM" instant — only the zone + guidance.
+    expect(out).not.toMatch(/\d{4}-\d{2}-\d{2}/)
+    expect(out).not.toMatch(/\d{1,2}:\d{2}\s*(?:AM|PM)/)
+  })
+})
+
+describe('applySubAgentLocalTimeGuidance', () => {
+  it('appends the local-time anchor unconditionally (no telegram gate)', () => {
+    const body = 'You are the worker sub-agent.'
+    const out = applySubAgentLocalTimeGuidance(body, 'Australia/Melbourne')
+    expect(out.startsWith(body)).toBe(true)
+    expect(out).toContain('Australia/Melbourne')
   })
 })

@@ -74,6 +74,32 @@ describe("timezone hook integration", () => {
     expect(mode & 0o100).toBe(0o100);
   });
 
+  // switchroom #tz-fix: sub-agents don't get the UserPromptSubmit local-time
+  // hook, so scaffold bakes a deterministic local-time anchor (resolved zone +
+  // directive, NOT a frozen wall-clock) into every sub-agent .md.
+  it("injects the resolved local-time anchor into each sub-agent .md", () => {
+    const agent = makeAgent({
+      timezone: "Australia/Melbourne",
+      subagents: {
+        worker: { description: "does execution work", prompt: "You are the worker." },
+      },
+    } as Partial<AgentConfig>);
+    const swConfig = makeSwitchroomConfig("tz-agent", agent);
+    const result = scaffoldAgent("tz-agent", agent, tmpDir, telegramConfig, swConfig);
+    const md = readFileSync(
+      join(result.agentDir, ".claude", "agents", "worker.md"),
+      "utf-8",
+    );
+    // Anchor present with the AGENT's configured zone (not the host's).
+    expect(md).toContain("Australia/Melbourne");
+    expect(md.toLowerCase()).toContain("local time");
+    expect(md).toContain("never assume or emit UTC");
+    // Deterministic-outcome guarantee: no baked UTC ISO "current time" and no
+    // frozen wall-clock instant that would drift stale on later dispatches.
+    expect(md).not.toMatch(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/);
+    expect(md).not.toMatch(/\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC/);
+  });
+
   it("places timezone hook AFTER the workspace-dynamic hook", () => {
     // Ordering matters because additionalContext from multiple hooks is
     // concatenated in declaration order. The local-time hint renders last

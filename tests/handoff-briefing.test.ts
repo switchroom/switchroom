@@ -344,6 +344,74 @@ describe("handoff-briefing.sh assembler", () => {
     expect(output).toContain("Previous session ended via:");
   });
 
+  it("renders the restart timestamp in LOCAL am/pm — never a UTC Z instant (deterministic-local-time)", () => {
+    // Regression guard for the resume-turn UTC vector: the "You just restarted
+    // at …" line is injected into the resume-turn system prompt, so its time
+    // must be local am/pm, NOT the old `date -u +%Y-%m-%dT%H:%M:%SZ`. Nothing
+    // guarded this before, which is how it slipped past the first pass.
+    const today = localDateString();
+    const memDir = join(tmpDir, "memory");
+    mkdirSync(memDir, { recursive: true });
+    writeFileSync(join(memDir, `${today}.md`), "- Restart-time guard\n", "utf-8");
+
+    const result = spawnSync("bash", [HANDOFF_BRIEFING_SCRIPT, "--stdout"], {
+      env: {
+        ...process.env,
+        AGENT_DIR: tmpDir,
+        TELEGRAM_STATE_DIR: "",
+        HINDSIGHT_API_URL: "",
+        HINDSIGHT_BANK_ID: "",
+        WORKSPACE_DIR: tmpDir,
+        SWITCHROOM_TIMEZONE: "Australia/Melbourne",
+        TZ: "Australia/Melbourne",
+      },
+      timeout: 10_000,
+    });
+    expect(result.status).toBe(0);
+    const output = result.stdout.toString();
+    // Extract the timestamp between "restarted at " and ". Previous session".
+    const m = output.match(/You just restarted at (.+?)\. Previous session ended via:/);
+    expect(m).not.toBeNull();
+    const stamp = m![1];
+    // Local am/pm shape with a zone abbrev: e.g. "Thursday 2026-07-16 04:09 PM AEST".
+    expect(stamp).toMatch(/ (?:AM|PM) [A-Za-z]{2,5}$/);
+    // The banned forms: bare "HH:MM UTC" wall clock and ISO trailing-Z.
+    expect(stamp).not.toMatch(/\d{1,2}:\d{2}(?::\d{2})?\s*UTC/);
+    expect(stamp).not.toMatch(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/);
+    expect(stamp.endsWith("Z")).toBe(false);
+    expect(stamp).not.toContain("UTC");
+  });
+
+  it("restart timestamp falls back to am/pm even with no timezone configured (no UTC 24h form)", () => {
+    const today = localDateString();
+    const memDir = join(tmpDir, "memory");
+    mkdirSync(memDir, { recursive: true });
+    writeFileSync(join(memDir, `${today}.md`), "- Restart-time fallback guard\n", "utf-8");
+
+    const env = {
+      ...process.env,
+      AGENT_DIR: tmpDir,
+      TELEGRAM_STATE_DIR: "",
+      HINDSIGHT_API_URL: "",
+      HINDSIGHT_BANK_ID: "",
+      WORKSPACE_DIR: tmpDir,
+    } as NodeJS.ProcessEnv;
+    delete env.SWITCHROOM_TIMEZONE;
+    delete env.TZ;
+
+    const result = spawnSync("bash", [HANDOFF_BRIEFING_SCRIPT, "--stdout"], {
+      env,
+      timeout: 10_000,
+    });
+    expect(result.status).toBe(0);
+    const output = result.stdout.toString();
+    const m = output.match(/You just restarted at (.+?)\. Previous session ended via:/);
+    expect(m).not.toBeNull();
+    // am/pm form even in the UTC fallback — never the old "%Y-%m-%d %H:%M:%S UTC" 24h shape.
+    expect(m![1]).toMatch(/ (?:AM|PM) /);
+    expect(m![1]).not.toMatch(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z/);
+  });
+
   it("hindsight skipped gracefully when API URL is empty", () => {
     const today = localDateString();
     const memDir = join(tmpDir, "memory");
