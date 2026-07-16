@@ -38,6 +38,15 @@ import { isValidModelArg } from './model-command.js'
 
 export const SESSION_MODEL_FILE = '.session-model'
 export const CONFIGURED_DEFAULT_MODEL_FILE = '.configured-default-model'
+/**
+ * Bounded-retry attempt counter for the session-model carrier (#3284).
+ * start.sh increments this on every boot that reads `.session-model` and
+ * applies it, and gives up (reverts + alerts) once it exceeds its bound. The
+ * gateway clears BOTH this file and the carrier on a healthy boot (see
+ * consumeSessionModelCarrierOnHealthyBoot) — the "healthy" signal a wedged
+ * boot cannot fake. Kept in sync with start.sh.hbs.
+ */
+export const SESSION_MODEL_BOOT_ATTEMPTS_FILE = '.session-model-boot-attempts'
 
 export interface SessionModelRecord {
   model: string
@@ -120,6 +129,37 @@ export function readSessionModelFile(agentDir: string): SessionModelRecord | nul
 export function clearSessionModelFile(agentDir: string): void {
   try {
     rmSync(join(agentDir, SESSION_MODEL_FILE), { force: true })
+  } catch {
+    /* best-effort */
+  }
+}
+
+/**
+ * Consume the session-model carrier on a HEALTHY boot (#3284).
+ *
+ * Called once this gateway has ACQUIRED the boot lock (boot.lock_acquired) —
+ * the deterministic signal that THIS boot is the surviving healthy session,
+ * which a boot that wedges before lock-acquire cannot fake. Deletes BOTH the
+ * consume-once carrier and the bounded-retry attempt counter, so:
+ *   - the next ordinary restart (deploy, /restart, crash) finds no carrier and
+ *     reverts to the configured default (session-scoped semantics preserved);
+ *   - a transient wedge BEFORE this point leaves the carrier in place, so the
+ *     retry boot re-applies the intended model instead of silently reverting.
+ *
+ * This is what moved out of start.sh's old delete-before-apply: start.sh no
+ * longer consumes the carrier itself, it only APPLIES it and lets this healthy
+ * signal do the consume. Best-effort — a failure here just means the carrier is
+ * re-read (and re-applied, harmlessly) on the next boot, still bounded by the
+ * counter. Idempotent.
+ */
+export function consumeSessionModelCarrierOnHealthyBoot(agentDir: string): void {
+  try {
+    rmSync(join(agentDir, SESSION_MODEL_FILE), { force: true })
+  } catch {
+    /* best-effort */
+  }
+  try {
+    rmSync(join(agentDir, SESSION_MODEL_BOOT_ATTEMPTS_FILE), { force: true })
   } catch {
     /* best-effort */
   }

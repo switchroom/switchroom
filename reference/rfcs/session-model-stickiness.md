@@ -8,12 +8,60 @@ status: Accepted — revised per adversarial review + operator decision (default
 
 # RFC — Session-scoped `/model` stickiness
 
-**Status:** Accepted (rev 5 — deterministic switch, §0.05, operator decision 2026-07-16; rev 4 session-scoped consume-once §0.1 stands EXCEPT its "live Claude switches write no carrier" bullet, now superseded by §0.05; rev 3 keep-by-default and rev 2 revert-by-default superseded where §0.1 says so)
+**Status:** Accepted (rev 6 — bounded-retry consume, §0.03, #3284, 2026-07-16, refines rev 4/5's "start.sh deletes the carrier before apply"; rev 5 — deterministic switch, §0.05, operator decision 2026-07-16; rev 4 session-scoped consume-once §0.1 stands EXCEPT its "live Claude switches write no carrier" bullet, now superseded by §0.05, and its "start.sh deletes the carrier on apply" mechanic, now refined by §0.03; rev 3 keep-by-default and rev 2 revert-by-default superseded where §0.1 says so)
 **Author:** (agent-authored, operator-directed; semantics decided by the operator 2026-07)
 **Targets:** `origin/main` @ v0.18.7
 **Builds on:** #2982 (in-memory `sessionModelSource` + one-shot `.session-model-override` carrier), #2983 (live model on progress cards), #3178 (durable /model ack/trace/queue)
 
 ---
+
+## 0.03 Rev 6 amendment (#3284, 2026-07-16) — BOUNDED-RETRY consume (who deletes the carrier, and when)
+
+**Problem.** Rev 4/5 had start.sh `rm` the `.session-model` carrier **before**
+apply/exec (pure consume-once). But a boot that reads the carrier can **wedge
+before its gateway acquires the boot lock** — e.g. the
+`boot.lock_stale_recovered_boot_mismatch` race a proxy-only `fable` apply-boot
+hit on marko/klanker (2026-07-16Z): two boots overlapped, the LOSER consumed
+(deleted) the carrier, and the WINNER's start.sh then found no carrier and
+booted the configured default (`opus`). The requested model was lost with no
+alert until a later boot happened to re-apply it. Deleting the carrier on the
+apply boot hands it to whichever start.sh runs first, which is **not
+necessarily the surviving healthy session**.
+
+**Decision.** The carrier is **APPLIED by start.sh but consumed by the
+gateway** on a healthy boot:
+
+- **start.sh applies, does NOT delete.** The boot that reads the carrier sets
+  `_EFFECTIVE_MODEL` and `exec claude --model <token>` as before, then **leaves
+  the carrier in place**. So a wedge before a healthy gateway leaves the carrier
+  for the retry boot to RE-APPLY instead of silently reverting. The lock-WINNER
+  always runs the applied model, because its start.sh read the carrier (present
+  until consumed) before exec.
+- **The gateway consumes on `boot.lock_acquired`.** Once this gateway acquires
+  the boot lock (`startup-mutex.ts` → `consumeSessionModelCarrierOnHealthyBoot`
+  in `session-model-file.ts`, called from `gateway.ts`), it deletes BOTH the
+  carrier and the attempt counter. Lock acquisition is the deterministic
+  "this boot is the surviving healthy session" signal a wedged boot cannot fake.
+  The consume is post-application cleanup for FUTURE boots — the running process
+  already has the model baked into its `exec`.
+- **Crashloop bound (REVIVED `.session-model-boot-attempts`).** start.sh
+  increments a persisted attempt counter on every apply boot and **gives up
+  after `_SM_MAX_ATTEMPTS` (3)** — deletes the carrier + counter, reverts to the
+  configured default, and writes a `.session-model-alert`. A genuinely BAD token
+  (one that crashes claude before lock-acquire on every boot) therefore reverts
+  after a hard finite bound, NEVER an unbounded wedge→retry→wedge crashloop.
+  This restores rev 4's "a bad token crashes at most one boot then reverts"
+  guarantee as "at most `_SM_MAX_ATTEMPTS` boots then reverts". The counter is
+  swept as stale by start.sh whenever no carrier is present.
+- **Unchanged.** All invalidation branches (corrupt / shape-gate-fail /
+  configured-default-changed / proxy-only+LiteLLM-down) still drop the carrier
+  immediately and alert — they now also drop the counter. The LiteLLM-down guard
+  stays a terminal revert (the 120s probe already elapsed, so "still down" is a
+  real down-state, not the transient boot-lock wedge the counter covers).
+
+This refines rev 4/5's consume mechanic; the session-scoped semantics
+(override reverts on the next ordinary restart) are unchanged — a healthy boot
+consumes, so the next restart finds no carrier.
 
 ## 0.05 Rev 5 amendment (operator decision 2026-07-16) — DETERMINISTIC switch (reverses §0.1's "live Claude switches write no carrier")
 
