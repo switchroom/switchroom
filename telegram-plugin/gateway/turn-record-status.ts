@@ -63,19 +63,33 @@ export function computeTurnStatus(turn: {
  * A throw is a failure; a no-throw send that delivered fewer chunks than it
  * split into is a partial delivery and is treated as `failed` (the user did not
  * receive the whole answer) — never silently `delivered`/`complete`.
+ *
+ * #3276 — INDEPENDENT-RECEIPT REQUIREMENT. A backstop send is only `delivered`
+ * when it produced a real, positive Telegram `message_id` receipt for every
+ * chunk. `receiptIds` is the list of message ids the send loop actually
+ * collected from resolved `sendMessage`/`sendRichMessage` results. This closes
+ * the silent-drop the issue documents: a non-throwing API call (a status-card
+ * mutation, a degraded/stubbed "ok", or any resolve that yields no usable
+ * message id) must NOT be recorded `complete`. Delivery is proven by an
+ * independent receipt, not by "the promise didn't throw".
  */
 export function backstopSendOutcome(args: {
   threw: boolean
-  sentCount: number
   chunkCount: number
+  receiptIds: number[]
 }): DeliveryOutcome {
   if (args.threw) return 'failed'
   // Defense (Fix 5): a "send" that split into zero chunks delivered nothing —
-  // do NOT let sentCount(0) < chunkCount(0) === false slip through to
-  // 'delivered'/'complete' (which would trip the silent-no-op-candidate
-  // detector on a tools:0 turn). Nothing sent → failed.
+  // do NOT let a 0-chunk send slip through to 'delivered'/'complete' (which
+  // would trip the silent-no-op-candidate detector on a tools:0 turn).
   if (args.chunkCount === 0) return 'failed'
-  if (args.sentCount < args.chunkCount) return 'failed'
+  // #3276: count ONLY real, positive message-id receipts. A card edit / stub /
+  // non-message "ok" contributes no positive id, so it can never reach the
+  // chunkCount floor and can never be recorded delivered.
+  const validReceipts = args.receiptIds.filter(
+    (id) => typeof id === 'number' && Number.isInteger(id) && id > 0,
+  ).length
+  if (validReceipts < args.chunkCount) return 'failed'
   return 'delivered'
 }
 
@@ -88,7 +102,7 @@ export function backstopSendOutcome(args: {
  */
 export function finalizeBackstopSend(
   turn: { deliveryOutcome?: DeliveryOutcome },
-  send: { threw: boolean; sentCount: number; chunkCount: number },
+  send: { threw: boolean; chunkCount: number; receiptIds: number[] },
 ): DeliveryOutcome {
   const outcome = backstopSendOutcome(send)
   turn.deliveryOutcome = outcome

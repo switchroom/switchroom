@@ -18922,12 +18922,30 @@ function handleSessionEvent(ev: SessionEvent): void {
 
         void (async () => {
           await new Promise<void>(resolve => setTimeout(resolve, 500))
-          if (HISTORY_ENABLED) {
+          // #3276 SUPPRESSION-ORACLE FIX. The primary "did a reply already
+          // land?" signal is the IN-TURN `turn.replyCalled` flag — flipped
+          // synchronously the moment the reply tool is invoked (gateway
+          // reply-tool observer), so a reply that lands in this post-fire
+          // window is caught even when history.db is stale. The issue found
+          // the old sole check `getRecentOutboundCount` was blinded by a
+          // history.db that stopped recording (always returned 0), defeating
+          // suppression. We now check the in-memory latch FIRST and keep the
+          // history.db count only as a secondary/best-effort corroborator.
+          const replyLatched = turn.replyCalled === true
+          if (HISTORY_ENABLED || replyLatched) {
             try {
-              const { getRecentOutboundCount } = await import('../history.js')
-              const recentCount = getRecentOutboundCount(backstopChatId, 2)
-              if (recentCount > 0) {
-                process.stderr.write(`telegram gateway: turn-flush suppressed — reply tool sent ${recentCount} message(s) within 2s\n`)
+              let recentCount = 0
+              if (HISTORY_ENABLED) {
+                try {
+                  const { getRecentOutboundCount } = await import('../history.js')
+                  recentCount = getRecentOutboundCount(backstopChatId, 2)
+                } catch {}
+              }
+              if (replyLatched || recentCount > 0) {
+                const why = replyLatched
+                  ? `reply tool invoked in-turn (replyCalled=true)${recentCount > 0 ? `; history corroborates ${recentCount}` : ''}`
+                  : `reply tool sent ${recentCount} message(s) within 2s`
+                process.stderr.write(`telegram gateway: turn-flush suppressed — ${why}\n`)
                 // Do NOT finalize the status reaction here. As of #1713
                 // the reaction is only finalized by the `turn_end` IPC
                 // handler — mid-turn delivery proofs (local history,
@@ -18981,74 +18999,84 @@ function handleSessionEvent(ev: SessionEvent): void {
             // exactly one U+00A0 spacer per gap, never doubled).
             const renderedText = addParagraphSpacers(capturedText)
             htmlChunks = splitMarkdownChunks(renderedText, limit)
-            // #654 deterministic double-message fix. If the progress
-            // card is on screen (60s timer fired before turn_end), edit
-            // it in place with the first chunk of the answer instead of
-            // posting a fresh message — avoids the user seeing both the
-            // pinned card AND a separate text bubble for the same turn.
-            // Multi-chunk answers (>4000 chars) edit chunk[0] into the
-            // card and send chunks[1..] fresh. If the edit fails (e.g.
-            // user deleted the card, parse-mode conflict), fall back to
-            // a fresh send for chunk[0] — accepts a 2-message outcome
-            // for that edge case rather than dropping the answer.
-            // #1075: route turn-flush sends/edits through robustApiCall.
-            // Edit-in-place isn't thread-id-bearing on its own (the
-            // target message id implies a thread), so a stale-thread
-            // 400 just fails the edit and the loop falls back to fresh
-            // sendMessage. sendMessage IS thread-id-bearing — drop the
-            // thread on THREAD_NOT_FOUND so the captured prose still
-            // lands somewhere instead of being lost entirely.
-            let firstSendUsedEdit = false
-            let liveThreadId: number | undefined = backstopThreadId
-            if (backstopCardMessageId != null && htmlChunks.length > 0) {
-              try {
-                await robustApiCall(
-                  () =>
-                    bot.api.editMessageText(
-                      backstopChatId,
-                      backstopCardMessageId,
-                      richMessage(htmlChunks[0]),
-                      sendOpts,
-                    ),
-                  {
-                    chat_id: backstopChatId,
-                    verb: 'turn-flush.editMessageText',
-                    ...(liveThreadId != null ? { threadId: liveThreadId } : {}),
-                  },
-                )
-                sentIds.push(backstopCardMessageId)
-                firstSendUsedEdit = true
-              } catch (err) {
-                process.stderr.write(
-                  `telegram gateway: turn-flush card-takeover edit failed: ${(err as Error).message} — falling back to sendMessage\n`,
-                )
-                if (err instanceof Error && err.message === 'THREAD_NOT_FOUND') {
-                  liveThreadId = undefined
-                }
-              }
+            // #3276 DETERMINISTIC-DELIVERY FIX. Route the flush through the
+            // SAME primitive the reply tool uses (`sendReplyChunks`, extracted
+            // from executeReply) so a flushed answer lands as a real, durable
+            // chat message that emits the identical `[outbound] path=reply
+            // msg_id=…` receipt per chunk and collects real Telegram
+            // message_ids — the independent receipt `finalizeBackstopSend`
+            // now requires. This replaces the old hand-rolled loop whose
+            // card-takeover `editMessageText` branch was dead code at this HEAD
+            // (progressDriver === null → backstopCardMessageId === null) yet
+            // still let a receipt-less `sendRichMessage` "ok" masquerade as
+            // delivery. sendReplyChunks carries the same THREAD_NOT_FOUND /
+            // oversize re-split / parse-reject fallback ladder, so no delivery
+            // robustness is lost. Note: `sendOpts` (built above) is superseded
+            // by the per-chunk `buildSendOpts` here; kept for the log line.
+            void sendOpts
+            const backstopChunkSendDeps: ReplyChunkSendDeps = {
+              sendRich: (opts, body, tid) =>
+                robustApiCall(
+                  // allow-raw-bot-api: backstop chunk-loop adapter — sendRichMessage routed through robustApiCall; THREAD_NOT_FOUND handled by sendReplyChunks' fallback ladder
+                  () => bot.api.sendRichMessage(backstopChatId, body as never, opts as never),
+                  { threadId: tid, chat_id: backstopChatId, verb: 'turn-flush.sendMessage', priorityClass: 'critical' },
+                ),
+              sendLiteral: (opts, txt, tid) =>
+                robustApiCall(
+                  // allow-raw-bot-api: backstop literal send routed through robustApiCall; THREAD_NOT_FOUND handled by sendReplyChunks
+                  () => bot.api.sendMessage(backstopChatId, txt, opts as never),
+                  { threadId: tid, chat_id: backstopChatId, verb: 'turn-flush.sendMessage', priorityClass: 'critical' },
+                ),
+              sendLiteralRaw: (opts, txt) =>
+                // allow-raw-bot-api: backstop literal last-resort fallback (parse-reject / length re-split); wrapping would re-enter the policy that just rejected the payload
+                bot.api.sendMessage(backstopChatId, txt, opts as never),
+              sendRichRaw: (opts, body) =>
+                // allow-raw-bot-api: backstop rich length-error re-split last resort; wrapping would re-enter the chunk-loop's own classification
+                bot.api.sendRichMessage(backstopChatId, body as never, opts as never),
+              editPreview: (mid, body, opts, tid) =>
+                robustApiCall(
+                  // allow-raw-bot-api: backstop preview edit-in-place (unreached — previewMessageId is null); kept for dep-shape parity with executeReply
+                  () => bot.api.editMessageText(backstopChatId, mid, body as never, opts as never),
+                  { threadId: tid, chat_id: backstopChatId, verb: 'turn-flush.editMessageText', priorityClass: 'critical', messageId: mid, editPayload: body },
+                ),
+              richMessage,
+              logOutbound,
+              // Unreached in the flush path (previewMessageId is null so
+              // sendReplyChunks never edits/deletes a preview); a best-effort
+              // delete keyed on the backstop chat keeps the dep total.
+              deleteStalePreview: async (id: number) => {
+                try {
+                  // allow-raw-bot-api: unreached preview cleanup (previewMessageId===null); best-effort
+                  await bot.api.deleteMessage(backstopChatId, id)
+                } catch { /* best-effort */ }
+              },
+              stderr: (s: string) => { process.stderr.write(s) },
             }
-            const remainingChunks = firstSendUsedEdit ? htmlChunks.slice(1) : htmlChunks
-            for (const c of remainingChunks) {
-              const sent = await retryWithThreadFallback(
-                robustApiCall,
-                (tid) => {
-                  const opts = {
-                    link_preview_options: { is_disabled: true },
-                    ...(tid != null ? { message_thread_id: tid } : {}),
-                  }
-                  return bot.api.sendRichMessage(backstopChatId, richMessage(c), opts)
-                },
-                {
-                  threadId: liveThreadId,
-                  chat_id: backstopChatId,
-                  verb: 'turn-flush.sendMessage',
-                },
+            const sendResult = await sendReplyChunks(backstopChunkSendDeps, {
+              chatId: backstopChatId,
+              chunks: htmlChunks,
+              literalText: false,
+              suppressText: false,
+              threadId: backstopThreadId,
+              previewMessageId: null,
+              sentIds,
+              buildSendOpts: (_i, _isLast, tid) => ({
+                link_preview_options: { is_disabled: true },
+                ...(tid != null ? { message_thread_id: tid } : {}),
+              }),
+              buildPreviewEditOpts: () => ({}),
+            })
+            void sendResult
+            // #3276 — emit the same independent delivery receipt the reply
+            // primitive logs (`reply: finalized … messageIds=[…]`), tagged
+            // via=turn-flush, so a flushed answer is auditable as a real chat
+            // delivery — not a card mutation. Per-chunk `[outbound] path=reply
+            // msg_id=…` lines are already emitted inside sendReplyChunks.
+            if (sentIds.length > 0) {
+              process.stderr.write(
+                `telegram channel: reply: finalized chatId=${backstopChatId} ` +
+                `messageIds=[${sentIds.join(',')}] chunks=${htmlChunks.length} via=turn-flush\n`,
               )
-              if (liveThreadId != null) {
-                const sentMsg = sent as { message_thread_id?: number }
-                if (sentMsg.message_thread_id == null) liveThreadId = undefined
-              }
-              sentIds.push(sent.message_id)
             }
             if (HISTORY_ENABLED && sentIds.length > 0) {
               try {
@@ -19140,10 +19168,15 @@ function handleSessionEvent(ev: SessionEvent): void {
             // above already emitted its record and `return`ed BEFORE reaching
             // this try, so it can never double-write with this finally.
             if (backstopTurnEndedAt != null) {
+              // #3276 — require an INDEPENDENT receipt: pass the real message
+              // ids collected by sendReplyChunks. A non-throwing send that
+              // yielded no positive message_id is `send_failed`, never
+              // `complete` — the deterministic guard against a logged-`ok`
+              // silent drop.
               finalizeBackstopSend(turn, {
                 threw: sendThrew,
-                sentCount: sentIds.length,
                 chunkCount: htmlChunks.length,
+                receiptIds: sentIds,
               })
               emitTurnRecord(turn, backstopTurnEndedAt)
             }
