@@ -146,13 +146,29 @@ describe('gateway boot: session-model re-hydration + confirmation + alert relay'
     expect(GATEWAY_SRC).toContain('gw /model relaunch scheduled agent=')
   })
 
-  it('sends ONE switch-confirmation from the ACTUAL launched model, keyed on the apply-boot (F1/G3)', () => {
+  it('sends ONE switch-confirmation from the ACTUAL launched model, keyed on the /model reason (F1/N4)', () => {
     const idx = GATEWAY_SRC.indexOf('const isApplyBoot = launched.length > 0')
     expect(idx).toBeGreaterThan(0)
-    const win = GATEWAY_SRC.slice(idx, idx + 3200)
-    // Success is asserted only from the real launched value, never optimistically.
-    expect(win).toContain('if (isApplyBoot && modelSwitchMarkerChat)')
+    const win = GATEWAY_SRC.slice(idx, idx + 3400)
+    // Keyed on the deterministic /model switch reason, so it also fires on a
+    // launched===configured apply-boot (/model default) — N4. Never optimistic.
+    expect(win).toContain('if (modelSwitchReason != null && modelSwitchMarkerChat)')
     expect(win).toContain('✅ Now running')
+    // N4: the launched===configured branch still confirms.
+    expect(win).toContain('(the configured default)')
+  })
+
+  it('N4/reason: the /model switch reason is captured from the clean-shutdown marker', () => {
+    expect(GATEWAY_SRC).toContain("cleanMarker.reason.startsWith('user: /model')")
+    expect(GATEWAY_SRC).toContain('let modelSwitchReason: string | null = null')
+  })
+
+  it('N3: the generic boot card is suppressed on a /model apply-boot (one card per switch)', () => {
+    const idx = GATEWAY_SRC.indexOf('const suppressBootCardForModelSwitch')
+    expect(idx).toBeGreaterThan(0)
+    const win = GATEWAY_SRC.slice(idx, idx + 800)
+    expect(win).toContain('modelSwitchReason != null && modelSwitchMarkerChat != null')
+    expect(win).toContain('else if (target)')
   })
 
   it('consumes the .session-model-alert sentinel, notifies ALL operators, and deletes it', () => {

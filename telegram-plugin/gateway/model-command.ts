@@ -274,14 +274,6 @@ export interface ModelCommandDeps {
   escapeHtml: (s: string) => string
   preBlock: (s: string) => string
   /**
-   * The active session-model override set by a prior `/model` switch.
-   * Null when no session override is active (using configured/default model).
-   * Used to detect whether the current session is on an sr-* (OpenRouter)
-   * model so a switch back to Claude can trigger a graceful restart instead
-   * of an in-place inject (which would leave stale sr-* routing in place).
-   */
-  getActiveSessionModel: () => string | null
-  /**
    * Schedule a graceful restart of this agent. Called instead of inject
    * when switching from an sr-* model back to Claude — the restart clears
    * the sr-* session context cleanly, whereas an in-place inject would
@@ -653,11 +645,38 @@ export function modelSelectCallbackData(label: string): string {
   // Rev 5: embed the CANONICAL `claude --model` token directly, not a label
   // hash. A tap no longer needs live picker discovery to resolve the row — it
   // goes straight to the carrier relaunch (`mdl:s:<token>`), removing the last
-  // terminal-driving step from the switch path. The "Default (recommended)" row
-  // has no derivable token (`canonicalClaudeToken` → null); it carries the
-  // `default` sentinel so the tap routes to the clear+revert relaunch.
-  const token = canonicalClaudeToken(label) ?? 'default'
-  return `${MODEL_CALLBACK_SELECT}${token}`
+  // terminal-driving step from the switch path.
+  const token = canonicalClaudeToken(label)
+  if (token) return `${MODEL_CALLBACK_SELECT}${token}`
+  // The "Default (recommended)" row has no derivable token (`canonicalClaudeToken`
+  // → null) — it carries the `default` sentinel so the tap routes to the
+  // clear+revert relaunch.
+  if (/^default\b/i.test(label.trim())) return `${MODEL_CALLBACK_SELECT}default`
+  // N2: an UNMAPPED non-default Claude row (a label whose first word is neither a
+  // known alias nor `claude-*`, nor `default`) has no derivable token. Emit an
+  // EMPTY suffix so the tap is REJECTED by the switch-tap gate and re-renders,
+  // rather than collapsing to the `default` sentinel — which would silently
+  // REVERT to the configured default instead of switching to the labelled model.
+  return MODEL_CALLBACK_SELECT
+}
+
+/**
+ * N1: is `token` a switch target we actually recognize? A stale menu rendered by
+ * an OLD gateway carries `mdl:s:<8-hex labelTag>` callback_data, which passes the
+ * loose `MODEL_ARG_RE` shape gate — relaunching onto it would write a garbage
+ * carrier and `--fallback-model` would silently serve a fallback. Constrain
+ * SELECT/alias/sr tokens to a known set before scheduling any relaunch:
+ *   - the `default` sentinel (clear+revert),
+ *   - any sr-* (LiteLLM/OpenRouter) id (accepted raw, never picker-validated),
+ *   - a canonical Claude token (a known alias or a `claude-*` id).
+ * An 8-hex tag, an empty suffix, or any other unmapped string returns false → the
+ * handler re-renders the menu (the old "Model list changed" graceful degrade)
+ * instead of relaunching onto a token claude will silently fall back from.
+ */
+export function isRecognizedSwitchToken(token: string): boolean {
+  if (token.toLowerCase() === 'default') return true
+  if (isSrModel(token)) return true
+  return canonicalClaudeToken(token) !== null
 }
 
 const BUSY_REFUSAL_TEXT =
@@ -982,6 +1001,13 @@ export async function handleModelMenuCallback(
     }
     if (!isValidModelArg(token)) {
       return { answer: 'Invalid model name', reply: await buildModelMenu(deps) }
+    }
+    // N1: reject a token we don't recognize (a stale OLD-gateway `mdl:s:<hex>`
+    // callback, an unmapped SELECT row, or garbage). Relaunching onto it would
+    // write a carrier claude silently falls back from (--fallback-model). Re-render
+    // the fresh menu instead — the graceful degrade the label-tag path used to give.
+    if (!isRecognizedSwitchToken(token)) {
+      return { answer: 'Model list changed — menu refreshed', reply: await buildModelMenu(deps) }
     }
     // Mid-turn: refuse WITHOUT touching the message so the menu keeps its
     // buttons and the operator can tap again once idle. (The gateway dispatcher

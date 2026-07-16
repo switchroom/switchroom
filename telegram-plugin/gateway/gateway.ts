@@ -23348,7 +23348,6 @@ function buildModelDeps(restartCtx?: ModelDepsRestartContext): ModelMenuDeps & M
     },
     escapeHtml: escapeHtmlForTg,
     preBlock,
-    getActiveSessionModel: () => sessionModelSource.getOverride(),
     /**
      * Graceful restart for sr-* → Claude model switch. Same mechanism as
      * the /restart command: writes a restart marker (so the post-restart
@@ -30347,9 +30346,14 @@ void (async () => {
         // Rev 5: capture the restart-marker chat BEFORE the boot-card block
         // clears it, so the session-model re-hydration block below can send the
         // switch-confirmation ("✅ Now running X") to the chat that initiated the
-        // switch. Only used when the re-hydration detects a genuine apply-boot
-        // (`launched !== configured`); a non-switch restart leaves it unused.
+        // switch. A non-`/model` restart leaves these unused.
         let modelSwitchMarkerChat: { chatId: string; threadId: number | null } | null = null
+        // The DETERMINISTIC "this boot was a /model switch" signal: the reason
+        // stampUserRestartReason() wrote to the clean-shutdown marker. Precise
+        // (distinguishes a model-switch relaunch from any other restart) and works
+        // even when launched === configured (a `/model default` / switch-to-default
+        // apply-boot) — that is how N4 (confirm the default case too) is closed.
+        let modelSwitchReason: string | null = null
 
         // Boot card — always post on every gateway start with the restart reason.
         // Gated on session marker so a grammY poll-restart (same process, no
@@ -30414,9 +30418,15 @@ void (async () => {
             process.stderr.write(`telegram gateway: boot: restart-marker present, chat_id=${marker.chat_id} age=${ageSec}s within5min=${ageMs < 5 * 60_000}\n`)
             // Stash the chat for the model-switch confirmation (rev 5) before the
             // marker is cleared. Bounded to a recent marker (<5min) so a stale
-            // marker can't misdirect a confirmation.
+            // marker can't misdirect a confirmation. Pair it with the /model
+            // switch reason (from the clean-shutdown marker) so the confirmation
+            // fires ONLY on a genuine /model relaunch (not a plain /restart that
+            // also wrote a marker chat).
             if (ageMs < 5 * 60_000) {
               modelSwitchMarkerChat = { chatId: marker.chat_id, threadId: marker.thread_id }
+              if (typeof cleanMarker?.reason === 'string' && cleanMarker.reason.startsWith('user: /model')) {
+                modelSwitchReason = cleanMarker.reason
+              }
             }
             clearRestartMarker()
           }
@@ -30454,7 +30464,21 @@ void (async () => {
               })
             }
 
-            if (target) {
+            // N3 (dedup to ONE card per switch): a `/model` apply-boot already
+            // sends the `✅ Now running X` confirmation from the re-hydration block
+            // below (into the same chat). Suppress the generic restart boot card
+            // here so a deliberate switch yields exactly one card — the
+            // confirmation, which carries the operative "here's your model" info.
+            // Only when we KNOW it was a /model switch (reason) AND we will send the
+            // confirmation (marker chat captured); otherwise the boot card fires
+            // normally. Version/quota remain available via /status.
+            const suppressBootCardForModelSwitch =
+              modelSwitchReason != null && modelSwitchMarkerChat != null
+            if (target && suppressBootCardForModelSwitch) {
+              process.stderr.write(
+                `telegram gateway: boot: suppressing generic boot card — /model switch apply-boot (reason=${JSON.stringify(modelSwitchReason)}); the confirmation card replaces it\n`,
+              )
+            } else if (target) {
               const { chatId, threadId, ackMsgId } = target
               // First-write-wins dedupe: if bridge-reconnect already
               // claimed (its IPC client connected before this IIFE
@@ -30584,25 +30608,25 @@ void (async () => {
                 process.stderr.write(
                   `telegram gateway: gw /model relaunch applied agent=${getMyAgentName()} launched=${launched || '(none)'} configured=${configured} override=${isApplyBoot ? 'set' : 'cleared'}\n`,
                 )
-                // Switch-confirmation (F1 / PLAN §4 step 2): on a genuine apply-boot
+                // Switch-confirmation (F1 / PLAN §4 step 2): on a /model apply-boot
                 // with a known initiating chat, send ONE confirmation built from the
-                // ACTUAL launched model — never optimistic. G3: this is the only
-                // switch-specific card; the generic boot card is the restart
-                // greeting (it shows configured-model diffs, not a session override),
-                // so the two do not duplicate. Fired only when launched !== configured,
-                // i.e. at most once per switch.
-                if (isApplyBoot && modelSwitchMarkerChat) {
+                // ACTUAL launched model — never optimistic. Keyed on the DETERMINISTIC
+                // /model switch reason (from the clean-shutdown marker), not on
+                // `launched !== configured`, so it ALSO fires when a switch landed on
+                // the configured default (`/model default`, or `/model <configured>`)
+                // — N4. The generic boot card is suppressed for this boot (N3), so
+                // this is the single card the operator sees for the switch.
+                if (modelSwitchReason != null && modelSwitchMarkerChat) {
                   const chat = modelSwitchMarkerChat
+                  const body = isApplyBoot
+                    ? `✅ Now running \`${launched}\` — session-only, reverts to the configured model on the next restart. Fresh session; memory and the handoff briefing carry the context.`
+                    : `✅ Now running \`${launched || configured}\` (the configured default) — fresh session; memory and the handoff briefing carry the context.`
                   // allow-raw-bot-api: one-shot boot confirmation, same shape as the session-model alert relay below
                   void lockedBot.api
-                    .sendMessage(
-                      chat.chatId,
-                      `✅ Now running \`${launched}\` — session-only, reverts to the configured model on the next restart. Fresh session; memory and the handoff briefing carry the context.`,
-                      {
-                        parse_mode: 'Markdown',
-                        ...(chat.threadId != null ? { message_thread_id: chat.threadId } : {}),
-                      },
-                    )
+                    .sendMessage(chat.chatId, body, {
+                      parse_mode: 'Markdown',
+                      ...(chat.threadId != null ? { message_thread_id: chat.threadId } : {}),
+                    })
                     .catch((err: unknown) =>
                       process.stderr.write(
                         `telegram gateway: model-switch confirmation send failed: ${(err as Error)?.message ?? String(err)}\n`,

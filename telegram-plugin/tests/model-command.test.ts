@@ -222,6 +222,7 @@ import {
   buildModelMenu,
   handleModelMenuCallback,
   modelSelectCallbackData,
+  isRecognizedSwitchToken,
   classifyDiscoveredOptions,
   canonicalClaudeToken,
   MODEL_CALLBACK_REFRESH,
@@ -274,6 +275,25 @@ describe("modelSelectCallbackData — embeds the canonical token (rev 5)", () =>
   it("the Default row carries the `default` sentinel", () => {
     expect(modelSelectCallbackData("Default (recommended)")).toBe("mdl:s:default");
   });
+  it("N2: an UNMAPPED Claude row does NOT collapse to the `default` sentinel", () => {
+    // A label whose first word is neither a known alias nor claude-* nor default
+    // must not masquerade as a default-revert; it carries an empty (rejected) suffix.
+    expect(modelSelectCallbackData("Sparkle 9 (preview)")).toBe("mdl:s:");
+    expect(modelSelectCallbackData("Sparkle 9 (preview)")).not.toBe("mdl:s:default");
+  });
+});
+
+describe("isRecognizedSwitchToken (N1 allowlist)", () => {
+  it("accepts default, sr-*, aliases, and claude-* ids", () => {
+    for (const t of ["default", "sr-glm-5", "opus", "fable", "claude-opus-4-8"]) {
+      expect(isRecognizedSwitchToken(t)).toBe(true);
+    }
+  });
+  it("rejects a stale 8-hex labelTag and other garbage", () => {
+    for (const t of ["1a2b3c4d", "", "deadbeef", "Sparkle9"]) {
+      expect(isRecognizedSwitchToken(t)).toBe(false);
+    }
+  });
 });
 
 describe("handleModelMenuCallback — every switch tap relaunches (rev 5)", () => {
@@ -288,6 +308,25 @@ describe("handleModelMenuCallback — every switch tap relaunches (rev 5)", () =
     expect(out.reply.text).toContain("relaunching");
     expect(Object.prototype.hasOwnProperty.call(out, "selectedModel")).toBe(false);
     expect(Object.prototype.hasOwnProperty.call(out, "selectedModelToken")).toBe(false);
+  });
+
+  it("N1: a stale SELECT token (old 8-hex labelTag) does NOT relaunch — re-renders instead", async () => {
+    // A menu rendered by the OLD gateway carries `mdl:s:<hex>`. The hex passes the
+    // loose shape gate but is not a recognized model token; relaunching onto it
+    // would write a garbage carrier that --fallback-model silently masks. The
+    // handler must re-render, not schedule anything.
+    const { deps, relaunchCalls, defaultRelaunchCalls } = makeMenuDeps();
+    const out = await handleModelMenuCallback("mdl:s:1a2b3c4d", deps);
+    expect(relaunchCalls).toHaveLength(0);
+    expect(defaultRelaunchCalls).toHaveLength(0);
+    expect(out.answer).toContain("menu refreshed");
+  });
+
+  it("N1: an empty SELECT suffix (unmapped row) does NOT relaunch", async () => {
+    const { deps, relaunchCalls, defaultRelaunchCalls } = makeMenuDeps();
+    await handleModelMenuCallback("mdl:s:", deps);
+    expect(relaunchCalls).toHaveLength(0);
+    expect(defaultRelaunchCalls).toHaveLength(0);
   });
 
   it("picker SELECT of the Default row routes to the default relaunch", async () => {
