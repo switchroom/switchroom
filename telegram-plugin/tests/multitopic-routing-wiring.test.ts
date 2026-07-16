@@ -20,6 +20,13 @@ const bridgeSrc = readFileSync(
   resolve(__dirname, '..', 'bridge', 'bridge.ts'),
   'utf-8',
 )
+// #3268 — deriveTurnId was extracted from the gateway monolith into its own
+// importable module so the enqueue seam and the handback round-trip test share
+// ONE function. The body-shape assertion below now reads it from there.
+const deriveTurnIdSrc = readFileSync(
+  resolve(__dirname, '..', 'gateway', 'derive-turn-id.ts'),
+  'utf-8',
+)
 
 describe('component 3 — turn-origin reply routing', () => {
   it('CurrentTurn carries a turnId, and the enqueue handler initialises it', () => {
@@ -35,10 +42,15 @@ describe('component 3 — turn-origin reply routing', () => {
 
   it('deriveTurnId is stable across inbound-build and enqueue (message-id based)', () => {
     // The id must be derivable identically at both sites — keyed on
-    // chat/thread/messageId, NOT the not-yet-known startedAt.
-    const fn = gatewaySrc.split('function deriveTurnId')[1]?.split('\nfunction ')[0] ?? ''
+    // chat/thread/messageId, NOT the not-yet-known startedAt. Lives in the
+    // extracted derive-turn-id.ts module (#3268); the gateway imports it under
+    // the same name (asserted below), so every enqueue callsite is unchanged.
+    const fn = deriveTurnIdSrc.split('export function deriveTurnId')[1]?.split('\nexport function ')[0] ?? ''
     expect(fn).toMatch(/chatKey\(chatId, threadId \?\? null\)/)
     expect(fn).toMatch(/messageId/)
+    // The gateway must import the shared function, not redefine it — so the
+    // enqueue seam and the round-trip test provably use the same identity.
+    expect(gatewaySrc).toMatch(/import \{ deriveTurnId \} from '\.\/derive-turn-id\.js'/)
   })
 
   it('executeReply resolves the answer thread via the origin turn, not the live currentTurn', () => {
