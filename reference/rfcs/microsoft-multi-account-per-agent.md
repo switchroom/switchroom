@@ -3,8 +3,8 @@
 Status: Design (read-only research, no implementation)
 Extends: RFC #1873 (`reference/rfcs/microsoft-workspace.md`)
 Driving requirement: one agent (Marko) must bind TWO Microsoft accounts at once —
-`lisa_goodfellow@hotmail.com` scoped to OneDrive storage tools, and
-`lisa@thinksolve.com.au` scoped to the 4 read-only mail tools.
+`alice@example.com` scoped to OneDrive storage tools, and
+`bob@example.com` scoped to the 4 read-only mail tools.
 
 ---
 
@@ -300,14 +300,14 @@ agents:
   marko:
     microsoft_workspace:
       accounts:
-        - account: lisa_goodfellow@hotmail.com
+        - account: alice@example.com
           tools: [drive, upload-file, create-upload-session, download-file, delete-file, list-drives]
-        - account: lisa@thinksolve.com.au
+        - account: bob@example.com
           tools: [list-mail-messages, get-mail-message, list-mail-folders, search-mail]  # 4 read-only
 microsoft_accounts:
-  lisa_goodfellow@hotmail.com:
+  alice@example.com:
     enabled_for: [marko]
-  lisa@thinksolve.com.au:
+  bob@example.com:
     enabled_for: [marko]
 ```
 (Exact softeria tool-name tokens are NEEDS-VERIFY against `@softeria/ms-365-mcp-server@0.113.0`.)

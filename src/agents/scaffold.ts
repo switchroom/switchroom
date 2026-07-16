@@ -3679,11 +3679,72 @@ export interface IntegrationMcpResolver {
   ) => { key: string; value: McpServerConfig }[];
   /**
    * OPTIONAL retraction-key set for plural integrations: every mcpServers
-   * key this integration COULD own for the agent (regardless of ACL), so
-   * reconcile can delete stale per-account keys when bindings shrink.
-   * When present it supersedes `retractionKey`.
+   * key this integration COULD own for the agent under the CURRENT config
+   * (regardless of ACL). NOTE: this cannot see a FULLY-REMOVED binding
+   * (its slug is gone from config), so it only handles the
+   * ACL-revoked-while-still-declared case. Durable full retraction uses
+   * `ownsKeyName` (namespace predicate) instead — see
+   * `retractStaleIntegrationKeys`.
    */
   ownedKeys?: (agentConfig: AgentConfig) => Set<string>;
+  /**
+   * OPTIONAL namespace predicate: does `key` belong to THIS integration's
+   * mcpServers namespace (e.g. `ms-365` or `ms-365-<slug>`)? Used by
+   * `retractStaleIntegrationKeys` to drop stale keys present in EXISTING
+   * settings that are no longer emitted — WITHOUT enumerating from the
+   * current config, so a binding that was fully removed (its slug no
+   * longer in config) is still retracted. When absent, retraction falls
+   * back to the single literal `retractionKey`.
+   */
+  ownsKeyName?: (key: string) => boolean;
+}
+
+/**
+ * Durable, namespace-scoped retraction: delete every key in `existing`
+ * that (a) belongs to the integration's namespace (`ownsKeyName`, or the
+ * literal `retractionKey` fallback), (b) is NOT in the freshly-emitted
+ * set, and (c) is NOT a user-declared mcp_servers key. Mutates `existing`
+ * in place and returns the removed keys.
+ *
+ * This is the fix for the multi-account retraction gap: `ownedKeys`
+ * (config enumeration) minus emitted can never drop a binding that was
+ * FULLY removed from `microsoft_workspace.accounts` (its slug is in
+ * neither set). Diffing the EXISTING mcpServers object against the emitted
+ * set by namespace catches the removed slug. The user-declared guard keeps
+ * an operator's hand-written `mcp_servers` entry from being swept.
+ */
+export function retractStaleIntegrationKeys(
+  integration: IntegrationMcpResolver,
+  emittedKeys: ReadonlySet<string>,
+  existing: Record<string, unknown>,
+  protectedKeys?: ReadonlySet<string>,
+): string[] {
+  const removed: string[] = [];
+  for (const key of Object.keys(existing)) {
+    if (emittedKeys.has(key)) continue;
+    if (protectedKeys?.has(key)) continue;
+    const owns = integration.ownsKeyName
+      ? integration.ownsKeyName(key)
+      : key === integration.retractionKey;
+    if (owns) {
+      delete existing[key];
+      removed.push(key);
+    }
+  }
+  return removed;
+}
+
+/**
+ * The set of user-declared mcp_servers keys (truthy values only — `false`
+ * is an opt-out sentinel, not a declaration) — protected from namespace
+ * retraction so an operator's hand-written entry survives.
+ */
+export function userDeclaredMcpKeys(agentConfig: AgentConfig): Set<string> {
+  return new Set(
+    Object.entries(agentConfig.mcp_servers ?? {})
+      .filter(([, v]) => v !== false)
+      .map(([k]) => k),
+  );
 }
 
 /**
@@ -3782,6 +3843,10 @@ export const INTEGRATION_MCP_RESOLVERS: readonly IntegrationMcpResolver[] = [
     resolve: resolveMs365McpEntry,
     resolveEntries: resolveMs365McpEntries,
     ownedKeys: ms365OwnedKeys,
+    // Namespace: the bare `ms-365` OR any `ms-365-<slug>` per-account key.
+    // Lets retraction drop a fully-removed binding's stale key without
+    // enumerating from the (already-shrunk) config.
+    ownsKeyName: (key: string) => key === "ms-365" || /^ms-365-[a-z0-9-]+$/.test(key),
   },
   {
     label: "Notion",
@@ -4162,17 +4227,41 @@ export function scaffoldAgent(
       // entry already in settings.mcpServers takes priority. Registry
       // iteration preserves the gdrive → ms-365 → notion order from
       // INTEGRATION_MCP_RESOLVERS.
+      const site1Protected = userDeclaredMcpKeys(agentConfig);
       for (const integration of INTEGRATION_MCP_RESOLVERS) {
-        for (const entry of integrationMcpEntries(
+        const entries = integrationMcpEntries(
           integration,
           name,
           agentConfig,
           switchroomConfig,
-        )) {
+        );
+        for (const entry of entries) {
           if (!settings.mcpServers[entry.key]) {
             settings.mcpServers[entry.key] = entry.value;
           }
         }
+        // Durable retraction on this MERGE path (existing settings.json is
+        // read + merged, never rebuilt): drop any owned-namespace key
+        // (bare `ms-365` or `ms-365-<slug>`) still present from a prior
+        // apply that is no longer emitted — e.g. an account removed from
+        // `microsoft_workspace.accounts`. Without this the stale per-account
+        // key lingers in settings.json.mcpServers across `switchroom apply`.
+        //
+        // This IS load-bearing, not hygiene: the main session's `exec claude`
+        // in profiles/_base/start.sh.hbs does NOT pass `--strict-mcp-config`
+        // (only the cron session does — cron-session.sh.hbs), so Claude Code
+        // loads MCP servers from settings.json.mcpServers in ADDITION to
+        // .mcp.json. A stale `ms-365-<slug>` left here would resurrect the
+        // removed account's tool namespace. (The reconcileAgentInner
+        // settings.json + .mcp.json paths rebuild `mcpServers` from scratch,
+        // so they retract fully-removed slugs by reconstruction — this merge
+        // path is the only one that needs an explicit prefix-scoped diff.)
+        retractStaleIntegrationKeys(
+          integration,
+          new Set(entries.map((e) => e.key)),
+          settings.mcpServers,
+          site1Protected,
+        );
       }
 
       // Hindsight memory plugin install (replaces our old shell hook).

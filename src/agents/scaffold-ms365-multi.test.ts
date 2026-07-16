@@ -18,6 +18,10 @@ import {
   resolveMs365McpEntries,
   resolveMs365McpEntry,
   ms365OwnedKeys,
+  retractStaleIntegrationKeys,
+  integrationMcpEntries,
+  userDeclaredMcpKeys,
+  INTEGRATION_MCP_RESOLVERS,
 } from "./scaffold.js";
 import { microsoftAccountSlug } from "../config/microsoft-workspace-acl.js";
 import type { AgentConfig, SwitchroomConfig } from "../config/schema.js";
@@ -127,5 +131,106 @@ describe("resolveMs365McpEntries — multi-account", () => {
       config,
     );
     expect(entries).toHaveLength(0);
+  });
+});
+
+describe("retractStaleIntegrationKeys — durable shrink retraction (namespace diff)", () => {
+  const ms365 = INTEGRATION_MCP_RESOLVERS.find((i) => i.emitKey === "ms-365")!;
+  const slugA = `ms-365-${microsoftAccountSlug(STORAGE)}`;
+  const slugB = `ms-365-${microsoftAccountSlug(MAIL)}`;
+  const config = cfg({
+    [STORAGE]: { enabled_for: ["marko"] },
+    [MAIL]: { enabled_for: ["marko"] },
+  });
+
+  it("drops a FULLY-REMOVED binding's stale key that config enumeration cannot see", () => {
+    // Simulate settings.json.mcpServers from a prior 3-account apply where
+    // account B has since been removed. The config still binds 2+ accounts
+    // (A, C) so the survivors keep their per-slug keys. Emitted = {slugA, slugC}.
+    const slugC = `ms-365-${microsoftAccountSlug("carol@example.com")}`;
+    const stillMultiCfg = agent({
+      microsoft_workspace: {
+        accounts: [{ account: STORAGE }, { account: "carol@example.com" }],
+      },
+    });
+    const cfgAC = cfg({
+      [STORAGE]: { enabled_for: ["marko"] },
+      "carol@example.com": { enabled_for: ["marko"] },
+    });
+    const emitted = new Set(
+      integrationMcpEntries(ms365, "marko", stillMultiCfg, cfgAC).map((e) => e.key),
+    );
+    expect([...emitted].sort()).toEqual([slugA, slugC].sort());
+
+    const existing: Record<string, unknown> = {
+      hindsight: { command: "x" },
+      [slugA]: { command: "a" },
+      [slugB]: { command: "b" }, // account B removed from config → stale
+      [slugC]: { command: "c" },
+    };
+
+    const removed = retractStaleIntegrationKeys(
+      ms365,
+      emitted,
+      existing,
+      userDeclaredMcpKeys(stillMultiCfg),
+    );
+
+    expect(removed).toEqual([slugB]);
+    expect(existing[slugB]).toBeUndefined(); // stale gone — config enumeration alone could NOT see this
+    expect(existing[slugA]).toBeDefined(); // surviving account kept
+    expect(existing[slugC]).toBeDefined(); // surviving account kept
+    expect(existing.hindsight).toBeDefined(); // foreign key untouched
+  });
+
+  it("multi→single collapse retracts BOTH old per-slug keys (survivor reverts to bare `ms-365`)", () => {
+    // Shrinking from 2 accounts to 1 flips the survivor from `ms-365-<slug>`
+    // back to the bare `ms-365` key (documented back-compat). Both stale
+    // per-slug keys must be dropped.
+    const singleCfg = agent({ microsoft_workspace: { accounts: [{ account: STORAGE }] } });
+    const emitted = new Set(
+      integrationMcpEntries(ms365, "marko", singleCfg, config).map((e) => e.key),
+    );
+    expect([...emitted]).toEqual(["ms-365"]); // single-account collapses to bare key
+
+    const existing: Record<string, unknown> = {
+      [slugA]: { command: "a" },
+      [slugB]: { command: "b" },
+    };
+    const removed = retractStaleIntegrationKeys(ms365, emitted, existing, userDeclaredMcpKeys(singleCfg));
+    expect(removed.sort()).toEqual([slugA, slugB].sort());
+    expect(existing[slugA]).toBeUndefined();
+    expect(existing[slugB]).toBeUndefined();
+  });
+
+  it("also retracts the bare `ms-365` key when an agent goes from single → zero bindings", () => {
+    const existing: Record<string, unknown> = { "ms-365": { command: "x" } };
+    const removed = retractStaleIntegrationKeys(ms365, new Set(), existing);
+    expect(removed).toEqual(["ms-365"]);
+    expect(existing["ms-365"]).toBeUndefined();
+  });
+
+  it("PROTECTS an operator's hand-declared ms-365-* mcp_servers key", () => {
+    const existing: Record<string, unknown> = { "ms-365-custom": { command: "x" } };
+    const removed = retractStaleIntegrationKeys(
+      ms365,
+      new Set(),
+      existing,
+      new Set(["ms-365-custom"]),
+    );
+    expect(removed).toEqual([]);
+    expect(existing["ms-365-custom"]).toBeDefined();
+  });
+
+  it("does not touch keys outside the ms-365 namespace", () => {
+    const existing: Record<string, unknown> = {
+      gdrive: { command: "g" },
+      notion: { command: "n" },
+      "ms-365": { command: "m" },
+    };
+    retractStaleIntegrationKeys(ms365, new Set(), existing);
+    expect(existing.gdrive).toBeDefined();
+    expect(existing.notion).toBeDefined();
+    expect(existing["ms-365"]).toBeUndefined();
   });
 });
