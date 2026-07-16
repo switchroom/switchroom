@@ -228,6 +228,21 @@ function dateInZone(tz: string): string {
 const AGENT_ZONE = "Pacific/Kiritimati"; // UTC+14 — the agent's SWITCHROOM_TIMEZONE
 const PROC_ZONE = "Pacific/Midway"; //     UTC-11 — the process TZ (what un-TZ'd `date` reads)
 
+/**
+ * "Today" exactly as handoff-briefing.sh will compute it — run the SAME
+ * `date +%Y-%m-%d` the script runs (bin/handoff-briefing.sh `TODAY=`),
+ * under the EXACT env the script will receive. Tests that pin or delete
+ * TZ/SWITCHROOM_TIMEZONE in the child env MUST name the daily-memory file
+ * with this (not `localDateString()`, which uses the vitest process TZ):
+ * a UTC runner between 14:00–24:00 UTC is already "tomorrow" in
+ * Australia/Melbourne, so the two dates disagree and the script finds no
+ * daily memory — the pre-existing date-boundary flake in this file.
+ */
+function scriptDateString(env: NodeJS.ProcessEnv): string {
+  const r = spawnSync("bash", ["-c", "date +%Y-%m-%d"], { env, timeout: 5_000 });
+  return r.stdout.toString().trim();
+}
+
 describe("handoff-briefing.sh assembler", () => {
   let tmpDir: string;
 
@@ -369,29 +384,29 @@ describe("handoff-briefing.sh assembler", () => {
     // must be local am/pm, NOT the old `date -u +%Y-%m-%dT%H:%M:%SZ`. Nothing
     // guarded this before, which is how it slipped past the first pass.
     //
-    // Name the daily-memory file in the SAME zone we pass to the script
-    // (Australia/Melbourne) — NOT the test process's zone. The script resolves
-    // TODAY in Melbourne, so during the UTC/local date-divergence window a
-    // parent-zone name (e.g. localDateString() on a UTC CI runner) would write
-    // the wrong day's file, the daily section would be empty, the whole briefing
-    // would be empty, and the regex below would match null. Zone-align the name
-    // so this test is deterministic regardless of the runner's wall clock.
-    const today = dateInZone("Australia/Melbourne");
+    // The script runs under TZ=Australia/Melbourne, so "today" (and the
+    // daily-memory filename it looks for) must be derived under THAT zone —
+    // not the runner's process TZ. A UTC CI runner after 14:00 UTC is
+    // already tomorrow in Melbourne; using localDateString() here made the
+    // script find no daily memory and the regex match null (date-boundary
+    // flake, pre-existing from #3275). Derive it under the child's exact env.
+    const env = {
+      ...process.env,
+      AGENT_DIR: tmpDir,
+      TELEGRAM_STATE_DIR: "",
+      HINDSIGHT_API_URL: "",
+      HINDSIGHT_BANK_ID: "",
+      WORKSPACE_DIR: tmpDir,
+      SWITCHROOM_TIMEZONE: "Australia/Melbourne",
+      TZ: "Australia/Melbourne",
+    };
+    const today = scriptDateString(env);
     const memDir = join(tmpDir, "memory");
     mkdirSync(memDir, { recursive: true });
     writeFileSync(join(memDir, `${today}.md`), "- Restart-time guard\n", "utf-8");
 
     const result = spawnSync("bash", [HANDOFF_BRIEFING_SCRIPT, "--stdout"], {
-      env: {
-        ...process.env,
-        AGENT_DIR: tmpDir,
-        TELEGRAM_STATE_DIR: "",
-        HINDSIGHT_API_URL: "",
-        HINDSIGHT_BANK_ID: "",
-        WORKSPACE_DIR: tmpDir,
-        SWITCHROOM_TIMEZONE: "Australia/Melbourne",
-        TZ: "Australia/Melbourne",
-      },
+      env,
       timeout: 10_000,
     });
     expect(result.status).toBe(0);
@@ -451,11 +466,6 @@ describe("handoff-briefing.sh assembler", () => {
   });
 
   it("restart timestamp falls back to am/pm even with no timezone configured (no UTC 24h form)", () => {
-    const today = localDateString();
-    const memDir = join(tmpDir, "memory");
-    mkdirSync(memDir, { recursive: true });
-    writeFileSync(join(memDir, `${today}.md`), "- Restart-time fallback guard\n", "utf-8");
-
     const env = {
       ...process.env,
       AGENT_DIR: tmpDir,
@@ -466,6 +476,14 @@ describe("handoff-briefing.sh assembler", () => {
     } as NodeJS.ProcessEnv;
     delete env.SWITCHROOM_TIMEZONE;
     delete env.TZ;
+
+    // With TZ deleted, the child bash falls back to the SYSTEM zone, which
+    // may differ from the vitest process's TZ env — derive "today" under the
+    // child's env (same date-boundary rationale as the Melbourne test above).
+    const today = scriptDateString(env);
+    const memDir = join(tmpDir, "memory");
+    mkdirSync(memDir, { recursive: true });
+    writeFileSync(join(memDir, `${today}.md`), "- Restart-time fallback guard\n", "utf-8");
 
     const result = spawnSync("bash", [HANDOFF_BRIEFING_SCRIPT, "--stdout"], {
       env,
