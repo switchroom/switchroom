@@ -38,6 +38,7 @@ import {
   MICROSOFT_WORKSPACE_MCP_PACKAGE,
   MICROSOFT_WORKSPACE_MCP_PINNED_VERSION,
 } from "../memory/scaffold-integration.js";
+import { microsoftAccountSlug } from "../config/microsoft-workspace-acl.js";
 
 /**
  * The env var softeria reads at startup to receive a pre-acquired
@@ -99,6 +100,18 @@ export function computeRestartBackoffMs(attempt: number): number {
 export interface LauncherOptions {
   /** Whether to pass `--org-mode` to softeria (Teams/SharePoint). */
   orgMode?: boolean;
+  /**
+   * The Microsoft account this launcher instance serves (multi-account
+   * form). Threaded to the broker as `getCredentials("microsoft", account)`
+   * and used to key the per-account heartbeat file. Omitted → single-
+   * account back-compat (broker derives the account from config).
+   */
+  account?: string;
+  /**
+   * Per-account tool allowlist regex → softeria `--enabled-tools`. Already
+   * joined (e.g. `list-mail-messages|get-mail-message`). Omitted = all tools.
+   */
+  enabledTools?: string;
 }
 
 export interface LauncherRuntime {
@@ -126,6 +139,9 @@ export function buildSofteriaArgs(opts: LauncherOptions = {}): string[] {
   const pkg = `${MICROSOFT_WORKSPACE_MCP_PACKAGE}@${MICROSOFT_WORKSPACE_MCP_PINNED_VERSION}`;
   const args = ["-y", pkg];
   if (opts.orgMode) args.push("--org-mode");
+  if (opts.enabledTools && opts.enabledTools.length > 0) {
+    args.push("--enabled-tools", opts.enabledTools);
+  }
   return args;
 }
 
@@ -167,8 +183,9 @@ export function computeRefreshDelayMs(
 export function writeRefreshHeartbeat(
   agentName: string,
   data: { lastRefreshMs: number; nextRefreshMs: number; expiresAtMs: number },
+  account?: string,
 ): void {
-  const path = heartbeatPath(agentName);
+  const path = heartbeatPath(agentName, account);
   try {
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, JSON.stringify(data, null, 2), { mode: 0o644 });
@@ -191,13 +208,25 @@ export function writeRefreshHeartbeat(
  * Test override: if `SWITCHROOM_M365_HEARTBEAT_DIR` is set, write
  * there instead. Lets tests use a per-test tmpdir without poking
  * `/state/agent/`.
+ *
+ * **Per-account (multi-account form):** when `account` is set, the file
+ * is keyed by the account slug so N launchers don't clobber each other:
+ * `m365-launcher-<slug>.heartbeat.json`. Single-account launchers (no
+ * `account`) keep the bare path for back-compat. The doctor probe globs
+ * `m365-launcher*.heartbeat.json` to read all of them.
  */
-export function heartbeatPath(agentName: string): string {
+export function heartbeatPath(agentName: string, account?: string): string {
+  const slug = account ? microsoftAccountSlug(account) : undefined;
   const override = process.env.SWITCHROOM_M365_HEARTBEAT_DIR;
   if (override) {
-    return join(override, `m365-launcher-${agentName}.heartbeat.json`);
+    const base = slug
+      ? `m365-launcher-${agentName}-${slug}`
+      : `m365-launcher-${agentName}`;
+    return join(override, `${base}.heartbeat.json`);
   }
-  return "/state/agent/m365-launcher.heartbeat.json";
+  return slug
+    ? `/state/agent/m365-launcher-${slug}.heartbeat.json`
+    : "/state/agent/m365-launcher.heartbeat.json";
 }
 
 /**
@@ -401,11 +430,15 @@ export async function runMs365McpLauncher(
   const scheduleRefresh = (expiresAtMs: number) => {
     const delayMs = computeRefreshDelayMs(expiresAtMs, now());
     const nextRefreshMs = now() + delayMs;
-    writeRefreshHeartbeat(agentName, {
-      lastRefreshMs: now(),
-      nextRefreshMs,
-      expiresAtMs,
-    });
+    writeRefreshHeartbeat(
+      agentName,
+      {
+        lastRefreshMs: now(),
+        nextRefreshMs,
+        expiresAtMs,
+      },
+      opts.account,
+    );
     log(
       `m365-launcher: scheduled refresh in ${Math.round(delayMs / 1000)}s (token expires at ${new Date(expiresAtMs).toISOString()})`,
     );
@@ -523,16 +556,24 @@ export function registerM365McpLauncherCommand(program: Command): void {
       "Pass --org-mode to softeria (Teams/SharePoint tools).",
       false,
     )
+    .option(
+      "--account <email>",
+      "Microsoft account this launcher serves (multi-account form). Fetches THAT account's token from the broker and keys a per-account heartbeat. Omitted → single-account back-compat.",
+    )
+    .option(
+      "--enabled-tools <pattern>",
+      "Per-account tool allowlist regex forwarded to softeria --enabled-tools (tokens joined with |). Omitted = all tools.",
+    )
     .description(
       "Internal — Microsoft 365 MCP launcher. Acquires a fresh access token from the auth-broker and execs softeria/ms-365-mcp-server in BYOT mode, restarting it ~55min before token expiry. RFC #1873 PR 3.",
     )
-    .action(async (opts: { orgMode?: boolean }) => {
+    .action(async (opts: { orgMode?: boolean; account?: string; enabledTools?: string }) => {
       const { brokerCall } = await import("./broker-call.js");
 
       const code = await runMs365McpLauncher(opts, {
         fetchCreds: async () => {
           return await brokerCall(async (client) => {
-            const data = await client.getCredentials("microsoft");
+            const data = await client.getCredentials("microsoft", opts.account);
             const mc = (data.credentials as {
               microsoftOauth?: { accessToken?: string; expiresAt?: number };
             }) ?? {};

@@ -82,7 +82,27 @@ const GATEWAY_SOCKET =
 const KERNEL_SOCKET =
   process.env.SWITCHROOM_KERNEL_SOCKET ?? "/run/switchroom/kernel/sock";
 
-const TOOL_PREFIX = "mcp__ms-365__";
+/**
+ * Multi-account-aware MS-365 tool-name matcher. Matches BOTH the bare
+ * single-account server key (`mcp__ms-365__<tool>`) AND the per-account
+ * multi-account keys (`mcp__ms-365-<slug>__<tool>`), capturing the bare
+ * softeria tool name after the LAST `__`.
+ *
+ * MERGE-BLOCKER (multi-account RFC §2.5): before this, the gate keyed off
+ * the literal `mcp__ms-365__` prefix, so every `mcp__ms-365-<slug>__*`
+ * write tool sailed through UN-gated (fail-open). The `(-[a-z0-9-]+)?`
+ * group closes that.
+ */
+const MS365_TOOL_RE = /^mcp__ms-365(?:-[a-z0-9-]+)?__(.+)$/;
+
+/**
+ * Return the bare softeria tool name if `toolName` is on the MS-365
+ * surface (single OR multi-account server key), else null.
+ */
+export function ms365BareToolName(toolName: string): string | null {
+  const m = MS365_TOOL_RE.exec(toolName);
+  return m ? m[1] : null;
+}
 
 /**
  * Gated softeria write tools — AUTHORITATIVE names.
@@ -240,8 +260,9 @@ export const KNOWN_SAFE_MS365_READ_TOOLS = new Set<string>([
  *     unrecognized / renamed tool) → true (gate).
  */
 export function isGatedMs365Tool(toolName: string): boolean {
-  if (!toolName.startsWith(TOOL_PREFIX)) return false;
-  const bare = toolName.slice(TOOL_PREFIX.length);
+  const bare = ms365BareToolName(toolName);
+  // Not an MS-365 tool (single or multi-account) → not our surface.
+  if (bare === null) return false;
   // Degenerate prefix-only name — not a real tool invocation.
   if (bare.length === 0) return false;
   // Verified read-only tools pass through without a card.
@@ -367,8 +388,8 @@ export interface Ms365CalendarEnrichment {
  * a single event id are excluded — nothing to resolve.)
  */
 export function isCalendarEventTool(toolName: string): boolean {
-  if (!toolName.startsWith(TOOL_PREFIX)) return false;
-  const bare = toolName.slice(TOOL_PREFIX.length);
+  const bare = ms365BareToolName(toolName);
+  if (bare === null) return false;
   return bare.includes("calendar-event");
 }
 

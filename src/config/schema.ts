@@ -2247,25 +2247,60 @@ export const AgentGoogleWorkspaceConfigSchema = z
  * `microsoft_client_id/secret` are not per-agent (one app reg per
  * switchroom install).
  */
+const MicrosoftAccountEmailSchema = z
+  .string()
+  .regex(/^[^@\s:]+@[^@\s:]+\.[^@\s:]+$/, {
+    message:
+      "microsoft_workspace.account must be a Microsoft account email like " +
+      "'alice@outlook.com' or 'alice@contoso.com' (colons not allowed)",
+  })
+  .transform((v) => v.trim().toLowerCase());
+
+/**
+ * A single Microsoft account binding in the plural `accounts[]` form
+ * (multi-account-per-agent RFC). Each binding pins one account, an
+ * optional per-account tool allowlist (→ softeria `--enabled-tools`),
+ * and an optional per-binding org_mode override.
+ */
+export const MicrosoftAccountBindingSchema = z.object({
+  account: MicrosoftAccountEmailSchema.describe(
+    "The Microsoft account this binding uses. Must be a key in top-level " +
+    "`microsoft_accounts:` with this agent in its `enabled_for[]`."
+  ),
+  tools: z
+    .array(z.string().min(1))
+    .min(1)
+    .optional()
+    .describe(
+      "Per-account tool allowlist → softeria `--enabled-tools <regex>` " +
+      "(tokens joined with `|`). Omitted = all tools exposed for this account."
+    ),
+  org_mode: z
+    .boolean()
+    .optional()
+    .describe("Per-binding org_mode override (RFC #1873 §6.4)."),
+});
+
 export const AgentMicrosoftWorkspaceConfigSchema = z
   .object({
-    account: z
-      .string()
-      .regex(/^[^@\s:]+@[^@\s:]+\.[^@\s:]+$/, {
-        message:
-          "microsoft_workspace.account must be a Microsoft account email like " +
-          "'alice@outlook.com' or 'alice@contoso.com' (colons not allowed)",
-      })
-      .transform((v) => v.trim().toLowerCase())
+    account: MicrosoftAccountEmailSchema.optional().describe(
+      "RFC #1873: the Microsoft account this agent uses for the M365 MCP. " +
+      "Must be a key in top-level `microsoft_accounts:` with this agent " +
+      "listed in its `enabled_for[]`. Read by the auth-broker " +
+      "(get-credentials, provider=microsoft) and by the scaffold to " +
+      "decide whether to emit the `ms-365` MCP entry. Normalized to " +
+      "lowercase so it matches the microsoft_accounts key (which is " +
+      "also normalized). Mutually exclusive with `accounts` (plural)."
+    ),
+    tools: z
+      .array(z.string().min(1))
+      .min(1)
       .optional()
       .describe(
-        "RFC #1873: the Microsoft account this agent uses for the M365 MCP. " +
-        "Must be a key in top-level `microsoft_accounts:` with this agent " +
-        "listed in its `enabled_for[]`. Read by the auth-broker " +
-        "(get-credentials, provider=microsoft) and by the scaffold to " +
-        "decide whether to emit the `ms-365` MCP entry. Normalized to " +
-        "lowercase so it matches the microsoft_accounts key (which is " +
-        "also normalized)."
+        "Per-account tool allowlist for the SINGULAR `account` form → " +
+        "softeria `--enabled-tools <regex>`. Omitted = all tools. Only " +
+        "valid with the singular `account`; using it together with the " +
+        "plural `accounts` (which carries per-binding `tools`) is an error."
       ),
     org_mode: z
       .boolean()
@@ -2275,6 +2310,51 @@ export const AgentMicrosoftWorkspaceConfigSchema = z
         "the top-level microsoft_workspace.org_mode for this agent. " +
         "Defaults to top-level value (which defaults to false)."
       ),
+    accounts: z
+      .array(MicrosoftAccountBindingSchema)
+      .min(1)
+      .optional()
+      .describe(
+        "Plural multi-account form: bind MULTIPLE Microsoft accounts to " +
+        "this agent, each with its own tool scope. Mutually exclusive with " +
+        "the singular `account`. Each account gets its own `ms-365-<slug>` " +
+        "MCP server."
+      ),
+  })
+  .superRefine((v, ctx) => {
+    const hasSingular = v.account !== undefined;
+    const hasPlural = v.accounts !== undefined;
+    if (hasSingular && hasPlural) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "microsoft_workspace: use EITHER `account` (singular) OR " +
+          "`accounts` (plural array), not both",
+        path: ["accounts"],
+      });
+    }
+    if (hasPlural && v.tools !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "microsoft_workspace: block-level `tools` applies to the singular " +
+          "`account` only; with `accounts` put `tools` inside each binding",
+        path: ["tools"],
+      });
+    }
+    if (hasPlural) {
+      const seen = new Set<string>();
+      for (const b of v.accounts!) {
+        if (seen.has(b.account)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `microsoft_workspace: duplicate account '${b.account}' in accounts[]`,
+            path: ["accounts"],
+          });
+        }
+        seen.add(b.account);
+      }
+    }
   })
   .optional();
 
@@ -4243,6 +4323,38 @@ export const SwitchroomConfigSchema = z.object({
   }
   for (const [name, a] of Object.entries(cfg.agents ?? {})) {
     checkServes((a as { serves?: string[] }).serves, ["agents", name, "serves"]);
+  }
+
+  // Multi-account-per-agent: for the PLURAL `microsoft_workspace.accounts`
+  // form, EVERY bound account must list this agent in
+  // `microsoft_accounts.<account>.enabled_for[]` — the twin-key gate,
+  // applied per account. A missing pair is a loud load-time error (mirrors
+  // the broker's FORBIDDEN hint) rather than a silently-missing tool
+  // namespace. The singular `account` form keeps its lenient
+  // emit-iff-enabled behavior (no hard error) for back-compat.
+  const microsoftAccounts = (cfg as {
+    microsoft_accounts?: Record<string, { enabled_for?: string[] } | undefined>;
+  }).microsoft_accounts;
+  for (const [name, a] of Object.entries(cfg.agents ?? {})) {
+    const mw = (a as { microsoft_workspace?: { accounts?: Array<{ account?: string }> } })
+      .microsoft_workspace;
+    const accounts = mw?.accounts;
+    if (!accounts) continue;
+    accounts.forEach((b, i) => {
+      const acct = b?.account?.trim().toLowerCase();
+      if (!acct) return;
+      const enabledFor = microsoftAccounts?.[acct]?.enabled_for ?? [];
+      if (!enabledFor.includes(name)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            `agent '${name}' binds Microsoft account '${acct}' but is not in ` +
+            `microsoft_accounts['${acct}'].enabled_for[] — operator must run ` +
+            `\`switchroom auth microsoft enable ${acct} ${name}\``,
+          path: ["agents", name, "microsoft_workspace", "accounts", i, "account"],
+        });
+      }
+    });
   }
 });
 

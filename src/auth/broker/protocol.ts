@@ -88,6 +88,15 @@ export const GetCredentialsRequestSchema = z.object({
    * returning credentials.
    */
   provider: ProviderNameSchema.optional(),
+  /**
+   * Requested Microsoft account (multi-account-per-agent). Optional. When
+   * present (provider="microsoft"), the broker validates it is one of the
+   * agent's `microsoft_workspace` bindings AND that the account lists this
+   * agent in `microsoft_accounts.<account>.enabled_for[]`, then returns
+   * THAT account's credentials. Omitted → single-account back-compat (the
+   * account is derived from the agent's singular `microsoft_workspace.account`).
+   */
+  account: z.string().min(1).optional(),
 });
 
 export const ListStateRequestSchema = z.object({

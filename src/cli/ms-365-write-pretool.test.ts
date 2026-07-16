@@ -31,7 +31,48 @@ import {
   buildCalendarChanges,
   enrichCalendarPreview,
   loadAllowFrom,
+  ms365BareToolName,
 } from "./ms-365-write-pretool.js";
+
+describe("multi-account prefix widening (MERGE-BLOCKER — fail-open regression guard)", () => {
+  // If the PreToolUse prefix isn't widened from the literal `mcp__ms-365__`
+  // to `mcp__ms-365(-<slug>)?__`, every multi-account write tool sails
+  // through UN-gated. These assertions FAIL unless the prefix is widened.
+  it("GATES a write tool on a per-account server key", () => {
+    expect(isGatedMs365Tool("mcp__ms-365-lisa-goodfellow-1a2b__delete-onedrive-file")).toBe(true);
+    expect(isGatedMs365Tool("mcp__ms-365-lisa-thinksolve-3c4d__send-mail")).toBe(true);
+    // unrecognized tool on a per-account key still fail-closes
+    expect(isGatedMs365Tool("mcp__ms-365-acct-9999__some-new-write-tool")).toBe(true);
+  });
+
+  it("PASSES a verified read tool on a per-account server key", () => {
+    expect(isGatedMs365Tool("mcp__ms-365-lisa-thinksolve-3c4d__list-mail-messages")).toBe(false);
+    expect(isGatedMs365Tool("mcp__ms-365-lisa-goodfellow-1a2b__list-drives")).toBe(false);
+  });
+
+  it("still gates + passes on the bare single-account key (back-compat)", () => {
+    expect(isGatedMs365Tool("mcp__ms-365__delete-onedrive-file")).toBe(true);
+    expect(isGatedMs365Tool("mcp__ms-365__list-mail-messages")).toBe(false);
+  });
+
+  it("ignores non-ms-365 tools", () => {
+    expect(isGatedMs365Tool("mcp__gdrive__delete-file")).toBe(false);
+    expect(isGatedMs365Tool("Bash")).toBe(false);
+    // a look-alike that isn't the ms-365 namespace
+    expect(isGatedMs365Tool("mcp__ms-366__delete-file")).toBe(false);
+  });
+
+  it("ms365BareToolName extracts the bare tool after the last __ (single + multi)", () => {
+    expect(ms365BareToolName("mcp__ms-365__send-mail")).toBe("send-mail");
+    expect(ms365BareToolName("mcp__ms-365-lisa-1a2b__send-mail")).toBe("send-mail");
+    expect(ms365BareToolName("Bash")).toBeNull();
+  });
+
+  it("isCalendarEventTool works on per-account keys", () => {
+    expect(isCalendarEventTool("mcp__ms-365-acct-1a2b__update-calendar-event")).toBe(true);
+    expect(isCalendarEventTool("mcp__ms-365-acct-1a2b__list-mail-messages")).toBe(false);
+  });
+});
 
 describe("isGatedMs365Tool — real softeria write names (Bug 1: gate)", () => {
   it("GATES real calendar writes", () => {

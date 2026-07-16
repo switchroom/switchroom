@@ -698,3 +698,94 @@ describe("runMs365McpLauncher — crash-loop backoff (#2586)", () => {
     delete process.env.SWITCHROOM_M365_HEARTBEAT_DIR;
   });
 });
+
+// ────────────────────────────────────────────────────────────────────────
+// Multi-account per agent — enabled-tools + per-slug heartbeat isolation
+// ────────────────────────────────────────────────────────────────────────
+
+describe("buildSofteriaArgs — --enabled-tools (per-account tool scope)", () => {
+  it("appends --enabled-tools when a pattern is given", () => {
+    const args = buildSofteriaArgs({ enabledTools: "list-mail-messages|get-mail-message" });
+    const i = args.indexOf("--enabled-tools");
+    expect(i).toBeGreaterThan(-1);
+    expect(args[i + 1]).toBe("list-mail-messages|get-mail-message");
+  });
+
+  it("omits --enabled-tools when absent (all tools)", () => {
+    expect(buildSofteriaArgs()).not.toContain("--enabled-tools");
+    expect(buildSofteriaArgs({ orgMode: true })).not.toContain("--enabled-tools");
+  });
+});
+
+describe("heartbeatPath — per-slug isolation for N launchers", () => {
+  const hbDir = `/tmp/m365-multi-hb-${process.pid}-${Date.now()}`;
+  beforeEach(() => {
+    process.env.SWITCHROOM_M365_HEARTBEAT_DIR = hbDir;
+  });
+  afterEach(() => {
+    delete process.env.SWITCHROOM_M365_HEARTBEAT_DIR;
+    rmSync(hbDir, { recursive: true, force: true });
+  });
+
+  it("two accounts on one agent get DISTINCT heartbeat files (no clobber)", () => {
+    const a = heartbeatPath("marko", "alice@example.com");
+    const b = heartbeatPath("marko", "bob@example.com");
+    expect(a).not.toBe(b);
+    // both are per-slug, not the bare single-account path
+    expect(a).not.toContain("m365-launcher-marko.heartbeat.json");
+    expect(b).not.toContain("m365-launcher-marko.heartbeat.json");
+  });
+
+  it("no account (single-account) keeps the bare per-agent path", () => {
+    const p = heartbeatPath("marko");
+    expect(p).toContain("m365-launcher-marko.heartbeat.json");
+  });
+
+  it("writing two accounts' heartbeats leaves both files intact", () => {
+    writeRefreshHeartbeat("marko", { lastRefreshMs: 1, nextRefreshMs: 2, expiresAtMs: 3 }, "alice@example.com");
+    writeRefreshHeartbeat("marko", { lastRefreshMs: 4, nextRefreshMs: 5, expiresAtMs: 6 }, "bob@example.com");
+    const a = heartbeatPath("marko", "alice@example.com");
+    const b = heartbeatPath("marko", "bob@example.com");
+    expect(existsSync(a)).toBe(true);
+    expect(existsSync(b)).toBe(true);
+    expect(JSON.parse(readFileSync(a, "utf-8")).lastRefreshMs).toBe(1);
+    expect(JSON.parse(readFileSync(b, "utf-8")).lastRefreshMs).toBe(4);
+  });
+});
+
+describe("runMs365McpLauncher — per-account (multi) writes a per-slug heartbeat", () => {
+  const hbDir = `/tmp/m365-run-multi-hb-${process.pid}-${Date.now()}`;
+  afterEach(() => {
+    delete process.env.SWITCHROOM_AGENT_NAME;
+    delete process.env.SWITCHROOM_M365_HEARTBEAT_DIR;
+    rmSync(hbDir, { recursive: true, force: true });
+  });
+
+  it("keys the heartbeat by the --account slug and threads that account's token", async () => {
+    process.env.SWITCHROOM_AGENT_NAME = "marko";
+    process.env.SWITCHROOM_M365_HEARTBEAT_DIR = hbDir;
+    const account = "bob@example.com";
+    let spawnedEnv: NodeJS.ProcessEnv | undefined;
+    const child = makeFakeChild();
+    const promise = runMs365McpLauncher(
+      { account },
+      {
+        fetchCreds: async () => ({ accessToken: "at-mail", expiresAt: Date.now() + 60 * 60 * 1000 }),
+        spawnSofteria: (env) => {
+          spawnedEnv = env;
+          return child as unknown as import("node:child_process").ChildProcess;
+        },
+        setTimer: ((_cb: () => void, _ms: number) => setTimeout(() => {}, 0)) as typeof setTimeout,
+        log: () => {},
+      },
+    );
+    await new Promise((r) => setImmediate(r));
+    expect(spawnedEnv?.[SOFTERIA_TOKEN_ENV]).toBe("at-mail");
+    // heartbeat lands at the per-slug path, NOT the bare single-account path.
+    expect(existsSync(heartbeatPath("marko", account))).toBe(true);
+    expect(existsSync(heartbeatPath("marko"))).toBe(false);
+    child.exitCode = 0;
+    child.emit("exit", 0, null);
+    await promise;
+  });
+});
