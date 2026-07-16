@@ -89,6 +89,7 @@ import { getBundledSkillsPoolDir } from "./reconcile-default-skills.js";
 import { loadHostCapabilities } from "../setup/host-capabilities.js";
 import type { VoiceEngine } from "../setup/gpu-detect.js";
 import { AGENT_UID_MIN, AGENT_UID_MAX, allocateAgentUid } from "./agent-uid.js";
+import { GRANTS_DB_DIRNAME, GRANTS_DB_CONTAINER_DIR } from "../vault/grants-db-path.js";
 
 // UID derivation lives in agent-uid.ts (a leaf module) so scaffold.ts can
 // import it without a compose ↔ scaffold cycle (compose.ts imports
@@ -1489,32 +1490,41 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   // because broker appends; broker runs as root with CAP_DAC_OVERRIDE
   // so file ownership/mode doesn't gate the write path. See #1025.
   lines.push(`      - ${homePrefix}/.switchroom/vault-audit.log:/root/.switchroom/vault-audit.log`);
-  // Capability grants DB — bind-mount the host SQLite file into the
-  // broker so grants survive container recreate. Without this mount
-  // the broker writes to `/root/.switchroom/vault-grants.db` inside
-  // the container (which evaporates on every recreate). The token
-  // files on disk (`~/.switchroom/agents/<agent>/.vault-token`)
-  // persist via the per-agent bind mounts and reference a grant ID
-  // that no longer exists in the fresh broker DB — the broker's
-  // #1496 fall-through routes the call to the standing schedule.
-  // secrets ACL, which usually denies because the granted key
-  // isn't in the agent's static config (the whole reason a grant
-  // was minted in the first place). Surfaces as
-  // `VAULT-BROKER-DENIED [DENIED]: key 'X' not in ACL for agent
-  // 'Y'` on every `switchroom vault get` from inside the agent
-  // container after a broker recreate.
+  // Capability grants DB — bind-mount the host DIRECTORY that holds the
+  // grants SQLite file (and its WAL sidecars) into the broker so grants
+  // survive container recreate. Without this mount the broker writes to
+  // `/root/.switchroom/vault-broker/vault-grants.db` inside the container
+  // (which evaporates on every recreate). The token files on disk
+  // (`~/.switchroom/agents/<agent>/.vault-token`) persist via the per-agent
+  // bind mounts and reference a grant ID that no longer exists in the fresh
+  // broker DB — the broker's #1496 fall-through routes the call to the
+  // standing schedule.secrets ACL, which usually denies because the granted
+  // key isn't in the agent's static config (the whole reason a grant was
+  // minted in the first place). Surfaces as `VAULT-BROKER-DENIED [DENIED]:
+  // key 'X' not in ACL for agent 'Y'` on every `switchroom vault get` from
+  // inside the agent container after a broker recreate.
+  //
+  // WHY A DIRECTORY, NOT THE BARE FILE (#3289): the grants DB runs in WAL
+  // mode, which writes `-wal`/`-shm` sidecars BESIDE the main file. When only
+  // the single main file was mounted (pre-#3289), those sidecars landed in the
+  // container's ephemeral overlayfs — so a committed grant sat in the
+  // container-local WAL until a rare automatic checkpoint and was LOST on
+  // container recreate. Mounting the whole `vault-broker` directory keeps the
+  // main file AND its sidecars together on the host fs. The in-container path
+  // and the host directory are resolved from `grants-db.ts` helpers so no path
+  // literal is duplicated.
   //
   // Surfaced 2026-05-24 after the v0.13.31 broker recreate wiped
   // every grant minted earlier the same day (clerk's vg_5e1991 for
   // `ha/access-token`). The doctor probe doesn't catch this — it
   // only inspects path-as-identity ACL, not grant-based access.
   //
-  // Pre-created mode 0600 by `ensureHostMountSources()` (apply.ts)
-  // so docker doesn't auto-create a directory at the source path.
-  // Broker writes via root with CAP_DAC_OVERRIDE so file
-  // ownership doesn't gate the write path. (Same pattern as
-  // vault-audit.log above and host-control-audit.log on hostd.)
-  lines.push(`      - ${homePrefix}/.switchroom/vault-grants.db:/root/.switchroom/vault-grants.db`);
+  // The directory is pre-created (mode 0700, with the DB migrated in) by
+  // `ensureHostMountSources()` (apply.ts) so docker doesn't auto-create a
+  // root-owned path at the source. Broker writes via root with
+  // CAP_DAC_OVERRIDE so ownership doesn't gate the write path. (Same pattern
+  // as vault-audit.log above and host-control-audit.log on hostd.)
+  lines.push(`      - ${homePrefix}/.switchroom/${GRANTS_DB_DIRNAME}:${GRANTS_DB_CONTAINER_DIR}`);
   // Per-agent vault-grant token files. The broker's mint_grant
   // handler (server.ts ~2222) writes the minted token at
   // `os.homedir() + .switchroom/agents/<agent>/.vault-token`.

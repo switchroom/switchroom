@@ -66,6 +66,11 @@ import {
   ConfigError,
 } from "../config/loader.js";
 import { scaffoldAgent, alignAgentUid, renderFleetInvariants, toHostHomePath } from "../agents/scaffold.js";
+import {
+  getGrantsDbDir,
+  getGrantsDbPath,
+  migrateLegacyGrantsDbLocation,
+} from "../vault/grants-db-path.js";
 import { renderFleetDefaultsClaudeMd } from "../agents/fleet-defaults.js";
 import { refreshAgentConnectionHealth } from "../agents/connection-health.js";
 import type { VaultAclResult } from "./doctor-mcp-secrets.js";
@@ -1019,23 +1024,41 @@ export async function ensureHostMountSources(
   }
 
   // vault-grants.db: capability-token grants persisted to a SQLite
-  // file. Same dir-vs-file race as vault-audit.log — if the source
-  // path doesn't exist, docker auto-creates it as a root-owned
-  // DIRECTORY and the broker can't write. Pre-create as a 0-byte
-  // file owned by the operator (mode 0600 — secrets material, no
-  // group/other access). The broker's `openGrantsDb` runs the SQL
-  // migration on first open and turns the empty file into a valid
-  // schema, so the broker boots cleanly on either a fresh empty
-  // file OR an existing populated DB.
+  // file inside a DEDICATED directory (`~/.switchroom/vault-broker/`).
   //
-  // Without this bind mount + pre-create, broker recreates wipe
-  // every capability grant — the orphaned `.vault-token` files
-  // on disk then fail every `vault get` from inside agent
-  // containers. Surfaced 2026-05-24 after the v0.13.31 rollout.
-  const grantsDbPath = join(home, ".switchroom", "vault-grants.db");
-  if (!existsSync(grantsDbPath)) {
-    writeFileSync(grantsDbPath, "", { mode: 0o600 });
-  }
+  // WHY A DIRECTORY, NOT THE BARE FILE (#3289): the grants DB runs in WAL
+  // mode, which writes `-wal`/`-shm` sidecars beside the main file. The old
+  // single-file bind mount left those sidecars in the broker's ephemeral
+  // overlayfs, so a committed grant sat in the container-local WAL until a
+  // rare checkpoint and was LOST on container recreate. Bind-mounting the
+  // whole directory keeps the main file AND its sidecars on the host fs.
+  //
+  // Pre-create the directory (mode 0700 — secrets material, no group/other
+  // access) so docker doesn't auto-create a root-owned path at the bind
+  // source, then relocate any legacy `~/.switchroom/vault-grants.db` (plus its
+  // WAL sidecars) into it. `migrateLegacyGrantsDbLocation` is idempotent and a
+  // no-op on greenfield / already-migrated hosts. The broker's `openGrantsDb`
+  // runs the SQL migration on first open, so it boots cleanly on a fresh empty
+  // directory OR an existing populated DB. Both resolve the path from the
+  // shared `grants-db-path` helpers — no duplicated literal.
+  //
+  // Without this bind mount + pre-create, broker recreates wipe every
+  // capability grant — the orphaned `.vault-token` files on disk then fail
+  // every `vault get` from inside agent containers. Surfaced 2026-05-24 after
+  // the v0.13.31 rollout; WAL-sidecar durability hardened in #3289.
+  //
+  // UPGRADE-WINDOW CAVEAT: while a PRE-fix broker is still running, it holds
+  // the legacy DB open via the old single-file mount. A grant minted between
+  // this migration and the broker's recreate (`docker compose up`, which the
+  // operator/updater runs after apply) lands in a fresh container-local
+  // legacy -wal the new broker never replays and may need re-minting. This
+  // window is unavoidable without stopping the broker before apply; apply
+  // therefore runs the migration as late as it can — inside the mount-source
+  // preparation immediately preceding the compose handoff. The broker's own
+  // boot re-runs the same idempotent migration as a second chance.
+  const grantsDbDir = getGrantsDbDir(home);
+  mkdirSync(grantsDbDir, { recursive: true, mode: 0o700 });
+  migrateLegacyGrantsDbLocation(getGrantsDbPath(home));
 
   // host-control-audit.log: same pattern as vault-audit.log — hostd
   // is the writer (from inside its own container at /host-home),

@@ -148,6 +148,33 @@ function rowToGrant(row: Record<string, unknown>): GrantRow {
 }
 
 /**
+ * Defense-in-depth WAL durability: fold the write-ahead log back into the
+ * main DB file immediately after a grant mutation.
+ *
+ * The primary durability fix is mounting the whole grants-DB DIRECTORY into
+ * the broker (so `-wal`/`-shm` persist across container recreate — see
+ * grants-db.ts). This checkpoint is the belt-and-braces: grant write volume
+ * is trivial (a mint or revoke is a rare, human-paced event), so truncating
+ * the WAL after every mutation is effectively free and guarantees the main
+ * file is always current for host-side readers (doctor, migration) without a
+ * race on the next automatic checkpoint. We keep WAL mode (not journal_mode=
+ * DELETE) because the broker and the approval-kernel share this one handle and
+ * rely on WAL's concurrent-reader behaviour + busy_timeout; DELETE would
+ * change those shared semantics, whereas an explicit checkpoint does not.
+ *
+ * Best-effort: an in-memory test DB or a non-WAL handle makes this a harmless
+ * no-op/throw which we swallow — the mutation is already committed; this only
+ * advances the durability point of the main file.
+ */
+function checkpointGrantsWal(db: Database): void {
+  try {
+    db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+  } catch {
+    // Non-fatal — see above.
+  }
+}
+
+/**
  * Match a key name against a list of patterns. Patterns are literal
  * key names, optionally with a trailing `*` for prefix-glob (e.g.
  * `OPENAI_*` matches `OPENAI_API_KEY` and `OPENAI_TIMEOUT`). No other
@@ -214,6 +241,7 @@ export async function mintGrant(
       description ?? null,
     ],
   );
+  checkpointGrantsWal(db);
 
   return { token, id, expires_at };
 }
@@ -361,6 +389,7 @@ export function revokeGrant(db: Database, id: string): boolean {
     `UPDATE vault_grants SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`,
     [now, id],
   );
+  checkpointGrantsWal(db);
   return (result.changes ?? 0) > 0;
 }
 

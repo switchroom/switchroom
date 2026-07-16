@@ -151,8 +151,8 @@ const AGENTS = ["alice", "bob", "carol"];
  */
 function readGrantsSchemaVersion(containerName: string): number | null {
   // The broker opens ~/.switchroom/vault-grants.db inside the container —
-  // that resolves to /root/.switchroom/vault-grants.db (USER 0:0).
-  const dbPath = "/root/.switchroom/vault-grants.db";
+  // that resolves to /root/.switchroom/vault-broker/vault-grants.db (USER 0:0).
+  const dbPath = "/root/.switchroom/vault-broker/vault-grants.db";
   try {
     const out = execSync(
       `docker exec ${containerName} bun -e ` +

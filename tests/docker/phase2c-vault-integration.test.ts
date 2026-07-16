@@ -475,7 +475,7 @@ beforeAll(() => {
     brokerName,
     kernelName,
     agentNames,
-    initialBrokerSchemaVersion: readSchemaVersion(brokerName, "/root/.switchroom/vault-grants.db"),
+    initialBrokerSchemaVersion: readSchemaVersion(brokerName, "/root/.switchroom/vault-broker/vault-grants.db"),
     initialKernelSchemaVersion: readSchemaVersion(kernelName, "/state/approvals/kernel.db"),
     prodSnapshot,
   };
@@ -884,7 +884,7 @@ describe.skipIf(!imagesOk)(
         // Broker grants DB.
         const afterBroker = readSchemaVersion(
           fx.brokerName,
-          "/root/.switchroom/vault-grants.db",
+          "/root/.switchroom/vault-broker/vault-grants.db",
         );
         if (fx.initialBrokerSchemaVersion !== null && afterBroker !== null) {
           expect(afterBroker).toBe(fx.initialBrokerSchemaVersion);
