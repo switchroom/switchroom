@@ -102,7 +102,7 @@ import {
   forwardOriginDateIso,
   type ForwardOriginInfo,
 } from './forward-origin.js'
-import { fmtLocalStamp, resolveEnvTimezone } from '../shared/local-time.js'
+import { fmtLocalStamp, resolveEnvTimezone, renderLogTimestampsLocal } from '../shared/local-time.js'
 import { StatusReactionController } from '../status-reactions.js'
 import { DeferredDoneReactions } from '../reaction-defer.js'
 import { createWorkerActivityFeed, isWorkerActivityFeedEnabled } from '../worker-activity-feed.js'
@@ -22911,9 +22911,14 @@ async function runSwitchroomCommand(
   // commands) preserve in-place reply behavior. /logs /audit
   // /upgradestatus /memory pass 'heavy' to route to admin alias.
   classification: 'query' | 'mutation' | 'heavy' = 'query',
+  // Optional DISPLAY-ONLY transform applied to the stripped command output
+  // before formatting (never mutates the underlying stored logs). /logs uses
+  // this to render leading UTC ISO docker-log timestamps in local am/pm.
+  transformOutput?: (raw: string) => string,
 ): Promise<void> {
   try {
-    const output = stripAnsi(switchroomExec(args))
+    const stripped = stripAnsi(switchroomExec(args))
+    const output = transformOutput ? transformOutput(stripped) : stripped
     const formatted = formatSwitchroomOutput(output)
     if (formatted) { await switchroomReply(ctx, preBlock(formatted), { html: true, classification }) }
     else { await switchroomReply(ctx, `${label}: done (no output)`, { classification }) }
@@ -26982,7 +26987,18 @@ bot.command('logs', async ctx => {
   const lines = linesArg ? parseInt(linesArg, 10) : 20
   const lineCount = isNaN(lines) || lines < 1 ? 20 : Math.min(lines, 200)
   // PR5 — heavy-output → admin alias in supergroup mode (CPO #4).
-  await runSwitchroomCommand(ctx, ['agent', 'logs', name, '--lines', String(lineCount)], `logs ${name}`, 'heavy')
+  // #tz-fix audit (MEDIUM gap 2): docker log lines carry a leading UTC ISO-Z
+  // timestamp. Render it in the operator's local am/pm at DISPLAY time so
+  // `/logs` doesn't surface UTC (competing with the local-time hint). Stored
+  // logs are untouched — this transform runs only on the text sent to chat.
+  const tz = resolveEnvTimezone()
+  await runSwitchroomCommand(
+    ctx,
+    ['agent', 'logs', name, '--lines', String(lineCount)],
+    `logs ${name}`,
+    'heavy',
+    (raw) => renderLogTimestampsLocal(raw, tz),
+  )
 })
 
 bot.command('memory', async ctx => {

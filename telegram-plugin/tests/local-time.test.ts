@@ -10,7 +10,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { fmtLocalStamp, resolveEnvTimezone } from '../shared/local-time.js'
+import { fmtLocalStamp, resolveEnvTimezone, renderLogTimestampsLocal } from '../shared/local-time.js'
 
 // 2025-06-15T14:26:40Z — a fixed instant so the local rendering is deterministic.
 const MS = 1750000000 * 1000
@@ -64,5 +64,52 @@ describe('fmtLocalStamp', () => {
       expect(s).toMatch(/ (?:AM|PM) /)
       expect(s).not.toContain('UTC')
     }
+  })
+})
+
+describe('renderLogTimestampsLocal', () => {
+  // #tz-fix audit (MEDIUM gap 2): /logs docker lines carry a leading UTC
+  // ISO-Z stamp; render it in local am/pm at display time.
+  it('rewrites a leading UTC ISO-Z timestamp into local am/pm', () => {
+    // 04:09Z in July → Melbourne AEST (UTC+10) → 02:09 PM.
+    const out = renderLogTimestampsLocal(
+      '2026-07-16T04:09:00.123456789Z gateway boot ok',
+      'Australia/Melbourne',
+    )
+    expect(out).toContain('2026-07-16 02:09 PM AEST')
+    expect(out).toContain('gateway boot ok')
+    expect(out).not.toContain('T04:09')
+    expect(out).not.toContain('Z gateway')
+  })
+
+  it('handles a fractionless ISO-Z timestamp', () => {
+    const out = renderLogTimestampsLocal('2026-07-16T04:09:00Z hello', 'Australia/Melbourne')
+    expect(out).toContain('2026-07-16 02:09 PM AEST hello')
+  })
+
+  it('converts every line and preserves non-timestamped lines verbatim', () => {
+    const input = [
+      '2026-07-16T04:09:00Z first',
+      '  continuation line with no timestamp',
+      '2026-07-16T05:10:00Z second',
+    ].join('\n')
+    const out = renderLogTimestampsLocal(input, 'Australia/Melbourne').split('\n')
+    expect(out[0]).toContain('02:09 PM AEST first')
+    expect(out[1]).toBe('  continuation line with no timestamp')
+    expect(out[2]).toContain('03:10 PM AEST second')
+  })
+
+  it('preserves a line whose leading token is not a valid ISO-Z stamp', () => {
+    const raw = 'not-a-timestamp still here'
+    expect(renderLogTimestampsLocal(raw, 'Australia/Melbourne')).toBe(raw)
+  })
+
+  it('does not touch a timestamp that is not at line start', () => {
+    const raw = 'prefix 2026-07-16T04:09:00Z trailing'
+    expect(renderLogTimestampsLocal(raw, 'Australia/Melbourne')).toBe(raw)
+  })
+
+  it('returns empty input unchanged', () => {
+    expect(renderLogTimestampsLocal('', 'Australia/Melbourne')).toBe('')
   })
 })

@@ -4,6 +4,7 @@ import {
   extractZoneFromLocaltimeLink,
   resolveTimezone,
   classifyTimezoneSource,
+  isResolvableTimezone,
 } from "../src/config/timezone.js";
 import { SwitchroomConfigSchema, type AgentConfig, type SwitchroomConfig } from "../src/config/schema.js";
 
@@ -421,5 +422,27 @@ describe("schema validation — timezone", () => {
       baseConfig({ timezone: zone }),
     );
     expect(result.success).toBe(false);
+  });
+});
+
+describe("isResolvableTimezone (#tz-fix audit gap 3)", () => {
+  it.each(["UTC", "Australia/Melbourne", "America/New_York", "America/Argentina/Buenos_Aires"])(
+    "accepts the real IANA zone %s",
+    (zone) => {
+      expect(isResolvableTimezone(zone)).toBe(true);
+    },
+  );
+
+  it.each(["Australia/Melbrone", "America/New_Yrok", "Europe/Lodnon", "Foo/Bar"])(
+    "rejects the shape-valid-but-nonexistent zone %s",
+    (zone) => {
+      // These pass TIMEZONE_REGEX (Region/City shape) but no such zone exists;
+      // the runtime would silently degrade them to UTC without this check.
+      expect(isResolvableTimezone(zone)).toBe(false);
+    },
+  );
+
+  it("rejects garbage without throwing", () => {
+    expect(isResolvableTimezone("not a zone!!")).toBe(false);
   });
 });

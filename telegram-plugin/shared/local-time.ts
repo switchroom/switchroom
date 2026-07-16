@@ -123,3 +123,36 @@ export function fmtLocalStamp(ms: number, tz: string): string {
     return new Date(ms).toISOString()
   }
 }
+
+/**
+ * Leading ISO-8601-Z timestamp at the start of a log line, e.g.
+ * `2026-07-16T04:09:00.123456789Z` or `2026-07-16T04:09:00Z`. Docker log
+ * lines (as surfaced by `switchroom agent logs`) carry one of these per line.
+ * Anchored at line start; the trailing capture is the rest of the line.
+ */
+const LEADING_ISO_Z = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)(\s|$)/
+
+/**
+ * DISPLAY-ONLY: rewrite a leading UTC ISO-8601-Z timestamp on each line of
+ * `text` into the operator's LOCAL am/pm wall clock via {@link fmtLocalStamp},
+ * so `/logs` output reads `Thursday 2026-07-16 02:09 PM AEST …` instead of a
+ * raw `…T04:09:00Z`. Applied at send time; never mutates stored logs.
+ *
+ * Pure / total — matches ONLY a well-formed leading ISO-Z stamp and preserves
+ * every other line (and any line whose timestamp doesn't parse) verbatim, so a
+ * non-timestamped or partial log line is passed through untouched. `\r`
+ * line endings are preserved.
+ */
+export function renderLogTimestampsLocal(text: string, tz: string): string {
+  if (!text) return text
+  return text
+    .split('\n')
+    .map((line) => {
+      const m = LEADING_ISO_Z.exec(line)
+      if (!m) return line
+      const ms = Date.parse(m[1])
+      if (Number.isNaN(ms)) return line
+      return `${fmtLocalStamp(ms, tz)}${m[2] === '' ? '' : ' '}${line.slice(m[0].length)}`
+    })
+    .join('\n')
+}

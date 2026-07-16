@@ -8,6 +8,7 @@ import { resolveDualPath } from "./paths.js";
 import { applyAgentOverlays } from "./overlay-loader.js";
 import { resolveAgentConfig } from "./merge.js";
 import { validateNotionWorkspaceConfig } from "./notion-workspace-acl.js";
+import { isResolvableTimezone } from "./timezone.js";
 
 export class ConfigError extends Error {
   constructor(
@@ -222,7 +223,57 @@ export function loadConfig(configPath?: string): SwitchroomConfig {
     );
   }
 
+  // #tz-fix audit (LOW gap 3): the `timezone` zod fields enforce SHAPE only
+  // (TIMEZONE_REGEX). A shape-valid TYPO like `Australia/Melbrone` passes the
+  // schema, then silently degrades to UTC at runtime when `Intl`/`ZoneInfo`
+  // reject the unknown zone. Reject it here — at config load/apply — so the
+  // operator sees a loud failure instead of every agent quietly running in
+  // UTC. Same fail-fast rationale as the cron-topic and notion checks above.
+  validateAllTimezones(config, filePath);
+
   return config;
+}
+
+/**
+ * Reject any declared `timezone:` value that is shape-valid (passes the zod
+ * TIMEZONE_REGEX) but names a zone the runtime cannot actually resolve — the
+ * typo case that would otherwise degrade silently to UTC at runtime.
+ *
+ * Walks every layer that carries a `timezone` field (global, defaults, each
+ * profile, each agent), aggregating all violations into one `ConfigError` so a
+ * yaml with several typos surfaces them all in a single pass.
+ */
+function validateAllTimezones(
+  config: SwitchroomConfig,
+  filePath: string,
+): void {
+  const issues: string[] = [];
+  const check = (zone: string | undefined, where: string): void => {
+    if (zone == null) return;
+    if (!isResolvableTimezone(zone)) {
+      issues.push(
+        `  ${where}: "${zone}" is not a resolvable IANA timezone ` +
+        `(shape is valid but no such zone exists — check for a typo, ` +
+        `e.g. "Australia/Melbourne", "America/New_York", "UTC").`,
+      );
+    }
+  };
+
+  check(config.switchroom?.timezone, "switchroom.timezone");
+  check(config.defaults?.timezone, "defaults.timezone");
+  for (const [profileName, profile] of Object.entries(config.profiles ?? {})) {
+    check(profile?.timezone, `profiles.${profileName}.timezone`);
+  }
+  for (const [agentName, agentRaw] of Object.entries(config.agents)) {
+    check(agentRaw?.timezone, `agents.${agentName}.timezone`);
+  }
+
+  if (issues.length > 0) {
+    throw new ConfigError(
+      `Invalid timezone configuration in ${filePath}`,
+      issues,
+    );
+  }
 }
 
 /**
