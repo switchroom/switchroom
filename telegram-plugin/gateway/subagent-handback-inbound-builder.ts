@@ -115,6 +115,18 @@ export function buildSubagentHandbackInbound(opts: {
     meta: {
       source: 'subagent_handback',
       outcome: opts.ctx.outcome,
+      // #3268 — round-trip the fabricated `ts` through `meta.message_id` so it
+      // survives to enqueue. `ev.messageId` at enqueue is parsed from the
+      // channel envelope's `message_id` attribute, which is rendered ONLY from
+      // `meta.message_id` — the top-level `messageId` field does NOT survive the
+      // bridge. Without this, enqueue's `deriveTurnId` returns null → the
+      // dead-air pre-turn card's identity-based adoption never matches (the card
+      // is orphaned + a false "handback never started" reap message fires on
+      // every SUCCESSFUL handback). Mirrors resume-inbound-builder.ts's
+      // `message_id: String(ts)` for the identical enqueue-round-trip reason. It
+      // is NEVER used as a Telegram reply anchor: `parseSourceMessageId` gates
+      // the 13-digit synthetic ts out of the reply-anchor path at enqueue.
+      message_id: String(ts),
       // meta.message_thread_id is the model-visible channel attribute
       // (mirrors the real-inbound shape) so the model's reply targets
       // the dispatching topic. Mirrors gateway.ts:10557.

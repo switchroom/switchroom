@@ -262,12 +262,20 @@ export function createHandbackPreturnSignal(
     // Start the turn-long typing loop NOW so the chat lights up the instant the
     // handback is released; it keeps running across adoption into the turn.
     deps.startTypingLoop(entry.chatId, entry.threadId)
+    entry.emitted = true
+    // Age-based self-reap armed HERE — before (and independent of) the async
+    // card open — so a card send that returns null / fails, OR an enqueue that
+    // never arrives, can never leak the entry + a forever-running typing loop.
+    // A reap with `activityMessageId == null` just stops the typing loop and
+    // drops the entry (no card to finalize). Cancelled by `tryAdopt` on
+    // adoption. (Reaping is independent of topic liveness — lever 4.)
+    entry.reapTimer = setTimer(() => reap(entry), adoptTimeoutMs)
     // Paint the card. Async: the entry may be consumed (adopted) before the send
     // resolves — guard on that so we never orphan a card the turn already owns.
     void Promise.resolve()
       .then(() => deps.openCard(entry.chatId, entry.threadId))
       .then((messageId) => {
-        if (messageId == null) return
+        if (messageId == null) return // no card painted; the reap timer cleans up
         if (entry.consumed) {
           // Adopted/reaped while the send was in flight: the card is now the
           // turn's (adoption seeds a null id it can't use) — finalize+clear so
@@ -283,7 +291,6 @@ export function createHandbackPreturnSignal(
           return
         }
         entry.activityMessageId = messageId
-        entry.emitted = true
         const record: PreTurnCardRecord = {
           turnKey: entry.syntheticTurnKey,
           chatId: entry.chatId,
@@ -293,10 +300,9 @@ export function createHandbackPreturnSignal(
           pinned: entry.pinned,
         }
         // COMPLETE durable record — the crash backstop: a gateway restart before
-        // adoption lets the boot reaper finalize this orphan.
+        // adoption lets the boot reaper finalize this orphan. (The self-reap
+        // timer was armed synchronously above.)
         deps.writeCardRecord(record)
-        // Age-based self-reap, independent of topic liveness.
-        entry.reapTimer = setTimer(() => reap(entry), adoptTimeoutMs)
       })
       .catch((err) => {
         log(

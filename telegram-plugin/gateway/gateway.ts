@@ -202,6 +202,7 @@ import {
   createHandbackPreturnSignal,
   type PreTurnCardRecord,
 } from './handback-preturn-signal.js'
+import { deriveTurnId } from './derive-turn-id.js'
 import { createTypingEmitter, TYPING_REFRESH_MS } from '../typing-emitter.js'
 import { type DraftStreamHandle } from '../draft-stream.js'
 import { handlePtyPartialPure, type PtyHandlerState } from '../pty-partial-handler.js'
@@ -3759,25 +3760,10 @@ function findTurnByQuotedMessageId(chatId: string, replyTo: unknown): CurrentTur
   if (turn == null || turn.sessionChatId !== chatId) return null
   return turn
 }
-/**
- * Component 3 — derive the stable per-turn identity from the chat, thread,
- * and originating message id. Stamped into the inbound meta at build time
- * (`origin_turn_id`) AND reconstructed at enqueue time from the same three
- * values, so the id stamped on the message the model reads matches the id
- * on the turn the gateway started for it. Using the message id (not the
- * not-yet-known startedAt) is what lets the two sites agree. Returns null
- * when there is no message id (synthetic / cron / handback turns have no
- * originating inbound — they never need origin routing, the live turn IS
- * the origin).
- */
-function deriveTurnId(
-  chatId: string,
-  threadId: number | null | undefined,
-  messageId: string | number | null | undefined,
-): string | null {
-  if (messageId == null || messageId === '' || String(messageId) === '0') return null
-  return `${chatKey(chatId, threadId ?? null)}#${messageId}`
-}
+// Component 3 — the stable per-turn identity. Extracted to `derive-turn-id.ts`
+// (#3268) so the enqueue seam and the handback round-trip test share ONE
+// function. Re-exported into scope under the original name so every existing
+// callsite is unchanged.
 
 /**
  * Component 3 — resolve the turn that OWNS a reply by its `origin_turn_id`

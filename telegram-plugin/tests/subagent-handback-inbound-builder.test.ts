@@ -37,6 +37,11 @@ describe('buildSubagentHandbackInbound', () => {
     // The wake-up contract: bridge renders <channel source="subagent_handback">.
     expect(inbound.meta.source).toBe('subagent_handback')
     expect(inbound.meta.outcome).toBe('completed')
+    // #3268 — the fabricated ts rounds-trips through meta.message_id (the only
+    // channel-rendered id) so enqueue's deriveTurnId matches the pre-turn seam's
+    // adopt id. Must equal the top-level messageId as a string.
+    expect(inbound.meta.message_id).toBe(String(FIXED_NOW))
+    expect(inbound.meta.message_id).toBe(String(inbound.messageId))
     // Text carries the task, the result, and the beat-4 steer.
     expect(inbound.text).toContain('Refactor the auth module')
     expect(inbound.text).toContain('4 tests added, all green')
