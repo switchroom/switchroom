@@ -10,8 +10,67 @@
 
 import { describe, it, expect } from "vitest";
 import { Command } from "commander";
-import { summarizeReconcileBatch } from "./agent.js";
-import { registerAgentCommand } from "./agent.js";
+import { summarizeReconcileBatch, resolveLogsTail, registerAgentCommand } from "./agent.js";
+import { buildAgentLogsArgs } from "../agents/lifecycle.js";
+
+describe("resolveLogsTail (agent logs --lines clamp contract)", () => {
+  it("defaults to 50 when --lines is omitted", () => {
+    expect(resolveLogsTail(undefined)).toBe(50);
+  });
+
+  it("passes through an in-range value", () => {
+    expect(resolveLogsTail("30")).toBe(30);
+    expect(resolveLogsTail("1")).toBe(1); // floor
+    expect(resolveLogsTail("1000")).toBe(1000); // cap boundary
+  });
+
+  it("caps at 1000", () => {
+    expect(resolveLogsTail("1001")).toBe(1000);
+    expect(resolveLogsTail("999999")).toBe(1000);
+  });
+
+  it("falls back to the default of 50 for non-numeric input", () => {
+    expect(resolveLogsTail("abc")).toBe(50);
+    expect(resolveLogsTail("")).toBe(50);
+  });
+
+  it("falls back to the default of 50 for values below the floor", () => {
+    expect(resolveLogsTail("0")).toBe(50);
+    expect(resolveLogsTail("-5")).toBe(50);
+  });
+});
+
+describe("buildAgentLogsArgs (docker argv contract)", () => {
+  it("emits docker logs --tail <n> for a bounded dump", () => {
+    expect(buildAgentLogsArgs("coach", false, 30)).toEqual([
+      "logs", "--tail", "30", "switchroom-coach",
+    ]);
+  });
+
+  it("threads the resolved default (50) through as --tail 50", () => {
+    expect(buildAgentLogsArgs("coach", false, resolveLogsTail(undefined))).toEqual([
+      "logs", "--tail", "50", "switchroom-coach",
+    ]);
+  });
+
+  it("threads a clamped oversize value through as --tail 1000", () => {
+    expect(buildAgentLogsArgs("coach", false, resolveLogsTail("5000"))).toEqual([
+      "logs", "--tail", "1000", "switchroom-coach",
+    ]);
+  });
+
+  it("bounds the follow backlog too (-f + --tail)", () => {
+    expect(buildAgentLogsArgs("coach", true, 50)).toEqual([
+      "logs", "-f", "--tail", "50", "switchroom-coach",
+    ]);
+  });
+
+  it("omits --tail entirely when no tail is given (full-dump escape hatch)", () => {
+    expect(buildAgentLogsArgs("coach", false, undefined)).toEqual([
+      "logs", "switchroom-coach",
+    ]);
+  });
+});
 
 describe("agent logs command options", () => {
   // Outcome test for the #logs Telegram-drift bug: the gateway builds

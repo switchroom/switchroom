@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixes
+
+- **Telegram `/logs` works again** (#3283) — the gateway passed `--lines`
+  to `switchroom agent logs`, which didn't accept the flag; it now exists
+  (`-n, --lines <count>`). Behavior change for direct CLI users:
+  `agent logs` now defaults to the last 50 lines (cap 1000) instead of
+  dumping the entire log, and `-f` starts from a 50-line backlog before
+  streaming.
+
 ## v0.18.27 — Steadier Telegram cards and more reliable model switching
 
 This release smooths the Telegram surface — no more dead air on

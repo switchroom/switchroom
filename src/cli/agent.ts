@@ -89,6 +89,24 @@ export function summarizeReconcileBatch(
     lines: failures.map((f) => `${f.name}: ${f.error}`),
   };
 }
+
+/**
+ * Resolve the `agent logs --lines` value to a docker `--tail` count.
+ * Pure so the clamp contract is unit-testable: default 50 when omitted,
+ * floor 1, cap 1000; a non-numeric or out-of-range (< 1) value falls
+ * back to the default rather than erroring — the Telegram /logs UX
+ * passes its argument through verbatim. (The Telegram layer applies its
+ * own tighter chat-sized bounds — default 20, max 200 — BEFORE calling
+ * the CLI; the two defaults are different entry points, not a conflict.)
+ */
+export function resolveLogsTail(lines: string | undefined): number {
+  const DEFAULT_TAIL = 50;
+  const MAX_TAIL = 1000;
+  if (lines === undefined) return DEFAULT_TAIL;
+  const parsed = Number.parseInt(lines, 10);
+  if (!Number.isFinite(parsed) || parsed < 1) return DEFAULT_TAIL;
+  return Math.min(parsed, MAX_TAIL);
+}
 import { execFileSync as dockerExecFile } from "node:child_process";
 import { renameAgent, type HindsightMode } from "../agents/rename-orchestrator.js";
 import { validateBotTokenMatchesAgent } from "../setup/telegram-api.js";
@@ -1654,7 +1672,7 @@ export function registerAgentCommand(program: Command): void {
     .option("-f, --follow", "Follow log output")
     .option(
       "-n, --lines <count>",
-      "Number of trailing log lines to show (default 50, capped at 1000)",
+      "Number of trailing log lines to show (default 50, capped at 1000; with -f, bounds the initial backlog before streaming). Note: Telegram's /logs applies its own chat-sized default of 20 / max 200 before invoking this.",
     )
     .action(
       withConfigError(async (name: string, opts: { follow?: boolean; lines?: string }) => {
@@ -1665,18 +1683,7 @@ export function registerAgentCommand(program: Command): void {
           process.exit(1);
         }
 
-        // Resolve --lines: default 50, floor 1, cap 1000. A non-numeric /
-        // out-of-range value falls back to the default rather than erroring —
-        // the Telegram /logs UX passes this through verbatim.
-        let tail = 50;
-        if (opts.lines !== undefined) {
-          const parsed = Number.parseInt(opts.lines, 10);
-          if (Number.isFinite(parsed) && parsed >= 1) {
-            tail = Math.min(parsed, 1000);
-          }
-        }
-
-        getAgentLogs(name, opts.follow ?? false, tail);
+        getAgentLogs(name, opts.follow ?? false, resolveLogsTail(opts.lines));
       })
     );
 
