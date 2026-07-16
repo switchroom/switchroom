@@ -88,8 +88,14 @@ export function resolveEnvTimezone(env: NodeJS.ProcessEnv = process.env): string
  * with NO "UTC" / trailing-Z — so the LLM can never read one of these as UTC
  * "now" and reason an offset wrong.
  *
- * Format mirrors `bin/timezone-hook.sh`'s `%A %Y-%m-%d %I:%M %p %Z` so the
- * inbound-tag time and the UserPromptSubmit local-time hint read identically.
+ * Format matches the CORE of `bin/timezone-hook.sh`'s stamp —
+ * `%A %Y-%m-%d %I:%M %p %Z` (weekday, ISO date, am/pm, zone abbrev) — so the
+ * inbound-tag time and the UserPromptSubmit local-time hint read the same way.
+ * The hook additionally appends a ` (UTC±HH:MM)` numeric-offset LABEL that this
+ * helper deliberately omits: the abbrev (AEST/EDT) already disambiguates, and
+ * keeping the output free of any "UTC" substring makes the deterministic
+ * no-UTC-current-time guard trivially strict for every callsite. So it is NOT
+ * a byte-for-byte match — same core shape, minus the offset tail.
  *
  * Pure / total: an invalid IANA `tz` (misconfigured agent) degrades to the
  * same am/pm shape rendered in UTC rather than throwing out of the inbound

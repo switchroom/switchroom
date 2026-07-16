@@ -52,4 +52,17 @@ describe('fmtLocalStamp', () => {
     const out = fmtLocalStamp(MS, 'UTC')
     expect(out).toMatch(/ (?:AM|PM) /)
   })
+
+  it('tracks DST — Australia/Melbourne is AEDT in Jan (summer) and AEST in Jul (winter)', () => {
+    // Southern-hemisphere DST: daylight time is the Dec–Mar summer.
+    const summer = fmtLocalStamp(Date.UTC(2026, 0, 15, 3, 0, 0), 'Australia/Melbourne') // 15 Jan
+    const winter = fmtLocalStamp(Date.UTC(2026, 6, 15, 3, 0, 0), 'Australia/Melbourne') // 15 Jul
+    expect(summer).toContain('AEDT')
+    expect(winter).toContain('AEST')
+    // Both stay am/pm and UTC-free across the transition.
+    for (const s of [summer, winter]) {
+      expect(s).toMatch(/ (?:AM|PM) /)
+      expect(s).not.toContain('UTC')
+    }
+  })
 })
