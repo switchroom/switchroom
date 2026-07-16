@@ -857,6 +857,11 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
    * terminal recap's state/result/narrative when finalizing).
    */
   function groupSubstanceKey(g: FeedGroup, terminalRecap: WorkerActivityView | null): string {
+    // Unambiguous delimiters so adjacent fields can never blur into a boundary
+    // collision (e.g. toolCount `1`+desc `"23"` vs toolCount `12`+desc `"3"`).
+    // FS separates fields within a row; RS separates rows in the combined body.
+    const FS = '\x00'
+    const RS = '\x1e'
     if (terminalRecap != null) {
       return [
         'T',
@@ -866,7 +871,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
         terminalRecap.totalTokens ?? '',
         terminalRecap.latestSummary,
         ...(terminalRecap.narrativeLines ?? []),
-      ].join('')
+      ].join(FS)
     }
     const running = runningRows(g)
     if (running.length === 0) return 'EMPTY'
@@ -880,9 +885,9 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
           v.toolCount,
           v.totalTokens ?? '',
           ...r.narrative,
-        ].join('')
+        ].join(FS)
       })
-      .join('')
+      .join(RS)
   }
 
   /** Remove a worker's row + index entry; delete the group if it is now empty. */

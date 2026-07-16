@@ -1638,4 +1638,37 @@ describe('createWorkerActivityFeed — elapsed-only edit pacing', () => {
     expect(last).toContain('done · 6 tools')
     expect(last).toContain('31s')
   })
+
+  it('does not over-suppress a substantive change that would field-boundary-collide under naive concatenation', async () => {
+    const bot = makeFakeBot()
+    const ref = { t: 10_000 }
+    const feed = mkFeed(bot, ref)
+
+    // Paint: toolCount 1, totalTokens 23. Under a delimiter-less substance key
+    // the fields `1` and `23` concatenate to `123`.
+    ref.t = 20_000
+    await feed.update(
+      'w1',
+      'chat',
+      view({ elapsedMs: 9000, latestSummary: 'scanning', toolCount: 1, totalTokens: 23 }),
+    )
+    expect(bot.sent).toHaveLength(1)
+
+    // A REAL substantive change (toolCount 1→12, totalTokens 23→3) that collides
+    // to the SAME `123` under naive concatenation. It lands within the 15s
+    // elapsed-refresh window (past the 2.5s floor), so ONLY a substance-key
+    // difference can drive the edit. A colliding key would wrongly treat this as
+    // elapsed-only churn and suppress it; the NUL/RS-delimited key keeps them
+    // distinct, so the edit fires promptly.
+    ref.t = 22_500
+    await feed.update(
+      'w1',
+      'chat',
+      view({ elapsedMs: 11_500, latestSummary: 'scanning', toolCount: 12, totalTokens: 3 }),
+    )
+    await drain()
+    expect(bot.edits.length).toBeGreaterThanOrEqual(1)
+    // The rendered card reflects the new tool count, proving the change landed.
+    expect(bot.edits[bot.edits.length - 1].text).toContain('12 tools')
+  })
 })
