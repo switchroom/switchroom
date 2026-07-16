@@ -13412,6 +13412,21 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
       // Deferred: the correction (edit-in-place vs delete+resend) is decided at
       // the send site once chunk count / files / preview are known.
       supersedeFlushIds = decision.deleteMessageIds
+      // Set the answer-delivered latch NOW, at record consumption — BEFORE the
+      // arg-validation throws between here and the correction site (file
+      // too-large ~L13699, inline_keyboard invalid ~L13782). Without this, a
+      // late reply that supersedes a flush AND carries an oversized file /
+      // invalid keyboard would throw before the correction runs (message A
+      // neither deleted nor edited), the model would retry `reply`, and — the
+      // supersede record already consumed by `take()` above — the retry would
+      // fall into the else/no-record branch below with no latch set, so
+      // suppression wouldn't fire and a fresh B would ship alongside the stale
+      // narration A (both visible). Latching here mirrors the else-branch's own
+      // `answerDelivered = true` and closes that resurrection window: the retry
+      // resolves the same ended owner turn, sees the latch, and is suppressed —
+      // exactly one message ever ships. The latch is idempotent and the normal
+      // (no-throw) path is unaffected: the correction below still ships B once.
+      if (ownerTurn != null) ownerTurn.answerDelivered = true
     } else {
       // 2026-07 double-reply-on-DM fix (Part 2) — answer-delivered race latch.
       // Supersede found no record. Either there was no flush (normal reply), or

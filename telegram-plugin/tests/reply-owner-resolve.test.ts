@@ -277,3 +277,93 @@ describe('F2 — recency-bound the destructive latest-ended supersede tier', () 
     ).toBe('turn-T')
   })
 })
+
+/**
+ * Reply-flicker edit-in-place fix (PR #3266) — the deferred-correction
+ * resurrection window (adversarial-review L1).
+ *
+ * The fix defers the flushed-message correction (delete-resend vs edit-in-place)
+ * from the supersede site to the send site so a single-message reply can EDIT
+ * the flushed message A in place instead of delete+resend. But `take()` consumes
+ * the supersede record at the supersede site, and TWO arg-validation `throw`s
+ * (file too-large, invalid inline_keyboard) sit BETWEEN consumption and the
+ * correction. A late reply that supersedes a flush AND carries an oversized file
+ * / invalid keyboard throws before the correction runs: message A is neither
+ * deleted nor edited, the model retries `reply`, and — the record already
+ * consumed — the retry takes the no-record branch. Without a latch the retry
+ * would ship a fresh B alongside the stale narration A (both visible).
+ *
+ * The fix latches `ownerTurn.answerDelivered = true` at record consumption, so
+ * the retry (resolving the SAME ended owner turn) is caught by
+ * `decideAnswerLatchSuppression` and suppressed — exactly one message survives.
+ */
+describe('reply-flicker edit-in-place — mid-path throw + retry never resurrects the duplicate (L1)', () => {
+  const CHAT = '636363'
+
+  /** Minimal model of the ended owner turn atom the gateway mutates + reads. */
+  interface OwnerTurn { turnId: string; answerDelivered: boolean }
+
+  /**
+   * Drive the two gateway `reply` calls the incident produces, threading the
+   * SAME registry + owner-turn atom. `setLatchOnSupersede` toggles the fix on
+   * (true = PR behaviour) vs off (false = pre-fix red-on-main contrast).
+   * Returns which messages are visible after the sequence.
+   */
+  function runSupersedeThenThrowRetry(setLatchOnSupersede: boolean): {
+    visible: string[]
+    firstSuperseded: boolean
+    retrySuppressed: boolean
+  } {
+    const reg = new FlushedTurnSupersedeRegistry()
+    const now = 2_000_000
+    const owner: OwnerTurn = { turnId: 'turn-A', answerDelivered: false }
+    // The flush posted message A for turn-A and recorded it.
+    reg.record(CHAT, undefined, { turnId: owner.turnId, messageIds: [8001], text: 'narration\n\nthe answer' }, now)
+    const visible = ['A(flush-narration)']
+
+    // --- Call 1: the model's real `reply` lands and SUPERSEDES the flush. ---
+    const d1 = reg.take(CHAT, undefined, { liveTurnId: owner.turnId, now: now + 10 })
+    const firstSuperseded = d1.supersede
+    if (d1.supersede && setLatchOnSupersede) {
+      // The fix: latch at consumption, BEFORE the arg-validation throw.
+      owner.answerDelivered = true
+    }
+    // Arg-validation throw fires here (oversized file / invalid keyboard):
+    // the correction never runs → A is neither deleted nor edited, B not sent.
+    // (Modelled by simply NOT applying the correction and NOT pushing B.)
+
+    // --- Call 2: the model retries `reply` after seeing the MCP error. ---
+    // The record was consumed by Call 1's take() → no-record now.
+    const d2 = reg.take(CHAT, undefined, { liveTurnId: owner.turnId, now: now + 20 })
+    let retrySuppressed = false
+    if (!d2.supersede) {
+      // else/no-record branch: the retry is a late substantive reply.
+      retrySuppressed = decideAnswerLatchSuppression({
+        superseded: false,
+        replySubstantive: true,
+        isLateReply: true,
+        ownerAnswerDelivered: owner.answerDelivered,
+      })
+    }
+    if (!retrySuppressed) visible.push('B(retry-reply)')
+    return { visible, firstSuperseded, retrySuppressed }
+  }
+
+  it('WITH the fix: the retry is latch-suppressed → exactly ONE surviving message (never A+B)', () => {
+    const r = runSupersedeThenThrowRetry(true)
+    expect(r.firstSuperseded).toBe(true)
+    expect(r.retrySuppressed).toBe(true)
+    expect(r.visible).toHaveLength(1)
+    // The single surviving message is the flushed A (the correction throw left it
+    // in place); the retry B was suppressed — no stale-narration + reply duplicate.
+    expect(r.visible).toEqual(['A(flush-narration)'])
+  })
+
+  it('WITHOUT the fix (contrast): the retry is NOT suppressed → BOTH A and B ship (the resurrected duplicate)', () => {
+    const r = runSupersedeThenThrowRetry(false)
+    expect(r.firstSuperseded).toBe(true)
+    expect(r.retrySuppressed).toBe(false)
+    // The exact regression: stale narration A AND the retry reply B are both visible.
+    expect(r.visible).toEqual(['A(flush-narration)', 'B(retry-reply)'])
+  })
+})
