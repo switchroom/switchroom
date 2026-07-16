@@ -209,6 +209,25 @@ function localDateString(): string {
   return `${year}-${month}-${day}`;
 }
 
+// YYYY-MM-DD for "now" as observed in the given IANA timezone (en-CA yields
+// ISO-ordered date parts). Matches what `TZ=<zone> date +%Y-%m-%d` prints.
+function dateInZone(tz: string): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+}
+
+// Two real IANA zones whose local clocks are 25h apart (UTC+14 vs UTC-11), so
+// their calendar dates ALWAYS differ by exactly one day — at every instant,
+// independent of the runner's wall clock. This gives a *deterministic* (not
+// luck-of-the-date) UTC/local date-divergence window: agentZone is a full day
+// ahead of procZone, always.
+const AGENT_ZONE = "Pacific/Kiritimati"; // UTC+14 — the agent's SWITCHROOM_TIMEZONE
+const PROC_ZONE = "Pacific/Midway"; //     UTC-11 — the process TZ (what un-TZ'd `date` reads)
+
 describe("handoff-briefing.sh assembler", () => {
   let tmpDir: string;
 
@@ -349,7 +368,15 @@ describe("handoff-briefing.sh assembler", () => {
     // at …" line is injected into the resume-turn system prompt, so its time
     // must be local am/pm, NOT the old `date -u +%Y-%m-%dT%H:%M:%SZ`. Nothing
     // guarded this before, which is how it slipped past the first pass.
-    const today = localDateString();
+    //
+    // Name the daily-memory file in the SAME zone we pass to the script
+    // (Australia/Melbourne) — NOT the test process's zone. The script resolves
+    // TODAY in Melbourne, so during the UTC/local date-divergence window a
+    // parent-zone name (e.g. localDateString() on a UTC CI runner) would write
+    // the wrong day's file, the daily section would be empty, the whole briefing
+    // would be empty, and the regex below would match null. Zone-align the name
+    // so this test is deterministic regardless of the runner's wall clock.
+    const today = dateInZone("Australia/Melbourne");
     const memDir = join(tmpDir, "memory");
     mkdirSync(memDir, { recursive: true });
     writeFileSync(join(memDir, `${today}.md`), "- Restart-time guard\n", "utf-8");
@@ -380,6 +407,47 @@ describe("handoff-briefing.sh assembler", () => {
     expect(stamp).not.toMatch(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/);
     expect(stamp.endsWith("Z")).toBe(false);
     expect(stamp).not.toContain("UTC");
+  });
+
+  it("resolves TODAY (daily-memory lookup) in the agent's LOCAL zone, not UTC — date-boundary regression", () => {
+    // Regression for the un-TZ'd `TODAY=$(date +%Y-%m-%d)` at bin/handoff-briefing.sh:139.
+    // TODAY keys the memory/${TODAY}.md lookup. The agent's SWITCHROOM_TIMEZONE
+    // (AGENT_ZONE, UTC+14) is a full calendar day AHEAD of the process TZ
+    // (PROC_ZONE, UTC-11) at every instant. We write the daily file under the
+    // agent-LOCAL date. Old code reads the process TZ → PROC_ZONE date → looks up
+    // the WRONG (day-behind) file → miss → drops the whole restart header. Fixed
+    // code applies the SWITCHROOM_TIMEZONE cascade → AGENT_ZONE date → hit.
+    const agentDate = dateInZone(AGENT_ZONE);
+    const procDate = dateInZone(PROC_ZONE);
+    expect(agentDate).not.toBe(procDate); // deterministic: 25h apart ⇒ always different days
+
+    const memDir = join(tmpDir, "memory");
+    mkdirSync(memDir, { recursive: true });
+    // File named for the agent's LOCAL date only — NOT the process-TZ date.
+    writeFileSync(join(memDir, `${agentDate}.md`), "- Local-date daily memory\n", "utf-8");
+
+    const result = spawnSync("bash", [HANDOFF_BRIEFING_SCRIPT, "--stdout"], {
+      env: {
+        ...process.env,
+        AGENT_DIR: tmpDir,
+        TELEGRAM_STATE_DIR: "",
+        HINDSIGHT_API_URL: "",
+        HINDSIGHT_BANK_ID: "",
+        WORKSPACE_DIR: tmpDir,
+        // Agent's local zone via SWITCHROOM_TIMEZONE; process TZ a full day behind
+        // so the OLD un-TZ'd `date` resolves to the wrong day and misses the file.
+        SWITCHROOM_TIMEZONE: AGENT_ZONE,
+        TZ: PROC_ZONE,
+      },
+      timeout: 10_000,
+    });
+    expect(result.status).toBe(0);
+    const output = result.stdout.toString();
+    // The daily memory (and therefore the restart header) must be present because
+    // TODAY resolved to the agent-LOCAL date the file was written under.
+    expect(output).toContain("Local-date daily memory");
+    expect(output).toContain(`Today's memory (${agentDate})`);
+    expect(output).toContain("You just restarted at");
   });
 
   it("restart timestamp falls back to am/pm even with no timezone configured (no UTC 24h form)", () => {
