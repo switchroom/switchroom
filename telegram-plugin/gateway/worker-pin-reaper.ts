@@ -52,6 +52,10 @@ export interface WorkerPinCandidate {
   chatId: string
   /** Wall-clock ms the claim was first taken (gateway's pinnedAt registry). */
   pinnedAt: number
+  /** The pinned message id. Present for store-only candidates (whose reap is a
+   *  raw per-message unpin — no in-memory claim to reconcile through). Omitted
+   *  for in-memory candidates, which reap via reconcileStatusPin off the claim. */
+  messageId?: number
 }
 
 export interface WorkerPinReap extends WorkerPinCandidate {
@@ -86,6 +90,56 @@ export type WorkerRegistryStatus = 'terminal' | 'running' | 'unknown'
  * for stalled / missing / lookup-error; a DB hiccup must degrade to 'unknown'
  * — kept until the TTL — never to a spurious 'terminal' unpin).
  */
+/** A durable-store row (status-pins.json) as seen by the reconciling sweep. */
+export interface StoreOrphanRow {
+  pinKey: string
+  chatId: string
+  messageId: number
+  /** Pin API call still in-flight (persist-intent-first). Never reaped. */
+  pending?: boolean
+  /** Time-scoped `tool:` pin. Never a worker orphan; excluded. */
+  expiresAt?: number
+}
+
+/**
+ * Build the extra `wk:` reap candidates that exist ONLY in the durable store
+ * (status-pins.json) and NOT in the in-memory claim map — the divergence window
+ * where the in-memory claim was lost/never-held but the Telegram pin AND its
+ * store row survive. Without this, such an orphan lingers until the next
+ * gateway boot (runStatusPinBootCleanup); this lets the PERIODIC sweep recover
+ * it too, group-safely (per-message unpin of a bot-tracked row — never an
+ * unpin-all, never a human pin).
+ *
+ * The store persists NO timestamp, so a store-only candidate carries
+ * `pinnedAt = now`: only a TERMINAL registry verdict can reap it. It is never
+ * TTL-reaped (no trustworthy age to age it out), never touched while its worker
+ * is `running`, and it is always a `wk:` row (the documented leak class).
+ * `pending` rows (pin API in-flight) and time-scoped `tool:` rows are excluded,
+ * as are rows already tracked in memory (the in-memory reaper owns those, with
+ * a real `pinnedAt` that can drive the TTL).
+ */
+export function storeOnlyWorkerPinCandidates(args: {
+  rows: Iterable<StoreOrphanRow>
+  inMemoryPinKeys: ReadonlySet<string>
+  now: number
+}): WorkerPinCandidate[] {
+  const out: WorkerPinCandidate[] = []
+  for (const r of args.rows) {
+    if (workerAgentIdOfPinKey(r.pinKey) == null) continue // only wk: rows
+    if (r.pending) continue // pin API in-flight — do not race the write
+    if (r.expiresAt != null) continue // time-scoped tool pin — not a worker
+    if (r.chatId.length === 0) continue // can't unpin without a chat
+    if (args.inMemoryPinKeys.has(r.pinKey)) continue // in-memory reaper owns it
+    out.push({
+      pinKey: r.pinKey,
+      chatId: r.chatId,
+      pinnedAt: args.now,
+      messageId: r.messageId,
+    })
+  }
+  return out
+}
+
 export function decideWorkerPinReaps(args: {
   pins: Iterable<WorkerPinCandidate>
   statusOf: (agentId: string) => WorkerRegistryStatus

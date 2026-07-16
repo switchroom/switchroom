@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   decideWorkerPinReaps,
+  storeOnlyWorkerPinCandidates,
   workerAgentIdOfPinKey,
   WORKER_PIN_TTL_MS_DEFAULT,
   type WorkerPinCandidate,
@@ -124,6 +125,83 @@ describe("decideWorkerPinReaps (#3001 mid-session wk: sweep)", () => {
     const reaps = decideWorkerPinReaps({
       pins: [pin()],
       statusOf: () => 'unknown' as const,
+      ttlMs: TTL,
+      now: NOW,
+    });
+    expect(reaps).toHaveLength(0);
+  });
+});
+
+describe("storeOnlyWorkerPinCandidates (#3001 durable group net)", () => {
+  const inMem = (keys: string[] = []) => new Set(keys);
+
+  it("promotes a wk: store row that has NO in-memory claim into a reap candidate (group chat)", () => {
+    // A GROUP chat id is negative; the reconciling sweep must recover a
+    // bot-tracked orphan there via a per-message unpin (never an unpin-all).
+    const cands = storeOnlyWorkerPinCandidates({
+      rows: [{ pinKey: "wk:group:-100:5", chatId: "-100", messageId: 42 }],
+      inMemoryPinKeys: inMem(),
+      now: NOW,
+    });
+    expect(cands).toHaveLength(1);
+    expect(cands[0].pinKey).toBe("wk:group:-100:5");
+    expect(cands[0].chatId).toBe("-100");
+    // messageId is carried so the gateway can per-message unpin (group-safe).
+    expect(cands[0].messageId).toBe(42);
+    // A terminal registry verdict reaps it now, however "young" (pinnedAt=now).
+    const reaps = decideWorkerPinReaps({
+      pins: cands,
+      statusOf: () => "terminal" as const,
+      ttlMs: TTL,
+      now: NOW,
+    });
+    expect(reaps.map((r) => r.pinKey)).toEqual(["wk:group:-100:5"]);
+  });
+
+  it("NEVER promotes an untracked/human pin — only wk: rows qualify (fg:/tool:/banner: excluded)", () => {
+    const cands = storeOnlyWorkerPinCandidates({
+      rows: [
+        { pinKey: "fg:-100:9", chatId: "-100", messageId: 1 },
+        { pinKey: "tool:-100:9", chatId: "-100", messageId: 2, expiresAt: NOW + 1 },
+        { pinKey: "banner:owner", chatId: "-100", messageId: 3 },
+      ],
+      inMemoryPinKeys: inMem(),
+      now: NOW,
+    });
+    expect(cands).toHaveLength(0);
+  });
+
+  it("skips rows the in-memory reaper already owns (dedup by pinKey)", () => {
+    const cands = storeOnlyWorkerPinCandidates({
+      rows: [{ pinKey: "wk:a", chatId: "-100", messageId: 7 }],
+      inMemoryPinKeys: inMem(["wk:a"]),
+      now: NOW,
+    });
+    expect(cands).toHaveLength(0);
+  });
+
+  it("skips pending (pin API in-flight) and time-scoped tool rows and empty-chat rows", () => {
+    const cands = storeOnlyWorkerPinCandidates({
+      rows: [
+        { pinKey: "wk:pending", chatId: "-100", messageId: 1, pending: true },
+        { pinKey: "wk:tool", chatId: "-100", messageId: 2, expiresAt: NOW + 1000 },
+        { pinKey: "wk:nochat", chatId: "", messageId: 3 },
+      ],
+      inMemoryPinKeys: inMem(),
+      now: NOW,
+    });
+    expect(cands).toHaveLength(0);
+  });
+
+  it("a store-orphan with a live 'running' worker is kept (never reaped mid-run)", () => {
+    const cands = storeOnlyWorkerPinCandidates({
+      rows: [{ pinKey: "wk:live", chatId: "-100", messageId: 5 }],
+      inMemoryPinKeys: inMem(),
+      now: NOW,
+    });
+    const reaps = decideWorkerPinReaps({
+      pins: cands,
+      statusOf: () => "running" as const,
       ttlMs: TTL,
       now: NOW,
     });

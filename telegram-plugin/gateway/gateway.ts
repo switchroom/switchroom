@@ -604,6 +604,7 @@ import {
 } from './queued-card-store.js'
 import {
   decideWorkerPinReaps,
+  storeOnlyWorkerPinCandidates,
   WORKER_PIN_TTL_MS_DEFAULT,
 } from './worker-pin-reaper.js'
 import { driveEscalation } from './escalation-drive.js'
@@ -9023,16 +9024,32 @@ async function runMidSessionCardReaper(): Promise<void> {
   //    the durable store row clear together.
   if (WORKER_PIN_REAPER_ENABLED && PIN_STATUS_WHILE_WORKING) {
     try {
-      const candidates = [...statusPinState.keys()]
-        .filter((k) => k.startsWith('wk:'))
-        .map((k) => ({
-          pinKey: k,
-          chatId: statusPinChatIds.get(k) ?? '',
-          // A missing timestamp (should not happen — set on every claim)
-          // degrades to "claimed just now": terminality can still reap it,
-          // the TTL gate never can. Conservative, never a spurious unpin.
-          pinnedAt: statusPinPinnedAt.get(k) ?? now,
-        }))
+      const inMemoryKeys = new Set(
+        [...statusPinState.keys()].filter((k) => k.startsWith('wk:')),
+      )
+      const inMemoryCandidates = [...inMemoryKeys].map((k) => ({
+        pinKey: k,
+        chatId: statusPinChatIds.get(k) ?? '',
+        // A missing timestamp (should not happen — set on every claim)
+        // degrades to "claimed just now": terminality can still reap it,
+        // the TTL gate never can. Conservative, never a spurious unpin.
+        pinnedAt: statusPinPinnedAt.get(k) ?? now,
+      }))
+      // #3001 durable group net: fold in `wk:` rows that live in the DURABLE
+      // store but have NO in-memory claim — the divergence window where the
+      // claim was lost but the Telegram pin + store row survive. These would
+      // otherwise linger until the next boot cleanup; the reconciling sweep
+      // recovers them mid-session too, group-safely (per-message unpin of a
+      // bot-tracked row, NEVER an unpin-all, NEVER an untracked/human pin).
+      const storeOnlyCandidates = statusPinPersistEnabled
+        ? storeOnlyWorkerPinCandidates({
+            rows: loadStatusPins(STATUS_PIN_STORE_PATH, statusPinStoreFs),
+            inMemoryPinKeys: inMemoryKeys,
+            now,
+          })
+        : []
+      const storeOnlyKeys = new Set(storeOnlyCandidates.map((c) => c.pinKey))
+      const candidates = [...inMemoryCandidates, ...storeOnlyCandidates]
       const reaps = decideWorkerPinReaps({
         pins: candidates,
         statusOf: (agentId) => {
@@ -9064,11 +9081,35 @@ async function runMidSessionCardReaper(): Promise<void> {
         now,
       })
       for (const reap of reaps) {
+        const storeOnly = storeOnlyKeys.has(reap.pinKey)
         process.stderr.write(
           `telegram gateway: worker-pin reaper unpinning ${reap.pinKey} ` +
-            `(chat=${reap.chatId} reason=${reap.reason})\n`,
+            `(chat=${reap.chatId} reason=${reap.reason}` +
+            `${storeOnly ? ' source=store-orphan' : ''})\n`,
         )
-        await reconcileStatusPin(reap.pinKey, reap.chatId, { pinned: false })
+        if (storeOnly && reap.messageId != null) {
+          // No in-memory claim to reconcile: unpin the exact tracked message
+          // (per-message — group-safe) and drop the store row directly. Both
+          // are best-effort/idempotent; a failed unpin still drops the row so
+          // the next boot's cleanup is the final backstop.
+          try {
+            await statusPinApi().unpinChatMessage(reap.chatId, reap.messageId)
+          } catch (err) {
+            process.stderr.write(
+              `telegram gateway: worker-pin reaper store-orphan unpin failed ` +
+                `(${reap.pinKey} chat=${reap.chatId} msg=${reap.messageId}): ` +
+                `${(err as Error).message}\n`,
+            )
+          }
+          await mutateStatusPinRow(
+            STATUS_PIN_STORE_PATH,
+            statusPinStoreFs,
+            reap.pinKey,
+            null,
+          )
+        } else {
+          await reconcileStatusPin(reap.pinKey, reap.chatId, { pinned: false })
+        }
       }
     } catch (err) {
       process.stderr.write(
