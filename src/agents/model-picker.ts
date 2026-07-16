@@ -8,10 +8,11 @@
  *
  *   discoverModels()  open picker → parse the rendered option rows →
  *                     ALWAYS Esc out (verified) → return the options.
- *   selectModel()     open picker → parse → arrow-key the cursor to the
- *                     target row (matched by label, never by stale
- *                     index) → press `s` (session-only apply) → capture
- *                     claude's confirmation. Esc + bail on any mismatch.
+ *
+ * NB (rev 5): the terminal-DRIVING `selectModel()` / `extractConfirmation()`
+ * were removed — the `/model` switch path no longer drives the picker to APPLY a
+ * switch (every switch is a deterministic carrier relaunch, see
+ * reference/rfcs/session-model-stickiness.md §0.05). Discovery here is RENDER-only.
  *
  * Validated against claude 2.1.170's picker (2026-06-10, test-harness):
  *
@@ -171,10 +172,6 @@ export type DiscoverResult =
       dismissFailed?: true;
     }
   | { ok: false; reason: string; dismissFailed?: true };
-
-export type SelectResult =
-  | { ok: true; confirmation: string }
-  | { ok: false; reason: string };
 
 const realSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -360,89 +357,3 @@ export async function discoverModels(
   });
 }
 
-/**
- * Select a model by LABEL via the picker, applying session-only (`s`).
- * Re-opens and re-parses the picker fresh — never trusts a previously
- * rendered index. Any mismatch aborts via Escape.
- */
-export async function selectModel(
-  agentName: string,
-  targetLabel: string,
-  opts: PickerOpts = {},
-): Promise<SelectResult> {
-  const io = makeIo(agentName, opts);
-  if (!io.runner.hasSession(io.socket, io.session)) {
-    return { ok: false, reason: "tmux session not found" };
-  }
-
-  // Same per-pane serialization as discoverModels — see that comment.
-  return withPaneLock(`${io.socket}:${io.session}`, async () => {
-    io.startedAt = Date.now(); // budget starts when the lock is held
-    let selected = false;
-    try {
-      const parsed = await openPickerWithRetry(io);
-      if (!parsed || !parsed.footerSeen) {
-        return { ok: false, reason: "picker did not render — agent may be mid-turn" };
-      }
-      const target = parsed.options.find((o) => o.label === targetLabel);
-      if (!target) {
-        const have = parsed.options.map((o) => o.label).join(", ");
-        return { ok: false, reason: `option "${targetLabel}" not offered (have: ${have})` };
-      }
-      if (parsed.cursorIndex < 0) {
-        return { ok: false, reason: "cursor marker not visible — refusing blind navigation" };
-      }
-
-      // Walk the cursor to the target row one keypress at a time,
-      // verifying position after the walk. Option indices are the
-      // picker's own contiguous numbering.
-      const delta = target.index - parsed.cursorIndex;
-      const key = delta > 0 ? "Down" : "Up";
-      for (let i = 0; i < Math.abs(delta); i++) {
-        if (expired(io)) return { ok: false, reason: "timed out navigating picker" };
-        sendKey(io, key);
-        await io.sleep(Math.min(io.stepMs, 250));
-      }
-      await io.sleep(io.stepMs);
-      const verifyPane = io.runner.capture(io.socket, io.session) ?? "";
-      const verify = parseModelPicker(verifyPane);
-      const atRow = verify?.options.find((o) => o.index === verify.cursorIndex);
-      if (!verify || !atRow || atRow.label !== targetLabel) {
-        return {
-          ok: false,
-          reason: `cursor verification failed (on "${atRow?.label ?? "?"}", wanted "${targetLabel}")`,
-        };
-      }
-
-      // `s` = apply for this session only — the keypress dismisses the
-      // modal itself, so no Escape on this path.
-      sendLiteral(io, "s");
-      selected = true;
-      await io.sleep(io.stepMs);
-      const after = io.runner.capture(io.socket, io.session) ?? "";
-      const confirmation = extractConfirmation(after) ?? `Switched to ${targetLabel} (session)`;
-      return { ok: true, confirmation };
-    } catch (err) {
-      return { ok: false, reason: err instanceof Error ? err.message : String(err) };
-    } finally {
-      if (!selected) {
-        // Failure is reported loudly inside dismissOrWarn (gateway log).
-        await dismissOrWarn(io, "select");
-      }
-    }
-  });
-}
-
-/**
- * Pull claude's post-selection confirmation line from the pane tail —
- * e.g. "Set model to Haiku 4.5 for this session" / "Kept model as …".
- * Returns null when no recognizable line is present.
- */
-export function extractConfirmation(pane: string): string | null {
-  const lines = pane.split("\n");
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const t = lines[i].replace(/^\s*⎿\s*/, "").trim();
-    if (/^(Set model to|Kept model as|Switched to)/i.test(t)) return t;
-  }
-  return null;
-}

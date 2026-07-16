@@ -6,21 +6,19 @@
  * picker layout, update the fixture from a fresh capture and the
  * parser together.
  *
- * Headline safety invariants:
- *   1. Esc-always: every discovery path and every failed selection
- *      path sends Escape — the picker is never left open to wedge the
- *      pane (the /rate-limit-options class of wedge).
- *   2. Never select blind: `selectModel` re-verifies the cursor row's
- *      LABEL after navigation; any mismatch aborts via Escape and the
- *      session-only `s` keypress is never sent.
+ * Headline safety invariant:
+ *   Esc-always: every discovery path sends Escape — the picker is never
+ *   left open to wedge the pane (the /rate-limit-options class of wedge).
+ *
+ * NB (rev 5): the terminal-DRIVING selectModel()/extractConfirmation() were
+ * removed (the /model switch is now a deterministic carrier relaunch), so this
+ * suite covers discovery/parse + the shared pane-lock/dismissal invariants only.
  */
 import { describe, it, expect } from "vitest";
 import {
   parseModelPicker,
   labelTag,
-  extractConfirmation,
   discoverModels,
-  selectModel,
 } from "../src/agents/model-picker.js";
 import type { TmuxRunner } from "../src/agents/inject.js";
 
@@ -128,14 +126,6 @@ describe("labelTag", () => {
   });
 });
 
-describe("extractConfirmation", () => {
-  it("pulls the ⎿ confirmation line", () => {
-    expect(extractConfirmation(AFTER_S)).toBe("Set model to Haiku 4.5 for this session");
-    expect(extractConfirmation(AFTER_ESC)).toBe("Kept model as Sonnet 4.6");
-    expect(extractConfirmation(IDLE)).toBeNull();
-  });
-});
-
 /**
  * Scripted fake runner: `frames` is consumed one capture at a time
  * (last frame repeats); every send is recorded for exact-sequence
@@ -226,62 +216,6 @@ describe("#3241 interstitial dismiss-and-retry", () => {
   });
 });
 
-describe("selectModel", () => {
-  it("navigates cursor→target, verifies the label, presses s — no Escape", async () => {
-    // open → PICKER (cursor 2) → after Down: cursor 3 → verify → s → confirmation
-    const { runner, sends } = fakeRunner([PICKER, PICKER_CURSOR_3, AFTER_S]);
-    const res = await selectModel("agentx", "Haiku", { ...fastOpts, _runner: runner });
-    expect(res).toEqual({ ok: true, confirmation: "Set model to Haiku 4.5 for this session" });
-    expect(sentKeys(sends)).toEqual(["/model", "Enter", "Down", "s"]);
-  });
-
-  it("navigates UP when the target is above the cursor", async () => {
-    const cursorOn3 = PICKER_CURSOR_3;
-    const cursorOn2 = PICKER;
-    const { runner, sends } = fakeRunner([cursorOn3, cursorOn2, AFTER_S]);
-    const res = await selectModel("agentx", "Sonnet", { ...fastOpts, _runner: runner });
-    expect(res.ok).toBe(true);
-    expect(sentKeys(sends)).toEqual(["/model", "Enter", "Up", "s"]);
-  });
-
-  it("aborts via Escape when the label is not offered — never presses s", async () => {
-    const { runner, sends } = fakeRunner([PICKER, AFTER_ESC]);
-    const res = await selectModel("agentx", "Nonexistent Model", { ...fastOpts, _runner: runner });
-    expect(res.ok).toBe(false);
-    if (!res.ok) expect(res.reason).toContain("not offered");
-    const keys = sentKeys(sends);
-    expect(keys).toContain("Escape");
-    expect(keys).not.toContain("s");
-  });
-
-  it("aborts via Escape when cursor verification fails — never presses s", async () => {
-    // After the Down keypress the pane unexpectedly still shows cursor
-    // on Sonnet (row 2) — e.g. the pane shifted under us.
-    const { runner, sends } = fakeRunner([PICKER, PICKER, AFTER_ESC]);
-    const res = await selectModel("agentx", "Haiku", { ...fastOpts, _runner: runner });
-    expect(res.ok).toBe(false);
-    if (!res.ok) expect(res.reason).toContain("cursor verification failed");
-    const keys = sentKeys(sends);
-    expect(keys).toContain("Escape");
-    expect(keys).not.toContain("s");
-  });
-
-  it("zero-delta selection (target == cursor row) presses s directly", async () => {
-    const { runner, sends } = fakeRunner([PICKER, PICKER, AFTER_S]);
-    const res = await selectModel("agentx", "Sonnet", { ...fastOpts, _runner: runner });
-    expect(res.ok).toBe(true);
-    expect(sentKeys(sends)).toEqual(["/model", "Enter", "s"]);
-  });
-
-  it("aborts when the picker never renders", async () => {
-    const { runner, sends } = fakeRunner([IDLE]);
-    const res = await selectModel("agentx", "Haiku", { ...fastOpts, _runner: runner, timeoutMs: 20 });
-    expect(res.ok).toBe(false);
-    expect(sentKeys(sends)).not.toContain("s");
-    expect(sentKeys(sends)).toContain("Escape");
-  });
-});
-
 describe("pane-lock serialization (#2263 review blocker 1)", () => {
   it("two concurrent drives on one pane never interleave keys", async () => {
     // A slow runner whose captures resolve through real microtasks;
@@ -312,15 +246,10 @@ describe("pane-lock serialization (#2263 review blocker 1)", () => {
     ]);
   });
 
-  it("a select queued behind a discover runs after its Escape", async () => {
+  it("two discovers on one pane serialize (never interleave)", async () => {
     const sends: string[][] = [];
     let i = 0;
-    const frames = [
-      // discover: open → esc
-      PICKER, AFTER_ESC,
-      // select: open → walk-verify → s-confirm
-      PICKER, PICKER_CURSOR_3, AFTER_S,
-    ];
+    const frames = [PICKER, AFTER_ESC, PICKER, AFTER_ESC];
     const runner: TmuxRunner = {
       capture: () => frames[Math.min(i++, frames.length - 1)],
       send: (_s, _t, args) => {
@@ -329,15 +258,15 @@ describe("pane-lock serialization (#2263 review blocker 1)", () => {
       hasSession: () => true,
     };
     const opts = { ...fastOpts, _runner: runner };
-    const [d, s] = await Promise.all([
+    const [d1, d2] = await Promise.all([
       discoverModels("samepane2", opts),
-      selectModel("samepane2", "Haiku", opts),
+      discoverModels("samepane2", opts),
     ]);
-    expect(d.ok).toBe(true);
-    expect(s).toEqual({ ok: true, confirmation: "Set model to Haiku 4.5 for this session" });
+    expect(d1.ok).toBe(true);
+    expect(d2.ok).toBe(true);
     expect(sentKeys(sends)).toEqual([
       "/model", "Enter", "Escape",
-      "/model", "Enter", "Down", "s",
+      "/model", "Enter", "Escape",
     ]);
   });
 });
@@ -358,15 +287,4 @@ describe("dismissal failure is loud (#2263 review blocker 3)", () => {
     expect(logs.some((l) => l.includes("may still be open"))).toBe(true);
   });
 
-  it("failed select logs the stuck-modal warning too", async () => {
-    const logs: string[] = [];
-    const { runner } = fakeRunner([PICKER]);
-    const res = await selectModel("agentx", "Nonexistent Model", {
-      ...fastOpts,
-      _runner: runner,
-      _log: (l) => logs.push(l),
-    });
-    expect(res.ok).toBe(false);
-    expect(logs.some((l) => l.includes("may still be open"))).toBe(true);
-  });
 });
