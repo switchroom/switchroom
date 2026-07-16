@@ -752,10 +752,29 @@ export function attachAgent(name: string, tmuxSupervisor = true): void {
   }
 }
 
-export function getAgentLogs(name: string, follow: boolean): void {
+/**
+ * Build the docker argv for `getAgentLogs`. Pure so the `--tail`
+ * contract is unit-testable without spawning docker.
+ *
+ * `--tail N` bounds the dump to the last N lines; with `-f` it bounds
+ * the initial backlog before streaming. The Telegram /logs [name]
+ * [lines] UX relies on this bound so a heavy dump doesn't blow past
+ * the reply size limit. NOTE (behavior change with the --lines fix):
+ * the CLI action now always passes a tail (default 50), so a bare
+ * `switchroom agent logs <name>` no longer dumps the entire log.
+ */
+export function buildAgentLogsArgs(name: string, follow: boolean, tail?: number): string[] {
   const args = ["logs"];
   if (follow) args.push("-f");
+  if (tail !== undefined && Number.isFinite(tail) && tail >= 1) {
+    args.push("--tail", String(Math.floor(tail)));
+  }
   args.push(containerName(name));
+  return args;
+}
+
+export function getAgentLogs(name: string, follow: boolean, tail?: number): void {
+  const args = buildAgentLogsArgs(name, follow, tail);
 
   const child = spawn("docker", args, { stdio: "inherit" });
   child.on("error", (err) => {
