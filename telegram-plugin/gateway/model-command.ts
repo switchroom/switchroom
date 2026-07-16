@@ -11,24 +11,26 @@
  * When discovery fails (agent mid-turn, CLI UI changed, kill-switched
  * via SWITCHROOM_MODEL_MENU=0) it falls back to the static v1 text.
  *
- * `/model <alias|full-id>` types claude's own `/model <name>` into the
- * agent's tmux pane via the existing allowlisted inject primitive
- * (`src/agents/inject.ts` — `/model` is already on the allowlist) and
- * relays the captured response. This is the Claude-native mechanism:
- * the unmodified CLI's REPL command, no API, no SDK, no config
- * mutation. The switch is session-scoped — it lasts until the agent
- * restarts; persisting requires `model:` in switchroom.yaml (cascade)
- * and a restart, which the reply spells out.
+ * `/model <alias|full-id>` (and every menu tap) is a DETERMINISTIC carrier
+ * relaunch (rev 5, session-model-stickiness.md §0.05): the requested token is
+ * written to the consume-once `.session-model` carrier and applied by start.sh's
+ * `exec claude --model <token>` on the next boot. The inject-into-tmux +
+ * terminal-scrape path is RETIRED — it silently no-op'd (keystrokes swallowed
+ * on a busy pane) then optimistically recorded success, an unverifiable lie to
+ * `/status`. A relaunch cannot silently no-op, and `.active-session-model` is a
+ * real post-boot signal. Still Claude-native (the unmodified CLI's `--model`
+ * flag, no API/SDK). The switch is session-scoped — it lasts until the next
+ * restart, then reverts to the configured `model:`; persisting requires
+ * `model:` in switchroom.yaml (cascade), which the reply spells out. The cost
+ * is a ~30s fresh session (Hindsight memory + the handoff briefing carry
+ * context); no `--continue`/`--resume`.
  *
  * Split parser/handler shape mirrors `auth-command.ts` so the logic is
  * unit-testable without booting the bot.
  */
 
-import type { InjectResult, InjectOpts } from '../../src/agents/inject.js'
 import {
-  labelTag,
   type DiscoverResult,
-  type SelectResult,
   type ModelPickerOption,
 } from '../../src/agents/model-picker.js'
 
@@ -254,17 +256,6 @@ export function modelCommandReceiptLine(
 
 export interface ModelCommandDeps {
   /**
-   * Inject primitive — wired to injectSlashCommand in the gateway. The optional
-   * third argument forwards the #3241 poll-until-signal opts (successPattern /
-   * errorPattern / settleBeforeSendMs); the set path passes them so the `/model`
-   * confirmation scrape is deterministic instead of racing a fixed window.
-   */
-  inject: (
-    agent: string,
-    command: string,
-    opts?: Pick<InjectOpts, 'successPattern' | 'errorPattern' | 'settleBeforeSendMs'>,
-  ) => Promise<InjectResult>
-  /**
    * True while the agent is mid-turn. A typed `/model <name>` switch drives
    * claude's session (either an inject into the input box, or a carrier-backed
    * restart) — doing either mid-turn is unsafe: an inject queues `/model` as
@@ -308,38 +299,44 @@ export interface ModelCommandDeps {
    * on the following restart. Wired to the same restart dispatch as
    * `scheduleRestart`, plus the carrier write. `model` is the full `sr-*` id
    * (already alias-expanded); `reason` is stamped as the restart reason.
+   *
+   * Rev 5 (deterministic switch): EVERY `/model` switch — Claude→Claude,
+   * Claude→sr-*, sr-*→Claude, the Fable/alias button, and the picker SELECT —
+   * routes through here. The inject-into-tmux + terminal-scrape path is retired,
+   * so a switch can no longer silently no-op or optimistically lie to /status:
+   * start.sh's `exec claude --model <token>` cannot silently no-op, and the
+   * post-boot `.active-session-model` signal is what /status reflects.
    */
   scheduleModelRelaunch: (model: string, reason: string) => Promise<void>
+  /**
+   * Revert TO the configured default (`/model default`) via a relaunch. Clears
+   * the consume-once `.session-model` carrier + the in-memory override, then
+   * relaunches so the LIVE session actually reverts to `switchroom.yaml model:`
+   * (rev 5: with inject retired, a relaunch is the only way to make `default`
+   * take effect live — consistent with "all switches relaunch"). Mirrors
+   * scheduleModelRelaunch's careful rollback: a `restart_in_flight` throw keeps
+   * the cleared state (the in-flight boot reverts anyway); any other dispatch
+   * failure restores the prior carrier + override.
+   */
+  scheduleModelDefaultRelaunch: (reason: string) => Promise<void>
 }
 
 export interface ModelCommandReply {
   text: string
   html: true
   /**
-   * On a POSITIVELY-CONFIRMED typed switch, the model now running this session
-   * (parsed from claude's confirmation, falling back to the requested token).
-   * The gateway records this as the session-model override so `/status` reflects
-   * what's actually running — the SAME code path the menu callback uses via
-   * `ModelCallbackOutcome.selectedModel`. Absent on every unverified / non-switch
-   * outcome (silent capture, error, busy refusal) so an unconfirmed switch never
-   * lies to `/status`.
+   * Rev 5: a `/model` switch NEVER carries a live-model field. The inject +
+   * terminal-scrape path that produced an optimistic `selectedModel` is retired.
+   * Every switch relaunches through `scheduleModelRelaunch`, which owns the
+   * in-memory override write for the restart window; the ACTUAL running model is
+   * reconciled at boot from `.active-session-model` (and by the transcript's
+   * `message.model`), never optimistically asserted from a scraped pane. So
+   * there is no `selectedModel`/`optimistic` here to lie to /status with.
    */
-  selectedModel?: string
-  /**
-   * True when `selectedModel` was recorded OPTIMISTICALLY (#3241 part B): the
-   * inject SEND succeeded and NO explicit error line was scraped, but claude's
-   * confirmation line was not read either. Poll-until-signal already waited the
-   * full window, so a missing line means a silent switch (or a confirmation
-   * that scrolled off) — NOT a failure — and we record the requested model so
-   * `/status` is right. The switch is retracted (no `selectedModel`) only when
-   * an error line IS scraped. Purely a wording hint; the gateway records
-   * `selectedModel` the same way whether confirmed or optimistic.
-   */
-  optimistic?: boolean
 }
 
 const PERSIST_NOTE =
-  '_Session-only — this override lasts until the agent’s next restart, then reverts to the configured \`model:\`. \`/model default\` clears it now. To change the default permanently, set \`model:\` in switchroom.yaml._'
+  '_A `/model` switch relaunches the session (~30s) on the chosen model. Session-only — reverts to the configured \`model:\` on the next restart. \`/model default\` reverts now. Live scrollback is replaced by a fresh session; memory and the handoff briefing carry the context. To change the default permanently, set \`model:\` in switchroom.yaml._'
 
 function helpText(deps: ModelCommandDeps, reason?: string): ModelCommandReply {
   const srAliasExamples = Object.keys(SR_MODEL_ALIASES).map(a => `\`${a}\``).join(' · ')
@@ -350,7 +347,7 @@ function helpText(deps: ModelCommandDeps, reason?: string): ModelCommandReply {
     '\`/model\` — show the configured model',
     `\`/model <name>\` — switch the live session (${MODEL_ALIASES.map(a => `\`${a}\``).join(' · ')} or a full model id)`,
     `_OpenRouter shortcuts:_ ${srAliasExamples}`,
-    '_OpenRouter (sr-\\*) switches restart the session (~30s); Claude switches apply instantly._',
+    '_Every switch relaunches the session (~30s) on the chosen model — Claude and OpenRouter (sr-\\*) alike._',
     PERSIST_NOTE,
   )
   return { text: lines.join('\n'), html: true }
@@ -388,10 +385,10 @@ export async function handleModelCommand(
   // Expand short aliases: `flash` → `sr-gemini-2.5-flash`, `codex` → `sr-codex-5.5`, etc.
   const model = expandSrAlias(parsed.model)
 
-  // Busy gate: a typed switch either injects into claude's input box or triggers
-  // a carrier-backed restart. Both are unsafe mid-turn — an inject queues the
-  // `/model` text instead of switching, and a restart kills the live turn. Refuse
-  // and ask the operator to retry (parity with the menu callback's isBusy check).
+  // Busy gate: a switch RELAUNCHES the session, which is unsafe mid-turn (it
+  // would tear down the live turn). The gateway's mid-turn path ACKs + queues +
+  // applies-on-idle before this handler is reached; this is the belt-and-braces
+  // seam for a caller that skipped it.
   if (deps.isBusy()) {
     return {
       text: '⏳ The agent is mid-turn — a model switch needs an idle session. The switch was not applied.',
@@ -399,182 +396,71 @@ export async function handleModelCommand(
     }
   }
 
-  // sr-* → Claude: an in-place `/model` inject would leave LiteLLM routing
-  // active in the live session because the sr-* model context was set by
-  // the proxy at session start, not by claude's own REPL. A graceful restart
-  // is the only clean path back to the native OAuth route. Route it through the
-  // SAME carrier mechanism as a Claude → sr-* switch (scheduleModelRelaunch)
-  // so the requested Claude model is written to the durable `.session-model` and
-  // survives the restart — otherwise boot launches the configured default and
-  // the operator's choice is silently dropped. start.sh's LiteLLM-down guard
-  // only special-cases `sr-*` overrides, so a Claude token is never dropped.
-  const currentSession = deps.getActiveSessionModel()
-  if (currentSession !== null && isSrModel(currentSession) && isClaudeModel(model)) {
-    try {
-      await deps.scheduleModelRelaunch(model, `user: /model ${model} (sr-to-claude restart)`)
-    } catch (err) {
-      if (isRestartInFlight(err)) {
-        return {
-          text: `⏳ A restart is already in flight — your switch to \`${deps.escapeHtml(model)}\` will apply as it completes (~15s).`,
-          html: true,
-        }
-      }
-      const msg = err instanceof Error ? err.message : String(err)
-      return {
-        text: `❌ Could not schedule restart: ${deps.escapeHtml(msg)}`,
-        html: true,
-      }
-    }
+  // Rev 5 (deterministic switch): route EVERY target through the consume-once
+  // `.session-model` carrier relaunch. `default` clears the carrier + override
+  // and relaunches so the live session reverts to the configured `model:`; any
+  // other token — Claude alias/id, sr-*, Fable — is carried and applied by
+  // start.sh's `exec claude --model <token>`. The inject-into-tmux +
+  // terminal-scrape path is RETIRED: a switch can no longer silently no-op or
+  // optimistically lie to /status (start.sh cannot silently no-op, and the
+  // post-boot `.active-session-model` signal is the source of truth).
+  if (model.toLowerCase() === 'default') {
+    return scheduleDefaultRelaunchReply(deps, 'user: /model default (revert relaunch)')
+  }
+  return scheduleRelaunchReply(deps, model, `user: /model ${model} (session-only relaunch)`)
+}
+
+/** The one-line ack shown while a switch relaunches (~30s). */
+function switchingLine(deps: Pick<ModelCommandDeps, 'escapeHtml'>, model: string): string {
+  const friendly = isSrModel(model) ? srFriendlyLabel(model) : model
+  return `🔄 Switching to \`${deps.escapeHtml(friendly)}\` — relaunching the session (~30s).`
+}
+
+/** Map a relaunch-dispatch error to an honest reply (debounce vs failure). */
+function relaunchErrorReply(
+  deps: Pick<ModelCommandDeps, 'escapeHtml'>,
+  model: string,
+  err: unknown,
+): ModelCommandReply {
+  if (isRestartInFlight(err)) {
     return {
-      text: [
-        `Switching from \`${deps.escapeHtml(currentSession)}\` back to Claude — restarting session cleanly. Claude will be ready in ~30s.`,
-        PERSIST_NOTE,
-      ].join('\n'),
+      text: `⏳ A restart is already in flight — your switch to \`${deps.escapeHtml(model)}\` will apply as it completes (~15s).`,
       html: true,
     }
   }
+  const msg = err instanceof Error ? err.message : String(err)
+  return { text: `❌ Could not schedule model switch: ${deps.escapeHtml(msg)}`, html: true }
+}
 
-  // Claude → sr-*: an in-place inject can't set a non-Anthropic model — claude's
-  // native `/model` picker rejects the unknown `sr-*` id ("Model not found").
-  // Carry the token across a graceful restart and relaunch `claude --model
-  // sr-*` directly (LiteLLM routes it). Session-only: reverts to the configured
-  // default on the next restart. The sr-* → Claude direction is handled above.
-  if (isSrModel(model)) {
-    try {
-      await deps.scheduleModelRelaunch(model, `user: /model ${model} (session-only relaunch)`)
-    } catch (err) {
-      if (isRestartInFlight(err)) {
-        return {
-          text: `⏳ A restart is already in flight — your switch to \`${deps.escapeHtml(model)}\` will apply as it completes (~15s).`,
-          html: true,
-        }
-      }
-      const msg = err instanceof Error ? err.message : String(err)
-      return {
-        text: `❌ Could not schedule model switch: ${deps.escapeHtml(msg)}`,
-        html: true,
-      }
-    }
-    return {
-      text: [
-        `Switching to \`${deps.escapeHtml(model)}\` — restarting session (~30s).`,
-        PERSIST_NOTE,
-      ].join('\n'),
-      html: true,
-    }
-  }
-
-  const verbHtml = `\`/model ${deps.escapeHtml(model)}\``
-  let result: InjectResult
+/** Schedule a carrier relaunch onto `model`, returning the deterministic ack. */
+async function scheduleRelaunchReply(
+  deps: ModelCommandDeps,
+  model: string,
+  reason: string,
+): Promise<ModelCommandReply> {
   try {
-    // #3241 part A — poll-until-signal. Hand the inject primitive the exact
-    // confirmation / error line shapes so its capture loop keeps polling until
-    // claude's "Set model to …" (or an error) actually lands, instead of
-    // breaking at a fixed settle window on the first pane change (which the
-    // async access banner tripped, capturing the banner and missing the
-    // confirmation). settleBeforeSendMs waits for a clean prompt so the keys
-    // aren't typed into a still-animating pane (symptom 2's silent no-op).
-    result = await deps.inject(deps.getAgentName(), `/model ${model}`, {
-      successPattern: MODEL_SWITCH_CONFIRMATION_PREFIX,
-      errorPattern: MODEL_SWITCH_ERROR_RE,
-      settleBeforeSendMs: 1500,
-    })
+    await deps.scheduleModelRelaunch(model, reason)
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    return {
-      text: `❌ ${verbHtml} — inject failed: ${deps.escapeHtml(msg)}`,
-      html: true,
-    }
+    return relaunchErrorReply(deps, model, err)
   }
+  return { text: [switchingLine(deps, model), PERSIST_NOTE].join('\n'), html: true }
+}
 
-  if (result.outcome === 'ok' || result.outcome === 'ok_no_output') {
-    // claude's `/model <name>` prints a "Set model to X" acknowledgement, an
-    // error line ("Model not found"), a "Kept model as X" no-op, or (rarely)
-    // switches with the confirmation scrolled off. `result.output` on a silent
-    // path is just pane scrollback (the agent's previous prose) — NEVER a
-    // confirmation, and it must not be dumped back as a code block (screenshot-
-    // confirmed leak on klanker, v0.16.47).
-    //
-    // Honest reporting (#3241 part B inverts the old "record nothing unless
-    // confirmed" to "record optimistically, retract only on a scraped error").
-    // Order matters (#3242 review MEDIUM 1): check the CONFIRMATION line FIRST —
-    // a genuine switch always prints one, so it can never be flipped to a failure
-    // by a stray availability/denial word (the widened MODEL_SWITCH_ERROR_RE) in
-    // the same region. Then:
-    //   (1) "Kept model as X" → genuine no-op; report it, record NOTHING.
-    //   (2) other confirmation → verified switch; relay it, record the display
-    //       name for /status.
-    //   (3) error/denial line scraped (bad id OR access denial) → switch FAILED.
-    //       Report it; record NOTHING (the retract — /status keeps the prior model).
-    //   (4) no line either way → poll-until-signal already waited the full
-    //       window, so this is a SILENT success, not a failure. Record the
-    //       requested model OPTIMISTICALLY (normalized to display form) so
-    //       /status is right, and say so.
-    const confirmation = result.outcome === 'ok' ? modelSwitchConfirmationLine(result.output) : null
-    if (confirmation) {
-      if (isKeptModelConfirmation(confirmation)) {
-        // "Kept model as X" — nothing changed. Relay it, record no override.
-        return {
-          text: [
-            `${verbHtml}`,
-            deps.preBlock(confirmation),
-            ...(result.truncated ? ['_truncated_'] : []),
-            PERSIST_NOTE,
-          ].join('\n'),
-          html: true,
-        }
-      }
-      const confirmed = sessionModelFromConfirmation(confirmation) ?? model
-      return {
-        text: [
-          `${verbHtml}`,
-          deps.preBlock(confirmation),
-          ...(result.truncated ? ['_truncated_'] : []),
-          PERSIST_NOTE,
-        ].join('\n'),
-        html: true,
-        selectedModel: confirmed,
-      }
-    }
-    const errLine = result.outcome === 'ok' ? modelSwitchErrorLine(result.output) : null
-    if (errLine) {
-      return {
-        text: [
-          `❌ ${verbHtml} — the switch did not take:`,
-          deps.preBlock(errLine),
-          'Check \`/model\` for a valid, available model.',
-        ].join('\n'),
-        html: true,
-      }
-    }
-    // No confirmation and no error — optimistic record (#3241 part B). The
-    // Telegram copy stays PROVISIONAL (#3242 review FIX 2): we couldn't read a
-    // confirmation, and if the CLI denied the switch with wording our error
-    // regex misses, an affirmative "recorded X" would be a lie that never
-    // self-corrects. `/status` DOES self-heal (the override is reclaimed by the
-    // next transcript line), so point the user there rather than assert success.
-    const optimisticLabel = optimisticModelRecordLabel(model)
-    return {
-      text: [
-        `${verbHtml} — sent, but couldn't read a confirmation line. \`/status\` will show the live model once it's confirmed.`,
-        PERSIST_NOTE,
-      ].join('\n'),
-      html: true,
-      selectedModel: optimisticLabel,
-      optimistic: true,
-    }
-  }
-
-  // outcome === 'failed'
-  if (result.errorCode === 'session_missing') {
-    return {
-      text:
-        '❌ tmux session not found — the agent must be running under the tmux supervisor (the default). Remove \`experimental.legacy_pty: true\` if set.',
-      html: true,
-    }
+/** Schedule the `/model default` clear + revert relaunch, returning its ack. */
+async function scheduleDefaultRelaunchReply(
+  deps: ModelCommandDeps,
+  reason: string,
+): Promise<ModelCommandReply> {
+  try {
+    await deps.scheduleModelDefaultRelaunch(reason)
+  } catch (err) {
+    return relaunchErrorReply(deps, 'default', err)
   }
   return {
-    text: `❌ ${verbHtml} — ${deps.escapeHtml(result.errorMessage ?? 'inject failed')}`,
+    text: [
+      '🔄 Reverting to the configured default model — relaunching the session (~30s).',
+      PERSIST_NOTE,
+    ].join('\n'),
     html: true,
   }
 }
@@ -584,12 +470,14 @@ export async function handleModelCommand(
 // ---------------------------------------------------------------------------
 
 export interface ModelMenuDeps {
-  /** Live picker discovery — src/agents/model-picker.ts discoverModels. */
-  discover: (agent: string) => Promise<DiscoverResult>
-  /** Live picker selection by label — selectModel (session-only `s`). */
-  select: (agent: string, label: string) => Promise<SelectResult>
   /**
-   * True while the agent is mid-turn. Driving the picker types into
+   * Live picker discovery — src/agents/model-picker.ts discoverModels. Used ONLY
+   * to RENDER the model list (buildModelMenu); rev 5 retired the terminal-driving
+   * `select` from the switch path, so discovery no longer applies a switch.
+   */
+  discover: (agent: string) => Promise<DiscoverResult>
+  /**
+   * True while the agent is mid-turn. Driving the picker (for RENDER) types into
    * claude's input box; doing that mid-turn would queue "/model" as
    * user text instead of opening the modal — refuse instead.
    */
@@ -628,9 +516,9 @@ export const MODEL_CALLBACK_HEADER = 'mdl:h'
 /**
  * Callback prefix for Claude aliases that the CLI picker doesn't render but
  * the CLI resolves natively (e.g. `fable`). Carries the alias verbatim; its
- * handler INJECTS `/model <alias>` — the same mechanism MODEL_CALLBACK_SR
- * uses — because the cursor-nav select path can only pick rows claude's own
- * picker actually renders.
+ * handler routes to the carrier relaunch (`scheduleModelRelaunch`) — the same
+ * deterministic mechanism every switch uses (rev 5). `fable` boots via the
+ * LiteLLM router repoint in start.sh (see the fable case there).
  */
 export const MODEL_CALLBACK_ALIAS = 'mdl:alias:'
 /** Callback: open the nested "External models" keyboard page. */
@@ -644,9 +532,10 @@ export type ModelMenuPage = 'main' | 'external'
 /**
  * Static Claude aliases appended to the scraped Claude group. The claude CLI's
  * own `/model` picker (deps.discover) does NOT list `fable`, but the CLI
- * resolves the alias natively, so we render it as an extra button that selects
- * by injecting `/model fable` (MODEL_CALLBACK_ALIAS). Extend this list to
- * surface further CLI-resolvable aliases the picker omits.
+ * resolves the alias natively, so we render it as an extra button that switches
+ * via the carrier relaunch (MODEL_CALLBACK_ALIAS → scheduleModelRelaunch, rev
+ * 5). Extend this list to surface further CLI-resolvable aliases the picker
+ * omits.
  */
 export const EXTRA_CLAUDE_ALIASES: ReadonlyArray<{ alias: string; label: string }> = [
   { alias: 'fable', label: 'Fable' },
@@ -735,32 +624,6 @@ export function srFriendlyLabel(srName: string): string {
 }
 
 /**
- * #3242 review LOW 4 — display normalization for the OPTIMISTIC `/status` record.
- * The confirmed path records the display name claude printed (e.g. "Fable 5" via
- * `sessionModelFromConfirmation`); the optimistic path only has the requested
- * arg. Without a confirmation we can't know the version suffix, so we normalize
- * a bare Claude alias to the same DISPLAY style — Title-case ("fable" → "Fable")
- * — and leave a full `claude-*` id as-is (already canonical).
- *
- * #3242 review FIX 1 (MEDIUM) — sr-* tokens are returned UNCHANGED (with the
- * `sr-` prefix). The stored `selectedModel` doubles as the sr-*→Claude sentinel:
- * `gateway.ts` `isSrToClaudeTransition` checks `prevModel?.startsWith('sr-')` to
- * decide whether a later Claude switch needs the graceful restart that tears
- * down LiteLLM routing. De-prefixing here (as the earlier LOW-4 pass did via
- * `srFriendlyLabel`) would silently break that restart. So this helper never
- * de-prefixes: the caller normalizes only the DISPLAY text separately (see
- * `srFriendlyLabel`), never the stored token.
- */
-export function optimisticModelRecordLabel(token: string): string {
-  if (isSrModel(token)) return token
-  const lower = token.toLowerCase()
-  if ((MODEL_ALIASES as readonly string[]).includes(lower)) {
-    return lower.charAt(0).toUpperCase() + lower.slice(1)
-  }
-  return token
-}
-
-/**
  * Split picker-discovered options into native Claude options and sr-*
  * (LiteLLM non-Anthropic) options. Options with "/" in the label or
  * other non-native prefixes (e.g., "openrouter/...", "gpt-4") are
@@ -787,11 +650,14 @@ export function classifyDiscoveredOptions(options: ModelPickerOption[]): {
 }
 
 export function modelSelectCallbackData(label: string): string {
-  // Identity is the label's hash, not its index — a tap re-discovers
-  // the picker and matches by tag, so a list that shifted between
-  // render and tap can never select the wrong row. 8 hex chars keeps
-  // callback_data tiny (well under Telegram's 64-byte cap).
-  return `${MODEL_CALLBACK_SELECT}${labelTag(label)}`
+  // Rev 5: embed the CANONICAL `claude --model` token directly, not a label
+  // hash. A tap no longer needs live picker discovery to resolve the row — it
+  // goes straight to the carrier relaunch (`mdl:s:<token>`), removing the last
+  // terminal-driving step from the switch path. The "Default (recommended)" row
+  // has no derivable token (`canonicalClaudeToken` → null); it carries the
+  // `default` sentinel so the tap routes to the clear+revert relaunch.
+  const token = canonicalClaudeToken(label) ?? 'default'
+  return `${MODEL_CALLBACK_SELECT}${token}`
 }
 
 const BUSY_REFUSAL_TEXT =
@@ -1044,30 +910,14 @@ export interface ModelCallbackOutcome {
    */
   busyRefusal?: boolean
   /**
-   * On a successful session switch, the live model name now running (parsed
-   * from claude's confirmation, e.g. "Fable 5"). The gateway records this as
-   * the session-model override so `/status` reflects what's actually running.
-   * Absent on every non-switch outcome.
+   * Rev 5: a menu tap NEVER carries a scrape-derived live-model field. Every
+   * switch (alias/Fable, picker SELECT, sr-*) relaunches through
+   * `scheduleModelRelaunch`/`scheduleModelDefaultRelaunch`, which own the
+   * in-memory override + carrier writes; the ACTUAL running model is reconciled
+   * at boot from `.active-session-model`. So there is no `selectedModel` /
+   * `selectedModelToken` / `clearedDefault` here to record optimistically — the
+   * gateway no longer post-processes the outcome for side effects.
    */
-  selectedModel?: string
-  /**
-   * The canonical `claude --model` token (alias or full `claude-*` id) for a
-   * Claude selection, when derivable — distinct from `selectedModel` (a display
-   * name for /status). Session-scoped (rev 4): a live Claude selection persists
-   * NO carrier (the switch applies in-session and reverts on the next boot);
-   * the gateway uses this token ONLY on an sr-* → Claude transition, writing it
-   * to the consume-once `.session-model` carrier so that transition's own
-   * apply-relaunch boots the tapped model (then reverts on the following
-   * restart). Absent when the target has no derivable token.
-   */
-  selectedModelToken?: string
-  /**
-   * True when the confirmed selection was the "Default (recommended)" row —
-   * i.e. the session is now on the configured default and any leftover
-   * `.session-model` carrier must be CLEARED (a stale carrier would be
-   * consumed — mis-applied — by the next boot).
-   */
-  clearedDefault?: boolean
   /** Short toast for answerCallbackQuery. */
   answer: string
   /** Replacement dashboard (message edit). */
@@ -1098,98 +948,6 @@ export async function handleModelMenuCallback(
     return { answer: 'Back', reply: await buildModelMenu(deps, 'main') }
   }
 
-  // Claude-alias tap (e.g. Fable): the CLI resolves the alias but its picker
-  // doesn't render it, so select by injecting `/model <alias>` — same path as
-  // the sr-* handler below, no cursor-nav.
-  if (data.startsWith(MODEL_CALLBACK_ALIAS)) {
-    const alias = data.slice(MODEL_CALLBACK_ALIAS.length)
-    if (!isValidModelArg(alias)) {
-      return { answer: 'Invalid model name', reply: await buildModelMenu(deps) }
-    }
-    if (deps.isBusy()) {
-      return {
-        answer: '⏳ Agent is mid-turn — tap again when it’s idle',
-        reply: { text: BUSY_REFUSAL_TEXT, html: true },
-        toastOnly: true,
-        busyRefusal: true,
-      }
-    }
-    let aliasResult: InjectResult
-    try {
-      // #3241 part A — same poll-until-signal + clean-prompt opts as the typed
-      // set path so the alias (e.g. Fable) confirmation scrape is deterministic
-      // and immune to the async access banner.
-      aliasResult = await deps.inject(deps.getAgentName(), `/model ${alias}`, {
-        successPattern: MODEL_SWITCH_CONFIRMATION_PREFIX,
-        errorPattern: MODEL_SWITCH_ERROR_RE,
-        settleBeforeSendMs: 1500,
-      })
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      return {
-        answer: 'Switch failed',
-        reply: await menuWithBanner(deps, `❌ Switch to **${deps.escapeHtml(alias)}** failed: ${deps.escapeHtml(msg)}`),
-      }
-    }
-    // #3242 review MEDIUM 2 — the alias BUTTON (the primary Fable UI, the exact
-    // async-banner scenario) must be symmetric with the typed set path: handle
-    // BOTH `ok` and `ok_no_output` with record-on-send / retract-on-scraped-error.
-    // Previously `ok_no_output` fell through to "Switch failed — agent may be
-    // mid-turn" and dropped the override, so a silent successful button-switch
-    // was reported as a failure while the identical typed command recorded.
-    if (aliasResult.outcome === 'ok' || aliasResult.outcome === 'ok_no_output') {
-      // Confirmation first (a genuine switch always prints one) so a stray
-      // availability/denial word can't flip it to a failure.
-      const confirmation = aliasResult.outcome === 'ok'
-        ? modelSwitchConfirmationLine(aliasResult.output)
-        : null
-      if (confirmation) {
-        // "Kept model as X" means no change — don't overwrite the override.
-        const kept = isKeptModelConfirmation(confirmation)
-        return {
-          answer: confirmation,
-          reply: await menuWithBannerStatic(deps, `✅ ${deps.escapeHtml(confirmation)}`),
-          ...(kept ? {} : {
-            selectedModel: sessionModelFromConfirmation(confirmation) ?? optimisticModelRecordLabel(alias),
-            selectedModelToken: alias,
-          }),
-        }
-      }
-      // Scraped error/denial (bad id OR access denial) → genuine failure, record
-      // nothing (retract).
-      const aliasErr = aliasResult.outcome === 'ok' ? modelSwitchErrorLine(aliasResult.output) : null
-      if (aliasErr) {
-        return {
-          answer: 'Switch failed',
-          reply: await menuWithBanner(
-            deps,
-            `❌ Switch to **${deps.escapeHtml(alias)}** did not take: ${deps.escapeHtml(aliasErr)}`,
-          ),
-        }
-      }
-      // Silent success (no confirmation, no error) → optimistic record, same as
-      // the typed path. PROVISIONAL copy (#3242 review FIX 2): don't assert the
-      // switch succeeded — we couldn't read a confirmation, and /status self-heals.
-      const optimisticLabel = optimisticModelRecordLabel(alias)
-      return {
-        answer: `Sent /model ${alias} — check /status`,
-        reply: await menuWithBannerStatic(
-          deps,
-          `Sent \`/model ${deps.escapeHtml(alias)}\` — couldn’t read a confirmation line. \`/status\` will show the live model once it’s confirmed.`,
-        ),
-        selectedModel: optimisticLabel,
-        selectedModelToken: alias,
-      }
-    }
-    return {
-      answer: 'Switch failed',
-      reply: await menuWithBanner(
-        deps,
-        `❌ Switch to **${deps.escapeHtml(alias)}** failed — agent may be mid-turn`,
-      ),
-    }
-  }
-
   if (data === MODEL_CALLBACK_HEADER) {
     // Section-header row — the gateway handles this with a direct answerCallbackQuery
     // before calling this function, so this branch is dead in practice. Guard
@@ -1197,20 +955,38 @@ export async function handleModelMenuCallback(
     return { answer: 'Tap a model in this section to switch', reply: { text: '', html: true }, toastOnly: true }
   }
 
-  // sr-* model tap. In the live gateway this branch is DEAD — the gateway
-  // intercepts `mdl:sr:` at its callback dispatcher (before calling this
-  // function) and routes it straight to scheduleModelRelaunch (carrier + restart).
-  // The old body here text-injected `/model sr-<name>`, which is doubly broken if
-  // ever reached: claude's picker rejects unknown sr-* ids AND the ANTHROPIC_BASE_URL
-  // is never repointed at the LiteLLM router, so the request 4xxs against Anthropic.
-  // Delegate to the SAME carrier mechanism so a direct caller (tests, a future
-  // refactor that drops the gateway intercept) still does the safe thing.
-  if (data.startsWith(MODEL_CALLBACK_SR)) {
-    const srName = data.slice(MODEL_CALLBACK_SR.length)
-    const friendlyName = srFriendlyLabel(srName)
-    if (!isValidModelArg(srName)) {
+  // A model-SWITCH tap — Fable/alias button (`mdl:alias:`), an sr-* target
+  // (`mdl:sr:`), or a picker SELECT row (`mdl:s:<token>`). Rev 5: every one
+  // relaunches through the consume-once `.session-model` carrier. No inject, no
+  // cursor-nav, no terminal scrape — a tap resolves its canonical token and
+  // hands off to `scheduleModelRelaunch` (or the clear+revert path for the
+  // `default` sentinel, which the "Default (recommended)" row and the Default
+  // alias button both carry). This is what makes a tap deterministic: it can no
+  // longer silently no-op or optimistically record a switch that never applied.
+  if (
+    data.startsWith(MODEL_CALLBACK_ALIAS) ||
+    data.startsWith(MODEL_CALLBACK_SR) ||
+    data.startsWith(MODEL_CALLBACK_SELECT)
+  ) {
+    let token: string
+    let label: string
+    if (data.startsWith(MODEL_CALLBACK_ALIAS)) {
+      token = data.slice(MODEL_CALLBACK_ALIAS.length)
+      label = token
+    } else if (data.startsWith(MODEL_CALLBACK_SR)) {
+      token = data.slice(MODEL_CALLBACK_SR.length)
+      label = srFriendlyLabel(token)
+    } else {
+      token = data.slice(MODEL_CALLBACK_SELECT.length)
+      label = token
+    }
+    if (!isValidModelArg(token)) {
       return { answer: 'Invalid model name', reply: await buildModelMenu(deps) }
     }
+    // Mid-turn: refuse WITHOUT touching the message so the menu keeps its
+    // buttons and the operator can tap again once idle. (The gateway dispatcher
+    // already enqueues switch taps mid-turn before calling this handler; this is
+    // the belt-and-braces seam for callers that skip it.)
     if (deps.isBusy()) {
       return {
         answer: '⏳ Agent is mid-turn — tap again when it’s idle',
@@ -1219,195 +995,55 @@ export async function handleModelMenuCallback(
         busyRefusal: true,
       }
     }
-    try {
-      await deps.scheduleModelRelaunch(srName, `user: /model ${srName} (session-only relaunch, menu)`)
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
+    return menuRelaunchOutcome(deps, token, label)
+  }
+
+  return { answer: 'Unknown action', reply: await buildModelMenu(deps) }
+}
+
+/**
+ * Shared menu-tap relaunch: schedule the carrier relaunch onto `token` (or the
+ * clear+revert relaunch for the `default` sentinel) and return the deterministic
+ * "relaunching (~30s)" card. Uses the STATIC banner (no discover()) because the
+ * pane is about to restart. No `selectedModel` — the actual running model is
+ * reconciled at boot from `.active-session-model`.
+ */
+async function menuRelaunchOutcome(
+  deps: ModelMenuDeps & ModelCommandDeps,
+  token: string,
+  label: string,
+): Promise<ModelCallbackOutcome> {
+  const isDefault = token.toLowerCase() === 'default'
+  try {
+    if (isDefault) {
+      await deps.scheduleModelDefaultRelaunch('user: /model default (revert relaunch, menu)')
+    } else {
+      await deps.scheduleModelRelaunch(token, `user: /model ${token} (session-only relaunch, menu)`)
+    }
+  } catch (err) {
+    if (isRestartInFlight(err)) {
       return {
-        answer: 'Switch failed',
-        reply: await menuWithBannerStatic(deps, `❌ Switch to **${deps.escapeHtml(friendlyName)}** failed: ${deps.escapeHtml(msg)}`),
+        answer: 'A restart is already in flight (~15s)',
+        reply: await menuWithBannerStatic(
+          deps,
+          `⏳ A restart is already in flight — your switch to **${deps.escapeHtml(label)}** will apply as it completes (~15s).`,
+        ),
       }
     }
+    const msg = err instanceof Error ? err.message : String(err)
     return {
-      answer: `Switching to ${friendlyName} — restarting (~30s)`,
-      reply: await menuWithBannerStatic(
-        deps,
-        `🔄 Switching session to **${deps.escapeHtml(friendlyName)}** — restarting (~30s).\n${PERSIST_NOTE}`,
-      ),
-      selectedModel: srName,
+      answer: 'Switch failed',
+      reply: await menuWithBannerStatic(deps, `❌ Switch to **${deps.escapeHtml(label)}** failed: ${deps.escapeHtml(msg)}`),
     }
   }
-
-  if (!data.startsWith(MODEL_CALLBACK_SELECT)) {
-    return { answer: 'Unknown action', reply: await buildModelMenu(deps) }
-  }
-  // Mid-turn: refuse WITHOUT touching the message. Driving the picker types
-  // into claude's input box, which mid-turn would queue "/model" as user
-  // text. toastOnly keeps the menu (and its buttons) exactly as-is so the
-  // operator just taps again when the agent is idle — no button-less
-  // "try again" line that read as a dead menu.
-  if (deps.isBusy()) {
-    return {
-      answer: '⏳ Agent is mid-turn — tap again when it’s idle',
-      reply: { text: BUSY_REFUSAL_TEXT, html: true },
-      toastOnly: true,
-      busyRefusal: true,
-    }
-  }
-
-  const tag = data.slice(MODEL_CALLBACK_SELECT.length)
-  const discovered = await deps.discover(deps.getAgentName())
-  if (!discovered.ok) {
-    // Keep the menu interactive: re-render (falls back to v1 text if even
-    // the show path can't discover) with the failure as a banner.
-    return {
-      answer: 'Picker unavailable',
-      reply: await menuWithBanner(
-        deps,
-        `❌ Could not open the model picker: ${deps.escapeHtml(discovered.reason)}`,
-      ),
-    }
-  }
-  const target = discovered.options.find((o) => labelTag(o.label) === tag)
-  if (!target) {
-    // Options changed since the menu rendered — never guess; re-render.
-    const fresh = await buildModelMenu(deps)
-    return { answer: 'Model list changed — menu refreshed', reply: fresh }
-  }
-  // NOTE: do NOT short-circuit when target.current is set. The picker's ✔
-  // marks claude's DEFAULT FOR NEW SESSIONS, which is a DIFFERENT axis from
-  // the model the live session is running (set by --model at launch). Tapping
-  // the ✔ row to apply that model to the live session is a legitimate switch
-  // — e.g. an agent launched on Fable tapping "Default (Opus)". Skipping it
-  // here was the "tapped Default, nothing happened" bug. Always drive the
-  // selection; claude harmlessly answers "Kept model as X" if it's already
-  // the session model.
-  const result = await deps.select(deps.getAgentName(), target.label)
-  if (!result.ok) {
-    // Switch failed but the agent is reachable — keep the menu so the
-    // operator can retry, with the reason as a banner.
-    return {
-      answer: 'Switch failed — see the menu',
-      reply: await menuWithBanner(
-        deps,
-        `❌ Switch to **${deps.escapeHtml(target.label)}** failed: ${deps.escapeHtml(result.reason)}`,
-      ),
-    }
-  }
-
-  // "Kept model as X" means the tapped model was ALREADY the session model —
-  // nothing changed. Do NOT overwrite the override (and never store the display
-  // label). Tapping the "Default (recommended)" row on the already-default model
-  // previously stored "Default (recommended)" verbatim into /status.
-  if (isKeptModelConfirmation(result.confirmation)) {
-    return {
-      answer: deps.escapeHtml(result.confirmation),
-      reply: await menuWithBanner(deps, `✅ ${deps.escapeHtml(result.confirmation)}`),
-    }
-  }
-  // Normalize what we store: prefer the model name claude confirmed, else a
-  // canonical token derived from the row label — never a pure display label like
-  // "Default (recommended)". If neither resolves, record nothing rather than lie.
-  const token = canonicalClaudeToken(target.label)
-  const selectedModel = sessionModelFromConfirmation(result.confirmation) ?? token ?? undefined
-  // The "Default (recommended)" row has no derivable token BY DESIGN — a
-  // confirmed switch to it means "back on the configured default", which the
-  // gateway must translate into clearing the sticky override.
-  const clearedDefault = token == null && /^default\b/i.test(target.label.trim())
+  const friendly = isDefault ? 'the configured default' : label
   return {
-    answer: deps.escapeHtml(result.confirmation),
-    reply: await menuWithBanner(deps, `✅ ${deps.escapeHtml(result.confirmation)}`),
-    ...(selectedModel ? { selectedModel } : {}),
-    ...(token ? { selectedModelToken: token } : {}),
-    ...(clearedDefault ? { clearedDefault: true } : {}),
+    answer: `Switching to ${isDefault ? 'default' : label} — relaunching (~30s)`,
+    reply: await menuWithBannerStatic(
+      deps,
+      `🔄 Switching session to **${deps.escapeHtml(friendly)}** — relaunching (~30s).\n${PERSIST_NOTE}`,
+    ),
   }
-}
-
-/**
- * True when the transition from `prevModel` to `nextModel` is a switch FROM
- * an sr-* (LiteLLM/OpenRouter) model BACK TO a native Claude model. This
- * signals that a session restart is required — an in-place model-picker select
- * cannot undo the LiteLLM routing that the sr-* switch established in the live
- * session. Null / undefined prev means no prior sr-* session — not a transition.
- */
-export function isSrToClaudeTransition(
-  prevModel: string | null | undefined,
-  nextModel: string,
-): boolean {
-  return !!prevModel?.startsWith('sr-') && !nextModel.startsWith('sr-')
-}
-
-/**
- * Return the single line of a pane capture that actually reads as claude's
- * model-switch acknowledgement ("Set model to X…", "Switched to X", or
- * "Kept model as X"), or null when no such line is present. Used by the
- * direct `/model <name>` path to decide whether `result.output` carries a
- * genuine confirmation worth relaying, versus mere scrollback that must NOT
- * be echoed back to chat. Mirrors the line-scan already used by the picker
- * alias/sr-* callback paths.
- */
-export function modelSwitchConfirmationLine(output: string): string | null {
-  const line = output
-    .split('\n')
-    .map((l) => l.trim())
-    .find((l) => MODEL_SWITCH_CONFIRMATION_PREFIX.test(l))
-  return line && line.length > 0 ? line : null
-}
-
-/**
- * claude's failure output for a bad `/model <name>` — the CLI rejects an
- * unknown id with "Model not found" / "Invalid model" / "Unknown model".
- * Detecting it lets the typed set path report an HONEST failure instead of
- * falsely claiming "switched (session)". Anchored to LINE START (behind the
- * same optional status glyph + optional "Error:" prefix as
- * MODEL_SWITCH_CONFIRMATION_PREFIX) so ordinary scrollback prose that merely
- * CONTAINS the phrase mid-sentence (e.g. "deploy failed: model not found in
- * registry") can never false-positive a successful switch into a reported
- * failure — the false-FAILURE variant of the scrollback-leak class.
- *
- * Empirically verified against claude v2.1.205 (disposable TUI probe,
- * 2026-07-10): `/model claude-bogus-99` prints
- * `⎿  Model 'claude-bogus-99' not found` — glyph prefix `⎿`, quoted model
- * name between "Model" and "not found". Both shapes are covered.
- *
- * #3242 review MEDIUM 1 — ACCESS/ENTITLEMENT DENIAL. A bad-id shape is not the
- * only failure: `/model fable` on a plan that lacks it prints an availability /
- * access-denial line ("Fable is not available on your plan", "access denied",
- * "requires a subscription", "not enabled for your account", "no access to …").
- * Those match neither the bad-id shapes nor the confirmation prefix, so the poll
- * loop would expire and the optimistic branch would falsely record the switch —
- * exactly the Fable-entitlement case this PR is about. The second alternation
- * group covers those phrasings. It allows up to four leading words (a model
- * name + a linking adverb etc.) BEFORE the denial phrase — unlike the bad-id
- * branches, which keep
- * their original tight line-start anchoring so ordinary scrollback that merely
- * says "model not found" mid-sentence still can't false-fail a silent switch.
- * The handler checks the confirmation line FIRST (below), so a genuine switch —
- * which always prints a confirmation — is never flipped to a failure by a stray
- * availability word in the same region.
- */
-const MODEL_SWITCH_ERROR_RE =
-  /^\s*[⏺●•>⎿-]?\s*(?:Error:\s*)?(?:Model(?:\s+'[^']+')?\s+not found|Invalid model|Unknown model|No such model|(?:[\w'’.\-]+\s+){0,4}(?:(?:is |are )?(?:not available|unavailable|not enabled|not supported)|access denied|requires\b[^\n]{0,40}\b(?:subscription|plan)|no access)\b)/i
-
-/** The single capture line that reads as a claude model-switch error, or null. */
-export function modelSwitchErrorLine(output: string): string | null {
-  const line = output
-    .split('\n')
-    .map((l) => l.trim())
-    .find((l) => MODEL_SWITCH_ERROR_RE.test(l))
-  return line && line.length > 0 ? line : null
-}
-
-/**
- * True when a confirmation line is claude's "Kept model as X" — i.e. the model
- * was ALREADY the session model and nothing changed. The caller must NOT record
- * this as a session-override (there is nothing to override), and must not store
- * a display label in its place. See the menu-select bug where tapping the
- * "Default (recommended)" row on the already-default model stored the display
- * label verbatim into /status.
- */
-export function isKeptModelConfirmation(confirmation: string): boolean {
-  return /^\s*[⏺●•>⎿-]?\s*Kept model as\b/i.test(confirmation.trim())
 }
 
 /**
@@ -1435,43 +1071,6 @@ export function canonicalClaudeToken(label: string): string | null {
  */
 export function isRestartInFlight(err: unknown): boolean {
   return !!err && typeof err === 'object' && (err as { code?: unknown }).code === 'restart_in_flight'
-}
-
-/**
- * claude's real model-switch confirmation always begins the line (optionally
- * behind a status glyph like `⏺` or `⎿` + whitespace) with one of these exact
- * phrasings. Anchoring to the line start keeps ordinary scrollback prose that
- * merely *contains* words like "switched" or "set model" (e.g. "I switched the
- * deploy to blue-green") from false-positiving as a confirmation worth
- * relaying. Shared by `modelSwitchConfirmationLine` (does this line qualify?)
- * and `sessionModelFromConfirmation` (pull the name out).
- *
- * Empirically verified against claude v2.1.205 (disposable TUI probe,
- * 2026-07-10): the arg form `/model opus` is NOT silent — it prints
- * `⎿  Set model to Opus 4.8 and saved as your default for new sessions`.
- * The `⎿` glyph survives the inject capture (isTuiChromeLine doesn't strip
- * it), so it must be in the glyph class or every typed switch would fall
- * through to the "couldn't confirm" branch and never record the override.
- */
-const MODEL_SWITCH_CONFIRMATION_PREFIX =
-  /^\s*[⏺●•>⎿-]?\s*(?:Set model to|Switched to|Kept model as)\b/i
-
-/**
- * Pull the model NAME out of claude's session-switch confirmation so it can
- * be shown in `/status` as the live session model. claude phrases it as
- * "Set model to <name> for this session only" / "Switched to <name>" /
- * (v2.1.205 arg form) "Set model to <name> and saved as your default for new
- * sessions" — the "and saved" tail must terminate the name capture or the
- * whole sentence would be stored as the model. Returns null when the
- * confirmation doesn't carry a recognizable name (the caller falls back to
- * the tapped picker label).
- */
-export function sessionModelFromConfirmation(confirmation: string): string | null {
-  const m = /(?:Set model to|Switched to)\s+(.+?)(?:\s+for (?:this|the) session|\s+and saved\b|\s*\(|\s*$)/i.exec(
-    confirmation.trim(),
-  )
-  const name = m?.[1]?.trim()
-  return name && name.length > 0 ? name : null
 }
 
 /**

@@ -1,10 +1,11 @@
 /**
- * Structural pins for the session-scoped /model wiring in gateway.ts
- * (reference/rfcs/session-model-stickiness.md §0.1, rev 4 — consume-once).
+ * Structural pins for the DETERMINISTIC /model wiring in gateway.ts
+ * (reference/rfcs/session-model-stickiness.md §0.05, rev 5 — every switch
+ * relaunches through the consume-once carrier; the inject/scrape path retired).
  *
  * The behaviour lives in un-exported inline closures (buildModelDeps's
- * scheduleModelRelaunch/scheduleRestart, the typed/menu recorders, and the
- * boot re-hydration block inside the startup IIFE), so — mirroring the other
+ * scheduleModelRelaunch / scheduleModelDefaultRelaunch / scheduleRestart, and
+ * the boot re-hydration block inside the startup IIFE), so — mirroring the other
  * gateway-*.test.ts source-pins — we assert on the source structure. The
  * end-to-end boot behaviour is exercised in tests/scaffold.session-model.test.ts
  * (rendered start.sh), the file helpers in session-model-file.test.ts, and the
@@ -42,7 +43,7 @@ describe('gateway: scheduleModelRelaunch dep (consume-once .session-model carrie
   it('writes the carrier via writeSessionModelFile before dispatching the restart', () => {
     const idx = GATEWAY_SRC.indexOf('scheduleModelRelaunch: async')
     expect(idx).toBeGreaterThan(0)
-    const win = GATEWAY_SRC.slice(idx, idx + 1800)
+    const win = GATEWAY_SRC.slice(idx, idx + 2600)
     const writeIdx = win.indexOf('writeSessionModelFile(')
     const restartIdx = win.indexOf('deps.scheduleRestart(reason)')
     expect(writeIdx).toBeGreaterThan(0)
@@ -51,7 +52,7 @@ describe('gateway: scheduleModelRelaunch dep (consume-once .session-model carrie
 
   it('sets the in-memory session-model override before dispatching the restart', () => {
     const idx = GATEWAY_SRC.indexOf('scheduleModelRelaunch: async')
-    const win = GATEWAY_SRC.slice(idx, idx + 1800)
+    const win = GATEWAY_SRC.slice(idx, idx + 2600)
     const setIdx = win.indexOf('sessionModelSource.setOverride(model)')
     const restartIdx = win.indexOf('deps.scheduleRestart(reason)')
     expect(setIdx).toBeGreaterThan(0)
@@ -60,7 +61,7 @@ describe('gateway: scheduleModelRelaunch dep (consume-once .session-model carrie
 
   it('rolls back the prior carrier content (not just deletion) on a non-in-flight dispatch failure', () => {
     const idx = GATEWAY_SRC.indexOf('scheduleModelRelaunch: async')
-    const win = GATEWAY_SRC.slice(idx, idx + 1800)
+    const win = GATEWAY_SRC.slice(idx, idx + 2600)
     expect(win).toContain('const prevFileRaw = readSessionModelFileRaw(agentDir)')
     expect(win).toContain('restoreSessionModelFileRaw(agentDir, prevFileRaw)')
     expect(win).toContain("!== 'restart_in_flight'")
@@ -68,80 +69,90 @@ describe('gateway: scheduleModelRelaunch dep (consume-once .session-model carrie
 
   it('reuses the same scheduleRestart dispatch (not a bespoke restart path)', () => {
     const idx = GATEWAY_SRC.indexOf('scheduleModelRelaunch: async')
-    const win = GATEWAY_SRC.slice(idx, idx + 1800)
+    const win = GATEWAY_SRC.slice(idx, idx + 2600)
     expect(win).toContain('await deps.scheduleRestart(reason)')
   })
 })
 
-describe('gateway: menu callback carrier handling (session-scoped)', () => {
-  it('a live Claude selection records the in-memory override but writes NO carrier', () => {
-    const idx = GATEWAY_SRC.indexOf('function recordModelMenuSideEffects')
+describe('gateway: the retired scrape-recorders are GONE (rev 5 inversion)', () => {
+  it('recordTypedModelSwitch and recordModelMenuSideEffects no longer exist', () => {
+    // INVERTED from rev 4: these helpers recorded a scrape-derived selectedModel
+    // and drove the sr-to-claude special case. Every switch now relaunches, so
+    // they are deleted — their presence would mean the retired path survived.
+    expect(GATEWAY_SRC).not.toContain('function recordTypedModelSwitch')
+    expect(GATEWAY_SRC).not.toContain('function recordModelMenuSideEffects')
+  })
+
+  it('no isSrToClaudeTransition wiring (every switch relaunches — no distinct transition)', () => {
+    expect(GATEWAY_SRC).not.toContain('isSrToClaudeTransition')
+  })
+
+  it('buildModelDeps wires neither the inject nor the select terminal-driver dep', () => {
+    const idx = GATEWAY_SRC.indexOf('function buildModelDeps')
+    expect(idx).toBeGreaterThan(0)
+    const win = GATEWAY_SRC.slice(idx, idx + 4000)
+    expect(win).not.toContain('inject: injectSlashCommandImpl')
+    expect(win).not.toContain('select: (a, label) => selectModel')
+  })
+})
+
+describe('gateway: scheduleModelDefaultRelaunch (G1 — clear + revert relaunch)', () => {
+  it('clears the carrier + override and mirrors scheduleModelRelaunch rollback', () => {
+    const idx = GATEWAY_SRC.indexOf('scheduleModelDefaultRelaunch: async')
     expect(idx).toBeGreaterThan(0)
     const win = GATEWAY_SRC.slice(idx, idx + 900)
-    // The first (live-switch) block sets the override but no longer persists.
-    expect(win).toContain('sessionModelSource.setOverride(outcome.selectedModel)')
-    const overrideIdx = win.indexOf('sessionModelSource.setOverride(outcome.selectedModel)')
-    const nextClearIdx = win.indexOf('outcome.clearedDefault')
-    const writeBetween = win.slice(overrideIdx, nextClearIdx)
-    expect(writeBetween).not.toContain('writeSessionModelFile(')
-  })
-
-  it('a confirmed "Default" selection CLEARS the carrier', () => {
-    const idx = GATEWAY_SRC.indexOf('function recordModelMenuSideEffects')
-    const win = GATEWAY_SRC.slice(idx, idx + 2400)
-    expect(win).toContain('outcome.clearedDefault')
-    expect(win).toContain('clearSessionModelFile(smDir)')
-  })
-
-  it('the sr-* callback branch calls scheduleModelRelaunch, not inject', () => {
-    const idx = GATEWAY_SRC.indexOf('const srLabel = escapeHtmlForTg(srFriendlyLabel(srName))')
-    expect(idx).toBeGreaterThan(0)
-    const win = GATEWAY_SRC.slice(idx, idx + 1400)
-    expect(win).toContain('modelDeps.scheduleModelRelaunch(srName')
-    expect(win).toMatch(/scheduleModelRelaunch[\s\S]*?\n\s*return\n/)
-  })
-
-  it('the sr-to-claude transition (a relaunch) writes the carrier, and clears it on a Default tap', () => {
-    const idx = GATEWAY_SRC.indexOf('isSrToClaudeTransition(prevSessionModel, outcome.selectedModel)')
-    expect(idx).toBeGreaterThan(0)
-    const win = GATEWAY_SRC.slice(idx, idx + 3600)
-    expect(win).toMatch(/writeSessionModelFile\(\s*agentDir,\s*token/)
-    expect(win).toContain('clearSessionModelFile(agentDir)')
-    expect(win).toContain("triggerSelfRestart(agentName, 'sr-to-claude-model-switch'")
-  })
-})
-
-describe('gateway: typed /model is session-scoped (live Claude switch writes no carrier)', () => {
-  it('the Claude path sets the in-memory override but never persists a carrier', () => {
-    const idx = GATEWAY_SRC.indexOf('function recordTypedModelSwitch')
-    expect(idx).toBeGreaterThan(0)
-    const win = GATEWAY_SRC.slice(idx, idx + 1400)
-    expect(win).toContain('sessionModelSource.setOverride(reply.selectedModel)')
-    // No durable carrier write on the live-switch path.
-    expect(win).not.toContain('writeSessionModelFile(')
-  })
-
-  it('`/model default` clears the carrier + in-memory override (silent-switch path must not resurrect)', () => {
-    const idx = GATEWAY_SRC.indexOf('function recordTypedModelSwitch')
-    const win = GATEWAY_SRC.slice(idx, idx + 1400)
-    expect(win).toContain("requested?.toLowerCase() === 'default'")
-    expect(win).toContain('clearSessionModelFile(smDir)')
-    expect(win).toContain('sessionModelSource.setOverride(null)')
-    // The file-clear is not gated on a positive confirmation.
-    const clearIdx = win.indexOf('if (smDir) clearSessionModelFile(smDir)')
-    const gatedOverrideIdx = win.indexOf('if (reply.selectedModel) sessionModelSource.setOverride(null)')
+    const clearIdx = win.indexOf('clearSessionModelFile(agentDir)')
+    const overrideIdx = win.indexOf('sessionModelSource.setOverride(null)')
+    const restartIdx = win.indexOf('deps.scheduleRestart(reason)')
     expect(clearIdx).toBeGreaterThan(0)
-    expect(gatedOverrideIdx).toBeGreaterThan(clearIdx)
+    expect(overrideIdx).toBeGreaterThan(clearIdx)
+    expect(restartIdx).toBeGreaterThan(overrideIdx)
+    // G1 rollback on a non-in-flight dispatch failure.
+    expect(win).toContain('restoreSessionModelFileRaw(agentDir, prevFileRaw)')
+    expect(win).toContain("!== 'restart_in_flight'")
   })
 })
 
-describe('gateway boot: session-model re-hydration + alert relay', () => {
-  it('re-hydrates the override from .active-session-model', () => {
+describe('gateway: the live callback dispatcher routes every switch tap to the handler', () => {
+  it('calls handleModelMenuCallback and no longer post-processes a scrape outcome', () => {
+    const idx = GATEWAY_SRC.indexOf('const outcome = await handleModelMenuCallback(data, modelDeps)')
+    expect(idx).toBeGreaterThan(0)
+    const win = GATEWAY_SRC.slice(idx, idx + 600)
+    expect(win).not.toContain('recordModelMenuSideEffects')
+  })
+
+  it('the typed dispatcher relays the handler reply directly (no recordTypedModelSwitch)', () => {
+    const idx = GATEWAY_SRC.indexOf('const reply = await handleModelCommand(parsed, deps)')
+    expect(idx).toBeGreaterThan(0)
+    const win = GATEWAY_SRC.slice(idx, idx + 400)
+    expect(win).not.toContain('recordTypedModelSwitch')
+    expect(win).toContain('switchroomReply(ctx, reply.text')
+  })
+})
+
+describe('gateway boot: session-model re-hydration + confirmation + alert relay', () => {
+  it('re-hydrates the override from .active-session-model (launched !== configured)', () => {
     const idx = GATEWAY_SRC.indexOf("join(smAgentDir, '.active-session-model')")
     expect(idx).toBeGreaterThan(0)
-    const win = GATEWAY_SRC.slice(idx - 200, idx + 1400)
-    expect(win).toMatch(/launched\.length > 0 && launched !== configured \? launched : null/)
+    const win = GATEWAY_SRC.slice(idx - 200, idx + 3200)
+    // F1: `launched !== configured` is the deterministic apply-boot signal.
+    expect(win).toContain('const isApplyBoot = launched.length > 0 && launched !== configured')
+    expect(win).toContain('sessionModelSource.setOverride(isApplyBoot ? launched : null)')
     expect(win).toContain('resolveMainModel(raw ?? undefined)')
+  })
+
+  it('logs the applied model for diagnosability (F1)', () => {
+    expect(GATEWAY_SRC).toContain('gw /model relaunch applied agent=')
+    expect(GATEWAY_SRC).toContain('gw /model relaunch scheduled agent=')
+  })
+
+  it('sends ONE switch-confirmation from the ACTUAL launched model, keyed on the apply-boot (F1/G3)', () => {
+    const idx = GATEWAY_SRC.indexOf('const isApplyBoot = launched.length > 0')
+    expect(idx).toBeGreaterThan(0)
+    const win = GATEWAY_SRC.slice(idx, idx + 3200)
+    // Success is asserted only from the real launched value, never optimistically.
+    expect(win).toContain('if (isApplyBoot && modelSwitchMarkerChat)')
+    expect(win).toContain('✅ Now running')
   })
 
   it('consumes the .session-model-alert sentinel, notifies ALL operators, and deletes it', () => {
