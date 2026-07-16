@@ -113,6 +113,64 @@ export function decideSupersede(
   return { supersede: true, deleteMessageIds: [...record.messageIds], reason: 'supersede' }
 }
 
+/**
+ * How the gateway should CORRECT a flushed message once its canonical `reply`
+ * lands. Historically the supersede always did `deleteMessage(A)` + fresh send
+ * of the canonical reply B — visible to the user as a delete+replace flicker
+ * plus a second device ping. When the reply fits a single message and matches
+ * the flushed message's type (both plain text, the normal case), we can instead
+ * edit message A in place with B's content: no delete, no flicker, no re-ping.
+ *
+ *   - `edit-in-place` → the gateway feeds `editMessageId` into the existing
+ *     single-message edit path (the `previewMessageId` edit lane in
+ *     `sendReplyChunks`), which renders the canonical reply with the SAME rich
+ *     path a fresh reply uses and, on any edit 400 (message too old / can't be
+ *     edited / not found), falls back to delete+resend — so correctness never
+ *     regresses. `deleteMessageIds` is empty (message A becomes message B).
+ *   - `delete-resend` → the legacy behaviour: delete every flushed message id,
+ *     then send the canonical reply fresh. Chosen whenever edit-in-place isn't
+ *     safe (multi-part reply, >1 flushed message, a file/voice-only reply, or a
+ *     draft-stream preview already owns the single-message edit lane).
+ */
+export type SupersedeCorrection =
+  | { mode: 'edit-in-place'; editMessageId: number; deleteMessageIds: number[] }
+  | { mode: 'delete-resend'; deleteMessageIds: number[] }
+
+/**
+ * Decide how to correct a superseded flush. Pure so the gateway runs the exact
+ * branch the regression tests exercise. Edit-in-place is chosen IFF the flush
+ * posted exactly ONE message AND the canonical reply is a single plain-text
+ * message with no competing edit target:
+ *   - `flushMessageIds.length === 1` — a multi-message flush has no single
+ *     edit target; delete all and resend.
+ *   - `chunkCount === 1` — a multi-part reply can't collapse into one edit.
+ *   - `!hasFiles` — a file/album reply is not a plain-text edit.
+ *   - `!suppressText` — a voice-only reply sends no text body to edit into.
+ *   - `!hasOpenPreview` — a live draft-stream preview already owns the
+ *     single-message edit lane; deleting the flush and letting the preview edit
+ *     keeps exactly one message.
+ * `literalText` (`format:'text'`) stays eligible — it is still a text message,
+ * and the edit lane renders literal vs rich identically to a fresh send.
+ */
+export function decideSupersedeCorrection(input: {
+  flushMessageIds: number[]
+  chunkCount: number
+  hasFiles: boolean
+  suppressText: boolean
+  hasOpenPreview: boolean
+}): SupersedeCorrection {
+  const eligible =
+    input.flushMessageIds.length === 1 &&
+    input.chunkCount === 1 &&
+    !input.hasFiles &&
+    !input.suppressText &&
+    !input.hasOpenPreview
+  if (eligible) {
+    return { mode: 'edit-in-place', editMessageId: input.flushMessageIds[0]!, deleteMessageIds: [] }
+  }
+  return { mode: 'delete-resend', deleteMessageIds: [...input.flushMessageIds] }
+}
+
 /** Sentinel key for records whose flush carried no turnId nonce. */
 const NULL_TURN_KEY = '<<null-turn>>'
 
