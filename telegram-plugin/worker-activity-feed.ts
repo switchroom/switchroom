@@ -239,6 +239,21 @@ export interface WorkerActivityFeedOpts {
    */
   minEditIntervalMs?: number
   /**
+   * Coarse cadence (ms) for elapsed-ONLY refreshes. When the only thing that
+   * changed since the last edit is the volatile elapsed clock (no new step, no
+   * state/toolCount/token change), the card is NOT re-edited until this much
+   * time has passed — so a worker sitting in one long tool call advances its
+   * clock only every ~`elapsedRefreshMs`, not every jsonl tick. This is the
+   * primary defense against the sustained same-message edit stream that earns a
+   * Telegram flood ban (finn incident: 26,460 clock-only edits → ~88min 429).
+   * A SUBSTANTIVE change (new narrative step, done/failed, toolCount/token
+   * delta) still renders promptly under `minEditIntervalMs`. Default 15000ms.
+   * The terminal finish edit and forced edits bypass it. Liveness for a truly
+   * silent worker is already carried by the typing loop, so a slow clock is not
+   * a liveness regression.
+   */
+  elapsedRefreshMs?: number
+  /**
    * A worker must have been running at least this long before its first
    * message is posted. Sub-second / trivial workers never surface a live
    * message — their result still reaches the user via the handback
@@ -467,6 +482,14 @@ interface FeedGroup {
    */
   messageCreatedAtMs: number
   lastBody: string | null
+  /**
+   * Substance signature of the last EDITED body — every rendered field EXCEPT
+   * the volatile elapsed clock (and heartbeat live suffix). Used to distinguish
+   * an elapsed-only change (paced to `elapsedRefreshMs`) from a real update
+   * (new step / state / toolCount / tokens, rendered promptly). Null until the
+   * group's first paint. See {@link groupSubstanceKey}.
+   */
+  lastSubstanceKey: string | null
   lastEditAt: number
   cooldownUntil: number
   /** Single serialization chain for the shared message — ticks can't interleave sends. */
@@ -647,6 +670,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
   const nowFn = opts.now ?? Date.now
   const floodWaitRemainingMs = opts.floodWaitRemainingMs ?? (() => 0)
   const minEditInterval = opts.minEditIntervalMs ?? 2500
+  const elapsedRefreshMs = Math.max(minEditInterval, Math.floor(opts.elapsedRefreshMs ?? 15000))
   const firstPaintMin = opts.firstPaintMinMs ?? 8000
   const heartbeatTickMs = opts.heartbeatTickMs ?? 6000
   const maxRows = Math.max(1, Math.floor(opts.maxRows ?? 8))
@@ -820,6 +844,47 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
     return renderCombinedWorkerFeed(rows, { maxRows })
   }
 
+  /**
+   * Substance signature of a group's render at `now` — a stable string of every
+   * field that renders EXCEPT the volatile elapsed clock (and the heartbeat
+   * live suffix, which is elapsed-derived). Two renders with the same substance
+   * key differ only in their clock; an edit between them advances nothing the
+   * user cares about and is exactly the churn that accumulates into a flood ban.
+   *
+   * Built from the group data (not by string-stripping the rendered body) so it
+   * is deterministic and robust to render-format changes: description, state,
+   * toolCount, totalTokens, and the full narrative trail per running row (or the
+   * terminal recap's state/result/narrative when finalizing).
+   */
+  function groupSubstanceKey(g: FeedGroup, terminalRecap: WorkerActivityView | null): string {
+    if (terminalRecap != null) {
+      return [
+        'T',
+        terminalRecap.state,
+        terminalRecap.description,
+        terminalRecap.toolCount,
+        terminalRecap.totalTokens ?? '',
+        terminalRecap.latestSummary,
+        ...(terminalRecap.narrativeLines ?? []),
+      ].join('')
+    }
+    const running = runningRows(g)
+    if (running.length === 0) return 'EMPTY'
+    return running
+      .map((r) => {
+        const v = r.lastView as WorkerActivityView
+        return [
+          r.agentId,
+          v.state,
+          v.description,
+          v.toolCount,
+          v.totalTokens ?? '',
+          ...r.narrative,
+        ].join('')
+      })
+      .join('')
+  }
+
   /** Remove a worker's row + index entry; delete the group if it is now empty. */
   function removeWorker(g: FeedGroup, agentId: string): void {
     g.workers.delete(agentId)
@@ -926,6 +991,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
     }
 
     const body = renderGroupBody(g, now, opts2.terminalRecap ?? null, opts2.heartbeat ?? false)
+    const substanceKey = groupSubstanceKey(g, opts2.terminalRecap ?? null)
     if (body == null) {
       // Nothing to show. On a terminal finalize the row is already dropped;
       // clear the staged repaint (the handback carries the result).
@@ -961,6 +1027,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
         // group-message lifetime cap measures the message's true absolute age.
         g.messageCreatedAtMs = now
         g.lastBody = body
+        g.lastSubstanceKey = substanceKey
         g.lastEditAt = now
         // A fresh message is a live running paint, never a terminal recap.
         g.terminalPainted = false
@@ -982,7 +1049,19 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       if (isTerminal) clearStaged()
       return
     }
-    if (!opts2.force && now - g.lastEditAt < minEditInterval) return
+    if (!opts2.force && !isTerminal) {
+      // Spacing floor: never edit the same message faster than the 429 floor.
+      if (now - g.lastEditAt < minEditInterval) return
+      // Elapsed-only pacing (flood-ban defense): if the SUBSTANCE is unchanged
+      // since the last edit — the body differs only because the clock advanced —
+      // hold the edit until the coarse `elapsedRefreshMs` cadence. A real change
+      // (new step / state / toolCount / tokens) shifts `substanceKey` and falls
+      // through immediately (subject only to the spacing floor above). This is
+      // what collapses the sustained ~0.33/s clock-only edit stream that
+      // accumulates into Telegram's per-message flood counter.
+      const substanceChanged = substanceKey !== g.lastSubstanceKey
+      if (!substanceChanged && now - g.lastEditAt < elapsedRefreshMs) return
+    }
 
     try {
       const res = await opts.bot.editMessageText(g.chatId, g.messageId, body, sendOptsFor(g))
@@ -996,6 +1075,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
         return
       }
       g.lastBody = body
+      g.lastSubstanceKey = substanceKey
       g.lastEditAt = now
       if (isTerminal) {
         log(
@@ -1029,6 +1109,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       }
       if (outcome === 'not_modified') {
         g.lastBody = body
+        g.lastSubstanceKey = substanceKey
         g.lastEditAt = now
         if (isTerminal) clearStaged()
         return
@@ -1040,6 +1121,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
         g.messageId = null
         g.messageCreatedAtMs = 0
         g.lastBody = null
+        g.lastSubstanceKey = null
         // The pinned message no longer exists → release the group pin claim
         // (clearStaged already re-syncs on the terminal path).
         if (isTerminal) clearStaged()
@@ -1242,6 +1324,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
         g.messageId = null
         g.messageCreatedAtMs = 0
         g.lastBody = null
+        g.lastSubstanceKey = null
         // Clear the (possibly stale) pin claim for the retired message; the
         // fresh first-paint below re-pins the new one from a null claim.
         syncPin(g)
@@ -1322,6 +1405,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
           messageId: null,
           messageCreatedAtMs: 0,
           lastBody: null,
+          lastSubstanceKey: null,
           lastEditAt: 0,
           cooldownUntil: 0,
           chain: Promise.resolve(),
@@ -1342,6 +1426,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
         g.messageId = null
         g.messageCreatedAtMs = 0
         g.lastBody = null
+        g.lastSubstanceKey = null
         g.pendingFinalize.clear()
         g.terminalPainted = false
         // The stale terminal message is no longer this group's pinned surface.
