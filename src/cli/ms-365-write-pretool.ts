@@ -49,6 +49,20 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 
+import {
+  loadMicrosoftFromAuthBroker,
+  fetchCalendarEventContext,
+  type Ms365AccessHandle,
+  type CalendarEventContext,
+} from "../ms365/graph-resolve.js";
+import {
+  readLedger,
+  recordOutcome,
+  evaluateBatchAdmission,
+  countCurrentBatchApplied,
+  buildBatchAbortReason,
+} from "../ms365/batch-ledger.js";
+
 // ────────────────────────────────────────────────────────────────────────
 // Configuration
 // ────────────────────────────────────────────────────────────────────────
@@ -317,6 +331,218 @@ export interface Ms365PreviewExtract {
   sizeBytesAfter?: number;
 }
 
+/** A single before→after change surfaced on the card. */
+export interface Ms365Change {
+  field: string;
+  before?: string;
+  after?: string;
+}
+
+/**
+ * Enrichment produced by resolving a calendar event's opaque Graph id into
+ * human-readable context. All fields optional — a failed/partial resolve
+ * simply omits what it couldn't fetch.
+ */
+export interface Ms365CalendarEnrichment {
+  /** Resolved event subject (overrides the payload-scraped display name). */
+  itemDisplayName?: string;
+  /** "start → end" human string for the card's `When:` line. */
+  eventWhen?: string;
+  /** Authenticated Microsoft account email (from the broker identity). */
+  accountEmail?: string;
+  /** Structural before→after diff for the fields the mutation changes. */
+  changes?: Ms365Change[];
+  /**
+   * True when we attempted Graph resolution but it failed (broker/network) —
+   * lets the caller mark the account as "(unresolved)" rather than
+   * "(unknown)" so the operator can tell "couldn't reach Graph" from
+   * "never tried".
+   */
+  resolveAttemptedButFailed?: boolean;
+}
+
+/**
+ * Is this a calendar-EVENT tool whose opaque id is worth resolving to a
+ * subject + start/end via Graph? (Calendar/permission tools that don't act on
+ * a single event id are excluded — nothing to resolve.)
+ */
+export function isCalendarEventTool(toolName: string): boolean {
+  if (!toolName.startsWith(TOOL_PREFIX)) return false;
+  const bare = toolName.slice(TOOL_PREFIX.length);
+  return bare.includes("calendar-event");
+}
+
+/**
+ * Extract the calendar event id from a tool_input. softeria uses `eventId`
+ * (and, for specific-calendar variants, still `eventId`); we also accept `id`.
+ */
+export function extractEventId(toolInput: unknown): string | null {
+  const o =
+    toolInput && typeof toolInput === "object"
+      ? (toolInput as Record<string, unknown>)
+      : {};
+  for (const k of ["eventId", "id", "event_id"]) {
+    if (typeof o[k] === "string" && (o[k] as string).length > 0) {
+      return o[k] as string;
+    }
+  }
+  return null;
+}
+
+/** Normalise a possibly-HTML/object body field to a short plain-text string. */
+function bodyToText(v: unknown): string | undefined {
+  if (typeof v === "string") {
+    return v.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim() || undefined;
+  }
+  if (v && typeof v === "object") {
+    const content = (v as { content?: unknown }).content;
+    if (typeof content === "string") return bodyToText(content);
+  }
+  return undefined;
+}
+
+function dateTimeField(v: unknown): string | undefined {
+  if (typeof v === "string" && v.length > 0) return v;
+  if (v && typeof v === "object") {
+    const dt = (v as { dateTime?: unknown }).dateTime;
+    if (typeof dt === "string" && dt.length > 0) return dt;
+  }
+  return undefined;
+}
+
+function locationField(v: unknown): string | undefined {
+  if (typeof v === "string" && v.length > 0) return v;
+  if (v && typeof v === "object") {
+    const dn = (v as { displayName?: unknown }).displayName;
+    if (typeof dn === "string" && dn.length > 0) return dn;
+  }
+  return undefined;
+}
+
+function shorten(s: string, n = 120): string {
+  // Collapse control whitespace so Graph-sourced values (subject/location/body)
+  // can't smuggle newlines into the plain-text card as fake labelled lines
+  // (#3267 review Finding 2). Defence in depth — the card renderer's truncate()
+  // sanitises again at render time.
+  const oneLine = s.replace(/[\r\n\t]+/g, " ").trim();
+  return oneLine.length <= n ? oneLine : oneLine.slice(0, n - 1) + "…";
+}
+
+/**
+ * Build the structural before→after diff for a calendar update by comparing
+ * the mutation `tool_input` (the "after" — only changed fields present) against
+ * the event's current Graph state (the "before"). Pure.
+ */
+export function buildCalendarChanges(
+  toolInput: unknown,
+  current: CalendarEventContext | null,
+): Ms365Change[] {
+  const o =
+    toolInput && typeof toolInput === "object"
+      ? (toolInput as Record<string, unknown>)
+      : {};
+  const changes: Ms365Change[] = [];
+
+  const pushIfChanged = (field: string, before?: string, after?: string) => {
+    if (after === undefined) return;
+    if (before !== undefined && before === after) return;
+    changes.push({
+      field,
+      before: before !== undefined ? shorten(before) : undefined,
+      after: shorten(after),
+    });
+  };
+
+  if ("subject" in o || "title" in o) {
+    const after =
+      typeof o.subject === "string"
+        ? o.subject
+        : typeof o.title === "string"
+          ? o.title
+          : undefined;
+    pushIfChanged("subject", current?.subject, after);
+  }
+  if ("start" in o) {
+    pushIfChanged("start", current?.start, dateTimeField(o.start));
+  }
+  if ("end" in o) {
+    pushIfChanged("end", current?.end, dateTimeField(o.end));
+  }
+  if ("location" in o) {
+    pushIfChanged("location", current?.location, locationField(o.location));
+  }
+  if ("body" in o || "bodyPreview" in o) {
+    const after = bodyToText(o.body ?? o.bodyPreview);
+    pushIfChanged("body", current?.bodyPreview, after);
+  }
+  return changes;
+}
+
+export interface EnrichCalendarDeps {
+  loadHandle?: () => Promise<Ms365AccessHandle | null>;
+  fetchEvent?: (args: {
+    accessToken: string;
+    eventId: string;
+  }) => Promise<CalendarEventContext | null>;
+}
+
+/**
+ * Resolve a calendar event's opaque Graph id into human-readable card context
+ * (subject, when, account) and a before→after diff. Best-effort and fail-soft:
+ * NEVER throws — on any failure returns `{ resolveAttemptedButFailed: true }`
+ * (or partial context) so the hook falls back cleanly without blocking.
+ */
+export async function enrichCalendarPreview(
+  toolName: string,
+  toolInput: unknown,
+  deps: EnrichCalendarDeps = {},
+): Promise<Ms365CalendarEnrichment> {
+  if (!isCalendarEventTool(toolName)) return {};
+  const loadHandle = deps.loadHandle ?? (() => loadMicrosoftFromAuthBroker());
+  const fetchEvent =
+    deps.fetchEvent ??
+    ((a: { accessToken: string; eventId: string }) =>
+      fetchCalendarEventContext(a));
+
+  let handle: Ms365AccessHandle | null;
+  try {
+    handle = await loadHandle();
+  } catch {
+    return { resolveAttemptedButFailed: true };
+  }
+  if (!handle) return { resolveAttemptedButFailed: true };
+
+  const out: Ms365CalendarEnrichment = {};
+  if (handle.account_email) out.accountEmail = handle.account_email;
+
+  const eventId = extractEventId(toolInput);
+  let current: CalendarEventContext | null = null;
+  if (eventId) {
+    try {
+      current = await fetchEvent({
+        accessToken: handle.access_token,
+        eventId,
+      });
+    } catch {
+      current = null;
+    }
+  }
+
+  if (current?.subject) out.itemDisplayName = current.subject;
+  if (current?.start || current?.end) {
+    out.eventWhen = `${current.start ?? "?"} → ${current.end ?? "?"}`;
+  }
+
+  const changes = buildCalendarChanges(toolInput, current);
+  if (changes.length > 0) out.changes = changes;
+
+  // Resolution "succeeded" if we got an account or any event context. If we
+  // got a token but Graph gave us nothing (deleted event, permission gap),
+  // mark it as attempted-but-failed for the account marker.
+  if (!out.accountEmail && !current) out.resolveAttemptedButFailed = true;
+  return out;
+}
+
 /**
  * Best-effort extract the preview-shape fields from softeria's
  * tool_input. softeria's exact param names vary per tool — we look for
@@ -555,17 +781,54 @@ async function main(): Promise<void> {
     fail("SWITCHROOM_AGENT_NAME unset — cannot identify agent to gate write");
   }
 
-  const accountEmail = process.env.SWITCHROOM_MICROSOFT_ACCOUNT ?? "(unknown)";
-
   const extract = extractMs365Preview(toolName, input.tool_input);
+
+  // ── Problem 2: batch admission ──────────────────────────────────────────
+  // If an earlier op in this same recent batch already lapsed/aborted, refuse
+  // the remaining ops UP FRONT (before posting a card or mutating) with a
+  // distinct "grant lapsed, N applied — stop and reconcile" signal, instead of
+  // dribbling further partial application + re-prompts. Fail-soft: a
+  // missing/corrupt ledger admits the op (a first write is never blocked by
+  // this).
+  const now = Date.now();
+  const admission = evaluateBatchAdmission({
+    entries: readLedger(now).entries,
+    now,
+  });
+  if (!admission.admit) {
+    fail(buildBatchAbortReason(admission.appliedInBatch));
+  }
+
+  // ── Problem 1: resolve opaque Graph id → human-readable card context ─────
+  // For calendar-event tools, resolve the event's subject + start/end and the
+  // authenticated account from Graph BEFORE rendering the card, rather than
+  // scraping the mutation payload (which omits unchanged fields). Best-effort
+  // and fail-soft — enrichCalendarPreview never throws.
+  let enrichment: Ms365CalendarEnrichment = {};
+  try {
+    enrichment = await enrichCalendarPreview(toolName, input.tool_input);
+  } catch {
+    enrichment = { resolveAttemptedButFailed: true };
+  }
+
+  const accountEmail =
+    enrichment.accountEmail ??
+    process.env.SWITCHROOM_MICROSOFT_ACCOUNT ??
+    (enrichment.resolveAttemptedButFailed ? "(unresolved)" : "(unknown)");
+
+  const itemDisplayName =
+    enrichment.itemDisplayName ?? extract.itemDisplayName;
+
   const preview = {
     agentName,
     toolName,
     itemId: extract.itemId,
-    itemDisplayName: extract.itemDisplayName,
+    itemDisplayName,
     accountEmail,
     deepLink: extract.deepLink,
     sizeBytesAfter: extract.sizeBytesAfter,
+    eventWhen: enrichment.eventWhen,
+    changes: enrichment.changes,
     // No agentRationale yet — softeria doesn't pass one, and we
     // don't have a sidecar channel for the agent to supply it.
   };
@@ -605,14 +868,42 @@ async function main(): Promise<void> {
   // so no Approve ever stuck. Mirror the working Drive pretool and pass the
   // loaded allowFrom.
   const approverSet = loadAllowFrom();
+  const ledgerEntry = { tool: toolName, itemId: extract.itemId };
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, KERNEL_POLL_INTERVAL_MS));
     const lookup = await approvalLookupByRequest(agentName, requestId, approverSet);
     if (!lookup) continue;
     const state = lookup.state;
-    if (state === "granted") allow();
-    if (state === "denied" || state === "drift_revoked" || state === "expired") {
+    if (state === "granted") {
+      // Record the applied write so a later op that lapses can report an
+      // accurate "N of the batch already applied" count.
+      recordOutcome(Date.now(), { ...ledgerEntry, outcome: "applied" });
+      allow();
+    }
+    if (state === "expired" || state === "drift_revoked") {
+      // Grant lapsed (TTL elapsed / approver drift) — NOT an intentional deny.
+      // If earlier ops in THIS batch already applied, this is the mid-batch
+      // partial-application case (#3267 Problem 2): mark the batch aborted so
+      // the REMAINING identical ops are refused up front, and give the agent a
+      // distinct "N of the batch applied — stop and reconcile" signal. A lone
+      // lapse with nothing applied in this batch (or only unrelated earlier
+      // writes) is just a timeout — don't suppress.
+      const t = Date.now();
+      const applied = countCurrentBatchApplied(readLedger(t).entries, t);
+      if (applied > 0) {
+        recordOutcome(t, {
+          ...ledgerEntry,
+          outcome: "aborted",
+          appliedInBatch: applied,
+        });
+        fail(buildBatchAbortReason(applied));
+      }
       fail(`operator ${state}`);
+    }
+    if (state === "denied") {
+      // An explicit Deny is a deliberate per-op decision — it must NOT suppress
+      // later, unrelated writes, so we don't write a batch-abort entry here.
+      fail("operator denied");
     }
   }
   fail("approval timed out");

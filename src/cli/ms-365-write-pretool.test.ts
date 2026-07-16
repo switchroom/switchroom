@@ -26,6 +26,10 @@ import {
   GATED_MS365_WRITE_TOOLS,
   KNOWN_SAFE_MS365_READ_TOOLS,
   isGatedMs365Tool,
+  isCalendarEventTool,
+  extractEventId,
+  buildCalendarChanges,
+  enrichCalendarPreview,
   loadAllowFrom,
 } from "./ms-365-write-pretool.js";
 
@@ -292,5 +296,128 @@ describe("extractMs365Preview", () => {
     expect(extractMs365Preview("x", null).itemId).toBe("(new)");
     expect(extractMs365Preview("x", "not-an-object").itemId).toBe("(new)");
     expect(extractMs365Preview("x", undefined).itemDisplayName).toBe("(unknown)");
+  });
+});
+
+// ── #3267 Problem 1: Graph-resolved calendar context + diff ────────────────
+
+describe("isCalendarEventTool / extractEventId", () => {
+  it("detects calendar-event tools", () => {
+    expect(isCalendarEventTool("mcp__ms-365__update-calendar-event")).toBe(true);
+    expect(isCalendarEventTool("mcp__ms-365__create-specific-calendar-event")).toBe(true);
+    expect(isCalendarEventTool("mcp__ms-365__cancel-calendar-event")).toBe(true);
+  });
+  it("does not flag non-event calendar / mail / drive tools", () => {
+    expect(isCalendarEventTool("mcp__ms-365__create-calendar")).toBe(false);
+    expect(isCalendarEventTool("mcp__ms-365__update-mail-message")).toBe(false);
+    expect(isCalendarEventTool("mcp__ms-365__upload-file-content")).toBe(false);
+    expect(isCalendarEventTool("Edit")).toBe(false);
+  });
+  it("extracts the event id from common shapes", () => {
+    expect(extractEventId({ eventId: "AQ==" })).toBe("AQ==");
+    expect(extractEventId({ id: "xyz" })).toBe("xyz");
+    expect(extractEventId({})).toBeNull();
+    expect(extractEventId(null)).toBeNull();
+  });
+});
+
+describe("buildCalendarChanges", () => {
+  const current = {
+    subject: "Standup",
+    start: "2026-07-20T09:00:00",
+    end: "2026-07-20T09:30:00",
+    location: "Room A",
+    bodyPreview: "old notes",
+  };
+
+  it("diffs only the fields the mutation actually changes (body-only edit)", () => {
+    const changes = buildCalendarChanges(
+      { eventId: "AQ==", body: { contentType: "HTML", content: "<p>new notes</p>" } },
+      current,
+    );
+    expect(changes).toEqual([
+      { field: "body", before: "old notes", after: "new notes" },
+    ]);
+  });
+
+  it("emits before→after for a location change", () => {
+    const changes = buildCalendarChanges({ location: "Room B" }, current);
+    expect(changes).toEqual([{ field: "location", before: "Room A", after: "Room B" }]);
+  });
+
+  it("skips no-op changes where after === before", () => {
+    expect(buildCalendarChanges({ location: "Room A" }, current)).toEqual([]);
+  });
+
+  it("works with no current context (before undefined)", () => {
+    const changes = buildCalendarChanges({ start: { dateTime: "2026-07-20T10:00:00" } }, null);
+    expect(changes).toEqual([{ field: "start", after: "2026-07-20T10:00:00" }]);
+  });
+});
+
+describe("enrichCalendarPreview — resolves subject + account for a body-only edit", () => {
+  it("returns a real subject + account instead of '(unknown)' when Graph resolves", async () => {
+    const enrichment = await enrichCalendarPreview(
+      "mcp__ms-365__update-calendar-event",
+      { eventId: "AQMkADAw==", body: { content: "<p>new</p>" } },
+      {
+        loadHandle: async () => ({
+          access_token: "at-1",
+          expires_at: Date.now() + 3_600_000,
+          account_email: "ken@example.com",
+        }),
+        fetchEvent: async () => ({
+          subject: "Dentist appointment",
+          start: "2026-07-20T09:00:00",
+          end: "2026-07-20T09:30:00",
+          bodyPreview: "old",
+        }),
+      },
+    );
+    // The exact bug: a body-only edit used to fall through to "(unknown)".
+    expect(enrichment.itemDisplayName).toBe("Dentist appointment");
+    expect(enrichment.accountEmail).toBe("ken@example.com");
+    expect(enrichment.eventWhen).toBe("2026-07-20T09:00:00 → 2026-07-20T09:30:00");
+    expect(enrichment.changes).toEqual([{ field: "body", before: "old", after: "new" }]);
+    expect(enrichment.resolveAttemptedButFailed).toBeUndefined();
+  });
+
+  it("is a no-op for non-calendar tools", async () => {
+    const e = await enrichCalendarPreview("mcp__ms-365__upload-file-content", {}, {
+      loadHandle: async () => {
+        throw new Error("should not be called");
+      },
+    });
+    expect(e).toEqual({});
+  });
+
+  it("degrades to resolveAttemptedButFailed when the broker is unreachable (never throws)", async () => {
+    const e = await enrichCalendarPreview(
+      "mcp__ms-365__update-calendar-event",
+      { eventId: "AQ==" },
+      { loadHandle: async () => null },
+    );
+    expect(e.resolveAttemptedButFailed).toBe(true);
+    expect(e.itemDisplayName).toBeUndefined();
+  });
+
+  it("does not throw when the Graph fetch itself rejects", async () => {
+    const e = await enrichCalendarPreview(
+      "mcp__ms-365__update-calendar-event",
+      { eventId: "AQ==", location: "New" },
+      {
+        loadHandle: async () => ({
+          access_token: "at",
+          expires_at: Date.now() + 3_600_000,
+          account_email: "ken@example.com",
+        }),
+        fetchEvent: async () => {
+          throw new Error("network");
+        },
+      },
+    );
+    // Still resolves the account (from the token identity) and the after-value.
+    expect(e.accountEmail).toBe("ken@example.com");
+    expect(e.changes).toEqual([{ field: "location", after: "New" }]);
   });
 });
