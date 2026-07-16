@@ -135,8 +135,14 @@ $RECALL_TEXT"
 fi
 
 # ── Source 3: Today's daily memory ─────────────────────────────────────────────
+# Resolve "today" in the agent's LOCAL time — NOT the process default (UTC on
+# most hosts/CI). TODAY keys the daily-memory lookup (memory/${TODAY}.md); using
+# UTC here would look up the wrong day's file during the window where the local
+# date is ahead of/behind UTC, silently dropping today's memory. Same
+# SWITCHROOM_TIMEZONE → TZ → UTC cascade the restart-timestamp render below uses.
+_TZ_VAL="${SWITCHROOM_TIMEZONE:-${TZ:-UTC}}"
 DAILY_SECTION=""
-TODAY=$(date +%Y-%m-%d 2>/dev/null || true)
+TODAY=$(TZ="$_TZ_VAL" date +%Y-%m-%d 2>/dev/null || date +%Y-%m-%d 2>/dev/null || true)
 if [ -n "$TODAY" ] && [ -n "$WORKSPACE_DIR" ]; then
   DAILY_FILE="$WORKSPACE_DIR/memory/${TODAY}.md"
   if [ -f "$DAILY_FILE" ] && [ -s "$DAILY_FILE" ]; then
@@ -156,7 +162,7 @@ fi
 # UTC "now" (the whole point of the deterministic-local-time work). Same
 # SWITCHROOM_TIMEZONE → TZ → UTC cascade and `%A %Y-%m-%d %I:%M %p %Z` am/pm
 # format the UserPromptSubmit local-time hook (bin/timezone-hook.sh) uses.
-_TZ_VAL="${SWITCHROOM_TIMEZONE:-${TZ:-UTC}}"
+# (_TZ_VAL is computed once above, in the daily-memory section.)
 TIMESTAMP=$(TZ="$_TZ_VAL" date '+%A %Y-%m-%d %I:%M %p %Z' 2>/dev/null || date '+%A %Y-%m-%d %I:%M %p %Z')
 
 # Determine restart reason if available
