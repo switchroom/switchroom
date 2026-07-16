@@ -37,9 +37,16 @@
   `litellm-local`) instead of `auth`. Per Ken's deterministic error-surfacing
   policy, operator-actionable faults (credential / credit / proxy-misconfig) are
   now delivered to the OPERATOR chat ONLY; other allowlist users get, at most, a
-  brief diagnosis-free "couldn't complete — it's on our side" notice. The
+  brief diagnosis-free "couldn't complete — it's on our side" notice. The user
+  notice is gated on the TURN OUTCOME, not the error line: it is deferred to the
+  turn-end funnel and dropped when the turn still delivered a reply (a fallback
+  401 followed by a successful retry produces NO false failure notice), sent
+  only when the turn ends reply-less, and silently expired if no turn end
+  resolves it (bias to silence). The misconfig detection requires the definitive
+  "x-api-key header is required" marker or the fallback + x-api-key structural
+  pair — an ambiguous proxy envelope keeps the credentials diagnosis. The
   operator (allowlist head, including their own DM in a DM agent) always keeps
-  the full card. LiteLLM config itself is fixed separately on the host.
+  the full immediate card. LiteLLM config itself is fixed separately on the host.
 - **Telegram `/logs` works again** (#3283) — the gateway passed `--lines`
   to `switchroom agent logs`, which didn't accept the flag; it now exists
   (`-n, --lines <count>`). Behavior change for direct CLI users:

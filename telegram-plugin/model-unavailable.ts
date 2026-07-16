@@ -220,8 +220,18 @@ export function isLitellmProxyLocal429(text: string): boolean {
  * Detection (deterministic wording, mirrors `isLitellmProxyLocal429`):
  *   - the definitive "x-api-key header is required" marker (impossible for our
  *     OAuth flow — only the keyless-proxy path emits it), OR
- *   - an `authentication_error` CO-OCCURRING with LiteLLM-proxy / fallback
- *     provenance markers (the proxy wraps the upstream 401 as it re-dispatches).
+ *   - an `authentication_error` CO-OCCURRING with the proxy-FALLBACK-specific
+ *     structural pair: "fallback" re-dispatch provenance AND an explicit
+ *     "x-api-key" mention.
+ *
+ * PRECISION over recall (#3293 review finding 2): an earlier draft matched any
+ * `authentication_error` + (litellm|proxy) + (fallback|x-api-key|api_key) —
+ * broad enough that a GENUINE OAuth expiry wrapped in a proxy envelope that
+ * merely mentions "api_key" would misdiagnose as proxy-misconfig (still
+ * operator-visible, but the recommendation would point at the proxy config
+ * instead of a re-auth). Both classes route operator-only now, so an ambiguous
+ * envelope deliberately KEEPS the credentials-invalid/-expired diagnosis;
+ * only the unambiguous keyless-fallback signature classifies as misconfig.
  * Never throws on weird input.
  */
 export function isLitellmProxyAuthMisconfig(text: string): boolean {
@@ -230,16 +240,14 @@ export function isLitellmProxyAuthMisconfig(text: string): boolean {
   const lower = sample.toLowerCase()
   // Definitive marker — see provenance above.
   if (lower.includes('x-api-key header is required')) return true
-  // Structural co-occurrence: an authentication_error wrapped by the local
-  // proxy's fallback re-dispatch. Keyed tightly so a genuine Anthropic OAuth
-  // expiry (which never mentions the proxy or an x-api-key) is NOT down-classified.
+  // Structural signature: an authentication_error carrying BOTH the fallback
+  // re-dispatch provenance AND an explicit x-api-key mention. A proxy envelope
+  // that merely mentions litellm/proxy/api_key stays on the credentials
+  // diagnosis (ambiguous → not misconfig).
   const isAuthErr =
     lower.includes('authentication_error') || lower.includes('authenticationerror')
   if (!isAuthErr) return false
-  return (
-    (lower.includes('litellm') || lower.includes('proxy')) &&
-    (lower.includes('fallback') || lower.includes('x-api-key') || lower.includes('api_key'))
-  )
+  return lower.includes('fallback') && lower.includes('x-api-key')
 }
 
 /**

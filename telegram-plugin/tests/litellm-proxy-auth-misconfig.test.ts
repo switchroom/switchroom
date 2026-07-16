@@ -34,6 +34,11 @@ import {
 } from '../operator-events.js'
 import { isLitellmProxyAuthMisconfig } from '../model-unavailable.js'
 import { parseLlmError, renderLlmError } from '../llm-error-present.js'
+import {
+  PendingUserNoticeGate,
+  PENDING_USER_NOTICE_TTL_MS,
+  type PendingUserNotice,
+} from '../pending-user-notice.js'
 
 // The verbatim shape Anthropic returns to the header-less proxy fallback.
 const PROXY_401_MESSAGE =
@@ -56,10 +61,10 @@ describe('isLitellmProxyAuthMisconfig', () => {
     expect(isLitellmProxyAuthMisconfig('x-api-key header is required')).toBe(true)
   })
 
-  it('detects an authentication_error co-occurring with proxy/fallback provenance', () => {
+  it('detects an authentication_error carrying the fallback + x-api-key structural pair', () => {
     expect(
       isLitellmProxyAuthMisconfig(
-        'litellm proxy fallback: authentication_error while routing to backup deployment',
+        'litellm fallback re-dispatch: authentication_error — upstream demanded x-api-key on backup deployment',
       ),
     ).toBe(true)
   })
@@ -71,6 +76,26 @@ describe('isLitellmProxyAuthMisconfig', () => {
       ),
     ).toBe(false)
     expect(isLitellmProxyAuthMisconfig('authentication_error: invalid bearer token')).toBe(false)
+  })
+
+  // #3293 review finding 2 — precision over recall: an AMBIGUOUS proxy
+  // envelope (mentions litellm/proxy/api_key but lacks the keyless-fallback
+  // signature) must KEEP the credentials diagnosis, not become misconfig.
+  it('does NOT claim a genuine expiry wrapped in a proxy envelope mentioning api_key', () => {
+    const wrappedExpiry =
+      'litellm.AuthenticationError: AnthropicException - authentication_error: OAuth token has expired (api_key slot proxy-default). Please refresh.'
+    expect(isLitellmProxyAuthMisconfig(wrappedExpiry)).toBe(false)
+    expect(
+      classifyClaudeError({ type: 'authentication_error', status: 401, message: wrappedExpiry }),
+    ).toBe('credentials-expired')
+  })
+
+  it('does NOT claim proxy+fallback wording without an explicit x-api-key signal', () => {
+    expect(
+      isLitellmProxyAuthMisconfig(
+        'litellm proxy fallback: authentication_error while routing to backup deployment',
+      ),
+    ).toBe(false)
   })
 
   it('never throws on junk input', () => {
@@ -184,6 +209,57 @@ describe('decideOperatorEventAudience — Ken routing policy', () => {
     expect(isOperatorActionableKind('credit-exhausted')).toBe(true)
     expect(isOperatorActionableKind('rate-limited')).toBe(false)
     expect(isOperatorActionableKind('quota-exhausted')).toBe(false)
+  })
+})
+
+// #3293 review finding 1 — the user notice is gated on the TURN OUTCOME, not
+// the error line: a turn that 401s on the proxy fallback but still delivers a
+// reply must produce NO user notice; only a reply-less turn end flushes it.
+describe('PendingUserNoticeGate — notice fires IFF the turn dies reply-less', () => {
+  function makeNotice(overrides?: Partial<PendingUserNotice>): PendingUserNotice {
+    return {
+      chatIds: ['5000000002', '5000000003'],
+      text: renderUserFacingFailureNotice(),
+      agent: 'gymbro',
+      kind: 'proxy-misconfig',
+      atMs: 1_000_000,
+      ...overrides,
+    }
+  }
+
+  it('DROPS the notice when the turn recovered (delivered a reply)', () => {
+    const gate = new PendingUserNoticeGate()
+    gate.schedule(makeNotice())
+    expect(gate.resolveTurnEnd(true, 1_001_000)).toEqual([])
+    // And it does not resurrect on a later failed turn end.
+    expect(gate.resolveTurnEnd(false, 1_002_000)).toEqual([])
+  })
+
+  it('SENDS the notice exactly once when the turn ends without a reply', () => {
+    const gate = new PendingUserNoticeGate()
+    const notice = makeNotice()
+    gate.schedule(notice)
+    const flushed = gate.resolveTurnEnd(false, 1_001_000)
+    expect(flushed).toHaveLength(1)
+    expect(flushed[0].chatIds).toEqual(['5000000002', '5000000003'])
+    // Exactly once — a second turn end flushes nothing.
+    expect(gate.resolveTurnEnd(false, 1_002_000)).toEqual([])
+  })
+
+  it('collapses an error burst within one turn to ONE pending notice per agent', () => {
+    const gate = new PendingUserNoticeGate()
+    gate.schedule(makeNotice({ atMs: 1_000_000 }))
+    gate.schedule(makeNotice({ atMs: 1_000_500 }))
+    gate.schedule(makeNotice({ atMs: 1_001_000 }))
+    expect(gate.resolveTurnEnd(false, 1_002_000)).toHaveLength(1)
+  })
+
+  it('expires an unresolved notice after the TTL (bias to silence over false failure)', () => {
+    const gate = new PendingUserNoticeGate()
+    gate.schedule(makeNotice({ atMs: 1_000_000 }))
+    const after = 1_000_000 + PENDING_USER_NOTICE_TTL_MS + 1
+    expect(gate.hasPending(after)).toBe(false)
+    expect(gate.resolveTurnEnd(false, after)).toEqual([])
   })
 })
 
