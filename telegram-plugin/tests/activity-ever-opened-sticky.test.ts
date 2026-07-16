@@ -10,8 +10,14 @@
  * resume-400 signature) from "feed opened + finalized".
  *
  * Load-bearing constraints:
- *   1. `activityEverOpened = true` is set exactly ONCE in gateway.ts (at the
- *      send-message success site in drainActivitySummary).
+ *   1. `activityEverOpened = true` is set only at legitimate feed-OPEN signal
+ *      sites in gateway.ts — the send-message success site in
+ *      drainActivitySummary, AND the sub-agent-handback pre-turn ADOPTION site
+ *      (#3268): an adopted turn inherits an already-open pre-turn card via a
+ *      seeded `activityMessageId`, so it only ever EDITs the feed (never hits
+ *      the open branch), and must stamp the flag itself so the turn-end
+ *      DEGRADED check doesn't false-flag it as "feed never opened". Both are
+ *      set-TRUE (never a reset), preserving the sticky-true invariant.
  *   2. `turn.activityEverOpened = false` NEVER appears in gateway.ts (it is only
  *      initialised to `false` in the turn-initialiser object literal, never reset
  *      via a standalone assignment).
@@ -28,9 +34,13 @@ const gatewaySrc = readFileSync(
 )
 
 describe('M-2: activityEverOpened sticky-true invariant', () => {
-  it('activityEverOpened = true appears exactly once (set at send-message success)', () => {
+  it('activityEverOpened = true appears only at the two feed-OPEN signal sites', () => {
+    // Site 1: drainActivitySummary send-message success. Site 2: the #3268
+    // handback pre-turn ADOPTION seed (an adopted turn only edits, so it stamps
+    // the flag itself). Both are set-TRUE; the sticky invariant (no reset to
+    // false) is enforced by the next test.
     const setTrueMatches = [...gatewaySrc.matchAll(/activityEverOpened\s*=\s*true/g)]
-    expect(setTrueMatches).toHaveLength(1)
+    expect(setTrueMatches).toHaveLength(2)
   })
 
   it('turn.activityEverOpened = false never appears (no standalone reset)', () => {
