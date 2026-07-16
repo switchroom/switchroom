@@ -161,6 +161,12 @@ export interface HandbackPreturnSignalDeps {
   /** Age after emit at which a never-adopted card self-reaps. Independent of
    *  topic liveness. */
   adoptTimeoutMs?: number
+  /** Injected scheduler (mirrors bridge-dead-watchdog.ts): defaults to
+   *  setTimeout/clearTimeout. Injected so a runner-agnostic test can drive the
+   *  debounce + self-reap deterministically WITHOUT any vitest-only fake-timer
+   *  API (bun's test runner lacks `vi.advanceTimersByTimeAsync`). */
+  setTimer?: (fn: () => void, ms: number) => unknown
+  clearTimer?: (handle: unknown) => void
   log?: (line: string) => void
 }
 
@@ -173,8 +179,8 @@ interface PreTurnEntry {
   syntheticTurnKey: string
   startedAt: number
   pinned: boolean
-  debounceTimer: ReturnType<typeof setTimeout> | null
-  reapTimer: ReturnType<typeof setTimeout> | null
+  debounceTimer: unknown | null
+  reapTimer: unknown | null
   /** Set once the debounce fired and the card was painted. */
   activityMessageId: number | null
   emitted: boolean
@@ -212,6 +218,14 @@ export function createHandbackPreturnSignal(
   const now = deps.now ?? (() => Date.now())
   const debounceMs = deps.debounceMs ?? 700
   const adoptTimeoutMs = deps.adoptTimeoutMs ?? 30_000
+  const setTimer =
+    deps.setTimer ??
+    ((fn: () => void, ms: number) => {
+      const t = setTimeout(fn, ms)
+      ;(t as { unref?: () => void }).unref?.()
+      return t
+    })
+  const clearTimer = deps.clearTimer ?? ((h: unknown) => clearTimeout(h as ReturnType<typeof setTimeout>))
   const log = deps.log ?? ((l: string) => process.stderr.write(l))
 
   // Keyed by statusKey — one live pre-turn entry per topic (dedupe).
@@ -221,11 +235,11 @@ export function createHandbackPreturnSignal(
 
   function clearTimers(entry: PreTurnEntry): void {
     if (entry.debounceTimer != null) {
-      clearTimeout(entry.debounceTimer)
+      clearTimer(entry.debounceTimer)
       entry.debounceTimer = null
     }
     if (entry.reapTimer != null) {
-      clearTimeout(entry.reapTimer)
+      clearTimer(entry.reapTimer)
       entry.reapTimer = null
     }
   }
@@ -282,8 +296,7 @@ export function createHandbackPreturnSignal(
         // adoption lets the boot reaper finalize this orphan.
         deps.writeCardRecord(record)
         // Age-based self-reap, independent of topic liveness.
-        entry.reapTimer = setTimeout(() => reap(entry), adoptTimeoutMs)
-        entry.reapTimer.unref?.()
+        entry.reapTimer = setTimer(() => reap(entry), adoptTimeoutMs)
       })
       .catch((err) => {
         log(
@@ -351,8 +364,7 @@ export function createHandbackPreturnSignal(
       }
       byKey.set(statusKey, entry)
       bySyntheticKey.set(syntheticTurnKey, statusKey)
-      entry.debounceTimer = setTimeout(() => emit(entry), debounceMs)
-      entry.debounceTimer.unref?.()
+      entry.debounceTimer = setTimer(() => emit(entry), debounceMs)
     },
 
     tryAdopt(turnId) {

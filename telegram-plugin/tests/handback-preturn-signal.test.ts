@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   createHandbackPreturnSignal,
@@ -12,9 +12,11 @@ import type { InboundMessage } from '../gateway/ipc-protocol.js'
 
 /**
  * Contract test for the sub-agent-handback dead-air fix (the extracted
- * emit→adopt→reap seam). Drives the pure seam with fake timers + spy
- * transports so the whole card lifecycle is asserted without the gateway or
- * the Telegram bot API:
+ * emit→adopt→reap seam). Drives the pure seam through an INJECTED clock +
+ * INJECTED scheduler (NOT vitest's `vi.useFakeTimers` / `advanceTimersByTimeAsync`,
+ * which bun's test runner does not implement) so it passes identically under
+ * BOTH runners (the telegram-plugin dual-run rule). Asserts the whole card
+ * lifecycle without the gateway or the Telegram bot API:
  *
  *   - drain-site emit within the debounce window (typing action + card)
  *   - adoption across the enqueue boundary is an EDIT (no second card send)
@@ -79,18 +81,70 @@ function userInbound(opts: {
   }
 }
 
+/** Flush the microtask queue so the seam's async openCard promise chain settles
+ *  between scheduler ticks. Runner-agnostic (no fake-timer API): a handful of
+ *  `await` turns drains the fixed-depth chain the seam builds. */
+async function flushMicrotasks(): Promise<void> {
+  for (let i = 0; i < 12; i++) await Promise.resolve()
+}
+
+/** Manual injected scheduler + clock — the runner-agnostic replacement for
+ *  vitest fake timers. Fires due timers in chronological order, allowing a
+ *  fired timer to schedule another, and flushes microtasks after each fire so
+ *  the async card-open chain completes deterministically. */
+function makeScheduler() {
+  let seq = 0
+  let currentTime = 0
+  const timers = new Map<number, { fn: () => void; at: number }>()
+  return {
+    now: () => currentTime,
+    setTimer: (fn: () => void, ms: number): unknown => {
+      const id = ++seq
+      timers.set(id, { fn, at: currentTime + ms })
+      return id
+    },
+    clearTimer: (handle: unknown): void => {
+      timers.delete(handle as number)
+    },
+    async advance(ms: number): Promise<void> {
+      const target = currentTime + ms
+      for (;;) {
+        let nextId: number | null = null
+        let nextAt = Infinity
+        for (const [id, t] of timers) {
+          if (t.at <= target && t.at < nextAt) {
+            nextId = id
+            nextAt = t.at
+          }
+        }
+        if (nextId == null) break
+        const t = timers.get(nextId)!
+        timers.delete(nextId)
+        currentTime = t.at
+        t.fn()
+        await flushMicrotasks()
+      }
+      currentTime = target
+      await flushMicrotasks()
+    },
+  }
+}
+
 interface Harness {
   signal: ReturnType<typeof createHandbackPreturnSignal>
   typing: ReturnType<typeof createTurnTypingLoop>
+  sched: ReturnType<typeof makeScheduler>
   sendChatAction: ReturnType<typeof vi.fn>
   openCard: ReturnType<typeof vi.fn>
   finalizeCard: ReturnType<typeof vi.fn>
   records: Map<string, PreTurnCardRecord>
   finalizedIds: number[]
-  nextMessageId: () => number
 }
 
+const harnesses: Harness[] = []
+
 function makeHarness(overrides: Partial<HandbackPreturnSignalDeps> = {}): Harness {
+  const sched = makeScheduler()
   const sendChatAction = vi.fn<(c: string, t: number | null) => void>()
   const typing = createTurnTypingLoop({
     sendChatAction,
@@ -99,9 +153,8 @@ function makeHarness(overrides: Partial<HandbackPreturnSignalDeps> = {}): Harnes
   })
 
   let msgSeq = 1000
-  const nextMessageId = () => ++msgSeq
   const openCard = vi.fn<(c: string, t: number | null) => Promise<number | null>>(
-    async () => nextMessageId(),
+    async () => ++msgSeq,
   )
 
   // In-memory durable record store keyed by turnKey (mirrors the activity card
@@ -129,21 +182,24 @@ function makeHarness(overrides: Partial<HandbackPreturnSignalDeps> = {}): Harnes
     finalizeCard,
     writeCardRecord,
     clearCardRecord,
-    now: () => Date.now(),
+    now: sched.now,
+    setTimer: sched.setTimer,
+    clearTimer: sched.clearTimer,
     debounceMs: 700,
     adoptTimeoutMs: 30_000,
     ...overrides,
   })
 
-  return { signal, typing, sendChatAction, openCard, finalizeCard, records, finalizedIds, nextMessageId }
+  const h: Harness = { signal, typing, sched, sendChatAction, openCard, finalizeCard, records, finalizedIds }
+  harnesses.push(h)
+  return h
 }
 
 describe('handback-preturn-signal — dead-air pre-turn emit→adopt→reap', () => {
-  beforeEach(() => {
-    vi.useFakeTimers()
-  })
   afterEach(() => {
-    vi.useRealTimers()
+    // Real setInterval-backed typing loops in the harnesses are unref'd, but
+    // clear them so no interval leaks across the runner's test files.
+    for (const h of harnesses.splice(0)) h.typing.stopAll()
   })
 
   it('isHandbackInbound only matches the load-bearing source string', () => {
@@ -156,12 +212,12 @@ describe('handback-preturn-signal — dead-air pre-turn emit→adopt→reap', ()
     h.signal.noteHandbackRelease(handbackInbound({ chatId: 'chatA', threadId: 7, messageId: 555 }))
 
     // Nothing paints before the debounce elapses (flicker guard).
-    await vi.advanceTimersByTimeAsync(699)
+    await h.sched.advance(699)
     expect(h.sendChatAction).not.toHaveBeenCalled()
     expect(h.openCard).not.toHaveBeenCalled()
 
     // At the debounce boundary: typing loop lights up AND the card opens.
-    await vi.advanceTimersByTimeAsync(1)
+    await h.sched.advance(1)
     expect(h.sendChatAction).toHaveBeenCalledWith('chatA', 7)
     expect(h.typing.activeCount()).toBe(1)
     expect(h.openCard).toHaveBeenCalledTimes(1)
@@ -179,12 +235,10 @@ describe('handback-preturn-signal — dead-air pre-turn emit→adopt→reap', ()
 
   it('adoption across the enqueue boundary edits (no second card) and keeps typing ≥1 continuously', async () => {
     const h = makeHarness()
-    const inbound = handbackInbound({ chatId: 'chatB', messageId: 900 })
-    h.signal.noteHandbackRelease(inbound)
-    await vi.advanceTimersByTimeAsync(700)
+    h.signal.noteHandbackRelease(handbackInbound({ chatId: 'chatB', messageId: 900 }))
+    await h.sched.advance(700)
     expect(h.openCard).toHaveBeenCalledTimes(1)
-    const cardId = h.openCard.mock.results[0]!.value // Promise<number>
-    const resolvedId = await cardId
+    const resolvedId = await h.openCard.mock.results[0]!.value
 
     // Typing is already lit before the turn mints — sample it: never zero.
     expect(h.typing.activeCount()).toBe(1)
@@ -213,7 +267,7 @@ describe('handback-preturn-signal — dead-air pre-turn emit→adopt→reap', ()
   it('turn-end hands off cleanly: typing stops exactly once, durable record cleared, map empty', async () => {
     const h = makeHarness()
     h.signal.noteHandbackRelease(handbackInbound({ chatId: 'chatC', threadId: 3, messageId: 12 }))
-    await vi.advanceTimersByTimeAsync(700)
+    await h.sched.advance(700)
     const resolvedId = await h.openCard.mock.results[0]!.value
     const turnId = deriveTurnId('chatC', 3, 12)!
     const adoption = h.signal.tryAdopt(turnId)!
@@ -232,13 +286,13 @@ describe('handback-preturn-signal — dead-air pre-turn emit→adopt→reap', ()
   it('never-adopted handback self-reaps its frozen card past the TTL', async () => {
     const h = makeHarness()
     h.signal.noteHandbackRelease(handbackInbound({ chatId: 'chatD', messageId: 77 }))
-    await vi.advanceTimersByTimeAsync(700)
+    await h.sched.advance(700)
     const resolvedId = await h.openCard.mock.results[0]!.value
     expect(h.typing.activeCount()).toBe(1)
     expect(h.records.size).toBe(1)
 
     // No enqueue ever arrives. Past the adopt TTL the orphan self-reaps.
-    await vi.advanceTimersByTimeAsync(30_000)
+    await h.sched.advance(30_000)
 
     expect(h.finalizedIds).toEqual([resolvedId]) // finalized exactly THAT card
     expect(h.typing.activeCount()).toBe(0) // typing stopped
@@ -249,7 +303,7 @@ describe('handback-preturn-signal — dead-air pre-turn emit→adopt→reap', ()
   it('identity race: a user inbound on the same topic never mis-adopts the handback, no double-send', async () => {
     const h = makeHarness()
     h.signal.noteHandbackRelease(handbackInbound({ chatId: 'chatE', messageId: 200 }))
-    await vi.advanceTimersByTimeAsync(700)
+    await h.sched.advance(700)
     expect(h.openCard).toHaveBeenCalledTimes(1)
 
     // A racing user inbound on the SAME topic key mints a DIFFERENT turnId.
@@ -275,7 +329,7 @@ describe('handback-preturn-signal — dead-air pre-turn emit→adopt→reap', ()
     h.signal.noteHandbackRelease(handbackInbound({ chatId: 'chatF', messageId: 10 }))
     h.signal.noteHandbackRelease(handbackInbound({ chatId: 'chatF', messageId: 11 }))
     expect(h.signal.pendingCount()).toBe(1)
-    await vi.advanceTimersByTimeAsync(700)
+    await h.sched.advance(700)
     expect(h.openCard).toHaveBeenCalledTimes(1)
   })
 
@@ -284,7 +338,7 @@ describe('handback-preturn-signal — dead-air pre-turn emit→adopt→reap', ()
     const h = makeHarness({ isTurnSettled: (k) => settled.has(k) })
     h.signal.noteHandbackRelease(handbackInbound({ chatId: 'chatG', messageId: 5 }))
     settled.add('chatG:_') // the turn delivered its answer during the debounce
-    await vi.advanceTimersByTimeAsync(700)
+    await h.sched.advance(700)
     expect(h.openCard).not.toHaveBeenCalled()
     expect(h.typing.activeCount()).toBe(0)
     expect(h.signal.pendingCount()).toBe(0)
