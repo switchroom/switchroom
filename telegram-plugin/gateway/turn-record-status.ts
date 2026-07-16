@@ -80,6 +80,51 @@ export function backstopSendOutcome(args: {
 }
 
 /**
+ * Resolve a backstop send's outcome using the #3276 RECEIPT gate: success
+ * requires at least one FRESH, non-card chat message id. This supersedes the
+ * naive chunk-count comparison for the turn-flush backstop, where a delivery
+ * that landed only onto the (soon-swept) progress card must count as a failure,
+ * not `complete`.
+ *
+ *   threw                              → failed
+ *   no fresh non-card id delivered     → failed  (card-only "success")
+ *   fewer fresh ids than chunks split  → failed  (partial delivery)
+ *   >=1 fresh id AND all chunks landed → delivered
+ *
+ * `cardMessageId` is the taken-over progress-card id (or null); any id equal to
+ * it is excluded from the delivered set before counting.
+ */
+export function backstopSendOutcomeGated(args: {
+  threw: boolean
+  sentIds: readonly number[]
+  chunkCount: number
+  cardMessageId: number | null
+}): DeliveryOutcome {
+  if (args.threw) return 'failed'
+  if (args.chunkCount === 0) return 'failed'
+  const freshCount = args.sentIds.filter(
+    id => args.cardMessageId == null || id !== args.cardMessageId,
+  ).length
+  // Guard 7: a card-only delivery (zero fresh ids) is a hard failure.
+  if (freshCount === 0) return 'failed'
+  if (freshCount < args.chunkCount) return 'failed'
+  return 'delivered'
+}
+
+/**
+ * Stamp a turn's `deliveryOutcome` from a resolved backstop send using the
+ * #3276 receipt gate (fresh non-card ids only). Mutates and returns the outcome.
+ */
+export function finalizeBackstopSendGated(
+  turn: { deliveryOutcome?: DeliveryOutcome },
+  send: { threw: boolean; sentIds: readonly number[]; chunkCount: number; cardMessageId: number | null },
+): DeliveryOutcome {
+  const outcome = backstopSendOutcomeGated(send)
+  turn.deliveryOutcome = outcome
+  return outcome
+}
+
+/**
  * Stamp a turn's `deliveryOutcome` from a resolved backstop send. This is the
  * exact accounting the turn-flush IIFE's `finally` performs — factored here so
  * the gateway and the tests run the SAME mapping (a real send that throws or

@@ -629,6 +629,40 @@ describe('selectFlushDeliveryText — deliver the terminal answer, strip only na
     expect(selectFlushDeliveryText([])).toBe('')
   })
 
+  // #3276 guard 8 — the NARRATION_OPENER regex alone misses progress narration
+  // that does NOT open with "Let me…/I'll…" but trails off into an ellipsis or
+  // colon ("Checking now…"). Pre-fix, `isNarrationBlock` returned false for it,
+  // so the whole `narration\n\nanswer` blob was delivered. FAILS pre-fix.
+  it('strips a non-opener progress narration ("Checking now…") that precedes the answer', () => {
+    const out = selectFlushDeliveryText(['Checking now…', 'The build is green.'])
+    expect(out).toBe('The build is green.')
+    expect(out).not.toContain('Checking now')
+  })
+
+  it('strips a colon-terminated progress narration ("Pulling the numbers:")', () => {
+    const out = selectFlushDeliveryText(['Pulling the numbers:', 'Revenue was 4.2M.'])
+    expect(out).toBe('Revenue was 4.2M.')
+  })
+
+  it('still delivers a SHORT terminal answer after progress narration (no min-char re-gate)', () => {
+    // "yes, done" is well under FLUSH_SUBSTANTIVE_MIN_CHARS and MUST still deliver.
+    const out = selectFlushDeliveryText(['Looking into that...', 'yes, done'])
+    expect(out).toBe('yes, done')
+  })
+
+  // #3276 finding 7 — the narration heuristic only ever strips PRECEDING blocks;
+  // the terminal answer block is always preserved. A colon-terminated line that
+  // IS the whole answer (e.g. a lead-in the model never continued) must NOT be
+  // dropped, whether it stands alone or is the terminal block after narration.
+  it('never drops a colon-terminated line that IS the whole answer (single block)', () => {
+    expect(selectFlushDeliveryText(['Here are the results:'])).toBe('Here are the results:')
+  })
+
+  it('keeps a colon-terminated TERMINAL block (it is the answer, not narration)', () => {
+    const out = selectFlushDeliveryText(['Checking now…', 'Here are the results:'])
+    expect(out).toBe('Here are the results:')
+  })
+
   it('decideTurnFlush delivers the narrowed answer, not the whole blob', () => {
     const decision = decideTurnFlush({
       chatId: 'chat1',
