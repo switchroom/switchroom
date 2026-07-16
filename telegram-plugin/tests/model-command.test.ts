@@ -28,6 +28,9 @@ import {
   isClaudeModel,
   isBusyRefusalText,
   isOfflineTrustedModelToken,
+  classifyModelSwitchConfirmation,
+  parseModelSwitchTarget,
+  modelFamilyToken,
   MODEL_ALIASES,
   type ModelCommandDeps,
 } from "../gateway/model-command.js";
@@ -526,5 +529,135 @@ describe("#3177 — routing decision helpers", () => {
     expect(line).toContain("gw /model received");
     expect(line).toContain("agent=klanker");
     expect(line).toContain("arg=opus");
+  });
+});
+
+describe("parseModelSwitchTarget", () => {
+  it("extracts the target from a menu relaunch reason", () => {
+    expect(
+      parseModelSwitchTarget("user: /model fable (session-only relaunch, menu)"),
+    ).toBe("fable");
+  });
+  it("extracts the target from a typed relaunch reason", () => {
+    expect(
+      parseModelSwitchTarget("user: /model sr-gemini-2.5-flash (session-only relaunch)"),
+    ).toBe("sr-gemini-2.5-flash");
+  });
+  it("extracts the default sentinel from a revert reason", () => {
+    expect(parseModelSwitchTarget("user: /model default (revert relaunch)")).toBe("default");
+  });
+  it("returns null for a non-/model reason", () => {
+    expect(parseModelSwitchTarget("cli: restart")).toBeNull();
+  });
+});
+
+describe("classifyModelSwitchConfirmation", () => {
+  // The regression this fix closes: a /model fable apply-boot that reverted to
+  // the configured default (opus) must be reported as NOT-applied (⚠️), not as a
+  // green "✅ Now running opus (the configured default)". Under the OLD inline
+  // logic (isApplyBoot ? applied : green-default) this exact case produced the
+  // misleading green card — this asserts the corrected outcome.
+  it("flags a non-default switch that reverted to the configured default as not-applied", () => {
+    const out = classifyModelSwitchConfirmation({
+      reason: "user: /model fable (session-only relaunch, menu)",
+      launched: "opus",
+      configured: "opus",
+    });
+    expect(out).toEqual({ kind: "not-applied", target: "fable", revertedTo: "opus" });
+  });
+
+  it("reports an applied switch when the launched model differs from the default", () => {
+    const out = classifyModelSwitchConfirmation({
+      reason: "user: /model fable (session-only relaunch, menu)",
+      launched: "fable",
+      configured: "opus",
+    });
+    expect(out).toEqual({ kind: "applied", launched: "fable" });
+  });
+
+  it("reports the default (green) for an intended /model default revert", () => {
+    const out = classifyModelSwitchConfirmation({
+      reason: "user: /model default (revert relaunch)",
+      launched: "opus",
+      configured: "opus",
+    });
+    expect(out).toEqual({ kind: "default", launched: "opus" });
+  });
+
+  it("reports the default (green) when the operator asked for the configured model itself", () => {
+    // /model opus while configured=opus is a SUCCESS, not a silent revert.
+    const out = classifyModelSwitchConfirmation({
+      reason: "user: /model opus (session-only relaunch)",
+      launched: "opus",
+      configured: "opus",
+    });
+    expect(out).toEqual({ kind: "default", launched: "opus" });
+  });
+
+  it("is case-insensitive on the target-vs-launched comparison", () => {
+    const out = classifyModelSwitchConfirmation({
+      reason: "user: /model OPUS (session-only relaunch)",
+      launched: "opus",
+      configured: "opus",
+    });
+    expect(out).toEqual({ kind: "default", launched: "opus" });
+  });
+
+  it("treats an empty launched value (unreadable .active-session-model) as a revert to the default", () => {
+    const out = classifyModelSwitchConfirmation({
+      reason: "user: /model fable (session-only relaunch, menu)",
+      launched: "",
+      configured: "opus",
+    });
+    expect(out).toEqual({ kind: "not-applied", target: "fable", revertedTo: "opus" });
+  });
+
+  // LOW-1: an ALIAS target must family-match its RESOLVED full-id revert, so a
+  // `/model sonnet` on a `claude-sonnet-5`-default agent (start.sh wrote the full
+  // id to .active-session-model on a config-changed / proxy-down revert path) is
+  // NOT falsely reported as "sonnet didn't apply". This is the exact case the
+  // reviewer flagged; a naive string compare returns not-applied here.
+  it("family-matches an alias target to its resolved full-id default (sonnet ≡ claude-sonnet-5)", () => {
+    const out = classifyModelSwitchConfirmation({
+      reason: "user: /model sonnet (session-only relaunch)",
+      launched: "claude-sonnet-5",
+      configured: "claude-sonnet-5",
+    });
+    expect(out).toEqual({ kind: "default", launched: "claude-sonnet-5" });
+  });
+
+  it("still flags a genuinely different-family switch that reverted to the full-id default", () => {
+    // /model opus reverting to a claude-sonnet-5 default is a REAL failed switch.
+    const out = classifyModelSwitchConfirmation({
+      reason: "user: /model opus (session-only relaunch)",
+      launched: "claude-sonnet-5",
+      configured: "claude-sonnet-5",
+    });
+    expect(out).toEqual({ kind: "not-applied", target: "opus", revertedTo: "claude-sonnet-5" });
+  });
+
+  it("family-matches a full-id target to the aliased default (claude-opus-4-8 ≡ opus)", () => {
+    const out = classifyModelSwitchConfirmation({
+      reason: "user: /model claude-opus-4-8 (session-only relaunch)",
+      launched: "opus",
+      configured: "opus",
+    });
+    expect(out).toEqual({ kind: "default", launched: "opus" });
+  });
+});
+
+describe("modelFamilyToken", () => {
+  it("reduces a claude full id to its family, dropping version + date", () => {
+    expect(modelFamilyToken("claude-sonnet-5")).toBe("sonnet");
+    expect(modelFamilyToken("claude-opus-4-8")).toBe("opus");
+    expect(modelFamilyToken("claude-haiku-4-5-20251001")).toBe("haiku");
+  });
+  it("passes a bare alias through, lowercased", () => {
+    expect(modelFamilyToken("Sonnet")).toBe("sonnet");
+    expect(modelFamilyToken("fable")).toBe("fable");
+  });
+  it("keeps sr-* routing ids verbatim (no claude- prefix)", () => {
+    expect(modelFamilyToken("sr-glm-5")).toBe("sr-glm-5");
+    expect(modelFamilyToken("sr-gemini-2.5-flash")).toBe("sr-gemini-2.5-flash");
   });
 });

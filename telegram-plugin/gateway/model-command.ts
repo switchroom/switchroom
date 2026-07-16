@@ -84,6 +84,110 @@ export function isClaudeModel(name: string): boolean {
   return lower.startsWith('claude-')
 }
 
+/**
+ * The outcome of a `/model` apply-boot, derived purely from the DETERMINISTIC
+ * post-boot signals (never optimistic):
+ *
+ *   - `reason`     — the clean-shutdown marker reason that keyed this boot as a
+ *                    `/model` apply-boot, e.g.
+ *                    `user: /model fable (session-only relaunch, menu)`.
+ *   - `launched`   — the contents of `.active-session-model`: the model start.sh
+ *                    actually passed to `claude --model` this boot.
+ *   - `configured` — the resolved configured default model.
+ *
+ * Three outcomes:
+ *   - `applied`      — the launched model differs from the configured default, so
+ *                      the switch landed (a session-only override).
+ *   - `default`      — the operator asked for the configured default (`/model
+ *                      default`, or `/model <configured>`) and got it.
+ *   - `not-applied`  — the operator asked for a NON-default model, but the boot
+ *                      came back on the configured default: the switch SILENTLY
+ *                      failed to apply. The consume-once carrier was consumed by a
+ *                      boot that never launched the target (e.g. a wedged apply-boot
+ *                      that hit boot.lock_stale_recovered_boot_mismatch and reverted
+ *                      to the default). This is the case that previously emitted a
+ *                      MISLEADING green "✅ Now running <default> (the configured
+ *                      default)" card with no signal that the requested switch was
+ *                      lost. It self-corrects across boots: a later boot that
+ *                      genuinely launches the target reports `applied`.
+ */
+export type ModelSwitchConfirmation =
+  | { kind: 'applied'; launched: string }
+  | { kind: 'default'; launched: string }
+  | { kind: 'not-applied'; target: string; revertedTo: string }
+
+/**
+ * Extract the requested `/model <target>` token from a clean-shutdown reason
+ * (e.g. `user: /model fable (session-only relaunch, menu)` → `fable`). Returns
+ * null when the reason carries no `/model <token>` (a non-switch reason).
+ */
+export function parseModelSwitchTarget(reason: string): string | null {
+  const m = reason.match(/\/model\s+(\S+)/)
+  return m ? m[1] : null
+}
+
+/**
+ * Reduce a model token to a comparable FAMILY key so an alias and its resolved
+ * full id compare equal (`sonnet` ≡ `claude-sonnet-5` ≡ `claude-sonnet-5-<date>`).
+ *
+ * This is the normalization the silent-revert classifier needs: `target` from
+ * the clean-shutdown reason is the RAW user token (an alias like `sonnet`),
+ * while `.active-session-model` / the configured default may be the RESOLVED
+ * full id start.sh wrote on a revert-with-alert path (config-default-changed at
+ * start.sh.hbs:1228, proxy-down at :1234). A naive string compare would flag
+ * `/model sonnet` on a `claude-sonnet-5`-default agent as "didn't apply" even
+ * though sonnet IS the default.
+ *
+ * NB `resolveMainModel` (scaffold.ts:1358) is NOT sufficient here — it only
+ * remaps the `default` alias / unset to the switchroom default; it passes
+ * `sonnet`/`opus`/etc. through unchanged. The alias↔full-id equivalence is a
+ * FAMILY reduction (same rule model-label.ts uses one-way), done here:
+ *   - `claude-<family>-…` → `<family>`  (e.g. `claude-sonnet-5` → `sonnet`)
+ *   - a bare alias / any other token     → itself, lowercased (`sonnet`, `sr-glm-5`)
+ * sr-* ids never carry a `claude-` prefix, so they stay verbatim — correct,
+ * since the reason token and `.active-session-model` both hold the same
+ * already-expanded sr-* id and compare equal directly.
+ */
+export function modelFamilyToken(token: string): string {
+  const t = token.trim().toLowerCase()
+  if (t.startsWith('claude-')) {
+    const family = t.slice('claude-'.length).split('-').filter((p) => p.length > 0)[0]
+    return family ?? t
+  }
+  return t
+}
+
+/**
+ * Classify a `/model` apply-boot outcome from the post-boot signals. Pure so the
+ * confirmation-card decision is unit-testable without booting the gateway. The
+ * `not-applied` branch is the fix for the silent-revert bug: a non-default switch
+ * that reverted to the configured default must warn, not print a green ✅.
+ */
+export function classifyModelSwitchConfirmation(input: {
+  reason: string
+  launched: string
+  configured: string
+}): ModelSwitchConfirmation {
+  const { reason, launched, configured } = input
+  const isApplyBoot = launched.length > 0 && launched !== configured
+  if (isApplyBoot) return { kind: 'applied', launched }
+  // launched === configured (or empty): either an intended default/revert, or a
+  // NON-default switch that silently reverted to the configured default.
+  const target = parseModelSwitchTarget(reason)
+  const revertedTo = launched.length > 0 ? launched : configured
+  // Family-normalize both sides so an alias target (`sonnet`) matches its
+  // resolved full-id revert (`claude-sonnet-5`) — otherwise a `/model sonnet`
+  // that reverted to the sonnet default would emit a WRONG "didn't apply" card.
+  if (
+    target != null &&
+    target.toLowerCase() !== 'default' &&
+    modelFamilyToken(target) !== modelFamilyToken(revertedTo)
+  ) {
+    return { kind: 'not-applied', target, revertedTo }
+  }
+  return { kind: 'default', launched: revertedTo }
+}
+
 export type ParsedModelCommand =
   | { kind: 'show' }
   | { kind: 'set'; model: string }
