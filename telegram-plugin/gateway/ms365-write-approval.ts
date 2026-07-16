@@ -57,8 +57,25 @@ export interface Ms365WritePreview {
   /** Byte delta — present only for OneDrive uploads with known sizes. */
   sizeBytesBefore?: number;
   sizeBytesAfter?: number;
+  /**
+   * "start → end" human string for calendar events, resolved from Graph.
+   * Present only when the opaque event id resolved successfully (#3267).
+   */
+  eventWhen?: string;
+  /**
+   * Structural before→after diff for the fields the mutation changes
+   * (calendar body/location/time). Present only when resolved (#3267).
+   */
+  changes?: Ms365PreviewChange[];
   /** 1-line agent rationale — advisory; operator should not over-trust. */
   agentRationale?: string;
+}
+
+/** A single before→after change rendered on the card. */
+export interface Ms365PreviewChange {
+  field: string;
+  before?: string;
+  after?: string;
 }
 
 /**
@@ -84,8 +101,30 @@ export function validateMs365Preview(input: unknown): Ms365WritePreview | null {
   if (typeof o.deepLink === "string") out.deepLink = o.deepLink;
   if (typeof o.sizeBytesBefore === "number") out.sizeBytesBefore = o.sizeBytesBefore;
   if (typeof o.sizeBytesAfter === "number") out.sizeBytesAfter = o.sizeBytesAfter;
+  if (typeof o.eventWhen === "string") out.eventWhen = o.eventWhen;
+  const changes = sanitizeChanges(o.changes);
+  if (changes) out.changes = changes;
   if (typeof o.agentRationale === "string") out.agentRationale = o.agentRationale;
   return out;
+}
+
+/**
+ * Validate the wire `changes` array into typed before→after entries. Drops
+ * malformed entries defensively; returns undefined when nothing usable.
+ */
+function sanitizeChanges(input: unknown): Ms365PreviewChange[] | undefined {
+  if (!Array.isArray(input)) return undefined;
+  const out: Ms365PreviewChange[] = [];
+  for (const raw of input) {
+    if (!raw || typeof raw !== "object") continue;
+    const c = raw as Record<string, unknown>;
+    if (typeof c.field !== "string" || c.field.length === 0) continue;
+    const entry: Ms365PreviewChange = { field: c.field };
+    if (typeof c.before === "string") entry.before = c.before;
+    if (typeof c.after === "string") entry.after = c.after;
+    out.push(entry);
+  }
+  return out.length > 0 ? out : undefined;
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -168,6 +207,9 @@ export function buildMs365CardText(p: Ms365WritePreview): string {
     lines.push(`ID:   ${truncate(p.itemId, 96)}`);
   }
   lines.push(`Account: ${truncate(p.accountEmail, 96)}`);
+  if (p.eventWhen) {
+    lines.push(`When: ${truncate(p.eventWhen, 96)}`);
+  }
   if (
     typeof p.sizeBytesBefore === "number" ||
     typeof p.sizeBytesAfter === "number"
@@ -181,13 +223,26 @@ export function buildMs365CardText(p: Ms365WritePreview): string {
   if (p.deepLink) {
     lines.push(`Link: ${truncate(p.deepLink, 256)}`);
   }
+  if (p.changes && p.changes.length > 0) {
+    lines.push("");
+    lines.push("Changes:");
+    for (const c of p.changes.slice(0, 8)) {
+      const before = c.before !== undefined ? truncate(c.before, 96) : "(none)";
+      const after = c.after !== undefined ? truncate(c.after, 96) : "(cleared)";
+      lines.push(`• ${c.field}: ${before} → ${after}`);
+    }
+  }
   if (p.agentRationale) {
     lines.push("");
     lines.push(`💬 ${truncate(p.agentRationale, 512)}`);
   }
   lines.push("");
+  // With a resolved structural diff present the operator is no longer
+  // approving a blind write; soften the attestation warning accordingly.
   lines.push(
-    "⚠️ Weak attestation (RFC §8 v1): operator should click through to verify the actual change before approving. Structural diff coming v1.5.",
+    p.changes && p.changes.length > 0
+      ? "⚠️ Attestation (RFC §8 v1.5): the diff above is derived from live Graph state + the mutation payload. Verify before approving."
+      : "⚠️ Weak attestation (RFC §8 v1): operator should click through to verify the actual change before approving. Structural diff coming v1.5.",
   );
   // hardenCardBreaks: labelled field lines (Agent:/Tool:/Item:/Account:/Size:…)
   // would soft-collapse into one blob under the GFM rich renderer; this card is

@@ -152,6 +152,78 @@ describe("buildMs365CardText", () => {
     const text = buildMs365CardText({ ...base, itemDisplayName: "x".repeat(500) });
     expect(text).toContain("…");
   });
+
+  // ── #3267 Problem 1: calendar context + structural diff ──────────────────
+  it("renders a resolved event subject + account (not '(unknown)') for a body-only calendar edit", () => {
+    const text = buildMs365CardText({
+      agentName: "clerk",
+      toolName: "mcp__ms-365__update-calendar-event",
+      itemId: "AQMkADAw==",
+      itemDisplayName: "Dentist appointment", // resolved from Graph, not payload
+      accountEmail: "ken@example.com", // from Graph identity, not env
+      eventWhen: "2026-07-20T09:00:00 → 2026-07-20T09:30:00",
+      changes: [{ field: "location", before: "Old Rd", after: "New St" }],
+    });
+    expect(text).toContain("Dentist appointment");
+    expect(text).toContain("ken@example.com");
+    expect(text).not.toContain("(unknown)");
+    expect(text).toContain("When:");
+    expect(text).toContain("Changes:");
+    expect(text).toContain("location: Old Rd → New St");
+  });
+
+  it("shows '(cleared)' when a change removes a field's value", () => {
+    const text = buildMs365CardText({
+      ...base,
+      changes: [{ field: "location", before: "Somewhere" }],
+    });
+    expect(text).toContain("location: Somewhere → (cleared)");
+  });
+
+  it("softens the attestation warning when a structural diff is present", () => {
+    const text = buildMs365CardText({
+      ...base,
+      changes: [{ field: "body", before: "old", after: "new" }],
+    });
+    expect(text).toContain("RFC §8 v1.5");
+    expect(text).not.toContain("Weak attestation");
+  });
+
+  it("keeps the weak-attestation warning when no diff is present", () => {
+    const text = buildMs365CardText(base);
+    expect(text).toContain("Weak attestation (RFC §8 v1)");
+  });
+});
+
+describe("validateMs365Preview — #3267 diff fields", () => {
+  const validPreview = {
+    agentName: "clerk",
+    toolName: "mcp__ms-365__update-calendar-event",
+    itemId: "AQ==",
+    itemDisplayName: "Standup",
+    accountEmail: "ken@example.com",
+  };
+
+  it("carries eventWhen + well-formed changes through", () => {
+    const r = validateMs365Preview({
+      ...validPreview,
+      eventWhen: "a → b",
+      changes: [{ field: "start", before: "9am", after: "10am" }],
+    });
+    expect(r).not.toBeNull();
+    expect(r!.eventWhen).toBe("a → b");
+    expect(r!.changes).toEqual([{ field: "start", before: "9am", after: "10am" }]);
+  });
+
+  it("drops malformed change entries and a non-array changes field", () => {
+    const r = validateMs365Preview({
+      ...validPreview,
+      changes: [{ field: "" }, { after: "x" }, 42, { field: "ok", after: "y" }],
+    });
+    expect(r!.changes).toEqual([{ field: "ok", after: "y" }]);
+    const r2 = validateMs365Preview({ ...validPreview, changes: "nope" });
+    expect(r2!.changes).toBeUndefined();
+  });
 });
 
 // ────────────────────────────────────────────────────────────────────────
