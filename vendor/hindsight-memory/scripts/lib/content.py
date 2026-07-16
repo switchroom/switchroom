@@ -255,7 +255,13 @@ def format_memories(results: list) -> str:
         mem_type = r.get("type", "")
         mentioned_at = r.get("mentioned_at", "")
         type_str = f" [{mem_type}]" if mem_type else ""
-        date_str = f" ({mentioned_at})" if mentioned_at else ""
+        # switchroom #tz-fix (recall side): mentioned_at arrives as a UTC ISO
+        # timestamp from the Hindsight server. Render it through the same
+        # SWITCHROOM_TIMEZONE→TZ→UTC zoneinfo conversion as format_current_time
+        # so recall lines never inject a UTC "when". Date-only / unparseable
+        # values are surfaced verbatim rather than crashing recall.
+        display_at = _format_local_timestamp(mentioned_at) if mentioned_at else ""
+        date_str = f" ({display_at})" if display_at else ""
         lines.append(f"- {text}{type_str}{date_str}")
     return "\n\n".join(lines)
 
@@ -269,6 +275,52 @@ def _resolve_agent_timezone() -> str:
     so it inherits both env vars (compose.ts bakes them onto the container).
     """
     return os.environ.get("SWITCHROOM_TIMEZONE") or os.environ.get("TZ") or "UTC"
+
+
+def _format_local_timestamp(value: str) -> str:
+    """Render a UTC ISO timestamp in the agent's LOCAL timezone (am/pm form).
+
+    Used by ``format_memories`` to convert the server-supplied ``mentioned_at``
+    (UTC ISO, e.g. ``2026-07-16T04:09:00Z``) through the same
+    SWITCHROOM_TIMEZONE→TZ→UTC zoneinfo cascade as ``format_current_time``,
+    so recalled memories never surface a UTC "when".
+
+    Guarding: only full ISO *datetime* values (those carrying a time component,
+    i.e. containing ``T``) are converted. Date-only strings (``2024-01-01``) and
+    anything unparseable are returned verbatim rather than crashing recall or
+    fabricating a midnight time.
+    """
+    if not isinstance(value, str):
+        return value
+    raw = value.strip()
+    # Only convert full ISO datetimes — a bare date has no wall-clock to shift.
+    if "T" not in raw:
+        return value
+    parsed = None
+    try:
+        # Python <3.11 fromisoformat rejects a trailing 'Z'; normalise it.
+        iso = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+        parsed = datetime.fromisoformat(iso)
+    except (ValueError, TypeError):
+        return value
+    # Naive value → server sends UTC, so assume UTC before converting.
+    if parsed.tzinfo is None:
+        if ZoneInfo is not None:
+            try:
+                parsed = parsed.replace(tzinfo=ZoneInfo("UTC"))
+            except Exception:
+                return value
+        else:
+            return value
+    tz_name = _resolve_agent_timezone()
+    if ZoneInfo is not None:
+        try:
+            local = parsed.astimezone(ZoneInfo(tz_name))
+        except Exception:  # unknown/invalid zone — degrade to process-local.
+            local = parsed.astimezone()
+    else:
+        local = parsed.astimezone()
+    return local.strftime("%Y-%m-%d %I:%M %p %Z")
 
 
 def format_current_time() -> str:

@@ -392,3 +392,74 @@ agents:
     expect(joined).toContain("alerst");
   });
 });
+
+describe("loader: timezone validity (#tz-fix audit gap 3)", () => {
+  it("accepts a real IANA zone on an agent", () => {
+    const path = writeTempConfig(`${validBaseYaml.replace("agents: {}", "")}
+agents:
+  alice:
+    topic_name: "alice"
+    timezone: "Australia/Melbourne"
+`);
+    const config = loadConfig(path);
+    expect(config.agents.alice?.timezone).toBe("Australia/Melbourne");
+  });
+
+  it("accepts UTC and a real global switchroom.timezone", () => {
+    const path = writeTempConfig(`
+switchroom:
+  version: 1
+  timezone: "America/New_York"
+telegram:
+  bot_token: "x"
+  forum_chat_id: "1"
+agents:
+  bob:
+    topic_name: "bob"
+    timezone: "UTC"
+`.trim());
+    const config = loadConfig(path);
+    expect(config.switchroom.timezone).toBe("America/New_York");
+    expect(config.agents.bob?.timezone).toBe("UTC");
+  });
+
+  it("rejects a shape-valid but non-existent IANA zone (typo) at load", () => {
+    // Passes TIMEZONE_REGEX (Region/City shape) but no such zone exists — it
+    // would silently degrade to UTC at runtime without this check.
+    const path = writeTempConfig(`${validBaseYaml.replace("agents: {}", "")}
+agents:
+  carol:
+    topic_name: "carol"
+    timezone: "Australia/Melbrone"
+`);
+    let caught: Error | null = null;
+    try { loadConfig(path); } catch (e) { caught = e as Error; }
+    expect(caught).toBeInstanceOf(ConfigError);
+    const joined = (caught as ConfigError).details?.join("\n") ?? "";
+    expect(joined).toContain("agents.carol.timezone");
+    expect(joined).toContain("Australia/Melbrone");
+  });
+
+  it("aggregates typos across the global layer and multiple agents", () => {
+    const path = writeTempConfig(`
+switchroom:
+  version: 1
+  timezone: "America/New_Yrok"
+telegram:
+  bot_token: "x"
+  forum_chat_id: "1"
+agents:
+  dave:
+    topic_name: "dave"
+    timezone: "Europe/Lodnon"
+`.trim());
+    let caught: Error | null = null;
+    try { loadConfig(path); } catch (e) { caught = e as Error; }
+    expect(caught).toBeInstanceOf(ConfigError);
+    const details = (caught as ConfigError).details ?? [];
+    expect(details.length).toBe(2);
+    const joined = details.join("\n");
+    expect(joined).toContain("switchroom.timezone");
+    expect(joined).toContain("agents.dave.timezone");
+  });
+});

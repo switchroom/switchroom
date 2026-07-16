@@ -329,6 +329,41 @@ class TestFormatMemories:
         result = format_memories(mems)
         assert "bare memory" in result
 
+    # switchroom #tz-fix (recall side): mentioned_at is a UTC ISO timestamp
+    # from the Hindsight server; recall must render it in the agent's LOCAL
+    # am/pm, not surface a UTC "when".
+    def test_mentioned_at_utc_iso_rendered_local(self, monkeypatch):
+        monkeypatch.setenv("SWITCHROOM_TIMEZONE", "Australia/Melbourne")
+        monkeypatch.delenv("TZ", raising=False)
+        # 04:09Z in July → AEST (UTC+10) → 02:09 PM local.
+        mems = [{"text": "m", "mentioned_at": "2026-07-16T04:09:00Z"}]
+        result = format_memories(mems)
+        assert "(2026-07-16 02:09 PM AEST)" in result
+        # Never the raw UTC value.
+        assert "04:09:00Z" not in result
+        assert "T04:09" not in result
+
+    def test_mentioned_at_offset_form_rendered_local(self, monkeypatch):
+        monkeypatch.setenv("SWITCHROOM_TIMEZONE", "Australia/Melbourne")
+        monkeypatch.delenv("TZ", raising=False)
+        mems = [{"text": "m", "mentioned_at": "2026-07-16T04:09:00+00:00"}]
+        result = format_memories(mems)
+        assert "(2026-07-16 02:09 PM AEST)" in result
+
+    def test_mentioned_at_date_only_preserved_verbatim(self, monkeypatch):
+        # A bare date has no wall clock to shift — surface it verbatim rather
+        # than fabricating a midnight time.
+        monkeypatch.setenv("SWITCHROOM_TIMEZONE", "Australia/Melbourne")
+        mems = [{"text": "m", "mentioned_at": "2024-01-01"}]
+        result = format_memories(mems)
+        assert "(2024-01-01)" in result
+
+    def test_mentioned_at_unparseable_preserved_verbatim(self, monkeypatch):
+        monkeypatch.setenv("SWITCHROOM_TIMEZONE", "Australia/Melbourne")
+        mems = [{"text": "m", "mentioned_at": "not-a-timestampT!!"}]
+        result = format_memories(mems)
+        assert "(not-a-timestampT!!)" in result
+
 
 # ---------------------------------------------------------------------------
 # _is_channel_message_tool

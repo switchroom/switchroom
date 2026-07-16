@@ -70,6 +70,22 @@ describe("buildAgentLogsArgs (docker argv contract)", () => {
       "logs", "switchroom-coach",
     ]);
   });
+
+  // #tz-fix audit gap 2: the Telegram /logs local-time render depends on
+  // docker's own UTC ISO-Z per-line stamp, which ONLY exists when the argv
+  // carries --timestamps. Without this, raw lines have no leading ISO-Z
+  // stamp and the display transform is dead code.
+  it("emits --timestamps when requested (the Telegram /logs shape)", () => {
+    expect(buildAgentLogsArgs("coach", false, 20, true)).toEqual([
+      "logs", "--tail", "20", "--timestamps", "switchroom-coach",
+    ]);
+  });
+
+  it("omits --timestamps by default (plain CLI dump unchanged)", () => {
+    expect(buildAgentLogsArgs("coach", false, 20)).toEqual([
+      "logs", "--tail", "20", "switchroom-coach",
+    ]);
+  });
 });
 
 describe("agent logs command options", () => {
@@ -102,6 +118,18 @@ describe("agent logs command options", () => {
   it("advertises --lines in its help output", () => {
     const logs = findLogsCommand();
     expect(logs.helpInformation()).toContain("--lines");
+  });
+
+  // Same drift-class outcome test for --timestamps: the gateway's /logs now
+  // builds `agent logs <name> --lines <n> --timestamps`; an unregistered
+  // option would make every /logs invocation error out.
+  it("registers a --timestamps / -t boolean option", () => {
+    const logs = findLogsCommand();
+    const opt = logs.options.find((o) => o.long === "--timestamps");
+    expect(opt).toBeDefined();
+    expect(opt!.short).toBe("-t");
+    // boolean flag (takes no value)
+    expect(opt!.required || opt!.optional).toBe(false);
   });
 });
 

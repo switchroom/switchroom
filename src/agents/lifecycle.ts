@@ -763,18 +763,36 @@ export function attachAgent(name: string, tmuxSupervisor = true): void {
  * the CLI action now always passes a tail (default 50), so a bare
  * `switchroom agent logs <name>` no longer dumps the entire log.
  */
-export function buildAgentLogsArgs(name: string, follow: boolean, tail?: number): string[] {
+export function buildAgentLogsArgs(
+  name: string,
+  follow: boolean,
+  tail?: number,
+  timestamps?: boolean,
+): string[] {
   const args = ["logs"];
   if (follow) args.push("-f");
   if (tail !== undefined && Number.isFinite(tail) && tail >= 1) {
     args.push("--tail", String(Math.floor(tail)));
   }
+  // #tz-fix audit (gap 2): `--timestamps` prefixes EVERY line with docker's
+  // own UTC ISO-8601-Z stamp (e.g. `2026-07-16T20:17:58.433481596Z `) —
+  // the only deterministic per-line timestamp available. Without it, lines
+  // carry only whatever stamp the app itself printed (often none, or a
+  // local-zone `%H:%M:%S,mmm` form). The Telegram /logs path requests this
+  // so the gateway can render the stamp in the operator's local am/pm at
+  // display time (renderLogTimestampsLocal).
+  if (timestamps) args.push("--timestamps");
   args.push(containerName(name));
   return args;
 }
 
-export function getAgentLogs(name: string, follow: boolean, tail?: number): void {
-  const args = buildAgentLogsArgs(name, follow, tail);
+export function getAgentLogs(
+  name: string,
+  follow: boolean,
+  tail?: number,
+  timestamps?: boolean,
+): void {
+  const args = buildAgentLogsArgs(name, follow, tail, timestamps);
 
   const child = spawn("docker", args, { stdio: "inherit" });
   child.on("error", (err) => {

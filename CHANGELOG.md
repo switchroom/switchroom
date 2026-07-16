@@ -24,6 +24,17 @@
   directory. Two new doctor probes flag a persistently un-checkpointed WAL
   inside the broker and any agent `.vault-token` referencing a grant id
   absent from the DB (the orphan-token symptom).
+- **Timestamps you can read** (#3286) — three follow-ups to the #3275
+  timezone fix. Recalled-memory `mentioned_at` timestamps and Telegram
+  `/logs` output now render in local am/pm instead of UTC (`/logs` gains
+  a per-line docker timestamp via a new `agent logs -t/--timestamps`
+  flag; the conversion is display-only, in the gateway/operator zone).
+  **Behavior change:** a `timezone:` config value that is shape-valid
+  but names a non-existent IANA zone (e.g. `Australia/Melbrone`) now
+  fails config load/apply loudly with the offending field named. Such a
+  typo previously passed validation and silently ran the agent on UTC —
+  if your apply starts failing here, the fleet was already mis-timed;
+  fix the zone name.
 
 ## v0.18.27 — Steadier Telegram cards and more reliable model switching
 

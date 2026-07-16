@@ -1674,8 +1674,12 @@ export function registerAgentCommand(program: Command): void {
       "-n, --lines <count>",
       "Number of trailing log lines to show (default 50, capped at 1000; with -f, bounds the initial backlog before streaming). Note: Telegram's /logs applies its own chat-sized default of 20 / max 200 before invoking this.",
     )
+    .option(
+      "-t, --timestamps",
+      "Prefix each line with docker's UTC ISO-8601 timestamp (docker logs --timestamps). Telegram's /logs passes this so the gateway can render each stamp in the operator's local time at display.",
+    )
     .action(
-      withConfigError(async (name: string, opts: { follow?: boolean; lines?: string }) => {
+      withConfigError(async (name: string, opts: { follow?: boolean; lines?: string; timestamps?: boolean }) => {
         const config = getConfig(program);
 
         if (!config.agents[name]) {
@@ -1683,7 +1687,7 @@ export function registerAgentCommand(program: Command): void {
           process.exit(1);
         }
 
-        getAgentLogs(name, opts.follow ?? false, resolveLogsTail(opts.lines));
+        getAgentLogs(name, opts.follow ?? false, resolveLogsTail(opts.lines), opts.timestamps ?? false);
       })
     );
 

@@ -40,6 +40,32 @@
 import { readFileSync, readlinkSync } from "node:fs";
 import type { AgentConfig, SwitchroomConfig } from "./schema.js";
 
+/**
+ * Does this string name a timezone the runtime can actually resolve?
+ *
+ * `isValidTimezone` (schema.ts) is a SHAPE check — a cheap regex that accepts
+ * any `Region/City` pair without shipping the IANA database. That lets a
+ * shape-valid TYPO (e.g. `Australia/Melbrone`, `America/New_Yrok`) pass config
+ * load, then silently degrade to UTC at runtime because `Intl` / `ZoneInfo`
+ * reject the unknown zone (#tz-fix audit, LOW gap 3).
+ *
+ * This predicate closes that gap by asking the runtime directly: constructing
+ * an `Intl.DateTimeFormat` with an unknown `timeZone` throws `RangeError`,
+ * while every real IANA zone (and `UTC`) succeeds. Node ships full-ICU by
+ * default, so the tz database backing this is the same one the agent's
+ * `Intl`-based local-time rendering uses — a zone that passes here is a zone
+ * that renders correctly at runtime. Total: never throws, returns a boolean.
+ */
+export function isResolvableTimezone(zone: string): boolean {
+  try {
+    // eslint-disable-next-line no-new
+    new Intl.DateTimeFormat("en-US", { timeZone: zone });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export interface ResolveTimezoneOpts {
   /**
    * Read /etc/timezone (or equivalent). Return the trimmed string or
