@@ -898,6 +898,20 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
   }
 
   /**
+   * Force-evict a LEAKED row from the specific group it lives in, used when the
+   * agentIndex has desynced (points at a different feed, or none) so the normal
+   * `removeWorker`/`terminateWorker` path — which resolves the group via the
+   * index — can't reach it. Deletes the index entry ONLY if it still points at
+   * THIS group, so a live row for the same agentId in another feed keeps its
+   * mapping intact.
+   */
+  function evictRowFromGroup(g: FeedGroup, agentId: string): void {
+    g.workers.delete(agentId)
+    if (agentIndex.get(agentId) === g.feedKey) agentIndex.delete(agentId)
+    maybeDeleteGroup(g)
+  }
+
+  /**
    * Delete an empty group. A group is gone only when it has NO tracked workers
    * AND no staged terminal repaints pending — the latter keeps the group object
    * reachable for the heartbeat re-drive after a flood/429 deferred the recap,
@@ -1243,7 +1257,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
     //      that keeps getting `update()` cues every heartbeat resets
     //      `lastUpdateAt` forever, so only an age anchor immune to that reset can
     //      reap it (Carrie 5h zombie pin, re-edited 3000+ times).
-    const staleAgentIds: Array<{ agentId: string; reason: 'silence' | 'absolute' }> = []
+    const staleAgentIds: Array<{ g: FeedGroup; agentId: string; reason: 'silence' | 'absolute' }> = []
     const staleFinished: Array<{ g: FeedGroup; agentId: string; reason: 'silence' | 'absolute' }> = []
     for (const g of groups.values()) {
       for (const row of g.workers.values()) {
@@ -1253,8 +1267,12 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
         // Attribute the reap to the absolute cap only when silence alone would
         // NOT have fired — so the log names the trigger that actually caught it.
         const reason: 'silence' | 'absolute' = silent ? 'silence' : 'absolute'
+        // Carry the group the row was ACTUALLY found in (not `groupOfAgent`,
+        // which resolves via the agentIndex — that index can desync from a
+        // group's `workers` map when an agentId migrated feeds, orphaning the
+        // old row. Using `g` guarantees the reap evicts the row that exists.)
         if (row.finished) staleFinished.push({ g, agentId: row.agentId, reason })
-        else staleAgentIds.push({ agentId: row.agentId, reason })
+        else staleAgentIds.push({ g, agentId: row.agentId, reason })
       }
     }
     // GC any FINISHED row still lingering past the TTL (#3207: finished rows
@@ -1274,15 +1292,32 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       removeWorker(g, agentId)
       syncPin(g)
     }
-    for (const { agentId, reason } of staleAgentIds) {
-      const row = groupOfAgent(agentId)?.workers.get(agentId)
+    for (const { g, agentId, reason } of staleAgentIds) {
+      // Read the row from the group it was FOUND in, so the log reports the
+      // real age even when the agentIndex has desynced (the old bug printed
+      // "no update in 0s" because it read `groupOfAgent(agentId)`, which
+      // resolved to a different/absent group and fell back to `now`).
+      const row = g.workers.get(agentId)
       if (reason === 'absolute') {
         const age = Math.floor((now - (row?.createdAtMs ?? now)) / 1000)
         log(`worker-feed: ABSOLUTE cap reap agent=${agentId} — row age ${age}s (>= ${Math.floor(absoluteRowLifetimeCapMs / 1000)}s); force-terminating immortal row (survives lastUpdateAt reset)`)
       } else {
         log(`worker-feed: TTL reap agent=${agentId} — no update in ${Math.floor((now - (row?.lastUpdateAt ?? now)) / 1000)}s (>= ${Math.floor(staleWorkerTtlMs / 1000)}s); force-terminating leaked row`)
       }
-      void terminateWorker(agentId)
+      // Normal honest finalize when the agentIndex still points at THIS group
+      // (renders the terminal recap + releases the pin through the chain). But
+      // when the index has desynced — it resolves to a different group or none
+      // — `terminateWorker` would look up the wrong/no row and no-op, leaving
+      // this row to churn every heartbeat forever. Detect that and force-evict
+      // the leaked row directly from the group it actually lives in.
+      if (groupOfAgent(agentId) === g) {
+        void terminateWorker(agentId)
+      } else {
+        log(`worker-feed: force-evicting leaked row agent=${agentId} feed=${g.feedKey} — agentIndex desynced (points elsewhere); removing directly`)
+        markFinalized(agentId)
+        evictRowFromGroup(g, agentId)
+        syncPin(g)
+      }
     }
     for (const g of [...groups.values()]) {
       // Deferred-finalize re-drive: a terminal edit that hit a cooldown/flood
@@ -1401,6 +1436,20 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       if (existingRow?.finished === true) return Promise.resolve()
 
       const feedKey = feedKeyOf(chatId, threadId)
+      // Feed-migration cleanup (root-cause of the "no update in 0s" churn): if
+      // this agentId is already indexed to a DIFFERENT feed, its prior row is
+      // about to be orphaned (we re-index below to the new feed, but the old
+      // group's `workers` map still holds the stale row — invisible to
+      // `groupOfAgent` forever after, so the TTL sweep can never evict it and
+      // it churns every heartbeat). Evict the stale row from its old group now.
+      const priorFeedKey = agentIndex.get(agentId)
+      if (priorFeedKey != null && priorFeedKey !== feedKey) {
+        const priorGroup = groups.get(priorFeedKey)
+        if (priorGroup != null) {
+          evictRowFromGroup(priorGroup, agentId)
+          syncPin(priorGroup)
+        }
+      }
       let g = groups.get(feedKey)
       if (g == null) {
         g = {
