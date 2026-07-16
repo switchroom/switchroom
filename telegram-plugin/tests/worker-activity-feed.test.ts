@@ -659,6 +659,10 @@ describe('createWorkerActivityFeed — heartbeat', () => {
       bot,
       now: () => clock,
       minEditIntervalMs: 2500,
+      // Suffix-mechanics test: pin the elapsed-refresh cadence to the edit floor
+      // so this exercises the classic 6s heartbeat suffix, not the coarse
+      // flood-pacing cadence (covered by its own tests below).
+      elapsedRefreshMs: 2500,
       heartbeatTickMs: 6000,
       // No real timer: drive ticks manually.
       setInterval: () => 1,
@@ -862,6 +866,10 @@ describe('createWorkerActivityFeed — heartbeat', () => {
       firstPaintMinMs: 8000,
       heartbeatTickMs: 6000,
       minEditIntervalMs: 2500,
+      // Heartbeat-liveness test: pin the elapsed-refresh cadence to the edit
+      // floor so a later heartbeat repaints the climbing clock under the classic
+      // 6s cadence (coarse flood-pacing is covered by its own tests below).
+      elapsedRefreshMs: 2500,
       setInterval: () => 1,
       clearInterval: () => {},
     })
@@ -1549,5 +1557,118 @@ describe('worker-feed send-gate shed contract', () => {
     expect(bot.edits).toHaveLength(1)
     expect(bot.edits[0].text).toContain('_done · 5 tools')
     expect(feed.has('w1')).toBe(false)
+  })
+})
+
+// ─── elapsed-only edit pacing (flood-ban defense, Part 1) ────────────────────
+
+describe('createWorkerActivityFeed — elapsed-only edit pacing', () => {
+  const drain = () => new Promise((r) => setTimeout(r, 0))
+
+  function mkFeed(bot: FakeBot, nowRef: { t: number }) {
+    return createWorkerActivityFeed({
+      bot,
+      now: () => nowRef.t,
+      minEditIntervalMs: 2500,
+      elapsedRefreshMs: 15_000,
+      firstPaintMinMs: 8000,
+      heartbeatTickMs: 6000,
+      setInterval: () => 1,
+      clearInterval: () => {},
+    })
+  }
+
+  it('suppresses clock-only churn: elapsed advancing within elapsedRefreshMs emits NO edit', async () => {
+    const bot = makeFakeBot()
+    const ref = { t: 10_000 }
+    const feed = mkFeed(bot, ref)
+
+    // First paint.
+    ref.t = 20_000
+    await feed.update('w1', 'chat', view({ elapsedMs: 9000, latestSummary: 'scanning', toolCount: 3 }))
+    expect(bot.sent).toHaveLength(1)
+
+    // A stream of ticks where ONLY the elapsed clock advances (same step, same
+    // toolCount). Every one is past the 2.5s edit floor but under the 15s
+    // elapsed-refresh cadence measured from the last edit (paint @20_000) — so
+    // the send-gate-evading clock-only edit that earns a flood ban never fires.
+    for (const t of [23_000, 26_000, 30_000, 34_000]) {
+      ref.t = t
+      await feed.update('w1', 'chat', view({ elapsedMs: t - 11_000, latestSummary: 'scanning', toolCount: 3 }))
+    }
+    await drain()
+    expect(bot.edits).toHaveLength(0)
+  })
+
+  it('renders a substantive step change PROMPTLY (before the elapsed-refresh cadence)', async () => {
+    const bot = makeFakeBot()
+    const ref = { t: 10_000 }
+    const feed = mkFeed(bot, ref)
+
+    ref.t = 20_000
+    await feed.update('w1', 'chat', view({ elapsedMs: 9000, latestSummary: 'scanning', toolCount: 3 }))
+    expect(bot.sent).toHaveLength(1)
+
+    // 6s later: still under the 15s elapsed-refresh cadence, but the STEP and
+    // toolCount changed — a real update. It renders immediately (only the 2.5s
+    // floor applies), not held for the coarse clock cadence.
+    ref.t = 26_000
+    await feed.update('w1', 'chat', view({ elapsedMs: 15_000, latestSummary: 'writing report', toolCount: 4 }))
+    await drain()
+    expect(bot.edits.length).toBeGreaterThanOrEqual(1)
+    expect(bot.edits[bot.edits.length - 1].text).toContain('writing report')
+  })
+
+  it('forces the terminal edit through and renders the honest final elapsed', async () => {
+    const bot = makeFakeBot()
+    const ref = { t: 10_000 }
+    const feed = mkFeed(bot, ref)
+
+    ref.t = 20_000
+    await feed.update('w1', 'chat', view({ elapsedMs: 9000, latestSummary: 'scanning', toolCount: 3 }))
+    expect(bot.sent).toHaveLength(1)
+
+    // Completion within the elapsed-refresh window still finalizes immediately
+    // (terminal edits bypass the pacing) and shows the correct final elapsed.
+    ref.t = 28_000
+    await feed.finish('w1', view({ state: 'done', toolCount: 6, elapsedMs: 31_000, latestSummary: 'all done' }))
+    await drain()
+    expect(bot.edits.length).toBeGreaterThanOrEqual(1)
+    const last = bot.edits[bot.edits.length - 1].text
+    expect(last).toContain('done · 6 tools')
+    expect(last).toContain('31s')
+  })
+
+  it('does not over-suppress a substantive change that would field-boundary-collide under naive concatenation', async () => {
+    const bot = makeFakeBot()
+    const ref = { t: 10_000 }
+    const feed = mkFeed(bot, ref)
+
+    // Paint: toolCount 1, totalTokens 23. Under a delimiter-less substance key
+    // the fields `1` and `23` concatenate to `123`.
+    ref.t = 20_000
+    await feed.update(
+      'w1',
+      'chat',
+      view({ elapsedMs: 9000, latestSummary: 'scanning', toolCount: 1, totalTokens: 23 }),
+    )
+    expect(bot.sent).toHaveLength(1)
+
+    // A REAL substantive change (toolCount 1→12, totalTokens 23→3) that collides
+    // to the SAME `123` under naive concatenation. It lands within the 15s
+    // elapsed-refresh window (past the 2.5s floor), so ONLY a substance-key
+    // difference can drive the edit. A colliding key would wrongly treat this as
+    // elapsed-only churn and suppress it; the NUL/RS-delimited key keeps them
+    // distinct, so the edit fires promptly.
+    ref.t = 22_500
+    await feed.update(
+      'w1',
+      'chat',
+      view({ elapsedMs: 11_500, latestSummary: 'scanning', toolCount: 12, totalTokens: 3 }),
+    )
+    await drain()
+    expect(bot.edits.length).toBeGreaterThanOrEqual(1)
+    // The rendered card reflects the new tool count, proving the change landed.
+    expect(bot.edits[bot.edits.length - 1].text).toContain('12 tools')
   })
 })

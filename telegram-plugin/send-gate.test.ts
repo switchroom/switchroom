@@ -137,6 +137,8 @@ describe('send-gate: SEND_GATE_DEFAULTS (compile-time default PIN)', () => {
       perGroupPerMin: 18,
       perGroupBurst: 2,
       editFloorMs: 1500,
+      perMessageEditWindowMs: 300_000,
+      perMessageEditMaxPerWindow: 150,
     })
   })
 })
@@ -157,6 +159,8 @@ describe('send-gate: sendGateConfigFromEnv (yaml → env → createSendGate)', (
         SWITCHROOM_TG_SEND_GATE_PER_GROUP_PER_MIN: '30',
         SWITCHROOM_TG_SEND_GATE_PER_GROUP_BURST: '4',
         SWITCHROOM_TG_SEND_GATE_EDIT_FLOOR_MS: '2000',
+        SWITCHROOM_TG_SEND_GATE_PER_MSG_EDIT_WINDOW_MS: '30000',
+        SWITCHROOM_TG_SEND_GATE_PER_MSG_EDIT_MAX: '8',
       }),
     )
     expect(cfg).toEqual({
@@ -168,7 +172,21 @@ describe('send-gate: sendGateConfigFromEnv (yaml → env → createSendGate)', (
       perGroupPerMin: 30,
       perGroupBurst: 4,
       editFloorMs: 2000,
+      perMessageEditWindowMs: 30000,
+      perMessageEditMaxPerWindow: 8,
     })
+  })
+
+  it('per-message edit budget: MAX accepts 0 (disables the backstop); WINDOW must be positive', () => {
+    expect(
+      sendGateConfigFromEnv(E({ SWITCHROOM_TG_SEND_GATE_PER_MSG_EDIT_MAX: '0' }))
+        .perMessageEditMaxPerWindow,
+    ).toBe(0)
+    // A zero/negative window is malformed → dropped so createSendGate's default applies.
+    expect(
+      sendGateConfigFromEnv(E({ SWITCHROOM_TG_SEND_GATE_PER_MSG_EDIT_WINDOW_MS: '0' }))
+        .perMessageEditWindowMs,
+    ).toBeUndefined()
   })
 
   it('accepts a fractional per-sec rate (rates are not integers)', () => {
@@ -855,5 +873,125 @@ describe('send-gate: flood windows + boot ramp (L3 / §7 hook)', () => {
     await flush()
     await Promise.all(ps2)
     expect(c2.filter((c) => c.at === 11_000).length).toBe(10) // full burst, no ramp
+  })
+})
+
+describe('send-gate: long-horizon per-message edit budget (backstop)', () => {
+  it('paces + coalesces a sustained same-message cosmetic edit stream under the rolling cap', async () => {
+    const clock = new FakeClock()
+    const { calls, fn } = recorder(clock)
+    // Tight, fast budget for a deterministic test: 2 cosmetic edits / 5s window,
+    // 1s edit floor. A distinct edit every 1s would sail through the floor
+    // forever (this is exactly the sub-1/s flood the backstop exists to stop).
+    const gate = createSendGate({
+      enabled: true,
+      clock,
+      editFloorMs: 1000,
+      perMessageEditWindowMs: 5000,
+      perMessageEditMaxPerWindow: 2,
+    })
+    const msg = 77
+    const attempts = 20
+    const promises: Promise<unknown>[] = []
+    for (let i = 0; i < attempts; i++) {
+      promises.push(
+        gate.gate(fn(`v${i}`), { messageId: msg, editPayload: `v${i}`, priorityClass: 'cosmetic' }),
+      )
+      await flush()
+      await clock.advance(1000)
+    }
+    // Drain any final budget-deferred send (a full window is enough).
+    await clock.advance(5000)
+    await flush()
+    await Promise.allSettled(promises)
+
+    const stats = gate.stats().global
+    // The sustained ~1/s stream is paced FAR below the attempt count — bounded
+    // by ~2 sends per 5s over the ~25s simulated span, not 20 one-per-second.
+    expect(stats.sent).toBeLessThan(attempts)
+    expect(stats.sent).toBeLessThanOrEqual(10)
+    // The backstop actively deferred at least one edit (not just the 1s floor).
+    expect(stats.budgetDeferred).toBeGreaterThan(0)
+    // Coalescing collapsed the deferred edits (last-write-wins), so the FINAL
+    // send carries the newest payload — no stale body is shown.
+    expect(calls[calls.length - 1].label).toBe(`v${attempts - 1}`)
+  })
+
+  it('does NOT throttle distinct message_ids — each message gets its own budget', async () => {
+    const clock = new FakeClock()
+    const { calls, fn } = recorder(clock)
+    const gate = createSendGate({
+      enabled: true,
+      clock,
+      editFloorMs: 1000,
+      perMessageEditWindowMs: 5000,
+      perMessageEditMaxPerWindow: 1,
+    })
+    // One cosmetic edit to each of two distinct messages at t=0. A per-message
+    // budget of 1 must NOT make message B's first edit wait on message A's.
+    const pA = gate.gate(fn('A'), { messageId: 1, editPayload: 'A', priorityClass: 'cosmetic' })
+    const pB = gate.gate(fn('B'), { messageId: 2, editPayload: 'B', priorityClass: 'cosmetic' })
+    await flush()
+    await Promise.all([pA, pB])
+    expect(calls.map((c) => c.label).sort()).toEqual(['A', 'B'])
+    expect(calls.every((c) => c.at === 0)).toBe(true)
+    expect(gate.stats().global.budgetDeferred).toBe(0)
+  })
+
+  it('does NOT throttle non-cosmetic (useful/untagged) edits of the same message', async () => {
+    const clock = new FakeClock()
+    const { calls, fn } = recorder(clock)
+    // Budget so tight it would allow only ONE cosmetic edit ever in the span —
+    // yet untagged edits default to `useful` and must bypass the budget entirely
+    // (only the 1s floor applies). Legitimate stream/draft edits are untouched.
+    const gate = createSendGate({
+      enabled: true,
+      clock,
+      editFloorMs: 1000,
+      perMessageEditWindowMs: 100_000,
+      perMessageEditMaxPerWindow: 1,
+    })
+    const msg = 9
+    const promises: Promise<unknown>[] = []
+    for (let i = 0; i < 5; i++) {
+      promises.push(gate.gate(fn(`u${i}`), { messageId: msg, editPayload: `u${i}` }))
+      await flush()
+      await clock.advance(1000)
+    }
+    await clock.advance(1000)
+    await flush()
+    await Promise.allSettled(promises)
+    // All five distinct useful edits landed (floor-spaced), none budget-deferred.
+    expect(gate.stats().global.sent).toBe(5)
+    expect(gate.stats().global.budgetDeferred).toBe(0)
+    expect(calls.map((c) => c.label)).toEqual(['u0', 'u1', 'u2', 'u3', 'u4'])
+  })
+
+  it('disables the backstop when perMessageEditMaxPerWindow is 0', async () => {
+    const clock = new FakeClock()
+    const { calls, fn } = recorder(clock)
+    const gate = createSendGate({
+      enabled: true,
+      clock,
+      editFloorMs: 1000,
+      perMessageEditMaxPerWindow: 0,
+    })
+    const msg = 55
+    const promises: Promise<unknown>[] = []
+    for (let i = 0; i < 6; i++) {
+      promises.push(
+        gate.gate(fn(`c${i}`), { messageId: msg, editPayload: `c${i}`, priorityClass: 'cosmetic' }),
+      )
+      await flush()
+      await clock.advance(1000)
+    }
+    await clock.advance(1000)
+    await flush()
+    await Promise.allSettled(promises)
+    // With the budget off, only the 1s floor gates: every floor-spaced distinct
+    // edit lands and nothing is budget-deferred.
+    expect(gate.stats().global.sent).toBe(6)
+    expect(gate.stats().global.budgetDeferred).toBe(0)
+    expect(calls.map((c) => c.label)).toEqual(['c0', 'c1', 'c2', 'c3', 'c4', 'c5'])
   })
 })

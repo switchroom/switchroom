@@ -197,6 +197,14 @@ export interface BucketCounters {
    * because the open window exceeded the fail-fast ceiling (part3-design §3).
    */
   failedFast: number
+  /**
+   * Cosmetic edits DEFERRED at least once by the long-horizon per-message edit
+   * budget (rolling-window cap). Counts driver loop iterations that slept on the
+   * budget, not distinct messages — a paced runaway stream increments this each
+   * time it waits out the window. A non-zero, climbing value means the backstop
+   * is actively pacing a sustained same-message edit stream.
+   */
+  budgetDeferred: number
 }
 
 export interface SendGateStats {
@@ -256,6 +264,35 @@ export interface SendGateConfig {
   perGroupBurst?: number
   /** Minimum ms between edits of the same message_id. Default 1500. */
   editFloorMs?: number
+  /**
+   * Long-horizon per-message edit budget (rolling window). DEFENSE-IN-DEPTH
+   * backstop for a runaway same-message edit stream (finn incident: sustained
+   * worker-card clock-only edits → ~88min 429 ban). It caps a SINGLE message to
+   * at most `perMessageEditMaxPerWindow` cosmetic edits per
+   * `perMessageEditWindowMs`; beyond that the driver DEFERS the next edit until
+   * the window slides, and newer edits coalesce (last-write-wins) onto the
+   * pending slot in the meantime — so a runaway is paced + collapsed rather than
+   * sustained.
+   *
+   * IMPORTANT — this is a coarse rate ceiling, NOT the primary fix. The gate
+   * cannot tell a SUBSTANTIVE cosmetic edit (a new worker step) from an
+   * elapsed-clock cosmetic edit; both carry a changed payload. So the primary
+   * cure for the clock-churn flood is at the source (`worker-activity-feed.ts`
+   * suppresses elapsed-only edits via a substance signature), and THIS backstop
+   * must sit ABOVE legitimate substantive cadence so it never throttles real
+   * updates. The worker feed's own min-edit interval is 2500ms (≤24 edits/min);
+   * the default here — 150 edits / 300_000ms ⟹ a 30 edits/min sustained ceiling
+   * — sits above that, so a normal (even continuously-updating) card never
+   * binds, while a stream that sustains faster than the feed's throttle for
+   * minutes (e.g. a future regression re-introducing per-tick churn, or a
+   * lowered floor) is paced back to 30/min. Scoped strictly to `cosmetic`-class
+   * edits of the SAME `${chat_id}:${messageId}` (worker-feed, typing,
+   * reactions); `useful` / `critical` edits and all non-edit sends are
+   * untouched, and distinct messages each get their own budget. Set
+   * `perMessageEditMaxPerWindow: 0` to disable the backstop.
+   */
+  perMessageEditWindowMs?: number
+  perMessageEditMaxPerWindow?: number
   /**
    * Flood windows to re-open at construction (part3-design §7). PR 2 loads
    * these from `flood-wait.json` BEFORE the first outbound call so a restart
@@ -433,6 +470,14 @@ interface MessageEditState {
   running: boolean
   /** Per-message flood suppression window (part3-design §7). */
   suppressedUntilMs: number
+  /**
+   * Send-START timestamps of recent COSMETIC edits to this message, kept within
+   * the long-horizon rolling window (`perMessageEditWindowMs`). Pruned to the
+   * window on each driver loop and appended at each send start; its length is
+   * the message's edit count over the trailing window and gates the per-message
+   * edit budget. Bounded by the budget cap; empty when the backstop is disabled.
+   */
+  editWindowTs: number[]
 }
 
 function hashPayload(payload: unknown): string {
@@ -517,6 +562,15 @@ export const SEND_GATE_DEFAULTS = {
   perGroupBurst: 2,
   /** Minimum ms between edits of the same message_id. */
   editFloorMs: 1500,
+  /** Long-horizon per-message edit budget: rolling window length (ms). */
+  perMessageEditWindowMs: 300_000,
+  /**
+   * Long-horizon per-message edit budget: max cosmetic edits per window.
+   * 150 / 300s ⟹ a 30 edits/min sustained ceiling — above the worker feed's
+   * own 24/min cadence so legitimate substantive updates never bind (see the
+   * SendGateConfig field doc).
+   */
+  perMessageEditMaxPerWindow: 150,
 } as const
 
 export function createSendGate(config: SendGateConfig): SendGate {
@@ -529,6 +583,14 @@ export function createSendGate(config: SendGateConfig): SendGate {
   const perGroupPerMin = config.perGroupPerMin ?? SEND_GATE_DEFAULTS.perGroupPerMin
   const perGroupBurst = config.perGroupBurst ?? SEND_GATE_DEFAULTS.perGroupBurst
   const editFloorMs = config.editFloorMs ?? SEND_GATE_DEFAULTS.editFloorMs
+  const perMessageEditWindowMs = Math.max(
+    1,
+    Math.floor(config.perMessageEditWindowMs ?? SEND_GATE_DEFAULTS.perMessageEditWindowMs),
+  )
+  const perMessageEditMaxPerWindow = Math.max(
+    0,
+    Math.floor(config.perMessageEditMaxPerWindow ?? SEND_GATE_DEFAULTS.perMessageEditMaxPerWindow),
+  )
   const messageStateTtlMs = config.messageStateTtlMs ?? 60_000
   const maxMessageStates = config.maxMessageStates ?? 5_000
   const usefulTtlMs = config.usefulTtlMs ?? 120_000
@@ -546,6 +608,7 @@ export function createSendGate(config: SendGateConfig): SendGate {
     shed: 0,
     expired: 0,
     failedFast: 0,
+    budgetDeferred: 0,
   }
 
   const bootStart = clock.now()
@@ -605,6 +668,7 @@ export function createSendGate(config: SendGateConfig): SendGate {
         pending: null,
         running: false,
         suppressedUntilMs: 0,
+        editWindowTs: [],
       }
       perMessage.set(key, state)
     }
@@ -902,7 +966,28 @@ export function createSendGate(config: SendGateConfig): SendGate {
     try {
       while (state.pending) {
         const now = clock.now()
-        const readyAt = Math.max(state.lastSentMs + editFloorMs, state.suppressedUntilMs)
+        let readyAt = Math.max(state.lastSentMs + editFloorMs, state.suppressedUntilMs)
+        // Long-horizon per-message edit budget (backstop). Scoped to cosmetic
+        // edits of THIS message: prune the rolling window, and if it is already
+        // full, defer until the oldest in-window send ages out. Reading the
+        // pending edit's (possibly upgraded) class here means a critical edit
+        // that coalesced onto a cosmetic driver is NOT budget-capped — it must
+        // never block unbounded (part3-design §3). Newer edits keep coalescing
+        // into `state.pending` while we sleep, so pacing preserves last-write-
+        // wins rather than sending stale bodies.
+        if (perMessageEditMaxPerWindow > 0 && state.pending.priorityClass === 'cosmetic') {
+          const windowStart = now - perMessageEditWindowMs
+          while (state.editWindowTs.length > 0 && state.editWindowTs[0] <= windowStart) {
+            state.editWindowTs.shift()
+          }
+          if (state.editWindowTs.length >= perMessageEditMaxPerWindow) {
+            const budgetReadyAt = state.editWindowTs[0] + perMessageEditWindowMs
+            if (budgetReadyAt > readyAt) {
+              readyAt = budgetReadyAt
+              counters.budgetDeferred++
+            }
+          }
+        }
         const waitMs = readyAt - now
         if (waitMs > 0) {
           // Still inside the floor / an open window — sleep, then re-read
@@ -958,6 +1043,16 @@ export function createSendGate(config: SendGateConfig): SendGate {
         // Reserve the send-start time BEFORE awaiting the network so the floor
         // is measured from send start (matches the per-message serialization).
         state.lastSentMs = clock.now()
+        // Record this send against the long-horizon budget when it is a cosmetic
+        // edit (the only class the budget gates). Recorded at send START so the
+        // rolling window measures dispatch cadence, consistent with the floor.
+        if (perMessageEditMaxPerWindow > 0 && p.priorityClass === 'cosmetic') {
+          state.editWindowTs.push(state.lastSentMs)
+          // Bound the array against pathological inputs (it is naturally ≈ the
+          // budget cap since we prune to the window each loop).
+          const overflow = state.editWindowTs.length - (perMessageEditMaxPerWindow + 1)
+          if (overflow > 0) state.editWindowTs.splice(0, overflow)
+        }
         try {
           // N3 (liveness): this awaits `p.fn()` with no watchdog. A `fn` that
           // NEVER settles would keep `state.running` true forever, making the
@@ -1222,6 +1317,8 @@ export type SendGateEnvConfig = Pick<SendGateConfig, 'enabled'> &
       | 'perGroupPerMin'
       | 'perGroupBurst'
       | 'editFloorMs'
+      | 'perMessageEditWindowMs'
+      | 'perMessageEditMaxPerWindow'
       | 'conservativeGlobalFloodScope'
     >
   >
@@ -1270,6 +1367,12 @@ export function sendGateConfigFromEnv(
   if (perGroupBurst !== undefined) out.perGroupBurst = perGroupBurst
   const editFloorMs = parseNonNegativeInt(env.SWITCHROOM_TG_SEND_GATE_EDIT_FLOOR_MS)
   if (editFloorMs !== undefined) out.editFloorMs = editFloorMs
+  // Long-horizon per-message edit budget (flood-ban backstop). Window ≥1ms is
+  // enforced in createSendGate; MAX_PER_WINDOW=0 disables the backstop.
+  const perMsgWindowMs = parsePositiveInt(env.SWITCHROOM_TG_SEND_GATE_PER_MSG_EDIT_WINDOW_MS)
+  if (perMsgWindowMs !== undefined) out.perMessageEditWindowMs = perMsgWindowMs
+  const perMsgMax = parseNonNegativeInt(env.SWITCHROOM_TG_SEND_GATE_PER_MSG_EDIT_MAX)
+  if (perMsgMax !== undefined) out.perMessageEditMaxPerWindow = perMsgMax
   // #3111 break-glass: restore the pre-#3111 always-open-global flood posture.
   // Unset ⇒ scope-precise default (global opened only on genuinely global 429s).
   const conservativeGlobal = parseBoolFlag(env.SWITCHROOM_TG_SEND_GATE_CONSERVATIVE_GLOBAL)
