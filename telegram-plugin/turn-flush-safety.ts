@@ -193,8 +193,32 @@ export function selectFlushDeliveryText(blocks: string[]): string {
 const NARRATION_OPENER =
   /^(let me\b|lemme\b|i'?ll\b|i will\b|i am going to\b|i'?m going to\b|i'?m about to\b|going to\b|first,?\s+(?:let me|i'?ll|i will)\b|now,?\s+(?:let me|i'?ll|i will)\b|next,?\s+(?:let me|i'?ll|i will)\b|let'?s\b)/i
 
+/**
+ * #3276 guard 8 — the `NARRATION_OPENER` regex alone misses common progress
+ * narration that opens with a gerund/present-continuous verb and trails off
+ * into an ellipsis or colon: "Checking now…", "Pulling the numbers:",
+ * "Looking into that…". Relying on the opener regex leaked those blocks into
+ * the delivered answer. This recognises a NON-terminal narration line
+ * deterministically, WITHOUT re-gating on a min-char floor (a short real
+ * answer like "Yes, done." must still deliver): a single short line that ends
+ * with an ellipsis or a colon is progress narration, not the terminal answer.
+ *
+ * Kept conservative on purpose — only a SINGLE-line block (no internal
+ * paragraph) under the substantive floor, ending in `…` / `...` / `:`, so a
+ * genuine multi-paragraph answer that happens to end a paragraph with a colon
+ * is never mistaken for narration.
+ */
+const NARRATION_TRAILER = /(?:\.{3}|…|:)\s*$/
+
+function isTrailingNarrationLine(block: string): boolean {
+  const t = block.trim()
+  if (t.length === 0 || t.length >= FLUSH_SUBSTANTIVE_MIN_CHARS) return false
+  if (t.includes('\n')) return false
+  return NARRATION_TRAILER.test(t)
+}
+
 function isNarrationBlock(block: string): boolean {
-  return NARRATION_OPENER.test(block.trimStart())
+  return NARRATION_OPENER.test(block.trimStart()) || isTrailingNarrationLine(block)
 }
 
 export type FlushDecision =

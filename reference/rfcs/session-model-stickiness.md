@@ -8,10 +8,84 @@ status: Accepted — revised per adversarial review + operator decision (default
 
 # RFC — Session-scoped `/model` stickiness
 
-**Status:** Accepted (rev 4 — session-scoped consume-once, #3183; rev 3 keep-by-default and rev 2 revert-by-default are superseded where §0.1 says so)
+**Status:** Accepted (rev 5 — deterministic switch, §0.05, operator decision 2026-07-16; rev 4 session-scoped consume-once §0.1 stands EXCEPT its "live Claude switches write no carrier" bullet, now superseded by §0.05; rev 3 keep-by-default and rev 2 revert-by-default superseded where §0.1 says so)
 **Author:** (agent-authored, operator-directed; semantics decided by the operator 2026-07)
 **Targets:** `origin/main` @ v0.18.7
 **Builds on:** #2982 (in-memory `sessionModelSource` + one-shot `.session-model-override` carrier), #2983 (live model on progress cards), #3178 (durable /model ack/trace/queue)
+
+---
+
+## 0.05 Rev 5 amendment (operator decision 2026-07-16) — DETERMINISTIC switch (reverses §0.1's "live Claude switches write no carrier")
+
+**Decision:** ALL `/model` switches — Claude→Claude, Claude→sr-*, sr-*→Claude,
+the Fable/alias button, and the picker SELECT — go through the consume-once
+`.session-model` carrier relaunch (`scheduleModelRelaunch` /
+`scheduleModelDefaultRelaunch`). The typed-inject-into-tmux + terminal-scrape
+switch path is **RETIRED**. This **supersedes §0.1 bullet 1** ("Live Claude
+switches write NO carrier … apply in-session via claude's native picker").
+Everything else in §0.1 (session-scoped revert on the next restart, consume-once,
+`/effort` unchanged, the invalidation/down-guard branches) still holds.
+
+- **Rationale.** The inject path silently no-op'd — keystrokes were swallowed
+  when the pane was not idle (and, per operator report, on idle panes too) — then
+  **optimistically recorded** the requested model as a success, an unverifiable
+  lie to `/status`. The carrier relaunch is deterministic: start.sh's
+  `exec claude --model <token>` cannot silently no-op, and `.active-session-model`
+  is a real post-boot signal. Success is reported ONLY from that signal (the
+  in-memory override is re-hydrated from `.active-session-model` at boot; the
+  transcript's `message.model` reclaims it on the first assistant line), never
+  from a scraped pane.
+
+- **Trade-off accepted.** A Claude→Claude switch now costs a fresh session
+  (~30s) and loses live in-session scrollback. Acceptable per operator: Hindsight
+  memory + the handoff briefing carry context. No `--continue`/`--resume`.
+
+- **Determinism scope (honest).** `.active-session-model` records the token
+  start.sh wrote *before* `exec claude` (the REQUESTED token), not a post-launch
+  confirmation. If a shape-valid but UNKNOWN Claude id is requested,
+  `--fallback-model` can mask it — claude serves the fallback while
+  `.active-session-model` holds the requested token. This is NOT a persistent
+  lie: the transcript's `message.model` reclaims the source on the first
+  assistant line, correcting `/status` to the model actually serving calls. The
+  pre-first-assistant window is the only optimistic window (bounded,
+  self-healing); it is documented here, not silently asserted as success. The
+  honest-FAILURE surface is scoped to the three modes start.sh's
+  `.session-model-alert` can report (corrupt carrier / configured-default changed
+  / proxy-only + LiteLLM-down); other divergence is corrected by the transcript,
+  not announced.
+
+- **`default` reverts via relaunch.** With inject retired, `/model default`
+  clears the carrier + in-memory override and RELAUNCHES so the live session
+  actually reverts to the configured `model:` (rather than a live no-op clear).
+
+- **Fable via the router (F2).** Routing the Fable BUTTON through the carrier
+  newly exposes that `fable`/`claude-fable-5` needs the LiteLLM **router root**,
+  not the `/anthropic` passthrough: `claude-fable-5` is a retired codename that
+  4xxs direct-to-Anthropic and only resolves via the router
+  (maps `fable`/`claude-fable-5` → `anthropic/claude-fable-5`, forwarding the
+  OAuth). start.sh's passthrough→router repoint `case` and its LiteLLM-down guard
+  are extended from `sr-*` to also cover `fable`/`claude-fable-5`. Verified live
+  against the litellm config + router `/v1/models`. Other Claude sessions
+  (opus/sonnet/haiku/default) keep the passthrough (it dodges the Opus SSE
+  re-chunk stall); Fable trades that for being routable at all.
+
+- **No restart storm.** Unchanged: the 15s `scheduleRestart` debounce (one
+  relaunch per switch; a second `/model` inside the window surfaces "~15s"),
+  consume-once (`rm -f` before apply), and last-write-wins on the carrier.
+
+- **Retired code.** `recordTypedModelSwitch`, `recordModelMenuSideEffects`, the
+  `isSrToClaudeTransition` wiring, the `inject`/`select` model-deps, and the
+  scrape helpers (`modelSwitchConfirmationLine`, `modelSwitchErrorLine`,
+  `isKeptModelConfirmation`, `sessionModelFromConfirmation`,
+  `optimisticModelRecordLabel`, `MODEL_SWITCH_*` regexes) are deleted; the
+  `optimistic` / scrape-derived `selectedModel` reply fields are removed.
+
+- **Copy.** All user-facing strings that claimed Claude switches are
+  instant/in-session are corrected to: *"A `/model` switch relaunches the session
+  (~30s) on the chosen model; session-only, reverts to the configured `model:` on
+  the next restart. Live scrollback is replaced by a fresh session — memory and
+  the handoff briefing carry the context."* §4.5's "applies in-session via
+  claude's native picker" copy is superseded accordingly.
 
 ---
 
@@ -26,11 +100,13 @@ it lives for the current session and any restart drops it back to the
 
 Mechanism — **consume-once carrier** (no intent file):
 
-- **Live Claude switches write NO carrier.** A typed `/model <claude>` or a
-  Claude menu tap applies in-session via claude's native picker; the explicit
-  `claude --model <configured>` flag start.sh always execs reverts it on the
-  next boot for free. `sessionModelSource.setOverride` still records it live so
-  `/status` and progress cards stay truthful for the running session.
+- **Live Claude switches write NO carrier.** _[SUPERSEDED by §0.05 (rev 5).]_
+  This bullet described the retired inject-into-tmux path (a typed `/model
+  <claude>` or Claude menu tap applied in-session via claude's native picker,
+  writing no carrier). Rev 5 routes EVERY switch — including Claude→Claude and
+  the picker/Fable buttons — through the consume-once `.session-model` carrier
+  relaunch, because the inject path silently no-op'd then optimistically lied to
+  `/status`. See §0.05.
 - **Relaunch-requiring switches write a consume-once `.session-model`.** The
   sr-* and sr→Claude paths (`scheduleModelRelaunch` / the menu sr→Claude
   transition) and a queued /model persisted at graceful shutdown write the

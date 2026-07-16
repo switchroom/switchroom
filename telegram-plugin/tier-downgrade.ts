@@ -20,9 +20,10 @@
  * account-swap, never by a downgrade.
  *
  * There is NO automatic return to the premium model. The `/model` override is
- * SESSION-SCOPED and in-memory only (`recordTypedModelSwitch` writes NO carrier
- * — reference/rfcs/session-model-stickiness.md §0.1 rev 4), so it dies on the
- * downgrade SIGTERM. The downgrade writes a consume-once `.session-model`
+ * SESSION-SCOPED: rev 5 (reference/rfcs/session-model-stickiness.md §0.05) makes
+ * every switch a consume-once `.session-model` carrier relaunch, so the override
+ * dies on the downgrade SIGTERM (the carrier was consumed on its own apply-boot).
+ * The downgrade writes a consume-once `.session-model`
  * carrier for the CONFIGURED DEFAULT: start.sh applies+deletes it on the resume
  * boot, and every subsequent restart boots the configured default too. The
  * premium model is never restored on its own — the user must re-issue

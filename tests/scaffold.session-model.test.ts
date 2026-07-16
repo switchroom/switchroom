@@ -278,11 +278,42 @@ describe("scaffoldAgent: session-model consume-once boot resolver (start.sh)", (
     expect(baseUrl).toBe(PASSTHROUGH);
   });
 
-  it("claude-* carrier → KEEPS the /anthropic passthrough (only sr-* repoints)", () => {
+  it("claude-* carrier → KEEPS the /anthropic passthrough (only sr-*/fable repoint)", () => {
     writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8"));
     const { effective, baseUrl } = runBlockRouting("1");
     expect(effective).toBe("claude-opus-4-8");
     expect(baseUrl).toBe(PASSTHROUGH);
+  });
+
+  // ── Fable (F2): proxy-only Claude alias — repoints like sr-*, guards like sr-* ──
+  it("fable carrier + LiteLLM up → applies + REPOINTS ANTHROPIC_BASE_URL to the router root", () => {
+    // FAILS on old start.sh: the repoint `case` matched sr-* ONLY, so a fable
+    // carrier kept the /anthropic passthrough and 4xx'd (claude-fable-5 is a
+    // retired codename direct-to-Anthropic; it only resolves via the router).
+    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("fable"));
+    const { effective, baseUrl } = runBlockRouting("1");
+    expect(effective).toBe("fable");
+    expect(baseUrl).toBe(ROUTER_ROOT);
+    expect(baseUrl.endsWith("/anthropic")).toBe(false);
+    expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
+  });
+
+  it("claude-fable-5 carrier + LiteLLM up → also repoints to the router root", () => {
+    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-fable-5"));
+    const { effective, baseUrl } = runBlockRouting("1");
+    expect(effective).toBe("claude-fable-5");
+    expect(baseUrl).toBe(ROUTER_ROOT);
+  });
+
+  it("fable carrier + LiteLLM DOWN → boots default, CONSUMES the carrier, tells the operator to re-issue", () => {
+    // FAILS on old start.sh: the down-guard was sr-* only, so a fable carrier
+    // would APPLY with the proxy down and then 4xx at runtime.
+    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("fable"));
+    expect(runBlock("")).toBe(DEFAULT_MODEL);
+    expect(existsSync(join(agentDir, ".session-model"))).toBe(false);
+    const alert = alertText();
+    expect(alert).toContain("fable");
+    expect(alert).toContain("LiteLLM");
   });
 
   // ── migration from the one-shot carrier ──────────────────────────────────

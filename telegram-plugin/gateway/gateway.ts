@@ -474,7 +474,6 @@ import {
   handleModelCommand,
   buildModelMenu,
   handleModelMenuCallback,
-  isSrToClaudeTransition,
   isValidModelArg,
   MODEL_CALLBACK_PREFIX,
   MODEL_CALLBACK_HEADER,
@@ -506,7 +505,7 @@ import {
 import { runTierDowngrade } from './tier-downgrade-wiring.js'
 import { runPremiumRecoveryPing } from './premium-recovery-wiring.js'
 import { decidePremiumRecovery } from '../premium-recovery.js'
-import { discoverModels, selectModel } from '../../src/agents/model-picker.js'
+import { discoverModels } from '../../src/agents/model-picker.js'
 import { resolveMainModel, SWITCHROOM_DEFAULT_THINKING_EFFORT } from '../../src/agents/scaffold.js'
 import {
   parseEffortCommand,
@@ -636,9 +635,13 @@ import { decideObligationTurnEnd } from './obligation-turn-end.js'
 import { maybeRotate } from './turns-jsonl-rotate.js'
 import {
   buildTurnRecord,
-  finalizeBackstopSend,
+  finalizeBackstopSendGated,
   type DeliveryOutcome,
 } from './turn-record-status.js'
+import {
+  BackstopDeliveryLedger,
+  runBackstopDelivery,
+} from './backstop-delivery.js'
 import {
   createDeliveryQueue,
   trackDelivery,
@@ -2339,6 +2342,150 @@ const outboundDedup = new OutboundDedupCache()
 // catches the containment case the exact-text `outboundDedup` misses (a
 // `narration\n\nanswer` flush never equals the clean `answer`-only reply).
 const flushedTurnSupersede = new FlushedTurnSupersedeRegistry()
+// #3276 — the turn-flush backstop's per-turn delivery latch + per-chunk
+// idempotency ledger. The latch (keyed on `turnId`) is the deterministic
+// arbiter of backstop-vs-reply; the chunk ledger lets a retry after a partial
+// send resume at the first unsent chunk instead of re-sending chunk 0.
+const backstopDeliveryLedger = new BackstopDeliveryLedger()
+// #3276 finding-1 — bounded in-turn retries for the backstop send before it
+// gives up and records `send_failed` (leaving the obligation open for the
+// liveness floor). Resumes mid-chunk each attempt, so chunk 0 is never
+// re-sent. Env-tunable for ops; default 3.
+const BACKSTOP_DELIVERY_MAX_ATTEMPTS = (() => {
+  const raw = Number(process.env.SWITCHROOM_BACKSTOP_DELIVERY_MAX_ATTEMPTS)
+  return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : 3
+})()
+
+/**
+ * #3276 — the ONE delivery primitive the turn-flush backstop uses to put a
+ * flushed answer into the chat. It routes through `sendReplyChunks` — the SAME
+ * battle-tested send core `executeReply` uses (THREAD_NOT_FOUND fallback,
+ * length re-split, parse-reject plaintext fallback) — and returns the REAL
+ * fresh chat message ids.
+ *
+ * Deliberately NOT card-coupled: it never edits the progress card, so a
+ * "delivery" can never be a card mutation that the marker-sweep GC's ~60-90s
+ * later. The card is unpinned/collapsed by the caller as a purely cosmetic
+ * follow-up (guard 4). `previewMessageId` is always null here.
+ *
+ * Idempotent (guard 6): each chunk is sent under `backstopDeliveryLedger`. A
+ * chunk that already landed for this `turnId` is skipped, and a pending marker
+ * is written before every wire call, so a retry after a partial send or a lost
+ * ack resumes at the first unsent chunk and never re-sends chunk 0.
+ *
+ * `text` must already be fully normalized/redacted/scrubbed by the caller (the
+ * turn-flush branch runs the exact reply-parity pipeline before calling this).
+ */
+async function deliverAnswer(args: {
+  chatId: string
+  threadId: number | undefined
+  text: string
+  turnId: string
+  cardMessageId: number | null
+}): Promise<{ sentIds: number[]; chunkCount: number; delivered: boolean; exhausted: boolean }> {
+  const { chatId, turnId } = args
+  // Inject visible blank-line spacers into `\n\n` gaps, then split — exactly as
+  // executeReply does on the non-literal path (idempotent, one U+00A0 per gap).
+  const rendered = addParagraphSpacers(args.text)
+  const chunks = splitMarkdownChunks(rendered, RICH_MESSAGE_MAX_CHARS)
+
+  const deps: ReplyChunkSendDeps = {
+    sendRich: (opts, body, tid) =>
+      robustApiCall(
+        // allow-raw-bot-api: deliverAnswer chunk-loop adapter — sendRichMessage routed through robustApiCall; THREAD_NOT_FOUND handled by sendReplyChunks' fallback ladder
+        () => bot.api.sendRichMessage(chatId, body as never, opts as never),
+        { threadId: tid, chat_id: chatId, priorityClass: 'critical' },
+      ),
+    sendLiteral: (opts, txt, tid) =>
+      robustApiCall(
+        // allow-raw-bot-api: deliverAnswer chunk-loop adapter — literal sendMessage routed through robustApiCall; THREAD_NOT_FOUND handled by sendReplyChunks
+        () => bot.api.sendMessage(chatId, txt, opts as never),
+        { threadId: tid, chat_id: chatId, priorityClass: 'critical' },
+      ),
+    // allow-raw-bot-api: literal last-resort fallback (parse-reject / length re-split); wrapping would re-enter the policy that just rejected the payload
+    sendLiteralRaw: (opts, txt) => bot.api.sendMessage(chatId, txt, opts as never),
+    // allow-raw-bot-api: rich length-error re-split last resort; wrapping would re-enter the chunk-loop classification on an already-classified length failure
+    sendRichRaw: (opts, body) => bot.api.sendRichMessage(chatId, body as never, opts as never),
+    editPreview: (mid, body, opts, tid) =>
+      robustApiCall(
+        // allow-raw-bot-api: preview edit-in-place routed through robustApiCall; thread fallback handled by sendReplyChunks
+        () => bot.api.editMessageText(chatId, mid, body as never, opts as never),
+        { threadId: tid, chat_id: chatId, priorityClass: 'critical', messageId: mid, editPayload: body },
+      ),
+    richMessage,
+    logOutbound,
+    // deliverAnswer never sets a previewMessageId, so this is never invoked;
+    // provide a best-effort delete for interface completeness.
+    deleteStalePreview: async (id: number): Promise<void> => {
+      await swallowingApiCall(
+        () => bot.api.deleteMessage(chatId, id),
+        { chat_id: chatId, verb: 'deliverAnswer.deleteStalePreview' },
+      )
+    },
+    stderr: (s: string) => { process.stderr.write(s) },
+  }
+
+  // Send ONE chunk via the shared `sendReplyChunks` core. `liveThreadId`
+  // threads the THREAD_NOT_FOUND fallback decision across chunks. Returns the
+  // landed message id(s) (a length-resplit chunk may land >1); throws on an
+  // unrecoverable send failure so the retry orchestrator can resume.
+  let liveThreadId = args.threadId
+  const sendChunk = async (_chunkIndex: number, text: string): Promise<number[]> => {
+    const chunkIds: number[] = []
+    const res = await sendReplyChunks(deps, {
+      chatId,
+      chunks: [text],
+      literalText: false,
+      suppressText: false,
+      threadId: liveThreadId,
+      previewMessageId: null,
+      sentIds: chunkIds,
+      buildSendOpts: (_i, _isLast, tid) => ({
+        ...(tid != null ? { message_thread_id: tid } : {}),
+        link_preview_options: { is_disabled: true },
+      }),
+      buildPreviewEditOpts: () => ({}),
+    })
+    liveThreadId = res.threadId
+    return chunkIds
+  }
+
+  // Bounded in-turn retry (finding-1 fix): resumes at the first unsent chunk on
+  // each attempt via the ledger, so chunk 0 is delivered exactly once even
+  // across retries. `delivered`/`exhausted` tell the caller whether the answer
+  // actually reached the chat — the caller leaves the delivery obligation OPEN
+  // on terminal failure so the liveness floor re-presents it.
+  const result = await runBackstopDelivery(
+    backstopDeliveryLedger,
+    turnId,
+    chunks,
+    args.cardMessageId,
+    {
+      sendChunk,
+      recordOutbound: HISTORY_ENABLED
+        ? (messageIds, texts) => {
+            try {
+              recordOutbound({
+                chat_id: chatId,
+                thread_id: args.threadId ?? null,
+                message_ids: messageIds,
+                texts,
+              })
+            } catch { /* best-effort */ }
+          }
+        : undefined,
+      stderr: (s: string) => { process.stderr.write(s) },
+    },
+    BACKSTOP_DELIVERY_MAX_ATTEMPTS,
+  )
+  return {
+    sentIds: result.sentIds,
+    chunkCount: result.chunkCount,
+    delivered: result.delivered,
+    exhausted: result.exhausted,
+  }
+}
+
 /**
  * Per-chat cache of `available_reactions` from `getChat`. Populated lazily —
  * the FIRST message in a chat creates a controller without the filter (null
@@ -5082,7 +5229,7 @@ function emitTurnRecord(turn: CurrentTurn, endedAt: number): void {
 
 function endCurrentTurnAtomic(
   turn: CurrentTurn,
-  opts?: { deferRecord?: boolean },
+  opts?: { deferRecord?: boolean; deferObligationClose?: boolean },
 ): number | null {
   // PR-4e — keyed liveness + keyed clear (leak-close-at-origin). Flag-OFF: the
   // guard is `currentTurn === turn` and the clear nulls the singleton, verbatim.
@@ -5151,7 +5298,13 @@ function endCurrentTurnAtomic(
   // obligations are designed to catch ends via silence_fallback, NOT turn_end.
   // At turn_end with replyCalled=true the model explicitly signalled completion
   // AND replied, so the obligation is satisfied regardless of finalAnswerDelivered.
-  if (OBLIGATION_LEDGER_ENABLED) {
+  // #3276 finding 1 — the turn-flush backstop passes `deferObligationClose` so
+  // the obligation disposition reflects the REAL send outcome (resolved in its
+  // async finally after the bounded retry), NOT the speculative fire-time
+  // `finalAnswerDelivered=true`. Closing here would satisfy the obligation
+  // before the send is known to have landed, re-introducing the silent-drop on
+  // terminal failure. Every synchronous turn-end path is unchanged.
+  if (OBLIGATION_LEDGER_ENABLED && opts?.deferObligationClose !== true) {
     if (decideObligationTurnEnd(turn.finalAnswerDelivered, turn.replyCalled) === 'close') {
       obligationLedger.close(turn.turnId)
     } else {
@@ -18859,14 +19012,28 @@ function handleSessionEvent(ev: SessionEvent): void {
         // post-fire pre-record window resolves this turn (via the unified owner
         // resolver, reading the atom preserved in `recentTurnsById`) and
         // suppresses itself against this latch — closing the residual race Part
-        // 1's supersede cannot reach. Scoped to a SUBSTANTIVE terminal answer
-        // (the same ≥`FLUSH_SUBSTANTIVE_MIN_CHARS` floor the codebase uses to
-        // recognise a real answer) so a short flush never latches against a
-        // legitimate substantive reply. `capturedText` here is the selected,
+        // 1's supersede cannot reach. `capturedText` here is the selected,
         // normalized flush delivery text.
-        if (capturedText.trim().length >= FLUSH_SUBSTANTIVE_MIN_CHARS) {
-          turn.answerDelivered = true
-        }
+        //
+        // #3276 guard 2/5 — the arm is now UNCONDITIONAL (dropped the former
+        // ≥`FLUSH_SUBSTANTIVE_MIN_CHARS` gate). A short terminal answer ("yes,
+        // done") is a genuine answer this backstop is about to deliver, so a
+        // late reply carrying the same short answer MUST supersede/suppress
+        // rather than post a duplicate — the real-id supersede recorded below
+        // corrects it in place.
+        //
+        // TWO distinct arbiters set synchronously here, before any `await`:
+        //   (a) `turn.answerDelivered` — the backstop-vs-LATE-REPLY signal the
+        //       reply path already reads (`decideAnswerLatchSuppression` +
+        //       `flushedTurnSupersede`), exactly as on `main`.
+        //   (b) `backstopDeliveryLedger.claim` — the backstop-vs-BACKSTOP
+        //       double-fire latch: `claim` returning false means this turn
+        //       already fired a backstop (answer-ready quiescence, then the
+        //       turn-end backstop), so this fire is a no-op. It does NOT
+        //       arbitrate the late reply (that is (a)); it is redundant-but-
+        //       cheap with the `currentTurn == null` bail below.
+        turn.answerDelivered = true
+        const backstopLatchClaimed = backstopDeliveryLedger.claim(turn.turnId)
 
         // #654 deterministic double-message fix. Hand off the pinned
         // progress card BEFORE state reset so the driver doesn't keep
@@ -18898,7 +19065,7 @@ function handleSessionEvent(ev: SessionEvent): void {
         // bookkeeping, purge) still runs synchronously here for the #1067 /
         // #1556 wedge-safety reasons. `backstopTurnEndedAt` is null iff the
         // atom was already torn down elsewhere (no record to emit).
-        const backstopTurnEndedAt = endCurrentTurnAtomic(turn, { deferRecord: true })
+        const backstopTurnEndedAt = endCurrentTurnAtomic(turn, { deferRecord: true, deferObligationClose: true })
         // #549 fix — turn-flush takes ownership of the captured-text
         // backup; reset the preamble buffer (its content is already in
         // the captured `capturedText`, which turn-flush is about to send).
@@ -18945,6 +19112,13 @@ function handleSessionEvent(ev: SessionEvent): void {
                 // finalAnswerDelivered). Not a failure.
                 if (backstopTurnEndedAt != null) {
                   turn.deliveryOutcome = 'suppressed'
+                  // #3276 finding 1 — obligation close was DEFERRED out of
+                  // endCurrentTurnAtomic. The reply tool already delivered this
+                  // turn's answer (recentCount>0), so resolve it as satisfied
+                  // here (idempotent with the reply path's own close). Without
+                  // this the deferred obligation would linger OPEN and spuriously
+                  // re-present a turn that WAS answered.
+                  if (OBLIGATION_LEDGER_ENABLED) obligationLedger.close(turn.turnId)
                   emitTurnRecord(turn, backstopTurnEndedAt)
                 }
                 return
@@ -18952,118 +19126,53 @@ function handleSessionEvent(ev: SessionEvent): void {
             } catch {}
           }
 
+          // #3276 guard 5 — double-fire guard. If this turn already claimed the
+          // delivery latch (a prior backstop fire — e.g. answer-ready quiescence
+          // followed by the turn-end backstop for the same turn), do NOT deliver
+          // again. The first fire owns delivery; this fire is a cosmetic no-op.
+          if (!backstopLatchClaimed) {
+            process.stderr.write(
+              `telegram gateway: turn-flush skipped — turn ${turn.turnId} already claimed the delivery latch\n`,
+            )
+            return
+          }
+
           process.stderr.write(
             `telegram gateway: turn-flush firing — ${capturedText.length} chars without reply tool ` +
             `(chat=${backstopChatId} cardMsgId=${backstopCardMessageId ?? 'none'})\n`,
           )
-          const sendOpts = {
-            ...(backstopThreadId != null ? { message_thread_id: backstopThreadId } : {}),
-            link_preview_options: { is_disabled: true },
-          }
-          const limit = RICH_MESSAGE_MAX_CHARS
-          // PR B (Fix 1) — send accounting is declared OUTSIDE the try so the
-          // single-record `finally` below can read it, and ALL setup (the chunk
-          // split) is pulled INSIDE the try so a throw there still lands in the
-          // finally (→ one honest `send_failed` row) rather than rejecting the
-          // IIFE with zero turns.jsonl rows written / an unhandled rejection.
-          let htmlChunks: string[] = []
-          const sentIds: number[] = []
-          // track whether the send threw so the deferred record reflects the
-          // real outcome (throw OR partial multi-chunk → send_failed).
-          let sendThrew = false
+          // PR B (Fix 1) — send accounting declared OUTSIDE the try so the
+          // single-record `finally` below reads it on EVERY in-process exit.
+          // `delivered` is the RECEIPT-gated truth (>=1 fresh non-card id AND
+          // all chunks landed), computed by the retry orchestrator — NOT a
+          // blanket outer-catch flag, so a throw in the post-delivery
+          // bookkeeping below (dedup / supersede record) can never demote a
+          // genuinely delivered turn to `send_failed` (finding 4).
+          let sentIds: number[] = []
+          let chunkCount = 0
+          let delivered = false
           try {
-            // #2798 / #2692 — inject visible blank-line spacers into prose `\n\n`
-            // gaps before splitting, exactly as executeReply does. The rich GFM
-            // renderer collapses a bare `\n\n` gap TIGHT, so without this the
-            // paragraph boundaries from the '\n\n' block join (turn-flush-safety
-            // .ts) would still render jammed together. Mirrors reply's
-            // `addParagraphSpacers(text)` on the non-literal path (idempotent —
-            // exactly one U+00A0 spacer per gap, never doubled).
-            const renderedText = addParagraphSpacers(capturedText)
-            htmlChunks = splitMarkdownChunks(renderedText, limit)
-            // #654 deterministic double-message fix. If the progress
-            // card is on screen (60s timer fired before turn_end), edit
-            // it in place with the first chunk of the answer instead of
-            // posting a fresh message — avoids the user seeing both the
-            // pinned card AND a separate text bubble for the same turn.
-            // Multi-chunk answers (>4000 chars) edit chunk[0] into the
-            // card and send chunks[1..] fresh. If the edit fails (e.g.
-            // user deleted the card, parse-mode conflict), fall back to
-            // a fresh send for chunk[0] — accepts a 2-message outcome
-            // for that edge case rather than dropping the answer.
-            // #1075: route turn-flush sends/edits through robustApiCall.
-            // Edit-in-place isn't thread-id-bearing on its own (the
-            // target message id implies a thread), so a stale-thread
-            // 400 just fails the edit and the loop falls back to fresh
-            // sendMessage. sendMessage IS thread-id-bearing — drop the
-            // thread on THREAD_NOT_FOUND so the captured prose still
-            // lands somewhere instead of being lost entirely.
-            let firstSendUsedEdit = false
-            let liveThreadId: number | undefined = backstopThreadId
-            if (backstopCardMessageId != null && htmlChunks.length > 0) {
-              try {
-                await robustApiCall(
-                  () =>
-                    bot.api.editMessageText(
-                      backstopChatId,
-                      backstopCardMessageId,
-                      richMessage(htmlChunks[0]),
-                      sendOpts,
-                    ),
-                  {
-                    chat_id: backstopChatId,
-                    verb: 'turn-flush.editMessageText',
-                    ...(liveThreadId != null ? { threadId: liveThreadId } : {}),
-                  },
-                )
-                sentIds.push(backstopCardMessageId)
-                firstSendUsedEdit = true
-              } catch (err) {
-                process.stderr.write(
-                  `telegram gateway: turn-flush card-takeover edit failed: ${(err as Error).message} — falling back to sendMessage\n`,
-                )
-                if (err instanceof Error && err.message === 'THREAD_NOT_FOUND') {
-                  liveThreadId = undefined
-                }
-              }
-            }
-            const remainingChunks = firstSendUsedEdit ? htmlChunks.slice(1) : htmlChunks
-            for (const c of remainingChunks) {
-              const sent = await retryWithThreadFallback(
-                robustApiCall,
-                (tid) => {
-                  const opts = {
-                    link_preview_options: { is_disabled: true },
-                    ...(tid != null ? { message_thread_id: tid } : {}),
-                  }
-                  return bot.api.sendRichMessage(backstopChatId, richMessage(c), opts)
-                },
-                {
-                  threadId: liveThreadId,
-                  chat_id: backstopChatId,
-                  verb: 'turn-flush.sendMessage',
-                },
-              )
-              if (liveThreadId != null) {
-                const sentMsg = sent as { message_thread_id?: number }
-                if (sentMsg.message_thread_id == null) liveThreadId = undefined
-              }
-              sentIds.push(sent.message_id)
-            }
-            if (HISTORY_ENABLED && sentIds.length > 0) {
-              try {
-                recordOutbound({
-                  chat_id: backstopChatId,
-                  thread_id: backstopThreadId ?? null,
-                  message_ids: sentIds,
-                  texts: htmlChunks,
-                })
-              } catch {}
-            }
-            // #546 dedup: record what turn-flush just sent so a
-            // late-arriving reply / stream_reply with the same
-            // content gets suppressed (claude-code retries the
-            // un-acked tool_call after a bridge reconnect).
+            // #3276 — the ONE delivery primitive. deliverAnswer routes through
+            // `sendReplyChunks` (the same send core executeReply uses) and posts
+            // a FRESH chat message; it NEVER edits the progress card, so a
+            // "delivery" can never be a card mutation the marker-sweep GC's
+            // ~60-90s later. It returns the REAL fresh chat message ids and
+            // retries mid-chunk (bounded) before giving up — the per-chunk
+            // ledger resumes at the first unsent chunk, never re-sending chunk 0
+            // (guard 6).
+            const delivery = await deliverAnswer({
+              chatId: backstopChatId,
+              threadId: backstopThreadId,
+              text: capturedText,
+              turnId: turn.turnId,
+              cardMessageId: backstopCardMessageId,
+            })
+            sentIds = delivery.sentIds
+            chunkCount = delivery.chunkCount
+            delivered = delivery.delivered
+
+            // #546 dedup: record what turn-flush just sent so a late-arriving
+            // reply / stream_reply with the same content gets suppressed.
             outboundDedup.record(
               backstopChatId,
               backstopThreadId,
@@ -19071,14 +19180,10 @@ function handleSessionEvent(ev: SessionEvent): void {
               Date.now(),
               currentTurn?.registryKey ?? null,
             )
-            // 2026-07 duplicate-reply fix — record the flushed message id(s)
-            // keyed on THIS turn's `turnId` nonce so a late `reply` for the same
-            // turn supersedes them (delete + canonical resend) instead of
-            // shipping a duplicate. `turn` is the ending turn atom captured at
-            // the top of this branch (endCurrentTurnAtomic nulled currentTurn,
-            // but the captured `turn` still carries the honest turnId). Covers
-            // BOTH flush paths — answer-ready quiescence and the turn-end
-            // backstop both funnel through this single IIFE.
+            // #3276 guard 3 — feed the REAL fresh chat ids into the supersede
+            // record so a late `reply` for the same turn corrects them in place
+            // (edit / delete+resend) instead of shipping a second bubble. These
+            // are genuine chat message ids now, never a card-edit id.
             if (sentIds.length > 0) {
               flushedTurnSupersede.record(
                 backstopChatId,
@@ -19087,13 +19192,25 @@ function handleSessionEvent(ev: SessionEvent): void {
                 Date.now(),
               )
             }
-            // #1713: route the backstop terminal through finalize() —
-            // single terminal path keeps the controller contract clean.
-            if (backstopCtrl) backstopCtrl.finalize('done')
-            // Unpin the card. completeTurn cleans up pinMgr's per-turn
-            // state and unpins via the API. If we didn't take over a
-            // turn (cardTakeover.turnKey == null), fall back to the
-            // legacy unpinForChat sweep.
+            // #3276 guard 4 — collapse the taken-over card to a NON-answer
+            // state. The answer flowed ONLY through deliverAnswer (a fresh
+            // bubble); here we just unpin/complete the card so no orphaned
+            // ⚙️ Working… lingers. The card carries NO answer text, so a
+            // card-collapse failure and a fresh-send failure can never leave
+            // BOTH an answer-card AND an answer-bubble visible.
+            if (!delivered) {
+              // Retries exhausted with nothing durable delivered — finalize the
+              // reaction as error and reset the latch so a genuine late reply is
+              // NOT suppressed.
+              if (backstopCtrl) backstopCtrl.finalize('error')
+              backstopDeliveryLedger.release(turn.turnId)
+              turn.answerDelivered = false
+            } else if (backstopCtrl) {
+              backstopCtrl.finalize('done')
+            }
+            // Unpin the card either way (cosmetic). completeTurn cleans up
+            // pinMgr's per-turn state and unpins; fall back to the legacy
+            // unpinForChat sweep when we didn't take over a turn.
             if (backstopCardTurnKey != null) {
               completeProgressCardTurn?.({
                 chatId: backstopChatId,
@@ -19104,49 +19221,50 @@ function handleSessionEvent(ev: SessionEvent): void {
               unpinProgressCardForChat?.(backstopChatId, backstopThreadId)
             }
           } catch (err) {
-            sendThrew = true
-            process.stderr.write(`telegram gateway: turn-flush send failed: ${(err as Error).message}\n`)
-            // 2026-07 double-reply-on-DM fix (F1) — the flush armed
-            // `answerDelivered` synchronously at FIRE time, but the send just
-            // FAILED. When nothing was delivered the supersede record was NOT
-            // written (gated on `sentIds.length > 0` above), so Part 1 can never
-            // fire for this turn — leaving the latch armed would make a genuine
-            // late reply suppress itself and the user would get ZERO messages
-            // (silent answer loss; on main that path still delivers the reply).
-            // Reset the latch so the late reply is NOT suppressed. On a PARTIAL
-            // send (sentIds > 0) the record WAS written, so Part 1's supersede
-            // deletes the partial message A and the reply delivers cleanly —
-            // resetting here is harmless in that case too.
-            // FOLLOW-UP (coordinator to file an issue): a reply suppressed
-            // synchronously DURING the in-flight send that then fails is not
-            // fully closable with a boolean latch — a residual micro-window the
-            // supersede+latch pair cannot eliminate. Not addressed in this PR.
-            turn.answerDelivered = false
-            // #1713: backstop send failed — finalize as error so the
-            // turn ends cleanly with 😱 rather than leaving it open.
-            if (backstopCtrl) backstopCtrl.finalize('error')
+            // Only reachable via a throw in the post-delivery bookkeeping (the
+            // delivery itself is retry-wrapped inside deliverAnswer and never
+            // throws out). `delivered` already reflects the receipt-gated truth;
+            // do NOT flip it here (finding 4). If nothing landed, reset the
+            // latch so a genuine late reply is not suppressed.
+            process.stderr.write(`telegram gateway: turn-flush post-delivery bookkeeping failed: ${(err as Error).message}\n`)
+            if (!delivered) {
+              turn.answerDelivered = false
+              backstopDeliveryLedger.release(turn.turnId)
+              if (backstopCtrl) backstopCtrl.finalize('error')
+            }
           } finally {
-            // PR B (Fix 1) — SINGLE-RECORD GUARANTEE. The send has now RESOLVED
-            // (or thrown); this finally runs on EVERY in-process exit of the send
-            // block — clean send, throw in setup/split, throw mid-send — so
-            // exactly one turns.jsonl row is written, with the outcome reflecting
-            // what actually happened. A throw or a partial multi-chunk delivery
-            // (sentIds < htmlChunks) or an un-run/empty split → 'failed' → status
-            // `send_failed`; a full delivery → 'delivered' → `complete`. This
-            // replaces the false `complete` the old synchronous write produced
-            // for a flood-dropped / errored answer the user never received, and
-            // restores the old code's one-row-per-turn guarantee (the pre-finally
-            // shape wrote ZERO rows if setup threw). The suppressed-reply branch
-            // above already emitted its record and `return`ed BEFORE reaching
-            // this try, so it can never double-write with this finally.
+            // #3276 guard 7 + finding 1 — honest record AND honest recovery.
+            // Status is derived from the RECEIPT gate: `complete` IFF a fresh
+            // non-card id landed for every chunk; otherwise `send_failed`.
+            //
+            // The delivery-obligation close was DEFERRED out of
+            // endCurrentTurnAtomic (deferObligationClose) so it reflects the
+            // REAL send outcome here, not the speculative fire-time flag:
+            //   delivered  → close the obligation (answered).
+            //   NOT deliv. → leave it OPEN + noteTurnEnded, so the ~150s
+            //                liveness floor re-presents the answer instead of
+            //                the old silent `send_failed` drop.
             if (backstopTurnEndedAt != null) {
-              finalizeBackstopSend(turn, {
-                threw: sendThrew,
-                sentCount: sentIds.length,
-                chunkCount: htmlChunks.length,
+              finalizeBackstopSendGated(turn, {
+                threw: !delivered,
+                sentIds,
+                chunkCount,
+                cardMessageId: backstopCardMessageId,
               })
+              if (OBLIGATION_LEDGER_ENABLED) {
+                if (delivered) {
+                  obligationLedger.close(turn.turnId)
+                } else {
+                  // Terminal fail — do NOT mark the obligation satisfied.
+                  turn.finalAnswerDelivered = false
+                  obligationLedger.noteTurnEnded(turn.turnId, Date.now())
+                }
+              }
               emitTurnRecord(turn, backstopTurnEndedAt)
             }
+            // GC the ledger only now — after success OR retry exhaustion — so a
+            // resume could always read prior progress up to this point.
+            backstopDeliveryLedger.clear(turn.turnId)
           }
           // #2094 cosmetic: the trailing `finally { purgeReactionTracking() }`
           // was removed. endCurrentTurnAtomic already ran the canonical purge
@@ -23324,7 +23442,6 @@ function buildModelDeps(restartCtx?: ModelDepsRestartContext): ModelMenuDeps & M
         return []
       }
     },
-    select: (a, label) => selectModel(a, label),
     isBusy: () => currentTurn !== null,
     getAgentName: getMyAgentName,
     getQuotaBrief: async () => {
@@ -23343,7 +23460,6 @@ function buildModelDeps(restartCtx?: ModelDepsRestartContext): ModelMenuDeps & M
       } catch { /* quota is garnish — never block the menu on it */ }
       return null
     },
-    inject: injectSlashCommandImpl,
     getConfiguredModel: () => {
       type AgentListResp = { agents: Array<{ name: string; model?: string | null }> }
       const data = switchroomExecJson<AgentListResp>(['agent', 'list'])
@@ -23351,7 +23467,6 @@ function buildModelDeps(restartCtx?: ModelDepsRestartContext): ModelMenuDeps & M
     },
     escapeHtml: escapeHtmlForTg,
     preBlock,
-    getActiveSessionModel: () => sessionModelSource.getOverride(),
     /**
      * Graceful restart for sr-* → Claude model switch. Same mechanism as
      * the /restart command: writes a restart marker (so the post-restart
@@ -23437,6 +23552,18 @@ function buildModelDeps(restartCtx?: ModelDepsRestartContext): ModelMenuDeps & M
           resolveMainModel(deps.getConfiguredModel() ?? undefined),
       )
       sessionModelSource.setOverride(model)
+      // Diagnosability (rev 5): the applied-model is now always greppable at the
+      // relaunch boundary — `grep 'gw /model relaunch scheduled'` — closing the
+      // gap the debug worker flagged (the retired inject path logged nothing).
+      process.stderr.write(
+        `telegram gateway: gw /model relaunch scheduled agent=${getMyAgentName()} token=${model} reason=${JSON.stringify(reason)}\n`,
+      )
+      // A manual /model switch clears any pending premium-recovery marker so the
+      // "available again" ping can't still fire after the operator switched away
+      // themselves. Rev 5: this moves here (from the deleted recordTypedModelSwitch /
+      // recordModelMenuSideEffects) so it fires for EVERY switch path uniformly —
+      // both R5 sites collapse to this single call.
+      clearPremiumRecoveryOnManualSwitch(model)
       try {
         await deps.scheduleRestart(reason)
       } catch (err) {
@@ -23446,6 +23573,36 @@ function buildModelDeps(restartCtx?: ModelDepsRestartContext): ModelMenuDeps & M
         // "~15s". Any OTHER dispatch failure means no restart is coming, so
         // roll BOTH back — a lingering carrier would lie to /status and be
         // consumed (mis-applied) by an unrelated later boot.
+        if ((err as { code?: string })?.code !== 'restart_in_flight') {
+          restoreSessionModelFileRaw(agentDir, prevFileRaw)
+          sessionModelSource.setOverride(prevOverride)
+        }
+        throw err
+      }
+    },
+    /**
+     * `/model default` (rev 5): CLEAR the consume-once carrier + the in-memory
+     * override, then relaunch so the LIVE session reverts to the configured
+     * default. Mirrors scheduleModelRelaunch's rollback discipline (G1): on a
+     * `restart_in_flight` throw keep the cleared state (the in-flight boot has no
+     * carrier and reverts anyway); on any other dispatch failure restore the
+     * prior carrier + override so a failed default-revert doesn't strand the
+     * session in a half-cleared state.
+     */
+    scheduleModelDefaultRelaunch: async (reason: string) => {
+      const agentDir = resolveAgentDirFromEnv()
+      if (!agentDir) throw new Error('agent dir unresolvable — cannot clear session-model file')
+      const prevOverride = sessionModelSource.getOverride()
+      const prevFileRaw = readSessionModelFileRaw(agentDir)
+      clearSessionModelFile(agentDir)
+      sessionModelSource.setOverride(null)
+      process.stderr.write(
+        `telegram gateway: gw /model relaunch scheduled agent=${getMyAgentName()} token=(default) reason=${JSON.stringify(reason)}\n`,
+      )
+      clearPremiumRecoveryOnManualSwitch(null)
+      try {
+        await deps.scheduleRestart(reason)
+      } catch (err) {
         if ((err as { code?: string })?.code !== 'restart_in_flight') {
           restoreSessionModelFileRaw(agentDir, prevFileRaw)
           sessionModelSource.setOverride(prevOverride)
@@ -23467,125 +23624,14 @@ function modelMenuReplyMarkup(reply: ModelMenuReply): InlineKeyboard | undefined
   return kb
 }
 
-/**
- * Record a POSITIVELY-CONFIRMED typed `/model` switch: set the in-memory
- * override so `/status` reflects the live model. Shared by the live
- * `bot.command('model')` handler and the deferred (queued mid-turn) apply so
- * both record identically. Returns a warning suffix to append to the reply
- * body (currently always empty — kept for a stable signature).
- *
- * Session-scoped (rev 4): a live Claude `/model` switch writes NO
- * `.session-model` carrier — it applies in-session and the explicit
- * `claude --model <configured>` flag reverts it on the next boot, so it lasts
- * exactly until the next restart with no durable state. (sr-* switches never
- * reach here — they go through scheduleModelRelaunch, which owns the
- * consume-once carrier.) The `/status` honesty invariant lives here: only
- * `reply.selectedModel` records; an unverified inject records nothing.
- * `/model default` clears any in-memory override and any leftover carrier.
- */
-function recordTypedModelSwitch(
-  reply: { text: string; selectedModel?: string },
-  requestedModelArg: string | null,
-  _deps: ModelCommandDeps,
-): string {
-  const requested = requestedModelArg != null ? expandSrAlias(requestedModelArg) : null
-  if (requested?.toLowerCase() === 'default') {
-    const smDir = resolveAgentDirFromEnv()
-    if (smDir) clearSessionModelFile(smDir)
-    if (reply.selectedModel) sessionModelSource.setOverride(null)
-    return ''
-  }
-  if (!reply.selectedModel) return ''
-  sessionModelSource.setOverride(reply.selectedModel)
-  // A manual /model apply to the dropped premium clears any pending recovery
-  // marker so the "available again" ping can't still fire after the user has
-  // already switched back themselves.
-  clearPremiumRecoveryOnManualSwitch(reply.selectedModel)
-  return ''
-}
-
-/**
- * Record a model-MENU callback outcome (set the live in-memory override, clear
- * a leftover carrier on a Default tap) and drive an sr-*→Claude graceful
- * restart when the tap crosses that boundary — the only menu path that writes a
- * consume-once `.session-model` carrier (a live Claude tap writes none, rev 4).
- * Extracted from the live `mdl:*` dispatcher so the deferred (queued mid-turn)
- * apply records + restarts identically. Does NOT edit any Telegram message —
- * callers own the card edit. Returns a restart notice when a session restart
- * was scheduled (the card should then drop its keyboard).
- */
-function recordModelMenuSideEffects(
-  outcome: Awaited<ReturnType<typeof handleModelMenuCallback>>,
-  modelDeps: ModelCommandDeps,
-  cbChatId: string,
-  cbThreadId: number | undefined,
-  prevSessionModel: string | null,
-): { restartNotice?: string } {
-  // Record a successful session switch so /status reflects what's actually
-  // running. Session-scoped (rev 4): a live Claude menu tap writes NO
-  // `.session-model` carrier — it applies in-session (native picker) and
-  // reverts on the next boot. Only the sr→Claude transition below (which
-  // relaunches) writes the consume-once carrier. A confirmed "Default
-  // (recommended)" selection clears any leftover carrier.
-  if (outcome.selectedModel) {
-    sessionModelSource.setOverride(outcome.selectedModel)
-    // Clear a pending premium-recovery marker when the tap re-selects the
-    // dropped premium (menu OR the recovery ping's own switch-back button):
-    // no stale "available again" ping once we're back on it. Idempotent — the
-    // ping-send path already consumed the marker, so this is a no-op there.
-    clearPremiumRecoveryOnManualSwitch(outcome.selectedModel)
-  }
-  if (outcome.clearedDefault) {
-    const smDir = resolveAgentDirFromEnv()
-    if (smDir) clearSessionModelFile(smDir)
-  }
-
-  // sr-* → Claude transition: the picker-select only changes the session model
-  // label, but the sr-* LiteLLM routing context persists until the session is
-  // torn down — a graceful restart (same mechanism as /restart) is required.
-  if (outcome.selectedModel && isSrToClaudeTransition(prevSessionModel, outcome.selectedModel)) {
-    const agentName = getMyAgentName()
-    // Carry the requested Claude model across the restart via the SAME
-    // consume-once `.session-model` carrier a Claude → sr-* switch uses —
-    // otherwise this transition's apply-relaunch boots the CONFIGURED default
-    // and the tapped model is silently dropped. Applied on that one boot,
-    // then reverts on the next restart (rev 4).
-    const agentDir = resolveAgentDirFromEnv()
-    const token = outcome.selectedModelToken
-    if (agentDir && token) {
-      try {
-        writeSessionModelFile(
-          agentDir,
-          token,
-          readConfiguredDefaultModel(agentDir) ??
-            resolveMainModel(modelDeps.getConfiguredModel() ?? undefined),
-        )
-        sessionModelSource.setOverride(token)
-      } catch (e) {
-        process.stderr.write(`telegram gateway: sr-to-claude session-model write failed: ${(e as Error)?.message ?? String(e)}\n`)
-      }
-    } else if (agentDir) {
-      // Default-row tap while on sr-*: the restart must land on the configured
-      // default — a stale sticky override would resurrect the old model.
-      clearSessionModelFile(agentDir)
-    }
-    // Write the restart marker so the post-restart boot card edits into this chat.
-    writeRestartMarker({ chat_id: cbChatId, thread_id: cbThreadId ?? null, ack_message_id: null, ts: Date.now() })
-    stampUserRestartReason('user: sr-to-claude model switch (menu)')
-    if (turnInFlightForGate()) {
-      // Defer restart until the in-flight turn completes (same gate as /restart).
-      pendingRestarts.set(agentName, Date.now())
-    } else {
-      void sweepBeforeSelfRestart().finally(() =>
-        triggerSelfRestart(agentName, 'sr-to-claude-model-switch', 1500),
-      )
-    }
-    return {
-      restartNotice: `🔄 Switching from **${escapeHtmlForTg(prevSessionModel!)}** back to Claude — restarting session cleanly. Claude will be ready in ~30s.`,
-    }
-  }
-  return {}
-}
+// Rev 5 (deterministic switch): `recordTypedModelSwitch` and
+// `recordModelMenuSideEffects` are RETIRED. Every switch now routes through
+// `scheduleModelRelaunch` / `scheduleModelDefaultRelaunch` inside the handlers,
+// which own the carrier + in-memory override writes and the premium-recovery
+// clear. The sr-*→Claude special case is gone: because EVERY switch relaunches,
+// the sr-* LiteLLM routing is always torn down cleanly by the boot, so there is
+// no distinct transition to detect. The ACTUAL running model is reconciled at
+// boot from `.active-session-model` (never from a scraped `selectedModel`).
 
 // ─── Mid-turn ack-queue-apply-confirm for /model + /effort (#3017) ──────────
 //
@@ -23644,24 +23690,17 @@ function enqueueSessionCommand(cmd: PendingSessionCommand): void {
 async function applyQueuedModelCommand(cmd: PendingSessionCommand): Promise<string> {
   const deps = buildModelDeps({ chatId: cmd.chatId, threadId: cmd.threadId })
   if (cmd.origin === 'menu') {
-    // Menu SELECT (mdl:s:<tag>) — replay the callback handler (discovery is
-    // idle-safe now) and record via the shared side-effects helper.
-    const prevSessionModel = sessionModelSource.getOverride()
+    // Menu SELECT (mdl:s:<token>) — replay the callback handler, which now
+    // relaunches through the carrier itself (rev 5: no side-effects helper, no
+    // scrape). The relaunch writes its own restart marker so the post-boot card
+    // lands in this chat.
     const outcome = await handleModelMenuCallback(cmd.arg, deps)
-    const { restartNotice } = recordModelMenuSideEffects(
-      outcome,
-      deps,
-      cmd.chatId,
-      cmd.threadId,
-      prevSessionModel,
-    )
-    return restartNotice ?? outcome.reply.text
+    return outcome.reply.text
   }
   // Typed (and alias/sr menu taps converted to typed at enqueue): run the real
-  // handler + shared recording.
+  // handler, which relaunches through the carrier and owns all side effects.
   const reply = await handleModelCommand({ kind: 'set', model: cmd.arg }, deps)
-  const warning = recordTypedModelSwitch(reply, cmd.arg, deps)
-  return reply.text + warning
+  return reply.text
 }
 
 /** Apply a queued typed/menu effort command at idle; return the reply body. */
@@ -23880,17 +23919,12 @@ bot.command('model', async ctx => {
     })
     return
   }
+  // Rev 5: the handler relaunches through the carrier and owns every side effect
+  // (override write, carrier, premium-recovery clear). There is no post-hoc
+  // recording — /status is reconciled at boot from `.active-session-model`, so
+  // an unapplied switch can never be optimistically recorded here.
   const reply = await handleModelCommand(parsed, deps)
-  // Record a POSITIVELY-CONFIRMED typed switch so /status reflects what's
-  // actually running (shared with the deferred/menu paths). The sr-*/relaunch
-  // paths already set the override inside scheduleModelRelaunch; an unverified
-  // switch carries no selectedModel so /status is never lied to.
-  const persistWarning = recordTypedModelSwitch(
-    reply,
-    parsed.kind === 'set' ? parsed.model : null,
-    deps,
-  )
-  await switchroomReply(ctx, reply.text + persistWarning, { html: reply.html })
+  await switchroomReply(ctx, reply.text, { html: reply.html })
 })
 
 // `/effort` — show or switch the reasoning effort for the live session.
@@ -27382,51 +27416,15 @@ bot.on('callback_query:data', async ctx => {
     // rather than the switch-oriented "Switching…".
     const isPageNav = data === MODEL_CALLBACK_PAGE_EXTERNAL || data === MODEL_CALLBACK_PAGE_MAIN
     await ctx.answerCallbackQuery({ text: isPageNav ? 'Loading…' : 'Switching…' }).catch(() => {})
-    // sr-* inject waits for claude to respond (can take 10-30s). Edit the
-    // menu immediately to show a "working on it" state so the operator isn't
-    // left looking at a stale menu with no feedback. The final edit (✅/❌)
-    // replaces this once the inject returns.
-    // NOTE: this await yields the event loop, so a new inbound turn could
-    // start between here and handleModelMenuCallback's inner isBusy() check.
-    // We track whether we applied the interim edit so we can skip the
-    // toastOnly short-circuit if we did — a toastOnly return after the interim
-    // edit would leave the menu stuck button-less.
-    // sr-* TARGET tap: switch TO a non-Claude (LiteLLM/OpenRouter) model.
-    // Parity with the text `/model sr-*` path — claude's native picker rejects
-    // unknown sr-* ids, so an in-place inject can't set them. Carry the token
-    // across a graceful restart (the consume-once `.session-model` carrier) and
-    // relaunch `claude --model sr-*`. Session-only; reverts to the configured
-    // default on the next restart. The sr-* → Claude direction is handled below
-    // via the SELECT/alias outcome + isSrToClaudeTransition.
-    if (data.startsWith(MODEL_CALLBACK_SR)) {
-      const srName = data.slice(MODEL_CALLBACK_SR.length)
-      const srLabel = escapeHtmlForTg(srFriendlyLabel(srName))
-      if (!isValidModelArg(srName)) {
-        await ctx
-          .editMessageText(richMessage('❌ Invalid model name'), { reply_markup: { inline_keyboard: [] } })
-          .catch(() => {})
-        return
-      }
-      await ctx
-        .editMessageText(
-          richMessage(`🔄 Switching session to **${srLabel}** — restarting (~30s). _Session-only; reverts to the configured default on the next restart._`),
-          { reply_markup: { inline_keyboard: [] } },
-        )
-        .catch(() => {})
-      try {
-        await modelDeps.scheduleModelRelaunch(srName, `user: /model ${srName} (session-only relaunch, menu)`)
-      } catch (err) {
-        await ctx
-          .editMessageText(
-            richMessage(`❌ Could not switch to **${srLabel}**: ${escapeHtmlForTg((err as Error)?.message ?? String(err))}`),
-            { reply_markup: { inline_keyboard: [] } },
-          )
-          .catch(() => {})
-      }
-      return
-    }
+    // Rev 5 (deterministic switch): EVERY switch tap — Fable/alias (`mdl:alias:`),
+    // sr-* target (`mdl:sr:`), and picker SELECT (`mdl:s:<token>`) — goes through
+    // the single handler, which relaunches through the consume-once carrier
+    // (`scheduleModelRelaunch` / `scheduleModelDefaultRelaunch`). No inject, no
+    // cursor-nav, no scrape, and no post-hoc `recordModelMenuSideEffects`: the
+    // relaunch owns the override + carrier writes, and `.active-session-model`
+    // reconciles /status at boot. The handler writes its own restart marker so
+    // the post-boot card lands in this chat.
     try {
-      const prevSessionModel = sessionModelSource.getOverride()
       const outcome = await handleModelMenuCallback(data, modelDeps)
       // toastOnly: leave the menu untouched — a mid-turn refusal keeps its
       // buttons so the operator can tap again. (In the enqueue world this
@@ -27434,23 +27432,6 @@ bot.on('callback_query:data', async ctx => {
       // before ever calling the handler — but retained for callers that skip
       // the dispatcher gate.)
       if (outcome.toastOnly) return
-      // Record the switch (persist/clear sticky override) + drive an sr-*→Claude
-      // graceful restart when needed. Shared with the deferred (queued) apply so
-      // both surfaces record identically. Returns a restart notice when a
-      // session restart was scheduled.
-      const { restartNotice } = recordModelMenuSideEffects(
-        outcome,
-        modelDeps,
-        cbChatId,
-        cbThreadId,
-        prevSessionModel,
-      )
-      if (restartNotice) {
-        await ctx
-          .editMessageText(richMessage(restartNotice), { reply_markup: { inline_keyboard: [] } })
-          .catch(() => {})
-        return
-      }
       await ctx
         .editMessageText(richMessage(outcome.reply.text), {
           reply_markup: modelMenuReplyMarkup(outcome.reply) ?? { inline_keyboard: [] },
@@ -30481,6 +30462,18 @@ void (async () => {
           void sweepableIds
         } catch {}
 
+        // Rev 5: capture the restart-marker chat BEFORE the boot-card block
+        // clears it, so the session-model re-hydration block below can send the
+        // switch-confirmation ("✅ Now running X") to the chat that initiated the
+        // switch. A non-`/model` restart leaves these unused.
+        let modelSwitchMarkerChat: { chatId: string; threadId: number | null } | null = null
+        // The DETERMINISTIC "this boot was a /model switch" signal: the reason
+        // stampUserRestartReason() wrote to the clean-shutdown marker. Precise
+        // (distinguishes a model-switch relaunch from any other restart) and works
+        // even when launched === configured (a `/model default` / switch-to-default
+        // apply-boot) — that is how N4 (confirm the default case too) is closed.
+        let modelSwitchReason: string | null = null
+
         // Boot card — always post on every gateway start with the restart reason.
         // Gated on session marker so a grammY poll-restart (same process, no
         // actual restart) does NOT re-post.  See session-marker.ts for the
@@ -30542,6 +30535,18 @@ void (async () => {
             const ageMs = nowMs - marker.ts
             const ageSec = Math.max(1, Math.round(ageMs / 1000))
             process.stderr.write(`telegram gateway: boot: restart-marker present, chat_id=${marker.chat_id} age=${ageSec}s within5min=${ageMs < 5 * 60_000}\n`)
+            // Stash the chat for the model-switch confirmation (rev 5) before the
+            // marker is cleared. Bounded to a recent marker (<5min) so a stale
+            // marker can't misdirect a confirmation. Pair it with the /model
+            // switch reason (from the clean-shutdown marker) so the confirmation
+            // fires ONLY on a genuine /model relaunch (not a plain /restart that
+            // also wrote a marker chat).
+            if (ageMs < 5 * 60_000) {
+              modelSwitchMarkerChat = { chatId: marker.chat_id, threadId: marker.thread_id }
+              if (typeof cleanMarker?.reason === 'string' && cleanMarker.reason.startsWith('user: /model')) {
+                modelSwitchReason = cleanMarker.reason
+              }
+            }
             clearRestartMarker()
           }
 
@@ -30578,7 +30583,21 @@ void (async () => {
               })
             }
 
-            if (target) {
+            // N3 (dedup to ONE card per switch): a `/model` apply-boot already
+            // sends the `✅ Now running X` confirmation from the re-hydration block
+            // below (into the same chat). Suppress the generic restart boot card
+            // here so a deliberate switch yields exactly one card — the
+            // confirmation, which carries the operative "here's your model" info.
+            // Only when we KNOW it was a /model switch (reason) AND we will send the
+            // confirmation (marker chat captured); otherwise the boot card fires
+            // normally. Version/quota remain available via /status.
+            const suppressBootCardForModelSwitch =
+              modelSwitchReason != null && modelSwitchMarkerChat != null
+            if (target && suppressBootCardForModelSwitch) {
+              process.stderr.write(
+                `telegram gateway: boot: suppressing generic boot card — /model switch apply-boot (reason=${JSON.stringify(modelSwitchReason)}); the confirmation card replaces it\n`,
+              )
+            } else if (target) {
               const { chatId, threadId, ackMsgId } = target
               // First-write-wins dedupe: if bridge-reconnect already
               // claimed (its IPC client connected before this IIFE
@@ -30684,9 +30703,55 @@ void (async () => {
                   // a phantom session override.
                   return resolveMainModel(raw ?? undefined)
                 })()
-                sessionModelSource.setOverride(
-                  launched.length > 0 && launched !== configured ? launched : null,
+                // `launched !== configured` is the DETERMINISTIC "a model switch
+                // landed" signal (F1): the carrier is consume-once, so a launched
+                // model that differs from the configured default only ever
+                // happens on a genuine apply-boot. Seed the in-memory override
+                // from it — this is the ONLY success reporting, sourced from the
+                // real post-boot signal (`.active-session-model`), never from a
+                // scraped pane or an optimistic record.
+                const isApplyBoot = launched.length > 0 && launched !== configured
+                sessionModelSource.setOverride(isApplyBoot ? launched : null)
+                // Diagnosability (rev 5): the applied model is now always
+                // greppable — `grep 'gw /model relaunch applied'`. F4 note:
+                // `launched` is the REQUESTED token start.sh wrote before `exec
+                // claude` (it is NOT a post-launch confirmation). If a shape-valid
+                // but unknown Claude id was requested, `--fallback-model` may mask
+                // it: claude serves a fallback while this records the requested
+                // token. That divergence is NOT a persistent lie — the transcript's
+                // `message.model` (noteTranscriptModel) reclaims the source from
+                // this override on the first assistant line, correcting /status to
+                // the model actually serving calls. The pre-first-assistant window
+                // is the only optimistic window (G2), and it is bounded and
+                // self-healing; it is documented, not silently asserted as success.
+                process.stderr.write(
+                  `telegram gateway: gw /model relaunch applied agent=${getMyAgentName()} launched=${launched || '(none)'} configured=${configured} override=${isApplyBoot ? 'set' : 'cleared'}\n`,
                 )
+                // Switch-confirmation (F1 / PLAN §4 step 2): on a /model apply-boot
+                // with a known initiating chat, send ONE confirmation built from the
+                // ACTUAL launched model — never optimistic. Keyed on the DETERMINISTIC
+                // /model switch reason (from the clean-shutdown marker), not on
+                // `launched !== configured`, so it ALSO fires when a switch landed on
+                // the configured default (`/model default`, or `/model <configured>`)
+                // — N4. The generic boot card is suppressed for this boot (N3), so
+                // this is the single card the operator sees for the switch.
+                if (modelSwitchReason != null && modelSwitchMarkerChat) {
+                  const chat = modelSwitchMarkerChat
+                  const body = isApplyBoot
+                    ? `✅ Now running \`${launched}\` — session-only, reverts to the configured model on the next restart. Fresh session; memory and the handoff briefing carry the context.`
+                    : `✅ Now running \`${launched || configured}\` (the configured default) — fresh session; memory and the handoff briefing carry the context.`
+                  // allow-raw-bot-api: one-shot boot confirmation, same shape as the session-model alert relay below
+                  void lockedBot.api
+                    .sendMessage(chat.chatId, body, {
+                      parse_mode: 'Markdown',
+                      ...(chat.threadId != null ? { message_thread_id: chat.threadId } : {}),
+                    })
+                    .catch((err: unknown) =>
+                      process.stderr.write(
+                        `telegram gateway: model-switch confirmation send failed: ${(err as Error)?.message ?? String(err)}\n`,
+                      ),
+                    )
+                }
               } catch { /* leave override as-is on a bad read */ }
             }
 
