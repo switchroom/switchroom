@@ -1236,56 +1236,10 @@ try {
   }
 }
 
-// Issue #758: if TELEGRAM_BOT_TOKEN is not set in env (e.g. agent's .env was
-// never written because bot_token in switchroom.yaml is a `vault:` reference),
-// materialize it from the vault at startup. Resolved value is held in
-// process.env only — never written back to disk.
-//
-// The outer try/catch is narrowed (post-#761 review) to ONLY catch the case
-// where the helper module itself fails to load (ERR_MODULE_NOT_FOUND from the
-// dynamic import). Anything else — including throws from inside
-// materializeBotToken that aren't BotTokenMaterializeError — must propagate
-// with its original message so we don't mask real bugs behind the legacy
-// "set in .env" hint.
+// P0b (#2996): the bot token (Issue #758: vault materialization → TELEGRAM_BOT_TOKEN
+// env → refuse) is resolved at boot in initGatewayBot(), not at import — order + exit(1) refusal unchanged.
 type MaterializeMod = typeof import('../../src/telegram/materialize-bot-token.js')
-let materializeMod: MaterializeMod | null = null
-try {
-  materializeMod = await import('../../src/telegram/materialize-bot-token.js')
-} catch (err) {
-  const code = (err as NodeJS.ErrnoException | undefined)?.code
-  if (code === 'ERR_MODULE_NOT_FOUND' || code === 'MODULE_NOT_FOUND') {
-    // Module genuinely missing — fall through with materializeMod=null and
-    // handle below.
-  } else {
-    // Programming error, side-effect failure during module init, etc.
-    // Propagate the real message rather than masking it.
-    throw err
-  }
-}
-
 let TOKEN: string
-if (materializeMod !== null) {
-  const { materializeBotToken, BotTokenMaterializeError } = materializeMod
-  try {
-    TOKEN = await materializeBotToken({ agentName: process.env.SWITCHROOM_AGENT_NAME })
-  } catch (err) {
-    if (err instanceof BotTokenMaterializeError) {
-      process.stderr.write(`telegram gateway: ${err.message}\n`)
-      process.exit(1)
-    }
-    throw err
-  }
-} else if (process.env.TELEGRAM_BOT_TOKEN) {
-  TOKEN = process.env.TELEGRAM_BOT_TOKEN
-} else {
-  process.stderr.write(
-    `telegram gateway: TELEGRAM_BOT_TOKEN required\n` +
-    `  set in ${ENV_FILE}\n` +
-    `  format: TELEGRAM_BOT_TOKEN=123456789:AAH...\n` +
-    `  (token-materialization helper not found)\n`,
-  )
-  process.exit(1)
-}
 
 const STATIC = process.env.TELEGRAM_ACCESS_MODE === 'static'
 const TOPIC_ID = process.env.TELEGRAM_TOPIC_ID ? Number(process.env.TELEGRAM_TOPIC_ID) : undefined
@@ -1296,16 +1250,9 @@ const TOPIC_ID = process.env.TELEGRAM_TOPIC_ID ? Number(process.env.TELEGRAM_TOP
 const AGENT_ADMIN = process.env.SWITCHROOM_AGENT_ADMIN === 'true'
 
 // ─── Bot + chat lock ──────────────────────────────────────────────────────
-const bot = new Bot(TOKEN)
-installTgPostLogger(bot)
-
-// ─── Diagnostic update tap (#3300) ────────────────────────────────────────
-// One compact line per received update, logged BEFORE any specific handler
-// runs, so a drop at the grammy-routing layer is always diagnosable from the
-// logs. Pass-through middleware — never consumes an update or alters routing.
-// Rate-limited inside installUpdateTap (per-minute cap + suppression summary
-// line so even a flood is never invisible).
-installUpdateTap(bot, line => process.stderr.write(line))
+// P0b (#2996): `bot` is constructed at boot in initGatewayBot(), not at import
+// (`!` — its ~300 in-function references all run post-boot).
+let bot!: Bot<Context>
 
 // ─── getUpdates heartbeat ─────────────────────────────────────────────────
 // Tracks the last time getUpdates completed (success OR error). Used by
@@ -1313,19 +1260,10 @@ installUpdateTap(bot, line => process.stderr.write(line))
 // getUpdates hasn't responded in a while, the grammy runner loop is frozen
 // without the network being down (2026-06-30: clerk/klanker deaf for 2h
 // after a single timeout — getMe stayed green so the getMe-only check
-// never fired). Initialized to now so the first health-check interval
-// doesn't false-positive before the runner makes its first poll.
+// never fired). Initialized to now so the first health-check interval doesn't
+// false-positive before the runner's first poll. The api middleware that writes
+// it is installed in initGatewayBot() (P0b, #2996).
 let lastGetUpdatesHeartbeatMs = Date.now()
-bot.api.config.use(async (prev, method, payload, signal) => {
-  try {
-    const result = await prev(method, payload, signal)
-    if (method === 'getUpdates') lastGetUpdatesHeartbeatMs = Date.now()
-    return result
-  } catch (err) {
-    if (method === 'getUpdates') lastGetUpdatesHeartbeatMs = Date.now()
-    throw err
-  }
-})
 
 const GRAMMY_VERSION: string = (() => {
   try {
@@ -1337,22 +1275,14 @@ const GRAMMY_VERSION: string = (() => {
 })()
 
 // ─── sendChecklist / editMessageChecklist boot probes ─────────────────────
-// grammY 1.x exposes new Telegram Bot API methods via bot.api.raw before the
-// typed wrapper is generated. We probe for availability at boot so callers
-// can detect degraded mode gracefully instead of throwing at call time.
-const _rawSendChecklist = (bot.api.raw as unknown as Record<string, unknown>).sendChecklist
-const _rawEditMessageChecklist = (bot.api.raw as unknown as Record<string, unknown>).editMessageChecklist
-
-/** True when the connected Telegram Bot API supports native checklists. */
-const CHECKLIST_API_AVAILABLE =
-  typeof _rawSendChecklist === 'function' &&
-  typeof _rawEditMessageChecklist === 'function'
-
-if (!CHECKLIST_API_AVAILABLE) {
-  process.stderr.write(
-    `telegram gateway: sendChecklist / editMessageChecklist not available in this grammY/Bot API version (${GRAMMY_VERSION}) — checklist tools will error gracefully\n`,
-  )
-}
+// grammY 1.x exposes new Bot API methods via bot.api.raw before the typed
+// wrapper is generated; we probe availability at boot so callers degrade
+// gracefully instead of throwing at call time. P0b (#2996): the probe reads
+// `bot.api.raw` in initGatewayBot() — module-scope so the wrappers read them.
+let _rawSendChecklist: unknown
+let _rawEditMessageChecklist: unknown
+/** True when the connected Telegram Bot API supports native checklists. Set in initGatewayBot() (#2996 P0b). */
+let CHECKLIST_API_AVAILABLE = false
 
 /**
  * Send a native Telegram checklist message.
@@ -1416,7 +1346,8 @@ async function rawEditMessageChecklist(args: {
 }
 
 const chatLock = createChatLock()
-const lockedBot = chatLock.wrapBot({ api: bot.api as unknown as Record<string, unknown> }) as unknown as typeof bot
+// P0b (#2996): wrapped in initGatewayBot() once `bot` is constructed at boot.
+let lockedBot!: Bot<Context>
 let botUsername = ''
 
 // ─── Access control ───────────────────────────────────────────────────────
@@ -20783,7 +20714,7 @@ async function handleInbound(
         }
         vaultPassphraseCache.set(chat_id, { passphrase, expiresAt: Date.now() + VAULT_PASSPHRASE_TTL_MS })
         if (msgId != null) await deleteSensitiveMessage(chat_id, msgId, 'vault passphrase')
-        await executeDeferredSecretSave(ctx, pendingVault.deferKey, passphrase, pendingVault.cardMessageId)
+        await callbackQueryHandlers.executeDeferredSecretSave(ctx, pendingVault.deferKey, passphrase, pendingVault.cardMessageId)
       } else if (pendingVault.kind === 'passphrase-for-access-approve') {
         // #1012 Phase 2 follow-up + #1051: operator tapped Approve on
         // one or more vault_request_access cards without first
@@ -20823,12 +20754,12 @@ async function handleInbound(
               .catch(() => {})
             continue
           }
-          await performVaultAccessApproval(ctx, stagedAccess, item.stageId, item.senderId, { kind: 'passphrase', passphrase })
+          await callbackQueryHandlers.performVaultAccessApproval(ctx, stagedAccess, item.stageId, item.senderId, { kind: 'passphrase', passphrase })
         }
       } else if (pendingVault.kind === 'grant-wizard' && pendingVault.awaitingCustomDuration) {
         // Issue #227: custom duration text reply for grant wizard
         const input = text.trim()
-        const ttlSeconds = parseGrantDuration(input)
+        const ttlSeconds = callbackQueryHandlers.parseGrantDuration(input)
         if (ttlSeconds === null) {
           // Re-set state so user can try again
           pendingVaultOps.set(chat_id, { ...pendingVault, startedAt: Date.now() })
@@ -20836,7 +20767,7 @@ async function handleInbound(
           return
         }
         const newState = { ...pendingVault, ttlSeconds, awaitingCustomDuration: false }
-        await grantWizardConfirm(ctx, chat_id, newState)
+        await callbackQueryHandlers.grantWizardConfirm(ctx, chat_id, newState)
       } else if (pendingVault.kind === 'grant-wizard') {
         // Text received mid-wizard but not awaiting custom duration — ignore and re-set
         pendingVaultOps.set(chat_id, { ...pendingVault, startedAt: Date.now() })
@@ -23414,16 +23345,10 @@ async function buildLiveProbeRows(agentName: string): Promise<StatusProbeRow[]> 
   }
 }
 
-// RFC B §9: register /approvals list|revoke against the approval kernel.
-// The kernel's IPC client (`src/vault/approvals/client.ts`) round-trips
-// through the vault broker — same socket, no new daemon. The isApprover
-// gate reuses the existing dmCommandGate / allowFrom pattern.
-{
-  const { registerApprovalsCommands } = await import('./approvals-commands.js')
-  registerApprovalsCommands(bot, {
-    isApprover: ctx => dmCommandGate(ctx) !== null,
-  })
-}
+// RFC B §9: /approvals list|revoke is registered against the approval kernel.
+// P0b (#2996): this references `bot`, so it moved to initGatewayBot() at boot —
+// kept AHEAD of registerGatewayHandlers so /approvals stays before the admin-gate
+// bot.use in the grammY stack (unchanged pre-P0b ordering; /approvals not gated).
 
 
 
@@ -25563,67 +25488,13 @@ function resolveAgentDirForName(agent: string): string | null {
 
 // ─── Callback-query handler families (#2996 Phase 5, remaining item 2) ─────
 // Extracted verbatim to callback-query-handlers.ts behind an injected deps
-// object (see that module's header for what moved and what deliberately
-// stayed). Destructuring keeps every call site below byte-identical.
-const callbackQueryHandlers = createCallbackQueryHandlers({
-  bot,
-  lockedBot,
-  loadAccess,
-  escapeHtmlForTg,
-  switchroomReply,
-  resolveThreadId,
-  deliverResumeSyntheticOrBuffer,
-  expireMentalModelProposeCard,
-  readLiveSwitchroomConfigText,
-  mentalModelCorrelationKey,
-  getMyAgentName,
-  triggerSelfRestart,
-  runSwitchroomAuthCommand,
-  switchroomExecJson,
-  assertSafeAgentName,
-  buildDeferredSecretKeyboard,
-  recordDeferredSecretKernelDecision,
-  mintGrantWizardKernelRequest,
-  recordGrantWizardKernelDecision,
-  robustApiCall,
-  swallowingApiCall,
-  pendingVaultRequestAccesses,
-  pendingVaultRequestSaves,
-  pendingMentalModelProposes,
-  pendingCardStore,
-  pendingMentalModelCorrelations,
-  pendingVaultOps,
-  vaultPassphraseCache,
-  deferredSecrets,
-  pendingReauthFlows,
-  secretStaging,
-  lastAuthRefreshAtMs,
-  // Mutable module `let`s — injected as getters so the startup config
-  // assignment (and any later reload) stays observable from the module.
-  getVaultApprovalAuthMode: () => VAULT_APPROVAL_AUTH_MODE,
-  getAdminOnlyKeys: () => ADMIN_ONLY_KEYS,
-  vaultKeyRegex: VAULT_KEY_REGEX,
-  mentalModelProposeTtlMs: MENTAL_MODEL_PROPOSE_TTL_MS,
-  // #2975 Stage 1 — loud-failure funnel for a rate-window retry that also
-  // failed (cooldown + record + broadcast in one place).
-  emitOperatorEvent: emitGatewayOperatorEvent,
-})
-const {
-  handleVaultRecentDenialCallback,
-  performVaultAccessApproval,
-  handleSkillProposalCallback,
-  handleMentalModelProposeCallback,
-  handleVaultRequestAccessCallback,
-  handleVaultRequestSaveCallback,
-  handleVaultDeferCallback,
-  parseGrantDuration,
-  startGrantWizardStep1,
-  grantWizardConfirm,
-  handleVaultGrantCallback,
-  executeDeferredSecretSave,
-  handleOperatorEventCallback,
-  handleAuthDashboardCallback,
-} = callbackQueryHandlers
+// object (see that module's header for what moved and what deliberately stayed).
+// P0b (#2996): the factory injects `bot`/`lockedBot`, so it is invoked at boot in
+// initGatewayBot(). Call sites reference `callbackQueryHandlers.<name>` (the
+// former module-scope destructure was removed — its names would be unassigned at
+// import once construction is deferred). This module-scope `let` is assigned once
+// at boot, before the runner, so every call site (all post-boot) resolves.
+let callbackQueryHandlers!: ReturnType<typeof createCallbackQueryHandlers>
 
 // /reauth was removed in v0.6.13 — the `/auth` dashboard's
 // `🔄 Reauth default` button fires the same flow (the `case 'reauth':`
@@ -26537,13 +26408,13 @@ async function handleMessageReaction(ctx: Context): Promise<void> {
 // invariant in catch-all-unhandled-message.test.ts. Behaviour-preserving leaf
 // move: registration ORDER is byte-identical (every message:* handler still
 // precedes the installUnhandledMessageCatchAll terminal catch-all, which still
-// precedes message_reaction + the error boundary) and the single call below
-// runs at the same point in module evaluation as the old last registration, so
-// grammY sees the exact same middleware/handler sequence. `bot` is injected
-// (P0b defers its construction); `deps` is the forward seam for per-handler
-// dependency injection that later #2996 phases widen — in P0a the handler
-// bodies still close over gateway module scope. Statements keep their original
-// indentation (no reindent) so the move is a byte-verifiable relocation.
+// precedes message_reaction + the error boundary) and the single call site (now
+// inside initGatewayBot() — P0b, #2996) runs at the same boot point as the old
+// module-scope registration: after `bot` is constructed, before the runner, so
+// grammY sees the exact same middleware/handler sequence. `bot` is injected (P0b
+// defers construction); `deps` is the forward seam for per-handler DI later
+// #2996 phases widen — in P0a the bodies still close over module scope.
+// Statements keep original indentation (no reindent): a byte-verifiable move.
 type RegisterGatewayHandlersDeps = Record<string, never>
 function registerGatewayHandlers(bot: Bot<Context>, deps: RegisterGatewayHandlersDeps): void {
   void deps
@@ -28008,7 +27879,7 @@ bot.command('vault', async ctx => {
 
   // Issue #227: /vault grant — inline-keyboard wizard to mint capability tokens
   if (sub === 'grant') {
-    await startGrantWizardStep1(ctx, chatId)
+    await callbackQueryHandlers.startGrantWizardStep1(ctx, chatId)
     return
   }
 
@@ -28293,7 +28164,7 @@ bot.on('callback_query:data', async ctx => {
       await ctx.answerCallbackQuery({ text: 'Not authorized.' })
       return
     }
-    await handleAuthDashboardCallback(ctx)
+    await callbackQueryHandlers.handleAuthDashboardCallback(ctx)
     return
   }
 
@@ -28611,7 +28482,7 @@ bot.on('callback_query:data', async ctx => {
   // renderOperatorEvent(). Agent name is URL-encoded at emit (issue #24).
   // Actions: dismiss, restart, reauth, logs.
   if (data.startsWith('op:')) {
-    await handleOperatorEventCallback(ctx, data)
+    await callbackQueryHandlers.handleOperatorEventCallback(ctx, data)
     return
   }
 
@@ -28619,7 +28490,7 @@ bot.on('callback_query:data', async ctx => {
   // Actions: unlock (prompt for passphrase + auto-write), cancel.
   // Issue #44.
   if (data.startsWith('vd:')) {
-    await handleVaultDeferCallback(ctx, data)
+    await callbackQueryHandlers.handleVaultDeferCallback(ctx, data)
     return
   }
 
@@ -28652,7 +28523,7 @@ bot.on('callback_query:data', async ctx => {
   // vg:confirm:<id> — execute revoke
   // vg:cancel:<id> — dismiss
   if (data.startsWith('vg:')) {
-    await handleVaultGrantCallback(ctx, data)
+    await callbackQueryHandlers.handleVaultGrantCallback(ctx, data)
     return
   }
 
@@ -28661,7 +28532,7 @@ bot.on('callback_query:data', async ctx => {
   // vrs:discard:<stageId>  — drop the staged value, edit card to discarded
   // vrs:rename:<stageId>   — prompt for a new key name, then resume
   if (data.startsWith('vrs:')) {
-    await handleVaultRequestSaveCallback(ctx, data)
+    await callbackQueryHandlers.handleVaultRequestSaveCallback(ctx, data)
     return
   }
 
@@ -28669,7 +28540,7 @@ bot.on('callback_query:data', async ctx => {
   // vra:approve:<stageId> — mint scoped grant via broker, write token
   // vra:deny:<stageId>    — refuse, edit card to denied
   if (data.startsWith('vra:')) {
-    await handleVaultRequestAccessCallback(ctx, data)
+    await callbackQueryHandlers.handleVaultRequestAccessCallback(ctx, data)
     return
   }
 
@@ -28686,7 +28557,7 @@ bot.on('callback_query:data', async ctx => {
   //                           via operator-approved config edit) + ensure it
   //   mmp:deny:<stageId>    — drop the proposal; NOTHING is written
   if (data.startsWith('mmp:')) {
-    await handleMentalModelProposeCallback(ctx, data)
+    await callbackQueryHandlers.handleMentalModelProposeCallback(ctx, data)
     return
   }
 
@@ -28696,7 +28567,7 @@ bot.on('callback_query:data', async ctx => {
   //   skprop:deny:<id>    — dismiss + record a rejection fingerprint so it
   //                         isn't re-proposed
   if (data.startsWith('skprop:')) {
-    await handleSkillProposalCallback(ctx, data)
+    await callbackQueryHandlers.handleSkillProposalCallback(ctx, data)
     return
   }
 
@@ -28713,7 +28584,7 @@ bot.on('callback_query:data', async ctx => {
   //   vrd:<agent>:<key> — mint a 30-day read-grant for the agent + key
   // Posted by /vault audit <agent> in the "Recent denials" section.
   if (data.startsWith('vrd:')) {
-    await handleVaultRecentDenialCallback(ctx, data)
+    await callbackQueryHandlers.handleVaultRecentDenialCallback(ctx, data)
     return
   }
 
@@ -29951,8 +29822,8 @@ bot.catch(err => {
   process.stderr.write(`telegram gateway: handler error (polling continues): ${err.error}\n`)
 })
 }
-registerGatewayHandlers(bot, {})
-
+// registerGatewayHandlers(bot, {}) is invoked from initGatewayBot() at boot
+// (#2996 P0b) — off module top level now that `bot` is constructed at boot.
 // ─── Shutdown ─────────────────────────────────────────────────────────────
 //
 // 35-second drain budget. The 2026-04-23 incident showed that a 3-second
@@ -30346,6 +30217,153 @@ if (POLL_HEALTH_INTERVAL_MS > 0) {
   })
 }
 
+// ─── Boot-time bot construction (#2996 P0b) ───────────────────────────────
+// Deferred out of module import so `import`ing gateway.ts performs no token
+// materialization, no `new Bot`, and has no reachable process.exit(1). Invoked
+// once from the boot IIFE below, before initVaultApprovalPosture() and the
+// runner, reproducing the original import-time order VERBATIM: token → new Bot →
+// installTgPostLogger → installUpdateTap → heartbeat middleware → checklist
+// probes → chatLock.wrapBot → registerGatewayHandlers. Token (Issue #758): if
+// TELEGRAM_BOT_TOKEN isn't in env, materialize from the vault (stays in
+// process.env, never on disk); the try/catch around the dynamic import is
+// narrowed (post-#761) to ONLY ERR_MODULE_NOT_FOUND, anything else propagates.
+async function initGatewayBot(): Promise<void> {
+  let materializeMod: MaterializeMod | null = null
+  try {
+    materializeMod = await import('../../src/telegram/materialize-bot-token.js')
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code
+    if (code === 'ERR_MODULE_NOT_FOUND' || code === 'MODULE_NOT_FOUND') {
+      // Module genuinely missing — fall through with materializeMod=null and
+      // handle below.
+    } else {
+      // Programming error, side-effect failure during module init, etc.
+      // Propagate the real message rather than masking it.
+      throw err
+    }
+  }
+
+  if (materializeMod !== null) {
+    const { materializeBotToken, BotTokenMaterializeError } = materializeMod
+    try {
+      TOKEN = await materializeBotToken({ agentName: process.env.SWITCHROOM_AGENT_NAME })
+    } catch (err) {
+      if (err instanceof BotTokenMaterializeError) {
+        process.stderr.write(`telegram gateway: ${err.message}\n`)
+        process.exit(1)
+      }
+      throw err
+    }
+  } else if (process.env.TELEGRAM_BOT_TOKEN) {
+    TOKEN = process.env.TELEGRAM_BOT_TOKEN
+  } else {
+    process.stderr.write(
+      `telegram gateway: TELEGRAM_BOT_TOKEN required\n` +
+      `  set in ${ENV_FILE}\n` +
+      `  format: TELEGRAM_BOT_TOKEN=123456789:AAH...\n` +
+      `  (token-materialization helper not found)\n`,
+    )
+    process.exit(1)
+  }
+
+  bot = new Bot(TOKEN)
+  installTgPostLogger(bot)
+
+  // Diagnostic update tap (#3300): one compact line per received update, logged
+  // BEFORE any specific handler runs, so a routing-layer drop is diagnosable
+  // from the logs. Pass-through middleware; rate-limited inside installUpdateTap.
+  installUpdateTap(bot, line => process.stderr.write(line))
+
+  // getUpdates heartbeat instrumentation — writes lastGetUpdatesHeartbeatMs
+  // (declared module-scope, read by the poll health check).
+  bot.api.config.use(async (prev, method, payload, signal) => {
+    try {
+      const result = await prev(method, payload, signal)
+      if (method === 'getUpdates') lastGetUpdatesHeartbeatMs = Date.now()
+      return result
+    } catch (err) {
+      if (method === 'getUpdates') lastGetUpdatesHeartbeatMs = Date.now()
+      throw err
+    }
+  })
+
+  // sendChecklist / editMessageChecklist boot probes (see declarations above).
+  _rawSendChecklist = (bot.api.raw as unknown as Record<string, unknown>).sendChecklist
+  _rawEditMessageChecklist = (bot.api.raw as unknown as Record<string, unknown>).editMessageChecklist
+  CHECKLIST_API_AVAILABLE =
+    typeof _rawSendChecklist === 'function' &&
+    typeof _rawEditMessageChecklist === 'function'
+  if (!CHECKLIST_API_AVAILABLE) {
+    process.stderr.write(
+      `telegram gateway: sendChecklist / editMessageChecklist not available in this grammY/Bot API version (${GRAMMY_VERSION}) — checklist tools will error gracefully\n`,
+    )
+  }
+
+  lockedBot = chatLock.wrapBot({ api: bot.api as unknown as Record<string, unknown> }) as unknown as typeof bot
+
+  // RFC B §9 (moved here by P0b): register /approvals against the approval
+  // kernel. The kernel's IPC client round-trips through the vault broker; the
+  // isApprover gate reuses dmCommandGate / allowFrom. Kept BEFORE
+  // registerGatewayHandlers so /approvals stays ahead of the admin-gate bot.use
+  // in the grammY stack — byte-identical middleware order to pre-P0b.
+  {
+    const { registerApprovalsCommands } = await import('./approvals-commands.js')
+    registerApprovalsCommands(bot, {
+      isApprover: ctx => dmCommandGate(ctx) !== null,
+    })
+  }
+
+  // Callback-query handler families (#2996 Phase 5) — factory injects bot/
+  // lockedBot, so it is constructed here at boot (P0b). Moved verbatim from
+  // module scope; every injected dep is a module-scope singleton available now.
+  callbackQueryHandlers = createCallbackQueryHandlers({
+    bot,
+    lockedBot,
+    loadAccess,
+    escapeHtmlForTg,
+    switchroomReply,
+    resolveThreadId,
+    deliverResumeSyntheticOrBuffer,
+    expireMentalModelProposeCard,
+    readLiveSwitchroomConfigText,
+    mentalModelCorrelationKey,
+    getMyAgentName,
+    triggerSelfRestart,
+    runSwitchroomAuthCommand,
+    switchroomExecJson,
+    assertSafeAgentName,
+    buildDeferredSecretKeyboard,
+    recordDeferredSecretKernelDecision,
+    mintGrantWizardKernelRequest,
+    recordGrantWizardKernelDecision,
+    robustApiCall,
+    swallowingApiCall,
+    pendingVaultRequestAccesses,
+    pendingVaultRequestSaves,
+    pendingMentalModelProposes,
+    pendingCardStore,
+    pendingMentalModelCorrelations,
+    pendingVaultOps,
+    vaultPassphraseCache,
+    deferredSecrets,
+    pendingReauthFlows,
+    secretStaging,
+    lastAuthRefreshAtMs,
+    // Mutable module `let`s — injected as getters so the startup config
+    // assignment (and any later reload) stays observable from the module.
+    getVaultApprovalAuthMode: () => VAULT_APPROVAL_AUTH_MODE,
+    getAdminOnlyKeys: () => ADMIN_ONLY_KEYS,
+    vaultKeyRegex: VAULT_KEY_REGEX,
+    mentalModelProposeTtlMs: MENTAL_MODEL_PROPOSE_TTL_MS,
+    // #2975 Stage 1 — loud-failure funnel for a rate-window retry that also
+    // failed (cooldown + record + broadcast in one place).
+    emitOperatorEvent: emitGatewayOperatorEvent,
+  })
+
+  // Install the grammY registration surface (P0a) — once, before the runner.
+  registerGatewayHandlers(bot, {})
+}
+
 // One-shot startup guard. The outer for-loop below re-enters its try block
 // on 409 Conflict retries — those are transient polling conflicts, not
 // process restarts. Anything that should fire exactly once per gateway
@@ -30359,6 +30377,11 @@ if (POLL_HEALTH_INTERVAL_MS > 0) {
 let didOneTimeSetup = false
 
 void (async () => {
+  // #2996 P0b: construct the bot + install the registration surface FIRST,
+  // before vault-posture init and the runner. Keeps failure modes in pre-P0b
+  // order: token refusal (exit 1) precedes the vault-posture refusal (exit 78).
+  await initGatewayBot()
+
   // Load vault-grant approval posture once at startup. Side-effect: when
   // posture is `telegram-id`, this reads the machine-bound auto-unlock
   // blob and holds the plaintext passphrase in memory for silent
