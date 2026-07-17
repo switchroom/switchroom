@@ -2257,6 +2257,30 @@ const MicrosoftAccountEmailSchema = z
   .transform((v) => v.trim().toLowerCase());
 
 /**
+ * A single per-account tool-allowlist token. These are forwarded verbatim
+ * to softeria as `--enabled-tools <tokens joined by |>` and evaluated by
+ * softeria as an UNANCHORED, case-insensitive regex against each tool alias.
+ *
+ * Restricting the token charset to `[a-z0-9-]+` (review 2026-07-17, Finding
+ * 4) is a defense-in-depth guard: an unescaped regex metacharacter in a
+ * token (`(`, `[`, `\`, `*`, …) would otherwise reach softeria's `new
+ * RegExp(...)` and can throw on startup — crashing the launcher child into a
+ * restart loop. Softeria tool aliases are all lowercase kebab-case
+ * (`send-mail`, `list-calendar-events`), so this charset loses no legitimate
+ * matching power while making a malformed-regex crash impossible.
+ */
+const MicrosoftToolTokenSchema = z
+  .string()
+  .min(1)
+  .regex(/^[a-z0-9-]+$/, {
+    message:
+      "microsoft_workspace tools[] tokens are forwarded to softeria's " +
+      "--enabled-tools regex; each must be lowercase kebab-case " +
+      "([a-z0-9-]+, e.g. 'mail', 'calendar', 'send-mail') so an unescaped " +
+      "regex metacharacter can't crash the launcher",
+  });
+
+/**
  * A single Microsoft account binding in the plural `accounts[]` form
  * (multi-account-per-agent RFC). Each binding pins one account, an
  * optional per-account tool allowlist (→ softeria `--enabled-tools`),
@@ -2268,7 +2292,7 @@ export const MicrosoftAccountBindingSchema = z.object({
     "`microsoft_accounts:` with this agent in its `enabled_for[]`."
   ),
   tools: z
-    .array(z.string().min(1))
+    .array(MicrosoftToolTokenSchema)
     .min(1)
     .optional()
     .describe(
@@ -2293,7 +2317,7 @@ export const AgentMicrosoftWorkspaceConfigSchema = z
       "also normalized). Mutually exclusive with `accounts` (plural)."
     ),
     tools: z
-      .array(z.string().min(1))
+      .array(MicrosoftToolTokenSchema)
       .min(1)
       .optional()
       .describe(
@@ -4332,6 +4356,18 @@ export const SwitchroomConfigSchema = z.object({
   // the broker's FORBIDDEN hint) rather than a silently-missing tool
   // namespace. The singular `account` form keeps its lenient
   // emit-iff-enabled behavior (no hard error) for back-compat.
+  //
+  // DECISION (review 2026-07-17, Finding 3): the fleet-wide hard-fail is
+  // DELIBERATE and asymmetric with the singular form by design. Zod parse is
+  // all-or-nothing — there is no per-agent scoping at this layer — and a
+  // multi-account misconfig is an operator authoring error that should be
+  // caught at `switchroom apply`/load time, not silently drop one agent's
+  // M365 surface (which is much harder to notice than a failed load). The
+  // singular form stays lenient ONLY for back-compat with configs authored
+  // before the twin-key gate existed; new plural authors opt into the strict
+  // gate. Per-agent-scoped degradation (load the rest of the fleet, disable
+  // just the offending agent's M365) is tracked as a follow-up — it needs
+  // loader-level support, not a schema tweak.
   const microsoftAccounts = (cfg as {
     microsoft_accounts?: Record<string, { enabled_for?: string[] } | undefined>;
   }).microsoft_accounts;

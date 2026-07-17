@@ -3311,6 +3311,24 @@ export class AuthBroker {
         return;
       }
       account = bound.account;
+    } else if (bindings.length > 1) {
+      // Multi-account agent but NO account requested. Silently returning
+      // bindings[0] here is the root of the write-approval-card mis-resolve
+      // (review 2026-07-17, Finding 2): callers that forget to thread the
+      // account would enrich/act against the wrong mailbox. Fail loudly with
+      // a hint instead — every legitimate multi-account caller passes the
+      // account explicitly.
+      this.audit({ op: "get-credentials", identity, accountKind: "microsoft", ok: false, error: "account-ambiguous" });
+      socket.write(
+        encodeError(
+          id,
+          "INVALID_ARGS",
+          `agent '${agentName}' is bound to ${bindings.length} Microsoft accounts (${bindings
+            .map((b) => b.account)
+            .join(", ")}); an account must be specified — call getCredentials("microsoft", <account>)`,
+        ),
+      );
+      return;
     } else {
       // Back-compat: derive the single account from the (normalized)
       // bindings. Exactly one binding is expected in the singular form.

@@ -32,7 +32,10 @@ import {
   enrichCalendarPreview,
   loadAllowFrom,
   ms365BareToolName,
+  ms365AccountSlugFromToolName,
 } from "./ms-365-write-pretool.js";
+import { resolveMicrosoftAccountBySlug } from "../ms365/graph-resolve.js";
+import { microsoftAccountSlug } from "../config/microsoft-workspace-acl.js";
 
 describe("multi-account prefix widening (MERGE-BLOCKER — fail-open regression guard)", () => {
   // If the PreToolUse prefix isn't widened from the literal `mcp__ms-365__`
@@ -460,5 +463,64 @@ describe("enrichCalendarPreview — resolves subject + account for a body-only e
     // Still resolves the account (from the token identity) and the after-value.
     expect(e.accountEmail).toBe("ken@example.com");
     expect(e.changes).toEqual([{ field: "location", after: "New" }]);
+  });
+});
+
+describe("Finding 1 — enrichment resolves the CORRECT account on a multi-account agent", () => {
+  it("ms365AccountSlugFromToolName extracts the per-account slug (multi) / null (bare)", () => {
+    expect(ms365AccountSlugFromToolName("mcp__ms-365-lisa-1a2b__update-calendar-event")).toBe(
+      "lisa-1a2b",
+    );
+    // bare single-account key → no slug
+    expect(ms365AccountSlugFromToolName("mcp__ms-365__update-calendar-event")).toBeNull();
+    expect(ms365AccountSlugFromToolName("Bash")).toBeNull();
+  });
+
+  it("resolveMicrosoftAccountBySlug maps a slug back to its account email", async () => {
+    const first = "alice@contoso.com";
+    const second = "bob@fabrikam.com";
+    const secondSlug = microsoftAccountSlug(second);
+    const account = await resolveMicrosoftAccountBySlug(secondSlug, {
+      listAccounts: async () => [first, second],
+    });
+    expect(account).toBe(second);
+    // null slug (single-account back-compat) → no resolution
+    expect(
+      await resolveMicrosoftAccountBySlug(null, {
+        listAccounts: async () => [first, second],
+      }),
+    ).toBeNull();
+  });
+
+  it("enriches the card against the SECOND binding's mailbox, not bindings[0]", async () => {
+    // Simulate the broker: each account has its OWN token/identity. An
+    // account-less load (the pre-fix bug) returns bindings[0] — asserting the
+    // second account below FAILS on the buggy account-less path.
+    const first = "alice@contoso.com";
+    const second = "bob@fabrikam.com";
+    const secondSlug = microsoftAccountSlug(second);
+    const handlesByAccount: Record<string, string> = {
+      [first]: first,
+      [second]: second,
+    };
+    // The tool fires on the SECOND account's per-account server key.
+    const enrichment = await enrichCalendarPreview(
+      `mcp__ms-365-${secondSlug}__update-calendar-event`,
+      { eventId: "AQMkADAw==", body: { content: "<p>new</p>" } },
+      {
+        resolveAccount: async (slug) =>
+          slug === secondSlug ? second : slug === microsoftAccountSlug(first) ? first : null,
+        loadHandle: async (account) => ({
+          access_token: "at",
+          expires_at: Date.now() + 3_600_000,
+          // Back-compat account-less broker branch would return bindings[0]
+          // (== first). We echo the REQUESTED account's identity here.
+          account_email: account ? handlesByAccount[account] : first,
+        }),
+        fetchEvent: async () => ({ subject: "Bob's review", bodyPreview: "old" }),
+      },
+    );
+    expect(enrichment.accountEmail).toBe(second);
+    expect(enrichment.itemDisplayName).toBe("Bob's review");
   });
 });

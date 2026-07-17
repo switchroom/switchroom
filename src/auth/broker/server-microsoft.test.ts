@@ -854,4 +854,54 @@ describe("AuthBroker — Microsoft get-credentials, multi-account per agent", ()
 
     broker.stop();
   });
+
+  it("Finding 2 — INVALID_ARGS (not a silent bindings[0]) when multi-account and NO account requested", async () => {
+    const h = makeHarness();
+    const config = makeConfig(h, {
+      agents: {
+        marko: {
+          microsoft_workspace: {
+            accounts: [
+              { account: "alice@example.com" },
+              { account: "bob@example.com" },
+            ],
+          },
+        },
+      },
+      microsoftAccounts: {
+        "alice@example.com": { enabled_for: ["marko"] },
+        "bob@example.com": { enabled_for: ["marko"] },
+      },
+    });
+    seedMicrosoftAccount(h, "alice@example.com", {
+      expiresAt: Date.now() + 3600_000,
+      accessToken: "at-alice",
+    });
+    seedMicrosoftAccount(h, "bob@example.com", {
+      expiresAt: Date.now() + 3600_000,
+      accessToken: "at-bob",
+    });
+
+    const broker = new AuthBroker(config, {
+      home: h.home,
+      stateDir: h.stateDir,
+      socketRoot: h.socketRoot,
+      disableRefreshLoop: true,
+    });
+    await broker.start();
+
+    // Account-less request on a multi-account agent must NOT silently return
+    // bindings[0] (alice) — that was the root of the wrong-account card.
+    const resp = (await rpc(join(h.socketRoot, "marko", "sock"), {
+      v: 1,
+      id: "mm-5",
+      op: "get-credentials",
+      provider: "microsoft",
+    })) as { ok: false; error: { code: string; message: string } };
+    expect(resp.ok).toBe(false);
+    expect(resp.error.code).toBe("INVALID_ARGS");
+    expect(resp.error.message).toContain("account must be specified");
+
+    broker.stop();
+  });
 });

@@ -93,6 +93,28 @@ describe("AgentMicrosoftWorkspaceConfigSchema — reject forms", () => {
     });
     expect(r.success).toBe(false);
   });
+
+  it("Finding 4 — rejects tool tokens with regex metacharacters (singular + plural)", () => {
+    // An unescaped metacharacter would reach softeria's --enabled-tools regex
+    // and can throw on `new RegExp(...)`, crashing the launcher into a restart
+    // loop. The schema must reject it at load time.
+    for (const bad of ["send-mail|(", "mail.*", "cal[endar", "back\\slash"]) {
+      const singular = AgentMicrosoftWorkspaceConfigSchema.safeParse({
+        account: "a@outlook.com",
+        tools: [bad],
+      });
+      expect(singular.success).toBe(false);
+      const plural = AgentMicrosoftWorkspaceConfigSchema.safeParse({
+        accounts: [{ account: "a@outlook.com", tools: [bad] }],
+      });
+      expect(plural.success).toBe(false);
+    }
+    // Legitimate lowercase kebab-case tokens still pass.
+    const ok = AgentMicrosoftWorkspaceConfigSchema.safeParse({
+      accounts: [{ account: "a@outlook.com", tools: ["mail", "calendar", "send-mail"] }],
+    });
+    expect(ok.success).toBe(true);
+  });
 });
 
 describe("normalizeMicrosoftBindings — the drift guard", () => {
