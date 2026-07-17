@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+## v0.18.31 — Answers can no longer be silently dropped at delivery, and model config edits actually apply on restart
+
+### Fixes
+
+- **Turn-flush suppression can no longer eat an answer** (#3299) — the
+  answer-ready flush suppressed itself whenever ANY bot message had landed in
+  the chat within the previous 2 seconds — including worker progress-feed
+  updates, restart acks, and messages in *other* forum topics — and then
+  marked the turn's answer obligation closed, silently dropping the real
+  answer with no safety-net re-present. The suppression check now counts only
+  substantive same-thread answer sends, and a suppressed flush never closes
+  the obligation. Also: quiescence detection survives >1s thinking pauses, so
+  a deliberately-silent turn (trailing `NO_REPLY`) can no longer blurt its
+  working prose; and flushed answers quote-anchor the user's question the
+  same way reply-tool answers do. The crash-window duplicate/none residual
+  stays tracked in #3278.
+- **`model:` edits in switchroom.yaml apply on a plain restart** (#3300) —
+  the launcher resolved the agent's model from a literal baked into
+  `start.sh` at `switchroom apply` time, so a yaml edit + container restart
+  silently launched the stale model while every dashboard showed the new one
+  (the "pinned fable, runs opus" defect). The launcher now resolves the
+  configured model from the live yaml at every boot via the new
+  `switchroom agent effective-model <name>` verb (launcher and gateway share
+  one resolver), with a loud fallback chain: live yaml → last-known-good →
+  apply-time bake, each fallback surfacing an operator alert — never silent.
+  A `model: fable`-class pin with the LiteLLM proxy down at boot now degrades
+  to `opus` with an alert instead of 4xx-ing every call, and a
+  Claude↔non-Claude routing-class flip is detected and refused with a "run
+  switchroom apply" alert rather than half-applied. The retired
+  `claude-fable-5` codename normalizes to the `fable` alias everywhere. The
+  long-running-gateway stale-inode residual is tracked in #3301.
+
+## v0.18.28 – v0.18.30 — No inbound Telegram message silently dropped, and infra faults stop paging end users
+
+_Retro-consolidated: v0.18.28–v0.18.30 were tagged without a changelog
+consolidation pass, so their accumulated Unreleased notes are filed here
+under one combined heading rather than misattributed to a single tag._
+
 ### Fixes
 
 - **`model:` edits in switchroom.yaml now apply on a plain restart — the
