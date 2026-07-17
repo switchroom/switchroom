@@ -471,6 +471,14 @@ interface WorkerRow {
    * once past STEP_TIMER_MIN_MS.
    */
   stepStartedAtMs: number | null
+  /**
+   * Stable 1-based ordinal within the group's CURRENT card, assigned from the
+   * group's monotonic counter when the row is first registered and IMMUTABLE
+   * thereafter. The combined feed renders it as a `{n}. ` header prefix when
+   * 2+ workers are running; survivors keep their numbers when an earlier
+   * worker finishes (never renumbered positionally — #3298).
+   */
+  ordinal: number
 }
 
 /**
@@ -511,6 +519,13 @@ interface FeedGroup {
   chain: Promise<void>
   /** Live workers in this group, keyed by agentId (insertion ≈ dispatch order). */
   workers: Map<string, WorkerRow>
+  /**
+   * Monotonic per-card worker counter — `++counter` hands each newly
+   * registered row its stable {@link WorkerRow.ordinal}. Reset to 0 whenever a
+   * fresh card starts (group creation / the group-reuse-after-terminal repaint
+   * / registration into an emptied group), so every new card numbers from 1.
+   */
+  workerOrdinalCounter: number
   /**
    * Terminal renders (per finishing worker's recap) staged because a 429
    * cooldown / flood window blocked the edit. Keyed by agentId so a SECOND
@@ -844,6 +859,9 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       const currentStep = r.narrative.length > 0 ? r.narrative[r.narrative.length - 1] : v.latestSummary
       return {
         description: v.description,
+        // Stable per-card ordinal — assigned at registration, kept for the
+        // card's life (survivors don't renumber when an earlier worker ends).
+        ordinal: r.ordinal,
         elapsedMs: elapsedFor(r),
         toolCount: v.toolCount,
         totalTokens: v.totalTokens,
@@ -1488,6 +1506,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
           cooldownUntil: 0,
           chain: Promise.resolve(),
           workers: new Map(),
+          workerOrdinalCounter: 0,
           pendingFinalize: new Map(),
           terminalPainted: false,
         }
@@ -1512,8 +1531,12 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       }
       let row = g.workers.get(agentId)
       if (row == null) {
+        // A registration into an EMPTIED group starts a fresh card — number
+        // from 1 again rather than continuing the dead card's sequence.
+        if (g.workers.size === 0) g.workerOrdinalCounter = 0
         row = {
           agentId,
+          ordinal: ++g.workerOrdinalCounter,
           narrative: [],
           lastView: null,
           state: 'running',

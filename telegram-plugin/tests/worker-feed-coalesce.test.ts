@@ -754,6 +754,48 @@ describe('renderCombinedWorkerFeed (pure)', () => {
     expect(combinedHistoryDepth(6)).toBe(1)
     expect(combinedHistoryDepth(8)).toBe(1)
   })
+
+  // ── Worker numbering (#3298): stable ordinal prefix at 2+ workers ──────────
+  const rowN = (i: number, ordinal: number) => ({ ...row(i, `step ${i}`), ordinal })
+
+  it('numbers the workers with a literal "N. " prefix inside the bold header when 2+ run', () => {
+    const body = renderCombinedWorkerFeed([rowN(1, 1), rowN(2, 2)], { maxRows: 8 })!
+    // The literal `1. ` must survive markdown rendering, inside the bold span
+    // before the escaped description.
+    expect(body).toContain('**1. task number 1**')
+    expect(body).toContain('**2. task number 2**')
+  })
+
+  it('renders non-contiguous ordinals as-is (survivors keep their numbers after a finish)', () => {
+    // Worker 1 finished upstream — the surviving rows arrive with their
+    // ORIGINAL ordinals. Positional numbering would render 1./2. here; the
+    // stable scheme must render 2./3. and never a `1. `.
+    const body = renderCombinedWorkerFeed([rowN(2, 2), rowN(3, 3)], { maxRows: 8 })!
+    expect(body).toContain('**2. task number 2**')
+    expect(body).toContain('**3. task number 3**')
+    expect(body).not.toContain('**1. ')
+  })
+
+  it('a single row is never numbered, even when it carries an ordinal', () => {
+    const body = renderCombinedWorkerFeed([rowN(1, 1)], { maxRows: 8 })!
+    expect(body).toContain('**task number 1**')
+    expect(body).not.toContain('**1. ')
+  })
+
+  it('rows without ordinals render unnumbered (back-compat for direct callers)', () => {
+    const body = renderCombinedWorkerFeed([row(1, 'alpha'), row(2, 'beta')], { maxRows: 8 })!
+    expect(body).toContain('**task number 1**')
+    expect(body).toContain('**task number 2**')
+    expect(body).not.toContain('1. task')
+  })
+
+  it('spilled rows take their ordinals with them; visible ordinals do not shift', () => {
+    const rows = Array.from({ length: 10 }, (_, i) => rowN(i + 1, i + 1))
+    const body = renderCombinedWorkerFeed(rows, { maxRows: 4 })!
+    expect(body).toContain('+6 more working')
+    for (let n = 1; n <= 4; n++) expect(body).toContain(`**${n}. task number ${n}**`)
+    expect(body).not.toContain('**5. ')
+  })
 })
 
 /**
@@ -1017,5 +1059,89 @@ describe('worker-feed ghost-leak — deterministic terminal removal + backstop',
     await feed.update('e', 'chat', view('task e', 'same step', 0))
     await drain()
     expect(edits.length).toBe(afterPaint)
+  })
+})
+
+describe('worker numbering — stable per-card ordinals end to end (#3298)', () => {
+  const doneView = (desc: string, elapsedMs: number): WorkerActivityView => ({
+    description: desc,
+    lastTool: null,
+    toolCount: 3,
+    latestSummary: `${desc} result`,
+    elapsedMs,
+    state: 'done',
+  })
+  const lastBody = (h: { sends: { text: string }[]; edits: { messageId: number; text: string }[] }): string => {
+    if (h.edits.length > 0) return h.edits[h.edits.length - 1].text
+    return h.sends[h.sends.length - 1].text
+  }
+
+  it('assigns 1./2./3. at dispatch and survivors KEEP their numbers when an earlier worker finishes', async () => {
+    let clock = 1000
+    const h = ghostHarness({ now: () => clock })
+    await h.feed.update('a', 'chat', view('task alpha', 'a-doing', 0))
+    await h.feed.update('b', 'chat', view('task beta', 'b-doing', 0))
+    await h.feed.update('c', 'chat', view('task gamma', 'c-doing', 0))
+    await drain()
+
+    let body = lastBody(h)
+    expect(body).toContain('**1. task alpha**')
+    expect(body).toContain('**2. task beta**')
+    expect(body).toContain('**3. task gamma**')
+
+    // Worker 1 finishes: the survivors must STILL be 2. and 3. — positional
+    // numbering would renumber them 1./2. and this assertion would fail.
+    clock = 2000
+    await h.feed.finish('a', doneView('task alpha', 1000))
+    await drain()
+    body = lastBody(h)
+    expect(body).toContain('2 running')
+    expect(body).toContain('**2. task beta**')
+    expect(body).toContain('**3. task gamma**')
+    expect(body).not.toContain('**1. ')
+  })
+
+  it('a single running worker is never numbered (single-worker layout)', async () => {
+    const h = ghostHarness({ now: () => 1000 })
+    await h.feed.update('solo', 'chat', view('task solo', 'working', 0))
+    await drain()
+    const body = lastBody(h)
+    expect(body).toContain('task solo')
+    expect(body).not.toContain('1. task solo')
+  })
+
+  it('a fresh card after ALL workers finish numbers from 1 again', async () => {
+    let clock = 1000
+    const h = ghostHarness({ now: () => clock })
+    await h.feed.update('a', 'chat', view('task alpha', 'a-doing', 0))
+    await h.feed.update('b', 'chat', view('task beta', 'b-doing', 0))
+    await drain()
+    clock = 2000
+    await h.feed.finish('a', doneView('task alpha', 1000))
+    await h.feed.finish('b', doneView('task beta', 1000))
+    await drain()
+    expect(h.feed.size).toBe(0)
+
+    // New fan-out in the same chat → a NEW card that starts at 1., not 3.
+    clock = 3000
+    await h.feed.update('c', 'chat', view('task gamma', 'c-doing', 0))
+    await h.feed.update('d', 'chat', view('task delta', 'd-doing', 0))
+    await drain()
+    const body = lastBody(h)
+    expect(body).toContain('**1. task gamma**')
+    expect(body).toContain('**2. task delta**')
+  })
+
+  it('introducing ordinals causes no dedup churn (same substance → edit still skipped)', async () => {
+    const h = ghostHarness({ now: () => 1000 })
+    await h.feed.update('a', 'chat', view('task alpha', 'same step', 0))
+    await h.feed.update('b', 'chat', view('task beta', 'same step', 0))
+    await drain()
+    const landed = h.edits.length
+    // Byte-identical substance re-update: the dedup/no-op skip must still fire
+    // (a stable ordinal never varies the substance between identical renders).
+    await h.feed.update('a', 'chat', view('task alpha', 'same step', 0))
+    await drain()
+    expect(h.edits.length).toBe(landed)
   })
 })
