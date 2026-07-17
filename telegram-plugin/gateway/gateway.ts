@@ -23184,62 +23184,6 @@ async function runSwitchroomCommandFormatted(ctx: Context, args: string[], label
 // gate treats an empty group `allowFrom` as "allow every member". Non-
 // admin-verb traffic (`pass-through`, incl. `/restart`-self and all normal
 // chat) is untouched and reaches `next()` exactly as before.
-bot.use(async (ctx, next) => {
-  if (ctx.message?.text) {
-    const myName = getMyAgentName()
-    const decision = classifyAdminGate(ctx.message.text, myName)
-    if (decision.action === 'block') {
-      // `block` = a fleet-admin verb (ADMIN_COMMAND_NAMES) or
-      // `/restart <other-agent>`. classifyAdminGate already lets
-      // `/restart`-self and every non-admin command pass through, so
-      // this branch is exactly the privileged set.
-      const cmdHtml = escapeHtmlForTg(`/${decision.cmd}`)
-      const nameHtml = escapeHtmlForTg(myName)
-      const notFlagged =
-        decision.reason === 'other-agent'
-          ? `⚠️ \`${cmdHtml}\` targeting another agent is an admin operation — this agent (\`${nameHtml}\`) isn't admin-flagged. Run it from an admin agent, or set \`admin: true\` for this agent in switchroom.yaml. (Self-restart is allowed: send \`/restart\` with no arg.)`
-          : `⚠️ \`${cmdHtml}\` is an admin command — this agent (\`${nameHtml}\`) isn't admin-flagged. Run it from an admin agent, or set \`admin: true\` for this agent in switchroom.yaml.`
-      if (!AGENT_ADMIN) {
-        // Unchanged behaviour: a non-admin agent never executes admin
-        // verbs locally and must not forward them to Claude.
-        process.stderr.write(
-          `telegram gateway: admin-gate blocked cmd=/${decision.cmd} agent=${process.env.SWITCHROOM_AGENT_NAME ?? '-'} reason=${decision.reason} (AGENT_ADMIN=false)\n`,
-        )
-        await switchroomReply(ctx, notFlagged, { html: true })
-        return
-      }
-      // sec WS7-F2 (#1394): fleet-admin is OPERATOR-PRIVATE. Honor it
-      // ONLY in a private chat from an `access.allowFrom` sender.
-      // Before this, when AGENT_ADMIN=true the middleware was a no-op
-      // and the per-command `isAuthorizedSender` gate treats an empty
-      // group `allowFrom` as "allow every member" — so any member of
-      // an admin agent's forum/group could run /vault, /update apply,
-      // /grant, /dangerous, etc. (the default shape for an agent
-      // created via `agent add --topology forum` + `admin: true`).
-      // Strict `access.allowFrom` + private-chat-only — never the
-      // group-permissive isAuthorizedSender.
-      const senderId = String(ctx.from?.id ?? '')
-      const operatorPrivate =
-        ctx.chat?.type === 'private' &&
-        loadAccess().allowFrom.includes(senderId)
-      if (!operatorPrivate) {
-        process.stderr.write(
-          `telegram gateway: admin-gate refused (not operator-private) cmd=/${decision.cmd} agent=${process.env.SWITCHROOM_AGENT_NAME ?? '-'} chat=${ctx.chat?.type ?? '?'} sender=${senderId}\n`,
-        )
-        await switchroomReply(
-          ctx,
-          `⚠️ \`${cmdHtml}\` is a fleet-admin command — it is **operator-private**. Send it as a direct message to me from your operator account (a private chat where your Telegram ID is on the access allowlist), not in a group or forum.`,
-          { html: true },
-        )
-        return
-      }
-      // operator-private admin verb on an admin agent → fall through
-      // to the bot.command() handler (which re-checks isAuthorizedSender
-      // — redundant but harmless in a private allowFrom chat).
-    }
-  }
-  await next()
-})
 
 // ─── Bot commands ─────────────────────────────────────────────────────────
 
@@ -23481,59 +23425,9 @@ async function buildLiveProbeRows(agentName: string): Promise<StatusProbeRow[]> 
   })
 }
 
-bot.command('start', async ctx => {
-  // dmCommandGate (#894 backport): silent drop on disabled or
-  // non-allowlisted senders so the bot doesn't leak its existence.
-  const gated = dmCommandGate(ctx)
-  if (!gated) return
-  const disabled = gated.access.dmPolicy === 'disabled'
-  await ctx.replyWithRichMessage(richMessage(buildStartText(getMyAgentName(), disabled)))
-})
 
-bot.command('help', async ctx => {
-  if (!dmCommandGate(ctx)) return
-  await ctx.replyWithRichMessage(richMessage(buildHelpText(getMyAgentName())))
-})
 
-bot.command('status', async ctx => {
-  // dmCommandGate (#894 backport) drops disabled / non-allowlisted in
-  // allowlist mode. Pairing-mode users still fall through to either
-  // the pending-code branch or the unpaired branch.
-  const gated = dmCommandGate(ctx)
-  if (!gated) return
-  const { access, senderId } = gated
-  const from = ctx.from!
-  if (access.allowFrom.includes(senderId)) {
-    const demo = hasDemoFlag(getCommandArgs(ctx))
-    const userTag = from.username ? `@${from.username}` : senderId
-    const meta = await buildAgentMetadata(getMyAgentName())
-    await ctx.replyWithRichMessage(richMessage(buildStatusPairedText({ user: userTag, meta, demo })))
-    return
-  }
-  for (const [code, p] of Object.entries(access.pending)) {
-    if (p.senderId === senderId) {
-      await ctx.replyWithRichMessage(richMessage(buildStatusPendingText(code)))
-      return
-    }
-  }
-  await ctx.reply(buildStatusUnpairedText())
-})
 
-bot.command('agents', async ctx => {
-  if (!isAuthorizedSender(ctx)) return
-  await runSwitchroomCommandFormatted(ctx, ['agent', 'list'], 'agent list', () => {
-    type AgentListResp = { agents: Array<{ name: string; status: string; uptime: string; template: string; topic_name: string; topic_emoji?: string }> }
-    const data = switchroomExecJson<AgentListResp>(['agent', 'list'])
-    if (!data) return null
-    if (data.agents.length === 0) return '_No agents defined_'
-    const lines = ['**Agents**']
-    for (const a of data.agents) {
-      lines.push(`${statusIcon(a.status)} **${escapeHtmlForTg(a.name)}** · ${escapeHtmlForTg(a.status)} · ${escapeHtmlForTg(a.uptime)}`)
-      lines.push(`    _${escapeHtmlForTg(a.template)} → ${escapeHtmlForTg(a.topic_name)}${a.topic_emoji ? ' ' + a.topic_emoji : ''}_`)
-    }
-    return lines.join('\n')
-  })
-})
 
 // /inject — #725 Phase 2 slash-command bridge. Implementation in
 // inject-handler.ts so it's unit-testable without booting the bot.
@@ -23556,19 +23450,10 @@ function buildInjectDeps(opts?: { open?: boolean; fixedVerb?: string }): InjectD
   }
 }
 
-bot.command('inject', async ctx => {
-  await handleInjectCommand(ctx, buildInjectDeps())
-})
 
 // /compact + /clear — first-class session-control commands, open to anyone in
 // the chat. Both are in the INJECT_COMMANDS allowlist; they ride the same
 // inject primitive as `/inject compact` / `/inject clear`.
-bot.command('compact', async ctx => {
-  await handleInjectCommand(ctx, buildInjectDeps({ open: true, fixedVerb: '/compact' }))
-})
-bot.command('clear', async ctx => {
-  await handleInjectCommand(ctx, buildInjectDeps({ open: true, fixedVerb: '/clear' }))
-})
 
 // /model — model dashboard + switch for this agent's live session.
 // Bare form: drives claude's own /model picker (open → parse → Esc,
@@ -24021,85 +23906,6 @@ async function drainPendingSessionCommand(): Promise<void> {
   }
 }
 
-bot.command('model', async ctx => {
-  if (!isAuthorizedSender(ctx)) return
-  const text = ctx.message?.text ?? ctx.channelPost?.text ?? ''
-  const parsed = parseModelCommand(text) ?? { kind: 'show' as const }
-  const chatId = String(ctx.chat!.id)
-  const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
-  // #3177 — durable receipt FIRST. A typed /model must NEVER be invisible: even
-  // if every downstream reply is shed/dropped, or the session is in a
-  // phantom-idle window (turn atom cleared while claude is still busy), the
-  // command leaves a greppable log line + a history row before any branch. This
-  // is the fix for the finn 2026-07-12 zero-trace swallow (no log, no reply, no
-  // ack, no deferred apply). `busyNow` folds BOTH busy signals (turn atom AND
-  // the authoritative delivery-machine/approval gate) — but a STALE atom or a
-  // wedged approval older than the hard TTL is discounted as idle (#3262), so a
-  // phantom "active turn" on an idle session no longer blocks the switch. Resolve
-  // once (it may clear a dangling atom) and reuse for both the receipt log and
-  // the routing disposition.
-  const modelBusy = resolveModelEffortBusy()
-  const busyNow = modelBusy.currentTurnActive || modelBusy.turnInFlight
-  process.stderr.write(modelCommandReceiptLine(getMyAgentName(), parsed, busyNow) + '\n')
-  if (HISTORY_ENABLED && ctx.message?.message_id != null) {
-    try {
-      recordInbound({
-        chat_id: chatId,
-        thread_id: threadId ?? null,
-        message_id: ctx.message.message_id,
-        user: ctx.from?.username ?? (ctx.from?.id != null ? String(ctx.from.id) : null),
-        user_id: ctx.from?.id != null ? String(ctx.from.id) : null,
-        ts: ctx.message.date ?? Math.floor(Date.now() / 1000),
-        text,
-      })
-    } catch (err) {
-      process.stderr.write(`telegram gateway: /model recordInbound failed: ${(err as Error)?.message ?? String(err)}\n`)
-    }
-  }
-  const deps = buildModelDeps({ chatId, threadId })
-  // Route on a pure disposition (#3177) that folds BOTH busy signals so a
-  // session busy by EITHER measure ack+queues instead of silently injecting
-  // into a busy pane. Every branch below produces a visible action.
-  const disposition = planModelCommand(parsed, {
-    currentTurnActive: modelBusy.currentTurnActive,
-    turnInFlight: modelBusy.turnInFlight,
-    menuEnabled: process.env.SWITCHROOM_MODEL_MENU !== '0',
-  })
-  if (disposition.kind === 'menu') {
-    const menu = await buildModelMenu(deps)
-    await switchroomReply(ctx, menu.text, { html: true, reply_markup: modelMenuReplyMarkup(menu) })
-    return
-  }
-  // Mid-turn (by either busy signal): instead of dead-ending ("Try again in a
-  // moment") or silently injecting into a busy pane, ACK + QUEUE + apply-on-idle
-  // + confirm (#3017/#3177). The typed set path either injects into claude's
-  // input box or triggers a carrier restart — both unsafe while busy.
-  if (disposition.kind === 'queue') {
-    const target = disposition.target
-    const sent = await ctx.replyWithRichMessage(
-      richMessage(hardenCardBreaks(pendingCmdAckText('model', target, escapeHtmlForTg))),
-      threadId != null ? { message_thread_id: threadId } : {},
-    )
-    enqueueSessionCommand({
-      kind: 'model',
-      origin: 'typed',
-      arg: target,
-      targetLabel: target,
-      chatId,
-      threadId,
-      ackChatId: chatId,
-      ackMessageId: (sent as { message_id: number }).message_id,
-      requestedAt: Date.now(),
-    })
-    return
-  }
-  // Rev 5: the handler relaunches through the carrier and owns every side effect
-  // (override write, carrier, premium-recovery clear). There is no post-hoc
-  // recording — /status is reconciled at boot from `.active-session-model`, so
-  // an unapplied switch can never be optimistically recorded here.
-  const reply = await handleModelCommand(parsed, deps)
-  await switchroomReply(ctx, reply.text, { html: reply.html })
-})
 
 // `/effort` — show or switch the reasoning effort for the live session.
 // The effort sibling of `/model`: bare form renders a five-button menu
@@ -24156,191 +23962,15 @@ function effortMenuReplyMarkup(reply: EffortMenuReply): InlineKeyboard | undefin
   return kb
 }
 
-bot.command('effort', async ctx => {
-  if (!isAuthorizedSender(ctx)) return
-  const text = ctx.message?.text ?? ctx.channelPost?.text ?? ''
-  const parsed = parseEffortCommand(text) ?? { kind: 'show' as const }
-  const deps = buildEffortDeps()
-  if (parsed.kind === 'show') {
-    const menu = buildEffortMenu(deps)
-    await switchroomReply(ctx, menu.text, { html: true, reply_markup: effortMenuReplyMarkup(menu) })
-    return
-  }
-  // Mid-turn: ACK + QUEUE + apply-on-idle + confirm (#3017) — parity with
-  // /model. `applyEffort` mid-turn silently maybe-failed ("couldn't confirm it
-  // applied") before this gate existed. Use the SAME stale-aware busy resolver
-  // as /model (#3262) so a dangling turn atom older than the hard TTL is
-  // discounted as idle and the switch applies instead of queuing forever on an
-  // idle session.
-  const effortBusy = resolveModelEffortBusy()
-  if ((parsed.kind === 'set' || parsed.kind === 'default') && effortBusy.currentTurnActive) {
-    const requestedLevel = parsed.kind === 'set' ? parsed.level : 'default'
-    const chatId = String(ctx.chat!.id)
-    const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
-    const sent = await ctx.replyWithRichMessage(
-      richMessage(hardenCardBreaks(pendingCmdAckText('effort', requestedLevel, escapeHtmlForTg))),
-      threadId != null ? { message_thread_id: threadId } : {},
-    )
-    enqueueSessionCommand({
-      kind: 'effort',
-      origin: 'typed',
-      arg: requestedLevel,
-      targetLabel: requestedLevel,
-      chatId,
-      threadId,
-      ackChatId: chatId,
-      ackMessageId: (sent as { message_id: number }).message_id,
-      requestedAt: Date.now(),
-    })
-    return
-  }
-  const reply = await handleEffortCommand(parsed, deps)
-  await switchroomReply(ctx, reply.text, { html: reply.html })
-})
 
-bot.command('agentstart', async ctx => {
-  if (!isAuthorizedSender(ctx)) return
-  const name = ctx.match?.trim() || getMyAgentName()
-  try { assertSafeAgentName(name) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
-  await dispatchShortVerbViaHostd(
-    ctx,
-    { v: 1, op: 'agent_start', request_id: hostdRequestId('gw-start'), args: { name } },
-    `start ${name}`,
-    ['agent', 'start', name],
-  )
-})
 
 // #3020: container stop lives on /agentstop (pairs with /agentstart above).
 // It WAS /stop; that word now cancels the in-flight turn instead — the
 // intuitive meaning for a chat-first operator.
-bot.command('agentstop', async ctx => {
-  if (!isAuthorizedSender(ctx)) return
-  const name = ctx.match?.trim() || getMyAgentName()
-  try { assertSafeAgentName(name) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
-  await dispatchShortVerbViaHostd(
-    ctx,
-    { v: 1, op: 'agent_stop', request_id: hostdRequestId('gw-stop'), args: { name } },
-    `stop ${name}`,
-    ['agent', 'stop', name],
-  )
-})
 
 // #3020: /stop — cancel the agent's in-flight turn (the typed sibling of the
 // bare "stop" keyword and the empty-`!` interrupt; shared executeHaltNow).
-bot.command('stop', async ctx => {
-  if (!isAuthorizedSender(ctx)) return
-  // 7a: /stop takes NO argument. "/stop worker" is almost certainly old
-  // container-stop muscle memory (the verb that moved to /agentstop) — warn
-  // and do NOT halt, so a mis-remembered command can't kill an unrelated turn.
-  const arg = ctx.match?.trim()
-  if (arg) {
-    await switchroomReply(
-      ctx,
-      `/stop takes no argument — it cancels MY in-flight turn. ` +
-      `To stop a container, use /agentstop ${arg}. Nothing was stopped.`,
-    )
-    return
-  }
-  const queuedLabels = pendingSessionCommand.list().map(c => `/${c.kind} ${c.targetLabel}`)
-  const inFlight = turnInFlightForGate()
-  if (!inFlight) {
-    await switchroomReply(ctx, buildStopReply(false, queuedLabels).text)
-    return
-  }
-  await executeHaltNow('stop-command')
-  await switchroomReply(ctx, buildStopReply(true, queuedLabels).text)
-})
 
-bot.command('restart', async ctx => {
-  if (!isAuthorizedSender(ctx)) return
-  const name = ctx.match?.trim() || getMyAgentName()
-  try { assertSafeAgentName(name) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
-  if (isSelfTargetingCommand(name)) {
-    const existing = readRestartMarker()
-    if (existing && Date.now() - existing.ts < 15_000) {
-      await switchroomReply(ctx, `⏳ Restart already in progress — ignoring duplicate.`, { html: true })
-      return
-    }
-    const chatId = String(ctx.chat!.id)
-    const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
-    const ackText = buildRestartAckText(name)
-    let ackId: number | null = null
-    // #1075: thread-id-bearing — fall back to main chat on
-    // THREAD_NOT_FOUND so the ack still lands somewhere.
-    try {
-      const sent = await retryWithThreadFallback<{ message_id: number }>(
-        robustApiCall,
-        (tid) =>
-          lockedBot.api.sendRichMessage(chatId, richMessage(ackText), {
-            // Restart acknowledgement is a status notice — silence the
-            // open ping (the "restarted — ready" follow-up is what matters).
-            disable_notification: true,
-            ...(tid != null ? { message_thread_id: tid } : {}),
-          }),
-        { threadId, chat_id: chatId, verb: 'restart.ack' },
-      )
-      ackId = sent.message_id
-      if (HISTORY_ENABLED) {
-        try { recordOutbound({ chat_id: chatId, thread_id: threadId ?? null, message_ids: [sent.message_id], texts: [`🔄 Restarting ${name}…`], attachment_kinds: [] }) } catch {}
-      }
-    } catch {}
-    writeRestartMarker({ chat_id: chatId, thread_id: threadId ?? null, ack_message_id: ackId, ts: Date.now() })
-    // Stamp user attribution into the clean-shutdown marker so the next
-    // greeting card shows "Restarted  user: /restart from chat" instead
-    // of whatever reason the downstream CLI would default to.
-    stampUserRestartReason('user: /restart from chat')
-    // Session-scoped (rev 4): /restart reverts any live /model override to the
-    // configured default. A consume-once `.session-model` carrier (if one was
-    // in flight) was already consumed by its own apply-relaunch, so nothing to
-    // do here — start.sh boots the configured default.
-    await sweepBeforeSelfRestart()
-    const hostdResp = await tryHostdDispatch(getMyAgentName(), {
-      v: 1,
-      op: 'agent_restart',
-      request_id: hostdRequestId('gw-restart'),
-      args: { name, force: true, reason: 'user: /restart from chat' },
-    })
-    if (hostdResp === 'not-configured') {
-      warnLegacySpawnIfHostdDisabled('agent_restart')
-      spawnSwitchroomDetached(
-        ['agent', 'restart', name, '--force'],
-        notifyDetachedFailure(chatId, threadId ?? null, `restart ${name}`),
-      )
-      return
-    }
-    if (hostdResp.result === 'started' || hostdResp.result === 'completed') {
-      // Dispatched via hostd. The recreate will kill this gateway
-      // shortly; the new gateway reads the marker and edits the ack.
-      return
-    }
-    // hostd was attempted but errored/denied — clear marker and surface.
-    clearRestartMarker()
-    await switchroomReply(
-      ctx,
-      `❌ **restart ${escapeHtmlForTg(name)} failed via hostd** ` +
-        `(result=${escapeHtmlForTg(hostdResp.result)}):\n` +
-        preBlock(hostdResp.error ?? '(no error message)'),
-      { html: true },
-    )
-    return
-  }
-  // Cross-agent /restart <other>. Same hostd-first shape as self-target,
-  // but no restart marker / no self-kill: another agent's container is
-  // about to bounce, not ours. The daemon spawns the work and returns
-  // "started" (per handleAgentRestart at server.ts:466), so the user
-  // sees a brief dispatch ack and the audit log carries the outcome.
-  await dispatchShortVerbViaHostd(
-    ctx,
-    {
-      v: 1,
-      op: 'agent_restart',
-      request_id: hostdRequestId('gw-restart-cross'),
-      args: { name, force: true, reason: `user: /restart ${name} from chat` },
-    },
-    `restart ${name}`,
-    ['agent', 'restart', name],
-  )
-})
 
 // ─── /new and /reset ──────────────────────────────────────────────────────
 // Start a fresh session: flush .handoff.md + .handoff-topic so the restarted
@@ -24481,292 +24111,12 @@ async function handleNewCommand(ctx: Context): Promise<void> {
   )
 }
 
-bot.command('new', async ctx => handleNewCommand(ctx))
 
 // /update — host update from Telegram (#919). Default = dry-run plan
 // (`switchroom update --check`); explicit `apply` triggers the real
 // thing via spawnSwitchroomDetached so the gateway can be killed
 // mid-flight by the recreate-containers step without orphaning the
 // update. Admin-gated via ADMIN_COMMAND_NAMES.
-bot.command('update', async ctx => {
-  if (!isAuthorizedSender(ctx)) return
-  const arg = ctx.match?.trim() || ''
-  if (arg === '' || arg === 'check' || arg === '--check') {
-    await runSwitchroomCommand(ctx, ['update', '--check'], 'update --check')
-    await switchroomReply(
-      ctx,
-      'Reply with \`/update apply\` to execute, or \`/update apply --skip-images\` to skip the image pull.',
-      { html: true },
-    )
-    return
-  }
-  // Parse `apply` (with optional --skip-images / --rebuild passthrough).
-  // `/update apply` and `/update apply --skip-images` are the supported
-  // forms; everything else surfaces a usage hint.
-  const tokens = arg.split(/\s+/)
-  if (tokens[0] !== 'apply' && tokens[0] !== '--apply') {
-    await switchroomReply(
-      ctx,
-      'Usage: \`/update\` (dry-run) or \`/update apply [--skip-images] [--rebuild]\`',
-      { html: true },
-    )
-    return
-  }
-  // Whitelist passthrough flags. Anything outside the allowlist is
-  // refused — operators should not be able to inject arbitrary CLI
-  // args via Telegram (defense in depth even though admin-gated).
-  const ALLOWED_FLAGS = new Set(['--skip-images', '--rebuild'])
-  const passthrough = tokens.slice(1)
-  for (const tok of passthrough) {
-    if (!ALLOWED_FLAGS.has(tok)) {
-      await switchroomReply(
-        ctx,
-        `Refusing to pass unknown flag: \`${tok}\`. ` +
-        `Allowed: \`--skip-images\`, \`--rebuild\`.`,
-        { html: true },
-      )
-      return
-    }
-  }
-  // Pre-dispatch availability gate (#926 / #1469 / #1470). The gateway
-  // runs INSIDE the agent container, which has the switchroom CLI baked
-  // in but no docker binary and no /var/run/docker.sock mount. So
-  // `switchroom update`'s pull-images and recreate-containers steps
-  // would fail with "docker: command not found" — UNLESS hostd is in
-  // play (#1175 Phase 2 RFC C), in which case hostd runs on the host
-  // with the docker socket mounted and the in-container docker
-  // dependency goes away.
-  //
-  // Three states to distinguish here, so the operator gets a message
-  // pointing at the right remediation:
-  //
-  //   - hostd ready (socket bound): proceed — no gate.
-  //   - hostd configured-on but socket missing (#1470): tell the
-  //     operator to run `switchroom hostd install`. Don't conflate
-  //     with "enable host_control" — it's already on.
-  //   - hostd off AND no in-container docker (#1469): fall through
-  //     to spawn-detached would fail late; explain the choice between
-  //     host CLI and enabling hostd.
-  const myAgentName = getMyAgentName()
-  const hostdReady = hostdWillBeUsed(myAgentName)
-  if (!hostdReady && !isDockerReachable()) {
-    if (isHostdEnabled()) {
-      // hostd is configured on, but the per-agent socket isn't bound —
-      // hostd hasn't been installed yet, or its daemon is down.
-      await switchroomReply(
-        ctx,
-        `❌ **/update apply** needs \`hostd\`, but its socket ` +
-        `for agent \`${myAgentName}\` isn't ` +
-        `bound and in-container docker access isn't available either.\n\n` +
-        `\`host_control.enabled\` is on in \`switchroom.yaml\`, ` +
-        `so hostd is the expected dispatch path — but no socket at ` +
-        `\`/run/switchroom/hostd/${escapeHtmlForTg(myAgentName)}/sock\`. ` +
-        `On a fresh docker install this usually means hostd hasn't been ` +
-        `installed yet.\n\n` +
-        `Run \`switchroom hostd install\` on the host to install + ` +
-        `start the daemon, then retry. Send \`/upgradestatus\` to ` +
-        `re-check the daemon state from here.`,
-        { html: true },
-      )
-    } else {
-      // host_control explicitly off + no in-container docker: nothing
-      // can drive the apply from inside the container. Operator has to
-      // pick one of: host CLI, or enable hostd.
-      await switchroomReply(
-        ctx,
-        `❌ **/update apply** needs docker access from inside the agent ` +
-        `container, but it's not available (no \`docker\` binary on ` +
-        `PATH, no \`/var/run/docker.sock\` mount) and ` +
-        `\`host_control.enabled\` is off.\n\n` +
-        `Either run \`switchroom update\` from the host shell, or ` +
-        `set \`host_control.enabled: true\` in ` +
-        `\`switchroom.yaml\` and run ` +
-        `\`switchroom hostd install\` on the host so this verb ` +
-        `can dispatch through the host-side daemon.`,
-        { html: true },
-      )
-    }
-    return
-  }
-  // Debounce vs concurrent self-restart commands (/restart, /new, /reset
-  // and other /update). Reading + writing the SAME restart marker means
-  // a double-tap of /update apply is rejected, AND a /restart fired
-  // mid-update is rejected (and vice versa). 15s window matches the
-  // /restart handler.
-  const existing = readRestartMarker()
-  if (existing && Date.now() - existing.ts < 15_000) {
-    await switchroomReply(
-      ctx,
-      `⏳ Self-restart already in progress (started ${Math.round(
-        (Date.now() - existing.ts) / 1000,
-      )}s ago) — ignoring duplicate.`,
-      { html: true },
-    )
-    return
-  }
-  const chatId = String(ctx.chat!.id)
-  const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
-  // Send the ack and capture its message_id so the post-restart
-  // greeting card can edit/reply into the same message. Mirrors the
-  // /restart handler (gateway.ts ~6273) so the boot-card lookup
-  // (gateway.ts ~10393) finds chat_id + ack_message_id in the marker.
-  const ackText =
-    `🚀 **update started** — running ${[
-      '\`switchroom update\`',
-      ...passthrough.map((t) => `\`${t}\``),
-    ].join(' ')}\n` +
-    `\nThe gateway will restart as part of the recreate step; watch ` +
-    `for the post-restart greeting card to confirm completion.`
-  let ackId: number | null = null
-  // #1075: thread-id-bearing — fall back to main chat.
-  try {
-    const sent = await retryWithThreadFallback<{ message_id: number }>(
-      robustApiCall,
-      (tid) =>
-        lockedBot.api.sendRichMessage(chatId, richMessage(ackText), {
-          // "update started" acknowledgement is a status notice — silence
-          // the open ping (the post-restart greeting card is what matters).
-          disable_notification: true,
-          ...(tid != null ? { message_thread_id: tid } : {}),
-        }),
-      { threadId, chat_id: chatId, verb: 'update.ack' },
-    )
-    ackId = sent.message_id
-    if (HISTORY_ENABLED) {
-      try {
-        recordOutbound({
-          chat_id: chatId,
-          thread_id: threadId ?? null,
-          message_ids: [sent.message_id],
-          texts: [`🚀 update started`],
-          attachment_kinds: [],
-        })
-      } catch {}
-    }
-  } catch {}
-  writeRestartMarker({
-    chat_id: chatId,
-    thread_id: threadId ?? null,
-    ack_message_id: ackId,
-    ts: Date.now(),
-  })
-  // Reason banner for the post-restart greeting card. Without this the
-  // banner falls back to whatever the CLI's clean-shutdown marker
-  // stamped — usually 'unknown' or a docker-compose-restart string.
-  stampUserRestartReason('user: /update from chat')
-  // Unpin progress cards + clear active reactions before we die. The
-  // pinned-progress-card surface is the headline feature per CLAUDE.md;
-  // leaving one pinned across the recreate would surprise the operator.
-  await sweepBeforeSelfRestart()
-  const skipImages = passthrough.includes('--skip-images')
-  const rebuild = passthrough.includes('--rebuild')
-  const updateRequestId = hostdRequestId('gw-update')
-  // #1841 — forward the cached operator passphrase as the 2nd factor when
-  // hostd requires operator-attest on update_apply. No-op when the vault
-  // is locked / no passphrase is cached (feature-off posture unchanged).
-  const updatePassphrase = vaultPassphraseCache.get(chatId)?.passphrase
-  const hostdResp = await tryHostdDispatch(
-    getMyAgentName(),
-    withOperatorAttestation(
-      {
-        v: 1,
-        op: 'update_apply',
-        request_id: updateRequestId,
-        args: {
-          ...(skipImages ? { skip_images: true } : {}),
-          ...(rebuild ? { rebuild: true } : {}),
-        },
-      },
-      updatePassphrase,
-    ),
-  )
-  if (hostdResp === 'not-configured') {
-    warnLegacySpawnIfHostdDisabled('update_apply')
-    spawnSwitchroomDetached(
-      ['update', ...passthrough],
-      notifyDetachedFailure(chatId, threadId ?? null, 'update'),
-    )
-    return
-  }
-  if (hostdResp.result === 'completed') {
-    return
-  }
-  if (hostdResp.result === 'started') {
-    // Mark in-flight so the framework silence fallback renders hostd's
-    // real phase + elapsed (deterministic, model-free) instead of the
-    // content-free "still working…" — the klanker incident fix.
-    inFlightUpdate = { requestId: updateRequestId, startedAt: Date.now() }
-    // RFC C §5.3: long-running mutation. Poll get_status until terminal
-    // or until the recreate kills this gateway (whichever happens first).
-    // The success signal is the post-restart greeting card edited into
-    // ackId via the restart marker. The poll is here so that
-    // *fail-before-recreate* (image pull error, scaffold regen crash)
-    // doesn't leave the operator staring at the orphan "🚀 update started"
-    // ack indefinitely. Live repro: PR #1305.
-    void (async () => {
-     try {
-      // 60s budget: RFC C §5.3 specs `apply` at 30s and `update_apply`
-      // at 60s. Image pulls + scaffold regeneration dominate the wall
-      // clock for update_apply, hence the larger budget. The poll
-      // resolves earlier on any terminal state from the daemon.
-      const terminal = await pollHostdStatus(getMyAgentName(), updateRequestId, {
-        timeoutMs: 60_000,
-      })
-      if (terminal === 'not-configured') return
-      // completed → recreate is about to run / has run; let the post-
-      // restart greeting card handle the success message.
-      if (terminal.result === 'completed') return
-      // Anything else means the daemon's mutation failed before it could
-      // kill us. Edit the ack to surface the tail and clear the marker
-      // so the next gateway boot doesn't render a false success card.
-      clearRestartMarker()
-      const errBody =
-        terminal.error ??
-        terminal.stderr_tail ??
-        terminal.stdout_tail ??
-        '(no error tail returned)'
-      const editedText =
-        `🚀 **update started** — **FAILED** via hostd ` +
-        `(result=${escapeHtmlForTg(terminal.result)}):\n` +
-        preBlock(errBody)
-      if (ackId != null) {
-        try {
-          await robustApiCall(
-            () =>
-              lockedBot.api.editMessageText(chatId, ackId!, richMessage(editedText), {
-                link_preview_options: { is_disabled: true },
-              }),
-            { verb: 'update.poll.editAck' },
-          )
-        } catch {
-          // edit-failed (message deleted, parse error) — fall back to
-          // a fresh reply so the failure isn't silent.
-          try {
-            await switchroomReply(ctx, editedText, { html: true })
-          } catch {}
-        }
-      } else {
-        try {
-          await switchroomReply(ctx, editedText, { html: true })
-        } catch {}
-      }
-     } finally {
-       // Poll resolved (terminal / completed / not-configured /
-       // timeout) — stop substituting in-flight update status.
-       inFlightUpdate = null
-     }
-    })()
-    return
-  }
-  clearRestartMarker()
-  await switchroomReply(
-    ctx,
-    `❌ **/update apply failed via hostd** ` +
-      `(result=${escapeHtmlForTg(hostdResp.result)}):\n` +
-      preBlock(hostdResp.error ?? '(no error message)'),
-    { html: true },
-  )
-})
 
 // /upgradestatus — read-only snapshot of where this host stands (#927).
 // Wraps `switchroom update --status` synchronously and posts the
@@ -24775,101 +24125,15 @@ bot.command('update', async ctx => {
 // is the missing companion to /update's "trigger an update".
 // (Telegram slash-commands forbid hyphens, hence /upgradestatus not
 // /upgrade-status. The /upgrade alias just below redirects.)
-bot.command('upgradestatus', async ctx => {
-  if (!isAuthorizedSender(ctx)) return
-  // PR5 — heavy-output: route to admin alias in supergroup mode
-  // (CPO #4). Fleet-shared / DM agents fall through to in-place reply.
-  await runSwitchroomCommand(ctx, ['update', '--status'], 'update --status', 'heavy')
-})
 // Alias with hyphen — Grammy doesn't allow hyphens in command names
 // (Telegram's slash-command grammar excludes them) but operators are
 // likely to type /upgrade-status; surface a polite redirect.
-bot.command('upgrade', async ctx => {
-  if (!isAuthorizedSender(ctx)) return
-  await switchroomReply(
-    ctx,
-    'Did you mean \`/upgradestatus\` (no hyphen — Telegram slash-command grammar)? ' +
-    'Or \`/update\` to plan, \`/update apply\` to execute.',
-    { html: true },
-  )
-})
 
 // /audit hostd — tail/filter the hostd audit log. Mirrors `/vault audit`
 // in spirit (operator observability over a privileged subsystem from any
 // admin DM). Admin-gated via ADMIN_COMMAND_NAMES. Reads the audit JSONL
 // at ~/.switchroom/host-control-audit.log directly — no hostd RPC needed
 // because the file is shared via the host bind mount on docker installs.
-bot.command('audit', async ctx => {
-  if (!isAuthorizedSender(ctx)) return
-  const arg = (ctx.match ?? '').trim()
-  if (arg === '' || arg === 'help' || arg === '--help') {
-    await switchroomReply(
-      ctx,
-      'Usage: \`/audit hostd [--tail N] [--agent <name>] [--op <verb>] [--error] [--verbose]\`',
-      { html: true },
-    )
-    return
-  }
-  const tokens = arg.split(/\s+/)
-  const sub = tokens[0]
-  if (sub !== 'hostd') {
-    await switchroomReply(
-      ctx,
-      `Unknown audit target \`${sub ?? ''}\`. ` +
-      `Supported: \`hostd\`.`,
-      { html: true },
-    )
-    return
-  }
-  // Build the CLI argv for switchroom hostd audit. Validate each
-  // operator-supplied value to keep argv injection out of the picture.
-  const ALLOWED_OPS = new Set([
-    'agent_start', 'agent_stop', 'agent_restart', 'apply',
-    'update_check', 'update_apply', 'update_status', 'upgrade_status',
-    'get_status', 'doctor', 'fleet_state',
-  ])
-  const argv: string[] = ['hostd', 'audit']
-  for (let i = 1; i < tokens.length; i++) {
-    const t = tokens[i]!
-    if (t === '--error') { argv.push('--error'); continue }
-    if (t === '--verbose') { argv.push('--verbose'); continue }
-    if (t === '--tail' || t === '--agent' || t === '--op') {
-      const v = tokens[++i]
-      if (v == null) {
-        await switchroomReply(ctx, `Flag \`${t}\` requires a value.`, { html: true })
-        return
-      }
-      if (t === '--tail' && !/^[0-9]{1,4}$/.test(v)) {
-        await switchroomReply(ctx, `\`--tail\` must be an integer (1-9999).`, { html: true })
-        return
-      }
-      if (t === '--agent' && !/^[a-z][a-z0-9-]{0,62}$/i.test(v)) {
-        await switchroomReply(ctx, `\`--agent\` name has an invalid shape.`, { html: true })
-        return
-      }
-      if (t === '--op' && !ALLOWED_OPS.has(v)) {
-        await switchroomReply(
-          ctx,
-          `Unknown hostd verb \`${v}\`. ` +
-          `Known: ${[...ALLOWED_OPS].sort().map(o => `\`${o}\``).join(', ')}.`,
-          { html: true },
-        )
-        return
-      }
-      argv.push(t, v)
-      continue
-    }
-    await switchroomReply(
-      ctx,
-      `Unknown flag \`${t}\`. ` +
-      `Allowed: \`--tail\`, \`--agent\`, \`--op\`, \`--error\`, \`--verbose\`.`,
-      { html: true },
-    )
-    return
-  }
-  // PR5 — heavy-output → admin alias in supergroup mode (CPO #4).
-  await runSwitchroomCommand(ctx, argv, `hostd audit${argv.length > 2 ? ' …' : ''}`, 'heavy')
-})
 
 // ─── /approve, /deny, /pending ────────────────────────────────────────────
 // Slash-command alternatives to the inline-button approval flow (useful for
@@ -24942,8 +24206,6 @@ async function handlePermissionSlash(ctx: Context, behavior: 'allow' | 'deny'): 
   )
 }
 
-bot.command('approve', async ctx => handlePermissionSlash(ctx, 'allow'))
-bot.command('deny', async ctx => handlePermissionSlash(ctx, 'deny'))
 
 // ─── Drive folder picker (RFC E §4.1) ───────────────────────────────────
 // /folders — post a Telegram picker card listing this agent's top-level
@@ -24993,41 +24255,13 @@ function buildFolderPickerDeps(): FolderPickerHandlerDeps {
   }
 }
 
-bot.command('folders', async ctx => {
-  if (!isAuthorizedSender(ctx)) return
-  await handleFoldersCommand(ctx, buildFolderPickerDeps())
-})
 
 // /pending — list current pending permission prompts with their ids, so the
 // user can target a specific one via /approve <id> or /deny <id>.
 // Restricted to access.allowFrom DMs to match /approve and /deny — it
 // wouldn't make sense to let a group member see which permissions are
 // pending when they can't actually answer them.
-bot.command('pending', async ctx => {
-  if (!isAuthorizedSender(ctx)) return
-  const access = loadAccess()
-  const senderId = String(ctx.from?.id ?? '')
-  if (!access.allowFrom.includes(senderId)) {
-    await switchroomReply(ctx, 'Not authorized to view pending permission prompts.')
-    return
-  }
-  if (pendingPermissions.size === 0) {
-    await switchroomReply(ctx, 'No pending permission prompts.')
-    return
-  }
-  const lines: string[] = ['**Pending permission prompts**']
-  for (const [id, details] of pendingPermissions.entries()) {
-    lines.push(`• \`${id}\` — ${escapeHtmlForTg(details.tool_name)}`)
-  }
-  await switchroomReply(ctx, lines.join('\n'), { html: true })
-})
 
-bot.command('interrupt', async ctx => {
-  if (!isAuthorizedSender(ctx)) return
-  const name = ctx.match?.trim() || getMyAgentName()
-  try { assertSafeAgentName(name) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
-  await runSwitchroomCommand(ctx, ['agent', 'interrupt', name], `interrupt ${name}`)
-})
 
 // Persist-ops bundle for the legacy auto-fallback lockout file. The
 // only remaining reader is `isAutoFallbackCooldownActive` (line ~2030)
@@ -26241,6 +25475,1844 @@ async function finalizeMicrosoftConnect(key: string): Promise<void> {
  * app unless the operator BYO'd one). Admin-gated like `/auth add`.
  * `/connect cancel` aborts a pending flow. Google stays host-CLI.
  */
+
+
+// Boot-card auth-row loader (issue #708, RFC H rewire). Queries the
+// broker for `list-state` and hands the raw shape to the boot card,
+// which delegates rendering to `renderAuthLine`. Returns null on any
+// failure so the boot card silently omits the section.
+async function loadAccountsForBootCard(agent: string): Promise<ListStateData | null> {
+  try {
+    const client = await getAuthBrokerClient(agent)
+    if (!client) return null
+    return await client.listState()
+  } catch (err) {
+    process.stderr.write(`telegram gateway: boot-card auth probe failed: ${(err as Error)?.message ?? String(err)}\n`)
+    return null
+  }
+}
+
+/**
+ * Canonical boot-card quota probe (#1336): resolve this agent's
+ * effective account, then have the broker probe Anthropic server-side.
+ * Returns null on any failure (broker unreachable, no active account)
+ * so `probeQuota` falls back to a direct probe. Mirrors
+ * `loadAccountsForBootCard`'s broker-client + swallow-to-null shape,
+ * and the override→account→active resolution used by auth-line.ts.
+ */
+async function probeQuotaForBootCard(
+  agent: string,
+  timeoutMs?: number,
+): Promise<QuotaResult | null> {
+  try {
+    const client = await getAuthBrokerClient(agent)
+    if (!client) return null
+    const state = await client.listState()
+    const entry = state.agents.find((a) => a.name === agent)
+    const label = entry?.override ?? entry?.account ?? state.active
+    if (!label) return null
+    const { results } = await client.probeQuota([label], timeoutMs)
+    return results.find((r) => r.label === label)?.result ?? null
+  } catch (err) {
+    process.stderr.write(`telegram gateway: boot-card quota probe failed: ${(err as Error)?.message ?? String(err)}\n`)
+    return null
+  }
+}
+
+/**
+ * Read the pending auth session's target slot from the agent's
+ * `.setup-token.session.json` meta file. Returns null when no session
+ * is pending.
+ */
+function readPendingSessionSlot(agent: string): string | null {
+  try {
+    const agentDir = resolveAgentDirForName(agent)
+    if (!agentDir) return null
+    const metaPath = join(agentDir, '.claude', '.setup-token.session.json')
+    const raw = readFileSync(metaPath, 'utf-8')
+    const meta = JSON.parse(raw) as { slot?: string }
+    return meta.slot ?? 'default'
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Resolve the agent directory for a given name. Tries the local
+ * SWITCHROOM_CONFIG-driven lookup first, falls back to scanning
+ * known agent-root paths. Used by dashboard path probing without
+ * blowing up when configs are split across roots (klanker setup).
+ */
+function resolveAgentDirForName(agent: string): string | null {
+  try {
+    // If this gateway is scoped to a specific agent, prefer that.
+    if (agent === getMyAgentName()) {
+      return resolveAgentDirFromEnv()
+    }
+  } catch { /* ignore */ }
+  // Common split-root layout for klanker.
+  const candidates = [
+    join(process.env.HOME ?? '/root', `.switchroom-${agent}/agents/${agent}`),
+    join(process.env.HOME ?? '/root', `.switchroom/agents/${agent}`),
+  ]
+  for (const c of candidates) {
+    try { readFileSync(join(c, '.claude', 'settings.json'), 'utf-8'); return c } catch { /* try next */ }
+  }
+  return null
+}
+
+// ─── Callback-query handler families (#2996 Phase 5, remaining item 2) ─────
+// Extracted verbatim to callback-query-handlers.ts behind an injected deps
+// object (see that module's header for what moved and what deliberately
+// stayed). Destructuring keeps every call site below byte-identical.
+const callbackQueryHandlers = createCallbackQueryHandlers({
+  bot,
+  lockedBot,
+  loadAccess,
+  escapeHtmlForTg,
+  switchroomReply,
+  resolveThreadId,
+  deliverResumeSyntheticOrBuffer,
+  expireMentalModelProposeCard,
+  readLiveSwitchroomConfigText,
+  mentalModelCorrelationKey,
+  getMyAgentName,
+  triggerSelfRestart,
+  runSwitchroomAuthCommand,
+  switchroomExecJson,
+  assertSafeAgentName,
+  buildDeferredSecretKeyboard,
+  recordDeferredSecretKernelDecision,
+  mintGrantWizardKernelRequest,
+  recordGrantWizardKernelDecision,
+  robustApiCall,
+  swallowingApiCall,
+  pendingVaultRequestAccesses,
+  pendingVaultRequestSaves,
+  pendingMentalModelProposes,
+  pendingCardStore,
+  pendingMentalModelCorrelations,
+  pendingVaultOps,
+  vaultPassphraseCache,
+  deferredSecrets,
+  pendingReauthFlows,
+  secretStaging,
+  lastAuthRefreshAtMs,
+  // Mutable module `let`s — injected as getters so the startup config
+  // assignment (and any later reload) stays observable from the module.
+  getVaultApprovalAuthMode: () => VAULT_APPROVAL_AUTH_MODE,
+  getAdminOnlyKeys: () => ADMIN_ONLY_KEYS,
+  vaultKeyRegex: VAULT_KEY_REGEX,
+  mentalModelProposeTtlMs: MENTAL_MODEL_PROPOSE_TTL_MS,
+  // #2975 Stage 1 — loud-failure funnel for a rate-window retry that also
+  // failed (cooldown + record + broadcast in one place).
+  emitOperatorEvent: emitGatewayOperatorEvent,
+})
+const {
+  handleVaultRecentDenialCallback,
+  performVaultAccessApproval,
+  handleSkillProposalCallback,
+  handleMentalModelProposeCallback,
+  handleVaultRequestAccessCallback,
+  handleVaultRequestSaveCallback,
+  handleVaultDeferCallback,
+  parseGrantDuration,
+  startGrantWizardStep1,
+  grantWizardConfirm,
+  handleVaultGrantCallback,
+  executeDeferredSecretSave,
+  handleOperatorEventCallback,
+  handleAuthDashboardCallback,
+} = callbackQueryHandlers
+
+// /reauth was removed in v0.6.13 — the `/auth` dashboard's
+// `🔄 Reauth default` button fires the same flow (the `case 'reauth':`
+// callback dispatch calls `runSwitchroomAuthCommand` and seeds
+// `pendingReauthFlows`). The OAuth code paste-back is caught by the
+// generic message intercept that watches `pendingReauthFlows` —
+// pasting the code into chat now Just Works without a typed entry
+// point. Removed surfaces in this PR:
+//   - bot.command('reauth', ...)              → use /auth → 🔄 Reauth
+//   - /reauth <code|url>  paste-back          → paste into chat
+//   - /reauth <other-agent> targeting         → use that agent's /auth
+
+
+
+
+
+
+
+// Two-button scope picker shown to admin agents (when hostd is
+// reachable) so the operator can run doctor for the WHOLE FLEET
+// (host-side via hostd — has the docker socket) or just THIS agent
+// (in-container, degraded). callback_data is tiny (`dr:fleet` /
+// `dr:self`) — well within Telegram's 64-byte limit.
+function buildDoctorScopeKeyboard(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text('🩺 Whole fleet', 'dr:fleet')
+    .text('🩺 This agent', 'dr:self')
+}
+
+// Shared report prettifier: ANSI-strip + status-glyph swap + pre block.
+// Identical rendering for the in-container and the hostd fleet report.
+function formatDoctorReport(raw: string): string {
+  const trimmed = stripAnsi(raw).trim()
+  if (!trimmed) return 'doctor: no output'
+  const pretty = trimmed
+    .replace(/^( *)✓ /gm, '$1🟢 ')
+    .replace(/^( *)✗ /gm, '$1🔴 ')
+    .replace(/^( *)! /gm, '$1🟡 ')
+  return preBlock(formatSwitchroomOutput(pretty))
+}
+
+// In-container `switchroom doctor` — this agent's own (degraded: no
+// docker socket) view. The original /doctor behaviour, unchanged.
+async function renderSelfDoctor(ctx: Context): Promise<void> {
+  let output: string
+  try { output = switchroomExecCombined(['doctor'], 30000) }
+  catch (err: unknown) { output = (err as any).stdout ?? (err as any).message ?? 'doctor failed' }
+  await switchroomReply(ctx, formatDoctorReport(output), { html: true })
+}
+
+// Whole-fleet `switchroom doctor` via hostd: it runs host-side where
+// the docker socket exists, so it sees every container + singleton
+// instead of the degraded in-container reading. Read-only verb; the
+// daemon independently enforces the admin gate (path-as-identity), so
+// this is the audited boundary even though the gateway only offers
+// the button to admin agents.
+async function renderFleetDoctor(ctx: Context): Promise<void> {
+  const resp = await tryHostdDispatch(getMyAgentName(), {
+    v: 1,
+    op: 'doctor',
+    request_id: hostdRequestId('gw-doctor'),
+  })
+  if (resp === 'not-configured') {
+    await switchroomReply(ctx, '🩺 Whole-fleet doctor needs hostd, which isn’t configured here — showing this agent instead.', { html: true })
+    await renderSelfDoctor(ctx)
+    return
+  }
+  if (resp.result === 'denied') {
+    await switchroomReply(ctx, `🩺 **Whole-fleet doctor denied by hostd:**\n${preBlock(formatSwitchroomOutput(resp.error ?? 'admin required'))}`, { html: true })
+    return
+  }
+  // `completed` (including `switchroom doctor` exit 1 = "found
+  // problems", which the handler classifies as completed) or `error`:
+  // the report on stdout (or the error text) is exactly what the
+  // operator wants surfaced.
+  const body = resp.stdout_tail?.trim() || resp.error || '(no output from hostd doctor)'
+  await switchroomReply(ctx, formatDoctorReport(body), { html: true })
+}
+
+// Ops/info slash commands (/doctor /grant /dangerous /permissions /version
+// /whoami /commands) extracted verbatim to bot-commands-ops-info.ts (#2996
+// Phase 5). Registered here to preserve grammy's in-order registration.
+
+
+// ─── Inline-button handler (permissions) ──────────────────────────────────
+// Handles `perm:(allow|deny|always|asn|asb|back):<id>` — permission request buttons
+
+// ─── Inbound message handlers ─────────────────────────────────────────────
+
+
+
+
+/**
+ * Download a voice attachment from Telegram and transcribe it via
+ * the configured Whisper provider. Returns the transcript text on
+ * success, or null on any failure (caller falls back). All errors
+ * are logged to stderr but never thrown — voice-in is a UX
+ * enhancement, not a critical path.
+ */
+/**
+ * Filename hint for the multipart body. Telegram voice is OGG/Opus; agents
+ * may also attach mp3/m4a/wav which arrive as message:audio. Match the mime
+ * so the decoder (Whisper / faster-whisper) gets a usable extension.
+ */
+function voiceFilenameExt(mimeType: string | undefined): string {
+  return mimeType?.includes('mp3') ? 'mp3'
+    : mimeType?.includes('m4a') ? 'm4a'
+    : mimeType?.includes('wav') ? 'wav'
+    : 'ogg'
+}
+
+/**
+ * Download a Telegram voice attachment into memory. Shared by the cloud
+ * (Whisper) and local (sidecar) transcription paths. Returns the bytes on
+ * success, or null on any failure (caller falls back). Never throws.
+ */
+async function downloadVoiceBytes(fileId: string): Promise<Uint8Array | null> {
+  try {
+    const file = await bot.api.getFile(fileId)
+    if (!file.file_path) {
+      process.stderr.write(`telegram gateway: voice-in: getFile returned no file_path\n`)
+      return null
+    }
+    const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
+    const res = await fetch(url, { signal: AbortSignal.timeout(30_000) })
+    if (!res.ok) {
+      process.stderr.write(`telegram gateway: voice-in: telegram download HTTP ${res.status}\n`)
+      return null
+    }
+    return new Uint8Array(await res.arrayBuffer())
+  } catch (err) {
+    // Sanitize: never let the bot token leak into log lines via the
+    // download URL — strip anything that looks like a token.
+    const msg = (err as Error).message.replace(/bot[\w:-]+/g, 'bot[redacted]')
+    process.stderr.write(`telegram gateway: voice-in: download failed: ${msg}\n`)
+    return null
+  }
+}
+
+/**
+ * Transcribe a Telegram voice note via the LOCAL GPU STT sidecar (PR-B2).
+ * Used when the host voice verdict is `local`. Resolves the shared-secret
+ * token from the vault (voice/sidecar-token), downloads the audio, and
+ * POSTs it to the sidecar at loopback (the gateway is network_mode: host).
+ * Returns the transcript on success, null on any failure (caller falls
+ * back to the legacy "(voice message)" envelope). Never throws.
+ */
+async function maybeTranscribeVoiceLocal(
+  fileId: string,
+  mimeType: string | undefined,
+  language: string | undefined,
+): Promise<string | null> {
+  const token = await materializeSidecarToken()
+  if (!token) {
+    // materializeSidecarToken already logged the specific reason.
+    return null
+  }
+
+  const audioBytes = await downloadVoiceBytes(fileId)
+  if (!audioBytes) return null
+
+  const result = await transcribeViaSidecar({
+    token,
+    audio: audioBytes,
+    filename: `voice.${voiceFilenameExt(mimeType)}`,
+    language,
+  })
+
+  if (!result.ok) {
+    process.stderr.write(
+      `telegram gateway: voice-in: local sidecar transcription failed reason=${result.reason}` +
+      (result.detail ? ` detail=${JSON.stringify(result.detail).slice(0, 100)}` : '') +
+      '\n',
+    )
+    return null
+  }
+
+  process.stderr.write(
+    `telegram gateway: voice-in: local sidecar transcribed ${audioBytes.length} bytes in ${result.durationMs}ms ` +
+    `lang=${result.language ?? '?'} audio_s=${result.audioSeconds ?? '?'} chars=${result.text.length}\n`,
+  )
+  return result.text
+}
+
+async function maybeTranscribeVoice(
+  fileId: string,
+  mimeType: string | undefined,
+  language: string | undefined,
+  apiKeyRef: string | undefined,
+): Promise<string | null> {
+  // Resolve the STT key through the vault broker at use-time (PR-A:
+  // voice STT vault-unify). The configured `voice_in.api_key` is a
+  // `vault:<key>` reference (default `vault:openai/api-key`); the
+  // resolved value is held in memory only — never written to disk or
+  // surfaced into the agent prompt. On any failure we return null and
+  // the caller falls back to the legacy "(voice message)" envelope.
+  const apiKey = await materializeVoiceKey({ apiKeyRef })
+  if (!apiKey) {
+    // materializeVoiceKey already logged the specific reason.
+    return null
+  }
+
+  const audioBytes = await downloadVoiceBytes(fileId)
+  if (!audioBytes) return null
+
+  const result = await transcribeViaWhisper({
+    apiKey,
+    audio: audioBytes,
+    filename: `voice.${voiceFilenameExt(mimeType)}`,
+    language,
+  })
+
+  if (!result.ok) {
+    process.stderr.write(
+      `telegram gateway: voice-in: transcription failed reason=${result.reason}` +
+      (result.detail ? ` detail=${JSON.stringify(result.detail).slice(0, 100)}` : '') +
+      '\n',
+    )
+    return null
+  }
+
+  process.stderr.write(
+    `telegram gateway: voice-in: transcribed ${audioBytes.length} bytes in ${result.durationMs}ms ` +
+    `lang=${result.language ?? '?'} audio_s=${result.audioSeconds ?? '?'} chars=${result.text.length}\n`,
+  )
+  return result.text
+}
+
+
+
+
+
+
+// ─── Previously-silent inbound types (#1077) ─────────────────────────────
+// Telegram emits a dozen more `message:*` types that earlier versions of
+// this gateway never registered handlers for. The user would send a
+// contact / location / poll / etc., the gateway would log nothing, the
+// agent would never see the message, and the user would get zero
+// acknowledgement. Each type below now has an explicit decision:
+//
+//   forward         — build a descriptive envelope + flow through
+//                     handleInbound (gate + ack 👀 + bridge IPC).
+//   log-only ack    — gate, react 👀, log; agent is not bothered.
+//   log-only DENY   — refuse with a polite reply, never forward.
+//
+// Decision matrix (see issue #1077):
+//
+//   contact            forward          meaningful user intent
+//   location           forward          agent might map / lookup
+//   venue              forward          same shape as location
+//   poll               forward          could be feedback / polling agent
+//   web_app_data       forward          mini-app result; agent consumes
+//   users_shared       forward          explicit user-share request
+//   chat_shared        forward          same
+//   dice               ack-only         low-info — agent isn't a die
+//   game               ack-only         we aren't a game host
+//   story              ack-only         stories are FYI
+//   paid_media         ack-only + WARN  money flow — operator review
+//   successful_payment ack-only + WARN  money flow — operator review
+//   passport_data      DENY             regulated identity data, unsupported
+//
+// Every handler is wrapped in try/catch so a malformed Telegram payload
+// can never tear down the gateway dispatcher.
+
+/**
+ * Gate + 👀-react path for inbound types we acknowledge but don't
+ * forward to the agent. Mirrors the gate/drop/pair branches that
+ * handleInbound takes, but skips the IPC broadcast.
+ */
+async function handleAckOnly(
+  ctx: Context,
+  kind: string,
+  opts: { emoji?: string; warn?: boolean } = {},
+): Promise<void> {
+  try {
+    const result = gate(ctx)
+    if (result.action === 'drop') {
+      logGateDeny(ctx, result.reason)
+      return
+    }
+    if (result.action === 'pair') {
+      const lead = result.isResend ? 'Still pending' : 'Pairing required'
+      await ctx.reply(`${lead} — run in Claude Code:\n\n/telegram:access pair ${result.code}`).catch(() => {})
+      return
+    }
+    const chat_id = String(ctx.chat!.id)
+    const msgId = ctx.message?.message_id
+    if (msgId != null) {
+      void sendReaction(chat_id, msgId, (opts.emoji ?? '👀') as ReactionTypeEmoji['emoji']).catch(() => {})
+    }
+    const prefix = opts.warn ? 'WARN ' : ''
+    process.stderr.write(`telegram gateway: ${prefix}inbound ${kind} ack-only chat_id=${chat_id} from=${ctx.from?.id ?? '?'}\n`)
+  } catch (err) {
+    process.stderr.write(`telegram gateway: ack-only handler error (${kind}): ${(err as Error).message}\n`)
+  }
+}
+
+/**
+ * Polite refusal for inbound types we explicitly do not support
+ * (passport_data). Sends a reply, NEVER forwards to the agent.
+ */
+async function handleRefusal(
+  ctx: Context,
+  kind: string,
+  refusalText: string,
+): Promise<void> {
+  try {
+    const result = gate(ctx)
+    if (result.action === 'drop') {
+      logGateDeny(ctx, result.reason)
+      return
+    }
+    if (result.action === 'pair') {
+      // Pre-pair senders don't get the refusal either — same drop path
+      // as any other unauthorized inbound.
+      return
+    }
+    const chat_id = String(ctx.chat!.id)
+    const msgId = ctx.message?.message_id
+    const messageThreadId = ctx.message?.message_thread_id
+    if (msgId != null) {
+      void sendReaction(chat_id, msgId, '🚫' as ReactionTypeEmoji['emoji']).catch(() => {})
+    }
+    // #1075: thread-id-bearing — swallow on THREAD_NOT_FOUND so a
+    // deleted topic doesn't crash the refusal handler.
+    await swallowingApiCall(
+      () =>
+        bot.api.sendMessage(
+          chat_id,
+          refusalText,
+          messageThreadId != null ? { message_thread_id: messageThreadId } : {},
+        ),
+      {
+        chat_id,
+        verb: 'refusal-handler',
+        ...(messageThreadId != null ? { threadId: messageThreadId } : {}),
+      },
+    )
+    // Loud stderr: this category gets monitored. A passport_data inbound
+    // is unusual enough to warrant operator attention.
+    process.stderr.write(
+      `telegram gateway: SECURITY inbound ${kind} REFUSED chat_id=${chat_id} from=${ctx.from?.id ?? '?'} — agent never saw payload\n`,
+    )
+  } catch (err) {
+    process.stderr.write(`telegram gateway: refusal handler error (${kind}): ${(err as Error).message}\n`)
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ─── Checklist service message handlers ──────────────────────────────────
+// Telegram emits `checklist_tasks_done` and `checklist_tasks_added` service
+// messages when users tick or add tasks in a native checklist. These arrive
+// as part of the `message` update type, so no extra `allowed_updates` config
+// is required — bots already receive them.
+//
+// We route them to the agent as a new channel event with
+// kind="checklist_task_changed" so the agent can react to user actions on
+// a checklist it sent.
+
+type ChecklistTaskUpdate = {
+  message_checklist?: {
+    title?: string
+    tasks?: Array<{ id?: number; text?: string; is_completed?: boolean }>
+  }
+  checklist_tasks_done?: Array<{ id?: number; user?: { id?: number; username?: string }; done?: boolean }>
+  checklist_tasks_added?: Array<{ id?: number; text?: string; user?: { id?: number; username?: string } }>
+}
+
+function handleChecklistUpdate(
+  ctx: Context,
+  kind: 'checklist_tasks_done' | 'checklist_tasks_added',
+): void {
+  try {
+    const msg = ctx.message as (typeof ctx.message & ChecklistTaskUpdate) | undefined
+    if (!msg) return
+
+    const chat = ctx.chat
+    if (!chat) return
+
+    const chat_id = String(chat.id)
+    const access = loadAccess()
+
+    // Only notify if this chat is allowlisted — same guard as inbound user messages.
+    // Closes #472 finding #13. Pre-fix the `&& access.allowFrom.length > 0`
+    // tail made this fail-OPEN when the allowlist was empty: every chat's
+    // checklist tasks would forward to the agent. Sibling guards (the
+    // inbound-message gate at line ~588 and the operator-event broadcast
+    // at line ~1221) are both fail-closed for empty allowlists. The
+    // empty-allowlist case is the most likely state for a misconfiguration
+    // (e.g. /unpair just ran), so fail-OPEN is the worst default.
+    if (!access.allowFrom.includes(chat_id)) return
+
+    const message_id = String(msg.message_id)
+    const ts = msg.date ?? Math.floor(Date.now() / 1000)
+
+    // Extract task updates depending on service message type
+    const tasksDone = msg.checklist_tasks_done ?? []
+    const tasksAdded = msg.checklist_tasks_added ?? []
+    const allTasks = kind === 'checklist_tasks_done' ? tasksDone : tasksAdded
+
+    // Build per-task channel events and broadcast each to connected bridges.
+    for (const task of allTasks) {
+      const taskId = task.id != null ? String(task.id) : '?'
+      const user = (task.user as { username?: string; id?: number } | undefined)
+      const userName = user?.username ?? (user?.id != null ? String(user.id) : 'unknown')
+      const state = kind === 'checklist_tasks_done'
+        ? ((task as { done?: boolean }).done === false ? 'undone' : 'done')
+        : 'added'
+
+      const inboundMsg: InboundMessage = {
+        type: 'inbound',
+        chatId: chat_id,
+        messageId: Number(message_id),
+        user: userName,
+        userId: user?.id ?? 0,
+        ts,
+        text: `(checklist task ${state}: id=${taskId})`,
+        meta: {
+          chat_id,
+          message_id,
+          kind: 'checklist_task_changed',
+          task_id: taskId,
+          state,
+          user: userName,
+          user_id: user?.id != null ? String(user.id) : '0',
+          ts: new Date(ts * 1000).toISOString(),
+        },
+      }
+      // allow-broadcast: informational checklist task notification, not turn-driving
+      ipcServer.broadcast(inboundMsg)
+      process.stderr.write(
+        `telegram gateway: checklist ${kind}: chat_id=${chat_id} message_id=${message_id} task_id=${taskId} state=${state} user=${userName}\n`,
+      )
+    }
+  } catch (err) {
+    process.stderr.write(`telegram gateway: checklist handler error (${kind}): ${err}\n`)
+  }
+}
+
+
+
+// Suppress the "pinned a message" service message Telegram inserts when OUR
+// silent status-pin fires. The pin call passes `disable_notification: true`,
+// which kills the PUSH notification but NOT the in-chat service message — so
+// delete that service message as it lands, but ONLY for pins we own (tracked
+// in `statusPinState`). Manual/operator pins are never silent and are never
+// touched. Only silent status pins reach here as an OUR-pin match, so the
+// ownership check is the guard.
+//
+// Race tolerance: the service update can arrive before `reconcileStatusPin`
+// has stored the new PinState (the pin API call resolves, Telegram emits the
+// service message, and only then does the reconcile write the Map). A single
+// short retry covers that window; if it's still not one of ours, we leave the
+// service message alone.
+
+// ─── Terminal catch-all for unhandled message content types (#3300) ───────
+//
+// MUST stay registered LAST among the `message`/`message:*` handlers.
+//
+// grammy's `bot.on('message:<type>')` is filtering middleware: internally
+// `on → filter(pred, handler) → branch(pred, handler, pass)`. When the filter
+// matches, grammy runs the leaf handler, which never calls `next()`, so the
+// chain STOPS — a specific `message:text`/`:photo`/… match above consumes the
+// update and this catch-all never sees it (specific handler always wins; no
+// "already handled" guard is needed, the ordering is the guarantee). When NO
+// specific `message:*` filter matches, grammy ^1.44 would otherwise SILENTLY
+// drop the update — no log, no ack, no history row (the zero-observability
+// failure class behind the 2026-07-16 dropped-message incident: message_id
+// 19090 allocated in the DM with no gateway trace at all). This handler
+// closes the class: every inbound `message` is either delivered as a turn or
+// explicitly logged (known-noise service messages → log-only, no turn — see
+// SERVICE_NOISE_KEYS), so nothing is silently dropped at this layer again.
+//
+// Access gating is NOT re-implemented here — routing through
+// handleInboundCoalesced (the exact path `message:text` uses) applies the
+// same gate()/allowFrom checks, and parseForwardOrigin runs inside it so
+// forwarded-message provenance is preserved.
+
+// ─── Reaction-trigger runtime state (#1074) ──────────────────────────────
+//
+// Bot-message reactions in the configured allowlist trigger a synthetic
+// inbound turn (`<channel source="reaction">`) — mirrors the cron-fold-in
+// dispatch path. Three pieces of mutable state, all module-local:
+//
+//   - `reactionsCfg` — cascade-resolved config slice with built-in
+//     defaults; lazy-initialized on first reaction event.
+//   - `reactionHourCap` — in-memory rolling-1-hour counter per chat.
+//   - `reactionDebounce` — per-chat debounce buffer that batches rapid
+//     reactions into a single delivered synthetic.
+//
+// The persistence path (`recordReaction`) is independent — reactions
+// are persisted regardless of trigger outcome. This is the v1 contract
+// pinned by the existing UAT (`reactions-dm.test.ts`) and by tests
+// that rely on `get_recent_messages` surfacing user_reaction.
+let reactionsCfg: ReactionsResolvedConfig | null = null
+let reactionHourCap: HourCap | null = null
+let reactionDebounce: DebounceBuffer | null = null
+// Bot's own Telegram user_id; populated at startup from getMe(). Kept
+// for parity with botUsername; not currently used for authorship
+// detection on reactions (history.role is the primary signal).
+let botUserId = 0
+
+function getReactionsConfig(): ReactionsResolvedConfig {
+  if (reactionsCfg) return reactionsCfg
+  let raw: unknown = undefined
+  try {
+    const cfg = loadSwitchroomConfig()
+    const agentName = process.env.SWITCHROOM_AGENT_NAME
+    if (agentName) {
+      const rawAgent = cfg.agents?.[agentName]
+      if (rawAgent) {
+        const resolved = resolveAgentConfig(cfg.defaults, cfg.profiles, rawAgent)
+        raw = (resolved as { reactions?: unknown }).reactions
+      }
+    }
+  } catch (err) {
+    process.stderr.write(
+      `telegram gateway: reactions: config load failed, falling back to defaults: ${(err as Error).message}\n`,
+    )
+  }
+  reactionsCfg = resolveReactionsConfig(
+    raw as Parameters<typeof resolveReactionsConfig>[0] ?? null,
+  )
+  return reactionsCfg
+}
+
+function getReactionHourCap(): HourCap {
+  if (!reactionHourCap) {
+    reactionHourCap = new HourCap(getReactionsConfig().perHourCap)
+  }
+  return reactionHourCap
+}
+
+function getReactionDebounce(): DebounceBuffer {
+  if (!reactionDebounce) {
+    reactionDebounce = new DebounceBuffer(
+      getReactionsConfig().debounceMs,
+      flushReactionBatch,
+    )
+  }
+  return reactionDebounce
+}
+
+// ─── reaction_dispatch (#2291) ─────────────────────────────────────────────
+// Event-driven dispatch of ANY qualifying message_reaction as an inbound
+// `<channel event="reaction">` turn. Default OFF; independent of the
+// bot-authored `reactions` feedback path above.
+let reactionDispatchCfg: ReactionDispatchResolvedConfig | null = null
+
+function getReactionDispatchConfig(): ReactionDispatchResolvedConfig {
+  if (reactionDispatchCfg) return reactionDispatchCfg
+  let raw: unknown = undefined
+  try {
+    const cfg = loadSwitchroomConfig()
+    const agentName = process.env.SWITCHROOM_AGENT_NAME
+    if (agentName) {
+      const rawAgent = cfg.agents?.[agentName]
+      if (rawAgent) {
+        const resolved = resolveAgentConfig(cfg.defaults, cfg.profiles, rawAgent)
+        raw = (resolved as { reaction_dispatch?: unknown }).reaction_dispatch
+      }
+    }
+  } catch (err) {
+    process.stderr.write(
+      `telegram gateway: reaction_dispatch: config load failed, defaulting OFF: ${(err as Error).message}\n`,
+    )
+  }
+  reactionDispatchCfg = resolveReactionDispatchConfig(
+    raw as Parameters<typeof resolveReactionDispatchConfig>[0] ?? null,
+  )
+  return reactionDispatchCfg
+}
+
+/**
+ * Event-driven reaction → inbound turn (#2291). Called from the
+ * message_reaction handler for add/change events. Filters by the
+ * `reaction_dispatch` emoji allowlist (default empty ⇒ no-op), looks up
+ * the reacted message's text from the SQLite history buffer (graceful on
+ * miss), and injects an inbound shaped like a button-callback event via
+ * the same ipcServer.sendToAgent path cron uses. Removals never reach
+ * here (the caller filters them).
+ */
+function maybeDispatchReaction(args: {
+  chatId: string
+  messageId: number
+  emoji: string | null
+  action: 'add' | 'change'
+  user: string
+  userId: number
+  threadId?: number
+}): void {
+  const cfg = getReactionDispatchConfig()
+  const decision = evaluateReactionDispatch(cfg, { emoji: args.emoji, action: args.action })
+  if (!decision.ok) {
+    if (decision.reason === 'emoji_not_in_allowlist' && cfg.enabled) {
+      process.stderr.write(
+        `telegram gateway: reaction_dispatch.reject reason=allowlist_miss emoji=${args.emoji} chat=${args.chatId}\n`,
+      )
+    }
+    return
+  }
+
+  const agentName = process.env.SWITCHROOM_AGENT_NAME
+  if (!agentName) {
+    process.stderr.write(
+      `telegram gateway: reaction_dispatch: skipped — SWITCHROOM_AGENT_NAME unset\n`,
+    )
+    return
+  }
+
+  // History lookup is best-effort; a miss yields an empty body. The
+  // envelope still carries emoji / message_id / chat_id / user.
+  let reactedText = ''
+  if (HISTORY_ENABLED) {
+    try {
+      const row = lookupMessageRoleAndText(args.chatId, args.messageId)
+      reactedText = row?.text ?? ''
+    } catch (err) {
+      process.stderr.write(
+        `telegram gateway: reaction_dispatch: history lookup failed: ${err}\n`,
+      )
+    }
+  }
+
+  const { text, meta } = buildReactionDispatchInbound({
+    emoji: args.emoji!,
+    chatId: args.chatId,
+    messageId: args.messageId,
+    user: args.user,
+    userId: args.userId,
+    reactedText,
+    ...(typeof args.threadId === 'number' ? { threadId: args.threadId } : {}),
+  })
+
+  const ts = Date.now()
+  const inbound: InboundMessage = {
+    type: 'inbound',
+    chatId: args.chatId,
+    ...(typeof args.threadId === 'number' ? { threadId: args.threadId } : {}),
+    messageId: ts,
+    user: args.user,
+    userId: args.userId,
+    ts,
+    text,
+    meta,
+  }
+  const delivered = ipcServer.sendToAgent(agentName, inbound)
+  if (delivered) markClaudeBusyForInbound(inbound)
+  process.stderr.write(
+    `telegram gateway: reaction_dispatch agent=${agentName} chat=${args.chatId} ` +
+    `emoji=${args.emoji} message_id=${args.messageId} delivered=${delivered}\n`,
+  )
+  if (!delivered) {
+    pendingInboundBuffer.push(agentName, inbound)
+  }
+}
+
+/**
+ * Dispatch a debounce-flushed batch as a synthetic InboundMessage via
+ * the same `ipcServer.sendToAgent` path the cron-fold-in uses.
+ * Discriminated by `meta.source="reaction"`. Carries the bot-side
+ * message preview (capped at PREVIEW_MAX_CHARS in
+ * `reaction-trigger.ts`) — never the bot token, never vault material.
+ */
+function flushReactionBatch(batch: ReactionBatch): void {
+  const agentName = process.env.SWITCHROOM_AGENT_NAME
+  if (!agentName) {
+    process.stderr.write(
+      `telegram gateway: reactions: dispatch skipped — SWITCHROOM_AGENT_NAME unset\n`,
+    )
+    return
+  }
+  // Use the latest reaction's metadata for the wire envelope; the
+  // batched listing lives inside `text` + `meta.count`.
+  const head = batch.reactions[batch.reactions.length - 1]!
+  const text = buildReactionInboundText(batch)
+  const meta = buildReactionInboundMeta(batch)
+  const ts = Date.now()
+  const inbound: InboundMessage = {
+    type: 'inbound',
+    chatId: String(batch.chatId),
+    ...(head.threadId !== undefined ? { threadId: head.threadId } : {}),
+    // Synthetic id — same convention cron uses. The bridge only uses
+    // messageId for telegram_reply context; reaction-synthesized turns
+    // are not quote-replies, so any monotonic value works.
+    messageId: ts,
+    user: head.user,
+    userId: head.userId,
+    ts,
+    text,
+    meta,
+  }
+  // #2094 finding 3 — route the reaction flush through the SAME #1556
+  // decideInboundDelivery gate every other synthetic inbound uses (via
+  // deliverResumeSyntheticOrBuffer), instead of a raw ipcServer.sendToAgent.
+  // A reaction that lands WHILE a turn is in flight was previously fired
+  // mid-turn — the bridge typed it into the CLI composer where it stranded
+  // by the turn-completion race (the #1556 composer wedge). Now a mid-turn
+  // reaction buffers-until-idle (the turn-complete hook + idle-drain timer
+  // flush pendingInboundBuffer the instant claude goes idle, landing cleanly
+  // as a fresh turn); an idle reaction delivers now, buffering only on a
+  // genuine bridge-offline miss — the #1150 buffer-on-failure guarantee,
+  // preserved inside the helper.
+  const delivered = deliverResumeSyntheticOrBuffer(agentName, inbound)
+  process.stderr.write(
+    `telegram gateway: reactions.dispatch agent=${agentName} chat=${batch.chatId} ` +
+    `count=${batch.reactions.length} batched=${batch.batched} delivered=${delivered}\n`,
+  )
+}
+
+// ─── Inbound message_reaction handler ────────────────────────────────────
+// Telegram delivers MessageReactionUpdated events when a user adds, changes,
+// or removes an emoji reaction from a bot message. We persist the current
+// reaction to the SQLite history row so get_recent_messages can surface it,
+// AND (since #1074) optionally forward qualifying reactions to the agent
+// as synthetic inbound turns.
+//
+// Only emoji reactions are handled for v1 — custom emoji are silently skipped.
+// Requires "message_reaction" in allowed_updates (see run() call below).
+
+async function handleMessageReaction(ctx: Context): Promise<void> {
+  try {
+    // The payload is typed loosely via grammy's Context; cast to the
+    // Bot API shape we need (MessageReactionUpdated).
+    const update = (ctx as unknown as {
+      update: {
+        message_reaction?: {
+          chat: { id: number }
+          message_id: number
+          message_thread_id?: number
+          user?: { id: number; first_name?: string; username?: string }
+          old_reaction: Array<{ type: string; emoji?: string }>
+          new_reaction: Array<{ type: string; emoji?: string }>
+        }
+      }
+    }).update.message_reaction
+    if (!update) return
+
+    const chat_id = String(update.chat.id)
+    const message_id = update.message_id
+    const oldReaction = update.old_reaction ?? []
+    const newReaction = update.new_reaction ?? []
+
+    // Both empty — defensive no-op.
+    if (oldReaction.length === 0 && newReaction.length === 0) return
+
+    // Determine action and emoji for logging / storage.
+    let action: 'add' | 'remove' | 'change'
+    let emoji: string | null
+
+    if (oldReaction.length === 0 && newReaction.length > 0) {
+      action = 'add'
+      const first = newReaction.find(r => r.type === 'emoji')
+      if (!first) return // custom emoji only — skip
+      emoji = first.emoji ?? null
+    } else if (oldReaction.length > 0 && newReaction.length === 0) {
+      action = 'remove'
+      emoji = null
+    } else {
+      action = 'change'
+      const first = newReaction.find(r => r.type === 'emoji')
+      if (!first) return // custom emoji only — skip
+      emoji = first.emoji ?? null
+    }
+
+    if (HISTORY_ENABLED) {
+      try {
+        recordReaction({ chat_id, message_id, emoji })
+      } catch (err) {
+        process.stderr.write(`telegram gateway: history recordReaction failed: ${err}\n`)
+      }
+    }
+
+    process.stderr.write(
+      `telegram gateway: reaction: chatId=${chat_id} messageId=${message_id} emoji=${emoji ?? '(none)'} action=${action}\n`,
+    )
+
+    // ─── Trigger predicate (#1074) ───────────────────────────────────────
+    //
+    // Only `add` / `change` carry a NEW emoji; `remove` is log-only.
+    // From here on we ignore failures rather than reject (the persist
+    // path above is the v1 contract; trigger is best-effort).
+    if (action === 'remove' || emoji === null) return
+    const reacter = update.user
+    if (!reacter) return // anonymous group-channel reactions — not user-attributable
+
+    const reacterName = reacter.first_name ?? reacter.username ?? String(reacter.id)
+
+    // ─── reaction_dispatch (#2291) ───────────────────────────────────────
+    // Event-driven dispatch of ANY qualifying reaction as a button-style
+    // inbound turn. Independent of (and runs before) the bot-authored
+    // `reactions` feedback path below; both may fire for one reaction.
+    maybeDispatchReaction({
+      chatId: chat_id,
+      messageId: message_id,
+      emoji,
+      action,
+      user: reacterName,
+      userId: reacter.id,
+      ...(typeof update.message_thread_id === 'number'
+        ? { threadId: update.message_thread_id }
+        : {}),
+    })
+
+    if (!HISTORY_ENABLED) return // need history to identify bot-authored target
+
+    const cfg = getReactionsConfig()
+    if (!cfg.enabled) return
+
+    // Resolve target authorship + preview text from local history.
+    // If the row is missing (reacted-to message predates retention,
+    // history disabled mid-run, or was reaped), we cannot tell and
+    // therefore must NOT trigger (fail-closed on authorship).
+    const row = lookupMessageRoleAndText(chat_id, message_id)
+    const botAuthored = row?.role === 'assistant'
+    const preview = truncatePreview(row?.text ?? '')
+
+    const decision = evaluateTriggerCandidate(cfg, {
+      chatId: update.chat.id,
+      messageId: message_id,
+      emoji,
+      action,
+      botAuthored,
+    })
+    if (!decision.ok) {
+      // Only log the bot-authored allowlist-miss case; other rejections
+      // (disabled / not-bot-authored / no-emoji) are not interesting
+      // events and would spam stderr in groups where the bot has
+      // never spoken.
+      if (decision.reason === 'emoji_not_in_allowlist' && botAuthored) {
+        process.stderr.write(
+          `telegram gateway: reactions.reject reason=allowlist_miss emoji=${emoji} chat=${chat_id}\n`,
+        )
+      }
+      return
+    }
+
+    // ─── Group admin check (fail-closed on lookup failure) ──────────────
+    if (cfg.groupAdminOnly && isGroupChat(update.chat.id)) {
+      let isAdmin = false
+      try {
+        const member = await robustApiCall(
+          () => bot.api.getChatMember(update.chat.id, reacter.id),
+          { chat_id, verb: 'getChatMember' },
+        )
+        const status = (member as { status?: string } | undefined)?.status
+        isAdmin = status === 'creator' || status === 'administrator'
+      } catch (err) {
+        process.stderr.write(
+          `telegram gateway: reactions.admin_lookup_failed chat=${chat_id} ` +
+          `user=${reacter.id} err=${(err as Error).message}\n`,
+        )
+        isAdmin = false
+      }
+      if (!isAdmin) {
+        process.stderr.write(
+          `telegram gateway: reactions.reject reason=group_non_admin chat=${chat_id} user=${reacter.id}\n`,
+        )
+        return
+      }
+    }
+
+    // ─── Hour cap ───────────────────────────────────────────────────────
+    if (!getReactionHourCap().tryConsume(chat_id)) {
+      process.stderr.write(
+        `telegram gateway: reactions.reject reason=hour_cap_exhausted chat=${chat_id} cap=${cfg.perHourCap}\n`,
+      )
+      return
+    }
+
+    // ─── Enqueue into the per-chat debounce buffer ──────────────────────
+    const pending: PendingReaction = {
+      targetMessageId: message_id,
+      emoji,
+      action,
+      ts: Date.now(),
+      preview,
+      userId: reacter.id,
+      user: reacterName,
+      ...(typeof update.message_thread_id === 'number'
+        ? { threadId: update.message_thread_id }
+        : {}),
+    }
+    getReactionDebounce().enqueue(update.chat.id, pending)
+  } catch (err) {
+    process.stderr.write(`telegram gateway: message_reaction handler error: ${err}\n`)
+  }
+}
+
+// ─── Error handler ────────────────────────────────────────────────────────
+// ─── Handler registration (#2996 P0a) ──────────────────────────────────────
+// The top-level grammY registration statements (bot.use / bot.command /
+// bot.on / bot.catch, plus the two interleaved handler-registering helpers
+// registerOpsInfoCommands and installUnhandledMessageCatchAll) were extracted
+// VERBATIM, IN THEIR ORIGINAL ORDER, from their previously module-scope-
+// interspersed positions into this single function so the registration wiring
+// is one named, order-preserving unit — pinned by
+// gateway-handler-registration-wiring.test.ts and the catch-all-ordering
+// invariant in catch-all-unhandled-message.test.ts. Behaviour-preserving leaf
+// move: registration ORDER is byte-identical (every message:* handler still
+// precedes the installUnhandledMessageCatchAll terminal catch-all, which still
+// precedes message_reaction + the error boundary) and the single call below
+// runs at the same point in module evaluation as the old last registration, so
+// grammY sees the exact same middleware/handler sequence. `bot` is injected
+// (P0b defers its construction); `deps` is the forward seam for per-handler
+// dependency injection that later #2996 phases widen — in P0a the handler
+// bodies still close over gateway module scope. Statements keep their original
+// indentation (no reindent) so the move is a byte-verifiable relocation.
+type RegisterGatewayHandlersDeps = Record<string, never>
+function registerGatewayHandlers(bot: Bot<Context>, deps: RegisterGatewayHandlersDeps): void {
+  void deps
+bot.use(async (ctx, next) => {
+  if (ctx.message?.text) {
+    const myName = getMyAgentName()
+    const decision = classifyAdminGate(ctx.message.text, myName)
+    if (decision.action === 'block') {
+      // `block` = a fleet-admin verb (ADMIN_COMMAND_NAMES) or
+      // `/restart <other-agent>`. classifyAdminGate already lets
+      // `/restart`-self and every non-admin command pass through, so
+      // this branch is exactly the privileged set.
+      const cmdHtml = escapeHtmlForTg(`/${decision.cmd}`)
+      const nameHtml = escapeHtmlForTg(myName)
+      const notFlagged =
+        decision.reason === 'other-agent'
+          ? `⚠️ \`${cmdHtml}\` targeting another agent is an admin operation — this agent (\`${nameHtml}\`) isn't admin-flagged. Run it from an admin agent, or set \`admin: true\` for this agent in switchroom.yaml. (Self-restart is allowed: send \`/restart\` with no arg.)`
+          : `⚠️ \`${cmdHtml}\` is an admin command — this agent (\`${nameHtml}\`) isn't admin-flagged. Run it from an admin agent, or set \`admin: true\` for this agent in switchroom.yaml.`
+      if (!AGENT_ADMIN) {
+        // Unchanged behaviour: a non-admin agent never executes admin
+        // verbs locally and must not forward them to Claude.
+        process.stderr.write(
+          `telegram gateway: admin-gate blocked cmd=/${decision.cmd} agent=${process.env.SWITCHROOM_AGENT_NAME ?? '-'} reason=${decision.reason} (AGENT_ADMIN=false)\n`,
+        )
+        await switchroomReply(ctx, notFlagged, { html: true })
+        return
+      }
+      // sec WS7-F2 (#1394): fleet-admin is OPERATOR-PRIVATE. Honor it
+      // ONLY in a private chat from an `access.allowFrom` sender.
+      // Before this, when AGENT_ADMIN=true the middleware was a no-op
+      // and the per-command `isAuthorizedSender` gate treats an empty
+      // group `allowFrom` as "allow every member" — so any member of
+      // an admin agent's forum/group could run /vault, /update apply,
+      // /grant, /dangerous, etc. (the default shape for an agent
+      // created via `agent add --topology forum` + `admin: true`).
+      // Strict `access.allowFrom` + private-chat-only — never the
+      // group-permissive isAuthorizedSender.
+      const senderId = String(ctx.from?.id ?? '')
+      const operatorPrivate =
+        ctx.chat?.type === 'private' &&
+        loadAccess().allowFrom.includes(senderId)
+      if (!operatorPrivate) {
+        process.stderr.write(
+          `telegram gateway: admin-gate refused (not operator-private) cmd=/${decision.cmd} agent=${process.env.SWITCHROOM_AGENT_NAME ?? '-'} chat=${ctx.chat?.type ?? '?'} sender=${senderId}\n`,
+        )
+        await switchroomReply(
+          ctx,
+          `⚠️ \`${cmdHtml}\` is a fleet-admin command — it is **operator-private**. Send it as a direct message to me from your operator account (a private chat where your Telegram ID is on the access allowlist), not in a group or forum.`,
+          { html: true },
+        )
+        return
+      }
+      // operator-private admin verb on an admin agent → fall through
+      // to the bot.command() handler (which re-checks isAuthorizedSender
+      // — redundant but harmless in a private allowFrom chat).
+    }
+  }
+  await next()
+})
+bot.command('start', async ctx => {
+  // dmCommandGate (#894 backport): silent drop on disabled or
+  // non-allowlisted senders so the bot doesn't leak its existence.
+  const gated = dmCommandGate(ctx)
+  if (!gated) return
+  const disabled = gated.access.dmPolicy === 'disabled'
+  await ctx.replyWithRichMessage(richMessage(buildStartText(getMyAgentName(), disabled)))
+})
+bot.command('help', async ctx => {
+  if (!dmCommandGate(ctx)) return
+  await ctx.replyWithRichMessage(richMessage(buildHelpText(getMyAgentName())))
+})
+bot.command('status', async ctx => {
+  // dmCommandGate (#894 backport) drops disabled / non-allowlisted in
+  // allowlist mode. Pairing-mode users still fall through to either
+  // the pending-code branch or the unpaired branch.
+  const gated = dmCommandGate(ctx)
+  if (!gated) return
+  const { access, senderId } = gated
+  const from = ctx.from!
+  if (access.allowFrom.includes(senderId)) {
+    const demo = hasDemoFlag(getCommandArgs(ctx))
+    const userTag = from.username ? `@${from.username}` : senderId
+    const meta = await buildAgentMetadata(getMyAgentName())
+    await ctx.replyWithRichMessage(richMessage(buildStatusPairedText({ user: userTag, meta, demo })))
+    return
+  }
+  for (const [code, p] of Object.entries(access.pending)) {
+    if (p.senderId === senderId) {
+      await ctx.replyWithRichMessage(richMessage(buildStatusPendingText(code)))
+      return
+    }
+  }
+  await ctx.reply(buildStatusUnpairedText())
+})
+bot.command('agents', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  await runSwitchroomCommandFormatted(ctx, ['agent', 'list'], 'agent list', () => {
+    type AgentListResp = { agents: Array<{ name: string; status: string; uptime: string; template: string; topic_name: string; topic_emoji?: string }> }
+    const data = switchroomExecJson<AgentListResp>(['agent', 'list'])
+    if (!data) return null
+    if (data.agents.length === 0) return '_No agents defined_'
+    const lines = ['**Agents**']
+    for (const a of data.agents) {
+      lines.push(`${statusIcon(a.status)} **${escapeHtmlForTg(a.name)}** · ${escapeHtmlForTg(a.status)} · ${escapeHtmlForTg(a.uptime)}`)
+      lines.push(`    _${escapeHtmlForTg(a.template)} → ${escapeHtmlForTg(a.topic_name)}${a.topic_emoji ? ' ' + a.topic_emoji : ''}_`)
+    }
+    return lines.join('\n')
+  })
+})
+bot.command('inject', async ctx => {
+  await handleInjectCommand(ctx, buildInjectDeps())
+})
+bot.command('compact', async ctx => {
+  await handleInjectCommand(ctx, buildInjectDeps({ open: true, fixedVerb: '/compact' }))
+})
+bot.command('clear', async ctx => {
+  await handleInjectCommand(ctx, buildInjectDeps({ open: true, fixedVerb: '/clear' }))
+})
+bot.command('model', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const text = ctx.message?.text ?? ctx.channelPost?.text ?? ''
+  const parsed = parseModelCommand(text) ?? { kind: 'show' as const }
+  const chatId = String(ctx.chat!.id)
+  const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
+  // #3177 — durable receipt FIRST. A typed /model must NEVER be invisible: even
+  // if every downstream reply is shed/dropped, or the session is in a
+  // phantom-idle window (turn atom cleared while claude is still busy), the
+  // command leaves a greppable log line + a history row before any branch. This
+  // is the fix for the finn 2026-07-12 zero-trace swallow (no log, no reply, no
+  // ack, no deferred apply). `busyNow` folds BOTH busy signals (turn atom AND
+  // the authoritative delivery-machine/approval gate) — but a STALE atom or a
+  // wedged approval older than the hard TTL is discounted as idle (#3262), so a
+  // phantom "active turn" on an idle session no longer blocks the switch. Resolve
+  // once (it may clear a dangling atom) and reuse for both the receipt log and
+  // the routing disposition.
+  const modelBusy = resolveModelEffortBusy()
+  const busyNow = modelBusy.currentTurnActive || modelBusy.turnInFlight
+  process.stderr.write(modelCommandReceiptLine(getMyAgentName(), parsed, busyNow) + '\n')
+  if (HISTORY_ENABLED && ctx.message?.message_id != null) {
+    try {
+      recordInbound({
+        chat_id: chatId,
+        thread_id: threadId ?? null,
+        message_id: ctx.message.message_id,
+        user: ctx.from?.username ?? (ctx.from?.id != null ? String(ctx.from.id) : null),
+        user_id: ctx.from?.id != null ? String(ctx.from.id) : null,
+        ts: ctx.message.date ?? Math.floor(Date.now() / 1000),
+        text,
+      })
+    } catch (err) {
+      process.stderr.write(`telegram gateway: /model recordInbound failed: ${(err as Error)?.message ?? String(err)}\n`)
+    }
+  }
+  const deps = buildModelDeps({ chatId, threadId })
+  // Route on a pure disposition (#3177) that folds BOTH busy signals so a
+  // session busy by EITHER measure ack+queues instead of silently injecting
+  // into a busy pane. Every branch below produces a visible action.
+  const disposition = planModelCommand(parsed, {
+    currentTurnActive: modelBusy.currentTurnActive,
+    turnInFlight: modelBusy.turnInFlight,
+    menuEnabled: process.env.SWITCHROOM_MODEL_MENU !== '0',
+  })
+  if (disposition.kind === 'menu') {
+    const menu = await buildModelMenu(deps)
+    await switchroomReply(ctx, menu.text, { html: true, reply_markup: modelMenuReplyMarkup(menu) })
+    return
+  }
+  // Mid-turn (by either busy signal): instead of dead-ending ("Try again in a
+  // moment") or silently injecting into a busy pane, ACK + QUEUE + apply-on-idle
+  // + confirm (#3017/#3177). The typed set path either injects into claude's
+  // input box or triggers a carrier restart — both unsafe while busy.
+  if (disposition.kind === 'queue') {
+    const target = disposition.target
+    const sent = await ctx.replyWithRichMessage(
+      richMessage(hardenCardBreaks(pendingCmdAckText('model', target, escapeHtmlForTg))),
+      threadId != null ? { message_thread_id: threadId } : {},
+    )
+    enqueueSessionCommand({
+      kind: 'model',
+      origin: 'typed',
+      arg: target,
+      targetLabel: target,
+      chatId,
+      threadId,
+      ackChatId: chatId,
+      ackMessageId: (sent as { message_id: number }).message_id,
+      requestedAt: Date.now(),
+    })
+    return
+  }
+  // Rev 5: the handler relaunches through the carrier and owns every side effect
+  // (override write, carrier, premium-recovery clear). There is no post-hoc
+  // recording — /status is reconciled at boot from `.active-session-model`, so
+  // an unapplied switch can never be optimistically recorded here.
+  const reply = await handleModelCommand(parsed, deps)
+  await switchroomReply(ctx, reply.text, { html: reply.html })
+})
+bot.command('effort', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const text = ctx.message?.text ?? ctx.channelPost?.text ?? ''
+  const parsed = parseEffortCommand(text) ?? { kind: 'show' as const }
+  const deps = buildEffortDeps()
+  if (parsed.kind === 'show') {
+    const menu = buildEffortMenu(deps)
+    await switchroomReply(ctx, menu.text, { html: true, reply_markup: effortMenuReplyMarkup(menu) })
+    return
+  }
+  // Mid-turn: ACK + QUEUE + apply-on-idle + confirm (#3017) — parity with
+  // /model. `applyEffort` mid-turn silently maybe-failed ("couldn't confirm it
+  // applied") before this gate existed. Use the SAME stale-aware busy resolver
+  // as /model (#3262) so a dangling turn atom older than the hard TTL is
+  // discounted as idle and the switch applies instead of queuing forever on an
+  // idle session.
+  const effortBusy = resolveModelEffortBusy()
+  if ((parsed.kind === 'set' || parsed.kind === 'default') && effortBusy.currentTurnActive) {
+    const requestedLevel = parsed.kind === 'set' ? parsed.level : 'default'
+    const chatId = String(ctx.chat!.id)
+    const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
+    const sent = await ctx.replyWithRichMessage(
+      richMessage(hardenCardBreaks(pendingCmdAckText('effort', requestedLevel, escapeHtmlForTg))),
+      threadId != null ? { message_thread_id: threadId } : {},
+    )
+    enqueueSessionCommand({
+      kind: 'effort',
+      origin: 'typed',
+      arg: requestedLevel,
+      targetLabel: requestedLevel,
+      chatId,
+      threadId,
+      ackChatId: chatId,
+      ackMessageId: (sent as { message_id: number }).message_id,
+      requestedAt: Date.now(),
+    })
+    return
+  }
+  const reply = await handleEffortCommand(parsed, deps)
+  await switchroomReply(ctx, reply.text, { html: reply.html })
+})
+bot.command('agentstart', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const name = ctx.match?.trim() || getMyAgentName()
+  try { assertSafeAgentName(name) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
+  await dispatchShortVerbViaHostd(
+    ctx,
+    { v: 1, op: 'agent_start', request_id: hostdRequestId('gw-start'), args: { name } },
+    `start ${name}`,
+    ['agent', 'start', name],
+  )
+})
+bot.command('agentstop', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const name = ctx.match?.trim() || getMyAgentName()
+  try { assertSafeAgentName(name) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
+  await dispatchShortVerbViaHostd(
+    ctx,
+    { v: 1, op: 'agent_stop', request_id: hostdRequestId('gw-stop'), args: { name } },
+    `stop ${name}`,
+    ['agent', 'stop', name],
+  )
+})
+bot.command('stop', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  // 7a: /stop takes NO argument. "/stop worker" is almost certainly old
+  // container-stop muscle memory (the verb that moved to /agentstop) — warn
+  // and do NOT halt, so a mis-remembered command can't kill an unrelated turn.
+  const arg = ctx.match?.trim()
+  if (arg) {
+    await switchroomReply(
+      ctx,
+      `/stop takes no argument — it cancels MY in-flight turn. ` +
+      `To stop a container, use /agentstop ${arg}. Nothing was stopped.`,
+    )
+    return
+  }
+  const queuedLabels = pendingSessionCommand.list().map(c => `/${c.kind} ${c.targetLabel}`)
+  const inFlight = turnInFlightForGate()
+  if (!inFlight) {
+    await switchroomReply(ctx, buildStopReply(false, queuedLabels).text)
+    return
+  }
+  await executeHaltNow('stop-command')
+  await switchroomReply(ctx, buildStopReply(true, queuedLabels).text)
+})
+bot.command('restart', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const name = ctx.match?.trim() || getMyAgentName()
+  try { assertSafeAgentName(name) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
+  if (isSelfTargetingCommand(name)) {
+    const existing = readRestartMarker()
+    if (existing && Date.now() - existing.ts < 15_000) {
+      await switchroomReply(ctx, `⏳ Restart already in progress — ignoring duplicate.`, { html: true })
+      return
+    }
+    const chatId = String(ctx.chat!.id)
+    const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
+    const ackText = buildRestartAckText(name)
+    let ackId: number | null = null
+    // #1075: thread-id-bearing — fall back to main chat on
+    // THREAD_NOT_FOUND so the ack still lands somewhere.
+    try {
+      const sent = await retryWithThreadFallback<{ message_id: number }>(
+        robustApiCall,
+        (tid) =>
+          lockedBot.api.sendRichMessage(chatId, richMessage(ackText), {
+            // Restart acknowledgement is a status notice — silence the
+            // open ping (the "restarted — ready" follow-up is what matters).
+            disable_notification: true,
+            ...(tid != null ? { message_thread_id: tid } : {}),
+          }),
+        { threadId, chat_id: chatId, verb: 'restart.ack' },
+      )
+      ackId = sent.message_id
+      if (HISTORY_ENABLED) {
+        try { recordOutbound({ chat_id: chatId, thread_id: threadId ?? null, message_ids: [sent.message_id], texts: [`🔄 Restarting ${name}…`], attachment_kinds: [] }) } catch {}
+      }
+    } catch {}
+    writeRestartMarker({ chat_id: chatId, thread_id: threadId ?? null, ack_message_id: ackId, ts: Date.now() })
+    // Stamp user attribution into the clean-shutdown marker so the next
+    // greeting card shows "Restarted  user: /restart from chat" instead
+    // of whatever reason the downstream CLI would default to.
+    stampUserRestartReason('user: /restart from chat')
+    // Session-scoped (rev 4): /restart reverts any live /model override to the
+    // configured default. A consume-once `.session-model` carrier (if one was
+    // in flight) was already consumed by its own apply-relaunch, so nothing to
+    // do here — start.sh boots the configured default.
+    await sweepBeforeSelfRestart()
+    const hostdResp = await tryHostdDispatch(getMyAgentName(), {
+      v: 1,
+      op: 'agent_restart',
+      request_id: hostdRequestId('gw-restart'),
+      args: { name, force: true, reason: 'user: /restart from chat' },
+    })
+    if (hostdResp === 'not-configured') {
+      warnLegacySpawnIfHostdDisabled('agent_restart')
+      spawnSwitchroomDetached(
+        ['agent', 'restart', name, '--force'],
+        notifyDetachedFailure(chatId, threadId ?? null, `restart ${name}`),
+      )
+      return
+    }
+    if (hostdResp.result === 'started' || hostdResp.result === 'completed') {
+      // Dispatched via hostd. The recreate will kill this gateway
+      // shortly; the new gateway reads the marker and edits the ack.
+      return
+    }
+    // hostd was attempted but errored/denied — clear marker and surface.
+    clearRestartMarker()
+    await switchroomReply(
+      ctx,
+      `❌ **restart ${escapeHtmlForTg(name)} failed via hostd** ` +
+        `(result=${escapeHtmlForTg(hostdResp.result)}):\n` +
+        preBlock(hostdResp.error ?? '(no error message)'),
+      { html: true },
+    )
+    return
+  }
+  // Cross-agent /restart <other>. Same hostd-first shape as self-target,
+  // but no restart marker / no self-kill: another agent's container is
+  // about to bounce, not ours. The daemon spawns the work and returns
+  // "started" (per handleAgentRestart at server.ts:466), so the user
+  // sees a brief dispatch ack and the audit log carries the outcome.
+  await dispatchShortVerbViaHostd(
+    ctx,
+    {
+      v: 1,
+      op: 'agent_restart',
+      request_id: hostdRequestId('gw-restart-cross'),
+      args: { name, force: true, reason: `user: /restart ${name} from chat` },
+    },
+    `restart ${name}`,
+    ['agent', 'restart', name],
+  )
+})
+bot.command('new', async ctx => handleNewCommand(ctx))
+bot.command('update', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const arg = ctx.match?.trim() || ''
+  if (arg === '' || arg === 'check' || arg === '--check') {
+    await runSwitchroomCommand(ctx, ['update', '--check'], 'update --check')
+    await switchroomReply(
+      ctx,
+      'Reply with \`/update apply\` to execute, or \`/update apply --skip-images\` to skip the image pull.',
+      { html: true },
+    )
+    return
+  }
+  // Parse `apply` (with optional --skip-images / --rebuild passthrough).
+  // `/update apply` and `/update apply --skip-images` are the supported
+  // forms; everything else surfaces a usage hint.
+  const tokens = arg.split(/\s+/)
+  if (tokens[0] !== 'apply' && tokens[0] !== '--apply') {
+    await switchroomReply(
+      ctx,
+      'Usage: \`/update\` (dry-run) or \`/update apply [--skip-images] [--rebuild]\`',
+      { html: true },
+    )
+    return
+  }
+  // Whitelist passthrough flags. Anything outside the allowlist is
+  // refused — operators should not be able to inject arbitrary CLI
+  // args via Telegram (defense in depth even though admin-gated).
+  const ALLOWED_FLAGS = new Set(['--skip-images', '--rebuild'])
+  const passthrough = tokens.slice(1)
+  for (const tok of passthrough) {
+    if (!ALLOWED_FLAGS.has(tok)) {
+      await switchroomReply(
+        ctx,
+        `Refusing to pass unknown flag: \`${tok}\`. ` +
+        `Allowed: \`--skip-images\`, \`--rebuild\`.`,
+        { html: true },
+      )
+      return
+    }
+  }
+  // Pre-dispatch availability gate (#926 / #1469 / #1470). The gateway
+  // runs INSIDE the agent container, which has the switchroom CLI baked
+  // in but no docker binary and no /var/run/docker.sock mount. So
+  // `switchroom update`'s pull-images and recreate-containers steps
+  // would fail with "docker: command not found" — UNLESS hostd is in
+  // play (#1175 Phase 2 RFC C), in which case hostd runs on the host
+  // with the docker socket mounted and the in-container docker
+  // dependency goes away.
+  //
+  // Three states to distinguish here, so the operator gets a message
+  // pointing at the right remediation:
+  //
+  //   - hostd ready (socket bound): proceed — no gate.
+  //   - hostd configured-on but socket missing (#1470): tell the
+  //     operator to run `switchroom hostd install`. Don't conflate
+  //     with "enable host_control" — it's already on.
+  //   - hostd off AND no in-container docker (#1469): fall through
+  //     to spawn-detached would fail late; explain the choice between
+  //     host CLI and enabling hostd.
+  const myAgentName = getMyAgentName()
+  const hostdReady = hostdWillBeUsed(myAgentName)
+  if (!hostdReady && !isDockerReachable()) {
+    if (isHostdEnabled()) {
+      // hostd is configured on, but the per-agent socket isn't bound —
+      // hostd hasn't been installed yet, or its daemon is down.
+      await switchroomReply(
+        ctx,
+        `❌ **/update apply** needs \`hostd\`, but its socket ` +
+        `for agent \`${myAgentName}\` isn't ` +
+        `bound and in-container docker access isn't available either.\n\n` +
+        `\`host_control.enabled\` is on in \`switchroom.yaml\`, ` +
+        `so hostd is the expected dispatch path — but no socket at ` +
+        `\`/run/switchroom/hostd/${escapeHtmlForTg(myAgentName)}/sock\`. ` +
+        `On a fresh docker install this usually means hostd hasn't been ` +
+        `installed yet.\n\n` +
+        `Run \`switchroom hostd install\` on the host to install + ` +
+        `start the daemon, then retry. Send \`/upgradestatus\` to ` +
+        `re-check the daemon state from here.`,
+        { html: true },
+      )
+    } else {
+      // host_control explicitly off + no in-container docker: nothing
+      // can drive the apply from inside the container. Operator has to
+      // pick one of: host CLI, or enable hostd.
+      await switchroomReply(
+        ctx,
+        `❌ **/update apply** needs docker access from inside the agent ` +
+        `container, but it's not available (no \`docker\` binary on ` +
+        `PATH, no \`/var/run/docker.sock\` mount) and ` +
+        `\`host_control.enabled\` is off.\n\n` +
+        `Either run \`switchroom update\` from the host shell, or ` +
+        `set \`host_control.enabled: true\` in ` +
+        `\`switchroom.yaml\` and run ` +
+        `\`switchroom hostd install\` on the host so this verb ` +
+        `can dispatch through the host-side daemon.`,
+        { html: true },
+      )
+    }
+    return
+  }
+  // Debounce vs concurrent self-restart commands (/restart, /new, /reset
+  // and other /update). Reading + writing the SAME restart marker means
+  // a double-tap of /update apply is rejected, AND a /restart fired
+  // mid-update is rejected (and vice versa). 15s window matches the
+  // /restart handler.
+  const existing = readRestartMarker()
+  if (existing && Date.now() - existing.ts < 15_000) {
+    await switchroomReply(
+      ctx,
+      `⏳ Self-restart already in progress (started ${Math.round(
+        (Date.now() - existing.ts) / 1000,
+      )}s ago) — ignoring duplicate.`,
+      { html: true },
+    )
+    return
+  }
+  const chatId = String(ctx.chat!.id)
+  const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
+  // Send the ack and capture its message_id so the post-restart
+  // greeting card can edit/reply into the same message. Mirrors the
+  // /restart handler (gateway.ts ~6273) so the boot-card lookup
+  // (gateway.ts ~10393) finds chat_id + ack_message_id in the marker.
+  const ackText =
+    `🚀 **update started** — running ${[
+      '\`switchroom update\`',
+      ...passthrough.map((t) => `\`${t}\``),
+    ].join(' ')}\n` +
+    `\nThe gateway will restart as part of the recreate step; watch ` +
+    `for the post-restart greeting card to confirm completion.`
+  let ackId: number | null = null
+  // #1075: thread-id-bearing — fall back to main chat.
+  try {
+    const sent = await retryWithThreadFallback<{ message_id: number }>(
+      robustApiCall,
+      (tid) =>
+        lockedBot.api.sendRichMessage(chatId, richMessage(ackText), {
+          // "update started" acknowledgement is a status notice — silence
+          // the open ping (the post-restart greeting card is what matters).
+          disable_notification: true,
+          ...(tid != null ? { message_thread_id: tid } : {}),
+        }),
+      { threadId, chat_id: chatId, verb: 'update.ack' },
+    )
+    ackId = sent.message_id
+    if (HISTORY_ENABLED) {
+      try {
+        recordOutbound({
+          chat_id: chatId,
+          thread_id: threadId ?? null,
+          message_ids: [sent.message_id],
+          texts: [`🚀 update started`],
+          attachment_kinds: [],
+        })
+      } catch {}
+    }
+  } catch {}
+  writeRestartMarker({
+    chat_id: chatId,
+    thread_id: threadId ?? null,
+    ack_message_id: ackId,
+    ts: Date.now(),
+  })
+  // Reason banner for the post-restart greeting card. Without this the
+  // banner falls back to whatever the CLI's clean-shutdown marker
+  // stamped — usually 'unknown' or a docker-compose-restart string.
+  stampUserRestartReason('user: /update from chat')
+  // Unpin progress cards + clear active reactions before we die. The
+  // pinned-progress-card surface is the headline feature per CLAUDE.md;
+  // leaving one pinned across the recreate would surprise the operator.
+  await sweepBeforeSelfRestart()
+  const skipImages = passthrough.includes('--skip-images')
+  const rebuild = passthrough.includes('--rebuild')
+  const updateRequestId = hostdRequestId('gw-update')
+  // #1841 — forward the cached operator passphrase as the 2nd factor when
+  // hostd requires operator-attest on update_apply. No-op when the vault
+  // is locked / no passphrase is cached (feature-off posture unchanged).
+  const updatePassphrase = vaultPassphraseCache.get(chatId)?.passphrase
+  const hostdResp = await tryHostdDispatch(
+    getMyAgentName(),
+    withOperatorAttestation(
+      {
+        v: 1,
+        op: 'update_apply',
+        request_id: updateRequestId,
+        args: {
+          ...(skipImages ? { skip_images: true } : {}),
+          ...(rebuild ? { rebuild: true } : {}),
+        },
+      },
+      updatePassphrase,
+    ),
+  )
+  if (hostdResp === 'not-configured') {
+    warnLegacySpawnIfHostdDisabled('update_apply')
+    spawnSwitchroomDetached(
+      ['update', ...passthrough],
+      notifyDetachedFailure(chatId, threadId ?? null, 'update'),
+    )
+    return
+  }
+  if (hostdResp.result === 'completed') {
+    return
+  }
+  if (hostdResp.result === 'started') {
+    // Mark in-flight so the framework silence fallback renders hostd's
+    // real phase + elapsed (deterministic, model-free) instead of the
+    // content-free "still working…" — the klanker incident fix.
+    inFlightUpdate = { requestId: updateRequestId, startedAt: Date.now() }
+    // RFC C §5.3: long-running mutation. Poll get_status until terminal
+    // or until the recreate kills this gateway (whichever happens first).
+    // The success signal is the post-restart greeting card edited into
+    // ackId via the restart marker. The poll is here so that
+    // *fail-before-recreate* (image pull error, scaffold regen crash)
+    // doesn't leave the operator staring at the orphan "🚀 update started"
+    // ack indefinitely. Live repro: PR #1305.
+    void (async () => {
+     try {
+      // 60s budget: RFC C §5.3 specs `apply` at 30s and `update_apply`
+      // at 60s. Image pulls + scaffold regeneration dominate the wall
+      // clock for update_apply, hence the larger budget. The poll
+      // resolves earlier on any terminal state from the daemon.
+      const terminal = await pollHostdStatus(getMyAgentName(), updateRequestId, {
+        timeoutMs: 60_000,
+      })
+      if (terminal === 'not-configured') return
+      // completed → recreate is about to run / has run; let the post-
+      // restart greeting card handle the success message.
+      if (terminal.result === 'completed') return
+      // Anything else means the daemon's mutation failed before it could
+      // kill us. Edit the ack to surface the tail and clear the marker
+      // so the next gateway boot doesn't render a false success card.
+      clearRestartMarker()
+      const errBody =
+        terminal.error ??
+        terminal.stderr_tail ??
+        terminal.stdout_tail ??
+        '(no error tail returned)'
+      const editedText =
+        `🚀 **update started** — **FAILED** via hostd ` +
+        `(result=${escapeHtmlForTg(terminal.result)}):\n` +
+        preBlock(errBody)
+      if (ackId != null) {
+        try {
+          await robustApiCall(
+            () =>
+              lockedBot.api.editMessageText(chatId, ackId!, richMessage(editedText), {
+                link_preview_options: { is_disabled: true },
+              }),
+            { verb: 'update.poll.editAck' },
+          )
+        } catch {
+          // edit-failed (message deleted, parse error) — fall back to
+          // a fresh reply so the failure isn't silent.
+          try {
+            await switchroomReply(ctx, editedText, { html: true })
+          } catch {}
+        }
+      } else {
+        try {
+          await switchroomReply(ctx, editedText, { html: true })
+        } catch {}
+      }
+     } finally {
+       // Poll resolved (terminal / completed / not-configured /
+       // timeout) — stop substituting in-flight update status.
+       inFlightUpdate = null
+     }
+    })()
+    return
+  }
+  clearRestartMarker()
+  await switchroomReply(
+    ctx,
+    `❌ **/update apply failed via hostd** ` +
+      `(result=${escapeHtmlForTg(hostdResp.result)}):\n` +
+      preBlock(hostdResp.error ?? '(no error message)'),
+    { html: true },
+  )
+})
+bot.command('upgradestatus', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  // PR5 — heavy-output: route to admin alias in supergroup mode
+  // (CPO #4). Fleet-shared / DM agents fall through to in-place reply.
+  await runSwitchroomCommand(ctx, ['update', '--status'], 'update --status', 'heavy')
+})
+bot.command('upgrade', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  await switchroomReply(
+    ctx,
+    'Did you mean \`/upgradestatus\` (no hyphen — Telegram slash-command grammar)? ' +
+    'Or \`/update\` to plan, \`/update apply\` to execute.',
+    { html: true },
+  )
+})
+bot.command('audit', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const arg = (ctx.match ?? '').trim()
+  if (arg === '' || arg === 'help' || arg === '--help') {
+    await switchroomReply(
+      ctx,
+      'Usage: \`/audit hostd [--tail N] [--agent <name>] [--op <verb>] [--error] [--verbose]\`',
+      { html: true },
+    )
+    return
+  }
+  const tokens = arg.split(/\s+/)
+  const sub = tokens[0]
+  if (sub !== 'hostd') {
+    await switchroomReply(
+      ctx,
+      `Unknown audit target \`${sub ?? ''}\`. ` +
+      `Supported: \`hostd\`.`,
+      { html: true },
+    )
+    return
+  }
+  // Build the CLI argv for switchroom hostd audit. Validate each
+  // operator-supplied value to keep argv injection out of the picture.
+  const ALLOWED_OPS = new Set([
+    'agent_start', 'agent_stop', 'agent_restart', 'apply',
+    'update_check', 'update_apply', 'update_status', 'upgrade_status',
+    'get_status', 'doctor', 'fleet_state',
+  ])
+  const argv: string[] = ['hostd', 'audit']
+  for (let i = 1; i < tokens.length; i++) {
+    const t = tokens[i]!
+    if (t === '--error') { argv.push('--error'); continue }
+    if (t === '--verbose') { argv.push('--verbose'); continue }
+    if (t === '--tail' || t === '--agent' || t === '--op') {
+      const v = tokens[++i]
+      if (v == null) {
+        await switchroomReply(ctx, `Flag \`${t}\` requires a value.`, { html: true })
+        return
+      }
+      if (t === '--tail' && !/^[0-9]{1,4}$/.test(v)) {
+        await switchroomReply(ctx, `\`--tail\` must be an integer (1-9999).`, { html: true })
+        return
+      }
+      if (t === '--agent' && !/^[a-z][a-z0-9-]{0,62}$/i.test(v)) {
+        await switchroomReply(ctx, `\`--agent\` name has an invalid shape.`, { html: true })
+        return
+      }
+      if (t === '--op' && !ALLOWED_OPS.has(v)) {
+        await switchroomReply(
+          ctx,
+          `Unknown hostd verb \`${v}\`. ` +
+          `Known: ${[...ALLOWED_OPS].sort().map(o => `\`${o}\``).join(', ')}.`,
+          { html: true },
+        )
+        return
+      }
+      argv.push(t, v)
+      continue
+    }
+    await switchroomReply(
+      ctx,
+      `Unknown flag \`${t}\`. ` +
+      `Allowed: \`--tail\`, \`--agent\`, \`--op\`, \`--error\`, \`--verbose\`.`,
+      { html: true },
+    )
+    return
+  }
+  // PR5 — heavy-output → admin alias in supergroup mode (CPO #4).
+  await runSwitchroomCommand(ctx, argv, `hostd audit${argv.length > 2 ? ' …' : ''}`, 'heavy')
+})
+bot.command('approve', async ctx => handlePermissionSlash(ctx, 'allow'))
+bot.command('deny', async ctx => handlePermissionSlash(ctx, 'deny'))
+bot.command('folders', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  await handleFoldersCommand(ctx, buildFolderPickerDeps())
+})
+bot.command('pending', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const access = loadAccess()
+  const senderId = String(ctx.from?.id ?? '')
+  if (!access.allowFrom.includes(senderId)) {
+    await switchroomReply(ctx, 'Not authorized to view pending permission prompts.')
+    return
+  }
+  if (pendingPermissions.size === 0) {
+    await switchroomReply(ctx, 'No pending permission prompts.')
+    return
+  }
+  const lines: string[] = ['**Pending permission prompts**']
+  for (const [id, details] of pendingPermissions.entries()) {
+    lines.push(`• \`${id}\` — ${escapeHtmlForTg(details.tool_name)}`)
+  }
+  await switchroomReply(ctx, lines.join('\n'), { html: true })
+})
+bot.command('interrupt', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const name = ctx.match?.trim() || getMyAgentName()
+  try { assertSafeAgentName(name) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
+  await runSwitchroomCommand(ctx, ['agent', 'interrupt', name], `interrupt ${name}`)
+})
 bot.command('connect', async ctx => {
   // Credential-plane admin is OPERATOR-PRIVATE (WS7-F2 / #1408), exactly
   // like `/auth`: honor `/connect` ONLY in a private chat from a strict
@@ -26394,7 +27466,6 @@ bot.command('connect', async ctx => {
   // Background: poll Microsoft, register the account, edit the card.
   void finalizeMicrosoftConnect(key)
 })
-
 bot.command("auth", async ctx => {
   // sec WS7-F2b (#1394): `/auth` drives the auth-broker credential
   // lifecycle (`/auth add` mints/attaches an Anthropic account token,
@@ -26667,166 +27738,6 @@ bot.command("auth", async ctx => {
     await switchroomReply(ctx, reply.text, { html: reply.html })
   }
 })
-
-// Boot-card auth-row loader (issue #708, RFC H rewire). Queries the
-// broker for `list-state` and hands the raw shape to the boot card,
-// which delegates rendering to `renderAuthLine`. Returns null on any
-// failure so the boot card silently omits the section.
-async function loadAccountsForBootCard(agent: string): Promise<ListStateData | null> {
-  try {
-    const client = await getAuthBrokerClient(agent)
-    if (!client) return null
-    return await client.listState()
-  } catch (err) {
-    process.stderr.write(`telegram gateway: boot-card auth probe failed: ${(err as Error)?.message ?? String(err)}\n`)
-    return null
-  }
-}
-
-/**
- * Canonical boot-card quota probe (#1336): resolve this agent's
- * effective account, then have the broker probe Anthropic server-side.
- * Returns null on any failure (broker unreachable, no active account)
- * so `probeQuota` falls back to a direct probe. Mirrors
- * `loadAccountsForBootCard`'s broker-client + swallow-to-null shape,
- * and the override→account→active resolution used by auth-line.ts.
- */
-async function probeQuotaForBootCard(
-  agent: string,
-  timeoutMs?: number,
-): Promise<QuotaResult | null> {
-  try {
-    const client = await getAuthBrokerClient(agent)
-    if (!client) return null
-    const state = await client.listState()
-    const entry = state.agents.find((a) => a.name === agent)
-    const label = entry?.override ?? entry?.account ?? state.active
-    if (!label) return null
-    const { results } = await client.probeQuota([label], timeoutMs)
-    return results.find((r) => r.label === label)?.result ?? null
-  } catch (err) {
-    process.stderr.write(`telegram gateway: boot-card quota probe failed: ${(err as Error)?.message ?? String(err)}\n`)
-    return null
-  }
-}
-
-/**
- * Read the pending auth session's target slot from the agent's
- * `.setup-token.session.json` meta file. Returns null when no session
- * is pending.
- */
-function readPendingSessionSlot(agent: string): string | null {
-  try {
-    const agentDir = resolveAgentDirForName(agent)
-    if (!agentDir) return null
-    const metaPath = join(agentDir, '.claude', '.setup-token.session.json')
-    const raw = readFileSync(metaPath, 'utf-8')
-    const meta = JSON.parse(raw) as { slot?: string }
-    return meta.slot ?? 'default'
-  } catch {
-    return null
-  }
-}
-
-/**
- * Resolve the agent directory for a given name. Tries the local
- * SWITCHROOM_CONFIG-driven lookup first, falls back to scanning
- * known agent-root paths. Used by dashboard path probing without
- * blowing up when configs are split across roots (klanker setup).
- */
-function resolveAgentDirForName(agent: string): string | null {
-  try {
-    // If this gateway is scoped to a specific agent, prefer that.
-    if (agent === getMyAgentName()) {
-      return resolveAgentDirFromEnv()
-    }
-  } catch { /* ignore */ }
-  // Common split-root layout for klanker.
-  const candidates = [
-    join(process.env.HOME ?? '/root', `.switchroom-${agent}/agents/${agent}`),
-    join(process.env.HOME ?? '/root', `.switchroom/agents/${agent}`),
-  ]
-  for (const c of candidates) {
-    try { readFileSync(join(c, '.claude', 'settings.json'), 'utf-8'); return c } catch { /* try next */ }
-  }
-  return null
-}
-
-// ─── Callback-query handler families (#2996 Phase 5, remaining item 2) ─────
-// Extracted verbatim to callback-query-handlers.ts behind an injected deps
-// object (see that module's header for what moved and what deliberately
-// stayed). Destructuring keeps every call site below byte-identical.
-const callbackQueryHandlers = createCallbackQueryHandlers({
-  bot,
-  lockedBot,
-  loadAccess,
-  escapeHtmlForTg,
-  switchroomReply,
-  resolveThreadId,
-  deliverResumeSyntheticOrBuffer,
-  expireMentalModelProposeCard,
-  readLiveSwitchroomConfigText,
-  mentalModelCorrelationKey,
-  getMyAgentName,
-  triggerSelfRestart,
-  runSwitchroomAuthCommand,
-  switchroomExecJson,
-  assertSafeAgentName,
-  buildDeferredSecretKeyboard,
-  recordDeferredSecretKernelDecision,
-  mintGrantWizardKernelRequest,
-  recordGrantWizardKernelDecision,
-  robustApiCall,
-  swallowingApiCall,
-  pendingVaultRequestAccesses,
-  pendingVaultRequestSaves,
-  pendingMentalModelProposes,
-  pendingCardStore,
-  pendingMentalModelCorrelations,
-  pendingVaultOps,
-  vaultPassphraseCache,
-  deferredSecrets,
-  pendingReauthFlows,
-  secretStaging,
-  lastAuthRefreshAtMs,
-  // Mutable module `let`s — injected as getters so the startup config
-  // assignment (and any later reload) stays observable from the module.
-  getVaultApprovalAuthMode: () => VAULT_APPROVAL_AUTH_MODE,
-  getAdminOnlyKeys: () => ADMIN_ONLY_KEYS,
-  vaultKeyRegex: VAULT_KEY_REGEX,
-  mentalModelProposeTtlMs: MENTAL_MODEL_PROPOSE_TTL_MS,
-  // #2975 Stage 1 — loud-failure funnel for a rate-window retry that also
-  // failed (cooldown + record + broadcast in one place).
-  emitOperatorEvent: emitGatewayOperatorEvent,
-})
-const {
-  handleVaultRecentDenialCallback,
-  performVaultAccessApproval,
-  handleSkillProposalCallback,
-  handleMentalModelProposeCallback,
-  handleVaultRequestAccessCallback,
-  handleVaultRequestSaveCallback,
-  handleVaultDeferCallback,
-  parseGrantDuration,
-  startGrantWizardStep1,
-  grantWizardConfirm,
-  handleVaultGrantCallback,
-  executeDeferredSecretSave,
-  handleOperatorEventCallback,
-  handleAuthDashboardCallback,
-} = callbackQueryHandlers
-
-// /reauth was removed in v0.6.13 — the `/auth` dashboard's
-// `🔄 Reauth default` button fires the same flow (the `case 'reauth':`
-// callback dispatch calls `runSwitchroomAuthCommand` and seeds
-// `pendingReauthFlows`). The OAuth code paste-back is caught by the
-// generic message intercept that watches `pendingReauthFlows` —
-// pasting the code into chat now Just Works without a typed entry
-// point. Removed surfaces in this PR:
-//   - bot.command('reauth', ...)              → use /auth → 🔄 Reauth
-//   - /reauth <code|url>  paste-back          → paste into chat
-//   - /reauth <other-agent> targeting         → use that agent's /auth
-
 bot.command('vault', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   const chatId = String(ctx.chat!.id)
@@ -27118,12 +28029,10 @@ bot.command('vault', async ctx => {
   }
   await executeVaultOp(ctx, chatId, (sub === 'remove' ? 'delete' : sub) as 'list' | 'get' | 'set' | 'delete', key, passphrase, undefined)
 })
-
 bot.command('topics', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   await runSwitchroomCommand(ctx, ['topics', 'list'], 'topics list')
 })
-
 bot.command('logs', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   const parts = getCommandArgs(ctx).split(/\s+/).filter(Boolean)
@@ -27153,7 +28062,6 @@ bot.command('logs', async ctx => {
     (raw) => renderLogTimestampsLocal(raw, tz),
   )
 })
-
 bot.command('memory', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   const query = ctx.match?.trim()
@@ -27161,7 +28069,6 @@ bot.command('memory', async ctx => {
   // PR5 — heavy-output → admin alias in supergroup mode (CPO #4).
   await runSwitchroomCommand(ctx, ['memory', 'search', query], 'memory search', 'heavy')
 })
-
 bot.command('issues', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   const arg = (typeof ctx.match === "string" ? ctx.match : "").trim()
@@ -27235,7 +28142,6 @@ bot.command('issues', async ctx => {
     { html: true },
   )
 })
-
 bot.command('usage', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   const demo = hasDemoFlag(getCommandArgs(ctx))
@@ -27351,71 +28257,6 @@ bot.command('usage', async ctx => {
   }
   await switchroomReply(ctx, formatQuotaBlock(result.data), { html: true })
 })
-
-// Two-button scope picker shown to admin agents (when hostd is
-// reachable) so the operator can run doctor for the WHOLE FLEET
-// (host-side via hostd — has the docker socket) or just THIS agent
-// (in-container, degraded). callback_data is tiny (`dr:fleet` /
-// `dr:self`) — well within Telegram's 64-byte limit.
-function buildDoctorScopeKeyboard(): InlineKeyboard {
-  return new InlineKeyboard()
-    .text('🩺 Whole fleet', 'dr:fleet')
-    .text('🩺 This agent', 'dr:self')
-}
-
-// Shared report prettifier: ANSI-strip + status-glyph swap + pre block.
-// Identical rendering for the in-container and the hostd fleet report.
-function formatDoctorReport(raw: string): string {
-  const trimmed = stripAnsi(raw).trim()
-  if (!trimmed) return 'doctor: no output'
-  const pretty = trimmed
-    .replace(/^( *)✓ /gm, '$1🟢 ')
-    .replace(/^( *)✗ /gm, '$1🔴 ')
-    .replace(/^( *)! /gm, '$1🟡 ')
-  return preBlock(formatSwitchroomOutput(pretty))
-}
-
-// In-container `switchroom doctor` — this agent's own (degraded: no
-// docker socket) view. The original /doctor behaviour, unchanged.
-async function renderSelfDoctor(ctx: Context): Promise<void> {
-  let output: string
-  try { output = switchroomExecCombined(['doctor'], 30000) }
-  catch (err: unknown) { output = (err as any).stdout ?? (err as any).message ?? 'doctor failed' }
-  await switchroomReply(ctx, formatDoctorReport(output), { html: true })
-}
-
-// Whole-fleet `switchroom doctor` via hostd: it runs host-side where
-// the docker socket exists, so it sees every container + singleton
-// instead of the degraded in-container reading. Read-only verb; the
-// daemon independently enforces the admin gate (path-as-identity), so
-// this is the audited boundary even though the gateway only offers
-// the button to admin agents.
-async function renderFleetDoctor(ctx: Context): Promise<void> {
-  const resp = await tryHostdDispatch(getMyAgentName(), {
-    v: 1,
-    op: 'doctor',
-    request_id: hostdRequestId('gw-doctor'),
-  })
-  if (resp === 'not-configured') {
-    await switchroomReply(ctx, '🩺 Whole-fleet doctor needs hostd, which isn’t configured here — showing this agent instead.', { html: true })
-    await renderSelfDoctor(ctx)
-    return
-  }
-  if (resp.result === 'denied') {
-    await switchroomReply(ctx, `🩺 **Whole-fleet doctor denied by hostd:**\n${preBlock(formatSwitchroomOutput(resp.error ?? 'admin required'))}`, { html: true })
-    return
-  }
-  // `completed` (including `switchroom doctor` exit 1 = "found
-  // problems", which the handler classifies as completed) or `error`:
-  // the report on stdout (or the error text) is exactly what the
-  // operator wants surfaced.
-  const body = resp.stdout_tail?.trim() || resp.error || '(no output from hostd doctor)'
-  await switchroomReply(ctx, formatDoctorReport(body), { html: true })
-}
-
-// Ops/info slash commands (/doctor /grant /dangerous /permissions /version
-// /whoami /commands) extracted verbatim to bot-commands-ops-info.ts (#2996
-// Phase 5). Registered here to preserve grammy's in-order registration.
 registerOpsInfoCommands(bot, {
   AGENT_ADMIN,
   isAuthorizedSender,
@@ -27433,10 +28274,6 @@ registerOpsInfoCommands(bot, {
   hasDemoFlag,
   escapeHtmlForTg,
 })
-
-
-// ─── Inline-button handler (permissions) ──────────────────────────────────
-// Handles `perm:(allow|deny|always|asn|asb|back):<id>` — permission request buttons
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
 
@@ -28746,12 +29583,9 @@ bot.on('callback_query:data', async ctx => {
     },
   })
 })
-
-// ─── Inbound message handlers ─────────────────────────────────────────────
 bot.on('message:text', async ctx => {
   await handleInboundCoalesced(ctx, ctx.message.text, undefined)
 })
-
 bot.on('message:photo', async ctx => {
   const caption = ctx.message.caption ?? '(photo)'
   await handleInboundCoalesced(ctx, caption, async () => {
@@ -28793,13 +29627,11 @@ bot.on('message:photo', async ctx => {
     }
   })
 })
-
 bot.on('message:document', async ctx => {
   const doc = ctx.message.document
   const name = safeName(doc.file_name)
   await handleInboundCoalesced(ctx, ctx.message.caption ?? `(document: ${name ?? 'file'})`, undefined, { kind: 'document', file_id: doc.file_id, size: doc.file_size, mime: doc.mime_type, name })
 })
-
 bot.on('message:voice', async ctx => {
   const voice = ctx.message.voice
   // #578 spike: when voice_in is enabled in access.json, download
@@ -28862,159 +29694,19 @@ bot.on('message:voice', async ctx => {
   }
   await handleInboundCoalesced(ctx, ctx.message.caption ?? '(voice message)', undefined, { kind: 'voice', file_id: voice.file_id, size: voice.file_size, mime: voice.mime_type })
 })
-
-/**
- * Download a voice attachment from Telegram and transcribe it via
- * the configured Whisper provider. Returns the transcript text on
- * success, or null on any failure (caller falls back). All errors
- * are logged to stderr but never thrown — voice-in is a UX
- * enhancement, not a critical path.
- */
-/**
- * Filename hint for the multipart body. Telegram voice is OGG/Opus; agents
- * may also attach mp3/m4a/wav which arrive as message:audio. Match the mime
- * so the decoder (Whisper / faster-whisper) gets a usable extension.
- */
-function voiceFilenameExt(mimeType: string | undefined): string {
-  return mimeType?.includes('mp3') ? 'mp3'
-    : mimeType?.includes('m4a') ? 'm4a'
-    : mimeType?.includes('wav') ? 'wav'
-    : 'ogg'
-}
-
-/**
- * Download a Telegram voice attachment into memory. Shared by the cloud
- * (Whisper) and local (sidecar) transcription paths. Returns the bytes on
- * success, or null on any failure (caller falls back). Never throws.
- */
-async function downloadVoiceBytes(fileId: string): Promise<Uint8Array | null> {
-  try {
-    const file = await bot.api.getFile(fileId)
-    if (!file.file_path) {
-      process.stderr.write(`telegram gateway: voice-in: getFile returned no file_path\n`)
-      return null
-    }
-    const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
-    const res = await fetch(url, { signal: AbortSignal.timeout(30_000) })
-    if (!res.ok) {
-      process.stderr.write(`telegram gateway: voice-in: telegram download HTTP ${res.status}\n`)
-      return null
-    }
-    return new Uint8Array(await res.arrayBuffer())
-  } catch (err) {
-    // Sanitize: never let the bot token leak into log lines via the
-    // download URL — strip anything that looks like a token.
-    const msg = (err as Error).message.replace(/bot[\w:-]+/g, 'bot[redacted]')
-    process.stderr.write(`telegram gateway: voice-in: download failed: ${msg}\n`)
-    return null
-  }
-}
-
-/**
- * Transcribe a Telegram voice note via the LOCAL GPU STT sidecar (PR-B2).
- * Used when the host voice verdict is `local`. Resolves the shared-secret
- * token from the vault (voice/sidecar-token), downloads the audio, and
- * POSTs it to the sidecar at loopback (the gateway is network_mode: host).
- * Returns the transcript on success, null on any failure (caller falls
- * back to the legacy "(voice message)" envelope). Never throws.
- */
-async function maybeTranscribeVoiceLocal(
-  fileId: string,
-  mimeType: string | undefined,
-  language: string | undefined,
-): Promise<string | null> {
-  const token = await materializeSidecarToken()
-  if (!token) {
-    // materializeSidecarToken already logged the specific reason.
-    return null
-  }
-
-  const audioBytes = await downloadVoiceBytes(fileId)
-  if (!audioBytes) return null
-
-  const result = await transcribeViaSidecar({
-    token,
-    audio: audioBytes,
-    filename: `voice.${voiceFilenameExt(mimeType)}`,
-    language,
-  })
-
-  if (!result.ok) {
-    process.stderr.write(
-      `telegram gateway: voice-in: local sidecar transcription failed reason=${result.reason}` +
-      (result.detail ? ` detail=${JSON.stringify(result.detail).slice(0, 100)}` : '') +
-      '\n',
-    )
-    return null
-  }
-
-  process.stderr.write(
-    `telegram gateway: voice-in: local sidecar transcribed ${audioBytes.length} bytes in ${result.durationMs}ms ` +
-    `lang=${result.language ?? '?'} audio_s=${result.audioSeconds ?? '?'} chars=${result.text.length}\n`,
-  )
-  return result.text
-}
-
-async function maybeTranscribeVoice(
-  fileId: string,
-  mimeType: string | undefined,
-  language: string | undefined,
-  apiKeyRef: string | undefined,
-): Promise<string | null> {
-  // Resolve the STT key through the vault broker at use-time (PR-A:
-  // voice STT vault-unify). The configured `voice_in.api_key` is a
-  // `vault:<key>` reference (default `vault:openai/api-key`); the
-  // resolved value is held in memory only — never written to disk or
-  // surfaced into the agent prompt. On any failure we return null and
-  // the caller falls back to the legacy "(voice message)" envelope.
-  const apiKey = await materializeVoiceKey({ apiKeyRef })
-  if (!apiKey) {
-    // materializeVoiceKey already logged the specific reason.
-    return null
-  }
-
-  const audioBytes = await downloadVoiceBytes(fileId)
-  if (!audioBytes) return null
-
-  const result = await transcribeViaWhisper({
-    apiKey,
-    audio: audioBytes,
-    filename: `voice.${voiceFilenameExt(mimeType)}`,
-    language,
-  })
-
-  if (!result.ok) {
-    process.stderr.write(
-      `telegram gateway: voice-in: transcription failed reason=${result.reason}` +
-      (result.detail ? ` detail=${JSON.stringify(result.detail).slice(0, 100)}` : '') +
-      '\n',
-    )
-    return null
-  }
-
-  process.stderr.write(
-    `telegram gateway: voice-in: transcribed ${audioBytes.length} bytes in ${result.durationMs}ms ` +
-    `lang=${result.language ?? '?'} audio_s=${result.audioSeconds ?? '?'} chars=${result.text.length}\n`,
-  )
-  return result.text
-}
-
 bot.on('message:audio', async ctx => {
   const audio = ctx.message.audio
   const name = safeName(audio.file_name)
   await handleInboundCoalesced(ctx, ctx.message.caption ?? `(audio: ${safeName(audio.title) ?? name ?? 'audio'})`, undefined, { kind: 'audio', file_id: audio.file_id, size: audio.file_size, mime: audio.mime_type, name })
 })
-
 bot.on('message:video', async ctx => {
   const video = ctx.message.video
   await handleInboundCoalesced(ctx, ctx.message.caption ?? '(video)', undefined, { kind: 'video', file_id: video.file_id, size: video.file_size, mime: video.mime_type, name: safeName(video.file_name) })
 })
-
 bot.on('message:video_note', async ctx => {
   const vn = ctx.message.video_note
   await handleInboundCoalesced(ctx, '(video note)', undefined, { kind: 'video_note', file_id: vn.file_id, size: vn.file_size })
 })
-
 bot.on('message:sticker', async ctx => {
   const sticker = ctx.message.sticker
   // Render to a clearer text envelope so the agent has signal to
@@ -29029,7 +29721,6 @@ bot.on('message:sticker', async ctx => {
   const text = parts.length > 0 ? `(sticker — ${parts.join(' ')})` : '(sticker)'
   await handleInboundCoalesced(ctx, text, undefined, { kind: 'sticker', file_id: sticker.file_id, size: sticker.file_size })
 })
-
 bot.on('message:animation', async ctx => {
   // Animation = Telegram's GIF type (MP4-encoded looping clips).
   // Caption is optional; if present it carries the user's intent
@@ -29048,122 +29739,6 @@ bot.on('message:animation', async ctx => {
     name: safeName(animation.file_name),
   })
 })
-
-// ─── Previously-silent inbound types (#1077) ─────────────────────────────
-// Telegram emits a dozen more `message:*` types that earlier versions of
-// this gateway never registered handlers for. The user would send a
-// contact / location / poll / etc., the gateway would log nothing, the
-// agent would never see the message, and the user would get zero
-// acknowledgement. Each type below now has an explicit decision:
-//
-//   forward         — build a descriptive envelope + flow through
-//                     handleInbound (gate + ack 👀 + bridge IPC).
-//   log-only ack    — gate, react 👀, log; agent is not bothered.
-//   log-only DENY   — refuse with a polite reply, never forward.
-//
-// Decision matrix (see issue #1077):
-//
-//   contact            forward          meaningful user intent
-//   location           forward          agent might map / lookup
-//   venue              forward          same shape as location
-//   poll               forward          could be feedback / polling agent
-//   web_app_data       forward          mini-app result; agent consumes
-//   users_shared       forward          explicit user-share request
-//   chat_shared        forward          same
-//   dice               ack-only         low-info — agent isn't a die
-//   game               ack-only         we aren't a game host
-//   story              ack-only         stories are FYI
-//   paid_media         ack-only + WARN  money flow — operator review
-//   successful_payment ack-only + WARN  money flow — operator review
-//   passport_data      DENY             regulated identity data, unsupported
-//
-// Every handler is wrapped in try/catch so a malformed Telegram payload
-// can never tear down the gateway dispatcher.
-
-/**
- * Gate + 👀-react path for inbound types we acknowledge but don't
- * forward to the agent. Mirrors the gate/drop/pair branches that
- * handleInbound takes, but skips the IPC broadcast.
- */
-async function handleAckOnly(
-  ctx: Context,
-  kind: string,
-  opts: { emoji?: string; warn?: boolean } = {},
-): Promise<void> {
-  try {
-    const result = gate(ctx)
-    if (result.action === 'drop') {
-      logGateDeny(ctx, result.reason)
-      return
-    }
-    if (result.action === 'pair') {
-      const lead = result.isResend ? 'Still pending' : 'Pairing required'
-      await ctx.reply(`${lead} — run in Claude Code:\n\n/telegram:access pair ${result.code}`).catch(() => {})
-      return
-    }
-    const chat_id = String(ctx.chat!.id)
-    const msgId = ctx.message?.message_id
-    if (msgId != null) {
-      void sendReaction(chat_id, msgId, (opts.emoji ?? '👀') as ReactionTypeEmoji['emoji']).catch(() => {})
-    }
-    const prefix = opts.warn ? 'WARN ' : ''
-    process.stderr.write(`telegram gateway: ${prefix}inbound ${kind} ack-only chat_id=${chat_id} from=${ctx.from?.id ?? '?'}\n`)
-  } catch (err) {
-    process.stderr.write(`telegram gateway: ack-only handler error (${kind}): ${(err as Error).message}\n`)
-  }
-}
-
-/**
- * Polite refusal for inbound types we explicitly do not support
- * (passport_data). Sends a reply, NEVER forwards to the agent.
- */
-async function handleRefusal(
-  ctx: Context,
-  kind: string,
-  refusalText: string,
-): Promise<void> {
-  try {
-    const result = gate(ctx)
-    if (result.action === 'drop') {
-      logGateDeny(ctx, result.reason)
-      return
-    }
-    if (result.action === 'pair') {
-      // Pre-pair senders don't get the refusal either — same drop path
-      // as any other unauthorized inbound.
-      return
-    }
-    const chat_id = String(ctx.chat!.id)
-    const msgId = ctx.message?.message_id
-    const messageThreadId = ctx.message?.message_thread_id
-    if (msgId != null) {
-      void sendReaction(chat_id, msgId, '🚫' as ReactionTypeEmoji['emoji']).catch(() => {})
-    }
-    // #1075: thread-id-bearing — swallow on THREAD_NOT_FOUND so a
-    // deleted topic doesn't crash the refusal handler.
-    await swallowingApiCall(
-      () =>
-        bot.api.sendMessage(
-          chat_id,
-          refusalText,
-          messageThreadId != null ? { message_thread_id: messageThreadId } : {},
-        ),
-      {
-        chat_id,
-        verb: 'refusal-handler',
-        ...(messageThreadId != null ? { threadId: messageThreadId } : {}),
-      },
-    )
-    // Loud stderr: this category gets monitored. A passport_data inbound
-    // is unusual enough to warrant operator attention.
-    process.stderr.write(
-      `telegram gateway: SECURITY inbound ${kind} REFUSED chat_id=${chat_id} from=${ctx.from?.id ?? '?'} — agent never saw payload\n`,
-    )
-  } catch (err) {
-    process.stderr.write(`telegram gateway: refusal handler error (${kind}): ${(err as Error).message}\n`)
-  }
-}
-
 bot.on('message:contact', async ctx => {
   try {
     const c = ctx.message.contact
@@ -29179,7 +29754,6 @@ bot.on('message:contact', async ctx => {
     process.stderr.write(`telegram gateway: contact handler error: ${(err as Error).message}\n`)
   }
 })
-
 bot.on('message:location', async ctx => {
   try {
     const loc = ctx.message.location
@@ -29195,7 +29769,6 @@ bot.on('message:location', async ctx => {
     process.stderr.write(`telegram gateway: location handler error: ${(err as Error).message}\n`)
   }
 })
-
 bot.on('message:venue', async ctx => {
   try {
     const v = ctx.message.venue
@@ -29210,7 +29783,6 @@ bot.on('message:venue', async ctx => {
     process.stderr.write(`telegram gateway: venue handler error: ${(err as Error).message}\n`)
   }
 })
-
 bot.on('message:poll', async ctx => {
   try {
     const p = ctx.message.poll
@@ -29227,7 +29799,6 @@ bot.on('message:poll', async ctx => {
     process.stderr.write(`telegram gateway: poll handler error: ${(err as Error).message}\n`)
   }
 })
-
 bot.on('message:web_app_data', async ctx => {
   try {
     const w = ctx.message.web_app_data
@@ -29244,7 +29815,6 @@ bot.on('message:web_app_data', async ctx => {
     process.stderr.write(`telegram gateway: web_app_data handler error: ${(err as Error).message}\n`)
   }
 })
-
 bot.on('message:users_shared', async ctx => {
   try {
     const u = ctx.message.users_shared
@@ -29257,7 +29827,6 @@ bot.on('message:users_shared', async ctx => {
     process.stderr.write(`telegram gateway: users_shared handler error: ${(err as Error).message}\n`)
   }
 })
-
 bot.on('message:chat_shared', async ctx => {
   try {
     const c = ctx.message.chat_shared
@@ -29270,27 +29839,22 @@ bot.on('message:chat_shared', async ctx => {
     process.stderr.write(`telegram gateway: chat_shared handler error: ${(err as Error).message}\n`)
   }
 })
-
 bot.on('message:dice', async ctx => {
   process.stderr.write(`telegram gateway: inbound dice from chat=${ctx.chat?.id ?? '?'}\n`)
   await handleAckOnly(ctx, 'dice', { emoji: '🎲' })
 })
-
 bot.on('message:game', async ctx => {
   process.stderr.write(`telegram gateway: inbound game from chat=${ctx.chat?.id ?? '?'}\n`)
   await handleAckOnly(ctx, 'game')
 })
-
 bot.on('message:story', async ctx => {
   process.stderr.write(`telegram gateway: inbound story from chat=${ctx.chat?.id ?? '?'}\n`)
   await handleAckOnly(ctx, 'story')
 })
-
 bot.on('message:paid_media', async ctx => {
   process.stderr.write(`telegram gateway: inbound paid_media from chat=${ctx.chat?.id ?? '?'}\n`)
   await handleAckOnly(ctx, 'paid_media', { warn: true })
 })
-
 bot.on('message:successful_payment', async ctx => {
   // Money has changed hands — log loudly with the structured fields a
   // reconciliation script would want. Do NOT forward to the agent; an
@@ -29309,7 +29873,6 @@ bot.on('message:successful_payment', async ctx => {
   }
   await handleAckOnly(ctx, 'successful_payment', { warn: true })
 })
-
 bot.on('message:passport_data', async ctx => {
   // Telegram Passport is a regulated identity-document flow. Forwarding
   // the encrypted credentials to an LLM-driven agent would be reckless;
@@ -29323,118 +29886,12 @@ bot.on('message:passport_data', async ctx => {
     "Sorry, I don't handle Telegram Passport data. Please share identity documents through a supported channel — your agent does not process encrypted Passport payloads.",
   )
 })
-
-// ─── Checklist service message handlers ──────────────────────────────────
-// Telegram emits `checklist_tasks_done` and `checklist_tasks_added` service
-// messages when users tick or add tasks in a native checklist. These arrive
-// as part of the `message` update type, so no extra `allowed_updates` config
-// is required — bots already receive them.
-//
-// We route them to the agent as a new channel event with
-// kind="checklist_task_changed" so the agent can react to user actions on
-// a checklist it sent.
-
-type ChecklistTaskUpdate = {
-  message_checklist?: {
-    title?: string
-    tasks?: Array<{ id?: number; text?: string; is_completed?: boolean }>
-  }
-  checklist_tasks_done?: Array<{ id?: number; user?: { id?: number; username?: string }; done?: boolean }>
-  checklist_tasks_added?: Array<{ id?: number; text?: string; user?: { id?: number; username?: string } }>
-}
-
-function handleChecklistUpdate(
-  ctx: Context,
-  kind: 'checklist_tasks_done' | 'checklist_tasks_added',
-): void {
-  try {
-    const msg = ctx.message as (typeof ctx.message & ChecklistTaskUpdate) | undefined
-    if (!msg) return
-
-    const chat = ctx.chat
-    if (!chat) return
-
-    const chat_id = String(chat.id)
-    const access = loadAccess()
-
-    // Only notify if this chat is allowlisted — same guard as inbound user messages.
-    // Closes #472 finding #13. Pre-fix the `&& access.allowFrom.length > 0`
-    // tail made this fail-OPEN when the allowlist was empty: every chat's
-    // checklist tasks would forward to the agent. Sibling guards (the
-    // inbound-message gate at line ~588 and the operator-event broadcast
-    // at line ~1221) are both fail-closed for empty allowlists. The
-    // empty-allowlist case is the most likely state for a misconfiguration
-    // (e.g. /unpair just ran), so fail-OPEN is the worst default.
-    if (!access.allowFrom.includes(chat_id)) return
-
-    const message_id = String(msg.message_id)
-    const ts = msg.date ?? Math.floor(Date.now() / 1000)
-
-    // Extract task updates depending on service message type
-    const tasksDone = msg.checklist_tasks_done ?? []
-    const tasksAdded = msg.checklist_tasks_added ?? []
-    const allTasks = kind === 'checklist_tasks_done' ? tasksDone : tasksAdded
-
-    // Build per-task channel events and broadcast each to connected bridges.
-    for (const task of allTasks) {
-      const taskId = task.id != null ? String(task.id) : '?'
-      const user = (task.user as { username?: string; id?: number } | undefined)
-      const userName = user?.username ?? (user?.id != null ? String(user.id) : 'unknown')
-      const state = kind === 'checklist_tasks_done'
-        ? ((task as { done?: boolean }).done === false ? 'undone' : 'done')
-        : 'added'
-
-      const inboundMsg: InboundMessage = {
-        type: 'inbound',
-        chatId: chat_id,
-        messageId: Number(message_id),
-        user: userName,
-        userId: user?.id ?? 0,
-        ts,
-        text: `(checklist task ${state}: id=${taskId})`,
-        meta: {
-          chat_id,
-          message_id,
-          kind: 'checklist_task_changed',
-          task_id: taskId,
-          state,
-          user: userName,
-          user_id: user?.id != null ? String(user.id) : '0',
-          ts: new Date(ts * 1000).toISOString(),
-        },
-      }
-      // allow-broadcast: informational checklist task notification, not turn-driving
-      ipcServer.broadcast(inboundMsg)
-      process.stderr.write(
-        `telegram gateway: checklist ${kind}: chat_id=${chat_id} message_id=${message_id} task_id=${taskId} state=${state} user=${userName}\n`,
-      )
-    }
-  } catch (err) {
-    process.stderr.write(`telegram gateway: checklist handler error (${kind}): ${err}\n`)
-  }
-}
-
 bot.on('message:checklist_tasks_done' as Parameters<typeof bot.on>[0], (ctx) => {
   handleChecklistUpdate(ctx as unknown as Context, 'checklist_tasks_done')
 })
-
 bot.on('message:checklist_tasks_added' as Parameters<typeof bot.on>[0], (ctx) => {
   handleChecklistUpdate(ctx as unknown as Context, 'checklist_tasks_added')
 })
-
-// Suppress the "pinned a message" service message Telegram inserts when OUR
-// silent status-pin fires. The pin call passes `disable_notification: true`,
-// which kills the PUSH notification but NOT the in-chat service message — so
-// delete that service message as it lands, but ONLY for pins we own (tracked
-// in `statusPinState`). Manual/operator pins are never silent and are never
-// touched. Only silent status pins reach here as an OUR-pin match, so the
-// ownership check is the guard.
-//
-// Race tolerance: the service update can arrive before `reconcileStatusPin`
-// has stored the new PinState (the pin API call resolves, Telegram emits the
-// service message, and only then does the reconcile write the Map). A single
-// short retry covers that window; if it's still not one of ours, we leave the
-// service message alone.
 bot.on('message:pinned_message', async ctx => {
   const pinnedId = ctx.msg.pinned_message?.message_id
   if (pinnedId == null) return
@@ -29481,454 +29938,20 @@ bot.on('message:pinned_message', async ctx => {
     )
   }
 })
-
-// ─── Terminal catch-all for unhandled message content types (#3300) ───────
-//
-// MUST stay registered LAST among the `message`/`message:*` handlers.
-//
-// grammy's `bot.on('message:<type>')` is filtering middleware: internally
-// `on → filter(pred, handler) → branch(pred, handler, pass)`. When the filter
-// matches, grammy runs the leaf handler, which never calls `next()`, so the
-// chain STOPS — a specific `message:text`/`:photo`/… match above consumes the
-// update and this catch-all never sees it (specific handler always wins; no
-// "already handled" guard is needed, the ordering is the guarantee). When NO
-// specific `message:*` filter matches, grammy ^1.44 would otherwise SILENTLY
-// drop the update — no log, no ack, no history row (the zero-observability
-// failure class behind the 2026-07-16 dropped-message incident: message_id
-// 19090 allocated in the DM with no gateway trace at all). This handler
-// closes the class: every inbound `message` is either delivered as a turn or
-// explicitly logged (known-noise service messages → log-only, no turn — see
-// SERVICE_NOISE_KEYS), so nothing is silently dropped at this layer again.
-//
-// Access gating is NOT re-implemented here — routing through
-// handleInboundCoalesced (the exact path `message:text` uses) applies the
-// same gate()/allowFrom checks, and parseForwardOrigin runs inside it so
-// forwarded-message provenance is preserved.
 installUnhandledMessageCatchAll(
   bot,
   (ctx, text) => handleInboundCoalesced(ctx, text, undefined),
   line => process.stderr.write(line),
 )
-
-// ─── Reaction-trigger runtime state (#1074) ──────────────────────────────
-//
-// Bot-message reactions in the configured allowlist trigger a synthetic
-// inbound turn (`<channel source="reaction">`) — mirrors the cron-fold-in
-// dispatch path. Three pieces of mutable state, all module-local:
-//
-//   - `reactionsCfg` — cascade-resolved config slice with built-in
-//     defaults; lazy-initialized on first reaction event.
-//   - `reactionHourCap` — in-memory rolling-1-hour counter per chat.
-//   - `reactionDebounce` — per-chat debounce buffer that batches rapid
-//     reactions into a single delivered synthetic.
-//
-// The persistence path (`recordReaction`) is independent — reactions
-// are persisted regardless of trigger outcome. This is the v1 contract
-// pinned by the existing UAT (`reactions-dm.test.ts`) and by tests
-// that rely on `get_recent_messages` surfacing user_reaction.
-let reactionsCfg: ReactionsResolvedConfig | null = null
-let reactionHourCap: HourCap | null = null
-let reactionDebounce: DebounceBuffer | null = null
-// Bot's own Telegram user_id; populated at startup from getMe(). Kept
-// for parity with botUsername; not currently used for authorship
-// detection on reactions (history.role is the primary signal).
-let botUserId = 0
-
-function getReactionsConfig(): ReactionsResolvedConfig {
-  if (reactionsCfg) return reactionsCfg
-  let raw: unknown = undefined
-  try {
-    const cfg = loadSwitchroomConfig()
-    const agentName = process.env.SWITCHROOM_AGENT_NAME
-    if (agentName) {
-      const rawAgent = cfg.agents?.[agentName]
-      if (rawAgent) {
-        const resolved = resolveAgentConfig(cfg.defaults, cfg.profiles, rawAgent)
-        raw = (resolved as { reactions?: unknown }).reactions
-      }
-    }
-  } catch (err) {
-    process.stderr.write(
-      `telegram gateway: reactions: config load failed, falling back to defaults: ${(err as Error).message}\n`,
-    )
-  }
-  reactionsCfg = resolveReactionsConfig(
-    raw as Parameters<typeof resolveReactionsConfig>[0] ?? null,
-  )
-  return reactionsCfg
-}
-
-function getReactionHourCap(): HourCap {
-  if (!reactionHourCap) {
-    reactionHourCap = new HourCap(getReactionsConfig().perHourCap)
-  }
-  return reactionHourCap
-}
-
-function getReactionDebounce(): DebounceBuffer {
-  if (!reactionDebounce) {
-    reactionDebounce = new DebounceBuffer(
-      getReactionsConfig().debounceMs,
-      flushReactionBatch,
-    )
-  }
-  return reactionDebounce
-}
-
-// ─── reaction_dispatch (#2291) ─────────────────────────────────────────────
-// Event-driven dispatch of ANY qualifying message_reaction as an inbound
-// `<channel event="reaction">` turn. Default OFF; independent of the
-// bot-authored `reactions` feedback path above.
-let reactionDispatchCfg: ReactionDispatchResolvedConfig | null = null
-
-function getReactionDispatchConfig(): ReactionDispatchResolvedConfig {
-  if (reactionDispatchCfg) return reactionDispatchCfg
-  let raw: unknown = undefined
-  try {
-    const cfg = loadSwitchroomConfig()
-    const agentName = process.env.SWITCHROOM_AGENT_NAME
-    if (agentName) {
-      const rawAgent = cfg.agents?.[agentName]
-      if (rawAgent) {
-        const resolved = resolveAgentConfig(cfg.defaults, cfg.profiles, rawAgent)
-        raw = (resolved as { reaction_dispatch?: unknown }).reaction_dispatch
-      }
-    }
-  } catch (err) {
-    process.stderr.write(
-      `telegram gateway: reaction_dispatch: config load failed, defaulting OFF: ${(err as Error).message}\n`,
-    )
-  }
-  reactionDispatchCfg = resolveReactionDispatchConfig(
-    raw as Parameters<typeof resolveReactionDispatchConfig>[0] ?? null,
-  )
-  return reactionDispatchCfg
-}
-
-/**
- * Event-driven reaction → inbound turn (#2291). Called from the
- * message_reaction handler for add/change events. Filters by the
- * `reaction_dispatch` emoji allowlist (default empty ⇒ no-op), looks up
- * the reacted message's text from the SQLite history buffer (graceful on
- * miss), and injects an inbound shaped like a button-callback event via
- * the same ipcServer.sendToAgent path cron uses. Removals never reach
- * here (the caller filters them).
- */
-function maybeDispatchReaction(args: {
-  chatId: string
-  messageId: number
-  emoji: string | null
-  action: 'add' | 'change'
-  user: string
-  userId: number
-  threadId?: number
-}): void {
-  const cfg = getReactionDispatchConfig()
-  const decision = evaluateReactionDispatch(cfg, { emoji: args.emoji, action: args.action })
-  if (!decision.ok) {
-    if (decision.reason === 'emoji_not_in_allowlist' && cfg.enabled) {
-      process.stderr.write(
-        `telegram gateway: reaction_dispatch.reject reason=allowlist_miss emoji=${args.emoji} chat=${args.chatId}\n`,
-      )
-    }
-    return
-  }
-
-  const agentName = process.env.SWITCHROOM_AGENT_NAME
-  if (!agentName) {
-    process.stderr.write(
-      `telegram gateway: reaction_dispatch: skipped — SWITCHROOM_AGENT_NAME unset\n`,
-    )
-    return
-  }
-
-  // History lookup is best-effort; a miss yields an empty body. The
-  // envelope still carries emoji / message_id / chat_id / user.
-  let reactedText = ''
-  if (HISTORY_ENABLED) {
-    try {
-      const row = lookupMessageRoleAndText(args.chatId, args.messageId)
-      reactedText = row?.text ?? ''
-    } catch (err) {
-      process.stderr.write(
-        `telegram gateway: reaction_dispatch: history lookup failed: ${err}\n`,
-      )
-    }
-  }
-
-  const { text, meta } = buildReactionDispatchInbound({
-    emoji: args.emoji!,
-    chatId: args.chatId,
-    messageId: args.messageId,
-    user: args.user,
-    userId: args.userId,
-    reactedText,
-    ...(typeof args.threadId === 'number' ? { threadId: args.threadId } : {}),
-  })
-
-  const ts = Date.now()
-  const inbound: InboundMessage = {
-    type: 'inbound',
-    chatId: args.chatId,
-    ...(typeof args.threadId === 'number' ? { threadId: args.threadId } : {}),
-    messageId: ts,
-    user: args.user,
-    userId: args.userId,
-    ts,
-    text,
-    meta,
-  }
-  const delivered = ipcServer.sendToAgent(agentName, inbound)
-  if (delivered) markClaudeBusyForInbound(inbound)
-  process.stderr.write(
-    `telegram gateway: reaction_dispatch agent=${agentName} chat=${args.chatId} ` +
-    `emoji=${args.emoji} message_id=${args.messageId} delivered=${delivered}\n`,
-  )
-  if (!delivered) {
-    pendingInboundBuffer.push(agentName, inbound)
-  }
-}
-
-/**
- * Dispatch a debounce-flushed batch as a synthetic InboundMessage via
- * the same `ipcServer.sendToAgent` path the cron-fold-in uses.
- * Discriminated by `meta.source="reaction"`. Carries the bot-side
- * message preview (capped at PREVIEW_MAX_CHARS in
- * `reaction-trigger.ts`) — never the bot token, never vault material.
- */
-function flushReactionBatch(batch: ReactionBatch): void {
-  const agentName = process.env.SWITCHROOM_AGENT_NAME
-  if (!agentName) {
-    process.stderr.write(
-      `telegram gateway: reactions: dispatch skipped — SWITCHROOM_AGENT_NAME unset\n`,
-    )
-    return
-  }
-  // Use the latest reaction's metadata for the wire envelope; the
-  // batched listing lives inside `text` + `meta.count`.
-  const head = batch.reactions[batch.reactions.length - 1]!
-  const text = buildReactionInboundText(batch)
-  const meta = buildReactionInboundMeta(batch)
-  const ts = Date.now()
-  const inbound: InboundMessage = {
-    type: 'inbound',
-    chatId: String(batch.chatId),
-    ...(head.threadId !== undefined ? { threadId: head.threadId } : {}),
-    // Synthetic id — same convention cron uses. The bridge only uses
-    // messageId for telegram_reply context; reaction-synthesized turns
-    // are not quote-replies, so any monotonic value works.
-    messageId: ts,
-    user: head.user,
-    userId: head.userId,
-    ts,
-    text,
-    meta,
-  }
-  // #2094 finding 3 — route the reaction flush through the SAME #1556
-  // decideInboundDelivery gate every other synthetic inbound uses (via
-  // deliverResumeSyntheticOrBuffer), instead of a raw ipcServer.sendToAgent.
-  // A reaction that lands WHILE a turn is in flight was previously fired
-  // mid-turn — the bridge typed it into the CLI composer where it stranded
-  // by the turn-completion race (the #1556 composer wedge). Now a mid-turn
-  // reaction buffers-until-idle (the turn-complete hook + idle-drain timer
-  // flush pendingInboundBuffer the instant claude goes idle, landing cleanly
-  // as a fresh turn); an idle reaction delivers now, buffering only on a
-  // genuine bridge-offline miss — the #1150 buffer-on-failure guarantee,
-  // preserved inside the helper.
-  const delivered = deliverResumeSyntheticOrBuffer(agentName, inbound)
-  process.stderr.write(
-    `telegram gateway: reactions.dispatch agent=${agentName} chat=${batch.chatId} ` +
-    `count=${batch.reactions.length} batched=${batch.batched} delivered=${delivered}\n`,
-  )
-}
-
-// ─── Inbound message_reaction handler ────────────────────────────────────
-// Telegram delivers MessageReactionUpdated events when a user adds, changes,
-// or removes an emoji reaction from a bot message. We persist the current
-// reaction to the SQLite history row so get_recent_messages can surface it,
-// AND (since #1074) optionally forward qualifying reactions to the agent
-// as synthetic inbound turns.
-//
-// Only emoji reactions are handled for v1 — custom emoji are silently skipped.
-// Requires "message_reaction" in allowed_updates (see run() call below).
 bot.on('message_reaction' as Parameters<typeof bot.on>[0], (ctx) => {
   // Capture outer-scope handle so the async helper has stable shape.
   void handleMessageReaction(ctx as unknown as Context)
 })
-
-async function handleMessageReaction(ctx: Context): Promise<void> {
-  try {
-    // The payload is typed loosely via grammy's Context; cast to the
-    // Bot API shape we need (MessageReactionUpdated).
-    const update = (ctx as unknown as {
-      update: {
-        message_reaction?: {
-          chat: { id: number }
-          message_id: number
-          message_thread_id?: number
-          user?: { id: number; first_name?: string; username?: string }
-          old_reaction: Array<{ type: string; emoji?: string }>
-          new_reaction: Array<{ type: string; emoji?: string }>
-        }
-      }
-    }).update.message_reaction
-    if (!update) return
-
-    const chat_id = String(update.chat.id)
-    const message_id = update.message_id
-    const oldReaction = update.old_reaction ?? []
-    const newReaction = update.new_reaction ?? []
-
-    // Both empty — defensive no-op.
-    if (oldReaction.length === 0 && newReaction.length === 0) return
-
-    // Determine action and emoji for logging / storage.
-    let action: 'add' | 'remove' | 'change'
-    let emoji: string | null
-
-    if (oldReaction.length === 0 && newReaction.length > 0) {
-      action = 'add'
-      const first = newReaction.find(r => r.type === 'emoji')
-      if (!first) return // custom emoji only — skip
-      emoji = first.emoji ?? null
-    } else if (oldReaction.length > 0 && newReaction.length === 0) {
-      action = 'remove'
-      emoji = null
-    } else {
-      action = 'change'
-      const first = newReaction.find(r => r.type === 'emoji')
-      if (!first) return // custom emoji only — skip
-      emoji = first.emoji ?? null
-    }
-
-    if (HISTORY_ENABLED) {
-      try {
-        recordReaction({ chat_id, message_id, emoji })
-      } catch (err) {
-        process.stderr.write(`telegram gateway: history recordReaction failed: ${err}\n`)
-      }
-    }
-
-    process.stderr.write(
-      `telegram gateway: reaction: chatId=${chat_id} messageId=${message_id} emoji=${emoji ?? '(none)'} action=${action}\n`,
-    )
-
-    // ─── Trigger predicate (#1074) ───────────────────────────────────────
-    //
-    // Only `add` / `change` carry a NEW emoji; `remove` is log-only.
-    // From here on we ignore failures rather than reject (the persist
-    // path above is the v1 contract; trigger is best-effort).
-    if (action === 'remove' || emoji === null) return
-    const reacter = update.user
-    if (!reacter) return // anonymous group-channel reactions — not user-attributable
-
-    const reacterName = reacter.first_name ?? reacter.username ?? String(reacter.id)
-
-    // ─── reaction_dispatch (#2291) ───────────────────────────────────────
-    // Event-driven dispatch of ANY qualifying reaction as a button-style
-    // inbound turn. Independent of (and runs before) the bot-authored
-    // `reactions` feedback path below; both may fire for one reaction.
-    maybeDispatchReaction({
-      chatId: chat_id,
-      messageId: message_id,
-      emoji,
-      action,
-      user: reacterName,
-      userId: reacter.id,
-      ...(typeof update.message_thread_id === 'number'
-        ? { threadId: update.message_thread_id }
-        : {}),
-    })
-
-    if (!HISTORY_ENABLED) return // need history to identify bot-authored target
-
-    const cfg = getReactionsConfig()
-    if (!cfg.enabled) return
-
-    // Resolve target authorship + preview text from local history.
-    // If the row is missing (reacted-to message predates retention,
-    // history disabled mid-run, or was reaped), we cannot tell and
-    // therefore must NOT trigger (fail-closed on authorship).
-    const row = lookupMessageRoleAndText(chat_id, message_id)
-    const botAuthored = row?.role === 'assistant'
-    const preview = truncatePreview(row?.text ?? '')
-
-    const decision = evaluateTriggerCandidate(cfg, {
-      chatId: update.chat.id,
-      messageId: message_id,
-      emoji,
-      action,
-      botAuthored,
-    })
-    if (!decision.ok) {
-      // Only log the bot-authored allowlist-miss case; other rejections
-      // (disabled / not-bot-authored / no-emoji) are not interesting
-      // events and would spam stderr in groups where the bot has
-      // never spoken.
-      if (decision.reason === 'emoji_not_in_allowlist' && botAuthored) {
-        process.stderr.write(
-          `telegram gateway: reactions.reject reason=allowlist_miss emoji=${emoji} chat=${chat_id}\n`,
-        )
-      }
-      return
-    }
-
-    // ─── Group admin check (fail-closed on lookup failure) ──────────────
-    if (cfg.groupAdminOnly && isGroupChat(update.chat.id)) {
-      let isAdmin = false
-      try {
-        const member = await robustApiCall(
-          () => bot.api.getChatMember(update.chat.id, reacter.id),
-          { chat_id, verb: 'getChatMember' },
-        )
-        const status = (member as { status?: string } | undefined)?.status
-        isAdmin = status === 'creator' || status === 'administrator'
-      } catch (err) {
-        process.stderr.write(
-          `telegram gateway: reactions.admin_lookup_failed chat=${chat_id} ` +
-          `user=${reacter.id} err=${(err as Error).message}\n`,
-        )
-        isAdmin = false
-      }
-      if (!isAdmin) {
-        process.stderr.write(
-          `telegram gateway: reactions.reject reason=group_non_admin chat=${chat_id} user=${reacter.id}\n`,
-        )
-        return
-      }
-    }
-
-    // ─── Hour cap ───────────────────────────────────────────────────────
-    if (!getReactionHourCap().tryConsume(chat_id)) {
-      process.stderr.write(
-        `telegram gateway: reactions.reject reason=hour_cap_exhausted chat=${chat_id} cap=${cfg.perHourCap}\n`,
-      )
-      return
-    }
-
-    // ─── Enqueue into the per-chat debounce buffer ──────────────────────
-    const pending: PendingReaction = {
-      targetMessageId: message_id,
-      emoji,
-      action,
-      ts: Date.now(),
-      preview,
-      userId: reacter.id,
-      user: reacterName,
-      ...(typeof update.message_thread_id === 'number'
-        ? { threadId: update.message_thread_id }
-        : {}),
-    }
-    getReactionDebounce().enqueue(update.chat.id, pending)
-  } catch (err) {
-    process.stderr.write(`telegram gateway: message_reaction handler error: ${err}\n`)
-  }
-}
-
-// ─── Error handler ────────────────────────────────────────────────────────
 bot.catch(err => {
   process.stderr.write(`telegram gateway: handler error (polling continues): ${err.error}\n`)
 })
+}
+registerGatewayHandlers(bot, {})
 
 // ─── Shutdown ─────────────────────────────────────────────────────────────
 //
