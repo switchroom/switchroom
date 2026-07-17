@@ -2399,6 +2399,13 @@ async function deliverAnswer(args: {
   text: string
   turnId: string
   cardMessageId: number | null
+  /** S4 (fable red-team 2026-07-17) — the inbound message this turn answers
+   *  (`turn.sourceMessageId`). When present, the FIRST chunk is sent as a
+   *  native quote-reply so the flushed answer anchors to the user's question,
+   *  matching `executeReply`'s default. `allow_sending_without_reply` keeps
+   *  the send alive if the user deleted their message. Null for synthesized
+   *  turns (cron/handback) — those send bare, as before. */
+  replyToMessageId: number | null
 }): Promise<{ sentIds: number[]; chunkCount: number; delivered: boolean; exhausted: boolean }> {
   const { chatId, turnId } = args
   // Inject visible blank-line spacers into `\n\n` gaps, then split — exactly as
@@ -2447,8 +2454,17 @@ async function deliverAnswer(args: {
   // landed message id(s) (a length-resplit chunk may land >1); throws on an
   // unrecoverable send failure so the retry orchestrator can resume.
   let liveThreadId = args.threadId
-  const sendChunk = async (_chunkIndex: number, text: string): Promise<number[]> => {
+  const sendChunk = async (chunkIndex: number, text: string): Promise<number[]> => {
     const chunkIds: number[] = []
+    // S4 — quote-anchor the FIRST chunk only (chunkIndex is the OVERALL chunk
+    // index across the retry orchestrator; each sendReplyChunks call here
+    // carries exactly one chunk, so the inner index is always 0). Mirrors
+    // executeReply's first-chunk-only default. The ledger resumes retries at
+    // the first UNSENT chunk, so chunk 0 keeps its anchor across retries.
+    const anchor =
+      chunkIndex === 0 && args.replyToMessageId != null
+        ? { reply_parameters: { message_id: args.replyToMessageId, allow_sending_without_reply: true } }
+        : {}
     const res = await sendReplyChunks(deps, {
       chatId,
       chunks: [text],
@@ -2458,6 +2474,7 @@ async function deliverAnswer(args: {
       previewMessageId: null,
       sentIds: chunkIds,
       buildSendOpts: (_i, _isLast, tid) => ({
+        ...anchor,
         ...(tid != null ? { message_thread_id: tid } : {}),
         link_preview_options: { is_disabled: true },
       }),
@@ -18097,6 +18114,16 @@ function handleSessionEvent(ev: SessionEvent): void {
       // — read `turn` once, don't re-read currentTurn after any await.
       const turn = currentTurn
       if (turn == null) return
+      // S2 fix (fable red-team 2026-07-17) — a thinking block means the model
+      // is still working, not quiescent. Without this, "prose → >1s thinking
+      // pause → trailing NO_REPLY" let the answer-ready quiescence timer fire
+      // mid-pause and deliver a turn the model was about to mark silent
+      // (#2053 in miniature). Re-arm (not just clear): `reset()` re-verifies
+      // via `decideTurnFlush` and pushes the debounce out by a fresh window,
+      // so the trailing sentinel gets to land before any fire; if no further
+      // text arrives, the flush still fires one window after the LAST
+      // thinking event — the fast path is deferred, never lost.
+      resetAnswerReadyFlushTimeout()
       const ctrl = activeStatusReactions.get(statusKey(turn.sessionChatId, turn.sessionThreadId))
       if (ctrl) ctrl.setThinking()
       return
@@ -19208,10 +19235,28 @@ function handleSessionEvent(ev: SessionEvent): void {
           await new Promise<void>(resolve => setTimeout(resolve, 500))
           if (HISTORY_ENABLED) {
             try {
-              const { getRecentOutboundCount } = await import('../history.js')
-              const recentCount = getRecentOutboundCount(backstopChatId, 2)
-              if (recentCount > 0) {
-                process.stderr.write(`telegram gateway: turn-flush suppressed — reply tool sent ${recentCount} message(s) within 2s\n`)
+              // S1 fix (fable red-team 2026-07-17) — the old predicate here,
+              // `getRecentOutboundCount(chatId, 2) > 0`, counted ANY assistant
+              // row in the WHOLE chat: a worker `progress_update`, a command
+              // ack / restart notice, or a reply in a DIFFERENT forum topic all
+              // suppressed the flush and (worse) CLOSED the obligation below —
+              // silently dropping the user's real answer. The scoped predicate
+              // (same thread, length ≥ min(answerLength, 200)) lives in
+              // `turn-flush-suppression.ts`; `hasOutboundDeliveredSince` is the
+              // durable oracle whose thread/length semantics history tests pin.
+              const { hasOutboundDeliveredSince } = await import('../history.js')
+              const { shouldSuppressTurnFlush } = await import('./turn-flush-suppression.js')
+              const suppress = shouldSuppressTurnFlush(
+                { hasSubstantiveOutbound: hasOutboundDeliveredSince },
+                {
+                  chatId: backstopChatId,
+                  threadId: backstopThreadId ?? null,
+                  answerLength: capturedText.length,
+                  nowMs: Date.now(),
+                },
+              )
+              if (suppress) {
+                process.stderr.write(`telegram gateway: turn-flush suppressed — a substantive same-thread outbound landed within 2s\n`)
                 // Do NOT finalize the status reaction here. As of #1713
                 // the reaction is only finalized by the `turn_end` IPC
                 // handler — mid-turn delivery proofs (local history,
@@ -19223,19 +19268,23 @@ function handleSessionEvent(ev: SessionEvent): void {
                 // here re-fired on an already-cleared key WITHOUT `endingTurn`,
                 // emitting an inconsistent shadow trace. Removed.
                 //
-                // PR B — the reply tool already delivered this turn's answer, so
-                // the flush was legitimately suppressed. Emit the deferred record
-                // as 'suppressed' (→ `complete`, since the reply path set
-                // finalAnswerDelivered). Not a failure.
+                // PR B — a substantive same-thread outbound just delivered this
+                // turn's answer, so the flush was legitimately suppressed. Emit
+                // the deferred record as 'suppressed'. Not a failure.
                 if (backstopTurnEndedAt != null) {
                   turn.deliveryOutcome = 'suppressed'
-                  // #3276 finding 1 — obligation close was DEFERRED out of
-                  // endCurrentTurnAtomic. The reply tool already delivered this
-                  // turn's answer (recentCount>0), so resolve it as satisfied
-                  // here (idempotent with the reply path's own close). Without
-                  // this the deferred obligation would linger OPEN and spuriously
-                  // re-present a turn that WAS answered.
-                  if (OBLIGATION_LEDGER_ENABLED) obligationLedger.close(turn.turnId)
+                  // S1 fix — do NOT close the obligation here. When the recent
+                  // outbound is genuinely this turn's answer (a raced reply /
+                  // stream materialization), the reply path closes its own
+                  // obligation idempotently; when the suppression is a false
+                  // positive (a long same-thread non-answer inside the 2s
+                  // window — the residual the scoped predicate can't
+                  // discriminate), closing here made the drop PERMANENT.
+                  // Leaving it open lets the obligation sweep arbitrate: it
+                  // stands down silently if a substantive outbound answered
+                  // the user, and re-presents otherwise. `noteTurnEnded` arms
+                  // the liveness floor exactly as the send-failed path does.
+                  if (OBLIGATION_LEDGER_ENABLED) obligationLedger.noteTurnEnded(turn.turnId, Date.now())
                   emitTurnRecord(turn, backstopTurnEndedAt)
                 }
                 return
@@ -19283,6 +19332,9 @@ function handleSessionEvent(ev: SessionEvent): void {
               text: capturedText,
               turnId: turn.turnId,
               cardMessageId: backstopCardMessageId,
+              // S4 — anchor the flushed answer to the inbound it answers
+              // (null for synthesized turns, which send bare as before).
+              replyToMessageId: turn.sourceMessageId,
             })
             sentIds = delivery.sentIds
             chunkCount = delivery.chunkCount
