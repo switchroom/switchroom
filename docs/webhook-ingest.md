@@ -156,7 +156,11 @@ server (the other half is the dashboard). It can run two ways:
   stop && disable switchroom-web.service`. To keep the container refreshed
   by `switchroom update`, set `web_service.managed: true` in
   `switchroom.yaml` (default `false`, so existing systemd installs are
-  untouched).
+  untouched). If another service owns port 8080 on the host, set
+  `web_service.port` in `switchroom.yaml` — `webd install` (and the
+  update refresh) render the container command with that port, so the
+  custom port survives compose regeneration. Point the cloudflared
+  tunnel and `tailscale serve` at the same port.
 
 ## Out of scope
 
