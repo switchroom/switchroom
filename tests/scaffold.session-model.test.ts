@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, chmodSync, rmSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -89,9 +89,15 @@ describe("scaffoldAgent: session-model consume-once boot resolver (start.sh)", (
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  /** Run the extracted block with a given _LITELLM_OK, echo the effective model. */
+  /**
+   * Run the extracted block with a given _LITELLM_OK, echo the effective
+   * model. SWITCHROOM_CONFIG is unset so the live-config resolution branch
+   * is skipped and the bake seeds $_EFFECTIVE_MODEL — the carrier contract
+   * under test here is independent of where the configured default came
+   * from. The live-read branch has its own suite below.
+   */
   function runBlock(litellmOk: string): string {
-    const script = `set -e\n_LITELLM_OK=${JSON.stringify(litellmOk)}\n${block}\necho "EFFECTIVE=$_EFFECTIVE_MODEL"`;
+    const script = `set -e\nunset SWITCHROOM_CONFIG\n_LITELLM_OK=${JSON.stringify(litellmOk)}\n${block}\necho "EFFECTIVE=$_EFFECTIVE_MODEL"`;
     const out = execFileSync("bash", ["-c", script], { encoding: "utf-8" });
     const m = out.match(/EFFECTIVE=(.*)/);
     return m ? m[1].trim() : "";
@@ -102,6 +108,7 @@ describe("scaffoldAgent: session-model consume-once boot resolver (start.sh)", (
   function runBlockRouting(litellmOk: string): { effective: string; baseUrl: string } {
     const script = [
       "set -e",
+      "unset SWITCHROOM_CONFIG",
       `export ANTHROPIC_BASE_URL=${JSON.stringify(PASSTHROUGH)}`,
       `export SWITCHROOM_LITELLM_BASE=${JSON.stringify(ROUTER_ROOT)}`,
       `_LITELLM_OK=${JSON.stringify(litellmOk)}`,
@@ -154,8 +161,9 @@ describe("scaffoldAgent: session-model consume-once boot resolver (start.sh)", (
     // clears it on a healthy boot.
     expect(block).toMatch(/cat[^\n]*\.session-model-boot-attempts/);
     expect(block).toContain("_SM_MAX_ATTEMPTS");
-    // modelQ is assigned BARE (already shell-quoted by the scaffold).
-    expect(block).toContain("_EFFECTIVE_MODEL='claude-sonnet-5'");
+    // modelQ is assigned BARE (already shell-quoted by the scaffold), as the
+    // last-ditch fallback seed for the live-config resolution.
+    expect(block).toContain("_BAKED_MODEL='claude-sonnet-5'");
     const startSh = readFileSync(join(agentDir, "start.sh"), "utf-8");
     expect(startSh).toContain('--model "$_EFFECTIVE_MODEL"');
     expect(startSh).not.toContain("--model {{{modelQ}}}");
@@ -427,7 +435,7 @@ describe("scaffoldAgent: session-model consume-once boot resolver (start.sh)", (
     return `${JSON.stringify({ level, configuredDefaultAtWrite: cfg, ts })}\n`;
   }
   function runBlockEffort(): { model: string; effortArg: string } {
-    const script = `set -e\n_LITELLM_OK=1\n${block}\necho "EFFECTIVE=$_EFFECTIVE_MODEL"\necho "EFFORTARG=$_EFFORT_ARG"`;
+    const script = `set -e\nunset SWITCHROOM_CONFIG\n_LITELLM_OK=1\n${block}\necho "EFFECTIVE=$_EFFECTIVE_MODEL"\necho "EFFORTARG=$_EFFORT_ARG"`;
     const out = execFileSync("bash", ["-c", script], { encoding: "utf-8" });
     return {
       model: out.match(/EFFECTIVE=(.*)/)?.[1].trim() ?? "",
@@ -517,9 +525,10 @@ describe("scaffoldAgent: configured-default sr-* model (no override)", () => {
   it("LiteLLM up → repoints to router root", () => {
     const { tmp, block } = scaffoldSrDefault("switchroom-session-model-srdef-");
     try {
-      expect(block).toContain("_EFFECTIVE_MODEL='sr-glm-5'");
+      expect(block).toContain("_BAKED_MODEL='sr-glm-5'");
       const script = [
         "set -e",
+        "unset SWITCHROOM_CONFIG",
         `export ANTHROPIC_BASE_URL=${JSON.stringify(PASSTHROUGH)}`,
         `export SWITCHROOM_LITELLM_BASE=${JSON.stringify(ROUTER_ROOT)}`,
         "_LITELLM_OK=1",
@@ -541,6 +550,7 @@ describe("scaffoldAgent: configured-default sr-* model (no override)", () => {
     try {
       const script = [
         "set -e",
+        "unset SWITCHROOM_CONFIG",
         `export ANTHROPIC_BASE_URL=${JSON.stringify(ROUTER_ROOT)}`,
         `export SWITCHROOM_LITELLM_BASE=${JSON.stringify(ROUTER_ROOT)}`,
         '_LITELLM_OK=""',
@@ -554,5 +564,207 @@ describe("scaffoldAgent: configured-default sr-* model (no override)", () => {
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
+  });
+});
+
+// ── Live configured-default resolution (Defect B / drift fix) ────────────────
+//
+// The launcher no longer trusts the apply-time bake: at boot it resolves the
+// agent's configured model from the LIVE mounted switchroom.yaml via
+// `switchroom agent effective-model` (the same resolver the gateway's /status
+// uses), falling back live → last-known-good (.configured-default-model) →
+// bake, never silently past the live read. These are outcome tests against
+// the RENDERED block, with a fake `switchroom` on PATH standing in for the
+// CLI so each failure mode is actually exercised (a test that wouldn't fail
+// on the drift is not a test).
+describe("scaffoldAgent: live configured-default resolution (start.sh)", () => {
+  let tmpDir: string;
+  let agentDir: string;
+  let block: string;
+  let fakeBin: string;
+  let cfgPath: string;
+
+  function scaffold(model?: string): void {
+    const name = "live-agent";
+    const config = makeAgentConfig(model ? ({ model } as Partial<AgentConfig>) : {});
+    const res = scaffoldAgent(name, config, tmpDir, telegramConfig, makeSwitchroomConfig(name, config));
+    agentDir = res.agentDir;
+    block = extractBlock(readFileSync(join(agentDir, "start.sh"), "utf-8"));
+  }
+
+  /** Install a fake `switchroom` CLI; its stdout/exit code drive the live read. */
+  function fakeSwitchroom(body: string): void {
+    writeFileSync(join(fakeBin, "switchroom"), `#!/bin/bash\necho "$@" >> ${JSON.stringify(join(fakeBin, "args.log"))}\n${body}\n`);
+    chmodSync(join(fakeBin, "switchroom"), 0o755);
+  }
+
+  function fakeArgs(): string {
+    const p = join(fakeBin, "args.log");
+    return existsSync(p) ? readFileSync(p, "utf-8") : "";
+  }
+
+  function runLive(litellmOk = "1"): string {
+    const script = [
+      "set -e",
+      `export PATH=${JSON.stringify(fakeBin)}:"$PATH"`,
+      `export SWITCHROOM_CONFIG=${JSON.stringify(cfgPath)}`,
+      `_LITELLM_OK=${JSON.stringify(litellmOk)}`,
+      block,
+      'echo "EFFECTIVE=$_EFFECTIVE_MODEL"',
+    ].join("\n");
+    const out = execFileSync("bash", ["-c", script], { encoding: "utf-8" });
+    const m = out.match(/EFFECTIVE=(.*)/);
+    return m ? m[1].trim() : "";
+  }
+
+  function alertText(): string {
+    const p = join(agentDir, ".session-model-alert");
+    return existsSync(p) ? readFileSync(p, "utf-8") : "";
+  }
+
+  function recordedDefault(): string {
+    return readFileSync(join(agentDir, ".configured-default-model"), "utf-8").trim();
+  }
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-live-model-"));
+    fakeBin = join(tmpDir, "fakebin");
+    mkdirSync(fakeBin, { recursive: true });
+    cfgPath = join(tmpDir, "switchroom.yaml");
+    writeFileSync(cfgPath, "agents: {}\n");
+    scaffold();
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  // THE regression test the fable launch bug was missing: yaml edited to
+  // fable after apply (bake still sonnet) + plain restart → boots fable.
+  it("boots the LIVE yaml model when it differs from the apply-time bake (Defect B)", () => {
+    fakeSwitchroom('echo fable');
+    expect(runLive("1")).toBe("fable");
+    // The recorded configured default is the live value (next boot's LKG)…
+    expect(recordedDefault()).toBe("fable");
+    // …and the resolver was asked with the live config and the agent's name.
+    expect(fakeArgs()).toContain("--config");
+    expect(fakeArgs()).toContain("agent effective-model live-agent");
+    // Normal path: no operator alert.
+    expect(alertText()).toBe("");
+  });
+
+  it("retries once on a torn/failed first read, then uses the live value", () => {
+    fakeSwitchroom(`marker=${JSON.stringify(join(fakeBin, "second-call"))}
+if [ -f "$marker" ]; then echo claude-opus-4-8; else touch "$marker"; echo "mangled: [truncated ya" ; fi`);
+    expect(runLive("1")).toBe("claude-opus-4-8");
+    expect(alertText()).toBe("");
+  });
+
+  it("live read fails → falls back to last-known-good with an operator alert", () => {
+    writeFileSync(join(agentDir, ".configured-default-model"), "claude-opus-4-8\n");
+    fakeSwitchroom("exit 1");
+    expect(runLive("1")).toBe("claude-opus-4-8");
+    expect(alertText()).toContain("last-known-good");
+    expect(alertText()).toContain("claude-opus-4-8");
+  });
+
+  it("live read fails with no last-known-good → falls back to the bake with an operator alert", () => {
+    fakeSwitchroom("exit 1");
+    expect(runLive("1")).toBe(DEFAULT_MODEL);
+    expect(alertText()).toContain("apply-time default");
+    expect(alertText()).toContain(DEFAULT_MODEL);
+  });
+
+  it("garbage CLI output fails the shape gate and falls back (never reaches --model)", () => {
+    fakeSwitchroom('echo "not a!! model;; rm -rf"');
+    expect(runLive("1")).toBe(DEFAULT_MODEL);
+    expect(alertText()).not.toBe("");
+  });
+
+  it("Claude→sr-* class flip is NOT half-applied: keeps the bake and tells the operator to run apply", () => {
+    fakeSwitchroom("echo sr-glm-5");
+    expect(runLive("1")).toBe(DEFAULT_MODEL);
+    expect(alertText()).toContain("switchroom apply");
+    // The recorded default must be what actually booted, not the unapplied flip.
+    expect(recordedDefault()).toBe(DEFAULT_MODEL);
+  });
+
+  it("sr-*→Claude class flip is symmetric: keeps the sr-* bake and alerts", () => {
+    scaffold("sr-glm-5");
+    fakeSwitchroom("echo claude-opus-4-8");
+    expect(runLive("1")).toBe("sr-glm-5");
+    expect(alertText()).toContain("switchroom apply");
+  });
+
+  it("no SWITCHROOM_CONFIG mount → bake, silently (nothing live to read, nothing actionable)", () => {
+    fakeSwitchroom("echo fable");
+    const script = [
+      "set -e",
+      `export PATH=${JSON.stringify(fakeBin)}:"$PATH"`,
+      "unset SWITCHROOM_CONFIG",
+      '_LITELLM_OK="1"',
+      block,
+      'echo "EFFECTIVE=$_EFFECTIVE_MODEL"',
+    ].join("\n");
+    const out = execFileSync("bash", ["-c", script], { encoding: "utf-8" });
+    expect(out).toContain(`EFFECTIVE=${DEFAULT_MODEL}`);
+    expect(alertText()).toBe("");
+    expect(fakeArgs()).toBe(""); // CLI never invoked
+  });
+
+  // SE-3 ordering: the live value must land before the carrier compare, so a
+  // session override written against the current live default still applies.
+  it("resolves live BEFORE the carrier compare: override against the live default applies", () => {
+    fakeSwitchroom(`echo ${DEFAULT_MODEL}`);
+    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-opus-4-8"));
+    expect(runLive("1")).toBe("claude-opus-4-8");
+  });
+
+  it("carrier written against a SUPERSEDED live default is dropped (compare uses the live value)", () => {
+    fakeSwitchroom("echo claude-opus-4-8");
+    // Carrier recorded when the configured default was still sonnet.
+    writeFileSync(join(agentDir, ".session-model"), sessionModelJson("claude-haiku-4-5", DEFAULT_MODEL));
+    expect(runLive("1")).toBe("claude-opus-4-8");
+    expect(alertText()).toContain("configured default model changed");
+  });
+
+  // SE-4: a proxy-only CONFIGURED default with LiteLLM down must not 4xx
+  // every call — Claude agents degrade to opus, loudly.
+  it("configured fable + LiteLLM down → boots opus with an operator alert", () => {
+    fakeSwitchroom("echo fable");
+    expect(runLive("")).toBe("opus");
+    expect(alertText()).toContain("LiteLLM");
+    expect(alertText()).toContain("fable");
+  });
+
+  it("configured fable + LiteLLM up → boots fable (guard is down-only)", () => {
+    fakeSwitchroom("echo fable");
+    expect(runLive("1")).toBe("fable");
+    expect(alertText()).toBe("");
+  });
+
+  // SE-3 rendered-script ordering lock: live resolution → recorded default →
+  // carrier block → configured-default litellm guard → repoint → active-model
+  // write → exec. If any of these move, the override/invalidate logic misfires.
+  it("locks the resolution ordering in the rendered start.sh", () => {
+    const startSh = readFileSync(join(agentDir, "start.sh"), "utf-8");
+    const idxLive = startSh.indexOf("# --- Live configured-default resolution");
+    const idxRecord = startSh.indexOf('.configured-default-model" 2>/dev/null || true');
+    const idxCarrier = startSh.indexOf('if [ -f "' + agentDir + '/.session-model" ]');
+    const idxGuard = startSh.indexOf("# Configured-default LiteLLM guard");
+    const idxRepoint = startSh.indexOf("sr-* passthrough→router repoint");
+    const idxActive = startSh.indexOf('.active-session-model"');
+    const idxExec = startSh.lastIndexOf('--model "$_EFFECTIVE_MODEL"');
+    expect(idxLive).toBeGreaterThan(-1);
+    expect(idxRecord).toBeGreaterThan(idxLive);
+    expect(idxCarrier).toBeGreaterThan(idxRecord);
+    expect(idxGuard).toBeGreaterThan(idxCarrier);
+    expect(idxRepoint).toBeGreaterThan(idxGuard);
+    expect(idxActive).toBeGreaterThan(idxRepoint);
+    expect(idxExec).toBeGreaterThan(idxActive);
+    // And the LKG read happens BEFORE the recorded-default overwrite.
+    const idxLkg = startSh.indexOf('_LKG_MODEL="$(cat');
+    expect(idxLkg).toBeGreaterThan(-1);
+    expect(idxLkg).toBeLessThan(idxRecord);
   });
 });

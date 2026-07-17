@@ -167,3 +167,22 @@ describe("summarizeReconcileBatch", () => {
     expect(out!.header).toBe("Summary: 0 succeeded, 2 failed");
   });
 });
+
+describe("agent effective-model command", () => {
+  // The launcher (start.sh) shells `switchroom agent effective-model <name>`
+  // at every boot — an unregistered verb would silently fail the live read
+  // on EVERY agent and drop the whole fleet to baked/LKG fallbacks. Same
+  // drift-class outcome test as the /logs options above.
+  function findCommand(): Command | undefined {
+    const program = new Command();
+    registerAgentCommand(program);
+    const agent = program.commands.find((c) => c.name() === "agent")!;
+    return agent.commands.find((c) => c.name() === "effective-model");
+  }
+
+  it("is registered with a required <name> argument", () => {
+    const cmd = findCommand();
+    expect(cmd).toBeDefined();
+    expect(cmd!.registeredArguments.map((a) => `${a.name()}:${a.required}`)).toEqual(["name:true"]);
+  });
+});

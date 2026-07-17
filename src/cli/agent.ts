@@ -10,7 +10,7 @@ import { isHindsightEnabled } from "../memory/hindsight.js";
 import { HINDSIGHT_DEFAULT_MCP_URL } from "../setup/hindsight.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 import { withConfigError, getConfig, getConfigPath } from "./helpers.js";
-import { scaffoldAgent, reconcileAgent, buildSettingsHooksBlock, detectHooksDrift, SWITCHROOM_DEFAULT_MAIN_MODEL, SWITCHROOM_DEFAULT_THINKING_EFFORT } from "../agents/scaffold.js";
+import { scaffoldAgent, reconcileAgent, buildSettingsHooksBlock, detectHooksDrift, resolveMainModel, SWITCHROOM_DEFAULT_MAIN_MODEL, SWITCHROOM_DEFAULT_THINKING_EFFORT } from "../agents/scaffold.js";
 import { writeComposeFile } from "./write-compose.js";
 import type { ReleaseBlockShape } from "../config/release-resolve.js";
 import { bareClonePath } from "../repos/bare-clone.js";
@@ -852,16 +852,17 @@ export function registerAgentCommand(program: Command): void {
             const agentConfig = config.agents[name];
             const status = statuses[name];
             const sched = schedulerStates[name];
-            // Cascade-resolved effective model — the same value scaffold
-            // bakes into settings.json / `--model` (falls back to the
-            // baked default when unset). Consumed by the gateway's
-            // /status and /model surfaces.
+            // Cascade-resolved effective model, through the SAME resolver
+            // scaffold bakes with (`default`/unset → switchroom default,
+            // retired codenames → alias). Consumed by the gateway's
+            // /status and /model surfaces AND `agent effective-model`, so
+            // launcher and gateway can never disagree on the mapping.
             const resolved = resolveAgentConfig(config.defaults, config.profiles, agentConfig);
             return {
               name,
               status: status?.active ?? "unknown",
               uptime: formatUptime(status?.uptime ?? null),
-              model: resolved.model ?? SWITCHROOM_DEFAULT_MAIN_MODEL,
+              model: resolveMainModel(resolved.model),
               // Cascade-resolved effort — what start.sh bakes into
               // `--effort`, and the default the /effort session switch
               // reverts to on restart. Consumed by the gateway's /effort.
@@ -903,6 +904,34 @@ export function registerAgentCommand(program: Command): void {
         console.log();
         printTable(headers, rows, widths);
         console.log();
+      })
+    );
+
+  // switchroom agent effective-model <name>
+  //
+  // The ONE model resolver, exposed as a verb. Prints exactly the value the
+  // agent's launcher should pass to `claude --model`: cascade-resolved
+  // (defaults/profiles/agent), `default`/unset remapped to the switchroom
+  // default, retired codenames normalized to their alias. start.sh calls this
+  // at boot against the live mounted switchroom.yaml (see profiles/_base/
+  // start.sh.hbs "Live configured-default resolution") so a `model:` edit +
+  // restart takes effect WITHOUT a full apply, and the gateway's /status
+  // reads the same resolver via `agent list --json` — one implementation,
+  // no shell re-derivation, no drift. Plain single-line stdout on purpose:
+  // the shell consumer wants a bare token, not JSON.
+  agent
+    .command("effective-model <name>")
+    .description("Print the cascade-resolved model the agent's launcher boots with")
+    .action(
+      withConfigError(async (name: string) => {
+        const config = getConfig(program);
+        const agentConfig = config.agents[name];
+        if (!agentConfig) {
+          console.error(chalk.red(`Agent "${name}" is not defined in switchroom.yaml`));
+          process.exit(1);
+        }
+        const resolved = resolveAgentConfig(config.defaults, config.profiles, agentConfig);
+        console.log(resolveMainModel(resolved.model));
       })
     );
 

@@ -263,3 +263,34 @@ did not touch the Anthropic subscription endpoint. The live LiteLLM config
 and Hindsight's live container env (`ANTHROPIC_BASE_URL=http://127.0.0.1:4010`,
 global model `openrouter/z-ai/glm-5.2`) were also read directly for the I2 and
 Hindsight-credential claims above.
+
+## Boot-time model resolution is LIVE (Defect B fix, 2026-07-17)
+
+The model an agent boots with is **no longer frozen at `switchroom apply`
+time**. `profiles/_base/start.sh.hbs` ("Live configured-default resolution")
+resolves the configured model at every boot by shelling
+`switchroom agent effective-model <name>` against the live-mounted
+`$SWITCHROOM_CONFIG` — the same `resolveMainModel` resolver the gateway's
+/status and `agent list --json` use, so what-you-see and what-runs come from
+one implementation. Editing `model:` in switchroom.yaml + `docker restart`
+now applies the change; no full apply needed for Claude↔Claude switches.
+
+Bounded fallback chain (never silent past the live read): live yaml →
+`.configured-default-model` (last-known-good from the prior boot) → the
+apply-time bake, with a `.session-model-alert` relayed to the operator on any
+fallback. Two deliberate boundaries:
+
+- **Claude↔sr-\* class flips still require a real `switchroom apply`** —
+  routing (`ANTHROPIC_BASE_URL` passthrough vs router root, litellm
+  provisioning) is rendered into compose at apply time. The launcher detects
+  a class flip between the live value and the bake, refuses to half-apply it,
+  boots the baked model, and alerts "run switchroom apply".
+- **A proxy-only configured default (`fable`) with LiteLLM unreachable at
+  boot degrades to `opus` with an alert** instead of 4xx-ing every call
+  (the codename is retired direct-to-Anthropic; only the router serves it).
+
+Known residual (tracked follow-up): the single-file yaml bind mount is
+inode-pinned per container start, and host-side CLI writers save via atomic
+rename — so a LONG-RUNNING gateway's mid-life `agent list` reads reflect the
+yaml as of its last container start. Boot-time reads (the path above) always
+re-resolve and are unaffected.
