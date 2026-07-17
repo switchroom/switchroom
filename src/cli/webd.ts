@@ -184,7 +184,7 @@ services:
     image: ghcr.io/switchroom/switchroom-web:${imageTag}
     container_name: switchroom-web
     restart: always
-    # The server MUST own host loopback 127.0.0.1:8080 — the cloudflared
+    # The server MUST own host loopback 127.0.0.1:${port} — the cloudflared
     # tunnel (GitHub webhooks) and \`tailscale serve\` (dashboard) both
     # reach it there, and the dashboard CSRF gate trusts the
     # Tailscale-User-Login header only when the request arrives on
