@@ -88,7 +88,7 @@ human, not the reverse.
 # Part 2 — Production pipeline
 
 Two sanctioned ways to author a diagram. Both produce a diffable text source
-and a raster build artifact; both obey the Part 2 visual recipe below.
+and a raster build artifact; both obey the Part 3 visual recipe below.
 
 ## Method A — HTML/CSS → 2x PNG (narrative diagrams)
 

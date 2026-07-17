@@ -7,12 +7,12 @@
 # Renders the HTML at a 2x device scale into <name>.png next to the source.
 # The HTML is the source of truth; the PNG is a build artifact — re-render,
 # never hand-edit the PNG. A 2x screenshot of a ~1200-wide canvas produces a
-# ~2400px-wide PNG. Default canvas is 1200x800; pass WxH to override to match
+# ~2400px-wide PNG. Default canvas is 1200x760; pass WxH to override to match
 # the diagram's .stage dimensions.
 set -euo pipefail
 
 html="${1:-}"
-size="${2:-1200x800}"
+size="${2:-1200x760}"
 if [[ -z "$html" || ! -f "$html" ]]; then
   echo "usage: render.sh <diagram.html> [WxH]  (e.g. 1200x760)" >&2
   exit 2
