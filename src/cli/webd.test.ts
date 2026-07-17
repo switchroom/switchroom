@@ -22,6 +22,7 @@ describe("renderWebComposeFile", () => {
       hostHome: "/home/operator",
       imageTag: "v0.14.12",
       operatorUid: 1000,
+      port: 8080,
     });
     expect(out).toContain("services:");
     expect(out).toContain("web:");
@@ -33,26 +34,26 @@ describe("renderWebComposeFile", () => {
     // both reach the server on 127.0.0.1:8080, and the dashboard CSRF
     // gate trusts the Tailscale-User-Login header only on loopback
     // (PR #1380). Only host networking preserves that.
-    const out = renderWebComposeFile({ hostHome: "/h", imageTag: "latest", operatorUid: 1000 });
+    const out = renderWebComposeFile({ hostHome: "/h", imageTag: "latest", operatorUid: 1000, port: 8080 });
     expect(out).toContain("network_mode: host");
   });
 
   it("runs as the operator uid so webhook.sock forwards pass the gateway peercred ACL", () => {
-    const out = renderWebComposeFile({ hostHome: "/h", imageTag: "latest", operatorUid: 1000 });
+    const out = renderWebComposeFile({ hostHome: "/h", imageTag: "latest", operatorUid: 1000, port: 8080 });
     expect(out).toContain('user: "1000:1000"');
 
     // Different operator uid → different user line, verbatim.
-    const other = renderWebComposeFile({ hostHome: "/h", imageTag: "latest", operatorUid: 1234 });
+    const other = renderWebComposeFile({ hostHome: "/h", imageTag: "latest", operatorUid: 1234, port: 8080 });
     expect(other).toContain('user: "1234:1234"');
   });
 
   it("does NOT mount the docker socket (minimal internet-facing surface)", () => {
-    const out = renderWebComposeFile({ hostHome: "/h", imageTag: "latest", operatorUid: 1000 });
+    const out = renderWebComposeFile({ hostHome: "/h", imageTag: "latest", operatorUid: 1000, port: 8080 });
     expect(out).not.toContain("docker.sock");
   });
 
   it("drops ALL caps and re-adds NONE (web server never chowns or shells docker)", () => {
-    const out = renderWebComposeFile({ hostHome: "/h", imageTag: "latest", operatorUid: 1000 });
+    const out = renderWebComposeFile({ hostHome: "/h", imageTag: "latest", operatorUid: 1000, port: 8080 });
     expect(out).toContain("cap_drop:");
     expect(out).toMatch(/cap_drop:\s*\n\s+- ALL/);
     expect(out).not.toContain("cap_add:");
@@ -61,12 +62,12 @@ describe("renderWebComposeFile", () => {
   });
 
   it("sets no-new-privileges:true", () => {
-    const out = renderWebComposeFile({ hostHome: "/h", imageTag: "latest", operatorUid: 1000 });
+    const out = renderWebComposeFile({ hostHome: "/h", imageTag: "latest", operatorUid: 1000, port: 8080 });
     expect(out).toContain("no-new-privileges:true");
   });
 
   it("substitutes the host home into the bind mounts (rw tree + ro symlink-safe yaml)", () => {
-    const out = renderWebComposeFile({ hostHome: "/home/alice", imageTag: "latest", operatorUid: 1000 });
+    const out = renderWebComposeFile({ hostHome: "/home/alice", imageTag: "latest", operatorUid: 1000, port: 8080 });
     // Whole ~/.switchroom tree rw — the receiver reads secrets and
     // connects per-agent webhook.sock under it.
     expect(out).toContain("/home/alice/.switchroom:/host-home/.switchroom:rw");
@@ -77,33 +78,73 @@ describe("renderWebComposeFile", () => {
   });
 
   it("pins the image tag exactly as passed", () => {
-    const out = renderWebComposeFile({ hostHome: "/h", imageTag: "v0.14.12", operatorUid: 1000 });
+    const out = renderWebComposeFile({ hostHome: "/h", imageTag: "v0.14.12", operatorUid: 1000, port: 8080 });
     expect(out).toContain("image: ghcr.io/switchroom/switchroom-web:v0.14.12");
     expect(out).not.toContain("ghcr.io/switchroom/switchroom-web:latest");
   });
 
   it("sets HOME, SWITCHROOM_CONFIG, PATH env", () => {
-    const out = renderWebComposeFile({ hostHome: "/h", imageTag: "latest", operatorUid: 1000 });
+    const out = renderWebComposeFile({ hostHome: "/h", imageTag: "latest", operatorUid: 1000, port: 8080 });
     expect(out).toContain("HOME: /host-home");
     expect(out).toContain("SWITCHROOM_CONFIG: /state/config/switchroom.yaml");
     expect(out).toContain("PATH:");
   });
 
   it("byte-deterministic for the same inputs", () => {
-    const a = renderWebComposeFile({ hostHome: "/h", imageTag: "v1", operatorUid: 1000 });
-    const b = renderWebComposeFile({ hostHome: "/h", imageTag: "v1", operatorUid: 1000 });
+    const a = renderWebComposeFile({ hostHome: "/h", imageTag: "v1", operatorUid: 1000, port: 8080 });
+    const b = renderWebComposeFile({ hostHome: "/h", imageTag: "v1", operatorUid: 1000, port: 8080 });
     expect(a).toBe(b);
   });
 
   it("warns against operator hand-edits at the top of the file", () => {
-    const out = renderWebComposeFile({ hostHome: "/h", imageTag: "latest", operatorUid: 1000 });
+    const out = renderWebComposeFile({ hostHome: "/h", imageTag: "latest", operatorUid: 1000, port: 8080 });
     expect(out.split("\n")[0]).toContain("AUTO-GENERATED");
     expect(out).toContain("do not hand-edit");
   });
 
   it("uses a 15s stop_grace_period for clean bun shutdown on docker stop", () => {
-    const out = renderWebComposeFile({ hostHome: "/h", imageTag: "latest", operatorUid: 1000 });
+    const out = renderWebComposeFile({ hostHome: "/h", imageTag: "latest", operatorUid: 1000, port: 8080 });
     expect(out).toContain("stop_grace_period: 15s");
+  });
+
+  it("overrides the image CMD with the configured port (web_service.port)", () => {
+    // The Dockerfile CMD hardcodes 8080; the compose `command:` must
+    // override it with the config-driven port so a custom port survives
+    // the `switchroom update` refresh-web regeneration instead of being
+    // silently reverted (e.g. host where another service owns 8080).
+    const out = renderWebComposeFile({ hostHome: "/h", imageTag: "latest", operatorUid: 1000, port: 8081 });
+    expect(out).toContain(
+      'command: ["switchroom", "web", "--port", "8081", "--bind", "127.0.0.1"]',
+    );
+    expect(out).not.toContain('"--port", "8080"');
+  });
+
+  it("emits the default 8080 command when port is 8080", () => {
+    const out = renderWebComposeFile({ hostHome: "/h", imageTag: "latest", operatorUid: 1000, port: 8080 });
+    expect(out).toContain(
+      'command: ["switchroom", "web", "--port", "8080", "--bind", "127.0.0.1"]',
+    );
+  });
+
+  it("always binds loopback regardless of port (network exposure is not what port config is for)", () => {
+    const out = renderWebComposeFile({ hostHome: "/h", imageTag: "latest", operatorUid: 1000, port: 9999 });
+    expect(out).toContain('"--bind", "127.0.0.1"');
+    expect(out).not.toContain("0.0.0.0");
+  });
+});
+
+describe("web_service.port schema (config-driven so it survives update)", () => {
+  it("defaults to 8080 and accepts a custom port", async () => {
+    const { WebServiceConfigSchema } = await import("../config/schema.js");
+    expect(WebServiceConfigSchema.parse({}).port).toBe(8080);
+    expect(WebServiceConfigSchema.parse({ port: 8081 }).port).toBe(8081);
+  });
+
+  it("rejects out-of-range or non-integer ports", async () => {
+    const { WebServiceConfigSchema } = await import("../config/schema.js");
+    expect(() => WebServiceConfigSchema.parse({ port: 0 })).toThrow();
+    expect(() => WebServiceConfigSchema.parse({ port: 65536 })).toThrow();
+    expect(() => WebServiceConfigSchema.parse({ port: 80.5 })).toThrow();
   });
 });
 

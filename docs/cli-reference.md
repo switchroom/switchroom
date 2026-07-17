@@ -300,5 +300,9 @@ health summary); a follow-up may rename it to `drift` or fold it into
   Replaces the legacy `switchroom-web.service` systemd unit. `switchroom
   update` refreshes it only when `web_service.managed: true` is set in
   `switchroom.yaml` (default off — existing systemd installs are
-  untouched). See `docs/webhook-ingest.md` § Deployment. *Grounded in:*
+  untouched). The listen port comes from `web_service.port` in
+  `switchroom.yaml` (default `8080`) — set it when another service owns
+  8080 on the host; because `install` regenerates the compose file, a
+  config-driven port survives `switchroom update` where a hand-edit
+  would be reverted. See `docs/webhook-ingest.md` § Deployment. *Grounded in:*
   `src/cli/webd.ts`.

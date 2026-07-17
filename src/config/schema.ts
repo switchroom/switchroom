@@ -3805,6 +3805,22 @@ export const WebServiceConfigSchema = z.object({
       "network_mode: host so it keeps owning loopback:8080 for the " +
       "cloudflared tunnel + tailscale serve consumers.",
     ),
+  port: z
+    .number()
+    .int()
+    .min(1)
+    .max(65535)
+    .default(8080)
+    .describe(
+      "Host loopback port the web server listens on (127.0.0.1:<port>). " +
+      "Default: 8080. Set this when another service owns 8080 on the " +
+      "host (e.g. UniFi OS Server) — `switchroom webd install` and the " +
+      "`switchroom update` refresh-web step both honor it, so a custom " +
+      "port survives updates instead of being silently reverted to " +
+      "8080 by the regenerated compose file. Remember to point the " +
+      "host-side consumers (cloudflared tunnel, `tailscale serve`) at " +
+      "the same port.",
+    ),
 });
 
 /**
