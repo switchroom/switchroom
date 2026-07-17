@@ -102,6 +102,10 @@ import {
   forwardOriginDateIso,
   type ForwardOriginInfo,
 } from './forward-origin.js'
+import {
+  installUpdateTap,
+  installUnhandledMessageCatchAll,
+} from './unhandled-message.js'
 import { fmtLocalStamp, resolveEnvTimezone, renderLogTimestampsLocal } from '../shared/local-time.js'
 import { StatusReactionController } from '../status-reactions.js'
 import { DeferredDoneReactions } from '../reaction-defer.js'
@@ -1291,6 +1295,14 @@ const AGENT_ADMIN = process.env.SWITCHROOM_AGENT_ADMIN === 'true'
 // ─── Bot + chat lock ──────────────────────────────────────────────────────
 const bot = new Bot(TOKEN)
 installTgPostLogger(bot)
+
+// ─── Diagnostic update tap (#3300) ────────────────────────────────────────
+// One compact line per received update, logged BEFORE any specific handler
+// runs, so a drop at the grammy-routing layer is always diagnosable from the
+// logs. Pass-through middleware — never consumes an update or alters routing.
+// Rate-limited inside installUpdateTap (per-minute cap + suppression summary
+// line so even a flood is never invisible).
+installUpdateTap(bot, line => process.stderr.write(line))
 
 // ─── getUpdates heartbeat ─────────────────────────────────────────────────
 // Tracks the last time getUpdates completed (success OR error). Used by
@@ -29333,6 +29345,34 @@ bot.on('message:pinned_message', async ctx => {
     )
   }
 })
+
+// ─── Terminal catch-all for unhandled message content types (#3300) ───────
+//
+// MUST stay registered LAST among the `message`/`message:*` handlers.
+//
+// grammy's `bot.on('message:<type>')` is filtering middleware: internally
+// `on → filter(pred, handler) → branch(pred, handler, pass)`. When the filter
+// matches, grammy runs the leaf handler, which never calls `next()`, so the
+// chain STOPS — a specific `message:text`/`:photo`/… match above consumes the
+// update and this catch-all never sees it (specific handler always wins; no
+// "already handled" guard is needed, the ordering is the guarantee). When NO
+// specific `message:*` filter matches, grammy ^1.44 would otherwise SILENTLY
+// drop the update — no log, no ack, no history row (the zero-observability
+// failure class behind the 2026-07-16 dropped-message incident: message_id
+// 19090 allocated in the DM with no gateway trace at all). This handler
+// closes the class: every inbound `message` is either delivered as a turn or
+// explicitly logged (known-noise service messages → log-only, no turn — see
+// SERVICE_NOISE_KEYS), so nothing is silently dropped at this layer again.
+//
+// Access gating is NOT re-implemented here — routing through
+// handleInboundCoalesced (the exact path `message:text` uses) applies the
+// same gate()/allowFrom checks, and parseForwardOrigin runs inside it so
+// forwarded-message provenance is preserved.
+installUnhandledMessageCatchAll(
+  bot,
+  (ctx, text) => handleInboundCoalesced(ctx, text, undefined),
+  line => process.stderr.write(line),
+)
 
 // ─── Reaction-trigger runtime state (#1074) ──────────────────────────────
 //
