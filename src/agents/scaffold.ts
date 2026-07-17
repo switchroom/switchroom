@@ -628,7 +628,13 @@ import {
   getNotionMcpSettingsEntry,
 } from "../memory/scaffold-integration.js";
 import { shouldEmitGdriveMcp } from "../config/google-workspace-acl.js";
-import { shouldEmitMs365Mcp } from "../config/microsoft-workspace-acl.js";
+import {
+  shouldEmitMs365Mcp,
+  bindingsForAgent,
+  ms365McpKeyForBinding,
+  microsoftAccountSlug,
+  normalizeMicrosoftBindings,
+} from "../config/microsoft-workspace-acl.js";
 import { shouldEmitNotionMcp } from "../config/notion-workspace-acl.js";
 import { reconcileAgentDefaultSkills } from "./reconcile-default-skills.js";
 import { applyTelegramProgressGuidance, applySubAgentLocalTimeGuidance } from "./sub-agent-telegram-prompt.js";
@@ -3482,39 +3488,89 @@ export function resolveGdriveMcpEntry(
  *
  * Returns null when the entry must not be emitted.
  */
+export function resolveMs365McpEntries(
+  agentName: string,
+  agentConfig: AgentConfig,
+  switchroomConfig: SwitchroomConfig | undefined,
+): { key: string; value: McpServerConfig }[] {
+  if ((agentConfig.mcp_servers ?? {})["ms-365"] === false) return [];
+  const mw = agentConfig.microsoft_workspace;
+  const microsoftAccounts = switchroomConfig?.microsoft_accounts;
+  const bindings = bindingsForAgent(agentName, mw, microsoftAccounts);
+  if (bindings.length === 0) return [];
+
+  // Guard against two distinct emails colliding on the same slug/key on
+  // one agent — fail loud rather than silently dropping a binding.
+  const seenKeys = new Set<string>();
+  const entries: { key: string; value: McpServerConfig }[] = [];
+  for (const b of bindings) {
+    const key = ms365McpKeyForBinding(mw, b.account);
+    if (seenKeys.has(key)) {
+      throw new Error(
+        `agent '${agentName}': Microsoft account slug collision on MCP key '${key}' ` +
+        `(account '${b.account}'). Rename or disambiguate the accounts.`,
+      );
+    }
+    seenKeys.add(key);
+    // org_mode: per-binding override → top-level default. Launcher
+    // re-reads from config and is authoritative; threading here just
+    // makes the resolved choice visible in settings.json.
+    const orgMode =
+      b.org_mode ??
+      switchroomConfig?.microsoft_workspace?.org_mode ??
+      false;
+    // Only thread --account for the multi-account (plural) form so a
+    // single-account agent keeps byte-identical settings (bare ms-365,
+    // no --account) — back-compat.
+    const isMulti = key !== "ms-365";
+    const entry = getMs365McpSettingsEntry(DOCKER_SWITCHROOM_CLI_PATH, {
+      orgMode,
+      key,
+      ...(isMulti ? { account: b.account } : {}),
+      ...(b.tools ? { enabledTools: b.tools } : {}),
+    });
+    // Env-threading shape, minus vault-broker (the m365 launcher only
+    // talks to the auth-broker — no vault calls for client_secret yet
+    // because that gates per-agent vault ACL which isn't wired in PR 3).
+    // If a future PR teaches the launcher to resolve `vault:` refs for
+    // client_secret directly, re-add SWITCHROOM_VAULT_BROKER_SOCK here.
+    entry.value.env = {
+      SWITCHROOM_CONFIG: DOCKER_CONFIG_PATH,
+      SWITCHROOM_AGENT_NAME: agentName,
+      SWITCHROOM_CONTAINER: "1",
+      SWITCHROOM_AUTH_BROKER_SOCKET: DOCKER_AUTH_BROKER_SOCKET,
+      HOME: DOCKER_AGENT_HOME,
+    };
+    entries.push(entry);
+  }
+  return entries;
+}
+
+/**
+ * Singular back-compat shim: returns the FIRST resolved ms-365 entry (or
+ * null). Retained for callers/tests that expect one entry; multi-account
+ * callers use `resolveMs365McpEntries`.
+ */
 export function resolveMs365McpEntry(
   agentName: string,
   agentConfig: AgentConfig,
   switchroomConfig: SwitchroomConfig | undefined,
 ): { key: string; value: McpServerConfig } | null {
-  if ((agentConfig.mcp_servers ?? {})["ms-365"] === false) return null;
-  const account = agentConfig.microsoft_workspace?.account;
-  const microsoftAccounts = switchroomConfig?.microsoft_accounts;
-  if (!shouldEmitMs365Mcp(agentName, account, microsoftAccounts)) return null;
-  // org_mode: per-agent override → top-level default. Launcher
-  // re-reads from config and is authoritative; threading here just
-  // makes the resolved choice visible in settings.json.
-  const orgMode =
-    agentConfig.microsoft_workspace?.org_mode ??
-    switchroomConfig?.microsoft_workspace?.org_mode ??
-    false;
-  const entry = getMs365McpSettingsEntry(
-    DOCKER_SWITCHROOM_CLI_PATH,
-    orgMode ? { orgMode: true } : {},
-  );
-  // Env-threading shape, minus vault-broker (the m365 launcher only
-  // talks to the auth-broker — no vault calls for client_secret yet
-  // because that gates per-agent vault ACL which isn't wired in PR 3).
-  // If a future PR teaches the launcher to resolve `vault:` refs for
-  // client_secret directly, re-add SWITCHROOM_VAULT_BROKER_SOCK here.
-  entry.value.env = {
-    SWITCHROOM_CONFIG: DOCKER_CONFIG_PATH,
-    SWITCHROOM_AGENT_NAME: agentName,
-    SWITCHROOM_CONTAINER: "1",
-    SWITCHROOM_AUTH_BROKER_SOCKET: DOCKER_AUTH_BROKER_SOCKET,
-    HOME: DOCKER_AGENT_HOME,
-  };
-  return entry;
+  return resolveMs365McpEntries(agentName, agentConfig, switchroomConfig)[0] ?? null;
+}
+
+/**
+ * All mcpServers keys the ms-365 integration COULD own for this agent —
+ * the bare `ms-365` plus `ms-365-<slug>` for every declared binding
+ * (regardless of ACL). Used at reconcile to retract stale per-account
+ * keys when an agent's bindings shrink or the ACL is revoked.
+ */
+export function ms365OwnedKeys(agentConfig: AgentConfig): Set<string> {
+  const keys = new Set<string>(["ms-365"]);
+  for (const b of normalizeMicrosoftBindings(agentConfig.microsoft_workspace)) {
+    keys.add(`ms-365-${microsoftAccountSlug(b.account)}`);
+  }
+  return keys;
 }
 
 /**
@@ -3609,6 +3665,124 @@ export interface IntegrationMcpResolver {
     agentConfig: AgentConfig,
     switchroomConfig: SwitchroomConfig | undefined,
   ) => { key: string; value: McpServerConfig } | null;
+  /**
+   * OPTIONAL plural resolver for integrations that emit MORE THAN ONE
+   * mcpServers key (e.g. Microsoft 365 multi-account: one `ms-365-<slug>`
+   * per bound account). When present it supersedes `resolve` for
+   * emission; `resolve` is kept as a single-entry shim for callers/tests
+   * that expect one entry.
+   */
+  resolveEntries?: (
+    name: string,
+    agentConfig: AgentConfig,
+    switchroomConfig: SwitchroomConfig | undefined,
+  ) => { key: string; value: McpServerConfig }[];
+  /**
+   * OPTIONAL retraction-key set for plural integrations: every mcpServers
+   * key this integration COULD own for the agent under the CURRENT config
+   * (regardless of ACL). NOTE: this cannot see a FULLY-REMOVED binding
+   * (its slug is gone from config), so it only handles the
+   * ACL-revoked-while-still-declared case. Durable full retraction uses
+   * `ownsKeyName` (namespace predicate) instead — see
+   * `retractStaleIntegrationKeys`.
+   */
+  ownedKeys?: (agentConfig: AgentConfig) => Set<string>;
+  /**
+   * OPTIONAL namespace predicate: does `key` belong to THIS integration's
+   * mcpServers namespace (e.g. `ms-365` or `ms-365-<slug>`)? Used by
+   * `retractStaleIntegrationKeys` to drop stale keys present in EXISTING
+   * settings that are no longer emitted — WITHOUT enumerating from the
+   * current config, so a binding that was fully removed (its slug no
+   * longer in config) is still retracted. When absent, retraction falls
+   * back to the single literal `retractionKey`.
+   */
+  ownsKeyName?: (key: string) => boolean;
+}
+
+/**
+ * Durable, namespace-scoped retraction: delete every key in `existing`
+ * that (a) belongs to the integration's namespace (`ownsKeyName`, or the
+ * literal `retractionKey` fallback), (b) is NOT in the freshly-emitted
+ * set, and (c) is NOT a user-declared mcp_servers key. Mutates `existing`
+ * in place and returns the removed keys.
+ *
+ * This is the fix for the multi-account retraction gap: `ownedKeys`
+ * (config enumeration) minus emitted can never drop a binding that was
+ * FULLY removed from `microsoft_workspace.accounts` (its slug is in
+ * neither set). Diffing the EXISTING mcpServers object against the emitted
+ * set by namespace catches the removed slug. The user-declared guard keeps
+ * an operator's hand-written `mcp_servers` entry from being swept.
+ */
+export function retractStaleIntegrationKeys(
+  integration: IntegrationMcpResolver,
+  emittedKeys: ReadonlySet<string>,
+  existing: Record<string, unknown>,
+  protectedKeys?: ReadonlySet<string>,
+): string[] {
+  const removed: string[] = [];
+  for (const key of Object.keys(existing)) {
+    if (emittedKeys.has(key)) continue;
+    if (protectedKeys?.has(key)) continue;
+    const owns = integration.ownsKeyName
+      ? integration.ownsKeyName(key)
+      : key === integration.retractionKey;
+    if (owns) {
+      delete existing[key];
+      removed.push(key);
+    }
+  }
+  return removed;
+}
+
+/**
+ * The set of user-declared mcp_servers keys (truthy values only — `false`
+ * is an opt-out sentinel, not a declaration) — protected from namespace
+ * retraction so an operator's hand-written entry survives.
+ */
+export function userDeclaredMcpKeys(agentConfig: AgentConfig): Set<string> {
+  return new Set(
+    Object.entries(agentConfig.mcp_servers ?? {})
+      .filter(([, v]) => v !== false)
+      .map(([k]) => k),
+  );
+}
+
+/**
+ * The mcpServers entries an integration emits for an agent — plural-aware.
+ * Uses `resolveEntries` when present, else wraps the single `resolve`.
+ */
+export function integrationMcpEntries(
+  integration: IntegrationMcpResolver,
+  name: string,
+  agentConfig: AgentConfig,
+  switchroomConfig: SwitchroomConfig | undefined,
+): { key: string; value: McpServerConfig }[] {
+  if (integration.resolveEntries) {
+    return integration.resolveEntries(name, agentConfig, switchroomConfig);
+  }
+  const entry = integration.resolve(name, agentConfig, switchroomConfig);
+  return entry ? [entry] : [];
+}
+
+/**
+ * The set of mcpServers keys to `delete` for an integration at reconcile
+ * that are NOT in the currently-emitted set — plural-aware retraction.
+ */
+export function integrationRetractionKeys(
+  integration: IntegrationMcpResolver,
+  name: string,
+  agentConfig: AgentConfig,
+  switchroomConfig: SwitchroomConfig | undefined,
+): string[] {
+  const emitted = new Set(
+    integrationMcpEntries(integration, name, agentConfig, switchroomConfig).map(
+      (e) => e.key,
+    ),
+  );
+  const owned = integration.ownedKeys
+    ? integration.ownedKeys(agentConfig)
+    : new Set<string>([integration.retractionKey]);
+  return [...owned].filter((k) => !emitted.has(k));
 }
 
 /**
@@ -3667,6 +3841,12 @@ export const INTEGRATION_MCP_RESOLVERS: readonly IntegrationMcpResolver[] = [
     emitKey: "ms-365",
     retractionKey: "ms-365",
     resolve: resolveMs365McpEntry,
+    resolveEntries: resolveMs365McpEntries,
+    ownedKeys: ms365OwnedKeys,
+    // Namespace: the bare `ms-365` OR any `ms-365-<slug>` per-account key.
+    // Lets retraction drop a fully-removed binding's stale key without
+    // enumerating from the (already-shrunk) config.
+    ownsKeyName: (key: string) => key === "ms-365" || /^ms-365-[a-z0-9-]+$/.test(key),
   },
   {
     label: "Notion",
@@ -4047,11 +4227,41 @@ export function scaffoldAgent(
       // entry already in settings.mcpServers takes priority. Registry
       // iteration preserves the gdrive → ms-365 → notion order from
       // INTEGRATION_MCP_RESOLVERS.
+      const site1Protected = userDeclaredMcpKeys(agentConfig);
       for (const integration of INTEGRATION_MCP_RESOLVERS) {
-        const entry = integration.resolve(name, agentConfig, switchroomConfig);
-        if (entry && !settings.mcpServers[entry.key]) {
-          settings.mcpServers[entry.key] = entry.value;
+        const entries = integrationMcpEntries(
+          integration,
+          name,
+          agentConfig,
+          switchroomConfig,
+        );
+        for (const entry of entries) {
+          if (!settings.mcpServers[entry.key]) {
+            settings.mcpServers[entry.key] = entry.value;
+          }
         }
+        // Durable retraction on this MERGE path (existing settings.json is
+        // read + merged, never rebuilt): drop any owned-namespace key
+        // (bare `ms-365` or `ms-365-<slug>`) still present from a prior
+        // apply that is no longer emitted — e.g. an account removed from
+        // `microsoft_workspace.accounts`. Without this the stale per-account
+        // key lingers in settings.json.mcpServers across `switchroom apply`.
+        //
+        // This IS load-bearing, not hygiene: the main session's `exec claude`
+        // in profiles/_base/start.sh.hbs does NOT pass `--strict-mcp-config`
+        // (only the cron session does — cron-session.sh.hbs), so Claude Code
+        // loads MCP servers from settings.json.mcpServers in ADDITION to
+        // .mcp.json. A stale `ms-365-<slug>` left here would resurrect the
+        // removed account's tool namespace. (The reconcileAgentInner
+        // settings.json + .mcp.json paths rebuild `mcpServers` from scratch,
+        // so they retract fully-removed slugs by reconstruction — this merge
+        // path is the only one that needs an explicit prefix-scoped diff.)
+        retractStaleIntegrationKeys(
+          integration,
+          new Set(entries.map((e) => e.key)),
+          settings.mcpServers,
+          site1Protected,
+        );
       }
 
       // Hindsight memory plugin install (replaces our old shell hook).
@@ -4245,8 +4455,12 @@ export function scaffoldAgent(
       // INTEGRATION_MCP_RESOLVERS so two integrations never silently
       // disagree on precedence between sites.
       for (const integration of INTEGRATION_MCP_RESOLVERS) {
-        const entry = integration.resolve(name, agentConfig, switchroomConfig);
-        if (entry) {
+        for (const entry of integrationMcpEntries(
+          integration,
+          name,
+          agentConfig,
+          switchroomConfig,
+        )) {
           mcpServers[entry.key] = entry.value;
         }
       }
@@ -6516,11 +6730,24 @@ function reconcileAgentInner(
       // from its emit key cannot silently drift between emit and
       // retract paths. Mirrors how #235 switchroom-mcp retraction works.
       for (const integration of INTEGRATION_MCP_RESOLVERS) {
-        const entry = integration.resolve(name, agentConfig, switchroomConfig);
-        if (entry) {
+        for (const entry of integrationMcpEntries(
+          integration,
+          name,
+          agentConfig,
+          switchroomConfig,
+        )) {
           mcpServers[entry.key] = entry.value;
-        } else {
-          delete mcpServers[integration.retractionKey];
+        }
+        // Retract every owned key NOT in the current emit set — for the
+        // plural ms-365 integration this deletes stale `ms-365-<slug>`
+        // entries when an agent's bindings shrink or an ACL is revoked.
+        for (const stale of integrationRetractionKeys(
+          integration,
+          name,
+          agentConfig,
+          switchroomConfig,
+        )) {
+          delete mcpServers[stale];
         }
       }
     }
@@ -6883,8 +7110,12 @@ function reconcileAgentInner(
       // fresh from the hardcoded set each reconcile, so a retracted
       // entry simply isn't re-added (no explicit delete needed).
       for (const integration of INTEGRATION_MCP_RESOLVERS) {
-        const entry = integration.resolve(name, agentConfig, switchroomConfig);
-        if (entry) {
+        for (const entry of integrationMcpEntries(
+          integration,
+          name,
+          agentConfig,
+          switchroomConfig,
+        )) {
           mcpServers[entry.key] = entry.value;
         }
       }

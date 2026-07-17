@@ -51,6 +51,7 @@ import { randomBytes } from "node:crypto";
 
 import {
   loadMicrosoftFromAuthBroker,
+  resolveMicrosoftAccountBySlug,
   fetchCalendarEventContext,
   type Ms365AccessHandle,
   type CalendarEventContext,
@@ -82,7 +83,40 @@ const GATEWAY_SOCKET =
 const KERNEL_SOCKET =
   process.env.SWITCHROOM_KERNEL_SOCKET ?? "/run/switchroom/kernel/sock";
 
-const TOOL_PREFIX = "mcp__ms-365__";
+/**
+ * Multi-account-aware MS-365 tool-name matcher. Matches BOTH the bare
+ * single-account server key (`mcp__ms-365__<tool>`) AND the per-account
+ * multi-account keys (`mcp__ms-365-<slug>__<tool>`), capturing the bare
+ * softeria tool name after the LAST `__`.
+ *
+ * MERGE-BLOCKER (multi-account RFC §2.5): before this, the gate keyed off
+ * the literal `mcp__ms-365__` prefix, so every `mcp__ms-365-<slug>__*`
+ * write tool sailed through UN-gated (fail-open). The `(-[a-z0-9-]+)?`
+ * group closes that.
+ */
+const MS365_TOOL_RE = /^mcp__ms-365(?:-([a-z0-9-]+))?__(.+)$/;
+
+/**
+ * Return the bare softeria tool name if `toolName` is on the MS-365
+ * surface (single OR multi-account server key), else null.
+ */
+export function ms365BareToolName(toolName: string): string | null {
+  const m = MS365_TOOL_RE.exec(toolName);
+  return m ? m[2] : null;
+}
+
+/**
+ * Return the per-account MCP-key slug if `toolName` is on a MULTI-account
+ * MS-365 server key (`mcp__ms-365-<slug>__<tool>` → `<slug>`), else null
+ * (bare single-account key `mcp__ms-365__<tool>`, or not our surface).
+ *
+ * The slug is what threads the correct account through the enrichment path
+ * on a multi-account agent (review 2026-07-17, Finding 1).
+ */
+export function ms365AccountSlugFromToolName(toolName: string): string | null {
+  const m = MS365_TOOL_RE.exec(toolName);
+  return m && m[1] ? m[1] : null;
+}
 
 /**
  * Gated softeria write tools — AUTHORITATIVE names.
@@ -240,8 +274,9 @@ export const KNOWN_SAFE_MS365_READ_TOOLS = new Set<string>([
  *     unrecognized / renamed tool) → true (gate).
  */
 export function isGatedMs365Tool(toolName: string): boolean {
-  if (!toolName.startsWith(TOOL_PREFIX)) return false;
-  const bare = toolName.slice(TOOL_PREFIX.length);
+  const bare = ms365BareToolName(toolName);
+  // Not an MS-365 tool (single or multi-account) → not our surface.
+  if (bare === null) return false;
   // Degenerate prefix-only name — not a real tool invocation.
   if (bare.length === 0) return false;
   // Verified read-only tools pass through without a card.
@@ -367,8 +402,8 @@ export interface Ms365CalendarEnrichment {
  * a single event id are excluded — nothing to resolve.)
  */
 export function isCalendarEventTool(toolName: string): boolean {
-  if (!toolName.startsWith(TOOL_PREFIX)) return false;
-  const bare = toolName.slice(TOOL_PREFIX.length);
+  const bare = ms365BareToolName(toolName);
+  if (bare === null) return false;
   return bare.includes("calendar-event");
 }
 
@@ -479,7 +514,19 @@ export function buildCalendarChanges(
 }
 
 export interface EnrichCalendarDeps {
-  loadHandle?: () => Promise<Ms365AccessHandle | null>;
+  /**
+   * Load the Graph access handle for a specific account. The `account`
+   * argument is the email resolved from the tool-name slug — threading it
+   * is what makes the card enrich against the RIGHT mailbox on a
+   * multi-account agent (Finding 1). `undefined` → single-account
+   * back-compat (broker derives the sole account from config).
+   */
+  loadHandle?: (account?: string) => Promise<Ms365AccessHandle | null>;
+  /**
+   * Resolve the per-account slug (from the tool name) back to an account
+   * email. Injectable for tests; defaults to the broker inventory match.
+   */
+  resolveAccount?: (slug: string | null) => Promise<string | null>;
   fetchEvent?: (args: {
     accessToken: string;
     eventId: string;
@@ -498,15 +545,36 @@ export async function enrichCalendarPreview(
   deps: EnrichCalendarDeps = {},
 ): Promise<Ms365CalendarEnrichment> {
   if (!isCalendarEventTool(toolName)) return {};
-  const loadHandle = deps.loadHandle ?? (() => loadMicrosoftFromAuthBroker());
+  const loadHandle =
+    deps.loadHandle ??
+    ((account?: string) =>
+      loadMicrosoftFromAuthBroker(
+        account !== undefined ? { account } : {},
+      ));
+  const resolveAccount =
+    deps.resolveAccount ??
+    ((slug: string | null) => resolveMicrosoftAccountBySlug(slug));
   const fetchEvent =
     deps.fetchEvent ??
     ((a: { accessToken: string; eventId: string }) =>
       fetchCalendarEventContext(a));
 
+  // Multi-account agents key each binding as `mcp__ms-365-<slug>__*`. Resolve
+  // the slug back to the account email so the broker returns THAT mailbox's
+  // token — not the account-less back-compat `bindings[0]` (Finding 1). On a
+  // single-account (bare) key the slug is null → account stays undefined and
+  // the broker derives the sole configured account.
+  const slug = ms365AccountSlugFromToolName(toolName);
+  let account: string | undefined;
+  try {
+    account = (await resolveAccount(slug)) ?? undefined;
+  } catch {
+    account = undefined;
+  }
+
   let handle: Ms365AccessHandle | null;
   try {
-    handle = await loadHandle();
+    handle = await loadHandle(account);
   } catch {
     return { resolveAttemptedButFailed: true };
   }

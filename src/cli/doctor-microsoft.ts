@@ -36,6 +36,11 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 
 import type { SwitchroomConfig } from "../config/schema.js";
+import {
+  bindingsForAgent,
+  isMultiAccount,
+  microsoftAccountSlug,
+} from "../config/microsoft-workspace-acl.js";
 
 import type { CheckStatus } from "./doctor-status.js";
 import { checkIntegrationScaffoldWiring } from "./doctor-scaffold-wiring.js";
@@ -192,11 +197,31 @@ interface LauncherHeartbeat {
   expiresAtMs: number;
 }
 
-function readHeartbeat(
+/**
+ * The heartbeat filename for a binding — mirrors
+ * `heartbeatPath()` in m365-mcp-launcher.ts. Single-account agents keep
+ * the bare `m365-launcher.heartbeat.json`; multi-account agents get one
+ * `m365-launcher-<slug>.heartbeat.json` per bound account so N launchers
+ * don't clobber each other.
+ */
+function heartbeatFileName(
+  config: SwitchroomConfig,
+  agentName: string,
+  account: string,
+): string {
+  const mw = config.agents?.[agentName]?.microsoft_workspace;
+  if (isMultiAccount(mw)) {
+    return `m365-launcher-${microsoftAccountSlug(account)}.heartbeat.json`;
+  }
+  return "m365-launcher.heartbeat.json";
+}
+
+function readHeartbeatFile(
   d: ResolvedDeps,
   agentName: string,
+  fileName: string,
 ): LauncherHeartbeat | { error: string } {
-  const path = join(d.agentsDir, agentName, "m365-launcher.heartbeat.json");
+  const path = join(d.agentsDir, agentName, fileName);
   if (!d.existsSync(path)) {
     return { error: "heartbeat file missing — launcher has not yet started" };
   }
@@ -217,21 +242,49 @@ function readHeartbeat(
 }
 
 function checkLauncherHeartbeat(
+  config: SwitchroomConfig,
   msEnabledAgents: string[],
   d: ResolvedDeps,
 ): CheckResult[] {
   const results: CheckResult[] = [];
   for (const name of msEnabledAgents) {
-    const hb = readHeartbeat(d, name);
-    if ("error" in hb) {
-      results.push({
-        name: `microsoft:launcher-heartbeat:${name}`,
-        status: "warn",
-        detail: `${hb.error} (path: ~/.switchroom/agents/${name}/m365-launcher.heartbeat.json)`,
-        fix: `Launcher writes the heartbeat on its first refresh tick. If agent has been running for >5min and the file is still missing, check the launcher log via 'docker logs switchroom-${name}'.`,
-      });
-      continue;
+    // One heartbeat per passing binding (bare file for single-account,
+    // per-slug files for multi-account). Read them all.
+    const bindings = bindingsForAgent(
+      name,
+      config.agents?.[name]?.microsoft_workspace,
+      config.microsoft_accounts,
+    );
+    for (const b of bindings) {
+      const multi = bindings.length > 1 || isMultiAccount(config.agents?.[name]?.microsoft_workspace);
+      const checkName = multi
+        ? `microsoft:launcher-heartbeat:${name}:${b.account}`
+        : `microsoft:launcher-heartbeat:${name}`;
+      const fileName = heartbeatFileName(config, name, b.account);
+      const hb = readHeartbeatFile(d, name, fileName);
+      if ("error" in hb) {
+        results.push({
+          name: checkName,
+          status: "warn",
+          detail: `${hb.error} (path: ~/.switchroom/agents/${name}/${fileName})`,
+          fix: `Launcher writes the heartbeat on its first refresh tick. If agent has been running for >5min and the file is still missing, check the launcher log via 'docker logs switchroom-${name}'.`,
+        });
+        continue;
+      }
+      results.push(...evaluateHeartbeat(checkName, hb, name, d));
     }
+  }
+  return results;
+}
+
+function evaluateHeartbeat(
+  checkName: string,
+  hb: LauncherHeartbeat,
+  name: string,
+  d: ResolvedDeps,
+): CheckResult[] {
+  const results: CheckResult[] = [];
+  {
     const now = d.now();
     const ageSinceLastRefresh = now - hb.lastRefreshMs;
     const untilNextRefresh = hb.nextRefreshMs - now;
@@ -239,21 +292,21 @@ function checkLauncherHeartbeat(
     // OR nextRefreshMs in the past (refresh tick didn't fire when scheduled).
     if (ageSinceLastRefresh > 90 * 60 * 1000) {
       results.push({
-        name: `microsoft:launcher-heartbeat:${name}`,
+        name: checkName,
         status: "fail",
         detail: `last refresh was ${Math.round(ageSinceLastRefresh / 60000)}min ago (>90min) — launcher refresh loop appears dead`,
         fix: `Restart the agent: 'switchroom agent restart ${name}'. If problem recurs, check launcher logs for broker/network failures.`,
       });
     } else if (untilNextRefresh < -5 * 60 * 1000) {
       results.push({
-        name: `microsoft:launcher-heartbeat:${name}`,
+        name: checkName,
         status: "warn",
         detail: `nextRefreshMs was ${Math.round(-untilNextRefresh / 60000)}min ago — refresh tick missed its scheduled time`,
         fix: `Tick is overdue but not yet stale. Monitor; if it doesn't update within a few minutes, restart the agent.`,
       });
     } else {
       results.push({
-        name: `microsoft:launcher-heartbeat:${name}`,
+        name: checkName,
         status: "ok",
         detail: `last refresh ${Math.round(ageSinceLastRefresh / 60000)}min ago, next in ${Math.round(untilNextRefresh / 60000)}min`,
       });
@@ -284,15 +337,16 @@ export function computeMicrosoftEnabledAgents(
   // invariant ever weakens, route through `shouldEmitMs365Mcp` from
   // `src/config/microsoft-workspace-acl.ts` (which re-normalizes
   // defensively) to keep this in sync with the scaffold gate.
-  const accounts = config.microsoft_accounts ?? {};
-  return Object.keys(config.agents ?? {}).filter((name) => {
-    const acct = agentMicrosoftAccount(config, name);
-    return (
-      !!acct &&
-      !!accounts[acct] &&
-      (accounts[acct].enabled_for ?? []).includes(name)
-    );
-  });
+  // Multi-account-aware: an agent is "enabled" iff AT LEAST ONE of its
+  // Microsoft bindings (singular OR plural) passes the twin-key gate.
+  return Object.keys(config.agents ?? {}).filter(
+    (name) =>
+      bindingsForAgent(
+        name,
+        config.agents?.[name]?.microsoft_workspace,
+        config.microsoft_accounts,
+      ).length > 0,
+  );
 }
 
 export function runMicrosoftChecks(
@@ -317,7 +371,7 @@ export function runMicrosoftChecks(
 
   const msAgents = computeMicrosoftEnabledAgents(config);
   results.push(...checkOAuthClient(config, msAgents.length > 0));
-  results.push(...checkLauncherHeartbeat(msAgents, d));
+  results.push(...checkLauncherHeartbeat(config, msAgents, d));
   results.push(
     ...checkIntegrationScaffoldWiring({
       label: "microsoft",

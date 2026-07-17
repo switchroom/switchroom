@@ -43,6 +43,15 @@ export interface LoadMicrosoftFromAuthBrokerOptions {
   /** Override the broker socket path (tests pass a tmp socket). */
   socketPath?: string;
   /**
+   * The Microsoft account (email) to resolve credentials for. On a
+   * multi-account agent this MUST be threaded so the broker returns the
+   * token for the RIGHT mailbox — otherwise the account-less back-compat
+   * branch returns `bindings[0]`'s token and the card enriches against the
+   * wrong account (review 2026-07-17, Finding 1). Omitted → single-account
+   * back-compat (broker derives the sole account from config).
+   */
+  account?: string;
+  /**
    * If the broker's credentials expire within this many ms, treat them as
    * unusable and return null (caller degrades gracefully). Default 60_000.
    */
@@ -75,7 +84,7 @@ export async function loadMicrosoftFromAuthBroker(
   try {
     result = await withAuthBrokerClient(
       async (client) => {
-        return (await client.getCredentials("microsoft")) as {
+        return (await client.getCredentials("microsoft", options.account)) as {
           account: string;
           credentials: unknown;
           expiresAt?: number;
@@ -114,6 +123,70 @@ export async function loadMicrosoftFromAuthBroker(
     expires_at: expiresAt,
     account_email: creds.microsoftOauth?.accountEmail,
   };
+}
+
+/** Options for {@link resolveMicrosoftAccountBySlug}. */
+export interface ResolveAccountBySlugOptions {
+  /** Override the broker socket path (tests pass a tmp socket). */
+  socketPath?: string;
+  /**
+   * Injectable account inventory (tests). Defaults to the broker's
+   * `list-microsoft-accounts`. Returns candidate account emails.
+   */
+  listAccounts?: () => Promise<string[]>;
+}
+
+/**
+ * Map a per-account MCP-key slug (`ms-365-<slug>` → `<slug>`) back to the
+ * Microsoft account email it was derived from, by recomputing
+ * `microsoftAccountSlug` over the broker's account inventory and matching.
+ *
+ * This is how the write-approval hook threads the CORRECT account on a
+ * multi-account agent: the invoking tool name (`mcp__ms-365-<slug>__*`)
+ * carries the slug, and we resolve it to an email to pass to
+ * `getCredentials("microsoft", account)` (review 2026-07-17, Finding 1).
+ *
+ * Fail-soft: returns `null` when the broker is unreachable, no slug is
+ * given (single-account back-compat), or nothing matches — the caller then
+ * falls back to the account-less broker path. The broker's per-agent ACL
+ * still applies downstream, so a slug that resolves to an account the agent
+ * isn't bound to is rejected there (never a silent cross-account leak).
+ */
+export async function resolveMicrosoftAccountBySlug(
+  slug: string | null | undefined,
+  options: ResolveAccountBySlugOptions = {},
+): Promise<string | null> {
+  if (!slug) return null;
+  const { microsoftAccountSlug } = await import(
+    "../config/microsoft-workspace-acl.js"
+  );
+
+  let accounts: string[];
+  try {
+    if (options.listAccounts) {
+      accounts = await options.listAccounts();
+    } else {
+      const { withAuthBrokerClient } = await import("../auth/broker/client.js");
+      accounts = await withAuthBrokerClient(
+        async (client) => {
+          const data = (await client.listMicrosoftAccounts()) as {
+            accounts?: Array<{ account?: string }>;
+          };
+          return (data.accounts ?? [])
+            .map((a) => a.account)
+            .filter((a): a is string => typeof a === "string");
+        },
+        options.socketPath !== undefined ? { socket: options.socketPath } : undefined,
+      );
+    }
+  } catch {
+    return null;
+  }
+
+  for (const account of accounts) {
+    if (microsoftAccountSlug(account) === slug) return account;
+  }
+  return null;
 }
 
 // ────────────────────────────────────────────────────────────────────────

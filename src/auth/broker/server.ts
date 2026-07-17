@@ -110,6 +110,10 @@ import {
   writeMicrosoftAccountCredentials,
 } from "./microsoft-storage.js";
 import { ProviderRegistry, type ProviderName } from "./provider.js";
+import {
+  normalizeMicrosoftBindings,
+  type MicrosoftWorkspaceLike,
+} from "../../config/microsoft-workspace-acl.js";
 import type { GoogleCredentialsShape, MicrosoftCredentialsShape } from "./protocol.js";
 import {
   accountCredentialsPath,
@@ -1043,7 +1047,12 @@ export class AuthBroker {
             break;
           }
           if (provider === "microsoft") {
-            await this.opMicrosoftGetCredentials(socket, reqId, identity);
+            await this.opMicrosoftGetCredentials(
+              socket,
+              reqId,
+              identity,
+              req.account,
+            );
             break;
           }
           socket.write(
@@ -3266,6 +3275,7 @@ export class AuthBroker {
     socket: net.Socket,
     id: string,
     identity: Identity,
+    requestedAccount?: string,
   ): Promise<void> {
     if (identity.kind !== "agent") {
       socket.write(
@@ -3279,9 +3289,51 @@ export class AuthBroker {
     }
     const agentName = identity.name;
     const agent = (this.config.agents ?? {})[agentName] as
-      | { microsoft_workspace?: { account?: string } }
+      | { microsoft_workspace?: MicrosoftWorkspaceLike }
       | undefined;
-    const account = agent?.microsoft_workspace?.account;
+    const bindings = normalizeMicrosoftBindings(agent?.microsoft_workspace);
+    let account: string | undefined;
+    if (requestedAccount !== undefined) {
+      // Multi-account form: the requested account must be one of the
+      // agent's bindings. A mismatch keeps the ACCOUNT_NOT_FOUND code so
+      // nothing silently downgrades.
+      const wanted = requestedAccount.trim().toLowerCase();
+      const bound = bindings.find((b) => b.account === wanted);
+      if (!bound) {
+        this.audit({ op: "get-credentials", identity, account: wanted, accountKind: "microsoft", ok: false, error: "account-not-bound" });
+        socket.write(
+          encodeError(
+            id,
+            "ACCOUNT_NOT_FOUND",
+            `agent '${agentName}' is not bound to Microsoft account '${wanted}' in switchroom.yaml microsoft_workspace`,
+          ),
+        );
+        return;
+      }
+      account = bound.account;
+    } else if (bindings.length > 1) {
+      // Multi-account agent but NO account requested. Silently returning
+      // bindings[0] here is the root of the write-approval-card mis-resolve
+      // (review 2026-07-17, Finding 2): callers that forget to thread the
+      // account would enrich/act against the wrong mailbox. Fail loudly with
+      // a hint instead — every legitimate multi-account caller passes the
+      // account explicitly.
+      this.audit({ op: "get-credentials", identity, accountKind: "microsoft", ok: false, error: "account-ambiguous" });
+      socket.write(
+        encodeError(
+          id,
+          "INVALID_ARGS",
+          `agent '${agentName}' is bound to ${bindings.length} Microsoft accounts (${bindings
+            .map((b) => b.account)
+            .join(", ")}); an account must be specified — call getCredentials("microsoft", <account>)`,
+        ),
+      );
+      return;
+    } else {
+      // Back-compat: derive the single account from the (normalized)
+      // bindings. Exactly one binding is expected in the singular form.
+      account = bindings[0]?.account;
+    }
     if (!account) {
       this.audit({ op: "get-credentials", identity, accountKind: "microsoft", ok: false, error: "no-microsoft-account-configured" });
       socket.write(

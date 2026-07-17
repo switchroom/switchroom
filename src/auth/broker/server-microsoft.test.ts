@@ -719,3 +719,189 @@ describe("AuthBroker — Microsoft refresh-tick", () => {
     broker.stop();
   });
 });
+
+describe("AuthBroker — Microsoft get-credentials, multi-account per agent", () => {
+  it("returns the REQUESTED account's creds when the agent binds multiple accounts", async () => {
+    const h = makeHarness();
+    const config = makeConfig(h, {
+      agents: {
+        marko: {
+          microsoft_workspace: {
+            accounts: [
+              { account: "alice@example.com", tools: ["list-drives"] },
+              { account: "bob@example.com", tools: ["list-mail-messages"] },
+            ],
+          },
+        },
+      },
+      microsoftAccounts: {
+        "alice@example.com": { enabled_for: ["marko"] },
+        "bob@example.com": { enabled_for: ["marko"] },
+      },
+    });
+    seedMicrosoftAccount(h, "alice@example.com", {
+      expiresAt: Date.now() + 3600_000,
+      accessToken: "at-storage",
+    });
+    seedMicrosoftAccount(h, "bob@example.com", {
+      expiresAt: Date.now() + 3600_000,
+      accessToken: "at-mail",
+    });
+
+    const broker = new AuthBroker(config, {
+      home: h.home,
+      stateDir: h.stateDir,
+      socketRoot: h.socketRoot,
+      disableRefreshLoop: true,
+    });
+    await broker.start();
+
+    const storage = (await rpc(join(h.socketRoot, "marko", "sock"), {
+      v: 1,
+      id: "mm-1",
+      op: "get-credentials",
+      provider: "microsoft",
+      account: "alice@example.com",
+    })) as { ok: true; data: { account: string; credentials: MicrosoftCredentialsShape } };
+    expect(storage.ok).toBe(true);
+    expect(storage.data.account).toBe("alice@example.com");
+    expect(storage.data.credentials.microsoftOauth.accessToken).toBe("at-storage");
+
+    const mail = (await rpc(join(h.socketRoot, "marko", "sock"), {
+      v: 1,
+      id: "mm-2",
+      op: "get-credentials",
+      provider: "microsoft",
+      account: "bob@example.com",
+    })) as { ok: true; data: { account: string; credentials: MicrosoftCredentialsShape } };
+    expect(mail.ok).toBe(true);
+    expect(mail.data.account).toBe("bob@example.com");
+    expect(mail.data.credentials.microsoftOauth.accessToken).toBe("at-mail");
+
+    broker.stop();
+  });
+
+  it("ACCOUNT_NOT_FOUND when the requested account is not one of the agent's bindings", async () => {
+    const h = makeHarness();
+    const config = makeConfig(h, {
+      agents: {
+        marko: {
+          microsoft_workspace: {
+            accounts: [{ account: "bob@example.com" }],
+          },
+        },
+      },
+      microsoftAccounts: {
+        "bob@example.com": { enabled_for: ["marko"] },
+        "someone@else.com": { enabled_for: ["marko"] },
+      },
+    });
+    seedMicrosoftAccount(h, "someone@else.com", { expiresAt: Date.now() + 3600_000 });
+
+    const broker = new AuthBroker(config, {
+      home: h.home,
+      stateDir: h.stateDir,
+      socketRoot: h.socketRoot,
+      disableRefreshLoop: true,
+    });
+    await broker.start();
+
+    const resp = (await rpc(join(h.socketRoot, "marko", "sock"), {
+      v: 1,
+      id: "mm-3",
+      op: "get-credentials",
+      provider: "microsoft",
+      account: "someone@else.com",
+    })) as { ok: false; error: { code: string } };
+    expect(resp.ok).toBe(false);
+    expect(resp.error.code).toBe("ACCOUNT_NOT_FOUND");
+
+    broker.stop();
+  });
+
+  it("FORBIDDEN when a bound account does not list the agent in enabled_for[]", async () => {
+    const h = makeHarness();
+    const config = makeConfig(h, {
+      agents: {
+        marko: {
+          microsoft_workspace: {
+            accounts: [{ account: "bob@example.com" }],
+          },
+        },
+      },
+      // bound, but enabled for a DIFFERENT agent → per-account ACL miss.
+      microsoftAccounts: { "bob@example.com": { enabled_for: ["clerk"] } },
+    });
+    seedMicrosoftAccount(h, "bob@example.com", { expiresAt: Date.now() + 3600_000 });
+
+    const broker = new AuthBroker(config, {
+      home: h.home,
+      stateDir: h.stateDir,
+      socketRoot: h.socketRoot,
+      disableRefreshLoop: true,
+    });
+    await broker.start();
+
+    const resp = (await rpc(join(h.socketRoot, "marko", "sock"), {
+      v: 1,
+      id: "mm-4",
+      op: "get-credentials",
+      provider: "microsoft",
+      account: "bob@example.com",
+    })) as { ok: false; error: { code: string } };
+    expect(resp.ok).toBe(false);
+    expect(resp.error.code).toBe("FORBIDDEN");
+
+    broker.stop();
+  });
+
+  it("Finding 2 — INVALID_ARGS (not a silent bindings[0]) when multi-account and NO account requested", async () => {
+    const h = makeHarness();
+    const config = makeConfig(h, {
+      agents: {
+        marko: {
+          microsoft_workspace: {
+            accounts: [
+              { account: "alice@example.com" },
+              { account: "bob@example.com" },
+            ],
+          },
+        },
+      },
+      microsoftAccounts: {
+        "alice@example.com": { enabled_for: ["marko"] },
+        "bob@example.com": { enabled_for: ["marko"] },
+      },
+    });
+    seedMicrosoftAccount(h, "alice@example.com", {
+      expiresAt: Date.now() + 3600_000,
+      accessToken: "at-alice",
+    });
+    seedMicrosoftAccount(h, "bob@example.com", {
+      expiresAt: Date.now() + 3600_000,
+      accessToken: "at-bob",
+    });
+
+    const broker = new AuthBroker(config, {
+      home: h.home,
+      stateDir: h.stateDir,
+      socketRoot: h.socketRoot,
+      disableRefreshLoop: true,
+    });
+    await broker.start();
+
+    // Account-less request on a multi-account agent must NOT silently return
+    // bindings[0] (alice) — that was the root of the wrong-account card.
+    const resp = (await rpc(join(h.socketRoot, "marko", "sock"), {
+      v: 1,
+      id: "mm-5",
+      op: "get-credentials",
+      provider: "microsoft",
+    })) as { ok: false; error: { code: string; message: string } };
+    expect(resp.ok).toBe(false);
+    expect(resp.error.code).toBe("INVALID_ARGS");
+    expect(resp.error.message).toContain("account must be specified");
+
+    broker.stop();
+  });
+});

@@ -237,6 +237,23 @@ export interface Ms365McpEntryOptions {
    * resolved choice visible in settings.json.
    */
   orgMode?: boolean;
+  /**
+   * The MCP server key. Single-account agents keep the bare `ms-365`
+   * (back-compat); multi-account agents get `ms-365-<slug>` per binding.
+   * Defaults to `ms-365`.
+   */
+  key?: string;
+  /**
+   * The Microsoft account this entry binds. When set, threaded to the
+   * launcher as `--account <email>` so it fetches THAT account's token
+   * from the broker. Omitted (singular back-compat) → no `--account`.
+   */
+  account?: string;
+  /**
+   * Per-account tool allowlist → softeria `--enabled-tools <regex>`
+   * (tokens joined with `|`). Omitted = all tools for this account.
+   */
+  enabledTools?: string[];
 }
 
 /**
@@ -252,12 +269,17 @@ export function getMs365McpSettingsEntry(
   switchroomCliPath: string,
   options: Ms365McpEntryOptions = {},
 ): { key: string; value: McpServerConfig } {
-  const orgArgs = options.orgMode ? ["--org-mode"] : [];
+  const args: string[] = ["m365-mcp-launcher"];
+  if (options.orgMode) args.push("--org-mode");
+  if (options.account) args.push("--account", options.account);
+  if (options.enabledTools && options.enabledTools.length > 0) {
+    args.push("--enabled-tools", options.enabledTools.join("|"));
+  }
   return {
-    key: "ms-365",
+    key: options.key ?? "ms-365",
     value: {
       command: switchroomCliPath,
-      args: ["m365-mcp-launcher", ...orgArgs],
+      args,
     },
   };
 }
