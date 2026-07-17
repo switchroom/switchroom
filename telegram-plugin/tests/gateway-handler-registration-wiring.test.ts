@@ -18,6 +18,13 @@
  * module top-level (which would change its evaluation order relative to the
  * single call site).
  *
+ * P0b (#2996) update: the single `registerGatewayHandlers(bot, {})` call moved
+ * OFF module top level into the boot function `initGatewayBot()` — because P0b
+ * defers `new Bot` construction to boot, so `bot` no longer exists at import.
+ * The call still fires exactly once, after construction and before the runner,
+ * preserving registration order. The call-site assertion below now pins that
+ * new location (zero top-level calls; exactly one inside initGatewayBot).
+ *
  * The golden sequence below was captured from `origin/main` immediately
  * BEFORE the move (parser-extracted top-level `bot.*` order) so the same
  * assertion holds pre- and post-move — the ordered list is a behaviour
@@ -209,8 +216,12 @@ describe('gateway #2996 P0a: registerGatewayHandlers is the single ordered regis
     expect(leaked).toEqual([])
   })
 
-  it('calls registerGatewayHandlers(bot, ...) exactly once at module top level', () => {
-    let calls = 0
+  it('calls registerGatewayHandlers(bot, ...) exactly once, inside initGatewayBot (P0b), never at module top level', () => {
+    // P0b (#2996): the call moved off module top level into the boot function
+    // initGatewayBot(). Assert (a) ZERO top-level calls — proving the deferral —
+    // and (b) exactly one call in the whole file, with `bot` as its first arg,
+    // located inside initGatewayBot's body.
+    let topLevelCalls = 0
     for (const stmt of sourceFile.statements) {
       if (
         ts.isExpressionStatement(stmt) &&
@@ -218,12 +229,38 @@ describe('gateway #2996 P0a: registerGatewayHandlers is the single ordered regis
         ts.isIdentifier(stmt.expression.expression) &&
         stmt.expression.expression.text === 'registerGatewayHandlers'
       ) {
-        calls++
-        // first arg is the bot singleton
-        expect(stmt.expression.arguments[0]?.getText(sourceFile)).toBe('bot')
+        topLevelCalls++
       }
     }
-    expect(calls).toBe(1)
+    expect(topLevelCalls).toBe(0)
+
+    // Count every registerGatewayHandlers(...) call anywhere in the module, and
+    // record whether it is lexically inside the initGatewayBot function.
+    const initGatewayBot = findFunction('initGatewayBot')
+    expect(initGatewayBot).toBeDefined()
+    const initStart = initGatewayBot!.getStart(sourceFile)
+    const initEnd = initGatewayBot!.getEnd()
+
+    let totalCalls = 0
+    let callsInsideInit = 0
+    const visit = (node: ts.Node): void => {
+      if (
+        ts.isCallExpression(node) &&
+        ts.isIdentifier(node.expression) &&
+        node.expression.text === 'registerGatewayHandlers'
+      ) {
+        totalCalls++
+        // first arg is the bot singleton
+        expect(node.arguments[0]?.getText(sourceFile)).toBe('bot')
+        const start = node.getStart(sourceFile)
+        if (start >= initStart && node.getEnd() <= initEnd) callsInsideInit++
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(sourceFile)
+
+    expect(totalCalls).toBe(1)
+    expect(callsInsideInit).toBe(1)
   })
 
   it('registers the admin-gate middleware (bot.use) FIRST and the error boundary (bot.catch) LAST', () => {
