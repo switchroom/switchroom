@@ -646,6 +646,15 @@ export interface CombinedWorkerRow {
   /** Running total tokens for this worker — rendered as `· {N} tok` on the row
    *  header. Omitted (0/undefined) → no token segment. */
   totalTokens?: number
+  /**
+   * Stable per-card ordinal (1-based), assigned when the worker joins its feed
+   * group and KEPT for the card's lifetime — survivors keep their numbers when
+   * an earlier worker finishes (the card may show `2.`/`3.` with no `1.`; the
+   * `N running` chrome carries the count). Rendered as a `{ordinal}. ` prefix
+   * inside the bold header when the card has 2+ rows. Omitted → unnumbered
+   * (back-compat for direct callers).
+   */
+  ordinal?: number
 }
 
 export interface CombinedWorkerFeedOpts {
@@ -687,12 +696,18 @@ export function combinedHistoryDepth(w: number): number {
  * markdown; callers send verbatim — do NOT re-escape). Layout:
  *
  *   🛠 **Workers** · _N running_
- *   **{desc1}** _· {elapsed} · {n} tools_
+ *   **1. {desc1}** _· {elapsed} · {n} tools_
  *   ~~_✓ {earlier step}_~~
  *   **→ {newest step}**
- *   **{desc2}** _· {elapsed} · {n} tools_
+ *   **2. {desc2}** _· {elapsed} · {n} tools_
  *   **→ {newest step}**
  *   _+M more working…_
+ *
+ * NUMBERING (#3298): when the card tracks 2+ rows AND a row carries `ordinal`,
+ * its header gets a stable `{ordinal}. ` prefix. Ordinals are assigned by the
+ * caller at dispatch and kept for the card's life — after an earlier worker
+ * finishes the survivors keep their numbers (`2.`, `3.` with no `1.`). A lone
+ * row, or rows without ordinals, render unnumbered.
  *
  * ADAPTIVE DENSITY: each visible worker renders its last-K narrative lines as a
  * `✓`/`→` trail (prior steps struck, newest bold in-progress) — the single-
@@ -716,6 +731,11 @@ export function renderCombinedWorkerFeed(
   if (rows.length === 0) return null
   const maxRows = Math.max(1, Math.floor(opts.maxRows))
 
+  // Number the workers only when the CARD tracks 2+ (a lone worker stays
+  // unnumbered). Uses the total row count, not the visible count, so ordinals
+  // don't appear/vanish as the overflow backstop shrinks the visible set.
+  const numbered = rows.length >= 2
+
   const rowHeader = (r: CombinedWorkerRow): string => {
     const desc = escapeMarkdown(
       truncate(stripMarkdown(r.description).replace(/\s+/g, ' ').trim() || 'background task', COMBINED_ROW_DESC_MAX),
@@ -724,7 +744,11 @@ export function renderCombinedWorkerFeed(
     const tokPart = tokenSegment(r.totalTokens)
     const modelLabel = formatModelLabel(r.model)
     const modelPart = modelLabel != null ? ` · ${escapeMarkdown(modelLabel)}` : ''
-    return `**${desc}** _· ${formatFeedElapsed(r.elapsedMs)} · ${r.toolCount} ${toolWord}${tokPart}${modelPart}_`
+    // Stable ordinal prefix INSIDE the bold span, before the already-escaped
+    // description — no new escaping surface, and the gateway md→HTML conversion
+    // has no ordered-list auto-formatting on bolded text.
+    const num = numbered && r.ordinal != null ? `${r.ordinal}. ` : ''
+    return `**${num}${desc}** _· ${formatFeedElapsed(r.elapsedMs)} · ${r.toolCount} ${toolWord}${tokPart}${modelPart}_`
   }
 
   // Raw (unescaped) history for a worker, oldest→newest, empty lines stripped.
