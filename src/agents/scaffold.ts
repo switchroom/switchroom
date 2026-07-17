@@ -1363,7 +1363,19 @@ export const SWITCHROOM_DEFAULT_THINKING_EFFORT = "low";
  */
 export function resolveMainModel(model: string | undefined): string {
   if (model === undefined || model === "default") return SWITCHROOM_DEFAULT_MAIN_MODEL;
-  return model;
+  return normalizeModelAlias(model);
+}
+
+/**
+ * Prefer the `fable` alias over the retired `claude-fable-5` codename in
+ * anything we launch or persist. The codename 4xxs direct-to-Anthropic and
+ * only resolves via the LiteLLM router; the alias resolves everywhere the
+ * model is reachable at all (the claude CLI maps it via
+ * ANTHROPIC_DEFAULT_FABLE_MODEL), so it is the only safe spelling to write.
+ * Everything else passes through unchanged.
+ */
+export function normalizeModelAlias(model: string): string {
+  return model === "claude-fable-5" ? "fable" : model;
 }
 
 /**

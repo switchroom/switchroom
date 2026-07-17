@@ -4,6 +4,27 @@
 
 ### Fixes
 
+- **`model:` edits in switchroom.yaml now apply on a plain restart — the
+  launcher resolves the configured model LIVE at boot** (Defect B, the
+  fable-pin-runs-opus bug). The model used to be baked into `start.sh` at
+  `switchroom apply` time, while /status read the live yaml — two sources of
+  truth that silently disagreed after any `model:` edit without a full
+  re-apply. start.sh now shells `switchroom agent effective-model <name>`
+  (new verb; the SAME `resolveMainModel` resolver `agent list --json` and the
+  gateway use — never re-implemented in shell) against the live-mounted
+  config, with a bounded, never-silent fallback chain: live yaml →
+  `.configured-default-model` (last-known-good) → the apply-time bake, each
+  fallback alerting the operator via `.session-model-alert`. Claude↔sr-*
+  routing-class flips are detected and refused with a "run switchroom apply"
+  alert instead of half-applied against stale routing; a proxy-only
+  configured default (`fable`) with LiteLLM unreachable at boot degrades to
+  `opus` with an alert instead of 4xx-ing every call; `agent list --json`
+  now reports the resolved model (`default` → the fleet default) and the
+  retired `claude-fable-5` codename is normalized to the `fable` alias
+  everywhere the resolver runs. Rendered-script ordering (live resolution →
+  recorded default → carrier compare → litellm guard → repoint → exec) is
+  locked by tests, including the previously-missing regression
+  "baked=opus, live yaml=fable → boots fable".
 - **Inbound Telegram messages are never silently dropped at the routing
   layer** (#3300) — the gateway registered only content-specific handlers
   (`bot.on('message:text')`, `:photo`, … `:paid_media`); grammy ^1.44 routes

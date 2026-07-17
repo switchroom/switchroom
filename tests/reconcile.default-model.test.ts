@@ -164,8 +164,11 @@ describe("resolveMainModel — the `model: default` footgun guard", () => {
     expect(resolveMainModel("opus")).toBe("opus");
     expect(resolveMainModel("sonnet")).toBe("sonnet");
     expect(resolveMainModel("claude-haiku-4-5-20251001")).toBe("claude-haiku-4-5-20251001");
-    // a deliberate fable id (an account that HAS access) is honoured — we only
-    // guard the bare `default` alias, not fable itself.
-    expect(resolveMainModel("claude-fable-5")).toBe("claude-fable-5");
+    // a deliberate fable pin is honoured, but as the `fable` ALIAS: the
+    // retired `claude-fable-5` codename 4xxs direct-to-Anthropic and only
+    // resolves via the LiteLLM router, so the resolver normalizes it to the
+    // alias that resolves everywhere (see normalizeModelAlias).
+    expect(resolveMainModel("fable")).toBe("fable");
+    expect(resolveMainModel("claude-fable-5")).toBe("fable");
   });
 });

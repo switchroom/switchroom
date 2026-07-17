@@ -1170,15 +1170,92 @@ fi
 # which the gateway relays to the operator chat once at boot. The normal apply
 # path is silent here — the gateway already acked the `/model` in chat.
 #
+# --- Live configured-default resolution (Defect B / drift fix) ---
+#
+# The apply-time bake ({{{modelQ}}}) is only the LAST-DITCH fallback: editing
+# `model:` in switchroom.yaml and restarting must take effect WITHOUT a full
+# `switchroom apply`. The launcher asks the SAME resolver the gateway's
+# /status uses (`switchroom agent effective-model`, which applies
+# resolveMainModel server-side) against the live mounted yaml — one resolver,
+# never re-implemented in shell, so what-you-see and what-runs cannot split.
+#
+# Fallback chain, never silent past step 1:
+#   1. live read of $SWITCHROOM_CONFIG (one bounded retry — a host-side
+#      in-place rewrite can present a torn file for a moment);
+#   2. `.configured-default-model` — the last-known-good live value this
+#      launcher recorded on every prior boot (read BEFORE it is overwritten);
+#   3. the apply-time bake.
+# Steps 2/3 append to `.session-model-alert` so the gateway tells the
+# operator once at boot. No SWITCHROOM_CONFIG mount at all means there is
+# nothing to read live — the bake IS the truth there (stderr note only; an
+# operator alert every boot forever would be noise with no action).
+#
+# The yaml file bind mount re-resolves by PATH at container start, so a
+# host-side atomic-rename write is always picked up by the NEXT boot — the
+# path this block runs on. Only mid-life reads by long-running processes can
+# see a stale inode; that pre-existing edge is out of scope here (tracked as
+# a follow-up on the drift fix).
+#
 # NB {{{modelQ}}} is already shell-single-quoted by the scaffold (it renders as
 # a quoted token, e.g. 'claude-sonnet-5'), so it is assigned BARE here — never
 # inside additional double quotes, which would embed the literal quote chars in
 # the value and break `claude --model`.
-_EFFECTIVE_MODEL={{{modelQ}}}
+_BAKED_MODEL={{{modelQ}}}
+_LKG_MODEL="$(cat "{{agentDir}}/.configured-default-model" 2>/dev/null | tr -d '[:space:]' || true)"
+_EFFECTIVE_MODEL=""
+if [ -n "$SWITCHROOM_CONFIG" ] && [ -f "$SWITCHROOM_CONFIG" ] && command -v switchroom >/dev/null 2>&1; then
+  _lm_live=""
+  for _lm_try in 1 2; do
+    _lm_live="$(timeout 20 switchroom --config "$SWITCHROOM_CONFIG" agent effective-model "{{name}}" 2>/dev/null | tail -n 1 | tr -d '[:space:]')" || _lm_live=""
+    # Shape gate — same regex as the .session-model carrier below (byte-kept
+    # with MODEL_ARG_RE); the tr above already guarantees single-line.
+    if [ -n "$_lm_live" ] && printf '%s' "$_lm_live" | grep -Eq '^[A-Za-z0-9][]A-Za-z0-9._[/-]{0,99}$'; then
+      break
+    fi
+    _lm_live=""
+    if [ "$_lm_try" -eq 1 ]; then sleep 1; fi
+  done
+  if [ -n "$_lm_live" ]; then
+    # Routing class (Claude passthrough vs sr-* router root) is baked into
+    # compose at render time, so a Claude<->sr-* class flip CANNOT be applied
+    # by a bare restart — half-applying would run the new model against the
+    # old routing. Detect the flip, keep the baked model, and tell the
+    # operator to run a real apply.
+    case "$_BAKED_MODEL" in sr-*) _lm_baked_class=router ;; *) _lm_baked_class=claude ;; esac
+    case "$_lm_live" in sr-*) _lm_live_class=router ;; *) _lm_live_class=claude ;; esac
+    if [ "$_lm_live_class" != "$_lm_baked_class" ]; then
+      echo "session-model: configured model class changed ('$_BAKED_MODEL' -> '$_lm_live', $_lm_baked_class -> $_lm_live_class) — routing is render-time, NOT applying; run 'switchroom apply' then restart" >&2
+      printf 'The configured model changed from `%s` to `%s`, which switches routing class — a restart alone cannot apply that. The agent booted on `%s`. Run `switchroom apply` on the host, then restart this agent.\n' "$_BAKED_MODEL" "$_lm_live" "$_BAKED_MODEL" >> "{{agentDir}}/.session-model-alert" 2>/dev/null || true
+      _EFFECTIVE_MODEL="$_BAKED_MODEL"
+    else
+      _EFFECTIVE_MODEL="$_lm_live"
+      if [ "$_lm_live" != "$_BAKED_MODEL" ]; then
+        echo "session-model: live configured model '$_lm_live' differs from apply-time bake '$_BAKED_MODEL' — using the live value (switchroom.yaml is the source of truth)" >&2
+      fi
+    fi
+  elif [ -n "$_LKG_MODEL" ] && printf '%s' "$_LKG_MODEL" | grep -Eq '^[A-Za-z0-9][]A-Za-z0-9._[/-]{0,99}$'; then
+    # Live read failed (torn write mid-read, yaml schema error, CLI wedge).
+    # Last-known-good beats the bake: it was live truth on a prior boot,
+    # while the bake can predate any number of yaml edits. Loud either way —
+    # a silent fallback here would resurrect Defect B as an intermittent flap.
+    _EFFECTIVE_MODEL="$_LKG_MODEL"
+    echo "session-model: live config read FAILED — using last-known-good configured model '$_LKG_MODEL' (apply-time bake: '$_BAKED_MODEL')" >&2
+    printf 'switchroom.yaml could not be read at boot, so the agent booted on the last-known-good configured model `%s`. If you just changed `model:`, check the yaml for errors and restart the agent.\n' "$_LKG_MODEL" >> "{{agentDir}}/.session-model-alert" 2>/dev/null || true
+  else
+    _EFFECTIVE_MODEL="$_BAKED_MODEL"
+    echo "session-model: live config read FAILED and no last-known-good value — using apply-time baked model '$_BAKED_MODEL'" >&2
+    printf 'switchroom.yaml could not be read at boot and no prior boot recorded a model, so the agent booted on the apply-time default `%s`. If you just changed `model:`, check the yaml for errors and restart the agent.\n' "$_BAKED_MODEL" >> "{{agentDir}}/.session-model-alert" 2>/dev/null || true
+  fi
+  unset _lm_live _lm_try _lm_baked_class _lm_live_class
+else
+  _EFFECTIVE_MODEL="$_BAKED_MODEL"
+fi
+unset _BAKED_MODEL _LKG_MODEL
 # Record the RESOLVED configured default (raw, unquoted) every boot, before
 # override resolution. The gateway copies this into the carrier's
 # `configuredDefaultAtWrite`, so both sides of the invalidation compare below
-# come from the same resolver. Overwrite, not consumed.
+# come from the same resolver. Overwrite, not consumed — and doubling as the
+# last-known-good live value the fallback chain above reads on the NEXT boot.
 printf '%s\n' "$_EFFECTIVE_MODEL" > "{{agentDir}}/.configured-default-model" 2>/dev/null || true
 
 # Rev-4 hygiene (#3184 review LOW-2): remove the files retired with the
@@ -1303,6 +1380,26 @@ if [ -f "{{agentDir}}/.session-model" ]; then
   fi
   unset _smf _sm_model _sm_cfg _sm_attempts _SM_MAX_ATTEMPTS
 fi
+
+# Configured-default LiteLLM guard. A proxy-only *configured* model with
+# LiteLLM unreachable at boot would exec against the /anthropic passthrough,
+# where `fable`/`claude-fable-5` is a retired codename and EVERY call 4xxs —
+# a total outage. The carrier block above already drops proxy-only OVERRIDES
+# on a down proxy; this extends the same guard to the configured default,
+# which the live-config read above makes a mainline path (pinning `model:
+# fable` in yaml is now the normal way to run Fable). Claude agents have a
+# safe same-class fallback (opus); sr-* configured defaults keep today's
+# loud-degraded behavior — there is no Claude fallback for them and the
+# repoint case below already leaves their routing to self-heal.
+case "$_EFFECTIVE_MODEL" in
+  fable|claude-fable-5)
+    if [ -z "$_LITELLM_OK" ]; then
+      echo "session-model: configured model '$_EFFECTIVE_MODEL' is proxy-only but LiteLLM is unreachable at boot — booting 'opus' until the proxy recovers" >&2
+      printf 'LiteLLM was unreachable at boot, so the configured model `%s` (proxy-only) could not be used — the agent booted on `opus` instead. Restart the agent once the proxy is back to return to `%s`.\n' "$_EFFECTIVE_MODEL" "$_EFFECTIVE_MODEL" >> "{{agentDir}}/.session-model-alert" 2>/dev/null || true
+      _EFFECTIVE_MODEL="opus"
+    fi
+    ;;
+esac
 
 # --- Session effort resolution (consume-once .session-effort carrier, #3186) ---
 #
