@@ -522,8 +522,9 @@ interface FeedGroup {
   /**
    * Monotonic per-card worker counter — `++counter` hands each newly
    * registered row its stable {@link WorkerRow.ordinal}. Reset to 0 whenever a
-   * fresh card starts (group creation / the group-reuse-after-terminal repaint
-   * / registration into an emptied group), so every new card numbers from 1.
+   * fresh card starts (group creation, and registration into an emptied group
+   * — which covers the group-reuse-after-terminal repaint, since finalize
+   * drops rows from `workers` immediately), so every new card numbers from 1.
    */
   workerOrdinalCounter: number
   /**
