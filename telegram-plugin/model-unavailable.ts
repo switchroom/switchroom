@@ -196,6 +196,61 @@ export function isLitellmProxyLocal429(text: string): boolean {
 }
 
 /**
+ * True when `text` is a LiteLLM-proxy-LOCAL AUTH misconfiguration — the
+ * proxy-fallback keyless-401 class, NOT a genuine end-user credential wall.
+ *
+ * PROVENANCE (incident, 2026-07-16). LiteLLM's internal model-fallback chain
+ * (`gpt-oss-20b -> [gpt-oss-20b-openrouter, claude-sonnet-5]`) re-dispatches a
+ * failed primary WITHOUT forwarding the client's OAuth `Authorization` header.
+ * The `claude-sonnet-5` deployment is deliberately keyless (passthrough auth —
+ * it expects the forwarded OAuth), so Anthropic rejects the header-less
+ * fallback with a 401 `authentication_error` whose message is
+ * "x-api-key header is required". Switchroom agents authenticate the unmodified
+ * `claude` CLI with an OAuth Bearer token and NEVER an `x-api-key`, so that
+ * demand can only originate from the proxy dropping the header on a keyless
+ * fallback deployment — a host-side infra misconfig for the OPERATOR to fix,
+ * never a login problem an end user (or even the operator's OAuth) can act on.
+ *
+ * Misclassifying it (as `classifyClaudeError` did → `credentials-invalid` →
+ * a "🔑 re-authenticate" card) is doubly wrong: wrong AUDIENCE (a non-operator
+ * user like Lisa cannot re-auth anything) and wrong DIAGNOSIS (the login is
+ * fine; the proxy fallback config is not). Detecting it here lets both
+ * classifiers route it to the operator-only infra surface instead.
+ *
+ * Detection (deterministic wording, mirrors `isLitellmProxyLocal429`):
+ *   - the definitive "x-api-key header is required" marker (impossible for our
+ *     OAuth flow — only the keyless-proxy path emits it), OR
+ *   - an `authentication_error` CO-OCCURRING with the proxy-FALLBACK-specific
+ *     structural pair: "fallback" re-dispatch provenance AND an explicit
+ *     "x-api-key" mention.
+ *
+ * PRECISION over recall (#3293 review finding 2): an earlier draft matched any
+ * `authentication_error` + (litellm|proxy) + (fallback|x-api-key|api_key) —
+ * broad enough that a GENUINE OAuth expiry wrapped in a proxy envelope that
+ * merely mentions "api_key" would misdiagnose as proxy-misconfig (still
+ * operator-visible, but the recommendation would point at the proxy config
+ * instead of a re-auth). Both classes route operator-only now, so an ambiguous
+ * envelope deliberately KEEPS the credentials-invalid/-expired diagnosis;
+ * only the unambiguous keyless-fallback signature classifies as misconfig.
+ * Never throws on weird input.
+ */
+export function isLitellmProxyAuthMisconfig(text: string): boolean {
+  if (typeof text !== 'string' || text.length === 0) return false
+  const sample = text.length > 16_384 ? text.slice(0, 16_384) : text
+  const lower = sample.toLowerCase()
+  // Definitive marker — see provenance above.
+  if (lower.includes('x-api-key header is required')) return true
+  // Structural signature: an authentication_error carrying BOTH the fallback
+  // re-dispatch provenance AND an explicit x-api-key mention. A proxy envelope
+  // that merely mentions litellm/proxy/api_key stays on the credentials
+  // diagnosis (ambiguous → not misconfig).
+  const isAuthErr =
+    lower.includes('authentication_error') || lower.includes('authenticationerror')
+  if (!isAuthErr) return false
+  return lower.includes('fallback') && lower.includes('x-api-key')
+}
+
+/**
  * Best-effort extraction of the limit detail LiteLLM embeds in its
  * proxy-local 429 bodies, for instrumentation (the `rate_limit_429_classified`
  * runtime metric). All fields null when nothing parseable is found — never

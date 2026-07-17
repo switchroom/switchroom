@@ -328,9 +328,12 @@ import { autoClassifyMidTurnInbound } from './auto-classify-mid-turn.js'
 import {
   renderOperatorEvent,
   shouldEmitOperatorEvent,
+  decideOperatorEventAudience,
+  renderUserFacingFailureNotice,
   type OperatorEvent,
   type OperatorEventKind,
 } from '../operator-events.js'
+import { pendingUserNoticeGate } from '../pending-user-notice.js'
 import { recordOperatorEvent } from '../operator-events-history.js'
 import {
   parseLlmError,
@@ -5355,6 +5358,13 @@ function endCurrentTurnAtomic(
   // wedging forever. No-op when this turn delivered, when nothing is
   // buffered, or when the serialize feature is off.
   armNoReplyDrainTimer(turn)
+  // #3293 finding 1 — resolve any deferred non-operator failure notice against
+  // this turn's outcome: replied → the turn recovered from the error line, the
+  // gate drops the notice; reply-less → the turn genuinely died, the notice is
+  // sent now. replyCalled covers the short-answer/#2624 shape where
+  // finalAnswerDelivered stays false despite an explicit reply. No-op when
+  // nothing is pending (the overwhelmingly common path).
+  flushPendingUserFailureNotices(turn.finalAnswerDelivered || turn.replyCalled)
   return turnEndedAt
 }
 
@@ -8558,7 +8568,24 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
     `telegram gateway: operator-event posting agent=${agent} kind=${kind} to ${access.allowFrom.length} chat(s)` +
       (opEventTopic != null ? ` topic=${opEventTopic}` : '') + '\n',
   )
-  for (const chat_id of access.allowFrom) {
+  // Ken's deterministic error-surfacing policy: an OPERATOR-ACTIONABLE fault
+  // (credentials / credit / proxy-misconfig) must not reach non-operator users
+  // as a raw or misleading card they can't act on. Split the audience — the
+  // operator (allowlist head) gets the full card; every other allowlist chat
+  // gets, at most, a brief plain-language "it's on our side" notice. Non-
+  // actionable kinds keep their existing broadcast (all chats are operatorChats).
+  const { operatorChats, userNoticeChats } = decideOperatorEventAudience(
+    kind,
+    access.allowFrom,
+    access.allowFrom[0],
+  )
+  if (userNoticeChats.length > 0) {
+    process.stderr.write(
+      `telegram gateway: operator-event operator-only routing agent=${agent} kind=${kind} operatorChats=${operatorChats.length} userNoticeChats=${userNoticeChats.length}\n`,
+    )
+  }
+
+  for (const chat_id of operatorChats) {
     // The resolved topic is valid ONLY in the agent's supergroup — attaching
     // it to an operator DM recipient yields 400 "message thread not found" and
     // the event silently fails to deliver (the marko #2096 class). Guard it:
@@ -8594,6 +8621,63 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
           `telegram gateway: operator-event send to ${chat_id} failed agent=${agent} kind=${kind}: ${e}\n`,
         )
       })
+  }
+
+  // Non-operator users: only the plain-language failure notice, and ONLY when
+  // the turn genuinely dies (userNoticeChats is empty for every non-actionable
+  // kind — see decideOperatorEventAudience). #3293 review finding 1: an error
+  // line is NOT proof of turn failure — the LiteLLM fallback can 401 while a
+  // retry / another deployment still serves the turn, and sending "couldn't
+  // complete that" for a turn that completed is a false failure report. So the
+  // notice is never sent here: it is SCHEDULED on the pendingUserNoticeGate and
+  // resolved at the turn-end funnel (endCurrentTurnAtomic) — dropped when the
+  // turn delivered a reply (recovered), sent when it ended reply-less (died).
+  // Un-resolved notices expire after PENDING_USER_NOTICE_TTL_MS (bias to
+  // silence over a false failure claim). Operator cards above stay immediate.
+  if (userNoticeChats.length > 0) {
+    pendingUserNoticeGate.schedule({
+      chatIds: userNoticeChats,
+      text: renderUserFacingFailureNotice(),
+      agent,
+      kind,
+      atMs: Date.now(),
+    })
+    process.stderr.write(
+      `telegram gateway: operator-event user-notice deferred to turn-end agent=${agent} kind=${kind} chats=${userNoticeChats.length}\n`,
+    )
+  }
+}
+
+/**
+ * Turn-end resolution of deferred user failure notices (#3293 finding 1).
+ * Called from `endCurrentTurnAtomic` — the ONE funnel every turn-end path
+ * passes through. `turnDeliveredReply` is `finalAnswerDelivered || replyCalled`
+ * (the model explicitly replied → the turn recovered → notices are dropped by
+ * the gate). Only a reply-less turn end flushes the pending notices to the
+ * non-operator chats, so the user notice fires IFF the turn genuinely died.
+ */
+function flushPendingUserFailureNotices(turnDeliveredReply: boolean): void {
+  const notices = pendingUserNoticeGate.resolveTurnEnd(turnDeliveredReply)
+  if (notices.length === 0) return
+  const noticeTopic = resolveAgentOutboundTopic({ kind: 'compact-watchdog' })
+  const noticeSupergroup = resolveAgentSupergroupChatId()
+  for (const notice of notices) {
+    process.stderr.write(
+      `telegram gateway: user-notice flush (turn died reply-less) agent=${notice.agent} kind=${notice.kind} chats=${notice.chatIds.length}\n`,
+    )
+    for (const chat_id of notice.chatIds) {
+      const thread = topicForRecipient({ recipientChatId: chat_id, resolvedTopic: noticeTopic, supergroupChatId: noticeSupergroup })
+      const opts = {
+        ...(thread != null ? { message_thread_id: thread } : {}),
+      }
+      // allow-raw-bot-api: deferred user-notice flush loop; topic-aware opts
+      void bot.api.sendRichMessage(chat_id, richMessage(notice.text), opts as never)
+        .catch(e => {
+          process.stderr.write(
+            `telegram gateway: user-notice send to ${chat_id} failed agent=${notice.agent} kind=${notice.kind}: ${e}\n`,
+          )
+        })
+    }
   }
 }
 
