@@ -847,6 +847,17 @@ const DEFAULT_REAPER_INTERVAL_MS = 15 * 60_000     // 15 minutes
 const TERMINAL_CLEANUP_GRACE_MS = 30_000
 
 /**
+ * Bounded tail window (bytes) the boot-reconcile fast-path reads to decide
+ * whether a stale historical worker already reached `turn_end` before this
+ * boot (see `probeReachedTurnEndAtBoot`). Large enough to contain any realistic
+ * final line (a `turn_duration` line is ~100 bytes; an `end_turn` assistant
+ * answer line is well under this), yet a tiny fraction of the multi-MB
+ * transcripts a long-running worker accumulates — so the boot read is O(window)
+ * per record instead of O(filesize). 512 KiB.
+ */
+const BOOT_TERMINAL_PROBE_WINDOW_BYTES = 512 * 1024
+
+/**
  * Throttle for the liveness-path retry of `backfillJsonlAgentId` (see
  * WorkerEntry.lastBackfillAttemptAt). Cheap (one meta.json read + two
  * indexed lookups) but no reason to run it on every 1s poll tick.
@@ -1923,6 +1934,58 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
 
   let stopped = false
 
+  /**
+   * Cheap boot-terminal probe. Reads only a BOUNDED TAIL of a JSONL (not the
+   * whole multi-MB transcript) and runs the canonical `projectSubagentLine`
+   * projector over its complete lines to decide whether the worker had already
+   * reached `sub_agent_turn_end` before this boot. Used by the boot-reconcile
+   * fast-path to tell a done-at-boot worker (which still needs terminal
+   * cleanup — feed-row sweep, card collapse/unpin) apart from a running-at-boot
+   * dead prior-session worker (which needs nothing) WITHOUT the expensive full
+   * read. `done` is the only terminal boot state (`WorkerState` never flips to
+   * `'failed'` at boot — see its doc), and its signal (`system/turn_duration`
+   * or an `end_turn` assistant line) is always the tail of the file, so a
+   * bounded window catches it. Conservative on error: an unreadable/oversized
+   * final line returns `false`, so the entry falls through to the running-stale
+   * skip rather than being mis-swept.
+   */
+  function probeReachedTurnEndAtBoot(filePath: string, size: number): boolean {
+    if (size <= 0) return false
+    const start = Math.max(0, size - BOOT_TERMINAL_PROBE_WINDOW_BYTES)
+    let raw: string
+    try {
+      const len = size - start
+      const buf = Buffer.alloc(len)
+      const fd = fs.openSync(filePath, 'r')
+      try {
+        fs.readSync(fd, buf, 0, len, start)
+      } finally {
+        fs.closeSync(fd)
+      }
+      raw = buf.toString('utf-8')
+    } catch {
+      return false
+    }
+    const lines = raw.split('\n')
+    // If we started mid-file, the first fragment is a partial line — drop it
+    // (projectSubagentLine would JSON-parse-fail on it anyway, but be explicit).
+    if (start > 0) lines.shift()
+    const probeState = { hasEmittedStart: true } // suppress start events; irrelevant here
+    for (const line of lines) {
+      if (!line) continue
+      let events
+      try {
+        events = projectSubagentLine(line, 'probe', probeState)
+      } catch {
+        continue
+      }
+      for (const ev of events) {
+        if (ev.kind === 'sub_agent_turn_end') return true
+      }
+    }
+    return false
+  }
+
   // ─── Per-agent registration ─────────────────────────────────────────────
 
   /**
@@ -2004,24 +2067,46 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       // bites at fleet scale where mtimes are present.
       if (mtimeMs != null && n - mtimeMs > inflightPromoteMaxAgeMs) {
         const fileAgeMs = n - mtimeMs
-        // Park the tail cursor at the boot-time EOF (the size we already
-        // stat'd) INSTEAD of doing the full initial `readSubTail`. This is the
-        // whole optimisation: the expensive boot work was that read (whole-
-        // transcript parse + per-record sqlite liveness/backfill round-trips),
-        // and it produced nothing actionable for a worker the freshness gate
-        // was about to leave historical anyway. A historical entry whose cursor
-        // sits at EOF is a genuinely cheap no-op in the poll loop — readSubTail
-        // statSyncs, sees `size === cursor`, and returns before any openSync or
-        // sqlite (the skeleton-cue path is gated on `!entry.historical`) — so no
-        // poll-loop special-casing is needed. Two correctness properties are
-        // preserved: (1) a stale worker's pre-existing terminal `turn_end` sits
-        // BEFORE the parked cursor, so it is never replayed as a spurious
-        // completion (the v0.14.23 stale-handback regression stays fixed); and
-        // (2) a genuine post-boot resume that grows the file PAST this EOF is
-        // still read on the next poll and surfaced. No FSWatcher: a dead
-        // prior-session worker has no live transition to observe.
+        // The expensive boot work was the full initial `readSubTail` (whole-
+        // transcript parse + per-record sqlite liveness/backfill round-trips)
+        // done for EVERY historical `running` JSONL, including the hundreds a
+        // busy 24/7 agent hoards that were last written days-to-weeks ago. It
+        // produced nothing actionable for a worker the freshness gate was about
+        // to leave historical anyway, yet its O(filesize) disk reads (×~1177 on
+        // the incident agent) delayed the gateway answering Telegram by minutes
+        // after every restart. Replace it with a BOUNDED tail probe.
+        //
+        // The probe distinguishes the two stale-at-boot populations WITHOUT the
+        // full read, so we don't over-skip: a *done*-at-boot worker (its JSONL
+        // already reached `turn_end`) must still reach `scheduleTerminalCleanup`
+        // — otherwise its worker-feed row leaks as a ghost (card never
+        // collapsed/unpinned; #<worker-feed ghost-leak>). A *running*-at-boot
+        // dead prior-session worker (never wrote a terminal `turn_end` — the
+        // incident population) needs nothing: no read, no backfill, no watcher,
+        // no cleanup.
+        const doneAtBoot = probeReachedTurnEndAtBoot(filePath, fileSize)
+        // Park the tail cursor at the boot-time EOF either way. A historical
+        // entry whose cursor sits at EOF is a cheap no-op in the poll loop
+        // (readSubTail statSyncs, sees `size === cursor`, returns before any
+        // openSync/sqlite — the skeleton-cue path is gated on `!historical`), so
+        // no poll-loop special-casing is needed; a genuine post-boot resume that
+        // grows the file PAST this EOF is still read on the next poll. No
+        // FSWatcher: a dead prior-session worker has no live transition to
+        // observe. And a stale worker's pre-existing `turn_end` sits BEFORE the
+        // parked cursor, so it is never replayed as a spurious completion (the
+        // v0.14.23 stale-handback regression stays fixed).
         tails.set(agentId, { cursor: fileSize, pendingPartial: '', hasEmittedStart: false, watcher: null })
-        log?.(`subagent-watcher: ${agentId} running at boot but stale (last write ${Math.round(fileAgeMs / 1000)}s ago > ${Math.round(inflightPromoteMaxAgeMs / 1000)}s) — leaving historical, skipping reconcile read (dead prior-session worker, not in-flight; no whole-transcript parse, no backfill, no watcher)`)
+        if (doneAtBoot) {
+          // Mirror the done-at-boot branch of the full path (below), minus the
+          // whole-transcript parse: suppress a spurious completion notification
+          // and schedule the terminal cleanup so the feed row is swept.
+          entry.state = 'done'
+          entry.completionNotified = true
+          log?.(`subagent-watcher: ${agentId} done at boot but stale (last write ${Math.round(fileAgeMs / 1000)}s ago > ${Math.round(inflightPromoteMaxAgeMs / 1000)}s) — historical; scheduling terminal cleanup (bounded tail probe, no whole-transcript parse, no watcher)`)
+          scheduleTerminalCleanup(agentId)
+        } else {
+          log?.(`subagent-watcher: ${agentId} running at boot but stale (last write ${Math.round(fileAgeMs / 1000)}s ago > ${Math.round(inflightPromoteMaxAgeMs / 1000)}s) — leaving historical, skipping reconcile read (dead prior-session worker, not in-flight; no whole-transcript parse, no backfill, no watcher)`)
+        }
         return
       }
     }

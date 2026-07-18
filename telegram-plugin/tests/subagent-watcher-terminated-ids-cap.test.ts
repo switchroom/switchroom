@@ -60,14 +60,7 @@ describe('terminatedAgentIds cap (fix #9a)', () => {
         if (ps === subagentsDir) return visibleFiles
         return []
       }) as unknown as typeof fs.readdirSync,
-      // Recent mtime: these workers finished (turn_end below) just before this
-      // boot, so their files are fresh — which is what routes them through the
-      // done-at-boot terminal-cleanup path this test exercises. (A weeks-stale
-      // mtime would instead trip the boot-reconcile fast-path that leaves a
-      // provably-dead prior-session worker historical without reading it. The
-      // epoch-0 value here was incidental, not part of the cap contract under
-      // test.)
-      statSync: (() => ({ size: content.length, mtimeMs: 1_000_000 }) as fs.Stats) as typeof fs.statSync,
+      statSync: (() => ({ size: content.length, mtimeMs: 0 }) as fs.Stats) as typeof fs.statSync,
       openSync: ((p: fs.PathLike) => { lastOpened = String(p); return 7 }) as unknown as typeof fs.openSync,
       closeSync: (() => { lastOpened = null }) as typeof fs.closeSync,
       readSync: ((
