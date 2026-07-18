@@ -104,7 +104,6 @@ import {
   installUnhandledMessageCatchAll,
 } from './unhandled-message.js'
 import {
-  safeName,
   handleContactMessage,
   handleLocationMessage,
   handleVenueMessage,
@@ -120,6 +119,15 @@ import {
   handlePaidMediaMessage,
   type MediaEnvelopeDeps,
 } from './media-message-handlers.js'
+import {
+  handleDocumentMessage,
+  handleAudioMessage,
+  handleVideoMessage,
+  handleVideoNoteMessage,
+  handleStickerMessage,
+  handleAnimationMessage,
+  type AttachmentHandlerDeps,
+} from './attachment-message-handlers.js'
 import { fmtLocalStamp, resolveEnvTimezone, renderLogTimestampsLocal } from '../shared/local-time.js'
 import { StatusReactionController } from '../status-reactions.js'
 import { DeferredDoneReactions } from '../reaction-defer.js'
@@ -24663,11 +24671,7 @@ bot.on('message:photo', async ctx => {
     }
   })
 })
-bot.on('message:document', async ctx => {
-  const doc = ctx.message.document
-  const name = safeName(doc.file_name)
-  await handleInboundCoalesced(ctx, ctx.message.caption ?? `(document: ${name ?? 'file'})`, undefined, { kind: 'document', file_id: doc.file_id, size: doc.file_size, mime: doc.mime_type, name })
-})
+bot.on('message:document', ctx => handleDocumentMessage(ctx, attachmentHandlerDeps))
 bot.on('message:voice', async ctx => {
   const voice = ctx.message.voice
   // #578 spike: when voice_in is enabled in access.json, download
@@ -24730,51 +24734,11 @@ bot.on('message:voice', async ctx => {
   }
   await handleInboundCoalesced(ctx, ctx.message.caption ?? '(voice message)', undefined, { kind: 'voice', file_id: voice.file_id, size: voice.file_size, mime: voice.mime_type })
 })
-bot.on('message:audio', async ctx => {
-  const audio = ctx.message.audio
-  const name = safeName(audio.file_name)
-  await handleInboundCoalesced(ctx, ctx.message.caption ?? `(audio: ${safeName(audio.title) ?? name ?? 'audio'})`, undefined, { kind: 'audio', file_id: audio.file_id, size: audio.file_size, mime: audio.mime_type, name })
-})
-bot.on('message:video', async ctx => {
-  const video = ctx.message.video
-  await handleInboundCoalesced(ctx, ctx.message.caption ?? '(video)', undefined, { kind: 'video', file_id: video.file_id, size: video.file_size, mime: video.mime_type, name: safeName(video.file_name) })
-})
-bot.on('message:video_note', async ctx => {
-  const vn = ctx.message.video_note
-  await handleInboundCoalesced(ctx, '(video note)', undefined, { kind: 'video_note', file_id: vn.file_id, size: vn.file_size })
-})
-bot.on('message:sticker', async ctx => {
-  const sticker = ctx.message.sticker
-  // Render to a clearer text envelope so the agent has signal to
-  // respond to. Includes the emoji (semantic anchor — what mood the
-  // sticker maps to) and the set name (so the agent can say "that's
-  // from your <set>" if relevant). Both optional. The file_id flows
-  // through the attachment field as before, so the agent can echo it
-  // back via send_sticker if it wants to mirror the sticker.
-  const parts: string[] = []
-  if (sticker.emoji) parts.push(sticker.emoji)
-  if (sticker.set_name) parts.push(`from "${sticker.set_name}"`)
-  const text = parts.length > 0 ? `(sticker — ${parts.join(' ')})` : '(sticker)'
-  await handleInboundCoalesced(ctx, text, undefined, { kind: 'sticker', file_id: sticker.file_id, size: sticker.file_size })
-})
-bot.on('message:animation', async ctx => {
-  // Animation = Telegram's GIF type (MP4-encoded looping clips).
-  // Caption is optional; if present it carries the user's intent
-  // (e.g. "perfect 👌"); if absent, the GIF itself is the message.
-  // Surfaces to the agent so it can respond in kind via send_gif —
-  // mirroring is fine for assistant-style personas, less so for
-  // coding ones.
-  const animation = ctx.message.animation
-  const caption = ctx.message.caption
-  const text = caption ? `(gif) ${caption}` : '(gif)'
-  await handleInboundCoalesced(ctx, text, undefined, {
-    kind: 'animation',
-    file_id: animation.file_id,
-    size: animation.file_size,
-    mime: animation.mime_type,
-    name: safeName(animation.file_name),
-  })
-})
+bot.on('message:audio', ctx => handleAudioMessage(ctx, attachmentHandlerDeps))
+bot.on('message:video', ctx => handleVideoMessage(ctx, attachmentHandlerDeps))
+bot.on('message:video_note', ctx => handleVideoNoteMessage(ctx, attachmentHandlerDeps))
+bot.on('message:sticker', ctx => handleStickerMessage(ctx, attachmentHandlerDeps))
+bot.on('message:animation', ctx => handleAnimationMessage(ctx, attachmentHandlerDeps))
 // Injected dispatch/log surfaces for the extracted media-envelope handlers
 // (switchroom#2996 P6 cluster A). Bound once here so each thin bot.on
 // delegation stays a one-liner.
@@ -24783,6 +24747,11 @@ const mediaEnvelopeDeps: MediaEnvelopeDeps = {
   handleAckOnly,
   handleRefusal,
   log: line => process.stderr.write(line),
+}
+// Injected coalescing-dispatch surface for the extracted metadata-only
+// attachment handlers (switchroom#2996 P6 cluster C).
+const attachmentHandlerDeps: AttachmentHandlerDeps = {
+  handleInboundCoalesced,
 }
 bot.on('message:contact', ctx => handleContactMessage(ctx, mediaEnvelopeDeps))
 bot.on('message:location', ctx => handleLocationMessage(ctx, mediaEnvelopeDeps))
