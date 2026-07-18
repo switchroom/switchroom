@@ -143,7 +143,8 @@ describe('resolution clears the durable store (Defect A)', () => {
 
 describe('TTL expiry wakes the parked agent (Defect B)', () => {
   it('the periodic reaper runs the approval-card expiry sweep inside try/catch', () => {
-    const reaper = slice(GATEWAY, 'const pendingStateReaper = setInterval', 12000)
+    // Anchor tolerates the #2996 P0c `isGatewayMain ? setInterval(...)` boot gate.
+    const reaper = slice(GATEWAY, 'const pendingStateReaper = ', 12000)
     // The sweep call must be guarded like the sibling sweepStaleTurnActiveMarker:
     // an escaped throw inside this setInterval callback reaches uncaughtException
     // and takes the whole gateway down.
