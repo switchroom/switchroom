@@ -145,8 +145,9 @@ describe('auth-flow context rule — Channel B (structural wiring in gateway.ts)
   })
 
   it('reaps awaitingAuthCodeAt in the TTL reaper alongside other pending-state maps', () => {
-    // The pendingStateReaper interval must sweep expired auth-code-context entries
-    const reaperIdx = src.indexOf('pendingStateReaper = setInterval')
+    // The pendingStateReaper interval must sweep expired auth-code-context entries.
+    // Anchor tolerates the #2996 P0c `isGatewayMain ? setInterval(...)` boot gate.
+    const reaperIdx = src.indexOf('pendingStateReaper = ')
     expect(reaperIdx).toBeGreaterThan(0)
     const reaperBlock = src.slice(reaperIdx, reaperIdx + 800)
     expect(reaperBlock).toMatch(/awaitingAuthCodeAt/)
