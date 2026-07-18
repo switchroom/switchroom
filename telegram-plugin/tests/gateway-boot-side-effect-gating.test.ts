@@ -5,36 +5,41 @@
  * `startGateway()` at the bottom of the file.
  *
  * WHY this asserts on the parsed SOURCE, not a real `import()`:
- * gateway.ts statically reaches modules whose bun:sqlite access + the still-
- * ungated P0d process-handler / reaction-sweep registrations make a hermetic
- * `await import()` under vitest impractical without heavy mocking (see the P0e
- * note in the PR). The repo's oracle for "pin gateway structure without booting
- * it" is source-parsing via `ts.createSourceFile` — the same pattern as
+ * the repo's oracle for "pin gateway structure without booting it" is
+ * source-parsing via `ts.createSourceFile` — the same pattern as
  * gateway-bot-construction-deferral.test.ts (P0b) and
- * gateway-handler-registration-wiring.test.ts (P0a). This test follows it and
- * asserts OUTCOMES:
+ * gateway-handler-registration-wiring.test.ts (P0a). (Since P0e, #3318, a
+ * hermetic `await import()` of gateway.ts does complete cleanly; upgrading
+ * this oracle to a real runtime import is possible but deliberately out of
+ * scope here — the source parse stays the pinned pattern.) This test follows
+ * it and asserts OUTCOMES:
  *
  *   1. `isGatewayMain` is a module-scope const whose value is the argv[1]
  *      main-check (true only when this module is the process entrypoint).
  *   2. The boot sequence is `async function startGateway()`, invoked EXACTLY
  *      once, and that sole invocation is guarded by `isGatewayMain`. The old
  *      top-level boot IIFE (`void (async () => …)()`) is gone.
- *   3. No UNGUARDED module-scope P0c side effect remains: every top-level
+ *   3. No UNGUARDED module-scope side effect remains: every top-level
  *      `setInterval` / `setTimeout` / `<x>.startTimer(…)` / `mkdirSync` /
  *      `runHistoryReaperNow` / `openTurnsDb` / `initHistory` /
  *      `acquireStartupLock` / `startWebhookIngestServer` /
- *      `createPollHealthCheck` / `loadObligations` call, and every module-scope
- *      `await`, sits inside an `isGatewayMain` guard (an `if (isGatewayMain …)`
- *      or an `isGatewayMain ? … : …` ternary) — or inside a function body.
+ *      `createPollHealthCheck` / `loadObligations` /
+ *      `installPosthogErrorHandlers` / `sweepActiveReactions` /
+ *      `process.on(…)` call, and every module-scope `await`, sits inside an
+ *      `isGatewayMain` guard (an `if (isGatewayMain …)` or an
+ *      `isGatewayMain ? … : …` ternary) — or inside a function body.
  *
  * A regression that re-hoists a timer, the startup-lock await, the boot IIFE,
  * or the turn-registry open back to unguarded module scope fails (3).
  *
- * OUT OF SCOPE (P0d, deliberately still unguarded — see the PR/issue): the
- * process signal/error handlers (`process.on('SIGTERM'|'SIGINT'|'beforeExit'|
- * 'unhandledRejection'|'uncaughtException')`, `installPosthogErrorHandlers()`)
- * and the startup reaction sweep (`sweepActiveReactions`). Those are NOT in the
- * sentinel set below.
+ * The process signal/error handlers (`process.on('SIGTERM'|'SIGINT'|
+ * 'beforeExit'|'unhandledRejection'|'uncaughtException')`,
+ * `installPosthogErrorHandlers()`) and the startup reaction sweep
+ * (`sweepActiveReactions`) — the "P0d" inventory from the P0c handback — were
+ * gated behind `isGatewayMain` by P0e (#3318, `ab34bb7b`) too; #2996 P0d was
+ * verified already-delivered and closed with no PR (plan Amendment 11). They
+ * ARE in the sentinel set below, so a regression that un-gates any of them
+ * back to bare module scope fails (3) as well.
  */
 
 import { describe, it, expect } from 'vitest'
@@ -71,8 +76,9 @@ function lineOf(n: ts.Node): number {
   return sourceFile.getLineAndCharacterOfPosition(n.getStart(sourceFile)).line + 1
 }
 
-// The P0c-scoped side-effect sentinels. Each of these, at module scope, MUST be
-// isGatewayMain-guarded after P0c.
+// The side-effect sentinels. Each of these, at module scope, MUST be
+// isGatewayMain-guarded: the first block since P0c, the last two — the "P0d"
+// process-wiring inventory, gated by P0e (#3318) — since P0e.
 const CALL_SENTINELS = new Set([
   'setInterval',
   'setTimeout',
@@ -84,6 +90,8 @@ const CALL_SENTINELS = new Set([
   'startWebhookIngestServer',
   'createPollHealthCheck',
   'loadObligations',
+  'installPosthogErrorHandlers',
+  'sweepActiveReactions',
 ])
 
 function sentinelName(n: ts.Node): string | null {
@@ -93,6 +101,19 @@ function sentinelName(n: ts.Node): string | null {
     // `<obj>.startTimer(...)` — the silencePoke / pendingProgress timers.
     if (ts.isPropertyAccessExpression(e) && e.name.text === 'startTimer') {
       return `${e.expression.getText(sourceFile)}.startTimer`
+    }
+    // `process.on(...)` — the P0d signal/error-handler registrations
+    // (SIGTERM / SIGINT / beforeExit / unhandledRejection /
+    // uncaughtException), gated by P0e. Several route through shutdown() →
+    // process.exit, so an unguarded registration makes exit reachable from a
+    // bare import.
+    if (
+      ts.isPropertyAccessExpression(e) &&
+      e.name.text === 'on' &&
+      ts.isIdentifier(e.expression) &&
+      e.expression.text === 'process'
+    ) {
+      return 'process.on'
     }
   }
   if (n.kind === ts.SyntaxKind.AwaitExpression) return 'await'
