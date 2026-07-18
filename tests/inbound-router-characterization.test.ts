@@ -27,6 +27,10 @@
  * F1 — the ONE production change PR-0 needs: `handleInbound` /
  *   `handleInboundCoalesced` + a `__inboundRouterTestSeam` accessor were
  *   exported from gateway.ts (they were module-private). No behaviour change.
+ *   The seam exposes the module-local intercept stores + a fake-`ipcServer`
+ *   injector; it deliberately does NOT expose a `currentTurn` setter (a raw
+ *   `currentTurn =` write would trip the PR-4e keyed-accessor guard, and the
+ *   halt path's wrong-turn guard works with the default null anyway).
  * F2 — the `_ENABLED` / `AUTOCLASSIFY_MIDTURN_SHADOW` flags are module-level
  *   `const`s captured at import, so env must be set BEFORE the dynamic
  *   import below; a flag flip needs a separate vitest worker (a second file
@@ -43,7 +47,7 @@ import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest'
 import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { chatKey } from '../gateway/chat-key.js'
+import { chatKey } from '../telegram-plugin/gateway/chat-key.js'
 
 // ─── Fixtures / identity ────────────────────────────────────────────────
 const SENDER = '111'
@@ -74,7 +78,7 @@ process.env.SWITCHROOM_AGENT_NAME = 'chartestagent'
 const callLog: string[] = []
 const dispatchCalls: { kinds: string[] }[] = []
 
-vi.mock('../gateway/inbound-delivery-machine-dispatch.js', () => ({
+vi.mock('../telegram-plugin/gateway/inbound-delivery-machine-dispatch.js', () => ({
   dispatchEffects: (effects: { kind: string }[], deps: any) => {
     const kinds = effects.map((e) => e.kind)
     callLog.push('dispatch:' + kinds.join(','))
@@ -89,14 +93,14 @@ const sendAgentInterrupt = vi.fn(() => {
   callLog.push('sigint')
   return { ok: true }
 })
-vi.mock('../../src/agents/tmux.js', () => ({
+vi.mock('../src/agents/tmux.js', () => ({
   sendAgentInterrupt,
   clearAgentComposer: vi.fn(() => ({ ok: true })),
 }))
 
 // runPipeline is controlled per-test via `pipelineImpl`.
 let pipelineImpl: (args: any) => any = () => ({ stored: [], rewritten_text: '', deferred: [] })
-vi.mock('../secret-detect/pipeline.js', () => ({
+vi.mock('../telegram-plugin/secret-detect/pipeline.js', () => ({
   runPipeline: (args: any) => {
     callLog.push('runPipeline')
     return pipelineImpl(args)
@@ -106,8 +110,8 @@ vi.mock('../secret-detect/pipeline.js', () => ({
 // Keep the REAL pendingAuthAddFlows Map (so seeding + gateway read share one
 // instance); only stub the network submit so a seeded flow can't touch a
 // broker. The order intercept only needs the map delete at the branch head.
-vi.mock('../gateway/auth-add-flow.js', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../gateway/auth-add-flow.js')>()
+vi.mock('../telegram-plugin/gateway/auth-add-flow.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../telegram-plugin/gateway/auth-add-flow.js')>()
   return {
     ...actual,
     submitAccountAuthCode: vi.fn(async () => {
@@ -130,14 +134,14 @@ beforeAll(() => {
 })
 
 // Lazily-imported module handles (populated in beforeAll after env is set).
-let gw: typeof import('../gateway/gateway.js')
-let shadow: typeof import('../gateway/inbound-delivery-machine-shadow.js')
-let authAddFlows: typeof import('../gateway/auth-add-flow.js')
+let gw: typeof import('../telegram-plugin/gateway/gateway.js')
+let shadow: typeof import('../telegram-plugin/gateway/inbound-delivery-machine-shadow.js')
+let authAddFlows: typeof import('../telegram-plugin/gateway/auth-add-flow.js')
 
 beforeAll(async () => {
-  gw = await import('../gateway/gateway.js')
-  shadow = await import('../gateway/inbound-delivery-machine-shadow.js')
-  authAddFlows = await import('../gateway/auth-add-flow.js')
+  gw = await import('../telegram-plugin/gateway/gateway.js')
+  shadow = await import('../telegram-plugin/gateway/inbound-delivery-machine-shadow.js')
+  authAddFlows = await import('../telegram-plugin/gateway/auth-add-flow.js')
   // Inject a fake ipcServer so the imperative deliver / permission-verdict
   // paths (which deref the module-global) don't crash on `undefined`. The
   // machine-authoritative deliver/buffer routing goes through the mocked
@@ -163,7 +167,6 @@ beforeEach(() => {
   gw.__inboundRouterTestSeam.activeStatusReactions.clear()
   gw.__inboundRouterTestSeam.activeTurnStartedAt.clear()
   gw.__inboundRouterTestSeam.vaultPassphraseCache.clear?.()
-  gw.__inboundRouterTestSeam.setCurrentTurn(null)
 })
 
 // ─── ctx factory ────────────────────────────────────────────────────────

@@ -15192,10 +15192,6 @@ export const __inboundRouterTestSeam = {
   pendingPermissions,
   secretStaging,
   vaultPassphraseCache,
-  // currentTurn is a `let`; expose get/set so the harness can pin the
-  // in-flight-turn identity the halt / cross-topic paths read.
-  getCurrentTurn: (): CurrentTurn | null => currentTurn,
-  setCurrentTurn: (t: CurrentTurn | null): void => { currentTurn = t },
   // ipcServer is only assigned on the prod boot path (isGatewayMain); under
   // a test import it is undefined, so the imperative deliver / permission-
   // verdict paths would deref undefined. Let the harness inject a fake.
