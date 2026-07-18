@@ -35,7 +35,14 @@ import {
   renderVaultRequestSaveCard,
   buildVaultRequestSaveKeyboard,
 } from './vault-request-save-card.js'
-import type { PendingVaultRequestSave } from './callback-query-handlers.js'
+import {
+  renderVaultRequestAccessCard,
+  buildVaultRequestAccessKeyboard,
+} from './vault-request-access-card.js'
+import type {
+  PendingVaultRequestSave,
+  PendingVaultRequestAccess,
+} from './callback-query-handlers.js'
 import type { SweepableCardStore } from './approval-card-stores.js'
 import type { PendingCardStore } from './pending-card-store.js'
 
@@ -72,8 +79,20 @@ export interface CardToolHandlersDeps {
   VAULT_KEY_REGEX_LABEL: string
   // Pending-state stores (consolidated surfaces; the ONE shared instance).
   pendingVaultRequestSaves: SweepableCardStore<PendingVaultRequestSave>
+  pendingVaultRequestAccesses: SweepableCardStore<PendingVaultRequestAccess>
   /** Durable card-metadata store (restart survival). */
   pendingCardStore: PendingCardStore
+  /**
+   * Broker no-token `list` probe AS THIS AGENT (path-as-identity) — the
+   * authoritative standing-ACL coverage check in executeVaultRequestAccess
+   * (Fix B, #1487 follow-up). Injected (rather than imported) so the
+   * fail-open probe path and the ALREADY-covered short-circuit are
+   * deterministic under test; gateway wires the real
+   * src/vault/broker/client.js listViaBroker.
+   */
+  listViaBroker: () => Promise<string[] | null>
+  /** VAULT_REQUEST_ACCESS_TTL_MS (config-driven approval-card lifetime). */
+  VAULT_REQUEST_ACCESS_TTL_MS: number
 }
 
 /**
@@ -88,7 +107,10 @@ export function createCardToolHandlers(deps: CardToolHandlersDeps) {
     VAULT_KEY_REGEX,
     VAULT_KEY_REGEX_LABEL,
     pendingVaultRequestSaves,
+    pendingVaultRequestAccesses,
     pendingCardStore,
+    listViaBroker,
+    VAULT_REQUEST_ACCESS_TTL_MS,
   } = deps
 
   async function executeVaultRequestSave(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
@@ -178,7 +200,149 @@ export function createCardToolHandlers(deps: CardToolHandlersDeps) {
     }
   }
 
-  return { executeVaultRequestSave }
+  /**
+   * `vault_request_access` tool — agent surfaces an approval card asking
+   * the operator to grant a vault ACL it doesn't yet have. See #1012.
+   * Auth boundary: only operators on the gateway allowFrom list can tap;
+   * the agent itself can only REQUEST.
+   */
+  async function executeVaultRequestAccess(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
+    const chat_id = String(args.chat_id ?? '')
+    if (!chat_id) throw new Error('vault_request_access: chat_id is required')
+    const key = args.key as string
+    if (!key || typeof key !== 'string') throw new Error('vault_request_access: key is required')
+    if (!VAULT_KEY_REGEX.test(key)) {
+      throw new Error(`vault_request_access: key must match ${VAULT_KEY_REGEX_LABEL}`)
+    }
+    const scopeRaw = typeof args.scope === 'string' ? args.scope : 'read'
+    if (scopeRaw !== 'read' && scopeRaw !== 'write') {
+      throw new Error('vault_request_access: scope must be "read" or "write"')
+    }
+    // Accept `why` as an alias for `reason`: the sibling tool
+    // vault_request_save uses `why`, and agents cross-contaminate the two
+    // schemas — without the alias the rationale silently drops off the
+    // approval card and the operator sees "why: not provided".
+    const reason =
+      typeof args.reason === 'string' ? args.reason : typeof args.why === 'string' ? args.why : undefined
+    // Duration: accept a "30d" / "12h" string from the agent OR default
+    // to 30 days. Cap at 90 days — beyond that the operator should use
+    // the host CLI and pick the lifetime explicitly. Refuse "never"
+    // requests outright; agent-initiated grants must have a sunset.
+    let ttl_seconds = 30 * 24 * 60 * 60
+    const durRaw = args.duration
+    if (typeof durRaw === 'string' && durRaw.length > 0) {
+      const m = durRaw.match(/^(\d+)([dh])$/)
+      if (!m) {
+        throw new Error('vault_request_access: duration must look like "30d" or "12h"')
+      }
+      const n = Number(m[1])
+      const unit = m[2]
+      const parsed = unit === 'd' ? n * 86400 : n * 3600
+      const NINETY_DAYS = 90 * 86400
+      if (parsed <= 0 || parsed > NINETY_DAYS) {
+        throw new Error('vault_request_access: duration must be > 0 and <= 90d')
+      }
+      ttl_seconds = parsed
+    }
+    assertAllowedChat(chat_id)
+
+    const agentSlug = process.env.SWITCHROOM_AGENT_NAME || 'agent'
+
+    // Fix B (#1487 follow-up): if this agent's STANDING ACL already
+    // covers the key, do NOT render a card or mint a grant. Minting
+    // writes a `.vault-token` that — pre-#1487 — *shadowed* the standing
+    // ACL (the exact gymbro trap) and is simply redundant post-#1487.
+    // Determine coverage AUTHORITATIVELY by probing the broker AS THIS
+    // AGENT (no-token list over the per-agent socket — path-as-identity;
+    // the gateway runs in the agent's container so the broker attributes
+    // it to this agent). NOT a gateway-side config read: the gateway can
+    // see newer config than the broker has loaded, so a config-derived
+    // "covered" could be wrong where the broker still denies. `list`
+    // returns only ACL-visible key NAMES — never secret values. Read
+    // scope only: schedule.secrets[] confers read, not write.
+    if (scopeRaw === 'read') {
+      try {
+        const visible = await listViaBroker()
+        if (visible !== null && visible.includes(key)) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text:
+                  `vault_request_access: '${key}' is ALREADY covered by ${agentSlug}'s ` +
+                  `standing ACL (schedule.secrets[]). No approval card or grant is needed — ` +
+                  `read it directly: \`switchroom vault get ${key}\`. Do NOT request a grant ` +
+                  `for this key (a minted token would shadow the standing ACL). If a read ` +
+                  `still returns VAULT-BROKER-DENIED, the broker likely needs a restart to ` +
+                  `pick up a recent config change — tell the operator; don't re-request.`,
+              },
+            ],
+          }
+        }
+      } catch {
+        // Probe failed (broker unreachable / transient): fall through to
+        // the normal card flow. Fail-open is correct here — a redundant
+        // card is harmless; suppressing a needed card is not.
+      }
+    }
+
+    const stageId = randomBytes(4).toString('hex')
+    const pending: PendingVaultRequestAccess = {
+      agent: agentSlug,
+      chat_id,
+      key,
+      scope: scopeRaw,
+      reason,
+      ttl_seconds,
+      staged_at: Date.now(),
+    }
+    pendingVaultRequestAccesses.set(stageId, pending)
+    pendingVaultRequestAccesses.sweep(Date.now())
+
+    // renderVaultRequestAccessCard self-hardens its field line breaks (this card
+    // is sent direct, bypassing the switchroomReply chokepoint).
+    const text = renderVaultRequestAccessCard(pending)
+    const threadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
+    // Remember the agent's working topic so the grant-outcome inbound resumes in it.
+    if (threadId != null) pending.threadId = threadId
+    // #1075: deleted-topic safe — fall back to main chat.
+    const sent = await retryWithThreadFallback<{ message_id: number }>(
+      robustApiCall,
+      (tid) =>
+        lockedBot.api.sendRichMessage(chat_id, richMessage(text), {
+          reply_markup: buildVaultRequestAccessKeyboard(stageId),
+          ...(tid != null && Number.isFinite(tid) ? { message_thread_id: tid } : {}),
+        }),
+      { threadId, chat_id, verb: 'vault_request_access.card' },
+    )
+    pending.card_message_id = sent.message_id
+    // Persist card metadata (no secret material — this flow stages only the ACL
+    // request) so a gateway restart doesn't strand the parked agent.
+    pendingCardStore.add({
+      family: 'vault_request_access',
+      stageId,
+      agent: pending.agent,
+      chatId: pending.chat_id,
+      ...(pending.card_message_id != null ? { cardMessageId: pending.card_message_id } : {}),
+      ...(pending.threadId != null ? { threadId: pending.threadId } : {}),
+      key: pending.key,
+      scope: pending.scope,
+      ...(pending.reason != null ? { reason: pending.reason } : {}),
+      ttlSeconds: pending.ttl_seconds,
+      stagedAt: pending.staged_at,
+    })
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `vault_request_access: card sent (stage_id=${stageId}, key=${key}, scope=${scopeRaw}). Wait for the operator to tap Approve or Deny — do not retry the vault read until you see a confirmation message. If the card times out (${Math.round(VAULT_REQUEST_ACCESS_TTL_MS / 60000)} min) you can re-request.`,
+        },
+      ],
+    }
+  }
+
+  return { executeVaultRequestSave, executeVaultRequestAccess }
 }
 
 export type CardToolHandlers = ReturnType<typeof createCardToolHandlers>
