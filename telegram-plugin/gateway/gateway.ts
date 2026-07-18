@@ -128,6 +128,10 @@ import {
   handleAnimationMessage,
   type AttachmentHandlerDeps,
 } from './attachment-message-handlers.js'
+import {
+  handlePhotoMessage,
+  type PhotoHandlerDeps,
+} from './photo-message-handler.js'
 import { fmtLocalStamp, resolveEnvTimezone, renderLogTimestampsLocal } from '../shared/local-time.js'
 import { StatusReactionController } from '../status-reactions.js'
 import { DeferredDoneReactions } from '../reaction-defer.js'
@@ -24630,47 +24634,7 @@ bot.on('callback_query:data', async ctx => {
 bot.on('message:text', async ctx => {
   await handleInboundCoalesced(ctx, ctx.message.text, undefined)
 })
-bot.on('message:photo', async ctx => {
-  const caption = ctx.message.caption ?? '(photo)'
-  await handleInboundCoalesced(ctx, caption, async () => {
-    const photos = ctx.message.photo
-    const best = photos[photos.length - 1]
-    try {
-      const file = await ctx.api.getFile(best.file_id)
-      if (!file.file_path) return undefined
-      // Build download URL — token is embedded in the URL but never exposed
-      // in error messages or logs (caught and sanitized below).
-      //
-      // Bounded fetch: a stalled Telegram CDN connection without a
-      // timeout would hang the entire inbound handler, blocking the
-      // user's photo from ever being acked or seen by the agent.
-      // 15s is generous for normal photos (typical 100ms-2s) and
-      // tight enough to surface a real outage.
-      const downloadUrl = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
-      const res = await fetch(downloadUrl, { signal: AbortSignal.timeout(15_000) })
-      if (!res.ok) {
-        process.stderr.write(`telegram gateway: photo download failed: HTTP ${res.status}\n`)
-        return undefined
-      }
-      const buf = Buffer.from(await res.arrayBuffer())
-      const dlPath = buildAttachmentPath({
-        inboxDir: INBOX_DIR,
-        telegramFilePath: file.file_path,
-        fileUniqueId: best.file_unique_id,
-        now: Date.now(),
-      })
-      mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 })
-      assertInsideInbox(INBOX_DIR, dlPath)
-      writeFileSync(dlPath, buf, { mode: 0o600 })
-      return dlPath
-    } catch (err) {
-      // Sanitize error to avoid leaking bot token in logs
-      const msg = err instanceof Error ? err.message : 'unknown error'
-      process.stderr.write(`telegram gateway: photo download failed: ${msg.replace(TOKEN!, '<REDACTED>')}\n`)
-      return undefined
-    }
-  })
-})
+bot.on('message:photo', ctx => handlePhotoMessage(ctx, photoHandlerDeps))
 bot.on('message:document', ctx => handleDocumentMessage(ctx, attachmentHandlerDeps))
 bot.on('message:voice', async ctx => {
   const voice = ctx.message.voice
@@ -24752,6 +24716,15 @@ const mediaEnvelopeDeps: MediaEnvelopeDeps = {
 // attachment handlers (switchroom#2996 P6 cluster C).
 const attachmentHandlerDeps: AttachmentHandlerDeps = {
   handleInboundCoalesced,
+}
+// Injected surface for the extracted photo handler (switchroom#2996 P6
+// cluster D). `getToken` reads the bot token lazily — it is materialized
+// after this deps object is constructed.
+const photoHandlerDeps: PhotoHandlerDeps = {
+  handleInboundCoalesced,
+  getToken: () => TOKEN,
+  inboxDir: INBOX_DIR,
+  log: line => process.stderr.write(line),
 }
 bot.on('message:contact', ctx => handleContactMessage(ctx, mediaEnvelopeDeps))
 bot.on('message:location', ctx => handleLocationMessage(ctx, mediaEnvelopeDeps))
