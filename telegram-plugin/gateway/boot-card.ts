@@ -68,6 +68,7 @@ import {
   type ConfigDiff,
 } from './config-snapshot.js'
 import { join } from 'path'
+import { readFileSync, statSync } from 'fs'
 import { bootCardChatKey, loadBootCardMsgId, saveBootCardMsgId } from './boot-card-msgid.js'
 import { nonEssentialSendSuppression } from '../flood-circuit-breaker.js'
 import { loadConfig as _loadSwitchroomConfig } from '../../src/config/loader.js'
@@ -278,6 +279,89 @@ const REASON_LABEL: Record<RestartReason, string> = {
   fresh:    'fresh start',
 }
 
+// ─── Routing-mode row (.routing-mode observability) ─────────────────────────
+
+/**
+ * Parsed `.routing-mode` state file — one overwrite-per-boot line written by
+ * start.sh immediately before `exec claude`:
+ *
+ *   mode=<router-root|passthrough|direct-oauth> base=<url> model=<effective>
+ *   litellm_ok=<0|1> declared=<mode> ts=<iso>
+ *
+ * `prevBoot` marks a RENDER-TIMING hazard, not file corruption: the gateway
+ * (outer pass) can render the boot card BEFORE the inner pass writes this
+ * boot's line (the inner LiteLLM probe can hold the write back for minutes on
+ * a degraded proxy). When the file's mtime predates this gateway process
+ * start, the value belongs to the PREVIOUS boot and must be labeled as such —
+ * never shown as current.
+ */
+export interface RoutingModeInfo {
+  /** Landed routing mode this boot: router-root | passthrough | direct-oauth. */
+  mode: string
+  /** Declared (apply-time) routing intent, when present in the file. */
+  declared?: string
+  /** Effective launched model recorded alongside the mode. */
+  model?: string
+  /** LiteLLM liveliness at boot ("1" ok / "0" not confirmed). */
+  litellmOk?: string
+  /** True when the file predates this gateway boot (stale — prev boot's value). */
+  prevBoot: boolean
+}
+
+/**
+ * Read + parse `<agentDir>/.routing-mode`. Returns null when the file is
+ * absent, unreadable, or carries no `mode=` field (tolerant by design — the
+ * boot card must render fine on fleets that pre-date the state file).
+ *
+ * `bootStartMs` is the epoch-ms this gateway process started; a file mtime
+ * strictly older than it is flagged `prevBoot` so the renderer can label the
+ * row instead of presenting stale data as current.
+ */
+export function readRoutingMode(
+  agentDir: string,
+  bootStartMs: number,
+  fsImpl: { readFileSync: typeof readFileSync; statSync: typeof statSync } = { readFileSync, statSync },
+): RoutingModeInfo | null {
+  const path = join(agentDir, '.routing-mode')
+  try {
+    const raw = fsImpl.readFileSync(path, 'utf-8')
+    const line = raw.split('\n')[0] ?? ''
+    const field = (key: string): string | undefined => {
+      const m = line.match(new RegExp(`(?:^|\\s)${key}=([^\\s]+)`))
+      return m ? m[1] : undefined
+    }
+    const mode = field('mode')
+    if (!mode) return null
+    const mtimeMs = fsImpl.statSync(path).mtimeMs
+    return {
+      mode,
+      declared: field('declared'),
+      model: field('model'),
+      litellmOk: field('litellm_ok'),
+      prevBoot: mtimeMs < bootStartMs,
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Render the routing row for the boot card. Divergence (landed ≠ declared)
+ * gets the warning dot; a converged mode renders as a dim informational row —
+ * deliberately always visible (2026-07-17 incident: both divergence cases
+ * were SILENT; the row is the standing observability surface).
+ */
+export function renderRoutingRow(r: RoutingModeInfo): string {
+  const diverged = r.declared != null && r.declared !== '' && r.mode !== r.declared
+  const dot = diverged ? DOT.degraded : '🔀'
+  const parts: string[] = [escapeMarkdown(r.mode)]
+  if (diverged) parts.push(`≠ declared ${escapeMarkdown(r.declared as string)}`)
+  if (r.model) parts.push(`\`${r.model}\``)
+  if (r.litellmOk != null) parts.push(r.litellmOk === '1' ? 'litellm ok' : 'litellm unconfirmed')
+  const suffix = r.prevBoot ? ' _(prev boot)_' : ''
+  return `${dot} **Routing**  ${parts.join(' · ')}${suffix}`
+}
+
 export interface RenderBootCardOpts {
   agentName: string
   /** Lowercase slug used for systemd unit names. Falls back to
@@ -338,6 +422,14 @@ export interface RenderBootCardOpts {
    * persisted snapshot from the prior boot. See `config-snapshot.ts`.
    */
   configChanges?: ConfigDiff
+  /**
+   * Parsed `.routing-mode` state (see `readRoutingMode`). When present, a
+   * "Routing" row is rendered — always visible, warning-dotted on
+   * landed≠declared divergence, suffixed "(prev boot)" when the file
+   * predates this gateway boot. Absent/null = row omitted entirely
+   * (fleets pre-dating the state file, unreadable file).
+   */
+  routing?: RoutingModeInfo | null
 }
 
 /**
@@ -456,8 +548,13 @@ export function renderBootCard(opts: RenderBootCardOpts): string {
     }
   }
 
+  // Routing row (.routing-mode observability) — rendered whenever the state
+  // file was readable. Sits with the probe rows so divergence reads like any
+  // other degraded surface.
+  const routingRows: string[] = opts.routing ? [renderRoutingRow(opts.routing)] : []
+
   const sections: string[] = [ack]
-  if (degradedRows.length > 0) sections.push('', ...degradedRows)
+  if (degradedRows.length > 0 || routingRows.length > 0) sections.push('', ...degradedRows, ...routingRows)
   if (accountRows.length > 0) sections.push('', ...accountRows)
   if (opts.updateOutcomeLine) {
     // PR C: each line of the update-outcome blob is its own row in the
@@ -616,6 +713,13 @@ export interface RunProbesOpts {
   floodStatePath?: string
   /** Injectable clock for the flood-wait check (tests). Defaults to Date.now. */
   nowMs?: () => number
+  /**
+   * Epoch-ms this gateway boot started — the staleness threshold for the
+   * `.routing-mode` row (a file mtime older than this is the PREVIOUS boot's
+   * value and is labeled, never shown as current). Defaults to the gateway
+   * process start (`Date.now() - process.uptime()*1000`). Test override.
+   */
+  routingBootStartMs?: number
 }
 
 /** Run all six probes concurrently with their own per-probe timeouts.
@@ -879,6 +983,21 @@ export async function startBootCard(
           }
         }
 
+        // Routing-mode row (.routing-mode observability). Read at settle
+        // time — by then a healthy inner pass has usually written this
+        // boot's line; a degraded LiteLLM probe can still delay the write,
+        // in which case the file mtime predates this gateway boot and the
+        // reader flags it prevBoot (rendered "(prev boot)", never as
+        // current). Absent/unreadable file → row omitted.
+        const routingBootStartMs =
+          opts.routingBootStartMs ?? Date.now() - process.uptime() * 1000
+        let routing: RoutingModeInfo | null = null
+        try {
+          routing = readRoutingMode(opts.agentDir, routingBootStartMs)
+        } catch {
+          routing = null
+        }
+
         // Render with current probe state and edit if anything changed.
         let currentText = renderBootCard({
           agentName: opts.agentName,
@@ -892,6 +1011,7 @@ export async function startBootCard(
           ...(snoozeRows.length > 0 ? { snoozeRows } : {}),
           ...(opts.updateOutcomeLine ? { updateOutcomeLine: opts.updateOutcomeLine } : {}),
           ...(configChanges.length > 0 ? { configChanges } : {}),
+          ...(routing ? { routing } : {}),
         })
 
         if (currentText !== ackText) {
@@ -947,6 +1067,8 @@ export async function startBootCard(
             // (computed once in Phase 1). Pass them through unchanged so
             // the live-agent-status edits keep the config-diff rows.
             ...(configChanges.length > 0 ? { configChanges } : {}),
+            // Routing row is stable for the card lifetime (read once above).
+            ...(routing ? { routing } : {}),
           })
 
           if (updatedText === currentText) continue

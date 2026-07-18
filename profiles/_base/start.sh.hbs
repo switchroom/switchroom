@@ -96,6 +96,13 @@ if [ "$SWITCHROOM_RUNTIME" = "docker" ] && [ -z "$SWITCHROOM_DOCKER_TMUX_INNER" 
   #
   # SWITCHROOM_AGENT_NAME is injected by compose env (compose.ts:1816)
   # so it is available here, before the inner-pass export at line ~320.
+  #
+  # Capture whether LiteLLM routing was configured at compose time BEFORE the
+  # missing-key fail-open below can strip SWITCHROOM_LITELLM. The routing-mode
+  # observability block (inner pass, pre-exec) reads this to distinguish
+  # "litellm never configured" (declared intent IS direct-oauth — no
+  # divergence) from "configured but stripped at boot" (real divergence).
+  export SWITCHROOM_LITELLM_DECLARED="${SWITCHROOM_LITELLM_DECLARED:-${SWITCHROOM_LITELLM:-}}"
   if [ -n "${SWITCHROOM_LITELLM:-}" ] && [ -z "$ANTHROPIC_CUSTOM_HEADERS" ] && command -v switchroom >/dev/null 2>&1; then
     sr_ll_key="$(switchroom vault get "litellm/$SWITCHROOM_AGENT_NAME/api-key" 2>/dev/null || true)"
     sr_ll_ok=""
@@ -1096,7 +1103,20 @@ fi
 # unreachable at boot, or claude would 4xx an unknown model against Anthropic.
 # Empty by default (proxy not confirmed live); set to "1" only on a successful
 # liveliness probe. Deliberately NOT unset with the sr_ll_* scratch vars.
+#
+# _LITELLM_UNREACHABLE distinguishes WHY _LITELLM_OK is empty (routing-cause
+# split, 2026-07-17 boot-race incident): "1" means the key was present and the
+# probe failed — routing was LEFT IN PLACE pointing at the proxy, so a
+# proxy-only model (fable/sr-*) can boot loud-degraded and self-heal per
+# request. Empty means either the key is MISSING (routing stripped — a
+# proxy-only model genuinely cannot work and must demote) or LiteLLM is not
+# configured at all (same conclusion). Deliberately NOT unset either.
 _LITELLM_OK=""
+_LITELLM_UNREACHABLE=""
+# Idempotent mirror of the outer-pass capture (first setter wins) — on the
+# non-docker path only this inner block runs, so capture here too, before the
+# missing-key fail-open below can strip SWITCHROOM_LITELLM.
+export SWITCHROOM_LITELLM_DECLARED="${SWITCHROOM_LITELLM_DECLARED:-${SWITCHROOM_LITELLM:-}}"
 if [ -n "${SWITCHROOM_LITELLM:-}" ] && command -v switchroom >/dev/null 2>&1; then
   sr_ll_key="$(switchroom vault get "litellm/$SWITCHROOM_AGENT_NAME/api-key" 2>/dev/null || true)"
   sr_ll_ok=""
@@ -1112,10 +1132,14 @@ if [ -n "${SWITCHROOM_LITELLM:-}" ] && command -v switchroom >/dev/null 2>&1; th
     # co-boots, the litellm proxy's heavy Python app is often not yet healthy
     # in the first few seconds. A single one-shot probe fails-open and takes
     # this agent dark (untracked) for the WHOLE session. Poll the liveliness
-    # endpoint every ~3s for up to 120s (hard budget) and only fall open if
+    # endpoint every ~3s for up to SWITCHROOM_LITELLM_BOOT_BUDGET seconds
+    # (default 240 — the INNER budget only; the outer/gateway-pass probe stays
+    # at 120s so gateway boot latency is not doubled) and only fall open if
     # it is STILL unreachable after that whole window.
     sr_ll_url="${SWITCHROOM_LITELLM_BASE:-${ANTHROPIC_BASE_URL%/anthropic}}/health/liveliness"
-    sr_ll_deadline=$(( $(date +%s) + 120 ))
+    sr_ll_budget="${SWITCHROOM_LITELLM_BOOT_BUDGET:-240}"
+    case "$sr_ll_budget" in *[!0-9]*|"") sr_ll_budget=240 ;; esac
+    sr_ll_deadline=$(( $(date +%s) + sr_ll_budget ))
     sr_ll_up=""
     while :; do
       if curl -fsS -m 5 -o /dev/null "$sr_ll_url" 2>/dev/null; then sr_ll_up="1"; break; fi
@@ -1127,8 +1151,9 @@ if [ -n "${SWITCHROOM_LITELLM:-}" ] && command -v switchroom >/dev/null 2>&1; th
       # leave it pointed at litellm so the fleet self-heals once the proxy is
       # back (the socat forwarder at 127.0.0.1:4010 reconnects per-connection).
       sr_ll_unreachable="1"
+      _LITELLM_UNREACHABLE="1"
       echo "==================== litellm UNREACHABLE ====================" >&2
-      echo "WARNING: litellm proxy unreachable at ${SWITCHROOM_LITELLM_BASE:-$ANTHROPIC_BASE_URL} after 120s of retries;" >&2
+      echo "WARNING: litellm proxy unreachable at ${SWITCHROOM_LITELLM_BASE:-$ANTHROPIC_BASE_URL} after ${sr_ll_budget}s of retries;" >&2
       echo "WARNING: Claude traffic will FAIL until it recovers — routing LEFT IN PLACE" >&2
       echo "WARNING: so it self-heals (socat forwarder reconnects per-connection)." >&2
       echo "WARNING: NOT falling back to untracked direct Anthropic OAuth." >&2
@@ -1136,7 +1161,7 @@ if [ -n "${SWITCHROOM_LITELLM:-}" ] && command -v switchroom >/dev/null 2>&1; th
     else
       sr_ll_ok="1"
     fi
-    unset sr_ll_url sr_ll_deadline sr_ll_up
+    unset sr_ll_url sr_ll_budget sr_ll_deadline sr_ll_up
   else
     sr_ll_ok="1"
   fi
@@ -1419,22 +1444,37 @@ if [ -f "{{agentDir}}/.session-model" ]; then
   unset _smf _sm_model _sm_cfg _sm_attempts _SM_MAX_ATTEMPTS
 fi
 
-# Configured-default LiteLLM guard. A proxy-only *configured* model with
-# LiteLLM unreachable at boot would exec against the /anthropic passthrough,
-# where `fable`/`claude-fable-5` is a retired codename and EVERY call 4xxs —
-# a total outage. The carrier block above already drops proxy-only OVERRIDES
-# on a down proxy; this extends the same guard to the configured default,
-# which the live-config read above makes a mainline path (pinning `model:
-# fable` in yaml is now the normal way to run Fable). Claude agents have a
-# safe same-class fallback (opus); sr-* configured defaults keep today's
-# loud-degraded behavior — there is no Claude fallback for them and the
-# repoint case below already leaves their routing to self-heal.
+# Configured-default LiteLLM guard, SPLIT BY CAUSE (2026-07-17 boot-race
+# incident: a slow LiteLLM co-boot demoted a configured-fable agent to opus on
+# the passthrough — silent divergence that persisted for the whole session).
+#
+#   - MISSING KEY / LiteLLM not configured (_LITELLM_UNREACHABLE empty):
+#     routing was STRIPPED (direct Anthropic OAuth), where `fable`/
+#     `claude-fable-5` is a retired codename and EVERY call 4xxs — a total
+#     outage. Claude agents have a safe same-class fallback: demote to opus,
+#     loudly (stderr + .session-model-alert).
+#   - PROXY UNREACHABLE, key present (_LITELLM_UNREACHABLE="1"): routing was
+#     LEFT IN PLACE pointing at the proxy. Do NOT demote — boot the declared
+#     fable model against the LiteLLM router root (the repoint case below
+#     includes the unreachable path) and run loud-degraded, the same policy as
+#     sr-* configured defaults: requests fail until the proxy heals, then work
+#     with ZERO divergence and no restart needed (per-request recovery — see
+#     the repoint comment below).
+#
+# The carrier block above already drops proxy-only OVERRIDES on a down proxy;
+# this guard covers only the configured default, which the live-config read
+# above makes a mainline path (pinning `model: fable` in yaml is the normal
+# way to run Fable).
 case "$_EFFECTIVE_MODEL" in
   fable|claude-fable-5)
     if [ -z "$_LITELLM_OK" ]; then
-      echo "session-model: configured model '$_EFFECTIVE_MODEL' is proxy-only but LiteLLM is unreachable at boot — booting 'opus' until the proxy recovers" >&2
-      printf 'LiteLLM was unreachable at boot, so the configured model `%s` (proxy-only) could not be used — the agent booted on `opus` instead. Restart the agent once the proxy is back to return to `%s`.\n' "$_EFFECTIVE_MODEL" "$_EFFECTIVE_MODEL" >> "{{agentDir}}/.session-model-alert" 2>/dev/null || true
-      _EFFECTIVE_MODEL="opus"
+      if [ -n "$_LITELLM_UNREACHABLE" ]; then
+        echo "session-model: configured model '$_EFFECTIVE_MODEL' is proxy-only and LiteLLM is unreachable at boot — booting '$_EFFECTIVE_MODEL' anyway against the LiteLLM router (loud-degraded; requests fail until the proxy recovers, then self-heal per-request). NOT demoting to opus." >&2
+      else
+        echo "session-model: configured model '$_EFFECTIVE_MODEL' is proxy-only but no LiteLLM virtual key is available (routing stripped to direct Anthropic, where it would 4xx every call) — booting 'opus' instead" >&2
+        printf 'No LiteLLM virtual key was available at boot (routing stripped to direct Anthropic), so the configured model `%s` (proxy-only) cannot work — the agent booted on `opus` instead. Run `switchroom apply` on the host (it provisions the LiteLLM key), then restart this agent to return to `%s`.\n' "$_EFFECTIVE_MODEL" "$_EFFECTIVE_MODEL" >> "{{agentDir}}/.session-model-alert" 2>/dev/null || true
+        _EFFECTIVE_MODEL="opus"
+      fi
     fi
     ;;
 esac
@@ -1518,9 +1558,16 @@ printf '%s\n' "$_EFFECTIVE_EFFORT" > "{{agentDir}}/.active-session-effort" 2>/de
 # /v1/models (both `fable` and `claude-fable-5` served). Other Claude sessions
 # (opus/sonnet/haiku/default) keep the passthrough — it dodges the Opus SSE
 # re-chunk stall; Fable trades that for being routable at all.
+# Repoint fires when the proxy is LIVE (_LITELLM_OK) OR when it is unreachable
+# with the key present (_LITELLM_UNREACHABLE — routing left in place, cause
+# split above): a configured fable that survives the unreachable guard must
+# land on the ROUTER ROOT, not the model-agnostic passthrough, or it would
+# keep 4xxing even after the proxy heals. Missing-key boots never get here
+# with a proxy-only model (the guard above demoted fable to opus, and sr-*
+# had its routing stripped anyway).
 case "$_EFFECTIVE_MODEL" in
   sr-*|fable|claude-fable-5)
-    if [ -n "$_LITELLM_OK" ] && [ -n "$SWITCHROOM_LITELLM_BASE" ]; then
+    if { [ -n "$_LITELLM_OK" ] || [ -n "$_LITELLM_UNREACHABLE" ]; } && [ -n "$SWITCHROOM_LITELLM_BASE" ]; then
       export ANTHROPIC_BASE_URL="$SWITCHROOM_LITELLM_BASE"
       echo "session-model: effective model '$_EFFECTIVE_MODEL' is proxy-only (sr-*/fable) — routing via LiteLLM model router '$SWITCHROOM_LITELLM_BASE' (off /anthropic passthrough)" >&2
     fi
@@ -1530,6 +1577,38 @@ esac
 # in-memory session-model state after this restart, keeping /status and the
 # welcome card honest. Overwrite (not consumed) — the gateway reads it at boot.
 printf '%s\n' "$_EFFECTIVE_MODEL" > "{{agentDir}}/.active-session-model" 2>/dev/null || true
+
+# --- Routing-mode observability (.routing-mode, 2026-07-17 boot-race incident) ---
+#
+# Deterministic record of WHERE this boot actually landed, written immediately
+# before exec claude (overwrite-per-boot, one line). Consumers: the gateway
+# boot card's "routing" row and any operator shell. _DECLARED_ROUTING is baked
+# at render time from the same isClaudeModel() split compose.ts uses for
+# ANTHROPIC_BASE_URL (passthrough for Claude-class models, router-root
+# otherwise) — the apply-time INTENT the landed mode is compared against.
+# Divergence (landed ≠ declared) appends a consume-once .session-model-alert
+# line the gateway relays to the operator, but ONLY when the landed mode
+# differs from the PREVIOUS boot's landed mode — a persistently degraded agent
+# alerts once, not on every restart.
+_DECLARED_ROUTING={{{declaredRoutingQ}}}
+# When LiteLLM was never configured for this agent (no SWITCHROOM_LITELLM at
+# boot entry, captured before any strip), compose injects NO routing env — the
+# declared intent genuinely IS direct-oauth, not the model-class bake. This
+# keeps non-LiteLLM fleets from false-alerting divergence on every boot.
+if [ -z "${SWITCHROOM_LITELLM_DECLARED:-}" ]; then _DECLARED_ROUTING="direct-oauth"; fi
+case "${ANTHROPIC_BASE_URL:-}" in
+  "") _ROUTING_MODE="direct-oauth" ;;
+  */anthropic) _ROUTING_MODE="passthrough" ;;
+  *) _ROUTING_MODE="router-root" ;;
+esac
+_prev_routing_mode="$(sed -n 's/^mode=\([^ ]*\).*/\1/p' "{{agentDir}}/.routing-mode" 2>/dev/null | head -n 1 || true)"
+_routing_line="mode=$_ROUTING_MODE base=${ANTHROPIC_BASE_URL:-direct} model=$_EFFECTIVE_MODEL litellm_ok=${_LITELLM_OK:-0} declared=$_DECLARED_ROUTING ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+printf '%s\n' "$_routing_line" > "{{agentDir}}/.routing-mode" 2>/dev/null || true
+echo "routing: $_routing_line" >&2
+if [ "$_ROUTING_MODE" != "$_DECLARED_ROUTING" ] && [ "$_ROUTING_MODE" != "$_prev_routing_mode" ]; then
+  printf 'Routing divergence: this agent landed on `%s` (base `%s`, model `%s`) but its declared routing is `%s`. Check `%s/.routing-mode` and the boot log for the cause (LiteLLM key/provision or proxy reachability).\n' "$_ROUTING_MODE" "${ANTHROPIC_BASE_URL:-direct}" "$_EFFECTIVE_MODEL" "$_DECLARED_ROUTING" "{{agentDir}}" >> "{{agentDir}}/.session-model-alert" 2>/dev/null || true
+fi
+unset _prev_routing_mode _routing_line
 
 {{#if useSwitchroomPlugin}}
 if [ -n "$APPEND_PROMPT" ]; then

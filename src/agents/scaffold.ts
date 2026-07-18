@@ -599,6 +599,7 @@ export function maybeWriteCronMcp(
   return path;
 }
 import { resolveUsers, resolvePersonEntries } from "../config/users.js";
+import { isClaudeModel } from "../../telegram-plugin/gateway/model-command.js";
 import {
   resolveAgentConfig,
   translateHooksToClaudeShape,
@@ -3242,6 +3243,13 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     // switchroom.yaml. See profiles/_base/start.sh.hbs (Session model
     // resolution) and telegram-plugin/gateway/model-command.ts.
     modelQ: shellSingleQuote(resolveMainModel(agentConfig.model)),
+    // Declared routing INTENT, baked with the same isClaudeModel split
+    // compose.ts uses to pick ANTHROPIC_BASE_URL (passthrough vs router
+    // root). start.sh compares the LANDED routing mode against this and
+    // writes both to `.routing-mode` (2026-07-17 boot-race incident).
+    declaredRoutingQ: shellSingleQuote(
+      isClaudeModel(resolveMainModel(agentConfig.model)) ? "passthrough" : "router-root",
+    ),
     ...buildCronSessionContext(agentConfig),
     thinkingEffort: agentConfig.thinking_effort ?? SWITCHROOM_DEFAULT_THINKING_EFFORT,
     permissionMode: agentConfig.permission_mode,
@@ -6458,6 +6466,11 @@ function reconcileAgentInner(
       // home, not /host-home (see hostHomeForBake).
       hostHomeQ: hostHomeQForBake(),
       modelQ: shellSingleQuote(resolveMainModel(agentConfig.model)),
+      // Mirror buildWorkspaceContext: declared routing intent for the
+      // `.routing-mode` landed-vs-declared comparison in start.sh.
+      declaredRoutingQ: shellSingleQuote(
+        isClaudeModel(resolveMainModel(agentConfig.model)) ? "passthrough" : "router-root",
+      ),
       ...buildCronSessionContext(agentConfig),
       thinkingEffort: agentConfig.thinking_effort ?? SWITCHROOM_DEFAULT_THINKING_EFFORT,
       permissionMode: agentConfig.permission_mode,
