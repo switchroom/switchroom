@@ -24,13 +24,16 @@ const bridgeSrc = readFileSync(
   'utf-8',
 )
 // #2996 Phase 5: the callback-query handler families moved verbatim to
-// gateway/callback-query-handlers.ts; these pins read the gateway source
-// COMBINED with that module so the wiring assertions keep covering the
-// same runtime source text.
+// gateway/callback-query-handlers.ts, and the agent-facing card-STAGING
+// execute* tool handlers moved verbatim to gateway/card-tool-handlers.ts
+// (#2996 P5-tail); these pins read the gateway source COMBINED with those
+// modules so the wiring assertions keep covering the same runtime source text.
 const gatewaySrc =
   readFileSync(resolve(__dirname, '..', 'gateway', 'gateway.ts'), 'utf-8') +
   '\n' +
-  readFileSync(resolve(__dirname, '..', 'gateway', 'callback-query-handlers.ts'), 'utf-8')
+  readFileSync(resolve(__dirname, '..', 'gateway', 'callback-query-handlers.ts'), 'utf-8') +
+  '\n' +
+  readFileSync(resolve(__dirname, '..', 'gateway', 'card-tool-handlers.ts'), 'utf-8')
 
 describe('vault_request_access (#1012)', () => {
   it('bridge advertises the tool to MCP clients', () => {
@@ -64,7 +67,9 @@ describe('vault_request_access (#1012)', () => {
   it('gateway routes vault_request_access in executeToolCall', () => {
     // fails when: the switch arm is dropped. Tool would be accepted
     // by ALLOWED_TOOLS but fall through to the `unknown tool` branch.
-    expect(gatewaySrc).toMatch(/case\s+'vault_request_access':\s*\n\s*return\s+executeVaultRequestAccess/)
+    // #2996 P5-tail: the dispatcher arm now routes through the extracted
+    // card-tool-handlers factory instance.
+    expect(gatewaySrc).toMatch(/case\s+'vault_request_access':\s*\n\s*return\s+cardToolHandlers\.executeVaultRequestAccess/)
   })
 
   it('gateway dispatches vra: callback prefix', () => {

@@ -34,6 +34,7 @@ function makeDeps(overrides: Partial<CardToolHandlersDeps> = {}) {
   const removed: string[] = []
   const allowedChats: string[] = []
   const saves = fakeCardStore<Record<string, unknown>>()
+  const accesses = fakeCardStore<Record<string, unknown>>()
   const deps: CardToolHandlersDeps = {
     lockedBot: {
       api: {
@@ -47,13 +48,17 @@ function makeDeps(overrides: Partial<CardToolHandlersDeps> = {}) {
     VAULT_KEY_REGEX,
     VAULT_KEY_REGEX_LABEL,
     pendingVaultRequestSaves: saves,
+    pendingVaultRequestAccesses: accesses,
     pendingCardStore: {
       add: (e: unknown) => void added.push(e),
       remove: (id: string) => void removed.push(id),
     } as unknown as CardToolHandlersDeps['pendingCardStore'],
+    // Default: broker sees no keys (no standing ACL) — normal card flow.
+    listViaBroker: async () => [],
+    VAULT_REQUEST_ACCESS_TTL_MS: 10 * 60_000,
     ...overrides,
   }
-  return { deps, added, removed, allowedChats, saves }
+  return { deps, added, removed, allowedChats, saves, accesses }
 }
 
 describe('executeVaultRequestSave', () => {
@@ -120,5 +125,104 @@ describe('executeVaultRequestSave', () => {
     await expect(
       executeVaultRequestSave({ chat_id: '123', key: 'svc/token', value: 'v', kind: 'nope' }),
     ).rejects.toThrow(/kind must be/)
+  })
+})
+
+describe('executeVaultRequestAccess', () => {
+  it('stages the card and returns stage_id + key + scope; default scope=read, default ttl=30d', async () => {
+    const { deps, added, accesses } = makeDeps()
+    const { executeVaultRequestAccess } = createCardToolHandlers(deps)
+    const res = await executeVaultRequestAccess({ chat_id: '123', key: 'svc/token' })
+    const text = res.content[0]!.text
+    expect(text).toMatch(/vault_request_access: card sent/)
+    expect(text).toMatch(/key=svc\/token/)
+    expect(text).toMatch(/scope=read/)
+    expect(accesses.map.size).toBe(1)
+    const staged = [...accesses.map.values()][0] as Record<string, unknown>
+    expect(staged.scope).toBe('read')
+    expect(staged.ttl_seconds).toBe(30 * 24 * 60 * 60)
+    expect(added).toHaveLength(1)
+    const rec = added[0] as Record<string, unknown>
+    expect(rec.family).toBe('vault_request_access')
+    expect(rec.scope).toBe('read')
+  })
+
+  it('parses "12h"/"45d" durations and REFUSES > 90d and malformed/"never" shapes (threat model)', async () => {
+    const { deps, accesses } = makeDeps()
+    const { executeVaultRequestAccess } = createCardToolHandlers(deps)
+    await executeVaultRequestAccess({ chat_id: '1', key: 'a/b', duration: '12h' })
+    expect(([...accesses.map.values()].pop() as Record<string, unknown>).ttl_seconds).toBe(12 * 3600)
+    await executeVaultRequestAccess({ chat_id: '1', key: 'a/c', duration: '45d' })
+    expect(([...accesses.map.values()].pop() as Record<string, unknown>).ttl_seconds).toBe(45 * 86400)
+    await expect(
+      executeVaultRequestAccess({ chat_id: '1', key: 'a/d', duration: '91d' }),
+    ).rejects.toThrow(/<= 90d/)
+    await expect(
+      executeVaultRequestAccess({ chat_id: '1', key: 'a/e', duration: 'never' }),
+    ).rejects.toThrow(/must look like/)
+    await expect(
+      executeVaultRequestAccess({ chat_id: '1', key: 'a/f', duration: '0d' }),
+    ).rejects.toThrow(/> 0/)
+  })
+
+  it('rejects an invalid scope', async () => {
+    const { deps } = makeDeps()
+    const { executeVaultRequestAccess } = createCardToolHandlers(deps)
+    await expect(
+      executeVaultRequestAccess({ chat_id: '1', key: 'a/b', scope: 'admin' }),
+    ).rejects.toThrow(/scope must be/)
+  })
+
+  it('standing-ACL short-circuit: read scope + broker lists the key → NO card, NO staging, NO durable record', async () => {
+    const { deps, added, accesses } = makeDeps({
+      listViaBroker: async () => ['svc/token', 'other/key'],
+    })
+    let sends = 0
+    ;(deps.lockedBot as { api: { sendRichMessage: unknown } }).api.sendRichMessage = async () => {
+      sends++
+      return { message_id: 1 }
+    }
+    const { executeVaultRequestAccess } = createCardToolHandlers(deps)
+    const res = await executeVaultRequestAccess({ chat_id: '123', key: 'svc/token' })
+    expect(res.content[0]!.text).toMatch(/ALREADY covered/)
+    expect(sends).toBe(0)
+    expect(accesses.map.size).toBe(0)
+    expect(added).toHaveLength(0)
+  })
+
+  it('write scope does NOT consult the standing-ACL probe (read-only coverage)', async () => {
+    let probes = 0
+    const { deps, accesses } = makeDeps({
+      listViaBroker: async () => {
+        probes++
+        return ['svc/token']
+      },
+    })
+    const { executeVaultRequestAccess } = createCardToolHandlers(deps)
+    const res = await executeVaultRequestAccess({ chat_id: '123', key: 'svc/token', scope: 'write' })
+    expect(probes).toBe(0)
+    expect(res.content[0]!.text).toMatch(/card sent/)
+    expect(accesses.map.size).toBe(1)
+  })
+
+  it('broker probe failure fails OPEN to the normal card flow', async () => {
+    const { deps, accesses } = makeDeps({
+      listViaBroker: async () => {
+        throw new Error('broker unreachable')
+      },
+    })
+    const { executeVaultRequestAccess } = createCardToolHandlers(deps)
+    const res = await executeVaultRequestAccess({ chat_id: '123', key: 'svc/token' })
+    expect(res.content[0]!.text).toMatch(/card sent/)
+    expect(accesses.map.size).toBe(1)
+  })
+
+  it('accepts `why` as an alias for `reason` and derives the timeout copy from the injected TTL', async () => {
+    const { deps, accesses } = makeDeps({ VAULT_REQUEST_ACCESS_TTL_MS: 25 * 60_000 })
+    const { executeVaultRequestAccess } = createCardToolHandlers(deps)
+    const res = await executeVaultRequestAccess({ chat_id: '1', key: 'a/b', why: 'need it' })
+    const staged = [...accesses.map.values()][0] as Record<string, unknown>
+    expect(staged.reason).toBe('need it')
+    expect(res.content[0]!.text).toMatch(/times out \(25 min\)/)
   })
 })

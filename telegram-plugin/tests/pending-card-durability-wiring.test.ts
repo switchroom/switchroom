@@ -66,7 +66,7 @@ describe('pending-card-store wiring', () => {
 
 describe('staging persists card metadata (Defect A)', () => {
   it('vault_request_access stages into the durable store', () => {
-    const fn = slice(GATEWAY, 'async function executeVaultRequestAccess', 6000)
+    const fn = slice(CARD_TOOL, 'async function executeVaultRequestAccess', 6000)
     expect(fn).toMatch(/pendingCardStore\.add\(\{[\s\S]*family: 'vault_request_access'/)
   })
 
@@ -223,7 +223,7 @@ describe('TTL expiry wakes the parked agent (Defect B)', () => {
 
 describe('vault_request_access copy derives the window from the real TTL', () => {
   it('no hard-coded "10 min" claim; uses VAULT_REQUEST_ACCESS_TTL_MS', () => {
-    const fn = slice(GATEWAY, 'async function executeVaultRequestAccess', 12000)
+    const fn = slice(CARD_TOOL, 'async function executeVaultRequestAccess', 12000)
     expect(fn).not.toMatch(/times out \(10 min\)/)
     expect(fn).toMatch(/Math\.round\(VAULT_REQUEST_ACCESS_TTL_MS \/ 60000\)/)
   })
