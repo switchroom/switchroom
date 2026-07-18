@@ -56,6 +56,42 @@ function isObligationRow(x: unknown): x is Obligation {
 }
 
 /**
+ * #3282 — true iff the optional captured-answer snapshot is structurally sound.
+ * A malformed blob (partial write, forward-incompatible shape) must NOT crash the
+ * resume: `sanitizeCapturedDelivery` strips it, so the obligation degrades to a
+ * fresh-generation represent (today's behaviour) rather than throwing.
+ */
+function isValidCapturedDelivery(x: unknown): boolean {
+  if (x == null || typeof x !== 'object') return false
+  const c = x as Record<string, unknown>
+  // Empty chunks ⇒ nothing to resume: treat as malformed so it is STRIPPED and
+  // the obligation degrades to a (bounded) fresh-generation represent rather than
+  // sitting non-null-but-empty and no-op'ing the sweep forever.
+  if (!Array.isArray(c.chunks) || c.chunks.length === 0 || !c.chunks.every((t) => typeof t === 'string')) return false
+  if (!Array.isArray(c.chunkStates)) return false
+  return c.chunkStates.every((s) => {
+    if (s == null || typeof s !== 'object') return false
+    const st = s as Record<string, unknown>
+    return (
+      typeof st.index === 'number' &&
+      typeof st.confirmed === 'boolean' &&
+      Array.isArray(st.messageIds) &&
+      st.messageIds.every((m) => typeof m === 'number')
+    )
+  })
+}
+
+/** Drop a malformed `capturedDelivery` in place so a corrupt snapshot degrades to
+ *  fresh-generation represent instead of crashing the resume (fail-open). */
+function sanitizeCapturedDelivery(o: Obligation): Obligation {
+  if (o.capturedDelivery != null && !isValidCapturedDelivery(o.capturedDelivery)) {
+    const { capturedDelivery: _drop, ...rest } = o
+    return rest
+  }
+  return o
+}
+
+/**
  * Load the persisted open set. Returns [] on a missing, unreadable, or
  * malformed file (fail-open to empty: a corrupt snapshot must never crash boot;
  * worst case we lose the cross-restart obligation guarantee for that boot and
@@ -78,7 +114,7 @@ export function loadObligations(path: string, fs: ObligationStoreFsSeam): Obliga
   if (parsed == null || typeof parsed !== 'object') return []
   const env = parsed as Record<string, unknown>
   if (env.v !== 1 || !Array.isArray(env.obligations)) return []
-  return env.obligations.filter(isObligationRow)
+  return env.obligations.filter(isObligationRow).map(sanitizeCapturedDelivery)
 }
 
 /**

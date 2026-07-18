@@ -26,6 +26,28 @@
 
 import type { InboundMessage } from './ipc-protocol.js'
 
+/**
+ * #3282 — the durable per-chunk snapshot of a PARTIALLY delivered backstop
+ * answer, attached to the obligation so the represent can resume the exact
+ * captured answer's non-`landed-confirmed` tail (byte-identical) instead of
+ * regenerating it (which re-posts chunks that already landed). Rides the
+ * obligation ledger's atomic snapshot, so it survives a gateway/container
+ * restart. See captured-answer-resume.ts for the resume mechanism.
+ */
+export interface CapturedDeliverySnapshot {
+  /** The byte-identical captured answer, split into chunks (the SAME split the
+   *  original backstop delivery used). Re-delivered verbatim on resume. */
+  readonly chunks: string[]
+  /** Per-LANDED-chunk state: the landed message id(s) + whether a read-back
+   *  confirmed the message exists. A chunk absent here never landed → the resume
+   *  treats it as `unsent` and re-sends it. */
+  readonly chunkStates: Array<{
+    readonly index: number
+    readonly messageIds: number[]
+    readonly confirmed: boolean
+  }>
+}
+
 export interface Obligation {
   /** deriveTurnId(chat, thread, messageId) — the stable identity. */
   readonly originTurnId: string
@@ -61,6 +83,12 @@ export interface Obligation {
    *  re-present/escalate when the sweep fires < 5s later. Durable (part of the
    *  snapshot) so the grace window survives a restart. */
   lastRepresentedAt?: number
+  /** #3282 — durable captured-answer snapshot for a PARTIALLY delivered backstop
+   *  answer. Present ⇒ the represent branch drives a byte-identical captured-answer
+   *  RESUME of the non-confirmed tail (never a regeneration); absent ⇒ the genuine
+   *  "model wrote nothing" represent falls through to fresh generation. Dropped
+   *  with the obligation on close/escalate (bounded lifetime, design A6). */
+  capturedDelivery?: CapturedDeliverySnapshot
 }
 
 /** What the gateway should do for the oldest open obligation at an idle boundary. */
@@ -314,6 +342,20 @@ export class ObligationLedger {
     if (routedOriginId != null) return routedOriginId
     if (liveTurnId != null && this.open.has(liveTurnId)) return liveTurnId
     return null
+  }
+
+  /**
+   * #3282 — attach (or refresh) the durable captured-answer snapshot for a
+   * PARTIALLY delivered backstop answer. No-op if the obligation isn't open (a
+   * fully delivered turn closes its obligation, so there is nothing to resume).
+   * Persists, so the snapshot survives a restart and the represent resumes the
+   * missing tail instead of regenerating the whole answer.
+   */
+  noteCapturedDelivery(originTurnId: string, snapshot: CapturedDeliverySnapshot): void {
+    const o = this.open.get(originTurnId)
+    if (o === undefined || snapshot.chunks.length === 0) return
+    o.capturedDelivery = snapshot
+    this.persist()
   }
 
   /** Record that an obligation was just re-presented (bumps representCount, stamps

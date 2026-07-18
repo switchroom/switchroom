@@ -620,3 +620,43 @@ describe("ObligationLedger — escalation suppression predicate (Fix 4)", () => 
     expect(snapshots[1]).toEqual([]);
   });
 });
+
+// #3282 — the durable captured-answer snapshot attaches to the OPEN obligation
+// so a partial backstop delivery is resumed (tail only) rather than regenerated.
+describe("ObligationLedger — noteCapturedDelivery (#3282)", () => {
+  function input(id: string, openedAt: number) {
+    return { originTurnId: id, chatId: "-100123", threadId: 3, messageId: 1, text: "q", openedAt };
+  }
+  const snap = { chunks: ["c0", "c1"], chunkStates: [{ index: 0, messageIds: [10], confirmed: true }] };
+
+  it("attaches the snapshot to an OPEN obligation and persists it", () => {
+    const snapshots: Obligation[][] = [];
+    const L = new ObligationLedger(2, { onChange: (s) => snapshots.push(s) });
+    L.openIfAbsent(input("c:3#1", 1000));
+    L.noteCapturedDelivery("c:3#1", snap);
+    expect(L.list()[0]!.capturedDelivery).toEqual(snap);
+    // The mutation persisted (onChange fired again after open).
+    expect(snapshots.at(-1)![0]!.capturedDelivery).toEqual(snap);
+  });
+
+  it("is a no-op for an obligation that is not open (a delivered turn has none to resume)", () => {
+    const L = new ObligationLedger(2);
+    L.noteCapturedDelivery("c:3#missing", snap); // never opened
+    expect(L.isOpen("c:3#missing")).toBe(false);
+  });
+
+  it("ignores an EMPTY snapshot (nothing to resume)", () => {
+    const L = new ObligationLedger(2);
+    L.openIfAbsent(input("c:3#1", 1000));
+    L.noteCapturedDelivery("c:3#1", { chunks: [], chunkStates: [] });
+    expect(L.list()[0]!.capturedDelivery).toBeUndefined();
+  });
+
+  it("close drops the snapshot with the obligation (bounded lifetime, A6)", () => {
+    const L = new ObligationLedger(2);
+    L.openIfAbsent(input("c:3#1", 1000));
+    L.noteCapturedDelivery("c:3#1", snap);
+    expect(L.close("c:3#1")).toBe(true);
+    expect(L.isOpen("c:3#1")).toBe(false);
+  });
+});
