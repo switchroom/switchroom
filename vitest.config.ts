@@ -112,6 +112,8 @@ export default defineConfig({
       "**/src/vault/broker/server-write-grants.test.ts",
       // Scope/format durability across rotation (#3143-A) — bun:sqlite.
       "**/src/vault/broker/server-scope-persist.test.ts",
+      // Tokenless-write entry-scope enforcement (#3143-B/C) — bun:sqlite.
+      "**/src/vault/broker/server-tokenless-scope.test.ts",
       // Passphrase-attestation suite (issue #969 P1a) — bun:sqlite.
       "**/src/vault/broker/server-passphrase-attest.test.ts",
       // mint_grant passphrase-attestation suite (#1012 Phase 2) — bun:sqlite.
