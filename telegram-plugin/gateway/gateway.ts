@@ -15199,6 +15199,15 @@ export const __inboundRouterTestSeam = {
   // a test import it is undefined, so the imperative deliver / permission-
   // verdict paths would deref undefined. Let the harness inject a fake.
   setIpcServer: (s: IpcServer): void => { ipcServer = s },
+  // The coalesce window holds real setTimeout flush timers whose callback
+  // fires `void handleInbound(...)`. Under a test import, an entry still
+  // buffered when a test ends flushes DURING a later test and pollutes its
+  // dispatch log (the #3359 CI flake: the "stop with attachment" entry's
+  // deferred flush delivered mid-way through the FAIL-CLOSED test). Exposed
+  // so the harness can `peek()` (assert content-path buffering) and
+  // `reset()` (cancel stale timers) in beforeEach. Read/reset only — no
+  // production behaviour change.
+  inboundCoalescer,
 }
 
 export async function handleInboundCoalesced(

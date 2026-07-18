@@ -706,7 +706,7 @@ const DESIGN_FANOUT = 6
  * DESIGN_FANOUT of 6 fully-rendered workers needs 6 × 4 = 24 lines. That fully
  * fits every fan-out through 6 workers (w1=7, w2=12, w3=15, w4=16, w5=20,
  * w6=24); a 7th/8th concurrent worker overflows and the backstop drops the
- * oldest visible rows to the spill — bounding the card at 24 body lines so a
+ * newest (trailing) visible rows to the spill — bounding the card at 24 body lines so a
  * big swarm never explodes it. The per-worker curve wins on DEPTH; this ceiling
  * wins on ROW COUNT.
  */
@@ -825,8 +825,9 @@ export function renderCombinedWorkerFeed(
 
   // Cap to maxRows first, then shrink the visible set while EITHER the total
   // body-line budget (#3349: bounds a big swarm without stealing depth from the
-  // shown workers) OR the wire char budget is exceeded. Oldest rows collapse
-  // into the `+M more working…` spill.
+  // shown workers) OR the wire char budget is exceeded. Newest (trailing) rows
+  // collapse into the `+M more working…` spill (`rows.slice(0, visibleCount)`
+  // keeps the head of the list).
   let visible = Math.min(rows.length, maxRows)
   let { body, bodyLines } = compose(visible)
   while (
