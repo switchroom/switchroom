@@ -110,6 +110,8 @@ export default defineConfig({
       // Write-grant suites (issue #969 P1b) also use bun:sqlite — run via test:bun.
       "**/src/vault/write-grants.test.ts",
       "**/src/vault/broker/server-write-grants.test.ts",
+      // Scope/format durability across rotation (#3143-A) — bun:sqlite.
+      "**/src/vault/broker/server-scope-persist.test.ts",
       // Passphrase-attestation suite (issue #969 P1a) — bun:sqlite.
       "**/src/vault/broker/server-passphrase-attest.test.ts",
       // mint_grant passphrase-attestation suite (#1012 Phase 2) — bun:sqlite.
