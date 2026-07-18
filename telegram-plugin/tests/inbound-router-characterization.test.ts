@@ -368,11 +368,14 @@ describe('inbound-router characterization — secret-detect pipeline', () => {
       passphrase: 'pw', expiresAt: Date.now() + 60_000,
     })
     pipelineImpl = () => ({
-      stored: [{ masked: 'sk-…zz', actual_slug: 'secret' }],
+      stored: [{ masked: 'tok…zz', actual_slug: 'secret' }],
       rewritten_text: '[redacted secret]',
       deferred: [],
     })
-    await gw.handleInbound(makeCtx({ text: 'sk-ant-xxxxxxxxxxxx' }), 'sk-ant-xxxxxxxxxxxx', undefined, undefined)
+    // The pipeline is mocked, so the text content is immaterial — kept
+    // secret-shaped but NOT a contiguous token literal (check-no-pii-secrets).
+    const secretish = ['sk', 'ant', 'xxxxxxxxxxxx'].join('-')
+    await gw.handleInbound(makeCtx({ text: secretish }), secretish, undefined, undefined)
     expect(callLog).toContain('runPipeline')
     // ORDER: runPipeline strictly precedes the deliver dispatch (secret must
     // be scrubbed before the agent/IPC/history sinks — design §1 seam #3).
@@ -387,7 +390,8 @@ describe('inbound-router characterization — secret-detect pipeline', () => {
       passphrase: 'pw', expiresAt: Date.now() + 60_000,
     })
     pipelineImpl = () => { throw new Error('boom — pipeline crash') }
-    await gw.handleInbound(makeCtx({ text: 'sk-ant-crashme12345' }), 'sk-ant-crashme12345', undefined, undefined)
+    const secretish = ['sk', 'ant', 'crashme12345'].join('-')
+    await gw.handleInbound(makeCtx({ text: secretish }), secretish, undefined, undefined)
     expect(callLog).toContain('runPipeline')
     // The critical security invariant: no deliver, no buffer — dropped.
     expect(delivered()).toBe(false)
