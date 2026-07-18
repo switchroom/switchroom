@@ -54,6 +54,8 @@ async function startMockBackend(
   opts: {
     tools?: { name: string; inputSchema: unknown }[];
     sse?: boolean;
+    /** Never answer tools/call — request is DELIVERED but hangs (slow backend). */
+    hangToolsCall?: boolean;
   } = {},
 ): Promise<MockBackend> {
   const tools = opts.tools ?? [
@@ -102,6 +104,7 @@ async function startMockBackend(
           reply({ tools });
           return;
         case "tools/call":
+          if (opts.hangToolsCall) return; // delivered, never answered
           reply({
             content: [
               { type: "text", text: `called:${msg.params?.name}` },
@@ -333,6 +336,135 @@ describe("with the backend up", () => {
     const result = up?.result as { isError: boolean; content: { text: string }[] };
     expect(result.isError).toBe(false);
     expect(result.content[0].text).toBe("called:recall");
+  });
+});
+
+// ─── review #3313 must-fix 1: no post-delivery re-send ────────────────────
+
+describe("double-execution guard", () => {
+  let backend: MockBackend;
+  afterEach(async () => {
+    await backend.close();
+  });
+
+  it("a delivered-then-timed-out tools/call is NOT re-sent to the backend", async () => {
+    backend = await startMockBackend({ hangToolsCall: true });
+    const shim = makeShim({ url: backend.url, cacheDir, toolsCallTimeoutMs: 300 });
+
+    const res = await shim.handle(
+      rpc(1, "tools/call", { name: "retain", arguments: { content: "x" } }) as never,
+    );
+    // Outcome 1: the caller gets a clean isError result, not a crash.
+    expect((res?.result as { isError: boolean }).isError).toBe(true);
+    // Outcome 2: the backend received the non-idempotent call EXACTLY once
+    // (blind retry-after-abort would show 2 → duplicate retain).
+    const callPosts = backend.requests.filter((r) => r.method === "tools/call");
+    expect(callPosts.length).toBe(1);
+  });
+
+  it("still retries pre-delivery failures (classification unit)", async () => {
+    backend = await startMockBackend();
+    const { isPreDeliveryError } = await import("../src/cli/hindsight-mcp-shim.js");
+    const refused = new TypeError("fetch failed");
+    (refused as { cause?: unknown }).cause = Object.assign(new Error("connect ECONNREFUSED"), {
+      code: "ECONNREFUSED",
+    });
+    expect(isPreDeliveryError(refused)).toBe(true);
+    const abort = Object.assign(new Error("This operation was aborted"), {
+      name: "AbortError",
+    });
+    expect(isPreDeliveryError(abort)).toBe(false);
+    expect(isPreDeliveryError(new Error("mid-response parse failure"))).toBe(false);
+  });
+});
+
+// ─── review #3313 must-fix 2: no head-of-line blocking ────────────────────
+
+describe("concurrent handling", () => {
+  let backend: MockBackend;
+  afterEach(async () => {
+    await backend.close();
+  });
+
+  it("a hung tools/call does not block a concurrent ping", async () => {
+    const { PassThrough } = await import("node:stream");
+    backend = await startMockBackend({ hangToolsCall: true });
+    const shim = makeShim({ url: backend.url, cacheDir, toolsCallTimeoutMs: 1500 });
+
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const lines: { id?: number; result?: unknown }[] = [];
+    let buf = "";
+    output.on("data", (c) => {
+      buf += c.toString();
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        lines.push(JSON.parse(buf.slice(0, nl)));
+        buf = buf.slice(nl + 1);
+      }
+    });
+    const done = shim.run(input, output);
+
+    input.write(JSON.stringify(rpc(1, "tools/call", { name: "recall", arguments: {} })) + "\n");
+    input.write(JSON.stringify(rpc(2, "ping")) + "\n");
+
+    // The ping must answer while the tools/call is still pending — not
+    // queued behind its 1.5s timeout.
+    const start = Date.now();
+    while (lines.length === 0 && Date.now() - start < 1000) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(lines.length).toBe(1);
+    expect(lines[0].id).toBe(2); // ping answered FIRST
+    expect(Date.now() - start).toBeLessThan(1000);
+
+    input.end();
+    await done; // drain still waits for the hung call's isError flush
+    expect(lines.length).toBe(2);
+    expect(lines[1].id).toBe(1);
+    expect((lines[1].result as { isError: boolean }).isError).toBe(true);
+  });
+});
+
+// ─── review #3313 finding 3: honest listChanged ───────────────────────────
+
+describe("tools/list_changed on recovery", () => {
+  it("emits the notification after fallback-served manifest and backend recovery", async () => {
+    // Reserve a port, keep it dead for tools/list...
+    const probe = createServer();
+    await new Promise<void>((r) => probe.listen(0, "127.0.0.1", r));
+    const port = (probe.address() as { port: number }).port;
+    await new Promise<void>((r) => probe.close(() => r()));
+    const url = `http://127.0.0.1:${port}/mcp/`;
+
+    const shim = makeShim({ url, cacheDir });
+    const notifications: { method?: string }[] = [];
+    shim.notificationSink = (m) => notifications.push(m as { method?: string });
+
+    const list = await shim.handle(rpc(1, "tools/list") as never);
+    expect((list?.result as { tools: unknown[] }).tools.length).toBeGreaterThan(0);
+    expect(notifications.length).toBe(0); // still down — nothing to announce
+
+    // ...bring the backend up on that port; next successful call announces
+    // that the client's stale manifest should be re-listed.
+    const backend = await startMockBackend();
+    const liveServer = backend.server;
+    await new Promise<void>((r) => liveServer.close(() => r()));
+    await new Promise<void>((resolve, reject) => {
+      liveServer.once("error", reject);
+      liveServer.listen(port, "127.0.0.1", resolve);
+    });
+    try {
+      await shim.handle(rpc(2, "tools/call", { name: "recall", arguments: {} }) as never);
+      expect(notifications.map((n) => n.method)).toEqual([
+        "notifications/tools/list_changed",
+      ]);
+      // One-shot: a second successful call does not re-announce.
+      await shim.handle(rpc(3, "tools/call", { name: "recall", arguments: {} }) as never);
+      expect(notifications.length).toBe(1);
+    } finally {
+      await new Promise<void>((r) => liveServer.close(() => r()));
+    }
   });
 });
 

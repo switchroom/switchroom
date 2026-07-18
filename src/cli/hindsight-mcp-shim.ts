@@ -95,8 +95,9 @@ export const TOOLS_CACHE_FILENAME = "hindsight-tools-list.json";
  * Schemas are deliberately permissive ({} per property) — the point is
  * that the tools EXIST at session start; the first successful live
  * tools/list replaces this with the backend's real schemas via the disk
- * cache. tests/hindsight-mcp-shim.fallback.test.ts pins this table against
- * the snapshot fixture so the two can never drift silently.
+ * cache. The "static fallback manifest" describe block in
+ * tests/hindsight-mcp-shim.test.ts pins this table against the snapshot
+ * fixture so the two can never drift silently.
  */
 export const FALLBACK_TOOL_TABLE: Record<string, [string[], string[]]> = {
   cancel_operation: [["operation_id"], ["bank_id", "operation_id"]],
@@ -318,10 +319,22 @@ export class UpstreamClient {
   }
 
   /**
-   * Forward one request to the backend. Lazy-connects, and on transport
+   * Forward one request to the backend. Lazy-connects, and on PRE-DELIVERY
    * failure resets the session and (when `retry`) re-attempts exactly once
    * — covering both cold backends that just came up and expired upstream
-   * sessions (hindsight answers those with 404).
+   * sessions (hindsight answers those with 404, i.e. it refused the request
+   * without executing it).
+   *
+   * DOUBLE-EXECUTION GUARD (#3313 review must-fix 1): the retry is scoped
+   * to failures where the request provably never reached the backend —
+   * `ensureSession()` failures, connect-level errors (refused/DNS), and a
+   * 404 session rejection. Once the POST has been delivered (the fetch
+   * resolved, or it failed with a timeout/abort/mid-response error that
+   * cannot be distinguished from "backend is still executing"), the shim
+   * NEVER re-sends: a slow-but-alive backend processing a non-idempotent
+   * call (retain, create_directive, ...) must not receive it twice. The
+   * legacy direct-HTTP entry never auto-retried; neither do we
+   * post-delivery.
    */
   async request(
     method: string,
@@ -329,25 +342,75 @@ export class UpstreamClient {
     timeoutMs: number,
     retry = true,
   ): Promise<JsonRpcMessage> {
+    // Phase 1 — session handshake. Nothing about THIS request has been
+    // sent yet, so any failure here is safely retryable.
     try {
       await this.ensureSession();
-      const id = this.nextId++;
-      const res = await this.post(
-        { jsonrpc: "2.0", id, method, params },
-        timeoutMs,
-      );
-      if (res.status === 404) {
-        // Session expired upstream — retry with a fresh one.
-        throw new Error("upstream session expired (404)");
-      }
-      if (!res.ok) throw new Error(`upstream HTTP ${res.status}`);
-      return await this.parseResponse(res, id);
     } catch (err) {
       this.reset();
       if (retry) return this.request(method, params, timeoutMs, false);
       throw err;
     }
+    const id = this.nextId++;
+    // Phase 2 — the POST itself. Only connect-level failures (the request
+    // never left) are retryable; an abort/timeout may have been delivered.
+    let res: Response;
+    try {
+      res = await this.post({ jsonrpc: "2.0", id, method, params }, timeoutMs);
+    } catch (err) {
+      this.reset();
+      if (retry && isPreDeliveryError(err)) {
+        return this.request(method, params, timeoutMs, false);
+      }
+      throw err;
+    }
+    if (res.status === 404) {
+      // Session expired upstream: the server REJECTED the request without
+      // executing it — safe to retry on a fresh session.
+      this.reset();
+      await res.text().catch(() => undefined);
+      if (retry) return this.request(method, params, timeoutMs, false);
+      throw new Error("upstream session expired (404)");
+    }
+    // Phase 3 — delivered. Failures from here on are never retried.
+    try {
+      if (!res.ok) throw new Error(`upstream HTTP ${res.status}`);
+      return await this.parseResponse(res, id);
+    } catch (err) {
+      this.reset();
+      throw err;
+    }
   }
+}
+
+/**
+ * True when a fetch rejection proves the request was never accepted by the
+ * backend (connection refused / DNS failure / connect-phase timeout). An
+ * AbortError (our own bounded timeout) or a reset/parse failure mid-response
+ * is NOT pre-delivery — the backend may be executing the call — so those are
+ * deliberately absent. Walks the `cause` chain because undici wraps network
+ * errors in TypeError("fetch failed").
+ */
+export function isPreDeliveryError(err: unknown): boolean {
+  const PRE_DELIVERY_CODES = new Set([
+    "ECONNREFUSED",
+    "ENOTFOUND",
+    "EAI_AGAIN",
+    "UND_ERR_CONNECT_TIMEOUT",
+  ]);
+  let cur: unknown = err;
+  for (let depth = 0; cur && depth < 5; depth++) {
+    const code = (cur as { code?: unknown }).code;
+    if (typeof code === "string" && PRE_DELIVERY_CODES.has(code)) return true;
+    // AggregateError (e.g. Happy Eyeballs dual-stack connect): pre-delivery
+    // iff every underlying error is.
+    const errors = (cur as { errors?: unknown[] }).errors;
+    if (Array.isArray(errors) && errors.length > 0) {
+      return errors.every((e) => isPreDeliveryError(e));
+    }
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  return false;
 }
 
 // ─── The shim server ──────────────────────────────────────────────────────
@@ -428,9 +491,17 @@ export class HindsightShim {
 
   /**
    * Answer `initialize` locally — NEVER touches the backend, so the stdio
-   * handshake always succeeds regardless of backend state. Capabilities
-   * advertise the backend's known surface (tools, with listChanged so a
-   * client could re-list after recovery).
+   * handshake always succeeds regardless of backend state.
+   *
+   * Capabilities are deliberately **tools-only** even though the live
+   * backend also advertises prompts/resources (review #3313 finding 5):
+   * switchroom's hindsight integration consumes only the tool surface
+   * (`mcp__hindsight__*`), and advertising prompts/resources here would
+   * promise a surface the shim cannot guarantee offline (there is no
+   * cached/fallback manifest for them — an early prompts/list against a
+   * down backend would just error). `forward()` still proxies those
+   * methods transparently if a client sends them anyway. `listChanged` is
+   * honest: see notifyIfRecovered().
    */
   private initializeResult(params: unknown): unknown {
     const requested = (params as { protocolVersion?: string } | undefined)
@@ -446,6 +517,38 @@ export class HindsightShim {
     };
   }
 
+  /**
+   * True after we served a cached/fallback manifest — i.e. the client's
+   * view of the tool schemas may be stale relative to the live backend.
+   * Cleared (with a `notifications/tools/list_changed` emission) once the
+   * backend is reachable again, honoring the advertised `listChanged`.
+   */
+  private staleManifestServed = false;
+
+  /**
+   * Sink for server-initiated notifications, wired to stdout by run().
+   * No-op default so direct handle() callers (tests) work without wiring.
+   */
+  notificationSink: (msg: JsonRpcMessage) => void = () => undefined;
+
+  /**
+   * Review #3313 finding 3: `listChanged: true` must be honest. When a
+   * stale (cached/fallback) manifest has been served and a later upstream
+   * request succeeds — proof the backend is reachable again — emit
+   * `notifications/tools/list_changed` so the client re-lists and picks up
+   * the live schemas. (The shim has no listen stream to RELAY backend-side
+   * change notifications; this recovery emission is the one change event
+   * it can genuinely detect.)
+   */
+  private notifyIfRecovered(): void {
+    if (!this.staleManifestServed) return;
+    this.staleManifestServed = false;
+    this.notificationSink({
+      jsonrpc: "2.0",
+      method: "notifications/tools/list_changed",
+    });
+  }
+
   /** tools/list: live fetch -> refresh cache; else cache; else fallback. */
   private async toolsList(params: unknown): Promise<unknown> {
     try {
@@ -458,6 +561,9 @@ export class HindsightShim {
       const result = res.result as { tools?: ToolDef[] };
       if (Array.isArray(result?.tools)) {
         this.writeCache(result);
+        // The client is receiving the LIVE manifest right now — its view
+        // is fresh, no recovery notification needed.
+        this.staleManifestServed = false;
         return result;
       }
       throw new Error("upstream tools/list returned no tools array");
@@ -466,6 +572,7 @@ export class HindsightShim {
         `[hindsight-shim] live tools/list failed (${String(err)}); serving ` +
           "cached/fallback manifest",
       );
+      this.staleManifestServed = true;
       return this.readCache() ?? buildFallbackToolsList();
     }
   }
@@ -478,6 +585,8 @@ export class HindsightShim {
         params,
         this.opts.toolsCallTimeoutMs ?? TOOLS_CALL_TIMEOUT_MS,
       );
+      // Any answer at all proves the backend is reachable again.
+      this.notifyIfRecovered();
       if (res.error) {
         // Upstream answered with a protocol-level error while up (e.g.
         // unknown tool). Surface it as a tool error result rather than
@@ -535,7 +644,19 @@ export class HindsightShim {
   }
 
   /**
-   * Wire the shim to stdio: newline-delimited JSON-RPC, serialized writes.
+   * Wire the shim to stdio: newline-delimited JSON-RPC.
+   *
+   * Messages are handled **concurrently** (review #3313 must-fix 2): with
+   * serialized handling, one tools/call against a hung-but-listening
+   * backend would head-of-line-block ping / tools/list / parallel tool
+   * calls for up to the full call timeout — the very "whole memory server
+   * unresponsive" failure mode this shim exists to prevent — and a
+   * notifications/cancelled would queue behind the call it cancels. Only
+   * the stdout WRITES need serializing, which each handler gets for free:
+   * every response is emitted as exactly one synchronous `output.write()`
+   * of a complete line, and Node stream writes never interleave within a
+   * single chunk.
+   *
    * Resolves after the input stream ends AND every in-flight handler has
    * flushed its response — callers must not exit before then (caught live:
    * exiting on raw stdin "end" raced the async tools/list handler and
@@ -545,8 +666,10 @@ export class HindsightShim {
     input: NodeJS.ReadableStream,
     output: NodeJS.WritableStream,
   ): Promise<void> {
+    // Server-initiated notifications share the same atomic-line discipline.
+    this.notificationSink = (msg) => output.write(JSON.stringify(msg) + "\n");
     const rl = createInterface({ input, crlfDelay: Infinity });
-    let chain: Promise<void> = Promise.resolve();
+    const inflight = new Set<Promise<void>>();
     rl.on("line", (line) => {
       const trimmed = line.trim();
       if (!trimmed) return;
@@ -557,9 +680,7 @@ export class HindsightShim {
         this.log(`[hindsight-shim] dropping non-JSON stdin line`);
         return;
       }
-      // Serialize responses so concurrent handling can never interleave
-      // partial writes on stdout.
-      chain = chain.then(async () => {
+      const task = (async () => {
         try {
           const res = await this.handle(msg);
           if (res) output.write(JSON.stringify(res) + "\n");
@@ -576,10 +697,15 @@ export class HindsightShim {
             );
           }
         }
-      });
+      })();
+      inflight.add(task);
+      void task.finally(() => inflight.delete(task));
     });
     await new Promise<void>((resolve) => rl.on("close", resolve));
-    await chain;
+    // Drain: new tasks can no longer arrive (input closed); settle all.
+    while (inflight.size > 0) {
+      await Promise.allSettled([...inflight]);
+    }
   }
 }
 
