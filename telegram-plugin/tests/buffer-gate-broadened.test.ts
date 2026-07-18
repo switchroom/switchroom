@@ -36,6 +36,13 @@ const gatewaySrc = readFileSync(
   resolve(__dirname, '..', 'gateway', 'gateway.ts'),
   'utf-8',
 )
+// #2996 P2: executeReply's body moved verbatim to outbound-send-path.ts
+// (`sendReply`); the post-send block assertions read there. The
+// `releaseTurnBufferGate` helper itself stays in gateway.ts.
+const sendPathSrc = readFileSync(
+  resolve(__dirname, '..', 'gateway', 'outbound-send-path.ts'),
+  'utf-8',
+)
 
 describe('buffer-gate release decoupled from final-answer classification', () => {
   // Extract the helper's docstring (everything between the matching
@@ -102,8 +109,8 @@ describe('buffer-gate release decoupled from final-answer classification', () =>
   it('executeReply calls releaseTurnBufferGate OUTSIDE the isFinalAnswerReply branch', () => {
     // Slice the executeReply post-send block (between the anchor
     // comments and the next exported function).
-    const post = gatewaySrc.split("fresh sendMessage from reply tool is a user-visible")[1] ?? ''
-    const slice = post.split('\nasync function ')[0] ?? ''
+    const post = sendPathSrc.split("fresh sendMessage from reply tool is a user-visible")[1] ?? ''
+    const slice = post.split('\nexport async function ')[0] ?? ''
     // The narrow `isFinalAnswerReply`-gated finalize MUST stay (it
     // emits the 👍 reaction on the final-answer happy path).
     expect(slice).toMatch(/isFinalAnswerReply\(/)
@@ -131,9 +138,12 @@ describe('buffer-gate release decoupled from final-answer classification', () =>
     // helper is narrow on purpose. If future code adds new
     // callsites that aren't turn-terminal, the steer-vs-queue
     // semantics could drift.
-    const callMatches = gatewaySrc.match(/releaseTurnBufferGate\(/g) ?? []
-    // Definition + 2 callsites = 3:
-    //   - executeReply's post-send block (reply-finalize, the original).
+    // #2996 P2: the reply-finalize callsite moved (verbatim) into
+    // outbound-send-path.ts `sendReply`; gateway.ts keeps the definition,
+    // the halt callsite, and the deps-injection reference.
+    const callMatches = (gatewaySrc + sendPathSrc).match(/releaseTurnBufferGate\(/g) ?? []
+    // Definition + deps-interface member + 2 callsites = 4:
+    //   - sendReply's post-send block (reply-finalize, the original).
     //   - executeHaltNow (#3020): an interrupt-cancelled turn never reaches
     //     reply-finalize (the C-c killed it and no replacement inbound
     //     follows), so the halt IS that turn's terminal — releasing there is
@@ -142,6 +152,6 @@ describe('buffer-gate release decoupled from final-answer classification', () =>
     //     with executeStreamReply.)
     // If this count grows the test catches it; reviewer must justify
     // any new callsite.
-    expect(callMatches.length).toBe(3)
+    expect(callMatches.length).toBe(4)
   })
 })

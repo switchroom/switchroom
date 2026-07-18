@@ -267,16 +267,18 @@ describe('#2798 turn-flush punctuation/bold parity with reply', () => {
     // (`normalizeOutboundBody`). The reply path delegates to it via
     // `normalizeOutboundBody(rawText, 'reply', redactOutboundText)`; the
     // redact→normalize→scrub ordering is now pinned in the module source.
-    const replyDelegates = gatewaySrc.indexOf(
-      `normalizeOutboundBody(rawText, 'reply', redactOutboundText)`,
-      gatewaySrc.indexOf('async function executeReply('),
-    )
-    expect(replyDelegates).toBeGreaterThan(0)
-
     const moduleSrc = readFileSync(
       new URL('../gateway/outbound-send-path.ts', import.meta.url),
       'utf8',
     )
+    // #2996 P2: the reply orchestration itself now lives in the module
+    // (`sendReply`); the delegation line is pinned there.
+    const replyDelegates = moduleSrc.indexOf(
+      `normalizeOutboundBody(rawText, 'reply', redactOutboundText)`,
+      moduleSrc.indexOf('export async function sendReply('),
+    )
+    expect(replyDelegates).toBeGreaterThan(0)
+
     const start = moduleSrc.indexOf('export function normalizeOutboundBody(')
     const redactIdx = moduleSrc.indexOf('redact(text, site)', start)
     const normIdx = moduleSrc.indexOf('stripExcessBold(normalizePunctuation(text))', start)

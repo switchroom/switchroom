@@ -48,6 +48,19 @@ const gatewaySrc = readFileSync(
   resolve(__dirname, '..', 'gateway', 'gateway.ts'),
   'utf-8',
 )
+// #2996 P2: executeReply's body (the over-ping block + the lever-2 finalize)
+// moved VERBATIM to outbound-send-path.ts `sendReply()`. The façade call-site
+// assertions that used to grep the executeReply window grep the sendReply
+// window there instead — the wiring contract they pin is unchanged.
+const sendPathSrc = readFileSync(
+  resolve(__dirname, '..', 'gateway', 'outbound-send-path.ts'),
+  'utf-8',
+)
+/** The sendReply window: from the function decl to the next export. */
+function sendReplyWindow(): string {
+  const after = sendPathSrc.split('export async function sendReply(')[1] ?? ''
+  return after.split('\nexport ')[0] ?? after
+}
 
 /** Source of a named gateway function up to the next top-level definition. */
 function fnSrc(name: string): string {
@@ -243,15 +256,15 @@ describe('claimOrDowngradePing — PR-4c over-ping decision moves into the faça
     // The relocation must NOT split the #2562 pair across the façade boundary:
     // the façade decides; the call-site thunk sets firstPingAt AND
     // firstPingWasSubstantive on two adjacent lines, no await between.
-    expect(gatewaySrc).toMatch(
+    expect(sendPathSrc).toMatch(
       /turn\.firstPingAt = now\s*\n\s*turn\.firstPingWasSubstantive = replySubstantive/,
     )
     // No await anywhere in the executeReply over-ping block (the decide→apply→
     // pair-set synchronous chain). Bound to the block, BEFORE the Telegraph
     // block below (which legitimately awaits).
-    const blockStart = gatewaySrc.indexOf('const applyOverPingDecision')
-    const telegraphIdx = gatewaySrc.indexOf('// Telegraph publish (#579)', blockStart)
-    const block = gatewaySrc.slice(blockStart, telegraphIdx)
+    const blockStart = sendPathSrc.indexOf('const applyOverPingDecision')
+    const telegraphIdx = sendPathSrc.indexOf('// Telegraph publish (#579)', blockStart)
+    const block = sendPathSrc.slice(blockStart, telegraphIdx)
     const blockCode = block
       .split('\n')
       .filter((l) => {
@@ -267,17 +280,14 @@ describe('claimOrDowngradePing — PR-4c over-ping decision moves into the faça
     // The over-ping net exists ONLY in executeReply. The retired stream_reply
     // tool (executeStreamReply) had no decideOverPing / firstPingAt /
     // wasOverPingSuppressed and never called claimOrDowngradePing.
-    const calls = [...gatewaySrc.matchAll(/\.claimOrDowngradePing\(/g)]
+    // #2996 P2: the single call now lives in the extracted sendReply body;
+    // gateway.ts must have ZERO (the wrapper delegates).
+    const gwCalls = [...gatewaySrc.matchAll(/\.claimOrDowngradePing\(/g)]
+    expect(gwCalls).toHaveLength(0)
+    const calls = [...sendPathSrc.matchAll(/\.claimOrDowngradePing\(/g)]
     expect(calls).toHaveLength(1)
-    const callIdx = gatewaySrc.indexOf('.claimOrDowngradePing(')
-    const execReplyIdx = gatewaySrc.indexOf('async function executeReply(')
-    // Upper bound: the next top-level function after executeReply.
-    const nextFnIdx = gatewaySrc.indexOf('\nasync function ', execReplyIdx + 1)
-    expect(execReplyIdx).toBeGreaterThan(-1)
-    expect(nextFnIdx).toBeGreaterThan(execReplyIdx)
-    // The single call is inside executeReply.
-    expect(callIdx).toBeGreaterThan(execReplyIdx)
-    expect(callIdx).toBeLessThan(nextFnIdx)
+    // The single call is inside the sendReply window.
+    expect(sendReplyWindow()).toMatch(/\.claimOrDowngradePing\(/)
   })
 })
 
@@ -299,7 +309,8 @@ describe('façade delegates to the existing emission primitives (call-site liter
   it('finalizeCard wraps clearActivitySummary at the call sites (not CALLED inside the façade)', () => {
     expect(facadeSrc).not.toMatch(/import .*clearActivitySummary/)
     expect(facadeCode).not.toMatch(/clearActivitySummary\(/)
-    expect(gatewaySrc).toMatch(/finalizeCard\(\(\) => \{\s*\n\s*clearActivitySummary\(/)
+    // #2996 P2: the lever-2 call site moved (verbatim) into sendReply.
+    expect(sendPathSrc).toMatch(/finalizeCard\(\(\) => \{\s*\n\s*clearActivitySummary\(/)
   })
 
   it('claimOrDowngradePing — the call-site disabled thunk STILL contains a literal decideOverPing( (disabled-path proof)', () => {
@@ -308,9 +319,9 @@ describe('façade delegates to the existing emission primitives (call-site liter
     // its OWN literal `decideOverPing(` call inside the call-site thunk, VERBATIM
     // from PR-4b-base — so the disabled path is provably byte-identical (never
     // depends on the façade for the decision).
-    const pingIdx = gatewaySrc.indexOf('claimOrDowngradePing(')
+    const pingIdx = sendPathSrc.indexOf('claimOrDowngradePing(')
     expect(pingIdx).toBeGreaterThan(-1)
-    const window = gatewaySrc.slice(pingIdx, pingIdx + 1600)
+    const window = sendPathSrc.slice(pingIdx, pingIdx + 1600)
     expect(window).toMatch(/decideOverPing\(/)
   })
 })
@@ -385,8 +396,7 @@ describe('the drain sites route through the façade with producers preserved ver
 
 describe('the lever-2 finalize block routes through the façade', () => {
   it('executeReply finalize routes via markSubstantiveFinalDelivered + finalizeCard (latch + clear preserved)', () => {
-    const after = gatewaySrc.split('async function executeReply(')[1] ?? ''
-    const body = after.split('\nasync function ')[0]?.split('\nfunction ')[0] ?? after
+    const body = sendReplyWindow()
     expect(body).toMatch(/markSubstantiveFinalDelivered\(\(\) => \{\s*\n\s*finalizeTurn\.finalAnswerEverDelivered = true/)
     expect(body).toMatch(/finalizeCard\(\(\) => \{\s*\n\s*clearActivitySummary\(finalizeTurn\)/)
   })
