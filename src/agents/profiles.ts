@@ -3,14 +3,53 @@ import { resolve, join, sep as pathSep } from "node:path";
 import Handlebars from "handlebars";
 
 /**
- * Root of the filesystem profiles directory (project-level). Each
- * subdirectory is a named profile containing `CLAUDE.md.hbs`,
+ * Resolve the root of the filesystem profiles directory (project-level).
+ * Each subdirectory is a named profile containing `CLAUDE.md.hbs`,
  * optional `SOUL.md.hbs`, and an optional `skills/` subdir. The
  * `_base/` sibling holds framework-level render templates
  * (start.sh.hbs, settings.json.hbs) that every agent uses regardless
  * of their `extends:` choice.
+ *
+ * The bundle can live in two layouts and the profiles dir sits in a
+ * DIFFERENT relative spot in each — a single hardcoded relative path
+ * only works for one and silently breaks the other (#3346):
+ *
+ *   - npm / dev layout: bundle at `<pkg>/dist/cli/switchroom.js`, so
+ *     profiles are two dirs up at `<pkg>/profiles` (`../../profiles`).
+ *   - agent Docker image: bundle at `/opt/switchroom/switchroom.js`,
+ *     so `../../profiles` resolves to `/profiles` — a path the image
+ *     never shipped, which broke every in-container `rollout`/`apply`
+ *     with `Profile not found: default (searched /profiles)`. The
+ *     Dockerfile now COPYs profiles to `/opt/switchroom/profiles`, i.e.
+ *     `./profiles` relative to the bundle dir.
+ *
+ * Rather than hardcode one relative path, probe an ordered list of
+ * candidates and pick the first that actually exists on disk. The
+ * `SWITCHROOM_PROFILES_ROOT` env override wins for tests and operator
+ * escape hatches. If none exist we fall back to the npm-layout path so
+ * the downstream "Profile not found" error still names a sensible root.
  */
-const PROFILES_ROOT = resolve(import.meta.dirname, "../../profiles");
+export function resolveProfilesRoot(): string {
+  const envOverride = process.env.SWITCHROOM_PROFILES_ROOT?.trim();
+  if (envOverride) {
+    return resolve(envOverride);
+  }
+  const candidates = [
+    // npm / dev layout: <pkg>/dist/cli -> <pkg>/profiles
+    resolve(import.meta.dirname, "../../profiles"),
+    // agent Docker image: /opt/switchroom -> /opt/switchroom/profiles
+    resolve(import.meta.dirname, "profiles"),
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  // Preserve the historical default so error messages stay meaningful.
+  return candidates[0];
+}
+
+export const PROFILES_ROOT = resolveProfilesRoot();
 
 /**
  * Resolve the filesystem path for a named profile. Falls back to

@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
 import { sep as pathSep, resolve } from "node:path";
 import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, rmSync, readFileSync, existsSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -8,9 +8,49 @@ import {
   listAvailableProfiles,
   renderProfileClaudeTemplate,
   renderVaultProtocolFragment,
+  resolveProfilesRoot,
 } from "./profiles.js";
 import { scaffoldAgent } from "./scaffold.js";
 import type { AgentConfig, TelegramConfig } from "../config/schema.js";
+
+describe("resolveProfilesRoot (#3346)", () => {
+  const ENV_KEY = "SWITCHROOM_PROFILES_ROOT";
+  const saved = process.env[ENV_KEY];
+  afterEach(() => {
+    if (saved === undefined) delete process.env[ENV_KEY];
+    else process.env[ENV_KEY] = saved;
+  });
+
+  it("honours the SWITCHROOM_PROFILES_ROOT env override", () => {
+    const dir = mkdtempSync(join(tmpdir(), "profiles-root-"));
+    try {
+      process.env[ENV_KEY] = dir;
+      expect(resolveProfilesRoot()).toBe(resolve(dir));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("probes candidates and returns a profiles dir that exists on disk", () => {
+    // In the dev/npm layout the real profiles dir must resolve and exist —
+    // this is the resolution that also underpins the in-container fix: the
+    // function does not hardcode one relative path, it picks the first
+    // candidate present.
+    delete process.env[ENV_KEY];
+    const root = resolveProfilesRoot();
+    expect(existsSync(root)).toBe(true);
+    expect(existsSync(join(root, "default"))).toBe(true);
+  });
+
+  it("does not resolve to the historically-broken /profiles path", () => {
+    // Regression guard for the exact failure in #3346: the bundle-relative
+    // `../../profiles` resolved to `/profiles` inside the agent image, a dir
+    // that was never shipped. The resolver must never land there when a real
+    // profiles dir is reachable.
+    delete process.env[ENV_KEY];
+    expect(resolveProfilesRoot()).not.toBe("/profiles");
+  });
+});
 
 describe("getProfilePath", () => {
   it("resolves a real profile that exists on disk", () => {

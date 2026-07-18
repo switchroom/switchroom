@@ -30,6 +30,16 @@ describe("Dockerfile.agent bakes", () => {
     );
   });
 
+  // #3346: profiles must ship next to the bundle at /opt/switchroom/profiles.
+  // The CLI resolves PROFILES_ROOT relative to the bundle dir; without this
+  // COPY, in-container `rollout`/`apply` fail with `Profile not found:
+  // default (searched /profiles)`.
+  it("bakes the render profiles next to the bundle", () => {
+    expect(dockerfile).toMatch(
+      /COPY\s+profiles\s+\/opt\/switchroom\/profiles/,
+    );
+  });
+
   it("bakes the autoaccept-poll bundle", () => {
     expect(dockerfile).toMatch(
       /COPY\s+dist\/cli\/autoaccept-poll\.js\s+\/opt\/switchroom\/autoaccept-poll\.js/,

@@ -310,6 +310,17 @@ RUN chmod 0755 /opt/switchroom/security-plugin/hooks/*.mjs
 # shells out to `switchroom <verb>` for /auth, /vault, /agent, /topics
 # and friends (see telegram-plugin/gateway/gateway.ts:switchroomExec).
 COPY dist/cli/switchroom.js /opt/switchroom/switchroom.js
+# Ship the render profiles next to the bundle (#3346). The CLI resolves
+# PROFILES_ROOT relative to the bundle dir: in the npm/dev layout that's
+# `<pkg>/dist/cli/../../profiles`, but in THIS image the bundle lives at
+# /opt/switchroom/switchroom.js, so `../../profiles` would resolve to
+# `/profiles` — a dir the image never shipped. That broke every
+# in-container `rollout`/`apply` with `Profile not found: default
+# (searched /profiles)`. src/agents/profiles.ts now also probes
+# `<bundle-dir>/profiles`, so shipping them here makes profile
+# re-rendering work in-container. Placed in the frequently-changed dist
+# zone since profile templates change with src.
+COPY profiles /opt/switchroom/profiles
 # Ship package.json next to the bundle so `switchroom --version` resolves the
 # authoritative version at runtime (src/cli/resolve-version.ts), immune to a
 # stale build-info baked into the prebuilt bundle or a build-cache layer.
