@@ -691,3 +691,120 @@ describe('selectFlushDeliveryText — deliver the terminal answer, strip only na
     }
   })
 })
+
+// ── #3237: STRUCTURAL block-provenance discriminator ───────────────────────
+// The opener heuristic cannot tell a narration preamble from a real answer
+// paragraph that merely opens with "Let me explain…". The structural flag
+// (`followedByToolUse`, = `!lastInMessage`) can: a narration preamble is
+// followed by a tool_use in its message; a terminal answer paragraph is not.
+describe('selectFlushDeliveryText — structural provenance (followedByToolUse) #3237', () => {
+  // The exact real-answer shape from #3237: a genuine two-paragraph answer
+  // whose FIRST block opens with a narration phrase, written as plain text with
+  // NO tool calls (the model forgot the reply tool → flush path). Structure
+  // says neither block was followed by a tool_use, so nothing is narration.
+  const p1 =
+    'Let me explain how the flush path works: it fires at turn_end when the ' +
+    'model never called the reply tool, joining the captured assistant text ' +
+    'blocks with a paragraph break so the answer renders with real separation.'
+  const p2 =
+    'The terminal block is always delivered, so the answer is never fully ' +
+    'lost — but the opening paragraph could be dropped by the opener-only strip.'
+
+  it('#3237 regression: a real 2-paragraph answer opening with "Let me explain…" is NOT truncated when structure says neither block was followed by a tool_use', () => {
+    // With NO structural signal (legacy string[]) the opener strip DROPS p1.
+    expect(selectFlushDeliveryText([p1, p2])).toBe(p2) // documents the bug
+    // With structure present ([false,false]) the full answer is delivered.
+    const out = selectFlushDeliveryText([p1, p2], [false, false])
+    expect(out).toBe(`${p1}\n\n${p2}`)
+    expect(out).toContain('Let me explain how the flush path works')
+  })
+
+  it('duplicate-reply fix preserved: a narration block FOLLOWED by a tool_use is stripped, terminal answer delivered', () => {
+    const narration = 'Let me pull the numbers together before I answer.'
+    const realAnswer = 'Revenue was 4.2M, up 12% year over year.'
+    // followedByToolUse[0]=true (the model drafted then acted), [1]=false (terminal).
+    const out = selectFlushDeliveryText([narration, realAnswer], [true, false])
+    expect(out).toBe(realAnswer)
+    expect(out).not.toContain('Let me pull the numbers')
+  })
+
+  it('structure alone drives the strip — a preamble the opener regex would MISS is still stripped when it was followed by a tool_use', () => {
+    // "Here are the figures" matches no NARRATION_OPENER, but a tool_use
+    // followed it → structural narration → stripped.
+    const preamble = 'Here are the figures you asked about.'
+    const realAnswer = 'The three services are all green.'
+    const out = selectFlushDeliveryText([preamble, realAnswer], [true, false])
+    expect(out).toBe(realAnswer)
+    expect(out).not.toContain('Here are the figures')
+  })
+
+  it('structure WINS over the opener heuristic — a "Let me…" opener NOT followed by a tool_use is kept (never truncated)', () => {
+    const first = 'Let me walk you through the three steps in order.'
+    const second = 'Step one is to branch off fresh main.'
+    // Opener-only would strip `first`; structure ([false,false]) keeps it.
+    expect(selectFlushDeliveryText([first, second], [false, false])).toBe(
+      `${first}\n\n${second}`,
+    )
+  })
+
+  it('per-block fallback: an UNDEFINED entry falls back to the opener heuristic for that block only', () => {
+    const narration = 'Let me check that.'
+    const realAnswer = 'Done — all green.'
+    // meta[0] undefined → fall back to isNarrationBlock("Let me check that.") = true → stripped.
+    const out = selectFlushDeliveryText([narration, realAnswer], [undefined, false])
+    expect(out).toBe(realAnswer)
+  })
+
+  it('flag-absent back-compat: omitting the meta array reproduces today\'s opener-strip EXACTLY', () => {
+    // Every legacy case behaves identically with no meta argument.
+    expect(selectFlushDeliveryText(['Let me check.', 'the answer'])).toBe('the answer')
+    expect(selectFlushDeliveryText(['Checking now…', 'The build is green.'])).toBe(
+      'The build is green.',
+    )
+    expect(selectFlushDeliveryText([p1, p2])).toBe(p2) // opener strip drops p1
+    const first = 'B'.repeat(FLUSH_SUBSTANTIVE_MIN_CHARS + 5)
+    const last = 'C'.repeat(FLUSH_SUBSTANTIVE_MIN_CHARS + 5)
+    expect(selectFlushDeliveryText([first, last])).toBe(`${first}\n\n${last}`)
+  })
+
+  it('meta stays ALIGNED across the empty-block filter (zip-before-filter)', () => {
+    // An empty block between narration and answer must not shift the meta index.
+    const narration = 'Let me look that up.'
+    const realAnswer = 'The value is 42.'
+    // blocks[1] is empty (dropped); meta must still map [narration→true, ''→_, answer→false].
+    const out = selectFlushDeliveryText([narration, '   ', realAnswer], [true, false, false])
+    expect(out).toBe(realAnswer)
+    expect(out).not.toContain('Let me look that up')
+  })
+
+  it('cross-message shape: narration (msg1, tool_use after) + answer (msg2, terminal) → narration stripped', () => {
+    // lastInMessage semantics are per-message; a narration that is the last text
+    // of msg1 but has a tool_use after it in msg1 is followedByToolUse=true.
+    const narration = 'Let me search the codebase for the symbol.'
+    const realAnswer = 'It is defined in session-tail.ts.'
+    const out = selectFlushDeliveryText([narration, realAnswer], [true, false])
+    expect(out).toBe(realAnswer)
+  })
+
+  it('decideTurnFlush plumbs capturedBlockMeta through to the strip (#3237 end-to-end)', () => {
+    // Real-answer case: structure keeps both paragraphs.
+    const keep = decideTurnFlush({
+      chatId: 'chat1',
+      replyCalled: false,
+      capturedText: [p1, p2],
+      capturedBlockMeta: [false, false],
+    })
+    expect(keep.kind).toBe('flush')
+    if (keep.kind === 'flush') expect(keep.text).toBe(`${p1}\n\n${p2}`)
+
+    // Narration case: structure strips the preamble.
+    const strip = decideTurnFlush({
+      chatId: 'chat1',
+      replyCalled: false,
+      capturedText: ['Let me pull the numbers.', 'Revenue was 4.2M.'],
+      capturedBlockMeta: [true, false],
+    })
+    expect(strip.kind).toBe('flush')
+    if (strip.kind === 'flush') expect(strip.text).toBe('Revenue was 4.2M.')
+  })
+})
