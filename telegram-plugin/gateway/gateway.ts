@@ -114,6 +114,10 @@ import {
   handleChatSharedMessage,
   handleSuccessfulPaymentMessage,
   handlePassportDataMessage,
+  handleDiceMessage,
+  handleGameMessage,
+  handleStoryMessage,
+  handlePaidMediaMessage,
   type MediaEnvelopeDeps,
 } from './media-message-handlers.js'
 import { fmtLocalStamp, resolveEnvTimezone, renderLogTimestampsLocal } from '../shared/local-time.js'
@@ -24787,22 +24791,10 @@ bot.on('message:poll', ctx => handlePollMessage(ctx, mediaEnvelopeDeps))
 bot.on('message:web_app_data', ctx => handleWebAppDataMessage(ctx, mediaEnvelopeDeps))
 bot.on('message:users_shared', ctx => handleUsersSharedMessage(ctx, mediaEnvelopeDeps))
 bot.on('message:chat_shared', ctx => handleChatSharedMessage(ctx, mediaEnvelopeDeps))
-bot.on('message:dice', async ctx => {
-  process.stderr.write(`telegram gateway: inbound dice from chat=${ctx.chat?.id ?? '?'}\n`)
-  await handleAckOnly(ctx, 'dice', { emoji: '🎲' })
-})
-bot.on('message:game', async ctx => {
-  process.stderr.write(`telegram gateway: inbound game from chat=${ctx.chat?.id ?? '?'}\n`)
-  await handleAckOnly(ctx, 'game')
-})
-bot.on('message:story', async ctx => {
-  process.stderr.write(`telegram gateway: inbound story from chat=${ctx.chat?.id ?? '?'}\n`)
-  await handleAckOnly(ctx, 'story')
-})
-bot.on('message:paid_media', async ctx => {
-  process.stderr.write(`telegram gateway: inbound paid_media from chat=${ctx.chat?.id ?? '?'}\n`)
-  await handleAckOnly(ctx, 'paid_media', { warn: true })
-})
+bot.on('message:dice', ctx => handleDiceMessage(ctx, mediaEnvelopeDeps))
+bot.on('message:game', ctx => handleGameMessage(ctx, mediaEnvelopeDeps))
+bot.on('message:story', ctx => handleStoryMessage(ctx, mediaEnvelopeDeps))
+bot.on('message:paid_media', ctx => handlePaidMediaMessage(ctx, mediaEnvelopeDeps))
 bot.on('message:successful_payment', ctx => handleSuccessfulPaymentMessage(ctx, mediaEnvelopeDeps))
 bot.on('message:passport_data', ctx => handlePassportDataMessage(ctx, mediaEnvelopeDeps))
 bot.on('message:checklist_tasks_done' as Parameters<typeof bot.on>[0], (ctx) => {
