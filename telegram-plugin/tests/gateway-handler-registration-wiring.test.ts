@@ -53,10 +53,7 @@ const GATEWAY_SRC = readFileSync(GATEWAY_PATH, 'utf8')
  */
 const GOLDEN_REGISTRATIONS: readonly string[] = [
   'use',
-  'command:start',
-  'command:help',
-  'command:status',
-  'command:agents',
+  'helper:registerStartInfoCommands',
   'command:inject',
   'command:compact',
   'command:clear',
@@ -122,7 +119,7 @@ const GOLDEN_REGISTRATIONS: readonly string[] = [
  * every `message:*` handler (grammY no-double-handling; see
  * catch-all-unhandled-message.test.ts) and before `message_reaction`.
  */
-const HELPER_REGISTRARS = new Set(['registerOpsInfoCommands', 'installUnhandledMessageCatchAll'])
+const HELPER_REGISTRARS = new Set(['registerOpsInfoCommands', 'registerStartInfoCommands', 'installUnhandledMessageCatchAll'])
 
 const sourceFile = ts.createSourceFile(
   GATEWAY_PATH,
