@@ -21,12 +21,15 @@ import { describe, it, expect } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
+// #2996 P2: executeReply's body (incl. the file-send + result + history
+// block this suite pins) moved VERBATIM to outbound-send-path.ts
+// (`sendReply`); the slice reads there now. Assertions unchanged.
 const gatewaySrc = readFileSync(
-  resolve(__dirname, '..', 'gateway', 'gateway.ts'),
+  resolve(__dirname, '..', 'gateway', 'outbound-send-path.ts'),
   'utf-8',
 )
 
-// Slice executeReply's file-send + result + history block: from the
+// Slice sendReply's file-send + result + history block: from the
 // photo-precheck anchor to the recordOutbound call for replies.
 const sliceStart = gatewaySrc.indexOf('const photoPrecheck = new Map')
 const sliceEnd = gatewaySrc.indexOf('history recordOutbound (reply) failed')

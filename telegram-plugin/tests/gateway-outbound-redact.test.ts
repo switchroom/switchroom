@@ -22,6 +22,13 @@ describe('gateway outbound secret-scrub — structural wiring', () => {
     new URL('../gateway/gateway.ts', import.meta.url),
     'utf8',
   )
+  // #2996 P2: executeReply's body moved VERBATIM to outbound-send-path.ts
+  // (`sendReply`); the reply-path scrub-ordering assertion reads there. The
+  // injected redactor (`redactOutboundText`) still lives in gateway.ts.
+  const sendPathSrc = readFileSync(
+    new URL('../gateway/outbound-send-path.ts', import.meta.url),
+    'utf8',
+  )
 
   it('imports the shared redactor', () => {
     expect(src).toMatch(/import \{ redact \} from '\.\.\/secret-detect\/redact\.js'/)
@@ -39,9 +46,9 @@ describe('gateway outbound secret-scrub — structural wiring', () => {
     // voice-scrub) is extracted into outbound-send-path.ts. The reply path now
     // delegates via `normalizeOutboundBody(rawText, 'reply', redactOutboundText)`
     // — the injected redactor still runs at entry, before the stderr preview.
-    const start = src.indexOf('async function executeReply(')
-    const redactIdx = src.indexOf(`normalizeOutboundBody(rawText, 'reply', redactOutboundText)`, start)
-    const previewIdx = src.indexOf('reply: invoked chatId=', start)
+    const start = sendPathSrc.indexOf('export async function sendReply(')
+    const redactIdx = sendPathSrc.indexOf(`normalizeOutboundBody(rawText, 'reply', redactOutboundText)`, start)
+    const previewIdx = sendPathSrc.indexOf('reply: invoked chatId=', start)
     expect(start).toBeGreaterThan(0)
     expect(redactIdx).toBeGreaterThan(start)
     expect(previewIdx).toBeGreaterThan(redactIdx) // mask BEFORE the preview is logged

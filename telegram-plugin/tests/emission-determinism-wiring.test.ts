@@ -17,6 +17,13 @@ const gatewaySrc = readFileSync(
   resolve(__dirname, '..', 'gateway', 'gateway.ts'),
   'utf-8',
 )
+// #2996 P2: executeReply's body (incl. the lever-2 finalize + the latch sets)
+// moved VERBATIM to outbound-send-path.ts `sendReply()`; the assertions that
+// pinned that body now read it there. The wiring contract is unchanged.
+const sendPathSrc = readFileSync(
+  resolve(__dirname, '..', 'gateway', 'outbound-send-path.ts'),
+  'utf-8',
+)
 
 /** Source of `drainActivitySummary` up to the next top-level function. */
 function drainSrc(): string {
@@ -51,20 +58,23 @@ describe('sticky finalAnswerEverDelivered latch (lever 1 precondition / R0)', ()
   it('every site that sets the sticky latch true gates on finalAnswerSubstantive', () => {
     // The latch is set true only at the points that set finalAnswerDelivered=true,
     // and only when the reply was substantive — so an ack never latches it.
-    const setTrue = [...gatewaySrc.matchAll(/finalAnswerEverDelivered\s*=\s*true/g)]
-    // executeReply, silent-anchor merge, + the lever-2 finalize block
+    // #2996 P2: all three latch-set sites live in the extracted sendReply body.
+    const setTrue = [...sendPathSrc.matchAll(/finalAnswerEverDelivered\s*=\s*true/g)]
+    // sendReply post-send, silent-anchor merge, + the lever-2 finalize block
     // (which is itself substantive-gated).
     expect(setTrue.length).toBeGreaterThanOrEqual(3)
+    // And gateway.ts has none left (the wrapper delegates).
+    expect(gatewaySrc).not.toMatch(/finalAnswerEverDelivered\s*=\s*true/)
     // Each `finalAnswerEverDelivered = true` must sit in a substantive context:
     // either guarded by `if (turn.finalAnswerSubstantive)` or inside an
     // `isSubstantiveFinalReply(...)` branch. Assert the substantive-gating
     // token co-occurs (no bare unconditional latch set).
     const bareUnconditional = [
-      ...gatewaySrc.matchAll(/\n\s*(?:turn|finalizeTurn)\.finalAnswerEverDelivered\s*=\s*true/g),
+      ...sendPathSrc.matchAll(/\n\s*(?:turn|finalizeTurn)\.finalAnswerEverDelivered\s*=\s*true/g),
     ]
     for (const m of bareUnconditional) {
       const idx = m.index ?? 0
-      const window = gatewaySrc.slice(Math.max(0, idx - 600), idx)
+      const window = sendPathSrc.slice(Math.max(0, idx - 600), idx)
       expect(
         /finalAnswerSubstantive/.test(window) || /isSubstantiveFinalReply/.test(window),
       ).toBe(true)
@@ -125,10 +135,11 @@ describe('drain producers — narrative may not OPEN, liveness + tool may', () =
 })
 
 describe('lever 2 — finalize the card BEFORE a substantive reply send', () => {
-  /** executeReply body up to the next top-level function. */
+  /** The extracted reply-orchestration body (#2996 P2): the sendReply window
+   *  in outbound-send-path.ts, up to the next export. */
   function executeReplySrc(): string {
-    const after = gatewaySrc.split('async function executeReply(')[1] ?? ''
-    return after.split('\nasync function ')[0]?.split('\nfunction ')[0] ?? after
+    const after = sendPathSrc.split('export async function sendReply(')[1] ?? ''
+    return after.split('\nexport ')[0] ?? after
   }
 
   // #2996 step 1: the chunk send loop was relocated verbatim from executeReply

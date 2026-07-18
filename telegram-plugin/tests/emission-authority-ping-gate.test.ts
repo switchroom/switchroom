@@ -354,8 +354,11 @@ describe('claimOrDowngradePing — no await in the synchronous decide→apply→
     resolve(__dirname, '..', 'gateway', 'emission-authority.ts'),
     'utf-8',
   )
+  // #2996 P2: the over-ping call site moved VERBATIM (with executeReply's
+  // body) into outbound-send-path.ts `sendReply()`; the await-free window
+  // assertion reads there. Contract unchanged.
   const gatewaySrc = readFileSync(
-    resolve(__dirname, '..', 'gateway', 'gateway.ts'),
+    resolve(__dirname, '..', 'gateway', 'outbound-send-path.ts'),
     'utf-8',
   )
 

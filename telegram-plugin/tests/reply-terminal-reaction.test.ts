@@ -43,8 +43,10 @@ describe('#1713 + #1728 — reply tool reaction contract', () => {
     const fs = require('node:fs') as typeof import('node:fs')
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const path = require('node:path') as typeof import('node:path')
+    // #2996 P2: executeReply's body moved verbatim to outbound-send-path.ts
+    // (`sendReply`); the post-send block anchors live there now.
     const src = fs.readFileSync(
-      path.resolve(__dirname, '../gateway/gateway.ts'),
+      path.resolve(__dirname, '../gateway/outbound-send-path.ts'),
       'utf8',
     )
     // Find the executeReply post-send block — anchored on the
@@ -75,8 +77,10 @@ describe('#1713 + #1728 — reply tool reaction contract', () => {
     const fs = require('node:fs') as typeof import('node:fs')
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const path = require('node:path') as typeof import('node:path')
+    // #2996 P2: executeReply's body moved verbatim to outbound-send-path.ts
+    // (`sendReply`); the post-send block anchors live there now.
     const src = fs.readFileSync(
-      path.resolve(__dirname, '../gateway/gateway.ts'),
+      path.resolve(__dirname, '../gateway/outbound-send-path.ts'),
       'utf8',
     )
     const anchor = src.indexOf("fresh sendMessage from reply tool is a user-visible")

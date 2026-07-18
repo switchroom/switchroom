@@ -12,6 +12,13 @@ import { describe, it, expect } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
+// #2996 P2: executeReply's body moved VERBATIM to outbound-send-path.ts
+// (`sendReply`); the reply-path routing assertions read the window there.
+const sendPathSrc = readFileSync(
+  resolve(__dirname, '..', 'gateway', 'outbound-send-path.ts'),
+  'utf-8',
+)
+const sendReplyFn = sendPathSrc.split('export async function sendReply(')[1]?.split('\nexport ')[0] ?? ''
 const gatewaySrc = readFileSync(
   resolve(__dirname, '..', 'gateway', 'gateway.ts'),
   'utf-8',
@@ -54,7 +61,7 @@ describe('component 3 — turn-origin reply routing', () => {
   })
 
   it('executeReply resolves the answer thread via the origin turn, not the live currentTurn', () => {
-    const fn = gatewaySrc.split('async function executeReply')[1]?.split('\nasync function ')[0] ?? ''
+    const fn = sendReplyFn
     expect(fn).toMatch(/TURN_ORIGIN_ROUTING_ENABLED/)
     expect(fn).toMatch(/findTurnByOriginId\(args\.origin_turn_id/)
     // The resolution + reply-route telemetry go through resolveAnswerThreadWithLog,
@@ -85,8 +92,7 @@ describe('framework-owned origin recovery (determinism residual, 2026-06-05)', (
   })
 
   it('the reply path recovers origin from the quoted message_id when the model omits the echo', () => {
-    for (const name of ['executeReply']) {
-      const fn = gatewaySrc.split(new RegExp(`async function ${name}`))[1]?.split('\nasync function ')[0] ?? ''
+    for (const fn of [sendReplyFn]) {
       // Echo first (authoritative), quoted message_id as the framework fallback.
       expect(fn).toMatch(/const echoedTurn = findTurnByOriginId\(args\.origin_turn_id/)
       // Quoted lookup is CHAT-SCOPED (cross-chat message-id collision guard).
