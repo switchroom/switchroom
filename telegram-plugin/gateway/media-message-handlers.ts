@@ -5,7 +5,9 @@
  * gateway renders into a compact text envelope for the agent — contact,
  * location, venue, poll, web_app_data, users_shared, chat_shared — plus the
  * two money/identity outliers that are deliberately NOT forwarded to the agent
- * (successful_payment → log-and-ack, passport_data → refuse).
+ * (successful_payment → log-and-ack, passport_data → refuse), plus the
+ * situational ack-only leaves (dice/game/story/paid_media → log-and-react,
+ * switchroom#2996 P6 cluster B).
  *
  * Extracted VERBATIM out of gateway.ts (the P0a `registerGatewayHandlers`
  * block) so the rendering logic is unit-testable against a fake ctx + mock
@@ -206,6 +208,38 @@ export async function handleSuccessfulPaymentMessage(
     deps.log(`telegram gateway: successful_payment log failed: ${(err as Error).message}\n`)
   }
   await deps.handleAckOnly(ctx, 'successful_payment', { warn: true })
+}
+
+export async function handleDiceMessage(
+  ctx: Filter<Context, 'message:dice'>,
+  deps: MediaEnvelopeDeps,
+): Promise<void> {
+  deps.log(`telegram gateway: inbound dice from chat=${ctx.chat?.id ?? '?'}\n`)
+  await deps.handleAckOnly(ctx, 'dice', { emoji: '🎲' })
+}
+
+export async function handleGameMessage(
+  ctx: Filter<Context, 'message:game'>,
+  deps: MediaEnvelopeDeps,
+): Promise<void> {
+  deps.log(`telegram gateway: inbound game from chat=${ctx.chat?.id ?? '?'}\n`)
+  await deps.handleAckOnly(ctx, 'game')
+}
+
+export async function handleStoryMessage(
+  ctx: Filter<Context, 'message:story'>,
+  deps: MediaEnvelopeDeps,
+): Promise<void> {
+  deps.log(`telegram gateway: inbound story from chat=${ctx.chat?.id ?? '?'}\n`)
+  await deps.handleAckOnly(ctx, 'story')
+}
+
+export async function handlePaidMediaMessage(
+  ctx: Filter<Context, 'message:paid_media'>,
+  deps: MediaEnvelopeDeps,
+): Promise<void> {
+  deps.log(`telegram gateway: inbound paid_media from chat=${ctx.chat?.id ?? '?'}\n`)
+  await deps.handleAckOnly(ctx, 'paid_media', { warn: true })
 }
 
 export async function handlePassportDataMessage(

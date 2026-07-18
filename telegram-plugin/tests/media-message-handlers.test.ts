@@ -20,6 +20,10 @@ import {
   handleChatSharedMessage,
   handleSuccessfulPaymentMessage,
   handlePassportDataMessage,
+  handleDiceMessage,
+  handleGameMessage,
+  handleStoryMessage,
+  handlePaidMediaMessage,
   type MediaEnvelopeDeps,
 } from '../gateway/media-message-handlers.js'
 
@@ -215,6 +219,49 @@ describe('handleSuccessfulPaymentMessage', () => {
     expect(handleAckOnly).toHaveBeenCalledWith(ctx, 'successful_payment', { warn: true })
     expect(logs[0]).toContain('currency=USD total_amount=500')
     expect(logs[0]).toContain('payload="order-1"')
+  })
+})
+
+describe('ack-only leaves (dice/game/story/paid_media)', () => {
+  it('handleDiceMessage logs and reacts 🎲, never forwarding', async () => {
+    const { deps, handleInbound, handleAckOnly, logs } = makeDeps()
+    const ctx = ctxWith({ dice: { emoji: '🎲', value: 4 } })
+    await handleDiceMessage(ctx, deps)
+    expect(handleInbound).not.toHaveBeenCalled()
+    expect(handleAckOnly).toHaveBeenCalledWith(ctx, 'dice', { emoji: '🎲' })
+    expect(logs[0]).toBe('telegram gateway: inbound dice from chat=42\n')
+  })
+
+  it('handleGameMessage logs and acks with no options', async () => {
+    const { deps, handleAckOnly, logs } = makeDeps()
+    const ctx = ctxWith({ game: {} })
+    await handleGameMessage(ctx, deps)
+    expect(handleAckOnly).toHaveBeenCalledWith(ctx, 'game')
+    expect(logs[0]).toBe('telegram gateway: inbound game from chat=42\n')
+  })
+
+  it('handleStoryMessage logs and acks with no options', async () => {
+    const { deps, handleAckOnly, logs } = makeDeps()
+    const ctx = ctxWith({ story: {} })
+    await handleStoryMessage(ctx, deps)
+    expect(handleAckOnly).toHaveBeenCalledWith(ctx, 'story')
+    expect(logs[0]).toBe('telegram gateway: inbound story from chat=42\n')
+  })
+
+  it('handlePaidMediaMessage logs and acks warn:true', async () => {
+    const { deps, handleInbound, handleAckOnly, logs } = makeDeps()
+    const ctx = ctxWith({ paid_media: {} })
+    await handlePaidMediaMessage(ctx, deps)
+    expect(handleInbound).not.toHaveBeenCalled()
+    expect(handleAckOnly).toHaveBeenCalledWith(ctx, 'paid_media', { warn: true })
+    expect(logs[0]).toBe('telegram gateway: inbound paid_media from chat=42\n')
+  })
+
+  it('falls back to ? for a missing chat id', async () => {
+    const { deps, logs } = makeDeps()
+    const ctx = ctxWith({ dice: {} }, null)
+    await handleDiceMessage(ctx, deps)
+    expect(logs[0]).toBe('telegram gateway: inbound dice from chat=?\n')
   })
 })
 
