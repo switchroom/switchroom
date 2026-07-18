@@ -206,6 +206,32 @@ describe("alignAgentTreeOwnershipIfRoot — flag gating (#3333 stage 2)", () => 
   });
 });
 
+describe("chownShallow — -h symlink semantics on non-root CI (#3362 review fix 2)", () => {
+  // The root-gated -h tests below self-skip on the non-root CI runner, so a
+  // `-h` removal from chownShallow's argv would ship green there. This test
+  // runs UNPRIVILEGED: chown to our OWN uid:gid needs no CAP_CHOWN, and a
+  // DANGLING symlink makes -h load-bearing — without -h (GNU non-recursive
+  // chown and busybox both dereference by default) the chown hits ENOENT and
+  // throws; with -h it lchowns the link and succeeds. Outcome-asserting:
+  // fails if -h is ever dropped, on any runner.
+  it("real chownShallow lchowns a dangling symlink instead of dereferencing (would throw without -h)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "switchroom-shallow-h-"));
+    try {
+      const file = join(dir, "plain");
+      writeFileSync(file, "x");
+      const dangling = join(dir, "dangling");
+      symlinkSync("/nonexistent/target/for-h-test", dangling);
+      const uid = process.getuid?.() ?? 0;
+      const gid = process.getgid?.() ?? 0;
+      expect(() =>
+        real.chownShallow(uid, gid, [dir, file, dangling]),
+      ).not.toThrow();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 // Real-outcome pins: only where the test process has CAP_CHOWN (self-skip on
 // the non-root CI runner). The recorder tests above cover the wiring there.
 describe("chownScopedTree — real outcomes (root only)", () => {
