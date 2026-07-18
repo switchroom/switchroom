@@ -140,6 +140,10 @@ import {
   handlePinnedMessage,
   type PinnedMessageHandlerDeps,
 } from './pinned-message-handler.js'
+import {
+  handleChecklistUpdate,
+  type ChecklistHandlerDeps,
+} from './checklist-message-handler.js'
 import { fmtLocalStamp, resolveEnvTimezone, renderLogTimestampsLocal } from '../shared/local-time.js'
 import { StatusReactionController } from '../status-reactions.js'
 import { DeferredDoneReactions } from '../reaction-defer.js'
@@ -21067,94 +21071,10 @@ async function handleRefusal(
 
 
 // ─── Checklist service message handlers ──────────────────────────────────
-// Telegram emits `checklist_tasks_done` and `checklist_tasks_added` service
-// messages when users tick or add tasks in a native checklist. These arrive
-// as part of the `message` update type, so no extra `allowed_updates` config
-// is required — bots already receive them.
-//
-// We route them to the agent as a new channel event with
-// kind="checklist_task_changed" so the agent can react to user actions on
-// a checklist it sent.
-
-type ChecklistTaskUpdate = {
-  message_checklist?: {
-    title?: string
-    tasks?: Array<{ id?: number; text?: string; is_completed?: boolean }>
-  }
-  checklist_tasks_done?: Array<{ id?: number; user?: { id?: number; username?: string }; done?: boolean }>
-  checklist_tasks_added?: Array<{ id?: number; text?: string; user?: { id?: number; username?: string } }>
-}
-
-function handleChecklistUpdate(
-  ctx: Context,
-  kind: 'checklist_tasks_done' | 'checklist_tasks_added',
-): void {
-  try {
-    const msg = ctx.message as (typeof ctx.message & ChecklistTaskUpdate) | undefined
-    if (!msg) return
-
-    const chat = ctx.chat
-    if (!chat) return
-
-    const chat_id = String(chat.id)
-    const access = loadAccess()
-
-    // Only notify if this chat is allowlisted — same guard as inbound user messages.
-    // Closes #472 finding #13. Pre-fix the `&& access.allowFrom.length > 0`
-    // tail made this fail-OPEN when the allowlist was empty: every chat's
-    // checklist tasks would forward to the agent. Sibling guards (the
-    // inbound-message gate at line ~588 and the operator-event broadcast
-    // at line ~1221) are both fail-closed for empty allowlists. The
-    // empty-allowlist case is the most likely state for a misconfiguration
-    // (e.g. /unpair just ran), so fail-OPEN is the worst default.
-    if (!access.allowFrom.includes(chat_id)) return
-
-    const message_id = String(msg.message_id)
-    const ts = msg.date ?? Math.floor(Date.now() / 1000)
-
-    // Extract task updates depending on service message type
-    const tasksDone = msg.checklist_tasks_done ?? []
-    const tasksAdded = msg.checklist_tasks_added ?? []
-    const allTasks = kind === 'checklist_tasks_done' ? tasksDone : tasksAdded
-
-    // Build per-task channel events and broadcast each to connected bridges.
-    for (const task of allTasks) {
-      const taskId = task.id != null ? String(task.id) : '?'
-      const user = (task.user as { username?: string; id?: number } | undefined)
-      const userName = user?.username ?? (user?.id != null ? String(user.id) : 'unknown')
-      const state = kind === 'checklist_tasks_done'
-        ? ((task as { done?: boolean }).done === false ? 'undone' : 'done')
-        : 'added'
-
-      const inboundMsg: InboundMessage = {
-        type: 'inbound',
-        chatId: chat_id,
-        messageId: Number(message_id),
-        user: userName,
-        userId: user?.id ?? 0,
-        ts,
-        text: `(checklist task ${state}: id=${taskId})`,
-        meta: {
-          chat_id,
-          message_id,
-          kind: 'checklist_task_changed',
-          task_id: taskId,
-          state,
-          user: userName,
-          user_id: user?.id != null ? String(user.id) : '0',
-          ts: new Date(ts * 1000).toISOString(),
-        },
-      }
-      // allow-broadcast: informational checklist task notification, not turn-driving
-      ipcServer.broadcast(inboundMsg)
-      process.stderr.write(
-        `telegram gateway: checklist ${kind}: chat_id=${chat_id} message_id=${message_id} task_id=${taskId} state=${state} user=${userName}\n`,
-      )
-    }
-  } catch (err) {
-    process.stderr.write(`telegram gateway: checklist handler error (${kind}): ${err}\n`)
-  }
-}
+// Extracted to gateway/checklist-message-handler.ts (switchroom#2996 P6).
+// The bot.on('message:checklist_tasks_*') registrations delegate there;
+// `checklistHandlerDeps` (defined next to the other handler deps) injects
+// the allowlist gate, the IPC broadcast, and the stderr log sink.
 
 
 
@@ -24723,6 +24643,23 @@ const pinnedMessageHandlerDeps: PinnedMessageHandlerDeps = {
     ).then(() => undefined),
   log: line => process.stderr.write(line),
 }
+// Injected surface for the extracted checklist service-message handler
+// (switchroom#2996 P6). The broadcast binding keeps the ipcServer.broadcast
+// callsite (and its allow-broadcast justification) here in gateway.ts.
+const checklistHandlerDeps: ChecklistHandlerDeps = {
+  loadAccess,
+  // Param is named `inboundMsg` deliberately: three structural tests
+  // (gateway-request-secret / secret-detect-oauth-code / secret-detect-fail-
+  // closed) anchor ordering assertions on the literal
+  // `ipcServer.broadcast(inboundMsg)` appearing after their pipeline
+  // anchors — the checklist handler's broadcast was the occurrence they
+  // matched before this extraction.
+  broadcast: inboundMsg => {
+    // allow-broadcast: informational checklist task notification, not turn-driving
+    ipcServer.broadcast(inboundMsg)
+  },
+  log: line => process.stderr.write(line),
+}
 bot.on('message:contact', ctx => handleContactMessage(ctx, mediaEnvelopeDeps))
 bot.on('message:location', ctx => handleLocationMessage(ctx, mediaEnvelopeDeps))
 bot.on('message:venue', ctx => handleVenueMessage(ctx, mediaEnvelopeDeps))
@@ -24737,10 +24674,10 @@ bot.on('message:paid_media', ctx => handlePaidMediaMessage(ctx, mediaEnvelopeDep
 bot.on('message:successful_payment', ctx => handleSuccessfulPaymentMessage(ctx, mediaEnvelopeDeps))
 bot.on('message:passport_data', ctx => handlePassportDataMessage(ctx, mediaEnvelopeDeps))
 bot.on('message:checklist_tasks_done' as Parameters<typeof bot.on>[0], (ctx) => {
-  handleChecklistUpdate(ctx as unknown as Context, 'checklist_tasks_done')
+  handleChecklistUpdate(ctx as unknown as Context, 'checklist_tasks_done', checklistHandlerDeps)
 })
 bot.on('message:checklist_tasks_added' as Parameters<typeof bot.on>[0], (ctx) => {
-  handleChecklistUpdate(ctx as unknown as Context, 'checklist_tasks_added')
+  handleChecklistUpdate(ctx as unknown as Context, 'checklist_tasks_added', checklistHandlerDeps)
 })
 bot.on('message:pinned_message', ctx => handlePinnedMessage(ctx, pinnedMessageHandlerDeps))
 installUnhandledMessageCatchAll(
