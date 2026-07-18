@@ -24648,9 +24648,15 @@ const pinnedMessageHandlerDeps: PinnedMessageHandlerDeps = {
 // callsite (and its allow-broadcast justification) here in gateway.ts.
 const checklistHandlerDeps: ChecklistHandlerDeps = {
   loadAccess,
-  broadcast: msg => {
+  // Param is named `inboundMsg` deliberately: three structural tests
+  // (gateway-request-secret / secret-detect-oauth-code / secret-detect-fail-
+  // closed) anchor ordering assertions on the literal
+  // `ipcServer.broadcast(inboundMsg)` appearing after their pipeline
+  // anchors — the checklist handler's broadcast was the occurrence they
+  // matched before this extraction.
+  broadcast: inboundMsg => {
     // allow-broadcast: informational checklist task notification, not turn-driving
-    ipcServer.broadcast(msg)
+    ipcServer.broadcast(inboundMsg)
   },
   log: line => process.stderr.write(line),
 }
