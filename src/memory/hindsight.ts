@@ -24,6 +24,23 @@ export interface McpServerConfig {
 }
 
 /**
+ * In-container path to the switchroom CLI (`Dockerfile.agent` symlinks
+ * `dist/cli/switchroom.js` here). Local copy of scaffold.ts's
+ * DOCKER_SWITCHROOM_CLI_PATH — duplicated (not imported) because
+ * scaffold.ts imports this module and the reverse import would be a cycle.
+ * tests/memory.test.ts pins the two in lockstep.
+ */
+export const HINDSIGHT_SHIM_CLI_PATH = "/usr/local/bin/switchroom";
+
+/**
+ * In-container HOME for the agent (mirror of scaffold.ts
+ * DOCKER_AGENT_HOME / compose.ts emitAgentService env). Claude Code spawns
+ * MCP commands with a SANITIZED env, so HOME + the shim inputs must be
+ * threaded explicitly onto the entry.
+ */
+export const HINDSIGHT_SHIM_AGENT_HOME = "/state/agent/home";
+
+/**
  * Generate the MCP server config entry for Hindsight.
  *
  * Hindsight exposes MCP via Streamable HTTP at /mcp/. The host/port can be
@@ -31,6 +48,19 @@ export interface McpServerConfig {
  * (HINDSIGHT_DEFAULT_MCP_URL). The upstream default of 8888 conflicts with
  * Coolify, nginx front-proxies and tunnel gateways — hence the 18888 default,
  * which the launcher binds and the scaffolding writes in lockstep.
+ *
+ * Default transport is the **lazy-connect stdio shim**
+ * (`switchroom hindsight-mcp-shim`, src/cli/hindsight-mcp-shim.ts): Claude
+ * Code marks an HTTP MCP server failed for the ENTIRE session when the
+ * backend is down at session start (~3 handshake retries, then only a
+ * manual /mcp recovers), so a direct `type: "http"` entry couples the
+ * agent's whole memory tool surface to hindsight being up at the instant
+ * the session boots. The shim always completes the stdio handshake itself
+ * and lazy-connects to the backend per call, so registration can never
+ * fail and mid-session outages self-heal.
+ *
+ * Escape hatch: `memory.config.mcp_transport: "http"` restores the old
+ * direct HTTP entry.
  */
 export function generateHindsightMcpConfig(
   collection: string,
@@ -38,11 +68,27 @@ export function generateHindsightMcpConfig(
 ): McpServerConfig {
   const url = (memoryConfig.config?.url as string | undefined)
     ?? HINDSIGHT_DEFAULT_MCP_URL;
+  if (memoryConfig.config?.mcp_transport === "http") {
+    return {
+      type: "http",
+      url,
+      headers: {
+        "X-Bank-Id": collection,
+      },
+    };
+  }
   return {
-    type: "http",
-    url,
-    headers: {
-      "X-Bank-Id": collection,
+    type: "stdio",
+    command: HINDSIGHT_SHIM_CLI_PATH,
+    args: ["hindsight-mcp-shim"],
+    // Claude Code spawns MCP commands with a sanitized env — every input
+    // the shim needs must be threaded here explicitly (the X-Bank-Id
+    // header of the http form becomes HINDSIGHT_BANK_ID).
+    env: {
+      HINDSIGHT_MCP_URL: url,
+      HINDSIGHT_BANK_ID: collection,
+      HINDSIGHT_SHIM_CACHE_DIR: `${HINDSIGHT_SHIM_AGENT_HOME}/.hindsight-shim`,
+      HOME: HINDSIGHT_SHIM_AGENT_HOME,
     },
   };
 }

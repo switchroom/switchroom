@@ -123,7 +123,7 @@ The scaffold wires the following MCP servers automatically:
 
 - **switchroom** — management CLI wrapper (list/start/stop agents, check auth). Always wired.
 - **playwright** — Microsoft's `@playwright/mcp` browser automation server, launched via `npx -y @playwright/mcp@<pinned-version> --snapshot`. Always wired by default; opt out with `mcp_servers: { playwright: false }`. Runs in accessibility-tree (snapshot) mode, which is token-cheap and reliable for most web automation tasks. Exposes `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, and related tools directly to the agent without requiring a local Playwright installation. The version is pinned in `src/memory/scaffold-integration.ts` — bump deliberately when validating against a newer release.
-- **hindsight** — semantic memory bank, wired only when `memory.backend` is `hindsight`. Agents using a different memory backend (or none) don't get this server.
+- **hindsight** — semantic memory bank, wired only when `memory.backend` is `hindsight`. Agents using a different memory backend (or none) don't get this server. By default it is wired as a lazy-connect stdio proxy (`switchroom hindsight-mcp-shim`) rather than a direct HTTP entry: Claude Code marks an HTTP MCP server failed for the whole session if the backend is down at session start, while the shim always registers, serves a cached (or built-in fallback) tool manifest, and reconnects to the backend per call. Set `memory.config.mcp_transport: "http"` to revert to the legacy direct Streamable-HTTP entry.
 
 ### Tuning auto-recall — `memory.recall.max_memories`
 

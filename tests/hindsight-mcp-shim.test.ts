@@ -1,0 +1,400 @@
+/**
+ * Outcome tests for the lazy-connect Hindsight stdio MCP shim
+ * (src/cli/hindsight-mcp-shim.ts):
+ *
+ *   1. stdio initialize handshake succeeds with the backend DOWN
+ *   2. tools/list is served from the disk cache with the backend down
+ *   3. tools/list falls back to the static manifest on first boot (no cache)
+ *   4. tools/call returns an isError tool result (not a crash) when down
+ *   5. calls pass through to a live (mock) backend, including the lazy
+ *      Streamable HTTP session handshake + X-Bank-Id header
+ *   6. a successful live tools/list refreshes the disk cache
+ *   7. recovery: after a down-backend isError, the SAME shim instance
+ *      succeeds once the backend comes up (per-call reconnect)
+ */
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { createServer, type Server } from "node:http";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import {
+  HindsightShim,
+  buildFallbackToolsList,
+  FALLBACK_TOOL_TABLE,
+  TOOLS_CACHE_FILENAME,
+  SHIM_SUPPORTED_PROTOCOL_VERSIONS,
+  type ShimOptions,
+} from "../src/cli/hindsight-mcp-shim.js";
+
+// ─── helpers ──────────────────────────────────────────────────────────────
+
+/** A 127.0.0.1 URL where nothing listens (bind :0, close, reuse port). */
+async function deadUrl(): Promise<string> {
+  const srv = createServer();
+  await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+  const port = (srv.address() as { port: number }).port;
+  await new Promise<void>((r) => srv.close(() => r()));
+  return `http://127.0.0.1:${port}/mcp/`;
+}
+
+interface MockBackend {
+  url: string;
+  server: Server;
+  /** Every JSON-RPC request body received, in order. */
+  requests: { method?: string; headers: Record<string, unknown> }[];
+  close: () => Promise<void>;
+}
+
+/**
+ * Minimal Streamable HTTP MCP backend: answers initialize (issuing a
+ * session id), accepts notifications, and serves tools/list + tools/call.
+ */
+async function startMockBackend(
+  opts: {
+    tools?: { name: string; inputSchema: unknown }[];
+    sse?: boolean;
+  } = {},
+): Promise<MockBackend> {
+  const tools = opts.tools ?? [
+    { name: "recall", inputSchema: { type: "object" } },
+    { name: "retain", inputSchema: { type: "object" } },
+  ];
+  const requests: MockBackend["requests"] = [];
+  const server = createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      const msg = JSON.parse(body) as {
+        id?: number;
+        method?: string;
+        params?: { name?: string; arguments?: unknown };
+      };
+      requests.push({ method: msg.method, headers: { ...req.headers } });
+      const reply = (result: unknown) => {
+        const payload = JSON.stringify({ jsonrpc: "2.0", id: msg.id, result });
+        if (opts.sse) {
+          res.writeHead(200, {
+            "content-type": "text/event-stream",
+            "mcp-session-id": "sess-1",
+          });
+          res.end(`event: message\ndata: ${payload}\n\n`);
+        } else {
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "mcp-session-id": "sess-1",
+          });
+          res.end(payload);
+        }
+      };
+      switch (msg.method) {
+        case "initialize":
+          reply({
+            protocolVersion: "2025-03-26",
+            capabilities: { tools: { listChanged: true } },
+            serverInfo: { name: "mock-hindsight", version: "0.8.4" },
+          });
+          return;
+        case "notifications/initialized":
+          res.writeHead(202).end();
+          return;
+        case "tools/list":
+          reply({ tools });
+          return;
+        case "tools/call":
+          reply({
+            content: [
+              { type: "text", text: `called:${msg.params?.name}` },
+            ],
+            isError: false,
+          });
+          return;
+        default:
+          reply({});
+      }
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as { port: number }).port;
+  return {
+    url: `http://127.0.0.1:${port}/mcp/`,
+    server,
+    requests,
+    close: () => new Promise((r) => server.close(() => r())),
+  };
+}
+
+function makeShim(overrides: Partial<ShimOptions> & { url: string; cacheDir: string }): HindsightShim {
+  return new HindsightShim({
+    bankId: "test-bank",
+    toolsListTimeoutMs: 500,
+    toolsCallTimeoutMs: 1000,
+    connectTimeoutMs: 500,
+    logger: () => undefined,
+    ...overrides,
+  });
+}
+
+const rpc = (id: number, method: string, params?: unknown) =>
+  ({ jsonrpc: "2.0" as const, id, method, params });
+
+let cacheDir: string;
+beforeEach(() => {
+  cacheDir = mkdtempSync(join(tmpdir(), "hindsight-shim-test-"));
+});
+afterEach(() => {
+  rmSync(cacheDir, { recursive: true, force: true });
+});
+
+// ─── 1. handshake never depends on the backend ────────────────────────────
+
+describe("initialize handshake", () => {
+  it("succeeds immediately with the backend down", async () => {
+    const shim = makeShim({ url: await deadUrl(), cacheDir });
+    const res = await shim.handle(
+      rpc(1, "initialize", {
+        protocolVersion: "2025-06-18",
+        capabilities: {},
+        clientInfo: { name: "claude-code", version: "2.x" },
+      }) as never,
+    );
+    expect(res?.error).toBeUndefined();
+    const result = res?.result as {
+      protocolVersion: string;
+      capabilities: { tools: unknown };
+      serverInfo: { name: string };
+    };
+    expect(result.protocolVersion).toBe("2025-06-18");
+    expect(result.capabilities.tools).toBeDefined();
+    expect(result.serverInfo.name).toBe("switchroom-hindsight-shim");
+  });
+
+  it("negotiates down to our newest version for unknown client versions", async () => {
+    const shim = makeShim({ url: await deadUrl(), cacheDir });
+    const res = await shim.handle(
+      rpc(1, "initialize", { protocolVersion: "2099-01-01" }) as never,
+    );
+    expect((res?.result as { protocolVersion: string }).protocolVersion).toBe(
+      SHIM_SUPPORTED_PROTOCOL_VERSIONS[0],
+    );
+  });
+
+  it("answers ping locally with backend down (keepalive can't kill the session)", async () => {
+    const shim = makeShim({ url: await deadUrl(), cacheDir });
+    const res = await shim.handle(rpc(2, "ping") as never);
+    expect(res?.error).toBeUndefined();
+    expect(res?.result).toEqual({});
+  });
+});
+
+// ─── 2+3. tools/list resilience ───────────────────────────────────────────
+
+describe("tools/list with backend down", () => {
+  it("serves the persisted cache when one exists", async () => {
+    const cached = {
+      tools: [
+        { name: "recall", description: "cached", inputSchema: { type: "object" } },
+      ],
+    };
+    mkdirSync(cacheDir, { recursive: true });
+    writeFileSync(join(cacheDir, TOOLS_CACHE_FILENAME), JSON.stringify(cached));
+    const shim = makeShim({ url: await deadUrl(), cacheDir });
+
+    const res = await shim.handle(rpc(3, "tools/list") as never);
+    expect(res?.error).toBeUndefined();
+    expect(res?.result).toEqual(cached);
+  });
+
+  it("serves the static fallback manifest on first boot (no cache)", async () => {
+    const shim = makeShim({ url: await deadUrl(), cacheDir });
+    const res = await shim.handle(rpc(3, "tools/list") as never);
+    expect(res?.error).toBeUndefined();
+    const { tools } = res?.result as { tools: { name: string }[] };
+    const names = tools.map((t) => t.name);
+    // The load-bearing memory surface must exist at session start.
+    for (const required of ["recall", "retain", "sync_retain", "reflect", "create_directive"]) {
+      expect(names).toContain(required);
+    }
+    expect(tools.length).toBe(Object.keys(FALLBACK_TOOL_TABLE).length);
+  });
+});
+
+// ─── 4. tools/call error result, never a crash ────────────────────────────
+
+describe("tools/call with backend down", () => {
+  it("returns isError:true with a temporarily-unavailable message", async () => {
+    const shim = makeShim({ url: await deadUrl(), cacheDir });
+    const res = await shim.handle(
+      rpc(4, "tools/call", { name: "recall", arguments: { query: "x" } }) as never,
+    );
+    expect(res?.error).toBeUndefined(); // tool ERROR RESULT, not protocol error
+    const result = res?.result as {
+      isError: boolean;
+      content: { type: string; text: string }[];
+    };
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/temporarily unavailable/i);
+  });
+});
+
+// ─── 5+6. pass-through against a live mock backend ────────────────────────
+
+describe("with the backend up", () => {
+  let backend: MockBackend;
+  afterEach(async () => {
+    await backend.close();
+  });
+
+  it("lazily handshakes upstream and passes tools/call through", async () => {
+    backend = await startMockBackend();
+    const shim = makeShim({ url: backend.url, cacheDir });
+
+    // Client-side handshake first (local, no upstream traffic yet).
+    await shim.handle(rpc(1, "initialize", { protocolVersion: "2025-06-18" }) as never);
+    expect(backend.requests.length).toBe(0);
+
+    const res = await shim.handle(
+      rpc(2, "tools/call", { name: "recall", arguments: { query: "x" } }) as never,
+    );
+    const result = res?.result as { isError: boolean; content: { text: string }[] };
+    expect(result.isError).toBe(false);
+    expect(result.content[0].text).toBe("called:recall");
+
+    // Upstream saw a full lazy handshake then the call, with the bank header.
+    expect(backend.requests.map((r) => r.method)).toEqual([
+      "initialize",
+      "notifications/initialized",
+      "tools/call",
+    ]);
+    expect(backend.requests[2].headers["x-bank-id"]).toBe("test-bank");
+    expect(backend.requests[2].headers["mcp-session-id"]).toBe("sess-1");
+  });
+
+  it("parses SSE-framed backend responses", async () => {
+    backend = await startMockBackend({ sse: true });
+    const shim = makeShim({ url: backend.url, cacheDir });
+    const res = await shim.handle(
+      rpc(2, "tools/call", { name: "retain", arguments: {} }) as never,
+    );
+    expect((res?.result as { content: { text: string }[] }).content[0].text).toBe(
+      "called:retain",
+    );
+  });
+
+  it("refreshes the disk cache from a live tools/list (stale cache replaced)", async () => {
+    // Seed a stale cache the live result must overwrite.
+    mkdirSync(cacheDir, { recursive: true });
+    writeFileSync(
+      join(cacheDir, TOOLS_CACHE_FILENAME),
+      JSON.stringify({ tools: [{ name: "stale_tool", inputSchema: {} }] }),
+    );
+    backend = await startMockBackend({
+      tools: [{ name: "fresh_tool", inputSchema: { type: "object" } }],
+    });
+    const shim = makeShim({ url: backend.url, cacheDir });
+
+    const res = await shim.handle(rpc(5, "tools/list") as never);
+    const { tools } = res?.result as { tools: { name: string }[] };
+    expect(tools.map((t) => t.name)).toEqual(["fresh_tool"]);
+
+    const persisted = JSON.parse(
+      readFileSync(join(cacheDir, TOOLS_CACHE_FILENAME), "utf-8"),
+    ) as { tools: { name: string }[] };
+    expect(persisted.tools.map((t) => t.name)).toEqual(["fresh_tool"]);
+  });
+
+  it("recovers per-call: isError while down, real result after the backend comes up", async () => {
+    // Reserve a port, keep it dead for the first call...
+    const probe = createServer();
+    await new Promise<void>((r) => probe.listen(0, "127.0.0.1", r));
+    const port = (probe.address() as { port: number }).port;
+    await new Promise<void>((r) => probe.close(() => r()));
+    const url = `http://127.0.0.1:${port}/mcp/`;
+
+    const shim = makeShim({ url, cacheDir });
+    const down = await shim.handle(
+      rpc(1, "tools/call", { name: "recall", arguments: {} }) as never,
+    );
+    expect((down?.result as { isError: boolean }).isError).toBe(true);
+
+    // ...then bring a backend up on THAT port and reuse the same shim.
+    backend = await startMockBackend();
+    const liveServer = backend.server;
+    await new Promise<void>((r) => liveServer.close(() => r()));
+    await new Promise<void>((resolve, reject) => {
+      liveServer.once("error", reject);
+      liveServer.listen(port, "127.0.0.1", resolve);
+    });
+    backend.url = url;
+
+    const up = await shim.handle(
+      rpc(2, "tools/call", { name: "recall", arguments: {} }) as never,
+    );
+    const result = up?.result as { isError: boolean; content: { text: string }[] };
+    expect(result.isError).toBe(false);
+    expect(result.content[0].text).toBe("called:recall");
+  });
+});
+
+// ─── stdio wiring ─────────────────────────────────────────────────────────
+
+describe("run() stdio loop", () => {
+  it("flushes every pending response before resolving on input end (backend down)", async () => {
+    const { PassThrough } = await import("node:stream");
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const shim = makeShim({ url: await deadUrl(), cacheDir });
+
+    const done = shim.run(input, output);
+    input.write(
+      JSON.stringify(rpc(1, "initialize", { protocolVersion: "2025-06-18" })) + "\n",
+    );
+    input.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
+    input.write(JSON.stringify(rpc(2, "tools/list")) + "\n");
+    input.end(); // Claude Code teardown — must NOT drop the tools/list reply
+    await done;
+
+    const lines = output.read()?.toString().trim().split("\n") ?? [];
+    expect(lines.length).toBe(2);
+    const [init, list] = lines.map((l: string) => JSON.parse(l));
+    expect(init.id).toBe(1);
+    expect(init.result.serverInfo.name).toBe("switchroom-hindsight-shim");
+    expect(list.id).toBe(2);
+    expect(list.result.tools.length).toBeGreaterThan(0);
+  });
+});
+
+// ─── fallback manifest drift guard ────────────────────────────────────────
+
+describe("static fallback manifest", () => {
+  it("stays in lockstep with the captured hindsight tools/list snapshot", () => {
+    const snapshot = JSON.parse(
+      readFileSync(
+        join(__dirname, "fixtures", "hindsight-tools-list.snapshot.json"),
+        "utf-8",
+      ),
+    ) as { tools: Record<string, { required: string[]; props: string[] }> };
+    const fromSnapshot = Object.fromEntries(
+      Object.entries(snapshot.tools).map(([name, t]) => [
+        name,
+        [t.required ?? [], t.props ?? []],
+      ]),
+    );
+    expect(FALLBACK_TOOL_TABLE).toEqual(fromSnapshot);
+  });
+
+  it("materializes valid MCP tool defs (object schemas with required lists)", () => {
+    const { tools } = buildFallbackToolsList();
+    for (const tool of tools) {
+      const schema = tool.inputSchema as {
+        type: string;
+        properties: Record<string, unknown>;
+        required: string[];
+      };
+      expect(schema.type).toBe("object");
+      for (const req of schema.required) {
+        expect(Object.keys(schema.properties)).toContain(req);
+      }
+    }
+  });
+});
