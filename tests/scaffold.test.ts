@@ -2297,9 +2297,22 @@ describe("reconcileAgent", () => {
     expect(startSh).toContain('"method":"initialize"');
     expect(startSh).toContain("-X POST");
     expect(startSh).toContain('-H "Accept: application/json, text/event-stream"');
-    expect(startSh).toContain(`grep -q '"result"'`);
-    // Bounded at 120s; boots anyway on timeout with a warning line
+    expect(startSh).toContain(`grep -q '"serverInfo"'`);
+    // The probe payload must be valid JSON after Handlebars rendering — a
+    // template mangle should fail here, not just a substring check
+    const payloadMatch = startSh.match(/-d '(\{.*\})'/);
+    expect(payloadMatch).toBeTruthy();
+    const payload = JSON.parse(payloadMatch![1]);
+    expect(payload.jsonrpc).toBe("2.0");
+    expect(payload.method).toBe("initialize");
+    expect(payload.params.protocolVersion).toBeTruthy();
+    // Best-effort session cleanup after a successful probe
+    expect(startSh).toContain("-X DELETE");
+    expect(startSh).toContain("Mcp-Session-Id");
+    // True 120s wall-clock bound (elapsed via date +%s, not iteration count);
+    // boots anyway on timeout with a warning line
     expect(startSh).toContain("HINDSIGHT_WAIT -lt 120");
+    expect(startSh).toContain("_hs_start=$(date +%s)");
     expect(startSh).toContain("hindsight boot gate TIMED OUT");
     expect(startSh).toContain("/mcp/");
   });

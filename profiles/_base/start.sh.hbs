@@ -613,22 +613,37 @@ export MCP_TIMEOUT="${MCP_TIMEOUT:-30000}"
 # a 30s bare-GET gate — the endpoint returned HTTP 200 mid-restart while a
 # real MCP initialize still failed). So: probe with an actual JSON-RPC
 # initialize POST and require a JSON-RPC result, not just HTTP 200.
-# Bounded at 120s; on timeout we log a warning and boot anyway (degraded
+# Bounded at 120s of real wall-clock time (each probe costs up to ~3s of
+# curl timeout + 1s sleep, so an iteration count would overshoot — measure
+# elapsed seconds against the deadline instead; HINDSIGHT_WAIT holds real
+# elapsed seconds). On timeout we log a warning and boot anyway (degraded
 # beats never-boots — the plugin reconnects once Hindsight recovers).
 HINDSIGHT_WAIT=0
 HINDSIGHT_READY=0
+_hs_start=$(date +%s)
 while [ $HINDSIGHT_WAIT -lt 120 ]; do
-  if curl -sf --max-time 3 \
+  _hs_resp=$(curl -sf --max-time 3 -i \
        -X POST {{{hindsightApiBaseUrlQ}}}/mcp/ \
        -H "Content-Type: application/json" \
        -H "Accept: application/json, text/event-stream" \
        -d '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"switchroom-boot-gate","version":"1.0"}}}' \
-       2>/dev/null | grep -q '"result"'; then
+       2>/dev/null)
+  # Match on serverInfo — only present in a successful initialize result;
+  # a JSON-RPC *error* body could legitimately contain the substring "result".
+  if printf '%s\n' "$_hs_resp" | grep -q '"serverInfo"'; then
     HINDSIGHT_READY=1
+    # Best-effort cleanup of the probe's server-side MCP session (one would
+    # leak per boot otherwise). Header may be absent on stateless servers.
+    _hs_sid=$(printf '%s\n' "$_hs_resp" | tr -d '\r' | sed -n 's/^[Mm][Cc][Pp]-[Ss]ession-[Ii][Dd]: *//p' | head -n 1)
+    if [ -n "$_hs_sid" ]; then
+      curl -s -o /dev/null --max-time 2 -X DELETE {{{hindsightApiBaseUrlQ}}}/mcp/ \
+        -H "Mcp-Session-Id: $_hs_sid" 2>/dev/null || true
+    fi
+    HINDSIGHT_WAIT=$(( $(date +%s) - _hs_start ))
     break
   fi
   sleep 1
-  HINDSIGHT_WAIT=$((HINDSIGHT_WAIT + 1))
+  HINDSIGHT_WAIT=$(( $(date +%s) - _hs_start ))
 done
 if [ "$HINDSIGHT_READY" = "1" ]; then
   echo "start.sh: hindsight boot gate — MCP initialize OK after ${HINDSIGHT_WAIT}s" >&2
