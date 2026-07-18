@@ -855,13 +855,14 @@ const BACKFILL_RETRY_INTERVAL_MS = 3000
 
 /**
  * Fix #9a: cap on `terminatedAgentIds` (the re-discovery dedup guard in
- * `cleanupTerminalAgent` / `scanSubagentsDir`). Pre-fix the Set only grew
+ * `cleanupTerminalAgent` / `scanSubagentsDir`). Pre-fix the map only grew
  * (added on every terminal cleanup, only ever cleared wholesale in
  * `stop()`), so a long-lived gateway with sustained sub-agent throughput
- * accumulated ids without bound. A `Set` preserves insertion order, so once
+ * accumulated ids without bound. A `Map` preserves insertion order, so once
  * the cap is hit the OLDEST id is evicted on each new insert (simple ring
  * buffer semantics) — recently-terminated ids (the ones actually at risk of
- * a re-discovery race) always stay covered.
+ * a re-discovery race, or of a SendMessage resume — issue #3315) always stay
+ * covered.
  */
 const TERMINATED_AGENT_IDS_CAP = 5000
 
@@ -1861,18 +1862,26 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
   const historicalFiles = new Set<string>()
   /**
    * AgentIds that have transitioned to a terminal state and been swept
-   * out of `registry` by `cleanupTerminalAgent`. Issue #1116 (Bug B):
-   * the JSONL file outlives the registry entry — Claude Code leaves
-   * the file on disk after the sub-agent finishes. Without this guard,
-   * the next `rescanSubagentDirs` poll re-discovered the file, called
-   * `registerAgent`, the fresh entry read the terminal `turn_duration`
-   * line, and `maybySendStateTransition` fired a duplicate "Worker done"
-   * notification — looping forever every grace-window.
+   * out of `registry` by `cleanupTerminalAgent`, mapped to the JSONL byte
+   * SIZE at cleanup time. Issue #1116 (Bug B): the JSONL file outlives the
+   * registry entry — Claude Code leaves the file on disk after the sub-agent
+   * finishes. Without this guard, the next `rescanSubagentDirs` poll
+   * re-discovered the file, called `registerAgent`, the fresh entry read the
+   * terminal `turn_duration` line, and `maybySendStateTransition` fired a
+   * duplicate "Worker done" notification — looping forever every grace-window.
    *
-   * `scanSubagentsDir` consults this set and treats re-discovered
-   * terminal JSONLs as a no-op.
+   * Issue #3315 (SendMessage resume): a resumed sub-agent reuses the SAME
+   * `agent-<id>.jsonl`, appending a NEW turn to it — so the file's size grows
+   * PAST the size it had at terminal cleanup. `scanSubagentsDir` compares the
+   * live file size against this recorded terminal size: at/below it the JSONL
+   * is a static leftover and stays suppressed (#1116 Bug B); above it the
+   * worker resumed and is re-registered live (#3315) so its progress card
+   * updates again. Storing the size (not a bare membership flag) is what makes
+   * that distinction deterministic and lifecycle-driven rather than a
+   * heuristic. Map iteration order is insertion order, so the eviction ring
+   * buffer (Fix #9a) still evicts the oldest id.
    */
-  const terminatedAgentIds = new Set<string>()
+  const terminatedAgentIds = new Map<string, number>()
   /**
    * Issue #3023 (card resurrection). Per-worker record of a FALSE terminal
    * finish — a terminal state produced by silent-stall synthesis (NOT a real
@@ -1916,7 +1925,17 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
 
   // ─── Per-agent registration ─────────────────────────────────────────────
 
-  function registerAgent(filePath: string, agentId: string): void {
+  /**
+   * @param resumeFromCursor Issue #3315: when re-registering a worker whose
+   *   JSONL resumed growing after a terminal cleanup (a SendMessage resume),
+   *   start the tail cursor at the terminal byte boundary instead of 0. The
+   *   already-handed-back completed turn (its `sub_agent_turn_end` and all
+   *   prior events) is therefore never re-read — so the fresh entry stays
+   *   `running` on the NEW turn's content rather than instantly re-reading the
+   *   old terminal line and re-finalising. Omitted (⇒ 0) for every normal
+   *   registration, which reads from the start.
+   */
+  function registerAgent(filePath: string, agentId: string, resumeFromCursor?: number): void {
     if (registry.has(agentId)) return
     const n = nowFn()
     const isHistorical = historicalFiles.has(filePath)
@@ -1976,7 +1995,12 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
     }
 
     const tail: SubTail = {
-      cursor: 0, // read from start to capture description
+      // Normally read from the start (to replay the full transcript); on a
+      // resume re-registration (#3315) start at the terminal boundary so only
+      // the new turn is read. A resumed cursor sits on a JSONL newline boundary
+      // (the prior turn ended with a complete `turn_end` line), so no partial
+      // line is straddled.
+      cursor: resumeFromCursor ?? 0,
       pendingPartial: '',
       hasEmittedStart: false,
       watcher: null,
@@ -2274,24 +2298,42 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       try { tail.watcher.close() } catch { /* ignore */ }
       tail.watcher = null
     }
-    tails.delete(agentId)
     const entry = registry.get(agentId)
+    // Issue #3315: snapshot the JSONL byte size at cleanup so a later
+    // SendMessage-resume — which appends a NEW turn to the SAME
+    // agent-<id>.jsonl — is detected by `scanSubagentsDir` as growth PAST this
+    // size and re-registered. The on-disk stat is the source of truth (it
+    // captures any bytes that landed during the terminal-cleanup grace window,
+    // so only genuinely post-cleanup writes trip a resume); fall back to the
+    // tail cursor, then 0, when the file is unreadable.
+    let terminalSize = tail?.cursor ?? 0
+    if (entry?.filePath) {
+      try {
+        terminalSize = fs.statSync(entry.filePath).size
+      } catch { /* keep the cursor-based fallback */ }
+    }
+    tails.delete(agentId)
     if (entry?.filePath) {
       knownFiles.delete(entry.filePath)
     }
     registry.delete(agentId)
     // Issue #1116 (Bug B): record that this agent has been fully
-    // processed so a rescan that rediscovers the still-present JSONL
-    // doesn't re-register and re-notify.
+    // processed so a rescan that rediscovers the still-present (unchanged)
+    // JSONL doesn't re-register and re-notify. The recorded value is the
+    // terminal byte size (issue #3315): `scanSubagentsDir` keeps suppressing
+    // while the file stays at/below it, and re-registers once it grows past it
+    // (a resume).
     //
-    // Fix #9a: bound the Set so it can't grow unboundedly over a long-lived
-    // gateway — evict the oldest id once the cap is hit (Set iteration
-    // order is insertion order, so `.values().next().value` is the oldest).
+    // Fix #9a: bound the Map so it can't grow unboundedly over a long-lived
+    // gateway — evict the oldest id once the cap is hit (Map iteration
+    // order is insertion order, so the first key is the oldest). A re-set of
+    // an existing key updates its value without moving it, so a re-completed
+    // (resumed-then-finished-again) agent just refreshes its terminal size.
     if (!terminatedAgentIds.has(agentId) && terminatedAgentIds.size >= terminatedAgentIdsCap) {
-      const oldest = terminatedAgentIds.values().next().value
+      const oldest = terminatedAgentIds.keys().next().value
       if (oldest != null) terminatedAgentIds.delete(oldest)
     }
-    terminatedAgentIds.add(agentId)
+    terminatedAgentIds.set(agentId, terminalSize)
     log?.(`subagent-watcher: cleaned up terminal agent ${agentId}`)
     // Authoritative terminal sweep → notify the worker-activity feed so its row
     // for this agent is removed even on the paths that never fire `onFinish`
@@ -2865,11 +2907,52 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       const filePath = join(subagentsPath, e)
       if (knownFiles.has(filePath)) continue
       const agentId = e.slice('agent-'.length, -'.jsonl'.length)
-      // Issue #1116 (Bug B): skip JSONLs whose agent already completed
-      // and was swept by cleanupTerminalAgent. Re-adding to knownFiles
-      // here would let a subsequent rescan re-register, fire a duplicate
-      // "Worker done", and loop forever every grace-window.
-      if (terminatedAgentIds.has(agentId)) continue
+      // Issue #1116 (Bug B) + issue #3315 (SendMessage resume). A rediscovered
+      // JSONL whose agent already went terminal + was swept is normally a
+      // static leftover Claude Code left on disk — re-registering it would
+      // re-read the terminal turn and re-fire a duplicate handback, looping
+      // every grace-window (#1116). BUT a SendMessage resume appends a NEW turn
+      // to the SAME agent-<id>.jsonl, growing the file PAST the size it had at
+      // terminal cleanup. That growth is the deterministic, lifecycle-driven
+      // signal (not a heuristic) that the worker resumed and must be tracked
+      // again so its progress card resumes updating. Distinguish the two by the
+      // recorded terminal size.
+      const terminalSize = terminatedAgentIds.get(agentId)
+      if (terminalSize !== undefined) {
+        // A worker whose terminal state was a FALSE finish (silent-stall
+        // synthesis) is owned by the issue-#3023 resurrection path
+        // (`checkResurrections`), which carries the bounded-chain +
+        // `onResurrect`/`onWorkerLost` semantics and re-reads from cursor 0 to
+        // rebuild the still-in-progress turn. Skipping it here avoids
+        // double-handling the same growth in one poll; this branch's concern is
+        // GENUINE terminal completions (real `turn_end`, no false-finish record)
+        // that were resumed via SendMessage (issue #3315). A false finish that
+        // has since been evicted from `falseFinishTracker` (512-cap) is no
+        // longer double-handled, so falling through to re-register it live here
+        // is correct.
+        if (falseFinishTracker.has(agentId)) continue
+        let currentSize: number
+        try {
+          currentSize = fs.statSync(filePath).size
+        } catch {
+          continue // unreadable — nothing to resume; keep suppressing
+        }
+        // At/below the terminal snapshot ⇒ static leftover file (#1116 Bug B):
+        // stay suppressed, do NOT re-register.
+        if (currentSize <= terminalSize) continue
+        // Grew past it ⇒ the worker resumed (#3315). Re-register as a fresh
+        // LIVE worker, reading only from the terminal boundary so the
+        // already-completed turn is not replayed. At-most-once per resume:
+        // dropping the id from terminatedAgentIds means the next completion
+        // re-adds it with the new (larger) terminal size, so one resume yields
+        // exactly one re-registration.
+        log?.(`subagent-watcher: agent ${agentId} resumed after terminal cleanup — JSONL grew ${terminalSize} → ${currentSize} bytes (SendMessage resume); re-registering as live so its progress card resumes (issue #3315)`)
+        terminatedAgentIds.delete(agentId)
+        historicalFiles.delete(filePath)
+        knownFiles.add(filePath)
+        registerAgent(filePath, agentId, terminalSize)
+        continue
+      }
       knownFiles.add(filePath)
       // During the initial boot scan, mark every discovered file as
       // historical so stall-detection and completion notifications are
