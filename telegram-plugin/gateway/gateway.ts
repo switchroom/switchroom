@@ -895,6 +895,8 @@ import {
   type StatusQuerySurfaces,
 } from '../status-query-telemetry.js'
 
+const isGatewayMain = typeof process !== 'undefined' && process.argv[1] != null && (process.argv[1].endsWith('gateway.ts') || process.argv[1].endsWith('gateway.js'))  // #2996 P0c: true only when this module is the process entrypoint (prod `bun .../gateway.js`; under vitest argv[1] is the runner → false; mirrors streaming-report.ts). Every module-load side effect below is guarded by it; the boot sequence is the guarded startGateway() at the bottom, so an import() fires nothing.
+
 // ─── Stderr logging ───────────────────────────────────────────────────────
 // Install the line-stamper FIRST so it wraps closest to the original
 // stderr.write. plugin-logger's file mirror then sees the timestamped text.
@@ -1636,7 +1638,7 @@ function pruneExpired(a: Access): boolean {
 // ─── History ──────────────────────────────────────────────────────────────
 const HISTORY_ACCESS = loadAccess()
 const HISTORY_ENABLED = HISTORY_ACCESS.historyEnabled !== false
-if (HISTORY_ENABLED) {
+if (isGatewayMain && HISTORY_ENABLED) {  // #2996 P0c: gated — initHistory opens bun:sqlite
   try {
     initHistory(STATE_DIR, HISTORY_ACCESS.historyRetentionDays ?? 30)
     process.stderr.write(`telegram gateway: history capture enabled at ${join(STATE_DIR, 'history.db')}\n`)
@@ -1676,7 +1678,7 @@ let pendingRedelivery: { turn: Turn; maxAgeMs: number } | null = null
 // boots (the consumed marker's `count`; 0 when no fresh marker). Set in
 // the boot block below, consumed by the watchdog constructor further down.
 let bridgeDeadPriorStreak = 0
-try {
+if (isGatewayMain) try {  // #2996 P0c: gated — opens bun:sqlite + writes .pending-turn.env
   // STATE_DIR is `<agentDir>/telegram` in production. openTurnsDb expects
   // the parent (agent dir) and joins `telegram/registry.db` itself.
   const agentDir = STATE_DIR.endsWith('/telegram')
@@ -2205,11 +2207,11 @@ function runHistoryReaperNow(reason: 'boot' | 'periodic'): void {
     }
   }
 }
-// Run once at boot to catch up long-stopped agents.
-runHistoryReaperNow('boot')
+// Run once at boot to catch up long-stopped agents. (#2996 P0c: gated.)
+if (isGatewayMain) runHistoryReaperNow('boot')
 // Then every 6h. unref() so the interval doesn't keep the process alive
 // past shutdown.
-if (!STATIC) {
+if (isGatewayMain && !STATIC) {
   setInterval(() => runHistoryReaperNow('periodic'), REGISTRY_REAPER_INTERVAL_MS).unref()
 }
 
@@ -2229,12 +2231,12 @@ function checkApprovals(): void {
     )
   }
 }
-if (!STATIC) setInterval(checkApprovals, 5000).unref()
+if (isGatewayMain && !STATIC) setInterval(checkApprovals, 5000).unref()
 // Idle auto-clear: check wall-clock idle every minute; maybeIdleClear no-ops
 // when disabled ('0s'), mid-turn, or already cleared this idle period. The
 // `let` state + maybeIdleClear are hoisted/initialized before this fires.
 const IDLE_CLEAR_CHECK_MS = Number(process.env.SWITCHROOM_IDLE_CLEAR_CHECK_MS ?? 60_000)
-if (!STATIC && IDLE_CLEAR_CHECK_MS > 0) setInterval(maybeIdleClear, IDLE_CLEAR_CHECK_MS).unref()
+if (isGatewayMain && !STATIC && IDLE_CLEAR_CHECK_MS > 0) setInterval(maybeIdleClear, IDLE_CLEAR_CHECK_MS).unref()
 
 // ─── Thread / status / stream state ───────────────────────────────────────
 const chatThreadMap = new Map<string, number>()
@@ -2771,7 +2773,7 @@ const obligationLedger = new ObligationLedger(OBLIGATION_REPRESENT_MAX, {
       ? undefined
       : (snapshot) => persistObligations(OBLIGATION_STORE_PATH, obligationStoreFs, snapshot),
 })
-if (!STATIC && OBLIGATION_LEDGER_ENABLED) {
+if (isGatewayMain && !STATIC && OBLIGATION_LEDGER_ENABLED) {
   // Restart-durability: re-open obligations that were OPEN/ESCALATING when the
   // gateway last ran. The very next idle sweep re-presents or re-escalates them.
   const restored = loadObligations(OBLIGATION_STORE_PATH, obligationStoreFs)
@@ -6179,7 +6181,7 @@ const floodWindowObserver = createFloodWindowObserver({
     )
   },
 })
-if (sendGateConfig.enabled) {
+if (isGatewayMain && sendGateConfig.enabled) {
   const observeTimer = setInterval(() => {
     try {
       sendGateStatsLogger.tick()
@@ -7766,7 +7768,7 @@ function sweepHeldPermissionCards(): void {
 }
 
 // 60-second sweep drops anything past its documented TTL.
-const pendingStateReaper = setInterval(() => {
+const pendingStateReaper = isGatewayMain ? setInterval(() => {  // #2996 P0c gate
   const now = Date.now()
   // #3084 follow-up — bring held cards BACK the moment the channel reopens.
   // Runs before the TTL sweep below so a card that can be re-delivered on this
@@ -8034,8 +8036,8 @@ const pendingStateReaper = setInterval(() => {
     )
     void drainPendingSessionCommand()
   }
-}, 60_000)
-pendingStateReaper.unref()
+}, 60_000) : undefined
+pendingStateReaper?.unref()
 
 /**
  * Does a message look like a Claude setup-token browser code?
@@ -9319,10 +9321,10 @@ async function runMidSessionCardReaper(): Promise<void> {
   }
 }
 
-const midSessionCardReaper = setInterval(() => {
+const midSessionCardReaper = isGatewayMain ? setInterval(() => {  // #2996 P0c gate
   void runMidSessionCardReaper()
-}, MID_SESSION_CARD_REAPER_INTERVAL_MS)
-midSessionCardReaper.unref()
+}, MID_SESSION_CARD_REAPER_INTERVAL_MS) : undefined
+midSessionCardReaper?.unref()
 
 // NOTE: statusPinBootCleanup() is deliberately NOT invoked here at import time.
 // The status-pin store is a SHARED per-agent file, and cleanup issues real
@@ -9605,8 +9607,8 @@ let workerActivityFeed: ReturnType<typeof createWorkerActivityFeed> | null = nul
 
 // ─── IPC server ───────────────────────────────────────────────────────────
 const SOCKET_PATH = process.env.SWITCHROOM_GATEWAY_SOCKET ?? join(STATE_DIR, 'gateway.sock')
-// Ensure the directory for the socket exists
-mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+// Ensure the directory for the socket exists (#2996 P0c: gated — disk write).
+if (isGatewayMain) mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
 
 // PID file + session marker. See pid-file.ts and session-marker.ts for
 // the 2026-04-22 incident that motivates these. The PID file lets the
@@ -9700,7 +9702,7 @@ function ensureIssuesCard(chatId: string, threadId: number | undefined): void {
 //
 // We use top-level await so the mutex resolves BEFORE any other module
 // code runs (in particular before the bot.start IIFE further down).
-{
+if (isGatewayMain) {  // #2996 P0c: gated in place; guarded await never runs on import
   const SWITCHROOM_AGENT_NAME = process.env.SWITCHROOM_AGENT_NAME ?? '-'
   try {
     const outcome = await acquireStartupLock({
@@ -9924,7 +9926,7 @@ function parseKeyForSurvival(key: string): { chatId: string } {
   return { chatId: idx < 0 ? key : key.slice(0, idx) }
 }
 
-silencePoke.startTimer({
+if (isGatewayMain) silencePoke.startTimer({
   thresholdsMs: { fallback: SILENCE_FALLBACK_MS, fallbackHardCeiling: SILENCE_FALLBACK_HARD_MS, floor: SILENCE_FLOOR_MS },
   deferFallbackWhileToolInFlight: SILENCE_DEFER_INFLIGHT_TOOLS,
   isLegitimatelyWorking: (key) => isLegitimatelyWorking(key),
@@ -10325,10 +10327,10 @@ silencePoke.startTimer({
 // imperative silence-poke still owns the user-facing ping), so there
 // is no double-poke. unref so the interval never holds the process.
 const DELIVERY_MACHINE_TICK_MS = 30_000
-const _deliveryMachineTick = setInterval(() => {
+const _deliveryMachineTick = isGatewayMain ? setInterval(() => {  // #2996 P0c gate
   shadowEmit({ kind: 'tick', now: Date.now() })
-}, DELIVERY_MACHINE_TICK_MS)
-_deliveryMachineTick.unref?.()
+}, DELIVERY_MACHINE_TICK_MS) : undefined
+_deliveryMachineTick?.unref?.()
 
 // Enrol a buffer-redelivered inbound in the deliver-until-acked queue so the
 // existing sweep re-delivers it until claude's `enqueue` ack lands. Wired into
@@ -10457,7 +10459,7 @@ function sweepSuspendedTargets(): { keys: Set<string>; chats: Set<string> } {
   return { keys, chats }
 }
 
-const _deliveryConfirmSweep = setInterval(() => {
+const _deliveryConfirmSweep = isGatewayMain ? setInterval(() => {  // #2996 P0c gate
   if (!DELIVERY_CONFIRM_ENABLED) return
   // Re-deliver ONLY when claude is genuinely idle. `currentTurn` is set solely
   // by the enqueue session-event and nulled at turn-end, so `currentTurn != null`
@@ -10478,8 +10480,8 @@ const _deliveryConfirmSweep = setInterval(() => {
     if (isRedeliverySuspended(p.key, suspended)) continue
     void redeliverStrandedInbound(p)
   }
-}, DELIVERY_CONFIRM_SWEEP_MS)
-_deliveryConfirmSweep.unref?.()
+}, DELIVERY_CONFIRM_SWEEP_MS) : undefined
+_deliveryConfirmSweep?.unref?.()
 
 // #1445 cross-turn pending-async ambient. When a turn ends after the
 // model dispatched background async work (Agent / Task / Bash run-in-
@@ -10490,7 +10492,7 @@ _deliveryConfirmSweep.unref?.()
 // model synthesises a handback. The full design rationale lives in
 // `pending-work-progress.ts`'s header docblock. Kill switch:
 // `SWITCHROOM_DISABLE_PENDING_PROGRESS=1`.
-pendingProgress.startTimer({
+if (isGatewayMain) pendingProgress.startTimer({
   editMessage: async (ctx) => {
     // #2669: re-edit via the SAME shape the anchor was sent with. A rich
     // anchor (the reply tool's default) re-edits via the rich-markdown
@@ -11223,7 +11225,7 @@ function obligationSweep(): void {
     deadlineMs: OBLIGATION_ESCALATE_SEND_DEADLINE_MS,
   })
 }
-if (!STATIC && OBLIGATION_LEDGER_ENABLED) {
+if (isGatewayMain && !STATIC && OBLIGATION_LEDGER_ENABLED) {
   setInterval(obligationSweep, OBLIGATION_SWEEP_MS).unref()
 }
 
@@ -11235,7 +11237,7 @@ if (!STATIC && OBLIGATION_LEDGER_ENABLED) {
 // and it hasn't been delivered yet — so a multi-restart sequence resumes a
 // given turn once, not N times. When there's no spool (STATIC mode) push
 // straight to the in-memory buffer.
-if (bootResumeInbound != null) {
+if (isGatewayMain && bootResumeInbound != null) {
   if (inboundSpool != null) {
     inboundSpool.put(bootResumeInbound.agent, bootResumeInbound.msg)
   } else {
@@ -11267,7 +11269,7 @@ if (bootResumeInbound != null) {
 // spool.put dedups on the already-live id, so this re-push does NOT
 // double-append. This is what makes a queued message survive a
 // restart instead of being silently lost.
-if (inboundSpool != null) {
+if (isGatewayMain && inboundSpool != null) {
   const replay = inboundSpool.liveEntries()
   for (const e of replay) pendingInboundBuffer.push(e.agent, e.msg)
   if (replay.length > 0) {
@@ -11480,7 +11482,7 @@ const bridgeDeadWatchdog = createBridgeDeadWatchdog({
   // "any named non-cron client" test inside the watchdog.
   selfAgentName: process.env.SWITCHROOM_AGENT_NAME ?? '',
 })
-if (BRIDGE_DEAD_ESCALATION_ENABLED) {
+if (isGatewayMain && BRIDGE_DEAD_ESCALATION_ENABLED) {
   bridgeDeadWatchdog.arm()
   process.stderr.write(
     `telegram gateway: [bridge-dead-watchdog] armed (grace=${BRIDGE_DEAD_GRACE_MS}ms)\n`,
@@ -12860,7 +12862,7 @@ const ipcServer: IpcServer = createIpcServer({
 // peercred-gated UDS; this gateway (agent UID) owns the jsonl append,
 // dedup, and dispatch firing. Wrapped so any failure is best-effort and can
 // NEVER crash gateway boot (which would take the agent down).
-;(() => {
+if (isGatewayMain) (() => {  // #2996 P0c: gated — starts webhook-ingest UDS server
   try {
     const selfAgent = process.env.SWITCHROOM_AGENT_NAME ?? ''
     if (!selfAgent) return
@@ -12961,7 +12963,7 @@ const ipcServer: IpcServer = createIpcServer({
 // reuse the #1546 `redeliverBufferedInbound` (lossless: re-buffers any
 // per-message miss).
 const IDLE_DRAIN_INTERVAL_MS = 5000
-if (!STATIC) {
+if (isGatewayMain && !STATIC) {
   setInterval(() => {
     const selfAgent = process.env.SWITCHROOM_AGENT_NAME ?? ''
     const r = idleDrainTick(
@@ -13362,7 +13364,7 @@ function sweepVoiceCache(): void {
   }
 }
 
-if (!STATIC) {
+if (isGatewayMain && !STATIC) {
   sweepVoiceCache() // boot sweep — covers a died timer / long downtime
   setInterval(sweepVoiceCache, VOICE_SWEEP_INTERVAL_MS).unref()
 }
@@ -17283,7 +17285,7 @@ function feedHeartbeatTick(): void {
   }
   })
 }
-if (!STATIC && FEED_HEARTBEAT_ENABLED) {
+if (isGatewayMain && !STATIC && FEED_HEARTBEAT_ENABLED) {
   setInterval(feedHeartbeatTick, FEED_HEARTBEAT_TICK_MS).unref()
 }
 
@@ -30022,7 +30024,7 @@ async function shutdown(signal: string): Promise<void> {
   // any timer-driven flushes during drain still call into handleInbound
   // (which itself short-circuits when shuttingDown is true).
 
-  clearInterval(pendingStateReaper)
+  if (pendingStateReaper) clearInterval(pendingStateReaper)
   vaultPassphraseCache.clear()
 
   // #1067: orphaned-reply timeout now lives on the per-turn atom.
@@ -30186,7 +30188,7 @@ const POLL_HEALTH_THRESHOLD = Number(
 )
 
 let pollHealthCheck: PollHealthCheckHandle | null = null
-if (POLL_HEALTH_INTERVAL_MS > 0) {
+if (isGatewayMain && POLL_HEALTH_INTERVAL_MS > 0) {  // #2996 P0c: gated (probe timer)
   pollHealthCheck = createPollHealthCheck({
     ping: async () => {
       await bot.api.getMe()
@@ -30376,7 +30378,7 @@ async function initGatewayBot(): Promise<void> {
 // grammY 409 retry loop).
 let didOneTimeSetup = false
 
-void (async () => {
+async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now invoked once at the bottom only under isGatewayMain; body byte-identical to the pre-P0c IIFE
   // #2996 P0b: construct the bot + install the registration surface FIRST,
   // before vault-posture init and the runner. Keeps failure modes in pre-P0b
   // order: token refusal (exit 1) precedes the vault-posture refusal (exit 78).
@@ -32156,4 +32158,6 @@ void (async () => {
       process.exit(1)
     }
   }
-})()
+}
+
+if (isGatewayMain) void startGateway()  // #2996 P0c: the single, guarded boot invocation
