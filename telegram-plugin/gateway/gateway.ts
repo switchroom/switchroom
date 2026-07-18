@@ -666,8 +666,6 @@ import { shadowEmit, isMachineInTurn } from './inbound-delivery-machine-shadow.j
 import type { ChatKey as _ChatKey } from './inbound-delivery-machine.js'
 import { dispatchEffects } from './inbound-delivery-machine-dispatch.js'
 import { maybeFireWarmup } from './prefix-warmup.js'
-import { renderMentalModelProposeCard, buildMentalModelProposeKeyboard } from './mental-model-propose-card.js'
-import { readDeclaredMentalModelNames } from './mental-model-propose-diff.js'
 import {
   renderSkillProposalCard,
   skillProposalKeyboard,
@@ -12811,7 +12809,7 @@ async function executeToolCall(tool: string, args: Record<string, unknown>): Pro
     case 'request_secret':
       return cardToolHandlers.executeRequestSecret(args)
     case 'mental_model_propose':
-      return executeMentalModelPropose(args)
+      return cardToolHandlers.executeMentalModelPropose(args)
     case 'linear_agent_activity':
       return executeLinearAgentActivity(args)
     case 'linear_create_issue':
@@ -13941,176 +13939,15 @@ function readLiveSwitchroomConfigText(): string {
   return readFileSync(cfgPath, 'utf8')
 }
 
-const MENTAL_MODEL_NAME_REGEX = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/
-
-/**
- * `mental_model_propose` tool (hindsight Phase 5) — the agent surfaces a
- * candidate mental model for the operator to approve. Mirrors the
- * `vault_request_access` shape: the agent can only PROPOSE; the [Approve]/[Deny]
- * tap is operator-gated (handleMentalModelProposeCallback), so an agent can
- * never self-approve. On Approve the proposal is DECLARED — appended to the
- * agent's memory.mental_models[] via the operator-approved config-edit path
- * (reusing config_propose_edit apply+reconcile) — and ensured in the bank. On
- * Deny nothing is written. Guardrails enforced here BEFORE any card:
- * duplicate-name rejection against the agent's already-declared models, and a
- * per-agent rate limit so proposals stay non-spammy.
- */
-async function executeMentalModelPropose(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
-  const chat_id = String(args.chat_id ?? '')
-  if (!chat_id) throw new Error('mental_model_propose: chat_id is required')
-  const name = typeof args.name === 'string' ? args.name.trim() : ''
-  if (!name) throw new Error('mental_model_propose: name is required')
-  if (!MENTAL_MODEL_NAME_REGEX.test(name)) {
-    throw new Error('mental_model_propose: name must be a slug (letters/digits/_/-, ≤64 chars, e.g. `training-plan-state`)')
-  }
-  const source_query = typeof args.source_query === 'string' ? args.source_query.trim() : ''
-  if (!source_query) throw new Error('mental_model_propose: source_query is required')
-  // Enforce the memory.mental_models[] schema cap (src/config/schema.ts) up-front
-  // so the operator never approves a card that then fails hostd config validation.
-  // The 2000-char ceiling also keeps the rendered card under Telegram's 4096-char
-  // message limit.
-  if (source_query.length > MENTAL_MODEL_SOURCE_QUERY_MAX) {
-    throw new Error(
-      `mental_model_propose: source_query is ${source_query.length} chars; the schema caps it at ${MENTAL_MODEL_SOURCE_QUERY_MAX} (a standing reflection query, not a document). Shorten it.`,
-    )
-  }
-  // Accept `why` as an alias for `reason` (mirrors the vault tools).
-  const reason =
-    typeof args.reason === 'string' ? args.reason : typeof args.why === 'string' ? args.why : undefined
-  let refresh_after_consolidation: boolean | undefined
-  if (args.refresh_after_consolidation !== undefined) {
-    if (typeof args.refresh_after_consolidation !== 'boolean') {
-      throw new Error('mental_model_propose: refresh_after_consolidation must be a boolean')
-    }
-    refresh_after_consolidation = args.refresh_after_consolidation
-  }
-  let max_tokens: number | undefined
-  if (args.max_tokens !== undefined) {
-    const n = Number(args.max_tokens)
-    if (!Number.isInteger(n) || n <= 0) {
-      throw new Error('mental_model_propose: max_tokens must be a positive integer')
-    }
-    // Enforce the schema ceiling (src/config/schema.ts) here so the card can't be
-    // approved into a config-validation failure downstream.
-    if (n > MENTAL_MODEL_MAX_TOKENS_CAP) {
-      throw new Error(
-        `mental_model_propose: max_tokens ${n} exceeds the schema cap of ${MENTAL_MODEL_MAX_TOKENS_CAP} (a mental model is a standing summary, not a corpus).`,
-      )
-    }
-    max_tokens = n
-  }
-  assertAllowedChat(chat_id)
-
-  const agentSlug = process.env.SWITCHROOM_AGENT_NAME || 'agent'
-
-  // Rate limit: a proposal is a rare, deliberate curation act — throttle so a
-  // looping agent can never spam the operator with cards.
-  const rate = checkMentalModelProposeRate()
-  if (!rate.ok) {
-    const retryAtIso = new Date(rate.retryAtMs).toISOString()
-    return {
-      content: [
-        {
-          type: 'text',
-          text:
-            `mental_model_propose: RATE-LIMITED (max ${MENTAL_MODEL_PROPOSE_MAX_PER_WINDOW} proposals/hour). ` +
-            `No card was posted. Next slot opens at ${retryAtIso}. Proposing mental models is meant to be ` +
-            `rare — batch or wait rather than re-firing.`,
-        },
-      ],
-    }
-  }
-
-  // Duplicate-name guard: reject a proposal for a model already DECLARED for
-  // this agent, BEFORE posting a card (the name is the idempotent-ensure key).
-  try {
-    const configText = readLiveSwitchroomConfigText()
-    const declared = readDeclaredMentalModelNames(configText, agentSlug)
-    if (declared.includes(name)) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text:
-              `mental_model_propose: '${name}' is ALREADY a declared mental model for ${agentSlug} ` +
-              `(memory.mental_models[]). No card was posted — it already exists and is ensured in your ` +
-              `bank. Pick a different name if you meant a NEW model, or just use the existing one.`,
-          },
-        ],
-      }
-    }
-  } catch (err) {
-    // Config read failed (transient) — fall through to the card. The approve
-    // path re-reads and re-checks (dupe guard is defense-in-depth), so a
-    // redundant card is harmless; suppressing a needed card is not.
-    process.stderr.write(`telegram gateway: mental_model_propose dup pre-check read failed: ${(err as Error).message}\n`)
-  }
-
-  const stageId = randomBytes(4).toString('hex')
-  const pending: PendingMentalModelPropose = {
-    agent: agentSlug,
-    chat_id,
-    spec: {
-      name,
-      source_query,
-      ...(refresh_after_consolidation !== undefined ? { refresh_after_consolidation } : {}),
-      ...(max_tokens !== undefined ? { max_tokens } : {}),
-    },
-    ...(reason ? { reason } : {}),
-    staged_at: Date.now(),
-  }
-  pendingMentalModelProposes.set(stageId, pending)
-  pendingMentalModelProposes.sweep(Date.now())
-
-  const text = renderMentalModelProposeCard({
-    agent: agentSlug,
-    name,
-    source_query,
-    ...(reason ? { reason } : {}),
-    ...(refresh_after_consolidation !== undefined ? { refresh_after_consolidation } : {}),
-  })
-  const threadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
-  if (threadId != null) pending.threadId = threadId
-  const sent = await retryWithThreadFallback<{ message_id: number }>(
-    robustApiCall,
-    (tid) =>
-      lockedBot.api.sendRichMessage(chat_id, richMessage(text), {
-        reply_markup: buildMentalModelProposeKeyboard(stageId),
-        ...(tid != null && Number.isFinite(tid) ? { message_thread_id: tid } : {}),
-      }),
-    { threadId, chat_id, verb: 'mental_model_propose.card' },
-  )
-  pending.card_message_id = sent.message_id
-  // Persist card metadata (the proposed DECLARATION is not secret material) so
-  // a gateway restart doesn't strand the parked agent.
-  pendingCardStore.add({
-    family: 'mental_model_propose',
-    stageId,
-    agent: pending.agent,
-    chatId: pending.chat_id,
-    ...(pending.card_message_id != null ? { cardMessageId: pending.card_message_id } : {}),
-    ...(pending.threadId != null ? { threadId: pending.threadId } : {}),
-    spec: pending.spec,
-    ...(pending.reason != null ? { reason: pending.reason } : {}),
-    stagedAt: pending.staged_at,
-  })
-  // Only count a proposal against the rate budget once its card actually
-  // posted (validation errors / dupes don't consume the budget).
-  mentalModelProposeTimes.push(Date.now())
-
-  return {
-    content: [
-      {
-        type: 'text',
-        text:
-          `mental_model_propose: card sent (stage_id=${stageId}, name=${name}). Wait for the operator to tap ` +
-          `Approve or Deny — END YOUR TURN cleanly. A fresh inbound arrives with the outcome ` +
-          `(source=mental_model_proposal_applied / mental_model_proposal_denied). Do NOT re-propose this ` +
-          `model while the card is open.`,
-      },
-    ],
-  }
-}
+// executeMentalModelPropose (and its MENTAL_MODEL_NAME_REGEX, whose only user
+// it was) moved verbatim to card-tool-handlers.ts (#2996 P5-tail) — invoked as
+// cardToolHandlers.executeMentalModelPropose(args) from the tool dispatcher.
+// Its store (pendingMentalModelProposes), the rate limiter
+// (checkMentalModelProposeRate + mentalModelProposeTimes[]), the schema caps
+// (MENTAL_MODEL_SOURCE_QUERY_MAX / MENTAL_MODEL_MAX_TOKENS_CAP /
+// MENTAL_MODEL_PROPOSE_MAX_PER_WINDOW), and readLiveSwitchroomConfigText stay
+// here and are injected; expiry (expireMentalModelProposeCard) and boot restore
+// (restorePendingApprovalCards) stay here untouched.
 
 async function executeReact(args: Record<string, unknown>): Promise<unknown> {
   if (!args.chat_id) throw new Error('react: chat_id is required')
@@ -25693,6 +25530,13 @@ async function initGatewayBot(): Promise<void> {
     sweepSecretRequests,
     listViaBroker,
     VAULT_REQUEST_ACCESS_TTL_MS,
+    pendingMentalModelProposes,
+    mentalModelProposeTimes,
+    checkMentalModelProposeRate,
+    readLiveSwitchroomConfigText,
+    MENTAL_MODEL_SOURCE_QUERY_MAX,
+    MENTAL_MODEL_MAX_TOKENS_CAP,
+    MENTAL_MODEL_PROPOSE_MAX_PER_WINDOW,
   })
 
   // Install the grammY registration surface (P0a) — once, before the runner.

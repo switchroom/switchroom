@@ -76,7 +76,8 @@ describe('staging persists card metadata (Defect A)', () => {
   })
 
   it('mental_model_propose stages into the durable store', () => {
-    const fn = slice(GATEWAY, 'async function executeMentalModelPropose', 6000)
+    // 7000: the factory indent puts the add block ~6.1k chars past the def.
+    const fn = slice(CARD_TOOL, 'async function executeMentalModelPropose', 7000)
     expect(fn).toMatch(/pendingCardStore\.add\(\{[\s\S]*family: 'mental_model_propose'/)
   })
 
