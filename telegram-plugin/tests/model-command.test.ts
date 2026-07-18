@@ -449,6 +449,12 @@ describe("SR_MODEL_ALIASES / expandSrAlias", () => {
     expect(expandSrAlias("kimi")).toBe("sr-kimi-k3");
     expect(expandSrAlias("gpt")).toBe("sr-gpt-5.6-sol");
   });
+  it("per-tier GPT-5.6 buttons sol/terra/luna expand to their sr-* ids", () => {
+    expect(expandSrAlias("sol")).toBe("sr-gpt-5.6-sol");
+    expect(expandSrAlias("terra")).toBe("sr-gpt-5.6-terra");
+    expect(expandSrAlias("luna")).toBe("sr-gpt-5.6-luna");
+    for (const a of ["sol", "terra", "luna"]) expect(isOfflineTrustedModelToken(a)).toBe(true);
+  });
   it("new flagship buttons are offline-trustable carriers (#3042 gate)", () => {
     for (const a of ["grok", "kimi", "gpt"]) expect(isOfflineTrustedModelToken(a)).toBe(true);
     for (const id of ["sr-grok-4.5", "sr-kimi-k3", "sr-gpt-5.6-sol"])
