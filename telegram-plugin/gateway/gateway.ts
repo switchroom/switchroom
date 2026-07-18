@@ -30,7 +30,6 @@ import {
   validateAskUserArgs,
   generateAskId,
   encodeAskCallback,
-  decodeAskCallback,
   type AskUserArgs,
   type AskUserOutcome,
 } from '../ask-user.js'
@@ -146,6 +145,7 @@ import {
 } from './checklist-message-handler.js'
 import { registerStartInfoCommands } from './bot-commands-start-info.js'
 import { registerModelEffortCommands } from './bot-commands-model-effort.js'
+import { handleAskCallback, type AskCallbackDeps } from './ask-callback-handler.js'
 import { fmtLocalStamp, resolveEnvTimezone, renderLogTimestampsLocal } from '../shared/local-time.js'
 import { StatusReactionController } from '../status-reactions.js'
 import { DeferredDoneReactions } from '../reaction-defer.js'
@@ -23577,62 +23577,10 @@ bot.on('callback_query:data', async ctx => {
     return
   }
 
-  // ask_user callback (#574). aq:<idx>:<askId>. Same authorization
-  // gate as permission buttons — only allowFrom users can answer.
-  // Tapped option resolves the originating ask_user tool call's
-  // deferred promise; the agent receives { kind: 'answered',
-  // choice, idx } as the tool result and continues.
-  const askMatch = decodeAskCallback(data)
-  if (askMatch != null) {
-    const accessCheck = loadAccess()
-    const senderId = String(ctx.from.id)
-    if (!accessCheck.allowFrom.includes(senderId)) {
-      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
-      return
-    }
-    const entry = pendingAskUser.get(askMatch.askId)
-    if (entry == null) {
-      // Stale tap — TTL fired, prompt was cancelled, or chat closed
-      // before the user got back to it. Acknowledge politely so the
-      // user doesn't see the spinner stick.
-      await ctx.answerCallbackQuery({ text: 'This question expired.' }).catch(() => {})
-      return
-    }
-    if (askMatch.idx >= entry.options.length) {
-      // Encoded an out-of-bounds index — should be impossible from
-      // our own encoding, but defend against a hostile callback.
-      await ctx.answerCallbackQuery({ text: 'Invalid option.' }).catch(() => {})
-      return
-    }
-    const choice = entry.options[askMatch.idx]
-    clearTimeout(entry.timer)
-    pendingAskUser.delete(askMatch.askId)
-    entry.resolve({ kind: 'answered', choice, idx: askMatch.idx })
-
-    // Edit the question in place to remove the buttons + show the
-    // chosen option as a checkmarked line. Makes the chat surface
-    // self-documenting — no orphaned-buttons graveyard.
-    //
-    // Escape `sourceMsg.text` before re-rendering with HTML parse
-    // mode. `msg.text` returns entities-stripped plain UTF-8; an
-    // agent-supplied `ask_user` question containing raw `<`/`>`/`&`
-    // (common in code-related questions like "Run `<command>`?")
-    // would crash the HTML re-parse, the try/catch would swallow,
-    // and the button keyboard would stay tappable — the exact bug
-    // PR #1158 caught on the operator-event card.
-    const sourceMsg = ctx.callbackQuery?.message
-    if (sourceMsg && 'text' in sourceMsg && sourceMsg.text != null) {
-      try {
-        await ctx.editMessageText(
-          richMessage(`${escapeHtmlForTg(sourceMsg.text)}\n\n✅ **${escapeHtmlForTg(choice)}**`),
-        )
-      } catch {
-        /* edit-failed is fine — the answer-callback below still acks */
-      }
-    }
-    await ctx.answerCallbackQuery({ text: '✅ ' + choice.slice(0, 60) }).catch(() => {})
-    return
-  }
+  // ask_user callback (#574, `aq:<idx>:<askId>`) — extracted to
+  // ask-callback-handler.ts (switchroom#2996 P6 dispatcher drain). Returns
+  // true when handled (dispatcher stops), false to fall through.
+  if (await handleAskCallback(ctx, data, askCallbackDeps)) return
 
   // on-demand voice: '🔊 Listen' buttons carry a reserved `voice:<token>`
   // callback_data. Handle INTERNALLY here — synthesize the cached reply text
@@ -24519,6 +24467,12 @@ const checklistHandlerDeps: ChecklistHandlerDeps = {
     ipcServer.broadcast(inboundMsg)
   },
   log: line => process.stderr.write(line),
+}
+// Injected surface for the extracted ask_user option-callback family
+// (switchroom#2996 P6 dispatcher drain). The pending store is injected live.
+const askCallbackDeps: AskCallbackDeps = {
+  loadAccess,
+  pendingAskUser,
 }
 bot.on('message:contact', ctx => handleContactMessage(ctx, mediaEnvelopeDeps))
 bot.on('message:location', ctx => handleLocationMessage(ctx, mediaEnvelopeDeps))
