@@ -216,7 +216,7 @@ import {
   retryWithThreadFallback,
   isFloodWaitActiveError,
 } from '../retry-api-call.js'
-import { createSendGate, sendGateConfigFromEnv } from '../send-gate.js'
+import { createSendGate, sendGateConfigFromEnv, isSendGateShed } from '../send-gate.js'
 import { createStatsLogger, createFloodWindowObserver } from '../send-gate-observability.js'
 import { installTgPostLogger, withTgPostTags } from '../shared/bot-runtime.js'
 import {
@@ -369,6 +369,7 @@ import {
   sendReplyChunks,
   sendReply,
   deliverCapturedProse as deliverCapturedProseCore,
+  createBackstopReadBack,
   type ReplyChunkSendDeps,
   type SendReplyGatewayDeps,
   type DeliverCapturedProseDeps,
@@ -2408,6 +2409,24 @@ async function deliverAnswer(args: {
     return chunkIds
   }
 
+  // #3278 read-back confirmation. A returned message_id proves Telegram
+  // ACCEPTED a send, not that the message is VISIBLE — a server-side
+  // accept-then-silently-discard (flood/anti-spam) returns a fresh id yet the
+  // user sees nothing. `createBackstopReadBack` re-confirms each landed chunk
+  // via a no-op editMessageText before it counts as delivered; it is paced
+  // COSMETIC through the send gate (sheds under a flood window → ambiguous,
+  // never a re-send) and scoped to this RARE backstop path — the hot reply-tool
+  // path issues ZERO probes (#3278 §1.3/§1.5).
+  const readBack = createBackstopReadBack({
+    // allow-raw-bot-api: #3278 read-back probe — no-op editMessageText, paced by the injected sendGate.gate (cosmetic) and classified by classifyReadBackError; a gate shed / any throw → ambiguous (never re-send)
+    editMessageText: (mid, body, apiOpts) => bot.api.editMessageText(chatId, mid, body as never, apiOpts as never),
+    gate: (fn, opts) => sendGate.gate(fn, opts),
+    isShed: isSendGateShed,
+    richMessage,
+    chatId,
+    threadId: args.threadId,
+  })
+
   // Bounded in-turn retry (finding-1 fix): resumes at the first unsent chunk on
   // each attempt via the ledger, so chunk 0 is delivered exactly once even
   // across retries. `delivered`/`exhausted` tell the caller whether the answer
@@ -2420,6 +2439,7 @@ async function deliverAnswer(args: {
     args.cardMessageId,
     {
       sendChunk,
+      readBack,
       recordOutbound: HISTORY_ENABLED
         ? (messageIds, texts) => {
             try {

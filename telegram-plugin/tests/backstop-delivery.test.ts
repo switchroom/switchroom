@@ -5,6 +5,8 @@ import {
   backstopReceiptIds,
   backstopDelivered,
   runBackstopDelivery,
+  combineReadBackResults,
+  type ReadBackResult,
 } from '../gateway/backstop-delivery.js'
 import {
   backstopSendOutcomeGated,
@@ -246,5 +248,170 @@ describe('runBackstopDelivery — integration oracle over the delivery wiring', 
     expect(recorded[0].ids).toEqual([10, 11, 12])
     expect(recorded[0].texts).toEqual(['A', 'B', 'B'])
     expect(recorded[0].ids).toHaveLength(recorded[0].texts.length)
+  })
+})
+
+/**
+ * #3278 — read-back confirmation of an accepted-but-dropped send.
+ *
+ * A returned message_id proves Telegram ACCEPTED the send, not that the message
+ * is VISIBLE (a flood/anti-spam silent discard returns a fresh id yet the user
+ * sees nothing). These assert the deterministic OUTCOMES of the per-chunk state
+ * machine `unsent → pending → landed-unconfirmed → {landed-confirmed | unsent}`
+ * driven by a no-op editMessageText read-back — NOT code-path execution.
+ */
+describe('#3278 read-back — the ledger confirmation state machine', () => {
+  it('confirmChunk transitions landed-unconfirmed → landed-confirmed', () => {
+    const l = new BackstopDeliveryLedger()
+    l.recordChunk('#t', 0, [900]) // landed-unconfirmed
+    expect(l.hasChunk('#t', 0)).toBe(true)
+    expect(l.hasConfirmedChunk('#t', 0)).toBe(false)
+    expect(l.landedUnconfirmedIndices('#t', 1)).toEqual([0])
+    l.confirmChunk('#t', 0)
+    expect(l.hasConfirmedChunk('#t', 0)).toBe(true)
+    expect(l.landedUnconfirmedIndices('#t', 1)).toEqual([])
+    expect(l.allConfirmed('#t', 1)).toBe(true)
+    expect(l.confirmedIds('#t')).toEqual([900])
+  })
+
+  it('demoteChunk resets a landed(-unconfirmed) chunk back to unsent (safe re-send)', () => {
+    const l = new BackstopDeliveryLedger()
+    l.recordChunk('#t', 0, [901])
+    l.confirmChunk('#t', 0)
+    l.demoteChunk('#t', 0) // positive-absence read-back
+    expect(l.hasChunk('#t', 0)).toBe(false)
+    expect(l.hasConfirmedChunk('#t', 0)).toBe(false)
+    expect(l.unsentIndices('#t', 1)).toEqual([0]) // resume set includes it again
+    expect(l.confirmedIds('#t')).toEqual([])
+  })
+
+  it('allConfirmed is false while any chunk is only landed-unconfirmed', () => {
+    const l = new BackstopDeliveryLedger()
+    l.recordChunk('#t', 0, [1]); l.confirmChunk('#t', 0)
+    l.recordChunk('#t', 1, [2]) // landed-unconfirmed
+    expect(l.allConfirmed('#t', 2)).toBe(false)
+    expect(l.landedUnconfirmedIndices('#t', 2)).toEqual([1])
+  })
+
+  it('confirmedIds returns ONLY confirmed chunk ids, in index order', () => {
+    const l = new BackstopDeliveryLedger()
+    l.recordChunk('#t', 0, [10]); l.confirmChunk('#t', 0)
+    l.recordChunk('#t', 1, [11]) // unconfirmed
+    l.recordChunk('#t', 2, [12, 13]); l.confirmChunk('#t', 2)
+    expect(l.confirmedIds('#t')).toEqual([10, 12, 13])
+  })
+})
+
+describe('#3278 combineReadBackResults — per-chunk id combine (guard A7)', () => {
+  it('ANY absent id ⇒ absent (re-send the whole chunk)', () => {
+    expect(combineReadBackResults(['exists', 'absent'])).toBe('absent')
+    expect(combineReadBackResults(['absent', 'ambiguous'])).toBe('absent')
+  })
+  it('ALL exist ⇒ exists', () => {
+    expect(combineReadBackResults(['exists', 'exists'])).toBe('exists')
+  })
+  it('some ambiguous, none absent ⇒ ambiguous (never re-send)', () => {
+    expect(combineReadBackResults(['exists', 'ambiguous'])).toBe('ambiguous')
+  })
+  it('empty id set ⇒ ambiguous (fabricate neither confirm nor demote)', () => {
+    expect(combineReadBackResults([])).toBe('ambiguous')
+  })
+})
+
+describe('#3278 runBackstopDelivery — read-back drives the delivery outcome', () => {
+  it('exists probe ⇒ landed-confirmed, delivered=true, ONE probe, no re-send', async () => {
+    const ledger = new BackstopDeliveryLedger()
+    const sendChunk = vi.fn(async () => [960])
+    const readBack = vi.fn(async (): Promise<ReadBackResult> => 'exists')
+    const res = await runBackstopDelivery(ledger, '#ok', ['the answer'], null, { sendChunk, readBack }, 3)
+    expect(res.delivered).toBe(true)
+    expect(res.exhausted).toBe(false)
+    expect(sendChunk).toHaveBeenCalledTimes(1) // never re-sent
+    expect(readBack).toHaveBeenCalledTimes(1) // exactly one probe per chunk
+    expect(ledger.hasConfirmedChunk('#ok', 0)).toBe(true)
+  })
+
+  it('400/absent probe ⇒ demote → RE-SENT EXACTLY ONCE, then confirmed', async () => {
+    const ledger = new BackstopDeliveryLedger()
+    let sends = 0
+    const sendChunk = vi.fn(async () => { sends++; return [900 + sends] })
+    let probes = 0
+    // First probe: the send was silently dropped (absent). After the re-send the
+    // message is present (exists).
+    const readBack = vi.fn(async (): Promise<ReadBackResult> => {
+      probes++
+      return probes === 1 ? 'absent' : 'exists'
+    })
+    const res = await runBackstopDelivery(ledger, '#drop', ['answer'], null, { sendChunk, readBack }, 3)
+    expect(sendChunk).toHaveBeenCalledTimes(2) // initial + exactly one re-send
+    expect(res.delivered).toBe(true)
+    expect(ledger.hasConfirmedChunk('#drop', 0)).toBe(true)
+  })
+
+  it('429/ambiguous probe ⇒ NOT re-sent, stays landed-unconfirmed, delivered=false', async () => {
+    const ledger = new BackstopDeliveryLedger()
+    const sendChunk = vi.fn(async () => [950])
+    const readBack = vi.fn(async (): Promise<ReadBackResult> => 'ambiguous')
+    const res = await runBackstopDelivery(ledger, '#amb', ['answer'], null, { sendChunk, readBack }, 3)
+    expect(sendChunk).toHaveBeenCalledTimes(1) // never re-sent on ambiguous
+    expect(res.delivered).toBe(false)
+    expect(res.exhausted).toBe(true)
+    expect(ledger.hasConfirmedChunk('#amb', 0)).toBe(false)
+    expect(ledger.landedUnconfirmedIndices('#amb', 1)).toEqual([0]) // still landed-unconfirmed
+  })
+
+  it('a read-back adapter THAT THROWS is treated as ambiguous — never re-sent', async () => {
+    const ledger = new BackstopDeliveryLedger()
+    const sendChunk = vi.fn(async () => [951])
+    const readBack = vi.fn(async () => { throw new Error('boom') })
+    const res = await runBackstopDelivery(ledger, '#throw', ['answer'], null, { sendChunk, readBack }, 3)
+    expect(sendChunk).toHaveBeenCalledTimes(1)
+    expect(res.delivered).toBe(false)
+  })
+
+  it('#3278 CORE: API-ack fresh id but read-back ABSENT ⇒ send_failed, NOT complete', async () => {
+    const ledger = new BackstopDeliveryLedger()
+    const cardId = 500
+    // The Bot API returns a fresh non-card id (an accept) every time...
+    const sendChunk = vi.fn(async () => [970])
+    // ...but the read-back proves the message is not actually in the chat
+    // (flood/anti-spam silent discard). It never confirms.
+    const readBack = vi.fn(async (): Promise<ReadBackResult> => 'absent')
+    const res = await runBackstopDelivery(ledger, '#ghost', ['answer'], cardId, { sendChunk, readBack }, 3)
+    expect(res.delivered).toBe(false) // pre-#3278 this was true → false `complete`
+    expect(res.exhausted).toBe(true)
+    // The exact input the gateway feeds the turn record: delivered=false ⇒ the
+    // status is send_failed and the obligation is left OPEN — the answer is NOT
+    // silently marked complete.
+    const turn: { finalAnswerDelivered: boolean; deliveryOutcome?: 'delivered' | 'failed' | 'suppressed' } = {
+      finalAnswerDelivered: true,
+    }
+    finalizeBackstopSendGated(turn, {
+      threw: !res.delivered, sentIds: res.sentIds, chunkCount: res.chunkCount, cardMessageId: cardId,
+    })
+    expect(computeTurnStatus(turn)).toBe('send_failed')
+  })
+
+  it('scope guard: NO readBack dep ⇒ ZERO probes, legacy confirm-on-landing preserved', async () => {
+    const ledger = new BackstopDeliveryLedger()
+    const readBack = vi.fn()
+    const sendChunk = vi.fn(async () => [980])
+    // deliberately omit `readBack` — the hot path / opt-out shape.
+    const res = await runBackstopDelivery(ledger, '#noprobe', ['answer'], null, { sendChunk })
+    expect(readBack).not.toHaveBeenCalled()
+    expect(res.delivered).toBe(true) // confirmed on landing (receipt-gated)
+    expect(ledger.hasConfirmedChunk('#noprobe', 0)).toBe(true)
+  })
+
+  it('partial: chunk 0 confirmed, chunk 1 ambiguous ⇒ delivered=false, chunk 0 not re-sent', async () => {
+    const ledger = new BackstopDeliveryLedger()
+    const calls: number[] = []
+    const sendChunk = vi.fn(async (i: number) => { calls.push(i); return [700 + i] })
+    const readBack = vi.fn(async (i: number): Promise<ReadBackResult> => (i === 0 ? 'exists' : 'ambiguous'))
+    const res = await runBackstopDelivery(ledger, '#part', ['c0', 'c1'], null, { sendChunk, readBack }, 3)
+    expect(res.delivered).toBe(false)
+    expect(calls.filter(i => i === 0)).toHaveLength(1) // confirmed chunk never re-sent
+    expect(ledger.hasConfirmedChunk('#part', 0)).toBe(true)
+    expect(ledger.hasConfirmedChunk('#part', 1)).toBe(false)
   })
 })
