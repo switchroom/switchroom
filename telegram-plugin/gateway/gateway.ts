@@ -156,6 +156,8 @@ import {
   type DeferredSecret,
   type PendingVaultRequestSave,
   type PendingVaultRequestAccess,
+  type PendingSecretRequest,
+  type ArmedSecretCapture,
   type PendingMentalModelPropose,
 } from './callback-query-handlers.js'
 import { createSweepableStore, createPlainStore } from './pending-state-stores.js'
@@ -13901,21 +13903,11 @@ async function executeVaultRequestSave(args: Record<string, unknown>): Promise<{
 // never recorded to history, never logged, never returned to the agent —
 // the agent only ever references `vault:<key>`. This removes the reason an
 // agent would ever ask a user to paste a secret as a normal chat message.
-interface PendingSecretRequest {
-  agent: string
-  chat_id: string
-  key: string
-  reason?: string
-  staged_at: number
-  card_message_id?: number
-  /** Supergroup forum topic the agent was working in — carried into the
-   *  provide/decline/fail outcome inbounds so the resumed reply lands back
-   *  in that topic, not General. */
-  threadId?: number
-}
+// PendingSecretRequest + ArmedSecretCapture moved to callback-query-handlers.ts
+// (#2996 P5) with handleSecretRequestCallback; imported back above. The stores
+// below hold the SAME singleton instances injected into the callback handlers.
 // chat_id -> the armed capture: the operator's NEXT message in this chat is
 // the value for `key`. Set when [Provide securely] is tapped.
-interface ArmedSecretCapture { key: string; agent: string; stageId: string; armed_at: number; threadId?: number }
 // Storage extracted to pending-state-stores.ts (#2996 Phase 3 step 2). Swept by
 // sweepSecretRequests (below) — a plain delete-past-TTL, no wake (transient
 // post-tap window). Direction preserved: now - armed_at > TTL.
@@ -14142,87 +14134,6 @@ async function captureProvidedSecret(
     `telegram gateway: secret_provided injection agent=${armed.agent} key=${armed.key} stage=${armed.stageId} delivered=${delivered}\n`,
   )
   return true
-}
-
-/**
- * `vsp:` callbacks — agent-requested-secret card.
- *   vsp:provide:<stageId>  — arm capture: operator's next message is the value
- *   vsp:decline:<stageId>  — drop the request; tell the agent it was declined
- */
-async function handleSecretRequestCallback(ctx: Context, data: string): Promise<void> {
-  const senderId = String(ctx.from?.id ?? '')
-  const access = loadAccess()
-  if (!access.allowFrom.includes(senderId)) {
-    await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
-    return
-  }
-  const parts = data.split(':')
-  const action = parts[1]
-  const stageId = parts[2] ?? ''
-  const pending = pendingSecretRequests.get(stageId)
-  if (!pending) {
-    await ctx.answerCallbackQuery({ text: 'This request expired.' }).catch(() => {})
-    return
-  }
-
-  if (action === 'provide') {
-    armedSecretCaptures.set(pending.chat_id, {
-      key: pending.key,
-      agent: pending.agent,
-      stageId,
-      armed_at: Date.now(),
-      ...(pending.threadId != null ? { threadId: pending.threadId } : {}),
-    })
-    await ctx.answerCallbackQuery({ text: 'Send the value now — it auto-deletes.' }).catch(() => {})
-    if (pending.card_message_id != null) {
-      await ctx.api
-        .editMessageText(
-          pending.chat_id,
-          pending.card_message_id,
-          richMessage(`🔐 Send the value for \`${pending.key}\` as your next message — a single message, exactly as-is (don't add other text). I’ll delete it instantly and store it in the vault.`),
-          { reply_markup: { inline_keyboard: [] } },
-        )
-        .catch(() => {})
-    }
-    return
-  }
-
-  if (action === 'decline') {
-    pendingSecretRequests.delete(stageId)
-    pendingCardStore.remove(stageId)
-    armedSecretCaptures.delete(pending.chat_id)
-    await ctx.answerCallbackQuery({ text: 'Declined.' }).catch(() => {})
-    if (pending.card_message_id != null) {
-      await ctx.api
-        .editMessageText(pending.chat_id, pending.card_message_id, richMessage(`🚫 Declined — \`${pending.key}\` not provided.`), {
-          reply_markup: { inline_keyboard: [] },
-        })
-        .catch(() => {})
-    }
-    // Tell the agent so it stops waiting.
-    const ts = Date.now()
-    const synthetic: InboundMessage = {
-      type: 'inbound',
-      chatId: pending.chat_id,
-      ...(pending.threadId != null ? { threadId: pending.threadId } : {}),
-      messageId: ts,
-      user: 'vault-broker',
-      userId: 0,
-      ts,
-      text: `🚫 Operator declined your request for \`vault:${pending.key}\`. Proceed without it or ask how they'd like to handle the task.`,
-      meta: {
-        source: 'secret_declined',
-        agent: pending.agent,
-        ...(pending.threadId != null ? { message_thread_id: String(pending.threadId) } : {}),
-        key: pending.key,
-        stage_id: stageId,
-      },
-    }
-    deliverResumeSyntheticOrBuffer(pending.agent, synthetic)
-    return
-  }
-
-  await ctx.answerCallbackQuery().catch(() => {})
 }
 
 /**
@@ -24309,7 +24220,7 @@ bot.on('callback_query:data', async ctx => {
   //   vsp:provide:<stageId> — arm capture; operator's next message is the value
   //   vsp:decline:<stageId> — drop the request, notify the agent
   if (data.startsWith('vsp:')) {
-    await handleSecretRequestCallback(ctx, data)
+    await callbackQueryHandlers.handleSecretRequestCallback(ctx, data)
     return
   }
 
@@ -26111,6 +26022,8 @@ async function initGatewayBot(): Promise<void> {
     swallowingApiCall,
     pendingVaultRequestAccesses,
     pendingVaultRequestSaves,
+    pendingSecretRequests,
+    armedSecretCaptures,
     pendingMentalModelProposes,
     pendingCardStore,
     pendingMentalModelCorrelations,

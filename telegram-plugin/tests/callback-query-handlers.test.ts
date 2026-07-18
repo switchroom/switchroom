@@ -32,6 +32,8 @@ import {
   type CallbackQueryHandlersDeps,
   type PendingVaultRequestAccess,
   type PendingVaultRequestSave,
+  type PendingSecretRequest,
+  type ArmedSecretCapture,
   type PendingMentalModelPropose,
   type DeferredSecret,
   type PendingVaultOp,
@@ -200,6 +202,12 @@ function makeDeps(overrides: Partial<CallbackQueryHandlersDeps> = {}) {
       expire: () => () => {},
       log: () => () => {},
     }),
+    pendingSecretRequests: createSweepableCardStore<PendingSecretRequest>({
+      isExpired: () => false,
+      expire: () => () => {},
+      log: () => () => {},
+    }),
+    armedSecretCaptures: createSweepableStore<ArmedSecretCapture>(() => false),
     pendingMentalModelProposes: createSweepableCardStore<PendingMentalModelPropose>({
       isExpired: () => false,
       expire: () => () => {},
@@ -452,6 +460,98 @@ describe('handleVaultDeferCallback', () => {
       text: 'This card expired. Re-send the secret.',
     })
     expect(raw.editMessageReplyMarkup).toHaveBeenCalled()
+  })
+})
+
+// ── vsp:* — request_secret (agent asks operator to PROVIDE a secret) ─────
+
+function stagedSecretRequest(over: Partial<PendingSecretRequest> = {}): PendingSecretRequest {
+  return {
+    agent: 'worker',
+    chat_id: '111',
+    card_message_id: 42,
+    key: 'openai/api_key',
+    reason: 'need it to call the API',
+    staged_at: Date.now(),
+    ...over,
+  }
+}
+
+describe('handleSecretRequestCallback', () => {
+  it('refuses a sender not on allowFrom (never touches state)', async () => {
+    const { deps } = makeDeps()
+    deps.pendingSecretRequests.set('s1', stagedSecretRequest())
+    const h = createCallbackQueryHandlers(deps)
+    const { ctx, raw } = makeCtx({ senderId: '999' })
+    await h.handleSecretRequestCallback(ctx, 'vsp:provide:s1')
+    expect(raw.answerCallbackQuery).toHaveBeenCalledWith({ text: 'Not authorized.' })
+    // Auth gate runs before any capture is armed.
+    expect(deps.armedSecretCaptures.has('111')).toBe(false)
+  })
+
+  // Race pin (#2996 P5 mandate — verdict-during-expiry): a tap that lands after
+  // the card's TTL sweep already dropped the pending request must degrade to
+  // the expired toast, NOT arm a capture or wake the agent.
+  it('a tap on an already-expired/unknown stage toasts "This request expired." and changes nothing', async () => {
+    const { deps, injected } = makeDeps()
+    const h = createCallbackQueryHandlers(deps)
+    const { ctx, raw } = makeCtx()
+    await h.handleSecretRequestCallback(ctx, 'vsp:provide:gone')
+    expect(raw.answerCallbackQuery).toHaveBeenCalledWith({ text: 'This request expired.' })
+    expect(deps.armedSecretCaptures.has('111')).toBe(false)
+    expect(injected).toHaveLength(0)
+  })
+
+  it('provide: arms the capture keyed by chat_id and swaps the card to the send-now prompt', async () => {
+    const { deps } = makeDeps()
+    deps.pendingSecretRequests.set('s1', stagedSecretRequest({ threadId: 7 }))
+    const h = createCallbackQueryHandlers(deps)
+    const { ctx, raw } = makeCtx()
+    await h.handleSecretRequestCallback(ctx, 'vsp:provide:s1')
+    const armed = deps.armedSecretCaptures.get('111')
+    expect(armed?.key).toBe('openai/api_key')
+    expect(armed?.stageId).toBe('s1')
+    expect(armed?.threadId).toBe(7)
+    expect(raw.answerCallbackQuery).toHaveBeenCalledWith({
+      text: 'Send the value now — it auto-deletes.',
+    })
+    // Card edited to the "send the value" prompt with the keyboard stripped.
+    expect(raw.api.editMessageText).toHaveBeenCalled()
+    // The pending request survives until the value actually arrives.
+    expect(deps.pendingSecretRequests.has('s1')).toBe(true)
+  })
+
+  it('decline: drops the stage, clears any armed capture, edits the card, wakes the agent', async () => {
+    const { deps, injected } = makeDeps()
+    deps.pendingSecretRequests.set('s1', stagedSecretRequest())
+    deps.armedSecretCaptures.set('111', {
+      key: 'openai/api_key',
+      agent: 'worker',
+      stageId: 's1',
+      armed_at: Date.now(),
+    })
+    const h = createCallbackQueryHandlers(deps)
+    const { ctx, raw } = makeCtx()
+    await h.handleSecretRequestCallback(ctx, 'vsp:decline:s1')
+    expect(deps.pendingSecretRequests.has('s1')).toBe(false)
+    expect(deps.pendingCardStore.remove).toHaveBeenCalledWith('s1')
+    expect(deps.armedSecretCaptures.has('111')).toBe(false)
+    expect(raw.answerCallbackQuery).toHaveBeenCalledWith({ text: 'Declined.' })
+    expect(raw.api.editMessageText).toHaveBeenCalled()
+    expect(injected).toHaveLength(1)
+    expect(injected[0]!.agent).toBe('worker')
+    expect(injected[0]!.text).toContain('openai/api_key')
+  })
+
+  it('an unknown action just acknowledges without mutating state', async () => {
+    const { deps, injected } = makeDeps()
+    deps.pendingSecretRequests.set('s1', stagedSecretRequest())
+    const h = createCallbackQueryHandlers(deps)
+    const { ctx, raw } = makeCtx()
+    await h.handleSecretRequestCallback(ctx, 'vsp:bogus:s1')
+    expect(raw.answerCallbackQuery).toHaveBeenCalledWith()
+    expect(deps.pendingSecretRequests.has('s1')).toBe(true)
+    expect(injected).toHaveLength(0)
   })
 })
 
@@ -748,6 +848,7 @@ describe('authorization gate parity', () => {
     ['vrd', (h, ctx) => h.handleVaultRecentDenialCallback(ctx, 'vrd:worker:k')],
     ['vra', (h, ctx) => h.handleVaultRequestAccessCallback(ctx, 'vra:approve:s1')],
     ['vrs', (h, ctx) => h.handleVaultRequestSaveCallback(ctx, 'vrs:save:s1')],
+    ['vsp', (h, ctx) => h.handleSecretRequestCallback(ctx, 'vsp:provide:s1')],
     ['vd', (h, ctx) => h.handleVaultDeferCallback(ctx, 'vd:unlock:111:7')],
     ['vg', (h, ctx) => h.handleVaultGrantCallback(ctx, 'vg:cancel')],
     ['mmp', (h, ctx) => h.handleMentalModelProposeCallback(ctx, 'mmp:approve:m1')],
