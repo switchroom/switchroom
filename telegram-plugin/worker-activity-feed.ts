@@ -54,11 +54,12 @@ import {
   stripMarkdown,
   truncate,
 } from './card-format.js'
-import { STATUS_ROLLING_LINES } from './status-no-truncate.js'
+import { WORKER_HISTORY_MAX } from './status-no-truncate.js'
 import {
   renderStatusCard,
   formatStepSuffix,
   renderCombinedWorkerFeed,
+  workerHistoryDepth,
   type CombinedWorkerRow,
 } from './tool-activity-summary.js'
 import { isSendGateShed } from './send-gate.js'
@@ -213,6 +214,9 @@ export function renderWorkerActivity(v: WorkerActivityView, liveSuffix = ''): st
     final: finished,
     liveSuffix: finished ? '' : liveSuffix,
     result,
+    // Lone-worker card: window to the w=1 point of Ken's curve (6) so it shows
+    // the full recent trail, not the 5-line agent-card default (#3349).
+    historyWindow: workerHistoryDepth(1),
   })
   if (card == null) {
     // Unreachable (header always present) — defensive.
@@ -420,7 +424,7 @@ interface WorkerRow {
   agentId: string
   /**
    * Accumulated narrative lines (oldest→newest), deduped within the whole
-   * rolling window. Rolling-window capped to STATUS_ROLLING_LINES. Grows the
+   * rolling window. Rolling-window capped to WORKER_HISTORY_MAX. Grows the
    * live render so the feed reads like the main agent's answer.
    */
   narrative: string[]
@@ -797,8 +801,10 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
     row.narrative.push(line)
     // The `→` current-step line just CHANGED — reset the per-step timer.
     row.stepStartedAtMs = nowFn()
-    if (row.narrative.length > STATUS_ROLLING_LINES) {
-      row.narrative.splice(0, row.narrative.length - STATUS_ROLLING_LINES)
+    // Retain up to WORKER_HISTORY_MAX (6) — the lone-worker card's deepest
+    // window (#3349). STATUS_ROLLING_LINES (5) governs the agent card, not this.
+    if (row.narrative.length > WORKER_HISTORY_MAX) {
+      row.narrative.splice(0, row.narrative.length - WORKER_HISTORY_MAX)
     }
   }
 

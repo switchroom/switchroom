@@ -6,7 +6,7 @@ import {
   type WorkerActivityView,
   type BotApiForWorkerFeed,
 } from '../worker-activity-feed.js'
-import { STATUS_ROLLING_LINES, STATUS_LINE_MAX } from '../status-no-truncate.js'
+import { STATUS_ROLLING_LINES, WORKER_HISTORY_MAX, STATUS_LINE_MAX } from '../status-no-truncate.js'
 import { SEND_GATE_SHED } from '../send-gate.js'
 
 describe('isWorkerActivityFeedEnabled (default ON)', () => {
@@ -188,17 +188,31 @@ describe('renderWorkerActivity', () => {
     expect(stepCount(out)).toBe(2)
   })
 
-  it('shows a "+N earlier…" header when the feed exceeds STATUS_ROLLING_LINES (worker surface)', () => {
-    const total = STATUS_ROLLING_LINES + 3
+  it('shows a "+N earlier…" header when the feed exceeds WORKER_HISTORY_MAX (worker surface, #3349)', () => {
+    const total = WORKER_HISTORY_MAX + 3
     const lines = Array.from({ length: total }, (_, i) => `step ${i + 1}`)
     const out = renderWorkerActivity(view({ narrativeLines: lines }))
-    expect(out).toContain(`_✓ +${total - STATUS_ROLLING_LINES} earlier…_`)
+    expect(out).toContain(`_✓ +${total - WORKER_HISTORY_MAX} earlier…_`)
     expect(out).not.toContain('step 1<')
-    const firstVisible = total - STATUS_ROLLING_LINES + 1
+    const firstVisible = total - WORKER_HISTORY_MAX + 1
     expect(out).toContain(`~~_✓ step ${firstVisible}_~~`)
     expect(out).toContain(`**→ step ${total}**`)
-    // STATUS_ROLLING_LINES visible step lines (the overflow header isn't a step).
-    expect(out.match(/step \d/g) ?? []).toHaveLength(STATUS_ROLLING_LINES)
+    // WORKER_HISTORY_MAX visible step lines (the overflow header isn't a step).
+    expect(out.match(/step \d/g) ?? []).toHaveLength(WORKER_HISTORY_MAX)
+  })
+
+  it('the lone-worker card shows the full 6-step trail — the raised ceiling (#3349)', () => {
+    // Ken's curve at w=1 is 6; the single-worker surface must reach it (the old
+    // STATUS_ROLLING_LINES=5 cap could never show the 6th step).
+    expect(WORKER_HISTORY_MAX).toBe(6)
+    const lines = Array.from({ length: 8 }, (_, n) => `ln-${n + 1}`)
+    const out = renderWorkerActivity(view({ narrativeLines: lines }))
+    // Last 6 render (ln-3 … ln-8); the two oldest collapse into a "+2 earlier…".
+    for (let n = 3; n <= 8; n++) expect(out).toContain(`ln-${n}`)
+    expect(out).toContain('_✓ +2 earlier…_')
+    expect(out).toContain('**→ ln-8**') // newest last, bold in-progress
+    // Exactly 6 rendered step bullets (the +N header is not a bullet).
+    expect((out.match(/ln-\d/g) ?? []).length).toBe(6)
   })
 
   it('strips the CONTENT Markdown markup (the card keeps its own ** / _ wrappers, #2669)', () => {
@@ -457,7 +471,7 @@ describe('createWorkerActivityFeed', () => {
     expect(last.text.match(/[✓→]/g) ?? []).toHaveLength(1)
   })
 
-  it('rolls the narrative block to the last STATUS_ROLLING_LINES lines', async () => {
+  it('rolls the narrative block to the last WORKER_HISTORY_MAX lines (#3349)', async () => {
     const bot = makeFakeBot()
     let clock = 10_000
     const feed = createWorkerActivityFeed({ bot, now: () => clock, minEditIntervalMs: 0 })
@@ -469,10 +483,32 @@ describe('createWorkerActivityFeed', () => {
     }
 
     const last = bot.edits.at(-1)!
-    expect(last.text.match(/[✓→]/g) ?? []).toHaveLength(STATUS_ROLLING_LINES)
-    const firstVisible = total - STATUS_ROLLING_LINES + 1
+    expect(last.text.match(/[✓→]/g) ?? []).toHaveLength(WORKER_HISTORY_MAX)
+    const firstVisible = total - WORKER_HISTORY_MAX + 1
     for (let i = 1; i < firstVisible; i++) expect(last.text).not.toContain(`ln-${String(i).padStart(3, '0')}`)
     for (let i = firstVisible; i <= total; i++) expect(last.text).toContain(`ln-${String(i).padStart(3, '0')}`)
+  })
+
+  it('the deeper 6-step trail does NOT add edits — one landed render per substantive step (#3349, no #3270 flood)', async () => {
+    // Render-only change: edit frequency is a function of SUBSTANTIVE changes
+    // (new narrative step), never of how many trail lines a render carries. Push
+    // 8 distinct steps to a lone worker; with the edit floor at 0 exactly one
+    // render lands per step: 1 send + 7 edits = 8 landed renders, regardless of
+    // the 6-line trail depth. A widened window that re-fired edits would break
+    // this (that is the #3270 flood we must not reintroduce).
+    const bot = makeFakeBot()
+    let clock = 10_000
+    const feed = createWorkerActivityFeed({ bot, now: () => clock, minEditIntervalMs: 0 })
+    for (let i = 1; i <= 8; i++) {
+      clock += 1000
+      await feed.update('w1', 'chat', view({ toolCount: i, latestSummary: `edit-step-${i}` }))
+    }
+    expect(bot.sent).toHaveLength(1)
+    expect(bot.edits).toHaveLength(7)
+    // Re-pushing the SAME newest step (no substance change) fires NO extra edit.
+    clock += 1000
+    await feed.update('w1', 'chat', view({ toolCount: 8, latestSummary: 'edit-step-8' }))
+    expect(bot.edits).toHaveLength(7)
   })
 
   it('grows the narrative even while throttled (line surfaces on next edit)', async () => {
@@ -576,10 +612,10 @@ describe('createWorkerActivityFeed — log sink', () => {
 // char-budget backstop is the only wire-limit ceiling.
 
 describe('rolling window + STATUS_LINE_MAX — renderWorkerActivity', () => {
-  it('with 12 narrative lines, exactly the last STATUS_ROLLING_LINES render + a +N earlier header', () => {
+  it('with 12 narrative lines, exactly the last WORKER_HISTORY_MAX render + a +N earlier header (#3349)', () => {
     const narrativeLines = Array.from({ length: 12 }, (_, i) => `stp-${String(i + 1).padStart(3, '0')}`)
     const out = renderWorkerActivity(view({ narrativeLines }))
-    const firstVisible = 12 - STATUS_ROLLING_LINES + 1
+    const firstVisible = 12 - WORKER_HISTORY_MAX + 1
     for (let i = firstVisible; i <= 12; i++) {
       expect(out).toContain(`stp-${String(i).padStart(3, '0')}`)
     }
@@ -587,7 +623,7 @@ describe('rolling window + STATUS_LINE_MAX — renderWorkerActivity', () => {
       expect(out).not.toContain(`stp-${String(i).padStart(3, '0')}`)
     }
     // Overflow header now appears on the worker surface too.
-    expect(out).toContain(`_✓ +${12 - STATUS_ROLLING_LINES} earlier…_`)
+    expect(out).toContain(`_✓ +${12 - WORKER_HISTORY_MAX} earlier…_`)
     expect(out).toContain('**→ stp-012**')
   })
 
@@ -623,7 +659,7 @@ describe('rolling window + STATUS_LINE_MAX — renderWorkerActivity', () => {
 })
 
 describe('rolling window — createWorkerActivityFeed narrative accumulation', () => {
-  it('with 12 pushes, only the last STATUS_ROLLING_LINES appear in the render', async () => {
+  it('with 12 pushes, only the last WORKER_HISTORY_MAX appear in the render (#3349)', async () => {
     const bot = makeFakeBot()
     let clock = 10_000
     const feed = createWorkerActivityFeed({ bot, now: () => clock, minEditIntervalMs: 0 })
@@ -634,16 +670,16 @@ describe('rolling window — createWorkerActivityFeed narrative accumulation', (
     }
 
     const last = bot.edits.at(-1)!
-    const firstVisible = 12 - STATUS_ROLLING_LINES + 1
+    const firstVisible = 12 - WORKER_HISTORY_MAX + 1
     for (let i = firstVisible; i <= 12; i++) {
       expect(last.text).toContain(`ln-${String(i).padStart(3, '0')}`)
     }
     for (let i = 1; i < firstVisible; i++) {
       expect(last.text).not.toContain(`ln-${String(i).padStart(3, '0')}`)
     }
-    // The manager caps the in-memory narrative at STATUS_ROLLING_LINES, so the
+    // The manager caps the in-memory narrative at WORKER_HISTORY_MAX, so the
     // render never sees overflow — no "+N earlier…" marker on the manager path
-    // (it surfaces only on direct renderWorkerActivity calls with >5 lines).
+    // (it surfaces only on direct renderWorkerActivity calls with >6 lines).
     expect(last.text).not.toContain('earlier…')
     expect(last.text).toContain('**→ ln-012**')
   })
@@ -1337,8 +1373,8 @@ describe('narrative dedup — non-adjacent repeats collapse (A,B,A)', () => {
     const feed = createWorkerActivityFeed({ bot, now: () => clock, minEditIntervalMs: 0 })
 
     await feed.update('w2', 'chat', view({ latestSummary: 'step-repeat' }))
-    // Push STATUS_ROLLING_LINES distinct lines so 'step-repeat' scrolls out.
-    for (let i = 0; i < STATUS_ROLLING_LINES; i++) {
+    // Push WORKER_HISTORY_MAX distinct lines so 'step-repeat' scrolls out (#3349).
+    for (let i = 0; i < WORKER_HISTORY_MAX; i++) {
       clock += 1000
       await feed.update('w2', 'chat', view({ latestSummary: `filler-${i}` }))
     }
