@@ -43,6 +43,14 @@ const gatewaySrc = readFileSync(
   resolve(__dirname, '..', 'gateway', 'gateway.ts'),
   'utf-8',
 )
+// #2996 P4-A: the enqueue-time `scheduleEarlyLivenessOpen(next)` moved with
+// handleSessionEvent into stream-render.ts; the turn-end teardown stays in
+// gateway.ts. The timer-lifecycle assertion spans both files.
+const streamSrc = readFileSync(
+  resolve(__dirname, '..', 'gateway', 'stream-render.ts'),
+  'utf-8',
+)
+const gatewayAndStreamSrc = gatewaySrc + '\n' + streamSrc
 
 /** Return the source text of `feedHeartbeatTick` (everything up to the next top-level function). */
 function feedHeartbeatTickSrc(): string {
@@ -121,8 +129,8 @@ describe('H-1: feedHeartbeatTick liveness-open threshold', () => {
     // The enqueue-time early-open (the dead-air fix): a one-shot timer fires the
     // shared open helper at turn start, and it is cancelled at the canonical
     // turn-end so a leaked timer can never fire against a successor turn.
-    expect(gatewaySrc).toMatch(/scheduleEarlyLivenessOpen\(next\)/)
-    expect(gatewaySrc).toMatch(/stopEarlyLivenessOpen\(key as string\)/)
+    expect(gatewayAndStreamSrc).toMatch(/scheduleEarlyLivenessOpen\(next\)/)
+    expect(gatewayAndStreamSrc).toMatch(/stopEarlyLivenessOpen\(key as string\)/)
   })
 })
 

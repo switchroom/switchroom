@@ -23,6 +23,14 @@ const gatewaySrc = readFileSync(
   resolve(__dirname, '..', 'gateway', 'gateway.ts'),
   'utf-8',
 )
+// #2996 P4-A: the enqueue handler (turn ctor: `const turnId = deriveTurnId`,
+// `rememberRecentTurn(next)`, `promoteQueuedStatus`) moved VERBATIM into
+// stream-render.ts with handleSessionEvent. Enqueue-seam assertions span both.
+const streamSrc = readFileSync(
+  resolve(__dirname, '..', 'gateway', 'stream-render.ts'),
+  'utf-8',
+)
+const gatewayAndStreamSrc = gatewaySrc + '\n' + streamSrc
 const bridgeSrc = readFileSync(
   resolve(__dirname, '..', 'bridge', 'bridge.ts'),
   'utf-8',
@@ -38,8 +46,8 @@ const deriveTurnIdSrc = readFileSync(
 describe('component 3 — turn-origin reply routing', () => {
   it('CurrentTurn carries a turnId, and the enqueue handler initialises it', () => {
     expect(gatewaySrc).toMatch(/turnId: string/)
-    expect(gatewaySrc).toMatch(/const turnId\s*=\s*\n?\s*deriveTurnId\(/)
-    expect(gatewaySrc).toMatch(/rememberRecentTurn\(next\)/)
+    expect(gatewayAndStreamSrc).toMatch(/const turnId\s*=\s*\n?\s*deriveTurnId\(/)
+    expect(gatewayAndStreamSrc).toMatch(/rememberRecentTurn\(next\)/)
   })
 
   it('the inbound meta stamps origin_turn_id derived from chat/thread/messageId', () => {
@@ -151,7 +159,7 @@ describe('component 5 — queued-status UX (delete-on-answer)', () => {
   })
 
   it('Hook B promotes the placeholder to "On it" when the buffered turn starts', () => {
-    expect(gatewaySrc).toMatch(/promoteQueuedStatus\(ev\.chatId, enqThreadIdNum\)/)
+    expect(gatewayAndStreamSrc).toMatch(/promoteQueuedStatus\(ev\.chatId, enqThreadIdNum\)/)
   })
 
   it('Hook C reaps the placeholder on the answer (executeReply / stream)', () => {

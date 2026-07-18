@@ -22,6 +22,11 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 const gatewaySrc = readFileSync(resolve(__dirname, '..', 'gateway', 'gateway.ts'), 'utf-8')
+// #2996 P4-A: the turn-flush / turn_end / `thinking`-arm code moved VERBATIM
+// into stream-render.ts with handleSessionEvent. Windows that used to live in
+// the gateway switch are grepped from the extracted module now.
+const streamSrc = readFileSync(resolve(__dirname, '..', 'gateway', 'stream-render.ts'), 'utf-8')
+const gatewayAndStreamSrc = gatewaySrc + '\n' + streamSrc
 
 function between(src: string, startMarker: string, endMarker: string): string {
   const after = src.split(startMarker)[1] ?? ''
@@ -42,7 +47,7 @@ describe('S1 wiring — turn-flush suppression call site', () => {
   // The whole suppression branch: predicate call through the end of the
   // `if (suppress)` early-return.
   const branch = between(
-    gatewaySrc,
+    streamSrc,
     'const { shouldSuppressTurnFlush }',
     '// #3276 guard 5',
   )
@@ -72,7 +77,7 @@ describe('S1 wiring — turn-flush suppression call site', () => {
   it('the old predicate is gone from the whole gateway turn-flush path', () => {
     // getRecentOutboundCount must not be consulted anywhere in gateway.ts —
     // any reintroduction re-opens the chat-wide suppression class.
-    expect(codeOnly(gatewaySrc)).not.toMatch(/getRecentOutboundCount/)
+    expect(codeOnly(gatewayAndStreamSrc)).not.toMatch(/getRecentOutboundCount/)
   })
 })
 
@@ -81,7 +86,7 @@ describe('S2 wiring — thinking events re-arm the answer-ready quiescence flush
     // Without this, "prose → >1s thinking pause → trailing NO_REPLY" lets the
     // quiescence timer fire mid-pause and deliver a turn the model intended
     // silent. Scope to the thinking case arm only.
-    const arm = between(gatewaySrc, "case 'thinking': {", "case 'tool_use': {")
+    const arm = between(streamSrc, "case 'thinking': {", "case 'tool_use': {")
     expect(arm.length).toBeGreaterThan(50)
     expect(codeOnly(arm)).toMatch(/resetAnswerReadyFlushTimeout\(\)/)
   })
@@ -107,6 +112,6 @@ describe('S4 wiring — flushed answers quote-anchor to the inbound they answer'
   it('the turn-flush call site passes the turn’s inbound id (bare for synthesized turns)', () => {
     // The anchor must be the message this TURN answers — turn.sourceMessageId
     // is null for cron/handback turns, which therefore still send bare.
-    expect(codeOnly(gatewaySrc)).toMatch(/replyToMessageId:\s*turn\.sourceMessageId/)
+    expect(codeOnly(gatewayAndStreamSrc)).toMatch(/replyToMessageId:\s*turn\.sourceMessageId/)
   })
 })

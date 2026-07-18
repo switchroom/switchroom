@@ -24,6 +24,11 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 const gatewaySrc = readFileSync(resolve(__dirname, '..', 'gateway', 'gateway.ts'), 'utf-8')
+// #2996 P4-A: the model-driven reset sites (tool_label append, answer-stream
+// onMetric) live inside handleSessionEvent, which moved VERBATIM to
+// stream-render.ts. There the live-turn guard reads the injected accessor
+// (`getCurrentTurn() === turn`) rather than the `currentTurn` module global.
+const streamSrc = readFileSync(resolve(__dirname, '..', 'gateway', 'stream-render.ts'), 'utf-8')
 
 function between(src: string, startMarker: string, endMarker: string): string {
   const after = src.split(startMarker)[1] ?? ''
@@ -47,18 +52,18 @@ describe('silence-poke production-liveness — heartbeat safety', () => {
     // appendActivityLabel returns a fresh render only when the model emits a NEW
     // labelled step — the genuine liveness signal the heartbeat can never forge.
     const block = between(
-      gatewaySrc,
+      streamSrc,
       'const rendered = appendActivityLabel(turn.mirrorLines, ev.label)',
       '\n      return',
     )
     expect(block).toMatch(/silencePoke\.noteProduction/)
-    expect(block).toMatch(/currentTurn === turn/)
+    expect(block).toMatch(/getCurrentTurn\(\) === turn/)
   })
 
   it('the answer-stream draft onMetric reset is model-driven and gated on the live turn', () => {
-    const block = between(gatewaySrc, 'onMetric: (metricEv) => {', '\n            },')
+    const block = between(streamSrc, 'onMetric: (metricEv) => {', '\n            },')
     expect(block).toMatch(/silencePoke\.noteProduction/)
-    expect(block).toMatch(/currentTurn === turn/)
+    expect(block).toMatch(/getCurrentTurn\(\) === turn/)
   })
 
   it('production-liveness is behind the default-ON SWITCHROOM_SILENCE_LIVENESS_PRODUCTION kill switch', () => {
