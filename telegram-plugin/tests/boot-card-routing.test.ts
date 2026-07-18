@@ -14,10 +14,10 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, rmSync, writeFileSync, utimesSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync, utimesSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { readRoutingMode, renderRoutingRow, renderBootCard } from '../gateway/boot-card.js'
+import { readRoutingMode, renderRoutingRow, renderBootCard, containerBootStartMs } from '../gateway/boot-card.js'
 
 const LINE =
   'mode=router-root base=http://litellm:4010 model=fable litellm_ok=1 declared=router-root ts=2026-07-17T02:00:00Z\n'
@@ -54,6 +54,41 @@ describe('readRoutingMode', () => {
     const r = readRoutingMode(dir, Date.now() - 1_000)
     expect(r).not.toBeNull()
     expect(r!.prevBoot).toBe(true)
+  })
+})
+
+describe('containerBootStartMs', () => {
+  it('derives PID-1 start epoch from /proc/stat btime + /proc/1/stat starttime', () => {
+    const btime = 1_700_000_000 // seconds since epoch
+    const startTicks = 500 // 5s after boot at 100 HZ
+    const fsImpl = {
+      readFileSync: ((p: unknown) => {
+        if (p === '/proc/stat') return `cpu 1 2 3\nbtime ${btime}\nprocesses 100\n`
+        if (p === '/proc/1/stat')
+          // pid (comm) state ... field22=starttime. comm has a space+paren to
+          // exercise the last-')' split.
+          return `1 (init a) S 0 1 1 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 ${startTicks} 0`
+        throw new Error('unexpected path')
+      }) as typeof readFileSync,
+    }
+    expect(containerBootStartMs(fsImpl)).toBe((btime + startTicks / 100) * 1000)
+  })
+
+  it('returns null when /proc is unavailable (fallback path for callers)', () => {
+    const fsImpl = {
+      readFileSync: (() => {
+        throw new Error('ENOENT')
+      }) as typeof readFileSync,
+    }
+    expect(containerBootStartMs(fsImpl)).toBeNull()
+  })
+
+  it('returns null when btime is missing', () => {
+    const fsImpl = {
+      readFileSync: ((p: unknown) =>
+        p === '/proc/stat' ? 'cpu 1 2 3\nprocesses 100\n' : '1 (init) S 0') as typeof readFileSync,
+    }
+    expect(containerBootStartMs(fsImpl)).toBeNull()
   })
 })
 

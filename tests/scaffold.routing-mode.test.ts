@@ -165,6 +165,33 @@ describe("rendered start.sh: routing-mode observability + fable cause split", ()
     expect(out).toContain(`BASEURL=${ROUTER_ROOT}`);
   });
 
+  it("healthy fable declares router-root and fires NO divergence alert (CRITICAL-1 regression)", () => {
+    // A configured-fable agent rides compose's /anthropic passthrough env but
+    // start.sh repoints it onto the router root — so its DECLARED intent must
+    // be router-root, matching the landed mode. A regression to the raw
+    // isClaudeModel split (declared=passthrough) makes every healthy fable boot
+    // cry wolf with a permanent "Routing divergence" alert.
+    scaffold("fable");
+    const { out } = runBlock({ litellmOk: "1" });
+    expect(out).toContain(`BASEURL=${ROUTER_ROOT}`);
+    expect(routingFile()).toContain("mode=router-root");
+    expect(routingFile()).toContain("declared=router-root");
+    expect(alertText()).not.toContain("Routing divergence");
+  });
+
+  it("re-alerts when the declared class flips while the landed mode stays stuck (LOW-2 dedup pair)", () => {
+    // Boot 1: sonnet declares passthrough but lands router-root → divergence.
+    scaffold("claude-sonnet-5");
+    runBlock({ litellmOk: "1", baseUrl: ROUTER_ROOT });
+    const first = alertText();
+    expect(first).toContain("Routing divergence");
+    // Boot 2: same landed router-root, but now declared flips to direct-oauth
+    // (operator un-configured LiteLLM). Landed mode is unchanged, yet the
+    // (landed, declared) PAIR changed → a NEW divergence alert must fire.
+    runBlock({ litellmOk: "1", baseUrl: ROUTER_ROOT, litellmDeclared: "" });
+    expect(alertText().length).toBeGreaterThan(first.length);
+  });
+
   // ── 2. .routing-mode state file + stderr line ───────────────────────────
 
   it("writes one .routing-mode line with mode/base/model/litellm_ok/declared/ts and echoes routing: to stderr", () => {
@@ -262,10 +289,14 @@ describe("rendered start.sh: routing-mode observability + fable cause split", ()
     expect(startSh).not.toContain("LiteLLM was unreachable at boot, so the configured model");
   });
 
-  it("bakes _DECLARED_ROUTING from the model class (passthrough for Claude, router-root for sr-*)", () => {
+  it("bakes _DECLARED_ROUTING from the POST-REPOINT mode (passthrough only for non-fable Claude; router-root for fable + sr-*)", () => {
     scaffold("claude-sonnet-5");
     expect(startSh).toContain("_DECLARED_ROUTING='passthrough'");
     scaffold("sr-glm-5");
+    expect(startSh).toContain("_DECLARED_ROUTING='router-root'");
+    // fable is a Claude-class model but start.sh repoints it to the router
+    // root, so its DECLARED intent must be router-root, not passthrough.
+    scaffold("fable");
     expect(startSh).toContain("_DECLARED_ROUTING='router-root'");
   });
 });

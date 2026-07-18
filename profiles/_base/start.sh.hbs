@@ -1583,13 +1583,16 @@ printf '%s\n' "$_EFFECTIVE_MODEL" > "{{agentDir}}/.active-session-model" 2>/dev/
 # Deterministic record of WHERE this boot actually landed, written immediately
 # before exec claude (overwrite-per-boot, one line). Consumers: the gateway
 # boot card's "routing" row and any operator shell. _DECLARED_ROUTING is baked
-# at render time from the same isClaudeModel() split compose.ts uses for
-# ANTHROPIC_BASE_URL (passthrough for Claude-class models, router-root
-# otherwise) — the apply-time INTENT the landed mode is compared against.
+# at render time by declaredRoutingMode() — the POST-REPOINT mode this boot is
+# meant to land on (fable/claude-fable-5/sr-* declare router-root because the
+# repoint case below moves them there; only non-fable Claude models declare
+# passthrough) — the apply-time INTENT the landed mode is compared against.
 # Divergence (landed ≠ declared) appends a consume-once .session-model-alert
-# line the gateway relays to the operator, but ONLY when the landed mode
-# differs from the PREVIOUS boot's landed mode — a persistently degraded agent
-# alerts once, not on every restart.
+# line the gateway relays to the operator, but ONLY when the (landed, declared)
+# PAIR differs from the PREVIOUS boot's pair — a persistently degraded agent
+# alerts once, not on every restart, yet a declared-only flip (operator changes
+# the configured model class while the agent stays stuck on the same wrong
+# landed mode) still re-alerts.
 _DECLARED_ROUTING={{{declaredRoutingQ}}}
 # When LiteLLM was never configured for this agent (no SWITCHROOM_LITELLM at
 # boot entry, captured before any strip), compose injects NO routing env — the
@@ -1602,13 +1605,18 @@ case "${ANTHROPIC_BASE_URL:-}" in
   *) _ROUTING_MODE="router-root" ;;
 esac
 _prev_routing_mode="$(sed -n 's/^mode=\([^ ]*\).*/\1/p' "{{agentDir}}/.routing-mode" 2>/dev/null | head -n 1 || true)"
+_prev_declared_routing="$(sed -n 's/.* declared=\([^ ]*\).*/\1/p' "{{agentDir}}/.routing-mode" 2>/dev/null | head -n 1 || true)"
 _routing_line="mode=$_ROUTING_MODE base=${ANTHROPIC_BASE_URL:-direct} model=$_EFFECTIVE_MODEL litellm_ok=${_LITELLM_OK:-0} declared=$_DECLARED_ROUTING ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 printf '%s\n' "$_routing_line" > "{{agentDir}}/.routing-mode" 2>/dev/null || true
 echo "routing: $_routing_line" >&2
-if [ "$_ROUTING_MODE" != "$_DECLARED_ROUTING" ] && [ "$_ROUTING_MODE" != "$_prev_routing_mode" ]; then
+# Dedup on the (landed, declared) PAIR, not landed alone: a persistently
+# degraded agent alerts once, but if the operator flips the declared class
+# while the agent stays stuck on the same wrong landed mode, the pair changes
+# and we re-alert (LOW-2).
+if [ "$_ROUTING_MODE" != "$_DECLARED_ROUTING" ] && { [ "$_ROUTING_MODE" != "$_prev_routing_mode" ] || [ "$_DECLARED_ROUTING" != "$_prev_declared_routing" ]; }; then
   printf 'Routing divergence: this agent landed on `%s` (base `%s`, model `%s`) but its declared routing is `%s`. Check `%s/.routing-mode` and the boot log for the cause (LiteLLM key/provision or proxy reachability).\n' "$_ROUTING_MODE" "${ANTHROPIC_BASE_URL:-direct}" "$_EFFECTIVE_MODEL" "$_DECLARED_ROUTING" "{{agentDir}}" >> "{{agentDir}}/.session-model-alert" 2>/dev/null || true
 fi
-unset _prev_routing_mode _routing_line
+unset _prev_routing_mode _prev_declared_routing _routing_line
 
 {{#if useSwitchroomPlugin}}
 if [ -n "$APPEND_PROMPT" ]; then

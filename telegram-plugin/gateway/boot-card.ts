@@ -309,13 +309,55 @@ export interface RoutingModeInfo {
 }
 
 /**
+ * Epoch-ms this CONTAINER booted, derived from PID 1's start time
+ * (`/proc/stat` btime + `/proc/1/stat` field 22 in USER_HZ ticks). This is the
+ * correct staleness threshold for `.routing-mode`: start.sh writes that file
+ * ONCE per container boot, before exec-ing claude/the gateway. Keying staleness
+ * on the gateway PROCESS start (`Date.now() - process.uptime()*1000`) mislabels
+ * a gateway-only respawn — supervisor restarts the gateway process while the
+ * container (and its still-current `.routing-mode`) stays up — as "(prev boot)".
+ * Container boot time is stable across such respawns (LOW-1). Returns null when
+ * /proc is unavailable or unparseable (non-Linux, tests), so callers fall back
+ * to the process-start estimate.
+ */
+export function containerBootStartMs(
+  fsImpl: { readFileSync: typeof readFileSync } = { readFileSync },
+): number | null {
+  try {
+    const btimeLine = fsImpl
+      .readFileSync('/proc/stat', 'utf-8')
+      .split('\n')
+      .find((l) => l.startsWith('btime '))
+    if (!btimeLine) return null
+    const btimeSec = Number(btimeLine.split(/\s+/)[1])
+    if (!Number.isFinite(btimeSec)) return null
+    // /proc/1/stat field 22 (starttime) is in clock ticks since system boot.
+    // Fields 2 (comm) may contain spaces/parens, so split on the last ')'.
+    const stat = fsImpl.readFileSync('/proc/1/stat', 'utf-8')
+    const afterComm = stat.slice(stat.lastIndexOf(')') + 2)
+    const fields = afterComm.split(/\s+/)
+    // starttime is field 22 overall → index 19 of the post-comm slice
+    // (field 1 pid + field 2 comm consumed; field 3 becomes index 0).
+    const startTicks = Number(fields[19])
+    if (!Number.isFinite(startTicks)) return null
+    const HZ = 100 // USER_HZ on effectively all Linux; sysconf unavailable in node
+    return (btimeSec + startTicks / HZ) * 1000
+  } catch {
+    return null
+  }
+}
+
+/**
  * Read + parse `<agentDir>/.routing-mode`. Returns null when the file is
  * absent, unreadable, or carries no `mode=` field (tolerant by design — the
  * boot card must render fine on fleets that pre-date the state file).
  *
- * `bootStartMs` is the epoch-ms this gateway process started; a file mtime
- * strictly older than it is flagged `prevBoot` so the renderer can label the
- * row instead of presenting stale data as current.
+ * `bootStartMs` is the epoch-ms this CONTAINER booted (see
+ * `containerBootStartMs`); a file mtime strictly older than it belongs to a
+ * previous container boot and is flagged `prevBoot` so the renderer can label
+ * the row instead of presenting stale data as current. Keyed on container boot
+ * (not gateway process start) so a gateway-only respawn does not mislabel the
+ * still-current file.
  */
 export function readRoutingMode(
   agentDir: string,
@@ -716,8 +758,10 @@ export interface RunProbesOpts {
   /**
    * Epoch-ms this gateway boot started — the staleness threshold for the
    * `.routing-mode` row (a file mtime older than this is the PREVIOUS boot's
-   * value and is labeled, never shown as current). Defaults to the gateway
-   * process start (`Date.now() - process.uptime()*1000`). Test override.
+   * value and is labeled, never shown as current). Defaults to the CONTAINER
+   * boot time (`containerBootStartMs`, stable across gateway-only respawns),
+   * falling back to the gateway process start when /proc is unavailable. Test
+   * override.
    */
   routingBootStartMs?: number
 }
@@ -990,7 +1034,9 @@ export async function startBootCard(
         // reader flags it prevBoot (rendered "(prev boot)", never as
         // current). Absent/unreadable file → row omitted.
         const routingBootStartMs =
-          opts.routingBootStartMs ?? Date.now() - process.uptime() * 1000
+          opts.routingBootStartMs ??
+          containerBootStartMs() ??
+          Date.now() - process.uptime() * 1000
         let routing: RoutingModeInfo | null = null
         try {
           routing = readRoutingMode(opts.agentDir, routingBootStartMs)
