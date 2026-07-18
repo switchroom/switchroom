@@ -115,6 +115,7 @@ import {
   handlePaidMediaMessage,
   type MediaEnvelopeDeps,
 } from './media-message-handlers.js'
+import { routeInbound, type InboundRouterDeps } from './inbound-router.js'
 import {
   handleDocumentMessage,
   handleAudioMessage,
@@ -8023,7 +8024,7 @@ function looksLikeAuthCode(text: string): boolean {
 }
 
 // ─── Coalescing ───────────────────────────────────────────────────────────
-type AttachmentMeta = {
+export type AttachmentMeta = {
   kind: string
   file_id: string
   size?: number
@@ -24050,8 +24051,15 @@ bot.on('callback_query:data', async ctx => {
     },
   })
 })
+// Injected collaborators for the P7 inbound-routing seam (switchroom#2996 P7).
+// Bound once here so the coalesced entry points (message:text + the terminal
+// catch-all) delegate through the single `routeInbound` chokepoint. Live
+// references only — no value snapshots (see InboundRouterDeps).
+const inboundRouterDeps: InboundRouterDeps = {
+  handleInboundCoalesced,
+}
 bot.on('message:text', async ctx => {
-  await handleInboundCoalesced(ctx, ctx.message.text, undefined)
+  await routeInbound(ctx, ctx.message.text, undefined, undefined, inboundRouterDeps)
 })
 bot.on('message:photo', ctx => handlePhotoMessage(ctx, photoHandlerDeps))
 bot.on('message:document', ctx => handleDocumentMessage(ctx, attachmentHandlerDeps))
@@ -24223,7 +24231,7 @@ bot.on('message:checklist_tasks_added' as Parameters<typeof bot.on>[0], (ctx) =>
 bot.on('message:pinned_message', ctx => handlePinnedMessage(ctx, pinnedMessageHandlerDeps))
 installUnhandledMessageCatchAll(
   bot,
-  (ctx, text) => handleInboundCoalesced(ctx, text, undefined),
+  (ctx, text) => routeInbound(ctx, text, undefined, undefined, inboundRouterDeps),
   line => process.stderr.write(line),
 )
 bot.on('message_reaction' as Parameters<typeof bot.on>[0], (ctx) => {
