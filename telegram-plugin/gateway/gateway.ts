@@ -132,6 +132,10 @@ import {
   handlePhotoMessage,
   type PhotoHandlerDeps,
 } from './photo-message-handler.js'
+import {
+  handleVoiceMessage,
+  type VoiceHandlerDeps,
+} from './voice-message-handler.js'
 import { fmtLocalStamp, resolveEnvTimezone, renderLogTimestampsLocal } from '../shared/local-time.js'
 import { StatusReactionController } from '../status-reactions.js'
 import { DeferredDoneReactions } from '../reaction-defer.js'
@@ -24636,68 +24640,7 @@ bot.on('message:text', async ctx => {
 })
 bot.on('message:photo', ctx => handlePhotoMessage(ctx, photoHandlerDeps))
 bot.on('message:document', ctx => handleDocumentMessage(ctx, attachmentHandlerDeps))
-bot.on('message:voice', async ctx => {
-  const voice = ctx.message.voice
-  // #578 spike: when voice_in is enabled in access.json, download
-  // the audio and transcribe via Whisper before surfacing to the
-  // agent. The transcript becomes the inbound text; the agent reads
-  // it like a typed message. Failure paths gracefully fall back to
-  // the legacy "(voice message)" envelope so the agent still gets
-  // SOMETHING — better than silent drops.
-  const access = loadAccess()
-  const voiceIn = access.voice_in
-  // Engine selection (PR-B2): the persisted host verdict decides HOW we
-  // transcribe. `local` → the in-fleet GPU sidecar (no third-party key,
-  // vision #3 + #4); anything else → the OpenAI cloud provider. The local
-  // path needs no `provider === 'openai'` gate — it has no API key — so we
-  // route to the sidecar whenever voice_in is enabled AND the host verdict
-  // is `local`. The cloud path keeps its existing openai gate.
-  // Source precedence: the compose-injected SWITCHROOM_VOICE_ENGINE env
-  // (set per-agent by compose-gen from the host verdict — PR-B3) wins,
-  // then the persisted host-capabilities file, then a fail-safe `cloud`.
-  // The env is load-bearing in-fleet: the in-container `~/.switchroom`
-  // is a read-only constructed view that does NOT carry the host's
-  // host-capabilities.json, so without the env the file lookup always
-  // misses and every agent silently falls back to `cloud`. Narrow the
-  // env value to the VoiceEngine union so a bogus value can't leak
-  // through — anything but 'local'/'cloud' is ignored and we fall back.
-  const envVoiceEngine = process.env.SWITCHROOM_VOICE_ENGINE
-  const voiceEngine: VoiceEngine =
-    envVoiceEngine === 'local' || envVoiceEngine === 'cloud'
-      ? envVoiceEngine
-      : loadHostCapabilities()?.voice.engine ?? 'cloud'
-  const localEnabled = voiceIn?.enabled === true && voiceEngine === 'local'
-  const cloudEnabled =
-    voiceIn?.enabled === true && voiceEngine !== 'local' && voiceIn?.provider === 'openai'
-  if (localEnabled || cloudEnabled) {
-    const transcript = localEnabled
-      ? await maybeTranscribeVoiceLocal(
-          voice.file_id,
-          voice.mime_type,
-          voiceIn?.language,
-        )
-      : await maybeTranscribeVoice(
-          voice.file_id,
-          voice.mime_type,
-          voiceIn?.language,
-          voiceIn?.api_key,
-        )
-    if (transcript != null) {
-      const text = ctx.message.caption
-        ? `${ctx.message.caption}\n\n[voice transcript] ${transcript}`
-        : `[voice transcript] ${transcript}`
-      await handleInboundCoalesced(ctx, text, undefined, {
-        kind: 'voice',
-        file_id: voice.file_id,
-        size: voice.file_size,
-        mime: voice.mime_type,
-      })
-      return
-    }
-    // Fall through to the legacy path on transcription failure.
-  }
-  await handleInboundCoalesced(ctx, ctx.message.caption ?? '(voice message)', undefined, { kind: 'voice', file_id: voice.file_id, size: voice.file_size, mime: voice.mime_type })
-})
+bot.on('message:voice', ctx => handleVoiceMessage(ctx, voiceHandlerDeps))
 bot.on('message:audio', ctx => handleAudioMessage(ctx, attachmentHandlerDeps))
 bot.on('message:video', ctx => handleVideoMessage(ctx, attachmentHandlerDeps))
 bot.on('message:video_note', ctx => handleVideoNoteMessage(ctx, attachmentHandlerDeps))
@@ -24725,6 +24668,16 @@ const photoHandlerDeps: PhotoHandlerDeps = {
   getToken: () => TOKEN,
   inboxDir: INBOX_DIR,
   log: line => process.stderr.write(line),
+}
+// Injected surface for the extracted voice handler (switchroom#2996 P6
+// cluster E) — access + host-capability loads, both transcribe entry points,
+// and the coalescing dispatch.
+const voiceHandlerDeps: VoiceHandlerDeps = {
+  loadAccess,
+  loadHostCapabilities,
+  maybeTranscribeVoiceLocal,
+  maybeTranscribeVoice,
+  handleInboundCoalesced,
 }
 bot.on('message:contact', ctx => handleContactMessage(ctx, mediaEnvelopeDeps))
 bot.on('message:location', ctx => handleLocationMessage(ctx, mediaEnvelopeDeps))
