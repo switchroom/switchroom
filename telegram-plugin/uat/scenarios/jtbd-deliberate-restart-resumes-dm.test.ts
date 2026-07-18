@@ -21,10 +21,13 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { execSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { spinUp } from "../harness.js";
+import { restartCapableOrAnnounceSkip } from "../restart-capability.js";
 
 const AGENT = "test-harness";
+const SCENARIO_TITLE =
+  "uat: deliberate restart mid-turn resumes exactly once (DM, #2988)";
 const MID_TURN_MS = 10_000;        // let the turn get in-flight before the bounce
 const RESUME_BUDGET_MS = 180_000;  // boot + resume + reply
 const QUIET_WINDOW_MS = 90_000;    // after the resume completes, no second resume may fire
@@ -35,15 +38,6 @@ const QUIET_WINDOW_MS = 90_000;    // after the resume completes, no second resu
 const SAME_TURN_GRACE_MS = 20_000;
 
 const RESUME_FRAMING = /resum|picking .*back|interrupted|cut off|just restarted/i;
-
-function canShellSudo(): boolean {
-  try {
-    execSync("sudo -n true", { stdio: "ignore", timeout: 2_000 });
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 function kickRestartDetached(name: string): void {
   // A deliberate operator restart: clean SIGTERM path, clean-shutdown marker
@@ -57,10 +51,10 @@ function kickRestartDetached(name: string): void {
   child.unref();
 }
 
-const sudoOk = canShellSudo();
+const sudoOk = restartCapableOrAnnounceSkip(SCENARIO_TITLE);
 
 (sudoOk ? describe : describe.skip)(
-  "uat: deliberate restart mid-turn resumes exactly once (DM, #2988)",
+  SCENARIO_TITLE,
   () => {
     it(
       "an operator restart mid-turn resumes the work once, and never a second time",

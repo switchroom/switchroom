@@ -55,8 +55,10 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import { execSync } from "node:child_process";
 import { spinUp } from "../harness.js";
+import { restartCapableOrAnnounceSkip } from "../restart-capability.js";
 
 const AGENT = "test-harness";
+const SCENARIO_TITLE = "uat: always-on after restart";
 
 // Budget for the marker-safe restart itself (per
 // feedback_agent_restart_needs_sudo_when_running.md, restart blocks
@@ -74,15 +76,6 @@ const HARD_REPLY_BUDGET_MS = 120_000;
 // contract but worth logging for forensic visibility.
 const VISION_REPLY_BUDGET_MS = 30_000;
 
-function canShellSudo(): boolean {
-  try {
-    execSync("sudo -n true", { stdio: "ignore", timeout: 2_000 });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function restartAgent(name: string): void {
   // Marker-safe restart per memory feedback_compose_rollout.md +
   // feedback_agent_restart_needs_sudo_when_running.md. Apply step
@@ -96,11 +89,12 @@ function restartAgent(name: string): void {
 }
 
 // This scenario requires NOPASSWD sudo + the switchroom CLI on PATH on
-// the harness host. Skip on CI runners that don't expose those.
-const sudoOk = canShellSudo();
+// the harness host. Skip on CI runners that don't expose those — and when
+// we skip, announce it LOUDLY so a green isn't mistaken for live proof.
+const sudoOk = restartCapableOrAnnounceSkip(SCENARIO_TITLE);
 
 (sudoOk ? describe : describe.skip)(
-  "uat: always-on after restart",
+  SCENARIO_TITLE,
   () => {
     beforeAll(() => {
       restartAgent(AGENT);
