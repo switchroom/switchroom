@@ -63,3 +63,19 @@ export function renderVaultRequestAccessCard(
   // direct via richMessage, bypassing the switchroomReply chokepoint.
   return hardenCardBreaks(lines.join('\n'))
 }
+
+/**
+ * Inline keyboard for the vault-access request card (#1012). Callback prefix
+ * `vra:`, handled by handleVaultRequestAccessCallback in
+ * callback-query-handlers.ts. Extracted verbatim from gateway.ts (#2996 P5).
+ */
+export function buildVaultRequestAccessKeyboard(stageId: string): { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } {
+  return {
+    inline_keyboard: [
+      [
+        { text: '✅ Approve', callback_data: `vra:approve:${stageId}` },
+        { text: '🚫 Deny', callback_data: `vra:deny:${stageId}` },
+      ],
+    ],
+  }
+}
