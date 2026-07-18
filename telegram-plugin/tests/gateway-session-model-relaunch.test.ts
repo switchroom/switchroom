@@ -122,9 +122,15 @@ describe('gateway: the live callback dispatcher routes every switch tap to the h
   })
 
   it('the typed dispatcher relays the handler reply directly (no recordTypedModelSwitch)', () => {
-    const idx = GATEWAY_SRC.indexOf('const reply = await handleModelCommand(parsed, deps)')
+    // #2996 P6: the typed /model handler moved to bot-commands-model-effort.ts
+    // (registerModelEffortCommands); scrape the extracted module instead.
+    const MODULE_SRC = readFileSync(
+      resolve(__dirname, '..', 'gateway', 'bot-commands-model-effort.ts'),
+      'utf8',
+    )
+    const idx = MODULE_SRC.indexOf('const reply = await handleModelCommand(parsed, cmdDeps)')
     expect(idx).toBeGreaterThan(0)
-    const win = GATEWAY_SRC.slice(idx, idx + 400)
+    const win = MODULE_SRC.slice(idx, idx + 400)
     expect(win).not.toContain('recordTypedModelSwitch')
     expect(win).toContain('switchroomReply(ctx, reply.text')
   })
