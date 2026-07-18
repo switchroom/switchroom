@@ -203,10 +203,34 @@ function renderTable(node: TableNode): string {
   return [headerLine, sepLine, ...bodyLines].join("\n");
 }
 
+/**
+ * Escape a line-leading `#` in rendered PROSE so Telegram cannot promote the
+ * line to a heading (#3304 regression).
+ *
+ * Per CommonMark/GFM, `#` opens an ATX heading only when followed by a space,
+ * another `#`, or end-of-line — so micromark correctly parses `#3304 is
+ * merged.` as a plain paragraph, and this renderer re-emits it verbatim
+ * (`escapeMarkdown` deliberately leaves `#` alone). But Telegram's Bot API
+ * 10.1 server-side rich-markdown parser is NON-spec here: any line-leading
+ * `#` run is read as a heading, so an issue reference opening a line renders
+ * the whole paragraph as huge heading text. Backslash-escaping the first `#`
+ * of each such line keeps it literal on Telegram while remaining a no-op
+ * visually (Telegram honours backslash escapes, same mechanism the link-href
+ * `)` escape relies on).
+ *
+ * Applied ONLY to paragraph output (including paragraphs nested in
+ * blockquotes / list items via their renderBlock recursion), never to
+ * heading, code-block, or table nodes — so a genuine `# Title` heading node
+ * still renders as `# Title`.
+ */
+function escapeLineLeadingHash(text: string): string {
+  return text.replace(/^([ \t]{0,3})#/gm, "$1\\#");
+}
+
 function renderBlock(node: Block): string {
   switch (node.type) {
     case "paragraph":
-      return renderInlineChildren(node.children);
+      return escapeLineLeadingHash(renderInlineChildren(node.children));
     case "heading":
       return `${"#".repeat(node.level)} ${renderInlineChildren(node.children)}`;
     case "blockquote":

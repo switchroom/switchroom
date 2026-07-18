@@ -143,6 +143,48 @@ describe("render: inline palette", () => {
   });
 });
 
+describe("render: line-leading issue refs are not headings (#3304 regression)", () => {
+  it("multi-line message whose first line starts with #3304 stays a paragraph", () => {
+    const md = "#3304 is merged. The regression suite is green.\n\nNext up: the follow-up PR.";
+    const doc = parse(md);
+    // Spec-correct parse: `#` without a following space is NOT an ATX heading.
+    expect(doc.blocks.map((b) => b.type)).toEqual(["paragraph", "paragraph"]);
+
+    const out = render(doc);
+    // The line-leading `#` must be escaped so Telegram's non-spec rich parser
+    // cannot promote the line to a heading...
+    expect(out.startsWith("\\#3304 is merged.")).toBe(true);
+    expect(out).not.toMatch(/^#{1,6} /m);
+    // ...and the escape resolves back to the literal "#3304" on re-parse
+    // (what the reader sees), with no heading node anywhere.
+    const reparsed = parse(out);
+    expect(reparsed.blocks.map((b) => b.type)).toEqual(["paragraph", "paragraph"]);
+    expect((reparsed.blocks[0] as any).children[0].text).toContain("#3304 is merged.");
+  });
+
+  it("issue ref at line start mid-message is escaped too", () => {
+    const md = "Shipped today:\n#123 closes the loop on retries.";
+    const out = render(parse(md));
+    expect(out).toContain("\n\\#123 closes the loop");
+    const reparsed = parse(out);
+    expect(reparsed.blocks.every((b) => b.type !== "heading")).toBe(true);
+  });
+
+  it("a genuine `# Heading` still renders as a heading", () => {
+    const md = "# Release notes\n\n#456 fixed the flake.";
+    const out = render(parse(md));
+    expect(out.startsWith("# Release notes")).toBe(true);
+    expect(out).toContain("\\#456 fixed the flake.");
+    const reparsed = parse(out);
+    expect(reparsed.blocks[0].type).toBe("heading");
+  });
+
+  it("mid-line `#` is left alone", () => {
+    const md = "merged in PR #789 yesterday";
+    expect(render(parse(md))).toBe(md);
+  });
+});
+
 describe("render: block palette", () => {
   it("heading levels 1-6", () => {
     for (let level = 1; level <= 6; level++) {
