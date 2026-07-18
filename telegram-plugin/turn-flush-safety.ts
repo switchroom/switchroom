@@ -170,13 +170,21 @@ export const FLUSH_SUBSTANTIVE_MIN_CHARS = 200
  * the model ACTS (a tool call follows it); a terminal answer paragraph is not
  * followed by any tool call. That per-block flag (`lastInMessage`) is computed
  * upstream by `projectAssistantTextBlocks` (session-tail.ts) and, when the
- * caller plumbs it through as `followedByToolUse`, we trust STRUCTURE ALONE:
- * a preceding block is narration iff it was followed by a tool_use. Where the
- * structural flag is ABSENT for a block (legacy `string[]` caller, or the
- * accumulator lost provenance) we fall back to the opener/trailer heuristic for
- * that block — so the change is strictly additive: never worse than the
- * opener-only strip, deterministic and truncation-free when the signal is
- * present.
+ * caller plumbs it through as `followedByToolUse`, we consult STRUCTURE, but
+ * asymmetrically:
+ *   - present-and-FALSE (no tool_use followed) is purely additive — it can only
+ *     RESCUE a block the opener regex would have mis-stripped (a terminal answer
+ *     opening "Let me explain…"); it never drops a block the heuristic kept.
+ *   - present-and-TRUE (a tool_use followed) is NOT taken as narration on its
+ *     own: a substantial real-content paragraph can precede a tool call, so the
+ *     strip is GATED by the substance check (narration only if it also matches
+ *     the opener/trailer heuristic OR falls below the substantive floor). This
+ *     is deliberately not "strictly additive" over the opener-only strip — it
+ *     both rescues real content the old flag-alone path would have dropped and
+ *     stays truncation-free.
+ * Where the structural flag is ABSENT for a block (legacy `string[]` caller, or
+ * the accumulator lost provenance) we fall back to the opener/trailer heuristic
+ * for that block.
  *
  * `followedByToolUse` is a parallel array aligned to `blocks` (index `i` ⇒
  * `blocks[i]`); it is zipped BEFORE the empty-block filter so alignment holds
@@ -199,14 +207,26 @@ export function selectFlushDeliveryText(
   const answer = candidates[candidates.length - 1].text
   const preceding = candidates.slice(0, -1)
   // Deliver only the terminal answer when every earlier block is
-  // intent-narration. Per block: when a reliable structural signal is present
-  // (`followedByToolUse !== undefined`) trust it ALONE — a block followed by a
-  // tool_use in its message is the model drafting-then-acting (narration);
-  // otherwise fall back to the opener/trailer heuristic. Otherwise the earlier
-  // blocks carry real content — keep the full joined text so a legitimate
-  // multi-block answer is never truncated to its last paragraph (#3237).
+  // intent-narration. Per block:
+  //   - structural flag TRUE ⇒ a tool_use followed this block, but that alone
+  //     is NOT sufficient to drop it: a substantial real-content paragraph can
+  //     legitimately precede a tool call (the model writes a real answer, then
+  //     calls a memory/verify tool, then a short wrap-up). So gate the
+  //     structural strip with the substantive floor — narration only if the
+  //     block ALSO looks like narration OR is below the substantive floor.
+  //   - structural flag FALSE ⇒ present-and-false definitively overrides the
+  //     opener regex: no tool_use followed, so it is a terminal-style block,
+  //     never narration (#3237).
+  //   - structural flag ABSENT ⇒ fall back to the opener/trailer heuristic.
+  // Otherwise the earlier blocks carry real content — keep the full joined text
+  // so a legitimate multi-block answer is never truncated to its last
+  // paragraph (#3237).
   const allNarration = preceding.every(c =>
-    c.followedByToolUse !== undefined ? c.followedByToolUse : isNarrationBlock(c.text),
+    c.followedByToolUse === true
+      ? isNarrationBlock(c.text) || c.text.trim().length < FLUSH_SUBSTANTIVE_MIN_CHARS
+      : c.followedByToolUse === false
+        ? false
+        : isNarrationBlock(c.text),
   )
   return allNarration ? answer : candidates.map(c => c.text).join('\n\n')
 }
@@ -283,7 +303,9 @@ export interface FlushDecisionInput {
    * Consumed by `selectFlushDeliveryText` to separate a narration preamble from
    * a real answer paragraph that merely opens with a narration phrase (#3237).
    * When absent (legacy caller / lost provenance) the strip falls back to the
-   * opener/trailer heuristic, so this field is strictly additive. */
+   * opener/trailer heuristic. Present-and-false is additive (only rescues a
+   * mis-stripped terminal answer); present-and-true is gated by the substantive
+   * floor rather than trusted alone. */
   capturedBlockMeta?: boolean[]
   /** Feature flag — defaults to true. Pass `false` to force skip everywhere. */
   flushEnabled?: boolean

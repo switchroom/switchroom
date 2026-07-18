@@ -807,4 +807,52 @@ describe('selectFlushDeliveryText — structural provenance (followedByToolUse) 
     expect(strip.kind).toBe('flush')
     if (strip.kind === 'flush') expect(strip.text).toBe('Revenue was 4.2M.')
   })
+
+  // Regression for the post-#3338 review finding: a SUBSTANTIAL real-content
+  // block (≥ FLUSH_SUBSTANTIVE_MIN_CHARS, NOT narration-shaped) that happens to
+  // be followed by a tool_use must be KEPT — the model can write a real answer
+  // paragraph, then call a memory/verify tool, then a short wrap-up. Trusting
+  // followedByToolUse ALONE (the pre-fix behaviour) dropped the real answer and
+  // delivered only the wrap-up. The structural strip is gated by the substantive
+  // floor, so the substantial block survives.
+  it('substantial real-content block followed by a tool_use is KEPT (structural flag gated by the substantive floor)', () => {
+    const realAnswer =
+      'The migration completed cleanly across all five shards: each shard was ' +
+      'drained, the schema applied under an advisory lock, and traffic cut back ' +
+      'over with zero dropped requests. The new index brought the p99 query time ' +
+      'down from 840ms to 60ms, and the old columns are now safe to remove in ' +
+      'the next release once the read path is confirmed off them entirely.'
+    expect(realAnswer.length).toBeGreaterThanOrEqual(FLUSH_SUBSTANTIVE_MIN_CHARS)
+    // Not narration-shaped: no first-person "about to do X" opener, no
+    // trailing ellipsis/colon — so only the structural flag could strip it.
+    const wrapUp = 'Saved that to memory.'
+    // meta[0]=true (a memory tool_use followed the real answer), [1]=false.
+    const out = selectFlushDeliveryText([realAnswer, wrapUp], [true, false])
+    expect(out).toBe(`${realAnswer}\n\n${wrapUp}`)
+    expect(out).toContain('The migration completed cleanly')
+
+    // End-to-end through decideTurnFlush.
+    const decision = decideTurnFlush({
+      chatId: 'chat1',
+      replyCalled: false,
+      capturedText: [realAnswer, wrapUp],
+      capturedBlockMeta: [true, false],
+    })
+    expect(decision.kind).toBe('flush')
+    if (decision.kind === 'flush') {
+      expect(decision.text).toBe(`${realAnswer}\n\n${wrapUp}`)
+    }
+  })
+
+  // A SHORT block followed by a tool_use is still stripped via the length floor
+  // (the pre-#3237 "short preamble the opener misses" behaviour is preserved):
+  // it is below FLUSH_SUBSTANTIVE_MIN_CHARS, so the gated strip still fires.
+  it('short block followed by a tool_use is still stripped (length-floor branch of the gate)', () => {
+    const shortPreamble = 'Here are the figures you asked about.'
+    expect(shortPreamble.length).toBeLessThan(FLUSH_SUBSTANTIVE_MIN_CHARS)
+    const realAnswer = 'The three services are all green.'
+    const out = selectFlushDeliveryText([shortPreamble, realAnswer], [true, false])
+    expect(out).toBe(realAnswer)
+    expect(out).not.toContain('Here are the figures')
+  })
 })
