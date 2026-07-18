@@ -154,20 +154,20 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Set up Bun (build.mjs invokes bun build)
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
-        with:
-          bun-version: latest
+      - name: Set up workspace (pinned bun + warm cache + frozen lockfile)
+        # Composite action: pinned bun (not `latest` — an unpinned bun
+        # release changing under a release build is a flake vector), bun
+        # package cache restore, and `bun install --frozen-lockfile`
+        # (a bare `bun install` can silently drift from bun.lock).
+        uses: ./.github/actions/setup-switchroom
 
-      - name: Install deps + build dist/
+      - name: Build dist/
         env:
           # Arms the mis-stamp guard in scripts/build.mjs: on a tag build this is
           # the tag (e.g. v0.15.56); on non-tag builds it is empty so the guard
           # stays silent and dev builds fall back to package.json.
           TAG_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
-        run: |
-          bun install
-          npm run build
+        run: npm run build
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
@@ -335,20 +335,20 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Set up Bun (build.mjs invokes bun build)
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
-        with:
-          bun-version: latest
+      - name: Set up workspace (pinned bun + warm cache + frozen lockfile)
+        # Composite action: pinned bun (not `latest` — an unpinned bun
+        # release changing under a release build is a flake vector), bun
+        # package cache restore, and `bun install --frozen-lockfile`
+        # (a bare `bun install` can silently drift from bun.lock).
+        uses: ./.github/actions/setup-switchroom
 
-      - name: Install deps + build dist/
+      - name: Build dist/
         env:
           # Arms the mis-stamp guard in scripts/build.mjs: on a tag build this is
           # the tag (e.g. v0.15.56); on non-tag builds it is empty so the guard
           # stays silent and dev builds fall back to package.json.
           TAG_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
-        run: |
-          bun install
-          npm run build
+        run: npm run build
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
@@ -721,13 +721,10 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Set up Bun
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
-        with:
-          bun-version: latest
-
-      - name: Install deps
-        run: bun install
+      - name: Set up workspace (pinned bun + warm cache + frozen lockfile)
+        # Composite action — pinned bun + cached `bun install
+        # --frozen-lockfile` (was unpinned `latest` + bare `bun install`).
+        uses: ./.github/actions/setup-switchroom
 
       - name: Log in to GHCR (smoke pulls private images)
         uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0  # v4.4.0

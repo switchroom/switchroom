@@ -142,6 +142,11 @@ jobs:
       - name: Run voice-sidecar unittests
         working-directory: docker/voice-sidecar
         run: python3 -m unittest discover -s . -p 'test_*.py'
+      # Mirrors ci-tests-python.yml — this step was missing here (twin-job
+      # drift), so the nightly sweep never ran the pacer suite.
+      - name: Run litellm-pacer unittests
+        working-directory: docker/litellm-pacer
+        run: python3 -m unittest discover -s . -p 'test_*.py'
 
   # ─── Docker e2e, forced COLD path (mirrors docker-e2e.yml e2e) ────
   # Deliberately no actions/cache restore: the nightly job exists to
@@ -231,17 +236,17 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Set up Bun (build.mjs invokes bun build)
+      - name: Set up workspace (pinned bun + warm cache + frozen lockfile)
+        # Composite action: pinned bun (not `latest` — an unpinned bun
+        # release changing under the job is a flake vector), bun package
+        # cache restore, and `bun install --frozen-lockfile` (a bare
+        # `bun install` can silently drift from bun.lock).
         if: matrix.image.dist
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
-        with:
-          bun-version: latest
+        uses: ./.github/actions/setup-switchroom
 
-      - name: Install deps + build dist/
+      - name: Build dist/
         if: matrix.image.dist
-        run: |
-          bun install
-          npm run build
+        run: npm run build
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0

@@ -36,6 +36,22 @@ on:
       - ".github/workflows/ci-evals.yml"
   push:
     branches: [main]
+    # Same eval-relevant scope as the PR trigger. Pre-fix the push
+    # trigger had NO paths filter, so EVERY main merge (refactors, docs,
+    # unrelated src/) ran both eval jobs — each a real claude-model
+    # spend (API pool or subscription weekly cap). Evals are not a
+    # required check and ci-infra-watchdog doesn't observe them, so
+    # path-scoping the push trigger is safe; workflow_dispatch remains
+    # the on-demand full-run lever. Mirrors the quota-driven
+    # path-scoping already on ci-uat's push trigger.
+    paths:
+      - "skills/**/SKILL.md"
+      - "evals/run_trigger.py"
+      - "evals/run_quality.py"
+      - "evals/trigger_dataset.yaml"
+      - "evals/dataset.yaml"
+      - "profiles/**/CLAUDE.md*"
+      - ".github/workflows/ci-evals.yml"
   workflow_dispatch:
 
 permissions:
