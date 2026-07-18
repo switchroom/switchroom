@@ -59,6 +59,7 @@ function makeHarness(opts: { agentId?: string } = {}) {
   const progressCalls: ProgressCall[] = []
   const finishCalls: Array<{ agentId: string; outcome: string }> = []
   const terminalCleanupCalls: string[] = []
+  const resumeCalls: Array<{ agentId: string; description: string }> = []
   const logs: string[] = []
 
   const agentDir = '/home/user/.switchroom/agents/myagent'
@@ -133,6 +134,7 @@ function makeHarness(opts: { agentId?: string } = {}) {
       progressCalls.push({ agentId: id, skeleton: skeleton === true, progressLine, toolCount }),
     onFinish: ({ agentId: id, outcome }) => finishCalls.push({ agentId: id, outcome }),
     onTerminalCleanup: (id) => terminalCleanupCalls.push(id),
+    onResume: (id, description) => resumeCalls.push({ agentId: id, description }),
     now: () => currentTime,
     setInterval: (fn, ms) => {
       const ref = nextRef++
@@ -191,6 +193,7 @@ function makeHarness(opts: { agentId?: string } = {}) {
     progressCalls,
     finishCalls,
     terminalCleanupCalls,
+    resumeCalls,
     logs,
     advance,
     watcher,
@@ -240,6 +243,13 @@ describe('subagent-watcher resume re-registration (issue #3315)', () => {
     expect(revived!.historical).toBe(false)
     expect(h.logs.some((l) => l.includes('resumed after terminal cleanup') && l.includes(agentId))).toBe(true)
 
+    // Issue #3373: onResume fired exactly once for the resumed worker, BEFORE
+    // registration re-fires onProgress — this is what clears the feed's terminal
+    // `finalized` latch so the resumed cues re-surface a card instead of being
+    // swallowed. (The feed-side re-surface behaviour is covered in
+    // worker-activity-feed.test.ts.)
+    expect(h.resumeCalls.filter((c) => c.agentId === agentId)).toHaveLength(1)
+
     // Progress cues resume (the card updates again) — the user-visible fix.
     expect(h.progressCalls.length).toBeGreaterThan(progressBeforeResume)
     expect(h.progressCalls.slice(progressBeforeResume).some((c) => c.agentId === agentId)).toBe(true)
@@ -285,6 +295,10 @@ describe('subagent-watcher resume re-registration (issue #3315)', () => {
     expect(h.progressCalls).toHaveLength(progressAfterCleanup) // no card churn
     // Cleanup fired exactly once — no leaked/duplicated terminal sweep.
     expect(h.terminalCleanupCalls.filter((id) => id === agentId)).toHaveLength(1)
+    // Issue #3373 anti-zombie: a genuinely-finished worker that never grew past
+    // its terminal boundary must NEVER fire onResume — otherwise the feed's
+    // finalized latch would be cleared and a dead worker could zombie-resurface.
+    expect(h.resumeCalls.filter((c) => c.agentId === agentId)).toHaveLength(0)
 
     h.watcher.stop()
   })
