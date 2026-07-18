@@ -1,16 +1,17 @@
 /**
- * Structural test for the `bot.on('message:pinned_message')` handler that
- * suppresses the "pinned a message" service message Telegram inserts when
- * OUR silent status-pin fires.
+ * Structural test for the `message:pinned_message` handler that suppresses the
+ * "pinned a message" service message Telegram inserts when OUR silent status-pin
+ * fires.
  *
- * Why structural: like every other gateway handler, this closure is wired
- * inline against the live `bot` instance and is not exported — a functional
- * invocation would require booting the full grammy runtime against a mocked
- * Bot API. The gateway suite settled on file-level grep assertions for
- * exactly this reason (see `inbound-message-types.test.ts`). The regression
- * we care about: a future hand dropping the handler, dropping the ownership
- * guard (which would let us delete manual/operator pins), or swapping the
- * house deletion wrapper for a raw `bot.api.deleteMessage` (allowlist drift).
+ * As of switchroom#2996 P6 cluster F the handler body lives in the extracted
+ * `gateway/pinned-message-handler.ts` module (unit-tested for real in
+ * `pinned-message-handler.test.ts`); gateway.ts keeps only the thin
+ * `bot.on('message:pinned_message', …)` delegation plus the injected
+ * `deleteServiceMessage` binding that wraps the raw `lockedBot.api.deleteMessage`
+ * in `robustApiCall`. The regressions this structural test still guards: a hand
+ * dropping the delegation, dropping the ownership guard (which would let us
+ * delete manual/operator pins), or moving the raw delete out from under the
+ * robust wrapper (allowlist drift).
  */
 
 import { describe, it, expect } from 'vitest'
@@ -25,66 +26,58 @@ const SRC = readFileSync(
   'utf8',
 )
 
-/**
- * Extract the body of the `bot.on('message:pinned_message', …)` handler:
- * from the `bot.on(` line to the matching outer-scope closing brace.
- */
-function pinnedMessageHandler(): string {
-  const needle = `bot.on('message:pinned_message'`
-  const start = SRC.indexOf(needle)
-  expect(start, `handler ${needle} not found`).toBeGreaterThan(0)
-  const firstBrace = SRC.indexOf('{', start)
-  let depth = 0
-  for (let i = firstBrace; i < SRC.length; i++) {
-    const c = SRC[i]
-    if (c === '{') depth++
-    else if (c === '}') {
-      depth--
-      if (depth === 0) return SRC.slice(start, i + 1)
-    }
-  }
-  throw new Error('could not find end of pinned_message handler')
-}
+const MODULE_SRC = readFileSync(
+  new URL('../gateway/pinned-message-handler.ts', import.meta.url),
+  'utf8',
+)
 
 describe('status-pin service-message suppression', () => {
-  it("registers a bot.on('message:pinned_message') handler", () => {
+  it("registers a bot.on('message:pinned_message') delegation to the extracted handler", () => {
     expect(SRC).toContain(`bot.on('message:pinned_message'`)
+    // The registration is now a thin delegation into the extracted module.
+    expect(SRC).toContain('handlePinnedMessage(ctx, pinnedMessageHandlerDeps)')
   })
-
-  const body = pinnedMessageHandler()
 
   it('guards on ownership via the chat-scoped pinnedMessageIsOurs helper', () => {
     // Must consult our tracked pins — never blindly delete a pin service
     // message (which would nuke manual/operator pins too) — AND it must be
     // chat-scoped (pinnedMessageIsOurs requires chatId + messageId), never a
     // messageId-only match.
-    expect(body).toContain('statusPinState')
-    expect(body).toMatch(/pinned_message\?\.message_id/)
-    expect(body).toContain('pinnedMessageIsOurs(')
+    expect(MODULE_SRC).toContain('deps.statusPinState')
+    expect(MODULE_SRC).toMatch(/pinned_message\?\.message_id/)
+    expect(MODULE_SRC).toContain('pinnedMessageIsOurs(')
     // The chatId computed from the update must be fed to the guard.
-    expect(body).toMatch(/pinnedMessageIsOurs\(trackedPins\(\), chatId, pinnedId\)/)
+    expect(MODULE_SRC).toMatch(/pinnedMessageIsOurs\(trackedPins\(\), chatId, pinnedId\)/)
     // And the tracked entries must carry their chat association.
-    expect(body).toContain('statusPinChatIds.get(pinKey)')
+    expect(MODULE_SRC).toContain('deps.statusPinChatIds.get(pinKey)')
   })
 
   it('bails out when the pinned message is not one of ours', () => {
     // A `return` guard for the non-owned case must exist.
-    expect(body).toMatch(/if \(!isOurs\(\)\) return/)
+    expect(MODULE_SRC).toMatch(/if \(!isOurs\(\)\) return/)
   })
 
   it('deletes the service message through the robust wrapper (not a raw api call)', () => {
-    expect(body).toContain('robustApiCall(')
-    expect(body).toContain('deleteMessage')
-    // The message deleted is the service message itself, not the pinned msg.
-    expect(body).toContain('serviceMsgId')
-    // House verb tag so operators can trace it.
-    expect(body).toContain("verb: 'status-pin.delete-service-message'")
+    // The extracted module carries no raw Bot API site — it calls the injected
+    // `deleteServiceMessage`, which gateway.ts binds through robustApiCall.
+    expect(MODULE_SRC).toContain('deps.deleteServiceMessage(chatId, serviceMsgId)')
+    // The module makes no raw Bot API call outside a comment (the docstring
+    // names the wrapped call as an example). Strip comment lines, then assert
+    // no `lockedBot.api.*(` invocation survives in executable code.
+    const codeOnly = MODULE_SRC.split('\n')
+      .filter(l => !/^\s*(\/\/|\*|\/\*)/.test(l))
+      .join('\n')
+    expect(codeOnly).not.toMatch(/lockedBot\.api\.\w+\(/)
+    // gateway.ts owns the robust wrapper + house verb tag.
+    expect(SRC).toContain('robustApiCall(')
+    expect(SRC).toContain('lockedBot.api.deleteMessage(chatId, serviceMsgId)')
+    expect(SRC).toContain("verb: 'status-pin.delete-service-message'")
   })
 
   it('tolerates the reconcile-store race with a short retry', () => {
     // The service update can arrive before reconcileStatusPin stores the
     // PinState; a single delayed re-check covers that window.
-    expect(body).toContain('setTimeout')
+    expect(MODULE_SRC).toContain('setTimeout')
   })
 })
 
@@ -199,9 +192,9 @@ describe('service-message deletion in supergroups / forum topics', () => {
 
   it('the handler logs a missing-admin-right hint on delete failure (supergroup)', () => {
     // Structural: the catch block names the likely supergroup cause so an
-    // operator isn't left with silent nothing.
+    // operator isn't left with silent nothing. Lives in the extracted module.
     const src = readFileSync(
-      new URL('../gateway/gateway.ts', import.meta.url),
+      new URL('../gateway/pinned-message-handler.ts', import.meta.url),
       'utf8',
     )
     expect(src).toContain('could not delete pin service message')

@@ -136,6 +136,10 @@ import {
   handleVoiceMessage,
   type VoiceHandlerDeps,
 } from './voice-message-handler.js'
+import {
+  handlePinnedMessage,
+  type PinnedMessageHandlerDeps,
+} from './pinned-message-handler.js'
 import { fmtLocalStamp, resolveEnvTimezone, renderLogTimestampsLocal } from '../shared/local-time.js'
 import { StatusReactionController } from '../status-reactions.js'
 import { DeferredDoneReactions } from '../reaction-defer.js'
@@ -615,12 +619,10 @@ import { buildCapturedDeliverySnapshot, createCapturedResumeDispatcher } from '.
 import {
   loadStatusPins,
   mutateStatusPinRow,
-  pinnedMessageIsOurs,
   reconcileAndPersistStatusPin,
   runStatusPinBootCleanup,
   type PersistedStatusPin,
   type StatusPinPersistOp,
-  type TrackedStatusPin,
 } from './status-pin-store.js'
 import {
   loadActivityCards,
@@ -24705,6 +24707,22 @@ const voiceHandlerDeps: VoiceHandlerDeps = {
   maybeTranscribeVoice,
   handleInboundCoalesced,
 }
+// Injected surface for the extracted pinned-message service-message cleanup
+// (switchroom#2996 P6 cluster F). The pin-ownership maps are injected live;
+// `deleteServiceMessage` binds the raw `lockedBot.api.deleteMessage` call
+// inside robustApiCall HERE so the extracted module carries no raw Bot API
+// site (check-bot-api-wrapping stays satisfied — the raw call remains in
+// gateway.ts, already inside the retry policy).
+const pinnedMessageHandlerDeps: PinnedMessageHandlerDeps = {
+  statusPinState,
+  statusPinChatIds,
+  deleteServiceMessage: (chatId, serviceMsgId) =>
+    robustApiCall(
+      () => lockedBot.api.deleteMessage(chatId, serviceMsgId),
+      { chat_id: chatId, verb: 'status-pin.delete-service-message' },
+    ).then(() => undefined),
+  log: line => process.stderr.write(line),
+}
 bot.on('message:contact', ctx => handleContactMessage(ctx, mediaEnvelopeDeps))
 bot.on('message:location', ctx => handleLocationMessage(ctx, mediaEnvelopeDeps))
 bot.on('message:venue', ctx => handleVenueMessage(ctx, mediaEnvelopeDeps))
@@ -24724,52 +24742,7 @@ bot.on('message:checklist_tasks_done' as Parameters<typeof bot.on>[0], (ctx) => 
 bot.on('message:checklist_tasks_added' as Parameters<typeof bot.on>[0], (ctx) => {
   handleChecklistUpdate(ctx as unknown as Context, 'checklist_tasks_added')
 })
-bot.on('message:pinned_message', async ctx => {
-  const pinnedId = ctx.msg.pinned_message?.message_id
-  if (pinnedId == null) return
-  const chatId = String(ctx.chat.id)
-  const serviceMsgId = ctx.msg.message_id
-
-  // Chat-scoped ownership (see pinnedMessageIsOurs): the match requires BOTH
-  // the messageId AND that the tracked entry lives in THIS chat, so a pin id
-  // colliding across chats can't delete a foreign (e.g. operator-manual) pin
-  // notice. statusPinChatIds is the companion pinKey→chatId map written on
-  // every desired-pinned reconcile.
-  const trackedPins = (): TrackedStatusPin[] => {
-    const out: TrackedStatusPin[] = []
-    for (const [pinKey, state] of statusPinState) {
-      const c = statusPinChatIds.get(pinKey)
-      if (c != null) out.push({ chatId: c, messageId: state.messageId })
-    }
-    return out
-  }
-  const isOurs = () => pinnedMessageIsOurs(trackedPins(), chatId, pinnedId)
-
-  if (!isOurs()) {
-    // Tolerate the reconcile-store race: wait briefly, then re-check once.
-    await new Promise(resolve => setTimeout(resolve, 250))
-    if (!isOurs()) return
-  }
-
-  try {
-    await robustApiCall(
-      () => lockedBot.api.deleteMessage(chatId, serviceMsgId),
-      { chat_id: chatId, verb: 'status-pin.delete-service-message' },
-    )
-  } catch (err) {
-    // Best-effort: a failure to delete the service message is cosmetic only —
-    // the "pinned a message" line just stays. The most likely cause in a
-    // supergroup/forum is the bot lacking can_delete_messages admin right, so
-    // surface a concise one-liner (robustApiCall rethrows this case without
-    // logging a reason) rather than swallowing silently — an operator sees WHY.
-    const msg = err instanceof Error ? err.message : String(err)
-    process.stderr.write(
-      `telegram gateway: status-pin: could not delete pin service message ` +
-        `(chat=${chatId} msg=${serviceMsgId}) — likely missing can_delete_messages ` +
-        `admin right in this chat: ${msg}\n`,
-    )
-  }
-})
+bot.on('message:pinned_message', ctx => handlePinnedMessage(ctx, pinnedMessageHandlerDeps))
 installUnhandledMessageCatchAll(
   bot,
   (ctx, text) => handleInboundCoalesced(ctx, text, undefined),
