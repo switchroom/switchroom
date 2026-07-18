@@ -76,6 +76,27 @@ export const ownershipRuntime = {
       stdio: ["ignore", "ignore", "pipe"],
     });
   },
+  /** Monotonic clock (ms), injectable so the timing log is deterministic in tests. */
+  now: (): number => Date.now(),
+  /**
+   * Count the inodes under `rootDir` (best-effort, instrumentation only —
+   * #3333). Shells `find | wc -l` so busybox and GNU both work; `rootDir`
+   * is passed as a positional arg (not interpolated) to avoid shell
+   * injection. Returns null when the count itself fails — instrumentation
+   * must never break the sweep.
+   */
+  countInodes: (rootDir: string): number | null => {
+    try {
+      const out = execFileSync("sh", ["-c", 'find "$1" 2>/dev/null | wc -l', "sh", rootDir], {
+        encoding: "utf8",
+        maxBuffer: 256 * 1024 * 1024,
+      });
+      const n = Number.parseInt(out.trim(), 10);
+      return Number.isFinite(n) ? n : null;
+    } catch {
+      return null;
+    }
+  },
 };
 
 /**
@@ -97,8 +118,19 @@ export function alignAgentTreeOwnershipIfRoot(
   if (ownershipRuntime.geteuid() !== 0) return null;
   if (!existsSync(agentDir)) return null;
   const uid = allocateAgentUid(name);
+  // Instrumentation (#3333 stage 1): time the sweep and count the inodes it
+  // walks, so a real roll can validate the "~620k → ~5k" scoping thesis
+  // before the scoped sweep flips on. Pure observation — no behaviour change,
+  // never allowed to break the sweep (countInodes returns null on failure).
+  const inodes = ownershipRuntime.countInodes(agentDir);
+  const startedAt = ownershipRuntime.now();
   try {
     ownershipRuntime.chownTree(uid, uid, agentDir);
+    const elapsedMs = ownershipRuntime.now() - startedAt;
+    console.log(
+      `[ownership-sweep] #3333 agent=${name} scope=full uid=${uid} ` +
+        `inodes=${inodes ?? "unknown"} elapsedMs=${elapsedMs} dir=${agentDir}`,
+    );
   } catch (err) {
     throw new Error(
       `reconcile wrote into ${agentDir} as root but could not restore agent ` +
