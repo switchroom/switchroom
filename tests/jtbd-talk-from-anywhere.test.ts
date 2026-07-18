@@ -56,6 +56,24 @@ const bridgeSrc = readFileSync(
   "utf-8",
 );
 
+// The approval-card keyboards were extracted from gateway.ts into
+// per-card modules (#2996 P5, PR #3330). The Principle-3 consistency
+// census must grep the extracted modules too, or the ✅/🚫 button
+// count undercounts — this exact miss kept main red on every
+// push-to-main full-suite run after #3330 merged (PRs stayed green
+// because `vitest --changed` never selected this file).
+const approvalCardsSrc = [
+  gatewaySrc,
+  readFileSync(
+    resolve(REPO_ROOT, "telegram-plugin/gateway/vault-request-save-card.ts"),
+    "utf-8",
+  ),
+  readFileSync(
+    resolve(REPO_ROOT, "telegram-plugin/gateway/vault-request-access-card.ts"),
+    "utf-8",
+  ),
+].join("\n");
+
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 /** Extract a single rendering case block from vault-error.ts switch arm. */
@@ -307,8 +325,8 @@ describe("Principles/consistency — every operator approval card uses the same 
     // failure: same operation, different emoji. Either standardise on
     // ✅ for all confirm buttons, or document why /vault audit is
     // different.
-    const approveButtons = gatewaySrc.match(/text:\s*['"`]✅[^'"`]+['"`]/g) ?? [];
-    const denyButtons = gatewaySrc.match(/text:\s*['"`]🚫[^'"`]+['"`]/g) ?? [];
+    const approveButtons = approvalCardsSrc.match(/text:\s*['"`]✅[^'"`]+['"`]/g) ?? [];
+    const denyButtons = approvalCardsSrc.match(/text:\s*['"`]🚫[^'"`]+['"`]/g) ?? [];
     // ✅ confirm buttons: at least 3 (save, access, recent-denial)
     expect(approveButtons.length, "≥3 ✅ confirm buttons across approval flows").toBeGreaterThanOrEqual(3);
     // 🚫 deny buttons: at least 2 (save discard, access deny)
@@ -326,7 +344,7 @@ describe("Principles/consistency — every operator approval card uses the same 
     // the dispatcher list is hand-maintained, so this test is more
     // a documentation invariant than a hard contract.
     const prefixUses = new Set<string>();
-    for (const m of gatewaySrc.matchAll(/callback_data:\s*[`'"]([a-z]+):/gi)) {
+    for (const m of approvalCardsSrc.matchAll(/callback_data:\s*[`'"]([a-z]+):/gi)) {
       prefixUses.add(m[1]!);
     }
     // Expected set as of #1012 Phase 1; `auth:` added when the
