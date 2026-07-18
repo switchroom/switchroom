@@ -48,6 +48,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { chatKey } from '../telegram-plugin/gateway/chat-key.js'
+import { inboundCoalesceKey } from '../telegram-plugin/gateway/inbound-coalesce.js'
 
 // ─── Fixtures / identity ────────────────────────────────────────────────
 const SENDER = '111'
@@ -147,7 +148,9 @@ beforeAll(async () => {
   // machine-authoritative deliver/buffer routing goes through the mocked
   // dispatchEffects instead; this fake only backstops the legacy callsites.
   gw.__inboundRouterTestSeam.setIpcServer({
-    sendToAgent: () => true,
+    // Logged so ORDER assertions can pin imperative-path deliveries (the
+    // `!`-interrupt body ships via this legacy callsite, not dispatchEffects).
+    sendToAgent: () => { callLog.push('ipcSend'); return true },
     broadcast: () => {},
   } as any)
 })
@@ -167,6 +170,13 @@ beforeEach(() => {
   gw.__inboundRouterTestSeam.activeStatusReactions.clear()
   gw.__inboundRouterTestSeam.activeTurnStartedAt.clear()
   gw.__inboundRouterTestSeam.vaultPassphraseCache.clear?.()
+  // Drain the coalesce window: an entry a prior test left buffered (e.g. the
+  // "stop with attachment" content path) holds a REAL setTimeout whose flush
+  // fires `void handleInbound(...)` — on a slow runner that deferred flush
+  // lands DURING a later test and appends a stray deliverToBridge/bufferInbound
+  // to dispatchCalls (the #3359 CI flake against the FAIL-CLOSED test).
+  // Cancelling the timers here makes every test start from an empty window.
+  gw.__inboundRouterTestSeam.inboundCoalescer.reset()
 })
 
 // ─── ctx factory ────────────────────────────────────────────────────────
@@ -283,10 +293,20 @@ describe('inbound-router characterization — interrupt / stop intercepts', () =
     // interrupt must not sit in the coalesce window.
     await gw.handleInboundCoalesced(makeCtx({ text: '!stop and do X', msgId: 3 }), '!stop and do X', undefined, undefined)
     expect(sendAgentInterrupt).toHaveBeenCalledTimes(1)
-    // ORDER: the SIGINT precedes any deliver-effect dispatch.
+    // ORDER: the SIGINT precedes the delivery of the replacement body.
+    // Characterization: today the interrupt body ships via the imperative
+    // ipcServer path (`ipcSend`), not a dispatchEffects deliver — so pin the
+    // SIGINT-before-ipcSend order UNCONDITIONALLY. The old
+    // `if (dispatchIdx >= 0)` guard was vacuously true (dispatch never fires
+    // here) and would have silently unpinned the ordering forever.
     const sigintIdx = callLog.indexOf('sigint')
-    const dispatchIdx = callLog.findIndex((t) => t.startsWith('dispatch:'))
+    const ipcSendIdx = callLog.indexOf('ipcSend')
     expect(sigintIdx).toBeGreaterThanOrEqual(0)
+    expect(ipcSendIdx).toBeGreaterThanOrEqual(0)
+    expect(sigintIdx).toBeLessThan(ipcSendIdx)
+    // And if a dispatchEffects deliver ever DOES appear on this path, it must
+    // still come after the SIGINT.
+    const dispatchIdx = callLog.findIndex((t) => t.startsWith('dispatch:'))
     if (dispatchIdx >= 0) expect(sigintIdx).toBeLessThan(dispatchIdx)
   })
 
@@ -302,6 +322,12 @@ describe('inbound-router characterization — interrupt / stop intercepts', () =
     await primeInFlightTurn()
     await gw.handleInboundCoalesced(makeCtx({ text: 'stop', msgId: 5 }), 'stop', dl, undefined)
     expect(sendAgentInterrupt).not.toHaveBeenCalled()
+    // Positive content-path assertion: the message PARKED in the coalesce
+    // window (it did not bypass, did not halt, and has not yet flushed).
+    // Its pending flush timer is cancelled by the next beforeEach — see the
+    // inboundCoalescer.reset() note there (#3359 flake).
+    const key = inboundCoalesceKey(String(DM_CHAT), undefined, SENDER)
+    expect(gw.__inboundRouterTestSeam.inboundCoalescer.peek(key as string)?.count).toBe(1)
   })
 })
 

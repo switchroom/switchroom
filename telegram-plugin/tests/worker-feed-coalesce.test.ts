@@ -757,9 +757,9 @@ describe('renderCombinedWorkerFeed (pure)', () => {
     expect(headerAndHistory.length).toBeLessThanOrEqual(24)
   })
 
-  it('drops OLDEST rows into the spill when the fan-out overflows the 24-line body budget, keeping per-worker depth at 3 (#3349)', () => {
+  it('drops NEWEST (trailing) rows into the spill when the fan-out overflows the 24-line body budget, keeping per-worker depth at 3 (#3349)', () => {
     // 8 workers × (1 header + 3 depth) = 32 > 24 → the backstop collapses the 2
-    // oldest visible rows into `+M more working…`, so 6 rows render at full
+    // newest (trailing) visible rows into `+M more working…`, so 6 rows render at full
     // depth-3 (24 lines) rather than every worker losing a step.
     const rows = Array.from({ length: 8 }, (_, i) =>
       rowH(i, [`w${i} s1`, `w${i} s2`, `w${i} s3`]),

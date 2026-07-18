@@ -670,8 +670,9 @@ export interface CombinedWorkerRow {
 
 export interface CombinedWorkerFeedOpts {
   /** Max worker rows rendered before the `+M more working…` spill line.
-   *  The overflow is ordered oldest-hidden-first (the newest/most-recently
-   *  active workers stay visible). */
+   *  Rows are kept head-first (`rows.slice(0, visibleCount)`): the earliest
+   *  supplied (oldest dispatch-order) workers stay visible and the
+   *  newest/trailing rows spill. */
   maxRows: number
 }
 
@@ -687,7 +688,7 @@ const MIN_WORKER_DEPTH = 3
 /**
  * Design fan-out: the largest concurrent-worker count whose full Ken curve is
  * allowed to render before the total-line backstop starts collapsing the
- * OLDEST rows into `+M more working…`. Chosen at 6 — beyond six live workers a
+ * NEWEST (trailing) rows into `+M more working…`. Chosen at 6 — beyond six live workers a
  * per-worker trail is no longer a glanceable card, so extra rows spill rather
  * than every shown worker losing depth. Every worker that IS shown keeps its
  * full curve depth; the ceiling trims row COUNT, never per-worker depth.
@@ -706,7 +707,7 @@ const DESIGN_FANOUT = 6
  * DESIGN_FANOUT of 6 fully-rendered workers needs 6 × 4 = 24 lines. That fully
  * fits every fan-out through 6 workers (w1=7, w2=12, w3=15, w4=16, w5=20,
  * w6=24); a 7th/8th concurrent worker overflows and the backstop drops the
- * oldest visible rows to the spill — bounding the card at 24 body lines so a
+ * newest (trailing) visible rows to the spill — bounding the card at 24 body lines so a
  * big swarm never explodes it. The per-worker curve wins on DEPTH; this ceiling
  * wins on ROW COUNT.
  */
@@ -757,7 +758,7 @@ export const workerHistoryDepth = combinedHistoryDepth
  * Pure. Rows are rendered in the order supplied (the manager passes them
  * dispatch-order, oldest first). `maxRows` caps the visible rows; the hidden
  * remainder collapses to a single `+M more working…` line. A total-budget
- * backstop drops the OLDEST visible rows one at a time (growing the spill)
+ * backstop drops the NEWEST (trailing) visible rows one at a time (growing the spill)
  * until the body fits STATUS_CARD_CHAR_BUDGET, so a burst of long descriptions
  * can never overflow the wire limit. Returns null only when `rows` is empty.
  */
@@ -825,8 +826,9 @@ export function renderCombinedWorkerFeed(
 
   // Cap to maxRows first, then shrink the visible set while EITHER the total
   // body-line budget (#3349: bounds a big swarm without stealing depth from the
-  // shown workers) OR the wire char budget is exceeded. Oldest rows collapse
-  // into the `+M more working…` spill.
+  // shown workers) OR the wire char budget is exceeded. Newest (trailing) rows
+  // collapse into the `+M more working…` spill (`rows.slice(0, visibleCount)`
+  // keeps the head of the list).
   let visible = Math.min(rows.length, maxRows)
   let { body, bodyLines } = compose(visible)
   while (
