@@ -23,25 +23,19 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { execSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { spinUp } from "../harness.js";
+import { restartCapableOrAnnounceSkip } from "../restart-capability.js";
 
 const AGENT = "test-harness";
 const MID_TURN_MS = 10_000;        // let the turn enqueue (become a recorded interrupted turn)
 const RESUME_BUDGET_MS = 180_000;  // boot + resume + reply
 
+const SCENARIO_TITLE = "uat: interrupted turn resumes after restart (DM)";
+
 // The resume builder tells the model to "briefly let the user know you're
 // resuming what was interrupted" — so the reply always opens with this framing.
 const RESUME_FRAMING = /resum|picking .*back|interrupted|cut off|just restarted/i;
-
-function canShellSudo(): boolean {
-  try {
-    execSync("sudo -n true", { stdio: "ignore", timeout: 2_000 });
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 function kickRestartDetached(name: string): void {
   // --force WITHOUT --wait → recreate now, interrupting the in-flight turn.
@@ -54,9 +48,9 @@ function kickRestartDetached(name: string): void {
   child.unref();
 }
 
-const sudoOk = canShellSudo();
+const sudoOk = restartCapableOrAnnounceSkip(SCENARIO_TITLE);
 
-(sudoOk ? describe : describe.skip)("uat: interrupted turn resumes after restart (DM)", () => {
+(sudoOk ? describe : describe.skip)(SCENARIO_TITLE, () => {
   it(
     "a turn interrupted by a restart is resumed and the resume turn completes",
     async () => {
