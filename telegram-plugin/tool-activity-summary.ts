@@ -670,8 +670,9 @@ export interface CombinedWorkerRow {
 
 export interface CombinedWorkerFeedOpts {
   /** Max worker rows rendered before the `+M more working…` spill line.
-   *  The overflow is ordered oldest-hidden-first (the newest/most-recently
-   *  active workers stay visible). */
+   *  Rows are kept head-first (`rows.slice(0, visibleCount)`): the earliest
+   *  supplied (oldest dispatch-order) workers stay visible and the
+   *  newest/trailing rows spill. */
   maxRows: number
 }
 
@@ -687,7 +688,7 @@ const MIN_WORKER_DEPTH = 3
 /**
  * Design fan-out: the largest concurrent-worker count whose full Ken curve is
  * allowed to render before the total-line backstop starts collapsing the
- * OLDEST rows into `+M more working…`. Chosen at 6 — beyond six live workers a
+ * NEWEST (trailing) rows into `+M more working…`. Chosen at 6 — beyond six live workers a
  * per-worker trail is no longer a glanceable card, so extra rows spill rather
  * than every shown worker losing depth. Every worker that IS shown keeps its
  * full curve depth; the ceiling trims row COUNT, never per-worker depth.
@@ -757,7 +758,7 @@ export const workerHistoryDepth = combinedHistoryDepth
  * Pure. Rows are rendered in the order supplied (the manager passes them
  * dispatch-order, oldest first). `maxRows` caps the visible rows; the hidden
  * remainder collapses to a single `+M more working…` line. A total-budget
- * backstop drops the OLDEST visible rows one at a time (growing the spill)
+ * backstop drops the NEWEST (trailing) visible rows one at a time (growing the spill)
  * until the body fits STATUS_CARD_CHAR_BUDGET, so a burst of long descriptions
  * can never overflow the wire limit. Returns null only when `rows` is empty.
  */
