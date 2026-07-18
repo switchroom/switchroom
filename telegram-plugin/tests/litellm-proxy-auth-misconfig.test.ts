@@ -227,39 +227,94 @@ describe('PendingUserNoticeGate — notice fires IFF the turn dies reply-less', 
     }
   }
 
+  // The single-turn norm: the error surfaced while topic A's turn was live, so
+  // the notice is keyed to A and topic A's turn end resolves it. `TOPIC_A` is a
+  // `statusKey(chatId, threadId)`-shaped value.
+  const TOPIC_A = '5000000002'
+  const TOPIC_B = '5000000009:42'
+
   it('DROPS the notice when the turn recovered (delivered a reply)', () => {
     const gate = new PendingUserNoticeGate()
-    gate.schedule(makeNotice())
-    expect(gate.resolveTurnEnd(true, 1_001_000)).toEqual([])
+    gate.schedule(makeNotice({ key: TOPIC_A }))
+    expect(gate.resolveTurnEnd(TOPIC_A, true, 1_001_000)).toEqual([])
     // And it does not resurrect on a later failed turn end.
-    expect(gate.resolveTurnEnd(false, 1_002_000)).toEqual([])
+    expect(gate.resolveTurnEnd(TOPIC_A, false, 1_002_000)).toEqual([])
   })
 
   it('SENDS the notice exactly once when the turn ends without a reply', () => {
     const gate = new PendingUserNoticeGate()
-    const notice = makeNotice()
-    gate.schedule(notice)
-    const flushed = gate.resolveTurnEnd(false, 1_001_000)
+    gate.schedule(makeNotice({ key: TOPIC_A }))
+    const flushed = gate.resolveTurnEnd(TOPIC_A, false, 1_001_000)
     expect(flushed).toHaveLength(1)
     expect(flushed[0].chatIds).toEqual(['5000000002', '5000000003'])
     // Exactly once — a second turn end flushes nothing.
-    expect(gate.resolveTurnEnd(false, 1_002_000)).toEqual([])
+    expect(gate.resolveTurnEnd(TOPIC_A, false, 1_002_000)).toEqual([])
   })
 
-  it('collapses an error burst within one turn to ONE pending notice per agent', () => {
+  it('collapses an error burst within one turn to ONE pending notice per topic', () => {
     const gate = new PendingUserNoticeGate()
-    gate.schedule(makeNotice({ atMs: 1_000_000 }))
-    gate.schedule(makeNotice({ atMs: 1_000_500 }))
-    gate.schedule(makeNotice({ atMs: 1_001_000 }))
-    expect(gate.resolveTurnEnd(false, 1_002_000)).toHaveLength(1)
+    gate.schedule(makeNotice({ atMs: 1_000_000, key: TOPIC_A }))
+    gate.schedule(makeNotice({ atMs: 1_000_500, key: TOPIC_A }))
+    gate.schedule(makeNotice({ atMs: 1_001_000, key: TOPIC_A }))
+    expect(gate.resolveTurnEnd(TOPIC_A, false, 1_002_000)).toHaveLength(1)
   })
 
   it('expires an unresolved notice after the TTL (bias to silence over false failure)', () => {
     const gate = new PendingUserNoticeGate()
-    gate.schedule(makeNotice({ atMs: 1_000_000 }))
+    gate.schedule(makeNotice({ atMs: 1_000_000, key: TOPIC_A }))
     const after = 1_000_000 + PENDING_USER_NOTICE_TTL_MS + 1
     expect(gate.hasPending(after)).toBe(false)
-    expect(gate.resolveTurnEnd(false, after)).toEqual([])
+    expect(gate.resolveTurnEnd(TOPIC_A, false, after)).toEqual([])
+  })
+
+  // ── #3294 — keyed by turn/topic so concurrent per-topic turns don't
+  //    cross-resolve each other's pending notices. ─────────────────────────────
+  it("does NOT flush topic A's notice when a DIFFERENT topic's turn ends reply-less", () => {
+    const gate = new PendingUserNoticeGate()
+    gate.schedule(makeNotice({ atMs: 1_000_000, key: TOPIC_A }))
+    // Topic B's turn ends WITHOUT a reply. Pre-#3294 this flushed A's notice
+    // (a false "couldn't complete" for a turn that may still recover). Now B's
+    // end resolves nothing keyed to A.
+    expect(gate.resolveTurnEnd(TOPIC_B, false, 1_000_500)).toEqual([])
+    // A's notice is still pending, and A's OWN reply-less end flushes it.
+    expect(gate.hasPending(1_000_600)).toBe(true)
+    const flushed = gate.resolveTurnEnd(TOPIC_A, false, 1_000_700)
+    expect(flushed).toHaveLength(1)
+    expect(flushed[0].key).toBe(TOPIC_A)
+  })
+
+  it("does NOT drop topic A's notice when a DIFFERENT topic's turn recovers", () => {
+    const gate = new PendingUserNoticeGate()
+    gate.schedule(makeNotice({ atMs: 1_000_000, key: TOPIC_A }))
+    // Topic B's turn recovered (delivered a reply). It must not drop A's notice.
+    expect(gate.resolveTurnEnd(TOPIC_B, true, 1_000_500)).toEqual([])
+    // A's notice survives and still flushes on A's reply-less end.
+    expect(gate.resolveTurnEnd(TOPIC_A, false, 1_000_700)).toHaveLength(1)
+  })
+
+  it('keeps a per-topic pending notice for each concurrent topic (no cross-collapse)', () => {
+    const gate = new PendingUserNoticeGate()
+    gate.schedule(makeNotice({ atMs: 1_000_000, key: TOPIC_A, chatIds: ['5000000002'] }))
+    gate.schedule(makeNotice({ atMs: 1_000_100, key: TOPIC_B, chatIds: ['5000000009'] }))
+    // A's end flushes only A.
+    const a = gate.resolveTurnEnd(TOPIC_A, false, 1_000_200)
+    expect(a).toHaveLength(1)
+    expect(a[0].chatIds).toEqual(['5000000002'])
+    // B is still pending and flushes on B's end.
+    const b = gate.resolveTurnEnd(TOPIC_B, false, 1_000_300)
+    expect(b).toHaveLength(1)
+    expect(b[0].chatIds).toEqual(['5000000009'])
+  })
+
+  it('an UNATTRIBUTED (undefined-key) notice resolves on any turn end (legacy single-turn behavior)', () => {
+    const gate = new PendingUserNoticeGate()
+    // No key — the error arrived with no live turn (between turns / post-poke).
+    gate.schedule(makeNotice({ atMs: 1_000_000 }))
+    // Any topic's reply-less end flushes it (preserves pre-#3294 behavior so a
+    // genuine death on a single-turn gateway still notifies the user).
+    const flushed = gate.resolveTurnEnd(TOPIC_B, false, 1_000_500)
+    expect(flushed).toHaveLength(1)
+    expect(flushed[0].key).toBeUndefined()
   })
 })
 
