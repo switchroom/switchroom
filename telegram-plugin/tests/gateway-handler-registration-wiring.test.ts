@@ -57,8 +57,7 @@ const GOLDEN_REGISTRATIONS: readonly string[] = [
   'command:inject',
   'command:compact',
   'command:clear',
-  'command:model',
-  'command:effort',
+  'helper:registerModelEffortCommands',
   'command:agentstart',
   'command:agentstop',
   'command:stop',
@@ -119,7 +118,7 @@ const GOLDEN_REGISTRATIONS: readonly string[] = [
  * every `message:*` handler (grammY no-double-handling; see
  * catch-all-unhandled-message.test.ts) and before `message_reaction`.
  */
-const HELPER_REGISTRARS = new Set(['registerOpsInfoCommands', 'registerStartInfoCommands', 'installUnhandledMessageCatchAll'])
+const HELPER_REGISTRARS = new Set(['registerOpsInfoCommands', 'registerStartInfoCommands', 'registerModelEffortCommands', 'installUnhandledMessageCatchAll'])
 
 const sourceFile = ts.createSourceFile(
   GATEWAY_PATH,
