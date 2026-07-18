@@ -32,7 +32,7 @@
 
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { resolve } from "node:path";
-import { listAvailableProfiles } from "../agents/profiles.js";
+import { listAvailableProfiles, PROFILES_ROOT } from "../agents/profiles.js";
 
 /**
  * Short description per profile — kept as a static map so the picker UI
@@ -101,7 +101,8 @@ export interface ProfilePickerResult {
 }
 
 const DEFAULT_MAX_ATTEMPTS = 3;
-const PROFILES_ROOT = resolve(import.meta.dirname, "../../profiles");
+// Reuse the layout-aware profiles root from ../agents/profiles.js so the
+// dev/npm vs. Docker-image resolution (#3346) lives in exactly one place.
 
 /**
  * Default real-fs implementation of listProfileSkills. Returns the
