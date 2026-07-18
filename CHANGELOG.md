@@ -2,6 +2,76 @@
 
 ## Unreleased
 
+## v0.18.32 — Backstop answer delivery gets read-back confirmation and crash-window resume, and the gateway decomposition lands its first phases
+
+### Delivery reliability
+
+- **Read-back confirmation for backstop delivery** (#3321, closes #3278) —
+  the answer-of-record safety net now confirms the answer actually landed in
+  the chat (a read-back check) before marking the turn's answer obligation
+  closed, instead of assuming the send succeeded. Closes the residual
+  crash-window duplicate/none gap left tracked after v0.18.31's #3299.
+- **Captured-answer resume for partial backstop delivery** (#3322, closes
+  #3282) — when the gateway crashes mid-flush with an answer only partially
+  delivered, the captured answer is re-presented on resume rather than lost,
+  completing the backstop-delivery guarantee started by #3321.
+- **Resumed sub-agents re-register so progress cards resume** (#3320, closes
+  #3315) — after a gateway restart, in-flight sub-agents are re-registered
+  with the subagent-watcher so their progress cards keep updating instead of
+  going dark for the rest of the turn.
+- **PendingUserNoticeGate keyed by turn/topic** (#3309, closes #3294) — the
+  pending-user-notice gate is now keyed per turn and per topic, so a notice
+  in one forum topic can no longer suppress or misfire against an unrelated
+  turn in another topic.
+
+### Progress card
+
+- **Numbered workers on the combined Workers card** (#3305, closes #3298) —
+  sub-agents on the shared Workers progress card are now numbered, so a user
+  watching several parallel workers can tell the rows apart at a glance.
+
+### Gateway decomposition (#2996)
+
+Phased, behavior-preserving decomposition of the monolithic
+`telegram-plugin/gateway/gateway.ts`, each phase landed as its own reviewed
+PR:
+
+- **Anti-inflation line-count ratchet for `gateway.ts`** (#3307, #2996 P0.5)
+  — a CI guard that fails if `gateway.ts` grows past its current line budget,
+  locking in the decomposition rather than letting the file re-inflate.
+- **Extract `registerGatewayHandlers(bot, deps)`** (#3308, #2996 P0a) —
+  handler registration pulled into a discrete, testable function.
+- **Defer token materialization + `Bot` construction to boot** (#3310, #2996
+  P0b) — the bot token and grammy `Bot` instance are no longer built at
+  module load.
+- **Gate module-load boot side effects behind `startGateway()`** (#3312,
+  #2996 P0c) — importing the module no longer triggers boot side effects;
+  they run only when `startGateway()` is called.
+- **Make `gateway.ts` import-clean — defer last module-load side effects**
+  (#3318, #2996 P0e) — the remaining load-time side effects are deferred so
+  the module can be imported cleanly (e.g. by tests) without booting.
+- **Machine is the sole turn-in-flight gate** (#3316, #2996 P1, refs #2794) —
+  removes the `claudeBusyKeys` shadow state, the gate-parity probe, and the
+  cutover kill switch now that the state machine is the single source of
+  truth for turn-in-flight.
+- **`executeReply` → outbound-send-path `sendReply` façade** (#3319, #2996
+  P2) — the reply-execution path is routed through a single
+  `sendReply` façade on the outbound-send path.
+
+### Other fixes
+
+- **Configurable web dashboard host port** (#3303) — the web dashboard host
+  port is now set via `web_service.port` instead of being hard-coded.
+- **Regression coverage for the 2026-07-17 fixes** (#3304) — pins the #3299
+  gateway wiring (scenarios S1/S2/S4) with regression tests so the
+  turn-flush-suppression fix can't silently regress.
+- **Harden the Hindsight boot gate** (#3311) — the scaffold's Hindsight boot
+  gate now runs a real MCP `initialize` probe with a 120s bound and a logged
+  outcome, instead of a weaker readiness check.
+- **Lazy-connect stdio MCP shim for Hindsight** (#3313) — Hindsight is
+  registered via a lazy-connect stdio MCP shim so its registration can never
+  fail at session start.
+
 ## v0.18.31 — Answers can no longer be silently dropped at delivery, and model config edits actually apply on restart
 
 ### Fixes
