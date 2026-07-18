@@ -395,4 +395,36 @@ describe('subagent-watcher card resurrection (issue #3023)', () => {
     h.advance(500)
     expect(h.resurrectCalls).toHaveLength(1)
   })
+
+  it('(f) a false finish resumed after cleanup grace is owned by resurrection, not the #3315 resume path', () => {
+    // Non-interference guard (issue #3315 × #3023): once the terminal-cleanup
+    // grace has elapsed, a falsely-finalised worker's id sits in BOTH
+    // `terminatedAgentIds` (the #3315 resume-detection map) AND
+    // `falseFinishTracker`. Its JSONL resuming must be handled by the
+    // resurrection path (bounded-chain + onResurrect semantics), NOT
+    // double-handled by the scanSubagentsDir resume branch. The branch defers
+    // when a false-finish record exists.
+    const agentId = 'false-finish-post-grace'
+    const h = makeHarness({ agentId })
+
+    h.advance(500)
+    unmarkHistorical(h, agentId)
+
+    driveToFalseFinish(h, agentId)
+    // Let the 30s terminal-cleanup grace elapse so the entry is swept — its id
+    // is now in BOTH terminatedAgentIds and falseFinishTracker.
+    h.advance(30_000)
+    expect(h.watcher.getRegistry().has(agentId)).toBe(false)
+
+    // JSONL resumes growing.
+    h.appendActivity()
+    h.advance(500)
+
+    // Resurrected exactly once via the #3023 path...
+    expect(h.resurrectCalls).toHaveLength(1)
+    expect(h.watcher.getRegistry().get(agentId)?.state).toBe('running')
+    // ...and NOT re-registered by the #3315 resume branch (its log marker is
+    // absent — the branch deferred because a false-finish record existed).
+    expect(h.logs.some((l) => l.includes('resumed after terminal cleanup'))).toBe(false)
+  })
 })
