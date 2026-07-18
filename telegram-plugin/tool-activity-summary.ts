@@ -86,6 +86,7 @@ export function describeToolUse(
 import {
   STATUS_CARD_CHAR_BUDGET,
   STATUS_ROLLING_LINES,
+  WORKER_HISTORY_MAX,
   STATUS_LINE_MAX,
   NESTED_PREFIX,
 } from './status-no-truncate.js'
@@ -286,7 +287,8 @@ function escapeStepLine(raw: string): string {
 
 /**
  * Shared step-feed emitter. Appends `✓`/`→` bullet lines to `out` for the
- * given ALREADY-ESCAPED step strings, windowing to STATUS_ROLLING_LINES and
+ * given ALREADY-ESCAPED step strings, windowing to `window` (default
+ * STATUS_ROLLING_LINES; the worker surfaces pass a deeper window) and
  * prepending a `+N earlier…` header when the feed overflows the window (on
  * BOTH surfaces now). The worker feed imports this directly.
  *
@@ -301,9 +303,10 @@ export function renderStepFeed(
   steps: string[],
   allDone: boolean,
   liveSuffix = '',
+  window: number = STATUS_ROLLING_LINES,
 ): void {
   if (steps.length === 0) return
-  const shown = steps.slice(-STATUS_ROLLING_LINES)
+  const shown = steps.slice(-Math.max(1, window))
   const hidden = steps.length - shown.length
   if (hidden > 0) out.push(`_✓ +${hidden} earlier…_`)
   const lastIdx = shown.length - 1
@@ -351,6 +354,13 @@ export interface StatusCardOpts {
   stepCount?: number
   /** Optional terminal result block (worker recap), already-cleaned text + emoji. */
   result?: { emoji: string; text: string }
+  /**
+   * How many trailing step/child lines the rolling window shows. Defaults to
+   * STATUS_ROLLING_LINES (the 🤖 agent card). The 🛠 single-worker card passes
+   * a deeper window (`workerHistoryDepth(1)` = 6) so a lone worker can show its
+   * full recent trail — see WORKER_HISTORY_MAX.
+   */
+  historyWindow?: number
 }
 
 /**
@@ -364,6 +374,7 @@ export interface StatusCardOpts {
  */
 export function renderStatusCard(opts: StatusCardOpts): string | null {
   const { header, final = false, liveSuffix = '', stepCount, result } = opts
+  const window = Math.max(1, opts.historyWindow ?? STATUS_ROLLING_LINES)
   const rawSteps = opts.steps.filter((s) => s != null)
   const rawChildren = (opts.childSteps ?? []).map((s) => s.trim()).filter((s) => s.length > 0)
   const hasChildren = rawChildren.length > 0
@@ -393,12 +404,12 @@ export function renderStatusCard(opts: StatusCardOpts): string | null {
 
   if (hasChildren) {
     // Parent lines all render done — the live → step lives in the nested block.
-    const shownParent = steps.slice(-STATUS_ROLLING_LINES)
+    const shownParent = steps.slice(-window)
     const hiddenParent = steps.length - shownParent.length
     if (hiddenParent > 0) out.push(`_✓ +${hiddenParent} earlier…_`)
     for (const s of shownParent) out.push(`~~_✓ ${s}_~~`)
     // Child block.
-    const shownChild = children.slice(-STATUS_ROLLING_LINES)
+    const shownChild = children.slice(-window)
     const hiddenChild = children.length - shownChild.length
     if (hiddenChild > 0) out.push(`${NESTED_PREFIX}_+${hiddenChild} earlier…_`)
     const lastChildIdx = shownChild.length - 1
@@ -410,7 +421,7 @@ export function renderStatusCard(opts: StatusCardOpts): string | null {
       )
     })
   } else {
-    renderStepFeed(out, steps, final, liveSuffix)
+    renderStepFeed(out, steps, final, liveSuffix, window)
   }
 
   if (final && stepCount != null && stepCount > 0) {
@@ -664,32 +675,58 @@ export interface CombinedWorkerFeedOpts {
   maxRows: number
 }
 
-/**
- * Total per-worker BODY line budget for the combined feed — the sum, across all
- * visible workers, of (one header line + that worker's history lines). The top
- * `🛠 Workers · N running` line and the `+M more working…` spill are OUTSIDE
- * this budget (fixed chrome). 13 is chosen so the card stays a compact glance,
- * not a wall: at 2 workers it yields the full 5-line history each (2·1 header +
- * 2·5 history = 12 ≤ 13), and it degrades to a single history line each by ~6
- * workers — matching the pre-adaptive one-line-per-worker floor while never
- * letting a 2–3 worker fan-out lose its narrative trail.
- */
-const MAX_COMBINED_BODY_LINES = 13
 /** Each visible worker costs one header line before any history. */
 const PER_WORKER_HEADER_COST = 1
 
 /**
+ * Floor of the per-worker depth curve — every SHOWN worker renders at least
+ * this many recent steps, no matter how large the fan-out (Ken's "4+ → 3 each").
+ */
+const MIN_WORKER_DEPTH = 3
+
+/**
+ * Design fan-out: the largest concurrent-worker count whose full Ken curve is
+ * allowed to render before the total-line backstop starts collapsing the
+ * OLDEST rows into `+M more working…`. Chosen at 6 — beyond six live workers a
+ * per-worker trail is no longer a glanceable card, so extra rows spill rather
+ * than every shown worker losing depth. Every worker that IS shown keeps its
+ * full curve depth; the ceiling trims row COUNT, never per-worker depth.
+ */
+const DESIGN_FANOUT = 6
+
+/**
+ * Total per-worker BODY line budget for the combined feed — the sum, across all
+ * visible workers, of (one header line + that worker's history lines). The top
+ * `🛠 Workers · N running` line and the `+M more working…` spill are OUTSIDE
+ * this budget (fixed chrome).
+ *
+ * Re-derived (#3349) to fit Ken's per-worker curve `max(3, 7 − w)` rather than
+ * to DRIVE the depth: at the flat tail (w ≥ 4, depth = MIN_WORKER_DEPTH) each
+ * worker costs `PER_WORKER_HEADER_COST + MIN_WORKER_DEPTH` = 4 lines, so a
+ * DESIGN_FANOUT of 6 fully-rendered workers needs 6 × 4 = 24 lines. That fully
+ * fits every fan-out through 6 workers (w1=7, w2=12, w3=15, w4=16, w5=20,
+ * w6=24); a 7th/8th concurrent worker overflows and the backstop drops the
+ * oldest visible rows to the spill — bounding the card at 24 body lines so a
+ * big swarm never explodes it. The per-worker curve wins on DEPTH; this ceiling
+ * wins on ROW COUNT.
+ */
+const MAX_COMBINED_BODY_LINES = DESIGN_FANOUT * (PER_WORKER_HEADER_COST + MIN_WORKER_DEPTH)
+
+/**
  * Deterministic per-worker history depth for `w` visible workers:
- *   clamp( floor( (BUDGET − headerCost·w) / w ), 1, STATUS_ROLLING_LINES )
- * So 2 workers → 5 lines each, 3 → 3, 4 → 2, ≥6 → 1 (today's single-line floor
- * is the graceful-degradation floor, never below it). Pure function of the
- * visible worker count — no model input, consistent with deterministic controls.
+ *   clamp( max(MIN_WORKER_DEPTH, 7 − w), 1, WORKER_HISTORY_MAX )
+ * So 1 worker → 6, 2 → 5, 3 → 4, 4 → 3, ≥4 → 3 (Ken's 6/5/4/3 curve, #3349).
+ * Pure function of the visible worker count — no model input, consistent with
+ * deterministic controls. Replaces the former budget-driven divide (which
+ * yielded 5/5/3/2/… and could never reach 6 for a lone worker).
  */
 export function combinedHistoryDepth(w: number): number {
   if (w <= 0) return 1
-  const raw = Math.floor((MAX_COMBINED_BODY_LINES - PER_WORKER_HEADER_COST * w) / w)
-  return Math.max(1, Math.min(STATUS_ROLLING_LINES, raw))
+  return Math.min(WORKER_HISTORY_MAX, Math.max(MIN_WORKER_DEPTH, 7 - w))
 }
+
+/** Alias for readability at the single-worker call site — same curve. */
+export const workerHistoryDepth = combinedHistoryDepth
 
 /**
  * Render N≥1 live workers into ONE combined feed body (ready Telegram
@@ -758,37 +795,46 @@ export function renderCombinedWorkerFeed(
     return src.filter((s) => s != null && stripMarkdown(s).replace(/\s+/g, ' ').trim().length > 0)
   }
 
-  const compose = (visibleCount: number): string => {
+  const compose = (visibleCount: number): { body: string; bodyLines: number } => {
     const shown = rows.slice(0, visibleCount)
     const hidden = rows.length - shown.length
-    // Adaptive depth: split the fixed body-line budget across the VISIBLE
-    // workers so the card stays bounded regardless of fan-out.
+    // Per-worker depth follows Ken's deterministic curve max(3, 7−w) (#3349):
+    // the curve drives DEPTH; the total-line budget below drives ROW COUNT.
     const depth = combinedHistoryDepth(shown.length)
-    const out: string[] = [`🛠 **Workers** · _${rows.length} running_`]
+    const chrome: string[] = [`🛠 **Workers** · _${rows.length} running_`]
+    const bodyOut: string[] = []
     for (const r of shown) {
-      out.push(rowHeader(r))
+      bodyOut.push(rowHeader(r))
       const hist = rowHistory(r)
       if (hist.length === 0) {
-        out.push('→ _starting…_')
+        bodyOut.push('→ _starting…_')
         continue
       }
       // Paint the last-K history lines with the SAME `✓`/`→` idiom as the
       // single-worker card: escape each raw line through the shared per-line
       // pipeline (escapeStepLine), then renderStepFeed strikes the prior steps
-      // and bolds the newest in-progress step.
+      // and bolds the newest in-progress step. The window equals the depth so a
+      // per-worker `+N earlier…` marker never appears inside the combined feed.
       const esc = hist.slice(-depth).map(escapeStepLine)
-      renderStepFeed(out, esc, false)
+      renderStepFeed(bodyOut, esc, false, '', depth)
     }
+    const out = [...chrome, ...bodyOut]
     if (hidden > 0) out.push(`_+${hidden} more working…_`)
-    return stackCardLines(out)
+    return { body: stackCardLines(out), bodyLines: bodyOut.length }
   }
 
-  // Cap to maxRows first, then shrink further only if the char budget demands.
+  // Cap to maxRows first, then shrink the visible set while EITHER the total
+  // body-line budget (#3349: bounds a big swarm without stealing depth from the
+  // shown workers) OR the wire char budget is exceeded. Oldest rows collapse
+  // into the `+M more working…` spill.
   let visible = Math.min(rows.length, maxRows)
-  let body = compose(visible)
-  while (body.length > STATUS_CARD_CHAR_BUDGET && visible > 1) {
+  let { body, bodyLines } = compose(visible)
+  while (
+    (bodyLines > MAX_COMBINED_BODY_LINES || body.length > STATUS_CARD_CHAR_BUDGET) &&
+    visible > 1
+  ) {
     visible -= 1
-    body = compose(visible)
+    ;({ body, bodyLines } = compose(visible))
   }
   return body
 }

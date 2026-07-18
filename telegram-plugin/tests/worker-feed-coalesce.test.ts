@@ -186,12 +186,20 @@ describe('coalesced worker feed — one message per chat under load', () => {
     // would shed ~ (N-1)/N of every second's cosmetic edits.
     expect(gate.stats().global.shed).toBeLessThanOrEqual(3)
 
-    // Liveness: the LAST landed edit carries EVERY worker's latest step — all
-    // rows refreshed together in the one message within one edit cycle.
+    // Liveness + bounded card (#3349): under Ken's curve every SHOWN worker
+    // keeps depth 3, so a 15-way storm cannot render every row — the 24-line
+    // body ceiling collapses the newest rows into a `+N more working…` spill.
+    // The last landed edit still carries the VISIBLE workers' latest steps
+    // (refreshed together in the one message) and a spill marker for the rest.
     const lastBody = edits[edits.length - 1].text
-    for (const id of ids) {
-      expect(lastBody).toContain(latest[id])
+    // 6 rows fit the 24-line budget (6·(1 header + 3 depth) = 24); the oldest
+    // rows (w0…w5) stay visible, the 9 newest spill.
+    for (let i = 0; i < 6; i++) {
+      expect(lastBody).toContain(latest[`w${i}`])
     }
+    expect(lastBody).toContain('more working')
+    // Still exactly ONE message — the spill is a render detail, not a new send.
+    expect(sends.length).toBe(1)
   })
 
   it('admits a critical reply mid-storm (never shed or starved by the cosmetic feed)', async () => {
@@ -722,21 +730,23 @@ describe('renderCombinedWorkerFeed (pure)', () => {
     expect(body).toContain('b first')
   })
 
-  it('degrades to ONE history line per worker at a large fan-out and stays within the body budget', () => {
+  it('holds the MIN_WORKER_DEPTH (3) floor per shown worker at a large fan-out and stays within the body budget (#3349)', () => {
+    // 6 workers each with a deep (5-line) history. Ken's curve pins depth=3 at
+    // 4+ workers, so every SHOWN worker paints its last 3 steps. 6·(1 header +
+    // 3 history) = 24 lines = MAX_COMBINED_BODY_LINES, so all 6 stay visible.
     const rows = Array.from({ length: 6 }, (_, i) =>
-      rowH(i, [`w${i} oldest`, `w${i} middle`, `w${i} newest`]),
+      rowH(i, [`w${i} s1`, `w${i} s2`, `w${i} s3`, `w${i} s4`, `w${i} s5`]),
     )
     const body = renderCombinedWorkerFeed(rows, { maxRows: 8 })!
-    // Only the newest step of each worker survives — the earlier lines are
-    // dropped by the per-worker depth clamp (floor((13-6)/6)=1).
     for (let i = 0; i < 6; i++) {
-      expect(body).toContain(current(`w${i} newest`))
-      expect(body).not.toContain(`w${i} oldest`)
-      expect(body).not.toContain(`w${i} middle`)
+      // Last 3 steps shown; the two oldest dropped by the depth-3 window.
+      expect(body).toContain(current(`w${i} s5`))
+      expect(body).toContain(struck(`w${i} s4`))
+      expect(body).toContain(struck(`w${i} s3`))
+      expect(body).not.toContain(`w${i} s1`)
+      expect(body).not.toContain(`w${i} s2`)
     }
-    // Total body lines (worker headers + history) stay within the budget: 6
-    // header lines + 6 history lines = 12 ≤ MAX_COMBINED_BODY_LINES (13). Count
-    // only the per-worker body lines (exclude the top count line + any spill).
+    // Body lines (worker headers + history) stay within the re-derived budget.
     const bodyLines = body
       .split('\n')
       .map((l) => l.trim())
@@ -744,15 +754,43 @@ describe('renderCombinedWorkerFeed (pure)', () => {
     const headerAndHistory = bodyLines.filter(
       (l) => !l.startsWith('🛠') && !l.includes('more working'),
     )
-    expect(headerAndHistory.length).toBeLessThanOrEqual(13)
+    expect(headerAndHistory.length).toBeLessThanOrEqual(24)
   })
 
-  it('exposes the deterministic depth formula (2→5, 3→3, 4→2, 6→1)', () => {
+  it('drops OLDEST rows into the spill when the fan-out overflows the 24-line body budget, keeping per-worker depth at 3 (#3349)', () => {
+    // 8 workers × (1 header + 3 depth) = 32 > 24 → the backstop collapses the 2
+    // oldest visible rows into `+M more working…`, so 6 rows render at full
+    // depth-3 (24 lines) rather than every worker losing a step.
+    const rows = Array.from({ length: 8 }, (_, i) =>
+      rowH(i, [`w${i} s1`, `w${i} s2`, `w${i} s3`]),
+    )
+    const body = renderCombinedWorkerFeed(rows, { maxRows: 8 })!
+    expect(body).toContain('more working')
+    const bodyLines = body
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0)
+    const headerAndHistory = bodyLines.filter(
+      (l) => !l.startsWith('🛠') && !l.includes('more working'),
+    )
+    expect(headerAndHistory.length).toBeLessThanOrEqual(24)
+    expect(body).toContain('+2 more working')
+    // The 6 kept rows render at full depth-3 (last row kept shows all 3 steps).
+    expect(body).toContain(current('w5 s3'))
+    expect(body).toContain(struck('w5 s2'))
+    expect(body).toContain(struck('w5 s1'))
+    // The 2 trailing rows spilled — none of worker 7's lines render.
+    expect(body).not.toContain('w7 s3')
+  })
+
+  it("exposes Ken's deterministic depth curve max(3, 7−w): 1→6, 2→5, 3→4, 4→3, 5+→3 (#3349)", () => {
+    expect(combinedHistoryDepth(1)).toBe(6)
     expect(combinedHistoryDepth(2)).toBe(5)
-    expect(combinedHistoryDepth(3)).toBe(3)
-    expect(combinedHistoryDepth(4)).toBe(2)
-    expect(combinedHistoryDepth(6)).toBe(1)
-    expect(combinedHistoryDepth(8)).toBe(1)
+    expect(combinedHistoryDepth(3)).toBe(4)
+    expect(combinedHistoryDepth(4)).toBe(3)
+    expect(combinedHistoryDepth(5)).toBe(3)
+    expect(combinedHistoryDepth(6)).toBe(3)
+    expect(combinedHistoryDepth(8)).toBe(3)
   })
 
   // ── Worker numbering (#3298): stable ordinal prefix at 2+ workers ──────────
@@ -795,6 +833,58 @@ describe('renderCombinedWorkerFeed (pure)', () => {
     expect(body).toContain('+6 more working')
     for (let n = 1; n <= 4; n++) expect(body).toContain(`**${n}. task number ${n}**`)
     expect(body).not.toContain('**5. ')
+  })
+})
+
+// ── #3349: Ken's per-worker depth curve 6/5/4/3, exact rendered depth ─────────
+describe("Ken's per-worker step-trail depth curve (#3349)", () => {
+  // A worker with a DEEP history (8 lines) so the depth curve — not the buffer —
+  // is always the binding limit. Each history line is uniquely tokenised
+  // (`w{i}-s{n}`) so we can count exactly how many of a worker's steps rendered.
+  const deepRow = (i: number) => ({
+    description: `task w${i}`,
+    elapsedMs: 12_000 + i * 1000,
+    toolCount: 3,
+    ordinal: i + 1,
+    currentStep: `w${i}-s8`,
+    historyLines: Array.from({ length: 8 }, (_, n) => `w${i}-s${n + 1}`),
+  })
+  // Count how many of worker `i`'s step tokens appear in the rendered body.
+  const shownSteps = (body: string, i: number): number =>
+    (body.match(new RegExp(`w${i}-s\\d`, 'g')) ?? []).length
+
+  it.each([
+    [1, 6],
+    [2, 5],
+    [3, 4],
+    [4, 3],
+    [5, 3],
+  ])('%i worker(s) → exactly %i steps rendered per worker', (workers, expectedDepth) => {
+    const rows = Array.from({ length: workers }, (_, i) => deepRow(i))
+    const body = renderCombinedWorkerFeed(rows, { maxRows: 8 })!
+    expect(combinedHistoryDepth(workers)).toBe(expectedDepth)
+    for (let i = 0; i < workers; i++) {
+      expect(shownSteps(body, i)).toBe(expectedDepth)
+    }
+    // Newest step last (bottom-anchored → bold), oldest rendered step struck.
+    const worker0 = `**→ w0-s8**`
+    expect(body).toContain(worker0)
+  })
+
+  it('a worker with FEWER steps than the depth shows all it has, no padding', () => {
+    // 3 workers → depth 4, but this worker only has 2 steps: render both, no more.
+    const rows = [
+      { description: 'shallow', elapsedMs: 12_000, toolCount: 1, ordinal: 1,
+        currentStep: 'only-b', historyLines: ['only-a', 'only-b'] },
+      deepRow(1),
+      deepRow(2),
+    ]
+    const body = renderCombinedWorkerFeed(rows, { maxRows: 8 })!
+    expect(combinedHistoryDepth(3)).toBe(4)
+    expect(body).toContain('~~_✓ only-a_~~')
+    expect(body).toContain('**→ only-b**')
+    // Deep workers still get their full 4.
+    expect(shownSteps(body, 1)).toBe(4)
   })
 })
 

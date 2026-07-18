@@ -29,6 +29,19 @@ import { RICH_MESSAGE_MAX_CHARS } from './format.js'
 export const STATUS_ROLLING_LINES = 5
 
 /**
+ * Ceiling on the per-worker recent-step history RETAINED in `row.narrative`
+ * (worker-activity-feed.ts) and the deepest trail the worker cards will render.
+ *
+ * Distinct from `STATUS_ROLLING_LINES` (which governs the 🤖 agent card's
+ * window and stays at 5) so raising the worker trail never widens the agent
+ * card. Set to 6 because the deterministic per-worker depth curve
+ * (`workerHistoryDepth`, tool-activity-summary.ts) peaks at 6 for a lone
+ * worker — `max(3, 7 − workerCount)` at `w = 1`. The buffer must retain at
+ * least this many lines or the renderer would ask for 6 and only find 5.
+ */
+export const WORKER_HISTORY_MAX = 6
+
+/**
  * Per-line character cap, applied to every step + child step on BOTH
  * surfaces before HTML-escaping (clip raw → escape last). A line longer
  * than this is truncated with a trailing `…`.
