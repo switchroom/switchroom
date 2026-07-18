@@ -67,3 +67,19 @@ export function renderMentalModelProposeCard(
   // richMessage, bypassing the switchroomReply chokepoint.
   return hardenCardBreaks(lines.join("\n"));
 }
+
+/**
+ * Inline keyboard for the mental-model proposal card (hindsight Phase 5).
+ * Callback prefix `mmp:`, handled by handleMentalModelProposeCallback in
+ * callback-query-handlers.ts. Extracted verbatim from gateway.ts (#2996 P5).
+ */
+export function buildMentalModelProposeKeyboard(stageId: string): { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } {
+  return {
+    inline_keyboard: [
+      [
+        { text: '✅ Approve', callback_data: `mmp:approve:${stageId}` },
+        { text: '🚫 Deny', callback_data: `mmp:deny:${stageId}` },
+      ],
+    ],
+  }
+}

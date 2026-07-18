@@ -139,7 +139,9 @@ import {
   STALE_TAP_NOTICE,
   type PermissionCardRef,
 } from './permission-timeout.js'
-import { renderVaultRequestAccessCard } from './vault-request-access-card.js'
+import { renderVaultRequestAccessCard, buildVaultRequestAccessKeyboard } from './vault-request-access-card.js'
+import { renderVaultRequestSaveCard, buildVaultRequestSaveKeyboard } from './vault-request-save-card.js'
+import { renderSecretRequestCard, buildSecretRequestKeyboard } from './secret-request-card.js'
 import { createPermissionCardStore, type PersistedPermCard } from './permission-card-store.js'
 import { createPendingCardStore, type PersistedApprovalCard } from './pending-card-store.js'
 import {
@@ -664,7 +666,7 @@ import { shadowEmit, isMachineInTurn } from './inbound-delivery-machine-shadow.j
 import type { ChatKey as _ChatKey } from './inbound-delivery-machine.js'
 import { dispatchEffects } from './inbound-delivery-machine-dispatch.js'
 import { maybeFireWarmup } from './prefix-warmup.js'
-import { renderMentalModelProposeCard } from './mental-model-propose-card.js'
+import { renderMentalModelProposeCard, buildMentalModelProposeKeyboard } from './mental-model-propose-card.js'
 import { readDeclaredMentalModelNames } from './mental-model-propose-diff.js'
 import {
   renderSkillProposalCard,
@@ -13765,42 +13767,6 @@ async function publishToTelegraph(
 }
 
 /**
- * Build the inline keyboard for the agent-initiated vault-save approval card.
- * Issue #969 P1a. Callback prefix `vrs:` (vault-request-save).
- *
- * Buttons must fit Telegram's 64-byte callback_data limit. Stage IDs are
- * 8 hex chars (32 bits of entropy), so each callback comfortably fits.
- */
-function buildVaultRequestSaveKeyboard(stageId: string): { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } {
-  return {
-    inline_keyboard: [
-      [
-        { text: '✅ Save once', callback_data: `vrs:save:${stageId}` },
-        { text: '🚫 Discard', callback_data: `vrs:discard:${stageId}` },
-      ],
-      [
-        { text: '✏️ Rename', callback_data: `vrs:rename:${stageId}` },
-      ],
-    ],
-  }
-}
-
-function renderVaultRequestSaveCard(req: PendingVaultRequestSave, agentSlug: string): string {
-  const lines: string[] = []
-  lines.push(`🔐 **${escapeHtmlForTg(agentSlug)}** wants to save a secret`)
-  lines.push(`key: \`${req.key}\``)
-  if (req.why && req.why.length > 0) {
-    lines.push(`why: _${escapeHtmlForTg(req.why)}_`)
-  }
-  lines.push('')
-  lines.push(`_Tap Save to write to the host vault, Rename to change the key name, or Discard to drop it. The value is held in this chat's gateway memory until you decide._`)
-  // hardenCardBreaks: labelled field lines (key: / why:) would soft-collapse
-  // into one blob under the GFM rich renderer; this card is sent direct via
-  // richMessage, bypassing the switchroomReply chokepoint.
-  return hardenCardBreaks(lines.join('\n'))
-}
-
-/**
  * `vault_request_save` tool — agent surfaces an approval card asking
  * the user to confirm saving a secret. The value is staged here and
  * written to vault only on user tap. See #969 P1a.
@@ -13931,30 +13897,6 @@ function sweepSecretRequests(now = Date.now()): void {
   // only set after the operator taps [Provide securely], and the request is
   // no longer parked-on-a-card. Just drop stale ones — no wake needed.
   armedSecretCaptures.sweep(now)
-}
-
-function buildSecretRequestKeyboard(stageId: string): { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } {
-  return {
-    inline_keyboard: [
-      [
-        { text: '🔐 Provide securely', callback_data: `vsp:provide:${stageId}` },
-        { text: '🚫 Decline', callback_data: `vsp:decline:${stageId}` },
-      ],
-    ],
-  }
-}
-
-function renderSecretRequestCard(req: PendingSecretRequest): string {
-  const lines: string[] = [
-    `🔒 **${escapeHtmlForTg(req.agent)}** needs a secret:`,
-    `\`${req.key}\``,
-  ]
-  if (req.reason) lines.push(`_${escapeHtmlForTg(req.reason)}_`)
-  lines.push(
-    '',
-    'Tap **Provide securely**, then send the value as your next message. I’ll delete it instantly and store it in the vault — it is never shown in chat or to the agent.',
-  )
-  return lines.join('\n')
 }
 
 /**
@@ -14137,22 +14079,6 @@ async function captureProvidedSecret(
 }
 
 /**
- * Issue #1012 — render the agent-initiated ACL request approval card.
- * Same visual language as the recent-denials one-tap allow (#969 P2b)
- * but with the agent's own reason and an explicit [Deny] path.
- */
-function buildVaultRequestAccessKeyboard(stageId: string): { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } {
-  return {
-    inline_keyboard: [
-      [
-        { text: '✅ Approve', callback_data: `vra:approve:${stageId}` },
-        { text: '🚫 Deny', callback_data: `vra:deny:${stageId}` },
-      ],
-    ],
-  }
-}
-
-/**
  * `vault_request_access` tool — agent surfaces an approval card asking
  * the operator to grant a vault ACL it doesn't yet have. See #1012.
  * Auth boundary: only operators on the gateway allowFrom list can tap;
@@ -14302,17 +14228,6 @@ function readLiveSwitchroomConfigText(): string {
 }
 
 const MENTAL_MODEL_NAME_REGEX = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/
-
-function buildMentalModelProposeKeyboard(stageId: string): { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } {
-  return {
-    inline_keyboard: [
-      [
-        { text: '✅ Approve', callback_data: `mmp:approve:${stageId}` },
-        { text: '🚫 Deny', callback_data: `mmp:deny:${stageId}` },
-      ],
-    ],
-  }
-}
 
 /**
  * `mental_model_propose` tool (hindsight Phase 5) — the agent surfaces a
