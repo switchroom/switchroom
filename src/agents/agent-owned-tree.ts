@@ -57,8 +57,38 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync, lstatSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, statSync } from "node:fs";
+import { join } from "node:path";
 import { allocateAgentUid } from "./agent-uid.js";
+
+/**
+ * The agent-dir SUBDIRECTORIES the scoped sweep recurses into (#3333
+ * amendment A). Root reconcile writers land inside these state dirs
+ * (`.claude/` — settings.json + subagents + backups; `.claude-cron/` —
+ * the cron .mcp.json; `telegram/` — the inbox). Everything else at the top
+ * level is a single file (start.sh, CLAUDE.md*, cron-session.sh,
+ * .mcp.json, .resume-mode-migration-warned, the SOUL.md symlink) captured
+ * by the top-level SHALLOW chown; the giant caches that make the full
+ * sweep slow (home/ ~96% of inodes, workspace/, tmp/) are deliberately
+ * NOT recursed into.
+ *
+ * This is the single source of truth for scope-of-sweep; the widened
+ * post-sweep assert (#3333 stage 3) derives its candidate set from the
+ * same constant so scope-of-sweep == scope-of-assert.
+ */
+export const SCOPED_RECURSIVE_SUBDIRS = [
+  ".claude",
+  ".claude-cron",
+  "telegram",
+] as const;
+
+/**
+ * Env flag that switches the reconcile sweep from the full recursive chown
+ * to the scoped sweep (#3333). Default OFF — the flag is injected by the
+ * rollout ONLY into the canary restart spawn (stage 4, amendment C), never
+ * globally, so a staged canary roll flips one agent at a time.
+ */
+export const SCOPED_SWEEP_ENV = "SWITCHROOM_SCOPED_OWNERSHIP_SWEEP";
 
 /**
  * Process/syscall seams, injectable for tests (unit tests run as an
@@ -76,6 +106,26 @@ export const ownershipRuntime = {
       stdio: ["ignore", "ignore", "pipe"],
     });
   },
+  /**
+   * SHALLOW chown (no `-R`) of the given paths — the top-level pass of the
+   * scoped sweep (#3333 amendment A). `-h` is retained for the same busybox
+   * symlink-safety reason as chownTree: a top-level entry may be a symlink
+   * (SOUL.md → workspace/SOUL.md) and must be lchowned, not dereferenced.
+   * Without `-R`, a directory arg chowns only the dir inode, not its
+   * contents — so home/ workspace/ tmp/ are never traversed here.
+   */
+  chownShallow: (uid: number, gid: number, paths: string[]): void => {
+    if (paths.length === 0) return;
+    execFileSync("chown", ["-h", `${uid}:${gid}`, ...paths], {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+  },
+  /**
+   * Whether the scoped sweep is enabled for this invocation (#3333). Reads
+   * the per-invocation env flag; default OFF. Injectable so tests can flip
+   * it without mutating process.env.
+   */
+  scopedSweepEnabled: (): boolean => process.env[SCOPED_SWEEP_ENV] === "1",
   /** Monotonic clock (ms), injectable so the timing log is deterministic in tests. */
   now: (): number => Date.now(),
   /**
@@ -100,6 +150,41 @@ export const ownershipRuntime = {
 };
 
 /**
+ * The scoped sweep (#3333 amendment A). Instead of `chown -h -R` over the
+ * whole ~620k-inode agent tree (hours at single-spindle IOPS), re-own only
+ * what root reconcile writers actually touch:
+ *
+ *   1. SHALLOW chown of the agent dir itself + every direct child (files
+ *      and symlinks — captures start.sh, CLAUDE.md*, cron-session.sh,
+ *      .mcp.json, .resume-mode-migration-warned, SOUL.md, regardless of
+ *      name). Directory children get only their dir inode chowned, NOT
+ *      their contents — so home/ workspace/ tmp/ are skipped.
+ *   2. Recursive `chown -h -R` into the scoped state SUBDIRS
+ *      (SCOPED_RECURSIVE_SUBDIRS) that exist — the dirs root writers create
+ *      new inodes inside (.claude/settings.json, subagents, backups;
+ *      .claude-cron/.mcp.json; telegram/ inbox).
+ *
+ * The walk itself is never hand-rolled: `readdirSync` reads ONE directory
+ * level for the shallow pass, and the recursion is done by `chown -h -R`,
+ * preserving `-h` symlink semantics throughout (amendment A).
+ */
+export function chownScopedTree(uid: number, gid: number, agentDir: string): void {
+  let children: string[];
+  try {
+    children = readdirSync(agentDir).map((name) => join(agentDir, name));
+  } catch {
+    children = [];
+  }
+  ownershipRuntime.chownShallow(uid, gid, [agentDir, ...children]);
+  for (const sub of SCOPED_RECURSIVE_SUBDIRS) {
+    const subPath = join(agentDir, sub);
+    if (existsSync(subPath)) {
+      ownershipRuntime.chownTree(uid, gid, subPath);
+    }
+  }
+}
+
+/**
  * When the current process runs as root, chown the agent's state tree to
  * the agent's deterministic container UID. No-op (returns null) when not
  * root: a non-root writer is either the agent itself (files already land
@@ -122,13 +207,18 @@ export function alignAgentTreeOwnershipIfRoot(
   // walks, so a real roll can validate the "~620k → ~5k" scoping thesis
   // before the scoped sweep flips on. Pure observation — no behaviour change,
   // never allowed to break the sweep (countInodes returns null on failure).
+  const scoped = ownershipRuntime.scopedSweepEnabled();
   const inodes = ownershipRuntime.countInodes(agentDir);
   const startedAt = ownershipRuntime.now();
   try {
-    ownershipRuntime.chownTree(uid, uid, agentDir);
+    if (scoped) {
+      chownScopedTree(uid, uid, agentDir);
+    } else {
+      ownershipRuntime.chownTree(uid, uid, agentDir);
+    }
     const elapsedMs = ownershipRuntime.now() - startedAt;
     console.log(
-      `[ownership-sweep] #3333 agent=${name} scope=full uid=${uid} ` +
+      `[ownership-sweep] #3333 agent=${name} scope=${scoped ? "scoped" : "full"} uid=${uid} ` +
         `inodes=${inodes ?? "unknown"} elapsedMs=${elapsedMs} dir=${agentDir}`,
     );
   } catch (err) {
