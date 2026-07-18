@@ -69,7 +69,12 @@ describe('handlePinnedMessage — ownership guard', () => {
 
 describe('handlePinnedMessage — reconcile-store race', () => {
   it('re-checks ownership once after the store catches up', async () => {
-    vi.useFakeTimers()
+    // REAL timers on purpose: this suite also runs under `bun test`, whose
+    // vitest shim does not support vi.useFakeTimers — fake timers here left
+    // the global clock mocked and hung the NEXT test file in CI (the exact
+    // #3354 bun-test failure). The handler waits 250ms before its single
+    // re-check; populate the store inside that window and await the real
+    // delay.
     const state = new Map<string, { messageId: number }>()
     const chatIds = new Map<string, string>()
     const { deps, deleteServiceMessage } = makeDeps({
@@ -80,10 +85,8 @@ describe('handlePinnedMessage — reconcile-store race', () => {
     // Store catches up during the 250ms race window.
     state.set('fg:a', { messageId: 555 })
     chatIds.set('fg:a', '42')
-    await vi.advanceTimersByTimeAsync(250)
     await p
     expect(deleteServiceMessage).toHaveBeenCalledWith('42', 999)
-    vi.useRealTimers()
   })
 })
 
