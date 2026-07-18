@@ -317,6 +317,7 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
           silentAnchorMessageId: null,
           silentAnchorText: '',
           capturedText: [],
+          capturedBlockMeta: [],
           orphanedReplyTimeoutId: null,
           answerReadyFlushTimeoutId: null,
           // Fresh liveness tracker: lastStreamEventAt seeded to the turn start
@@ -813,6 +814,13 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
       const turn = getCurrentTurn()
       if (turn != null) {
         turn.capturedText.push(ev.text)
+        // #3237 — accumulate the block's structural provenance in LOCKSTEP with
+        // the text (same push, same index). `ev.lastInMessage` is true when NO
+        // tool_use follows this text block in its assistant message; its
+        // negation is the draft-then-send narration signal the turn-flush strip
+        // uses (`selectFlushDeliveryText`) to keep a real answer intact instead
+        // of truncating a paragraph that merely opens with "Let me explain…".
+        turn.capturedBlockMeta.push(!ev.lastInMessage)
         // Narrative-dedup gate step 1 (JSONL-text-narrative primitive):
         // stage this text block for one lookahead step. If a previous block
         // was pending with nothing reply-shaped after it, it flushes here as
@@ -1366,6 +1374,7 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
             chatId: turn.sessionChatId,
             replyCalled: turn.replyCalled,
             capturedText: turn.capturedText,
+            capturedBlockMeta: turn.capturedBlockMeta,
             flushEnabled: TURN_FLUSH_SAFETY_ENABLED,
           })
       // #1667 — resolve the turn_end answer-delivery gate once, here, via the
