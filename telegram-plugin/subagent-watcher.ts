@@ -1969,6 +1969,63 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
     }
     registry.set(agentId, entry)
 
+    // Boot reconcile fast-path (perf): a historical boot entry whose file's
+    // LAST WRITE already exceeds the in-flight promotion freshness window is a
+    // provably-dead prior-session worker. The freshness gate below reaches the
+    // exact same verdict ("stale — leaving historical, no live transition to
+    // observe"), but only AFTER the full initial `readSubTail` (a whole-
+    // transcript parse plus per-record sqlite liveness/backfill round-trips).
+    // On a busy 24/7 agent, hundreds of these dead JSONLs accumulate, and doing
+    // that O(n) work synchronously at boot delayed the gateway answering
+    // Telegram by minutes after every restart — the agent looked dead. Since
+    // the age check ALONE decides "dead prior-session worker" (identical
+    // threshold `inflightPromoteMaxAgeMs`), compute it up front and short-
+    // circuit: register a minimal historical entry, skip the read, the
+    // promotion attempt, and the FSWatcher. A resume re-registration (#3315)
+    // passes isHistorical=false (historicalFiles.delete precedes it) and a
+    // genuinely fresh in-flight-at-boot worker fails the age check, so both
+    // still take the full path below.
+    if (isHistorical) {
+      let mtimeMs: number | null = null
+      let fileSize = 0
+      try {
+        const st = fs.statSync(filePath)
+        if (typeof st.size === 'number') fileSize = st.size
+        if (typeof st.mtimeMs === 'number') mtimeMs = st.mtimeMs
+      } catch {
+        /* unreadable → mtimeMs stays null → conservative full path below */
+      }
+      // Only fast-path when the mtime is KNOWN and already past the freshness
+      // window — a confidently-dead prior-session worker. A missing/unreadable
+      // mtime is NOT treated as dead here (unlike the freshness gate's
+      // Infinity-is-stale rule): we conservatively fall through to the full
+      // path so the read still happens, since the whole optimisation targets
+      // real on-disk files (which always carry an mtime) and the boot cost only
+      // bites at fleet scale where mtimes are present.
+      if (mtimeMs != null && n - mtimeMs > inflightPromoteMaxAgeMs) {
+        const fileAgeMs = n - mtimeMs
+        // Park the tail cursor at the boot-time EOF (the size we already
+        // stat'd) INSTEAD of doing the full initial `readSubTail`. This is the
+        // whole optimisation: the expensive boot work was that read (whole-
+        // transcript parse + per-record sqlite liveness/backfill round-trips),
+        // and it produced nothing actionable for a worker the freshness gate
+        // was about to leave historical anyway. A historical entry whose cursor
+        // sits at EOF is a genuinely cheap no-op in the poll loop — readSubTail
+        // statSyncs, sees `size === cursor`, and returns before any openSync or
+        // sqlite (the skeleton-cue path is gated on `!entry.historical`) — so no
+        // poll-loop special-casing is needed. Two correctness properties are
+        // preserved: (1) a stale worker's pre-existing terminal `turn_end` sits
+        // BEFORE the parked cursor, so it is never replayed as a spurious
+        // completion (the v0.14.23 stale-handback regression stays fixed); and
+        // (2) a genuine post-boot resume that grows the file PAST this EOF is
+        // still read on the next poll and surfaced. No FSWatcher: a dead
+        // prior-session worker has no live transition to observe.
+        tails.set(agentId, { cursor: fileSize, pendingPartial: '', hasEmittedStart: false, watcher: null })
+        log?.(`subagent-watcher: ${agentId} running at boot but stale (last write ${Math.round(fileAgeMs / 1000)}s ago > ${Math.round(inflightPromoteMaxAgeMs / 1000)}s) — leaving historical, skipping reconcile read (dead prior-session worker, not in-flight; no whole-transcript parse, no backfill, no watcher)`)
+        return
+      }
+    }
+
     // Backfill jsonl_agent_id linkage. The PreToolUse hook inserts the row
     // keyed on tool_use_id and doesn't know the JSONL stem yet (the JSONL
     // doesn't exist when PreToolUse fires). We bridge that gap here: read
