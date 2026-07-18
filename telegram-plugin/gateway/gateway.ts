@@ -5191,8 +5191,9 @@ function endCurrentTurnAtomic(
   // gate drops the notice; reply-less → the turn genuinely died, the notice is
   // sent now. replyCalled covers the short-answer/#2624 shape where
   // finalAnswerDelivered stays false despite an explicit reply. No-op when
-  // nothing is pending (the overwhelmingly common path).
-  flushPendingUserFailureNotices(turn.finalAnswerDelivered || turn.replyCalled)
+  // nothing is pending (the overwhelmingly common path). #3294 — `key` scopes
+  // resolution to THIS turn's topic under keyed liveness.
+  flushPendingUserFailureNotices(turn.finalAnswerDelivered || turn.replyCalled, key)
   return turnEndedAt
 }
 
@@ -8463,15 +8464,23 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
   // Un-resolved notices expire after PENDING_USER_NOTICE_TTL_MS (bias to
   // silence over a false failure claim). Operator cards above stay immediate.
   if (userNoticeChats.length > 0) {
+    // #3294 — key the notice to the live turn's topic so under PR-4e keyed
+    // liveness only THAT topic's turn end resolves it (full rationale on
+    // `PendingUserNotice.key`). `undefined` (no live turn — the event is
+    // agent-level, empty wire chatId) keeps the legacy agent-wide resolution.
+    const liveTurn = currentTurn
+    const noticeKey =
+      liveTurn != null ? statusKey(liveTurn.sessionChatId, liveTurn.sessionThreadId) : undefined
     pendingUserNoticeGate.schedule({
       chatIds: userNoticeChats,
       text: renderUserFacingFailureNotice(),
       agent,
       kind,
       atMs: Date.now(),
+      key: noticeKey,
     })
     process.stderr.write(
-      `telegram gateway: operator-event user-notice deferred to turn-end agent=${agent} kind=${kind} chats=${userNoticeChats.length}\n`,
+      `telegram gateway: operator-event user-notice deferred to turn-end agent=${agent} kind=${kind} chats=${userNoticeChats.length} topic=${noticeKey ?? '-'}\n`,
     )
   }
 }
@@ -8483,9 +8492,11 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
  * (the model explicitly replied → the turn recovered → notices are dropped by
  * the gate). Only a reply-less turn end flushes the pending notices to the
  * non-operator chats, so the user notice fires IFF the turn genuinely died.
+ * `turnKey` (#3294) scopes resolution to the ending turn's topic — a concurrent
+ * topic's pending notice is left for its own turn end under keyed liveness.
  */
-function flushPendingUserFailureNotices(turnDeliveredReply: boolean): void {
-  const notices = pendingUserNoticeGate.resolveTurnEnd(turnDeliveredReply)
+function flushPendingUserFailureNotices(turnDeliveredReply: boolean, turnKey: string): void {
+  const notices = pendingUserNoticeGate.resolveTurnEnd(turnKey, turnDeliveredReply)
   if (notices.length === 0) return
   const noticeTopic = resolveAgentOutboundTopic({ kind: 'compact-watchdog' })
   const noticeSupergroup = resolveAgentSupergroupChatId()

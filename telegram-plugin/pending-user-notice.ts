@@ -36,6 +36,25 @@ export interface PendingUserNotice {
   kind: string
   /** When the notice was scheduled (ms epoch). */
   atMs: number
+  /**
+   * TOPIC KEY (#3294) — `statusKey(chatId, threadId)` of the turn that was live
+   * when the error surfaced, or `undefined` when no turn was attributable (the
+   * error arrived between turns, or after a silence poke nulled the live turn).
+   *
+   * Why it exists: the api_error operator event is agent-level (its wire
+   * `chatId` is always empty), so the gate USED to collapse per-agent and let
+   * ANY turn end resolve the notice. Under the PR-4e keyed-liveness flag
+   * (concurrent per-topic turns) that is a bug: turn B's reply-less end would
+   * flush turn A's pending notice while A may still recover — a FALSE "couldn't
+   * complete" claim. Keying the notice by the live turn's topic means only a
+   * turn end on the SAME topic resolves it (see {@link
+   * PendingUserNoticeGate.resolveTurnEnd}).
+   *
+   * A notice with an UNDEFINED key keeps the legacy agent-wide resolution (any
+   * turn end resolves it), so single-turn gateways — the current norm, where
+   * there is only ever one topic — are byte-identical to the pre-#3294 gate.
+   */
+  key?: string
 }
 
 /** How long a scheduled notice may wait for a resolving turn end. */
@@ -45,28 +64,55 @@ export class PendingUserNoticeGate {
   private pending: PendingUserNotice[] = []
 
   /**
-   * Schedule a notice for turn-end resolution. Collapses per agent — a burst
-   * of error lines within one turn holds ONE pending notice, not a stack.
+   * Schedule a notice for turn-end resolution. Collapses per (agent, topic key)
+   * — a burst of error lines within one turn holds ONE pending notice for that
+   * topic, not a stack. Distinct concurrent topics (keyed liveness) each keep
+   * their own pending notice, so one topic's burst never overwrites another's.
+   * (For a single-turn gateway every notice shares the one topic — or an
+   * undefined key — so the collapse is identical to the pre-#3294 per-agent one.)
    */
   schedule(notice: PendingUserNotice): void {
     this.prune(notice.atMs)
-    this.pending = this.pending.filter((p) => p.agent !== notice.agent)
+    this.pending = this.pending.filter(
+      (p) => !(p.agent === notice.agent && p.key === notice.key),
+    )
     this.pending.push(notice)
   }
 
   /**
-   * Resolve at turn end. `turnDeliveredReply` is the turn's outcome signal
-   * (the gateway passes `finalAnswerDelivered || replyCalled`):
-   *   - true  → the turn recovered; every pending notice is dropped, [] returned.
-   *   - false → the turn died without a reply; the un-expired pending notices
-   *     are returned EXACTLY ONCE for the caller to send.
-   * Either way the ledger is cleared (a notice never survives its turn end).
+   * Resolve at the end of the turn whose topic is `turnKey`. `turnDeliveredReply`
+   * is the turn's outcome signal (the gateway passes `finalAnswerDelivered ||
+   * replyCalled`).
+   *
+   * A pending notice is RESOLVED by this turn end iff it belongs to the ending
+   * turn's topic (`p.key === turnKey`) OR it is unattributed (`p.key ===
+   * undefined` — legacy agent-wide resolution, kept so single-turn gateways are
+   * unchanged). Notices scheduled for a DIFFERENT live topic stay pending until
+   * their own topic's turn ends (or the TTL expires) — this is the #3294 fix:
+   * turn B's end no longer flushes turn A's pending notice.
+   *
+   * Of the resolved notices:
+   *   - `turnDeliveredReply === true`  → the turn recovered; the resolved
+   *     notices are dropped and `[]` is returned.
+   *   - `turnDeliveredReply === false` → the turn died reply-less; the resolved,
+   *     un-expired notices are returned EXACTLY ONCE for the caller to send.
+   * Either way the resolved notices leave the ledger (a notice never survives
+   * the end of the turn it is keyed to).
    */
-  resolveTurnEnd(turnDeliveredReply: boolean, now: number = Date.now()): PendingUserNotice[] {
+  resolveTurnEnd(
+    turnKey: string | undefined,
+    turnDeliveredReply: boolean,
+    now: number = Date.now(),
+  ): PendingUserNotice[] {
     this.prune(now)
-    const out = turnDeliveredReply ? [] : [...this.pending]
-    this.pending = []
-    return out
+    const resolved: PendingUserNotice[] = []
+    const remaining: PendingUserNotice[] = []
+    for (const p of this.pending) {
+      if (p.key === turnKey || p.key === undefined) resolved.push(p)
+      else remaining.push(p)
+    }
+    this.pending = remaining
+    return turnDeliveredReply ? [] : resolved
   }
 
   /** True when at least one un-expired notice is pending (does not mutate). */
