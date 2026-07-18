@@ -38,14 +38,13 @@
  *
  * The gateway-internal turn/poke effects (setTurnStarted,
  * clearTurnStarted, noteOutbound, firePoke) map to gateway-scope state
- * (`claudeBusyKeys`, the silence-poke ladder) that this decoupled module
+ * (the silence-poke ladder, turn markers) that this decoupled module
  * cannot reach directly, so they are dispatched through OPTIONAL
  * callbacks on the ctx. When a callback is absent the effect logs an
  * `unwired` trace rather than silently no-opping — the trace is the gate.
  *
- * Kill switch: `SWITCHROOM_DELIVERY_MACHINE_CUTOVER=0` disables
- * dispatcher execution and the gateway falls back to imperative-only.
- * Default is ON — this PR is the cutover.
+ * The `SWITCHROOM_DELIVERY_MACHINE_CUTOVER` kill switch was removed in
+ * #2996 P1 after the cutover baked — the dispatcher always executes.
  */
 
 import type {
@@ -80,10 +79,10 @@ export interface DispatchCtx {
    */
   readonly onUserInboundDelivered?: (merged: InboundMessage) => void
   // ── Gateway-internal turn/poke effect callbacks ──────────────────
-  // These effects map to gateway-scope state (`claudeBusyKeys`, the
-  // silence-poke ladder) that this decoupled module cannot reach. The
-  // gateway supplies them when it flips inbound routing through the
-  // machine (PR3c). Absent → the effect logs an `unwired` trace.
+  // These effects map to gateway-scope state (the silence-poke ladder,
+  // turn markers) that this decoupled module cannot reach. The
+  // gateway supplies them at the live inbound call site. Absent → the
+  // effect logs an `unwired` trace.
   readonly onSetTurnStarted?: (key: ChatKey, at: number) => void
   /**
    * Optional: observe the outcome of a `deliverToBridge` effect. The
@@ -101,12 +100,6 @@ export interface DispatchCtx {
   readonly onFirePoke?: (key: ChatKey, level: 'soft' | 'firm' | 'fallback') => void
 }
 
-const enabled = process.env.SWITCHROOM_DELIVERY_MACHINE_CUTOVER !== '0'
-
-export function isDispatchEnabled(): boolean {
-  return enabled
-}
-
 /**
  * Execute the effects returned by `transition()`. Pure imperative
  * driver: side-effects only, no machine state held here.
@@ -117,7 +110,6 @@ export function isDispatchEnabled(): boolean {
  * already up).
  */
 export function dispatchEffects(effects: readonly Effect[], ctx: DispatchCtx): void {
-  if (!enabled) return
   for (const effect of effects) {
     dispatchOne(effect, ctx)
   }

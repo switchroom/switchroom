@@ -101,14 +101,17 @@ describe('inbound gate holds while approval card is outstanding (#2841)', () => 
     expect(fn).toMatch(/hasPendingApproval\s*=\s*pendingPermissions\.size\s*>\s*0/)
   })
 
-  it('turnInFlightMachineOnly carries BOTH busy paths (legacy claudeBusyKeys + machine)', () => {
+  it('turnInFlightMachineOnly reads the delivery machine (sole gate, #2996 P1)', () => {
     // #3262: the machine-in-turn signal moved here (read by the /model & /effort
-    // resolver without the approval hold). Both the legacy claudeBusyKeys path
-    // and the machine-authoritative probeGateParity path must be present — a
-    // dropped branch would silently change the busy read.
+    // resolver without the approval hold). #2996 P1 deleted the legacy
+    // claudeBusyKeys branch and the gate-parity probe — the machine read is
+    // the ONLY busy source now; a reintroduced legacy branch would silently
+    // fork the busy read again.
     const fn = slice(GATEWAY, 'function turnInFlightMachineOnly()', 1400)
-    expect(fn).toMatch(/claudeBusyKeys\.size\s*>\s*0/)
-    expect(fn).toContain('probeGateParity(')
+    expect(fn).toContain('return isMachineInTurn()')
+    // Code-shape pins (comments may still narrate the deleted legacy design):
+    expect(fn).not.toMatch(/claudeBusyKeys\.size/)
+    expect(fn).not.toMatch(/probeGateParity\(/)
     // NOT gated by the approval hold — that stays in turnInFlightForGate.
     expect(fn).not.toContain('hasPendingApproval')
   })

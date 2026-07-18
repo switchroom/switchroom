@@ -115,9 +115,9 @@ describe("agent button taps use the turn-gate (mid-turn → buffer)", () => {
     });
 
     it("buffers + spools on bridge-offline (existing behaviour intact)", () => {
-      // The idle-branch send missed → the reservation is released in lockstep
-      // and the tap is spooled to the pending-inbound buffer for replay.
-      expect(body).toMatch(/claudeBusyKeys\.delete\(reservedBusyKey\)/);
+      // The idle-branch send missed → the tap is spooled to the
+      // pending-inbound buffer for replay. (#2996 P1: the legacy busy-key
+      // reservation/release pair was deleted with the claudeBusyKeys set.)
       expect(body).toMatch(/return 'buffered-bridge-offline'/);
       // The bridge-offline buffer push is the LAST push (after the send miss),
       // so it always spools before returning the offline outcome.

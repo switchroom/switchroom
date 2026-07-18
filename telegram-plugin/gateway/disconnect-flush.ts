@@ -37,17 +37,6 @@ export interface DisconnectFlushDeps<Ctrl extends { finalize: (reason?: 'done' |
   activeReactionMsgIds: Map<string, { chatId: string; messageId: number }>
   /** Mirror map: same keys → turn-start timestamps. */
   activeTurnStartedAt: Map<string, number>
-  /** PR3b: keys claude has actually been handed (delivered, not just
-   *  received). Cleared on disconnect for the same reason as
-   *  activeTurnStartedAt — the bridge just died, every turn it
-   *  was handed is dead by definition. */
-  claudeBusyKeys: Set<string>
-  /** #2787: insertion-timestamp map for `claudeBusyKeys`, backing the orphan
-   *  reaper. MUST stay in lockstep with `claudeBusyKeys` at every clear site —
-   *  a stale timestamp surviving a clear makes a later re-marked key look
-   *  >TTL-old and get reaped against a live delivery. Deleted alongside every
-   *  `claudeBusyKeys.delete`/`.clear` below. */
-  claudeBusyKeySince: Map<string, number>
 
   /** Open draft-stream handles keyed by chat:thread:replyId. */
   activeDraftStreams: Map<string, Stream>
@@ -96,8 +85,6 @@ export function flushOnAgentDisconnect<
     activeStatusReactions,
     activeReactionMsgIds,
     activeTurnStartedAt,
-    claudeBusyKeys,
-    claudeBusyKeySince,
     activeDraftStreams,
     clearActiveReactions,
     disposeProgressDriver,
@@ -125,8 +112,6 @@ export function flushOnAgentDisconnect<
     activeStatusReactions.delete(key)
     activeReactionMsgIds.delete(key)
     activeTurnStartedAt.delete(key)
-    claudeBusyKeys.delete(key)
-    claudeBusyKeySince.delete(key) // #2787: keep orphan-TTL map in lockstep
   }
   clearActiveReactions()
 
@@ -146,8 +131,6 @@ export function flushOnAgentDisconnect<
     for (const k of danglingKeys) {
       activeTurnStartedAt.delete(k)
       activeReactionMsgIds.delete(k)
-      claudeBusyKeys.delete(k)
-      claudeBusyKeySince.delete(k) // #2787: keep orphan-TTL map in lockstep
     }
     log(
       `telegram gateway: disconnect-flush swept ${danglingKeys.length} dangling turn key(s) ` +
@@ -156,33 +139,12 @@ export function flushOnAgentDisconnect<
     onDanglingTurnsSwept?.(danglingKeys)
   }
 
-  // PR3b orphan-sweep (#1880 follow-up): claudeBusyKeys can hold keys
-  // that activeTurnStartedAt does NOT — specifically when a synthetic
-  // inbound (cron via onInjectInbound, reaction dispatch, vault
-  // grant-approved / -denied / save-discarded / -failed / -completed,
-  // button-callback) was delivered. Those paths bypass handleInbound's
-  // fresh-turn branch (which is what would set activeTurnStartedAt),
-  // so the sweep loop above wouldn't notice them. Pre-PR3b this was
-  // invisible because the fleet gate read activeTurnStartedAt.size —
-  // synthetic-only turns never registered. PR3b's claudeBusyKeys.add
-  // is the more-accurate "claude is busy on this" gate, which means
-  // a synthetic-delivered turn that dies WITHOUT turn_end leaves an
-  // orphan that the activeTurnStartedAt-keyed sweep can't see.
-  // Cure: clear any leftover busy keys here. Bridge died → every
-  // busy key is dead by definition. Same justification as the
-  // dangling-sweep above for activeTurnStartedAt.
-  if (claudeBusyKeys.size > 0) {
-    const orphanCount = claudeBusyKeys.size
-    const orphanKeys = [...claudeBusyKeys]
-    claudeBusyKeys.clear()
-    // #2787: keep the orphan-TTL map in lockstep with the set it shadows.
-    for (const k of orphanKeys) claudeBusyKeySince.delete(k)
-    log(
-      `telegram gateway: disconnect-flush cleared ${orphanCount} orphan claudeBusyKeys ` +
-      `entr${orphanCount === 1 ? 'y' : 'ies'} (synthetic-inbound deliveries that never turn_ended)` +
-      ` keys=${orphanKeys.join(',')}`,
-    )
-  }
+  // (#2996 P1) The PR3b `claudeBusyKeys` orphan-sweep that lived here was
+  // deleted with the set itself: the delivery machine's `bridgeDown` event
+  // — emitted by the gateway's onClientDisconnected alongside this flush —
+  // resets the machine to bridge_dead, which structurally clears the
+  // turn-in-flight gate for synthetic-delivered turns that died without a
+  // turn_end (the case the sweep existed for).
 
   // Stop coalesce timers that could emit into a finalized draft stream, but
   // preserve chats with pendingCompletion=true — those have background

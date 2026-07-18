@@ -9,10 +9,10 @@
  * — before the permission-reply / `/auth` paste-back / interrupt-empty /
  * secret-detect-drop intercepts — an intercepted message (e.g. an approval
  * reply) drove the machine idle→`bridge_alive_in_turn`, then early-returned
- * as an intercept: no delivery, no claudeBusyKeys mark, and critically no
- * `turnEnd`. The machine held the gate closed until the 5-min TTL tick
- * force-cleared it, buffering every inbound (including `/usage`) meanwhile —
- * the dangerous `machine_over_holds` divergence gate-parity-probe.ts flags.
+ * as an intercept: no delivery, and critically no `turnEnd`. The machine
+ * held the gate closed until the 5-min TTL tick force-cleared it, buffering
+ * every inbound (including `/usage`) meanwhile — the dangerous over-hold
+ * direction the bake-era gate-parity probe flagged.
  *
  * The behaviour lives inside the un-exported `handleInbound` closure, so —
  * mirroring the other gateway-*.test.ts source-pins — we assert on source

@@ -18,13 +18,12 @@
  *   3. Invariant #1 at the dispatch layer: an inbound is delivered XOR
  *      (buffered AND persisted) — never both, never neither.
  *
- * It does NOT invoke the imperative twins (`markClaudeBusyForInbound`,
- * the legacy `turnInFlightForGate` claudeBusyKeys branch,
- * `dispatchPermissionVerdict`, the silence-poke ladder), so it is NOT a
- * proof that machine path and imperative path produce identical I/O.
- * Twin-equivalence evidence for PR4 (twin deletion) must come from the
- * live shadow trace + gate-parity-probe bake per the RFC's cutover
- * protocol — do NOT cite this file as that proof.
+ * It does NOT invoke the remaining imperative delivery body (the twin
+ * carve-outs for `!`-interrupt / bridge_dead, `dispatchPermissionVerdict`,
+ * the silence-poke ladder), so it is NOT a proof that machine path and
+ * imperative path produce identical I/O. (#2996 P1 deleted the legacy
+ * gate/claudeBusyKeys twins after the cutover bake; the carve-out body's
+ * eventual deletion — the #2794 PR4 remainder — needs its own evidence.)
  *
  * What it DOES gate: if a future edit adds an effect kind the
  * dispatcher doesn't execute, the "no unhandled effect" assertion fails

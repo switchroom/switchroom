@@ -304,14 +304,14 @@ State of the triple-maintained paths as of this checklist:
 
 | Concern | Machine (authoritative?) | Shadow / imperative still live? |
 |---|---|---|
-| bridgeUp drain (inbound + perm-verdict redelivery) | **Yes** — dispatched via `dispatchEffects` (PR3a) | Imperative drain only under kill-switch `SWITCHROOM_DELIVERY_MACHINE_CUTOVER=0` (gateway.ts bridgeUp handler) |
-| turn-in-flight GATE (`turnInFlightForGate`) | **Yes** — `isMachineInTurn()` | `claudeBusyKeys` set still fully maintained + reaped in parallel; read on kill-switch path. **Drift canary added (`gate-parity-probe.ts`, #2794).** |
+| bridgeUp drain (inbound + perm-verdict redelivery) | **Yes** — dispatched via `dispatchEffects` (PR3a) | **Deleted** (#2996 P1) — the imperative kill-switch drain fallback is gone; `dispatchEffects` is unconditional |
+| turn-in-flight GATE (`turnInFlightForGate`) | **Yes** — `isMachineInTurn()` | **Deleted** (#2996 P1) — the `claudeBusyKeys` set + `busy-key-reaper.ts` + the `gate-parity-probe.ts` drift canary + the kill-switch branch are gone; the machine is the sole gate |
 | `turnEnd` lifecycle | No — shadow-only (`shadowEmit`) | Imperative `purgeReactionTracking` / `endCurrentTurnAtomic` + multi-callsite emits (RFC PR3b step 1 audit) |
-| `inbound` routing (deliver vs buffer) | **Yes** — `handleInbound` dispatches the captured `inbound` effects via `dispatchEffects` (PR3c flip, #2794) | Imperative twin retained for kill-switch `=0` + two documented carve-outs the machine doesn't model yet (`!`-interrupt while in_turn; bridge_dead send-miss semantics — the carve-out keys off the anchored `inbound_bridge_dead_buffer` trace stage). **Known behavior delta, accepted for the bake:** after a machine-path send-miss (bridge nominally alive, `sendToAgent` false/throw) the machine stays `in_turn` until the TTL tick or a bridge flap clears it, so subsequent inbounds in that window are machine-buffered (queued busy-ack) instead of the legacy per-message send attempt + restart notice. Delete twin in PR4 after the 48h bake |
+| `inbound` routing (deliver vs buffer) | **Yes** — `handleInbound` dispatches the captured `inbound` effects via `dispatchEffects` (PR3c flip, #2794) | Kill-switch fallback **deleted** (#2996 P1); the imperative delivery body remains ONLY for the two documented carve-outs the machine doesn't model yet (`!`-interrupt while in_turn; bridge_dead send-miss semantics — the carve-out keys off the anchored `inbound_bridge_dead_buffer` trace stage). **Known behavior delta, accepted for the bake:** after a machine-path send-miss (bridge nominally alive, `sendToAgent` false/throw) the machine stays `in_turn` until the TTL tick or a bridge flap clears it, so subsequent inbounds in that window are machine-buffered (queued busy-ack) instead of the legacy per-message send attempt + restart notice. Deleting the carve-out body is the PR4 remainder (needs machine interrupt + bridge_dead send-miss events) |
 | poke ladder + `firePoke` | No | Imperative silence-poke |
 | perm-verdict deliver/persist (non-bridgeUp) | No | Imperative |
 
-Checklist (each box = one baked PR; keep the kill-switch until PR4):
+Checklist (each box = one baked PR):
 
 - [x] **PR3a** — dispatcher + bridgeUp effect execution. *(done)*
 - [x] **Gate cutover** — `turnInFlightForGate` reads the machine. *(done, #2794 adds the drift canary so the parallel `claudeBusyKeys` shadow can't silently diverge in the dangerous `machine_over_holds` direction before it is deleted.)*
@@ -332,9 +332,15 @@ Checklist (each box = one baked PR; keep the kill-switch until PR4):
   the body) and bridge_dead (the twin's shouldTrackDelivery drop
   carve-outs + restart notice are the contract). Twin deleted in PR4
   after the 48h bake.)*
-- [ ] **PR4** — delete the kill-switch fallback branches, the
-  `claudeBusyKeys` set + its reaper, `gate-parity-probe.ts`, and the
-  redundant silence-poke/purge primitives. Net −200…−500 lines.
+- [ ] **PR4** — *(partially delivered in #2996 P1: the kill-switch
+  fallback branches (`SWITCHROOM_DELIVERY_MACHINE_CUTOVER` /
+  `SWITCHROOM_DELIVERY_MACHINE_SHADOW`), the `claudeBusyKeys` set + its
+  reaper (`busy-key-reaper.ts`), and `gate-parity-probe.ts` are deleted —
+  the machine is the sole turn-in-flight gate.)* Remainder: delete the
+  imperative inbound delivery body behind the two carve-outs (needs a
+  machine `interrupt` event + bridge_dead send-miss semantics — see
+  PR3c note) and the redundant silence-poke/purge primitives (blocked
+  on PR3b step 2).
 
 Each step must keep the delivery-reliability guarantees from #2787
 (confirm-sweep scoping) and #2801 (enqueue-ack) intact — the machine's
