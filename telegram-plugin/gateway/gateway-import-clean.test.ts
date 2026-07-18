@@ -51,18 +51,35 @@ describe('gateway.ts import-cleanliness (#2996 P0e)', () => {
     // With the gate intact it is never invoked. (Also proves the import no
     // longer depends on a real Bun global — it resolves whether or not one
     // exists.)
+    //
+    // Dual-runner note: this file runs under BOTH vitest (Node) and `bun test`
+    // (the plugin bun suite globs every *.test.ts). Under Node `globalThis.Bun`
+    // is undefined and the fake installs cleanly — that run holds the no-bind
+    // oracle. Under the Bun runtime the `Bun` global is READONLY (assignment
+    // throws "Attempted to assign to readonly property"), so the swap is
+    // best-effort there; the bind oracle is then carried by the vitest run and
+    // the source pins below, while the remaining outcome assertions (resolve /
+    // no exit / no listeners) still run in both runtimes.
     const listenSpy = vi.fn(() => {
       throw new Error('Bun.listen was called during import() — an IPC server was bound')
     })
     const priorBun = (globalThis as { Bun?: unknown }).Bun
-    ;(globalThis as { Bun?: unknown }).Bun = { listen: listenSpy }
+    let bunSwapped = false
+    try {
+      ;(globalThis as { Bun?: unknown }).Bun = { listen: listenSpy }
+      bunSwapped = true
+    } catch {
+      // Bun runtime — readonly global; see dual-runner note above.
+    }
 
     let mod: Record<string, unknown>
     try {
       mod = (await import('./gateway.js')) as Record<string, unknown>
     } finally {
-      if (priorBun === undefined) delete (globalThis as { Bun?: unknown }).Bun
-      else (globalThis as { Bun?: unknown }).Bun = priorBun
+      if (bunSwapped) {
+        if (priorBun === undefined) delete (globalThis as { Bun?: unknown }).Bun
+        else (globalThis as { Bun?: unknown }).Bun = priorBun
+      }
       exitSpy.mockRestore()
     }
 
@@ -70,7 +87,8 @@ describe('gateway.ts import-cleanliness (#2996 P0e)', () => {
     // unreachable — the import rejected with `Bun is not defined`.
     expect(mod).toBeTruthy()
 
-    // No IPC server bound.
+    // No IPC server bound (Node run; under Bun the swap is best-effort and the
+    // spy simply stays uninstalled + uncalled).
     expect(listenSpy).not.toHaveBeenCalled()
 
     // No exit reachable on import.
@@ -81,7 +99,9 @@ describe('gateway.ts import-cleanliness (#2996 P0e)', () => {
     // its own, so those two are asserted via the delta only.)
     const after = signalListenerCounts()
     for (const sig of GATEWAY_SIGNALS) {
-      expect(after[sig] - before[sig], `${sig} listeners added by import`).toBe(0)
+      // Runner-agnostic single-arg expect (bun's expect has no message arg):
+      // encode the signal name in the compared value so a failure is legible.
+      expect(`${sig}:+${after[sig] - before[sig]}`).toBe(`${sig}:+0`)
     }
   }, 60_000)
 
