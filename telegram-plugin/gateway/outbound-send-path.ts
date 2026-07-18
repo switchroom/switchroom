@@ -40,7 +40,11 @@ import { isMessageTooLongError, isHtmlParseRejectError } from '../retry-api-call
 // surfaces are injected via SendReplyGatewayDeps (see the DI contract below).
 import { statSync } from 'fs'
 import { extname } from 'path'
-import { InputFile, type Bot, type Context } from 'grammy'
+import { GrammyError, InputFile, type Bot, type Context } from 'grammy'
+import {
+  combineReadBackResults,
+  type ReadBackResult,
+} from './backstop-delivery.js'
 import {
   escapeMarkdown,
 } from '../format.js'
@@ -424,6 +428,130 @@ export async function sendReplyChunks(
   }
 
   return { threadId, previewMessageId }
+}
+
+// ─── Read-back confirmation probe (#3278) ─────────────────────────────────
+//
+// A returned message_id proves Telegram ACCEPTED a send, not that the message
+// is VISIBLE: a server-side accept-then-silently-discard (flood/anti-spam)
+// returns a fresh id yet the user sees nothing. The only echo primitive the Bot
+// API offers (there is no getMessage) is a no-op `editMessageText` against the
+// returned id — a `400 message to edit not found` proves absence, an edit-ok /
+// `message is not modified` proves presence. This primitive classifies that
+// probe per id and combines a chunk's ids into one verdict; the backstop
+// delivery orchestrator (`runBackstopDelivery`) consumes the verdict to decide
+// confirm / demote-and-re-send / leave-unconfirmed. Scoped to the RARE backstop
+// path only — the hot reply-tool send path issues ZERO probes (#3278 §1.3/§1.5).
+
+/**
+ * Classify a single-id read-back `editMessageText` FAILURE into a
+ * {@link ReadBackResult}. Pure over the thrown error:
+ *  - `400 message to edit not found` ⇒ `absent`   (positive drop → safe re-send)
+ *  - `400 message is not modified`   ⇒ `exists`   (a no-op edit → message present)
+ *  - anything else (429 / 5xx / network / thread-not-found / parse) ⇒ `ambiguous`
+ *    (never re-send — a re-send would risk a duplicate).
+ *
+ * A read-back that RESOLVES (the edit applied) means the message existed and is
+ * classified `exists` by the caller — this helper only maps the error branch.
+ */
+export function classifyReadBackError(err: unknown): ReadBackResult {
+  if (err instanceof GrammyError && err.error_code === 400) {
+    const d = (err.description || '').toLowerCase()
+    if (d.includes('message to edit not found')) return 'absent'
+    if (d.includes('not modified')) return 'exists'
+  }
+  return 'ambiguous'
+}
+
+/** Injected per-id probe for {@link createBackstopReadBackProbe}. Resolves to the
+ *  chunk-id's {@link ReadBackResult} — the gateway wires this to a no-op
+ *  `editMessageText` paced through the send gate (cosmetic priority, so it sheds
+ *  under a flood window and never storms); a test supplies a scripted fake. */
+export interface BackstopReadBackDeps {
+  /** Probe ONE landed message id (edit it to `body`, its identical rich render). */
+  probeId: (messageId: number, body: unknown) => Promise<ReadBackResult>
+  /** rich-markdown wrapper (`richMessage`) — the probe edits to the SAME body the
+   *  chunk was sent with, so an existing message returns "not modified" (no
+   *  visible mutation) rather than actually changing the delivered answer. */
+  richMessage: (s: string) => unknown
+}
+
+/**
+ * Build the `readBack` dep injected into `runBackstopDelivery` (#3278). For each
+ * landed chunk it probes EVERY message id (a length-resplit chunk lands >1) and
+ * combines them (guard A7 — the chunk is confirmed only if ALL ids exist; ANY
+ * positive absence ⇒ re-send the whole chunk). An empty id set is `ambiguous`
+ * (nothing to probe → fabricate neither a confirmation nor a demotion).
+ */
+export function createBackstopReadBackProbe(
+  deps: BackstopReadBackDeps,
+): (chunkIndex: number, messageIds: readonly number[], text: string) => Promise<ReadBackResult> {
+  return async (_chunkIndex, messageIds, text) => {
+    if (messageIds.length === 0) return 'ambiguous'
+    const body = deps.richMessage(text)
+    const perId: ReadBackResult[] = []
+    for (const id of messageIds) {
+      perId.push(await deps.probeId(id, body))
+    }
+    return combineReadBackResults(perId)
+  }
+}
+
+/** Injected wiring for {@link createBackstopReadBack}. The gateway supplies its
+ *  raw send primitives; a test can drive the whole probe with fakes. */
+export interface BackstopReadBackWiring {
+  /** Raw `editMessageText` with the chat_id baked in by the caller — edits the
+   *  message to `body` with `apiOpts`; resolves grammy's result or throws the
+   *  raw grammy error (NOT swallowed, so not-found/not-modified stay
+   *  distinguishable via {@link classifyReadBackError}). */
+  editMessageText: (messageId: number, body: unknown, apiOpts: unknown) => Promise<unknown>
+  /** Send-gate wrapper — the probe routes through it at COSMETIC priority so it
+   *  sheds under a flood window (never storms) and paces like every other send. */
+  gate: <T>(fn: () => Promise<T>, opts: RetryCallOpts) => Promise<T>
+  /** `SEND_GATE_SHED` sentinel detector: a shed probe is `ambiguous` (never a
+   *  re-send), NOT a false `exists`. */
+  isShed: (r: unknown) => boolean
+  /** rich-markdown wrapper (`richMessage`). */
+  richMessage: (s: string) => unknown
+  chatId: string
+  threadId: number | undefined
+}
+
+/**
+ * Build the complete #3278 `readBack` dep for `runBackstopDelivery`, owning the
+ * per-id probe: a no-op `editMessageText` to the message's IDENTICAL body,
+ * paced cosmetic through the send gate. A resolved edit (or a `not modified`
+ * 400) ⇒ `exists`; a `message to edit not found` 400 ⇒ `absent`; a gate shed,
+ * 429/5xx/network, or any other throw ⇒ `ambiguous` (never re-send). Per-chunk
+ * ids are combined by {@link createBackstopReadBackProbe} (guard A7).
+ */
+export function createBackstopReadBack(
+  w: BackstopReadBackWiring,
+): (chunkIndex: number, messageIds: readonly number[], text: string) => Promise<ReadBackResult> {
+  const probeId = async (messageId: number, body: unknown): Promise<ReadBackResult> => {
+    // Match the SEND's link_preview_options so editing to the identical body is
+    // a genuine no-op ("message is not modified") and never visibly mutates the
+    // delivered answer. editMessageText targets a globally-unique message_id, so
+    // no message_thread_id is needed on the edit itself.
+    const editApiOpts = { link_preview_options: { is_disabled: true } }
+    // Retry/gate metadata (RetryCallOpts) — keys the gate's per-message edit
+    // floor + cosmetic shedding; NOT sent to Telegram as API params.
+    const gateOpts: RetryCallOpts = {
+      chat_id: w.chatId,
+      verb: 'backstop.readback',
+      priorityClass: 'cosmetic',
+      messageId,
+      editPayload: body,
+      ...(w.threadId != null ? { threadId: w.threadId } : {}),
+    }
+    try {
+      const r = await w.gate(() => w.editMessageText(messageId, body, editApiOpts), gateOpts)
+      return w.isShed(r) ? 'ambiguous' : 'exists'
+    } catch (err) {
+      return classifyReadBackError(err)
+    }
+  }
+  return createBackstopReadBackProbe({ probeId, richMessage: w.richMessage })
 }
 
 // ─── Send-orchestration façade (#2996 P2, Amendments 9/10) ────────────────

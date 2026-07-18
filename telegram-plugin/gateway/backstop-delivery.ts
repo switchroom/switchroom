@@ -40,6 +40,12 @@ export class BackstopDeliveryLedger {
   private chunks = new Map<string, Map<number, number[]>>()
   /** turnId -> chunk indices with an in-flight (pre-ack) send (guard 6). */
   private pending = new Map<string, Set<number>>()
+  /** turnId -> chunk indices whose read-back probe CONFIRMED the message
+   *  actually exists in the chat (#3278). A chunk with a landed message id but
+   *  no confirmation is `landed-unconfirmed` — the Bot API accepted the send but
+   *  a server-side silent discard (flood/anti-spam) can return a fresh id for a
+   *  message the user never sees, so an id alone is NOT proof of delivery. */
+  private confirmed = new Map<string, Set<number>>()
 
   /**
    * Guard 5 — once-per-turn BACKSTOP double-fire latch. Returns `true` on the
@@ -99,6 +105,78 @@ export class BackstopDeliveryLedger {
     return (this.chunks.get(turnId)?.get(index)?.length ?? 0) > 0
   }
 
+  /** The landed message id(s) for one chunk (empty when unsent). The read-back
+   *  probe reads these to confirm every id of the chunk (guard A7 — a
+   *  length-resplit chunk lands >1 id and all must exist to count confirmed). */
+  chunkIds(turnId: string, index: number): number[] {
+    return (this.chunks.get(turnId)?.get(index) ?? []).slice()
+  }
+
+  /**
+   * #3278 — transition a landed-unconfirmed chunk to `landed-confirmed` after a
+   * read-back probe proved the message exists in the chat. Only a confirmed
+   * chunk counts toward delivery / `complete`.
+   */
+  confirmChunk(turnId: string, index: number): void {
+    let set = this.confirmed.get(turnId)
+    if (set == null) {
+      set = new Set()
+      this.confirmed.set(turnId, set)
+    }
+    set.add(index)
+  }
+
+  /**
+   * #3278 — demote a chunk back to `unsent` on a POSITIVE absence read-back
+   * (Telegram `400 message to edit not found`): the send was silently dropped,
+   * so re-sending it is safe (it never reached the user). Clears the landed ids,
+   * the pending marker, and any stale confirmation. NEVER call this on an
+   * ambiguous probe (429/5xx/network) — that would risk a duplicate.
+   */
+  demoteChunk(turnId: string, index: number): void {
+    this.chunks.get(turnId)?.delete(index)
+    this.pending.get(turnId)?.delete(index)
+    this.confirmed.get(turnId)?.delete(index)
+  }
+
+  /** True only for a `landed-confirmed` chunk (read-back proved it exists). */
+  hasConfirmedChunk(turnId: string, index: number): boolean {
+    return this.confirmed.get(turnId)?.has(index) ?? false
+  }
+
+  /** Chunk indices that have landed at least one id but are NOT yet confirmed —
+   *  the set the read-back probe must resolve (confirm / demote / leave). */
+  landedUnconfirmedIndices(turnId: string, chunkCount: number): number[] {
+    const out: number[] = []
+    for (let i = 0; i < chunkCount; i++) {
+      if (this.hasChunk(turnId, i) && !this.hasConfirmedChunk(turnId, i)) out.push(i)
+    }
+    return out
+  }
+
+  /** True IFF every chunk 0..chunkCount-1 is `landed-confirmed`. `chunkCount===0`
+   *  is never "all confirmed" (nothing was delivered). */
+  allConfirmed(turnId: string, chunkCount: number): boolean {
+    if (chunkCount <= 0) return false
+    for (let i = 0; i < chunkCount; i++) {
+      if (!this.hasConfirmedChunk(turnId, i)) return false
+    }
+    return true
+  }
+
+  /** Landed message ids of CONFIRMED chunks only, in chunk-index order — the set
+   *  the delivery predicate counts (fresh non-card ids that are proven-present). */
+  confirmedIds(turnId: string): number[] {
+    const m = this.chunks.get(turnId)
+    const set = this.confirmed.get(turnId)
+    if (m == null || set == null) return []
+    const out: number[] = []
+    for (const index of Array.from(m.keys()).sort((a, b) => a - b)) {
+      if (set.has(index)) out.push(...(m.get(index) ?? []))
+    }
+    return out
+  }
+
   /** All landed message ids for this turn, in chunk-index order. */
   sentIds(turnId: string): number[] {
     const m = this.chunks.get(turnId)
@@ -137,7 +215,47 @@ export class BackstopDeliveryLedger {
     this.latched.delete(turnId)
     this.chunks.delete(turnId)
     this.pending.delete(turnId)
+    this.confirmed.delete(turnId)
   }
+}
+
+/**
+ * #3278 — the tri-state a read-back probe resolves a landed chunk into:
+ *  - `exists`    — a no-op `editMessageText` succeeded or returned "message is
+ *                  not modified" ⇒ the message is present at the chat_id ⇒
+ *                  `landed-confirmed` (counts toward delivery).
+ *  - `absent`    — Telegram `400 message to edit not found` ⇒ positive absence
+ *                  ⇒ demote to `unsent` (safe to re-send — it never landed).
+ *  - `ambiguous` — 429 / 5xx / network / gate-shed / anything else ⇒ leave
+ *                  `landed-unconfirmed`; NEVER re-send (a re-send would risk a
+ *                  duplicate, and duplicate-risk beats missing-risk here).
+ *
+ * NOTE (honest limitation, #3278 §1.4): a passing probe proves only that the
+ * message EXISTS at that chat_id. It does NOT prove the human's client rendered
+ * it, and it does NOT catch a wrong-thread/chat misroute (the edit succeeds
+ * because the message exists — just not where the operator is looking).
+ * Read-back is necessary-but-not-sufficient; it is paired with the correct
+ * chat/thread resolution already pinned by the backstop caller.
+ */
+export type ReadBackResult = 'exists' | 'absent' | 'ambiguous'
+
+/**
+ * Combine the per-id read-back results of ONE chunk into the chunk's verdict
+ * (guard A7 — a length-resplit chunk lands >1 message id and every id must be
+ * present for the chunk to count confirmed). Pure:
+ *  - ANY id `absent`               ⇒ `absent`   (the chunk is incomplete on the
+ *                                     wire → re-send the whole chunk)
+ *  - ALL ids `exists`              ⇒ `exists`
+ *  - otherwise (some `ambiguous`,
+ *    none `absent`)                ⇒ `ambiguous` (never re-send)
+ *  - empty id set                  ⇒ `ambiguous` (nothing to probe → don't
+ *                                     fabricate a confirmation OR a demotion)
+ */
+export function combineReadBackResults(perId: readonly ReadBackResult[]): ReadBackResult {
+  if (perId.length === 0) return 'ambiguous'
+  if (perId.some(r => r === 'absent')) return 'absent'
+  if (perId.every(r => r === 'exists')) return 'exists'
+  return 'ambiguous'
 }
 
 /**
@@ -175,6 +293,25 @@ export interface BackstopDeliveryDeps {
   /** Record the delivered ids + aligned texts to history (called once, after
    *  the attempts resolve, with the full landed set). */
   recordOutbound?: (messageIds: number[], texts: string[]) => void
+  /**
+   * #3278 read-back confirmation. After a chunk lands a message id, a no-op
+   * `editMessageText` probe re-confirms the message ACTUALLY exists in the chat
+   * (a returned id is only an API accept, not proof of visibility). Returns the
+   * chunk's {@link ReadBackResult} — `exists` ⇒ landed-confirmed, `absent` ⇒
+   * demote to unsent + re-send, `ambiguous` ⇒ stay landed-unconfirmed and NEVER
+   * re-send. Runs once per landed chunk after the send attempts resolve, and is
+   * itself flood-window-paced by the caller (never a storm).
+   *
+   * When OMITTED, a landed chunk is confirmed on landing (pre-#3278 behavior) —
+   * still gated by the fresh-non-card receipt filter, so a card-only "delivery"
+   * is never counted. This is the hot-path default: read-back is scoped to the
+   * RARE backstop delivery, so the reply-tool path issues ZERO probes (§1.3).
+   */
+  readBack?: (
+    chunkIndex: number,
+    messageIds: readonly number[],
+    text: string,
+  ) => Promise<ReadBackResult>
   /** Optional stderr sink for progress/resume logging. */
   stderr?: (s: string) => void
 }
@@ -204,6 +341,14 @@ export interface BackstopDeliveryResult {
  * so the caller can leave the delivery obligation OPEN for the liveness floor
  * to re-present — instead of the old silent `send_failed` drop.
  *
+ * #3278 — after each attempt's sends resolve, every `landed-unconfirmed` chunk
+ * is read-back-probed via `deps.readBack` (when provided): `exists` confirms it,
+ * `absent` demotes it to `unsent` so the NEXT attempt re-sends only that chunk,
+ * and `ambiguous` leaves it `landed-unconfirmed` — never re-sent (duplicate-risk
+ * beats missing-risk). `delivered` now requires every chunk `landed-confirmed`,
+ * so an API-ack'd-but-silently-dropped send (fresh id, absent on read-back) is
+ * reported `delivered:false` and the caller leaves the obligation OPEN.
+ *
  * `recordOutbound` (when provided) fires ONCE at the end with the full landed
  * set and a `texts` array ALIGNED to the actual sent ids (via `ledger.entries`).
  * The ledger is NOT cleared here — the caller clears it only after success or
@@ -223,37 +368,92 @@ export async function runBackstopDelivery(
 
   for (let attempt = 1; attempt <= Math.max(1, maxAttempts); attempt++) {
     attempts = attempt
+    // 1. SEND the `unsent` chunks (never-landed OR demoted by a prior absent
+    //    read-back), resuming in chunk-index order. Guard 6 keeps a chunk that
+    //    already landed from being re-sent.
     const resume = ledger.unsentIndices(turnId, chunkCount)
-    if (resume.length === 0) break // everything already landed
-    if (attempt > 1) {
-      stderr(
-        `telegram gateway: backstop delivery retry ${attempt}/${maxAttempts} — ` +
-        `resuming at unsent chunk(s) [${resume.join(', ')}] for turn ${turnId}\n`,
-      )
-    }
     let attemptThrew = false
-    try {
-      for (const i of resume) {
-        // Guard 6 — never re-send a chunk that already landed for this turn.
-        if (ledger.hasChunk(turnId, i)) continue
-        ledger.markPending(turnId, i)
-        const ids = await deps.sendChunk(i, chunks[i])
-        ledger.recordChunk(turnId, i, ids)
+    if (resume.length > 0) {
+      if (attempt > 1) {
+        stderr(
+          `telegram gateway: backstop delivery retry ${attempt}/${maxAttempts} — ` +
+          `resuming at unsent chunk(s) [${resume.join(', ')}] for turn ${turnId}\n`,
+        )
       }
-    } catch (err) {
-      attemptThrew = true
-      stderr(
-        `telegram gateway: backstop delivery attempt ${attempt}/${maxAttempts} failed: ` +
-        `${err instanceof Error ? err.message : String(err)}\n`,
-      )
+      try {
+        for (const i of resume) {
+          if (ledger.hasChunk(turnId, i)) continue
+          ledger.markPending(turnId, i)
+          const ids = await deps.sendChunk(i, chunks[i])
+          ledger.recordChunk(turnId, i, ids) // → landed-unconfirmed
+        }
+      } catch (err) {
+        attemptThrew = true
+        stderr(
+          `telegram gateway: backstop delivery attempt ${attempt}/${maxAttempts} failed: ` +
+          `${err instanceof Error ? err.message : String(err)}\n`,
+        )
+      }
     }
-    if (!attemptThrew && ledger.unsentIndices(turnId, chunkCount).length === 0) break
+
+    // 2. CONFIRM landed-unconfirmed chunks via read-back (#3278). Without a probe
+    //    wired, landing IS confirmation (pre-#3278) — the fresh-non-card receipt
+    //    filter below still rejects a card-only "delivery".
+    let demotedAny = false
+    for (const i of ledger.landedUnconfirmedIndices(turnId, chunkCount)) {
+      if (deps.readBack == null) {
+        ledger.confirmChunk(turnId, i)
+        continue
+      }
+      let verdict: ReadBackResult
+      try {
+        verdict = await deps.readBack(i, ledger.chunkIds(turnId, i), chunks[i])
+      } catch (err) {
+        // A probe adapter that itself throws must NEVER trigger a re-send.
+        verdict = 'ambiguous'
+        stderr(
+          `telegram gateway: backstop read-back probe threw for chunk ${i} ` +
+          `(turn ${turnId}) — treating as ambiguous: ` +
+          `${err instanceof Error ? err.message : String(err)}\n`,
+        )
+      }
+      if (verdict === 'exists') {
+        ledger.confirmChunk(turnId, i)
+      } else if (verdict === 'absent') {
+        // Positive absence — the send was silently dropped. Safe to re-send.
+        ledger.demoteChunk(turnId, i)
+        demotedAny = true
+        stderr(
+          `telegram gateway: backstop read-back — chunk ${i} not found in chat ` +
+          `(turn ${turnId}); demoting to unsent for re-send\n`,
+        )
+      } else {
+        // Ambiguous (429/5xx/network/gate-shed) — leave landed-unconfirmed and
+        // NEVER re-send it (would risk a duplicate).
+        stderr(
+          `telegram gateway: backstop read-back — chunk ${i} ambiguous ` +
+          `(turn ${turnId}); left landed-unconfirmed, not re-sending\n`,
+        )
+      }
+    }
+
+    // 3. Fully confirmed ⇒ done.
+    if (ledger.allConfirmed(turnId, chunkCount)) break
+    // 4. Another attempt ONLY re-sends chunks demoted to `unsent`. If nothing is
+    //    unsent, the remaining non-confirmed chunks are all `landed-unconfirmed`
+    //    (ambiguous) — re-sending them would duplicate, so stop here.
+    if (ledger.unsentIndices(turnId, chunkCount).length === 0) break
+    // 5. Guard against a spin: if this attempt neither sent, threw, nor demoted
+    //    anything, another identical attempt is pointless.
+    if (resume.length === 0 && !attemptThrew && !demotedAny) break
   }
 
   const sentIds = ledger.sentIds(turnId)
+  // #3278 — delivered IFF every chunk is `landed-confirmed` AND at least one
+  // confirmed id is a fresh non-card chat id (the receipt gate, guard 7).
   const delivered =
-    chunkCount > 0 && ledger.unsentIndices(turnId, chunkCount).length === 0 &&
-    backstopReceiptIds(sentIds, cardMessageId).length > 0
+    ledger.allConfirmed(turnId, chunkCount) &&
+    backstopReceiptIds(ledger.confirmedIds(turnId), cardMessageId).length > 0
   const exhausted = !delivered
 
   if (deps.recordOutbound && sentIds.length > 0) {
