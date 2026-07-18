@@ -162,6 +162,7 @@ import {
   type ArmedSecretCapture,
   type PendingMentalModelPropose,
 } from './callback-query-handlers.js'
+import { createCardToolHandlers } from './card-tool-handlers.js'
 import { createSweepableStore, createPlainStore } from './pending-state-stores.js'
 import {
   isPermissionRearmEnabled,
@@ -12805,7 +12806,7 @@ async function executeToolCall(tool: string, args: Record<string, unknown>): Pro
     case 'send_gif':
       return executeSendGif(args)
     case 'vault_request_save':
-      return executeVaultRequestSave(args)
+      return cardToolHandlers.executeVaultRequestSave(args)
     case 'vault_request_access':
       return executeVaultRequestAccess(args)
     case 'request_secret':
@@ -13766,97 +13767,10 @@ async function publishToTelegraph(
   return page.value.url
 }
 
-/**
- * `vault_request_save` tool — agent surfaces an approval card asking
- * the user to confirm saving a secret. The value is staged here and
- * written to vault only on user tap. See #969 P1a.
- */
-async function executeVaultRequestSave(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
-  const chat_id = String(args.chat_id ?? '')
-  if (!chat_id) throw new Error('vault_request_save: chat_id is required')
-  const key = args.key as string
-  if (!key || typeof key !== 'string') throw new Error('vault_request_save: key is required')
-  const value = args.value as string
-  if (typeof value !== 'string' || value.length === 0) {
-    throw new Error('vault_request_save: value is required and must be a non-empty string')
-  }
-  const why = typeof args.why === 'string' ? args.why : undefined
-  const kindRaw = typeof args.kind === 'string' ? args.kind : 'string'
-  if (kindRaw !== 'string' && kindRaw !== 'binary') {
-    throw new Error('vault_request_save: kind must be "string" or "binary"')
-  }
-  assertAllowedChat(chat_id)
-
-  // Validate slug shape — vault keys must match a tight charset so the
-  // host CLI hints render cleanly and reference resolution stays
-  // predictable. Includes `/` so the canonical namespaced shape
-  // (`fatsecret/client_id`, `mff/agent-private-key`, ...) is
-  // accepted — issue #1047. The broker itself has no key regex
-  // (just `z.string().min(1)` in protocol.ts); this gateway-side
-  // gate is a UX guard, not a security boundary.
-  if (!VAULT_KEY_REGEX.test(key)) {
-    throw new Error(`vault_request_save: key must match ${VAULT_KEY_REGEX_LABEL}`)
-  }
-
-  const agentSlug = process.env.SWITCHROOM_AGENT_NAME || 'agent'
-
-  // Stage the request server-side. The value never leaves gateway memory
-  // until the user approves.
-  const stageId = randomBytes(4).toString('hex')
-  const pending: PendingVaultRequestSave = {
-    agent: agentSlug,
-    chat_id,
-    key,
-    kind: kindRaw,
-    value,
-    why,
-    staged_at: Date.now(),
-  }
-  pendingVaultRequestSaves.set(stageId, pending)
-  pendingVaultRequestSaves.sweep(Date.now())
-
-  // Send the approval card. #1075: route through retryWithThreadFallback
-  // so a deleted topic still lands the card on the main chat instead of
-  // crashing the tool call.
-  const text = renderVaultRequestSaveCard(pending, agentSlug)
-  const threadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
-  // Remember the agent's working topic so the save-outcome inbound resumes in it.
-  if (threadId != null) pending.threadId = threadId
-  const sent = await retryWithThreadFallback<{ message_id: number }>(
-    robustApiCall,
-    (tid) =>
-      lockedBot.api.sendRichMessage(chat_id, richMessage(text), {
-        reply_markup: buildVaultRequestSaveKeyboard(stageId),
-        ...(tid != null && Number.isFinite(tid) ? { message_thread_id: tid } : {}),
-      }),
-    { threadId, chat_id, verb: 'vault_request_save.card' },
-  )
-  pending.card_message_id = sent.message_id
-  // Persist card METADATA (never the staged `value` — secrets hygiene) so a
-  // gateway restart doesn't strand the parked agent. A restored Save tap can't
-  // complete (value is gone) and degrades to a "value lost to restart" wake-up.
-  pendingCardStore.add({
-    family: 'vault_request_save',
-    stageId,
-    agent: pending.agent,
-    chatId: pending.chat_id,
-    ...(pending.card_message_id != null ? { cardMessageId: pending.card_message_id } : {}),
-    ...(pending.threadId != null ? { threadId: pending.threadId } : {}),
-    key: pending.key,
-    kind: pending.kind,
-    ...(pending.why != null ? { why: pending.why } : {}),
-    stagedAt: pending.staged_at,
-  })
-
-  return {
-    content: [
-      {
-        type: 'text',
-        text: `vault_request_save: card sent (stage_id=${stageId}, key=${key}). The user must tap a button before the secret is persisted; do not assume success until you see the user's next message confirming the outcome.`,
-      },
-    ],
-  }
-}
+// executeVaultRequestSave moved verbatim to card-tool-handlers.ts (#2996
+// P5-tail) — invoked as cardToolHandlers.executeVaultRequestSave(args) from the
+// tool dispatcher; its stores (pendingVaultRequestSaves, pendingCardStore) stay
+// here and are injected.
 
 // ─── #2045 request_secret — agent asks the operator to PROVIDE a secret ───
 //
@@ -21083,6 +20997,9 @@ function resolveAgentDirForName(agent: string): string | null {
 // import once construction is deferred). This module-scope `let` is assigned once
 // at boot, before the runner, so every call site (all post-boot) resolves.
 let callbackQueryHandlers!: ReturnType<typeof createCallbackQueryHandlers>
+// #2996 P5-tail: the agent-facing card-staging tool handlers (moved verbatim to
+// card-tool-handlers.ts). Assigned once in the isGatewayMain boot block.
+let cardToolHandlers!: ReturnType<typeof createCardToolHandlers>
 
 // /reauth was removed in v0.6.13 — the `/auth` dashboard's
 // `🔄 Reauth default` button fires the same flow (the `case 'reauth':`
@@ -25957,6 +25874,20 @@ async function initGatewayBot(): Promise<void> {
     // #2975 Stage 1 — loud-failure funnel for a rate-window retry that also
     // failed (cooldown + record + broadcast in one place).
     emitOperatorEvent: emitGatewayOperatorEvent,
+  })
+
+  // #2996 P5-tail — the agent-facing card-STAGING tool handlers (propose/stage
+  // half; the resolution half is callbackQueryHandlers above). Stores are the
+  // SAME shared singletons injected into the callback handlers (Amendment 1 —
+  // never re-`new`'d in the module).
+  cardToolHandlers = createCardToolHandlers({
+    lockedBot,
+    robustApiCall,
+    assertAllowedChat,
+    VAULT_KEY_REGEX,
+    VAULT_KEY_REGEX_LABEL,
+    pendingVaultRequestSaves,
+    pendingCardStore,
   })
 
   // Install the grammY registration surface (P0a) — once, before the runner.
