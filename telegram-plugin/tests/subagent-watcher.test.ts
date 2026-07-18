@@ -647,6 +647,36 @@ describe('startSubagentWatcher', () => {
       h.poll()
       // The draft is staged, not yet resolved — no cue yet.
       // The very next event is a reply tool with matching text → SUPPRESS.
+      // #3231: feed the PREFIXED prod wire shape (mcp__…__stream_reply), the
+      // form real jsonl actually carries. Before the isReplyTool fix a bare
+      // REPLY_TOOLS.has() missed this and the draft was WRONGLY surfaced.
+      appendFileSync(jsonlPath, buildJSONL({
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', name: 'mcp__switchroom-telegram__stream_reply', id: 'r1', input: { text: answer } }] },
+      }))
+      h.poll()
+      expect(narrativeCues.length).toBe(0)
+    })
+
+    it('narrative gate: a draft-then-reply sub_agent_text is SUPPRESSED with a BARE reply tool name too (#3231)', () => {
+      // Symmetric with the prefixed case above: bare 'stream_reply' can still
+      // arrive from non-MCP sources, so isReplyTool must match it as well.
+      const narrativeCues: string[] = []
+      const agentDir = join(tmpRoot, 'agent')
+      const subagentsDir = join(agentDir, '.claude', 'projects', 'p1', 'session-abc', 'subagents')
+      mkdirSync(subagentsDir, { recursive: true })
+      const jsonlPath = join(subagentsDir, 'agent-deadbeef.jsonl')
+      const h = startWatcherSync({
+        agentDir,
+        onProgress: ({ progressLine, latestSummary, skeleton }) => {
+          if (!skeleton && progressLine == null) narrativeCues.push(latestSummary)
+        },
+      })
+      writeFileSync(jsonlPath, buildJSONL(subAgentUserMsg('Find the repo path')))
+      h.poll()
+      const answer = 'The repo is at /home/user/code/switchroom.'
+      appendFileSync(jsonlPath, buildJSONL(subAgentAssistantText(answer)))
+      h.poll()
       appendFileSync(jsonlPath, buildJSONL({
         type: 'assistant',
         message: { content: [{ type: 'tool_use', name: 'stream_reply', id: 'r1', input: { text: answer } }] },
@@ -786,10 +816,11 @@ describe('startSubagentWatcher', () => {
       writeFileSync(jsonlPath, buildJSONL(subAgentUserMsg('Summarise the diff')))
       h.poll()
       const answer = 'The fix touches three files and adds a unit test for the double-Done case.'
-      // Final tool of the turn is stream_reply carrying the answer.
+      // Final tool of the turn is stream_reply carrying the answer. #3231: use
+      // the PREFIXED prod wire shape so lastReplyText capture (isReplyTool) fires.
       appendFileSync(jsonlPath, buildJSONL({
         type: 'assistant',
-        message: { content: [{ type: 'tool_use', name: 'stream_reply', id: 'r1', input: { text: answer } }] },
+        message: { content: [{ type: 'tool_use', name: 'mcp__switchroom-telegram__stream_reply', id: 'r1', input: { text: answer } }] },
       }))
       h.poll()
       // Trailing text block (separate message) that drafts the delivered answer.
@@ -819,9 +850,10 @@ describe('startSubagentWatcher', () => {
       writeFileSync(jsonlPath, buildJSONL(subAgentUserMsg('Summarise the diff')))
       h.poll()
       const answer = 'The fix touches three files and adds a unit test for the double-Done case.'
+      // #3231: prefixed prod wire shape.
       appendFileSync(jsonlPath, buildJSONL({
         type: 'assistant',
-        message: { content: [{ type: 'tool_use', name: 'stream_reply', id: 'r1', input: { text: answer } }] },
+        message: { content: [{ type: 'tool_use', name: 'mcp__switchroom-telegram__stream_reply', id: 'r1', input: { text: answer } }] },
       }))
       h.poll()
       appendFileSync(jsonlPath, buildJSONL(subAgentAssistantText('Done — cleaning up the worktree now.')))

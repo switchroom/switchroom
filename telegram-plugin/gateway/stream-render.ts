@@ -57,7 +57,7 @@ import { createAnswerStream } from '../answer-stream.js'
 import { LivenessTracker, isContextExhaustionText } from '../context-exhaustion.js'
 import { normalizeParagraphBreaks, normalizePunctuation, repairEscapedWhitespace, stripExcessBold } from '../format.js'
 import { hasOutboundDeliveredSince, recordOutbound } from '../history.js'
-import { REPLY_TOOLS } from '../narrative-dedup.js'
+import { isReplyTool } from '../narrative-dedup.js'
 import { NarrativeFlushController } from '../narrative-flush.js'
 import { recordTurnEnd, recordTurnStart } from '../registry/turns-schema.js'
 import { retryWithThreadFallback } from '../retry-api-call.js'
@@ -623,9 +623,10 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
         // text so flushPendingNarrativeAtTurnEnd compares a trailing
         // narrative block against the real answer surface, not
         // capturedText.join('') (which mis-suppresses when the model emits
-        // the same short string twice in a turn). REPLY_TOOLS ('reply',
+        // the same short string twice in a turn). Reply tools ('reply',
         // 'stream_reply') carry the answer in input.text; only those count.
-        if (REPLY_TOOLS.has(name) && typeof ev.input?.text === 'string') {
+        // Prefix-aware: prod jsonl carries the mcp__…__stream_reply form.
+        if (isReplyTool(name) && typeof ev.input?.text === 'string') {
           turn.lastReplyText = ev.input.text as string
         }
         if (turn.orphanedReplyTimeoutId != null) {

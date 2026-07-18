@@ -3,6 +3,7 @@ import {
   normalizeNarrative,
   prefixSimilarity,
   isDraftOfReply,
+  isReplyTool,
   DRAFT_SUPPRESS_THRESHOLD,
   REPLY_TOOLS,
 } from '../narrative-dedup.js'
@@ -16,6 +17,37 @@ describe('narrative-dedup', () => {
     expect(REPLY_TOOLS.has('reply')).toBe(true)
     expect(REPLY_TOOLS.has('stream_reply')).toBe(true)
     expect(REPLY_TOOLS.has('Bash')).toBe(false)
+  })
+
+  describe('isReplyTool (#3231 prefix-aware matching)', () => {
+    it('matches the PREFIXED prod wire shape (what real jsonl actually carries)', () => {
+      // The whole point of #3231: production jsonl carries mcp__…__telegram__<tool>,
+      // so a bare REPLY_TOOLS.has(name) was always false in prod → suppression inert.
+      expect(isReplyTool('mcp__switchroom-telegram__stream_reply')).toBe(true)
+      expect(isReplyTool('mcp__switchroom-telegram__reply')).toBe(true)
+    })
+
+    it('matches under ANY registration key (clerk-telegram, forks)', () => {
+      expect(isReplyTool('mcp__clerk-telegram__stream_reply')).toBe(true)
+      expect(isReplyTool('mcp__my-fork-telegram__reply')).toBe(true)
+    })
+
+    it('still matches BARE names (non-MCP sources)', () => {
+      expect(isReplyTool('reply')).toBe(true)
+      expect(isReplyTool('stream_reply')).toBe(true)
+    })
+
+    it('rejects non-reply tools, prefixed or bare', () => {
+      expect(isReplyTool('Bash')).toBe(false)
+      expect(isReplyTool('mcp__switchroom-telegram__react')).toBe(false)
+      expect(isReplyTool('mcp__switchroom-telegram__edit_message')).toBe(false)
+      expect(isReplyTool('mcp__hindsight__retain')).toBe(false)
+    })
+
+    it('is null/undefined safe', () => {
+      expect(isReplyTool(null)).toBe(false)
+      expect(isReplyTool(undefined)).toBe(false)
+    })
   })
 
   describe('normalizeNarrative', () => {

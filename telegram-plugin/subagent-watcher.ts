@@ -46,7 +46,7 @@ import { homedir } from 'os'
 import { projectSubagentLine, sanitizeCwdToProjectName, detectErrorInTranscriptLine } from './session-tail.js'
 import { sanitiseToolArg } from './fleet-state.js'
 import { clipNarrative, describeToolUse } from './tool-activity-summary.js'
-import { REPLY_TOOLS } from './narrative-dedup.js'
+import { isReplyTool } from './narrative-dedup.js'
 import { NarrativeFlushController, PENDING_NARRATIVE_FLUSH_MS } from './narrative-flush.js'
 import { truncate } from './card-format.js'
 import { bumpSubagentActivity, recordSubagentStall, recordSubagentResume, recordSubagentEnd, reapStuckRunningRows, countRunningBackgroundSubagents, recordNestedSubagentDispatch, recordSubagentModel } from './registry/subagents-schema.js'
@@ -1551,8 +1551,8 @@ export function readSubTail(
           const narrativeJustFired = resolvePendingSubNarrative(ev.toolName, ev.input)
           // NIT 3: capture a foreground sub-agent's actual reply text so the
           // turn_end path can suppress a trailing draft of it (see
-          // resolvePendingSubNarrative). Only REPLY_TOOLS carry the answer.
-          if (REPLY_TOOLS.has(ev.toolName) && typeof ev.input?.text === 'string') {
+          // resolvePendingSubNarrative). Only reply tools carry the answer.
+          if (isReplyTool(ev.toolName) && typeof ev.input?.text === 'string') {
             entry.lastReplyText = ev.input.text as string
           }
           entry.toolCount++
