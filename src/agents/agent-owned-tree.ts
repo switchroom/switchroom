@@ -83,6 +83,41 @@ export const SCOPED_RECURSIVE_SUBDIRS = [
 ] as const;
 
 /**
+ * Top-level agent-dir files a root reconcile writer can create/rewrite that
+ * MUST stay agent-readable (#3333 amendment A + finding 1). These are the
+ * critical members of the top-level SHALLOW sweep — the ones whose owner-only
+ * (0600) form would silently wedge the agent (#3168). `cron-session.sh` and
+ * `.resume-mode-migration-warned` are the leak-list entries the enumeration
+ * found outside the original static assert set; `CLAUDE.md` is included
+ * because it is root-rewritten in place. Not exhaustive of every top-level
+ * file (the sweep re-owns them all) — this is the ASSERT allowlist, the
+ * subset we fail loudly on.
+ */
+export const SCOPED_TOP_LEVEL_CRITICAL = [
+  "start.sh",
+  ".mcp.json",
+  "CLAUDE.md",
+  "cron-session.sh",
+  ".resume-mode-migration-warned",
+] as const;
+
+/**
+ * The STATIC scoped candidate set for the post-sweep readability assert
+ * (#3333 stage 3, amendment B). Derived from the SAME scope constants the
+ * sweep uses, so scope-of-sweep == scope-of-assert. The reconcile assert
+ * unions this with the dynamic per-run `changes` list — it NEVER replaces
+ * it (dropping `changes` would narrow coverage of touched-but-out-of-scope
+ * files). Missing paths are harmless: findAgentUnreadablePaths skips them.
+ */
+export function scopedAssertCandidates(agentDir: string): string[] {
+  return [
+    join(agentDir, ".claude", "settings.json"),
+    join(agentDir, ".claude-cron", ".mcp.json"),
+    ...SCOPED_TOP_LEVEL_CRITICAL.map((f) => join(agentDir, f)),
+  ];
+}
+
+/**
  * Env flag that switches the reconcile sweep from the full recursive chown
  * to the scoped sweep (#3333). Default OFF — the flag is injected by the
  * rollout ONLY into the canary restart spawn (stage 4, amendment C), never
