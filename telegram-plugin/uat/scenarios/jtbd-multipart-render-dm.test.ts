@@ -128,9 +128,17 @@ function kinds(msg: ObservedMessage): Set<string> {
           await sc.sendDM(PROMPT);
 
           // Chunk 1: the part carrying the HEAD marker.
+          //
+          // Budget: 240s, not 120s. When the model stages the long output
+          // via a file Write+Read (a 900+-line, ~90k-token turn), the
+          // inbound→chunks wall time runs ~3m49s (observed UAT v0.18.32 r2:
+          // test gave up at 120s / 08:42:13; the correctly-chunked reply
+          // actually landed 08:44:02 — a timing-budget oracle defect, not a
+          // delivery failure, since both ordered chunks delivered with zero
+          // 4xx). 240s clears that staging path with headroom (#3334 item a).
           const first = await sc.expectMessage(
             (m: ObservedMessage) => m.text.includes(HEAD) || m.text === "\x01",
-            { from: "bot", timeout: 120_000 },
+            { from: "bot", timeout: 240_000 },
           );
           // Chunk 2 (final): the part carrying the TAIL marker. This is a
           // DIFFERENT message than `first` — if the reply hadn't chunked,
@@ -140,7 +148,7 @@ function kinds(msg: ObservedMessage): Set<string> {
             (m: ObservedMessage) =>
               (m.text.includes(TAIL) || m.text === "\x01") &&
               m.messageId !== first.messageId,
-            { from: "bot", timeout: 120_000 },
+            { from: "bot", timeout: 240_000 },
           );
 
           // (4) Neither part is the unsupported-media sentinel.
@@ -187,7 +195,9 @@ function kinds(msg: ObservedMessage): Set<string> {
           await sc.tearDown();
         }
       },
-      180_000,
+      // Outer budget must exceed the two sequential 240s expectMessage
+      // windows (chunk 1, then chunk 2) plus spinUp settle + slack.
+      540_000,
     );
   },
 );
