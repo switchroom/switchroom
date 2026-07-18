@@ -581,8 +581,10 @@ describe("Hindsight port-collision regression", () => {
       backend: "hindsight",
       config: {},
     } as never);
-    expect(cfg.url).toBe(HINDSIGHT_DEFAULT_MCP_URL);
-    const urlPort = new URL(cfg.url as string).port;
+    // Default entry is the stdio shim — the backend URL rides its env.
+    const cfgUrl = cfg.env?.HINDSIGHT_MCP_URL;
+    expect(cfgUrl).toBe(HINDSIGHT_DEFAULT_MCP_URL);
+    const urlPort = new URL(cfgUrl as string).port;
     expect(Number(urlPort)).toBe(HINDSIGHT_DEFAULT_API_PORT);
   });
 

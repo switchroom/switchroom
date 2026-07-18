@@ -1,0 +1,741 @@
+/**
+ * `switchroom hindsight-mcp-shim` — lazy-connect stdio MCP proxy for the
+ * Hindsight memory backend.
+ *
+ * ## Why this exists (#hindsight-startup-resilience)
+ *
+ * Hindsight exposes MCP over Streamable HTTP only (127.0.0.1:18888/mcp/),
+ * and upstream explicitly leaves client resilience to clients. Claude Code
+ * retries a failed MCP handshake ~3x at session start and then marks the
+ * server FAILED for the entire session — a manual `/mcp` reconnect is the
+ * only recovery. So if the hindsight container is down (or still booting)
+ * at the moment an agent session starts, the agent loses its entire memory
+ * tool surface for the whole session, even after the backend comes back.
+ *
+ * This shim converts that hard startup dependency into a soft per-call one:
+ *
+ *   - It is spawned as a stdio MCP server (`command` entry in .mcp.json),
+ *     and it ALWAYS completes the stdio `initialize` handshake itself,
+ *     immediately, without touching the backend. Registration can never
+ *     fail at session start.
+ *   - `tools/list` tries a live fetch from the backend (short timeout);
+ *     on success the manifest is cached to disk, on failure the cached
+ *     manifest is served (or a static built-in fallback on first boot).
+ *   - `tools/call` lazily opens/reuses a Streamable HTTP session per call
+ *     with a bounded timeout + one retry; when the backend is down it
+ *     returns a proper `isError: true` tool result telling the agent that
+ *     memory is temporarily unavailable — never a shim crash, never a
+ *     session-wide failure. The next call after the backend recovers goes
+ *     straight through.
+ *   - Everything else (ping, prompts/*, resources/*, unknown methods) is
+ *     forwarded transparently when the backend is up, and answered with a
+ *     JSON-RPC error when it is down.
+ *
+ * Escape hatch: `memory.config.mcp_transport: "http"` in switchroom.yaml
+ * reverts the scaffolded entry to the old direct `type: "http"` form (see
+ * generateHindsightMcpConfig in src/memory/hindsight.ts).
+ *
+ * The shim is a hidden CLI verb, wired as the `hindsight` MCP `command`
+ * inside agent containers (spawned by Claude Code, sanitized env — all
+ * inputs are threaded via the entry's `env` block):
+ *
+ *   HINDSIGHT_MCP_URL         backend Streamable HTTP endpoint
+ *   HINDSIGHT_BANK_ID         X-Bank-Id header value (agent's collection)
+ *   HINDSIGHT_SHIM_CACHE_DIR  where the cached tools/list manifest lives
+ */
+
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createInterface } from "node:readline";
+
+import type { Command } from "commander";
+
+import { HINDSIGHT_DEFAULT_MCP_URL } from "../setup/hindsight.js";
+
+// ─── Protocol constants ───────────────────────────────────────────────────
+
+/**
+ * Protocol versions the shim itself understands, newest first. On
+ * `initialize` the shim echoes the client's requested version when it is
+ * one of these, else answers with the newest — the standard MCP
+ * version-negotiation rule. The backend's own negotiation happens
+ * independently on the lazy upstream session; the shim only ever forwards
+ * method payloads that are stable across these revisions (tools/list,
+ * tools/call, ping), so the two negotiations never need to agree.
+ */
+export const SHIM_SUPPORTED_PROTOCOL_VERSIONS = [
+  "2025-06-18",
+  "2025-03-26",
+  "2024-11-05",
+];
+
+/** Timeout for the live tools/list fetch before falling back to cache. */
+export const TOOLS_LIST_TIMEOUT_MS = 3_000;
+
+/**
+ * Per-attempt timeout for tools/call forwarding. Generous because reflect /
+ * consolidation-adjacent tools do real LLM work upstream; bounded so a
+ * wedged backend can never hang the agent's tool call forever.
+ */
+export const TOOLS_CALL_TIMEOUT_MS = 120_000;
+
+/** Timeout for the upstream initialize/initialized handshake. */
+export const UPSTREAM_CONNECT_TIMEOUT_MS = 3_000;
+
+/** Cached-manifest filename inside the cache dir. */
+export const TOOLS_CACHE_FILENAME = "hindsight-tools-list.json";
+
+// ─── Static fallback manifest ─────────────────────────────────────────────
+
+/**
+ * First-boot fallback tool manifest: tool name -> [required, allProps].
+ * Derived from tests/fixtures/hindsight-tools-list.snapshot.json (captured
+ * live from hindsight on 2026-06-07; upstream's tool surface is stable).
+ * Schemas are deliberately permissive ({} per property) — the point is
+ * that the tools EXIST at session start; the first successful live
+ * tools/list replaces this with the backend's real schemas via the disk
+ * cache. The "static fallback manifest" describe block in
+ * tests/hindsight-mcp-shim.test.ts pins this table against the snapshot
+ * fixture so the two can never drift silently.
+ */
+export const FALLBACK_TOOL_TABLE: Record<string, [string[], string[]]> = {
+  cancel_operation: [["operation_id"], ["bank_id", "operation_id"]],
+  clear_memories: [[], ["bank_id", "type"]],
+  create_bank: [["bank_id"], ["bank_id", "mission", "name"]],
+  create_directive: [["content", "name"], ["bank_id", "content", "is_active", "name", "priority", "tags"]],
+  create_mental_model: [["name", "source_query"], ["bank_id", "max_tokens", "mental_model_id", "name", "source_query", "tags", "trigger_refresh_after_consolidation"]],
+  delete_bank: [[], ["bank_id"]],
+  delete_directive: [["directive_id"], ["bank_id", "directive_id"]],
+  delete_document: [["document_id"], ["bank_id", "document_id"]],
+  delete_mental_model: [["mental_model_id"], ["bank_id", "mental_model_id"]],
+  get_bank: [[], ["bank_id"]],
+  get_bank_stats: [[], ["bank_id"]],
+  get_document: [["document_id"], ["bank_id", "document_id"]],
+  get_memory: [["memory_id"], ["bank_id", "memory_id"]],
+  get_mental_model: [["mental_model_id"], ["bank_id", "detail", "mental_model_id"]],
+  get_operation: [["operation_id"], ["bank_id", "operation_id"]],
+  list_banks: [[], []],
+  list_directives: [[], ["active_only", "bank_id", "tags"]],
+  list_documents: [[], ["bank_id", "limit", "q"]],
+  list_memories: [[], ["bank_id", "limit", "offset", "q", "type"]],
+  list_mental_models: [[], ["bank_id", "detail", "tags"]],
+  list_operations: [[], ["bank_id", "limit", "status"]],
+  list_tags: [[], ["bank_id", "limit", "q"]],
+  recall: [["query"], ["bank_id", "budget", "max_tokens", "query", "query_timestamp", "tag_groups", "tags", "tags_match", "types"]],
+  reflect: [["query"], ["bank_id", "budget", "context", "max_tokens", "query", "response_schema", "tags", "tags_match"]],
+  refresh_mental_model: [["mental_model_id"], ["bank_id", "mental_model_id"]],
+  retain: [["content"], ["bank_id", "content", "context", "document_id", "metadata", "strategy", "tags", "timestamp", "update_mode"]],
+  sync_retain: [["content"], ["bank_id", "content", "context", "document_id", "metadata", "strategy", "tags", "timestamp"]],
+  update_bank: [[], ["bank_id", "config_updates", "mission", "name"]],
+  update_mental_model: [["mental_model_id"], ["bank_id", "max_tokens", "mental_model_id", "name", "source_query", "tags", "trigger_refresh_after_consolidation"]],
+};
+
+/** Materialize the static fallback manifest in MCP tools/list shape. */
+export function buildFallbackToolsList(): { tools: ToolDef[] } {
+  const tools = Object.entries(FALLBACK_TOOL_TABLE).map(
+    ([name, [required, props]]) => ({
+      name,
+      description:
+        "Hindsight memory tool (served from the shim's static fallback " +
+        "manifest because the backend has not been reachable yet; the " +
+        "schema is permissive and will be replaced by the live one).",
+      inputSchema: {
+        type: "object" as const,
+        properties: Object.fromEntries(props.map((p) => [p, {}])),
+        required,
+      },
+    }),
+  );
+  return { tools };
+}
+
+// ─── Types ────────────────────────────────────────────────────────────────
+
+export interface ToolDef {
+  name: string;
+  description?: string;
+  inputSchema: unknown;
+  [k: string]: unknown;
+}
+
+interface JsonRpcMessage {
+  jsonrpc: "2.0";
+  id?: number | string | null;
+  method?: string;
+  params?: unknown;
+  result?: unknown;
+  error?: { code: number; message: string; data?: unknown };
+}
+
+export interface ShimOptions {
+  /** Backend Streamable HTTP endpoint (e.g. http://127.0.0.1:18888/mcp/). */
+  url: string;
+  /** X-Bank-Id header threaded onto every backend request (may be ""). */
+  bankId: string;
+  /** Directory for the persisted tools/list cache. Created on demand. */
+  cacheDir: string;
+  /** Test seams — timeouts in ms. */
+  toolsListTimeoutMs?: number;
+  toolsCallTimeoutMs?: number;
+  connectTimeoutMs?: number;
+  /** Injectable fetch (tests). Defaults to global fetch. */
+  fetchImpl?: typeof fetch;
+  /** Where diagnostics go. Defaults to process.stderr. */
+  logger?: (line: string) => void;
+}
+
+// ─── Upstream Streamable HTTP client ──────────────────────────────────────
+
+/**
+ * Minimal Streamable HTTP MCP client for the hindsight backend.
+ *
+ * Lazy: nothing is sent until the first request needs a session. On any
+ * transport failure the session is dropped so the next call re-handshakes
+ * — that's the whole recovery model (per-call reconnect).
+ */
+export class UpstreamClient {
+  private sessionId: string | null = null;
+  private protocolVersion: string | null = null;
+  private nextId = 1;
+
+  constructor(private readonly opts: ShimOptions) {}
+
+  private get fetchImpl(): typeof fetch {
+    return this.opts.fetchImpl ?? fetch;
+  }
+
+  /** Drop the session so the next request re-initializes. */
+  reset(): void {
+    this.sessionId = null;
+    this.protocolVersion = null;
+  }
+
+  get connected(): boolean {
+    return this.sessionId !== null || this.protocolVersion !== null;
+  }
+
+  private headers(): Record<string, string> {
+    const h: Record<string, string> = {
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+    };
+    if (this.opts.bankId) h["X-Bank-Id"] = this.opts.bankId;
+    if (this.sessionId) h["mcp-session-id"] = this.sessionId;
+    if (this.protocolVersion) h["mcp-protocol-version"] = this.protocolVersion;
+    return h;
+  }
+
+  private async post(
+    body: JsonRpcMessage,
+    timeoutMs: number,
+  ): Promise<Response> {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), timeoutMs);
+    try {
+      return await this.fetchImpl(this.opts.url, {
+        method: "POST",
+        headers: this.headers(),
+        body: JSON.stringify(body),
+        signal: ctl.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Parse a Streamable HTTP response body into the JSON-RPC response for
+   * `id`. Handles both `application/json` and `text/event-stream` bodies
+   * (hindsight answers POSTs with SSE-framed single responses).
+   */
+  private async parseResponse(
+    res: Response,
+    id: number,
+  ): Promise<JsonRpcMessage> {
+    const ctype = res.headers.get("content-type") ?? "";
+    const text = await res.text();
+    if (ctype.includes("text/event-stream")) {
+      // SSE frames: take each `data:` payload, find the response with our id.
+      for (const chunk of text.split(/\n\n/)) {
+        const data = chunk
+          .split(/\n/)
+          .filter((l) => l.startsWith("data:"))
+          .map((l) => l.slice(5).trim())
+          .join("\n");
+        if (!data) continue;
+        try {
+          const msg = JSON.parse(data) as JsonRpcMessage;
+          if (msg.id === id) return msg;
+        } catch {
+          // non-JSON keepalive frame — skip
+        }
+      }
+      throw new Error("no matching JSON-RPC response in SSE stream");
+    }
+    return JSON.parse(text) as JsonRpcMessage;
+  }
+
+  /** Ensure an initialized upstream session exists. Throws on failure. */
+  private async ensureSession(): Promise<void> {
+    if (this.protocolVersion) return;
+    const timeoutMs = this.opts.connectTimeoutMs ?? UPSTREAM_CONNECT_TIMEOUT_MS;
+    const id = this.nextId++;
+    const res = await this.post(
+      {
+        jsonrpc: "2.0",
+        id,
+        method: "initialize",
+        params: {
+          protocolVersion: SHIM_SUPPORTED_PROTOCOL_VERSIONS[0],
+          capabilities: {},
+          clientInfo: { name: "switchroom-hindsight-shim", version: "1.0.0" },
+        },
+      },
+      timeoutMs,
+    );
+    if (!res.ok) {
+      throw new Error(`upstream initialize failed: HTTP ${res.status}`);
+    }
+    this.sessionId = res.headers.get("mcp-session-id");
+    const msg = await this.parseResponse(res, id);
+    if (msg.error) {
+      throw new Error(`upstream initialize error: ${msg.error.message}`);
+    }
+    const negotiated = (msg.result as { protocolVersion?: string } | undefined)
+      ?.protocolVersion;
+    this.protocolVersion = negotiated ?? SHIM_SUPPORTED_PROTOCOL_VERSIONS[0];
+    // notifications/initialized completes the upstream handshake. 202 (or
+    // any 2xx) expected; failure here is fatal for the session attempt.
+    const notifRes = await this.post(
+      { jsonrpc: "2.0", method: "notifications/initialized" },
+      timeoutMs,
+    );
+    if (!notifRes.ok && notifRes.status !== 405) {
+      throw new Error(`upstream initialized notification failed: HTTP ${notifRes.status}`);
+    }
+    // Drain body so undici can reuse the socket.
+    await notifRes.text().catch(() => undefined);
+  }
+
+  /**
+   * Forward one request to the backend. Lazy-connects, and on PRE-DELIVERY
+   * failure resets the session and (when `retry`) re-attempts exactly once
+   * — covering both cold backends that just came up and expired upstream
+   * sessions (hindsight answers those with 404, i.e. it refused the request
+   * without executing it).
+   *
+   * DOUBLE-EXECUTION GUARD (#3313 review must-fix 1): the retry is scoped
+   * to failures where the request provably never reached the backend —
+   * `ensureSession()` failures, connect-level errors (refused/DNS), and a
+   * 404 session rejection. Once the POST has been delivered (the fetch
+   * resolved, or it failed with a timeout/abort/mid-response error that
+   * cannot be distinguished from "backend is still executing"), the shim
+   * NEVER re-sends: a slow-but-alive backend processing a non-idempotent
+   * call (retain, create_directive, ...) must not receive it twice. The
+   * legacy direct-HTTP entry never auto-retried; neither do we
+   * post-delivery.
+   */
+  async request(
+    method: string,
+    params: unknown,
+    timeoutMs: number,
+    retry = true,
+  ): Promise<JsonRpcMessage> {
+    // Phase 1 — session handshake. Nothing about THIS request has been
+    // sent yet, so any failure here is safely retryable.
+    try {
+      await this.ensureSession();
+    } catch (err) {
+      this.reset();
+      if (retry) return this.request(method, params, timeoutMs, false);
+      throw err;
+    }
+    const id = this.nextId++;
+    // Phase 2 — the POST itself. Only connect-level failures (the request
+    // never left) are retryable; an abort/timeout may have been delivered.
+    let res: Response;
+    try {
+      res = await this.post({ jsonrpc: "2.0", id, method, params }, timeoutMs);
+    } catch (err) {
+      this.reset();
+      if (retry && isPreDeliveryError(err)) {
+        return this.request(method, params, timeoutMs, false);
+      }
+      throw err;
+    }
+    if (res.status === 404) {
+      // Session expired upstream: the server REJECTED the request without
+      // executing it — safe to retry on a fresh session.
+      this.reset();
+      await res.text().catch(() => undefined);
+      if (retry) return this.request(method, params, timeoutMs, false);
+      throw new Error("upstream session expired (404)");
+    }
+    // Phase 3 — delivered. Failures from here on are never retried.
+    try {
+      if (!res.ok) throw new Error(`upstream HTTP ${res.status}`);
+      return await this.parseResponse(res, id);
+    } catch (err) {
+      this.reset();
+      throw err;
+    }
+  }
+}
+
+/**
+ * True when a fetch rejection proves the request was never accepted by the
+ * backend (connection refused / DNS failure / connect-phase timeout). An
+ * AbortError (our own bounded timeout) or a reset/parse failure mid-response
+ * is NOT pre-delivery — the backend may be executing the call — so those are
+ * deliberately absent. Walks the `cause` chain because undici wraps network
+ * errors in TypeError("fetch failed").
+ */
+export function isPreDeliveryError(err: unknown): boolean {
+  const PRE_DELIVERY_CODES = new Set([
+    "ECONNREFUSED",
+    "ENOTFOUND",
+    "EAI_AGAIN",
+    "UND_ERR_CONNECT_TIMEOUT",
+  ]);
+  let cur: unknown = err;
+  for (let depth = 0; cur && depth < 5; depth++) {
+    const code = (cur as { code?: unknown }).code;
+    if (typeof code === "string" && PRE_DELIVERY_CODES.has(code)) return true;
+    // AggregateError (e.g. Happy Eyeballs dual-stack connect): pre-delivery
+    // iff every underlying error is.
+    const errors = (cur as { errors?: unknown[] }).errors;
+    if (Array.isArray(errors) && errors.length > 0) {
+      return errors.every((e) => isPreDeliveryError(e));
+    }
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+// ─── The shim server ──────────────────────────────────────────────────────
+
+export class HindsightShim {
+  readonly upstream: UpstreamClient;
+  private readonly log: (line: string) => void;
+
+  constructor(private readonly opts: ShimOptions) {
+    this.upstream = new UpstreamClient(opts);
+    this.log = opts.logger ?? ((l) => process.stderr.write(l + "\n"));
+  }
+
+  private get cachePath(): string {
+    return join(this.opts.cacheDir, TOOLS_CACHE_FILENAME);
+  }
+
+  /** Persist a successful tools/list result (atomic tmp+rename). */
+  private writeCache(result: unknown): void {
+    try {
+      mkdirSync(this.opts.cacheDir, { recursive: true });
+      const tmp = join(
+        this.opts.cacheDir,
+        `.${TOOLS_CACHE_FILENAME}.${process.pid}.tmp`,
+      );
+      writeFileSync(tmp, JSON.stringify(result, null, 2) + "\n");
+      renameSync(tmp, this.cachePath);
+    } catch (err) {
+      this.log(`[hindsight-shim] cache write failed: ${String(err)}`);
+    }
+  }
+
+  private readCache(): { tools: ToolDef[] } | null {
+    try {
+      const parsed = JSON.parse(readFileSync(this.cachePath, "utf-8")) as {
+        tools?: ToolDef[];
+      };
+      if (Array.isArray(parsed.tools)) return parsed as { tools: ToolDef[] };
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Handle one client JSON-RPC message; returns the response to write, or
+   * null for notifications (which never get responses).
+   */
+  async handle(msg: JsonRpcMessage): Promise<JsonRpcMessage | null> {
+    const { id, method } = msg;
+    if (method === undefined) return null; // response from client — ignore
+
+    // Notifications: initialized is consumed; others are forwarded
+    // best-effort only when a session already exists (a notification must
+    // never trigger a connect attempt, and failures are swallowed).
+    if (id === undefined || id === null) {
+      if (method !== "notifications/initialized" && this.upstream.connected) {
+        this.upstream
+          .request(method, msg.params, this.opts.connectTimeoutMs ?? UPSTREAM_CONNECT_TIMEOUT_MS, false)
+          .catch(() => undefined);
+      }
+      return null;
+    }
+
+    switch (method) {
+      case "initialize":
+        return { jsonrpc: "2.0", id, result: this.initializeResult(msg.params) };
+      case "tools/list":
+        return { jsonrpc: "2.0", id, result: await this.toolsList(msg.params) };
+      case "tools/call":
+        return { jsonrpc: "2.0", id, result: await this.toolsCall(msg.params) };
+      case "ping":
+        return { jsonrpc: "2.0", id, result: {} };
+      default:
+        return this.forward(msg);
+    }
+  }
+
+  /**
+   * Answer `initialize` locally — NEVER touches the backend, so the stdio
+   * handshake always succeeds regardless of backend state.
+   *
+   * Capabilities are deliberately **tools-only** even though the live
+   * backend also advertises prompts/resources (review #3313 finding 5):
+   * switchroom's hindsight integration consumes only the tool surface
+   * (`mcp__hindsight__*`), and advertising prompts/resources here would
+   * promise a surface the shim cannot guarantee offline (there is no
+   * cached/fallback manifest for them — an early prompts/list against a
+   * down backend would just error). `forward()` still proxies those
+   * methods transparently if a client sends them anyway. `listChanged` is
+   * honest: see notifyIfRecovered().
+   */
+  private initializeResult(params: unknown): unknown {
+    const requested = (params as { protocolVersion?: string } | undefined)
+      ?.protocolVersion;
+    const version =
+      requested && SHIM_SUPPORTED_PROTOCOL_VERSIONS.includes(requested)
+        ? requested
+        : SHIM_SUPPORTED_PROTOCOL_VERSIONS[0];
+    return {
+      protocolVersion: version,
+      capabilities: { tools: { listChanged: true } },
+      serverInfo: { name: "switchroom-hindsight-shim", version: "1.0.0" },
+    };
+  }
+
+  /**
+   * True after we served a cached/fallback manifest — i.e. the client's
+   * view of the tool schemas may be stale relative to the live backend.
+   * Cleared (with a `notifications/tools/list_changed` emission) once the
+   * backend is reachable again, honoring the advertised `listChanged`.
+   */
+  private staleManifestServed = false;
+
+  /**
+   * Sink for server-initiated notifications, wired to stdout by run().
+   * No-op default so direct handle() callers (tests) work without wiring.
+   */
+  notificationSink: (msg: JsonRpcMessage) => void = () => undefined;
+
+  /**
+   * Review #3313 finding 3: `listChanged: true` must be honest. When a
+   * stale (cached/fallback) manifest has been served and a later upstream
+   * request succeeds — proof the backend is reachable again — emit
+   * `notifications/tools/list_changed` so the client re-lists and picks up
+   * the live schemas. (The shim has no listen stream to RELAY backend-side
+   * change notifications; this recovery emission is the one change event
+   * it can genuinely detect.)
+   */
+  private notifyIfRecovered(): void {
+    if (!this.staleManifestServed) return;
+    this.staleManifestServed = false;
+    this.notificationSink({
+      jsonrpc: "2.0",
+      method: "notifications/tools/list_changed",
+    });
+  }
+
+  /** tools/list: live fetch -> refresh cache; else cache; else fallback. */
+  private async toolsList(params: unknown): Promise<unknown> {
+    try {
+      const res = await this.upstream.request(
+        "tools/list",
+        params ?? {},
+        this.opts.toolsListTimeoutMs ?? TOOLS_LIST_TIMEOUT_MS,
+      );
+      if (res.error) throw new Error(res.error.message);
+      const result = res.result as { tools?: ToolDef[] };
+      if (Array.isArray(result?.tools)) {
+        this.writeCache(result);
+        // The client is receiving the LIVE manifest right now — its view
+        // is fresh, no recovery notification needed.
+        this.staleManifestServed = false;
+        return result;
+      }
+      throw new Error("upstream tools/list returned no tools array");
+    } catch (err) {
+      this.log(
+        `[hindsight-shim] live tools/list failed (${String(err)}); serving ` +
+          "cached/fallback manifest",
+      );
+      this.staleManifestServed = true;
+      return this.readCache() ?? buildFallbackToolsList();
+    }
+  }
+
+  /** tools/call: lazy connect + bounded timeout + one retry; isError on down. */
+  private async toolsCall(params: unknown): Promise<unknown> {
+    try {
+      const res = await this.upstream.request(
+        "tools/call",
+        params,
+        this.opts.toolsCallTimeoutMs ?? TOOLS_CALL_TIMEOUT_MS,
+      );
+      // Any answer at all proves the backend is reachable again.
+      this.notifyIfRecovered();
+      if (res.error) {
+        // Upstream answered with a protocol-level error while up (e.g.
+        // unknown tool). Surface it as a tool error result rather than
+        // crashing the shim or hiding the message.
+        return {
+          content: [
+            { type: "text", text: `Hindsight returned an error: ${res.error.message}` },
+          ],
+          isError: true,
+        };
+      }
+      return res.result;
+    } catch (err) {
+      const name =
+        (params as { name?: string } | undefined)?.name ?? "unknown";
+      this.log(
+        `[hindsight-shim] tools/call ${name} failed after retry: ${String(err)}`,
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "Hindsight memory is temporarily unavailable (backend at " +
+              `${this.opts.url} is not reachable: ${String(err)}). ` +
+              "This is transient - the shim reconnects automatically, so " +
+              "simply retry this tool call shortly. Do not treat memory " +
+              "as permanently lost.",
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+
+  /** Transparent forwarding for every other request method. */
+  private async forward(msg: JsonRpcMessage): Promise<JsonRpcMessage> {
+    try {
+      const res = await this.upstream.request(
+        msg.method as string,
+        msg.params,
+        this.opts.toolsListTimeoutMs ?? TOOLS_LIST_TIMEOUT_MS,
+      );
+      return { jsonrpc: "2.0", id: msg.id, result: res.result, ...(res.error ? { error: res.error } : {}) };
+    } catch (err) {
+      return {
+        jsonrpc: "2.0",
+        id: msg.id,
+        error: {
+          code: -32001,
+          message: `hindsight backend unavailable: ${String(err)}`,
+        },
+      };
+    }
+  }
+
+  /**
+   * Wire the shim to stdio: newline-delimited JSON-RPC.
+   *
+   * Messages are handled **concurrently** (review #3313 must-fix 2): with
+   * serialized handling, one tools/call against a hung-but-listening
+   * backend would head-of-line-block ping / tools/list / parallel tool
+   * calls for up to the full call timeout — the very "whole memory server
+   * unresponsive" failure mode this shim exists to prevent — and a
+   * notifications/cancelled would queue behind the call it cancels. Only
+   * the stdout WRITES need serializing, which each handler gets for free:
+   * every response is emitted as exactly one synchronous `output.write()`
+   * of a complete line, and Node stream writes never interleave within a
+   * single chunk.
+   *
+   * Resolves after the input stream ends AND every in-flight handler has
+   * flushed its response — callers must not exit before then (caught live:
+   * exiting on raw stdin "end" raced the async tools/list handler and
+   * dropped its response).
+   */
+  async run(
+    input: NodeJS.ReadableStream,
+    output: NodeJS.WritableStream,
+  ): Promise<void> {
+    // Server-initiated notifications share the same atomic-line discipline.
+    this.notificationSink = (msg) => output.write(JSON.stringify(msg) + "\n");
+    const rl = createInterface({ input, crlfDelay: Infinity });
+    const inflight = new Set<Promise<void>>();
+    rl.on("line", (line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return;
+      let msg: JsonRpcMessage;
+      try {
+        msg = JSON.parse(trimmed) as JsonRpcMessage;
+      } catch {
+        this.log(`[hindsight-shim] dropping non-JSON stdin line`);
+        return;
+      }
+      const task = (async () => {
+        try {
+          const res = await this.handle(msg);
+          if (res) output.write(JSON.stringify(res) + "\n");
+        } catch (err) {
+          // Absolute last-resort guard: the shim must never crash.
+          this.log(`[hindsight-shim] handler threw: ${String(err)}`);
+          if (msg.id !== undefined && msg.id !== null) {
+            output.write(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: msg.id,
+                error: { code: -32603, message: `shim internal error: ${String(err)}` },
+              }) + "\n",
+            );
+          }
+        }
+      })();
+      inflight.add(task);
+      void task.finally(() => inflight.delete(task));
+    });
+    await new Promise<void>((resolve) => rl.on("close", resolve));
+    // Drain: new tasks can no longer arrive (input closed); settle all.
+    while (inflight.size > 0) {
+      await Promise.allSettled([...inflight]);
+    }
+  }
+}
+
+// ─── CLI wiring ───────────────────────────────────────────────────────────
+
+/** Resolve shim options from the sanitized MCP-spawn env. */
+export function resolveShimOptionsFromEnv(
+  env: NodeJS.ProcessEnv,
+): ShimOptions {
+  const home = env.HOME && env.HOME !== "/" ? env.HOME : tmpdir();
+  return {
+    url: env.HINDSIGHT_MCP_URL || HINDSIGHT_DEFAULT_MCP_URL,
+    bankId: env.HINDSIGHT_BANK_ID || "",
+    cacheDir:
+      env.HINDSIGHT_SHIM_CACHE_DIR || join(home, ".hindsight-shim"),
+  };
+}
+
+export function registerHindsightMcpShimCommand(program: Command): void {
+  program
+    .command("hindsight-mcp-shim", { hidden: true })
+    .description(
+      "Internal: lazy-connect stdio MCP proxy for the Hindsight memory " +
+        "backend. Spawned as the `hindsight` MCP command inside agents.",
+    )
+    .action(async () => {
+      const shim = new HindsightShim(resolveShimOptionsFromEnv(process.env));
+      // Resolves when Claude Code closes stdin (session teardown) and all
+      // in-flight responses have been written.
+      await shim.run(process.stdin, process.stdout);
+      process.exit(0);
+    });
+}

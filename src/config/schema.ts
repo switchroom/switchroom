@@ -3525,6 +3525,18 @@ export const MemoryBackendConfigSchema = z.object({
         .url("Hindsight URL must be a valid URL (no shell-special characters)")
         .optional()
         .describe("Hindsight MCP endpoint URL (e.g., http://localhost:18888/mcp/). Defaults to http://localhost:8888/mcp/."),
+      mcp_transport: z
+        .enum(["shim", "http"])
+        .optional()
+        .describe(
+          "How agents reach Hindsight's MCP surface. Default (unset or " +
+          "'shim'): the lazy-connect stdio proxy `switchroom " +
+          "hindsight-mcp-shim`, which always registers at session start " +
+          "even when the hindsight container is down and reconnects " +
+          "per-call. 'http' is the escape hatch that restores the legacy " +
+          "direct Streamable-HTTP entry (session-fatal if the backend is " +
+          "down when the agent session boots).",
+        ),
     })
     .optional(),
 });

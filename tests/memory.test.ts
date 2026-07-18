@@ -4,7 +4,13 @@ import {
   generateDockerComposeSnippet,
   getCollectionForAgent,
   isStrictIsolation,
+  HINDSIGHT_SHIM_CLI_PATH,
+  HINDSIGHT_SHIM_AGENT_HOME,
 } from "../src/memory/hindsight.js";
+import {
+  DOCKER_SWITCHROOM_CLI_PATH,
+  DOCKER_AGENT_HOME,
+} from "../src/agents/scaffold.js";
 import { reflectAcrossAgents } from "../src/memory/search.js";
 import {
   getHindsightMcpUrl,
@@ -39,22 +45,50 @@ function makeSwitchroomConfig(
 }
 
 describe("generateHindsightMcpConfig", () => {
-  it("generates HTTP URL config for Hindsight MCP endpoint", () => {
+  it("defaults to the lazy-connect stdio shim entry (startup-resilient)", () => {
     const memConfig = makeMemoryConfig();
     const result = generateHindsightMcpConfig("my-collection", memConfig);
 
+    expect(result.type).toBe("stdio");
+    expect(result.command).toBe(HINDSIGHT_SHIM_CLI_PATH);
+    expect(result.args).toEqual(["hindsight-mcp-shim"]);
+    // Sanitized MCP-spawn env: every shim input threaded explicitly.
+    expect(result.env).toEqual({
+      HINDSIGHT_MCP_URL: "http://127.0.0.1:18888/mcp/",
+      HINDSIGHT_BANK_ID: "my-collection",
+      HINDSIGHT_SHIM_CACHE_DIR: "/state/agent/home/.hindsight-shim",
+      HOME: "/state/agent/home",
+    });
+    expect(result.url).toBeUndefined();
+  });
+
+  it("threads memory.config.url override into the shim env", () => {
+    const memConfig = makeMemoryConfig({
+      config: { provider: "ollama", docker_service: false, url: "http://localhost:19000/mcp/" },
+    });
+    const result = generateHindsightMcpConfig("local-col", memConfig);
+
+    expect(result.env?.HINDSIGHT_MCP_URL).toBe("http://localhost:19000/mcp/");
+  });
+
+  it("mcp_transport: 'http' escape hatch restores the direct HTTP entry", () => {
+    const memConfig = makeMemoryConfig({
+      config: { provider: "ollama", docker_service: true, mcp_transport: "http" },
+    });
+    const result = generateHindsightMcpConfig("my-collection", memConfig);
+
+    expect(result.type).toBe("http");
     expect(result.url).toBe("http://127.0.0.1:18888/mcp/");
+    expect(result.headers).toEqual({ "X-Bank-Id": "my-collection" });
     expect(result.command).toBeUndefined();
     expect(result.args).toBeUndefined();
   });
 
-  it("generates HTTP URL config regardless of docker_service setting", () => {
-    const memConfig = makeMemoryConfig({
-      config: { provider: "ollama", docker_service: false },
-    });
-    const result = generateHindsightMcpConfig("local-col", memConfig);
-
-    expect(result.url).toBe("http://127.0.0.1:18888/mcp/");
+  it("shim CLI path / HOME stay in lockstep with the scaffold docker constants", () => {
+    // HINDSIGHT_SHIM_CLI_PATH is a deliberate local copy (import cycle) —
+    // this pin is the drift guard the comment in hindsight.ts promises.
+    expect(HINDSIGHT_SHIM_CLI_PATH).toBe(DOCKER_SWITCHROOM_CLI_PATH);
+    expect(HINDSIGHT_SHIM_AGENT_HOME).toBe(DOCKER_AGENT_HOME);
   });
 });
 

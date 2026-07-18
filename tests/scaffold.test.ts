@@ -1364,8 +1364,11 @@ describe("scaffoldAgent", () => {
 
     expect(settings.mcpServers).toBeDefined();
     expect(settings.mcpServers.hindsight).toBeDefined();
-    expect(settings.mcpServers.hindsight.url).toBe("http://127.0.0.1:18888/mcp/");
-    expect(settings.mcpServers.hindsight.type).toBe("http");
+    // Default transport is the lazy-connect stdio shim (startup-resilient).
+    expect(settings.mcpServers.hindsight.type).toBe("stdio");
+    expect(settings.mcpServers.hindsight.args).toEqual(["hindsight-mcp-shim"]);
+    expect(settings.mcpServers.hindsight.env.HINDSIGHT_MCP_URL).toBe("http://127.0.0.1:18888/mcp/");
+    expect(settings.mcpServers.hindsight.env.HINDSIGHT_BANK_ID).toBe("memory-agent");
   });
 
   it("respects memory.config.url override for Hindsight MCP", () => {
@@ -1397,7 +1400,7 @@ describe("scaffoldAgent", () => {
       readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
     );
 
-    expect(settings.mcpServers.hindsight.url).toBe("http://localhost:18888/mcp/");
+    expect(settings.mcpServers.hindsight.env.HINDSIGHT_MCP_URL).toBe("http://localhost:18888/mcp/");
   });
 
   it("seeds profile workspace/ files into agent's workspace/ directory", () => {
@@ -2152,7 +2155,7 @@ describe("reconcileAgent", () => {
     expect(result.changes).toContain(settingsPath);
     const after = JSON.parse(readFileSync(settingsPath, "utf-8"));
     expect(after.mcpServers.hindsight).toBeDefined();
-    expect(after.mcpServers.hindsight.url).toBe("http://localhost:18888/mcp/");
+    expect(after.mcpServers.hindsight.env.HINDSIGHT_MCP_URL).toBe("http://localhost:18888/mcp/");
     // Fix 1.2 (#2903): enumerated allow-list, NOT a wildcard/bare server grant.
     expect(after.permissions.allow).not.toContain("mcp__hindsight__*");
     expect(after.permissions.allow).not.toContain("mcp__hindsight");
@@ -2203,7 +2206,7 @@ describe("reconcileAgent", () => {
     const after = JSON.parse(readFileSync(mcpJsonPath, "utf-8"));
     expect(after.mcpServers["switchroom-telegram"]).toBeDefined();
     expect(after.mcpServers.hindsight).toBeDefined();
-    expect(after.mcpServers.hindsight.url).toBe("http://localhost:18888/mcp/");
+    expect(after.mcpServers.hindsight.env.HINDSIGHT_MCP_URL).toBe("http://localhost:18888/mcp/");
   });
 
   it("does not touch CLAUDE.md, SOUL.md, or telegram user-content files on reconcile", () => {
