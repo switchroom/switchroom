@@ -29,6 +29,10 @@ const gatewaySrc = readFileSync(resolve(__dirname, '..', 'gateway', 'gateway.ts'
 // stream-render.ts. There the live-turn guard reads the injected accessor
 // (`getCurrentTurn() === turn`) rather than the `currentTurn` module global.
 const streamSrc = readFileSync(resolve(__dirname, '..', 'gateway', 'stream-render.ts'), 'utf-8')
+// #2996 P4-B: drainActivitySummary / feedHeartbeatTick moved VERBATIM into
+// narrative-lane.ts (factory scope, bodies indented +2; gateway keeps thin
+// same-name wrappers) — the heartbeat-safety windows read the module source.
+const laneSrc = readFileSync(resolve(__dirname, '..', 'gateway', 'narrative-lane.ts'), 'utf-8')
 
 function between(src: string, startMarker: string, endMarker: string): string {
   const after = src.split(startMarker)[1] ?? ''
@@ -37,13 +41,13 @@ function between(src: string, startMarker: string, endMarker: string): string {
 
 describe('silence-poke production-liveness — heartbeat safety', () => {
   it('drainActivitySummary must NOT reset the silence clock (the framework heartbeat drains here)', () => {
-    const body = between(gatewaySrc, 'async function drainActivitySummary', '\nfunction feedHeartbeatTick')
+    const body = between(laneSrc, 'async function drainActivitySummary', '\n  function feedHeartbeatTick')
     expect(body.length).toBeGreaterThan(100) // sanity: the slice found the function body
     expect(body).not.toMatch(/noteProduction/)
   })
 
   it('feedHeartbeatTick itself must NOT reset the silence clock (model-independent re-render)', () => {
-    const body = between(gatewaySrc, 'function feedHeartbeatTick(): void {', '\n}')
+    const body = between(laneSrc, 'function feedHeartbeatTick(): void {', '\n  }')
     expect(body.length).toBeGreaterThan(50)
     expect(body).not.toMatch(/noteProduction/)
   })

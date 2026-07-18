@@ -32,12 +32,21 @@ const streamSrc = readFileSync(
   resolve(__dirname, '..', 'gateway', 'stream-render.ts'),
   'utf-8',
 )
-const gatewayAndStreamSrc = gatewaySrc + '\n' + streamSrc
+// #2996 P4-B: the narrative/activity lane (drainActivitySummary,
+// showNarrativeStep, feedHeartbeatTick, clearActivitySummary) moved VERBATIM
+// into narrative-lane.ts (factory scope, bodies indented +2); gateway keeps
+// thin same-name wrappers. Lane-body windows read the module source.
+const laneSrc = readFileSync(
+  resolve(__dirname, '..', 'gateway', 'narrative-lane.ts'),
+  'utf-8',
+)
+const gatewayAndStreamSrc = gatewaySrc + '\n' + streamSrc + '\n' + laneSrc
 
 /** Source of `drainActivitySummary` up to the next top-level function. */
 function drainSrc(): string {
-  const after = gatewaySrc.split('async function drainActivitySummary(')[1] ?? ''
-  return after.split('\nasync function ')[0]?.split('\nfunction ')[0] ?? after
+  // #2996 P4-B: reads the lane module (factory scope — next fn at 2-space indent).
+  const after = laneSrc.split('async function drainActivitySummary(')[1] ?? ''
+  return after.split('\n  async function ')[0]?.split('\n  function ')[0] ?? after
 }
 
 describe('sticky finalAnswerEverDelivered latch (lever 1 precondition / R0)', () => {
@@ -127,14 +136,14 @@ describe('drainActivitySummary OPEN gate (levers 1 + 5, heartbeat-covered)', () 
 
 describe('drain producers — narrative may not OPEN, liveness + tool may', () => {
   it('showNarrativeStep drains with producer "narrative" (lever 5 base case)', () => {
-    const after = gatewaySrc.split('function showNarrativeStep(')[1] ?? ''
-    const body = after.split('\nfunction ')[0] ?? after
+    const after = laneSrc.split('function showNarrativeStep(')[1] ?? ''
+    const body = after.split('\n  function ')[0] ?? after
     expect(body).toMatch(/drainActivitySummary\(turn,\s*'narrative'\)/)
   })
 
   it('the liveness-open path drains with producer "liveness" (producer C preserved)', () => {
-    const after = gatewaySrc.split('function feedHeartbeatTick(')[1] ?? ''
-    const body = after.split('\nfunction ')[0] ?? after
+    const after = laneSrc.split('function feedHeartbeatTick(')[1] ?? ''
+    const body = after.split('\n  function ')[0] ?? after
     expect(body).toMatch(/drainActivitySummary\(turn,\s*'liveness'\)/)
   })
 

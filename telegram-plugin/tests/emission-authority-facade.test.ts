@@ -65,7 +65,17 @@ const streamRenderSrc = readFileSync(
   resolve(__dirname, '..', 'gateway', 'stream-render.ts'),
   'utf-8',
 )
-const gatewayAndStreamSrc = gatewaySrc + '\n' + streamRenderSrc
+// #2996 P4-B: the narrative/activity lane (showNarrativeStep,
+// openLivenessFeedIfDue, feedHeartbeatTick, drainActivitySummary,
+// clearActivitySummary + the cardDrainGate-wrapped drains inside them) moved
+// VERBATIM into narrative-lane.ts (factory scope, bodies indented +2).
+// gateway.ts keeps thin same-name wrappers, so lane-body assertions must read
+// the MODULE source, not the wrapper.
+const laneSrc = readFileSync(
+  resolve(__dirname, '..', 'gateway', 'narrative-lane.ts'),
+  'utf-8',
+)
+const gatewayAndStreamSrc = gatewaySrc + '\n' + streamRenderSrc + '\n' + laneSrc
 /** The sendReply window: from the function decl to the next export. */
 function sendReplyWindow(): string {
   const after = sendPathSrc.split('export async function sendReply(')[1] ?? ''
@@ -76,6 +86,13 @@ function sendReplyWindow(): string {
 function fnSrc(name: string): string {
   const after = gatewaySrc.split(`function ${name}(`)[1] ?? ''
   return after.split('\nasync function ')[0]?.split('\nfunction ')[0] ?? after
+}
+
+/** Source of a named narrative-lane function (factory scope, indented +2) up
+ *  to the next lane function definition (#2996 P4-B). */
+function laneFnSrc(name: string): string {
+  const after = laneSrc.split(`function ${name}(`)[1] ?? ''
+  return after.split('\n  async function ')[0]?.split('\n  function ')[0] ?? after
 }
 
 describe('SWITCHROOM_EMISSION_AUTHORITY kill-switch (default OFF)', () => {
@@ -338,7 +355,7 @@ describe('façade delegates to the existing emission primitives (call-site liter
 
 describe('the drain sites route through the façade with producers preserved verbatim', () => {
   it('the narrative SHOW site routes via openOrEditCard("narrative") + the producer-"narrative" drain', () => {
-    const body = fnSrc('showNarrativeStep')
+    const body = laneFnSrc('showNarrativeStep')
     expect(body).toMatch(/openOrEditCard\('narrative'/)
     // The drain literal (producer arg verbatim) is preserved in the delegate.
     expect(body).toMatch(/drainActivitySummary\(turn,\s*'narrative'\)/)
@@ -358,8 +375,8 @@ describe('the drain sites route through the façade with producers preserved ver
     //   - feedHeartbeatTick:     the 0-label CLIMB of an already-open card
     //                            (Phase 1) + the labelled-feed stale-step maintain.
     // All must still route via the façade with the producer arg verbatim.
-    const earlyOpen = fnSrc('openLivenessFeedIfDue')
-    const heartbeat = fnSrc('feedHeartbeatTick')
+    const earlyOpen = laneFnSrc('openLivenessFeedIfDue')
+    const heartbeat = laneFnSrc('feedHeartbeatTick')
     const opens = [
       ...earlyOpen.matchAll(/openOrEditCard\('liveness'/g),
       ...heartbeat.matchAll(/openOrEditCard\('liveness'/g),
@@ -405,7 +422,7 @@ describe('the drain sites route through the façade with producers preserved ver
     // gateway call site — pinned by feed-heartbeat-liveness-open.test.ts +
     // silent-turn-climb-transport.test.ts.
     expect(mayDrainGuards).toHaveLength(8)
-    expect(gatewaySrc).toMatch(/mayDrain:\s*\(\)\s*=>\s*ea\.mayDrain\(turn\)/)
+    expect(gatewayAndStreamSrc).toMatch(/mayDrain:\s*\(\)\s*=>\s*ea\.mayDrain\(turn\)/)
   })
 })
 
@@ -540,6 +557,6 @@ describe('mayDrainCardNow — PR-4d card-drain gate (pure read; gateway holds th
     // the SAME helper via an injected thunk — its call lives in the extracted
     // tick body (feed-heartbeat-climb.ts), wired at the gateway call site as
     // `cardDrainGate: (run) => cardDrainGate(turn, ea, run)`.
-    expect(gatewaySrc).toMatch(/cardDrainGate:\s*\(run\)\s*=>\s*cardDrainGate\(turn, ea, run\)/)
+    expect(gatewayAndStreamSrc).toMatch(/cardDrainGate:\s*\(run\)\s*=>\s*cardDrainGate\(turn, ea, run\)/)
   })
 })

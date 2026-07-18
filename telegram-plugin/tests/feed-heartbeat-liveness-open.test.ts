@@ -50,19 +50,28 @@ const streamSrc = readFileSync(
   resolve(__dirname, '..', 'gateway', 'stream-render.ts'),
   'utf-8',
 )
-const gatewayAndStreamSrc = gatewaySrc + '\n' + streamSrc
+// #2996 P4-B: feedHeartbeatTick / openLivenessFeedIfDue (and the whole
+// activity lane) moved VERBATIM into narrative-lane.ts (factory scope, bodies
+// indented +2); gateway keeps thin same-name wrappers, so the body helpers
+// below read the module source.
+const laneSrc = readFileSync(
+  resolve(__dirname, '..', 'gateway', 'narrative-lane.ts'),
+  'utf-8',
+)
+const gatewayAndStreamSrc = gatewaySrc + '\n' + streamSrc + '\n' + laneSrc
 
 /** Return the source text of `feedHeartbeatTick` (everything up to the next top-level function). */
 function feedHeartbeatTickSrc(): string {
-  const after = gatewaySrc.split('function feedHeartbeatTick(): void {')[1] ?? ''
-  // Stop at the next top-level function definition.
-  return after.split('\nfunction ')[0] ?? after
+  // #2996 P4-B: reads narrative-lane.ts; next lane fn sits at 2-space indent.
+  const after = laneSrc.split('function feedHeartbeatTick(): void {')[1] ?? ''
+  return after.split('\n  async function ')[0]?.split('\n  function ')[0] ?? after
 }
 
 /** Return the source text of `openLivenessFeedIfDue` (the shared open helper). */
 function openLivenessFeedIfDueSrc(): string {
-  const after = gatewaySrc.split('function openLivenessFeedIfDue(turn: CurrentTurn): void {')[1] ?? ''
-  return after.split('\nfunction ')[0] ?? after
+  // #2996 P4-B: reads narrative-lane.ts; next lane fn sits at 2-space indent.
+  const after = laneSrc.split('function openLivenessFeedIfDue(turn: CurrentTurn): void {')[1] ?? ''
+  return after.split('\n  async function ')[0]?.split('\n  function ')[0] ?? after
 }
 
 describe('H-1: feedHeartbeatTick liveness-open threshold', () => {
