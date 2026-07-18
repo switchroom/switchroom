@@ -30,6 +30,10 @@ const CARD_STORES = read('gateway/approval-card-stores.ts')
 // moved verbatim behind callback-query-handlers.ts; handler-body pins read
 // that module while staging/boot/sweep wiring stays pinned on gateway.ts.
 const CB_HANDLERS = read('gateway/callback-query-handlers.ts')
+// #2996 P5-tail: the agent-facing card-STAGING execute* tool handlers moved
+// verbatim behind card-tool-handlers.ts; their staging pins read that module
+// while the stores/boot/sweep wiring stays pinned on gateway.ts.
+const CARD_TOOL = read('gateway/card-tool-handlers.ts')
 
 function slice(src: string, header: string, span = 3000): string {
   const start = src.indexOf(header)
@@ -77,7 +81,7 @@ describe('staging persists card metadata (Defect A)', () => {
   })
 
   it('vault_request_save stages metadata but NEVER the secret value (hygiene)', () => {
-    const fn = slice(GATEWAY, 'async function executeVaultRequestSave', 6000)
+    const fn = slice(CARD_TOOL, 'async function executeVaultRequestSave', 6000)
     const addBlock = slice(fn, "pendingCardStore.add({", 700)
     expect(addBlock).toMatch(/family: 'vault_request_save'/)
     // The staged secret `value` must NOT be copied into the persisted record.
