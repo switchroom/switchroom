@@ -227,6 +227,38 @@ export interface PendingVaultRequestSave {
 }
 
 /**
+ * #2045 `request_secret` — agent asks the operator to PROVIDE a secret it does
+ * NOT have. No `value` is staged (unlike PendingVaultRequestSave): the value
+ * arrives via secure capture (the operator's next message after they tap
+ * [Provide securely]). Only request metadata lives here — nothing sensitive.
+ */
+export interface PendingSecretRequest {
+  agent: string
+  chat_id: string
+  key: string
+  reason?: string
+  staged_at: number
+  card_message_id?: number
+  /** Supergroup forum topic the agent was working in — carried into the
+   *  provide/decline/fail outcome inbounds so the resumed reply lands back
+   *  in that topic, not General. */
+  threadId?: number
+}
+
+/**
+ * The armed capture for a `request_secret` card: after [Provide securely] is
+ * tapped, the operator's NEXT message in `chat_id` is the value for `key`.
+ * Transient post-tap window (never persisted).
+ */
+export interface ArmedSecretCapture {
+  key: string
+  agent: string
+  stageId: string
+  armed_at: number
+  threadId?: number
+}
+
+/**
  * Issue #1012 — agent-initiated vault ACL request. The agent calls
  * `vault_request_access` when it hits VAULT-BROKER-DENIED (or
  * preemptively, when it knows it'll need a key it doesn't yet have).
@@ -367,6 +399,10 @@ export interface CallbackQueryHandlersDeps {
   // Pending-state stores (consolidated surfaces from #3008/#3011).
   pendingVaultRequestAccesses: SweepableCardStore<PendingVaultRequestAccess>
   pendingVaultRequestSaves: SweepableCardStore<PendingVaultRequestSave>
+  /** Agent-initiated `request_secret` cards awaiting an operator tap (`vsp:`). */
+  pendingSecretRequests: SweepableCardStore<PendingSecretRequest>
+  /** Post-[Provide securely] armed captures, keyed by chat_id. */
+  armedSecretCaptures: SweepableStore<ArmedSecretCapture>
   pendingMentalModelProposes: SweepableCardStore<PendingMentalModelPropose>
   pendingCardStore: { remove(stageId: string): void }
   pendingMentalModelCorrelations: SweepableStore<{
@@ -431,6 +467,8 @@ export function createCallbackQueryHandlers(deps: CallbackQueryHandlersDeps) {
     swallowingApiCall,
     pendingVaultRequestAccesses,
     pendingVaultRequestSaves,
+    pendingSecretRequests,
+    armedSecretCaptures,
     pendingMentalModelProposes,
     pendingCardStore,
     pendingMentalModelCorrelations,
@@ -1676,6 +1714,91 @@ async function handleVaultRequestSaveCallback(ctx: Context, data: string): Promi
   await ctx.answerCallbackQuery({ text: 'Unknown action' }).catch(() => {})
 }
 
+/**
+ * `vsp:` callbacks — agent-requested-secret card (#2045).
+ *   vsp:provide:<stageId>  — arm capture: operator's next message is the value
+ *   vsp:decline:<stageId>  — drop the request; tell the agent it was declined
+ *
+ * Extracted verbatim from gateway.ts (#2996 P5) — behavior-preserving. The
+ * `pendingSecretRequests` / `armedSecretCaptures` stores are the SAME singleton
+ * instances gateway.ts constructs (injected via deps, never re-`new`ed here).
+ */
+async function handleSecretRequestCallback(ctx: Context, data: string): Promise<void> {
+  const senderId = String(ctx.from?.id ?? '')
+  const access = loadAccess()
+  if (!access.allowFrom.includes(senderId)) {
+    await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+    return
+  }
+  const parts = data.split(':')
+  const action = parts[1]
+  const stageId = parts[2] ?? ''
+  const pending = pendingSecretRequests.get(stageId)
+  if (!pending) {
+    await ctx.answerCallbackQuery({ text: 'This request expired.' }).catch(() => {})
+    return
+  }
+
+  if (action === 'provide') {
+    armedSecretCaptures.set(pending.chat_id, {
+      key: pending.key,
+      agent: pending.agent,
+      stageId,
+      armed_at: Date.now(),
+      ...(pending.threadId != null ? { threadId: pending.threadId } : {}),
+    })
+    await ctx.answerCallbackQuery({ text: 'Send the value now — it auto-deletes.' }).catch(() => {})
+    if (pending.card_message_id != null) {
+      await ctx.api
+        .editMessageText(
+          pending.chat_id,
+          pending.card_message_id,
+          richMessage(`🔐 Send the value for \`${pending.key}\` as your next message — a single message, exactly as-is (don't add other text). I’ll delete it instantly and store it in the vault.`),
+          { reply_markup: { inline_keyboard: [] } },
+        )
+        .catch(() => {})
+    }
+    return
+  }
+
+  if (action === 'decline') {
+    pendingSecretRequests.delete(stageId)
+    pendingCardStore.remove(stageId)
+    armedSecretCaptures.delete(pending.chat_id)
+    await ctx.answerCallbackQuery({ text: 'Declined.' }).catch(() => {})
+    if (pending.card_message_id != null) {
+      await ctx.api
+        .editMessageText(pending.chat_id, pending.card_message_id, richMessage(`🚫 Declined — \`${pending.key}\` not provided.`), {
+          reply_markup: { inline_keyboard: [] },
+        })
+        .catch(() => {})
+    }
+    // Tell the agent so it stops waiting.
+    const ts = Date.now()
+    const synthetic: InboundMessage = {
+      type: 'inbound',
+      chatId: pending.chat_id,
+      ...(pending.threadId != null ? { threadId: pending.threadId } : {}),
+      messageId: ts,
+      user: 'vault-broker',
+      userId: 0,
+      ts,
+      text: `🚫 Operator declined your request for \`vault:${pending.key}\`. Proceed without it or ask how they'd like to handle the task.`,
+      meta: {
+        source: 'secret_declined',
+        agent: pending.agent,
+        ...(pending.threadId != null ? { message_thread_id: String(pending.threadId) } : {}),
+        key: pending.key,
+        stage_id: stageId,
+      },
+    }
+    deliverResumeSyntheticOrBuffer(pending.agent, synthetic)
+    return
+  }
+
+  await ctx.answerCallbackQuery().catch(() => {})
+}
+
 async function handleVaultDeferCallback(ctx: Context, data: string): Promise<void> {
   const senderId = String(ctx.from?.id ?? '')
   const access = loadAccess()
@@ -2734,6 +2857,7 @@ async function handleAuthDashboardCallback(ctx: Context): Promise<void> {
     handleMentalModelProposeCallback,
     handleVaultRequestAccessCallback,
     handleVaultRequestSaveCallback,
+    handleSecretRequestCallback,
     handleVaultDeferCallback,
     parseGrantDuration,
     formatGrantExpiry,
