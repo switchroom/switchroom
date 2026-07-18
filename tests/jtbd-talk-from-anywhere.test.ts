@@ -37,7 +37,7 @@
  * Read the JTBD before adding/removing a test here.
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, it, expect } from "vitest";
 
@@ -62,16 +62,22 @@ const bridgeSrc = readFileSync(
 // count undercounts — this exact miss kept main red on every
 // push-to-main full-suite run after #3330 merged (PRs stayed green
 // because `vitest --changed` never selected this file).
+//
+// Durable by construction: glob every `*-card.ts` module in the
+// gateway dir (excluding tests) instead of hardcoding file names —
+// the #2996 extraction series is ongoing, and a hardcoded list would
+// undercount again on the next extraction. This also pulls in the
+// cards that already lived outside the census (mental-model-propose,
+// secret-request, skill-proposal, …); their `mmp:`/`vsp:` prefixes
+// are covered by expectedPrefixes below.
 const approvalCardsSrc = [
   gatewaySrc,
-  readFileSync(
-    resolve(REPO_ROOT, "telegram-plugin/gateway/vault-request-save-card.ts"),
-    "utf-8",
-  ),
-  readFileSync(
-    resolve(REPO_ROOT, "telegram-plugin/gateway/vault-request-access-card.ts"),
-    "utf-8",
-  ),
+  ...readdirSync(resolve(REPO_ROOT, "telegram-plugin/gateway"))
+    .filter((f) => f.endsWith("-card.ts") && !f.endsWith(".test.ts"))
+    .sort()
+    .map((f) =>
+      readFileSync(resolve(REPO_ROOT, "telegram-plugin/gateway", f), "utf-8"),
+    ),
 ].join("\n");
 
 // ── Helpers ─────────────────────────────────────────────────────────────
