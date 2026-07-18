@@ -23,7 +23,11 @@ import chalk from "chalk";
 import type { AgentConfig, QuotaConfig, SwitchroomConfig, TelegramConfig } from "../config/schema.js";
 import { CRON_SCRIPT_BASENAME_RE, LEGACY_CRON_SCRIPT_BASENAME_RE } from "./cron-unit-name.js";
 import { atomicWriteFileSync } from "../util/atomic.js";
-import { alignAgentTreeOwnershipIfRoot, findAgentUnreadablePaths } from "./agent-owned-tree.js";
+import {
+  alignAgentTreeOwnershipIfRoot,
+  findAgentUnreadablePaths,
+  scopedAssertCandidates,
+} from "./agent-owned-tree.js";
 
 // Repo root for referencing bin/ scripts in hooks
 const REPO_ROOT = resolve(import.meta.dirname, "../..");
@@ -7339,12 +7343,18 @@ function reconcileAgentInner(
   {
     const sweptUid = alignAgentTreeOwnershipIfRoot(name, agentDir);
     if (sweptUid !== null) {
+      // #3333 amendment B: the assert candidate set is the UNION of the
+      // static scoped set (derived from the same scope constants the sweep
+      // uses — scope-of-sweep == scope-of-assert) and this run's dynamic
+      // `changes` list. The `changes` term must be PRESERVED, never
+      // replaced: it is what catches a touched-but-out-of-scope file (e.g.
+      // a future top-level write) that the static set doesn't name. Dedup
+      // so a file in both terms is only reported once.
       const critical = [
-        join(agentDir, ".claude", "settings.json"),
-        join(agentDir, ".mcp.json"),
-        join(agentDir, ".claude-cron", ".mcp.json"),
-        join(agentDir, "start.sh"),
-        ...changes.filter((p) => p.startsWith(agentDir + "/")),
+        ...new Set([
+          ...scopedAssertCandidates(agentDir),
+          ...changes.filter((p) => p.startsWith(agentDir + "/")),
+        ]),
       ];
       const unreadable = findAgentUnreadablePaths(critical, sweptUid);
       if (unreadable.length > 0) {
