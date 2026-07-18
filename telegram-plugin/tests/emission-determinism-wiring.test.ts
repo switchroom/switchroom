@@ -24,6 +24,15 @@ const sendPathSrc = readFileSync(
   resolve(__dirname, '..', 'gateway', 'outbound-send-path.ts'),
   'utf-8',
 )
+// #2996 P4-A: the per-turn CurrentTurn object literal (which initialises the
+// sticky `finalAnswerEverDelivered: false` latch) is constructed in
+// handleSessionEvent's `enqueue` branch, which moved VERBATIM to
+// stream-render.ts. The init-latch assertions scan gateway.ts + that module.
+const streamSrc = readFileSync(
+  resolve(__dirname, '..', 'gateway', 'stream-render.ts'),
+  'utf-8',
+)
+const gatewayAndStreamSrc = gatewaySrc + '\n' + streamSrc
 
 /** Source of `drainActivitySummary` up to the next top-level function. */
 function drainSrc(): string {
@@ -33,16 +42,16 @@ function drainSrc(): string {
 
 describe('sticky finalAnswerEverDelivered latch (lever 1 precondition / R0)', () => {
   it('is initialised false in the turn object literal (per-turn reset at turn start)', () => {
-    expect(gatewaySrc).toMatch(/finalAnswerEverDelivered:\s*false/)
+    expect(gatewayAndStreamSrc).toMatch(/finalAnswerEverDelivered:\s*false/)
   })
 
   it('is reset to false in exactly ONE place — the turn initialiser (never cleared by reopen)', () => {
     // Mirrors activityEverOpened's sticky-true contract: the only `false` is the
     // per-turn init. A standalone `= false` reassignment would let reopen clear
     // the latch and reintroduce the reorder (the R0 correction).
-    const initFalse = [...gatewaySrc.matchAll(/finalAnswerEverDelivered:\s*false/g)]
+    const initFalse = [...gatewayAndStreamSrc.matchAll(/finalAnswerEverDelivered:\s*false/g)]
     expect(initFalse).toHaveLength(1)
-    const resetFalse = [...gatewaySrc.matchAll(/finalAnswerEverDelivered\s*=\s*false/g)]
+    const resetFalse = [...gatewayAndStreamSrc.matchAll(/finalAnswerEverDelivered\s*=\s*false/g)]
     expect(resetFalse).toHaveLength(0)
   })
 

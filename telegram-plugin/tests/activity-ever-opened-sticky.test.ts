@@ -32,6 +32,15 @@ const gatewaySrc = readFileSync(
   resolve(__dirname, '..', 'gateway', 'gateway.ts'),
   'utf-8',
 )
+// #2996 P4-A: one sticky-latch set site + the per-turn object-literal init live
+// in handleSessionEvent (the tool-label/answer send-success + the `enqueue`
+// turn ctor), which moved VERBATIM to stream-render.ts. The population spans
+// gateway.ts + that module.
+const streamSrc = readFileSync(
+  resolve(__dirname, '..', 'gateway', 'stream-render.ts'),
+  'utf-8',
+)
+const gatewayAndStreamSrc = gatewaySrc + '\n' + streamSrc
 
 describe('M-2: activityEverOpened sticky-true invariant', () => {
   it('activityEverOpened = true appears only at the two feed-OPEN signal sites', () => {
@@ -39,19 +48,19 @@ describe('M-2: activityEverOpened sticky-true invariant', () => {
     // handback pre-turn ADOPTION seed (an adopted turn only edits, so it stamps
     // the flag itself). Both are set-TRUE; the sticky invariant (no reset to
     // false) is enforced by the next test.
-    const setTrueMatches = [...gatewaySrc.matchAll(/activityEverOpened\s*=\s*true/g)]
+    const setTrueMatches = [...gatewayAndStreamSrc.matchAll(/activityEverOpened\s*=\s*true/g)]
     expect(setTrueMatches).toHaveLength(2)
   })
 
   it('turn.activityEverOpened = false never appears (no standalone reset)', () => {
     // The only `false` value must be in the object literal initialiser
     // (e.g. `activityEverOpened: false`), never a standalone reassignment.
-    const resetMatches = [...gatewaySrc.matchAll(/turn\.activityEverOpened\s*=\s*false/g)]
+    const resetMatches = [...gatewayAndStreamSrc.matchAll(/turn\.activityEverOpened\s*=\s*false/g)]
     expect(resetMatches).toHaveLength(0)
   })
 
   it('activityEverOpened is initialised false in the turn object literal (per-turn reset)', () => {
     // The object literal form `activityEverOpened: false` must exist (per-turn init).
-    expect(gatewaySrc).toMatch(/activityEverOpened:\s*false/)
+    expect(gatewayAndStreamSrc).toMatch(/activityEverOpened:\s*false/)
   })
 })

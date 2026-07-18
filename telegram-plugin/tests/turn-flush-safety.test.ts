@@ -261,6 +261,19 @@ describe('#2798 turn-flush punctuation/bold parity with reply', () => {
     new URL('../gateway/gateway.ts', import.meta.url),
     'utf8',
   )
+  // #2996 P4-A: the turn_flush backstop (redact → normalize → scrub on
+  // `capturedText`) moved VERBATIM into stream-render.ts with
+  // handleSessionEvent. The reply path's identical `...(text))` wrapper lives
+  // in outbound-send-path.ts (`normalizeOutboundBody`, #2996 P2). Parity is
+  // pinned across the two extracted homes.
+  const streamSrc = readFileSync(
+    new URL('../gateway/stream-render.ts', import.meta.url),
+    'utf8',
+  )
+  const replyModuleSrc = readFileSync(
+    new URL('../gateway/outbound-send-path.ts', import.meta.url),
+    'utf8',
+  )
 
   it('reply path: normalizes AFTER redact and BEFORE the voice scrub', () => {
     // #2996: the reply-path entry pipeline moved into outbound-send-path.ts
@@ -290,13 +303,13 @@ describe('#2798 turn-flush punctuation/bold parity with reply', () => {
   })
 
   it('turn-flush backstop: applies the SAME normalization in the SAME slot (REDS if the line is removed)', () => {
-    const redactIdx = gatewaySrc.indexOf(`redactOutboundText(capturedText, 'turn_flush')`)
+    const redactIdx = streamSrc.indexOf(`redactOutboundText(capturedText, 'turn_flush')`)
     // The normalization call the reply path uses, verbatim, on the turn_flush
     // variable. This indexOf is what returns -1 (→ assertion fails) if the
     // `stripExcessBold(normalizePunctuation(capturedText))` line is deleted
     // from the turn_flush branch.
-    const normIdx = gatewaySrc.indexOf('stripExcessBold(normalizePunctuation(capturedText))', redactIdx)
-    const scrubIdx = gatewaySrc.indexOf('scrubVoice(capturedText)', redactIdx)
+    const normIdx = streamSrc.indexOf('stripExcessBold(normalizePunctuation(capturedText))', redactIdx)
+    const scrubIdx = streamSrc.indexOf('scrubVoice(capturedText)', redactIdx)
     expect(redactIdx).toBeGreaterThan(0)
     expect(normIdx).toBeGreaterThan(redactIdx) // normalize AFTER the turn_flush redact
     expect(scrubIdx).toBeGreaterThan(normIdx) // ...and BEFORE the voice scrub — mirrors reply
@@ -305,8 +318,8 @@ describe('#2798 turn-flush punctuation/bold parity with reply', () => {
   it('both send sites share the identical `stripExcessBold(normalizePunctuation(` wrapper', () => {
     // Parity, structurally: the exact normalization wrapper the reply path uses
     // is the one the turn_flush branch uses — same call, not a lookalike.
-    expect(gatewaySrc).toContain('stripExcessBold(normalizePunctuation(text))')
-    expect(gatewaySrc).toContain('stripExcessBold(normalizePunctuation(capturedText))')
+    expect(replyModuleSrc).toContain('stripExcessBold(normalizePunctuation(text))')
+    expect(streamSrc).toContain('stripExcessBold(normalizePunctuation(capturedText))')
   })
 
   // Behavioural coverage (kept from the original suite): reconstruct the

@@ -56,6 +56,16 @@ const sendPathSrc = readFileSync(
   resolve(__dirname, '..', 'gateway', 'outbound-send-path.ts'),
   'utf-8',
 )
+// #2996 P4-A: `handleSessionEvent`'s body (the tool_label / sub-agent drains
+// and their `ea.mayDrain(turn)` single-flight guards) moved VERBATIM to
+// stream-render.ts. Drain-site assertions that grep for the full population of
+// façade call sites therefore scan gateway.ts + stream-render.ts combined —
+// the wiring contract they pin is unchanged, only its file home split.
+const streamRenderSrc = readFileSync(
+  resolve(__dirname, '..', 'gateway', 'stream-render.ts'),
+  'utf-8',
+)
+const gatewayAndStreamSrc = gatewaySrc + '\n' + streamRenderSrc
 /** The sendReply window: from the function decl to the next export. */
 function sendReplyWindow(): string {
   const after = sendPathSrc.split('export async function sendReply(')[1] ?? ''
@@ -372,15 +382,20 @@ describe('the drain sites route through the façade with producers preserved ver
   it('both foreground sub-agent drains route via openOrEditCard("tool") with producer made EXPLICIT', () => {
     // Previously these called drainActivitySummary(turn) with the implicit
     // 'tool' default; PR-4a makes 'tool' explicit at both, per the plan.
-    const opens = [...gatewaySrc.matchAll(/ea\.openOrEditCard\('tool', \(\) => \{\s*\n\s*turn\.activityInFlight = drainActivitySummary\(turn, 'tool'\)/g)]
+    // #2996 P4-A: these sites now live in stream-render.ts (tool_label + the
+    // sub-agent drains moved with handleSessionEvent), so scan the combined src.
+    const opens = [...gatewayAndStreamSrc.matchAll(/ea\.openOrEditCard\('tool', \(\) => \{\s*\n\s*turn\.activityInFlight = drainActivitySummary\(turn, 'tool'\)/g)]
     // tool_label site (1) + the two sub-agent drains (2) = 3 'tool' openers.
     expect(opens.length).toBeGreaterThanOrEqual(3)
     // No foreground drain still uses the bare implicit-producer form.
-    expect(gatewaySrc).not.toMatch(/turn\.activityInFlight = drainActivitySummary\(turn\)\n/)
+    expect(gatewayAndStreamSrc).not.toMatch(/turn\.activityInFlight = drainActivitySummary\(turn\)\n/)
   })
 
   it('every routed drain site guards the single-flight via ea.mayDrain(turn), not a bare activityInFlight read', () => {
-    const mayDrainGuards = [...gatewaySrc.matchAll(/if \(ea\.mayDrain\(turn\)\)/g)]
+    // #2996 P4-A: the tool / sub-agent / post-answer bg-liveness guards moved
+    // to stream-render.ts with handleSessionEvent; the narrative + liveness
+    // guards stay in gateway.ts. The full population (8) spans both files.
+    const mayDrainGuards = [...gatewayAndStreamSrc.matchAll(/if \(ea\.mayDrain\(turn\)\)/g)]
     // narrative SHOW + narrative RETRACT (timer-flush early-paint retract,
     // narrative-flush.ts) + 2 liveness + tool + 2 sub-agent + 1 post-answer
     // bg-liveness (Fix 2) = 8. The Phase-1 0-label climb
@@ -406,7 +421,9 @@ describe('per-turn construction — one façade per turn, explicit chat/thread k
   it('the turn ctor constructs a fresh EmissionAuthority with the explicit statusKey', () => {
     // Per-turn: born in the CurrentTurn object literal so it is discarded with
     // the turn and never persists across turns.
-    expect(gatewaySrc).toMatch(/emissionAuthority: new EmissionAuthority\(\s*\n\s*statusKey\(/)
+    // #2996 P4-A: the turn ctor lives in handleSessionEvent's `enqueue` branch,
+    // which moved to stream-render.ts.
+    expect(gatewayAndStreamSrc).toMatch(/emissionAuthority: new EmissionAuthority\(\s*\n\s*statusKey\(/)
   })
 
   it('the façade constructor takes the chat/thread key EXPLICITLY (the PR-4e map seam)', () => {
@@ -514,7 +531,10 @@ describe('mayDrainCardNow — PR-4d card-drain gate (pure read; gateway holds th
     // thunks stay byte-identical, wrapped by the centralized helper.
     // 6 original + 1 post-answer background-agent liveness drain (Fix 2) + 1
     // narrative-retract drain (timer-flush early-paint retract, narrative-flush.ts).
-    const wraps = [...gatewaySrc.matchAll(/cardDrainGate\(turn, ea, \(\) => \{/g)]
+    // #2996 P4-A: one of these guarded drains (the post-answer bg-liveness
+    // drain) moved to stream-render.ts with handleSessionEvent; the population
+    // of 8 now spans gateway.ts + stream-render.ts.
+    const wraps = [...gatewayAndStreamSrc.matchAll(/cardDrainGate\(turn, ea, \(\) => \{/g)]
     expect(wraps).toHaveLength(8)
     // The Phase-1 0-label climb (deterministic-turn-liveness.md) routes through
     // the SAME helper via an injected thunk — its call lives in the extracted

@@ -29,6 +29,14 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 const gatewaySrc = readFileSync(resolve(__dirname, '..', 'gateway', 'gateway.ts'), 'utf-8')
+// #2996 P4-A: the enqueue turn-ctor SET (`setCurrentTurn(next, statusKey(…))`)
+// and two of the three keyed-liveness comparison sites moved VERBATIM into
+// stream-render.ts with handleSessionEvent. In the extracted module the
+// flag-OFF liveness read routes through the injected accessor
+// (`getCurrentTurn() === turn`) rather than the `currentTurn` module global —
+// same invariant, accessor spelling. These wiring oracles span both files.
+const streamSrc = readFileSync(resolve(__dirname, '..', 'gateway', 'stream-render.ts'), 'utf-8')
+const gatewayAndStreamSrc = gatewaySrc + '\n' + streamSrc
 
 // ---------------------------------------------------------------------------
 // (a) SOURCE-READ STRUCTURAL ORACLE
@@ -51,8 +59,9 @@ describe('PR-4e source-read oracle — the wiring the per-topic map depends on',
     const rawAssigns = gatewaySrc.match(/^[^/\n]*\bcurrentTurn = (?!currentTurnMap\.get\(\)|null$)/gm) ?? []
     expect(rawAssigns, `unexpected raw currentTurn assignment(s): ${JSON.stringify(rawAssigns)}`).toEqual([])
 
-    // The turn ctor SET routes through setCurrentTurn with the statusKey.
-    expect(gatewaySrc).toMatch(/setCurrentTurn\(next, statusKey\(ev\.chatId, enqThreadIdNum\)\)/)
+    // The turn ctor SET routes through setCurrentTurn with the statusKey
+    // (now in stream-render.ts's `enqueue` branch — #2996 P4-A).
+    expect(gatewayAndStreamSrc).toMatch(/setCurrentTurn\(next, statusKey\(ev\.chatId, enqThreadIdNum\)\)/)
     // The disconnect-flush clears the WHOLE map (every entry is a ghost).
     expect(gatewaySrc).toMatch(/clearAllCurrentTurns\(\)/)
     // The silence-poke fallback does a keyed delete for the wedged turn's key.
@@ -88,8 +97,12 @@ describe('PR-4e source-read oracle — the wiring the per-topic map depends on',
     // the flag, resolve THIS turn by ITS OWN topic key. We assert the keyed
     // form appears the expected number of times AND the literal flag-OFF form is
     // retained (the silence-liveness-wiring oracle requires `currentTurn === turn`).
-    const keyedLiveness = gatewaySrc.match(
-      /EMISSION_AUTHORITY_ENABLED \? turnLiveForItsTopic\(turn\) : currentTurn === turn/g,
+    // #2996 P4-A: two of the three sites moved to stream-render.ts, where the
+    // flag-OFF read is spelled `getCurrentTurn() === turn` (injected accessor);
+    // the one remaining in gateway.ts keeps `currentTurn === turn`. Match either
+    // spelling across both files — the population is still exactly 3.
+    const keyedLiveness = gatewayAndStreamSrc.match(
+      /EMISSION_AUTHORITY_ENABLED \? turnLiveForItsTopic\(turn\) : (?:currentTurn|getCurrentTurn\(\)) === turn/g,
     ) ?? []
     expect(keyedLiveness.length).toBe(3)
   })

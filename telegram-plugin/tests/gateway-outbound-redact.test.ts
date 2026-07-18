@@ -29,6 +29,12 @@ describe('gateway outbound secret-scrub — structural wiring', () => {
     new URL('../gateway/outbound-send-path.ts', import.meta.url),
     'utf8',
   )
+  // #2996 P4-A: the turn-flush backstop scrub lives in handleSessionEvent,
+  // which moved VERBATIM to stream-render.ts.
+  const streamSrc = readFileSync(
+    new URL('../gateway/stream-render.ts', import.meta.url),
+    'utf8',
+  )
 
   it('imports the shared redactor', () => {
     expect(src).toMatch(/import \{ redact \} from '\.\.\/secret-detect\/redact\.js'/)
@@ -66,8 +72,8 @@ describe('gateway outbound secret-scrub — structural wiring', () => {
   it('turn-flush backstop: scrubs the model terminal prose before send', () => {
     // Turn-flush delivers the model's answer when it skipped reply/stream_reply
     // — arbitrary agent free-text that hits the wire + stderr preview.
-    const redactIdx = src.indexOf(`redactOutboundText(capturedText, 'turn_flush')`)
-    const scrubSiteIdx = src.indexOf(`site: 'turn_flush'`)
+    const redactIdx = streamSrc.indexOf(`redactOutboundText(capturedText, 'turn_flush')`)
+    const scrubSiteIdx = streamSrc.indexOf(`site: 'turn_flush'`)
     expect(redactIdx).toBeGreaterThan(0)
     expect(scrubSiteIdx).toBeGreaterThan(redactIdx) // mask BEFORE the voice scrub + send
   })
