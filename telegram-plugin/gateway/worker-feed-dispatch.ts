@@ -1,5 +1,45 @@
 import type { Subagent } from '../registry/subagents-schema.js'
 
+/**
+ * The narrow slice of the worker-activity feed `handleWorkerResume` needs —
+ * structurally satisfied by `WorkerActivityFeed` (worker-activity-feed.ts)
+ * without importing it (keeps this module dependency-light and the seam
+ * trivially mockable in tests).
+ */
+export interface WorkerFeedForResume {
+  resurrect(agentId: string): void
+}
+
+/**
+ * Issue #3373 (SendMessage-resume feed re-surface) — the gateway's `onResume`
+ * handler body, extracted so the seam is unit-testable and gateway.ts keeps
+ * only a thin delegation (the line-ratchet drains inline bodies).
+ *
+ * A worker with a GENUINE terminal completion that is resumed via SendMessage
+ * grows its jsonl past the terminal boundary and is re-registered live by the
+ * watcher (#3315). This clears the feed's terminal `finalized` latch
+ * (`feed.resurrect`) so the resumed worker's next onProgress cue repaints a
+ * fresh live row — without it the latch swallows every resumed cue and the
+ * worker reads as silence. Distinct from the #3023 `onResurrect` path: no
+ * bounded-chain budget (a worker may be stopped/resumed any number of times).
+ *
+ * Best-effort: a resurrect failure is logged, never thrown back into the
+ * watcher's poll loop. `feed` may be null/undefined (feed disabled) — the
+ * re-surface log line is still emitted for the audit trail.
+ */
+export function handleWorkerResume(
+  feed: WorkerFeedForResume | null | undefined,
+  agentId: string,
+  log: (msg: string) => void,
+): void {
+  try {
+    feed?.resurrect(agentId)
+  } catch (err) {
+    log(`telegram gateway: worker resume feed re-surface error agent=${agentId}: ${(err as Error).message}`)
+  }
+  log(`telegram gateway: worker ${agentId} card RE-SURFACED — resumed via SendMessage after a genuine terminal (issue #3373)`)
+}
+
 export interface WorkerFeedDispatch {
   /** True when the sub-agent was dispatched with `run_in_background: true`. */
   isBackground: boolean
