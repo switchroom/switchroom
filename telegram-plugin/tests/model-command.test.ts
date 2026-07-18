@@ -444,6 +444,30 @@ describe("SR_MODEL_ALIASES / expandSrAlias", () => {
   it("every alias target is a sr-* id", () => {
     for (const target of Object.values(SR_MODEL_ALIASES)) expect(isSrModel(target)).toBe(true);
   });
+  it("2026-07-19 grok/kimi/gpt flagship buttons expand to their sr-* ids", () => {
+    expect(expandSrAlias("grok")).toBe("sr-grok-4.5");
+    expect(expandSrAlias("kimi")).toBe("sr-kimi-k3");
+    expect(expandSrAlias("gpt")).toBe("sr-gpt-5.6-sol");
+  });
+  it("new flagship buttons are offline-trustable carriers (#3042 gate)", () => {
+    for (const a of ["grok", "kimi", "gpt"]) expect(isOfflineTrustedModelToken(a)).toBe(true);
+    for (const id of ["sr-grok-4.5", "sr-kimi-k3", "sr-gpt-5.6-sol"])
+      expect(isOfflineTrustedModelToken(id)).toBe(true);
+  });
+  it("labels every new grok/kimi/gpt-5.6 sr-* id (typeable tiers included)", () => {
+    for (const id of [
+      "sr-grok-4.5",
+      "sr-grok-4.3",
+      "sr-kimi-k3",
+      "sr-kimi-k2.7-code",
+      "sr-gpt-5.6-sol",
+      "sr-gpt-5.6-terra",
+      "sr-gpt-5.6-luna",
+    ]) {
+      expect(SR_MODEL_LABELS[id]).toBeTypeOf("string");
+      expect(isValidModelArg(id)).toBe(true);
+    }
+  });
 });
 
 describe("classifyDiscoveredOptions", () => {
