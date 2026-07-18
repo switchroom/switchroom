@@ -699,6 +699,11 @@ export const SR_MODEL_ALIASES: Record<string, string> = {
   grok: 'sr-grok-4.5',
   kimi: 'sr-kimi-k3',
   gpt: 'sr-gpt-5.6-sol',
+  // Per-tier buttons for the GPT-5.6 line so each is a one-word shortcut
+  // (`gpt` stays the flagship-Sol default). Added 2026-07-19.
+  sol: 'sr-gpt-5.6-sol',
+  terra: 'sr-gpt-5.6-terra',
+  luna: 'sr-gpt-5.6-luna',
 }
 
 /** Expand a short alias (case-insensitive) to its full sr-* id, or return the original. */
