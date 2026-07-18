@@ -907,14 +907,22 @@ installPluginLogger()
 // PostHog Error Tracking before the process dies. Mirrors the CLI's
 // install (src/cli/index.ts), so gateway + CLI errors land in the same
 // dashboard tagged `source: 'gateway'` vs `source: 'cli'`.
-installPosthogErrorHandlers()
-// Flush analytics on graceful shutdown so the last batch isn't lost.
-// The signal handlers themselves remain owned by other modules — we
-// piggyback by emitting a `beforeExit` listener which fires after
-// SIGTERM/SIGINT have run their handlers and the event loop is empty.
-process.on('beforeExit', () => {
-  void shutdownAnalytics()
-})
+// #2996 P0e: global error handlers + the analytics-flush `beforeExit` listener
+// are boot process-wiring, not import-time state. installGlobalErrorHandlers
+// registers an `uncaughtException` handler that calls `process.exit(1)`, so
+// leaving it ungated would make exit reachable from a bare `import(gateway.ts)`.
+// Gate on isGatewayMain: registered verbatim (same order, same position) on the
+// prod boot path; a no-op under a vitest import.
+if (isGatewayMain) {
+  installPosthogErrorHandlers()
+  // Flush analytics on graceful shutdown so the last batch isn't lost.
+  // The signal handlers themselves remain owned by other modules — we
+  // piggyback by emitting a `beforeExit` listener which fires after
+  // SIGTERM/SIGINT have run their handlers and the event loop is empty.
+  process.on('beforeExit', () => {
+    void shutdownAnalytics()
+  })
+}
 
 // ─── Env + state dir ──────────────────────────────────────────────────────
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
@@ -10407,7 +10415,13 @@ if (isGatewayMain) pendingProgress.startTimer({
 // processed when it reconnects" promise deterministic across a
 // gateway/container restart (finn/carrie lost-on-restart incident,
 // 2026-05-19). STATIC mode has no runtime/bridge, so no spool.
-const inboundSpool = STATIC
+// #2996 P0e: createInboundSpool hydrates its in-memory projection from the
+// on-disk spool at construction (readFileSync) — a module-load disk read.
+// Defer past import; still constructs at the identical boot point in prod
+// (isGatewayMain true). Under an import()/vitest load it stays undefined, which
+// is exactly the STATIC-mode shape every reader already guards for (`!= null`).
+let inboundSpool: ReturnType<typeof createInboundSpool> | undefined
+if (isGatewayMain) inboundSpool = STATIC
   ? undefined
   : createInboundSpool({
       path: join(STATE_DIR, 'inbound-spool.jsonl'),
@@ -11351,7 +11365,15 @@ if (isGatewayMain && BRIDGE_DEAD_ESCALATION_ENABLED) {
   )
 }
 
-const ipcServer: IpcServer = createIpcServer({
+// #2996 P0e: constructing the IPC server renames/unlinks the socket file and
+// binds a UDS listener (`Bun.listen`) at call time — a hard module-load side
+// effect (and the reason `import(gateway.ts)` threw `Bun is not defined` under
+// vitest). Defer construction past import; it still constructs at the identical
+// boot point in prod, where `isGatewayMain` is true. Definite-assignment `!`:
+// every reader runs only after boot (in a handler / timer / startGateway), so
+// the binding is always populated before first read on the prod path.
+let ipcServer!: IpcServer
+if (isGatewayMain) ipcServer = createIpcServer({
   socketPath: SOCKET_PATH,
 
   onClientRegistered(client: IpcClient) {
@@ -29843,11 +29865,17 @@ async function shutdown(signal: string): Promise<void> {
 
   process.exit(0)
 }
-process.on('SIGTERM', () => void shutdown('SIGTERM'))
-process.on('SIGINT', () => void shutdown('SIGINT'))
+// #2996 P0e: signal handlers route through shutdown() → process.exit; gate on
+// isGatewayMain so a bare import doesn't register exit-reachable handlers.
+if (isGatewayMain) {
+  process.on('SIGTERM', () => void shutdown('SIGTERM'))
+  process.on('SIGINT', () => void shutdown('SIGINT'))
+}
 
 // ─── Stale reaction sweep (gateway crash recovery) ────────────────────────
-{
+// #2996 P0e: the boot-time sweep reads the agent dir and sends reactions —
+// module-load IO. Gate on isGatewayMain (runs verbatim on the prod boot path).
+if (isGatewayMain) {
   const startupAgentDir = resolveAgentDirFromEnv()
   if (startupAgentDir != null) {
     void sweepActiveReactions(
@@ -29895,19 +29923,23 @@ process.on('SIGINT', () => void shutdown('SIGINT'))
 // found") are logged but NOT crashed-on. These leaked through restart loops
 // for klanker (#99) and lawgpt's mid-day crash family — see the unit tests
 // in `tests/unhandled-rejection-policy.test.ts`.
-process.on('unhandledRejection', err => {
-  const action = classifyRejection(err)
-  process.stderr.write(
-    `telegram gateway: unhandled rejection (${action}): ${err}\n`,
-  )
-  if (action === 'shutdown') {
-    void shutdown('unhandledRejection')
-  }
-})
-process.on('uncaughtException', err => {
-  process.stderr.write(`telegram gateway: uncaught exception: ${err}\n`)
-  void shutdown('uncaughtException')
-})
+// #2996 P0e: these route through shutdown() → process.exit; gate on
+// isGatewayMain so importing the module registers no exit-reachable handlers.
+if (isGatewayMain) {
+  process.on('unhandledRejection', err => {
+    const action = classifyRejection(err)
+    process.stderr.write(
+      `telegram gateway: unhandled rejection (${action}): ${err}\n`,
+    )
+    if (action === 'shutdown') {
+      void shutdown('unhandledRejection')
+    }
+  })
+  process.on('uncaughtException', err => {
+    process.stderr.write(`telegram gateway: uncaught exception: ${err}\n`)
+    void shutdown('uncaughtException')
+  })
+}
 
 let runnerHandle: RunnerHandle | null = null
 
