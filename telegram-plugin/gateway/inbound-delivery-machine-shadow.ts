@@ -1,31 +1,29 @@
 /**
- * InboundDeliveryStateMachine — SHADOW MODE wiring (Phase 2b PR 2).
+ * InboundDeliveryStateMachine — live machine state + event driver.
  *
- * Per RFC `reference/rfcs/inbound-delivery-state-machine.md` Phase 2b PR 2:
- * the state machine runs ALONGSIDE the existing imperative gateway
- * code, recording predicted effects to a structured trace. Behavior
- * is unchanged — every existing code path still executes the actual
- * I/O. This module's job:
+ * Historically the "shadow mode" wiring (RFC
+ * `reference/rfcs/inbound-delivery-state-machine.md` Phase 2b PR 2): the
+ * machine ran ALONGSIDE the imperative gateway code, predicting effects
+ * to a structured trace. The #3012 cutover made this state AUTHORITATIVE
+ * for the turn-in-flight gate and the deliver-vs-buffer inbound routing,
+ * and #2996 P1 removed the kill switches (`SWITCHROOM_DELIVERY_MACHINE_SHADOW`,
+ * `SWITCHROOM_DELIVERY_MACHINE_CUTOVER`) — the machine is now the sole
+ * delivery authority. (The `shadowEmit` name is kept for its ~15 gateway
+ * call sites; the `gw-trace shadow` trace prefix is kept for log-parser
+ * continuity.) This module's job:
  *
  *   1. Own the module-scope machine state.
- *   2. Expose `shadowEmit(event)` that runs `transition()` + logs the
- *      predicted effects via `gw-trace shadow ...` stderr lines.
- *   3. Provide test hooks for resetting + inspecting state.
+ *   2. Expose `shadowEmit(event)` that runs `transition()`, advances the
+ *      state, logs via `gw-trace shadow ...` stderr lines, and RETURNS
+ *      the effects for the gateway to execute (`dispatchEffects`).
+ *   3. Expose `isMachineInTurn()` — the authoritative gate read.
+ *   4. Provide test hooks for resetting + inspecting state.
  *
- * After PR 2 bakes on the fleet for 24+ hours, PR 3 will wire the
- * effects to drive ACTUAL behavior (the cutover), at which point the
- * imperative paths get deleted in PR 4.
- *
- * Telemetry approach: each `shadowEmit` writes a single stderr line
- * with the event kind + emitted effect kinds. Operators can then:
+ * Telemetry: each `shadowEmit` writes a single stderr line with the
+ * event kind + emitted effect kinds. Operators can then:
  *
  *   docker exec switchroom-<agent> sh -lc 'grep "gw-trace shadow" \
  *     /var/log/switchroom/gateway-supervisor.log | tail -50'
- *
- * to see what the state machine PREDICTS the gateway should do for
- * each event. Comparing against the actual log lines (`pending-inbound-
- * buffer: agent=X buffered ...` etc.) is the validation that the
- * machine is bit-identical with reality.
  *
  * Trace verbosity (#3025): the TTL `tick` event fires every ~30s and on a
  * healthy idle agent emits a zero-signal `event=tick effects=[]
@@ -36,10 +34,6 @@
  * in `../shared/gw-trace-gate.ts` and also governs the `tg-post` poll
  * heartbeats. Real events, turn-expiring ticks, and in-turn ticks always
  * log regardless of the flag.
- *
- * Toggle off via `SWITCHROOM_DELIVERY_MACHINE_SHADOW=0` — a kill
- * switch for the case where the shadow emits prove problematic
- * (e.g., trace volume too high). The default is ON.
  */
 
 import {
@@ -52,58 +46,36 @@ import {
 import { shouldEmitShadowTrace } from '../shared/gw-trace-gate.js'
 
 let state: State = initialState()
-const enabled = process.env.SWITCHROOM_DELIVERY_MACHINE_SHADOW !== '0'
-
-// Phase 2b PR 3 — STAGED CUTOVER. When enabled, the gateway's
-// "is a turn in flight?" gate reads this machine's global state
-// instead of the PR3b `claudeBusyKeys` set. The machine tracks ONE
-// `activeTurn` (single bridge) plus TTL `tick` expiry, so — unlike a
-// per-delivery key set — it cannot accumulate orphan keys and wedge
-// the gate "in-flight forever" (the gymbro/clerk 5-min dangle of
-// 2026-05-28). Scope is the turn-in-flight GATE only; the poke ladder
-// and perm-verdict effects stay imperative for a follow-up PR.
-//
-// Kill switch: `SWITCHROOM_DELIVERY_MACHINE_CUTOVER=0` reverts every
-// gate to the legacy claudeBusyKeys read (zero behaviour change).
-// Requires shadow mode ON — with shadow off the machine state is
-// frozen and must NOT be read as authoritative.
-const cutoverEnabled = enabled && process.env.SWITCHROOM_DELIVERY_MACHINE_CUTOVER !== '0'
-
-/**
- * True when the kill-switch leaves the delivery machine authoritative
- * for the turn-in-flight gate. Gateway gate sites branch on this.
- */
-export function isDeliveryCutoverEnabled(): boolean {
-  return cutoverEnabled
-}
 
 /**
  * Authoritative "is a turn currently in flight?" read for the gate.
- * Maps the machine's global state to the boolean the legacy
- * `claudeBusyKeys.size > 0` gate produced. `bridge_dead` and
- * `bridge_alive_idle` are both "not in flight".
+ * The machine tracks ONE `activeTurn` (single bridge) plus TTL `tick`
+ * expiry, so — unlike the deleted per-delivery `claudeBusyKeys` set —
+ * it cannot accumulate orphan keys and wedge the gate "in-flight
+ * forever" (the gymbro/clerk 5-min dangle of 2026-05-28). `bridge_dead`
+ * and `bridge_alive_idle` are both "not in flight".
  */
 export function isMachineInTurn(): boolean {
   return state.global.kind === 'bridge_alive_in_turn'
 }
 
 /**
- * Run an event through the state machine in shadow mode. The machine
- * state advances, the predicted effects are LOGGED, but no I/O fires.
- *
- * Returns the effects for callers that want to inspect them inline
- * (e.g., the eventual PR 3 cutover will replace the return-and-ignore
- * pattern here with return-and-execute).
+ * Run an event through the state machine: the machine state advances,
+ * the effects are logged and RETURNED for the caller to execute
+ * (`dispatchEffects` at the live inbound/bridgeUp call sites; the
+ * lifecycle emits — turnStart/turnEnd/modelOutbound/tick — advance state
+ * only and ignore the return, their real-world work still being
+ * imperative per the RFC's open PR3b checklist).
  */
 export function shadowEmit(event: Event): readonly Effect[] {
-  if (!enabled) return []
-  // Shadow mode MUST NEVER break the gateway. The state machine is
-  // pure (no I/O, no async) and property-tested over 5000 schedules,
+  // The machine driver MUST NEVER break the gateway. The state machine
+  // is pure (no I/O, no async) and property-tested over 5000 schedules,
   // so transition() won't throw on well-formed input. But event
   // construction at the call site could mis-shape inputs; the
-  // try/catch is belt-and-braces so a shadow bug never wedges a real
-  // turn. The catch logs and bails — the imperative gateway code
-  // below the emit point still runs.
+  // try/catch is belt-and-braces so a driver bug never wedges a real
+  // turn. The catch logs and bails — the gateway code below the emit
+  // point still runs (falling back to the buffer-everything semantics
+  // of an un-advanced machine).
   try {
     const result = transition(state, event)
     state = result.state
@@ -163,9 +135,4 @@ export function __shadowResetForTests(): void {
 /** Test hook: read the current shadow state. */
 export function __shadowGetStateForTests(): State {
   return state
-}
-
-/** Test hook: check if shadow mode is enabled (mirrors the env-var). */
-export function __shadowEnabledForTests(): boolean {
-  return enabled
 }

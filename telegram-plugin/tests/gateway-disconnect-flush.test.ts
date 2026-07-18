@@ -51,19 +51,6 @@ function makeDeps(agentName: string | null) {
     ['chat1:thr1:msg1', 100],
     ['chat2:thr2:msg2', 200],
   ])
-  // PR3b: claudeBusyKeys tracks turns actually handed to claude. In a
-  // healthy registered-disconnect scenario both maps would carry the
-  // same keys (delivery succeeded); the dangling-sweep tests below
-  // override individual deps to exercise the orphaned-key path.
-  const claudeBusyKeys = new Set<string>([
-    'chat1:thr1:msg1',
-    'chat2:thr2:msg2',
-  ])
-  // #2787: shadow timestamp map, kept in lockstep with claudeBusyKeys.
-  const claudeBusyKeySince = new Map<string, number>([
-    ['chat1:thr1:msg1', 100],
-    ['chat2:thr2:msg2', 200],
-  ])
   const activeDraftStreams = new Map<string, FakeStream>([
     ['chat1:thr1:r1', { isFinal: () => false, finalize: finalizeA }],
     ['chat2:thr2:r2', { isFinal: () => true, finalize: finalizeB }],
@@ -79,8 +66,6 @@ function makeDeps(agentName: string | null) {
       activeStatusReactions,
       activeReactionMsgIds,
       activeTurnStartedAt,
-      claudeBusyKeys,
-      claudeBusyKeySince,
       activeDraftStreams,
       clearActiveReactions,
       disposeProgressDriver,
@@ -202,8 +187,6 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
         ['ghost:thr:msg', { chatId: 'ghost', messageId: 42 }],
       ]),
       activeTurnStartedAt: new Map<string, number>([['ghost:thr:msg', 100]]),
-      claudeBusyKeys: new Set<string>(['ghost:thr:msg']),
-      claudeBusyKeySince: new Map<string, number>([['ghost:thr:msg', 100]]),
       activeDraftStreams: new Map<string, FakeStream>(),
       clearActiveReactions,
       disposeProgressDriver,
@@ -214,10 +197,6 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
 
     flushOnAgentDisconnect(deps)
 
-    // PR3b: claudeBusyKeys swept alongside the activeTurnStartedAt
-    // dangling entry — both maps mirror each other on registered
-    // disconnects, so a key in one is always a key in the other.
-    expect(deps.claudeBusyKeys.size).toBe(0)
     // The sweep fired and cleared the dangling entry.
     expect(deps.activeTurnStartedAt.size).toBe(0)
     expect(deps.activeReactionMsgIds.size).toBe(0)
@@ -261,8 +240,6 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
       activeStatusReactions: new Map<string, FakeCtrl>(),
       activeReactionMsgIds: new Map<string, { chatId: string; messageId: number }>(),
       activeTurnStartedAt: new Map<string, number>([['real-turn:thr:msg', 100]]),
-      claudeBusyKeys: new Set<string>(['real-turn:thr:msg']),
-      claudeBusyKeySince: new Map<string, number>([['real-turn:thr:msg', 100]]),
       activeDraftStreams: new Map<string, FakeStream>(),
       clearActiveReactions: vi.fn(),
       disposeProgressDriver: vi.fn(),
@@ -278,109 +255,11 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
     expect(onDanglingTurnsSwept).not.toHaveBeenCalled()
   })
 
-  // PR3b orphan-sweep regression: synthetic-inbound deliveries
-  // (cron, reactions, vault, button-callback) bypass handleInbound's
-  // fresh-turn branch and so never stamp activeTurnStartedAt. They
-  // DO mark claudeBusyKeys. If their turn dies without turn_end, the
-  // activeTurnStartedAt-keyed dangling sweep misses them — orphan
-  // persists in claudeBusyKeys → fleet gate wedges. This test pins
-  // the post-sweep claudeBusyKeys.clear() fix.
-  it('sweeps claudeBusyKeys orphans that have NO activeTurnStartedAt entry (PR3b follow-up)', () => {
-    const onDanglingTurnsSwept = vi.fn()
-    const log = vi.fn()
-    const deps = {
-      agentName: 'clerk',
-      activeStatusReactions: new Map<string, FakeCtrl>(),
-      activeReactionMsgIds: new Map<string, { chatId: string; messageId: number }>(),
-      activeTurnStartedAt: new Map<string, number>(),
-      // The orphan scenario: claude was handed a turn (e.g. cron
-      // synthetic delivered), so claudeBusyKeys has it, but
-      // activeTurnStartedAt was never set because cron bypasses
-      // handleInbound's fresh-turn branch.
-      claudeBusyKeys: new Set<string>(['cron-only-key:_']),
-      claudeBusyKeySince: new Map<string, number>([['cron-only-key:_', 100]]),
-      activeDraftStreams: new Map<string, FakeStream>(),
-      clearActiveReactions: vi.fn(),
-      disposeProgressDriver: vi.fn(),
-      stopTurnTypingLoops: vi.fn(),
-      onDanglingTurnsSwept,
-      log,
-    }
-
-    flushOnAgentDisconnect(deps)
-
-    // The orphan is cleared even though it never had an
-    // activeTurnStartedAt entry.
-    expect(deps.claudeBusyKeys.size).toBe(0)
-    // The activeTurnStartedAt-keyed sweep wasn't fired (nothing in
-    // that map to sweep) — so onDanglingTurnsSwept shouldn't fire
-    // either. The orphan sweep is a separate observation.
-    expect(onDanglingTurnsSwept).not.toHaveBeenCalled()
-    // But it logs the orphan-clear so operators can see it.
-    expect(
-      log.mock.calls.some((c: unknown[]) =>
-        typeof c[0] === 'string' && /orphan claudeBusyKeys/.test(c[0]),
-      ),
-    ).toBe(true)
-  })
-
-  it('orphan-sweep singular vs plural log message agrees with count', () => {
-    // Tiny grammar regression: "1 entry" vs "2 entries".
-    const log = vi.fn()
-    const baseDeps = {
-      agentName: 'clerk',
-      activeStatusReactions: new Map<string, FakeCtrl>(),
-      activeReactionMsgIds: new Map<string, { chatId: string; messageId: number }>(),
-      activeTurnStartedAt: new Map<string, number>(),
-      activeDraftStreams: new Map<string, FakeStream>(),
-      clearActiveReactions: vi.fn(),
-      disposeProgressDriver: vi.fn(),
-      stopTurnTypingLoops: vi.fn(),
-    }
-    // Singular form.
-    flushOnAgentDisconnect({
-      ...baseDeps,
-      claudeBusyKeys: new Set<string>(['k1:_']),
-      claudeBusyKeySince: new Map<string, number>([['k1:_', 100]]),
-      log,
-    })
-    expect(log.mock.calls.some((c: unknown[]) =>
-      typeof c[0] === 'string' && / 1 orphan claudeBusyKeys entry /.test(c[0]),
-    )).toBe(true)
-    // Plural form.
-    log.mockClear()
-    flushOnAgentDisconnect({
-      ...baseDeps,
-      claudeBusyKeys: new Set<string>(['k1:_', 'k2:1']),
-      claudeBusyKeySince: new Map<string, number>([['k1:_', 100], ['k2:1', 100]]),
-      log,
-    })
-    expect(log.mock.calls.some((c: unknown[]) =>
-      typeof c[0] === 'string' && / 2 orphan claudeBusyKeys entries /.test(c[0]),
-    )).toBe(true)
-  })
-
-  it('does NOT fire orphan-sweep log when claudeBusyKeys is empty', () => {
-    // Zero-noise discipline: every disconnect for a healthy idle
-    // agent shouldn't produce a "0 orphan claudeBusyKeys" line.
-    const log = vi.fn()
-    flushOnAgentDisconnect({
-      agentName: 'clerk',
-      activeStatusReactions: new Map<string, FakeCtrl>(),
-      activeReactionMsgIds: new Map<string, { chatId: string; messageId: number }>(),
-      activeTurnStartedAt: new Map<string, number>(),
-      claudeBusyKeys: new Set<string>(),
-      claudeBusyKeySince: new Map<string, number>(),
-      activeDraftStreams: new Map<string, FakeStream>(),
-      clearActiveReactions: vi.fn(),
-      disposeProgressDriver: vi.fn(),
-      stopTurnTypingLoops: vi.fn(),
-      log,
-    })
-    expect(log.mock.calls.some((c: unknown[]) =>
-      typeof c[0] === 'string' && /orphan claudeBusyKeys/.test(c[0]),
-    )).toBe(false)
-  })
+  // (#2996 P1) The PR3b claudeBusyKeys orphan-sweep tests that lived here
+  // were deleted with the set itself — the delivery machine's bridgeDown
+  // event (emitted by the gateway alongside this flush) structurally
+  // clears the turn-in-flight gate for synthetic-delivered turns that
+  // died without a turn_end.
 
   it('omitting onDanglingTurnsSwept is safe (optional callback)', () => {
     // Backward-compat guard — existing callers that don't pass the new
@@ -390,8 +269,6 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
       activeStatusReactions: new Map<string, FakeCtrl>(),
       activeReactionMsgIds: new Map<string, { chatId: string; messageId: number }>(),
       activeTurnStartedAt: new Map<string, number>([['ghost:thr:msg', 100]]),
-      claudeBusyKeys: new Set<string>(['ghost:thr:msg']),
-      claudeBusyKeySince: new Map<string, number>([['ghost:thr:msg', 100]]),
       activeDraftStreams: new Map<string, FakeStream>(),
       clearActiveReactions: vi.fn(),
       disposeProgressDriver: vi.fn(),

@@ -441,7 +441,6 @@ import {
 } from '../active-reactions.js'
 import { sweepActiveReactions } from '../active-reactions-sweep.js'
 import { flushOnAgentDisconnect } from './disconnect-flush.js'
-import { markBusyKeyLockstep, reapOrphanBusyKeys } from './busy-key-reaper.js'
 import { PreambleSuppressor } from './preamble-suppressor.js'
 import {
   fetchFolderPage,
@@ -664,15 +663,14 @@ import {
 } from './inbound-delivery-confirm.js'
 import { createPendingPermissionBuffer } from './pending-permission-decisions.js'
 import { chatKey, chatKeyWithSuffix, chatIdOfChatKey } from './chat-key.js'
-// Phase 2b PR 2 — shadow mode. Each event-site below calls shadowEmit()
-// to record what the InboundDeliveryStateMachine PREDICTS the gateway
-// should do. Behavior unchanged in this PR — the imperative code below
-// still runs everything. PR 3 will cut over to executing the machine's
-// effects.
-import { shadowEmit, isMachineInTurn, isDeliveryCutoverEnabled } from './inbound-delivery-machine-shadow.js'
+// Delivery state machine (#2794 cutover, kill switch removed in #2996 P1).
+// Each event-site below calls shadowEmit() to advance the machine; the
+// machine is the SOLE authority for the turn-in-flight gate and for the
+// deliver-vs-buffer inbound routing (modulo the two documented twin
+// carve-outs at the handleInbound delivery site).
+import { shadowEmit, isMachineInTurn } from './inbound-delivery-machine-shadow.js'
 import type { ChatKey as _ChatKey } from './inbound-delivery-machine.js'
-import { dispatchEffects, isDispatchEnabled } from './inbound-delivery-machine-dispatch.js'
-import { probeGateParity } from './gate-parity-probe.js'
+import { dispatchEffects } from './inbound-delivery-machine-dispatch.js'
 import { maybeFireWarmup } from './prefix-warmup.js'
 import { renderMentalModelProposeCard } from './mental-model-propose-card.js'
 import { readDeclaredMentalModelNames } from './mental-model-propose-diff.js'
@@ -2472,33 +2470,13 @@ async function deliverAnswer(args: {
 const chatAvailableReactions = new Map<string, Set<string> | null>()
 const chatProbesInFlight = new Set<string>()
 const activeTurnStartedAt = new Map<string, number>()
-// PR3b parallel-turns: tracks turns claude has ACTUALLY been handed
-// (set after successful sendToAgent, cleared on turn_end), as opposed
-// to activeTurnStartedAt which is set eagerly on inbound receipt to
-// stamp the user-visible turn start time. Under fleet-shared and DM
-// topologies these are equivalent — every received inbound is delivered.
-// Under supergroup-owned (one agent owns the whole supergroup, multiple
-// topics share this gateway process), topic B's inbound that arrives
-// while topic A is processing gets buffered; without this split, keyB
-// stays in activeTurnStartedAt forever (no turn_end ever fires for a
-// turn claude never started), so the fleet-wide "claude is idle" gate
-// at purgeReactionTracking/releaseTurnBufferGate never re-opens — the
-// canonical supergroup-mode deadlock. Fleet gates read claudeBusyKeys;
-// per-key reads (status-query metric, wedge detection, etc.) keep
-// reading activeTurnStartedAt because they want the receipt timestamp.
-const claudeBusyKeys = new Set<string>()
-
-// #2787 Mechanism B — insertion timestamps for the busy keys above, so the
-// confirm sweep can reap an orphaned marker. `busy` is stamped EAGERLY at
-// delivery and cleared only at turn_end; a delivered-but-never-enqueued inbound
-// (e.g. a composer strand or an enqueue-ack mismatch) therefore leaves its key
-// stuck forever, wedging the legacy-regime idle-drain (turnInFlightForGate reads
-// claudeBusyKeys.size) for EVERY topic until the ~300s silence poke — the
-// 5-minute all-topics stall of #1922. The reaper (reapOrphanBusyKeys) uses these
-// timestamps to bound that dangle. The delivery-machine cutover regime is already
-// immune (it tracks one activeTurn + TTL tick, never a per-key set); this bounds
-// the legacy path it hasn't replaced yet.
-const claudeBusyKeySince = new Map<string, number>()
+// #2996 P1: the legacy PR3b `claudeBusyKeys` set + its #2787 orphan reaper
+// were deleted here — the delivery machine (single activeTurn + TTL tick,
+// structurally immune to per-key orphan dangles) is the sole turn-in-flight
+// authority now. Fleet gates read `isMachineInTurn()` via
+// turnInFlightForGate(); per-key reads (status-query metric, wedge
+// detection, etc.) keep reading activeTurnStartedAt because they want the
+// receipt timestamp.
 
 /**
  * #2527 observability: count emoji transitions per status-reaction controller
@@ -2516,13 +2494,16 @@ const reactionTransitionCounts = new Map<string, number>()
 const firstTextReplyLogged = new Set<string>()
 
 /**
- * Helper: stamp a claudeBusyKeys entry for an inbound about to be
- * handed to claude. Pulls the thread id from the top-level field if
- * present, otherwise falls back to meta.message_thread_id (cron and
- * vault-synthetic inbounds put it there). chatKey canonicalises
- * null/undefined/0 to `_` so callers don't need to think about it.
+ * Helper: canonical chat key for an inbound about to be handed to claude —
+ * the key the delivery-confirm tracker matches `enqueue` acks against.
+ * Pulls the thread id from the top-level field if present, otherwise falls
+ * back to meta.message_thread_id (cron and vault-synthetic inbounds put it
+ * there). chatKey canonicalises null/undefined/0 to `_` so callers don't
+ * need to think about it. (#2996 P1: this replaced the deleted
+ * `markClaudeBusyForInbound` twin — same key derivation, no busy-set
+ * side effect; the delivery machine owns the turn-in-flight fact.)
  */
-function markClaudeBusyForInbound(m: {
+function chatKeyForInbound(m: {
   chatId: string
   threadId?: number
   meta?: Record<string, string>
@@ -2532,67 +2513,7 @@ function markClaudeBusyForInbound(m: {
     const n = Number(m.meta.message_thread_id)
     if (Number.isFinite(n)) tid = n
   }
-  const key = chatKey(m.chatId, tid)
-  // #2787: lockstep add + idle→busy timestamp. Keyed on set membership (see
-  // busy-key-reaper.ts) so a re-mark after a disconnect flush (which cleared
-  // claudeBusyKeys directly) always re-stamps a fresh Date.now() and the orphan
-  // TTL measures the CURRENT dangle, never a stale pre-disconnect timestamp.
-  markBusyKeyLockstep(claudeBusyKeys, claudeBusyKeySince, key, Date.now())
-  return key
-}
-
-// #2787 Mechanism B — reap orphaned busy markers. Called from the confirm sweep
-// ONLY once `currentTurn == null` has been asserted: with no turn in flight, any
-// surviving claudeBusyKeys entry is definitionally an orphan (a real turn would
-// hold currentTurn non-null), so clearing a stale one can never clobber a live
-// turn. Also prunes timestamp entries whose key already left the set (e.g. a
-// disconnect flush cleared claudeBusyKeys directly) so the map can't grow
-// unbounded.
-//
-// SLOW-DELIVERY SAFETY (the #1922 hazard): `currentTurn == null` is NOT proof of
-// idle — busy is marked EAGERLY at delivery, and the gateway→claude enqueue-ack
-// lag can be up to ~5 MINUTES under load (#1922). During that eager-mark→enqueue
-// window `currentTurn` is null yet the turn is real-and-merely-slow, so a bare
-// time-grace reaper could reap a genuine delivery and re-open the idle-drain gate
-// while claude is about to process the very inbound whose key it just reaped
-// (duplicate / concurrent delivery on the CORE inbound path). A time grace alone
-// cannot distinguish "slow" from "orphaned".
-//
-// So the reap is PROOF-GATED, not just time-gated (option (b), the load-bearing
-// guarantee): a key is reaped ONLY when it has NO corresponding entry in the
-// delivery-confirm queue (`deliveryQueue.pending`). A slow-but-real inbound is
-// tracked there from delivery until claude's `enqueue` ack lands (or forever, via
-// the never-drop re-deliver loop), so any key still awaiting its turn is present
-// and skipped — no matter how slow. Only a key that is busy-marked yet has no
-// pending delivery is a TRUE orphan: either it was acked (its turn ran and should
-// have cleared busy at turn_end — a genuinely stuck marker) or it was a
-// steer/interrupt inbound that shouldTrackDelivery excludes (it amends a running
-// turn, so with currentTurn == null its marker is likewise stale). Reaping only
-// these can never clobber a slow delivery.
-//
-// The time grace is retained as defense-in-depth on top of the proof gate, raised
-// to a default well above the observed enqueue-ack lag and env-tunable via the
-// config cascade. This bounds the legacy-regime idle-drain wedge from ~300s
-// (silence poke) to the grace window without racing a slow delivery.
-//
-// Config cascade: SWITCHROOM_BUSY_ORPHAN_TTL_MS is an OVERRIDE-mode scalar
-// (defaults → profiles → agents; a lower layer's value replaces, not merges).
-// Default 360_000ms (6 min) — comfortably above the ~5-min #1922 tail so the
-// grace never trips on a merely-slow delivery even if the proof gate is bypassed.
-// Clamped to a positive finite value; a degenerate override falls back to default.
-const _busyOrphanTtlRaw = process.env.SWITCHROOM_BUSY_ORPHAN_TTL_MS
-const _busyOrphanTtlParsed =
-  _busyOrphanTtlRaw != null && _busyOrphanTtlRaw !== '' ? Number(_busyOrphanTtlRaw) : 360_000
-const CLAUDE_BUSY_ORPHAN_TTL_MS =
-  Number.isFinite(_busyOrphanTtlParsed) && _busyOrphanTtlParsed > 0 ? _busyOrphanTtlParsed : 360_000
-function reapOrphanBusyKeysNow(now: number): void {
-  reapOrphanBusyKeys(claudeBusyKeys, claudeBusyKeySince, now, {
-    ttlMs: CLAUDE_BUSY_ORPHAN_TTL_MS,
-    // Proof gate — a key still tracked in the delivery-confirm queue is a
-    // slow-but-real inbound awaiting its enqueue ack, never an orphan (#1922).
-    hasPendingDelivery: (key) => deliveryQueue.pending.has(key),
-    log: (msg) => process.stderr.write(`${msg}\n`),
-  })
+  return chatKey(m.chatId, tid)
 }
 
 // ─── Reliable inbound delivery: deliver-until-acked (the marko drop-wedge) ─
@@ -2797,25 +2718,12 @@ const obligationEscalateInFlight = new Set<string>()
 // drain on the bare turn-end signal.
 const SERIALIZE_UNTIL_REPLIED_ENABLED =
   process.env.SWITCHROOM_SERIALIZE_UNTIL_REPLIED !== '0'
-// #2917 — rapid-fire per-chat FIFO. The #1556 delivery gate documents its
-// `turnInFlight` input as a LIVE read ("evaluated at delivery time — not a
-// receipt-time snapshot"), but handleInbound passes a receipt-time snapshot
-// (`turnInFlightAtReceipt`) taken at function entry. Under rapid-fire two
-// same-chat inbounds each snapshot "idle" during the other's async lead-in
-// (attachment download, composer-clear), both pass the gate, and both are
-// delivered — so replies come back reordered (observed 1,2,4,5,3,7,8,6). The
-// fix reads the gate LIVE off `claudeBusyKeys` (which does NOT yet contain
-// THIS inbound's own key — that is only marked at delivery — so it can't
-// self-block) AND reserves the key synchronously BEFORE the composer-clear
-// await, so a concurrent same-chat inbound observes the reservation and
-// buffers behind it, preserving FIFO. Nothing is dropped: a buffered inbound
-// drains on turn-complete / idle exactly as before. Kill switch (=0) restores
-// the receipt-snapshot behaviour. Only the non-cutover path is affected — the
-// delivery-machine cutover keeps its own at-receipt machine snapshot (reading
-// the machine live WOULD self-block, since its inbound event already advanced
-// it for this key).
-const SERIALIZE_INBOUND_DELIVERY_ENABLED =
-  process.env.SWITCHROOM_SERIALIZE_INBOUND_DELIVERY !== '0'
+// #2917 rapid-fire per-chat FIFO note (#2996 P1): the legacy live-read +
+// synchronous busy-key reservation (`SWITCHROOM_SERIALIZE_INBOUND_DELIVERY`)
+// was deleted with the claudeBusyKeys set — under the delivery machine the
+// inbound event advances the machine SYNCHRONOUSLY at the emit (idle→
+// in_turn), so the machine itself is the pre-await reservation and a
+// concurrent same-chat inbound observes it at its own receipt snapshot.
 // Component 2 (bounded no-reply escape hatch). A turn that legitimately
 // ends with NO reply (handback ack, NO_REPLY marker, silent-end) sets
 // finalAnswerDelivered=false and would block the serialize gate forever.
@@ -2948,22 +2856,20 @@ const POST_ANSWER_LIVENESS_STALE_MS = parsePostAnswerLivenessMs(
 // the CURRENT step's own elapsed, shown only past STEP_TIMER_MIN_MS (10 s).
 
 /**
- * Authoritative "is a turn in flight?" for every gate that previously
- * read `claudeBusyKeys.size`. PR 3b cutover (extends PR 3a's bridgeUp
- * dispatch): when the delivery state machine is authoritative
- * (`SWITCHROOM_DELIVERY_MACHINE_CUTOVER` on + shadow on) the answer is
- * its single-`activeTurn` global state, which — unlike the
- * per-delivery `claudeBusyKeys` set — cannot accumulate orphan keys and
- * wedge the gate "in-flight forever" (the gymbro/clerk 5-min dangle,
- * 2026-05-28). Kill-switch off → exact legacy claudeBusyKeys behaviour.
+ * Authoritative "is a turn in flight?" for every fleet-wide gate. The
+ * delivery state machine's single-`activeTurn` global state is the sole
+ * authority (#2794 cutover, kill switch + legacy `claudeBusyKeys` shadow
+ * deleted in #2996 P1) — unlike a per-delivery key set it cannot
+ * accumulate orphan keys and wedge the gate "in-flight forever" (the
+ * gymbro/clerk 5-min dangle, 2026-05-28).
  *
- * NOT for the inbound-receipt gate (line ~8551): that must snapshot the
+ * NOT for the inbound-receipt gate: that must snapshot the
  * machine state BEFORE the inbound event advances it, or a fresh-turn
  * message self-blocks. See the snapshot at the inbound handler.
  */
 function turnInFlightForGate(): boolean {
   // Include pendingPermissions in the "turn busy" signal (#2841): after the
-  // first interim reply, `releaseTurnBufferGate` clears claudeBusyKeys/machine
+  // first interim reply, `releaseTurnBufferGate` clears the machine turn
   // even though a permission card is still outstanding and claude is still
   // blocked mid-turn waiting for the tap verdict. A new inbound that arrives
   // in this window would see turnInFlightAtReceipt=false and deliver directly,
@@ -3005,14 +2911,11 @@ function turnInFlightForGate(): boolean {
  * idle session (#3262), even though it correctly holds the general inbound gate.
  */
 function turnInFlightMachineOnly(): boolean {
-  if (!isDeliveryCutoverEnabled()) return claudeBusyKeys.size > 0
-  // Machine is authoritative. Run the log-only drift canary (#2794): the
-  // imperative `claudeBusyKeys` shadow is still live in parallel, so a
-  // dangerous over-hold divergence (machine holds the gate while the
-  // imperative view is idle) is surfaced without changing behaviour. The
-  // benign orphan-dangle direction — the wedge the machine self-heals — is
-  // NOT flagged. `probeGateParity` returns the machine value unchanged.
-  return probeGateParity(isMachineInTurn(), claudeBusyKeys.size)
+  // The machine is the sole authority (#2996 P1): the legacy claudeBusyKeys
+  // read, the kill-switch branch, and the gate-parity drift canary were
+  // deleted once the #3012 cutover baked — see gate-parity-probe.ts history
+  // for the bake-era drift classification.
+  return isMachineInTurn()
 }
 
 /**
@@ -3112,8 +3015,7 @@ function deliverResumeSyntheticOrBuffer(agent: string, inbound: InboundMessage):
     return false
   }
   const delivered = ipcServer.sendToAgent(agent, inbound)
-  if (delivered) markClaudeBusyForInbound(inbound)
-  else pendingInboundBuffer.push(agent, inbound)
+  if (!delivered) pendingInboundBuffer.push(agent, inbound)
   return delivered
 }
 
@@ -3154,7 +3056,7 @@ async function deliverButtonTapInbound(
   // resume-synthetic path uses. Mid-turn → hold in the pending-inbound buffer;
   // the turn-complete hook + idle-drain timer flush it when claude goes idle,
   // where it lands cleanly as a fresh turn instead of stranding in the composer.
-  const { decision, reserve } = reserveInboundDelivery({
+  const { decision } = reserveInboundDelivery({
     turnInFlight: turnInFlightForGate(),
     isSteering: false,
     isInterrupt: false,
@@ -3162,14 +3064,6 @@ async function deliverButtonTapInbound(
   if (decision === 'buffer-until-idle') {
     pendingInboundBuffer.push(agent, inbound)
     return 'buffered-mid-turn'
-  }
-  // #2917 per-chat FIFO: reserve the chat's busy key SYNCHRONOUSLY — before the
-  // composer-clear await below — so a concurrent same-chat inbound reaching the
-  // live gate observes this in-flight delivery and buffers behind it. Released
-  // in lockstep below if the send misses (bridge offline).
-  let reservedBusyKey: string | null = null
-  if (reserve && SERIALIZE_INBOUND_DELIVERY_ENABLED) {
-    reservedBusyKey = markClaudeBusyForInbound(inbound)
   }
   // Pre-send composer clear (the marko wedge) — wipe stale typed-ahead / ghost
   // text so the channel notification lands at a clean line and auto-submits.
@@ -3191,7 +3085,7 @@ async function deliverButtonTapInbound(
   }
   const delivered = ipcServer.sendToAgent(agent, inbound)
   if (delivered) {
-    const busyKey = reservedBusyKey ?? markClaudeBusyForInbound(inbound)
+    const busyKey = chatKeyForInbound(inbound)
     // Track until claude acks via `enqueue` so the deliver-until-acked sweep
     // re-delivers a tap stranded in the composer. Only when we have a real
     // message_id to match the ack against — otherwise the never-drop loop storms.
@@ -3210,13 +3104,8 @@ async function deliverButtonTapInbound(
     }
     return 'delivered'
   }
-  // Bridge offline: release the synchronous reservation in lockstep (else the
-  // orphaned busy key gates every later inbound into the buffer), then spool the
-  // tap so it replays on reconnect — same behaviour as before this fix.
-  if (reservedBusyKey != null) {
-    claudeBusyKeys.delete(reservedBusyKey)
-    claudeBusyKeySince.delete(reservedBusyKey)
-  }
+  // Bridge offline: spool the tap so it replays on reconnect — same
+  // behaviour as before this fix.
   pendingInboundBuffer.push(agent, inbound)
   return 'buffered-bridge-offline'
 }
@@ -4475,9 +4364,7 @@ async function fireDeferredInterrupt(reason: 'boundary' | 'timeout'): Promise<vo
   // bridge — same sendToAgent + buffer-on-miss primitive the synchronous
   // interrupt carve-out uses at the handleInbound delivery site.
   const delivered = ipcServer.sendToAgent(pending.agentName, pending.inboundMsg)
-  if (delivered) {
-    markClaudeBusyForInbound(pending.inboundMsg)
-  } else {
+  if (!delivered) {
     pendingInboundBuffer.push(pending.agentName, pending.inboundMsg)
     process.stderr.write(
       `telegram gateway: deferred-interrupt body buffered (bridge miss) agent=${pending.agentName} chat=${pending.chatId}\n`,
@@ -4791,11 +4678,7 @@ function performBufferDrain(reason: string): void {
   const fr = redeliverBufferedInbound(
     pendingInboundBuffer,
     selfAgentForFlush,
-    (m) => {
-      const d = ipcServer.sendToAgent(selfAgentForFlush, m)
-      if (d) markClaudeBusyForInbound(m)
-      return d
-    },
+    (m) => ipcServer.sendToAgent(selfAgentForFlush, m),
     inboundSpool,
     trackRedeliveredInbound,
   )
@@ -4919,11 +4802,6 @@ function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
     clearTimeout(busyAckRecheck)
     busyAckRecheckTimers.delete(key)
   }
-  // PR3b: clear the parallel-turns fleet-gate entry. Symmetric with
-  // the markClaudeBusyForInbound on the delivery path. Safe no-op
-  // when the key was never marked (synthetic purge from a sweep).
-  claudeBusyKeys.delete(key)
-  claudeBusyKeySince.delete(key) // #2787: keep the orphan-TTL map in lockstep
   // #2527: clear the per-key reaction-transition counter and first-reply
   // sentinel alongside the controller so we don't leak state across turns.
   reactionTransitionCounts.delete(key)
@@ -4987,15 +4865,11 @@ function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
   // response to the client was already sent when the restart was
   // scheduled, so nobody is waiting on this.
   //
-  // PR3b: gated on `claudeBusyKeys.size`, not `activeTurnStartedAt.size`,
-  // so a buffered topic-B inbound (which had eagerly set its own
-  // activeTurnStartedAt entry in the fresh-turn branch) doesn't pin this
-  // gate forever while claude is genuinely idle. See the claudeBusyKeys
-  // declaration for the supergroup deadlock this fixes.
-  // PR3b-cutover: `turnInFlightForGate()` reads the delivery machine
-  // when the cutover kill-switch is on; the turnEnd event was emitted
-  // just above (purgeReactionTracking head), so the machine is already
-  // idle here.
+  // Gated on the delivery machine (turns claude has actually been handed),
+  // not `activeTurnStartedAt.size` (receipt-eager), so a buffered topic-B
+  // inbound doesn't pin this gate forever while claude is genuinely idle
+  // (the supergroup deadlock). The turnEnd event was emitted just above
+  // (purgeReactionTracking head), so the machine is already idle here.
   // #1556: the deterministic delivery point. claude has just gone idle —
   // flush any inbound held mid-turn so the channel notification lands at
   // the idle prompt and submits as a fresh turn (instead of stranding in
@@ -5113,10 +4987,6 @@ function snapshotContextOccupancy(): void {
 function releaseTurnBufferGate(key: string, endingTurn?: CurrentTurn): void {
   if (!activeTurnStartedAt.has(key)) return
   activeTurnStartedAt.delete(key)
-  // PR3b: keep claudeBusyKeys in sync — same lifecycle as the
-  // activeTurnStartedAt entry it's mirroring here.
-  claudeBusyKeys.delete(key)
-  claudeBusyKeySince.delete(key) // #2787: keep the orphan-TTL map in lockstep
   // Shadow trace so the structural turn-end metric still records.
   // outboundEmitted=true is correct here — we only reach this from
   // executeReply AFTER an outbound landed.
@@ -10296,11 +10166,7 @@ if (isGatewayMain) silencePoke.startTimer({
     const fbRedeliver = redeliverBufferedInbound(
       pendingInboundBuffer,
       fbSelfAgent,
-      (m) => {
-        const d = ipcServer.sendToAgent(fbSelfAgent, m)
-        if (d) markClaudeBusyForInbound(m)
-        return d
-      },
+      (m) => ipcServer.sendToAgent(fbSelfAgent, m),
       inboundSpool,
       trackRedeliveredInbound,
     )
@@ -10413,11 +10279,9 @@ async function redeliverStrandedInbound(p: PendingDelivery<InboundMessage>): Pro
   } catch { /* best-effort; re-deliver regardless */ }
   const ok = ipcServer.sendToAgent(selfAgent, p.inbound)
   if (ok) {
-    // Keep the #1556 gate coherent with the re-sent delivery, and survive an
-    // ack that raced the `await import` above: only `enqueue` clears tracking,
-    // so if a concurrent ack removed the entry, re-affirm it — never drop.
-    // Both ops are idempotent.
-    markClaudeBusyForInbound(p.inbound)
+    // Survive an ack that raced the `await import` above: only `enqueue`
+    // clears tracking, so if a concurrent ack removed the entry, re-affirm
+    // it — never drop. Idempotent.
     if (!deliveryQueue.pending.has(p.key)) {
       trackDelivery(deliveryQueue, p.key, p.inbound, Date.now(), p.messageId)
     }
@@ -10465,12 +10329,10 @@ const _deliveryConfirmSweep = isGatewayMain ? setInterval(() => {  // #2996 P0c 
   // by the enqueue session-event and nulled at turn-end, so `currentTurn != null`
   // means a real turn is in flight — re-clearing the composer + re-sending now
   // would clobber it (the exact mid-turn wedge this queue exists to prevent).
-  // NB: claudeBusyKeys (turnInFlightForGate) is set EAGERLY at delivery and
-  // stays set through a strand, so it is NOT a usable "idle" signal here.
+  // NB: the machine's in-turn state (turnInFlightForGate) is advanced EAGERLY
+  // at delivery and stays set through a strand until the TTL tick, so it is
+  // NOT a usable "idle" signal here.
   if (currentTurn != null) return
-  // #2787 Mechanism B: no turn in flight → reap any orphaned busy marker so a
-  // delivered-but-never-enqueued inbound can't wedge the idle-drain globally.
-  reapOrphanBusyKeysNow(Date.now())
   // #2787 Mechanism A: a pending permission / ask_user card suspends re-delivery
   // ONLY for its own chat/topic — never globally. Skip just the stranded entries
   // whose target holds a live card; sweep the rest so unrelated topics keep
@@ -10630,9 +10492,9 @@ const pendingInboundBuffer = createPendingInboundBuffer({
 // delivered | bounded give-up (no cycle re-increments a counter). This sweep is
 // the FSM's driver; its termination rests on three liveness facts, all bounded:
 //   (1) the 5s setInterval keeps firing;
-//   (2) the gate (turnInFlightForGate) opens — claudeBusyKeys is cleared at
+//   (2) the gate (turnInFlightForGate) opens — the machine turn is cleared at
 //       turn-end (purgeReactionTracking / releaseTurnBufferGate), on bridge
-//       disconnect (disconnect-flush.ts), and by the 300s silence-poke watchdog;
+//       disconnect (bridgeDown), and by the machine's 5-min TTL tick;
 //   (3) the escalation send settles — bounded BY CONSTRUCTION via withDeadline
 //       below (grammy has no request timeout, so an unbounded send was the one
 //       way an obligation could get stuck OPEN forever — now closed);
@@ -11541,52 +11403,19 @@ const ipcServer: IpcServer = createIpcServer({
     // bridges never registered an identity and can't have accumulated
     // buffered inbounds keyed by name).
     if (client.agentName != null) {
-      if (isDispatchEnabled()) {
-        dispatchEffects(bridgeUpEffects, {
-          selfAgent: client.agentName,
-          ipcServer,
-          pendingInboundBuffer,
-          inboundSpool: inboundSpool ?? null,
-          pendingPermissionBuffer,
-          client,
-          // Enrol each drained user inbound in the deliver-until-acked queue
-          // so the 5s sweep re-delivers until claude's `enqueue` ack lands —
-          // a socket-write into a still-booting session is NOT consumption
-          // (clerk lost-message incident, 2026-06-03).
-          onUserInboundDelivered: trackRedeliveredInbound,
-        })
-      } else {
-        // Kill-switch fallback: imperative drain (parity with pre-cutover
-        // behavior). Kept for SWITCHROOM_DELIVERY_MACHINE_CUTOVER=0
-        // rollback safety; deleted in PR 4 once the cutover bakes.
-        const pending = pendingInboundBuffer.drain(client.agentName)
-        for (const msg of pending) {
-          try {
-            client.send(msg)
-            inboundSpool?.ack(msg)
-            // Same enrol as the cutover drain path: a socket-write success is
-            // not proof claude consumed it — enrol so the sweep re-delivers
-            // until `enqueue` (clerk lost-message incident, 2026-06-03).
-            trackRedeliveredInbound(msg)
-          } catch (err) {
-            process.stderr.write(
-              `telegram gateway: pending-inbound drain failed agent=${client.agentName} ` +
-              `source=${msg.meta?.source ?? '-'}: ${(err as Error).message}\n`,
-            )
-          }
-        }
-        const pendingVerdicts = pendingPermissionBuffer.drain(client.agentName)
-        for (const ev of pendingVerdicts) {
-          try {
-            client.send(ev)
-          } catch (err) {
-            process.stderr.write(
-              `telegram gateway: pending-permission drain failed agent=${client.agentName} ` +
-              `request=${ev.requestId} behavior=${ev.behavior}: ${(err as Error).message}\n`,
-            )
-          }
-        }
-      }
+      dispatchEffects(bridgeUpEffects, {
+        selfAgent: client.agentName,
+        ipcServer,
+        pendingInboundBuffer,
+        inboundSpool: inboundSpool ?? null,
+        pendingPermissionBuffer,
+        client,
+        // Enrol each drained user inbound in the deliver-until-acked queue
+        // so the 5s sweep re-delivers until claude's `enqueue` ack lands —
+        // a socket-write into a still-booting session is NOT consumption
+        // (clerk lost-message incident, 2026-06-03).
+        onUserInboundDelivered: trackRedeliveredInbound,
+      })
     }
 
     // Prefix-cache warmup (cold-start TTFO RFC, opt-in via
@@ -11739,8 +11568,6 @@ const ipcServer: IpcServer = createIpcServer({
       activeStatusReactions,
       activeReactionMsgIds,
       activeTurnStartedAt,
-      claudeBusyKeys,
-      claudeBusyKeySince,
       activeDraftStreams,
       clearActiveReactions: () => {
         const ad = resolveAgentDirFromEnv()
@@ -12045,10 +11872,9 @@ const ipcServer: IpcServer = createIpcServer({
     const { agentName } = msg;
 
     // Check if any turn is currently in flight.
-    // PR3b: gated on claudeBusyKeys (actually-handed-to-claude turns)
+    // Gated on the delivery machine (actually-handed-to-claude turns)
     // not activeTurnStartedAt (receipt-eager), so a buffered topic-B
     // inbound doesn't pin this as turnInFlight=true forever.
-    // PR3b-cutover: reads the delivery machine when the kill-switch is on.
     const turnInFlight = turnInFlightForGate();
 
     if (!turnInFlight) {
@@ -12626,11 +12452,6 @@ const ipcServer: IpcServer = createIpcServer({
       // lost for this fire. Surfaced via the unified runtime-metrics fan-out.
       emitRuntimeMetric({ kind: 'cron_fell_back_to_main', agent: msg.agentName, prompt_key: promptKey })
     }
-    // Status-silent (§2.4): a cron fire delivered to the CRON session must NOT
-    // set the MAIN agent's currentTurn. But a fire that LANDED on the main
-    // bridge (a non-cron fire, or one that fell back) IS a main-session turn —
-    // surface it on the progress card, or the session looks dark.
-    if (delivered && target === msg.agentName) markClaudeBusyForInbound(msg.inbound)
     process.stderr.write(
       `telegram gateway: inject_inbound agent=${msg.agentName} target=${target}${fellBackToMain ? " (fellback)" : ""} source=${source} prompt_key=${promptKey} delivered=${delivered}\n`,
     )
@@ -12904,8 +12725,7 @@ if (isGatewayMain) (() => {  // #2996 P0c: gated — starts webhook-ingest UDS s
       // InboundMessage (same cast the scheduler's ipcDispatcher uses).
       const msg = inbound as InboundMessage
       const delivered = ipcServer.sendToAgent(agentName, msg)
-      if (delivered) markClaudeBusyForInbound(msg)
-      else pendingInboundBuffer.push(agentName, msg)
+      if (!delivered) pendingInboundBuffer.push(agentName, msg)
       return delivered
     }
 
@@ -12971,18 +12791,13 @@ if (isGatewayMain && !STATIC) {
       selfAgent,
       () => {
         // #1556: never drain mid-turn — that re-creates the composer
-        // wedge this buffer exists to prevent.
-        // PR3b: gated on claudeBusyKeys (see purgeReactionTracking).
-        // PR3b-cutover: reads the delivery machine when the kill-switch is on.
+        // wedge this buffer exists to prevent. Gate reads the delivery
+        // machine (turnInFlightForGate).
         if (turnInFlightForGate()) return false
         const c = ipcServer.getClient(selfAgent)
         return c != null && c.isAlive()
       },
-      (m) => {
-        const d = ipcServer.sendToAgent(selfAgent, m)
-        if (d) markClaudeBusyForInbound(m)
-        return d
-      },
+      (m) => ipcServer.sendToAgent(selfAgent, m),
       inboundSpool,
       trackRedeliveredInbound,
     )
@@ -18617,8 +18432,9 @@ function handleSessionEvent(ev: SessionEvent): void {
       // throw in a pre-purge op (redactOutboundText, progressDriver?.
       // takeOverCard, narrative dedup, answer-stream finalize, …) skipped
       // endCurrentTurnAtomic → purgeReactionTracking, which would otherwise
-      // leave activeTurnStartedAt + claudeBusyKeys populated and wedge the
-      // #1556 inbound gate closed. No-op on the happy path (key already gone).
+      // leave activeTurnStartedAt populated (and the machine un-turnEnded)
+      // and wedge the #1556 inbound gate closed until the TTL tick. No-op on
+      // the happy path (key already gone).
       const turnEndBackstopTurn = currentTurn
       const turnEndBackstopKey =
         turnEndBackstopTurn != null
@@ -20153,32 +19969,27 @@ async function handleInbound(
   // network RTT) but not a user-perceived end-to-end measurement.
   const inboundReceivedAt = Date.now()
 
-  // PR3b-cutover: snapshot the machine's in-turn state AT RECEIPT, before
-  // this handler emits the `inbound` event (that emit is DEFERRED below to
-  // the delivery-commit point — search DEFERRED_INBOUND_EMIT). A fresh-turn
+  // Snapshot the machine's in-turn state AT RECEIPT, before this handler
+  // emits the `inbound` event (that emit is DEFERRED below to the
+  // delivery-commit point — search DEFERRED_INBOUND_EMIT). A fresh-turn
   // inbound transitions the machine idle→in_turn; reading after the emit
-  // would see THIS message's own just-started turn and self-block it (the
-  // same self-block hazard the claudeBusyKeys snapshot below guards). Null
-  // when the kill-switch is off, in which case the gate uses the legacy
-  // claudeBusyKeys read.
+  // would see THIS message's own just-started turn and self-block it.
   //
   // WHY THE INBOUND EMIT IS DEFERRED (overlord /usage wedge, 2026-07-08):
-  // the `inbound` event drives the now-AUTHORITATIVE turn-in-flight gate
+  // the `inbound` event drives the AUTHORITATIVE turn-in-flight gate
   // (turnInFlightForGate → isMachineInTurn). Emitting it HERE — at handler
   // entry, before the intercept gauntlet below (permission-reply, /auth
   // paste-back, interrupt-empty, secret-detect drop, …) — drove the machine
   // into `bridge_alive_in_turn` for messages that then EARLY-RETURN as an
-  // intercept and never become a turn. No delivery, no claudeBusyKeys mark,
-  // and critically no `turnEnd` ever fires, so the machine held the gate
-  // closed until the 5-min TTL tick force-cleared it — buffering every
-  // subsequent inbound (including /usage) the whole time. That is exactly
-  // the dangerous `machine_over_holds` divergence gate-parity-probe.ts
-  // flags. The imperative claudeBusyKeys tracker got it right (never marked
-  // busy for the intercepted message); the machine was mis-fed. Fix: emit
-  // `inbound` only once the message clears every intercept and reaches the
-  // deliver-or-buffer decision, keeping the machine in lockstep with the
-  // imperative delivery lifecycle it models.
-  const machineInTurnAtReceipt = isDeliveryCutoverEnabled() ? isMachineInTurn() : null
+  // intercept and never become a turn. No delivery, and critically no
+  // `turnEnd` ever fires, so the machine held the gate closed until the
+  // 5-min TTL tick force-cleared it — buffering every subsequent inbound
+  // (including /usage) the whole time (the dangerous over-hold direction
+  // the bake-era gate-parity probe flagged). Fix: emit `inbound` only once
+  // the message clears every intercept and reaches the deliver-or-buffer
+  // decision, keeping the machine in lockstep with the delivery lifecycle
+  // it models.
+  const machineInTurnAtReceipt = isMachineInTurn()
 
   // #1556 self-blocking fix (v0.12.22): snapshot the live turn-state
   // BEFORE the fresh-turn branch (line ~7357) sets activeTurnStartedAt
@@ -20211,21 +20022,14 @@ async function handleInbound(
   // an ack on the buffered path). The snapshot is the minimal precise
   // fix. Phase 2b's state-machine extraction will revisit this
   // structurally.
-  // PR3b: gated on claudeBusyKeys (turns claude has been handed) not
+  // Gated on the machine's "turns claude has been handed" state, not
   // activeTurnStartedAt (eager set on receipt). In supergroup mode,
-  // topic A active + topic B inbound arriving: pre-fix, B saw
-  // turnInFlightAtReceipt=true because A's key was in
-  // activeTurnStartedAt, AND B's fresh-turn branch then eagerly set
-  // its OWN key — wedging the gate forever (claude is idle on B but
-  // no turn_end ever fires). With claudeBusyKeys, B sees true (A is
+  // topic A active + topic B inbound arriving: B sees true (A is
   // busy) → B is buffered correctly, AND the gate cleanly reopens
-  // when A's turn_end deletes keyA → flush triggers → B delivered.
-  // PR3b-cutover: prefer the machine snapshot taken before the inbound
-  // event advanced it (machineInTurnAtReceipt); null when the
-  // kill-switch is off, in which case the legacy claudeBusyKeys read
-  // stands. Both are "was a turn in flight at receipt", not a live
+  // when A's turnEnd clears the machine → flush triggers → B delivered.
+  // This is "was a turn in flight at receipt", not a live
   // post-this-inbound read — see machineInTurnAtReceipt's comment.
-  const turnInFlightAtReceipt = machineInTurnAtReceipt ?? (claudeBusyKeys.size > 0)
+  const turnInFlightAtReceipt = machineInTurnAtReceipt
 
   const access = result.access
   const from = ctx.from!
@@ -21590,39 +21394,36 @@ async function handleInbound(
     effectiveText,
   })
 
-  // ── PR3c inbound cutover (#2794 / #2996 item 1) ────────────────────────
-  // The machine's effect list is now AUTHORITATIVE for the deliver-vs-buffer
-  // routing when the cutover is on: the effects captured at the emit above
-  // are executed through `dispatchEffects` (wired to real executors in
-  // #3006) instead of the imperative twin below. The twin stays fully
-  // intact as the kill-switch fallback (`SWITCHROOM_DELIVERY_MACHINE_CUTOVER=0`
-  // restores the exact legacy path) and is deleted in PR4 after the 48h bake.
+  // ── Machine-authoritative inbound routing (#2794 cutover; kill switch
+  // removed in #2996 P1) ─────────────────────────────────────────────────
+  // The machine's effect list is AUTHORITATIVE for the deliver-vs-buffer
+  // routing: the effects captured at the emit above are executed through
+  // `dispatchEffects` (wired to real executors in #3006).
   //
-  // Two carve-outs fall back to the imperative twin even with the cutover on
-  // (both documented in the RFC as un-modeled by the machine; the twin's
-  // behavior is the contract until the machine grows the events):
-  //   1. `!`-interrupt while the machine reads in_turn — the twin's
-  //      interrupt carve-out delivers (the SIGINT'd turn may never emit
+  // Two carve-outs still route to the imperative delivery body below (both
+  // documented in the RFC as un-modeled by the machine; the twin-body
+  // behavior is the contract until the machine grows the events — tracked
+  // as the #2794 PR4 remainder):
+  //   1. `!`-interrupt while the machine reads in_turn — the interrupt
+  //      carve-out delivers (the SIGINT'd turn may never emit
   //      turn_complete, so buffering would strand the body; see
   //      decideInboundDelivery). The machine has no interrupt concept yet
   //      and would buffer.
-  //   2. machine reads bridge_dead — the twin attempts the send and, on
-  //      miss, applies the shouldTrackDelivery carve-outs (steering /
-  //      interrupt / sourced bodies are dropped, not replayed orphaned
-  //      after restart) + posts the restart notice. The machine's
+  //   2. machine reads bridge_dead — the imperative body attempts the send
+  //      and, on miss, applies the shouldTrackDelivery carve-outs
+  //      (steering / interrupt / sourced bodies are dropped, not replayed
+  //      orphaned after restart) + posts the restart notice. The machine's
   //      unconditional buffer+persist would replay a steer as a fresh turn.
   const machineDelivers = machineInboundEffects.some((e) => e.kind === 'deliverToBridge')
   const machineBuffers = machineInboundEffects.some((e) => e.kind === 'bufferInbound')
   // ANCHORED STRING — must match the machine's bridge-dead inbound trace
   // stage verbatim (see the anchor comment at its emit site in
   // inbound-delivery-machine.ts + the pin test in
-  // inbound-delivery-cutover-flip.test.ts). Deleted in PR4 with the twin.
+  // inbound-delivery-cutover-flip.test.ts).
   const machineBridgeDead = machineInboundEffects.some(
     (e) => e.kind === 'logTrace' && e.stage === 'inbound_bridge_dead_buffer',
   )
   const machineAuthoritative =
-    isDeliveryCutoverEnabled() &&
-    isDispatchEnabled() &&
     !machineBridgeDead &&
     (machineDelivers || (machineBuffers && interrupt.isInterrupt !== true))
   if (machineAuthoritative && machineBuffers) {
@@ -21656,20 +21457,14 @@ async function handleInbound(
     return
   }
 
-  // #2917: read the gate LIVE (not the receipt snapshot) on the default path
-  // so a sibling same-chat inbound delivered during THIS handler's async
-  // lead-in is observed here. Reading `claudeBusyKeys` live is self-block-safe:
-  // THIS inbound's own key is only added at delivery (below), never by the
-  // fresh-turn init bundle — so the live read never sees its own key. The
-  // delivery-machine cutover keeps its at-receipt machine snapshot (a live
-  // machine read WOULD self-block, since the inbound event already advanced
-  // the machine for this key). Kill switch (=0) restores the pure snapshot.
-  const gateTurnInFlight =
-    SERIALIZE_INBOUND_DELIVERY_ENABLED && machineInTurnAtReceipt == null
-      ? claudeBusyKeys.size > 0
-      : turnInFlightAtReceipt
+  // #2917 rapid-fire FIFO: the at-receipt machine snapshot is used here (a
+  // live machine read WOULD self-block — the inbound event above already
+  // advanced the machine for this key). The machine's synchronous advance
+  // at the emit is itself the pre-await reservation a concurrent same-chat
+  // inbound observes, so per-chat FIFO holds without the deleted legacy
+  // busy-key reservation.
   const deliveryGate = reserveInboundDelivery({
-    turnInFlight: gateTurnInFlight,
+    turnInFlight: turnInFlightAtReceipt,
     isSteering,
     // Interrupt-marker carve-out (2026-05-24): the `!`-prefixed body
     // must bypass the "buffer-until-turn-complete" gate because the
@@ -21718,22 +21513,6 @@ async function handleInbound(
     return
   }
 
-  // #2917: reserve the chat's busy key SYNCHRONOUSLY here — before the
-  // composer-clear await below — so a concurrent same-chat inbound reaching
-  // the LIVE gate above observes this in-flight delivery and buffers behind it
-  // (per-chat FIFO). Without this, both handlers pass the gate during each
-  // other's async lead-in and race to the bridge, reordering the replies.
-  // Only fresh-turn deliveries reserve (steering/interrupt amend a running
-  // turn and must not). Released below if the send misses (bridge offline).
-  // PR3c: skipped when the machine is authoritative — the inbound event at
-  // DEFERRED_INBOUND_EMIT advanced the machine SYNCHRONOUSLY (idle→in_turn),
-  // so the machine itself is the pre-await reservation; the busy-key mirror
-  // is stamped by the setTurnStarted effect in the dispatch below.
-  let reservedBusyKey: string | null = null
-  if (!machineAuthoritative && deliveryGate.reserve && SERIALIZE_INBOUND_DELIVERY_ENABLED && machineInTurnAtReceipt == null) {
-    reservedBusyKey = markClaudeBusyForInbound(inboundMsg)
-  }
-
   // Pre-send composer clear (the marko wedge). The inbound is about to be
   // delivered as an MCP `notifications/claude/channel` notification, which
   // the unmodified CLI appends into its composer and auto-submits ONLY when
@@ -21761,42 +21540,30 @@ async function handleInbound(
     }
   }
 
-  // ── PR3c machine deliver path (#2794) ──────────────────────────────────
+  // ── Machine deliver path (#2794) ───────────────────────────────────────
   // The machine said deliver (fresh turn: setTurnStarted + deliverToBridge;
   // steer: deliverToBridge only). dispatchEffects executes the send; the
-  // post-send branches below mirror the imperative twin bit-for-bit:
-  // delivered → steer ack + busy-mark (idempotent, same lifecycle the twin
-  // stamps) + delivery-confirm tracking; miss → release the busy mirror in
-  // lockstep, durable-buffer per the shouldTrackDelivery carve-outs, and
-  // post the restart notice. NOTE the machine already advanced to in_turn
-  // at the emit; a send-miss therefore leaves the machine in_turn until the
-  // TTL tick clears it — identical to today's cutover behavior (the emit
-  // has always preceded the send attempt), not a regression of this flip.
+  // post-send branches below: delivered → steer ack + delivery-confirm
+  // tracking; miss → durable-buffer per the shouldTrackDelivery carve-outs
+  // and post the restart notice. NOTE the machine already advanced to
+  // in_turn at the emit; a send-miss therefore leaves the machine in_turn
+  // until the TTL tick clears it (subsequent inbounds in that window are
+  // machine-buffered with the queued busy-ack — the documented RFC
+  // carve-out row).
   if (machineAuthoritative) {
     let machineDelivered = false
-    // Key stamped by THIS dispatch's setTurnStarted effect (fresh turn only —
-    // a mid-turn steer emits deliverToBridge WITHOUT setTurnStarted). The
-    // miss branch below may only release a key THIS dispatch stamped: on a
-    // steer-miss the chat's busy key belongs to the ORIGINAL in-flight turn
-    // (mirroring the twin, which only ever releases reservedBusyKey and never
-    // reserves for steers). An unconditional delete would wipe the running
-    // turn's key → false machine_over_holds parity drift during the bake +
-    // the pending-restart gate (claudeBusyKeys.size) could green-light a
-    // mid-turn restart.
-    let machineStampedKey: string | null = null
     dispatchEffects(machineInboundEffects, {
       selfAgent,
       ipcServer,
       pendingInboundBuffer,
       inboundSpool: inboundSpool ?? null,
       pendingPermissionBuffer,
-      // Busy-key mirror: same lockstep add markClaudeBusyForInbound does —
-      // keeps the kill-switch fallback + gate-parity-probe + pending-restart
-      // gate (claudeBusyKeys.size) coherent while the twins remain live.
-      onSetTurnStarted: (k, at) => {
-        machineStampedKey = k
-        markBusyKeyLockstep(claudeBusyKeys, claudeBusyKeySince, k, at)
-      },
+      // setTurnStarted is a deliberate no-op at gateway scope (#2996 P1):
+      // the machine's own idle→in_turn transition at the emit IS the
+      // authoritative turn marker now that the legacy claudeBusyKeys
+      // mirror is deleted. Wired (not omitted) so the dispatcher's
+      // `unwired` trace stays meaningful for genuinely missing wiring.
+      onSetTurnStarted: () => {},
       onDeliverResult: (_k, ok) => {
         machineDelivered = ok
       },
@@ -21805,10 +21572,8 @@ async function handleInbound(
       if (isSteering) {
         maybePostBusyAck('steer', chat_id, messageThreadId ?? undefined)
       }
-      // Mirror the twin: EVERY delivered inbound stamps the busy key
-      // (steer/interrupt included — idempotent lockstep re-stamp), and the
-      // returned key is what the delivery-confirm tracker matches acks on.
-      const busyKey = markClaudeBusyForInbound(inboundMsg)
+      // The chat key is what the delivery-confirm tracker matches acks on.
+      const busyKey = chatKeyForInbound(inboundMsg)
       if (
         DELIVERY_CONFIRM_ENABLED &&
         shouldTrackDelivery({
@@ -21821,21 +21586,10 @@ async function handleInbound(
         trackDelivery(deliveryQueue, busyKey, inboundMsg, Date.now(), String(inboundMsg.messageId))
       }
     } else {
-      // Send missed while the machine read bridge-alive. Release ONLY a busy
-      // mirror THIS dispatch's setTurnStarted stamped (lockstep with the
-      // twin's reservedBusyKey release). A steer-miss stamped nothing — the
-      // chat key belongs to the original in-flight turn and must survive
-      // (see machineStampedKey above). Then buffer per the carve-outs, notify.
-      //
-      // Known behavior delta (documented, accepted for the bake): the
-      // machine already advanced to in_turn at the emit, so until the TTL
-      // tick / bridge-flap clears it, SUBSEQUENT inbounds are machine-
-      // buffered ("queued" busy-ack) instead of the legacy per-message send
-      // attempt + restart notice. See the RFC carve-out row + PR body.
-      if (machineStampedKey != null) {
-        claudeBusyKeys.delete(machineStampedKey)
-        claudeBusyKeySince.delete(machineStampedKey)
-      }
+      // Send missed while the machine read bridge-alive. Buffer per the
+      // shouldTrackDelivery carve-outs, then notify. (The machine stays
+      // in_turn until the TTL tick / bridge-flap clears it — see the
+      // carve-out note above.)
       if (
         shouldTrackDelivery({
           isSteering,
@@ -21870,10 +21624,8 @@ async function handleInbound(
     if (isSteering) {
       maybePostBusyAck('steer', chat_id, messageThreadId ?? undefined)
     }
-    // Reuse the key reserved synchronously above (#2917) when present, else
-    // mark now — markClaudeBusyForInbound is idempotent (lockstep re-stamp),
-    // so a re-mark is safe and returns the same chat key.
-    const busyKey = reservedBusyKey ?? markClaudeBusyForInbound(inboundMsg)
+    // The chat key is what the delivery-confirm tracker matches acks on.
+    const busyKey = chatKeyForInbound(inboundMsg)
     // Track until claude acks via `enqueue` (the marko drop-wedge): if no ack
     // lands, the message stranded in the composer and the sweep re-delivers
     // it. Track ONLY messages that produce an `enqueue` to ack against —
@@ -21895,15 +21647,6 @@ async function handleInbound(
     }
   }
   if (!delivered) {
-    // #2917: the synchronous reservation assumed delivery; the send missed
-    // (bridge offline), so release it in lockstep — otherwise the orphaned
-    // busy key would gate every subsequent inbound into the buffer until the
-    // orphan reaper clears it. The message itself is buffered below, so FIFO
-    // is still preserved (it drains in order on the next bridge register).
-    if (reservedBusyKey != null) {
-      claudeBusyKeys.delete(reservedBusyKey)
-      claudeBusyKeySince.delete(reservedBusyKey)
-    }
     // Only persist fresh user turns to the durable spool. Steering / `!`
     // interrupt / empty bodies are mid-turn amendments or no-ops that would
     // arrive orphaned if replayed as a fresh turn after a restart — drop them
@@ -26156,7 +25899,6 @@ function maybeDispatchReaction(args: {
     meta,
   }
   const delivered = ipcServer.sendToAgent(agentName, inbound)
-  if (delivered) markClaudeBusyForInbound(inbound)
   process.stderr.write(
     `telegram gateway: reaction_dispatch agent=${agentName} chat=${args.chatId} ` +
     `emoji=${args.emoji} message_id=${args.messageId} delivered=${delivered}\n`,

@@ -414,8 +414,8 @@ describe('approve vs deny shape invariants', () => {
 // grant/save-outcome inbound must carry that topic so the resumed turn's
 // reply lands back in it — not General. The carrier is two-fold and BOTH
 // halves are load-bearing:
-//   - top-level `threadId` → the gateway's per-topic busy-key / deliver-
-//     until-acked keying (markClaudeBusyForInbound reads it).
+//   - top-level `threadId` → the gateway's per-topic deliver-until-acked
+//     keying (chatKeyForInbound reads it).
 //   - `meta.message_thread_id` (stringified) → rendered into the
 //     `<channel message_thread_id="…">` XML, which session-tail's
 //     parseChannelMeta re-extracts to set currentTurn.sessionThreadId, which

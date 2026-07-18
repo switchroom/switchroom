@@ -1,13 +1,14 @@
 /**
- * PR3b cutover — the turn-in-flight GATE now reads the delivery state
- * machine (`isMachineInTurn`) instead of the PR3b `claudeBusyKeys` set.
+ * The turn-in-flight GATE reads the delivery state machine
+ * (`isMachineInTurn`) — since #2996 P1 the machine is the SOLE authority
+ * (the legacy `claudeBusyKeys` set was deleted).
  *
- * The bug this closes (gymbro/clerk, 2026-05-28): `claudeBusyKeys` is a
- * per-delivery Set — every delivery `.add`s a key, but turn-end `.delete`s
- * exactly one. When a turn-end is missed (or fires under a non-matching
- * key) the set keeps an orphan, `size > 0` reads true forever, and EVERY
- * subsequent inbound buffers as "held mid-turn" until the 5-min
- * framework-fallback force-drains it.
+ * The bug the machine gate closes (gymbro/clerk, 2026-05-28): the legacy
+ * set was per-delivery — every delivery `.add`ed a key, but turn-end
+ * `.delete`d exactly one. When a turn-end was missed (or fired under a
+ * non-matching key) the set kept an orphan, `size > 0` read true forever,
+ * and EVERY subsequent inbound buffered as "held mid-turn" until the 5-min
+ * framework-fallback force-drained it.
  *
  * The machine cannot accumulate orphans: global state holds ONE
  * `activeTurn`, so any matching turnEnd returns it to idle, and the TTL
@@ -19,7 +20,6 @@ import { describe, expect, it, beforeEach } from 'vitest'
 import {
   shadowEmit,
   isMachineInTurn,
-  isDeliveryCutoverEnabled,
   __shadowResetForTests,
 } from '../gateway/inbound-delivery-machine-shadow.js'
 import { TURN_TTL_MS, type ChatKey } from '../gateway/inbound-delivery-machine.js'
@@ -31,12 +31,8 @@ function inbound(key: ChatKey, at: number, msgId = 1) {
   shadowEmit({ kind: 'inbound', key, msg: { msgId, isSteering: false, payload: null }, at })
 }
 
-describe('PR3b cutover gate accessors', () => {
+describe('machine turn-in-flight gate accessors (sole authority, #2996 P1)', () => {
   beforeEach(() => __shadowResetForTests())
-
-  it('enabled by default (shadow on, no kill-switch in test env)', () => {
-    expect(isDeliveryCutoverEnabled()).toBe(true)
-  })
 
   it('reads idle before any turn (bridge alive)', () => {
     shadowEmit({ kind: 'bridgeUp', at: 1000 })

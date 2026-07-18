@@ -17,7 +17,6 @@ import { describe, expect, it, vi, beforeEach } from 'vitest'
 import {
   __dispatchOneForTests,
   dispatchEffects,
-  isDispatchEnabled,
 } from '../gateway/inbound-delivery-machine-dispatch'
 import type { DispatchCtx } from '../gateway/inbound-delivery-machine-dispatch'
 import { createPendingInboundBuffer } from '../gateway/pending-inbound-buffer'
@@ -49,12 +48,6 @@ function makeCtx(overrides?: Partial<DispatchCtx>): {
   }
   return { ctx, logs, sendToAgent, clientSend, inbound, perm }
 }
-
-describe('isDispatchEnabled', () => {
-  it('defaults to true when the kill-switch env-var is unset', () => {
-    expect(isDispatchEnabled()).toBe(true)
-  })
-})
 
 describe('dispatchEffects — drainBuffer', () => {
   it('redelivers buffered inbound to the registered client', () => {
@@ -172,15 +165,6 @@ describe('dispatchEffects — bridgeUp composite (all three effects in order)', 
     expect(clientSend).toHaveBeenNthCalledWith(1, verdict)
     expect(clientSend).toHaveBeenNthCalledWith(2, inMsg)
     expect(logs.some((l) => l.includes('stage=bridge_recover'))).toBe(true)
-  })
-})
-
-describe('dispatchEffects — kill switch', () => {
-  // The kill switch is checked at module-load time so we can't toggle
-  // it inside the test process easily. We validate the contract that
-  // the helper exists and respects the env-var — see isDispatchEnabled.
-  it('exposes the kill-switch check', () => {
-    expect(typeof isDispatchEnabled()).toBe('boolean')
   })
 })
 
