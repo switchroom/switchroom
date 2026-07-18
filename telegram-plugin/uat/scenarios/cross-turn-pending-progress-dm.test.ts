@@ -147,11 +147,20 @@ describe("uat: cross-turn pending-async ambient progress (#1445)", () => {
             if (firstAnchorMsgId == null && entry.kind === "fresh") {
               firstAnchorMsgId = entry.messageId;
             }
+            // EXACT match only. The prompt demands the completion signal be
+            // the single word "done" and nothing else; the loose `/\bdone\b/`
+            // fallback false-positived on the model's beat-1 ACK ("…I'll
+            // reply \"done\" when it finishes"), tripping a 10s wind-down that
+            // quit the test ~22s BEFORE the turn even ended — so the ambient
+            // edit mechanism was never observable (#3334 item b, observed UAT
+            // v0.18.32 r2). Requiring `trim() === "done"` makes the terminal
+            // signal deterministic and un-spoofable by an ack that merely
+            // mentions the word.
             const trimmedFinal = entry.text.trim().toLowerCase();
             const looksLikeDone =
               entry.kind === "fresh" &&
               entry.messageId !== firstAnchorMsgId &&
-              (trimmedFinal === "done" || /\bdone\b/.test(trimmedFinal));
+              trimmedFinal === "done";
             if (looksLikeDone) {
               sawDone = true;
               quiescenceDeadline = Date.now() + 10_000;
