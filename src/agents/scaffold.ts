@@ -599,6 +599,7 @@ export function maybeWriteCronMcp(
   return path;
 }
 import { resolveUsers, resolvePersonEntries } from "../config/users.js";
+import { isClaudeModel } from "../../telegram-plugin/gateway/model-command.js";
 import {
   resolveAgentConfig,
   translateHooksToClaudeShape,
@@ -1364,6 +1365,33 @@ export const SWITCHROOM_DEFAULT_THINKING_EFFORT = "low";
 export function resolveMainModel(model: string | undefined): string {
   if (model === undefined || model === "default") return SWITCHROOM_DEFAULT_MAIN_MODEL;
   return normalizeModelAlias(model);
+}
+
+/**
+ * Declared routing INTENT for a resolved main model — the mode start.sh will
+ * actually LAND on after its repoint case, NOT the raw compose `isClaudeModel`
+ * env split. start.sh (profiles/_base/start.sh.hbs) repoints
+ * `sr-*|fable|claude-fable-5` onto the LiteLLM model-router ROOT whenever the
+ * proxy is live/unreachable-with-key, so a healthy configured-fable boot lands
+ * on `router-root` even though compose baked its ANTHROPIC_BASE_URL on the
+ * `/anthropic` passthrough (fable is a Claude model). Only NON-fable Claude
+ * models (opus/sonnet/haiku/default) keep the passthrough. Non-Claude models
+ * (sr-*) have no `.session-model-override` carrier and route via the root too.
+ *
+ * `.routing-mode` compares the LANDED mode against this DECLARED value, so it
+ * must encode the post-repoint intent — otherwise a healthy fable boot fires a
+ * spurious "Routing divergence" alert and a permanent 🟡 boot-card row.
+ * Mirror the repoint `case` set exactly.
+ */
+export function declaredRoutingMode(resolvedModel: string): "passthrough" | "router-root" {
+  if (
+    resolvedModel === "fable" ||
+    resolvedModel === "claude-fable-5" ||
+    resolvedModel.startsWith("sr-")
+  ) {
+    return "router-root";
+  }
+  return isClaudeModel(resolvedModel) ? "passthrough" : "router-root";
 }
 
 /**
@@ -3242,6 +3270,15 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     // switchroom.yaml. See profiles/_base/start.sh.hbs (Session model
     // resolution) and telegram-plugin/gateway/model-command.ts.
     modelQ: shellSingleQuote(resolveMainModel(agentConfig.model)),
+    // Declared routing INTENT — the POST-REPOINT mode start.sh lands on (see
+    // declaredRoutingMode), NOT the raw compose isClaudeModel env split: a
+    // configured fable rides compose's `/anthropic` env but start.sh repoints
+    // it onto the router root, so declared must say `router-root`. start.sh
+    // compares the LANDED routing mode against this and writes both to
+    // `.routing-mode` (2026-07-17 boot-race incident).
+    declaredRoutingQ: shellSingleQuote(
+      declaredRoutingMode(resolveMainModel(agentConfig.model)),
+    ),
     ...buildCronSessionContext(agentConfig),
     thinkingEffort: agentConfig.thinking_effort ?? SWITCHROOM_DEFAULT_THINKING_EFFORT,
     permissionMode: agentConfig.permission_mode,
@@ -6458,6 +6495,11 @@ function reconcileAgentInner(
       // home, not /host-home (see hostHomeForBake).
       hostHomeQ: hostHomeQForBake(),
       modelQ: shellSingleQuote(resolveMainModel(agentConfig.model)),
+      // Mirror buildWorkspaceContext: declared routing intent for the
+      // `.routing-mode` landed-vs-declared comparison in start.sh.
+      declaredRoutingQ: shellSingleQuote(
+        declaredRoutingMode(resolveMainModel(agentConfig.model)),
+      ),
       ...buildCronSessionContext(agentConfig),
       thinkingEffort: agentConfig.thinking_effort ?? SWITCHROOM_DEFAULT_THINKING_EFFORT,
       permissionMode: agentConfig.permission_mode,
