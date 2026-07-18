@@ -552,6 +552,31 @@ export interface SubagentWatcherConfig {
    */
   onWorkerLost?: (agentId: string, description: string) => void
   /**
+   * Issue #3373 (SendMessage-resume feed re-surface). Fires when a worker that
+   * had a GENUINE terminal completion (a real `sub_agent_turn_end`, then swept
+   * by `cleanupTerminalAgent`) is RESUMED via SendMessage — its
+   * `agent-<id>.jsonl` grows PAST the byte size recorded at terminal cleanup,
+   * and `scanSubagentsDir` re-registers it as a fresh live entry (#3315).
+   *
+   * This is DISTINCT from `onResurrect` (#3023), which reverses a FALSE finish
+   * from silent-stall synthesis and carries bounded-chain semantics. A
+   * SendMessage resume is a real, legitimately-unbounded lifecycle event (a
+   * worker may be stopped and resumed many times), so it does NOT route through
+   * the resurrection budget — it fires here every time growth-past-terminal is
+   * observed.
+   *
+   * Why it exists: the live worker-activity feed latches a terminal `finalized`
+   * gate per agentId (worker-activity-feed.ts) so a late zombie tick can't
+   * repaint a done worker. The #3315 re-registration re-arms the watcher and
+   * re-fires `onProgress`, but those cues are SWALLOWED by that latch — so a
+   * resumed long-running worker reads as silence with no card. The gateway
+   * wires this to `feed.resurrect(agentId)` (clear the latch) so the subsequent
+   * `onProgress` cue repaints a fresh live row. Deterministic: gated solely on
+   * the file growing past the recorded terminal boundary, never on model
+   * discipline. Best-effort; the callback is expected to be idempotent.
+   */
+  onResume?: (agentId: string, description: string) => void
+  /**
    * Called exactly once per sub-agent when its watcher observes a terminal
    * transition (`done` or `failed`). Mirrors the existing `sub_agent_started`
    * surface (emitted from session-tail) so the audit trail is symmetric.
@@ -3092,6 +3117,22 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
         terminatedAgentIds.delete(agentId)
         historicalFiles.delete(filePath)
         knownFiles.add(filePath)
+        // Issue #3373: the worker-activity feed latched a terminal `finalized`
+        // gate for this agentId at its genuine completion, so the `onProgress`
+        // cues the re-registration is about to re-fire would be SWALLOWED and no
+        // card would re-surface. Fire onResume FIRST (before registerAgent, whose
+        // initial read can synchronously re-emit onProgress) so the gateway clears
+        // that gate; the subsequent live cue then repaints a fresh row. Fired only
+        // on growth-past-terminal — never for a static leftover (the
+        // `currentSize <= terminalSize` continue above), so the anti-zombie latch
+        // still blocks genuinely-finished workers.
+        if (config.onResume != null) {
+          try {
+            config.onResume(agentId, registry.get(agentId)?.description ?? 'sub-agent')
+          } catch (cbErr) {
+            log?.(`subagent-watcher: onResume callback error ${agentId}: ${(cbErr as Error).message}`)
+          }
+        }
         registerAgent(filePath, agentId, terminalSize)
         continue
       }

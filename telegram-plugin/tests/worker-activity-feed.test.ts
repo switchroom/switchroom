@@ -1063,6 +1063,37 @@ describe('createWorkerActivityFeed — resurrection guard + deferred finalize', 
     expect(bot.sent[1].text).toContain('back to work')
   })
 
+  it('#3373: a GENUINE terminal then a SendMessage resume re-surfaces a live card (resurrect+update), while an un-resumed terminal stays dead', async () => {
+    const bot = makeFakeBot()
+    let clock = 10_000
+    const feed = createWorkerActivityFeed({ bot, now: () => clock, minEditIntervalMs: 0 })
+
+    // Worker runs, then GENUINELY completes (a real turn_end handback) — the
+    // row is dropped and the agentId latched into the terminal `finalized` gate.
+    await feed.update('w1', 'chat', view({ toolCount: 1, latestSummary: 'step one' }))
+    await feed.finish('w1', view({ state: 'done', toolCount: 1, latestSummary: 'real result' }))
+    expect(feed.has('w1')).toBe(false)
+
+    // Anti-zombie: with NO resume signal, later cues stay swallowed forever — a
+    // genuinely-finished worker must never zombie-resurface on a stray tick.
+    clock = 12_000
+    await feed.update('w1', 'chat', view({ toolCount: 2, latestSummary: 'stray tick' }))
+    expect(bot.sent).toHaveLength(1)
+    expect(feed.has('w1')).toBe(false)
+
+    // Now the worker is RESUMED via SendMessage: the watcher observes jsonl
+    // growth past the terminal boundary (#3315) and fires onResume, which the
+    // gateway wires to feed.resurrect — clearing the finalized latch.
+    feed.resurrect('w1')
+
+    // The resumed worker's next progress cue re-surfaces a fresh live card.
+    clock = 13_000
+    await feed.update('w1', 'chat', view({ toolCount: 3, latestSummary: 'resumed work' }))
+    expect(bot.sent).toHaveLength(2)
+    expect(feed.has('w1')).toBe(true)
+    expect(bot.sent[1].text).toContain('resumed work')
+  })
+
   it('#3023: resurrect() on a never-finalized worker is a harmless no-op', () => {
     const bot = makeFakeBot()
     const feed = createWorkerActivityFeed({ bot, now: () => 10_000 })
