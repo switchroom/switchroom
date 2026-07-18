@@ -1912,7 +1912,34 @@ export class VaultBroker {
       // state is also rolled back — otherwise the broker would serve an
       // entry that isn't on disk and the next reload would lose it.
       const previousEntry = existing;
-      this.secrets[req.key] = req.entry;
+      // sec #3143-A: merge-preserve server-side metadata (`scope`, `format`)
+      // on rotation of an EXISTING entry. The wire `PutRequestSchema.entry`
+      // is `{kind, value}` only — it cannot carry `scope`/`format` — so a
+      // blind `this.secrets[key] = req.entry` silently ERASED the entry's
+      // `scope.deny`/`scope.allow` and `format` hint on every legitimate
+      // rotation. That defeated the #3084-F2/F3 write-scope durability: any
+      // allowed agent's rotation stripped the deny, after which
+      // checkEntryScope(undefined) → allow re-opened the key to a
+      // previously-denied agent. Preserve prior metadata unless the caller
+      // is the operator (passphrase attestation) — the operator IS allowed
+      // to reshape an entry from a host-trusted path. New-key creation
+      // (existing === undefined) has nothing to preserve.
+      let nextEntry: VaultEntry = req.entry;
+      if (existing !== undefined && !passphraseAttested) {
+        // `format` only exists on the string/binary variants (the `files`
+        // variant has none); `in` narrows it safely. `req.entry` is always
+        // string|binary here, so the merged shape stays a valid VaultEntry.
+        const preservedFormat =
+          "format" in existing && existing.format !== undefined
+            ? { format: existing.format }
+            : {};
+        nextEntry = {
+          ...req.entry,
+          ...preservedFormat,
+          ...(existing.scope !== undefined ? { scope: existing.scope } : {}),
+        };
+      }
+      this.secrets[req.key] = nextEntry;
       try {
         saveVault(this.passphrase, this.vaultPath, this.secrets);
       } catch (err: unknown) {
