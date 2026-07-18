@@ -1851,6 +1851,36 @@ export class VaultBroker {
           socket.write(encodeResponse(errorResponse("DENIED", aclResult.reason)));
           return;
         }
+        // sec #3143-B: enforce the per-entry `scope` on the tokenless
+        // (path-as-identity) write too. The READ path-as-identity path
+        // checks this (~line 1508) and the write-GRANT path checks it
+        // (#3084-F2, ~line 1773), but this twin historically ran
+        // `checkAclByAgent` ONLY — so an agent whose `schedule.secrets[]`
+        // ACL covers a key that ALSO carries `scope.deny:[thatagent]` could
+        // rotate it without a token, silently bypassing the deny. Keyed on
+        // the socket-bound identity (`agentName`), same slug the read path
+        // and ACL use. Only meaningful for rotations of an existing scoped
+        // entry; a not-yet-existing key has no scope to honour (and the
+        // path-as-identity path refuses new keys just below anyway).
+        const existingForScope = this.secrets[req.key];
+        if (existingForScope !== undefined) {
+          const writeScope = checkEntryScope(existingForScope.scope, agentName);
+          if (!writeScope.allow) {
+            this.auditLogger.write({
+              ts: new Date().toISOString(),
+              op: "put",
+              key: req.key,
+              caller: auditCaller,
+              pid: auditPid,
+              cgroup: auditCgroup,
+              result: `denied:${writeScope.reason}`,
+            });
+            socket.write(
+              encodeResponse(errorResponse("DENIED", writeScope.reason)),
+            );
+            return;
+          }
+        }
       }
       // Refuse to introduce new keys ON THE PATH-AS-IDENTITY PATH ONLY.
       // Write-grants and passphrase-attestation explicitly permit new-key
