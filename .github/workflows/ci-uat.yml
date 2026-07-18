@@ -134,6 +134,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      # Runner guard (#3335): sweep stale `switchroom.wedged-*` remnants from the
+      # persistent _work tree so a prior mid-checkout wedge (git clean -ffdx into
+      # D-state on the slow uat-runner-state volume) doesn't accumulate as dead
+      # weight. The remnants are SIBLINGS of the checkout dir (renamed aside by
+      # manual recovery), so `git clean` never touches them and running this
+      # right after checkout is sound. Age-gated (keeps fresh wedges for
+      # forensics) and self-bounded (each rm is `timeout`-wrapped so the guard
+      # can't itself wedge). Best-effort — never fails the job.
+      - name: Reap stale wedged workdirs (runner guard)
+        shell: bash
+        run: bash scripts/ci/reap-stale-workdirs.sh
       - name: Secrets gate
         id: secrets
         run: |
@@ -218,6 +229,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      # Runner guard (#3335): sweep stale `switchroom.wedged-*` remnants — see
+      # the uat-gate-run job above for rationale.
+      - name: Reap stale wedged workdirs (runner guard)
+        shell: bash
+        run: bash scripts/ci/reap-stale-workdirs.sh
       - name: Secrets gate
         id: secrets
         run: |
