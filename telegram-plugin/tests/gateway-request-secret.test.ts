@@ -15,6 +15,10 @@ import { readFileSync } from 'node:fs'
  */
 describe('request_secret — gateway wiring', () => {
   const gw = readFileSync(new URL('../gateway/gateway.ts', import.meta.url), 'utf8')
+  // executeRequestSecret moved verbatim to card-tool-handlers.ts (#2996 P5-tail);
+  // the handler-body pins below read that module. The dispatch case + the
+  // secure-capture path (captureProvidedSecret / handleInbound) stay in gateway.ts.
+  const cardTool = readFileSync(new URL('../gateway/card-tool-handlers.ts', import.meta.url), 'utf8')
   const bridge = readFileSync(new URL('../bridge/bridge.ts', import.meta.url), 'utf8')
 
   it('declares the MCP tool with required {chat_id,key} and NO value arg', () => {
@@ -30,7 +34,7 @@ describe('request_secret — gateway wiring', () => {
 
   it('is allow-listed and dispatched', () => {
     expect(gw).toMatch(/'request_secret',\n/)
-    expect(gw).toMatch(/case 'request_secret':\s*\n\s*return executeRequestSecret\(args\)/)
+    expect(gw).toMatch(/case 'request_secret':\s*\n\s*return cardToolHandlers\.executeRequestSecret\(args\)/)
   })
 
   it('routes the vsp: callback', () => {
@@ -71,8 +75,8 @@ describe('request_secret — gateway wiring', () => {
   })
 
   it('dedupes to one open request per (chat,key)', () => {
-    const idx = gw.indexOf('async function executeRequestSecret(')
-    const body = gw.slice(idx, idx + 1800)
+    const idx = cardTool.indexOf('async function executeRequestSecret(')
+    const body = cardTool.slice(idx, idx + 1800)
     expect(body).toMatch(/p\.chat_id === chat_id && p\.key === key/)
   })
 })
