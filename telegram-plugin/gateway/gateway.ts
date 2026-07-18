@@ -58,10 +58,7 @@ import {
 } from '../voice-synthesize-sidecar.js'
 import {
   VoiceOnDemandCache,
-  isVoiceOnDemandCallback,
-  parseVoiceOnDemandToken,
 } from '../voice-ondemand.js'
-import { sendVoiceReusingFileId } from '../voice-send.js'
 import {
   PreSynthQueue,
   sweepVoiceCacheDir,
@@ -146,6 +143,10 @@ import {
 import { registerStartInfoCommands } from './bot-commands-start-info.js'
 import { registerModelEffortCommands } from './bot-commands-model-effort.js'
 import { handleAskCallback, type AskCallbackDeps } from './ask-callback-handler.js'
+import {
+  handleVoiceOnDemandCallback,
+  type VoiceOnDemandCallbackDeps,
+} from './voice-ondemand-callback-handler.js'
 import { fmtLocalStamp, resolveEnvTimezone, renderLogTimestampsLocal } from '../shared/local-time.js'
 import { StatusReactionController } from '../status-reactions.js'
 import { DeferredDoneReactions } from '../reaction-defer.js'
@@ -23582,167 +23583,11 @@ bot.on('callback_query:data', async ctx => {
   // true when handled (dispatcher stops), false to fall through.
   if (await handleAskCallback(ctx, data, askCallbackDeps)) return
 
-  // on-demand voice: '🔊 Listen' buttons carry a reserved `voice:<token>`
-  // callback_data. Handle INTERNALLY here — synthesize the cached reply text
-  // and send it as a native voice note. This MUST run before the agent:
-  // routing below so a tap never reaches the agent as an inbound message.
-  if (isVoiceOnDemandCallback(data)) {
-    const access = loadAccess()
-    const senderId = String(ctx.from.id)
-    if (!access.allowFrom.includes(senderId)) {
-      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
-      return
-    }
-    const token = parseVoiceOnDemandToken(data)
-    const entry = token != null ? voiceOnDemandCache.get(token) : null
-    if (entry == null) {
-      await ctx
-        .answerCallbackQuery({ text: 'Voice expired — send again to hear it.' })
-        .catch(() => {})
-      return
-    }
-    const cbChatId = String(ctx.chat?.id ?? ctx.from.id)
-    const cbMessageId = ctx.callbackQuery?.message?.message_id
-    const cbThreadId = (() => {
-      const msg = ctx.callbackQuery?.message
-      if (msg && 'is_topic_message' in msg && msg.is_topic_message && 'message_thread_id' in msg) {
-        const tid = (msg as { message_thread_id?: number }).message_thread_id
-        return typeof tid === 'number' ? tid : undefined
-      }
-      return undefined
-    })()
-    const tok = token as string
-    const sendOpts = {
-      ...(cbMessageId != null ? { reply_parameters: { message_id: cbMessageId } } : {}),
-      ...(cbThreadId != null ? { message_thread_id: cbThreadId } : {}),
-    } as never
-    const sendVerbOpts = {
-      chat_id: cbChatId,
-      verb: 'voice-ondemand.sendVoice',
-      ...(cbThreadId != null ? { threadId: cbThreadId } : {}),
-    }
-
-    // #2763 attach-on-tap: prefer the eagerly pre-synthesized file (written by
-    // the pre-synth queue at reply time). If it's on disk, attach it
-    // immediately — no GPU wait. Missing/unreadable file (expired + swept,
-    // crash, pre-feature entry, kill-switched gateway) falls back transparently
-    // to the lazy synth path. Only invoked when there's no reusable file_id (or
-    // a stored id was rejected as stale) — see sendVoiceReusingFileId.
-    const loadAudio = async (): Promise<Uint8Array | null> => {
-      let audio: Uint8Array | null = null
-      if (entry.filePath != null) {
-        try {
-          audio = readFileSync(entry.filePath)
-        } catch {
-          audio = null // swept/missing — lazy fallback
-        }
-      }
-      if (audio != null) {
-        await ctx.answerCallbackQuery({ text: '🔊' }).catch(() => {})
-        return audio
-      }
-      await ctx.answerCallbackQuery({ text: '🔊 Synthesizing…' }).catch(() => {})
-      // Local sidecar (kokoro) synthesis — same helper the immediate voice-out
-      // path uses. On-demand is a local-engine feature; the cache is only
-      // populated when resolveVoiceOutPlan gated the local verdict.
-      const sidecarToken = await materializeSidecarToken()
-      if (!sidecarToken) {
-        await ctx
-          .answerCallbackQuery({ text: 'Voice sidecar unavailable — try again later.' })
-          .catch(() => {})
-        return null
-      }
-      const result = await synthesizeViaSidecar({
-        token: sidecarToken,
-        // #2760 Phase 1: same deterministic normalization as the immediate
-        // voice-out path — the Listen lazy path builds its own /tts body from
-        // the persisted cache, so it must normalize independently (cache
-        // entries may predate the flag flip).
-        text: normalizeForTts(entry.text),
-        voice: entry.voice,
-        speed: entry.speed,
-      })
-      if (!result.ok) {
-        process.stderr.write(
-          `telegram gateway: voice-out on-demand: synthesis failed reason=${result.reason}\n`,
-        )
-        await ctx
-          .answerCallbackQuery({ text: `Voice failed: ${result.reason}` })
-          .catch(() => {})
-        return null
-      }
-      return result.audio
-    }
-
-    // Fast path: if we already captured a reusable file_id, ack instantly and
-    // send BY the id — no disk read, no re-upload. First tap (no id yet) and a
-    // stale-id fallback both go through loadAudio + InputFile below and refresh
-    // the stored id from the returned message.
-    if (entry.telegramFileId != null) {
-      await ctx.answerCallbackQuery({ text: '🔊' }).catch(() => {})
-    }
-    const sendResult = await sendVoiceReusingFileId({
-      fileId: entry.telegramFileId ?? null,
-      sendByFileId: (fid) =>
-        robustApiCall(
-          // allow-raw-bot-api: reuse Telegram's file_id — no re-upload.
-          () => bot.api.sendVoice(cbChatId, fid, sendOpts),
-          sendVerbOpts,
-        ),
-      loadAudio,
-      sendByUpload: (audioOut) =>
-        robustApiCall(
-          // allow-raw-bot-api: single native voice-note send for an on-demand Listen tap.
-          () => bot.api.sendVoice(cbChatId, new InputFile(Buffer.from(audioOut)), sendOpts),
-          sendVerbOpts,
-        ),
-      onFileId: (fid) => voiceOnDemandCache.setTelegramFileId(tok, fid),
-      log: (line) => process.stderr.write(line),
-    })
-
-    if (!sendResult.ok) {
-      // no-audio already surfaced a toast inside loadAudio; send-failed is
-      // logged non-fatally — the '🔊 Listen' keyboard is left intact so the
-      // user can retry (only a successful send strips it below).
-      if (sendResult.reason === 'send-failed') {
-        const err = sendResult.error
-        const msg = err instanceof Error ? err.message : String(err)
-        process.stderr.write(
-          `telegram gateway: voice-out on-demand: sendVoice failed (non-fatal): ${msg}\n`,
-        )
-      }
-      return
-    }
-
-    try {
-      // Single-use on SUCCESS: strip the '🔊 Listen' keyboard so the button
-      // can't be re-tapped now that the audio has been delivered. Mirrors the
-      // agent-button single_use strip (keyboardIsSingleUse) house style.
-      // Best-effort + non-fatal — a failed strip only leaves a replayable
-      // button, never drops the delivered audio. Only reached on a successful
-      // sendVoice; expiry / synth-failure / sidecar-unavailable all return
-      // earlier WITHOUT stripping, so the user can retry those.
-      if (cbMessageId != null) {
-        await robustApiCall(
-          () =>
-            bot.api.editMessageReplyMarkup(cbChatId, cbMessageId, {
-              reply_markup: { inline_keyboard: [] },
-            }),
-          {
-            chat_id: cbChatId,
-            verb: 'voice-ondemand.strip-listen-keyboard',
-            ...(cbThreadId != null ? { threadId: cbThreadId } : {}),
-          },
-        ).catch(() => {})
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      process.stderr.write(
-        `telegram gateway: voice-out on-demand: strip-listen-keyboard failed (non-fatal): ${msg}\n`,
-      )
-    }
-    return
-  }
+  // on-demand voice ('🔊 Listen', `voice:<token>`) — extracted to
+  // voice-ondemand-callback-handler.ts (switchroom#2996 P6 dispatcher
+  // drain). Handled INTERNALLY (never reaches the agent); must stay ahead
+  // of the agent-callback routing below. Returns true when handled.
+  if (await handleVoiceOnDemandCallback(ctx, data, voiceOnDemandCallbackDeps)) return
 
   // #271: agent-emitted inline_keyboard callbacks. Namespaced with
   // an `agent:` prefix in inline-keyboard-callbacks.ts so they can
@@ -24473,6 +24318,48 @@ const checklistHandlerDeps: ChecklistHandlerDeps = {
 const askCallbackDeps: AskCallbackDeps = {
   loadAccess,
   pendingAskUser,
+}
+// Injected surface for the extracted on-demand voice callback family
+// (switchroom#2996 P6 dispatcher drain, cluster-F DI pattern): the raw
+// bot.api sendVoice / editMessageReplyMarkup calls stay HERE inside
+// robustApiCall with their allow-raw-bot-api markers, so the extracted
+// module has no raw Bot API site.
+const voiceOnDemandCallbackDeps: VoiceOnDemandCallbackDeps = {
+  loadAccess,
+  voiceOnDemandCache,
+  sendVoiceByFileId: (chatId, fid, sendOpts, threadId) =>
+    robustApiCall(
+      // allow-raw-bot-api: reuse Telegram's file_id — no re-upload.
+      () => bot.api.sendVoice(chatId, fid, sendOpts as never),
+      {
+        chat_id: chatId,
+        verb: 'voice-ondemand.sendVoice',
+        ...(threadId != null ? { threadId } : {}),
+      },
+    ),
+  sendVoiceByUpload: (chatId, audio, sendOpts, threadId) =>
+    robustApiCall(
+      // allow-raw-bot-api: single native voice-note send for an on-demand Listen tap.
+      () => bot.api.sendVoice(chatId, new InputFile(Buffer.from(audio)), sendOpts as never),
+      {
+        chat_id: chatId,
+        verb: 'voice-ondemand.sendVoice',
+        ...(threadId != null ? { threadId } : {}),
+      },
+    ),
+  stripListenKeyboard: (chatId, messageId, threadId) =>
+    robustApiCall(
+      () =>
+        bot.api.editMessageReplyMarkup(chatId, messageId, {
+          reply_markup: { inline_keyboard: [] },
+        }),
+      {
+        chat_id: chatId,
+        verb: 'voice-ondemand.strip-listen-keyboard',
+        ...(threadId != null ? { threadId } : {}),
+      },
+    ).then(() => undefined),
+  log: line => process.stderr.write(line),
 }
 bot.on('message:contact', ctx => handleContactMessage(ctx, mediaEnvelopeDeps))
 bot.on('message:location', ctx => handleLocationMessage(ctx, mediaEnvelopeDeps))
