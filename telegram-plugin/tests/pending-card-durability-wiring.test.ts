@@ -127,9 +127,13 @@ describe('resolution clears the durable store (Defect A)', () => {
   })
 
   it('secret request provide/decline remove from the store', () => {
-    // capture (provide → value arrives) removes via armed.stageId
+    // capture (provide → value arrives) removes via armed.stageId — the value
+    // arrival path (captureProvidedSecret) stays in gateway.ts.
     expect(GATEWAY).toMatch(/pendingCardStore\.remove\(armed\.stageId\)/)
-    const decline = slice(GATEWAY, 'async function handleSecretRequestCallback', 3000)
+    // The decline branch moved with handleSecretRequestCallback into
+    // callback-query-handlers.ts (#2996 P5) — pin the body there, mirroring the
+    // handleMentalModelProposeCallback pin below.
+    const decline = slice(CB_HANDLERS, 'async function handleSecretRequestCallback', 3000)
     expect(decline).toMatch(/pendingCardStore\.remove\(stageId\)/)
   })
 
