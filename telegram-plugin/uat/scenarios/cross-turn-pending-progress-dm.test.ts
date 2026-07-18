@@ -81,8 +81,16 @@ interface TrailEntry {
   text: string;
 }
 
+// Mirrors the production matcher (`pending-work-progress.ts` SUFFIX_RE):
+// the CURRENT emit is the italic rich-markdown form
+// `\n\n_still working (Nm) · message me anytime, I'll keep you posted_`
+// (#2669) — mtcute's parsed `Message.text` strips the italic markers, so
+// the observed text is `\n\nstill working (Nm) · …`. The legacy em-dash
+// prefix (`— still working`) and a literal-underscore render are also
+// tolerated. The old mandatory-em-dash regex could not match ANY current
+// production edit (stale oracle, diagnosed 2026-07-18).
 const SUFFIX_RE =
-  /\n\n— still working \(\d+m\)( · message me anytime, I'll keep you posted)?$/;
+  /\n\n(?:— |_)?still working \(\d+m\)( · message me anytime, I'll keep you posted)?_?$/;
 
 function pad(s: string, n: number): string {
   return s.length >= n ? s : s + " ".repeat(n - s.length);

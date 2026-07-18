@@ -123,8 +123,18 @@ describe("uat: bridge-flap resilience — agent stays responsive, gateway does n
             `overall deadline hit before DM ${i} — earlier turns were too slow`,
           ).toBeGreaterThan(0);
 
+          // Skip empty-text observations: the Bot API cannot send an
+          // empty text message (Telegram rejects it), so an empty-text
+          // fromBot observation is by construction a SERVICE message —
+          // e.g. the `[pinned_message]` event from the progress-card pin.
+          // One of those latched here as "the reply" on 2026-07-18
+          // (ci-uat run 29634400115: pinChatMessage 06:54:36.420Z → rx
+          // [pinned_message] 06:54:37.012Z, exactly at the DM-2 failure).
+          // A genuinely eaten turn_end still fails loudly: no non-empty
+          // reply arrives and this expectMessage times out.
           const reply = await sc.expectMessage(
-            (m: ObservedMessage) => m.fromBot && !m.edited,
+            (m: ObservedMessage) =>
+              m.fromBot && !m.edited && m.text.length > 0,
             { from: "bot", timeout: remaining },
           );
           expect(

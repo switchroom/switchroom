@@ -89,7 +89,17 @@ const BG_DISPATCH_PROMPT =
   `brief reply saying you've kicked off the background worker so I can ` +
   `watch the progress feed.`;
 
-const WORKER_RUNNING_RE = /running\s*·/i;
+// Single-worker RUNNING headers show NO literal "running" — they render
+// `<elapsed> · <n> tools[ · <tok> tok][ · <model>]`
+// (`tool-activity-summary.ts` renderActivityHeader, running branch); the
+// word "running" only appears on the MULTI-worker combined header
+// (`🛠 Workers · N running`). The old `/running\s*·/i` oracle matched only
+// by accident when the multi-worker header happened to render (failed live
+// 2026-07-18, ci-uat run 29634400115, against a healthy in-flight card).
+// In-flight signal = either header shape's live metric, paired with the
+// `not.toMatch(WORKER_DONE_RE)` terminal exclusion below — a skeleton that
+// paints only `🛠 Worker · <name>` with no metric line still fails.
+const WORKER_RUNNING_RE = /\brunning\b|·\s*\d+\s+tools?\b/i;
 const WORKER_DONE_RE = /finished\s*·\s*(completed|failed)/i;
 
 describe("uat: background sub-agent visibility (#709/#776/#782/#788)", () => {
@@ -117,9 +127,9 @@ describe("uat: background sub-agent visibility (#709/#776/#782/#788)", () => {
         expect(feed.messageId).toBeGreaterThan(0);
         expect(feed.text).toMatch(WORKER_FEED_RE);
 
-        // AC-2 step 1: feed body MUST show "running ·" (the in-flight
-        // status), NOT the terminal "finished ·" — the worker hasn't
-        // completed yet.
+        // AC-2 step 1: feed body MUST show an in-flight signal (live
+        // metric line, or multi-worker "N running"), NOT the terminal
+        // "finished ·" — the worker hasn't completed yet.
         expect(feed.text).toMatch(WORKER_RUNNING_RE);
         expect(feed.text).not.toMatch(WORKER_DONE_RE);
 

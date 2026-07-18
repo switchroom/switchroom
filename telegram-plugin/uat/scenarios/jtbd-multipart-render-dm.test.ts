@@ -70,23 +70,47 @@ const TAIL = "MULTITAIL9";
 
 // We need the composed reply to exceed the 32768-char cap so the gateway
 // chunks it. Asking a model to emit ~40k literal chars is flaky (it'll
-// summarize or truncate). Instead we ask it to REPEAT a fixed, cheap-to-
-// generate padding block a deterministic number of times — a task an agent
-// reliably obeys because it's mechanical, not generative.
-const PAD_LINE = "The quick brown fox jumps over the lazy dog. ";
-// Overshoot the cap by a comfortable margin so a slightly-short reply still
-// splits: (cap / line) rounded up, times a 1.3 safety factor.
-const REPEATS = Math.ceil((RICH_MESSAGE_MAX_CHARS / PAD_LINE.length) * 1.3);
+// summarize or truncate). We keep the task MECHANICAL (cycle a fixed
+// sentence list, prefix each line with its index) so an agent reliably
+// obeys — but every emitted line is UNIQUE. Verbatim repetition of one
+// sentence 900+ times reads as degenerate output to Anthropic's content
+// filter and 4xx-kills the turn before any reply exists to send (observed
+// live 2026-07-18, ci-uat run 29634400115: four "unknown-4xx / Output
+// blocked by content filtering policy" events, gateway-supervisor.log
+// 06:43–06:53Z — the reply never reached the send path).
+const PAD_SENTENCES = [
+  "The quick brown fox jumps over the lazy dog.",
+  "Pack my box with five dozen liquor jugs.",
+  "How vexingly quick daft zebras jump.",
+  "Sphinx of black quartz, judge my vow.",
+  "The five boxing wizards jump quickly.",
+  "Jackdaws love my big sphinx of quartz.",
+  "Waltz, bad nymph, for quick jigs vex.",
+  "Glib jocks quiz nymph to vex dwarf.",
+  "Bright vixens jump; dozy fowl quack.",
+  "Quick zephyrs blow, vexing daft Jim.",
+];
+// Conservative per-line floor: the SHORTEST pad sentence plus the numeric
+// prefix. Overshoot the cap by a 1.3 safety factor so a slightly-short
+// reply still splits.
+const PER_LINE_MIN =
+  Math.min(...PAD_SENTENCES.map((s) => s.length)) + "Line 1: ".length;
+const LINE_COUNT = Math.ceil((RICH_MESSAGE_MAX_CHARS / PER_LINE_MIN) * 1.3);
 
 const PROMPT = [
   `I need a LONG reply to test message chunking. Do EXACTLY this, nothing else:`,
   ``,
   `1. Start your reply with: ${HEAD}: **head bold marker**`,
-  `2. Then output this exact sentence ${REPEATS} times, each on its own line:`,
-  `   "${PAD_LINE.trim()}"`,
+  `2. Then output ${LINE_COUNT} numbered lines. Line i (1-based) must be:`,
+  `   "Line i: " followed by sentence number (i mod 10) from this list`,
+  `   (list index 0-9):`,
+  ...PAD_SENTENCES.map((s, idx) => `     ${idx}: "${s}"`),
+  `   So line 1 is "Line 1: ${PAD_SENTENCES[1]}", line 2 is`,
+  `   "Line 2: ${PAD_SENTENCES[2]}", and so on, wrapping the list.`,
   `3. End your reply with: ${TAIL}: **tail bold marker**`,
   ``,
-  `Do not summarize or shorten. Emit all ${REPEATS} repetitions verbatim.`,
+  `Every line is unique because of its number. Do not summarize, do not`,
+  `stop early — emit all ${LINE_COUNT} lines.`,
 ].join("\n");
 
 function kinds(msg: ObservedMessage): Set<string> {
