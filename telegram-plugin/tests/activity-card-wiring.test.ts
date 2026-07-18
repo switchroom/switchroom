@@ -20,6 +20,11 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 const gatewaySrc = readFileSync(resolve(__dirname, '..', 'gateway', 'gateway.ts'), 'utf-8')
+// #2996 P4-B: drainActivitySummary (the card-OPEN persist site) and
+// clearActivitySummary (the normal-CLOSE clear site) moved VERBATIM into
+// narrative-lane.ts (bodies indented +2 inside the factory — multi-line
+// markers below use the lane spelling).
+const laneSrc = readFileSync(resolve(__dirname, '..', 'gateway', 'narrative-lane.ts'), 'utf-8')
 
 function between(src: string, startMarker: string, endMarker: string): string {
   const after = src.split(startMarker)[1] ?? ''
@@ -30,7 +35,7 @@ describe('activity-card durability wiring', () => {
   it('the card-OPEN path persists the durable handle (writeActivityCardRecord)', () => {
     // The open branch runs when activityMessageId transitions null → set.
     const openBranch = between(
-      gatewaySrc,
+      laneSrc,
       'if (turn.activityMessageId == null) {',
       'turn.activityLastSentRender = target',
     )
@@ -55,8 +60,8 @@ describe('activity-card durability wiring', () => {
 
   it('the normal-CLOSE path clears the durable handle, id-scoped (reap-race guard)', () => {
     const closeBody = between(
-      gatewaySrc,
-      'const id = turn.activityMessageId\n    turn.activityMessageId = null',
+      laneSrc,
+      'const id = turn.activityMessageId\n      turn.activityMessageId = null',
       'if (CLEAR_STATUS_ON_COMPLETION)',
     )
     expect(closeBody.length).toBeGreaterThan(50)

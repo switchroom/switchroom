@@ -40,7 +40,13 @@ const streamSrc = readFileSync(
   resolve(__dirname, '..', 'gateway', 'stream-render.ts'),
   'utf-8',
 )
-const gatewayAndStreamSrc = gatewaySrc + '\n' + streamSrc
+// #2996 P4-B: the drain-side set-TRUE site (drainActivitySummary) moved on
+// into narrative-lane.ts.
+const laneSrc = readFileSync(
+  resolve(__dirname, '..', 'gateway', 'narrative-lane.ts'),
+  'utf-8',
+)
+const gatewayAndStreamSrc = gatewaySrc + '\n' + streamSrc + '\n' + laneSrc
 
 describe('M-2: activityEverOpened sticky-true invariant', () => {
   it('activityEverOpened = true appears only at the two feed-OPEN signal sites', () => {
