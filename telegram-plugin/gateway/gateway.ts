@@ -20,7 +20,7 @@ import {
   existsSync, unlinkSync, appendFileSync,
 } from 'fs'
 import { homedir } from 'os'
-import { join, extname, sep, basename } from 'path'
+import { join, sep, basename } from 'path'
 
 import { installPluginLogger } from '../plugin-logger.js'
 import { installStderrTimestamps } from '../stderr-timestamps.js'
@@ -59,11 +59,8 @@ import {
 } from '../voice-synthesize-sidecar.js'
 import {
   VoiceOnDemandCache,
-  mintVoiceOnDemandToken,
   isVoiceOnDemandCallback,
   parseVoiceOnDemandToken,
-  buildListenKeyboard,
-  mayInjectListenButton,
 } from '../voice-ondemand.js'
 import { sendVoiceReusingFileId } from '../voice-send.js'
 import {
@@ -88,7 +85,7 @@ import {
   type TelegraphAccount,
 } from '../telegraph.js'
 import { OutboundDedupCache } from '../recent-outbound-dedup.js'
-import { FlushedTurnSupersedeRegistry, DEFAULT_SUPERSEDE_TTL_MS, decideSupersedeCorrection } from '../flushed-turn-supersede.js'
+import { FlushedTurnSupersedeRegistry, DEFAULT_SUPERSEDE_TTL_MS } from '../flushed-turn-supersede.js'
 import { createInboundCoalescer, inboundCoalesceKey } from './inbound-coalesce.js'
 import {
   splitCoalescedAttachments,
@@ -217,12 +214,10 @@ import {
   createRetryApiCall,
   createSwallowingRetryApiCall,
   retryWithThreadFallback,
-  isPhotoDimensionRejectError,
   isFloodWaitActiveError,
 } from '../retry-api-call.js'
 import { createSendGate, sendGateConfigFromEnv } from '../send-gate.js'
 import { createStatsLogger, createFloodWindowObserver } from '../send-gate-observability.js'
-import { classifyPhotoFile, rerouteResultSuffix } from '../photo-precheck.js'
 import { installTgPostLogger, withTgPostTags } from '../shared/bot-runtime.js'
 import {
   floodStatePath,
@@ -243,12 +238,10 @@ import {
   shutdownAnalytics,
 } from '../analytics-posthog.js'
 import { emitRuntimeMetric } from '../runtime-metrics.js'
-import { decideOverPing, type OverPingDecision } from '../over-ping-safety-net.js'
-import { decideSilentReplyAnchor } from '../silent-reply-anchor.js'
 import { classifyInbound } from '../inbound-classifier.js'
 import * as silencePoke from '../silence-poke.js'
 import * as pendingProgress from '../pending-work-progress.js'
-import { writeSilentEndState, clearSilentEndState, recordUndeliveredTurnEnd, silentEndFallbackText, decideCapturedProseDelivery, settleCapturedProseDelivery, CAPTURED_PROSE_MIN_CHARS, type SilentEndDeps, type CapturedProseSendOutcome } from '../silent-end.js'
+import { writeSilentEndState, clearSilentEndState, recordUndeliveredTurnEnd, silentEndFallbackText, decideCapturedProseDelivery, CAPTURED_PROSE_MIN_CHARS, type SilentEndDeps } from '../silent-end.js'
 import { isFinalAnswerReply, isSubstantiveFinalReply, FINAL_ANSWER_MIN_CHARS } from '../final-answer-detect.js'
 import { deriveTurnRole, decideTerminalReason, parsePostAnswerLivenessMs, evaluatePostAnswerLiveness, type LoopRole } from '../turn-liveness-floor.js'
 import { createAnswerStream, type AnswerStreamHandle } from '../answer-stream.js'
@@ -368,7 +361,7 @@ const REPLY_TO_TEXT_MAX = 200
 // #1161 silent-end fallback text now lives in ../silent-end.ts
 // (`silentEndFallbackText`, imported above) so the transport-boundary
 // tests exercise the real string — see PR #2892.
-import { splitMarkdownChunks, repairEscapedWhitespace, normalizeParagraphBreaks, addParagraphSpacers, normalizePunctuation, stripExcessBold, escapeMarkdown, hardenCardBreaks, RICH_MESSAGE_MAX_CHARS } from '../format.js'
+import { splitMarkdownChunks, repairEscapedWhitespace, normalizeParagraphBreaks, addParagraphSpacers, normalizePunctuation, stripExcessBold, hardenCardBreaks, RICH_MESSAGE_MAX_CHARS } from '../format.js'
 import { richMessage } from '../rich-send.js'
 import { decideRedeliver, decideRedeliverCapture } from './redelivery-decision.js'
 import { scrubVoice } from '../text-voice-scrub.js'
@@ -381,14 +374,7 @@ import {
   type DeliverCapturedProseDeps,
 } from './outbound-send-path.js'
 import {
-  validateInlineKeyboard,
-  type AnyButton,
-} from '../telegram-button-constraints.js'
-import {
-  wrapAgentCallbacks,
-  redactAgentKeyboard,
   parseAgentCallback,
-  extractAgentButtonMeta,
   keyboardIsSingleUse,
   finalizeCallback,
   resolveTapAnnotation,
@@ -424,7 +410,6 @@ import {
 } from '../turn-flush-safety.js'
 import {
   resolveReplyOwnerTurnId,
-  decideAnswerLatchSuppression,
 } from '../reply-owner-resolve.js'
 // PR A — deterministic answer-ready quiescence flush (late-delivery fix).
 import {
@@ -639,7 +624,6 @@ import {
 } from './emission-authority.js'
 import { CurrentTurnMap } from './current-turn-map.js'
 import { resolveAnswerThreadId } from './answer-thread-resolve.js'
-import { resolveChatIdFallback } from './chat-id-fallback.js'
 import { decideObligationTurnEnd } from './obligation-turn-end.js'
 import { maybeRotate } from './turns-jsonl-rotate.js'
 import {
