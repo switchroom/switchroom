@@ -103,6 +103,19 @@ import {
   installUpdateTap,
   installUnhandledMessageCatchAll,
 } from './unhandled-message.js'
+import {
+  safeName,
+  handleContactMessage,
+  handleLocationMessage,
+  handleVenueMessage,
+  handlePollMessage,
+  handleWebAppDataMessage,
+  handleUsersSharedMessage,
+  handleChatSharedMessage,
+  handleSuccessfulPaymentMessage,
+  handlePassportDataMessage,
+  type MediaEnvelopeDeps,
+} from './media-message-handlers.js'
 import { fmtLocalStamp, resolveEnvTimezone, renderLogTimestampsLocal } from '../shared/local-time.js'
 import { StatusReactionController } from '../status-reactions.js'
 import { DeferredDoneReactions } from '../reaction-defer.js'
@@ -15134,9 +15147,8 @@ function isAuthorizedSender(ctx: Context): boolean {
   return false
 }
 
-function safeName(s: string | undefined): string | undefined {
-  return s?.replace(/[<>\[\]\r\n;]/g, '_')
-}
+// safeName moved to ./media-message-handlers.ts (switchroom#2996 P6 cluster A);
+// imported above and shared with the attachment handlers still inline here.
 
 // ─── Inbound message handling ─────────────────────────────────────────────
 
@@ -24759,106 +24771,22 @@ bot.on('message:animation', async ctx => {
     name: safeName(animation.file_name),
   })
 })
-bot.on('message:contact', async ctx => {
-  try {
-    const c = ctx.message.contact
-    const phone = safeName(c.phone_number) ?? '?'
-    const first = safeName(c.first_name) ?? ''
-    const last = safeName(c.last_name) ?? ''
-    const name = [first, last].filter(Boolean).join(' ') || '?'
-    const userIdPart = c.user_id != null ? ` user_id=${c.user_id}` : ''
-    const text = `(contact: name="${name}" phone="${phone}"${userIdPart})`
-    process.stderr.write(`telegram gateway: inbound contact from chat=${ctx.chat?.id ?? '?'}\n`)
-    await handleInbound(ctx, text, undefined)
-  } catch (err) {
-    process.stderr.write(`telegram gateway: contact handler error: ${(err as Error).message}\n`)
-  }
-})
-bot.on('message:location', async ctx => {
-  try {
-    const loc = ctx.message.location
-    const lat = typeof loc.latitude === 'number' ? loc.latitude.toFixed(6) : '?'
-    const lon = typeof loc.longitude === 'number' ? loc.longitude.toFixed(6) : '?'
-    const live = (loc as { live_period?: number }).live_period != null
-      ? ` live_period=${(loc as { live_period?: number }).live_period}s`
-      : ''
-    const text = `(location: lat=${lat} lon=${lon}${live})`
-    process.stderr.write(`telegram gateway: inbound location from chat=${ctx.chat?.id ?? '?'}\n`)
-    await handleInbound(ctx, text, undefined)
-  } catch (err) {
-    process.stderr.write(`telegram gateway: location handler error: ${(err as Error).message}\n`)
-  }
-})
-bot.on('message:venue', async ctx => {
-  try {
-    const v = ctx.message.venue
-    const title = safeName(v.title) ?? '?'
-    const address = safeName(v.address) ?? '?'
-    const lat = typeof v.location?.latitude === 'number' ? v.location.latitude.toFixed(6) : '?'
-    const lon = typeof v.location?.longitude === 'number' ? v.location.longitude.toFixed(6) : '?'
-    const text = `(venue: title="${title}" address="${address}" lat=${lat} lon=${lon})`
-    process.stderr.write(`telegram gateway: inbound venue from chat=${ctx.chat?.id ?? '?'}\n`)
-    await handleInbound(ctx, text, undefined)
-  } catch (err) {
-    process.stderr.write(`telegram gateway: venue handler error: ${(err as Error).message}\n`)
-  }
-})
-bot.on('message:poll', async ctx => {
-  try {
-    const p = ctx.message.poll
-    const q = safeName(p.question) ?? '?'
-    const optsCount = Array.isArray(p.options) ? p.options.length : 0
-    const optsList = Array.isArray(p.options)
-      ? p.options.slice(0, 10).map(o => safeName((o as { text?: string }).text) ?? '?').join(' | ')
-      : ''
-    const anon = p.is_anonymous ? ' anonymous' : ''
-    const text = `(poll: question="${q}" options=${optsCount}${anon}${optsList ? ` choices=[${optsList}]` : ''})`
-    process.stderr.write(`telegram gateway: inbound poll from chat=${ctx.chat?.id ?? '?'}\n`)
-    await handleInbound(ctx, text, undefined)
-  } catch (err) {
-    process.stderr.write(`telegram gateway: poll handler error: ${(err as Error).message}\n`)
-  }
-})
-bot.on('message:web_app_data', async ctx => {
-  try {
-    const w = ctx.message.web_app_data
-    // web_app_data.data is arbitrary user-supplied string from the
-    // mini-app — pass it through but cap length so a malicious mini-app
-    // can't blast the agent with multi-MB payloads.
-    const raw = typeof w.data === 'string' ? w.data : ''
-    const data = raw.length > 4096 ? raw.slice(0, 4096) + '…(truncated)' : raw
-    const button = safeName(w.button_text) ?? '?'
-    const text = `(web_app_data: button="${button}" data=${JSON.stringify(data)})`
-    process.stderr.write(`telegram gateway: inbound web_app_data from chat=${ctx.chat?.id ?? '?'} button="${button}" bytes=${raw.length}\n`)
-    await handleInbound(ctx, text, undefined)
-  } catch (err) {
-    process.stderr.write(`telegram gateway: web_app_data handler error: ${(err as Error).message}\n`)
-  }
-})
-bot.on('message:users_shared', async ctx => {
-  try {
-    const u = ctx.message.users_shared
-    const users = Array.isArray(u.users) ? u.users : []
-    const ids = users.map(usr => String((usr as { user_id?: number }).user_id ?? '?')).join(',')
-    const text = `(users_shared: request_id=${u.request_id ?? '?'} user_ids=[${ids}] count=${users.length})`
-    process.stderr.write(`telegram gateway: inbound users_shared from chat=${ctx.chat?.id ?? '?'} count=${users.length}\n`)
-    await handleInbound(ctx, text, undefined)
-  } catch (err) {
-    process.stderr.write(`telegram gateway: users_shared handler error: ${(err as Error).message}\n`)
-  }
-})
-bot.on('message:chat_shared', async ctx => {
-  try {
-    const c = ctx.message.chat_shared
-    const title = safeName((c as { title?: string }).title) ?? ''
-    const titlePart = title ? ` title="${title}"` : ''
-    const text = `(chat_shared: request_id=${c.request_id ?? '?'} chat_id=${c.chat_id ?? '?'}${titlePart})`
-    process.stderr.write(`telegram gateway: inbound chat_shared from chat=${ctx.chat?.id ?? '?'} shared_chat_id=${c.chat_id ?? '?'}\n`)
-    await handleInbound(ctx, text, undefined)
-  } catch (err) {
-    process.stderr.write(`telegram gateway: chat_shared handler error: ${(err as Error).message}\n`)
-  }
-})
+// Injected dispatch/log surfaces for the extracted media-envelope handlers
+// (switchroom#2996 P6 cluster A). Bound once here so each thin bot.on
+// delegation stays a one-liner.
+const mediaEnvelopeDeps: MediaEnvelopeDeps = {
+  handleInbound,
+  handleAckOnly,
+  handleRefusal,
+  log: line => process.stderr.write(line),
+}
+bot.on('message:contact', ctx => handleContactMessage(ctx, mediaEnvelopeDeps))
+bot.on('message:location', ctx => handleLocationMessage(ctx, mediaEnvelopeDeps))
+bot.on('message:venue', ctx => handleVenueMessage(ctx, mediaEnvelopeDeps))
+bot.on('message:poll', ctx => handlePollMessage(ctx, mediaEnvelopeDeps))
+bot.on('message:web_app_data', ctx => handleWebAppDataMessage(ctx, mediaEnvelopeDeps))
+bot.on('message:users_shared', ctx => handleUsersSharedMessage(ctx, mediaEnvelopeDeps))
+bot.on('message:chat_shared', ctx => handleChatSharedMessage(ctx, mediaEnvelopeDeps))
 bot.on('message:dice', async ctx => {
   process.stderr.write(`telegram gateway: inbound dice from chat=${ctx.chat?.id ?? '?'}\n`)
   await handleAckOnly(ctx, 'dice', { emoji: '🎲' })
@@ -24875,37 +24803,8 @@ bot.on('message:paid_media', async ctx => {
   process.stderr.write(`telegram gateway: inbound paid_media from chat=${ctx.chat?.id ?? '?'}\n`)
   await handleAckOnly(ctx, 'paid_media', { warn: true })
 })
-bot.on('message:successful_payment', async ctx => {
-  // Money has changed hands — log loudly with the structured fields a
-  // reconciliation script would want. Do NOT forward to the agent; an
-  // LLM should not be in the loop for confirming receipts.
-  try {
-    const p = ctx.message.successful_payment
-    process.stderr.write(
-      `telegram gateway: inbound successful_payment from chat=${ctx.chat?.id ?? '?'} ` +
-      `currency=${p.currency ?? '?'} total_amount=${p.total_amount ?? '?'} ` +
-      `payload="${safeName(p.invoice_payload) ?? ''}" ` +
-      `provider_charge=${safeName(p.provider_payment_charge_id) ?? '?'} ` +
-      `telegram_charge=${safeName(p.telegram_payment_charge_id) ?? '?'}\n`,
-    )
-  } catch (err) {
-    process.stderr.write(`telegram gateway: successful_payment log failed: ${(err as Error).message}\n`)
-  }
-  await handleAckOnly(ctx, 'successful_payment', { warn: true })
-})
-bot.on('message:passport_data', async ctx => {
-  // Telegram Passport is a regulated identity-document flow. Forwarding
-  // the encrypted credentials to an LLM-driven agent would be reckless;
-  // we explicitly refuse to handle it and tell the user so they can
-  // route via the proper channel. Logged at SECURITY level so operators
-  // can see if a passport_data inbound ever lands here (an outlier worth
-  // investigating).
-  await handleRefusal(
-    ctx,
-    'passport_data',
-    "Sorry, I don't handle Telegram Passport data. Please share identity documents through a supported channel — your agent does not process encrypted Passport payloads.",
-  )
-})
+bot.on('message:successful_payment', ctx => handleSuccessfulPaymentMessage(ctx, mediaEnvelopeDeps))
+bot.on('message:passport_data', ctx => handlePassportDataMessage(ctx, mediaEnvelopeDeps))
 bot.on('message:checklist_tasks_done' as Parameters<typeof bot.on>[0], (ctx) => {
   handleChecklistUpdate(ctx as unknown as Context, 'checklist_tasks_done')
 })
