@@ -25,8 +25,31 @@
  * message.
  */
 
-/** Tools whose `input.text` IS the canonical answer surface. */
+/** Tool suffixes whose `input.text` IS the canonical answer surface. */
 export const REPLY_TOOLS = new Set(['reply', 'stream_reply'])
+
+/**
+ * Strip this plugin's `mcp__<server-key>__telegram__` prefix, matched by the
+ * same key-agnostic regex `computeLabel` / `isTelegramReplyTool` use so renames
+ * and forks (`clerk-telegram`, `switchroom-telegram`, …) all resolve. A bare
+ * name (no prefix) is returned unchanged.
+ */
+const TELEGRAM_TOOL_PREFIX_RE = /^mcp__[^_].*?telegram__/
+
+/**
+ * Prefix-aware membership test for {@link REPLY_TOOLS}.
+ *
+ * Production jsonl carries the fully-qualified MCP tool name
+ * (`mcp__switchroom-telegram__stream_reply`), so a bare `REPLY_TOOLS.has(name)`
+ * is always false in prod and the draft-then-send suppression path silently
+ * goes inert (#3231). Bare names ('reply' / 'stream_reply') can still appear
+ * from non-MCP sources, so both wire shapes must match: strip the telegram MCP
+ * prefix (a no-op for bare names) then test the suffix against REPLY_TOOLS.
+ */
+export function isReplyTool(toolName: string | null | undefined): boolean {
+  if (typeof toolName !== 'string') return false
+  return REPLY_TOOLS.has(toolName.replace(TELEGRAM_TOOL_PREFIX_RE, ''))
+}
 
 /**
  * Normalize for prefix comparison: strip markdown/HTML-ish emphasis,

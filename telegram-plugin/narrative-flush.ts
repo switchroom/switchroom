@@ -39,7 +39,7 @@
  * effects and the per-turn lifetime.
  */
 
-import { REPLY_TOOLS, isDraftOfReply } from './narrative-dedup.js'
+import { isReplyTool, isDraftOfReply } from './narrative-dedup.js'
 
 /**
  * Time-box for the parked-narrative early-paint (the kernel's home for the
@@ -139,7 +139,7 @@ export class NarrativeFlushController {
   resolveOnTool(toolName: string, input: Record<string, unknown> | undefined): void {
     this.scheduler.disarm()
     const replyText =
-      REPLY_TOOLS.has(toolName) && typeof input?.text === 'string' ? (input.text as string) : null
+      isReplyTool(toolName) && typeof input?.text === 'string' ? (input.text as string) : null
     if (replyText != null) this.maybeRetract(replyText)
     const pending = this.pending
     if (pending == null) return

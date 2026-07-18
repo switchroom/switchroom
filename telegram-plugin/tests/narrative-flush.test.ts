@@ -101,7 +101,10 @@ describe('anti-double-print (deferred path) — a draft-then-send reply is suppr
     const answer = 'The build is green — all 412 tests pass.'
     ctrl.stage(answer) // the model drafting its answer just before reply()
 
-    ctrl.resolveOnTool('reply', { text: answer }) // draft-then-send → SUPPRESS
+    // #3231: feed the PREFIXED prod wire shape (mcp__…__reply). Before the
+    // isReplyTool fix a bare REPLY_TOOLS.has() missed this and the draft was
+    // WRONGLY shown — the suppression path was inert on the real wire shape.
+    ctrl.resolveOnTool('mcp__switchroom-telegram__reply', { text: answer }) // draft-then-send → SUPPRESS
     expect(show).not.toHaveBeenCalled()
     expect(retractShown).not.toHaveBeenCalled() // nothing was shown to retract
     expect(scheduler.isArmed).toBe(false)
@@ -128,7 +131,8 @@ describe('anti-double-print (TIMER path) — a timer-painted draft is retracted'
 
     // The reply finally lands and IS that block → must be retracted, not left
     // on the card to double-print against the canonical reply.
-    ctrl.resolveOnTool('stream_reply', { text: answer })
+    // #3231: prefixed prod wire shape.
+    ctrl.resolveOnTool('mcp__switchroom-telegram__stream_reply', { text: answer })
     expect(retractShown).toHaveBeenCalledTimes(1)
     expect(retractShown).toHaveBeenCalledWith(answer)
     expect(show).toHaveBeenCalledTimes(1) // not re-shown
