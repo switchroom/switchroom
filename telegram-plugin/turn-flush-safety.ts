@@ -155,28 +155,60 @@ export const FLUSH_SUBSTANTIVE_MIN_CHARS = 200
  * `[verboseNarration(250), realAnswer(150)]` a reversed length scan returns the
  * 250-char narration and DROPS the 150-char real answer. Instead we take the
  * last non-empty block as the answer and strip only the EARLIER blocks — and
- * only when they look like intent-narration (short, or the classic "Let me…" /
- * "I'll…" openers). If the earlier blocks are themselves substantial (a genuine
- * multi-paragraph answer written as several blocks) we keep the whole thing
- * joined, so we never truncate a real long answer down to its last paragraph.
+ * only when they look like intent-narration. If the earlier blocks are
+ * themselves substantial (a genuine multi-paragraph answer written as several
+ * blocks) we keep the whole thing joined, so we never truncate a real long
+ * answer down to its last paragraph.
+ *
+ * #3237 — the STRUCTURAL discriminator. The opener heuristic below
+ * (`isNarrationBlock`) cannot tell a narration preamble ("Let me pull the
+ * numbers…" followed by a separate reply) from a real answer paragraph that
+ * merely OPENS with "Let me explain…": both match the same regex, and length
+ * cannot separate them (the observed narration was itself ≥200 chars). The one
+ * signal that DOES separate them is structural — did a `tool_use` follow this
+ * block in the model's actual message? A narration preamble is drafted, then
+ * the model ACTS (a tool call follows it); a terminal answer paragraph is not
+ * followed by any tool call. That per-block flag (`lastInMessage`) is computed
+ * upstream by `projectAssistantTextBlocks` (session-tail.ts) and, when the
+ * caller plumbs it through as `followedByToolUse`, we trust STRUCTURE ALONE:
+ * a preceding block is narration iff it was followed by a tool_use. Where the
+ * structural flag is ABSENT for a block (legacy `string[]` caller, or the
+ * accumulator lost provenance) we fall back to the opener/trailer heuristic for
+ * that block — so the change is strictly additive: never worse than the
+ * opener-only strip, deterministic and truncation-free when the signal is
+ * present.
+ *
+ * `followedByToolUse` is a parallel array aligned to `blocks` (index `i` ⇒
+ * `blocks[i]`); it is zipped BEFORE the empty-block filter so alignment holds
+ * even if the caller passes empty/whitespace blocks. `undefined` at an index
+ * (or a missing/short array) means "no reliable structural signal for this
+ * block" → opener-heuristic fallback.
  *
  * `blocks` are already trimmed/non-empty candidates (silent markers removed by
  * the caller's guards). Returns the chosen delivery text.
  */
-export function selectFlushDeliveryText(blocks: string[]): string {
+export function selectFlushDeliveryText(
+  blocks: string[],
+  followedByToolUse?: ReadonlyArray<boolean | undefined>,
+): string {
   const candidates = blocks
-    .map(b => b.trim())
-    .filter(b => b.length > 0)
+    .map((b, i) => ({ text: b.trim(), followedByToolUse: followedByToolUse?.[i] }))
+    .filter(c => c.text.length > 0)
   if (candidates.length === 0) return ''
-  if (candidates.length === 1) return candidates[0]
-  const answer = candidates[candidates.length - 1]
+  if (candidates.length === 1) return candidates[0].text
+  const answer = candidates[candidates.length - 1].text
   const preceding = candidates.slice(0, -1)
   // Deliver only the terminal answer when every earlier block is
-  // intent-narration (a short block, or a "Let me…/I'll…/I'm going to…" opener).
-  // Otherwise the earlier blocks carry real content — keep the full joined text
-  // so a legitimate multi-block answer is never truncated to its last paragraph.
-  const allNarration = preceding.every(isNarrationBlock)
-  return allNarration ? answer : candidates.join('\n\n')
+  // intent-narration. Per block: when a reliable structural signal is present
+  // (`followedByToolUse !== undefined`) trust it ALONE — a block followed by a
+  // tool_use in its message is the model drafting-then-acting (narration);
+  // otherwise fall back to the opener/trailer heuristic. Otherwise the earlier
+  // blocks carry real content — keep the full joined text so a legitimate
+  // multi-block answer is never truncated to its last paragraph (#3237).
+  const allNarration = preceding.every(c =>
+    c.followedByToolUse !== undefined ? c.followedByToolUse : isNarrationBlock(c.text),
+  )
+  return allNarration ? answer : candidates.map(c => c.text).join('\n\n')
 }
 
 /**
@@ -244,6 +276,15 @@ export interface FlushDecisionInput {
    * is false — once the model has called reply / stream_reply the turn is
    * served and trailing terminal text is dropped (see `decideTurnFlush`). */
   capturedText: string[]
+  /** Optional per-block structural provenance, aligned to `capturedText`
+   * (index `i` describes `capturedText[i]`). `true` ⇒ a `tool_use` followed
+   * this text block in its assistant message (the draft-then-send narration
+   * signal — the negation of `projectAssistantTextBlocks`' `lastInMessage`).
+   * Consumed by `selectFlushDeliveryText` to separate a narration preamble from
+   * a real answer paragraph that merely opens with a narration phrase (#3237).
+   * When absent (legacy caller / lost provenance) the strip falls back to the
+   * opener/trailer heuristic, so this field is strictly additive. */
+  capturedBlockMeta?: boolean[]
   /** Feature flag — defaults to true. Pass `false` to force skip everywhere. */
   flushEnabled?: boolean
 }
@@ -316,7 +357,10 @@ export function decideTurnFlush(input: FlushDecisionInput): FlushDecision {
   // blob (see `selectFlushDeliveryText`). The silent-marker / empty guards above
   // still run on the full `joined` string so a partly-silent turn is classified
   // correctly; only the DELIVERED text is narrowed to the answer.
-  return { kind: 'flush', text: selectFlushDeliveryText(input.capturedText) }
+  return {
+    kind: 'flush',
+    text: selectFlushDeliveryText(input.capturedText, input.capturedBlockMeta),
+  }
 }
 
 /**

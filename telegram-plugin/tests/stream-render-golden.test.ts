@@ -75,6 +75,7 @@ function makeTurn(over: Partial<CurrentTurn> = {}): CurrentTurn {
     lastReplyText: '',
     answerStream: null,
     capturedText: ['The composed terminal answer that the model never sent via reply.'],
+    capturedBlockMeta: [false],
     finalAnswerDelivered: false,
     finalAnswerSubstantive: false,
     answerDelivered: false,
@@ -288,6 +289,65 @@ describe('stream-render — turn-flush records into the shared OutboundDedupCach
     expect(h.delivered).toContain(answer)
     // the module's OWN record statement (stream-render.ts:1784) ran
     expect(h.dedup.check(CHAT, undefined, answer, Date.now(), null)).not.toBeNull()
+  })
+})
+
+// ── #3237 HARD GATE: block provenance survives stream-render accumulation ───
+// The whole fix hinges on `ev.lastInMessage` surviving the `case 'text'`
+// accumulation into `turn.capturedBlockMeta` and reaching selectFlushDeliveryText
+// via decideTurnFlush. These drive the REAL handleSessionEvent text path (not a
+// preset capturedText) so the accumulation code actually runs, then assert BOTH
+// the accumulated provenance AND the flush's delivered text. Each case is
+// engineered so the OPPOSITE outcome would result if provenance were lost and
+// the strip fell back to the opener heuristic — proving structure is consulted.
+describe('#3237 — block provenance survives accumulation and reaches the flush strip', () => {
+  function driveTextTurn(blocks: Array<{ text: string; lastInMessage: boolean }>) {
+    const turn = makeTurn({ capturedText: [], capturedBlockMeta: [], answerStream: null })
+    const h = makeStreamDeps({ turn })
+    blocks.forEach((b, i) =>
+      handleSessionEvent(h.deps, {
+        kind: 'text',
+        text: b.text,
+        blockIndex: i,
+        lastInMessage: b.lastInMessage,
+      }),
+    )
+    return { turn, h }
+  }
+
+  it('narration FOLLOWED by a tool_use (lastInMessage=false) → provenance=[true,false], flush strips the preamble', async () => {
+    // "Here are the figures." matches NO opener regex — if provenance were lost
+    // the opener-only strip would KEEP it and deliver the whole blob. Structure
+    // ([true,false]) strips it. Asserting answer-only proves structure was used.
+    const narration = 'Here are the figures you asked about.'
+    const answer = 'All three services are green.'
+    const { turn, h } = driveTextTurn([
+      { text: narration, lastInMessage: false }, // a tool_use followed it in its message
+      { text: answer, lastInMessage: true }, // terminal
+    ])
+    // Provenance survived the accumulation into the parallel array.
+    expect(turn.capturedBlockMeta).toEqual([true, false])
+    handleSessionEvent(h.deps, { kind: 'turn_end', durationMs: 1200 })
+    await settle()
+    expect(h.delivered.join('\n')).toContain(answer)
+    expect(h.delivered.join('\n')).not.toContain('Here are the figures')
+  })
+
+  it('#3237 real answer: two paragraphs, NEITHER followed by a tool_use (lastInMessage=true) → provenance=[false,false], flush keeps BOTH (no truncation)', async () => {
+    // p1 OPENS with "Let me explain…" — the opener strip WOULD drop it if
+    // provenance were lost. Structure ([false,false]) keeps the full answer.
+    const p1 = 'Let me explain the plan in two parts.'
+    const p2 = 'Part two: we ship it behind the existing flag.'
+    const { turn, h } = driveTextTurn([
+      { text: p1, lastInMessage: true },
+      { text: p2, lastInMessage: true },
+    ])
+    expect(turn.capturedBlockMeta).toEqual([false, false])
+    handleSessionEvent(h.deps, { kind: 'turn_end', durationMs: 1200 })
+    await settle()
+    const out = h.delivered.join('\n')
+    expect(out).toContain('Let me explain the plan')
+    expect(out).toContain('Part two')
   })
 })
 

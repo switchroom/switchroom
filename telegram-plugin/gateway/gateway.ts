@@ -3386,6 +3386,13 @@ export type CurrentTurn = {
   silentAnchorMessageId: number | null
   silentAnchorText: string
   capturedText: string[]
+  // #3237 — per-block structural provenance, pushed in LOCKSTEP with
+  // `capturedText` at the `case 'text'` accumulation site (stream-render.ts).
+  // `capturedBlockMeta[i] === true` ⇒ a tool_use followed `capturedText[i]` in
+  // its assistant message (`!ev.lastInMessage`), i.e. the model drafted then
+  // acted — the deterministic narration signal the flush strip uses to avoid
+  // truncating a real answer that merely opens with "Let me explain…".
+  capturedBlockMeta: boolean[]
   orphanedReplyTimeoutId: ReturnType<typeof setTimeout> | null
   // PR A — answer-ready quiescence flush timer. Armed in `case 'text'` once the
   // turn has a genuine composed terminal answer and is quiescent; fires a
@@ -14344,6 +14351,7 @@ const answerReadyFlush = new AnswerReadyFlushController<CurrentTurn>({
       chatId: turn.sessionChatId,
       replyCalled: turn.replyCalled,
       capturedText: turn.capturedText,
+      capturedBlockMeta: turn.capturedBlockMeta,
       flushEnabled: TURN_FLUSH_SAFETY_ENABLED,
     },
     inFlightToolCount: toolFlightTracker.inFlightCount(),
