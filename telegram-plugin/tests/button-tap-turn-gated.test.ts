@@ -129,30 +129,39 @@ describe("agent button taps use the turn-gate (mid-turn → buffer)", () => {
   });
 
   describe("the agent: callback handler routes through the helper", () => {
+    // #2996 P6: the agent-callback family moved to
+    // agent-button-callback-handler.ts (handleAgentButtonCallback); the
+    // structural pins now scrape the extracted module. The injected
+    // deliverButtonTapInbound + restarting-notice bindings stay in gateway.ts.
+    const moduleSrc = readFileSync(
+      resolve(__dirname, "..", "gateway", "agent-button-callback-handler.ts"),
+      "utf8",
+    );
     it("delivers the tap via deliverButtonTapInbound, not a raw sendToAgent", () => {
-      // Locate the agent-callback handler block.
-      const anchor = gatewaySrc.indexOf("const agentCb = parseAgentCallback(data)");
+      const anchor = moduleSrc.indexOf("const agentCb = parseAgentCallback(data)");
       expect(anchor, "agent-callback handler missing").toBeGreaterThan(0);
-      const handler = gatewaySrc.slice(anchor, gatewaySrc.indexOf("// Permission request buttons.", anchor));
+      const handler = moduleSrc.slice(anchor);
       // The tap is routed through the turn-safe helper...
-      expect(handler).toMatch(/await deliverButtonTapInbound\(selfAgentBtn, inboundMsg\)/);
+      expect(handler).toMatch(/await deps\.deliverButtonTapInbound\(selfAgentBtn, inboundMsg\)/);
       // ...and NOT via a raw ungated sendToAgent of the tap inbound (the
       // regressed path that stranded the tap mid-turn).
       expect(handler).not.toMatch(/ipcServer\.sendToAgent\(selfAgentBtn, inboundMsg\)/);
+      // The gateway binding still wires the real helper.
+      expect(gatewaySrc).toMatch(/deliverButtonTapInbound,/);
     });
 
     it("still shows the restart notice only on bridge-offline", () => {
-      const anchor = gatewaySrc.indexOf("const agentCb = parseAgentCallback(data)");
-      const handler = gatewaySrc.slice(anchor, gatewaySrc.indexOf("// Permission request buttons.", anchor));
+      const handler = moduleSrc;
       // The restart notice is gated on the bridge-offline outcome — a mid-turn
       // buffered tap must NOT nag the user (it will be actioned at idle).
       expect(handler).toMatch(/btnOutcome === 'buffered-bridge-offline'/);
-      expect(handler).toMatch(/button-tap-restarting-notice/);
+      // The notice text + verb live in the gateway's injected binding.
+      expect(gatewaySrc).toMatch(/button-tap-restarting-notice/);
     });
 
     it("preserves the ack toast and single-use keyboard strip (UX unchanged)", () => {
-      const anchor = gatewaySrc.indexOf("const agentCb = parseAgentCallback(data)");
-      const handler = gatewaySrc.slice(anchor, gatewaySrc.indexOf("// Permission request buttons.", anchor));
+      const anchor = moduleSrc.indexOf("const agentCb = parseAgentCallback(data)");
+      const handler = moduleSrc.slice(anchor);
       // Ack toast fires FIRST (before delivery) so the tap always registers…
       const ackIdx = handler.indexOf("answerCallbackQuery({ text: ackText })");
       const deliverIdx = handler.indexOf("deliverButtonTapInbound(");
