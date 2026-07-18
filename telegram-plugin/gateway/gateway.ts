@@ -913,7 +913,7 @@ import {
 import { findAgentProcessInContainer } from './boot-probes.js'
 import { applySubagentsSchema, getSubagentByJsonlId, resolveSubagentOriginTurnKey, listNonTerminalSubagentsForTurn } from '../registry/subagents-schema.js'
 import type { InterruptedSubagent } from './resume-inbound-builder.js'
-import { resolveWorkerFeedDispatch, type WorkerFeedDispatch } from './worker-feed-dispatch.js'
+import { resolveWorkerFeedDispatch, handleWorkerResume, type WorkerFeedDispatch } from './worker-feed-dispatch.js'
 import {
   resolveSubagentStatusSurface,
   isOrphanSubagentStatusEnabled,
@@ -25946,25 +25946,12 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                   `telegram gateway: worker ${agentId} card RESURRECTED — false terminal finish reversed, worker resumed (issue #3023)\n`,
                 )
               },
-              // Issue #3373 (SendMessage-resume feed re-surface). A worker with a
-              // GENUINE terminal completion that is resumed via SendMessage grows
-              // its jsonl past the terminal boundary and is re-registered live by
-              // the watcher (#3315). Clear the feed's terminal `finalized` latch so
-              // the resumed worker's next onProgress cue repaints a fresh live row
-              // (without this the latch swallows every resumed cue → the worker
-              // reads as silence). Distinct from onResurrect: no bounded-chain
-              // budget — a worker may be stopped/resumed any number of times.
+              // Issue #3373 (SendMessage-resume feed re-surface): clear the
+              // feed's terminal `finalized` latch so a resumed worker's cues
+              // repaint a live card. Body lives in worker-feed-dispatch.ts
+              // (handleWorkerResume, unit-tested there) — thin delegation only.
               onResume: (agentId, _description) => {
-                try {
-                  workerActivityFeed?.resurrect(agentId)
-                } catch (err) {
-                  process.stderr.write(
-                    `telegram gateway: worker resume feed re-surface error agent=${agentId}: ${(err as Error).message}\n`,
-                  )
-                }
-                process.stderr.write(
-                  `telegram gateway: worker ${agentId} card RE-SURFACED — resumed via SendMessage after a genuine terminal (issue #3373)\n`,
-                )
+                handleWorkerResume(workerActivityFeed, agentId, (m) => process.stderr.write(m + '\n'))
               },
               // Issue #3023 (bounded chain). A worker resurrected once and then
               // falsely finalised again is NOT resurrected forever — the
