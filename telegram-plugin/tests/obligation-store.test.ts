@@ -118,6 +118,49 @@ describe("obligation-store", () => {
     expect(loaded[0]!.representCount).toBe(1);
   });
 
+  it("round-trips a valid capturedDelivery snapshot through persist → load (#3282)", () => {
+    const { fs } = memFs();
+    const capturedDelivery = {
+      chunks: ["c0", "c1"],
+      chunkStates: [
+        { index: 0, messageIds: [10], confirmed: true },
+        { index: 1, messageIds: [11, 12], confirmed: false },
+      ],
+    };
+    persistObligations(PATH, fs, [ob("c:3#715", { capturedDelivery })]);
+    const loaded = loadObligations(PATH, fs);
+    expect(loaded).toHaveLength(1);
+    expect(loaded[0]!.capturedDelivery).toEqual(capturedDelivery);
+  });
+
+  it("STRIPS a malformed capturedDelivery (fail-open to fresh-generation represent) (#3282)", () => {
+    // A partial write / forward-incompatible shape must not crash the resume: the
+    // row survives (obligation preserved), the bad blob is dropped.
+    const bad = {
+      v: 1,
+      obligations: [
+        { ...ob("c:3#715"), capturedDelivery: { chunks: "not-an-array", chunkStates: [] } },
+        { ...ob("c:3#716"), capturedDelivery: { chunks: ["c0"], chunkStates: [{ index: 0 }] } },
+      ],
+    };
+    const { fs } = memFs({ [PATH]: JSON.stringify(bad) });
+    const loaded = loadObligations(PATH, fs);
+    expect(loaded.map((o) => o.originTurnId)).toEqual(["c:3#715", "c:3#716"]);
+    expect(loaded[0]!.capturedDelivery).toBeUndefined();
+    expect(loaded[1]!.capturedDelivery).toBeUndefined();
+  });
+
+  it("STRIPS an empty-chunks capturedDelivery (nothing to resume → fresh-gen, bounded) (#3282)", () => {
+    const bad = {
+      v: 1,
+      obligations: [{ ...ob("c:3#715"), capturedDelivery: { chunks: [], chunkStates: [] } }],
+    };
+    const { fs } = memFs({ [PATH]: JSON.stringify(bad) });
+    const loaded = loadObligations(PATH, fs);
+    expect(loaded).toHaveLength(1);
+    expect(loaded[0]!.capturedDelivery).toBeUndefined();
+  });
+
   it("never throws on a write failure — degrades to in-memory (logs)", () => {
     const logs: string[] = [];
     const fs: ObligationStoreFsSeam = {

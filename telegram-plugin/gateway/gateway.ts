@@ -569,8 +569,10 @@ import {
   ObligationLedger,
   buildObligationRepresentInbound,
   obligationEscalationText,
+  type CapturedDeliverySnapshot,
 } from './obligation-ledger.js'
 import { loadObligations, persistObligations } from './obligation-store.js'
+import { buildCapturedDeliverySnapshot, createCapturedResumeDispatcher } from './captured-answer-resume.js'
 import {
   loadStatusPins,
   mutateStatusPinRow,
@@ -2331,12 +2333,14 @@ async function deliverAnswer(args: {
    *  the send alive if the user deleted their message. Null for synthesized
    *  turns (cron/handback) — those send bare, as before. */
   replyToMessageId: number | null
+  /** #3282 captured-answer RESUME (see captured-answer-resume.ts): re-deliver the SAME byte-identical chunks + pre-hydrate the ledger (non-confirmed tail only). */
+  resume?: { snapshot: CapturedDeliverySnapshot; hydrate: (ledger: BackstopDeliveryLedger, turnId: string) => void }
 }): Promise<{ sentIds: number[]; chunkCount: number; delivered: boolean; exhausted: boolean }> {
   const { chatId, turnId } = args
-  // Inject visible blank-line spacers into `\n\n` gaps, then split — exactly as
-  // executeReply does on the non-literal path (idempotent, one U+00A0 per gap).
-  const rendered = addParagraphSpacers(args.text)
-  const chunks = splitMarkdownChunks(rendered, RICH_MESSAGE_MAX_CHARS)
+  // Spacers into `\n\n` gaps then split (as executeReply); a resume re-delivers the EXACT captured chunks (byte-stable, no re-split).
+  const chunks = args.resume
+    ? args.resume.snapshot.chunks
+    : splitMarkdownChunks(addParagraphSpacers(args.text), RICH_MESSAGE_MAX_CHARS)
 
   const deps: ReplyChunkSendDeps = {
     sendRich: (opts, body, tid) =>
@@ -2427,6 +2431,9 @@ async function deliverAnswer(args: {
     threadId: args.threadId,
   })
 
+  // #3282 — a resume pre-hydrates the ledger (confirmed chunks never re-sent).
+  if (args.resume) args.resume.hydrate(backstopDeliveryLedger, turnId)
+
   // Bounded in-turn retry (finding-1 fix): resumes at the first unsent chunk on
   // each attempt via the ledger, so chunk 0 is delivered exactly once even
   // across retries. `delivered`/`exhausted` tell the caller whether the answer
@@ -2436,7 +2443,7 @@ async function deliverAnswer(args: {
     backstopDeliveryLedger,
     turnId,
     chunks,
-    args.cardMessageId,
+    args.resume ? null : args.cardMessageId,
     {
       sendChunk,
       readBack,
@@ -2456,6 +2463,9 @@ async function deliverAnswer(args: {
     },
     BACKSTOP_DELIVERY_MAX_ATTEMPTS,
   )
+  // #3282 — on a PARTIAL first-delivery, persist the per-chunk snapshot onto the still-OPEN obligation so the represent resumes the tail (not a regeneration).
+  if (!args.resume && !result.delivered && OBLIGATION_LEDGER_ENABLED)
+    obligationLedger.noteCapturedDelivery(turnId, buildCapturedDeliverySnapshot(backstopDeliveryLedger, turnId, chunks))
   return {
     sentIds: result.sentIds,
     chunkCount: result.chunkCount,
@@ -2722,6 +2732,12 @@ if (isGatewayMain && !STATIC && OBLIGATION_LEDGER_ENABLED) {
 // firing a second concurrent send for the same obligation while the first is
 // still awaiting (an escalation that takes >5s, or repeated failures).
 const obligationEscalateInFlight = new Set<string>()
+
+// #3282 — captured-answer resume driver (orchestration in the extracted module).
+const capturedResume = createCapturedResumeDispatcher({
+  deliverAnswer: (a) => deliverAnswer(a), obligationLedger, backstopDeliveryLedger,
+  flushedTurnSupersede, historyEnabled: HISTORY_ENABLED,
+})
 
 // ─── Serialize-until-replied (multitopic reply-routing) ───────────────────
 // Component 1 (deliver-before-drain gate). A buffered cross-topic inbound
@@ -10859,6 +10875,8 @@ function obligationSweep(): void {
       obligationLedger.close(o.originTurnId)
       return
     }
+    // #3282 — source-aware represent: a captured snapshot ⇒ resume the non-confirmed tail byte-identically; no snapshot ⇒ the fresh-generation represent below.
+    if (o.capturedDelivery != null) { capturedResume.dispatch(o); return }
     // Re-present goes through the bridge → buffer. Only the represent path is
     // gated on an empty buffer (let the existing drain run first, avoid
     // double-presenting). Escalation below is NOT gated on the buffer — it is a
@@ -17718,8 +17736,8 @@ function handleSessionEvent(ev: SessionEvent): void {
               }
               emitTurnRecord(turn, backstopTurnEndedAt)
             }
-            // GC the ledger only now — after success OR retry exhaustion — so a
-            // resume could always read prior progress up to this point.
+            // GC the IN-MEMORY ledger now; on a partial, deliverAnswer already
+            // persisted the snapshot to the durable obligation (#3282) to resume.
             backstopDeliveryLedger.clear(turn.turnId)
           }
           // #2094 cosmetic: the trailing `finally { purgeReactionTracking() }`
