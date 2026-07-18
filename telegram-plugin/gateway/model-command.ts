@@ -666,6 +666,16 @@ export const SR_MODEL_LABELS: Record<string, string> = {
   'sr-gemini-flash-lite': 'Gemini 3.1 Flash Lite',
   'sr-minimax-m3': 'MiniMax M3',
   'sr-deepseek-v4-flash': 'DeepSeek V4 Flash',
+  // xAI Grok / Moonshot Kimi / OpenAI GPT-5.6 (added 2026-07-19, pairs with the
+  // live litellm sr-* model_name additions). The `.5`/`.7`/`.6` version dots are
+  // valid model-arg chars (MODEL_ARG_RE) and match the sr-* ids in the proxy config.
+  'sr-grok-4.5': 'Grok 4.5',
+  'sr-grok-4.3': 'Grok 4.3',
+  'sr-kimi-k3': 'Kimi K3',
+  'sr-kimi-k2.7-code': 'Kimi K2.7 Code',
+  'sr-gpt-5.6-sol': 'GPT-5.6 Sol',
+  'sr-gpt-5.6-terra': 'GPT-5.6 Terra',
+  'sr-gpt-5.6-luna': 'GPT-5.6 Luna',
 }
 
 /**
@@ -681,6 +691,14 @@ export const SR_MODEL_ALIASES: Record<string, string> = {
   r1: 'sr-deepseek-r1',
   glm: 'sr-glm-5',
   codex: 'sr-codex-5.5',
+  // Flagship keyboard buttons for the three providers added 2026-07-19. Each
+  // points at that provider's top tier; the cheaper tiers (grok-4.3,
+  // kimi-k2.7-code, gpt-5.6-terra/luna) stay typeable via `/model sr-<id>` and
+  // keep a friendly label above, matching the "labels are a superset of buttons"
+  // design (SR_MODEL_LABELS doc comment).
+  grok: 'sr-grok-4.5',
+  kimi: 'sr-kimi-k3',
+  gpt: 'sr-gpt-5.6-sol',
 }
 
 /** Expand a short alias (case-insensitive) to its full sr-* id, or return the original. */
