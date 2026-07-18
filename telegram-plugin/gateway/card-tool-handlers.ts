@@ -43,13 +43,23 @@ import {
   renderSecretRequestCard,
   buildSecretRequestKeyboard,
 } from './secret-request-card.js'
+import {
+  renderMentalModelProposeCard,
+  buildMentalModelProposeKeyboard,
+} from './mental-model-propose-card.js'
+import { readDeclaredMentalModelNames } from './mental-model-propose-diff.js'
 import type {
   PendingVaultRequestSave,
   PendingVaultRequestAccess,
   PendingSecretRequest,
+  PendingMentalModelPropose,
 } from './callback-query-handlers.js'
 import type { SweepableCardStore } from './approval-card-stores.js'
 import type { PendingCardStore } from './pending-card-store.js'
+
+// Moved with executeMentalModelPropose (its only user) — the propose-name slug
+// gate, distinct from the vault-key regex.
+const MENTAL_MODEL_NAME_REGEX = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/
 
 // ─── Bot shape the handlers touch (grammy Bot / chat-locked wrapper) ────────
 
@@ -106,6 +116,25 @@ export interface CardToolHandlersDeps {
   listViaBroker: () => Promise<string[] | null>
   /** VAULT_REQUEST_ACCESS_TTL_MS (config-driven approval-card lifetime). */
   VAULT_REQUEST_ACCESS_TTL_MS: number
+  // ── executeMentalModelPropose deps ────────────────────────────────────────
+  /** The ONE pending-propose store (gateway singleton; expiry/restore stay there). */
+  pendingMentalModelProposes: SweepableCardStore<PendingMentalModelPropose>
+  /**
+   * The rate-limit window log — the SAME array instance the gateway-side
+   * checkMentalModelProposeRate mutates. The handler pushes onto it only
+   * after a card actually posts (validation errors / dupes don't consume
+   * budget); injected as the array (not an accessor) to keep the push
+   * byte-identical.
+   */
+  mentalModelProposeTimes: number[]
+  /** Per-agent propose rate limiter (window state lives in gateway). */
+  checkMentalModelProposeRate: (now?: number) => { ok: true } | { ok: false; retryAtMs: number }
+  /** Live switchroom.yaml bytes for the duplicate-name pre-check. */
+  readLiveSwitchroomConfigText: () => string
+  /** memory.mental_models[] schema caps (src/config/schema.ts), injected under source names. */
+  MENTAL_MODEL_SOURCE_QUERY_MAX: number
+  MENTAL_MODEL_MAX_TOKENS_CAP: number
+  MENTAL_MODEL_PROPOSE_MAX_PER_WINDOW: number
 }
 
 /**
@@ -126,6 +155,13 @@ export function createCardToolHandlers(deps: CardToolHandlersDeps) {
     sweepSecretRequests,
     listViaBroker,
     VAULT_REQUEST_ACCESS_TTL_MS,
+    pendingMentalModelProposes,
+    mentalModelProposeTimes,
+    checkMentalModelProposeRate,
+    readLiveSwitchroomConfigText,
+    MENTAL_MODEL_SOURCE_QUERY_MAX,
+    MENTAL_MODEL_MAX_TOKENS_CAP,
+    MENTAL_MODEL_PROPOSE_MAX_PER_WINDOW,
   } = deps
 
   async function executeVaultRequestSave(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
@@ -428,7 +464,176 @@ export function createCardToolHandlers(deps: CardToolHandlersDeps) {
     }
   }
 
-  return { executeVaultRequestSave, executeVaultRequestAccess, executeRequestSecret }
+  /**
+   * `mental_model_propose` tool (hindsight Phase 5) — the agent surfaces a
+   * candidate mental model for the operator to approve. Mirrors the
+   * `vault_request_access` shape: the agent can only PROPOSE; the [Approve]/[Deny]
+   * tap is operator-gated (handleMentalModelProposeCallback), so an agent can
+   * never self-approve. On Approve the proposal is DECLARED — appended to the
+   * agent's memory.mental_models[] via the operator-approved config-edit path
+   * (reusing config_propose_edit apply+reconcile) — and ensured in the bank. On
+   * Deny nothing is written. Guardrails enforced here BEFORE any card:
+   * duplicate-name rejection against the agent's already-declared models, and a
+   * per-agent rate limit so proposals stay non-spammy.
+   */
+  async function executeMentalModelPropose(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
+    const chat_id = String(args.chat_id ?? '')
+    if (!chat_id) throw new Error('mental_model_propose: chat_id is required')
+    const name = typeof args.name === 'string' ? args.name.trim() : ''
+    if (!name) throw new Error('mental_model_propose: name is required')
+    if (!MENTAL_MODEL_NAME_REGEX.test(name)) {
+      throw new Error('mental_model_propose: name must be a slug (letters/digits/_/-, ≤64 chars, e.g. `training-plan-state`)')
+    }
+    const source_query = typeof args.source_query === 'string' ? args.source_query.trim() : ''
+    if (!source_query) throw new Error('mental_model_propose: source_query is required')
+    // Enforce the memory.mental_models[] schema cap (src/config/schema.ts) up-front
+    // so the operator never approves a card that then fails hostd config validation.
+    // The 2000-char ceiling also keeps the rendered card under Telegram's 4096-char
+    // message limit.
+    if (source_query.length > MENTAL_MODEL_SOURCE_QUERY_MAX) {
+      throw new Error(
+        `mental_model_propose: source_query is ${source_query.length} chars; the schema caps it at ${MENTAL_MODEL_SOURCE_QUERY_MAX} (a standing reflection query, not a document). Shorten it.`,
+      )
+    }
+    // Accept `why` as an alias for `reason` (mirrors the vault tools).
+    const reason =
+      typeof args.reason === 'string' ? args.reason : typeof args.why === 'string' ? args.why : undefined
+    let refresh_after_consolidation: boolean | undefined
+    if (args.refresh_after_consolidation !== undefined) {
+      if (typeof args.refresh_after_consolidation !== 'boolean') {
+        throw new Error('mental_model_propose: refresh_after_consolidation must be a boolean')
+      }
+      refresh_after_consolidation = args.refresh_after_consolidation
+    }
+    let max_tokens: number | undefined
+    if (args.max_tokens !== undefined) {
+      const n = Number(args.max_tokens)
+      if (!Number.isInteger(n) || n <= 0) {
+        throw new Error('mental_model_propose: max_tokens must be a positive integer')
+      }
+      // Enforce the schema ceiling (src/config/schema.ts) here so the card can't be
+      // approved into a config-validation failure downstream.
+      if (n > MENTAL_MODEL_MAX_TOKENS_CAP) {
+        throw new Error(
+          `mental_model_propose: max_tokens ${n} exceeds the schema cap of ${MENTAL_MODEL_MAX_TOKENS_CAP} (a mental model is a standing summary, not a corpus).`,
+        )
+      }
+      max_tokens = n
+    }
+    assertAllowedChat(chat_id)
+
+    const agentSlug = process.env.SWITCHROOM_AGENT_NAME || 'agent'
+
+    // Rate limit: a proposal is a rare, deliberate curation act — throttle so a
+    // looping agent can never spam the operator with cards.
+    const rate = checkMentalModelProposeRate()
+    if (!rate.ok) {
+      const retryAtIso = new Date(rate.retryAtMs).toISOString()
+      return {
+        content: [
+          {
+            type: 'text',
+            text:
+              `mental_model_propose: RATE-LIMITED (max ${MENTAL_MODEL_PROPOSE_MAX_PER_WINDOW} proposals/hour). ` +
+              `No card was posted. Next slot opens at ${retryAtIso}. Proposing mental models is meant to be ` +
+              `rare — batch or wait rather than re-firing.`,
+          },
+        ],
+      }
+    }
+
+    // Duplicate-name guard: reject a proposal for a model already DECLARED for
+    // this agent, BEFORE posting a card (the name is the idempotent-ensure key).
+    try {
+      const configText = readLiveSwitchroomConfigText()
+      const declared = readDeclaredMentalModelNames(configText, agentSlug)
+      if (declared.includes(name)) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text:
+                `mental_model_propose: '${name}' is ALREADY a declared mental model for ${agentSlug} ` +
+                `(memory.mental_models[]). No card was posted — it already exists and is ensured in your ` +
+                `bank. Pick a different name if you meant a NEW model, or just use the existing one.`,
+            },
+          ],
+        }
+      }
+    } catch (err) {
+      // Config read failed (transient) — fall through to the card. The approve
+      // path re-reads and re-checks (dupe guard is defense-in-depth), so a
+      // redundant card is harmless; suppressing a needed card is not.
+      process.stderr.write(`telegram gateway: mental_model_propose dup pre-check read failed: ${(err as Error).message}\n`)
+    }
+
+    const stageId = randomBytes(4).toString('hex')
+    const pending: PendingMentalModelPropose = {
+      agent: agentSlug,
+      chat_id,
+      spec: {
+        name,
+        source_query,
+        ...(refresh_after_consolidation !== undefined ? { refresh_after_consolidation } : {}),
+        ...(max_tokens !== undefined ? { max_tokens } : {}),
+      },
+      ...(reason ? { reason } : {}),
+      staged_at: Date.now(),
+    }
+    pendingMentalModelProposes.set(stageId, pending)
+    pendingMentalModelProposes.sweep(Date.now())
+
+    const text = renderMentalModelProposeCard({
+      agent: agentSlug,
+      name,
+      source_query,
+      ...(reason ? { reason } : {}),
+      ...(refresh_after_consolidation !== undefined ? { refresh_after_consolidation } : {}),
+    })
+    const threadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
+    if (threadId != null) pending.threadId = threadId
+    const sent = await retryWithThreadFallback<{ message_id: number }>(
+      robustApiCall,
+      (tid) =>
+        lockedBot.api.sendRichMessage(chat_id, richMessage(text), {
+          reply_markup: buildMentalModelProposeKeyboard(stageId),
+          ...(tid != null && Number.isFinite(tid) ? { message_thread_id: tid } : {}),
+        }),
+      { threadId, chat_id, verb: 'mental_model_propose.card' },
+    )
+    pending.card_message_id = sent.message_id
+    // Persist card metadata (the proposed DECLARATION is not secret material) so
+    // a gateway restart doesn't strand the parked agent.
+    pendingCardStore.add({
+      family: 'mental_model_propose',
+      stageId,
+      agent: pending.agent,
+      chatId: pending.chat_id,
+      ...(pending.card_message_id != null ? { cardMessageId: pending.card_message_id } : {}),
+      ...(pending.threadId != null ? { threadId: pending.threadId } : {}),
+      spec: pending.spec,
+      ...(pending.reason != null ? { reason: pending.reason } : {}),
+      stagedAt: pending.staged_at,
+    })
+    // Only count a proposal against the rate budget once its card actually
+    // posted (validation errors / dupes don't consume the budget).
+    mentalModelProposeTimes.push(Date.now())
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text:
+            `mental_model_propose: card sent (stage_id=${stageId}, name=${name}). Wait for the operator to tap ` +
+            `Approve or Deny — END YOUR TURN cleanly. A fresh inbound arrives with the outcome ` +
+            `(source=mental_model_proposal_applied / mental_model_proposal_denied). Do NOT re-propose this ` +
+            `model while the card is open.`,
+        },
+      ],
+    }
+  }
+
+  return { executeVaultRequestSave, executeVaultRequestAccess, executeRequestSecret, executeMentalModelPropose }
 }
 
 export type CardToolHandlers = ReturnType<typeof createCardToolHandlers>

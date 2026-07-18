@@ -37,6 +37,8 @@ function makeDeps(overrides: Partial<CardToolHandlersDeps> = {}) {
   const accesses = fakeCardStore<Record<string, unknown>>()
   const secrets = fakeCardStore<Record<string, unknown>>()
   const sweeps: number[] = []
+  const proposes = fakeCardStore<Record<string, unknown>>()
+  const proposeTimes: number[] = []
   const deps: CardToolHandlersDeps = {
     lockedBot: {
       api: {
@@ -60,9 +62,18 @@ function makeDeps(overrides: Partial<CardToolHandlersDeps> = {}) {
     // Default: broker sees no keys (no standing ACL) — normal card flow.
     listViaBroker: async () => [],
     VAULT_REQUEST_ACCESS_TTL_MS: 10 * 60_000,
+    pendingMentalModelProposes: proposes,
+    mentalModelProposeTimes: proposeTimes,
+    // Default: under budget.
+    checkMentalModelProposeRate: () => ({ ok: true }),
+    // Default: no agents block — dup pre-check finds nothing declared.
+    readLiveSwitchroomConfigText: () => 'agents: {}\n',
+    MENTAL_MODEL_SOURCE_QUERY_MAX: 2000,
+    MENTAL_MODEL_MAX_TOKENS_CAP: 8192,
+    MENTAL_MODEL_PROPOSE_MAX_PER_WINDOW: 5,
     ...overrides,
   }
-  return { deps, added, removed, allowedChats, saves, accesses, secrets, sweeps }
+  return { deps, added, removed, allowedChats, saves, accesses, secrets, sweeps, proposes, proposeTimes }
 }
 
 describe('executeVaultRequestSave', () => {
@@ -324,5 +335,163 @@ describe('executeRequestSecret', () => {
     const { executeRequestSecret } = createCardToolHandlers(deps)
     await executeRequestSecret({ chat_id: '123', key: 'svc/token' })
     expect(sweeps.length).toBeGreaterThan(0)
+  })
+})
+
+describe('executeMentalModelPropose', () => {
+  // The dup-name pre-check keys on agents.<slug>.memory.mental_models[] where
+  // slug = SWITCHROOM_AGENT_NAME || 'agent' (read live by the handler).
+  const agentSlug = process.env.SWITCHROOM_AGENT_NAME || 'agent'
+  const declaredYaml =
+    `agents:\n  ${agentSlug}:\n    memory:\n      mental_models:\n        - name: existing-model\n          source_query: standing query\n`
+
+  it('stages the card and returns stage_id + name + the END-YOUR-TURN copy; budget consumed AFTER post', async () => {
+    const { deps, added, proposes, proposeTimes } = makeDeps()
+    const { executeMentalModelPropose } = createCardToolHandlers(deps)
+    const res = await executeMentalModelPropose({
+      chat_id: '123',
+      name: 'training-plan-state',
+      source_query: 'what is the current training plan state',
+      reason: 'recurring question',
+      max_tokens: 512,
+      refresh_after_consolidation: true,
+    })
+    const text = res.content[0]!.text
+    expect(text).toMatch(/mental_model_propose: card sent/)
+    expect(text).toMatch(/name=training-plan-state/)
+    expect(text).toMatch(/END YOUR TURN/)
+    expect(proposes.map.size).toBe(1)
+    const staged = [...proposes.map.values()][0] as { spec: Record<string, unknown>; reason?: string; card_message_id?: number }
+    expect(staged.spec.name).toBe('training-plan-state')
+    expect(staged.spec.max_tokens).toBe(512)
+    expect(staged.spec.refresh_after_consolidation).toBe(true)
+    expect(staged.reason).toBe('recurring question')
+    expect(staged.card_message_id).toBe(4242)
+    expect(added).toHaveLength(1)
+    const rec = added[0] as Record<string, unknown>
+    expect(rec.family).toBe('mental_model_propose')
+    // Rate budget consumed exactly once, only because the card posted.
+    expect(proposeTimes).toHaveLength(1)
+  })
+
+  it('RATE-LIMITED path: no card send, no staging, no durable record, no budget consumed', async () => {
+    const retryAtMs = Date.now() + 30 * 60_000
+    const { deps, added, proposes, proposeTimes } = makeDeps({
+      checkMentalModelProposeRate: () => ({ ok: false, retryAtMs }),
+    })
+    let sends = 0
+    ;(deps.lockedBot as { api: { sendRichMessage: unknown } }).api.sendRichMessage = async () => {
+      sends++
+      return { message_id: 1 }
+    }
+    const { executeMentalModelPropose } = createCardToolHandlers(deps)
+    const res = await executeMentalModelPropose({ chat_id: '123', name: 'm', source_query: 'q' })
+    const text = res.content[0]!.text
+    expect(text).toMatch(/RATE-LIMITED \(max 5 proposals\/hour\)/)
+    expect(text).toContain(new Date(retryAtMs).toISOString())
+    expect(sends).toBe(0)
+    expect(proposes.map.size).toBe(0)
+    expect(added).toHaveLength(0)
+    expect(proposeTimes).toHaveLength(0)
+  })
+
+  it('duplicate-name short-circuit: declared model → NO card, NO staging, NO budget', async () => {
+    const { deps, added, proposes, proposeTimes } = makeDeps({
+      readLiveSwitchroomConfigText: () => declaredYaml,
+    })
+    const { executeMentalModelPropose } = createCardToolHandlers(deps)
+    const res = await executeMentalModelPropose({ chat_id: '123', name: 'existing-model', source_query: 'q' })
+    expect(res.content[0]!.text).toMatch(/ALREADY a declared mental model/)
+    expect(proposes.map.size).toBe(0)
+    expect(added).toHaveLength(0)
+    expect(proposeTimes).toHaveLength(0)
+  })
+
+  it('a DIFFERENT name passes the dup guard against the same declared config', async () => {
+    const { deps, proposes } = makeDeps({
+      readLiveSwitchroomConfigText: () => declaredYaml,
+    })
+    const { executeMentalModelPropose } = createCardToolHandlers(deps)
+    const res = await executeMentalModelPropose({ chat_id: '123', name: 'new-model', source_query: 'q' })
+    expect(res.content[0]!.text).toMatch(/card sent/)
+    expect(proposes.map.size).toBe(1)
+  })
+
+  it('config-read failure fails OPEN to the card flow (approve path re-checks)', async () => {
+    const { deps, proposes } = makeDeps({
+      readLiveSwitchroomConfigText: () => {
+        throw new Error('yaml unreadable')
+      },
+    })
+    const { executeMentalModelPropose } = createCardToolHandlers(deps)
+    const res = await executeMentalModelPropose({ chat_id: '123', name: 'm', source_query: 'q' })
+    expect(res.content[0]!.text).toMatch(/card sent/)
+    expect(proposes.map.size).toBe(1)
+  })
+
+  it('rejects an over-cap source_query with the schema-cap error; NO budget consumed', async () => {
+    const { deps, proposeTimes } = makeDeps({ MENTAL_MODEL_SOURCE_QUERY_MAX: 20 })
+    const { executeMentalModelPropose } = createCardToolHandlers(deps)
+    await expect(
+      executeMentalModelPropose({ chat_id: '1', name: 'm', source_query: 'x'.repeat(21) }),
+    ).rejects.toThrow(/schema caps it at 20/)
+    expect(proposeTimes).toHaveLength(0)
+  })
+
+  it('rejects over-cap and non-positive-integer max_tokens', async () => {
+    const { deps } = makeDeps({ MENTAL_MODEL_MAX_TOKENS_CAP: 100 })
+    const { executeMentalModelPropose } = createCardToolHandlers(deps)
+    await expect(
+      executeMentalModelPropose({ chat_id: '1', name: 'm', source_query: 'q', max_tokens: 101 }),
+    ).rejects.toThrow(/exceeds the schema cap of 100/)
+    await expect(
+      executeMentalModelPropose({ chat_id: '1', name: 'm', source_query: 'q', max_tokens: 1.5 }),
+    ).rejects.toThrow(/positive integer/)
+    await expect(
+      executeMentalModelPropose({ chat_id: '1', name: 'm', source_query: 'q', max_tokens: 0 }),
+    ).rejects.toThrow(/positive integer/)
+  })
+
+  it('rejects a non-slug name and missing required args', async () => {
+    const { deps } = makeDeps()
+    const { executeMentalModelPropose } = createCardToolHandlers(deps)
+    await expect(
+      executeMentalModelPropose({ chat_id: '1', name: 'bad name!', source_query: 'q' }),
+    ).rejects.toThrow(/name must be a slug/)
+    await expect(
+      executeMentalModelPropose({ chat_id: '1', source_query: 'q' }),
+    ).rejects.toThrow(/name is required/)
+    await expect(
+      executeMentalModelPropose({ chat_id: '1', name: 'm' }),
+    ).rejects.toThrow(/source_query is required/)
+    await expect(
+      executeMentalModelPropose({ name: 'm', source_query: 'q' }),
+    ).rejects.toThrow(/chat_id is required/)
+  })
+
+  it('accepts `why` as an alias for `reason` and a boolean-only refresh_after_consolidation', async () => {
+    const { deps, proposes } = makeDeps()
+    const { executeMentalModelPropose } = createCardToolHandlers(deps)
+    await executeMentalModelPropose({ chat_id: '1', name: 'm', source_query: 'q', why: 'because' })
+    const staged = [...proposes.map.values()][0] as { reason?: string }
+    expect(staged.reason).toBe('because')
+    await expect(
+      executeMentalModelPropose({ chat_id: '1', name: 'm2', source_query: 'q', refresh_after_consolidation: 'yes' }),
+    ).rejects.toThrow(/must be a boolean/)
+  })
+
+  it('enforces the allow-list before staging (deny throws, nothing staged, no budget)', async () => {
+    const { deps, added, proposes, proposeTimes } = makeDeps({
+      assertAllowedChat: () => {
+        throw new Error('chat not allowed')
+      },
+    })
+    const { executeMentalModelPropose } = createCardToolHandlers(deps)
+    await expect(
+      executeMentalModelPropose({ chat_id: '999', name: 'm', source_query: 'q' }),
+    ).rejects.toThrow(/chat not allowed/)
+    expect(proposes.map.size).toBe(0)
+    expect(added).toHaveLength(0)
+    expect(proposeTimes).toHaveLength(0)
   })
 })
