@@ -2292,7 +2292,15 @@ describe("reconcileAgent", () => {
 
     const startSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
     expect(startSh).toContain("HINDSIGHT_WAIT=0");
-    expect(startSh).toContain("curl -sf -o /dev/null --max-time 2");
+    // Real MCP initialize probe (a bare GET returned 200 mid-restart and let
+    // a toolless session boot — 2026-07-18 clerk incident)
+    expect(startSh).toContain('"method":"initialize"');
+    expect(startSh).toContain("-X POST");
+    expect(startSh).toContain('-H "Accept: application/json, text/event-stream"');
+    expect(startSh).toContain(`grep -q '"result"'`);
+    // Bounded at 120s; boots anyway on timeout with a warning line
+    expect(startSh).toContain("HINDSIGHT_WAIT -lt 120");
+    expect(startSh).toContain("hindsight boot gate TIMED OUT");
     expect(startSh).toContain("/mcp/");
   });
 

@@ -602,16 +602,39 @@ export HINDSIGHT_SENDER_BANKS_JSON={{{hindsightSenderBanksJsonQ}}}
 {{#if hindsightTopicFilterMode}}
 export HINDSIGHT_TOPIC_FILTER_MODE={{hindsightTopicFilterMode}}
 {{/if}}
-# Wait for Hindsight API to be reachable before launching Claude, otherwise
-# the MCP server connection fails at startup with "1 MCP server failed".
+# Give Claude Code a longer MCP server-startup budget (ms). The default can
+# race a Hindsight restart window; the boot gate below usually absorbs it,
+# but this keeps the in-session connect attempt itself patient too.
+# Documented Claude Code env var (MCP server startup timeout).
+export MCP_TIMEOUT="${MCP_TIMEOUT:-30000}"
+# Wait for Hindsight MCP to be READY before launching Claude, otherwise the
+# MCP server connection fails at startup with "1 MCP server failed" and the
+# session boots toolless (incident 2026-07-18: clerk booted toolless despite
+# a 30s bare-GET gate — the endpoint returned HTTP 200 mid-restart while a
+# real MCP initialize still failed). So: probe with an actual JSON-RPC
+# initialize POST and require a JSON-RPC result, not just HTTP 200.
+# Bounded at 120s; on timeout we log a warning and boot anyway (degraded
+# beats never-boots — the plugin reconnects once Hindsight recovers).
 HINDSIGHT_WAIT=0
-while [ $HINDSIGHT_WAIT -lt 30 ]; do
-  if curl -sf -o /dev/null --max-time 2 {{{hindsightApiBaseUrlQ}}}/mcp/; then
+HINDSIGHT_READY=0
+while [ $HINDSIGHT_WAIT -lt 120 ]; do
+  if curl -sf --max-time 3 \
+       -X POST {{{hindsightApiBaseUrlQ}}}/mcp/ \
+       -H "Content-Type: application/json" \
+       -H "Accept: application/json, text/event-stream" \
+       -d '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"switchroom-boot-gate","version":"1.0"}}}' \
+       2>/dev/null | grep -q '"result"'; then
+    HINDSIGHT_READY=1
     break
   fi
   sleep 1
   HINDSIGHT_WAIT=$((HINDSIGHT_WAIT + 1))
 done
+if [ "$HINDSIGHT_READY" = "1" ]; then
+  echo "start.sh: hindsight boot gate — MCP initialize OK after ${HINDSIGHT_WAIT}s" >&2
+else
+  echo "start.sh: WARNING hindsight boot gate TIMED OUT after ${HINDSIGHT_WAIT}s — MCP initialize never returned a JSON-RPC result; launching claude anyway (memory tools may be unavailable this session)" >&2
+fi
 {{/if}}
 {{#if userEnvQuoted}}
 # User-declared env vars from switchroom.yaml (agent + defaults merged).
