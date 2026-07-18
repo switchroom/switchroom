@@ -39,30 +39,62 @@ const SRC = readFileSync(
   'utf8',
 )
 
+// The media-envelope handlers were extracted out of gateway.ts into their own
+// module (switchroom#2996 P6 cluster A). gateway.ts keeps the `bot.on(…)`
+// registration lines (their order is a load-bearing invariant) but each now
+// delegates to a `handle<Kind>Message(ctx, mediaEnvelopeDeps)` function that
+// lives here. The structural assertions below still need to see the real
+// handler body, so we resolve a delegation to the extracted source.
+const MEDIA_SRC = readFileSync(
+  new URL('../gateway/media-message-handlers.ts', import.meta.url),
+  'utf8',
+)
+
 // ─── Helpers ─────────────────────────────────────────────────────────────
 
 /**
- * Extract the body of a `bot.on('message:<kind>', …)` handler. Returns
- * the substring from the `bot.on(` line up to the matching closing
- * `})` at the outer scope. Good enough for grepping — not a full
- * AST parse.
+ * Return the substring of `src` starting at `header` up to the matching
+ * closing brace of the block it opens. Naive depth count of {/} from the
+ * first `{` — good enough for grepping, not a full AST parse.
+ */
+function braceBlock(src: string, header: string, label: string): string {
+  const start = src.indexOf(header)
+  expect(start, `${label} not found`).toBeGreaterThan(0)
+  const firstBrace = src.indexOf('{', start)
+  let depth = 0
+  for (let i = firstBrace; i < src.length; i++) {
+    const c = src[i]
+    if (c === '{') depth++
+    else if (c === '}') {
+      depth--
+      if (depth === 0) return src.slice(start, i + 1)
+    }
+  }
+  throw new Error(`could not find end of ${label}`)
+}
+
+/**
+ * Extract the body of a `bot.on('message:<kind>', …)` handler. If the
+ * registration delegates to an extracted `handle<Kind>Message(ctx,
+ * mediaEnvelopeDeps)` function, the returned body is that function's source
+ * (from media-message-handlers.ts). Otherwise it is the inline gateway.ts
+ * handler block. Either way callers see the real handler logic.
  */
 function handlerBody(kind: string): string {
   const needle = `bot.on('message:${kind}'`
   const start = SRC.indexOf(needle)
   expect(start, `handler bot.on('message:${kind}') not found`).toBeGreaterThan(0)
-  // Find the matching close — naive depth count of {/} from the first `{`.
-  const firstBrace = SRC.indexOf('{', start)
-  let depth = 0
-  for (let i = firstBrace; i < SRC.length; i++) {
-    const c = SRC[i]
-    if (c === '{') depth++
-    else if (c === '}') {
-      depth--
-      if (depth === 0) return SRC.slice(start, i + 1)
-    }
+  const lineEnd = SRC.indexOf('\n', start)
+  const regLine = SRC.slice(start, lineEnd < 0 ? SRC.length : lineEnd)
+  const delegate = regLine.match(/(handle\w+Message)\(ctx,\s*mediaEnvelopeDeps\)/)
+  if (delegate) {
+    return braceBlock(
+      MEDIA_SRC,
+      `export async function ${delegate[1]}(`,
+      `extracted handler ${delegate[1]}`,
+    )
   }
-  throw new Error(`could not find end of handler ${kind}`)
+  return braceBlock(SRC, needle, `handler ${kind}`)
 }
 
 // ─── Registration completeness ───────────────────────────────────────────
@@ -108,7 +140,9 @@ describe('inbound message-type handlers: forwarding decisions', () => {
     it(`${kind} forwards via handleInbound and logs to stderr`, () => {
       const body = handlerBody(kind)
       expect(body).toMatch(/handleInbound\(ctx,/)
-      expect(body).toMatch(/process\.stderr\.write/)
+      // Logs the event — directly (inline handlers) or via the injected
+      // `deps.log` stderr sink (extracted media-envelope handlers).
+      expect(body).toMatch(/process\.stderr\.write|deps\.log\(/)
       // Must not divert to the ack-only path — that would silently
       // hide the payload from the agent.
       expect(body).not.toMatch(/handleAckOnly\(/)
@@ -148,7 +182,9 @@ describe('inbound message-type handlers: ack-only decisions', () => {
     it(`${kind} uses handleAckOnly (no forward to agent)`, () => {
       const body = handlerBody(kind)
       expect(body).toMatch(/handleAckOnly\(/)
-      expect(body).toMatch(/process\.stderr\.write/)
+      // Logs the event — directly (inline handlers) or via the injected
+      // `deps.log` stderr sink (extracted media-envelope handlers).
+      expect(body).toMatch(/process\.stderr\.write|deps\.log\(/)
       // Ack-only must NOT call handleInbound — the whole point is
       // we don't bother the agent for these.
       expect(body).not.toMatch(/handleInbound\(/)
