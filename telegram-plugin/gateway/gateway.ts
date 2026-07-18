@@ -15172,7 +15172,37 @@ function isAuthorizedSender(ctx: Context): boolean {
 
 // ─── Inbound message handling ─────────────────────────────────────────────
 
-async function handleInboundCoalesced(
+// ── PR-0 characterization-harness export seam (#2996 P7) ──────────────────
+// `handleInboundCoalesced` / `handleInbound` are the inbound-routing
+// extraction target (P7). The characterization harness in
+// `tests/inbound-router-characterization.test.ts` drives them functionally
+// with real intercept code executing, spying only at the Deps boundary
+// (the delivery machine / dispatch / tmux / secret-detect modules). That
+// requires (a) the two entrypoints be importable and (b) a minimal accessor
+// onto the module-local turn/intercept state the harness must seed to reach
+// each intercept branch. This is the ONE small production change PR-0 needs
+// (design finding F1). Nothing here is referenced on the prod boot path.
+export const __inboundRouterTestSeam = {
+  // Turn-state stores (mid-turn steer classification + status-KPI reads).
+  activeStatusReactions,
+  activeTurnStartedAt,
+  lastAgentOutputAt,
+  // Intercept-precondition stores (seed to reach each gauntlet branch).
+  pendingReauthFlows,
+  pendingPermissions,
+  secretStaging,
+  vaultPassphraseCache,
+  // currentTurn is a `let`; expose get/set so the harness can pin the
+  // in-flight-turn identity the halt / cross-topic paths read.
+  getCurrentTurn: (): CurrentTurn | null => currentTurn,
+  setCurrentTurn: (t: CurrentTurn | null): void => { currentTurn = t },
+  // ipcServer is only assigned on the prod boot path (isGatewayMain); under
+  // a test import it is undefined, so the imperative deliver / permission-
+  // verdict paths would deref undefined. Let the harness inject a fake.
+  setIpcServer: (s: IpcServer): void => { ipcServer = s },
+}
+
+export async function handleInboundCoalesced(
   ctx: Context,
   text: string,
   downloadImage: (() => Promise<string | undefined>) | undefined,
@@ -15340,7 +15370,7 @@ function maybePokeFloorForMidTurnInbound(ctx: Context, from: NonNullable<Context
   silencePoke.pokeFloorNow(key, Date.now())
 }
 
-async function handleInbound(
+export async function handleInbound(
   ctx: Context,
   text: string,
   downloadImage: (() => Promise<string | undefined>) | undefined,
