@@ -39,9 +39,14 @@ import {
   renderVaultRequestAccessCard,
   buildVaultRequestAccessKeyboard,
 } from './vault-request-access-card.js'
+import {
+  renderSecretRequestCard,
+  buildSecretRequestKeyboard,
+} from './secret-request-card.js'
 import type {
   PendingVaultRequestSave,
   PendingVaultRequestAccess,
+  PendingSecretRequest,
 } from './callback-query-handlers.js'
 import type { SweepableCardStore } from './approval-card-stores.js'
 import type { PendingCardStore } from './pending-card-store.js'
@@ -80,8 +85,16 @@ export interface CardToolHandlersDeps {
   // Pending-state stores (consolidated surfaces; the ONE shared instance).
   pendingVaultRequestSaves: SweepableCardStore<PendingVaultRequestSave>
   pendingVaultRequestAccesses: SweepableCardStore<PendingVaultRequestAccess>
+  pendingSecretRequests: SweepableCardStore<PendingSecretRequest>
   /** Durable card-metadata store (restart survival). */
   pendingCardStore: PendingCardStore
+  /**
+   * Reaper hook that sweeps BOTH pendingSecretRequests and the transient
+   * armedSecretCaptures store. Injected (not re-derived) so executeRequestSecret
+   * stays byte-identical and armedSecretCaptures — which is shared with the
+   * handleInbound capture path — stays the ONE instance in gateway.ts.
+   */
+  sweepSecretRequests: (now?: number) => void
   /**
    * Broker no-token `list` probe AS THIS AGENT (path-as-identity) — the
    * authoritative standing-ACL coverage check in executeVaultRequestAccess
@@ -108,7 +121,9 @@ export function createCardToolHandlers(deps: CardToolHandlersDeps) {
     VAULT_KEY_REGEX_LABEL,
     pendingVaultRequestSaves,
     pendingVaultRequestAccesses,
+    pendingSecretRequests,
     pendingCardStore,
+    sweepSecretRequests,
     listViaBroker,
     VAULT_REQUEST_ACCESS_TTL_MS,
   } = deps
@@ -342,7 +357,78 @@ export function createCardToolHandlers(deps: CardToolHandlersDeps) {
     }
   }
 
-  return { executeVaultRequestSave, executeVaultRequestAccess }
+  /**
+   * `request_secret` tool — agent surfaces a card asking the operator to
+   * provide a missing secret. No `value` arg: the value arrives via secure
+   * capture (the operator's next message after they tap [Provide securely]).
+   */
+  async function executeRequestSecret(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
+    const chat_id = String(args.chat_id ?? '')
+    if (!chat_id) throw new Error('request_secret: chat_id is required')
+    const key = args.key as string
+    if (!key || typeof key !== 'string') throw new Error('request_secret: key is required')
+    const reason = typeof args.reason === 'string' ? args.reason : undefined
+    assertAllowedChat(chat_id)
+    if (!VAULT_KEY_REGEX.test(key)) {
+      throw new Error(`request_secret: key must match ${VAULT_KEY_REGEX_LABEL}`)
+    }
+    const agentSlug = process.env.SWITCHROOM_AGENT_NAME || 'agent'
+
+    // Dedupe: one open request per (chat, key). Drop any prior stage for
+    // the same target so the operator never sees stacked cards.
+    for (const [sid, p] of pendingSecretRequests) {
+      if (p.chat_id === chat_id && p.key === key) {
+        pendingSecretRequests.delete(sid)
+        pendingCardStore.remove(sid)
+      }
+    }
+
+    const stageId = randomBytes(4).toString('hex')
+    const pending: PendingSecretRequest = { agent: agentSlug, chat_id, key, reason, staged_at: Date.now() }
+    pendingSecretRequests.set(stageId, pending)
+    sweepSecretRequests()
+
+    const text = renderSecretRequestCard(pending)
+    const threadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
+    // Remember the agent's working topic so the provide/decline/fail inbound resumes in it.
+    if (threadId != null) pending.threadId = threadId
+    const sent = await retryWithThreadFallback<{ message_id: number }>(
+      robustApiCall,
+      (tid) =>
+        lockedBot.api.sendRichMessage(chat_id, richMessage(text), {
+          reply_markup: buildSecretRequestKeyboard(stageId),
+          ...(tid != null && Number.isFinite(tid) ? { message_thread_id: tid } : {}),
+        }),
+      { threadId, chat_id, verb: 'request_secret.card' },
+    )
+    pending.card_message_id = sent.message_id
+    // Persist card metadata so a gateway restart doesn't strand the parked
+    // agent. request_secret holds NO value at staging time (the value arrives
+    // after the operator taps [Provide securely]), so nothing sensitive lands
+    // on disk here.
+    pendingCardStore.add({
+      family: 'request_secret',
+      stageId,
+      agent: pending.agent,
+      chatId: pending.chat_id,
+      ...(pending.card_message_id != null ? { cardMessageId: pending.card_message_id } : {}),
+      ...(pending.threadId != null ? { threadId: pending.threadId } : {}),
+      key: pending.key,
+      ...(pending.reason != null ? { reason: pending.reason } : {}),
+      stagedAt: pending.staged_at,
+    })
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `request_secret: card sent (stage_id=${stageId}, key=${key}). END YOUR TURN now and wait — a fresh inbound message arrives once the operator provides (or declines) the secret. Do NOT ask them to paste it as a normal message; the card handles it securely.`,
+        },
+      ],
+    }
+  }
+
+  return { executeVaultRequestSave, executeVaultRequestAccess, executeRequestSecret }
 }
 
 export type CardToolHandlers = ReturnType<typeof createCardToolHandlers>

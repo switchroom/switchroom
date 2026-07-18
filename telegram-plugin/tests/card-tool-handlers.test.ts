@@ -35,6 +35,8 @@ function makeDeps(overrides: Partial<CardToolHandlersDeps> = {}) {
   const allowedChats: string[] = []
   const saves = fakeCardStore<Record<string, unknown>>()
   const accesses = fakeCardStore<Record<string, unknown>>()
+  const secrets = fakeCardStore<Record<string, unknown>>()
+  const sweeps: number[] = []
   const deps: CardToolHandlersDeps = {
     lockedBot: {
       api: {
@@ -49,16 +51,18 @@ function makeDeps(overrides: Partial<CardToolHandlersDeps> = {}) {
     VAULT_KEY_REGEX_LABEL,
     pendingVaultRequestSaves: saves,
     pendingVaultRequestAccesses: accesses,
+    pendingSecretRequests: secrets,
     pendingCardStore: {
       add: (e: unknown) => void added.push(e),
       remove: (id: string) => void removed.push(id),
     } as unknown as CardToolHandlersDeps['pendingCardStore'],
+    sweepSecretRequests: (now = Date.now()) => void sweeps.push(now),
     // Default: broker sees no keys (no standing ACL) — normal card flow.
     listViaBroker: async () => [],
     VAULT_REQUEST_ACCESS_TTL_MS: 10 * 60_000,
     ...overrides,
   }
-  return { deps, added, removed, allowedChats, saves, accesses }
+  return { deps, added, removed, allowedChats, saves, accesses, secrets, sweeps }
 }
 
 describe('executeVaultRequestSave', () => {
@@ -224,5 +228,101 @@ describe('executeVaultRequestAccess', () => {
     const staged = [...accesses.map.values()][0] as Record<string, unknown>
     expect(staged.reason).toBe('need it')
     expect(res.content[0]!.text).toMatch(/times out \(25 min\)/)
+  })
+})
+
+describe('executeRequestSecret', () => {
+  it('stages the card and returns stage_id + key + the END-YOUR-TURN copy', async () => {
+    const { deps, added, secrets } = makeDeps()
+    const { executeRequestSecret } = createCardToolHandlers(deps)
+    const res = await executeRequestSecret({ chat_id: '123', key: 'svc/token', reason: 'need it' })
+    const text = res.content[0]!.text
+    expect(text).toMatch(/request_secret: card sent/)
+    expect(text).toMatch(/key=svc\/token/)
+    // The secure-capture contract: the agent must END ITS TURN and wait.
+    expect(text).toMatch(/END YOUR TURN/)
+    expect(secrets.map.size).toBe(1)
+    const staged = [...secrets.map.values()][0] as Record<string, unknown>
+    expect(staged.key).toBe('svc/token')
+    expect(staged.reason).toBe('need it')
+    expect(staged.card_message_id).toBe(4242)
+    expect(added).toHaveLength(1)
+    const rec = added[0] as Record<string, unknown>
+    expect(rec.family).toBe('request_secret')
+    expect(rec.key).toBe('svc/token')
+  })
+
+  it('NEVER stages or persists a secret VALUE — request_secret carries none at staging time', async () => {
+    // The whole point of request_secret (vs vault_request_save): the value
+    // arrives LATER via secure capture, so no value must exist on the pending
+    // record or in the durable store at staging time.
+    const { deps, added, secrets } = makeDeps()
+    const { executeRequestSecret } = createCardToolHandlers(deps)
+    await executeRequestSecret({ chat_id: '123', key: 'svc/token', value: 'should-be-ignored' })
+    const staged = [...secrets.map.values()][0] as Record<string, unknown>
+    expect(staged).not.toHaveProperty('value')
+    expect(JSON.stringify(staged)).not.toContain('should-be-ignored')
+    const rec = added[0] as Record<string, unknown>
+    expect(rec).not.toHaveProperty('value')
+    expect(JSON.stringify(rec)).not.toContain('should-be-ignored')
+  })
+
+  it('dedupes to one open request per (chat,key): a prior stage is dropped from BOTH stores', async () => {
+    const { deps, removed, secrets } = makeDeps()
+    const { executeRequestSecret } = createCardToolHandlers(deps)
+    await executeRequestSecret({ chat_id: '123', key: 'svc/token' })
+    const firstId = [...secrets.map.keys()][0]!
+    // Second request for the SAME (chat,key) drops the first stage.
+    await executeRequestSecret({ chat_id: '123', key: 'svc/token' })
+    expect(secrets.map.size).toBe(1)
+    expect(secrets.map.has(firstId)).toBe(false)
+    // The dropped stage's durable record is removed too (no stacked cards).
+    expect(removed).toContain(firstId)
+  })
+
+  it('does NOT dedupe across a different key or a different chat', async () => {
+    const { deps, secrets } = makeDeps()
+    const { executeRequestSecret } = createCardToolHandlers(deps)
+    await executeRequestSecret({ chat_id: '123', key: 'svc/token' })
+    await executeRequestSecret({ chat_id: '123', key: 'other/key' })
+    await executeRequestSecret({ chat_id: '456', key: 'svc/token' })
+    expect(secrets.map.size).toBe(3)
+  })
+
+  it('enforces the allow-list before staging (deny path throws, nothing staged)', async () => {
+    const { deps, added, secrets } = makeDeps({
+      assertAllowedChat: () => {
+        throw new Error('chat not allowed')
+      },
+    })
+    const { executeRequestSecret } = createCardToolHandlers(deps)
+    await expect(
+      executeRequestSecret({ chat_id: '999', key: 'svc/token' }),
+    ).rejects.toThrow(/chat not allowed/)
+    expect(secrets.map.size).toBe(0)
+    expect(added).toHaveLength(0)
+  })
+
+  it('rejects a malformed vault key with the labelled charset error', async () => {
+    const { deps, secrets } = makeDeps()
+    const { executeRequestSecret } = createCardToolHandlers(deps)
+    await expect(
+      executeRequestSecret({ chat_id: '123', key: 'bad key!' }),
+    ).rejects.toThrow(/key must match/)
+    expect(secrets.map.size).toBe(0)
+  })
+
+  it('rejects a missing chat_id and a missing key', async () => {
+    const { deps } = makeDeps()
+    const { executeRequestSecret } = createCardToolHandlers(deps)
+    await expect(executeRequestSecret({ key: 'svc/token' })).rejects.toThrow(/chat_id is required/)
+    await expect(executeRequestSecret({ chat_id: '123' })).rejects.toThrow(/key is required/)
+  })
+
+  it('runs the injected sweepSecretRequests reaper on the way through', async () => {
+    const { deps, sweeps } = makeDeps()
+    const { executeRequestSecret } = createCardToolHandlers(deps)
+    await executeRequestSecret({ chat_id: '123', key: 'svc/token' })
+    expect(sweeps.length).toBeGreaterThan(0)
   })
 })

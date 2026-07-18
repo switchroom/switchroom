@@ -71,7 +71,7 @@ describe('staging persists card metadata (Defect A)', () => {
   })
 
   it('request_secret stages into the durable store', () => {
-    const fn = slice(GATEWAY, 'async function executeRequestSecret', 3000)
+    const fn = slice(CARD_TOOL, 'async function executeRequestSecret', 3000)
     expect(fn).toMatch(/pendingCardStore\.add\(\{[\s\S]*family: 'request_secret'/)
   })
 
