@@ -256,9 +256,12 @@ describe('gateway.ts catch-all registration invariant', () => {
     expect(SRC.indexOf('installUnhandledMessageCatchAll(', installIdx + 1)).toBe(-1)
   })
 
-  it('routes the catch-all through handleInboundCoalesced (same gating + forward-origin path)', () => {
+  it('routes the catch-all through routeInbound → handleInboundCoalesced (same gating + forward-origin path)', () => {
+    // P7 PR-1: the catch-all now delegates through the single `routeInbound`
+    // seam, which forwards to `handleInboundCoalesced` unchanged (pure
+    // indirection). Anchor on the seam call the registration actually makes.
     const installIdx = SRC.indexOf('installUnhandledMessageCatchAll(')
     const body = SRC.slice(installIdx, installIdx + 400)
-    expect(body).toMatch(/handleInboundCoalesced\(ctx, text, undefined\)/)
+    expect(body).toMatch(/routeInbound\(ctx, text, undefined, undefined, inboundRouterDeps\)/)
   })
 })
