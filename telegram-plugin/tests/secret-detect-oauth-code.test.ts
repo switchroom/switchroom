@@ -98,10 +98,12 @@ describe('anthropic_oauth_code pattern — Channel A', () => {
 // ─── Channel B — context rule structural tests ────────────────────────────────
 
 describe('auth-flow context rule — Channel B (structural wiring in gateway.ts)', () => {
-  const src = readFileSync(
-    new URL('../gateway/gateway.ts', import.meta.url),
-    'utf8',
-  )
+  const src =
+    readFileSync(new URL('../gateway/gateway.ts', import.meta.url), 'utf8') +
+    '\n' +
+    // P7 PR-9 (#2996): the secret-detect pipeline intercept moved verbatim
+    // into gateway/inbound-interceptors.ts (interceptSecretDetectPipeline).
+    readFileSync(new URL('../gateway/inbound-interceptors.ts', import.meta.url), 'utf8')
 
   it('declares awaitingAuthCodeAt map and AUTH_CODE_CONTEXT_TTL_MS constant', () => {
     expect(src).toMatch(/const awaitingAuthCodeAt = new Map<string, number>/)
@@ -121,7 +123,7 @@ describe('auth-flow context rule — Channel B (structural wiring in gateway.ts)
 
   it('clears awaitingAuthCodeAt (delete) in the inbound handler when the flag is active', () => {
     // The inbound handler must call delete after reading the flag
-    expect(src).toMatch(/awaitingAuthCodeAt\.delete\(chat_id\)/)
+    expect(src).toMatch(/awaitingAuthCodeAt\.delete\((?:p\.)?chat_id\)/)
   })
 
   it('checks isAuthFlowContext in the secret-detect block (passphrase path)', () => {
@@ -155,7 +157,9 @@ describe('auth-flow context rule — Channel B (structural wiring in gateway.ts)
   })
 
   it('auth-flow context rule sits BEFORE recordInbound() and broadcast()', () => {
-    const contextIdx = src.indexOf('isAuthFlowContext')
+    // P7 PR-9: the context rule lives inside interceptSecretDetectPipeline;
+    // its gateway CALL SITE is the ordering anchor against the sinks.
+    const contextIdx = src.indexOf('await interceptSecretDetectPipeline(')
     const recordIdx = src.indexOf('recordInbound(', contextIdx)
     const broadcastIdx = src.indexOf('ipcServer.broadcast(inboundMsg)', contextIdx)
     expect(contextIdx).toBeGreaterThan(0)
@@ -241,10 +245,12 @@ describe('pendingReauthFlows intercept — deleteMessage sequencing (Blocker 1)'
 // Test 3: Flag consumption — awaitingAuthCodeAt is NOT cleared on a non-detection
 // inbound (a stray "ok" within the 5-min window should not disarm Channel B).
 describe('awaitingAuthCodeAt flag — consumption only on actual detection', () => {
-  const src = readFileSync(
-    new URL('../gateway/gateway.ts', import.meta.url),
-    'utf8',
-  )
+  const src =
+    readFileSync(new URL('../gateway/gateway.ts', import.meta.url), 'utf8') +
+    '\n' +
+    // P7 PR-9 (#2996): the secret-detect pipeline intercept moved verbatim
+    // into gateway/inbound-interceptors.ts (interceptSecretDetectPipeline).
+    readFileSync(new URL('../gateway/inbound-interceptors.ts', import.meta.url), 'utf8')
 
   it('delete(chat_id) does NOT appear at the top of the isAuthFlowContext block (no early consume)', () => {
     // The old bug: delete fired unconditionally inside `if (isAuthFlowContext)`.
@@ -265,7 +271,7 @@ describe('awaitingAuthCodeAt flag — consumption only on actual detection', () 
     expect(fallbackIdx).toBeGreaterThan(0)
     // Within 400 chars after the comment, delete must appear
     const window = src.slice(fallbackIdx, fallbackIdx + 400)
-    expect(window).toMatch(/awaitingAuthCodeAt\.delete\(chat_id\)/)
+    expect(window).toMatch(/(?:deps\.)?awaitingAuthCodeAt\.delete\((?:p\.)?chat_id\)/)
   })
 
   it('awaitingAuthCodeAt.delete appears inside the no-passphrase hasHigh branch', () => {
@@ -276,7 +282,7 @@ describe('awaitingAuthCodeAt flag — consumption only on actual detection', () 
     const window = src.slice(noPpIdx, noPpIdx + 1200)
     // Conditional consume: only fires if isAuthFlowContext
     expect(window).toMatch(/if \(isAuthFlowContext\)/)
-    expect(window).toMatch(/awaitingAuthCodeAt\.delete\(chat_id\)/)
+    expect(window).toMatch(/(?:deps\.)?awaitingAuthCodeAt\.delete\((?:p\.)?chat_id\)/)
   })
 })
 
