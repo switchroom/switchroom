@@ -652,6 +652,7 @@ import {
   mutateStatusPinRow,
   reconcileAndPersistStatusPin,
   runStatusPinBootCleanup,
+  withPinReconcileLock,
   type PersistedStatusPin,
   type StatusPinPersistOp,
 } from './status-pin-store.js'
@@ -8441,6 +8442,10 @@ const PIN_STATUS_WHILE_WORKING = (() => {
 // handlers unconditionally unpinning on every send) and runs NO polling
 // watchdog / getChat().pinned_message reconciler.
 const statusPinState = new Map<string, PinState>()
+// F2 serialization: same-pinKey reconciles run one-at-a-time via
+// `withPinReconcileLock` (status-pin-store.ts — kept there so it's
+// unit-testable) so each reads a fresh `prev`; see its doc for the stale-`prev`
+// race it closes. Adds zero Telegram API calls (a serialized noop still no-ops).
 // Companion registry: pinKey → chatId, so the pre-restart sweep can unpin
 // owned pins without threading the chat id through every call site. Written on
 // every desired-pinned reconcile, cleared alongside the state on unpin.
@@ -9024,7 +9029,10 @@ async function reconcileStatusPin(
   // absorbed. (The `pin_message` MCP tool still surfaces failures to the agent
   // as a normal tool-error — that path is `executePinMessage`, not this one.)
   try {
-    await reconcileStatusPinInner(pinKey, chatId, desired)
+    // Serialize per pinKey (F2): reconcileStatusPinInner reads `prev` from the
+    // in-memory claim map at its top, so overlapping same-key reconciles must
+    // run one-at-a-time or a stale `prev` clears the disk row under a live pin.
+    await withPinReconcileLock(pinKey, () => reconcileStatusPinInner(pinKey, chatId, desired))
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     process.stderr.write(
@@ -9041,14 +9049,11 @@ async function reconcileStatusPinInner(
 ): Promise<void> {
   if (!PIN_STATUS_WHILE_WORKING) return
   if (chatId.length === 0) return
-  // NOTE (invisible-worker-cards review, intentionally left): this reconcile is
-  // NOT serialized per pinKey — it snapshots `prev` then awaits. Two edits that
-  // fire `syncPin` in the same microtask window after a dropped claim can both
-  // read `prev=null` and both issue a `pinChatMessage` for the SAME id. That is
-  // benign and self-healing: re-pinning an already-pinned id is idempotent on
-  // Telegram, and the first reconcile to set the claim makes every subsequent
-  // edit a no-op — it converges in one round, never a storm. A per-key mutex
-  // would remove the duplicate pin but adds lock complexity for zero UX gain.
+  // Serialized per pinKey by `withPinReconcileLock` at the caller (F2), so this
+  // `prev` snapshot is taken only after any prior same-key reconcile fully
+  // settled — always the true current claim. Closes the stale-`prev` race (a
+  // turn-end clear dropping the disk row under a flood-delayed open-pin) and the
+  // older duplicate-pin concern (two edits both reading prev=null).
   const prev = statusPinState.get(pinKey) ?? null
 
   const runReconcile = () =>

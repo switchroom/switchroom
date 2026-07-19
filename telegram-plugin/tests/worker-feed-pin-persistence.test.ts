@@ -5,7 +5,12 @@ import {
   type BotApiForWorkerFeed,
 } from '../worker-activity-feed.js'
 import { reconcilePin, type PinBotApi } from '../status-pin-driver.js'
-import type { PinState, DesiredPin } from '../status-pin.js'
+import { decidePinAction, type PinState, type DesiredPin } from '../status-pin.js'
+import {
+  reconcileAndPersistStatusPin,
+  loadStatusPins,
+  type StatusPinStoreFsSeam,
+} from '../gateway/status-pin-store.js'
 
 /**
  * Outcome tests for the invisible-worker-cards fix (2026-07-15).
@@ -118,6 +123,131 @@ function makePinHarness() {
 async function flush(): Promise<void> {
   for (let i = 0; i < 8; i++) await new Promise((r) => setImmediate(r))
 }
+
+/** In-memory fs seam with atomic rename, mirroring status-pin-store.test.ts. */
+function memFs(): { fs: StatusPinStoreFsSeam; files: Map<string, string> } {
+  const files = new Map<string, string>()
+  const fs: StatusPinStoreFsSeam = {
+    readFileSync: (p) => {
+      if (!files.has(p)) throw new Error(`ENOENT ${p}`)
+      return files.get(p)!
+    },
+    writeFileSync: (p, d) => {
+      files.set(p, d)
+    },
+    renameSync: (a, b) => {
+      if (!files.has(a)) throw new Error(`ENOENT ${a}`)
+      files.set(b, files.get(a)!)
+      files.delete(a)
+    },
+    existsSync: (p) => files.has(p),
+  }
+  return { fs, files }
+}
+
+/**
+ * A pin harness that routes the feed's `reconcilePin` hook through the REAL
+ * persistence path (`reconcileAndPersistStatusPin`) against a memFs-backed
+ * status-pins.json — exactly as the gateway wires it: read prev claim → decide
+ * → map to a persist op → reconcileAndPersistStatusPin(applyPin=reconcilePin).
+ * This lets a test INSPECT THE FILE across steady-state edits (F1).
+ */
+function makePersistingPinHarness(path: string) {
+  const { fs } = memFs()
+  const claims = new Map<string, PinState>()
+  const pinCalls: number[] = []
+  const unpinCalls: number[] = []
+  const api: PinBotApi = {
+    pinChatMessage: async (_c, id) => {
+      pinCalls.push(id)
+    },
+    unpinChatMessage: async (_c, id) => {
+      unpinCalls.push(id)
+    },
+  }
+  async function reconcile(key: string, chatId: string, desired: DesiredPin): Promise<void> {
+    const prev = claims.get(key) ?? null
+    const action = decidePinAction(prev, desired)
+    const op = action.kind === 'pin'
+      ? ({ kind: 'pin', messageId: action.messageId } as const)
+      : ({ kind: 'clear' } as const)
+    const next = await reconcileAndPersistStatusPin({
+      path,
+      fs,
+      pinKey: key,
+      chatId,
+      op,
+      applyPin: () => reconcilePin({ api, chatId, prevState: prev, desired }),
+      log: () => {},
+    })
+    if (next == null) claims.delete(key)
+    else claims.set(key, next)
+  }
+  const reconcilePinFn = (args: {
+    feedKey: string
+    chatId: string
+    threadId?: number
+    messageId: number | null
+  }): void => {
+    const key = `wk:group:${args.feedKey}`
+    if (args.messageId != null) void reconcile(key, args.chatId, { pinned: true, messageId: args.messageId })
+    else void reconcile(key, args.chatId, { pinned: false })
+  }
+  return {
+    reconcilePinFn,
+    fs,
+    pinCalls,
+    unpinCalls,
+    rows: () => loadStatusPins(path, fs),
+  }
+}
+
+describe('worker-feed pin persistence — durable status-pins.json survives steady-state edits (F1)', () => {
+  const PATH = '/state/agent/telegram/status-pins.json'
+
+  it('preserves the wk:group row across many steady-state edits (noop-clear must NOT delete it)', async () => {
+    const bot = makeFakeBot()
+    const pin = makePersistingPinHarness(PATH)
+    let clock = 0
+    const feed = createWorkerActivityFeed({
+      bot,
+      now: () => clock,
+      firstPaintMinMs: 0,
+      minEditIntervalMs: 0,
+      reconcilePin: pin.reconcilePinFn,
+    })
+
+    // First paint → message posted, pinned once, durable row written.
+    clock = 1000
+    await feed.update('w1', 'chat', view({ elapsedMs: 1000, toolCount: 1 }))
+    await flush()
+    const msgId = bot.sent[0].messageId
+    expect(pin.pinCalls).toEqual([msgId])
+    expect(pin.rows()).toHaveLength(1)
+    const pinKey = pin.rows()[0].pinKey
+    expect(pinKey).toMatch(/^wk:group:/)
+    expect(pin.rows()).toEqual([
+      { pinKey, chatId: 'chat', messageId: msgId },
+    ])
+
+    // Many steady-state edits — the feed calls syncPin on EVERY edit, each a
+    // re-pin of the SAME id → noop → a `clear` op with a LIVE claim. Pre-fix the
+    // clear branch deleted the durable row here; the fix preserves it.
+    for (let i = 2; i <= 8; i++) {
+      clock = i * 1000
+      await feed.update('w1', 'chat', view({ elapsedMs: i * 1000, toolCount: i }))
+      await flush()
+    }
+
+    // The durable row is STILL on disk (inspect the file), and no extra pin/
+    // unpin API call was issued across all those steady-state edits.
+    expect(pin.rows()).toEqual([
+      { pinKey, chatId: 'chat', messageId: msgId },
+    ])
+    expect(pin.pinCalls).toEqual([msgId]) // exactly one pin, ever
+    expect(pin.unpinCalls).toEqual([]) // never unpinned
+  })
+})
 
 describe('worker-feed pin persistence — steady-state re-pin (invisible-worker-cards)', () => {
   it('re-pins on a steady-state edit when the claim was lost, and does NOT re-pin when already correct (no storm)', async () => {

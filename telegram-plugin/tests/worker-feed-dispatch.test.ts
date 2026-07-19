@@ -72,6 +72,33 @@ describe('resolveWorkerFeedDispatch (#2002 regression pin)', () => {
     expect(resolveWorkerFeedDispatch(null, 'sub-agent').feedModel).toBeNull()
     expect(resolveWorkerFeedDispatch(makeSub({ model: null }), 'sub-agent').feedModel).toBeNull()
   })
+
+  // F3 (progress-card fork model) — outcome coverage. The dispatch-time seed is
+  // suppressed for forks at the hook (subagent-tracker-pretool.mjs), so a fork
+  // row carries model=null and the card omits the model until the watcher writes
+  // the transcript model. resolveWorkerFeedDispatch simply surfaces the row's
+  // CURRENT model, so these assert the feed-level outcomes on top of that.
+  it('(b) a fork row carries no dispatch-time model → feedModel null (card omits it until transcript)', () => {
+    // What the hook now writes for a fork dispatch: agent_type 'fork', model null
+    // (the ignored override is not persisted).
+    const forkRow = makeSub({ background: true, agent_type: 'fork', model: null })
+    expect(resolveWorkerFeedDispatch(forkRow, 'sub-agent').feedModel).toBeNull()
+  })
+
+  it('(a) once the watcher overwrites the row model from the transcript, feedModel reflects the transcript model', () => {
+    // Transcript wins: the watcher (recordSubagentModel) overwrites the row's
+    // model column in place, so the resolved feedModel is the transcript value —
+    // even for a fork that started with model=null.
+    const afterTranscript = makeSub({ background: true, agent_type: 'fork', model: 'claude-opus-4-8' })
+    expect(resolveWorkerFeedDispatch(afterTranscript, 'sub-agent').feedModel).toBe('claude-opus-4-8')
+  })
+
+  it('(c) a mid-run model switch is reflected: feedModel tracks the row’s latest recorded model', () => {
+    // The watcher writes model-on-change; the row holds the LATEST model, so a
+    // later substantive tick resolves the switched-to model.
+    const switchedTo = makeSub({ background: true, model: 'sr-glm-5' })
+    expect(resolveWorkerFeedDispatch(switchedTo, 'sub-agent').feedModel).toBe('sr-glm-5')
+  })
 })
 
 describe('gateway onFinish — fix #1: resultText-driven handback fallback (model)', () => {

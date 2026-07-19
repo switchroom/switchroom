@@ -389,7 +389,18 @@ export function createNarrativeLane(deps: NarrativeLaneDeps) {
             // mid-turn has something to finalize on next boot instead of
             // leaving this card frozen forever. Fire-and-forget/best-effort:
             // a failed persist degrades to the pre-fix (in-memory-only)
-            // behaviour, never blocks the card opening.
+            // behaviour, never blocks the card opening (writeActivityCardRecord
+            // → persistActivityCards swallows write errors — it never throws).
+            //
+            // F6 (persist-intent-first ordering): this write is the FIRST action
+            // taken after the send resolves and BEFORE the status-pin reconcile
+            // below — no `await` sits between the send and this persist, so the
+            // crash window in which a sent card has no durable record (and is
+            // thus unreapable by the boot reaper) is the minimum achievable. A
+            // true pre-send provisional record is impossible: the reaper keys
+            // its finalizing edit on `activityMessageId`, which only exists once
+            // sendRichMessage returns. Keep this persist synchronous and ahead
+            // of the pin; do not move it after an await.
             if (activityCardPersistEnabled) {
               writeActivityCardRecord(ACTIVITY_CARD_STORE_PATH, activityCardStoreFs, {
                 turnKey: statusKey(chat, thread),
@@ -397,15 +408,18 @@ export function createNarrativeLane(deps: NarrativeLaneDeps) {
                 threadId: thread ?? null,
                 activityMessageId: sent.message_id,
                 startedAt: turn.startedAt,
-                // Mirror the ACTUAL pin decision, not an unconditional `true`:
-                // the OPEN below silently-pins the fresh card only when
-                // `PIN_STATUS_WHILE_WORKING` is on (`reconcileStatusPin` no-ops
-                // when it's off, and can also fail on missing supergroup
-                // rights). Persisting `pinned: true` regardless would make the
-                // boot reaper attempt an unpin on a card that was never pinned.
-                // The reaper's unpin is defense-in-depth anyway
+                // F5 (persist-intent honesty): mirror the ACTUAL pin decision,
+                // not an unconditional `true`. The OPEN below silently-pins the
+                // fresh card only when `PIN_STATUS_WHILE_WORKING` is on
+                // (`reconcileStatusPin` no-ops when it's off, and can also fail
+                // on missing supergroup rights). Persisting `pinned: true`
+                // regardless would make the boot reaper attempt an unpin on a
+                // card that was never pinned. The persist is intentionally
+                // written BEFORE the fire-and-forget pin resolves (intent, not
+                // outcome); the reaper's unpin is idempotent defense-in-depth
                 // (`statusPinBootCleanup` owns the primary unpin), so tracking
-                // the flag honestly is what matters here.
+                // the DECISION honestly — pinned iff we will actually attempt a
+                // pin — is what matters here, not the async pin's result.
                 pinned: PIN_STATUS_WHILE_WORKING,
               })
             }

@@ -360,6 +360,22 @@ function main() {
   }
 
   const input = event.tool_input ?? {}
+  // F3 (progress-card fork model): a FORK dispatch (`subagent_type === 'fork'`)
+  // inherits the PARENT session's model and IGNORES any `tool_input.model`
+  // override. Seeding the row's first-paint model from that ignored override
+  // makes the worker card show a WRONG model (e.g. "sonnet" while the fork
+  // actually runs Opus) until the watcher overwrites it from the fork's own
+  // transcript. Suppress the dispatch-time seed for forks — leave model NULL so
+  // the card omits the model rather than showing a value the fork won't honor;
+  // the transcript-sourced model then paints as soon as the first assistant
+  // line lands (transcript wins, exactly as for non-fork workers). Fixing it at
+  // the seed source (not downstream in worker-feed-dispatch) keeps the
+  // transcript-confirmed model flowing to the terminal card unchanged.
+  const isFork = input.subagent_type === 'fork'
+  const dispatchModel =
+    !isFork && typeof input.model === 'string' && input.model.length > 0
+      ? input.model
+      : null
   // Resolve parent_turn_key from the live turn-active marker (the turn whose
   // tool call is dispatching this sub-agent). Claude Code's PreToolUse payload
   // carries only its own session id, never the gateway-minted Telegram turn_key
@@ -384,8 +400,9 @@ function main() {
       // BEFORE the sub-agent writes its first assistant line. Persisted so the
       // card can render the model from dispatch; the watcher later overwrites it
       // from the worker's own transcript (transcript wins). Only a non-empty
-      // string is stored — never guess from config.
-      model: typeof input.model === 'string' && input.model.length > 0 ? input.model : null,
+      // string is stored — never guess from config. NULL for a fork dispatch,
+      // which ignores the model override (see dispatchModel above, F3).
+      model: dispatchModel,
       now: Date.now(),
     },
     (err) => {
