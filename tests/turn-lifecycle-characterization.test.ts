@@ -117,6 +117,7 @@ beforeEach(() => {
   seam.activeReactionMsgIds.clear()
   seam.pendingPermissions.clear?.()
   seam.pendingRestarts.clear()
+  seam.deliveryQueue.pending.clear()
   // Drain any buffered inbound a prior test left behind.
   for (const m of seam.pendingInboundBuffer.drain(SELF_AGENT)) void m
 })
@@ -344,19 +345,73 @@ describe('turn-lifecycle characterization — PR-E ghost-clears (M1: atom-clear 
 })
 
 describe('turn-lifecycle characterization — idle-only sweeps (P0c gate: tick body only)', () => {
-  it('case 4 — delivery-confirm sweep is a no-op mid-turn (currentTurn != null)', () => {
+  it('case 4 — delivery-confirm sweep: a stranded entry is HELD mid-turn, redelivered at idle', async () => {
+    // LOAD-BEARING both ways (P8 M-1): the queue holds a genuinely stranded
+    // entry (lastAttemptAt=0 → past any confirm timeout), so the mid-turn leg
+    // proves the idle gate SUPPRESSED a redelivery that was otherwise due —
+    // deleting `if (!getCurrentTurnNull()) return` in delivery-confirm-wiring
+    // reds this test (mutation-verified). The idle leg then proves the same
+    // entry IS redelivered once the turn atom clears.
     const turn = makeTurn({ replyCalled: true, finalAnswerDelivered: true })
-    goLive(turn) // currentTurn != null → the idle gate suppresses redelivery
-    expect(() => seam.runDeliveryConfirmSweep()).not.toThrow()
-    // Nothing re-delivered while a turn is live (the documented mid-turn wedge
-    // guard, gateway.ts delivery-sweep idle gate).
+    goLive(turn) // currentTurn != null → the idle gate must suppress redelivery
+    const strandedKey = seam.statusKey(DM_CHAT, undefined)
+    const stranded = bufferedInbound(55)
+    seam.deliveryQueue.pending.set(strandedKey, {
+      key: strandedKey,
+      inbound: stranded,
+      messageId: '55',
+      lastAttemptAt: 0, // stranded long past DELIVERY_CONFIRM_TIMEOUT_MS
+    })
+
+    seam.runDeliveryConfirmSweep()
+
+    // Mid-turn: NOT redelivered (the documented mid-turn wedge guard) and the
+    // entry's attempt clock untouched — the gate returned BEFORE the queue sweep.
     expect(ipcSends.length).toBe(0)
+    expect(seam.deliveryQueue.pending.get(strandedKey)?.lastAttemptAt).toBe(0)
+
+    // Clear the live turn → idle → the SAME stranded entry is redelivered.
+    seam.clearAllCurrentTurns()
+    seam.runDeliveryConfirmSweep()
+    // redeliverStrandedInbound awaits a dynamic import before sendToAgent.
+    await vi.waitFor(() => expect(ipcSends.length).toBe(1), { timeout: 5000 })
+    expect((ipcSends[0] as any).messageId).toBe(55)
+    seam.deliveryQueue.pending.delete(strandedKey)
   })
 
-  it('case 5 — obligation sweep is idle-only and safe to tick with no open obligations', () => {
-    // No live turn (idle) and an empty ledger → the sweep runs its idle path
-    // without re-presenting anything (grace windows / never-storm invariant).
-    expect(() => seam.obligationSweep()).not.toThrow()
-    expect(ipcSends.length).toBe(0)
+  it('case 5 — obligation sweep: an over-grace obligation is SUPPRESSED mid-turn, re-presented at idle', () => {
+    // LOAD-BEARING both ways (P8 M-1): the ledger holds an open obligation past
+    // every grace window (opened 30 min ago > the 20 min background-work
+    // ceiling, handling turn ended 10 min ago > the 45s escalate grace, never
+    // re-presented), so the mid-turn leg proves the idle gate SUPPRESSED a
+    // represent that was otherwise due — deleting `if (turnInFlightForGate())
+    // return` in obligation-wiring reds this test (mutation-verified). The
+    // idle leg then proves the sweep DOES re-present it (a represent inbound
+    // pushed into the offline buffer).
+    const now = Date.now()
+    const originTurnId = 'oblig-sweep-case5'
+    seam.obligationLedger.openIfAbsent({
+      originTurnId, chatId: DM_CHAT, messageId: 9, text: 'unanswered q', openedAt: now - 30 * 60_000,
+    })
+    seam.obligationLedger.noteTurnEnded(originTurnId, now - 10 * 60_000)
+
+    // Turn in flight (driven via the pendingPermissions leg of
+    // turnInFlightForGate, same as case 8): the sweep must do nothing.
+    seam.pendingPermissions.set('k5', { at: now, cards: [] } as any)
+    seam.obligationSweep()
+    expect(seam.pendingInboundBuffer.depth(SELF_AGENT)).toBe(0)
+    expect(seam.obligationLedger.isOpen(originTurnId)).toBe(true)
+
+    // Idle → the sweep re-presents: the represent inbound lands in the buffer
+    // and the obligation stays open awaiting the real answer.
+    seam.pendingPermissions.clear?.()
+    seam.obligationSweep()
+    const drained = seam.pendingInboundBuffer.drain(SELF_AGENT)
+    expect(drained.length).toBe(1)
+    expect(drained[0].meta?.source).toBe('obligation_represent')
+    expect(drained[0].meta?.origin_turn_id).toBe(originTurnId)
+    expect(seam.obligationLedger.isOpen(originTurnId)).toBe(true)
+    // Clean up for later cases.
+    seam.obligationLedger.close(originTurnId)
   })
 })
