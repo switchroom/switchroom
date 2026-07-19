@@ -157,6 +157,11 @@ describe('gateway wiring (source-level guards) — the gateway IIFE is too entan
     // The unwedge fallback calls redeliverBufferedInbound directly — it
     // must NOT be gated by the serialize predicate, or a stuck no-reply
     // turn whose bounded timer somehow failed would never recover.
-    expect(gatewaySrc).toMatch(/silence-poke framework-fallback ended wedged turn/)
+    // #2996 P8 PR-C3: the fallback body moved verbatim to liveness-wiring.ts.
+    const livenessSrc = readFileSync(
+      resolve(__dirname, '..', 'gateway', 'liveness-wiring.ts'),
+      'utf-8',
+    )
+    expect(livenessSrc).toMatch(/silence-poke framework-fallback ended wedged turn/)
   })
 })

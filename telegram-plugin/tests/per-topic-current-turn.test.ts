@@ -36,6 +36,9 @@ const gatewaySrc = readFileSync(resolve(__dirname, '..', 'gateway', 'gateway.ts'
 // (`getCurrentTurn() === turn`) rather than the `currentTurn` module global —
 // same invariant, accessor spelling. These wiring oracles span both files.
 const streamSrc = readFileSync(resolve(__dirname, '..', 'gateway', 'stream-render.ts'), 'utf-8')
+// #2996 P8 PR-C3: the silence-poke fallback body (keyed delete + purgeChatStale
+// self-heal) moved verbatim to liveness-wiring.ts — those oracles read there.
+const livenessSrc = readFileSync(resolve(__dirname, '..', 'gateway', 'liveness-wiring.ts'), 'utf-8')
 const gatewayAndStreamSrc = gatewaySrc + '\n' + streamSrc
 
 // ---------------------------------------------------------------------------
@@ -64,8 +67,9 @@ describe('PR-4e source-read oracle — the wiring the per-topic map depends on',
     expect(gatewayAndStreamSrc).toMatch(/setCurrentTurn\(next, statusKey\(ev\.chatId, enqThreadIdNum\)\)/)
     // The disconnect-flush clears the WHOLE map (every entry is a ghost).
     expect(gatewaySrc).toMatch(/clearAllCurrentTurns\(\)/)
-    // The silence-poke fallback does a keyed delete for the wedged turn's key.
-    expect(gatewaySrc).toMatch(/endCurrentTurnForKey\(wedgedTurn, fbKey\)/)
+    // The silence-poke fallback does a keyed delete for the wedged turn's key
+    // (#2996 P8 PR-C3: the fallback body lives in liveness-wiring.ts).
+    expect(livenessSrc).toMatch(/endCurrentTurnForKey\(wedgedTurn, fbKey\)/)
   })
 
   it('endCurrentTurnAtomic closes the leak AT ORIGIN — keyed liveness guard + keyed delete', () => {
@@ -124,7 +128,8 @@ describe('PR-4e source-read oracle — the wiring the per-topic map depends on',
   })
 
   it('the self-heal backstop drops per-topic entries for the swept chat (purgeChatStale)', () => {
-    expect(gatewaySrc).toMatch(/currentTurnMap\.purgeChatStale\(fbChatId,/)
+    // #2996 P8 PR-C3: the self-heal lives in the extracted fallback body.
+    expect(livenessSrc).toMatch(/currentTurnMap\.purgeChatStale\(fbChatId,/)
   })
 })
 
