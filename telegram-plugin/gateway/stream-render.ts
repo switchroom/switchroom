@@ -1623,16 +1623,19 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
         // corrects it in place.
         //
         // TWO distinct arbiters set synchronously here, before any `await`:
-        //   (a) `turn.answerDelivered` — the backstop-vs-LATE-REPLY signal the
-        //       reply path already reads (`decideAnswerLatchSuppression` +
-        //       `flushedTurnSupersede`), exactly as on `main`.
+        //   (a) `turn.answerDelivered = 'flush'` — the backstop-vs-LATE-REPLY
+        //       signal the reply path already reads
+        //       (`decideAnswerLatchSuppression` + `flushedTurnSupersede`).
+        //       Source-tagged 'flush' (#3426): the late-reply suppression is
+        //       scoped to flush-armed latches, so a later async handback
+        //       attributed to a reply-delivered ended turn is never dropped.
         //   (b) `backstopDeliveryLedger.claim` — the backstop-vs-BACKSTOP
         //       double-fire latch: `claim` returning false means this turn
         //       already fired a backstop (answer-ready quiescence, then the
         //       turn-end backstop), so this fire is a no-op. It does NOT
         //       arbitrate the late reply (that is (a)); it is redundant-but-
         //       cheap with the `currentTurn == null` bail below.
-        turn.answerDelivered = true
+        turn.answerDelivered = 'flush'
         const backstopLatchClaimed = backstopDeliveryLedger.claim(turn.turnId)
 
         // #654 deterministic double-message fix. Hand off the pinned

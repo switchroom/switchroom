@@ -899,20 +899,25 @@ export async function sendReply(
       // resolves the same ended owner turn, sees the latch, and is suppressed —
       // exactly one message ever ships. The latch is idempotent and the normal
       // (no-throw) path is unaffected: the correction below still ships B once.
-      if (ownerTurn != null) ownerTurn.answerDelivered = true
+      // Tagged 'flush' (#3426): a flush record existed for this turn (take()
+      // just consumed it), so the flushed message A is what the suppression
+      // protects against duplicating.
+      if (ownerTurn != null) ownerTurn.answerDelivered = 'flush'
     } else {
       // 2026-07 double-reply-on-DM fix (Part 2) — answer-delivered race latch.
       // Supersede found no record. Either there was no flush (normal reply), or
       // the flush FIRED but has not yet recorded its message ids (the residual
       // pre-record race Part 1's supersede cannot reach). The flush sets
-      // `answerDelivered = true` synchronously at fire time (before its async
-      // send AND before `record`), and it persists on the ended turn — so when
-      // this LATE, substantive reply resolves its owner turn and sees the latch
-      // already set, the flush's message A is already on its way out and this
-      // reply would ship a duplicate. Suppress it. Scoped to the substantive
-      // ≥`FLUSH_SUBSTANTIVE_MIN_CHARS` floor and the late-reply case so an
-      // interim sub-floor ack, a chunked multi-part answer, or a legitimate
-      // second in-turn substantive reply (live `currentTurn`) is never
+      // `answerDelivered = 'flush'` synchronously at fire time (before its
+      // async send AND before `record`), and it persists on the ended turn — so
+      // when this LATE, substantive reply resolves its owner turn and sees the
+      // FLUSH-armed latch, the flush's message A is already on its way out and
+      // this reply would ship a duplicate. Suppress it. Scoped to the
+      // substantive ≥`FLUSH_SUBSTANTIVE_MIN_CHARS` floor, the late-reply case,
+      // AND the 'flush' latch source (#3426) so an interim sub-floor ack, a
+      // chunked multi-part answer, a legitimate second in-turn substantive
+      // reply (live `currentTurn`), or an async sub-agent handback landing
+      // after a reply-delivered turn ended (latch = 'reply') is never
       // suppressed. `isSubstantiveFinalReply` reduces to the ≥200-char test on
       // the `reply` path (no `done`); pass the model's original notification
       // intent to mirror the #2533 decoupling call shape.
@@ -934,11 +939,16 @@ export async function sendReply(
         )
         return { content: [{ type: 'text', text: 'sent (deduped — answer already delivered via turn-flush)' }] }
       }
-      // A substantive answer is going out via this reply — set the latch on its
-      // owner turn so a later bridge-replayed / reworded duplicate of the same
-      // answer is caught by the branch above.
+      // A substantive answer is going out via this reply — record it on the
+      // owner turn, tagged 'reply' (#3426). The 'reply' tag does NOT trip the
+      // late-reply suppression above: a later reply attributed to this turn
+      // after it ends (the async sub-agent handback pattern — dispatch, interim
+      // ack, turn_end, handback with no live gateway turn) is genuinely new
+      // content and must deliver. Byte-identical replays of THIS answer are
+      // deduped by the content-keyed #546 cache at the top of this function,
+      // whose 60 s TTL matches the latest-ended owner tier's supersede TTL.
       if (replySubstantive && ownerTurn != null) {
-        ownerTurn.answerDelivered = true
+        ownerTurn.answerDelivered = 'reply'
       }
     }
   }

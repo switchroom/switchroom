@@ -34,8 +34,10 @@ import {
   resolveReplyOwnerTurnId,
   decideAnswerLatchSuppression,
   type ReplyOwnerCandidates,
+  type AnswerDeliveredLatch,
 } from '../reply-owner-resolve.js'
 import { FlushedTurnSupersedeRegistry, DEFAULT_SUPERSEDE_TTL_MS } from '../flushed-turn-supersede.js'
+import { OutboundDedupCache } from '../recent-outbound-dedup.js'
 
 const NONE: ReplyOwnerCandidates = {
   liveTurnId: null,
@@ -129,13 +131,13 @@ describe('Part 1 end-to-end: unified resolver drives the flush supersede', () =>
 
 describe('decideAnswerLatchSuppression — race backstop (Part 2)', () => {
   it('RACE: a late substantive reply lands in the flush post-fire pre-record ' +
-    'window (no supersede record yet) → SUPPRESSED by the latch', () => {
+    'window (no supersede record yet) → SUPPRESSED by the flush-armed latch', () => {
     expect(
       decideAnswerLatchSuppression({
         superseded: false,
         replySubstantive: true,
         isLateReply: true,
-        ownerAnswerDelivered: true,
+        ownerAnswerDelivered: 'flush',
       }),
     ).toBe(true)
   })
@@ -147,7 +149,7 @@ describe('decideAnswerLatchSuppression — race backstop (Part 2)', () => {
         superseded: true,
         replySubstantive: true,
         isLateReply: true,
-        ownerAnswerDelivered: true,
+        ownerAnswerDelivered: 'flush',
       }),
     ).toBe(false)
   })
@@ -159,7 +161,7 @@ describe('decideAnswerLatchSuppression — race backstop (Part 2)', () => {
         superseded: false,
         replySubstantive: false,
         isLateReply: true,
-        ownerAnswerDelivered: true,
+        ownerAnswerDelivered: 'flush',
       }),
     ).toBe(false)
   })
@@ -171,7 +173,7 @@ describe('decideAnswerLatchSuppression — race backstop (Part 2)', () => {
         superseded: false,
         replySubstantive: true,
         isLateReply: false,
-        ownerAnswerDelivered: true,
+        ownerAnswerDelivered: 'flush',
       }),
     ).toBe(false)
   })
@@ -195,7 +197,7 @@ describe('F1 — flush send failure must NOT suppress the late reply (zero-messa
   // latch armed would make a genuine late reply suppress itself → the user gets
   // ZERO messages. The gateway's send-failure catch resets `answerDelivered =
   // false`; these assert the resulting coordination outcome at the pure core.
-  const lateSubstantiveReply = (ownerAnswerDelivered: boolean) =>
+  const lateSubstantiveReply = (ownerAnswerDelivered: AnswerDeliveredLatch) =>
     decideAnswerLatchSuppression({
       superseded: false,
       replySubstantive: true,
@@ -205,8 +207,8 @@ describe('F1 — flush send failure must NOT suppress the late reply (zero-messa
 
   it('WITHOUT the catch-reset (latch still armed) the late reply is suppressed ' +
     '— the zero-message bug', () => {
-    // Models the buggy state: flush armed the latch, send failed, latch left true.
-    expect(lateSubstantiveReply(true)).toBe(true)
+    // Models the buggy state: flush armed the latch, send failed, latch left armed.
+    expect(lateSubstantiveReply('flush')).toBe(true)
   })
 
   it('WITH the catch-reset (answerDelivered=false) the late reply DELIVERS', () => {
@@ -293,15 +295,15 @@ describe('F2 — recency-bound the destructive latest-ended supersede tier', () 
  * consumed — the retry takes the no-record branch. Without a latch the retry
  * would ship a fresh B alongside the stale narration A (both visible).
  *
- * The fix latches `ownerTurn.answerDelivered = true` at record consumption, so
- * the retry (resolving the SAME ended owner turn) is caught by
+ * The fix latches `ownerTurn.answerDelivered = 'flush'` at record consumption,
+ * so the retry (resolving the SAME ended owner turn) is caught by
  * `decideAnswerLatchSuppression` and suppressed — exactly one message survives.
  */
 describe('reply-flicker edit-in-place — mid-path throw + retry never resurrects the duplicate (L1)', () => {
   const CHAT = '636363'
 
   /** Minimal model of the ended owner turn atom the gateway mutates + reads. */
-  interface OwnerTurn { turnId: string; answerDelivered: boolean }
+  interface OwnerTurn { turnId: string; answerDelivered: AnswerDeliveredLatch }
 
   /**
    * Drive the two gateway `reply` calls the incident produces, threading the
@@ -325,8 +327,9 @@ describe('reply-flicker edit-in-place — mid-path throw + retry never resurrect
     const d1 = reg.take(CHAT, undefined, { liveTurnId: owner.turnId, now: now + 10 })
     const firstSuperseded = d1.supersede
     if (d1.supersede && setLatchOnSupersede) {
-      // The fix: latch at consumption, BEFORE the arg-validation throw.
-      owner.answerDelivered = true
+      // The fix: latch at consumption, BEFORE the arg-validation throw. Tagged
+      // 'flush' (#3426) — a flush record existed for this turn.
+      owner.answerDelivered = 'flush'
     }
     // Arg-validation throw fires here (oversized file / invalid keyboard):
     // the correction never runs → A is neither deleted nor edited, B not sent.
@@ -365,5 +368,194 @@ describe('reply-flicker edit-in-place — mid-path throw + retry never resurrect
     expect(r.retrySuppressed).toBe(false)
     // The exact regression: stale narration A AND the retry reply B are both visible.
     expect(r.visible).toEqual(['A(flush-narration)', 'B(retry-reply)'])
+  })
+})
+
+/**
+ * #3426 — async sub-agent handback silently dropped by a stale answer-delivered
+ * latch.
+ *
+ * ## The incident these tests pin (overlord, chat 12345, turn …#10473)
+ *
+ *   11:28:00  interim ack `reply` (321 chars — ABOVE the ≥200 substantive
+ *             floor) lands in the LIVE turn; the gateway records the answer on
+ *             the turn atom (outbound-send-path no-record branch tail).
+ *   11:28:10  turn_end (replyCalled=true, finalAnswer=true); the atom persists
+ *             in recentTurnsById with endedAt stamped.
+ *   11:28:51  the async sub-agent completes and the agent's handback `reply`
+ *             (1365 chars, GENUINELY DIFFERENT content) lands with NO live
+ *             gateway turn (a sub-agent completion is not a new inbound, so no
+ *             new turn atom exists). The owner resolves to the ENDED ack turn
+ *             via the latest-ended tier (41 s ≤ the 60 s supersede TTL), whose
+ *             boolean latch was still armed → the handback was suppressed as a
+ *             "flush duplicate" and a false "deduped" success returned. The
+ *             user never saw the sub-agent's findings.
+ *
+ * ## The fix
+ *
+ * The latch is SOURCE-TAGGED (`AnswerDeliveredLatch`): 'flush' when the
+ * turn-flush backstop armed it (the two races the suppression exists for),
+ * 'reply' when a normally-delivered reply carried the answer.
+ * `decideAnswerLatchSuppression` suppresses a late reply ONLY for a
+ * flush-armed latch — a 'reply'-armed latch never suppresses, so the
+ * dispatch → ack → turn_end → handback sequence always delivers. Genuine
+ * byte-identical replays of the delivered reply remain covered by the
+ * content-keyed #546 outbound dedup (whose 60 s TTL matches the latest-ended
+ * owner tier bound), asserted below.
+ */
+describe('#3426 — async sub-agent handback after an interim-ack turn', () => {
+  const CHAT = '12345'
+  const ACK_TURN = '12345:_#10473'
+  /** ms between turn_end (11:28:10) and the handback landing (11:28:51). */
+  const HANDBACK_AGE_MS = 41_000
+
+  interface OwnerTurn { turnId: string; answerDelivered: AnswerDeliveredLatch }
+
+  /** The OLD (pre-#3426) decision, reproduced verbatim for the red-on-main
+   *  contrast: the latch was a plain boolean, so ANY armed latch suppressed a
+   *  late substantive reply regardless of which path armed it. */
+  function oldBooleanLatchSuppression(input: {
+    superseded: boolean
+    replySubstantive: boolean
+    isLateReply: boolean
+    ownerAnswerDelivered: boolean
+  }): boolean {
+    if (input.superseded) return false
+    if (!input.replySubstantive) return false
+    if (!input.isLateReply) return false
+    return input.ownerAnswerDelivered
+  }
+
+  /**
+   * Drive the incident timeline through the SAME pure cores the gateway runs.
+   * `latchSemantics` toggles the fixed source-tagged decision ('tagged') vs
+   * the pre-fix boolean decision ('boolean' — red-on-main contrast).
+   * Returns what the user ends up seeing.
+   */
+  function runDispatchAckHandback(latchSemantics: 'tagged' | 'boolean'): {
+    delivered: string[]
+    ownerId: string | null
+    handbackSuppressed: boolean
+  } {
+    const reg = new FlushedTurnSupersedeRegistry()
+    const now = 1_000_000
+    const owner: OwnerTurn = { turnId: ACK_TURN, answerDelivered: false }
+    const delivered: string[] = []
+
+    // ── 1. Interim ack lands IN the live turn (substantive: 321 ≥ 200). ──
+    // Live turn ⇒ isLateReply=false ⇒ never suppressed; the gateway then
+    // arms the latch on the owner turn (outbound-send-path no-record tail).
+    const ackSuppressed = decideAnswerLatchSuppression({
+      superseded: false,
+      replySubstantive: true,
+      isLateReply: false, // currentTurn is live at ack time
+      ownerAnswerDelivered: owner.answerDelivered,
+    })
+    expect(ackSuppressed).toBe(false)
+    delivered.push('ack("Kicked off a fable researcher…")')
+    owner.answerDelivered = 'reply' // the fixed arm site tags the source
+
+    // ── 2. turn_end — the atom persists (endedAt stamped), latch still armed. ──
+
+    // ── 3. The async handback lands 41 s later with NO live gateway turn. ──
+    // DM ⇒ no origin_turn_id; no quote recovery; the latest-ended tier
+    // resolves the ENDED ack turn as owner (41 s ≤ 60 s TTL) — the latch IS
+    // genuinely reachable, which is exactly how the incident happened.
+    const ownerId = resolveReplyOwnerTurnId({
+      liveTurnId: null,
+      originTurnId: null,
+      quotedTurnId: null,
+      latestEndedTurnId: owner.turnId,
+      latestEndedAgeMs: HANDBACK_AGE_MS,
+      latestEndedTtlMs: DEFAULT_SUPERSEDE_TTL_MS,
+    })
+    expect(ownerId).toBe(ACK_TURN)
+
+    // No flush ever fired this turn ⇒ no supersede record to take.
+    const supersede = reg.take(CHAT, undefined, { liveTurnId: ownerId, now: now + HANDBACK_AGE_MS })
+    expect(supersede.supersede).toBe(false)
+
+    const handbackSuppressed = latchSemantics === 'tagged'
+      ? decideAnswerLatchSuppression({
+          superseded: false,
+          replySubstantive: true, // 1365 chars
+          isLateReply: true, // no live gateway turn at handback time
+          ownerAnswerDelivered: owner.answerDelivered,
+        })
+      : oldBooleanLatchSuppression({
+          superseded: false,
+          replySubstantive: true,
+          isLateReply: true,
+          // Pre-fix the latch was `true` (a bare boolean, source-blind).
+          ownerAnswerDelivered: owner.answerDelivered !== false,
+        })
+    if (!handbackSuppressed) delivered.push('handback("Fable\'s back. The /model fix…")')
+    return { delivered, ownerId, handbackSuppressed }
+  }
+
+  it('CORE REGRESSION (the fix): the handback is NOT suppressed — the user ' +
+    'receives BOTH the interim ack AND the sub-agent findings', () => {
+    const r = runDispatchAckHandback('tagged')
+    expect(r.handbackSuppressed).toBe(false)
+    expect(r.delivered).toEqual([
+      'ack("Kicked off a fable researcher…")',
+      'handback("Fable\'s back. The /model fix…")',
+    ])
+  })
+
+  it('RED-ON-MAIN CONTRAST: the pre-fix boolean latch suppresses the handback ' +
+    '— the silent drop (only the ack ever reaches the user)', () => {
+    const r = runDispatchAckHandback('boolean')
+    // Owner resolution is identical in both worlds — the ended ack turn.
+    expect(r.ownerId).toBe(ACK_TURN)
+    expect(r.handbackSuppressed).toBe(true)
+    expect(r.delivered).toEqual(['ack("Kicked off a fable researcher…")'])
+  })
+
+  it('pure core: a reply-armed latch never suppresses a late substantive reply', () => {
+    expect(
+      decideAnswerLatchSuppression({
+        superseded: false,
+        replySubstantive: true,
+        isLateReply: true,
+        ownerAnswerDelivered: 'reply',
+      }),
+    ).toBe(false)
+  })
+
+  it('flush race NOT reopened: the same late-landing shape against a ' +
+    'FLUSH-armed latch is still suppressed (the Part 2 backstop holds)', () => {
+    // Same timeline shape, but the turn's answer went out via the turn-flush
+    // backstop (post-fire pre-record window): latch = 'flush', no record yet.
+    expect(
+      decideAnswerLatchSuppression({
+        superseded: false,
+        replySubstantive: true,
+        isLateReply: true,
+        ownerAnswerDelivered: 'flush',
+      }),
+    ).toBe(true)
+  })
+
+  it('double-send NOT reopened: a byte-identical replay of the delivered ' +
+    'reply is still caught by the #546 content dedup (60 s TTL)', () => {
+    const dedup = new OutboundDedupCache()
+    const now = 5_000_000
+    const answer =
+      'Fable is back. The /model fix landed in release 1.0.128 and the fallback ' +
+      'behaviour matches what we saw in the transcripts yesterday evening.'
+    // The reply path records what it sent (with its turn key)…
+    dedup.record(CHAT, undefined, answer, now, ACK_TURN)
+    // …and a late byte-identical replay (no live turn ⇒ null turnKey, which
+    // matches any recorded entry) is deduped before the latch is ever consulted.
+    const replay = dedup.check(CHAT, undefined, answer, now + HANDBACK_AGE_MS, null)
+    expect(replay).not.toBeNull()
+    // While the DIFFERENT-content handback sails past the content dedup…
+    const handback = dedup.check(
+      CHAT, undefined,
+      'Completely different sub-agent findings text, long enough to clear the dedup floor.',
+      now + HANDBACK_AGE_MS, null,
+    )
+    expect(handback).toBeNull()
   })
 })

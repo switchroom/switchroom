@@ -108,6 +108,31 @@ export function resolveReplyOwnerTurnId(candidates: ReplyOwnerCandidates): strin
 }
 
 /**
+ * The answer-delivered latch value — SOURCE-TAGGED (#3426).
+ *
+ * `false`   — no answer delivered this turn (latch unarmed).
+ * `'flush'` — the TURN-FLUSH backstop delivered (or is mid-delivering) this
+ *             turn's answer as its own message A. Set synchronously at
+ *             flush-fire time, and at supersede-record consumption (the
+ *             resurrection window — a flush record existed for this turn).
+ * `'reply'` — a normally-delivered `reply` tool call carried this turn's
+ *             answer (no flush involved).
+ *
+ * Why the tag exists: the late-reply suppression below is a race backstop for
+ * FLUSH duplicates only. A boolean latch also suppressed the async sub-agent
+ * handback pattern (#3426): the parent turn's interim ack (a substantive
+ * `reply`) armed the latch, the turn ended, and the sub-agent completion
+ * handback — a genuinely NEW answer arriving with no live gateway turn —
+ * resolved the ended turn as owner (latest-ended tier, inside the 60 s
+ * supersede TTL), saw the stale latch, and was silently dropped with a false
+ * "deduped" success. Tagging the source lets the suppression fire ONLY for the
+ * flush races it exists for; byte-identical replays of a reply-delivered
+ * answer remain covered by the content-keyed outbound dedup (#546), whose 60 s
+ * TTL matches the latest-ended owner tier's bound.
+ */
+export type AnswerDeliveredLatch = false | 'flush' | 'reply'
+
+/**
  * The answer-delivered latch inputs (Part 2 — the race backstop).
  *
  * The unified resolver (Part 1) closes the common late-reply case where the
@@ -118,11 +143,11 @@ export function resolveReplyOwnerTurnId(candidates: ReplyOwnerCandidates): strin
  * There `flushed-turn-supersede` finds no record (nothing to delete yet) and the
  * reply would ship message B as a duplicate of the flush's message A.
  *
- * The latch closes that window: the gateway sets `answerDelivered = true` on the
- * turn atom SYNCHRONOUSLY at flush-fire time — before the ~500 ms async send and
- * before the record — and the flag persists on the ended turn (readable via the
- * unified resolver after `currentTurn` is null). A reply landing in the race
- * window then sees the latch already set and suppresses itself.
+ * The latch closes that window: the gateway sets `answerDelivered = 'flush'` on
+ * the turn atom SYNCHRONOUSLY at flush-fire time — before the ~500 ms async send
+ * and before the record — and the flag persists on the ended turn (readable via
+ * the unified resolver after `currentTurn` is null). A reply landing in the race
+ * window then sees the flush latch already set and suppresses itself.
  */
 export interface AnswerLatchSuppressInput {
   /** True when Part 1's supersede already fired for THIS reply (message A was
@@ -140,21 +165,29 @@ export interface AnswerLatchSuppressInput {
    *  legitimate second in-turn substantive reply (a genuine multi-message
    *  answer, live currentTurn) untouched. */
   isLateReply: boolean
-  /** The resolved owner turn's `answerDelivered` latch. */
-  ownerAnswerDelivered: boolean
+  /** The resolved owner turn's source-tagged `answerDelivered` latch. */
+  ownerAnswerDelivered: AnswerDeliveredLatch
 }
 
 /**
  * Decide whether the answer-delivered latch suppresses a landing reply.
  *
  * Suppress IFF: Part 1 did NOT already supersede, the reply is a substantive
- * final answer, it is a late reply (no live turn), AND the owner turn's latch is
- * already set (the flush delivered the same substantive answer as message A in
- * the pre-record race window). Otherwise the reply sends.
+ * final answer, it is a late reply (no live turn), AND the owner turn's latch
+ * was armed by the TURN-FLUSH path (`'flush'` — the flush delivered the same
+ * substantive answer as message A in the pre-record race window, or the
+ * supersede-consumed resurrection window). Otherwise the reply sends.
+ *
+ * A `'reply'`-armed latch deliberately does NOT suppress (#3426): the prior
+ * answer went out via a normal, completed `reply`, so a later late-landing
+ * reply attributed to that ended turn is NOT a flush duplicate — it is
+ * (typically) an async sub-agent handback carrying genuinely new content, and
+ * suppressing it silently drops the user's answer. Byte-identical replays of
+ * the delivered reply are still deduped by the content-keyed #546 cache.
  */
 export function decideAnswerLatchSuppression(input: AnswerLatchSuppressInput): boolean {
   if (input.superseded) return false
   if (!input.replySubstantive) return false
   if (!input.isLateReply) return false
-  return input.ownerAnswerDelivered
+  return input.ownerAnswerDelivered === 'flush'
 }
