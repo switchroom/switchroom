@@ -627,6 +627,30 @@ def _apply_tag_weights(results, tag_weights) -> int:
     return changed
 
 
+def _effective_tag_weights(config) -> dict:
+    """Merge the built-in lesson/anti-pattern demotion weights UNDER the operator's
+    ``recallTagWeights`` (switchroom E2 / PR9, #398).
+
+    The retain side (``detect_lesson_tags``) tags failure-mode-adjacent transcripts
+    ``lesson`` / ``anti-pattern``; this composes those tags into the same PR5
+    score-penalty map so they are DEMOTED out of the box. Precedence: an explicit
+    ``recallTagWeights`` entry WINS over the built-in for the same tag (operator
+    override), and the PR5 ``sidechain`` seed still composes cleanly since it lives
+    only in ``recallTagWeights``. When ``lessonDemotion`` is false the built-ins are
+    dropped entirely (rollback lever) and only ``recallTagWeights`` applies.
+    """
+    configured = config.get("recallTagWeights")
+    configured = configured if isinstance(configured, dict) else {}
+    if not config.get("lessonDemotion", True):
+        return configured
+    builtin = config.get("lessonDemotionWeights")
+    builtin = builtin if isinstance(builtin, dict) else {}
+    if not builtin:
+        return configured
+    # builtin first, operator override wins on key conflict.
+    return {**builtin, **configured}
+
+
 def _write_recall_log(entry: dict) -> None:
     """Append a JSONL line to recall_log.jsonl. Bounded by line count.
 
@@ -1631,7 +1655,7 @@ def main():
     # is the "reduced weight" the demote-tag DROP filter above cannot express:
     # a penalised memory ranks below equal-scoring untagged memories yet still
     # survives the cap when it is the only relevant hit. See _apply_tag_weights.
-    tag_weights = config.get("recallTagWeights")
+    tag_weights = _effective_tag_weights(config)
     weighted = _apply_tag_weights(results, tag_weights)
     if weighted > 0:
         debug_log(config, f"Applied recallTagWeights to {weighted} memories: {tag_weights}")

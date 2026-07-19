@@ -23,6 +23,28 @@
 
 ### Added (switchroom divergence)
 
+- **retain.py + recall.py: lesson/anti-pattern tagging → recall demotion**
+  (switchroom hindsight-leverage PR9, workstream E2, #398). Closes the corpus-
+  hygiene half of #398: a retained transcript that captures a self-recognised
+  lesson ("lesson learned", "note to self:") or a failure mode ("anti-pattern:",
+  "what not to do") is now deterministically tagged (`lesson` / `anti-pattern`)
+  at retain time by `retain.detect_lesson_tags` — a case-insensitive substring
+  match against the configurable `lessonTagMarkers` map (NOT model-dependent),
+  wired into `build_retain_payload` so it applies to both Stop-hook and sidechain
+  retains without clobbering configured `retainTags`. Recall then DEMOTES those
+  tags via the PR5 score-penalty weight map: `recall._effective_tag_weights`
+  merges built-in `lessonDemotionWeights` (`{lesson: 0.85, anti-pattern: 0.5}`)
+  UNDER `recallTagWeights`, so a failure-mode-adjacent transcript ranks below a
+  clean equal-score session memory yet is NEVER hard-dropped (re-rank, not the
+  demote-tag DROP filter) and still surfaces when it is the only relevant hit.
+  Precedence: an explicit `recallTagWeights` entry wins over the built-in for the
+  same tag; the PR5 `sidechain: 0.8` seed composes cleanly. Toggles:
+  `HINDSIGHT_LESSON_TAGGING=false` (retain side), `HINDSIGHT_LESSON_DEMOTION=false`
+  (recall side) as rollback levers; `HINDSIGHT_LESSON_TAG_MARKERS` /
+  `HINDSIGHT_LESSON_DEMOTION_WEIGHTS` (JSON) for overrides. NON-GOAL
+  (epic-recorded): the historical corpus is NOT re-tagged — this fires on NEW
+  retains only. Acceptance: `scripts/tests/test_lesson_tagging.py`.
+
 - **recall.py: parallel multi-bank recall under one shared deadline**
   (switchroom hindsight-leverage PR3, workstream A3 stage 2). The directives
   fetch and every bank recall (own + additional/profile/shared/sender banks)
