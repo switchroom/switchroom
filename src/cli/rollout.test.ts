@@ -34,6 +34,7 @@ import {
   type RolloutResult,
   type RolloutStep,
 } from "./rollout.js";
+import { SCOPED_SWEEP_ENV } from "../agents/agent-owned-tree.js";
 
 describe("normalizeVersion", () => {
   it("strips a leading v and trims so config pin == in-container version", () => {
@@ -131,17 +132,20 @@ function harness(opts: {
 }): {
   deps: RolloutDeps;
   runs: string[][];
+  runEnvs: Array<Record<string, string> | undefined>;
   logs: string[];
   persisted: string[];
   phases: RolloutPhase[];
 } {
   const runs: string[][] = [];
+  const runEnvs: Array<Record<string, string> | undefined> = [];
   const logs: string[] = [];
   const persisted: string[] = [];
   const phases: RolloutPhase[] = [];
   const deps: RolloutDeps = {
-    run: (args) => {
+    run: (args, runOpts) => {
       runs.push(args);
+      runEnvs.push(runOpts?.env);
       return { status: opts.runStatus ? opts.runStatus(args) : 0 };
     },
     probeVersion: (agent) => opts.versions[agent] ?? null,
@@ -151,7 +155,7 @@ function harness(opts: {
     hindsightExists: () => opts.hindsightExists ?? false,
     webImageTag: () => opts.webImageTag ?? null,
   };
-  return { deps, runs, logs, persisted, phases };
+  return { deps, runs, runEnvs, logs, persisted, phases };
 }
 
 describe("executeRollout", () => {
@@ -171,6 +175,34 @@ describe("executeRollout", () => {
     expect(runs).toContainEqual(["agent", "restart", "clerk", "--wait", "--force"]);
     expect(runs).toContainEqual(["webd", "install", "--tag", TARGET]);
     expect(runs).toContainEqual(["hostd", "install", "--tag", TARGET]);
+  });
+
+  it("injects the scoped-sweep env into ONLY the canary restart spawn (#3333 amendment C)", () => {
+    const steps = planRollout(["clerk", "marko", "nadia"]);
+    const { deps, runs, runEnvs } = harness({
+      versions: { clerk: "0.15.18", marko: "0.15.18", nadia: "0.15.18" },
+    });
+    const r = executeRollout(steps, TARGET, deps);
+    expect(r.ok).toBe(true);
+
+    // Correlate each restart spawn with the env it was given.
+    const restartIdxs = runs
+      .map((a, i) => ({ a, i }))
+      .filter(({ a }) => a[0] === "agent" && a[1] === "restart")
+      .map(({ i }) => i);
+    expect(restartIdxs.length).toBe(3);
+
+    // Canary = first restarted agent → gets the flag.
+    expect(runEnvs[restartIdxs[0]]).toEqual({ [SCOPED_SWEEP_ENV]: "1" });
+    // Every subsequent agent → NO flag (global env would defeat the canary).
+    expect(runEnvs[restartIdxs[1]]).toBeUndefined();
+    expect(runEnvs[restartIdxs[2]]).toBeUndefined();
+
+    // And nothing else in the roll (apply, webd, hostd) carries the flag.
+    for (let i = 0; i < runs.length; i++) {
+      if (i === restartIdxs[0]) continue;
+      expect(runEnvs[i]?.[SCOPED_SWEEP_ENV]).toBeUndefined();
+    }
   });
 
   it("persists the pin BEFORE a bare apply when pinToPersist is set", () => {

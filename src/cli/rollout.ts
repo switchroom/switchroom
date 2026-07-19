@@ -55,6 +55,7 @@ import { SWITCHROOM_VERSION } from "./resolve-version.js";
 import { readAndFilter, defaultAuditLogPath } from "../host-control/audit-reader.js";
 import { isHindsightContainerExists } from "../setup/hindsight.js";
 import { deployedImageTag } from "./deploy-version-guard.js";
+import { SCOPED_SWEEP_ENV } from "../agents/agent-owned-tree.js";
 
 /** One ordered step of a rollout plan. Pure data so it unit-tests. */
 export type RolloutStep =
@@ -362,8 +363,16 @@ export function parseRolloutPhaseLine(line: string): RolloutPhase | null {
 
 /** Injectable side-effects so the executor unit-tests without docker. */
 export interface RolloutDeps {
-  /** Run a `switchroom <args>` subcommand; returns the exit status. */
-  run(args: string[]): { status: number };
+  /**
+   * Run a `switchroom <args>` subcommand; returns the exit status.
+   *
+   * `opts.env` layers extra env vars onto the spawned process's environment
+   * (#3333 amendment C). This is how the scoped-sweep flag is injected into
+   * ONLY the canary restart spawn — the reconcile ownership sweep runs
+   * inside this spawned `switchroom agent restart` process, so an env set
+   * here (and nowhere else) gates exactly one agent, never the whole fleet.
+   */
+  run(args: string[], opts?: { env?: Record<string, string> }): { status: number };
   /** Probe the in-container `switchroom --version` for an agent. */
   probeVersion(agent: string): string | null;
   /** Emit a progress line. */
@@ -680,7 +689,19 @@ export function executeRollout(
         const restartArgs = execOpts.hostdContext
           ? ["agent", "restart", step.agent, "--wait", "--force", "--pin", target]
           : ["agent", "restart", step.agent, "--wait", "--force"];
-        deps.run(restartArgs);
+        // #3333 amendment C — staged canary rollout of the scoped ownership
+        // sweep. The reconcile sweep runs INSIDE this spawned `switchroom
+        // agent restart` process, so injecting the scoped-sweep env into the
+        // canary spawn ONLY (and reading it at the sweep site) flips exactly
+        // one agent per roll — the first-restarted canary. A global/container
+        // boot env would flip every agent at once and defeat the canary gate.
+        // Verify on the roll: the canary's restart-time collapse (scope=scoped
+        // in its `[ownership-sweep] #3333` log) with no approval-card storm,
+        // before the default is flipped ON (stage 5).
+        deps.run(
+          restartArgs,
+          isCanary ? { env: { [SCOPED_SWEEP_ENV]: "1" } } : undefined,
+        );
         const got = deps.probeVersion(step.agent);
         if (got === null || normalizeVersion(got) !== targetNorm) {
           deps.log(`  ✗ ${step.agent} → ${got ?? "<unreachable>"} (expected ${target}) — STOPPING`);
@@ -1024,8 +1045,13 @@ export function registerRolloutCommand(program: Command): void {
       const configPath = getConfigPath(program);
       const scriptPath = process.argv[1] ?? "switchroom";
       const deps: RolloutDeps = {
-        run: (args) => {
-          const r = spawnSync(process.execPath, [scriptPath, ...args], { stdio: "inherit" });
+        run: (args, opts) => {
+          const r = spawnSync(process.execPath, [scriptPath, ...args], {
+            stdio: "inherit",
+            // #3333 amendment C: layer the per-invocation env (the scoped-sweep
+            // flag on the canary spawn) onto the inherited environment.
+            env: opts?.env ? { ...process.env, ...opts.env } : process.env,
+          });
           return { status: r.status ?? 1 };
         },
         probeVersion: (agent) => {
