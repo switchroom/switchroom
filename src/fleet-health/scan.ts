@@ -25,6 +25,7 @@ import { fleetHealthLedgerPath } from "../web/fleet-health-read.js";
 import { scanAgent, type Finding, type AgentScanResult } from "./detect.js";
 import { buildLedger } from "./ledger.js";
 import { isTestAgent } from "./test-agents.js";
+import { scanLitellmConfig } from "./litellm-config-sensor.js";
 
 /**
  * Resolve the `.switchroom` base dir, matching the read-side
@@ -46,6 +47,10 @@ export interface ScanOptions {
   /** Override the silent-no-op windowing floor (unix seconds). Defaults to
    *  `SILENT_NOOP_FLOOR_TS`. Exposed for tests / future re-baselining. */
   silentNoopFloorTs?: number;
+  /** Override the LiteLLM config path the I2 header-passthrough sensor reads.
+   *  Defaults to `LITELLM_CONFIG_PATH` env → the host-correct default. Exposed
+   *  for tests; absent file → the sensor skips with a visible notice. */
+  litellmConfigPath?: string;
 }
 
 export interface ScanResult {
@@ -137,6 +142,13 @@ export function runScan(opts: ScanOptions = {}): ScanResult {
       skipped.push(agent);
     }
   }
+
+  // Standalone config sensor (I2 OAuth-leak guard). Runs where the scan runs —
+  // the load-bearing enforcement point (the lint step is near-vacuous off-host).
+  // Absent config file → skips with a visible notice; a scoping violation
+  // escalates into the ledger like any agent finding.
+  const litellm = scanLitellmConfig({ path: opts.litellmConfigPath, log });
+  findings.push(...litellm.findings);
 
   const prior = readLedgerIfPresent(base);
   const ledger = buildLedger(findings, {

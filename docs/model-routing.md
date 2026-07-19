@@ -246,6 +246,20 @@ Ranked, highest-leverage first.
   when caps are enabled their trips are legible and quiet. Follow-up: pick
   cap values from the metric and enable `tpm_limit` on the per-consumer
   virtual keys / deployments in the operator-maintained proxy config.
+- **G8 — LiteLLM-side retry churn on Claude groups fights the broker's
+  failover authority.** The auth broker is the retry/failover authority for
+  subscription accounts: on a real 429 it marks the account exhausted and rolls
+  the fleet to a healthy account (`markExhaustedAndRoll`,
+  `src/auth/broker/server.ts`). A Claude `model_group_settings` entry with
+  `num_retries > 1` and no `fallbacks` chain just re-hammers the SAME walled
+  account inside LiteLLM before the broker's failover can take effect — added
+  latency, no benefit. **Recommended shape** (advisory-warned by
+  `scripts/check-litellm-config-guard.mjs` and the fleet-health litellm-config
+  sensor): set `num_retries: 1` on Claude groups and configure a `fallbacks`
+  chain (e.g. `claude-opus → claude-sonnet`) so a single in-proxy failure hands
+  off to a different group rather than retrying the exhausted one, leaving the
+  broker's mark-exhausted / roll as the account-level failover authority. This
+  is a WARN, not an enforced invariant — the operator owns the proxy config.
 
 ## Verification
 
