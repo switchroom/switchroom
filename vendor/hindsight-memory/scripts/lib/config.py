@@ -149,6 +149,32 @@ DEFAULTS = {
     # can never push the hook past its ceiling. Slots still unfinished when the
     # deadline elapses are abandoned (daemon threads) and marked timed_out.
     "recallParallelDeadlineSeconds": 10,
+    # Switchroom hindsight-leverage E1 / PR8 (#3369) — bounded transcript-grep
+    # fallback. Boot reconciliation (reconcile_tail.py) closes the crash-loss
+    # window at the NEXT SessionStart, but between an abrupt kill and that boot,
+    # live recall returns nothing for the lost turns because the fact layer was
+    # never told about them. When on (default) AND every bank returned zero
+    # results AND no bank/directives slot hit its deadline (deadline_hit False —
+    # so a timed-out bank can't masquerade as a genuinely empty fact layer, the
+    # #3369 sequencing constraint that depends on A3's shared-deadline telemetry),
+    # recall greps the CURRENT session's transcript tail for turns that mention
+    # the query's terms and injects them as a clearly-labelled, lower-confidence
+    # fallback block. Everything is bounded: the tail read (…MaxBytes), the number
+    # of matched turns (…MaxTurns), the emitted characters (…MaxChars), and the
+    # grep wall-time (…DeadlineMs). Set false (HINDSIGHT_RECALL_TRANSCRIPT_FALLBACK
+    # =false) to disable — the rollback lever.
+    "recallTranscriptFallback": True,
+    # Tail bytes read from the session transcript for the grep. 256 KiB covers
+    # many turns of recent conversation while keeping the read well inside the
+    # hook budget; only the LAST max_bytes are read (partial first line dropped).
+    "recallTranscriptFallbackMaxBytes": 262144,
+    # Hard ceiling on matched turns injected into the fallback block.
+    "recallTranscriptFallbackMaxTurns": 6,
+    # Hard ceiling on the fallback block's excerpt characters.
+    "recallTranscriptFallbackMaxChars": 2000,
+    # Wall-clock bound (ms) on the grep itself — abandons scanning older turns
+    # once exceeded so the fallback can never eat the recall critical path.
+    "recallTranscriptFallbackDeadlineMs": 1500,
     # Connection
     "hindsightApiUrl": None,
     "hindsightApiToken": None,
@@ -226,6 +252,14 @@ ENV_OVERRIDES = {
     # lever; the deadline is the ceiling-minus-2s hard budget (see DEFAULTS).
     "HINDSIGHT_RECALL_PARALLEL": ("recallParallel", bool),
     "HINDSIGHT_RECALL_PARALLEL_DEADLINE_SECONDS": ("recallParallelDeadlineSeconds", int),
+    # Switchroom hindsight-leverage E1 / PR8 (#3369) — transcript-grep fallback
+    # toggle + bounds. HINDSIGHT_RECALL_TRANSCRIPT_FALLBACK=false is the rollback
+    # lever; the others tune the byte / turn / char / time bounds.
+    "HINDSIGHT_RECALL_TRANSCRIPT_FALLBACK": ("recallTranscriptFallback", bool),
+    "HINDSIGHT_RECALL_TRANSCRIPT_FALLBACK_MAX_BYTES": ("recallTranscriptFallbackMaxBytes", int),
+    "HINDSIGHT_RECALL_TRANSCRIPT_FALLBACK_MAX_TURNS": ("recallTranscriptFallbackMaxTurns", int),
+    "HINDSIGHT_RECALL_TRANSCRIPT_FALLBACK_MAX_CHARS": ("recallTranscriptFallbackMaxChars", int),
+    "HINDSIGHT_RECALL_TRANSCRIPT_FALLBACK_DEADLINE_MS": ("recallTranscriptFallbackDeadlineMs", int),
     "HINDSIGHT_RECALL_MAX_QUERY_CHARS": ("recallMaxQueryChars", int),
     "HINDSIGHT_RECALL_CONTEXT_TURNS": ("recallContextTurns", int),
     # Switchroom hindsight-leverage A2 — byte-tail bound for the multi-turn

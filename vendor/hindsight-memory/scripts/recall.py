@@ -54,10 +54,12 @@ from lib.bank import derive_bank_id, ensure_bank_mission
 from lib.client import HindsightClient
 from lib.config import debug_log, load_config
 from lib.content import (
+    _extract_text_content,
     compose_recall_query,
     format_current_time,
     format_memories,
     strip_channel_envelope,
+    strip_memory_tags,
     truncate_recall_query,
 )
 from lib.daemon import get_api_url
@@ -714,7 +716,9 @@ def read_transcript_messages(transcript_path: str, tail_bytes: int = 0) -> list:
     ``tail_bytes`` (Switchroom A2) byte-bounds the read: when > 0 and the file
     is larger, only the trailing ``tail_bytes`` (complete lines) are parsed, so
     the added per-recall transcript read stays cheap on long sessions. 0 reads
-    the whole file.
+    the whole file. The #3369 grep fallback reuses this same tail-reader (see
+    ``_transcript_grep_fallback``) rather than shipping its own seek logic, so
+    there is a single byte-bounded transcript reader.
     """
     if not transcript_path or not os.path.isfile(transcript_path):
         return []
@@ -739,6 +743,129 @@ def read_transcript_messages(transcript_path: str, tail_bytes: int = 0) -> list:
     except OSError:
         pass
     return messages
+
+
+# Switchroom hindsight-leverage E1 / PR8 (#3369) — bounded transcript-grep
+# fallback telemetry shape. A zeroed record is the "did not fire" default,
+# emitted on the recall_log row whenever the fallback is gated off, skipped, or
+# produced no match — so the log schema is uniform and a downstream query can
+# always read `transcript_fallback` without a KeyError.
+_FALLBACK_TELEMETRY_ZERO = {
+    "fired": False,
+    "matched_turns": 0,
+    "chars": 0,
+    "elapsed_ms": 0,
+    "bytes_read": 0,
+    "truncated": False,
+}
+
+_FALLBACK_BLOCK_PREAMBLE = (
+    "No stored memories matched this query — the fact layer may not have "
+    "reconciled this session yet (e.g. an abrupt session death before boot "
+    "reconciliation). The following are VERBATIM excerpts from recent turns of "
+    "THIS session that mention related terms. Treat them as lower-confidence "
+    "than stored memory — they are raw transcript, not synthesized fact:"
+)
+
+
+def _transcript_grep_fallback(transcript_path, query, config):
+    """Bounded transcript-grep fallback for the empty-fact-layer window (#3369).
+
+    Reads the CURRENT session transcript's tail (bounded bytes), keeps the most
+    recent user/assistant turns whose terms lexically overlap the recall query,
+    and returns a clearly-labelled, size-bounded fallback context block plus a
+    telemetry dict. Every dimension is bounded: bytes read
+    (``recallTranscriptFallbackMaxBytes``), matched turns
+    (``recallTranscriptFallbackMaxTurns``), emitted characters
+    (``recallTranscriptFallbackMaxChars``), and grep wall-time
+    (``recallTranscriptFallbackDeadlineMs``). The caller only invokes this when
+    all banks returned zero AND no slot hit its deadline, so a timed-out bank can
+    never masquerade as a genuinely empty fact layer.
+
+    Returns ``(block_or_None, telemetry)``. Failure-safe: any error path returns
+    ``(None, zeroed-telemetry)`` so the fallback can never break recall.
+    """
+    telemetry = dict(_FALLBACK_TELEMETRY_ZERO)
+    start = time.monotonic()
+
+    if not transcript_path or not os.path.isfile(transcript_path):
+        return None, telemetry
+
+    def _int_cfg(key, default):
+        try:
+            val = int(config.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        return val
+
+    max_bytes = _int_cfg("recallTranscriptFallbackMaxBytes", 262144)
+    max_turns = _int_cfg("recallTranscriptFallbackMaxTurns", 6)
+    max_chars = _int_cfg("recallTranscriptFallbackMaxChars", 2000)
+    deadline_ms = _int_cfg("recallTranscriptFallbackDeadlineMs", 1500)
+
+    if max_turns <= 0 or max_chars <= 0 or max_bytes <= 0:
+        return None, telemetry
+
+    query_tokens = _overlap_tokens(query)
+    if not query_tokens:
+        return None, telemetry
+
+    try:
+        telemetry["bytes_read"] = min(os.path.getsize(transcript_path), max_bytes)
+    except OSError:
+        pass
+
+    messages = read_transcript_messages(transcript_path, tail_bytes=max_bytes)
+
+    matched = []
+    total_chars = 0
+    # Newest-first so, under the turn/char/time bounds, we keep the MOST RECENT
+    # relevant turns; the collected list is reversed back to chronological order
+    # before formatting.
+    for msg in reversed(messages):
+        if (time.monotonic() - start) * 1000.0 > deadline_ms:
+            telemetry["truncated"] = True
+            break
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        text = _extract_text_content(msg.get("content", ""), role=role)
+        text = strip_memory_tags(strip_channel_envelope(text)).strip()
+        if not text:
+            continue
+        if not (_overlap_tokens(text) & query_tokens):
+            continue
+        entry = f"[{role}] {text}"
+        remaining = max_chars - total_chars
+        if remaining <= 0:
+            telemetry["truncated"] = True
+            break
+        if len(entry) > remaining:
+            entry = entry[:remaining].rstrip() + "…"
+            telemetry["truncated"] = True
+        matched.append(entry)
+        total_chars += len(entry)
+        if len(matched) >= max_turns:
+            break
+
+    telemetry["elapsed_ms"] = int((time.monotonic() - start) * 1000)
+
+    if not matched:
+        return None, telemetry
+
+    matched.reverse()  # restore chronological order for the model
+    block = (
+        "<hindsight_transcript_fallback>\n"
+        f"{_FALLBACK_BLOCK_PREAMBLE}\n\n"
+        + "\n".join(matched)
+        + "\n</hindsight_transcript_fallback>"
+    )
+    telemetry["fired"] = True
+    telemetry["matched_turns"] = len(matched)
+    telemetry["chars"] = len(block)
+    return block, telemetry
 
 
 # Switchroom Phase 6a — stateless-prompt classifier for the recall skip.
@@ -1146,6 +1273,15 @@ def main():
                 "active_topic_alias": active_topic_alias,
                 "topic_filter_mode": _topic_filter_mode(),
                 "directive_nudge": bool(nudge_block),
+                # E1 / PR8 (#3369) — no banks ran on a cache hit, so the
+                # transcript fallback never fires; carry the zeroed fields for a
+                # uniformly queryable schema.
+                "transcript_fallback": False,
+                "transcript_fallback_turns": 0,
+                "transcript_fallback_chars": 0,
+                "transcript_fallback_bytes_read": 0,
+                "transcript_fallback_elapsed_ms": 0,
+                "transcript_fallback_truncated": False,
             })
             return
         debug_log(config, f"Recall cache MISS (key={cache_key[:12]}…)")
@@ -1390,6 +1526,14 @@ def main():
                 "timed_out": _bank_timed_out,
             })
 
+    # Switchroom hindsight-leverage A3 — FINALIZED `deadline_hit`: True when ANY
+    # slot on the critical path hit its deadline (a bank that raised a hard
+    # per-request timeout, or — parallel mode — a bank/directives slot abandoned
+    # at the shared deadline). Hoisted here (was inline in the recall_log write)
+    # so the E1 / PR8 transcript fallback can gate on it: the #3369 fallback must
+    # NOT fire when a bank timed out, only when the fact layer is genuinely empty.
+    deadline_hit = any(bt["timed_out"] for bt in bank_timings) or directives_timed_out
+
     directives_block = format_active_directives_block(directives) if directives else None
     if directives_block:
         debug_log(config, f"Injecting {len(directives)} active directives")
@@ -1524,6 +1668,35 @@ def main():
     else:
         debug_log(config, "No memories found")
 
+    # Switchroom hindsight-leverage E1 / PR8 (#3369) — bounded transcript-grep
+    # fallback. Fires ONLY when every bank returned zero results (pre_filter_count
+    # == 0 — the merged pre-demote bank count) AND no slot hit its deadline
+    # (deadline_hit False, so a timed-out bank can't masquerade as an empty fact
+    # layer — the #3369 sequencing constraint on A3's telemetry). This recovers
+    # the crash-loss window between an abrupt session death and the next boot
+    # reconciliation, where live recall would otherwise return nothing for the
+    # lost turns. Everything is bounded inside the helper (bytes/turns/chars/time).
+    # On by default; HINDSIGHT_RECALL_TRANSCRIPT_FALLBACK=false is the rollback
+    # lever. Mutually exclusive with memories_block by construction: a non-empty
+    # memories_block requires results, which requires pre_filter_count > 0.
+    transcript_fallback_block = None
+    transcript_fallback_telemetry = dict(_FALLBACK_TELEMETRY_ZERO)
+    if (
+        config.get("recallTranscriptFallback", True)
+        and pre_filter_count == 0
+        and not deadline_hit
+    ):
+        transcript_fallback_block, transcript_fallback_telemetry = _transcript_grep_fallback(
+            hook_input.get("transcript_path", ""),
+            query,
+            config,
+        )
+        if transcript_fallback_block:
+            debug_log(
+                config,
+                f"Transcript-grep fallback fired: {transcript_fallback_telemetry}",
+            )
+
     # Switchroom #303 — recall is done, model is about to start the long
     # TTFT. Update the placeholder so the user doesn't keep staring at
     # `📚 recalling memories` for the next 15–20 s of opus thinking.
@@ -1593,7 +1766,7 @@ def main():
         # (rollback) mode `directives_timed_out` is always False and each bank's
         # `timed_out` is per-request only, so this reduces to the pre-A3 form —
         # keeping the two modes' rows directly comparable in the breach baseline.
-        "deadline_hit": any(bt["timed_out"] for bt in bank_timings) or directives_timed_out,
+        "deadline_hit": deadline_hit,
         # A3 — recall execution mode ("parallel"/"serial") and the shared
         # deadline budget (ms; None in serial mode). These distinguish pre-A3
         # (serial) from post-A3 (parallel) rows so the ≥3-day breach baseline
@@ -1621,24 +1794,39 @@ def main():
         "topic_filter_mode": topic_filter_mode,
         "topic_dropped": topic_dropped,
         "directive_nudge": bool(nudge_block),
+        # Switchroom hindsight-leverage E1 / PR8 (#3369) — transcript-grep
+        # fallback telemetry so its firing (and its bounds) are visible per turn
+        # in recall_log.jsonl. `transcript_fallback` True only on an all-zero,
+        # no-deadline-hit turn where the grep found ≥1 matching session turn.
+        "transcript_fallback": transcript_fallback_telemetry["fired"],
+        "transcript_fallback_turns": transcript_fallback_telemetry["matched_turns"],
+        "transcript_fallback_chars": transcript_fallback_telemetry["chars"],
+        "transcript_fallback_bytes_read": transcript_fallback_telemetry["bytes_read"],
+        "transcript_fallback_elapsed_ms": transcript_fallback_telemetry["elapsed_ms"],
+        "transcript_fallback_truncated": transcript_fallback_telemetry["truncated"],
     })
 
     # If neither block has content, there's nothing to inject — exit
     # silently to avoid emitting an empty hookSpecificOutput. #2848: unless
     # the directive-capture nudge fired, in which case emit the nudge alone
     # (a correction with no memories/directives still needs the reminder).
-    if not directives_block and not memories_block:
+    if not directives_block and not memories_block and not transcript_fallback_block:
         if nudge_block:
             _emit_cached_context(nudge_block)
         return
 
     # Compose final context. Directives block goes ABOVE memories so the
-    # agent reads HARD RULES before low-signal recall traces.
+    # agent reads HARD RULES before low-signal recall traces. The E1/PR8
+    # transcript fallback (#3369) goes LAST — it is the lowest-confidence
+    # signal (raw transcript, not synthesized fact) and only present when
+    # memories_block is empty by construction.
     parts = []
     if directives_block:
         parts.append(directives_block)
     if memories_block:
         parts.append(memories_block)
+    if transcript_fallback_block:
+        parts.append(transcript_fallback_block)
     context_message = "\n\n".join(parts)
 
     # Save last recall to state for diagnostics
