@@ -400,8 +400,12 @@ describe('reply-flicker edit-in-place — mid-path throw + retry never resurrect
  * flush-armed latch — a 'reply'-armed latch never suppresses, so the
  * dispatch → ack → turn_end → handback sequence always delivers. Genuine
  * byte-identical replays of the delivered reply remain covered by the
- * content-keyed #546 outbound dedup (whose 60 s TTL matches the latest-ended
- * owner tier bound), asserted below.
+ * content-keyed #546 outbound dedup, asserted below. (Honest bound: the dedup
+ * TTL is anchored at reply RECORD time, the latest-ended owner tier at
+ * `endedAt` — a replay landing in the gap between those 60 s windows now
+ * delivers as a rare duplicate rather than being suppressed; a conscious
+ * trade against the silent handback drop. See the `AnswerDeliveredLatch`
+ * docblock.)
  */
 describe('#3426 — async sub-agent handback after an interim-ack turn', () => {
   const CHAT = '12345'

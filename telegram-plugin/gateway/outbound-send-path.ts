@@ -945,8 +945,14 @@ export async function sendReply(
       // after it ends (the async sub-agent handback pattern — dispatch, interim
       // ack, turn_end, handback with no live gateway turn) is genuinely new
       // content and must deliver. Byte-identical replays of THIS answer are
-      // deduped by the content-keyed #546 cache at the top of this function,
-      // whose 60 s TTL matches the latest-ended owner tier's supersede TTL.
+      // deduped by the content-keyed #546 cache at the top of this function.
+      // Honest bound: the dedup TTL (60 s) is anchored at reply RECORD time,
+      // while the latest-ended owner tier's 60 s is anchored at `endedAt` —
+      // later by the reply→turn_end gap. A byte-identical replay landing >60 s
+      // after record but ≤60 s after endedAt is evicted from dedup yet still
+      // resolves this ended turn, so it now DELIVERS as a duplicate message.
+      // Conscious trade: a rare duplicate beats the silent handback drop the
+      // boolean latch caused (#3426).
       if (replySubstantive && ownerTurn != null) {
         ownerTurn.answerDelivered = 'reply'
       }

@@ -11,7 +11,12 @@
   turn, resolved the ended ack turn as owner (latest-ended tier, ≤60 s), and
   was suppressed with a false "deduped" success. Flush-race dedup (post-fire
   pre-record window, supersede resurrection window) and byte-identical replay
-  dedup (#546 content cache) are unchanged.
+  dedup (#546 content cache) are unchanged. Conscious trade: the weak
+  "reworded/bridge-replayed duplicate" suppression the reply-armed latch used
+  to provide is dropped — un-acked tool_call replays are byte-identical (the
+  #546 content dedup's case), and a model-regenerated paraphrase is
+  indistinguishable from a genuine handback, so delivering is correct. A rare
+  duplicate message beats a silent drop.
 
 ## v0.19.2 — Hindsight recovery, External spend on /usage, auth-broker hardening, /model carrier doctor
 

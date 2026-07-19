@@ -127,8 +127,19 @@ export function resolveReplyOwnerTurnId(candidates: ReplyOwnerCandidates): strin
  * supersede TTL), saw the stale latch, and was silently dropped with a false
  * "deduped" success. Tagging the source lets the suppression fire ONLY for the
  * flush races it exists for; byte-identical replays of a reply-delivered
- * answer remain covered by the content-keyed outbound dedup (#546), whose 60 s
- * TTL matches the latest-ended owner tier's bound.
+ * answer remain covered by the content-keyed outbound dedup (#546).
+ *
+ * Honest bound on that dedup cover: the #546 TTL (60 s) is anchored at reply
+ * RECORD time, while the latest-ended owner tier's 60 s is anchored at the
+ * turn's `endedAt` — later by the reply→turn_end gap. A byte-identical replay
+ * landing >60 s after record but ≤60 s after endedAt is evicted from dedup yet
+ * still resolves the ended turn, so it DELIVERS as a duplicate message. That
+ * is a conscious trade: this fix also drops the weak "reworded/bridge-replayed
+ * duplicate" suppression the reply-armed boolean latch used to provide —
+ * replays of an un-acked tool_call are byte-identical (content dedup's case),
+ * and a model-REGENERATED paraphrase is indistinguishable from a genuinely new
+ * handback, so delivering it is the correct default. A rare duplicate message
+ * beats the silent handback drop.
  */
 export type AnswerDeliveredLatch = false | 'flush' | 'reply'
 
