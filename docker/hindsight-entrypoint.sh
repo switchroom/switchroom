@@ -119,18 +119,19 @@ EOF
     return 0
   fi
   [ -n "${_pgpw}" ] || return 0
-  # NOTE (2026-07-19 dual-writer recovery): avoid the old UPDATE-returning
-  # + count-via-grep pattern — concurrent activity made that form abort
-  # with a spurious unique-constraint error on pk_async_operations, so the
-  # reaper silently no-oped and crash-orphaned consolidations stayed
-  # processing (blocking every new claim for that bank). Plain UPDATE + a
-  # follow-up SELECT of newly-unlocked pending ops is enough to count.
-  PGPASSWORD="${_pgpw}" "${_psql}" -U "${_pguser}" -h /tmp -p "${_pgport}" -d "${_pgdb}" -v ON_ERROR_STOP=1 -c \
+  # NOTE (2026-07-19 dual-writer recovery): never count via an UPDATE that
+  # returns rows piped into a line-counter (the recovery-title form aborted
+  # under concurrent activity with a spurious unique-constraint error on
+  # pk_async_operations, so the reaper silently no-oped and crash-orphaned
+  # consolidations stayed processing, blocking every new claim for that bank).
+  #
+  # Count comes from psql's own `UPDATE N` tag (ROW_COUNT of THIS statement).
+  # A post-UPDATE `SELECT count(*) … updated_at > now()-5s` inflated the
+  # log with fresh enqueues that never matched the stale-processing WHERE.
+  _out="$(PGPASSWORD="${_pgpw}" "${_psql}" -U "${_pguser}" -h /tmp -p "${_pgport}" -d "${_pgdb}" -v ON_ERROR_STOP=1 -c \
     "UPDATE async_operations SET status='pending', worker_id=NULL, claimed_at=NULL, updated_at=now() WHERE status='processing' AND claimed_at < now() - make_interval(secs => ${REAP_STALE_S}) AND coalesce(result_metadata->>'batch_id','') = ''" \
-    >/dev/null 2>&1 || return 0
-  _n="$(PGPASSWORD="${_pgpw}" "${_psql}" -U "${_pguser}" -h /tmp -p "${_pgport}" -d "${_pgdb}" -tAc \
-    "SELECT count(*) FROM async_operations WHERE status='pending' AND worker_id IS NULL AND claimed_at IS NULL AND updated_at > now() - interval '5 seconds'" \
-    2>/dev/null || echo 0)"
+    2>/dev/null)" || return 0
+  _n="$(printf '%s\n' "${_out}" | awk '/^UPDATE[[:space:]]+[0-9]+/ { print $2; exit }')"
   _n="$(echo "${_n}" | tr -d '[:space:]')"
   if [ "${_n:-0}" -gt 0 ] 2>/dev/null; then
     log "stale-claim reaper reset ${_n} stuck 'processing' op(s) older than ${REAP_STALE_S}s -> pending"

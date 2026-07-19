@@ -460,4 +460,57 @@ describe("hindsight dual-writer + LiteLLM silent-outage classifiers (2026-07-19)
     expect(classifyLiteLlmReachability(true, "127.0.0.1:4010")?.status).toBe("ok");
     expect(classifyLiteLlmReachability(null, "x")).toBeNull();
   });
+
+  it("does NOT treat bare ANTHROPIC_BASE_URL alone as LiteLLM configured", () => {
+    const exec = (_cmd: string, args: string[]) => {
+      if (args.includes("inspect") && args.some((a) => String(a).includes("ShmSize"))) {
+        return "2147483648\n";
+      }
+      if (args.includes("inspect") && args.some((a) => String(a).includes("StartedAt"))) {
+        return "2020-01-01T00:00:00Z\n";
+      }
+      if (args.includes("inspect") && args.some((a) => String(a).includes("NetworkMode"))) {
+        return "bridge\n";
+      }
+      if (args.includes("inspect") && args.some((a) => String(a).includes("Config.Env"))) {
+        // Residual / non-litellm anthropic base — must NOT trip network-mode fail.
+        return "ANTHROPIC_BASE_URL=https://api.anthropic.com\nHINDSIGHT_API_LLM_PROVIDER=claude-code\n";
+      }
+      if (args.includes("inspect")) return "2147483648\n";
+      if (args.includes("ps")) return "switchroom-hindsight\n";
+      if (args.includes("switchroom-hindsight-autoheal")) throw new Error("No such container");
+      if (args.includes("logs")) return "Extract facts: 4 facts, 1 chunks from 1 contents in 12s";
+      return "";
+    };
+    const results = checkHindsightContainerHealth({ exec });
+    const net = results.find((r) => r.name === "hindsight network mode");
+    expect(net?.status).toBe("ok");
+    expect(results.find((r) => r.name === "hindsight LiteLLM reachability")).toBeUndefined();
+  });
+
+  it("treats ANTHROPIC_BASE_URL on :4010 /anthropic as LiteLLM configured", () => {
+    const exec = (_cmd: string, args: string[]) => {
+      if (args.includes("inspect") && args.some((a) => String(a).includes("ShmSize"))) {
+        return "2147483648\n";
+      }
+      if (args.includes("inspect") && args.some((a) => String(a).includes("StartedAt"))) {
+        return "2020-01-01T00:00:00Z\n";
+      }
+      if (args.includes("inspect") && args.some((a) => String(a).includes("NetworkMode"))) {
+        return "bridge\n";
+      }
+      if (args.includes("inspect") && args.some((a) => String(a).includes("Config.Env"))) {
+        return "ANTHROPIC_BASE_URL=http://127.0.0.1:4010/anthropic\n";
+      }
+      if (args.includes("inspect")) return "2147483648\n";
+      if (args.includes("ps")) return "switchroom-hindsight\n";
+      if (_cmd === "bash") throw new Error("refused");
+      if (args.includes("switchroom-hindsight-autoheal")) throw new Error("No such container");
+      if (args.includes("logs")) return "Extract facts: 4 facts, 1 chunks from 1 contents in 12s";
+      return "";
+    };
+    const results = checkHindsightContainerHealth({ exec });
+    expect(results.find((r) => r.name === "hindsight network mode")?.status).toBe("fail");
+    expect(results.find((r) => r.name === "hindsight LiteLLM reachability")?.status).toBe("fail");
+  });
 });
