@@ -71,7 +71,13 @@ export type GatewaySignal =
   | "represent-escalation"
   | "reply-delivery-failure";
 
-export type L0Signal = TurnSignal | GatewaySignal;
+/** Signals from the standalone config/state sensors — NOT derived from an
+ *  agent's turns.jsonl or gateway log. Each sensor reads a hard artifact
+ *  (an operator-maintained config file, etc.) and emits a finding when the
+ *  invariant it guards is violated. */
+export type SensorSignal = "litellm-header-passthrough-misconfig";
+
+export type L0Signal = TurnSignal | GatewaySignal | SensorSignal;
 
 /** A single flagged occurrence with its hard-artifact evidence. */
 export interface Finding {

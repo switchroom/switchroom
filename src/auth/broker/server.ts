@@ -180,6 +180,23 @@ const THROTTLE_ESCALATION_WINDOW_MS = 10 * 60 * 1000;
  * (one burst counts as one hit). */
 const MARK_THROTTLED_MIN_INTERVAL_MS = 5 * 1000;
 
+/**
+ * 4c — corroboration-probe delay after an UNCORROBORATED long exhaustion mark.
+ *
+ * A long mark (> MARK_EXHAUSTED_DEFAULT_MS — the +7d weekly-wall shape) that is
+ * accepted WITHOUT a fresh contradicting snapshot is legitimate under #2218
+ * weekly-durability, so `clampMarkExpiry` trusts it (never hard-clamps). But a
+ * bogus/misparsed weekly signal accepted the same way would strand a healthy
+ * account for days. This delay schedules ONE live corroboration probe after the
+ * mark; a COMPLETE probe (F0 `sevenDayUtilPresent`) that positively contradicts
+ * the weekly wall clamps the persisted `exhausted_until` to 5h. Bounded low
+ * enough to neutralise a bogus multi-day mark quickly, high enough to avoid
+ * hammering the upstream immediately after the reactive roll (which just
+ * probed). Set to 0 (tests) to disable auto-scheduling and drive the probe
+ * directly.
+ */
+const MARK_CORROBORATION_PROBE_DELAY_MS = 90 * 1000;
+
 /** Audit-log size cap before rotation (10 MB, per RFC §4.4). */
 const AUDIT_ROTATE_BYTES = 10 * 1024 * 1024;
 const AUDIT_KEEP = 5;
@@ -454,6 +471,10 @@ export interface AuthBrokerOptions {
   /** Test-only: replace the quota fetcher so the consumer-probe sensor (and
    *  probe-quota) can be driven without real api.anthropic.com calls. */
   _testFetchQuota?: typeof fetchQuota;
+  /** Test-only (4c): override the mark-corroboration probe delay (ms). Set to
+   *  0 to disable auto-scheduling so tests drive `corroborateExhaustionMark`
+   *  directly; defaults to `MARK_CORROBORATION_PROBE_DELAY_MS`. */
+  _testCorroborationDelayMs?: number;
 }
 
 /* ───────────────────────── Helpers ───────────────────────── */
@@ -555,6 +576,11 @@ export class AuthBroker {
    *  consumer-quota-sensor.ts. Null when disabled or no consumers. */
   private consumerProbeTimer: NodeJS.Timeout | null = null;
   private fleetProbeTimer: NodeJS.Timeout | null = null;
+  /** 4c — live one-shot corroboration-probe timers keyed to uncorroborated
+   *  long exhaustion marks. Tracked so `stop()` can clear them. */
+  private markCorroborationTimers = new Set<NodeJS.Timeout>();
+  /** 4c — corroboration-probe delay (ms); 0 disables auto-scheduling (tests). */
+  private readonly markCorroborationDelayMs: number = MARK_CORROBORATION_PROBE_DELAY_MS;
   /** Quota fetcher — injectable for tests via opts._testFetchQuota. */
   private fetchQuotaImpl: typeof fetchQuota;
   private stateDir: string;
@@ -645,6 +671,8 @@ export class AuthBroker {
     this.operatorUid = opts.operatorUid;
     this.fetcher = opts.fetcher;
     this.fetchQuotaImpl = opts._testFetchQuota ?? fetchQuota;
+    this.markCorroborationDelayMs =
+      opts._testCorroborationDelayMs ?? MARK_CORROBORATION_PROBE_DELAY_MS;
     this.stateDir =
       opts.stateDir ?? resolve(this.homeRoot(), ".switchroom", "state", "auth-broker");
     this.socketRoot = opts.socketRoot ?? AUTH_BROKER_ROOT;
@@ -826,6 +854,8 @@ export class AuthBroker {
       clearInterval(this.fleetProbeTimer);
       this.fleetProbeTimer = null;
     }
+    for (const timer of this.markCorroborationTimers) clearTimeout(timer);
+    this.markCorroborationTimers.clear();
     for (const [sock, lis] of this.listeners) {
       try { lis.server.close(); } catch { /* ignore */ }
       for (const s of lis.sockets) {
@@ -2898,6 +2928,17 @@ export class AuthBroker {
     // living beside the exhaustion mark in the same ledger entry.
     this.quota[account] = { ...this.quota[account], exhausted_until: exhaustedUntil, marked_at: now };
     this.persistQuota();
+    // 4c — a LONG mark accepted here is either (a) synchronously corroborated
+    // (a fresh contradicting snapshot already clamped it to 5h above) or (b)
+    // UNCORROBORATED: no fresh snapshot, so clampMarkExpiry trusted the caller
+    // (the legit #2218 weekly-durability path). For case (b) we do NOT
+    // hard-clamp (that regresses #2218) — instead schedule ONE live
+    // corroboration probe. A COMPLETE probe that positively contradicts the
+    // weekly wall clamps the persisted mark to 5h; a failed/incomplete probe
+    // leaves the durable weekly mark intact.
+    if (exhaustedUntil > now + MARK_EXHAUSTED_DEFAULT_MS) {
+      this.scheduleMarkCorroboration(account, now, identity);
+    }
     // Fan out next-fallback creds to every agent whose active account is
     // `account`. Uses the LIVE selector (Bug 1): force-probe an `unknown`
     // candidate before ruling it out so a never-probed-but-healthy secondary is
@@ -2961,6 +3002,110 @@ export class AuthBroker {
       );
     }
     return { rolled, rolledTo };
+  }
+
+  /**
+   * 4c — schedule a one-shot corroboration probe for an uncorroborated long
+   * exhaustion mark. Keyed to the mark's `markedAt` so a mark that is cleared
+   * or superseded before the probe fires is a no-op. Timer is `unref`'d (never
+   * holds the process open) and tracked for `stop()` cleanup. Delay 0 (tests)
+   * disables auto-scheduling — the test drives `corroborateExhaustionMark`.
+   */
+  private scheduleMarkCorroboration(
+    account: string,
+    markedAt: number,
+    identity: Identity,
+  ): void {
+    if (this.markCorroborationDelayMs <= 0) return;
+    const timer = setTimeout(() => {
+      this.markCorroborationTimers.delete(timer);
+      void this.corroborateExhaustionMark(account, markedAt, identity).catch((err) => {
+        this.logErr(`mark-corroboration ${account}: ${(err as Error).message}`);
+      });
+    }, this.markCorroborationDelayMs);
+    timer.unref?.();
+    this.markCorroborationTimers.add(timer);
+  }
+
+  /**
+   * 4c — corroborate (or refute) an uncorroborated long exhaustion mark with a
+   * single live probe. A COMPLETE probe (F0 `sevenDayUtilPresent`) that
+   * positively contradicts the weekly wall — the same condition `clampMarkExpiry`
+   * enforces — clamps the PERSISTED `exhausted_until` to `now + 5h`. Everything
+   * else is a NO-OP, preserving #2218 weekly-durability:
+   *   - the mark was cleared/superseded since scheduling → no-op;
+   *   - the mark is no longer long (already clamped) → no-op;
+   *   - no creds / probe failed / probe INCOMPLETE (7d window absent) → no-op
+   *     (clampMarkExpiry's F0 guard refuses to clamp a weekly mark off a probe
+   *     that never saw the weekly window);
+   *   - probe complete but the account is still walled → no-op.
+   *
+   * This is the "contradicting probe → rewrite persisted exhausted_until" write
+   * path that did not exist before (clampMarkExpiry is mark-TIME only). Public
+   * for tests (driven via `_testFetchQuota` + `_testCorroborationDelayMs: 0`).
+   */
+  async corroborateExhaustionMark(
+    account: string,
+    markedAt: number,
+    identity: Identity,
+  ): Promise<{ clamped: boolean; reason: string; until?: number }> {
+    const entry = this.quota[account];
+    if (!entry || entry.marked_at !== markedAt) {
+      return { clamped: false, reason: "mark-superseded" };
+    }
+    const until = entry.exhausted_until;
+    const now = this.now();
+    if (until == null || until <= now + MARK_EXHAUSTED_DEFAULT_MS) {
+      return { clamped: false, reason: "not-long" };
+    }
+    const creds = readAccountCredentials(account, this.home);
+    const token = creds?.claudeAiOauth?.accessToken;
+    if (!token) return { clamped: false, reason: "no-token" };
+    let result: QuotaResult;
+    try {
+      result = await this.fetchQuotaImpl({ accessToken: token });
+    } catch (err) {
+      this.logErr(`mark-corroboration probe ${account}: ${(err as Error).message}`);
+      return { clamped: false, reason: "probe-failed" };
+    }
+    // Cache so the dashboard / eligibility see the fresh snapshot and so
+    // clampMarkExpiry consults live truth (it reads lastQuotaCache-shaped data).
+    this.cacheQuotaSnapshot(account, result);
+    const snapshot = this.lastQuotaCache[account];
+    // clampMarkExpiry enforces the F0 completeness guard (sevenDayUtilPresent)
+    // internally: an incomplete probe that never measured the 7-day window
+    // CANNOT clamp a legitimate weekly mark down to 5h.
+    const clampedUntil = clampMarkExpiry({
+      proposedUntil: until,
+      now,
+      shortMs: MARK_EXHAUSTED_DEFAULT_MS,
+      snapshot,
+    });
+    if (clampedUntil >= until) {
+      return { clamped: false, reason: "not-contradicted" };
+    }
+    // Re-read the live entry: a concurrent op may have changed the mark between
+    // the await and here. Only rewrite when the SAME mark is still in place and
+    // the clamp actually shortens it.
+    const live = this.quota[account];
+    if (!live || live.marked_at !== markedAt || (live.exhausted_until ?? 0) <= clampedUntil) {
+      return { clamped: false, reason: "mark-superseded" };
+    }
+    this.quota[account] = { ...live, exhausted_until: clampedUntil };
+    this.persistQuota();
+    this.audit({
+      op: "mark-corroboration-clamp",
+      identity,
+      account,
+      accountKind: "claude",
+      ok: true,
+    });
+    process.stdout.write(
+      `auth-broker: mark-corroboration probe CONTRADICTS ${account} weekly wall — ` +
+        `clamped exhausted_until ${new Date(until).toISOString()} → ` +
+        `${new Date(clampedUntil).toISOString()}\n`,
+    );
+    return { clamped: true, reason: "contradicted", until: clampedUntil };
   }
 
   /**

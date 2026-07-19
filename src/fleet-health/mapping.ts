@@ -93,6 +93,17 @@ export const SIGNAL_MAP: Record<L0Signal, SignalMapping> = {
     job_spec: "feel-like-a-colleague",
     signature: "represent:obligation-escalation",
   },
+  "litellm-header-passthrough-misconfig": {
+    // The LiteLLM proxy's `forward_client_headers_to_llm_api` flag scoped
+    // beyond the Claude allowlist (global, or a non-Claude/`*-openrouter`
+    // group) forwards the subscription OAuth token to a third party — a
+    // constraint violation of the "keep my subscription honest" contract.
+    // Highest severity: a single misconfig is a live credential-leak surface.
+    failure_mode: "constraint-violation",
+    severity: 3,
+    job_spec: "keep-my-subscription-honest",
+    signature: "litellm-header-passthrough:oauth-leak-scope",
+  },
 };
 
 /** The full set of 23 job-spec slugs the ledger carries a record for. Kept
