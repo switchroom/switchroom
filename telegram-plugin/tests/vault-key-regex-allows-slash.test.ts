@@ -38,7 +38,11 @@ const gatewaySrc =
   "\n" +
   readFileSync(resolve(__dirname, "..", "gateway", "callback-query-handlers.ts"), "utf-8") +
   "\n" +
-  readFileSync(resolve(__dirname, "..", "gateway", "card-tool-handlers.ts"), "utf-8");
+  readFileSync(resolve(__dirname, "..", "gateway", "card-tool-handlers.ts"), "utf-8") +
+  "\n" +
+  // P7 PR-8 (#2996): the vault pending-op intercept (incl. the rename-staged-
+  // key validation) moved verbatim into gateway/inbound-interceptors.ts.
+  readFileSync(resolve(__dirname, "..", "gateway", "inbound-interceptors.ts"), "utf-8");
 
 /** The exported regex literal — what the gateway actually validates against. */
 function extractVaultKeyRegex(): RegExp {
@@ -53,7 +57,10 @@ function extractVaultKeyRegex(): RegExp {
 }
 
 /** Either inline literal with `/`, OR a reference to VAULT_KEY_REGEX. */
-const ACCEPTS_SLASH = /\[A-Za-z0-9_(\/|\\\/|\.)+-\]|VAULT_KEY_REGEX/;
+// `vaultKeyRegex` is the InboundInterceptorDeps field gateway.ts binds to the
+// shared VAULT_KEY_REGEX constant (P7 PR-8) — same runtime regex, new name at
+// the moved call site.
+const ACCEPTS_SLASH = /\[A-Za-z0-9_(\/|\\\/|\.)+-\]|VAULT_KEY_REGEX|vaultKeyRegex/;
 
 describe("vault-key regex accepts canonical slash-namespaced keys (#1047)", () => {
   it("vault_request_save validation includes '/' in the charclass", () => {

@@ -30,7 +30,12 @@ import { join, dirname } from 'node:path'
 const __dir = dirname(fileURLToPath(import.meta.url))
 const pluginDir = join(__dir, '..')
 
-const gatewaySrc = readFileSync(join(pluginDir, 'gateway', 'gateway.ts'), 'utf8')
+const gatewaySrc =
+  readFileSync(join(pluginDir, 'gateway', 'gateway.ts'), 'utf8') +
+  '\n' +
+  // P7 PR-8 (#2996): the vault pending-op intercept (incl. the unlock branch)
+  // moved verbatim into gateway/inbound-interceptors.ts (interceptVault).
+  readFileSync(join(pluginDir, 'gateway', 'inbound-interceptors.ts'), 'utf8')
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 

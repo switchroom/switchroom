@@ -20,7 +20,15 @@ import type { ReactionTypeEmoji } from 'grammy/types'
 import { parseStopKeyword, buildStopReply } from './stop-command.js'
 import { decideInterruptTiming, resolveSafeBoundaryEnabled } from './interrupt-defer.js'
 import { naturalAction } from '../permission-title.js'
+import { richMessage } from '../rich-send.js'
+import { renderVaultRequestSaveCard, buildVaultRequestSaveKeyboard } from './vault-request-save-card.js'
 import type { PendingAuthAddFlow } from './auth-add-flow.js'
+import type {
+  createCallbackQueryHandlers,
+  PendingVaultOp,
+  PendingVaultRequestSave,
+  PendingVaultRequestAccess,
+} from './callback-query-handlers.js'
 import {
   pendingLoopbackFlows,
   submitLoopbackRedirect,
@@ -119,6 +127,45 @@ export interface InboundInterceptorDeps {
   preBlock: (text: string) => string
   formatSwitchroomOutput: (output: string) => string
   formatAuthOutputForTelegram: (output: string) => { text: string; url: string | null }
+  // --- vault intercept (P7 PR-8) collaborators ---
+  pendingVaultOps: {
+    get: (chatId: string) => PendingVaultOp | undefined
+    delete: (chatId: string) => boolean
+    set: (chatId: string, v: PendingVaultOp) => void
+  }
+  /** VAULT_INPUT_TTL_MS / VAULT_PASSPHRASE_TTL_MS — fixed constants. */
+  vaultInputTtlMs: number
+  vaultPassphraseTtlMs: number
+  vaultPassphraseCache: {
+    get: (chatId: string) => { passphrase: string; expiresAt: number } | undefined
+    set: (chatId: string, v: { passphrase: string; expiresAt: number }) => void
+  }
+  deleteSensitiveMessage: (chatId: string, msgId: number, reason: string) => Promise<void>
+  executeVaultOp: (
+    ctx: Context,
+    chatId: string,
+    op: 'list' | 'get' | 'set' | 'delete',
+    key: string | undefined,
+    passphrase: string,
+    setValue: string | undefined,
+  ) => Promise<void>
+  unlockViaBroker: (passphrase: string) => Promise<{ ok: boolean; msg?: string }>
+  /** LAZY accessor — callbackQueryHandlers is a boot-assigned `let` in gateway.ts. */
+  callbackQueryHandlers: () => Pick<
+    ReturnType<typeof createCallbackQueryHandlers>,
+    | 'executeDeferredSecretSave'
+    | 'performVaultAccessApproval'
+    | 'parseGrantDuration'
+    | 'grantWizardConfirm'
+  >
+  pendingVaultRequestAccesses: {
+    get: (stageId: string) => PendingVaultRequestAccess | undefined
+  }
+  pendingVaultRequestSaves: {
+    get: (stageId: string) => PendingVaultRequestSave | undefined
+  }
+  vaultKeyRegex: RegExp
+  vaultKeyRegexLabel: string
 }
 
 /**
@@ -591,5 +638,174 @@ export async function interceptReauth(
     return { handled: true }
   }
   deps.pendingReauthFlows.delete(p.interceptKey)
+  return { handled: false }
+}
+
+
+/** Per-message facts for the vault intercept (P7 PR-8). Keyed by chat_id
+ * (a vault op is chat-scoped, not topic-scoped — unlike the auth intercepts). */
+export interface VaultInterceptParams {
+  ctx: Context
+  text: string
+  chat_id: string
+  msgId: number | undefined
+}
+
+/**
+ * Vault pending-op intercept: the text reply that completes a /vault flow
+ * (passphrase, broker unlock, deferred-secret save, access-approve passphrase
+ * drain, grant-wizard duration, secret value, rename-vault-save). Fully
+ * intercepts any fresh pending entry (`handled: true` — the reply text is a
+ * passphrase or secret, never forwarded to the agent); a TTL-stale entry is
+ * dropped and the message falls through.
+ *
+ * Moved VERBATIM from gateway.ts (#2996 P7 PR-8). The two raw
+ * `p.ctx.api\n.editMessageText` calls keep their inline line-split shape and
+ * `.catch(() => {})` best-effort semantics exactly as before.
+ */
+export async function interceptVault(
+  p: VaultInterceptParams,
+  deps: InboundInterceptorDeps,
+): Promise<InterceptOutcome> {
+  const pendingVault = deps.pendingVaultOps.get(p.chat_id)
+  if (pendingVault) {
+    const elapsed = Date.now() - pendingVault.startedAt
+    if (elapsed > deps.vaultInputTtlMs) {
+      deps.pendingVaultOps.delete(p.chat_id)
+    } else {
+      deps.pendingVaultOps.delete(p.chat_id)
+      if (pendingVault.kind === 'passphrase') {
+        const passphrase = p.text.trim()
+        if (!passphrase) {
+          await deps.switchroomReply(p.ctx, 'Passphrase cannot be empty. Try /vault again.', { html: true })
+          return { handled: true }
+        }
+        deps.vaultPassphraseCache.set(p.chat_id, { passphrase, expiresAt: Date.now() + deps.vaultPassphraseTtlMs })
+        if (p.msgId != null) await deps.deleteSensitiveMessage(p.chat_id, p.msgId, 'vault passphrase')
+        await deps.executeVaultOp(p.ctx, p.chat_id, pendingVault.op, pendingVault.key, passphrase, undefined)
+      } else if (pendingVault.kind === 'unlock') {
+        // Issue #158: passphrase for /vault unlock — sent directly to the
+        // broker unlock socket, never cached or logged.
+        const passphrase = p.text.trim()
+        if (!passphrase) {
+          await deps.switchroomReply(p.ctx, 'Passphrase cannot be empty. Try /vault unlock again.', { html: true })
+          return { handled: true }
+        }
+        if (p.msgId != null) await deps.deleteSensitiveMessage(p.chat_id, p.msgId, 'vault unlock passphrase')
+        const result = await deps.unlockViaBroker(passphrase)
+        if (result.ok) {
+          await deps.switchroomReply(p.ctx, '🔓 Vault broker unlocked.', { html: true })
+        } else {
+          await deps.switchroomReply(p.ctx, `**vault unlock failed:** ${deps.escapeHtmlForTg(result.msg ?? 'unknown error')}`, { html: true })
+        }
+      } else if (pendingVault.kind === 'passphrase-for-deferred') {
+        // Issue #44: passphrase entered after tapping "🔓 Unlock vault &
+        // save" on the deferred-secret card. Cache the passphrase then
+        // auto-write the held secret directly — no re-paste required.
+        // The passphrase message itself is deleted so it doesn't linger
+        // in chat history (same protection as the original secret got).
+        const passphrase = p.text.trim()
+        if (!passphrase) {
+          await deps.switchroomReply(p.ctx, 'Passphrase cannot be empty. Tap the unlock button again.', { html: true })
+          return { handled: true }
+        }
+        deps.vaultPassphraseCache.set(p.chat_id, { passphrase, expiresAt: Date.now() + deps.vaultPassphraseTtlMs })
+        if (p.msgId != null) await deps.deleteSensitiveMessage(p.chat_id, p.msgId, 'vault passphrase')
+        await deps.callbackQueryHandlers().executeDeferredSecretSave(p.ctx, pendingVault.deferKey, passphrase, pendingVault.cardMessageId)
+      } else if (pendingVault.kind === 'passphrase-for-access-approve') {
+        // #1012 Phase 2 follow-up + #1051: operator tapped Approve on
+        // one or more vault_request_access cards without first
+        // unlocking. We captured the next message as the passphrase,
+        // cache it, delete the chat copy, and resume the approve
+        // flow for EVERY queued stage (#1051 — without the queue, a
+        // concurrent second tap orphaned the first stage). Wrong
+        // passphrase surfaces via the broker's
+        // DENIED:passphrase-mismatch path and edits each card to the
+        // mint_grant-failed message (see performVaultAccessApproval).
+        const passphrase = p.text.trim()
+        if (!passphrase) {
+          await deps.switchroomReply(p.ctx, 'Passphrase cannot be empty. Ask the agent to re-issue the request card.', { html: true })
+          return { handled: true }
+        }
+        deps.vaultPassphraseCache.set(p.chat_id, { passphrase, expiresAt: Date.now() + deps.vaultPassphraseTtlMs })
+        if (p.msgId != null) await deps.deleteSensitiveMessage(p.chat_id, p.msgId, 'vault passphrase')
+        // Drain the queued items SEQUENTIALLY. The grant-union step
+        // inside performVaultAccessApproval lists existing grants
+        // before minting; sequential processing means the union
+        // grows monotonically (item 1 mints grant for [keyA]; item 2
+        // lists, finds [keyA], unions with keyB → mints [keyA, keyB]).
+        // Parallel processing would race on the list-and-merge.
+        for (const item of pendingVault.items) {
+          const stagedAccess = deps.pendingVaultRequestAccesses.get(item.stageId)
+          if (!stagedAccess) {
+            // Stage expired or denied between tap and passphrase reply.
+            // Edit its card to a clean explanation; don't break the
+            // loop (sibling cards may still be valid).
+            await p.ctx.api
+              .editMessageText(
+                item.cardChatId,
+                item.cardMessageId,
+                richMessage(`⌛ _Vault unlocked, but this access-request card expired or was denied before you replied. Ask the agent to re-issue if still needed._`),
+                { reply_markup: { inline_keyboard: [] } },
+              )
+              .catch(() => {})
+            continue
+          }
+          await deps.callbackQueryHandlers().performVaultAccessApproval(p.ctx, stagedAccess, item.stageId, item.senderId, { kind: 'passphrase', passphrase })
+        }
+      } else if (pendingVault.kind === 'grant-wizard' && pendingVault.awaitingCustomDuration) {
+        // Issue #227: custom duration text reply for grant wizard
+        const input = p.text.trim()
+        const ttlSeconds = deps.callbackQueryHandlers().parseGrantDuration(input)
+        if (ttlSeconds === null) {
+          // Re-set state so user can try again
+          deps.pendingVaultOps.set(p.chat_id, { ...pendingVault, startedAt: Date.now() })
+          await deps.switchroomReply(p.ctx, '⚠️ Invalid duration. Use \`Nd\` (days) or \`Nh\` (hours), e.g. \`30d\` or \`12h\`.', { html: true })
+          return { handled: true }
+        }
+        const newState = { ...pendingVault, ttlSeconds, awaitingCustomDuration: false }
+        await deps.callbackQueryHandlers().grantWizardConfirm(p.ctx, p.chat_id, newState)
+      } else if (pendingVault.kind === 'grant-wizard') {
+        // Text received mid-wizard but not awaiting custom duration — ignore and re-set
+        deps.pendingVaultOps.set(p.chat_id, { ...pendingVault, startedAt: Date.now() })
+      } else if (pendingVault.kind === 'value') {
+        let value = p.text
+        const codeBlockMatch = /^```[\w]*\n?([\s\S]*?)```$/m.exec(p.text)
+        if (codeBlockMatch) value = codeBlockMatch[1]!
+        if (p.msgId != null) await deps.deleteSensitiveMessage(p.chat_id, p.msgId, 'vault secret value')
+        await deps.executeVaultOp(p.ctx, p.chat_id, 'set', pendingVault.key, pendingVault.passphrase, value.trim())
+      } else if (pendingVault.kind === 'rename-vault-save') {
+        // Issue #969 P1a: user tapped Rename on a vault_request_save
+        // card and is now telling us the new key name. Validate the
+        // slug, update the staged entry, refresh the card.
+        const newKey = p.text.trim()
+        const staged = deps.pendingVaultRequestSaves.get(pendingVault.stageId)
+        if (!staged) {
+          await deps.switchroomReply(p.ctx, '⌛ That save card expired before you renamed. Ask the agent to re-issue.', { html: true })
+          return { handled: true }
+        }
+        if (!deps.vaultKeyRegex.test(newKey)) {
+          // Re-arm the pending state so the user can try again.
+          deps.pendingVaultOps.set(p.chat_id, { ...pendingVault, startedAt: Date.now() })
+          await deps.switchroomReply(p.ctx, `⚠️ Key must match \`${deps.vaultKeyRegexLabel}\`. Send a different name.`, { html: true })
+          return { handled: true }
+        }
+        staged.key = newKey
+        if (p.msgId != null) await deps.deleteSensitiveMessage(p.chat_id, p.msgId, 'vault rename input')
+        // Edit the card in place with the new suggested key + same buttons.
+        if (staged.card_message_id != null) {
+          await p.ctx.api
+            .editMessageText(
+              staged.chat_id,
+              staged.card_message_id,
+              richMessage(renderVaultRequestSaveCard(staged, staged.agent)),
+              { reply_markup: buildVaultRequestSaveKeyboard(pendingVault.stageId) },
+            )
+            .catch(() => {})
+        }
+      }
+      return { handled: true }
+    }
+  }
   return { handled: false }
 }

@@ -26,10 +26,12 @@ import { readFileSync } from 'node:fs'
  * rather than live.
  */
 describe('gateway secret-detect intercept — structural wiring', () => {
-  const src = readFileSync(
-    new URL('../gateway/gateway.ts', import.meta.url),
-    'utf8',
-  )
+  const src =
+    readFileSync(new URL('../gateway/gateway.ts', import.meta.url), 'utf8') +
+    '\n' +
+    // P7 PR-8 (#2996): the vault pending-op intercept (incl. the deferred-
+    // secret passphrase branch) moved into gateway/inbound-interceptors.ts.
+    readFileSync(new URL('../gateway/inbound-interceptors.ts', import.meta.url), 'utf8')
 
   it('imports the pipeline + staging modules', () => {
     expect(src).toMatch(/from '\.\.\/secret-detect\/pipeline\.js'/)

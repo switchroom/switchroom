@@ -48,7 +48,10 @@ import { resolveVaultApprovalPosture } from '../vault-approval-posture.js'
 const gatewaySrc =
   readFileSync(resolve(__dirname, '..', 'gateway', 'gateway.ts'), 'utf-8') +
   '\n' +
-  readFileSync(resolve(__dirname, '..', 'gateway', 'callback-query-handlers.ts'), 'utf-8')
+  readFileSync(resolve(__dirname, '..', 'gateway', 'callback-query-handlers.ts'), 'utf-8') +
+  '\n' +
+  // P7 PR-8 (#2996): vault pending-op intercept moved to inbound-interceptors.ts.
+  readFileSync(resolve(__dirname, '..', 'gateway', 'inbound-interceptors.ts'), 'utf-8')
 
 function sliceAccessApproveBlock(): string {
   const fn =
@@ -102,7 +105,10 @@ describe('handleVaultRequestAccessCallback — posture branch', () => {
     expect(approveBlock).toMatch(/passphrase-for-access-approve/)
     // Pinned: the queued-drain path passes the typed passphrase via
     // the new attestation shape `{ kind: 'passphrase', passphrase }`.
-    expect(gatewaySrc).toMatch(/performVaultAccessApproval\(ctx, stagedAccess, item\.stageId, item\.senderId, \{ kind: ['"]passphrase['"], passphrase \}\)/)
+    // P7 PR-8: the queued-drain call site moved into interceptVault
+    // (inbound-interceptors.ts) — ctx is `p.ctx` and the handler resolves via
+    // the lazy deps accessor. Same attestation shape pinned.
+    expect(gatewaySrc).toMatch(/performVaultAccessApproval\((?:p\.)?ctx, stagedAccess, item\.stageId, item\.senderId, \{ kind: ['"]passphrase['"], passphrase \}\)/)
   })
 })
 
