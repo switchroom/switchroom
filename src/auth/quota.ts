@@ -135,9 +135,35 @@ export function isProbeThin(q: {
   return q.fiveHourUtilPresent === false && q.sevenDayUtilPresent === false;
 }
 
+/**
+ * Structured probe-failure classification.
+ *  - `entitlement_blocked` — a 403 whose body says the org/subscription has
+ *    DISABLED Claude Code access ("Your organization has disabled Claude
+ *    subscription access for Claude Code"). A hard, account-level block: the
+ *    account can NEVER serve, and re-probing won't lift it until the org
+ *    re-enables Code access. Distinct from a bad-token-scope 403 (that keeps
+ *    `"other"`).
+ *  - `"other"` — any other non-ok HTTP status (bad scope 403, 401, 5xx, …) or
+ *    a header-parse miss. Retains the legacy no-op semantics upstream.
+ */
+export type QuotaFailureKind = "entitlement_blocked" | "other";
+
 export type QuotaResult =
   | { ok: true; data: QuotaUtilization }
-  | { ok: false; reason: string };
+  | {
+      ok: false;
+      /** Human-readable failure string (preserved for logs, unchanged shape). */
+      reason: string;
+      /** HTTP status when the failure came from an upstream response. Absent
+       *  for pre-response failures (network error, timeout, empty token). */
+      httpStatus?: number;
+      /** The Anthropic API error `message` (from the JSON body `error.message`,
+       *  else the raw body text truncated). Absent when no body was read. */
+      apiErrorMessage?: string;
+      /** Structured classification (see {@link QuotaFailureKind}). Absent =
+       *  unclassified (legacy callers read the same `{ ok:false, reason }`). */
+      failureKind?: QuotaFailureKind;
+    };
 
 export type FetchQuotaOptions = {
   /** OAuth access token to probe with. Required. */
@@ -288,6 +314,46 @@ export function refillNormalizedUtils(
   };
 }
 
+/**
+ * Extract the human-facing API error message from an Anthropic error body.
+ * Anthropic returns `{"type":"error","error":{"type":"...","message":"..."}}`
+ * on a 4xx; fall back to the raw (truncated) body when it isn't that shape.
+ * Returns null for an empty body. PURE — no I/O.
+ */
+export function extractApiErrorMessage(bodyText: string): string | null {
+  if (!bodyText || bodyText.trim().length === 0) return null;
+  try {
+    const parsed = JSON.parse(bodyText) as unknown;
+    const msg = (parsed as { error?: { message?: unknown } })?.error?.message;
+    if (typeof msg === "string" && msg.trim().length > 0) return msg.trim();
+  } catch {
+    // Body isn't JSON — fall through to the raw text.
+  }
+  return bodyText.trim().slice(0, 500);
+}
+
+/**
+ * Does this API error message indicate the org/subscription has DISABLED Claude
+ * Code access (the entitlement-403), as opposed to a bad-token-scope 403?
+ *
+ * The observed entitlement message is "Your organization has disabled Claude
+ * subscription access for Claude Code". We key on the DISABLED verb plus a
+ * Claude-Code/subscription reference plus an org/subscription reference — a
+ * conjunction the scope-error messages ("credential is only authorized for use
+ * with Claude Code", "OAuth token does not have the required scopes") never
+ * satisfy, since they carry no "disabled". PURE — no I/O.
+ */
+export function isEntitlementDisabledMessage(
+  message: string | null | undefined,
+): boolean {
+  if (!message) return false;
+  const m = message.toLowerCase();
+  if (!m.includes("disabled")) return false;
+  const mentionsCode = m.includes("claude code") || m.includes("claude subscription");
+  const mentionsOrgOrSub = m.includes("organization") || m.includes("subscription") || m.includes(" org ");
+  return mentionsCode && mentionsOrgOrSub;
+}
+
 export async function fetchQuota(opts: FetchQuotaOptions): Promise<QuotaResult> {
   const token = opts.accessToken?.trim();
   if (!token || token.length === 0) {
@@ -328,12 +394,33 @@ export async function fetchQuota(opts: FetchQuotaOptions): Promise<QuotaResult> 
   clearTimeout(timeout);
 
   // Read headers regardless of HTTP status — the rate-limit headers
-  // are populated on 200 AND on auth-failure 4xx responses.
+  // are populated on 200 AND on auth-failure 4xx responses. A 429 tier-wall
+  // carries the 7d_oi headers and parses ok:true here (kept as-is).
   const parsed = parseQuotaHeaders(resp.headers);
   if (parsed.ok) return parsed;
 
   if (!resp.ok) {
-    return { ok: false, reason: `HTTP ${resp.status} from Anthropic (${parsed.reason})` };
+    // The probe FAILED at the HTTP layer. Read the body to classify the
+    // failure: an entitlement-403 (org disabled Claude Code access) is a hard
+    // account-level block, NOT the transient no-op every other failure is.
+    // Losing the body here was the gap — a disabled account looked identical to
+    // a flaky probe and decayed to "unknown" on the stale cache.
+    let bodyText = "";
+    try {
+      bodyText = await resp.text();
+    } catch {
+      // Body unreadable — leave empty; classification degrades to "other".
+    }
+    const apiErrorMessage = extractApiErrorMessage(bodyText);
+    const entitlement =
+      resp.status === 403 && isEntitlementDisabledMessage(apiErrorMessage);
+    return {
+      ok: false,
+      reason: `HTTP ${resp.status} from Anthropic (${parsed.reason})`,
+      httpStatus: resp.status,
+      ...(apiErrorMessage ? { apiErrorMessage } : {}),
+      failureKind: entitlement ? "entitlement_blocked" : "other",
+    };
   }
   return parsed;
 }

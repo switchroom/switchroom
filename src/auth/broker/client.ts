@@ -218,6 +218,15 @@ export interface AccountState {
   /** #3176 — latest flagship-tier canary snapshot, for the dashboard/card. */
   last_tier_quota?: LastTierQuotaSnapshot | null;
   /**
+   * Entitlement-403 hard block: the org/subscription has DISABLED Claude Code
+   * access. A hard account-level block (never serves) until a later successful
+   * probe clears it. Absent on pre-entitlement brokers (treat as false).
+   *
+   * NOTE (PR2): MINIMAL local definition so the backend branch compiles. PR1
+   * owns the fuller client type + renderers; reconciles on rebase.
+   */
+  entitlement_blocked?: boolean;
+  /**
    * #3185 — rolling per-tier usage summary (standard 5h/7d + premium `7d_oi`),
    * refill-normalized by the broker. Answers "how much Fable/standard headroom
    * is left, and the recent trend". Absent on pre-#3185 brokers.

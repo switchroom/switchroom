@@ -568,3 +568,52 @@ describe("accountEligibility — allow_overage matrix (the alice case and safety
     }
   });
 });
+
+describe("entitlement-403 hard block", () => {
+  it("entitlementBlocked=true → blocked even with a fresh HEALTHY snapshot", () => {
+    // Defense-in-depth: a stale/healthy cache must never let a disabled account
+    // be selected. Fresh, well-under-wall snapshot would otherwise be eligible.
+    expect(
+      accountEligibility({
+        snapshot: snap(1, 2, 500),
+        now: NOW,
+        entitlementBlocked: true,
+      }),
+    ).toBe("blocked");
+  });
+
+  it("entitlementBlocked=true → blocked even when overage would lift the wall", () => {
+    // An overage opt-in cannot rescue a hard-disabled account.
+    expect(
+      accountEligibility({
+        snapshot: snap(0, 100, 500, { status: "allowed", reason: null }),
+        now: NOW,
+        allowOverage: true,
+        entitlementBlocked: true,
+      }),
+    ).toBe("blocked");
+  });
+
+  it("entitlementBlocked=false leaves the normal verdict unchanged (healthy → eligible)", () => {
+    expect(
+      accountEligibility({
+        snapshot: snap(1, 2, 500),
+        now: NOW,
+        entitlementBlocked: false,
+      }),
+    ).toBe("eligible");
+    // Omitting the flag entirely defaults to the same non-blocking behaviour.
+    expect(
+      accountEligibility({ snapshot: snap(1, 2, 500), now: NOW }),
+    ).toBe("eligible");
+  });
+
+  it("isAccountBlocked mirrors the entitlement block", () => {
+    expect(
+      isAccountBlocked({ snapshot: snap(1, 2, 500), now: NOW, entitlementBlocked: true }),
+    ).toBe(true);
+    expect(
+      isAccountBlocked({ snapshot: snap(1, 2, 500), now: NOW, entitlementBlocked: false }),
+    ).toBe(false);
+  });
+});
