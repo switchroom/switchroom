@@ -455,6 +455,13 @@ describe("hindsight-entrypoint.sh (#1245)", () => {
     // aborted under concurrent activity). A mention of RETURNING in a
     // comment is fine — ban the pipeline shape only.
     expect(raw).not.toMatch(/RETURNING[\s\S]{0,80}grep -c/);
+    // Count must come from THIS UPDATE's rowcount (psql `UPDATE N` tag), not a
+    // follow-up SELECT of recently-touched pending rows (that counted fresh
+    // enqueues and inflated the reaper log after #3421).
+    expect(raw).toMatch(/\^UPDATE\[\[:space:\]\]\+/);
+    expect(raw).not.toMatch(
+      /SELECT count\(\*\) FROM async_operations WHERE status='pending' AND worker_id IS NULL/,
+    );
     // Gated + best-effort: 0 disables, and it rides the existing loop.
     expect(raw).toMatch(/REAP_STALE_S.*-gt 0.*\|\| return 0/);
     expect(raw).toMatch(/reap_stale_processing \|\| true/);

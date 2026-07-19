@@ -790,22 +790,88 @@ describe("hindsight recovery footguns (2026-07-19 dual-writer + silent LLM)", ()
     expect(built).toContain(",9)");
   });
 
+  it("compose with loopback per-op LiteLLM base uses host network + LiteLLM-aware healthcheck", async () => {
+    const {
+      generateHindsightComposeSnippet,
+      HINDSIGHT_DEFAULT_API_PORT,
+      HINDSIGHT_HEALTHCHECK_PY,
+    } = await import("../../src/setup/hindsight.js");
+    const snippet = generateHindsightComposeSnippet({
+      retain: {
+        provider: "litellm",
+        model: "openai/gpt-oss-20b",
+        base_url: "http://127.0.0.1:4010/v1",
+      },
+      reflect: {
+        provider: "litellm",
+        model: "openai/gpt-oss-20b",
+        base_url: "http://127.0.0.1:4010/v1",
+      },
+    });
+    // Match live fleet deploy + startHindsight: host net for loopback LiteLLM.
+    expect(snippet).toContain("network_mode: host");
+    expect(snippet).not.toMatch(/^\s+ports:/m);
+    expect(snippet).toContain(`HINDSIGHT_API_PORT=${HINDSIGHT_DEFAULT_API_PORT}`);
+    expect(snippet).toContain(
+      `HINDSIGHT_CP_DATAPLANE_API_URL=http://localhost:${HINDSIGHT_DEFAULT_API_PORT}`,
+    );
+    // Health pairs /health with TCP to LiteLLM — not the bare DB-only probe.
+    expect(snippet).toContain("create_connection(('127.0.0.1',4010)");
+    expect(snippet).toContain(`localhost:${HINDSIGHT_DEFAULT_API_PORT}/health`);
+    expect(snippet).not.toContain(HINDSIGHT_HEALTHCHECK_PY);
+  });
+
+  it("compose with explicit litellm config uses host network + LiteLLM-aware healthcheck", async () => {
+    const { generateHindsightComposeSnippet } = await import("../../src/setup/hindsight.js");
+    const snippet = generateHindsightComposeSnippet(
+      undefined,
+      undefined,
+      { baseUrl: "http://127.0.0.1:4010", apiKey: "sk-test" },
+    );
+    expect(snippet).toContain("network_mode: host");
+    expect(snippet).toContain("create_connection(('127.0.0.1',4010)");
+    expect(snippet).toContain("ANTHROPIC_BASE_URL=");
+  });
+
+  it("compose without LiteLLM stays bridge + plain /health probe", async () => {
+    const {
+      generateHindsightComposeSnippet,
+      HINDSIGHT_HEALTHCHECK_PY,
+      HINDSIGHT_DEFAULT_API_PORT,
+    } = await import("../../src/setup/hindsight.js");
+    const snippet = generateHindsightComposeSnippet();
+    expect(snippet).not.toContain("network_mode: host");
+    expect(snippet).toContain(`"127.0.0.1:${HINDSIGHT_DEFAULT_API_PORT}:8888"`);
+    // JSON.stringify escapes embedded quotes in the CMD python body, so the
+    // raw HINDSIGHT_HEALTHCHECK_PY string is not a literal substring.
+    expect(snippet).toMatch(/healthcheck:[\s\S]*localhost:8888\/health/);
+    expect(snippet).not.toContain("create_connection");
+  });
+
   it("stopHindsight disables restart and removes every data-volume twin, not just the live name", () => {
     const calls: string[][] = [];
     const exec = (cmd: string, args: string[]) => {
       calls.push([cmd, ...args]);
     };
-    stopHindsight(exec, () => [
-      HINDSIGHT_DEFAULT_WORKER_ID,
-      "switchroom-hindsight-old-v01833",
-    ]);
-    const twin = "switchroom-hindsight-old-v01833";
-    const lines = calls.map((c) => c.join(" "));
-    expect(lines).toContain(`docker update --restart=no ${twin}`);
-    expect(lines).toContain(`docker stop ${twin}`);
-    expect(lines).toContain(`docker rm -f ${twin}`);
-    expect(lines).toContain(`docker update --restart=no ${HINDSIGHT_DEFAULT_WORKER_ID}`);
-    expect(lines).toContain(`docker rm -f ${HINDSIGHT_DEFAULT_WORKER_ID}`);
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      stopHindsight(exec, () => [
+        HINDSIGHT_DEFAULT_WORKER_ID,
+        "switchroom-hindsight-old-v01833",
+      ]);
+      const twin = "switchroom-hindsight-old-v01833";
+      const lines = calls.map((c) => c.join(" "));
+      expect(lines).toContain(`docker update --restart=no ${twin}`);
+      expect(lines).toContain(`docker stop ${twin}`);
+      expect(lines).toContain(`docker rm -f ${twin}`);
+      expect(lines).toContain(`docker update --restart=no ${HINDSIGHT_DEFAULT_WORKER_ID}`);
+      expect(lines).toContain(`docker rm -f ${HINDSIGHT_DEFAULT_WORKER_ID}`);
+      expect(errSpy).toHaveBeenCalledWith(
+        expect.stringContaining("switchroom-hindsight-old-v01833"),
+      );
+    } finally {
+      errSpy.mockRestore();
+    }
   });
 
   it("listHindsightDataVolumeMounts uses docker ps filter on the data volume", () => {

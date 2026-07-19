@@ -767,14 +767,81 @@ export function resolveHindsightLlm(
  */
 
 /**
- * Build a docker `--health-cmd` that requires BOTH the hindsight /health
- * endpoint and TCP reachability of the LiteLLM base URL. /health alone is
- * DB-backed — a container mis-created on the bridge network still answers
- * 200 while every retain dies with "Connection error" to 127.0.0.1:4010
- * (2026-07-19 recovery regression). Pairing catches that class of silent
- * outage in `docker ps` health.
+ * True when `url` resolves to a host-loopback listener (localhost / 127.0.0.1 /
+ * ::1). Used to decide whether hindsight must join the host network so the
+ * container can reach a LiteLLM base the operator wrote as loopback.
  */
-export function buildLiteLlmAwareHealthCmd(apiPort: number, litellmBaseUrl: string): string {
+export function isLoopbackHttpUrl(url: string): boolean {
+  try {
+    const u = new URL(url.includes("://") ? url : `http://${url}`);
+    const h = (u.hostname || "").toLowerCase();
+    return h === "localhost" || h === "127.0.0.1" || h === "::1";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Collect every configured LiteLLM / per-op LLM base URL from the same inputs
+ * `startHindsight` / `generateHindsightComposeSnippet` take. Order is
+ * stable: explicit `litellm.baseUrl` first, then retain/reflect/consolidation
+ * per-op base URLs in that op order.
+ */
+export function collectHindsightLlmBaseUrls(
+  llm?: HindsightLlmConfig,
+  litellm?: LiteLLMHindsightConfig,
+): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const push = (raw: string | undefined) => {
+    const v = raw?.trim();
+    if (!v || seen.has(v)) return;
+    seen.add(v);
+    out.push(v);
+  };
+  push(litellm?.baseUrl);
+  for (const [k, v] of resolveHindsightPerOpLlm(llm)) {
+    if (k.endsWith("_BASE_URL")) push(v);
+  }
+  return out;
+}
+
+/**
+ * Whether the hindsight container must use host networking so LLM base URLs
+ * remain reachable. Mirrors `startHindsight`: an explicit LiteLLM routing
+ * config always forces host network; otherwise any configured per-op base
+ * URL that points at host loopback does the same (compose used to stay on
+ * bridge forever while still emitting `http://127.0.0.1:4010` — silent retain
+ * outage that doctor now flags).
+ */
+export function hindsightNeedsHostNetwork(
+  llm?: HindsightLlmConfig,
+  litellm?: LiteLLMHindsightConfig,
+): boolean {
+  if (litellm?.baseUrl?.trim()) return true;
+  return collectHindsightLlmBaseUrls(llm).some(isLoopbackHttpUrl);
+}
+
+/**
+ * Prefered LiteLLM base URL for health/TCP probes: explicit litellm config,
+ * else the first per-op `*_LLM_BASE_URL`. Undefined when nothing is configured.
+ */
+export function pickHindsightLiteLlmProbeUrl(
+  llm?: HindsightLlmConfig,
+  litellm?: LiteLLMHindsightConfig,
+): string | undefined {
+  return collectHindsightLlmBaseUrls(llm, litellm)[0];
+}
+
+/**
+ * Bare python body (compose exec-form `["CMD","python3","-c",PY]`) that requires
+ * BOTH the hindsight /health endpoint and TCP reachability of the LiteLLM base
+ * URL. /health alone is DB-backed — a container mis-created on the bridge
+ * network still answers 200 while every retain dies with "Connection error"
+ * to 127.0.0.1:4010 (2026-07-19 recovery regression). Pairing catches that
+ * class of silent outage in `docker ps` health.
+ */
+export function buildLiteLlmAwareHealthPy(apiPort: number, litellmBaseUrl: string): string {
   let host = "127.0.0.1";
   let port = "80";
   try {
@@ -784,14 +851,23 @@ export function buildLiteLlmAwareHealthCmd(apiPort: number, litellmBaseUrl: stri
   } catch {
     // fall through with defaults; better a weak probe than a throw in start
   }
-  // One-liner python (docker health-cmd is shell-eval'd; keep it single-line).
-  // Exit 0 only when BOTH /health is 200 AND the LiteLLM host:port accepts TCP.
+  // One-liner python (docker health-cmd / compose CMD is single-arg). Exit 0
+  // only when BOTH /health is 200 AND the LiteLLM host:port accepts TCP.
   return (
-    `python3 -c "import socket,urllib.request,sys;` +
+    `import socket,urllib.request,sys;` +
     `r=urllib.request.urlopen('http://localhost:${apiPort}/health',timeout=4);` +
     `(r.getcode()==200) or sys.exit(1);` +
-    `s=socket.create_connection(('${host}',${Number(port)}),2);s.close()"`
+    `s=socket.create_connection(('${host}',${Number(port)}),2);s.close()`
   );
+}
+
+/**
+ * Build a docker `--health-cmd` string wrapping {@link buildLiteLlmAwareHealthPy}.
+ * Shared by the `docker run` path ({@link startHindsight}); compose uses the
+ * bare PY body via exec-form CMD so the generators never drift.
+ */
+export function buildLiteLlmAwareHealthCmd(apiPort: number, litellmBaseUrl: string): string {
+  return `python3 -c "${buildLiteLlmAwareHealthPy(apiPort, litellmBaseUrl)}"`;
 }
 
 export function startHindsight(
@@ -934,23 +1010,45 @@ export function startHindsight(
     // status through the docker-socket-proxy and issues `docker restart` with
     // a sliding-window cap + backoff. python3 is always present in the image;
     // curl/wget are not.
-    // Liveness: API /health alone is necessary but NOT sufficient when the
-    // container is on host network for LiteLLM — a bridge mis-create still
+    // Liveness: API /health alone is necessary but NOT sufficient when LLM
+    // routing depends on a side-car base URL — a bridge mis-create still
     // answers /health (DB-backed) while every retain/LLM op dies with
-    // Connection error. Pair the health endpoint with a TCP probe to the
-    // LiteLLM base URL so docker health reflects LLM reachability too.
-    "--health-cmd", litellm
-      ? buildLiteLlmAwareHealthCmd(apiPort, litellm.baseUrl)
-      : HINDSIGHT_HEALTHCHECK_CMD,
+    // Connection error. Pair the health endpoint with a TCP probe so docker
+    // health reflects LLM reachability too. Host network is required for
+    // loopback bases (see hindsightNeedsHostNetwork); probe TCP still applies
+    // on bridge when the LLM is a non-loopback address.
+    ...(() => {
+      const hostNet = hindsightNeedsHostNetwork(llm, litellm);
+      // Inside the container: host-net API binds HINDSIGHT_API_PORT; bridge
+      // maps host:apiPort → container:8888 (image default).
+      const healthApiPort = hostNet ? apiPort : 8888;
+      const probe = pickHindsightLiteLlmProbeUrl(llm, litellm);
+      return [
+        "--health-cmd",
+        probe
+          ? buildLiteLlmAwareHealthCmd(healthApiPort, probe)
+          : HINDSIGHT_HEALTHCHECK_CMD,
+      ] as string[];
+    })(),
     "--health-interval", "30s",
     "--health-timeout", "5s",
     "--health-retries", "3",
     "--health-start-period", "60s",
   ];
 
-  if (litellm) {
-    // Host network: ports are published directly (no -p flags).
+  if (hindsightNeedsHostNetwork(llm, litellm)) {
+    // Host network: ports are published directly (no -p flags). Required so
+    // loopback LiteLLM (127.0.0.1:4010) is reachable from the container.
     args.push("--network", "host");
+    // When only per-op loopback bases forced host net (no full litellm cfg),
+    // still pin API/CP ports the way the litellm branch does — otherwise the
+    // image default 8888 binds on the shared host stack.
+    if (!litellm) {
+      envArgs.push(
+        "-e", `HINDSIGHT_API_PORT=${apiPort}`,
+        "-e", `HINDSIGHT_CP_DATAPLANE_API_URL=http://localhost:${apiPort}`,
+      );
+    }
   } else {
     args.push(
       "-p", `127.0.0.1:${apiPort}:8888`,
@@ -1058,6 +1156,15 @@ export function stopHindsight(
 ): void {
   const names = new Set<string>([HINDSIGHT_DEFAULT_WORKER_ID, ...listMounts()]);
   for (const name of names) {
+    // Surface non-canonical twins (canary holdback / `-old-*` rename) so the
+    // dual-writer cleanup is operator-visible in the memory/setup CLI stream.
+    // Match the console.* style used by src/cli/memory.ts around start/stop —
+    // this helper has no logger dependency today.
+    if (name !== HINDSIGHT_DEFAULT_WORKER_ID) {
+      console.error(
+        `stopHindsight: removing hindsight data-volume twin ${name} (not the canonical ${HINDSIGHT_DEFAULT_WORKER_ID})`,
+      );
+    }
     try { exec("docker", ["update", "--restart=no", name]); } catch { /* gone */ }
     try { exec("docker", ["stop", name]); } catch { /* gone */ }
     try { exec("docker", ["rm", "-f", name]); } catch { /* gone */ }
@@ -1203,6 +1310,15 @@ export function getHindsightMcpUrl(): {
  * because it's owned by the switchroom compose project (the auth-broker
  * container chowns and binds the per-consumer socket inside it). The
  * hindsight compose project is separate; it consumes the volume.
+ *
+ * Networking + healthcheck track {@link startHindsight}: when an explicit
+ * LiteLLM config is passed, OR any configured per-op `*_LLM_BASE_URL`
+ * points at host loopback, the snippet emits `network_mode: host` (ports
+ * are published on the host stack directly — no `ports:` mapping) and pairs
+ * /health with a TCP probe of the LiteLLM base. The live fleet deploys
+ * hindsight this way for loopback LiteLLM (`http://127.0.0.1:4010`); leaving
+ * compose on bridge with a loopback BASE_URL is the silent-retain class
+ * of outage doctor already fails closed on.
  */
 export function generateHindsightComposeSnippet(
   llm?: HindsightLlmConfig,
@@ -1215,9 +1331,29 @@ export function generateHindsightComposeSnippet(
    * output identical to pre-#2578.
    */
   mirrorDir?: string,
+  /**
+   * Optional LiteLLM routing config (same shape as {@link startHindsight}).
+   * When set — or when `llm` carries a loopback per-op base URL — the
+   * snippet switches to `network_mode: host` and a LiteLLM-aware healthcheck
+   * so compose never silently diverges from the docker-run path.
+   */
+  litellm?: LiteLLMHindsightConfig,
 ): string {
-  const { provider: llmProvider, model: llmModel } = resolveHindsightLlm(llm);
+  const { provider: llmProvider, model: llmModel } = resolveHindsightLlm(llm, litellm);
   const perOpLlm = resolveHindsightPerOpLlm(llm);
+  const hostNetwork = hindsightNeedsHostNetwork(llm, litellm);
+  const apiPort = HINDSIGHT_DEFAULT_API_PORT;
+  // Bridge compose keeps the image-default internal bind (8888) and maps the
+  // host port onto it. Host-network binds HINDSIGHT_API_PORT on the host
+  // stack directly (same as startHindsight) so agents' memory.config.url
+  // still hits the right place.
+  const internalApiPort = hostNetwork ? apiPort : 8888;
+  const probeUrl = pickHindsightLiteLlmProbeUrl(llm, litellm);
+  // Pair /health with LiteLLM TCP whenever any base URL is configured —
+  // including bridge+non-loopback. Host network is the loopback case only.
+  const healthPy = probeUrl
+    ? buildLiteLlmAwareHealthPy(internalApiPort, probeUrl)
+    : HINDSIGHT_HEALTHCHECK_PY;
   const environment = [
     `      - HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE=${HINDSIGHT_DEFAULT_MAX_OBSERVATIONS_PER_SCOPE}`,
     `      - HINDSIGHT_API_LLM_PROVIDER=${llmProvider}`,
@@ -1227,16 +1363,30 @@ export function generateHindsightComposeSnippet(
     // Mirror of the docker-run path: with the claude-code provider, pin
     // ANTHROPIC_MODEL to the same model for the underlying claude subprocess.
     ...(llmProvider === "claude-code" ? [`      - ANTHROPIC_MODEL=${llmModel}`] : []),
-    // Pin the CP dashboard's dataplane URL to the port the API actually
-    // binds INSIDE the container. This compose path is bridge-networked
-    // (host ${HINDSIGHT_DEFAULT_API_PORT} → container 8888), so the API binds
-    // the image default 8888 internally and there is no host-port collision
-    // in the container's own netns. We still set the var explicitly (rather
-    // than leaning on the image default) so it stays correct and matches the
-    // docker-run path, where host-network mode requires it point at the
-    // moved-off API port to dodge the squatted-8888 → 502 dashboard bug.
-    `      - HINDSIGHT_CP_DATAPLANE_API_URL=http://localhost:8888`,
+    // Host-network: API binds HINDSIGHT_API_PORT on the shared host stack
+    // (and CP dataplane must track it so it doesn't hit squatted 8888).
+    // Bridge: API binds image-default 8888 inside the container netns.
+    ...(hostNetwork
+      ? [
+          `      - HINDSIGHT_API_PORT=${apiPort}`,
+          `      - HINDSIGHT_CP_DATAPLANE_API_URL=http://localhost:${apiPort}`,
+        ]
+      : [`      - HINDSIGHT_CP_DATAPLANE_API_URL=http://localhost:8888`]),
   ];
+  // Optional LiteLLM proxy env (ANTHROPIC_BASE_URL + spend-tag headers) —
+  // same shape startHindsight emits when litellm is configured. Requires the
+  // api key; compose generators without a vault-resolved key skip headers
+  // but still get host network + health pairing from loopback per-op URLs.
+  if (litellm?.baseUrl?.trim() && litellm.apiKey?.trim()) {
+    const litellmRoot = litellm.baseUrl.replace(/\/+$/, "");
+    const anthropicBaseUrl = isClaudeModel(llmModel)
+      ? `${litellmRoot}/anthropic`
+      : litellmRoot;
+    environment.push(
+      `      - ANTHROPIC_BASE_URL=${anthropicBaseUrl}`,
+      `      - ANTHROPIC_CUSTOM_HEADERS=x-litellm-api-key: Bearer ${litellm.apiKey}\\nx-litellm-customer-id: hindsight\\nx-litellm-tags: service:hindsight`,
+    );
+  }
   // Mirror mode (#2578): a one-shot init service chowns the fresh shared
   // creds volume to the consumer UID (a named volume mounts root:root, but
   // hindsight's entrypoint runs as UID 11000 and would EACCES on its
@@ -1261,6 +1411,25 @@ export function generateHindsightComposeSnippet(
         "        condition: service_completed_successfully",
       ]
     : [];
+  // network_mode: host OR bridge port publish — mutually exclusive in compose
+  // (docker rejects `ports:` alongside host network).
+  const networkOrPorts = hostNetwork
+    ? [
+        // Match startHindsight(--network host): LiteLLM on host loopback is
+        // reachable, HINDSIGHT_API_PORT binds directly on the host stack.
+        "    network_mode: host",
+      ]
+    : [
+        "    ports:",
+        // Host side 18888/19999 → container 8888/9999. The host port MUST match
+        // HINDSIGHT_DEFAULT_API_PORT / the scaffolded memory.config.url or agents
+        // point at a dead URL (see the 2026-07 outage).
+        // Bind to 127.0.0.1 only: the hindsight API is TOKENLESS, so publishing on
+        // 0.0.0.0 would expose the unauthenticated MCP/REST surface to the network.
+        // This mirrors the startHindsight() docker-run path, which binds loopback.
+        `      - "127.0.0.1:${HINDSIGHT_DEFAULT_API_PORT}:8888"`,
+        "      - \"127.0.0.1:19999:9999\"",
+      ];
   return [
     "services:",
     ...initService,
@@ -1268,15 +1437,7 @@ export function generateHindsightComposeSnippet(
     `    image: ${HINDSIGHT_IMAGE}`,
     "    container_name: switchroom-hindsight",
     ...dependsOn,
-    "    ports:",
-    // Host side 18888/19999 → container 8888/9999. The host port MUST match
-    // HINDSIGHT_DEFAULT_API_PORT / the scaffolded memory.config.url or agents
-    // point at a dead URL (see the 2026-07 outage).
-    // Bind to 127.0.0.1 only: the hindsight API is TOKENLESS, so publishing on
-    // 0.0.0.0 would expose the unauthenticated MCP/REST surface to the network.
-    // This mirrors the startHindsight() docker-run path, which binds loopback.
-    `      - "127.0.0.1:${HINDSIGHT_DEFAULT_API_PORT}:8888"`,
-    "      - \"127.0.0.1:19999:9999\"",
+    ...networkOrPorts,
     "    environment:",
     ...environment,
     `      - HINDSIGHT_API_MCP_STATELESS=${HINDSIGHT_DEFAULT_MCP_STATELESS}`,
@@ -1297,8 +1458,10 @@ export function generateHindsightComposeSnippet(
     // container gets Docker's 64MB default and all writes/queries fail.
     `    shm_size: ${HINDSIGHT_DEFAULT_SHM_SIZE}`,
     // Liveness — restart a wedged/never-booted API (see the docker-run path).
+    // When host-network + LiteLLM base is known, pair /health with a TCP
+    // probe of the proxy so docker health reflects LLM reachability too.
     "    healthcheck:",
-    `      test: ${JSON.stringify(["CMD", "python3", "-c", HINDSIGHT_HEALTHCHECK_PY])}`,
+    `      test: ${JSON.stringify(["CMD", "python3", "-c", healthPy])}`,
     "      interval: 30s",
     "      timeout: 5s",
     "      retries: 3",

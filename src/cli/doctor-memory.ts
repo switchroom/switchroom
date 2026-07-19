@@ -550,16 +550,40 @@ export function checkHindsightContainerHealth(
     const envBlob = exec("docker", [
       "inspect", name, "--format", "{{range .Config.Env}}{{println .}}{{end}}",
     ]);
-    const litellmConfigured =
-      /HINDSIGHT_API_(RETAIN|REFLECT|CONSOLIDATION)_LLM_BASE_URL=/.test(envBlob) ||
-      /ANTHROPIC_BASE_URL=/.test(envBlob);
+    // Gate primarily on the retained per-op LLM base URLs (set whenever
+    // hindsight.llm.{retain,reflect,consolidation}.base_url or startHindsight's
+    // litellm path is active). ANTHROPIC_BASE_URL alone is common on ordinary
+    // agent containers / residual env and is NOT a LiteLLM signal unless its
+    // value looks like a litellm proxy path (host :4010 or /anthropic suffix).
+    const perOpBasePresent =
+      /HINDSIGHT_API_(RETAIN|REFLECT|CONSOLIDATION)_LLM_BASE_URL=/.test(envBlob);
+    const anthropicBaseMatch = envBlob.match(/(?:^|\n)ANTHROPIC_BASE_URL=(\S+)/);
+    const anthropicLooksLikeLiteLlm = (() => {
+      const raw = anthropicBaseMatch?.[1]?.trim();
+      if (!raw) return false;
+      try {
+        const u = new URL(raw.includes("://") ? raw : `http://${raw}`);
+        const port = u.port || (u.protocol === "https:" ? "443" : "80");
+        const path = (u.pathname || "").replace(/\/+$/, "");
+        // Fleet LiteLLM default is :4010; pass-through is <root>/anthropic.
+        if (port === "4010") return true;
+        if (/\/anthropic$/i.test(path)) return true;
+        if (/litellm/i.test(u.hostname || "")) return true;
+        return false;
+      } catch {
+        return false;
+      }
+    })();
+    const litellmConfigured = perOpBasePresent || anthropicLooksLikeLiteLlm;
     results.push(classifyHindsightNetworkMode(netMode, litellmConfigured));
 
     if (litellmConfigured) {
-      // Prefer the retained base URL; default to host LiteLLM.
+      // Prefer per-op retained base URL; only fall back to ANTHROPIC_BASE_URL
+      // when it already looked like LiteLLM above. Default host LiteLLM.
       const m = envBlob.match(/HINDSIGHT_API_RETAIN_LLM_BASE_URL=(\S+)/)
         ?? envBlob.match(/HINDSIGHT_API_REFLECT_LLM_BASE_URL=(\S+)/)
-        ?? envBlob.match(/ANTHROPIC_BASE_URL=(\S+)/);
+        ?? envBlob.match(/HINDSIGHT_API_CONSOLIDATION_LLM_BASE_URL=(\S+)/)
+        ?? (anthropicLooksLikeLiteLlm ? anthropicBaseMatch : null);
       let endpoint = "127.0.0.1:4010";
       if (m) {
         try {
