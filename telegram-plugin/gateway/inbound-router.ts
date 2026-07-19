@@ -17,6 +17,22 @@
 
 import type { Context } from 'grammy'
 import type { AttachmentMeta } from './gateway.js'
+import {
+  interceptStopKeyword,
+  interceptInterruptMarker,
+  interceptPermissionReply,
+  interceptAuthAdd,
+  interceptLoopbackRelay,
+  interceptReauth,
+  interceptVault,
+  interceptSecretStagingCommand,
+  type InboundInterceptorDeps,
+  type InterceptOutcome,
+  type StopKeywordParams,
+  type InterruptMarkerParams,
+  type InterruptMarkerOutcome,
+  type AuthAddParams,
+} from './inbound-interceptors.js'
 import type { InboundMessage } from './ipc-protocol.js'
 import { deriveTurnId } from './derive-turn-id.js'
 import { formatReplyToText } from '../steering.js'
@@ -311,4 +327,74 @@ export function buildInboundEnvelope(p: EnvelopeBuildParams): InboundMessage {
     },
   }
   return inboundMsg
+}
+
+
+// ─── P7 PR-11: kill-switched v2 intercept chain ────────────────────────────
+
+/**
+ * THE deterministic cutover switch (#2996 P7 PR-11, design §2). Read ONCE at
+ * module load (F2: flags are const-captured — flipping requires an agent
+ * restart, same as every other `_ENABLED` flag). Default OFF: the legacy
+ * inline delegation sequence in gateway.ts `handleInbound` remains the
+ * production control flow until the canary (flag `=1`) bakes clean. The v2
+ * chain and the legacy sequence call the SAME extracted intercept functions
+ * in the SAME order — the characterization harness is the parity oracle (F6;
+ * the #3316-removed gate-parity probe is not relied on), and
+ * tests/inbound-router-v2-chain.test.ts pins the v2 path with the flag set
+ * env-before-import.
+ *
+ * Rollback: unset / `=0` + agent restart. No model involvement.
+ */
+export const INBOUND_ROUTER_V2 = process.env.SWITCHROOM_INBOUND_ROUTER_V2 === '1'
+
+/** Outcome of the pre-turn chain: stop-keyword then interrupt-marker. */
+export type PreTurnChainOutcome = InterruptMarkerOutcome
+
+/**
+ * v2 chain, segment 1 — the pre-turn kill switches, in load-bearing order:
+ * stop-keyword (#3020) THEN interrupt-marker (#575). Between this chain and
+ * the paste-back chain the caller runs the stay-behind status-KPI telemetry
+ * block (F3 — non-intercepting, position preserved).
+ */
+export async function runPreTurnIntercepts(
+  p: { stop: StopKeywordParams; interrupt: InterruptMarkerParams },
+  deps: InboundInterceptorDeps,
+): Promise<PreTurnChainOutcome> {
+  const stopOutcome = await interceptStopKeyword(p.stop, deps)
+  if (stopOutcome.handled) return { handled: true }
+  return interceptInterruptMarker(p.interrupt, deps)
+}
+
+/**
+ * v2 chain, segment 2 — the reply/paste-back gauntlet, in load-bearing order:
+ * permission-reply → auth-add → loopback-relay (incl. #3084 fail-safe) →
+ * reauth → vault → secret-staging command. Auth-add-before-reauth and
+ * fail-safe-before-reauth orderings are enforced structurally here (the
+ * design's PR-11 goal: ordering by code, not by comment).
+ */
+export async function runPasteBackIntercepts(
+  p: AuthAddParams,
+  deps: InboundInterceptorDeps,
+): Promise<InterceptOutcome> {
+  const perm = interceptPermissionReply(
+    { text: p.text, chat_id: p.chat_id, msgId: p.msgId },
+    deps,
+  )
+  if (perm.handled) return perm
+  const authAdd = await interceptAuthAdd(p, deps)
+  if (authAdd.handled) return authAdd
+  const loopback = await interceptLoopbackRelay(p, deps)
+  if (loopback.handled) return loopback
+  const reauth = await interceptReauth(p, deps)
+  if (reauth.handled) return reauth
+  const vault = await interceptVault(
+    { ctx: p.ctx, text: p.text, chat_id: p.chat_id, msgId: p.msgId },
+    deps,
+  )
+  if (vault.handled) return vault
+  return interceptSecretStagingCommand(
+    { ctx: p.ctx, text: p.text, chat_id: p.chat_id, msgId: p.msgId },
+    deps,
+  )
 }

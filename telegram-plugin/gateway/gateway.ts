@@ -120,6 +120,9 @@ import {
   admitInbound,
   buildReplyForwardContext,
   buildInboundEnvelope,
+  INBOUND_ROUTER_V2,
+  runPreTurnIntercepts,
+  runPasteBackIntercepts,
   type InboundRouterDeps,
   type InboundAdmissionDeps,
 } from './inbound-router.js'
@@ -14758,31 +14761,54 @@ export async function handleInbound(
   // Pure text only (7b): a photo/attachment captioned "stop" is content for
   // the agent, not a halt request — it must never trip the halt-and-drop
   // path (the caption + attachment flow through as a normal turn).
-  {
-    const stopOutcome = await interceptStopKeyword(
-      { text, chat_id, msgId, messageThreadId, downloadImage, attachment, extraAttachments },
-      inboundInterceptorDeps,
-    )
-    if (stopOutcome.handled) return
-  }
-
-  const interrupt = parseInterruptMarker(text)
   // Problem B: defer this `!`'s SIGINT to a safe boundary instead of firing it
   // synchronously. Extracted to interceptInterruptMarker (#2996 P7 PR-3);
   // `deferInterrupt` comes back as an at-receipt captured VALUE the delivery
   // site consumes (when true the synchronous SIGINT was skipped and the built
   // inbound is stashed at the delivery site, #3020 semantics unchanged).
+  // `interrupt` is parsed from the ORIGINAL text on both arms (isInterrupt
+  // feeds the downstream envelope/delivery path).
+  let interrupt: ReturnType<typeof parseInterruptMarker>
   let deferInterrupt = false
-  {
-    const interruptOutcome = await interceptInterruptMarker(
-      { interrupt, chat_id, msgId, messageThreadId },
+  if (INBOUND_ROUTER_V2) {
+    // v2 (#2996 P7 PR-11): consolidated pre-turn chain — stop-keyword then
+    // interrupt-marker, ordering owned by runPreTurnIntercepts. Same
+    // intercept functions as the legacy arm; the characterization harness +
+    // inbound-router-v2-chain.test.ts pin parity.
+    interrupt = parseInterruptMarker(text)
+    const pre = await runPreTurnIntercepts(
+      {
+        stop: { text, chat_id, msgId, messageThreadId, downloadImage, attachment, extraAttachments },
+        interrupt: { interrupt, chat_id, msgId, messageThreadId },
+      },
       inboundInterceptorDeps,
     )
-    if (interruptOutcome.handled) return
-    deferInterrupt = interruptOutcome.deferInterrupt
+    if (pre.handled) return
+    deferInterrupt = pre.deferInterrupt
     // Replace the inbound text with the `!` body and continue normal
     // processing. The agent receives a fresh turn with no `!` prefix.
-    if (interruptOutcome.replacedText != null) text = interruptOutcome.replacedText
+    if (pre.replacedText != null) text = pre.replacedText
+  } else {
+    {
+      const stopOutcome = await interceptStopKeyword(
+        { text, chat_id, msgId, messageThreadId, downloadImage, attachment, extraAttachments },
+        inboundInterceptorDeps,
+      )
+      if (stopOutcome.handled) return
+    }
+
+    interrupt = parseInterruptMarker(text)
+    {
+      const interruptOutcome = await interceptInterruptMarker(
+        { interrupt, chat_id, msgId, messageThreadId },
+        inboundInterceptorDeps,
+      )
+      if (interruptOutcome.handled) return
+      deferInterrupt = interruptOutcome.deferInterrupt
+      // Replace the inbound text with the `!` body and continue normal
+      // processing. The agent receives a fresh turn with no `!` prefix.
+      if (interruptOutcome.replacedText != null) text = interruptOutcome.replacedText
+    }
   }
 
   // Issue #109: when the user has to ask "status?" mid-turn, the live progress
@@ -14841,80 +14867,96 @@ export async function handleInbound(
     }
   }
 
-  // Permission-reply intercept (moved to interceptPermissionReply, #2996 P7
-  // PR-4; PERMISSION_REPLY_RE lives in inbound-interceptors.ts now).
-  {
-    const permOutcome = interceptPermissionReply({ text, chat_id, msgId }, inboundInterceptorDeps)
-    if (permOutcome.handled) return
-  }
-
-  // `/auth add` paste-back intercept — sibling to pendingReauthFlows.
-  // Both intercepts are deliberate so the LLM never sees the OAuth
-  // code (it doesn't need to + plaintext OAuth in chat history is bad
-  // hygiene). The add-flow intercept comes first because /auth add
-  // creates fresh credentials at the broker layer, vs /reauth which
-  // mutates an existing agent's slot — different success paths.
-  //
-  // PR3 supergroup-mode: keyed by chatKey(chat, thread) so an OAuth
-  // code pasted into topic A isn't intercepted when topic B has a
-  // separate /auth add flow pending (security: prevents cross-topic
-  // credential mis-attribution).
+  // PR3 supergroup-mode: keyed by chatKey(chat, thread) so an OAuth code
+  // pasted into topic A isn't intercepted when topic B has a separate flow
+  // pending (security: prevents cross-topic credential mis-attribution).
   const interceptKey = chatKey(chat_id, messageThreadId) as string
-  // (moved to interceptAuthAdd, #2996 P7 PR-5; the anchor literal
-  // pendingAuthAddFlows.get(interceptKey) lives inside the delegation now)
-  {
-    const authAddOutcome = await interceptAuthAdd(
+
+  if (INBOUND_ROUTER_V2) {
+    // v2 (#2996 P7 PR-11): consolidated reply/paste-back chain — permission
+    // → auth-add → loopback (incl. #3084 fail-safe) → reauth → vault →
+    // secret-staging, ordering owned by runPasteBackIntercepts. Same
+    // intercept functions as the legacy arm below.
+    const pasteBackOutcome = await runPasteBackIntercepts(
       { ctx, text, chat_id, msgId, interceptKey },
       inboundInterceptorDeps,
     )
-    if (authAddOutcome.handled) return
-  }
+    if (pasteBackOutcome.handled) return
+  } else {
+    // Permission-reply intercept (moved to interceptPermissionReply, #2996 P7
+    // PR-4; PERMISSION_REPLY_RE lives in inbound-interceptors.ts now).
+    {
+      const permOutcome = interceptPermissionReply({ text, chat_id, msgId }, inboundInterceptorDeps)
+      if (permOutcome.handled) return
+    }
 
-  // Loopback OAuth relay paste-back intercept (issue #2582) — sibling to
-  // the /auth add intercept above. When a Google/Microsoft loopback relay is
-  // pending for this chat and the operator pastes their `127.0.0.1:<port>`
-  // redirect URL, validate `state` and hand the code to the waiting CLI
-  // listener. The LLM never sees the code (same hygiene rationale as above).
-  // Consume-gate is deliberately narrow (PR #3100 review finding 1): only a
-  // message that actually parses as a loopback redirect — carrying a code,
-  // or a provider `error` param — is consumed and deleted. Unrelated chatter
-  // that merely mentions localhost/127.0.0.1 flows through untouched.
-  // (moved to interceptLoopbackRelay incl. the #3084 fail-safe redaction tail,
-  // #2996 P7 PR-6)
-  {
-    const loopbackOutcome = await interceptLoopbackRelay(
-      { ctx, text, chat_id, msgId, interceptKey },
-      inboundInterceptorDeps,
-    )
-    if (loopbackOutcome.handled) return
-  }
+    // `/auth add` paste-back intercept — sibling to pendingReauthFlows.
+    // Both intercepts are deliberate so the LLM never sees the OAuth
+    // code (it doesn't need to + plaintext OAuth in chat history is bad
+    // hygiene). The add-flow intercept comes first because /auth add
+    // creates fresh credentials at the broker layer, vs /reauth which
+    // mutates an existing agent's slot — different success paths.
+    //
+    // PR3 supergroup-mode: keyed by chatKey(chat, thread) so an OAuth
+    // code pasted into topic A isn't intercepted when topic B has a
+    // separate /auth add flow pending (security: prevents cross-topic
+    // credential mis-attribution).
+    // (moved to interceptAuthAdd, #2996 P7 PR-5; the anchor literal
+    // pendingAuthAddFlows.get(interceptKey) lives inside the delegation now)
+    {
+      const authAddOutcome = await interceptAuthAdd(
+        { ctx, text, chat_id, msgId, interceptKey },
+        inboundInterceptorDeps,
+      )
+      if (authAddOutcome.handled) return
+    }
 
-  // Auth-code (reauth) intercept — moved to interceptReauth (#2996 P7 PR-7).
-  // Structural anchor for gateway-loopback-paste-redact.test.ts ordering:
-  // const pendingReauth = pendingReauthFlows.get(interceptKey) now lives in
-  // the interceptor; the delegation below preserves its position.
-  {
-    const reauthOutcome = await interceptReauth(
-      { ctx, text, chat_id, msgId, interceptKey },
-      inboundInterceptorDeps,
-    )
-    if (reauthOutcome.handled) return
-  }
+    // Loopback OAuth relay paste-back intercept (issue #2582) — sibling to
+    // the /auth add intercept above. When a Google/Microsoft loopback relay is
+    // pending for this chat and the operator pastes their `127.0.0.1:<port>`
+    // redirect URL, validate `state` and hand the code to the waiting CLI
+    // listener. The LLM never sees the code (same hygiene rationale as above).
+    // Consume-gate is deliberately narrow (PR #3100 review finding 1): only a
+    // message that actually parses as a loopback redirect — carrying a code,
+    // or a provider `error` param — is consumed and deleted. Unrelated chatter
+    // that merely mentions localhost/127.0.0.1 flows through untouched.
+    // (moved to interceptLoopbackRelay incl. the #3084 fail-safe redaction tail,
+    // #2996 P7 PR-6)
+    {
+      const loopbackOutcome = await interceptLoopbackRelay(
+        { ctx, text, chat_id, msgId, interceptKey },
+        inboundInterceptorDeps,
+      )
+      if (loopbackOutcome.handled) return
+    }
 
-  // Vault intercept — moved to interceptVault (#2996 P7 PR-8).
-  {
-    const vaultOutcome = await interceptVault({ ctx, text, chat_id, msgId }, inboundInterceptorDeps)
-    if (vaultOutcome.handled) return
-  }
+    // Auth-code (reauth) intercept — moved to interceptReauth (#2996 P7 PR-7).
+    // Structural anchor for gateway-loopback-paste-redact.test.ts ordering:
+    // const pendingReauth = pendingReauthFlows.get(interceptKey) now lives in
+    // the interceptor; the delegation below preserves its position.
+    {
+      const reauthOutcome = await interceptReauth(
+        { ctx, text, chat_id, msgId, interceptKey },
+        inboundInterceptorDeps,
+      )
+      if (reauthOutcome.handled) return
+    }
 
-  // Secret-detect follow-up command intercept — moved to
-  // interceptSecretStagingCommand (#2996 P7 PR-9).
-  {
-    const stagingOutcome = await interceptSecretStagingCommand(
-      { ctx, text, chat_id, msgId },
-      inboundInterceptorDeps,
-    )
-    if (stagingOutcome.handled) return
+    // Vault intercept — moved to interceptVault (#2996 P7 PR-8).
+    {
+      const vaultOutcome = await interceptVault({ ctx, text, chat_id, msgId }, inboundInterceptorDeps)
+      if (vaultOutcome.handled) return
+    }
+
+    // Secret-detect follow-up command intercept — moved to
+    // interceptSecretStagingCommand (#2996 P7 PR-9).
+    {
+      const stagingOutcome = await interceptSecretStagingCommand(
+        { ctx, text, chat_id, msgId },
+        inboundInterceptorDeps,
+      )
+      if (stagingOutcome.handled) return
+    }
   }
 
   // Typing indicator in the ORIGINATING topic — on a supergroup-topic inbound,
