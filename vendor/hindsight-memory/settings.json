@@ -11,6 +11,7 @@
   "recallMaxMemories": 12,
   "recallTypes": ["world", "experience"],
   "recallContextTurns": 1,
+  "directivesCacheTtlSeconds": 120,
   "recallMaxQueryChars": 800,
   "recallRoles": ["user", "assistant"],
   "recallTags": [],

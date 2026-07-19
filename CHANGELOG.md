@@ -17,6 +17,14 @@
   #546 content dedup's case), and a model-regenerated paraphrase is
   indistinguishable from a genuine handback, so delivering is correct. A rare
   duplicate message beats a silent drop.
+- Hindsight recall: cache the active-directives list on the recall critical path
+  with a short TTL (default 120s, `directivesCacheTtlSeconds` /
+  `HINDSIGHT_DIRECTIVES_CACHE_TTL_SECONDS`; 0 disables). `directive_verify.py`
+  (Stop hook) invalidates the cache when the just-ended turn wrote a directive,
+  so in-session create/update/delete is visible on the very next turn; cross-
+  process writes (and sub-agent / Bash-CLI writes with no main-transcript
+  tool_use) are at most TTL stale. Saves the 2s-timeout `list_directives`
+  round-trip on cache-hit turns. (hindsight-leverage A4)
 
 ## v0.19.2 — Hindsight recovery, External spend on /usage, auth-broker hardening, /model carrier doctor
 

@@ -61,7 +61,11 @@ from lib.content import (
     truncate_recall_query,
 )
 from lib.daemon import get_api_url
-from lib.directives import fetch_active_directives, format_active_directives_block
+from lib.directives import (
+    DIRECTIVES_CACHE_TTL_SECONDS,
+    fetch_active_directives_cached,
+    format_active_directives_block,
+)
 from lib.gateway_ipc import extract_chat_id_from_prompt, extract_topic_from_prompt, extract_user_from_prompt, update_placeholder
 from lib.state import read_state, write_state
 
@@ -1143,10 +1147,21 @@ def main():
     # surfaced every turn). Workaround for upstream bug
     # vectorize-io/hindsight#1269 (tagged directives silently dropped from
     # `reflect`); `list_directives` itself works correctly upstream, so this
-    # is a pure client-side surface. fetch_active_directives is failure-safe
-    # and returns [] on any error.
+    # is a pure client-side surface. fetch_active_directives_cached is
+    # failure-safe and returns [] on any error.
+    #
+    # A4: cache the list with a short TTL (invalidated in-session by
+    # directive_verify.py on a directive write) so the common no-write turn
+    # skips the HTTP round-trip. TTL=0 disables the cache (live every turn).
+    # The A3 timing wrapper below measures the fetch either way — on a cache
+    # HIT directives_elapsed_ms reads ~0 (that is the A4 latency win, not a
+    # telemetry regression).
     _directives_start = time.monotonic()
-    directives = fetch_active_directives(client, bank_id)
+    directives = fetch_active_directives_cached(
+        client,
+        bank_id,
+        ttl_seconds=config.get("directivesCacheTtlSeconds", DIRECTIVES_CACHE_TTL_SECONDS),
+    )
     directives_elapsed_ms = int((time.monotonic() - _directives_start) * 1000)
     directives_block = format_active_directives_block(directives) if directives else None
     if directives_block:

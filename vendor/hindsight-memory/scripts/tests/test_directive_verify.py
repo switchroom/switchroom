@@ -25,6 +25,7 @@ Stdlib-only.
 import os
 import sys
 import unittest
+import unittest.mock
 
 SCRIPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if SCRIPTS_DIR not in sys.path:
@@ -32,11 +33,14 @@ if SCRIPTS_DIR not in sys.path:
 
 from directive_verify import (  # noqa: E402
     _VERIFY_BLOCK_REASON,
+    _is_directive_write_tool,
     directive_recorded_after,
     evaluate,
     find_last_human_turn,
+    invalidate_cache_on_directive_write,
     is_synthetic_inbound,
     looks_like_durable_directive,
+    turn_contains_directive_write,
 )
 from recall import looks_like_standing_rule  # noqa: E402
 
@@ -510,6 +514,171 @@ class TestBlockReason(unittest.TestCase):
         self.assertIn("create_directive", _VERIFY_BLOCK_REASON)
         self.assertIn("one-off", _VERIFY_BLOCK_REASON)
         self.assertIn("<directive_capture_verify>", _VERIFY_BLOCK_REASON)
+
+
+class TestDirectiveWriteDetection(unittest.TestCase):
+    """A4 — the Stop-hook detector that decides whether the just-ended turn
+    wrote a directive (and should therefore invalidate the recall cache)."""
+
+    def test_write_tool_names_recognised(self):
+        for name in (
+            "create_directive",
+            "update_directive",
+            "delete_directive",
+            "mcp__hindsight__create_directive",
+            "mcp__hindsight__update_directive",
+        ):
+            self.assertTrue(_is_directive_write_tool(name), name)
+
+    def test_read_and_unrelated_tools_ignored(self):
+        for name in ("list_directives", "recall", "retain", "reflect", "", None):
+            self.assertFalse(_is_directive_write_tool(name), name)
+
+    def _assistant_tool_use(self, tool_name):
+        return {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "t1", "name": tool_name, "input": {}}],
+        }
+
+    def test_turn_with_create_directive_detected(self):
+        messages = [
+            {"role": "user", "content": "From now on call me Ken."},
+            self._assistant_tool_use("mcp__hindsight__create_directive"),
+        ]
+        self.assertTrue(turn_contains_directive_write(messages, 0))
+
+    def test_turn_without_write_not_detected(self):
+        messages = [
+            {"role": "user", "content": "What did we decide?"},
+            self._assistant_tool_use("mcp__hindsight__list_directives"),
+        ]
+        self.assertFalse(turn_contains_directive_write(messages, 0))
+
+    def test_write_before_start_index_ignored(self):
+        # A directive write in a PRIOR turn (before the current human turn) does
+        # not count — only writes after start_index are this turn's.
+        messages = [
+            self._assistant_tool_use("create_directive"),  # prior turn
+            {"role": "user", "content": "Now do something else."},
+            {"role": "assistant", "content": "Sure."},
+        ]
+        self.assertFalse(turn_contains_directive_write(messages, 1))
+
+
+class TestCacheInvalidationHook(unittest.TestCase):
+    """A4 — invalidate_cache_on_directive_write end-to-end: a real transcript
+    containing a directive write deletes a seeded cache file."""
+
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._patch = unittest.mock.patch.dict(
+            os.environ, {"CLAUDE_PLUGIN_DATA": self._tmp.name}
+        )
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+
+    def _seed_cache(self, bank_id="bank1"):
+        from lib.directives import _cache_name
+        from lib.state import read_state, write_state
+
+        write_state(_cache_name(bank_id), {"ts": 1000.0, "bank_id": bank_id, "directives": []})
+        self.assertIsNotNone(read_state(_cache_name(bank_id), None))
+
+    def _cache_present(self, bank_id="bank1"):
+        from lib.directives import _cache_name
+        from lib.state import read_state
+
+        return read_state(_cache_name(bank_id), None) is not None
+
+    def test_directive_write_invalidates_cache(self):
+        self._seed_cache()
+        messages = [
+            {"role": "user", "content": "From now on call me Ken."},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "t1", "name": "create_directive", "input": {}}
+                ],
+            },
+        ]
+        invalidate_cache_on_directive_write(messages, {})
+        self.assertFalse(self._cache_present())
+
+    def test_no_write_leaves_cache_intact(self):
+        self._seed_cache()
+        messages = [
+            {"role": "user", "content": "What's the weather?"},
+            {"role": "assistant", "content": "Sunny."},
+        ]
+        invalidate_cache_on_directive_write(messages, {})
+        self.assertTrue(self._cache_present())
+
+    def test_empty_messages_is_noop(self):
+        self._seed_cache()
+        invalidate_cache_on_directive_write([], {})
+        self.assertTrue(self._cache_present())
+
+
+class TestMainSingleTranscriptRead(unittest.TestCase):
+    """A4 finding 2 — main() must parse the transcript AT MOST ONCE (shared by
+    cache-invalidation + capture-verify), and not at all when nothing needs it.
+    A Stop hook on a multi-MB session cannot afford a doubled multi-second
+    parse inside its 10s budget."""
+
+    def _run_main_counting_reads(self, config, stop_hook_active=False):
+        import io
+        import json
+
+        import directive_verify as dv
+
+        calls = {"n": 0}
+
+        def _counting_read(_path):
+            calls["n"] += 1
+            return []
+
+        hook_input = {"transcript_path": "/some/transcript", "stop_hook_active": stop_hook_active}
+        with unittest.mock.patch.object(dv, "read_transcript", side_effect=_counting_read), \
+             unittest.mock.patch.object(dv, "load_config", return_value=config), \
+             unittest.mock.patch("sys.stdin", new=io.StringIO(json.dumps(hook_input))), \
+             unittest.mock.patch("sys.stdout", new=io.StringIO()):
+            dv.main()
+        return calls["n"]
+
+    def test_reads_once_when_cache_and_verify_on(self):
+        n = self._run_main_counting_reads({
+            "directivesCacheTtlSeconds": 120,
+            "directiveCaptureNudge": True,
+            "directiveCaptureVerify": True,
+        })
+        self.assertEqual(n, 1)
+
+    def test_reads_once_when_only_cache_on(self):
+        n = self._run_main_counting_reads({
+            "directivesCacheTtlSeconds": 120,
+            "directiveCaptureNudge": False,
+            "directiveCaptureVerify": False,
+        })
+        self.assertEqual(n, 1)
+
+    def test_reads_once_when_only_verify_on(self):
+        n = self._run_main_counting_reads({
+            "directivesCacheTtlSeconds": 0,
+            "directiveCaptureNudge": True,
+            "directiveCaptureVerify": True,
+        })
+        self.assertEqual(n, 1)
+
+    def test_reads_zero_when_all_disabled(self):
+        n = self._run_main_counting_reads({
+            "directivesCacheTtlSeconds": 0,
+            "directiveCaptureNudge": False,
+            "directiveCaptureVerify": False,
+        })
+        self.assertEqual(n, 0)
 
 
 if __name__ == "__main__":

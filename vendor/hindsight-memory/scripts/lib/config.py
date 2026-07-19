@@ -71,6 +71,12 @@ DEFAULTS = {
     # per-agent via memory.directive_capture_verify=false →
     # HINDSIGHT_DIRECTIVE_CAPTURE_VERIFY.
     "directiveCaptureVerify": True,
+    # Switchroom hindsight-leverage A4 — TTL (seconds) for the directives-list
+    # cache on the recall critical path (see lib/directives.py). The list is
+    # re-fetched at most once per TTL window for no-write turns; in-session
+    # directive writes invalidate the cache immediately via directive_verify.py.
+    # 0 disables the cache (live fetch every turn — the A4 rollback lever).
+    "directivesCacheTtlSeconds": 120,
     "recallContextTurns": 1,
     "recallMaxQueryChars": 800,
     "recallRoles": ["user", "assistant"],
@@ -184,6 +190,9 @@ ENV_OVERRIDES = {
     # agents.<name>.memory.directive_capture_verify only when the operator
     # overrode it; the switchroom default is on.
     "HINDSIGHT_DIRECTIVE_CAPTURE_VERIFY": ("directiveCaptureVerify", bool),
+    # Switchroom hindsight-leverage A4 — directives-list cache TTL (seconds).
+    # 0 disables the cache (rollback lever).
+    "HINDSIGHT_DIRECTIVES_CACHE_TTL_SECONDS": ("directivesCacheTtlSeconds", int),
     "HINDSIGHT_RECALL_MAX_QUERY_CHARS": ("recallMaxQueryChars", int),
     "HINDSIGHT_RECALL_CONTEXT_TURNS": ("recallContextTurns", int),
     # Upstream 962140eef — recall tag filters. The tags env var accepts JSON
