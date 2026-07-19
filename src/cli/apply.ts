@@ -17,7 +17,7 @@
  */
 import { Option, type Command } from "commander";
 import chalk from "chalk";
-import { accessSync, chownSync, constants as fsConstants, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, chownSync, constants as fsConstants, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { writeConfigFileSync } from "../util/atomic.js";
 import { mkdir } from "node:fs/promises";
 import { spawnSync as childSpawnSync } from "node:child_process";
@@ -271,6 +271,33 @@ export async function resolveOperatorVaultPassphrase(home: string): Promise<stri
 /**
  * @internal exported for the apply-level e2e (src/litellm/provision-apply-e2e.test.ts).
  */
+
+/**
+ * Materialize the LiteLLM master key into the auth-broker state dir so the
+ * broker can publish `get-external-spend` without every agent holding the
+ * key. File mode 0600; path is never mounted into agent containers.
+ * Best-effort: failures are warnings (agents just omit the External block).
+ */
+export function materializeLitellmMasterKeyForBroker(
+  masterKey: string,
+  home: string = process.env.HOME ?? "/root",
+): { ok: true; path: string } | { ok: false; error: string } {
+  try {
+    const stateDir = join(home, ".switchroom", "state", "auth-broker");
+    mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    const path = join(stateDir, "litellm-master-key");
+    writeFileSync(path, masterKey.trim() + "\n", { mode: 0o600 });
+    try {
+      chmodSync(path, 0o600);
+    } catch {
+      /* best-effort */
+    }
+    return { ok: true, path };
+  } catch (err) {
+    return { ok: false, error: (err as Error).message };
+  }
+}
+
 export async function provisionLiteLLMKeys(
   config: SwitchroomConfig,
   agentNames: string[],
@@ -300,6 +327,7 @@ export async function provisionLiteLLMKeys(
     (config as { litellm?: { enabled?: boolean } }).litellm?.enabled === true &&
     (config as { memory?: { backend?: string } }).memory?.backend === "hindsight";
   if (optedIn.length === 0 && !needsHindsight) return; // zero-impact when the feature is off
+  let brokerKeyMaterialized = false;
 
   // Lazy imports — only paid for when at least one agent opts in or hindsight is wired.
   const [{ getViaBrokerStructured, putViaBroker }, { ensureTeam, ensureKey, validateKey, bindKeyToTeam }, { addAgentSecret }] =
@@ -531,6 +559,21 @@ export async function provisionLiteLLMKeys(
           masterKeyErr = `litellm: admin_key vault ref '${adminKeyRef}' is not a string secret.`;
         } else {
           masterKey = resolved.entry.value;
+        }
+      }
+
+      if (masterKey && !brokerKeyMaterialized) {
+        const mat = materializeLitellmMasterKeyForBroker(
+          masterKey,
+          ctx.home ?? homedir(),
+        );
+        brokerKeyMaterialized = true;
+        if (!mat.ok) {
+          ctx.writeErr(
+            chalk.yellow(
+              `  ! litellm: could not materialize master key for auth-broker external-spend (${mat.error})\n`,
+            ),
+          );
         }
       }
 

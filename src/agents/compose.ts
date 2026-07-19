@@ -1707,6 +1707,15 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   //   /state/agents    → ~/.switchroom/agents/
   //   /state/auth-broker → ~/.switchroom/state/auth-broker/
   lines.push(`      SWITCHROOM_AUTH_BROKER_STATE_DIR: /state/auth-broker`);
+  {
+    // LiteLLM root URL for get-external-spend (OpenRouter cash on /usage).
+    // Broker holds master key in state-dir; agents never see it.
+    const llBase =
+      (config as { litellm?: { base_url?: string } }).litellm?.base_url;
+    if (typeof llBase === "string" && llBase.trim()) {
+      lines.push(`      SWITCHROOM_LITELLM_BASE: ${JSON.stringify(llBase.trim())}`);
+    }
+  }
   lines.push(`      SWITCHROOM_ACCOUNTS_DIR: /state/accounts`);
   lines.push(`      SWITCHROOM_AGENTS_DIR: /state/agents`);
   // Operator UID — when set, the broker binds an additional listener at
