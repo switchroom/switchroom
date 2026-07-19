@@ -70,6 +70,14 @@ Don't retain:
 
 The plugin's auto-retain (Stop hook) fires every turn, but in chunked mode each retain only processes a small recent window (~3 turns) — so storage stays prompt and cheap and survives restarts without re-sending the whole transcript, and you don't need to manually retain everything. Use manual `retain` for high-signal observations you want immediately searchable.
 
+### When to synthesize — concrete triggers
+
+Auto-recall and auto-retain keep the bank fed, but they never *synthesize* — that's on you, and it only happens if you act on these triggers. Each is paired with a deterministic backstop so nothing depends on you remembering:
+
+- **Reflect instead of hand-assembling.** When a question needs an answer *across many past memories* — "what did we decide about X", "summarize where Y stands", "have I seen this before" — call `mcp__hindsight__reflect` rather than firing several `recall`s and stitching the fragments yourself. Rule of thumb: if you're about to make 2+ manual `recall` calls to reconstruct one answer, that's a `reflect`. (Backstop: auto-recall already injects the top hits every turn — reflect is the escalation when those aren't enough, not a replacement.)
+- **Propose a model when you keep re-deriving.** When you notice you've rebuilt the *same standing answer* two or three sessions running — the recurring state of your specialty a user keeps asking around — stop re-deriving and propose a mental model via `mcp__switchroom-telegram__mental_model_propose(name, source_query)` (or run the `mental-model-curator` skill to survey the bank and propose the earned few). One organic proposal beats ten reflexive recalls. Don't propose for a one-off fact — that's a `retain`; don't propose identity/"who is the user" — profile banks own that.
+- **Merge or retire directives when they pile up.** Directives are capped at `MAX_DIRECTIVES=15` active per bank — past that, the lowest-priority ones are silently truncated from the `<active_directives>` recall block and never reach you. When directives start overlapping or reading stale, run the `mental-model-curator` skill's directive merge/retire pass (it proposes; deletes stay operator-approved). (Backstop: `switchroom doctor` WARNs at >12 and FAILs at >15 active directives, so the pile-up surfaces on the issues card even if you don't notice it in-session.)
+
 ## Sub-Agent Delegation
 
 The main session is for conversation. Execution belongs in sub-agents. Before making tool calls, classify the request:
