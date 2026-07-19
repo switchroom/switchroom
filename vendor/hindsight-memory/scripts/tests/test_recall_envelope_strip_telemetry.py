@@ -37,7 +37,7 @@ if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 
 import recall  # noqa: E402
-from lib.content import compose_recall_query  # noqa: E402
+from lib.content import compose_recall_query, strip_channel_envelope  # noqa: E402
 
 
 def _memory(text, mem_type="fact", mentioned_at="2026-01-01", mem_id=None):
@@ -317,6 +317,104 @@ class RecallTelemetryFields(_LogTestBase):
         self.assertFalse(timings["shared-bank"]["timed_out"])
 
 
+class TotalFailureStillLogs(_LogTestBase):
+    """Review finding 1 — a turn where every bank times out AND directives
+    are empty produces no injected block, yet the telemetry row (the exact
+    breach event the baseline counts) must still be written."""
+
+    def test_own_bank_timeout_no_directives_still_writes_row(self):
+        client = _RecordingClient(
+            memories=[],
+            directives=[],
+            bank_behaviour={"test-bank": socket.timeout("timed out")},
+        )
+        ctx, raw = _run_main_with(client, prompt=BARE)
+        # No block injected (no directives, no memories).
+        self.assertIsNone(ctx)
+        self.assertEqual(raw.strip(), "")
+        # …but the telemetry row exists and records the deadline hit.
+        entries = self._read_log()
+        self.assertEqual(len(entries), 1)
+        e = entries[0]
+        self.assertFalse(e["cache_hit"])
+        self.assertTrue(e["deadline_hit"])
+        self.assertEqual(e["result_count"], 0)
+        self.assertEqual(len(e["bank_timings"]), 1)
+        self.assertTrue(e["bank_timings"][0]["timed_out"])
+        self.assertIsInstance(e["total_elapsed_ms"], int)
+
+    def test_query_field_is_bounded_excerpt(self):
+        # Review finding 5 — the stored query is a bounded excerpt (≤200)
+        # even when the real query is long; query_chars keeps the full length.
+        long_tail = "auth flow " * 200  # ~2000 chars, well over the 800 cap
+        client = _RecordingClient(memories=[_memory("m", mem_id="m1")])
+        _run_main_with(client, prompt="decide " + long_tail)
+        e = self._read_log()[0]
+        self.assertLessEqual(len(e["query"]), 200)
+        # Full (post-truncation) length is still recorded separately.
+        self.assertGreater(e["query_chars"], 200)
+
+
+class CacheHitRowSchema(_LogTestBase):
+    """Review finding 3 — a cache-hit row carries the telemetry keys as
+    None/[] (no banks ran), never `deadline_hit: False`."""
+
+    def test_cache_hit_row_has_none_telemetry(self):
+        client = _RecordingClient(memories=[_memory("unused")])
+        with patch.object(recall, "_cache_ttl_secs", return_value=300), patch.object(
+            recall, "_cache_lookup", return_value="cached context block"
+        ):
+            _run_main_with(client, prompt=BARE)
+        # The cache hit returns before any client.recall call.
+        self.assertEqual(client.queries, [])
+        entries = self._read_log()
+        self.assertEqual(len(entries), 1)
+        e = entries[0]
+        self.assertTrue(e["cache_hit"])
+        self.assertIsNone(e["deadline_hit"])
+        self.assertEqual(e["bank_timings"], [])
+        self.assertIsNone(e["total_elapsed_ms"])
+        self.assertIsNone(e["directives_elapsed_ms"])
+        self.assertIsNone(e["query"])
+
+
+class MultiEnvelopeStrip(unittest.TestCase):
+    """Review finding 6 — strip_channel_envelope now sits on the live query
+    path, so a coalesced multi-envelope prompt must keep every inner text,
+    not just the first."""
+
+    def test_single_envelope_unchanged(self):
+        self.assertEqual(
+            strip_channel_envelope('<channel source="telegram">hello there</channel>'),
+            "hello there",
+        )
+
+    def test_bare_text_unchanged(self):
+        self.assertEqual(strip_channel_envelope("no envelope here"), "no envelope here")
+
+    def test_two_envelopes_are_coalesced(self):
+        content = (
+            '<channel source="telegram" chat_id="1">first message</channel>'
+            '<channel source="telegram" chat_id="1">second message</channel>'
+        )
+        out = strip_channel_envelope(content)
+        self.assertIn("first message", out)
+        self.assertIn("second message", out)
+        self.assertNotIn("<channel", out)
+        self.assertNotIn("chat_id", out)
+
+    def test_three_envelopes_with_interleaved_whitespace(self):
+        content = (
+            '<channel source="telegram">alpha</channel>\n'
+            '<channel source="telegram">beta</channel>\n'
+            '<channel source="telegram">gamma</channel>'
+        )
+        out = strip_channel_envelope(content)
+        for tok in ("alpha", "beta", "gamma"):
+            self.assertIn(tok, out)
+        self.assertNotIn("<channel", out)
+
+
 class TimeoutClassifier(unittest.TestCase):
     """Unit coverage for _is_timeout_error's classification."""
 
@@ -340,6 +438,33 @@ class TimeoutClassifier(unittest.TestCase):
 
     def test_connection_refused_is_not_timeout(self):
         self.assertFalse(recall._is_timeout_error(ConnectionRefusedError("refused")))
+
+    def test_http_504_wrapper_with_timed_out_body_is_not_timeout(self):
+        # Review finding 4 — lib.client wraps HTTP errors as
+        # `RuntimeError("HTTP <code> from <url>: <body>")`. A 502/504 body
+        # containing an upstream proxy's "timed out" text is a SERVER status,
+        # not a client-side read deadline.
+        self.assertFalse(
+            recall._is_timeout_error(
+                RuntimeError("HTTP 504 from http://h/recall: upstream request timed out")
+            )
+        )
+
+    def test_direct_httperror_is_not_timeout(self):
+        import urllib.error
+        exc = urllib.error.HTTPError(
+            url="http://h/recall", code=504, msg="Gateway Timeout", hdrs=None, fp=None
+        )
+        self.assertFalse(recall._is_timeout_error(exc))
+
+    def test_runtimeerror_causing_httperror_is_not_timeout(self):
+        import urllib.error
+        http = urllib.error.HTTPError(
+            url="http://h/recall", code=502, msg="Bad Gateway", hdrs=None, fp=None
+        )
+        wrapper = RuntimeError("wrapped: connection timed out")
+        wrapper.__cause__ = http
+        self.assertFalse(recall._is_timeout_error(wrapper))
 
 
 if __name__ == "__main__":

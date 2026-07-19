@@ -176,6 +176,15 @@ def _summarise_source_topics(results: list) -> dict:
 # `switchroom memory recall-log <agent>`.
 RECALL_LOG_FILE = "recall_log.jsonl"
 RECALL_LOG_MAX_LINES = 5000
+# Honest per-line upper-bound estimate for the size-gated trim (hindsight-
+# leverage PR 1, review finding 5). The A3-telemetry row (bounded query
+# excerpt ≤200 chars + bank_timings + memory_ids) runs ~700-900 bytes worst
+# case; 1024 is a safe upper bound. The size gate only reads+trims the file
+# when it plausibly exceeds the line cap, so it must OVER-estimate row size
+# (threshold = cap × upper-bound) — otherwise a file over the old 250 B/line
+# threshold but still under the line cap triggers a full-file read on every
+# hook (critical-path thrash) that never actually trims.
+RECALL_LOG_BYTES_PER_LINE_EST = 1024
 
 
 def _cache_ttl_secs() -> int:
@@ -526,6 +535,20 @@ def _is_timeout_error(exc: BaseException) -> bool:
     """
     if isinstance(exc, (socket.timeout, TimeoutError)):
         return True
+
+    # An HTTP status response is NEVER a client-side read deadline, even when
+    # its body says "upstream timed out" / "gateway timeout" (502/504). Rule
+    # these out BEFORE the message sniff below (review finding 4), both when
+    # the HTTPError is raised directly and when lib.client wraps it as
+    # `RuntimeError(f"HTTP {code} from {url}: {body}")` — whose body can carry
+    # a proxy's "timed out" text and would otherwise be misclassified.
+    cause = getattr(exc, "__cause__", None)
+    if isinstance(exc, urllib.error.HTTPError) or isinstance(cause, urllib.error.HTTPError):
+        return False
+    if re.match(r"HTTP \d+ from ", str(exc)):
+        return False
+
+    # A non-HTTP URLError (DNS, connection, read timeout) — inspect the reason.
     if isinstance(exc, urllib.error.URLError):
         reason = getattr(exc, "reason", None)
         if isinstance(reason, (socket.timeout, TimeoutError)):
@@ -533,7 +556,9 @@ def _is_timeout_error(exc: BaseException) -> bool:
         # Some stdlib versions stringify the timeout into the reason.
         if isinstance(reason, str) and "timed out" in reason.lower():
             return True
-    # Fall back to a message sniff for RuntimeError wrappers from lib.client.
+
+    # Fall back to a message sniff for RuntimeError wrappers from lib.client
+    # (non-HTTP failures — the HTTP-wrapper shape was ruled out above).
     return "timed out" in str(exc).lower()
 
 
@@ -559,13 +584,15 @@ def _write_recall_log(entry: dict) -> None:
         # under the cap and the trim path is a no-op.
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(line)
-        # Cheap rolling trim every ~50 writes (estimated by file size
-        # vs. 200 bytes/line average) to amortize the read cost.
+        # Size-gated trim: only pay the full-file read when the byte size
+        # says we plausibly exceed the line cap. The estimate is a per-line
+        # UPPER bound (see RECALL_LOG_BYTES_PER_LINE_EST) so we don't read on
+        # every hook once rows grew past the old 200 B/line assumption.
         try:
             size = os.path.getsize(log_path)
         except OSError:
             return
-        if size > RECALL_LOG_MAX_LINES * 250:
+        if size > RECALL_LOG_MAX_LINES * RECALL_LOG_BYTES_PER_LINE_EST:
             try:
                 with open(log_path, "r", encoding="utf-8") as f:
                     lines = f.readlines()
@@ -996,10 +1023,15 @@ def main():
                 # A3 stage-1 telemetry keys kept present for a uniformly
                 # queryable schema; a cache hit issues no bank HTTP, so there
                 # is no per-bank timing and no deadline pressure to record.
+                # All are None/[] (NOT False) so a cache-hit row is never
+                # miscounted as an observed no-timeout recall in the breach
+                # baseline — `deadline_hit is False` means "banks ran, none
+                # timed out"; `deadline_hit is None` means "no banks ran"
+                # (review finding 3).
                 "total_elapsed_ms": None,
                 "directives_elapsed_ms": None,
                 "bank_timings": [],
-                "deadline_hit": False,
+                "deadline_hit": None,
                 # PR6 — record the active topic on cache hits too so the
                 # log is uniformly queryable (cache_key now includes
                 # active_thread_id, so a hit means the prior recall was
@@ -1301,6 +1333,77 @@ def main():
     if placeholder_chat_id:
         update_placeholder(placeholder_chat_id, "💭 thinking")
 
+    # Switchroom #432 phase 4.3 — telemetry log. memory IDs (when
+    # available) let an operator confirm what was injected on a given turn.
+    # Failure-tolerant.
+    #
+    # Hoisted ABOVE the empty-block early-return (hindsight-leverage PR 1,
+    # review finding 1): a turn where every bank times out AND directives
+    # fail produces no directives_block and no memories_block — precisely the
+    # breach event the A3 baseline counts. Logging here (not after the return)
+    # guarantees every cache-MISS recall attempt records bank_timings /
+    # deadline_hit / total_elapsed_ms.
+    #
+    # NOTE on the PR-3 baseline denominator (review finding 2): a hook the
+    # Claude Code UserPromptSubmit ceiling *kills* mid-flight (sequential
+    # worst case ~18s > the 12s ceiling) never reaches this line, so a true
+    # ceiling breach manifests as a MISSING row, not a logged one. The
+    # baseline method is therefore two-signal: (a) ceiling-breach (total-drop)
+    # rate = recall-log rows-missing vs the UserPromptSubmit turn count over
+    # the window; (b) `deadline_hit` here = per-bank hard-timeout among the
+    # hooks that survived long enough to log. Neither number alone is the
+    # breach rate; PR 3's before/after must cite both.
+    _write_recall_log({
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "session_id": (session_id or "")[:32],
+        "bank_id": bank_id,
+        "additional_banks": additional_banks,
+        "query_chars": len(query),
+        # Switchroom A1 (hindsight-leverage PR 1) — a BOUNDED excerpt (≤200
+        # chars, review finding 5) of the envelope-stripped, truncated query
+        # actually sent to recall. Enough to assert no `<channel` substring
+        # reaches the embedding and to pair queries with hits (D2) without
+        # bloating each row (which would thrash the size-based trim below).
+        # `query_chars` above carries the full untruncated length.
+        "query": query[:200],
+        "result_count": len(results),
+        "directive_count": len(directives),
+        "demoted_count": demoted_count,
+        "overlap_dropped": overlap_dropped,
+        "capped": capped,
+        "pre_cap_count": pre_cap_count,
+        "memory_ids": [
+            m.get("id") for m in results
+            if isinstance(m, dict) and m.get("id")
+        ],
+        "cache_hit": False,
+        # Switchroom A3 stage-1 telemetry (hindsight-leverage PR 1) — per-bank
+        # latency + timeout breakdown, directives-fetch latency, total
+        # critical-path wall time, and a derived `deadline_hit` (any bank hit
+        # its hard per-request timeout). Accrues the fresh pre-A3 baseline the
+        # parallelism change measures against; the 17-26% figure it replaces is
+        # the stale 2026-05-24 pre-fix audit.
+        "total_elapsed_ms": int((time.monotonic() - recall_start_monotonic) * 1000),
+        "directives_elapsed_ms": directives_elapsed_ms,
+        "bank_timings": bank_timings,
+        "deadline_hit": any(bt["timed_out"] for bt in bank_timings),
+        # PR6 — instrumentation for binding-failure analysis.
+        # `active_thread_id`: the current prompt's topic (null on
+        # DM / fleet-shared). `source_topics`: distribution of
+        # source thread_ids in the recall set (before optional
+        # hard-filter). `topic_filter_mode`: "soft-preamble" or
+        # "hard-filter". `topic_dropped`: count dropped by hard
+        # filter. From these fields we can derive the cross-topic
+        # recall rate over time and decide whether to flip to
+        # hard-filter mode based on real data.
+        "active_thread_id": active_thread_id,
+        "active_topic_alias": active_topic_alias,
+        "source_topics": source_topic_summary,
+        "topic_filter_mode": topic_filter_mode,
+        "topic_dropped": topic_dropped,
+        "directive_nudge": bool(nudge_block),
+    })
+
     # If neither block has content, there's nothing to inject — exit
     # silently to avoid emitting an empty hookSpecificOutput. #2848: unless
     # the directive-capture nudge fired, in which case emit the nudge alone
@@ -1339,57 +1442,8 @@ def main():
         except Exception as e:
             debug_log(config, f"Recall cache write failed (non-fatal): {e}")
 
-    # Switchroom #432 phase 4.3 — telemetry log. memory IDs (when
-    # available) let an operator confirm what was injected on a given
-    # turn. Failure-tolerant.
-    _write_recall_log({
-        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "session_id": (session_id or "")[:32],
-        "bank_id": bank_id,
-        "additional_banks": additional_banks,
-        "query_chars": len(query),
-        # Switchroom A1 (hindsight-leverage PR 1) — the envelope-stripped,
-        # truncated query text actually sent to recall. Persisted so the
-        # query-hygiene acceptance check can assert no `<channel` substring
-        # ever reaches the embedding, and so D2 can pair queries with hits.
-        "query": query,
-        "result_count": len(results),
-        "directive_count": len(directives),
-        "demoted_count": demoted_count,
-        "overlap_dropped": overlap_dropped,
-        "capped": capped,
-        "pre_cap_count": pre_cap_count,
-        "memory_ids": [
-            m.get("id") for m in results
-            if isinstance(m, dict) and m.get("id")
-        ],
-        "cache_hit": False,
-        # Switchroom A3 stage-1 telemetry (hindsight-leverage PR 1) — per-bank
-        # latency + timeout breakdown, directives-fetch latency, total
-        # critical-path wall time, and a derived `deadline_hit` (any bank hit
-        # its hard per-request timeout). Accrues the fresh pre-A3 baseline the
-        # parallelism change measures against; the 17-26% figure it replaces is
-        # the stale 2026-05-24 pre-fix audit.
-        "total_elapsed_ms": int((time.monotonic() - recall_start_monotonic) * 1000),
-        "directives_elapsed_ms": directives_elapsed_ms,
-        "bank_timings": bank_timings,
-        "deadline_hit": any(bt["timed_out"] for bt in bank_timings),
-        # PR6 — instrumentation for binding-failure analysis.
-        # `active_thread_id`: the current prompt's topic (null on
-        # DM / fleet-shared). `source_topics`: distribution of
-        # source thread_ids in the recall set (before optional
-        # hard-filter). `topic_filter_mode`: "soft-preamble" or
-        # "hard-filter". `topic_dropped`: count dropped by hard
-        # filter. From these fields we can derive the cross-topic
-        # recall rate over time and decide whether to flip to
-        # hard-filter mode based on real data.
-        "active_thread_id": active_thread_id,
-        "active_topic_alias": active_topic_alias,
-        "source_topics": source_topic_summary,
-        "topic_filter_mode": topic_filter_mode,
-        "topic_dropped": topic_dropped,
-        "directive_nudge": bool(nudge_block),
-    })
+    # (Telemetry log already written above, before the empty-block return, so
+    # total-failure turns are recorded — hindsight-leverage PR 1 finding 1.)
 
     # Output JSON for Claude Code hook system. #2848: append the
     # directive-capture nudge (if it fired) at emit time — it's kept out of
