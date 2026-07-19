@@ -2963,6 +2963,17 @@ function renderHindsightSettingsOverrides(
   // =false (exported as HINDSIGHT_DIRECTIVE_CAPTURE_NUDGE only when overridden;
   // the env value wins over this settings.json default).
   settings.directiveCaptureNudge = true;
+  // hindsight-leverage PR5 — recall-side weight for sidechain (sub-agent)
+  // memories. The paired SubagentStop retain (vendor .../subagent_retain.py)
+  // tags delegated worker process-facts `sidechain`; this down-weights their
+  // recall `scores.final` by 0.8 so first-party session memory ranks first,
+  // while a sidechain fact still surfaces when it is the only relevant hit
+  // (a DOWN-RANK, not the hard demote-tag DROP filter). No first-class cascade
+  // knob yet (mirrors the intentionally-dormant recallTags port below);
+  // operators re-tune per-agent by setting HINDSIGHT_RECALL_TAG_WEIGHTS (a JSON
+  // object) via the agent's `env:` map in switchroom.yaml — the env value wins
+  // over this scaffold default (config.py ENV_OVERRIDES).
+  settings.recallTagWeights = { sidechain: 0.8 };
   // Static shared-bank recall (RFC reference/rfcs/per-speaker-memory-routing.md,
   // ship-B): recall these extra banks on every turn, merged into the agent's
   // own bank results. Sourced from memory.recall.additional_banks (cascaded);

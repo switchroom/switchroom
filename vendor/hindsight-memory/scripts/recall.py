@@ -562,6 +562,59 @@ def _is_timeout_error(exc: BaseException) -> bool:
     return "timed out" in str(exc).lower()
 
 
+def _apply_tag_weights(results, tag_weights) -> int:
+    """Multiply each result's ``scores.final`` by a per-tag weight in place.
+
+    Switchroom hindsight-leverage PR5 — the recall-side counterpart to the
+    ``sidechain`` retain tag. A NEW mechanism, deliberately distinct from the
+    demote-tag DROP filter (`_is_demoted_memory`): that path removes a tagged
+    memory from recall entirely, which cannot express "keep it, but rank it
+    lower". This step DOWN-WEIGHTS a memory's engine relevance score so a
+    penalised memory sorts below an equal-scoring un-penalised one at the sort
+    below, yet is still returned when it is the only relevant hit (the cap sees
+    the full penalised set, not a filtered one).
+
+    ``tag_weights`` is a ``{tag: multiplier}`` map. For each result, the
+    multipliers of ALL its tags that appear in the map are multiplied together
+    and applied to ``scores.final`` (so a memory carrying two penalised tags is
+    penalised compoundly — intended). Tags are matched case-sensitively after
+    ``strip()`` (consistent with ``_is_demoted_memory``). Results whose
+    ``scores.final`` is absent or non-numeric are left untouched — a score-less
+    entry already sorts last and there is nothing to scale. A weight of exactly
+    1.0 (or a non-positive / non-numeric weight) is a no-op for that tag.
+
+    Returns the number of results whose score was actually changed (for the
+    debug log). Mutation is intentional: the effective (post-weight) score is
+    what the sort, the cap, and the recall-log ranking should all reflect.
+    """
+    if not isinstance(tag_weights, dict) or not tag_weights:
+        return 0
+    changed = 0
+    for m in results:
+        if not isinstance(m, dict):
+            continue
+        tags = m.get("tags")
+        if not isinstance(tags, list):
+            continue
+        factor = 1.0
+        for tag in tags:
+            if not isinstance(tag, str):
+                continue
+            w = tag_weights.get(tag.strip())
+            if isinstance(w, (int, float)) and not isinstance(w, bool) and w > 0:
+                factor *= float(w)
+        if factor == 1.0:
+            continue
+        scores = m.get("scores")
+        if not isinstance(scores, dict):
+            continue
+        val = scores.get("final")
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            scores["final"] = float(val) * factor
+            changed += 1
+    return changed
+
+
 def _write_recall_log(entry: dict) -> None:
     """Append a JSONL line to recall_log.jsonl. Bounded by line count.
 
@@ -1256,6 +1309,17 @@ def main():
             )
     else:
         overlap_dropped = 0
+
+    # Switchroom hindsight-leverage PR5 — per-tag score penalty. Applied
+    # IMMEDIATELY before the relevance sort so a down-weighted tag (e.g.
+    # `sidechain: 0.8`) reorders the merged set without dropping anything. This
+    # is the "reduced weight" the demote-tag DROP filter above cannot express:
+    # a penalised memory ranks below equal-scoring untagged memories yet still
+    # survives the cap when it is the only relevant hit. See _apply_tag_weights.
+    tag_weights = config.get("recallTagWeights")
+    weighted = _apply_tag_weights(results, tag_weights)
+    if weighted > 0:
+        debug_log(config, f"Applied recallTagWeights to {weighted} memories: {tag_weights}")
 
     # Switchroom Phase-1 precision — sort the merged primary + additional-bank
     # result set by the engine's relevance score (`scores.final`) descending
