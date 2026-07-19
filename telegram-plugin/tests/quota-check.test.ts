@@ -118,6 +118,63 @@ describe('formatQuotaBlock', () => {
     })
     expect(block).toContain('Overage: disabled (spend_cap_reached)')
   })
+
+  it('renders "no data" (never a confident 0%) for an absent window header (F3)', () => {
+    // Adversarial-review F3 — a thin probe leaves the utilization field
+    // coalesced to 0 but flags the window absent. The legacy block renderer
+    // used to print a confident `0%`, indistinguishable from a genuine
+    // fresh-account 0%. Backport the modern card's handling: absent → no data.
+    const block = formatQuotaBlock({
+      fiveHourUtilizationPct: 0,
+      sevenDayUtilizationPct: 0,
+      fiveHourResetAt: null,
+      sevenDayResetAt: null,
+      representativeClaim: null,
+      overageStatus: null,
+      overageDisabledReason: null,
+      fiveHourUtilPresent: false,
+      sevenDayUtilPresent: false,
+    })
+    const fiveLine = block.split('\n').find((l) => l.includes('5h window'))!
+    const sevenLine = block.split('\n').find((l) => l.includes('7d window'))!
+    expect(fiveLine).toContain('no data')
+    expect(sevenLine).toContain('no data')
+    // The confident-0% lie must be gone.
+    expect(fiveLine).not.toContain('`0%`')
+    expect(sevenLine).not.toContain('`0%`')
+  })
+
+  it('still renders the percent when a window is present but genuinely 0% (F3 guard)', () => {
+    const block = formatQuotaBlock({
+      fiveHourUtilizationPct: 0,
+      sevenDayUtilizationPct: 0,
+      fiveHourResetAt: null,
+      sevenDayResetAt: null,
+      representativeClaim: null,
+      overageStatus: null,
+      overageDisabledReason: null,
+      fiveHourUtilPresent: true,
+      sevenDayUtilPresent: true,
+    })
+    expect(block).toContain('`0%`')
+    expect(block).not.toContain('no data')
+  })
+
+  it('renders the percent for legacy snapshots with no presence markers (F3 back-compat)', () => {
+    // Optional markers unset → real/legacy probe → render the number.
+    const block = formatQuotaBlock({
+      fiveHourUtilizationPct: 0,
+      sevenDayUtilizationPct: 5,
+      fiveHourResetAt: null,
+      sevenDayResetAt: null,
+      representativeClaim: null,
+      overageStatus: null,
+      overageDisabledReason: null,
+    })
+    expect(block).toContain('`0%`')
+    expect(block).toContain('`5%`')
+    expect(block).not.toContain('no data')
+  })
 })
 
 describe('fetchQuota', () => {

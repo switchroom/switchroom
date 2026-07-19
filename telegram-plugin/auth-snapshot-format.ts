@@ -1012,6 +1012,45 @@ export function zipProbeResults(
 }
 
 /**
+ * The freshness-marker subset of the /usage card's render opts. Mirrors the
+ * three mutually-prioritised fields on `UsageCardRenderOpts`
+ * (quota-bar-format.ts) without importing across the module — cache-stale >
+ * live > probe-failed.
+ */
+export interface UsageFooterFreshness {
+  staleCachedAtMs?: number;
+  liveProbedAtMs?: number;
+  probeFailed?: boolean;
+}
+
+/**
+ * Decide the /usage card's freshness footer from a broker probe response.
+ *
+ * Adversarial-review F1: the caller must NEVER stamp "Live" when no account
+ * row carries usable live data. A non-empty `results` array is NOT proof of
+ * that — opProbeQuota (src/auth/broker/server.ts) returns
+ * `{result:{ok:false}, served:"live"}` for a failed live probe against an
+ * empty cache, so every row can be `ok:false` while `results.length > 0`.
+ * `zipProbeResults` only marks `served==="cache"` rows stale, so those failed
+ * rows carry no cache stamp either. The honest signal is whether ANY row's
+ * `result.ok` is true.
+ *
+ * Precedence (highest first): cache-served data (`staleCachedAtMs`, real but
+ * stale) → live data present (`liveProbedAtMs`) → nothing usable
+ * (`probeFailed`). Extracted so the decision is unit-testable and can't drift
+ * back to a length check.
+ */
+export function deriveUsageFooterFreshness(
+  results: readonly ProbeQuotaResultRow[],
+  staleCachedAtMs: number | undefined,
+  liveProbedAtMs: number,
+): UsageFooterFreshness {
+  if (staleCachedAtMs != null) return { staleCachedAtMs };
+  if (results.some((r) => r.result.ok)) return { liveProbedAtMs };
+  return { probeFailed: true };
+}
+
+/**
  * Given the broker's `listState` data + a parallel array of live quota
  * results (same length, same order), return the AccountSnapshot[] the
  * formatters need.
