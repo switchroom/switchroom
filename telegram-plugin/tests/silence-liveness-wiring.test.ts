@@ -83,12 +83,17 @@ describe('silence-poke production-liveness — heartbeat safety', () => {
     // Structural guard so a refactor can't silently re-silence the re-ping
     // (the gateway IIFE can't be instantiated in-process — same pattern as the
     // heartbeat-safety assertions above).
-    const block = between(gatewaySrc, 'onFrameworkFallback: async (ctx) => {', '\nfunction trackRedeliveredInbound')
+    // #2996 P8 PR-C3: the fallback body moved verbatim to liveness-wiring.ts;
+    // the send itself is the injected `sendSilenceText(chat, thread, text,
+    // silent)` closure (gateway keeps the bot-api touch), so the gate now
+    // rides the closure's `silent` argument at the callsite.
+    const livenessSrc = readFileSync(resolve(__dirname, '..', 'gateway', 'liveness-wiring.ts'), 'utf-8')
+    const block = between(livenessSrc, 'onFrameworkFallback: async (ctx) => {', '\n  }\n}')
     expect(block.length).toBeGreaterThan(100) // sanity: slice found the handler body
     // The signal is derived once, hoisted above the update-status branch so it's
     // in scope at the send site.
     expect(block).toMatch(/const blockedOnApproval = activeStatusReactions/)
     // The send gates on it rather than hard-coding silent.
-    expect(block).toMatch(/disable_notification: blockedOnApproval \? false : true/)
+    expect(block).toMatch(/sendSilenceText\(ctx\.chatId, ctx\.threadId \?\? null, text, blockedOnApproval \? false : true\)/)
   })
 })
