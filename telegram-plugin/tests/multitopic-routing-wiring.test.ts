@@ -19,10 +19,13 @@ const sendPathSrc = readFileSync(
   'utf-8',
 )
 const sendReplyFn = sendPathSrc.split('export async function sendReply(')[1]?.split('\nexport ')[0] ?? ''
-const gatewaySrc = readFileSync(
-  resolve(__dirname, '..', 'gateway', 'gateway.ts'),
-  'utf-8',
-)
+const gatewaySrc =
+  readFileSync(resolve(__dirname, '..', 'gateway', 'gateway.ts'), 'utf-8') +
+  '\n' +
+  // P7 PR-10 (#2996): the InboundMessage envelope assembly (origin_turn_id,
+  // topic_scope, meta lane) moved verbatim into gateway/inbound-router.ts
+  // (buildInboundEnvelope) — include it in the scraped corpus.
+  readFileSync(resolve(__dirname, '..', 'gateway', 'inbound-router.ts'), 'utf-8')
 // #2996 P4-A: the enqueue handler (turn ctor: `const turnId = deriveTurnId`,
 // `rememberRecentTurn(next)`, `promoteQueuedStatus`) moved VERBATIM into
 // stream-render.ts with handleSessionEvent. Enqueue-seam assertions span both.
@@ -56,7 +59,7 @@ describe('component 3 — turn-origin reply routing', () => {
   })
 
   it('the inbound meta stamps origin_turn_id derived from chat/thread/messageId', () => {
-    expect(gatewaySrc).toMatch(/const originTurnId = deriveTurnId\(chat_id, messageThreadId \?\? null, msgId\)/)
+    expect(gatewaySrc).toMatch(/const originTurnId = deriveTurnId\((?:p\.)?chat_id, (?:p\.)?messageThreadId \?\? null, (?:p\.)?msgId\)/)
     expect(gatewaySrc).toMatch(/origin_turn_id: originTurnId/)
   })
 
@@ -142,7 +145,9 @@ describe('component 4 — per-turn topic framing', () => {
     expect(gatewaySrc).toMatch(/TOPIC_FRAMING_ENABLED/)
     expect(gatewaySrc).toMatch(/topic_scope: topicScope/)
     // Only for topic inbounds — DMs get nothing.
-    expect(gatewaySrc).toMatch(/TOPIC_FRAMING_ENABLED && messageThreadId != null/)
+    // P7 PR-10: the guard reads the injected constant + params inside
+    // buildInboundEnvelope (topicFramingEnabled / p.messageThreadId).
+    expect(gatewaySrc).toMatch(/(?:TOPIC_FRAMING_ENABLED|p\.topicFramingEnabled) && (?:p\.)?messageThreadId != null/)
   })
 
   it('the bridge instructions frame each channel message as the current topic', () => {
