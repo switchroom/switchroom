@@ -33,11 +33,17 @@ def strip_channel_envelope(content: str) -> str:
     This is the Claude Code equivalent of Openclaw's stripMetadataEnvelopes().
     Extracts the inner text, preserving the actual user message while removing
     transport metadata that Hindsight doesn't need.
+
+    A single prompt may carry MORE THAN ONE envelope (e.g. a coalesced
+    burst where several inbound messages were concatenated). Since this now
+    sits on the live recall-query path (hindsight-leverage PR 1, review
+    finding 6), coalesce EVERY envelope's inner text rather than keeping only
+    the first and silently dropping everything after the first ``</channel>``.
     """
-    # Match <channel ...>content</channel> — extract inner text
-    match = re.search(r"<channel\b[^>]*>([\s\S]*?)</channel>", content)
-    if match:
-        return match.group(1).strip()
+    # Match every <channel ...>content</channel> — extract & join inner texts.
+    matches = re.findall(r"<channel\b[^>]*>([\s\S]*?)</channel>", content)
+    if matches:
+        return "\n".join(m.strip() for m in matches if m.strip()).strip()
     return content
 
 
@@ -79,7 +85,14 @@ def compose_recall_query(
 
         <latest query>
     """
-    latest = latest_query.strip()
+    # Switchroom A1 (hindsight-leverage PR 1) — strip the <channel> envelope
+    # from the latest query INSIDE the helper as well, so any caller (present
+    # or future) gets an envelope-free composed query. The recall.py caller
+    # already strips before calling, but keeping the strip here is defence in
+    # depth: it guarantees the trailing latest-query segment appended below
+    # (and returned on the turns<=1 short-circuit) never carries the raw
+    # chat_id/ts/user XML noise into the embedding or the char cap.
+    latest = strip_channel_envelope(latest_query).strip()
     if recall_context_turns <= 1 or not isinstance(messages, list) or not messages:
         return latest
 

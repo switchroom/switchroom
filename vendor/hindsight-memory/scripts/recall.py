@@ -43,8 +43,10 @@ import hashlib
 import json
 import os
 import re
+import socket
 import sys
 import time
+import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -55,6 +57,7 @@ from lib.content import (
     compose_recall_query,
     format_current_time,
     format_memories,
+    strip_channel_envelope,
     truncate_recall_query,
 )
 from lib.daemon import get_api_url
@@ -173,6 +176,15 @@ def _summarise_source_topics(results: list) -> dict:
 # `switchroom memory recall-log <agent>`.
 RECALL_LOG_FILE = "recall_log.jsonl"
 RECALL_LOG_MAX_LINES = 5000
+# Honest per-line upper-bound estimate for the size-gated trim (hindsight-
+# leverage PR 1, review finding 5). The A3-telemetry row (bounded query
+# excerpt ≤200 chars + bank_timings + memory_ids) runs ~700-900 bytes worst
+# case; 1024 is a safe upper bound. The size gate only reads+trims the file
+# when it plausibly exceeds the line cap, so it must OVER-estimate row size
+# (threshold = cap × upper-bound) — otherwise a file over the old 250 B/line
+# threshold but still under the line cap triggers a full-file read on every
+# hook (critical-path thrash) that never actually trims.
+RECALL_LOG_BYTES_PER_LINE_EST = 1024
 
 
 def _cache_ttl_secs() -> int:
@@ -509,6 +521,47 @@ def _sort_by_final_score(results):
     return results
 
 
+def _is_timeout_error(exc: BaseException) -> bool:
+    """True if `exc` is (or wraps) a network read/connect timeout.
+
+    Switchroom A3 stage-1 telemetry (hindsight-leverage PR 1). The recall
+    HTTP path is `urllib.request.urlopen(..., timeout=8)`. On a hard timeout
+    urlopen raises either a bare ``socket.timeout`` / ``TimeoutError`` or a
+    ``urllib.error.URLError`` whose ``.reason`` is one of those. We classify
+    both so the per-bank ``timed_out`` flag (and the derived ``deadline_hit``)
+    distinguishes a bank that hit its deadline from one that failed fast
+    (5xx, connection refused, malformed response). Best-effort: anything we
+    can't positively identify as a timeout is treated as a non-timeout error.
+    """
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return True
+
+    # An HTTP status response is NEVER a client-side read deadline, even when
+    # its body says "upstream timed out" / "gateway timeout" (502/504). Rule
+    # these out BEFORE the message sniff below (review finding 4), both when
+    # the HTTPError is raised directly and when lib.client wraps it as
+    # `RuntimeError(f"HTTP {code} from {url}: {body}")` — whose body can carry
+    # a proxy's "timed out" text and would otherwise be misclassified.
+    cause = getattr(exc, "__cause__", None)
+    if isinstance(exc, urllib.error.HTTPError) or isinstance(cause, urllib.error.HTTPError):
+        return False
+    if re.match(r"HTTP \d+ from ", str(exc)):
+        return False
+
+    # A non-HTTP URLError (DNS, connection, read timeout) — inspect the reason.
+    if isinstance(exc, urllib.error.URLError):
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, (socket.timeout, TimeoutError)):
+            return True
+        # Some stdlib versions stringify the timeout into the reason.
+        if isinstance(reason, str) and "timed out" in reason.lower():
+            return True
+
+    # Fall back to a message sniff for RuntimeError wrappers from lib.client
+    # (non-HTTP failures — the HTTP-wrapper shape was ruled out above).
+    return "timed out" in str(exc).lower()
+
+
 def _write_recall_log(entry: dict) -> None:
     """Append a JSONL line to recall_log.jsonl. Bounded by line count.
 
@@ -531,13 +584,15 @@ def _write_recall_log(entry: dict) -> None:
         # under the cap and the trim path is a no-op.
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(line)
-        # Cheap rolling trim every ~50 writes (estimated by file size
-        # vs. 200 bytes/line average) to amortize the read cost.
+        # Size-gated trim: only pay the full-file read when the byte size
+        # says we plausibly exceed the line cap. The estimate is a per-line
+        # UPPER bound (see RECALL_LOG_BYTES_PER_LINE_EST) so we don't read on
+        # every hook once rows grew past the old 200 B/line assumption.
         try:
             size = os.path.getsize(log_path)
         except OSError:
             return
-        if size > RECALL_LOG_MAX_LINES * 250:
+        if size > RECALL_LOG_MAX_LINES * RECALL_LOG_BYTES_PER_LINE_EST:
             try:
                 with open(log_path, "r", encoding="utf-8") as f:
                     lines = f.readlines()
@@ -959,11 +1014,24 @@ def main():
                 "bank_id": bank_id,
                 "additional_banks": additional_banks,
                 "query_chars": len(prompt),
+                "query": None,  # no recall query composed on a cache hit
                 "result_count": None,  # not known on cache hit
                 "directive_count": None,
                 "demoted_count": 0,
                 "capped": False,
                 "cache_hit": True,
+                # A3 stage-1 telemetry keys kept present for a uniformly
+                # queryable schema; a cache hit issues no bank HTTP, so there
+                # is no per-bank timing and no deadline pressure to record.
+                # All are None/[] (NOT False) so a cache-hit row is never
+                # miscounted as an observed no-timeout recall in the breach
+                # baseline — `deadline_hit is False` means "banks ran, none
+                # timed out"; `deadline_hit is None` means "no banks ran"
+                # (review finding 3).
+                "total_elapsed_ms": None,
+                "directives_elapsed_ms": None,
+                "bank_timings": [],
+                "deadline_hit": None,
                 # PR6 — record the active topic on cache hits too so the
                 # log is uniformly queryable (cache_key now includes
                 # active_thread_id, so a hit means the prior recall was
@@ -976,6 +1044,12 @@ def main():
             return
         debug_log(config, f"Recall cache MISS (key={cache_key[:12]}…)")
 
+    # Switchroom A3 stage-1 telemetry (hindsight-leverage PR 1). Wall-clock
+    # start for the recall critical path (mission ensure + transcript read +
+    # directives fetch + every bank recall). Feeds `total_elapsed_ms` in the
+    # log so a fresh pre-parallelism (pre-A3) breach baseline can accrue.
+    recall_start_monotonic = time.monotonic()
+
     # Set bank mission on first use
     ensure_bank_mission(client, bank_id, config, debug_fn=_dbg)
 
@@ -984,15 +1058,26 @@ def main():
     recall_max_query_chars = config.get("recallMaxQueryChars", 800)
     recall_roles = config.get("recallRoles", ["user", "assistant"])
 
+    # Switchroom A1 (hindsight-leverage PR 1) — strip the <channel …> transport
+    # envelope from the prompt ONCE, before both the single-turn and multi-turn
+    # branches, so ~100-200 chars of chat_id/ts/user XML noise never reach the
+    # embedding or consume the recallMaxQueryChars cap. `prompt` itself is left
+    # untouched (the ack/nudge gates and cache-hit log-length field still want
+    # the raw form); only the value fed to the recall query is stripped.
+    # compose_recall_query also strips its latest_query internally (defence in
+    # depth), but we strip here too so the single-turn path and
+    # truncate_recall_query's latest_query arg are both envelope-free.
+    recall_query_text = strip_channel_envelope(prompt)
+
     if recall_context_turns > 1:
         transcript_path = hook_input.get("transcript_path", "")
         messages = read_transcript_messages(transcript_path)
         debug_log(config, f"Multi-turn context: {recall_context_turns} turns, {len(messages)} messages from transcript")
-        query = compose_recall_query(prompt, messages, recall_context_turns, recall_roles)
+        query = compose_recall_query(recall_query_text, messages, recall_context_turns, recall_roles)
     else:
-        query = prompt
+        query = recall_query_text
 
-    query = truncate_recall_query(query, prompt, recall_max_query_chars)
+    query = truncate_recall_query(query, recall_query_text, recall_max_query_chars)
 
     # Final defensive cap (mirrors Openclaw)
     if len(query) > recall_max_query_chars:
@@ -1007,13 +1092,23 @@ def main():
     # `reflect`); `list_directives` itself works correctly upstream, so this
     # is a pure client-side surface. fetch_active_directives is failure-safe
     # and returns [] on any error.
+    _directives_start = time.monotonic()
     directives = fetch_active_directives(client, bank_id)
+    directives_elapsed_ms = int((time.monotonic() - _directives_start) * 1000)
     directives_block = format_active_directives_block(directives) if directives else None
     if directives_block:
         debug_log(config, f"Injecting {len(directives)} active directives")
 
     # Call Hindsight recall API
+    #
+    # Switchroom A3 stage-1 telemetry — per-bank timing + timeout flag.
+    # `bank_timings` accumulates one record per bank queried (own bank first,
+    # then each additional bank) so the log carries a per-bank latency and
+    # deadline-hit breakdown ahead of the A3 parallelism change.
+    bank_timings = []
     results = []
+    _own_bank_start = time.monotonic()
+    _own_bank_timed_out = False
     try:
         response = client.recall(
             bank_id=bank_id,
@@ -1043,10 +1138,16 @@ def main():
         )
         results = response.get("results", [])
     except Exception as e:
+        _own_bank_timed_out = _is_timeout_error(e)
         print(f"[Hindsight] Recall failed: {e}", file=sys.stderr)
         # Fall through — we still want to emit the directives block if we
         # have one, so a recall API failure doesn't blind the agent to
         # its own active directives.
+    bank_timings.append({
+        "bank_id": bank_id,
+        "elapsed_ms": int((time.monotonic() - _own_bank_start) * 1000),
+        "timed_out": _own_bank_timed_out,
+    })
 
     # Also recall from any additional banks (e.g. shared user profile bank).
     # `additional_banks` was already extracted above the cache check so the
@@ -1066,6 +1167,8 @@ def main():
             "recallTagsMatch",
             tags_match if extra_tags or extra_tag_groups else None,
         )
+        _extra_start = time.monotonic()
+        _extra_timed_out = False
         try:
             extra_response = client.recall(
                 bank_id=extra_bank_id,
@@ -1095,7 +1198,13 @@ def main():
                 debug_log(config, f"Got {len(extra_results)} memories from additional bank '{extra_bank_id}'")
                 results = results + extra_results
         except Exception as e:
+            _extra_timed_out = _is_timeout_error(e)
             debug_log(config, f"Recall from additional bank '{extra_bank_id}' failed: {e}")
+        bank_timings.append({
+            "bank_id": extra_bank_id,
+            "elapsed_ms": int((time.monotonic() - _extra_start) * 1000),
+            "timed_out": _extra_timed_out,
+        })
 
     # Switchroom #432 phase 4.4 — drop demote-tagged memories before
     # the cap. Filtering early means the cap kicks in over the
@@ -1224,6 +1333,77 @@ def main():
     if placeholder_chat_id:
         update_placeholder(placeholder_chat_id, "💭 thinking")
 
+    # Switchroom #432 phase 4.3 — telemetry log. memory IDs (when
+    # available) let an operator confirm what was injected on a given turn.
+    # Failure-tolerant.
+    #
+    # Hoisted ABOVE the empty-block early-return (hindsight-leverage PR 1,
+    # review finding 1): a turn where every bank times out AND directives
+    # fail produces no directives_block and no memories_block — precisely the
+    # breach event the A3 baseline counts. Logging here (not after the return)
+    # guarantees every cache-MISS recall attempt records bank_timings /
+    # deadline_hit / total_elapsed_ms.
+    #
+    # NOTE on the PR-3 baseline denominator (review finding 2): a hook the
+    # Claude Code UserPromptSubmit ceiling *kills* mid-flight (sequential
+    # worst case ~18s > the 12s ceiling) never reaches this line, so a true
+    # ceiling breach manifests as a MISSING row, not a logged one. The
+    # baseline method is therefore two-signal: (a) ceiling-breach (total-drop)
+    # rate = recall-log rows-missing vs the UserPromptSubmit turn count over
+    # the window; (b) `deadline_hit` here = per-bank hard-timeout among the
+    # hooks that survived long enough to log. Neither number alone is the
+    # breach rate; PR 3's before/after must cite both.
+    _write_recall_log({
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "session_id": (session_id or "")[:32],
+        "bank_id": bank_id,
+        "additional_banks": additional_banks,
+        "query_chars": len(query),
+        # Switchroom A1 (hindsight-leverage PR 1) — a BOUNDED excerpt (≤200
+        # chars, review finding 5) of the envelope-stripped, truncated query
+        # actually sent to recall. Enough to assert no `<channel` substring
+        # reaches the embedding and to pair queries with hits (D2) without
+        # bloating each row (which would thrash the size-based trim below).
+        # `query_chars` above carries the full untruncated length.
+        "query": query[:200],
+        "result_count": len(results),
+        "directive_count": len(directives),
+        "demoted_count": demoted_count,
+        "overlap_dropped": overlap_dropped,
+        "capped": capped,
+        "pre_cap_count": pre_cap_count,
+        "memory_ids": [
+            m.get("id") for m in results
+            if isinstance(m, dict) and m.get("id")
+        ],
+        "cache_hit": False,
+        # Switchroom A3 stage-1 telemetry (hindsight-leverage PR 1) — per-bank
+        # latency + timeout breakdown, directives-fetch latency, total
+        # critical-path wall time, and a derived `deadline_hit` (any bank hit
+        # its hard per-request timeout). Accrues the fresh pre-A3 baseline the
+        # parallelism change measures against; the 17-26% figure it replaces is
+        # the stale 2026-05-24 pre-fix audit.
+        "total_elapsed_ms": int((time.monotonic() - recall_start_monotonic) * 1000),
+        "directives_elapsed_ms": directives_elapsed_ms,
+        "bank_timings": bank_timings,
+        "deadline_hit": any(bt["timed_out"] for bt in bank_timings),
+        # PR6 — instrumentation for binding-failure analysis.
+        # `active_thread_id`: the current prompt's topic (null on
+        # DM / fleet-shared). `source_topics`: distribution of
+        # source thread_ids in the recall set (before optional
+        # hard-filter). `topic_filter_mode`: "soft-preamble" or
+        # "hard-filter". `topic_dropped`: count dropped by hard
+        # filter. From these fields we can derive the cross-topic
+        # recall rate over time and decide whether to flip to
+        # hard-filter mode based on real data.
+        "active_thread_id": active_thread_id,
+        "active_topic_alias": active_topic_alias,
+        "source_topics": source_topic_summary,
+        "topic_filter_mode": topic_filter_mode,
+        "topic_dropped": topic_dropped,
+        "directive_nudge": bool(nudge_block),
+    })
+
     # If neither block has content, there's nothing to inject — exit
     # silently to avoid emitting an empty hookSpecificOutput. #2848: unless
     # the directive-capture nudge fired, in which case emit the nudge alone
@@ -1262,42 +1442,8 @@ def main():
         except Exception as e:
             debug_log(config, f"Recall cache write failed (non-fatal): {e}")
 
-    # Switchroom #432 phase 4.3 — telemetry log. memory IDs (when
-    # available) let an operator confirm what was injected on a given
-    # turn. Failure-tolerant.
-    _write_recall_log({
-        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "session_id": (session_id or "")[:32],
-        "bank_id": bank_id,
-        "additional_banks": additional_banks,
-        "query_chars": len(query),
-        "result_count": len(results),
-        "directive_count": len(directives),
-        "demoted_count": demoted_count,
-        "overlap_dropped": overlap_dropped,
-        "capped": capped,
-        "pre_cap_count": pre_cap_count,
-        "memory_ids": [
-            m.get("id") for m in results
-            if isinstance(m, dict) and m.get("id")
-        ],
-        "cache_hit": False,
-        # PR6 — instrumentation for binding-failure analysis.
-        # `active_thread_id`: the current prompt's topic (null on
-        # DM / fleet-shared). `source_topics`: distribution of
-        # source thread_ids in the recall set (before optional
-        # hard-filter). `topic_filter_mode`: "soft-preamble" or
-        # "hard-filter". `topic_dropped`: count dropped by hard
-        # filter. From these fields we can derive the cross-topic
-        # recall rate over time and decide whether to flip to
-        # hard-filter mode based on real data.
-        "active_thread_id": active_thread_id,
-        "active_topic_alias": active_topic_alias,
-        "source_topics": source_topic_summary,
-        "topic_filter_mode": topic_filter_mode,
-        "topic_dropped": topic_dropped,
-        "directive_nudge": bool(nudge_block),
-    })
+    # (Telemetry log already written above, before the empty-block return, so
+    # total-failure turns are recorded — hindsight-leverage PR 1 finding 1.)
 
     # Output JSON for Claude Code hook system. #2848: append the
     # directive-capture nudge (if it fired) at emit time — it's kept out of
