@@ -120,6 +120,7 @@ import {
   interceptStopKeyword,
   interceptInterruptMarker,
   interceptPermissionReply,
+  interceptAuthAdd,
   type InboundInterceptorDeps,
 } from './inbound-interceptors.js'
 import {
@@ -15410,6 +15411,19 @@ const inboundInterceptorDeps: InboundInterceptorDeps = {
   resumeReactionAfterVerdict,
   pendingPermissions,
   postPermissionResumeMessage,
+  pendingAuthAddFlows,
+  looksLikeAuthCode,
+  reauthInterceptTtlMs: REAUTH_INTERCEPT_TTL_MS,
+  submitAccountAuthCode,
+  addAccountViaBroker,
+  cleanAuthAddScratchDir,
+  cancelAccountAuthSession,
+  switchroomReply,
+  escapeHtmlForTg,
+  redactAuthCode: (chatId, redactMsgId) =>
+    redactAuthCodeMessage(redactAuthCodeApi as never, chatId, redactMsgId, line =>
+      process.stderr.write(line),
+    ),
 }
 
 export async function handleInbound(
@@ -15700,52 +15714,14 @@ export async function handleInbound(
   // separate /auth add flow pending (security: prevents cross-topic
   // credential mis-attribution).
   const interceptKey = chatKey(chat_id, messageThreadId) as string
-  const pendingAdd = pendingAuthAddFlows.get(interceptKey)
-  if (pendingAdd && looksLikeAuthCode(text)) {
-    const elapsed = Date.now() - pendingAdd.startedAt
-    if (elapsed < REAUTH_INTERCEPT_TTL_MS) {
-      pendingAuthAddFlows.delete(interceptKey)
-      try {
-        const credentials = await submitAccountAuthCode(pendingAdd, text.trim())
-        try {
-          await addAccountViaBroker(pendingAdd.label, credentials, { replace: false })
-          // success — wipe scratch dir now that the broker owns the creds
-          cleanAuthAddScratchDir(pendingAdd.scratchDir)
-          await switchroomReply(
-            ctx,
-            `✓ Account \`${pendingAdd.label}\` added.\n` +
-              `The fleet's active account hasn't changed. Send ` +
-              `\`/auth use ${escapeHtmlForTg(pendingAdd.label)}\` to switch to it.`,
-            { html: true },
-          )
-        } catch (brokerErr) {
-          // Broker rejected (e.g. label already exists). Wipe scratch
-          // either way — the credentials are useless without broker
-          // bookkeeping.
-          cleanAuthAddScratchDir(pendingAdd.scratchDir)
-          await switchroomReply(
-            ctx,
-            `**/auth add failed at broker:** ${escapeHtmlForTg((brokerErr as Error)?.message ?? String(brokerErr))}`,
-            { html: true },
-          )
-        }
-      } catch (err) {
-        // submitAccountAuthCode wiped the scratch dir on its own
-        // failure paths (timeout, child exit, stdin broken).
-        await switchroomReply(
-          ctx,
-          `**/auth add code failed:** ${escapeHtmlForTg((err as Error)?.message ?? String(err))}`,
-          { html: true },
-        )
-      }
-      // Redact the OAuth code paste from chat history (#488).
-      redactAuthCodeMessage(redactAuthCodeApi as never, chat_id, msgId ?? null, line => process.stderr.write(line))
-      return
-    }
-    // Stale — drop the pending entry but let the message fall through
-    // to other intercepts (defensively wipe scratch).
-    cancelAccountAuthSession(pendingAdd)
-    pendingAuthAddFlows.delete(interceptKey)
+  // (moved to interceptAuthAdd, #2996 P7 PR-5; the anchor literal
+  // pendingAuthAddFlows.get(interceptKey) lives inside the delegation now)
+  {
+    const authAddOutcome = await interceptAuthAdd(
+      { ctx, text, chat_id, msgId, interceptKey },
+      inboundInterceptorDeps,
+    )
+    if (authAddOutcome.handled) return
   }
 
   // Loopback OAuth relay paste-back intercept (issue #2582) — sibling to

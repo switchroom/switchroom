@@ -59,7 +59,9 @@ describe('gateway: inbound machine-emit is deferred past the intercepts', () => 
 
   it('emits AFTER the `/auth add` paste-back intercept', () => {
     const emitIdx = inboundEmitOffset()
-    const authIdx = GATEWAY_SRC.indexOf('pendingAuthAddFlows.get(interceptKey)')
+    // P7 PR-5: the intercept body moved to inbound-interceptors.ts; the
+    // gateway call site is the ordering anchor now.
+    const authIdx = GATEWAY_SRC.indexOf('interceptAuthAdd(')
     expect(authIdx).toBeGreaterThan(0)
     expect(emitIdx).toBeGreaterThan(authIdx)
   })
