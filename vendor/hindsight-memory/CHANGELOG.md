@@ -23,6 +23,29 @@
 
 ### Added (switchroom divergence)
 
+- **recall.py: parallel multi-bank recall under one shared deadline**
+  (switchroom hindsight-leverage PR3, workstream A3 stage 2). The directives
+  fetch and every bank recall (own + additional/profile/shared/sender banks)
+  now run CONCURRENTLY in daemon threads via `lib/parallel_recall.py`
+  (`run_parallel`), bounded by ONE shared deadline
+  (`recallParallelDeadlineSeconds`, default 10 = the 12s UserPromptSubmit hook
+  ceiling minus 2s headroom). Serially the round-trips SUM, so a heavy
+  multi-bank agent could breach the ceiling and drop recall entirely; parallel
+  makes the critical path the SLOWEST slot. A slot still running at the deadline
+  is abandoned (daemon thread, reaped on process exit) and marked `timed_out` —
+  a straggler bank can never hold the hook open past its ceiling; `recall.py`'s
+  `__main__` additionally `os._exit(0)`s (after a stdout flush) as a
+  belt-and-suspenders. The directives slot is dedicated and composes with the A4
+  directives cache (a cache HIT returns near-instantly with no HTTP). Env-gated
+  rollback: `HINDSIGHT_RECALL_PARALLEL=false` restores the pre-A3 serial path.
+  The `deadline_hit` telemetry field (shipped interim in PR1) is FINALIZED:
+  True when any bank raised a hard per-request timeout OR any bank/directives
+  slot was abandoned at the shared deadline; serial mode reduces to the pre-A3
+  per-bank-only form so both modes' `recall_log.jsonl` rows stay comparable in
+  the breach baseline. New log fields: `recall_mode`, `deadline_budget_ms`,
+  `directives_timed_out`. Acceptance: `scripts/tests/test_recall_parallel_deadline.py`
+  (stub-timing tests proving a 3s bank cannot breach a 0.6s deadline).
+
 - **SubagentStop sidechain retain** (switchroom hindsight-leverage PR5). New
   `scripts/subagent_retain.py`, registered on the `SubagentStop` event in
   `hooks/hooks.json` (async, 15s). Delegated (Task-tool / sub-agent) work was

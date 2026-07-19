@@ -67,10 +67,16 @@ from lib.directives import (
     format_active_directives_block,
 )
 from lib.gateway_ipc import extract_chat_id_from_prompt, extract_topic_from_prompt, extract_user_from_prompt, update_placeholder
+from lib.parallel_recall import run_parallel
 from lib.state import read_state, write_state
 
 LAST_RECALL_STATE = "last_recall.json"
 RECALL_CACHE_STATE = "recall_cache.json"
+
+# Switchroom hindsight-leverage A3 — label for the directives fetch slot in the
+# parallel fan-out. Distinct from any bank_id (banks can't start with "__") so a
+# bank named "directives" never collides with the directives slot.
+DIRECTIVES_SLOT = "__directives__"
 
 # Switchroom #424 phase 4.1 — per-session recall cache.
 #
@@ -1126,6 +1132,11 @@ def main():
                 "directives_elapsed_ms": None,
                 "bank_timings": [],
                 "deadline_hit": None,
+                # A3 — no banks ran on a cache hit, so mode/deadline are null
+                # for a uniformly queryable schema (never "serial"/"parallel").
+                "recall_mode": None,
+                "deadline_budget_ms": None,
+                "directives_timed_out": None,
                 # PR6 — record the active topic on cache hits too so the
                 # log is uniformly queryable (cache_key now includes
                 # active_thread_id, so a hit means the prior recall was
@@ -1190,82 +1201,68 @@ def main():
     # is a pure client-side surface. fetch_active_directives_cached is
     # failure-safe and returns [] on any error.
     #
-    # A4: cache the list with a short TTL (invalidated in-session by
+    # A4: cache the directives list with a short TTL (invalidated in-session by
     # directive_verify.py on a directive write) so the common no-write turn
     # skips the HTTP round-trip. TTL=0 disables the cache (live every turn).
-    # The A3 timing wrapper below measures the fetch either way — on a cache
-    # HIT directives_elapsed_ms reads ~0 (that is the A4 latency win, not a
-    # telemetry regression).
-    _directives_start = time.monotonic()
-    directives = fetch_active_directives_cached(
-        client,
-        bank_id,
-        ttl_seconds=config.get("directivesCacheTtlSeconds", DIRECTIVES_CACHE_TTL_SECONDS),
-    )
-    directives_elapsed_ms = int((time.monotonic() - _directives_start) * 1000)
-    directives_block = format_active_directives_block(directives) if directives else None
-    if directives_block:
-        debug_log(config, f"Injecting {len(directives)} active directives")
-
-    # Call Hindsight recall API
     #
-    # Switchroom A3 stage-1 telemetry — per-bank timing + timeout flag.
-    # `bank_timings` accumulates one record per bank queried (own bank first,
-    # then each additional bank) so the log carries a per-bank latency and
-    # deadline-hit breakdown ahead of the A3 parallelism change.
-    bank_timings = []
-    results = []
-    _own_bank_start = time.monotonic()
-    _own_bank_timed_out = False
-    try:
-        response = client.recall(
-            bank_id=bank_id,
-            query=query,
-            max_tokens=config.get("recallMaxTokens", 1024),
-            budget=config.get("recallBudget", "mid"),
-            types=config.get("recallTypes"),
-            # Upstream 962140eef — optional tag filters (resolved above the
-            # cache check; part of the cache key).
-            tags=recall_tags,
-            tags_match=tags_match,
-            tag_groups=tag_groups,
-            # Switchroom Phase-1 precision — prefer deduped observation
-            # statements over the raw facts they supersede, backfilling freed
-            # slots for denser coverage inside the same budget. On by default;
-            # operators can pin off via `recallPreferObservations: false`.
-            prefer_observations=config.get("recallPreferObservations", True),
-            # 8s in-script timeout leaves 4s headroom inside the 12s
-            # UserPromptSubmit hook ceiling (see hooks.json:20) for cache
-            # write + block formatting. Tightened from 10s in switchroom
-            # v0.13.22: the 2026-05-24 audit showed 17-26% of turns
-            # breaching the 12s hook timeout on heavy agents (finn /
-            # gymbro / klanker), which dropped the recall entirely; an
-            # earlier-hard-timeout failure returns cleanly with no
-            # memories instead of blowing past the hook ceiling.
-            timeout=8,
-        )
-        results = response.get("results", [])
-    except Exception as e:
-        _own_bank_timed_out = _is_timeout_error(e)
-        print(f"[Hindsight] Recall failed: {e}", file=sys.stderr)
-        # Fall through — we still want to emit the directives block if we
-        # have one, so a recall API failure doesn't blind the agent to
-        # its own active directives.
-    bank_timings.append({
-        "bank_id": bank_id,
-        "elapsed_ms": int((time.monotonic() - _own_bank_start) * 1000),
-        "timed_out": _own_bank_timed_out,
-    })
+    # Switchroom hindsight-leverage A3 — the directives fetch and every bank
+    # recall run CONCURRENTLY (daemon threads) under ONE shared deadline instead
+    # of serially. Serially their latencies SUM (own bank + N extra banks +
+    # directives), and a heavy multi-bank agent can breach the 12s
+    # UserPromptSubmit ceiling — dropping recall for the turn. Parallel makes the
+    # critical path the SLOWEST slot, bounded by `recallParallelDeadlineSeconds`
+    # (the hook ceiling minus 2s headroom). A slot still running at the deadline
+    # is abandoned (daemon thread, reaped on process exit) and marked timed_out —
+    # a straggler bank can never push the hook past its ceiling.
+    # HINDSIGHT_RECALL_PARALLEL=false restores the serial path (rollback lever).
+    # The directives slot composes with the A4 cache: on a cache HIT it returns
+    # near-instantly with no HTTP, so directives_elapsed_ms reads ~0.
 
-    # Also recall from any additional banks (e.g. shared user profile bank).
-    # `additional_banks` was already extracted above the cache check so the
-    # cache key reflects every bank queried; reuse that local instead of
-    # re-reading config.
+    def _directives_task():
+        return fetch_active_directives_cached(
+            client,
+            bank_id,
+            ttl_seconds=config.get("directivesCacheTtlSeconds", DIRECTIVES_CACHE_TTL_SECONDS),
+        )
+
+    def _make_bank_task(target_bank_id, b_tags, b_tags_match, b_tag_groups):
+        def _bank_task():
+            return client.recall(
+                bank_id=target_bank_id,
+                query=query,
+                max_tokens=config.get("recallMaxTokens", 1024),
+                budget=config.get("recallBudget", "mid"),
+                types=config.get("recallTypes"),
+                # Upstream 962140eef — optional per-bank tag filters (resolved
+                # above the cache check; part of the cache key).
+                tags=b_tags,
+                tags_match=b_tags_match,
+                tag_groups=b_tag_groups,
+                # Switchroom Phase-1 precision — prefer deduped observation
+                # statements over the raw facts they supersede, backfilling freed
+                # slots for denser coverage inside the same budget. On by default;
+                # operators can pin off via `recallPreferObservations: false`.
+                prefer_observations=config.get("recallPreferObservations", True),
+                # 8s in-script per-request timeout: even parallelised, each bank
+                # carries its own hard deadline so a single hung bank returns
+                # cleanly with no memories rather than sitting on the shared
+                # deadline. Tightened from 10s in v0.13.22 (2026-05-24 breach
+                # audit); the shared deadline below is the outer ceiling guard.
+                timeout=8,
+            )
+        return _bank_task
+
+    # Resolve (bank_id, tags, tags_match, tag_groups) for every bank we query —
+    # own bank first, then each additional bank in config order. This order is
+    # preserved for bank_timings and the result-merge sequence regardless of
+    # thread completion order, so the emitted telemetry is deterministic.
+    # `additional_banks` was extracted above the cache check (so the cache key
+    # reflects every bank queried); reuse that local.
+    bank_specs = [(bank_id, recall_tags, tags_match, tag_groups)]
     for extra_bank_id in additional_banks:
-        # Upstream 962140eef — per-bank tag-filter overrides; fall back to
-        # the global filters when the bank has no entry. Applies uniformly
-        # to config-listed banks and sender banks appended by
-        # _resolve_sender_bank (both flow through `additional_banks`).
+        # Upstream 962140eef — per-bank tag-filter overrides; fall back to the
+        # global filters when the bank has no entry. Applies uniformly to
+        # config-listed banks and sender banks appended by _resolve_sender_bank.
         extra_filter = additional_bank_filters.get(extra_bank_id, {})
         if not isinstance(extra_filter, dict):
             extra_filter = {}
@@ -1275,44 +1272,118 @@ def main():
             "recallTagsMatch",
             tags_match if extra_tags or extra_tag_groups else None,
         )
-        _extra_start = time.monotonic()
-        _extra_timed_out = False
-        try:
-            extra_response = client.recall(
-                bank_id=extra_bank_id,
-                query=query,
-                max_tokens=config.get("recallMaxTokens", 1024),
-                budget=config.get("recallBudget", "mid"),
-                types=config.get("recallTypes"),
-                tags=extra_tags,
-                tags_match=extra_tags_match,
-                tag_groups=extra_tag_groups,
-                # Switchroom Phase-1 precision — prefer deduped observation
-                # statements here too so additional banks contribute their
-                # densest statements to the merged, score-sorted set.
-                prefer_observations=config.get("recallPreferObservations", True),
-                # 8s in-script timeout leaves 4s headroom inside the 12s
-                # UserPromptSubmit hook ceiling (see hooks.json:20) for cache
-                # write + block formatting. Tightened from 10s in switchroom
-                # v0.13.22: the 2026-05-24 audit showed 17-26% of turns
-                # breaching the 12s hook timeout on heavy agents (finn /
-                # gymbro / klanker), which dropped the recall entirely; an
-                # earlier-hard-timeout failure returns cleanly with no
-                # memories instead of blowing past the hook ceiling.
-                timeout=8,
+        bank_specs.append((extra_bank_id, extra_tags, extra_tags_match, extra_tag_groups))
+
+    recall_parallel = bool(config.get("recallParallel", True))
+    try:
+        deadline_seconds = float(config.get("recallParallelDeadlineSeconds", 10))
+    except (TypeError, ValueError):
+        deadline_seconds = 10.0
+
+    directives = []
+    directives_timed_out = False
+    bank_timings = []
+    results = []
+
+    if recall_parallel:
+        recall_mode = "parallel"
+        deadline_budget_ms = int(deadline_seconds * 1000)
+        # The shared deadline is measured from recall_start_monotonic (the top
+        # of the critical path), so mission-ensure + transcript read already
+        # spent budget: subtract what elapsed so the remaining wait still
+        # respects the ceiling-minus-2s guarantee.
+        already_spent = time.monotonic() - recall_start_monotonic
+        remaining_deadline = max(0.0, deadline_seconds - already_spent)
+
+        tasks = {DIRECTIVES_SLOT: _directives_task}
+        for spec in bank_specs:
+            tasks[spec[0]] = _make_bank_task(spec[0], spec[1], spec[2], spec[3])
+        outcomes = run_parallel(tasks, remaining_deadline)
+
+        # Directives slot. A slot that hit the deadline OR raised yields [] —
+        # the same failure-safe contract fetch_active_directives_cached honours.
+        d_outcome = outcomes[DIRECTIVES_SLOT]
+        directives_elapsed_ms = d_outcome.elapsed_ms if d_outcome.elapsed_ms is not None else 0
+        directives_timed_out = not d_outcome.completed
+        if d_outcome.completed and isinstance(d_outcome.value, list):
+            directives = d_outcome.value
+        elif directives_timed_out:
+            debug_log(config, "Directives slot hit the shared recall deadline")
+        elif d_outcome.error is not None:
+            debug_log(config, f"Directives fetch failed: {d_outcome.error}")
+
+        # Bank slots, own-bank first in config order. A bank is timed_out if it
+        # did not complete before the shared deadline OR completed by raising a
+        # hard timeout error (the finalized `deadline_hit` semantics — an
+        # abandoned straggler now counts, which the serial-era per-request-only
+        # flag could not express).
+        for spec in bank_specs:
+            b_id = spec[0]
+            b_outcome = outcomes[b_id]
+            b_timed_out = (not b_outcome.completed) or (
+                b_outcome.error is not None and _is_timeout_error(b_outcome.error)
             )
-            extra_results = extra_response.get("results", [])
-            if extra_results:
-                debug_log(config, f"Got {len(extra_results)} memories from additional bank '{extra_bank_id}'")
-                results = results + extra_results
-        except Exception as e:
-            _extra_timed_out = _is_timeout_error(e)
-            debug_log(config, f"Recall from additional bank '{extra_bank_id}' failed: {e}")
-        bank_timings.append({
-            "bank_id": extra_bank_id,
-            "elapsed_ms": int((time.monotonic() - _extra_start) * 1000),
-            "timed_out": _extra_timed_out,
-        })
+            if b_outcome.completed and b_outcome.error is None:
+                bank_results = (
+                    b_outcome.value.get("results", [])
+                    if isinstance(b_outcome.value, dict)
+                    else []
+                )
+                if bank_results:
+                    debug_log(config, f"Got {len(bank_results)} memories from bank '{b_id}'")
+                    results = results + bank_results
+            elif b_outcome.error is not None:
+                # Own bank failure surfaces on stderr (journald signal); extra
+                # banks are debug-only, matching the pre-A3 serial behaviour.
+                if b_id == bank_id:
+                    print(f"[Hindsight] Recall failed: {b_outcome.error}", file=sys.stderr)
+                else:
+                    debug_log(config, f"Recall from additional bank '{b_id}' failed: {b_outcome.error}")
+            elif not b_outcome.completed:
+                debug_log(config, f"Recall from bank '{b_id}' hit the shared deadline")
+            bank_timings.append({
+                "bank_id": b_id,
+                "elapsed_ms": b_outcome.elapsed_ms if b_outcome.elapsed_ms is not None else 0,
+                "timed_out": b_timed_out,
+            })
+    else:
+        # Pre-A3 serial path (rollback lever, HINDSIGHT_RECALL_PARALLEL=false).
+        # Directives first, then each bank in turn — total latency is the SUM of
+        # the round-trips, byte-for-byte the pre-parallelism behaviour.
+        recall_mode = "serial"
+        deadline_budget_ms = None
+        _directives_start = time.monotonic()
+        directives = fetch_active_directives_cached(
+            client,
+            bank_id,
+            ttl_seconds=config.get("directivesCacheTtlSeconds", DIRECTIVES_CACHE_TTL_SECONDS),
+        )
+        directives_elapsed_ms = int((time.monotonic() - _directives_start) * 1000)
+        for spec in bank_specs:
+            b_id, b_tags, b_tags_match, b_tag_groups = spec
+            _bank_start = time.monotonic()
+            _bank_timed_out = False
+            try:
+                response = _make_bank_task(b_id, b_tags, b_tags_match, b_tag_groups)()
+                bank_results = response.get("results", []) if isinstance(response, dict) else []
+                if bank_results:
+                    debug_log(config, f"Got {len(bank_results)} memories from bank '{b_id}'")
+                    results = results + bank_results
+            except Exception as e:
+                _bank_timed_out = _is_timeout_error(e)
+                if b_id == bank_id:
+                    print(f"[Hindsight] Recall failed: {e}", file=sys.stderr)
+                else:
+                    debug_log(config, f"Recall from additional bank '{b_id}' failed: {e}")
+            bank_timings.append({
+                "bank_id": b_id,
+                "elapsed_ms": int((time.monotonic() - _bank_start) * 1000),
+                "timed_out": _bank_timed_out,
+            })
+
+    directives_block = format_active_directives_block(directives) if directives else None
+    if directives_block:
+        debug_log(config, f"Injecting {len(directives)} active directives")
 
     # Switchroom #432 phase 4.4 — drop demote-tagged memories before
     # the cap. Filtering early means the cap kicks in over the
@@ -1505,7 +1576,22 @@ def main():
         "total_elapsed_ms": int((time.monotonic() - recall_start_monotonic) * 1000),
         "directives_elapsed_ms": directives_elapsed_ms,
         "bank_timings": bank_timings,
-        "deadline_hit": any(bt["timed_out"] for bt in bank_timings),
+        # Switchroom hindsight-leverage A3 — FINALIZED `deadline_hit` semantics
+        # (PR 1 shipped the interim per-bank-only form pending this PR). It is
+        # now True when ANY slot on the critical path hit its deadline: a bank
+        # that raised a hard per-request timeout OR (parallel mode) a bank/
+        # directives slot abandoned when the shared deadline elapsed. In serial
+        # (rollback) mode `directives_timed_out` is always False and each bank's
+        # `timed_out` is per-request only, so this reduces to the pre-A3 form —
+        # keeping the two modes' rows directly comparable in the breach baseline.
+        "deadline_hit": any(bt["timed_out"] for bt in bank_timings) or directives_timed_out,
+        # A3 — recall execution mode ("parallel"/"serial") and the shared
+        # deadline budget (ms; None in serial mode). These distinguish pre-A3
+        # (serial) from post-A3 (parallel) rows so the ≥3-day breach baseline
+        # can segment by mode without guessing from timing.
+        "recall_mode": recall_mode,
+        "deadline_budget_ms": deadline_budget_ms,
+        "directives_timed_out": directives_timed_out,
         # PR6 — instrumentation for binding-failure analysis.
         # `active_thread_id`: the current prompt's topic (null on
         # DM / fleet-shared). `source_topics`: distribution of
@@ -1661,6 +1747,21 @@ def _record_issue_safely(detail: str, class_name: str) -> None:
 if __name__ == "__main__":
     try:
         main()
+        # Switchroom hindsight-leverage A3 — hard, immediate process exit.
+        #
+        # The parallel recall path spawns daemon threads. Daemon threads already
+        # do not block a normal interpreter shutdown, but two things still can:
+        # (a) a non-daemon thread a client library might spawn, and (b) atexit /
+        # interpreter-shutdown thread-join bookkeeping. A straggler bank still
+        # blocked on an 8s socket read must NEVER hold the UserPromptSubmit hook
+        # open past its 12s ceiling. os._exit skips all of that and returns
+        # control to Claude Code immediately — but it also skips stdout buffer
+        # flushing, so flush FIRST or the hookSpecificOutput JSON is lost.
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+        os._exit(0)
     except Exception as e:
         # Switchroom #1070 (redo per #1085 review).
         #
