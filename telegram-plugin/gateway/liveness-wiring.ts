@@ -56,7 +56,7 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
     currentTurnMap,
     turnLiveForItsTopic,
     endCurrentTurnForKey,
-    pendingInboundBuffer,
+    getPendingInboundBuffer,
     trackRedeliveredInbound,
     closeActivityLane,
     closeProgressLane,
@@ -421,7 +421,7 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
     // re-buffers so nothing is lost if the bridge is genuinely offline.
     const fbSelfAgent = process.env.SWITCHROOM_AGENT_NAME ?? ''
     const fbRedeliver = redeliverBufferedInbound(
-      pendingInboundBuffer,
+      getPendingInboundBuffer(),
       fbSelfAgent,
       (m) => sendToAgent(fbSelfAgent, m),
       getInboundSpool(),
