@@ -108,6 +108,15 @@ export interface BankHealth {
   unextractedDocuments: BankDocumentSummary[];
   /** From /mental-models */
   mentalModels: BankMentalModelSummary[];
+  /**
+   * Count of ACTIVE directives on this bank (from `GET .../directives?active_only=true`
+   * — the same REST surface `lib/directives.py` fetches on the recall hook). `null`
+   * when the directives fetch failed / wasn't attempted (best-effort: a directive-
+   * fetch error must not fail the whole bank inspection). Used by the doctor to
+   * WARN/FAIL on runaway directive counts and to surface silent MAX_DIRECTIVES
+   * truncation of the recall block.
+   */
+  activeDirectiveCount: number | null;
 }
 
 /** Derive the REST base URL from the configured MCP URL (strip /mcp/ suffix). */
@@ -200,6 +209,7 @@ export async function inspectBankHealth(
     newestDocumentAt: null,
     unextractedDocuments: [],
     mentalModels: [],
+    activeDirectiveCount: null,
   };
 
   const stats = await getJson<{
@@ -236,6 +246,20 @@ export async function inspectBankHealth(
   }>(`${base}/v1/default/banks/${bank}/mental-models`, opts);
   if (!models.ok) return { ...empty, reason: models.reason };
 
+  // Active directives — best-effort, on the SAME REST surface `lib/directives.py`
+  // fetches on the recall hook (`?active_only=true`, `items[]`). A directive-fetch
+  // failure must NOT fail the whole bank inspection (the ingest-health signal is
+  // more important), so on error we leave the count `null` (= unknown) rather than
+  // returning `{ ok: false }`.
+  const directives = await getJson<{ items?: unknown[] }>(
+    `${base}/v1/default/banks/${bank}/directives?active_only=true`,
+    opts,
+  );
+  const activeDirectiveCount =
+    directives.ok && Array.isArray(directives.data.items)
+      ? directives.data.items.length
+      : null;
+
   const docItems = docs.data.items ?? [];
   let newestDocumentAt: string | null = null;
   const unextracted: BankDocumentSummary[] = [];
@@ -263,6 +287,7 @@ export async function inspectBankHealth(
     pendingOperations: stats.data.pending_operations ?? 0,
     newestDocumentAt,
     unextractedDocuments: unextracted,
+    activeDirectiveCount,
     mentalModels: (models.data.items ?? [])
       .filter((m): m is { id: string; name: string; last_refreshed_at?: string | null; created_at?: string | null; content?: string | null; source_query?: string | null; trigger?: { mode?: string | null } | null; reflect_response?: { based_on?: Record<string, unknown> | null } | null } =>
         typeof m?.id === "string" && typeof m?.name === "string",

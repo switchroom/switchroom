@@ -32,7 +32,7 @@ import { loadManifest, detectDrift, type DriftProbers } from "../manifest.js";
 import { probeHindsight, isHindsightEnabled, fetchHindsightToolsList, collectProfileBanks } from "../memory/hindsight.js";
 import { HINDSIGHT_DEFAULT_MCP_URL } from "../setup/hindsight.js";
 import { inspectBankHealth, staleMentalModels, corruptedMentalModels, recentUnextracted, ageDays } from "../memory/bank-health.js";
-import { checkHindsightContainerHealth, classifyToolContract, checkHindsightHealthEndpoint, classifyConsolidationBacklog } from "./doctor-memory.js";
+import { checkHindsightContainerHealth, classifyToolContract, checkHindsightHealthEndpoint, classifyConsolidationBacklog, classifyDirectiveCount } from "./doctor-memory.js";
 import { runLitellmModelChecks } from "../litellm/model-validation.js";
 import { isVaultReference, parseVaultReference } from "../vault/resolver.js";
 import { isDockerMode, runDockerChecks } from "./doctor-docker.js";
@@ -1172,6 +1172,14 @@ export async function checkBankIngestHealth(
       });
       continue;
     }
+
+    // Active-directive count (workstream C2): WARN past DIRECTIVE_WARN_THRESHOLD,
+    // FAIL past MAX_DIRECTIVES (where the recall block silently truncates the
+    // overflow). Emitted as its OWN row, independent of the ingest-health branch
+    // chain below (which `continue`s after the first match), so a directive
+    // pile-up surfaces even on a bank that also has an ingest issue.
+    const directiveRow = classifyDirectiveCount(h.activeDirectiveCount, label);
+    if (directiveRow) results.push(directiveRow);
     if (h.totalDocuments === 0) {
       results.push({
         name: label,

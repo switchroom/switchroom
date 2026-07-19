@@ -19,6 +19,7 @@ function fakeFetchFor(banks: Record<string, {
   stats?: unknown;
   documents?: unknown;
   models?: unknown;
+  directives?: unknown;
   failWith?: number;
 }>): typeof fetch {
   return (async (input: RequestInfo | URL) => {
@@ -34,7 +35,7 @@ function fakeFetchFor(banks: Record<string, {
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }
-    const m = url.match(/\/v1\/default\/banks\/([^/]+)\/(stats|documents|mental-models)/);
+    const m = url.match(/\/v1\/default\/banks\/([^/?]+)\/(stats|documents|mental-models|directives)/);
     if (!m) return new Response("not found", { status: 404 });
     const bank = decodeURIComponent(m[1]);
     const fixture = banks[bank];
@@ -43,6 +44,7 @@ function fakeFetchFor(banks: Record<string, {
     const body =
       m[2] === "stats" ? fixture.stats ?? {} :
       m[2] === "documents" ? fixture.documents ?? { items: [] } :
+      m[2] === "directives" ? fixture.directives ?? { items: [] } :
       fixture.models ?? { items: [] };
     return new Response(JSON.stringify(body), {
       status: 200,
@@ -386,6 +388,51 @@ describe("checkBankIngestHealth (doctor)", () => {
     expect(names).toContain("bank ken-profile (profile)");
     // the agent-less profile bank must NOT render the empty "()" label
     expect(names).not.toContain("bank ken-profile ()");
+  });
+
+  it("emits a FAIL directives row surfacing MAX_DIRECTIVES truncation (workstream C2), alongside the ingest row", async () => {
+    const OVER_CAP = {
+      ...HEALTHY_BANK,
+      directives: { items: Array.from({ length: 16 }, (_, i) => ({ id: `dir-${i}` })) },
+    };
+    const results = await checkBankIngestHealth(
+      minimalConfig({ marko: {} }),
+      "http://x/mcp/",
+      { fetchImpl: fakeFetchFor({ marko: OVER_CAP }), now: NOW },
+    );
+    const byName = Object.fromEntries(results.map((r) => [r.name, r]));
+    // Healthy ingest row still present…
+    expect(byName["bank marko"].status).toBe("ok");
+    // …plus a distinct FAIL directives row that names the silent truncation.
+    const dir = byName["bank marko directives"];
+    expect(dir.status).toBe("fail");
+    expect(dir.detail).toMatch(/silently truncated/i);
+    expect(dir.detail).toContain("16 active directives");
+  });
+
+  it("emits a WARN directives row at 13, and NO directives row at 12 or below", async () => {
+    const WARN_BANK = {
+      ...HEALTHY_BANK,
+      directives: { items: Array.from({ length: 13 }, (_, i) => ({ id: `dir-${i}` })) },
+    };
+    const OK_BANK = {
+      ...HEALTHY_BANK,
+      directives: { items: Array.from({ length: 12 }, (_, i) => ({ id: `dir-${i}` })) },
+    };
+    const warn = await checkBankIngestHealth(
+      minimalConfig({ marko: {} }),
+      "http://x/mcp/",
+      { fetchImpl: fakeFetchFor({ marko: WARN_BANK }), now: NOW },
+    );
+    expect(warn.find((r) => r.name === "bank marko directives")?.status).toBe("warn");
+
+    const ok = await checkBankIngestHealth(
+      minimalConfig({ marko: {} }),
+      "http://x/mcp/",
+      { fetchImpl: fakeFetchFor({ marko: OK_BANK }), now: NOW },
+    );
+    // At the threshold and below, no directives row is emitted at all.
+    expect(ok.some((r) => r.name === "bank marko directives")).toBe(false);
   });
 
   it("omits the fleet consolidation-backlog row unless opted in (#2903 fix 5.3)", async () => {

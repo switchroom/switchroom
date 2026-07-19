@@ -9,6 +9,9 @@ import {
   classifyHindsightHealthProbe,
   checkHindsightHealthEndpoint,
   classifyConsolidationBacklog,
+  classifyDirectiveCount,
+  MAX_DIRECTIVES,
+  DIRECTIVE_WARN_THRESHOLD,
   classifyAutohealStatus,
   classifyLlmVerification,
   classifyHindsightDataVolumeMounts,
@@ -99,6 +102,60 @@ describe("classifyConsolidationBacklog (#2903 fix 5.3)", () => {
   it("omits the age clause when age is unknown (REST /stats has no per-op age — #2847)", () => {
     const r = classifyConsolidationBacklog(CONSOLIDATION_BACKLOG_WARN, null);
     expect(r.detail).not.toMatch(/oldest/);
+  });
+});
+
+describe("classifyDirectiveCount (workstream C2 — directive pile-up + truncation surfacing)", () => {
+  it("no row when the directive fetch failed / count is unknown", () => {
+    expect(classifyDirectiveCount(null, "bank coach")).toBeNull();
+  });
+
+  it("no row at or below the warn threshold (avoids one ok line per bank)", () => {
+    expect(classifyDirectiveCount(0, "bank coach")).toBeNull();
+    expect(classifyDirectiveCount(DIRECTIVE_WARN_THRESHOLD, "bank coach")).toBeNull();
+  });
+
+  it("WARNs at 13 (one past the warn threshold, still under the cap)", () => {
+    const r = classifyDirectiveCount(DIRECTIVE_WARN_THRESHOLD + 1, "bank coach");
+    expect(r).not.toBeNull();
+    expect(r!.status).toBe("warn");
+    expect(r!.name).toBe("bank coach directives");
+    expect(r!.detail).toContain("13 active directives");
+    expect(r!.detail).toContain(`MAX_DIRECTIVES=${MAX_DIRECTIVES}`);
+  });
+
+  it("still WARNs (not FAILs) exactly at the cap of 15 — nothing is truncated yet", () => {
+    const r = classifyDirectiveCount(MAX_DIRECTIVES, "bank coach");
+    expect(r!.status).toBe("warn");
+  });
+
+  it("FAILs at 16 and surfaces the SILENT MAX_DIRECTIVES truncation", () => {
+    const r = classifyDirectiveCount(MAX_DIRECTIVES + 1, "bank coach");
+    expect(r).not.toBeNull();
+    expect(r!.status).toBe("fail");
+    expect(r!.detail).toContain("16 active directives");
+    expect(r!.detail).toMatch(/silently truncated/i);
+    expect(r!.detail).toContain(`MAX_DIRECTIVES=${MAX_DIRECTIVES}`);
+    // 16 - 15 = 1 directive dropped from the recall block.
+    expect(r!.detail).toContain("1 lowest-priority directive");
+    expect(r!.fix).toBeDefined();
+  });
+
+  it("reports the correct truncated count as the overflow grows", () => {
+    const r = classifyDirectiveCount(20, "bank coach");
+    expect(r!.status).toBe("fail");
+    // 20 - 15 = 5 truncated.
+    expect(r!.detail).toContain("5 lowest-priority directive");
+  });
+
+  it("TS MAX_DIRECTIVES pins the Python constant in vendor/hindsight-memory (drift guard)", () => {
+    const py = readFileSync(
+      resolve(__dirname, "..", "vendor", "hindsight-memory", "scripts", "lib", "directives.py"),
+      "utf-8",
+    );
+    const m = py.match(/^MAX_DIRECTIVES\s*=\s*(\d+)\s*$/m);
+    expect(m).not.toBeNull();
+    expect(Number(m![1])).toBe(MAX_DIRECTIVES);
   });
 });
 

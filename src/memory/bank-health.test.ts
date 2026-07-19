@@ -108,6 +108,31 @@ describe("inspectBankHealth", () => {
     expect(h.mentalModels.map((m) => m.id)).toEqual(["ok"]);
   });
 
+  it("counts active directives from the directives REST surface", async () => {
+    const fetchImpl = jsonFetch({
+      "/stats": { total_documents: 1, total_nodes: 1, pending_operations: 0 },
+      "/documents": { items: [] },
+      "/mental-models": { items: [] },
+      "/directives": { items: [{ id: "x1" }, { id: "x2" }, { id: "x3" }] },
+    });
+    const h = await inspectBankHealth(MCP_URL, "coach", { fetchImpl });
+    expect(h.ok).toBe(true);
+    expect(h.activeDirectiveCount).toBe(3);
+  });
+
+  it("leaves activeDirectiveCount null (not zero) when the directives fetch fails — without failing the bank", async () => {
+    // No /directives route → 404. The directives fetch is best-effort: the bank
+    // still inspects ok, but the count is unknown (null), not a misleading 0.
+    const fetchImpl = jsonFetch({
+      "/stats": { total_documents: 1, total_nodes: 1, pending_operations: 0 },
+      "/documents": { items: [] },
+      "/mental-models": { items: [] },
+    });
+    const h = await inspectBankHealth(MCP_URL, "coach", { fetchImpl });
+    expect(h.ok).toBe(true);
+    expect(h.activeDirectiveCount).toBeNull();
+  });
+
   it("returns ok:false with the failing stage's reason when a REST call errors", async () => {
     const fetchImpl = (async () => new Response("boom", { status: 500 })) as unknown as typeof fetch;
     const h = await inspectBankHealth(MCP_URL, "coach", { fetchImpl });
