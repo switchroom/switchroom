@@ -32,6 +32,8 @@ import { probeHindsight, isHindsightEnabled, fetchHindsightToolsList, collectPro
 import { HINDSIGHT_DEFAULT_MCP_URL } from "../setup/hindsight.js";
 import { inspectBankHealth, staleMentalModels, corruptedMentalModels, recentUnextracted, ageDays } from "../memory/bank-health.js";
 import { checkHindsightContainerHealth, classifyToolContract, checkHindsightHealthEndpoint, classifyConsolidationBacklog } from "./doctor-memory.js";
+import { runLitellmModelChecks } from "../litellm/model-validation.js";
+import { isVaultReference, parseVaultReference } from "../vault/resolver.js";
 import { isDockerMode, runDockerChecks } from "./doctor-docker.js";
 import { runAuthBrokerChecks } from "./doctor-auth-broker.js";
 import { runHostdChecks } from "./doctor-hostd.js";
@@ -3046,6 +3048,25 @@ export function registerDoctorCommand(program: Command): void {
           },
           { title: "Vault access", results: await runSecretAccessChecks(config) },
           { title: "Memory (Hindsight)", results: await checkHindsight(config) },
+          {
+            // #3407: config-time drift guard — every switchroom-managed LLM
+            // model reference (hindsight llm config + explicit agent litellm
+            // routes) must exist in the live proxy model_list. FAILs loudly at
+            // doctor time instead of 400ing silently at runtime; WARNs (never
+            // fails) when the proxy is unreachable.
+            title: "LiteLLM model routing (#3407)",
+            results: await runLitellmModelChecks(config, {
+              resolveSecret: (ref) => {
+                if (!isVaultReference(ref)) return ref; // literal admin_key
+                if (!passphrase || !existsSync(vaultPath)) return null;
+                try {
+                  return getStringSecret(passphrase, vaultPath, parseVaultReference(ref));
+                } catch {
+                  return null;
+                }
+              },
+            }),
+          },
           { title: "Telegram", results: await checkTelegram(config) },
           { title: "Agents", results: checkAgents(config, configPath) },
           {
