@@ -538,6 +538,9 @@ import {
   modelCommandReceiptLine,
   handleModelCommand,
   classifyModelSwitchConfirmation,
+  formatModelRelaunchDiagLog,
+  formatModelSwitchConfirmationBody,
+  formatModelRelaunchSuppressNotAppliedLog,
   buildModelMenu,
   handleModelMenuCallback,
   isValidModelArg,
@@ -23907,62 +23910,36 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                 // scraped pane or an optimistic record.
                 const isApplyBoot = launched.length > 0 && launched !== configured
                 sessionModelSource.setOverride(isApplyBoot ? launched : null)
-                // Diagnosability (rev 5): the applied model is now always
-                // greppable — `grep 'gw /model relaunch applied'`. F4 note:
-                // `launched` is the REQUESTED token start.sh wrote before `exec
-                // claude` (it is NOT a post-launch confirmation). If a shape-valid
-                // but unknown Claude id was requested, `--fallback-model` may mask
-                // it: claude serves a fallback while this records the requested
-                // token. That divergence is NOT a persistent lie — the transcript's
-                // `message.model` (noteTranscriptModel) reclaims the source from
-                // this override on the first assistant line, correcting /status to
-                // the model actually serving calls. The pre-first-assistant window
-                // is the only optimistic window (G2), and it is bounded and
-                // self-healing; it is documented, not silently asserted as success.
+                // F1/N4: classify + log + one confirmation card. Formatters live
+                // in model-command.ts so this file does not inflate (#2996 ratchet).
+                const confirmation = modelSwitchReason != null
+                  ? classifyModelSwitchConfirmation({
+                      reason: modelSwitchReason,
+                      launched,
+                      configured,
+                    })
+                  : null
                 process.stderr.write(
-                  `telegram gateway: gw /model relaunch applied agent=${getMyAgentName()} launched=${launched || '(none)'} configured=${configured} override=${isApplyBoot ? 'set' : 'cleared'}\n`,
-                )
-                // Switch-confirmation (F1 / PLAN §4 step 2): on a /model apply-boot
-                // with a known initiating chat, send ONE confirmation built from the
-                // ACTUAL launched model — never optimistic. Keyed on the DETERMINISTIC
-                // /model switch reason (from the clean-shutdown marker), not on
-                // `launched !== configured`, so it ALSO fires when a switch landed on
-                // the configured default (`/model default`, or `/model <configured>`)
-                // — N4. The generic boot card is suppressed for this boot (N3), so
-                // this is the single card the operator sees for the switch.
-                if (modelSwitchReason != null && modelSwitchMarkerChat) {
-                  const chat = modelSwitchMarkerChat
-                  // Derive the confirmation from the DETERMINISTIC post-boot
-                  // signals. A non-default switch that reverted to the configured
-                  // default (a wedged/consumed apply-boot — the silent-revert bug)
-                  // must WARN, not print a misleading green "✅ Now running
-                  // <default>" card. `applied` / `default` keep the honest green
-                  // card (N4: the default/revert case still confirms).
-                  const confirmation = classifyModelSwitchConfirmation({
-                    reason: modelSwitchReason,
+                  formatModelRelaunchDiagLog({
+                    agent: getMyAgentName(),
                     launched,
                     configured,
-                  })
-                  // LOW-2 dedup: the config-default-changed / proxy-down revert
-                  // paths in start.sh write a TAILORED `.session-model-alert`
-                  // (relayed to operators below) that already explains why the
-                  // switch didn't apply and how to re-issue it. Suppress the
-                  // generic not-applied card when such an alert is present for
-                  // this boot so the operator isn't double-warned — the alert is
-                  // the more specific message. The not-applied card still fires
-                  // for the plain wedge/revert case (no alert on disk).
+                    confirmation,
+                    isApplyBoot,
+                  }),
+                )
+                if (confirmation != null && modelSwitchMarkerChat) {
+                  const chat = modelSwitchMarkerChat
                   const hasSessionModelAlert = existsSync(join(smAgentDir, '.session-model-alert'))
                   if (confirmation.kind === 'not-applied' && hasSessionModelAlert) {
                     process.stderr.write(
-                      `telegram gateway: gw /model relaunch applied — suppressing not-applied confirmation (a .session-model-alert is present and will be relayed) agent=${getMyAgentName()} target=${confirmation.target}\n`,
+                      formatModelRelaunchSuppressNotAppliedLog({
+                        agent: getMyAgentName(),
+                        target: confirmation.target,
+                      }),
                     )
                   } else {
-                    const body =
-                      confirmation.kind === 'applied'
-                        ? `✅ Now running \`${confirmation.launched}\` — session-only, reverts to the configured model on the next restart. Fresh session; memory and the handoff briefing carry the context.`
-                        : confirmation.kind === 'not-applied'
-                          ? `⚠️ Your switch to \`${confirmation.target}\` didn't apply — the agent reverted to \`${confirmation.revertedTo}\` (the apply-boot didn't complete). Re-issue \`/model ${confirmation.target}\` to try again.`
-                          : `✅ Now running \`${confirmation.launched}\` (the configured default) — fresh session; memory and the handoff briefing carry the context.`
+                    const body = formatModelSwitchConfirmationBody(confirmation)
                     // allow-raw-bot-api: one-shot boot confirmation, same shape as the session-model alert relay below
                     void lockedBot.api
                       .sendMessage(chat.chatId, body, {

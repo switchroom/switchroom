@@ -1211,6 +1211,7 @@ fi
 
 # --- Session model resolution (consume-once .session-model carrier) ---
 #
+# Doctor (checkStartShSessionModelCarrier) and tests pin this path against gateway SESSION_MODEL_FILE — regenerate via `switchroom apply` if fleet start.sh drifts.
 # Contract: reference/rfcs/session-model-stickiness.md §0.05 (rev 5, operator
 # decision 2026-07-16 — DETERMINISTIC SWITCH, superseding rev 4 §0.1's "live
 # Claude switches write no carrier"). A `/model` override lasts only for the

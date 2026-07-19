@@ -1819,6 +1819,90 @@ export function checkStartShStale(
 }
 
 /**
+ * Detect agents whose start.sh predates the rev-5 `/model` consume-once
+ * carrier (`.session-model` JSON). The gateway writes that file on every
+ * Telegram `/model` / menu switch; a stale start.sh that only reads the
+ * legacy one-shot `.session-model-override` text carrier silently boots the
+ * yaml pin and the switch looks applied (`override=cleared`) while it isn't.
+ * Same class as #911 silent-cron-loss — doctor is the fleet-wide tripwire
+ * until the next `switchroom apply` rewrites start.sh from start.sh.hbs.
+ *
+ * Match shell structure, not bare comments: require an `[ -f …/.session-model ]`
+ * whose basename is exactly `.session-model` (not `-override` / `-alert` /
+ * `-boot-attempts` / `-kept-notified`), plus a rev5 JSON-apply marker
+ * (`configuredDefaultAtWrite` or `session-model-boot-attempts`). Live hbs
+ * also migrates a leftover `.session-model-override` into `.session-model`;
+ * that hangs off the same bare path test and is fine. Legacy-only scripts fail.
+ *
+ * @internal exported for testing
+ */
+export function checkStartShSessionModelCarrier(
+  agentName: string,
+  startShPath: string,
+): CheckResult {
+  const label = `${agentName}: start.sh /model session carrier`;
+  if (!existsSync(startShPath)) {
+    return {
+      name: label,
+      status: "warn",
+      detail: `${startShPath} not found`,
+      fix: `Run \`switchroom apply\` to scaffold start.sh (rev5 \`.session-model\` carrier).`,
+    };
+  }
+  let content: string;
+  try {
+    content = readFileSync(startShPath, "utf-8");
+  } catch (err) {
+    return {
+      name: label,
+      status: "skip",
+      detail: `unreadable from host (${(err as Error).message}) — agent-UID-owned; the session-model carrier block can't be checked from the operator UID`,
+      fix: `Verify in-agent: docker exec switchroom-${agentName} sh -c 'grep -E "\\[ -f .*\\.session-model\\" \\]" /state/agent/start.sh && echo ok'`,
+    };
+  }
+  // Every `[ -f …]` path; require at least one whose trailing basename is
+  // exactly `.session-model` (optional quotes stripped). Comments alone never match.
+  const fileTestPaths = [...content.matchAll(/\[\s*-f\s+([^\]]+?)\s*\]/g)].map(
+    (m) => m[1].replace(/["']/g, "").trim(),
+  );
+  const hasBareSessionModelTest = fileTestPaths.some((p) =>
+    /(?:^|\/)\.session-model$/.test(p),
+  );
+  // Primary JSON shape start.sh parses from the gateway-written carrier.
+  const hasJsonCarrierParse =
+    /configuredDefaultAtWrite/.test(content) ||
+    /session-model-boot-attempts/.test(content);
+  if (hasBareSessionModelTest && hasJsonCarrierParse) {
+    return {
+      name: label,
+      status: "ok",
+      detail: "rev5 `.session-model` consume-once carrier present",
+    };
+  }
+  if (hasBareSessionModelTest && !hasJsonCarrierParse) {
+    return {
+      name: label,
+      status: "fail",
+      detail:
+        "start.sh tests `.session-model` but lacks rev5 JSON apply (`configuredDefaultAtWrite` / boot-attempts) — /model switches may not stick",
+      fix:
+        "Run `switchroom apply` to regenerate start.sh from profiles/_base/start.sh.hbs (rev5 carrier). Takes effect on the next agent restart (no need to bounce until release).",
+    };
+  }
+  const legacyOnly =
+    /\.session-model-override/.test(content) && !hasBareSessionModelTest;
+  return {
+    name: label,
+    status: "fail",
+    detail: legacyOnly
+      ? "start.sh only reads legacy `.session-model-override`; gateway writes rev5 `.session-model` — Telegram /model relaunches boot the yaml pin (silent miss)"
+      : "start.sh missing rev5 `.session-model` carrier file test — Telegram /model cannot apply session overrides across relaunch",
+    fix:
+      "Run `switchroom apply` to regenerate start.sh from the latest template (rev5 `.session-model` carrier). The rewrite is on disk immediately; session switches apply on the next agent restart/release bounce.",
+  };
+}
+
+/**
  * Detect leaked $HOME/.switchroom state inside an agent's bind-mounted
  * state dir (#933). Agents that ran before #910's symlink fix landed
  * may have written analytics-id / quota-cache / logs into the wrong
@@ -2055,6 +2139,10 @@ export function checkAgents(config: SwitchroomConfig, configPath: string): Check
 
     // 1b. start.sh has the post-Phase-4 scheduler supervisor block
     results.push(checkStartShStale(name, join(agentDir, "start.sh")));
+    // 1b2. start.sh speaks rev5 `.session-model` (Telegram /model carrier)
+    results.push(
+      checkStartShSessionModelCarrier(name, join(agentDir, "start.sh")),
+    );
 
     // 1c. Leaked $HOME/.switchroom state from pre-#910 runs (#933).
     // Inside the container HOME=/state/agent/home; if the agent ever
