@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+## v0.19.0 — Re-architected inbound routing and turn-lifecycle paths are now ON by default
+
+The two gateway-decomposition kill switches that shipped default-OFF in
+v0.18.33 are now **default-ON**, after canary validation on v0.18.33
+(5/5 UAT pass, DM + supergroup):
+
+- **Inbound routing v2 is the production path** (#3402) —
+  `SWITCHROOM_INBOUND_ROUTER_V2` flipped from opt-in (`=1`) to default-ON.
+  The consolidated intercept chain (stop-keyword, interrupt-marker,
+  permission-reply, auth-add / loopback-relay / reauth paste-back, admission
+  head, secret-detect, vault pending-op) now runs by default.
+  Escape hatch: `SWITCHROOM_INBOUND_ROUTER_V2=0` + agent restart.
+- **Turn-end funnel v2 is the production path** (#3403) —
+  `SWITCHROOM_TURN_END_FUNNEL_V2` flipped from opt-in (`=1`) to default-ON.
+  Every turn-end site now goes through the single `endTurn(reason)`
+  dispatcher. Escape hatch: `SWITCHROOM_TURN_END_FUNNEL_V2=0` + agent restart.
+
+Both legacy (v1) arms remain in the tree and stay covered: the
+characterization harnesses pin the legacy arm with an explicit `=0`, and the
+gateway boot-smoke test now exercises three postures (flags unset = both v2
+ON, both `=1`, and the both-`=0` legacy escape hatch). The legacy paths will
+be deleted in a later release once the default-ON posture has baked.
+
 ## v0.18.33 — Gateway decomposition lands its P7 inbound-router and P8 turn-lifecycle phases (kill-switched, default OFF), plus a P0 boot-crash fix and background-worker visibility repairs
 
 ### Gateway decomposition (#2996)
