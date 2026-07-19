@@ -135,6 +135,20 @@ DEFAULTS = {
     # HINDSIGHT_RECONCILE_{LOOKBACK_H,MAX_TURNS,BUDGET_S} bounds (read directly).
     "reconcileOnStart": True,
     "recallAdditionalBanks": [],
+    # Switchroom hindsight-leverage A3 — parallelise multi-bank recall.
+    # When on (default), the directives fetch and every bank recall run
+    # concurrently in daemon threads under ONE shared deadline
+    # (recallParallelDeadlineSeconds), so total critical-path latency is the
+    # SLOWEST slot instead of their SUM. Set false
+    # (HINDSIGHT_RECALL_PARALLEL=false) to restore the pre-A3 serial path —
+    # the rollback lever if the parallel path ever misbehaves.
+    "recallParallel": True,
+    # Shared deadline (seconds) for the whole parallel recall section. Sized
+    # at the UserPromptSubmit hook ceiling (12s, hooks.json) MINUS 2s headroom
+    # for block formatting + cache write + stdout flush, so a straggler bank
+    # can never push the hook past its ceiling. Slots still unfinished when the
+    # deadline elapses are abandoned (daemon threads) and marked timed_out.
+    "recallParallelDeadlineSeconds": 10,
     # Connection
     "hindsightApiUrl": None,
     "hindsightApiToken": None,
@@ -207,6 +221,11 @@ ENV_OVERRIDES = {
     # Switchroom hindsight-leverage A4 — directives-list cache TTL (seconds).
     # 0 disables the cache (rollback lever).
     "HINDSIGHT_DIRECTIVES_CACHE_TTL_SECONDS": ("directivesCacheTtlSeconds", int),
+    # Switchroom hindsight-leverage A3 — parallel multi-bank recall toggle +
+    # shared deadline. HINDSIGHT_RECALL_PARALLEL=false is the serial rollback
+    # lever; the deadline is the ceiling-minus-2s hard budget (see DEFAULTS).
+    "HINDSIGHT_RECALL_PARALLEL": ("recallParallel", bool),
+    "HINDSIGHT_RECALL_PARALLEL_DEADLINE_SECONDS": ("recallParallelDeadlineSeconds", int),
     "HINDSIGHT_RECALL_MAX_QUERY_CHARS": ("recallMaxQueryChars", int),
     "HINDSIGHT_RECALL_CONTEXT_TURNS": ("recallContextTurns", int),
     # Switchroom hindsight-leverage A2 — byte-tail bound for the multi-turn
