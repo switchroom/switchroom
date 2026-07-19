@@ -26,6 +26,11 @@ const gatewaySrc = readFileSync(
 // #2996 P4-A: the enqueue handler (turn ctor: `const turnId = deriveTurnId`,
 // `rememberRecentTurn(next)`, `promoteQueuedStatus`) moved VERBATIM into
 // stream-render.ts with handleSessionEvent. Enqueue-seam assertions span both.
+// #2996 P8 PR-B: the turn-end funnel bodies moved verbatim to turn-end.ts.
+const turnEndSrc = readFileSync(
+  resolve(__dirname, '..', 'gateway', 'turn-end.ts'),
+  'utf-8',
+)
 const streamSrc = readFileSync(
   resolve(__dirname, '..', 'gateway', 'stream-render.ts'),
   'utf-8',
@@ -163,13 +168,13 @@ describe('component 5 — queued-status UX (delete-on-answer)', () => {
   })
 
   it('Hook C reaps the placeholder on the answer (executeReply / stream)', () => {
-    const reapCalls = gatewaySrc.match(/reapQueuedStatus\(/g) ?? []
+    const reapCalls = (gatewaySrc + turnEndSrc).match(/reapQueuedStatus\(/g) ?? []
     // definition + executeReply + purge cleanup (2 branches)
     expect(reapCalls.length).toBeGreaterThanOrEqual(4)
   })
 
   it('purgeReactionTracking reaps the placeholder on abnormal turn-end (defense-in-depth)', () => {
-    const fn = gatewaySrc.split('function purgeReactionTracking')[1]?.split('\nfunction ')[0] ?? ''
+    const fn = turnEndSrc.split('function purgeReactionTracking')[1]?.split('\nfunction ')[0] ?? ''
     expect(fn).toMatch(/reapQueuedStatus\(/)
     // Reap sits alongside the activeReactionMsgIds cleanup.
     expect(fn).toMatch(/activeReactionMsgIds\.delete\(key\)/)
