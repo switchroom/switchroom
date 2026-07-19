@@ -225,6 +225,16 @@ export function isHindsightEnabled(
  * memory quality (less conversational filler stored, fewer marginal hits
  * surfacing in subsequent recalls).
  *
+ * 2026-07-19 (hindsight fleet review): live fleet banks skewed heavily
+ * toward transient in-flight-task narration ("P6 worker paused waiting on
+ * its PR", "three more tracks dispatched") — experience-node volume
+ * exceeded world-fact volume on the busiest bank. That class of memory is
+ * process status, not a fact/decision/outcome worth recalling later, and
+ * it's exactly what feeds the consolidation backlog. Added an explicit
+ * carve-out below so the extraction step recognizes it as noise alongside
+ * one-off chatter, not just "temporary task noise" (which didn't stop the
+ * pattern in practice).
+ *
  * Switchroom seeds this for newly scaffolded agents only (see
  * `scaffoldAgent` in `src/agents/scaffold.ts`). Existing agents'
  * missions are left alone — operators may have customized them, and
@@ -235,7 +245,10 @@ export function isHindsightEnabled(
 export const DEFAULT_RETAIN_MISSION =
   "Extract user preferences, ongoing projects, recurring commitments, " +
   "important context, and durable facts that should help across future " +
-  "conversations. Skip one-off chatter and temporary task noise.";
+  "conversations. Skip one-off chatter and temporary task noise, " +
+  "including in-flight workflow/process narration (a sub-task started, " +
+  "paused, or is still running) — only retain the outcome once a task " +
+  "actually completes or a decision is made.";
 
 /**
  * Hindsight bank disposition traits (1-5 each). Mirrors the engine's flat

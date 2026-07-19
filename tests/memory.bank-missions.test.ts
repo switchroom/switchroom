@@ -23,15 +23,16 @@ async function captureUpdateBankArgs(
 }
 
 describe("DEFAULT_RETAIN_MISSION", () => {
-  it("matches upstream Hindsight per-user-memory guide wording", () => {
-    // Sourced verbatim from
+  it("starts from the upstream Hindsight per-user-memory guide wording", () => {
+    // Base sourced verbatim from
     // hindsight-docs/guides/2026-04-15-guide-openclaw-per-user-memory-across-channels-setup.md
-    // lines 188-193.
-    expect(DEFAULT_RETAIN_MISSION).toBe(
+    // lines 188-193; extended 2026-07-19 (hindsight fleet review) with an
+    // explicit in-flight-process-narration carve-out — see block comment.
+    expect(DEFAULT_RETAIN_MISSION.startsWith(
       "Extract user preferences, ongoing projects, recurring commitments, " +
         "important context, and durable facts that should help across future " +
-        "conversations. Skip one-off chatter and temporary task noise.",
-    );
+        "conversations. Skip one-off chatter and temporary task noise,",
+    )).toBe(true);
   });
 
   it("explicitly tells extraction to skip conversational filler", () => {
@@ -42,6 +43,17 @@ describe("DEFAULT_RETAIN_MISSION", () => {
   it("focuses on durable, cross-conversation signal", () => {
     expect(DEFAULT_RETAIN_MISSION).toContain("durable facts");
     expect(DEFAULT_RETAIN_MISSION).toContain("across future");
+  });
+
+  // Regression for the 2026-07-19 fleet review (REPORT.md finding B1):
+  // live banks were dominated by transient in-flight task narration
+  // ("P6 worker paused waiting on its PR") rather than durable facts —
+  // that class of memory feeds the consolidation backlog for no lasting
+  // recall value. The mission must name it explicitly so extraction
+  // recognizes it, not just lump it under vague "task noise".
+  it("explicitly excludes in-flight workflow/process narration", () => {
+    expect(DEFAULT_RETAIN_MISSION).toContain("in-flight workflow/process narration");
+    expect(DEFAULT_RETAIN_MISSION).toContain("only retain the outcome once a task");
   });
 });
 
