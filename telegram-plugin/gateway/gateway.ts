@@ -116,7 +116,11 @@ import {
   type MediaEnvelopeDeps,
 } from './media-message-handlers.js'
 import { routeInbound, type InboundRouterDeps } from './inbound-router.js'
-import { interceptStopKeyword, type InboundInterceptorDeps } from './inbound-interceptors.js'
+import {
+  interceptStopKeyword,
+  interceptInterruptMarker,
+  type InboundInterceptorDeps,
+} from './inbound-interceptors.js'
 import {
   handleDocumentMessage,
   handleAudioMessage,
@@ -15398,6 +15402,9 @@ const inboundInterceptorDeps: InboundInterceptorDeps = {
   swallowingApiCall,
   botApi: () => bot.api,
   log: line => process.stderr.write(line),
+  loadAccess,
+  toolFlightTracker,
+  cancelInterruptedObligation,
 }
 
 export async function handleInbound(
@@ -15596,84 +15603,21 @@ export async function handleInbound(
 
   const interrupt = parseInterruptMarker(text)
   // Problem B: defer this `!`'s SIGINT to a safe boundary instead of firing it
-  // synchronously below. Set only when the `interrupt.safe_boundary` flag is on
-  // AND a top-level tool call is in flight AND the body is non-empty (an empty
-  // `!` is a halt-now — routed through `executeHaltNow`, which honors the same
-  // safe-boundary deferral internally, #3020). When set, we skip the
-  // synchronous SIGINT here and stash the built inbound at the delivery site.
+  // synchronously. Extracted to interceptInterruptMarker (#2996 P7 PR-3);
+  // `deferInterrupt` comes back as an at-receipt captured VALUE the delivery
+  // site consumes (when true the synchronous SIGINT was skipped and the built
+  // inbound is stashed at the delivery site, #3020 semantics unchanged).
   let deferInterrupt = false
-  if (interrupt.isInterrupt) {
-    const agentName = process.env.SWITCHROOM_AGENT_NAME
-    const access = loadAccess()
-    deferInterrupt =
-      !interrupt.emptyBody &&
-      decideInterruptTiming({
-        safeBoundaryEnabled: resolveSafeBoundaryEnabled(access.interruptSafeBoundary),
-        midToolCall: toolFlightTracker.isMidToolCall(),
-      }) === 'defer'
-    process.stderr.write(
-      `telegram gateway: interrupt-marker received chat_id=${chat_id} agent=${agentName ?? '-'} ` +
-      `body_len=${interrupt.body.length} empty=${interrupt.emptyBody} defer=${deferInterrupt} ` +
-      `in_flight=${toolFlightTracker.inFlightCount()}\n`,
+  {
+    const interruptOutcome = await interceptInterruptMarker(
+      { interrupt, chat_id, msgId, messageThreadId },
+      inboundInterceptorDeps,
     )
-    if (msgId != null) {
-      void sendReaction(chat_id, msgId, '⚡' as ReactionTypeEmoji['emoji']).catch(() => {})
-    }
-    if (interrupt.emptyBody) {
-      // #3020: empty `!` is a pure halt (no replacement body) — same shared
-      // sequence as /stop: safe-boundary deferral, tmux C-c, obligation
-      // cancel, deterministic busy release.
-      await executeHaltNow('bang-empty')
-      // #1075: thread-id-bearing — route through swallowingApiCall so
-      // a deleted topic doesn't crash the gateway; the reaction
-      // already acked the user so a missing follow-up is tolerable.
-      await swallowingApiCall(
-        () =>
-          bot.api.sendMessage(
-            chat_id,
-            '⚡ Interrupted. Send your replacement instruction now.',
-            messageThreadId != null ? { message_thread_id: messageThreadId } : {},
-          ),
-        {
-          chat_id,
-          verb: 'interrupt-empty-body',
-          ...(messageThreadId != null ? { threadId: messageThreadId } : {}),
-        },
-      )
-      return
-    }
-    if (agentName && !deferInterrupt) {
-      try {
-        // The gateway runs INSIDE the agent container in docker mode,
-        // so calling `interruptAgent` (which probes `docker inspect`
-        // for the PID) always returns "no running PID" — the host's
-        // docker socket isn't visible to us. Skip the PID round-trip
-        // entirely and use tmux send-keys directly: the tmux socket
-        // is local to our container. Discovered during UAT overnight
-        // 2026-05-13 — pre-fix every `!` interrupt produced an
-        // "Agent has no running PID" stderr line and the user got
-        // ghosted because the SIGINT never fired.
-        const { sendAgentInterrupt } = await import('../../src/agents/tmux.js')
-        const r = sendAgentInterrupt({ agentName })
-        if ('ok' in r) {
-          process.stderr.write(
-            `telegram gateway: interrupt-marker SIGINT delivered via tmux send-keys agent=${agentName}\n`,
-          )
-        } else {
-          process.stderr.write(
-            `telegram gateway: interrupt-marker SIGINT via tmux failed agent=${agentName}: ${r.error}\n`,
-          )
-        }
-      } catch (err) {
-        process.stderr.write(`telegram gateway: interrupt-marker SIGINT failed: ${(err as Error).message}\n`)
-      }
-      // The SIGINT just killed the in-flight turn — cancel its obligation so the
-      // interrupted (user-redirected) question isn't re-presented/escalated later.
-      cancelInterruptedObligation()
-    }
-    // Replace the inbound text with the body and continue normal
+    if (interruptOutcome.handled) return
+    deferInterrupt = interruptOutcome.deferInterrupt
+    // Replace the inbound text with the `!` body and continue normal
     // processing. The agent receives a fresh turn with no `!` prefix.
-    text = interrupt.body
+    if (interruptOutcome.replacedText != null) text = interruptOutcome.replacedText
   }
 
   // Issue #109: when the user has to ask "status?" mid-turn, the live progress

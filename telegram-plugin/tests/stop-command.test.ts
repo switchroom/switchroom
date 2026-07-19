@@ -196,7 +196,8 @@ describe('gateway wiring — /stop cancels the in-flight turn (#3020)', () => {
   })
 
   it('the empty-`!` interrupt routes through the same executeHaltNow helper', () => {
-    expect(GATEWAY_SRC).toContain("executeHaltNow('bang-empty')")
+    // P7 PR-3: the `!`-marker intercept moved to inbound-interceptors.ts.
+    expect(INTERCEPTORS_SRC).toContain("deps.executeHaltNow('bang-empty')")
   })
 
   it('/stop with an argument warns and does NOT halt (old container-stop muscle memory)', () => {
