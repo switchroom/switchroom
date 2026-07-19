@@ -147,6 +147,16 @@ describe("classifyDirectiveCount (workstream C2 — directive pile-up + truncati
     // 20 - 15 = 5 truncated.
     expect(r!.detail).toContain("5 lowest-priority directive");
   });
+
+  it("TS MAX_DIRECTIVES pins the Python constant in vendor/hindsight-memory (drift guard)", () => {
+    const py = readFileSync(
+      resolve(__dirname, "..", "vendor", "hindsight-memory", "scripts", "lib", "directives.py"),
+      "utf-8",
+    );
+    const m = py.match(/^MAX_DIRECTIVES\s*=\s*(\d+)\s*$/m);
+    expect(m).not.toBeNull();
+    expect(Number(m![1])).toBe(MAX_DIRECTIVES);
+  });
 });
 
 describe("classifyShmSize", () => {
