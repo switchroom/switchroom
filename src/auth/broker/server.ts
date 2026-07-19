@@ -29,6 +29,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -38,7 +39,7 @@ import {
 import { closeSync, openSync, writeSync } from "node:fs";
 import * as constants from "node:constants";
 import { createHash } from "node:crypto";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 import { allocateAgentUid } from "../../agents/compose.js";
 import { resolveAgentsDir } from "../../config/loader.js";
@@ -83,7 +84,8 @@ import {
   SNAPSHOT_STALE_AGE_MS,
 } from "./account-eligibility.js";
 import type { AuthConfig, AuthConsumer, SwitchroomConfig } from "../../config/schema.js";
-import { atomicWriteFileSync, atomicWriteJsonSync } from "../../util/atomic.js";
+import { atomicWriteJsonSync } from "../../util/atomic.js";
+import { safeMirrorWrite } from "./mirror-write.js";
 import {
   REFRESH_THRESHOLD_MS,
   refreshAccountIfNeeded,
@@ -3914,24 +3916,101 @@ export class AuthBroker {
   private mirrorAccountToConsumer(label: string, consumer: { name: string; uid?: number; mirror_dir?: string }): boolean {
     const mirrorDir = consumer.mirror_dir;
     if (!mirrorDir) return false;
-    const targetPath = join(mirrorDir, ".credentials.json");
     const credsPath = accountCredentialsPath(label, this.home);
     if (!existsSync(credsPath)) return false;
     const mirrorContent = enrichMirrorContent(readFileSync(credsPath, "utf-8"));
-    try {
-      mkdirSync(mirrorDir, { recursive: true, mode: 0o700 });
-      atomicWriteFileSync(targetPath, mirrorContent, 0o600);
+
+    // Symlink guard (#1393 / M1): the consumer owns `mirror_dir` and its
+    // contents, so it can pre-plant `mirror_dir` (or the target file, or
+    // any ancestor of a not-yet-existing `mirror_dir`) as a symlink. The
+    // broker runs as root; a raw recursive-mkdir + path-chown would
+    // dereference that and hand the consumer a root-owned write/chown at
+    // an arbitrary host path. Validate + safely create BEFORE any write.
+    const safe = this.resolveConsumerMirrorPathsSafe(consumer.name, mirrorDir);
+    if (!safe) return false;
+
+    return safeMirrorWrite({
+      parentDir: safe.mirrorDir,
+      expectedRealParent: safe.expectedRealParent,
+      targetPath: safe.targetPath,
+      content: mirrorContent,
+      uid: consumer.uid ?? 0,
+      onChownError: (err) => this.warnCapChownMissing(err),
+      refuse: (component, reason) =>
+        this.auditMirrorRefused({ kind: "consumer", name: consumer.name }, component, reason),
+      logErr: (msg) => this.logErr(`consumer-mirror ${consumer.name} <- ${label}: ${msg}`),
+    });
+  }
+
+  /**
+   * Symlink guard for a consumer's `mirror_dir` write path (#1393 / M1).
+   *
+   * Harsher than the per-agent tree: the broker `mkdirSync({recursive})`s
+   * `mirror_dir`, and that directory is consumer-writable. So we refuse to
+   * CREATE it through any symlinked ancestor — the leaf `mirror_dir` is
+   * mkdir'd (non-recursively) only after `lstat` confirms it is absent and
+   * its parent is a real (non-symlink) directory. An already-existing
+   * `mirror_dir` must itself be a real directory (not a symlink the
+   * consumer swapped in). The target `.credentials.json` must be
+   * absent or a regular file — never a symlink.
+   *
+   * Returns the validated paths + the canonical-parent pin for
+   * `safeMirrorWrite`, or `null` if the mirror must be skipped (already
+   * logged + audited). Never throws.
+   */
+  private resolveConsumerMirrorPathsSafe(
+    consumerName: string,
+    mirrorDir: string,
+  ): { mirrorDir: string; targetPath: string; expectedRealParent: string } | null {
+    const identity: Identity = { kind: "consumer", name: consumerName };
+    const refuse = (component: string, reason: string): null => {
+      this.auditMirrorRefused(identity, component, reason);
+      return null;
+    };
+
+    const parent = dirname(mirrorDir);
+    const mirrorStat = this.lstatOrNull(mirrorDir);
+    if (mirrorStat) {
+      // `mirror_dir` exists — it must be a real directory, not a symlink
+      // the consumer swapped in to redirect the root write.
+      if (mirrorStat.isSymbolicLink()) return refuse("mirror_dir", "is-a-symlink");
+      if (!mirrorStat.isDirectory()) return refuse("mirror_dir", "is-not-a-directory");
+    } else {
+      // `mirror_dir` absent — create it, but ONLY through a real
+      // (non-symlink) parent: refuse to mkdir through a symlinked
+      // ancestor the consumer could have planted.
+      const parentStat = this.lstatOrNull(parent);
+      if (!parentStat) return refuse("mirror_dir-parent", "does-not-exist");
+      if (parentStat.isSymbolicLink()) return refuse("mirror_dir-parent", "is-a-symlink");
+      if (!parentStat.isDirectory()) return refuse("mirror_dir-parent", "is-not-a-directory");
       try {
-        const uid = consumer.uid ?? 0;
-        chownSync(targetPath, uid, uid);
+        mkdirSync(mirrorDir, { recursive: false, mode: 0o700 });
       } catch (err) {
-        this.warnCapChownMissing(err);
+        this.logErr(`consumer-mirror ${consumerName}: mkdir ${mirrorDir}: ${(err as Error).message}`);
+        return null;
       }
-      return true;
-    } catch (err) {
-      this.logErr(`consumer-mirror ${consumer.name} <- ${label}: ${(err as Error).message}`);
-      return false;
     }
+
+    const targetPath = join(mirrorDir, ".credentials.json");
+    const targetStat = this.lstatOrNull(targetPath);
+    if (targetStat) {
+      if (targetStat.isSymbolicLink()) return refuse(".credentials.json", "is-a-symlink");
+      if (!targetStat.isFile()) return refuse(".credentials.json", "is-not-a-regular-file");
+    }
+
+    // Canonical-parent pin (M1): derive the expected realpath from the
+    // parent's canonical location + the leaf name. `safeMirrorWrite`
+    // recomputes `realpathSync(mirror_dir)` and refuses on divergence —
+    // catching a raced swap of `mirror_dir` to a symlink after this sweep.
+    let expectedRealParent: string;
+    try {
+      expectedRealParent = join(realpathSync(parent), basename(mirrorDir));
+    } catch (err) {
+      this.logErr(`consumer-mirror ${consumerName}: realpath ${parent}: ${(err as Error).message}`);
+      return null;
+    }
+
+    return { mirrorDir, targetPath, expectedRealParent };
   }
 
   /**
@@ -4033,23 +4112,14 @@ export class AuthBroker {
    */
   private resolveMirrorPathsSafe(
     agentName: string,
-  ): { agentDir: string; claudeDir: string; targetPath: string } | null {
+  ): { agentDir: string; claudeDir: string; targetPath: string; expectedRealParent: string } | null {
     const agentsDir = resolveAgentsDir(this.config);
     const agentDir = resolve(agentsDir, agentName);
     const claudeDir = join(agentDir, ".claude");
     const targetPath = join(claudeDir, ".credentials.json");
 
     const refuse = (component: string, reason: string): null => {
-      this.logErr(
-        `fanout ${agentName}: REFUSING mirror — ${component} ${reason} ` +
-          `(symlink-guard #1393; agent-owned tree may be attacker-poisoned)`,
-      );
-      this.audit({
-        op: "mirror-symlink-refused",
-        identity: { kind: "agent", name: agentName, admin: false },
-        ok: false,
-        error: `${component}:${reason}`,
-      });
+      this.auditMirrorRefused({ kind: "agent", name: agentName, admin: false }, component, reason);
       return null;
     };
 
@@ -4098,7 +4168,16 @@ export class AuthBroker {
         return refuse(".credentials.json", "is-not-a-regular-file");
     }
 
-    return { agentDir, claudeDir, targetPath };
+    // Canonical-parent pin (M1): derive `claudeDir`'s expected realpath
+    // from the trusted anchor (`agentsDir`, root-owned, lstat-verified
+    // non-symlink) + the lstat-validated component names. `safeMirrorWrite`
+    // recomputes `realpathSync(claudeDir)` right before the write and
+    // refuses on divergence — catching a raced swap of `agentDir`/`.claude`
+    // to a symlink after this sweep. `agentsDir` is guaranteed to exist
+    // here (validated above), so `realpathSync` cannot throw for it.
+    const expectedRealParent = join(realpathSync(agentsDir), agentName, ".claude");
+
+    return { agentDir, claudeDir, targetPath, expectedRealParent };
   }
 
   private lstatOrNull(path: string): ReturnType<typeof lstatSync> | null {
@@ -4107,6 +4186,25 @@ export class AuthBroker {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Log + audit a symlink/TOCTOU mirror refusal (#1393). Shared by the
+   * per-agent and per-consumer resolvers and the `safeMirrorWrite`
+   * primitive. Never throws.
+   */
+  private auditMirrorRefused(identity: Identity, component: string, reason: string): void {
+    const who = identity.kind === "operator" ? "operator" : identity.name;
+    this.logErr(
+      `mirror ${who}: REFUSING mirror — ${component} ${reason} ` +
+        `(symlink-guard #1393; peer-owned tree may be attacker-poisoned)`,
+    );
+    this.audit({
+      op: "mirror-symlink-refused",
+      identity,
+      ok: false,
+      error: `${component}:${reason}`,
+    });
   }
 
   private mirrorAccountToAgent(label: string, agentName: string): boolean {
@@ -4121,7 +4219,13 @@ export class AuthBroker {
     // the fanout.
     const safe = this.resolveMirrorPathsSafe(agentName);
     if (!safe) return false;
-    const { claudeDir, targetPath } = safe;
+    const { claudeDir, targetPath, expectedRealParent } = safe;
+    // `.claude` was lstat-verified (absent or a real dir) by
+    // `resolveMirrorPathsSafe`; `agentDir` is a verified real dir, so a
+    // recursive mkdir here only ever creates the single `.claude` leaf and
+    // cannot traverse a symlink. `safeMirrorWrite` then re-pins
+    // `realpathSync(claudeDir)` against `expectedRealParent` right before
+    // the write to close the residual lstat→write TOCTOU.
     mkdirSync(claudeDir, { recursive: true, mode: 0o700 });
     // Claude Code (2.x) reads OAuth credentials from `.credentials.json`
     // (dotfile, see the binary string table). The pre-RFC-H fanout used
@@ -4132,19 +4236,17 @@ export class AuthBroker {
     // must land at the dotfile path or agents silently lose auth on
     // first restart. Pinned by tests in server.test.ts. `targetPath`
     // is the symlink-guarded path from `resolveMirrorPathsSafe`.
-    try {
-      atomicWriteFileSync(targetPath, mirrorContent, 0o600);
-      try {
-        const uid = allocateAgentUid(agentName);
-        chownSync(targetPath, uid, uid);
-      } catch (err) {
-        this.warnCapChownMissing(err);
-      }
-      return true;
-    } catch (err) {
-      this.logErr(`fanout ${agentName} <- ${label}: ${(err as Error).message}`);
-      return false;
-    }
+    return safeMirrorWrite({
+      parentDir: claudeDir,
+      expectedRealParent,
+      targetPath,
+      content: mirrorContent,
+      uid: allocateAgentUid(agentName),
+      onChownError: (err) => this.warnCapChownMissing(err),
+      refuse: (component, reason) =>
+        this.auditMirrorRefused({ kind: "agent", name: agentName, admin: false }, component, reason),
+      logErr: (msg) => this.logErr(`fanout ${agentName} <- ${label}: ${msg}`),
+    });
   }
 
   /* ─── State persistence ─────────────────────────────────────── */

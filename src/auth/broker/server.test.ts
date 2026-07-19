@@ -2656,34 +2656,38 @@ describe("AuthBroker — historical-bug regressions (2026-05-14 fanout incident)
   it("Bug 1: per-agent mirror is chowned to the per-agent UID, never left as root", async () => {
     // The broker container runs as root and writes per-agent credentials.json.
     // Without an explicit chown, the file would land as root:root 0600 and
-    // the agent (running as 10001–10999) couldn't read it. server.ts:953-956
-    // calls `chownSync(targetPath, uid, uid)` where uid = allocateAgentUid().
-    // We can't run as root in the test (so chownSync is a best-effort no-op
-    // under dev — see the catch block), but we CAN verify the call is made
-    // and reaches the right UID by spying on chownSync indirectly:
-    // statSync(targetPath).uid will equal the test runner's UID in dev mode
-    // (broker tried to chown to per-agent UID but lacked CAP_CHOWN). In
-    // production with CAP_CHOWN, it would equal allocateAgentUid("ziggy").
+    // the agent (running as 10001–10999) couldn't read it. mirrorAccountToAgent
+    // flips ownership to `allocateAgentUid(agentName)`.
     //
-    // The pin: read the broker's source to confirm the chown call exists
-    // with the right argument shape — a structural assertion that survives
-    // a future "just remove the chown, it's a no-op in dev" refactor.
+    // Since PR1 (#1393 / M1) the ownership flip is done on the tempfile *fd*
+    // inside `safeMirrorWrite` → `atomicWriteFileSync` (fd-based fchown BEFORE
+    // rename), NOT a path-based `chownSync(targetPath)`. A path-based chown
+    // after the write would follow a symlink an attacker raced into place at
+    // the destination — the M1 TOCTOU this PR closes. So the pin now asserts
+    // the *new* hardened shape and that the old path-chown did NOT come back.
+    //
+    // We can't reliably run as root in CI (so the fchown is a best-effort
+    // no-op under dev — swallowed via onChownError), but we CAN verify the
+    // call is made and reaches the right UID by reading the source.
     const fs = await import("node:fs");
     const url = await import("node:url");
     const path = await import("node:path");
     const here = path.dirname(url.fileURLToPath(import.meta.url));
     const serverSrc = fs.readFileSync(path.join(here, "server.ts"), "utf-8");
-    // Must chown the mirror file to allocateAgentUid(agentName), not leave
-    // it root-owned. The exact pattern (a chownSync call against the
-    // freshly-written .credentials.json path inside mirrorAccountToAgent)
-    // is what closes Bug 1.
-    // Budget bumped from 1600 → 3000 when mirror-time enrichment
-    // landed (enrichMirrorContent call + load-bearing inline comments
-    // about the .credentials.json dotfile invariant). The pin is still
-    // meaningful — it asserts the chown call is *inside* the function,
-    // not extracted to a remote helper that could regress silently.
-    expect(serverSrc).toMatch(/mirrorAccountToAgent[\s\S]{0,3000}allocateAgentUid/);
-    expect(serverSrc).toMatch(/mirrorAccountToAgent[\s\S]{0,3000}chownSync\(targetPath/);
+    const atomicSrc = fs.readFileSync(
+      path.join(here, "..", "..", "util", "atomic.ts"),
+      "utf-8",
+    );
+    // mirrorAccountToAgent must hand the per-agent UID to the shared write
+    // primitive, not leave the mirror root-owned. The pin asserts the uid is
+    // wired through inside the function, not silently dropped.
+    expect(serverSrc).toMatch(/mirrorAccountToAgent[\s\S]{0,3000}safeMirrorWrite/);
+    expect(serverSrc).toMatch(/mirrorAccountToAgent[\s\S]{0,3000}uid:\s*allocateAgentUid/);
+    // M1 regression guard: the path-based chown that followed a raced symlink
+    // must NOT be reintroduced inside mirrorAccountToAgent.
+    expect(serverSrc).not.toMatch(/mirrorAccountToAgent[\s\S]{0,3000}chownSync\(targetPath/);
+    // The ownership flip lands on the fd (fchownSync), before rename.
+    expect(atomicSrc).toMatch(/fchownSync\(fd/);
   });
 
   it("Bug 2: refresh tick writes ONLY the agent's effective account, not last-iterated label", async () => {
