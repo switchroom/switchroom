@@ -80,6 +80,19 @@ DEFAULTS = {
     "recallTagsMatch": "any",
     "recallTagGroups": None,
     "recallAdditionalBankFilters": {},
+    # Switchroom (hindsight-leverage PR5) — per-tag recall score weights. A map
+    # of ``{tag: multiplier}`` applied to each result's ``scores.final`` just
+    # before the final relevance sort/cap in recall.py. A weight < 1.0 DEMOTES
+    # (down-ranks) memories carrying that tag without DROPPING them — distinct
+    # from the hard demote-tag drop filter (`_is_demoted_memory`), which removes
+    # a memory from recall entirely. This is the "reduced weight" the drop
+    # filter cannot express: a demoted memory still surfaces when it is the only
+    # relevant hit, just below equal-scoring untagged memories. Default {} =
+    # no-op (identity weighting). Switchroom's scaffold seeds
+    # ``{"sidechain": 0.8}`` so delegated sub-agent process-memories rank just
+    # under first-party session memories. Env: HINDSIGHT_RECALL_TAG_WEIGHTS
+    # (JSON object).
+    "recallTagWeights": {},
     "recallPromptPreamble": (
         "Relevant memories from past conversations (prioritize recent when "
         "conflicting). Only use memories that are directly useful to continue "
@@ -178,6 +191,7 @@ ENV_OVERRIDES = {
     "HINDSIGHT_RECALL_TAGS": ("recallTags", list),
     "HINDSIGHT_RECALL_TAGS_MATCH": ("recallTagsMatch", str),
     "HINDSIGHT_RECALL_TAG_GROUPS": ("recallTagGroups", dict),
+    "HINDSIGHT_RECALL_TAG_WEIGHTS": ("recallTagWeights", dict),
     "HINDSIGHT_RECALL_ADDITIONAL_BANK_FILTERS": ("recallAdditionalBankFilters", dict),
     "HINDSIGHT_API_PORT": ("apiPort", int),
     "HINDSIGHT_DAEMON_IDLE_TIMEOUT": ("daemonIdleTimeout", int),

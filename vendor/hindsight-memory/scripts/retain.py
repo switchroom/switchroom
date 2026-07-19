@@ -38,7 +38,7 @@ from lib.pacing import inflight_lock
 from lib.state import increment_turn_count, track_retention
 
 
-def read_transcript(transcript_path: str) -> list:
+def read_transcript(transcript_path: str, max_bytes: int | None = None) -> list:
     """Read a JSONL transcript file and return list of message dicts.
 
     Claude Code transcript format nests messages:
@@ -52,12 +52,30 @@ def read_transcript(transcript_path: str) -> list:
     watermark can key on it. The uuid is stable across compaction and unique
     per entry. Adding the key is inert for downstream formatting
     (``lib/content`` reads only ``role``/``content``).
+
+    ``max_bytes`` (switchroom hindsight-leverage PR5 — bounded read): when set,
+    only the LAST ``max_bytes`` of the file are read and the first (possibly
+    partial) line of that window is discarded, so a multi-hour worker's
+    arbitrarily-large sidechain transcript can never eat the hook budget on the
+    read before the volume-gate/POST. Transcript ORDER is preserved (we read the
+    tail, in order); a window this covers >> the retain window + gate floors, so
+    the "last N turns" slice and PASS/skip decision are unaffected in practice.
+    ``None`` (default) reads the whole file — the main Stop/reconcile paths are
+    unchanged.
     """
     if not transcript_path or not os.path.isfile(transcript_path):
         return []
     messages = []
     try:
-        with open(transcript_path, encoding="utf-8") as f:
+        with open(transcript_path, encoding="utf-8", errors="replace") as f:
+            if max_bytes is not None and max_bytes > 0:
+                try:
+                    size = os.path.getsize(transcript_path)
+                    if size > max_bytes:
+                        f.seek(size - max_bytes)
+                        f.readline()  # drop the partial first line of the window
+                except OSError:
+                    pass
             for line in f:
                 line = line.strip()
                 if not line:

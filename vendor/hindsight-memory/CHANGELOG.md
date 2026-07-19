@@ -2,6 +2,42 @@
 
 ## [Unreleased]
 
+### Added (switchroom divergence)
+
+- **SubagentStop sidechain retain** (switchroom hindsight-leverage PR5). New
+  `scripts/subagent_retain.py`, registered on the `SubagentStop` event in
+  `hooks/hooks.json` (async, 15s). Delegated (Task-tool / sub-agent) work was
+  the biggest systematic memory hole — the main-session Stop retain only reads
+  the parent `transcript_path`, so a worker's process facts reached memory only
+  as its terse final report. This hook retains a bounded window (last 40 human
+  turns) of the *sidechain* transcript, tagged `sidechain` +
+  `parent_session:<id>`, with a deterministic content-derived `document_id` in a
+  distinct namespace (`{session}-sub-{agent}-r{start}-{end}`) so re-fires upsert.
+  Failures enqueue to the same `pending-retains` durability queue the Stop retain
+  uses. A **volume gate** (< 6 human turns OR < 2,000 chars of non-tool-result
+  text) skips trivial forks (every Task fires SubagentStop, including
+  10-second ones). Empirically probed on Claude Code 2.1.215: the hook input
+  carries a first-class `agent_transcript_path` pointing at
+  `<project>/<session>/subagents/agent-<agent_id>.jsonl` (used as the primary
+  path), with a directory-scan of the newest `isSidechain:true` jsonl as the
+  fallback for CLIs that omit the field. `reconcile_tail.py` and any transcript
+  sweeper now **skip** sidechain transcripts (shared
+  `content.transcript_first_line_is_sidechain` predicate) so the boot reconciler
+  cannot re-retain a sub-agent fork as a pseudo-session — untagged, at full
+  recall weight, bypassing the volume gate — which its recursive `**/*.jsonl`
+  glob would otherwise do one restart after any worker.
+
+- **recall.py: `recallTagWeights` per-tag score penalty** (switchroom
+  hindsight-leverage PR5). A `{tag: multiplier}` config map (default `{}`,
+  env `HINDSIGHT_RECALL_TAG_WEIGHTS`) applied to each result's `scores.final`
+  immediately before the relevance sort. Unlike the demote-tag DROP filter
+  (`_is_demoted_memory`), which removes a tagged memory from recall entirely,
+  this DEMOTES (down-ranks) a memory while keeping it recallable when it is the
+  only relevant hit — the "reduced weight" the drop filter cannot express.
+  Switchroom's scaffold seeds `{"sidechain": 0.8}` so delegated-worker
+  process-memories rank just below first-party session memory. **Candidate to
+  upstream** — a general recall-shaping primitive, not switchroom-specific.
+
 ### Changed (switchroom divergence)
 
 - **retain.py: decouple chunked window-slicing from the `retainEveryNTurns > 1`

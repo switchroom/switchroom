@@ -341,6 +341,55 @@ class TestWatermark(DurabilityTestBase):
         self.assertIsNone(watermark.load("wm2"))
 
 
+class TestSidechainSkip(DurabilityTestBase):
+    """PR5 review finding 1: reconcile must NOT treat a sub-agent sidechain
+    transcript as a pseudo-session. The recursive glob matches
+    <session>/subagents/agent-<id>.jsonl; without the guard reconcile would
+    retain it at boot with an untagged, disjoint-namespace document (permanent
+    duplicate of subagent_retain.py's tagged retain, at full recall weight,
+    bypassing the volume gate)."""
+
+    def _write_sidechain(self, path, n_turns):
+        lines = []
+        for i in range(n_turns):
+            lines.append(json.dumps({
+                "type": "user", "isSidechain": True, "agentId": "af5",
+                "uuid": f"su{i}", "message": {"role": "user", "content": f"sc turn {i}"},
+            }))
+            lines.append(json.dumps({
+                "type": "assistant", "isSidechain": True, "agentId": "af5",
+                "uuid": f"sa{i}", "message": {"role": "assistant", "content": f"sc did {i}"},
+            }))
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+
+    def test_reconcile_skips_sidechain_transcript(self):
+        session = "sessX"
+        # A real parent session with un-committed turns (must still reconcile).
+        parent = os.path.join(self.transcripts, f"{session}.jsonl")
+        _write_transcript(parent, 4, session_prefix=session)
+        # A sidechain under <session>/subagents/ that the recursive glob matches.
+        sub_dir = os.path.join(self.transcripts, session, "subagents")
+        os.makedirs(sub_dir)
+        sc = os.path.join(sub_dir, "agent-af5.jsonl")
+        self._write_sidechain(sc, 5)
+
+        hook = {"session_id": session, "transcript_path": parent, "cwd": "/x"}
+        summary = reconcile_tail.reconcile(self._config(), hook_input=hook)
+
+        # The sidechain was recognised and skipped ...
+        self.assertGreaterEqual(summary["skipped_sidechain"], 1)
+        blob = self.daemon.content_blob()
+        # ... none of its content was retained ...
+        self.assertNotIn("sc turn", blob)
+        self.assertNotIn("sc did", blob)
+        # ... and no document carries the untagged agent-<id> namespace.
+        self.assertFalse(any(did.startswith("agent-af5") for did in self.daemon.docs))
+        # ... while the genuine parent session WAS reconciled.
+        for i in range(4):
+            self.assertIn(f"user turn {i}", blob)
+
+
 def _stdin(obj):
     import io
     return io.StringIO(json.dumps(obj))
