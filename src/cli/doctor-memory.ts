@@ -42,6 +42,71 @@ export interface CheckResult {
 /** 1 GiB in bytes — the floor below which PostgreSQL's shared segments fail. */
 export const MIN_HINDSIGHT_SHM_BYTES = 1024 * 1024 * 1024;
 
+/**
+ * Hard cap on how many active directives the recall hook ever injects into the
+ * prompt — MUST mirror `MAX_DIRECTIVES` in
+ * `vendor/hindsight-memory/scripts/lib/directives.py`. A bank with MORE active
+ * directives than this has its list SILENTLY truncated (`directives[:15]`) in the
+ * `<active_directives>` recall block: the lowest-priority directives beyond the
+ * cap never reach the agent. The doctor surfaces that truncation so it isn't
+ * silent (workstream C2).
+ */
+export const MAX_DIRECTIVES = 15;
+
+/**
+ * Soft threshold: a bank with MORE active directives than this earns a WARN
+ * before it hits the truncating hard cap. Directive count is a slow-moving
+ * signal an operator should prune well before recall starts dropping rules.
+ */
+export const DIRECTIVE_WARN_THRESHOLD = 12;
+
+/**
+ * Pure: classify a bank's ACTIVE-directive count into a health result.
+ *
+ * - `null` count (directive fetch failed / not attempted) → no row (returns null).
+ * - `<= DIRECTIVE_WARN_THRESHOLD` (≤12) → healthy, no row (avoids one ok line per
+ *   bank across the fleet; the issues card stays focused on problems).
+ * - `> DIRECTIVE_WARN_THRESHOLD` and `<= MAX_DIRECTIVES` (13–15) → **warn**: pile-up
+ *   approaching the truncating cap.
+ * - `> MAX_DIRECTIVES` (16+) → **fail**: the recall block silently truncates the
+ *   overflow; the lowest-priority directives never reach the agent.
+ */
+export function classifyDirectiveCount(
+  count: number | null,
+  bankLabel: string,
+): CheckResult | null {
+  if (count === null) return null;
+  const name = `${bankLabel} directives`;
+  if (count > MAX_DIRECTIVES) {
+    const truncated = count - MAX_DIRECTIVES;
+    return {
+      name,
+      status: "fail",
+      detail:
+        `${count} active directives — exceeds MAX_DIRECTIVES=${MAX_DIRECTIVES}, so the ` +
+        `${truncated} lowest-priority directive(s) are SILENTLY truncated from the ` +
+        `<active_directives> recall block and never reach the agent`,
+      fix:
+        "Retire or merge stale directives so the active count is at or below " +
+        `${MAX_DIRECTIVES} (deletes stay operator-approved). The mental-model-curator ` +
+        "skill's directive merge/retire pass is the durable path.",
+    };
+  }
+  if (count > DIRECTIVE_WARN_THRESHOLD) {
+    return {
+      name,
+      status: "warn",
+      detail:
+        `${count} active directives — approaching the MAX_DIRECTIVES=${MAX_DIRECTIVES} cap ` +
+        `above which the recall block silently truncates the overflow`,
+      fix:
+        "Prune or merge low-value directives before the count crosses " +
+        `${MAX_DIRECTIVES}. Review with \`switchroom memory --directives <bank>\`.`,
+    };
+  }
+  return null;
+}
+
 /** Pure: classify a container's ShmSize (bytes) into a health result. */
 export function classifyShmSize(bytes: number): CheckResult {
   const mib = Math.round(bytes / 1024 / 1024);
