@@ -314,6 +314,40 @@ export function withStoreLock<T>(
 }
 
 /**
+ * Per-pinKey async serial lock (F2, invisible-worker-cards review).
+ *
+ * The gateway's status-pin reconcile reads its `prev` claim from an in-memory
+ * map at the TOP of the reconcile, then awaits the persist+pin. Two overlapping
+ * reconciles for the SAME key could each capture a stale `prev`: a turn-end
+ * `{pinned:false}` reading prev=null no-ops and clears the durable row while a
+ * flood-delayed open-pin lands right after — a stuck pin with NO on-disk record.
+ *
+ * Chaining every reconcile for one pinKey through this tail map guarantees the
+ * NEXT reconcile reads `prev` only after the prior one for that key has fully
+ * settled (its in-memory Maps updated), so the pin decision always sees the true
+ * current claim. Different keys never contend. Same non-rejecting-tail contract
+ * as `withStoreLock`. Keyed by pinKey, held by the gateway around the WHOLE
+ * read-prev → decide → reconcileAndPersistStatusPin → update-Maps sequence.
+ */
+const pinReconcileTails = new Map<string, Promise<unknown>>()
+
+export function withPinReconcileLock<T>(
+  pinKey: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const prev = pinReconcileTails.get(pinKey) ?? Promise.resolve()
+  const run = prev.then(fn, fn)
+  pinReconcileTails.set(
+    pinKey,
+    run.then(
+      () => undefined,
+      () => undefined,
+    ),
+  )
+  return run
+}
+
+/**
  * READ-MODIFY-WRITE for exactly ONE pinKey's row, against the authoritative
  * on-disk file. Loads the current snapshot from disk, drops any row for
  * `pinKey`, appends `row` (unless null = removal), and persists atomically.
@@ -431,11 +465,37 @@ export function reconcileAndPersistStatusPin(args: {
       return next
     }
 
-    // clear: unpin (best-effort) THEN drop the record. Ordering is safe here —
-    // if we crash after the unpin but before the rewrite, the stale record just
-    // gets unpinned again next boot (idempotent), never a lingering pin.
+    // clear: unpin (best-effort) THEN reconcile the record with the OUTCOME.
+    //
+    // F1 (invisible-worker-cards review): a `clear` op covers BOTH a genuine
+    // unpin AND a `noop: already pinned` — the pin decision maps every non-`pin`
+    // action here (see decidePinAction → the gateway's op mapping). For a real
+    // unpin, applyPin drops the claim and returns null → we remove the row. But
+    // for a noop-already-pinned, reconcilePin returns the LIVE claim unchanged
+    // (non-null) and issues NO Telegram call — the pin is still up. The worker
+    // feed calls syncPin on EVERY steady-state edit, so a noop-clear fires
+    // constantly; unconditionally deleting the row there erased the durable
+    // status-pins.json entry for a still-live pin. A crash after that left a
+    // stuck pinned card boot cleanup could never see. So: only drop the row when
+    // the claim is actually gone (next == null); when applyPin returns a live
+    // claim, PRESERVE the row (rewritten confirmed) so the durable record keeps
+    // tracking the pin that is genuinely still up. No extra Telegram API call is
+    // added — applyPin already ran; this only changes the disk write's content.
+    // Ordering for the real-unpin case is safe: if we crash after the unpin but
+    // before the rewrite, the stale record just gets unpinned again next boot
+    // (idempotent), never a lingering pin.
     const next = await args.applyPin()
-    applyStatusPinRow(path, fs, pinKey, null, log)
+    if (next == null) {
+      applyStatusPinRow(path, fs, pinKey, null, log)
+    } else {
+      applyStatusPinRow(
+        path,
+        fs,
+        pinKey,
+        { pinKey, chatId, messageId: next.messageId },
+        log,
+      )
+    }
     return next
   })
 }

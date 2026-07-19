@@ -58,6 +58,53 @@ describe('activity-card durability wiring', () => {
     expect(recordCode).not.toMatch(/pinned: true/)
   })
 
+  // F6 (persist-intent-first ordering): the durable record must be written in
+  // the SAME synchronous block as the send, BEFORE the status-pin reconcile and
+  // with NO `await` between the send resolving and the persist — otherwise the
+  // crash window in which a sent card has no reapable record reopens. Structural
+  // lock (the gateway IIFE can't be instantiated in-process); complements the
+  // behavioural store/reaper tests in activity-card-store.test.ts.
+  it('(F6) persists the record BEFORE the status-pin reconcile, with no await between send and persist', () => {
+    const openBranch = between(
+      laneSrc,
+      'if (turn.activityMessageId == null) {',
+      'turn.activityLastSentRender = target',
+    )
+    const persistIdx = openBranch.indexOf('writeActivityCardRecord(')
+    const pinIdx = openBranch.indexOf('void reconcileStatusPin(')
+    expect(persistIdx).toBeGreaterThanOrEqual(0)
+    expect(pinIdx).toBeGreaterThanOrEqual(0)
+    // Persist-intent-first: the record write precedes the pin reconcile.
+    expect(persistIdx).toBeLessThan(pinIdx)
+    // No `await` sits between the send returning and the persist — the whole
+    // window from `const sent =` to writeActivityCardRecord( is synchronous.
+    const sendToPersist = between(openBranch, 'const sent = await robustApiCall', 'writeActivityCardRecord(')
+    const codeOnly = sendToPersist
+      .split('\n')
+      .filter((l) => !l.trim().startsWith('//') && !l.trim().startsWith('*'))
+      .join('\n')
+    expect(codeOnly).not.toMatch(/\bawait\b/)
+  })
+
+  // F5 (persist-intent honesty): the persisted `pinned` mirrors the ACTUAL pin
+  // decision (PIN_STATUS_WHILE_WORKING), never a bare `pinned: true`. This is
+  // also asserted in the OPEN test above; kept as a named F5 lock so a rename or
+  // refactor that reintroduces an unconditional `pinned: true` is caught here too.
+  it('(F5) the persisted record mirrors the real pin decision, not an unconditional pinned:true', () => {
+    const openBranch = between(
+      laneSrc,
+      'if (turn.activityMessageId == null) {',
+      'turn.activityLastSentRender = target',
+    )
+    const recordBlock = between(openBranch, 'writeActivityCardRecord(', 'void reconcileStatusPin(')
+    const recordCode = recordBlock
+      .split('\n')
+      .filter((l) => !l.trim().startsWith('//'))
+      .join('\n')
+    expect(recordCode).toMatch(/pinned: PIN_STATUS_WHILE_WORKING/)
+    expect(recordCode).not.toMatch(/pinned: true/)
+  })
+
   it('the normal-CLOSE path clears the durable handle, id-scoped (reap-race guard)', () => {
     const closeBody = between(
       laneSrc,

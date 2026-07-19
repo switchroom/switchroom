@@ -147,6 +147,56 @@ describe('subagent-tracker-pretool', () => {
     expect(row?.model ?? null).toBeNull()
   })
 
+  // F3 (progress-card fork model): a fork dispatch inherits the parent's model
+  // and IGNORES tool_input.model, so seeding the row's first-paint model from
+  // that ignored override made the worker card show a WRONG model (e.g. "sonnet"
+  // while the fork runs Opus) until the transcript overwrote it. The seed must
+  // be suppressed for forks — model stays NULL and the card omits it until the
+  // watcher records the real model from the fork's own transcript.
+  it('leaves model null for a FORK dispatch even when tool_input.model is set (F3)', () => {
+    const event = {
+      session_id: 'sess-fork',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_fork001',
+      tool_input: {
+        subagent_type: 'fork',
+        description: 'Fork the session',
+        run_in_background: true,
+        model: 'sonnet', // override a fork ignores — must NOT be persisted
+      },
+    }
+    const result = runHook(PRETOOL_SCRIPT, event)
+    expect(result.status).toBe(0)
+
+    const db = openDb()
+    const row = db.prepare('SELECT model FROM subagents WHERE id = ?').get('toolu_fork001') as
+      | { model: string | null }
+      | undefined
+    expect(row?.model ?? null).toBeNull()
+  })
+
+  it('still persists tool_input.model for a NON-fork dispatch (fork suppression is scoped)', () => {
+    const event = {
+      session_id: 'sess-nonfork',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_nonfork001',
+      tool_input: {
+        subagent_type: 'researcher',
+        description: 'Research with a pinned model',
+        run_in_background: true,
+        model: 'claude-opus-4-8',
+      },
+    }
+    const result = runHook(PRETOOL_SCRIPT, event)
+    expect(result.status).toBe(0)
+
+    const db = openDb()
+    const row = db.prepare('SELECT model FROM subagents WHERE id = ?').get('toolu_nonfork001') as
+      | { model: string | null }
+      | undefined
+    expect(row?.model).toBe('claude-opus-4-8')
+  })
+
   it('does not write a row when tool_name is not Agent', () => {
     const event = {
       session_id: 'sess-abc123',

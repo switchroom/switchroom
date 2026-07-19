@@ -7,10 +7,13 @@ import {
   pinnedMessageIsOurs,
   reconcileAndPersistStatusPin,
   runStatusPinBootCleanup,
+  withPinReconcileLock,
   type PersistedStatusPin,
   type StatusPinStoreFsSeam,
   type TrackedStatusPin,
 } from "../gateway/status-pin-store.js";
+import { decidePinAction, type PinState, type DesiredPin } from "../status-pin.js";
+import { reconcilePin, type PinBotApi } from "../status-pin-driver.js";
 
 /** In-memory fs seam with an atomic rename, so the store's tmp→rename
  *  crash-safety contract is exercised without touching the real disk. */
@@ -717,5 +720,200 @@ describe("reconcileAndPersistStatusPin — persist-before-pin ordering", () => {
     });
     expect(next).toBeNull();
     expect(loadStatusPins(PATH, fs)).toEqual([]);
+  });
+
+  // F1 (invisible-worker-cards review): a `clear` op is emitted for BOTH a real
+  // unpin AND a `noop: already pinned`. For a noop, reconcilePin issues NO
+  // Telegram call and returns the LIVE claim (non-null). The pre-fix clear
+  // branch dropped the row unconditionally, so the worker feed's per-edit
+  // syncPin (every steady-state edit maps to a noop-clear) erased the durable
+  // row for a still-live pin — a crash after that left a stuck pinned card boot
+  // cleanup could never see. The row MUST be preserved when applyPin returns a
+  // live claim.
+  it("clear op with a LIVE claim (noop-already-pinned) PRESERVES the durable row", async () => {
+    const { fs, calls } = memFs();
+    persistStatusPins(PATH, fs, [pin({ pinKey: "wk:group:g1", messageId: 715 })]);
+    const before = calls.length;
+    // applyPin returns the live claim unchanged (what reconcilePin does on noop).
+    const next = await reconcileAndPersistStatusPin({
+      path: PATH,
+      fs,
+      pinKey: "wk:group:g1",
+      chatId: "-100123",
+      op: { kind: "clear" },
+      applyPin: async () => ({ messageId: 715 }),
+      log: () => {},
+    });
+    expect(next).toEqual({ messageId: 715 });
+    // Row survives (rewritten confirmed, no `pending`).
+    expect(loadStatusPins(PATH, fs)).toEqual([
+      { pinKey: "wk:group:g1", chatId: "-100123", messageId: 715 },
+    ]);
+    // Sanity: at least one disk write happened (the confirm rewrite) — the fix
+    // does not skip persistence, it changes the CONTENT from delete to upsert.
+    expect(calls.length).toBeGreaterThan(before);
+  });
+
+  it("repeated steady-state noop-clears keep the row present across many edits", async () => {
+    const { fs } = memFs();
+    persistStatusPins(PATH, fs, [pin({ pinKey: "wk:group:g1", messageId: 715 })]);
+    for (let i = 0; i < 5; i++) {
+      await reconcileAndPersistStatusPin({
+        path: PATH,
+        fs,
+        pinKey: "wk:group:g1",
+        chatId: "-100123",
+        op: { kind: "clear" },
+        applyPin: async () => ({ messageId: 715 }),
+        log: () => {},
+      });
+    }
+    expect(loadStatusPins(PATH, fs)).toEqual([
+      { pinKey: "wk:group:g1", chatId: "-100123", messageId: 715 },
+    ]);
+  });
+});
+
+/**
+ * F2 (invisible-worker-cards review): the gateway's status-pin reconcile reads
+ * its `prev` claim from an in-memory map at the top of the reconcile, then
+ * awaits. Two overlapping reconciles for ONE key with OPPOSITE desires could
+ * both capture a stale `prev` → a turn-end `{pinned:false}` clears the durable
+ * row while a flood-delayed open-pin lands, leaving a stuck pin with no row.
+ *
+ * These tests exercise the REAL fix primitives — `withPinReconcileLock` +
+ * `reconcileAndPersistStatusPin` + `reconcilePin` + `decidePinAction` — composed
+ * exactly as the gateway wires them (read prev INSIDE the per-key lock), and
+ * prove the row survives. The `noLock` control models the pre-fix ordering
+ * (prev read OUTSIDE the lock) and shows it regresses — so the lock, not luck,
+ * is what fixes it.
+ */
+describe("status-pin-store — F2 per-key reconcile serialization", () => {
+  // A gateway-faithful reconcile: an in-memory claim map (the `prev` source read
+  // at the TOP of the reconcile), the real decide→op mapping, and
+  // reconcileAndPersistStatusPin driving reconcilePin against a call-counting
+  // pin API. An optional gate lets a test hold ONE reconcile's applyPin open to
+  // force the exact interleave. `serialize` toggles the F2 fix.
+  function makeReconciler(fs: StatusPinStoreFsSeam, opts: { serialize: boolean }) {
+    const claims = new Map<string, PinState>();
+    const pinCalls: number[] = [];
+    const unpinCalls: number[] = [];
+    const api: PinBotApi = {
+      pinChatMessage: async (_c, id) => {
+        pinCalls.push(id);
+      },
+      unpinChatMessage: async (_c, id) => {
+        unpinCalls.push(id);
+      },
+    };
+    async function core(
+      pinKey: string,
+      chatId: string,
+      desired: DesiredPin,
+      gate?: Promise<void>,
+    ) {
+      const prev = claims.get(pinKey) ?? null; // read BEFORE the store op (the F2 window)
+      const action = decidePinAction(prev, desired);
+      const op =
+        action.kind === "pin"
+          ? ({ kind: "pin", messageId: action.messageId } as const)
+          : ({ kind: "clear" } as const);
+      const next = await reconcileAndPersistStatusPin({
+        path: PATH,
+        fs,
+        pinKey,
+        chatId,
+        op,
+        applyPin: async () => {
+          if (gate) await gate; // hold the pin open inside the store lock
+          return reconcilePin({ api, chatId, prevState: prev, desired });
+        },
+        log: () => {},
+      });
+      if (next == null) claims.delete(pinKey);
+      else claims.set(pinKey, next);
+    }
+    function reconcile(
+      pinKey: string,
+      chatId: string,
+      desired: DesiredPin,
+      gate?: Promise<void>,
+    ) {
+      return opts.serialize
+        ? withPinReconcileLock(pinKey, () => core(pinKey, chatId, desired, gate))
+        : core(pinKey, chatId, desired, gate);
+    }
+    return { reconcile, claims, pinCalls, unpinCalls };
+  }
+
+  // The exact review sequence: a flood-delayed OPEN-pin (A) is in-flight inside
+  // the store lock; a turn-end UNPIN (B) starts during A's await window and
+  // reads prev=null (A has not set the claim yet). Pre-fix, B's clear then drops
+  // the disk row A wrote — stranding a live in-memory claim with NO durable row.
+  async function runStrandingSequence(serialize: boolean) {
+    const { fs } = memFs();
+    const r = makeReconciler(fs, { serialize });
+    let releaseA!: () => void;
+    const gateA = new Promise<void>((res) => {
+      releaseA = res;
+    });
+    // A: open-pin 900, held open at applyPin.
+    const aDone = r.reconcile("fg:c:3", "-100123", { pinned: true, messageId: 900 }, gateA);
+    // Let A reach its applyPin await (pending row on disk; claim NOT yet set).
+    await Promise.resolve();
+    await Promise.resolve();
+    // B: turn-end unpin, starts now — reads prev from the in-memory claim map.
+    const bDone = r.reconcile("fg:c:3", "-100123", { pinned: false });
+    await Promise.resolve();
+    releaseA();
+    await Promise.all([aDone, bDone]);
+    return { fs, claims: r.claims, unpinCalls: r.unpinCalls, pinCalls: r.pinCalls };
+  }
+
+  it("serialized: turn-end unpin waits for the in-flight open-pin, so the pinned message is genuinely UNPINNED (not stranded)", async () => {
+    const { fs, claims, pinCalls, unpinCalls } = await runStrandingSequence(true);
+    const rows = loadStatusPins(PATH, fs);
+    // Under serialization B runs only after A fully settles, so B reads
+    // prev={900}, issues a REAL unpin of the pinned message, and clears the row
+    // and claim together. The Telegram pin is cleaned up — nothing stuck.
+    expect(pinCalls).toEqual([900]); // A pinned it
+    expect(unpinCalls).toEqual([900]); // B unpinned it (the fix)
+    expect(rows).toEqual([]);
+    expect(claims.get("fg:c:3") ?? null).toBeNull();
+  });
+
+  it("pre-fix control (no per-key lock): the same interleave STRANDS the pinned message — pinned, row cleared, NEVER unpinned", async () => {
+    const { fs, unpinCalls, pinCalls } = await runStrandingSequence(false);
+    const rows = loadStatusPins(PATH, fs);
+    // Reproduces the F2 defect the lock removes: B read prev=null during A's
+    // await window, so its clear was a NO-OP unpin (issued no Telegram unpin)
+    // yet still dropped the durable row A wrote — while A's pin call landed. The
+    // message 900 stays pinned on Telegram with NO durable row and no unpin ever
+    // issued → stuck until a boot cleanup that can no longer see it.
+    expect(pinCalls).toEqual([900]); // message 900 WAS pinned
+    expect(unpinCalls).toEqual([]); // …but never unpinned (no-op clear on prev=null)
+    expect(rows).toEqual([]); // …and the durable row is gone → unreapable
+  });
+
+  it("serialized steady-state noop reconciles add ZERO pin/unpin API calls (finn-flood guard)", async () => {
+    const { fs } = memFs();
+    const r = makeReconciler(fs, { serialize: true });
+    // First open pins exactly once.
+    await r.reconcile("wk:group:g1", "-100123", { pinned: true, messageId: 900 });
+    expect(r.pinCalls).toEqual([900]);
+    expect(r.unpinCalls).toEqual([]);
+
+    // 20 steady-state edits — each a re-pin of the SAME id → decidePinAction
+    // noop → reconcilePin issues NO Telegram call. The serialization + F1
+    // row-preservation must not add a single pin/unpin API call.
+    for (let i = 0; i < 20; i++) {
+      await r.reconcile("wk:group:g1", "-100123", { pinned: true, messageId: 900 });
+    }
+    expect(r.pinCalls).toEqual([900]); // still exactly one pin, ever
+    expect(r.unpinCalls).toEqual([]); // never unpinned
+    // The durable row is intact throughout (F1).
+    expect(loadStatusPins(PATH, fs)).toEqual([
+      { pinKey: "wk:group:g1", chatId: "-100123", messageId: 900 },
+    ]);
   });
 });
