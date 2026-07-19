@@ -236,6 +236,108 @@ export function classifyAutohealStatus(logs: string): CheckResult {
 }
 
 /**
+ * Pure: classify hindsight's boot-time LLM-connection verification from its
+ * container logs (#3408). Hindsight's `MemoryEngine._initialize` verifies each
+ * DISTINCT llm config (`default`/`retain`/`reflect`/`consolidation`) once at
+ * boot and, on failure, logs a WARNING and KEEPS SERVING:
+ *
+ *   LLM connection verification failed for '<config>' config: <error>. Server
+ *   will start but LLM-dependent operations may fail until the provider is
+ *   available.
+ *
+ * That exact condition ran ~2h in the 2026-07-19 outage — the container was up
+ * and answering MCP, but every default-config LLM op 400'd ("Invalid model
+ * name") because the operator's LiteLLM `model_list` edit dropped the model the
+ * hindsight env still pinned. The verification WARNING was the earliest clean
+ * signal and it sat unread in `docker logs`. This classifier reads it back so
+ * `switchroom doctor` turns it red — the same model-free "doctor reads a known
+ * log line" mechanism as {@link classifyAutohealStatus} /
+ * {@link classifyConsolidationBacklog}.
+ *
+ * State is per-config and LAST-WINS: a boot that failed then a later restart
+ * that verified clean must clear the alarm, so we track the MOST RECENT event
+ * (success or failure) for each config in log order. A config whose latest
+ * event is a failure → FAIL; if any config failed we report FAIL naming them.
+ * If the window shows only successes → OK. If NO verification event appears at
+ * all (nothing verified in the window, or verification was skipped) → we return
+ * `null` so the caller omits the row rather than showing a spurious "ok".
+ *
+ * Provider-agnostic: matches the shared `MemoryEngine` failure line (which
+ * carries the config name) plus every provider's success line
+ * (`LiteLLM`/`Anthropic`/`llama.cpp`/`codex` "… connection verified
+ * successfully" and llama.cpp's "verification passed"). Provider success lines
+ * don't name a config, so a success clears the `default` config (the one always
+ * verified); a per-op failure still stands on its own named line. Never throws.
+ */
+export function classifyLlmVerification(logs: string): CheckResult | null {
+  // Per-config latest outcome, in log (chronological) order. `true` = failed.
+  const latestFailed = new Map<string, boolean>();
+  const failDetail = new Map<string, string>();
+  let sawAny = false;
+
+  // Split once; scan line-by-line so ordering (last-wins) is deterministic.
+  for (const line of logs.split("\n")) {
+    // Failure line — names the config and carries the error tail.
+    const fail = line.match(
+      /LLM connection verification failed for '([^']+)' config:\s*(.*?)(?:\.\s*Server will start|$)/,
+    );
+    if (fail) {
+      sawAny = true;
+      const cfg = fail[1];
+      latestFailed.set(cfg, true);
+      failDetail.set(cfg, (fail[2] ?? "").trim());
+      continue;
+    }
+    // Success lines — provider-specific, don't name a config. A successful
+    // verification pass implies the `default` config verified (it's always in
+    // the set). Clear it.
+    if (
+      /connection verified successfully/.test(line) ||
+      /LLM verification passed/.test(line)
+    ) {
+      sawAny = true;
+      latestFailed.set("default", false);
+    }
+  }
+
+  if (!sawAny) return null;
+
+  const failedConfigs = [...latestFailed.entries()]
+    .filter(([, failed]) => failed)
+    .map(([cfg]) => cfg);
+
+  if (failedConfigs.length === 0) {
+    return {
+      name: "hindsight LLM verification",
+      status: "ok",
+      detail: "boot LLM connection verified",
+    };
+  }
+
+  const named = failedConfigs
+    .map((cfg) => {
+      const err = failDetail.get(cfg);
+      return err ? `'${cfg}' (${err})` : `'${cfg}'`;
+    })
+    .join(", ");
+  return {
+    name: "hindsight LLM verification",
+    status: "fail",
+    detail:
+      `boot LLM connection verification FAILED for config(s): ${named} — ` +
+      `hindsight is serving but every LLM-dependent op (retain/reflect/` +
+      `consolidation extraction) for that config will fail silently until the ` +
+      `provider is reachable`,
+    fix:
+      "Almost always a model-name drift: the pinned `hindsight.llm.*.model` no " +
+      "longer exists in the LiteLLM proxy's model_list (run `switchroom doctor` " +
+      "— the LiteLLM model-routing check names the exact missing model), or the " +
+      "provider is down. Fix the model reference (or the proxy), then " +
+      "`switchroom memory --restart` so hindsight re-verifies.",
+  };
+}
+
+/**
  * Best-effort: inspect the local `switchroom-hindsight` container's shm + recent
  * logs. Returns [] (silently skipped) when hindsight isn't a local container —
  * a remote `memory.config.url`, no docker, or running inside an agent container.
@@ -247,7 +349,14 @@ export function checkHindsightContainerHealth(
   const exec =
     opts?.exec ??
     ((cmd: string, args: string[]) =>
-      execFileSync(cmd, args, { stdio: ["ignore", "pipe", "ignore"], timeout: 8000 }).toString());
+      execFileSync(cmd, args, {
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 8000,
+        // Boot-window log fetches (verification below) can exceed the 1MB
+        // default on a busy hindsight; a truncation throw would silently drop
+        // the check. 16MB is ample for a bounded ~10-min boot window.
+        maxBuffer: 16 * 1024 * 1024,
+      }).toString());
 
   const results: CheckResult[] = [];
 
@@ -260,6 +369,36 @@ export function checkHindsightContainerHealth(
   const shmBytes = parseInt(shmRaw, 10);
   if (Number.isFinite(shmBytes) && shmBytes > 0) {
     results.push(classifyShmSize(shmBytes));
+  }
+
+  // Boot-time LLM-connection verification (#3408). Verification fires ONCE at
+  // startup, which may be far outside the 10m extraction window — so we bound
+  // the fetch to this container's own boot window: [StartedAt, StartedAt+10m].
+  // That captures the verification lines regardless of how long ago hindsight
+  // booted, while staying tightly bounded (never a full multi-day log dump).
+  try {
+    const startedAt = exec("docker", [
+      "inspect",
+      name,
+      "--format",
+      "{{.State.StartedAt}}",
+    ]).trim();
+    const startMs = Date.parse(startedAt);
+    if (Number.isFinite(startMs)) {
+      const untilIso = new Date(startMs + 10 * 60_000).toISOString();
+      const bootLogs = exec("docker", [
+        "logs",
+        "--since",
+        startedAt,
+        "--until",
+        untilIso,
+        name,
+      ]);
+      const verifyRow = classifyLlmVerification(bootLogs);
+      if (verifyRow) results.push(verifyRow);
+    }
+  } catch {
+    // inspect/logs unavailable — skip the verification check rather than fail.
   }
 
   try {

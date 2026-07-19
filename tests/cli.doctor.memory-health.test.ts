@@ -10,6 +10,7 @@ import {
   checkHindsightHealthEndpoint,
   classifyConsolidationBacklog,
   classifyAutohealStatus,
+  classifyLlmVerification,
   CONSOLIDATION_BACKLOG_WARN,
   CONSOLIDATION_BACKLOG_FAIL,
   type AdvertisedTool,
@@ -200,6 +201,68 @@ describe("classifyAutohealStatus (#2910 host-side autoheal surface)", () => {
     expect(r.status).toBe("fail");
     expect(r.detail).toContain("GAVE UP after 3");
     expect(r.detail).toContain("NOT restart-");
+  });
+});
+
+describe("classifyLlmVerification (#3408 boot LLM-verification surface)", () => {
+  const FAIL_LINE =
+    "2026-07-19 01:31:02,123 - WARNING - hindsight_api.engine.memory_engine - " +
+    "LLM connection verification failed for 'default' config: litellm.BadRequestError: " +
+    "Invalid model name passed in model=openrouter/google/gemini-3.1-flash-lite. " +
+    "Server will start but LLM-dependent operations may fail until the provider is available.";
+  const OK_LINE =
+    "2026-07-19 03:43:56,055 - INFO - hindsight_api.engine.providers.litellm_llm - " +
+    "LiteLLM connection verified successfully";
+
+  it("returns null when no verification event appears in the window (no spurious ok)", () => {
+    expect(classifyLlmVerification("some unrelated boot log\nanother line")).toBeNull();
+  });
+
+  it("flags a boot verification failure as FAIL, naming the config and error", () => {
+    const r = classifyLlmVerification(FAIL_LINE);
+    expect(r).not.toBeNull();
+    expect(r!.status).toBe("fail");
+    expect(r!.detail).toContain("'default'");
+    expect(r!.detail).toContain("Invalid model name");
+    expect(r!.fix).toContain("model_list");
+  });
+
+  it("reports OK when the only verification event is a success", () => {
+    const r = classifyLlmVerification(OK_LINE);
+    expect(r).not.toBeNull();
+    expect(r!.status).toBe("ok");
+  });
+
+  it("is last-wins: a later success for the same config clears an earlier failure", () => {
+    const r = classifyLlmVerification(`${FAIL_LINE}\n${OK_LINE}`);
+    expect(r!.status).toBe("ok");
+  });
+
+  it("stays FAIL when a failure follows a success (drifted after a clean boot)", () => {
+    const r = classifyLlmVerification(`${OK_LINE}\n${FAIL_LINE}`);
+    expect(r!.status).toBe("fail");
+    expect(r!.detail).toContain("'default'");
+  });
+
+  it("tracks multiple distinct configs independently and names each failing one", () => {
+    const retainFail = FAIL_LINE.replace("'default'", "'retain'").replace(
+      "gemini-3.1-flash-lite",
+      "openrouter/z-ai/glm-legacy",
+    );
+    const r = classifyLlmVerification(`${OK_LINE}\n${retainFail}`);
+    // default cleared by OK_LINE, retain failed → overall FAIL naming retain only.
+    expect(r!.status).toBe("fail");
+    expect(r!.detail).toContain("'retain'");
+    expect(r!.detail).not.toContain("'default'");
+  });
+
+  it("matches the Anthropic and llama.cpp provider success phrasings", () => {
+    expect(
+      classifyLlmVerification("... Anthropic connection verified successfully")!.status,
+    ).toBe("ok");
+    expect(
+      classifyLlmVerification("... llama.cpp LLM verification passed")!.status,
+    ).toBe("ok");
   });
 });
 
