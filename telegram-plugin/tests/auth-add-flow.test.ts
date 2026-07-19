@@ -60,6 +60,9 @@ import {
   handleAuthCommand,
   isAuthAdmin,
   validateAuthAddLabel,
+  readdPrecheckError,
+  formatGrantedScopesReply,
+  REQUIRED_USAGE_SCOPE,
 } from '../gateway/auth-command.js'
 import {
   pendingAuthAddFlows,
@@ -166,12 +169,12 @@ function makeMockTmuxOps(opts: {
 describe('parseAuthCommand — /auth add and /auth cancel', () => {
   it('recognises "/auth add <label>" with a valid label', () => {
     const p = parseAuthCommand('/auth add alice@example.com')
-    expect(p).toEqual({ kind: 'add', label: 'alice@example.com' })
+    expect(p).toEqual({ kind: 'add', label: 'alice@example.com', replace: false })
   })
 
   it('recognises gmail-tag labels (the + character)', () => {
     const p = parseAuthCommand('/auth add alice+work@example.com')
-    expect(p).toEqual({ kind: 'add', label: 'alice+work@example.com' })
+    expect(p).toEqual({ kind: 'add', label: 'alice+work@example.com', replace: false })
   })
 
   it('treats "/auth add" with no label as a help reply', () => {
@@ -191,7 +194,7 @@ describe('parseAuthCommand — /auth add and /auth cancel', () => {
     // whitespace is the parser's contract — the validator catches
     // shape violations on the first token.
     const p = parseAuthCommand('/auth add foo bar')
-    expect(p).toEqual({ kind: 'add', label: 'foo' })
+    expect(p).toEqual({ kind: 'add', label: 'foo', replace: false })
   })
 
   it('rejects an over-length label (>64 chars)', () => {
@@ -260,7 +263,7 @@ describe('isAuthAdmin', () => {
 describe('handleAuthCommand — add/cancel are gateway-routed (defensive contract)', () => {
   it('returns a "not routed" error for parsed.kind === "add" so the contract is loud if a future refactor forgets the gateway dispatch', async () => {
     const reply = await handleAuthCommand(
-      { kind: 'add', label: 'foo' },
+      { kind: 'add', label: 'foo', replace: false },
       {
         agentName: 'clerk',
         isAdmin: true,
@@ -272,7 +275,7 @@ describe('handleAuthCommand — add/cancel are gateway-routed (defensive contrac
 
   it('refuses /auth add for non-admin before the not-routed branch', async () => {
     const reply = await handleAuthCommand(
-      { kind: 'add', label: 'foo' },
+      { kind: 'add', label: 'foo', replace: false },
       {
         agentName: 'other',
         isAdmin: false,
@@ -656,6 +659,114 @@ describe('mocked-broker addAccount integration sketch', () => {
       expect(res.expiresAt).toBe(fakeCredentials.claudeAiOauth.expiresAt)
       expect(addAccountSpy).toHaveBeenCalledTimes(1)
     })
+  })
+
+  it('readd threads replace=true through to the broker addAccount verb', async () => {
+    const fakeCredentials = {
+      claudeAiOauth: {
+        accessToken: 'sk-ant-oat01-test-' + 'x'.repeat(40),
+        expiresAt: Date.now() + 3600_000,
+        scopes: ['org:create_api_key', 'user:profile', 'user:inference'],
+      },
+    }
+    const addAccountSpy = vi.fn(async (label: string, _c: typeof fakeCredentials, replace?: boolean) => ({
+      label,
+      replace,
+    }))
+    // Plain add → replace false; readd → replace true. Both round-trip.
+    const added = await addAccountSpy('pooled@example.com', fakeCredentials, false)
+    const readded = await addAccountSpy('pooled@example.com', fakeCredentials, true)
+    expect(added.replace).toBe(false)
+    expect(readded.replace).toBe(true)
+    expect(addAccountSpy).toHaveBeenCalledTimes(2)
+  })
+})
+
+/* ── 9b. /auth readd parser + precheck + scope reply (PR C) ────────────── */
+
+describe('parseAuthCommand — /auth readd and add --replace', () => {
+  it('parses "/auth readd <label>" as an add with replace=true', () => {
+    expect(parseAuthCommand('/auth readd pooled@example.com')).toEqual({
+      kind: 'add',
+      label: 'pooled@example.com',
+      replace: true,
+    })
+  })
+
+  it('parses "/auth add <label> --replace" as replace=true too', () => {
+    expect(parseAuthCommand('/auth add pooled@example.com --replace')).toEqual({
+      kind: 'add',
+      label: 'pooled@example.com',
+      replace: true,
+    })
+  })
+
+  it('plain "/auth add <label>" stays replace=false', () => {
+    expect(parseAuthCommand('/auth add fresh@example.com')).toEqual({
+      kind: 'add',
+      label: 'fresh@example.com',
+      replace: false,
+    })
+  })
+
+  it('"/auth readd" with no label is a help reply', () => {
+    const p = parseAuthCommand('/auth readd')
+    expect(p?.kind).toBe('help')
+    if (p?.kind === 'help') expect(p.reason).toMatch(/Usage: \/auth readd/)
+  })
+
+  it('rejects an unknown flag on add/readd', () => {
+    const p = parseAuthCommand('/auth add foo --wipe')
+    expect(p?.kind).toBe('help')
+    if (p?.kind === 'help') expect(p.reason).toMatch(/Unknown flag/i)
+  })
+
+  it('is case-insensitive on the readd verb', () => {
+    expect(parseAuthCommand('/auth READD foo')).toEqual({ kind: 'add', label: 'foo', replace: true })
+  })
+})
+
+describe('readdPrecheckError — exists gate', () => {
+  it('readd of a NONEXISTENT label errors clearly', () => {
+    const err = readdPrecheckError('ghost@example.com', true, false)
+    expect(err).toMatch(/no account named/i)
+    expect(err).toMatch(/ghost@example\.com/)
+  })
+
+  it('readd of an EXISTING label passes (null)', () => {
+    expect(readdPrecheckError('pooled@example.com', true, true)).toBeNull()
+  })
+
+  it('plain add of an EXISTING label errors and points at readd', () => {
+    const err = readdPrecheckError('pooled@example.com', false, true)
+    expect(err).toMatch(/already exists/i)
+    expect(err).toMatch(/\/auth readd/)
+  })
+
+  it('plain add of a NEW label passes (null)', () => {
+    expect(readdPrecheckError('fresh@example.com', false, false)).toBeNull()
+  })
+})
+
+describe('formatGrantedScopesReply — scope-in-reply (structured, no scraping)', () => {
+  it('lists granted scopes and confirms when user:profile is present', () => {
+    const r = formatGrantedScopesReply(['org:create_api_key', 'user:profile', 'user:inference'])
+    expect(r.hasUsageScope).toBe(true)
+    expect(r.text).toContain('user:profile')
+    expect(r.text).toMatch(/unlocked/i)
+  })
+
+  it('warns LOUDLY when user:profile is absent (the setup-token footgun)', () => {
+    const r = formatGrantedScopesReply(['user:inference'])
+    expect(r.hasUsageScope).toBe(false)
+    expect(r.text).toMatch(/MISSING/)
+    expect(r.text).toContain(REQUIRED_USAGE_SCOPE)
+  })
+
+  it('warns when the token reports no scopes at all', () => {
+    const r = formatGrantedScopesReply(undefined)
+    expect(r.hasUsageScope).toBe(false)
+    expect(r.text).toMatch(/No scopes reported/i)
   })
 })
 

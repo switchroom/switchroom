@@ -44,7 +44,19 @@ export type ParsedAuthCommand =
   | { kind: 'list' }
   | { kind: 'use'; label: string }
   | { kind: 'rotate' }
-  | { kind: 'add'; label: string }
+  | {
+      kind: 'add'
+      label: string
+      /**
+       * Re-auth an EXISTING account label in place (broker `addAccount(...,
+       * replace=true)`). Set by the `/auth readd <label>` verb (and
+       * `/auth add <label> --replace`). Plain `/auth add` leaves it false —
+       * the broker rejects a duplicate label, which is the desired guard for
+       * a fresh add. `/auth readd` is the path to widen scope on the 3 pooled
+       * accounts without renaming them.
+       */
+      replace: boolean
+    }
   | { kind: 'cancel' }
   | {
       kind: 'provider-add'
@@ -149,12 +161,25 @@ export function parseAuthCommand(text: string): ParsedAuthCommand | null {
       if (!label) return { kind: 'help', reason: 'Usage: /auth use <label>' }
       return { kind: 'use', label }
     }
-    case 'add': {
-      const label = parts[1]
-      if (!label) return { kind: 'help', reason: 'Usage: /auth add <label>' }
+    case 'add':
+    case 'readd': {
+      // `readd` is `add` with replace=true; `add --replace` is the same.
+      const positional = parts.slice(1).filter((t) => !t.startsWith('--'))
+      const flags = new Set(
+        parts.slice(1).filter((t) => t.startsWith('--')).map((t) => t.toLowerCase()),
+      )
+      const label = positional[0]
+      const usage = verb === 'readd' ? 'Usage: /auth readd <label>' : 'Usage: /auth add <label>'
+      if (!label) return { kind: 'help', reason: usage }
       const err = validateAuthAddLabel(label)
       if (err) return { kind: 'help', reason: err }
-      return { kind: 'add', label }
+      for (const f of flags) {
+        if (f !== '--replace') {
+          return { kind: 'help', reason: `Unknown flag \`${codeSpanSafe(f)}\` for \`/auth ${verb}\`.` }
+        }
+      }
+      const replace = verb === 'readd' || flags.has('--replace')
+      return { kind: 'add', label, replace }
     }
     case 'cancel':
       return { kind: 'cancel' }
@@ -451,6 +476,7 @@ export async function handleAuthCommand(
         `  \`/auth use <label>\` — admin: swap the fleet to <label>\n` +
         `  \`/auth rotate\` — admin: cycle to next non-exhausted fallback\n` +
         `  \`/auth add <label>\` — admin: OAuth-add a new Anthropic account from chat\n` +
+        `  \`/auth readd <label>\` — admin: re-auth an EXISTING account in place (widen scope)\n` +
         `  \`/auth google add <email>\` — admin: Telegram-native Google account add/re-auth\n` +
         `  \`/auth microsoft add <email>\` — admin: Telegram-native Microsoft account add/re-auth\n` +
         `  \`/auth cancel\` — abort an \`/auth add\` or provider add in progress\n` +
@@ -817,6 +843,83 @@ export function isAuthAdmin(args: { isAdmin: boolean }): boolean {
 
 function isAdmin(ctx: AuthCommandContext): boolean {
   return ctx.isAdmin === true
+}
+
+/**
+ * The scope every `server:` mode agent needs from a pooled account for
+ * fable/Claude 7-day usage reporting. Absence is the whole reason
+ * `/auth readd` exists (setup-token tokens can't carry it).
+ */
+export const REQUIRED_USAGE_SCOPE = 'user:profile'
+
+/**
+ * Precheck for the gateway `/auth add`/`readd` dispatch. Returns a
+ * user-facing error string when the request is incoherent against current
+ * broker state, else null.
+ *
+ *   - `readd` (replace=true) of a label that does NOT exist → error (there's
+ *     nothing to re-auth; the operator wants `/auth add`).
+ *   - plain `add` (replace=false) of a label that ALREADY exists → error
+ *     (the broker would reject the duplicate anyway; fail fast with a clear
+ *     message pointing at `/auth readd`).
+ *
+ * Kept pure so it's unit-testable without a live broker.
+ */
+export function readdPrecheckError(
+  label: string,
+  replace: boolean,
+  labelExists: boolean,
+): string | null {
+  if (replace && !labelExists) {
+    return (
+      `**/auth readd:** no account named \`${codeSpanSafe(label)}\` to re-auth. ` +
+      `Run \`/auth show\` for the current list, or \`/auth add ${codeSpanSafe(label)}\` to add it fresh.`
+    )
+  }
+  if (!replace && labelExists) {
+    return (
+      `**/auth add:** \`${codeSpanSafe(label)}\` already exists. ` +
+      `Use \`/auth readd ${codeSpanSafe(label)}\` to re-authenticate it in place (e.g. to widen scope).`
+    )
+  }
+  return null
+}
+
+/**
+ * Render the "granted scopes" tail for a successful `/auth add`/`readd`.
+ * Reads the scopes STRUCTURALLY from `credentials.claudeAiOauth.scopes`
+ * (never scraped from the pane). Returns the text plus a `warn` flag set
+ * when {@link REQUIRED_USAGE_SCOPE} is absent, so the caller can surface a
+ * loud warning at add time instead of a silent `/usage` failure later.
+ */
+export function formatGrantedScopesReply(scopes: string[] | undefined): {
+  text: string
+  hasUsageScope: boolean
+} {
+  const list = Array.isArray(scopes) ? scopes.filter((s) => typeof s === 'string') : []
+  const hasUsageScope = list.includes(REQUIRED_USAGE_SCOPE)
+  if (list.length === 0) {
+    return {
+      text:
+        `\n⚠️ **No scopes reported** on the new token — could not confirm \`${REQUIRED_USAGE_SCOPE}\`. ` +
+        `7-day usage reporting may not work. Re-run \`/auth readd\` if usage is missing.`,
+      hasUsageScope: false,
+    }
+  }
+  const rendered = list.map((s) => `\`${codeSpanSafe(s)}\``).join(', ')
+  if (hasUsageScope) {
+    return {
+      text: `\nGranted scopes: ${rendered}\n✓ \`${REQUIRED_USAGE_SCOPE}\` present — 7-day usage reporting is unlocked.`,
+      hasUsageScope: true,
+    }
+  }
+  return {
+    text:
+      `\nGranted scopes: ${rendered}\n` +
+      `⚠️ **\`${REQUIRED_USAGE_SCOPE}\` is MISSING** — 7-day usage reporting will not work for this account. ` +
+      `This usually means the narrow \`setup-token\` minter was used. Re-run \`/auth readd <label>\` with the broad login to fix.`,
+    hasUsageScope: false,
+  }
 }
 
 /**

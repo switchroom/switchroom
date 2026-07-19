@@ -192,6 +192,13 @@ export interface PendingAuthAddFlow {
   /** tmux session name (`auth-add-<label>-<hex>`). */
   tmuxSession: string
   startedAt: number
+  /**
+   * True when this flow re-authenticates an EXISTING account label in place
+   * (`/auth readd`) — threaded to `addAccountViaBroker(..., { replace: true })`
+   * so the broker overwrites the stored credentials instead of rejecting the
+   * duplicate. Absent/false is a fresh add. Set by the gateway dispatch.
+   */
+  replace?: boolean
 }
 export const pendingAuthAddFlows = new Map<string, PendingAuthAddFlow>()
 

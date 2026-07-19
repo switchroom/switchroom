@@ -347,6 +347,7 @@ import {
   handleAuthCommand,
   isAuthAdmin,
   pendingAuthRmFlows,
+  readdPrecheckError,
 } from './auth-command.js'
 import type { AuthBrokerClient } from './auth-command.js'
 import type { ListStateData } from './auth-line.js'
@@ -20901,6 +20902,24 @@ bot.command("auth", async ctx => {
       )
       return
     }
+    // Precheck against broker state: readd (replace) requires the label to
+    // exist; a fresh add requires it NOT to exist. Fail fast with a clear
+    // message before spinning up a tmux/OAuth flow. Best-effort — if the
+    // broker is unreachable we skip the precheck and let addAccount enforce.
+    try {
+      const brokerClient = await getAuthBrokerClient(currentAgent)
+      if (brokerClient) {
+        const state = await brokerClient.listState()
+        const exists = state.accounts.some((a) => a.label === parsed.label)
+        const precheckErr = readdPrecheckError(parsed.label, parsed.replace, exists)
+        if (precheckErr) {
+          await switchroomReply(ctx, precheckErr, { html: true })
+          return
+        }
+      }
+    } catch {
+      // broker unreachable — skip precheck; addAccountViaBroker enforces.
+    }
     try {
       const { loginUrl, scratchDir, tmuxSocket, tmuxSession } = await startAccountAuthSession(parsed.label)
       pendingAuthAddFlows.set(authAddKey, {
@@ -20909,10 +20928,12 @@ bot.command("auth", async ctx => {
         tmuxSocket,
         tmuxSession,
         startedAt: Date.now(),
+        replace: parsed.replace,
       })
+      const verbNoun = parsed.replace ? 'Re-authenticating account' : 'Adding account'
       await switchroomReply(
         ctx,
-        `**Adding account** \`${parsed.label}\`\n\n` +
+        `**${verbNoun}** \`${parsed.label}\`\n\n` +
           `1. Open this URL on your phone:\n${loginUrl}\n\n` +
           `2. Log into Anthropic, copy the code Claude shows.\n` +
           `3. Paste it back here.\n\n` +
@@ -20922,7 +20943,7 @@ bot.command("auth", async ctx => {
     } catch (err) {
       await switchroomReply(
         ctx,
-        `**/auth add failed:** ${escapeHtmlForTg((err as Error)?.message ?? String(err))}`,
+        `**/auth ${parsed.replace ? 'readd' : 'add'} failed:** ${escapeHtmlForTg((err as Error)?.message ?? String(err))}`,
         { html: true },
       )
     }
