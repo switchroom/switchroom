@@ -21,9 +21,28 @@
 
 import { matchSocketName } from "../../broker-common/peercred-path.js";
 
-/** Listener-bind regex. Accepts `<name>/sock` shape only — flat `<name>.sock` is rejected. */
-const AUTH_BROKER_SOCKET_PATH_RE =
-  /^\/run\/switchroom\/auth-broker\/([a-zA-Z0-9][a-zA-Z0-9_-]*)\/sock$/;
+/** Production socket root. The listener bind path is `<root>/<name>/sock`. */
+export const AUTH_BROKER_ROOT = "/run/switchroom/auth-broker";
+
+/**
+ * Build the listener-bind regex for a given socket root. Accepts the
+ * `<root>/<name>/sock` shape only — a flat `<name>.sock` is rejected.
+ *
+ * `socketRoot` is broker-controlled config (never wire input), so anchoring
+ * an escaped copy of it is safe; the slug shape + `maxNameLen` guard in
+ * `matchSocketName` still fail-close on anything but a well-formed name.
+ * Parametrising the root lets the classify gate work when the broker binds
+ * under a relocated root (the test harness, or an operator override) instead
+ * of silently returning null — which used to be masked by a `?? boundIdentity`
+ * fallback that leaked stale identities.
+ */
+function authBrokerSocketRe(socketRoot: string): RegExp {
+  const escaped = socketRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^${escaped}/([a-zA-Z0-9][a-zA-Z0-9_-]*)/sock$`);
+}
+
+/** Listener-bind regex for the production root. */
+const AUTH_BROKER_SOCKET_PATH_RE = authBrokerSocketRe(AUTH_BROKER_ROOT);
 
 /** Max slug length — defence in depth beyond the regex slug shape. */
 const AUTH_BROKER_MAX_NAME_LEN = 63;
@@ -42,12 +61,15 @@ export const RESERVED_NAMES = new Set(["operator"]);
  * supplies only the auth-broker pattern + length cap. Semantics are
  * identical to the pre-#2795 inline implementation.
  */
-export function socketPathToName(socketPath: string): string | null {
-  return matchSocketName(
-    socketPath,
-    [AUTH_BROKER_SOCKET_PATH_RE],
-    AUTH_BROKER_MAX_NAME_LEN,
-  );
+export function socketPathToName(
+  socketPath: string,
+  socketRoot?: string,
+): string | null {
+  const pattern =
+    socketRoot === undefined || socketRoot === AUTH_BROKER_ROOT
+      ? AUTH_BROKER_SOCKET_PATH_RE
+      : authBrokerSocketRe(socketRoot);
+  return matchSocketName(socketPath, [pattern], AUTH_BROKER_MAX_NAME_LEN);
 }
 
 /**
@@ -79,8 +101,9 @@ export type Identity =
 export function classify(
   socketPath: string,
   config: AuthConfigShape,
+  socketRoot?: string,
 ): Identity | null {
-  const name = socketPathToName(socketPath);
+  const name = socketPathToName(socketPath, socketRoot);
   if (!name) return null;
   if (name === "operator") return { kind: "operator" };
   if (RESERVED_NAMES.has(name)) return null;
