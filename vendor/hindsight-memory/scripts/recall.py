@@ -810,12 +810,20 @@ def _transcript_grep_fallback(transcript_path, query, config):
     if not query_tokens:
         return None, telemetry
 
+    # TODO(consolidation, #3450 / epic #3430): two bounded transcript tail-readers now
+    # coexist post-merge — retain's, and recall's shared ``_read_transcript_lines``
+    # (#3443, which this #3369 fallback now reuses via ``read_transcript_messages``).
+    # They each re-implement "read the last N bytes of the session JSONL and parse
+    # turns". Consolidate onto a single shared bounded tail-reader helper. Tracked
+    # in follow-up #3450 (tied to epic #3430).
+    messages = read_transcript_messages(transcript_path, tail_bytes=max_bytes)
+
+    # Review finding — record bytes_read only AFTER the read succeeds, so a
+    # failed/partial read doesn't report bytes we never actually consumed.
     try:
         telemetry["bytes_read"] = min(os.path.getsize(transcript_path), max_bytes)
     except OSError:
         pass
-
-    messages = read_transcript_messages(transcript_path, tail_bytes=max_bytes)
 
     matched = []
     total_chars = 0
@@ -843,7 +851,10 @@ def _transcript_grep_fallback(transcript_path, query, config):
             telemetry["truncated"] = True
             break
         if len(entry) > remaining:
-            entry = entry[:remaining].rstrip() + "…"
+            # Review finding — reserve 1 char for the ellipsis so the emitted
+            # entry is EXACTLY `remaining` chars, not remaining+1 (the "…" is a
+            # single code point). Keeps the char budget an exact bound.
+            entry = entry[:remaining - 1].rstrip() + "…"
             telemetry["truncated"] = True
         matched.append(entry)
         total_chars += len(entry)
@@ -1464,6 +1475,12 @@ def main():
             b_timed_out = (not b_outcome.completed) or (
                 b_outcome.error is not None and _is_timeout_error(b_outcome.error)
             )
+            # Switchroom review finding (PR8 gating hole) — a bank that raised a
+            # HARD (non-timeout) error: connection refused, 5xx, daemon down,
+            # malformed response. Distinct from `timed_out` so the transcript
+            # fallback can be suppressed on a genuine outage (the fact layer was
+            # unreachable, not "empty because nothing reconciled yet").
+            b_errored = b_outcome.error is not None and not _is_timeout_error(b_outcome.error)
             if b_outcome.completed and b_outcome.error is None:
                 bank_results = (
                     b_outcome.value.get("results", [])
@@ -1486,6 +1503,7 @@ def main():
                 "bank_id": b_id,
                 "elapsed_ms": b_outcome.elapsed_ms if b_outcome.elapsed_ms is not None else 0,
                 "timed_out": b_timed_out,
+                "errored": b_errored,
             })
     else:
         # Pre-A3 serial path (rollback lever, HINDSIGHT_RECALL_PARALLEL=false).
@@ -1508,6 +1526,7 @@ def main():
             b_id, b_tags, b_tags_match, b_tag_groups = spec
             _bank_start = time.monotonic()
             _bank_timed_out = False
+            _bank_errored = False
             try:
                 response = _make_bank_task(b_id, b_tags, b_tags_match, b_tag_groups)()
                 bank_results = response.get("results", []) if isinstance(response, dict) else []
@@ -1516,6 +1535,8 @@ def main():
                     results = results + bank_results
             except Exception as e:
                 _bank_timed_out = _is_timeout_error(e)
+                # Non-timeout error → hard outage (see parallel-path note above).
+                _bank_errored = not _bank_timed_out
                 if b_id == bank_id:
                     print(f"[Hindsight] Recall failed: {e}", file=sys.stderr)
                 else:
@@ -1524,6 +1545,7 @@ def main():
                 "bank_id": b_id,
                 "elapsed_ms": int((time.monotonic() - _bank_start) * 1000),
                 "timed_out": _bank_timed_out,
+                "errored": _bank_errored,
             })
 
     # Switchroom hindsight-leverage A3 — FINALIZED `deadline_hit`: True when ANY
@@ -1533,6 +1555,15 @@ def main():
     # so the E1 / PR8 transcript fallback can gate on it: the #3369 fallback must
     # NOT fire when a bank timed out, only when the fact layer is genuinely empty.
     deadline_hit = any(bt["timed_out"] for bt in bank_timings) or directives_timed_out
+
+    # Switchroom review finding (PR8 gating hole) — True when ANY bank raised a
+    # HARD (non-timeout) error. A connection-refused / 5xx / daemon-down outage
+    # contributes zero results with `deadline_hit` False, which would otherwise
+    # let the empty-fact-layer transcript fallback fire on every turn for the
+    # whole outage — mislabelling "fact layer unreachable" as "nothing
+    # reconciled yet" and flooding telemetry. Gated on below so the fallback
+    # only fires when all banks genuinely returned zero: no timeout AND no error.
+    bank_errored = any(bt.get("errored") for bt in bank_timings)
 
     directives_block = format_active_directives_block(directives) if directives else None
     if directives_block:
@@ -1672,7 +1703,10 @@ def main():
     # fallback. Fires ONLY when every bank returned zero results (pre_filter_count
     # == 0 — the merged pre-demote bank count) AND no slot hit its deadline
     # (deadline_hit False, so a timed-out bank can't masquerade as an empty fact
-    # layer — the #3369 sequencing constraint on A3's telemetry). This recovers
+    # layer — the #3369 sequencing constraint on A3's telemetry) AND no bank
+    # raised a hard error (bank_errored False, so a connection-refused / 5xx /
+    # daemon-down outage can't masquerade as an empty fact layer either — the
+    # PR8 gating-hole fix). This recovers
     # the crash-loss window between an abrupt session death and the next boot
     # reconciliation, where live recall would otherwise return nothing for the
     # lost turns. Everything is bounded inside the helper (bytes/turns/chars/time).
@@ -1685,6 +1719,7 @@ def main():
         config.get("recallTranscriptFallback", True)
         and pre_filter_count == 0
         and not deadline_hit
+        and not bank_errored
     ):
         transcript_fallback_block, transcript_fallback_telemetry = _transcript_grep_fallback(
             hook_input.get("transcript_path", ""),
@@ -1696,6 +1731,14 @@ def main():
                 config,
                 f"Transcript-grep fallback fired: {transcript_fallback_telemetry}",
             )
+    elif pre_filter_count == 0 and bank_errored:
+        # Suppressed: a bank outage (hard error), not a genuinely empty fact
+        # layer. Logged so the gate decision is visible during an outage.
+        debug_log(
+            config,
+            "Transcript-grep fallback suppressed: bank_errored (hard bank error, "
+            "not an empty fact layer)",
+        )
 
     # Switchroom #303 — recall is done, model is about to start the long
     # TTFT. Update the placeholder so the user doesn't keep staring at
@@ -1767,6 +1810,12 @@ def main():
         # `timed_out` is per-request only, so this reduces to the pre-A3 form —
         # keeping the two modes' rows directly comparable in the breach baseline.
         "deadline_hit": deadline_hit,
+        # Switchroom review finding (PR8 gating hole) — True when any bank raised
+        # a hard (non-timeout) error this turn. Gates the transcript fallback
+        # (suppressed on a real outage) and makes the outage visible per-row so a
+        # spike in empty-result turns can be attributed to unreachable banks
+        # rather than a genuinely empty fact layer.
+        "bank_errored": bank_errored,
         # A3 — recall execution mode ("parallel"/"serial") and the shared
         # deadline budget (ms; None in serial mode). These distinguish pre-A3
         # (serial) from post-A3 (parallel) rows so the ≥3-day breach baseline

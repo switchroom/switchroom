@@ -64,10 +64,14 @@ def _memory(text, mem_id=None):
 class _Client:
     """Fake HindsightClient with per-bank sleep + result control."""
 
-    def __init__(self, bank_sleep=None, bank_results=None, directives=None):
+    def __init__(self, bank_sleep=None, bank_results=None, directives=None,
+                 bank_errors=None):
         self._bank_sleep = bank_sleep or {}
         self._bank_results = bank_results or {}
         self._directives = directives or []
+        # {bank_id: Exception instance} — raised (hard, non-timeout error) to
+        # simulate a connection-refused / 5xx / daemon-down outage.
+        self._bank_errors = bank_errors or {}
         self._lock = threading.Lock()
         self.recall_calls = []
 
@@ -80,6 +84,9 @@ class _Client:
         sleep_s = self._bank_sleep.get(bank_id, 0.0)
         if sleep_s:
             time.sleep(sleep_s)
+        err = self._bank_errors.get(bank_id)
+        if err is not None:
+            raise err
         return {"results": list(self._bank_results.get(bank_id, []))}
 
 
@@ -242,6 +249,74 @@ class DoesNotFireWhenDeadlineHit(_Harness):
         self.assertFalse(e["transcript_fallback"])
 
 
+class DoesNotFireWhenBankErrored(_Harness):
+    """PR8 gating-hole fix — a HARD (non-timeout) bank error contributes zero
+    results with deadline_hit False. The fallback must be suppressed: an
+    unreachable fact layer is NOT a genuinely empty one, and firing every turn
+    during an outage would flood telemetry and mislabel the cause."""
+
+    def test_errored_bank_suppresses_fallback_parallel(self):
+        transcript = self._write_transcript([
+            _nested_line("user", "we should redo the auth flow with PKCE"),
+        ])
+        # Own bank raises a hard, non-timeout error (connection refused).
+        client = _Client(
+            bank_errors={"own-bank": ConnectionRefusedError("connection refused")},
+        )
+        context = self._run(client, transcript_path=transcript)
+        self.assertIsNone(context, "fallback must not fire when a bank hard-errored")
+        e = self._read_log()[0]
+        self.assertTrue(e["bank_errored"])
+        self.assertFalse(e["deadline_hit"])
+        self.assertFalse(e["transcript_fallback"])
+        self.assertEqual(e["result_count"], 0)
+
+    def test_errored_bank_suppresses_fallback_serial(self):
+        transcript = self._write_transcript([
+            _nested_line("user", "we should redo the auth flow with PKCE"),
+        ])
+        client = _Client(
+            bank_errors={"own-bank": RuntimeError("upstream 503 service unavailable")},
+        )
+        context = self._run(
+            client,
+            transcript_path=transcript,
+            config_extra={"recallParallel": False},
+        )
+        self.assertIsNone(context, "fallback must not fire when a bank hard-errored")
+        e = self._read_log()[0]
+        self.assertEqual(e["recall_mode"], "serial")
+        self.assertTrue(e["bank_errored"])
+        self.assertFalse(e["deadline_hit"])
+        self.assertFalse(e["transcript_fallback"])
+
+
+class FiresInSerialMode(_Harness):
+    """Rollback (serial) mode gates the fallback identically to parallel mode:
+    on an all-zero, no-timeout, no-error turn it fires; the mode is only a
+    latency lever, not a behavioural one."""
+
+    def test_fires_when_all_banks_zero_serial(self):
+        transcript = self._write_transcript([
+            _nested_line("user", "we should redo the auth flow with PKCE"),
+            _nested_line("assistant", "agreed, the auth flow now uses PKCE"),
+        ])
+        client = _Client(bank_results={"own-bank": []})
+        context = self._run(
+            client,
+            transcript_path=transcript,
+            config_extra={"recallParallel": False},
+        )
+        self.assertIsNotNone(context, "fallback should fire in serial mode too")
+        self.assertIn("<hindsight_transcript_fallback>", context)
+        self.assertIn("PKCE", context)
+        e = self._read_log()[0]
+        self.assertEqual(e["recall_mode"], "serial")
+        self.assertTrue(e["transcript_fallback"])
+        self.assertFalse(e["deadline_hit"])
+        self.assertFalse(e["bank_errored"])
+
+
 class BoundsHold(_Harness):
     def test_byte_bound_only_reads_tail(self):
         # A query-matching line in the HEAD, padded past the byte window, must
@@ -296,9 +371,19 @@ class BoundsHold(_Harness):
         e = self._read_log()[0]
         self.assertTrue(e["transcript_fallback"])
         self.assertTrue(e["transcript_fallback_truncated"])
-        # The injected excerpt characters are bounded by the cap (the wrapper
-        # block adds the fixed preamble/tags around it).
-        self.assertLessEqual(e["transcript_fallback_chars"], 300 + len(recall._FALLBACK_BLOCK_PREAMBLE) + 200)
+        # The injected excerpt characters are bounded by the cap. The emitted
+        # block is: the fixed wrapper tags + preamble, plus the excerpt whose
+        # length is capped at MaxChars (300). We compute the EXACT wrapper
+        # overhead so a cap breach (e.g. the off-by-one that made a truncated
+        # entry cap+1 chars) would actually fail this assertion — the previous
+        # `+ 200` slack was loose enough to swallow such a breach.
+        wrapper = len(
+            "<hindsight_transcript_fallback>\n"
+            + recall._FALLBACK_BLOCK_PREAMBLE
+            + "\n\n"
+            + "\n</hindsight_transcript_fallback>"
+        )
+        self.assertLessEqual(e["transcript_fallback_chars"], 300 + wrapper)
 
 
 class ConfigGate(_Harness):
