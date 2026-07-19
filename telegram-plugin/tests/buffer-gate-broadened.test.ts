@@ -37,10 +37,15 @@ const gatewaySrc = readFileSync(
   'utf-8',
 )
 // #2996 P2: executeReply's body moved verbatim to outbound-send-path.ts
-// (`sendReply`); the post-send block assertions read there. The
-// `releaseTurnBufferGate` helper itself stays in gateway.ts.
+// (`sendReply`); the post-send block assertions read there. #2996 P8 PR-B: the
+// `releaseTurnBufferGate` helper body moved verbatim to turn-end.ts (gateway
+// keeps a thin delegating wrapper); the helper-body assertions read there.
 const sendPathSrc = readFileSync(
   resolve(__dirname, '..', 'gateway', 'outbound-send-path.ts'),
+  'utf-8',
+)
+const turnEndSrc = readFileSync(
+  resolve(__dirname, '..', 'gateway', 'turn-end.ts'),
   'utf-8',
 )
 
@@ -50,7 +55,7 @@ describe('buffer-gate release decoupled from final-answer classification', () =>
   // function declaration). The body slice (used by other tests) is
   // separate — see fnBody().
   function fnDocstring(): string {
-    const beforeFn = gatewaySrc.split('function releaseTurnBufferGate')[0] ?? ''
+    const beforeFn = turnEndSrc.split('function releaseTurnBufferGate')[0] ?? ''
     const lastBlockOpen = beforeFn.lastIndexOf('/**')
     if (lastBlockOpen < 0) return ''
     return beforeFn.slice(lastBlockOpen)
@@ -59,7 +64,7 @@ describe('buffer-gate release decoupled from final-answer classification', () =>
     // The function body — everything between `function
     // releaseTurnBufferGate(...): void {` and its matching `}`. Use
     // a simple brace-balance over the slice from open-brace onward.
-    const afterDecl = gatewaySrc.split('function releaseTurnBufferGate')[1] ?? ''
+    const afterDecl = turnEndSrc.split('function releaseTurnBufferGate')[1] ?? ''
     const openIdx = afterDecl.indexOf('{')
     if (openIdx < 0) return ''
     let depth = 0
@@ -78,7 +83,7 @@ describe('buffer-gate release decoupled from final-answer classification', () =>
     // Multitopic component 1: the signature now also accepts an optional
     // `endingTurn` so the serialize-until-replied drain gate can read its
     // finalAnswerDelivered flag. The narrow-helper contract is unchanged.
-    expect(gatewaySrc).toMatch(
+    expect(turnEndSrc).toMatch(
       /function releaseTurnBufferGate\(key: string, endingTurn\?: CurrentTurn\): void/,
     )
     // The helper docstring must explain WHY split from
@@ -152,6 +157,10 @@ describe('buffer-gate release decoupled from final-answer classification', () =>
     //     with executeStreamReply.)
     // If this count grows the test catches it; reviewer must justify
     // any new callsite.
-    expect(callMatches.length).toBe(4)
+    // #2996 P8 PR-B adds exactly one more match in gateway.ts: the thin
+    // wrapper's delegate call (`turnEndFunnel().releaseTurnBufferGate(...)`)
+    // alongside the wrapper's own declaration. Still only TWO turn-terminal
+    // callsites (sendReply post-send + executeHaltNow).
+    expect(callMatches.length).toBe(5)
   })
 })

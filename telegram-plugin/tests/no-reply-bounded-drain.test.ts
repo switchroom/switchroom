@@ -125,9 +125,15 @@ describe('gateway wiring (source-level guards) — the gateway IIFE is too entan
     resolve(__dirname, '..', 'gateway', 'gateway.ts'),
     'utf-8',
   )
+  // #2996 P8 PR-B: the funnel bodies moved verbatim to turn-end.ts; the
+  // body-structure guards read there (gateway keeps delegating wrappers).
+  const turnEndSrc = readFileSync(
+    resolve(__dirname, '..', 'gateway', 'turn-end.ts'),
+    'utf-8',
+  )
 
   it('endCurrentTurnAtomic arms the no-reply drain timer after the serialize-gated purge', () => {
-    const fn = gatewaySrc.split('function endCurrentTurnAtomic')[1]?.split('\nfunction ')[0] ?? ''
+    const fn = turnEndSrc.split('function endCurrentTurnAtomic')[1]?.split('\nfunction ')[0] ?? ''
     expect(fn).toMatch(/purgeReactionTracking\(/)
     expect(fn).toMatch(/armNoReplyDrainTimer\(turn\)/)
     // The arm must come AFTER the purge (the purge attempts the gated
@@ -136,7 +142,7 @@ describe('gateway wiring (source-level guards) — the gateway IIFE is too entan
   })
 
   it('armNoReplyDrainTimer uses the shared predicate + a bounded setTimeout that force-drains', () => {
-    const fn = gatewaySrc.split('function armNoReplyDrainTimer')[1]?.split('\nfunction ')[0] ?? ''
+    const fn = turnEndSrc.split('function armNoReplyDrainTimer')[1]?.split('\nfunction ')[0] ?? ''
     expect(fn).toMatch(/shouldArmNoReplyDrain\(/)
     expect(fn).toMatch(/setTimeout\(/)
     expect(fn).toMatch(/SERIALIZE_NOREPLY_DRAIN_MS/)

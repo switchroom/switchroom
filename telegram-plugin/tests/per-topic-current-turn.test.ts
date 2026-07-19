@@ -72,7 +72,13 @@ describe('PR-4e source-read oracle — the wiring the per-topic map depends on',
     // Anchor on the `function ` prefix only — the signature is multi-line
     // (gained an `opts?` param + `number | null` return in the send-honesty
     // work), and `function ` disambiguates the definition from its call sites.
-    const body = gatewaySrc
+    // #2996 P8 PR-B: the funnel body moved verbatim to turn-end.ts (gateway
+    // keeps a thin delegating wrapper) — read the body there.
+    const turnEndSrc = readFileSync(
+      resolve(__dirname, '..', 'gateway', 'turn-end.ts'),
+      'utf-8',
+    )
+    const body = turnEndSrc
       .split('function endCurrentTurnAtomic(')[1]
       ?.split('\n}')[0] ?? ''
     expect(body.length).toBeGreaterThan(50)

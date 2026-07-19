@@ -20,6 +20,11 @@ const gatewaySrc = readFileSync(
   resolve(__dirname, '..', 'gateway', 'gateway.ts'),
   'utf-8',
 )
+// #2996 P8 PR-B: purgeReactionTracking's body moved verbatim to turn-end.ts.
+const turnEndSrc = readFileSync(
+  resolve(__dirname, '..', 'gateway', 'turn-end.ts'),
+  'utf-8',
+)
 
 describe('#2995 mid-flight busy ack — gateway wiring', () => {
   it('the buffer-until-idle branch calls maybePostBusyAck for the inbound own chat/topic', () => {
@@ -97,7 +102,7 @@ describe('#2995 mid-flight busy ack — gateway wiring', () => {
   })
 
   it('turn-end cleanup is PER-KEY: dedupe entry deleted and re-check timer cancelled for the ending turn only', () => {
-    const purge = gatewaySrc.split('function purgeReactionTracking')[1]?.split('\nfunction ')[0] ?? ''
+    const purge = turnEndSrc.split('function purgeReactionTracking')[1]?.split('\nfunction ')[0] ?? ''
     // Per-key delete — a purge for topic A must not reset topic B's dedupe.
     expect(purge).toMatch(/busyAckPostedKeys\.delete\(key\)/)
     expect(purge).not.toMatch(/busyAckPostedKeys\.clear\(\)/)

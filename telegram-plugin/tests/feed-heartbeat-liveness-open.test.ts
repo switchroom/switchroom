@@ -58,7 +58,13 @@ const laneSrc = readFileSync(
   resolve(__dirname, '..', 'gateway', 'narrative-lane.ts'),
   'utf-8',
 )
-const gatewayAndStreamSrc = gatewaySrc + '\n' + streamSrc + '\n' + laneSrc
+// #2996 P8 PR-B: the turn-end funnel (incl. the `stopEarlyLivenessOpen(key as
+// string)` teardown inside purgeReactionTracking) moved verbatim to turn-end.ts.
+const turnEndSrc = readFileSync(
+  resolve(__dirname, '..', 'gateway', 'turn-end.ts'),
+  'utf-8',
+)
+const gatewayAndStreamSrc = gatewaySrc + '\n' + streamSrc + '\n' + laneSrc + '\n' + turnEndSrc
 
 /** Return the source text of `feedHeartbeatTick` (everything up to the next top-level function). */
 function feedHeartbeatTickSrc(): string {
