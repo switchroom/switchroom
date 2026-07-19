@@ -263,6 +263,31 @@ If the user asks whether scheduled runs were missed during downtime: the schedul
 
 ---
 
+## Hindsight model change — "swap the memory model", "move retain off the subscription"
+
+Changing which LLM runs Hindsight's retain / reflect / consolidation ops is a
+config-plus-recreate operation with three known traps. **Follow the runbook:
+`docs/operators/hindsight-model-change.md`.** The short version:
+
+1. Edit `hindsight.llm.{retain,reflect,consolidation}` in the operator's
+   `switchroom.yaml` — keep the outgoing block in a dated comment for rollback.
+2. Pick a full lane: non-Claude via LiteLLM needs `provider: litellm` +
+   `model` + `base_url` + `api_key`; subscription Claude needs
+   `provider: claude-code` + a Claude model name with NO base_url/api_key.
+   A per-op `model:` alone does **not** reroute (docs/model-routing.md G1/G5).
+3. Apply with `switchroom memory setup --recreate` **on the host** — a plain
+   `docker restart` does not re-derive env, and running the CLI inside an
+   agent container silently reads the stale `SWITCHROOM_CONFIG` snapshot.
+4. Verify with `docker inspect switchroom-hindsight`:
+   `HINDSIGHT_API_<OP>_LLM_MODEL` / `_PROVIDER` / `_BASE_URL` match the yaml,
+   and health reaches `healthy`.
+5. `docker restart switchroom-hostd` after the yaml edit, and **re-verify after
+   any fleet rollout** — the singletons bind-mount the yaml as a single file,
+   so an atomic (rename-based) edit leaves them pinned to the stale old inode
+   and a hostd-driven rollout can silently revert the model change.
+
+---
+
 ## Telegram plugin reference — "what MCP tools", "how does reply work"
 
 The `switchroom-telegram` plugin is an enhanced fork of the official Telegram MCP plugin and is the default for all switchroom agents. It exposes **9 MCP tools** (all prefixed `mcp__switchroom-telegram__`):

@@ -138,6 +138,12 @@ anything unset.
 Takes effect on the next `switchroom memory setup` / rollout recreate of the
 hindsight container (env is read at container launch).
 
+**Changing models?** Follow the step-by-step runbook in
+[`hindsight-model-change.md`](hindsight-model-change.md) — it covers the two
+routing lanes (per-op `model:` alone does NOT reroute under a `claude-code`
+global; see `docs/model-routing.md` G1/G5), the recreate-from-the-host
+requirement, verification, and rollback.
+
 ## Health
 
 The container now carries a Docker **healthcheck** (`/health` via

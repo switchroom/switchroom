@@ -359,7 +359,7 @@ export function registerMemoryCommand(program: Command): void {
     .option("--status", "Show Hindsight container status")
     .option(
       "--recreate",
-      "Pull the latest image and recreate the container (reusing its current port). Used by `switchroom update` to keep the hindsight singleton current.",
+      "Pull the latest image and recreate the container (reusing its current port). Used by `switchroom update` to keep the hindsight singleton current. Also required after any `hindsight.llm` model/provider config change — env is only re-derived on recreate, a plain docker restart is not enough (see docs/operators/hindsight-model-change.md).",
     )
     .option(
       "--tag <version>",
