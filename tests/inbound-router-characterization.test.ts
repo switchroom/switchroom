@@ -71,6 +71,12 @@ writeFileSync(
 )
 process.env.TELEGRAM_STATE_DIR = stateDir
 process.env.SWITCHROOM_AGENT_NAME = 'chartestagent'
+// This harness pins the LEGACY (v1) inline-delegation arm. Now that
+// SWITCHROOM_INBOUND_ROUTER_V2 defaults ON (`!== '0'`), pin it to '0' here so
+// the legacy arm stays covered until the legacy path is deleted. Use `??=` so
+// the v2 wrapper (inbound-router-characterization-v2.test.ts sets `='1'` then
+// re-imports THIS file) is NOT clobbered — only a standalone run defaults to '0'.
+process.env.SWITCHROOM_INBOUND_ROUTER_V2 ??= '0'
 
 // ─── Deps-boundary spies ────────────────────────────────────────────────
 // A single ordered call log across every boundary mock — the intercept-ORDER
