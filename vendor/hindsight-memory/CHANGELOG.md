@@ -42,7 +42,9 @@
   True when any bank raised a hard per-request timeout OR any bank/directives
   slot was abandoned at the shared deadline; serial mode reduces to the pre-A3
   per-bank-only form so both modes' `recall_log.jsonl` rows stay comparable in
-  the breach baseline. New log fields: `recall_mode`, `deadline_budget_ms`,
+  the breach baseline. New log fields: `recall_mode`, `deadline_budget_ms`
+  (the CONFIGURED budget), `deadline_effective_ms` (the smaller wait the slots
+  actually got after pre-fan-out spend; null in serial mode / on cache hits),
   `directives_timed_out`. Acceptance: `scripts/tests/test_recall_parallel_deadline.py`
   (stub-timing tests proving a 3s bank cannot breach a 0.6s deadline).
 

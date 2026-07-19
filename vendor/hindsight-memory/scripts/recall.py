@@ -1136,6 +1136,7 @@ def main():
                 # for a uniformly queryable schema (never "serial"/"parallel").
                 "recall_mode": None,
                 "deadline_budget_ms": None,
+                "deadline_effective_ms": None,
                 "directives_timed_out": None,
                 # PR6 — record the active topic on cache hits too so the
                 # log is uniformly queryable (cache_key now includes
@@ -1294,6 +1295,10 @@ def main():
         # respects the ceiling-minus-2s guarantee.
         already_spent = time.monotonic() - recall_start_monotonic
         remaining_deadline = max(0.0, deadline_seconds - already_spent)
+        # `deadline_budget_ms` is the CONFIGURED budget; the wait the slots
+        # actually get is `remaining_deadline` after pre-fan-out spend. Log both
+        # so the breach baseline can tell "configured" from "effectively granted".
+        deadline_effective_ms = int(remaining_deadline * 1000)
 
         tasks = {DIRECTIVES_SLOT: _directives_task}
         for spec in bank_specs:
@@ -1349,9 +1354,13 @@ def main():
     else:
         # Pre-A3 serial path (rollback lever, HINDSIGHT_RECALL_PARALLEL=false).
         # Directives first, then each bank in turn — total latency is the SUM of
-        # the round-trips, byte-for-byte the pre-parallelism behaviour.
+        # the round-trips. Behaviourally equivalent to the pre-parallelism path
+        # (log rows stay comparable), NOT byte-for-byte: this path emits an extra
+        # own-bank debug line, logs the directives block after the bank loop
+        # rather than before, and __main__ still os._exit(0)s on completion.
         recall_mode = "serial"
         deadline_budget_ms = None
+        deadline_effective_ms = None
         _directives_start = time.monotonic()
         directives = fetch_active_directives_cached(
             client,
@@ -1591,6 +1600,11 @@ def main():
         # can segment by mode without guessing from timing.
         "recall_mode": recall_mode,
         "deadline_budget_ms": deadline_budget_ms,
+        # A3 — effective deadline actually granted to the slots after pre-fan-out
+        # spend (mission-ensure + transcript read). `deadline_budget_ms` is the
+        # configured ceiling; this is the smaller wait the slots really got.
+        # None in serial mode and on cache hits (no fan-out).
+        "deadline_effective_ms": deadline_effective_ms,
         "directives_timed_out": directives_timed_out,
         # PR6 — instrumentation for binding-failure analysis.
         # `active_thread_id`: the current prompt's topic (null on

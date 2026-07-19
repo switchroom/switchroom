@@ -67,10 +67,14 @@ class SlotResult:
 def _runner(slot, fn, start):
     """Worker body: run the task, capturing value/exception and duration.
 
-    Catches ``BaseException`` deliberately — a recall client can raise
-    ``socket.timeout`` (a ``BaseException`` subclass only in some stdlib
-    versions, but ``OSError`` in others) and we must never let a worker thread
-    die with an unhandled exception that the deadline join would then miss.
+    Catches ``BaseException`` deliberately for slot isolation: a slot runs in
+    its own daemon thread, and a task failure of ANY kind — including
+    non-``Exception`` subclasses like ``KeyboardInterrupt`` /
+    ``SystemExit`` — must be captured into ``slot.error`` rather than escaping
+    the thread. An escaped exception would let the slot die silently and the
+    deadline join would then see no value AND no recorded error. (``socket.timeout``
+    is itself just an ``OSError`` subclass, i.e. an ordinary ``Exception``; the
+    broad catch is about never letting any slot failure leak out of the thread.)
     """
     try:
         slot.value = fn()

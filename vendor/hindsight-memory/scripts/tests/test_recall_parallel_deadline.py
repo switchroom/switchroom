@@ -196,6 +196,11 @@ class SlowBankCannotBreachCeiling(_MainHarness):
         e = self._read_log()[0]
         self.assertEqual(e["recall_mode"], "parallel")
         self.assertEqual(e["deadline_budget_ms"], 600)
+        # Effective deadline is the configured budget minus pre-fan-out spend,
+        # so it is present, positive, and never exceeds the configured budget.
+        self.assertIsNotNone(e["deadline_effective_ms"])
+        self.assertGreater(e["deadline_effective_ms"], 0)
+        self.assertLessEqual(e["deadline_effective_ms"], e["deadline_budget_ms"])
         timings = {bt["bank_id"]: bt for bt in e["bank_timings"]}
         self.assertFalse(timings["own-bank"]["timed_out"])
         self.assertTrue(timings["shared-bank"]["timed_out"])
@@ -338,6 +343,7 @@ class SerialRollback(_MainHarness):
         e = self._read_log()[0]
         self.assertEqual(e["recall_mode"], "serial")
         self.assertIsNone(e["deadline_budget_ms"])
+        self.assertIsNone(e["deadline_effective_ms"])
         self.assertFalse(e["directives_timed_out"])
         # Both banks were queried and merged.
         self.assertEqual(sorted(e["memory_ids"]), ["m1", "m2"])
