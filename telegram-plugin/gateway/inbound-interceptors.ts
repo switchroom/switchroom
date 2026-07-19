@@ -22,13 +22,21 @@ import { decideInterruptTiming, resolveSafeBoundaryEnabled } from './interrupt-d
 import { naturalAction } from '../permission-title.js'
 import { richMessage } from '../rich-send.js'
 import { renderVaultRequestSaveCard, buildVaultRequestSaveKeyboard } from './vault-request-save-card.js'
+import { runPipeline } from '../secret-detect/pipeline.js'
+import { maskToken } from '../secret-detect/mask.js'
+import { defaultVaultWrite, defaultVaultList } from '../secret-detect/vault-write.js'
+import { parseVaultCliError, renderVaultCliError } from '../secret-detect/vault-error.js'
+import { detectSecrets } from '../secret-detect/index.js'
+import type { StagingMap } from '../secret-detect/staging.js'
 import type { PendingAuthAddFlow } from './auth-add-flow.js'
 import type {
   createCallbackQueryHandlers,
   PendingVaultOp,
   PendingVaultRequestSave,
   PendingVaultRequestAccess,
+  DeferredSecret,
 } from './callback-query-handlers.js'
+import type { InlineKeyboard } from 'grammy'
 import {
   pendingLoopbackFlows,
   submitLoopbackRedirect,
@@ -75,10 +83,11 @@ export interface InboundInterceptorDeps {
       text: string,
       other?: { message_thread_id?: number },
     ) => Promise<unknown>
+    deleteMessage: (chatId: string, messageId: number) => Promise<unknown>
   }
   log: (line: string) => void
   // --- interrupt-marker (P7 PR-3) collaborators ---
-  loadAccess: () => { interruptSafeBoundary?: boolean }
+  loadAccess: () => { interruptSafeBoundary?: boolean; allowFrom: string[] }
   toolFlightTracker: { isMidToolCall: () => boolean; inFlightCount: () => number }
   cancelInterruptedObligation: () => void
   // --- permission-reply (P7 PR-4) collaborators ---
@@ -108,7 +117,11 @@ export interface InboundInterceptorDeps {
   ) => Promise<unknown>
   cleanAuthAddScratchDir: (scratchDir: string) => void
   cancelAccountAuthSession: (flow: PendingAuthAddFlow) => void
-  switchroomReply: (ctx: Context, text: string, options?: { html?: boolean }) => Promise<unknown>
+  switchroomReply: (
+    ctx: Context,
+    text: string,
+    options?: { html?: boolean; reply_markup?: InlineKeyboard },
+  ) => Promise<unknown>
   escapeHtmlForTg: (text: string) => string
   /** Closure over redactAuthCodeMessage + the gateway's redactAuthCodeApi (#488). */
   redactAuthCode: (chatId: string, msgId: number | null) => void
@@ -166,6 +179,15 @@ export interface InboundInterceptorDeps {
   }
   vaultKeyRegex: RegExp
   vaultKeyRegexLabel: string
+  // --- secret-detect (P7 PR-9) collaborators ---
+  secretStaging: StagingMap
+  awaitingAuthCodeAt: { get: (chatId: string) => number | undefined; delete: (chatId: string) => boolean }
+  /** AUTH_CODE_CONTEXT_TTL_MS — fixed constant. */
+  authCodeContextTtlMs: number
+  deferredSecrets: { set: (key: string, v: DeferredSecret) => void }
+  deferredKey: (chatId: string, messageId: number) => string
+  mintDeferredSecretKernelRequest: (slug: string, approverSet: string[]) => Promise<string | null>
+  buildDeferredSecretKeyboard: (deferKey: string) => InlineKeyboard
 }
 
 /**
@@ -808,4 +830,304 @@ export async function interceptVault(
     }
   }
   return { handled: false }
+}
+
+
+/** Per-message facts for the secret-detect intercepts (P7 PR-9). */
+export interface SecretStagingCommandParams {
+  ctx: Context
+  text: string
+  chat_id: string
+  msgId: number | undefined
+}
+
+/**
+ * Secret-detect follow-up command intercept: `stash NAME` / `ignore` /
+ * `rename X` / `forget` on a pending ambiguous detection. The user is replying
+ * to our "looks like a high-entropy string — reply `stash NAME` or `ignore`"
+ * prompt; we look up the most recent staged detection for this chat and act on
+ * it. With no staged entry the message falls through to normal handling.
+ * Moved verbatim from gateway.ts (#2996 P7 PR-9).
+ */
+export async function interceptSecretStagingCommand(
+  p: SecretStagingCommandParams,
+  deps: InboundInterceptorDeps,
+): Promise<InterceptOutcome> {
+  // --- Secret-detect follow-up command intercept ---
+  // `stash NAME` / `ignore` / `rename X` / `forget` on a pending ambiguous
+  // detection. The user is replying to our "looks like a high-entropy
+  // string — reply `stash NAME` or `ignore`" prompt. We look up the most
+  // recent staged detection for this chat and act on it.
+  const stagedMatch = /^\s*(stash|ignore|rename|forget)\b\s*(\S+)?/i.exec(p.text)
+  if (stagedMatch) {
+    const staged = deps.secretStaging.latestForChat(p.chat_id)
+    if (staged != null) {
+      const verb = stagedMatch[1]!.toLowerCase()
+      const arg = stagedMatch[2]?.trim()
+      if (verb === 'ignore' || verb === 'forget') {
+        deps.secretStaging.delete(staged.chat_id, staged.message_id)
+        await deps.switchroomReply(p.ctx, 'ok — ignored. nothing stored.', { html: true })
+        // #1075: operates on a message in a (possibly-deleted) thread.
+        if (p.msgId != null) {
+          const delMsgId = p.msgId
+          void deps.swallowingApiCall(
+            () => deps.botApi().deleteMessage(p.chat_id, delMsgId),
+            { chat_id: p.chat_id, verb: 'staged-secret.delete-ignored' },
+          )
+        }
+        return { handled: true }
+      }
+      if (verb === 'stash' || verb === 'rename') {
+        const cached = deps.vaultPassphraseCache.get(p.chat_id)
+        if (!cached || cached.expiresAt <= Date.now()) {
+          await deps.switchroomReply(p.ctx, 'No vault passphrase cached. Run \`/vault list\` first (or any /vault command) to unlock, then re-send \`stash NAME\`.', { html: true })
+          return { handled: true }
+        }
+        const slugBase = arg && arg.length > 0 ? arg : staged.detection.suggested_slug
+        const listed = defaultVaultList(cached.passphrase)
+        const existing = new Set(listed.ok ? listed.keys : [])
+        let slug = slugBase
+        let n = 2
+        while (existing.has(slug)) slug = `${slugBase}_${n++}`
+        const write = defaultVaultWrite(slug, staged.detection.matched_text, cached.passphrase)
+        if (!write.ok) {
+          // Route P0a markers (#969) through the structured renderer so
+          // a "new key, needs operator approval" failure surfaces a
+          // host-CLI hint instead of a raw stderr blob.
+          const parsed = parseVaultCliError(write.output)
+          const rendered = renderVaultCliError(parsed, { verb: 'save', key: slug })
+          const body = rendered.suppressRaw
+            ? rendered.html
+            : `**vault write failed:**\n${deps.preBlock(write.output)}`
+          await deps.switchroomReply(p.ctx, body, { html: true })
+          return { handled: true }
+        }
+        deps.secretStaging.delete(staged.chat_id, staged.message_id)
+        if (p.msgId != null) await deps.deleteSensitiveMessage(p.chat_id, p.msgId, 'stash command')
+        await deps.deleteSensitiveMessage(p.chat_id, staged.message_id, 'detected secret')
+        await deps.switchroomReply(p.ctx, `✅ stored as \`vault:${slug}\` (masked: \`${maskToken(staged.detection.matched_text)}\`)`, { html: true })
+        return { handled: true }
+      }
+    }
+    // No staged entry to act on — fall through to normal handling.
+  }
+  return { handled: false }
+}
+
+/** Params for the secret-detect pipeline intercept (P7 PR-9). `effectiveText`
+ * is the steer/queue-prefix-stripped text captured in handleInbound; the
+ * scrub may REWRITE it, so it crosses back in the outcome as a value. */
+export interface SecretDetectPipelineParams {
+  ctx: Context
+  chat_id: string
+  msgId: number | undefined
+  effectiveText: string
+}
+
+/** Outcome of the pipeline intercept: `handled: true` drops/consumes the
+ * message; otherwise the caller MUST adopt `effectiveText` (possibly rewritten
+ * with vault refs) for everything downstream — history, envelope, IPC. */
+export type SecretDetectPipelineOutcome =
+  | { handled: true }
+  | { handled: false; effectiveText: string }
+
+/**
+ * Secret detection + vault-scrub (moved verbatim, #2996 P7 PR-9). If the user
+ * pasted a secret, intercept BEFORE recording to history or broadcasting to
+ * the agent: write to vault, delete the Telegram message, rewrite the prompt
+ * so the downstream session .jsonl, Hindsight memory, and IPC payload never
+ * see the raw bytes. No cached passphrase → high-confidence hits are deferred
+ * behind the one-tap unlock+save card (#44).
+ *
+ * FAIL-CLOSED: if the pipeline throws, drop the message and warn the user —
+ * never fall through to recordInbound/broadcast with raw bytes. See
+ * gateway-secret-detect.test.ts and secret-detect-fail-closed.test.ts.
+ */
+export async function interceptSecretDetectPipeline(
+  p: SecretDetectPipelineParams,
+  deps: InboundInterceptorDeps,
+): Promise<SecretDetectPipelineOutcome> {
+  let effectiveText = p.effectiveText
+  // --- Secret detection + vault-scrub ---
+  // If the user pasted a secret, intercept BEFORE we record to history or
+  // broadcast to the agent: write to vault, delete the Telegram message,
+  // rewrite the prompt so the downstream session .jsonl, Hindsight memory,
+  // and IPC payload never see the raw bytes. If there's no cached vault
+  // passphrase, high-confidence hits are deferred and the user is asked to
+  // unlock first.
+  //
+  // FAIL-CLOSED: if the pipeline throws, drop the message and warn the user
+  // — never fall through to recordInbound/broadcast with raw bytes. See
+  // gateway-secret-detect.test.ts and secret-detect-fail-closed.test.ts.
+  try {
+    // Channel B context rule: if we emitted "Paste the browser code here"
+    // recently in this chat, treat the inbound as auth-flow-sensitive —
+    // high-confidence secret detection regardless of pattern match. This
+    // survives Anthropic changing their token format because it tracks the
+    // gateway's own prompt, not the token shape.
+    const authCodeSentAt = deps.awaitingAuthCodeAt.get(p.chat_id)
+    const isAuthFlowContext =
+      authCodeSentAt !== undefined && Date.now() - authCodeSentAt < deps.authCodeContextTtlMs
+    if (isAuthFlowContext) {
+      process.stderr.write(`[secret-detect] auth-flow context rule active for chat ${p.chat_id}\n`)
+    }
+
+    const cachedPp = deps.vaultPassphraseCache.get(p.chat_id)
+    const passphrase = cachedPp && cachedPp.expiresAt > Date.now() ? cachedPp.passphrase : null
+    if (passphrase) {
+      const pipeRes = runPipeline({
+        chat_id: p.chat_id,
+        message_id: p.msgId ?? null,
+        text: effectiveText,
+        passphrase,
+        vaultWrite: defaultVaultWrite,
+        vaultList: defaultVaultList,
+      })
+      if (pipeRes.stored.length > 0) {
+        effectiveText = pipeRes.rewritten_text
+        if (isAuthFlowContext) {
+          deps.awaitingAuthCodeAt.delete(p.chat_id) // consume: one message per prompt
+        }
+        // 2026-05-12: route through deps.deleteSensitiveMessage so a
+        // failed delete posts an in-chat warning naming the leaked
+        // message id, instead of only logging to stderr (invisible
+        // on mobile). Previously the operator saw "we deleted it
+        // from chat" while the raw secret stayed visible. See
+        // tests/secret-detect-delete-must-surface-failures.test.ts.
+        if (p.msgId != null) {
+          await deps.deleteSensitiveMessage(p.chat_id, p.msgId, 'detected secret')
+        }
+        const lines = pipeRes.stored.map((s) =>
+          `• \`${s.masked}\` → \`vault:${s.actual_slug}\``,
+        )
+        await deps.switchroomReply(
+          p.ctx,
+          [`🔒 captured ${pipeRes.stored.length} secret${pipeRes.stored.length === 1 ? '' : 's'}:`, ...lines, '', 'reply \`rename X\` or \`forget\`.'].join('\n'),
+          { html: true },
+        )
+        for (const s of pipeRes.stored) {
+          deps.secretStaging.set({
+            chat_id: p.chat_id,
+            message_id: p.msgId ?? 0,
+            detection: { ...s.detection, suggested_slug: s.actual_slug },
+            staged_at: Date.now(),
+          })
+        }
+      } else if (isAuthFlowContext && pipeRes.stored.length === 0) {
+        // Channel B fallback: pattern didn't fire (Anthropic may have changed
+        // the token format) but we know this is an auth code paste because we
+        // prompted for it. Delete + stage + warn so no raw bytes leak.
+        deps.awaitingAuthCodeAt.delete(p.chat_id) // consume: one message per prompt
+        // 2026-05-12: route through deps.deleteSensitiveMessage. See
+        // tests/secret-detect-delete-must-surface-failures.test.ts.
+        if (p.msgId != null) {
+          await deps.deleteSensitiveMessage(p.chat_id, p.msgId, 'auth-flow secret')
+        }
+        // Issue #44: even with passphrase cached we hit this branch when the
+        // pattern didn't fire — but at this point a vault write would still
+        // need the user's intent. Stash with a one-tap unlock+save card so
+        // the post-context flow stays seamless.
+        const dKey = deps.deferredKey(p.chat_id, p.msgId ?? 0)
+        const cachedBranchDetection = detectSecrets(effectiveText).find((d) => d.confidence === 'high' && !d.suppressed)
+        const cachedBranchSlug = cachedBranchDetection?.suggested_slug ?? (isAuthFlowContext ? 'anthropic_oauth_code' : 'secret')
+        const cachedBranchKernelId = await deps.mintDeferredSecretKernelRequest(
+          cachedBranchSlug,
+          deps.loadAccess().allowFrom,
+        )
+        deps.deferredSecrets.set(dKey, {
+          chat_id: p.chat_id,
+          original_message_id: p.msgId ?? 0,
+          text: effectiveText,
+          staged_at: Date.now(),
+          suggested_slug: cachedBranchSlug,
+          kernel_request_id: cachedBranchKernelId ?? undefined,
+        })
+        await deps.switchroomReply(
+          p.ctx,
+          '🔒 auth-flow secret detected. we deleted it from chat. tap below to save it to the vault — no re-paste needed.',
+          { html: true, reply_markup: deps.buildDeferredSecretKeyboard(dKey) },
+        )
+        return { handled: true }
+      } else if (pipeRes.ambiguous.length > 0) {
+        for (const d of pipeRes.ambiguous) {
+          deps.secretStaging.set({ chat_id: p.chat_id, message_id: p.msgId ?? 0, detection: d, staged_at: Date.now() })
+        }
+        const top = pipeRes.ambiguous[0]!
+        await deps.switchroomReply(
+          p.ctx,
+          `👀 looks like a high-entropy string (rule: \`${top.rule_id}\`). reply \`stash NAME\` to store in vault, or \`ignore\`.`,
+          { html: true },
+        )
+        // For ambiguous, we do NOT delete the message or rewrite — let the
+        // user confirm first.
+      }
+    } else {
+      // No passphrase cached — detect, but defer. Issue #44 turned this
+      // into a one-tap unlock-and-save flow: previously the user had to
+      // run `/vault list`, type their passphrase, then re-paste the
+      // original secret (six steps for a non-technical user). Now they
+      // tap a button and re-enter the passphrase exactly once.
+      const detections = detectSecrets(effectiveText)
+      const highConfDetection = detections.find((d) => d.confidence === 'high' && !d.suppressed)
+      const hasHigh = highConfDetection !== undefined || isAuthFlowContext
+      if (hasHigh) {
+        if (isAuthFlowContext) {
+          deps.awaitingAuthCodeAt.delete(p.chat_id) // consume: one message per prompt
+        }
+        // Capture the slug at defer-time so the post-unlock auto-write
+        // doesn't have to re-detect (which has a degenerate case for
+        // Channel-B context defers where no pattern fired).
+        const suggestedSlug =
+          highConfDetection?.suggested_slug
+          ?? (isAuthFlowContext ? 'anthropic_oauth_code' : 'secret')
+        const dKey = deps.deferredKey(p.chat_id, p.msgId ?? 0)
+        const noPassKernelId = await deps.mintDeferredSecretKernelRequest(
+          suggestedSlug,
+          deps.loadAccess().allowFrom,
+        )
+        deps.deferredSecrets.set(dKey, {
+          chat_id: p.chat_id,
+          original_message_id: p.msgId ?? 0,
+          text: effectiveText,
+          staged_at: Date.now(),
+          suggested_slug: suggestedSlug,
+          kernel_request_id: noPassKernelId ?? undefined,
+        })
+        // 2026-05-12: route through deps.deleteSensitiveMessage. See
+        // tests/secret-detect-delete-must-surface-failures.test.ts.
+        if (p.msgId != null) {
+          await deps.deleteSensitiveMessage(p.chat_id, p.msgId, 'detected secret')
+        }
+        await deps.switchroomReply(
+          p.ctx,
+          '🔒 caught a secret. we deleted it from chat. tap below to unlock the vault and save it — no re-paste needed.',
+          { html: true, reply_markup: deps.buildDeferredSecretKeyboard(dKey) },
+        )
+        return { handled: true }
+      }
+    }
+  } catch (err) {
+    // FAIL-CLOSED: if the detector throws, we must NOT fall through to
+    // recordInbound() / ipcServer.broadcast() with the raw text — that
+    // would stamp the secret into SQLite and emit it to the agent
+    // unscrubbed. Drop the message on the floor and warn the user.
+    process.stderr.write(`[secret-detect] pipeline error: ${(err as Error).message}\n`)
+    try {
+      await deps.switchroomReply(
+        p.ctx,
+        '⚠️ secret-detect pipeline crashed; this message was dropped for safety. please try again or check the agent log.',
+        { html: true },
+      )
+    } catch {}
+    // 2026-05-12: route through deps.deleteSensitiveMessage. The
+    // pipeline-error fail-closed path is the LAST line of defence —
+    // if delete fails here, the operator must know so they can
+    // delete manually. See
+    // tests/secret-detect-delete-must-surface-failures.test.ts.
+    if (p.msgId != null) {
+      await deps.deleteSensitiveMessage(p.chat_id, p.msgId, 'secret-detect pipeline-error fallback')
+    }
+    return { handled: true }
+  }
+  return { handled: false, effectiveText }
 }

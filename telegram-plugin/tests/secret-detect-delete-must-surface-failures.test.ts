@@ -31,10 +31,14 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-const gatewaySrc = readFileSync(
-  resolve(__dirname, "..", "gateway", "gateway.ts"),
-  "utf-8",
-);
+const gatewaySrc =
+  readFileSync(resolve(__dirname, "..", "gateway", "gateway.ts"), "utf-8") +
+  "\n" +
+  // P7 PR-9 (#2996): the secret-detect pipeline intercept moved verbatim into
+  // gateway/inbound-interceptors.ts (interceptSecretDetectPipeline); the
+  // FAIL-CLOSED block anchor now resolves there. deleteSensitiveMessage is
+  // injected via deps but every branch still routes through it.
+  readFileSync(resolve(__dirname, "..", "gateway", "inbound-interceptors.ts"), "utf-8");
 
 /** Slice the gateway source between two anchor strings. */
 function sliceBetween(src: string, from: string, to: string): string {

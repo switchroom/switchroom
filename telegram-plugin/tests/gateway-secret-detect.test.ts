@@ -56,7 +56,9 @@ describe('gateway secret-detect intercept — structural wiring', () => {
   })
 
   it('runPipeline call sits BEFORE recordInbound() and ipcServer.broadcast(inboundMsg)', () => {
-    const pipelineIdx = src.indexOf('runPipeline({')
+    // P7 PR-9: runPipeline lives in interceptSecretDetectPipeline; the
+    // gateway CALL SITE is the ordering anchor against the sinks.
+    const pipelineIdx = src.indexOf('await interceptSecretDetectPipeline(')
     const recordIdx = src.indexOf('recordInbound(', pipelineIdx)
     const broadcastIdx = src.indexOf('ipcServer.broadcast(inboundMsg)', pipelineIdx)
     expect(pipelineIdx).toBeGreaterThan(0)
@@ -76,7 +78,7 @@ describe('gateway secret-detect intercept — structural wiring', () => {
     // swallowed. See
     // tests/secret-detect-delete-must-surface-failures.test.ts for
     // the full contract pin.
-    expect(tail).toMatch(/deleteSensitiveMessage\(chat_id, msgId, 'detected secret'\)/)
+    expect(tail).toMatch(/deleteSensitiveMessage\((?:p\.)?chat_id, (?:p\.)?msgId, 'detected secret'\)/)
     // Tells the user what was captured (masked).
     expect(tail).toMatch(/captured \$\{pipeRes\.stored\.length\} secret/)
     // Surfaces the masked form (s.masked is computed via maskToken in the pipeline).
@@ -104,7 +106,7 @@ describe('gateway secret-detect intercept — structural wiring', () => {
     //    migrated to deleteSensitiveMessage so failures surface to the
     //    operator via in-chat warning. See
     //    tests/secret-detect-delete-must-surface-failures.test.ts.
-    expect(tail).toMatch(/deleteSensitiveMessage\(chat_id, msgId, 'detected secret'\)/)
+    expect(tail).toMatch(/deleteSensitiveMessage\((?:p\.)?chat_id, (?:p\.)?msgId, 'detected secret'\)/)
     // 4. The new inline keyboard helper is used in lieu of the legacy
     //    plain-text "run /vault list" warning.
     expect(tail).toMatch(/buildDeferredSecretKeyboard\(/)
@@ -136,9 +138,15 @@ describe('gateway secret-detect intercept — structural wiring', () => {
     // pre-staging body, not a precise offset — it has grown before (#3020's
     // stop-keyword block pushed it past the old 30k) and may grow again;
     // bump it when new early-return branches land above the staging block.
-    const handleInboundIdx = src.indexOf('async function handleInbound(')
-    const tail = src.slice(handleInboundIdx, handleInboundIdx + 50000)
+    // P7 PR-9: the parser moved to interceptSecretStagingCommand
+    // (inbound-interceptors.ts), still invoked from handleInbound's
+    // inbound-text path (same allowFrom gating) — anchor on the function.
+    const stagingFnIdx = src.indexOf('export async function interceptSecretStagingCommand(')
+    expect(stagingFnIdx).toBeGreaterThan(0)
+    const tail = src.slice(stagingFnIdx, stagingFnIdx + 6000)
     expect(tail).toMatch(/\(stash\|ignore\|rename\|forget\)/)
-    expect(tail).toMatch(/secretStaging\.latestForChat\(chat_id\)/)
+    expect(tail).toMatch(/secretStaging\.latestForChat\((?:p\.)?chat_id\)/)
+    // And handleInbound must actually delegate to it.
+    expect(src).toMatch(/await interceptSecretStagingCommand\(/)
   })
 })
