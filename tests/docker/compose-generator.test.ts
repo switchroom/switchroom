@@ -47,6 +47,7 @@ interface MakeConfigAgent {
   resources?: { memory?: string; memory_reservation?: string; pids_limit?: number; cpus?: number };
   timezone?: string;
   network_isolation?: "host" | "strict";
+  experimental?: { legacy_pty?: boolean; legacy_autoaccept_expect?: boolean };
   litellm?: {
     enabled?: boolean;
     base_url?: string;
@@ -93,6 +94,7 @@ function makeConfig(
           resources: cfg.resources,
           timezone: cfg.timezone,
           network_isolation: cfg.network_isolation,
+          experimental: cfg.experimental,
           litellm: cfg.litellm,
           schedule: [],
           tools: { allow: [], deny: [] },
@@ -2723,6 +2725,68 @@ describe("agent service env — user-declared env propagation", () => {
     const env = envBlockFor(out, "charlie");
     expect(env).toMatch(/SWITCHROOM_RUNTIME:\s*"docker"/);
     expect(env).toMatch(/HOME:\s*"\/state\/agent\/home"/);
+  });
+});
+
+describe("SWITCHROOM_TMUX_SUPERVISOR env provisioning (#725 enabler)", () => {
+  // The gateway's deterministic in-chat `/auth add` OAuth flow
+  // (telegram-plugin/gateway/auth-add-flow.ts) HARD-REFUSES to launch
+  // unless SWITCHROOM_TMUX_SUPERVISOR === "1". The guard shipped in
+  // v0.19.2 with NO provisioning — nothing in the compose render, start.sh,
+  // or the container env ever set it — so the flow was unreachable on every
+  // agent. These tests assert the OUTCOME the bug was: the var is present
+  // (=="1") on a default (tmux-supervisor) agent and absent on a legacy_pty
+  // agent, not merely that some code path ran.
+  function envBlockFor(yml: string, agent: string): string {
+    const re = new RegExp(
+      `  agent-${agent}:[\\s\\S]*?    environment:([\\s\\S]*?)\\n    volumes:`,
+    );
+    return re.exec(yml)?.[1] ?? "";
+  }
+
+  it("emits SWITCHROOM_TMUX_SUPERVISOR=\"1\" for a default (tmux-supervisor) agent", () => {
+    const out = generateCompose({ config: makeConfig({ klanker: {} }) });
+    const env = envBlockFor(out, "klanker");
+    expect(env).toMatch(/SWITCHROOM_TMUX_SUPERVISOR:\s*"1"/);
+  });
+
+  it("emits it for an agent that explicitly sets experimental.legacy_pty=false", () => {
+    const out = generateCompose({
+      config: makeConfig({ klanker: { experimental: { legacy_pty: false } } }),
+    });
+    const env = envBlockFor(out, "klanker");
+    expect(env).toMatch(/SWITCHROOM_TMUX_SUPERVISOR:\s*"1"/);
+  });
+
+  it("OMITS it when the operator opted into experimental.legacy_pty=true", () => {
+    const out = generateCompose({
+      config: makeConfig({ klanker: { experimental: { legacy_pty: true } } }),
+    });
+    const env = envBlockFor(out, "klanker");
+    expect(env).not.toMatch(/SWITCHROOM_TMUX_SUPERVISOR/);
+  });
+
+  it("is system-authoritative — an operator env: block can't clobber it on a supervisor agent", () => {
+    // The pre-fix interim workaround was to hand-set this in `env:`; now it
+    // is compose-provisioned and the "1" must win over any yaml value so a
+    // stale/typo'd override can't silently disable the auth-add flow.
+    const out = generateCompose({
+      config: makeConfig({
+        klanker: { env: { SWITCHROOM_TMUX_SUPERVISOR: "0" } },
+      }),
+    });
+    const env = envBlockFor(out, "klanker");
+    expect(env).toMatch(/SWITCHROOM_TMUX_SUPERVISOR:\s*"1"/);
+    expect(env).not.toMatch(/SWITCHROOM_TMUX_SUPERVISOR:\s*"0"/);
+  });
+
+  it("describeAgents surfaces tmuxSupervisor true by default and false under legacy_pty", () => {
+    const [dflt] = describeAgents(makeConfig({ klanker: {} }));
+    expect(dflt!.tmuxSupervisor).toBe(true);
+    const [legacy] = describeAgents(
+      makeConfig({ klanker: { experimental: { legacy_pty: true } } }),
+    );
+    expect(legacy!.tmuxSupervisor).toBe(false);
   });
 });
 

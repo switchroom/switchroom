@@ -772,6 +772,26 @@ interface AgentServiceData {
    * via the compose `environment:` block — see #1198.
    */
   timezone: string;
+  /**
+   * Whether the agent runs under the #725 tmux supervisor (the default)
+   * rather than the legacy PTY supervisor. Cascade-resolved from
+   * `experimental.legacy_pty`: `true` unless the operator opted out with
+   * `experimental.legacy_pty: true`. Surfaces in the container
+   * `environment:` block as `SWITCHROOM_TMUX_SUPERVISOR="1"` when true.
+   *
+   * This env var is the ENABLER for the gateway's deterministic in-chat
+   * `/auth add` flow: `startAccountAuthSession` (telegram-plugin/gateway/
+   * auth-add-flow.ts) HARD-REFUSES to launch unless
+   * `SWITCHROOM_TMUX_SUPERVISOR === "1"` — the guard shipped without its
+   * provisioning, so before this the flow was unreachable on every agent
+   * (nothing in the compose render, start.sh, or the container env set it;
+   * only docs/tmux-supervisor-fanout.md mentioned it as a systemd line for
+   * a unit shape this docker deployment doesn't use). Gated on the SAME
+   * `legacy_pty !== true` predicate the rest of the tmux-supervisor surface
+   * uses (src/cli/agent.ts:1606, src/agents/lifecycle.ts:397) so the flag
+   * and the runtime it guards can never disagree.
+   */
+  tmuxSupervisor: boolean;
 }
 
 /**
@@ -871,6 +891,12 @@ export function describeAgents(
       // path that previously silently baked UTC into every agent. The
       // warning surfaces on `switchroom apply` / `switchroom agent
       // reconcile` — the ops that regenerate the compose file.
+      // tmux supervisor is the default; only an explicit
+      // `experimental.legacy_pty: true` opts out. Same predicate the
+      // inject/lifecycle/agent-log surfaces use — keep them in lockstep so
+      // the SWITCHROOM_TMUX_SUPERVISOR env can never disagree with the
+      // supervisor the agent actually boots under.
+      tmuxSupervisor: resolved.experimental?.legacy_pty !== true,
       timezone: resolveTimezone(config, resolved, {
         onUtcFallback: () => {
           console.warn(
@@ -2336,6 +2362,24 @@ function emitAgentService(
   // unconditionally with the resolved value (`local` or `cloud`) so the
   // gateway honors it deterministically.
   env.SWITCHROOM_VOICE_ENGINE = voiceEngine;
+  // SWITCHROOM_TMUX_SUPERVISOR: the enabler for the gateway's deterministic
+  // in-chat `/auth add` OAuth flow. `startAccountAuthSession`
+  // (telegram-plugin/gateway/auth-add-flow.ts) HARD-REFUSES to launch its
+  // tmux pane unless this is exactly "1" — the guard shipped in v0.19.2
+  // without any provisioning, so the flow was unreachable on every agent
+  // (verified: nothing in the compose render, start.sh, or the container
+  // env ever set it; only docs/tmux-supervisor-fanout.md mentioned it as a
+  // systemd `Environment=` line for a unit shape this docker deployment
+  // doesn't use). Provisioned here, config-derived, whenever the agent runs
+  // under the tmux supervisor — i.e. unless the operator opted out with
+  // `experimental.legacy_pty: true`. Under legacy_pty there is no tmux
+  // supervisor, so the flag is deliberately omitted (the flow correctly
+  // stays refused). Emitted BEFORE the userEnv merge so on a
+  // tmux-supervisor agent (the default) the "1" is system-authoritative and
+  // the operator can't clobber the runtime contract from yaml.
+  if (a.tmuxSupervisor) {
+    env.SWITCHROOM_TMUX_SUPERVISOR = "1";
+  }
   // Merge operator-declared env vars from the agent's `env:` block.
   // System-managed keys (HOME, NPM_*, SWITCHROOM_*) win on collision —
   // an operator can't override the runtime contract from yaml. A
