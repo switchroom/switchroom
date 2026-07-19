@@ -18,6 +18,7 @@
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { parseStopKeyword, buildStopReply } from './stop-command.js'
 import { decideInterruptTiming, resolveSafeBoundaryEnabled } from './interrupt-defer.js'
+import { naturalAction } from '../permission-title.js'
 import type { parseInterruptMarker } from '../interrupt-marker.js'
 import type { RetryCallOpts } from '../retry-api-call.js'
 import type { AttachmentMeta } from './gateway.js'
@@ -63,6 +64,17 @@ export interface InboundInterceptorDeps {
   loadAccess: () => { interruptSafeBoundary?: boolean }
   toolFlightTracker: { isMidToolCall: () => boolean; inFlightCount: () => number }
   cancelInterruptedObligation: () => void
+  // --- permission-reply (P7 PR-4) collaborators ---
+  dispatchPermissionVerdict: (ev: {
+    type: 'permission'
+    requestId: string
+    behavior: 'allow' | 'deny'
+  }) => void
+  resumeReactionAfterVerdict: () => void
+  pendingPermissions: {
+    get: (requestId: string) => { tool_name: string; input_preview: string } | undefined
+  }
+  postPermissionResumeMessage: (opts: { behavior: 'allow' | 'deny'; action: string }) => void
 }
 
 /**
@@ -252,4 +264,51 @@ export async function interceptInterruptMarker(
   // Replace the inbound text with the body and continue normal
   // processing. The agent receives a fresh turn with no `!` prefix.
   return { handled: false, deferInterrupt, replacedText: interrupt.body }
+}
+
+/**
+ * `y <id>` / `n <id>` permission verdict reply. The 5-char request id
+ * deliberately excludes `l` (ambiguity with `1`/`I` on phone keyboards).
+ * Moved verbatim from gateway.ts (P7 PR-4).
+ */
+const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
+
+/** Per-message facts for the permission-reply intercept (P7 PR-4). */
+export interface PermissionReplyParams {
+  text: string
+  chat_id: string
+  msgId: number | undefined
+}
+
+/**
+ * Text-reply permission verdict (`y ab3de` / `no ab3de`): forward the verdict
+ * to the connected bridge, un-park the status reaction, post the
+ * "continuing…" resume line, and ack with ✅/❌. Fully intercepts — the
+ * verdict text is never forwarded to the agent as a turn.
+ */
+export function interceptPermissionReply(
+  p: PermissionReplyParams,
+  deps: InboundInterceptorDeps,
+): InterceptOutcome {
+  const permMatch = PERMISSION_REPLY_RE.exec(p.text)
+  if (!permMatch) return { handled: false }
+  // Forward permission reply to connected bridge
+  const behavior = permMatch[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny'
+  const request_id = permMatch[2]!.toLowerCase()
+  deps.dispatchPermissionVerdict({
+    type: 'permission',
+    requestId: request_id,
+    behavior,
+  })
+  deps.resumeReactionAfterVerdict()
+  const ftDetails = deps.pendingPermissions.get(request_id)
+  deps.postPermissionResumeMessage({
+    behavior,
+    action: ftDetails ? naturalAction(ftDetails.tool_name, ftDetails.input_preview) : '',
+  })
+  if (p.msgId != null) {
+    const emoji = behavior === 'allow' ? '✅' : '❌'
+    void deps.sendReaction(p.chat_id, p.msgId, emoji as ReactionTypeEmoji['emoji']).catch(() => {})
+  }
+  return { handled: true }
 }
