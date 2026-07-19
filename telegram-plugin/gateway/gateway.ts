@@ -540,10 +540,10 @@ import {
   handleModelCommand,
   classifyModelSwitchConfirmation,
   formatModelRelaunchDiagLog,
-  resolveModelSwitchBootNotice,
   servedModelMatchesRequested,
-  formatServedModelDivergenceLog,
-  formatServedModelDivergenceCard,
+  buildServedModelDivergenceHandler,
+  deliverModelSwitchBootNotice,
+  type ModelBootCardDeps,
   buildModelMenu,
   handleModelMenuCallback,
   isValidModelArg,
@@ -23932,27 +23932,18 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                 // requested-vs-served tripwire — `launched` IS the token of the
                 // session now serving. Command-time setOverride never arms.
                 sessionModelSource.setOverride(isApplyBoot ? launched : null, { verify: true })
-                // Tripwire handler: the first LIVE assistant line serving a
-                // different model (invalid id OR transient unavailability —
-                // --fallback-model substituted) logs + warns the operator. The
-                // override is KEPT (M2): freshness rules already make /status
-                // show the served model, and a transient substitution
-                // self-corrects without us destroying the switch record.
+                // Boot /model cards (#3427): the divergence tripwire warn and
+                // the switch confirmation share one deps surface; the card
+                // logic lives in model-command.ts (#2996 ratchet).
+                const modelBootCardDeps: ModelBootCardDeps = {
+                  agent: getMyAgentName(),
+                  chat: modelSwitchMarkerChat,
+                  log: (line) => process.stderr.write(line),
+                  // allow-raw-bot-api: one-shot boot /model cards (divergence warn + switch confirmation), same shape as the session-model alert relay below
+                  sendCard: (chatId, body, opts) => lockedBot.api.sendMessage(chatId, body, opts),
+                }
                 if (isApplyBoot) {
-                  const dChat = modelSwitchMarkerChat
-                  sessionModelSource.setDivergenceHandler((d) => {
-                    process.stderr.write(formatServedModelDivergenceLog({ agent: getMyAgentName(), ...d }))
-                    if (!dChat) return
-                    // allow-raw-bot-api: one-shot divergence warn, same shape as the switch confirmation below
-                    void lockedBot.api
-                      .sendMessage(dChat.chatId, formatServedModelDivergenceCard(d), {
-                        parse_mode: 'Markdown',
-                        ...(dChat.threadId != null ? { message_thread_id: dChat.threadId } : {}),
-                      })
-                      .catch((err: unknown) =>
-                        process.stderr.write(`telegram gateway: served-model divergence send failed: ${(err as Error)?.message ?? String(err)}\n`),
-                      )
-                  })
+                  sessionModelSource.setDivergenceHandler(buildServedModelDivergenceHandler(modelBootCardDeps))
                 }
                 // F1/N4: classify + log + one confirmation card. Formatters live
                 // in model-command.ts so this file does not inflate (#2996 ratchet).
@@ -23972,29 +23963,13 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                     isApplyBoot,
                   }),
                 )
-                if (confirmation != null && modelSwitchMarkerChat) {
-                  const chat = modelSwitchMarkerChat
+                if (confirmation != null) {
                   // #3427 item 2: card-vs-suppress decision is pure + behaviorally tested.
-                  const notice = resolveModelSwitchBootNotice({
-                    agent: getMyAgentName(),
+                  deliverModelSwitchBootNotice({
+                    ...modelBootCardDeps,
                     confirmation,
                     hasSessionModelAlert: existsSync(join(smAgentDir, '.session-model-alert')),
                   })
-                  if (notice.kind === 'suppress') {
-                    process.stderr.write(notice.log)
-                  } else {
-                    // allow-raw-bot-api: one-shot boot confirmation, same shape as the session-model alert relay below
-                    void lockedBot.api
-                      .sendMessage(chat.chatId, notice.body, {
-                        parse_mode: 'Markdown',
-                        ...(chat.threadId != null ? { message_thread_id: chat.threadId } : {}),
-                      })
-                      .catch((err: unknown) =>
-                        process.stderr.write(
-                          `telegram gateway: model-switch confirmation send failed: ${(err as Error)?.message ?? String(err)}\n`,
-                        ),
-                      )
-                  }
                 }
               } catch { /* leave override as-is on a bad read */ }
             }

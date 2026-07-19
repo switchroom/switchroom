@@ -35,7 +35,10 @@ import {
   servedModelMatchesRequested,
   formatServedModelDivergenceLog,
   formatServedModelDivergenceCard,
+  buildServedModelDivergenceHandler,
+  deliverModelSwitchBootNotice,
   unvalidatedIdCaveat,
+  type ModelBootCardDeps,
   type ModelCommandDeps,
 } from "../gateway/model-command.js";
 
@@ -786,6 +789,99 @@ describe("served-model divergence formatters (#3427 item 4)", () => {
       agent: "a", requested: "claude-sonnet-9", served: "claude-opus-4-8",
     });
     expect(log).toContain("invalid/unknown OR model transiently unavailable");
+  });
+});
+
+describe("boot /model cards — buildServedModelDivergenceHandler / deliverModelSwitchBootNotice (#2996 extraction)", () => {
+  function makeCardDeps(overrides: Partial<ModelBootCardDeps> = {}) {
+    const logs: string[] = [];
+    const sends: Array<{ chatId: string; body: string; opts: Record<string, unknown> }> = [];
+    const deps: ModelBootCardDeps = {
+      agent: "klanker",
+      chat: { chatId: "-100123", threadId: 42 },
+      log: (line) => { logs.push(line); },
+      sendCard: (chatId, body, opts) => {
+        sends.push({ chatId, body, opts });
+        return Promise.resolve();
+      },
+      ...overrides,
+    };
+    return { deps, logs, sends };
+  }
+
+  it("divergence handler logs the DIVERGENCE line and sends the card to the marker chat + thread", () => {
+    const { deps, logs, sends } = makeCardDeps();
+    buildServedModelDivergenceHandler(deps)({ requested: "claude-sonnet-9", served: "claude-opus-4-8" });
+    expect(logs.some((l) => l.includes("gw /model served-model DIVERGENCE agent=klanker"))).toBe(true);
+    expect(sends).toHaveLength(1);
+    expect(sends[0].chatId).toBe("-100123");
+    expect(sends[0].body).toContain("`claude-opus-4-8`");
+    expect(sends[0].opts).toEqual({ parse_mode: "Markdown", message_thread_id: 42 });
+  });
+
+  it("divergence handler with NO marker chat still logs but never sends", () => {
+    const { deps, logs, sends } = makeCardDeps({ chat: null });
+    buildServedModelDivergenceHandler(deps)({ requested: "sonnet", served: "claude-opus-4-8" });
+    expect(logs.some((l) => l.includes("DIVERGENCE"))).toBe(true);
+    expect(sends).toHaveLength(0);
+  });
+
+  it("divergence card send rejection is swallowed and logged — never throws", async () => {
+    const { deps, logs } = makeCardDeps({
+      sendCard: () => Promise.reject(new Error("THREAD_NOT_FOUND")),
+    });
+    expect(() =>
+      buildServedModelDivergenceHandler(deps)({ requested: "claude-sonnet-9", served: "claude-opus-4-8" }),
+    ).not.toThrow();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(logs.some((l) => l.includes("served-model divergence send failed: THREAD_NOT_FOUND"))).toBe(true);
+  });
+
+  it("boot notice: applied confirmation sends the ✅ card (thread-aware), no suppress log", () => {
+    const { deps, logs, sends } = makeCardDeps();
+    deliverModelSwitchBootNotice({
+      ...deps,
+      confirmation: { kind: "applied", launched: "claude-opus-4-8" },
+      hasSessionModelAlert: false,
+    });
+    expect(sends).toHaveLength(1);
+    expect(sends[0].body).toContain("✅ Now running `claude-opus-4-8`");
+    expect(sends[0].opts).toEqual({ parse_mode: "Markdown", message_thread_id: 42 });
+    expect(logs).toHaveLength(0);
+  });
+
+  it("boot notice: not-applied + .session-model-alert suppresses the card and writes the suppress log", () => {
+    const { deps, logs, sends } = makeCardDeps({ chat: { chatId: "-100123", threadId: null } });
+    deliverModelSwitchBootNotice({
+      ...deps,
+      confirmation: { kind: "not-applied", target: "fable", revertedTo: "claude-sonnet-5" },
+      hasSessionModelAlert: true,
+    });
+    expect(sends).toHaveLength(0);
+    expect(logs.some((l) => l.includes("suppressing not-applied confirmation") && l.includes("target=fable"))).toBe(true);
+  });
+
+  it("boot notice: no marker chat is a full no-op (matches pre-extraction inline behavior)", () => {
+    const { deps, logs, sends } = makeCardDeps({ chat: null });
+    deliverModelSwitchBootNotice({
+      ...deps,
+      confirmation: { kind: "not-applied", target: "fable", revertedTo: "claude-sonnet-5" },
+      hasSessionModelAlert: true,
+    });
+    expect(sends).toHaveLength(0);
+    expect(logs).toHaveLength(0);
+  });
+
+  it("boot notice: threadId null omits message_thread_id from send opts", () => {
+    const { deps, sends } = makeCardDeps({ chat: { chatId: "777", threadId: null } });
+    deliverModelSwitchBootNotice({
+      ...deps,
+      confirmation: { kind: "default", launched: "claude-sonnet-5" },
+      hasSessionModelAlert: false,
+    });
+    expect(sends).toHaveLength(1);
+    expect(sends[0].chatId).toBe("777");
+    expect(sends[0].opts).toEqual({ parse_mode: "Markdown" });
   });
 });
 

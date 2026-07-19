@@ -300,12 +300,16 @@ describe('gateway boot: session-model re-hydration + confirmation + alert relay'
     const win = GATEWAY_SRC.slice(idx, idx + 4200)
     expect(win).toContain('classifyModelSwitchConfirmation({')
     expect(win).toContain('formatModelRelaunchDiagLog')
-    expect(win).toContain('if (confirmation != null && modelSwitchMarkerChat)')
-    expect(win).toContain('resolveModelSwitchBootNotice({')
+    expect(win).toContain('if (confirmation != null)')
+    expect(win).toContain('deliverModelSwitchBootNotice({')
     expect(win).toContain("existsSync(join(smAgentDir, '.session-model-alert'))")
-    // Both notice arms are consumed: suppress → stderr, card → sendMessage.
-    expect(win).toContain('process.stderr.write(notice.log)')
-    expect(win).toContain('.sendMessage(chat.chatId, notice.body')
+    // Both notice arms (suppress → stderr, card → sendMessage) now live in
+    // model-command.ts (deliverModelSwitchBootNotice — behaviorally tested in
+    // model-command.test.ts); the gateway injects the shared boot-card deps
+    // (stderr log sink + one raw thread-aware send closure).
+    expect(win).toContain('...modelBootCardDeps')
+    expect(win).toContain('log: (line) => process.stderr.write(line)')
+    expect(win).toContain('lockedBot.api.sendMessage(chatId, body, opts)')
   })
 
   it('arms the #3427 requested-vs-served tripwire on an apply-boot (comparator + handler)', () => {
@@ -316,14 +320,24 @@ describe('gateway boot: session-model re-hydration + confirmation + alert relay'
     const idx = GATEWAY_SRC.indexOf('const isApplyBoot = launched.length > 0')
     const win = GATEWAY_SRC.slice(idx, idx + 4500)
     expect(win).toContain('sessionModelSource.setOverride(isApplyBoot ? launched : null, { verify: true })')
-    expect(win).toContain('sessionModelSource.setDivergenceHandler((d) =>')
-    expect(win).toContain('formatServedModelDivergenceLog')
-    expect(win).toContain('formatServedModelDivergenceCard(d)')
+    // The handler body lives in model-command.ts (buildServedModelDivergenceHandler,
+    // behaviorally tested in model-command.test.ts — log line + operator card);
+    // the gateway registers it ONLY on an apply-boot, fed by the shared deps.
+    expect(win).toContain(
+      'sessionModelSource.setDivergenceHandler(buildServedModelDivergenceHandler(modelBootCardDeps))',
+    )
+    const armIdx = win.indexOf('sessionModelSource.setDivergenceHandler(')
+    expect(win.slice(0, armIdx)).toContain('if (isApplyBoot) {')
     // M2: the handler must NOT destroy the override record — a transient
     // fallback substitution self-corrects; freshness already fixes /status.
-    const handlerStart = win.indexOf('setDivergenceHandler((d) =>')
-    const handlerWin = win.slice(handlerStart, handlerStart + 900)
-    expect(handlerWin).not.toContain('setOverride(null)')
+    // Structurally guaranteed post-extraction: the injected ModelBootCardDeps
+    // surface (agent/chat/log/sendCard) carries NO handle to the source, so
+    // the handler CANNOT call setOverride. Pin that the deps object stays free
+    // of any source handle.
+    const depsStart = win.indexOf('const modelBootCardDeps')
+    expect(depsStart).toBeGreaterThan(0)
+    const depsWin = win.slice(depsStart, win.indexOf('if (isApplyBoot)'))
+    expect(depsWin).not.toContain('sessionModelSource')
   })
 
   it('H1 (#3437): the command-time relaunch record does NOT verify-arm the tripwire', () => {

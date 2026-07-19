@@ -398,6 +398,83 @@ export function formatServedModelDivergenceCard(input: {
   )
 }
 
+/** The boot marker chat that initiated a /model switch (thread-aware). */
+export interface ModelBootCardTarget {
+  chatId: string
+  threadId: number | null
+}
+
+/**
+ * Injected side-effect surface for the boot-time /model cards (#3427): the
+ * served-model divergence warn and the switch confirmation share ONE raw
+ * Markdown send closure plus a stderr log sink. Lives here (not inline in
+ * gateway.ts's boot IIFE) so gateway.ts does not inflate (#2996 ratchet).
+ */
+export interface ModelBootCardDeps {
+  agent: string
+  /** null → no initiating chat known; cards are skipped, logs still write. */
+  chat: ModelBootCardTarget | null
+  log: (line: string) => void
+  sendCard: (
+    chatId: string,
+    body: string,
+    opts: { parse_mode: 'Markdown'; message_thread_id?: number },
+  ) => Promise<unknown>
+}
+
+/** One-shot fire-and-forget card to the marker chat; send failures log, never throw. */
+function sendModelBootCard(deps: ModelBootCardDeps, chat: ModelBootCardTarget, body: string, failLabel: string): void {
+  void deps
+    .sendCard(chat.chatId, body, {
+      parse_mode: 'Markdown',
+      ...(chat.threadId != null ? { message_thread_id: chat.threadId } : {}),
+    })
+    .catch((err: unknown) =>
+      deps.log(`telegram gateway: ${failLabel} send failed: ${(err as Error)?.message ?? String(err)}\n`),
+    )
+}
+
+/**
+ * Build the divergence-tripwire handler gateway.ts registers at the boot
+ * rehydration site (#3427 item 4): the first LIVE assistant line serving a
+ * different model (invalid id OR transient unavailability — --fallback-model
+ * substituted) logs + warns the operator. The override is KEPT (M2): freshness
+ * rules already make /status show the served model, and a transient
+ * substitution self-corrects without destroying the switch record.
+ */
+export function buildServedModelDivergenceHandler(
+  deps: ModelBootCardDeps,
+): (d: { requested: string; served: string }) => void {
+  return (d) => {
+    deps.log(formatServedModelDivergenceLog({ agent: deps.agent, requested: d.requested, served: d.served }))
+    if (deps.chat == null) return
+    sendModelBootCard(deps, deps.chat, formatServedModelDivergenceCard(d), 'served-model divergence')
+  }
+}
+
+/**
+ * Deliver the boot-time model-switch confirmation (#3427 item 2): resolve the
+ * card-vs-suppress decision (pure — resolveModelSwitchBootNotice) and either
+ * log the suppress line or send the card. No-op when no initiating chat is
+ * known — matching the pre-extraction inline gateway.ts behavior (the
+ * suppress log only ever wrote when a marker chat existed).
+ */
+export function deliverModelSwitchBootNotice(
+  deps: ModelBootCardDeps & { confirmation: ModelSwitchConfirmation; hasSessionModelAlert: boolean },
+): void {
+  if (deps.chat == null) return
+  const notice = resolveModelSwitchBootNotice({
+    agent: deps.agent,
+    confirmation: deps.confirmation,
+    hasSessionModelAlert: deps.hasSessionModelAlert,
+  })
+  if (notice.kind === 'suppress') {
+    deps.log(notice.log)
+    return
+  }
+  sendModelBootCard(deps, deps.chat, notice.body, 'model-switch confirmation')
+}
+
 export type ParsedModelCommand =
   | { kind: 'show' }
   | { kind: 'set'; model: string }
