@@ -441,4 +441,47 @@ describe('renderUsageCard', () => {
     const out = renderUsageCard(snapshots, exhausted, { now: NOW });
     expect(out).toContain('- **ken@example.com** (active)');
   });
+
+  it('inserts External layout-B block after recommendation and before freshness', () => {
+    const out = renderUsageCard(snapshots, exhausted, {
+      now: NOW,
+      externalSpend: {
+        day24hUsd: 8.07,
+        day7dUsd: 119.89,
+        top: [
+          { label: 'gpt-oss-20b', usd: 6.1 },
+          { label: 'grok-4.5', usd: 1.18 },
+          { label: 'gemini-3.1-flash-lite', usd: 0.79 },
+        ],
+      },
+    });
+    const lines = out.split('\n');
+    // recommendation then External header then totals then top then freshness
+    const recIdx = lines.findIndex((l) => l.includes('Recommendation:'));
+    expect(recIdx).toBeGreaterThan(0);
+    expect(lines[recIdx + 1]).toBe('- 💸 External');
+    expect(lines[recIdx + 2]).toBe('- 24h `$8.07` · 7d `$119.89`');
+    expect(lines[recIdx + 3]).toBe(
+      '- top `gpt-oss-20b $6.10` · `grok-4.5 $1.18` · `gemini-3.1-flash-lite $0.79`',
+    );
+    expect(lines[lines.length - 1]).toBe('_Live_');
+  });
+
+  it('omits External block when externalSpend is null/undefined', () => {
+    const bare = renderUsageCard(snapshots, exhausted, { now: NOW });
+    const withNull = renderUsageCard(snapshots, exhausted, { now: NOW, externalSpend: null });
+    expect(bare).not.toContain('💸 External');
+    expect(withNull).not.toContain('💸 External');
+    expect(bare).toBe(withNull);
+  });
+
+  it('still renders External block at $0.00 when summary is present', () => {
+    const out = renderUsageCard(snapshots, exhausted, {
+      now: NOW,
+      externalSpend: { day24hUsd: 0, day7dUsd: 0, top: [] },
+    });
+    expect(out).toContain('- 💸 External');
+    expect(out).toContain('- 24h `$0.00` · 7d `$0.00`');
+    expect(out).not.toContain('- top ');
+  });
 });
