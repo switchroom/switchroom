@@ -13,9 +13,22 @@ Mechanism (deterministic, version-independent, config-only-impossible under
 LiteLLM v3's per-key reject-based limiter):
 
   * Runs as a LiteLLM CustomLogger callback. Its async_pre_call_hook is
-    invoked on the /anthropic passthrough path (call_type ==
-    "pass_through_endpoint") — verified against litellm v1.91
-    proxy/utils.py::pre_call_hook + pass_through_endpoints.py:845.
+    invoked on BOTH subscription-Claude paths — verified against litellm
+    v1.91.0:
+      - the /anthropic PASSTHROUGH path (call_type ==
+        "pass_through_endpoint" — proxy/utils.py::pre_call_hook +
+        pass_through_endpoints.py:845), and
+      - the /v1/messages ROUTER path (call_type == "anthropic_messages" —
+        proxy/endpoints.py route_type; exactly one pre_call per request,
+        no double-pacing).
+    The passthrough path is always paced (it has no routable group). The
+    router path is gated on an explicit paced-GROUP allowlist
+    (PACE_MODEL_GROUPS), because data["model"] on the router path is the
+    requested GROUP name (pre-routing), not the resolved deployment: e.g.
+    subscription-Claude aliases "sonnet"/"fable" and "claude-*" ARE paced,
+    but OpenRouter groups like "claude-sonnet-5-openrouter" are NOT (their
+    upstream limits differ from the fleet's Anthropic account, so the
+    Anthropic cooldown must not hold them).
   * Bounded global CONCURRENCY: at most PACE_MAX_CONCURRENCY upstream
     requests in flight across all 8 proxy workers, coordinated in Redis
     via a self-healing sorted-set lease (missed releases age out after
@@ -48,6 +61,7 @@ the proxy's sys.path). See PLAN.md for exact compose + apply steps.
 """
 
 import asyncio
+import fnmatch
 import os
 import random
 import time
@@ -70,6 +84,19 @@ def _float_env(name: str, default: float) -> float:
         return float(os.getenv(name, str(default)))
     except Exception:
         return default
+
+
+def _csv_env(name: str, default_csv: str) -> list[str]:
+    """Parse a comma-separated env list into a list of stripped, non-empty
+    entries. Falls back to the default CSV when the env is unset. Never
+    raises — a bad value degrades to the default."""
+    try:
+        raw = os.getenv(name)
+        if raw is None:
+            raw = default_csv
+        return [x.strip() for x in raw.split(",") if x.strip()]
+    except Exception:
+        return [x.strip() for x in default_csv.split(",") if x.strip()]
 
 
 # The gateway nulls a silent turn at SILENCE_FALLBACK_MS (default 300000ms /
@@ -154,8 +181,37 @@ class _Cfg:
     # Master on/off. Set PACE_ENABLED=false to make the hook a pure no-op
     # without touching config wiring.
     ENABLED = os.getenv("PACE_ENABLED", "true").lower() != "false"
-    # Only pace these call types. Passthrough is what agents use.
-    CALL_TYPES = {"pass_through_endpoint"}
+    # Only pace these call types. Both are subscription-Claude paths:
+    #   * "pass_through_endpoint" — the /anthropic passthrough (always paced;
+    #     no routable group).
+    #   * "anthropic_messages"   — the /v1/messages ROUTER path (paced only
+    #     when its GROUP is in the PACE_MODEL_GROUPS allowlist below).
+    # Env-overridable as a comma list (PACE_CALL_TYPES).
+    CALL_TYPES = set(
+        _csv_env("PACE_CALL_TYPES", "pass_through_endpoint,anthropic_messages")
+    )
+    # The passthrough call type carries no routable model GROUP, so it is
+    # never subject to the group allowlist below — it is paced whenever its
+    # call type is enabled. Every OTHER call type in CALL_TYPES is treated as
+    # a router path and gated on PACE_MODEL_GROUPS.
+    PASSTHROUGH_CALL_TYPE = os.getenv(
+        "PACE_PASSTHROUGH_CALL_TYPE", "pass_through_endpoint"
+    )
+    # Explicit allowlist of paced router GROUP names (fnmatch globs allowed).
+    # Seeded to cover the live subscription-Claude groups: the "claude-*"
+    # family plus the "sonnet"/"fable" aliases agents actually request (all
+    # carry forward_client_headers_to_llm_api:true in litellm-config.yaml).
+    # An explicit allowlist — NOT a "claude-*" prefix heuristic — because that
+    # heuristic is wrong both ways: "sonnet"/"fable" don't match it (would
+    # stay unpaced) and "claude-sonnet-5-openrouter" DOES match it (would be
+    # wrongly held by the Anthropic cooldown though it is an OpenRouter group).
+    PACE_MODEL_GROUPS = _csv_env("PACE_MODEL_GROUPS", "claude-*,sonnet,fable")
+    # Exclusion globs applied AFTER the allowlist (exclusion wins). Keeps any
+    # "*-openrouter" group out even though it may match "claude-*", since its
+    # upstream rate limits are OpenRouter's, not the fleet Anthropic account's.
+    PACE_MODEL_GROUPS_EXCLUDE = _csv_env(
+        "PACE_MODEL_GROUPS_EXCLUDE", "*-openrouter"
+    )
 
     REDIS_HOST = os.getenv("REDIS_HOST", "redis")
     REDIS_PORT = _int_env("REDIS_PORT", 6379)
@@ -294,6 +350,40 @@ class FleetPacer(CustomLogger):
         except Exception:
             pass
 
+    # ----- gating ------------------------------------------------------
+    @staticmethod
+    def _group_of(data: Any) -> Optional[str]:
+        """The requested model GROUP name on the router path. On /v1/messages
+        the pre_call hook sees the pre-routing group in data["model"], not the
+        resolved deployment."""
+        if isinstance(data, dict):
+            m = data.get("model")
+            if isinstance(m, str) and m:
+                return m
+        return None
+
+    @staticmethod
+    def _group_is_paced(group: Optional[str]) -> bool:
+        """A router GROUP is paced iff it matches the PACE_MODEL_GROUPS
+        allowlist AND is not excluded by PACE_MODEL_GROUPS_EXCLUDE
+        (exclusion wins). Unknown group -> not paced (can't attribute it to
+        the fleet Anthropic account)."""
+        if not group:
+            return False
+        if any(fnmatch.fnmatch(group, pat) for pat in _Cfg.PACE_MODEL_GROUPS_EXCLUDE):
+            return False
+        return any(fnmatch.fnmatch(group, pat) for pat in _Cfg.PACE_MODEL_GROUPS)
+
+    def _should_pace(self, call_type: str, data: Any) -> bool:
+        """Decide whether this request participates in pacing. Passthrough is
+        always paced (no routable group); every other enabled call type is a
+        router path gated on the paced-GROUP allowlist."""
+        if call_type not in _Cfg.CALL_TYPES:
+            return False
+        if call_type == _Cfg.PASSTHROUGH_CALL_TYPE:
+            return True
+        return self._group_is_paced(self._group_of(data))
+
     # ----- LiteLLM hooks ----------------------------------------------
     async def async_pre_call_hook(
         self,
@@ -302,8 +392,10 @@ class FleetPacer(CustomLogger):
         data: dict,
         call_type: str,
     ):
-        # Fast bail: disabled, wrong call type, or bad payload -> no-op.
-        if not _Cfg.ENABLED or call_type not in _Cfg.CALL_TYPES or not isinstance(data, dict):
+        # Fast bail: disabled, bad payload, or not a paced request -> no-op.
+        # Router-path traffic (e.g. anthropic_messages) is paced only when its
+        # requested GROUP is in the allowlist; passthrough is always paced.
+        if not _Cfg.ENABLED or not isinstance(data, dict) or not self._should_pace(call_type, data):
             return data
 
         r = await self._get_redis()

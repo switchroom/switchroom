@@ -594,5 +594,133 @@ class ReleaseJitterTests(_CfgPatchMixin, unittest.TestCase):
         self.assertTrue(all(0.10 <= x <= 0.40 for x in holding))
 
 
+# --- Router-path gating (H3: pacer must gate the /v1/messages router path) ---
+# The pacer historically paced only the /anthropic PASSTHROUGH path
+# (call_type "pass_through_endpoint"). Live litellm v1.91.0 routes /v1/messages
+# traffic through the ROUTER with call_type "anthropic_messages", which was
+# left UNPACED — reopening the burst-storm H3 for the aliases agents use. These
+# tests pin the corrected gate: an explicit paced-GROUP allowlist, NOT a
+# "claude-*" prefix heuristic (which is wrong both ways — see custom_pacing.py).
+class RouterGatePureTests(unittest.TestCase):
+    """Pure decision surface: _should_pace / _group_is_paced. No redis."""
+
+    def setUp(self):
+        self.pacer = custom_pacing.FleetPacer()
+
+    def _pace(self, call_type, model=None):
+        data = {} if model is None else {"model": model}
+        return self.pacer._should_pace(call_type, data)
+
+    def test_passthrough_always_paced_no_group(self):
+        # Existing behaviour preserved: passthrough is paced with no model group.
+        self.assertTrue(self._pace("pass_through_endpoint"))
+
+    def test_router_sonnet_alias_paced(self):
+        # Live subscription-Claude alias (config line 146) — MUST be paced even
+        # though it does NOT match a "claude-*" prefix.
+        self.assertTrue(self._pace("anthropic_messages", "sonnet"))
+
+    def test_router_fable_alias_paced(self):
+        # Live subscription-Claude alias (config line 158) — MUST be paced.
+        self.assertTrue(self._pace("anthropic_messages", "fable"))
+
+    def test_router_claude_group_paced(self):
+        self.assertTrue(self._pace("anthropic_messages", "claude-opus-4-5"))
+        self.assertTrue(self._pace("anthropic_messages", "claude-sonnet-4-5"))
+
+    def test_router_openrouter_claude_group_not_paced(self):
+        # "claude-sonnet-5-openrouter" (config line 309) MATCHES a claude-*
+        # prefix but is OpenRouter — must NOT be held by the Anthropic cooldown.
+        self.assertFalse(self._pace("anthropic_messages", "claude-sonnet-5-openrouter"))
+
+    def test_router_non_claude_openrouter_not_paced(self):
+        self.assertFalse(self._pace("anthropic_messages", "gpt-5-openrouter"))
+        self.assertFalse(self._pace("anthropic_messages", "kimi-k2-openrouter"))
+
+    def test_router_unknown_group_not_paced(self):
+        # Can't attribute an out-of-allowlist / missing group to the fleet
+        # Anthropic account -> do not pace.
+        self.assertFalse(self._pace("anthropic_messages", "some-random-group"))
+        self.assertFalse(self._pace("anthropic_messages"))
+
+    def test_disabled_call_type_not_paced(self):
+        self.assertFalse(self._pace("acompletion", "claude-opus-4-5"))
+
+    def test_default_call_types_cover_both_paths(self):
+        # Regression: the vendored defaults must include BOTH the passthrough
+        # and the router call types (read from source so runner env can't mask).
+        src = os.path.join(os.path.dirname(__file__), "custom_pacing.py")
+        with open(src, "r", encoding="utf-8") as fh:
+            source = fh.read()
+        self.assertIn("pass_through_endpoint,anthropic_messages", source)
+
+
+class RouterGateHookTests(_CfgPatchMixin, unittest.IsolatedAsyncioTestCase):
+    """Drive the real async_pre_call_hook to prove the gate actually engages /
+    bypasses the wait loop for router traffic. A paced request hits redis
+    (eval_calls>0); a no-op request never touches it (eval_calls==0)."""
+
+    async def _run(self, r, call_type, model=None):
+        pacer = custom_pacing.FleetPacer()
+        pacer._redis = r  # bypass _get_redis
+        data = {} if model is None else {"model": model}
+        custom_pacing._Cfg.MAX_WAIT_S = 0.15
+        custom_pacing._Cfg.HARD_MAX_WAIT_S = 0.2
+        custom_pacing._Cfg.COOLDOWN_HOLD = False
+        return await pacer.async_pre_call_hook(None, None, data, call_type)
+
+    async def test_router_sonnet_enters_pacer(self):
+        r = FakeRedis(eval_result=0)  # deny -> forces the wait loop
+        await self._run(r, "anthropic_messages", "sonnet")
+        self.assertGreaterEqual(r.eval_calls, 1)
+
+    async def test_router_openrouter_is_noop(self):
+        r = FakeRedis(eval_result=0)
+        data_back = await self._run(r, "anthropic_messages", "claude-sonnet-5-openrouter")
+        self.assertEqual(r.eval_calls, 0)  # never entered the pacer
+        self.assertIsInstance(data_back, dict)
+
+    async def test_passthrough_still_paced(self):
+        r = FakeRedis(eval_result=0)
+        await self._run(r, "pass_through_endpoint")
+        self.assertGreaterEqual(r.eval_calls, 1)
+
+
+class RouterCooldownHoldsTests(_CfgPatchMixin, unittest.IsolatedAsyncioTestCase):
+    """LOAD-BEARING H3 fix: a fleet cooldown SET by a router-path 429 must now
+    HOLD a subsequent router-path admission. Pre-fix the router pre_call was a
+    no-op, so the cooldown (though set) never gated router traffic."""
+
+    async def test_router_429_cooldown_holds_router_admission(self):
+        custom_pacing._Cfg.COOLDOWN_HOLD = True
+        custom_pacing._Cfg.MAX_WAIT_S = 0.2
+        custom_pacing._Cfg.COOLDOWN_HOLD_CEILING_S = 1.0
+        custom_pacing._Cfg.HARD_MAX_WAIT_S = 5.0
+
+        pacer = custom_pacing.FleetPacer()
+        r = FakeRedis(eval_result=0)  # never admit -> exercise the hold
+        pacer._redis = r
+
+        # A router-path (anthropic_messages) request 429s and parks the fleet
+        # cooldown (failure hook is ungated on call_type — it always sets it).
+        exc = types.SimpleNamespace(
+            status_code=429, message="would exceed your account rate limit"
+        )
+        await pacer.async_post_call_failure_hook(
+            {"model": "sonnet"}, exc, None
+        )
+        self.assertIn(custom_pacing._COOLDOWN_KEY, r.store)
+
+        # A subsequent router-path admission for a paced group must HOLD past
+        # the short burst ceiling because it now honours that cooldown.
+        t0 = time.time()
+        await pacer.async_pre_call_hook(None, None, {"model": "sonnet"}, "anthropic_messages")
+        elapsed = time.time() - t0
+        self.assertGreater(elapsed, custom_pacing._Cfg.MAX_WAIT_S + 0.15)
+        self.assertLessEqual(
+            elapsed, custom_pacing._Cfg.COOLDOWN_HOLD_CEILING_S + 0.4
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
