@@ -23907,21 +23907,6 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                 // scraped pane or an optimistic record.
                 const isApplyBoot = launched.length > 0 && launched !== configured
                 sessionModelSource.setOverride(isApplyBoot ? launched : null)
-                // Diagnosability (rev 5): the applied model is now always
-                // greppable — `grep 'gw /model relaunch applied'`. F4 note:
-                // `launched` is the REQUESTED token start.sh wrote before `exec
-                // claude` (it is NOT a post-launch confirmation). If a shape-valid
-                // but unknown Claude id was requested, `--fallback-model` may mask
-                // it: claude serves a fallback while this records the requested
-                // token. That divergence is NOT a persistent lie — the transcript's
-                // `message.model` (noteTranscriptModel) reclaims the source from
-                // this override on the first assistant line, correcting /status to
-                // the model actually serving calls. The pre-first-assistant window
-                // is the only optimistic window (G2), and it is bounded and
-                // self-healing; it is documented, not silently asserted as success.
-                process.stderr.write(
-                  `telegram gateway: gw /model relaunch applied agent=${getMyAgentName()} launched=${launched || '(none)'} configured=${configured} override=${isApplyBoot ? 'set' : 'cleared'}\n`,
-                )
                 // Switch-confirmation (F1 / PLAN §4 step 2): on a /model apply-boot
                 // with a known initiating chat, send ONE confirmation built from the
                 // ACTUAL launched model — never optimistic. Keyed on the DETERMINISTIC
@@ -23930,6 +23915,13 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                 // the configured default (`/model default`, or `/model <configured>`)
                 // — N4. The generic boot card is suppressed for this boot (N3), so
                 // this is the single card the operator sees for the switch.
+                //
+                // Diagnosability (rev 5): outcome KIND is greppable —
+                // `grep 'gw /model relaunch'`. Never emit a bare
+                // `override=cleared` alone after a /model switch reason — that
+                // looked like success when the carrier missed (stale start.sh).
+                // F4: `launched` is start.sh's pre-exec token, not a post-launch
+                // confirmation; transcript `message.model` reclaims /status (G2).
                 if (modelSwitchReason != null && modelSwitchMarkerChat) {
                   const chat = modelSwitchMarkerChat
                   // Derive the confirmation from the DETERMINISTIC post-boot
@@ -23943,6 +23935,22 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                     launched,
                     configured,
                   })
+                  if (confirmation.kind === 'not-applied') {
+                    process.stderr.write(
+                      `telegram gateway: gw /model relaunch NOT-APPLIED agent=${getMyAgentName()} target=${confirmation.target} launched=${launched || '(none)'} configured=${configured} revertedTo=${confirmation.revertedTo}
+`,
+                    )
+                  } else if (confirmation.kind === 'applied') {
+                    process.stderr.write(
+                      `telegram gateway: gw /model relaunch applied agent=${getMyAgentName()} launched=${launched || '(none)'} configured=${configured} override=set outcome=applied
+`,
+                    )
+                  } else {
+                    process.stderr.write(
+                      `telegram gateway: gw /model relaunch default/cleared agent=${getMyAgentName()} launched=${launched || '(none)'} configured=${configured} override=cleared
+`,
+                    )
+                  }
                   // LOW-2 dedup: the config-default-changed / proxy-down revert
                   // paths in start.sh write a TAILORED `.session-model-alert`
                   // (relayed to operators below) that already explains why the
@@ -23954,7 +23962,7 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                   const hasSessionModelAlert = existsSync(join(smAgentDir, '.session-model-alert'))
                   if (confirmation.kind === 'not-applied' && hasSessionModelAlert) {
                     process.stderr.write(
-                      `telegram gateway: gw /model relaunch applied — suppressing not-applied confirmation (a .session-model-alert is present and will be relayed) agent=${getMyAgentName()} target=${confirmation.target}\n`,
+                      `telegram gateway: gw /model relaunch NOT-APPLIED — suppressing not-applied confirmation (a .session-model-alert is present and will be relayed) agent=${getMyAgentName()} target=${confirmation.target}\n`,
                     )
                   } else {
                     const body =
@@ -23975,6 +23983,13 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                         ),
                       )
                   }
+                } else {
+                  // Ordinary boot (no /model switch reason): keep a single
+                  // diagnostic line for override hydrations without implying
+                  // a switch applied.
+                  process.stderr.write(
+                    `telegram gateway: gw /model relaunch applied agent=${getMyAgentName()} launched=${launched || '(none)'} configured=${configured} override=${isApplyBoot ? 'set' : 'cleared'}\n`,
+                  )
                 }
               } catch { /* leave override as-is on a bad read */ }
             }

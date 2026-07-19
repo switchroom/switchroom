@@ -16,6 +16,7 @@ import { describe, it, expect } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
+import { SESSION_MODEL_FILE } from '../gateway/session-model-file.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const GATEWAY_SRC = readFileSync(resolve(__dirname, '..', 'gateway', 'gateway.ts'), 'utf8')
@@ -152,6 +153,20 @@ describe('gateway boot: session-model re-hydration + confirmation + alert relay'
     expect(GATEWAY_SRC).toContain('gw /model relaunch scheduled agent=')
   })
 
+  it('logs outcome KIND explicitly on /model switch rehydration (NOT-APPLIED vs applied vs default)', () => {
+    const idx = GATEWAY_SRC.indexOf('const isApplyBoot = launched.length > 0')
+    expect(idx).toBeGreaterThan(0)
+    const win = GATEWAY_SRC.slice(idx, idx + 5200)
+    // Grepping never confuses silent fail with success — kind is in the line.
+    expect(win).toContain('gw /model relaunch NOT-APPLIED agent=')
+    expect(win).toContain('override=set outcome=applied')
+    expect(win).toContain('gw /model relaunch default/cleared agent=')
+    expect(win).toContain("confirmation.kind === 'not-applied'")
+    expect(win).toContain("confirmation.kind === 'applied'")
+    // Suppress path also tags NOT-APPLIED (not the ambiguous "relaunch applied —")
+    expect(win).toContain('gw /model relaunch NOT-APPLIED — suppressing not-applied confirmation')
+  })
+
   it('sends ONE switch-confirmation from the ACTUAL launched model, keyed on the /model reason (F1/N4)', () => {
     const idx = GATEWAY_SRC.indexOf('const isApplyBoot = launched.length > 0')
     expect(idx).toBeGreaterThan(0)
@@ -212,6 +227,32 @@ describe('gateway boot: session-model re-hydration + confirmation + alert relay'
     expect(win).toContain('.sendMessage(operator')
   })
 })
+
+
+describe('gateway SESSION_MODEL_FILE stays pinned to start.sh.hbs rev5 carrier', () => {
+  it('hbs applies the same basename gateway writes (no rev4/rev5 name drift)', async () => {
+    const { SESSION_MODEL_FILE } = await import('../gateway/session-model-file.js')
+    const { readFileSync } = await import('node:fs')
+    const { resolve, dirname } = await import('node:path')
+    const { fileURLToPath } = await import('node:url')
+    expect(SESSION_MODEL_FILE).toBe('.session-model')
+    // Vitest may run with import.meta or __dirname depending on config.
+    const here = typeof __dirname !== 'undefined'
+      ? __dirname
+      : dirname(fileURLToPath(import.meta.url))
+    const hbs = readFileSync(
+      resolve(here, '../../profiles/_base/start.sh.hbs'),
+      'utf8',
+    )
+    // Bare file test on the rev5 carrier (not only -override/-alert siblings).
+    expect(hbs).toMatch(/\[\s*-f\s+[^\]]*\/\.session-model["\s\]]/)
+    expect(hbs).toContain('configuredDefaultAtWrite')
+    // Legacy migration shim still converts leftover override → .session-model.
+    expect(hbs).toContain('.session-model-override')
+    expect(hbs).toMatch(/migrated legacy one-shot carrier/)
+  })
+})
+
 
 describe('gateway: the legacy one-shot carrier is no longer written', () => {
   it('no gateway code writes .session-model-override anymore (start.sh migration shim only reads it)', () => {

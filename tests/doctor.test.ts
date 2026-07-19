@@ -13,6 +13,7 @@ import {
   checkSkillsPrerequisites,
   checkConfig,
   checkStartShStale,
+  checkStartShSessionModelCarrier,
 } from "../src/cli/doctor.js";
 import { findConfigFile } from "../src/config/loader.js";
 import type { SwitchroomConfig } from "../src/config/schema.js";
@@ -732,6 +733,211 @@ describe("checkStartShStale", () => {
     );
     const result = checkStartShStale("clerk", startShPath);
     expect(result.status).toBe("ok");
+  });
+});
+
+describe("checkStartShSessionModelCarrier", () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = resolve(tmpdir(), `switchroom-doctor-sm-carrier-${Date.now()}`);
+    mkdirSync(tempDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("warns when start.sh is missing entirely", () => {
+    const result = checkStartShSessionModelCarrier(
+      "klanker",
+      join(tempDir, "missing.sh"),
+    );
+    expect(result.status).toBe("warn");
+    expect(result.detail).toContain("not found");
+    expect(result.fix).toContain("switchroom apply");
+  });
+
+  it("fails legacy-only .session-model-override primary (live pre-rev5 start.sh)", () => {
+    // Mirrors the live stale klanker start.sh signature:_header comments
+    // the override carrier, file-tests ONLY `.session-model-override`, never
+    // has a bare `.session-model` apply path or JSON shape.
+    const startShPath = join(tempDir, "start.sh");
+    writeFileSync(
+      startShPath,
+      [
+        "#!/usr/bin/env bash",
+        "# --- Session-only model override (carrier: .session-model-override) ---",
+        'if [ -f "/home/x/.switchroom/agents/klanker/.session-model-override" ]; then',
+        '  _override="$(tr -d \'[:space:]\' < "/home/x/.switchroom/agents/klanker/.session-model-override" 2>/dev/null || true)"',
+        '  rm -f "/home/x/.switchroom/agents/klanker/.session-model-override"',
+        '  echo "session-model: applied override $_override" >&2',
+        "fi",
+        // Comments that merely mention the rev5 name must not pass:
+        "# note: someday migrate to .session-model JSON",
+      ].join("\n"),
+    );
+    const result = checkStartShSessionModelCarrier("klanker", startShPath);
+    expect(result.status).toBe("fail");
+    expect(result.detail).toMatch(/legacy|\.session-model-override|yaml pin/i);
+    expect(result.fix).toContain("switchroom apply");
+    expect(result.fix).toMatch(/rev5|\.session-model/);
+  });
+
+  it("fails when a comment mentions .session-model but there is no file-test (false-positive guard)", () => {
+    const startShPath = join(tempDir, "start.sh");
+    writeFileSync(
+      startShPath,
+      [
+        "#!/usr/bin/env bash",
+        "# TODO: honor .session-model carrier from gateway",
+        'echo "session-model: nothing wired" >&2',
+      ].join("\n"),
+    );
+    const result = checkStartShSessionModelCarrier("clerk", startShPath);
+    expect(result.status).toBe("fail");
+    expect(result.detail).toMatch(/missing rev5|\.session-model/);
+  });
+
+  it("fails file-test of sibling paths only (.session-model-alert / boot-attempts / override)", () => {
+    const startShPath = join(tempDir, "start.sh");
+    writeFileSync(
+      startShPath,
+      [
+        "#!/usr/bin/env bash",
+        'if [ -f "/a/.session-model-alert" ]; then cat "/a/.session-model-alert"; fi',
+        'if [ -f "/a/.session-model-boot-attempts" ]; then cat "/a/.session-model-boot-attempts"; fi',
+        'if [ -f "/a/.session-model-override" ]; then cat "/a/.session-model-override"; fi',
+        // Looking like JSON apply without the bare carrier path must still fail.
+        'echo configuredDefaultAtWrite',
+      ].join("\n"),
+    );
+    const result = checkStartShSessionModelCarrier("clerk", startShPath);
+    expect(result.status).toBe("fail");
+  });
+
+  it("fails bare .session-model file-test without rev5 JSON apply markers", () => {
+    const startShPath = join(tempDir, "start.sh");
+    writeFileSync(
+      startShPath,
+      [
+        "#!/usr/bin/env bash",
+        'if [ -f "/a/.session-model" ]; then',
+        '  cat "/a/.session-model"',
+        "fi",
+      ].join("\n"),
+    );
+    const result = checkStartShSessionModelCarrier("clerk", startShPath);
+    expect(result.status).toBe("fail");
+    expect(result.detail).toMatch(/JSON|configuredDefaultAtWrite|boot-attempts/);
+  });
+
+  it("ok for rev5 hbs shape: bare .session-model test + JSON apply + legacy migration shim", () => {
+    const startShPath = join(tempDir, "start.sh");
+    // Minimal reduction of profiles/_base/start.sh.hbs rev5 block.
+    writeFileSync(
+      startShPath,
+      [
+        "#!/usr/bin/env bash",
+        "# --- Session model resolution (consume-once .session-model carrier) ---",
+        // Migration shim (reads override, WRITES .session-model) — OK.
+        'if [ -f "/a/.session-model-override" ]; then',
+        '  _mig="$(tr -d \'[:space:]\' < "/a/.session-model-override" 2>/dev/null || true)"',
+        '  rm -f "/a/.session-model-override"',
+        '  printf \'{"model":"%s","configuredDefaultAtWrite":"%s","ts":1}\\n\' "$_mig" "opus" > "/a/.session-model"',
+        "fi",
+        'if [ -f "/a/.session-model" ]; then',
+        '  _smf="$(cat "/a/.session-model" 2>/dev/null || true)"',
+        '  _sm_model="$(printf \'%s\' "$_smf" | sed -n \'s/.*"model":"\\([^"]*\\)".*/\\1/p\')"',
+        '  _sm_cfg="$(printf \'%s\' "$_smf" | sed -n \'s/.*"configuredDefaultAtWrite":"\\([^"]*\\)".*/\\1/p\')"',
+        '  _sm_attempts="$(cat "/a/.session-model-boot-attempts" 2>/dev/null | tr -dc \'0-9\' || true)"',
+        '  echo "session-model: applying $_sm_model (cfg=$_sm_cfg)" >&2',
+        "fi",
+      ].join("\n"),
+    );
+    const result = checkStartShSessionModelCarrier("clerk", startShPath);
+    expect(result.status).toBe("ok");
+    expect(result.detail).toMatch(/rev5|\.session-model/);
+  });
+});
+
+
+describe("checkStartShSessionModelCarrier (rev5 /model)", () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = resolve(tmpdir(), `switchroom-doctor-smcarrier-${Date.now()}`);
+    mkdirSync(tempDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("warns when start.sh is missing", () => {
+    const result = checkStartShSessionModelCarrier(
+      "klanker",
+      join(tempDir, "missing.sh"),
+    );
+    expect(result.status).toBe("warn");
+    expect(result.fix).toMatch(/switchroom apply/);
+  });
+
+  it("fails legacy-only .session-model-override start.sh (live pre-rev5 shape)", () => {
+    // Mirrors live klanker start.sh before apply — silent /model miss class.
+    const startShPath = join(tempDir, "start.sh");
+    writeFileSync(
+      startShPath,
+      [
+        "#!/usr/bin/env bash",
+        "# --- Session-only model override (carrier: .session-model-override) ---",
+        'if [ -f "/home/x/.switchroom/agents/klanker/.session-model-override" ]; then',
+        '  _override="$(cat "/home/x/.switchroom/agents/klanker/.session-model-override")"',
+        '  rm -f "/home/x/.switchroom/agents/klanker/.session-model-override"',
+        '  _EFFECTIVE_MODEL="$_override"',
+        "fi",
+      ].join("\n"),
+    );
+    const result = checkStartShSessionModelCarrier("klanker", startShPath);
+    expect(result.status).toBe("fail");
+    expect(result.detail).toMatch(/session-model-override/);
+    expect(result.fix).toMatch(/switchroom apply/);
+  });
+
+  it("fails when only comments mention .session-model (no real file test)", () => {
+    const startShPath = join(tempDir, "start.sh");
+    writeFileSync(
+      startShPath,
+      [
+        "#!/usr/bin/env bash",
+        "# TODO: wire .session-model rev5 carrier",
+        "# configuredDefaultAtWrite goes here someday",
+        'if [ -f "/tmp/unrelated" ]; then true; fi',
+      ].join("\n"),
+    );
+    const result = checkStartShSessionModelCarrier("klanker", startShPath);
+    expect(result.status).toBe("fail");
+  });
+
+  it("ok for rev5 hbs shape: bare .session-model file test + JSON parse markers", () => {
+    const startShPath = join(tempDir, "start.sh");
+    writeFileSync(
+      startShPath,
+      [
+        "#!/usr/bin/env bash",
+        'if [ -f "/home/x/agents/a/.session-model-override" ]; then',
+        '  printf \'{"model":"%s","configuredDefaultAtWrite":"%s"}\' "x" "y" > "/home/x/agents/a/.session-model"',
+        "fi",
+        'if [ -f "/home/x/agents/a/.session-model" ]; then',
+        '  _smf="$(cat "/home/x/agents/a/.session-model" 2>/dev/null || true)"',
+        "  : configuredDefaultAtWrite",
+        '  _sm_attempts="$(cat "/home/x/agents/a/.session-model-boot-attempts" 2>/dev/null || true)"',
+        "fi",
+      ].join("\n"),
+    );
+    const result = checkStartShSessionModelCarrier("klanker", startShPath);
+    expect(result.status).toBe("ok");
+    expect(result.detail).toMatch(/rev5/);
   });
 });
 
