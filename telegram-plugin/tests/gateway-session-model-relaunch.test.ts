@@ -19,6 +19,10 @@ import { dirname, resolve } from 'node:path'
 import { SESSION_MODEL_FILE } from '../gateway/session-model-file.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
+const MODEL_COMMAND_SRC = readFileSync(
+  resolve(__dirname, '../gateway/model-command.ts'),
+  'utf8',
+)
 const GATEWAY_SRC = readFileSync(resolve(__dirname, '..', 'gateway', 'gateway.ts'), 'utf8')
 
 describe('gateway: the .relaunch-model-intent subsystem is retired (rev 4)', () => {
@@ -149,58 +153,47 @@ describe('gateway boot: session-model re-hydration + confirmation + alert relay'
   })
 
   it('logs the applied model for diagnosability (F1)', () => {
-    expect(GATEWAY_SRC).toContain('gw /model relaunch applied agent=')
+    expect(GATEWAY_SRC).toContain('formatModelRelaunchDiagLog')
     expect(GATEWAY_SRC).toContain('gw /model relaunch scheduled agent=')
+    expect(MODEL_COMMAND_SRC).toContain('gw /model relaunch applied agent=')
   })
 
   it('logs outcome KIND explicitly on /model switch rehydration (NOT-APPLIED vs applied vs default)', () => {
-    const idx = GATEWAY_SRC.indexOf('const isApplyBoot = launched.length > 0')
-    expect(idx).toBeGreaterThan(0)
-    const win = GATEWAY_SRC.slice(idx, idx + 5200)
-    // Grepping never confuses silent fail with success — kind is in the line.
-    expect(win).toContain('gw /model relaunch NOT-APPLIED agent=')
-    expect(win).toContain('override=set outcome=applied')
-    expect(win).toContain('gw /model relaunch default/cleared agent=')
-    expect(win).toContain("confirmation.kind === 'not-applied'")
-    expect(win).toContain("confirmation.kind === 'applied'")
-    // Suppress path also tags NOT-APPLIED (not the ambiguous "relaunch applied —")
-    expect(win).toContain('gw /model relaunch NOT-APPLIED — suppressing not-applied confirmation')
+    // Formatters live in model-command.ts (gateway line-ratchet); gateway only calls them.
+    expect(GATEWAY_SRC).toContain('formatModelRelaunchDiagLog')
+    expect(GATEWAY_SRC).toContain('formatModelSwitchConfirmationBody')
+    expect(GATEWAY_SRC).toContain('formatModelRelaunchSuppressNotAppliedLog')
+    expect(MODEL_COMMAND_SRC).toContain('gw /model relaunch NOT-APPLIED agent=')
+    expect(MODEL_COMMAND_SRC).toContain('override=set outcome=applied')
+    expect(MODEL_COMMAND_SRC).toContain('override=cleared outcome=default')
+    expect(MODEL_COMMAND_SRC).toContain('gw /model relaunch NOT-APPLIED — suppressing not-applied confirmation')
   })
 
   it('sends ONE switch-confirmation from the ACTUAL launched model, keyed on the /model reason (F1/N4)', () => {
     const idx = GATEWAY_SRC.indexOf('const isApplyBoot = launched.length > 0')
     expect(idx).toBeGreaterThan(0)
-    const win = GATEWAY_SRC.slice(idx, idx + 5200)
-    // Keyed on the deterministic /model switch reason, so it also fires on a
-    // launched===configured apply-boot (/model default) — N4. Never optimistic.
-    expect(win).toContain('if (modelSwitchReason != null && modelSwitchMarkerChat)')
-    expect(win).toContain('✅ Now running')
-    // N4: the launched===configured branch still confirms.
-    expect(win).toContain('(the configured default)')
+    const win = GATEWAY_SRC.slice(idx, idx + 2500)
+    expect(win).toContain('if (confirmation != null && modelSwitchMarkerChat)')
+    expect(win).toContain('formatModelSwitchConfirmationBody')
+    expect(MODEL_COMMAND_SRC).toContain('✅ Now running')
+    expect(MODEL_COMMAND_SRC).toContain('(the configured default)')
   })
 
   it('warns instead of a green ✅ when a non-default switch silently reverted to the default (silent-revert fix)', () => {
-    const idx = GATEWAY_SRC.indexOf('const isApplyBoot = launched.length > 0')
-    const win = GATEWAY_SRC.slice(idx, idx + 5200)
-    // The confirmation card is derived from the pure classifier, not an inline
-    // isApplyBoot ternary — so a reverted non-default switch yields the ⚠️ card.
-    expect(win).toContain('classifyModelSwitchConfirmation({')
-    expect(win).toContain("confirmation.kind === 'applied'")
-    expect(win).toContain("confirmation.kind === 'not-applied'")
-    expect(win).toContain("⚠️ Your switch to")
-    expect(win).toContain("didn't apply")
-    // LOW-3: the re-issue hint interpolates the target inside backticks so a
-    // token containing Markdown metachars can't italicize / 400 the send.
-    expect(win).toContain('Re-issue \\`/model ${confirmation.target}\\`')
+    expect(GATEWAY_SRC).toContain('classifyModelSwitchConfirmation({')
+    expect(GATEWAY_SRC).toContain('formatModelSwitchConfirmationBody')
+    expect(MODEL_COMMAND_SRC).toContain('⚠️ Your switch to')
+    expect(MODEL_COMMAND_SRC).toContain("didn't apply")
+    // LOW-3: re-issue hint keeps target in backticks
+    expect(MODEL_COMMAND_SRC).toContain('Re-issue `/model ')
   })
 
   it('dedups the not-applied card against a tailored .session-model-alert (LOW-2)', () => {
     const idx = GATEWAY_SRC.indexOf('const isApplyBoot = launched.length > 0')
-    const win = GATEWAY_SRC.slice(idx, idx + 5200)
-    // When start.sh wrote a specific alert for this revert, the classifier's
-    // generic not-applied card is suppressed (the alert relay is the message).
+    const win = GATEWAY_SRC.slice(idx, idx + 2500)
     expect(win).toContain("existsSync(join(smAgentDir, '.session-model-alert'))")
     expect(win).toContain("confirmation.kind === 'not-applied' && hasSessionModelAlert")
+    expect(win).toContain('formatModelRelaunchSuppressNotAppliedLog')
   })
 
   it('N4/reason: the /model switch reason is captured from the clean-shutdown marker', () => {

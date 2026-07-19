@@ -188,6 +188,112 @@ export function classifyModelSwitchConfirmation(input: {
   return { kind: 'default', launched: revertedTo }
 }
 
+/**
+ * Diagnostic stderr lines for a /model apply-boot rehydration.
+ * Pure strings so gateway.ts stays thin (line-ratchet #2996).
+ */
+export function formatModelRelaunchDiagLog(input: {
+  agent: string
+  launched: string
+  configured: string
+  confirmation: ModelSwitchConfirmation | null
+  isApplyBoot: boolean
+}): string {
+  const { agent, launched, configured, confirmation, isApplyBoot } = input
+  const L = launched || '(none)'
+  if (confirmation == null) {
+    return (
+      'telegram gateway: gw /model relaunch applied agent=' +
+      agent +
+      ' launched=' +
+      L +
+      ' configured=' +
+      configured +
+      ' override=' +
+      (isApplyBoot ? 'set' : 'cleared') +
+      '\n'
+    )
+  }
+  if (confirmation.kind === 'not-applied') {
+    return (
+      'telegram gateway: gw /model relaunch NOT-APPLIED agent=' +
+      agent +
+      ' target=' +
+      confirmation.target +
+      ' launched=' +
+      L +
+      ' configured=' +
+      configured +
+      ' revertedTo=' +
+      confirmation.revertedTo +
+      '\n'
+    )
+  }
+  if (confirmation.kind === 'applied') {
+    return (
+      'telegram gateway: gw /model relaunch applied agent=' +
+      agent +
+      ' launched=' +
+      L +
+      ' configured=' +
+      configured +
+      ' override=set outcome=applied\n'
+    )
+  }
+  return (
+    'telegram gateway: gw /model relaunch applied agent=' +
+    agent +
+    ' launched=' +
+    L +
+    ' configured=' +
+    configured +
+    ' override=cleared outcome=default\n'
+  )
+}
+
+/** Telegram body for the single switch-confirmation card (F1/N4). */
+export function formatModelSwitchConfirmationBody(
+  confirmation: ModelSwitchConfirmation,
+): string {
+  if (confirmation.kind === 'applied') {
+    return (
+      '✅ Now running `' +
+      confirmation.launched +
+      '` — session-only, reverts to the configured model on the next restart. Fresh session; memory and the handoff briefing carry the context.'
+    )
+  }
+  if (confirmation.kind === 'not-applied') {
+    return (
+      "⚠️ Your switch to `" +
+      confirmation.target +
+      "` didn't apply — the agent reverted to `" +
+      confirmation.revertedTo +
+      "` (the apply-boot didn't complete). Re-issue `/model " +
+      confirmation.target +
+      "` to try again."
+    )
+  }
+  return (
+    '✅ Now running `' +
+    confirmation.launched +
+    '` (the configured default) — fresh session; memory and the handoff briefing carry the context.'
+  )
+}
+
+export function formatModelRelaunchSuppressNotAppliedLog(input: {
+  agent: string
+  target: string
+}): string {
+  return (
+    'telegram gateway: gw /model relaunch NOT-APPLIED — suppressing not-applied confirmation (a .session-model-alert is present and will be relayed) agent=' +
+    input.agent +
+    ' target=' +
+    input.target +
+    '\n'
+  )
+}
+
+
 export type ParsedModelCommand =
   | { kind: 'show' }
   | { kind: 'set'; model: string }
