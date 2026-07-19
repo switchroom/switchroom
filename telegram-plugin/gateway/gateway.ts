@@ -716,7 +716,7 @@ import { chatKey, chatKeyWithSuffix, chatIdOfChatKey } from './chat-key.js'
 // carve-outs at the handleInbound delivery site).
 import { shadowEmit, isMachineInTurn } from './inbound-delivery-machine-shadow.js'
 // #2996 P8 PR-B — the extracted turn-end funnel (state stays here; logic moved).
-import { createTurnEndFunnel } from './turn-end.js'
+import { createTurnEndFunnel, type TurnEndReason } from './turn-end.js'
 // #2996 P8 PR-C1 — the extracted delivery-confirm sweep wiring.
 import { createDeliveryConfirmWiring } from './delivery-confirm-wiring.js'
 // #2996 P8 PR-C2 — the extracted obligation wiring.
@@ -3062,7 +3062,10 @@ function resolveModelEffortBusy(now = Date.now()): { currentTurnActive: boolean;
     // the only live turn, and a stale atom is a ghost (its `turn_end` never
     // fired) — clearing every entry is equivalent to clearing it, matching the
     // bridge-died "every entry is a ghost" semantics.
-    clearAllCurrentTurns()
+    // PR-E (M1): under the v2 funnel this is the named 'phantom-ttl-clear'
+    // reason — atom-clear ONLY (no purge / obligation close / drain).
+    if (TURN_END_FUNNEL_V2) turnEndFunnel().endTurn('phantom-ttl-clear')
+    else clearAllCurrentTurns()
   }
   return { currentTurnActive: resolved.currentTurnActive, turnInFlight: resolved.turnInFlight }
 }
@@ -4759,6 +4762,7 @@ function gatewayTurnEndDeps() {
     turnInFlightForGate,
     turnLiveForItsTopic,
     endCurrentTurnForKey,
+    clearAllCurrentTurns,
     statusKey,
     reapQueuedStatus,
     stopTurnTypingLoop,
@@ -4794,6 +4798,13 @@ export type TurnEndDeps = ReturnType<typeof gatewayTurnEndDeps>
 // real turn end everything is assigned). Function-declaration wrappers (never
 // reassigned bindings) so by-name captures (stream-render deps, the
 // deferredDoneReactions purge arrow) resolve at call time, as before.
+// PR-E (#2996 P8) — deterministic kill switch for the endTurn(reason)
+// consolidation. Default OFF during bake: the wrappers below run the PR-B code
+// paths verbatim. =1 routes every wrapper (and the two ghost-clear callsites)
+// through the single `endTurn` dispatcher — same code, one auditable entry
+// point. Module-load const: flipping requires an agent restart (P7 F2).
+const TURN_END_FUNNEL_V2 = process.env.SWITCHROOM_TURN_END_FUNNEL_V2 === '1'  // default OFF during bake
+
 let _turnEndFunnel: ReturnType<typeof createTurnEndFunnel> | undefined
 function turnEndFunnel(): ReturnType<typeof createTurnEndFunnel> {
   return (_turnEndFunnel ??= createTurnEndFunnel(gatewayTurnEndDeps()))
@@ -4812,10 +4823,12 @@ function armNoReplyDrainTimer(turn: CurrentTurn): void {
 }
 
 function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
+  if (TURN_END_FUNNEL_V2) { turnEndFunnel().endTurn('fallback-purge', { key, endingTurn }); return }
   turnEndFunnel().purgeReactionTracking(key, endingTurn)
 }
 
 function releaseTurnBufferGate(key: string, endingTurn?: CurrentTurn): void {
+  if (TURN_END_FUNNEL_V2) { turnEndFunnel().endTurn('reply-gate-release', { key, endingTurn }); return }
   turnEndFunnel().releaseTurnBufferGate(key, endingTurn)
 }
 
@@ -4823,6 +4836,7 @@ function endCurrentTurnAtomic(
   turn: CurrentTurn,
   opts?: { deferRecord?: boolean; deferObligationClose?: boolean },
 ): number | null {
+  if (TURN_END_FUNNEL_V2) return turnEndFunnel().endTurn('turn-end', { turn, opts }) ?? null
   return turnEndFunnel().endCurrentTurnAtomic(turn, opts)
 }
 
@@ -10614,7 +10628,10 @@ if (isGatewayMain) ipcServer = createIpcServer({
           // PR-4e — the bridge DIED with a turn in flight: EVERY per-topic entry
           // is a ghost, not just the mirror's. Clear the whole map + mirror.
           // Flag-OFF: this nulls the singleton only (the map is empty), verbatim.
-          clearAllCurrentTurns()
+          // PR-E (M1): under the v2 funnel this is the named 'bridge-died-clear'
+          // reason — atom-clear ONLY (no purge / obligation close / drain).
+          if (TURN_END_FUNNEL_V2) turnEndFunnel().endTurn('bridge-died-clear')
+          else clearAllCurrentTurns()
         }
       },
       log: (msg) => process.stderr.write(`${msg}\n`),
@@ -14302,6 +14319,14 @@ export const __inboundRouterTestSeam = {
   purgeReactionTracking,
   releaseTurnBufferGate,
   armNoReplyDrainTimer,
+  // PR-E: the v2 dispatcher (always constructible; production callsites route
+  // through it only under SWITCHROOM_TURN_END_FUNNEL_V2=1) + the captured flag,
+  // so the harness can pin ghost-clear no-op effects and drive both branches.
+  endTurn: (
+    reason: TurnEndReason,
+    args?: { turn?: CurrentTurn; opts?: { deferRecord?: boolean; deferObligationClose?: boolean }; key?: string; endingTurn?: CurrentTurn },
+  ) => turnEndFunnel().endTurn(reason, args),
+  TURN_END_FUNNEL_V2,
   statusKey,
   obligationLedger,
   pendingInboundBuffer,
