@@ -9,7 +9,11 @@ description: >
   "review my memory bank", "what standing models should I have", "bootstrap
   mental models", "suggest mental models from my bank", "audit my mental models",
   "what recurring questions do I keep re-deriving", and typos like "propose
-  knowlege models". Do NOT use for storing a single fact/preference/decision —
+  knowlege models". ALSO owns the directive merge/retire pass — triggers like
+  "audit my directives", "merge my directives", "retire stale directives", "my
+  directives are overlapping", "too many active directives", "clean up my
+  guardrails", and when fleet doctor FLAGs a bank over the directive WARN/FAIL
+  threshold. Do NOT use for storing a single fact/preference/decision —
   that is retain, not a mental model. Do NOT use for identity or "who is the
   user" — that lives in profile banks, so never propose an identity model here
   (the operator's review of the card, not any code guard, is the only gate — so
@@ -18,7 +22,7 @@ description: >
   whose shape you know, PROPOSE it through the approve/deny card — never call
   create_mental_model directly (it is not pre-approved; the propose card is the
   only sanctioned write path, Fix 1.2 / #2903).
-allowed-tools: mcp__hindsight__list_banks mcp__hindsight__get_bank_stats mcp__hindsight__list_mental_models mcp__hindsight__get_mental_model mcp__hindsight__reflect mcp__hindsight__recall mcp__switchroom-telegram__mental_model_propose
+allowed-tools: mcp__hindsight__list_banks mcp__hindsight__get_bank_stats mcp__hindsight__list_mental_models mcp__hindsight__get_mental_model mcp__hindsight__list_directives mcp__hindsight__reflect mcp__hindsight__recall mcp__switchroom-telegram__mental_model_propose
 ---
 
 # mental-model-curator — Propose standing knowledge models from your own bank
@@ -54,6 +58,9 @@ models. Propose the few that are earned; let the operator ratify.
   (name + source_query + one-line reason) and STOP. Do NOT call
   `mental_model_propose` in this mode. This is the safe way to run against any
   bank.
+- **Directive merge/retire pass:** a separate job — see "Directive merge/retire
+  pass" below. It is always proposal-only (text out; the operator taps to enact),
+  and runs independently of the mental-model modes above.
 
 ## Workflow
 
@@ -144,6 +151,65 @@ empty topic at 3am is useless and noisy. If invoked from a scheduled sweep,
 **STAGE** the ranked candidates (retain them, or hold them) and surface them on
 the next interactive turn instead of firing cards unattended. Treat live-turn,
 operator-present proposing as the only supported path for now.
+
+## Directive merge/retire pass
+
+A second, independent job of this skill: keep the bank's **active directives**
+lean. Directives are hard rules applied on every `reflect` — but the bank caps
+active directives at **`MAX_DIRECTIVES=15`**. Past the cap, the lowest-priority
+directives are **silently truncated** from the `<active_directives>` recall block
+and never reach the agent — so an overloaded, overlapping, or stale directive set
+doesn't just add noise, it silently drops your real guardrails. Fleet doctor
+WARNs at >12 active and FAILs at >15 (workstream C2), and its fix text points
+here — this pass is the durable path it names.
+
+**You PROPOSE; you never delete.** `delete_directive` is deliberately NOT
+pre-approved (#2911) — it falls through to a per-call operator approval card, and
+that human tap is the only gate that retires a standing guardrail. So this pass
+outputs a plan; it does not enact retirements itself.
+
+### When to run it
+
+- The operator asks (see the directive triggers in the description), OR
+- fleet doctor flags a bank at/over the directive WARN/FAIL threshold, OR
+- you're already curating the bank and notice the directive set is bloated.
+
+### Workflow
+
+1. **List the active set.** `mcp__hindsight__list_directives` (active only). If
+   the count is comfortably under the WARN threshold (≤12) AND nothing reads
+   stale/overlapping, STOP and report "directive set is healthy (N active) —
+   nothing to merge or retire." Don't manufacture churn.
+2. **Cluster for overlap.** Group directives that encode substantially the same
+   rule (even reworded) or that are strict specializations of a broader one. Each
+   cluster of 2+ is a **merge candidate**: one crisp consolidated directive that
+   subsumes the group, with the retirements it replaces named.
+3. **Flag the stale.** A directive is a **retire candidate** when it's obsoleted
+   by a newer rule, references a decision/tool/project that no longer exists, or
+   contradicts a directive you're keeping. Contradictions are the priority — a
+   live contradictory pair makes `reflect` nondeterministic.
+4. **Present the plan as text — do NOT enact.** Output, ranked by how much it
+   reduces the active count and risk:
+   - **Merges:** the proposed consolidated directive text + the exact directives
+     (by name/id) it would retire.
+   - **Retirements:** each stale directive (name/id) + one-line reason.
+   - The resulting active count vs `MAX_DIRECTIVES`, so the operator sees whether
+     the plan clears the cap.
+   Then STOP. The operator decides. Enacting a merge is a follow-up: the
+   consolidated `create_directive` is autonomous, but **each** retirement fires
+   its own `delete_directive` approval card — that per-card human tap is the
+   deterministic backstop, not something this skill routes around.
+
+### Directive-pass anti-patterns
+
+- ❌ Calling `delete_directive` from this skill — it proposes; the operator's tap
+  on the per-call card is the only sanctioned retire path.
+- ❌ Merging directives that only look similar — a merge that drops a real
+  distinction silently weakens a guardrail. When unsure, propose retire-nothing.
+- ❌ Manufacturing merges on a healthy small set just to "tidy" — run the pass
+  when it's earned (bloat, overlap, staleness, or a doctor flag), not reflexively.
+- ❌ Leaving a live contradictory pair in place — surface it as the top retire
+  candidate; it's what makes `reflect` nondeterministic.
 
 ## Anti-patterns
 
