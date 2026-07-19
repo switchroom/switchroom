@@ -9635,7 +9635,14 @@ function gatewayLivenessWiringDeps() {
     currentTurnMap,
     turnLiveForItsTopic,
     endCurrentTurnForKey,
-    pendingInboundBuffer,
+    // Getter, not an eager read: `pendingInboundBuffer` (const) is declared
+    // LATER in this module (~9863) than the module-load `startTimer` call that
+    // invokes this builder (isGatewayMain path). A by-value capture here is a
+    // temporal-dead-zone ReferenceError that crash-loops every gateway boot
+    // (#3392 regression). Deferring to a getter — matching getInboundSpool /
+    // getTurnsDb / ipcServer — means the binding is only read when the
+    // fallback actually fires, well after module eval.
+    getPendingInboundBuffer: () => pendingInboundBuffer,
     trackRedeliveredInbound,
     closeActivityLane,
     closeProgressLane,
