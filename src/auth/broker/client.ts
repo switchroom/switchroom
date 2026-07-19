@@ -339,6 +339,16 @@ export interface ProbeQuotaEntry {
   capturedAt?: number;
 }
 
+export interface GetExternalSpendData {
+  available: boolean;
+  day24hUsd?: number;
+  day7dUsd?: number;
+  top?: Array<{ label: string; usd: number }>;
+  capturedAtMs?: number;
+  served?: "live" | "cache";
+  reason?: string;
+}
+
 export interface ProbeQuotaData {
   results: ProbeQuotaEntry[];
 }
@@ -593,6 +603,21 @@ export class AuthBrokerClient {
       }
     }
     return parsed;
+  }
+
+
+  /**
+   * Fleet external (OpenRouter cash) spend summary for `/usage`.
+   * Auth-broker owns the LiteLLM master key; agents never see it.
+   */
+  async getExternalSpend(forceLive?: boolean): Promise<GetExternalSpendData> {
+    const data = await this.send({
+      v: PROTOCOL_VERSION,
+      id: randomUUID(),
+      op: "get-external-spend",
+      ...(forceLive ? { forceLive: true } : {}),
+    });
+    return data as GetExternalSpendData;
   }
 
   async setActive(account: string): Promise<SetActiveData> {

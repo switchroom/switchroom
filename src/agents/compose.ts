@@ -1707,6 +1707,32 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   //   /state/agents    → ~/.switchroom/agents/
   //   /state/auth-broker → ~/.switchroom/state/auth-broker/
   lines.push(`      SWITCHROOM_AUTH_BROKER_STATE_DIR: /state/auth-broker`);
+  // LiteLLM root for get-external-spend (OpenRouter cash on /usage).
+  // Broker holds the master key in state-dir; agents never see it.
+  // Auth-broker runs on the compose bridge (not host net). Operator
+  // base_url is almost always loopback (socat on the host) — rewrite
+  // 127.0.0.1/localhost → host.docker.internal so the broker can reach
+  // the host-published proxy. Non-loopback URLs pass through unchanged.
+  // extra_hosts is only emitted when we configure a base — keeps the
+  // zero-litellm fleet compose free of host-gateway (network_isolation
+  // regression receive).
+  let authBrokerNeedsHostGateway = false;
+  {
+    const llBase =
+      (config as { litellm?: { base_url?: string } }).litellm?.base_url;
+    if (typeof llBase === "string" && llBase.trim()) {
+      const raw = llBase.trim().replace(/\/+$/, "");
+      const bridged = raw
+        .replace(/^http:\/\/127\.0\.0\.1(?=[:/]|$)/i, "http://host.docker.internal")
+        .replace(/^http:\/\/localhost(?=[:/]|$)/i, "http://host.docker.internal")
+        .replace(/^https:\/\/127\.0\.0\.1(?=[:/]|$)/i, "https://host.docker.internal")
+        .replace(/^https:\/\/localhost(?=[:/]|$)/i, "https://host.docker.internal");
+      lines.push(`      SWITCHROOM_LITELLM_BASE: ${JSON.stringify(bridged)}`);
+      // Always pair with host-gateway when base is set: loopback rewrite
+      // needs it; non-loopback? harmless + covers mixed host socat names.
+      authBrokerNeedsHostGateway = true;
+    }
+  }
   lines.push(`      SWITCHROOM_ACCOUNTS_DIR: /state/accounts`);
   lines.push(`      SWITCHROOM_AGENTS_DIR: /state/agents`);
   // Operator UID — when set, the broker binds an additional listener at
@@ -1717,6 +1743,10 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   // below is unused dead weight.
   if (opts.operatorUid !== undefined) {
     lines.push(`      SWITCHROOM_AUTH_BROKER_OPERATOR_UID: "${opts.operatorUid}"`);
+  }
+  if (authBrokerNeedsHostGateway) {
+    lines.push(`    extra_hosts:`);
+    lines.push(`      - "host.docker.internal:host-gateway"`);
   }
   lines.push(`    volumes:`);
   // Per-agent socket dir (named volume; agent side mounts the parent).

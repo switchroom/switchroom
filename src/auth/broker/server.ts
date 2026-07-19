@@ -17,7 +17,7 @@
  *
  * Verbs (RFC H §4.3): get-credentials, list-state, set-active,
  * mark-exhausted, mark-throttled, refresh-account, add-account,
- * rm-account, set-override.
+ * rm-account, set-override, get-external-spend.
  */
 
 import * as net from "node:net";
@@ -85,6 +85,14 @@ import {
 } from "./account-eligibility.js";
 import type { AuthConfig, AuthConsumer, SwitchroomConfig } from "../../config/schema.js";
 import { atomicWriteJsonSync } from "../../util/atomic.js";
+import {
+  fetchAndSummarizeExternalSpend,
+  EXTERNAL_SPEND_CACHE_TTL_MS,
+  EXTERNAL_SPEND_FETCH_TIMEOUT_MS,
+  LITELLM_MASTER_KEY_STATE_BASENAME,
+  DEFAULT_LITELLM_BASE,
+  type ExternalSpendSummary,
+} from "../../litellm/external-spend.js";
 import { safeMirrorWrite } from "./mirror-write.js";
 import {
   REFRESH_THRESHOLD_MS,
@@ -475,6 +483,18 @@ export interface AuthBrokerOptions {
    *  0 to disable auto-scheduling so tests drive `corroborateExhaustionMark`
    *  directly; defaults to `MARK_CORROBORATION_PROBE_DELAY_MS`. */
   _testCorroborationDelayMs?: number;
+  /**
+   * Test-only: replace the LiteLLM external-spend live fetch. Production
+   * never sets this; `get-external-spend` calls LiteLLM with the master key.
+   */
+  _testFetchExternalSpend?: (opts: {
+    adminKey: string;
+    baseUrl: string;
+    now: Date;
+    forceLive?: boolean;
+  }) => Promise<ExternalSpendSummary | null>;
+  /** Test-only: override master-key resolution (skips file/env). */
+  _testLitellmMasterKey?: string | null;
 }
 
 /* ───────────────────────── Helpers ───────────────────────── */
@@ -606,6 +626,17 @@ export class AuthBroker {
   /** Utilization cache. Populated by opProbeQuota; mirrored to disk
    *  (`last-quota.json`) and reloaded on boot — #2495 Change 1. */
   private lastQuotaCache: LastQuotaCache = {};
+  /**
+   * External OpenRouter/$ spend summary for `/usage`. Broker owns the
+   * LiteLLM master key; agents only pull this sanitized snapshot via
+   * `get-external-spend`. Mirrored to `external-spend.json`.
+   */
+  private externalSpendCache: {
+    summary: ExternalSpendSummary;
+    capturedAtMs: number;
+  } | null = null;
+  /** Single-flight for live LiteLLM external-spend refresh. */
+  private externalSpendInFlight: Promise<void> | null = null;
   /** #2495 Change 2 — single-flight: in-flight live probes keyed by account
    *  label. Concurrent `probe-quota` requests for the same label share the one
    *  pending upstream call (a render storm = 1 API call per account, not N). */
@@ -1364,6 +1395,9 @@ export class AuthBroker {
           break;
         case "claim-notification":
           this.opClaimNotification(socket, reqId, identity, req.key, req.windowMs);
+          break;
+        case "get-external-spend":
+          await this.opGetExternalSpend(socket, reqId, identity, req.forceLive);
           break;
       }
     } catch (err) {
@@ -3129,6 +3163,157 @@ export class AuthBroker {
   }
 
   /**
+   * `get-external-spend` — fleet OpenRouter/cash spend for `/usage`.
+   * ACL: same as list-state (any bound identity). Never puts the master
+   * key on the wire. Soft-fails with `available:false` when the key is
+   * missing or LiteLLM is unreachable and no durable cache exists.
+   */
+  private async opGetExternalSpend(
+    socket: net.Socket,
+    id: string,
+    _identity: Identity,
+    forceLive?: boolean,
+  ): Promise<void> {
+    const nowMs = this.now();
+    const ttl = EXTERNAL_SPEND_CACHE_TTL_MS;
+    const fresh =
+      this.externalSpendCache != null &&
+      nowMs - this.externalSpendCache.capturedAtMs < ttl;
+
+    if (forceLive || !fresh) {
+      try {
+        await this.refreshExternalSpend(forceLive === true);
+      } catch (err) {
+        this.logErr(
+          `external-spend refresh failed: ${(err as Error)?.message ?? err}`,
+        );
+      }
+    }
+
+    if (!this.externalSpendCache) {
+      socket.write(
+        encodeSuccess(id, {
+          available: false,
+          reason: this.resolveLitellmMasterKey()
+            ? "litellm_unreachable"
+            : "master_key_unavailable",
+        }),
+      );
+      return;
+    }
+
+    const recently =
+      nowMs - this.externalSpendCache.capturedAtMs < 5_000;
+    const outServed: "live" | "cache" = recently && (forceLive || !fresh)
+      ? "live"
+      : "cache";
+
+    const s = this.externalSpendCache.summary;
+    socket.write(
+      encodeSuccess(id, {
+        available: true,
+        day24hUsd: s.day24hUsd,
+        day7dUsd: s.day7dUsd,
+        top: s.top,
+        capturedAtMs: this.externalSpendCache.capturedAtMs,
+        served: outServed,
+      }),
+    );
+  }
+
+  /** Resolve LiteLLM master key: test override → env → state-dir file. Never logs value. */
+  private resolveLitellmMasterKey(): string | null {
+    if (this.opts._testLitellmMasterKey !== undefined) {
+      const v = this.opts._testLitellmMasterKey;
+      return v && v.trim() ? v.trim() : null;
+    }
+    const envKey = (
+      process.env.SWITCHROOM_LITELLM_ADMIN_KEY ??
+      process.env.LITELLM_MASTER_KEY ??
+      ""
+    ).trim();
+    if (envKey) return envKey;
+    try {
+      const path = join(this.stateDir, LITELLM_MASTER_KEY_STATE_BASENAME);
+      if (!existsSync(path)) return null;
+      const raw = readFileSync(path, "utf-8").trim();
+      return raw.length > 0 ? raw : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private resolveLitellmBaseUrl(): string {
+    const fromCfg = (this.config as { litellm?: { base_url?: string } }).litellm
+      ?.base_url;
+    const raw = (
+      process.env.SWITCHROOM_LITELLM_BASE ??
+      fromCfg ??
+      DEFAULT_LITELLM_BASE
+    ).trim();
+    return raw.replace(/\/+$/, "") || DEFAULT_LITELLM_BASE;
+  }
+
+  /**
+   * Live-refresh external spend from LiteLLM. Single-flight. On failure
+   * leaves any existing durable cache in place.
+   */
+  private async refreshExternalSpend(forceLive: boolean): Promise<void> {
+    // Wait for any in-flight refresh, then re-evaluate. A concurrent
+    // forceLive must not be starved by a non-force flight that no-ops
+    // on a still-within-TTL (but operator-stale) cache.
+    while (this.externalSpendInFlight) {
+      await this.externalSpendInFlight;
+      if (!forceLive) return;
+      const justNow = this.now();
+      if (
+        this.externalSpendCache &&
+        justNow - this.externalSpendCache.capturedAtMs < 5_000
+      ) {
+        return;
+      }
+      // lost the race to start another force — loop and try again
+    }
+    const run = (async () => {
+      const nowMs = this.now();
+      if (
+        !forceLive &&
+        this.externalSpendCache &&
+        nowMs - this.externalSpendCache.capturedAtMs < EXTERNAL_SPEND_CACHE_TTL_MS
+      ) {
+        return;
+      }
+      const key = this.resolveLitellmMasterKey();
+      if (!key) return;
+      const baseUrl = this.resolveLitellmBaseUrl();
+      const now = new Date(nowMs);
+      let summary: ExternalSpendSummary | null = null;
+      if (this.opts._testFetchExternalSpend) {
+        summary = await this.opts._testFetchExternalSpend({
+          adminKey: key,
+          baseUrl,
+          now,
+          forceLive,
+        });
+      } else {
+        summary = await fetchAndSummarizeExternalSpend({
+          adminKey: key,
+          baseUrl,
+          now,
+          timeoutMs: EXTERNAL_SPEND_FETCH_TIMEOUT_MS,
+        });
+      }
+      if (!summary) return;
+      this.externalSpendCache = { summary, capturedAtMs: this.now() };
+      this.persistExternalSpendCache();
+    })();
+    this.externalSpendInFlight = run.finally(() => {
+      this.externalSpendInFlight = null;
+    });
+    await this.externalSpendInFlight;
+  }
+
+  /**
    * Fleet notification-dedup claim. Grants the FIRST caller of a given
    * `key` inside `windowMs`; everyone else is denied. The check-and-set
    * is fully synchronous (no awaits), so two agents racing the same key
@@ -4478,6 +4663,39 @@ export class AuthBroker {
     // #3185 — reload the durable per-(account, tier) usage ledger so a restart
     // keeps the rolling history instead of starting the trend from scratch.
     this.usageLedger = this.readJson<UsageLedger>("usage-ledger.json") ?? {};
+    {
+      const es = this.readJson<{
+        summary?: ExternalSpendSummary;
+        capturedAtMs?: number;
+      }>("external-spend.json");
+      if (
+        es &&
+        es.summary &&
+        typeof es.capturedAtMs === "number" &&
+        Number.isFinite(es.summary.day24hUsd) &&
+        Number.isFinite(es.summary.day7dUsd) &&
+        Array.isArray(es.summary.top) &&
+        es.summary.top.every(
+          (t) =>
+            t &&
+            typeof t.label === "string" &&
+            typeof t.usd === "number" &&
+            Number.isFinite(t.usd),
+        )
+      ) {
+        this.externalSpendCache = {
+          summary: {
+            day24hUsd: es.summary.day24hUsd,
+            day7dUsd: es.summary.day7dUsd,
+            top: es.summary.top.map((t) => ({
+              label: t.label,
+              usd: t.usd,
+            })),
+          },
+          capturedAtMs: es.capturedAtMs,
+        };
+      }
+    }
     this.applyActiveOverride();
   }
 
@@ -4542,6 +4760,14 @@ export class AuthBroker {
   /** #2495 Change 1 — mirror the utilization cache to disk so it survives
    *  a broker restart. Same atomic-write pattern as the exhaustion ledger. */
   private persistLastQuotaCache(): void { atomicWriteJsonSync(join(this.stateDir, "last-quota.json"), this.lastQuotaCache, 0o600); }
+  private persistExternalSpendCache(): void {
+    if (!this.externalSpendCache) return;
+    atomicWriteJsonSync(
+      join(this.stateDir, "external-spend.json"),
+      this.externalSpendCache,
+      0o600,
+    );
+  }
   /** #3176 — mirror the flagship-tier canary cache to disk. */
   private persistLastTierQuotaCache(): void { atomicWriteJsonSync(join(this.stateDir, "last-tier-quota.json"), this.lastTierQuotaCache, 0o600); }
   /** #3185 — mirror the per-(account, tier) usage ledger to disk so the rolling

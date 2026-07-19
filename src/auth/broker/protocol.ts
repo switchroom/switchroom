@@ -412,6 +412,23 @@ export const ClaimNotificationRequestSchema = z.object({
   windowMs: z.number().int().positive().max(86_400_000),
 });
 
+/**
+ * Fleet external (OpenRouter / non-Claude cash) spend summary for the
+ * `/usage` card. ACL matches `list-state` — any authenticated identity.
+ * The auth-broker holds the LiteLLM master key and publishes only a
+ * sanitized summary (no key material on the wire).
+ *
+ * forceLive bypasses the broker's refresh TTL (same idea as probe-quota)
+ * when the operator re-opens /usage and wants fresher totals.
+ */
+export const GetExternalSpendRequestSchema = z.object({
+  v: z.literal(PROTOCOL_VERSION),
+  op: z.literal("get-external-spend"),
+  id: z.string().min(1),
+  /** Bypass the ~90s live-refresh TTL and re-query LiteLLM. */
+  forceLive: z.boolean().optional(),
+});
+
 export const RequestSchema = z.discriminatedUnion("op", [
   GetCredentialsRequestSchema,
   ListStateRequestSchema,
@@ -426,6 +443,7 @@ export const RequestSchema = z.discriminatedUnion("op", [
   ListMicrosoftAccountsRequestSchema,
   ProbeQuotaRequestSchema,
   ClaimNotificationRequestSchema,
+  GetExternalSpendRequestSchema,
 ]);
 
 export type Request = z.infer<typeof RequestSchema>;
@@ -541,6 +559,28 @@ export const ClaimNotificationDataSchema = z.object({
  * inventory don't need those, and never returning them keeps the wire
  * surface narrow.
  */
+export const GetExternalSpendDataSchema = z.object({
+  /** False when the broker has no master key / LiteLLM unreachable and no cache. */
+  available: z.boolean(),
+  day24hUsd: z.number().optional(),
+  day7dUsd: z.number().optional(),
+  top: z
+    .array(
+      z.object({
+        label: z.string(),
+        usd: z.number(),
+      }),
+    )
+    .optional(),
+  /** Unix ms when the summary was computed. */
+  capturedAtMs: z.number().int().nonnegative().optional(),
+  /** "live" freshly fetched, "cache" served from durable/TTL cache. */
+  served: z.enum(["live", "cache"]).optional(),
+  /** Short reason when available=false (never includes secrets). */
+  reason: z.string().optional(),
+});
+
+
 export const GoogleAccountStateSchema = z.object({
   account: z.string(),
   expiresAt: z.number(),
