@@ -116,6 +116,7 @@ import {
   type MediaEnvelopeDeps,
 } from './media-message-handlers.js'
 import { routeInbound, type InboundRouterDeps } from './inbound-router.js'
+import { interceptStopKeyword, type InboundInterceptorDeps } from './inbound-interceptors.js'
 import {
   handleDocumentMessage,
   handleAudioMessage,
@@ -15375,6 +15376,21 @@ function maybePokeFloorForMidTurnInbound(ctx: Context, from: NonNullable<Context
   silencePoke.pokeFloorNow(key, Date.now())
 }
 
+// Live collaborators for the extracted intercept gauntlet (switchroom#2996 P7).
+// Bound once; every field is a live reference (never a value snapshot). `botApi`
+// is a lazy accessor for `bot.api` (the grammY `bot` is assigned late on the
+// prod boot path) so the moved raw call keeps riding the same
+// `swallowingApiCall` retry wrapper it used inline, deref'd at call time.
+const inboundInterceptorDeps: InboundInterceptorDeps = {
+  pendingSessionCommand,
+  turnInFlightForGate,
+  sendReaction,
+  executeHaltNow,
+  swallowingApiCall,
+  botApi: () => bot.api,
+  log: line => process.stderr.write(line),
+}
+
 export async function handleInbound(
   ctx: Context,
   text: string,
@@ -15561,40 +15577,12 @@ export async function handleInbound(
   // Pure text only (7b): a photo/attachment captioned "stop" is content for
   // the agent, not a halt request — it must never trip the halt-and-drop
   // path (the caption + attachment flow through as a normal turn).
-  if (
-    parseStopKeyword(text) &&
-    downloadImage == null &&
-    attachment == null &&
-    (extraAttachments == null || extraAttachments.length === 0)
-  ) {
-    const queuedLabels = pendingSessionCommand.list().map(c => `/${c.kind} ${c.targetLabel}`)
-    const inFlight = turnInFlightForGate()
-    process.stderr.write(
-      `telegram gateway: stop-keyword received chat_id=${chat_id} in_flight_turn=${inFlight} ` +
-      `queued_cmds=${queuedLabels.length}\n`,
+  {
+    const stopOutcome = await interceptStopKeyword(
+      { text, chat_id, msgId, messageThreadId, downloadImage, attachment, extraAttachments },
+      inboundInterceptorDeps,
     )
-    if (inFlight) {
-      if (msgId != null) {
-        void sendReaction(chat_id, msgId, '⚡' as ReactionTypeEmoji['emoji']).catch(() => {})
-      }
-      await executeHaltNow('stop-keyword')
-    }
-    const stopReply = buildStopReply(inFlight, queuedLabels)
-    // #1075: thread-id-bearing — swallow so a deleted topic can't crash us.
-    await swallowingApiCall(
-      () =>
-        bot.api.sendMessage(
-          chat_id,
-          stopReply.text,
-          messageThreadId != null ? { message_thread_id: messageThreadId } : {},
-        ),
-      {
-        chat_id,
-        verb: 'stop-keyword-reply',
-        ...(messageThreadId != null ? { threadId: messageThreadId } : {}),
-      },
-    )
-    return
+    if (stopOutcome.handled) return
   }
 
   const interrupt = parseInterruptMarker(text)

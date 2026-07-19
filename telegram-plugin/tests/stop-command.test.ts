@@ -17,6 +17,13 @@ import { switchroomHelpCommandNames, switchroomHelpText } from '../welcome-text.
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const GATEWAY_SRC = readFileSync(resolve(__dirname, '..', 'gateway', 'gateway.ts'), 'utf8')
+// P7 PR-2 (#2996): the handleInbound stop-keyword intercept block moved into
+// inbound-interceptors.ts (`interceptStopKeyword`). The coalescer bypass stays
+// in gateway.ts. Scrapes anchor on whichever file now owns each literal.
+const INTERCEPTORS_SRC = readFileSync(
+  resolve(__dirname, '..', 'gateway', 'inbound-interceptors.ts'),
+  'utf8',
+)
 
 describe('parseStopKeyword', () => {
   it('matches the exact word stop, case-insensitively', () => {
@@ -177,14 +184,15 @@ describe('gateway wiring — /stop cancels the in-flight turn (#3020)', () => {
     expect(bypassIdx).toBeGreaterThan(0)
     const bypassWin = GATEWAY_SRC.slice(bypassIdx, bypassIdx + 800)
     expect(bypassWin).toContain('parseStopKeyword(text)')
-    // handleInbound keyword block: honest idle reply or halt + confirmation.
-    const kwIdx = GATEWAY_SRC.indexOf("executeHaltNow('stop-keyword')")
+    // interceptStopKeyword block (P7 PR-2, inbound-interceptors.ts): honest
+    // idle reply or halt + confirmation.
+    const kwIdx = INTERCEPTORS_SRC.indexOf("deps.executeHaltNow('stop-keyword')")
     expect(kwIdx).toBeGreaterThan(0)
-    const kwWin = GATEWAY_SRC.slice(kwIdx - 1600, kwIdx + 900)
-    expect(kwWin).toContain('turnInFlightForGate()')
+    const kwWin = INTERCEPTORS_SRC.slice(kwIdx - 1600, kwIdx + 900)
+    expect(kwWin).toContain('deps.turnInFlightForGate()')
     expect(kwWin).toContain('buildStopReply(inFlight, queuedLabels)')
     // Intercepted — never forwarded to the agent as a turn.
-    expect(kwWin).toContain('return')
+    expect(kwWin).toContain('return { handled: true }')
   })
 
   it('the empty-`!` interrupt routes through the same executeHaltNow helper', () => {
@@ -210,12 +218,13 @@ describe('gateway wiring — /stop cancels the in-flight turn (#3020)', () => {
       'parseStopKeyword(text) && downloadImage == null && attachment == null',
     )
     expect(bypassIdx).toBeGreaterThan(0)
-    // handleInbound keyword block: also excludes coalesced extra attachments.
-    const kwIdx = GATEWAY_SRC.indexOf("executeHaltNow('stop-keyword')")
-    const kwWin = GATEWAY_SRC.slice(kwIdx - 2400, kwIdx)
-    expect(kwWin).toContain('downloadImage == null')
-    expect(kwWin).toContain('attachment == null')
-    expect(kwWin).toContain('extraAttachments == null || extraAttachments.length === 0')
+    // interceptStopKeyword block (P7 PR-2): also excludes coalesced extra
+    // attachments (per-message facts arrive as the `p.` params object).
+    const kwIdx = INTERCEPTORS_SRC.indexOf("deps.executeHaltNow('stop-keyword')")
+    const kwWin = INTERCEPTORS_SRC.slice(kwIdx - 2400, kwIdx)
+    expect(kwWin).toContain('p.downloadImage == null')
+    expect(kwWin).toContain('p.attachment == null')
+    expect(kwWin).toContain('p.extraAttachments == null || p.extraAttachments.length === 0')
   })
 })
 
