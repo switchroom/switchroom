@@ -42,6 +42,7 @@ import {
   resolveSafeBoundaryEnabled,
 } from './interrupt-defer.js'
 import { parseStopKeyword, buildStopReply } from './stop-command.js'
+import { shouldMaskUsageLabels } from './usage-mask.js'
 import { shouldPostBusyAck, formatBusyAckText, BUSY_ACK_STEP_AGE_THRESHOLD_MS } from './busy-ack.js'
 import {
   resolveStickerSendArgs,
@@ -877,7 +878,7 @@ import {
   decideAnnouncementDelivery,
   foldAnnouncementIntoCard,
 } from '../fallback-card-collapse.js'
-import { buildSnapshotsFromState, buildSnapshotsFromCachedState, zipProbeResults } from '../auth-snapshot-format.js'
+import { buildSnapshotsFromState, buildSnapshotsFromCachedState, zipProbeResults, deriveUsageFooterFreshness } from '../auth-snapshot-format.js'
 import { maskUsername } from '../demo-mask.js'
 import {
   writeTurnActiveMarker,
@@ -14333,6 +14334,26 @@ function isAuthorizedSender(ctx: Context): boolean {
   return false
 }
 
+// Adversarial-review F4 — a group configured with an EMPTY `allowFrom`
+// authorizes every member (isAuthorizedSender returns true for any sender in
+// that group). That's an intentional "whole-group" access mode, but it means
+// `/usage` would expose per-account email labels + quota headroom to every
+// member of a broadly-shared group. Harden minimally: for the quota-bearing
+// card in a non-private chat, mask account labels (reusing the demo-mask
+// machinery) UNLESS the group pinned a non-empty `allowFrom` — i.e. an
+// explicit operator-curated member list is treated as trusted enough to see
+// the real labels. Private (operator DM) chats are never masked. This changes
+// only what /usage REVEALS, not who may run it. The pure decision lives in
+// ./usage-mask.ts (shouldMaskUsageLabels) so it is unit-testable without
+// importing the whole gateway module.
+function shouldMaskAccountLabels(ctx: Context): boolean {
+  const groupAllowFrom =
+    ctx.chat?.type === 'group' || ctx.chat?.type === 'supergroup'
+      ? loadAccess().groups[String(ctx.chat.id)]?.allowFrom
+      : undefined
+  return shouldMaskUsageLabels(ctx.chat?.type, groupAllowFrom)
+}
+
 // safeName moved to ./media-message-handlers.ts (switchroom#2996 P6 cluster A);
 // imported above and shared with the attachment handlers still inline here.
 
@@ -21444,7 +21465,12 @@ bot.command('issues', async ctx => {
 })
 bot.command('usage', async ctx => {
   if (!isAuthorizedSender(ctx)) return
-  const demo = hasDemoFlag(getCommandArgs(ctx))
+  // `demo` is the explicit `/usage demo` opt-in mask. F4 additionally masks
+  // account labels for a non-private chat whose group has no pinned
+  // `allowFrom` (open-membership group) — see shouldMaskAccountLabels. The
+  // effective mask feeds the label-rendering paths (renderUsageCard,
+  // buildSnapshotKeyboard) exactly as `demo` did.
+  const demo = hasDemoFlag(getCommandArgs(ctx)) || shouldMaskAccountLabels(ctx)
   // Format 2 path: enumerate every account in the broker's known set,
   // probe live quota in parallel, render the health-grouped snapshot.
   // Falls back to the legacy single-agent shape when the broker is
@@ -21496,14 +21522,17 @@ bot.command('usage', async ctx => {
           // Honesty backstop: a TOTAL probe failure (the .catch above
           // returned `{results: []}` and nothing was served from cache)
           // must render an explicit "probe failed" marker, NOT a false
-          // "Live" stamp next to "⚠️ no data" rows. Without this the
-          // footer claimed "Live · refreshed 0s ago" while every account
-          // row said "no data — probe failed" (#2959 review finding).
-          ...(staleCachedAtMs != null
-            ? { staleCachedAtMs }
-            : probeResp.results.length > 0
-              ? { liveProbedAtMs: renderNow.getTime() }
-              : { probeFailed: true }),
+          // "Live" stamp next to "⚠️ no data" rows (#2959 review finding).
+          // Honesty invariant (adversarial-review F1): the live stamp is
+          // derived from whether ANY row carries usable data, NOT from the
+          // array length — a failed live probe against an empty cache returns
+          // a non-empty results array of all-`ok:false` rows. Full rationale
+          // in deriveUsageFooterFreshness (auth-snapshot-format.ts).
+          ...deriveUsageFooterFreshness(
+            probeResp.results,
+            staleCachedAtMs,
+            renderNow.getTime(),
+          ),
         })
         // Preserve the Switch/Refresh/usage/Add inline keyboard on the
         // rich-message render — the table card carries the same actions the

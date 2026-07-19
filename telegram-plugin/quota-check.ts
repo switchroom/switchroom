@@ -252,11 +252,26 @@ export function formatQuotaBlock(q: QuotaUtilization, now: Date = new Date()): s
   const lines: string[] = [];
   lines.push("**Claude plan quota**");
   lines.push("");
+  // #2494 Bug C / adversarial-review F3 — a window whose utilization header
+  // was absent (a thin probe) has a numeric field that coalesced to 0, so a
+  // naive `${pct}%` renders a confident `0%` indistinguishable from a genuine
+  // fresh-account 0%. The modern bar card (quota-bar-format.ts ~200) already
+  // renders these as "no data"; backport that honesty here. The presence
+  // markers are optional — `undefined` means a legacy/real probe (render the
+  // percent); only an explicit `false` suppresses the number.
+  const fiveHour =
+    q.fiveHourUtilPresent === false
+      ? "no data"
+      : `\`${Math.round(q.fiveHourUtilizationPct)}%\``;
+  const sevenDay =
+    q.sevenDayUtilPresent === false
+      ? "no data"
+      : `\`${Math.round(q.sevenDayUtilizationPct)}%\``;
   lines.push(
-    `**5h window**  \`${Math.round(q.fiveHourUtilizationPct)}%\` · \`${formatResetRelative(q.fiveHourResetAt, now)}\``,
+    `**5h window**  ${fiveHour} · \`${formatResetRelative(q.fiveHourResetAt, now)}\``,
   );
   lines.push(
-    `**7d window**  \`${Math.round(q.sevenDayUtilizationPct)}%\` · \`${formatResetRelative(q.sevenDayResetAt, now)}\``,
+    `**7d window**  ${sevenDay} · \`${formatResetRelative(q.sevenDayResetAt, now)}\``,
   );
   if (q.representativeClaim) {
     lines.push("");
