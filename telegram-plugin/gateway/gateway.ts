@@ -115,7 +115,14 @@ import {
   handlePaidMediaMessage,
   type MediaEnvelopeDeps,
 } from './media-message-handlers.js'
-import { routeInbound, type InboundRouterDeps } from './inbound-router.js'
+import {
+  routeInbound,
+  admitInbound,
+  buildReplyForwardContext,
+  buildInboundEnvelope,
+  type InboundRouterDeps,
+  type InboundAdmissionDeps,
+} from './inbound-router.js'
 import {
   interceptStopKeyword,
   interceptInterruptMarker,
@@ -14513,6 +14520,13 @@ function maybePokeFloorForMidTurnInbound(ctx: Context, from: NonNullable<Context
 // is a lazy accessor for `bot.api` (the grammY `bot` is assigned late on the
 // prod boot path) so the moved raw call keeps riding the same
 // `swallowingApiCall` retry wrapper it used inline, deref'd at call time.
+// Admission-head collaborators (#2996 P7 PR-10): boot-fixed TOPIC_ID scoping
+// value + the live gate/deny-logger references.
+const inboundAdmissionDeps: InboundAdmissionDeps = {
+  topicId: TOPIC_ID ?? null,
+  gate,
+  logGateDeny: logGateDeny as InboundAdmissionDeps['logGateDeny'],
+}
 const inboundInterceptorDeps: InboundInterceptorDeps = {
   pendingSessionCommand,
   turnInFlightForGate,
@@ -14584,23 +14598,13 @@ export async function handleInbound(
   coalescedForwardOrigins?: ForwardOriginInfo[],
 ): Promise<void> {
   markIdleActivity() // any inbound resets the idle auto-clear timer + re-arms
-  const isTopicMessage = ctx.message?.is_topic_message ?? false
   const messageThreadId = ctx.message?.message_thread_id
 
-  if (TOPIC_ID != null) {
-    if (!isTopicMessage || messageThreadId !== TOPIC_ID) return
-  }
-
-  const result = gate(ctx)
-  if (result.action === 'drop') {
-    logGateDeny(ctx, result.reason)
-    return
-  }
-  if (result.action === 'pair') {
-    const lead = result.isResend ? 'Still pending' : 'Pairing required'
-    await ctx.reply(`${lead} — run in Claude Code:\n\n/telegram:access pair ${result.code}`)
-    return
-  }
+  // Topic-scope + access-gate admission head — moved to admitInbound
+  // (#2996 P7 PR-10); drop/pair early-return semantics unchanged.
+  const admission = await admitInbound(ctx, inboundAdmissionDeps)
+  if (!admission.admitted) return
+  const result = { action: 'deliver' as const, access: admission.access as Access }
 
   // A real message from an allowed sender (gate passed) ⇒ the operator is
   // present, so reset any no-repeat suppression: the next time the agent asks
@@ -15179,33 +15183,20 @@ export async function handleInbound(
   const primaryHasAttachment = imagePath != null || attachment != null
   const attachmentCount = (primaryHasAttachment ? 1 : 0) + extraResolved.length
 
-  // Telegram-native reply context (issue #119). Same pattern as server.ts:
-  // `replyToText` is raw (for SQLite); `replyToTextEscaped` is XML-escaped
-  // (for channel meta).
-  const replyToMsg = ctx.message?.reply_to_message
-  const replyToMessageId = replyToMsg?.message_id
-  const replyToTextRaw = replyToMsg
-    ? (replyToMsg.text ?? replyToMsg.caption ?? undefined)
-    : undefined
-  const replyToText = replyToTextRaw != null
-    ? (replyToTextRaw.length > REPLY_TO_TEXT_MAX
-        ? replyToTextRaw.slice(0, REPLY_TO_TEXT_MAX - 1) + '…'
-        : replyToTextRaw)
-    : undefined
-  const replyToTextEscaped = formatReplyToText(replyToTextRaw, REPLY_TO_TEXT_MAX)
-
-  // Forwarded-message origin context. `forward_origin` is stamped by
-  // Telegram's servers (Bot API 7.0+) — the forwarding user cannot forge
-  // it via the message body, so it rides the trusted attrs lane and is
-  // NEVER folded into the body text. Coalesced bursts pass their deduped
-  // per-entry origins; direct/bypass paths parse this ctx's own origin.
-  // Same raw-vs-escaped split as reply_to_text: `forwardOrigins` carries
-  // raw (truncated) names for SQLite, `buildForwardOriginMeta` escapes at
-  // the channel-meta boundary.
-  const forwardOrigins = coalescedForwardOrigins
-    ?? dedupeForwardOrigins([parseForwardOrigin(ctx.message?.forward_origin)])
-  const forwardOriginMeta = buildForwardOriginMeta(forwardOrigins)
-  const primaryForwardOrigin = forwardOrigins[0]
+  // Reply-to + forward-origin context — moved to buildReplyForwardContext
+  // (#2996 P7 PR-10, pure builder).
+  const {
+    replyToMessageId,
+    replyToText,
+    replyToTextEscaped,
+    forwardOrigins,
+    forwardOriginMeta,
+    primaryForwardOrigin,
+  } = buildReplyForwardContext({
+    ctx,
+    coalescedForwardOrigins,
+    replyToTextMax: REPLY_TO_TEXT_MAX,
+  })
 
   if (HISTORY_ENABLED) {
     try {
@@ -15257,110 +15248,35 @@ export async function handleInbound(
     }
   }
 
-  // Dispatch to connected bridge via IPC
-  // Component 3 — stable origin turn id stamped into the meta the model
-  // reads, so a reply can echo it back (origin_turn_id) and the gateway
-  // can route the answer to the turn that owns it even after currentTurn
-  // flips. Derived from chat/thread/messageId, matching the turnId the
-  // enqueue handler computes for the turn this inbound starts.
-  const originTurnId = deriveTurnId(chat_id, messageThreadId ?? null, msgId)
-  // Component 4 — per-turn topic framing. In a forum supergroup a queued
-  // cross-topic message could tempt the model to also answer a pending
-  // question from another topic. A one-line directive (only for topic
-  // inbounds, only when framing is enabled) pins the model to THIS
-  // message's topic. DMs / non-topic chats get nothing.
-  const topicScope =
-    TOPIC_FRAMING_ENABLED && messageThreadId != null
-      ? 'This message belongs to the current topic only — answer ONLY this question, in this topic. Do not also answer a pending message from another topic.'
-      : undefined
-  // person_id name resolution (docs/configuration.md, resolve-person.ts):
-  // chat-scoped, boot-time-static lookup — falls back to today's raw
-  // id/username behavior (fail-open) whenever unresolved or when group
-  // membership can't be positively confirmed from access.json's allowFrom.
-  // Never touches access.json itself and never blocks/denies anything.
-  const rawUser = from.username ?? String(from.id)
-  const displayUser = safeResolvePersonName(
-    PERSON_DIRECTORY,
-    {
-      telegramId: String(from.id),
-      username: from.username,
-      isDm: isDmChatId(chat_id),
-      groupAllowFrom: access.groups[chat_id]?.allowFrom,
-    },
-    rawUser,
-  )
-  const inboundMsg: InboundMessage = {
-    type: 'inbound',
-    chatId: chat_id,
-    ...(messageThreadId != null ? { threadId: messageThreadId } : {}),
-    messageId: msgId ?? 0,
-    user: displayUser,
-    userId: from.id,
-    ts: ctx.message?.date ?? Math.floor(Date.now() / 1000),
-    text: effectiveText,
-    ...(imagePath ? { imagePath } : {}),
-    ...(attachment ? {
-      attachment: {
-        fileId: attachment.file_id,
-        mimeType: attachment.mime ?? 'application/octet-stream',
-        ...(attachment.name ? { fileName: attachment.name } : {}),
-      },
-    } : {}),
-    meta: {
-      chat_id,
-      ...(msgId != null ? { message_id: String(msgId) } : {}),
-      user: displayUser,
-      user_id: String(from.id),
-      // Model-facing `ts="…"` on the inbound <channel> tag. Rendered as the
-      // agent's LOCAL am/pm wall-clock (NOT UTC ISO) so the model never reads
-      // a competing UTC "now" — the numeric epoch survives on InboundMessage.ts
-      // (above) and in the SQLite history for any machine consumer.
-      ts: fmtLocalStamp((ctx.message?.date ?? 0) * 1000, resolveEnvTimezone()),
-      ...(messageThreadId != null ? { message_thread_id: String(messageThreadId) } : {}),
-      // Component 3 — origin turn id. The model is told to pass this back
-      // as origin_turn_id on the reply so the answer routes to the topic
-      // this message came from (turn-origin routing). The reply tool also
-      // resolves it from the live/recent turn registry, so a model that
-      // omits it still routes correctly via the live-turn fallback.
-      ...(originTurnId != null ? { origin_turn_id: originTurnId } : {}),
-      // Component 4 — per-turn topic-scope directive (supergroup topics).
-      ...(topicScope != null ? { topic_scope: topicScope } : {}),
-      ...(imagePath ? { image_path: imagePath } : {}),
-      // Telegram-native reply context (issue #119). When set, the user
-      // long-pressed a prior message and chose "Reply" — the agent should
-      // treat this as the antecedent for "this" / "that" / pronoun
-      // references in the body, instead of asking the user what they meant.
-      ...(replyToMessageId != null ? { reply_to_message_id: String(replyToMessageId) } : {}),
-      // Use the XML-escaped form for the meta — the raw form is in the
-      // SQLite buffer for verbatim retrieval via get_recent_messages.
-      ...(replyToTextEscaped != null && replyToTextEscaped.length > 0 ? { reply_to_text: replyToTextEscaped } : {}),
-      // Forwarded-message origin (server-stamped, attrs-only — see above).
-      // forwarded_from / forwarded_from_type / forwarded_from_id /
-      // forwarded_date, plus numbered _2.. siblings for a multi-origin
-      // burst. Names are XML-escaped inside buildForwardOriginMeta.
-      ...forwardOriginMeta,
-      // queued="true" when mid-turn with no steer prefix (new default), or
-      // with explicit /queue or /q prefix (legacy alias).
-      ...((isQueuedMidTurn || isQueuedPrefix) ? { queued: 'true' } : {}),
-      // steering="true" only when explicit /steer or /s prefix used.
-      ...(isSteering ? { steering: 'true' } : {}),
-      ...(priorTurnInProgress ? { prior_turn_in_progress: 'true' } : {}),
-      ...(priorTurnInProgress && secondsSinceTurnStart != null ? { seconds_since_turn_start: String(secondsSinceTurnStart) } : {}),
-      ...(priorTurnInProgress && priorAssistantPreview != null && priorAssistantPreview.length > 0 ? { prior_assistant_preview: priorAssistantPreview } : {}),
-      ...(attachment ? {
-        attachment_kind: attachment.kind,
-        attachment_file_id: attachment.file_id,
-        ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
-        ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
-        ...(attachment.name ? { attachment_name: attachment.name } : {}),
-      } : {}),
-      // A2: numbered fields for the 2nd..Nth attachment + a total count so
-      // the agent reads every item in a coalesced multi-media burst.
-      ...(attachmentCount > 1 ? { attachment_count: String(attachmentCount) } : {}),
-      ...extraMeta,
-    },
-  }
-
+  // Dispatch to connected bridge via IPC — the InboundMessage envelope
+  // assembly moved to buildInboundEnvelope (#2996 P7 PR-10, pure builder).
+  // Every input is an at-call captured value; the machine emit and the
+  // deliver-or-buffer dispatch below stay wired exactly as before.
+  const inboundMsg: InboundMessage = buildInboundEnvelope({
+    ctx,
+    chat_id,
+    messageThreadId,
+    msgId,
+    effectiveText,
+    imagePath,
+    attachment,
+    attachmentCount,
+    extraMeta,
+    from,
+    access,
+    isSteering,
+    isQueuedPrefix,
+    isQueuedMidTurn,
+    priorTurnInProgress,
+    secondsSinceTurnStart,
+    priorAssistantPreview,
+    replyToMessageId,
+    replyToTextEscaped,
+    forwardOriginMeta,
+    topicFramingEnabled: TOPIC_FRAMING_ENABLED,
+    personDirectory: PERSON_DIRECTORY,
+    isDmChatId,
+  })
   // Deliver to THIS agent's registered bridge, buffering on miss.
   // broadcast()/clientCount() were the wrong primitives: broadcast is
   // not registered-keyed (writes to any alive socket incl. an
