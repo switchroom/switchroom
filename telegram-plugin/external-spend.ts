@@ -293,10 +293,6 @@ export async function resolveLitellmAdminKey(
 
 function defaultReadAdminKeyRef(): string | null {
   try {
-    // Dynamic import path keeps unit tests that never touch config hermetic
-    // when they inject readAdminKeyRef. Production uses loadConfig.
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { loadConfig, findConfigFile } = require('../src/config/loader.js') as typeof import('../src/config/loader.js');
     const cfgPath = findConfigFile();
     const cfg = loadConfig(cfgPath) as { litellm?: { admin_key?: string } };
     const ref = cfg.litellm?.admin_key;

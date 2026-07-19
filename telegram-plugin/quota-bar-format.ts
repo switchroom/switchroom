@@ -355,8 +355,9 @@ export function renderUsageCard(
   // Actionable cross-account verdict — restored from renderAuthSnapshotFormat2.
   lines.push(`_${recommendation(snapshots, now, demo)}_`);
   // External cash spend (OpenRouter / non-Claude) — layout B. Omitted when
-  // the caller could not fetch a summary (no admin key, timeout, etc.).
-  if (opts.externalSpend) {
+  // the caller could not fetch a summary (null/undefined: no admin key,
+  // timeout, error). Present summary including $0.00 still renders.
+  if (opts.externalSpend != null) {
     lines.push(...formatExternalSpendBlock(opts.externalSpend));
   }
   // Freshness signal: stale-cache warning takes precedence over a live stamp,
