@@ -2,6 +2,54 @@
 
 ## Unreleased
 
+## v0.18.33 — Gateway decomposition lands its P7 inbound-router and P8 turn-lifecycle phases (kill-switched, default OFF), plus a P0 boot-crash fix and background-worker visibility repairs
+
+### Gateway decomposition (#2996)
+
+Continued behavior-preserving decomposition of the monolithic
+`telegram-plugin/gateway/gateway.ts`, each phase landed as its own reviewed
+PR. The two largest new seams ship **kill-switched and default OFF** so the
+extracted paths bake behind a flag before becoming the default:
+
+- **P7 — inbound routing extracted behind `SWITCHROOM_INBOUND_ROUTER_V2`
+  (default OFF).** The inbound-router seam and `routeInbound` indirection
+  (#3380), plus the full kill-switched v2 inbound intercept chain — stop-keyword
+  (#3381), interrupt-marker (#3382), permission-reply (#3383), auth-add /
+  loopback-relay / reauth paste-back (#3384, #3385, #3387), admission head +
+  envelope builders (#3396), secret-detect (#3394), vault pending-op (#3388),
+  and the assembled intercept chain (#3397) with paste-back intercept-order
+  pinned (#3399). Characterization harness landed first (#3355).
+- **P8 — turn-lifecycle funnel extracted behind `SWITCHROOM_TURN_END_FUNNEL_V2`
+  (default OFF).** `turn-end.ts` funnel (#3389) with delivery-confirm sweep
+  (#3390), obligation (#3391) and silence-poke (#3392) wiring, the
+  kill-switched `endTurn(reason)` dispatcher (#3393), and the turn-start
+  surfaces block (#3398). Turn-lifecycle characterization + idle-sweep
+  harnesses made load-bearing (#3386, #3395).
+- Continued P6 dispatcher drain: command, callback-family, and
+  service-message handler extractions (#3361, #3367, #3368, #3372, #3375,
+  #3377).
+
+### Reliability
+
+- **P0 boot-crash fix** (#3400) — defer the `pendingInboundBuffer` read to a
+  getter to fix a temporal-dead-zone crash on gateway boot, with a new
+  `gateway-boot-smoke` test pinning the boot path so the crash can't silently
+  regress.
+- **Background-worker card visibility** (#3376, #3379) — re-surface a resumed
+  background worker's live progress card, with a guard test around the
+  `onResume` seam (handler extracted from the gateway).
+
+### Rollout
+
+- **Restart-speed canary wiring** (#3364, #3333 stage 4) — gate the scoped
+  ownership sweep on the canary via a per-invocation env var, wiring the
+  restart-speed reconcile canary (built on the flagged, default-OFF scoped
+  sweep from stages 1–2, #3360/#3370).
+
+### Docs
+
+- `postureMintAgents` vault-scope is now documented (informational).
+
 ## v0.18.32 — Backstop answer delivery gets read-back confirmation and crash-window resume, and the gateway decomposition lands its first phases
 
 ### Delivery reliability
