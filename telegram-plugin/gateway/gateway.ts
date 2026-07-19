@@ -10421,7 +10421,12 @@ function sweepSuspendedTargets(): { keys: Set<string>; chats: Set<string> } {
   return { keys, chats }
 }
 
-const _deliveryConfirmSweep = isGatewayMain ? setInterval(() => {  // #2996 P0c gate
+// #2996 P0c/P8 PR-A: the sweep TICK body is a named function so it can be driven
+// by the turn-lifecycle characterization harness (idle-gate / card-suspension
+// pins) — the gateway still owns the `setInterval` (the P0c gate rule). PR-C1
+// moves this body into `delivery-confirm-wiring.ts`; keeping it named here is a
+// pure hoist, no behaviour change.
+function runDeliveryConfirmSweep(): void {
   if (!DELIVERY_CONFIRM_ENABLED) return
   // Re-deliver ONLY when claude is genuinely idle. `currentTurn` is set solely
   // by the enqueue session-event and nulled at turn-end, so `currentTurn != null`
@@ -10440,7 +10445,8 @@ const _deliveryConfirmSweep = isGatewayMain ? setInterval(() => {  // #2996 P0c 
     if (isRedeliverySuspended(p.key, suspended)) continue
     void redeliverStrandedInbound(p)
   }
-}, DELIVERY_CONFIRM_SWEEP_MS) : undefined
+}
+const _deliveryConfirmSweep = isGatewayMain ? setInterval(runDeliveryConfirmSweep, DELIVERY_CONFIRM_SWEEP_MS) : undefined
 _deliveryConfirmSweep?.unref?.()
 
 // #1445 cross-turn pending-async ambient. When a turn ends after the
@@ -15219,6 +15225,35 @@ export const __inboundRouterTestSeam = {
   // `reset()` (cancel stale timers) in beforeEach. Read/reset only — no
   // production behaviour change.
   inboundCoalescer,
+  // ── P8 PR-A: turn-lifecycle WIRING handles (the parity oracle for PR-E). ──
+  // The turn-end funnel + its idle stores + the two idle-only sweeps, exposed
+  // read/drive-only so `turn-lifecycle-characterization.test.ts` can pin the
+  // wiring (map purge, obligation close, buffer drain, no-reply timer arm,
+  // pending-restart drain at turn-complete) BEFORE any of it moves to
+  // `turn-end.ts` (PR-B) / the wiring modules (PR-C). No production behaviour
+  // change — these are the same identifiers the deps builders will inject.
+  // `setCurrentTurn` is the SANCTIONED keyed writer (PR-4e accessor), NOT a raw
+  // `currentTurn =` setter — the harness registers a live turn through it so
+  // the funnel's keyed-liveness guard sees it.
+  setCurrentTurn,
+  getCurrentTurn: (): CurrentTurn | null => currentTurn,
+  // Test-teardown reset of the live-turn store (the disconnect/bridge-died
+  // ghost-clear primitive; PR-E names it a `*-clear` no-op-effect reason). The
+  // harness calls it in beforeEach so a live turn a prior case left set can't
+  // leak into the next case's `currentTurn?.replyCalled` fallback read.
+  clearAllCurrentTurns,
+  endCurrentTurnAtomic,
+  purgeReactionTracking,
+  releaseTurnBufferGate,
+  armNoReplyDrainTimer,
+  statusKey,
+  obligationLedger,
+  pendingInboundBuffer,
+  pendingRestarts,
+  deliveryQueue,
+  runDeliveryConfirmSweep,
+  obligationSweep,
+  activeReactionMsgIds,
 }
 
 export async function handleInboundCoalesced(
